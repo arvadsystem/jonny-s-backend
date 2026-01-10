@@ -1,17 +1,24 @@
-import express from "express"
-import pg from "pg"; // 1. Importamos el paquete pg
-import bodyParser from "body-parser"; // 2. Importamos body-parser
+import express from "express";
+import bodyParser from "body-parser";
 
-// Constante para el paquete de Express
+// IMPORTANTE: Aquí importamos tu archivo de conexión desde la carpeta config
+import pool from "./config/db-connection.js"; 
+
 const app = express();
-const { Pool } = pg;
 
 app.use(bodyParser.json());
 app.use(bodyParser.urlencoded({ extended: true }));
 
-// Constante para el paquete de body-parser
+// Ejemplo: Ruta de prueba para ver si la DB responde
+app.get('/prueba-db', async (req, res) => {
+    try {
+        const result = await pool.query('SELECT NOW()'); // Consulta simple de la hora
+        res.json({ mensaje: 'Base de datos conectada', hora: result.rows[0] });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
 
- // poner a escuchar nuestra aplicación en el puerto 3001
-    app.listen(3001, () => {
-        console.log('Servidor escuchando en el puerto 3001')
-    })
+app.listen(3001, () => {
+    console.log('Servidor escuchando en el puerto 3001');
+});
