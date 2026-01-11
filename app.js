@@ -1,24 +1,34 @@
-import express from "express";
-import bodyParser from "body-parser";
+import express from 'express';
+import cors from 'cors'; // <--- 1. IMPORTAR CORS
+import pool from './config/db-connection.js';
 
-// IMPORTANTE: Aquí importamos tu archivo de conexión desde la carpeta config
-import pool from "./config/db-connection.js"; 
+// Importamos las rutas
+import usuarioRoutes from './routers/usuarios.js';
+import loginRoutes from './routers/login.js'; // <--- 2. IMPORTAR RUTA LOGIN
 
 const app = express();
 
-app.use(bodyParser.json());
-app.use(bodyParser.urlencoded({ extended: true }));
+// Middlewares
+app.use(cors()); // <--- 3. ACTIVAR CORS (Permite que React se conecte)
+app.use(express.json());
 
-// Ejemplo: Ruta de prueba para ver si la DB responde
-app.get('/prueba-db', async (req, res) => {
+// Usamos las rutas
+app.use(usuarioRoutes);
+app.use(loginRoutes); // <--- 4. USAR RUTA LOGIN
+
+// Ruta de prueba de conexión DB
+app.get('/status', async (req, res) => {
     try {
-        const result = await pool.query('SELECT NOW()'); // Consulta simple de la hora
-        res.json({ mensaje: 'Base de datos conectada', hora: result.rows[0] });
-    } catch (error) {
-        res.status(500).json({ error: error.message });
+        const result = await pool.query('SELECT NOW()');
+        res.json({ status: 'ok', db_time: result.rows[0] });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
     }
 });
 
-app.listen(3001, () => {
-    console.log('Servidor escuchando en el puerto 3001');
+const PORT = 3001;
+app.listen(PORT, () => {
+    console.log(`Servidor activo en el puerto ${PORT}`);
 });
+
+export default app;
