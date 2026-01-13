@@ -1,0 +1,10 @@
+# Ignorar las dependencias (muy importante)
+node_modules/
+
+# Archivos de sistema y logs
+.DS_Store
+Thumbs.db
+*.log
+
+# Archivos de variables de entorno (seguridad)
+.env
