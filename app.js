@@ -6,15 +6,29 @@ import pool from './config/db-connection.js';
 import usuarioRoutes from './routers/usuarios.js';
 import loginRoutes from './routers/login.js'; // <--- 2. IMPORTAR RUTA LOGIN
 
+//ANDRES RUTAS
+import categoriasRoutes from './routers/categorias_productos.js';
+import almacenesRoutes from './routers/almacenes.js';
+import productosRoutes from './routers/productos.js';
+
+
 const app = express();
 
 // Middlewares
 app.use(cors()); // <--- 3. ACTIVAR CORS (Permite que React se conecte)
 app.use(express.json());
 
+
 // Usamos las rutas
 app.use(usuarioRoutes);
 app.use(loginRoutes); // <--- 4. USAR RUTA LOGIN
+
+//ANDRES APP.USE
+app.use(categoriasRoutes);
+app.use(almacenesRoutes);
+app.use(productosRoutes);
+
+
 
 // Ruta de prueba de conexión DB
 app.get('/status', async (req, res) => {
