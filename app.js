@@ -10,6 +10,12 @@ import usuarioRoutes from './routers/usuarios.js';
 import categoriasRoutes from './routers/categorias_productos.js';
 import almacenesRoutes from './routers/almacenes.js';
 import productosRoutes from './routers/productos.js';
+import insumosRoutes from './routers/insumos.js';
+import proveedoresRoutes from './routers/proveedores.js';
+import ordenComprasRoutes from './routers/orden_compras.js';
+import detalleOrdenComprasRoutes from './routers/detalle_orden_compras.js';
+import comprasRoutes from './routers/compras.js';
+import detalleComprasRoutes from './routers/detalle_compras.js';
 
 import { authRequired, csrfProtect } from './middleware/auth.js';
 
@@ -50,6 +56,12 @@ app.use(usuarioRoutes);
 app.use(categoriasRoutes);
 app.use(almacenesRoutes);
 app.use(productosRoutes);
+app.use(insumosRoutes);
+app.use(proveedoresRoutes);
+app.use(ordenComprasRoutes);
+app.use(detalleOrdenComprasRoutes);
+app.use(comprasRoutes);
+app.use(detalleComprasRoutes);
 
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
