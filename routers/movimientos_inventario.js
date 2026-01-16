@@ -3,48 +3,49 @@ import pool from '../config/db-connection.js';
 
 const router = express.Router();
 
-// GET: Obtener productos
-router.get('/productos', async (req, res) => {
-  try {
-    const tabla = 'productos';
+// ==============================
+// COMENTARIO EN MAYÚSCULAS: CRUD DE MOVIMIENTOS DE INVENTARIO (KARDEX)
+// TABLA: movimientos_inventario
+// COLUMNAS (SEGÚN LA TABLA QUE CREASTE):
+// id_movimiento, fecha_mov, tipo, cantidad, id_almacen, id_producto, id_insumo, ref_origen, id_ref, descripcion
+// ==============================
 
-    // ==============================
-    // COMENTARIO EN MAYÚSCULAS: SE AGREGA stock_minimo PARA ALERTAS
-    // ==============================
+// GET: Obtener movimientos de inventario
+router.get('/movimientos_inventario', async (req, res) => {
+  try {
+    const tabla = 'movimientos_inventario';
     const columnas =
-      'id_producto, nombre_producto, precio, cantidad, stock_minimo, descripcion_producto, fecha_ingreso_producto, fecha_caducidad, id_categoria_producto, id_almacen, id_tipo_departamento';
+      'id_movimiento, fecha_mov, tipo, cantidad, id_almacen, id_producto, id_insumo, ref_origen, id_ref, descripcion';
 
     const query = 'SELECT function_select($1, $2) as resultado';
     const result = await pool.query(query, [tabla, columnas]);
 
     const datos = result.rows[0].resultado || [];
     res.status(200).json(datos);
-
   } catch (err) {
-    console.error('Error al obtener productos:', err.message);
+    console.error('Error al obtener movimientos_inventario:', err.message);
     res.status(500).json({ error: true, message: err.message });
   }
 });
 
-// POST: Crear producto
-router.post('/productos', async (req, res) => {
+// POST: Crear movimiento
+router.post('/movimientos_inventario', async (req, res) => {
   try {
-    const tabla = 'productos';
+    const tabla = 'movimientos_inventario';
     const datos = req.body;
 
     const query = 'CALL pa_insert($1, $2)';
     await pool.query(query, [tabla, datos]);
 
-    res.status(201).json({ message: 'Producto creado exitosamente.' });
-
+    res.status(201).json({ message: 'Movimiento creado exitosamente.' });
   } catch (err) {
-    console.error('Error al crear producto:', err.message);
+    console.error('Error al crear movimiento_inventario:', err.message);
     res.status(500).json({ error: true, message: err.message });
   }
 });
 
-// PUT: Actualizar producto (1 campo)
-router.put('/productos', async (req, res) => {
+// PUT: Actualizar movimiento (1 campo)
+router.put('/movimientos_inventario', async (req, res) => {
   try {
     const { campo, valor, id_campo, id_valor } = req.body;
 
@@ -52,20 +53,19 @@ router.put('/productos', async (req, res) => {
       return res.status(400).json({ error: true, message: 'Faltan campos obligatorios' });
     }
 
-    const tabla = 'productos';
+    const tabla = 'movimientos_inventario';
     const query = 'CALL pa_update($1, $2, $3, $4, $5)';
     await pool.query(query, [tabla, campo, String(valor), id_campo, String(id_valor)]);
 
-    res.status(200).json({ message: 'Producto actualizado correctamente.' });
-
+    res.status(200).json({ message: 'Movimiento actualizado correctamente.' });
   } catch (err) {
-    console.error('Error al actualizar producto:', err.message);
+    console.error('Error al actualizar movimiento_inventario:', err.message);
     res.status(500).json({ error: true, message: err.message });
   }
 });
 
-// DELETE: Eliminar producto
-router.delete('/productos', async (req, res) => {
+// DELETE: Eliminar movimiento
+router.delete('/movimientos_inventario', async (req, res) => {
   try {
     const { columna_id, valor_id } = req.body;
 
@@ -73,14 +73,13 @@ router.delete('/productos', async (req, res) => {
       return res.status(400).json({ error: true, message: 'Faltan datos para eliminar' });
     }
 
-    const tabla = 'productos';
+    const tabla = 'movimientos_inventario';
     const query = 'CALL pa_delete($1, $2, $3)';
     await pool.query(query, [tabla, columna_id, String(valor_id)]);
 
-    res.status(200).json({ message: 'Producto eliminado.' });
-
+    res.status(200).json({ message: 'Movimiento eliminado.' });
   } catch (err) {
-    console.error('Error al eliminar producto:', err.message);
+    console.error('Error al eliminar movimiento_inventario:', err.message);
     res.status(500).json({ error: true, message: err.message });
   }
 });

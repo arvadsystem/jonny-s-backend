@@ -7,8 +7,12 @@ const router = express.Router();
 router.get('/insumos', async (req, res) => {
   try {
     const tabla = 'insumos';
+
+    // ==============================
+    // COMENTARIO EN MAYÚSCULAS: SE AGREGA stock_minimo PARA ALERTAS
+    // ==============================
     const columnas =
-      'id_insumo, nombre_insumo, precio, cantidad, fecha_ingreso_insumo, id_almacen, fecha_caducidad, descripcion';
+      'id_insumo, nombre_insumo, precio, cantidad, stock_minimo, fecha_ingreso_insumo, id_almacen, fecha_caducidad, descripcion';
 
     const query = 'SELECT function_select($1, $2) as resultado';
     const result = await pool.query(query, [tabla, columnas]);

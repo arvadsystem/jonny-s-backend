@@ -17,6 +17,14 @@ import detalleOrdenComprasRoutes from './routers/detalle_orden_compras.js';
 import comprasRoutes from './routers/compras.js';
 import detalleComprasRoutes from './routers/detalle_compras.js';
 
+// ✅ CAMBIO: ESTE ARCHIVO EXISTE COMO "tipos_departamentos.js"
+import tipoDepartamentoRoutes from './routers/tipos_departamentos.js';
+
+// ==============================
+// COMENTARIO EN MAYÚSCULAS: NUEVO ROUTER PARA KARDEX (MOVIMIENTOS DE INVENTARIO)
+// ==============================
+import movimientosInventarioRoutes from './routers/movimientos_inventario.js';
+
 import { authRequired, csrfProtect } from './middleware/auth.js';
 
 const app = express();
@@ -35,7 +43,7 @@ app.use(
 app.use(express.json());
 app.use(cookieParser());
 
-// Rutas públicas
+// RUTAS PUBLICAS
 app.get('/status', async (req, res) => {
   try {
     const result = await pool.query('SELECT NOW()');
@@ -47,11 +55,11 @@ app.get('/status', async (req, res) => {
 
 app.use(loginRoutes);
 
-// Rutas protegidas (JWT + CSRF)
+// RUTAS PROTEGIDAS (JWT + CSRF)
 app.use(authRequired);
 app.use(csrfProtect);
 
-// CRUD protegido
+// CRUD PROTEGIDO
 app.use(usuarioRoutes);
 app.use(categoriasRoutes);
 app.use(almacenesRoutes);
@@ -62,6 +70,12 @@ app.use(ordenComprasRoutes);
 app.use(detalleOrdenComprasRoutes);
 app.use(comprasRoutes);
 app.use(detalleComprasRoutes);
+app.use(tipoDepartamentoRoutes);
+
+// ==============================
+// COMENTARIO EN MAYÚSCULAS: ACTIVAR ENDPOINTS DE MOVIMIENTOS_INVENTARIO
+// ==============================
+app.use(movimientosInventarioRoutes);
 
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
