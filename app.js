@@ -17,12 +17,10 @@ import detalleOrdenComprasRoutes from './routers/detalle_orden_compras.js';
 import comprasRoutes from './routers/compras.js';
 import detalleComprasRoutes from './routers/detalle_compras.js';
 
-// ✅ CAMBIO: ESTE ARCHIVO EXISTE COMO "tipos_departamentos.js"
+// ESTE ARCHIVO EXISTE COMO "tipos_departamentos.js"
 import tipoDepartamentoRoutes from './routers/tipos_departamentos.js';
 
-// ==============================
-// COMENTARIO EN MAYÚSCULAS: NUEVO ROUTER PARA KARDEX (MOVIMIENTOS DE INVENTARIO)
-// ==============================
+
 import movimientosInventarioRoutes from './routers/movimientos_inventario.js';
 
 import { authRequired, csrfProtect } from './middleware/auth.js';
@@ -72,9 +70,7 @@ app.use(comprasRoutes);
 app.use(detalleComprasRoutes);
 app.use(tipoDepartamentoRoutes);
 
-// ==============================
-// COMENTARIO EN MAYÚSCULAS: ACTIVAR ENDPOINTS DE MOVIMIENTOS_INVENTARIO
-// ==============================
+
 app.use(movimientosInventarioRoutes);
 
 const PORT = process.env.PORT || 3001;

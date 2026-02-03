@@ -4,9 +4,9 @@ import pool from '../config/db-connection.js';
 const router = express.Router();
 
 // ==============================
-// COMENTARIO EN MAYÚSCULAS: CRUD DE MOVIMIENTOS DE INVENTARIO (KARDEX)
+// CRUD DE MOVIMIENTOS DE INVENTARIO (KARDEX)
 // TABLA: movimientos_inventario
-// COLUMNAS (SEGÚN LA TABLA QUE CREASTE):
+// COLUMNAS 
 // id_movimiento, fecha_mov, tipo, cantidad, id_almacen, id_producto, id_insumo, ref_origen, id_ref, descripcion
 // ==============================
 

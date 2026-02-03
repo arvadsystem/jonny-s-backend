@@ -9,7 +9,7 @@ router.get('/productos', async (req, res) => {
     const tabla = 'productos';
 
     // ==============================
-    // COMENTARIO EN MAYÚSCULAS: SE AGREGA stock_minimo PARA ALERTAS
+    // SE AGREGA stock_minimo PARA ALERTAS
     // ==============================
     const columnas =
       'id_producto, nombre_producto, precio, cantidad, stock_minimo, descripcion_producto, fecha_ingreso_producto, fecha_caducidad, id_categoria_producto, id_almacen, id_tipo_departamento';

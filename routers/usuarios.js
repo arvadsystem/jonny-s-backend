@@ -37,15 +37,15 @@ router.post('/usuarios', async (req, res) => {
         const tabla = 'usuarios';
         const datosUsuario = req.body; 
         
-        /* IMPORTANTE: 
-           Desde Postman debes enviar el JSON con las llaves correctas:
-           {
-             "nombre_usuario": "Juan",
-             "clave": "12345",
-             "estado": true,
-             "id_empleado": 1
-           }
-        */
+/* IMPORTANTE: 
+Desde Postman debes enviar el JSON con las llaves correctas:
+{
+"nombre_usuario": "Juan",
+"clave": "12345",
+"estado": true,
+"id_empleado": 1
+}
+*/
 
         const query = 'CALL pa_insert($1, $2)';
         await pool.query(query, [tabla, datosUsuario]);
@@ -71,14 +71,14 @@ router.put('/usuarios', async (req, res) => {
 
         const tabla = 'usuarios';
         
-        /* EN POSTMAN, para actualizar el nombre del usuario 1, enviarías:
-           {
-             "campo": "nombre_usuario",
-             "valor": "NuevoNombre",
-             "id_campo": "id_usuario",   <-- OJO AQUÍ: id_usuario
-             "id_valor": 1
-           }
-        */
+/* EN POSTMAN, para actualizar el nombre del usuario 1, enviarías:
+{
+"campo": "nombre_usuario",
+"valor": "NuevoNombre",
+"id_campo": "id_usuario",   <-- OJO AQUÍ: id_usuario
+"id_valor": 1 
+}
+*/
 
         const strNuevoDato = String(valor);
         const strValorCondicion = String(id_valor);

@@ -12,7 +12,7 @@ const cookieConfig = () => {
   const isProd = process.env.NODE_ENV === 'production';
   return {
     sameSite: isProd ? 'none' : 'lax',
-    secure: isProd, // en producción debe ser HTTPS si sameSite='none'
+    secure: isProd, 
     path: '/'
   };
 };
@@ -67,7 +67,7 @@ router.post('/login', async (req, res) => {
     return res.json({
       message: 'Login exitoso',
       usuario: payload,
-      csrfToken // opcional, útil si quieres ver/debug, pero el frontend puede leer la cookie también
+      csrfToken // opcional, útil para ver/debug, pero el frontend puede leer la cookie también
     });
   } catch (error) {
     console.error('Error en el login:', error);
