@@ -23,6 +23,8 @@ import tipoDepartamentoRoutes from './routers/tipos_departamentos.js';
 
 import movimientosInventarioRoutes from './routers/movimientos_inventario.js';
 
+import comboPromoRoutes from './routers/combo_promo.js';
+
 import { authRequired, csrfProtect } from './middleware/auth.js';
 
 const app = express();
@@ -69,6 +71,7 @@ app.use(detalleOrdenComprasRoutes);
 app.use(comprasRoutes);
 app.use(detalleComprasRoutes);
 app.use(tipoDepartamentoRoutes);
+app.use(comboPromoRoutes);
 
 
 app.use(movimientosInventarioRoutes);
