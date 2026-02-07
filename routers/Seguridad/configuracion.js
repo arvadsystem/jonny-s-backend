@@ -6,13 +6,15 @@
 import express from 'express';
 import pool from '../../config/db-connection.js';
 
+import { checkPermission } from '../../middleware/checkPermission.js';
+
 const router = express.Router();
 
 /**
  * GET /seguridad/configuracion/password
  * Retorna políticas actuales (password_*).
  */
-router.get('/configuracion/password', async (req, res) => {
+router.get('/configuracion/password', checkPermission('SEGURIDAD_VER'), async (req, res) => {
   try {
     const sql = `
       SELECT clave, valor, descripcion
@@ -41,7 +43,7 @@ router.get('/configuracion/password', async (req, res) => {
  *   "password_require_symbol": "false"
  * }
  */
-router.put('/configuracion/password', async (req, res) => {
+router.put('/configuracion/password', checkPermission('SEGURIDAD_CONFIG_EDITAR'), async (req, res) => {
   const client = await pool.connect();
 
   try {

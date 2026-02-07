@@ -6,6 +6,7 @@
 import express from 'express';
 import pool from '../../config/db-connection.js';
 import { closeSession } from '../../utils/security/sessionService.js';
+import { checkPermission } from '../../middleware/checkPermission.js';
 
 const router = express.Router();
 
@@ -13,7 +14,7 @@ const router = express.Router();
  * GET /seguridad/sesiones
  * Lista sesiones del usuario autenticado.
  */
-router.get('/sesiones', async (req, res) => {
+router.get('/sesiones', checkPermission('SEGURIDAD_VER'), async (req, res) => {
   try {
     const user = req.user || req.usuario;
     if (!user?.id_usuario) {
@@ -51,7 +52,7 @@ router.get('/sesiones', async (req, res) => {
  * Cierra (remotamente) una sesión por id_sesion.
  * Body: { id_sesion: "uuid..." }
  */
-router.post('/sesiones/cerrar', async (req, res) => {
+router.post('/sesiones/cerrar', checkPermission('SEGURIDAD_SESIONES_CERRAR'), async (req, res) => {
   try {
     const user = req.user || req.usuario;
     const { id_sesion } = req.body;
@@ -88,7 +89,7 @@ router.post('/sesiones/cerrar', async (req, res) => {
  * POST /seguridad/sesiones/cerrar-otras
  * Cierra todas las sesiones activas del usuario EXCEPTO la sesión actual (sid del JWT).
  */
-router.post('/sesiones/cerrar-otras', async (req, res) => {
+router.post('/sesiones/cerrar-otras', checkPermission('SEGURIDAD_SESIONES_CERRAR'), async (req, res) => {
   try {
     const user = req.user || req.usuario;
     if (!user?.id_usuario) {
