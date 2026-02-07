@@ -19,6 +19,8 @@ import comprasRoutes from './routers/compras.js';
 import detalleComprasRoutes from './routers/detalle_compras.js';
 import tipoDepartamentoRoutes from './routers/tipos_departamentos.js';
 import movimientosInventarioRoutes from './routers/movimientos_inventario.js';
+import perfilRoutes from './routers/perfil.js';
+
 
 // Seguridad
 import seguridadSesionesRoutes from './routers/seguridad/sesiones.js';
@@ -66,6 +68,8 @@ app.use(authRequired);               // 1) valida JWT
 app.use(requireActiveSession);       // 2) valida sesión activa en BD
 app.use(touchSessionMiddleware);     // 3) actualiza ultima_actividad
 app.use(csrfProtect);                // 4) CSRF para no-GET
+app.use(perfilRoutes);
+
 
 // ✅ 4) Rutas protegidas
 app.use('/seguridad', seguridadSesionesRoutes);
