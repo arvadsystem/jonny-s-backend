@@ -21,10 +21,12 @@ import tipoDepartamentoRoutes from './routers/tipos_departamentos.js';
 import movimientosInventarioRoutes from './routers/movimientos_inventario.js';
 
 // Seguridad
-import seguridadSesionesRoutes from './routers/Seguridad/sesiones.js';
+import seguridadSesionesRoutes from './routers/seguridad/sesiones.js';
 
 import { authRequired, csrfProtect } from './middleware/auth.js';
 import { touchSessionMiddleware } from './middleware/touchSession.js';
+import { requireActiveSession } from './middleware/requireActiveSession.js';
+
 
 const app = express();
 
@@ -60,8 +62,10 @@ app.get('/status', async (req, res) => {
 app.use(loginRoutes);
 
 // ✅ 3) A partir de aquí: todo protegido
-app.use(authRequired, touchSessionMiddleware);
-app.use(csrfProtect);
+app.use(authRequired);               // 1) valida JWT
+app.use(requireActiveSession);       // 2) valida sesión activa en BD
+app.use(touchSessionMiddleware);     // 3) actualiza ultima_actividad
+app.use(csrfProtect);                // 4) CSRF para no-GET
 
 // ✅ 4) Rutas protegidas
 app.use('/seguridad', seguridadSesionesRoutes);
