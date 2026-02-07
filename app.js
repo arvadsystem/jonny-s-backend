@@ -24,7 +24,7 @@ import perfilRoutes from './routers/perfil.js';
 
 // Seguridad
 import seguridadSesionesRoutes from './routers/seguridad/sesiones.js';
-
+import seguridadConfigRoutes from './routers/seguridad/configuracion.js';
 import { authRequired, csrfProtect } from './middleware/auth.js';
 import { touchSessionMiddleware } from './middleware/touchSession.js';
 import { requireActiveSession } from './middleware/requireActiveSession.js';
@@ -73,6 +73,7 @@ app.use(perfilRoutes);
 
 // ✅ 4) Rutas protegidas
 app.use('/seguridad', seguridadSesionesRoutes);
+app.use('/seguridad', seguridadConfigRoutes);
 
 app.use(usuarioRoutes);
 app.use(categoriasRoutes);
