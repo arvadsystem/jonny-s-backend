@@ -17,6 +17,12 @@ import detalleOrdenComprasRoutes from './routers/detalle_orden_compras.js';
 import comprasRoutes from './routers/compras.js';
 import detalleComprasRoutes from './routers/detalle_compras.js';
 
+//MODULO PERSONAS
+import personasRoutes from './routers/personas.js';
+import telefonosRoutes from './routers/telefonos.js';
+import direccionesRoutes from './routers/direcciones.js';
+import correosRoutes from './routers/correos.js';
+
 // ESTE ARCHIVO EXISTE COMO "tipos_departamentos.js"
 import tipoDepartamentoRoutes from './routers/tipos_departamentos.js';
 
@@ -70,6 +76,11 @@ app.use(comprasRoutes);
 app.use(detalleComprasRoutes);
 app.use(tipoDepartamentoRoutes);
 
+//MODULO PERSONAS 
+app.use(personasRoutes);
+app.use(telefonosRoutes);
+app.use(direccionesRoutes);
+app.use(correosRoutes);
 
 app.use(movimientosInventarioRoutes);
 
