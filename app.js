@@ -16,6 +16,8 @@ import ordenComprasRoutes from './routers/orden_compras.js';
 import detalleOrdenComprasRoutes from './routers/detalle_orden_compras.js';
 import comprasRoutes from './routers/compras.js';
 import detalleComprasRoutes from './routers/detalle_compras.js';
+import sucursalesRoutes from './routers/sucursales.js';
+import menuPosRouter from './routers/menu_pos.js'; // // Router del POS Menú 
 
 //MODULO PERSONAS
 import personasRoutes from './routers/personas.js';
@@ -28,6 +30,8 @@ import tipoDepartamentoRoutes from './routers/tipos_departamentos.js';
 
 
 import movimientosInventarioRoutes from './routers/movimientos_inventario.js';
+
+import comboPromoRoutes from './routers/combo_promo.js';
 
 import { authRequired, csrfProtect } from './middleware/auth.js';
 
@@ -75,12 +79,15 @@ app.use(detalleOrdenComprasRoutes);
 app.use(comprasRoutes);
 app.use(detalleComprasRoutes);
 app.use(tipoDepartamentoRoutes);
+app.use(sucursalesRoutes);
 
 //MODULO PERSONAS 
 app.use(personasRoutes);
 app.use(telefonosRoutes);
 app.use(direccionesRoutes);
 app.use(correosRoutes);
+app.use(comboPromoRoutes);
+app.use(menuPosRouter); // // Monta las rutas del POS Menú
 
 app.use(movimientosInventarioRoutes);
 
