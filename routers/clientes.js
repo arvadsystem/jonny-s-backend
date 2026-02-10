@@ -1,76 +1,59 @@
 import express from 'express';
 import pool from '../config/db-connection.js';
 
-const router = express.Router();
+const router = express.Router();  
 
 /* =======================
-   GET - PERSONAS CON DETALLE (JOINS)
+   GET - LISTAR CLIENTES
 ======================= */
-router.get('/personas-detalle', async (req, res) => {
+router.get('/clientes', async (req, res) => {
   try {
+    const tabla = 'clientes';
+    const columnas = 'id_cliente, fecha_ingreso, puntos, id_tipo_cliente, id_persona, id_empresa, estado';
 
-    const query = `
-      SELECT 
-        p.id_persona,
-        p.nombre,
-        p.apellido,
-        p.fecha_nacimiento,
-        p.genero,
-        p.dni,
-        p.rtn,
+    const query = 'SELECT function_select($1, $2) as resultado';
+    const result = await pool.query(query, [tabla, columnas]);
 
-        t.telefono AS telefono,
-        d.direccion AS direccion,
-        c.direccion_correo AS correo
-
-      FROM personas p
-      LEFT JOIN telefonos t ON t.id_telefono = p.id_telefono
-      LEFT JOIN direcciones d ON d.id_direccion = p.id_direccion
-      LEFT JOIN correos c ON c.id_correo = p.id_correo
-
-      ORDER BY p.id_persona;
-    `;
-
-    const result = await pool.query(query);
-    res.status(200).json(result.rows);
-
+    const datos = result.rows[0].resultado || [];
+    res.status(200).json(datos);
   } catch (err) {
-    console.error('Error al obtener personas detalle:', err.message);
+    console.error('Error al obtener el cliente:', err.message);
     res.status(500).json({ error: true, message: err.message });
   }
 });
 
 
 /* =======================
-   GET - PERSONA POR ID
+   GET - LISTAR CLIENTES POR ID
 ======================= */
-router.get('/personas/:id', async (req, res) => {
+router.get('/clientes/:id', async (req, res) => {
   try {
     const { id } = req.params;
 
-    const tabla = 'personas';
-    const columnas ='id_persona, nombre, apellido, fecha_nacimiento, genero, dni, rtn, id_telefono, id_direccion, id_correo';
+    const tabla = 'clientes';
+    const columnas = 'id_cliente, fecha_ingreso, puntos, id_tipo_cliente, id_persona, id_empresa, estado';
 
     const query = 'SELECT function_select($1::TEXT, $2::TEXT) AS resultado';
     const result = await pool.query(query, [tabla, columnas]);
 
     const datos = result.rows[0].resultado || [];
 
-    const persona = datos.find(
-      p => String(p.id_persona) === String(id)
+    // FILTRAR SOLO LA EMPRESA POR ID
+    const clientes = datos.find(
+      e => String(e.id_cliente) === String(id)
     );
 
-    if (!persona) {
+    if (!clientes) {
       return res.status(404).json({
         error: true,
-        message: 'Persona no encontrada'
+        message: 'Cliente no encontrado'
       });
     }
 
-    res.status(200).json(persona);
+    res.status(200).json(clientes);
 
   } catch (err) {
-    console.error('Error al obtener persona:', err.message);
+    console.error('Error al obtener el cliente:', err.message);
     res.status(500).json({
       error: true,
       message: err.message
@@ -78,30 +61,28 @@ router.get('/personas/:id', async (req, res) => {
   }
 });
 
-
 /* =======================
-   POST - INSERTAR
+   POST - INSERTAR CLIENTES
 ======================= */
-router.post('/personas', async (req, res) => {
+router.post('/clientes', async (req, res) => {
   try {
-    const tabla = 'personas';
+    const tabla = 'clientes';
     const datos = req.body;
 
     const query = 'CALL pa_insert($1, $2)';
     await pool.query(query, [tabla, datos]);
 
-    res.status(201).json({ message: 'Persona creada exitosamente.' });
+    res.status(201).json({ message: 'Cliente creado exitosamente.' });
   } catch (err) {
-    console.error('Error al crear persona:', err.message);
+    console.error('Error al crear el cliente:', err.message);
     res.status(500).json({ error: true, message: err.message });
   }
 });
 
-
 /* =======================
-   PUT - ACTUALIZAR
+   PUT - ACTUALIZAR LOS CLIENTES
 ======================= */
-router.put('/personas/:id', async (req, res) => {
+router.put('/clientes/:id', async (req, res) => {
   try {
     const { campo, valor } = req.body;
     const { id } = req.params;
@@ -113,7 +94,7 @@ router.put('/personas/:id', async (req, res) => {
       });
     }
 
-    const tabla = 'personas';
+    const tabla = 'clientes';
 
     await pool.query(
       'CALL pa_update($1::TEXT, $2::TEXT, $3::TEXT, $4::TEXT, $5::TEXT)',
@@ -121,18 +102,18 @@ router.put('/personas/:id', async (req, res) => {
         tabla,
         campo,
         String(valor),
-        'id_persona',
+        'id_cliente',
         String(id)
       ]
     );
 
     res.status(200).json({
       error: false,
-      message: 'Persona actualizada correctamente'
+      message: 'Cliente actualizado correctamente'
     });
 
   } catch (err) {
-    console.error('Error al actualizar persona:', err.message);
+    console.error('Error al actualizar el cliente:', err.message);
     res.status(500).json({
       error: true,
       message: err.message
@@ -140,31 +121,31 @@ router.put('/personas/:id', async (req, res) => {
   }
 });
 
-
 /* =======================
-   DELETE - ELIMINAR
+   DELETE - ELIMINAR LOS CLIENTES
 ======================= */
-router.delete('/personas/:id', async (req, res) => {
+router.delete('/clientes/:id', async (req, res) => {
   try {
     const { id } = req.params;
 
     await pool.query(
       'CALL pa_delete($1::TEXT, $2::TEXT, $3::TEXT)',
-      ['personas', 'id_persona', String(id)]
+      ['clientes', 'id_cliente', String(id)]
     );
 
     res.status(200).json({
       error: false,
-      message: 'Persona eliminada correctamente'
+      message: 'Cliente eliminado correctamente'
     });
 
   } catch (err) {
-    console.error('Error al eliminar persona:', err.message);
+    console.error('Error al eliminar el cliente:', err.message);
     res.status(500).json({
       error: true,
       message: err.message
     });
   }
 });
+
 
 export default router;

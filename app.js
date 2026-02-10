@@ -19,6 +19,12 @@ import detalleComprasRoutes from './routers/detalle_compras.js';
 import sucursalesRoutes from './routers/sucursales.js';
 import menuPosRouter from './routers/menu_pos.js'; // // Router del POS Menú 
 
+//MODULO PERSONAS
+import personasRoutes from './routers/personas.js';
+import telefonosRoutes from './routers/telefonos.js';
+import direccionesRoutes from './routers/direcciones.js';
+import correosRoutes from './routers/correos.js';
+
 // ESTE ARCHIVO EXISTE COMO "tipos_departamentos.js"
 import tipoDepartamentoRoutes from './routers/tipos_departamentos.js';
 
@@ -75,6 +81,11 @@ app.use(detalleComprasRoutes);
 app.use(tipoDepartamentoRoutes);
 app.use(sucursalesRoutes);
 
+//MODULO PERSONAS 
+app.use(personasRoutes);
+app.use(telefonosRoutes);
+app.use(direccionesRoutes);
+app.use(correosRoutes);
 app.use(comboPromoRoutes);
 app.use(menuPosRouter); // // Monta las rutas del POS Menú
 
