@@ -16,6 +16,7 @@ import ordenComprasRoutes from './routers/orden_compras.js';
 import detalleOrdenComprasRoutes from './routers/detalle_orden_compras.js';
 import comprasRoutes from './routers/compras.js';
 import detalleComprasRoutes from './routers/detalle_compras.js';
+import sucursalesRoutes from './routers/sucursales.js';
 
 // ESTE ARCHIVO EXISTE COMO "tipos_departamentos.js"
 import tipoDepartamentoRoutes from './routers/tipos_departamentos.js';
@@ -69,6 +70,7 @@ app.use(detalleOrdenComprasRoutes);
 app.use(comprasRoutes);
 app.use(detalleComprasRoutes);
 app.use(tipoDepartamentoRoutes);
+app.use(sucursalesRoutes);
 
 
 app.use(movimientosInventarioRoutes);
