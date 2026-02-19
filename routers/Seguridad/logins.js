@@ -11,7 +11,7 @@
 import express from "express";
 import pool from "../../config/db-connection.js";
 import { checkPermission } from "../../middleware/checkPermission.js";
-
+import { timestampAsHNToISO } from "../../utils/dates.js";
 const router = express.Router();
 
 // Puedes cambiarlo por otro permiso si deseas:
@@ -51,6 +51,9 @@ router.get("/logins", checkPermission(PERMISO_VER), async (req, res) => {
       }
     }
 
+    // ✅ IMPORTANTE: como la columna es timestamp sin TZ,
+    // aquí NO convertimos. Solo filtramos con Date normal.
+    // (Si quieres exactitud por TZ en filtros, luego lo afinamos.)
     if (desde) {
       where.push(`l.fecha_hora >= $${i++}`);
       params.push(new Date(desde));
@@ -108,12 +111,18 @@ router.get("/logins", checkPermission(PERMISO_VER), async (req, res) => {
 
     const dataRes = await pool.query(dataSql, [...params, lim, off]);
 
+    // ✅ Convertir fecha_hora a ISO con Z (asumiendo Honduras)
+    const rows = dataRes.rows.map((r) => ({
+      ...r,
+      fecha_hora: timestampAsHNToISO(r.fecha_hora),
+    }));
+
     return res.json({
       error: false,
       total,
       limit: lim,
       offset: off,
-      rows: dataRes.rows,
+      rows,
     });
   } catch (err) {
     console.error("GET /seguridad/logins error:", err.message);

@@ -7,7 +7,7 @@ import express from 'express';
 import pool from '../../config/db-connection.js';
 import { closeSession } from '../../utils/security/sessionService.js';
 import { checkPermission } from '../../middleware/checkPermission.js';
-
+import { timestampAsHNToISO } from "../../utils/dates.js";
 const router = express.Router();
 
 /**
@@ -33,19 +33,30 @@ router.get('/sesiones', checkPermission('SEGURIDAD_VER'), async (req, res) => {
         ultima_actividad,
         activa,
         fecha_cierre,
-        motivo_cierre
+        motivo_cierre,
+        (id_sesion = $2) AS es_actual
       FROM sesiones_activas
       WHERE id_usuario = $1
       ORDER BY activa DESC, ultima_actividad DESC
     `;
 
-    const result = await pool.query(sql, [user.id_usuario]);
-    return res.json({ error: false, sesiones: result.rows });
+    const result = await pool.query(sql, [user.id_usuario, user.sid]);
+
+    // ✅ Convertir timestamps sin TZ (HN) -> ISO UTC con Z
+    const sesiones = result.rows.map((s) => ({
+      ...s,
+      fecha_inicio: timestampAsHNToISO(s.fecha_inicio),
+      ultima_actividad: timestampAsHNToISO(s.ultima_actividad),
+      fecha_cierre: timestampAsHNToISO(s.fecha_cierre),
+    }));
+
+    return res.json({ error: false, sesiones });
   } catch (err) {
     console.error('GET /seguridad/sesiones error:', err);
     return res.status(500).json({ error: true, message: 'Error interno del servidor' });
   }
 });
+
 
 /**
  * POST /seguridad/sesiones/cerrar
