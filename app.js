@@ -43,6 +43,9 @@ import { authRequired, csrfProtect } from './middleware/auth.js';
 import { touchSessionMiddleware } from './middleware/touchSession.js';
 import { requireActiveSession } from './middleware/requireActiveSession.js';
 
+// Parametros
+import catalogosRoutes from './routers/Parametros/catalogos.js';
+
 
 const app = express();
 
@@ -90,6 +93,9 @@ app.use('/seguridad', seguridadSesionesRoutes);
 app.use('/seguridad', seguridadConfigRoutes);
 app.use('/seguridad', seguridadLoginsRoutes);
 app.use("/seguridad", seguridadPermisosRoutes);
+
+// Parametros
+app.use('/parametros/catalogos', catalogosRoutes);
 
 app.use(usuarioRoutes);
 app.use(categoriasRoutes);
