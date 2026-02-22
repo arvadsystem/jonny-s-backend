@@ -4,10 +4,10 @@ import jwt from 'jsonwebtoken';
 import crypto from 'crypto';
 import { authRequired } from '../middleware/auth.js';
 
-//helpers de HU78
+// helpers de HU78
 import { getClientIp, parseUserAgent } from '../utils/security/clientInfo.js';
 import { insertLoginLog } from '../utils/security/loginLogger.js';
-import { createSession } from '../utils/security/sessionService.js';
+import { createSession, closeSession } from '../utils/security/sessionService.js';
 
 const router = express.Router();
 
@@ -58,7 +58,7 @@ router.post('/login', async (req, res) => {
         dispositivo,
         navegador,
         sistema_operativo,
-        ubicacion: null, // opcional (luego HU78.4 si quieres GeoIP)
+        ubicacion: null,
         exito: false,
         mensaje_error: 'Usuario o contraseña incorrectos'
       });
@@ -79,7 +79,6 @@ router.post('/login', async (req, res) => {
       ubicacion: null
     });
 
-
     // Payload actual (no lo rompemos)
     const payload = {
       id_usuario: usuarioEncontrado.id_usuario,
@@ -87,7 +86,6 @@ router.post('/login', async (req, res) => {
       rol: usuarioEncontrado.id_empleado,
       sid: id_sesion // HU79: id de sesión actual
     };
-
 
     const token = jwt.sign(payload, JWT_SECRET, { expiresIn: '8h' });
 
@@ -101,7 +99,7 @@ router.post('/login', async (req, res) => {
 
     const csrfToken = issueCsrf(res);
 
-    // Login exitoso: registrar intento (por ahora sin id_sesion)
+    // Login exitoso: registrar intento
     await insertLoginLog({
       id_usuario: usuarioEncontrado.id_usuario,
       id_sesion: id_sesion,
@@ -124,7 +122,7 @@ router.post('/login', async (req, res) => {
   } catch (error) {
     console.error('Error en el login:', error);
 
-    // ✅ Si ocurre error interno, también logueamos (útil para auditoría)
+    // ✅ Si ocurre error interno, también logueamos
     try {
       await insertLoginLog({
         id_usuario: null,
@@ -140,7 +138,6 @@ router.post('/login', async (req, res) => {
         mensaje_error: 'Error interno del servidor'
       });
     } catch (e) {
-      // Si el log falla, no detenemos la respuesta principal
       console.error('No se pudo insertar logins:', e);
     }
 
@@ -148,9 +145,22 @@ router.post('/login', async (req, res) => {
   }
 });
 
-
-router.post('/logout', (req, res) => {
+/**
+ * ✅ FIX: Logout debe cerrar la sesión activa en la BD (sesiones_activas)
+ * usando el sid del JWT, y luego limpiar cookies.
+ */
+router.post('/logout', authRequired, async (req, res) => {
   const base = cookieConfig();
+
+  try {
+    const sid = req.user?.sid;
+    if (sid) {
+      await closeSession(sid, 'logout');
+    }
+  } catch (err) {
+    console.error('Error cerrando sesión en BD (logout):', err);
+    // No bloqueamos el logout aunque falle el cierre en BD
+  }
 
   res.clearCookie('access_token', base);
   res.clearCookie('csrf_token', base);

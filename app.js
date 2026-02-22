@@ -36,6 +36,7 @@ import perfilRoutes from './routers/perfil.js';
 import seguridadSesionesRoutes from './routers/seguridad/sesiones.js';
 import seguridadConfigRoutes from './routers/seguridad/configuracion.js';
 import seguridadLoginsRoutes from './routers/seguridad/logins.js';
+import seguridadPermisosRoutes from "./routers/seguridad/permisos.js";
 import comboPromoRoutes from './routers/combo_promo.js';
 
 import { authRequired, csrfProtect } from './middleware/auth.js';
@@ -88,6 +89,7 @@ app.use(perfilRoutes);
 app.use('/seguridad', seguridadSesionesRoutes);
 app.use('/seguridad', seguridadConfigRoutes);
 app.use('/seguridad', seguridadLoginsRoutes);
+app.use("/seguridad", seguridadPermisosRoutes);
 
 app.use(usuarioRoutes);
 app.use(categoriasRoutes);
