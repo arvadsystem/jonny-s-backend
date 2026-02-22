@@ -3,9 +3,19 @@ import pool from '../config/db-connection.js';
 
 const router = express.Router();
 
+const MAX_LIMIT = 100;
+
+const isPlainObject = (value) =>
+  value !== null && typeof value === 'object' && !Array.isArray(value);
+
+const parsePositiveInt = (value) => {
+  const parsed = Number.parseInt(value, 10);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : null;
+};
+
 /* =======================
    GET - PERSONAS CON DETALLE (JOINS)
-======================= */
+======================= 
 router.get('/personas-detalle', async (req, res) => {
   try {
 
@@ -38,7 +48,70 @@ router.get('/personas-detalle', async (req, res) => {
     console.error('Error al obtener personas detalle:', err.message);
     res.status(500).json({ error: true, message: err.message });
   }
+});*/
+
+router.get('/personas-detalle', async (req, res) => {
+  try {
+    const pageParam = req.query.page;
+    const limitParam = req.query.limit;
+
+    const page = pageParam === undefined ? 1 : parsePositiveInt(pageParam);
+    const limitRaw = limitParam === undefined ? 10 : parsePositiveInt(limitParam);
+
+    if (!page || !limitRaw) {
+      return res.status(400).json({
+        error: true,
+        message: 'Los parámetros page y limit deben ser enteros positivos'
+      });
+    }
+
+    const limit = Math.min(limitRaw, MAX_LIMIT);
+
+    const offset = (page - 1) * limit;
+
+    // consulta datos
+    const dataQuery = `
+      SELECT 
+        p.id_persona,
+        p.nombre,
+        p.apellido,
+        p.fecha_nacimiento,
+        p.genero,
+        p.dni,
+        p.rtn,
+        t.telefono,
+        d.direccion,
+        c.direccion_correo AS correo
+      FROM personas p
+      LEFT JOIN telefonos t ON t.id_telefono = p.id_telefono
+      LEFT JOIN direcciones d ON d.id_direccion = p.id_direccion
+      LEFT JOIN correos c ON c.id_correo = p.id_correo
+      ORDER BY p.id_persona
+      LIMIT $1 OFFSET $2;
+    `;
+
+    // total registros
+    const totalQuery = `SELECT COUNT(*) FROM personas`;
+
+    const [data, total] = await Promise.all([
+      pool.query(dataQuery, [limit, offset]),
+      pool.query(totalQuery)
+    ]);
+
+    res.status(200).json({
+      data: data.rows,
+      total: Number(total.rows[0].count),
+      page,
+      limit
+    });
+
+  } catch (err) {
+    console.error('Error al obtener personas detalle:', err.message);
+    res.status(500).json({ error: true, message: 'Error interno del servidor' });
+  }
 });
+
+
 
 
 /* =======================
@@ -48,17 +121,32 @@ router.get('/personas/:id', async (req, res) => {
   try {
     const { id } = req.params;
 
-    const tabla = 'personas';
-    const columnas ='id_persona, nombre, apellido, fecha_nacimiento, genero, dni, rtn, id_telefono, id_direccion, id_correo';
+    const idPersona = parsePositiveInt(id);
+    if (!idPersona) {
+      return res.status(400).json({
+        error: true,
+        message: 'El id debe ser un entero positivo'
+      });
+    }
 
-    const query = 'SELECT function_select($1::TEXT, $2::TEXT) AS resultado';
-    const result = await pool.query(query, [tabla, columnas]);
-
-    const datos = result.rows[0].resultado || [];
-
-    const persona = datos.find(
-      p => String(p.id_persona) === String(id)
-    );
+    const query = `
+      SELECT
+        id_persona,
+        nombre,
+        apellido,
+        fecha_nacimiento,
+        genero,
+        dni,
+        rtn,
+        id_telefono,
+        id_direccion,
+        id_correo
+      FROM personas
+      WHERE id_persona = $1
+      LIMIT 1;
+    `;
+    const result = await pool.query(query, [idPersona]);
+    const persona = result.rows[0];
 
     if (!persona) {
       return res.status(404).json({
@@ -73,7 +161,7 @@ router.get('/personas/:id', async (req, res) => {
     console.error('Error al obtener persona:', err.message);
     res.status(500).json({
       error: true,
-      message: err.message
+      message: 'Error interno del servidor'
     });
   }
 });
@@ -87,13 +175,20 @@ router.post('/personas', async (req, res) => {
     const tabla = 'personas';
     const datos = req.body;
 
+    if (!isPlainObject(datos) || Object.keys(datos).length === 0) {
+      return res.status(400).json({
+        error: true,
+        message: 'El cuerpo de la solicitud debe ser un objeto con datos válidos'
+      });
+    }
+
     const query = 'CALL pa_insert($1, $2)';
     await pool.query(query, [tabla, datos]);
 
     res.status(201).json({ message: 'Persona creada exitosamente.' });
   } catch (err) {
     console.error('Error al crear persona:', err.message);
-    res.status(500).json({ error: true, message: err.message });
+    res.status(500).json({ error: true, message: 'Error interno del servidor' });
   }
 });
 
@@ -105,11 +200,38 @@ router.put('/personas/:id', async (req, res) => {
   try {
     const { campo, valor } = req.body;
     const { id } = req.params;
+    const idPersona = parsePositiveInt(id);
 
     if (!campo || valor === undefined) {
       return res.status(400).json({
         error: true,
         message: 'Debe enviar campo y valor'
+      });
+    }
+
+    if (!idPersona) {
+      return res.status(400).json({
+        error: true,
+        message: 'El id debe ser un entero positivo'
+      });
+    }
+
+    const allowedFields = new Set([
+      'nombre',
+      'apellido',
+      'fecha_nacimiento',
+      'genero',
+      'dni',
+      'rtn',
+      'id_telefono',
+      'id_direccion',
+      'id_correo'
+    ]);
+
+    if (!allowedFields.has(campo)) {
+      return res.status(400).json({
+        error: true,
+        message: 'El campo no es válido para actualización'
       });
     }
 
@@ -122,7 +244,7 @@ router.put('/personas/:id', async (req, res) => {
         campo,
         String(valor),
         'id_persona',
-        String(id)
+        String(idPersona)
       ]
     );
 
@@ -135,7 +257,7 @@ router.put('/personas/:id', async (req, res) => {
     console.error('Error al actualizar persona:', err.message);
     res.status(500).json({
       error: true,
-      message: err.message
+      message: 'Error interno del servidor'
     });
   }
 });
@@ -147,10 +269,18 @@ router.put('/personas/:id', async (req, res) => {
 router.delete('/personas/:id', async (req, res) => {
   try {
     const { id } = req.params;
+    const idPersona = parsePositiveInt(id);
+
+    if (!idPersona) {
+      return res.status(400).json({
+        error: true,
+        message: 'El id debe ser un entero positivo'
+      });
+    }
 
     await pool.query(
       'CALL pa_delete($1::TEXT, $2::TEXT, $3::TEXT)',
-      ['personas', 'id_persona', String(id)]
+      ['personas', 'id_persona', String(idPersona)]
     );
 
     res.status(200).json({
@@ -162,7 +292,7 @@ router.delete('/personas/:id', async (req, res) => {
     console.error('Error al eliminar persona:', err.message);
     res.status(500).json({
       error: true,
-      message: err.message
+      message: 'Error interno del servidor'
     });
   }
 });
