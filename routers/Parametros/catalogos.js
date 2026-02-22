@@ -23,17 +23,14 @@ const CATALOGOS = {
   tipo_notificacion: 'id_tipo_notificacion, descripcion_tipo_notificacion',
   estados_pedido: 'id_estado_pedido, descripcion',
 
-  tipo_archivo: 'id_tipo_archivo, nombre_tipo_archivo',
-  marcas: 'id_marcas, marca',
-
   dispositivos_biometricos: 'id_dispositivo, nombre_dispositivo',
 
   tipo_hora_extra: 'id_tipo_hora, descripcion',
-  factor_horas_extra: 'id_factor_horas_extra, cantidad_horas, precio_hora',
+  factor_horas_extra: 'id_factor_horas_extras, cantidad_horas, precio_hora',
 
   tipo_nomina: 'id_tipo_nomina, descripcion_tipo_nomina',
   tipo_naturaleza: 'id_tipo_naturaleza, tipo_naturaleza, descripcion',
-  concepto_nomina: 'id_concepto_nomina, tipo_nomina, id_tipo_naturaleza, descripcion',
+  concepto_nomina: 'id_concepto_nomina, id_tipo_nomina, descripcion, id_tipo_naturaleza',
 
   estado_planilla: 'id_estado_planilla, descripcion',
 
@@ -41,8 +38,36 @@ const CATALOGOS = {
 };
 
 // Valida que la tabla sea un catálogo permitido
+const TABLA_ALIAS = {
+  factor_horas_extra: ['factor_horas_extra', 'factor_hora_extra', 'factor_horas_extras']
+};
+
 const validarTablaCatalogo = (tabla) => {
   return Object.prototype.hasOwnProperty.call(CATALOGOS, tabla);
+};
+
+const resolverTablaFisica = async (tabla) => {
+  const candidatas = TABLA_ALIAS[tabla] || [tabla];
+
+  for (const candidata of candidatas) {
+    const reg = await pool.query('SELECT to_regclass($1) as reg', [`public.${candidata}`]);
+    if (reg.rows?.[0]?.reg) return candidata;
+  }
+
+  return null;
+};
+
+const obtenerColumnasReales = async (tablaFisica) => {
+  const result = await pool.query(
+    `SELECT column_name
+     FROM information_schema.columns
+     WHERE table_schema = 'public'
+       AND table_name = $1
+     ORDER BY ordinal_position`,
+    [tablaFisica]
+  );
+
+  return result.rows.map((row) => row.column_name);
 };
 
 // GET: Listar registros de un catálogo
@@ -59,10 +84,28 @@ router.get('/:tabla', async (req, res) => {
     });
     }
 
-    const columnas = CATALOGOS[tabla];
+    const tablaFisica = await resolverTablaFisica(tabla);
+    if (!tablaFisica) {
+      return res.status(500).json({
+        ok: false,
+        message: `No existe la tabla fisica para el catalogo: ${tabla}`,
+        data: null
+      });
+    }
+
+    const columnasReales = await obtenerColumnasReales(tablaFisica);
+    if (columnasReales.length === 0) {
+      return res.status(500).json({
+        ok: false,
+        message: `No se encontraron columnas para la tabla fisica: ${tablaFisica}`,
+        data: null
+      });
+    }
+
+    const columnas = columnasReales.join(', ');
 
     const query = 'SELECT function_select($1, $2) as resultado';
-    const result = await pool.query(query, [tabla, columnas]);
+    const result = await pool.query(query, [tablaFisica, columnas]);
 
     const datos = result.rows[0].resultado || [];
     return res.status(200).json({
@@ -95,10 +138,19 @@ router.post('/:tabla', async (req, res) => {
       });
     }
 
+    const tablaFisica = await resolverTablaFisica(tabla);
+    if (!tablaFisica) {
+      return res.status(500).json({
+        ok: false,
+        message: `No existe la tabla fisica para el catalogo: ${tabla}`,
+        data: null
+      });
+    }
+
     const datos = req.body;
 
     const query = 'CALL public.pa_insert($1::text, $2::json)';
-    await pool.query(query, [tabla, JSON.stringify(datos)]);
+    await pool.query(query, [tablaFisica, JSON.stringify(datos)]);
 
     return res.status(201).json({
       ok: true,
@@ -131,6 +183,15 @@ router.put('/:tabla', async (req, res) => {
       });
     }
 
+    const tablaFisica = await resolverTablaFisica(tabla);
+    if (!tablaFisica) {
+      return res.status(500).json({
+        ok: false,
+        message: `No existe la tabla fisica para el catalogo: ${tabla}`,
+        data: null
+      });
+    }
+
     if (!campo || valor === undefined || !id_campo || id_valor === undefined) {
       return res.status(400).json({
         ok: false,
@@ -140,7 +201,7 @@ router.put('/:tabla', async (req, res) => {
     }
 
     // Seguridad: solo permitir columnas definidas en el catálogo
-    const columnasPermitidas = CATALOGOS[tabla].split(',').map((c) => c.trim());
+    const columnasPermitidas = await obtenerColumnasReales(tablaFisica);
 
     if (!columnasPermitidas.includes(campo) || !columnasPermitidas.includes(id_campo)) {
       return res.status(400).json({
@@ -151,7 +212,7 @@ router.put('/:tabla', async (req, res) => {
     }
 
     // 1) Verificar que el registro exista antes del UPDATE (evita "200" falso)
-    const existsQuery = `SELECT 1 FROM ${tabla} WHERE ${id_campo} = $1 LIMIT 1`;
+    const existsQuery = `SELECT 1 FROM ${tablaFisica} WHERE ${id_campo} = $1 LIMIT 1`;
     const exists = await pool.query(existsQuery, [String(id_valor)]);
 
     if (exists.rowCount === 0) {
@@ -165,7 +226,7 @@ router.put('/:tabla', async (req, res) => {
     // 2) Ejecutar pa_update (forzando schema y tipos)
     const query = 'CALL public.pa_update($1::text, $2::text, $3::text, $4::text, $5::text)';
     await pool.query(query, [
-      tabla,
+      tablaFisica,
       campo,
       String(valor),
       id_campo,
@@ -203,6 +264,15 @@ router.delete('/:tabla', async (req, res) => {
       });
     }
 
+    const tablaFisica = await resolverTablaFisica(tabla);
+    if (!tablaFisica) {
+      return res.status(500).json({
+        ok: false,
+        message: `No existe la tabla fisica para el catalogo: ${tabla}`,
+        data: null
+      });
+    }
+
     if (!columna_id || valor_id === undefined) {
       return res.status(400).json({
         ok: false,
@@ -212,9 +282,7 @@ router.delete('/:tabla', async (req, res) => {
     }
 
     // Seguridad extra: solo permitir borrar por columnas válidas del catálogo
-    const columnasPermitidas = CATALOGOS[tabla]
-      .split(',')
-      .map((c) => c.trim());
+    const columnasPermitidas = await obtenerColumnasReales(tablaFisica);
 
     if (!columnasPermitidas.includes(columna_id)) {
       return res.status(400).json({
@@ -225,7 +293,7 @@ router.delete('/:tabla', async (req, res) => {
     }
 
     const query = 'CALL public.pa_delete($1::text, $2::text, $3::text)';
-    await pool.query(query, [tabla, columna_id, String(valor_id)]);
+    await pool.query(query, [tablaFisica, columna_id, String(valor_id)]);
 
     return res.status(200).json({
       ok: true,
