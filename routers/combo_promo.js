@@ -3,6 +3,10 @@ import pool from '../config/db-connection.js'; // Importa el pool de conexión a
 
 const router = express.Router(); // Inicializa el router
 
+// NUEVO: helper para soportar boolean real o representaciones string/número
+const esProductoActivo = (estado) =>
+  estado === true || estado === 'true' || estado === 1 || estado === '1';
+
 // =====================================================
 // MÓDULO 6 - MENÚ
 // Combos definidos SOLO en detalle_combo
@@ -39,15 +43,19 @@ router.get('/menu/combos', async (req, res) => {
 
     // 2) Leer productos y filtrar por id_tipo_departamento = depCombos.id_tipo_departamento
     const tabla = 'productos'; // Tabla de productos (solo lectura)
+    // AJUSTE: se agrega estado para respetar soft delete en lectura
     const columnas =
-      'id_producto, nombre_producto, precio, cantidad, stock_minimo, descripcion_producto, fecha_ingreso_producto, fecha_caducidad, id_categoria_producto, id_almacen, id_tipo_departamento'; // Columnas necesarias
+      'id_producto, nombre_producto, precio, cantidad, stock_minimo, descripcion_producto, fecha_ingreso_producto, fecha_caducidad, id_categoria_producto, id_almacen, id_tipo_departamento, estado'; // Columnas necesarias
 
     const q = 'SELECT function_select($1, $2) as resultado'; // Select estándar del proyecto
     const r = await pool.query(q, [tabla, columnas]); // Ejecuta select
 
     const datos = r.rows[0].resultado || []; // Lista de productos
+    // NUEVO: filtrar combos/productos para devolver solo activos
     const combos = datos.filter(
-      (p) => Number(p.id_tipo_departamento) === Number(depCombos.id_tipo_departamento)
+      (p) =>
+        Number(p.id_tipo_departamento) === Number(depCombos.id_tipo_departamento) &&
+        esProductoActivo(p.estado)
     ); // Filtra los productos que pertenecen al departamento "Combos"
 
     return res.status(200).json(combos); // Devuelve combos encontrados
