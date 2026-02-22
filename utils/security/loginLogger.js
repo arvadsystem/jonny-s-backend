@@ -30,9 +30,10 @@ export async function insertLoginLog({
       sistema_operativo,
       ubicacion,
       exito,
-      mensaje_error
+      mensaje_error,
+      fecha_hora
     )
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11, timezone('America/Tegucigalpa', now()))
   `;
 
   const params = [
