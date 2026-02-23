@@ -20,9 +20,21 @@ export async function createSession({
 }) {
   const sql = `
     INSERT INTO sesiones_activas (
-      id_usuario, ip_origen, user_agent, dispositivo, navegador, sistema_operativo, ubicacion
+      id_usuario,
+      ip_origen,
+      user_agent,
+      dispositivo,
+      navegador,
+      sistema_operativo,
+      ubicacion,
+      fecha_inicio,
+      ultima_actividad
     )
-    VALUES ($1,$2,$3,$4,$5,$6,$7)
+    VALUES (
+      $1,$2,$3,$4,$5,$6,$7,
+      timezone('America/Tegucigalpa', now()),
+      timezone('America/Tegucigalpa', now())
+    )
     RETURNING id_sesion
   `;
 
@@ -45,7 +57,7 @@ export async function createSession({
 export async function touchSession(id_sesion) {
   const sql = `
     UPDATE sesiones_activas
-    SET ultima_actividad = CURRENT_TIMESTAMP
+    SET ultima_actividad = timezone('America/Tegucigalpa', now())
     WHERE id_sesion = $1 AND activa = TRUE
   `;
   await pool.query(sql, [id_sesion]);
@@ -58,7 +70,7 @@ export async function closeSession(id_sesion, motivo_cierre = 'logout') {
   const sql = `
     UPDATE sesiones_activas
     SET activa = FALSE,
-        fecha_cierre = CURRENT_TIMESTAMP,
+        fecha_cierre = timezone('America/Tegucigalpa', now()),
         motivo_cierre = $2
     WHERE id_sesion = $1 AND activa = TRUE
   `;

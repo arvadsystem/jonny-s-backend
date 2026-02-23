@@ -7,7 +7,7 @@ import express from 'express';
 import pool from '../../config/db-connection.js';
 import { closeSession } from '../../utils/security/sessionService.js';
 import { checkPermission } from '../../middleware/checkPermission.js';
-
+import { timestampAsHNToISO } from "../../utils/dates.js";
 const router = express.Router();
 
 /**
@@ -33,14 +33,24 @@ router.get('/sesiones', checkPermission('SEGURIDAD_VER'), async (req, res) => {
         ultima_actividad,
         activa,
         fecha_cierre,
-        motivo_cierre
+        motivo_cierre,
+        (id_sesion = $2) AS es_actual
       FROM sesiones_activas
       WHERE id_usuario = $1
       ORDER BY activa DESC, ultima_actividad DESC
     `;
 
-    const result = await pool.query(sql, [user.id_usuario]);
-    return res.json({ error: false, sesiones: result.rows });
+    const result = await pool.query(sql, [user.id_usuario, user.sid]);
+
+    // ✅ timestamp sin TZ (HN) -> ISO UTC con Z
+    const sesiones = result.rows.map((s) => ({
+      ...s,
+      fecha_inicio: timestampAsHNToISO(s.fecha_inicio),
+      ultima_actividad: timestampAsHNToISO(s.ultima_actividad),
+      fecha_cierre: timestampAsHNToISO(s.fecha_cierre),
+    }));
+
+    return res.json({ error: false, sesiones });
   } catch (err) {
     console.error('GET /seguridad/sesiones error:', err);
     return res.status(500).json({ error: true, message: 'Error interno del servidor' });
@@ -49,7 +59,6 @@ router.get('/sesiones', checkPermission('SEGURIDAD_VER'), async (req, res) => {
 
 /**
  * POST /seguridad/sesiones/cerrar
- * Cierra (remotamente) una sesión por id_sesion.
  * Body: { id_sesion: "uuid..." }
  */
 router.post('/sesiones/cerrar', checkPermission('SEGURIDAD_SESIONES_CERRAR'), async (req, res) => {
@@ -64,7 +73,7 @@ router.post('/sesiones/cerrar', checkPermission('SEGURIDAD_SESIONES_CERRAR'), as
       return res.status(400).json({ error: true, message: 'id_sesion es requerido' });
     }
 
-    // ✅ Seguridad: verifica que la sesión pertenece al usuario
+    // ✅ Verifica que la sesión pertenece al usuario
     const check = await pool.query(
       'SELECT id_sesion FROM sesiones_activas WHERE id_sesion = $1 AND id_usuario = $2',
       [id_sesion, user.id_usuario]
@@ -75,9 +84,6 @@ router.post('/sesiones/cerrar', checkPermission('SEGURIDAD_SESIONES_CERRAR'), as
     }
 
     await closeSession(id_sesion, 'cierre_remoto');
-
-    // Nota: si cierras la sesión actual, el usuario seguirá con token hasta que lo bloqueemos
-    // (en HU79 paso 4 agregamos "validar sesión activa" en auth para forzar logout)
     return res.json({ error: false, message: 'Sesión cerrada' });
   } catch (err) {
     console.error('POST /seguridad/sesiones/cerrar error:', err);
@@ -87,7 +93,6 @@ router.post('/sesiones/cerrar', checkPermission('SEGURIDAD_SESIONES_CERRAR'), as
 
 /**
  * POST /seguridad/sesiones/cerrar-otras
- * Cierra todas las sesiones activas del usuario EXCEPTO la sesión actual (sid del JWT).
  */
 router.post('/sesiones/cerrar-otras', checkPermission('SEGURIDAD_SESIONES_CERRAR'), async (req, res) => {
   try {
@@ -102,7 +107,7 @@ router.post('/sesiones/cerrar-otras', checkPermission('SEGURIDAD_SESIONES_CERRAR
     const sql = `
       UPDATE sesiones_activas
       SET activa = FALSE,
-          fecha_cierre = CURRENT_TIMESTAMP,
+          fecha_cierre = timezone('America/Tegucigalpa', now()),
           motivo_cierre = 'cierre_otras'
       WHERE id_usuario = $1
         AND activa = TRUE
