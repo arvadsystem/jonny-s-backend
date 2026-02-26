@@ -20,6 +20,18 @@ const CAMPOS_PERMITIDOS_PRODUCTOS = new Set([
 
 // NUEVO: codigos de conflicto SQL para responder 409 en constraints
 const CODIGOS_CONFLICTO_CONSTRAINT = new Set(['23503', '23505', '23514', '23502']);
+// NEW: codigo SQLSTATE de PostgreSQL para numeric/integer out of range.
+// WHY: identificar y sanitizar respuestas cuando un valor excede el rango del tipo de la BD.
+// IMPACT: solo manejo de errores en el router de Productos; no cambia consultas exitosas.
+const CODIGO_SQL_OUT_OF_RANGE = '22003';
+// NEW: limite superior de INTEGER (int4) usado por IDs en la BD/SPs actuales.
+// WHY: bloquear IDs fuera de rango antes de ejecutar `pa_update` / `pa_delete`.
+// IMPACT: valida requests invalidos y responde 400 en lugar de dejar que fallen con 500.
+const MAX_INT32_DB_ID = 2147483647;
+// NEW: query param opt-in para incluir inactivos en listados administrativos.
+// WHY: el GET de productos debe devolver activos por defecto tras adoptar soft delete.
+// IMPACT: mantiene compatibilidad con `?incluir_inactivos=1` sin crear endpoint nuevo.
+const shouldIncludeInactive = (query) => String(query?.incluir_inactivos ?? '').trim() === '1';
 
 // NUEVO: helper para detectar valores vacios en campos opcionales
 const esVacio = (valor) =>
@@ -39,6 +51,23 @@ function normalizarBoolean(valor) {
   }
 
   return { valido: false };
+}
+
+// NEW: valida IDs enteros positivos compatibles con INT32 de PostgreSQL.
+// WHY: `Number.isInteger` en JS acepta valores como Date.now() que luego fallan al castear a integer en la BD.
+// IMPACT: prevencion temprana en PUT/DELETE de Productos; payloads validos siguen igual.
+function esEnteroPositivoInt32(valor) {
+  return Number.isSafeInteger(valor) && valor > 0 && valor <= MAX_INT32_DB_ID;
+}
+
+// NEW: helper para interpretar `estado` aunque venga como string/number.
+// WHY: `function_select` puede serializar booleans de forma distinta segun el entorno.
+// IMPACT: solo afecta filtrado del GET /productos.
+function isRowActive(row) {
+  const raw = row?.estado;
+  if (raw === undefined || raw === null || raw === '') return true;
+  if (raw === true || raw === 1 || raw === '1') return true;
+  return String(raw).trim().toLowerCase() === 'true';
 }
 
 // NUEVO: valida formato de fecha y coherencia de calendario (yyyy-mm-dd)
@@ -205,6 +234,16 @@ function esErrorConflictoConstraint(err) {
   return Boolean(err?.code && CODIGOS_CONFLICTO_CONSTRAINT.has(err.code));
 }
 
+// NEW: sanitiza mensajes internos de BD para respuestas HTTP del router de Productos.
+// WHY: evitar exponer detalles como `out of range for type integer` al frontend/usuario.
+// IMPACT: solo cambia el texto de errores internos; status codes y logging del servidor se mantienen.
+function getSafeProductosServerErrorMessage(err, fallback = 'No se pudo completar la acción. Verifica los datos e intenta de nuevo.') {
+  const raw = String(err?.message || '').toLowerCase();
+  if (err?.code === CODIGO_SQL_OUT_OF_RANGE) return fallback;
+  if (raw.includes('out of range') && raw.includes('integer')) return fallback;
+  return String(err?.message || fallback);
+}
+
 // GET: Obtener productos
 router.get('/productos', async (req, res) => {
   try {
@@ -217,12 +256,16 @@ router.get('/productos', async (req, res) => {
     const query = 'SELECT function_select($1, $2) as resultado';
     const result = await pool.query(query, [tabla, columnas]);
 
-    const datos = result.rows[0].resultado || [];
+    const baseDatos = result.rows[0].resultado || [];
+    // NEW: activos por defecto; admin puede solicitar incluir inactivos.
+    // WHY: alinear GET /productos con inactivacion via `estado=false`.
+    // IMPACT: no rompe clientes actuales; amplia el contrato con query param opcional.
+    const datos = shouldIncludeInactive(req.query) ? baseDatos : baseDatos.filter(isRowActive);
     res.status(200).json(datos);
 
   } catch (err) {
     console.error('Error al obtener productos:', err.message);
-    res.status(500).json({ error: true, message: err.message });
+    res.status(500).json({ error: true, message: getSafeProductosServerErrorMessage(err, 'No se pudieron cargar los productos.') });
   }
 });
 
@@ -332,7 +375,7 @@ router.post('/productos', async (req, res) => {
       });
     }
 
-    res.status(500).json({ error: true, message: err.message });
+    res.status(500).json({ error: true, message: getSafeProductosServerErrorMessage(err) });
   }
 });
 
@@ -363,10 +406,10 @@ router.put('/productos', async (req, res) => {
 
     // VALIDACION: id objetivo valido
     const idProducto = Number(id_valor);
-    if (!Number.isInteger(idProducto) || idProducto <= 0) {
+    if (!esEnteroPositivoInt32(idProducto)) {
       return res.status(400).json({
         error: true,
-        message: 'id_valor debe ser un entero mayor a 0.'
+        message: 'id_valor debe ser un entero positivo dentro del rango permitido.'
       });
     }
 
@@ -441,68 +484,75 @@ router.put('/productos', async (req, res) => {
       });
     }
 
-    res.status(500).json({ error: true, message: err.message });
+    res.status(500).json({ error: true, message: getSafeProductosServerErrorMessage(err) });
   }
 });
 
-// DELETE: Eliminar producto
+// DELETE: Inactivar producto (soft delete)
 router.delete('/productos', async (req, res) => {
-  // AJUSTE: se declara fuera del try para reutilizar en hard/soft delete
-  let idProducto = null;
-
   try {
-    const { columna_id, valor_id } = req.body || {};
+    // NEW: fallback compatible para obtener id del producto desde body/query/params sin romper firmas actuales.
+    // WHY: evita `ReferenceError` y tolera clientes legacy que envian distintos nombres del ID.
+    // IMPACT: mantiene el endpoint DELETE /productos y amplia la lectura del ID de forma retrocompatible.
+    const rawIdProducto =
+      req.body?.idProducto ?? req.body?.id_producto ??
+      req.query?.idProducto ?? req.query?.id_producto ??
+      req.params?.idProducto ?? req.params?.id_producto ??
+      req.body?.valor_id ?? req.query?.valor_id;
 
-    if (!columna_id || valor_id === undefined) {
-      return res.status(400).json({ error: true, message: 'Faltan datos para eliminar' });
-    }
+    // NEW: fallback compatible para columna_id con default seguro.
+    // WHY: conservar compatibilidad con la firma actual (`columna_id`,`valor_id`) sin exigirla a otros callers.
+    // IMPACT: si no llega `columna_id`, se asume `id_producto`; payloads existentes siguen funcionando.
+    const columna_id =
+      req.body?.columna_id ?? req.query?.columna_id ?? req.params?.columna_id ?? 'id_producto';
 
     // VALIDACION: columna_id fijo para evitar deletes arbitrarios
     if (columna_id !== 'id_producto') {
       return res.status(400).json({
         error: true,
-        message: 'columna_id invalido. Debe ser exactamente id_producto.'
+        code: 'INVALID_PRODUCT_ID',
+        message: 'ID de producto inválido.'
       });
     }
 
     // VALIDACION: id del producto a eliminar
-    idProducto = Number(valor_id);
-    if (!Number.isInteger(idProducto) || idProducto <= 0) {
+    const idProducto = Number.parseInt(String(rawIdProducto ?? ''), 10);
+    if (!esEnteroPositivoInt32(idProducto)) {
       return res.status(400).json({
         error: true,
-        message: 'valor_id debe ser un entero mayor a 0.'
+        code: 'INVALID_PRODUCT_ID',
+        message: 'ID de producto inválido.'
+      });
+    }
+
+    // NEW: 404 explicito antes de inactivar.
+    // WHY: responder consistente sin depender del comportamiento interno de los SPs.
+    // IMPACT: solo afecta requests hacia IDs inexistentes.
+    const existeProducto = await existeProductoPorId(idProducto);
+    if (!existeProducto) {
+      return res.status(404).json({
+        error: true,
+        code: 'PRODUCT_NOT_FOUND',
+        message: 'Producto no encontrado.'
       });
     }
 
     const tabla = 'productos';
-    const query = 'CALL pa_delete($1, $2, $3)';
+    const query = 'CALL pa_update($1, $2, $3, $4, $5)';
+    await pool.query(query, [tabla, 'estado', 'false', columna_id, String(idProducto)]);
 
-    // AJUSTE: primero intenta hard delete
-    await pool.query(query, [tabla, columna_id, String(idProducto)]);
-
-    return res.status(200).json({ message: 'Producto eliminado.', hard_deleted: true });
+    return res.status(200).json({ error: false, message: 'Producto inactivado.' });
 
   } catch (err) {
-    // NUEVO: fallback soft delete cuando el hard delete falla por FK
-    if (err.code === '23503') {
-      try {
-        await pool.query(
-          'CALL pa_update($1, $2, $3, $4, $5)',
-          ['productos', 'estado', 'false', 'id_producto', String(idProducto)]
-        );
-
-        return res.status(200).json({
-          message: 'Producto desactivado porque est\u00E1 en uso y no se puede eliminar.',
-          soft_deleted: true
-        });
-      } catch (softErr) {
-        console.error('Error al aplicar soft delete de producto:', softErr.message);
-        return res.status(500).json({ error: true, message: softErr.message });
-      }
-    }
-
-    console.error('Error al eliminar producto:', err.message);
-    return res.status(500).json({ error: true, message: err.message });
+    console.error('Error al inactivar producto:', err.message);
+    // NEW: respuesta 500 estandarizada para no exponer detalles internos (ej. ReferenceError / SQL).
+    // WHY: el cliente no debe recibir mensajes crudos como `idProducto is not defined`.
+    // IMPACT: solo cambia el payload de error en DELETE /productos; logging del servidor se conserva.
+    return res.status(500).json({
+      error: true,
+      code: 'INTERNAL_ERROR',
+      message: 'No se pudo completar la acción. Intenta de nuevo.'
+    });
   }
 });
 
