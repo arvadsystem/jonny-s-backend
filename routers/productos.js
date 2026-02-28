@@ -1,5 +1,6 @@
 import express from 'express';
 import pool from '../config/db-connection.js';
+import { attachImagenPrincipalUrls } from '../utils/uploads.js';
 
 const router = express.Router();
 
@@ -15,6 +16,7 @@ const CAMPOS_PERMITIDOS_PRODUCTOS = new Set([
   'id_categoria_producto',
   'id_almacen',
   'id_tipo_departamento',
+  'id_archivo_imagen_principal',
   'estado'
 ]);
 
@@ -176,6 +178,22 @@ function validarCampoProducto(campo, valor) {
     return { valido: true, valor: numero };
   }
 
+  if (campo === 'id_archivo_imagen_principal') {
+    // NEW: imagen principal opcional referenciando `archivos.id_archivo`.
+    // WHY: permitir asociar o limpiar la imagen principal sin crear endpoints extra de productos.
+    // IMPACT: POST/PUT aceptan la FK real y mantienen el contrato actual del resto de campos.
+    if (esVacio(valor)) {
+      return { valido: true, valor: null };
+    }
+
+    const numero = Number(valor);
+    if (!Number.isInteger(numero) || numero <= 0) {
+      return { valido: false, message: 'id_archivo_imagen_principal debe ser un entero mayor a 0 o null/vacio.' };
+    }
+
+    return { valido: true, valor: numero };
+  }
+
   if (campo === 'estado') {
     // VALIDACION: estado boolean normalizado
     const bool = normalizarBoolean(valor);
@@ -217,6 +235,16 @@ async function validarExistenciaFk(campo, valor) {
     return r.rowCount > 0;
   }
 
+  if (campo === 'id_archivo_imagen_principal') {
+    if (valor === null) return true;
+
+    const r = await pool.query(
+      'SELECT 1 FROM archivos WHERE id_archivo = $1 LIMIT 1',
+      [valor]
+    );
+    return r.rowCount > 0;
+  }
+
   return true;
 }
 
@@ -227,6 +255,29 @@ async function existeProductoPorId(idProducto) {
     [idProducto]
   );
   return r.rowCount > 0;
+}
+
+// NEW: actualiza campos opcionales a SQL NULL sin pasar por `pa_update`.
+// WHY: `pa_update` serializa valores con `%L` y convertiria `null` en el texto `"null"`, rompiendo FKs integer.
+// IMPACT: solo se usa al limpiar FKs opcionales; el resto del flujo PUT conserva `pa_update` intacto.
+async function updateProductoFieldToNull(idProducto, campo) {
+  if (campo === 'id_archivo_imagen_principal') {
+    await pool.query(
+      'UPDATE productos SET id_archivo_imagen_principal = NULL WHERE id_producto = $1',
+      [idProducto]
+    );
+    return true;
+  }
+
+  if (campo === 'id_tipo_departamento') {
+    await pool.query(
+      'UPDATE productos SET id_tipo_departamento = NULL WHERE id_producto = $1',
+      [idProducto]
+    );
+    return true;
+  }
+
+  return false;
 }
 
 // NUEVO: helper para clasificar errores SQL de constraint como conflicto
@@ -251,7 +302,7 @@ router.get('/productos', async (req, res) => {
 
     // AJUSTE: se incluye estado para compatibilidad con soft delete
     const columnas =
-      'id_producto, nombre_producto, precio, cantidad, stock_minimo, descripcion_producto, fecha_ingreso_producto, fecha_caducidad, id_categoria_producto, id_almacen, id_tipo_departamento, estado';
+      'id_producto, nombre_producto, precio, cantidad, stock_minimo, descripcion_producto, fecha_ingreso_producto, fecha_caducidad, id_categoria_producto, id_almacen, id_tipo_departamento, estado, id_archivo_imagen_principal';
 
     const query = 'SELECT function_select($1, $2) as resultado';
     const result = await pool.query(query, [tabla, columnas]);
@@ -261,7 +312,8 @@ router.get('/productos', async (req, res) => {
     // WHY: alinear GET /productos con inactivacion via `estado=false`.
     // IMPACT: no rompe clientes actuales; amplia el contrato con query param opcional.
     const datos = shouldIncludeInactive(req.query) ? baseDatos : baseDatos.filter(isRowActive);
-    res.status(200).json(datos);
+    const datosConImagen = await attachImagenPrincipalUrls(pool, req, datos);
+    res.status(200).json(datosConImagen);
 
   } catch (err) {
     console.error('Error al obtener productos:', err.message);
@@ -355,6 +407,22 @@ router.post('/productos', async (req, res) => {
         return res.status(400).json({
           error: true,
           message: 'id_tipo_departamento no existe en tipo_departamento.'
+        });
+      }
+    }
+
+    // NEW: valida la imagen principal cuando el payload incluye FK a `archivos`.
+    // WHY: evitar referencias a archivos inexistentes y fallos de FK mas tarde en la BD.
+    // IMPACT: solo rechaza payloads invalidos; altas validas se mantienen intactas.
+    if (Object.prototype.hasOwnProperty.call(datosNormalizados, 'id_archivo_imagen_principal')) {
+      const existeArchivo = await validarExistenciaFk(
+        'id_archivo_imagen_principal',
+        datosNormalizados.id_archivo_imagen_principal
+      );
+      if (!existeArchivo) {
+        return res.status(400).json({
+          error: true,
+          message: 'id_archivo_imagen_principal no existe en archivos.'
         });
       }
     }
@@ -460,16 +528,26 @@ router.put('/productos', async (req, res) => {
       }
     }
 
+    if (campo === 'id_archivo_imagen_principal') {
+      const existeArchivo = await validarExistenciaFk('id_archivo_imagen_principal', resultado.valor);
+      if (!existeArchivo) {
+        return res.status(400).json({
+          error: true,
+          message: 'id_archivo_imagen_principal no existe en archivos.'
+        });
+      }
+    }
+
+    // NEW: desvincula FKs opcionales con SQL NULL real cuando el frontend limpia la imagen/campo.
+    // WHY: evita el error `invalid input syntax for type integer: "null"` reportado al quitar imagen.
+    // IMPACT: `Quitar imagen` y limpieza de departamento opcional funcionan sin tocar el contrato del endpoint.
+    if (resultado.valor === null && await updateProductoFieldToNull(idProducto, campo)) {
+      return res.status(200).json({ message: 'Producto actualizado correctamente.' });
+    }
+
     const tabla = 'productos';
     const query = 'CALL pa_update($1, $2, $3, $4, $5)';
-
-    // AJUSTE: soporte para limpiar id_tipo_departamento enviando null/vacio
-    const valorParaUpdate =
-      campo === 'id_tipo_departamento' && resultado.valor === null
-        ? 'null'
-        : String(resultado.valor);
-
-    await pool.query(query, [tabla, campo, valorParaUpdate, id_campo, String(idProducto)]);
+    await pool.query(query, [tabla, campo, String(resultado.valor), id_campo, String(idProducto)]);
 
     res.status(200).json({ message: 'Producto actualizado correctamente.' });
 
