@@ -5,6 +5,7 @@
  * ✅ Sprint 3 (HU31 adaptada):
  * - Listado GLOBAL de sesiones ACTIVAS (solo Super Admin)
  * - Cerrar TODAS las sesiones activas (menos la actual) (solo Super Admin)
+ * - ✅ HU84: Cerrar 1 sesión específica de otro usuario (solo Super Admin)
  */
 
 import express from 'express';
@@ -280,6 +281,79 @@ router.get('/sesiones/global', checkPermission('SEGURIDAD_VER'), async (req, res
     return res.status(500).json({ error: true, message: 'Error interno del servidor' });
   }
 });
+
+/**
+ * POST /seguridad/sesiones/cerrar-global
+ * HU84: Cierra una sesión activa específica del sistema.
+ * Body: { id_sesion: "uuid..." }
+ *
+ * Reglas:
+ * - Solo Super Admin
+ * - No permite cerrar la sesión actual (req.user.sid)
+ * - Marca activa=false y registra motivo
+ */
+router.post(
+  '/sesiones/cerrar-global',
+  checkPermission('SEGURIDAD_SESIONES_CERRAR'),
+  async (req, res) => {
+    try {
+      const user = req.user || req.usuario;
+      const { id_sesion } = req.body;
+
+      if (!user?.id_usuario) {
+        return res.status(401).json({ error: true, message: 'No autenticado' });
+      }
+      if (!user?.sid) {
+        return res.status(400).json({ error: true, message: 'Sesión actual no identificada (sid)' });
+      }
+
+      // 🔒 Solo Super Admin
+      if (!requireSuperAdmin(req, res)) return;
+
+      if (!id_sesion) {
+        return res.status(400).json({ error: true, message: 'id_sesion es requerido' });
+      }
+
+      // ⛔ Evitar cerrar la sesión actual del Super Admin
+      if (String(id_sesion) === String(user.sid)) {
+        return res.status(409).json({
+          error: true,
+          message: 'No se puede cerrar la sesión actual'
+        });
+      }
+
+      // Intento de cierre (solo si está activa)
+      const sql = `
+        UPDATE sesiones_activas
+        SET activa = FALSE,
+            fecha_cierre = timezone('America/Tegucigalpa', now()),
+            motivo_cierre = 'cierre_individual_superadmin'
+        WHERE id_sesion = $1
+          AND activa = TRUE
+      `;
+
+      const result = await pool.query(sql, [id_sesion]);
+
+      if (result.rowCount === 0) {
+        // Diferenciar no existe vs ya cerrada
+        const check = await pool.query('SELECT activa FROM sesiones_activas WHERE id_sesion = $1 LIMIT 1', [id_sesion]);
+        if (check.rows.length === 0) {
+          return res.status(404).json({ error: true, message: 'Sesión no encontrada' });
+        }
+        return res.status(409).json({ error: true, message: 'La sesión ya está cerrada' });
+      }
+
+      return res.json({
+        error: false,
+        message: 'Sesión cerrada (cierre individual Super Admin)',
+        id_sesion
+      });
+    } catch (err) {
+      console.error('POST /seguridad/sesiones/cerrar-global error:', err);
+      return res.status(500).json({ error: true, message: 'Error interno del servidor' });
+    }
+  }
+);
 
 /**
  * POST /seguridad/sesiones/cerrar-global-menos-actual
