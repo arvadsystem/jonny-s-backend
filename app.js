@@ -9,6 +9,7 @@ import loginRoutes from './routers/login.js';
 // ... tus otros routes
 import usuarioRoutes from './routers/usuarios.js';
 import categoriasRoutes from './routers/categorias_productos.js';
+import categoriasInsumosRoutes from './routers/categorias_insumos.js';
 import almacenesRoutes from './routers/almacenes.js';
 import productosRoutes from './routers/productos.js';
 import insumosRoutes from './routers/insumos.js';
@@ -40,10 +41,12 @@ import seguridadConfigRoutes from './routers/seguridad/configuracion.js';
 import seguridadLoginsRoutes from './routers/seguridad/logins.js';
 import seguridadPermisosRoutes from "./routers/seguridad/permisos.js";
 import comboPromoRoutes from './routers/combo_promo.js';
+import archivosRoutes from './routers/archivos.js';
 
 import { authRequired, csrfProtect } from './middleware/auth.js';
 import { touchSessionMiddleware } from './middleware/touchSession.js';
 import { requireActiveSession } from './middleware/requireActiveSession.js';
+import { MAX_IMAGE_JSON_LIMIT, UPLOADS_DIR } from './utils/uploads.js';
 
 // Parametros
 import catalogosRoutes from './routers/Parametros/catalogos.js';
@@ -66,8 +69,15 @@ app.use(
   })
 );
 
-app.use(express.json());
+// NEW: aumenta el limite JSON para soportar uploads base64 de imagen sin multipart.
+// WHY: el modulo Inventario enviara imagenes como data URL / base64 por JSON.
+// IMPACT: mantiene el parser global actual y habilita cuerpos de imagen dentro del limite definido.
+app.use(express.json({ limit: MAX_IMAGE_JSON_LIMIT }));
 app.use(cookieParser());
+// NEW: exposicion publica de `/uploads` para thumbnails e imagen principal de inventario.
+// WHY: los registros en `archivos.url_publica` apuntan a archivos locales servidos por Express.
+// IMPACT: no protege con JWT porque las imagenes deben poder cargarse en la UI como assets normales.
+app.use('/uploads', express.static(UPLOADS_DIR));
 
 // ✅ 2) Rutas públicas ANTES de auth
 app.get('/status', async (req, res) => {
@@ -100,7 +110,15 @@ app.use("/seguridad", seguridadPermisosRoutes);
 app.use('/parametros/catalogos', catalogosRoutes);
 
 app.use(usuarioRoutes);
+// NEW: alta de archivos para imagen principal de Productos/Insumos.
+// WHY: centralizar el guardado en tabla `archivos` y reutilizar el mismo flujo en Inventario.
+// IMPACT: agrega `POST /archivos`; no modifica endpoints existentes.
+app.use(archivosRoutes);
 app.use(categoriasRoutes);
+// NEW: CRUD de categorías de insumos con el mismo patrón que categorías de productos.
+// WHY: unificar Inventario > Categorías sin romper endpoints existentes.
+// IMPACT: agrega rutas nuevas `/categorias_insumos`; no altera rutas actuales.
+app.use(categoriasInsumosRoutes);
 app.use(almacenesRoutes);
 app.use(productosRoutes);
 app.use(insumosRoutes);

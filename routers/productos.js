@@ -1,5 +1,6 @@
 import express from 'express';
 import pool from '../config/db-connection.js';
+import { attachImagenPrincipalUrls } from '../utils/uploads.js';
 
 const router = express.Router();
 
@@ -15,11 +16,24 @@ const CAMPOS_PERMITIDOS_PRODUCTOS = new Set([
   'id_categoria_producto',
   'id_almacen',
   'id_tipo_departamento',
+  'id_archivo_imagen_principal',
   'estado'
 ]);
 
 // NUEVO: codigos de conflicto SQL para responder 409 en constraints
 const CODIGOS_CONFLICTO_CONSTRAINT = new Set(['23503', '23505', '23514', '23502']);
+// NEW: codigo SQLSTATE de PostgreSQL para numeric/integer out of range.
+// WHY: identificar y sanitizar respuestas cuando un valor excede el rango del tipo de la BD.
+// IMPACT: solo manejo de errores en el router de Productos; no cambia consultas exitosas.
+const CODIGO_SQL_OUT_OF_RANGE = '22003';
+// NEW: limite superior de INTEGER (int4) usado por IDs en la BD/SPs actuales.
+// WHY: bloquear IDs fuera de rango antes de ejecutar `pa_update` / `pa_delete`.
+// IMPACT: valida requests invalidos y responde 400 en lugar de dejar que fallen con 500.
+const MAX_INT32_DB_ID = 2147483647;
+// NEW: query param opt-in para incluir inactivos en listados administrativos.
+// WHY: el GET de productos debe devolver activos por defecto tras adoptar soft delete.
+// IMPACT: mantiene compatibilidad con `?incluir_inactivos=1` sin crear endpoint nuevo.
+const shouldIncludeInactive = (query) => String(query?.incluir_inactivos ?? '').trim() === '1';
 
 // NUEVO: helper para detectar valores vacios en campos opcionales
 const esVacio = (valor) =>
@@ -39,6 +53,23 @@ function normalizarBoolean(valor) {
   }
 
   return { valido: false };
+}
+
+// NEW: valida IDs enteros positivos compatibles con INT32 de PostgreSQL.
+// WHY: `Number.isInteger` en JS acepta valores como Date.now() que luego fallan al castear a integer en la BD.
+// IMPACT: prevencion temprana en PUT/DELETE de Productos; payloads validos siguen igual.
+function esEnteroPositivoInt32(valor) {
+  return Number.isSafeInteger(valor) && valor > 0 && valor <= MAX_INT32_DB_ID;
+}
+
+// NEW: helper para interpretar `estado` aunque venga como string/number.
+// WHY: `function_select` puede serializar booleans de forma distinta segun el entorno.
+// IMPACT: solo afecta filtrado del GET /productos.
+function isRowActive(row) {
+  const raw = row?.estado;
+  if (raw === undefined || raw === null || raw === '') return true;
+  if (raw === true || raw === 1 || raw === '1') return true;
+  return String(raw).trim().toLowerCase() === 'true';
 }
 
 // NUEVO: valida formato de fecha y coherencia de calendario (yyyy-mm-dd)
@@ -147,6 +178,22 @@ function validarCampoProducto(campo, valor) {
     return { valido: true, valor: numero };
   }
 
+  if (campo === 'id_archivo_imagen_principal') {
+    // NEW: imagen principal opcional referenciando `archivos.id_archivo`.
+    // WHY: permitir asociar o limpiar la imagen principal sin crear endpoints extra de productos.
+    // IMPACT: POST/PUT aceptan la FK real y mantienen el contrato actual del resto de campos.
+    if (esVacio(valor)) {
+      return { valido: true, valor: null };
+    }
+
+    const numero = Number(valor);
+    if (!Number.isInteger(numero) || numero <= 0) {
+      return { valido: false, message: 'id_archivo_imagen_principal debe ser un entero mayor a 0 o null/vacio.' };
+    }
+
+    return { valido: true, valor: numero };
+  }
+
   if (campo === 'estado') {
     // VALIDACION: estado boolean normalizado
     const bool = normalizarBoolean(valor);
@@ -188,6 +235,16 @@ async function validarExistenciaFk(campo, valor) {
     return r.rowCount > 0;
   }
 
+  if (campo === 'id_archivo_imagen_principal') {
+    if (valor === null) return true;
+
+    const r = await pool.query(
+      'SELECT 1 FROM archivos WHERE id_archivo = $1 LIMIT 1',
+      [valor]
+    );
+    return r.rowCount > 0;
+  }
+
   return true;
 }
 
@@ -200,9 +257,42 @@ async function existeProductoPorId(idProducto) {
   return r.rowCount > 0;
 }
 
+// NEW: actualiza campos opcionales a SQL NULL sin pasar por `pa_update`.
+// WHY: `pa_update` serializa valores con `%L` y convertiria `null` en el texto `"null"`, rompiendo FKs integer.
+// IMPACT: solo se usa al limpiar FKs opcionales; el resto del flujo PUT conserva `pa_update` intacto.
+async function updateProductoFieldToNull(idProducto, campo) {
+  if (campo === 'id_archivo_imagen_principal') {
+    await pool.query(
+      'UPDATE productos SET id_archivo_imagen_principal = NULL WHERE id_producto = $1',
+      [idProducto]
+    );
+    return true;
+  }
+
+  if (campo === 'id_tipo_departamento') {
+    await pool.query(
+      'UPDATE productos SET id_tipo_departamento = NULL WHERE id_producto = $1',
+      [idProducto]
+    );
+    return true;
+  }
+
+  return false;
+}
+
 // NUEVO: helper para clasificar errores SQL de constraint como conflicto
 function esErrorConflictoConstraint(err) {
   return Boolean(err?.code && CODIGOS_CONFLICTO_CONSTRAINT.has(err.code));
+}
+
+// NEW: sanitiza mensajes internos de BD para respuestas HTTP del router de Productos.
+// WHY: evitar exponer detalles como `out of range for type integer` al frontend/usuario.
+// IMPACT: solo cambia el texto de errores internos; status codes y logging del servidor se mantienen.
+function getSafeProductosServerErrorMessage(err, fallback = 'No se pudo completar la acción. Verifica los datos e intenta de nuevo.') {
+  const raw = String(err?.message || '').toLowerCase();
+  if (err?.code === CODIGO_SQL_OUT_OF_RANGE) return fallback;
+  if (raw.includes('out of range') && raw.includes('integer')) return fallback;
+  return String(err?.message || fallback);
 }
 
 // GET: Obtener productos
@@ -212,17 +302,22 @@ router.get('/productos', async (req, res) => {
 
     // AJUSTE: se incluye estado para compatibilidad con soft delete
     const columnas =
-      'id_producto, nombre_producto, precio, cantidad, stock_minimo, descripcion_producto, fecha_ingreso_producto, fecha_caducidad, id_categoria_producto, id_almacen, id_tipo_departamento, estado';
+      'id_producto, nombre_producto, precio, cantidad, stock_minimo, descripcion_producto, fecha_ingreso_producto, fecha_caducidad, id_categoria_producto, id_almacen, id_tipo_departamento, estado, id_archivo_imagen_principal';
 
     const query = 'SELECT function_select($1, $2) as resultado';
     const result = await pool.query(query, [tabla, columnas]);
 
-    const datos = result.rows[0].resultado || [];
-    res.status(200).json(datos);
+    const baseDatos = result.rows[0].resultado || [];
+    // NEW: activos por defecto; admin puede solicitar incluir inactivos.
+    // WHY: alinear GET /productos con inactivacion via `estado=false`.
+    // IMPACT: no rompe clientes actuales; amplia el contrato con query param opcional.
+    const datos = shouldIncludeInactive(req.query) ? baseDatos : baseDatos.filter(isRowActive);
+    const datosConImagen = await attachImagenPrincipalUrls(pool, req, datos);
+    res.status(200).json(datosConImagen);
 
   } catch (err) {
     console.error('Error al obtener productos:', err.message);
-    res.status(500).json({ error: true, message: err.message });
+    res.status(500).json({ error: true, message: getSafeProductosServerErrorMessage(err, 'No se pudieron cargar los productos.') });
   }
 });
 
@@ -316,6 +411,22 @@ router.post('/productos', async (req, res) => {
       }
     }
 
+    // NEW: valida la imagen principal cuando el payload incluye FK a `archivos`.
+    // WHY: evitar referencias a archivos inexistentes y fallos de FK mas tarde en la BD.
+    // IMPACT: solo rechaza payloads invalidos; altas validas se mantienen intactas.
+    if (Object.prototype.hasOwnProperty.call(datosNormalizados, 'id_archivo_imagen_principal')) {
+      const existeArchivo = await validarExistenciaFk(
+        'id_archivo_imagen_principal',
+        datosNormalizados.id_archivo_imagen_principal
+      );
+      if (!existeArchivo) {
+        return res.status(400).json({
+          error: true,
+          message: 'id_archivo_imagen_principal no existe en archivos.'
+        });
+      }
+    }
+
     const query = 'CALL pa_insert($1, $2)';
     await pool.query(query, [tabla, datosNormalizados]);
 
@@ -332,7 +443,7 @@ router.post('/productos', async (req, res) => {
       });
     }
 
-    res.status(500).json({ error: true, message: err.message });
+    res.status(500).json({ error: true, message: getSafeProductosServerErrorMessage(err) });
   }
 });
 
@@ -363,10 +474,10 @@ router.put('/productos', async (req, res) => {
 
     // VALIDACION: id objetivo valido
     const idProducto = Number(id_valor);
-    if (!Number.isInteger(idProducto) || idProducto <= 0) {
+    if (!esEnteroPositivoInt32(idProducto)) {
       return res.status(400).json({
         error: true,
-        message: 'id_valor debe ser un entero mayor a 0.'
+        message: 'id_valor debe ser un entero positivo dentro del rango permitido.'
       });
     }
 
@@ -417,16 +528,26 @@ router.put('/productos', async (req, res) => {
       }
     }
 
+    if (campo === 'id_archivo_imagen_principal') {
+      const existeArchivo = await validarExistenciaFk('id_archivo_imagen_principal', resultado.valor);
+      if (!existeArchivo) {
+        return res.status(400).json({
+          error: true,
+          message: 'id_archivo_imagen_principal no existe en archivos.'
+        });
+      }
+    }
+
+    // NEW: desvincula FKs opcionales con SQL NULL real cuando el frontend limpia la imagen/campo.
+    // WHY: evita el error `invalid input syntax for type integer: "null"` reportado al quitar imagen.
+    // IMPACT: `Quitar imagen` y limpieza de departamento opcional funcionan sin tocar el contrato del endpoint.
+    if (resultado.valor === null && await updateProductoFieldToNull(idProducto, campo)) {
+      return res.status(200).json({ message: 'Producto actualizado correctamente.' });
+    }
+
     const tabla = 'productos';
     const query = 'CALL pa_update($1, $2, $3, $4, $5)';
-
-    // AJUSTE: soporte para limpiar id_tipo_departamento enviando null/vacio
-    const valorParaUpdate =
-      campo === 'id_tipo_departamento' && resultado.valor === null
-        ? 'null'
-        : String(resultado.valor);
-
-    await pool.query(query, [tabla, campo, valorParaUpdate, id_campo, String(idProducto)]);
+    await pool.query(query, [tabla, campo, String(resultado.valor), id_campo, String(idProducto)]);
 
     res.status(200).json({ message: 'Producto actualizado correctamente.' });
 
@@ -441,68 +562,75 @@ router.put('/productos', async (req, res) => {
       });
     }
 
-    res.status(500).json({ error: true, message: err.message });
+    res.status(500).json({ error: true, message: getSafeProductosServerErrorMessage(err) });
   }
 });
 
-// DELETE: Eliminar producto
+// DELETE: Inactivar producto (soft delete)
 router.delete('/productos', async (req, res) => {
-  // AJUSTE: se declara fuera del try para reutilizar en hard/soft delete
-  let idProducto = null;
-
   try {
-    const { columna_id, valor_id } = req.body || {};
+    // NEW: fallback compatible para obtener id del producto desde body/query/params sin romper firmas actuales.
+    // WHY: evita `ReferenceError` y tolera clientes legacy que envian distintos nombres del ID.
+    // IMPACT: mantiene el endpoint DELETE /productos y amplia la lectura del ID de forma retrocompatible.
+    const rawIdProducto =
+      req.body?.idProducto ?? req.body?.id_producto ??
+      req.query?.idProducto ?? req.query?.id_producto ??
+      req.params?.idProducto ?? req.params?.id_producto ??
+      req.body?.valor_id ?? req.query?.valor_id;
 
-    if (!columna_id || valor_id === undefined) {
-      return res.status(400).json({ error: true, message: 'Faltan datos para eliminar' });
-    }
+    // NEW: fallback compatible para columna_id con default seguro.
+    // WHY: conservar compatibilidad con la firma actual (`columna_id`,`valor_id`) sin exigirla a otros callers.
+    // IMPACT: si no llega `columna_id`, se asume `id_producto`; payloads existentes siguen funcionando.
+    const columna_id =
+      req.body?.columna_id ?? req.query?.columna_id ?? req.params?.columna_id ?? 'id_producto';
 
     // VALIDACION: columna_id fijo para evitar deletes arbitrarios
     if (columna_id !== 'id_producto') {
       return res.status(400).json({
         error: true,
-        message: 'columna_id invalido. Debe ser exactamente id_producto.'
+        code: 'INVALID_PRODUCT_ID',
+        message: 'ID de producto inválido.'
       });
     }
 
     // VALIDACION: id del producto a eliminar
-    idProducto = Number(valor_id);
-    if (!Number.isInteger(idProducto) || idProducto <= 0) {
+    const idProducto = Number.parseInt(String(rawIdProducto ?? ''), 10);
+    if (!esEnteroPositivoInt32(idProducto)) {
       return res.status(400).json({
         error: true,
-        message: 'valor_id debe ser un entero mayor a 0.'
+        code: 'INVALID_PRODUCT_ID',
+        message: 'ID de producto inválido.'
+      });
+    }
+
+    // NEW: 404 explicito antes de inactivar.
+    // WHY: responder consistente sin depender del comportamiento interno de los SPs.
+    // IMPACT: solo afecta requests hacia IDs inexistentes.
+    const existeProducto = await existeProductoPorId(idProducto);
+    if (!existeProducto) {
+      return res.status(404).json({
+        error: true,
+        code: 'PRODUCT_NOT_FOUND',
+        message: 'Producto no encontrado.'
       });
     }
 
     const tabla = 'productos';
-    const query = 'CALL pa_delete($1, $2, $3)';
+    const query = 'CALL pa_update($1, $2, $3, $4, $5)';
+    await pool.query(query, [tabla, 'estado', 'false', columna_id, String(idProducto)]);
 
-    // AJUSTE: primero intenta hard delete
-    await pool.query(query, [tabla, columna_id, String(idProducto)]);
-
-    return res.status(200).json({ message: 'Producto eliminado.', hard_deleted: true });
+    return res.status(200).json({ error: false, message: 'Producto inactivado.' });
 
   } catch (err) {
-    // NUEVO: fallback soft delete cuando el hard delete falla por FK
-    if (err.code === '23503') {
-      try {
-        await pool.query(
-          'CALL pa_update($1, $2, $3, $4, $5)',
-          ['productos', 'estado', 'false', 'id_producto', String(idProducto)]
-        );
-
-        return res.status(200).json({
-          message: 'Producto desactivado porque est\u00E1 en uso y no se puede eliminar.',
-          soft_deleted: true
-        });
-      } catch (softErr) {
-        console.error('Error al aplicar soft delete de producto:', softErr.message);
-        return res.status(500).json({ error: true, message: softErr.message });
-      }
-    }
-
-    console.error('Error al eliminar producto:', err.message);
-    return res.status(500).json({ error: true, message: err.message });
+    console.error('Error al inactivar producto:', err.message);
+    // NEW: respuesta 500 estandarizada para no exponer detalles internos (ej. ReferenceError / SQL).
+    // WHY: el cliente no debe recibir mensajes crudos como `idProducto is not defined`.
+    // IMPACT: solo cambia el payload de error en DELETE /productos; logging del servidor se conserva.
+    return res.status(500).json({
+      error: true,
+      code: 'INTERNAL_ERROR',
+      message: 'No se pudo completar la acción. Intenta de nuevo.'
+    });
   }
 });
 
