@@ -18,6 +18,7 @@ import detalleOrdenComprasRoutes from './routers/detalle_orden_compras.js';
 import comprasRoutes from './routers/compras.js';
 import detalleComprasRoutes from './routers/detalle_compras.js';
 import sucursalesRoutes from './routers/sucursales.js';
+import ventasRoutes from './routers/ventas.js';
 import menuPosRouter from './routers/menu_pos.js'; // // Router del POS Menú 
 
 //MODULO PERSONAS
@@ -110,6 +111,7 @@ app.use(comprasRoutes);
 app.use(detalleComprasRoutes);
 app.use(tipoDepartamentoRoutes);
 app.use(sucursalesRoutes);
+app.use(ventasRoutes);
 
 //MODULO PERSONAS 
 app.use(personasRoutes);
