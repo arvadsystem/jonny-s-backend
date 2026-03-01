@@ -18,7 +18,7 @@ import detalleOrdenComprasRoutes from './routers/detalle_orden_compras.js';
 import comprasRoutes from './routers/compras.js';
 import detalleComprasRoutes from './routers/detalle_compras.js';
 import sucursalesRoutes from './routers/sucursales.js';
-import menuPosRouter from './routers/menu_pos.js'; // // Router del POS Menú 
+import menuPosRouter from './routers/menu_pos.js'; // // Router del POS Menú
 
 //MODULO PERSONAS
 import personasRoutes from './routers/personas.js';
@@ -32,12 +32,12 @@ import tipoDepartamentoRoutes from './routers/tipos_departamentos.js';
 import movimientosInventarioRoutes from './routers/movimientos_inventario.js';
 import perfilRoutes from './routers/perfil.js';
 
-
 // Seguridad
 import seguridadSesionesRoutes from './routers/seguridad/sesiones.js';
 import seguridadConfigRoutes from './routers/seguridad/configuracion.js';
 import seguridadLoginsRoutes from './routers/seguridad/logins.js';
 import seguridadPermisosRoutes from "./routers/seguridad/permisos.js";
+import seguridadUsuariosRoutes from "./routers/seguridad/usuarios.js";
 import comboPromoRoutes from './routers/combo_promo.js';
 
 import { authRequired, csrfProtect } from './middleware/auth.js';
@@ -46,7 +46,6 @@ import { requireActiveSession } from './middleware/requireActiveSession.js';
 
 // Parametros
 import catalogosRoutes from './routers/Parametros/catalogos.js';
-
 
 const app = express();
 
@@ -88,12 +87,12 @@ app.use(touchSessionMiddleware);     // 3) actualiza ultima_actividad
 app.use(csrfProtect);                // 4) CSRF para no-GET
 app.use(perfilRoutes);
 
-
 // ✅ 4) Rutas protegidas
 app.use('/seguridad', seguridadSesionesRoutes);
 app.use('/seguridad', seguridadConfigRoutes);
 app.use('/seguridad', seguridadLoginsRoutes);
 app.use("/seguridad", seguridadPermisosRoutes);
+app.use("/seguridad", seguridadUsuariosRoutes);
 
 // Parametros
 app.use('/parametros/catalogos', catalogosRoutes);
@@ -111,7 +110,7 @@ app.use(detalleComprasRoutes);
 app.use(tipoDepartamentoRoutes);
 app.use(sucursalesRoutes);
 
-//MODULO PERSONAS 
+//MODULO PERSONAS
 app.use(personasRoutes);
 app.use(telefonosRoutes);
 app.use(direccionesRoutes);
