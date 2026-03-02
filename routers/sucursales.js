@@ -7,23 +7,23 @@ const router = express.Router();
  * Función auxiliar para calcular la diferencia de tiempo
  */
 const calcularAntiguedad = (fechaInauguracion) => {
-  if (!fechaInauguracion) return 'Fecha no registrada';
+    if (!fechaInauguracion) return 'Fecha no registrada';
 
-  const fechaInicio = new Date(fechaInauguracion);
-  const fechaActual = new Date();
+    const fechaInicio = new Date(fechaInauguracion);
+    const fechaActual = new Date();
 
-  let anios = fechaActual.getFullYear() - fechaInicio.getFullYear();
-  let meses = fechaActual.getMonth() - fechaInicio.getMonth();
+    let anios = fechaActual.getFullYear() - fechaInicio.getFullYear();
+    let meses = fechaActual.getMonth() - fechaInicio.getMonth();
 
-  if (meses < 0) {
-    anios--;
-    meses += 12;
-  }
+    if (meses < 0) {
+        anios--;
+        meses += 12;
+    }
 
-  if (anios < 0) return 'Por inaugurar';
+    if (anios < 0) return 'Por inaugurar';
 
-  return `${anios} años, ${meses} meses`;
-};
+    return `${anios} años, ${meses} meses`;
+    };
 
 /**
  * ✅ NUEVO: Inserta dirección/teléfono/correo y luego sucursal (en DB)
@@ -82,18 +82,18 @@ router.get('/sucursales', async (req, res) => {
 // POST: Crear nueva sucursal (COMPLETA)
 // ==========================================
 router.post('/sucursales', async (req, res) => {
-  try {
+try {
     const datos = req.body;
 
-    if (!datos.nombre_sucursal) {
-      return res.status(400).json({ error: true, message: 'El nombre de la sucursal es obligatorio.' });
-    }
+if (!datos.nombre_sucursal) {
+    return res.status(400).json({ error: true, message: 'El nombre de la sucursal es obligatorio.' });
+}
 
     const id = await crearSucursalCompleta(datos);
 
-    res.status(201).json({
-      message: 'Sucursal creada exitosamente.',
-      id_sucursal: id,
+res.status(201).json({
+    message: 'Sucursal creada exitosamente.',
+    id_sucursal: id,
     });
   } catch (err) {
     console.error('Error al crear sucursal:', err.message);
