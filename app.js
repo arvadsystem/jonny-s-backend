@@ -28,6 +28,8 @@ import telefonosRoutes from './routers/telefonos.js';
 import direccionesRoutes from './routers/direcciones.js';
 import correosRoutes from './routers/correos.js';
 import empresasRoutes from './routers/empresas.js';
+import clientesRoutes from './routers/clientes.js';
+import empleadosRoutes from './routers/empleados.js';
 
 // ESTE ARCHIVO EXISTE COMO "tipos_departamentos.js"
 import tipoDepartamentoRoutes from './routers/tipos_departamentos.js';
@@ -136,6 +138,8 @@ app.use(personasRoutes);
 app.use(telefonosRoutes);
 app.use(direccionesRoutes);
 app.use(correosRoutes);
+app.use(clientesRoutes);
+app.use(empleadosRoutes);
 app.use(empresasRoutes);
 app.use(comboPromoRoutes);
 app.use(menuPosRouter); // // Monta las rutas del POS Menú
