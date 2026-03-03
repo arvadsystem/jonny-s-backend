@@ -85,6 +85,32 @@ const parseEntityIdentifier = (value, fieldName) => {
   return { ok: true, value: parsed };
 };
 
+const normalizeObservation = (value) => {
+  if (value === undefined || value === null) return null;
+
+  const normalized = String(value).replace(/\s+/g, ' ').trim();
+  if (!normalized) return null;
+
+  return normalized.slice(0, 200);
+};
+
+const buildKitchenDescriptionSummary = (lines, fallbackValue = null) => {
+  const summary = (Array.isArray(lines) ? lines : [])
+    .filter((line) => line?.requiere_cocina && line?.observacion)
+    .map((line) => `${line.nombre_item}: ${line.observacion}`)
+    .join(' | ')
+    .slice(0, 250);
+
+  if (summary) return summary;
+
+  const fallback =
+    typeof fallbackValue === 'string'
+      ? fallbackValue.replace(/\s+/g, ' ').trim().slice(0, 250)
+      : '';
+
+  return fallback || null;
+};
+
 const inferKitchenItemQuantity = (rawSubtotal, rawUnitPrice) => {
   const subtotal = Number(rawSubtotal || 0);
   const unitPrice = Number(rawUnitPrice || 0);
@@ -106,7 +132,8 @@ const buildDirectSaleDetailItems = (rows) =>
     precio_unitario: roundMoney(row.precio_unitario),
     sub_total: roundMoney(row.sub_total),
     total_linea: roundMoney(row.total_linea),
-    descuento: roundMoney(row.descuento)
+    descuento: roundMoney(row.descuento),
+    observacion: null
   }));
 
 const buildKitchenSaleDetailItems = (rows) =>
@@ -118,7 +145,8 @@ const buildKitchenSaleDetailItems = (rows) =>
     precio_unitario: roundMoney(row.precio_unitario),
     sub_total: roundMoney(row.sub_total),
     total_linea: roundMoney(row.total_linea),
-    descuento: roundMoney(row.descuento)
+    descuento: roundMoney(row.descuento),
+    observacion: normalizeObservation(row.observacion)
   }));
 
 const normalizeVentaItems = (items) => {
@@ -170,7 +198,8 @@ const normalizeVentaItems = (items) => {
       cantidad,
       id_producto: kind === 'PRODUCTO' ? entityId : null,
       id_combo: kind === 'COMBO' ? entityId : null,
-      id_receta: kind === 'RECETA' ? entityId : null
+      id_receta: kind === 'RECETA' ? entityId : null,
+      observacion: normalizeObservation(item.observacion)
     });
   }
 
@@ -418,7 +447,8 @@ const hydrateVentaLines = async (client, normalizedItems) => {
         nombre_item: producto.nombre_producto,
         cantidad: item.cantidad,
         precio_unitario: precioUnitario,
-        sub_total: subTotal
+        sub_total: subTotal,
+        observacion: null
       });
       subTotals.push(subTotal);
       continue;
@@ -454,7 +484,8 @@ const hydrateVentaLines = async (client, normalizedItems) => {
         nombre_item: combo.descripcion || `Combo #${item.id_combo}`,
         cantidad: item.cantidad,
         precio_unitario: precioUnitario,
-        sub_total: subTotal
+        sub_total: subTotal,
+        observacion: item.observacion
       });
       subTotals.push(subTotal);
       continue;
@@ -511,7 +542,8 @@ const hydrateVentaLines = async (client, normalizedItems) => {
       nombre_item: receta.nombre_receta || receta.nombre_producto_base,
       cantidad: item.cantidad,
       precio_unitario: precioUnitario,
-      sub_total: subTotal
+      sub_total: subTotal,
+      observacion: item.observacion
     });
     subTotals.push(subTotal);
   }
@@ -682,8 +714,10 @@ const buildVentaPayload = async ({ client, body, userId }) => {
     ok: true,
     data: {
       metodo_pago: metodoPago,
-      descripcion_pedido:
-        typeof body.descripcion_pedido === 'string' ? body.descripcion_pedido.trim() : null,
+      descripcion_pedido: buildKitchenDescriptionSummary(
+        kitchenLines,
+        typeof body.descripcion_pedido === 'string' ? body.descripcion_pedido : null
+      ),
       descripcion_envio:
         typeof body.descripcion_envio === 'string' ? body.descripcion_envio.trim() : null,
       descuento: descuentoTotal,
@@ -736,6 +770,52 @@ router.get('/ventas/catalogos/clientes', async (req, res) => {
     res.status(200).json(data);
   } catch (err) {
     console.error('Error al listar catalogo de clientes para ventas:', err.message);
+    res.status(500).json({ error: true, message: err.message });
+  }
+});
+
+router.get('/ventas/catalogos/combos', async (req, res) => {
+  try {
+    const result = await pool.query(
+      `
+        SELECT id_combo, descripcion, precio, estado
+        FROM combos
+        WHERE COALESCE(estado, true) = true
+        ORDER BY COALESCE(descripcion, id_combo::text)
+      `
+    );
+
+    res.status(200).json(result.rows);
+  } catch (err) {
+    console.error('Error al listar catalogo de combos para ventas:', err.message);
+    res.status(500).json({ error: true, message: err.message });
+  }
+});
+
+router.get('/ventas/catalogos/recetas', async (req, res) => {
+  try {
+    const result = await pool.query(
+      `
+        SELECT
+          r.id_receta,
+          r.nombre_receta,
+          r.estado,
+          r.id_producto AS id_producto_base,
+          p.nombre_producto AS nombre_producto_base,
+          p.precio,
+          p.estado AS estado_producto_base
+        FROM recetas r
+        LEFT JOIN productos p ON p.id_producto = r.id_producto
+        WHERE COALESCE(r.estado, true) = true
+          AND p.id_producto IS NOT NULL
+          AND COALESCE(p.estado, true) = true
+        ORDER BY COALESCE(r.nombre_receta, p.nombre_producto, r.id_receta::text)
+      `
+    );
+
+    res.status(200).json(result.rows);
+  } catch (err) {
+    console.error('Error al listar catalogo de recetas para ventas:', err.message);
     res.status(500).json({ error: true, message: err.message });
   }
 });
@@ -948,7 +1028,8 @@ router.get('/ventas/:id', async (req, res) => {
           COALESCE(df.precio_unitario, p.precio, 0) AS precio_unitario,
           COALESCE(df.sub_total, 0) AS sub_total,
           COALESCE(df.total_detalle, 0) AS total_linea,
-          COALESCE(d.monto_descuento, 0) AS descuento
+          COALESCE(d.monto_descuento, 0) AS descuento,
+          NULL::varchar(200) AS observacion
         FROM detalle_facturas df
         LEFT JOIN productos p ON p.id_producto = df.id_producto
         LEFT JOIN descuentos d ON d.id_descuento = df.id_descuento
@@ -992,7 +1073,8 @@ router.get('/ventas/:id', async (req, res) => {
             ) AS precio_unitario,
             COALESCE(dp.sub_total_pedido, 0) AS sub_total,
             COALESCE(dp.total_pedido, COALESCE(dp.sub_total_pedido, 0)) AS total_linea,
-            COALESCE(d.monto_descuento, 0) AS descuento
+            COALESCE(d.monto_descuento, 0) AS descuento,
+            dp.observacion
           FROM detalle_pedido dp
           LEFT JOIN productos prod ON prod.id_producto = dp.id_producto
           LEFT JOIN combos combo ON combo.id_combo = dp.id_combo
@@ -1105,9 +1187,10 @@ router.post('/ventas', async (req, res) => {
               id_descuento,
               estado,
               id_combo,
-              id_receta
+              id_receta,
+              observacion
             )
-            VALUES ($1, $2, $3, $4, $5, true, $6, $7)
+            VALUES ($1, $2, $3, $4, $5, true, $6, $7, $8)
           `,
           [
             line.sub_total,
@@ -1116,7 +1199,8 @@ router.post('/ventas', async (req, res) => {
             idPedido,
             line.id_descuento,
             line.id_combo,
-            line.id_receta
+            line.id_receta,
+            line.observacion
           ]
         );
       }

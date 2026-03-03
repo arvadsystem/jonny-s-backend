@@ -75,18 +75,51 @@ const extractPedidoNotes = (descripcionPedido) =>
     .map((segment) => segment.trim())
     .filter(Boolean);
 
+const splitObservationSegments = (value) => {
+  const source = String(value || '').trim();
+  if (!source) return [];
+
+  const separator = source.includes('|') ? '|' : ',';
+  return source
+    .split(separator)
+    .map((segment) => segment.trim())
+    .filter(Boolean);
+};
+
+const stripItemPrefix = (note, itemName) => {
+  const source = String(note || '').trim();
+  if (!source) return '';
+
+  const colonIndex = source.indexOf(':');
+  if (colonIndex === -1) return source;
+
+  const prefix = source.slice(0, colonIndex).trim();
+  const itemKey = normalizeTextKey(itemName).replace(/_/g, ' ');
+  const prefixKey = normalizeTextKey(prefix).replace(/_/g, ' ');
+
+  if (itemKey && prefixKey && (prefixKey.includes(itemKey) || itemKey.includes(prefixKey))) {
+    return source.slice(colonIndex + 1).trim();
+  }
+
+  return source;
+};
+
 const resolveItemModifications = ({ pedidoNotes, itemName, totalItems }) => {
   if (!pedidoNotes.length) return [];
-  if (totalItems <= 1) return pedidoNotes;
+  if (totalItems <= 1) {
+    return pedidoNotes.flatMap((note) => splitObservationSegments(stripItemPrefix(note, itemName)));
+  }
 
   const itemKey = normalizeTextKey(itemName).replace(/_/g, ' ');
   const itemTokens = itemKey.split(' ').filter((token) => token.length >= 4);
 
-  return pedidoNotes.filter((note) => {
-    const noteKey = normalizeTextKey(note).replace(/_/g, ' ');
-    if (itemKey && noteKey.includes(itemKey)) return true;
-    return itemTokens.some((token) => noteKey.includes(token));
-  });
+  return pedidoNotes
+    .filter((note) => {
+      const noteKey = normalizeTextKey(note).replace(/_/g, ' ');
+      if (itemKey && noteKey.includes(itemKey)) return true;
+      return itemTokens.some((token) => noteKey.includes(token));
+    })
+    .flatMap((note) => splitObservationSegments(stripItemPrefix(note, itemName)));
 };
 
 const resolveEstadoCode = (descripcion) => {
@@ -113,6 +146,17 @@ const buildEstadoIdMap = (rows) => {
   rows.forEach((row) => {
     if (row.code && !map.has(row.code)) {
       map.set(row.code, Number(row.id_estado_pedido));
+    }
+  });
+  return map;
+};
+
+const buildEstadoCodeByIdMap = (rows) => {
+  const map = new Map();
+  rows.forEach((row) => {
+    const id = Number(row.id_estado_pedido ?? 0);
+    if (id > 0 && row.code && !map.has(id)) {
+      map.set(id, row.code);
     }
   });
   return map;
@@ -182,6 +226,7 @@ router.get('/cocina/pedidos', async (req, res) => {
             OR COALESCE(s.nombre_sucursal, '') ILIKE ${qParam}
             OR COALESCE(NULLIF(trim(concat_ws(' ', per.nombre, per.apellido)), ''), emp.nombre_empresa, 'Consumidor final') ILIKE ${qParam}
             OR COALESCE(prod.nombre_producto, combo.descripcion, rec.nombre_receta, '') ILIKE ${qParam}
+            OR COALESCE(dp.observacion, p.descripcion_pedido, '') ILIKE ${qParam}
           )
         `);
       }
@@ -213,6 +258,7 @@ router.get('/cocina/pedidos', async (req, res) => {
             dp.id_producto,
             dp.id_combo,
             dp.id_receta,
+            dp.observacion,
             COALESCE(prod.nombre_producto, combo.descripcion, rec.nombre_receta, 'Item de cocina') AS nombre_item,
             COALESCE(
               CASE
@@ -291,6 +337,7 @@ router.get('/cocina/pedidos', async (req, res) => {
             id_receta: Number(row.id_receta ?? 0) || null,
             nombre_item: row.nombre_item || 'Item de cocina',
             cantidad,
+            observacion: row.observacion || null,
             modificaciones: []
           });
           pedido.total_items += cantidad;
@@ -302,14 +349,21 @@ router.get('/cocina/pedidos', async (req, res) => {
         const totalItems = pedido.items.length;
         return {
           ...pedido,
-          items: pedido.items.map((item) => ({
-            ...item,
-            modificaciones: resolveItemModifications({
-              pedidoNotes,
-              itemName: item.nombre_item,
-              totalItems
-            })
-          }))
+          items: pedido.items.map((item) => {
+            const modificaciones = item.observacion
+              ? splitObservationSegments(item.observacion)
+              : resolveItemModifications({
+                  pedidoNotes,
+                  itemName: item.nombre_item,
+                  totalItems
+                });
+
+            return {
+              ...item,
+              observacion: item.observacion,
+              modificaciones
+            };
+          })
         };
       });
 
@@ -345,11 +399,11 @@ router.put('/cocina/pedidos/:id/estado', async (req, res) => {
 
     const estadoRows = await fetchEstadoCatalog(client);
     const estadoIdMap = buildEstadoIdMap(estadoRows);
+    const estadoCodeByIdMap = buildEstadoCodeByIdMap(estadoRows);
     const pedidoResult = await client.query(
       `
-        SELECT p.id_pedido, p.id_estado_pedido, ep.descripcion AS estado_descripcion
+        SELECT p.id_pedido, p.id_estado_pedido
         FROM pedidos p
-        LEFT JOIN estados_pedido ep ON ep.id_estado_pedido = p.id_estado_pedido
         WHERE p.id_pedido = $1
         FOR UPDATE
       `,
@@ -362,7 +416,7 @@ router.put('/cocina/pedidos/:id/estado', async (req, res) => {
     }
 
     const pedido = pedidoResult.rows[0];
-    const estadoActual = resolveEstadoCode(pedido.estado_descripcion);
+    const estadoActual = estadoCodeByIdMap.get(Number(pedido.id_estado_pedido ?? 0)) || null;
 
     if (!estadoActual || !TRANSITIONS[estadoActual]) {
       await client.query('ROLLBACK');
