@@ -37,12 +37,12 @@ import tipoDepartamentoRoutes from './routers/tipos_departamentos.js';
 import movimientosInventarioRoutes from './routers/movimientos_inventario.js';
 import perfilRoutes from './routers/perfil.js';
 
-
 // Seguridad
 import seguridadSesionesRoutes from './routers/seguridad/sesiones.js';
 import seguridadConfigRoutes from './routers/seguridad/configuracion.js';
 import seguridadLoginsRoutes from './routers/seguridad/logins.js';
 import seguridadPermisosRoutes from "./routers/seguridad/permisos.js";
+import seguridadUsuariosRoutes from "./routers/seguridad/usuarios.js";
 import comboPromoRoutes from './routers/combo_promo.js';
 import archivosRoutes from './routers/archivos.js';
 
@@ -53,7 +53,6 @@ import { MAX_IMAGE_JSON_LIMIT, UPLOADS_DIR } from './utils/uploads.js';
 
 // Parametros
 import catalogosRoutes from './routers/Parametros/catalogos.js';
-
 
 const app = express();
 
@@ -102,12 +101,12 @@ app.use(touchSessionMiddleware);     // 3) actualiza ultima_actividad
 app.use(csrfProtect);                // 4) CSRF para no-GET
 app.use(perfilRoutes);
 
-
 // ✅ 4) Rutas protegidas
 app.use('/seguridad', seguridadSesionesRoutes);
 app.use('/seguridad', seguridadConfigRoutes);
 app.use('/seguridad', seguridadLoginsRoutes);
 app.use("/seguridad", seguridadPermisosRoutes);
+app.use("/seguridad", seguridadUsuariosRoutes);
 
 // Parametros
 app.use('/parametros/catalogos', catalogosRoutes);
@@ -135,7 +134,7 @@ app.use(sucursalesRoutes);
 app.use(ventasRoutes);
 app.use(cocinaRoutes);
 
-//MODULO PERSONAS 
+//MODULO PERSONAS
 app.use(personasRoutes);
 app.use(telefonosRoutes);
 app.use(direccionesRoutes);
