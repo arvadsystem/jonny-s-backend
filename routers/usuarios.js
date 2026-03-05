@@ -126,12 +126,16 @@ export default router;
 // ====================================================================================
 
 const USUARIOS_V2_MAX_LIMIT = 100;
-const USUARIOS_V2_IMAGE_MAX_BYTES = 200 * 1024;
 const USUARIOS_V2_FOTO_PERFIL_MAX_LENGTH = 500;
 const USUARIOS_V2_PASSWORD_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789';
 const USUARIOS_V2_BCRYPT_PREFIX_RE = /^\$2[abxy]?\$/i;
 const USUARIOS_V2_IMAGE_DATA_URL_RE = /^data:image\/(png|jpe?g|webp);base64,[A-Za-z0-9+/=]+$/i;
 const USUARIOS_V2_IMAGE_URL_RE = /^(https?:\/\/|\/uploads\/)/i;
+const USUARIOS_V2_CREATE_PASSWORD_MIN = 10;
+// Compatibilidad con login legacy:
+// routers/login.js valida con SQL directo: WHERE nombre_usuario = $1 AND clave = $2
+// por lo tanto, el valor almacenado en usuarios.clave debe coincidir en texto plano.
+const USUARIOS_V2_LOGIN_EXPECTS_PLAIN_PASSWORD = true;
 
 let usuariosV2CapabilitiesPromise = null;
 
@@ -156,6 +160,23 @@ const v2NormalizeText = (value) => {
   return String(value).trim();
 };
 
+const v2ValidateCreatePassword = (plainPassword) => {
+  const value = String(plainPassword ?? '');
+  if (!value) {
+    return { ok: false, message: 'Contrasena requerida' };
+  }
+  if (value.length < USUARIOS_V2_CREATE_PASSWORD_MIN) {
+    return { ok: false, message: 'La contrasena debe tener minimo 10 caracteres' };
+  }
+  if (!/[A-Z]/.test(value)) {
+    return { ok: false, message: 'La contrasena debe incluir al menos una mayuscula (A-Z)' };
+  }
+  if (!/[0-9]/.test(value)) {
+    return { ok: false, message: 'La contrasena debe incluir al menos un numero (0-9)' };
+  }
+  return { ok: true, message: '' };
+};
+
 const v2ToUpperNoAccents = (value) =>
   v2NormalizeText(value)
     .normalize('NFD')
@@ -169,8 +190,6 @@ const v2SplitWords = (value) =>
     .split(/\s+/)
     .map((part) => v2SanitizeUsernameToken(part))
     .filter(Boolean);
-
-const v2IsProduction = () => String(process.env.NODE_ENV || '').toLowerCase() === 'production';
 
 const v2EstimateDataUrlBytes = (dataUrl) => {
   const safe = v2NormalizeText(dataUrl);
@@ -201,7 +220,11 @@ const v2ValidatePhotoPayload = (fotoPerfil) => {
   }
 
   if (isDataImage) {
-    return { ok: true, value };
+    return {
+      ok: false,
+      status: 400,
+      message: 'No se puede guardar archivo directo; use URL de imagen o habilite almacenamiento en servidor.',
+    };
   }
 
   if (isShortUrl) {
@@ -247,6 +270,18 @@ const v2VerifyPassword = async (plainPassword, storedPassword, queryRunner = poo
   return Boolean(result.rows?.[0]?.ok);
 };
 
+const v2BuildPasswordForStorage = async (plainPassword, queryRunner = pool) => {
+  const safePassword = String(plainPassword ?? '');
+  if (!safePassword) throw new Error('La contrasena no puede estar vacia');
+
+  if (USUARIOS_V2_LOGIN_EXPECTS_PLAIN_PASSWORD) {
+    // TODO: migrar login legacy a bcrypt.compare y cambiar esta rama a hash seguro.
+    return safePassword;
+  }
+
+  return v2HashPasswordBcrypt(safePassword, queryRunner);
+};
+
 const v2GenerateTemporaryPassword = async () => {
   const { randomInt } = await import('node:crypto');
   const length = randomInt(10, 13);
@@ -258,86 +293,6 @@ const v2GenerateTemporaryPassword = async () => {
   }
 
   return output;
-};
-
-const v2SendCredentialsEmail = async ({ to, nombreCompleto, nombreUsuario, claveTemporal }) => {
-  const subject = 'Credenciales de acceso - Jonny\'s Smart Order';
-  const text = [
-    `Hola${nombreCompleto ? ` ${nombreCompleto}` : ''},`,
-    '',
-    'Se ha creado su usuario de acceso.',
-    `Usuario: ${nombreUsuario}`,
-    `Contrasena temporal: ${claveTemporal}`,
-    '',
-    'En el primer ingreso se le solicitara cambiar la contrasena.',
-  ].join('\n');
-
-  const html = `
-    <div style="font-family: Arial, sans-serif; line-height: 1.5; color: #111827;">
-      <p>Hola${nombreCompleto ? ` ${nombreCompleto}` : ''},</p>
-      <p>Se ha creado su usuario de acceso.</p>
-      <p><strong>Usuario:</strong> ${nombreUsuario}</p>
-      <p><strong>Contrasena temporal:</strong> ${claveTemporal}</p>
-      <p><strong>En el primer ingreso se le solicitara cambiar la contrasena.</strong></p>
-    </div>
-  `;
-
-  const hasSmtp = Boolean(
-    process.env.SMTP_HOST
-      && process.env.SMTP_PORT
-      && process.env.SMTP_USER
-      && process.env.SMTP_PASS
-  );
-
-  if (!hasSmtp) {
-    if (v2IsProduction()) {
-      throw new Error('SMTP no configurado en produccion');
-    }
-
-    console.log('[USUARIOS_V2][MAIL][DEV_FALLBACK] TO:', to);
-    console.log('[USUARIOS_V2][MAIL][DEV_FALLBACK] SUBJECT:', subject);
-    console.log('[USUARIOS_V2][MAIL][DEV_FALLBACK] BODY:\n' + text);
-    return { delivered: false, mode: 'dev-console' };
-  }
-
-  let nodemailer;
-  try {
-    const mod = await import('nodemailer');
-    nodemailer = mod?.default || mod;
-  } catch (error) {
-    if (v2IsProduction()) {
-      throw new Error('nodemailer no esta instalado en produccion');
-    }
-
-    console.warn('[USUARIOS_V2] nodemailer no disponible, se aplica fallback de desarrollo');
-    console.log('[USUARIOS_V2][MAIL][DEV_FALLBACK] TO:', to);
-    console.log('[USUARIOS_V2][MAIL][DEV_FALLBACK] SUBJECT:', subject);
-    console.log('[USUARIOS_V2][MAIL][DEV_FALLBACK] BODY:\n' + text);
-    return { delivered: false, mode: 'dev-console' };
-  }
-
-  const secure = String(process.env.SMTP_SECURE || '').toLowerCase() === 'true';
-  const port = Number.parseInt(String(process.env.SMTP_PORT), 10) || (secure ? 465 : 587);
-
-  const transporter = nodemailer.createTransport({
-    host: process.env.SMTP_HOST,
-    port,
-    secure,
-    auth: {
-      user: process.env.SMTP_USER,
-      pass: process.env.SMTP_PASS,
-    },
-  });
-
-  await transporter.sendMail({
-    from: process.env.SMTP_FROM || process.env.SMTP_USER,
-    to,
-    subject,
-    text,
-    html,
-  });
-
-  return { delivered: true, mode: 'smtp' };
 };
 
 const v2GetCapabilities = async () => {
@@ -682,6 +637,14 @@ router.post('/usuarios/v2/create', async (req, res) => {
       estado = parsedEstado;
     }
 
+    const plainPassword =
+      v2NormalizeText(req.body?.password)
+      || v2NormalizeText(req.body?.clave_plana);
+    const passwordValidation = v2ValidateCreatePassword(plainPassword);
+    if (!passwordValidation.ok) {
+      return res.status(400).json({ error: true, message: passwordValidation.message });
+    }
+
     await client.query('BEGIN');
 
     const role = await v2FindRoleById(idRol, client);
@@ -694,15 +657,6 @@ router.post('/usuarios/v2/create', async (req, res) => {
     if (!empleado) {
       await client.query('ROLLBACK');
       return res.status(404).json({ error: true, message: 'Empleado no encontrado' });
-    }
-
-    const correoEmpleado = v2NormalizeText(empleado.correo);
-    if (!correoEmpleado) {
-      await client.query('ROLLBACK');
-      return res.status(400).json({
-        error: true,
-        message: 'El empleado debe tener correo para crear el usuario',
-      });
     }
 
     const duplicateEmployee = await client.query(
@@ -722,13 +676,11 @@ router.post('/usuarios/v2/create', async (req, res) => {
       queryRunner: client,
     });
 
-    const temporaryPassword = await v2GenerateTemporaryPassword();
-    const passwordHash = await v2HashPasswordBcrypt(temporaryPassword, client);
-
+    const passwordForStorage = await v2BuildPasswordForStorage(plainPassword, client);
     const capabilities = await v2GetCapabilities();
 
     const insertColumns = ['nombre_usuario', 'clave', 'estado', 'id_empleado'];
-    const insertValues = [generatedUsername, passwordHash, estado, idEmpleado];
+    const insertValues = [generatedUsername, passwordForStorage, estado, idEmpleado];
     const insertFragments = insertValues.map((_, idx) => `$${idx + 1}`);
 
     if (capabilities.hasFechaCreacion) {
@@ -761,28 +713,6 @@ router.post('/usuarios/v2/create', async (req, res) => {
       [idUsuarioCreado, idRol]
     );
 
-    let mailInfo = { delivered: false, mode: 'none' };
-    try {
-      mailInfo = await v2SendCredentialsEmail({
-        to: correoEmpleado,
-        nombreCompleto: `${v2NormalizeText(empleado.nombre)} ${v2NormalizeText(empleado.apellido)}`.trim(),
-        nombreUsuario: generatedUsername,
-        claveTemporal: temporaryPassword,
-      });
-    } catch (mailError) {
-      if (v2IsProduction()) {
-        await client.query('ROLLBACK');
-        return res.status(500).json({
-          error: true,
-          message: `Usuario no creado porque fallo el envio de correo: ${mailError.message}`,
-        });
-      }
-
-      console.warn('[USUARIOS_V2] fallo envio correo en desarrollo:', mailError.message);
-      console.log('[USUARIOS_V2][DEV] Usuario:', generatedUsername);
-      console.log('[USUARIOS_V2][DEV] Clave temporal:', temporaryPassword);
-    }
-
     const usuarioCreado = await v2FetchUsuarioById(idUsuarioCreado, client);
 
     await client.query('COMMIT');
@@ -791,7 +721,6 @@ router.post('/usuarios/v2/create', async (req, res) => {
       error: false,
       message: 'Usuario creado exitosamente',
       usuario: usuarioCreado,
-      correo: mailInfo,
     });
   } catch (err) {
     await client.query('ROLLBACK');
@@ -803,6 +732,7 @@ router.post('/usuarios/v2/create', async (req, res) => {
 });
 
 router.put('/usuarios/v2/update/:id_usuario', async (req, res) => {
+  const client = await pool.connect();
   try {
     const idUsuario = v2ParsePositiveInt(req.params.id_usuario);
     if (!idUsuario) {
@@ -816,6 +746,8 @@ router.put('/usuarios/v2/update/:id_usuario', async (req, res) => {
 
     const updates = [];
     const values = [];
+    const hasRoleUpdate = Object.prototype.hasOwnProperty.call(req.body || {}, 'id_rol');
+    let nextRoleId = null;
 
     if (Object.prototype.hasOwnProperty.call(req.body || {}, 'estado')) {
       const parsedEstado = v2ParseBoolean(req.body.estado);
@@ -841,7 +773,19 @@ router.put('/usuarios/v2/update/:id_usuario', async (req, res) => {
       updates.push(`nombre_usuario = $${values.length}`);
     }
 
-    if (!updates.length) {
+    if (hasRoleUpdate) {
+      nextRoleId = v2ParsePositiveInt(req.body?.id_rol);
+      if (!nextRoleId) {
+        return res.status(400).json({ error: true, message: 'id_rol debe ser un entero positivo' });
+      }
+
+      const role = await v2FindRoleById(nextRoleId, client);
+      if (!role) {
+        return res.status(400).json({ error: true, message: 'Rol no encontrado' });
+      }
+    }
+
+    if (!updates.length && !hasRoleUpdate) {
       return res.status(200).json({
         error: false,
         message: 'No hay cambios para actualizar',
@@ -849,11 +793,25 @@ router.put('/usuarios/v2/update/:id_usuario', async (req, res) => {
       });
     }
 
-    values.push(idUsuario);
-    await pool.query(
-      `UPDATE usuarios SET ${updates.join(', ')} WHERE id_usuario = $${values.length}`,
-      values
-    );
+    await client.query('BEGIN');
+
+    if (updates.length) {
+      values.push(idUsuario);
+      await client.query(
+        `UPDATE usuarios SET ${updates.join(', ')} WHERE id_usuario = $${values.length}`,
+        values
+      );
+    }
+
+    if (hasRoleUpdate && nextRoleId) {
+      await client.query('DELETE FROM roles_usuarios WHERE id_usuario = $1', [idUsuario]);
+      await client.query(
+        'INSERT INTO roles_usuarios (id_usuario, id_rol) VALUES ($1, $2)',
+        [idUsuario, nextRoleId]
+      );
+    }
+
+    await client.query('COMMIT');
 
     const updated = await v2FetchUsuarioById(idUsuario);
     return res.status(200).json({
@@ -862,8 +820,11 @@ router.put('/usuarios/v2/update/:id_usuario', async (req, res) => {
       usuario: updated,
     });
   } catch (err) {
+    try { await client.query('ROLLBACK'); } catch (_) { /* ignore */ }
     console.error('Error en /usuarios/v2/update/:id_usuario:', err.message);
     return res.status(500).json({ error: true, message: 'Error interno del servidor' });
+  } finally {
+    client.release();
   }
 });
 
@@ -1003,10 +964,10 @@ router.post('/usuarios/v2/change-password', async (req, res) => {
     }
 
     const capabilities = await v2GetCapabilities();
-    const passwordHash = await v2HashPasswordBcrypt(claveNueva);
+    const passwordForStorage = await v2BuildPasswordForStorage(claveNueva);
 
     const setParts = ['clave = $1'];
-    const values = [passwordHash];
+    const values = [passwordForStorage];
 
     if (capabilities.mustChangePasswordField) {
       setParts.push(`${capabilities.mustChangePasswordField} = FALSE`);
@@ -1029,6 +990,157 @@ router.post('/usuarios/v2/change-password', async (req, res) => {
     });
   } catch (err) {
     console.error('Error en /usuarios/v2/change-password:', err.message);
+    return res.status(500).json({ error: true, message: 'Error interno del servidor' });
+  }
+});
+
+router.post('/usuarios/v2/generate', async (req, res) => {
+  const client = await pool.connect();
+  let createdUser = null;
+  let temporaryPassword = '';
+
+  try {
+    const idEmpleado = v2ParsePositiveInt(req.body?.id_empleado);
+    const idRol = v2ParsePositiveInt(req.body?.id_rol);
+
+    if (!idEmpleado) {
+      return res.status(400).json({ error: true, message: 'id_empleado es obligatorio y debe ser positivo' });
+    }
+
+    if (!idRol) {
+      return res.status(400).json({ error: true, message: 'id_rol es obligatorio y debe ser positivo' });
+    }
+
+    await client.query('BEGIN');
+
+    const role = await v2FindRoleById(idRol, client);
+    if (!role) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: true, message: 'Rol no encontrado' });
+    }
+
+    const empleado = await v2FindEmployeeForUser(idEmpleado, client);
+    if (!empleado) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: true, message: 'Empleado no encontrado' });
+    }
+
+    const duplicateEmployee = await client.query(
+      'SELECT id_usuario FROM usuarios WHERE id_empleado = $1 LIMIT 1',
+      [idEmpleado]
+    );
+
+    if (duplicateEmployee.rows.length > 0) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({ error: true, message: 'Empleado ya tiene usuario' });
+    }
+
+    const generatedUsername = await v2BuildUniqueUsername({
+      nombre: empleado.nombre,
+      apellido: empleado.apellido,
+      idEmpleado,
+      queryRunner: client,
+    });
+
+    temporaryPassword = await v2GenerateTemporaryPassword();
+    const passwordForStorage = await v2BuildPasswordForStorage(temporaryPassword, client);
+    const capabilities = await v2GetCapabilities();
+
+    const insertColumns = ['nombre_usuario', 'clave', 'estado', 'id_empleado'];
+    const insertValues = [generatedUsername, passwordForStorage, true, idEmpleado];
+    const insertFragments = insertValues.map((_, idx) => `$${idx + 1}`);
+
+    if (capabilities.hasFechaCreacion) {
+      insertColumns.push('fecha_creacion');
+      insertFragments.push('NOW()');
+    }
+
+    if (capabilities.mustChangePasswordField) {
+      insertColumns.push(capabilities.mustChangePasswordField);
+      insertValues.push(true);
+      insertFragments.push(`$${insertValues.length}`);
+    }
+
+    const insertResult = await client.query(
+      `
+        INSERT INTO usuarios (${insertColumns.join(', ')})
+        VALUES (${insertFragments.join(', ')})
+        RETURNING id_usuario
+      `,
+      insertValues
+    );
+
+    const idUsuarioCreado = insertResult.rows?.[0]?.id_usuario;
+    if (!idUsuarioCreado) {
+      throw new Error('No se pudo obtener el id del usuario creado');
+    }
+
+    await client.query(
+      'INSERT INTO roles_usuarios (id_usuario, id_rol) VALUES ($1, $2)',
+      [idUsuarioCreado, idRol]
+    );
+
+    createdUser = await v2FetchUsuarioById(idUsuarioCreado, client);
+    await client.query('COMMIT');
+
+    return res.status(201).json({
+      ok: true,
+      usuario: {
+        id_usuario: createdUser?.id_usuario,
+        nombre_usuario: createdUser?.nombre_usuario,
+        estado: createdUser?.estado,
+        fecha_creacion: createdUser?.fecha_creacion,
+        foto_perfil: createdUser?.foto_perfil || '',
+        id_empleado: createdUser?.id_empleado,
+      },
+      temp_password: temporaryPassword,
+    });
+  } catch (err) {
+    try { await client.query('ROLLBACK'); } catch (_) { /* ignore */ }
+    console.error('Error en /usuarios/v2/generate:', err.message);
+    return res.status(500).json({ error: true, message: 'Error interno del servidor' });
+  } finally {
+    client.release();
+  }
+});
+
+router.post('/usuarios/v2/reset-password/:id_usuario', async (req, res) => {
+  try {
+    const idUsuario = v2ParsePositiveInt(req.params.id_usuario);
+    if (!idUsuario) {
+      return res.status(400).json({ error: true, message: 'id_usuario invalido' });
+    }
+
+    const currentUser = await v2FetchUsuarioById(idUsuario);
+    if (!currentUser) {
+      return res.status(404).json({ error: true, message: 'Usuario no encontrado' });
+    }
+
+    const temporaryPassword = await v2GenerateTemporaryPassword();
+    const passwordForStorage = await v2BuildPasswordForStorage(temporaryPassword);
+    const capabilities = await v2GetCapabilities();
+
+    const setParts = ['clave = $1'];
+    const values = [passwordForStorage];
+
+    if (capabilities.mustChangePasswordField) {
+      setParts.push(`${capabilities.mustChangePasswordField} = TRUE`);
+    }
+
+    values.push(idUsuario);
+
+    await pool.query(
+      `UPDATE usuarios SET ${setParts.join(', ')} WHERE id_usuario = $${values.length}`,
+      values
+    );
+
+    return res.status(200).json({
+      ok: true,
+      nombre_usuario: currentUser?.nombre_usuario || null,
+      temp_password: temporaryPassword,
+    });
+  } catch (err) {
+    console.error('Error en /usuarios/v2/reset-password/:id_usuario:', err.message);
     return res.status(500).json({ error: true, message: 'Error interno del servidor' });
   }
 });
