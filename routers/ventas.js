@@ -685,15 +685,17 @@ const buildVentaPayload = async ({ client, body, userId }) => {
 
   const idCaja = await resolveCajaId(client, idSucursal, userId);
   const kitchenLines = finalizedLines.filter((line) => line.requiere_cocina);
-  const directLines = finalizedLines.filter((line) => !line.requiere_cocina);
+  const requiresPedido = kitchenLines.length > 0;
+  const pedidoLines = requiresPedido ? finalizedLines : [];
+  const directLines = requiresPedido ? [] : finalizedLines;
   const pedidoSubtotal = roundMoney(
-    kitchenLines.reduce((sum, line) => sum + line.total_linea, 0)
+    pedidoLines.reduce((sum, line) => sum + line.total_linea, 0)
   );
   const pedidoIsv = roundMoney(pedidoSubtotal * 0.15);
   const pedidoTotal = roundMoney(pedidoSubtotal + pedidoIsv);
 
   let idEstadoPedido = null;
-  if (kitchenLines.length > 0) {
+  if (requiresPedido) {
     idEstadoPedido =
       requestedEstadoPedido || (await resolveEstadoPedidoIdByCode(client, 'EN_COCINA'));
 
@@ -731,8 +733,10 @@ const buildVentaPayload = async ({ client, body, userId }) => {
       id_sucursal: idSucursal,
       id_estado_pedido: idEstadoPedido,
       id_usuario: userId,
+      all_lines: finalizedLines,
       direct_lines: directLines,
-      kitchen_lines: kitchenLines,
+      pedido_lines: pedidoLines,
+      requires_pedido: requiresPedido,
       pedido_subtotal: pedidoSubtotal,
       pedido_isv: pedidoIsv,
       pedido_total: pedidoTotal
@@ -900,7 +904,10 @@ router.get('/ventas', async (req, res) => {
         f.fecha_hora_facturacion,
         f.isv_15,
         f.isv_18,
-        COALESCE(df_info.total_items, dp_info.total_items, 0) AS total_items,
+        CASE
+          WHEN f.id_pedido IS NOT NULL THEN COALESCE(dp_info.total_items, 0)
+          ELSE COALESCE(df_info.total_items, 0)
+        END AS total_items,
         COALESCE(df_info.descuento_total, 0) AS descuento_total
       FROM facturas f
       LEFT JOIN pedidos p ON p.id_pedido = f.id_pedido
@@ -920,8 +927,41 @@ router.get('/ventas', async (req, res) => {
         WHERE df.id_factura = f.id_factura
       ) df_info ON true
       LEFT JOIN LATERAL (
-        SELECT COUNT(*)::int AS total_items
+        SELECT
+          COALESCE(
+            SUM(
+              CASE
+                WHEN dp.id_producto IS NOT NULL THEN GREATEST(
+                  1,
+                  ROUND(
+                    COALESCE(NULLIF(dp.sub_total_pedido, 0), dp.total_pedido, 0)
+                    / NULLIF(prod_dp.precio, 0)
+                  )::int
+                )
+                WHEN dp.id_combo IS NOT NULL THEN GREATEST(
+                  1,
+                  ROUND(
+                    COALESCE(NULLIF(dp.sub_total_pedido, 0), dp.total_pedido, 0)
+                    / NULLIF(combo_dp.precio, 0)
+                  )::int
+                )
+                WHEN dp.id_receta IS NOT NULL THEN GREATEST(
+                  1,
+                  ROUND(
+                    COALESCE(NULLIF(dp.sub_total_pedido, 0), dp.total_pedido, 0)
+                    / NULLIF(prod_rec_dp.precio, 0)
+                  )::int
+                )
+                ELSE 1
+              END
+            ),
+            0
+          )::int AS total_items
         FROM detalle_pedido dp
+        LEFT JOIN productos prod_dp ON prod_dp.id_producto = dp.id_producto
+        LEFT JOIN combos combo_dp ON combo_dp.id_combo = dp.id_combo
+        LEFT JOIN recetas rec_dp ON rec_dp.id_receta = dp.id_receta
+        LEFT JOIN productos prod_rec_dp ON prod_rec_dp.id_producto = rec_dp.id_producto
         WHERE dp.id_pedido = f.id_pedido
           AND COALESCE(dp.estado, true) = true
       ) dp_info ON true
@@ -1014,36 +1054,8 @@ router.get('/ventas/:id', async (req, res) => {
 
     const venta = headerResult.rows[0];
 
-    const directItemsResult = await pool.query(
-      `
-        SELECT
-          df.id_detalle_factura AS id_detalle,
-          'PRODUCTO' AS tipo_item,
-          df.id_producto,
-          NULL::int AS id_combo,
-          NULL::int AS id_receta,
-          p.nombre_producto AS nombre_item,
-          p.nombre_producto,
-          COALESCE(df.cantidad, 1) AS cantidad,
-          COALESCE(df.precio_unitario, p.precio, 0) AS precio_unitario,
-          COALESCE(df.sub_total, 0) AS sub_total,
-          COALESCE(df.total_detalle, 0) AS total_linea,
-          COALESCE(d.monto_descuento, 0) AS descuento,
-          NULL::varchar(200) AS observacion
-        FROM detalle_facturas df
-        LEFT JOIN productos p ON p.id_producto = df.id_producto
-        LEFT JOIN descuentos d ON d.id_descuento = df.id_descuento
-        WHERE df.id_factura = $1
-          AND df.id_producto IS NOT NULL
-        ORDER BY df.id_detalle_factura
-      `,
-      [venta.id_factura]
-    );
-
-    let kitchenItems = [];
-
     if (venta.id_pedido) {
-      const kitchenItemsResult = await pool.query(
+      const pedidoItemsResult = await pool.query(
         `
           SELECT
             dp.id_detalle_pedido AS id_detalle,
@@ -1088,17 +1100,47 @@ router.get('/ventas/:id', async (req, res) => {
         [venta.id_pedido]
       );
 
-      kitchenItems = buildKitchenSaleDetailItems(kitchenItemsResult.rows);
+      return res.status(200).json({
+        ...venta,
+        numero_venta: formatVentaNumero(venta.id_factura),
+        metodo_pago: 'efectivo',
+        items: buildKitchenSaleDetailItems(pedidoItemsResult.rows)
+      });
     }
 
+    const directItemsResult = await pool.query(
+      `
+        SELECT
+          df.id_detalle_factura AS id_detalle,
+          'PRODUCTO' AS tipo_item,
+          df.id_producto,
+          NULL::int AS id_combo,
+          NULL::int AS id_receta,
+          p.nombre_producto AS nombre_item,
+          p.nombre_producto,
+          COALESCE(df.cantidad, 1) AS cantidad,
+          COALESCE(df.precio_unitario, p.precio, 0) AS precio_unitario,
+          COALESCE(df.sub_total, 0) AS sub_total,
+          COALESCE(df.total_detalle, 0) AS total_linea,
+          COALESCE(d.monto_descuento, 0) AS descuento,
+          NULL::varchar(200) AS observacion
+        FROM detalle_facturas df
+        LEFT JOIN productos p ON p.id_producto = df.id_producto
+        LEFT JOIN descuentos d ON d.id_descuento = df.id_descuento
+        WHERE df.id_factura = $1
+          AND df.id_producto IS NOT NULL
+        ORDER BY df.id_detalle_factura
+      `,
+      [venta.id_factura]
+    );
+
     const directItems = buildDirectSaleDetailItems(directItemsResult.rows);
-    const items = [...directItems, ...kitchenItems];
 
     res.status(200).json({
       ...venta,
       numero_venta: formatVentaNumero(venta.id_factura),
       metodo_pago: 'efectivo',
-      items
+      items: directItems
     });
   } catch (err) {
     console.error('Error al obtener detalle de venta:', err.message);
@@ -1125,7 +1167,7 @@ router.post('/ventas', async (req, res) => {
     }
 
     const venta = prepared.data;
-    const allLines = [...venta.direct_lines, ...venta.kitchen_lines];
+    const allLines = [...venta.all_lines];
 
     for (const line of allLines) {
       let idDescuento = null;
@@ -1143,7 +1185,7 @@ router.post('/ventas', async (req, res) => {
 
     let idPedido = null;
 
-    if (venta.kitchen_lines.length > 0) {
+    if (venta.requires_pedido) {
       const pedidoResult = await client.query(
         `
           INSERT INTO pedidos (
@@ -1176,7 +1218,7 @@ router.post('/ventas', async (req, res) => {
 
       idPedido = pedidoResult.rows[0].id_pedido;
 
-      for (const line of venta.kitchen_lines) {
+      for (const line of venta.pedido_lines) {
         await client.query(
           `
             INSERT INTO detalle_pedido (
@@ -1237,7 +1279,7 @@ router.post('/ventas', async (req, res) => {
 
     const idFactura = facturaResult.rows[0].id_factura;
 
-    for (const line of venta.direct_lines) {
+    for (const line of venta.all_lines) {
       await client.query(
         `
           INSERT INTO detalle_facturas (
@@ -1250,37 +1292,11 @@ router.post('/ventas', async (req, res) => {
             total_detalle,
             id_pedido
           )
-          VALUES ($1, $2, $3, $4, $5, $6, $7, NULL)
+          VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
         `,
         [
           idFactura,
           line.id_producto,
-          line.id_descuento,
-          line.cantidad,
-          line.precio_unitario,
-          line.sub_total,
-          line.total_linea
-        ]
-      );
-    }
-
-    for (const line of venta.kitchen_lines) {
-      await client.query(
-        `
-          INSERT INTO detalle_facturas (
-            id_factura,
-            id_producto,
-            id_descuento,
-            cantidad,
-            precio_unitario,
-            sub_total,
-            total_detalle,
-            id_pedido
-          )
-          VALUES ($1, NULL, $2, $3, $4, $5, $6, $7)
-        `,
-        [
-          idFactura,
           line.id_descuento,
           line.cantidad,
           line.precio_unitario,
