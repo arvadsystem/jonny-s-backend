@@ -12,6 +12,35 @@ import { createSession, closeSession } from '../utils/security/sessionService.js
 const router = express.Router();
 
 const JWT_SECRET = process.env.JWT_SECRET || 'CAMBIA_ESTE_SECRET_EN_ENV';
+const MUST_CHANGE_PASSWORD_FIELDS = [
+  'must_change_password',
+  'debe_cambiar_clave',
+  'requiere_cambio_clave',
+  'force_password_change',
+  'password_temporal',
+];
+
+const parseMustChangePasswordValue = (value) => {
+  if (value === true || value === false) return value;
+  if (value === 1 || value === 0) return value === 1;
+  if (typeof value !== 'string') return false;
+
+  const normalized = value.trim().toLowerCase();
+  if (['true', '1', 't', 'si', 'yes', 'y', 'activo', 'activa'].includes(normalized)) return true;
+  if (['false', '0', 'f', 'no', 'n', 'inactivo', 'inactiva'].includes(normalized)) return false;
+  return false;
+};
+
+const resolveMustChangePassword = (row) => {
+  if (!row || typeof row !== 'object') return false;
+
+  for (const field of MUST_CHANGE_PASSWORD_FIELDS) {
+    if (!Object.prototype.hasOwnProperty.call(row, field)) continue;
+    return parseMustChangePasswordValue(row[field]);
+  }
+
+  return false;
+};
 
 const cookieConfig = () => {
   const isProd = process.env.NODE_ENV === 'production';
@@ -84,6 +113,7 @@ router.post('/login', async (req, res) => {
       id_usuario: usuarioEncontrado.id_usuario,
       nombre_usuario: usuarioEncontrado.nombre_usuario,
       rol: usuarioEncontrado.id_empleado,
+      must_change_password: resolveMustChangePassword(usuarioEncontrado),
       sid: id_sesion // HU79: id de sesión actual
     };
 
@@ -168,12 +198,34 @@ router.post('/logout', authRequired, async (req, res) => {
   return res.json({ message: 'Logout exitoso' });
 });
 
-router.get('/me', authRequired, (req, res) => {
+router.get('/me', authRequired, async (req, res) => {
   // Re-emite CSRF por si el frontend refresca y lo perdió
   const csrfToken = issueCsrf(res);
+  const usuario = { ...(req.user || {}) };
+
+  try {
+    const idUsuario = Number.parseInt(String(usuario?.id_usuario ?? ''), 10);
+    if (Number.isInteger(idUsuario) && idUsuario > 0) {
+      const result = await pool.query(
+        'SELECT * FROM usuarios WHERE id_usuario = $1 LIMIT 1',
+        [idUsuario]
+      );
+
+      if (result.rows.length > 0) {
+        usuario.must_change_password = resolveMustChangePassword(result.rows[0]);
+      } else if (!Object.prototype.hasOwnProperty.call(usuario, 'must_change_password')) {
+        usuario.must_change_password = false;
+      }
+    }
+  } catch (error) {
+    console.error('Error en /me al resolver must_change_password:', error);
+    if (!Object.prototype.hasOwnProperty.call(usuario, 'must_change_password')) {
+      usuario.must_change_password = false;
+    }
+  }
 
   return res.json({
-    usuario: req.user,
+    usuario,
     csrfToken
   });
 });
