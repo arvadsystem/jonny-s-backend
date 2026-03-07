@@ -55,6 +55,8 @@ import { MAX_IMAGE_JSON_LIMIT, UPLOADS_DIR } from './utils/uploads.js';
 import catalogosRoutes from './routers/Parametros/catalogos.js';
 
 const app = express();
+const USUARIOS_PHOTO_JSON_LIMIT = '30mb';
+
 
 const FRONTEND_ORIGIN = process.env.FRONTEND_ORIGIN || 'http://localhost:5173';
 
@@ -74,6 +76,7 @@ app.use(
 // NEW: aumenta el limite JSON para soportar uploads base64 de imagen sin multipart.
 // WHY: el modulo Inventario enviara imagenes como data URL / base64 por JSON.
 // IMPACT: mantiene el parser global actual y habilita cuerpos de imagen dentro del limite definido.
+app.use('/usuarios/v2/photo', express.json({ limit: USUARIOS_PHOTO_JSON_LIMIT }));
 app.use(express.json({ limit: MAX_IMAGE_JSON_LIMIT }));
 app.use(cookieParser());
 // NEW: exposicion publica de `/uploads` para thumbnails e imagen principal de inventario.

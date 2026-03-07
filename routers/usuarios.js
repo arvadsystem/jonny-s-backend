@@ -1,5 +1,13 @@
 import express from 'express';
+import crypto from 'node:crypto';
+import fs from 'fs/promises';
+import path from 'path';
 import pool from '../config/db-connection.js';
+import {
+  ALLOWED_IMAGE_MIME_TYPES,
+  UPLOADS_DIR,
+  detectImageMimeTypeFromBuffer
+} from '../utils/uploads.js';
 
 const router = express.Router();
 
@@ -127,6 +135,11 @@ export default router;
 
 const USUARIOS_V2_MAX_LIMIT = 100;
 const USUARIOS_V2_FOTO_PERFIL_MAX_LENGTH = 500;
+const USUARIOS_V2_IMAGE_MAX_BYTES = 20 * 1024 * 1024;
+const USUARIOS_V2_UPLOADS_SUBDIR = 'usuarios';
+const USUARIOS_V2_UPLOADS_PREFIX = '/uploads/usuarios/';
+const USUARIOS_V2_BASE64_BODY_REGEX = /^[A-Za-z0-9+/]+={0,2}$/;
+const USUARIOS_V2_DATA_URL_PARSE_RE = /^data:(image\/(?:png|jpe?g|webp));base64,([A-Za-z0-9+/=]+)$/i;
 const USUARIOS_V2_PASSWORD_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789';
 const USUARIOS_V2_BCRYPT_PREFIX_RE = /^\$2[abxy]?\$/i;
 const USUARIOS_V2_IMAGE_DATA_URL_RE = /^data:image\/(png|jpe?g|webp);base64,[A-Za-z0-9+/=]+$/i;
@@ -202,33 +215,153 @@ const v2EstimateDataUrlBytes = (dataUrl) => {
   return Math.floor((base64.length * 3) / 4) - padding;
 };
 
+const v2ParseDataImagePayload = (dataUrl) => {
+  const value = v2NormalizeText(dataUrl);
+  const match = value.match(USUARIOS_V2_DATA_URL_PARSE_RE);
+  if (!match) {
+    return {
+      ok: false,
+      status: 400,
+      message: 'Formato de foto no valido. Use una URL (http/https o /uploads/...) o una imagen mas ligera.',
+    };
+  }
+
+  return {
+    ok: true,
+    mimeType: String(match[1] || '').toLowerCase(),
+    base64Body: String(match[2] || ''),
+  };
+};
+
+const v2DecodeBase64Image = (base64Body) => {
+  const normalized = String(base64Body || '').replace(/\s+/g, '');
+  if (!normalized || normalized.length % 4 !== 0 || !USUARIOS_V2_BASE64_BODY_REGEX.test(normalized)) {
+    return {
+      ok: false,
+      status: 400,
+      message: 'Formato de foto no valido. Use una URL (http/https o /uploads/...) o una imagen mas ligera.',
+    };
+  }
+
+  const buffer = Buffer.from(normalized, 'base64');
+  if (!Buffer.isBuffer(buffer) || buffer.length <= 0) {
+    return {
+      ok: false,
+      status: 400,
+      message: 'Formato de foto no valido. Use una URL (http/https o /uploads/...) o una imagen mas ligera.',
+    };
+  }
+
+  if (buffer.length > USUARIOS_V2_IMAGE_MAX_BYTES) {
+    return {
+      ok: false,
+      status: 413,
+      message: 'La imagen supera el limite de 20 MB.',
+    };
+  }
+
+  return { ok: true, buffer };
+};
+
+const v2EnsureUsuariosUploadsDir = async () => {
+  await fs.mkdir(path.join(UPLOADS_DIR, USUARIOS_V2_UPLOADS_SUBDIR), { recursive: true });
+};
+
+const v2BuildUsuariosStoredPath = (fileName) => `${USUARIOS_V2_UPLOADS_PREFIX}${fileName}`;
+
+const v2StorePhotoDataUrlAsFile = async (dataUrl) => {
+  const parsed = v2ParseDataImagePayload(dataUrl);
+  if (!parsed.ok) return parsed;
+
+  const decoded = v2DecodeBase64Image(parsed.base64Body);
+  if (!decoded.ok) return decoded;
+
+  const detectedMimeType = detectImageMimeTypeFromBuffer(decoded.buffer);
+  const declaredMimeType = parsed.mimeType;
+  const effectiveMimeType = detectedMimeType || declaredMimeType;
+
+  if (!effectiveMimeType || !Object.prototype.hasOwnProperty.call(ALLOWED_IMAGE_MIME_TYPES, effectiveMimeType)) {
+    return {
+      ok: false,
+      status: 400,
+      message: 'Solo se permiten imagenes JPG, PNG o WEBP.',
+    };
+  }
+
+  if (declaredMimeType && detectedMimeType && declaredMimeType !== detectedMimeType) {
+    return {
+      ok: false,
+      status: 400,
+      message: 'El tipo de archivo de la imagen no coincide con su contenido.',
+    };
+  }
+
+  const extension = ALLOWED_IMAGE_MIME_TYPES[effectiveMimeType];
+  const fileName = `usuario-${Date.now()}-${crypto.randomUUID()}.${extension}`;
+  const fileAbsolutePath = path.join(UPLOADS_DIR, USUARIOS_V2_UPLOADS_SUBDIR, fileName);
+  const storedPath = v2BuildUsuariosStoredPath(fileName);
+
+  await v2EnsureUsuariosUploadsDir();
+  await fs.writeFile(fileAbsolutePath, decoded.buffer, { flag: 'wx' });
+
+  return {
+    ok: true,
+    storedPath,
+    writtenFileAbsolutePath: fileAbsolutePath,
+  };
+};
+
+const v2TryDeleteUsuariosStoredFile = async (storedPath) => {
+  const safe = v2NormalizeText(storedPath);
+  if (!safe.startsWith(USUARIOS_V2_UPLOADS_PREFIX)) return;
+
+  const fileName = safe.slice(USUARIOS_V2_UPLOADS_PREFIX.length).trim();
+  if (!fileName || fileName.includes('/') || fileName.includes('\\')) return;
+
+  const absolutePath = path.join(UPLOADS_DIR, USUARIOS_V2_UPLOADS_SUBDIR, fileName);
+  await fs.unlink(absolutePath).catch(() => null);
+};
+
 const v2ValidatePhotoPayload = (fotoPerfil) => {
   if (fotoPerfil === null || fotoPerfil === undefined || v2NormalizeText(fotoPerfil) === '') {
-    return { ok: true, value: '' };
+    return { ok: true, value: '', kind: 'empty' };
   }
 
   const value = v2NormalizeText(fotoPerfil);
   const isDataImage = USUARIOS_V2_IMAGE_DATA_URL_RE.test(value);
   const isShortUrl = USUARIOS_V2_IMAGE_URL_RE.test(value);
 
+  if (isDataImage) {
+    const estimatedBytes = v2EstimateDataUrlBytes(value);
+    if (estimatedBytes <= 0) {
+      return {
+        ok: false,
+        status: 400,
+        message: 'Formato de foto no valido. Use una URL (http/https o /uploads/...) o una imagen mas ligera.',
+      };
+    }
+
+    if (estimatedBytes > USUARIOS_V2_IMAGE_MAX_BYTES) {
+      return {
+        ok: false,
+        status: 413,
+        message: 'La imagen supera el limite de 20 MB.',
+      };
+    }
+
+    return { ok: true, value, kind: 'data_url' };
+  }
+
   if (value.length > USUARIOS_V2_FOTO_PERFIL_MAX_LENGTH) {
     return {
       ok: false,
       status: 413,
-      message: 'La imagen es demasiado grande para almacenarse. Use una URL o una imagen mas ligera.',
-    };
-  }
-
-  if (isDataImage) {
-    return {
-      ok: false,
-      status: 400,
-      message: 'No se puede guardar archivo directo; use URL de imagen o habilite almacenamiento en servidor.',
+      message: 'URL de imagen demasiado larga. Maximo 500 caracteres.',
     };
   }
 
   if (isShortUrl) {
-    return { ok: true, value };
+    return { ok: true, value, kind: 'url' };
   }
 
   return {
@@ -829,6 +962,7 @@ router.put('/usuarios/v2/update/:id_usuario', async (req, res) => {
 });
 
 router.put('/usuarios/v2/photo/:id_usuario', async (req, res) => {
+  let writtenFileAbsolutePath = '';
   try {
     const idUsuario = v2ParsePositiveInt(req.params.id_usuario);
     if (!idUsuario) {
@@ -840,20 +974,48 @@ router.put('/usuarios/v2/photo/:id_usuario', async (req, res) => {
     }
 
     const fotoPerfil = req.body?.foto_perfil;
-    console.log('foto_perfil length:', typeof fotoPerfil === 'string' ? fotoPerfil.length : null);
 
     const photoValidation = v2ValidatePhotoPayload(fotoPerfil);
     if (!photoValidation.ok) {
       return res.status(photoValidation.status || 400).json({ error: true, message: photoValidation.message });
     }
 
+    const existingResult = await pool.query(
+      'SELECT foto_perfil FROM usuarios WHERE id_usuario = $1 LIMIT 1',
+      [idUsuario]
+    );
+    const existingUsuario = existingResult.rows?.[0] || null;
+    if (!existingUsuario) {
+      return res.status(404).json({ error: true, message: 'Usuario no encontrado' });
+    }
+
+    const previousStoredPhoto = v2NormalizeText(existingUsuario.foto_perfil);
+    let valueToPersist = photoValidation.value;
+
+    if (photoValidation.kind === 'data_url') {
+      const storedPhoto = await v2StorePhotoDataUrlAsFile(photoValidation.value);
+      if (!storedPhoto.ok) {
+        return res.status(storedPhoto.status || 400).json({ error: true, message: storedPhoto.message });
+      }
+
+      writtenFileAbsolutePath = storedPhoto.writtenFileAbsolutePath || '';
+      valueToPersist = storedPhoto.storedPath;
+    }
+
     const result = await pool.query(
       'UPDATE usuarios SET foto_perfil = $1 WHERE id_usuario = $2',
-      [photoValidation.value, idUsuario]
+      [valueToPersist, idUsuario]
     );
 
     if (!result.rowCount) {
+      if (writtenFileAbsolutePath) {
+        await fs.unlink(writtenFileAbsolutePath).catch(() => null);
+      }
       return res.status(404).json({ error: true, message: 'Usuario no encontrado' });
+    }
+
+    if (previousStoredPhoto && previousStoredPhoto !== valueToPersist) {
+      await v2TryDeleteUsuariosStoredFile(previousStoredPhoto);
     }
 
     const updated = await v2FetchUsuarioById(idUsuario);
@@ -863,6 +1025,12 @@ router.put('/usuarios/v2/photo/:id_usuario', async (req, res) => {
       usuario: updated,
     });
   } catch (err) {
+    if (writtenFileAbsolutePath) {
+      await fs.unlink(writtenFileAbsolutePath).catch(() => null);
+    }
+    if (err?.code === '22001') {
+      return res.status(413).json({ error: true, message: 'URL de imagen demasiado larga. Maximo 500 caracteres.' });
+    }
     console.error('Error en /usuarios/v2/photo/:id_usuario:', err.message);
     return res.status(500).json({ error: true, message: 'Error interno del servidor' });
   }
