@@ -206,32 +206,24 @@ router.post('/menu-pos/archivos/upload', async (req, res) => {
       });
     }
 
-    const tabla = 'archivos';
-    const datos = {
-      nombre_original: String(nombre_original),
-      url_publica: String(url_publica),
-      tipo_archivo: tipo_archivo ? String(tipo_archivo) : null,
-      tamano_bytes: size,
-      fecha_creacion: new Date().toISOString(),
-      estado: true,
-      id_usuario: idUser
-    };
-
-    await pool.query('CALL pa_insert($1, $2)', [tabla, datos]);
-
-    const seqQuery = `
-      SELECT currval(pg_get_serial_sequence('public.archivos', 'id_archivo')) AS id_archivo;
+    // INSERT explicito para evitar desalineaciones de columnas/valores en pa_insert.
+    const insertQuery = `
+      INSERT INTO archivos (
+        nombre_original,
+        url_publica,
+        tipo_archivo,
+        tamano_bytes,
+        id_usuario
+      ) VALUES ($1, $2, $3, $4, $5)
+      RETURNING id_archivo, nombre_original, url_publica, tipo_archivo, tamano_bytes, fecha_creacion, estado, id_usuario;
     `;
-    const seqResult = await pool.query(seqQuery);
-    const nuevoIdArchivo = seqResult.rows[0]?.id_archivo;
-
-    const selectQuery = `
-      SELECT id_archivo, nombre_original, url_publica, tipo_archivo, tamano_bytes, fecha_creacion, estado, id_usuario
-      FROM archivos
-      WHERE id_archivo = $1
-      LIMIT 1;
-    `;
-    const result = await pool.query(selectQuery, [nuevoIdArchivo]);
+    const result = await pool.query(insertQuery, [
+      String(nombre_original),
+      String(url_publica),
+      tipo_archivo ? String(tipo_archivo) : null,
+      size,
+      idUser
+    ]);
 
     return res.status(201).json({
       ok: true,

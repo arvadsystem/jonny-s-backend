@@ -18,15 +18,33 @@ import {
 
 const router = express.Router();
 
-const TABLA_RECETAS = 'recetas';
-const COLUMNAS_RECETAS =
-  'id_receta, nombre_receta, descripcion, fecha_modificacion, id_menu, id_nivel_picante, fecha_creacion, id_usuario, estado, id_tipo_departamento, precio';
-
 // GET: listar recetas.
 router.get('/', async (req, res) => {
   try {
-    const result = await pool.query('SELECT function_select($1, $2) as resultado', [TABLA_RECETAS, COLUMNAS_RECETAS]);
-    const baseDatos = result.rows?.[0]?.resultado || [];
+    const result = await pool.query(
+      `
+        SELECT
+          r.id_receta,
+          r.nombre_receta,
+          r.descripcion,
+          r.fecha_modificacion,
+          r.id_menu,
+          r.id_nivel_picante,
+          r.id_archivo,
+          r.fecha_creacion,
+          r.id_usuario,
+          r.estado,
+          r.id_tipo_departamento,
+          r.precio,
+          a.url_publica AS url_imagen_publica
+        FROM recetas r
+        LEFT JOIN archivos a
+          ON a.id_archivo = r.id_archivo
+         AND (a.estado = true OR a.estado IS NULL)
+        ORDER BY r.id_receta DESC
+      `
+    );
+    const baseDatos = result.rows || [];
     const datos = shouldIncludeInactive(req.query) ? baseDatos : baseDatos.filter(isRowActive);
 
     return res.status(200).json(datos);

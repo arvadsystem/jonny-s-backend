@@ -6,6 +6,7 @@ const CAMPOS_PERMITIDOS_RECETAS = new Set([
   'descripcion',
   'id_menu',
   'id_nivel_picante',
+  'id_archivo',
   'id_usuario',
   'estado',
   'id_tipo_departamento',
@@ -23,7 +24,7 @@ const CAMPOS_REQUERIDOS_RECETA = [
 ];
 
 // Campos que aceptan NULL real en la tabla.
-const CAMPOS_NULLABLES_RECETA = new Set(['descripcion', 'id_nivel_picante']);
+const CAMPOS_NULLABLES_RECETA = new Set(['descripcion', 'id_nivel_picante', 'id_archivo']);
 
 // Codigos SQLSTATE de conflicto para mapear a HTTP 409.
 const CODIGOS_CONFLICTO_CONSTRAINT = new Set(['23503', '23505', '23514', '23502']);
@@ -97,6 +98,15 @@ export function validarCampoReceta(campo, valor) {
     const numero = Number(valor);
     if (!esEnteroPositivo(numero)) {
       return { valido: false, message: 'id_nivel_picante debe ser un entero mayor a 0 o null/vacio.' };
+    }
+    return { valido: true, valor: numero };
+  }
+
+  if (campo === 'id_archivo') {
+    if (esVacio(valor)) return { valido: true, valor: null };
+    const numero = Number(valor);
+    if (!esEnteroPositivo(numero)) {
+      return { valido: false, message: 'id_archivo debe ser un entero mayor a 0 o null/vacio.' };
     }
     return { valido: true, valor: numero };
   }
@@ -232,6 +242,14 @@ async function existeTipoDepartamento(idTipoDepartamento) {
   return result.rowCount > 0;
 }
 
+async function existeArchivo(idArchivo) {
+  const result = await pool.query(
+    'SELECT 1 FROM archivos WHERE id_archivo = $1 LIMIT 1',
+    [idArchivo]
+  );
+  return result.rowCount > 0;
+}
+
 function esDepartamentoDeProductos(idTipoDepartamento) {
   return DEPARTAMENTOS_PRODUCTOS_RESERVADOS.has(idTipoDepartamento);
 }
@@ -245,19 +263,24 @@ export async function obtenerRecetaPorId(idReceta) {
   const result = await pool.query(
     `
       SELECT
-        id_receta,
-        nombre_receta,
-        descripcion,
-        fecha_modificacion,
-        id_menu,
-        id_nivel_picante,
-        fecha_creacion,
-        id_usuario,
-        estado,
-        id_tipo_departamento,
-        precio
-      FROM recetas
-      WHERE id_receta = $1
+        r.id_receta,
+        r.nombre_receta,
+        r.descripcion,
+        r.fecha_modificacion,
+        r.id_menu,
+        r.id_nivel_picante,
+        r.id_archivo,
+        r.fecha_creacion,
+        r.id_usuario,
+        r.estado,
+        r.id_tipo_departamento,
+        r.precio,
+        a.url_publica AS url_imagen_publica
+      FROM recetas r
+      LEFT JOIN archivos a
+        ON a.id_archivo = r.id_archivo
+       AND (a.estado = true OR a.estado IS NULL)
+      WHERE r.id_receta = $1
       LIMIT 1
     `,
     [idReceta]
@@ -288,6 +311,13 @@ export async function validarReglasNegocioYFks(datosNormalizados) {
     return { ok: false, status: 400, message: 'id_tipo_departamento no existe en tipo_departamento.' };
   }
 
+  if (Object.prototype.hasOwnProperty.call(datosNormalizados, 'id_archivo') && datosNormalizados.id_archivo !== null) {
+    const existeFkArchivo = await existeArchivo(datosNormalizados.id_archivo);
+    if (!existeFkArchivo) {
+      return { ok: false, status: 400, message: 'id_archivo no existe en archivos.' };
+    }
+  }
+
   const departamentoEsDeProductos = await esDepartamentoDeProductos(datosNormalizados.id_tipo_departamento);
   if (departamentoEsDeProductos) {
     return {
@@ -309,6 +339,10 @@ export async function actualizarCampoReceta(client, idReceta, campo, valor) {
     }
     if (campo === 'id_nivel_picante') {
       await client.query('UPDATE recetas SET id_nivel_picante = NULL WHERE id_receta = $1', [idReceta]);
+      return;
+    }
+    if (campo === 'id_archivo') {
+      await client.query('UPDATE recetas SET id_archivo = NULL WHERE id_receta = $1', [idReceta]);
       return;
     }
   }

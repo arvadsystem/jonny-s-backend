@@ -261,10 +261,13 @@ router.get('/menu-pos/catalogo-imagenes', async (req, res) => {
         NULL::INTEGER AS id_almacen,
         r.id_tipo_departamento,
         COALESCE(r.estado, true) AS estado,
-        NULL::INTEGER AS id_archivo,
-        NULL::VARCHAR AS url_imagen,
+        r.id_archivo AS id_archivo,
+        a_receta.url_publica AS url_imagen,
         false AS es_combo
       FROM recetas r
+      LEFT JOIN archivos a_receta
+        ON a_receta.id_archivo = r.id_archivo
+       AND (a_receta.estado = true OR a_receta.estado IS NULL)
       WHERE COALESCE(r.estado, true) = true
         AND r.id_tipo_departamento IS NOT NULL
         AND r.id_tipo_departamento NOT IN (11, 12, 13, 14, 15, 19)
