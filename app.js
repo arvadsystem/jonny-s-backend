@@ -44,6 +44,7 @@ import seguridadLoginsRoutes from './routers/seguridad/logins.js';
 import seguridadPermisosRoutes from "./routers/seguridad/permisos.js";
 import seguridadUsuariosRoutes from "./routers/seguridad/usuarios.js";
 import comboPromoRoutes from './routers/combo_promo.js';
+import rolesPermisosRoutes from './routers/roles_permisos.js';
 import archivosRoutes from './routers/archivos.js';
 
 import { authRequired, csrfProtect } from './middleware/auth.js';
@@ -110,6 +111,7 @@ app.use('/seguridad', seguridadConfigRoutes);
 app.use('/seguridad', seguridadLoginsRoutes);
 app.use("/seguridad", seguridadPermisosRoutes);
 app.use("/seguridad", seguridadUsuariosRoutes);
+app.use('/api/roles-permisos', rolesPermisosRoutes);
 
 // Parametros
 app.use('/parametros/catalogos', catalogosRoutes);
@@ -156,3 +158,4 @@ app.listen(PORT, () => {
 });
 
 export default app;
+
