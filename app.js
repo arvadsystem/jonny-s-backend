@@ -43,9 +43,14 @@ import seguridadConfigRoutes from './routers/seguridad/configuracion.js';
 import seguridadLoginsRoutes from './routers/seguridad/logins.js';
 import seguridadPermisosRoutes from "./routers/seguridad/permisos.js";
 import seguridadUsuariosRoutes from "./routers/seguridad/usuarios.js";
+<<<<<<< Personas
 import comboPromoRoutes from './routers/combo_promo.js';
 import rolesPermisosRoutes from './routers/roles_permisos.js';
+=======
+
+>>>>>>> dev
 import archivosRoutes from './routers/archivos.js';
+import adminRecetasRouter from './routers/admin_recetas.js';
 
 import { authRequired, csrfProtect } from './middleware/auth.js';
 import { touchSessionMiddleware } from './middleware/touchSession.js';
@@ -104,6 +109,8 @@ app.use(requireActiveSession);       // 2) valida sesión activa en BD
 app.use(touchSessionMiddleware);     // 3) actualiza ultima_actividad
 app.use(csrfProtect);                // 4) CSRF para no-GET
 app.use(perfilRoutes);
+// Admin: CRUD de recetas para panel administrativo (rutas relativas en router).
+app.use('/api/admin/recetas', adminRecetasRouter);
 
 // ✅ 4) Rutas protegidas
 app.use('/seguridad', seguridadSesionesRoutes);
@@ -147,7 +154,7 @@ app.use(correosRoutes);
 app.use(clientesRoutes);
 app.use(empleadosRoutes);
 app.use(empresasRoutes);
-app.use(comboPromoRoutes);
+
 app.use(menuPosRouter); // // Monta las rutas del POS Menú
 
 app.use(movimientosInventarioRoutes);
@@ -158,4 +165,7 @@ app.listen(PORT, () => {
 });
 
 export default app;
+<<<<<<< Personas
 
+=======
+>>>>>>> dev
