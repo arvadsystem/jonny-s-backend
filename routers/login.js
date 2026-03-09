@@ -42,6 +42,46 @@ const resolveMustChangePassword = (row) => {
   return false;
 };
 
+const getUserAuthzSnapshot = async (idUsuario) => {
+  const userId = Number.parseInt(String(idUsuario ?? ''), 10);
+  if (!Number.isInteger(userId) || userId <= 0) {
+    return { roles: [], permisos: [] };
+  }
+
+  const [rolesResult, permisosResult] = await Promise.all([
+    pool.query(
+      `
+        SELECT DISTINCT r.nombre
+        FROM roles_usuarios ru
+        INNER JOIN roles r ON r.id_rol = ru.id_rol
+        WHERE ru.id_usuario = $1
+        ORDER BY r.nombre
+      `,
+      [userId]
+    ),
+    pool.query(
+      `
+        SELECT DISTINCT p.nombre_permiso
+        FROM roles_usuarios ru
+        INNER JOIN roles_permisos rp ON rp.id_rol = ru.id_rol
+        INNER JOIN permisos p ON p.id_permiso = rp.id_permiso
+        WHERE ru.id_usuario = $1
+        ORDER BY p.nombre_permiso
+      `,
+      [userId]
+    )
+  ]);
+
+  return {
+    roles: rolesResult.rows
+      .map((row) => String(row?.nombre || '').trim())
+      .filter(Boolean),
+    permisos: permisosResult.rows
+      .map((row) => String(row?.nombre_permiso || '').trim())
+      .filter(Boolean)
+  };
+};
+
 const cookieConfig = () => {
   const isProd = process.env.NODE_ENV === 'production';
   return {
@@ -117,6 +157,19 @@ router.post('/login', async (req, res) => {
       sid: id_sesion // HU79: id de sesión actual
     };
 
+    let authz = { roles: [], permisos: [] };
+    try {
+      authz = await getUserAuthzSnapshot(usuarioEncontrado.id_usuario);
+    } catch (authzError) {
+      console.error('Error resolviendo roles/permisos en /login:', authzError);
+    }
+
+    const usuarioResponse = {
+      ...payload,
+      roles: authz.roles,
+      permisos: authz.permisos
+    };
+
     const token = jwt.sign(payload, JWT_SECRET, { expiresIn: '8h' });
 
     const base = cookieConfig();
@@ -146,7 +199,9 @@ router.post('/login', async (req, res) => {
 
     return res.json({
       message: 'Login exitoso',
-      usuario: payload,
+      usuario: usuarioResponse,
+      roles: authz.roles,
+      permisos: authz.permisos,
       csrfToken
     });
   } catch (error) {
@@ -202,9 +257,9 @@ router.get('/me', authRequired, async (req, res) => {
   // Re-emite CSRF por si el frontend refresca y lo perdió
   const csrfToken = issueCsrf(res);
   const usuario = { ...(req.user || {}) };
+  const idUsuario = Number.parseInt(String(usuario?.id_usuario ?? ''), 10);
 
   try {
-    const idUsuario = Number.parseInt(String(usuario?.id_usuario ?? ''), 10);
     if (Number.isInteger(idUsuario) && idUsuario > 0) {
       const result = await pool.query(
         'SELECT * FROM usuarios WHERE id_usuario = $1 LIMIT 1',
@@ -224,8 +279,22 @@ router.get('/me', authRequired, async (req, res) => {
     }
   }
 
+  let authz = { roles: [], permisos: [] };
+  try {
+    if (Number.isInteger(idUsuario) && idUsuario > 0) {
+      authz = await getUserAuthzSnapshot(idUsuario);
+    }
+  } catch (authzError) {
+    console.error('Error resolviendo roles/permisos en /me:', authzError);
+  }
+
+  usuario.roles = authz.roles;
+  usuario.permisos = authz.permisos;
+
   return res.json({
     usuario,
+    roles: authz.roles,
+    permisos: authz.permisos,
     csrfToken
   });
 });
