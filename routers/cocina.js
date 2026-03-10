@@ -264,7 +264,7 @@ router.get('/cocina/pedidos', async (req, res) => {
               CASE
                 WHEN dp.id_producto IS NOT NULL THEN prod.precio
                 WHEN dp.id_combo IS NOT NULL THEN combo.precio
-                WHEN dp.id_receta IS NOT NULL THEN prod_rec.precio
+                WHEN dp.id_receta IS NOT NULL THEN rec.precio
                 ELSE NULL
               END,
               NULLIF(COALESCE(dp.sub_total_pedido, 0), 0),
@@ -286,7 +286,6 @@ router.get('/cocina/pedidos', async (req, res) => {
           LEFT JOIN productos prod ON prod.id_producto = dp.id_producto
           LEFT JOIN combos combo ON combo.id_combo = dp.id_combo
           LEFT JOIN recetas rec ON rec.id_receta = dp.id_receta
-          LEFT JOIN productos prod_rec ON prod_rec.id_producto = rec.id_producto
           ${whereClause}
           ORDER BY p.fecha_hora_pedido ASC, dp.id_detalle_pedido ASC
         `,

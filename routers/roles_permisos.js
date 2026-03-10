@@ -1,12 +1,26 @@
 import express from 'express';
 import pool from '../config/db-connection.js';
+import { checkPermission } from '../middleware/checkPermission.js';
 
 const router = express.Router();
+const MAX_ROLE_DETAIL_LIMIT = 500;
+const ROLE_VIEW_PERMISSIONS = ['ROLES_PERMISOS_VER', 'ROLES_PERMISOS_EDITAR'];
+const ROLE_EDIT_PERMISSIONS = ['ROLES_PERMISOS_EDITAR'];
 
 const parsePositiveInt = (value) => {
   const parsed = Number.parseInt(String(value ?? ''), 10);
   return Number.isInteger(parsed) && parsed > 0 ? parsed : null;
 };
+
+const normalizeRoleName = (value) =>
+  String(value ?? '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .trim()
+    .replace(/[^a-zA-Z0-9]+/g, '_')
+    .replace(/^_+|_+$/g, '')
+    .replace(/_+/g, '_')
+    .toLowerCase();
 
 const getRoleById = async (idRol, queryRunner = pool) => {
   const result = await queryRunner.query(
@@ -22,8 +36,73 @@ const getRoleById = async (idRol, queryRunner = pool) => {
   return result.rows[0] || null;
 };
 
+const roleNameExists = async (nombre, { excludeId = null, queryRunner = pool } = {}) => {
+  const params = [nombre];
+  let where = 'LOWER(TRIM(nombre)) = LOWER(TRIM($1))';
+
+  if (excludeId) {
+    params.push(excludeId);
+    where += ' AND id_rol <> $2';
+  }
+
+  const result = await queryRunner.query(
+    `
+      SELECT 1
+      FROM roles
+      WHERE ${where}
+      LIMIT 1
+    `,
+    params
+  );
+
+  return result.rows.length > 0;
+};
+
+const getRoleImpact = async (idRol, queryRunner = pool) => {
+  const [usuariosResult, permisosResult] = await Promise.all([
+    queryRunner.query(
+      `
+        SELECT
+          COUNT(*)::int AS total_usuarios,
+          COALESCE(
+            JSON_AGG(
+              JSON_BUILD_OBJECT(
+                'id_usuario', u.id_usuario,
+                'nombre_usuario', u.nombre_usuario
+              )
+              ORDER BY u.id_usuario ASC
+            ) FILTER (WHERE u.id_usuario IS NOT NULL),
+            '[]'::json
+          ) AS usuarios
+        FROM roles_usuarios ru
+        INNER JOIN usuarios u ON u.id_usuario = ru.id_usuario
+        WHERE ru.id_rol = $1
+      `,
+      [idRol]
+    ),
+    queryRunner.query(
+      `
+        SELECT COUNT(*)::int AS total_permisos
+        FROM roles_permisos
+        WHERE id_rol = $1
+      `,
+      [idRol]
+    )
+  ]);
+
+  const usuariosRow = usuariosResult.rows[0] || {};
+  const permisosRow = permisosResult.rows[0] || {};
+  const usuarios = Array.isArray(usuariosRow.usuarios) ? usuariosRow.usuarios : [];
+
+  return {
+    total_usuarios: Number(usuariosRow.total_usuarios || 0),
+    total_permisos: Number(permisosRow.total_permisos || 0),
+    usuarios: usuarios.slice(0, 10)
+  };
+};
+
 // GET /api/roles-permisos/roles
-router.get('/roles', async (_req, res) => {
+router.get('/roles', checkPermission(ROLE_VIEW_PERMISSIONS), async (_req, res) => {
   try {
     const sql = `
       SELECT
@@ -45,7 +124,7 @@ router.get('/roles', async (_req, res) => {
 });
 
 // GET /api/roles-permisos/permisos
-router.get('/permisos', async (_req, res) => {
+router.get('/permisos', checkPermission(ROLE_VIEW_PERMISSIONS), async (_req, res) => {
   try {
     const result = await pool.query(
       `
@@ -63,12 +142,12 @@ router.get('/permisos', async (_req, res) => {
 });
 
 // GET /api/roles-permisos/rol/:id_rol
-router.get('/rol/:id_rol', async (req, res) => {
+router.get('/rol/:id_rol', checkPermission(ROLE_VIEW_PERMISSIONS), async (req, res) => {
   try {
     const idRol = parsePositiveInt(req.params.id_rol);
     const page = parsePositiveInt(req.query.page) || 1;
     const limitInput = parsePositiveInt(req.query.limit) || 10;
-    const limit = Math.min(limitInput, 50);
+    const limit = Math.min(limitInput, MAX_ROLE_DETAIL_LIMIT);
     const offset = (page - 1) * limit;
     const search = String(req.query.search ?? '').trim();
     const hasSearch = search.length > 0;
@@ -152,7 +231,7 @@ router.get('/rol/:id_rol', async (req, res) => {
 });
 
 // PUT /api/roles-permisos/rol/:id_rol
-router.put('/rol/:id_rol', async (req, res) => {
+router.put('/rol/:id_rol', checkPermission(ROLE_EDIT_PERMISSIONS), async (req, res) => {
   const client = await pool.connect();
 
   try {
@@ -239,7 +318,7 @@ router.put('/rol/:id_rol', async (req, res) => {
 });
 
 // GET /api/roles-permisos/rol/:id_rol/usuarios (opcional recomendado)
-router.get('/rol/:id_rol/usuarios', async (req, res) => {
+router.get('/rol/:id_rol/usuarios', checkPermission(ROLE_VIEW_PERMISSIONS), async (req, res) => {
   try {
     const idRol = parsePositiveInt(req.params.id_rol);
 
@@ -266,6 +345,199 @@ router.get('/rol/:id_rol/usuarios', async (req, res) => {
   } catch (error) {
     console.error('GET /api/roles-permisos/rol/:id_rol/usuarios error:', error);
     return res.status(500).json({ error: true, message: 'Error interno del servidor' });
+  }
+});
+
+router.post('/roles', checkPermission(ROLE_EDIT_PERMISSIONS), async (req, res) => {
+  const client = await pool.connect();
+
+  try {
+    const nombreNormalizado = normalizeRoleName(req.body?.nombre);
+    if (!nombreNormalizado) {
+      return res.status(400).json({ error: true, message: 'El nombre del rol es obligatorio' });
+    }
+
+    await client.query('BEGIN');
+    await client.query('LOCK TABLE roles IN EXCLUSIVE MODE');
+
+    if (await roleNameExists(nombreNormalizado, { queryRunner: client })) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({ error: true, message: 'Ya existe un rol con ese nombre' });
+    }
+
+    const nextIdResult = await client.query(
+      'SELECT COALESCE(MAX(id_rol), 0)::int + 1 AS next_id FROM roles'
+    );
+    const nextId = Number(nextIdResult.rows[0]?.next_id || 0);
+
+    const insertResult = await client.query(
+      `
+        INSERT INTO roles (id_rol, nombre)
+        VALUES ($1, $2)
+        RETURNING id_rol, nombre
+      `,
+      [nextId, nombreNormalizado]
+    );
+
+    await client.query('COMMIT');
+
+    return res.status(201).json({
+      ok: true,
+      message: 'Rol creado correctamente',
+      rol: {
+        ...insertResult.rows[0],
+        total_permisos: 0
+      }
+    });
+  } catch (error) {
+    try {
+      await client.query('ROLLBACK');
+    } catch {
+      // ignore rollback errors
+    }
+
+    console.error('POST /api/roles-permisos/roles error:', error);
+    return res.status(500).json({ error: true, message: 'Error interno del servidor' });
+  } finally {
+    client.release();
+  }
+});
+
+router.put('/rol/:id_rol/meta', checkPermission(ROLE_EDIT_PERMISSIONS), async (req, res) => {
+  const client = await pool.connect();
+
+  try {
+    const idRol = parsePositiveInt(req.params.id_rol);
+    if (!idRol) {
+      return res.status(400).json({ error: true, message: 'id_rol invalido' });
+    }
+
+    const rolActual = await getRoleById(idRol, client);
+    if (!rolActual) {
+      return res.status(404).json({ error: true, message: 'Rol no encontrado' });
+    }
+
+    const nombreNormalizado = normalizeRoleName(req.body?.nombre);
+    if (!nombreNormalizado) {
+      return res.status(400).json({ error: true, message: 'El nombre del rol es obligatorio' });
+    }
+
+    await client.query('BEGIN');
+    await client.query('LOCK TABLE roles IN EXCLUSIVE MODE');
+
+    if (await roleNameExists(nombreNormalizado, { excludeId: idRol, queryRunner: client })) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({ error: true, message: 'Ya existe un rol con ese nombre' });
+    }
+
+    const result = await client.query(
+      `
+        UPDATE roles
+        SET nombre = $1
+        WHERE id_rol = $2
+        RETURNING id_rol, nombre
+      `,
+      [nombreNormalizado, idRol]
+    );
+
+    await client.query('COMMIT');
+
+    return res.status(200).json({
+      ok: true,
+      message: 'Rol actualizado correctamente',
+      rol: result.rows[0]
+    });
+  } catch (error) {
+    try {
+      await client.query('ROLLBACK');
+    } catch {
+      // ignore rollback errors
+    }
+    console.error('PUT /api/roles-permisos/rol/:id_rol/meta error:', error);
+    return res.status(500).json({ error: true, message: 'Error interno del servidor' });
+  } finally {
+    client.release();
+  }
+});
+
+router.get('/rol/:id_rol/impacto', checkPermission(ROLE_EDIT_PERMISSIONS), async (req, res) => {
+  try {
+    const idRol = parsePositiveInt(req.params.id_rol);
+    if (!idRol) {
+      return res.status(400).json({ error: true, message: 'id_rol invalido' });
+    }
+
+    const rol = await getRoleById(idRol);
+    if (!rol) {
+      return res.status(404).json({ error: true, message: 'Rol no encontrado' });
+    }
+
+    const impacto = await getRoleImpact(idRol);
+    return res.status(200).json({
+      rol,
+      impacto: {
+        ...impacto,
+        puede_eliminarse: impacto.total_usuarios === 0
+      }
+    });
+  } catch (error) {
+    console.error('GET /api/roles-permisos/rol/:id_rol/impacto error:', error);
+    return res.status(500).json({ error: true, message: 'Error interno del servidor' });
+  }
+});
+
+router.delete('/rol/:id_rol', checkPermission(ROLE_EDIT_PERMISSIONS), async (req, res) => {
+  const client = await pool.connect();
+
+  try {
+    const idRol = parsePositiveInt(req.params.id_rol);
+    if (!idRol) {
+      return res.status(400).json({ error: true, message: 'id_rol invalido' });
+    }
+
+    const rol = await getRoleById(idRol, client);
+    if (!rol) {
+      return res.status(404).json({ error: true, message: 'Rol no encontrado' });
+    }
+
+    const impacto = await getRoleImpact(idRol, client);
+    if (impacto.total_usuarios > 0) {
+      return res.status(409).json({
+        error: true,
+        message: 'No se puede eliminar el rol porque tiene usuarios asignados',
+        rol,
+        impacto: {
+          ...impacto,
+          puede_eliminarse: false
+        }
+      });
+    }
+
+    await client.query('BEGIN');
+    await client.query('DELETE FROM roles_permisos WHERE id_rol = $1', [idRol]);
+    await client.query('DELETE FROM roles WHERE id_rol = $1', [idRol]);
+    await client.query('COMMIT');
+
+    return res.status(200).json({
+      ok: true,
+      message: 'Rol eliminado correctamente',
+      rol,
+      impacto: {
+        ...impacto,
+        puede_eliminarse: true
+      }
+    });
+  } catch (error) {
+    try {
+      await client.query('ROLLBACK');
+    } catch {
+      // ignore rollback errors
+    }
+
+    console.error('DELETE /api/roles-permisos/rol/:id_rol error:', error);
+    return res.status(500).json({ error: true, message: 'Error interno del servidor' });
+  } finally {
+    client.release();
   }
 });
 

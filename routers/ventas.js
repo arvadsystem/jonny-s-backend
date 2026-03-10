@@ -245,12 +245,8 @@ const fetchRecetaMap = async (client, ids) => {
         r.id_receta,
         r.nombre_receta,
         r.estado,
-        r.id_producto AS id_producto_base,
-        p.nombre_producto AS nombre_producto_base,
-        p.precio AS precio_producto_base,
-        p.estado AS estado_producto_base
+        r.precio
       FROM recetas r
-      LEFT JOIN productos p ON p.id_producto = r.id_producto
       WHERE r.id_receta = ANY($1::int[])
     `,
     [ids]
@@ -508,29 +504,7 @@ const hydrateVentaLines = async (client, normalizedItems) => {
       };
     }
 
-    if (!receta.id_producto_base || !receta.nombre_producto_base) {
-      return {
-        ok: false,
-        status: 400,
-        body: {
-          error: true,
-          message: `La receta ${item.id_receta} no tiene un producto base valido.`
-        }
-      };
-    }
-
-    if (!parseBooleanish(receta.estado_producto_base)) {
-      return {
-        ok: false,
-        status: 400,
-        body: {
-          error: true,
-          message: `El producto base de la receta ${item.id_receta} esta inactivo.`
-        }
-      };
-    }
-
-    const precioUnitario = roundMoney(receta.precio_producto_base);
+    const precioUnitario = roundMoney(receta.precio);
     const subTotal = roundMoney(precioUnitario * item.cantidad);
 
     lines.push({
@@ -539,7 +513,7 @@ const hydrateVentaLines = async (client, normalizedItems) => {
       id_producto: null,
       id_combo: null,
       id_receta: item.id_receta,
-      nombre_item: receta.nombre_receta || receta.nombre_producto_base,
+      nombre_item: receta.nombre_receta || `Receta #${item.id_receta}`,
       cantidad: item.cantidad,
       precio_unitario: precioUnitario,
       sub_total: subTotal,
@@ -804,16 +778,14 @@ router.get('/ventas/catalogos/recetas', async (req, res) => {
           r.id_receta,
           r.nombre_receta,
           r.estado,
-          r.id_producto AS id_producto_base,
-          p.nombre_producto AS nombre_producto_base,
-          p.precio,
-          p.estado AS estado_producto_base
+          r.precio,
+          NULL::INTEGER AS id_producto_base,
+          r.nombre_receta AS nombre_producto_base,
+          r.precio AS precio_producto_base,
+          r.estado AS estado_producto_base
         FROM recetas r
-        LEFT JOIN productos p ON p.id_producto = r.id_producto
         WHERE COALESCE(r.estado, true) = true
-          AND p.id_producto IS NOT NULL
-          AND COALESCE(p.estado, true) = true
-        ORDER BY COALESCE(r.nombre_receta, p.nombre_producto, r.id_receta::text)
+        ORDER BY COALESCE(r.nombre_receta, r.id_receta::text)
       `
     );
 
@@ -949,7 +921,7 @@ router.get('/ventas', async (req, res) => {
                   1,
                   ROUND(
                     COALESCE(NULLIF(dp.sub_total_pedido, 0), dp.total_pedido, 0)
-                    / NULLIF(prod_rec_dp.precio, 0)
+                    / NULLIF(rec_dp.precio, 0)
                   )::int
                 )
                 ELSE 1
@@ -961,7 +933,6 @@ router.get('/ventas', async (req, res) => {
         LEFT JOIN productos prod_dp ON prod_dp.id_producto = dp.id_producto
         LEFT JOIN combos combo_dp ON combo_dp.id_combo = dp.id_combo
         LEFT JOIN recetas rec_dp ON rec_dp.id_receta = dp.id_receta
-        LEFT JOIN productos prod_rec_dp ON prod_rec_dp.id_producto = rec_dp.id_producto
         WHERE dp.id_pedido = f.id_pedido
           AND COALESCE(dp.estado, true) = true
       ) dp_info ON true
@@ -1074,7 +1045,7 @@ router.get('/ventas/:id', async (req, res) => {
               CASE
                 WHEN dp.id_producto IS NOT NULL THEN prod.precio
                 WHEN dp.id_combo IS NOT NULL THEN combo.precio
-                WHEN dp.id_receta IS NOT NULL THEN prod_rec.precio
+                WHEN dp.id_receta IS NOT NULL THEN rec.precio
                 ELSE NULL
               END,
               CASE
@@ -1091,7 +1062,6 @@ router.get('/ventas/:id', async (req, res) => {
           LEFT JOIN productos prod ON prod.id_producto = dp.id_producto
           LEFT JOIN combos combo ON combo.id_combo = dp.id_combo
           LEFT JOIN recetas rec ON rec.id_receta = dp.id_receta
-          LEFT JOIN productos prod_rec ON prod_rec.id_producto = rec.id_producto
           LEFT JOIN descuentos d ON d.id_descuento = dp.id_descuento
           WHERE dp.id_pedido = $1
             AND COALESCE(dp.estado, true) = true

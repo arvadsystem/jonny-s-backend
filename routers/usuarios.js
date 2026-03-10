@@ -478,14 +478,22 @@ const v2MapUsuarioRow = (row) => {
     sucursal_nombre: row.sucursal_nombre ?? null,
   };
 
+  const rawRoles = Array.isArray(row.roles) ? row.roles : [];
+  const roles = rawRoles
+    .map((role) => ({
+      id_rol: Number(role?.id_rol),
+      nombre: v2NormalizeText(role?.nombre) || null,
+    }))
+    .filter((role) => Number.isInteger(role.id_rol) && role.id_rol > 0 && role.nombre);
+
   const rolId = row.id_rol ?? row.rol_id ?? null;
   const rolNombre = row.rol_nombre ?? row.nombre_rol ?? row.nombre_rol_usuario ?? null;
-  const rol = rolId
+  const rol = roles[0] || (rolId
     ? {
       id_rol: Number(rolId),
       nombre: v2NormalizeText(rolNombre) || null,
     }
-    : null;
+    : null);
 
   return {
     id_usuario: row.id_usuario,
@@ -499,6 +507,7 @@ const v2MapUsuarioRow = (row) => {
     telefono: empleado.telefono,
     correo: empleado.correo,
     sucursal_nombre: empleado.sucursal_nombre,
+    roles,
     rol,
     empleado,
   };
@@ -518,8 +527,9 @@ const v2FetchUsuarioById = async (idUsuario, queryRunner = pool) => {
       t.telefono,
       c.direccion_correo AS correo,
       s.nombre_sucursal AS sucursal_nombre,
-      ru.id_rol,
-      r.nombre AS rol_nombre
+      roles_info.id_rol,
+      roles_info.rol_nombre,
+      roles_info.roles
     FROM usuarios u
     LEFT JOIN empleados e ON e.id_empleado = u.id_empleado
     LEFT JOIN personas p ON p.id_persona = e.id_persona
@@ -527,13 +537,20 @@ const v2FetchUsuarioById = async (idUsuario, queryRunner = pool) => {
     LEFT JOIN correos c ON c.id_correo = p.id_correo
     LEFT JOIN sucursales s ON s.id_sucursal = e.id_sucursal
     LEFT JOIN LATERAL (
-      SELECT ru2.id_rol
+      SELECT
+        MIN(r2.id_rol) AS id_rol,
+        (ARRAY_AGG(r2.nombre ORDER BY r2.id_rol ASC))[1] AS rol_nombre,
+        COALESCE(
+          JSON_AGG(
+            JSON_BUILD_OBJECT('id_rol', r2.id_rol, 'nombre', r2.nombre)
+            ORDER BY r2.id_rol ASC
+          ),
+          '[]'::json
+        ) AS roles
       FROM roles_usuarios ru2
+      INNER JOIN roles r2 ON r2.id_rol = ru2.id_rol
       WHERE ru2.id_usuario = u.id_usuario
-      ORDER BY ru2.id_rol ASC
-      LIMIT 1
-    ) ru ON TRUE
-    LEFT JOIN roles r ON r.id_rol = ru.id_rol
+    ) roles_info ON TRUE
     WHERE u.id_usuario = $1
     LIMIT 1
   `;
@@ -628,6 +645,66 @@ const v2FindRoleById = async (idRol, queryRunner = pool) => {
   return result.rows[0] || null;
 };
 
+const v2NormalizeRoleIdsInput = (payload = {}) => {
+  const hasRolesArray = Object.prototype.hasOwnProperty.call(payload || {}, 'id_roles');
+  const hasSingleRole = Object.prototype.hasOwnProperty.call(payload || {}, 'id_rol');
+
+  if (!hasRolesArray && !hasSingleRole) {
+    return { hasSelection: false, roleIds: [], invalid: false };
+  }
+
+  const rawValues = hasRolesArray
+    ? payload.id_roles
+    : [payload.id_rol];
+
+  if (!Array.isArray(rawValues)) {
+    return { hasSelection: true, roleIds: [], invalid: true };
+  }
+
+  const parsedRoleIds = rawValues.map((value) => v2ParsePositiveInt(value));
+  if (parsedRoleIds.some((value) => !value)) {
+    return { hasSelection: true, roleIds: [], invalid: true };
+  }
+
+  return {
+    hasSelection: true,
+    roleIds: [...new Set(parsedRoleIds)],
+    invalid: false,
+  };
+};
+
+const v2FindRolesByIds = async (roleIds, queryRunner = pool) => {
+  const uniqueRoleIds = [...new Set(
+    (Array.isArray(roleIds) ? roleIds : [])
+      .map((value) => Number(value))
+      .filter((value) => Number.isInteger(value) && value > 0)
+  )];
+
+  if (!uniqueRoleIds.length) return [];
+
+  const result = await queryRunner.query(
+    'SELECT id_rol, nombre FROM roles WHERE id_rol = ANY($1::int[]) ORDER BY id_rol ASC',
+    [uniqueRoleIds]
+  );
+
+  return result.rows;
+};
+
+const v2ReplaceUserRoles = async (idUsuario, roleIds, queryRunner = pool) => {
+  await queryRunner.query('DELETE FROM roles_usuarios WHERE id_usuario = $1', [idUsuario]);
+
+  if (!Array.isArray(roleIds) || roleIds.length === 0) return;
+
+  await queryRunner.query(
+    `
+      INSERT INTO roles_usuarios (id_usuario, id_rol)
+      SELECT $1, selected_roles.id_rol
+      FROM UNNEST($2::int[]) AS selected_roles(id_rol)
+    `,
+    [idUsuario, roleIds]
+  );
+};
+
 router.get('/usuarios/v2/roles', async (_req, res) => {
   try {
     const result = await pool.query(
@@ -666,7 +743,7 @@ router.get('/usuarios/v2/list', async (req, res) => {
         OR COALESCE(t.telefono, '') ILIKE $${params.length}
         OR COALESCE(c.direccion_correo, '') ILIKE $${params.length}
         OR COALESCE(s.nombre_sucursal, '') ILIKE $${params.length}
-        OR COALESCE(r.nombre, '') ILIKE $${params.length}
+        OR COALESCE(roles_info.roles_nombres, '') ILIKE $${params.length}
       )`);
     }
 
@@ -681,13 +758,11 @@ router.get('/usuarios/v2/list', async (req, res) => {
       LEFT JOIN correos c ON c.id_correo = p.id_correo
       LEFT JOIN sucursales s ON s.id_sucursal = e.id_sucursal
       LEFT JOIN LATERAL (
-        SELECT ru2.id_rol
+        SELECT STRING_AGG(r2.nombre, ', ' ORDER BY r2.id_rol ASC) AS roles_nombres
         FROM roles_usuarios ru2
+        INNER JOIN roles r2 ON r2.id_rol = ru2.id_rol
         WHERE ru2.id_usuario = u.id_usuario
-        ORDER BY ru2.id_rol ASC
-        LIMIT 1
-      ) ru ON TRUE
-      LEFT JOIN roles r ON r.id_rol = ru.id_rol
+      ) roles_info ON TRUE
       ${whereSql}
     `;
 
@@ -704,8 +779,9 @@ router.get('/usuarios/v2/list', async (req, res) => {
         t.telefono,
         c.direccion_correo AS correo,
         s.nombre_sucursal AS sucursal_nombre,
-        ru.id_rol,
-        r.nombre AS rol_nombre
+        roles_info.id_rol,
+        roles_info.rol_nombre,
+        roles_info.roles
       FROM usuarios u
       LEFT JOIN empleados e ON e.id_empleado = u.id_empleado
       LEFT JOIN personas p ON p.id_persona = e.id_persona
@@ -713,13 +789,21 @@ router.get('/usuarios/v2/list', async (req, res) => {
       LEFT JOIN correos c ON c.id_correo = p.id_correo
       LEFT JOIN sucursales s ON s.id_sucursal = e.id_sucursal
       LEFT JOIN LATERAL (
-        SELECT ru2.id_rol
+        SELECT
+          MIN(r2.id_rol) AS id_rol,
+          (ARRAY_AGG(r2.nombre ORDER BY r2.id_rol ASC))[1] AS rol_nombre,
+          STRING_AGG(r2.nombre, ', ' ORDER BY r2.id_rol ASC) AS roles_nombres,
+          COALESCE(
+            JSON_AGG(
+              JSON_BUILD_OBJECT('id_rol', r2.id_rol, 'nombre', r2.nombre)
+              ORDER BY r2.id_rol ASC
+            ),
+            '[]'::json
+          ) AS roles
         FROM roles_usuarios ru2
+        INNER JOIN roles r2 ON r2.id_rol = ru2.id_rol
         WHERE ru2.id_usuario = u.id_usuario
-        ORDER BY ru2.id_rol ASC
-        LIMIT 1
-      ) ru ON TRUE
-      LEFT JOIN roles r ON r.id_rol = ru.id_rol
+      ) roles_info ON TRUE
       ${whereSql}
       ORDER BY u.id_usuario DESC
       LIMIT $${params.length + 1}
@@ -756,9 +840,9 @@ router.post('/usuarios/v2/create', async (req, res) => {
       return res.status(400).json({ error: true, message: 'id_empleado es obligatorio y debe ser positivo' });
     }
 
-    const idRol = v2ParsePositiveInt(req.body?.id_rol);
-    if (!idRol) {
-      return res.status(400).json({ error: true, message: 'id_rol es obligatorio y debe ser positivo' });
+    const roleSelection = v2NormalizeRoleIdsInput(req.body);
+    if (roleSelection.invalid || !roleSelection.roleIds.length) {
+      return res.status(400).json({ error: true, message: 'Debe enviar al menos un rol valido en id_roles o id_rol' });
     }
 
     let estado = true;
@@ -780,10 +864,10 @@ router.post('/usuarios/v2/create', async (req, res) => {
 
     await client.query('BEGIN');
 
-    const role = await v2FindRoleById(idRol, client);
-    if (!role) {
+    const roles = await v2FindRolesByIds(roleSelection.roleIds, client);
+    if (roles.length !== roleSelection.roleIds.length) {
       await client.query('ROLLBACK');
-      return res.status(400).json({ error: true, message: 'Rol no encontrado' });
+      return res.status(400).json({ error: true, message: 'Uno o mas roles no existen' });
     }
 
     const empleado = await v2FindEmployeeForUser(idEmpleado, client);
@@ -841,10 +925,7 @@ router.post('/usuarios/v2/create', async (req, res) => {
       throw new Error('No se pudo obtener el id del usuario creado');
     }
 
-    await client.query(
-      'INSERT INTO roles_usuarios (id_usuario, id_rol) VALUES ($1, $2)',
-      [idUsuarioCreado, idRol]
-    );
+    await v2ReplaceUserRoles(idUsuarioCreado, roleSelection.roleIds, client);
 
     const usuarioCreado = await v2FetchUsuarioById(idUsuarioCreado, client);
 
@@ -879,8 +960,8 @@ router.put('/usuarios/v2/update/:id_usuario', async (req, res) => {
 
     const updates = [];
     const values = [];
-    const hasRoleUpdate = Object.prototype.hasOwnProperty.call(req.body || {}, 'id_rol');
-    let nextRoleId = null;
+    const roleSelection = v2NormalizeRoleIdsInput(req.body);
+    const hasRoleUpdate = roleSelection.hasSelection;
 
     if (Object.prototype.hasOwnProperty.call(req.body || {}, 'estado')) {
       const parsedEstado = v2ParseBoolean(req.body.estado);
@@ -907,14 +988,13 @@ router.put('/usuarios/v2/update/:id_usuario', async (req, res) => {
     }
 
     if (hasRoleUpdate) {
-      nextRoleId = v2ParsePositiveInt(req.body?.id_rol);
-      if (!nextRoleId) {
-        return res.status(400).json({ error: true, message: 'id_rol debe ser un entero positivo' });
+      if (roleSelection.invalid || !roleSelection.roleIds.length) {
+        return res.status(400).json({ error: true, message: 'Debe enviar al menos un rol valido en id_roles o id_rol' });
       }
 
-      const role = await v2FindRoleById(nextRoleId, client);
-      if (!role) {
-        return res.status(400).json({ error: true, message: 'Rol no encontrado' });
+      const roles = await v2FindRolesByIds(roleSelection.roleIds, client);
+      if (roles.length !== roleSelection.roleIds.length) {
+        return res.status(400).json({ error: true, message: 'Uno o mas roles no existen' });
       }
     }
 
@@ -936,12 +1016,8 @@ router.put('/usuarios/v2/update/:id_usuario', async (req, res) => {
       );
     }
 
-    if (hasRoleUpdate && nextRoleId) {
-      await client.query('DELETE FROM roles_usuarios WHERE id_usuario = $1', [idUsuario]);
-      await client.query(
-        'INSERT INTO roles_usuarios (id_usuario, id_rol) VALUES ($1, $2)',
-        [idUsuario, nextRoleId]
-      );
+    if (hasRoleUpdate) {
+      await v2ReplaceUserRoles(idUsuario, roleSelection.roleIds, client);
     }
 
     await client.query('COMMIT');
@@ -1169,22 +1245,22 @@ router.post('/usuarios/v2/generate', async (req, res) => {
 
   try {
     const idEmpleado = v2ParsePositiveInt(req.body?.id_empleado);
-    const idRol = v2ParsePositiveInt(req.body?.id_rol);
+    const roleSelection = v2NormalizeRoleIdsInput(req.body);
 
     if (!idEmpleado) {
       return res.status(400).json({ error: true, message: 'id_empleado es obligatorio y debe ser positivo' });
     }
 
-    if (!idRol) {
-      return res.status(400).json({ error: true, message: 'id_rol es obligatorio y debe ser positivo' });
+    if (roleSelection.invalid || !roleSelection.roleIds.length) {
+      return res.status(400).json({ error: true, message: 'Debe enviar al menos un rol valido en id_roles o id_rol' });
     }
 
     await client.query('BEGIN');
 
-    const role = await v2FindRoleById(idRol, client);
-    if (!role) {
+    const roles = await v2FindRolesByIds(roleSelection.roleIds, client);
+    if (roles.length !== roleSelection.roleIds.length) {
       await client.query('ROLLBACK');
-      return res.status(400).json({ error: true, message: 'Rol no encontrado' });
+      return res.status(400).json({ error: true, message: 'Uno o mas roles no existen' });
     }
 
     const empleado = await v2FindEmployeeForUser(idEmpleado, client);
@@ -1243,10 +1319,7 @@ router.post('/usuarios/v2/generate', async (req, res) => {
       throw new Error('No se pudo obtener el id del usuario creado');
     }
 
-    await client.query(
-      'INSERT INTO roles_usuarios (id_usuario, id_rol) VALUES ($1, $2)',
-      [idUsuarioCreado, idRol]
-    );
+    await v2ReplaceUserRoles(idUsuarioCreado, roleSelection.roleIds, client);
 
     createdUser = await v2FetchUsuarioById(idUsuarioCreado, client);
     await client.query('COMMIT');
