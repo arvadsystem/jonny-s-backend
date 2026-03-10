@@ -11,7 +11,7 @@
 import express from 'express';
 import pool from '../../config/db-connection.js';
 import { closeSession } from '../../utils/security/sessionService.js';
-import { checkPermission } from '../../middleware/checkPermission.js';
+import { checkPermission, isRequestUserSuperAdmin } from '../../middleware/checkPermission.js';
 import { timestampAsHNToISO } from '../../utils/dates.js';
 
 const router = express.Router();
@@ -19,11 +19,9 @@ const router = express.Router();
 // =====================================================
 // Helpers
 // =====================================================
-const isSuperAdmin = (user) => Number(user?.rol) === 1;
-
-const requireSuperAdmin = (req, res) => {
-  const user = req.user || req.usuario;
-  if (!isSuperAdmin(user)) {
+const requireSuperAdmin = async (req, res) => {
+  const isSuperAdmin = await isRequestUserSuperAdmin(req);
+  if (!isSuperAdmin) {
     res.status(403).json({ error: true, message: 'Acceso denegado: solo Super Admin' });
     return false;
   }
@@ -76,7 +74,10 @@ const buildBuscarClause = (buscar, startIdx) => {
  * GET /seguridad/sesiones
  * Lista sesiones del usuario autenticado.
  */
-router.get('/sesiones', checkPermission('SEGURIDAD_VER'), async (req, res) => {
+router.get(
+  '/sesiones',
+  checkPermission(['SEGURIDAD_VER', 'SEGURIDAD_SESIONES_VER', 'SEGURIDAD_SESIONES_VER_GLOBAL']),
+  async (req, res) => {
   try {
     const user = req.user || req.usuario;
     if (!user?.id_usuario) {
@@ -117,13 +118,17 @@ router.get('/sesiones', checkPermission('SEGURIDAD_VER'), async (req, res) => {
     console.error('GET /seguridad/sesiones error:', err);
     return res.status(500).json({ error: true, message: 'Error interno del servidor' });
   }
-});
+  }
+);
 
 /**
  * POST /seguridad/sesiones/cerrar
  * Body: { id_sesion: "uuid..." }
  */
-router.post('/sesiones/cerrar', checkPermission('SEGURIDAD_SESIONES_CERRAR'), async (req, res) => {
+router.post(
+  '/sesiones/cerrar',
+  checkPermission(['SEGURIDAD_SESIONES_CERRAR', 'SEGURIDAD_SESIONES_CERRAR_OTRAS']),
+  async (req, res) => {
   try {
     const user = req.user || req.usuario;
     const { id_sesion } = req.body;
@@ -151,13 +156,17 @@ router.post('/sesiones/cerrar', checkPermission('SEGURIDAD_SESIONES_CERRAR'), as
     console.error('POST /seguridad/sesiones/cerrar error:', err);
     return res.status(500).json({ error: true, message: 'Error interno del servidor' });
   }
-});
+  }
+);
 
 /**
  * POST /seguridad/sesiones/cerrar-otras
  * Cierra todas las sesiones del usuario autenticado menos la actual.
  */
-router.post('/sesiones/cerrar-otras', checkPermission('SEGURIDAD_SESIONES_CERRAR'), async (req, res) => {
+router.post(
+  '/sesiones/cerrar-otras',
+  checkPermission(['SEGURIDAD_SESIONES_CERRAR', 'SEGURIDAD_SESIONES_CERRAR_OTRAS']),
+  async (req, res) => {
   try {
     const user = req.user || req.usuario;
     if (!user?.id_usuario) {
@@ -187,7 +196,8 @@ router.post('/sesiones/cerrar-otras', checkPermission('SEGURIDAD_SESIONES_CERRAR
     console.error('POST /seguridad/sesiones/cerrar-otras error:', err);
     return res.status(500).json({ error: true, message: 'Error interno del servidor' });
   }
-});
+  }
+);
 
 // =====================================================
 // Sprint 3 (HU31 adaptada): Sesiones globales (solo Super Admin)
@@ -201,7 +211,10 @@ router.post('/sesiones/cerrar-otras', checkPermission('SEGURIDAD_SESIONES_CERRAR
  * - limit (default 10)
  * - offset (default 0)
  */
-router.get('/sesiones/global', checkPermission('SEGURIDAD_VER'), async (req, res) => {
+router.get(
+  '/sesiones/global',
+  checkPermission(['SEGURIDAD_VER', 'SEGURIDAD_SESIONES_VER_GLOBAL']),
+  async (req, res) => {
   try {
     const user = req.user || req.usuario;
     if (!user?.id_usuario) {
@@ -209,7 +222,7 @@ router.get('/sesiones/global', checkPermission('SEGURIDAD_VER'), async (req, res
     }
 
     // 🔒 Solo Super Admin
-    if (!requireSuperAdmin(req, res)) return;
+    if (!(await requireSuperAdmin(req, res))) return;
 
     const buscar = String(req.query.buscar ?? '').trim();
     const limit = clampInt(req.query.limit, 10, 1, 50);
@@ -280,7 +293,8 @@ router.get('/sesiones/global', checkPermission('SEGURIDAD_VER'), async (req, res
     console.error('GET /seguridad/sesiones/global error:', err);
     return res.status(500).json({ error: true, message: 'Error interno del servidor' });
   }
-});
+  }
+);
 
 /**
  * POST /seguridad/sesiones/cerrar-global
@@ -294,7 +308,7 @@ router.get('/sesiones/global', checkPermission('SEGURIDAD_VER'), async (req, res
  */
 router.post(
   '/sesiones/cerrar-global',
-  checkPermission('SEGURIDAD_SESIONES_CERRAR'),
+  checkPermission(['SEGURIDAD_SESIONES_CERRAR_GLOBAL', 'SEGURIDAD_SESIONES_CERRAR']),
   async (req, res) => {
     try {
       const user = req.user || req.usuario;
@@ -308,7 +322,7 @@ router.post(
       }
 
       // 🔒 Solo Super Admin
-      if (!requireSuperAdmin(req, res)) return;
+      if (!(await requireSuperAdmin(req, res))) return;
 
       if (!id_sesion) {
         return res.status(400).json({ error: true, message: 'id_sesion es requerido' });
@@ -361,7 +375,11 @@ router.post(
  */
 router.post(
   '/sesiones/cerrar-global-menos-actual',
-  checkPermission('SEGURIDAD_SESIONES_CERRAR'),
+  checkPermission([
+    'SEGURIDAD_SESIONES_CERRAR_GLOBAL_MENOS_ACTUAL',
+    'SEGURIDAD_SESIONES_CERRAR_GLOBAL',
+    'SEGURIDAD_SESIONES_CERRAR'
+  ]),
   async (req, res) => {
     try {
       const user = req.user || req.usuario;
@@ -374,7 +392,7 @@ router.post(
       }
 
       // 🔒 Solo Super Admin
-      if (!requireSuperAdmin(req, res)) return;
+      if (!(await requireSuperAdmin(req, res))) return;
 
       const sql = `
         UPDATE sesiones_activas

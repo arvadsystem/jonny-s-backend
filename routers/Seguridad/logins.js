@@ -9,7 +9,7 @@ import { checkPermission } from "../../middleware/checkPermission.js";
 import { timestampAsHNToISO, toHNWallTimestamp } from "../../utils/dates.js";
 const router = express.Router();
 
-const PERMISO_VER = "SEGURIDAD_VER";
+const PERMISO_VER = ["SEGURIDAD_LOGINS_VER", "SEGURIDAD_VER"];
 
 router.get("/logins", checkPermission(PERMISO_VER), async (req, res) => {
   try {
