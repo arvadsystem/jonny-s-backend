@@ -21,9 +21,9 @@ import detalleComprasRoutes from './routers/detalle_compras.js';
 import sucursalesRoutes from './routers/sucursales.js';
 import ventasRoutes from './routers/ventas.js';
 import cocinaRoutes from './routers/cocina.js';
-import menuPosRouter from './routers/menu_pos.js'; // // Router del POS Menú 
+import menuPosRouter from './routers/menu_pos.js'; // Router del POS Menú
 
-//MODULO PERSONAS
+// MODULO PERSONAS
 import personasRoutes from './routers/personas.js';
 import telefonosRoutes from './routers/telefonos.js';
 import direccionesRoutes from './routers/direcciones.js';
@@ -38,11 +38,12 @@ import movimientosInventarioRoutes from './routers/movimientos_inventario.js';
 import perfilRoutes from './routers/perfil.js';
 
 // Seguridad
-import seguridadSesionesRoutes from './routers/seguridad/sesiones.js';
-import seguridadConfigRoutes from './routers/seguridad/configuracion.js';
-import seguridadLoginsRoutes from './routers/seguridad/logins.js';
-import seguridadPermisosRoutes from "./routers/seguridad/permisos.js";
-import seguridadUsuariosRoutes from "./routers/seguridad/usuarios.js";
+import seguridadSesionesRoutes from './routers/Seguridad/sesiones.js';
+import seguridadConfigRoutes from './routers/Seguridad/configuracion.js';
+import seguridadLoginsRoutes from './routers/Seguridad/logins.js';
+import seguridadPermisosRoutes from './routers/Seguridad/permisos.js';
+import seguridadUsuariosRoutes from './routers/Seguridad/usuarios.js';
+import rolesPermisosRoutes from './routers/roles_permisos.js';
 
 import archivosRoutes from './routers/archivos.js';
 import adminRecetasRouter from './routers/admin_recetas.js';
@@ -57,6 +58,7 @@ import { MAX_IMAGE_JSON_LIMIT, UPLOADS_DIR } from './utils/uploads.js';
 import catalogosRoutes from './routers/Parametros/catalogos.js';
 
 const app = express();
+const USUARIOS_PHOTO_JSON_LIMIT = '30mb';
 
 const FRONTEND_ORIGIN = process.env.FRONTEND_ORIGIN || 'http://localhost:5173';
 
@@ -76,8 +78,10 @@ app.use(
 // NEW: aumenta el limite JSON para soportar uploads base64 de imagen sin multipart.
 // WHY: el modulo Inventario enviara imagenes como data URL / base64 por JSON.
 // IMPACT: mantiene el parser global actual y habilita cuerpos de imagen dentro del limite definido.
+app.use('/usuarios/v2/photo', express.json({ limit: USUARIOS_PHOTO_JSON_LIMIT }));
 app.use(express.json({ limit: MAX_IMAGE_JSON_LIMIT }));
 app.use(cookieParser());
+
 // NEW: exposicion publica de `/uploads` para thumbnails e imagen principal de inventario.
 // WHY: los registros en `archivos.url_publica` apuntan a archivos locales servidos por Express.
 // IMPACT: no protege con JWT porque las imagenes deben poder cargarse en la UI como assets normales.
@@ -102,6 +106,7 @@ app.use(requireActiveSession);       // 2) valida sesión activa en BD
 app.use(touchSessionMiddleware);     // 3) actualiza ultima_actividad
 app.use(csrfProtect);                // 4) CSRF para no-GET
 app.use(perfilRoutes);
+
 // Admin: CRUD de recetas para panel administrativo (rutas relativas en router).
 app.use('/api/admin/recetas', adminRecetasRouter);
 // Admin: CRUD de combos para panel administrativo (rutas relativas en router).
@@ -111,18 +116,22 @@ app.use('/api/admin/combos', adminCombosRouter);
 app.use('/seguridad', seguridadSesionesRoutes);
 app.use('/seguridad', seguridadConfigRoutes);
 app.use('/seguridad', seguridadLoginsRoutes);
-app.use("/seguridad", seguridadPermisosRoutes);
-app.use("/seguridad", seguridadUsuariosRoutes);
+app.use('/seguridad', seguridadPermisosRoutes);
+app.use('/seguridad', seguridadUsuariosRoutes);
+app.use('/api/roles-permisos', rolesPermisosRoutes);
 
 // Parametros
 app.use('/parametros/catalogos', catalogosRoutes);
 
 app.use(usuarioRoutes);
+
 // NEW: alta de archivos para imagen principal de Productos/Insumos.
 // WHY: centralizar el guardado en tabla `archivos` y reutilizar el mismo flujo en Inventario.
 // IMPACT: agrega `POST /archivos`; no modifica endpoints existentes.
 app.use(archivosRoutes);
+
 app.use(categoriasRoutes);
+
 // NEW: CRUD de categorías de insumos con el mismo patrón que categorías de productos.
 // WHY: unificar Inventario > Categorías sin romper endpoints existentes.
 // IMPACT: agrega rutas nuevas `/categorias_insumos`; no altera rutas actuales.
@@ -140,7 +149,7 @@ app.use(sucursalesRoutes);
 app.use(ventasRoutes);
 app.use(cocinaRoutes);
 
-//MODULO PERSONAS
+// MODULO PERSONAS
 app.use(personasRoutes);
 app.use(telefonosRoutes);
 app.use(direccionesRoutes);
@@ -149,8 +158,7 @@ app.use(clientesRoutes);
 app.use(empleadosRoutes);
 app.use(empresasRoutes);
 
-app.use(menuPosRouter); // // Monta las rutas del POS Menú
-
+app.use(menuPosRouter); // Monta las rutas del POS Menú
 app.use(movimientosInventarioRoutes);
 
 const PORT = process.env.PORT || 3001;

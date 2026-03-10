@@ -4,6 +4,7 @@ import pool from '../config/db-connection.js';
 const router = express.Router();
 
 const MAX_LIMIT = 100;
+const MAX_SUGGESTIONS_LIMIT = 12;
 const MAX_AUDIT_DESCRIPCION_LENGTH = 100;
 const BASE_FIELDS = [
   'id_persona',
@@ -155,6 +156,54 @@ const parseBooleanFilter = (value) => {
   return null;
 };
 
+const parseSuggestMode = (value) => {
+  if (value === undefined || value === null) return false;
+  if (typeof value === 'boolean') return value;
+  const normalized = String(value).trim().toLowerCase();
+  return ['1', 'true', 't', 'si', 'yes'].includes(normalized);
+};
+
+const normalizeGeneroFilter = (value) => {
+  if (typeof value !== 'string') return '';
+  const normalized = value.trim().toLowerCase();
+  if (!normalized || normalized === 'todos') return '';
+  if (['f', 'femenino', 'female', 'mujer'].includes(normalized)) return 'femenino';
+  if (['m', 'masculino', 'male', 'hombre'].includes(normalized)) return 'masculino';
+  return normalized;
+};
+
+const buildPersonaSuggestions = (rows = []) => {
+  const seen = new Set();
+  const suggestions = [];
+
+  for (const row of Array.isArray(rows) ? rows : []) {
+    const nombre = `${row?.nombre || ''} ${row?.apellido || ''}`.trim();
+    const dni = String(row?.dni ?? '').trim();
+    const correo = String(row?.direccion_correo ?? row?.correo ?? '').trim();
+    const telefono = String(row?.telefono ?? '').trim();
+    const fallback = dni || correo || telefono;
+    const value = nombre || fallback;
+    if (!value) continue;
+
+    const key = value.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+
+    suggestions.push({
+      id_persona: row?.id_persona ?? null,
+      value,
+      nombre,
+      dni,
+      correo,
+      telefono
+    });
+
+    if (suggestions.length >= MAX_SUGGESTIONS_LIMIT) break;
+  }
+
+  return suggestions;
+};
+
 const resolveUserId = (req) => req.user?.id_usuario ?? null;
 
 const getSchemaCapabilities = async () => {
@@ -223,7 +272,10 @@ const personaRepository = {
     page,
     limit,
     tenantId = null,
-    estado = null
+    estado = null,
+    sort = 'recientes',
+    genero = '',
+    suggestMode = false
   }) {
     const fields = BASE_FIELDS.map((field) => `p.${field}`);
     if (capabilities.softDeleteField && !BASE_FIELDS.includes(capabilities.softDeleteField)) {
@@ -244,43 +296,82 @@ const personaRepository = {
       LEFT JOIN correos cor ON cor.id_correo = p.id_correo
     `;
 
-    const params = [];
+    const whereParams = [];
     const whereParts = [];
 
-    params.push(`%${search}%`);
-    whereParts.push(`(
-      p.nombre ILIKE $1
-      OR p.apellido ILIKE $1
-      OR p.dni::TEXT ILIKE $1
-      OR COALESCE(telf.telefono, '') ILIKE $1
-      OR COALESCE(cor.direccion_correo, '') ILIKE $1
-    )`);
+    const searchTerm = typeof search === 'string' ? search.trim() : '';
+    if (searchTerm) {
+      whereParams.push(`%${searchTerm}%`);
+      const searchParamIndex = whereParams.length;
+      whereParts.push(`(
+        p.nombre ILIKE $${searchParamIndex}
+        OR p.apellido ILIKE $${searchParamIndex}
+        OR p.dni::TEXT ILIKE $${searchParamIndex}
+        OR COALESCE(telf.telefono, '') ILIKE $${searchParamIndex}
+        OR COALESCE(cor.direccion_correo, '') ILIKE $${searchParamIndex}
+        OR COALESCE(dir.direccion, '') ILIKE $${searchParamIndex}
+      )`);
+    }
+
+    const normalizedGenero = normalizeGeneroFilter(genero);
+    if (normalizedGenero === 'femenino') {
+      whereParts.push(`LOWER(COALESCE(p.genero, '')) IN ('f', 'femenino', 'female', 'mujer')`);
+    } else if (normalizedGenero === 'masculino') {
+      whereParts.push(`LOWER(COALESCE(p.genero, '')) IN ('m', 'masculino', 'male', 'hombre')`);
+    } else if (normalizedGenero) {
+      whereParams.push(`%${normalizedGenero}%`);
+      whereParts.push(`LOWER(COALESCE(p.genero, '')) LIKE LOWER($${whereParams.length})`);
+    }
 
     if (
       estado !== null
       && capabilities.softDeleteField
       && OPTIONAL_SOFT_DELETE_FIELDS.includes(capabilities.softDeleteField)
     ) {
-      params.push(estado);
-      whereParts.push(`p.${capabilities.softDeleteField} = $${params.length}`);
+      whereParams.push(estado);
+      whereParts.push(`p.${capabilities.softDeleteField} = $${whereParams.length}`);
     }
 
     if (tenantId && capabilities.hasTenantField) {
-      params.push(tenantId);
-      whereParts.push(`p.id_empresa = $${params.length}`);
+      whereParams.push(tenantId);
+      whereParts.push(`p.id_empresa = $${whereParams.length}`);
     }
 
     const whereClause = whereParts.length ? `WHERE ${whereParts.join(' AND ')}` : '';
     const offset = (page - 1) * limit;
-    const dataParams = [...params, limit, offset];
+    const dataParams = [...whereParams];
+    const normalizedSort = typeof sort === 'string' ? sort.trim().toLowerCase() : 'recientes';
+    let orderByClause = 'p.id_persona DESC';
+
+    if (normalizedSort === 'nombre_asc') {
+      orderByClause = "p.nombre ASC, p.apellido ASC, p.id_persona DESC";
+    } else if (normalizedSort === 'nombre_desc') {
+      orderByClause = "p.nombre DESC, p.apellido DESC, p.id_persona DESC";
+    } else if (searchTerm && (suggestMode || normalizedSort === 'relevancia')) {
+      dataParams.push(`${searchTerm}%`);
+      const prefixParamIndex = dataParams.length;
+      orderByClause = `CASE
+        WHEN p.nombre ILIKE $${prefixParamIndex} THEN 0
+        WHEN p.apellido ILIKE $${prefixParamIndex} THEN 1
+        WHEN p.dni::TEXT ILIKE $${prefixParamIndex} THEN 2
+        WHEN COALESCE(telf.telefono, '') ILIKE $${prefixParamIndex} THEN 3
+        WHEN COALESCE(cor.direccion_correo, '') ILIKE $${prefixParamIndex} THEN 4
+        WHEN COALESCE(dir.direccion, '') ILIKE $${prefixParamIndex} THEN 5
+        ELSE 6
+      END, p.id_persona DESC`;
+    }
+
+    const limitParamIndex = dataParams.length + 1;
+    const offsetParamIndex = dataParams.length + 2;
+    const dataParamsWithPage = [...dataParams, limit, offset];
 
     const dataQuery = `
       SELECT ${fields.join(', ')}
       ${fromClause}
       ${whereClause}
-      ORDER BY p.id_persona DESC
-      LIMIT $${params.length + 1}
-      OFFSET $${params.length + 2}
+      ORDER BY ${orderByClause}
+      LIMIT $${limitParamIndex}
+      OFFSET $${offsetParamIndex}
     `;
 
     const totalQuery = `
@@ -290,13 +381,60 @@ const personaRepository = {
     `;
 
     const [dataResult, totalResult] = await Promise.all([
-      pool.query(dataQuery, dataParams),
-      pool.query(totalQuery, params)
+      pool.query(dataQuery, dataParamsWithPage),
+      pool.query(totalQuery, whereParams)
     ]);
 
     return {
       data: dataResult.rows,
       total: totalResult.rows[0]?.total || 0
+    };
+  },
+
+  async getGlobalStats({ capabilities, tenantId = null, estado = null }) {
+    const whereParts = [];
+    const params = [];
+
+    if (
+      estado !== null
+      && capabilities.softDeleteField
+      && OPTIONAL_SOFT_DELETE_FIELDS.includes(capabilities.softDeleteField)
+    ) {
+      params.push(estado);
+      whereParts.push(`${capabilities.softDeleteField} = $${params.length}`);
+    }
+
+    if (tenantId && capabilities.hasTenantField) {
+      params.push(tenantId);
+      whereParts.push(`id_empresa = $${params.length}`);
+    }
+
+    const whereClause = whereParts.length ? `WHERE ${whereParts.join(' AND ')}` : '';
+    const activeExpr = capabilities.softDeleteField
+      ? `SUM(CASE WHEN ${capabilities.softDeleteField} = true THEN 1 ELSE 0 END)::INT AS activas`
+      : 'COUNT(*)::INT AS activas';
+    const inactiveExpr = capabilities.softDeleteField
+      ? `SUM(CASE WHEN ${capabilities.softDeleteField} = false THEN 1 ELSE 0 END)::INT AS inactivas`
+      : '0::INT AS inactivas';
+
+    const query = `
+      SELECT
+        COUNT(*)::INT AS total,
+        ${activeExpr},
+        ${inactiveExpr},
+        SUM(CASE WHEN LOWER(COALESCE(genero, '')) IN ('f', 'femenino', 'female', 'mujer') THEN 1 ELSE 0 END)::INT AS femenino,
+        SUM(CASE WHEN LOWER(COALESCE(genero, '')) IN ('m', 'masculino', 'male', 'hombre') THEN 1 ELSE 0 END)::INT AS masculino
+      FROM personas
+      ${whereClause}
+    `;
+
+    const result = await pool.query(query, params);
+    return result.rows[0] || {
+      total: 0,
+      activas: 0,
+      inactivas: 0,
+      femenino: 0,
+      masculino: 0
     };
   },
 
@@ -407,6 +545,9 @@ const personaService = {
     const searchName = typeof req.query.nombre === 'string' ? req.query.nombre.trim() : '';
     const searchTerm = search || searchName;
     const estado = parseBooleanFilter(req.query.estado);
+    const sort = typeof req.query.sort === 'string' ? req.query.sort.trim() : 'recientes';
+    const genero = typeof req.query.genero === 'string' ? req.query.genero.trim() : '';
+    const suggestMode = parseSuggestMode(req.query.suggest);
 
     if (req.query.estado !== undefined && estado === null) {
       return { status: 400, body: { error: true, message: 'El filtro estado debe ser booleano' } };
@@ -421,77 +562,30 @@ const personaService = {
 
     const tenantId = parsePositiveInt(req.user?.id_empresa);
 
-    if (searchTerm) {
-      const { data, total } = await personaRepository.searchWithPagination({
+    const effectiveLimit = suggestMode ? Math.min(limit, MAX_SUGGESTIONS_LIMIT) : limit;
+
+    const { data, total } = await personaRepository.searchWithPagination({
+      capabilities,
+      search: searchTerm,
+      page,
+      limit: effectiveLimit,
+      tenantId,
+      estado,
+      sort,
+      genero,
+      suggestMode
+    });
+
+    let stats = null;
+    if (!searchTerm && !suggestMode) {
+      stats = await personaRepository.getGlobalStats({
         capabilities,
-        search: searchTerm,
-        page,
-        limit,
         tenantId,
         estado
       });
-
-      return {
-        status: 200,
-        body: {
-          data,
-          total,
-          page,
-          limit
-        }
-      };
     }
 
-    const allRows = await personaRepository.list({ capabilities });
-    let data = Array.isArray(allRows) ? allRows : [];
-
-    if (tenantId && capabilities.hasTenantField) {
-      if (rowsHaveField(data, 'id_empresa')) {
-        data = data.filter((row) => parsePositiveInt(row?.id_empresa) === tenantId);
-      } else {
-        const allowedIds = await personaRepository.listPersonaIdsByTenant(tenantId);
-        data = data.filter((row) => allowedIds.has(parsePositiveInt(row?.id_persona)));
-      }
-    }
-
-    if (searchName) {
-      const needle = searchName.toLowerCase();
-      data = data.filter((row) => {
-        const haystack = [
-          row?.nombre,
-          row?.apellido,
-          row?.dni,
-          row?.rtn,
-          row?.telefono,
-          row?.direccion,
-          row?.direccion_correo,
-          row?.correo
-        ]
-          .filter((value) => value !== null && value !== undefined)
-          .join(' ')
-          .toLowerCase();
-
-        return haystack.includes(needle);
-      });
-    }
-
-    if (estado !== null && capabilities.softDeleteField) {
-      if (rowsHaveField(data, capabilities.softDeleteField)) {
-        data = data.filter((row) => Boolean(row?.[capabilities.softDeleteField]) === estado);
-      } else {
-        const allowedIds = await personaRepository.listPersonaIdsByEstado({
-          softDeleteField: capabilities.softDeleteField,
-          estado,
-          tenantId,
-          capabilities
-        });
-        data = data.filter((row) => allowedIds.has(parsePositiveInt(row?.id_persona)));
-      }
-    }
-
-    const total = data.length;
-    const offset = (page - 1) * limit;
-    data = data.slice(offset, offset + limit);
+    const suggestions = suggestMode ? buildPersonaSuggestions(data) : null;
 
     return {
       status: 200,
@@ -499,7 +593,9 @@ const personaService = {
         data,
         total,
         page,
-        limit
+        limit: effectiveLimit,
+        ...(stats ? { stats } : {}),
+        ...(suggestions ? { suggestions } : {})
       }
     };
   },

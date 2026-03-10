@@ -9,22 +9,40 @@
 
 import express from 'express';
 import pool from '../../config/db-connection.js';
-import { checkPermission } from '../../middleware/checkPermission.js';
+import { checkPermission, isRequestUserSuperAdmin } from '../../middleware/checkPermission.js';
 import { timestampAsHNToISO, toHNWallTimestamp } from '../../utils/dates.js';
 
 const router = express.Router();
 
-const PERMISO_VER = 'SEGURIDAD_VER';
-const PERMISO_CERRAR = 'SEGURIDAD_SESIONES_CERRAR';
+const PERMISOS_USUARIOS_VER = [
+  'SEGURIDAD_USUARIOS_VER',
+  'SEGURIDAD_USUARIOS_AUDITORIA_VER',
+  'SEGURIDAD_VER'
+];
+const PERMISOS_USUARIOS_SESIONES = [
+  'SEGURIDAD_USUARIOS_AUDITORIA_SESIONES_VER',
+  'SEGURIDAD_USUARIOS_AUDITORIA_VER',
+  'SEGURIDAD_USUARIOS_VER',
+  'SEGURIDAD_VER'
+];
+const PERMISOS_USUARIOS_LOGINS = [
+  'SEGURIDAD_USUARIOS_AUDITORIA_LOGINS_VER',
+  'SEGURIDAD_USUARIOS_AUDITORIA_VER',
+  'SEGURIDAD_USUARIOS_VER',
+  'SEGURIDAD_VER'
+];
+const PERMISOS_USUARIOS_CERRAR = [
+  'SEGURIDAD_USUARIOS_SESIONES_CERRAR',
+  'SEGURIDAD_SESIONES_CERRAR_GLOBAL',
+  'SEGURIDAD_SESIONES_CERRAR'
+];
 
 // =====================================================
 // Helpers
 // =====================================================
-const isSuperAdmin = (user) => Number(user?.rol) === 1;
-
-const requireSuperAdmin = (req, res) => {
-  const user = req.user || req.usuario;
-  if (!isSuperAdmin(user)) {
+const requireSuperAdmin = async (req, res) => {
+  const isSuperAdmin = await isRequestUserSuperAdmin(req);
+  if (!isSuperAdmin) {
     res.status(403).json({ error: true, message: 'Acceso denegado: solo Super Admin' });
     return false;
   }
@@ -100,7 +118,7 @@ const insertAuditLog = async ({ accion, descripcion, id_usuario }) => {
  * - limit (default 10)
  * - offset (default 0)
  */
-router.get('/usuarios/global', checkPermission(PERMISO_VER), async (req, res) => {
+router.get('/usuarios/global', checkPermission(PERMISOS_USUARIOS_VER), async (req, res) => {
   try {
     const user = req.user || req.usuario;
 
@@ -109,7 +127,7 @@ router.get('/usuarios/global', checkPermission(PERMISO_VER), async (req, res) =>
     }
 
     // 🔒 Solo Super Admin
-    if (!requireSuperAdmin(req, res)) return;
+    if (!(await requireSuperAdmin(req, res))) return;
 
     const buscar = String(req.query.buscar ?? '').trim();
     const estadoBool = normalizeEstado(req.query.estado);
@@ -223,13 +241,13 @@ router.get('/usuarios/global', checkPermission(PERMISO_VER), async (req, res) =>
  * GET /seguridad/usuarios/:id/detalle
  * HU1887: Perfil resumido del usuario para auditoria.
  */
-router.get('/usuarios/:id/detalle', checkPermission(PERMISO_VER), async (req, res) => {
+router.get('/usuarios/:id/detalle', checkPermission(PERMISOS_USUARIOS_VER), async (req, res) => {
   try {
     const actor = req.user || req.usuario;
     if (!actor?.id_usuario) {
       return res.status(401).json({ error: true, message: 'No autenticado' });
     }
-    if (!requireSuperAdmin(req, res)) return;
+    if (!(await requireSuperAdmin(req, res))) return;
 
     const idUsuario = parsePositiveInt(req.params.id);
     if (!idUsuario) {
@@ -335,13 +353,13 @@ router.get('/usuarios/:id/detalle', checkPermission(PERMISO_VER), async (req, re
  * GET /seguridad/usuarios/:id/sesiones
  * HU1887: Sesiones de un usuario especifico.
  */
-router.get('/usuarios/:id/sesiones', checkPermission(PERMISO_VER), async (req, res) => {
+router.get('/usuarios/:id/sesiones', checkPermission(PERMISOS_USUARIOS_SESIONES), async (req, res) => {
   try {
     const actor = req.user || req.usuario;
     if (!actor?.id_usuario) {
       return res.status(401).json({ error: true, message: 'No autenticado' });
     }
-    if (!requireSuperAdmin(req, res)) return;
+    if (!(await requireSuperAdmin(req, res))) return;
 
     const idUsuario = parsePositiveInt(req.params.id);
     if (!idUsuario) {
@@ -416,13 +434,13 @@ router.get('/usuarios/:id/sesiones', checkPermission(PERMISO_VER), async (req, r
  * GET /seguridad/usuarios/:id/logins
  * HU1887: Logins de usuario seleccionado (exitosos y fallidos), con filtros.
  */
-router.get('/usuarios/:id/logins', checkPermission(PERMISO_VER), async (req, res) => {
+router.get('/usuarios/:id/logins', checkPermission(PERMISOS_USUARIOS_LOGINS), async (req, res) => {
   try {
     const actor = req.user || req.usuario;
     if (!actor?.id_usuario) {
       return res.status(401).json({ error: true, message: 'No autenticado' });
     }
-    if (!requireSuperAdmin(req, res)) return;
+    if (!(await requireSuperAdmin(req, res))) return;
 
     const idUsuario = parsePositiveInt(req.params.id);
     if (!idUsuario) {
@@ -524,13 +542,13 @@ router.get('/usuarios/:id/logins', checkPermission(PERMISO_VER), async (req, res
  * POST /seguridad/usuarios/:id/sesiones/cerrar
  * HU1888: Cierra todas las sesiones activas de un usuario (forzado por Super Admin).
  */
-router.post('/usuarios/:id/sesiones/cerrar', checkPermission(PERMISO_CERRAR), async (req, res) => {
+router.post('/usuarios/:id/sesiones/cerrar', checkPermission(PERMISOS_USUARIOS_CERRAR), async (req, res) => {
   try {
     const actor = req.user || req.usuario;
     if (!actor?.id_usuario) {
       return res.status(401).json({ error: true, message: 'No autenticado' });
     }
-    if (!requireSuperAdmin(req, res)) return;
+    if (!(await requireSuperAdmin(req, res))) return;
 
     const idUsuario = parsePositiveInt(req.params.id);
     if (!idUsuario) {
