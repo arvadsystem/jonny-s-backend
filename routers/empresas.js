@@ -43,6 +43,21 @@ const parseBooleanFilter = (value) => {
   return null;
 };
 
+const parseBooleanValue = (value) => {
+  if (typeof value === 'boolean') return value;
+  if (typeof value === 'number') {
+    if (value === 1) return true;
+    if (value === 0) return false;
+    return null;
+  }
+  if (typeof value === 'string') {
+    const normalized = value.trim().toLowerCase();
+    if (['true', '1', 't', 'si', 'activo'].includes(normalized)) return true;
+    if (['false', '0', 'f', 'no', 'inactivo'].includes(normalized)) return false;
+  }
+  return null;
+};
+
 const resolveUserId = (req) => req.user?.id_usuario ?? null;
 const toNullableTrimmedText = (value) => {
   if (value === null || value === undefined) return null;
@@ -143,10 +158,14 @@ const empresaRepository = {
 
     return rows.map((row) => {
       const key = Number(row?.id_empresa);
-      if (!stateMap.has(key)) return row;
+      const estadoActual = stateMap.has(key)
+        ? stateMap.get(key)
+        : parseBooleanValue(row?.[capabilities.softDeleteField]);
+      const safeEstado = estadoActual === null ? false : Boolean(estadoActual);
       return {
         ...row,
-        [capabilities.softDeleteField]: stateMap.get(key)
+        [capabilities.softDeleteField]: safeEstado,
+        estado: safeEstado
       };
     });
   },
@@ -288,13 +307,22 @@ const empresaService = {
       return { status: 404, body: { error: true, message: 'Empresa no encontrada' } };
     }
 
-    if (capabilities.softDeleteField && empresa[capabilities.softDeleteField] === false) {
-      return { status: 404, body: { error: true, message: 'Empresa no encontrada' } };
-    }
-
     const tenantId = parsePositiveInt(req.user?.id_empresa);
     if (tenantId && tenantId !== empresa.id_empresa) {
       return { status: 403, body: { error: true, message: 'Acceso denegado para esta empresa' } };
+    }
+
+    if (capabilities.softDeleteField) {
+      const estadoActual = parseBooleanValue(empresa[capabilities.softDeleteField]);
+      const safeEstado = estadoActual === null ? false : Boolean(estadoActual);
+      return {
+        status: 200,
+        body: {
+          ...empresa,
+          [capabilities.softDeleteField]: safeEstado,
+          estado: safeEstado
+        }
+      };
     }
 
     return { status: 200, body: empresa };
@@ -303,6 +331,9 @@ const empresaService = {
   async create(req) {
     const capabilities = await getSchemaCapabilities();
     const payload = normalizeEmpresaFunctionPayload(req.body);
+    const estadoSolicitado = Object.prototype.hasOwnProperty.call(req.body || {}, 'estado')
+      ? parseBooleanValue(req.body?.estado)
+      : null;
 
     if (!isPlainObject(payload) || Object.keys(payload).length === 0) {
       return { status: 400, body: { error: true, message: 'Debe enviar un objeto con datos validos' } };
@@ -312,6 +343,10 @@ const empresaService = {
       return { status: 400, body: { error: true, message: 'nombre_empresa es obligatorio' } };
     }
 
+    if (Object.prototype.hasOwnProperty.call(req.body || {}, 'estado') && estadoSolicitado === null) {
+      return { status: 400, body: { error: true, message: 'estado debe ser booleano' } };
+    }
+
     const insertData = { ...payload };
     const idUsuario = resolveUserId(req);
 
@@ -319,6 +354,11 @@ const empresaService = {
     if (capabilities.hasUpdatedBy && idUsuario) insertData.updated_by = idUsuario;
 
     const createdId = await empresaRepository.create(insertData);
+
+    if (capabilities.softDeleteField && estadoSolicitado !== null && createdId) {
+      await empresaRepository.updateField(createdId, capabilities.softDeleteField, estadoSolicitado);
+    }
+
     await empresaRepository.addAuditLog({
       accion: 'EMPRESA_CREAR',
       descripcion: `Empresa creada: ${payload.nombre_empresa}`,
@@ -368,14 +408,20 @@ const empresaService = {
     const normalizedUpdates = normalizeEmpresaFunctionPayload(rawUpdates);
     const idUsuario = resolveUserId(req);
     let touched = false;
+    let estadoActualizado = false;
 
     if (capabilities.softDeleteField && Object.prototype.hasOwnProperty.call(rawUpdates, capabilities.softDeleteField)) {
+      const estadoSolicitado = parseBooleanValue(rawUpdates[capabilities.softDeleteField]);
+      if (estadoSolicitado === null) {
+        return { status: 400, body: { error: true, message: `${capabilities.softDeleteField} debe ser booleano` } };
+      }
       await empresaRepository.updateField(
         idEmpresa,
         capabilities.softDeleteField,
-        rawUpdates[capabilities.softDeleteField]
+        estadoSolicitado
       );
       touched = true;
+      estadoActualizado = true;
     }
 
     if (Object.keys(normalizedUpdates).length > 0) {
@@ -392,7 +438,7 @@ const empresaService = {
     }
 
     const updatedFields = Object.keys(normalizedUpdates);
-    if (capabilities.softDeleteField && Object.prototype.hasOwnProperty.call(rawUpdates, capabilities.softDeleteField)) {
+    if (estadoActualizado) {
       updatedFields.push(capabilities.softDeleteField);
     }
 

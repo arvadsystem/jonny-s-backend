@@ -299,14 +299,18 @@ const personaRepository = {
     const whereParams = [];
     const whereParts = [];
 
-    const searchTerm = typeof search === 'string' ? search.trim() : '';
+    const searchTerm = typeof search === 'string'
+      ? search.trim().replace(/\s+/g, ' ')
+      : '';
     if (searchTerm) {
       whereParams.push(`%${searchTerm}%`);
       const searchParamIndex = whereParams.length;
       whereParts.push(`(
         p.nombre ILIKE $${searchParamIndex}
         OR p.apellido ILIKE $${searchParamIndex}
+        OR CONCAT_WS(' ', COALESCE(p.nombre, ''), COALESCE(p.apellido, '')) ILIKE $${searchParamIndex}
         OR p.dni::TEXT ILIKE $${searchParamIndex}
+        OR p.rtn::TEXT ILIKE $${searchParamIndex}
         OR COALESCE(telf.telefono, '') ILIKE $${searchParamIndex}
         OR COALESCE(cor.direccion_correo, '') ILIKE $${searchParamIndex}
         OR COALESCE(dir.direccion, '') ILIKE $${searchParamIndex}
@@ -353,11 +357,13 @@ const personaRepository = {
       orderByClause = `CASE
         WHEN p.nombre ILIKE $${prefixParamIndex} THEN 0
         WHEN p.apellido ILIKE $${prefixParamIndex} THEN 1
-        WHEN p.dni::TEXT ILIKE $${prefixParamIndex} THEN 2
-        WHEN COALESCE(telf.telefono, '') ILIKE $${prefixParamIndex} THEN 3
-        WHEN COALESCE(cor.direccion_correo, '') ILIKE $${prefixParamIndex} THEN 4
-        WHEN COALESCE(dir.direccion, '') ILIKE $${prefixParamIndex} THEN 5
-        ELSE 6
+        WHEN CONCAT_WS(' ', COALESCE(p.nombre, ''), COALESCE(p.apellido, '')) ILIKE $${prefixParamIndex} THEN 2
+        WHEN p.dni::TEXT ILIKE $${prefixParamIndex} THEN 3
+        WHEN p.rtn::TEXT ILIKE $${prefixParamIndex} THEN 4
+        WHEN COALESCE(telf.telefono, '') ILIKE $${prefixParamIndex} THEN 5
+        WHEN COALESCE(cor.direccion_correo, '') ILIKE $${prefixParamIndex} THEN 6
+        WHEN COALESCE(dir.direccion, '') ILIKE $${prefixParamIndex} THEN 7
+        ELSE 8
       END, p.id_persona DESC`;
     }
 
@@ -374,9 +380,13 @@ const personaRepository = {
       OFFSET $${offsetParamIndex}
     `;
 
+    const countFromClause = searchTerm
+      ? fromClause
+      : 'FROM personas p';
+
     const totalQuery = `
       SELECT COUNT(*)::INT AS total
-      ${fromClause}
+      ${countFromClause}
       ${whereClause}
     `;
 
@@ -542,8 +552,11 @@ const personaService = {
     const search = typeof req.query.search === 'string'
       ? req.query.search.trim()
       : '';
+    const searchQuery = typeof req.query.q === 'string'
+      ? req.query.q.trim()
+      : '';
     const searchName = typeof req.query.nombre === 'string' ? req.query.nombre.trim() : '';
-    const searchTerm = search || searchName;
+    const searchTerm = search || searchQuery || searchName;
     const estado = parseBooleanFilter(req.query.estado);
     const sort = typeof req.query.sort === 'string' ? req.query.sort.trim() : 'recientes';
     const genero = typeof req.query.genero === 'string' ? req.query.genero.trim() : '';
