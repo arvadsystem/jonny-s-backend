@@ -11,7 +11,9 @@ import { createSession, closeSession } from '../utils/security/sessionService.js
 
 const router = express.Router();
 
-const JWT_SECRET = process.env.JWT_SECRET || 'CAMBIA_ESTE_SECRET_EN_ENV';
+const FALLBACK_JWT_SECRET = 'CAMBIA_ESTE_SECRET_EN_ENV';
+const JWT_SECRET = process.env.JWT_SECRET || (process.env.NODE_ENV === 'production' ? '' : FALLBACK_JWT_SECRET);
+const LEGACY_BCRYPT_PREFIX_RE = /^\$2[abxy]?\$/i;
 const MUST_CHANGE_PASSWORD_FIELDS = [
   'must_change_password',
   'debe_cambiar_clave',
@@ -104,8 +106,31 @@ const issueCsrf = (res) => {
   return csrfToken;
 };
 
+const verifyLoginPassword = async (plainPassword, storedPassword) => {
+  const plain = String(plainPassword ?? '');
+  const stored = String(storedPassword ?? '');
+
+  if (!plain || !stored) return false;
+  if (plain === stored) return true;
+  if (!LEGACY_BCRYPT_PREFIX_RE.test(stored)) return false;
+
+  const result = await pool.query(
+    'SELECT crypt($1::text, $2::text) = $2::text AS ok',
+    [plain, stored]
+  );
+
+  return Boolean(result.rows?.[0]?.ok);
+};
+
 router.post('/login', async (req, res) => {
   const { nombre_usuario, clave } = req.body;
+
+  if (!JWT_SECRET) {
+    return res.status(500).json({
+      error: true,
+      message: 'Configuracion de seguridad incompleta: JWT_SECRET no definido'
+    });
+  }
 
   // HU78: capturar IP + User-Agent + parseo
   const ip_origen = getClientIp(req);
@@ -113,11 +138,13 @@ router.post('/login', async (req, res) => {
   const { dispositivo, navegador, sistema_operativo } = parseUserAgent(user_agent);
 
   try {
-    const query = 'SELECT * FROM usuarios WHERE nombre_usuario = $1 AND clave = $2';
-    const result = await pool.query(query, [nombre_usuario, clave]);
+    const query = 'SELECT * FROM usuarios WHERE nombre_usuario = $1 LIMIT 1';
+    const result = await pool.query(query, [nombre_usuario]);
+    const usuarioEncontrado = result.rows[0] || null;
+    const passwordValida = await verifyLoginPassword(clave, usuarioEncontrado?.clave);
 
     // Login fallido: registrar intento
-    if (result.rows.length === 0) {
+    if (!usuarioEncontrado || !passwordValida) {
       await insertLoginLog({
         id_usuario: null,
         id_sesion: null, // HU79 lo llenaremos luego
@@ -135,7 +162,6 @@ router.post('/login', async (req, res) => {
       return res.status(401).json({ error: true, message: 'Usuario o contraseña incorrectos' });
     }
 
-    const usuarioEncontrado = result.rows[0];
 
     // ✅ HU79: crear sesión activa y obtener id_sesion (UUID)
     const id_sesion = await createSession({

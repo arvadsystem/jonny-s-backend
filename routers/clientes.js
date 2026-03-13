@@ -1,7 +1,12 @@
 import express from 'express';
 import pool from '../config/db-connection.js';
+import { checkPermission } from '../middleware/checkPermission.js';
 
 const router = express.Router();
+const CLIENTES_VIEW_PERMISSIONS = ['CLIENTES_VER', 'CLIENTES_CREAR', 'CLIENTES_EDITAR', 'CLIENTES_ELIMINAR'];
+const CLIENTES_CREATE_PERMISSIONS = ['CLIENTES_CREAR'];
+const CLIENTES_EDIT_PERMISSIONS = ['CLIENTES_EDITAR'];
+const CLIENTES_DELETE_PERMISSIONS = ['CLIENTES_ELIMINAR'];
 
 const MAX_LIMIT = 100;
 const BASE_FIELDS = ['id_cliente', 'fecha_ingreso', 'puntos', 'id_tipo_cliente', 'id_persona', 'id_empresa', 'estado'];
@@ -56,19 +61,6 @@ const parseNullablePositiveInt = (value) => {
 };
 
 const resolveUserId = (req) => req.user?.id_usuario ?? null;
-
-const parseJsonArray = (value) => {
-  if (Array.isArray(value)) return value;
-  if (typeof value === 'string') {
-    try {
-      const parsed = JSON.parse(value);
-      return Array.isArray(parsed) ? parsed : [];
-    } catch {
-      return [];
-    }
-  }
-  return [];
-};
 
 const firstNonEmptyValue = (...values) => {
   for (const value of values) {
@@ -305,156 +297,190 @@ const getSchemaCapabilities = async () => {
 };
 
 const clienteRepository = {
-  async list(capabilities) {
-    const result = await pool.query('SELECT fn_listar_clientes() AS clientes');
-    const rows = parseJsonArray(result.rows[0]?.clientes).map((row) => {
-      const personaNombre = String(row?.nombre ?? '').trim();
-      const personaApellido = String(row?.apellido ?? '').trim();
-      const personaCompleta = `${personaNombre} ${personaApellido}`.trim();
+  async searchWithPagination({
+    capabilities,
+    page,
+    limit,
+    searchTerm = '',
+    estado = null,
+    tenantId = null
+  }) {
+    const filters = [];
+    const countFilters = [];
+    const params = [];
+    const countParams = [];
 
-      return {
-        ...row,
-        persona_nombre: row?.persona_nombre ?? row?.nombre ?? null,
-        persona_apellido: row?.persona_apellido ?? row?.apellido ?? null,
-        persona_dni: row?.persona_dni ?? row?.dni ?? null,
-        persona_nombre_completo: (row?.persona_nombre_completo ?? personaCompleta) || null,
-        tipo_cliente_nombre: row?.tipo_cliente_nombre ?? row?.tipo_cliente ?? null,
-        empresa_rtn: row?.empresa_rtn ?? row?.rtn_empresa ?? null
-      };
-    });
+    const pushFilter = (fragment, value) => {
+      params.push(value);
+      countParams.push(value);
+      filters.push(fragment.replaceAll('$IDX', `$${params.length}`));
+      countFilters.push(fragment.replaceAll('$IDX', `$${countParams.length}`));
+    };
 
-    const contactFields = ['c.id_cliente'];
-    const contactJoins = [];
+    if (searchTerm) {
+      const value = `%${searchTerm}%`;
+      const searchFragments = [
+        'c.id_cliente::TEXT ILIKE $IDX',
+        "CONCAT('CLI-', c.id_cliente) ILIKE $IDX",
+        "COALESCE(c.fecha_ingreso::TEXT, '') ILIKE $IDX",
+        "COALESCE(c.puntos::TEXT, '') ILIKE $IDX"
+      ];
+
+      if (capabilities.softDeleteField) {
+        searchFragments.push(`COALESCE(c.${capabilities.softDeleteField}::TEXT, '') ILIKE $IDX`);
+      }
+
+      if (capabilities.hasPersonasTable) {
+        searchFragments.push("COALESCE(p.nombre, '') ILIKE $IDX");
+        searchFragments.push("COALESCE(p.apellido, '') ILIKE $IDX");
+        searchFragments.push("COALESCE(p.dni::TEXT, '') ILIKE $IDX");
+        searchFragments.push("COALESCE(telf_p.telefono, '') ILIKE $IDX");
+        searchFragments.push("COALESCE(cor_p.direccion_correo, '') ILIKE $IDX");
+      }
+
+      if (capabilities.hasEmpresasTable) {
+        searchFragments.push("COALESCE(e.nombre_empresa, '') ILIKE $IDX");
+        searchFragments.push("COALESCE(e.rtn::TEXT, '') ILIKE $IDX");
+        searchFragments.push("COALESCE(telf_e.telefono, '') ILIKE $IDX");
+        searchFragments.push("COALESCE(cor_e.direccion_correo, '') ILIKE $IDX");
+      }
+
+      if (capabilities.hasTipoClienteTable && capabilities.tipoClienteLabelField) {
+        searchFragments.push(`COALESCE(tc.${capabilities.tipoClienteLabelField}, '') ILIKE $IDX`);
+      }
+
+      pushFilter(`(${searchFragments.join(' OR ')})`, value);
+    }
+
+    if (estado !== null && capabilities.softDeleteField) {
+      pushFilter(`c.${capabilities.softDeleteField} = $IDX`, estado);
+    }
+
+    // Conserva comportamiento legacy: scoping por id_empresa del cliente.
+    if (tenantId && capabilities.hasTenantField) {
+      pushFilter('c.id_empresa = $IDX', tenantId);
+    }
+
+    const fields = [
+      'c.id_cliente',
+      'c.fecha_ingreso',
+      'c.puntos',
+      'c.id_tipo_cliente',
+      'c.id_persona',
+      capabilities.hasTenantField ? 'c.id_empresa' : 'NULL::INT AS id_empresa'
+    ];
+
+    if (capabilities.softDeleteField) {
+      fields.push(`c.${capabilities.softDeleteField}`);
+      if (capabilities.softDeleteField !== 'estado') {
+        fields.push(`c.${capabilities.softDeleteField} AS estado`);
+      }
+    } else {
+      fields.push('NULL::BOOLEAN AS estado');
+    }
 
     if (capabilities.hasPersonasTable) {
-      contactFields.push('telf_p.telefono AS persona_telefono');
-      contactFields.push('cor_p.direccion_correo AS persona_correo');
-      contactJoins.push('LEFT JOIN personas p ON p.id_persona = c.id_persona');
-      contactJoins.push('LEFT JOIN telefonos telf_p ON telf_p.id_telefono = p.id_telefono');
-      contactJoins.push('LEFT JOIN correos cor_p ON cor_p.id_correo = p.id_correo');
+      fields.push('p.nombre AS persona_nombre');
+      fields.push('p.apellido AS persona_apellido');
+      fields.push('p.dni AS persona_dni');
+      fields.push(`TRIM(CONCAT(COALESCE(p.nombre, ''), ' ', COALESCE(p.apellido, ''))) AS persona_nombre_completo`);
+      fields.push('telf_p.telefono AS persona_telefono');
+      fields.push('telf_p.telefono AS telefono_persona');
+      fields.push('cor_p.direccion_correo AS persona_correo');
+      fields.push('cor_p.direccion_correo AS correo_persona');
     } else {
-      contactFields.push('NULL::TEXT AS persona_telefono');
-      contactFields.push('NULL::TEXT AS persona_correo');
+      fields.push('NULL::TEXT AS persona_nombre');
+      fields.push('NULL::TEXT AS persona_apellido');
+      fields.push('NULL::TEXT AS persona_dni');
+      fields.push('NULL::TEXT AS persona_nombre_completo');
+      fields.push('NULL::TEXT AS persona_telefono');
+      fields.push('NULL::TEXT AS telefono_persona');
+      fields.push('NULL::TEXT AS persona_correo');
+      fields.push('NULL::TEXT AS correo_persona');
     }
 
     if (capabilities.hasEmpresasTable) {
-      contactFields.push('telf_e.telefono AS empresa_telefono');
-      contactFields.push('cor_e.direccion_correo AS empresa_correo');
-      contactJoins.push('LEFT JOIN empresas e ON e.id_empresa = c.id_empresa');
-      contactJoins.push('LEFT JOIN telefonos telf_e ON telf_e.id_telefono = e.id_telefono');
-      contactJoins.push('LEFT JOIN correos cor_e ON cor_e.id_correo = e.id_correo');
+      fields.push('e.nombre_empresa');
+      fields.push('e.rtn AS empresa_rtn');
+      fields.push('telf_e.telefono AS empresa_telefono');
+      fields.push('telf_e.telefono AS telefono_empresa');
+      fields.push('cor_e.direccion_correo AS empresa_correo');
+      fields.push('cor_e.direccion_correo AS correo_empresa');
     } else {
-      contactFields.push('NULL::TEXT AS empresa_telefono');
-      contactFields.push('NULL::TEXT AS empresa_correo');
+      fields.push('NULL::TEXT AS nombre_empresa');
+      fields.push('NULL::TEXT AS empresa_rtn');
+      fields.push('NULL::TEXT AS empresa_telefono');
+      fields.push('NULL::TEXT AS telefono_empresa');
+      fields.push('NULL::TEXT AS empresa_correo');
+      fields.push('NULL::TEXT AS correo_empresa');
     }
 
-    const contactQuery = `
-      SELECT ${contactFields.join(', ')}
-      FROM clientes c
-      ${contactJoins.join('\n')}
+    if (capabilities.hasTipoClienteTable && capabilities.tipoClienteLabelField) {
+      fields.push(`tc.${capabilities.tipoClienteLabelField} AS tipo_cliente_nombre`);
+    } else {
+      fields.push('NULL::TEXT AS tipo_cliente_nombre');
+    }
+
+    fields.push(`CASE
+      WHEN c.id_empresa IS NOT NULL AND c.id_persona IS NULL THEN 'empresa'
+      WHEN c.id_persona IS NOT NULL AND c.id_empresa IS NULL THEN 'persona'
+      WHEN c.id_empresa IS NOT NULL THEN 'empresa'
+      ELSE 'persona'
+    END AS origen_cliente`);
+
+    const personaNombreExpr = capabilities.hasPersonasTable
+      ? "NULLIF(TRIM(CONCAT(COALESCE(p.nombre, ''), ' ', COALESCE(p.apellido, ''))), '')"
+      : 'NULL';
+    const empresaNombreExpr = capabilities.hasEmpresasTable
+      ? "NULLIF(TRIM(COALESCE(e.nombre_empresa, '')), '')"
+      : 'NULL';
+    fields.push(`COALESCE(${personaNombreExpr}, ${empresaNombreExpr}) AS nombre_principal`);
+
+    const joins = [];
+    if (capabilities.hasPersonasTable) {
+      joins.push('LEFT JOIN personas p ON p.id_persona = c.id_persona');
+      joins.push('LEFT JOIN telefonos telf_p ON telf_p.id_telefono = p.id_telefono');
+      joins.push('LEFT JOIN correos cor_p ON cor_p.id_correo = p.id_correo');
+    }
+    if (capabilities.hasEmpresasTable) {
+      joins.push('LEFT JOIN empresas e ON e.id_empresa = c.id_empresa');
+      joins.push('LEFT JOIN telefonos telf_e ON telf_e.id_telefono = e.id_telefono');
+      joins.push('LEFT JOIN correos cor_e ON cor_e.id_correo = e.id_correo');
+    }
+    if (capabilities.hasTipoClienteTable && capabilities.tipoClienteLabelField) {
+      joins.push('LEFT JOIN tipo_cliente tc ON tc.id_tipo_cliente = c.id_tipo_cliente');
+    }
+
+    const joinsSql = joins.length ? `\n${joins.join('\n')}` : '';
+    const where = filters.length ? `WHERE ${filters.join(' AND ')}` : '';
+    const countWhere = countFilters.length ? `WHERE ${countFilters.join(' AND ')}` : '';
+    const offset = (page - 1) * limit;
+    const dataParams = [...params, limit, offset];
+
+    const dataQuery = `
+      SELECT ${fields.join(', ')}
+      FROM clientes c${joinsSql}
+      ${where}
+      ORDER BY c.id_cliente ASC
+      LIMIT $${params.length + 1}
+      OFFSET $${params.length + 2}
     `;
-    const contactResult = await pool.query(contactQuery);
-    const contactMap = new Map(
-      contactResult.rows.map((item) => [
-        Number(item.id_cliente),
-        {
-          persona_telefono: item.persona_telefono ?? null,
-          persona_correo: item.persona_correo ?? null,
-          empresa_telefono: item.empresa_telefono ?? null,
-          empresa_correo: item.empresa_correo ?? null
-        }
-      ])
-    );
 
-    const hydratedRows = rows.map((row) => {
-      const contact = contactMap.get(Number(row?.id_cliente)) || {};
+    const totalQuery = `
+      SELECT COUNT(*)::INT AS total
+      FROM clientes c${joinsSql}
+      ${countWhere}
+    `;
 
-      const personaTelefono = firstNonEmptyValue(
-        row?.persona_telefono,
-        row?.telefono_persona,
-        contact.persona_telefono
-      );
-      const empresaTelefono = firstNonEmptyValue(
-        row?.empresa_telefono,
-        row?.telefono_empresa,
-        contact.empresa_telefono
-      );
-      const personaCorreo = firstNonEmptyValue(
-        row?.persona_correo,
-        row?.correo_persona,
-        contact.persona_correo
-      );
-      const empresaCorreo = firstNonEmptyValue(
-        row?.empresa_correo,
-        row?.correo_empresa,
-        contact.empresa_correo
-      );
-      const telefonoGenerico = firstNonEmptyValue(
-        row?.telefono,
-        row?.telefono_numero,
-        row?.numero_telefono
-      );
-      const correoGenerico = firstNonEmptyValue(
-        row?.correo,
-        row?.direccion_correo,
-        row?.email
-      );
+    const [dataResult, totalResult] = await Promise.all([
+      pool.query(dataQuery, dataParams),
+      pool.query(totalQuery, countParams)
+    ]);
 
-      const hasPersona = Boolean(row?.id_persona);
-      const hasEmpresa = Boolean(row?.id_empresa);
-      const telefono = hasPersona
-        ? firstNonEmptyValue(personaTelefono, telefonoGenerico, empresaTelefono)
-        : hasEmpresa
-          ? firstNonEmptyValue(empresaTelefono, telefonoGenerico, personaTelefono)
-          : firstNonEmptyValue(telefonoGenerico, personaTelefono, empresaTelefono);
-      const correo = hasPersona
-        ? firstNonEmptyValue(personaCorreo, correoGenerico, empresaCorreo)
-        : hasEmpresa
-          ? firstNonEmptyValue(empresaCorreo, correoGenerico, personaCorreo)
-          : firstNonEmptyValue(correoGenerico, personaCorreo, empresaCorreo);
-
-      return {
-        ...row,
-        persona_telefono: personaTelefono,
-        telefono_persona: personaTelefono,
-        empresa_telefono: empresaTelefono,
-        telefono_empresa: empresaTelefono,
-        persona_correo: personaCorreo,
-        correo_persona: personaCorreo,
-        empresa_correo: empresaCorreo,
-        correo_empresa: empresaCorreo,
-        telefono,
-        correo,
-        direccion_correo: firstNonEmptyValue(row?.direccion_correo, correo)
-      };
-    });
-
-    if (!capabilities.softDeleteField) {
-      return hydratedRows.map((row) => normalizeClienteDto(row, capabilities.softDeleteField));
-    }
-
-    const stateResult = await pool.query(`
-      SELECT id_cliente, ${capabilities.softDeleteField} AS estado_actual
-      FROM clientes
-    `);
-    const stateMap = new Map(
-      stateResult.rows.map((item) => [Number(item.id_cliente), Boolean(item.estado_actual)])
-    );
-
-    return hydratedRows.map((row) => {
-      const key = Number(row?.id_cliente);
-      const estadoActual = stateMap.has(key)
-        ? stateMap.get(key)
-        : parseBooleanValue(row?.[capabilities.softDeleteField] ?? row?.estado);
-      const safeEstado = estadoActual === null ? false : Boolean(estadoActual);
-      const withState = {
-        ...row,
-        [capabilities.softDeleteField]: safeEstado,
-        estado: safeEstado
-      };
-
-      return normalizeClienteDto(withState, capabilities.softDeleteField);
-    });
+    return {
+      data: dataResult.rows,
+      total: Number(totalResult.rows?.[0]?.total) || 0
+    };
   },
 
   async findById(idCliente, capabilities) {
@@ -571,7 +597,10 @@ const clienteService = {
     }
 
     const limit = Math.min(requestedLimit, MAX_LIMIT);
+    const search = typeof req.query.search === 'string' ? req.query.search.trim() : '';
+    const searchQuery = typeof req.query.q === 'string' ? req.query.q.trim() : '';
     const searchName = typeof req.query.nombre === 'string' ? req.query.nombre.trim() : '';
+    const effectiveSearch = search || searchQuery || searchName;
     const estado = parseBooleanFilter(req.query.estado);
 
     if (req.query.estado !== undefined && estado === null) {
@@ -586,50 +615,23 @@ const clienteService = {
     }
 
     const tenantId = parsePositiveInt(req.user?.id_empresa);
-    const allRows = await clienteRepository.list(capabilities);
-
-    const normalizedRows = allRows.filter((row) => {
-      if (!tenantId) return true;
-      return Number(row?.id_empresa) === tenantId;
+    const { data, total } = await clienteRepository.searchWithPagination({
+      capabilities,
+      page,
+      limit,
+      searchTerm: effectiveSearch,
+      estado,
+      tenantId
     });
 
-    const searchedRows = searchName
-      ? normalizedRows.filter((row) => {
-          const haystack = [
-            row?.id_cliente,
-            row?.codigo_cliente,
-            row?.origen_cliente,
-            row?.nombre_principal,
-            row?.subtitulo_principal,
-            row?.documento_tipo,
-            row?.documento_valor,
-            row?.puntos,
-            row?.tipo_cliente,
-            row?.telefono,
-            row?.correo,
-            row?.fecha_ingreso,
-            row?.estado
-          ]
-            .filter((value) => value !== null && value !== undefined)
-            .map((value) => String(value).toLowerCase());
-
-          return haystack.some((value) => value.includes(searchName.toLowerCase()));
-        })
-      : normalizedRows;
-
-    const statusFilteredRows =
-      estado !== null && capabilities.softDeleteField
-        ? searchedRows.filter((row) => Boolean(row?.[capabilities.softDeleteField]) === estado)
-        : searchedRows;
-
-    const total = statusFilteredRows.length;
-    const offset = (page - 1) * limit;
-    const data = statusFilteredRows.slice(offset, offset + limit);
+    const normalizedData = (Array.isArray(data) ? data : []).map((row) =>
+      normalizeClienteDto(row, capabilities.softDeleteField)
+    );
 
     return {
       status: 200,
       body: {
-        data,
+        data: normalizedData,
         total,
         page,
         limit
@@ -911,27 +913,27 @@ const asyncHandler = (handler) => async (req, res) => {
 /* =======================
    GET - LISTAR CLIENTES
 ======================= */
-router.get('/clientes-detalle', asyncHandler(clienteService.list));
-router.get('/clientes', asyncHandler(clienteService.list));
+router.get('/clientes-detalle', checkPermission(CLIENTES_VIEW_PERMISSIONS), asyncHandler(clienteService.list));
+router.get('/clientes', checkPermission(CLIENTES_VIEW_PERMISSIONS), asyncHandler(clienteService.list));
 
 /* =======================
    GET - CLIENTE POR ID
 ======================= */
-router.get('/clientes/:id', asyncHandler(clienteService.getById));
+router.get('/clientes/:id', checkPermission(CLIENTES_VIEW_PERMISSIONS), asyncHandler(clienteService.getById));
 
 /* =======================
    POST - INSERTAR
 ======================= */
-router.post('/clientes', asyncHandler(clienteService.create));
+router.post('/clientes', checkPermission(CLIENTES_CREATE_PERMISSIONS), asyncHandler(clienteService.create));
 
 /* =======================
    PUT - ACTUALIZAR
 ======================= */
-router.put('/clientes/:id', asyncHandler(clienteService.update));
+router.put('/clientes/:id', checkPermission(CLIENTES_EDIT_PERMISSIONS), asyncHandler(clienteService.update));
 
 /* =======================
    DELETE - ELIMINAR
 ======================= */
-router.delete('/clientes/:id', asyncHandler(clienteService.remove));
+router.delete('/clientes/:id', checkPermission(CLIENTES_DELETE_PERMISSIONS), asyncHandler(clienteService.remove));
 
 export default router;

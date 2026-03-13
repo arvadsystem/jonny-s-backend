@@ -1,7 +1,18 @@
 import express from 'express';
 import pool from '../config/db-connection.js';
+import { checkPermission } from '../middleware/checkPermission.js';
 
 const router = express.Router();
+const PERSONAS_VIEW_PERMISSIONS = [
+  'PERSONAS_VER',
+  'PERSONAS_MODULO_VER',
+  'PERSONAS_CREAR',
+  'PERSONAS_EDITAR',
+  'PERSONAS_ELIMINAR'
+];
+const PERSONAS_CREATE_PERMISSIONS = ['PERSONAS_CREAR'];
+const PERSONAS_EDIT_PERMISSIONS = ['PERSONAS_EDITAR'];
+const PERSONAS_DELETE_PERMISSIONS = ['PERSONAS_ELIMINAR'];
 
 const MAX_LIMIT = 100;
 const MAX_SUGGESTIONS_LIMIT = 12;
@@ -835,27 +846,27 @@ const asyncHandler = (handler) => async (req, res) => {
 /* =======================
    GET - LISTAR PERSONAS
 ======================= */
-router.get('/personas', asyncHandler(personaService.list));
-router.get('/personas-detalle', asyncHandler(personaService.list));
+router.get('/personas', checkPermission(PERSONAS_VIEW_PERMISSIONS), asyncHandler(personaService.list));
+router.get('/personas-detalle', checkPermission(PERSONAS_VIEW_PERMISSIONS), asyncHandler(personaService.list));
 
 /* =======================
    GET - PERSONA POR ID
 ======================= */
-router.get('/personas/:id', asyncHandler(personaService.getById));
+router.get('/personas/:id', checkPermission(PERSONAS_VIEW_PERMISSIONS), asyncHandler(personaService.getById));
 
 /* =======================
    POST - INSERTAR
 ======================= */
-router.post('/personas', asyncHandler(personaService.create));
+router.post('/personas', checkPermission(PERSONAS_CREATE_PERMISSIONS), asyncHandler(personaService.create));
 
 /* =======================
    PUT - ACTUALIZAR
 ======================= */
-router.put('/personas/:id', asyncHandler(personaService.update));
+router.put('/personas/:id', checkPermission(PERSONAS_EDIT_PERMISSIONS), asyncHandler(personaService.update));
 
 /* =======================
    DELETE - ELIMINAR
 ======================= */
-router.delete('/personas/:id', asyncHandler(personaService.remove));
+router.delete('/personas/:id', checkPermission(PERSONAS_DELETE_PERMISSIONS), asyncHandler(personaService.remove));
 
 export default router;

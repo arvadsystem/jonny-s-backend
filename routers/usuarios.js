@@ -3,6 +3,7 @@ import crypto from 'node:crypto';
 import fs from 'fs/promises';
 import path from 'path';
 import pool from '../config/db-connection.js';
+import { checkPermission } from '../middleware/checkPermission.js';
 import {
   ALLOWED_IMAGE_MIME_TYPES,
   UPLOADS_DIR,
@@ -10,12 +11,18 @@ import {
 } from '../utils/uploads.js';
 
 const router = express.Router();
+const USUARIOS_VIEW_PERMISSIONS = ['USUARIOS_VER', 'USUARIOS_CREAR', 'USUARIOS_EDITAR', 'USUARIOS_ELIMINAR'];
+const USUARIOS_CREATE_PERMISSIONS = ['USUARIOS_CREAR'];
+const USUARIOS_EDIT_PERMISSIONS = ['USUARIOS_EDITAR'];
+const USUARIOS_DELETE_PERMISSIONS = ['USUARIOS_ELIMINAR'];
+const USUARIOS_RESET_PASSWORD_PERMISSIONS = ['USUARIOS_PASSWORD_RESETEAR'];
+const USUARIOS_IMAGE_EDIT_PERMISSIONS = ['USUARIOS_IMAGEN_SUBIR', 'USUARIOS_IMAGEN_ELIMINAR'];
 
 // ------------------------------------------------------------------------------------
 // GET: Obtener usuarios
 // ------------------------------------------------------------------------------------
 // GET: Obtener usuarios
-router.get('/usuarios', async (req, res) => {
+router.get('/usuarios', checkPermission(USUARIOS_VIEW_PERMISSIONS), async (req, res) => {
     try {
         const tabla = 'usuarios';
         
@@ -40,7 +47,7 @@ router.get('/usuarios', async (req, res) => {
 // ------------------------------------------------------------------------------------
 // POST: Crear nuevo usuario
 // ------------------------------------------------------------------------------------
-router.post('/usuarios', async (req, res) => {
+router.post('/usuarios', checkPermission(USUARIOS_CREATE_PERMISSIONS), async (req, res) => {
     try {
         const tabla = 'usuarios';
         const datosUsuario = req.body; 
@@ -69,7 +76,7 @@ Desde Postman debes enviar el JSON con las llaves correctas:
 // ------------------------------------------------------------------------------------
 // PUT: Actualizar usuario
 // ------------------------------------------------------------------------------------
-router.put('/usuarios', async (req, res) => {
+router.put('/usuarios', checkPermission(USUARIOS_EDIT_PERMISSIONS), async (req, res) => {
     try {
         const { campo, valor, id_campo, id_valor } = req.body;
 
@@ -105,7 +112,7 @@ router.put('/usuarios', async (req, res) => {
 // ------------------------------------------------------------------------------------
 // DELETE: Eliminar usuario
 // ------------------------------------------------------------------------------------
-router.delete('/usuarios', async (req, res) => {
+router.delete('/usuarios', checkPermission(USUARIOS_DELETE_PERMISSIONS), async (req, res) => {
     try {
         const { columna_id, valor_id } = req.body;
         // En Postman enviarías: { "columna_id": "id_usuario", "valor_id": 1 }
@@ -145,10 +152,10 @@ const USUARIOS_V2_BCRYPT_PREFIX_RE = /^\$2[abxy]?\$/i;
 const USUARIOS_V2_IMAGE_DATA_URL_RE = /^data:image\/(png|jpe?g|webp);base64,[A-Za-z0-9+/=]+$/i;
 const USUARIOS_V2_IMAGE_URL_RE = /^(https?:\/\/|\/uploads\/)/i;
 const USUARIOS_V2_CREATE_PASSWORD_MIN = 10;
-// Compatibilidad con login legacy:
-// routers/login.js valida con SQL directo: WHERE nombre_usuario = $1 AND clave = $2
-// por lo tanto, el valor almacenado en usuarios.clave debe coincidir en texto plano.
-const USUARIOS_V2_LOGIN_EXPECTS_PLAIN_PASSWORD = true;
+// Transicion controlada:
+// - Login soporta claves legacy en texto plano y hashes bcrypt.
+// - Nuevas claves se almacenan en bcrypt para mejorar seguridad gradualmente.
+const USUARIOS_V2_LOGIN_EXPECTS_PLAIN_PASSWORD = false;
 
 let usuariosV2CapabilitiesPromise = null;
 
@@ -408,7 +415,7 @@ const v2BuildPasswordForStorage = async (plainPassword, queryRunner = pool) => {
   if (!safePassword) throw new Error('La contrasena no puede estar vacia');
 
   if (USUARIOS_V2_LOGIN_EXPECTS_PLAIN_PASSWORD) {
-    // TODO: migrar login legacy a bcrypt.compare y cambiar esta rama a hash seguro.
+    // Fallback conservador para entornos legacy.
     return safePassword;
   }
 
@@ -705,7 +712,7 @@ const v2ReplaceUserRoles = async (idUsuario, roleIds, queryRunner = pool) => {
   );
 };
 
-router.get('/usuarios/v2/roles', async (_req, res) => {
+router.get('/usuarios/v2/roles', checkPermission(USUARIOS_VIEW_PERMISSIONS), async (_req, res) => {
   try {
     const result = await pool.query(
       'SELECT id_rol, nombre FROM roles ORDER BY id_rol ASC'
@@ -717,7 +724,7 @@ router.get('/usuarios/v2/roles', async (_req, res) => {
   }
 });
 
-router.get('/usuarios/v2/list', async (req, res) => {
+router.get('/usuarios/v2/list', checkPermission(USUARIOS_VIEW_PERMISSIONS), async (req, res) => {
   try {
     const page = req.query.page === undefined ? 1 : v2ParsePositiveInt(req.query.page);
     const requestedLimit = req.query.limit === undefined ? 10 : v2ParsePositiveInt(req.query.limit);
@@ -728,7 +735,7 @@ router.get('/usuarios/v2/list', async (req, res) => {
 
     const limit = Math.min(requestedLimit, USUARIOS_V2_MAX_LIMIT);
     const offset = (page - 1) * limit;
-    const q = v2NormalizeText(req.query.q);
+    const q = v2NormalizeText(req.query.q ?? req.query.search ?? req.query.nombre);
 
     const params = [];
     const whereParts = [];
@@ -831,7 +838,7 @@ router.get('/usuarios/v2/list', async (req, res) => {
   }
 });
 
-router.post('/usuarios/v2/create', async (req, res) => {
+router.post('/usuarios/v2/create', checkPermission(USUARIOS_CREATE_PERMISSIONS), async (req, res) => {
   const client = await pool.connect();
 
   try {
@@ -945,7 +952,7 @@ router.post('/usuarios/v2/create', async (req, res) => {
   }
 });
 
-router.put('/usuarios/v2/update/:id_usuario', async (req, res) => {
+router.put('/usuarios/v2/update/:id_usuario', checkPermission(USUARIOS_EDIT_PERMISSIONS), async (req, res) => {
   const client = await pool.connect();
   try {
     const idUsuario = v2ParsePositiveInt(req.params.id_usuario);
@@ -1037,7 +1044,7 @@ router.put('/usuarios/v2/update/:id_usuario', async (req, res) => {
   }
 });
 
-router.put('/usuarios/v2/photo/:id_usuario', async (req, res) => {
+router.put('/usuarios/v2/photo/:id_usuario', checkPermission(USUARIOS_IMAGE_EDIT_PERMISSIONS), async (req, res) => {
   let writtenFileAbsolutePath = '';
   try {
     const idUsuario = v2ParsePositiveInt(req.params.id_usuario);
@@ -1112,7 +1119,7 @@ router.put('/usuarios/v2/photo/:id_usuario', async (req, res) => {
   }
 });
 
-router.delete('/usuarios/v2/delete/:id_usuario', async (req, res) => {
+router.delete('/usuarios/v2/delete/:id_usuario', checkPermission(USUARIOS_DELETE_PERMISSIONS), async (req, res) => {
   try {
     const idUsuario = v2ParsePositiveInt(req.params.id_usuario);
     if (!idUsuario) {
@@ -1238,7 +1245,7 @@ router.post('/usuarios/v2/change-password', async (req, res) => {
   }
 });
 
-router.post('/usuarios/v2/generate', async (req, res) => {
+router.post('/usuarios/v2/generate', checkPermission(USUARIOS_CREATE_PERMISSIONS), async (req, res) => {
   const client = await pool.connect();
   let createdUser = null;
   let temporaryPassword = '';
@@ -1345,7 +1352,7 @@ router.post('/usuarios/v2/generate', async (req, res) => {
   }
 });
 
-router.post('/usuarios/v2/reset-password/:id_usuario', async (req, res) => {
+router.post('/usuarios/v2/reset-password/:id_usuario', checkPermission(USUARIOS_RESET_PASSWORD_PERMISSIONS), async (req, res) => {
   try {
     const idUsuario = v2ParsePositiveInt(req.params.id_usuario);
     if (!idUsuario) {

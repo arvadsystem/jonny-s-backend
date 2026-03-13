@@ -1,7 +1,12 @@
 import express from 'express';
 import pool from '../config/db-connection.js';
+import { checkPermission } from '../middleware/checkPermission.js';
 
 const router = express.Router();  
+const EMPRESAS_VIEW_PERMISSIONS = ['EMPRESAS_VER', 'EMPRESAS_CREAR', 'EMPRESAS_EDITAR', 'EMPRESAS_ELIMINAR'];
+const EMPRESAS_CREATE_PERMISSIONS = ['EMPRESAS_CREAR'];
+const EMPRESAS_EDIT_PERMISSIONS = ['EMPRESAS_EDITAR'];
+const EMPRESAS_DELETE_PERMISSIONS = ['EMPRESAS_ELIMINAR'];
 
 const MAX_LIMIT = 100;
 const BASE_FIELDS = ['id_empresa', 'rtn', 'nombre_empresa', 'id_telefono', 'id_direccion', 'id_correo'];
@@ -65,19 +70,6 @@ const toNullableTrimmedText = (value) => {
   return text || null;
 };
 
-const parseJsonArray = (value) => {
-  if (Array.isArray(value)) return value;
-  if (typeof value === 'string') {
-    try {
-      const parsed = JSON.parse(value);
-      return Array.isArray(parsed) ? parsed : [];
-    } catch {
-      return [];
-    }
-  }
-  return [];
-};
-
 const normalizeEmpresaFunctionPayload = (payload) => {
   if (!isPlainObject(payload)) return {};
 
@@ -139,35 +131,117 @@ const getSchemaCapabilities = async () => {
 };
 
 const empresaRepository = {
-  async list(capabilities) {
-    const result = await pool.query('SELECT fn_listar_empresas() AS empresas');
-    const rows = parseJsonArray(result.rows[0]?.empresas).map((row) => ({
-      ...row,
-      correo: row?.correo ?? row?.direccion_correo ?? null
-    }));
+  async searchWithPagination({
+    capabilities,
+    page,
+    limit,
+    searchName = '',
+    estado = null,
+    tenantId = null
+  }) {
+    const filters = [];
+    const countFilters = [];
+    const params = [];
+    const countParams = [];
 
-    if (!capabilities.softDeleteField) return rows;
+    const pushFilter = (fragment, value) => {
+      params.push(value);
+      countParams.push(value);
+      filters.push(fragment.replaceAll('$IDX', `$${params.length}`));
+      countFilters.push(fragment.replaceAll('$IDX', `$${countParams.length}`));
+    };
 
-    const stateResult = await pool.query(`
-      SELECT id_empresa, ${capabilities.softDeleteField} AS estado_actual
-      FROM empresas
-    `);
-    const stateMap = new Map(
-      stateResult.rows.map((item) => [Number(item.id_empresa), Boolean(item.estado_actual)])
-    );
+    if (searchName) {
+      const value = `%${searchName}%`;
+      const searchFragments = [
+        'e.id_empresa::TEXT ILIKE $IDX',
+        "COALESCE(e.rtn::TEXT, '') ILIKE $IDX",
+        "COALESCE(e.nombre_empresa, '') ILIKE $IDX",
+        "COALESCE(t.telefono, '') ILIKE $IDX",
+        "COALESCE(c.direccion_correo, '') ILIKE $IDX",
+        "COALESCE(d.direccion, '') ILIKE $IDX"
+      ];
+      pushFilter(`(${searchFragments.join(' OR ')})`, value);
+    }
 
-    return rows.map((row) => {
-      const key = Number(row?.id_empresa);
-      const estadoActual = stateMap.has(key)
-        ? stateMap.get(key)
-        : parseBooleanValue(row?.[capabilities.softDeleteField]);
+    if (estado !== null && capabilities.softDeleteField) {
+      pushFilter(`e.${capabilities.softDeleteField} = $IDX`, estado);
+    }
+
+    if (tenantId) {
+      pushFilter('e.id_empresa = $IDX', tenantId);
+    }
+
+    const where = filters.length ? `WHERE ${filters.join(' AND ')}` : '';
+    const countWhere = countFilters.length ? `WHERE ${countFilters.join(' AND ')}` : '';
+
+    const fields = [
+      'e.id_empresa',
+      'e.rtn',
+      'e.nombre_empresa',
+      'e.id_telefono',
+      'e.id_direccion',
+      'e.id_correo',
+      't.telefono',
+      'd.direccion',
+      'c.direccion_correo AS correo'
+    ];
+
+    if (capabilities.softDeleteField) {
+      fields.push(`e.${capabilities.softDeleteField}`);
+      if (capabilities.softDeleteField !== 'estado') {
+        fields.push(`e.${capabilities.softDeleteField} AS estado`);
+      }
+    }
+
+    const joinsSql = `
+      LEFT JOIN telefonos t ON t.id_telefono = e.id_telefono
+      LEFT JOIN direcciones d ON d.id_direccion = e.id_direccion
+      LEFT JOIN correos c ON c.id_correo = e.id_correo
+    `;
+
+    const offset = (page - 1) * limit;
+    const dataParams = [...params, limit, offset];
+
+    const dataQuery = `
+      SELECT ${fields.join(', ')}
+      FROM empresas e
+      ${joinsSql}
+      ${where}
+      ORDER BY e.id_empresa DESC
+      LIMIT $${params.length + 1}
+      OFFSET $${params.length + 2}
+    `;
+
+    const totalQuery = `
+      SELECT COUNT(*)::INT AS total
+      FROM empresas e
+      ${joinsSql}
+      ${countWhere}
+    `;
+
+    const [dataResult, totalResult] = await Promise.all([
+      pool.query(dataQuery, dataParams),
+      pool.query(totalQuery, countParams)
+    ]);
+
+    const data = dataResult.rows.map((row) => {
+      if (!capabilities.softDeleteField) return row;
+
+      const estadoActual = parseBooleanValue(row?.[capabilities.softDeleteField] ?? row?.estado);
       const safeEstado = estadoActual === null ? false : Boolean(estadoActual);
+
       return {
         ...row,
         [capabilities.softDeleteField]: safeEstado,
         estado: safeEstado
       };
     });
+
+    return {
+      data,
+      total: Number(totalResult.rows?.[0]?.total) || 0
+    };
   },
 
   async findById(idEmpresa, capabilities) {
@@ -244,7 +318,10 @@ const empresaService = {
     }
 
     const limit = Math.min(requestedLimit, MAX_LIMIT);
+    const search = typeof req.query.search === 'string' ? req.query.search.trim() : '';
+    const searchQuery = typeof req.query.q === 'string' ? req.query.q.trim() : '';
     const searchName = typeof req.query.nombre === 'string' ? req.query.nombre.trim() : '';
+    const effectiveSearch = search || searchQuery || searchName;
     const estado = parseBooleanFilter(req.query.estado);
 
     if (req.query.estado !== undefined && estado === null) {
@@ -259,29 +336,14 @@ const empresaService = {
     }
 
     const tenantId = parsePositiveInt(req.user?.id_empresa);
-
-    const allRows = await empresaRepository.list(capabilities);
-    const normalizedRows = allRows.filter((row) => {
-      if (!tenantId) return true;
-      return Number(row?.id_empresa) === tenantId;
+    const { data, total } = await empresaRepository.searchWithPagination({
+      capabilities,
+      page,
+      limit,
+      searchName: effectiveSearch,
+      estado,
+      tenantId
     });
-
-    const searchedRows = searchName
-      ? normalizedRows.filter((row) =>
-          String(row?.nombre_empresa ?? '')
-            .toLowerCase()
-            .includes(searchName.toLowerCase())
-        )
-      : normalizedRows;
-
-    const statusFilteredRows =
-      estado !== null && capabilities.softDeleteField
-        ? searchedRows.filter((row) => Boolean(row?.[capabilities.softDeleteField]) === estado)
-        : searchedRows;
-
-    const total = statusFilteredRows.length;
-    const offset = (page - 1) * limit;
-    const data = statusFilteredRows.slice(offset, offset + limit);
 
     return {
       status: 200,
@@ -510,27 +572,27 @@ const asyncHandler = (handler) => async (req, res) => {
 /* =======================
    GET - LISTAR EMPRESAS
 ======================= */
-router.get('/empresas', asyncHandler(empresaService.list));
+router.get('/empresas', checkPermission(EMPRESAS_VIEW_PERMISSIONS), asyncHandler(empresaService.list));
 
 /* =======================
    GET - LISTAR EMPRESAS POR ID
 ======================= */
-router.get('/empresas/:id', asyncHandler(empresaService.getById));
+router.get('/empresas/:id', checkPermission(EMPRESAS_VIEW_PERMISSIONS), asyncHandler(empresaService.getById));
 
 /* =======================
    POST - INSERTAR
 ======================= */
-router.post('/empresas', asyncHandler(empresaService.create));
+router.post('/empresas', checkPermission(EMPRESAS_CREATE_PERMISSIONS), asyncHandler(empresaService.create));
 
 /* =======================
    PUT - ACTUALIZAR
 ======================= */
-router.put('/empresas/:id', asyncHandler(empresaService.update));
+router.put('/empresas/:id', checkPermission(EMPRESAS_EDIT_PERMISSIONS), asyncHandler(empresaService.update));
 
 /* =======================
    DELETE - ELIMINAR
 ======================= */
-router.delete('/empresas/:id', asyncHandler(empresaService.remove));
+router.delete('/empresas/:id', checkPermission(EMPRESAS_DELETE_PERMISSIONS), asyncHandler(empresaService.remove));
 
 
 export default router;
