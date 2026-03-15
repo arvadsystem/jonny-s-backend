@@ -77,20 +77,41 @@ const parseIncludeInactivos = (rawValue) => {
 };
 
 const getAlmacenDependenciasById = async (idAlmacen) => {
-  const result = await pool.query(
-    `
-      SELECT
-        a.id_almacen,
-        COALESCE((SELECT COUNT(*) FROM public.movimientos_inventario m WHERE m.id_almacen = a.id_almacen), 0)::int AS movimientos,
-        COALESCE((SELECT COUNT(*) FROM public.productos p WHERE p.id_almacen = a.id_almacen), 0)::int AS productos,
-        COALESCE((SELECT COUNT(*) FROM public.insumos i WHERE i.id_almacen = a.id_almacen), 0)::int AS insumos,
-        COALESCE(a.estado, true) AS estado
-      FROM public.almacenes a
-      WHERE a.id_almacen = $1
-      LIMIT 1
-    `,
-    [idAlmacen]
-  );
+  let result;
+  try {
+    result = await pool.query(
+      `
+        SELECT
+          a.id_almacen,
+          COALESCE((SELECT COUNT(*) FROM public.movimientos_inventario m WHERE m.id_almacen = a.id_almacen), 0)::int AS movimientos,
+          COALESCE((SELECT COUNT(*) FROM public.productos_almacenes pa WHERE pa.id_almacen = a.id_almacen), 0)::int AS productos,
+          COALESCE((SELECT COUNT(*) FROM public.insumos_almacenes ia WHERE ia.id_almacen = a.id_almacen), 0)::int AS insumos,
+          COALESCE(a.estado, true) AS estado
+        FROM public.almacenes a
+        WHERE a.id_almacen = $1
+        LIMIT 1
+      `,
+      [idAlmacen]
+    );
+  } catch (error) {
+    if (error?.code !== '42P01') throw error;
+
+    // AM: fallback legacy cuando aun no existen tablas pivote *_almacenes.
+    result = await pool.query(
+      `
+        SELECT
+          a.id_almacen,
+          COALESCE((SELECT COUNT(*) FROM public.movimientos_inventario m WHERE m.id_almacen = a.id_almacen), 0)::int AS movimientos,
+          COALESCE((SELECT COUNT(*) FROM public.productos p WHERE p.id_almacen = a.id_almacen), 0)::int AS productos,
+          COALESCE((SELECT COUNT(*) FROM public.insumos i WHERE i.id_almacen = a.id_almacen), 0)::int AS insumos,
+          COALESCE(a.estado, true) AS estado
+        FROM public.almacenes a
+        WHERE a.id_almacen = $1
+        LIMIT 1
+      `,
+      [idAlmacen]
+    );
+  }
 
   const row = result.rows?.[0];
   if (!row) return { exists: false };
@@ -262,6 +283,35 @@ router.get('/almacenes', async (_req, res) => {
     res.status(200).json(result.rows || []);
   } catch (error) {
     return sendInternalError(res, 'Error al obtener almacenes', error);
+  }
+});
+
+// AM: catalogo liviano de almacenes para formularios create/edit (sin dependencias de vistas agregadas).
+// AM: se usa como respaldo cuando el dashboard completo de `/almacenes` falla por objetos SQL no disponibles.
+router.get('/almacenes/catalogo', async (req, res) => {
+  try {
+    const includeInactivosResult = parseIncludeInactivos(req.query?.include_inactivos);
+    if (!includeInactivosResult.ok) {
+      return sendValidationError(res, includeInactivosResult.error);
+    }
+
+    const result = await pool.query(
+      `
+        SELECT
+          a.id_almacen,
+          a.id_sucursal,
+          a.nombre,
+          COALESCE(a.estado, true) AS estado
+        FROM public.almacenes a
+        WHERE ($1::boolean = true OR COALESCE(a.estado, true) = true)
+        ORDER BY a.id_almacen ASC
+      `,
+      [includeInactivosResult.value]
+    );
+
+    return res.status(200).json(result.rows || []);
+  } catch (error) {
+    return sendInternalError(res, 'Error al obtener catalogo de almacenes', error);
   }
 });
 

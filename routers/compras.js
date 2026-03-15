@@ -1,10 +1,23 @@
 import express from 'express';
 import pool from '../config/db-connection.js';
+import { checkPermission } from '../middleware/checkPermission.js';
 
 const router = express.Router();
+// AM: hardening RBAC para evitar bypass por rutas CRUD legacy.
+const PERM_OC_VIEW_LEGACY = [
+  'INVENTARIO_ORDENES_COMPRA_VER_TODAS',
+  'INVENTARIO_ORDENES_COMPRA_GESTIONAR',
+  'INVENTARIO_ORDENES_COMPRA_CONVERTIR',
+  'INVENTARIO_ORDENES_COMPRA_ABASTECER'
+];
+const PERM_OC_MANAGE_LEGACY = [
+  'INVENTARIO_ORDENES_COMPRA_GESTIONAR',
+  'INVENTARIO_ORDENES_COMPRA_CONVERTIR',
+  'INVENTARIO_ORDENES_COMPRA_ABASTECER'
+];
 
 // GET: Obtener compras
-router.get('/compras', async (req, res) => {
+router.get('/compras', checkPermission(PERM_OC_VIEW_LEGACY), async (req, res) => {
   try {
     const tabla = 'compras';
     const columnas =
@@ -23,7 +36,7 @@ router.get('/compras', async (req, res) => {
 });
 
 // POST: Crear compra
-router.post('/compras', async (req, res) => {
+router.post('/compras', checkPermission(PERM_OC_MANAGE_LEGACY), async (req, res) => {
   try {
     const tabla = 'compras';
     const datos = req.body;
@@ -40,7 +53,7 @@ router.post('/compras', async (req, res) => {
 });
 
 // PUT: Actualizar compra (1 campo)
-router.put('/compras', async (req, res) => {
+router.put('/compras', checkPermission(PERM_OC_MANAGE_LEGACY), async (req, res) => {
   try {
     const { campo, valor, id_campo, id_valor } = req.body;
 
@@ -61,7 +74,7 @@ router.put('/compras', async (req, res) => {
 });
 
 // DELETE: Eliminar compra
-router.delete('/compras', async (req, res) => {
+router.delete('/compras', checkPermission(PERM_OC_MANAGE_LEGACY), async (req, res) => {
   try {
     const { columna_id, valor_id } = req.body;
 

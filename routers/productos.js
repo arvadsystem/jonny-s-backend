@@ -20,6 +20,13 @@ const CAMPOS_PERMITIDOS_PRODUCTOS = new Set([
   'estado'
 ]);
 
+// AM: allowlist extendida solo para altas masivas por multi-almacen.
+// AM: mantiene el contrato original (`id_almacen`) y agrega `id_almacenes` sin abrir campos arbitrarios.
+const CAMPOS_PERMITIDOS_PRODUCTOS_POST = new Set([
+  ...CAMPOS_PERMITIDOS_PRODUCTOS,
+  'id_almacenes'
+]);
+
 // NUEVO: codigos de conflicto SQL para responder 409 en constraints
 const CODIGOS_CONFLICTO_CONSTRAINT = new Set(['23503', '23505', '23514', '23502']);
 // NEW: codigo SQLSTATE de PostgreSQL para numeric/integer out of range.
@@ -30,6 +37,7 @@ const CODIGO_SQL_OUT_OF_RANGE = '22003';
 // WHY: bloquear IDs fuera de rango antes de ejecutar `pa_update` / `pa_delete`.
 // IMPACT: valida requests invalidos y responde 400 en lugar de dejar que fallen con 500.
 const MAX_INT32_DB_ID = 2147483647;
+const SQLSTATE_UNDEFINED_TABLE = '42P01';
 // NEW: query param opt-in para incluir inactivos en listados administrativos.
 // WHY: el GET de productos debe devolver activos por defecto tras adoptar soft delete.
 // IMPACT: mantiene compatibilidad con `?incluir_inactivos=1` sin crear endpoint nuevo.
@@ -60,6 +68,39 @@ function normalizarBoolean(valor) {
 // IMPACT: prevencion temprana en PUT/DELETE de Productos; payloads validos siguen igual.
 function esEnteroPositivoInt32(valor) {
   return Number.isSafeInteger(valor) && valor > 0 && valor <= MAX_INT32_DB_ID;
+}
+
+// AM: normaliza `id_almacen` / `id_almacenes` para soportar asignacion a uno o varios almacenes.
+// AM: se usa en create/edit multi para mantener compatibilidad con payloads legacy.
+function parseIdAlmacenes(rawSingle, rawMulti) {
+  const source = Array.isArray(rawMulti) ? rawMulti : (rawMulti === undefined || rawMulti === null ? [] : [rawMulti]);
+  const out = [];
+
+  for (const raw of source) {
+    const parsed = Number.parseInt(String(raw ?? '').trim(), 10);
+    if (!esEnteroPositivoInt32(parsed)) {
+      return { ok: false, message: 'id_almacenes contiene un id_almacen invalido.' };
+    }
+    if (!out.includes(parsed)) out.push(parsed);
+  }
+
+  if (out.length > 0) return { ok: true, ids: out };
+
+  const parsedSingle = Number.parseInt(String(rawSingle ?? '').trim(), 10);
+  if (esEnteroPositivoInt32(parsedSingle)) {
+    return { ok: true, ids: [parsedSingle] };
+  }
+
+  return { ok: false, message: 'Debe seleccionar al menos un id_almacen.' };
+}
+
+// AM: convierte valores Date/Timestamp a `YYYY-MM-DD` para reutilizarlos en payloads de edicion.
+function toDateOnlyString(value) {
+  if (!value) return '';
+  const raw = String(value);
+  if (raw.includes('T')) return raw.split('T')[0];
+  if (raw.length >= 10) return raw.slice(0, 10);
+  return raw;
 }
 
 // NEW: helper para interpretar `estado` aunque venga como string/number.
@@ -208,9 +249,9 @@ function validarCampoProducto(campo, valor) {
 }
 
 // NUEVO: valida existencia FK para integridad referencial previa
-async function validarExistenciaFk(campo, valor) {
+async function validarExistenciaFk(campo, valor, db = pool) {
   if (campo === 'id_categoria_producto') {
-    const r = await pool.query(
+    const r = await db.query(
       'SELECT 1 FROM categorias_productos WHERE id_categoria_producto = $1 LIMIT 1',
       [valor]
     );
@@ -218,7 +259,7 @@ async function validarExistenciaFk(campo, valor) {
   }
 
   if (campo === 'id_almacen') {
-    const r = await pool.query(
+    const r = await db.query(
       'SELECT 1 FROM almacenes WHERE id_almacen = $1 LIMIT 1',
       [valor]
     );
@@ -228,7 +269,7 @@ async function validarExistenciaFk(campo, valor) {
   if (campo === 'id_tipo_departamento') {
     if (valor === null) return true;
 
-    const r = await pool.query(
+    const r = await db.query(
       'SELECT 1 FROM tipo_departamento WHERE id_tipo_departamento = $1 LIMIT 1',
       [valor]
     );
@@ -238,7 +279,7 @@ async function validarExistenciaFk(campo, valor) {
   if (campo === 'id_archivo_imagen_principal') {
     if (valor === null) return true;
 
-    const r = await pool.query(
+    const r = await db.query(
       'SELECT 1 FROM archivos WHERE id_archivo = $1 LIMIT 1',
       [valor]
     );
@@ -255,6 +296,255 @@ async function existeProductoPorId(idProducto) {
     [idProducto]
   );
   return r.rowCount > 0;
+}
+
+// AM: carga snapshot completo del producto para soportar edicion multi-almacen sin perder campos opcionales.
+async function getProductoById(idProducto, db = pool) {
+  const r = await db.query(
+    `SELECT
+      id_producto,
+      nombre_producto,
+      precio,
+      cantidad,
+      stock_minimo,
+      descripcion_producto,
+      fecha_ingreso_producto,
+      fecha_caducidad,
+      id_categoria_producto,
+      id_almacen,
+      id_tipo_departamento,
+      estado,
+      id_archivo_imagen_principal
+    FROM productos
+    WHERE id_producto = $1
+    LIMIT 1`,
+    [idProducto]
+  );
+  return r.rows[0] || null;
+}
+
+// AM: busca un producto "equivalente" por llave de negocio operativa (nombre + categoria + depto opcional + almacen).
+// AM: se usa para sincronizar seleccion de varios almacenes en edicion sin crear duplicados innecesarios.
+async function findProductoByUniqueKey(
+  {
+    nombre_producto,
+    id_categoria_producto,
+    id_tipo_departamento,
+    id_almacen,
+    excludeId = null
+  },
+  db = pool
+) {
+  const params = [
+    String(nombre_producto ?? '').trim().toLowerCase(),
+    id_categoria_producto,
+    id_tipo_departamento ?? null,
+    id_almacen
+  ];
+
+  let sql = `
+    SELECT id_producto
+    FROM productos
+    WHERE lower(trim(nombre_producto)) = $1
+      AND id_categoria_producto = $2
+      AND (
+        (id_tipo_departamento IS NULL AND $3::integer IS NULL)
+        OR id_tipo_departamento = $3::integer
+      )
+      AND id_almacen = $4
+  `;
+
+  if (excludeId !== null && excludeId !== undefined) {
+    params.push(excludeId);
+    sql += ' AND id_producto <> $5';
+  }
+
+  sql += ' ORDER BY id_producto DESC LIMIT 1';
+  const r = await db.query(sql, params);
+  return r.rows[0] || null;
+}
+
+// AM: busca producto general (sin amarrarlo a un almacen) para evitar duplicados por sucursal en modelo multi-asignacion.
+async function findProductoByGeneralKey(
+  {
+    nombre_producto,
+    id_categoria_producto,
+    id_tipo_departamento,
+    excludeId = null
+  },
+  db = pool
+) {
+  const params = [
+    String(nombre_producto ?? '').trim().toLowerCase(),
+    id_categoria_producto,
+    id_tipo_departamento ?? null
+  ];
+
+  let sql = `
+    SELECT id_producto
+    FROM productos
+    WHERE lower(trim(nombre_producto)) = $1
+      AND id_categoria_producto = $2
+      AND (
+        (id_tipo_departamento IS NULL AND $3::integer IS NULL)
+        OR id_tipo_departamento = $3::integer
+      )
+  `;
+
+  if (excludeId !== null && excludeId !== undefined) {
+    params.push(excludeId);
+    sql += ' AND id_producto <> $4';
+  }
+
+  sql += ' ORDER BY id_producto ASC LIMIT 1';
+  const result = await db.query(sql, params);
+  return result.rows?.[0] || null;
+}
+
+// AM: sincroniza las asignaciones multi-almacen del producto sin duplicar filas de productos por sucursal.
+async function syncProductoAlmacenes(idProducto, idAlmacenes, db = pool) {
+  const uniqueIds = Array.from(
+    new Set(
+      (Array.isArray(idAlmacenes) ? idAlmacenes : [])
+        .map((id) => Number.parseInt(String(id ?? '').trim(), 10))
+        .filter((id) => esEnteroPositivoInt32(id))
+    )
+  );
+
+  if (uniqueIds.length === 0) return;
+
+  const primaryAlmacen = uniqueIds[0];
+  await db.query('UPDATE public.productos SET id_almacen = $1 WHERE id_producto = $2', [primaryAlmacen, idProducto]);
+
+  try {
+    await db.query(
+      `
+        INSERT INTO public.productos_almacenes (id_producto, id_almacen)
+        SELECT $1, UNNEST($2::int[])
+        ON CONFLICT (id_producto, id_almacen) DO NOTHING
+      `,
+      [idProducto, uniqueIds]
+    );
+
+    await db.query(
+      `
+        DELETE FROM public.productos_almacenes
+        WHERE id_producto = $1
+          AND id_almacen <> ALL($2::int[])
+      `,
+      [idProducto, uniqueIds]
+    );
+  } catch (error) {
+    // AM: fallback legacy cuando la tabla de asignaciones aun no existe.
+    if (error?.code !== SQLSTATE_UNDEFINED_TABLE) throw error;
+  }
+}
+
+// AM: asegura que GET /productos incluya `id_almacenes` sin romper compatibilidad con `id_almacen`.
+async function attachProductoAlmacenes(rows, db = pool) {
+  const list = Array.isArray(rows) ? rows : [];
+  if (list.length === 0) return list;
+
+  const ids = Array.from(
+    new Set(
+      list
+        .map((row) => Number.parseInt(String(row?.id_producto ?? ''), 10))
+        .filter((id) => esEnteroPositivoInt32(id))
+    )
+  );
+
+  if (ids.length === 0) {
+    return list.map((row) => ({ ...row, id_almacenes: [] }));
+  }
+
+  try {
+    const assignmentsResult = await db.query(
+      `
+        SELECT pa.id_producto, ARRAY_AGG(pa.id_almacen ORDER BY pa.id_almacen) AS id_almacenes
+        FROM public.productos_almacenes pa
+        WHERE pa.id_producto = ANY($1::int[])
+        GROUP BY pa.id_producto
+      `,
+      [ids]
+    );
+
+    const map = new Map(
+      assignmentsResult.rows.map((row) => [
+        Number(row.id_producto),
+        (Array.isArray(row.id_almacenes) ? row.id_almacenes : [])
+          .map((id) => Number.parseInt(String(id), 10))
+          .filter((id) => esEnteroPositivoInt32(id))
+      ])
+    );
+
+    return list.map((row) => {
+      const idProducto = Number.parseInt(String(row?.id_producto ?? ''), 10);
+      const fromMap = map.get(idProducto) || [];
+      const fallbackSingle = Number.parseInt(String(row?.id_almacen ?? ''), 10);
+      const idAlmacenesBase =
+        fromMap.length > 0
+          ? fromMap
+          : esEnteroPositivoInt32(fallbackSingle)
+          ? [fallbackSingle]
+          : [];
+      const idAlmacenes = idAlmacenesBase;
+      const primaryAlmacen = esEnteroPositivoInt32(fallbackSingle)
+        ? fallbackSingle
+        : (idAlmacenes[0] ?? null);
+
+      return {
+        ...row,
+        id_almacen: primaryAlmacen,
+        id_almacenes: idAlmacenes
+      };
+    });
+  } catch (error) {
+    if (error?.code !== SQLSTATE_UNDEFINED_TABLE) throw error;
+    return list.map((row) => {
+      const fallbackSingle = Number.parseInt(String(row?.id_almacen ?? ''), 10);
+      return {
+        ...row,
+        id_almacenes: esEnteroPositivoInt32(fallbackSingle) ? [fallbackSingle] : []
+      };
+    });
+  }
+}
+
+// AM: update explicito de todo el registro para sincronizacion multi-almacen.
+// AM: evita encadenar muchos `pa_update` y mantiene una sola transaccion atomica.
+async function updateProductoCompleto(idProducto, data, db = pool) {
+  await db.query(
+    `UPDATE productos
+     SET
+       nombre_producto = $1,
+       precio = $2,
+       cantidad = $3,
+       stock_minimo = $4,
+       descripcion_producto = $5,
+       fecha_ingreso_producto = $6,
+       fecha_caducidad = $7,
+       id_categoria_producto = $8,
+       id_almacen = $9,
+       id_tipo_departamento = $10,
+       estado = $11,
+       id_archivo_imagen_principal = $12
+     WHERE id_producto = $13`,
+    [
+      data.nombre_producto,
+      data.precio,
+      data.cantidad,
+      data.stock_minimo,
+      data.descripcion_producto || '',
+      data.fecha_ingreso_producto || null,
+      data.fecha_caducidad || null,
+      data.id_categoria_producto,
+      data.id_almacen,
+      data.id_tipo_departamento ?? null,
+      data.estado,
+      data.id_archivo_imagen_principal ?? null,
+      idProducto
+    ]
+  );
 }
 
 // NEW: actualiza campos opcionales a SQL NULL sin pasar por `pa_update`.
@@ -312,7 +602,8 @@ router.get('/productos', async (req, res) => {
     // WHY: alinear GET /productos con inactivacion via `estado=false`.
     // IMPACT: no rompe clientes actuales; amplia el contrato con query param opcional.
     const datos = shouldIncludeInactive(req.query) ? baseDatos : baseDatos.filter(isRowActive);
-    const datosConImagen = await attachImagenPrincipalUrls(pool, req, datos);
+    const datosConAlmacenes = await attachProductoAlmacenes(datos, pool);
+    const datosConImagen = await attachImagenPrincipalUrls(pool, req, datosConAlmacenes);
     res.status(200).json(datosConImagen);
 
   } catch (err) {
@@ -323,6 +614,7 @@ router.get('/productos', async (req, res) => {
 
 // POST: Crear producto
 router.post('/productos', async (req, res) => {
+  const client = await pool.connect();
   try {
     const tabla = 'productos';
     const datosEntrada = req.body;
@@ -335,7 +627,7 @@ router.post('/productos', async (req, res) => {
     const keys = Object.keys(datosEntrada);
 
     // VALIDACION: allowlist de campos aceptados
-    const keysDesconocidas = keys.filter((k) => !CAMPOS_PERMITIDOS_PRODUCTOS.has(k));
+    const keysDesconocidas = keys.filter((k) => !CAMPOS_PERMITIDOS_PRODUCTOS_POST.has(k));
     if (keysDesconocidas.length > 0) {
       return res.status(400).json({
         error: true,
@@ -348,8 +640,7 @@ router.post('/productos', async (req, res) => {
       'nombre_producto',
       'precio',
       'cantidad',
-      'id_categoria_producto',
-      'id_almacen'
+      'id_categoria_producto'
     ];
 
     const faltantes = camposRequeridos.filter((campo) => esVacio(datosEntrada[campo]));
@@ -364,6 +655,7 @@ router.post('/productos', async (req, res) => {
     const datosNormalizados = {};
 
     for (const campo of keys) {
+      if (campo === 'id_almacenes') continue;
       const resultado = validarCampoProducto(campo, datosEntrada[campo]);
       if (!resultado.valido) {
         return res.status(400).json({ error: true, message: resultado.message });
@@ -380,7 +672,7 @@ router.post('/productos', async (req, res) => {
     if (!Object.prototype.hasOwnProperty.call(datosNormalizados, 'id_categoria_producto')) {
       return res.status(400).json({ error: true, message: 'id_categoria_producto es obligatorio.' });
     }
-    const existeCategoria = await validarExistenciaFk('id_categoria_producto', datosNormalizados.id_categoria_producto);
+    const existeCategoria = await validarExistenciaFk('id_categoria_producto', datosNormalizados.id_categoria_producto, client);
     if (!existeCategoria) {
       return res.status(400).json({
         error: true,
@@ -389,20 +681,20 @@ router.post('/productos', async (req, res) => {
     }
 
     // VALIDACION: existencia FK almacen
-    if (!Object.prototype.hasOwnProperty.call(datosNormalizados, 'id_almacen')) {
-      return res.status(400).json({ error: true, message: 'id_almacen es obligatorio.' });
-    }
-    const existeAlmacen = await validarExistenciaFk('id_almacen', datosNormalizados.id_almacen);
-    if (!existeAlmacen) {
+    const almacenesParse = parseIdAlmacenes(datosEntrada?.id_almacen, datosEntrada?.id_almacenes);
+    if (!almacenesParse.ok || !Array.isArray(almacenesParse.ids) || almacenesParse.ids.length === 0) {
       return res.status(400).json({
         error: true,
-        message: 'id_almacen no existe en almacenes.'
+        message: almacenesParse.message || 'Debe seleccionar al menos un id_almacen.'
       });
     }
 
+    const idAlmacenes = almacenesParse.ids;
+    datosNormalizados.id_almacen = idAlmacenes[0];
+
     // VALIDACION: existencia FK tipo_departamento solo si viene con valor
     if (Object.prototype.hasOwnProperty.call(datosNormalizados, 'id_tipo_departamento')) {
-      const existeTipoDep = await validarExistenciaFk('id_tipo_departamento', datosNormalizados.id_tipo_departamento);
+      const existeTipoDep = await validarExistenciaFk('id_tipo_departamento', datosNormalizados.id_tipo_departamento, client);
       if (!existeTipoDep) {
         return res.status(400).json({
           error: true,
@@ -417,7 +709,8 @@ router.post('/productos', async (req, res) => {
     if (Object.prototype.hasOwnProperty.call(datosNormalizados, 'id_archivo_imagen_principal')) {
       const existeArchivo = await validarExistenciaFk(
         'id_archivo_imagen_principal',
-        datosNormalizados.id_archivo_imagen_principal
+        datosNormalizados.id_archivo_imagen_principal,
+        client
       );
       if (!existeArchivo) {
         return res.status(400).json({
@@ -427,12 +720,74 @@ router.post('/productos', async (req, res) => {
       }
     }
 
-    const query = 'CALL pa_insert($1, $2)';
-    await pool.query(query, [tabla, datosNormalizados]);
+    await client.query('BEGIN');
 
-    res.status(201).json({ message: 'Producto creado exitosamente.' });
+    for (const idAlmacen of idAlmacenes) {
+      const existeAlmacen = await validarExistenciaFk('id_almacen', idAlmacen, client);
+      if (!existeAlmacen) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({
+          error: true,
+          message: `id_almacen ${idAlmacen} no existe en almacenes.`
+        });
+      }
+    }
+
+    const duplicadoGeneral = await findProductoByGeneralKey(
+      {
+        nombre_producto: datosNormalizados.nombre_producto,
+        id_categoria_producto: datosNormalizados.id_categoria_producto,
+        id_tipo_departamento: datosNormalizados.id_tipo_departamento ?? null
+      },
+      client
+    );
+
+    if (duplicadoGeneral) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({
+        error: true,
+        message: 'Ya existe un producto general con el mismo nombre/categoria/departamento. Edita su asignacion de almacenes.'
+      });
+    }
+
+    const payloadPrimary = {
+      ...datosNormalizados,
+      id_almacen: idAlmacenes[0]
+    };
+
+    const query = 'CALL pa_insert($1, $2)';
+    await client.query(query, [tabla, payloadPrimary]);
+
+    const inserted = await findProductoByUniqueKey(
+      {
+        nombre_producto: payloadPrimary.nombre_producto,
+        id_categoria_producto: payloadPrimary.id_categoria_producto,
+        id_tipo_departamento: payloadPrimary.id_tipo_departamento ?? null,
+        id_almacen: payloadPrimary.id_almacen
+      },
+      client
+    );
+
+    const idProductoCreado = Number.parseInt(String(inserted?.id_producto ?? ''), 10);
+    if (!esEnteroPositivoInt32(idProductoCreado)) {
+      await client.query('ROLLBACK');
+      return res.status(500).json({
+        error: true,
+        message: 'No se pudo resolver el ID del producto creado.'
+      });
+    }
+
+    await syncProductoAlmacenes(idProductoCreado, idAlmacenes, client);
+    await client.query('COMMIT');
+
+    res.status(201).json({
+      message: 'Producto creado exitosamente.',
+      id_producto: idProductoCreado,
+      id_almacenes: idAlmacenes
+    });
 
   } catch (err) {
+    try { await client.query('ROLLBACK'); } catch {}
     console.error('Error al crear producto:', err.message);
 
     // AJUSTE: respuesta 409 para conflictos de FK/constraints
@@ -444,6 +799,177 @@ router.post('/productos', async (req, res) => {
     }
 
     res.status(500).json({ error: true, message: getSafeProductosServerErrorMessage(err) });
+  } finally {
+    client.release();
+  }
+});
+
+// AM: actualizacion completa del producto sincronizando uno o varios almacenes en una sola transaccion.
+// AM: conserva el endpoint `PUT /productos` por campo para compatibilidad y agrega flujo especifico multi-almacen.
+router.put('/productos/multi-almacen', async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const idProducto = Number.parseInt(String(req.body?.id_producto ?? ''), 10);
+    if (!esEnteroPositivoInt32(idProducto)) {
+      return res.status(400).json({ error: true, message: 'id_producto invalido.' });
+    }
+
+    const actual = await getProductoById(idProducto, client);
+    if (!actual) {
+      return res.status(404).json({ error: true, message: 'Producto no encontrado.' });
+    }
+
+    const datosEntrada = req.body && typeof req.body === 'object' ? { ...req.body } : {};
+    delete datosEntrada.id_producto;
+
+    const keys = Object.keys(datosEntrada);
+    const keysDesconocidas = keys.filter((k) => !CAMPOS_PERMITIDOS_PRODUCTOS_POST.has(k));
+    if (keysDesconocidas.length > 0) {
+      return res.status(400).json({
+        error: true,
+        message: `Campos no permitidos: ${keysDesconocidas.join(', ')}`
+      });
+    }
+
+    const merged = {
+      nombre_producto: datosEntrada.nombre_producto ?? actual.nombre_producto,
+      precio: datosEntrada.precio ?? actual.precio,
+      cantidad: datosEntrada.cantidad ?? actual.cantidad,
+      stock_minimo: datosEntrada.stock_minimo ?? actual.stock_minimo ?? 0,
+      descripcion_producto: datosEntrada.descripcion_producto ?? actual.descripcion_producto ?? '',
+      fecha_ingreso_producto: datosEntrada.fecha_ingreso_producto ?? toDateOnlyString(actual.fecha_ingreso_producto),
+      fecha_caducidad: datosEntrada.fecha_caducidad ?? toDateOnlyString(actual.fecha_caducidad),
+      id_categoria_producto: datosEntrada.id_categoria_producto ?? actual.id_categoria_producto,
+      id_tipo_departamento: Object.prototype.hasOwnProperty.call(datosEntrada, 'id_tipo_departamento')
+        ? datosEntrada.id_tipo_departamento
+        : actual.id_tipo_departamento,
+      id_archivo_imagen_principal: Object.prototype.hasOwnProperty.call(datosEntrada, 'id_archivo_imagen_principal')
+        ? datosEntrada.id_archivo_imagen_principal
+        : actual.id_archivo_imagen_principal,
+      estado: Object.prototype.hasOwnProperty.call(datosEntrada, 'estado')
+        ? datosEntrada.estado
+        : (actual.estado ?? true),
+      id_almacen: datosEntrada.id_almacen ?? actual.id_almacen
+    };
+
+    const datosNormalizados = {};
+    for (const [campo, valorRaw] of Object.entries(merged)) {
+      if ((campo === 'fecha_ingreso_producto' || campo === 'fecha_caducidad') && esVacio(valorRaw)) {
+        continue;
+      }
+      const resultado = validarCampoProducto(campo, valorRaw);
+      if (!resultado.valido) {
+        return res.status(400).json({ error: true, message: resultado.message });
+      }
+      datosNormalizados[campo] = resultado.valor;
+    }
+
+    const camposRequeridos = ['nombre_producto', 'precio', 'cantidad', 'stock_minimo', 'id_categoria_producto'];
+    const faltantes = camposRequeridos.filter((campo) => !Object.prototype.hasOwnProperty.call(datosNormalizados, campo));
+    if (faltantes.length > 0) {
+      return res.status(400).json({
+        error: true,
+        message: `Faltan campos obligatorios: ${faltantes.join(', ')}`
+      });
+    }
+
+    const almacenesParse = parseIdAlmacenes(
+      datosEntrada.id_almacen ?? actual.id_almacen,
+      datosEntrada.id_almacenes
+    );
+    if (!almacenesParse.ok || !Array.isArray(almacenesParse.ids) || almacenesParse.ids.length === 0) {
+      return res.status(400).json({
+        error: true,
+        message: almacenesParse.message || 'Debe seleccionar al menos un id_almacen.'
+      });
+    }
+    const idAlmacenes = almacenesParse.ids;
+
+    const existeCategoria = await validarExistenciaFk('id_categoria_producto', datosNormalizados.id_categoria_producto, client);
+    if (!existeCategoria) {
+      return res.status(400).json({
+        error: true,
+        message: 'id_categoria_producto no existe en categorias_productos.'
+      });
+    }
+
+    if (Object.prototype.hasOwnProperty.call(datosNormalizados, 'id_tipo_departamento')) {
+      const existeTipoDep = await validarExistenciaFk('id_tipo_departamento', datosNormalizados.id_tipo_departamento, client);
+      if (!existeTipoDep) {
+        return res.status(400).json({
+          error: true,
+          message: 'id_tipo_departamento no existe en tipo_departamento.'
+        });
+      }
+    }
+
+    if (Object.prototype.hasOwnProperty.call(datosNormalizados, 'id_archivo_imagen_principal')) {
+      const existeArchivo = await validarExistenciaFk(
+        'id_archivo_imagen_principal',
+        datosNormalizados.id_archivo_imagen_principal,
+        client
+      );
+      if (!existeArchivo) {
+        return res.status(400).json({
+          error: true,
+          message: 'id_archivo_imagen_principal no existe en archivos.'
+        });
+      }
+    }
+
+    for (const idAlmacen of idAlmacenes) {
+      const existeAlmacen = await validarExistenciaFk('id_almacen', idAlmacen, client);
+      if (!existeAlmacen) {
+        return res.status(400).json({
+          error: true,
+          message: `id_almacen ${idAlmacen} no existe en almacenes.`
+        });
+      }
+    }
+
+    await client.query('BEGIN');
+
+    const duplicateGeneral = await findProductoByGeneralKey(
+      {
+        nombre_producto: datosNormalizados.nombre_producto,
+        id_categoria_producto: datosNormalizados.id_categoria_producto,
+        id_tipo_departamento: datosNormalizados.id_tipo_departamento ?? null,
+        excludeId: idProducto
+      },
+      client
+    );
+
+    if (duplicateGeneral) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({
+        error: true,
+        message: 'Ya existe otro producto general con el mismo nombre/categoria/departamento.'
+      });
+    }
+
+    const primaryAlmacen = idAlmacenes[0];
+    const payloadPrimary = { ...datosNormalizados, id_almacen: primaryAlmacen };
+    await updateProductoCompleto(idProducto, payloadPrimary, client);
+    await syncProductoAlmacenes(idProducto, idAlmacenes, client);
+
+    await client.query('COMMIT');
+    return res.status(200).json({
+      message: `Producto actualizado y asignado en ${idAlmacenes.length} almacen(es).`,
+      id_producto: idProducto,
+      id_almacenes: idAlmacenes
+    });
+  } catch (err) {
+    try { await client.query('ROLLBACK'); } catch {}
+    console.error('Error en PUT /productos/multi-almacen:', err.message);
+    if (esErrorConflictoConstraint(err)) {
+      return res.status(409).json({
+        error: true,
+        message: 'No se pudo sincronizar el producto por una restriccion de datos.'
+      });
+    }
+    return res.status(500).json({ error: true, message: getSafeProductosServerErrorMessage(err) });
+  } finally {
+    client.release();
   }
 });
 
@@ -548,6 +1074,11 @@ router.put('/productos', async (req, res) => {
     const tabla = 'productos';
     const query = 'CALL pa_update($1, $2, $3, $4, $5)';
     await pool.query(query, [tabla, campo, String(resultado.valor), id_campo, String(idProducto)]);
+
+    if (campo === 'id_almacen') {
+      // AM: al mover almacen primario por endpoint legacy, se preserva coherencia en tabla de asignaciones multi-almacen.
+      await syncProductoAlmacenes(idProducto, [resultado.valor], pool);
+    }
 
     res.status(200).json({ message: 'Producto actualizado correctamente.' });
 

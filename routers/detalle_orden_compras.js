@@ -1,13 +1,27 @@
 import express from 'express';
 import pool from '../config/db-connection.js';
+import { checkPermission } from '../middleware/checkPermission.js';
 
 const router = express.Router();
+// AM: hardening RBAC para evitar bypass por rutas CRUD legacy.
+const PERM_OC_VIEW_LEGACY = [
+  'INVENTARIO_ORDENES_COMPRA_VER',
+  'INVENTARIO_ORDENES_COMPRA_CREAR',
+  'INVENTARIO_ORDENES_COMPRA_VER_TODAS'
+];
+const PERM_OC_CREATE_LEGACY = ['INVENTARIO_ORDENES_COMPRA_CREAR'];
+const PERM_OC_MANAGE_LEGACY = [
+  'INVENTARIO_ORDENES_COMPRA_GESTIONAR',
+  'INVENTARIO_ORDENES_COMPRA_CONVERTIR',
+  'INVENTARIO_ORDENES_COMPRA_ABASTECER'
+];
 
 // GET: Obtener detalle_orden_compras
-router.get('/detalle_orden_compras', async (req, res) => {
+router.get('/detalle_orden_compras', checkPermission(PERM_OC_VIEW_LEGACY), async (req, res) => {
   try {
     const tabla = 'detalle_orden_compras';
-    const columnas = 'id_detalle_orden, cantidad_orden, id_orden_compra, id_insumo';
+    // AM: expone ambos tipos de item para compatibilidad con detalle mixto (insumo/producto).
+    const columnas = 'id_detalle_orden, cantidad_orden, id_orden_compra, id_insumo, id_producto';
 
     const query = 'SELECT function_select($1, $2) as resultado';
     const result = await pool.query(query, [tabla, columnas]);
@@ -22,7 +36,7 @@ router.get('/detalle_orden_compras', async (req, res) => {
 });
 
 // POST: Crear detalle_orden_compra
-router.post('/detalle_orden_compras', async (req, res) => {
+router.post('/detalle_orden_compras', checkPermission(PERM_OC_CREATE_LEGACY), async (req, res) => {
   try {
     const tabla = 'detalle_orden_compras';
     const datos = req.body;
@@ -39,7 +53,7 @@ router.post('/detalle_orden_compras', async (req, res) => {
 });
 
 // PUT: Actualizar detalle_orden_compra (1 campo)
-router.put('/detalle_orden_compras', async (req, res) => {
+router.put('/detalle_orden_compras', checkPermission(PERM_OC_MANAGE_LEGACY), async (req, res) => {
   try {
     const { campo, valor, id_campo, id_valor } = req.body;
 
@@ -60,7 +74,7 @@ router.put('/detalle_orden_compras', async (req, res) => {
 });
 
 // DELETE: Eliminar detalle_orden_compra
-router.delete('/detalle_orden_compras', async (req, res) => {
+router.delete('/detalle_orden_compras', checkPermission(PERM_OC_MANAGE_LEGACY), async (req, res) => {
   try {
     const { columna_id, valor_id } = req.body;
 
