@@ -43,6 +43,69 @@ const SQLSTATE_UNDEFINED_TABLE = '42P01';
 // IMPACT: mantiene compatibilidad con `?incluir_inactivos=1` sin crear endpoint nuevo.
 const shouldIncludeInactive = (query) => String(query?.incluir_inactivos ?? '').trim() === '1';
 
+// AM: parse opcional de IDs positivos para filtros de catalogo por sucursal/almacen.
+const parseOptionalPositiveId = (value) => {
+  if (value === undefined || value === null || String(value).trim() === '') return null;
+  const parsed = Number.parseInt(String(value).trim(), 10);
+  return esEnteroPositivoInt32(parsed) ? parsed : null;
+};
+
+// AM: normaliza lista de almacenes del item usando pivote (id_almacenes) o fallback legacy (id_almacen).
+const resolveRowAlmacenes = (row) => {
+  const fromArray = Array.isArray(row?.id_almacenes)
+    ? row.id_almacenes
+      .map((id) => Number.parseInt(String(id ?? ''), 10))
+      .filter((id) => esEnteroPositivoInt32(id))
+    : [];
+  if (fromArray.length > 0) return Array.from(new Set(fromArray));
+
+  const fallback = Number.parseInt(String(row?.id_almacen ?? ''), 10);
+  return esEnteroPositivoInt32(fallback) ? [fallback] : [];
+};
+
+// AM: aplica filtros opcionales por id_sucursal/id_almacen para catalogos de OC sin romper contratos legacy.
+const filterProductosByCatalogScope = async (rows, query, db = pool) => {
+  const idAlmacen = parseOptionalPositiveId(query?.id_almacen);
+  const idSucursal = parseOptionalPositiveId(query?.id_sucursal);
+
+  if ((query?.id_almacen ?? '') !== '' && query?.id_almacen !== undefined && idAlmacen === null) {
+    return { ok: false, message: 'id_almacen invalido.' };
+  }
+  if ((query?.id_sucursal ?? '') !== '' && query?.id_sucursal !== undefined && idSucursal === null) {
+    return { ok: false, message: 'id_sucursal invalido.' };
+  }
+
+  if (!idAlmacen && !idSucursal) return { ok: true, rows };
+
+  let allowedWarehouseSet = null;
+  if (idSucursal) {
+    const allowed = await db.query(
+      `
+        SELECT a.id_almacen
+        FROM public.almacenes a
+        WHERE a.id_sucursal = $1
+          AND COALESCE(a.estado, true) = true
+      `,
+      [idSucursal]
+    );
+    allowedWarehouseSet = new Set(
+      (allowed.rows || [])
+        .map((row) => Number.parseInt(String(row?.id_almacen ?? ''), 10))
+        .filter((id) => esEnteroPositivoInt32(id))
+    );
+  }
+
+  const filtered = (Array.isArray(rows) ? rows : []).filter((row) => {
+    const rowAlmacenes = resolveRowAlmacenes(row);
+    if (rowAlmacenes.length === 0) return false;
+    if (idAlmacen && !rowAlmacenes.includes(idAlmacen)) return false;
+    if (allowedWarehouseSet && !rowAlmacenes.some((id) => allowedWarehouseSet.has(id))) return false;
+    return true;
+  });
+
+  return { ok: true, rows: filtered };
+};
+
 // NUEVO: helper para detectar valores vacios en campos opcionales
 const esVacio = (valor) =>
   valor === undefined ||
@@ -603,7 +666,11 @@ router.get('/productos', async (req, res) => {
     // IMPACT: no rompe clientes actuales; amplia el contrato con query param opcional.
     const datos = shouldIncludeInactive(req.query) ? baseDatos : baseDatos.filter(isRowActive);
     const datosConAlmacenes = await attachProductoAlmacenes(datos, pool);
-    const datosConImagen = await attachImagenPrincipalUrls(pool, req, datosConAlmacenes);
+    const scopedFilter = await filterProductosByCatalogScope(datosConAlmacenes, req.query, pool);
+    if (!scopedFilter.ok) {
+      return res.status(400).json({ error: true, message: scopedFilter.message || 'Filtros de catalogo invalidos.' });
+    }
+    const datosConImagen = await attachImagenPrincipalUrls(pool, req, scopedFilter.rows || []);
     res.status(200).json(datosConImagen);
 
   } catch (err) {

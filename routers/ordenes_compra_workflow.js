@@ -47,6 +47,8 @@ const MAX_LIMIT = 100;
 const DEFAULT_LIMIT = 20;
 const MAX_TEXT_LEN = 1000;
 const MAX_SHORT_TEXT_LEN = 250;
+// AM: lock transaccional para asignar correlativo visible de OC sin carreras concurrentes.
+const OC_VISIBLE_NUMBER_LOCK_KEY = 830051;
 const DISCOUNT_MODE_MONTO = 'MONTO';
 const DISCOUNT_MODE_PORCENTAJE = 'PORCENTAJE';
 const DISCOUNT_MODES = new Set([DISCOUNT_MODE_MONTO, DISCOUNT_MODE_PORCENTAJE]);
@@ -125,7 +127,8 @@ const isOcSchemaError = (error) => {
     message.includes('descuento_valor') ||
     message.includes('id_almacen_destino') ||
     message.includes('id_proveedor_sugerido') ||
-    message.includes('fecha_creacion')
+    message.includes('fecha_creacion') ||
+    message.includes('numero_oc_visible')
   );
 };
 
@@ -137,7 +140,7 @@ const sendServerError = (res, context, error) => {
       res,
       500,
       'OC_SCHEMA_MISSING',
-      'La base de datos aun no tiene las migraciones del workflow de ordenes de compra. Aplica docs/sql/2026-03-11-ordenes-compra-workflow.sql, docs/sql/2026-03-12-ordenes-compra-evidencias-recepcion.sql, docs/sql/2026-03-14-ordenes-compra-por-almacen.sql, docs/sql/2026-03-14-items-multi-almacen-asignacion.sql y docs/sql/2026-03-15-ordenes-compra-fase1-minima.sql.'
+      'La base de datos aun no tiene las migraciones del workflow de ordenes de compra. Aplica docs/sql/2026-03-11-ordenes-compra-workflow.sql, docs/sql/2026-03-12-ordenes-compra-evidencias-recepcion.sql, docs/sql/2026-03-14-ordenes-compra-por-almacen.sql, docs/sql/2026-03-14-items-multi-almacen-asignacion.sql, docs/sql/2026-03-15-ordenes-compra-fase1-minima.sql y docs/sql/2026-03-16-ordenes-compra-correlativo-visible.sql.'
     );
   }
 
@@ -317,12 +320,45 @@ const orderBelongsToSucursal = async (idOrdenCompra, idSucursal, queryRunner = p
   return result.rowCount > 0;
 };
 
+// AM: serializa operaciones que asignan/liberan correlativo visible para evitar condiciones de carrera.
+const acquireOcVisibleNumberLock = async (queryRunner = pool) => {
+  await queryRunner.query('SELECT pg_advisory_xact_lock($1)', [OC_VISIBLE_NUMBER_LOCK_KEY]);
+};
+
+// AM: calcula el menor correlativo visible disponible considerando ocupados solo estados no rechazados.
+const getNextVisibleOrderNumber = async (queryRunner = pool) => {
+  const result = await queryRunner.query(
+    `
+      WITH usados AS (
+        SELECT DISTINCT oc.numero_oc_visible AS n
+        FROM public.orden_compras oc
+        WHERE oc.numero_oc_visible IS NOT NULL
+          AND UPPER(COALESCE(oc.estado_flujo, '')) <> $1
+      ),
+      candidatos AS (
+        SELECT generate_series(
+          1,
+          COALESCE((SELECT MAX(u.n) FROM usados u), 0) + 1
+        ) AS n
+      )
+      SELECT MIN(c.n)::int AS siguiente_numero
+      FROM candidatos c
+      LEFT JOIN usados u ON u.n = c.n
+      WHERE u.n IS NULL
+    `,
+    [ESTADO_RECHAZADA]
+  );
+
+  return parsePositiveInt(result.rows?.[0]?.siguiente_numero) || 1;
+};
+
 const getOrderById = async (idOrdenCompra, queryRunner = pool) => {
   try {
     const result = await queryRunner.query(
       `
         SELECT
           oc.id_orden_compra,
+          COALESCE(NULLIF(to_jsonb(oc)->>'numero_oc_visible', '')::int, NULL) AS numero_oc_visible,
           oc.id_usuario,
           oc.id_usuario_revisor,
           oc.id_usuario_abastecedor,
@@ -390,6 +426,7 @@ const getOrderById = async (idOrdenCompra, queryRunner = pool) => {
       `
         SELECT
           oc.id_orden_compra,
+          COALESCE(NULLIF(to_jsonb(oc)->>'numero_oc_visible', '')::int, NULL) AS numero_oc_visible,
           oc.id_usuario,
           oc.id_usuario_revisor,
           oc.id_usuario_abastecedor,
@@ -1339,6 +1376,7 @@ router.get('/orden_compras/workflow', checkPermission(PERM_OC_VIEW), async (req,
         `
           SELECT
             oc.id_orden_compra,
+            COALESCE(NULLIF(to_jsonb(oc)->>'numero_oc_visible', '')::int, NULL) AS numero_oc_visible,
             oc.id_usuario,
             oc.id_usuario_revisor,
             oc.id_usuario_abastecedor,
@@ -1453,6 +1491,7 @@ router.get('/orden_compras/workflow', checkPermission(PERM_OC_VIEW), async (req,
         `
           SELECT
             oc.id_orden_compra,
+            COALESCE(NULLIF(to_jsonb(oc)->>'numero_oc_visible', '')::int, NULL) AS numero_oc_visible,
             oc.id_usuario,
             oc.id_usuario_revisor,
             oc.id_usuario_abastecedor,
@@ -1710,6 +1749,8 @@ router.post('/orden_compras/workflow', checkPermission(PERM_OC_CREATE), async (r
     const observacionSolicitud = normalizeText(req.body?.observacion, MAX_TEXT_LEN);
 
     await client.query('BEGIN');
+    await acquireOcVisibleNumberLock(client);
+    const numeroOcVisible = await getNextVisibleOrderNumber(client);
 
     // AM: crea la orden en estado pendiente con trazabilidad del solicitante.
     const ordenResult = await client.query(
@@ -1719,14 +1760,16 @@ router.post('/orden_compras/workflow', checkPermission(PERM_OC_CREATE), async (r
           fecha,
           estado,
           estado_flujo,
-          observacion_solicitud
+          observacion_solicitud,
+          numero_oc_visible
         )
-        VALUES ($1, CURRENT_DATE, false, $2, $3)
-        RETURNING id_orden_compra
+        VALUES ($1, CURRENT_DATE, false, $2, $3, $4)
+        RETURNING id_orden_compra, numero_oc_visible
       `,
-      [idUsuario, ESTADO_PENDIENTE, observacionSolicitud]
+      [idUsuario, ESTADO_PENDIENTE, observacionSolicitud, numeroOcVisible]
     );
     const idOrdenCompra = Number(ordenResult.rows?.[0]?.id_orden_compra);
+    const numeroOcVisibleCreado = parsePositiveInt(ordenResult.rows?.[0]?.numero_oc_visible) || numeroOcVisible;
 
     for (const detail of parsedDetails.details) {
       const idProducto = detail.item_tipo === 'producto' ? detail.id_item : null;
@@ -1786,7 +1829,8 @@ router.post('/orden_compras/workflow', checkPermission(PERM_OC_CREATE), async (r
     return res.status(201).json({
       ok: true,
       message: 'Solicitud de orden de compra creada correctamente.',
-      id_orden_compra: idOrdenCompra
+      id_orden_compra: idOrdenCompra,
+      numero_oc_visible: numeroOcVisibleCreado
     });
   } catch (error) {
     await withRollback(client);
@@ -2485,6 +2529,8 @@ router.post('/orden_compras/workflow/:id_orden_compra/rechazar', checkPermission
     }
 
     await client.query('BEGIN');
+    // AM: serializa liberacion de correlativo visible al rechazar para no cruzarse con altas concurrentes.
+    await acquireOcVisibleNumberLock(client);
 
     const orderRow = await getOrderByIdForUpdate(idOrdenCompra, client);
     if (!orderRow) {

@@ -20,7 +20,8 @@ const PERM_OC_MANAGE_LEGACY = [
 router.get('/orden_compras', checkPermission(PERM_OC_VIEW_LEGACY), async (req, res) => {
   try {
     const tabla = 'orden_compras';
-    const columnas = 'id_orden_compra, id_usuario, fecha, estado';
+    // AM: incluye correlativo visible de negocio sin reemplazar el id tecnico interno.
+    const columnas = 'id_orden_compra, numero_oc_visible, id_usuario, fecha, estado';
 
     const query = 'SELECT function_select($1, $2) as resultado';
     const result = await pool.query(query, [tabla, columnas]);

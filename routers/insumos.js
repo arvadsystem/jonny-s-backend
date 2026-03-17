@@ -28,6 +28,13 @@ const CAMPOS_PERMITIDOS_INSUMOS_POST = new Set([
 // IMPACT: mantiene compatibilidad agregando soporte opt-in `?incluir_inactivos=1`.
 const shouldIncludeInactive = (query) => String(query?.incluir_inactivos ?? '').trim() === '1';
 
+// AM: parse opcional de IDs positivos para filtros de catalogo por sucursal/almacen.
+const parseOptionalPositiveId = (value) => {
+  if (value === undefined || value === null || String(value).trim() === '') return null;
+  const parsed = Number.parseInt(String(value).trim(), 10);
+  return isPositiveIntegerId(parsed) ? parsed : null;
+};
+
 // NEW: normaliza el valor de `estado` para soportar boolean/string/number.
 // WHY: `function_select` puede serializar booleans de distintas formas segun el entorno.
 // IMPACT: solo afecta el filtrado del GET /insumos.
@@ -42,6 +49,62 @@ const isRowActive = (row) => {
 // WHY: evitar llamadas a BD/SP con IDs invalidos y responder 400/404 de forma consistente.
 // IMPACT: solo endurece requests mal formados; requests validos no cambian.
 const isPositiveIntegerId = (value) => Number.isSafeInteger(value) && value > 0;
+
+// AM: normaliza lista de almacenes del item usando pivote (id_almacenes) o fallback legacy (id_almacen).
+const resolveRowAlmacenes = (row) => {
+  const fromArray = Array.isArray(row?.id_almacenes)
+    ? row.id_almacenes
+      .map((id) => Number.parseInt(String(id ?? ''), 10))
+      .filter((id) => isPositiveIntegerId(id))
+    : [];
+  if (fromArray.length > 0) return Array.from(new Set(fromArray));
+
+  const fallback = Number.parseInt(String(row?.id_almacen ?? ''), 10);
+  return isPositiveIntegerId(fallback) ? [fallback] : [];
+};
+
+// AM: aplica filtros opcionales por id_sucursal/id_almacen para catalogos de OC sin romper contratos legacy.
+const filterInsumosByCatalogScope = async (rows, query, db = pool) => {
+  const idAlmacen = parseOptionalPositiveId(query?.id_almacen);
+  const idSucursal = parseOptionalPositiveId(query?.id_sucursal);
+
+  if ((query?.id_almacen ?? '') !== '' && query?.id_almacen !== undefined && idAlmacen === null) {
+    return { ok: false, message: 'id_almacen invalido.' };
+  }
+  if ((query?.id_sucursal ?? '') !== '' && query?.id_sucursal !== undefined && idSucursal === null) {
+    return { ok: false, message: 'id_sucursal invalido.' };
+  }
+
+  if (!idAlmacen && !idSucursal) return { ok: true, rows };
+
+  let allowedWarehouseSet = null;
+  if (idSucursal) {
+    const allowed = await db.query(
+      `
+        SELECT a.id_almacen
+        FROM public.almacenes a
+        WHERE a.id_sucursal = $1
+          AND COALESCE(a.estado, true) = true
+      `,
+      [idSucursal]
+    );
+    allowedWarehouseSet = new Set(
+      (allowed.rows || [])
+        .map((row) => Number.parseInt(String(row?.id_almacen ?? ''), 10))
+        .filter((id) => isPositiveIntegerId(id))
+    );
+  }
+
+  const filtered = (Array.isArray(rows) ? rows : []).filter((row) => {
+    const rowAlmacenes = resolveRowAlmacenes(row);
+    if (rowAlmacenes.length === 0) return false;
+    if (idAlmacen && !rowAlmacenes.includes(idAlmacen)) return false;
+    if (allowedWarehouseSet && !rowAlmacenes.some((id) => allowedWarehouseSet.has(id))) return false;
+    return true;
+  });
+
+  return { ok: true, rows: filtered };
+};
 
 // AM: normaliza la seleccion de almacenes (uno o varios) para create/edit multi-almacen.
 const parseIdAlmacenes = (rawSingle, rawMulti) => {
@@ -449,7 +512,11 @@ router.get('/insumos', async (req, res) => {
     // IMPACT: `?incluir_inactivos=1` mantiene soporte administrativo sin endpoint nuevo.
     const datos = shouldIncludeInactive(req.query) ? baseDatos : baseDatos.filter(isRowActive);
     const datosConAlmacenes = await attachInsumoAlmacenes(datos, pool);
-    const datosConImagen = await attachImagenPrincipalUrls(pool, req, datosConAlmacenes);
+    const scopedFilter = await filterInsumosByCatalogScope(datosConAlmacenes, req.query, pool);
+    if (!scopedFilter.ok) {
+      return res.status(400).json({ error: true, message: scopedFilter.message || 'Filtros de catalogo invalidos.' });
+    }
+    const datosConImagen = await attachImagenPrincipalUrls(pool, req, scopedFilter.rows || []);
     res.status(200).json(datosConImagen);
 
   } catch (err) {
