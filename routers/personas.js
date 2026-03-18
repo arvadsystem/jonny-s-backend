@@ -1,16 +1,11 @@
 import express from 'express';
 import pool from '../config/db-connection.js';
-import { checkPermission } from '../middleware/checkPermission.js';
+import { checkPermission, requestHasAnyPermission } from '../middleware/checkPermission.js';
 
 const router = express.Router();
-const PERSONAS_VIEW_PERMISSIONS = [
-  'PERSONAS_VER',
-  'PERSONAS_MODULO_VER',
-  'PERSONAS_CREAR',
-  'PERSONAS_EDITAR',
-  'PERSONAS_ELIMINAR'
-];
-const PERSONAS_CREATE_PERMISSIONS = ['PERSONAS_CREAR'];
+const PERSONAS_LIST_PERMISSIONS = ['PERSONAS_LISTADO_VER'];
+const PERSONAS_DETAIL_PERMISSIONS = ['PERSONAS_DETALLE_VER'];
+const PERSONAS_CREATE_PERMISSIONS = ['PERSONAS_CREAR', 'PERSONAS_CREAR_DESDE_CLIENTES'];
 const PERSONAS_EDIT_PERMISSIONS = ['PERSONAS_EDITAR'];
 const PERSONAS_DELETE_PERMISSIONS = ['PERSONAS_ELIMINAR'];
 
@@ -98,6 +93,23 @@ const normalizeUpdateFieldName = (field) => {
 const parsePositiveInt = (value) => {
   const parsed = Number.parseInt(value, 10);
   return Number.isInteger(parsed) && parsed > 0 ? parsed : null;
+};
+
+const isClientesContextRequest = (req) => {
+  const headerContext = String(
+    req.get('x-rbac-context')
+    || req.get('x-client-context')
+    || ''
+  ).trim().toLowerCase();
+  const bodyContext = String(
+    req.body?.rbac_context
+    ?? req.body?.contexto_origen
+    ?? req.body?.contexto
+    ?? req.body?._context
+    ?? ''
+  ).trim().toLowerCase();
+  const queryContext = String(req.query?.contexto ?? '').trim().toLowerCase();
+  return headerContext === 'clientes' || bodyContext === 'clientes' || queryContext === 'clientes';
 };
 
 const safeParseJson = (value) => {
@@ -652,6 +664,23 @@ const personaService = {
   async create(req) {
     const capabilities = await getSchemaCapabilities();
     const payload = normalizePersonaPayload(req.body);
+    const hasGeneralCreatePermission = await requestHasAnyPermission(req, ['PERSONAS_CREAR']);
+
+    if (!hasGeneralCreatePermission) {
+      const hasContextualCreatePermission = await requestHasAnyPermission(req, ['PERSONAS_CREAR_DESDE_CLIENTES']);
+      if (!hasContextualCreatePermission) {
+        return { status: 403, body: { error: true, message: 'Acceso denegado: permisos insuficientes' } };
+      }
+      if (!isClientesContextRequest(req)) {
+        return {
+          status: 403,
+          body: {
+            error: true,
+            message: 'Acceso denegado: PERSONAS_CREAR_DESDE_CLIENTES solo aplica en flujo de clientes'
+          }
+        };
+      }
+    }
 
     if (!isPlainObject(payload) || Object.keys(payload).length === 0) {
       return { status: 400, body: { error: true, message: 'Debe enviar un objeto con datos validos' } };
@@ -846,13 +875,13 @@ const asyncHandler = (handler) => async (req, res) => {
 /* =======================
    GET - LISTAR PERSONAS
 ======================= */
-router.get('/personas', checkPermission(PERSONAS_VIEW_PERMISSIONS), asyncHandler(personaService.list));
-router.get('/personas-detalle', checkPermission(PERSONAS_VIEW_PERMISSIONS), asyncHandler(personaService.list));
+router.get('/personas', checkPermission(PERSONAS_LIST_PERMISSIONS), asyncHandler(personaService.list));
+router.get('/personas-detalle', checkPermission(PERSONAS_LIST_PERMISSIONS), asyncHandler(personaService.list));
 
 /* =======================
    GET - PERSONA POR ID
 ======================= */
-router.get('/personas/:id', checkPermission(PERSONAS_VIEW_PERMISSIONS), asyncHandler(personaService.getById));
+router.get('/personas/:id', checkPermission(PERSONAS_DETAIL_PERMISSIONS), asyncHandler(personaService.getById));
 
 /* =======================
    POST - INSERTAR

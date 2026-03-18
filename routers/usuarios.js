@@ -3,7 +3,7 @@ import crypto from 'node:crypto';
 import fs from 'fs/promises';
 import path from 'path';
 import pool from '../config/db-connection.js';
-import { checkPermission } from '../middleware/checkPermission.js';
+import { checkPermission, requestHasAnyPermission } from '../middleware/checkPermission.js';
 import {
   ALLOWED_IMAGE_MIME_TYPES,
   UPLOADS_DIR,
@@ -11,18 +11,21 @@ import {
 } from '../utils/uploads.js';
 
 const router = express.Router();
-const USUARIOS_VIEW_PERMISSIONS = ['USUARIOS_VER', 'USUARIOS_CREAR', 'USUARIOS_EDITAR', 'USUARIOS_ELIMINAR'];
+const USUARIOS_LIST_PERMISSIONS = ['USUARIOS_LISTADO_VER'];
 const USUARIOS_CREATE_PERMISSIONS = ['USUARIOS_CREAR'];
 const USUARIOS_EDIT_PERMISSIONS = ['USUARIOS_EDITAR'];
 const USUARIOS_DELETE_PERMISSIONS = ['USUARIOS_ELIMINAR'];
 const USUARIOS_RESET_PASSWORD_PERMISSIONS = ['USUARIOS_PASSWORD_RESETEAR'];
 const USUARIOS_IMAGE_EDIT_PERMISSIONS = ['USUARIOS_IMAGEN_SUBIR', 'USUARIOS_IMAGEN_ELIMINAR'];
+const USUARIOS_ROLES_CATALOG_PERMISSIONS = ['USUARIOS_ROL_ASIGNAR', 'USUARIOS_CREAR', 'USUARIOS_EDITAR'];
+const USUARIOS_ROLE_ASSIGN_PERMISSIONS = ['USUARIOS_ROL_ASIGNAR'];
+const USUARIOS_CHANGE_OWN_PASSWORD_PERMISSIONS = ['USUARIOS_PASSWORD_CAMBIAR_PROPIO'];
 
 // ------------------------------------------------------------------------------------
 // GET: Obtener usuarios
 // ------------------------------------------------------------------------------------
 // GET: Obtener usuarios
-router.get('/usuarios', checkPermission(USUARIOS_VIEW_PERMISSIONS), async (req, res) => {
+router.get('/usuarios', checkPermission(USUARIOS_LIST_PERMISSIONS), async (req, res) => {
     try {
         const tabla = 'usuarios';
         
@@ -712,7 +715,7 @@ const v2ReplaceUserRoles = async (idUsuario, roleIds, queryRunner = pool) => {
   );
 };
 
-router.get('/usuarios/v2/roles', checkPermission(USUARIOS_VIEW_PERMISSIONS), async (_req, res) => {
+router.get('/usuarios/v2/roles', checkPermission(USUARIOS_ROLES_CATALOG_PERMISSIONS), async (_req, res) => {
   try {
     const result = await pool.query(
       'SELECT id_rol, nombre FROM roles ORDER BY id_rol ASC'
@@ -724,7 +727,7 @@ router.get('/usuarios/v2/roles', checkPermission(USUARIOS_VIEW_PERMISSIONS), asy
   }
 });
 
-router.get('/usuarios/v2/list', checkPermission(USUARIOS_VIEW_PERMISSIONS), async (req, res) => {
+router.get('/usuarios/v2/list', checkPermission(USUARIOS_LIST_PERMISSIONS), async (req, res) => {
   try {
     const page = req.query.page === undefined ? 1 : v2ParsePositiveInt(req.query.page);
     const requestedLimit = req.query.limit === undefined ? 10 : v2ParsePositiveInt(req.query.limit);
@@ -850,6 +853,13 @@ router.post('/usuarios/v2/create', checkPermission(USUARIOS_CREATE_PERMISSIONS),
     const roleSelection = v2NormalizeRoleIdsInput(req.body);
     if (roleSelection.invalid || !roleSelection.roleIds.length) {
       return res.status(400).json({ error: true, message: 'Debe enviar al menos un rol valido en id_roles o id_rol' });
+    }
+    const canAssignRoles = await requestHasAnyPermission(req, USUARIOS_ROLE_ASSIGN_PERMISSIONS);
+    if (!canAssignRoles) {
+      return res.status(403).json({
+        error: true,
+        message: 'Acceso denegado: permisos insuficientes para asignar roles'
+      });
     }
 
     let estado = true;
@@ -995,6 +1005,13 @@ router.put('/usuarios/v2/update/:id_usuario', checkPermission(USUARIOS_EDIT_PERM
     }
 
     if (hasRoleUpdate) {
+      const canAssignRoles = await requestHasAnyPermission(req, USUARIOS_ROLE_ASSIGN_PERMISSIONS);
+      if (!canAssignRoles) {
+        return res.status(403).json({
+          error: true,
+          message: 'Acceso denegado: permisos insuficientes para asignar roles'
+        });
+      }
       if (roleSelection.invalid || !roleSelection.roleIds.length) {
         return res.status(400).json({ error: true, message: 'Debe enviar al menos un rol valido en id_roles o id_rol' });
       }
@@ -1160,7 +1177,7 @@ router.delete('/usuarios/v2/delete/:id_usuario', checkPermission(USUARIOS_DELETE
   }
 });
 
-router.post('/usuarios/v2/change-password', async (req, res) => {
+router.post('/usuarios/v2/change-password', checkPermission(USUARIOS_CHANGE_OWN_PASSWORD_PERMISSIONS), async (req, res) => {
   try {
     const idUsuarioBody = v2ParsePositiveInt(req.body?.id_usuario);
     const idUsuarioJwt = v2ParsePositiveInt(req.user?.id_usuario);
@@ -1260,6 +1277,13 @@ router.post('/usuarios/v2/generate', checkPermission(USUARIOS_CREATE_PERMISSIONS
 
     if (roleSelection.invalid || !roleSelection.roleIds.length) {
       return res.status(400).json({ error: true, message: 'Debe enviar al menos un rol valido en id_roles o id_rol' });
+    }
+    const canAssignRoles = await requestHasAnyPermission(req, USUARIOS_ROLE_ASSIGN_PERMISSIONS);
+    if (!canAssignRoles) {
+      return res.status(403).json({
+        error: true,
+        message: 'Acceso denegado: permisos insuficientes para asignar roles'
+      });
     }
 
     await client.query('BEGIN');

@@ -3,13 +3,8 @@ import pool from '../config/db-connection.js';
 import { checkPermission } from '../middleware/checkPermission.js';
 
 const router = express.Router();
-const EMPLEADOS_VIEW_PERMISSIONS = [
-  'EMPLEADOS_VER',
-  'EMPLEADOS_DETALLE_VER',
-  'EMPLEADOS_CREAR',
-  'EMPLEADOS_EDITAR',
-  'EMPLEADOS_ELIMINAR'
-];
+const EMPLEADOS_LIST_PERMISSIONS = ['EMPLEADOS_LISTADO_VER'];
+const EMPLEADOS_DETAIL_PERMISSIONS = ['EMPLEADOS_DETALLE_VER'];
 const EMPLEADOS_CREATE_PERMISSIONS = ['EMPLEADOS_CREAR'];
 const EMPLEADOS_EDIT_PERMISSIONS = ['EMPLEADOS_EDITAR'];
 const EMPLEADOS_DELETE_PERMISSIONS = ['EMPLEADOS_ELIMINAR'];
@@ -531,13 +526,13 @@ const asyncHandler = (handler) => async (req, res) => {
 /* =======================
    GET - LISTAR EMPLEADOS
 ======================= */
-router.get('/empleados-detalle', checkPermission(EMPLEADOS_VIEW_PERMISSIONS), asyncHandler(empleadoService.list));
-router.get('/empleados', checkPermission(EMPLEADOS_VIEW_PERMISSIONS), asyncHandler(empleadoService.list));
+router.get('/empleados-detalle', checkPermission(EMPLEADOS_LIST_PERMISSIONS), asyncHandler(empleadoService.list));
+router.get('/empleados', checkPermission(EMPLEADOS_LIST_PERMISSIONS), asyncHandler(empleadoService.list));
 
 /* =======================
    GET - EMPLEADO POR ID
 ======================= */
-router.get('/empleados/:id', checkPermission(EMPLEADOS_VIEW_PERMISSIONS), asyncHandler(empleadoService.getById));
+router.get('/empleados/:id', checkPermission(EMPLEADOS_DETAIL_PERMISSIONS), asyncHandler(empleadoService.getById));
 
 /* =======================
    POST - INSERTAR

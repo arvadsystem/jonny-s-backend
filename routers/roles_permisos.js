@@ -4,8 +4,14 @@ import { checkPermission } from '../middleware/checkPermission.js';
 
 const router = express.Router();
 const MAX_ROLE_DETAIL_LIMIT = 500;
-const ROLE_VIEW_PERMISSIONS = ['ROLES_PERMISOS_VER', 'ROLES_PERMISOS_EDITAR'];
-const ROLE_EDIT_PERMISSIONS = ['ROLES_PERMISOS_EDITAR'];
+const ROLES_PERMISOS_ROLES_LIST_PERMISSIONS = ['ROLES_PERMISOS_ROLES_LISTADO_VER'];
+const ROLES_PERMISOS_ROLES_DETAIL_PERMISSIONS = ['ROLES_PERMISOS_ROLES_DETALLE_VER'];
+const ROLES_PERMISOS_ROLES_CREATE_PERMISSIONS = ['ROLES_PERMISOS_ROLES_CREAR'];
+const ROLES_PERMISOS_ROLES_EDIT_PERMISSIONS = ['ROLES_PERMISOS_ROLES_EDITAR'];
+const ROLES_PERMISOS_ROLES_DELETE_PERMISSIONS = ['ROLES_PERMISOS_ROLES_ELIMINAR'];
+const ROLES_PERMISOS_PERMISOS_LIST_PERMISSIONS = ['ROLES_PERMISOS_PERMISOS_LISTADO_VER'];
+const ROLES_PERMISOS_PERMISOS_GUARDAR_PERMISSIONS = ['ROLES_PERMISOS_PERMISOS_GUARDAR', 'ROLES_PERMISOS_PERMISOS_TOGGLE'];
+const ROLES_PERMISOS_AUDITORIA_PERMISSIONS = ['ROLES_PERMISOS_AUDITORIA_VER'];
 
 const parsePositiveInt = (value) => {
   const parsed = Number.parseInt(String(value ?? ''), 10);
@@ -102,7 +108,7 @@ const getRoleImpact = async (idRol, queryRunner = pool) => {
 };
 
 // GET /api/roles-permisos/roles
-router.get('/roles', checkPermission(ROLE_VIEW_PERMISSIONS), async (_req, res) => {
+router.get('/roles', checkPermission(ROLES_PERMISOS_ROLES_LIST_PERMISSIONS), async (_req, res) => {
   try {
     const sql = `
       SELECT
@@ -124,7 +130,7 @@ router.get('/roles', checkPermission(ROLE_VIEW_PERMISSIONS), async (_req, res) =
 });
 
 // GET /api/roles-permisos/permisos
-router.get('/permisos', checkPermission(ROLE_VIEW_PERMISSIONS), async (_req, res) => {
+router.get('/permisos', checkPermission(ROLES_PERMISOS_PERMISOS_LIST_PERMISSIONS), async (_req, res) => {
   try {
     const result = await pool.query(
       `
@@ -142,7 +148,7 @@ router.get('/permisos', checkPermission(ROLE_VIEW_PERMISSIONS), async (_req, res
 });
 
 // GET /api/roles-permisos/rol/:id_rol
-router.get('/rol/:id_rol', checkPermission(ROLE_VIEW_PERMISSIONS), async (req, res) => {
+router.get('/rol/:id_rol', checkPermission(ROLES_PERMISOS_ROLES_DETAIL_PERMISSIONS), async (req, res) => {
   try {
     const idRol = parsePositiveInt(req.params.id_rol);
     const page = parsePositiveInt(req.query.page) || 1;
@@ -231,7 +237,7 @@ router.get('/rol/:id_rol', checkPermission(ROLE_VIEW_PERMISSIONS), async (req, r
 });
 
 // PUT /api/roles-permisos/rol/:id_rol
-router.put('/rol/:id_rol', checkPermission(ROLE_EDIT_PERMISSIONS), async (req, res) => {
+router.put('/rol/:id_rol', checkPermission(ROLES_PERMISOS_PERMISOS_GUARDAR_PERMISSIONS), async (req, res) => {
   const client = await pool.connect();
 
   try {
@@ -318,7 +324,7 @@ router.put('/rol/:id_rol', checkPermission(ROLE_EDIT_PERMISSIONS), async (req, r
 });
 
 // GET /api/roles-permisos/rol/:id_rol/usuarios (opcional recomendado)
-router.get('/rol/:id_rol/usuarios', checkPermission(ROLE_VIEW_PERMISSIONS), async (req, res) => {
+router.get('/rol/:id_rol/usuarios', checkPermission(ROLES_PERMISOS_ROLES_DETAIL_PERMISSIONS), async (req, res) => {
   try {
     const idRol = parsePositiveInt(req.params.id_rol);
 
@@ -348,7 +354,7 @@ router.get('/rol/:id_rol/usuarios', checkPermission(ROLE_VIEW_PERMISSIONS), asyn
   }
 });
 
-router.post('/roles', checkPermission(ROLE_EDIT_PERMISSIONS), async (req, res) => {
+router.post('/roles', checkPermission(ROLES_PERMISOS_ROLES_CREATE_PERMISSIONS), async (req, res) => {
   const client = await pool.connect();
 
   try {
@@ -403,7 +409,7 @@ router.post('/roles', checkPermission(ROLE_EDIT_PERMISSIONS), async (req, res) =
   }
 });
 
-router.put('/rol/:id_rol/meta', checkPermission(ROLE_EDIT_PERMISSIONS), async (req, res) => {
+router.put('/rol/:id_rol/meta', checkPermission(ROLES_PERMISOS_ROLES_EDIT_PERMISSIONS), async (req, res) => {
   const client = await pool.connect();
 
   try {
@@ -460,7 +466,7 @@ router.put('/rol/:id_rol/meta', checkPermission(ROLE_EDIT_PERMISSIONS), async (r
   }
 });
 
-router.get('/rol/:id_rol/impacto', checkPermission(ROLE_EDIT_PERMISSIONS), async (req, res) => {
+router.get('/rol/:id_rol/impacto', checkPermission(ROLES_PERMISOS_AUDITORIA_PERMISSIONS), async (req, res) => {
   try {
     const idRol = parsePositiveInt(req.params.id_rol);
     if (!idRol) {
@@ -486,7 +492,7 @@ router.get('/rol/:id_rol/impacto', checkPermission(ROLE_EDIT_PERMISSIONS), async
   }
 });
 
-router.delete('/rol/:id_rol', checkPermission(ROLE_EDIT_PERMISSIONS), async (req, res) => {
+router.delete('/rol/:id_rol', checkPermission(ROLES_PERMISOS_ROLES_DELETE_PERMISSIONS), async (req, res) => {
   const client = await pool.connect();
 
   try {

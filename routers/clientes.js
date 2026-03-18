@@ -3,7 +3,8 @@ import pool from '../config/db-connection.js';
 import { checkPermission } from '../middleware/checkPermission.js';
 
 const router = express.Router();
-const CLIENTES_VIEW_PERMISSIONS = ['CLIENTES_VER', 'CLIENTES_CREAR', 'CLIENTES_EDITAR', 'CLIENTES_ELIMINAR'];
+const CLIENTES_LIST_PERMISSIONS = ['CLIENTES_LISTADO_VER'];
+const CLIENTES_DETAIL_PERMISSIONS = ['CLIENTES_DETALLE_VER'];
 const CLIENTES_CREATE_PERMISSIONS = ['CLIENTES_CREAR'];
 const CLIENTES_EDIT_PERMISSIONS = ['CLIENTES_EDITAR'];
 const CLIENTES_DELETE_PERMISSIONS = ['CLIENTES_ELIMINAR'];
@@ -913,13 +914,13 @@ const asyncHandler = (handler) => async (req, res) => {
 /* =======================
    GET - LISTAR CLIENTES
 ======================= */
-router.get('/clientes-detalle', checkPermission(CLIENTES_VIEW_PERMISSIONS), asyncHandler(clienteService.list));
-router.get('/clientes', checkPermission(CLIENTES_VIEW_PERMISSIONS), asyncHandler(clienteService.list));
+router.get('/clientes-detalle', checkPermission(CLIENTES_LIST_PERMISSIONS), asyncHandler(clienteService.list));
+router.get('/clientes', checkPermission(CLIENTES_LIST_PERMISSIONS), asyncHandler(clienteService.list));
 
 /* =======================
    GET - CLIENTE POR ID
 ======================= */
-router.get('/clientes/:id', checkPermission(CLIENTES_VIEW_PERMISSIONS), asyncHandler(clienteService.getById));
+router.get('/clientes/:id', checkPermission(CLIENTES_DETAIL_PERMISSIONS), asyncHandler(clienteService.getById));
 
 /* =======================
    POST - INSERTAR

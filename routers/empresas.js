@@ -1,10 +1,11 @@
 import express from 'express';
 import pool from '../config/db-connection.js';
-import { checkPermission } from '../middleware/checkPermission.js';
+import { checkPermission, requestHasAnyPermission } from '../middleware/checkPermission.js';
 
 const router = express.Router();  
-const EMPRESAS_VIEW_PERMISSIONS = ['EMPRESAS_VER', 'EMPRESAS_CREAR', 'EMPRESAS_EDITAR', 'EMPRESAS_ELIMINAR'];
-const EMPRESAS_CREATE_PERMISSIONS = ['EMPRESAS_CREAR'];
+const EMPRESAS_LIST_PERMISSIONS = ['EMPRESAS_LISTADO_VER'];
+const EMPRESAS_DETAIL_PERMISSIONS = ['EMPRESAS_DETALLE_VER'];
+const EMPRESAS_CREATE_PERMISSIONS = ['EMPRESAS_CREAR', 'EMPRESAS_CREAR_DESDE_CLIENTES'];
 const EMPRESAS_EDIT_PERMISSIONS = ['EMPRESAS_EDITAR'];
 const EMPRESAS_DELETE_PERMISSIONS = ['EMPRESAS_ELIMINAR'];
 
@@ -61,6 +62,23 @@ const parseBooleanValue = (value) => {
     if (['false', '0', 'f', 'no', 'inactivo'].includes(normalized)) return false;
   }
   return null;
+};
+
+const isClientesContextRequest = (req) => {
+  const headerContext = String(
+    req.get('x-rbac-context')
+    || req.get('x-client-context')
+    || ''
+  ).trim().toLowerCase();
+  const bodyContext = String(
+    req.body?.rbac_context
+    ?? req.body?.contexto_origen
+    ?? req.body?.contexto
+    ?? req.body?._context
+    ?? ''
+  ).trim().toLowerCase();
+  const queryContext = String(req.query?.contexto ?? '').trim().toLowerCase();
+  return headerContext === 'clientes' || bodyContext === 'clientes' || queryContext === 'clientes';
 };
 
 const resolveUserId = (req) => req.user?.id_usuario ?? null;
@@ -393,6 +411,24 @@ const empresaService = {
   async create(req) {
     const capabilities = await getSchemaCapabilities();
     const payload = normalizeEmpresaFunctionPayload(req.body);
+    const hasGeneralCreatePermission = await requestHasAnyPermission(req, ['EMPRESAS_CREAR']);
+
+    if (!hasGeneralCreatePermission) {
+      const hasContextualCreatePermission = await requestHasAnyPermission(req, ['EMPRESAS_CREAR_DESDE_CLIENTES']);
+      if (!hasContextualCreatePermission) {
+        return { status: 403, body: { error: true, message: 'Acceso denegado: permisos insuficientes' } };
+      }
+      if (!isClientesContextRequest(req)) {
+        return {
+          status: 403,
+          body: {
+            error: true,
+            message: 'Acceso denegado: EMPRESAS_CREAR_DESDE_CLIENTES solo aplica en flujo de clientes'
+          }
+        };
+      }
+    }
+
     const estadoSolicitado = Object.prototype.hasOwnProperty.call(req.body || {}, 'estado')
       ? parseBooleanValue(req.body?.estado)
       : null;
@@ -572,12 +608,12 @@ const asyncHandler = (handler) => async (req, res) => {
 /* =======================
    GET - LISTAR EMPRESAS
 ======================= */
-router.get('/empresas', checkPermission(EMPRESAS_VIEW_PERMISSIONS), asyncHandler(empresaService.list));
+router.get('/empresas', checkPermission(EMPRESAS_LIST_PERMISSIONS), asyncHandler(empresaService.list));
 
 /* =======================
    GET - LISTAR EMPRESAS POR ID
 ======================= */
-router.get('/empresas/:id', checkPermission(EMPRESAS_VIEW_PERMISSIONS), asyncHandler(empresaService.getById));
+router.get('/empresas/:id', checkPermission(EMPRESAS_DETAIL_PERMISSIONS), asyncHandler(empresaService.getById));
 
 /* =======================
    POST - INSERTAR
