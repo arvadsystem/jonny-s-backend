@@ -12,6 +12,16 @@ const EMPLEADOS_DELETE_PERMISSIONS = ['EMPLEADOS_ELIMINAR'];
 const MAX_LIMIT = 100;
 const BASE_FIELDS = ['id_empleado', 'fecha_ingreso', 'salario_base', 'estado', 'id_sucursal', 'id_persona'];
 const OPTIONAL_SOFT_DELETE_FIELDS = ['estado', 'activo', 'habilitado'];
+const FUNCTION_UPDATE_FIELDS = new Set([
+  'fecha_ingreso',
+  'salario_base',
+  'estado',
+  'id_sucursal',
+  'id_persona',
+  'cargo',
+  'nombre_referencia',
+  'telefono_referencia'
+]);
 
 let schemaCapabilitiesPromise;
 
@@ -34,6 +44,111 @@ const parseBooleanFilter = (value) => {
 };
 
 const resolveUserId = (req) => req.user?.id_usuario ?? null;
+const normalizeSearchText = (value) => String(value ?? '').trim().toLowerCase();
+const hasOwn = (obj, key) => Object.prototype.hasOwnProperty.call(obj, key);
+const hasTextValue = (value) => value !== null && value !== undefined && String(value).trim() !== '';
+
+const normalizeLegacyUpdatePayload = (body) => {
+  if (!isPlainObject(body)) return null;
+  if (!hasOwn(body, 'campo')) return null;
+
+  const campo = typeof body.campo === 'string' ? body.campo.trim() : '';
+  if (!campo || body.valor === undefined) return null;
+  return { [campo]: body.valor };
+};
+
+const mapEmpleadoListRow = (row) => {
+  const personaNombre = row.persona_nombre ?? row.nombre ?? null;
+  const personaApellido = row.persona_apellido ?? row.apellido ?? null;
+  const personaDni = row.persona_dni ?? row.dni ?? null;
+  const fullNameFromParts = [personaNombre, personaApellido].filter(Boolean).join(' ').trim();
+  const personaNombreCompleto =
+    row.persona_nombre_completo ??
+    row.nombre_completo ??
+    (fullNameFromParts || null);
+  const sucursalNombre = row.sucursal_nombre ?? row.nombre_sucursal ?? row.sucursal ?? null;
+  const telefono =
+    row.telefono ??
+    row.texto_telefono ??
+    row.telefono_texto ??
+    row.persona_telefono ??
+    row.telefono_persona ??
+    null;
+  const correo =
+    row.correo ??
+    row.texto_correo ??
+    row.correo_texto ??
+    row.direccion_correo ??
+    row.email ??
+    null;
+  const direccion =
+    row.direccion ??
+    row.texto_direccion ??
+    row.direccion_texto ??
+    row.persona_direccion ??
+    row.direccion_persona ??
+    null;
+
+  return {
+    ...row,
+    persona_nombre: personaNombre,
+    persona_apellido: personaApellido,
+    persona_dni: personaDni,
+    persona_nombre_completo: personaNombreCompleto,
+    sucursal_nombre: sucursalNombre,
+    nombre_sucursal: row.nombre_sucursal ?? sucursalNombre,
+    telefono,
+    correo,
+    direccion
+  };
+};
+
+const empleadoMatchesSearch = (empleado, normalizedSearch) => {
+  if (!normalizedSearch) return true;
+
+  const haystack = [
+    empleado.id_empleado,
+    empleado.salario_base,
+    empleado.cargo,
+    empleado.persona_nombre,
+    empleado.persona_apellido,
+    empleado.persona_nombre_completo,
+    empleado.nombre,
+    empleado.apellido,
+    empleado.nombre_completo,
+    empleado.persona_dni,
+    empleado.dni,
+    empleado.telefono,
+    empleado.correo,
+    empleado.direccion,
+    empleado.sucursal_nombre,
+    empleado.nombre_sucursal,
+    empleado.sucursal
+  ]
+    .map((value) => String(value ?? ''))
+    .join(' ')
+    .toLowerCase();
+
+  return haystack.includes(normalizedSearch);
+};
+
+const mapDbError = (err) => {
+  if (!err?.code) return null;
+
+  if (err.code === 'P0001' && /no existe/i.test(err.message || '')) {
+    return { status: 404, message: err.message };
+  }
+
+  const badRequestCodes = new Set(['22P02', '22003', '22007', '22008', '23502', '23503', '23505', 'P0001']);
+  if (badRequestCodes.has(err.code)) {
+    return {
+      status: 400,
+      message: err.detail || err.message || 'Solicitud invalida para empleados'
+    };
+  }
+
+  return null;
+};
 
 const getSchemaCapabilities = async () => {
   if (!schemaCapabilitiesPromise) {
@@ -60,6 +175,7 @@ const getSchemaCapabilities = async () => {
         SELECT
           to_regclass('public.personas') AS personas_table,
           to_regclass('public.sucursales') AS sucursales_table,
+          to_regclass('public.direcciones') AS direcciones_table,
           to_regclass('public.bitacoras') AS bitacoras_table
       `;
 
@@ -91,6 +207,7 @@ const getSchemaCapabilities = async () => {
         hasUpdatedBy: columns.has('updated_by'),
         hasTenantField: columns.has('id_empresa'),
         hasPersonasTable: Boolean(relatedTables.personas_table),
+        hasDireccionesTable: Boolean(relatedTables.direcciones_table),
         hasPersonaTenantField: personasColumns.has('id_empresa'),
         hasSucursalesTable,
         sucursalNameField,
@@ -106,108 +223,63 @@ const getSchemaCapabilities = async () => {
 };
 
 const empleadoRepository = {
-  async list({
-    page,
-    limit,
-    searchName,
-    estado,
-    tenantId,
-    capabilities
-  }) {
-    const filters = [];
-    const countFilters = [];
-    const params = [];
-    const countParams = [];
+  async list() {
+    const result = await pool.query('SELECT * FROM empleados_listar()');
+    return result.rows;
+  },
 
-    const pushFilter = (fragment, value) => {
-      params.push(value);
-      countParams.push(value);
-      filters.push(fragment.replaceAll('$IDX', `$${params.length}`));
-      countFilters.push(fragment.replaceAll('$IDX', `$${countParams.length}`));
-    };
+  async findDetailById(idEmpleado) {
+    const result = await pool.query(
+      'SELECT * FROM empleados_listar() WHERE id_empleado = $1 LIMIT 1',
+      [idEmpleado]
+    );
+    return result.rows[0] || null;
+  },
 
-    if (searchName) {
-      const value = `%${searchName}%`;
-      const searchFragments = ['e.id_empleado::TEXT ILIKE $IDX', 'e.salario_base::TEXT ILIKE $IDX'];
+  async backfillDirecciones(rows, capabilities) {
+    if (!Array.isArray(rows) || rows.length === 0) return rows;
+    if (!capabilities?.hasPersonasTable || !capabilities?.hasDireccionesTable) return rows;
 
-      if (capabilities.hasPersonasTable) {
-        searchFragments.push('p.nombre ILIKE $IDX');
-        searchFragments.push('p.apellido ILIKE $IDX');
-        searchFragments.push('p.dni::TEXT ILIKE $IDX');
-      }
+    const personaIds = [
+      ...new Set(
+        rows
+          .map((row) => parsePositiveInt(row?.id_persona))
+          .filter(Boolean)
+      )
+    ];
 
-      if (capabilities.hasSucursalesTable && capabilities.sucursalNameField) {
-        searchFragments.push(`s.${capabilities.sucursalNameField} ILIKE $IDX`);
-      }
+    if (!personaIds.length) return rows;
 
-      pushFilter(`(${searchFragments.join(' OR ')})`, value);
-    }
+    const direccionesResult = await pool.query(
+      `
+        SELECT p.id_persona, d.direccion
+        FROM personas p
+        LEFT JOIN direcciones d ON d.id_direccion = p.id_direccion
+        WHERE p.id_persona = ANY($1::int[])
+      `,
+      [personaIds]
+    );
 
-    if (estado !== null && capabilities.softDeleteField) {
-      pushFilter(`e.${capabilities.softDeleteField} = $IDX`, estado);
-    }
+    const direccionByPersona = new Map(
+      direccionesResult.rows.map((row) => [parsePositiveInt(row.id_persona), row.direccion ?? null])
+    );
 
-    if (tenantId && capabilities.hasTenantField) {
-      pushFilter('e.id_empresa = $IDX', tenantId);
-    } else if (tenantId && capabilities.hasPersonasTable && capabilities.hasPersonaTenantField) {
-      pushFilter('p.id_empresa = $IDX', tenantId);
-    }
+    return rows.map((row) => {
+      const currentDireccion = row?.direccion ?? row?.texto_direccion ?? row?.direccion_texto;
+      if (hasTextValue(currentDireccion)) return row;
 
-    const where = filters.length ? `WHERE ${filters.join(' AND ')}` : '';
-    const countWhere = countFilters.length ? `WHERE ${countFilters.join(' AND ')}` : '';
+      const personaId = parsePositiveInt(row?.id_persona);
+      if (!personaId) return row;
 
-    const fields = BASE_FIELDS.map((field) => `e.${field}`);
-    if (capabilities.softDeleteField && !BASE_FIELDS.includes(capabilities.softDeleteField)) {
-      fields.push(`e.${capabilities.softDeleteField}`);
-    }
-    if (capabilities.hasCreatedBy) fields.push('e.created_by');
-    if (capabilities.hasUpdatedBy) fields.push('e.updated_by');
-    if (capabilities.hasTenantField && !BASE_FIELDS.includes('id_empresa')) fields.push('e.id_empresa');
+      const fallbackDireccion = direccionByPersona.get(personaId);
+      if (!hasTextValue(fallbackDireccion)) return row;
 
-    if (capabilities.hasPersonasTable) {
-      fields.push('p.nombre AS persona_nombre');
-      fields.push('p.apellido AS persona_apellido');
-      fields.push('p.dni AS persona_dni');
-      fields.push(`TRIM(CONCAT(COALESCE(p.nombre, ''), ' ', COALESCE(p.apellido, ''))) AS persona_nombre_completo`);
-      if (capabilities.hasPersonaTenantField) fields.push('p.id_empresa AS persona_id_empresa');
-    }
-
-    if (capabilities.hasSucursalesTable && capabilities.sucursalNameField) {
-      fields.push(`s.${capabilities.sucursalNameField} AS sucursal_nombre`);
-    }
-
-    const joins = [];
-    if (capabilities.hasPersonasTable) joins.push('LEFT JOIN personas p ON p.id_persona = e.id_persona');
-    if (capabilities.hasSucursalesTable) joins.push('LEFT JOIN sucursales s ON s.id_sucursal = e.id_sucursal');
-
-    const joinsSql = joins.length ? `\n${joins.join('\n')}` : '';
-    const offset = (page - 1) * limit;
-    const dataParams = [...params, limit, offset];
-
-    const dataQuery = `
-      SELECT ${fields.join(', ')}
-      FROM empleados e${joinsSql}
-      ${where}
-      ORDER BY e.id_empleado
-      LIMIT $${params.length + 1}
-      OFFSET $${params.length + 2}
-    `;
-
-    const totalQuery = `
-      SELECT COUNT(*)::INT AS total
-      FROM empleados e${joinsSql}
-      ${countWhere}
-    `;
-
-    const [dataResult, totalResult] = await Promise.all([
-      pool.query(dataQuery, dataParams),
-      pool.query(totalQuery, countParams)
-    ]);
-
-    return {
-      data: dataResult.rows,
-      total: totalResult.rows[0]?.total || 0
-    };
+      return {
+        ...row,
+        direccion: fallbackDireccion,
+        texto_direccion: row?.texto_direccion ?? fallbackDireccion
+      };
+    });
   },
 
   async findById(idEmpleado, capabilities) {
@@ -248,7 +320,53 @@ const empleadoRepository = {
   },
 
   async create(data) {
-    await pool.query('CALL pa_insert($1, $2)', ['empleados', data]);
+    const result = await pool.query(
+      'SELECT empleados_crear($1::json) AS id_empleado',
+      [JSON.stringify(data ?? {})]
+    );
+    return parsePositiveInt(result.rows[0]?.id_empleado);
+  },
+
+  async update(idEmpleado, data) {
+    await pool.query(
+      'SELECT empleados_actualizar($1, $2::json)',
+      [idEmpleado, JSON.stringify(data ?? {})]
+    );
+  },
+
+  async listTenantEmpleadoIds(tenantId, capabilities) {
+    if (!tenantId) return null;
+
+    if (capabilities.hasTenantField) {
+      const tenantRows = await pool.query(
+        'SELECT id_empleado FROM empleados WHERE id_empresa = $1',
+        [tenantId]
+      );
+      return new Set(
+        tenantRows.rows
+          .map((row) => parsePositiveInt(row.id_empleado))
+          .filter(Boolean)
+      );
+    }
+
+    if (capabilities.hasPersonasTable && capabilities.hasPersonaTenantField) {
+      const tenantRows = await pool.query(
+        `
+          SELECT e.id_empleado
+          FROM empleados e
+          INNER JOIN personas p ON p.id_persona = e.id_persona
+          WHERE p.id_empresa = $1
+        `,
+        [tenantId]
+      );
+      return new Set(
+        tenantRows.rows
+          .map((row) => parsePositiveInt(row.id_empleado))
+          .filter(Boolean)
+      );
+    }
+
+    return null;
   },
 
   async updateField(idEmpleado, campo, valor) {
@@ -303,15 +421,33 @@ const empleadoService = {
     }
 
     const tenantId = parsePositiveInt(req.user?.id_empresa);
-
-    const { data, total } = await empleadoRepository.list({
-      page,
-      limit,
-      searchName: effectiveSearch,
-      estado,
-      tenantId,
+    const normalizedSearch = normalizeSearchText(effectiveSearch);
+    const allRows = await empleadoRepository.backfillDirecciones(
+      await empleadoRepository.list(),
       capabilities
-    });
+    );
+    const tenantEmpleadoIds = await empleadoRepository.listTenantEmpleadoIds(tenantId, capabilities);
+
+    let filteredRows = allRows
+      .map(mapEmpleadoListRow)
+      .filter((row) => {
+        if (!tenantEmpleadoIds) return true;
+        return tenantEmpleadoIds.has(parsePositiveInt(row.id_empleado));
+      })
+      .filter((row) => {
+        if (estado === null) return true;
+        const rowSoftDeleteValue =
+          capabilities.softDeleteField && row[capabilities.softDeleteField] !== undefined
+            ? row[capabilities.softDeleteField]
+            : row.estado;
+        return Boolean(rowSoftDeleteValue) === estado;
+      })
+      .filter((row) => empleadoMatchesSearch(row, normalizedSearch))
+      .sort((a, b) => Number(a.id_empleado) - Number(b.id_empleado));
+
+    const total = filteredRows.length;
+    const offset = (page - 1) * limit;
+    const data = filteredRows.slice(offset, offset + limit);
 
     return {
       status: 200,
@@ -356,7 +492,11 @@ const empleadoService = {
       return { status: 403, body: { error: true, message: 'Acceso denegado para este empleado' } };
     }
 
-    return { status: 200, body: empleado };
+    const detailedEmpleado = await empleadoRepository.findDetailById(idEmpleado);
+    const responsePayload = mapEmpleadoListRow(detailedEmpleado ? { ...empleado, ...detailedEmpleado } : empleado);
+    const [enrichedPayload] = await empleadoRepository.backfillDirecciones([responsePayload], capabilities);
+
+    return { status: 200, body: enrichedPayload };
   },
 
   async create(req) {
@@ -384,7 +524,20 @@ const empleadoService = {
     if (capabilities.hasCreatedBy && idUsuario) insertData.created_by = idUsuario;
     if (capabilities.hasUpdatedBy && idUsuario) insertData.updated_by = idUsuario;
 
-    await empleadoRepository.create(insertData);
+    const idEmpleado = await empleadoRepository.create(insertData);
+    if (!idEmpleado) {
+      throw new Error('No se pudo obtener el id del empleado creado');
+    }
+
+    if (capabilities.hasTenantField && insertData.id_empresa !== undefined) {
+      await empleadoRepository.updateField(idEmpleado, 'id_empresa', insertData.id_empresa);
+    }
+    if (capabilities.hasCreatedBy && idUsuario) {
+      await empleadoRepository.updateField(idEmpleado, 'created_by', idUsuario);
+    }
+    if (capabilities.hasUpdatedBy && idUsuario) {
+      await empleadoRepository.updateField(idEmpleado, 'updated_by', idUsuario);
+    }
     await empleadoRepository.addAuditLog({
       accion: 'EMPLEADO_CREAR',
       descripcion: `Empleado creado: persona ${payload.id_persona ?? 'sin_persona'}`,
@@ -398,23 +551,46 @@ const empleadoService = {
   async update(req) {
     const capabilities = await getSchemaCapabilities();
     const idEmpleado = parsePositiveInt(req.params.id);
-    const { campo, valor } = req.body;
 
     if (!idEmpleado) {
       return { status: 400, body: { error: true, message: 'El id debe ser un entero positivo' } };
     }
 
-    if (!campo || valor === undefined) {
-      return { status: 400, body: { error: true, message: 'Debe enviar campo y valor' } };
+    const legacyPayload = normalizeLegacyUpdatePayload(req.body);
+    const rawPayload = legacyPayload || req.body;
+
+    if (!isPlainObject(rawPayload) || Object.keys(rawPayload).length === 0) {
+      return {
+        status: 400,
+        body: { error: true, message: 'Debe enviar un objeto JSON con campos para actualizar' }
+      };
     }
 
-    const allowedFields = new Set([...BASE_FIELDS.filter((field) => field !== 'id_empleado')]);
+    const allowedFields = new Set(FUNCTION_UPDATE_FIELDS);
     if (capabilities.softDeleteField) allowedFields.add(capabilities.softDeleteField);
     if (capabilities.hasUpdatedBy) allowedFields.add('updated_by');
     if (capabilities.hasTenantField) allowedFields.add('id_empresa');
 
-    if (!allowedFields.has(campo)) {
-      return { status: 400, body: { error: true, message: 'El campo no es valido para actualizacion' } };
+    const payload = Object.fromEntries(
+      Object.entries(rawPayload).filter(([campo, valor]) => campo && valor !== undefined)
+    );
+
+    if (!Object.keys(payload).length) {
+      return {
+        status: 400,
+        body: { error: true, message: 'Debe enviar al menos un campo valido para actualizar' }
+      };
+    }
+
+    const invalidFields = Object.keys(payload).filter((campo) => !allowedFields.has(campo));
+    if (invalidFields.length) {
+      return {
+        status: 400,
+        body: {
+          error: true,
+          message: `Campos no validos para actualizacion: ${invalidFields.join(', ')}`
+        }
+      };
     }
 
     const current = await empleadoRepository.findById(idEmpleado, capabilities);
@@ -437,20 +613,43 @@ const empleadoService = {
       return { status: 403, body: { error: true, message: 'Acceso denegado para este empleado' } };
     }
 
-    if (campo === 'id_empresa' && capabilities.hasTenantField && tenantId && parsePositiveInt(valor) !== tenantId) {
+    if (
+      hasOwn(payload, 'id_empresa') &&
+      capabilities.hasTenantField &&
+      tenantId &&
+      parsePositiveInt(payload.id_empresa) !== tenantId
+    ) {
       return { status: 403, body: { error: true, message: 'No puede mover empleados a otra empresa' } };
     }
 
-    await empleadoRepository.updateField(idEmpleado, campo, valor);
+    const functionPayload = {};
+    const fallbackFieldUpdates = [];
+
+    for (const [campo, valor] of Object.entries(payload)) {
+      if (FUNCTION_UPDATE_FIELDS.has(campo)) {
+        functionPayload[campo] = valor;
+      } else {
+        fallbackFieldUpdates.push([campo, valor]);
+      }
+    }
+
+    if (Object.keys(functionPayload).length > 0) {
+      await empleadoRepository.update(idEmpleado, functionPayload);
+    }
+
+    for (const [campo, valor] of fallbackFieldUpdates) {
+      await empleadoRepository.updateField(idEmpleado, campo, valor);
+    }
 
     const idUsuario = resolveUserId(req);
-    if (capabilities.hasUpdatedBy && idUsuario && campo !== 'updated_by') {
+    if (capabilities.hasUpdatedBy && idUsuario && !hasOwn(payload, 'updated_by')) {
       await empleadoRepository.updateField(idEmpleado, 'updated_by', idUsuario);
     }
 
+    const changedFields = Object.keys(payload).join(', ');
     await empleadoRepository.addAuditLog({
       accion: 'EMPLEADO_ACTUALIZAR',
-      descripcion: `Empleado ${idEmpleado} actualizado: campo ${campo}`,
+      descripcion: `Empleado ${idEmpleado} actualizado: campos ${changedFields}`,
       idUsuario,
       capabilities
     });
@@ -519,6 +718,10 @@ const asyncHandler = (handler) => async (req, res) => {
     return res.status(result.status).json(result.body);
   } catch (err) {
     console.error('Empleados API error:', err.message);
+    const mappedError = mapDbError(err);
+    if (mappedError) {
+      return res.status(mappedError.status).json({ error: true, message: mappedError.message });
+    }
     return res.status(500).json({ error: true, message: 'Error interno del servidor' });
   }
 };
