@@ -1,9 +1,23 @@
 import express from 'express';
 import pool from '../config/db-connection.js';
+import { checkPermission } from '../middleware/checkPermission.js';
 
 const router = express.Router();
 
 const VENTA_DIRECTA_LABEL = 'VENTA DIRECTA';
+const TEGUCIGALPA_TZ = 'America/Tegucigalpa';
+const VENTAS_LIMITED_DAYS = 3;
+const VENTAS_HISTORY_LIMITED_ROLES = new Set(['CAJERO']);
+const VENTAS_DESCUENTOS_PERMISSIONS = ['VENTAS_DESCUENTOS_CATALOGO_VER'];
+const VENTAS_DESCUENTOS_WRITE_PERMISSIONS = [
+  'VENTAS_DESCUENTOS_CATALOGO_CREAR',
+  'VENTAS_DESCUENTOS_CATALOGO_EDITAR',
+  'VENTAS_DESCUENTOS_CATALOGO_ESTADO_CAMBIAR'
+];
+const DESCUENTO_TIPO_KEYS = {
+  MONTO_FIJO: 'MONTO_FIJO',
+  PORCENTAJE: 'PORCENTAJE'
+};
 const ESTADO_PEDIDO_CODES = {
   PENDIENTE: new Set(['pendiente']),
   EN_COCINA: new Set(['en_cocina']),
@@ -35,9 +49,35 @@ const parseOptionalPositiveInt = (value) => {
   return parsePositiveInt(value);
 };
 
+const parseRequiredPositiveInt = (value, fieldName) => {
+  const parsed = parsePositiveInt(value);
+  if (!parsed) {
+    return {
+      ok: false,
+      message: `${fieldName} debe ser un entero mayor a 0.`
+    };
+  }
+  return { ok: true, value: parsed };
+};
+
 const parseNonNegativeNumber = (value) => {
   const parsed = Number(value);
   return Number.isFinite(parsed) && parsed >= 0 ? roundMoney(parsed) : null;
+};
+
+const parseBooleanInput = (value) => {
+  if (value === true || value === false) return { ok: true, value };
+  if (value === 1 || value === 0) return { ok: true, value: value === 1 };
+  if (typeof value === 'string') {
+    const normalized = value.trim().toLowerCase();
+    if (['true', '1', 'si', 'yes', 'y', 'activo'].includes(normalized)) {
+      return { ok: true, value: true };
+    }
+    if (['false', '0', 'no', 'n', 'inactivo'].includes(normalized)) {
+      return { ok: true, value: false };
+    }
+  }
+  return { ok: false, value: false };
 };
 
 const isPlainObject = (value) =>
@@ -59,6 +99,28 @@ const normalizeTextKey = (value) =>
     .trim()
     .toLowerCase()
     .replace(/\s+/g, '_');
+
+const normalizeRoleName = (value) =>
+  String(value ?? '')
+    .trim()
+    .replace(/[\s-]+/g, '_')
+    .toUpperCase();
+
+const getRequestRoleSet = (req) =>
+  new Set(
+    (Array.isArray(req.user?.roles) ? req.user.roles : [])
+      .map(normalizeRoleName)
+      .filter(Boolean)
+  );
+
+const shouldLimitVentasHistoryByRole = (req) => {
+  const roleSet = getRequestRoleSet(req);
+  if (roleSet.size === 0) return false;
+  return [...roleSet].some((role) => VENTAS_HISTORY_LIMITED_ROLES.has(role));
+};
+
+const getVentasHistorySqlFilter = (tableAliasExpr = "COALESCE(p.fecha_hora_pedido, f.fecha_hora_facturacion)") =>
+  `(${tableAliasExpr} AT TIME ZONE '${TEGUCIGALPA_TZ}')::date >= ((NOW() AT TIME ZONE '${TEGUCIGALPA_TZ}')::date - INTERVAL '${VENTAS_LIMITED_DAYS - 1} day')::date`;
 
 const parseBooleanish = (value) =>
   value === true || value === 'true' || value === 1 || value === '1';
@@ -206,14 +268,16 @@ const normalizeVentaItems = (items) => {
   return { ok: true, data: normalized };
 };
 
-const fetchProductoMap = async (client, ids) => {
+const fetchProductoMap = async (client, ids, options = {}) => {
   if (!ids.length) return new Map();
 
+  const forUpdateClause = options?.forUpdate ? 'FOR UPDATE' : '';
   const result = await client.query(
     `
-      SELECT id_producto, nombre_producto, precio, estado
+      SELECT id_producto, nombre_producto, precio, estado, cantidad, id_almacen
       FROM productos
       WHERE id_producto = ANY($1::int[])
+      ${forUpdateClause}
     `,
     [ids]
   );
@@ -277,6 +341,73 @@ const fetchClienteInfo = async (client, idCliente) => {
   );
 
   return result.rows[0] || null;
+};
+
+const getNextTableId = async (client, tableName, idField, lock = true) => {
+  if (lock) {
+    await client.query(`LOCK TABLE ${tableName} IN EXCLUSIVE MODE`);
+  }
+  const result = await client.query(
+    `SELECT COALESCE(MAX(${idField}), 0)::int + 1 AS next_id FROM ${tableName}`
+  );
+  return Number(result.rows?.[0]?.next_id ?? 0) || 1;
+};
+
+const fetchDiscountCatalogById = async (client, idDescuentoCatalogo) => {
+  if (!idDescuentoCatalogo) return null;
+
+  const result = await client.query(
+    `
+      SELECT
+        dc.id_descuento_catalogo,
+        dc.nombre_descuento,
+        dc.valor_descuento,
+        dc.estado,
+        dc.id_tipo_descuento,
+        td.nombre_tipo_descuento,
+        td.estado AS tipo_estado
+      FROM descuentos_catalogos dc
+      INNER JOIN tipo_descuentos td
+        ON td.id_tipo_descuento = dc.id_tipo_descuento
+      WHERE dc.id_descuento_catalogo = $1
+      LIMIT 1
+    `,
+    [idDescuentoCatalogo]
+  );
+
+  return result.rows[0] || null;
+};
+
+const resolveDiscountTypeKey = (value) => {
+  const normalized = normalizeTextKey(value).toUpperCase();
+  if (normalized.includes('PORCENTAJE')) return DESCUENTO_TIPO_KEYS.PORCENTAJE;
+  if (normalized.includes('MONTO_FIJO') || normalized.includes('MONTO')) {
+    return DESCUENTO_TIPO_KEYS.MONTO_FIJO;
+  }
+  return null;
+};
+
+const computeDiscountValue = ({ subtotalBruto, valorDescuento, tipoDescuentoKey }) => {
+  const safeSubtotal = roundMoney(Math.max(0, subtotalBruto));
+  const safeValor = roundMoney(Math.max(0, Number(valorDescuento || 0)));
+  if (safeSubtotal <= 0 || safeValor <= 0) return 0;
+
+  if (tipoDescuentoKey === DESCUENTO_TIPO_KEYS.PORCENTAJE) {
+    return roundMoney(Math.min(safeSubtotal, (safeSubtotal * safeValor) / 100));
+  }
+
+  return roundMoney(Math.min(safeSubtotal, safeValor));
+};
+
+const aggregateProductoQuantities = (normalizedItems) => {
+  const totals = new Map();
+  for (const item of normalizedItems) {
+    if (item.kind !== 'PRODUCTO') continue;
+    const key = Number(item.id_producto);
+    const prev = totals.get(key) || 0;
+    totals.set(key, prev + Number(item.cantidad || 0));
+  }
+  return totals;
 };
 
 const resolveSucursalId = async (client, requestedId) => {
@@ -404,10 +535,34 @@ const hydrateVentaLines = async (client, normalizedItems) => {
   ];
 
   const [productoMap, comboMap, recetaMap] = await Promise.all([
-    fetchProductoMap(client, productoIds),
+    fetchProductoMap(client, productoIds, { forUpdate: true }),
     fetchComboMap(client, comboIds),
     fetchRecetaMap(client, recetaIds)
   ]);
+
+  const productoQtyById = aggregateProductoQuantities(normalizedItems);
+  for (const [idProducto, requestedQty] of productoQtyById.entries()) {
+    const producto = productoMap.get(idProducto);
+    if (!producto) {
+      return {
+        ok: false,
+        status: 400,
+        body: { error: true, message: `Producto no encontrado: ${idProducto}` }
+      };
+    }
+
+    const availableQty = Number(producto.cantidad ?? 0);
+    if (availableQty < requestedQty) {
+      return {
+        ok: false,
+        status: 409,
+        body: {
+          error: true,
+          message: `Stock insuficiente para ${producto.nombre_producto || `producto ${idProducto}`}. Disponible: ${availableQty}, solicitado: ${requestedQty}.`
+        }
+      };
+    }
+  }
 
   const lines = [];
   const subTotals = [];
@@ -433,6 +588,17 @@ const hydrateVentaLines = async (client, normalizedItems) => {
 
       const precioUnitario = roundMoney(producto.precio);
       const subTotal = roundMoney(precioUnitario * item.cantidad);
+      const idAlmacen = Number(producto.id_almacen ?? 0) || null;
+      if (!idAlmacen) {
+        return {
+          ok: false,
+          status: 409,
+          body: {
+            error: true,
+            message: `El producto ${producto.nombre_producto || item.id_producto} no tiene almacen asignado para descontar inventario.`
+          }
+        };
+      }
 
       lines.push({
         kind: 'PRODUCTO',
@@ -440,6 +606,7 @@ const hydrateVentaLines = async (client, normalizedItems) => {
         id_producto: item.id_producto,
         id_combo: null,
         id_receta: null,
+        id_almacen: idAlmacen,
         nombre_item: producto.nombre_producto,
         cantidad: item.cantidad,
         precio_unitario: precioUnitario,
@@ -477,6 +644,7 @@ const hydrateVentaLines = async (client, normalizedItems) => {
         id_producto: null,
         id_combo: item.id_combo,
         id_receta: null,
+        id_almacen: null,
         nombre_item: combo.descripcion || `Combo #${item.id_combo}`,
         cantidad: item.cantidad,
         precio_unitario: precioUnitario,
@@ -513,6 +681,7 @@ const hydrateVentaLines = async (client, normalizedItems) => {
       id_producto: null,
       id_combo: null,
       id_receta: item.id_receta,
+      id_almacen: null,
       nombre_item: receta.nombre_receta || `Receta #${item.id_receta}`,
       cantidad: item.cantidad,
       precio_unitario: precioUnitario,
@@ -546,11 +715,20 @@ const buildVentaPayload = async ({ client, body, userId }) => {
   const idCliente = parseOptionalPositiveInt(body.id_cliente);
   const idSucursalRequested = parseOptionalPositiveInt(body.id_sucursal);
   const idEstadoPedidoRequested = parseOptionalPositiveInt(body.id_estado_pedido);
-  const descuentoTotal = parseNonNegativeNumber(body.descuento ?? 0);
+  const idDescuentoCatalogo = parseOptionalPositiveInt(body.id_descuento_catalogo);
+  const descuentoLegacyInput = parseNonNegativeNumber(body.descuento ?? 0);
   const efectivoEntregadoInput = parseNonNegativeNumber(body.efectivo_entregado);
   const metodoPago = String(body.metodo_pago || 'efectivo').trim().toLowerCase();
 
-  if (body.descuento !== undefined && descuentoTotal === null) {
+  if (body.id_descuento_catalogo !== undefined && body.id_descuento_catalogo !== null && !idDescuentoCatalogo) {
+    return {
+      ok: false,
+      status: 400,
+      body: { error: true, message: 'id_descuento_catalogo debe ser un entero mayor a 0.' }
+    };
+  }
+
+  if (body.descuento !== undefined && descuentoLegacyInput === null) {
     return {
       ok: false,
       status: 400,
@@ -628,6 +806,55 @@ const buildVentaPayload = async ({ client, body, userId }) => {
 
   const { lines, subTotals } = hydratedResult.data;
   const subtotalBruto = roundMoney(subTotals.reduce((sum, value) => sum + value, 0));
+  let descuentoTotal = descuentoLegacyInput || 0;
+  let appliedDiscountCatalog = null;
+
+  if (idDescuentoCatalogo) {
+    const discountCatalog = await fetchDiscountCatalogById(client, idDescuentoCatalogo);
+    if (!discountCatalog) {
+      return {
+        ok: false,
+        status: 400,
+        body: { error: true, message: 'id_descuento_catalogo no existe.' }
+      };
+    }
+
+    if (!parseBooleanish(discountCatalog.estado)) {
+      return {
+        ok: false,
+        status: 409,
+        body: { error: true, message: 'El descuento seleccionado esta inactivo.' }
+      };
+    }
+
+    if (!parseBooleanish(discountCatalog.tipo_estado)) {
+      return {
+        ok: false,
+        status: 409,
+        body: { error: true, message: 'El tipo de descuento seleccionado esta inactivo.' }
+      };
+    }
+
+    const tipoDescuentoKey = resolveDiscountTypeKey(discountCatalog.nombre_tipo_descuento);
+    if (!tipoDescuentoKey) {
+      return {
+        ok: false,
+        status: 409,
+        body: { error: true, message: 'El tipo de descuento seleccionado no es soportado.' }
+      };
+    }
+
+    descuentoTotal = computeDiscountValue({
+      subtotalBruto,
+      valorDescuento: discountCatalog.valor_descuento,
+      tipoDescuentoKey
+    });
+    appliedDiscountCatalog = {
+      id_descuento_catalogo: Number(discountCatalog.id_descuento_catalogo),
+      id_tipo_descuento: Number(discountCatalog.id_tipo_descuento),
+      tipo_descuento_key: tipoDescuentoKey
+    };
+  }
 
   if (descuentoTotal > subtotalBruto) {
     return {
@@ -640,6 +867,7 @@ const buildVentaPayload = async ({ client, body, userId }) => {
   const descuentosPorLinea = allocateDiscounts(subTotals, descuentoTotal);
   const finalizedLines = lines.map((line, index) => ({
     ...line,
+    id_descuento_catalogo: appliedDiscountCatalog?.id_descuento_catalogo ?? null,
     descuento: descuentosPorLinea[index],
     total_linea: roundMoney(line.sub_total - descuentosPorLinea[index])
   }));
@@ -697,6 +925,7 @@ const buildVentaPayload = async ({ client, body, userId }) => {
       descripcion_envio:
         typeof body.descripcion_envio === 'string' ? body.descripcion_envio.trim() : null,
       descuento: descuentoTotal,
+      id_descuento_catalogo: appliedDiscountCatalog?.id_descuento_catalogo ?? null,
       subtotal,
       isv,
       total,
@@ -714,6 +943,66 @@ const buildVentaPayload = async ({ client, body, userId }) => {
       pedido_subtotal: pedidoSubtotal,
       pedido_isv: pedidoIsv,
       pedido_total: pedidoTotal
+    }
+  };
+};
+
+const validateDescuentoCatalogoPayload = async (client, payload, options = {}) => {
+  const mode = options.mode || 'create';
+  if (!isPlainObject(payload)) {
+    return { ok: false, status: 400, message: 'Payload invalido para descuentos_catalogos.' };
+  }
+
+  const nombre = String(payload.nombre_descuento || '').trim();
+  const descripcion =
+    payload.descripcion === undefined || payload.descripcion === null
+      ? null
+      : String(payload.descripcion).trim() || null;
+  const valorDescuento = parseNonNegativeNumber(payload.valor_descuento);
+  const tipoResult = parseRequiredPositiveInt(payload.id_tipo_descuento, 'id_tipo_descuento');
+
+  if (!nombre) {
+    return { ok: false, status: 400, message: 'nombre_descuento es obligatorio.' };
+  }
+  if (valorDescuento === null || valorDescuento <= 0) {
+    return { ok: false, status: 400, message: 'valor_descuento debe ser mayor a 0.' };
+  }
+  if (!tipoResult.ok) {
+    return { ok: false, status: 400, message: tipoResult.message };
+  }
+
+  const tipoResultRow = await client.query(
+    `
+      SELECT id_tipo_descuento, estado
+      FROM tipo_descuentos
+      WHERE id_tipo_descuento = $1
+      LIMIT 1
+    `,
+    [tipoResult.value]
+  );
+
+  if (tipoResultRow.rowCount === 0) {
+    return { ok: false, status: 400, message: 'id_tipo_descuento no existe.' };
+  }
+
+  if (!parseBooleanish(tipoResultRow.rows[0].estado)) {
+    return { ok: false, status: 409, message: 'El tipo de descuento seleccionado esta inactivo.' };
+  }
+
+  const estadoParsed = parseBooleanInput(payload.estado ?? true);
+  if (!estadoParsed.ok) {
+    return { ok: false, status: 400, message: 'estado debe ser booleano.' };
+  }
+
+  return {
+    ok: true,
+    data: {
+      nombre_descuento: nombre,
+      descripcion,
+      valor_descuento: valorDescuento,
+      id_tipo_descuento: tipoResult.value,
+      estado: estadoParsed.value,
+      mode
     }
   };
 };
@@ -756,10 +1045,17 @@ router.get('/ventas/catalogos/combos', async (req, res) => {
   try {
     const result = await pool.query(
       `
-        SELECT id_combo, descripcion, precio, estado
-        FROM combos
-        WHERE COALESCE(estado, true) = true
-        ORDER BY COALESCE(descripcion, id_combo::text)
+        SELECT 
+          c.id_combo, 
+          c.descripcion, 
+          c.precio, 
+          c.estado,
+          c.id_archivo,
+          a.url_publica AS imagen_principal_url
+        FROM combos c
+        LEFT JOIN archivos a ON a.id_archivo = c.id_archivo AND (a.estado = true OR a.estado IS NULL)
+        WHERE COALESCE(c.estado, true) = true
+        ORDER BY COALESCE(c.descripcion, c.id_combo::text)
       `
     );
 
@@ -779,11 +1075,14 @@ router.get('/ventas/catalogos/recetas', async (req, res) => {
           r.nombre_receta,
           r.estado,
           r.precio,
+          r.id_archivo,
+          a.url_publica AS imagen_principal_url,
           NULL::INTEGER AS id_producto_base,
           r.nombre_receta AS nombre_producto_base,
           r.precio AS precio_producto_base,
           r.estado AS estado_producto_base
         FROM recetas r
+        LEFT JOIN archivos a ON a.id_archivo = r.id_archivo AND (a.estado = true OR a.estado IS NULL)
         WHERE COALESCE(r.estado, true) = true
         ORDER BY COALESCE(r.nombre_receta, r.id_receta::text)
       `
@@ -793,6 +1092,286 @@ router.get('/ventas/catalogos/recetas', async (req, res) => {
   } catch (err) {
     console.error('Error al listar catalogo de recetas para ventas:', err.message);
     res.status(500).json({ error: true, message: err.message });
+  }
+});
+
+router.get('/ventas/catalogos/tipos-descuento', async (req, res) => {
+  try {
+    const result = await pool.query(
+      `
+        SELECT
+          td.id_tipo_descuento,
+          td.nombre_tipo_descuento,
+          td.descripcion,
+          td.estado
+        FROM tipo_descuentos td
+        WHERE COALESCE(td.estado, true) = true
+        ORDER BY td.id_tipo_descuento
+      `
+    );
+    res.status(200).json(result.rows || []);
+  } catch (err) {
+    console.error('Error al listar tipos de descuento:', err.message);
+    res.status(500).json({ error: true, message: err.message });
+  }
+});
+
+router.get('/ventas/catalogos/descuentos', async (req, res) => {
+  try {
+    const result = await pool.query(
+      `
+        SELECT
+          dc.id_descuento_catalogo,
+          dc.nombre_descuento,
+          dc.descripcion,
+          dc.valor_descuento,
+          dc.id_tipo_descuento,
+          td.nombre_tipo_descuento
+        FROM descuentos_catalogos dc
+        INNER JOIN tipo_descuentos td
+          ON td.id_tipo_descuento = dc.id_tipo_descuento
+        WHERE COALESCE(dc.estado, true) = true
+          AND COALESCE(td.estado, true) = true
+        ORDER BY dc.nombre_descuento ASC, dc.id_descuento_catalogo ASC
+      `
+    );
+    res.status(200).json(result.rows || []);
+  } catch (err) {
+    console.error('Error al listar descuentos activos de catalogo:', err.message);
+    res.status(500).json({ error: true, message: err.message });
+  }
+});
+
+router.get('/ventas/descuentos-catalogos', checkPermission(VENTAS_DESCUENTOS_PERMISSIONS), async (req, res) => {
+  try {
+    const q = typeof req.query.q === 'string' ? req.query.q.trim() : '';
+    const params = [];
+    let whereSql = '';
+
+    if (q) {
+      params.push(`%${q}%`);
+      whereSql = `
+        WHERE (
+          dc.id_descuento_catalogo::text ILIKE $1
+          OR COALESCE(dc.nombre_descuento, '') ILIKE $1
+          OR COALESCE(dc.descripcion, '') ILIKE $1
+          OR COALESCE(td.nombre_tipo_descuento, '') ILIKE $1
+        )
+      `;
+    }
+
+    const result = await pool.query(
+      `
+        SELECT
+          dc.id_descuento_catalogo,
+          dc.nombre_descuento,
+          dc.descripcion,
+          dc.valor_descuento,
+          dc.id_tipo_descuento,
+          td.nombre_tipo_descuento,
+          dc.estado,
+          dc.fecha_creacion,
+          dc.id_usuario
+        FROM descuentos_catalogos dc
+        INNER JOIN tipo_descuentos td ON td.id_tipo_descuento = dc.id_tipo_descuento
+        ${whereSql}
+        ORDER BY dc.id_descuento_catalogo DESC
+      `,
+      params
+    );
+
+    res.status(200).json(result.rows || []);
+  } catch (err) {
+    console.error('Error al listar descuentos_catalogos:', err.message);
+    res.status(500).json({ error: true, message: err.message });
+  }
+});
+
+router.get('/ventas/descuentos-catalogos/:id', checkPermission(VENTAS_DESCUENTOS_PERMISSIONS), async (req, res) => {
+  try {
+    const id = parsePositiveInt(req.params.id);
+    if (!id) {
+      return res.status(400).json({ error: true, message: 'ID de descuento catalogo invalido.' });
+    }
+
+    const result = await pool.query(
+      `
+        SELECT
+          dc.id_descuento_catalogo,
+          dc.nombre_descuento,
+          dc.descripcion,
+          dc.valor_descuento,
+          dc.id_tipo_descuento,
+          td.nombre_tipo_descuento,
+          dc.estado,
+          dc.fecha_creacion,
+          dc.id_usuario
+        FROM descuentos_catalogos dc
+        INNER JOIN tipo_descuentos td ON td.id_tipo_descuento = dc.id_tipo_descuento
+        WHERE dc.id_descuento_catalogo = $1
+        LIMIT 1
+      `,
+      [id]
+    );
+
+    if (result.rowCount === 0) {
+      return res.status(404).json({ error: true, message: 'Descuento de catalogo no encontrado.' });
+    }
+
+    return res.status(200).json(result.rows[0]);
+  } catch (err) {
+    console.error('Error al obtener descuento_catalogo por id:', err.message);
+    return res.status(500).json({ error: true, message: err.message });
+  }
+});
+
+router.post('/ventas/descuentos-catalogos', checkPermission(VENTAS_DESCUENTOS_WRITE_PERMISSIONS), async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const validated = await validateDescuentoCatalogoPayload(client, req.body, { mode: 'create' });
+    if (!validated.ok) {
+      await client.query('ROLLBACK');
+      return res.status(validated.status).json({ error: true, message: validated.message });
+    }
+
+    const nextId = await getNextTableId(
+      client,
+      'descuentos_catalogos',
+      'id_descuento_catalogo',
+      true
+    );
+
+    const created = await client.query(
+      `
+        INSERT INTO descuentos_catalogos (
+          id_descuento_catalogo,
+          nombre_descuento,
+          descripcion,
+          valor_descuento,
+          id_tipo_descuento,
+          estado,
+          fecha_creacion,
+          id_usuario
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, NOW(), $7)
+        RETURNING id_descuento_catalogo
+      `,
+      [
+        nextId,
+        validated.data.nombre_descuento,
+        validated.data.descripcion,
+        validated.data.valor_descuento,
+        validated.data.id_tipo_descuento,
+        validated.data.estado,
+        req.user?.id_usuario ?? null
+      ]
+    );
+
+    await client.query('COMMIT');
+    return res.status(201).json({
+      message: 'Descuento de catalogo creado exitosamente.',
+      id_descuento_catalogo: created.rows[0].id_descuento_catalogo
+    });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error('Error al crear descuentos_catalogos:', err.message);
+    return res.status(500).json({ error: true, message: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+router.put('/ventas/descuentos-catalogos/:id', checkPermission(VENTAS_DESCUENTOS_WRITE_PERMISSIONS), async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const id = parsePositiveInt(req.params.id);
+    if (!id) {
+      return res.status(400).json({ error: true, message: 'ID de descuento catalogo invalido.' });
+    }
+
+    await client.query('BEGIN');
+    const existing = await client.query(
+      'SELECT id_descuento_catalogo FROM descuentos_catalogos WHERE id_descuento_catalogo = $1 LIMIT 1',
+      [id]
+    );
+    if (existing.rowCount === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: true, message: 'Descuento de catalogo no encontrado.' });
+    }
+
+    const validated = await validateDescuentoCatalogoPayload(client, req.body, { mode: 'update' });
+    if (!validated.ok) {
+      await client.query('ROLLBACK');
+      return res.status(validated.status).json({ error: true, message: validated.message });
+    }
+
+    await client.query(
+      `
+        UPDATE descuentos_catalogos
+        SET
+          nombre_descuento = $1,
+          descripcion = $2,
+          valor_descuento = $3,
+          id_tipo_descuento = $4,
+          estado = $5
+        WHERE id_descuento_catalogo = $6
+      `,
+      [
+        validated.data.nombre_descuento,
+        validated.data.descripcion,
+        validated.data.valor_descuento,
+        validated.data.id_tipo_descuento,
+        validated.data.estado,
+        id
+      ]
+    );
+
+    await client.query('COMMIT');
+    return res.status(200).json({ message: 'Descuento de catalogo actualizado correctamente.' });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error('Error al actualizar descuentos_catalogos:', err.message);
+    return res.status(500).json({ error: true, message: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+router.patch('/ventas/descuentos-catalogos/:id/estado', checkPermission(VENTAS_DESCUENTOS_WRITE_PERMISSIONS), async (req, res) => {
+  try {
+    const id = parsePositiveInt(req.params.id);
+    if (!id) {
+      return res.status(400).json({ error: true, message: 'ID de descuento catalogo invalido.' });
+    }
+
+    const parsedEstado = parseBooleanInput(req.body?.estado);
+    if (!parsedEstado.ok) {
+      return res.status(400).json({ error: true, message: 'estado debe ser booleano.' });
+    }
+
+    const result = await pool.query(
+      `
+        UPDATE descuentos_catalogos
+        SET estado = $1
+        WHERE id_descuento_catalogo = $2
+        RETURNING id_descuento_catalogo
+      `,
+      [parsedEstado.value, id]
+    );
+
+    if (result.rowCount === 0) {
+      return res.status(404).json({ error: true, message: 'Descuento de catalogo no encontrado.' });
+    }
+
+    return res.status(200).json({
+      message: `Descuento de catalogo ${parsedEstado.value ? 'activado' : 'inactivado'} correctamente.`,
+      id_descuento_catalogo: result.rows[0].id_descuento_catalogo
+    });
+  } catch (err) {
+    console.error('Error al cambiar estado de descuentos_catalogos:', err.message);
+    return res.status(500).json({ error: true, message: err.message });
   }
 });
 
@@ -838,6 +1417,10 @@ router.get('/ventas', async (req, res) => {
 
     if (idCliente) {
       pushFilter('COALESCE(p.id_cliente, f.id_cliente) = $IDX', idCliente);
+    }
+
+    if (shouldLimitVentasHistoryByRole(req)) {
+      filters.push(getVentasHistorySqlFilter('COALESCE(p.fecha_hora_pedido, f.fecha_hora_facturacion)'));
     }
 
     const whereClause = filters.length ? `WHERE ${filters.join(' AND ')}` : '';
@@ -961,6 +1544,7 @@ router.get('/ventas/:id', async (req, res) => {
       return res.status(400).json({ error: true, message: 'ID de venta invalido.' });
     }
 
+    const enforceRoleRange = shouldLimitVentasHistoryByRole(req);
     const headerQuery = `
       SELECT
         f.id_factura,
@@ -1015,10 +1599,14 @@ router.get('/ventas/:id', async (req, res) => {
         WHERE df.id_factura = f.id_factura
       ) df_info ON true
       WHERE f.id_factura = $1
+        AND (
+          $2::boolean = false
+          OR ${getVentasHistorySqlFilter('COALESCE(p.fecha_hora_pedido, f.fecha_hora_facturacion)')}
+        )
       LIMIT 1
     `;
 
-    const headerResult = await pool.query(headerQuery, [idFactura]);
+    const headerResult = await pool.query(headerQuery, [idFactura, enforceRoleRange]);
     if (headerResult.rowCount === 0) {
       return res.status(404).json({ error: true, message: 'Venta no encontrada.' });
     }
@@ -1144,8 +1732,12 @@ router.post('/ventas', async (req, res) => {
 
       if (line.descuento > 0) {
         const descuentoResult = await client.query(
-          'INSERT INTO descuentos (monto_descuento) VALUES ($1) RETURNING id_descuento',
-          [line.descuento]
+          `
+            INSERT INTO descuentos (monto_descuento, id_descuento_catalogo)
+            VALUES ($1, $2)
+            RETURNING id_descuento
+          `,
+          [line.descuento, line.id_descuento_catalogo]
         );
         idDescuento = descuentoResult.rows[0].id_descuento;
       }
@@ -1273,6 +1865,34 @@ router.post('/ventas', async (req, res) => {
           line.sub_total,
           line.total_linea,
           idPedido
+        ]
+      );
+    }
+
+    for (const line of venta.all_lines) {
+      if (line.kind !== 'PRODUCTO') continue;
+      if (!line.id_almacen || !line.id_producto || !line.cantidad) continue;
+
+      await client.query(
+        `
+          INSERT INTO movimientos_inventario (
+            tipo,
+            cantidad,
+            id_almacen,
+            id_producto,
+            id_insumo,
+            ref_origen,
+            id_ref,
+            descripcion
+          )
+          VALUES ('SALIDA', $1, $2, $3, NULL, 'VENTA', $4, $5)
+        `,
+        [
+          Number(line.cantidad),
+          Number(line.id_almacen),
+          Number(line.id_producto),
+          Number(idFactura),
+          `Salida por venta ${formatVentaNumero(idFactura)}`
         ]
       );
     }
