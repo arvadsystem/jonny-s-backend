@@ -11,6 +11,7 @@ import express from 'express';
 import pool from '../../config/db-connection.js';
 import { checkPermission, isRequestUserSuperAdmin } from '../../middleware/checkPermission.js';
 import { timestampAsHNToISO, toHNWallTimestamp } from '../../utils/dates.js';
+import { insertSecurityAuditLog } from './auditLogger.js';
 
 const router = express.Router();
 
@@ -36,6 +37,12 @@ const PERMISOS_USUARIOS_CERRAR = [
   'SEGURIDAD_SESIONES_CERRAR_GLOBAL',
   'SEGURIDAD_SESIONES_CERRAR'
 ];
+const PERMISOS_BITACORAS_VER = [
+  'SEGURIDAD_VER',
+  'SEGURIDAD_LOGINS_VER',
+  'SEGURIDAD_USUARIOS_AUDITORIA_VER',
+  'SEGURIDAD_SESIONES_VER_GLOBAL'
+];
 
 // =====================================================
 // Helpers
@@ -56,6 +63,186 @@ const clampInt = (value, def, min, max) => {
 };
 
 const toHNISO = (val) => timestampAsHNToISO(val);
+
+const toUTCISO = (value) => {
+  if (!value) return null;
+
+  if (value instanceof Date) return value.toISOString();
+
+  let s = String(value).trim().replace(' ', 'T');
+  const hasTZ = /Z$|[+-]\d{2}:\d{2}$/.test(s);
+  if (!hasTZ) s = `${s}Z`;
+
+  const d = new Date(s);
+  if (Number.isNaN(d.getTime())) return null;
+  return d.toISOString();
+};
+
+const normalizeBitacoraFecha = (row) => {
+  const modulo = String(row?.modulo ?? '').trim();
+
+  // Legacy: registros viejos sin modulo suelen estar guardados como UTC wall-clock.
+  // Nuevos (Seguridad y los que migremos) usan hora Honduras.
+  if (!modulo) return toUTCISO(row?.fecha_hora);
+
+  return toHNISO(row?.fecha_hora);
+};
+
+const tryParseJsonObject = (value) => {
+  if (value === null || value === undefined) return null;
+  if (typeof value === 'object') return value;
+  if (typeof value !== 'string') return null;
+
+  try {
+    const parsed = JSON.parse(value);
+    return parsed && typeof parsed === 'object' ? parsed : null;
+  } catch {
+    return null;
+  }
+};
+
+const normalizeFieldName = (value) =>
+  String(value ?? '')
+    .trim()
+    .replace(/\s+/g, '_')
+    .toLowerCase();
+
+const parseLegacyPlainValue = (value) => {
+  const text = String(value ?? '').trim();
+  if (!text) return '';
+  if (text === '-') return '';
+  if (text === 'null') return '';
+  if (text === 'true') return true;
+  if (text === 'false') return false;
+  const numeric = Number(text);
+  if (!Number.isNaN(numeric) && text === String(numeric)) return numeric;
+  return text;
+};
+
+const parseLegacyPairs = (valueText) => {
+  const text = String(valueText ?? '').trim();
+  if (!text || text === '-') return {};
+
+  const output = {};
+  const chunks = text.split('|').map((chunk) => chunk.trim()).filter(Boolean);
+  for (const chunk of chunks) {
+    const idx = chunk.indexOf(':');
+    if (idx < 0) continue;
+    const key = normalizeFieldName(chunk.slice(0, idx));
+    if (!key) continue;
+    const rawValue = chunk.slice(idx + 1).trim();
+    output[key] = parseLegacyPlainValue(rawValue);
+  }
+  return output;
+};
+
+const LEGACY_SOFT_DELETE_ENTITIES = new Set([
+  'PRODUCTOS',
+  'INSUMOS',
+  'CATEGORIAS_PRODUCTOS',
+  'CATEGORIAS_INSUMOS'
+]);
+
+const parseLegacyBooleanLike = (value) => {
+  if (value === true || value === false) return value;
+  if (value === 1 || value === 0) return value === 1;
+  const s = String(value ?? '').trim().toLowerCase();
+  if (!s) return null;
+  if (['true', '1', 't', 'si', 'yes', 'y', 'activo', 'activa'].includes(s)) return true;
+  if (['false', '0', 'f', 'no', 'n', 'inactivo', 'inactiva'].includes(s)) return false;
+  return null;
+};
+
+const mapLegacyTechnicalPayload = (payload, row) => {
+  const obj = tryParseJsonObject(payload);
+  if (!obj) return { data: payload, detail: '' };
+
+  const hasEnvelopeShape = Object.prototype.hasOwnProperty.call(obj, 'request')
+    || Object.prototype.hasOwnProperty.call(obj, 'metadata')
+    || Object.prototype.hasOwnProperty.call(obj, 'response');
+  const hasSummaryShape = Object.prototype.hasOwnProperty.call(obj, 'accion_real')
+    || Object.prototype.hasOwnProperty.call(obj, 'campos')
+    || Object.prototype.hasOwnProperty.call(obj, 'valores')
+    || Object.prototype.hasOwnProperty.call(obj, 'detalle')
+    || Object.prototype.hasOwnProperty.call(obj, 'rol');
+
+  if (!hasEnvelopeShape && !hasSummaryShape) return { data: payload, detail: '' };
+
+  const metadata = tryParseJsonObject(obj.metadata) || {};
+  const request = tryParseJsonObject(obj.request) || {};
+  const body = tryParseJsonObject(request.body) || {};
+
+  const method = String(metadata.method || '').toUpperCase();
+  let actionLabel = method === 'POST'
+    ? 'CREAR'
+    : (method === 'DELETE' ? 'ELIMINAR' : 'ACTUALIZAR');
+  const modulo = String(metadata.modulo || row?.modulo || '').trim() || 'SISTEMA';
+  const entidad = String(metadata.tabla_afectada || row?.tabla_afectada || modulo).trim() || 'SISTEMA';
+  const registroId = Number(metadata.id_registro ?? row?.id_registro ?? 0) || 0;
+
+  let campos = [];
+  let cambios = {};
+
+  if (typeof body.campo === 'string' && Object.prototype.hasOwnProperty.call(body, 'valor')) {
+    const field = normalizeFieldName(body.campo);
+    if (field) {
+      campos = [field];
+      cambios = { [field]: body.valor };
+    }
+  } else if (typeof body.columna_id === 'string' && Object.prototype.hasOwnProperty.call(body, 'valor_id')) {
+    const field = normalizeFieldName(body.columna_id);
+    if (field) {
+      campos = [field];
+      cambios = { [field]: body.valor_id };
+    }
+  } else {
+    const entries = Object.entries(body).filter(([key, value]) => {
+      if (value === undefined) return false;
+      const k = normalizeFieldName(key);
+      if (!k) return false;
+      if (k === 'id' || k === 'created_by' || k === 'updated_by') return false;
+      if (/^id(_|$)/i.test(k)) return false;
+      if (k === 'token' || k === 'password' || k === 'csrf_token') return false;
+      return true;
+    }).slice(0, 8);
+
+    campos = entries.map(([key]) => normalizeFieldName(key)).filter(Boolean);
+    cambios = Object.fromEntries(entries);
+  }
+
+  if (!Object.keys(cambios).length && hasSummaryShape) {
+    const valuesFromSummary = parseLegacyPairs(obj.valores);
+    if (Object.keys(valuesFromSummary).length) {
+      cambios = valuesFromSummary;
+      campos = Object.keys(valuesFromSummary);
+    } else {
+      const camposText = String(obj.campos ?? '').trim();
+      if (camposText && camposText !== '-') {
+        campos = camposText
+          .split(',')
+          .map((item) => normalizeFieldName(item))
+          .filter(Boolean);
+      }
+    }
+  }
+
+  const estadoDespues = parseLegacyBooleanLike(cambios.estado);
+  const entidadUpper = String(entidad).trim().toUpperCase();
+
+  if (actionLabel === 'ELIMINAR' && (estadoDespues === false || LEGACY_SOFT_DELETE_ENTITIES.has(entidadUpper))) {
+    actionLabel = 'INACTIVAR';
+  } else if (actionLabel === 'ACTUALIZAR' && estadoDespues !== null) {
+    actionLabel = estadoDespues ? 'ACTIVAR' : 'INACTIVAR';
+  }
+
+  const detail = String(obj.detalle || '').trim()
+    || `${actionLabel === 'ELIMINAR' ? 'Elimino' : (actionLabel === 'CREAR' ? 'Creo' : (actionLabel === 'INACTIVAR' ? 'Inactivo' : (actionLabel === 'ACTIVAR' ? 'Activo' : 'Actualizo')))} ${entidad}${registroId > 0 ? ` #${registroId}` : ''}${campos.length ? `: ${campos.join(', ')}` : ''}`.slice(0, 100);
+
+  return {
+    detail,
+    data: cambios
+  };
+};
 
 const normalizeEstado = (raw) => {
   const s = String(raw ?? '').trim().toLowerCase();
@@ -79,31 +266,6 @@ const normalizeLoginEstado = (raw) => {
   if (['success', 'exito', 'exitoso', 'exitosos', 'ok', 'true', '1'].includes(s)) return true;
   if (['fail', 'failed', 'fallido', 'fallidos', 'error', 'false', '0'].includes(s)) return false;
   return null;
-};
-
-let hasBitacorasPromise;
-
-const hasBitacorasTable = async () => {
-  if (!hasBitacorasPromise) {
-    hasBitacorasPromise = pool
-      .query(`SELECT to_regclass('public.bitacoras') AS reg`)
-      .then((r) => Boolean(r.rows?.[0]?.reg))
-      .catch((err) => {
-        hasBitacorasPromise = null;
-        throw err;
-      });
-  }
-  return hasBitacorasPromise;
-};
-
-const insertAuditLog = async ({ accion, descripcion, id_usuario }) => {
-  if (!id_usuario) return;
-  const hasTable = await hasBitacorasTable();
-  if (!hasTable) return;
-  await pool.query(
-    `INSERT INTO bitacoras (accion, descripcion, id_usuario) VALUES ($1, $2, $3)`,
-    [accion, descripcion, id_usuario]
-  );
 };
 
 // =====================================================
@@ -539,6 +701,155 @@ router.get('/usuarios/:id/logins', checkPermission(PERMISOS_USUARIOS_LOGINS), as
 });
 
 /**
+ * GET /seguridad/bitacoras
+ * Bitacoras generales de Seguridad (solo Super Admin).
+ * Query:
+ * - usuario (opcional): id_usuario o username/nombre
+ * - limit (default 10)
+ * - offset (default 0)
+ */
+router.get('/bitacoras', checkPermission(PERMISOS_BITACORAS_VER), async (req, res) => {
+  try {
+    const actor = req.user || req.usuario;
+    if (!actor?.id_usuario) {
+      return res.status(401).json({ error: true, message: 'No autenticado' });
+    }
+    if (!(await requireSuperAdmin(req, res))) return;
+
+    const hasTableRes = await pool.query(`SELECT to_regclass('public.bitacoras') AS reg`);
+    if (!hasTableRes.rows?.[0]?.reg) {
+      return res.status(404).json({ error: true, message: 'Tabla bitacoras no disponible' });
+    }
+
+    const limit = clampInt(req.query.limit, 10, 1, 100);
+    const offset = clampInt(req.query.offset, 0, 0, 1_000_000);
+    const usuarioTerm = String(req.query.usuario ?? '').trim();
+    const actorId = parsePositiveInt(usuarioTerm);
+
+    const where = [];
+    const params = [];
+    let i = 1;
+
+    if (usuarioTerm) {
+      const like = `%${usuarioTerm}%`;
+      if (actorId) {
+        where.push(`(
+          b.id_usuario = $${i} OR
+          COALESCE(u.nombre_usuario, '') ILIKE $${i + 1} OR
+          COALESCE(p.nombre, '') ILIKE $${i + 1} OR
+          COALESCE(p.apellido, '') ILIKE $${i + 1}
+        )`);
+        params.push(actorId, like);
+        i += 2;
+      } else {
+        where.push(`(
+          COALESCE(u.nombre_usuario, '') ILIKE $${i} OR
+          COALESCE(p.nombre, '') ILIKE $${i} OR
+          COALESCE(p.apellido, '') ILIKE $${i}
+        )`);
+        params.push(like);
+        i += 1;
+      }
+    }
+
+    const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
+
+    const fromSql = `
+      FROM bitacoras b
+      LEFT JOIN usuarios u ON u.id_usuario = b.id_usuario
+      LEFT JOIN empleados e ON e.id_empleado = u.id_empleado
+      LEFT JOIN personas p ON p.id_persona = e.id_persona
+      LEFT JOIN LATERAL (
+        SELECT sa.ip_origen
+        FROM sesiones_activas sa
+        WHERE sa.id_usuario = b.id_usuario
+          AND COALESCE(sa.ip_origen, '') <> ''
+        ORDER BY sa.activa DESC, sa.ultima_actividad DESC NULLS LAST, sa.fecha_inicio DESC NULLS LAST
+        LIMIT 1
+      ) sa_last ON TRUE
+      LEFT JOIN LATERAL (
+        SELECT l.ip_origen
+        FROM logins l
+        WHERE l.id_usuario = b.id_usuario
+          AND COALESCE(l.ip_origen, '') <> ''
+        ORDER BY l.fecha_hora DESC
+        LIMIT 1
+      ) lg_last ON TRUE
+    `;
+
+    const countSql = `
+      SELECT COUNT(*)::int AS total
+      ${fromSql}
+      ${whereSql}
+    `;
+
+    const dataSql = `
+      SELECT
+        b.id_bitacora,
+        b.accion,
+        COALESCE(b.descripcion, '') AS descripcion,
+        b.fecha_hora,
+        b.id_usuario,
+        COALESCE(b.modulo, '') AS modulo,
+        COALESCE(b.tabla_afectada, '') AS tabla_afectada,
+        b.id_registro,
+        COALESCE(
+          NULLIF(COALESCE(b.ip_origen, ''), ''),
+          NULLIF(COALESCE(b.datos_despues->>'ip_origen', ''), ''),
+          NULLIF(COALESCE(b.datos_antes->>'ip_origen', ''), ''),
+          NULLIF(COALESCE(sa_last.ip_origen, ''), ''),
+          NULLIF(COALESCE(lg_last.ip_origen, ''), ''),
+          ''
+        ) AS ip_origen,
+        b.datos_antes,
+        b.datos_despues,
+        u.nombre_usuario AS actor_usuario,
+        TRIM(CONCAT(COALESCE(p.nombre, ''), ' ', COALESCE(p.apellido, ''))) AS actor_nombre,
+        COALESCE(
+          NULLIF(TRIM(COALESCE(u.nombre_usuario, '')), ''),
+          NULLIF(TRIM(CONCAT(COALESCE(p.nombre, ''), ' ', COALESCE(p.apellido, ''))), ''),
+          'N/D'
+        ) AS usuario_display
+      ${fromSql}
+      ${whereSql}
+      ORDER BY b.fecha_hora DESC, b.id_bitacora DESC
+      LIMIT $${i++} OFFSET $${i++}
+    `;
+
+    const [countRes, dataRes] = await Promise.all([
+      pool.query(countSql, params),
+      pool.query(dataSql, [...params, limit, offset])
+    ]);
+
+    const total = countRes.rows?.[0]?.total ?? 0;
+    const rows = dataRes.rows.map((r) => {
+      const afterMapped = mapLegacyTechnicalPayload(r.datos_despues, r);
+      const beforeMapped = mapLegacyTechnicalPayload(r.datos_antes, r);
+      const descripcionRaw = String(r.descripcion || '').trim();
+
+      return {
+        ...r,
+        descripcion: afterMapped.detail || descripcionRaw,
+        datos_antes: beforeMapped.data,
+        datos_despues: afterMapped.data,
+        fecha_hora: normalizeBitacoraFecha(r)
+      };
+    });
+
+    return res.json({
+      error: false,
+      limit,
+      offset,
+      total,
+      rows
+    });
+  } catch (err) {
+    console.error('GET /seguridad/bitacoras error:', err);
+    return res.status(500).json({ error: true, message: 'Error interno del servidor' });
+  }
+});
+
+/**
  * POST /seguridad/usuarios/:id/sesiones/cerrar
  * HU1888: Cierra todas las sesiones activas de un usuario (forzado por Super Admin).
  */
@@ -577,10 +888,19 @@ router.post('/usuarios/:id/sesiones/cerrar', checkPermission(PERMISOS_USUARIOS_C
       [idUsuario]
     );
 
-    await insertAuditLog({
-      accion: 'SEGURIDAD_CERRAR_SESIONES_USUARIO',
-      descripcion: `SuperAdmin ${actor.id_usuario} cerro ${closeRes.rowCount} sesiones activas de usuario ${idUsuario} (${username})`,
-      id_usuario: actor.id_usuario
+    await insertSecurityAuditLog({
+      req,
+      actorId: actor.id_usuario,
+      accion: 'CERRAR_SESIONES_USUARIO',
+      objetivo: { tabla_afectada: 'usuarios', id_registro: idUsuario },
+      descripcion: `SuperAdmin ${actor.id_usuario} cerro sesiones de usuario ${idUsuario}`,
+      detalle: {
+        actor_id: actor.id_usuario,
+        target_user_id: idUsuario,
+        username,
+        sesiones_cerradas: closeRes.rowCount,
+        motivo_cierre: 'cierre_forzado_superadmin'
+      }
     });
 
     if (closeRes.rowCount === 0) {

@@ -43,6 +43,7 @@ import seguridadConfigRoutes from './routers/Seguridad/configuracion.js';
 import seguridadLoginsRoutes from './routers/Seguridad/logins.js';
 import seguridadPermisosRoutes from './routers/Seguridad/permisos.js';
 import seguridadUsuariosRoutes from './routers/Seguridad/usuarios.js';
+import { globalAuditMiddleware } from './routers/Seguridad/globalAuditInterceptor.js';
 import rolesPermisosRoutes from './routers/roles_permisos.js';
 
 import archivosRoutes from './routers/archivos.js';
@@ -104,6 +105,7 @@ app.use(authRequired);               // 1) valida JWT
 app.use(requireActiveSession);       // 2) valida sesión activa en BD
 app.use(touchSessionMiddleware);     // 3) actualiza ultima_actividad
 app.use(csrfProtect);                // 4) CSRF para no-GET
+app.use(globalAuditMiddleware);      // 5) auditoria global (intencion real + diff puntual)
 app.use(perfilRoutes);
 
 // Admin: CRUD de recetas para panel administrativo (rutas relativas en router).
