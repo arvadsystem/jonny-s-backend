@@ -28,6 +28,60 @@ const getArchivoById = async (idArchivo) => {
   return result.rows[0] || null;
 };
 
+const getDriveFileIdFromUrl = (rawUrl) => {
+  const safeUrl = String(rawUrl || '').trim();
+  if (!safeUrl) return '';
+
+  try {
+    const parsed = new URL(safeUrl);
+    const host = String(parsed.hostname || '').toLowerCase();
+    const isDrive =
+      host.includes('drive.google.com') ||
+      host.includes('drive.usercontent.google.com') ||
+      host.includes('lh3.googleusercontent.com');
+
+    if (!isDrive) return '';
+
+    const path = String(parsed.pathname || '');
+    const fromPath =
+      path.match(/\/file\/d\/([^/?#]+)/i)?.[1] ||
+      path.match(/\/d\/([^/?#]+)/i)?.[1] ||
+      '';
+    const fromQuery = String(parsed.searchParams.get('id') || '').trim();
+    return String(fromPath || fromQuery).trim();
+  } catch {
+    return '';
+  }
+};
+
+const getDriveResourceKeyFromUrl = (rawUrl) => {
+  const safeUrl = String(rawUrl || '').trim();
+  if (!safeUrl) return '';
+
+  try {
+    const parsed = new URL(safeUrl);
+    return String(parsed.searchParams.get('resourcekey') || '').trim();
+  } catch {
+    return '';
+  }
+};
+
+// Normaliza enlaces de Drive a URL de imagen renderizable en <img>.
+const normalizeDriveImageUrl = (rawUrl) => {
+  const safeUrl = String(rawUrl || '').trim();
+  if (!safeUrl) return safeUrl;
+
+  const fileId = getDriveFileIdFromUrl(safeUrl);
+  if (!fileId) return safeUrl;
+
+  const resourceKey = getDriveResourceKeyFromUrl(safeUrl);
+  const resourceKeySuffix = resourceKey
+    ? `&resourcekey=${encodeURIComponent(resourceKey)}`
+    : '';
+
+  return `https://drive.google.com/thumbnail?id=${encodeURIComponent(fileId)}&sz=w1200${resourceKeySuffix}`;
+};
+
 // NUEVO: helper para soportar boolean real o representaciones string/número
 const esProductoActivo = (estado) =>
   estado === true || estado === 'true' || estado === 1 || estado === '1';
@@ -207,19 +261,21 @@ router.post('/menu-pos/archivos/upload', async (req, res) => {
     }
 
     // INSERT explicito para evitar desalineaciones de columnas/valores en pa_insert.
+    // Se fuerza estado=true para que el archivo sea visible en JOINs que filtran activos.
     const insertQuery = `
       INSERT INTO archivos (
         nombre_original,
         url_publica,
         tipo_archivo,
         tamano_bytes,
+        estado,
         id_usuario
-      ) VALUES ($1, $2, $3, $4, $5)
+      ) VALUES ($1, $2, $3, $4, true, $5)
       RETURNING id_archivo, nombre_original, url_publica, tipo_archivo, tamano_bytes, fecha_creacion, estado, id_usuario;
     `;
     const result = await pool.query(insertQuery, [
       String(nombre_original),
-      String(url_publica),
+      normalizeDriveImageUrl(url_publica),
       tipo_archivo ? String(tipo_archivo) : null,
       size,
       idUser

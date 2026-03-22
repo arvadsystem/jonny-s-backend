@@ -47,6 +47,7 @@ import rolesPermisosRoutes from './routers/roles_permisos.js';
 
 import archivosRoutes from './routers/archivos.js';
 import adminRecetasRouter from './routers/admin_recetas.js';
+import adminCombosRouter from './routers/admin_combos.js';
 
 import { authRequired, csrfProtect } from './middleware/auth.js';
 import { touchSessionMiddleware } from './middleware/touchSession.js';
@@ -108,6 +109,8 @@ app.use(perfilRoutes);
 
 // Admin: CRUD de recetas para panel administrativo (rutas relativas en router).
 app.use('/api/admin/recetas', adminRecetasRouter);
+// Admin: CRUD de combos para panel administrativo (rutas relativas en router).
+app.use('/api/admin/combos', adminCombosRouter);
 
 // ✅ 4) Rutas protegidas
 app.use('/seguridad', seguridadSesionesRoutes);
