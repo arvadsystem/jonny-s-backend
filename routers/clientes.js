@@ -30,6 +30,39 @@ const parsePositiveInt = (value) => {
   return Number.isInteger(parsed) && parsed > 0 ? parsed : null;
 };
 
+const normalizeComparableValue = (value) => {
+  if (value === null || value === undefined) return null;
+  if (typeof value === 'string') {
+    const text = value.trim();
+    return text ? text : null;
+  }
+  if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+  if (value instanceof Date) return value.toISOString();
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
+};
+
+const valuesDiffer = (beforeValue, afterValue) =>
+  normalizeComparableValue(beforeValue) !== normalizeComparableValue(afterValue);
+
+const truncateText = (value, maxLength) => {
+  const text = String(value ?? '');
+  if (!Number.isInteger(maxLength) || maxLength <= 0) return text;
+  return text.length > maxLength ? text.slice(0, maxLength) : text;
+};
+
+const toJsonParam = (value) => {
+  if (value === undefined || value === null) return null;
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return JSON.stringify({ value: String(value) });
+  }
+};
+
 const parseBooleanFilter = (value) => {
   if (value === undefined) return null;
   if (typeof value === 'boolean') return value;
@@ -578,11 +611,62 @@ const clienteRepository = {
     );
   },
 
-  async addAuditLog({ accion, descripcion, idUsuario, capabilities }) {
+  async addAuditLog({
+    accion,
+    descripcion,
+    idUsuario,
+    capabilities,
+    req,
+    modulo = 'CLIENTES',
+    tablaAfectada = 'clientes',
+    idRegistro = null,
+    datosAntes = null,
+    datosDespues = null
+  }) {
     if (!capabilities.hasBitacorasTable || !idUsuario) return;
+    const descripcionSafe = truncateText(descripcion, 100);
+    const moduloSafe = truncateText(modulo, 60) || null;
+    const tablaAfectadaSafe = truncateText(tablaAfectada, 60) || null;
+    const idRegistroSafe = parsePositiveInt(idRegistro);
+    const ipOrigen = req ? getClientIp(req) : null;
+
     await pool.query(
-      'INSERT INTO bitacoras (accion, descripcion, id_usuario) VALUES ($1, $2, $3)',
-      [accion, descripcion, idUsuario]
+      `
+        INSERT INTO bitacoras (
+          accion,
+          descripcion,
+          fecha_hora,
+          id_usuario,
+          modulo,
+          tabla_afectada,
+          id_registro,
+          ip_origen,
+          datos_antes,
+          datos_despues
+        ) VALUES (
+          $1,
+          $2,
+          timezone('America/Tegucigalpa', now()),
+          $3,
+          $4,
+          $5,
+          $6,
+          $7,
+          $8::jsonb,
+          $9::jsonb
+        )
+      `,
+      [
+        accion,
+        descripcionSafe,
+        idUsuario,
+        moduloSafe,
+        tablaAfectadaSafe,
+        idRegistroSafe,
+        ipOrigen,
+        toJsonParam(datosAntes),
+        toJsonParam(datosDespues)
+      ]
     );
   }
 };
@@ -715,7 +799,11 @@ const clienteService = {
       accion: 'CLIENTE_CREAR',
       descripcion: `Cliente creado: ${personaId ? `persona ${personaId}` : `empresa ${empresaId}`}`,
       idUsuario,
-      capabilities
+      capabilities,
+      req,
+      modulo: 'CLIENTES',
+      tablaAfectada: 'clientes',
+      datosDespues: insertData
     });
 
     return {
@@ -850,7 +938,13 @@ const clienteService = {
       accion: 'CLIENTE_ACTUALIZAR',
       descripcion: `Cliente ${idCliente} actualizado: ${updateEntries.map(([field]) => field).join(', ')}`,
       idUsuario,
-      capabilities
+      capabilities,
+      req,
+      modulo: 'CLIENTES',
+      tablaAfectada: 'clientes',
+      idRegistro: idCliente,
+      datosAntes: { [campo]: beforeValue },
+      datosDespues: { [campo]: valor }
     });
 
     return {
@@ -894,7 +988,12 @@ const clienteService = {
       accion: 'CLIENTE_ELIMINAR',
       descripcion: `Cliente ${idCliente} eliminado. Modo: ${capabilities.softDeleteField ? 'soft' : 'hard'}`,
       idUsuario,
-      capabilities
+      capabilities,
+      req,
+      modulo: 'CLIENTES',
+      tablaAfectada: 'clientes',
+      idRegistro: idCliente,
+      datosAntes: current
     });
 
     return { status: 200, body: { error: false, message } };

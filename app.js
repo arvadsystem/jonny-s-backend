@@ -18,6 +18,7 @@ import ordenComprasRoutes from './routers/orden_compras.js';
 import detalleOrdenComprasRoutes from './routers/detalle_orden_compras.js';
 import comprasRoutes from './routers/compras.js';
 import detalleComprasRoutes from './routers/detalle_compras.js';
+import ordenesCompraWorkflowRoutes from './routers/ordenes_compra_workflow.js';
 import sucursalesRoutes from './routers/sucursales.js';
 import ventasRoutes from './routers/ventas.js';
 import cocinaRoutes from './routers/cocina.js';
@@ -43,10 +44,12 @@ import seguridadConfigRoutes from './routers/Seguridad/configuracion.js';
 import seguridadLoginsRoutes from './routers/Seguridad/logins.js';
 import seguridadPermisosRoutes from './routers/Seguridad/permisos.js';
 import seguridadUsuariosRoutes from './routers/Seguridad/usuarios.js';
+import { globalAuditMiddleware } from './routers/Seguridad/globalAuditInterceptor.js';
 import rolesPermisosRoutes from './routers/roles_permisos.js';
 
 import archivosRoutes from './routers/archivos.js';
 import adminRecetasRouter from './routers/admin_recetas.js';
+import adminCombosRouter from './routers/admin_combos.js';
 
 import { authRequired, csrfProtect } from './middleware/auth.js';
 import { touchSessionMiddleware } from './middleware/touchSession.js';
@@ -104,10 +107,13 @@ app.use(authRequired);               // 1) valida JWT
 app.use(requireActiveSession);       // 2) valida sesión activa en BD
 app.use(touchSessionMiddleware);     // 3) actualiza ultima_actividad
 app.use(csrfProtect);                // 4) CSRF para no-GET
+app.use(globalAuditMiddleware);      // 5) auditoria global (intencion real + diff puntual)
 app.use(perfilRoutes);
 
 // Admin: CRUD de recetas para panel administrativo (rutas relativas en router).
 app.use('/api/admin/recetas', adminRecetasRouter);
+// Admin: CRUD de combos para panel administrativo (rutas relativas en router).
+app.use('/api/admin/combos', adminCombosRouter);
 
 // ✅ 4) Rutas protegidas
 app.use('/seguridad', seguridadSesionesRoutes);
@@ -141,6 +147,8 @@ app.use(ordenComprasRoutes);
 app.use(detalleOrdenComprasRoutes);
 app.use(comprasRoutes);
 app.use(detalleComprasRoutes);
+// AM: flujo transaccional y seguro para solicitudes/ordenes/compras de abastecimiento.
+app.use(ordenesCompraWorkflowRoutes);
 app.use(tipoDepartamentoRoutes);
 app.use(sucursalesRoutes);
 app.use(ventasRoutes);

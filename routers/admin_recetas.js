@@ -18,6 +18,95 @@ import {
 
 const router = express.Router();
 
+const toSafeFileBaseName = (value) => {
+  const sanitized = String(value || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9\s-]/g, '')
+    .replace(/\s+/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^-|-$/g, '');
+  return sanitized || 'receta';
+};
+
+const getDriveFileIdFromUrl = (rawUrl) => {
+  const safeUrl = String(rawUrl || '').trim();
+  if (!safeUrl) return '';
+
+  try {
+    const parsed = new URL(safeUrl);
+    const host = String(parsed.hostname || '').toLowerCase();
+    const isDrive =
+      host.includes('drive.google.com') ||
+      host.includes('drive.usercontent.google.com') ||
+      host.includes('lh3.googleusercontent.com');
+
+    if (!isDrive) return '';
+
+    const path = String(parsed.pathname || '');
+    const fromPath =
+      path.match(/\/file\/d\/([^/?#]+)/i)?.[1] ||
+      path.match(/\/d\/([^/?#]+)/i)?.[1] ||
+      '';
+    const fromQuery = String(parsed.searchParams.get('id') || '').trim();
+    return String(fromPath || fromQuery).trim();
+  } catch {
+    return '';
+  }
+};
+
+const getDriveResourceKeyFromUrl = (rawUrl) => {
+  const safeUrl = String(rawUrl || '').trim();
+  if (!safeUrl) return '';
+
+  try {
+    const parsed = new URL(safeUrl);
+    return String(parsed.searchParams.get('resourcekey') || '').trim();
+  } catch {
+    return '';
+  }
+};
+
+const normalizeDriveImageUrl = (rawUrl) => {
+  const safeUrl = String(rawUrl || '').trim();
+  if (!safeUrl) return safeUrl;
+
+  const fileId = getDriveFileIdFromUrl(safeUrl);
+  if (!fileId) return safeUrl;
+
+  const resourceKey = getDriveResourceKeyFromUrl(safeUrl);
+  const resourceKeySuffix = resourceKey
+    ? `&resourcekey=${encodeURIComponent(resourceKey)}`
+    : '';
+
+  return `https://drive.google.com/thumbnail?id=${encodeURIComponent(fileId)}&sz=w1200${resourceKeySuffix}`;
+};
+
+const registrarArchivoDesdeUrlPublica = async ({ nombreReceta, urlPublica, idUsuario }) => {
+  const insertResult = await pool.query(
+    `
+      INSERT INTO archivos (
+        nombre_original,
+        url_publica,
+        tipo_archivo,
+        tamano_bytes,
+        estado,
+        id_usuario
+      ) VALUES ($1, $2, $3, $4, true, $5)
+      RETURNING id_archivo
+    `,
+    [
+      `${toSafeFileBaseName(nombreReceta)}-url`,
+      normalizeDriveImageUrl(urlPublica),
+      'image/url',
+      null,
+      idUsuario
+    ]
+  );
+
+  return Number(insertResult.rows?.[0]?.id_archivo || 0);
+};
+
 // GET: listar recetas.
 router.get('/', async (req, res) => {
   try {
@@ -88,6 +177,23 @@ router.post('/', async (req, res) => {
     }
 
     const datosNormalizados = normalizacion.datos;
+
+    const urlImagenPublica = String(datosNormalizados.url_imagen_publica || '').trim();
+    if (urlImagenPublica) {
+      const idArchivoGenerado = await registrarArchivoDesdeUrlPublica({
+        nombreReceta: datosNormalizados.nombre_receta,
+        urlPublica: urlImagenPublica,
+        idUsuario: datosNormalizados.id_usuario
+      });
+
+      if (!esEnteroPositivo(idArchivoGenerado)) {
+        return res.status(500).json({ error: true, message: 'No se pudo registrar la imagen en archivos.' });
+      }
+
+      datosNormalizados.id_archivo = idArchivoGenerado;
+    }
+    delete datosNormalizados.url_imagen_publica;
+
     const reglasValidation = await validarReglasNegocioYFks(datosNormalizados);
     if (!reglasValidation.ok) {
       return res.status(reglasValidation.status).json({ error: true, message: reglasValidation.message });
@@ -101,15 +207,43 @@ router.post('/', async (req, res) => {
       fecha_modificacion: nowIso
     };
 
-    await pool.query('CALL pa_insert($1, $2)', ['recetas', datosInsert]);
+    // `pa_insert` usa json_each_text y omite valores NULL; por eso se excluyen
+    // campos nulos para evitar desajuste entre columnas y valores.
+    const datosInsertSinNull = Object.fromEntries(
+      Object.entries(datosInsert).filter(([, valor]) => valor !== null)
+    );
+
+    await pool.query('CALL pa_insert($1, $2)', ['recetas', datosInsertSinNull]);
     return res.status(201).json({ error: false, message: 'Receta creada exitosamente.' });
   } catch (err) {
     console.error('Error al crear receta admin:', err.message);
 
     if (esErrorConflictoConstraint(err)) {
+      if (err?.code === '23505' && err?.constraint === 'uq_recetas_menu_nombre_activo') {
+        return res.status(409).json({
+          error: true,
+          message: 'Ya existe una receta activa con ese nombre en este menu. Cambia el nombre o inactiva la receta anterior.'
+        });
+      }
+
+      // Mapeo explicito de conflictos conocidos para evitar mensajes genericos.
+      if (err?.code === '23502' && err?.column === 'id_nivel_picante') {
+        return res.status(400).json({
+          error: true,
+          message: 'id_nivel_picante es obligatorio.'
+        });
+      }
+
+      if (err?.constraint === 'recetas_departamento_valido') {
+        return res.status(409).json({
+          error: true,
+          message: 'El id_tipo_departamento corresponde a productos y no puede asignarse a recetas.'
+        });
+      }
+
       return res.status(409).json({
         error: true,
-        message: 'No se pudo crear la receta por un conflicto de datos.'
+        message: getSafeServerErrorMessage(err, 'No se pudo crear la receta por un conflicto de datos.')
       });
     }
 
@@ -143,6 +277,23 @@ router.put('/:id_receta', async (req, res) => {
     }
 
     const datosNormalizados = normalizacion.datos;
+
+    const urlImagenPublica = String(datosNormalizados.url_imagen_publica || '').trim();
+    if (urlImagenPublica) {
+      const idArchivoGenerado = await registrarArchivoDesdeUrlPublica({
+        nombreReceta: datosNormalizados.nombre_receta,
+        urlPublica: urlImagenPublica,
+        idUsuario: datosNormalizados.id_usuario
+      });
+
+      if (!esEnteroPositivo(idArchivoGenerado)) {
+        return res.status(500).json({ error: true, message: 'No se pudo registrar la imagen en archivos.' });
+      }
+
+      datosNormalizados.id_archivo = idArchivoGenerado;
+    }
+    delete datosNormalizados.url_imagen_publica;
+
     const reglasValidation = await validarReglasNegocioYFks(datosNormalizados);
     if (!reglasValidation.ok) {
       return res.status(reglasValidation.status).json({ error: true, message: reglasValidation.message });
@@ -171,6 +322,13 @@ router.put('/:id_receta', async (req, res) => {
     console.error('Error al actualizar receta admin:', err.message);
 
     if (esErrorConflictoConstraint(err)) {
+      if (err?.code === '23505' && err?.constraint === 'uq_recetas_menu_nombre_activo') {
+        return res.status(409).json({
+          error: true,
+          message: 'Ya existe una receta activa con ese nombre en este menu. Cambia el nombre o inactiva la receta anterior.'
+        });
+      }
+
       return res.status(409).json({
         error: true,
         message: 'No se pudo actualizar la receta por un conflicto de datos.'

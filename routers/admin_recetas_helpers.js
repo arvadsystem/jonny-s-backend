@@ -6,6 +6,7 @@ const CAMPOS_PERMITIDOS_RECETAS = new Set([
   'descripcion',
   'id_menu',
   'id_nivel_picante',
+  'url_imagen_publica',
   'id_archivo',
   'id_usuario',
   'estado',
@@ -17,6 +18,7 @@ const CAMPOS_PERMITIDOS_RECETAS = new Set([
 const CAMPOS_REQUERIDOS_RECETA = [
   'nombre_receta',
   'id_menu',
+  'id_nivel_picante',
   'id_tipo_departamento',
   'precio',
   'estado',
@@ -24,7 +26,7 @@ const CAMPOS_REQUERIDOS_RECETA = [
 ];
 
 // Campos que aceptan NULL real en la tabla.
-const CAMPOS_NULLABLES_RECETA = new Set(['descripcion', 'id_nivel_picante', 'id_archivo']);
+const CAMPOS_NULLABLES_RECETA = new Set(['descripcion', 'id_archivo']);
 
 // Codigos SQLSTATE de conflicto para mapear a HTTP 409.
 const CODIGOS_CONFLICTO_CONSTRAINT = new Set(['23503', '23505', '23514', '23502']);
@@ -94,10 +96,9 @@ export function validarCampoReceta(campo, valor) {
   }
 
   if (campo === 'id_nivel_picante') {
-    if (esVacio(valor)) return { valido: true, valor: null };
     const numero = Number(valor);
     if (!esEnteroPositivo(numero)) {
-      return { valido: false, message: 'id_nivel_picante debe ser un entero mayor a 0 o null/vacio.' };
+      return { valido: false, message: 'id_nivel_picante debe ser un entero mayor a 0.' };
     }
     return { valido: true, valor: numero };
   }
@@ -109,6 +110,24 @@ export function validarCampoReceta(campo, valor) {
       return { valido: false, message: 'id_archivo debe ser un entero mayor a 0 o null/vacio.' };
     }
     return { valido: true, valor: numero };
+  }
+
+  if (campo === 'url_imagen_publica') {
+    if (esVacio(valor)) return { valido: true, valor: null };
+    if (typeof valor !== 'string') {
+      return { valido: false, message: 'url_imagen_publica debe ser un texto.' };
+    }
+
+    const raw = valor.trim();
+    try {
+      const parsed = new URL(raw);
+      if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+        return { valido: false, message: 'url_imagen_publica debe iniciar con http:// o https://.' };
+      }
+      return { valido: true, valor: raw };
+    } catch {
+      return { valido: false, message: 'url_imagen_publica no es una URL valida.' };
+    }
   }
 
   if (campo === 'id_usuario') {
@@ -207,9 +226,6 @@ export function normalizarPayloadReceta(payload) {
   // Defaults explicitos para campos opcionales.
   if (!Object.prototype.hasOwnProperty.call(datosNormalizados, 'descripcion')) {
     datosNormalizados.descripcion = null;
-  }
-  if (!Object.prototype.hasOwnProperty.call(datosNormalizados, 'id_nivel_picante')) {
-    datosNormalizados.id_nivel_picante = null;
   }
 
   return { ok: true, datos: datosNormalizados };
@@ -335,10 +351,6 @@ export async function actualizarCampoReceta(client, idReceta, campo, valor) {
   if (valor === null && CAMPOS_NULLABLES_RECETA.has(campo)) {
     if (campo === 'descripcion') {
       await client.query('UPDATE recetas SET descripcion = NULL WHERE id_receta = $1', [idReceta]);
-      return;
-    }
-    if (campo === 'id_nivel_picante') {
-      await client.query('UPDATE recetas SET id_nivel_picante = NULL WHERE id_receta = $1', [idReceta]);
       return;
     }
     if (campo === 'id_archivo') {
