@@ -1,5 +1,6 @@
 import express from 'express';
 import pool from '../config/db-connection.js';
+import { getClientIp } from '../utils/security/clientInfo.js';
 
 const router = express.Router();
 
@@ -87,6 +88,54 @@ const normalizeUpdateFieldName = (field) => {
 const parsePositiveInt = (value) => {
   const parsed = Number.parseInt(value, 10);
   return Number.isInteger(parsed) && parsed > 0 ? parsed : null;
+};
+
+const normalizeComparableValue = (value) => {
+  if (value === null || value === undefined) return null;
+
+  if (typeof value === 'string') {
+    const text = value.trim();
+    if (!text) return null;
+    if (/^\d{4}-\d{2}-\d{2}(?:T.*)?$/.test(text)) return text.slice(0, 10);
+    return text;
+  }
+
+  if (value instanceof Date) return value.toISOString();
+  if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
+};
+
+const valuesDiffer = (beforeValue, afterValue) =>
+  normalizeComparableValue(beforeValue) !== normalizeComparableValue(afterValue);
+
+const getCurrentValueForField = (current, field) => {
+  if (!current) return null;
+
+  if (field === 'texto_direccion') {
+    return current.texto_direccion ?? current.direccion ?? null;
+  }
+  if (field === 'texto_correo') {
+    return current.texto_correo ?? current.correo ?? current.direccion_correo ?? null;
+  }
+  if (field === 'texto_telefono') {
+    return current.texto_telefono ?? current.telefono ?? null;
+  }
+
+  return current[field];
+};
+
+const toJsonParam = (value) => {
+  if (value === undefined || value === null) return null;
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return JSON.stringify({ value: String(value) });
+  }
 };
 
 const safeParseJson = (value) => {
@@ -518,12 +567,62 @@ const personaRepository = {
     );
   },
 
-  async addAuditLog({ accion, descripcion, idUsuario, capabilities }) {
+  async addAuditLog({
+    accion,
+    descripcion,
+    idUsuario,
+    capabilities,
+    req,
+    modulo = 'PERSONAS',
+    tablaAfectada = 'personas',
+    idRegistro = null,
+    datosAntes = null,
+    datosDespues = null
+  }) {
     if (!capabilities.hasBitacorasTable || !idUsuario) return;
     const descripcionSafe = truncateText(descripcion, MAX_AUDIT_DESCRIPCION_LENGTH);
+    const moduloSafe = truncateText(modulo, 60) || null;
+    const tablaAfectadaSafe = truncateText(tablaAfectada, 60) || null;
+    const idRegistroSafe = parsePositiveInt(idRegistro);
+    const ipOrigen = req ? getClientIp(req) : null;
+
     await pool.query(
-      'INSERT INTO bitacoras (accion, descripcion, id_usuario) VALUES ($1, $2, $3)',
-      [accion, descripcionSafe, idUsuario]
+      `
+        INSERT INTO bitacoras (
+          accion,
+          descripcion,
+          fecha_hora,
+          id_usuario,
+          modulo,
+          tabla_afectada,
+          id_registro,
+          ip_origen,
+          datos_antes,
+          datos_despues
+        ) VALUES (
+          $1,
+          $2,
+          timezone('America/Tegucigalpa', now()),
+          $3,
+          $4,
+          $5,
+          $6,
+          $7,
+          $8::jsonb,
+          $9::jsonb
+        )
+      `,
+      [
+        accion,
+        descripcionSafe,
+        idUsuario,
+        moduloSafe,
+        tablaAfectadaSafe,
+        idRegistroSafe,
+        ipOrigen,
+        toJsonParam(datosAntes),
+        toJsonParam(datosDespues)
+      ]
     );
   }
 };
@@ -655,7 +754,11 @@ const personaService = {
       accion: 'PERSONA_CREAR',
       descripcion: `Persona creada: ${payload.nombre ?? 'sin_nombre'}`,
       idUsuario,
-      capabilities
+      capabilities,
+      req,
+      modulo: 'PERSONAS',
+      tablaAfectada: 'personas',
+      datosDespues: payload
     });
 
     return {
@@ -741,18 +844,53 @@ const personaService = {
       }
     }
 
-    if (capabilities.hasUpdatedBy && idUsuario) {
-      updateData.updated_by = idUsuario;
+    if (capabilities.hasUpdatedBy && idUsuario) updateData.updated_by = idUsuario;
+
+    const changedEntries = Object.entries(updateData).filter(([field, newValue]) =>
+      valuesDiffer(getCurrentValueForField(current, field), newValue)
+    );
+
+    const updateDataFiltered = Object.fromEntries(changedEntries);
+    if (!Object.keys(updateDataFiltered).length) {
+      return {
+        status: 200,
+        body: {
+          error: false,
+          message: 'No se detectaron cambios para actualizar',
+          data: current
+        }
+      };
     }
 
-    const resultado = await personaRepository.update(idPersona, updateData);
-    const camposActualizados = Object.keys(updateData).join(', ');
+    if (capabilities.hasUpdatedBy && idUsuario && !Object.prototype.hasOwnProperty.call(updateDataFiltered, 'updated_by')) {
+      updateDataFiltered.updated_by = idUsuario;
+    }
+
+    const resultado = await personaRepository.update(idPersona, updateDataFiltered);
+    const changedEntriesForAudit = changedEntries.filter(([field]) => field !== 'updated_by');
+    const camposActualizados = changedEntriesForAudit.map(([field]) => field).join(', ');
+    const datosAntes = changedEntriesForAudit.reduce((acc, [field]) => {
+      acc[field] = getCurrentValueForField(current, field) ?? null;
+      return acc;
+    }, {});
+    const datosDespues = changedEntriesForAudit.reduce((acc, [field, value]) => {
+      acc[field] = value ?? null;
+      return acc;
+    }, {});
+    const auditDatosAntes = Object.keys(datosAntes).length ? datosAntes : null;
+    const auditDatosDespues = Object.keys(datosDespues).length ? datosDespues : null;
 
     await personaRepository.addAuditLog({
       accion: 'PERSONA_ACTUALIZAR',
-      descripcion: `Persona ${idPersona} actualizada: ${camposActualizados}`,
+      descripcion: `Persona ${idPersona} actualizada: ${camposActualizados || 'sin cambios detectados'}`,
       idUsuario,
-      capabilities
+      capabilities,
+      req,
+      modulo: 'PERSONAS',
+      tablaAfectada: 'personas',
+      idRegistro: idPersona,
+      datosAntes: auditDatosAntes,
+      datosDespues: auditDatosDespues
     });
 
     return {
@@ -802,7 +940,12 @@ const personaService = {
       accion: 'PERSONA_ELIMINAR',
       descripcion: `Persona ${idPersona} eliminada. Modo: ${capabilities.softDeleteField ? 'soft' : 'hard'}`,
       idUsuario,
-      capabilities
+      capabilities,
+      req,
+      modulo: 'PERSONAS',
+      tablaAfectada: 'personas',
+      idRegistro: idPersona,
+      datosAntes: current
     });
 
     return { status: 200, body: { error: false, message } };

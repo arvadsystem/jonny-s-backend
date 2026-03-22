@@ -13,6 +13,7 @@ import pool from '../../config/db-connection.js';
 import { closeSession } from '../../utils/security/sessionService.js';
 import { checkPermission, isRequestUserSuperAdmin } from '../../middleware/checkPermission.js';
 import { timestampAsHNToISO } from '../../utils/dates.js';
+import { insertSecurityAuditLog } from './auditLogger.js';
 
 const router = express.Router();
 
@@ -35,6 +36,14 @@ const clampInt = (value, def, min, max) => {
 };
 
 const toHNISO = (val) => timestampAsHNToISO(val);
+
+const logSecurityEvent = async (payload) => {
+  try {
+    await insertSecurityAuditLog(payload);
+  } catch (auditErr) {
+    console.error('Audit log error (sesiones):', auditErr);
+  }
+};
 
 /**
  * Construye cláusula de búsqueda con placeholders.
@@ -151,6 +160,21 @@ router.post(
     }
 
     await closeSession(id_sesion, 'cierre_remoto');
+
+    await logSecurityEvent({
+      req,
+      actorId: user.id_usuario,
+      accion: 'CERRAR_SESION',
+      objetivo: { tabla_afectada: 'sesiones_activas' },
+      descripcion: `Usuario ${user.id_usuario} cerro una sesion remota`,
+      detalle: {
+        actor_id: user.id_usuario,
+        id_sesion,
+        sid_actual: user.sid || null,
+        motivo_cierre: 'cierre_remoto'
+      }
+    });
+
     return res.json({ error: false, message: 'Sesión cerrada' });
   } catch (err) {
     console.error('POST /seguridad/sesiones/cerrar error:', err);
@@ -187,6 +211,21 @@ router.post(
     `;
 
     const result = await pool.query(sql, [user.id_usuario, user.sid]);
+
+    await logSecurityEvent({
+      req,
+      actorId: user.id_usuario,
+      accion: 'CERRAR_OTRAS_SESIONES',
+      objetivo: { tabla_afectada: 'usuarios', id_registro: user.id_usuario },
+      descripcion: `Usuario ${user.id_usuario} cerro otras sesiones`,
+      detalle: {
+        actor_id: user.id_usuario,
+        cerradas: result.rowCount,
+        sid_actual: user.sid || null,
+        motivo_cierre: 'cierre_otras'
+      }
+    });
+
     return res.json({
       error: false,
       message: 'Otras sesiones cerradas',
@@ -344,6 +383,7 @@ router.post(
             motivo_cierre = 'cierre_individual_superadmin'
         WHERE id_sesion = $1
           AND activa = TRUE
+        RETURNING id_usuario, id_sesion
       `;
 
       const result = await pool.query(sql, [id_sesion]);
@@ -356,6 +396,22 @@ router.post(
         }
         return res.status(409).json({ error: true, message: 'La sesión ya está cerrada' });
       }
+
+      const targetUserId = result.rows?.[0]?.id_usuario ?? null;
+
+      await logSecurityEvent({
+        req,
+        actorId: user.id_usuario,
+        accion: 'CERRAR_SESION_GLOBAL',
+        objetivo: { tabla_afectada: 'usuarios', id_registro: targetUserId },
+        descripcion: 'SuperAdmin ' + user.id_usuario + ' cerro sesion global',
+        detalle: {
+          actor_id: user.id_usuario,
+          target_user_id: targetUserId,
+          id_sesion,
+          motivo_cierre: 'cierre_individual_superadmin'
+        }
+      });
 
       return res.json({
         error: false,
@@ -404,6 +460,21 @@ router.post(
       `;
 
       const result = await pool.query(sql, [user.sid]);
+
+      await logSecurityEvent({
+        req,
+        actorId: user.id_usuario,
+        accion: 'CERRAR_SESIONES_GLOBALES',
+        objetivo: { tabla_afectada: 'sesiones_activas' },
+        descripcion: `SuperAdmin ${user.id_usuario} cerro sesiones globales`,
+        detalle: {
+          actor_id: user.id_usuario,
+          cerradas: result.rowCount,
+          sid_actual: user.sid || null,
+          motivo_cierre: 'cierre_global_superadmin'
+        }
+      });
+
       return res.json({
         error: false,
         message: 'Sesiones globales cerradas (menos la actual)',

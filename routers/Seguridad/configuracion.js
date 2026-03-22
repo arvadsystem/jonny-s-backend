@@ -7,6 +7,7 @@ import express from 'express';
 import pool from '../../config/db-connection.js';
 
 import { checkPermission } from '../../middleware/checkPermission.js';
+import { insertSecurityAuditLog } from './auditLogger.js';
 
 const router = express.Router();
 
@@ -47,6 +48,7 @@ router.put('/configuracion/password', checkPermission('SEGURIDAD_CONFIG_EDITAR')
   const client = await pool.connect();
 
   try {
+    const actor = req.user || req.usuario;
     const allowedKeys = new Set([
       'password_min_length',
       'password_require_upper',
@@ -85,6 +87,25 @@ router.put('/configuracion/password', checkPermission('SEGURIDAD_CONFIG_EDITAR')
       }
     }
 
+    const currentPoliciesRes = await client.query(
+      `
+      SELECT clave, valor
+      FROM configuracion_sistema
+      WHERE clave = ANY($1::text[])
+      `,
+      [entries.map(([clave]) => clave)]
+    );
+
+    const datosAntes = {};
+    for (const row of currentPoliciesRes.rows) {
+      datosAntes[row.clave] = row.valor;
+    }
+
+    const datosDespues = {};
+    for (const [clave, valorRaw] of entries) {
+      datosDespues[clave] = String(valorRaw);
+    }
+
     await client.query('BEGIN');
 
     for (const [clave, valorRaw] of entries) {
@@ -102,6 +123,25 @@ router.put('/configuracion/password', checkPermission('SEGURIDAD_CONFIG_EDITAR')
     }
 
     await client.query('COMMIT');
+
+    try {
+      await insertSecurityAuditLog({
+        req,
+        actorId: actor?.id_usuario ?? null,
+        accion: 'ACTUALIZAR_POLITICAS_PASSWORD',
+        objetivo: { tabla_afectada: 'configuracion_sistema' },
+        descripcion: `Usuario ${actor?.id_usuario ?? 'N/A'} actualizo politicas de password`,
+        detalle: {
+          actor_id: actor?.id_usuario ?? null,
+          claves_actualizadas: Object.keys(datosDespues),
+          total_cambios: Object.keys(datosDespues).length
+        },
+        datosAntes,
+        datosDespues
+      });
+    } catch (auditErr) {
+      console.error('Audit log error (configuracion/password):', auditErr);
+    }
 
     return res.json({ error: false, message: 'Políticas actualizadas correctamente' });
   } catch (err) {
