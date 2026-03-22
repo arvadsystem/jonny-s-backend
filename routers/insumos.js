@@ -4,6 +4,9 @@ import { attachImagenPrincipalUrls } from '../utils/uploads.js';
 
 const router = express.Router();
 const SQLSTATE_UNDEFINED_TABLE = '42P01';
+const INSUMOS_DUPLICATE_CONSTRAINT = 'uq_insumos_nombre_categoria_unidad_norm';
+const INSUMOS_DUPLICATE_MESSAGE = 'Ya existe un insumo con el mismo nombre, categoría y unidad de medida.';
+const SINGLE_ALMACEN_TEMP_MESSAGE = 'Temporalmente solo se permite un almacén por producto o insumo.';
 
 // AM: allowlist de campos permitidos para alta/edicion controlada de insumos.
 // AM: mantiene payload legacy (`id_almacen`) y habilita `id_almacenes` para asignacion multi-sucursal.
@@ -119,6 +122,9 @@ const parseIdAlmacenes = (rawSingle, rawMulti) => {
     if (!out.includes(parsed)) out.push(parsed);
   }
 
+  if (out.length > 1) {
+    return { ok: false, message: SINGLE_ALMACEN_TEMP_MESSAGE };
+  }
   if (out.length > 0) return { ok: true, ids: out };
 
   const parsedSingle = Number.parseInt(String(rawSingle ?? '').trim(), 10);
@@ -142,6 +148,13 @@ const toDateOnlyString = (value) => {
 // WHY: alinear manejo de errores con UX y evitar detalles internos.
 // IMPACT: no cambia contratos exitosos ni status codes de validacion.
 const safeServerErrorMessage = (fallback = 'No se pudo completar la accion. Verifica los datos e intenta de nuevo.') => fallback;
+
+const getInsumosConstraintConflictMessage = (err) => {
+  if (!err || err.code !== '23505') return '';
+  const trace = String(err?.constraint || err?.detail || err?.message || '').toLowerCase();
+  if (!trace.includes(INSUMOS_DUPLICATE_CONSTRAINT.toLowerCase())) return '';
+  return INSUMOS_DUPLICATE_MESSAGE;
+};
 
 // NEW: helper para validar `id_categoria_insumo` y asegurar que exista/este activa.
 // WHY: evitar guardar insumos apuntando a categorias inexistentes o inactivas.
@@ -215,6 +228,33 @@ const validateArchivoImagen = async (rawArchivoId, db = pool) => {
   }
 
   return { ok: true, id: archivoId };
+};
+
+const validateAlmacenActivo = async (rawAlmacenId, db = pool) => {
+  const almacenId = Number.parseInt(String(rawAlmacenId ?? ''), 10);
+  if (!isPositiveIntegerId(almacenId)) {
+    return { ok: false, status: 400, message: 'id_almacen debe ser un entero mayor a 0.' };
+  }
+
+  const result = await db.query(
+    `
+      SELECT id_almacen, COALESCE(estado, true) AS estado
+      FROM almacenes
+      WHERE id_almacen = $1
+      LIMIT 1
+    `,
+    [almacenId]
+  );
+
+  if (result.rowCount === 0) {
+    return { ok: false, status: 400, message: `id_almacen ${almacenId} no existe en almacenes.` };
+  }
+
+  if (!Boolean(result.rows?.[0]?.estado)) {
+    return { ok: false, status: 400, message: 'El almacen seleccionado esta inactivo.' };
+  }
+
+  return { ok: true, id: almacenId };
 };
 
 // NEW: actualiza FKs opcionales a SQL NULL real sin pasar por `pa_update`.
@@ -363,6 +403,7 @@ const syncInsumoAlmacenes = async (idInsumo, idAlmacenes, db = pool) => {
   if (uniqueIds.length === 0) return;
 
   const primaryAlmacen = uniqueIds[0];
+  const singleAlmacenIds = [primaryAlmacen];
   await db.query('UPDATE public.insumos SET id_almacen = $1 WHERE id_insumo = $2', [primaryAlmacen, idInsumo]);
 
   try {
@@ -372,7 +413,7 @@ const syncInsumoAlmacenes = async (idInsumo, idAlmacenes, db = pool) => {
         SELECT $1, UNNEST($2::int[])
         ON CONFLICT (id_insumo, id_almacen) DO NOTHING
       `,
-      [idInsumo, uniqueIds]
+      [idInsumo, singleAlmacenIds]
     );
 
     await db.query(
@@ -381,7 +422,7 @@ const syncInsumoAlmacenes = async (idInsumo, idAlmacenes, db = pool) => {
         WHERE id_insumo = $1
           AND id_almacen <> ALL($2::int[])
       `,
-      [idInsumo, uniqueIds]
+      [idInsumo, singleAlmacenIds]
     );
   } catch (error) {
     // AM: fallback legacy cuando la tabla de asignaciones aun no existe.
@@ -465,21 +506,19 @@ const updateInsumoCompleto = async (insumoId, data, db = pool) => {
      SET
       nombre_insumo = $1,
       precio = $2,
-      cantidad = $3,
-      stock_minimo = $4,
-      fecha_ingreso_insumo = $5,
-      id_almacen = $6,
-      id_categoria_insumo = $7,
-      id_unidad_medida = $8,
-      fecha_caducidad = $9,
-      descripcion = $10,
-      estado = $11,
-      id_archivo_imagen_principal = $12
-     WHERE id_insumo = $13`,
+      stock_minimo = $3,
+      fecha_ingreso_insumo = $4,
+      id_almacen = $5,
+      id_categoria_insumo = $6,
+      id_unidad_medida = $7,
+      fecha_caducidad = $8,
+      descripcion = $9,
+      estado = $10,
+      id_archivo_imagen_principal = $11
+     WHERE id_insumo = $12`,
     [
       data.nombre_insumo,
       data.precio,
-      data.cantidad,
       data.stock_minimo,
       data.fecha_ingreso_insumo || null,
       data.id_almacen,
@@ -598,15 +637,12 @@ router.post('/insumos', async (req, res) => {
     await client.query('BEGIN');
 
     for (const idAlmacen of idAlmacenes) {
-      const existeAlmacen = await client.query(
-        'SELECT 1 FROM almacenes WHERE id_almacen = $1 LIMIT 1',
-        [idAlmacen]
-      );
-      if (existeAlmacen.rowCount === 0) {
+      const almacenValidation = await validateAlmacenActivo(idAlmacen, client);
+      if (!almacenValidation.ok) {
         await client.query('ROLLBACK');
         return res.status(400).json({
           error: true,
-          message: `id_almacen ${idAlmacen} no existe en almacenes.`
+          message: almacenValidation.message
         });
       }
     }
@@ -624,7 +660,7 @@ router.post('/insumos', async (req, res) => {
       await client.query('ROLLBACK');
       return res.status(409).json({
         error: true,
-        message: 'Ya existe un insumo general con el mismo nombre/categoria/unidad. Edita su asignacion de almacenes.'
+        message: INSUMOS_DUPLICATE_MESSAGE
       });
     }
 
@@ -663,6 +699,13 @@ router.post('/insumos', async (req, res) => {
   } catch (err) {
     try { await client.query('ROLLBACK'); } catch {}
     console.error('Error al crear insumo:', err.message);
+    if (err?.code === '23505') {
+      const duplicateMessage = getInsumosConstraintConflictMessage(err);
+      if (duplicateMessage) {
+        return res.status(409).json({ error: true, message: duplicateMessage });
+      }
+      return res.status(409).json({ error: true, message: 'No se pudo crear el insumo por una restriccion de datos.' });
+    }
     res.status(500).json({ error: true, message: safeServerErrorMessage() });
   } finally {
     client.release();
@@ -683,9 +726,19 @@ router.put('/insumos/multi-almacen', async (req, res) => {
     if (!actual) {
       return res.status(404).json({ error: true, message: 'Insumo no encontrado.' });
     }
+    if (!isRowActive(actual)) {
+      return res.status(400).json({ error: true, message: 'El insumo esta inactivo.' });
+    }
 
     const datosEntrada = req.body && typeof req.body === 'object' ? { ...req.body } : {};
     delete datosEntrada.id_insumo;
+
+    if (Object.prototype.hasOwnProperty.call(datosEntrada, 'cantidad')) {
+      return res.status(400).json({
+        error: true,
+        message: 'La cantidad no puede editarse desde este módulo. Use movimientos de inventario.'
+      });
+    }
 
     const keys = Object.keys(datosEntrada);
     const keysDesconocidas = keys.filter((k) => !CAMPOS_PERMITIDOS_INSUMOS_POST.has(k));
@@ -699,7 +752,7 @@ router.put('/insumos/multi-almacen', async (req, res) => {
     const merged = {
       nombre_insumo: datosEntrada.nombre_insumo ?? actual.nombre_insumo,
       precio: datosEntrada.precio ?? actual.precio,
-      cantidad: datosEntrada.cantidad ?? actual.cantidad,
+      cantidad: actual.cantidad,
       stock_minimo: datosEntrada.stock_minimo ?? actual.stock_minimo ?? 0,
       fecha_ingreso_insumo: datosEntrada.fecha_ingreso_insumo ?? toDateOnlyString(actual.fecha_ingreso_insumo),
       id_almacen: datosEntrada.id_almacen ?? actual.id_almacen,
@@ -719,7 +772,7 @@ router.put('/insumos/multi-almacen', async (req, res) => {
         : actual.id_archivo_imagen_principal
     };
 
-    const required = ['nombre_insumo', 'precio', 'cantidad', 'stock_minimo'];
+    const required = ['nombre_insumo', 'precio', 'stock_minimo'];
     const faltantes = required.filter((campo) => {
       const raw = merged[campo];
       return raw === undefined || raw === null || String(raw).trim() === '';
@@ -785,14 +838,11 @@ router.put('/insumos/multi-almacen', async (req, res) => {
     const idAlmacenes = almacenesParse.ids;
 
     for (const idAlmacen of idAlmacenes) {
-      const existeAlmacen = await client.query(
-        'SELECT 1 FROM almacenes WHERE id_almacen = $1 LIMIT 1',
-        [idAlmacen]
-      );
-      if (existeAlmacen.rowCount === 0) {
+      const almacenValidation = await validateAlmacenActivo(idAlmacen, client);
+      if (!almacenValidation.ok) {
         return res.status(400).json({
           error: true,
-          message: `id_almacen ${idAlmacen} no existe en almacenes.`
+          message: almacenValidation.message
         });
       }
     }
@@ -827,7 +877,7 @@ router.put('/insumos/multi-almacen', async (req, res) => {
       await client.query('ROLLBACK');
       return res.status(409).json({
         error: true,
-        message: 'Ya existe otro insumo general con el mismo nombre/categoria/unidad.'
+        message: INSUMOS_DUPLICATE_MESSAGE
       });
     }
 
@@ -845,6 +895,13 @@ router.put('/insumos/multi-almacen', async (req, res) => {
   } catch (err) {
     try { await client.query('ROLLBACK'); } catch {}
     console.error('Error en PUT /insumos/multi-almacen:', err.message);
+    if (err?.code === '23505') {
+      const duplicateMessage = getInsumosConstraintConflictMessage(err);
+      if (duplicateMessage) {
+        return res.status(409).json({ error: true, message: duplicateMessage });
+      }
+      return res.status(409).json({ error: true, message: 'No se pudo actualizar el insumo por una restriccion de datos.' });
+    }
     return res.status(500).json({ error: true, message: safeServerErrorMessage() });
   } finally {
     client.release();
@@ -858,6 +915,13 @@ router.put('/insumos', async (req, res) => {
 
     if (!campo || valor === undefined || !id_campo || id_valor === undefined) {
       return res.status(400).json({ error: true, message: 'Faltan campos obligatorios' });
+    }
+
+    if (campo === 'cantidad') {
+      return res.status(400).json({
+        error: true,
+        message: 'La cantidad no puede editarse desde este módulo. Use movimientos de inventario.'
+      });
     }
 
     // NEW: valida categoria de insumo solo cuando se intenta actualizar ese campo.
@@ -901,6 +965,27 @@ router.put('/insumos', async (req, res) => {
       valorNormalizado = archivoValidation.id;
     }
 
+    if (campo === 'id_almacen') {
+      const idInsumo = Number.parseInt(String(id_valor ?? ''), 10);
+      if (!isPositiveIntegerId(idInsumo)) {
+        return res.status(400).json({ error: true, message: 'id_valor debe ser un entero mayor a 0.' });
+      }
+
+      const insumoActual = await getInsumoById(idInsumo, pool);
+      if (!insumoActual) {
+        return res.status(404).json({ error: true, message: 'Insumo no encontrado.' });
+      }
+      if (!isRowActive(insumoActual)) {
+        return res.status(400).json({ error: true, message: 'El insumo esta inactivo.' });
+      }
+
+      const almacenValidation = await validateAlmacenActivo(valorNormalizado, pool);
+      if (!almacenValidation.ok) {
+        return res.status(almacenValidation.status || 400).json({ error: true, message: almacenValidation.message });
+      }
+      valorNormalizado = almacenValidation.id;
+    }
+
     // NEW: cuando una FK opcional se limpia, se persiste `NULL` real para mantener coherencia con la BD.
     // WHY: corrige el bug de quitar imagen y evita el mismo fallo en categoria/unidad opcionales.
     // IMPACT: los clientes siguen usando el mismo payload `valor: null`; solo cambia la persistencia interna.
@@ -924,6 +1009,13 @@ router.put('/insumos', async (req, res) => {
 
   } catch (err) {
     console.error('Error al actualizar insumo:', err.message);
+    if (err?.code === '23505') {
+      const duplicateMessage = getInsumosConstraintConflictMessage(err);
+      if (duplicateMessage) {
+        return res.status(409).json({ error: true, message: duplicateMessage });
+      }
+      return res.status(409).json({ error: true, message: 'No se pudo actualizar el insumo por una restriccion de datos.' });
+    }
     res.status(500).json({ error: true, message: safeServerErrorMessage() });
   }
 });

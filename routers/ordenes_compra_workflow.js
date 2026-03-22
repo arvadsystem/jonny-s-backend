@@ -325,7 +325,7 @@ const acquireOcVisibleNumberLock = async (queryRunner = pool) => {
   await queryRunner.query('SELECT pg_advisory_xact_lock($1)', [OC_VISIBLE_NUMBER_LOCK_KEY]);
 };
 
-// AM: calcula el menor correlativo visible disponible considerando ocupados solo estados no rechazados.
+// AM: calcula el menor correlativo visible disponible considerando ocupados solo estados activos del flujo.
 const getNextVisibleOrderNumber = async (queryRunner = pool) => {
   const result = await queryRunner.query(
     `
@@ -333,7 +333,7 @@ const getNextVisibleOrderNumber = async (queryRunner = pool) => {
         SELECT DISTINCT oc.numero_oc_visible AS n
         FROM public.orden_compras oc
         WHERE oc.numero_oc_visible IS NOT NULL
-          AND UPPER(COALESCE(oc.estado_flujo, '')) <> $1
+          AND UPPER(COALESCE(oc.estado_flujo, '')) NOT IN ($1, $2)
       ),
       candidatos AS (
         SELECT generate_series(
@@ -346,10 +346,46 @@ const getNextVisibleOrderNumber = async (queryRunner = pool) => {
       LEFT JOIN usados u ON u.n = c.n
       WHERE u.n IS NULL
     `,
-    [ESTADO_RECHAZADA]
+    [ESTADO_RECHAZADA, ESTADO_CANCELADA]
   );
 
   return parsePositiveInt(result.rows?.[0]?.siguiente_numero) || 1;
+};
+
+// AM: calcula solo para las OC solicitadas el numero visible compacto del flujo, sin renumerar PK ni escribir en BD.
+const getVisibleFlowOrderNumberMap = async (orderIds, queryRunner = pool) => {
+  const safeOrderIds = Array.from(
+    new Set((Array.isArray(orderIds) ? orderIds : []).map((value) => parsePositiveInt(value)).filter(Boolean))
+  );
+
+  if (safeOrderIds.length === 0) return new Map();
+
+  const result = await queryRunner.query(
+    `
+      WITH ranked AS (
+        SELECT
+          oc.id_orden_compra,
+          ROW_NUMBER() OVER (
+            ORDER BY
+              COALESCE(NULLIF(to_jsonb(oc)->>'fecha_creacion', '')::timestamp, oc.fecha::timestamp),
+              oc.id_orden_compra
+          )::int AS numero_oc_visible_flujo
+        FROM public.orden_compras oc
+        WHERE UPPER(COALESCE(oc.estado_flujo, '')) NOT IN ($1, $2)
+      )
+      SELECT ranked.id_orden_compra, ranked.numero_oc_visible_flujo
+      FROM ranked
+      WHERE ranked.id_orden_compra = ANY($3::int[])
+    `,
+    [ESTADO_RECHAZADA, ESTADO_CANCELADA, safeOrderIds]
+  );
+
+  return new Map(
+    (result.rows || []).map((row) => [
+      Number(row.id_orden_compra),
+      parsePositiveInt(row.numero_oc_visible_flujo) || null
+    ])
+  );
 };
 
 const getOrderById = async (idOrdenCompra, queryRunner = pool) => {
@@ -986,23 +1022,28 @@ const validateCreateItemsExistence = async (details, queryRunner = pool) => {
   if (almacenIds.length > 0) {
     const almacenRows = await queryRunner.query(
       `
-        SELECT a.id_almacen
+        SELECT a.id_almacen, COALESCE(a.estado, true) AS estado
         FROM public.almacenes a
         WHERE a.id_almacen = ANY($1::int[])
       `,
       [almacenIds]
     );
 
-    const almacenSet = new Set(almacenRows.rows.map((row) => Number(row.id_almacen)));
+    const almacenMap = new Map(
+      almacenRows.rows.map((row) => [Number(row.id_almacen), Boolean(row.estado)])
+    );
     for (const idAlmacen of almacenIds) {
-      if (!almacenSet.has(idAlmacen)) {
+      if (!almacenMap.has(idAlmacen)) {
         return { ok: false, message: `El almacen destino ${idAlmacen} no existe.` };
+      }
+      if (!almacenMap.get(idAlmacen)) {
+        return { ok: false, message: `El almacen destino ${idAlmacen} esta inactivo.` };
       }
     }
   }
 
-  // AM: valida que cada item este asignado al almacen destino seleccionado.
-  // AM: fallback legacy cuando aun no existen tablas *_almacenes: se usa columna id_almacen del item.
+  // AM: valida que cada item pertenezca al almacen principal real (`id_almacen`) seleccionado.
+  // AM: evita depender de asignaciones multi-almacen en pivotes mientras el modelo temporal es 1 almacen por item.
   for (const detail of details) {
     const idAlmacenDestino = parsePositiveInt(detail?.id_almacen_destino);
     if (!idAlmacenDestino) {
@@ -1014,9 +1055,9 @@ const validateCreateItemsExistence = async (details, queryRunner = pool) => {
         const assigned = await queryRunner.query(
           `
             SELECT 1
-            FROM public.productos_almacenes pa
-            WHERE pa.id_producto = $1
-              AND pa.id_almacen = $2
+            FROM public.productos p
+            WHERE p.id_producto = $1
+              AND p.id_almacen = $2
             LIMIT 1
           `,
           [detail.id_item, idAlmacenDestino]
@@ -1031,9 +1072,9 @@ const validateCreateItemsExistence = async (details, queryRunner = pool) => {
         const assigned = await queryRunner.query(
           `
             SELECT 1
-            FROM public.insumos_almacenes ia
-            WHERE ia.id_insumo = $1
-              AND ia.id_almacen = $2
+            FROM public.insumos i
+            WHERE i.id_insumo = $1
+              AND i.id_almacen = $2
             LIMIT 1
           `,
           [detail.id_item, idAlmacenDestino]
@@ -1596,10 +1637,20 @@ router.get('/orden_compras/workflow', checkPermission(PERM_OC_VIEW), async (req,
       );
     }
 
+        const visibleFlowOrderNumberMap = await getVisibleFlowOrderNumberMap(
+      (rowsResult.rows || []).map((row) => row.id_orden_compra)
+    );
+
+    const rowsWithVisibleFlowNumber = (rowsResult.rows || []).map((row) => ({
+      ...row,
+      // AM: correlativo compacto solo para visualizacion del flujo; no toca el id interno.
+      numero_oc_visible_flujo: parsePositiveInt(visibleFlowOrderNumberMap.get(Number(row.id_orden_compra))) || null
+    }));
+
     const canViewAdminData = await canUserViewAdminOrderData(req, idUsuario);
     const rowsPayload = canViewAdminData
-      ? rowsResult.rows || []
-      : (rowsResult.rows || []).map((row) => sanitizeWorkflowListRowForOperative(row));
+      ? rowsWithVisibleFlowNumber
+      : rowsWithVisibleFlowNumber.map((row) => sanitizeWorkflowListRowForOperative(row));
 
     return res.status(200).json({
       ok: true,
@@ -1636,12 +1687,21 @@ router.get('/orden_compras/workflow/:id_orden_compra', checkPermission(PERM_OC_V
       return sendError(res, 403, 'FORBIDDEN', 'No tienes permiso para ver esta orden.');
     }
 
+        const visibleFlowOrderNumberMap = await getVisibleFlowOrderNumberMap([idOrdenCompra]);
+    const orderRowWithVisibleFlowNumber = {
+      ...orderRow,
+      // AM: numero compacto visible para detalle/modal sin reusar el id tecnico.
+      numero_oc_visible_flujo: parsePositiveInt(visibleFlowOrderNumberMap.get(Number(idOrdenCompra))) || null
+    };
+
     const canViewAdminData = await canUserViewAdminOrderData(req, idUsuario);
     const compraActual = canViewAdminData ? await getLatestCompraByOrden(idOrdenCompra) : null;
     const detallesRaw = await getOrderDetails(idOrdenCompra, compraActual?.id_compra || null);
     const detalles = canViewAdminData ? detallesRaw : sanitizeOrderDetailsForOperative(detallesRaw);
     const solicitudesItem = await getOrderItemRequests(idOrdenCompra);
-    const ordenPayload = canViewAdminData ? orderRow : sanitizeOrderForOperativeDetail(orderRow);
+    const ordenPayload = canViewAdminData
+      ? orderRowWithVisibleFlowNumber
+      : sanitizeOrderForOperativeDetail(orderRowWithVisibleFlowNumber);
 
     return res.status(200).json({
       ok: true,
@@ -2752,6 +2812,8 @@ router.post('/orden_compras/workflow/:id_orden_compra/convertir', checkPermissio
           doc.id_almacen_destino,
           p.id_producto AS producto_existente,
           i.id_insumo AS insumo_existente,
+          COALESCE(p.estado, true) AS producto_activo,
+          COALESCE(i.estado, true) AS insumo_activo,
           COALESCE(p.precio, i.precio, 0)::numeric AS precio_referencia,
           COALESCE(p.id_almacen, i.id_almacen) AS id_almacen_item,
           dc_prev.sub_total AS sub_total_compra_prev,
@@ -2785,6 +2847,28 @@ router.post('/orden_compras/workflow/:id_orden_compra/convertir', checkPermissio
       return sendError(res, 409, 'CONFLICT', 'La orden no tiene detalles para continuar.');
     }
 
+    const detailWarehouseIds = Array.from(
+      new Set(
+        details
+          .map((detail) => parsePositiveInt(detail.id_almacen_destino) || parsePositiveInt(detail.id_almacen_item))
+          .filter((id) => Number.isInteger(id) && id > 0)
+      )
+    );
+    const detailWarehouseMap = new Map();
+    if (detailWarehouseIds.length > 0) {
+      const warehouseRows = await client.query(
+        `
+          SELECT id_almacen, COALESCE(estado, true) AS estado
+          FROM public.almacenes
+          WHERE id_almacen = ANY($1::int[])
+        `,
+        [detailWarehouseIds]
+      );
+      for (const row of warehouseRows.rows || []) {
+        detailWarehouseMap.set(Number(row.id_almacen), Boolean(row.estado));
+      }
+    }
+
     const detailOverridesMap = parsedDetailOverrides.map;
     let subTotalBruto = 0;
     let descuentoLineas = 0;
@@ -2814,6 +2898,18 @@ router.post('/orden_compras/workflow/:id_orden_compra/convertir', checkPermissio
           `El producto asociado al detalle ${idDetalleOrden} ya no existe.`
         );
       }
+      if (
+        detail.id_producto &&
+        !(detail.producto_activo === true || detail.producto_activo === 1 || detail.producto_activo === '1')
+      ) {
+        await withRollback(client);
+        return sendError(
+          res,
+          409,
+          'CONFLICT',
+          `El producto asociado al detalle ${idDetalleOrden} esta inactivo.`
+        );
+      }
 
       if (detail.id_insumo && !detail.insumo_existente) {
         await withRollback(client);
@@ -2822,6 +2918,18 @@ router.post('/orden_compras/workflow/:id_orden_compra/convertir', checkPermissio
           409,
           'CONFLICT',
           `El insumo asociado al detalle ${idDetalleOrden} ya no existe.`
+        );
+      }
+      if (
+        detail.id_insumo &&
+        !(detail.insumo_activo === true || detail.insumo_activo === 1 || detail.insumo_activo === '1')
+      ) {
+        await withRollback(client);
+        return sendError(
+          res,
+          409,
+          'CONFLICT',
+          `El insumo asociado al detalle ${idDetalleOrden} esta inactivo.`
         );
       }
 
@@ -2833,6 +2941,24 @@ router.post('/orden_compras/workflow/:id_orden_compra/convertir', checkPermissio
           409,
           'CONFLICT',
           `El detalle ${idDetalleOrden} no tiene almacen destino valido.`
+        );
+      }
+      if (!detailWarehouseMap.has(idAlmacenDestino)) {
+        await withRollback(client);
+        return sendError(
+          res,
+          409,
+          'CONFLICT',
+          `El detalle ${idDetalleOrden} referencia un almacen destino que no existe.`
+        );
+      }
+      if (!detailWarehouseMap.get(idAlmacenDestino)) {
+        await withRollback(client);
+        return sendError(
+          res,
+          409,
+          'CONFLICT',
+          `El almacen destino del detalle ${idDetalleOrden} esta inactivo.`
         );
       }
 
@@ -3416,6 +3542,33 @@ router.post('/orden_compras/workflow/:id_orden_compra/abastecer', checkPermissio
 
       const idAlmacenDestino = parsePositiveInt(row.id_almacen_destino);
       if (idAlmacenDestino) {
+        const warehouseResult = await client.query(
+          `
+            SELECT COALESCE(estado, true) AS estado
+            FROM public.almacenes
+            WHERE id_almacen = $1
+            LIMIT 1
+          `,
+          [idAlmacenDestino]
+        );
+        if (warehouseResult.rowCount === 0) {
+          await withRollback(client);
+          return sendError(
+            res,
+            409,
+            'CONFLICT',
+            `El almacen destino ${idAlmacenDestino} no existe para abastecer.`
+          );
+        }
+        if (!Boolean(warehouseResult.rows?.[0]?.estado)) {
+          await withRollback(client);
+          return sendError(
+            res,
+            409,
+            'CONFLICT',
+            `El almacen destino ${idAlmacenDestino} esta inactivo.`
+          );
+        }
         idAlmacen = idAlmacenDestino;
       }
 
@@ -3423,7 +3576,7 @@ router.post('/orden_compras/workflow/:id_orden_compra/abastecer', checkPermissio
         if (!idAlmacen) {
           const productRow = await client.query(
             `
-              SELECT id_almacen
+              SELECT id_almacen, COALESCE(estado, true) AS estado
               FROM public.productos
               WHERE id_producto = $1
               LIMIT 1
@@ -3434,6 +3587,10 @@ router.post('/orden_compras/workflow/:id_orden_compra/abastecer', checkPermissio
             await withRollback(client);
             return sendError(res, 409, 'CONFLICT', `Producto ${row.id_producto} no existe para abastecer.`);
           }
+          if (!Boolean(productRow.rows?.[0]?.estado)) {
+            await withRollback(client);
+            return sendError(res, 409, 'CONFLICT', `El producto ${row.id_producto} esta inactivo.`);
+          }
           idAlmacen = parsePositiveInt(productRow.rows?.[0]?.id_almacen);
         }
         idProducto = Number(row.id_producto);
@@ -3441,7 +3598,7 @@ router.post('/orden_compras/workflow/:id_orden_compra/abastecer', checkPermissio
         if (!idAlmacen) {
           const insumoRow = await client.query(
             `
-              SELECT id_almacen
+              SELECT id_almacen, COALESCE(estado, true) AS estado
               FROM public.insumos
               WHERE id_insumo = $1
               LIMIT 1
@@ -3451,6 +3608,10 @@ router.post('/orden_compras/workflow/:id_orden_compra/abastecer', checkPermissio
           if (insumoRow.rowCount === 0) {
             await withRollback(client);
             return sendError(res, 409, 'CONFLICT', `Insumo ${row.id_insumo} no existe para abastecer.`);
+          }
+          if (!Boolean(insumoRow.rows?.[0]?.estado)) {
+            await withRollback(client);
+            return sendError(res, 409, 'CONFLICT', `El insumo ${row.id_insumo} esta inactivo.`);
           }
           idAlmacen = parsePositiveInt(insumoRow.rows?.[0]?.id_almacen);
         }
@@ -3467,6 +3628,34 @@ router.post('/orden_compras/workflow/:id_orden_compra/abastecer', checkPermissio
           409,
           'CONFLICT',
           `No se pudo determinar el almacen del item en detalle ${row.id_detalle_compra}.`
+        );
+      }
+
+      const storedWarehouse = await client.query(
+        `
+          SELECT COALESCE(estado, true) AS estado
+          FROM public.almacenes
+          WHERE id_almacen = $1
+          LIMIT 1
+        `,
+        [idAlmacen]
+      );
+      if (storedWarehouse.rowCount === 0) {
+        await withRollback(client);
+        return sendError(
+          res,
+          409,
+          'CONFLICT',
+          `No se encontro el almacen ${idAlmacen} para abastecer el detalle ${row.id_detalle_compra}.`
+        );
+      }
+      if (!Boolean(storedWarehouse.rows?.[0]?.estado)) {
+        await withRollback(client);
+        return sendError(
+          res,
+          409,
+          'CONFLICT',
+          `El almacen ${idAlmacen} esta inactivo y no puede abastecer el detalle ${row.id_detalle_compra}.`
         );
       }
 

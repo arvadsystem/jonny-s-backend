@@ -174,20 +174,24 @@ router.get('/almacenes', async (_req, res) => {
     const query = `
       WITH inventario_items AS (
         SELECT
-          p.id_almacen,
+          pa.id_almacen,
           p.id_producto AS item_id,
           p.cantidad,
           p.stock_minimo,
           p.estado
-        FROM public.productos p
+        FROM public.productos_almacenes pa
+        INNER JOIN public.productos p
+          ON p.id_producto = pa.id_producto
         UNION ALL
         SELECT
-          i.id_almacen,
+          ia.id_almacen,
           i.id_insumo AS item_id,
           i.cantidad,
           i.stock_minimo,
           i.estado
-        FROM public.insumos i
+        FROM public.insumos_almacenes ia
+        INNER JOIN public.insumos i
+          ON i.id_insumo = ia.id_insumo
       ),
       movimientos_hoy AS (
         SELECT
@@ -206,14 +210,14 @@ router.get('/almacenes', async (_req, res) => {
         GROUP BY m.id_almacen
       ),
       dep_productos AS (
-        SELECT p.id_almacen, COUNT(*)::int AS productos_count
-        FROM public.productos p
-        GROUP BY p.id_almacen
+        SELECT pa.id_almacen, COUNT(DISTINCT pa.id_producto)::int AS productos_count
+        FROM public.productos_almacenes pa
+        GROUP BY pa.id_almacen
       ),
       dep_insumos AS (
-        SELECT i.id_almacen, COUNT(*)::int AS insumos_count
-        FROM public.insumos i
-        GROUP BY i.id_almacen
+        SELECT ia.id_almacen, COUNT(DISTINCT ia.id_insumo)::int AS insumos_count
+        FROM public.insumos_almacenes ia
+        GROUP BY ia.id_almacen
       )
       SELECT
         a.id_almacen,

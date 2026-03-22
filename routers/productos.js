@@ -38,6 +38,9 @@ const CODIGO_SQL_OUT_OF_RANGE = '22003';
 // IMPACT: valida requests invalidos y responde 400 en lugar de dejar que fallen con 500.
 const MAX_INT32_DB_ID = 2147483647;
 const SQLSTATE_UNDEFINED_TABLE = '42P01';
+const PRODUCTOS_DUPLICATE_CONSTRAINT = 'uq_productos_nombre_categoria_departamento_norm';
+const PRODUCTOS_DUPLICATE_MESSAGE = 'Ya existe un producto con el mismo nombre, categoría y departamento.';
+const SINGLE_ALMACEN_TEMP_MESSAGE = 'Temporalmente solo se permite un almacén por producto o insumo.';
 // NEW: query param opt-in para incluir inactivos en listados administrativos.
 // WHY: el GET de productos debe devolver activos por defecto tras adoptar soft delete.
 // IMPACT: mantiene compatibilidad con `?incluir_inactivos=1` sin crear endpoint nuevo.
@@ -147,6 +150,9 @@ function parseIdAlmacenes(rawSingle, rawMulti) {
     if (!out.includes(parsed)) out.push(parsed);
   }
 
+  if (out.length > 1) {
+    return { ok: false, message: SINGLE_ALMACEN_TEMP_MESSAGE };
+  }
   if (out.length > 0) return { ok: true, ids: out };
 
   const parsedSingle = Number.parseInt(String(rawSingle ?? '').trim(), 10);
@@ -352,6 +358,28 @@ async function validarExistenciaFk(campo, valor, db = pool) {
   return true;
 }
 
+async function validarAlmacenOperativo(idAlmacen, db = pool) {
+  const r = await db.query(
+    `
+      SELECT id_almacen, COALESCE(estado, true) AS estado
+      FROM almacenes
+      WHERE id_almacen = $1
+      LIMIT 1
+    `,
+    [idAlmacen]
+  );
+
+  if (r.rowCount === 0) {
+    return { ok: false, message: `id_almacen ${idAlmacen} no existe en almacenes.` };
+  }
+
+  if (!Boolean(r.rows?.[0]?.estado)) {
+    return { ok: false, message: 'El almacen seleccionado esta inactivo.' };
+  }
+
+  return { ok: true };
+}
+
 // NUEVO: existencia de producto para respuesta 404 en PUT
 async function existeProductoPorId(idProducto) {
   const r = await pool.query(
@@ -477,6 +505,7 @@ async function syncProductoAlmacenes(idProducto, idAlmacenes, db = pool) {
   if (uniqueIds.length === 0) return;
 
   const primaryAlmacen = uniqueIds[0];
+  const singleAlmacenIds = [primaryAlmacen];
   await db.query('UPDATE public.productos SET id_almacen = $1 WHERE id_producto = $2', [primaryAlmacen, idProducto]);
 
   try {
@@ -486,7 +515,7 @@ async function syncProductoAlmacenes(idProducto, idAlmacenes, db = pool) {
         SELECT $1, UNNEST($2::int[])
         ON CONFLICT (id_producto, id_almacen) DO NOTHING
       `,
-      [idProducto, uniqueIds]
+      [idProducto, singleAlmacenIds]
     );
 
     await db.query(
@@ -495,7 +524,7 @@ async function syncProductoAlmacenes(idProducto, idAlmacenes, db = pool) {
         WHERE id_producto = $1
           AND id_almacen <> ALL($2::int[])
       `,
-      [idProducto, uniqueIds]
+      [idProducto, singleAlmacenIds]
     );
   } catch (error) {
     // AM: fallback legacy cuando la tabla de asignaciones aun no existe.
@@ -581,21 +610,19 @@ async function updateProductoCompleto(idProducto, data, db = pool) {
      SET
        nombre_producto = $1,
        precio = $2,
-       cantidad = $3,
-       stock_minimo = $4,
-       descripcion_producto = $5,
-       fecha_ingreso_producto = $6,
-       fecha_caducidad = $7,
-       id_categoria_producto = $8,
-       id_almacen = $9,
-       id_tipo_departamento = $10,
-       estado = $11,
-       id_archivo_imagen_principal = $12
-     WHERE id_producto = $13`,
+       stock_minimo = $3,
+       descripcion_producto = $4,
+       fecha_ingreso_producto = $5,
+       fecha_caducidad = $6,
+       id_categoria_producto = $7,
+       id_almacen = $8,
+       id_tipo_departamento = $9,
+       estado = $10,
+       id_archivo_imagen_principal = $11
+     WHERE id_producto = $12`,
     [
       data.nombre_producto,
       data.precio,
-      data.cantidad,
       data.stock_minimo,
       data.descripcion_producto || '',
       data.fecha_ingreso_producto || null,
@@ -636,6 +663,13 @@ async function updateProductoFieldToNull(idProducto, campo) {
 // NUEVO: helper para clasificar errores SQL de constraint como conflicto
 function esErrorConflictoConstraint(err) {
   return Boolean(err?.code && CODIGOS_CONFLICTO_CONSTRAINT.has(err.code));
+}
+
+function getProductosConstraintConflictMessage(err) {
+  if (!err || err.code !== '23505') return '';
+  const trace = String(err?.constraint || err?.detail || err?.message || '').toLowerCase();
+  if (!trace.includes(PRODUCTOS_DUPLICATE_CONSTRAINT.toLowerCase())) return '';
+  return PRODUCTOS_DUPLICATE_MESSAGE;
 }
 
 // NEW: sanitiza mensajes internos de BD para respuestas HTTP del router de Productos.
@@ -790,12 +824,12 @@ router.post('/productos', async (req, res) => {
     await client.query('BEGIN');
 
     for (const idAlmacen of idAlmacenes) {
-      const existeAlmacen = await validarExistenciaFk('id_almacen', idAlmacen, client);
-      if (!existeAlmacen) {
+      const almacenOperativo = await validarAlmacenOperativo(idAlmacen, client);
+      if (!almacenOperativo.ok) {
         await client.query('ROLLBACK');
         return res.status(400).json({
           error: true,
-          message: `id_almacen ${idAlmacen} no existe en almacenes.`
+          message: almacenOperativo.message
         });
       }
     }
@@ -813,7 +847,7 @@ router.post('/productos', async (req, res) => {
       await client.query('ROLLBACK');
       return res.status(409).json({
         error: true,
-        message: 'Ya existe un producto general con el mismo nombre/categoria/departamento. Edita su asignacion de almacenes.'
+        message: PRODUCTOS_DUPLICATE_MESSAGE
       });
     }
 
@@ -861,7 +895,7 @@ router.post('/productos', async (req, res) => {
     if (esErrorConflictoConstraint(err)) {
       return res.status(409).json({
         error: true,
-        message: 'No se pudo crear el producto por una restriccion de datos.'
+        message: getProductosConstraintConflictMessage(err) || 'No se pudo crear el producto por una restriccion de datos.'
       });
     }
 
@@ -885,9 +919,19 @@ router.put('/productos/multi-almacen', async (req, res) => {
     if (!actual) {
       return res.status(404).json({ error: true, message: 'Producto no encontrado.' });
     }
+    if (!isRowActive(actual)) {
+      return res.status(400).json({ error: true, message: 'El producto esta inactivo.' });
+    }
 
     const datosEntrada = req.body && typeof req.body === 'object' ? { ...req.body } : {};
     delete datosEntrada.id_producto;
+
+    if (Object.prototype.hasOwnProperty.call(datosEntrada, 'cantidad')) {
+      return res.status(400).json({
+        error: true,
+        message: 'La cantidad no puede editarse desde este módulo. Use movimientos de inventario.'
+      });
+    }
 
     const keys = Object.keys(datosEntrada);
     const keysDesconocidas = keys.filter((k) => !CAMPOS_PERMITIDOS_PRODUCTOS_POST.has(k));
@@ -901,7 +945,7 @@ router.put('/productos/multi-almacen', async (req, res) => {
     const merged = {
       nombre_producto: datosEntrada.nombre_producto ?? actual.nombre_producto,
       precio: datosEntrada.precio ?? actual.precio,
-      cantidad: datosEntrada.cantidad ?? actual.cantidad,
+      cantidad: actual.cantidad,
       stock_minimo: datosEntrada.stock_minimo ?? actual.stock_minimo ?? 0,
       descripcion_producto: datosEntrada.descripcion_producto ?? actual.descripcion_producto ?? '',
       fecha_ingreso_producto: datosEntrada.fecha_ingreso_producto ?? toDateOnlyString(actual.fecha_ingreso_producto),
@@ -931,7 +975,7 @@ router.put('/productos/multi-almacen', async (req, res) => {
       datosNormalizados[campo] = resultado.valor;
     }
 
-    const camposRequeridos = ['nombre_producto', 'precio', 'cantidad', 'stock_minimo', 'id_categoria_producto'];
+    const camposRequeridos = ['nombre_producto', 'precio', 'stock_minimo', 'id_categoria_producto'];
     const faltantes = camposRequeridos.filter((campo) => !Object.prototype.hasOwnProperty.call(datosNormalizados, campo));
     if (faltantes.length > 0) {
       return res.status(400).json({
@@ -985,11 +1029,11 @@ router.put('/productos/multi-almacen', async (req, res) => {
     }
 
     for (const idAlmacen of idAlmacenes) {
-      const existeAlmacen = await validarExistenciaFk('id_almacen', idAlmacen, client);
-      if (!existeAlmacen) {
+      const almacenOperativo = await validarAlmacenOperativo(idAlmacen, client);
+      if (!almacenOperativo.ok) {
         return res.status(400).json({
           error: true,
-          message: `id_almacen ${idAlmacen} no existe en almacenes.`
+          message: almacenOperativo.message
         });
       }
     }
@@ -1010,7 +1054,7 @@ router.put('/productos/multi-almacen', async (req, res) => {
       await client.query('ROLLBACK');
       return res.status(409).json({
         error: true,
-        message: 'Ya existe otro producto general con el mismo nombre/categoria/departamento.'
+        message: PRODUCTOS_DUPLICATE_MESSAGE
       });
     }
 
@@ -1031,7 +1075,7 @@ router.put('/productos/multi-almacen', async (req, res) => {
     if (esErrorConflictoConstraint(err)) {
       return res.status(409).json({
         error: true,
-        message: 'No se pudo sincronizar el producto por una restriccion de datos.'
+        message: getProductosConstraintConflictMessage(err) || 'No se pudo sincronizar el producto por una restriccion de datos.'
       });
     }
     return res.status(500).json({ error: true, message: getSafeProductosServerErrorMessage(err) });
@@ -1062,6 +1106,13 @@ router.put('/productos', async (req, res) => {
       return res.status(400).json({
         error: true,
         message: `Campo no permitido para actualizar: ${campo}`
+      });
+    }
+
+    if (campo === 'cantidad') {
+      return res.status(400).json({
+        error: true,
+        message: 'La cantidad no puede editarse desde este módulo. Use movimientos de inventario.'
       });
     }
 
@@ -1101,11 +1152,25 @@ router.put('/productos', async (req, res) => {
 
     // VALIDACION: FK almacen si se actualiza
     if (campo === 'id_almacen') {
-      const existeAlmacen = await validarExistenciaFk('id_almacen', resultado.valor);
-      if (!existeAlmacen) {
+      const productoActual = await getProductoById(idProducto, pool);
+      if (!productoActual) {
+        return res.status(404).json({
+          error: true,
+          message: 'Producto no encontrado.'
+        });
+      }
+      if (!isRowActive(productoActual)) {
         return res.status(400).json({
           error: true,
-          message: 'id_almacen no existe en almacenes.'
+          message: 'El producto esta inactivo.'
+        });
+      }
+
+      const almacenOperativo = await validarAlmacenOperativo(resultado.valor);
+      if (!almacenOperativo.ok) {
+        return res.status(400).json({
+          error: true,
+          message: almacenOperativo.message
         });
       }
     }
@@ -1156,7 +1221,7 @@ router.put('/productos', async (req, res) => {
     if (esErrorConflictoConstraint(err)) {
       return res.status(409).json({
         error: true,
-        message: 'No se pudo actualizar el producto por una restriccion de datos.'
+        message: getProductosConstraintConflictMessage(err) || 'No se pudo actualizar el producto por una restriccion de datos.'
       });
     }
 

@@ -167,6 +167,7 @@ const normalizeMovimientoPayload = (payload) => {
   const errors = [];
 
   const tipoResult = parseOptionalTipo(payload?.tipo);
+  if (!tipoResult.provided) errors.push('tipo es obligatorio.');
   if (tipoResult.error) errors.push(tipoResult.error);
   const tipo = tipoResult.value;
 
@@ -190,8 +191,10 @@ const normalizeMovimientoPayload = (payload) => {
 
   const hasProducto = productoResult.provided;
   const hasInsumo = insumoResult.provided;
-  if (hasProducto === hasInsumo) {
-    errors.push('Debe enviar exactamente uno entre id_producto o id_insumo.');
+  if (hasProducto && hasInsumo) {
+    errors.push('No puede enviar id_producto e id_insumo al mismo tiempo.');
+  } else if (!hasProducto && !hasInsumo) {
+    errors.push('Debe enviar id_producto o id_insumo.');
   }
 
   const idRefResult = parseOptionalPositiveInt(payload?.id_ref, 'id_ref');
@@ -263,6 +266,68 @@ const getKardexRowByMovimientoId = async (client, idMovimiento) => {
   );
 
   return result.rows[0] || null;
+};
+
+const validateOperationalEntities = async ({ id_almacen, id_producto, id_insumo }, db = pool) => {
+  const almacenResult = await db.query(
+    `
+      SELECT id_almacen, COALESCE(estado, true) AS estado
+      FROM public.almacenes
+      WHERE id_almacen = $1
+      LIMIT 1
+    `,
+    [id_almacen]
+  );
+
+  if (almacenResult.rowCount === 0) {
+    return { ok: false, status: 400, code: 'VALIDATION_ERROR', message: 'EL ALMACEN SELECCIONADO NO EXISTE.' };
+  }
+
+  if (!Boolean(almacenResult.rows?.[0]?.estado)) {
+    return { ok: false, status: 400, code: 'VALIDATION_ERROR', message: 'El almacen seleccionado esta inactivo.' };
+  }
+
+  if (id_producto) {
+    const productoResult = await db.query(
+      `
+        SELECT id_producto, COALESCE(estado, true) AS estado
+        FROM public.productos
+        WHERE id_producto = $1
+        LIMIT 1
+      `,
+      [id_producto]
+    );
+
+    if (productoResult.rowCount === 0) {
+      return { ok: false, status: 400, code: 'VALIDATION_ERROR', message: 'EL PRODUCTO SELECCIONADO NO EXISTE.' };
+    }
+
+    if (!Boolean(productoResult.rows?.[0]?.estado)) {
+      return { ok: false, status: 400, code: 'VALIDATION_ERROR', message: 'El producto esta inactivo.' };
+    }
+  }
+
+  if (id_insumo) {
+    const insumoResult = await db.query(
+      `
+        SELECT id_insumo, COALESCE(estado, true) AS estado
+        FROM public.insumos
+        WHERE id_insumo = $1
+        LIMIT 1
+      `,
+      [id_insumo]
+    );
+
+    if (insumoResult.rowCount === 0) {
+      return { ok: false, status: 400, code: 'VALIDATION_ERROR', message: 'EL INSUMO SELECCIONADO NO EXISTE.' };
+    }
+
+    if (!Boolean(insumoResult.rows?.[0]?.estado)) {
+      return { ok: false, status: 400, code: 'VALIDATION_ERROR', message: 'El insumo esta inactivo.' };
+    }
+  }
+
+  return { ok: true };
 };
 
 // NEW: TRADUCE ERRORES DE POSTGRES/TRIGGERS A MENSAJES DE DOMINIO MAS CLAROS.
@@ -451,6 +516,23 @@ router.post('/movimientos_inventario', async (req, res) => {
     const normalized = normalizeMovimientoPayload(req.body || {});
     if (!normalized.ok) {
       return sendValidationError(res, normalized.errors[0], normalized.errors);
+    }
+
+    const operationalValidation = await validateOperationalEntities(
+      {
+        id_almacen: normalized.values.id_almacen,
+        id_producto: normalized.values.id_producto,
+        id_insumo: normalized.values.id_insumo
+      },
+      pool
+    );
+    if (!operationalValidation.ok) {
+      return sendError(
+        res,
+        operationalValidation.status || 400,
+        operationalValidation.code || 'VALIDATION_ERROR',
+        operationalValidation.message || 'No se pudo registrar el movimiento.'
+      );
     }
 
     const createdId = await insertMovimiento(pool, {
