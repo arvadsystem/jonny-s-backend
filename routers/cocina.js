@@ -1,6 +1,6 @@
 import express from 'express';
 import pool from '../config/db-connection.js';
-
+import { isRequestUserSuperAdmin } from '../middleware/checkPermission.js';
 const router = express.Router();
 
 const ESTADO_PEDIDO_CODES = {
@@ -177,12 +177,22 @@ router.get('/cocina/pedidos', async (req, res) => {
         return res.status(200).json([]);
       }
 
-      const requestedSucursalId =
+      let requestedSucursalId =
         req.query.id_sucursal === undefined || req.query.id_sucursal === ''
           ? null
           : parsePositiveInt(req.query.id_sucursal);
       if (req.query.id_sucursal !== undefined && req.query.id_sucursal !== '' && !requestedSucursalId) {
         return res.status(400).json({ error: true, message: 'id_sucursal invalido.' });
+      }
+
+      const isSuperAdmin = await isRequestUserSuperAdmin(req);
+      const userSucursalId = parsePositiveInt(req.user?.id_sucursal);
+
+      if (!isSuperAdmin) {
+        if (!userSucursalId) {
+          return res.status(403).json({ error: true, message: 'El empleado no tiene sucursal asignada.' });
+        }
+        requestedSucursalId = userSucursalId; // Forzamos la sucursal del empleado
       }
 
       const requestedEstado = req.query.estado
