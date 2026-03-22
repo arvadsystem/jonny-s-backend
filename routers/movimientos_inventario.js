@@ -22,6 +22,26 @@ const hasValue = (value) =>
   value !== null &&
   !(typeof value === 'string' && value.trim() === '');
 
+const sendError = (res, status, code, message, extra = {}) =>
+  res.status(status).json({
+    ok: false,
+    error: true,
+    code,
+    message,
+    ...extra
+  });
+
+const sendValidationError = (res, message, details) =>
+  sendError(res, 400, 'VALIDATION_ERROR', message, details ? { details } : {});
+
+const sendConflictError = (res, message) =>
+  sendError(res, 409, 'CONFLICT', message);
+
+const sendInternalError = (res, context, error) => {
+  console.error(`[movimientos_inventario] ${context}:`, error);
+  return sendError(res, 500, 'INTERNAL_ERROR', 'No se pudo completar la operacion solicitada.');
+};
+
 const isPositiveIntegerId = (value) => Number.isSafeInteger(value) && value > 0;
 
 const isNonNegativeInteger = (value) => Number.isSafeInteger(value) && value >= 0;
@@ -108,8 +128,19 @@ const parseOptionalDate = (rawValue, fieldName) => {
     };
   }
 
-  const parsedDate = new Date(`${normalizedValue}T00:00:00Z`);
-  if (Number.isNaN(parsedDate.getTime())) {
+  const [yearRaw, monthRaw, dayRaw] = normalizedValue.split('-');
+  const year = Number(yearRaw);
+  const month = Number(monthRaw);
+  const day = Number(dayRaw);
+
+  // FIX IMPORTANTE: valida fecha calendario real para evitar casos como 2024-02-31 que JS autocorrige.
+  const parsedDate = new Date(Date.UTC(year, month - 1, day));
+  const isSameCalendarDate =
+    parsedDate.getUTCFullYear() === year &&
+    parsedDate.getUTCMonth() === month - 1 &&
+    parsedDate.getUTCDate() === day;
+
+  if (!isSameCalendarDate) {
     return {
       provided: true,
       value: null,
@@ -136,6 +167,7 @@ const normalizeMovimientoPayload = (payload) => {
   const errors = [];
 
   const tipoResult = parseOptionalTipo(payload?.tipo);
+  if (!tipoResult.provided) errors.push('tipo es obligatorio.');
   if (tipoResult.error) errors.push(tipoResult.error);
   const tipo = tipoResult.value;
 
@@ -159,8 +191,10 @@ const normalizeMovimientoPayload = (payload) => {
 
   const hasProducto = productoResult.provided;
   const hasInsumo = insumoResult.provided;
-  if (hasProducto === hasInsumo) {
-    errors.push('Debe enviar exactamente uno entre id_producto o id_insumo.');
+  if (hasProducto && hasInsumo) {
+    errors.push('No puede enviar id_producto e id_insumo al mismo tiempo.');
+  } else if (!hasProducto && !hasInsumo) {
+    errors.push('Debe enviar id_producto o id_insumo.');
   }
 
   const idRefResult = parseOptionalPositiveInt(payload?.id_ref, 'id_ref');
@@ -234,6 +268,68 @@ const getKardexRowByMovimientoId = async (client, idMovimiento) => {
   return result.rows[0] || null;
 };
 
+const validateOperationalEntities = async ({ id_almacen, id_producto, id_insumo }, db = pool) => {
+  const almacenResult = await db.query(
+    `
+      SELECT id_almacen, COALESCE(estado, true) AS estado
+      FROM public.almacenes
+      WHERE id_almacen = $1
+      LIMIT 1
+    `,
+    [id_almacen]
+  );
+
+  if (almacenResult.rowCount === 0) {
+    return { ok: false, status: 400, code: 'VALIDATION_ERROR', message: 'EL ALMACEN SELECCIONADO NO EXISTE.' };
+  }
+
+  if (!Boolean(almacenResult.rows?.[0]?.estado)) {
+    return { ok: false, status: 400, code: 'VALIDATION_ERROR', message: 'El almacen seleccionado esta inactivo.' };
+  }
+
+  if (id_producto) {
+    const productoResult = await db.query(
+      `
+        SELECT id_producto, COALESCE(estado, true) AS estado
+        FROM public.productos
+        WHERE id_producto = $1
+        LIMIT 1
+      `,
+      [id_producto]
+    );
+
+    if (productoResult.rowCount === 0) {
+      return { ok: false, status: 400, code: 'VALIDATION_ERROR', message: 'EL PRODUCTO SELECCIONADO NO EXISTE.' };
+    }
+
+    if (!Boolean(productoResult.rows?.[0]?.estado)) {
+      return { ok: false, status: 400, code: 'VALIDATION_ERROR', message: 'El producto esta inactivo.' };
+    }
+  }
+
+  if (id_insumo) {
+    const insumoResult = await db.query(
+      `
+        SELECT id_insumo, COALESCE(estado, true) AS estado
+        FROM public.insumos
+        WHERE id_insumo = $1
+        LIMIT 1
+      `,
+      [id_insumo]
+    );
+
+    if (insumoResult.rowCount === 0) {
+      return { ok: false, status: 400, code: 'VALIDATION_ERROR', message: 'EL INSUMO SELECCIONADO NO EXISTE.' };
+    }
+
+    if (!Boolean(insumoResult.rows?.[0]?.estado)) {
+      return { ok: false, status: 400, code: 'VALIDATION_ERROR', message: 'El insumo esta inactivo.' };
+    }
+  }
+
+  return { ok: true };
+};
+
 // NEW: TRADUCE ERRORES DE POSTGRES/TRIGGERS A MENSAJES DE DOMINIO MAS CLAROS.
 // WHY: EL KARDEX USA TRIGGERS/REGLAS DE BD Y EL FRONT NECESITA FEEDBACK ENTENDIBLE.
 // IMPACT: FALLAS DE STOCK, FK O VALIDACIONES DEL TRIGGER BAJAN COMO 400 CON MENSAJE LEGIBLE.
@@ -242,24 +338,37 @@ const normalizeMovimientoDbError = (error) => {
   const lowerMessage = rawMessage.toLowerCase();
 
   if (error?.code === 'P0001') {
-    return { status: 400, message: rawMessage || 'NO SE PUDO REGISTRAR EL MOVIMIENTO.' };
+    if (
+      lowerMessage.includes('stock insuficiente') ||
+      lowerMessage.includes('pertenece a otro almacen') ||
+      lowerMessage.includes('pertenece a otro almac') ||
+      lowerMessage.includes('no pertenece al almacen')
+    ) {
+      return {
+        status: 409,
+        code: 'CONFLICT',
+        message: 'No se pudo registrar el movimiento por conflicto de stock o de almacen.'
+      };
+    }
+
+    return { status: 400, code: 'VALIDATION_ERROR', message: 'No se pudo registrar el movimiento.' };
   }
 
   if (error?.code === '23503') {
     if (lowerMessage.includes('id_almacen')) {
-      return { status: 400, message: 'EL ALMACEN SELECCIONADO NO EXISTE.' };
+      return { status: 400, code: 'VALIDATION_ERROR', message: 'EL ALMACEN SELECCIONADO NO EXISTE.' };
     }
     if (lowerMessage.includes('id_producto')) {
-      return { status: 400, message: 'EL PRODUCTO SELECCIONADO NO EXISTE.' };
+      return { status: 400, code: 'VALIDATION_ERROR', message: 'EL PRODUCTO SELECCIONADO NO EXISTE.' };
     }
     if (lowerMessage.includes('id_insumo')) {
-      return { status: 400, message: 'EL INSUMO SELECCIONADO NO EXISTE.' };
+      return { status: 400, code: 'VALIDATION_ERROR', message: 'EL INSUMO SELECCIONADO NO EXISTE.' };
     }
-    return { status: 400, message: 'EL MOVIMIENTO REFERENCIA DATOS QUE NO EXISTEN.' };
+    return { status: 400, code: 'VALIDATION_ERROR', message: 'EL MOVIMIENTO REFERENCIA DATOS QUE NO EXISTEN.' };
   }
 
   if (error?.code === '23514' || error?.code === '22003' || error?.code === '22P02') {
-    return { status: 400, message: rawMessage || 'LOS DATOS DEL MOVIMIENTO SON INVALIDOS.' };
+    return { status: 400, code: 'VALIDATION_ERROR', message: 'LOS DATOS DEL MOVIMIENTO SON INVALIDOS.' };
   }
 
   if (
@@ -268,7 +377,11 @@ const normalizeMovimientoDbError = (error) => {
     lowerMessage.includes('pertenece a otro almac') ||
     lowerMessage.includes('no pertenece al almacen')
   ) {
-    return { status: 400, message: rawMessage };
+    return {
+      status: 409,
+      code: 'CONFLICT',
+      message: 'No se pudo registrar el movimiento por conflicto de stock o de almacen.'
+    };
   }
 
   return null;
@@ -279,12 +392,12 @@ router.get('/movimientos_inventario', async (req, res) => {
   try {
     const idAlmacenFilter = parseOptionalPositiveInt(req.query?.id_almacen, 'id_almacen');
     if (idAlmacenFilter.error) {
-      return res.status(400).json({ error: true, message: idAlmacenFilter.error });
+      return sendValidationError(res, idAlmacenFilter.error);
     }
 
     const idSucursalFilter = parseOptionalPositiveInt(req.query?.id_sucursal, 'id_sucursal');
     if (idSucursalFilter.error) {
-      return res.status(400).json({ error: true, message: idSucursalFilter.error });
+      return sendValidationError(res, idSucursalFilter.error);
     }
 
     const query = `
@@ -309,8 +422,7 @@ router.get('/movimientos_inventario', async (req, res) => {
     const result = await pool.query(query, [idAlmacenFilter.value, idSucursalFilter.value]);
     res.status(200).json(result.rows || []);
   } catch (error) {
-    console.error('Error al obtener movimientos_inventario:', error.message);
-    res.status(500).json({ error: true, message: error.message });
+    return sendInternalError(res, 'Error al obtener movimientos_inventario', error);
   }
 });
 
@@ -319,41 +431,41 @@ router.get('/kardex', async (req, res) => {
   try {
     const idAlmacenFilter = parseOptionalPositiveInt(req.query?.id_almacen, 'id_almacen');
     if (idAlmacenFilter.error) {
-      return res.status(400).json({ error: true, message: idAlmacenFilter.error });
+      return sendValidationError(res, idAlmacenFilter.error);
     }
 
     const idSucursalFilter = parseOptionalPositiveInt(req.query?.id_sucursal, 'id_sucursal');
     if (idSucursalFilter.error) {
-      return res.status(400).json({ error: true, message: idSucursalFilter.error });
+      return sendValidationError(res, idSucursalFilter.error);
     }
 
     const tipoFilter = parseOptionalTipo(req.query?.tipo);
     if (tipoFilter.error) {
-      return res.status(400).json({ error: true, message: tipoFilter.error });
+      return sendValidationError(res, tipoFilter.error);
     }
 
     const itemTipoFilter = parseOptionalItemTipo(req.query?.item_tipo);
     if (itemTipoFilter.error) {
-      return res.status(400).json({ error: true, message: itemTipoFilter.error });
+      return sendValidationError(res, itemTipoFilter.error);
     }
 
     const itemIdFilter = parseOptionalPositiveInt(req.query?.id_item, 'id_item');
     if (itemIdFilter.error) {
-      return res.status(400).json({ error: true, message: itemIdFilter.error });
+      return sendValidationError(res, itemIdFilter.error);
     }
 
     const desdeFilter = parseOptionalDate(req.query?.desde, 'desde');
     if (desdeFilter.error) {
-      return res.status(400).json({ error: true, message: desdeFilter.error });
+      return sendValidationError(res, desdeFilter.error);
     }
 
     const hastaFilter = parseOptionalDate(req.query?.hasta, 'hasta');
     if (hastaFilter.error) {
-      return res.status(400).json({ error: true, message: hastaFilter.error });
+      return sendValidationError(res, hastaFilter.error);
     }
 
     if (desdeFilter.value && hastaFilter.value && desdeFilter.value > hastaFilter.value) {
-      return res.status(400).json({ error: true, message: 'desde no puede ser mayor que hasta.' });
+      return sendValidationError(res, 'desde no puede ser mayor que hasta.');
     }
 
     const textFilter = parseOptionalText(req.query?.q);
@@ -394,8 +506,7 @@ router.get('/kardex', async (req, res) => {
 
     res.status(200).json(result.rows || []);
   } catch (error) {
-    console.error('Error al obtener kardex:', error.message);
-    res.status(500).json({ error: true, message: error.message });
+    return sendInternalError(res, 'Error al obtener kardex', error);
   }
 });
 
@@ -404,7 +515,24 @@ router.post('/movimientos_inventario', async (req, res) => {
   try {
     const normalized = normalizeMovimientoPayload(req.body || {});
     if (!normalized.ok) {
-      return res.status(400).json({ error: true, message: normalized.errors[0], details: normalized.errors });
+      return sendValidationError(res, normalized.errors[0], normalized.errors);
+    }
+
+    const operationalValidation = await validateOperationalEntities(
+      {
+        id_almacen: normalized.values.id_almacen,
+        id_producto: normalized.values.id_producto,
+        id_insumo: normalized.values.id_insumo
+      },
+      pool
+    );
+    if (!operationalValidation.ok) {
+      return sendError(
+        res,
+        operationalValidation.status || 400,
+        operationalValidation.code || 'VALIDATION_ERROR',
+        operationalValidation.message || 'No se pudo registrar el movimiento.'
+      );
     }
 
     const createdId = await insertMovimiento(pool, {
@@ -427,22 +555,24 @@ router.post('/movimientos_inventario', async (req, res) => {
   } catch (error) {
     const normalizedError = normalizeMovimientoDbError(error);
     if (normalizedError) {
-      return res.status(normalizedError.status).json({ error: true, message: normalizedError.message });
+      if (normalizedError.code === 'CONFLICT') {
+        return sendConflictError(res, normalizedError.message);
+      }
+      return sendError(res, normalizedError.status, normalizedError.code, normalizedError.message);
     }
 
-    console.error('Error al crear movimiento_inventario:', error.message);
-    res.status(500).json({ error: true, message: error.message });
+    return sendInternalError(res, 'Error al crear movimiento_inventario', error);
   }
 });
 
 // PUT: BLOQUEADO POR KARDEX APPEND-ONLY
 router.put('/movimientos_inventario', async (_req, res) => {
-  res.status(405).json({ error: true, message: APPEND_ONLY_MESSAGE });
+  res.status(405).json({ ok: false, error: true, code: 'METHOD_NOT_ALLOWED', message: APPEND_ONLY_MESSAGE });
 });
 
 // DELETE: BLOQUEADO POR KARDEX APPEND-ONLY
 router.delete('/movimientos_inventario', async (_req, res) => {
-  res.status(405).json({ error: true, message: APPEND_ONLY_MESSAGE });
+  res.status(405).json({ ok: false, error: true, code: 'METHOD_NOT_ALLOWED', message: APPEND_ONLY_MESSAGE });
 });
 
 export default router;

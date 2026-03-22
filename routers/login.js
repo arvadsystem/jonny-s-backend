@@ -174,11 +174,12 @@ router.post('/login', async (req, res) => {
       ubicacion: null
     });
 
-    // Payload actual (no lo rompemos)
+    // Payload actual
     const payload = {
       id_usuario: usuarioEncontrado.id_usuario,
       nombre_usuario: usuarioEncontrado.nombre_usuario,
       rol: usuarioEncontrado.id_empleado,
+      id_sucursal: usuarioEncontrado.id_sucursal, // <-- INYECTAR SUCURSAL
       must_change_password: resolveMustChangePassword(usuarioEncontrado),
       sid: id_sesion // HU79: id de sesión actual
     };
