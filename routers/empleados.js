@@ -1,8 +1,13 @@
 import express from 'express';
 import pool from '../config/db-connection.js';
-import { getClientIp } from '../utils/security/clientInfo.js';
+import { checkPermission } from '../middleware/checkPermission.js';
 
 const router = express.Router();
+const EMPLEADOS_LIST_PERMISSIONS = ['EMPLEADOS_LISTADO_VER'];
+const EMPLEADOS_DETAIL_PERMISSIONS = ['EMPLEADOS_DETALLE_VER'];
+const EMPLEADOS_CREATE_PERMISSIONS = ['EMPLEADOS_CREAR'];
+const EMPLEADOS_EDIT_PERMISSIONS = ['EMPLEADOS_EDITAR'];
+const EMPLEADOS_DELETE_PERMISSIONS = ['EMPLEADOS_ELIMINAR'];
 
 const MAX_LIMIT = 100;
 const BASE_FIELDS = ['id_empleado', 'fecha_ingreso', 'salario_base', 'estado', 'id_sucursal', 'id_persona'];
@@ -364,7 +369,10 @@ const empleadoService = {
     }
 
     const limit = Math.min(requestedLimit, MAX_LIMIT);
+    const search = typeof req.query.search === 'string' ? req.query.search.trim() : '';
+    const searchQuery = typeof req.query.q === 'string' ? req.query.q.trim() : '';
     const searchName = typeof req.query.nombre === 'string' ? req.query.nombre.trim() : '';
+    const effectiveSearch = search || searchQuery || searchName;
     const estado = parseBooleanFilter(req.query.estado);
 
     if (req.query.estado !== undefined && estado === null) {
@@ -383,7 +391,7 @@ const empleadoService = {
     const { data, total } = await empleadoRepository.list({
       page,
       limit,
-      searchName,
+      searchName: effectiveSearch,
       estado,
       tenantId,
       capabilities
@@ -625,27 +633,27 @@ const asyncHandler = (handler) => async (req, res) => {
 /* =======================
    GET - LISTAR EMPLEADOS
 ======================= */
-router.get('/empleados-detalle', asyncHandler(empleadoService.list));
-router.get('/empleados', asyncHandler(empleadoService.list));
+router.get('/empleados-detalle', checkPermission(EMPLEADOS_LIST_PERMISSIONS), asyncHandler(empleadoService.list));
+router.get('/empleados', checkPermission(EMPLEADOS_LIST_PERMISSIONS), asyncHandler(empleadoService.list));
 
 /* =======================
    GET - EMPLEADO POR ID
 ======================= */
-router.get('/empleados/:id', asyncHandler(empleadoService.getById));
+router.get('/empleados/:id', checkPermission(EMPLEADOS_DETAIL_PERMISSIONS), asyncHandler(empleadoService.getById));
 
 /* =======================
    POST - INSERTAR
 ======================= */
-router.post('/empleados', asyncHandler(empleadoService.create));
+router.post('/empleados', checkPermission(EMPLEADOS_CREATE_PERMISSIONS), asyncHandler(empleadoService.create));
 
 /* =======================
    PUT - ACTUALIZAR
 ======================= */
-router.put('/empleados/:id', asyncHandler(empleadoService.update));
+router.put('/empleados/:id', checkPermission(EMPLEADOS_EDIT_PERMISSIONS), asyncHandler(empleadoService.update));
 
 /* =======================
    DELETE - ELIMINAR
 ======================= */
-router.delete('/empleados/:id', asyncHandler(empleadoService.remove));
+router.delete('/empleados/:id', checkPermission(EMPLEADOS_DELETE_PERMISSIONS), asyncHandler(empleadoService.remove));
 
 export default router;
