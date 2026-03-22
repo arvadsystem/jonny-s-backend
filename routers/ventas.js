@@ -1,6 +1,6 @@
 import express from 'express';
 import pool from '../config/db-connection.js';
-import { checkPermission } from '../middleware/checkPermission.js';
+import { checkPermission, isRequestUserSuperAdmin } from '../middleware/checkPermission.js';
 
 const router = express.Router();
 
@@ -1116,6 +1116,27 @@ router.get('/ventas/catalogos/tipos-descuento', async (req, res) => {
   }
 });
 
+router.get('/ventas/catalogos/tipo-departamento', async (req, res) => {
+  try {
+    const result = await pool.query(
+      `
+        SELECT
+          td.id_tipo_departamento,
+          td.nombre_departamento,
+          td.descripcion,
+          td.estado
+        FROM tipo_departamento td
+        WHERE COALESCE(td.estado, true) = true
+        ORDER BY td.nombre_departamento
+      `
+    );
+    res.status(200).json(result.rows || []);
+  } catch (err) {
+    console.error('Error al listar tipos de departamento:', err.message);
+    res.status(500).json({ error: true, message: err.message });
+  }
+});
+
 router.get('/ventas/catalogos/descuentos', async (req, res) => {
   try {
     const result = await pool.query(
@@ -1236,17 +1257,9 @@ router.post('/ventas/descuentos-catalogos', checkPermission(VENTAS_DESCUENTOS_WR
       return res.status(validated.status).json({ error: true, message: validated.message });
     }
 
-    const nextId = await getNextTableId(
-      client,
-      'descuentos_catalogos',
-      'id_descuento_catalogo',
-      true
-    );
-
     const created = await client.query(
       `
         INSERT INTO descuentos_catalogos (
-          id_descuento_catalogo,
           nombre_descuento,
           descripcion,
           valor_descuento,
@@ -1255,11 +1268,10 @@ router.post('/ventas/descuentos-catalogos', checkPermission(VENTAS_DESCUENTOS_WR
           fecha_creacion,
           id_usuario
         )
-        VALUES ($1, $2, $3, $4, $5, $6, NOW(), $7)
+        VALUES ($1, $2, $3, $4, $5, NOW(), $6)
         RETURNING id_descuento_catalogo
       `,
       [
-        nextId,
         validated.data.nombre_descuento,
         validated.data.descripcion,
         validated.data.valor_descuento,
@@ -1387,8 +1399,18 @@ router.get('/ventas', async (req, res) => {
 
     const q = typeof req.query.q === 'string' ? req.query.q.trim() : '';
     const idEstadoPedido = parseOptionalPositiveInt(req.query.id_estado_pedido);
-    const idSucursal = parseOptionalPositiveInt(req.query.id_sucursal);
+    let idSucursal = parseOptionalPositiveInt(req.query.id_sucursal);
     const idCliente = parseOptionalPositiveInt(req.query.id_cliente);
+
+    const isSuperAdmin = await isRequestUserSuperAdmin(req);
+    const userSucursalId = parseOptionalPositiveInt(req.user?.id_sucursal);
+
+    if (!isSuperAdmin) {
+      if (!userSucursalId) {
+        return res.status(403).json({ error: true, message: 'El empleado no tiene sucursal asignada.' });
+      }
+      idSucursal = userSucursalId; // Forzamos la sucursal del empleado
+    }
 
     if (q) {
       const qLike = `%${q}%`;

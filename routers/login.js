@@ -113,7 +113,12 @@ router.post('/login', async (req, res) => {
   const { dispositivo, navegador, sistema_operativo } = parseUserAgent(user_agent);
 
   try {
-    const query = 'SELECT * FROM usuarios WHERE nombre_usuario = $1 AND clave = $2';
+    const query = `
+      SELECT u.*, e.id_sucursal 
+      FROM usuarios u 
+      LEFT JOIN empleados e ON u.id_empleado = e.id_empleado 
+      WHERE u.nombre_usuario = $1 AND u.clave = $2
+    `;
     const result = await pool.query(query, [nombre_usuario, clave]);
 
     // Login fallido: registrar intento
@@ -148,11 +153,12 @@ router.post('/login', async (req, res) => {
       ubicacion: null
     });
 
-    // Payload actual (no lo rompemos)
+    // Payload actual
     const payload = {
       id_usuario: usuarioEncontrado.id_usuario,
       nombre_usuario: usuarioEncontrado.nombre_usuario,
       rol: usuarioEncontrado.id_empleado,
+      id_sucursal: usuarioEncontrado.id_sucursal, // <-- INYECTAR SUCURSAL
       must_change_password: resolveMustChangePassword(usuarioEncontrado),
       sid: id_sesion // HU79: id de sesión actual
     };
