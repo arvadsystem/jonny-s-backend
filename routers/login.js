@@ -138,7 +138,12 @@ router.post('/login', async (req, res) => {
   const { dispositivo, navegador, sistema_operativo } = parseUserAgent(user_agent);
 
   try {
-    const query = 'SELECT * FROM usuarios WHERE nombre_usuario = $1 LIMIT 1';
+    const query = `
+      SELECT u.*, e.id_sucursal 
+      FROM usuarios u 
+      LEFT JOIN empleados e ON u.id_empleado = e.id_empleado 
+      WHERE u.nombre_usuario = $1 LIMIT 1
+    `;
     const result = await pool.query(query, [nombre_usuario]);
     const usuarioEncontrado = result.rows[0] || null;
     const passwordValida = await verifyLoginPassword(clave, usuarioEncontrado?.clave);
