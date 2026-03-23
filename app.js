@@ -5,6 +5,7 @@ import cookieParser from 'cookie-parser';
 import pool from './config/db-connection.js';
 
 import loginRoutes from './routers/login.js';
+import publicMenuRouter from './routers/public_menu/index.js';
 
 // ... tus otros routes
 import usuarioRoutes from './routers/usuarios.js';
@@ -99,6 +100,9 @@ app.get('/status', async (req, res) => {
 
 // ✅ Login debe ser público
 app.use(loginRoutes);
+
+// ✅ Menú público para clientes (sin sesión de dashboard/POS).
+app.use('/public-menu', publicMenuRouter);
 
 // ✅ 3) A partir de aquí: todo protegido
 app.use(authRequired);               // 1) valida JWT
