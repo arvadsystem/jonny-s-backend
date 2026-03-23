@@ -96,7 +96,7 @@ router.post('/', async (req, res) => {
       });
     }
 
-    const normalizacion = normalizarPayloadCombo(req.body);
+    const normalizacion = await normalizarPayloadCombo(req.body);
     if (!normalizacion.ok) {
       return res.status(400).json({ error: true, message: normalizacion.message });
     }
@@ -159,7 +159,7 @@ router.put('/:id_combo', async (req, res) => {
       return res.status(400).json({ error: true, message: detalleNormalizacion.message });
     }
 
-    const normalizacion = normalizarPayloadCombo(req.body);
+    const normalizacion = await normalizarPayloadCombo(req.body);
     if (!normalizacion.ok) {
       return res.status(400).json({ error: true, message: normalizacion.message });
     }
@@ -348,4 +348,3 @@ router.delete('/:id_combo/detalle/:id_detalle_combo', async (req, res) => {
 });
 
 export default router;
-

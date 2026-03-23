@@ -1,5 +1,6 @@
 import express from 'express';
 import pool from '../config/db-connection.js';
+import { resolveMenuDepartmentIds } from './menu_departamentos.js';
 
 const router = express.Router();
 
@@ -246,6 +247,16 @@ router.get('/menu-pos/catalogo-imagenes', async (req, res) => {
     }
 
     const productosTieneArchivo = await hasColumn('productos', 'id_archivo_imagen_principal');
+    const departmentIds = await resolveMenuDepartmentIds();
+    const recipeExcludedDepartmentIds = Array.isArray(departmentIds?.recipeExcludedDepartmentIds)
+      ? departmentIds.recipeExcludedDepartmentIds
+      : [];
+    const comboDepartmentId = Number.isInteger(departmentIds?.comboDepartmentId)
+      ? departmentIds.comboDepartmentId
+      : null;
+    const productDepartmentIds = Array.isArray(departmentIds?.productDepartmentIds)
+      ? departmentIds.productDepartmentIds
+      : [];
 
     const queryCatalogo = `
       SELECT
@@ -270,7 +281,7 @@ router.get('/menu-pos/catalogo-imagenes', async (req, res) => {
        AND (a_receta.estado = true OR a_receta.estado IS NULL)
       WHERE COALESCE(r.estado, true) = true
         AND r.id_tipo_departamento IS NOT NULL
-        AND r.id_tipo_departamento NOT IN (11, 12, 13, 14, 15, 19)
+        AND r.id_tipo_departamento <> ALL($2::INTEGER[])
         AND ($1::INTEGER IS NULL OR r.id_tipo_departamento = $1)
 
       UNION ALL
@@ -296,7 +307,7 @@ router.get('/menu-pos/catalogo-imagenes', async (req, res) => {
         ON a_combo.id_archivo = c.id_archivo
        AND (a_combo.estado = true OR a_combo.estado IS NULL)
       WHERE COALESCE(c.estado, true) = true
-        AND c.id_tipo_departamento = 19
+        AND ($3::INTEGER IS NOT NULL AND c.id_tipo_departamento = $3)
         AND ($1::INTEGER IS NULL OR c.id_tipo_departamento = $1)
 
       UNION ALL
@@ -324,12 +335,17 @@ router.get('/menu-pos/catalogo-imagenes', async (req, res) => {
        AND (a_producto.estado = true OR a_producto.estado IS NULL)`
         : ''}
       WHERE COALESCE(p.estado, true) = true
-        AND p.id_tipo_departamento IN (12, 13, 14, 15)
+        AND p.id_tipo_departamento = ANY($4::INTEGER[])
         AND ($1::INTEGER IS NULL OR p.id_tipo_departamento = $1)
       ORDER BY nombre_producto ASC;
     `;
 
-    const result = await pool.query(queryCatalogo, [idTipoDepartamento]);
+    const result = await pool.query(queryCatalogo, [
+      idTipoDepartamento,
+      recipeExcludedDepartmentIds,
+      comboDepartmentId,
+      productDepartmentIds
+    ]);
     const enrichedItems = await enrichCatalogItemsWithSauceConfig(result.rows);
 
     return res.status(200).json({

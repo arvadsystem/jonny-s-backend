@@ -1,4 +1,5 @@
 import pool from '../config/db-connection.js';
+import { resolveMenuDepartmentIds } from './menu_departamentos.js';
 
 // Allowlist de campos permitidos para crear/actualizar recetas.
 const CAMPOS_PERMITIDOS_RECETAS = new Set([
@@ -30,9 +31,6 @@ const CAMPOS_NULLABLES_RECETA = new Set(['descripcion', 'id_archivo']);
 
 // Codigos SQLSTATE de conflicto para mapear a HTTP 409.
 const CODIGOS_CONFLICTO_CONSTRAINT = new Set(['23503', '23505', '23514', '23502']);
-
-// Regla de negocio explicita: departamentos reservados para productos directos.
-const DEPARTAMENTOS_PRODUCTOS_RESERVADOS = new Set([12, 13, 14, 15]);
 
 // Query param opcional para incluir inactivos en listado admin.
 export const shouldIncludeInactive = (query) => String(query?.incluir_inactivos ?? '').trim() === '1';
@@ -266,8 +264,12 @@ async function existeArchivo(idArchivo) {
   return result.rowCount > 0;
 }
 
-function esDepartamentoDeProductos(idTipoDepartamento) {
-  return DEPARTAMENTOS_PRODUCTOS_RESERVADOS.has(idTipoDepartamento);
+async function esDepartamentoDeProductos(idTipoDepartamento) {
+  const departmentIds = await resolveMenuDepartmentIds();
+  const productDepartmentIds = Array.isArray(departmentIds?.productDepartmentIds)
+    ? departmentIds.productDepartmentIds
+    : [];
+  return productDepartmentIds.includes(Number(idTipoDepartamento));
 }
 
 export async function existeRecetaPorId(idReceta) {

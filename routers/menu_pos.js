@@ -1,6 +1,7 @@
 import express from 'express'; // Importa Express para crear rutas
 import pool from '../config/db-connection.js'; // Pool de conexión PostgreSQL
 import menuPosCatalogoRouter from './menu_pos_catalogo.js'; // Subrouter de catálogo POS
+import { resolveMenuDepartmentIds } from './menu_departamentos.js';
 
 const router = express.Router(); // Inicializa router
 
@@ -100,27 +101,39 @@ const esProductoActivo = (estado) =>
 // =====================================================
 router.get('/menu-pos/categorias', async (req, res) => {
   try {
+    // Resuelve IDs por nombre para evitar dependencia de IDs fijos.
+    const departmentIds = await resolveMenuDepartmentIds();
+    const recipeExcludedDepartmentIds = Array.isArray(departmentIds?.recipeExcludedDepartmentIds)
+      ? departmentIds.recipeExcludedDepartmentIds
+      : [];
+    const comboDepartmentId = Number.isInteger(departmentIds?.comboDepartmentId)
+      ? departmentIds.comboDepartmentId
+      : null;
+    const productDepartmentIds = Array.isArray(departmentIds?.productDepartmentIds)
+      ? departmentIds.productDepartmentIds
+      : [];
+
     const queryCategorias = `
       WITH categorias_menu AS (
         SELECT r.id_tipo_departamento
         FROM recetas r
         WHERE COALESCE(r.estado, true) = true
           AND r.id_tipo_departamento IS NOT NULL
-          AND r.id_tipo_departamento NOT IN (11, 12, 13, 14, 15, 19)
+          AND r.id_tipo_departamento <> ALL($1::INTEGER[])
 
         UNION
 
         SELECT c.id_tipo_departamento
         FROM combos c
         WHERE COALESCE(c.estado, true) = true
-          AND c.id_tipo_departamento = 19
+          AND ($2::INTEGER IS NOT NULL AND c.id_tipo_departamento = $2)
 
         UNION
 
         SELECT p.id_tipo_departamento
         FROM productos p
         WHERE COALESCE(p.estado, true) = true
-          AND p.id_tipo_departamento IN (12, 13, 14, 15)
+          AND p.id_tipo_departamento = ANY($3::INTEGER[])
       )
       SELECT
         td.id_tipo_departamento,
@@ -130,13 +143,16 @@ router.get('/menu-pos/categorias', async (req, res) => {
       INNER JOIN tipo_departamento td
         ON td.id_tipo_departamento = cm.id_tipo_departamento
       WHERE COALESCE(td.estado, true) = true
-        AND td.id_tipo_departamento <> 11
       ORDER BY
         COALESCE(td.orden_menu, 2147483647),
         td.nombre_departamento ASC;
     `;
 
-    const result = await pool.query(queryCategorias);
+    const result = await pool.query(queryCategorias, [
+      recipeExcludedDepartmentIds,
+      comboDepartmentId,
+      productDepartmentIds
+    ]);
 
     return res.status(200).json({
       ok: true,

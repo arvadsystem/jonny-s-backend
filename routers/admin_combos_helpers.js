@@ -1,6 +1,5 @@
 import pool from '../config/db-connection.js';
-
-const ID_TIPO_DEPARTAMENTO_COMBOS = 19;
+import { resolveMenuDepartmentIds } from './menu_departamentos.js';
 
 const CAMPOS_PERMITIDOS_COMBO = new Set([
   'id_menu',
@@ -208,7 +207,16 @@ export function validarEstructuraPayloadCombo(payload, { soloEstadoUsuario = fal
   return { ok: true };
 }
 
-export function normalizarPayloadCombo(payload) {
+const getComboDepartmentId = async () => {
+  const departmentIds = await resolveMenuDepartmentIds();
+  const comboDepartmentId = Number(departmentIds?.comboDepartmentId);
+  if (!esEnteroPositivo(comboDepartmentId)) {
+    throw new Error('No existe tipo_departamento "Combos".');
+  }
+  return comboDepartmentId;
+};
+
+export async function normalizarPayloadCombo(payload) {
   const datosNormalizados = {};
 
   for (const campo of Object.keys(payload)) {
@@ -228,8 +236,8 @@ export function normalizarPayloadCombo(payload) {
     datosNormalizados.id_archivo = null;
   }
 
-  // Regla explicita del proyecto: los combos son del departamento 19.
-  datosNormalizados.id_tipo_departamento = ID_TIPO_DEPARTAMENTO_COMBOS;
+  // Regla explicita del proyecto: los combos siempre se asignan al departamento "Combos".
+  datosNormalizados.id_tipo_departamento = await getComboDepartmentId();
 
   return { ok: true, datos: datosNormalizados };
 }
@@ -426,7 +434,7 @@ export async function crearComboConDetalle(client, datosNormalizados, detalle) {
       datosNormalizados.id_usuario,
       datosNormalizados.id_archivo,
       datosNormalizados.precio,
-      ID_TIPO_DEPARTAMENTO_COMBOS
+      datosNormalizados.id_tipo_departamento
     ]
   );
 
@@ -463,7 +471,7 @@ export async function actualizarComboConDetalle(client, idCombo, datosNormalizad
       datosNormalizados.id_usuario,
       datosNormalizados.id_archivo,
       datosNormalizados.precio,
-      ID_TIPO_DEPARTAMENTO_COMBOS
+      datosNormalizados.id_tipo_departamento
     ]
   );
 
