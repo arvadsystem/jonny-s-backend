@@ -1,7 +1,14 @@
 import express from 'express';
 import pool from '../config/db-connection.js';
+import { checkPermission, requestHasAnyPermission } from '../middleware/checkPermission.js';
+import { getClientIp } from '../utils/security/clientInfo.js';
 
 const router = express.Router();
+const PERSONAS_LIST_PERMISSIONS = ['PERSONAS_LISTADO_VER'];
+const PERSONAS_DETAIL_PERMISSIONS = ['PERSONAS_DETALLE_VER'];
+const PERSONAS_CREATE_PERMISSIONS = ['PERSONAS_CREAR', 'PERSONAS_CREAR_DESDE_CLIENTES'];
+const PERSONAS_EDIT_PERMISSIONS = ['PERSONAS_EDITAR'];
+const PERSONAS_DELETE_PERMISSIONS = ['PERSONAS_ELIMINAR'];
 
 const MAX_LIMIT = 100;
 const MAX_SUGGESTIONS_LIMIT = 12;
@@ -87,6 +94,23 @@ const normalizeUpdateFieldName = (field) => {
 const parsePositiveInt = (value) => {
   const parsed = Number.parseInt(value, 10);
   return Number.isInteger(parsed) && parsed > 0 ? parsed : null;
+};
+
+const isClientesContextRequest = (req) => {
+  const headerContext = String(
+    req.get('x-rbac-context')
+    || req.get('x-client-context')
+    || ''
+  ).trim().toLowerCase();
+  const bodyContext = String(
+    req.body?.rbac_context
+    ?? req.body?.contexto_origen
+    ?? req.body?.contexto
+    ?? req.body?._context
+    ?? ''
+  ).trim().toLowerCase();
+  const queryContext = String(req.query?.contexto ?? '').trim().toLowerCase();
+  return headerContext === 'clientes' || bodyContext === 'clientes' || queryContext === 'clientes';
 };
 
 const safeParseJson = (value) => {
@@ -299,14 +323,18 @@ const personaRepository = {
     const whereParams = [];
     const whereParts = [];
 
-    const searchTerm = typeof search === 'string' ? search.trim() : '';
+    const searchTerm = typeof search === 'string'
+      ? search.trim().replace(/\s+/g, ' ')
+      : '';
     if (searchTerm) {
       whereParams.push(`%${searchTerm}%`);
       const searchParamIndex = whereParams.length;
       whereParts.push(`(
         p.nombre ILIKE $${searchParamIndex}
         OR p.apellido ILIKE $${searchParamIndex}
+        OR CONCAT_WS(' ', COALESCE(p.nombre, ''), COALESCE(p.apellido, '')) ILIKE $${searchParamIndex}
         OR p.dni::TEXT ILIKE $${searchParamIndex}
+        OR p.rtn::TEXT ILIKE $${searchParamIndex}
         OR COALESCE(telf.telefono, '') ILIKE $${searchParamIndex}
         OR COALESCE(cor.direccion_correo, '') ILIKE $${searchParamIndex}
         OR COALESCE(dir.direccion, '') ILIKE $${searchParamIndex}
@@ -353,11 +381,13 @@ const personaRepository = {
       orderByClause = `CASE
         WHEN p.nombre ILIKE $${prefixParamIndex} THEN 0
         WHEN p.apellido ILIKE $${prefixParamIndex} THEN 1
-        WHEN p.dni::TEXT ILIKE $${prefixParamIndex} THEN 2
-        WHEN COALESCE(telf.telefono, '') ILIKE $${prefixParamIndex} THEN 3
-        WHEN COALESCE(cor.direccion_correo, '') ILIKE $${prefixParamIndex} THEN 4
-        WHEN COALESCE(dir.direccion, '') ILIKE $${prefixParamIndex} THEN 5
-        ELSE 6
+        WHEN CONCAT_WS(' ', COALESCE(p.nombre, ''), COALESCE(p.apellido, '')) ILIKE $${prefixParamIndex} THEN 2
+        WHEN p.dni::TEXT ILIKE $${prefixParamIndex} THEN 3
+        WHEN p.rtn::TEXT ILIKE $${prefixParamIndex} THEN 4
+        WHEN COALESCE(telf.telefono, '') ILIKE $${prefixParamIndex} THEN 5
+        WHEN COALESCE(cor.direccion_correo, '') ILIKE $${prefixParamIndex} THEN 6
+        WHEN COALESCE(dir.direccion, '') ILIKE $${prefixParamIndex} THEN 7
+        ELSE 8
       END, p.id_persona DESC`;
     }
 
@@ -374,9 +404,13 @@ const personaRepository = {
       OFFSET $${offsetParamIndex}
     `;
 
+    const countFromClause = searchTerm
+      ? fromClause
+      : 'FROM personas p';
+
     const totalQuery = `
       SELECT COUNT(*)::INT AS total
-      ${fromClause}
+      ${countFromClause}
       ${whereClause}
     `;
 
@@ -518,12 +552,62 @@ const personaRepository = {
     );
   },
 
-  async addAuditLog({ accion, descripcion, idUsuario, capabilities }) {
+  async addAuditLog({
+    accion,
+    descripcion,
+    idUsuario,
+    capabilities,
+    req,
+    modulo = 'PERSONAS',
+    tablaAfectada = 'personas',
+    idRegistro = null,
+    datosAntes = null,
+    datosDespues = null
+  }) {
     if (!capabilities.hasBitacorasTable || !idUsuario) return;
     const descripcionSafe = truncateText(descripcion, MAX_AUDIT_DESCRIPCION_LENGTH);
+    const moduloSafe = truncateText(modulo, 60) || null;
+    const tablaAfectadaSafe = truncateText(tablaAfectada, 60) || null;
+    const idRegistroSafe = parsePositiveInt(idRegistro);
+    const ipOrigen = req ? getClientIp(req) : null;
+
     await pool.query(
-      'INSERT INTO bitacoras (accion, descripcion, id_usuario) VALUES ($1, $2, $3)',
-      [accion, descripcionSafe, idUsuario]
+      `
+        INSERT INTO bitacoras (
+          accion,
+          descripcion,
+          fecha_hora,
+          id_usuario,
+          modulo,
+          tabla_afectada,
+          id_registro,
+          ip_origen,
+          datos_antes,
+          datos_despues
+        ) VALUES (
+          $1,
+          $2,
+          timezone('America/Tegucigalpa', now()),
+          $3,
+          $4,
+          $5,
+          $6,
+          $7,
+          $8::jsonb,
+          $9::jsonb
+        )
+      `,
+      [
+        accion,
+        descripcionSafe,
+        idUsuario,
+        moduloSafe,
+        tablaAfectadaSafe,
+        idRegistroSafe,
+        ipOrigen,
+        toJsonParam(datosAntes),
+        toJsonParam(datosDespues)
+      ]
     );
   }
 };
@@ -542,8 +626,11 @@ const personaService = {
     const search = typeof req.query.search === 'string'
       ? req.query.search.trim()
       : '';
+    const searchQuery = typeof req.query.q === 'string'
+      ? req.query.q.trim()
+      : '';
     const searchName = typeof req.query.nombre === 'string' ? req.query.nombre.trim() : '';
-    const searchTerm = search || searchName;
+    const searchTerm = search || searchQuery || searchName;
     const estado = parseBooleanFilter(req.query.estado);
     const sort = typeof req.query.sort === 'string' ? req.query.sort.trim() : 'recientes';
     const genero = typeof req.query.genero === 'string' ? req.query.genero.trim() : '';
@@ -628,6 +715,23 @@ const personaService = {
   async create(req) {
     const capabilities = await getSchemaCapabilities();
     const payload = normalizePersonaPayload(req.body);
+    const hasGeneralCreatePermission = await requestHasAnyPermission(req, ['PERSONAS_CREAR']);
+
+    if (!hasGeneralCreatePermission) {
+      const hasContextualCreatePermission = await requestHasAnyPermission(req, ['PERSONAS_CREAR_DESDE_CLIENTES']);
+      if (!hasContextualCreatePermission) {
+        return { status: 403, body: { error: true, message: 'Acceso denegado: permisos insuficientes' } };
+      }
+      if (!isClientesContextRequest(req)) {
+        return {
+          status: 403,
+          body: {
+            error: true,
+            message: 'Acceso denegado: PERSONAS_CREAR_DESDE_CLIENTES solo aplica en flujo de clientes'
+          }
+        };
+      }
+    }
 
     if (!isPlainObject(payload) || Object.keys(payload).length === 0) {
       return { status: 400, body: { error: true, message: 'Debe enviar un objeto con datos validos' } };
@@ -655,7 +759,11 @@ const personaService = {
       accion: 'PERSONA_CREAR',
       descripcion: `Persona creada: ${payload.nombre ?? 'sin_nombre'}`,
       idUsuario,
-      capabilities
+      capabilities,
+      req,
+      modulo: 'PERSONAS',
+      tablaAfectada: 'personas',
+      datosDespues: payload
     });
 
     return {
@@ -741,18 +849,53 @@ const personaService = {
       }
     }
 
-    if (capabilities.hasUpdatedBy && idUsuario) {
-      updateData.updated_by = idUsuario;
+    if (capabilities.hasUpdatedBy && idUsuario) updateData.updated_by = idUsuario;
+
+    const changedEntries = Object.entries(updateData).filter(([field, newValue]) =>
+      valuesDiffer(getCurrentValueForField(current, field), newValue)
+    );
+
+    const updateDataFiltered = Object.fromEntries(changedEntries);
+    if (!Object.keys(updateDataFiltered).length) {
+      return {
+        status: 200,
+        body: {
+          error: false,
+          message: 'No se detectaron cambios para actualizar',
+          data: current
+        }
+      };
     }
 
-    const resultado = await personaRepository.update(idPersona, updateData);
-    const camposActualizados = Object.keys(updateData).join(', ');
+    if (capabilities.hasUpdatedBy && idUsuario && !Object.prototype.hasOwnProperty.call(updateDataFiltered, 'updated_by')) {
+      updateDataFiltered.updated_by = idUsuario;
+    }
+
+    const resultado = await personaRepository.update(idPersona, updateDataFiltered);
+    const changedEntriesForAudit = changedEntries.filter(([field]) => field !== 'updated_by');
+    const camposActualizados = changedEntriesForAudit.map(([field]) => field).join(', ');
+    const datosAntes = changedEntriesForAudit.reduce((acc, [field]) => {
+      acc[field] = getCurrentValueForField(current, field) ?? null;
+      return acc;
+    }, {});
+    const datosDespues = changedEntriesForAudit.reduce((acc, [field, value]) => {
+      acc[field] = value ?? null;
+      return acc;
+    }, {});
+    const auditDatosAntes = Object.keys(datosAntes).length ? datosAntes : null;
+    const auditDatosDespues = Object.keys(datosDespues).length ? datosDespues : null;
 
     await personaRepository.addAuditLog({
       accion: 'PERSONA_ACTUALIZAR',
-      descripcion: `Persona ${idPersona} actualizada: ${camposActualizados}`,
+      descripcion: `Persona ${idPersona} actualizada: ${camposActualizados || 'sin cambios detectados'}`,
       idUsuario,
-      capabilities
+      capabilities,
+      req,
+      modulo: 'PERSONAS',
+      tablaAfectada: 'personas',
+      idRegistro: idPersona,
+      datosAntes: auditDatosAntes,
+      datosDespues: auditDatosDespues
     });
 
     return {
@@ -802,7 +945,12 @@ const personaService = {
       accion: 'PERSONA_ELIMINAR',
       descripcion: `Persona ${idPersona} eliminada. Modo: ${capabilities.softDeleteField ? 'soft' : 'hard'}`,
       idUsuario,
-      capabilities
+      capabilities,
+      req,
+      modulo: 'PERSONAS',
+      tablaAfectada: 'personas',
+      idRegistro: idPersona,
+      datosAntes: current
     });
 
     return { status: 200, body: { error: false, message } };
@@ -822,27 +970,27 @@ const asyncHandler = (handler) => async (req, res) => {
 /* =======================
    GET - LISTAR PERSONAS
 ======================= */
-router.get('/personas', asyncHandler(personaService.list));
-router.get('/personas-detalle', asyncHandler(personaService.list));
+router.get('/personas', checkPermission(PERSONAS_LIST_PERMISSIONS), asyncHandler(personaService.list));
+router.get('/personas-detalle', checkPermission(PERSONAS_LIST_PERMISSIONS), asyncHandler(personaService.list));
 
 /* =======================
    GET - PERSONA POR ID
 ======================= */
-router.get('/personas/:id', asyncHandler(personaService.getById));
+router.get('/personas/:id', checkPermission(PERSONAS_DETAIL_PERMISSIONS), asyncHandler(personaService.getById));
 
 /* =======================
    POST - INSERTAR
 ======================= */
-router.post('/personas', asyncHandler(personaService.create));
+router.post('/personas', checkPermission(PERSONAS_CREATE_PERMISSIONS), asyncHandler(personaService.create));
 
 /* =======================
    PUT - ACTUALIZAR
 ======================= */
-router.put('/personas/:id', asyncHandler(personaService.update));
+router.put('/personas/:id', checkPermission(PERSONAS_EDIT_PERMISSIONS), asyncHandler(personaService.update));
 
 /* =======================
    DELETE - ELIMINAR
 ======================= */
-router.delete('/personas/:id', asyncHandler(personaService.remove));
+router.delete('/personas/:id', checkPermission(PERSONAS_DELETE_PERMISSIONS), asyncHandler(personaService.remove));
 
 export default router;

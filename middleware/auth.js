@@ -1,10 +1,18 @@
 import jwt from 'jsonwebtoken';
 
-const JWT_SECRET = process.env.JWT_SECRET || 'CAMBIA_ESTE_SECRET_EN_ENV';
+const FALLBACK_JWT_SECRET = 'CAMBIA_ESTE_SECRET_EN_ENV';
+const JWT_SECRET = process.env.JWT_SECRET || (process.env.NODE_ENV === 'production' ? '' : FALLBACK_JWT_SECRET);
 
 const SAFE_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
 
 export const authRequired = (req, res, next) => {
+  if (!JWT_SECRET) {
+    return res.status(500).json({
+      error: true,
+      message: 'Configuracion de seguridad incompleta: JWT_SECRET no definido'
+    });
+  }
+
   const token = req.cookies?.access_token;
 
   if (!token) {

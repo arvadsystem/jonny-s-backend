@@ -1,7 +1,13 @@
 import express from 'express';
 import pool from '../config/db-connection.js';
+import { checkPermission } from '../middleware/checkPermission.js';
 
 const router = express.Router();
+const EMPLEADOS_LIST_PERMISSIONS = ['EMPLEADOS_LISTADO_VER'];
+const EMPLEADOS_DETAIL_PERMISSIONS = ['EMPLEADOS_DETALLE_VER'];
+const EMPLEADOS_CREATE_PERMISSIONS = ['EMPLEADOS_CREAR'];
+const EMPLEADOS_EDIT_PERMISSIONS = ['EMPLEADOS_EDITAR'];
+const EMPLEADOS_DELETE_PERMISSIONS = ['EMPLEADOS_ELIMINAR'];
 
 const MAX_LIMIT = 100;
 const BASE_FIELDS = ['id_empleado', 'fecha_ingreso', 'salario_base', 'estado', 'id_sucursal', 'id_persona'];
@@ -14,6 +20,39 @@ const isPlainObject = (value) => value !== null && typeof value === 'object' && 
 const parsePositiveInt = (value) => {
   const parsed = Number.parseInt(value, 10);
   return Number.isInteger(parsed) && parsed > 0 ? parsed : null;
+};
+
+const normalizeComparableValue = (value) => {
+  if (value === null || value === undefined) return null;
+  if (typeof value === 'string') {
+    const text = value.trim();
+    return text ? text : null;
+  }
+  if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+  if (value instanceof Date) return value.toISOString();
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
+};
+
+const valuesDiffer = (beforeValue, afterValue) =>
+  normalizeComparableValue(beforeValue) !== normalizeComparableValue(afterValue);
+
+const truncateText = (value, maxLength) => {
+  const text = String(value ?? '');
+  if (!Number.isInteger(maxLength) || maxLength <= 0) return text;
+  return text.length > maxLength ? text.slice(0, maxLength) : text;
+};
+
+const toJsonParam = (value) => {
+  if (value === undefined || value === null) return null;
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return JSON.stringify({ value: String(value) });
+  }
 };
 
 const parseBooleanFilter = (value) => {
@@ -259,11 +298,62 @@ const empleadoRepository = {
     );
   },
 
-  async addAuditLog({ accion, descripcion, idUsuario, capabilities }) {
+  async addAuditLog({
+    accion,
+    descripcion,
+    idUsuario,
+    capabilities,
+    req,
+    modulo = 'EMPLEADOS',
+    tablaAfectada = 'empleados',
+    idRegistro = null,
+    datosAntes = null,
+    datosDespues = null
+  }) {
     if (!capabilities.hasBitacorasTable || !idUsuario) return;
+    const descripcionSafe = truncateText(descripcion, 100);
+    const moduloSafe = truncateText(modulo, 60) || null;
+    const tablaAfectadaSafe = truncateText(tablaAfectada, 60) || null;
+    const idRegistroSafe = parsePositiveInt(idRegistro);
+    const ipOrigen = req ? getClientIp(req) : null;
+
     await pool.query(
-      'INSERT INTO bitacoras (accion, descripcion, id_usuario) VALUES ($1, $2, $3)',
-      [accion, descripcion, idUsuario]
+      `
+        INSERT INTO bitacoras (
+          accion,
+          descripcion,
+          fecha_hora,
+          id_usuario,
+          modulo,
+          tabla_afectada,
+          id_registro,
+          ip_origen,
+          datos_antes,
+          datos_despues
+        ) VALUES (
+          $1,
+          $2,
+          timezone('America/Tegucigalpa', now()),
+          $3,
+          $4,
+          $5,
+          $6,
+          $7,
+          $8::jsonb,
+          $9::jsonb
+        )
+      `,
+      [
+        accion,
+        descripcionSafe,
+        idUsuario,
+        moduloSafe,
+        tablaAfectadaSafe,
+        idRegistroSafe,
+        ipOrigen,
+        toJsonParam(datosAntes),
+        toJsonParam(datosDespues)
+      ]
     );
   }
 };
@@ -279,7 +369,10 @@ const empleadoService = {
     }
 
     const limit = Math.min(requestedLimit, MAX_LIMIT);
+    const search = typeof req.query.search === 'string' ? req.query.search.trim() : '';
+    const searchQuery = typeof req.query.q === 'string' ? req.query.q.trim() : '';
     const searchName = typeof req.query.nombre === 'string' ? req.query.nombre.trim() : '';
+    const effectiveSearch = search || searchQuery || searchName;
     const estado = parseBooleanFilter(req.query.estado);
 
     if (req.query.estado !== undefined && estado === null) {
@@ -298,7 +391,7 @@ const empleadoService = {
     const { data, total } = await empleadoRepository.list({
       page,
       limit,
-      searchName,
+      searchName: effectiveSearch,
       estado,
       tenantId,
       capabilities
@@ -380,7 +473,11 @@ const empleadoService = {
       accion: 'EMPLEADO_CREAR',
       descripcion: `Empleado creado: persona ${payload.id_persona ?? 'sin_persona'}`,
       idUsuario,
-      capabilities
+      capabilities,
+      req,
+      modulo: 'EMPLEADOS',
+      tablaAfectada: 'empleados',
+      datosDespues: insertData
     });
 
     return { status: 201, body: { message: 'Empleado creado exitosamente.' } };
@@ -432,9 +529,17 @@ const empleadoService = {
       return { status: 403, body: { error: true, message: 'No puede mover empleados a otra empresa' } };
     }
 
+    const idUsuario = resolveUserId(req);
+    const beforeValue = current?.[campo] ?? null;
+    if (!valuesDiffer(beforeValue, valor)) {
+      return {
+        status: 200,
+        body: { error: false, message: 'No se detectaron cambios para actualizar' }
+      };
+    }
+
     await empleadoRepository.updateField(idEmpleado, campo, valor);
 
-    const idUsuario = resolveUserId(req);
     if (capabilities.hasUpdatedBy && idUsuario && campo !== 'updated_by') {
       await empleadoRepository.updateField(idEmpleado, 'updated_by', idUsuario);
     }
@@ -443,7 +548,13 @@ const empleadoService = {
       accion: 'EMPLEADO_ACTUALIZAR',
       descripcion: `Empleado ${idEmpleado} actualizado: campo ${campo}`,
       idUsuario,
-      capabilities
+      capabilities,
+      req,
+      modulo: 'EMPLEADOS',
+      tablaAfectada: 'empleados',
+      idRegistro: idEmpleado,
+      datosAntes: { [campo]: beforeValue },
+      datosDespues: { [campo]: valor }
     });
 
     return {
@@ -497,7 +608,12 @@ const empleadoService = {
       accion: 'EMPLEADO_ELIMINAR',
       descripcion: `Empleado ${idEmpleado} eliminado. Modo: ${capabilities.softDeleteField ? 'soft' : 'hard'}`,
       idUsuario,
-      capabilities
+      capabilities,
+      req,
+      modulo: 'EMPLEADOS',
+      tablaAfectada: 'empleados',
+      idRegistro: idEmpleado,
+      datosAntes: current
     });
 
     return { status: 200, body: { error: false, message } };
@@ -517,27 +633,27 @@ const asyncHandler = (handler) => async (req, res) => {
 /* =======================
    GET - LISTAR EMPLEADOS
 ======================= */
-router.get('/empleados-detalle', asyncHandler(empleadoService.list));
-router.get('/empleados', asyncHandler(empleadoService.list));
+router.get('/empleados-detalle', checkPermission(EMPLEADOS_LIST_PERMISSIONS), asyncHandler(empleadoService.list));
+router.get('/empleados', checkPermission(EMPLEADOS_LIST_PERMISSIONS), asyncHandler(empleadoService.list));
 
 /* =======================
    GET - EMPLEADO POR ID
 ======================= */
-router.get('/empleados/:id', asyncHandler(empleadoService.getById));
+router.get('/empleados/:id', checkPermission(EMPLEADOS_DETAIL_PERMISSIONS), asyncHandler(empleadoService.getById));
 
 /* =======================
    POST - INSERTAR
 ======================= */
-router.post('/empleados', asyncHandler(empleadoService.create));
+router.post('/empleados', checkPermission(EMPLEADOS_CREATE_PERMISSIONS), asyncHandler(empleadoService.create));
 
 /* =======================
    PUT - ACTUALIZAR
 ======================= */
-router.put('/empleados/:id', asyncHandler(empleadoService.update));
+router.put('/empleados/:id', checkPermission(EMPLEADOS_EDIT_PERMISSIONS), asyncHandler(empleadoService.update));
 
 /* =======================
    DELETE - ELIMINAR
 ======================= */
-router.delete('/empleados/:id', asyncHandler(empleadoService.remove));
+router.delete('/empleados/:id', checkPermission(EMPLEADOS_DELETE_PERMISSIONS), asyncHandler(empleadoService.remove));
 
 export default router;
