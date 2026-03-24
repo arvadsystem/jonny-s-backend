@@ -290,8 +290,8 @@ router.get('/menu-pos/catalogo-imagenes', async (req, res) => {
         NULL::INTEGER AS id_producto,
         NULL::INTEGER AS id_receta,
         c.id_combo,
-        COALESCE(c.descripcion, CONCAT('Combo #', c.id_combo::text)) AS nombre_producto,
-        COALESCE(c.descripcion, '') AS descripcion_producto,
+        COALESCE(NULLIF(c.nombre_combo, ''), NULLIF(c.descripcion, ''), CONCAT('Combo #', c.id_combo::text)) AS nombre_producto,
+        COALESCE(c.descripcion, c.nombre_combo, '') AS descripcion_producto,
         c.precio,
         c.cant_personas AS cantidad,
         NULL::INTEGER AS stock_minimo,
@@ -431,6 +431,7 @@ router.get('/menu-pos/catalogo-imagenes/:id_tipo_departamento', async (req, res)
       SELECT
         c.id_combo,
         c.id_menu,
+        c.nombre_combo,
         c.descripcion,
         c.cant_personas,
         c.precio,

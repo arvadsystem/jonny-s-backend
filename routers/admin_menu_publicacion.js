@@ -185,7 +185,7 @@ const fetchBaseCatalogByMenu = async (idMenu, departmentIds) => {
       SELECT
         '${ITEM_TYPES.COMBO}'::text AS tipo_item,
         c.id_combo::int AS id_item_origen,
-        COALESCE(NULLIF(c.descripcion, ''), CONCAT('Combo #', c.id_combo::text))::text AS nombre_item,
+        COALESCE(NULLIF(c.nombre_combo, ''), NULLIF(c.descripcion, ''), CONCAT('Combo #', c.id_combo::text))::text AS nombre_item,
         COALESCE(c.estado, true) AS estado_item,
         c.precio::numeric AS precio_base
       FROM combos c

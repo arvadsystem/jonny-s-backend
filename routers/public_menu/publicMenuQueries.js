@@ -125,6 +125,7 @@ const buildCatalogSql = ({
       COALESCE(
         p.nombre_producto,
         r.nombre_receta,
+        NULLIF(c.nombre_combo, ''),
         NULLIF(c.descripcion, ''),
         CONCAT('Item #', dm.id_detalle_menu::text)
       ) AS nombre_item,
