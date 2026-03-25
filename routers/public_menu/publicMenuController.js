@@ -1,4 +1,5 @@
-import {
+﻿import {
+  createPublicOrderService,
   getMenuVigenteByBranchService,
   getPublicBranchesService,
   getPublicCatalogItemDetailService,
@@ -76,5 +77,26 @@ export const getPublicCatalogItemDetailController = async (req, res) => {
     return res.status(200).json({ ok: true, data });
   } catch (error) {
     return handleControllerError(res, error, 'No se pudo obtener el detalle del item publico.');
+  }
+};
+
+// POST /public-menu/pedidos
+export const createPublicOrderController = async (req, res) => {
+  try {
+    const { idSucursal, tipoPedido, origen, items } = req.publicMenu;
+    const data = await createPublicOrderService({
+      idSucursal,
+      tipoPedido,
+      origen,
+      items
+    });
+
+    return res.status(201).json({
+      ok: true,
+      message: 'Pedido registrado correctamente.',
+      data
+    });
+  } catch (error) {
+    return handleControllerError(res, error, 'No se pudo registrar el pedido desde menu publico.');
   }
 };

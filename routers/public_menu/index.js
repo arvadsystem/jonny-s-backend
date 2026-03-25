@@ -1,5 +1,6 @@
-import express from 'express';
+﻿import express from 'express';
 import {
+  createPublicOrderController,
   getActiveMenuByBranchController,
   getPublicBranchesController,
   getPublicCatalogController,
@@ -8,6 +9,7 @@ import {
 import {
   validateBranchParam,
   validateCatalogQuery,
+  validateCreateOrderBody,
   validateItemDetailRequest
 } from './publicMenuValidators.js';
 
@@ -25,5 +27,8 @@ router.get('/catalogo', validateCatalogQuery, getPublicCatalogController);
 
 // Detalle individual para HU-133.
 router.get('/items/:id_detalle_menu', validateItemDetailRequest, getPublicCatalogItemDetailController);
+
+// Crear pedido desde menu publico (sin login de dashboard).
+router.post('/pedidos', validateCreateOrderBody, createPublicOrderController);
 
 export default router;

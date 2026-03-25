@@ -1,4 +1,4 @@
-// Validador central para el modulo publico de menu.
+﻿// Validador central para el modulo publico de menu.
 // Mantiene parsing de parametros en un solo lugar para evitar duplicaciones en controladores.
 
 const PUBLIC_ORDER_TYPES = new Set(['dine-in', 'pickup', 'delivery']);
@@ -73,6 +73,57 @@ export const validateItemDetailRequest = (req, res, next) => {
     ...(req.publicMenu || {}),
     idDetalleMenu,
     idSucursal
+  };
+
+  return next();
+};
+
+// Valida payload para crear pedido desde el menu publico.
+export const validateCreateOrderBody = (req, res, next) => {
+  const body = req.body && typeof req.body === 'object' ? req.body : {};
+  const idSucursal = toPositiveInt(body.id_sucursal);
+  const tipoPedido = String(body.tipo_pedido || '').trim().toLowerCase();
+  const origen = String(body.origen || 'public-menu').trim() || 'public-menu';
+  const rawItems = Array.isArray(body.items) ? body.items : [];
+
+  if (!idSucursal) {
+    return sendValidationError(res, 'id_sucursal es obligatorio y debe ser un entero mayor a 0.');
+  }
+
+  if (!tipoPedido || !PUBLIC_ORDER_TYPES.has(tipoPedido)) {
+    return sendValidationError(res, 'tipo_pedido invalido. Valores permitidos: dine-in, pickup, delivery.');
+  }
+
+  if (rawItems.length === 0) {
+    return sendValidationError(res, 'Debes enviar al menos un item en el pedido.');
+  }
+
+  const items = [];
+  for (const rawItem of rawItems) {
+    const row = rawItem && typeof rawItem === 'object' ? rawItem : {};
+    const idDetalleMenu = toPositiveInt(row.id_detalle_menu);
+    const cantidad = toPositiveInt(row.cantidad);
+
+    if (!idDetalleMenu) {
+      return sendValidationError(res, 'Cada item debe incluir id_detalle_menu valido (> 0).');
+    }
+
+    if (!cantidad) {
+      return sendValidationError(res, 'Cada item debe incluir cantidad valida (> 0).');
+    }
+
+    items.push({
+      id_detalle_menu: idDetalleMenu,
+      cantidad
+    });
+  }
+
+  req.publicMenu = {
+    ...(req.publicMenu || {}),
+    idSucursal,
+    tipoPedido,
+    origen,
+    items
   };
 
   return next();

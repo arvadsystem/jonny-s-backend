@@ -343,3 +343,96 @@ export const fetchComboAvailabilityQuery = async (comboIds = []) => {
   const result = await pool.query(query, [comboIds]);
   return result.rows;
 };
+
+// Catalogo de estados de pedido para resolver estado inicial en flujo publico.
+export const fetchEstadoPedidoRowsQuery = async () => {
+  const result = await pool.query(
+    'SELECT id_estado_pedido, descripcion FROM estados_pedido ORDER BY id_estado_pedido'
+  );
+  return result.rows;
+};
+
+// Usuario fallback para registrar pedidos creados sin login de dashboard.
+export const fetchFallbackOrderUserIdQuery = async () => {
+  const hasEstadoColumn = await hasColumn('usuarios', 'estado');
+  const query = hasEstadoColumn
+    ? `
+      SELECT id_usuario
+      FROM usuarios
+      WHERE COALESCE(estado, true) = true
+      ORDER BY id_usuario
+      LIMIT 1;
+    `
+    : `
+      SELECT id_usuario
+      FROM usuarios
+      ORDER BY id_usuario
+      LIMIT 1;
+    `;
+
+  const result = await pool.query(query);
+  return result.rows[0]?.id_usuario ? Number(result.rows[0].id_usuario) : null;
+};
+
+// Inserta cabecera de pedido publico y devuelve ID generado.
+export const insertPublicPedidoQuery = async (client, payload) => {
+  const result = await client.query(
+    `
+      INSERT INTO pedidos (
+        descripcion_pedido,
+        descripcion_envio,
+        fecha_hora_pedido,
+        sub_total,
+        isv,
+        total,
+        id_estado_pedido,
+        id_sucursal,
+        id_cliente,
+        id_usuario
+      )
+      VALUES ($1, $2, CURRENT_TIMESTAMP, $3, $4, $5, $6, $7, NULL, $8)
+      RETURNING id_pedido, fecha_hora_pedido;
+    `,
+    [
+      payload.descripcion_pedido,
+      payload.descripcion_envio,
+      payload.sub_total,
+      payload.isv,
+      payload.total,
+      payload.id_estado_pedido,
+      payload.id_sucursal,
+      payload.id_usuario
+    ]
+  );
+
+  return result.rows[0] || null;
+};
+
+// Inserta una linea de detalle para pedido publico.
+export const insertPublicPedidoDetalleQuery = async (client, payload) => {
+  await client.query(
+    `
+      INSERT INTO detalle_pedido (
+        sub_total_pedido,
+        total_pedido,
+        id_producto,
+        id_pedido,
+        id_descuento,
+        estado,
+        id_combo,
+        id_receta,
+        observacion
+      )
+      VALUES ($1, $2, $3, $4, NULL, true, $5, $6, $7);
+    `,
+    [
+      payload.sub_total_pedido,
+      payload.total_pedido,
+      payload.id_producto,
+      payload.id_pedido,
+      payload.id_combo,
+      payload.id_receta,
+      payload.observacion
+    ]
+  );
+};

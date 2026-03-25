@@ -1,11 +1,16 @@
+﻿import pool from '../../config/db-connection.js';
 import {
   PUBLIC_ITEM_TYPES,
   fetchActiveMenuByBranchQuery,
   fetchCatalogItemByIdQuery,
   fetchCatalogRowsByMenuQuery,
   fetchComboAvailabilityQuery,
+  fetchEstadoPedidoRowsQuery,
+  fetchFallbackOrderUserIdQuery,
   fetchPublicBranchesQuery,
-  fetchRecipeAvailabilityQuery
+  fetchRecipeAvailabilityQuery,
+  insertPublicPedidoDetalleQuery,
+  insertPublicPedidoQuery
 } from './publicMenuQueries.js';
 
 // Tabla de mensajes legibles para no exponer codigos internos al frontend.
@@ -21,6 +26,14 @@ const AVAILABILITY_REASON_LABEL = Object.freeze({
   SIN_PRECIO: 'Item sin precio configurado.'
 });
 
+const SERVICE_TYPE_BY_ORDER_TYPE = Object.freeze({
+  'dine-in': 'LOCAL',
+  pickup: 'PARA_LLEVAR',
+  delivery: 'DELIVERY'
+});
+
+const ORDER_STATE_ALIASES = Object.freeze(['pendiente']);
+
 // Crea errores HTTP controlados para que el controlador responda con status consistente.
 const buildHttpError = (status, message) => {
   const error = new Error(message);
@@ -28,12 +41,29 @@ const buildHttpError = (status, message) => {
   return error;
 };
 
+const normalizeTextKey = (value) =>
+  String(value || '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, '_');
+
 // Convierte numeros de BD a Number JS cuidando null.
 const toNumberOrNull = (value) => {
   if (value === null || value === undefined) return null;
   const numericValue = Number(value);
   return Number.isFinite(numericValue) ? numericValue : null;
 };
+
+const toPositiveInt = (value) => {
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed <= 0) return null;
+  return parsed;
+};
+
+const roundMoney = (value) => Number(Number(value || 0).toFixed(2));
+const buildTicketNumber = (idPedido) => `VTA-${String(idPedido).padStart(5, '0')}`;
 
 // Normaliza booleans provenientes de PG.
 const toBoolean = (value) => value === true || value === 'true' || value === 1 || value === '1';
@@ -154,6 +184,31 @@ const mapMenuSummary = (row) => ({
   fecha_inicio: row.fecha_inicio
 });
 
+const resolvePendingStateId = async () => {
+  const rows = await fetchEstadoPedidoRowsQuery();
+  const match = rows.find((row) => ORDER_STATE_ALIASES.includes(normalizeTextKey(row?.descripcion)));
+  const id = Number(match?.id_estado_pedido || 0);
+  return id > 0 ? id : null;
+};
+
+const normalizeRequestedOrderItems = (items = []) => {
+  const merged = new Map();
+
+  (Array.isArray(items) ? items : []).forEach((row) => {
+    const idDetalleMenu = toPositiveInt(row?.id_detalle_menu);
+    const cantidad = toPositiveInt(row?.cantidad);
+    if (!idDetalleMenu || !cantidad) return;
+
+    const current = merged.get(idDetalleMenu) || 0;
+    merged.set(idDetalleMenu, current + cantidad);
+  });
+
+  return Array.from(merged.entries()).map(([idDetalleMenu, cantidad]) => ({
+    id_detalle_menu: idDetalleMenu,
+    cantidad
+  }));
+};
+
 // Servicio: listar sucursales publicas.
 export const getPublicBranchesService = async () => {
   const rows = await fetchPublicBranchesQuery();
@@ -251,4 +306,146 @@ export const getPublicCatalogItemDetailService = async ({ idSucursal, idDetalleM
     menu: mapMenuSummary(activeMenu),
     item: mapCatalogItem({ row, recipeAvailabilityMap, comboAvailabilityMap })
   };
+};
+
+// Servicio: registrar pedido enviado desde el menu publico (sin login dashboard).
+export const createPublicOrderService = async ({ idSucursal, tipoPedido, origen = 'public-menu', items = [] }) => {
+  const activeMenu = await fetchActiveMenuByBranchQuery(idSucursal);
+  if (!activeMenu) {
+    throw buildHttpError(409, 'La sucursal no tiene menu vigente activo para registrar pedidos.');
+  }
+
+  const requestedItems = normalizeRequestedOrderItems(items);
+  if (requestedItems.length === 0) {
+    throw buildHttpError(400, 'No hay items validos para registrar el pedido.');
+  }
+
+  const rows = await fetchCatalogRowsByMenuQuery(Number(activeMenu.id_menu));
+
+  const recipeIds = rows
+    .filter((row) => row.tipo_item === PUBLIC_ITEM_TYPES.RECETA && row.id_receta)
+    .map((row) => Number(row.id_receta));
+
+  const comboIds = rows
+    .filter((row) => row.tipo_item === PUBLIC_ITEM_TYPES.COMBO && row.id_combo)
+    .map((row) => Number(row.id_combo));
+
+  const [recipeAvailabilityRows, comboAvailabilityRows] = await Promise.all([
+    fetchRecipeAvailabilityQuery([...new Set(recipeIds)]),
+    fetchComboAvailabilityQuery([...new Set(comboIds)])
+  ]);
+
+  const recipeAvailabilityMap = toAvailabilityMap(recipeAvailabilityRows, 'id_receta');
+  const comboAvailabilityMap = toAvailabilityMap(comboAvailabilityRows, 'id_combo');
+
+  const catalogItems = rows.map((row) =>
+    mapCatalogItem({ row, recipeAvailabilityMap, comboAvailabilityMap })
+  );
+
+  const catalogByDetail = new Map(catalogItems.map((item) => [Number(item.id_detalle_menu), item]));
+
+  const normalizedLines = requestedItems.map((line) => {
+    const catalog = catalogByDetail.get(Number(line.id_detalle_menu));
+    if (!catalog) {
+      throw buildHttpError(400, `El item ${line.id_detalle_menu} no pertenece al menu vigente de la sucursal.`);
+    }
+
+    if (!catalog?.disponibilidad?.available) {
+      throw buildHttpError(409, `El item ${catalog.nombre} no esta disponible actualmente.`);
+    }
+
+    const precioUnitario = toNumberOrNull(catalog?.precio?.final);
+    if (precioUnitario === null || precioUnitario <= 0) {
+      throw buildHttpError(400, `El item ${catalog.nombre} no tiene precio valido para registrar pedido.`);
+    }
+
+    const cantidad = toPositiveInt(line.cantidad);
+    const subtotal = roundMoney(precioUnitario * cantidad);
+
+    return {
+      id_detalle_menu: Number(catalog.id_detalle_menu),
+      tipo_item: String(catalog.tipo_item || 'PRODUCTO'),
+      id_producto: catalog.id_producto ? Number(catalog.id_producto) : null,
+      id_combo: catalog.id_combo ? Number(catalog.id_combo) : null,
+      id_receta: catalog.id_receta ? Number(catalog.id_receta) : null,
+      nombre: catalog.nombre,
+      cantidad,
+      precio_unitario: roundMoney(precioUnitario),
+      subtotal
+    };
+  });
+
+  const total = roundMoney(normalizedLines.reduce((sum, line) => sum + line.subtotal, 0));
+  const idEstadoPedido = await resolvePendingStateId();
+  if (!idEstadoPedido) {
+    throw buildHttpError(500, 'No existe estado PENDIENTE en estados_pedido.');
+  }
+
+  const idUsuario = await fetchFallbackOrderUserIdQuery();
+  if (!idUsuario) {
+    throw buildHttpError(500, 'No hay usuario disponible para registrar pedidos publicos.');
+  }
+
+  const descripcionEnvio = SERVICE_TYPE_BY_ORDER_TYPE[tipoPedido] || 'LOCAL';
+  const descripcionPedido = `[${origen}] pedido web`;
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const pedido = await insertPublicPedidoQuery(client, {
+      descripcion_pedido: descripcionPedido,
+      descripcion_envio: descripcionEnvio,
+      sub_total: total,
+      isv: 0,
+      total,
+      id_estado_pedido: idEstadoPedido,
+      id_sucursal: Number(idSucursal),
+      id_usuario: Number(idUsuario)
+    });
+
+    const idPedido = Number(pedido?.id_pedido || 0);
+    if (!idPedido) {
+      throw buildHttpError(500, 'No se pudo generar el ID del pedido.');
+    }
+
+    for (const line of normalizedLines) {
+      await insertPublicPedidoDetalleQuery(client, {
+        sub_total_pedido: line.subtotal,
+        total_pedido: line.subtotal,
+        id_producto: line.id_producto,
+        id_pedido: idPedido,
+        id_combo: line.id_combo,
+        id_receta: line.id_receta,
+        observacion: null
+      });
+    }
+
+    await client.query('COMMIT');
+
+    return {
+      id_pedido: idPedido,
+      numero_ticket: buildTicketNumber(idPedido),
+      id_sucursal: Number(idSucursal),
+      id_menu: Number(activeMenu.id_menu),
+      tipo_pedido: tipoPedido,
+      estado: 'PENDIENTE',
+      total,
+      total_items: normalizedLines.reduce((sum, line) => sum + Number(line.cantidad || 0), 0),
+      fecha_hora_pedido: pedido?.fecha_hora_pedido || null,
+      items: normalizedLines.map((line) => ({
+        id_detalle_menu: line.id_detalle_menu,
+        tipo_item: line.tipo_item,
+        nombre: line.nombre,
+        cantidad: line.cantidad,
+        precio_unitario: line.precio_unitario,
+        subtotal: line.subtotal
+      }))
+    };
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally {
+    client.release();
+  }
 };
