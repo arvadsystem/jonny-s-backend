@@ -61,6 +61,7 @@ export const fetchActiveMenuByBranchQuery = async (idSucursal) => {
       AND COALESCE(mv.estado, true) = true
       AND COALESCE(m.estado, true) = true
       AND COALESCE(s.estado, true) = true
+      AND COALESCE(mv.fecha_inicio, NOW()) <= NOW()
     ORDER BY mv.fecha_inicio DESC, mv.id_menu_vigente DESC
     LIMIT 1;
   `;
