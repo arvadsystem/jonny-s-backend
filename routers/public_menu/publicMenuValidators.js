@@ -17,6 +17,22 @@ const sendValidationError = (res, message) =>
     message
   });
 
+const normalizeExtraSelection = (entry) => {
+  const idExtra = String(entry?.id_extra || entry || '').trim();
+  if (!idExtra) return null;
+  return { id_extra: idExtra };
+};
+
+const normalizeSauceSelection = (entry) => {
+  const idSalsa = toPositiveInt(entry?.id_salsa);
+  const cantidad = toPositiveInt(entry?.cantidad);
+  if (!idSalsa || !cantidad) return null;
+  return {
+    id_salsa: idSalsa,
+    cantidad
+  };
+};
+
 // Valida `:id_sucursal` en rutas de sucursal.
 export const validateBranchParam = (req, res, next) => {
   const idSucursal = toPositiveInt(req.params.id_sucursal);
@@ -112,9 +128,27 @@ export const validateCreateOrderBody = (req, res, next) => {
       return sendValidationError(res, 'Cada item debe incluir cantidad valida (> 0).');
     }
 
+    if (row.extras !== undefined && !Array.isArray(row.extras)) {
+      return sendValidationError(res, 'extras debe ser un arreglo cuando se envia en el item.');
+    }
+
+    if (row.salsas_por_unidad !== undefined && !Array.isArray(row.salsas_por_unidad)) {
+      return sendValidationError(res, 'salsas_por_unidad debe ser un arreglo cuando se envia en el item.');
+    }
+
+    const extras = (Array.isArray(row.extras) ? row.extras : [])
+      .map(normalizeExtraSelection)
+      .filter(Boolean);
+
+    const salsasPorUnidad = (Array.isArray(row.salsas_por_unidad) ? row.salsas_por_unidad : [])
+      .map(normalizeSauceSelection)
+      .filter(Boolean);
+
     items.push({
       id_detalle_menu: idDetalleMenu,
-      cantidad
+      cantidad,
+      extras,
+      salsas_por_unidad: salsasPorUnidad
     });
   }
 

@@ -52,6 +52,7 @@ import archivosRoutes from './routers/archivos.js';
 import adminRecetasRouter from './routers/admin_recetas.js';
 import adminCombosRouter from './routers/admin_combos.js';
 import adminMenuPublicacionRouter from './routers/admin_menu_publicacion.js';
+import adminSalsasRouter from './routers/admin_salsas.js';
 
 import { authRequired, csrfProtect } from './middleware/auth.js';
 import { touchSessionMiddleware } from './middleware/touchSession.js';
@@ -121,6 +122,8 @@ app.use('/api/admin/recetas', adminRecetasRouter);
 app.use('/api/admin/combos', adminCombosRouter);
 // Admin: publicacion de menu por sucursal (visible, precio_publico y orden).
 app.use('/api/admin/menu-publicacion', adminMenuPublicacionRouter);
+// Admin: catalogo/configuracion de salsas para recetas y combos.
+app.use('/api/admin/salsas', adminSalsasRouter);
 
 // ✅ 4) Rutas protegidas
 app.use('/seguridad', seguridadSesionesRoutes);

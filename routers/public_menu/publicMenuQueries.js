@@ -8,7 +8,14 @@ export const PUBLIC_ITEM_TYPES = Object.freeze({
 });
 
 // Verifica si una columna existe para mantener compatibilidad con esquemas legacy.
+const schemaColumnCache = new Map();
+
 const hasColumn = async (tableName, columnName) => {
+  const cacheKey = `${String(tableName || '').trim().toLowerCase()}.${String(columnName || '').trim().toLowerCase()}`;
+  if (schemaColumnCache.has(cacheKey)) {
+    return schemaColumnCache.get(cacheKey);
+  }
+
   const query = `
     SELECT 1
     FROM information_schema.columns
@@ -19,7 +26,9 @@ const hasColumn = async (tableName, columnName) => {
   `;
 
   const result = await pool.query(query, [tableName, columnName]);
-  return result.rowCount > 0;
+  const exists = result.rowCount > 0;
+  schemaColumnCache.set(cacheKey, exists);
+  return exists;
 };
 
 // Lista sucursales activas para entrada publica del flujo.
@@ -349,6 +358,81 @@ export const fetchEstadoPedidoRowsQuery = async () => {
   const result = await pool.query(
     'SELECT id_estado_pedido, descripcion FROM estados_pedido ORDER BY id_estado_pedido'
   );
+  return result.rows;
+};
+
+// Componentes receta por combo para calcular reglas de salsas por unidades reales.
+export const fetchComboRecipeComponentsQuery = async (comboIds = []) => {
+  if (!Array.isArray(comboIds) || comboIds.length === 0) return [];
+
+  const result = await pool.query(
+    `
+      SELECT
+        dc.id_combo,
+        dc.id_receta,
+        GREATEST(COALESCE(dc.cantidad, 1), 1)::int AS multiplicador,
+        r.nombre_receta
+      FROM detalle_combo dc
+      INNER JOIN recetas r
+        ON r.id_receta = dc.id_receta
+      WHERE dc.id_combo = ANY($1::int[])
+        AND dc.id_receta IS NOT NULL
+        AND COALESCE(dc.estado, true) = true
+        AND COALESCE(r.estado, true) = true
+      ORDER BY dc.id_combo, COALESCE(dc.orden, dc.id_detalle_combo);
+    `,
+    [comboIds]
+  );
+
+  return result.rows;
+};
+
+// Salsas permitidas por receta activa.
+export const fetchAllowedSauceRowsByRecipeIdsQuery = async (recipeIds = []) => {
+  if (!Array.isArray(recipeIds) || recipeIds.length === 0) return [];
+
+  const result = await pool.query(
+    `
+      SELECT
+        rs.id_receta,
+        s.id_salsa,
+        s.nombre,
+        s.nivel_picante,
+        s.orden
+      FROM receta_salsa rs
+      INNER JOIN salsas s
+        ON s.id_salsa = rs.id_salsa
+      WHERE rs.id_receta = ANY($1::int[])
+        AND COALESCE(rs.estado, true) = true
+        AND COALESCE(s.estado, true) = true
+      ORDER BY rs.id_receta, s.orden, s.nombre;
+    `,
+    [recipeIds]
+  );
+
+  return result.rows;
+};
+
+// Reglas de cuantas salsas son requeridas por rango de unidades.
+export const fetchSauceRuleRowsByRecipeIdsQuery = async (recipeIds = []) => {
+  if (!Array.isArray(recipeIds) || recipeIds.length === 0) return [];
+
+  const result = await pool.query(
+    `
+      SELECT
+        id_regla,
+        id_receta,
+        min_unidades,
+        max_unidades,
+        salsas_requeridas
+      FROM reglas_salsas_receta
+      WHERE id_receta = ANY($1::int[])
+        AND COALESCE(estado, true) = true
+      ORDER BY id_receta, min_unidades, max_unidades NULLS LAST, id_regla;
+    `,
+    [recipeIds]
+  );
+
   return result.rows;
 };
 

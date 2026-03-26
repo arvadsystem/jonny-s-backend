@@ -2,13 +2,16 @@
 import {
   PUBLIC_ITEM_TYPES,
   fetchActiveMenuByBranchQuery,
+  fetchAllowedSauceRowsByRecipeIdsQuery,
   fetchCatalogItemByIdQuery,
   fetchCatalogRowsByMenuQuery,
+  fetchComboRecipeComponentsQuery,
   fetchComboAvailabilityQuery,
   fetchEstadoPedidoRowsQuery,
   fetchFallbackOrderUserIdQuery,
   fetchPublicBranchesQuery,
   fetchRecipeAvailabilityQuery,
+  fetchSauceRuleRowsByRecipeIdsQuery,
   insertPublicPedidoDetalleQuery,
   insertPublicPedidoQuery
 } from './publicMenuQueries.js';
@@ -33,6 +36,16 @@ const SERVICE_TYPE_BY_ORDER_TYPE = Object.freeze({
 });
 
 const ORDER_STATE_ALIASES = Object.freeze(['pendiente']);
+const HAMBURGUESA_KEYWORDS = Object.freeze(['hamburguesa', 'burger', 'smash']);
+const PUBLIC_EXTRA_OPTIONS = Object.freeze([
+  {
+    id_extra: 'hamb-extra-bacon',
+    codigo: 'extra_bacon',
+    nombre: 'Extra bacon',
+    precio_adicional: 30,
+    keywords: HAMBURGUESA_KEYWORDS
+  }
+]);
 
 // Crea errores HTTP controlados para que el controlador responda con status consistente.
 const buildHttpError = (status, message) => {
@@ -48,6 +61,27 @@ const normalizeTextKey = (value) =>
     .trim()
     .toLowerCase()
     .replace(/\s+/g, '_');
+
+const normalizeSearchText = (value) =>
+  String(value || '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .trim()
+    .toLowerCase();
+
+const hasAnyKeyword = (rawText, keywords = []) => {
+  const source = normalizeSearchText(rawText);
+  if (!source) return false;
+  return keywords.some((keyword) => source.includes(normalizeSearchText(keyword)));
+};
+
+const toUniquePositiveIntArray = (values = []) => (
+  [...new Set(
+    (Array.isArray(values) ? values : [])
+      .map((value) => Number(value))
+      .filter((value) => Number.isInteger(value) && value > 0)
+  )]
+);
 
 // Convierte numeros de BD a Number JS cuidando null.
 const toNumberOrNull = (value) => {
@@ -65,6 +99,46 @@ const toPositiveInt = (value) => {
 const roundMoney = (value) => Number(Number(value || 0).toFixed(2));
 const buildTicketNumber = (idPedido) => `VTA-${String(idPedido).padStart(5, '0')}`;
 
+const sortSauceOptions = (items) => (
+  [...(Array.isArray(items) ? items : [])].sort((left, right) => {
+    const orderA = Number(left?.orden || 0);
+    const orderB = Number(right?.orden || 0);
+    if (orderA !== orderB) return orderA - orderB;
+    return String(left?.nombre || '').localeCompare(String(right?.nombre || ''), 'es', {
+      sensitivity: 'base'
+    });
+  })
+);
+
+const findMatchingSalsaRule = (rules, unidades) => {
+  const units = Number(unidades);
+  if (!Number.isFinite(units) || units <= 0) return null;
+
+  const orderedRules = [...(Array.isArray(rules) ? rules : [])].sort((left, right) => (
+    Number(left?.min_unidades || 0) - Number(right?.min_unidades || 0)
+  ));
+
+  return orderedRules.find((rule) => {
+    const min = Number(rule?.min_unidades || 0);
+    const max = rule?.max_unidades === null || rule?.max_unidades === undefined
+      ? null
+      : Number(rule.max_unidades);
+
+    if (!Number.isFinite(min) || units < min) return false;
+    if (max !== null && Number.isFinite(max) && units > max) return false;
+    return true;
+  }) || null;
+};
+
+const calculateRequiredSaucesForQuantity = (components, quantity = 1) => (
+  (Array.isArray(components) ? components : []).reduce((total, component) => {
+    const multiplier = Math.max(1, Number(component?.multiplicador || 1));
+    const units = Math.max(1, Number(quantity || 1)) * multiplier;
+    const rule = findMatchingSalsaRule(component?.reglas, units);
+    return total + Number(rule?.salsas_requeridas || 0);
+  }, 0)
+);
+
 // Normaliza booleans provenientes de PG.
 const toBoolean = (value) => value === true || value === 'true' || value === 1 || value === '1';
 
@@ -75,6 +149,145 @@ const mapBranch = (row) => ({
   address: row.direccion || 'Direccion no disponible',
   isOpen: toBoolean(row.estado)
 });
+
+const normalizeExtraOption = (option) => ({
+  id_extra: String(option?.id_extra || '').trim(),
+  codigo: String(option?.codigo || '').trim(),
+  nombre: String(option?.nombre || 'Extra').trim(),
+  precio_adicional: roundMoney(option?.precio_adicional || 0)
+});
+
+const getCatalogItemExtraOptions = ({ nombre, descripcion, categoriaNombre, tipoItem }) => {
+  if (String(tipoItem || '') !== PUBLIC_ITEM_TYPES.RECETA) {
+    return [];
+  }
+
+  const safeName = String(nombre || '').trim();
+  const safeDescription = String(descripcion || '').trim();
+  const safeCategory = String(categoriaNombre || '').trim();
+
+  return PUBLIC_EXTRA_OPTIONS
+    .filter((option) => (
+      hasAnyKeyword(safeName, option.keywords) ||
+      hasAnyKeyword(safeDescription, option.keywords) ||
+      hasAnyKeyword(safeCategory, option.keywords)
+    ))
+    .map(normalizeExtraOption);
+};
+
+const buildCatalogSauceConfigByDetail = async (catalogRows = []) => {
+  const directRecipeIds = toUniquePositiveIntArray(
+    catalogRows.map((row) => row?.id_receta)
+  );
+  const comboIds = toUniquePositiveIntArray(
+    catalogRows.map((row) => row?.id_combo)
+  );
+
+  const comboComponentRows = comboIds.length > 0
+    ? await fetchComboRecipeComponentsQuery(comboIds)
+    : [];
+
+  const allRecipeIds = toUniquePositiveIntArray([
+    ...directRecipeIds,
+    ...comboComponentRows.map((row) => row?.id_receta)
+  ]);
+
+  const [allowedSauceRows, sauceRuleRows] = allRecipeIds.length > 0
+    ? await Promise.all([
+      fetchAllowedSauceRowsByRecipeIdsQuery(allRecipeIds),
+      fetchSauceRuleRowsByRecipeIdsQuery(allRecipeIds)
+    ])
+    : [[], []];
+
+  const allowedSaucesByRecipe = new Map();
+  for (const row of allowedSauceRows) {
+    const recipeId = Number(row?.id_receta || 0);
+    if (!allowedSaucesByRecipe.has(recipeId)) {
+      allowedSaucesByRecipe.set(recipeId, []);
+    }
+    allowedSaucesByRecipe.get(recipeId).push({
+      id_salsa: Number(row.id_salsa),
+      nombre: row.nombre,
+      nivel_picante: Number(row.nivel_picante || 0),
+      orden: Number(row.orden || 0)
+    });
+  }
+
+  const rulesByRecipe = new Map();
+  for (const row of sauceRuleRows) {
+    const recipeId = Number(row?.id_receta || 0);
+    if (!rulesByRecipe.has(recipeId)) {
+      rulesByRecipe.set(recipeId, []);
+    }
+    rulesByRecipe.get(recipeId).push({
+      id_regla: Number(row.id_regla),
+      min_unidades: Number(row.min_unidades || 0),
+      max_unidades: row.max_unidades === null || row.max_unidades === undefined
+        ? null
+        : Number(row.max_unidades),
+      salsas_requeridas: Number(row.salsas_requeridas || 0)
+    });
+  }
+
+  const comboComponentsById = new Map();
+  for (const row of comboComponentRows) {
+    const comboId = Number(row?.id_combo || 0);
+    const recipeId = Number(row?.id_receta || 0);
+    if (!comboComponentsById.has(comboId)) {
+      comboComponentsById.set(comboId, []);
+    }
+
+    comboComponentsById.get(comboId).push({
+      id_receta: recipeId,
+      nombre_receta: row.nombre_receta,
+      multiplicador: Math.max(1, Number(row?.multiplicador || 1)),
+      salsas_permitidas: sortSauceOptions(allowedSaucesByRecipe.get(recipeId) || []),
+      reglas: rulesByRecipe.get(recipeId) || []
+    });
+  }
+
+  const configByDetail = new Map();
+
+  for (const row of catalogRows) {
+    const idDetalleMenu = Number(row?.id_detalle_menu || 0);
+    if (!idDetalleMenu) continue;
+
+    let salsasComponentes = [];
+    if (Number(row?.id_receta || 0) > 0) {
+      const recipeId = Number(row.id_receta);
+      salsasComponentes = [{
+        id_receta: recipeId,
+        nombre_receta: row.nombre_item || row.descripcion_item || 'Receta',
+        multiplicador: 1,
+        salsas_permitidas: sortSauceOptions(allowedSaucesByRecipe.get(recipeId) || []),
+        reglas: rulesByRecipe.get(recipeId) || []
+      }];
+    } else if (Number(row?.id_combo || 0) > 0) {
+      salsasComponentes = comboComponentsById.get(Number(row.id_combo)) || [];
+    }
+
+    const unionSauces = new Map();
+    for (const component of salsasComponentes) {
+      for (const sauce of component.salsas_permitidas || []) {
+        unionSauces.set(Number(sauce.id_salsa), sauce);
+      }
+    }
+
+    const salsasPermitidas = sortSauceOptions(Array.from(unionSauces.values()));
+    const salsasRequiereSeleccion = salsasComponentes.some((component) =>
+      (component.reglas || []).some((rule) => Number(rule?.salsas_requeridas || 0) > 0)
+    );
+
+    configByDetail.set(idDetalleMenu, {
+      salsas_componentes: salsasComponentes,
+      salsas_permitidas: salsasPermitidas,
+      salsas_requiere_seleccion: salsasRequiereSeleccion,
+      salsas_requeridas_base: calculateRequiredSaucesForQuantity(salsasComponentes, 1)
+    });
+  }
+
+  return configByDetail;
+};
 
 // Crea metadata de disponibilidad unificada para frontend.
 const buildAvailabilityPayload = ({ available, reasonCode = null }) => ({
@@ -138,11 +351,28 @@ const resolvePricePayload = (row) => {
 };
 
 // Convierte una fila SQL de catalogo a payload publico final.
-const mapCatalogItem = ({ row, recipeAvailabilityMap, comboAvailabilityMap }) => {
+const mapCatalogItem = ({
+  row,
+  recipeAvailabilityMap,
+  comboAvailabilityMap,
+  sauceConfigByDetail = new Map()
+}) => {
   const price = resolvePricePayload(row);
   const availability = row.tipo_item === PUBLIC_ITEM_TYPES.PRODUCTO
     ? resolveProductAvailability(row)
     : resolveComposedAvailability({ row, recipeAvailabilityMap, comboAvailabilityMap });
+  const itemSauceConfig = sauceConfigByDetail.get(Number(row?.id_detalle_menu || 0)) || {
+    salsas_componentes: [],
+    salsas_permitidas: [],
+    salsas_requiere_seleccion: false,
+    salsas_requeridas_base: 0
+  };
+  const extrasOpciones = getCatalogItemExtraOptions({
+    nombre: row?.nombre_item,
+    descripcion: row?.descripcion_item,
+    categoriaNombre: row?.categoria_nombre,
+    tipoItem: row?.tipo_item
+  });
 
   const finalAvailability = !price.hasValidPrice
     ? buildAvailabilityPayload({ available: false, reasonCode: 'SIN_PRECIO' })
@@ -164,6 +394,11 @@ const mapCatalogItem = ({ row, recipeAvailabilityMap, comboAvailabilityMap }) =>
     imagen_url: row.url_imagen || '',
     precio: price,
     disponibilidad: finalAvailability,
+    extras_opciones: extrasOpciones,
+    salsas_componentes: itemSauceConfig.salsas_componentes,
+    salsas_permitidas: itemSauceConfig.salsas_permitidas,
+    salsas_requiere_seleccion: itemSauceConfig.salsas_requiere_seleccion,
+    salsas_requeridas_base: Number(itemSauceConfig.salsas_requeridas_base || 0),
     visible: toBoolean(row.visible),
     orden: Number(row.orden || 0)
   };
@@ -191,6 +426,46 @@ const resolvePendingStateId = async () => {
   return id > 0 ? id : null;
 };
 
+const normalizeRequestedExtras = (rawExtras = []) => {
+  const uniqueIds = [...new Set(
+    (Array.isArray(rawExtras) ? rawExtras : [])
+      .map((entry) => String(entry?.id_extra || entry || '').trim())
+      .filter(Boolean)
+  )];
+
+  return uniqueIds.map((id_extra) => ({ id_extra }));
+};
+
+const normalizeRequestedSauces = (rawSauces = []) => {
+  const merged = new Map();
+
+  (Array.isArray(rawSauces) ? rawSauces : []).forEach((entry) => {
+    const id_salsa = toPositiveInt(entry?.id_salsa);
+    const cantidad = toPositiveInt(entry?.cantidad);
+    if (!id_salsa || !cantidad) return;
+
+    const current = merged.get(id_salsa) || 0;
+    merged.set(id_salsa, current + cantidad);
+  });
+
+  return Array.from(merged.entries())
+    .map(([id_salsa, cantidad]) => ({ id_salsa: Number(id_salsa), cantidad: Number(cantidad) }))
+    .sort((left, right) => left.id_salsa - right.id_salsa);
+};
+
+const buildRequestedConfigSignature = ({ extras = [], salsas_por_unidad = [] }) => {
+  const extrasToken = normalizeRequestedExtras(extras)
+    .map((entry) => entry.id_extra)
+    .sort()
+    .join('|');
+
+  const saucesToken = normalizeRequestedSauces(salsas_por_unidad)
+    .map((entry) => `${entry.id_salsa}:${entry.cantidad}`)
+    .join('|');
+
+  return `${extrasToken}::${saucesToken}`;
+};
+
 const normalizeRequestedOrderItems = (items = []) => {
   const merged = new Map();
 
@@ -199,14 +474,120 @@ const normalizeRequestedOrderItems = (items = []) => {
     const cantidad = toPositiveInt(row?.cantidad);
     if (!idDetalleMenu || !cantidad) return;
 
-    const current = merged.get(idDetalleMenu) || 0;
-    merged.set(idDetalleMenu, current + cantidad);
+    const signature = buildRequestedConfigSignature({
+      extras: row?.extras,
+      salsas_por_unidad: row?.salsas_por_unidad
+    });
+    const lineKey = `${idDetalleMenu}::${signature}`;
+    const current = merged.get(lineKey);
+
+    if (!current) {
+      merged.set(lineKey, {
+        id_detalle_menu: idDetalleMenu,
+        cantidad,
+        extras: normalizeRequestedExtras(row?.extras),
+        salsas_por_unidad: normalizeRequestedSauces(row?.salsas_por_unidad)
+      });
+      return;
+    }
+
+    current.cantidad += cantidad;
   });
 
-  return Array.from(merged.entries()).map(([idDetalleMenu, cantidad]) => ({
-    id_detalle_menu: idDetalleMenu,
-    cantidad
+  return Array.from(merged.values()).map((line) => ({
+    ...line,
+    cantidad: Number(line.cantidad || 0)
   }));
+};
+
+const buildLineObservation = ({ extras = [], salsasPorUnidad = [] }) => {
+  const extrasToken = (Array.isArray(extras) ? extras : [])
+    .map((entry) => {
+      const code = normalizeTextKey(entry?.codigo || entry?.id_extra || '');
+      if (!code) return null;
+      return `${code}*1@${roundMoney(entry?.precio_adicional || 0).toFixed(2)}`;
+    })
+    .filter(Boolean)
+    .sort()
+    .join(',');
+
+  const saucesToken = (Array.isArray(salsasPorUnidad) ? salsasPorUnidad : [])
+    .map((entry) => {
+      const id = Number(entry?.id_salsa || 0);
+      const qty = Number(entry?.cantidad || 0);
+      if (!Number.isInteger(id) || id <= 0 || !Number.isInteger(qty) || qty <= 0) return null;
+      return `${id}*${qty}`;
+    })
+    .filter(Boolean)
+    .sort()
+    .join(',');
+
+  const chunks = [];
+  if (extrasToken) chunks.push(`extras=${extrasToken}`);
+  if (saucesToken) chunks.push(`salsas=${saucesToken}`);
+  if (chunks.length === 0) return null;
+
+  return `PUBCFG:v1|${chunks.join('|')}`.slice(0, 200);
+};
+
+const validateAndResolveLineConfiguration = ({ catalog, line }) => {
+  const extraOptions = Array.isArray(catalog?.extras_opciones) ? catalog.extras_opciones : [];
+  const extraOptionById = new Map(extraOptions.map((option) => [String(option.id_extra), option]));
+  const selectedExtraIds = normalizeRequestedExtras(line?.extras).map((entry) => entry.id_extra);
+
+  const resolvedExtras = selectedExtraIds.map((idExtra) => {
+    const option = extraOptionById.get(String(idExtra));
+    if (!option) {
+      throw buildHttpError(400, `El item ${catalog.nombre} no permite el extra solicitado (${idExtra}).`);
+    }
+    return {
+      id_extra: String(option.id_extra),
+      codigo: String(option.codigo || option.id_extra),
+      nombre: String(option.nombre || 'Extra'),
+      precio_adicional: roundMoney(option.precio_adicional || 0)
+    };
+  });
+
+  const extraUnitAmount = roundMoney(
+    resolvedExtras.reduce((sum, entry) => sum + Number(entry.precio_adicional || 0), 0)
+  );
+
+  const allowedSauces = Array.isArray(catalog?.salsas_permitidas) ? catalog.salsas_permitidas : [];
+  const allowedSauceIds = new Set(allowedSauces.map((entry) => Number(entry.id_salsa)));
+  const selectedSauces = normalizeRequestedSauces(line?.salsas_por_unidad);
+
+  for (const selected of selectedSauces) {
+    if (!allowedSauceIds.has(Number(selected.id_salsa))) {
+      throw buildHttpError(
+        400,
+        `El item ${catalog.nombre} no permite la salsa ${selected.id_salsa} para esta configuracion.`
+      );
+    }
+  }
+
+  const selectedSauceCount = selectedSauces.reduce(
+    (sum, entry) => sum + Number(entry.cantidad || 0),
+    0
+  );
+  const requiredSauces = calculateRequiredSaucesForQuantity(
+    catalog?.salsas_componentes,
+    Number(line?.cantidad || 1)
+  );
+  const requiresSelection = catalog?.salsas_requiere_seleccion === true;
+
+  if (requiresSelection && requiredSauces > 0 && selectedSauceCount !== requiredSauces) {
+    throw buildHttpError(
+      400,
+      `El item ${catalog.nombre} requiere ${requiredSauces} salsa(s) para la cantidad seleccionada.`
+    );
+  }
+
+  return {
+    extras: resolvedExtras,
+    salsas_por_unidad: selectedSauces,
+    extra_unit_amount: extraUnitAmount,
+    salsas_requeridas: Number(requiredSauces || 0)
+  };
 };
 
 // Servicio: listar sucursales publicas.
@@ -240,6 +621,7 @@ export const getPublicCatalogService = async ({ idSucursal, tipoPedido = null })
   }
 
   const rows = await fetchCatalogRowsByMenuQuery(Number(activeMenu.id_menu));
+  const sauceConfigByDetail = await buildCatalogSauceConfigByDetail(rows);
 
   const recipeIds = rows
     .filter((row) => row.tipo_item === PUBLIC_ITEM_TYPES.RECETA && row.id_receta)
@@ -258,7 +640,12 @@ export const getPublicCatalogService = async ({ idSucursal, tipoPedido = null })
   const comboAvailabilityMap = toAvailabilityMap(comboAvailabilityRows, 'id_combo');
 
   const items = rows.map((row) =>
-    mapCatalogItem({ row, recipeAvailabilityMap, comboAvailabilityMap })
+    mapCatalogItem({
+      row,
+      recipeAvailabilityMap,
+      comboAvailabilityMap,
+      sauceConfigByDetail
+    })
   );
 
   const disponibles = items.filter((item) => item.disponibilidad.available).length;
@@ -290,6 +677,7 @@ export const getPublicCatalogItemDetailService = async ({ idSucursal, idDetalleM
   if (!row) {
     throw buildHttpError(404, 'El item no existe en el menu vigente de esta sucursal.');
   }
+  const sauceConfigByDetail = await buildCatalogSauceConfigByDetail([row]);
 
   const recipeIds = row.id_receta ? [Number(row.id_receta)] : [];
   const comboIds = row.id_combo ? [Number(row.id_combo)] : [];
@@ -304,7 +692,12 @@ export const getPublicCatalogItemDetailService = async ({ idSucursal, idDetalleM
 
   return {
     menu: mapMenuSummary(activeMenu),
-    item: mapCatalogItem({ row, recipeAvailabilityMap, comboAvailabilityMap })
+    item: mapCatalogItem({
+      row,
+      recipeAvailabilityMap,
+      comboAvailabilityMap,
+      sauceConfigByDetail
+    })
   };
 };
 
@@ -321,6 +714,7 @@ export const createPublicOrderService = async ({ idSucursal, tipoPedido, origen 
   }
 
   const rows = await fetchCatalogRowsByMenuQuery(Number(activeMenu.id_menu));
+  const sauceConfigByDetail = await buildCatalogSauceConfigByDetail(rows);
 
   const recipeIds = rows
     .filter((row) => row.tipo_item === PUBLIC_ITEM_TYPES.RECETA && row.id_receta)
@@ -339,7 +733,12 @@ export const createPublicOrderService = async ({ idSucursal, tipoPedido, origen 
   const comboAvailabilityMap = toAvailabilityMap(comboAvailabilityRows, 'id_combo');
 
   const catalogItems = rows.map((row) =>
-    mapCatalogItem({ row, recipeAvailabilityMap, comboAvailabilityMap })
+    mapCatalogItem({
+      row,
+      recipeAvailabilityMap,
+      comboAvailabilityMap,
+      sauceConfigByDetail
+    })
   );
 
   const catalogByDetail = new Map(catalogItems.map((item) => [Number(item.id_detalle_menu), item]));
@@ -354,13 +753,19 @@ export const createPublicOrderService = async ({ idSucursal, tipoPedido, origen 
       throw buildHttpError(409, `El item ${catalog.nombre} no esta disponible actualmente.`);
     }
 
-    const precioUnitario = toNumberOrNull(catalog?.precio?.final);
-    if (precioUnitario === null || precioUnitario <= 0) {
+    const configuration = validateAndResolveLineConfiguration({ catalog, line });
+    const precioBase = toNumberOrNull(catalog?.precio?.final);
+    if (precioBase === null || precioBase <= 0) {
       throw buildHttpError(400, `El item ${catalog.nombre} no tiene precio valido para registrar pedido.`);
     }
 
     const cantidad = toPositiveInt(line.cantidad);
+    const precioUnitario = roundMoney(Number(precioBase || 0) + Number(configuration.extra_unit_amount || 0));
     const subtotal = roundMoney(precioUnitario * cantidad);
+    const observacion = buildLineObservation({
+      extras: configuration.extras,
+      salsasPorUnidad: configuration.salsas_por_unidad
+    });
 
     return {
       id_detalle_menu: Number(catalog.id_detalle_menu),
@@ -371,7 +776,11 @@ export const createPublicOrderService = async ({ idSucursal, tipoPedido, origen 
       nombre: catalog.nombre,
       cantidad,
       precio_unitario: roundMoney(precioUnitario),
-      subtotal
+      subtotal,
+      observacion,
+      extras: configuration.extras,
+      salsas_por_unidad: configuration.salsas_por_unidad,
+      salsas_requeridas: configuration.salsas_requeridas
     };
   });
 
@@ -417,7 +826,7 @@ export const createPublicOrderService = async ({ idSucursal, tipoPedido, origen 
         id_pedido: idPedido,
         id_combo: line.id_combo,
         id_receta: line.id_receta,
-        observacion: null
+        observacion: line.observacion
       });
     }
 
@@ -439,7 +848,10 @@ export const createPublicOrderService = async ({ idSucursal, tipoPedido, origen 
         nombre: line.nombre,
         cantidad: line.cantidad,
         precio_unitario: line.precio_unitario,
-        subtotal: line.subtotal
+        subtotal: line.subtotal,
+        extras: line.extras,
+        salsas_por_unidad: line.salsas_por_unidad,
+        salsas_requeridas: line.salsas_requeridas
       }))
     };
   } catch (error) {
