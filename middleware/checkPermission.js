@@ -33,6 +33,11 @@ const LEGACY_PERMISSION_ALIASES = Object.freeze({
   EMPLEADOS_DETALLE_VER: ['EMPLEADOS_VER'],
   EMPLEADOS_USAR_FILTROS: ['EMPLEADOS_FILTROS_USAR'],
 
+  // Compatibilidad temporal del modulo Planillas mientras se propagan permisos PLANILLAS_* en roles.
+  PLANILLAS_MODULO_VER: ['PERSONAS_MODULO_VER'],
+  PLANILLAS_LISTADO_VER: ['PERSONAS_MODULO_VER'],
+  PLANILLAS_DETALLE_VER: ['PERSONAS_MODULO_VER'],
+
   USUARIOS_MODULO_VER: ['USUARIOS_VER'],
   USUARIOS_LISTADO_VER: ['USUARIOS_VER'],
   USUARIOS_DETALLE_VER: ['USUARIOS_VER'],
@@ -247,3 +252,4 @@ export function checkPermission(requiredPermission) {
     }
   };
 }
+
