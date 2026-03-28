@@ -6,7 +6,7 @@
  * - string: un permiso exacto
  * - array: acceso si tiene al menos uno de los permisos indicados
  * - bypass para rol SUPER_ADMIN
- * - compatibilidad temporal segura (endpoint nuevo -> permiso legacy equivalente)
+ * - compatibilidad segura para aliases legacy puntuales (sin incluir PLANILLAS_*)
  */
 
 import pool from '../config/db-connection.js';
@@ -32,11 +32,6 @@ const LEGACY_PERMISSION_ALIASES = Object.freeze({
   EMPLEADOS_LISTADO_VER: ['EMPLEADOS_VER'],
   EMPLEADOS_DETALLE_VER: ['EMPLEADOS_VER'],
   EMPLEADOS_USAR_FILTROS: ['EMPLEADOS_FILTROS_USAR'],
-
-  // Compatibilidad temporal del modulo Planillas mientras se propagan permisos PLANILLAS_* en roles.
-  PLANILLAS_MODULO_VER: ['PERSONAS_MODULO_VER'],
-  PLANILLAS_LISTADO_VER: ['PERSONAS_MODULO_VER'],
-  PLANILLAS_DETALLE_VER: ['PERSONAS_MODULO_VER'],
 
   USUARIOS_MODULO_VER: ['USUARIOS_VER'],
   USUARIOS_LISTADO_VER: ['USUARIOS_VER'],

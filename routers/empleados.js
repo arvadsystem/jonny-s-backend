@@ -1,6 +1,16 @@
 import express from 'express';
 import pool from '../config/db-connection.js';
 import { checkPermission } from '../middleware/checkPermission.js';
+import {
+  buildErrorBody,
+  mapDbErrorToSafe,
+  sanitizeApiErrorMessage,
+  isValidDateOnly,
+  isFutureDateOnly,
+  isSafePhoneHN,
+  isSafeHumanName,
+  unknownFieldsFromPayload
+} from '../utils/security/personasHardening.js';
 
 const router = express.Router();
 const EMPLEADOS_LIST_PERMISSIONS = ['EMPLEADOS_LISTADO_VER'];
@@ -47,6 +57,13 @@ const resolveUserId = (req) => req.user?.id_usuario ?? null;
 const normalizeSearchText = (value) => String(value ?? '').trim().toLowerCase();
 const hasOwn = (obj, key) => Object.prototype.hasOwnProperty.call(obj, key);
 const hasTextValue = (value) => value !== null && value !== undefined && String(value).trim() !== '';
+const rollbackQuietly = async (client) => {
+  try {
+    await client.query('ROLLBACK');
+  } catch {
+    // noop
+  }
+};
 
 const normalizeLegacyUpdatePayload = (body) => {
   if (!isPlainObject(body)) return null;
@@ -133,21 +150,51 @@ const empleadoMatchesSearch = (empleado, normalizedSearch) => {
 };
 
 const mapDbError = (err) => {
-  if (!err?.code) return null;
+  return mapDbErrorToSafe(err, {
+    defaultMessage: 'No se pudo procesar la solicitud de empleados.'
+  });
+};
 
-  if (err.code === 'P0001' && /no existe/i.test(err.message || '')) {
-    return { status: 404, message: err.message };
+const validateEmpleadoPayload = (payload = {}, { requirePersona = false, requireSucursal = false } = {}) => {
+  const errors = [];
+
+  if (requirePersona && !parsePositiveInt(payload.id_persona)) {
+    errors.push({ field: 'id_persona', message: 'id_persona es requerido y debe ser entero positivo.' });
   }
 
-  const badRequestCodes = new Set(['22P02', '22003', '22007', '22008', '23502', '23503', '23505', 'P0001']);
-  if (badRequestCodes.has(err.code)) {
-    return {
-      status: 400,
-      message: err.detail || err.message || 'Solicitud invalida para empleados'
-    };
+  if (requireSucursal && !parsePositiveInt(payload.id_sucursal)) {
+    errors.push({ field: 'id_sucursal', message: 'id_sucursal es requerido y debe ser entero positivo.' });
   }
 
-  return null;
+  if (Object.prototype.hasOwnProperty.call(payload, 'salario_base')) {
+    const salary = Number(payload.salario_base);
+    if (!Number.isFinite(salary) || salary < 0) {
+      errors.push({ field: 'salario_base', message: 'salario_base debe ser un numero valido mayor o igual a 0.' });
+    }
+  }
+
+  if (Object.prototype.hasOwnProperty.call(payload, 'fecha_ingreso')) {
+    const date = String(payload.fecha_ingreso ?? '').trim();
+    if (date && (!isValidDateOnly(date) || isFutureDateOnly(date))) {
+      errors.push({ field: 'fecha_ingreso', message: 'fecha_ingreso no es valida.' });
+    }
+  }
+
+  if (Object.prototype.hasOwnProperty.call(payload, 'telefono_referencia')) {
+    const phone = String(payload.telefono_referencia ?? '').trim();
+    if (phone && !isSafePhoneHN(phone)) {
+      errors.push({ field: 'telefono_referencia', message: 'telefono_referencia debe tener formato ####-####.' });
+    }
+  }
+
+  if (Object.prototype.hasOwnProperty.call(payload, 'nombre_referencia')) {
+    const name = String(payload.nombre_referencia ?? '').trim();
+    if (name && !isSafeHumanName(name)) {
+      errors.push({ field: 'nombre_referencia', message: 'nombre_referencia solo puede contener letras y espacios.' });
+    }
+  }
+
+  return errors;
 };
 
 const getSchemaCapabilities = async () => {
@@ -282,7 +329,7 @@ const empleadoRepository = {
     });
   },
 
-  async findById(idEmpleado, capabilities) {
+  async findById(idEmpleado, capabilities, db = pool) {
     const fields = BASE_FIELDS.map((field) => `e.${field}`);
     if (capabilities.softDeleteField && !BASE_FIELDS.includes(capabilities.softDeleteField)) {
       fields.push(`e.${capabilities.softDeleteField}`);
@@ -315,20 +362,20 @@ const empleadoRepository = {
       LIMIT 1
     `;
 
-    const result = await pool.query(query, [idEmpleado]);
+    const result = await db.query(query, [idEmpleado]);
     return result.rows[0] || null;
   },
 
-  async create(data) {
-    const result = await pool.query(
+  async create(data, db = pool) {
+    const result = await db.query(
       'SELECT empleados_crear($1::json) AS id_empleado',
       [JSON.stringify(data ?? {})]
     );
     return parsePositiveInt(result.rows[0]?.id_empleado);
   },
 
-  async update(idEmpleado, data) {
-    await pool.query(
+  async update(idEmpleado, data, db = pool) {
+    await db.query(
       'SELECT empleados_actualizar($1, $2::json)',
       [idEmpleado, JSON.stringify(data ?? {})]
     );
@@ -369,26 +416,44 @@ const empleadoRepository = {
     return null;
   },
 
-  async updateField(idEmpleado, campo, valor) {
-    await pool.query(
+  async updateField(idEmpleado, campo, valor, db = pool) {
+    await db.query(
       'CALL pa_update($1::TEXT, $2::TEXT, $3::TEXT, $4::TEXT, $5::TEXT)',
       ['empleados', campo, String(valor), 'id_empleado', String(idEmpleado)]
     );
   },
 
-  async hardDelete(idEmpleado) {
-    await pool.query(
+  async hardDelete(idEmpleado, db = pool) {
+    await db.query(
       'CALL pa_delete($1::TEXT, $2::TEXT, $3::TEXT)',
       ['empleados', 'id_empleado', String(idEmpleado)]
     );
   },
 
-  async addAuditLog({ accion, descripcion, idUsuario, capabilities }) {
+  async addAuditLog({ accion, descripcion, idUsuario, capabilities, db = pool }) {
     if (!capabilities.hasBitacorasTable || !idUsuario) return;
-    await pool.query(
+    await db.query(
       'INSERT INTO bitacoras (accion, descripcion, id_usuario) VALUES ($1, $2, $3)',
       [accion, descripcion, idUsuario]
     );
+  },
+
+  async personaExists(idPersona, db = pool) {
+    const result = await db.query('SELECT 1 FROM personas WHERE id_persona = $1 LIMIT 1', [idPersona]);
+    return result.rows.length > 0;
+  },
+
+  async sucursalExists(idSucursal, db = pool) {
+    const result = await db.query('SELECT 1 FROM sucursales WHERE id_sucursal = $1 LIMIT 1', [idSucursal]);
+    return result.rows.length > 0;
+  },
+
+  async personaTenantEmpresa(idPersona, db = pool) {
+    const result = await db.query(
+      'SELECT id_empresa FROM personas WHERE id_persona = $1 LIMIT 1',
+      [idPersona]
+    );
+    return result.rows[0]?.id_empresa ?? null;
   }
 };
 
@@ -408,9 +473,14 @@ const empleadoService = {
     const searchName = typeof req.query.nombre === 'string' ? req.query.nombre.trim() : '';
     const effectiveSearch = search || searchQuery || searchName;
     const estado = parseBooleanFilter(req.query.estado);
+    const idSucursal = req.query.id_sucursal === undefined ? null : parsePositiveInt(req.query.id_sucursal);
 
     if (req.query.estado !== undefined && estado === null) {
       return { status: 400, body: { error: true, message: 'El filtro estado debe ser booleano' } };
+    }
+
+    if (req.query.id_sucursal !== undefined && !idSucursal) {
+      return { status: 400, body: { error: true, message: 'El filtro id_sucursal debe ser entero positivo' } };
     }
 
     if (req.query.estado !== undefined && !capabilities.softDeleteField) {
@@ -441,6 +511,10 @@ const empleadoService = {
             ? row[capabilities.softDeleteField]
             : row.estado;
         return Boolean(rowSoftDeleteValue) === estado;
+      })
+      .filter((row) => {
+        if (!idSucursal) return true;
+        return parsePositiveInt(row.id_sucursal) === idSucursal;
       })
       .filter((row) => empleadoMatchesSearch(row, normalizedSearch))
       .sort((a, b) => Number(a.id_empleado) - Number(b.id_empleado));
@@ -504,7 +578,35 @@ const empleadoService = {
     const payload = req.body;
 
     if (!isPlainObject(payload) || Object.keys(payload).length === 0) {
-      return { status: 400, body: { error: true, message: 'Debe enviar un objeto con datos validos' } };
+      return {
+        status: 400,
+        body: buildErrorBody({ code: 'VALIDATION_ERROR', message: 'Debe enviar un objeto con datos validos.' })
+      };
+    }
+
+    const allowedFields = new Set([...FUNCTION_UPDATE_FIELDS, 'id_empresa', 'created_by', 'updated_by']);
+    const unknownFields = unknownFieldsFromPayload(payload, allowedFields);
+    if (unknownFields.length) {
+      return {
+        status: 400,
+        body: buildErrorBody({
+          code: 'UNKNOWN_FIELDS',
+          message: 'El payload contiene campos no permitidos.',
+          details: { fields: unknownFields }
+        })
+      };
+    }
+
+    const validationErrors = validateEmpleadoPayload(payload, { requirePersona: true, requireSucursal: true });
+    if (validationErrors.length) {
+      return {
+        status: 400,
+        body: buildErrorBody({
+          code: 'VALIDATION_ERROR',
+          message: validationErrors[0].message,
+          details: { field: validationErrors[0].field }
+        })
+      };
     }
 
     const insertData = { ...payload };
@@ -514,38 +616,81 @@ const empleadoService = {
     if (capabilities.hasTenantField && tenantId) {
       const requestedTenantId = parsePositiveInt(insertData.id_empresa);
       if (requestedTenantId && requestedTenantId !== tenantId) {
-        return { status: 403, body: { error: true, message: 'No puede crear empleados para otra empresa' } };
+        return {
+          status: 403,
+          body: buildErrorBody({ code: 'FORBIDDEN', message: 'No puede crear empleados para otra empresa.' })
+        };
       }
       if (!requestedTenantId) {
         insertData.id_empresa = tenantId;
       }
     }
 
+    const idPersona = parsePositiveInt(insertData.id_persona);
+    const idSucursal = parsePositiveInt(insertData.id_sucursal);
+    if (!idPersona || !(await empleadoRepository.personaExists(idPersona))) {
+      return {
+        status: 404,
+        body: buildErrorBody({ code: 'NOT_FOUND', message: 'La persona seleccionada no existe.' })
+      };
+    }
+
+    if (!idSucursal || !(await empleadoRepository.sucursalExists(idSucursal))) {
+      return {
+        status: 404,
+        body: buildErrorBody({ code: 'NOT_FOUND', message: 'La sucursal seleccionada no existe.' })
+      };
+    }
+
+    if (tenantId && capabilities.hasPersonaTenantField) {
+      const personaTenant = parsePositiveInt(await empleadoRepository.personaTenantEmpresa(idPersona));
+      if (personaTenant && personaTenant !== tenantId) {
+        return {
+          status: 403,
+          body: buildErrorBody({ code: 'FORBIDDEN', message: 'No puede vincular personas de otra empresa.' })
+        };
+      }
+    }
+
     if (capabilities.hasCreatedBy && idUsuario) insertData.created_by = idUsuario;
     if (capabilities.hasUpdatedBy && idUsuario) insertData.updated_by = idUsuario;
 
-    const idEmpleado = await empleadoRepository.create(insertData);
-    if (!idEmpleado) {
-      throw new Error('No se pudo obtener el id del empleado creado');
-    }
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
 
-    if (capabilities.hasTenantField && insertData.id_empresa !== undefined) {
-      await empleadoRepository.updateField(idEmpleado, 'id_empresa', insertData.id_empresa);
-    }
-    if (capabilities.hasCreatedBy && idUsuario) {
-      await empleadoRepository.updateField(idEmpleado, 'created_by', idUsuario);
-    }
-    if (capabilities.hasUpdatedBy && idUsuario) {
-      await empleadoRepository.updateField(idEmpleado, 'updated_by', idUsuario);
-    }
-    await empleadoRepository.addAuditLog({
-      accion: 'EMPLEADO_CREAR',
-      descripcion: `Empleado creado: persona ${payload.id_persona ?? 'sin_persona'}`,
-      idUsuario,
-      capabilities
-    });
+      const idEmpleado = await empleadoRepository.create(insertData, client);
+      if (!idEmpleado) {
+        const error = new Error('No se pudo obtener el id del empleado creado');
+        error.httpStatus = 500;
+        throw error;
+      }
 
-    return { status: 201, body: { message: 'Empleado creado exitosamente.' } };
+      if (capabilities.hasTenantField && insertData.id_empresa !== undefined) {
+        await empleadoRepository.updateField(idEmpleado, 'id_empresa', insertData.id_empresa, client);
+      }
+      if (capabilities.hasCreatedBy && idUsuario) {
+        await empleadoRepository.updateField(idEmpleado, 'created_by', idUsuario, client);
+      }
+      if (capabilities.hasUpdatedBy && idUsuario) {
+        await empleadoRepository.updateField(idEmpleado, 'updated_by', idUsuario, client);
+      }
+      await empleadoRepository.addAuditLog({
+        accion: 'EMPLEADO_CREAR',
+        descripcion: `Empleado creado: persona ${payload.id_persona ?? 'sin_persona'}`,
+        idUsuario,
+        capabilities,
+        db: client
+      });
+
+      await client.query('COMMIT');
+      return { status: 201, body: { ok: true, error: false, message: 'Empleado creado exitosamente.' } };
+    } catch (error) {
+      await rollbackQuietly(client);
+      throw error;
+    } finally {
+      client.release();
+    }
   },
 
   async update(req) {
@@ -553,7 +698,10 @@ const empleadoService = {
     const idEmpleado = parsePositiveInt(req.params.id);
 
     if (!idEmpleado) {
-      return { status: 400, body: { error: true, message: 'El id debe ser un entero positivo' } };
+      return {
+        status: 400,
+        body: buildErrorBody({ code: 'VALIDATION_ERROR', message: 'El id debe ser un entero positivo.' })
+      };
     }
 
     const legacyPayload = normalizeLegacyUpdatePayload(req.body);
@@ -562,7 +710,10 @@ const empleadoService = {
     if (!isPlainObject(rawPayload) || Object.keys(rawPayload).length === 0) {
       return {
         status: 400,
-        body: { error: true, message: 'Debe enviar un objeto JSON con campos para actualizar' }
+        body: buildErrorBody({
+          code: 'VALIDATION_ERROR',
+          message: 'Debe enviar un objeto JSON con campos para actualizar.'
+        })
       };
     }
 
@@ -575,10 +726,25 @@ const empleadoService = {
       Object.entries(rawPayload).filter(([campo, valor]) => campo && valor !== undefined)
     );
 
+    const unknownFields = unknownFieldsFromPayload(payload, allowedFields);
+    if (unknownFields.length) {
+      return {
+        status: 400,
+        body: buildErrorBody({
+          code: 'UNKNOWN_FIELDS',
+          message: 'El payload contiene campos no permitidos.',
+          details: { fields: unknownFields }
+        })
+      };
+    }
+
     if (!Object.keys(payload).length) {
       return {
         status: 400,
-        body: { error: true, message: 'Debe enviar al menos un campo valido para actualizar' }
+        body: buildErrorBody({
+          code: 'VALIDATION_ERROR',
+          message: 'Debe enviar al menos un campo valido para actualizar.'
+        })
       };
     }
 
@@ -586,21 +752,36 @@ const empleadoService = {
     if (invalidFields.length) {
       return {
         status: 400,
-        body: {
-          error: true,
+        body: buildErrorBody({
+          code: 'VALIDATION_ERROR',
           message: `Campos no validos para actualizacion: ${invalidFields.join(', ')}`
-        }
+        })
+      };
+    }
+
+    const validationErrors = validateEmpleadoPayload(payload, {
+      requirePersona: false,
+      requireSucursal: false
+    });
+    if (validationErrors.length) {
+      return {
+        status: 400,
+        body: buildErrorBody({
+          code: 'VALIDATION_ERROR',
+          message: validationErrors[0].message,
+          details: { field: validationErrors[0].field }
+        })
       };
     }
 
     const current = await empleadoRepository.findById(idEmpleado, capabilities);
     if (!current) {
-      return { status: 404, body: { error: true, message: 'Empleado no encontrado' } };
+      return { status: 404, body: buildErrorBody({ code: 'NOT_FOUND', message: 'Empleado no encontrado.' }) };
     }
 
     const tenantId = parsePositiveInt(req.user?.id_empresa);
     if (tenantId && capabilities.hasTenantField && tenantId !== current.id_empresa) {
-      return { status: 403, body: { error: true, message: 'Acceso denegado para este empleado' } };
+      return { status: 403, body: buildErrorBody({ code: 'FORBIDDEN', message: 'Acceso denegado para este empleado.' }) };
     }
 
     if (
@@ -610,7 +791,7 @@ const empleadoService = {
       capabilities.hasPersonaTenantField &&
       tenantId !== parsePositiveInt(current.persona_id_empresa)
     ) {
-      return { status: 403, body: { error: true, message: 'Acceso denegado para este empleado' } };
+      return { status: 403, body: buildErrorBody({ code: 'FORBIDDEN', message: 'Acceso denegado para este empleado.' }) };
     }
 
     if (
@@ -619,7 +800,36 @@ const empleadoService = {
       tenantId &&
       parsePositiveInt(payload.id_empresa) !== tenantId
     ) {
-      return { status: 403, body: { error: true, message: 'No puede mover empleados a otra empresa' } };
+      return { status: 403, body: buildErrorBody({ code: 'FORBIDDEN', message: 'No puede mover empleados a otra empresa.' }) };
+    }
+
+    if (hasOwn(payload, 'id_persona')) {
+      const nextPersonaId = parsePositiveInt(payload.id_persona);
+      if (!nextPersonaId || !(await empleadoRepository.personaExists(nextPersonaId))) {
+        return {
+          status: 404,
+          body: buildErrorBody({ code: 'NOT_FOUND', message: 'La persona seleccionada no existe.' })
+        };
+      }
+      if (tenantId && capabilities.hasPersonaTenantField) {
+        const personaTenant = parsePositiveInt(await empleadoRepository.personaTenantEmpresa(nextPersonaId));
+        if (personaTenant && personaTenant !== tenantId) {
+          return {
+            status: 403,
+            body: buildErrorBody({ code: 'FORBIDDEN', message: 'No puede vincular personas de otra empresa.' })
+          };
+        }
+      }
+    }
+
+    if (hasOwn(payload, 'id_sucursal')) {
+      const nextSucursalId = parsePositiveInt(payload.id_sucursal);
+      if (!nextSucursalId || !(await empleadoRepository.sucursalExists(nextSucursalId))) {
+        return {
+          status: 404,
+          body: buildErrorBody({ code: 'NOT_FOUND', message: 'La sucursal seleccionada no existe.' })
+        };
+      }
     }
 
     const functionPayload = {};
@@ -633,30 +843,43 @@ const empleadoService = {
       }
     }
 
-    if (Object.keys(functionPayload).length > 0) {
-      await empleadoRepository.update(idEmpleado, functionPayload);
-    }
-
-    for (const [campo, valor] of fallbackFieldUpdates) {
-      await empleadoRepository.updateField(idEmpleado, campo, valor);
-    }
-
     const idUsuario = resolveUserId(req);
-    if (capabilities.hasUpdatedBy && idUsuario && !hasOwn(payload, 'updated_by')) {
-      await empleadoRepository.updateField(idEmpleado, 'updated_by', idUsuario);
-    }
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
 
-    const changedFields = Object.keys(payload).join(', ');
-    await empleadoRepository.addAuditLog({
-      accion: 'EMPLEADO_ACTUALIZAR',
-      descripcion: `Empleado ${idEmpleado} actualizado: campos ${changedFields}`,
-      idUsuario,
-      capabilities
-    });
+      if (Object.keys(functionPayload).length > 0) {
+        await empleadoRepository.update(idEmpleado, functionPayload, client);
+      }
+
+      for (const [campo, valor] of fallbackFieldUpdates) {
+        await empleadoRepository.updateField(idEmpleado, campo, valor, client);
+      }
+
+      if (capabilities.hasUpdatedBy && idUsuario && !hasOwn(payload, 'updated_by')) {
+        await empleadoRepository.updateField(idEmpleado, 'updated_by', idUsuario, client);
+      }
+
+      const changedFields = Object.keys(payload).join(', ');
+      await empleadoRepository.addAuditLog({
+        accion: 'EMPLEADO_ACTUALIZAR',
+        descripcion: `Empleado ${idEmpleado} actualizado: campos ${changedFields}`,
+        idUsuario,
+        capabilities,
+        db: client
+      });
+
+      await client.query('COMMIT');
+    } catch (error) {
+      await rollbackQuietly(client);
+      throw error;
+    } finally {
+      client.release();
+    }
 
     return {
       status: 200,
-      body: { error: false, message: 'Empleado actualizado correctamente' }
+      body: { ok: true, error: false, message: 'Empleado actualizado correctamente' }
     };
   },
 
@@ -665,17 +888,35 @@ const empleadoService = {
     const idEmpleado = parsePositiveInt(req.params.id);
 
     if (!idEmpleado) {
-      return { status: 400, body: { error: true, message: 'El id debe ser un entero positivo' } };
+      return {
+        status: 400,
+        body: buildErrorBody({
+          code: 'VALIDATION_ERROR',
+          message: 'El id debe ser un entero positivo.'
+        })
+      };
     }
 
     const current = await empleadoRepository.findById(idEmpleado, capabilities);
     if (!current) {
-      return { status: 404, body: { error: true, message: 'Empleado no encontrado' } };
+      return {
+        status: 404,
+        body: buildErrorBody({
+          code: 'NOT_FOUND',
+          message: 'Empleado no encontrado.'
+        })
+      };
     }
 
     const tenantId = parsePositiveInt(req.user?.id_empresa);
     if (tenantId && capabilities.hasTenantField && tenantId !== current.id_empresa) {
-      return { status: 403, body: { error: true, message: 'Acceso denegado para este empleado' } };
+      return {
+        status: 403,
+        body: buildErrorBody({
+          code: 'FORBIDDEN',
+          message: 'Acceso denegado para este empleado.'
+        })
+      };
     }
 
     if (
@@ -685,30 +926,48 @@ const empleadoService = {
       capabilities.hasPersonaTenantField &&
       tenantId !== parsePositiveInt(current.persona_id_empresa)
     ) {
-      return { status: 403, body: { error: true, message: 'Acceso denegado para este empleado' } };
+      return {
+        status: 403,
+        body: buildErrorBody({
+          code: 'FORBIDDEN',
+          message: 'Acceso denegado para este empleado.'
+        })
+      };
     }
 
     const idUsuario = resolveUserId(req);
+    const client = await pool.connect();
     let message = 'Empleado eliminado correctamente';
 
-    if (capabilities.softDeleteField) {
-      await empleadoRepository.updateField(idEmpleado, capabilities.softDeleteField, false);
-      if (capabilities.hasUpdatedBy && idUsuario) {
-        await empleadoRepository.updateField(idEmpleado, 'updated_by', idUsuario);
+    try {
+      await client.query('BEGIN');
+
+      if (capabilities.softDeleteField) {
+        await empleadoRepository.updateField(idEmpleado, capabilities.softDeleteField, false, client);
+        if (capabilities.hasUpdatedBy && idUsuario) {
+          await empleadoRepository.updateField(idEmpleado, 'updated_by', idUsuario, client);
+        }
+        message = 'Empleado inactivado correctamente';
+      } else {
+        await empleadoRepository.hardDelete(idEmpleado, client);
       }
-      message = 'Empleado inactivado correctamente';
-    } else {
-      await empleadoRepository.hardDelete(idEmpleado);
+
+      await empleadoRepository.addAuditLog({
+        accion: 'EMPLEADO_ELIMINAR',
+        descripcion: `Empleado ${idEmpleado} eliminado. Modo: ${capabilities.softDeleteField ? 'soft' : 'hard'}`,
+        idUsuario,
+        capabilities,
+        db: client
+      });
+
+      await client.query('COMMIT');
+      return { status: 200, body: { ok: true, error: false, message } };
+    } catch (error) {
+      await rollbackQuietly(client);
+      throw error;
+    } finally {
+      client.release();
     }
-
-    await empleadoRepository.addAuditLog({
-      accion: 'EMPLEADO_ELIMINAR',
-      descripcion: `Empleado ${idEmpleado} eliminado. Modo: ${capabilities.softDeleteField ? 'soft' : 'hard'}`,
-      idUsuario,
-      capabilities
-    });
-
-    return { status: 200, body: { error: false, message } };
   }
 };
 
@@ -718,11 +977,28 @@ const asyncHandler = (handler) => async (req, res) => {
     return res.status(result.status).json(result.body);
   } catch (err) {
     console.error('Empleados API error:', err.message);
+    const httpStatus = Number.isInteger(err?.httpStatus) ? err.httpStatus : null;
+    if (httpStatus && httpStatus >= 400 && httpStatus < 500) {
+      return res.status(httpStatus).json(
+        buildErrorBody({
+          code: err.code || 'REQUEST_ERROR',
+          message: sanitizeApiErrorMessage(err.message, httpStatus)
+        })
+      );
+    }
+
     const mappedError = mapDbError(err);
     if (mappedError) {
-      return res.status(mappedError.status).json({ error: true, message: mappedError.message });
+      return res.status(mappedError.status).json(
+        buildErrorBody({ code: mappedError.code, message: mappedError.message })
+      );
     }
-    return res.status(500).json({ error: true, message: 'Error interno del servidor' });
+    return res.status(500).json(
+      buildErrorBody({
+        code: 'INTERNAL_ERROR',
+        message: 'No se pudo procesar la solicitud de empleados.'
+      })
+    );
   }
 };
 

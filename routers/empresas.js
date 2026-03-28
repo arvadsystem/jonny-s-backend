@@ -1,6 +1,15 @@
 import express from 'express';
 import pool from '../config/db-connection.js';
 import { checkPermission, requestHasAnyPermission } from '../middleware/checkPermission.js';
+import { getClientIp } from '../utils/security/clientInfo.js';
+import {
+  buildErrorBody,
+  mapDbErrorToSafe,
+  sanitizeApiErrorMessage,
+  unknownFieldsFromPayload,
+  isSafeEmail,
+  isSafePhoneHN
+} from '../utils/security/personasHardening.js';
 
 const router = express.Router();  
 const EMPRESAS_LIST_PERMISSIONS = ['EMPRESAS_LISTADO_VER'];
@@ -29,6 +38,7 @@ const LEGACY_TEXT_MAPPINGS = {
   email: 'texto_correo',
   direccion_correo: 'texto_correo'
 };
+const META_EMPRESA_FIELDS = new Set(['updated_by', 'created_by']);
 
 let schemaCapabilitiesPromise;
 
@@ -115,10 +125,31 @@ const isClientesContextRequest = (req) => {
 };
 
 const resolveUserId = (req) => req.user?.id_usuario ?? null;
+const rollbackQuietly = async (client) => {
+  try {
+    await client.query('ROLLBACK');
+  } catch {
+    // noop
+  }
+};
 const toNullableTrimmedText = (value) => {
   if (value === null || value === undefined) return null;
   const text = String(value).trim();
   return text || null;
+};
+
+const validateEmpresaContactData = (payload = {}) => {
+  const correo = toNullableTrimmedText(payload.texto_correo ?? payload.correo ?? payload.email ?? payload.direccion_correo);
+  if (correo && !isSafeEmail(correo)) {
+    return 'texto_correo debe ser un correo valido.';
+  }
+
+  const telefono = toNullableTrimmedText(payload.texto_telefono ?? payload.telefono);
+  if (telefono && !isSafePhoneHN(telefono)) {
+    return 'texto_telefono debe tener formato ####-####.';
+  }
+
+  return null;
 };
 
 const normalizeEmpresaFunctionPayload = (payload) => {
@@ -295,7 +326,7 @@ const empresaRepository = {
     };
   },
 
-  async findById(idEmpresa, capabilities) {
+  async findById(idEmpresa, capabilities, db = pool) {
     const fields = BASE_FIELDS.map((field) => `e.${field}`);
     if (capabilities.softDeleteField && !fields.includes(capabilities.softDeleteField)) {
       fields.push(`e.${capabilities.softDeleteField}`);
@@ -316,34 +347,34 @@ const empresaRepository = {
       LIMIT 1
     `;
 
-    const result = await pool.query(query, [idEmpresa]);
+    const result = await db.query(query, [idEmpresa]);
     return result.rows[0] || null;
   },
 
-  async create(data) {
-    const result = await pool.query(
+  async create(data, db = pool) {
+    const result = await db.query(
       'SELECT fn_guardar_empresa($1::json) AS id_empresa',
       [JSON.stringify(data)]
     );
     return result.rows[0]?.id_empresa ?? null;
   },
 
-  async updateWithFunction(idEmpresa, data) {
-    await pool.query(
+  async updateWithFunction(idEmpresa, data, db = pool) {
+    await db.query(
       'SELECT fn_actualizar_empresa($1::INT, $2::json) AS id_empresa',
       [idEmpresa, JSON.stringify(data)]
     );
   },
 
-  async updateField(idEmpresa, campo, valor) {
-    await pool.query(
+  async updateField(idEmpresa, campo, valor, db = pool) {
+    await db.query(
       'CALL pa_update($1::TEXT, $2::TEXT, $3::TEXT, $4::TEXT, $5::TEXT)',
       ['empresas', campo, String(valor), 'id_empresa', String(idEmpresa)]
     );
   },
 
-  async hardDelete(idEmpresa) {
-    await pool.query(
+  async hardDelete(idEmpresa, db = pool) {
+    await db.query(
       'CALL pa_delete($1::TEXT, $2::TEXT, $3::TEXT)',
       ['empresas', 'id_empresa', String(idEmpresa)]
     );
@@ -359,7 +390,8 @@ const empresaRepository = {
     tablaAfectada = 'empresas',
     idRegistro = null,
     datosAntes = null,
-    datosDespues = null
+    datosDespues = null,
+    db = pool
   }) {
     if (!capabilities.hasBitacorasTable || !idUsuario) return;
     const descripcionSafe = truncateText(descripcion, 100);
@@ -368,7 +400,7 @@ const empresaRepository = {
     const idRegistroSafe = parsePositiveInt(idRegistro);
     const ipOrigen = req ? getClientIp(req) : null;
 
-    await pool.query(
+    await db.query(
       `
         INSERT INTO bitacoras (
           accion,
@@ -494,39 +526,73 @@ const empresaService = {
 
   async create(req) {
     const capabilities = await getSchemaCapabilities();
-    const payload = normalizeEmpresaFunctionPayload(req.body);
+    const rawBody = isPlainObject(req.body) ? req.body : {};
+    const payload = normalizeEmpresaFunctionPayload(rawBody);
     const hasGeneralCreatePermission = await requestHasAnyPermission(req, ['EMPRESAS_CREAR']);
 
     if (!hasGeneralCreatePermission) {
       const hasContextualCreatePermission = await requestHasAnyPermission(req, ['EMPRESAS_CREAR_DESDE_CLIENTES']);
       if (!hasContextualCreatePermission) {
-        return { status: 403, body: { error: true, message: 'Acceso denegado: permisos insuficientes' } };
+        return {
+          status: 403,
+          body: buildErrorBody({ code: 'FORBIDDEN', message: 'Acceso denegado: permisos insuficientes.' })
+        };
       }
       if (!isClientesContextRequest(req)) {
         return {
           status: 403,
-          body: {
-            error: true,
-            message: 'Acceso denegado: EMPRESAS_CREAR_DESDE_CLIENTES solo aplica en flujo de clientes'
-          }
+          body: buildErrorBody({
+            code: 'FORBIDDEN',
+            message: 'Acceso denegado: EMPRESAS_CREAR_DESDE_CLIENTES solo aplica en flujo de clientes.'
+          })
         };
       }
     }
 
-    const estadoSolicitado = Object.prototype.hasOwnProperty.call(req.body || {}, 'estado')
-      ? parseBooleanValue(req.body?.estado)
+    const allowedFields = new Set([...FN_EMPRESA_FIELDS, 'estado', 'created_by', 'updated_by']);
+    const unknownFields = unknownFieldsFromPayload(rawBody, new Set([...allowedFields, ...Object.keys(LEGACY_TEXT_MAPPINGS)]));
+    if (unknownFields.length) {
+      return {
+        status: 400,
+        body: buildErrorBody({
+          code: 'UNKNOWN_FIELDS',
+          message: 'El payload contiene campos no permitidos.',
+          details: { fields: unknownFields }
+        })
+      };
+    }
+
+    const estadoSolicitado = Object.prototype.hasOwnProperty.call(rawBody, 'estado')
+      ? parseBooleanValue(rawBody.estado)
       : null;
 
     if (!isPlainObject(payload) || Object.keys(payload).length === 0) {
-      return { status: 400, body: { error: true, message: 'Debe enviar un objeto con datos validos' } };
+      return {
+        status: 400,
+        body: buildErrorBody({ code: 'VALIDATION_ERROR', message: 'Debe enviar un objeto con datos validos.' })
+      };
     }
 
     if (!payload.nombre_empresa || typeof payload.nombre_empresa !== 'string') {
-      return { status: 400, body: { error: true, message: 'nombre_empresa es obligatorio' } };
+      return {
+        status: 400,
+        body: buildErrorBody({ code: 'VALIDATION_ERROR', message: 'nombre_empresa es obligatorio.' })
+      };
     }
 
-    if (Object.prototype.hasOwnProperty.call(req.body || {}, 'estado') && estadoSolicitado === null) {
-      return { status: 400, body: { error: true, message: 'estado debe ser booleano' } };
+    if (Object.prototype.hasOwnProperty.call(rawBody, 'estado') && estadoSolicitado === null) {
+      return {
+        status: 400,
+        body: buildErrorBody({ code: 'VALIDATION_ERROR', message: 'estado debe ser booleano.' })
+      };
+    }
+
+    const contactValidationError = validateEmpresaContactData(rawBody);
+    if (contactValidationError) {
+      return {
+        status: 400,
+        body: buildErrorBody({ code: 'VALIDATION_ERROR', message: contactValidationError })
+      };
     }
 
     const insertData = { ...payload };
@@ -535,30 +601,45 @@ const empresaService = {
     if (capabilities.hasCreatedBy && idUsuario) insertData.created_by = idUsuario;
     if (capabilities.hasUpdatedBy && idUsuario) insertData.updated_by = idUsuario;
 
-    const createdId = await empresaRepository.create(insertData);
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
 
-    if (capabilities.softDeleteField && estadoSolicitado !== null && createdId) {
-      await empresaRepository.updateField(createdId, capabilities.softDeleteField, estadoSolicitado);
-    }
+      const createdId = await empresaRepository.create(insertData, client);
 
-    await empresaRepository.addAuditLog({
-      accion: 'EMPRESA_CREAR',
-      descripcion: `Empresa creada: ${payload.nombre_empresa}`,
-      idUsuario,
-      capabilities,
-      req,
-      modulo: 'EMPRESAS',
-      tablaAfectada: 'empresas',
-      datosDespues: insertData
-    });
-
-    return {
-      status: 201,
-      body: {
-        message: 'Empresa creada exitosamente.',
-        id_empresa: createdId
+      if (capabilities.softDeleteField && estadoSolicitado !== null && createdId) {
+        await empresaRepository.updateField(createdId, capabilities.softDeleteField, estadoSolicitado, client);
       }
-    };
+
+      await empresaRepository.addAuditLog({
+        accion: 'EMPRESA_CREAR',
+        descripcion: `Empresa creada: ${payload.nombre_empresa}`,
+        idUsuario,
+        capabilities,
+        req,
+        modulo: 'EMPRESAS',
+        tablaAfectada: 'empresas',
+        idRegistro: createdId,
+        datosDespues: insertData,
+        db: client
+      });
+
+      await client.query('COMMIT');
+      return {
+        status: 201,
+        body: {
+          ok: true,
+          error: false,
+          message: 'Empresa creada exitosamente.',
+          id_empresa: createdId
+        }
+      };
+    } catch (error) {
+      await rollbackQuietly(client);
+      throw error;
+    } finally {
+      client.release();
+    }
   },
 
   async update(req) {
@@ -570,80 +651,161 @@ const empresaService = {
       && Object.prototype.hasOwnProperty.call(body, 'valor');
 
     if (!idEmpresa) {
-      return { status: 400, body: { error: true, message: 'El id debe ser un entero positivo' } };
+      return {
+        status: 400,
+        body: buildErrorBody({ code: 'VALIDATION_ERROR', message: 'El id debe ser un entero positivo.' })
+      };
     }
 
     if (!isPlainObject(body)) {
-      return { status: 400, body: { error: true, message: 'Debe enviar un objeto con datos validos' } };
+      return {
+        status: 400,
+        body: buildErrorBody({ code: 'VALIDATION_ERROR', message: 'Debe enviar un objeto con datos validos.' })
+      };
     }
 
     const current = await empresaRepository.findById(idEmpresa, capabilities);
     if (!current) {
-      return { status: 404, body: { error: true, message: 'Empresa no encontrada' } };
+      return { status: 404, body: buildErrorBody({ code: 'NOT_FOUND', message: 'Empresa no encontrada.' }) };
     }
 
     const tenantId = parsePositiveInt(req.user?.id_empresa);
     if (tenantId && tenantId !== current.id_empresa) {
-      return { status: 403, body: { error: true, message: 'Acceso denegado para esta empresa' } };
+      return {
+        status: 403,
+        body: buildErrorBody({ code: 'FORBIDDEN', message: 'Acceso denegado para esta empresa.' })
+      };
     }
 
     const rawUpdates = hasCampoValor
       ? { [body.campo]: body.valor }
       : body;
 
+    const allowedFields = new Set([
+      ...FN_EMPRESA_FIELDS,
+      capabilities.softDeleteField || 'estado',
+      ...META_EMPRESA_FIELDS
+    ]);
+    const unknownFields = unknownFieldsFromPayload(rawUpdates, new Set([...allowedFields, ...Object.keys(LEGACY_TEXT_MAPPINGS)]));
+    if (unknownFields.length) {
+      return {
+        status: 400,
+        body: buildErrorBody({
+          code: 'UNKNOWN_FIELDS',
+          message: 'El payload contiene campos no permitidos.',
+          details: { fields: unknownFields }
+        })
+      };
+    }
+
     const normalizedUpdates = normalizeEmpresaFunctionPayload(rawUpdates);
     const idUsuario = resolveUserId(req);
-    let touched = false;
-    let estadoActualizado = false;
+    const contactValidationError = validateEmpresaContactData(rawUpdates);
+    if (contactValidationError) {
+      return {
+        status: 400,
+        body: buildErrorBody({ code: 'VALIDATION_ERROR', message: contactValidationError })
+      };
+    }
 
     if (capabilities.softDeleteField && Object.prototype.hasOwnProperty.call(rawUpdates, capabilities.softDeleteField)) {
       const estadoSolicitado = parseBooleanValue(rawUpdates[capabilities.softDeleteField]);
       if (estadoSolicitado === null) {
-        return { status: 400, body: { error: true, message: `${capabilities.softDeleteField} debe ser booleano` } };
+        return {
+          status: 400,
+          body: buildErrorBody({
+            code: 'VALIDATION_ERROR',
+            message: `${capabilities.softDeleteField} debe ser booleano.`
+          })
+        };
       }
-      await empresaRepository.updateField(
-        idEmpresa,
-        capabilities.softDeleteField,
-        estadoSolicitado
-      );
-      touched = true;
-      estadoActualizado = true;
+      rawUpdates[capabilities.softDeleteField] = estadoSolicitado;
     }
 
-    if (Object.keys(normalizedUpdates).length > 0) {
-      await empresaRepository.updateWithFunction(idEmpresa, normalizedUpdates);
-      touched = true;
+    if (Object.prototype.hasOwnProperty.call(rawUpdates, 'nombre_empresa')) {
+      const nombreEmpresa = toNullableTrimmedText(rawUpdates.nombre_empresa);
+      if (!nombreEmpresa) {
+        return {
+          status: 400,
+          body: buildErrorBody({ code: 'VALIDATION_ERROR', message: 'nombre_empresa no puede quedar vacio.' })
+        };
+      }
     }
 
-    if (!touched) {
-      return { status: 400, body: { error: true, message: 'No hay campos validos para actualizar' } };
-    }
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
 
-    if (capabilities.hasUpdatedBy && idUsuario) {
-      await empresaRepository.updateField(idEmpresa, 'updated_by', idUsuario);
-    }
+      let touched = false;
+      let estadoActualizado = false;
 
-    const updatedFields = Object.keys(normalizedUpdates);
-    if (estadoActualizado) {
-      updatedFields.push(capabilities.softDeleteField);
-    }
+      if (capabilities.softDeleteField && Object.prototype.hasOwnProperty.call(rawUpdates, capabilities.softDeleteField)) {
+        await empresaRepository.updateField(
+          idEmpresa,
+          capabilities.softDeleteField,
+          rawUpdates[capabilities.softDeleteField],
+          client
+        );
+        touched = true;
+        estadoActualizado = true;
+      }
 
-    await empresaRepository.addAuditLog({
-      accion: 'EMPRESA_ACTUALIZAR',
-      descripcion: `Empresa ${idEmpresa} actualizada: ${updatedFields.join(', ') || 'sin detalle'}`,
-      idUsuario,
-      capabilities,
-      req,
-      modulo: 'EMPRESAS',
-      tablaAfectada: 'empresas',
-      idRegistro: idEmpresa,
-      datosAntes: { [campo]: beforeValue },
-      datosDespues: { [campo]: valor }
-    });
+      if (Object.keys(normalizedUpdates).length > 0) {
+        await empresaRepository.updateWithFunction(idEmpresa, normalizedUpdates, client);
+        touched = true;
+      }
+
+      if (!touched) {
+        await rollbackQuietly(client);
+        return {
+          status: 400,
+          body: buildErrorBody({ code: 'VALIDATION_ERROR', message: 'No hay campos validos para actualizar.' })
+        };
+      }
+
+      if (capabilities.hasUpdatedBy && idUsuario) {
+        await empresaRepository.updateField(idEmpresa, 'updated_by', idUsuario, client);
+      }
+
+      const updatedFields = Object.keys(normalizedUpdates);
+      if (estadoActualizado) {
+        updatedFields.push(capabilities.softDeleteField);
+      }
+
+      const datosAntes = updatedFields.reduce((acc, field) => {
+        acc[field] = current[field] ?? null;
+        return acc;
+      }, {});
+      const datosDespues = updatedFields.reduce((acc, field) => {
+        acc[field] = rawUpdates[field] ?? normalizedUpdates[field] ?? null;
+        return acc;
+      }, {});
+
+      await empresaRepository.addAuditLog({
+        accion: 'EMPRESA_ACTUALIZAR',
+        descripcion: `Empresa ${idEmpresa} actualizada: ${updatedFields.join(', ') || 'sin detalle'}`,
+        idUsuario,
+        capabilities,
+        req,
+        modulo: 'EMPRESAS',
+        tablaAfectada: 'empresas',
+        idRegistro: idEmpresa,
+        datosAntes,
+        datosDespues,
+        db: client
+      });
+
+      await client.query('COMMIT');
+    } catch (error) {
+      await rollbackQuietly(client);
+      throw error;
+    } finally {
+      client.release();
+    }
 
     return {
       status: 200,
-      body: { error: false, message: 'Empresa actualizada correctamente' }
+      body: { ok: true, error: false, message: 'Empresa actualizada correctamente' }
     };
   },
 
@@ -652,45 +814,63 @@ const empresaService = {
     const idEmpresa = parsePositiveInt(req.params.id);
 
     if (!idEmpresa) {
-      return { status: 400, body: { error: true, message: 'El id debe ser un entero positivo' } };
+      return {
+        status: 400,
+        body: buildErrorBody({ code: 'VALIDATION_ERROR', message: 'El id debe ser un entero positivo.' })
+      };
     }
 
     const current = await empresaRepository.findById(idEmpresa, capabilities);
     if (!current) {
-      return { status: 404, body: { error: true, message: 'Empresa no encontrada' } };
+      return { status: 404, body: buildErrorBody({ code: 'NOT_FOUND', message: 'Empresa no encontrada.' }) };
     }
 
     const tenantId = parsePositiveInt(req.user?.id_empresa);
     if (tenantId && tenantId !== current.id_empresa) {
-      return { status: 403, body: { error: true, message: 'Acceso denegado para esta empresa' } };
+      return {
+        status: 403,
+        body: buildErrorBody({ code: 'FORBIDDEN', message: 'Acceso denegado para esta empresa.' })
+      };
     }
 
     const idUsuario = resolveUserId(req);
+    const client = await pool.connect();
     let message = 'Empresa eliminada correctamente';
 
-    if (capabilities.softDeleteField) {
-      await empresaRepository.updateField(idEmpresa, capabilities.softDeleteField, false);
-      if (capabilities.hasUpdatedBy && idUsuario) {
-        await empresaRepository.updateField(idEmpresa, 'updated_by', idUsuario);
+    try {
+      await client.query('BEGIN');
+
+      if (capabilities.softDeleteField) {
+        await empresaRepository.updateField(idEmpresa, capabilities.softDeleteField, false, client);
+        if (capabilities.hasUpdatedBy && idUsuario) {
+          await empresaRepository.updateField(idEmpresa, 'updated_by', idUsuario, client);
+        }
+        message = 'Empresa inactivada correctamente';
+      } else {
+        await empresaRepository.hardDelete(idEmpresa, client);
       }
-      message = 'Empresa inactivada correctamente';
-    } else {
-      await empresaRepository.hardDelete(idEmpresa);
+
+      await empresaRepository.addAuditLog({
+        accion: 'EMPRESA_ELIMINAR',
+        descripcion: `Empresa ${idEmpresa} eliminada. Modo: ${capabilities.softDeleteField ? 'soft' : 'hard'}`,
+        idUsuario,
+        capabilities,
+        req,
+        modulo: 'EMPRESAS',
+        tablaAfectada: 'empresas',
+        idRegistro: idEmpresa,
+        datosAntes: current,
+        db: client
+      });
+
+      await client.query('COMMIT');
+      return { status: 200, body: { ok: true, error: false, message } };
+    } catch (error) {
+      await rollbackQuietly(client);
+      throw error;
+    } finally {
+      client.release();
     }
-
-    await empresaRepository.addAuditLog({
-      accion: 'EMPRESA_ELIMINAR',
-      descripcion: `Empresa ${idEmpresa} eliminada. Modo: ${capabilities.softDeleteField ? 'soft' : 'hard'}`,
-      idUsuario,
-      capabilities,
-      req,
-      modulo: 'EMPRESAS',
-      tablaAfectada: 'empresas',
-      idRegistro: idEmpresa,
-      datosAntes: current
-    });
-
-    return { status: 200, body: { error: false, message } };
   }
 };
 
@@ -700,7 +880,29 @@ const asyncHandler = (handler) => async (req, res) => {
     return res.status(result.status).json(result.body);
   } catch (err) {
     console.error('Empresas API error:', err.message);
-    return res.status(500).json({ error: true, message: 'Error interno del servidor' });
+    const httpStatus = Number.isInteger(err?.httpStatus) ? err.httpStatus : null;
+    if (httpStatus && httpStatus >= 400 && httpStatus < 500) {
+      return res.status(httpStatus).json(
+        buildErrorBody({
+          code: err.code || 'REQUEST_ERROR',
+          message: sanitizeApiErrorMessage(err.message, httpStatus)
+        })
+      );
+    }
+
+    const mapped = mapDbErrorToSafe(err, {
+      defaultMessage: 'No se pudo procesar la solicitud de empresas.'
+    });
+
+    if (mapped) {
+      return res.status(mapped.status).json(
+        buildErrorBody({ code: mapped.code, message: mapped.message })
+      );
+    }
+
+    return res.status(500).json(
+      buildErrorBody({ code: 'INTERNAL_ERROR', message: 'No se pudo procesar la solicitud de empresas.' })
+    );
   }
 };
 

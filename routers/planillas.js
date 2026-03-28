@@ -1,6 +1,12 @@
 import express from 'express';
 import pool from '../config/db-connection.js';
 import { checkPermission, requestHasAnyPermission } from '../middleware/checkPermission.js';
+import {
+  buildErrorBody,
+  mapDbErrorToSafe,
+  sanitizeApiErrorMessage,
+  unknownFieldsFromPayload
+} from '../utils/security/personasHardening.js';
 
 const router = express.Router();
 
@@ -58,6 +64,35 @@ const PLANILLA_ENDPOINT_CONTRACT = Object.freeze({
   auditoria: 'fn_listar_auditoria_planilla',
   recalcularDetalle: 'fn_recalcular_detalle_planilla'
 });
+const GENERAR_ALLOWED_FIELDS = new Set([
+  'id_sucursal',
+  'periodo',
+  'id_estado_planilla',
+  'dias_laborados',
+  'horas_laboradas'
+]);
+const ESTADO_ALLOWED_FIELDS = new Set([
+  'id_estado_planilla',
+  'id_estado',
+  'estado',
+  'recalcular'
+]);
+const ANULAR_ALLOWED_FIELDS = new Set(['usuario_accion']);
+const APLICAR_ADELANTO_ALLOWED_FIELDS = new Set([
+  'id_adelanto',
+  'id_adelanto_salario',
+  'monto_aplicar',
+  'monto'
+]);
+const MOVIMIENTO_ALLOWED_FIELDS = new Set([
+  'id_detalle',
+  'id_detalle_planilla',
+  'tipo',
+  'tipo_movimiento',
+  'concepto',
+  'monto',
+  'observacion'
+]);
 
 let planillaFunctionCatalogPromise;
 
@@ -84,6 +119,22 @@ const normalizePeriodo = (value) => {
   if (/^\d{4}-\d{2}$/.test(text)) return `${text}-01`;
   if (/^\d{4}-\d{2}-\d{2}$/.test(text)) return text;
   return null;
+};
+
+const normalizeEstadoAlias = (value) => {
+  const normalized = String(value ?? '').trim().toUpperCase();
+  if (!normalized) return null;
+
+  const aliases = {
+    ABIERTA: 'BORRADOR',
+    BORRADOR: 'BORRADOR',
+    CERRADA: 'CALCULADA',
+    CALCULADA: 'CALCULADA',
+    PAGADA: 'PAGADA',
+    ANULADA: 'ANULADA'
+  };
+
+  return aliases[normalized] || normalized;
 };
 
 const toMonthKey = (value) => {
@@ -117,26 +168,16 @@ const mapDbError = (err) => {
   if (!err) return null;
 
   if (err.code === 'PLANILLA_FN_MISSING') {
-    return { status: 501, message: err.message };
-  }
-
-  if (err.code === '42883' && /fn_.*planilla/i.test(err.message || '')) {
     return {
       status: 501,
-      message: 'La funciÛn SQL de planilla no existe o tiene una firma diferente en esta base de datos.'
+      code: 'DB_FUNCTION_ERROR',
+      message: 'La funcion SQL requerida no esta disponible en esta base de datos.'
     };
   }
 
-  if (err.code === 'P0001' && /no existe/i.test(err.message || '')) {
-    return { status: 404, message: err.message };
-  }
-
-  const badRequestCodes = new Set(['22P02', '22003', '22007', '22008', '23502', '23503', '23505', 'P0001']);
-  if (badRequestCodes.has(err.code)) {
-    return { status: 400, message: err.detail || err.message || 'Solicitud inv·lida para planillas' };
-  }
-
-  return null;
+  return mapDbErrorToSafe(err, {
+    defaultMessage: 'No se pudo procesar la solicitud de planillas.'
+  });
 };
 
 const isFunctionAllowed = (name) => PLANILLA_FUNCTION_NAMES.includes(name);
@@ -167,12 +208,12 @@ const getPlanillaFunctionCatalog = async () => {
 
 const ensureFunctionInstalled = async (fnName) => {
   if (!isFunctionAllowed(fnName)) {
-    throw new Error(`FunciÛn SQL no permitida: ${fnName}`);
+    throw new Error(`Funci√≥n SQL no permitida: ${fnName}`);
   }
 
   const catalog = await getPlanillaFunctionCatalog();
   if (!catalog.has(fnName)) {
-    const error = new Error(`La funciÛn ${fnName} no est· instalada en la base de datos actual.`);
+    const error = new Error(`La funci√≥n ${fnName} no est√° instalada en la base de datos actual.`);
     error.code = 'PLANILLA_FN_MISSING';
     throw error;
   }
@@ -212,7 +253,7 @@ const resolveEstadoPlanillaId = async (body = {}) => {
     };
   }
 
-  const estadoText = sanitizeText(body.estado, 60);
+  const estadoText = normalizeEstadoAlias(sanitizeText(body.estado, 60));
   if (!estadoText) return null;
 
   const rs = await pool.query(
@@ -234,7 +275,7 @@ const resolveEstadoPlanillaId = async (body = {}) => {
 
 const getRequiredEstadoPermission = (descripcion = '') => {
   const normalized = String(descripcion || '').trim().toUpperCase();
-  if (normalized === 'CERRADA') return 'PLANILLAS_CERRAR';
+  if (normalized === 'CERRADA' || normalized === 'CALCULADA') return 'PLANILLAS_CERRAR';
   if (normalized === 'PAGADA') return 'PLANILLAS_PAGAR';
   if (normalized === 'ANULADA') return 'PLANILLAS_ANULAR';
   return null;
@@ -245,13 +286,30 @@ const asyncHandler = (handler) => async (req, res) => {
     const result = await handler(req, res);
     return res.status(result.status).json(result.body);
   } catch (err) {
+    const httpStatus = Number.isInteger(err?.httpStatus) ? err.httpStatus : null;
+    if (httpStatus && httpStatus >= 400 && httpStatus < 500) {
+      return res.status(httpStatus).json(
+        buildErrorBody({
+          code: err.code || 'REQUEST_ERROR',
+          message: sanitizeApiErrorMessage(err.message, httpStatus)
+        })
+      );
+    }
+
     const mappedError = mapDbError(err);
     if (mappedError) {
-      return res.status(mappedError.status).json({ error: true, message: mappedError.message });
+      return res.status(mappedError.status).json(
+        buildErrorBody({ code: mappedError.code, message: mappedError.message })
+      );
     }
 
     console.error('Planillas API error:', err.message);
-    return res.status(500).json({ error: true, message: 'Error interno del servidor' });
+    return res.status(500).json(
+      buildErrorBody({
+        code: 'INTERNAL_ERROR',
+        message: 'No se pudo procesar la solicitud de planillas.'
+      })
+    );
   }
 };
 
@@ -266,16 +324,23 @@ const planillaService = {
 
     const idSucursal = req.query.id_sucursal === undefined ? null : parsePositiveInt(req.query.id_sucursal);
     if (req.query.id_sucursal !== undefined && !idSucursal) {
-      return { status: 400, body: { error: true, message: 'id_sucursal inv·lido' } };
+      return { status: 400, body: { error: true, message: 'id_sucursal inv√°lido' } };
     }
 
     const periodo = req.query.periodo === undefined ? null : normalizePeriodo(req.query.periodo);
     if (req.query.periodo !== undefined && !periodo) {
-      return { status: 400, body: { error: true, message: 'periodo inv·lido. Use YYYY-MM o YYYY-MM-DD' } };
+      return { status: 400, body: { error: true, message: 'periodo inv√°lido. Use YYYY-MM o YYYY-MM-DD' } };
     }
 
     const search = sanitizeText(req.query.search ?? req.query.q, 120);
-    const estado = sanitizeText(req.query.estado, 60);
+    const estado = req.query.estado === undefined
+      ? null
+      : normalizeEstadoAlias(sanitizeText(req.query.estado, 60));
+
+    if (req.query.estado !== undefined && !estado) {
+      return { status: 400, body: { error: true, message: 'estado invalido' } };
+    }
+
     const periodoKey = periodo ? toMonthKey(periodo) : null;
 
     const filtered = rows.filter((row) => {
@@ -287,8 +352,8 @@ const planillaService = {
       }
 
       if (estado) {
-        const estadoPlanilla = String(row.estado_planilla || '').trim().toLowerCase();
-        if (!estadoPlanilla.includes(estado.toLowerCase())) return false;
+        const estadoPlanilla = normalizeEstadoAlias(row.estado_planilla ?? row.estado);
+        if (estadoPlanilla !== estado) return false;
       }
 
       if (search) {
@@ -318,9 +383,27 @@ const planillaService = {
   },
 
   async generar(req) {
+    const unknownFields = unknownFieldsFromPayload(req.body, GENERAR_ALLOWED_FIELDS);
+    if (unknownFields.length) {
+      return {
+        status: 400,
+        body: buildErrorBody({
+          code: 'UNKNOWN_FIELDS',
+          message: 'El payload contiene campos no permitidos.',
+          details: { fields: unknownFields }
+        })
+      };
+    }
+
     const idSucursal = parsePositiveInt(req.body?.id_sucursal);
     if (!idSucursal) {
-      return { status: 400, body: { error: true, message: 'id_sucursal es requerido' } };
+      return {
+        status: 400,
+        body: buildErrorBody({
+          code: 'VALIDATION_ERROR',
+          message: 'id_sucursal es requerido.'
+        })
+      };
     }
 
     const fechaPlanilla = normalizePeriodo(req.body?.periodo) || new Date().toISOString().slice(0, 10);
@@ -349,7 +432,7 @@ const planillaService = {
   async recalcularPlanilla(req) {
     const idPlanilla = parsePositiveInt(req.params.id_planilla);
     if (!idPlanilla) {
-      return { status: 400, body: { error: true, message: 'id_planilla inv·lido' } };
+      return { status: 400, body: { error: true, message: 'id_planilla inv√°lido' } };
     }
 
     const rows = await queryFunctionRows(PLANILLA_ENDPOINT_CONTRACT.recalcularPlanilla, [idPlanilla]);
@@ -362,7 +445,7 @@ const planillaService = {
   async detalle(req) {
     const idPlanilla = parsePositiveInt(req.params.id_planilla);
     if (!idPlanilla) {
-      return { status: 400, body: { error: true, message: 'id_planilla inv·lido' } };
+      return { status: 400, body: { error: true, message: 'id_planilla inv√°lido' } };
     }
 
     const pagination = parsePagination(req.query || {});
@@ -402,7 +485,7 @@ const planillaService = {
   async resumen(req) {
     const idPlanilla = parsePositiveInt(req.params.id_planilla);
     if (!idPlanilla) {
-      return { status: 400, body: { error: true, message: 'id_planilla inv·lido' } };
+      return { status: 400, body: { error: true, message: 'id_planilla inv√°lido' } };
     }
 
     const rows = await queryFunctionRows(PLANILLA_ENDPOINT_CONTRACT.resumen, [idPlanilla]);
@@ -412,7 +495,7 @@ const planillaService = {
   async completa(req) {
     const idPlanilla = parsePositiveInt(req.params.id_planilla);
     if (!idPlanilla) {
-      return { status: 400, body: { error: true, message: 'id_planilla inv·lido' } };
+      return { status: 400, body: { error: true, message: 'id_planilla inv√°lido' } };
     }
 
     const data = await queryFunctionScalar(PLANILLA_ENDPOINT_CONTRACT.completa, [idPlanilla]);
@@ -420,16 +503,31 @@ const planillaService = {
   },
 
   async actualizarEstado(req) {
+    const unknownFields = unknownFieldsFromPayload(req.body, ESTADO_ALLOWED_FIELDS);
+    if (unknownFields.length) {
+      return {
+        status: 400,
+        body: buildErrorBody({
+          code: 'UNKNOWN_FIELDS',
+          message: 'El payload contiene campos no permitidos.',
+          details: { fields: unknownFields }
+        })
+      };
+    }
+
     const idPlanilla = parsePositiveInt(req.params.id_planilla);
     if (!idPlanilla) {
-      return { status: 400, body: { error: true, message: 'id_planilla inv·lido' } };
+      return {
+        status: 400,
+        body: buildErrorBody({ code: 'VALIDATION_ERROR', message: 'id_planilla invalido.' })
+      };
     }
 
     const estadoInfo = await resolveEstadoPlanillaId(req.body || {});
     if (!estadoInfo) {
       return {
         status: 400,
-        body: { error: true, message: 'id_estado_planilla/estado inv·lido o no existe en cat·logo' }
+        body: { error: true, message: 'id_estado_planilla/estado inv√°lido o no existe en cat√°logo' }
       };
     }
 
@@ -439,7 +537,10 @@ const planillaService = {
       if (!hasPermission) {
         return {
           status: 403,
-          body: { error: true, message: `No tiene permiso ${requiredPermission} para este cambio de estado` }
+          body: buildErrorBody({
+            code: 'FORBIDDEN',
+            message: `No tiene permiso ${requiredPermission} para este cambio de estado.`
+          })
         };
       }
     }
@@ -461,9 +562,24 @@ const planillaService = {
   },
 
   async anularPlanilla(req) {
+    const unknownFields = unknownFieldsFromPayload(req.body, ANULAR_ALLOWED_FIELDS);
+    if (unknownFields.length) {
+      return {
+        status: 400,
+        body: buildErrorBody({
+          code: 'UNKNOWN_FIELDS',
+          message: 'El payload contiene campos no permitidos.',
+          details: { fields: unknownFields }
+        })
+      };
+    }
+
     const idPlanilla = parsePositiveInt(req.params.id_planilla);
     if (!idPlanilla) {
-      return { status: 400, body: { error: true, message: 'id_planilla inv·lido' } };
+      return {
+        status: 400,
+        body: buildErrorBody({ code: 'VALIDATION_ERROR', message: 'id_planilla invalido.' })
+      };
     }
 
     const usuarioAccion = sanitizeText(req.body?.usuario_accion, 100) || String(req.user?.id_usuario || 'sistema');
@@ -478,7 +594,7 @@ const planillaService = {
   async empleadosActivos(req) {
     const idSucursal = parsePositiveInt(req.params.id_sucursal);
     if (!idSucursal) {
-      return { status: 400, body: { error: true, message: 'id_sucursal inv·lido' } };
+      return { status: 400, body: { error: true, message: 'id_sucursal inv√°lido' } };
     }
 
     const pagination = parsePagination(req.query || {});
@@ -505,7 +621,7 @@ const planillaService = {
   async adelantosPendientes(req) {
     const idSucursal = parsePositiveInt(req.params.id_sucursal);
     if (!idSucursal) {
-      return { status: 400, body: { error: true, message: 'id_sucursal inv·lido' } };
+      return { status: 400, body: { error: true, message: 'id_sucursal inv√°lido' } };
     }
 
     const pagination = parsePagination(req.query || {});
@@ -516,7 +632,7 @@ const planillaService = {
     const rows = await queryFunctionRows(PLANILLA_ENDPOINT_CONTRACT.adelantosPendientes, [idSucursal]);
     const periodo = req.query.periodo ? normalizePeriodo(req.query.periodo) : null;
     if (req.query.periodo && !periodo) {
-      return { status: 400, body: { error: true, message: 'periodo inv·lido. Use YYYY-MM o YYYY-MM-DD' } };
+      return { status: 400, body: { error: true, message: 'periodo inv√°lido. Use YYYY-MM o YYYY-MM-DD' } };
     }
 
     const periodoKey = periodo ? toMonthKey(periodo) : null;
@@ -540,7 +656,7 @@ const planillaService = {
   async adelantosAplicables(req) {
     const idPlanilla = parsePositiveInt(req.params.id_planilla);
     if (!idPlanilla) {
-      return { status: 400, body: { error: true, message: 'id_planilla inv·lido' } };
+      return { status: 400, body: { error: true, message: 'id_planilla inv√°lido' } };
     }
 
     const pagination = parsePagination(req.query || {});
@@ -552,7 +668,7 @@ const planillaService = {
 
     const idDetalle = req.query.id_detalle === undefined ? null : parsePositiveInt(req.query.id_detalle);
     if (req.query.id_detalle !== undefined && !idDetalle) {
-      return { status: 400, body: { error: true, message: 'id_detalle inv·lido' } };
+      return { status: 400, body: { error: true, message: 'id_detalle inv√°lido' } };
     }
 
     if (idDetalle) {
@@ -575,6 +691,18 @@ const planillaService = {
   },
 
   async aplicarAdelanto(req) {
+    const unknownFields = unknownFieldsFromPayload(req.body, APLICAR_ADELANTO_ALLOWED_FIELDS);
+    if (unknownFields.length) {
+      return {
+        status: 400,
+        body: buildErrorBody({
+          code: 'UNKNOWN_FIELDS',
+          message: 'El payload contiene campos no permitidos.',
+          details: { fields: unknownFields }
+        })
+      };
+    }
+
     const idPlanilla = parsePositiveInt(req.params.id_planilla);
     const idAdelanto = parsePositiveInt(req.body?.id_adelanto ?? req.body?.id_adelanto_salario);
     const montoAplicar = parsePositiveNumber(req.body?.monto_aplicar ?? req.body?.monto);
@@ -600,6 +728,18 @@ const planillaService = {
   },
 
   async registrarMovimiento(req) {
+    const unknownFields = unknownFieldsFromPayload(req.body, MOVIMIENTO_ALLOWED_FIELDS);
+    if (unknownFields.length) {
+      return {
+        status: 400,
+        body: buildErrorBody({
+          code: 'UNKNOWN_FIELDS',
+          message: 'El payload contiene campos no permitidos.',
+          details: { fields: unknownFields }
+        })
+      };
+    }
+
     const idPlanilla = parsePositiveInt(req.params.id_planilla);
     const idDetalle = parsePositiveInt(req.body?.id_detalle ?? req.body?.id_detalle_planilla);
     const tipo = sanitizeText(req.body?.tipo ?? req.body?.tipo_movimiento, 20);
@@ -644,7 +784,7 @@ const planillaService = {
   async listarMovimientos(req) {
     const idPlanilla = parsePositiveInt(req.params.id_planilla);
     if (!idPlanilla) {
-      return { status: 400, body: { error: true, message: 'id_planilla inv·lido' } };
+      return { status: 400, body: { error: true, message: 'id_planilla inv√°lido' } };
     }
 
     const pagination = parsePagination(req.query || {});
@@ -654,7 +794,7 @@ const planillaService = {
 
     const idDetalle = req.query.id_detalle === undefined ? null : parsePositiveInt(req.query.id_detalle);
     if (req.query.id_detalle !== undefined && !idDetalle) {
-      return { status: 400, body: { error: true, message: 'id_detalle inv·lido' } };
+      return { status: 400, body: { error: true, message: 'id_detalle inv√°lido' } };
     }
 
     let rows = [];
@@ -711,7 +851,7 @@ const planillaService = {
   async anularMovimiento(req) {
     const idMovimiento = parsePositiveInt(req.params.id_movimiento);
     if (!idMovimiento) {
-      return { status: 400, body: { error: true, message: 'id_movimiento inv·lido' } };
+      return { status: 400, body: { error: true, message: 'id_movimiento inv√°lido' } };
     }
 
     const rows = await queryFunctionRows(PLANILLA_ENDPOINT_CONTRACT.anularMovimiento, [idMovimiento]);
@@ -729,7 +869,7 @@ const planillaService = {
   async auditoria(req) {
     const idPlanilla = parsePositiveInt(req.params.id_planilla);
     if (!idPlanilla) {
-      return { status: 400, body: { error: true, message: 'id_planilla inv·lido' } };
+      return { status: 400, body: { error: true, message: 'id_planilla inv√°lido' } };
     }
 
     const pagination = parsePagination(req.query || {});
@@ -805,3 +945,4 @@ router.get('/planillas/:id_planilla/auditoria', checkPermission(PLANILLAS_AUDITO
 router.post('/planillas/:id_planilla/detalle/:id_detalle/recalcular', checkPermission(PLANILLAS_RECALCULAR_PERMISSIONS), asyncHandler(planillaService.recalcularDetalle));
 
 export default router;
+
