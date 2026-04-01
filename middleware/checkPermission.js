@@ -6,7 +6,7 @@
  * - string: un permiso exacto
  * - array: acceso si tiene al menos uno de los permisos indicados
  * - bypass para rol SUPER_ADMIN
- * - compatibilidad temporal segura (endpoint nuevo -> permiso legacy equivalente)
+ * - compatibilidad segura para aliases legacy puntuales (sin incluir PLANILLAS_*)
  */
 
 import pool from '../config/db-connection.js';
@@ -247,3 +247,4 @@ export function checkPermission(requiredPermission) {
     }
   };
 }
+

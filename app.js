@@ -34,6 +34,8 @@ import correosRoutes from './routers/correos.js';
 import empresasRoutes from './routers/empresas.js';
 import clientesRoutes from './routers/clientes.js';
 import empleadosRoutes from './routers/empleados.js';
+import planillasRoutes from './routers/planillas.js';
+import personasAtomicRoutes from './routers/personas_atomic.js';
 
 // ESTE ARCHIVO EXISTE COMO "tipos_departamentos.js"
 import tipoDepartamentoRoutes from './routers/tipos_departamentos.js';
@@ -167,6 +169,8 @@ app.use(direccionesRoutes);
 app.use(correosRoutes);
 app.use(clientesRoutes);
 app.use(empleadosRoutes);
+app.use(personasAtomicRoutes);
+app.use(planillasRoutes);
 app.use(empresasRoutes);
 
 app.use(menuPosRouter); // Monta las rutas del POS Menú
@@ -178,3 +182,4 @@ app.listen(PORT, () => {
 });
 
 export default app;
+
