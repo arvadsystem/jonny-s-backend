@@ -1,6 +1,10 @@
 import express from 'express';
 import pool from '../config/db-connection.js';
-import { isRequestUserSuperAdmin } from '../middleware/checkPermission.js';
+import {
+  checkPermission,
+  requestHasAnyPermission
+} from '../middleware/checkPermission.js';
+import { resolveRequestUserSucursalScope } from '../utils/sucursalScope.js';
 const router = express.Router();
 
 const ESTADO_PEDIDO_CODES = {
@@ -32,6 +36,12 @@ const TRANSITIONS = {
   EN_PREPARACION: 'LISTO_PARA_ENTREGA',
   LISTO_PARA_ENTREGA: 'COMPLETADO'
 };
+const COCINA_VIEW_PERMISSIONS = ['COCINA_VER'];
+const COCINA_TRANSITION_PERMISSION_BY_STATE = Object.freeze({
+  EN_COCINA: 'COCINA_PEDIDO_INICIAR',
+  EN_PREPARACION: 'COCINA_PEDIDO_MARCAR_LISTO',
+  LISTO_PARA_ENTREGA: 'COCINA_PEDIDO_ENTREGAR'
+});
 
 const normalizeTextKey = (value) =>
   String(value || '')
@@ -164,7 +174,7 @@ const buildEstadoCodeByIdMap = (rows) => {
 
 const tryCreateReadyNotification = async () => false;
 
-router.get('/cocina/pedidos', async (req, res) => {
+router.get('/cocina/pedidos', checkPermission(COCINA_VIEW_PERMISSIONS), async (req, res) => {
   try {
     const client = await pool.connect();
 
@@ -185,8 +195,9 @@ router.get('/cocina/pedidos', async (req, res) => {
         return res.status(400).json({ error: true, message: 'id_sucursal invalido.' });
       }
 
-      const isSuperAdmin = await isRequestUserSuperAdmin(req);
-      const userSucursalId = parsePositiveInt(req.user?.id_sucursal);
+      const scope = await resolveRequestUserSucursalScope(req, client);
+      const isSuperAdmin = Boolean(scope.isSuperAdmin);
+      const userSucursalId = parsePositiveInt(scope.userSucursalId);
 
       if (!isSuperAdmin) {
         if (!userSucursalId) {
@@ -386,7 +397,7 @@ router.get('/cocina/pedidos', async (req, res) => {
   }
 });
 
-router.put('/cocina/pedidos/:id/estado', async (req, res) => {
+router.put('/cocina/pedidos/:id/estado', checkPermission(COCINA_VIEW_PERMISSIONS), async (req, res) => {
   const client = await pool.connect();
 
   try {
@@ -406,12 +417,20 @@ router.put('/cocina/pedidos/:id/estado', async (req, res) => {
 
     await client.query('BEGIN');
 
+    const scope = await resolveRequestUserSucursalScope(req, client);
+    const isSuperAdmin = Boolean(scope.isSuperAdmin);
+    const userSucursalId = parsePositiveInt(scope.userSucursalId);
+    if (!isSuperAdmin && !userSucursalId) {
+      await client.query('ROLLBACK');
+      return res.status(403).json({ error: true, message: 'El empleado no tiene sucursal asignada.' });
+    }
+
     const estadoRows = await fetchEstadoCatalog(client);
     const estadoIdMap = buildEstadoIdMap(estadoRows);
     const estadoCodeByIdMap = buildEstadoCodeByIdMap(estadoRows);
     const pedidoResult = await client.query(
       `
-        SELECT p.id_pedido, p.id_estado_pedido
+        SELECT p.id_pedido, p.id_estado_pedido, p.id_sucursal
         FROM pedidos p
         WHERE p.id_pedido = $1
         FOR UPDATE
@@ -425,6 +444,15 @@ router.put('/cocina/pedidos/:id/estado', async (req, res) => {
     }
 
     const pedido = pedidoResult.rows[0];
+    const pedidoSucursalId = parsePositiveInt(pedido.id_sucursal);
+    if (!isSuperAdmin && pedidoSucursalId !== userSucursalId) {
+      await client.query('ROLLBACK');
+      return res.status(403).json({
+        error: true,
+        message: 'No tienes permiso para operar pedidos de otra sucursal.'
+      });
+    }
+
     const estadoActual = estadoCodeByIdMap.get(Number(pedido.id_estado_pedido ?? 0)) || null;
 
     if (!estadoActual || !TRANSITIONS[estadoActual]) {
@@ -440,6 +468,16 @@ router.put('/cocina/pedidos/:id/estado', async (req, res) => {
       return res.status(409).json({
         error: true,
         message: `No se permite la transicion ${estadoActual} -> ${estadoDestino}.`
+      });
+    }
+
+    const transitionPermission = COCINA_TRANSITION_PERMISSION_BY_STATE[estadoActual];
+    const canChangeTransition = await requestHasAnyPermission(req, transitionPermission);
+    if (!canChangeTransition) {
+      await client.query('ROLLBACK');
+      return res.status(403).json({
+        error: true,
+        message: 'Acceso denegado: permisos insuficientes para cambiar estado en cocina.'
       });
     }
 
