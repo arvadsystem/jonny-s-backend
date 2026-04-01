@@ -16,8 +16,7 @@ export const loginLimiter = rateLimit({
     message: 'Demasiados intentos de inicio de sesión. Intenta de nuevo en 15 minutos.'
   },
   standardHeaders: true,
-  legacyHeaders: false,
-  keyGenerator: (req) => req.ip,
+  legacyHeaders: false
 });
 
 /**
@@ -31,8 +30,7 @@ export const registerLimiter = rateLimit({
     message: 'Demasiados intentos de registro. Intenta de nuevo en una hora.'
   },
   standardHeaders: true,
-  legacyHeaders: false,
-  keyGenerator: (req) => req.ip,
+  legacyHeaders: false
 });
 
 /**
@@ -46,6 +44,5 @@ export const forgotPasswordLimiter = rateLimit({
     message: 'Demasiados intentos. Intenta de nuevo en 15 minutos.'
   },
   standardHeaders: true,
-  legacyHeaders: false,
-  keyGenerator: (req) => req.ip,
+  legacyHeaders: false
 });

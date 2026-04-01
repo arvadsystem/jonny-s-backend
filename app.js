@@ -6,6 +6,7 @@ import helmet from 'helmet';
 import pool from './config/db-connection.js';
 
 import loginRoutes from './routers/login.js';
+import publicClienteRoutes from './routers/public_cliente.js';
 import publicMenuRouter from './routers/public_menu/index.js';
 
 // ... tus otros routes
@@ -110,7 +111,10 @@ app.get('/status', async (req, res) => {
 app.use(loginRoutes);
 
 // ✅ Menú público para clientes (sin sesión de dashboard/POS).
-app.use('/public-menu', publicMenuRouter);
+app.use('/api/public-menu', publicMenuRouter);
+
+// ✅ Rutas públicas de clientes (registro, login, menú, forgot-password)
+app.use(publicClienteRoutes);
 
 // ✅ 3) A partir de aquí: todo protegido
 app.use(authRequired);               // 1) valida JWT
