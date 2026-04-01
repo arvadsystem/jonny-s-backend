@@ -3,6 +3,8 @@ import pool from '../config/db-connection.js';
 import jwt from 'jsonwebtoken';
 import crypto from 'crypto';
 import { authRequired } from '../middleware/auth.js';
+import { loginLimiter } from '../middleware/rateLimiter.js';
+import JWT_SECRET from '../config/jwt.js';
 
 // helpers de HU78
 import { getClientIp, parseUserAgent } from '../utils/security/clientInfo.js';
@@ -10,9 +12,6 @@ import { insertLoginLog } from '../utils/security/loginLogger.js';
 import { createSession, closeSession } from '../utils/security/sessionService.js';
 
 const router = express.Router();
-
-const FALLBACK_JWT_SECRET = 'CAMBIA_ESTE_SECRET_EN_ENV';
-const JWT_SECRET = process.env.JWT_SECRET || (process.env.NODE_ENV === 'production' ? '' : FALLBACK_JWT_SECRET);
 const LEGACY_BCRYPT_PREFIX_RE = /^\$2[abxy]?\$/i;
 const MUST_CHANGE_PASSWORD_FIELDS = [
   'must_change_password',
@@ -106,12 +105,28 @@ const issueCsrf = (res) => {
   return csrfToken;
 };
 
-const verifyLoginPassword = async (plainPassword, storedPassword) => {
+const verifyLoginPassword = async (plainPassword, storedPassword, userId) => {
   const plain = String(plainPassword ?? '');
   const stored = String(storedPassword ?? '');
 
   if (!plain || !stored) return false;
-  if (plain === stored) return true;
+
+  // Contraseña en texto plano — validar y migrar a bcrypt on-the-fly
+  if (plain === stored) {
+    try {
+      if (userId) {
+        await pool.query(
+          "UPDATE usuarios SET clave = crypt($1, gen_salt('bf', 12)) WHERE id_usuario = $2",
+          [plain, userId]
+        );
+        console.log(`[security] Contraseña migrada a bcrypt para usuario ${userId}`);
+      }
+    } catch (hashErr) {
+      console.error('[security] Error migrando contraseña a bcrypt:', hashErr.message);
+    }
+    return true;
+  }
+
   if (!LEGACY_BCRYPT_PREFIX_RE.test(stored)) return false;
 
   const result = await pool.query(
@@ -122,7 +137,7 @@ const verifyLoginPassword = async (plainPassword, storedPassword) => {
   return Boolean(result.rows?.[0]?.ok);
 };
 
-router.post('/login', async (req, res) => {
+router.post('/login', loginLimiter, async (req, res) => {
   const { nombre_usuario, clave } = req.body;
 
   if (!JWT_SECRET) {
@@ -146,7 +161,7 @@ router.post('/login', async (req, res) => {
     `;
     const result = await pool.query(query, [nombre_usuario]);
     const usuarioEncontrado = result.rows[0] || null;
-    const passwordValida = await verifyLoginPassword(clave, usuarioEncontrado?.clave);
+    const passwordValida = await verifyLoginPassword(clave, usuarioEncontrado?.clave, usuarioEncontrado?.id_usuario);
 
     // Login fallido: registrar intento
     if (!usuarioEncontrado || !passwordValida) {
@@ -294,7 +309,7 @@ router.get('/me', authRequired, async (req, res) => {
   try {
     if (Number.isInteger(idUsuario) && idUsuario > 0) {
       const result = await pool.query(
-        'SELECT * FROM usuarios WHERE id_usuario = $1 LIMIT 1',
+        'SELECT id_usuario, nombre_usuario, tipo_usuario, estado, must_change_password, id_empleado, id_cliente, foto_perfil FROM usuarios WHERE id_usuario = $1 LIMIT 1',
         [idUsuario]
       );
 

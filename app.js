@@ -2,9 +2,11 @@ import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
 import cookieParser from 'cookie-parser';
+import helmet from 'helmet';
 import pool from './config/db-connection.js';
 
 import loginRoutes from './routers/login.js';
+import publicClienteRoutes from './routers/public_cliente.js';
 
 // ... tus otros routes
 import usuarioRoutes from './routers/usuarios.js';
@@ -68,6 +70,7 @@ const FRONTEND_ORIGIN = process.env.FRONTEND_ORIGIN || 'http://localhost:5173';
 app.set('trust proxy', 1);
 
 // ✅ 1) Middlewares base SIEMPRE antes de auth
+app.use(helmet());
 app.use(
   cors({
     origin: FRONTEND_ORIGIN,
@@ -101,6 +104,9 @@ app.get('/status', async (req, res) => {
 
 // ✅ Login debe ser público
 app.use(loginRoutes);
+
+// ✅ Rutas públicas de clientes (registro, login, menú, forgot-password)
+app.use(publicClienteRoutes);
 
 // ✅ 3) A partir de aquí: todo protegido
 app.use(authRequired);               // 1) valida JWT
