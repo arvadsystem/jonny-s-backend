@@ -2,6 +2,7 @@ import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
 import cookieParser from 'cookie-parser';
+import helmet from 'helmet';
 import pool from './config/db-connection.js';
 
 import loginRoutes from './routers/login.js';
@@ -33,6 +34,8 @@ import correosRoutes from './routers/correos.js';
 import empresasRoutes from './routers/empresas.js';
 import clientesRoutes from './routers/clientes.js';
 import empleadosRoutes from './routers/empleados.js';
+import planillasRoutes from './routers/planillas.js';
+import personasAtomicRoutes from './routers/personas_atomic.js';
 
 // ESTE ARCHIVO EXISTE COMO "tipos_departamentos.js"
 import tipoDepartamentoRoutes from './routers/tipos_departamentos.js';
@@ -71,6 +74,7 @@ const FRONTEND_ORIGIN = process.env.FRONTEND_ORIGIN || 'http://localhost:5173';
 app.set('trust proxy', 1);
 
 // ✅ 1) Middlewares base SIEMPRE antes de auth
+app.use(helmet());
 app.use(
   cors({
     origin: FRONTEND_ORIGIN,
@@ -171,6 +175,8 @@ app.use(direccionesRoutes);
 app.use(correosRoutes);
 app.use(clientesRoutes);
 app.use(empleadosRoutes);
+app.use(personasAtomicRoutes);
+app.use(planillasRoutes);
 app.use(empresasRoutes);
 
 app.use(menuPosRouter); // Monta las rutas del POS Menú
@@ -182,3 +188,4 @@ app.listen(PORT, () => {
 });
 
 export default app;
+

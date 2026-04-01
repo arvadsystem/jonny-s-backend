@@ -1,6 +1,7 @@
 import express from 'express';
 import pool from '../config/db-connection.js';
-import { checkPermission, isRequestUserSuperAdmin } from '../middleware/checkPermission.js';
+import { checkPermission } from '../middleware/checkPermission.js';
+import { resolveRequestUserSucursalScope } from '../utils/sucursalScope.js';
 
 const router = express.Router();
 
@@ -411,19 +412,13 @@ const aggregateProductoQuantities = (normalizedItems) => {
 };
 
 const resolveSucursalId = async (client, requestedId) => {
-  if (requestedId) {
-    const result = await client.query(
-      'SELECT id_sucursal FROM sucursales WHERE id_sucursal = $1 AND COALESCE(estado, true) = true LIMIT 1',
-      [requestedId]
-    );
-    return result.rowCount > 0 ? requestedId : null;
-  }
+  if (!requestedId) return null;
 
   const result = await client.query(
-    'SELECT id_sucursal FROM sucursales WHERE COALESCE(estado, true) = true ORDER BY id_sucursal LIMIT 1'
+    'SELECT id_sucursal FROM sucursales WHERE id_sucursal = $1 AND COALESCE(estado, true) = true LIMIT 1',
+    [requestedId]
   );
-
-  return result.rows[0]?.id_sucursal ?? null;
+  return result.rowCount > 0 ? requestedId : null;
 };
 
 const resolveCajaId = async (client, idSucursal, idUsuario) => {
@@ -694,7 +689,7 @@ const hydrateVentaLines = async (client, normalizedItems) => {
   return { ok: true, data: { lines, subTotals } };
 };
 
-const buildVentaPayload = async ({ client, body, userId }) => {
+const buildVentaPayload = async ({ client, body, userId, sucursalScope }) => {
   if (!isPlainObject(body)) {
     return {
       ok: false,
@@ -769,14 +764,44 @@ const buildVentaPayload = async ({ client, body, userId }) => {
     };
   }
 
-  const idSucursal = await resolveSucursalId(client, idSucursalRequested);
+  const isSuperAdmin = Boolean(sucursalScope?.isSuperAdmin);
+  const userSucursalId = parseOptionalPositiveInt(sucursalScope?.userSucursalId);
+
+  let idSucursalTarget = null;
+  if (isSuperAdmin) {
+    if (!idSucursalRequested) {
+      return {
+        ok: false,
+        status: 400,
+        body: {
+          error: true,
+          message: 'id_sucursal es obligatorio para super_admin al registrar ventas.'
+        }
+      };
+    }
+    idSucursalTarget = idSucursalRequested;
+  } else {
+    if (!userSucursalId) {
+      return {
+        ok: false,
+        status: 403,
+        body: {
+          error: true,
+          message: 'El empleado no tiene sucursal asignada.'
+        }
+      };
+    }
+    idSucursalTarget = userSucursalId;
+  }
+
+  const idSucursal = await resolveSucursalId(client, idSucursalTarget);
   if (!idSucursal) {
     return {
       ok: false,
-      status: 400,
+      status: 409,
       body: {
         error: true,
-        message: 'No se pudo resolver una sucursal activa para la venta.'
+        message: 'La sucursal operativa del usuario no esta disponible o se encuentra inactiva.'
       }
     };
   }
@@ -1402,8 +1427,9 @@ router.get('/ventas', async (req, res) => {
     let idSucursal = parseOptionalPositiveInt(req.query.id_sucursal);
     const idCliente = parseOptionalPositiveInt(req.query.id_cliente);
 
-    const isSuperAdmin = await isRequestUserSuperAdmin(req);
-    const userSucursalId = parseOptionalPositiveInt(req.user?.id_sucursal);
+    const scope = await resolveRequestUserSucursalScope(req);
+    const isSuperAdmin = Boolean(scope.isSuperAdmin);
+    const userSucursalId = parseOptionalPositiveInt(scope.userSucursalId);
 
     if (!isSuperAdmin) {
       if (!userSucursalId) {
@@ -1567,6 +1593,13 @@ router.get('/ventas/:id', async (req, res) => {
     }
 
     const enforceRoleRange = shouldLimitVentasHistoryByRole(req);
+    const scope = await resolveRequestUserSucursalScope(req);
+    const isSuperAdmin = Boolean(scope.isSuperAdmin);
+    const userSucursalId = parseOptionalPositiveInt(scope.userSucursalId);
+
+    if (!isSuperAdmin && !userSucursalId) {
+      return res.status(403).json({ error: true, message: 'El empleado no tiene sucursal asignada.' });
+    }
     const headerQuery = `
       SELECT
         f.id_factura,
@@ -1625,10 +1658,19 @@ router.get('/ventas/:id', async (req, res) => {
           $2::boolean = false
           OR ${getVentasHistorySqlFilter('COALESCE(p.fecha_hora_pedido, f.fecha_hora_facturacion)')}
         )
+        AND (
+          $3::boolean = true
+          OR COALESCE(p.id_sucursal, f.id_sucursal) = $4
+        )
       LIMIT 1
     `;
 
-    const headerResult = await pool.query(headerQuery, [idFactura, enforceRoleRange]);
+    const headerResult = await pool.query(headerQuery, [
+      idFactura,
+      enforceRoleRange,
+      isSuperAdmin,
+      userSucursalId
+    ]);
     if (headerResult.rowCount === 0) {
       return res.status(404).json({ error: true, message: 'Venta no encontrada.' });
     }
@@ -1734,11 +1776,13 @@ router.post('/ventas', async (req, res) => {
   try {
     await client.query('BEGIN');
 
-    const userId = req.user?.id_usuario ?? null;
+    const scope = await resolveRequestUserSucursalScope(req, client);
+    const userId = parseOptionalPositiveInt(scope.idUsuario);
     const prepared = await buildVentaPayload({
       client,
       body: req.body,
-      userId
+      userId,
+      sucursalScope: scope
     });
 
     if (!prepared.ok) {

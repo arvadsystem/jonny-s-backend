@@ -2,6 +2,18 @@ import express from 'express';
 import pool from '../config/db-connection.js';
 import { checkPermission, requestHasAnyPermission } from '../middleware/checkPermission.js';
 import { getClientIp } from '../utils/security/clientInfo.js';
+import {
+  buildErrorBody,
+  mapDbErrorToSafe,
+  sanitizeApiErrorMessage,
+  unknownFieldsFromPayload,
+  isSafeDni,
+  isSafeEmail,
+  isSafePhoneHN,
+  isSafeHumanName,
+  isValidDateOnly,
+  isFutureDateOnly
+} from '../utils/security/personasHardening.js';
 
 const router = express.Router();
 const PERSONAS_LIST_PERMISSIONS = ['PERSONAS_LISTADO_VER'];
@@ -38,6 +50,28 @@ const LISTAR_BASE_FIELDS = [
   'direccion',
   'direccion_correo'
 ];
+const PERSONA_CONTEXT_FIELDS = new Set(['rbac_context', 'contexto_origen', 'contexto', '_context']);
+const PERSONA_ALIAS_FIELDS = new Set(['direccion', 'telefono', 'correo', 'email']);
+const PERSONA_CORE_FIELDS = new Set([
+  'nombre',
+  'apellido',
+  'fecha_nacimiento',
+  'genero',
+  'dni',
+  'rtn',
+  'id_telefono',
+  'id_direccion',
+  'id_correo',
+  'texto_direccion',
+  'texto_telefono',
+  'texto_correo',
+  'id_empresa',
+  'estado',
+  'created_by',
+  'updated_by',
+  'campo',
+  'valor'
+]);
 
 let schemaCapabilitiesPromise;
 
@@ -50,6 +84,31 @@ const truncateText = (value, maxLength) => {
   if (!Number.isInteger(maxLength) || maxLength <= 0) return text;
   return text.length > maxLength ? text.slice(0, maxLength) : text;
 };
+const toJsonParam = (value) => {
+  if (value === undefined || value === null) return null;
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return JSON.stringify({ value: String(value) });
+  }
+};
+
+const normalizeComparableValue = (value) => {
+  if (value === null || value === undefined) return null;
+  if (typeof value === 'string') {
+    const text = value.trim();
+    return text ? text : null;
+  }
+  if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+  if (value instanceof Date) return value.toISOString();
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
+};
+const valuesDiffer = (beforeValue, afterValue) =>
+  normalizeComparableValue(beforeValue) !== normalizeComparableValue(afterValue);
 
 const normalizePersonaPayload = (payload) => {
   if (!isPlainObject(payload)) return {};
@@ -94,6 +153,19 @@ const normalizeUpdateFieldName = (field) => {
 const parsePositiveInt = (value) => {
   const parsed = Number.parseInt(value, 10);
   return Number.isInteger(parsed) && parsed > 0 ? parsed : null;
+};
+const parseBooleanValue = (value) => {
+  if (typeof value === 'boolean') return value;
+  if (typeof value === 'number') {
+    if (value === 1) return true;
+    if (value === 0) return false;
+    return null;
+  }
+  if (typeof value !== 'string') return null;
+  const normalized = value.trim().toLowerCase();
+  if (['true', '1', 't', 'si', 'activo'].includes(normalized)) return true;
+  if (['false', '0', 'f', 'no', 'inactivo'].includes(normalized)) return false;
+  return null;
 };
 
 const isClientesContextRequest = (req) => {
@@ -229,6 +301,87 @@ const buildPersonaSuggestions = (rows = []) => {
 };
 
 const resolveUserId = (req) => req.user?.id_usuario ?? null;
+const rollbackQuietly = async (client) => {
+  try {
+    await client.query('ROLLBACK');
+  } catch {
+    // noop
+  }
+};
+
+const getCurrentValueForField = (row, field) => {
+  if (!row || typeof row !== 'object') return undefined;
+  if (Object.prototype.hasOwnProperty.call(row, field)) return row[field];
+
+  if (field === 'texto_direccion') return row.direccion ?? null;
+  if (field === 'texto_telefono') return row.telefono ?? null;
+  if (field === 'texto_correo') return row.correo ?? row.direccion_correo ?? null;
+
+  return undefined;
+};
+
+const validatePersonaData = (payload = {}, { requireNombre = false, requireApellido = false } = {}) => {
+  const errors = [];
+  const hasOwn = (key) => Object.prototype.hasOwnProperty.call(payload, key);
+
+  if (requireNombre && !String(payload.nombre ?? '').trim()) {
+    errors.push({ field: 'nombre', message: 'nombre es obligatorio.' });
+  }
+  if (requireApellido && !String(payload.apellido ?? '').trim()) {
+    errors.push({ field: 'apellido', message: 'apellido es obligatorio.' });
+  }
+
+  if (hasOwn('nombre')) {
+    const value = String(payload.nombre ?? '').trim();
+    if (value && !isSafeHumanName(value)) {
+      errors.push({ field: 'nombre', message: 'nombre solo puede contener letras y espacios.' });
+    }
+  }
+
+  if (hasOwn('apellido')) {
+    const value = String(payload.apellido ?? '').trim();
+    if (value && !isSafeHumanName(value)) {
+      errors.push({ field: 'apellido', message: 'apellido solo puede contener letras y espacios.' });
+    }
+  }
+
+  if (hasOwn('dni')) {
+    const value = String(payload.dni ?? '').trim();
+    if (value && !isSafeDni(value)) {
+      errors.push({ field: 'dni', message: 'dni no tiene un formato valido.' });
+    }
+  }
+
+  if (hasOwn('texto_telefono')) {
+    const value = String(payload.texto_telefono ?? '').trim();
+    if (value && !isSafePhoneHN(value)) {
+      errors.push({ field: 'texto_telefono', message: 'texto_telefono debe tener formato ####-####.' });
+    }
+  }
+
+  if (hasOwn('texto_correo')) {
+    const value = String(payload.texto_correo ?? '').trim();
+    if (value && !isSafeEmail(value)) {
+      errors.push({ field: 'texto_correo', message: 'texto_correo debe ser un correo valido.' });
+    }
+  }
+
+  if (hasOwn('fecha_nacimiento')) {
+    const value = String(payload.fecha_nacimiento ?? '').trim();
+    if (value && (!isValidDateOnly(value) || isFutureDateOnly(value))) {
+      errors.push({ field: 'fecha_nacimiento', message: 'fecha_nacimiento no es valida.' });
+    }
+  }
+
+  if (hasOwn('estado')) {
+    const parsed = parseBooleanValue(payload.estado);
+    if (parsed === null) {
+      errors.push({ field: 'estado', message: 'estado debe ser booleano.' });
+    }
+  }
+
+  return errors;
+};
 
 const getSchemaCapabilities = async () => {
   if (!schemaCapabilitiesPromise) {
@@ -523,30 +676,30 @@ const personaRepository = {
     return result.rows[0] || null;
   },
 
-  async create(data) {
+  async create(data, db = pool) {
     const payloadJson = JSON.stringify(data ?? {});
-    const result = await pool.query('SELECT fn_guardar_persona($1::json) AS resultado', [payloadJson]);
+    const result = await db.query('SELECT fn_guardar_persona($1::json) AS resultado', [payloadJson]);
     return safeParseJson(extractFunctionResult(result.rows[0], 'resultado'));
   },
 
-  async update(idPersona, data) {
+  async update(idPersona, data, db = pool) {
     const payloadJson = JSON.stringify(data ?? {});
-    const result = await pool.query(
+    const result = await db.query(
       'SELECT fn_actualizar_persona($1, $2::json) AS resultado',
       [idPersona, payloadJson]
     );
     return safeParseJson(extractFunctionResult(result.rows[0], 'resultado'));
   },
 
-  async updateField(idPersona, campo, valor) {
-    await pool.query(
+  async updateField(idPersona, campo, valor, db = pool) {
+    await db.query(
       'CALL pa_update($1::TEXT, $2::TEXT, $3::TEXT, $4::TEXT, $5::TEXT)',
       ['personas', campo, String(valor), 'id_persona', String(idPersona)]
     );
   },
 
-  async hardDelete(idPersona) {
-    await pool.query(
+  async hardDelete(idPersona, db = pool) {
+    await db.query(
       'CALL pa_delete($1::TEXT, $2::TEXT, $3::TEXT)',
       ['personas', 'id_persona', String(idPersona)]
     );
@@ -562,7 +715,8 @@ const personaRepository = {
     tablaAfectada = 'personas',
     idRegistro = null,
     datosAntes = null,
-    datosDespues = null
+    datosDespues = null,
+    db = pool
   }) {
     if (!capabilities.hasBitacorasTable || !idUsuario) return;
     const descripcionSafe = truncateText(descripcion, MAX_AUDIT_DESCRIPCION_LENGTH);
@@ -571,7 +725,7 @@ const personaRepository = {
     const idRegistroSafe = parsePositiveInt(idRegistro);
     const ipOrigen = req ? getClientIp(req) : null;
 
-    await pool.query(
+    await db.query(
       `
         INSERT INTO bitacoras (
           accion,
@@ -714,27 +868,63 @@ const personaService = {
 
   async create(req) {
     const capabilities = await getSchemaCapabilities();
-    const payload = normalizePersonaPayload(req.body);
+    const rawBody = isPlainObject(req.body) ? req.body : {};
+    const payload = normalizePersonaPayload(rawBody);
     const hasGeneralCreatePermission = await requestHasAnyPermission(req, ['PERSONAS_CREAR']);
 
     if (!hasGeneralCreatePermission) {
       const hasContextualCreatePermission = await requestHasAnyPermission(req, ['PERSONAS_CREAR_DESDE_CLIENTES']);
       if (!hasContextualCreatePermission) {
-        return { status: 403, body: { error: true, message: 'Acceso denegado: permisos insuficientes' } };
+        return {
+          status: 403,
+          body: buildErrorBody({ code: 'FORBIDDEN', message: 'Acceso denegado: permisos insuficientes.' })
+        };
       }
       if (!isClientesContextRequest(req)) {
         return {
           status: 403,
-          body: {
-            error: true,
-            message: 'Acceso denegado: PERSONAS_CREAR_DESDE_CLIENTES solo aplica en flujo de clientes'
-          }
+          body: buildErrorBody({
+            code: 'FORBIDDEN',
+            message: 'Acceso denegado: PERSONAS_CREAR_DESDE_CLIENTES solo aplica en flujo de clientes.'
+          })
         };
       }
     }
 
+    const allowedFields = new Set([
+      ...PERSONA_CORE_FIELDS,
+      ...PERSONA_ALIAS_FIELDS,
+      ...PERSONA_CONTEXT_FIELDS
+    ]);
+    const unknownFields = unknownFieldsFromPayload(rawBody, allowedFields);
+    if (unknownFields.length) {
+      return {
+        status: 400,
+        body: buildErrorBody({
+          code: 'UNKNOWN_FIELDS',
+          message: 'El payload contiene campos no permitidos.',
+          details: { fields: unknownFields }
+        })
+      };
+    }
+
     if (!isPlainObject(payload) || Object.keys(payload).length === 0) {
-      return { status: 400, body: { error: true, message: 'Debe enviar un objeto con datos validos' } };
+      return {
+        status: 400,
+        body: buildErrorBody({ code: 'VALIDATION_ERROR', message: 'Debe enviar un objeto con datos validos.' })
+      };
+    }
+
+    const validationErrors = validatePersonaData(payload, { requireNombre: true, requireApellido: true });
+    if (validationErrors.length) {
+      return {
+        status: 400,
+        body: buildErrorBody({
+          code: 'VALIDATION_ERROR',
+          message: validationErrors[0].message,
+          details: { field: validationErrors[0].field }
+        })
+      };
     }
 
     const insertData = { ...payload };
@@ -744,7 +934,10 @@ const personaService = {
     if (capabilities.hasTenantField && tenantId) {
       const requestedTenantId = parsePositiveInt(insertData.id_empresa);
       if (requestedTenantId && requestedTenantId !== tenantId) {
-        return { status: 403, body: { error: true, message: 'No puede crear personas para otra empresa' } };
+        return {
+          status: 403,
+          body: buildErrorBody({ code: 'FORBIDDEN', message: 'No puede crear personas para otra empresa.' })
+        };
       }
       if (!requestedTenantId) {
         insertData.id_empresa = tenantId;
@@ -754,51 +947,93 @@ const personaService = {
     if (capabilities.hasCreatedBy && idUsuario) insertData.created_by = idUsuario;
     if (capabilities.hasUpdatedBy && idUsuario) insertData.updated_by = idUsuario;
 
-    const resultado = await personaRepository.create(insertData);
-    await personaRepository.addAuditLog({
-      accion: 'PERSONA_CREAR',
-      descripcion: `Persona creada: ${payload.nombre ?? 'sin_nombre'}`,
-      idUsuario,
-      capabilities,
-      req,
-      modulo: 'PERSONAS',
-      tablaAfectada: 'personas',
-      datosDespues: payload
-    });
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const resultado = await personaRepository.create(insertData, client);
+      await personaRepository.addAuditLog({
+        accion: 'PERSONA_CREAR',
+        descripcion: `Persona creada: ${payload.nombre ?? 'sin_nombre'}`,
+        idUsuario,
+        capabilities,
+        req,
+        modulo: 'PERSONAS',
+        tablaAfectada: 'personas',
+        datosDespues: payload,
+        db: client
+      });
+      await client.query('COMMIT');
 
-    return {
-      status: 201,
-      body: {
-        error: false,
-        message: isPlainObject(resultado) && resultado.message
-          ? resultado.message
-          : 'Persona creada exitosamente.',
-        data: resultado ?? null
-      }
-    };
+      return {
+        status: 201,
+        body: {
+          ok: true,
+          error: false,
+          message: isPlainObject(resultado) && resultado.message
+            ? resultado.message
+            : 'Persona creada exitosamente.',
+          data: resultado ?? null
+        }
+      };
+    } catch (error) {
+      await rollbackQuietly(client);
+      throw error;
+    } finally {
+      client.release();
+    }
   },
 
   async update(req) {
     const capabilities = await getSchemaCapabilities();
     const idPersona = parsePositiveInt(req.params.id);
-    const payload = normalizePersonaPayload(req.body);
+    const rawBody = isPlainObject(req.body) ? req.body : {};
+    const payload = normalizePersonaPayload(rawBody);
 
     if (!idPersona) {
-      return { status: 400, body: { error: true, message: 'El id debe ser un entero positivo' } };
+      return {
+        status: 400,
+        body: buildErrorBody({ code: 'VALIDATION_ERROR', message: 'El id debe ser un entero positivo.' })
+      };
     }
 
     if (!isPlainObject(payload) || Object.keys(payload).length === 0) {
-      return { status: 400, body: { error: true, message: 'Debe enviar datos validos para actualizar' } };
+      return {
+        status: 400,
+        body: buildErrorBody({ code: 'VALIDATION_ERROR', message: 'Debe enviar datos validos para actualizar.' })
+      };
+    }
+
+    const allowedRequestFields = new Set([
+      ...PERSONA_CORE_FIELDS,
+      ...PERSONA_ALIAS_FIELDS,
+      ...PERSONA_CONTEXT_FIELDS
+    ]);
+    const unknownFields = unknownFieldsFromPayload(rawBody, allowedRequestFields);
+    if (unknownFields.length) {
+      return {
+        status: 400,
+        body: buildErrorBody({
+          code: 'UNKNOWN_FIELDS',
+          message: 'El payload contiene campos no permitidos.',
+          details: { fields: unknownFields }
+        })
+      };
     }
 
     const current = await personaRepository.findById(idPersona, capabilities);
     if (!current) {
-      return { status: 404, body: { error: true, message: 'Persona no encontrada' } };
+      return {
+        status: 404,
+        body: buildErrorBody({ code: 'NOT_FOUND', message: 'Persona no encontrada.' })
+      };
     }
 
     const tenantId = parsePositiveInt(req.user?.id_empresa);
     if (tenantId && capabilities.hasTenantField && tenantId !== current.id_empresa) {
-      return { status: 403, body: { error: true, message: 'Acceso denegado para esta persona' } };
+      return {
+        status: 403,
+        body: buildErrorBody({ code: 'FORBIDDEN', message: 'Acceso denegado para esta persona.' })
+      };
     }
 
     const allowedFields = new Set([...BASE_FIELDS.filter((field) => field !== 'id_persona')]);
@@ -818,7 +1053,13 @@ const personaService = {
       const campo = normalizeUpdateFieldName(payload.campo);
       const valor = payload.valor;
       if (!allowedFields.has(campo)) {
-        return { status: 400, body: { error: true, message: 'El campo no es valido para actualizacion' } };
+        return {
+          status: 400,
+          body: buildErrorBody({
+            code: 'VALIDATION_ERROR',
+            message: 'El campo no es valido para actualizacion.'
+          })
+        };
       }
       updateData = { [campo]: valor };
     } else {
@@ -833,16 +1074,40 @@ const personaService = {
       if (!Object.keys(updateData).length) {
         return {
           status: 400,
-          body: { error: true, message: 'No se recibieron campos validos para actualizar' }
+          body: buildErrorBody({
+            code: 'VALIDATION_ERROR',
+            message: 'No se recibieron campos validos para actualizar.'
+          })
         };
       }
+    }
+
+    const validationErrors = validatePersonaData(updateData, {
+      requireNombre: false,
+      requireApellido: false
+    });
+    if (validationErrors.length) {
+      return {
+        status: 400,
+        body: buildErrorBody({
+          code: 'VALIDATION_ERROR',
+          message: validationErrors[0].message,
+          details: { field: validationErrors[0].field }
+        })
+      };
     }
 
     const idUsuario = resolveUserId(req);
     if (capabilities.hasTenantField && tenantId) {
       const requestedTenantId = parsePositiveInt(updateData.id_empresa);
       if (requestedTenantId && requestedTenantId !== tenantId) {
-        return { status: 403, body: { error: true, message: 'No puede actualizar personas de otra empresa' } };
+        return {
+          status: 403,
+          body: buildErrorBody({
+            code: 'FORBIDDEN',
+            message: 'No puede actualizar personas de otra empresa.'
+          })
+        };
       }
       if (!requestedTenantId) {
         updateData.id_empresa = tenantId;
@@ -860,8 +1125,9 @@ const personaService = {
       return {
         status: 200,
         body: {
+          ok: true,
           error: false,
-          message: 'No se detectaron cambios para actualizar',
+          message: 'No se detectaron cambios para actualizar.',
           data: current
         }
       };
@@ -871,7 +1137,6 @@ const personaService = {
       updateDataFiltered.updated_by = idUsuario;
     }
 
-    const resultado = await personaRepository.update(idPersona, updateDataFiltered);
     const changedEntriesForAudit = changedEntries.filter(([field]) => field !== 'updated_by');
     const camposActualizados = changedEntriesForAudit.map(([field]) => field).join(', ');
     const datosAntes = changedEntriesForAudit.reduce((acc, [field]) => {
@@ -885,29 +1150,42 @@ const personaService = {
     const auditDatosAntes = Object.keys(datosAntes).length ? datosAntes : null;
     const auditDatosDespues = Object.keys(datosDespues).length ? datosDespues : null;
 
-    await personaRepository.addAuditLog({
-      accion: 'PERSONA_ACTUALIZAR',
-      descripcion: `Persona ${idPersona} actualizada: ${camposActualizados || 'sin cambios detectados'}`,
-      idUsuario,
-      capabilities,
-      req,
-      modulo: 'PERSONAS',
-      tablaAfectada: 'personas',
-      idRegistro: idPersona,
-      datosAntes: auditDatosAntes,
-      datosDespues: auditDatosDespues
-    });
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const resultado = await personaRepository.update(idPersona, updateDataFiltered, client);
+      await personaRepository.addAuditLog({
+        accion: 'PERSONA_ACTUALIZAR',
+        descripcion: `Persona ${idPersona} actualizada: ${camposActualizados || 'sin cambios detectados'}`,
+        idUsuario,
+        capabilities,
+        req,
+        modulo: 'PERSONAS',
+        tablaAfectada: 'personas',
+        idRegistro: idPersona,
+        datosAntes: auditDatosAntes,
+        datosDespues: auditDatosDespues,
+        db: client
+      });
+      await client.query('COMMIT');
 
-    return {
-      status: 200,
-      body: {
-        error: false,
-        message: isPlainObject(resultado) && resultado.message
-          ? resultado.message
-          : 'Persona actualizada correctamente',
-        data: resultado ?? null
-      }
-    };
+      return {
+        status: 200,
+        body: {
+          ok: true,
+          error: false,
+          message: isPlainObject(resultado) && resultado.message
+            ? resultado.message
+            : 'Persona actualizada correctamente.',
+          data: resultado ?? null
+        }
+      };
+    } catch (error) {
+      await rollbackQuietly(client);
+      throw error;
+    } finally {
+      client.release();
+    }
   },
 
   async remove(req) {
@@ -915,45 +1193,66 @@ const personaService = {
     const idPersona = parsePositiveInt(req.params.id);
 
     if (!idPersona) {
-      return { status: 400, body: { error: true, message: 'El id debe ser un entero positivo' } };
+      return {
+        status: 400,
+        body: buildErrorBody({ code: 'VALIDATION_ERROR', message: 'El id debe ser un entero positivo.' })
+      };
     }
 
     const current = await personaRepository.findById(idPersona, capabilities);
     if (!current) {
-      return { status: 404, body: { error: true, message: 'Persona no encontrada' } };
+      return {
+        status: 404,
+        body: buildErrorBody({ code: 'NOT_FOUND', message: 'Persona no encontrada.' })
+      };
     }
 
     const tenantId = parsePositiveInt(req.user?.id_empresa);
     if (tenantId && capabilities.hasTenantField && tenantId !== current.id_empresa) {
-      return { status: 403, body: { error: true, message: 'Acceso denegado para esta persona' } };
+      return {
+        status: 403,
+        body: buildErrorBody({ code: 'FORBIDDEN', message: 'Acceso denegado para esta persona.' })
+      };
     }
 
     const idUsuario = resolveUserId(req);
+    const client = await pool.connect();
     let message = 'Persona eliminada correctamente';
 
-    if (capabilities.softDeleteField) {
-      await personaRepository.updateField(idPersona, capabilities.softDeleteField, false);
-      if (capabilities.hasUpdatedBy && idUsuario) {
-        await personaRepository.updateField(idPersona, 'updated_by', idUsuario);
+    try {
+      await client.query('BEGIN');
+
+      if (capabilities.softDeleteField) {
+        await personaRepository.updateField(idPersona, capabilities.softDeleteField, false, client);
+        if (capabilities.hasUpdatedBy && idUsuario) {
+          await personaRepository.updateField(idPersona, 'updated_by', idUsuario, client);
+        }
+        message = 'Persona inactivada correctamente';
+      } else {
+        await personaRepository.hardDelete(idPersona, client);
       }
-      message = 'Persona inactivada correctamente';
-    } else {
-      await personaRepository.hardDelete(idPersona);
+
+      await personaRepository.addAuditLog({
+        accion: 'PERSONA_ELIMINAR',
+        descripcion: `Persona ${idPersona} eliminada. Modo: ${capabilities.softDeleteField ? 'soft' : 'hard'}`,
+        idUsuario,
+        capabilities,
+        req,
+        modulo: 'PERSONAS',
+        tablaAfectada: 'personas',
+        idRegistro: idPersona,
+        datosAntes: current,
+        db: client
+      });
+
+      await client.query('COMMIT');
+      return { status: 200, body: { ok: true, error: false, message } };
+    } catch (error) {
+      await rollbackQuietly(client);
+      throw error;
+    } finally {
+      client.release();
     }
-
-    await personaRepository.addAuditLog({
-      accion: 'PERSONA_ELIMINAR',
-      descripcion: `Persona ${idPersona} eliminada. Modo: ${capabilities.softDeleteField ? 'soft' : 'hard'}`,
-      idUsuario,
-      capabilities,
-      req,
-      modulo: 'PERSONAS',
-      tablaAfectada: 'personas',
-      idRegistro: idPersona,
-      datosAntes: current
-    });
-
-    return { status: 200, body: { error: false, message } };
   }
 };
 
@@ -963,7 +1262,28 @@ const asyncHandler = (handler) => async (req, res) => {
     return res.status(result.status).json(result.body);
   } catch (err) {
     console.error('Personas API error:', err.message);
-    return res.status(500).json({ error: true, message: 'Error interno del servidor' });
+    const httpStatus = Number.isInteger(err?.httpStatus) ? err.httpStatus : null;
+    if (httpStatus && httpStatus >= 400 && httpStatus < 500) {
+      return res.status(httpStatus).json(
+        buildErrorBody({
+          code: err.code || 'REQUEST_ERROR',
+          message: sanitizeApiErrorMessage(err.message, httpStatus)
+        })
+      );
+    }
+
+    const mapped = mapDbErrorToSafe(err, {
+      defaultMessage: 'No se pudo procesar la solicitud de personas.'
+    });
+    if (mapped) {
+      return res.status(mapped.status).json(
+        buildErrorBody({ code: mapped.code, message: mapped.message })
+      );
+    }
+
+    return res.status(500).json(
+      buildErrorBody({ code: 'INTERNAL_ERROR', message: 'No se pudo procesar la solicitud de personas.' })
+    );
   }
 };
 
