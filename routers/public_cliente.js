@@ -142,10 +142,10 @@ const autenticarConSupabase = async (email, password) => {
 
 // ── POST /api/public/register ─────────────────────────────────────────
 router.post('/api/public/register', registerLimiter, async (req, res) => {
-  const { email, clave, nombre, apellido } = req.body;
+  const { email, clave, nombre, apellido, nombreUsuario } = req.body;
 
-  if (!email || !clave) {
-    return res.status(400).json({ error: true, message: 'Email y contraseña son requeridos' });
+  if (!email || !clave || !nombre || !apellido || !nombreUsuario) {
+    return res.status(400).json({ error: true, message: 'Todos los campos son obligatorios (Nombre, Apellido, Usuario, Email y Contraseña)' });
   }
 
   // Fix 7: Validación de fuerza de contraseña
@@ -167,36 +167,39 @@ router.post('/api/public/register', registerLimiter, async (req, res) => {
       return res.status(409).json({ error: true, message: 'El correo ya está registrado' });
     }
 
+    // 1.5 Verificar que no exista el nombre de usuario
+    const usuarioExiste = await client.query(
+      `SELECT id_usuario FROM usuarios WHERE nombre_usuario = $1`,
+      [nombreUsuario]
+    );
+    if (usuarioExiste.rows.length > 0) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({ error: true, message: 'El nombre de usuario ya está en uso' });
+    }
+
     // 2. Crear identidad en Supabase (SIN confirmar email)
     const auth_user_id = await crearIdentidadSupabase(email, clave);
 
-    // 3. Buscar o crear persona
-    let id_persona = null;
-    if (nombre) {
-      const personaRes = await client.query(
-        `INSERT INTO personas (nombre, apellido) VALUES ($1, $2) RETURNING id_persona`,
-        [nombre || '', apellido || '']
-      );
-      id_persona = personaRes.rows[0]?.id_persona;
-    }
+    // 3. Crear persona
+    const personaRes = await client.query(
+      `INSERT INTO personas (nombre, apellido) VALUES ($1, $2) RETURNING id_persona`,
+      [nombre, apellido]
+    );
+    const id_persona = personaRes.rows[0].id_persona;
 
-    // 4. Crear registro en clientes (id_tipo_cliente=2 = 'General', tabla no tiene columna 'estado')
-    let id_cliente = null;
-    if (id_persona) {
-      const clienteRes = await client.query(
-        `INSERT INTO clientes (id_persona, id_tipo_cliente, fecha_ingreso, puntos)
-         VALUES ($1, 2, CURRENT_DATE, 0) RETURNING id_cliente`,
-        [id_persona]
-      );
-      id_cliente = clienteRes.rows[0]?.id_cliente;
-    }
+    // 4. Crear registro en clientes (id_tipo_cliente=2 = 'General')
+    const clienteRes = await client.query(
+      `INSERT INTO clientes (id_persona, id_tipo_cliente, fecha_ingreso, puntos)
+       VALUES ($1, 2, CURRENT_DATE, 0) RETURNING id_cliente`,
+      [id_persona]
+    );
+    const id_cliente = clienteRes.rows[0].id_cliente;
 
     // 5. Crear usuario interno (estado: false hasta verificar email)
-    const nombre_usuario = email;
     const usuarioRes = await client.query(
       `INSERT INTO usuarios (nombre_usuario, clave, estado, tipo_usuario, id_cliente, must_change_password)
        VALUES ($1, 'SUPABASE_AUTH', false, 'CLIENTE', $2, false) RETURNING id_usuario, nombre_usuario, tipo_usuario, id_cliente`,
-      [nombre_usuario, id_cliente]
+      [nombreUsuario, id_cliente]
     );
     const nuevoUsuario = usuarioRes.rows[0];
 

@@ -1,6 +1,7 @@
 import express from 'express';
 import pool from '../config/db-connection.js';
 import { attachImagenPrincipalUrls } from '../utils/uploads.js';
+import { resolveRequestUserSucursalScope } from '../utils/sucursalScope.js';
 
 const router = express.Router();
 
@@ -70,6 +71,7 @@ const resolveRowAlmacenes = (row) => {
 const filterProductosByCatalogScope = async (rows, query, db = pool) => {
   const idAlmacen = parseOptionalPositiveId(query?.id_almacen);
   const idSucursal = parseOptionalPositiveId(query?.id_sucursal);
+  const allowedSucursales = Array.isArray(query?._allowedSucursalIds) ? query._allowedSucursalIds : [];
 
   if ((query?.id_almacen ?? '') !== '' && query?.id_almacen !== undefined && idAlmacen === null) {
     return { ok: false, message: 'id_almacen invalido.' };
@@ -78,18 +80,20 @@ const filterProductosByCatalogScope = async (rows, query, db = pool) => {
     return { ok: false, message: 'id_sucursal invalido.' };
   }
 
-  if (!idAlmacen && !idSucursal) return { ok: true, rows };
+  if (!idAlmacen && !idSucursal && allowedSucursales.length === 0) return { ok: true, rows };
 
   let allowedWarehouseSet = null;
-  if (idSucursal) {
+  const targetSucursales = idSucursal ? [idSucursal] : allowedSucursales;
+  
+  if (targetSucursales.length > 0) {
     const allowed = await db.query(
       `
         SELECT a.id_almacen
         FROM public.almacenes a
-        WHERE a.id_sucursal = $1
+        WHERE a.id_sucursal = ANY($1::int[])
           AND COALESCE(a.estado, true) = true
       `,
-      [idSucursal]
+      [targetSucursales]
     );
     allowedWarehouseSet = new Set(
       (allowed.rows || [])
@@ -685,6 +689,28 @@ function getSafeProductosServerErrorMessage(err, fallback = 'No se pudo completa
 // GET: Obtener productos
 router.get('/productos', async (req, res) => {
   try {
+    const scope = await resolveRequestUserSucursalScope(req);
+    const queryPayload = { ...req.query };
+
+    if (!scope.isSuperAdmin) {
+      if (!scope.allowedSucursalIds || scope.allowedSucursalIds.length === 0) {
+        return res.status(403).json({ error: true, message: 'El empleado no tiene sucursales asignadas.' });
+      }
+      
+      const requestedSucursal = parseOptionalPositiveId(req.query.id_sucursal);
+      if (requestedSucursal) {
+        if (!scope.allowedSucursalIds.includes(requestedSucursal)) {
+          return res.status(403).json({ error: true, message: 'No tiene acceso a la sucursal solicitada.' });
+        }
+      } else {
+        // En productos se permite enviar id_sucursal=X para filtrar, 
+        // si no envia, pero está capado, debería listar de sus almacenes permitidos.
+        // Pero filterProductosByCatalogScope por ahora toma 1 sucursal,
+        // esto requiere que si scope.allowedSucursalIds tiene varias sucursales y no pide una, filtre por todas.
+        queryPayload._allowedSucursalIds = scope.allowedSucursalIds;
+      }
+    }
+
     const tabla = 'productos';
 
     // AJUSTE: se incluye estado para compatibilidad con soft delete
@@ -698,9 +724,11 @@ router.get('/productos', async (req, res) => {
     // NEW: activos por defecto; admin puede solicitar incluir inactivos.
     // WHY: alinear GET /productos con inactivacion via `estado=false`.
     // IMPACT: no rompe clientes actuales; amplia el contrato con query param opcional.
-    const datos = shouldIncludeInactive(req.query) ? baseDatos : baseDatos.filter(isRowActive);
+    const datos = shouldIncludeInactive(queryPayload) ? baseDatos : baseDatos.filter(isRowActive);
     const datosConAlmacenes = await attachProductoAlmacenes(datos, pool);
-    const scopedFilter = await filterProductosByCatalogScope(datosConAlmacenes, req.query, pool);
+    
+    // Filtro legacy o multi sucursal
+    const scopedFilter = await filterProductosByCatalogScope(datosConAlmacenes, queryPayload, pool);
     if (!scopedFilter.ok) {
       return res.status(400).json({ error: true, message: scopedFilter.message || 'Filtros de catalogo invalidos.' });
     }
