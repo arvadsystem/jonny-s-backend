@@ -158,7 +158,7 @@ const buildCatalogSql = ({
         WHEN ${detalleComboExpr} IS NOT NULL THEN c.id_tipo_departamento
         ELSE NULL
       END AS id_tipo_departamento,
-      td.nombre_departamento AS categoria_nombre,
+      COALESCE(td.nombre_departamento, cp.nombre_categoria) AS categoria_nombre,
       CASE
         WHEN dm.id_producto IS NOT NULL THEN ${productImageSelect}
         WHEN ${detalleRecetaExpr} IS NOT NULL THEN a_receta.url_publica
@@ -170,6 +170,8 @@ const buildCatalogSql = ({
     FROM detalle_menu dm
     LEFT JOIN productos p
       ON p.id_producto = dm.id_producto
+    LEFT JOIN categorias_productos cp
+      ON cp.id_categoria_producto = p.id_categoria_producto
     ${productImageJoin}
     LEFT JOIN recetas r
       ON r.id_receta = ${detalleRecetaExpr}
