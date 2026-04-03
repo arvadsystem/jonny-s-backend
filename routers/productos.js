@@ -104,6 +104,11 @@ const filterProductosByCatalogScope = async (rows, query, db = pool) => {
 
   const filtered = (Array.isArray(rows) ? rows : []).filter((row) => {
     const rowAlmacenes = resolveRowAlmacenes(row);
+    
+    // Si no tenemos un set de almacenes permitidos (Super Admin sin sucursal), 
+    // mostramos todo lo que este activo.
+    if (!allowedWarehouseSet && !idAlmacen) return true;
+
     if (rowAlmacenes.length === 0) return false;
     if (idAlmacen && !rowAlmacenes.includes(idAlmacen)) return false;
     if (allowedWarehouseSet && !rowAlmacenes.some((id) => allowedWarehouseSet.has(id))) return false;
