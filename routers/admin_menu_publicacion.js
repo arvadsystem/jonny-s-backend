@@ -1,4 +1,4 @@
-import express from 'express';
+﻿import express from 'express';
 import pool from '../config/db-connection.js';
 import { resolveMenuDepartmentIds } from './menu_departamentos.js';
 
@@ -9,6 +9,21 @@ const ITEM_TYPES = Object.freeze({
   RECETA: 'RECETA',
   COMBO: 'COMBO'
 });
+
+// Fallback por categoria de inventario cuando el producto no trae id_tipo_departamento esperado.
+const MENU_PRODUCT_CATEGORY_ALIASES = Object.freeze([
+  'cervezas',
+  'cerveza',
+  'refrescos/agua',
+  'refrescos / agua',
+  'gaseosas y refrescos',
+  'gaseosas/refrescos',
+  'aguas, isotónicos y energéticas',
+  'aguas, isotonicos y energeticas',
+  'helados sarita',
+  'snacks',
+  'snack'
+]);
 
 const toPositiveInt = (value) => {
   const parsed = Number.parseInt(String(value ?? '').trim(), 10);
@@ -279,9 +294,7 @@ const fetchBaseCatalogByMenu = async (idMenu, departmentIds) => {
   const comboDepartmentId = Number.isInteger(departmentIds?.comboDepartmentId)
     ? departmentIds.comboDepartmentId
     : null;
-  const productDepartmentIds = Array.isArray(departmentIds?.productDepartmentIds)
-    ? departmentIds.productDepartmentIds
-    : [];
+  const productCategoryAliases = [...MENU_PRODUCT_CATEGORY_ALIASES];
 
   const result = await pool.query(
     `
@@ -317,7 +330,10 @@ const fetchBaseCatalogByMenu = async (idMenu, departmentIds) => {
         COALESCE(p.estado, true) AS estado_item,
         p.precio::numeric AS precio_base
       FROM productos p
-      WHERE p.id_tipo_departamento = ANY($4::int[])
+      LEFT JOIN categorias_productos cp
+        ON cp.id_categoria_producto = p.id_categoria_producto
+      WHERE COALESCE(cp.estado, true) = true
+        AND LOWER(REGEXP_REPLACE(TRIM(COALESCE(cp.nombre_categoria, '')), '\\s*/\\s*', '/', 'g')) = ANY($4::text[])
 
       ORDER BY tipo_item, nombre_item ASC;
     `,
@@ -325,7 +341,7 @@ const fetchBaseCatalogByMenu = async (idMenu, departmentIds) => {
       idMenu,
       recipeExcludedDepartmentIds,
       comboDepartmentId,
-      productDepartmentIds
+      productCategoryAliases
     ]
   );
 
@@ -463,7 +479,7 @@ const mapPreviewItemFromAdminCatalog = (item) => {
 
 const normalizeDraftItems = (items) => {
   if (!Array.isArray(items) || items.length === 0) {
-    return { ok: false, message: 'Debes enviar al menos un item para guardar publicaciÃ³n.', data: [] };
+    return { ok: false, message: 'Debes enviar al menos un item para guardar publicaciÃƒÂ³n.', data: [] };
   }
 
   const normalized = [];
@@ -473,18 +489,18 @@ const normalizeDraftItems = (items) => {
     const tipoItem = normalizeItemType(raw?.tipo_item);
     const idItemOrigen = toPositiveInt(raw?.id_item_origen);
     if (!tipoItem || !idItemOrigen) {
-      return { ok: false, message: 'Cada item requiere tipo_item vÃ¡lido e id_item_origen positivo.', data: [] };
+      return { ok: false, message: 'Cada item requiere tipo_item vÃƒÂ¡lido e id_item_origen positivo.', data: [] };
     }
 
     const visible = parseBoolean(raw?.visible);
     const precioPublico = toNullableMoney(raw?.precio_publico);
     if (Number.isNaN(precioPublico)) {
-      return { ok: false, message: `precio_publico invÃ¡lido para ${tipoItem} #${idItemOrigen}.`, data: [] };
+      return { ok: false, message: `precio_publico invÃƒÂ¡lido para ${tipoItem} #${idItemOrigen}.`, data: [] };
     }
 
     const orden = toNullablePositiveInt(raw?.orden);
     if (Number.isNaN(orden)) {
-      return { ok: false, message: `orden invÃ¡lido para ${tipoItem} #${idItemOrigen}.`, data: [] };
+      return { ok: false, message: `orden invÃƒÂ¡lido para ${tipoItem} #${idItemOrigen}.`, data: [] };
     }
 
     const key = buildItemKey(tipoItem, idItemOrigen);
@@ -661,7 +677,7 @@ const getVisibleCountByMenu = async ({ idMenu, capabilities, client }) => {
   return Number(result.rows?.[0]?.total || 0);
 };
 
-// Lista sucursales operativas para el selector de publicaciÃ³n.
+// Lista sucursales operativas para el selector de publicaciÃƒÂ³n.
 router.get('/sucursales', async (_req, res) => {
   try {
     const rows = await getBranchesForPublication();
@@ -672,7 +688,7 @@ router.get('/sucursales', async (_req, res) => {
   }
 });
 
-// Retorna el catÃ¡logo unificado con estado actual de publicaciÃ³n por sucursal.
+// Retorna el catÃƒÂ¡logo unificado con estado actual de publicaciÃƒÂ³n por sucursal.
 // Lista menus disponibles para programar vigencias por sucursal.
 router.get('/menus', async (_req, res) => {
   try {
