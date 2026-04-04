@@ -1068,22 +1068,52 @@ router.get('/ventas/catalogos/clientes', async (req, res) => {
 
 router.get('/ventas/catalogos/combos', async (req, res) => {
   try {
-    const result = await pool.query(
-      `
-        SELECT 
-          c.id_combo, 
-          c.descripcion, 
-          c.precio, 
-          c.estado,
-          c.id_archivo,
-          a.url_publica AS imagen_principal_url
-        FROM combos c
-        LEFT JOIN archivos a ON a.id_archivo = c.id_archivo AND (a.estado = true OR a.estado IS NULL)
-        WHERE COALESCE(c.estado, true) = true
-        ORDER BY COALESCE(c.descripcion, c.id_combo::text)
-      `
-    );
+    const scope = await resolveRequestUserSucursalScope(req);
+    const isSuperAdmin = Boolean(scope.isSuperAdmin);
+    let idSucursal = parseOptionalPositiveInt(req.query.id_sucursal);
 
+    if (!isSuperAdmin) {
+      if (!scope.allowedSucursalIds || scope.allowedSucursalIds.length === 0) {
+        return res.status(403).json({ error: true, message: 'El empleado no tiene sucursales asignadas.' });
+      }
+      if (idSucursal) {
+        if (!scope.allowedSucursalIds.includes(idSucursal)) {
+          return res.status(403).json({ error: true, message: 'No tiene acceso a la sucursal solicitada.' });
+        }
+      }
+    }
+
+    let joinClause = '';
+    let whereClause = '';
+    const params = [];
+
+    if (idSucursal) {
+      params.push(idSucursal);
+      joinClause = 'INNER JOIN menu_vigente mv ON mv.id_menu = c.id_menu';
+      whereClause = 'AND mv.id_sucursal = $1 AND COALESCE(mv.estado, true) = true AND (mv.fecha_inicio IS NULL OR mv.fecha_inicio <= CURRENT_TIMESTAMP)';
+    } else if (!isSuperAdmin) {
+      params.push(scope.allowedSucursalIds);
+      joinClause = 'INNER JOIN menu_vigente mv ON mv.id_menu = c.id_menu';
+      whereClause = 'AND mv.id_sucursal = ANY($1::int[]) AND COALESCE(mv.estado, true) = true AND (mv.fecha_inicio IS NULL OR mv.fecha_inicio <= CURRENT_TIMESTAMP)';
+    }
+
+    const query = `
+      SELECT DISTINCT
+        c.id_combo, 
+        c.descripcion, 
+        c.precio, 
+        c.estado,
+        c.id_archivo,
+        c.id_tipo_departamento,
+        a.url_publica AS imagen_principal_url
+      FROM combos c
+      LEFT JOIN archivos a ON a.id_archivo = c.id_archivo AND (a.estado = true OR a.estado IS NULL)
+      ${joinClause}
+      WHERE COALESCE(c.estado, true) = true ${whereClause}
+      ORDER BY COALESCE(c.descripcion, c.id_combo::text)
+    `;
+
+    const result = await pool.query(query, params);
     res.status(200).json(result.rows);
   } catch (err) {
     console.error('Error al listar catalogo de combos para ventas:', err.message);
@@ -1093,26 +1123,56 @@ router.get('/ventas/catalogos/combos', async (req, res) => {
 
 router.get('/ventas/catalogos/recetas', async (req, res) => {
   try {
-    const result = await pool.query(
-      `
-        SELECT
-          r.id_receta,
-          r.nombre_receta,
-          r.estado,
-          r.precio,
-          r.id_archivo,
-          a.url_publica AS imagen_principal_url,
-          NULL::INTEGER AS id_producto_base,
-          r.nombre_receta AS nombre_producto_base,
-          r.precio AS precio_producto_base,
-          r.estado AS estado_producto_base
-        FROM recetas r
-        LEFT JOIN archivos a ON a.id_archivo = r.id_archivo AND (a.estado = true OR a.estado IS NULL)
-        WHERE COALESCE(r.estado, true) = true
-        ORDER BY COALESCE(r.nombre_receta, r.id_receta::text)
-      `
-    );
+    const scope = await resolveRequestUserSucursalScope(req);
+    const isSuperAdmin = Boolean(scope.isSuperAdmin);
+    let idSucursal = parseOptionalPositiveInt(req.query.id_sucursal);
 
+    if (!isSuperAdmin) {
+      if (!scope.allowedSucursalIds || scope.allowedSucursalIds.length === 0) {
+        return res.status(403).json({ error: true, message: 'El empleado no tiene sucursales asignadas.' });
+      }
+      if (idSucursal) {
+        if (!scope.allowedSucursalIds.includes(idSucursal)) {
+          return res.status(403).json({ error: true, message: 'No tiene acceso a la sucursal solicitada.' });
+        }
+      }
+    }
+
+    let joinClause = '';
+    let whereClause = '';
+    const params = [];
+
+    if (idSucursal) {
+      params.push(idSucursal);
+      joinClause = 'INNER JOIN menu_vigente mv ON mv.id_menu = r.id_menu';
+      whereClause = 'AND mv.id_sucursal = $1 AND COALESCE(mv.estado, true) = true AND (mv.fecha_inicio IS NULL OR mv.fecha_inicio <= CURRENT_TIMESTAMP)';
+    } else if (!isSuperAdmin) {
+      params.push(scope.allowedSucursalIds);
+      joinClause = 'INNER JOIN menu_vigente mv ON mv.id_menu = r.id_menu';
+      whereClause = 'AND mv.id_sucursal = ANY($1::int[]) AND COALESCE(mv.estado, true) = true AND (mv.fecha_inicio IS NULL OR mv.fecha_inicio <= CURRENT_TIMESTAMP)';
+    }
+
+    const query = `
+      SELECT DISTINCT
+        r.id_receta,
+        r.nombre_receta,
+        r.estado,
+        r.precio,
+        r.id_archivo,
+        r.id_tipo_departamento,
+        a.url_publica AS imagen_principal_url,
+        NULL::INTEGER AS id_producto_base,
+        r.nombre_receta AS nombre_producto_base,
+        r.precio AS precio_producto_base,
+        r.estado AS estado_producto_base
+      FROM recetas r
+      LEFT JOIN archivos a ON a.id_archivo = r.id_archivo AND (a.estado = true OR a.estado IS NULL)
+      ${joinClause}
+      WHERE COALESCE(r.estado, true) = true ${whereClause}
+      ORDER BY COALESCE(r.nombre_receta, r.id_receta::text)
+    `;
+
+    const result = await pool.query(query, params);
     res.status(200).json(result.rows);
   } catch (err) {
     console.error('Error al listar catalogo de recetas para ventas:', err.message);
@@ -1432,12 +1492,19 @@ router.get('/ventas', async (req, res) => {
     const userSucursalId = parseOptionalPositiveInt(scope.userSucursalId);
 
     if (!isSuperAdmin) {
-      if (!userSucursalId) {
-        return res.status(403).json({ error: true, message: 'El empleado no tiene sucursal asignada.' });
+      if (!scope.allowedSucursalIds || scope.allowedSucursalIds.length === 0) {
+        return res.status(403).json({ error: true, message: 'El empleado no tiene sucursales asignadas.' });
       }
-      idSucursal = userSucursalId; // Forzamos la sucursal del empleado
+      
+      if (idSucursal) {
+        if (!scope.allowedSucursalIds.includes(idSucursal)) {
+          return res.status(403).json({ error: true, message: 'No tiene acceso a la sucursal solicitada.' });
+        }
+      } else {
+        // Si no pasa idSucursal, filtramos por todas las permitidas
+        pushFilter('COALESCE(p.id_sucursal, f.id_sucursal) = ANY($IDX::int[])', scope.allowedSucursalIds);
+      }
     }
-
     if (q) {
       const qLike = `%${q}%`;
       pushFilter(
@@ -1581,6 +1648,262 @@ router.get('/ventas', async (req, res) => {
     res.status(200).json(data);
   } catch (err) {
     console.error('Error al listar ventas:', err.message);
+    res.status(500).json({ error: true, message: err.message });
+  }
+});
+
+// --- ENPOINT DE PEDIDOS (MENÚ PÚBLICO) ---
+// Obtener pedidos pendientes (PENDIENTE, EN_COCINA, LISTO_PARA_ENTREGA)
+router.get('/ventas/pedidos-menu', checkPermission(['VENTAS_VER']), async (req, res) => {
+  try {
+    const scope = await resolveRequestUserSucursalScope(req);
+    const filters = [];
+    const values = [];
+    let queryIdx = 1;
+
+    // Filter by pending/preparing/ready-to-pickup states (assuming 1, 2, 3)
+    filters.push(`p.id_estado_pedido <= 3`);
+    
+    if (scope.allowedSucursalIds && scope.allowedSucursalIds.length > 0) {
+      const placeholders = scope.allowedSucursalIds.map(() => `$${queryIdx++}`).join(', ');
+      filters.push(`p.id_sucursal IN (${placeholders})`);
+      values.push(...scope.allowedSucursalIds);
+    }
+    
+    const whereClause = filters.length > 0 ? `WHERE ${filters.join(' AND ')}` : '';
+
+    const query = `
+      SELECT 
+        p.id_pedido, p.descripcion_pedido, p.descripcion_envio, 
+        p.fecha_hora_pedido, p.sub_total, p.isv, p.total, p.id_estado_pedido,
+        p.origen_pedido, ep.descripcion AS nombre_estado_pedido,
+        per.nombre AS nombres_cliente, per.apellido AS apellidos_cliente
+      FROM pedidos p
+      JOIN estados_pedido ep ON p.id_estado_pedido = ep.id_estado_pedido
+      LEFT JOIN clientes c ON p.id_cliente = c.id_cliente
+      LEFT JOIN personas per ON c.id_persona = per.id_persona
+      ${whereClause}
+      ORDER BY p.fecha_hora_pedido ASC
+    `;
+
+    const { rows } = await pool.query(query, values);
+    res.json(rows);
+  } catch (error) {
+    console.error('Error fetching pedidos-menu:', error.message);
+    res.status(500).json({ error: true, message: error.message });
+  }
+});
+
+// Actualizar estado de pedido
+router.put('/ventas/pedidos-menu/:id/estado', checkPermission(['VENTAS_VER']), async (req, res) => {
+  const { id } = req.params;
+  const { id_estado_pedido } = req.body;
+
+  try {
+    const query = `
+      UPDATE pedidos
+      SET id_estado_pedido = $1
+      WHERE id_pedido = $2
+      RETURNING *
+    `;
+    const { rows } = await pool.query(query, [id_estado_pedido, id]);
+
+    if (rows.length === 0) {
+      return res.status(404).json({ error: true, message: 'Pedido no encontrado' });
+    }
+
+    res.json(rows[0]);
+  } catch (error) {
+    console.error('Error updating pedido estado:', error);
+    res.status(500).json({ error: true, message: error.message });
+  }
+});
+
+// --- CATALOGOS PARA VENTAS ---
+router.get('/ventas/catalogos/clientes', async (req, res) => {
+  try {
+    const query = `
+      SELECT 
+        c.id_cliente,
+        COALESCE(
+          NULLIF(trim(concat_ws(' ', p.nombre, p.apellido)), ''),
+          e.nombre_empresa,
+          'Consumidor final'
+        ) AS cliente_nombre,
+        c.id_tipo_cliente
+      FROM clientes c
+      LEFT JOIN personas p ON c.id_persona = p.id_persona
+      LEFT JOIN empresas e ON c.id_empresa = e.id_empresa
+      WHERE COALESCE(c.estado, true) = true
+      ORDER BY cliente_nombre
+    `;
+
+    const result = await pool.query(query);
+    const data = result.rows.map((row) => ({
+      id: row.id_cliente,
+      nombre: row.cliente_nombre,
+      id_tipo_cliente: row.id_tipo_cliente
+    }));
+
+    res.status(200).json(data);
+  } catch (err) {
+    console.error('Error al listar catalogo de clientes para ventas:', err.message);
+    res.status(500).json({ error: true, message: err.message });
+  }
+});
+
+router.get('/ventas/catalogos/combos', async (req, res) => {
+  try {
+    const scope = await resolveRequestUserSucursalScope(req);
+    const isSuperAdmin = Boolean(scope.isSuperAdmin);
+    let idSucursal = parseOptionalPositiveInt(req.query.id_sucursal);
+
+    if (!isSuperAdmin) {
+      if (!scope.allowedSucursalIds || scope.allowedSucursalIds.length === 0) {
+        return res.status(200).json([]);
+      }
+      if (idSucursal) {
+        if (!scope.allowedSucursalIds.includes(idSucursal)) {
+          return res.status(403).json({ error: true, message: 'No tiene acceso a la sucursal solicitada.' });
+        }
+      }
+    }
+
+    let joinClause = '';
+    let whereClause = '';
+    const params = [];
+
+    const requiresMenuFilter = idSucursal || (!isSuperAdmin && scope.allowedSucursalIds.length > 0);
+
+    if (requiresMenuFilter) {
+      joinClause = 'INNER JOIN menu_vigente mv ON mv.id_menu = c.id_menu';
+      if (idSucursal) {
+        params.push(idSucursal);
+        whereClause = 'AND mv.id_sucursal = $1 AND COALESCE(mv.estado, true) = true AND (mv.fecha_inicio IS NULL OR mv.fecha_inicio <= CURRENT_TIMESTAMP)';
+      } else {
+        params.push(scope.allowedSucursalIds);
+        whereClause = 'AND mv.id_sucursal = ANY($1::int[]) AND COALESCE(mv.estado, true) = true AND (mv.fecha_inicio IS NULL OR mv.fecha_inicio <= CURRENT_TIMESTAMP)';
+      }
+    }
+
+    const query = `
+      SELECT DISTINCT
+        c.id_combo, 
+        c.descripcion, 
+        c.precio, 
+        c.estado,
+        c.id_archivo,
+        c.id_tipo_departamento,
+        a.url_publica AS imagen_principal_url
+      FROM combos c
+      LEFT JOIN archivos a ON a.id_archivo = c.id_archivo AND (a.estado = true OR a.estado IS NULL)
+      ${joinClause}
+      WHERE COALESCE(c.estado, true) = true ${whereClause}
+      ORDER BY COALESCE(c.descripcion, c.id_combo::text)
+    `;
+
+    const result = await pool.query(query, params);
+    res.status(200).json(result.rows);
+  } catch (err) {
+    console.error('Error al listar catalogo de combos para ventas:', err.message);
+    res.status(500).json({ error: true, message: err.message });
+  }
+});
+
+router.get('/ventas/catalogos/recetas', async (req, res) => {
+  try {
+    const scope = await resolveRequestUserSucursalScope(req);
+    const isSuperAdmin = Boolean(scope.isSuperAdmin);
+    let idSucursal = parseOptionalPositiveInt(req.query.id_sucursal);
+
+    if (!isSuperAdmin) {
+      if (!scope.allowedSucursalIds || scope.allowedSucursalIds.length === 0) {
+        return res.status(200).json([]); // No access, return empty list
+      }
+      if (idSucursal) {
+        if (!scope.allowedSucursalIds.includes(idSucursal)) {
+          return res.status(403).json({ error: true, message: 'No tiene acceso a la sucursal solicitada.' });
+        }
+      }
+    }
+
+    let joinClause = '';
+    let whereClause = '';
+    const params = [];
+
+    const requiresMenuFilter = idSucursal || (!isSuperAdmin && scope.allowedSucursalIds.length > 0);
+
+    if (requiresMenuFilter) {
+      joinClause = 'INNER JOIN menu_vigente mv ON mv.id_menu = r.id_menu';
+      if (idSucursal) {
+        params.push(idSucursal);
+        whereClause = 'AND mv.id_sucursal = $1 AND COALESCE(mv.estado, true) = true AND (mv.fecha_inicio IS NULL OR mv.fecha_inicio <= CURRENT_TIMESTAMP)';
+      } else {
+        params.push(scope.allowedSucursalIds);
+        whereClause = 'AND mv.id_sucursal = ANY($1::int[]) AND COALESCE(mv.estado, true) = true AND (mv.fecha_inicio IS NULL OR mv.fecha_inicio <= CURRENT_TIMESTAMP)';
+      }
+    }
+
+    const query = `
+      SELECT DISTINCT
+        r.id_receta, 
+        r.nombre_receta, 
+        r.descripcion, 
+        r.precio, 
+        r.estado,
+        r.id_archivo,
+        r.id_tipo_departamento,
+        a.url_publica AS imagen_principal_url
+      FROM recetas r
+      LEFT JOIN archivos a ON a.id_archivo = r.id_archivo AND (a.estado = true OR a.estado IS NULL)
+      ${joinClause}
+      WHERE COALESCE(r.estado, true) = true ${whereClause}
+      ORDER BY r.nombre_receta
+    `;
+
+    const result = await pool.query(query, params);
+    res.status(200).json(result.rows);
+  } catch (err) {
+    console.error('Error al listar catalogo de recetas para ventas:', err.message);
+    res.status(500).json({ error: true, message: err.message });
+  }
+});
+
+router.get('/ventas/catalogos/tipos-descuento', async (req, res) => {
+  try {
+    const result = await pool.query('SELECT id_tipo_descuento, nombre FROM tipos_descuento ORDER BY nombre');
+    res.status(200).json(result.rows);
+  } catch (err) {
+    console.error('Error al listar tipos de descuento:', err.message);
+    res.status(500).json({ error: true, message: err.message });
+  }
+});
+
+router.get('/ventas/catalogos/tipo-departamento', async (req, res) => {
+  try {
+    const result = await pool.query('SELECT id_tipo_departamento, nombre_departamento FROM tipos_departamentos ORDER BY nombre_departamento');
+    res.status(200).json(result.rows);
+  } catch (err) {
+    console.error('Error al listar tipos de departamento:', err.message);
+    res.status(500).json({ error: true, message: err.message });
+  }
+});
+
+router.get('/ventas/catalogos/descuentos', async (req, res) => {
+  try {
+    const query = `
+      SELECT 
+        dc.id_descuento_catalogo, dc.nombre, dc.porcentaje, dc.monto,
+        td.nombre AS tipo_descuento_nombre
+      FROM descuentos_catalogos dc
+      LEFT JOIN tipos_descuento td ON dc.id_tipo_descuento = td.id_tipo_descuento
+      WHERE COALESCE(dc.estado, true) = true
+      ORDER BY dc.nombre
+    `;
+    const result = await pool.query(query);
+    res.status(200).json(result.rows);
+  } catch (err) {
+    console.error('Error al listar catalogo de descuentos:', err.message);
     res.status(500).json({ error: true, message: err.message });
   }
 });
@@ -1826,9 +2149,10 @@ router.post('/ventas', async (req, res) => {
             id_estado_pedido,
             id_sucursal,
             id_cliente,
-            id_usuario
+            id_usuario,
+            origen_pedido
           )
-          VALUES ($1, $2, CURRENT_TIMESTAMP, $3, $4, $5, $6, $7, $8, $9)
+          VALUES ($1, $2, CURRENT_TIMESTAMP, $3, $4, $5, $6, $7, $8, $9, 'CAJA')
           RETURNING id_pedido
         `,
         [
@@ -1982,4 +2306,6 @@ router.post('/ventas', async (req, res) => {
   }
 });
 
+
 export default router;
+

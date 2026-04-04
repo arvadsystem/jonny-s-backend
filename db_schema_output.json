@@ -1,0 +1,4 @@
+{
+  "ok": false,
+  "error": "AggregateError [ETIMEDOUT]: \n    at C:\\Users\\academico\\Documents\\unah\\implementacion de sistemas\\Backend\\jonnys\\node_modules\\pg-pool\\index.js:45:11\n    at process.processTicksAndRejections (node:internal/process/task_queues:105:5)\n    at async check (file:///C:/Users/academico/Documents/unah/implementacion%20de%20sistemas/Backend/jonnys/check_schema_2.js:6:17)"
+}

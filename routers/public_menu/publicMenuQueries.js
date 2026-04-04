@@ -472,9 +472,10 @@ export const insertPublicPedidoQuery = async (client, payload) => {
         id_estado_pedido,
         id_sucursal,
         id_cliente,
-        id_usuario
+        id_usuario,
+        origen_pedido
       )
-      VALUES ($1, $2, CURRENT_TIMESTAMP, $3, $4, $5, $6, $7, NULL, $8)
+      VALUES ($1, $2, CURRENT_TIMESTAMP, $3, $4, $5, $6, $7, NULL, $8, 'MENU')
       RETURNING id_pedido, fecha_hora_pedido;
     `,
     [
