@@ -7,6 +7,7 @@ import express from 'express';
 import pool from '../../config/db-connection.js';
 import { checkPermission, isRequestUserSuperAdmin } from '../../middleware/checkPermission.js';
 import { timestampAsHNToISO } from '../../utils/dates.js';
+import { closeInactiveSessions } from '../../utils/security/sessionService.js';
 
 const router = express.Router();
 
@@ -373,6 +374,8 @@ const getSummary = async (req, res) => {
     }
 
     if (!(await requireSuperAdmin(req, res))) return;
+
+    await closeInactiveSessions();
 
     const range = parseRange(req.query.range);
     const rangeConfig = SUPPORTED_RANGES[range];

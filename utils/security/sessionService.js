@@ -5,6 +5,16 @@
 
 import pool from '../../config/db-connection.js';
 
+const HN_NOW_SQL = "timezone('America/Tegucigalpa', now())";
+
+const parseInactivityMinutes = () => {
+  const raw = Number.parseInt(String(process.env.SESSION_INACTIVITY_MINUTES ?? ''), 10);
+  if (!Number.isInteger(raw) || raw <= 0) return 20;
+  return raw;
+};
+
+const SESSION_INACTIVITY_MINUTES = parseInactivityMinutes();
+
 /**
  * Crea una sesión activa al iniciar sesión.
  * @returns {string} id_sesion (UUID)
@@ -32,8 +42,8 @@ export async function createSession({
     )
     VALUES (
       $1,$2,$3,$4,$5,$6,$7,
-      timezone('America/Tegucigalpa', now()),
-      timezone('America/Tegucigalpa', now())
+      ${HN_NOW_SQL},
+      ${HN_NOW_SQL}
     )
     RETURNING id_sesion
   `;
@@ -57,7 +67,7 @@ export async function createSession({
 export async function touchSession(id_sesion) {
   const sql = `
     UPDATE sesiones_activas
-    SET ultima_actividad = timezone('America/Tegucigalpa', now())
+    SET ultima_actividad = ${HN_NOW_SQL}
     WHERE id_sesion = $1 AND activa = TRUE
   `;
   await pool.query(sql, [id_sesion]);
@@ -70,9 +80,29 @@ export async function closeSession(id_sesion, motivo_cierre = 'logout') {
   const sql = `
     UPDATE sesiones_activas
     SET activa = FALSE,
-        fecha_cierre = timezone('America/Tegucigalpa', now()),
+        fecha_cierre = ${HN_NOW_SQL},
         motivo_cierre = $2
     WHERE id_sesion = $1 AND activa = TRUE
   `;
   await pool.query(sql, [id_sesion, motivo_cierre]);
+}
+
+/**
+ * Cierra sesiones activas que ya superaron el umbral de inactividad.
+ * Se usa en endpoints de consulta para mantener la vista de sesiones consistente.
+ */
+export async function closeInactiveSessions(minutes = SESSION_INACTIVITY_MINUTES) {
+  const safeMinutes = Number.isInteger(minutes) && minutes > 0 ? minutes : SESSION_INACTIVITY_MINUTES;
+
+  const sql = `
+    UPDATE sesiones_activas
+    SET activa = FALSE,
+        fecha_cierre = ${HN_NOW_SQL},
+        motivo_cierre = 'inactividad'
+    WHERE activa = TRUE
+      AND ultima_actividad <= (${HN_NOW_SQL} - make_interval(mins => $1))
+  `;
+
+  const result = await pool.query(sql, [safeMinutes]);
+  return result.rowCount || 0;
 }
