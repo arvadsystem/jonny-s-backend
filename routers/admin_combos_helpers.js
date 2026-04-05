@@ -1,9 +1,9 @@
 import pool from '../config/db-connection.js';
-
-const ID_TIPO_DEPARTAMENTO_COMBOS = 19;
+import { resolveMenuDepartmentIds } from './menu_departamentos.js';
 
 const CAMPOS_PERMITIDOS_COMBO = new Set([
   'id_menu',
+  'nombre_combo',
   'descripcion',
   'cant_personas',
   'estado',
@@ -15,7 +15,6 @@ const CAMPOS_PERMITIDOS_COMBO = new Set([
 
 const CAMPOS_REQUERIDOS_COMBO = [
   'id_menu',
-  'descripcion',
   'precio',
   'estado',
   'id_usuario'
@@ -53,17 +52,27 @@ function normalizarBoolean(valor) {
 }
 
 export function validarCampoCombo(campo, valor) {
+  if (campo === 'nombre_combo') {
+    if (typeof valor !== 'string') {
+      return { valido: false, message: 'nombre_combo debe ser texto.' };
+    }
+
+    const limpio = valor.trim();
+    if (!limpio) {
+      return { valido: false, message: 'nombre_combo es obligatorio.' };
+    }
+
+    return { valido: true, valor: limpio };
+  }
+
   if (campo === 'descripcion') {
+    if (esVacio(valor)) return { valido: true, valor: null };
     if (typeof valor !== 'string') {
       return { valido: false, message: 'descripcion debe ser texto.' };
     }
 
     const limpio = valor.trim();
-    if (!limpio) {
-      return { valido: false, message: 'descripcion es obligatoria.' };
-    }
-
-    return { valido: true, valor: limpio };
+    return { valido: true, valor: limpio || null };
   }
 
   if (campo === 'cant_personas') {
@@ -208,7 +217,16 @@ export function validarEstructuraPayloadCombo(payload, { soloEstadoUsuario = fal
   return { ok: true };
 }
 
-export function normalizarPayloadCombo(payload) {
+const getComboDepartmentId = async () => {
+  const departmentIds = await resolveMenuDepartmentIds();
+  const comboDepartmentId = Number(departmentIds?.comboDepartmentId);
+  if (!esEnteroPositivo(comboDepartmentId)) {
+    throw new Error('No existe tipo_departamento "Combos".');
+  }
+  return comboDepartmentId;
+};
+
+export async function normalizarPayloadCombo(payload) {
   const datosNormalizados = {};
 
   for (const campo of Object.keys(payload)) {
@@ -228,8 +246,21 @@ export function normalizarPayloadCombo(payload) {
     datosNormalizados.id_archivo = null;
   }
 
-  // Regla explicita del proyecto: los combos son del departamento 19.
-  datosNormalizados.id_tipo_departamento = ID_TIPO_DEPARTAMENTO_COMBOS;
+  // Compatibilidad: acepta payloads legacy con "descripcion" como nombre visible.
+  // Nuevo estandar: nombre_combo es el campo principal del titulo del combo.
+  const nombreCombo = String(datosNormalizados.nombre_combo || '').trim();
+  const descripcion = String(datosNormalizados.descripcion || '').trim();
+  const nombreFinal = nombreCombo || descripcion;
+  if (!nombreFinal) {
+    return { ok: false, message: 'nombre_combo es obligatorio.' };
+  }
+  datosNormalizados.nombre_combo = nombreFinal;
+  if (!descripcion) {
+    datosNormalizados.descripcion = nombreFinal;
+  }
+
+  // Regla explicita del proyecto: los combos siempre se asignan al departamento "Combos".
+  datosNormalizados.id_tipo_departamento = await getComboDepartmentId();
 
   return { ok: true, datos: datosNormalizados };
 }
@@ -273,6 +304,7 @@ export async function listarCombosAdmin() {
       SELECT
         c.id_combo,
         c.id_menu,
+        COALESCE(NULLIF(c.nombre_combo, ''), NULLIF(c.descripcion, ''), CONCAT('Combo #', c.id_combo::text)) AS nombre_combo,
         c.descripcion,
         c.cant_personas,
         c.estado,
@@ -306,6 +338,7 @@ export async function obtenerComboPorId(idCombo, { includeInactiveDetail = true 
       SELECT
         c.id_combo,
         c.id_menu,
+        COALESCE(NULLIF(c.nombre_combo, ''), NULLIF(c.descripcion, ''), CONCAT('Combo #', c.id_combo::text)) AS nombre_combo,
         c.descripcion,
         c.cant_personas,
         c.estado,
@@ -408,6 +441,7 @@ export async function crearComboConDetalle(client, datosNormalizados, detalle) {
     `
       INSERT INTO combos (
         id_menu,
+        nombre_combo,
         descripcion,
         cant_personas,
         estado,
@@ -415,18 +449,19 @@ export async function crearComboConDetalle(client, datosNormalizados, detalle) {
         id_archivo,
         precio,
         id_tipo_departamento
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
       RETURNING id_combo
     `,
     [
       datosNormalizados.id_menu,
+      datosNormalizados.nombre_combo,
       datosNormalizados.descripcion,
       datosNormalizados.cant_personas,
       datosNormalizados.estado,
       datosNormalizados.id_usuario,
       datosNormalizados.id_archivo,
       datosNormalizados.precio,
-      ID_TIPO_DEPARTAMENTO_COMBOS
+      datosNormalizados.id_tipo_departamento
     ]
   );
 
@@ -445,25 +480,27 @@ export async function actualizarComboConDetalle(client, idCombo, datosNormalizad
       UPDATE combos
       SET
         id_menu = $2,
-        descripcion = $3,
-        cant_personas = $4,
-        estado = $5,
-        id_usuario = $6,
-        id_archivo = $7,
-        precio = $8,
-        id_tipo_departamento = $9
+        nombre_combo = $3,
+        descripcion = $4,
+        cant_personas = $5,
+        estado = $6,
+        id_usuario = $7,
+        id_archivo = $8,
+        precio = $9,
+        id_tipo_departamento = $10
       WHERE id_combo = $1
     `,
     [
       idCombo,
       datosNormalizados.id_menu,
+      datosNormalizados.nombre_combo,
       datosNormalizados.descripcion,
       datosNormalizados.cant_personas,
       datosNormalizados.estado,
       datosNormalizados.id_usuario,
       datosNormalizados.id_archivo,
       datosNormalizados.precio,
-      ID_TIPO_DEPARTAMENTO_COMBOS
+      datosNormalizados.id_tipo_departamento
     ]
   );
 
