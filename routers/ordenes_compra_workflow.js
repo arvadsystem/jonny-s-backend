@@ -113,6 +113,132 @@ const sendError = (res, status, code, message, extra = {}) =>
     ...extra
   });
 
+// AM: payload canonico para diagnosticar mismatch entre almacen destino de OC y almacen real del item.
+const buildWarehouseMismatchData = ({
+  idDetalle = null,
+  id_detalle = null,
+  itemTipo = null,
+  item_tipo = null,
+  idItem = null,
+  id_item = null,
+  idAlmacenDestino = null,
+  id_almacen_destino = null,
+  idAlmacenActual = null,
+  id_almacen_actual = null
+} = {}) => {
+  const resolvedItemTipo = itemTipo ?? item_tipo;
+  const normalizedItemTipo = String(resolvedItemTipo || '')
+    .trim()
+    .toLowerCase();
+  return {
+    id_detalle: parsePositiveInt(idDetalle ?? id_detalle),
+    item_tipo: ['producto', 'insumo'].includes(normalizedItemTipo) ? normalizedItemTipo : null,
+    id_item: parsePositiveInt(idItem ?? id_item),
+    id_almacen_destino: parsePositiveInt(idAlmacenDestino ?? id_almacen_destino),
+    id_almacen_actual: parsePositiveInt(idAlmacenActual ?? id_almacen_actual)
+  };
+};
+
+// AM: mensaje uniforme para UI/API cuando se detecta incoherencia de almacenes por item.
+const formatWarehouseMismatchMessage = (data = {}) => {
+  const itemTipo = String(data?.item_tipo || '')
+    .trim()
+    .toLowerCase();
+  const itemLabel = itemTipo === 'producto' ? 'producto' : itemTipo === 'insumo' ? 'insumo' : 'item';
+  const idItem = parsePositiveInt(data?.id_item);
+  const idAlmacenDestino = parsePositiveInt(data?.id_almacen_destino);
+  const idAlmacenActual = parsePositiveInt(data?.id_almacen_actual);
+
+  if (idItem && idAlmacenDestino && idAlmacenActual) {
+    return `El ${itemLabel} ${idItem} pertenece al almacen ${idAlmacenActual} y no al almacen destino ${idAlmacenDestino}.`;
+  }
+
+  if (idAlmacenDestino && idAlmacenActual) {
+    return `El item pertenece al almacen ${idAlmacenActual} y no al almacen destino ${idAlmacenDestino}.`;
+  }
+
+  return 'Se detecto una incoherencia entre almacen destino y almacen real del item.';
+};
+
+// AM: parser defensivo para mapear excepciones SQL del trigger mono-almacen al contrato HTTP estable.
+const parseWarehouseMismatchDataFromDbError = (error) => {
+  const message = String(error?.message || '');
+  const detail = String(error?.detail || '');
+  const source = `${message} ${detail}`;
+  if (!source.toUpperCase().includes('WAREHOUSE_ITEM_MISMATCH')) return null;
+
+  const extractToken = (key) => {
+    const match = source.match(new RegExp(`${key}=([A-Za-z0-9_-]+)`, 'i'));
+    return match?.[1] || null;
+  };
+
+  return buildWarehouseMismatchData({
+    idDetalle: extractToken('id_detalle'),
+    itemTipo: extractToken('item_tipo'),
+    idItem: extractToken('id_item'),
+    idAlmacenDestino: extractToken('id_almacen_destino'),
+    idAlmacenActual: extractToken('id_almacen_actual')
+  });
+};
+
+const sendWarehouseMismatchConflict = (res, context = {}) => {
+  const data = buildWarehouseMismatchData(context);
+  return sendError(
+    res,
+    409,
+    'WAREHOUSE_ITEM_MISMATCH',
+    formatWarehouseMismatchMessage(data),
+    { data }
+  );
+};
+
+// AM: resuelve de forma uniforme el item de una linea OC/compra para validaciones de almacen destino.
+const resolveOrderItemReference = ({ idProducto = null, idInsumo = null } = {}) => {
+  const parsedProducto = parsePositiveInt(idProducto);
+  if (parsedProducto) {
+    return { item_tipo: 'producto', id_item: parsedProducto };
+  }
+
+  const parsedInsumo = parsePositiveInt(idInsumo);
+  if (parsedInsumo) {
+    return { item_tipo: 'insumo', id_item: parsedInsumo };
+  }
+
+  return { item_tipo: null, id_item: null };
+};
+
+// AM: helper central para bloquear incoherencias item-vs-almacen destino en modo mono-almacen real.
+const validateItemWarehouseAlignment = ({
+  idDetalle = null,
+  itemTipo = null,
+  idItem = null,
+  idAlmacenDestino = null,
+  idAlmacenActual = null
+} = {}) => {
+  const data = buildWarehouseMismatchData({
+    idDetalle,
+    itemTipo,
+    idItem,
+    idAlmacenDestino,
+    idAlmacenActual
+  });
+  const warehouseDestino = parsePositiveInt(data.id_almacen_destino);
+  const warehouseActual = parsePositiveInt(data.id_almacen_actual);
+
+  if (warehouseDestino && warehouseActual && warehouseDestino !== warehouseActual) {
+    return {
+      ok: false,
+      data
+    };
+  }
+
+  return {
+    ok: true,
+    data,
+    id_almacen_resuelto: warehouseDestino || warehouseActual || null
+  };
+};
+
 const isOcSchemaError = (error) => {
   const message = String(error?.message || '').toLowerCase();
   return (
@@ -134,6 +260,11 @@ const isOcSchemaError = (error) => {
 
 const sendServerError = (res, context, error) => {
   console.error(`[ordenes_compra_workflow] ${context}:`, error);
+
+  const warehouseMismatchData = parseWarehouseMismatchDataFromDbError(error);
+  if (warehouseMismatchData) {
+    return sendWarehouseMismatchConflict(res, warehouseMismatchData);
+  }
 
   if (isOcSchemaError(error)) {
     return sendError(
@@ -753,6 +884,37 @@ const getOrderItemRequests = async (idOrdenCompra, queryRunner = pool) => {
     if (!isOcSchemaError(error)) throw error;
     // AM: fallback para BD sin tabla de solicitudes de item (migracion 2026-03-12 pendiente).
     return [];
+  }
+};
+
+const getOrderEvidenceHistory = async (idOrdenCompra, queryRunner = pool) => {
+  try {
+    const result = await queryRunner.query(
+      `
+        SELECT
+          h.id_historial_evidencia,
+          h.id_orden_compra,
+          h.id_compra,
+          h.tipo_evidencia,
+          h.id_archivo,
+          h.id_usuario_registro,
+          h.origen_etapa,
+          h.fecha_registro,
+          a.url_publica AS evidencia_url_publica,
+          u.nombre_usuario AS usuario_registro_nombre
+        FROM public.orden_compra_evidencias_historial h
+        LEFT JOIN public.archivos a ON a.id_archivo = h.id_archivo
+        LEFT JOIN public.usuarios u ON u.id_usuario = h.id_usuario_registro
+        WHERE h.id_orden_compra = $1
+        ORDER BY h.fecha_registro DESC, h.id_historial_evidencia DESC
+      `,
+      [idOrdenCompra]
+    );
+    return result.rows || [];
+  } catch (error) {
+    // AM: compatibilidad con entornos donde la migracion de historial aun no esta aplicada.
+    if (error?.code === '42P01' || error?.code === '42883') return [];
+    throw error;
   }
 };
 
@@ -1698,6 +1860,7 @@ router.get('/orden_compras/workflow/:id_orden_compra', checkPermission(PERM_OC_V
     const compraActual = canViewAdminData ? await getLatestCompraByOrden(idOrdenCompra) : null;
     const detallesRaw = await getOrderDetails(idOrdenCompra, compraActual?.id_compra || null);
     const detalles = canViewAdminData ? detallesRaw : sanitizeOrderDetailsForOperative(detallesRaw);
+    const evidenciasHistorial = canViewAdminData ? await getOrderEvidenceHistory(idOrdenCompra) : [];
     const solicitudesItem = await getOrderItemRequests(idOrdenCompra);
     const ordenPayload = canViewAdminData
       ? orderRowWithVisibleFlowNumber
@@ -1709,6 +1872,7 @@ router.get('/orden_compras/workflow/:id_orden_compra', checkPermission(PERM_OC_V
         orden: ordenPayload,
         compra_actual: compraActual || null,
         detalles,
+        evidencias_historial: evidenciasHistorial,
         solicitudes_item: solicitudesItem
       }
     });
@@ -2878,6 +3042,10 @@ router.post('/orden_compras/workflow/:id_orden_compra/convertir', checkPermissio
     for (const detail of details) {
       const idDetalleOrden = Number(detail.id_detalle_orden);
       const cantidad = Number(detail.cantidad_orden);
+      const itemRef = resolveOrderItemReference({
+        idProducto: detail.id_producto,
+        idInsumo: detail.id_insumo
+      });
 
       if (!Number.isInteger(cantidad) || cantidad <= 0) {
         await withRollback(client);
@@ -2933,7 +3101,19 @@ router.post('/orden_compras/workflow/:id_orden_compra/convertir', checkPermissio
         );
       }
 
-      const idAlmacenDestino = parsePositiveInt(detail.id_almacen_destino) || parsePositiveInt(detail.id_almacen_item);
+      const warehouseAlignment = validateItemWarehouseAlignment({
+        idDetalle: idDetalleOrden,
+        itemTipo: itemRef.item_tipo,
+        idItem: itemRef.id_item,
+        idAlmacenDestino: detail.id_almacen_destino,
+        idAlmacenActual: detail.id_almacen_item
+      });
+      if (!warehouseAlignment.ok) {
+        await withRollback(client);
+        return sendWarehouseMismatchConflict(res, warehouseAlignment.data);
+      }
+
+      const idAlmacenDestino = parsePositiveInt(warehouseAlignment.id_almacen_resuelto);
       if (!idAlmacenDestino) {
         await withRollback(client);
         return sendError(
@@ -3540,85 +3720,84 @@ router.post('/orden_compras/workflow/:id_orden_compra/abastecer', checkPermissio
       let idProducto = null;
       let idInsumo = null;
 
-      const idAlmacenDestino = parsePositiveInt(row.id_almacen_destino);
-      if (idAlmacenDestino) {
-        const warehouseResult = await client.query(
-          `
-            SELECT COALESCE(estado, true) AS estado
-            FROM public.almacenes
-            WHERE id_almacen = $1
-            LIMIT 1
-          `,
-          [idAlmacenDestino]
-        );
-        if (warehouseResult.rowCount === 0) {
-          await withRollback(client);
-          return sendError(
-            res,
-            409,
-            'CONFLICT',
-            `El almacen destino ${idAlmacenDestino} no existe para abastecer.`
-          );
-        }
-        if (!Boolean(warehouseResult.rows?.[0]?.estado)) {
-          await withRollback(client);
-          return sendError(
-            res,
-            409,
-            'CONFLICT',
-            `El almacen destino ${idAlmacenDestino} esta inactivo.`
-          );
-        }
-        idAlmacen = idAlmacenDestino;
-      }
-
-      if (row.id_producto) {
-        if (!idAlmacen) {
-          const productRow = await client.query(
-            `
-              SELECT id_almacen, COALESCE(estado, true) AS estado
-              FROM public.productos
-              WHERE id_producto = $1
-              LIMIT 1
-            `,
-            [row.id_producto]
-          );
-          if (productRow.rowCount === 0) {
-            await withRollback(client);
-            return sendError(res, 409, 'CONFLICT', `Producto ${row.id_producto} no existe para abastecer.`);
-          }
-          if (!Boolean(productRow.rows?.[0]?.estado)) {
-            await withRollback(client);
-            return sendError(res, 409, 'CONFLICT', `El producto ${row.id_producto} esta inactivo.`);
-          }
-          idAlmacen = parsePositiveInt(productRow.rows?.[0]?.id_almacen);
-        }
-        idProducto = Number(row.id_producto);
-      } else if (row.id_insumo) {
-        if (!idAlmacen) {
-          const insumoRow = await client.query(
-            `
-              SELECT id_almacen, COALESCE(estado, true) AS estado
-              FROM public.insumos
-              WHERE id_insumo = $1
-              LIMIT 1
-            `,
-            [row.id_insumo]
-          );
-          if (insumoRow.rowCount === 0) {
-            await withRollback(client);
-            return sendError(res, 409, 'CONFLICT', `Insumo ${row.id_insumo} no existe para abastecer.`);
-          }
-          if (!Boolean(insumoRow.rows?.[0]?.estado)) {
-            await withRollback(client);
-            return sendError(res, 409, 'CONFLICT', `El insumo ${row.id_insumo} esta inactivo.`);
-          }
-          idAlmacen = parsePositiveInt(insumoRow.rows?.[0]?.id_almacen);
-        }
-        idInsumo = Number(row.id_insumo);
-      } else {
+      const itemRef = resolveOrderItemReference({
+        idProducto: row.id_producto,
+        idInsumo: row.id_insumo
+      });
+      if (!itemRef.item_tipo || !itemRef.id_item) {
         await withRollback(client);
         return sendError(res, 409, 'CONFLICT', `Detalle de compra ${row.id_detalle_compra} no define item.`);
+      }
+
+      const idAlmacenDestino = parsePositiveInt(row.id_almacen_destino);
+      if (itemRef.item_tipo === 'producto') {
+        const productRow = await client.query(
+          `
+            SELECT id_almacen, COALESCE(estado, true) AS estado
+            FROM public.productos
+            WHERE id_producto = $1
+            LIMIT 1
+          `,
+          [itemRef.id_item]
+        );
+        if (productRow.rowCount === 0) {
+          await withRollback(client);
+          return sendError(res, 409, 'CONFLICT', `Producto ${itemRef.id_item} no existe para abastecer.`);
+        }
+        if (!Boolean(productRow.rows?.[0]?.estado)) {
+          await withRollback(client);
+          return sendError(res, 409, 'CONFLICT', `El producto ${itemRef.id_item} esta inactivo.`);
+        }
+
+        // AM: bloqueo explicito cuando el almacen destino de compra no coincide con el almacen real del producto.
+        const warehouseAlignment = validateItemWarehouseAlignment({
+          idDetalle: row.id_detalle_compra,
+          itemTipo: itemRef.item_tipo,
+          idItem: itemRef.id_item,
+          idAlmacenDestino,
+          idAlmacenActual: productRow.rows?.[0]?.id_almacen
+        });
+        if (!warehouseAlignment.ok) {
+          await withRollback(client);
+          return sendWarehouseMismatchConflict(res, warehouseAlignment.data);
+        }
+
+        idAlmacen = parsePositiveInt(warehouseAlignment.id_almacen_resuelto);
+        idProducto = itemRef.id_item;
+      } else {
+        const insumoRow = await client.query(
+          `
+            SELECT id_almacen, COALESCE(estado, true) AS estado
+            FROM public.insumos
+            WHERE id_insumo = $1
+            LIMIT 1
+          `,
+          [itemRef.id_item]
+        );
+        if (insumoRow.rowCount === 0) {
+          await withRollback(client);
+          return sendError(res, 409, 'CONFLICT', `Insumo ${itemRef.id_item} no existe para abastecer.`);
+        }
+        if (!Boolean(insumoRow.rows?.[0]?.estado)) {
+          await withRollback(client);
+          return sendError(res, 409, 'CONFLICT', `El insumo ${itemRef.id_item} esta inactivo.`);
+        }
+
+        // AM: bloqueo explicito cuando el almacen destino de compra no coincide con el almacen real del insumo.
+        const warehouseAlignment = validateItemWarehouseAlignment({
+          idDetalle: row.id_detalle_compra,
+          itemTipo: itemRef.item_tipo,
+          idItem: itemRef.id_item,
+          idAlmacenDestino,
+          idAlmacenActual: insumoRow.rows?.[0]?.id_almacen
+        });
+        if (!warehouseAlignment.ok) {
+          await withRollback(client);
+          return sendWarehouseMismatchConflict(res, warehouseAlignment.data);
+        }
+
+        idAlmacen = parsePositiveInt(warehouseAlignment.id_almacen_resuelto);
+        idInsumo = itemRef.id_item;
       }
 
       if (!idAlmacen) {
