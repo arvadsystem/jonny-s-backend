@@ -1,6 +1,7 @@
 import express from 'express';
 import pool from '../config/db-connection.js';
 import { attachImagenPrincipalUrls } from '../utils/uploads.js';
+import { validarYDescontarPedido } from '../services/inventarioPedidoService.js';
 
 const router = express.Router();
 const SQLSTATE_UNDEFINED_TABLE = '42P01';
@@ -155,6 +156,53 @@ const getInsumosConstraintConflictMessage = (err) => {
   if (!trace.includes(INSUMOS_DUPLICATE_CONSTRAINT.toLowerCase())) return '';
   return INSUMOS_DUPLICATE_MESSAGE;
 };
+
+// Endpoint interno para descuentos de inventario por pedido.
+// -----------------------------------------------------------
+// QUE HACE:
+// - Recibe `id_sucursal`, `id_pedido` e `items`.
+// - Delega toda la logica atomica al servicio `validarYDescontarPedido`.
+// - Devuelve faltantes claros cuando no hay stock/configuracion suficiente.
+//
+// POR QUE ESTA AQUI:
+// - Este router ya es el punto de entrada natural del modulo INSUMOS.
+// - Se evita tocar VENTAS y otros dominios en esta etapa.
+router.post('/inventario/descontar-por-pedido', async (req, res) => {
+  try {
+    const result = await validarYDescontarPedido(req.body || {}, {
+      id_usuario: req?.user?.id_usuario
+    });
+
+    if (!result?.ok) {
+      return res.status(409).json({
+        ok: false,
+        error: true,
+        code: result.code || 'STOCK_O_CONFIG_INSUFICIENTE',
+        message: result.message || 'No se pudo descontar inventario para el pedido.',
+        id_pedido: result.id_pedido,
+        id_sucursal: result.id_sucursal,
+        faltantes: Array.isArray(result.faltantes) ? result.faltantes : []
+      });
+    }
+
+    return res.status(200).json({
+      ok: true,
+      message: result.message || 'Inventario descontado correctamente.',
+      data: result
+    });
+  } catch (error) {
+    const httpStatus = Number(error?.httpStatus || 500);
+    const code = String(error?.code || (httpStatus >= 500 ? 'INTERNAL_ERROR' : 'VALIDATION_ERROR'));
+
+    return res.status(httpStatus).json({
+      ok: false,
+      error: true,
+      code,
+      message: error?.message || safeServerErrorMessage(),
+      details: error?.details || undefined
+    });
+  }
+});
 
 // NEW: helper para validar `id_categoria_insumo` y asegurar que exista/este activa.
 // WHY: evitar guardar insumos apuntando a categorias inexistentes o inactivas.
