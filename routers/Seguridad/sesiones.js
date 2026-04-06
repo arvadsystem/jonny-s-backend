@@ -10,7 +10,7 @@
 
 import express from 'express';
 import pool from '../../config/db-connection.js';
-import { closeSession } from '../../utils/security/sessionService.js';
+import { closeInactiveSessions, closeSession } from '../../utils/security/sessionService.js';
 import { checkPermission, isRequestUserSuperAdmin } from '../../middleware/checkPermission.js';
 import { timestampAsHNToISO } from '../../utils/dates.js';
 import { insertSecurityAuditLog } from './auditLogger.js';
@@ -92,6 +92,8 @@ router.get(
     if (!user?.id_usuario) {
       return res.status(401).json({ error: true, message: 'No autenticado' });
     }
+
+    await closeInactiveSessions();
 
     const sql = `
       SELECT
@@ -262,6 +264,8 @@ router.get(
 
     // 🔒 Solo Super Admin
     if (!(await requireSuperAdmin(req, res))) return;
+
+    await closeInactiveSessions();
 
     const buscar = String(req.query.buscar ?? '').trim();
     const limit = clampInt(req.query.limit, 10, 1, 50);

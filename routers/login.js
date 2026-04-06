@@ -166,7 +166,7 @@ router.post('/login', loginLimiter, async (req, res) => {
     // Login fallido: registrar intento
     if (!usuarioEncontrado || !passwordValida) {
       await insertLoginLog({
-        id_usuario: null,
+        id_usuario: usuarioEncontrado?.id_usuario ?? null,
         id_sesion: null, // HU79 lo llenaremos luego
         ip_origen,
         nombre_usuario_intentado: nombre_usuario,

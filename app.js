@@ -50,6 +50,7 @@ import seguridadConfigRoutes from './routers/Seguridad/configuracion.js';
 import seguridadLoginsRoutes from './routers/Seguridad/logins.js';
 import seguridadPermisosRoutes from './routers/Seguridad/permisos.js';
 import seguridadUsuariosRoutes from './routers/Seguridad/usuarios.js';
+import seguridadDashboardRoutes from './routers/Seguridad/dashboard.js';
 import { globalAuditMiddleware } from './routers/Seguridad/globalAuditInterceptor.js';
 import rolesPermisosRoutes from './routers/roles_permisos.js';
 
@@ -140,6 +141,8 @@ app.use('/seguridad', seguridadConfigRoutes);
 app.use('/seguridad', seguridadLoginsRoutes);
 app.use('/seguridad', seguridadPermisosRoutes);
 app.use('/seguridad', seguridadUsuariosRoutes);
+app.use('/seguridad', seguridadDashboardRoutes);
+app.use('/api/security', seguridadDashboardRoutes);
 app.use('/api/roles-permisos', rolesPermisosRoutes);
 
 // Parametros
