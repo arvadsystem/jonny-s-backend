@@ -470,7 +470,7 @@ const personaRepository = {
       FROM personas p
       LEFT JOIN telefonos telf ON telf.id_telefono = p.id_telefono
       LEFT JOIN direcciones dir ON dir.id_direccion = p.id_direccion
-      LEFT JOIN correos cor ON cor.id_correo = p.id_correo
+      LEFT JOIN correos cor ON (cor.id_correo = p.id_correo OR (p.id_correo IS NULL AND cor.id_persona = p.id_persona))
     `;
 
     const whereParams = [];
@@ -667,7 +667,7 @@ const personaRepository = {
       FROM personas p
       LEFT JOIN telefonos t ON t.id_telefono = p.id_telefono
       LEFT JOIN direcciones d ON d.id_direccion = p.id_direccion
-      LEFT JOIN correos c ON c.id_correo = p.id_correo
+      LEFT JOIN correos c ON (c.id_correo = p.id_correo OR (p.id_correo IS NULL AND c.id_persona = p.id_persona))
       WHERE p.id_persona = $1
       LIMIT 1
     `;
