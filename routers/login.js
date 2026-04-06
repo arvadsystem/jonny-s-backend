@@ -147,7 +147,7 @@ router.post('/login', loginLimiter, async (req, res) => {
     });
   }
 
-  // HU78: capturar IP + User-Agent + parseo
+  //capturar IP + User-Agent + parseo
   const ip_origen = getClientIp(req);
   const user_agent = req.get('user-agent') || null;
   const { dispositivo, navegador, sistema_operativo } = parseUserAgent(user_agent);
