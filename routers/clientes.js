@@ -20,7 +20,7 @@ const CLIENTES_EDIT_PERMISSIONS = ['CLIENTES_EDITAR'];
 const CLIENTES_DELETE_PERMISSIONS = ['CLIENTES_ELIMINAR'];
 
 const MAX_LIMIT = 100;
-const BASE_FIELDS = ['id_cliente', 'fecha_ingreso', 'puntos', 'id_tipo_cliente', 'id_persona', 'id_empresa', 'estado'];
+const BASE_FIELDS = ['id_cliente', 'fecha_ingreso', 'puntos', 'id_tipo_cliente', 'id_persona', 'id_empresa', 'id_sucursal', 'estado'];
 const OPTIONAL_SOFT_DELETE_FIELDS = ['estado', 'activo', 'habilitado'];
 const FN_CLIENTE_FIELDS = new Set([
   'fecha_ingreso',
@@ -35,6 +35,7 @@ const NULLABLE_CLIENTE_COLUMNS = Object.freeze({
   id_persona: 'UPDATE clientes SET id_persona = NULL WHERE id_cliente = $1',
   id_empresa: 'UPDATE clientes SET id_empresa = NULL WHERE id_cliente = $1',
   id_tipo_cliente: 'UPDATE clientes SET id_tipo_cliente = NULL WHERE id_cliente = $1',
+  id_sucursal: 'UPDATE clientes SET id_sucursal = NULL WHERE id_cliente = $1',
   fecha_ingreso: 'UPDATE clientes SET fecha_ingreso = NULL WHERE id_cliente = $1'
 });
 
@@ -933,7 +934,7 @@ const clienteService = {
       };
     }
 
-    const allowedFields = new Set([...FN_CLIENTE_FIELDS, 'created_by', 'updated_by']);
+    const allowedFields = new Set([...FN_CLIENTE_FIELDS, 'created_by', 'updated_by', 'id_sucursal']);
     const unknownFields = unknownFieldsFromPayload(payload, allowedFields);
     if (unknownFields.length) {
       return {
@@ -975,6 +976,21 @@ const clienteService = {
     const tenantId = parsePositiveInt(req.user?.id_empresa);
     const personaId = parseNullablePositiveInt(insertData.id_persona);
     const empresaId = parseNullablePositiveInt(insertData.id_empresa);
+    const requestedSucursal = Object.prototype.hasOwnProperty.call(payload, 'id_sucursal')
+      ? parseNullablePositiveInt(payload.id_sucursal)
+      : null;
+
+    if (
+      Object.prototype.hasOwnProperty.call(payload, 'id_sucursal')
+      && payload.id_sucursal !== null
+      && payload.id_sucursal !== ''
+      && !requestedSucursal
+    ) {
+      return {
+        status: 400,
+        body: buildErrorBody({ code: 'VALIDATION_ERROR', message: 'id_sucursal debe ser un entero positivo.' })
+      };
+    }
 
     if ((personaId ? 1 : 0) + (empresaId ? 1 : 0) !== 1) {
       return {
@@ -1030,6 +1046,9 @@ const clienteService = {
       await client.query('BEGIN');
 
       const createdId = await clienteRepository.create(insertData, client);
+      if (capabilities.hasClienteSucursalField && requestedSucursal) {
+        await clienteRepository.updateField(createdId, 'id_sucursal', requestedSucursal, client);
+      }
       await clienteRepository.addAuditLog({
         accion: 'CLIENTE_CREAR',
         descripcion: `Cliente creado: ${personaId ? `persona ${personaId}` : `empresa ${empresaId}`}`,
@@ -1039,7 +1058,10 @@ const clienteService = {
         modulo: 'CLIENTES',
         tablaAfectada: 'clientes',
         idRegistro: createdId,
-        datosDespues: insertData,
+        datosDespues: {
+          ...insertData,
+          ...(capabilities.hasClienteSucursalField ? { id_sucursal: requestedSucursal } : {})
+        },
         db: client
       });
 
@@ -1089,6 +1111,7 @@ const clienteService = {
     if (capabilities.softDeleteField) allowedFields.add(capabilities.softDeleteField);
     if (capabilities.hasUpdatedBy) allowedFields.add('updated_by');
     if (capabilities.hasTenantField) allowedFields.add('id_empresa');
+    if (!capabilities.hasClienteSucursalField) allowedFields.delete('id_sucursal');
 
     const unknownFields = unknownFieldsFromPayload(rawUpdates, new Set([...allowedFields, ...META_UPDATE_FIELDS]));
     if (unknownFields.length) {
@@ -1154,6 +1177,17 @@ const clienteService = {
         status: 400,
         body: buildErrorBody({ code: 'VALIDATION_ERROR', message: 'fecha_ingreso no es valida.' })
       };
+    }
+
+    if (Object.prototype.hasOwnProperty.call(rawUpdates, 'id_sucursal')) {
+      const nextSucursalId = parseNullablePositiveInt(rawUpdates.id_sucursal);
+      if (rawUpdates.id_sucursal !== null && rawUpdates.id_sucursal !== '' && !nextSucursalId) {
+        return {
+          status: 400,
+          body: buildErrorBody({ code: 'VALIDATION_ERROR', message: 'id_sucursal debe ser un entero positivo.' })
+        };
+      }
+      rawUpdates.id_sucursal = nextSucursalId;
     }
 
     const touchesPersona = Object.prototype.hasOwnProperty.call(rawUpdates, 'id_persona');

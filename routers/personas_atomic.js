@@ -37,6 +37,7 @@ const CLIENTE_ATOMIC_ALLOWED_FIELDS = new Set([
   'id_tipo_cliente',
   'id_persona',
   'id_empresa',
+  'id_sucursal',
   'estado',
   'origen'
 ]);
@@ -175,6 +176,7 @@ const findClienteDetail = async (client, idCliente) => {
         c.id_cliente,
         c.id_persona,
         c.id_empresa,
+        c.id_sucursal,
         c.id_tipo_cliente,
         c.fecha_ingreso,
         c.puntos,
@@ -195,6 +197,21 @@ const findClienteDetail = async (client, idCliente) => {
   );
 
   return rs.rows?.[0] || null;
+};
+
+const trySetClienteSucursal = async (client, idCliente, idSucursal) => {
+  const parsedCliente = parsePositiveInt(idCliente);
+  const parsedSucursal = parsePositiveInt(idSucursal);
+  if (!parsedCliente || !parsedSucursal) return;
+  try {
+    await client.query(
+      'UPDATE clientes SET id_sucursal = $1 WHERE id_cliente = $2',
+      [parsedSucursal, parsedCliente]
+    );
+  } catch (error) {
+    if (error?.code === '42703') return;
+    throw error;
+  }
 };
 
 const atomicService = {
@@ -453,6 +470,8 @@ const atomicService = {
         error.httpStatus = 500;
         throw error;
       }
+
+      await trySetClienteSucursal(client, idCliente, normalizedCliente.id_sucursal);
 
       const cliente = await findClienteDetail(client, idCliente);
 

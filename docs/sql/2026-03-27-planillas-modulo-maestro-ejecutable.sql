@@ -432,7 +432,11 @@ RETURNS TABLE(id_movimiento_planilla INTEGER,id_detalle_planilla INTEGER,tipo_mo
 LANGUAGE plpgsql AS $$
 DECLARE v_id_movimiento_planilla INTEGER; v_neto_actualizado NUMERIC(12,2);
 BEGIN
-  IF NOT EXISTS (SELECT 1 FROM public.detalle_planilla WHERE id_detalle_planilla=p_id_detalle_planilla) THEN
+  IF NOT EXISTS (
+    SELECT 1
+    FROM public.detalle_planilla dp
+    WHERE dp.id_detalle_planilla=p_id_detalle_planilla
+  ) THEN
     RAISE EXCEPTION 'No existe detalle_planilla %', p_id_detalle_planilla;
   END IF;
   IF UPPER(TRIM(p_tipo_movimiento)) NOT IN ('BONO','DEDUCCION') THEN RAISE EXCEPTION 'Tipo invalido'; END IF;
