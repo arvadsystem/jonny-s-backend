@@ -157,7 +157,9 @@ router.post('/login', loginLimiter, async (req, res) => {
       SELECT u.*, e.id_sucursal 
       FROM usuarios u 
       LEFT JOIN empleados e ON u.id_empleado = e.id_empleado 
-      WHERE u.nombre_usuario = $1 LIMIT 1
+      LEFT JOIN identidades_auth ia ON u.id_usuario = ia.id_usuario
+      WHERE u.nombre_usuario = $1 OR ia.email_login = $1
+      LIMIT 1
     `;
     const result = await pool.query(query, [nombre_usuario]);
     const usuarioEncontrado = result.rows[0] || null;

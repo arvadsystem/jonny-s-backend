@@ -227,6 +227,7 @@ const normalizeClienteDto = (row, softDeleteField = null) => {
 
   return {
     ...row,
+    id_sucursal: row?.id_sucursal ?? null,
     codigo_cliente: codigoCliente,
     origen_cliente: origenCliente,
     origen_label: firstNonEmptyValue(
@@ -246,15 +247,26 @@ const normalizeClienteDto = (row, softDeleteField = null) => {
     ),
     dni: dni,
     rtn: rtn,
-    telefono: telefono,
-    correo: correo,
-    tipo_cliente: tipoCliente,
-    puntos,
+    telefono: phoneToDisplay(telefono),
+    correo: correo || 'No registrado',
+    direccion: firstNonEmptyValue(
+      row?.direccion,
+      row?.persona_direccion,
+      row?.empresa_direccion,
+      'No registrada'
+    ),
+    puntos: puntos,
     fecha_ingreso: fechaIngreso,
-    estado,
+    estado: estado,
     id_persona: row?.id_persona ?? null,
     id_empresa: row?.id_empresa ?? null
   };
+};
+
+const phoneToDisplay = (val) => {
+  if (!val) return 'Sin teléfono';
+  // Formatear si es necesario, o devolver tal cual
+  return val;
 };
 
 const normalizeClienteFunctionPayload = (payload) => {
@@ -422,8 +434,8 @@ const clienteRepository = {
     const pushFilter = (fragment, value) => {
       params.push(value);
       countParams.push(value);
-      filters.push(fragment.replaceAll('$IDX', `$${params.length}`));
-      countFilters.push(fragment.replaceAll('$IDX', `$${countParams.length}`));
+      filters.push(fragment.replace(/\$IDX/g, `$${params.length}`));
+      countFilters.push(fragment.replace(/\$IDX/g, `$${countParams.length}`));
     };
 
     if (searchTerm) {
@@ -452,6 +464,7 @@ const clienteRepository = {
         searchFragments.push("COALESCE(e.rtn::TEXT, '') ILIKE $IDX");
         searchFragments.push("COALESCE(telf_e.telefono, '') ILIKE $IDX");
         searchFragments.push("COALESCE(cor_e.direccion_correo, '') ILIKE $IDX");
+        searchFragments.push("COALESCE(dir_e.direccion, '') ILIKE $IDX");
       }
 
       if (capabilities.hasTipoClienteTable && capabilities.tipoClienteLabelField) {
@@ -523,6 +536,7 @@ const clienteRepository = {
       fields.push('telf_p.telefono AS telefono_persona');
       fields.push('cor_p.direccion_correo AS persona_correo');
       fields.push('cor_p.direccion_correo AS correo_persona');
+      fields.push('dir_p.direccion AS persona_direccion');
       if (capabilities.hasPersonaSucursalField) {
         if (capabilities.hasDerivedSucursalFromEmpleado) {
           fields.push('COALESCE(p.id_sucursal, emp_cli.id_sucursal) AS persona_id_sucursal');
@@ -543,6 +557,7 @@ const clienteRepository = {
       fields.push('NULL::TEXT AS telefono_persona');
       fields.push('NULL::TEXT AS persona_correo');
       fields.push('NULL::TEXT AS correo_persona');
+      fields.push('NULL::TEXT AS persona_direccion');
       if (capabilities.hasDerivedSucursalFromEmpleado) {
         fields.push('emp_cli.id_sucursal AS persona_id_sucursal');
       } else {
@@ -557,6 +572,7 @@ const clienteRepository = {
       fields.push('telf_e.telefono AS telefono_empresa');
       fields.push('cor_e.direccion_correo AS empresa_correo');
       fields.push('cor_e.direccion_correo AS correo_empresa');
+      fields.push('dir_e.direccion AS empresa_direccion');
       if (capabilities.hasEmpresaSucursalField) {
         fields.push('e.id_sucursal AS empresa_id_sucursal');
       } else {
@@ -569,6 +585,7 @@ const clienteRepository = {
       fields.push('NULL::TEXT AS telefono_empresa');
       fields.push('NULL::TEXT AS empresa_correo');
       fields.push('NULL::TEXT AS correo_empresa');
+      fields.push('NULL::TEXT AS empresa_direccion');
       fields.push('NULL::INT AS empresa_id_sucursal');
     }
 
@@ -596,13 +613,20 @@ const clienteRepository = {
     const joins = [];
     if (capabilities.hasPersonasTable) {
       joins.push('LEFT JOIN personas p ON p.id_persona = c.id_persona');
-      joins.push('LEFT JOIN telefonos telf_p ON telf_p.id_telefono = p.id_telefono');
-      joins.push('LEFT JOIN correos cor_p ON cor_p.id_correo = p.id_correo');
+      // Fix: Join robusto para telefonos (identifica el telefono por ID directo o por id_persona si el link directo es NULL)
+      // REVERTED: telefonos table does not have id_persona. Reverting to direct link.
+      joins.push(`LEFT JOIN telefonos telf_p ON telf_p.id_telefono = p.id_telefono`);
+      // Fix: Join robusto para correos (prioriza p.id_correo, pero busca cor_p.id_persona si no hay link directo)
+      joins.push(`LEFT JOIN correos cor_p ON (
+        cor_p.id_correo = p.id_correo OR (p.id_correo IS NULL AND cor_p.id_persona = p.id_persona)
+      )`);
+      joins.push('LEFT JOIN direcciones dir_p ON dir_p.id_direccion = p.id_direccion');
     }
     if (capabilities.hasEmpresasTable) {
       joins.push('LEFT JOIN empresas e ON e.id_empresa = c.id_empresa');
       joins.push('LEFT JOIN telefonos telf_e ON telf_e.id_telefono = e.id_telefono');
       joins.push('LEFT JOIN correos cor_e ON cor_e.id_correo = e.id_correo');
+      joins.push('LEFT JOIN direcciones dir_e ON dir_e.id_direccion = e.id_direccion');
     }
     if (capabilities.hasDerivedSucursalFromEmpleado) {
       joins.push(`LEFT JOIN LATERAL (

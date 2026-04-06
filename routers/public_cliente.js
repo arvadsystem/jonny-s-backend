@@ -142,15 +142,22 @@ const autenticarConSupabase = async (email, password) => {
 
 // ── POST /api/public/register ─────────────────────────────────────────
 router.post('/api/public/register', registerLimiter, async (req, res) => {
-  const { email, clave, nombre, apellido, nombreUsuario } = req.body;
+  const { email, clave, nombre, apellido } = req.body;
 
-  if (!email || !clave || !nombre || !apellido || !nombreUsuario) {
-    return res.status(400).json({ error: true, message: 'Todos los campos son obligatorios (Nombre, Apellido, Usuario, Email y Contraseña)' });
+  if (!email || !clave || !nombre || !apellido) {
+    return res.status(400).json({ error: true, message: 'Todos los campos son obligatorios (Nombre, Apellido, Email y Contraseña)' });
   }
 
-  // Fix 7: Validación de fuerza de contraseña
-  if (clave.length < 8) {
-    return res.status(400).json({ error: true, message: 'La contraseña debe tener al menos 8 caracteres' });
+  // Validaciones de seguridad desde configuracion_sistema (Hardcoded basados en DB actual para este servicio, o se pueden prefetched)
+  // password_min_length: 10, upper: true, number: true
+  if (clave.length < 10) {
+    return res.status(400).json({ error: true, message: 'La contraseña debe tener al menos 10 caracteres' });
+  }
+  if (!/[A-Z]/.test(clave)) {
+    return res.status(400).json({ error: true, message: 'La contraseña debe incluir al menos una mayúscula' });
+  }
+  if (!/[0-9]/.test(clave)) {
+    return res.status(400).json({ error: true, message: 'La contraseña debe incluir al menos un número' });
   }
 
   const client = await pool.connect();
@@ -167,14 +174,26 @@ router.post('/api/public/register', registerLimiter, async (req, res) => {
       return res.status(409).json({ error: true, message: 'El correo ya está registrado' });
     }
 
-    // 1.5 Verificar que no exista el nombre de usuario
-    const usuarioExiste = await client.query(
-      `SELECT id_usuario FROM usuarios WHERE nombre_usuario = $1`,
-      [nombreUsuario]
-    );
-    if (usuarioExiste.rows.length > 0) {
-      await client.query('ROLLBACK');
-      return res.status(409).json({ error: true, message: 'El nombre de usuario ya está en uso' });
+    // 1.5 Generar nombre de usuario automático
+    const firstLetter = nombre.trim().charAt(0).toLowerCase();
+    const surname = apellido.trim().split(' ')[0].toLowerCase().replace(/[^a-z]/g, '');
+    let nombreUsuario = '';
+    let isUnique = false;
+    let attempts = 0;
+
+    while (!isUnique && attempts < 10) {
+      const digits = Math.floor(100 + Math.random() * 900); // 3 dígitos
+      nombreUsuario = `${firstLetter}${surname}${digits}`;
+      
+      const checkU = await client.query(`SELECT id_usuario FROM usuarios WHERE nombre_usuario = $1`, [nombreUsuario]);
+      if (checkU.rows.length === 0) {
+        isUnique = true;
+      }
+      attempts++;
+    }
+
+    if (!isUnique) {
+      throw new Error('No se pudo generar un nombre de usuario único. Intente de nuevo.');
     }
 
     // 2. Crear identidad en Supabase (SIN confirmar email)
@@ -224,7 +243,7 @@ router.post('/api/public/register', registerLimiter, async (req, res) => {
       await client.query(
         `INSERT INTO correos (id_persona, direccion_correo) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
         [id_persona, email]
-      ).catch(() => {}); // silenciar si ya existe
+      ).catch(() => {});
     }
 
     await client.query('COMMIT');
@@ -254,6 +273,12 @@ router.post('/api/public/register', registerLimiter, async (req, res) => {
   } catch (error) {
     await client.query('ROLLBACK').catch(() => {});
     console.error('[public/register] Error:', error);
+
+    // Si el error viene de Supabase Auth (ej. usuario ya existe)
+    if (error.message?.includes('User already registered') || error.message?.includes('already exists')) {
+      return res.status(400).json({ error: true, message: 'El correo electrónico ya está registrado en el sistema de autenticación.' });
+    }
+
     return res.status(500).json({ error: true, message: error.message || 'Error interno al registrar cliente' });
   } finally {
     client.release();
@@ -262,9 +287,9 @@ router.post('/api/public/register', registerLimiter, async (req, res) => {
 
 // ── POST /api/public/login ────────────────────────────────────────────
 router.post('/api/public/login', loginLimiter, async (req, res) => {
-  const { email, clave } = req.body;
-  if (!email || !clave) {
-    return res.status(400).json({ error: true, message: 'Email y contraseña son requeridos' });
+  const { identifier, clave } = req.body;
+  if (!identifier || !clave) {
+    return res.status(400).json({ error: true, message: 'Usuario/email y contraseña son requeridos' });
   }
 
   const ip_origen = getClientIp(req);
@@ -272,6 +297,23 @@ router.post('/api/public/login', loginLimiter, async (req, res) => {
   const { dispositivo, navegador, sistema_operativo } = parseUserAgent(user_agent);
 
   try {
+    let email = identifier;
+
+    // Si el identifier NO es un email, buscar el email asociado en la tabla correos o identidades_auth
+    if (!identifier.includes('@')) {
+      const uRes = await pool.query(
+        `SELECT ia.email_login 
+         FROM usuarios u 
+         JOIN identidades_auth ia ON u.id_usuario = ia.id_usuario 
+         WHERE u.nombre_usuario = $1 LIMIT 1`,
+        [identifier]
+      );
+      if (uRes.rows.length === 0) {
+        return res.status(401).json({ error: true, message: 'Credenciales inválidas' });
+      }
+      email = uRes.rows[0].email_login;
+    }
+
     // 1. Autenticar contra Supabase
     const { auth_user_id } = await autenticarConSupabase(email, clave);
 
