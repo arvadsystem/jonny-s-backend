@@ -221,6 +221,7 @@ export const normalizeClienteAtomicPayload = (payload) => {
     id_tipo_cliente: parsePositiveInt(payload.id_tipo_cliente),
     id_persona: parsePositiveInt(payload.id_persona),
     id_empresa: parsePositiveInt(payload.id_empresa),
+    id_sucursal: parsePositiveInt(payload.id_sucursal),
     estado: payload.estado
   };
 
