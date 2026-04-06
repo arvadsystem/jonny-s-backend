@@ -42,6 +42,7 @@ import personasAtomicRoutes from './routers/personas_atomic.js';
 import tipoDepartamentoRoutes from './routers/tipos_departamentos.js';
 import movimientosInventarioRoutes from './routers/movimientos_inventario.js';
 import perfilRoutes from './routers/perfil.js';
+import mobiliarioRoutes from './routers/mobiliario.js';
 
 // Seguridad
 import seguridadSesionesRoutes from './routers/Seguridad/sesiones.js';
@@ -80,7 +81,7 @@ app.use(
   cors({
     origin: FRONTEND_ORIGIN,
     credentials: true,
-    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'X-CSRF-Token']
   })
 );
@@ -160,6 +161,8 @@ app.use(categoriasInsumosRoutes);
 app.use(almacenesRoutes);
 app.use(productosRoutes);
 app.use(insumosRoutes);
+// AM: submodulo Inventario > Mobiliario (v1).
+app.use(mobiliarioRoutes);
 app.use(proveedoresRoutes);
 app.use(ordenComprasRoutes);
 app.use(detalleOrdenComprasRoutes);
