@@ -24,7 +24,30 @@ if (process.env.SMTP_VERIFY_ON_BOOT === 'true') {
     .catch((err) => console.error('❌ [emailService] Error verificando SMTP:', err.message));
 }
 
-const FROM = process.env.SMTP_FROM || `Jonnys Smart Order <${process.env.SMTP_USER}>`;
+const FROM_DEFAULT = process.env.SMTP_FROM || `Jonnys Smart Order <${process.env.SMTP_USER}>`;
+
+// Mapeo de alias según configuración en .env
+const FROM_ALIASES = {
+  ACCESO: process.env.SMTP_FROM_ACCESO,
+  ADMON: process.env.SMTP_FROM_ADMON,
+  GERENCIA: process.env.SMTP_FROM_GERENCIA,
+  INVENTARIO: process.env.SMTP_FROM_INVENTARIO,
+  NORESPONDER: process.env.SMTP_FROM_NORESPONDER,
+  PEDIDOS: process.env.SMTP_FROM_PEDIDOS,
+  RRHH: process.env.SMTP_FROM_RRHH,
+  SOPORTE: process.env.SMTP_FROM_SOPORTE,
+};
+
+/**
+ * Obtener la dirección 'From' basada en un alias o el default.
+ */
+const getFromAddress = (fromKey) => {
+  const alias = FROM_ALIASES[String(fromKey).toUpperCase()];
+  if (alias) {
+    return `Jonnys Smart Order <${alias}>`;
+  }
+  return FROM_DEFAULT;
+};
 
 // ── Templates HTML ────────────────────────────────────────────────
 
@@ -121,7 +144,7 @@ const templateRecuperacion = (linkRecuperacion) => `
  * @param {object} [meta] - Metadata para log ({id_usuario, tipo_correo})
  */
 const enviarCorreo = async (to, subject, html, meta = {}) => {
-  const { id_usuario = null, tipo_correo = 'general' } = meta;
+  const { id_usuario = null, tipo_correo = 'general', fromKey = null } = meta;
 
   // Registrar intento en log
   let logId = null;
@@ -137,8 +160,9 @@ const enviarCorreo = async (to, subject, html, meta = {}) => {
   }
 
   try {
-    const info = await transporter.sendMail({ from: FROM, to, subject, html });
-    console.log(`📧 [emailService] Correo enviado a ${to} — MessageId: ${info.messageId}`);
+    const fromAddress = getFromAddress(fromKey);
+    const info = await transporter.sendMail({ from: fromAddress, to, subject, html });
+    console.log(`📧 [emailService] Correo enviado a ${to} (desde ${fromAddress}) — MessageId: ${info.messageId}`);
 
     // Actualizar log como exitoso
     if (logId) {
@@ -171,7 +195,8 @@ const enviarVerificacion = async (to, nombreUsuario, linkVerificacion, id_usuari
   const html = templateVerificacion(nombreUsuario, linkVerificacion);
   return enviarCorreo(to, 'Verifica tu cuenta — Jonny\'s SmartOrder', html, {
     id_usuario,
-    tipo_correo: 'verificacion'
+    tipo_correo: 'verificacion',
+    fromKey: 'ACCESO'
   });
 };
 
@@ -182,7 +207,8 @@ const enviarRecuperacion = async (to, linkRecuperacion, id_usuario = null) => {
   const html = templateRecuperacion(linkRecuperacion);
   return enviarCorreo(to, 'Recuperar contraseña — Jonny\'s SmartOrder', html, {
     id_usuario,
-    tipo_correo: 'recuperacion'
+    tipo_correo: 'recuperacion',
+    fromKey: 'ACCESO'
   });
 };
 
