@@ -14,14 +14,32 @@ export const INVENTARIO_UPLOADS_SUBDIR = 'inventario';
 export const MAX_IMAGE_BYTES = 6 * 1024 * 1024;
 export const MAX_IMAGE_JSON_LIMIT = '10mb';
 
-// NEW: MIME types permitidos para imagenes del modulo Inventario.
-// WHY: cumplir la regla de solo aceptar jpeg/png/webp sin dependencias externas.
-// IMPACT: se usa en validacion backend y en la generacion de extension segura del archivo.
-export const ALLOWED_IMAGE_MIME_TYPES = Object.freeze({
-  'image/jpeg': 'jpg',
-  'image/png': 'png',
-  'image/webp': 'webp'
+// NEW: configuracion de Supabase Storage.
+export const SUPABASE_ASSETS_BUCKET = 'jonnys-assets'; // Publico
+export const SUPABASE_ADMIN_BUCKET = 'admin-docs';     // Privado (RLS)
+
+// NEW: subdirectorios para organizacion interna
+export const ADMIN_UPLOADS_SUBDIR = 'documentos-admin';
+
+// NEW: MIME types permitidos por balde.
+// WHY: restringir el tipo de contenido segun su proposito administrativo o publico.
+// IMPACT: se usa en validacion dinamica en archivos.js
+export const ALLOWED_MIME_TYPES_BY_BUCKET = Object.freeze({
+  [SUPABASE_ASSETS_BUCKET]: {
+    'image/jpeg': 'jpg',
+    'image/png': 'png',
+    'image/webp': 'webp'
+  },
+  [SUPABASE_ADMIN_BUCKET]: {
+    'application/pdf': 'pdf',
+    'image/jpeg': 'jpg',
+    'image/png': 'png',
+    'image/webp': 'webp'
+  }
 });
+
+// Alias para retrocompatibilidad (usado en modulos anteriores)
+export const ALLOWED_IMAGE_MIME_TYPES = ALLOWED_MIME_TYPES_BY_BUCKET[SUPABASE_ASSETS_BUCKET];
 
 export const ensureUploadsDir = async () => {
   await fs.mkdir(path.join(UPLOADS_DIR, INVENTARIO_UPLOADS_SUBDIR), { recursive: true });
@@ -36,6 +54,20 @@ export const buildAbsolutePublicUrl = (req, rawUrl) => {
   if (!normalized) return null;
   if (/^https?:\/\//i.test(normalized)) return normalized;
 
+  // Si la URL empieza con el prefijo de supabase storage publico (ej: jonnys-assets/)
+  if (normalized.startsWith(`${SUPABASE_ASSETS_BUCKET}/`)) {
+    const supabaseUrl = String(process.env.SUPABASE_URL || '').trim().replace(/\/+$/, '');
+    if (supabaseUrl) {
+      return `${supabaseUrl}/storage/v1/object/public/${normalized}`;
+    }
+  }
+
+  // SI ES PRIVADO (admin-docs), NO RETORNAMOS URL PUBLICA.
+  // El frontend debera llamar al endpoint de firma.
+  if (normalized.startsWith(`${SUPABASE_ADMIN_BUCKET}/`)) {
+    return null;
+  }
+
   const explicitBase = String(process.env.PUBLIC_BACKEND_URL || '').trim().replace(/\/+$/, '');
   const requestBase = req ? `${req.protocol}://${req.get('host')}` : '';
   const base = explicitBase || requestBase;
@@ -44,12 +76,12 @@ export const buildAbsolutePublicUrl = (req, rawUrl) => {
   return `${base}${normalized.startsWith('/') ? '' : '/'}${normalized}`;
 };
 
-export const detectImageMimeTypeFromBuffer = (buffer) => {
+export const detectFileMimeTypeFromBuffer = (buffer) => {
   if (!Buffer.isBuffer(buffer) || buffer.length === 0) return null;
 
-  // NEW: firmas binarias minimas para evitar confiar solo en el MIME declarado por el cliente.
-  // WHY: el upload usa JSON/base64 y no hay libreria externa para inspeccion profunda.
-  // IMPACT: rechaza archivos renombrados/falsos sin modificar el flujo de imagenes validas.
+  // FIRMAS BINARIAS (Magic Numbers)
+  
+  // JPEG: FF D8 FF
   const isJpeg =
     buffer.length >= 3 &&
     buffer[0] === 0xff &&
@@ -57,6 +89,7 @@ export const detectImageMimeTypeFromBuffer = (buffer) => {
     buffer[2] === 0xff;
   if (isJpeg) return 'image/jpeg';
 
+  // PNG: 89 50 4E 47 0D 0A 1A 0A
   const isPng =
     buffer.length >= 8 &&
     buffer[0] === 0x89 &&
@@ -69,14 +102,24 @@ export const detectImageMimeTypeFromBuffer = (buffer) => {
     buffer[7] === 0x0a;
   if (isPng) return 'image/png';
 
+  // WEBP: RIFF .... WEBP
   const isWebp =
     buffer.length >= 12 &&
     buffer.subarray(0, 4).toString('ascii') === 'RIFF' &&
     buffer.subarray(8, 12).toString('ascii') === 'WEBP';
   if (isWebp) return 'image/webp';
 
+  // PDF: %PDF- (25 50 44 46 2d)
+  const isPdf =
+    buffer.length >= 5 &&
+    buffer.subarray(0, 5).toString('ascii') === '%PDF-';
+  if (isPdf) return 'application/pdf';
+
   return null;
 };
+
+// Alias para retrocompatibilidad
+export const detectImageMimeTypeFromBuffer = detectFileMimeTypeFromBuffer;
 
 export const attachImagenPrincipalUrls = async (pool, req, rows) => {
   if (!Array.isArray(rows) || rows.length === 0) return [];
