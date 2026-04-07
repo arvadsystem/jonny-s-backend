@@ -95,6 +95,19 @@ const REGISTRAR_ADELANTO_ALLOWED_FIELDS = new Set([
   'monto',
   'id_sucursal'
 ]);
+const ACTUALIZAR_ADELANTO_ALLOWED_FIELDS = new Set([
+  'id_empleado',
+  'fecha',
+  'monto',
+  'observacion',
+  'motivo',
+  'id_sucursal'
+]);
+const ANULAR_ADELANTO_ALLOWED_FIELDS = new Set([
+  'motivo',
+  'observacion',
+  'id_sucursal'
+]);
 const REGISTRAR_HORAS_EXTRA_ALLOWED_FIELDS = new Set([
   'id_empleado',
   'fecha',
@@ -694,6 +707,7 @@ const buildMovimientosDataset = async ({ idPlanilla, idDetalle = null }) => {
     return {
       id_movimiento_planilla: null,
       id_movimiento: `ad-${row.id_adelanto_aplicacion}`,
+      id_adelanto_salario: idAdelanto || null,
       id_detalle_planilla: detalleEmpleado?.id_detalle_planilla || null,
       id_empleado: empleadoId,
       tipo_movimiento: 'ADELANTO',
@@ -711,7 +725,57 @@ const buildMovimientosDataset = async ({ idPlanilla, idDetalle = null }) => {
     };
   });
 
-  return [...movimientosRows, ...adelantosRows, ...horasExtraRows].sort(
+  const adelantosEliminadosResult = await pool.query(
+    `
+      SELECT
+        a.id_adelanto_salario,
+        a.id_empleado,
+        a.fecha,
+        a.monto,
+        a.saldo,
+        a.estado
+      FROM public.adelantos_salario a
+      WHERE a.id_empleado = ANY($1::int[])
+        AND COALESCE(a.estado, FALSE) = FALSE
+        AND COALESCE(a.saldo, 0) <= 0
+        AND NOT EXISTS (
+          SELECT 1
+          FROM public.adelanto_aplicacion aa
+          WHERE aa.id_adelanto_salario = a.id_adelanto_salario
+        )
+      ORDER BY a.fecha DESC, a.id_adelanto_salario DESC
+    `,
+    [employeeIds]
+  );
+
+  const adelantosEliminadosRows = (adelantosEliminadosResult.rows || []).map((row) => {
+    const empleadoId = parsePositiveInt(row.id_empleado);
+    const detalleEmpleado = empleadoId ? detalleByEmpleado.get(empleadoId) : null;
+    const idAdelanto = parsePositiveInt(row.id_adelanto_salario);
+    const monto = Number(row.monto ?? 0);
+
+    return {
+      id_movimiento_planilla: null,
+      id_movimiento: `ad-del-${idAdelanto || 0}`,
+      id_adelanto_salario: idAdelanto || null,
+      id_detalle_planilla: detalleEmpleado?.id_detalle_planilla || null,
+      id_empleado: empleadoId,
+      tipo_movimiento: 'ADELANTO',
+      tipo: 'ADELANTO',
+      concepto: idAdelanto ? `Adelanto eliminado (AD-${idAdelanto})` : 'Adelanto eliminado',
+      monto: Number.isFinite(monto) ? monto : 0,
+      es_monetario: true,
+      observacion: '[ELIMINADO_AD] Adelanto eliminado desde historial de planilla.',
+      fecha: row.fecha,
+      fecha_registro: row.fecha,
+      origen_movimiento: 'ADELANTO',
+      anulado: true,
+      activo: false,
+      anulable: false
+    };
+  });
+
+  return [...movimientosRows, ...adelantosRows, ...adelantosEliminadosRows, ...horasExtraRows].sort(
     (left, right) =>
       toTimestampSafe(right.fecha_registro || right.fecha) -
       toTimestampSafe(left.fecha_registro || left.fecha)
@@ -2087,6 +2151,341 @@ const planillaService = {
     };
   },
 
+  async actualizarAdelanto(req) {
+    const unknownFields = unknownFieldsFromPayload(req.body, ACTUALIZAR_ADELANTO_ALLOWED_FIELDS);
+    if (unknownFields.length) {
+      return {
+        status: 400,
+        body: buildErrorBody({
+          code: 'UNKNOWN_FIELDS',
+          message: 'El payload contiene campos no permitidos.',
+          details: { fields: unknownFields }
+        })
+      };
+    }
+
+    const idPlanilla = parsePositiveInt(req.params.id_planilla);
+    const idAdelanto = parsePositiveInt(req.params.id_adelanto);
+    const idEmpleadoPayload = parsePositiveInt(req.body?.id_empleado);
+    const monto = parsePositiveNumber(req.body?.monto);
+    const fecha = normalizeTimestampInput(req.body?.fecha);
+
+    if (!idPlanilla || !idAdelanto || !monto) {
+      return {
+        status: 400,
+        body: buildErrorBody({
+          code: 'VALIDATION_ERROR',
+          message: 'id_planilla, id_adelanto y monto son requeridos.'
+        })
+      };
+    }
+
+    if (req.body?.fecha !== undefined && !fecha) {
+      return {
+        status: 400,
+        body: buildErrorBody({
+          code: 'VALIDATION_ERROR',
+          message: 'La fecha enviada no es valida.'
+        })
+      };
+    }
+
+    const scopeValidation = await validatePlanillaSucursalScope(idPlanilla, req.body?.id_sucursal);
+    if (!scopeValidation.ok) {
+      return { status: scopeValidation.status, body: scopeValidation.body };
+    }
+
+    const detalleRows = await queryFunctionRows(PLANILLA_ENDPOINT_CONTRACT.detalle, [idPlanilla]);
+    const detalleEmpleadoIds = new Set(
+      (detalleRows || [])
+        .map((row) => parsePositiveInt(row.id_empleado))
+        .filter((value) => value > 0)
+    );
+
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+
+      const adelantoResult = await client.query(
+        `
+          SELECT
+            a.id_adelanto_salario,
+            a.id_empleado,
+            a.fecha,
+            a.monto,
+            a.saldo,
+            a.estado,
+            e.id_sucursal
+          FROM public.adelantos_salario a
+          INNER JOIN public.empleados e
+            ON e.id_empleado = a.id_empleado
+          WHERE a.id_adelanto_salario = $1
+          FOR UPDATE
+        `,
+        [idAdelanto]
+      );
+
+      if (!adelantoResult.rows?.length) {
+        throw createRequestError('El adelanto indicado no existe.', 404, 'NOT_FOUND');
+      }
+
+      const adelanto = adelantoResult.rows[0];
+      const idEmpleado = parsePositiveInt(adelanto.id_empleado);
+      const saldoActual = Number(adelanto.saldo ?? 0);
+      const estadoActual = adelanto.estado === true;
+      const idSucursalAdelanto = parsePositiveInt(adelanto.id_sucursal);
+
+      if (!idEmpleado) {
+        throw createRequestError('El adelanto no tiene empleado asociado.', 409, 'RELATION_ERROR');
+      }
+
+      if (idEmpleadoPayload && idEmpleadoPayload !== idEmpleado) {
+        throw createRequestError(
+          'No se puede cambiar el empleado de un adelanto ya registrado.',
+          409,
+          'ADELANTO_EMPLEADO_INMUTABLE'
+        );
+      }
+
+      if (!detalleEmpleadoIds.has(idEmpleado)) {
+        throw createRequestError(
+          'El empleado del adelanto no pertenece al detalle de la planilla seleccionada.',
+          409,
+          'PLANILLA_SCOPE_MISMATCH'
+        );
+      }
+
+      if (scopeValidation.idSucursal && idSucursalAdelanto && scopeValidation.idSucursal !== idSucursalAdelanto) {
+        throw createRequestError(
+          'El adelanto no pertenece a la sucursal activa.',
+          409,
+          'SUCURSAL_SCOPE_MISMATCH'
+        );
+      }
+
+      if (!estadoActual || !Number.isFinite(saldoActual) || saldoActual <= 0) {
+        throw createRequestError(
+          'Solo se pueden editar adelantos pendientes con saldo disponible.',
+          409,
+          'ADELANTO_NO_EDITABLE'
+        );
+      }
+
+      const aplicacionesResult = await client.query(
+        `
+          SELECT
+            COALESCE(SUM(aa.monto_aplicado), 0) AS total_aplicado
+          FROM public.adelanto_aplicacion aa
+          WHERE aa.id_adelanto_salario = $1
+        `,
+        [idAdelanto]
+      );
+
+      const totalAplicado = Number(aplicacionesResult.rows?.[0]?.total_aplicado ?? 0);
+      if (Number.isFinite(totalAplicado) && totalAplicado > monto) {
+        throw createRequestError(
+          `El monto no puede ser menor a lo ya aplicado (${totalAplicado.toFixed(2)}).`,
+          409,
+          'ADELANTO_MONTO_INVALIDO'
+        );
+      }
+
+      const nuevoSaldo = Math.max(0, monto - (Number.isFinite(totalAplicado) ? totalAplicado : 0));
+      const nuevoEstado = nuevoSaldo > 0;
+
+      const updateResult = await client.query(
+        `
+          UPDATE public.adelantos_salario
+          SET
+            monto = $2,
+            saldo = $3,
+            estado = $4,
+            fecha = COALESCE($5::timestamp, fecha)
+          WHERE id_adelanto_salario = $1
+          RETURNING
+            id_adelanto_salario,
+            id_empleado,
+            fecha,
+            monto,
+            saldo,
+            estado
+        `,
+        [idAdelanto, monto, nuevoSaldo, nuevoEstado, fecha]
+      );
+
+      await client.query('COMMIT');
+
+      return {
+        status: 200,
+        body: {
+          error: false,
+          message: 'Adelanto pendiente actualizado correctamente.',
+          data: updateResult.rows?.[0] || null
+        }
+      };
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
+  },
+
+  async anularAdelanto(req) {
+    const unknownFields = unknownFieldsFromPayload(req.body, ANULAR_ADELANTO_ALLOWED_FIELDS);
+    if (unknownFields.length) {
+      return {
+        status: 400,
+        body: buildErrorBody({
+          code: 'UNKNOWN_FIELDS',
+          message: 'El payload contiene campos no permitidos.',
+          details: { fields: unknownFields }
+        })
+      };
+    }
+
+    const idPlanilla = parsePositiveInt(req.params.id_planilla);
+    const idAdelanto = parsePositiveInt(req.params.id_adelanto);
+    if (!idPlanilla || !idAdelanto) {
+      return {
+        status: 400,
+        body: buildErrorBody({
+          code: 'VALIDATION_ERROR',
+          message: 'id_planilla e id_adelanto son requeridos.'
+        })
+      };
+    }
+
+    const scopeValidation = await validatePlanillaSucursalScope(idPlanilla, req.body?.id_sucursal);
+    if (!scopeValidation.ok) {
+      return { status: scopeValidation.status, body: scopeValidation.body };
+    }
+
+    const detalleRows = await queryFunctionRows(PLANILLA_ENDPOINT_CONTRACT.detalle, [idPlanilla]);
+    const detalleEmpleadoIds = new Set(
+      (detalleRows || [])
+        .map((row) => parsePositiveInt(row.id_empleado))
+        .filter((value) => value > 0)
+    );
+
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+
+      const adelantoResult = await client.query(
+        `
+          SELECT
+            a.id_adelanto_salario,
+            a.id_empleado,
+            a.fecha,
+            a.monto,
+            a.saldo,
+            a.estado,
+            e.id_sucursal
+          FROM public.adelantos_salario a
+          INNER JOIN public.empleados e
+            ON e.id_empleado = a.id_empleado
+          WHERE a.id_adelanto_salario = $1
+          FOR UPDATE
+        `,
+        [idAdelanto]
+      );
+
+      if (!adelantoResult.rows?.length) {
+        throw createRequestError('El adelanto indicado no existe.', 404, 'NOT_FOUND');
+      }
+
+      const adelanto = adelantoResult.rows[0];
+      const idEmpleado = parsePositiveInt(adelanto.id_empleado);
+      const saldoActual = Number(adelanto.saldo ?? 0);
+      const estadoActual = adelanto.estado === true;
+      const idSucursalAdelanto = parsePositiveInt(adelanto.id_sucursal);
+
+      if (!idEmpleado) {
+        throw createRequestError('El adelanto no tiene empleado asociado.', 409, 'RELATION_ERROR');
+      }
+
+      if (!detalleEmpleadoIds.has(idEmpleado)) {
+        throw createRequestError(
+          'El empleado del adelanto no pertenece al detalle de la planilla seleccionada.',
+          409,
+          'PLANILLA_SCOPE_MISMATCH'
+        );
+      }
+
+      if (scopeValidation.idSucursal && idSucursalAdelanto && scopeValidation.idSucursal !== idSucursalAdelanto) {
+        throw createRequestError(
+          'El adelanto no pertenece a la sucursal activa.',
+          409,
+          'SUCURSAL_SCOPE_MISMATCH'
+        );
+      }
+
+      if (!estadoActual || !Number.isFinite(saldoActual) || saldoActual <= 0) {
+        throw createRequestError(
+          'Solo se pueden eliminar adelantos pendientes con saldo disponible.',
+          409,
+          'ADELANTO_NO_ELIMINABLE'
+        );
+      }
+
+      const aplicacionesResult = await client.query(
+        `
+          SELECT
+            COUNT(*)::int AS total_aplicaciones,
+            COALESCE(SUM(aa.monto_aplicado), 0) AS total_aplicado
+          FROM public.adelanto_aplicacion aa
+          WHERE aa.id_adelanto_salario = $1
+        `,
+        [idAdelanto]
+      );
+
+      const totalAplicaciones = Number(aplicacionesResult.rows?.[0]?.total_aplicaciones ?? 0);
+      const totalAplicado = Number(aplicacionesResult.rows?.[0]?.total_aplicado ?? 0);
+      if ((Number.isFinite(totalAplicaciones) && totalAplicaciones > 0) || (Number.isFinite(totalAplicado) && totalAplicado > 0)) {
+        throw createRequestError(
+          'No se puede eliminar el adelanto porque ya tiene aplicaciones registradas.',
+          409,
+          'ADELANTO_CON_APLICACIONES'
+        );
+      }
+
+      const updateResult = await client.query(
+        `
+          UPDATE public.adelantos_salario
+          SET
+            saldo = 0,
+            estado = FALSE
+          WHERE id_adelanto_salario = $1
+          RETURNING
+            id_adelanto_salario,
+            id_empleado,
+            fecha,
+            monto,
+            saldo,
+            estado
+        `,
+        [idAdelanto]
+      );
+
+      await client.query('COMMIT');
+
+      return {
+        status: 200,
+        body: {
+          error: false,
+          message: 'Adelanto eliminado correctamente.',
+          data: updateResult.rows?.[0] || null
+        }
+      };
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
+  },
+
   async registrarMovimiento(req) {
     const unknownFields = unknownFieldsFromPayload(req.body, MOVIMIENTO_ALLOWED_FIELDS);
     if (unknownFields.length) {
@@ -2381,6 +2780,8 @@ router.get('/planillas/sucursales/:id_sucursal/adelantos-pendientes', checkPermi
 router.get('/planillas/:id_planilla/adelantos-aplicables', checkPermission(PLANILLAS_ADELANTOS_PERMISSIONS), asyncHandler(planillaService.adelantosAplicables));
 router.post('/planillas/:id_planilla/adelantos/registrar', checkPermission(PLANILLAS_ADELANTOS_PERMISSIONS), asyncHandler(planillaService.registrarAdelanto));
 router.post('/planillas/:id_planilla/adelantos/aplicar', checkPermission(PLANILLAS_ADELANTOS_PERMISSIONS), asyncHandler(planillaService.aplicarAdelanto));
+router.post('/planillas/:id_planilla/adelantos/:id_adelanto/actualizar', checkPermission(PLANILLAS_ADELANTOS_PERMISSIONS), asyncHandler(planillaService.actualizarAdelanto));
+router.post('/planillas/:id_planilla/adelantos/:id_adelanto/anular', checkPermission(PLANILLAS_ADELANTOS_PERMISSIONS), asyncHandler(planillaService.anularAdelanto));
 router.post('/planillas/:id_planilla/movimientos', checkPermission(PLANILLAS_MOVIMIENTO_REGISTER_PERMISSIONS), asyncHandler(planillaService.registrarMovimiento));
 router.get('/planillas/:id_planilla/movimientos', checkPermission(PLANILLAS_DETAIL_PERMISSIONS), asyncHandler(planillaService.listarMovimientos));
 router.get('/planillas/:id_planilla/movimientos/:id_detalle', checkPermission(PLANILLAS_DETAIL_PERMISSIONS), asyncHandler(planillaService.listarMovimientosDetalle));
