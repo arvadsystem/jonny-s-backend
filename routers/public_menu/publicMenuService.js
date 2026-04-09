@@ -35,7 +35,15 @@ const SERVICE_TYPE_BY_ORDER_TYPE = Object.freeze({
   delivery: 'DELIVERY'
 });
 
-const ORDER_STATE_ALIASES = Object.freeze(['pendiente']);
+const ORDER_STATE_ALIASES = Object.freeze([
+  'pendiente',
+  'pendientes',
+  'pendiente_/_por_pagar',
+  'pendientes_/_por_pagar',
+  'por_pagar',
+  'pendiente_por_pagar'
+]);
+const PENDING_STATE_ID_PRIORITY = 1;
 const HAMBURGUESA_KEYWORDS = Object.freeze(['hamburguesa', 'burger', 'smash']);
 const PUBLIC_EXTRA_OPTIONS = Object.freeze([
   {
@@ -421,8 +429,21 @@ const mapMenuSummary = (row) => ({
 
 const resolvePendingStateId = async () => {
   const rows = await fetchEstadoPedidoRowsQuery();
-  const match = rows.find((row) => ORDER_STATE_ALIASES.includes(normalizeTextKey(row?.descripcion)));
-  const id = Number(match?.id_estado_pedido || 0);
+  // Regla de compatibilidad con tablero Ventas:
+  // El carril "Pendientes / Por pagar" consume actualmente id_estado_pedido = 1.
+  // Priorizamos ese ID para que los pedidos del menú público entren en la primera columna.
+  const priorityById = rows.find(
+    (row) => Number(row?.id_estado_pedido || 0) === PENDING_STATE_ID_PRIORITY
+  );
+  if (priorityById) {
+    return Number(priorityById.id_estado_pedido);
+  }
+
+  // Fallback defensivo por descripción (instalaciones con catálogo distinto).
+  const matchByAlias = rows.find((row) =>
+    ORDER_STATE_ALIASES.includes(normalizeTextKey(row?.descripcion))
+  );
+  const id = Number(matchByAlias?.id_estado_pedido || 0);
   return id > 0 ? id : null;
 };
 
