@@ -629,6 +629,34 @@ const toTimestampSafe = (value) => {
   return Number.isFinite(parsed) ? parsed : 0;
 };
 
+const resolveEmpleadoDniMap = async (employeeIds = []) => {
+  const safeEmployeeIds = [...new Set((employeeIds || []).map(parsePositiveInt).filter(Boolean))];
+  if (!safeEmployeeIds.length) return new Map();
+
+  try {
+    const result = await pool.query(
+      `
+        SELECT
+          e.id_empleado,
+          p.dni
+        FROM public.empleados e
+        LEFT JOIN public.personas p
+          ON p.id_persona = e.id_persona
+        WHERE e.id_empleado = ANY($1::int[])
+      `,
+      [safeEmployeeIds]
+    );
+
+    return new Map(
+      (result.rows || [])
+        .map((row) => [parsePositiveInt(row.id_empleado), sanitizeText(row.dni, 40)])
+        .filter(([idEmpleado]) => Boolean(idEmpleado))
+    );
+  } catch {
+    return new Map();
+  }
+};
+
 const buildMovimientosDataset = async ({ idPlanilla, idDetalle = null }) => {
   const planillaPeriodoResult = await pool.query(
     `
@@ -1458,6 +1486,8 @@ const planillaService = {
     }
 
     const rows = await queryFunctionRows(PLANILLA_ENDPOINT_CONTRACT.detalle, [idPlanilla]);
+    const employeeIds = [...new Set((rows || []).map((row) => parsePositiveInt(row.id_empleado)).filter(Boolean))];
+    const dniMap = await resolveEmpleadoDniMap(employeeIds);
 
     const horasResult = await pool.query(
       `
@@ -1511,8 +1541,14 @@ const planillaService = {
       const idEmpleado = parsePositiveInt(row.id_empleado);
       const horasPendientes = idEmpleado ? Number(horasPendientesMap.get(idEmpleado) ?? 0) : 0;
       const adelantosAplicados = idEmpleado ? Number(adelantosMap.get(idEmpleado) ?? 0) : 0;
+      const resolvedDni = sanitizeText(
+        row.dni || row.persona_dni || row.dni_persona || row.numero_dni || (idEmpleado ? dniMap.get(idEmpleado) : ''),
+        40
+      );
       return {
         ...row,
+        dni: resolvedDni || null,
+        persona_dni: resolvedDni || null,
         he_tiempo: Number.isFinite(horasPendientes) ? horasPendientes : 0,
         horas_extra_tiempo: Number.isFinite(horasPendientes) ? horasPendientes : 0,
         total_adelantos_aplicados: Number.isFinite(adelantosAplicados) ? adelantosAplicados : 0,
@@ -1525,6 +1561,7 @@ const planillaService = {
       const haystack = [
         row.id_empleado,
         row.nombre_completo,
+        row.dni,
         row.sucursal,
         row.cargo,
         row.salario_base,
