@@ -10,6 +10,7 @@ import {
 
 const router = express.Router();
 
+// API cap intentionally fixed to 100; consumers should paginate to gather complete datasets.
 const MAX_LIMIT = 100;
 const DEFAULT_LIMIT = 10;
 
@@ -196,6 +197,36 @@ const normalizeTimestampInput = (value) => {
   const parsed = new Date(text);
   if (Number.isNaN(parsed.getTime())) return null;
   return parsed.toISOString();
+};
+
+const todayLocalDateKey = () => {
+  const now = new Date();
+  const year = now.getFullYear();
+  const month = String(now.getMonth() + 1).padStart(2, '0');
+  const day = String(now.getDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
+};
+
+const normalizeDateOnlyKey = (value) => {
+  const text = sanitizeText(value, 40);
+  if (!text) return null;
+
+  const directDateMatch = /^(\d{4})-(\d{2})-(\d{2})$/.exec(text);
+  if (directDateMatch) {
+    return `${directDateMatch[1]}-${directDateMatch[2]}-${directDateMatch[3]}`;
+  }
+
+  const parsed = new Date(text);
+  if (Number.isNaN(parsed.getTime())) return null;
+  return `${parsed.getUTCFullYear()}-${String(parsed.getUTCMonth() + 1).padStart(2, '0')}-${String(
+    parsed.getUTCDate()
+  ).padStart(2, '0')}`;
+};
+
+const isFutureDateInput = (value) => {
+  const dateKey = normalizeDateOnlyKey(value);
+  if (!dateKey) return false;
+  return dateKey > todayLocalDateKey();
 };
 
 const normalizeEstadoAlias = (value) => {
@@ -565,12 +596,56 @@ const validatePlanillaSucursalScope = async (idPlanilla, rawIdSucursal, options 
   return { ok: true, scope, idSucursal };
 };
 
+const syncDetalleSalarioBaseFromEmpleado = async ({
+  db = pool,
+  idPlanilla,
+  idDetallePlanilla = null
+}) => {
+  const safePlanillaId = parsePositiveInt(idPlanilla);
+  if (!safePlanillaId) return { updated: 0 };
+
+  const safeDetalleId = idDetallePlanilla === null ? null : parsePositiveInt(idDetallePlanilla);
+  if (idDetallePlanilla !== null && !safeDetalleId) return { updated: 0 };
+
+  const result = await db.query(
+    `
+      UPDATE public.detalle_planilla dp
+      SET salario_base = COALESCE(e.salario_base, 0)
+      FROM public.empleados e
+      WHERE dp.id_planilla = $1
+        AND dp.id_empleado = e.id_empleado
+        AND ($2::int IS NULL OR dp.id_detalle_planilla = $2::int)
+        AND COALESCE(dp.salario_base, 0) IS DISTINCT FROM COALESCE(e.salario_base, 0)
+      RETURNING dp.id_detalle_planilla
+    `,
+    [safePlanillaId, safeDetalleId]
+  );
+
+  return { updated: result.rowCount || 0 };
+};
+
 const toTimestampSafe = (value) => {
   const parsed = new Date(value ?? 0).getTime();
   return Number.isFinite(parsed) ? parsed : 0;
 };
 
 const buildMovimientosDataset = async ({ idPlanilla, idDetalle = null }) => {
+  const planillaPeriodoResult = await pool.query(
+    `
+      SELECT
+        date_trunc('month', p.fecha_creacion)::timestamp AS periodo_inicio,
+        (date_trunc('month', p.fecha_creacion) + interval '1 month')::timestamp AS periodo_fin,
+        p.fecha_creacion
+      FROM public.planillas p
+      WHERE p.id_planilla = $1
+      LIMIT 1
+    `,
+    [idPlanilla]
+  );
+  const planillaPeriodoInicio = planillaPeriodoResult.rows?.[0]?.periodo_inicio || null;
+  const planillaPeriodoFin = planillaPeriodoResult.rows?.[0]?.periodo_fin || null;
+  const planillaPeriodoKey = toMonthKey(planillaPeriodoResult.rows?.[0]?.fecha_creacion || planillaPeriodoInicio);
+
   const detalleRows = await queryFunctionRows(PLANILLA_ENDPOINT_CONTRACT.detalle, [idPlanilla]);
 
   const detalleById = new Map();
@@ -614,6 +689,9 @@ const buildMovimientosDataset = async ({ idPlanilla, idDetalle = null }) => {
 
   const movimientosRows = detalleChunks.flat().map((row) => ({
     ...row,
+    id_planilla: idPlanilla,
+    periodo_movimiento: planillaPeriodoKey || null,
+    fecha_periodo: planillaPeriodoInicio,
     tipo: row.tipo || row.tipo_movimiento,
     fecha: row.fecha || row.fecha_registro,
     es_monetario: true,
@@ -661,6 +739,7 @@ const buildMovimientosDataset = async ({ idPlanilla, idDetalle = null }) => {
       id_movimiento_planilla: null,
       id_movimiento: `he-${row.id_horas_extra}`,
       id_detalle_planilla: detalleEmpleado?.id_detalle_planilla || null,
+      id_planilla: idPlanilla,
       id_empleado: empleadoId,
       tipo_movimiento: 'H.E. TIEMPO',
       tipo: 'H.E. TIEMPO',
@@ -674,6 +753,8 @@ const buildMovimientosDataset = async ({ idPlanilla, idDetalle = null }) => {
         row.observacion,
         255
       ) || (isCompensada ? 'Compensada con tiempo libre.' : 'Pendiente de compensacion.'),
+      periodo_movimiento: planillaPeriodoKey || null,
+      fecha_periodo: planillaPeriodoInicio,
       fecha: fechaMovimiento,
       fecha_registro: fechaMovimiento,
       origen_movimiento: 'HORAS_EXTRA',
@@ -709,6 +790,7 @@ const buildMovimientosDataset = async ({ idPlanilla, idDetalle = null }) => {
       id_movimiento: `ad-${row.id_adelanto_aplicacion}`,
       id_adelanto_salario: idAdelanto || null,
       id_detalle_planilla: detalleEmpleado?.id_detalle_planilla || null,
+      id_planilla: idPlanilla,
       id_empleado: empleadoId,
       tipo_movimiento: 'ADELANTO',
       tipo: 'ADELANTO',
@@ -718,6 +800,8 @@ const buildMovimientosDataset = async ({ idPlanilla, idDetalle = null }) => {
       monto: Number.isFinite(montoAplicado) ? montoAplicado : 0,
       es_monetario: true,
       observacion: 'Aplicado automaticamente al detalle de planilla.',
+      periodo_movimiento: planillaPeriodoKey || null,
+      fecha_periodo: planillaPeriodoInicio,
       fecha: row.fecha,
       fecha_registro: row.fecha,
       origen_movimiento: 'ADELANTO',
@@ -736,6 +820,11 @@ const buildMovimientosDataset = async ({ idPlanilla, idDetalle = null }) => {
         a.estado
       FROM public.adelantos_salario a
       WHERE a.id_empleado = ANY($1::int[])
+        AND (
+          $2::timestamp IS NULL
+          OR $3::timestamp IS NULL
+          OR (a.fecha >= $2::timestamp AND a.fecha < $3::timestamp)
+        )
         AND COALESCE(a.estado, FALSE) = FALSE
         AND COALESCE(a.saldo, 0) <= 0
         AND NOT EXISTS (
@@ -745,7 +834,7 @@ const buildMovimientosDataset = async ({ idPlanilla, idDetalle = null }) => {
         )
       ORDER BY a.fecha DESC, a.id_adelanto_salario DESC
     `,
-    [employeeIds]
+    [employeeIds, planillaPeriodoInicio, planillaPeriodoFin]
   );
 
   const adelantosEliminadosRows = (adelantosEliminadosResult.rows || []).map((row) => {
@@ -766,6 +855,9 @@ const buildMovimientosDataset = async ({ idPlanilla, idDetalle = null }) => {
       monto: Number.isFinite(monto) ? monto : 0,
       es_monetario: true,
       observacion: '[ELIMINADO_AD] Adelanto eliminado desde historial de planilla.',
+      id_planilla: idPlanilla,
+      periodo_movimiento: planillaPeriodoKey || null,
+      fecha_periodo: planillaPeriodoInicio,
       fecha: row.fecha,
       fecha_registro: row.fecha,
       origen_movimiento: 'ADELANTO',
@@ -787,6 +879,82 @@ const createRequestError = (message, httpStatus = 400, code = 'VALIDATION_ERROR'
   err.httpStatus = httpStatus;
   err.code = code;
   return err;
+};
+
+const MONEY_VALIDATION_EPSILON = 0.000001;
+
+const formatMoneyForMessage = (value = 0) => {
+  const safe = Number.isFinite(value) ? value : 0;
+  return `L ${safe.toLocaleString('es-HN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+};
+
+const resolveNetoDisponibleDetalle = async ({ db = pool, idDetallePlanilla, idPlanilla, idEmpleado }) => {
+  if (!idDetallePlanilla || !idPlanilla || !idEmpleado) return null;
+
+  const totalsResult = await db.query(
+    `
+      WITH bonos AS (
+        SELECT COALESCE(SUM(mp.monto), 0) AS total_bonos
+        FROM public.movimiento_planilla mp
+        WHERE mp.id_detalle_planilla = $1
+          AND UPPER(TRIM(mp.tipo_movimiento)) = 'BONO'
+          AND COALESCE(mp.estado, TRUE) = TRUE
+      ),
+      deducciones_mov AS (
+        SELECT COALESCE(SUM(mp.monto), 0) AS total_deducciones_mov
+        FROM public.movimiento_planilla mp
+        WHERE mp.id_detalle_planilla = $1
+          AND UPPER(TRIM(mp.tipo_movimiento)) = 'DEDUCCION'
+          AND COALESCE(mp.estado, TRUE) = TRUE
+      ),
+      adelantos AS (
+        SELECT COALESCE(SUM(aa.monto_aplicado), 0) AS total_adelantos
+        FROM public.adelanto_aplicacion aa
+        INNER JOIN public.adelantos_salario a
+          ON a.id_adelanto_salario = aa.id_adelanto_salario
+        WHERE aa.id_planilla = $2
+          AND a.id_empleado = $3
+      )
+      SELECT
+        COALESCE(dp.salario_base, 0) AS salario_base,
+        COALESCE(bonos.total_bonos, 0) AS total_bonos,
+        COALESCE(deducciones_mov.total_deducciones_mov, 0) AS total_deducciones_mov,
+        COALESCE(adelantos.total_adelantos, 0) AS total_adelantos,
+        COALESCE(dp.neto_pagar, 0) AS neto_actual
+      FROM public.detalle_planilla dp, bonos, deducciones_mov, adelantos
+      WHERE dp.id_detalle_planilla = $1
+      LIMIT 1
+    `,
+    [idDetallePlanilla, idPlanilla, idEmpleado]
+  );
+
+  const totals = totalsResult.rows?.[0] || null;
+  if (!totals) return null;
+
+  const salarioBase = Number(totals.salario_base ?? 0);
+  const totalBonos = Number(totals.total_bonos ?? 0);
+  const totalDeduccionesMov = Number(totals.total_deducciones_mov ?? 0);
+  const totalAdelantos = Number(totals.total_adelantos ?? 0);
+  const netoCalculado = salarioBase + totalBonos - totalDeduccionesMov - totalAdelantos;
+
+  if (Number.isFinite(netoCalculado)) return netoCalculado;
+
+  const netoActual = Number(totals.neto_actual ?? 0);
+  return Number.isFinite(netoActual) ? netoActual : null;
+};
+
+const assertAdelantoDentroNetoDisponible = (monto, netoDisponible) => {
+  const montoSafe = Number(monto ?? 0);
+  const netoSafe = Number(netoDisponible ?? 0);
+  if (!Number.isFinite(montoSafe) || montoSafe <= 0) return;
+  const netoFinal = Number.isFinite(netoSafe) ? Math.max(0, netoSafe) : 0;
+  if (montoSafe - netoFinal > MONEY_VALIDATION_EPSILON) {
+    throw createRequestError(
+      `El monto del adelanto no puede superar el neto a pagar disponible (${formatMoneyForMessage(netoFinal)}).`,
+      409,
+      'ADELANTO_NETO_INSUFICIENTE'
+    );
+  }
 };
 
 const applyAdelantoFallback = async ({ idAdelanto, idPlanilla, montoAplicar = null }) => {
@@ -849,6 +1017,13 @@ const applyAdelantoFallback = async ({ idAdelanto, idPlanilla, montoAplicar = nu
     }
 
     const idDetallePlanilla = parsePositiveInt(detalleResult.rows[0].id_detalle_planilla);
+    if (!idDetallePlanilla) {
+      throw createRequestError(
+        'No se pudo identificar el detalle de planilla del empleado para validar el adelanto.',
+        409,
+        'RELATION_ERROR'
+      );
+    }
     const montoAplicado = Number.isFinite(montoAplicar) && montoAplicar > 0 ? montoAplicar : saldoActual;
 
     if (!Number.isFinite(montoAplicado) || montoAplicado <= 0) {
@@ -862,6 +1037,14 @@ const applyAdelantoFallback = async ({ idAdelanto, idPlanilla, montoAplicar = nu
         'ADELANTO_MONTO_INVALIDO'
       );
     }
+
+    const netoDisponible = await resolveNetoDisponibleDetalle({
+      db: client,
+      idDetallePlanilla,
+      idPlanilla,
+      idEmpleado
+    });
+    assertAdelantoDentroNetoDisponible(montoAplicado, netoDisponible);
 
     const existing = await client.query(
       `
@@ -907,6 +1090,11 @@ const applyAdelantoFallback = async ({ idAdelanto, idPlanilla, montoAplicar = nu
 
     let netoActualizado = null;
     try {
+      await syncDetalleSalarioBaseFromEmpleado({
+        db: client,
+        idPlanilla,
+        idDetallePlanilla
+      });
       const recalc = await client.query(
         'SELECT public.fn_recalcular_detalle_planilla($1) AS neto_actualizado',
         [idDetallePlanilla]
@@ -994,10 +1182,49 @@ const getRequiredEstadoPermission = (descripcion = '') => {
   return null;
 };
 
+const mapStatusToErrorCode = (status = 500) => {
+  if (status === 400) return 'VALIDATION_ERROR';
+  if (status === 401) return 'UNAUTHORIZED';
+  if (status === 403) return 'FORBIDDEN';
+  if (status === 404) return 'NOT_FOUND';
+  if (status === 409) return 'CONFLICT_ERROR';
+  return 'INTERNAL_ERROR';
+};
+
+const decodeMojibakeText = (value = '') => {
+  const text = String(value ?? '');
+  if (!/[ÃÂ]/.test(text)) return text;
+  try {
+    const decoded = Buffer.from(text, 'latin1').toString('utf8');
+    if (decoded && !decoded.includes('�')) return decoded;
+  } catch {
+    // noop
+  }
+  return text;
+};
+
+const normalizeServiceErrorBody = (status = 500, body = null) => {
+  const source = body && typeof body === 'object' ? body : {};
+  const safeStatus = Number.isInteger(status) ? status : 500;
+  const message = sanitizeApiErrorMessage(
+    decodeMojibakeText(source.message || source.mensaje),
+    safeStatus
+  );
+  return buildErrorBody({
+    code: String(source.code || mapStatusToErrorCode(safeStatus)).trim() || mapStatusToErrorCode(safeStatus),
+    message,
+    details: source.details && typeof source.details === 'object' ? source.details : undefined
+  });
+};
+
 const asyncHandler = (handler) => async (req, res) => {
   try {
     const result = await handler(req, res);
-    return res.status(result.status).json(result.body);
+    const status = Number.isInteger(result?.status) ? result.status : 500;
+    if (status >= 400) {
+      return res.status(status).json(normalizeServiceErrorBody(status, result?.body));
+    }
+    return res.status(status).json(result?.body ?? { error: false });
   } catch (err) {
     const httpStatus = Number.isInteger(err?.httpStatus) ? err.httpStatus : null;
     if (httpStatus && httpStatus >= 400 && httpStatus < 500) {
@@ -1203,6 +1430,7 @@ const planillaService = {
       return { status: scopeValidation.status, body: scopeValidation.body };
     }
 
+    await syncDetalleSalarioBaseFromEmpleado({ idPlanilla });
     const rows = await queryFunctionRows(PLANILLA_ENDPOINT_CONTRACT.recalcularPlanilla, [idPlanilla]);
     return {
       status: 200,
@@ -1546,6 +1774,16 @@ const planillaService = {
       };
     }
 
+    if (req.body?.fecha !== undefined && fecha && isFutureDateInput(req.body?.fecha)) {
+      return {
+        status: 400,
+        body: buildErrorBody({
+          code: 'VALIDATION_ERROR',
+          message: 'La fecha no puede ser mayor al dia actual.'
+        })
+      };
+    }
+
     if (req.body?.id_tipo_hora !== undefined && !idTipoHora) {
       return {
         status: 400,
@@ -1754,6 +1992,10 @@ const planillaService = {
 
       idDetallePlanilla = parsePositiveInt(detalleResult.rows?.[0]?.id_detalle_planilla);
       if (idDetallePlanilla) {
+        await syncDetalleSalarioBaseFromEmpleado({
+          idPlanilla,
+          idDetallePlanilla
+        });
         netoActualizado = await queryFunctionScalar(PLANILLA_ENDPOINT_CONTRACT.recalcularDetalle, [idDetallePlanilla]);
       }
     }
@@ -1833,6 +2075,9 @@ const planillaService = {
         };
       }
       recalcular = parsedRecalcular;
+    }
+    if (recalcular) {
+      await syncDetalleSalarioBaseFromEmpleado({ idPlanilla });
     }
     await queryFunctionScalar(PLANILLA_ENDPOINT_CONTRACT.actualizarEstado, [
       idPlanilla,
@@ -2028,12 +2273,144 @@ const planillaService = {
       return { status: scopeValidation.status, body: scopeValidation.body };
     }
 
+    const adelantoScopeResult = await pool.query(
+      `
+        SELECT
+          a.id_adelanto_salario,
+          a.id_empleado,
+          a.saldo,
+          a.estado
+        FROM public.adelantos_salario a
+        WHERE a.id_adelanto_salario = $1
+        LIMIT 1
+      `,
+      [idAdelanto]
+    );
+
+    if (!adelantoScopeResult.rows?.length) {
+      return {
+        status: 404,
+        body: buildErrorBody({
+          code: 'NOT_FOUND',
+          message: 'El adelanto indicado no existe.'
+        })
+      };
+    }
+
+    const adelantoScope = adelantoScopeResult.rows[0];
+    const idEmpleadoAdelanto = parsePositiveInt(adelantoScope.id_empleado);
+    const saldoActual = Number(adelantoScope.saldo ?? 0);
+    const estadoActivo = adelantoScope.estado === true;
+
+    if (!idEmpleadoAdelanto) {
+      return {
+        status: 409,
+        body: buildErrorBody({
+          code: 'RELATION_ERROR',
+          message: 'El adelanto no tiene empleado asociado.'
+        })
+      };
+    }
+
+    if (!estadoActivo) {
+      return {
+        status: 409,
+        body: buildErrorBody({
+          code: 'ADELANTO_INACTIVO',
+          message: 'El adelanto esta inactivo o ya fue liquidado.'
+        })
+      };
+    }
+
+    if (!Number.isFinite(saldoActual) || saldoActual <= 0) {
+      return {
+        status: 409,
+        body: buildErrorBody({
+          code: 'ADELANTO_SIN_SALDO',
+          message: 'El adelanto no tiene saldo disponible.'
+        })
+      };
+    }
+
+    const montoAplicarEfectivo = Number.isFinite(montoAplicar) && montoAplicar > 0 ? montoAplicar : saldoActual;
+    if (!Number.isFinite(montoAplicarEfectivo) || montoAplicarEfectivo <= 0) {
+      return {
+        status: 400,
+        body: buildErrorBody({
+          code: 'VALIDATION_ERROR',
+          message: 'El monto a aplicar debe ser mayor que 0.'
+        })
+      };
+    }
+
+    if (montoAplicarEfectivo > saldoActual) {
+      return {
+        status: 409,
+        body: buildErrorBody({
+          code: 'ADELANTO_MONTO_INVALIDO',
+          message: 'El monto a aplicar no puede superar el saldo disponible del adelanto.'
+        })
+      };
+    }
+
+    const detalleScopeResult = await pool.query(
+      `
+        SELECT dp.id_detalle_planilla
+        FROM public.detalle_planilla dp
+        WHERE dp.id_planilla = $1
+          AND dp.id_empleado = $2
+        LIMIT 1
+      `,
+      [idPlanilla, idEmpleadoAdelanto]
+    );
+
+    if (!detalleScopeResult.rows?.length) {
+      return {
+        status: 409,
+        body: buildErrorBody({
+          code: 'PLANILLA_SCOPE_MISMATCH',
+          message: 'El empleado asociado al adelanto no pertenece a la planilla seleccionada.'
+        })
+      };
+    }
+
+    const idDetallePlanilla = parsePositiveInt(detalleScopeResult.rows[0].id_detalle_planilla);
+    if (!idDetallePlanilla) {
+      return {
+        status: 409,
+        body: buildErrorBody({
+          code: 'RELATION_ERROR',
+          message: 'No se pudo identificar el detalle de planilla del empleado para validar el adelanto.'
+        })
+      };
+    }
+    const netoDisponible = await resolveNetoDisponibleDetalle({
+      db: pool,
+      idDetallePlanilla,
+      idPlanilla,
+      idEmpleado: idEmpleadoAdelanto
+    });
+    try {
+      assertAdelantoDentroNetoDisponible(montoAplicarEfectivo, netoDisponible);
+    } catch (error) {
+      if (error?.httpStatus) {
+        return {
+          status: error.httpStatus,
+          body: buildErrorBody({
+            code: error.code || 'ADELANTO_NETO_INSUFICIENTE',
+            message: error.message
+          })
+        };
+      }
+      throw error;
+    }
+
     let data = null;
     try {
       const rows = await queryFunctionRows(PLANILLA_ENDPOINT_CONTRACT.aplicarAdelanto, [
         idAdelanto,
         idPlanilla,
-        montoAplicar
+        montoAplicarEfectivo
       ]);
       data = rows[0] || null;
     } catch (err) {
@@ -2042,7 +2419,7 @@ const planillaService = {
         data = await applyAdelantoFallback({
           idAdelanto,
           idPlanilla,
-          montoAplicar
+          montoAplicar: montoAplicarEfectivo
         });
       } else {
         throw err;
@@ -2097,6 +2474,16 @@ const planillaService = {
       };
     }
 
+    if (req.body?.fecha !== undefined && fecha && isFutureDateInput(req.body?.fecha)) {
+      return {
+        status: 400,
+        body: buildErrorBody({
+          code: 'VALIDATION_ERROR',
+          message: 'La fecha no puede ser mayor al dia actual.'
+        })
+      };
+    }
+
     const scopeValidation = await validatePlanillaSucursalScope(idPlanilla, req.body?.id_sucursal);
     if (!scopeValidation.ok) {
       return { status: scopeValidation.status, body: scopeValidation.body };
@@ -2112,6 +2499,38 @@ const planillaService = {
           message: 'El empleado no pertenece al detalle de la planilla seleccionada.'
         })
       };
+    }
+
+    const detalleEmpleado = (detalleRows || []).find((row) => parsePositiveInt(row.id_empleado) === idEmpleado);
+    const idDetallePlanilla = parsePositiveInt(detalleEmpleado?.id_detalle_planilla);
+    if (!idDetallePlanilla) {
+      return {
+        status: 409,
+        body: buildErrorBody({
+          code: 'RELATION_ERROR',
+          message: 'No se pudo identificar el detalle de planilla del empleado para validar el adelanto.'
+        })
+      };
+    }
+    const netoDisponible = await resolveNetoDisponibleDetalle({
+      db: pool,
+      idDetallePlanilla,
+      idPlanilla,
+      idEmpleado
+    });
+    try {
+      assertAdelantoDentroNetoDisponible(monto, netoDisponible);
+    } catch (error) {
+      if (error?.httpStatus) {
+        return {
+          status: error.httpStatus,
+          body: buildErrorBody({
+            code: error.code || 'ADELANTO_NETO_INSUFICIENTE',
+            message: error.message
+          })
+        };
+      }
+      throw error;
     }
 
     const insertResult = await pool.query(
@@ -2190,6 +2609,16 @@ const planillaService = {
       };
     }
 
+    if (req.body?.fecha !== undefined && fecha && isFutureDateInput(req.body?.fecha)) {
+      return {
+        status: 400,
+        body: buildErrorBody({
+          code: 'VALIDATION_ERROR',
+          message: 'La fecha no puede ser mayor al dia actual.'
+        })
+      };
+    }
+
     const scopeValidation = await validatePlanillaSucursalScope(idPlanilla, req.body?.id_sucursal);
     if (!scopeValidation.ok) {
       return { status: scopeValidation.status, body: scopeValidation.body };
@@ -2254,6 +2683,23 @@ const planillaService = {
           'PLANILLA_SCOPE_MISMATCH'
         );
       }
+
+      const detalleEmpleado = (detalleRows || []).find((row) => parsePositiveInt(row.id_empleado) === idEmpleado);
+      const idDetallePlanilla = parsePositiveInt(detalleEmpleado?.id_detalle_planilla);
+      if (!idDetallePlanilla) {
+        throw createRequestError(
+          'No se pudo identificar el detalle de planilla del empleado para validar el adelanto.',
+          409,
+          'RELATION_ERROR'
+        );
+      }
+      const netoDisponible = await resolveNetoDisponibleDetalle({
+        db: client,
+        idDetallePlanilla,
+        idPlanilla,
+        idEmpleado
+      });
+      assertAdelantoDentroNetoDisponible(monto, netoDisponible);
 
       if (scopeValidation.idSucursal && idSucursalAdelanto && scopeValidation.idSucursal !== idSucursalAdelanto) {
         throw createRequestError(
@@ -2751,6 +3197,10 @@ const planillaService = {
       };
     }
 
+    await syncDetalleSalarioBaseFromEmpleado({
+      idPlanilla,
+      idDetallePlanilla: idDetalle
+    });
     const netoActualizado = await queryFunctionScalar(PLANILLA_ENDPOINT_CONTRACT.recalcularDetalle, [idDetalle]);
 
     return {
