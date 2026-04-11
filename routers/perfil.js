@@ -75,11 +75,21 @@ router.get('/perfil', async (req, res) => {
     `;
     const ultimo = await pool.query(sqlUltimoAcceso, [idUsuario]);
 
+    // Conteo historico de sesiones exitosas del usuario
+    const sqlSesionesTotales = `
+      SELECT COUNT(*)::int AS total
+      FROM logins
+      WHERE id_usuario = $1 AND exito = TRUE
+    `;
+    const sesionesTotalesRes = await pool.query(sqlSesionesTotales, [idUsuario]);
+    const sesionesTotales = Number(sesionesTotalesRes.rows[0]?.total || 0);
+
     return res.json({
       error: false,
       perfil: perfil.rows[0],
       roles: roles.rows,
-      ultimo_acceso: ultimo.rows[0] || null
+      ultimo_acceso: ultimo.rows[0] || null,
+      sesiones_totales: sesionesTotales
     });
   } catch (err) {
     console.error('GET /perfil error:', err);
