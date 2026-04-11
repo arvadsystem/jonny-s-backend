@@ -3,6 +3,7 @@ import pool from '../config/db-connection.js';
 import jwt from 'jsonwebtoken';
 import crypto from 'crypto';
 import { authRequired } from '../middleware/auth.js';
+import { requireActiveSession } from '../middleware/requireActiveSession.js';
 import { loginLimiter } from '../middleware/rateLimiter.js';
 import JWT_SECRET from '../config/jwt.js';
 
@@ -302,7 +303,7 @@ router.post('/logout', authRequired, async (req, res) => {
   return res.json({ message: 'Logout exitoso' });
 });
 
-router.get('/me', authRequired, async (req, res) => {
+router.get('/me', authRequired, requireActiveSession, async (req, res) => {
   // Re-emite CSRF por si el frontend refresca y lo perdió
   const csrfToken = issueCsrf(res);
   const usuario = { ...(req.user || {}) };
