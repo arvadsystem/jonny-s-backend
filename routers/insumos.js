@@ -2,11 +2,19 @@ import express from 'express';
 import pool from '../config/db-connection.js';
 import { attachImagenPrincipalUrls } from '../utils/uploads.js';
 import { validarYDescontarPedido } from '../services/inventarioPedidoService.js';
+import { checkPermission } from '../middleware/checkPermission.js';
 
 const router = express.Router();
+const INSUMOS_LIST_PERMISSIONS = ['INVENTARIO_INSUMOS_VER'];
+const INSUMOS_CREATE_PERMISSIONS = ['INVENTARIO_INSUMOS_CREAR'];
+const INSUMOS_EDIT_PERMISSIONS = ['INVENTARIO_INSUMOS_EDITAR'];
+const INSUMOS_STATE_PERMISSIONS = ['INVENTARIO_INSUMOS_ESTADO_CAMBIAR'];
+const INSUMOS_DELETE_PERMISSIONS = ['INVENTARIO_INSUMOS_ELIMINAR'];
 const SQLSTATE_UNDEFINED_TABLE = '42P01';
+const INSUMOS_ALMACENES_TABLE_MISSING_CODE = 'INSUMOS_ALMACENES_TABLE_MISSING';
+const INSUMOS_ALMACENES_TABLE_MISSING_MESSAGE = 'Falta una estructura requerida del sistema: tabla public.insumos_almacenes. Aplica las migraciones pendientes.';
 const INSUMOS_DUPLICATE_CONSTRAINT = 'uq_insumos_nombre_categoria_unidad_norm';
-const INSUMOS_DUPLICATE_MESSAGE = 'Ya existe un insumo con el mismo nombre, categoría y unidad de medida.';
+const INSUMOS_DUPLICATE_MESSAGE = 'Ya existe un insumo con ese nombre en el almacén seleccionado.';
 const SINGLE_ALMACEN_TEMP_MESSAGE = 'Temporalmente solo se permite un almacén por producto o insumo.';
 
 // AM: allowlist de campos permitidos para alta/edicion controlada de insumos.
@@ -23,8 +31,20 @@ const CAMPOS_PERMITIDOS_INSUMOS_POST = new Set([
   'id_unidad_medida',
   'fecha_caducidad',
   'descripcion',
-  'estado',
   'id_archivo_imagen_principal'
+]);
+const CAMPOS_PERMITIDOS_INSUMOS_PUT_EDICION = new Set([
+  'nombre_insumo',
+  'precio',
+  'stock_minimo',
+  'fecha_ingreso_insumo',
+  'id_almacen',
+  'id_categoria_insumo',
+  'id_unidad_medida',
+  'fecha_caducidad',
+  'descripcion',
+  'id_archivo_imagen_principal',
+  'id_insumo'
 ]);
 
 // NEW: permite incluir inactivos solo cuando el cliente lo solicita explicitamente.
@@ -145,10 +165,49 @@ const toDateOnlyString = (value) => {
   return raw;
 };
 
+const sanitizeOptionalText = (value) => {
+  if (value === undefined || value === null) return '';
+  return String(value).trim();
+};
+
+const validateOptionalDateInput = (rawValue, fieldName) => {
+  const value = sanitizeOptionalText(rawValue);
+  if (value === '') return { ok: true, value: '' };
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) {
+    return { ok: false, message: `${fieldName} debe tener formato YYYY-MM-DD.` };
+  }
+
+  const [year, month, day] = value.split('-').map((part) => Number.parseInt(part, 10));
+  const probe = new Date(Date.UTC(year, month - 1, day));
+  const isValid =
+    probe.getUTCFullYear() === year &&
+    probe.getUTCMonth() === (month - 1) &&
+    probe.getUTCDate() === day;
+  if (!isValid) {
+    return { ok: false, message: `${fieldName} no es una fecha valida.` };
+  }
+
+  return { ok: true, value };
+};
+
 // NEW: mensaje seguro para no exponer errores crudos de BD.
 // WHY: alinear manejo de errores con UX y evitar detalles internos.
 // IMPACT: no cambia contratos exitosos ni status codes de validacion.
 const safeServerErrorMessage = (fallback = 'No se pudo completar la accion. Verifica los datos e intenta de nuevo.') => fallback;
+
+const isMissingInsumosAlmacenesTableError = (error) => {
+  if (error?.code !== SQLSTATE_UNDEFINED_TABLE) return false;
+  const trace = String(error?.table || error?.message || error?.detail || '').toLowerCase();
+  return trace.includes('insumos_almacenes');
+};
+
+const buildInsumosAlmacenesTableMissingError = (error) => {
+  const wrapped = new Error(INSUMOS_ALMACENES_TABLE_MISSING_MESSAGE);
+  wrapped.code = INSUMOS_ALMACENES_TABLE_MISSING_CODE;
+  wrapped.status = 500;
+  wrapped.cause = error;
+  return wrapped;
+};
 
 const getInsumosConstraintConflictMessage = (err) => {
   if (!err || err.code !== '23505') return '';
@@ -359,8 +418,6 @@ const getInsumoById = async (insumoId, db = pool) => {
 const findInsumoByUniqueKey = async (
   {
     nombre_insumo,
-    id_categoria_insumo,
-    id_unidad_medida,
     id_almacen,
     excludeId = null
   },
@@ -368,8 +425,6 @@ const findInsumoByUniqueKey = async (
 ) => {
   const params = [
     String(nombre_insumo ?? '').trim().toLowerCase(),
-    id_categoria_insumo ?? null,
-    id_unidad_medida ?? null,
     id_almacen
   ];
 
@@ -377,20 +432,13 @@ const findInsumoByUniqueKey = async (
     SELECT id_insumo
     FROM insumos
     WHERE lower(trim(nombre_insumo)) = $1
-      AND (
-        (id_categoria_insumo IS NULL AND $2::integer IS NULL)
-        OR id_categoria_insumo = $2::integer
-      )
-      AND (
-        (id_unidad_medida IS NULL AND $3::integer IS NULL)
-        OR id_unidad_medida = $3::integer
-      )
-      AND id_almacen = $4
+      AND id_almacen = $2
+      AND COALESCE(estado, true) = true
   `;
 
   if (excludeId !== null && excludeId !== undefined) {
     params.push(excludeId);
-    sql += ' AND id_insumo <> $5';
+    sql += ' AND id_insumo <> $3';
   }
 
   sql += ' ORDER BY id_insumo DESC LIMIT 1';
@@ -473,8 +521,10 @@ const syncInsumoAlmacenes = async (idInsumo, idAlmacenes, db = pool) => {
       [idInsumo, singleAlmacenIds]
     );
   } catch (error) {
-    // AM: fallback legacy cuando la tabla de asignaciones aun no existe.
-    if (error?.code !== SQLSTATE_UNDEFINED_TABLE) throw error;
+    if (isMissingInsumosAlmacenesTableError(error)) {
+      throw buildInsumosAlmacenesTableMissingError(error);
+    }
+    throw error;
   }
 };
 
@@ -536,14 +586,10 @@ const attachInsumoAlmacenes = async (rows, db = pool) => {
       };
     });
   } catch (error) {
-    if (error?.code !== SQLSTATE_UNDEFINED_TABLE) throw error;
-    return list.map((row) => {
-      const fallbackSingle = Number.parseInt(String(row?.id_almacen ?? ''), 10);
-      return {
-        ...row,
-        id_almacenes: isPositiveIntegerId(fallbackSingle) ? [fallbackSingle] : []
-      };
-    });
+    if (isMissingInsumosAlmacenesTableError(error)) {
+      throw buildInsumosAlmacenesTableMissingError(error);
+    }
+    throw error;
   }
 };
 
@@ -582,7 +628,7 @@ const updateInsumoCompleto = async (insumoId, data, db = pool) => {
 };
 
 // GET: Obtener insumos
-router.get('/insumos', async (req, res) => {
+router.get('/insumos', checkPermission(INSUMOS_LIST_PERMISSIONS), async (req, res) => {
   try {
     const tabla = 'insumos';
 
@@ -608,18 +654,27 @@ router.get('/insumos', async (req, res) => {
 
   } catch (err) {
     console.error('Error al obtener insumos:', err.message);
+    if (err?.code === INSUMOS_ALMACENES_TABLE_MISSING_CODE) {
+      return res.status(500).json({ error: true, message: INSUMOS_ALMACENES_TABLE_MISSING_MESSAGE });
+    }
     res.status(500).json({ error: true, message: safeServerErrorMessage('No se pudieron cargar los insumos.') });
   }
 });
 
 // POST: Crear insumo
-router.post('/insumos', async (req, res) => {
+router.post('/insumos', checkPermission(INSUMOS_CREATE_PERMISSIONS), async (req, res) => {
   const client = await pool.connect();
   try {
-    const tabla = 'insumos';
     const datos = req.body && typeof req.body === 'object' ? { ...req.body } : null;
     if (!datos || Array.isArray(datos)) {
       return res.status(400).json({ error: true, message: 'Payload invalido para crear insumo.' });
+    }
+
+    if (Object.prototype.hasOwnProperty.call(datos, 'estado')) {
+      return res.status(400).json({
+        error: true,
+        message: 'El estado no puede enviarse en este formulario. Use el flujo de activacion/inactivacion.'
+      });
     }
 
     const keys = Object.keys(datos);
@@ -643,6 +698,52 @@ router.post('/insumos', async (req, res) => {
     const payloadBase = { ...datos };
     delete payloadBase.id_almacenes;
     payloadBase.id_almacen = idAlmacenes[0];
+
+    const nombreInsumo = sanitizeOptionalText(payloadBase?.nombre_insumo);
+    if (nombreInsumo === '') {
+      return res.status(400).json({ error: true, message: 'nombre_insumo es obligatorio.' });
+    }
+    if (nombreInsumo.length < 2 || nombreInsumo.length > 80) {
+      return res.status(400).json({ error: true, message: 'nombre_insumo debe tener entre 2 y 80 caracteres.' });
+    }
+
+    const precioRaw = payloadBase?.precio;
+    if (precioRaw === undefined || precioRaw === null || String(precioRaw).trim() === '') {
+      return res.status(400).json({ error: true, message: 'precio es obligatorio.' });
+    }
+    const precio = Number(precioRaw);
+    if (!Number.isFinite(precio) || precio < 0) {
+      return res.status(400).json({ error: true, message: 'precio debe ser un numero mayor o igual a 0.' });
+    }
+
+    const cantidadRaw = payloadBase?.cantidad;
+    if (cantidadRaw === undefined || cantidadRaw === null || String(cantidadRaw).trim() === '') {
+      return res.status(400).json({ error: true, message: 'cantidad es obligatoria.' });
+    }
+    const cantidad = Number(cantidadRaw);
+    if (!Number.isFinite(cantidad) || !Number.isInteger(cantidad) || cantidad < 0) {
+      return res.status(400).json({ error: true, message: 'cantidad debe ser un entero mayor o igual a 0.' });
+    }
+
+    const stockMinimoRaw = payloadBase?.stock_minimo;
+    if (stockMinimoRaw === undefined || stockMinimoRaw === null || String(stockMinimoRaw).trim() === '') {
+      return res.status(400).json({ error: true, message: 'stock_minimo es obligatorio.' });
+    }
+    const stockMinimo = Number(stockMinimoRaw);
+    if (!Number.isInteger(stockMinimo) || stockMinimo < 0) {
+      return res.status(400).json({ error: true, message: 'stock_minimo debe ser un entero mayor o igual a 0.' });
+    }
+
+    const fechaIngresoValidation = validateOptionalDateInput(payloadBase?.fecha_ingreso_insumo, 'fecha_ingreso_insumo');
+    if (!fechaIngresoValidation.ok) {
+      return res.status(400).json({ error: true, message: fechaIngresoValidation.message });
+    }
+    const fechaCaducidadValidation = validateOptionalDateInput(payloadBase?.fecha_caducidad, 'fecha_caducidad');
+    if (!fechaCaducidadValidation.ok) {
+      return res.status(400).json({ error: true, message: fechaCaducidadValidation.message });
+    }
+    const hasDescripcion = Object.prototype.hasOwnProperty.call(payloadBase, 'descripcion');
+    const descripcion = hasDescripcion ? sanitizeOptionalText(payloadBase?.descripcion) : undefined;
 
     // NEW: valida categoria de insumo si el frontend la envia en alta.
     // WHY: proteger integridad de referencia sin depender solo de la FK.
@@ -675,6 +776,20 @@ router.post('/insumos', async (req, res) => {
     }
 
     const payload = { ...payloadBase };
+    payload.nombre_insumo = nombreInsumo;
+    payload.precio = precio;
+    payload.estado = true;
+    payload.cantidad = cantidad;
+    payload.stock_minimo = stockMinimo;
+    if (Object.prototype.hasOwnProperty.call(payloadBase, 'fecha_ingreso_insumo')) {
+      if (fechaIngresoValidation.value === '') delete payload.fecha_ingreso_insumo;
+      else payload.fecha_ingreso_insumo = fechaIngresoValidation.value;
+    }
+    if (Object.prototype.hasOwnProperty.call(payloadBase, 'fecha_caducidad')) {
+      if (fechaCaducidadValidation.value === '') delete payload.fecha_caducidad;
+      else payload.fecha_caducidad = fechaCaducidadValidation.value;
+    }
+    if (hasDescripcion) payload.descripcion = descripcion;
     if (categoriaValidation.id === null) delete payload.id_categoria_insumo;
     else payload.id_categoria_insumo = categoriaValidation.id;
     if (unidadValidation.id === null) delete payload.id_unidad_medida;
@@ -695,11 +810,10 @@ router.post('/insumos', async (req, res) => {
       }
     }
 
-    const duplicateGeneral = await findInsumoByGeneralKey(
+    const duplicateGeneral = await findInsumoByUniqueKey(
       {
         nombre_insumo: payload.nombre_insumo,
-        id_categoria_insumo: payload.id_categoria_insumo ?? null,
-        id_unidad_medida: payload.id_unidad_medida ?? null
+        id_almacen: idAlmacenes[0]
       },
       client
     );
@@ -713,20 +827,32 @@ router.post('/insumos', async (req, res) => {
     }
 
     const primaryPayload = { ...payload, id_almacen: idAlmacenes[0] };
-    const query = 'CALL pa_insert($1, $2)';
-    await client.query(query, [tabla, primaryPayload]);
-
-    const inserted = await findInsumoByUniqueKey(
-      {
-        nombre_insumo: primaryPayload.nombre_insumo,
-        id_categoria_insumo: primaryPayload.id_categoria_insumo ?? null,
-        id_unidad_medida: primaryPayload.id_unidad_medida ?? null,
-        id_almacen: primaryPayload.id_almacen
-      },
-      client
+    const INSERT_COLUMN_ORDER = [
+      'nombre_insumo',
+      'precio',
+      'cantidad',
+      'stock_minimo',
+      'fecha_ingreso_insumo',
+      'id_almacen',
+      'id_categoria_insumo',
+      'id_unidad_medida',
+      'fecha_caducidad',
+      'descripcion',
+      'estado',
+      'id_archivo_imagen_principal'
+    ];
+    const insertColumns = INSERT_COLUMN_ORDER.filter((column) =>
+      Object.prototype.hasOwnProperty.call(primaryPayload, column)
     );
-
-    const idInsumoCreado = Number.parseInt(String(inserted?.id_insumo ?? ''), 10);
+    const insertValues = insertColumns.map((column) => primaryPayload[column]);
+    const insertPlaceholders = insertColumns.map((_, index) => `$${index + 1}`).join(', ');
+    const insertQuery = `
+      INSERT INTO public.insumos (${insertColumns.join(', ')})
+      VALUES (${insertPlaceholders})
+      RETURNING id_insumo
+    `;
+    const inserted = await client.query(insertQuery, insertValues);
+    const idInsumoCreado = Number.parseInt(String(inserted?.rows?.[0]?.id_insumo ?? ''), 10);
     if (!isPositiveIntegerId(idInsumoCreado)) {
       await client.query('ROLLBACK');
       return res.status(500).json({
@@ -747,6 +873,9 @@ router.post('/insumos', async (req, res) => {
   } catch (err) {
     try { await client.query('ROLLBACK'); } catch {}
     console.error('Error al crear insumo:', err.message);
+    if (err?.code === INSUMOS_ALMACENES_TABLE_MISSING_CODE) {
+      return res.status(500).json({ error: true, message: INSUMOS_ALMACENES_TABLE_MISSING_MESSAGE });
+    }
     if (err?.code === '23505') {
       const duplicateMessage = getInsumosConstraintConflictMessage(err);
       if (duplicateMessage) {
@@ -760,26 +889,49 @@ router.post('/insumos', async (req, res) => {
   }
 });
 
-// AM: actualizacion completa del insumo sincronizando uno o varios almacenes en una sola transaccion.
-// AM: conserva `PUT /insumos` por campo y agrega flujo dedicado multi-almacen para crear/editar desde UI.
-router.put('/insumos/multi-almacen', async (req, res) => {
+// OBSOLETO: endpoint descontinuado de forma controlada (no eliminar por compatibilidad externa no confirmada).
+router.put('/insumos/multi-almacen', checkPermission(INSUMOS_EDIT_PERMISSIONS), async (_req, res) => {
+  return res.status(410).json({
+    error: true,
+    message: 'Este endpoint ha sido descontinuado. El sistema actual de Insumos ya no soporta multi-almacén.'
+  });
+});
+
+router.put('/insumos/edicion', checkPermission(INSUMOS_EDIT_PERMISSIONS), async (req, res) => {
   const client = await pool.connect();
   try {
-    const idInsumo = Number.parseInt(String(req.body?.id_insumo ?? ''), 10);
+    const datosEntrada = req.body && typeof req.body === 'object' && !Array.isArray(req.body) ? { ...req.body } : null;
+    if (!datosEntrada) {
+      return res.status(400).json({ error: true, message: 'Payload invalido para editar insumo.' });
+    }
+
+    const keys = Object.keys(datosEntrada);
+    const keysDesconocidas = keys.filter((k) => k !== 'estado' && !CAMPOS_PERMITIDOS_INSUMOS_PUT_EDICION.has(k));
+    if (keysDesconocidas.length > 0) {
+      return res.status(400).json({
+        error: true,
+        message: `Campos no permitidos: ${keysDesconocidas.join(', ')}`
+      });
+    }
+
+    const idInsumo = Number.parseInt(String(datosEntrada.id_insumo ?? ''), 10);
     if (!isPositiveIntegerId(idInsumo)) {
       return res.status(400).json({ error: true, message: 'id_insumo invalido.' });
     }
 
-    const actual = await getInsumoById(idInsumo, client);
-    if (!actual) {
-      return res.status(404).json({ error: true, message: 'Insumo no encontrado.' });
-    }
-    if (!isRowActive(actual)) {
-      return res.status(400).json({ error: true, message: 'El insumo esta inactivo.' });
+    if (Object.prototype.hasOwnProperty.call(datosEntrada, 'estado')) {
+      return res.status(400).json({
+        error: true,
+        message: 'El estado no puede editarse desde este modulo. Use el flujo de activacion/inactivacion.'
+      });
     }
 
-    const datosEntrada = req.body && typeof req.body === 'object' ? { ...req.body } : {};
-    delete datosEntrada.id_insumo;
+    if (Object.prototype.hasOwnProperty.call(datosEntrada, 'id_almacen')) {
+      return res.status(400).json({
+        error: true,
+        message: 'El almacén no puede modificarse desde la edición del insumo. Use un flujo de traslado o reasignación controlada.'
+      });
+    }
 
     if (Object.prototype.hasOwnProperty.call(datosEntrada, 'cantidad')) {
       return res.status(400).json({
@@ -788,13 +940,9 @@ router.put('/insumos/multi-almacen', async (req, res) => {
       });
     }
 
-    const keys = Object.keys(datosEntrada);
-    const keysDesconocidas = keys.filter((k) => !CAMPOS_PERMITIDOS_INSUMOS_POST.has(k));
-    if (keysDesconocidas.length > 0) {
-      return res.status(400).json({
-        error: true,
-        message: `Campos no permitidos: ${keysDesconocidas.join(', ')}`
-      });
+    const actual = await getInsumoById(idInsumo, client);
+    if (!actual) {
+      return res.status(404).json({ error: true, message: 'Insumo no encontrado.' });
     }
 
     const merged = {
@@ -802,7 +950,9 @@ router.put('/insumos/multi-almacen', async (req, res) => {
       precio: datosEntrada.precio ?? actual.precio,
       cantidad: actual.cantidad,
       stock_minimo: datosEntrada.stock_minimo ?? actual.stock_minimo ?? 0,
-      fecha_ingreso_insumo: datosEntrada.fecha_ingreso_insumo ?? toDateOnlyString(actual.fecha_ingreso_insumo),
+      fecha_ingreso_insumo: Object.prototype.hasOwnProperty.call(datosEntrada, 'fecha_ingreso_insumo')
+        ? datosEntrada.fecha_ingreso_insumo
+        : toDateOnlyString(actual.fecha_ingreso_insumo),
       id_almacen: datosEntrada.id_almacen ?? actual.id_almacen,
       id_categoria_insumo: Object.prototype.hasOwnProperty.call(datosEntrada, 'id_categoria_insumo')
         ? datosEntrada.id_categoria_insumo
@@ -810,11 +960,13 @@ router.put('/insumos/multi-almacen', async (req, res) => {
       id_unidad_medida: Object.prototype.hasOwnProperty.call(datosEntrada, 'id_unidad_medida')
         ? datosEntrada.id_unidad_medida
         : actual.id_unidad_medida,
-      fecha_caducidad: datosEntrada.fecha_caducidad ?? toDateOnlyString(actual.fecha_caducidad),
-      descripcion: datosEntrada.descripcion ?? actual.descripcion ?? '',
-      estado: Object.prototype.hasOwnProperty.call(datosEntrada, 'estado')
-        ? datosEntrada.estado
-        : (actual.estado ?? true),
+      fecha_caducidad: Object.prototype.hasOwnProperty.call(datosEntrada, 'fecha_caducidad')
+        ? datosEntrada.fecha_caducidad
+        : toDateOnlyString(actual.fecha_caducidad),
+      descripcion: Object.prototype.hasOwnProperty.call(datosEntrada, 'descripcion')
+        ? datosEntrada.descripcion
+        : (actual.descripcion ?? ''),
+      estado: actual.estado ?? true,
       id_archivo_imagen_principal: Object.prototype.hasOwnProperty.call(datosEntrada, 'id_archivo_imagen_principal')
         ? datosEntrada.id_archivo_imagen_principal
         : actual.id_archivo_imagen_principal
@@ -848,6 +1000,14 @@ router.put('/insumos/multi-almacen', async (req, res) => {
     if (!Number.isInteger(stockMinimo) || stockMinimo < 0) {
       return res.status(400).json({ error: true, message: 'stock_minimo debe ser un entero mayor o igual a 0.' });
     }
+    const fechaIngresoValidation = validateOptionalDateInput(merged.fecha_ingreso_insumo, 'fecha_ingreso_insumo');
+    if (!fechaIngresoValidation.ok) {
+      return res.status(400).json({ error: true, message: fechaIngresoValidation.message });
+    }
+    const fechaCaducidadValidation = validateOptionalDateInput(merged.fecha_caducidad, 'fecha_caducidad');
+    if (!fechaCaducidadValidation.ok) {
+      return res.status(400).json({ error: true, message: fechaCaducidadValidation.message });
+    }
 
     const categoriaValidation = await validateCategoriaInsumoActiva(merged.id_categoria_insumo, client);
     if (!categoriaValidation.ok) {
@@ -876,23 +1036,13 @@ router.put('/insumos/multi-almacen', async (req, res) => {
       });
     }
 
-    const almacenesParse = parseIdAlmacenes(merged.id_almacen, datosEntrada.id_almacenes);
-    if (!almacenesParse.ok || !Array.isArray(almacenesParse.ids) || almacenesParse.ids.length === 0) {
-      return res.status(400).json({
+    const idAlmacen = Number.parseInt(String(merged.id_almacen ?? ''), 10);
+    const almacenValidation = await validateAlmacenActivo(idAlmacen, client);
+    if (!almacenValidation.ok) {
+      return res.status(almacenValidation.status || 400).json({
         error: true,
-        message: almacenesParse.message || 'Debe seleccionar al menos un id_almacen.'
+        message: almacenValidation.message
       });
-    }
-    const idAlmacenes = almacenesParse.ids;
-
-    for (const idAlmacen of idAlmacenes) {
-      const almacenValidation = await validateAlmacenActivo(idAlmacen, client);
-      if (!almacenValidation.ok) {
-        return res.status(400).json({
-          error: true,
-          message: almacenValidation.message
-        });
-      }
     }
 
     const normalized = {
@@ -900,10 +1050,11 @@ router.put('/insumos/multi-almacen', async (req, res) => {
       precio,
       cantidad,
       stock_minimo: stockMinimo,
-      fecha_ingreso_insumo: String(merged.fecha_ingreso_insumo ?? '').trim(),
+      fecha_ingreso_insumo: fechaIngresoValidation.value,
+      id_almacen: almacenValidation.id,
       id_categoria_insumo: categoriaValidation.id,
       id_unidad_medida: unidadValidation.id,
-      fecha_caducidad: String(merged.fecha_caducidad ?? '').trim(),
+      fecha_caducidad: fechaCaducidadValidation.value,
       descripcion: String(merged.descripcion ?? '').trim(),
       estado: merged.estado === true || merged.estado === 'true' || merged.estado === 1 || merged.estado === '1',
       id_archivo_imagen_principal: archivoValidation.id
@@ -911,16 +1062,14 @@ router.put('/insumos/multi-almacen', async (req, res) => {
 
     await client.query('BEGIN');
 
-    const duplicateGeneral = await findInsumoByGeneralKey(
+    const duplicateGeneral = await findInsumoByUniqueKey(
       {
         nombre_insumo: normalized.nombre_insumo,
-        id_categoria_insumo: normalized.id_categoria_insumo,
-        id_unidad_medida: normalized.id_unidad_medida,
+        id_almacen: normalized.id_almacen,
         excludeId: idInsumo
       },
       client
     );
-
     if (duplicateGeneral) {
       await client.query('ROLLBACK');
       return res.status(409).json({
@@ -929,20 +1078,20 @@ router.put('/insumos/multi-almacen', async (req, res) => {
       });
     }
 
-    const primaryAlmacen = idAlmacenes[0];
-    const primaryPayload = { ...normalized, id_almacen: primaryAlmacen };
-    await updateInsumoCompleto(idInsumo, primaryPayload, client);
-    await syncInsumoAlmacenes(idInsumo, idAlmacenes, client);
+    await updateInsumoCompleto(idInsumo, normalized, client);
+    await syncInsumoAlmacenes(idInsumo, [normalized.id_almacen], client);
 
     await client.query('COMMIT');
     return res.status(200).json({
-      message: `Insumo actualizado y asignado en ${idAlmacenes.length} almacen(es).`,
-      id_insumo: idInsumo,
-      id_almacenes: idAlmacenes
+      message: 'Insumo actualizado correctamente.',
+      id_insumo: idInsumo
     });
   } catch (err) {
     try { await client.query('ROLLBACK'); } catch {}
-    console.error('Error en PUT /insumos/multi-almacen:', err.message);
+    console.error('Error en PUT /insumos/edicion:', err.message);
+    if (err?.code === INSUMOS_ALMACENES_TABLE_MISSING_CODE) {
+      return res.status(500).json({ error: true, message: INSUMOS_ALMACENES_TABLE_MISSING_MESSAGE });
+    }
     if (err?.code === '23505') {
       const duplicateMessage = getInsumosConstraintConflictMessage(err);
       if (duplicateMessage) {
@@ -957,9 +1106,21 @@ router.put('/insumos/multi-almacen', async (req, res) => {
 });
 
 // PUT: Actualizar insumo (1 campo)
-router.put('/insumos', async (req, res) => {
+router.put('/insumos', checkPermission(INSUMOS_EDIT_PERMISSIONS), async (req, res) => {
   try {
     const { campo, valor, id_campo, id_valor } = req.body || {};
+    const CAMPOS_GENERICOS_ACTUALIZABLES = new Set([
+      'nombre_insumo',
+      'precio',
+      'stock_minimo',
+      'fecha_ingreso_insumo',
+      'id_categoria_insumo',
+      'id_unidad_medida',
+      'fecha_caducidad',
+      'descripcion',
+      'id_archivo_imagen_principal'
+    ]);
+    const ID_CAMPOS_PERMITIDOS = new Set(['id_insumo']);
 
     if (!campo || valor === undefined || !id_campo || id_valor === undefined) {
       return res.status(400).json({ error: true, message: 'Faltan campos obligatorios' });
@@ -975,7 +1136,72 @@ router.put('/insumos', async (req, res) => {
     // NEW: valida categoria de insumo solo cuando se intenta actualizar ese campo.
     // WHY: mantener PUT genérico pero asegurando coherencia con `categorias_insumos.estado`.
     // IMPACT: no afecta updates de otros campos.
+    if (campo === 'estado') {
+      return res.status(400).json({
+        error: true,
+        message: 'El estado no puede editarse desde este modulo. Use el flujo de activacion/inactivacion.'
+      });
+    }
+
+    if (campo === 'id_almacen') {
+      return res.status(400).json({
+        error: true,
+        message: 'El almacén no puede modificarse desde la edición del insumo. Use un flujo de traslado o reasignación controlada.'
+      });
+    }
+
     let valorNormalizado = valor;
+
+    if (campo === 'nombre_insumo') {
+      const nombreInsumo = sanitizeOptionalText(valorNormalizado);
+      if (nombreInsumo === '') {
+        return res.status(400).json({ error: true, message: 'nombre_insumo es obligatorio.' });
+      }
+      if (nombreInsumo.length < 2 || nombreInsumo.length > 80) {
+        return res.status(400).json({ error: true, message: 'nombre_insumo debe tener entre 2 y 80 caracteres.' });
+      }
+      valorNormalizado = nombreInsumo;
+    }
+
+    if (campo === 'precio') {
+      const precioRaw = valorNormalizado;
+      if (precioRaw === undefined || precioRaw === null || String(precioRaw).trim() === '') {
+        return res.status(400).json({ error: true, message: 'precio debe ser un numero mayor o igual a 0.' });
+      }
+      const precio = Number(precioRaw);
+      if (!Number.isFinite(precio) || precio < 0) {
+        return res.status(400).json({ error: true, message: 'precio debe ser un numero mayor o igual a 0.' });
+      }
+      valorNormalizado = precio;
+    }
+
+    if (campo === 'stock_minimo') {
+      const stockMinimoRaw = valorNormalizado;
+      if (stockMinimoRaw === undefined || stockMinimoRaw === null || String(stockMinimoRaw).trim() === '') {
+        return res.status(400).json({ error: true, message: 'stock_minimo debe ser un entero mayor o igual a 0.' });
+      }
+      const stockMinimo = Number(stockMinimoRaw);
+      if (!Number.isInteger(stockMinimo) || stockMinimo < 0) {
+        return res.status(400).json({ error: true, message: 'stock_minimo debe ser un entero mayor o igual a 0.' });
+      }
+      valorNormalizado = stockMinimo;
+    }
+
+    if (campo === 'fecha_ingreso_insumo') {
+      const fechaIngresoValidation = validateOptionalDateInput(valorNormalizado, 'fecha_ingreso_insumo');
+      if (!fechaIngresoValidation.ok) {
+        return res.status(400).json({ error: true, message: fechaIngresoValidation.message });
+      }
+      valorNormalizado = fechaIngresoValidation.value === '' ? null : fechaIngresoValidation.value;
+    }
+
+    if (campo === 'fecha_caducidad') {
+      const fechaCaducidadValidation = validateOptionalDateInput(valorNormalizado, 'fecha_caducidad');
+      if (!fechaCaducidadValidation.ok) {
+        return res.status(400).json({ error: true, message: fechaCaducidadValidation.message });
+      }
+      valorNormalizado = fechaCaducidadValidation.value === '' ? null : fechaCaducidadValidation.value;
+    }
 
     if (campo === 'id_categoria_insumo') {
       const categoriaValidation = await validateCategoriaInsumoActiva(valor);
@@ -1013,25 +1239,29 @@ router.put('/insumos', async (req, res) => {
       valorNormalizado = archivoValidation.id;
     }
 
-    if (campo === 'id_almacen') {
+    if (campo === 'nombre_insumo') {
       const idInsumo = Number.parseInt(String(id_valor ?? ''), 10);
-      if (!isPositiveIntegerId(idInsumo)) {
-        return res.status(400).json({ error: true, message: 'id_valor debe ser un entero mayor a 0.' });
-      }
+      if (isPositiveIntegerId(idInsumo)) {
+        const insumoActualParaDuplicado = await getInsumoById(idInsumo, pool);
+        if (insumoActualParaDuplicado) {
+          const nombreFinal = String(valorNormalizado ?? '');
+          const idAlmacenFinal = Number.parseInt(String(insumoActualParaDuplicado.id_almacen ?? ''), 10);
 
-      const insumoActual = await getInsumoById(idInsumo, pool);
-      if (!insumoActual) {
-        return res.status(404).json({ error: true, message: 'Insumo no encontrado.' });
+          if (String(nombreFinal).trim() !== '' && isPositiveIntegerId(idAlmacenFinal)) {
+            const duplicateByNombreAlmacen = await findInsumoByUniqueKey(
+              {
+                nombre_insumo: nombreFinal,
+                id_almacen: idAlmacenFinal,
+                excludeId: idInsumo
+              },
+              pool
+            );
+            if (duplicateByNombreAlmacen) {
+              return res.status(409).json({ error: true, message: INSUMOS_DUPLICATE_MESSAGE });
+            }
+          }
+        }
       }
-      if (!isRowActive(insumoActual)) {
-        return res.status(400).json({ error: true, message: 'El insumo esta inactivo.' });
-      }
-
-      const almacenValidation = await validateAlmacenActivo(valorNormalizado, pool);
-      if (!almacenValidation.ok) {
-        return res.status(almacenValidation.status || 400).json({ error: true, message: almacenValidation.message });
-      }
-      valorNormalizado = almacenValidation.id;
     }
 
     // NEW: cuando una FK opcional se limpia, se persiste `NULL` real para mantener coherencia con la BD.
@@ -1041,22 +1271,23 @@ router.put('/insumos', async (req, res) => {
       return res.status(200).json({ message: 'Insumo actualizado correctamente.' });
     }
 
-    const tabla = 'insumos';
-    const query = 'CALL pa_update($1, $2, $3, $4, $5)';
-    await pool.query(query, [tabla, campo, String(valorNormalizado), id_campo, String(id_valor)]);
-
-    if (campo === 'id_almacen') {
-      // AM: mantiene alineada la tabla de asignaciones cuando el endpoint legacy cambia el almacen primario.
-      const insumoId = Number.parseInt(String(id_valor ?? ''), 10);
-      if (isPositiveIntegerId(insumoId) && isPositiveIntegerId(valorNormalizado)) {
-        await syncInsumoAlmacenes(insumoId, [valorNormalizado], pool);
-      }
+    if (!CAMPOS_GENERICOS_ACTUALIZABLES.has(campo)) {
+      return res.status(400).json({ error: true, message: 'campo no permitido para actualizacion.' });
     }
+    if (!ID_CAMPOS_PERMITIDOS.has(id_campo)) {
+      return res.status(400).json({ error: true, message: 'id_campo no permitido para actualizacion.' });
+    }
+
+    const query = `UPDATE public.insumos SET ${campo} = $1 WHERE ${id_campo} = $2`;
+    await pool.query(query, [valorNormalizado, id_valor]);
 
     res.status(200).json({ message: 'Insumo actualizado correctamente.' });
 
   } catch (err) {
     console.error('Error al actualizar insumo:', err.message);
+    if (err?.code === INSUMOS_ALMACENES_TABLE_MISSING_CODE) {
+      return res.status(500).json({ error: true, message: INSUMOS_ALMACENES_TABLE_MISSING_MESSAGE });
+    }
     if (err?.code === '23505') {
       const duplicateMessage = getInsumosConstraintConflictMessage(err);
       if (duplicateMessage) {
@@ -1068,8 +1299,52 @@ router.put('/insumos', async (req, res) => {
   }
 });
 
+// PATCH: Cambiar estado de insumo (flujo dedicado activar/inactivar)
+router.patch('/insumos/estado', checkPermission(INSUMOS_STATE_PERMISSIONS), async (req, res) => {
+  try {
+    const idInsumo = Number.parseInt(String(req.body?.id_insumo ?? ''), 10);
+    if (!isPositiveIntegerId(idInsumo)) {
+      return res.status(400).json({ error: true, message: 'id_insumo invalido.' });
+    }
+
+    const rawEstado = req.body?.estado;
+    if (rawEstado === undefined || rawEstado === null || String(rawEstado).trim() === '') {
+      return res.status(400).json({ error: true, message: 'estado es obligatorio.' });
+    }
+
+    const rawEstadoText = String(rawEstado).trim().toLowerCase();
+    let nextEstado = null;
+    if (rawEstado === true || rawEstado === 1 || rawEstado === '1' || rawEstadoText === 'true') nextEstado = true;
+    if (rawEstado === false || rawEstado === 0 || rawEstado === '0' || rawEstadoText === 'false') nextEstado = false;
+    if (nextEstado === null) {
+      return res.status(400).json({ error: true, message: 'estado debe ser boolean (true/false o 1/0).' });
+    }
+    if (nextEstado === false) {
+      return res.status(400).json({
+        error: true,
+        message: 'Para inactivar use el flujo de eliminacion/inactivacion existente (DELETE /insumos).'
+      });
+    }
+
+    const actual = await getInsumoById(idInsumo, pool);
+    if (!actual) {
+      return res.status(404).json({ error: true, message: 'Insumo no encontrado.' });
+    }
+
+    const query = 'UPDATE public.insumos SET estado = $1 WHERE id_insumo = $2';
+    await pool.query(query, [nextEstado, idInsumo]);
+
+    return res.status(200).json({
+      message: 'Insumo activado.'
+    });
+  } catch (err) {
+    console.error('Error al actualizar estado de insumo:', err.message);
+    return res.status(500).json({ error: true, message: safeServerErrorMessage() });
+  }
+});
+
 // DELETE: Inactivar insumo (soft delete)
-router.delete('/insumos', async (req, res) => {
+router.delete('/insumos', checkPermission(INSUMOS_DELETE_PERMISSIONS), async (req, res) => {
   try {
     const { columna_id, valor_id } = req.body || {};
 
@@ -1097,9 +1372,8 @@ router.delete('/insumos', async (req, res) => {
       return res.status(404).json({ error: true, message: 'Insumo no encontrado.' });
     }
 
-    const tabla = 'insumos';
-    const query = 'CALL pa_update($1, $2, $3, $4, $5)';
-    await pool.query(query, [tabla, 'estado', 'false', columna_id, String(insumoId)]);
+    const query = 'UPDATE public.insumos SET estado = false WHERE id_insumo = $1';
+    await pool.query(query, [insumoId]);
 
     res.status(200).json({ error: false, message: 'Insumo inactivado.' });
 

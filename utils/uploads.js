@@ -11,12 +11,16 @@ const __dirname = path.dirname(__filename);
 export const UPLOADS_DIR = path.resolve(__dirname, '..', 'uploads');
 export const UPLOADS_PUBLIC_PREFIX = '/uploads';
 export const INVENTARIO_UPLOADS_SUBDIR = 'inventario';
-export const MAX_IMAGE_BYTES = 6 * 1024 * 1024;
+export const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
 export const MAX_IMAGE_JSON_LIMIT = '10mb';
 
 // NEW: configuracion de Supabase Storage.
 export const SUPABASE_ASSETS_BUCKET = 'jonnys-assets'; // Publico
 export const SUPABASE_ADMIN_BUCKET = 'admin-docs';     // Privado (RLS)
+export const MAX_FILE_BYTES_BY_BUCKET = Object.freeze({
+  [SUPABASE_ASSETS_BUCKET]: 5 * 1024 * 1024,
+  [SUPABASE_ADMIN_BUCKET]: 10 * 1024 * 1024
+});
 
 // NEW: subdirectorios para organizacion interna
 export const ADMIN_UPLOADS_SUBDIR = 'documentos-admin';

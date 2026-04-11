@@ -4,6 +4,7 @@ import pool from '../config/db-connection.js';
 import { supabase } from '../services/supabaseClient.js';
 import {
   ALLOWED_MIME_TYPES_BY_BUCKET,
+  MAX_FILE_BYTES_BY_BUCKET,
   MAX_IMAGE_BYTES,
   INVENTARIO_UPLOADS_SUBDIR,
   ADMIN_UPLOADS_SUBDIR,
@@ -57,7 +58,7 @@ const parseUploadPayload = (payload) => {
   };
 };
 
-const decodeBase64File = (base64Body) => {
+const decodeBase64File = (base64Body, maxBytes = MAX_IMAGE_BYTES) => {
   const normalized = String(base64Body || '').replace(/\s+/g, '');
   if (!normalized || normalized.length % 4 !== 0 || !BASE64_BODY_REGEX.test(normalized)) {
     return { ok: false, status: 400, message: 'El contenido base64 no es valido.' };
@@ -68,11 +69,11 @@ const decodeBase64File = (base64Body) => {
     return { ok: false, status: 400, message: 'El archivo enviado no contiene datos validos.' };
   }
 
-  if (buffer.length > MAX_IMAGE_BYTES) {
+  if (buffer.length > maxBytes) {
     return {
       ok: false,
       status: 400,
-      message: `El archivo supera el limite permitido de ${Math.floor(MAX_IMAGE_BYTES / (1024 * 1024))} MB.`
+      message: `El archivo supera el limite permitido de ${Math.floor(maxBytes / (1024 * 1024))} MB.`
     };
   }
 
@@ -86,8 +87,7 @@ const decodeBase64File = (base64Body) => {
  */
 router.post('/archivos', async (req, res) => {
   let supabaseFilePath = '';
-  // Bucket destino (default: assets publicos)
-  const targetBucket = req.body.bucket || SUPABASE_ASSETS_BUCKET;
+  const targetBucket = String(req.body?.bucket || SUPABASE_ASSETS_BUCKET).trim() || SUPABASE_ASSETS_BUCKET;
   
   try {
     const payload = req.body;
@@ -106,7 +106,10 @@ router.post('/archivos', async (req, res) => {
       return res.status(parsedPayload.status).json({ ok: false, message: parsedPayload.message });
     }
 
-    const decoded = decodeBase64File(parsedPayload.base64Body);
+    const bucketMaxBytes =
+      MAX_FILE_BYTES_BY_BUCKET[targetBucket] || MAX_FILE_BYTES_BY_BUCKET[SUPABASE_ASSETS_BUCKET] || MAX_IMAGE_BYTES;
+
+    const decoded = decodeBase64File(parsedPayload.base64Body, bucketMaxBytes);
     if (!decoded.ok) {
       return res.status(decoded.status).json({ ok: false, message: decoded.message });
     }

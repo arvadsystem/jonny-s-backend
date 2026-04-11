@@ -1,6 +1,8 @@
 import express from 'express';
 import pool from '../config/db-connection.js';
 import { checkPermission, isRequestUserSuperAdmin } from '../middleware/checkPermission.js';
+import { supabase } from '../services/supabaseClient.js';
+import { SUPABASE_ADMIN_BUCKET, buildAbsolutePublicUrl } from '../utils/uploads.js';
 
 const router = express.Router();
 
@@ -47,6 +49,7 @@ const MAX_LIMIT = 100;
 const DEFAULT_LIMIT = 20;
 const MAX_TEXT_LEN = 1000;
 const MAX_SHORT_TEXT_LEN = 250;
+const OC_EVIDENCE_SIGNED_URL_TTL_SECONDS = 900;
 // AM: lock transaccional para asignar correlativo visible de OC sin carreras concurrentes.
 const OC_VISIBLE_NUMBER_LOCK_KEY = 830051;
 const DISCOUNT_MODE_MONTO = 'MONTO';
@@ -916,6 +919,53 @@ const getOrderEvidenceHistory = async (idOrdenCompra, queryRunner = pool) => {
     if (error?.code === '42P01' || error?.code === '42883') return [];
     throw error;
   }
+};
+
+const getArchivoById = async (idArchivo, queryRunner = pool) => {
+  const result = await queryRunner.query(
+    `
+      SELECT id_archivo, url_publica, tipo_archivo
+      FROM public.archivos
+      WHERE id_archivo = $1
+        AND COALESCE(estado, true) = true
+      LIMIT 1
+    `,
+    [idArchivo]
+  );
+  return result.rows?.[0] || null;
+};
+
+const resolveEvidenceAccessUrl = async (req, storedPath) => {
+  const normalized = String(storedPath || '').trim();
+  if (!normalized) return { url: null, signed: false, expiresIn: null };
+  if (/^https?:\/\//i.test(normalized)) {
+    return { url: normalized, signed: false, expiresIn: null };
+  }
+
+  const [bucket, ...pathParts] = normalized.replace(/^\/+/, '').split('/');
+  const filePath = pathParts.join('/');
+
+  if (bucket === SUPABASE_ADMIN_BUCKET && filePath) {
+    const { data, error } = await supabase.storage
+      .from(SUPABASE_ADMIN_BUCKET)
+      .createSignedUrl(filePath, OC_EVIDENCE_SIGNED_URL_TTL_SECONDS);
+
+    if (error || !data?.signedUrl) {
+      throw new Error('No se pudo generar la URL firmada de evidencia.');
+    }
+
+    return {
+      url: data.signedUrl,
+      signed: true,
+      expiresIn: OC_EVIDENCE_SIGNED_URL_TTL_SECONDS
+    };
+  }
+
+  return {
+    url: buildAbsolutePublicUrl(req, normalized),
+    signed: false,
+    expiresIn: null
+  };
 };
 
 const getOrderItemRequestByIdForUpdate = async (idOrdenCompra, idSolicitudItem, queryRunner = pool) => {
@@ -1880,6 +1930,137 @@ router.get('/orden_compras/workflow/:id_orden_compra', checkPermission(PERM_OC_V
     return sendServerError(res, 'GET /orden_compras/workflow/:id_orden_compra', error);
   }
 });
+
+router.get(
+  '/orden_compras/workflow/:id_orden_compra/evidencias/factura',
+  checkPermission(PERM_OC_VIEW),
+  async (req, res) => {
+    try {
+      const idUsuario = getRequestUserId(req);
+      if (!idUsuario) return sendError(res, 401, 'UNAUTHORIZED', 'No autorizado.');
+
+      const idOrdenCompra = parsePositiveInt(req.params?.id_orden_compra);
+      if (!idOrdenCompra) {
+        return sendError(res, 400, 'VALIDATION_ERROR', 'id_orden_compra invalido.');
+      }
+
+      const orderRow = await getOrderById(idOrdenCompra);
+      if (!orderRow) {
+        return sendError(res, 404, 'NOT_FOUND', 'Orden de compra no encontrada.');
+      }
+
+      const canView = await validateOrderVisibility(req, idUsuario, orderRow);
+      if (!canView) {
+        return sendError(res, 403, 'FORBIDDEN', 'No tienes permiso para ver esta orden.');
+      }
+
+      const idArchivoFactura = parsePositiveInt(orderRow?.id_archivo_factura_recepcion);
+      if (!idArchivoFactura) {
+        return sendError(res, 404, 'NOT_FOUND', 'La orden no tiene factura de recepcion registrada.');
+      }
+
+      const archivoRow = await getArchivoById(idArchivoFactura);
+      if (!archivoRow) {
+        return sendError(res, 404, 'NOT_FOUND', 'La evidencia de factura no existe o no esta disponible.');
+      }
+
+      const access = await resolveEvidenceAccessUrl(req, archivoRow.url_publica);
+      if (!access?.url) {
+        return sendError(res, 404, 'NOT_FOUND', 'No se pudo resolver la evidencia de factura.');
+      }
+
+      return res.status(200).json({
+        ok: true,
+        data: {
+          id_orden_compra: idOrdenCompra,
+          tipo_evidencia: 'FACTURA_RECEPCION',
+          id_archivo: idArchivoFactura,
+          mime_type: String(archivoRow?.tipo_archivo || '').trim().toLowerCase() || null,
+          url: access.url,
+          is_signed_url: access.signed,
+          expires_in: access.expiresIn
+        }
+      });
+    } catch (error) {
+      return sendServerError(
+        res,
+        'GET /orden_compras/workflow/:id_orden_compra/evidencias/factura',
+        error
+      );
+    }
+  }
+);
+
+router.get(
+  '/orden_compras/workflow/:id_orden_compra/evidencias/transferencia',
+  checkPermission(PERM_OC_VIEW),
+  async (req, res) => {
+    try {
+      const idUsuario = getRequestUserId(req);
+      if (!idUsuario) return sendError(res, 401, 'UNAUTHORIZED', 'No autorizado.');
+
+      const idOrdenCompra = parsePositiveInt(req.params?.id_orden_compra);
+      if (!idOrdenCompra) {
+        return sendError(res, 400, 'VALIDATION_ERROR', 'id_orden_compra invalido.');
+      }
+
+      const orderRow = await getOrderById(idOrdenCompra);
+      if (!orderRow) {
+        return sendError(res, 404, 'NOT_FOUND', 'Orden de compra no encontrada.');
+      }
+
+      const canView = await validateOrderVisibility(req, idUsuario, orderRow);
+      if (!canView) {
+        return sendError(res, 403, 'FORBIDDEN', 'No tienes permiso para ver esta orden.');
+      }
+
+      const canViewAdminData = await canUserViewAdminOrderData(req, idUsuario);
+      if (!canViewAdminData) {
+        return sendError(res, 403, 'FORBIDDEN', 'No tienes permiso para ver evidencias administrativas.');
+      }
+
+      const compraActual = await getLatestCompraByOrden(idOrdenCompra);
+      const idArchivoTransferencia = parsePositiveInt(compraActual?.id_archivo_transferencia);
+      if (!idArchivoTransferencia) {
+        return sendError(res, 404, 'NOT_FOUND', 'La orden no tiene deposito/transferencia registrada.');
+      }
+
+      const archivoRow = await getArchivoById(idArchivoTransferencia);
+      if (!archivoRow) {
+        return sendError(
+          res,
+          404,
+          'NOT_FOUND',
+          'La evidencia de deposito/transferencia no existe o no esta disponible.'
+        );
+      }
+
+      const access = await resolveEvidenceAccessUrl(req, archivoRow.url_publica);
+      if (!access?.url) {
+        return sendError(res, 404, 'NOT_FOUND', 'No se pudo resolver la evidencia de deposito/transferencia.');
+      }
+
+      return res.status(200).json({
+        ok: true,
+        data: {
+          id_orden_compra: idOrdenCompra,
+          tipo_evidencia: 'DEPOSITO_TRANSFERENCIA',
+          id_archivo: idArchivoTransferencia,
+          mime_type: String(archivoRow?.tipo_archivo || '').trim().toLowerCase() || null,
+          url: access.url,
+          is_signed_url: access.signed,
+          expires_in: access.expiresIn
+        }
+      });
+    } catch (error) {
+      return sendServerError(
+        res,
+        'GET /orden_compras/workflow/:id_orden_compra/evidencias/transferencia',
+        error
+      );
+    }
+  }
+);
 
 router.post('/orden_compras/workflow', checkPermission(PERM_OC_CREATE), async (req, res) => {
   const client = await pool.connect();
