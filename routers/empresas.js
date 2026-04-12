@@ -39,6 +39,12 @@ const LEGACY_TEXT_MAPPINGS = {
   direccion_correo: 'texto_correo'
 };
 const META_EMPRESA_FIELDS = new Set(['updated_by', 'created_by']);
+const CONTEXT_EMPRESA_FIELDS = new Set([
+  'rbac_context',
+  'contexto_origen',
+  'contexto',
+  '_context'
+]);
 
 let schemaCapabilitiesPromise;
 
@@ -222,15 +228,11 @@ const empresaRepository = {
     tenantId = null
   }) {
     const filters = [];
-    const countFilters = [];
     const params = [];
-    const countParams = [];
 
     const pushFilter = (fragment, value) => {
       params.push(value);
-      countParams.push(value);
       filters.push(fragment.replaceAll('$IDX', `$${params.length}`));
-      countFilters.push(fragment.replaceAll('$IDX', `$${countParams.length}`));
     };
 
     if (searchName) {
@@ -255,7 +257,6 @@ const empresaRepository = {
     }
 
     const where = filters.length ? `WHERE ${filters.join(' AND ')}` : '';
-    const countWhere = countFilters.length ? `WHERE ${countFilters.join(' AND ')}` : '';
 
     const fields = [
       'e.id_empresa',
@@ -275,6 +276,7 @@ const empresaRepository = {
         fields.push(`e.${capabilities.softDeleteField} AS estado`);
       }
     }
+    fields.push('COUNT(*) OVER()::INT AS __total__');
 
     const joinsSql = `
       LEFT JOIN telefonos t ON t.id_telefono = e.id_telefono
@@ -295,34 +297,37 @@ const empresaRepository = {
       OFFSET $${params.length + 2}
     `;
 
-    const totalQuery = `
-      SELECT COUNT(*)::INT AS total
-      FROM empresas e
-      ${joinsSql}
-      ${countWhere}
-    `;
-
-    const [dataResult, totalResult] = await Promise.all([
-      pool.query(dataQuery, dataParams),
-      pool.query(totalQuery, countParams)
-    ]);
+    const dataResult = await pool.query(dataQuery, dataParams);
+    let total = Number(dataResult.rows?.[0]?.__total__) || 0;
 
     const data = dataResult.rows.map((row) => {
-      if (!capabilities.softDeleteField) return row;
+      const { __total__, ...empresa } = row;
+      if (!capabilities.softDeleteField) return empresa;
 
-      const estadoActual = parseBooleanValue(row?.[capabilities.softDeleteField] ?? row?.estado);
+      const estadoActual = parseBooleanValue(empresa?.[capabilities.softDeleteField] ?? empresa?.estado);
       const safeEstado = estadoActual === null ? false : Boolean(estadoActual);
 
       return {
-        ...row,
+        ...empresa,
         [capabilities.softDeleteField]: safeEstado,
         estado: safeEstado
       };
     });
 
+    if (data.length === 0) {
+      const totalQuery = `
+        SELECT COUNT(*)::INT AS total
+        FROM empresas e
+        ${joinsSql}
+        ${where}
+      `;
+      const totalResult = await pool.query(totalQuery, params);
+      total = Number(totalResult.rows?.[0]?.total) || 0;
+    }
+
     return {
       data,
-      total: Number(totalResult.rows?.[0]?.total) || 0
+      total
     };
   },
 
@@ -550,7 +555,10 @@ const empresaService = {
     }
 
     const allowedFields = new Set([...FN_EMPRESA_FIELDS, 'estado', 'created_by', 'updated_by']);
-    const unknownFields = unknownFieldsFromPayload(rawBody, new Set([...allowedFields, ...Object.keys(LEGACY_TEXT_MAPPINGS)]));
+    const unknownFields = unknownFieldsFromPayload(
+      rawBody,
+      new Set([...allowedFields, ...Object.keys(LEGACY_TEXT_MAPPINGS), ...CONTEXT_EMPRESA_FIELDS])
+    );
     if (unknownFields.length) {
       return {
         status: 400,
@@ -686,7 +694,10 @@ const empresaService = {
       capabilities.softDeleteField || 'estado',
       ...META_EMPRESA_FIELDS
     ]);
-    const unknownFields = unknownFieldsFromPayload(rawUpdates, new Set([...allowedFields, ...Object.keys(LEGACY_TEXT_MAPPINGS)]));
+    const unknownFields = unknownFieldsFromPayload(
+      rawUpdates,
+      new Set([...allowedFields, ...Object.keys(LEGACY_TEXT_MAPPINGS), ...CONTEXT_EMPRESA_FIELDS])
+    );
     if (unknownFields.length) {
       return {
         status: 400,
