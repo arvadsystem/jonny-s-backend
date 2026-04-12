@@ -1,33 +1,26 @@
-﻿import {
+import {
   createPublicOrderService,
   getMenuVigenteByBranchService,
   getPublicBranchesService,
   getPublicCatalogItemDetailService,
   getPublicCatalogService
 } from './publicMenuService.js';
+import { sendPublicMenuClientError, sendPublicMenuError } from './publicMenuResponse.js';
 
-// Respuesta de error uniforme para evitar duplicacion en cada controlador.
-const handleControllerError = (res, error, fallbackMessage) => {
-  const status = Number(error?.status) || 500;
-  const message = error?.message || fallbackMessage;
-
-  if (status >= 500) {
-    console.error('Public menu error:', message, error?.stack || '');
-  }
-
-  return res.status(status).json({
-    ok: false,
-    message
+// Respuesta de error uniforme y saneada para controladores del modulo.
+const handleControllerError = (req, res, error, fallbackMessage) =>
+  sendPublicMenuError(req, res, {
+    error,
+    fallbackMessage
   });
-};
 
 // GET /public-menu/sucursales
-export const getPublicBranchesController = async (_req, res) => {
+export const getPublicBranchesController = async (req, res) => {
   try {
     const data = await getPublicBranchesService();
     return res.status(200).json({ ok: true, data });
   } catch (error) {
-    return handleControllerError(res, error, 'No se pudieron listar sucursales publicas.');
+    return handleControllerError(req, res, error, 'No se pudieron listar sucursales publicas.');
   }
 };
 
@@ -38,15 +31,15 @@ export const getActiveMenuByBranchController = async (req, res) => {
     const data = await getMenuVigenteByBranchService(idSucursal);
 
     if (!data) {
-      return res.status(404).json({
-        ok: false,
+      return sendPublicMenuClientError(req, res, {
+        status: 404,
         message: 'La sucursal no tiene menu vigente activo.'
       });
     }
 
     return res.status(200).json({ ok: true, data });
   } catch (error) {
-    return handleControllerError(res, error, 'No se pudo resolver el menu vigente de la sucursal.');
+    return handleControllerError(req, res, error, 'No se pudo resolver el menu vigente de la sucursal.');
   }
 };
 
@@ -61,7 +54,7 @@ export const getPublicCatalogController = async (req, res) => {
 
     return res.status(200).json({ ok: true, data });
   } catch (error) {
-    return handleControllerError(res, error, 'No se pudo construir el catalogo publico.');
+    return handleControllerError(req, res, error, 'No se pudo construir el catalogo publico.');
   }
 };
 
@@ -76,7 +69,7 @@ export const getPublicCatalogItemDetailController = async (req, res) => {
 
     return res.status(200).json({ ok: true, data });
   } catch (error) {
-    return handleControllerError(res, error, 'No se pudo obtener el detalle del item publico.');
+    return handleControllerError(req, res, error, 'No se pudo obtener el detalle del item publico.');
   }
 };
 
@@ -106,6 +99,6 @@ export const createPublicOrderController = async (req, res) => {
       data
     });
   } catch (error) {
-    return handleControllerError(res, error, 'No se pudo registrar el pedido desde menu publico.');
+    return handleControllerError(req, res, error, 'No se pudo registrar el pedido desde menu publico.');
   }
 };

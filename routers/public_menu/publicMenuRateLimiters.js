@@ -1,4 +1,5 @@
 import rateLimit from 'express-rate-limit';
+import { sendPublicMenuClientError } from './publicMenuResponse.js';
 
 const ONE_MINUTE_MS = 60 * 1000;
 
@@ -35,8 +36,9 @@ const buildPublicMenuRateLimiter = ({ max, message, keyGenerator }) =>
     keyGenerator,
     handler: (request, response, _next, options) => {
       const retryAfter = getRetryAfterSeconds(request);
-      return response.status(options.statusCode).json({
-        ok: false,
+      return sendPublicMenuClientError(request, response, {
+        status: options.statusCode,
+        code: 'PUBLIC_MENU_RATE_LIMIT',
         message: `${message} Intenta de nuevo en ${retryAfter}s.`
       });
     }
@@ -87,4 +89,3 @@ export const publicMenuOrderCreateCustomerLimiter = buildPublicMenuRateLimiter({
     return `cliente:${idCliente}`;
   }
 });
-

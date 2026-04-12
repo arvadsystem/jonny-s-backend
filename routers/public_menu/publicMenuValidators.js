@@ -1,4 +1,6 @@
-﻿// Validador central para el modulo publico de menu.
+import { sendPublicMenuClientError } from './publicMenuResponse.js';
+
+// Validador central para el modulo publico de menu.
 // Mantiene parsing de parametros en un solo lugar para evitar duplicaciones en controladores.
 
 const PUBLIC_ORDER_TYPES = new Set(['dine-in', 'pickup', 'delivery']);
@@ -21,9 +23,10 @@ const toPositiveInt = (value) => {
 };
 
 // Helper para devolver errores uniformes de validacion.
-const sendValidationError = (res, message) =>
-  res.status(400).json({
-    ok: false,
+const sendValidationError = (req, res, message) =>
+  sendPublicMenuClientError(req, res, {
+    status: 400,
+    code: 'PUBLIC_MENU_VALIDATION_ERROR',
     message
   });
 
@@ -146,7 +149,7 @@ export const validateBranchParam = (req, res, next) => {
   const idSucursal = toPositiveInt(req.params.id_sucursal);
 
   if (!idSucursal) {
-    return sendValidationError(res, 'id_sucursal debe ser un entero mayor a 0.');
+    return sendValidationError(req, res, 'id_sucursal debe ser un entero mayor a 0.');
   }
 
   req.publicMenu = {
@@ -164,11 +167,11 @@ export const validateCatalogQuery = (req, res, next) => {
   const tipoPedido = tipoPedidoRaw || null;
 
   if (!idSucursal) {
-    return sendValidationError(res, 'id_sucursal es obligatorio y debe ser un entero mayor a 0.');
+    return sendValidationError(req, res, 'id_sucursal es obligatorio y debe ser un entero mayor a 0.');
   }
 
   if (tipoPedido && !PUBLIC_ORDER_TYPES.has(tipoPedido)) {
-    return sendValidationError(res, 'tipo_pedido invalido. Valores permitidos: dine-in, pickup, delivery.');
+    return sendValidationError(req, res, 'tipo_pedido invalido. Valores permitidos: dine-in, pickup, delivery.');
   }
 
   req.publicMenu = {
@@ -186,11 +189,11 @@ export const validateItemDetailRequest = (req, res, next) => {
   const idSucursal = toPositiveInt(req.query.id_sucursal);
 
   if (!idDetalleMenu) {
-    return sendValidationError(res, 'id_detalle_menu debe ser un entero mayor a 0.');
+    return sendValidationError(req, res, 'id_detalle_menu debe ser un entero mayor a 0.');
   }
 
   if (!idSucursal) {
-    return sendValidationError(res, 'id_sucursal es obligatorio para resolver el item en el menu vigente.');
+    return sendValidationError(req, res, 'id_sucursal es obligatorio para resolver el item en el menu vigente.');
   }
 
   req.publicMenu = {
@@ -211,20 +214,20 @@ export const validateCreateOrderBody = (req, res, next) => {
   const rawItems = Array.isArray(body.items) ? body.items : [];
 
   if (!idSucursal) {
-    return sendValidationError(res, 'id_sucursal es obligatorio y debe ser un entero mayor a 0.');
+    return sendValidationError(req, res, 'id_sucursal es obligatorio y debe ser un entero mayor a 0.');
   }
 
   if (!tipoPedido || !PUBLIC_ORDER_TYPES.has(tipoPedido)) {
-    return sendValidationError(res, 'tipo_pedido invalido. Valores permitidos: dine-in, pickup, delivery.');
+    return sendValidationError(req, res, 'tipo_pedido invalido. Valores permitidos: dine-in, pickup, delivery.');
   }
 
   if (rawItems.length === 0) {
-    return sendValidationError(res, 'Debes enviar al menos un item en el pedido.');
+    return sendValidationError(req, res, 'Debes enviar al menos un item en el pedido.');
   }
 
   const businessContextResult = normalizeOrderBusinessContext({ body, tipoPedido });
   if (businessContextResult?.error) {
-    return sendValidationError(res, businessContextResult.error);
+    return sendValidationError(req, res, businessContextResult.error);
   }
 
   const items = [];
@@ -234,19 +237,19 @@ export const validateCreateOrderBody = (req, res, next) => {
     const cantidad = toPositiveInt(row.cantidad);
 
     if (!idDetalleMenu) {
-      return sendValidationError(res, 'Cada item debe incluir id_detalle_menu valido (> 0).');
+      return sendValidationError(req, res, 'Cada item debe incluir id_detalle_menu valido (> 0).');
     }
 
     if (!cantidad) {
-      return sendValidationError(res, 'Cada item debe incluir cantidad valida (> 0).');
+      return sendValidationError(req, res, 'Cada item debe incluir cantidad valida (> 0).');
     }
 
     if (row.extras !== undefined && !Array.isArray(row.extras)) {
-      return sendValidationError(res, 'extras debe ser un arreglo cuando se envia en el item.');
+      return sendValidationError(req, res, 'extras debe ser un arreglo cuando se envia en el item.');
     }
 
     if (row.salsas_por_unidad !== undefined && !Array.isArray(row.salsas_por_unidad)) {
-      return sendValidationError(res, 'salsas_por_unidad debe ser un arreglo cuando se envia en el item.');
+      return sendValidationError(req, res, 'salsas_por_unidad debe ser un arreglo cuando se envia en el item.');
     }
 
     const extras = (Array.isArray(row.extras) ? row.extras : [])
@@ -280,3 +283,4 @@ export const validateCreateOrderBody = (req, res, next) => {
 
   return next();
 };
+

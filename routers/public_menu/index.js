@@ -1,12 +1,16 @@
 import express from 'express';
 import publicMenuReadRouter from './publicMenuReadRouter.js';
 import publicMenuOrderRouter from './publicMenuOrderRouter.js';
+import { attachPublicMenuRequestContext } from './publicMenuResponse.js';
 
 // Router raiz del modulo publico de menu.
 // Se divide en dos superficies para definir frontera de seguridad:
 // 1) Lectura publica: ver sucursales/menu/precios sin sesion.
 // 2) Escritura de pedidos: frontera protegida para auth cliente.
 const router = express.Router();
+
+// Traza todas las respuestas del modulo con request_id uniforme.
+router.use(attachPublicMenuRequestContext);
 
 // Lectura publica del menu (anonimo permitido).
 router.use(publicMenuReadRouter);
