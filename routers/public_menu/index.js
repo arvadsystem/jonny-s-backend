@@ -1,34 +1,17 @@
-﻿import express from 'express';
-import {
-  createPublicOrderController,
-  getActiveMenuByBranchController,
-  getPublicBranchesController,
-  getPublicCatalogController,
-  getPublicCatalogItemDetailController
-} from './publicMenuController.js';
-import {
-  validateBranchParam,
-  validateCatalogQuery,
-  validateCreateOrderBody,
-  validateItemDetailRequest
-} from './publicMenuValidators.js';
+import express from 'express';
+import publicMenuReadRouter from './publicMenuReadRouter.js';
+import publicMenuOrderRouter from './publicMenuOrderRouter.js';
 
-// Router publico aislado para menu de clientes.
+// Router raiz del modulo publico de menu.
+// Se divide en dos superficies para definir frontera de seguridad:
+// 1) Lectura publica: ver sucursales/menu/precios sin sesion.
+// 2) Escritura de pedidos: frontera protegida para auth cliente.
 const router = express.Router();
 
-// Lista inicial de sucursales visibles para cliente final.
-router.get('/sucursales', getPublicBranchesController);
+// Lectura publica del menu (anonimo permitido).
+router.use(publicMenuReadRouter);
 
-// Menu vigente activo por sucursal.
-router.get('/sucursales/:id_sucursal/menu-vigente', validateBranchParam, getActiveMenuByBranchController);
-
-// Catalogo publicado usando menu_vigente + detalle_menu.
-router.get('/catalogo', validateCatalogQuery, getPublicCatalogController);
-
-// Detalle individual para HU-133.
-router.get('/items/:id_detalle_menu', validateItemDetailRequest, getPublicCatalogItemDetailController);
-
-// Crear pedido desde menu publico (sin login de dashboard).
-router.post('/pedidos', validateCreateOrderBody, createPublicOrderController);
+// Escritura de pedidos (a endurecer con auth de cliente en siguiente paso).
+router.use(publicMenuOrderRouter);
 
 export default router;
