@@ -8,7 +8,6 @@ import {
   fetchComboRecipeComponentsQuery,
   fetchComboAvailabilityQuery,
   fetchEstadoPedidoRowsQuery,
-  fetchFallbackOrderUserIdQuery,
   fetchPublicBranchesQuery,
   fetchRecipeAvailabilityQuery,
   fetchSauceRuleRowsByRecipeIdsQuery,
@@ -722,8 +721,21 @@ export const getPublicCatalogItemDetailService = async ({ idSucursal, idDetalleM
   };
 };
 
-// Servicio: registrar pedido enviado desde el menu publico (sin login dashboard).
-export const createPublicOrderService = async ({ idSucursal, tipoPedido, origen = 'public-menu', items = [] }) => {
+// Servicio: registrar pedido enviado desde el menu publico.
+// Regla: pedido asociado al cliente autenticado (sin usuario fallback).
+export const createPublicOrderService = async ({
+  idSucursal,
+  tipoPedido,
+  origen = 'public-menu',
+  items = [],
+  auth = {}
+}) => {
+  const idUsuario = toPositiveInt(auth?.idUsuario);
+  const idCliente = toPositiveInt(auth?.idCliente);
+  if (!idUsuario || !idCliente) {
+    throw buildHttpError(401, 'Sesion de cliente invalida para registrar el pedido.');
+  }
+
   const activeMenu = await fetchActiveMenuByBranchQuery(idSucursal);
   if (!activeMenu) {
     throw buildHttpError(409, 'La sucursal no tiene menu vigente activo para registrar pedidos.');
@@ -811,11 +823,6 @@ export const createPublicOrderService = async ({ idSucursal, tipoPedido, origen 
     throw buildHttpError(500, 'No existe estado PENDIENTE en estados_pedido.');
   }
 
-  const idUsuario = await fetchFallbackOrderUserIdQuery();
-  if (!idUsuario) {
-    throw buildHttpError(500, 'No hay usuario disponible para registrar pedidos publicos.');
-  }
-
   const descripcionEnvio = SERVICE_TYPE_BY_ORDER_TYPE[tipoPedido] || 'LOCAL';
   const descripcionPedido = `[${origen}] pedido web`;
 
@@ -831,6 +838,7 @@ export const createPublicOrderService = async ({ idSucursal, tipoPedido, origen 
       total,
       id_estado_pedido: idEstadoPedido,
       id_sucursal: Number(idSucursal),
+      id_cliente: Number(idCliente),
       id_usuario: Number(idUsuario)
     });
 
@@ -857,6 +865,7 @@ export const createPublicOrderService = async ({ idSucursal, tipoPedido, origen 
       id_pedido: idPedido,
       numero_ticket: buildTicketNumber(idPedido),
       id_sucursal: Number(idSucursal),
+      id_cliente: Number(idCliente),
       id_menu: Number(activeMenu.id_menu),
       tipo_pedido: tipoPedido,
       estado: 'PENDIENTE',

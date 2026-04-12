@@ -83,12 +83,13 @@ export const getPublicCatalogItemDetailController = async (req, res) => {
 // POST /public-menu/pedidos
 export const createPublicOrderController = async (req, res) => {
   try {
-    const { idSucursal, tipoPedido, origen, items } = req.publicMenu;
+    const { idSucursal, tipoPedido, origen, items, auth } = req.publicMenu;
     const data = await createPublicOrderService({
       idSucursal,
       tipoPedido,
       origen,
-      items
+      items,
+      auth
     });
 
     return res.status(201).json({
