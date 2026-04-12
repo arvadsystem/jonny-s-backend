@@ -1,6 +1,6 @@
 ﻿import express from 'express';
 import pool from '../config/db-connection.js';
-import { checkPermission } from '../middleware/checkPermission.js';
+import { checkPermission, isRequestUserSuperAdmin } from '../middleware/checkPermission.js';
 import {
   normalizeEmpleadoAtomicPayload,
   normalizeClienteAtomicPayload,
@@ -36,17 +36,225 @@ const CLIENTE_ATOMIC_ALLOWED_FIELDS = new Set([
   'puntos',
   'id_tipo_cliente',
   'id_persona',
+  'id_empresa_cliente',
   'id_empresa',
   'id_sucursal',
   'estado',
   'origen'
 ]);
+const TIPO_CLIENTE_LABEL_CANDIDATES = ['tipo_cliente', 'descripcion', 'nombre'];
+let tipoClienteLabelColumnCache = null;
+let tipoClienteLabelCheckedAt = 0;
+let hasClienteEmpresaFieldCache = null;
+let hasClienteEmpresaFieldCheckedAt = 0;
+let fnGuardarClienteSupportsEmpresaClienteCache = null;
+let fnGuardarClienteSupportCheckedAt = 0;
+const ATOMIC_SCHEMA_CACHE_TTL_MS = 60_000;
 
 const isPlainObject = (value) => value !== null && typeof value === 'object' && !Array.isArray(value);
 
 const parsePositiveInt = (value) => {
   const parsed = Number.parseInt(String(value ?? ''), 10);
   return Number.isInteger(parsed) && parsed > 0 ? parsed : null;
+};
+
+const safeParseJson = (value) => {
+  if (value === null || value === undefined) return null;
+  if (typeof value !== 'string') return value;
+  const text = value.trim();
+  if (!text) return null;
+  try {
+    return JSON.parse(text);
+  } catch {
+    return value;
+  }
+};
+
+const extractIdFromUnknown = (value, candidateKeys = []) => {
+  const seen = new Set();
+  const dynamicKeys = [
+    ...candidateKeys,
+    'resultado',
+    'id',
+    'id_cliente',
+    'cliente_id'
+  ];
+
+  const walk = (node, depth = 0) => {
+    if (depth > 5 || node === null || node === undefined) return null;
+    const direct = parsePositiveInt(node);
+    if (direct) return direct;
+
+    if (typeof node === 'string') {
+      const parsedNode = safeParseJson(node);
+      if (parsedNode !== node) {
+        const nested = walk(parsedNode, depth + 1);
+        if (nested) return nested;
+      }
+      return null;
+    }
+
+    if (Array.isArray(node)) {
+      for (const item of node) {
+        const nested = walk(item, depth + 1);
+        if (nested) return nested;
+      }
+      return null;
+    }
+
+    if (typeof node !== 'object') return null;
+    if (seen.has(node)) return null;
+    seen.add(node);
+
+    for (const key of dynamicKeys) {
+      if (!Object.prototype.hasOwnProperty.call(node, key)) continue;
+      const nested = walk(node[key], depth + 1);
+      if (nested) return nested;
+    }
+
+    const heuristicIdKeys = Object.keys(node).filter((key) => /(^id$|^id_|_id$)/i.test(String(key)));
+    for (const key of heuristicIdKeys) {
+      const nested = walk(node[key], depth + 1);
+      if (nested) return nested;
+    }
+
+    for (const nestedValue of Object.values(node)) {
+      const nested = walk(nestedValue, depth + 1);
+      if (nested) return nested;
+    }
+
+    return null;
+  };
+
+  return walk(value, 0);
+};
+
+const isSchemaMissingError = (error) => ['42P01', '42703'].includes(String(error?.code || '').trim());
+
+const resolveTenantContextForRequest = async (req, client = pool) => {
+  const isSuperAdmin = await isRequestUserSuperAdmin(req).catch(() => false);
+  const fromToken = parsePositiveInt(req?.user?.id_empresa ?? req?.user?.id_empresa_contexto);
+  if (fromToken) return { tenantId: fromToken, isSuperAdmin };
+
+  if (isSuperAdmin) {
+    const fromPayload = parsePositiveInt(
+      req?.body?.cliente?.id_empresa_tenant
+      ?? req?.body?.id_empresa_tenant
+      ?? req?.body?.tenant_id
+    );
+    return { tenantId: fromPayload || null, isSuperAdmin };
+  }
+
+  const idUsuario = parsePositiveInt(req?.user?.id_usuario);
+  if (!idUsuario) return { tenantId: null, isSuperAdmin };
+
+  try {
+    const tenantResult = await client.query(
+      `
+        SELECT
+          COALESCE(u.id_empresa, p_emp.id_empresa) AS id_empresa_resuelta
+        FROM public.usuarios u
+        LEFT JOIN public.empleados e ON e.id_empleado = u.id_empleado
+        LEFT JOIN public.personas p_emp ON p_emp.id_persona = e.id_persona
+        WHERE u.id_usuario = $1
+        LIMIT 1
+      `,
+      [idUsuario]
+    );
+    return {
+      tenantId: parsePositiveInt(tenantResult.rows?.[0]?.id_empresa_resuelta),
+      isSuperAdmin
+    };
+  } catch {
+    return { tenantId: null, isSuperAdmin };
+  }
+};
+
+const getTipoClienteLabelColumn = async (client, { forceRefresh = false } = {}) => {
+  const now = Date.now();
+  const shouldRefresh = forceRefresh
+    || !tipoClienteLabelCheckedAt
+    || (now - tipoClienteLabelCheckedAt) > ATOMIC_SCHEMA_CACHE_TTL_MS;
+
+  if (!shouldRefresh) return tipoClienteLabelColumnCache;
+
+  tipoClienteLabelCheckedAt = now;
+  try {
+    const rs = await client.query(
+      `
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name = 'tipo_cliente'
+      `
+    );
+    const columns = new Set((rs.rows || []).map((row) => String(row.column_name || '').trim()));
+    tipoClienteLabelColumnCache = TIPO_CLIENTE_LABEL_CANDIDATES.find((name) => columns.has(name)) || null;
+  } catch {
+    tipoClienteLabelColumnCache = null;
+  }
+
+  return tipoClienteLabelColumnCache;
+};
+
+const hasClienteEmpresaField = async (client, { forceRefresh = false } = {}) => {
+  const now = Date.now();
+  const shouldRefresh = forceRefresh
+    || !hasClienteEmpresaFieldCheckedAt
+    || (now - hasClienteEmpresaFieldCheckedAt) > ATOMIC_SCHEMA_CACHE_TTL_MS;
+
+  if (!shouldRefresh && hasClienteEmpresaFieldCache !== null) {
+    return hasClienteEmpresaFieldCache;
+  }
+
+  hasClienteEmpresaFieldCheckedAt = now;
+  try {
+    const rs = await client.query(
+      `
+        SELECT 1
+        FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name = 'clientes'
+          AND column_name = 'id_empresa_cliente'
+        LIMIT 1
+      `
+    );
+    hasClienteEmpresaFieldCache = Boolean(rs.rows?.length);
+  } catch {
+    hasClienteEmpresaFieldCache = false;
+  }
+
+  return hasClienteEmpresaFieldCache;
+};
+
+const fnGuardarClienteSupportsEmpresaCliente = async (client, { forceRefresh = false } = {}) => {
+  const now = Date.now();
+  const shouldRefresh = forceRefresh
+    || !fnGuardarClienteSupportCheckedAt
+    || (now - fnGuardarClienteSupportCheckedAt) > ATOMIC_SCHEMA_CACHE_TTL_MS;
+
+  if (!shouldRefresh && fnGuardarClienteSupportsEmpresaClienteCache !== null) {
+    return fnGuardarClienteSupportsEmpresaClienteCache;
+  }
+
+  fnGuardarClienteSupportCheckedAt = now;
+  try {
+    const rs = await client.query(
+      "SELECT pg_get_functiondef('public.fn_guardar_cliente(json)'::regprocedure) AS ddl"
+    );
+    const ddl = String(rs.rows?.[0]?.ddl || '').toLowerCase();
+    fnGuardarClienteSupportsEmpresaClienteCache = ddl.includes('id_empresa_cliente');
+  } catch {
+    // Fallback seguro: usar deteccion de columna.
+    fnGuardarClienteSupportsEmpresaClienteCache = await hasClienteEmpresaField(client, { forceRefresh });
+  }
+
+  return fnGuardarClienteSupportsEmpresaClienteCache;
+};
+
+const isLegacyClienteRelationError = (error) => {
+  const message = String(error?.message || '').toLowerCase();
+  return message.includes('id_persona o id_empresa');
 };
 
 const parsePositiveNumber = (value) => {
@@ -84,6 +292,13 @@ const rollbackQuietly = async (client) => {
 };
 
 const mapDbError = (err) => {
+  if (String(err?.code || '').trim() === '23514') {
+    return {
+      status: 400,
+      code: 'VALIDATION_ERROR',
+      message: 'Los datos del cliente no cumplen las reglas de validacion.'
+    };
+  }
   return mapDbErrorToSafe(err, {
     defaultMessage: 'No se pudo procesar la solicitud atomica.'
   });
@@ -111,7 +326,12 @@ const asyncHandler = (handler) => async (req, res) => {
       );
     }
 
-    console.error('Personas atomic API error:', err.message);
+    console.error('Personas atomic API error:', {
+      message: err?.message,
+      code: err?.code,
+      detail: err?.detail,
+      where: err?.where
+    });
     return res.status(500).json(
       buildErrorBody({
         code: 'INTERNAL_ERROR',
@@ -154,12 +374,12 @@ const findEmpleadoDetail = async (client, idEmpleado) => {
           c.direccion_correo AS correo,
           d.direccion,
           s.nombre_sucursal AS sucursal
-        FROM empleados e
-        LEFT JOIN personas p ON p.id_persona = e.id_persona
-        LEFT JOIN telefonos t ON t.id_telefono = p.id_telefono
-        LEFT JOIN correos c ON c.id_correo = p.id_correo
-        LEFT JOIN direcciones d ON d.id_direccion = p.id_direccion
-        LEFT JOIN sucursales s ON s.id_sucursal = e.id_sucursal
+        FROM public.empleados e
+        LEFT JOIN public.personas p ON p.id_persona = e.id_persona
+        LEFT JOIN public.telefonos t ON t.id_telefono = p.id_telefono
+        LEFT JOIN public.correos c ON c.id_correo = p.id_correo
+        LEFT JOIN public.direcciones d ON d.id_direccion = p.id_direccion
+        LEFT JOIN public.sucursales s ON s.id_sucursal = e.id_sucursal
         WHERE e.id_empleado = $1
         LIMIT 1
       `,
@@ -170,11 +390,17 @@ const findEmpleadoDetail = async (client, idEmpleado) => {
 };
 
 const findClienteDetail = async (client, idCliente) => {
+  let empresaRelationExpr = 'CASE WHEN c.id_persona IS NULL THEN c.id_empresa ELSE NULL END';
+  if (await hasClienteEmpresaField(client)) {
+    empresaRelationExpr = 'COALESCE(c.id_empresa_cliente, CASE WHEN c.id_persona IS NULL THEN c.id_empresa ELSE NULL END)';
+  }
+
   const rs = await client.query(
     `
       SELECT
         c.id_cliente,
         c.id_persona,
+        ${empresaRelationExpr} AS id_empresa_cliente,
         c.id_empresa,
         c.id_sucursal,
         c.id_tipo_cliente,
@@ -185,18 +411,49 @@ const findClienteDetail = async (client, idCliente) => {
         p.dni AS persona_dni,
         e.nombre_empresa,
         e.rtn AS empresa_rtn,
-        tc.descripcion AS tipo_cliente
-      FROM clientes c
-      LEFT JOIN personas p ON p.id_persona = c.id_persona
-      LEFT JOIN empresas e ON e.id_empresa = c.id_empresa
-      LEFT JOIN tipo_cliente tc ON tc.id_tipo_cliente = c.id_tipo_cliente
+        NULL::TEXT AS tipo_cliente
+      FROM public.clientes c
+      LEFT JOIN public.personas p ON p.id_persona = c.id_persona
+      LEFT JOIN public.empresas e ON e.id_empresa = ${empresaRelationExpr}
       WHERE c.id_cliente = $1
       LIMIT 1
     `,
     [idCliente]
   );
 
-  return rs.rows?.[0] || null;
+  const row = rs.rows?.[0] || null;
+  if (!row) return null;
+
+  const idTipoCliente = parsePositiveInt(row.id_tipo_cliente);
+  if (!idTipoCliente) return row;
+
+  try {
+    let labelColumn = await getTipoClienteLabelColumn(client);
+    if (!labelColumn) return row;
+
+    let tipoRs;
+    try {
+      tipoRs = await client.query(
+        `SELECT ${labelColumn} AS tipo_cliente FROM public.tipo_cliente WHERE id_tipo_cliente = $1 LIMIT 1`,
+        [idTipoCliente]
+      );
+    } catch (error) {
+      if (!isSchemaMissingError(error)) throw error;
+      labelColumn = await getTipoClienteLabelColumn(client, { forceRefresh: true });
+      if (!labelColumn) return row;
+      tipoRs = await client.query(
+        `SELECT ${labelColumn} AS tipo_cliente FROM public.tipo_cliente WHERE id_tipo_cliente = $1 LIMIT 1`,
+        [idTipoCliente]
+      );
+    }
+
+    const tipoLabel = toTrimmedText(tipoRs.rows?.[0]?.tipo_cliente);
+    if (tipoLabel) row.tipo_cliente = tipoLabel;
+  } catch (error) {
+    if (!isSchemaMissingError(error)) throw error;
+  }
+
+  return row;
 };
 
 const trySetClienteSucursal = async (client, idCliente, idSucursal) => {
@@ -205,13 +462,205 @@ const trySetClienteSucursal = async (client, idCliente, idSucursal) => {
   if (!parsedCliente || !parsedSucursal) return;
   try {
     await client.query(
-      'UPDATE clientes SET id_sucursal = $1 WHERE id_cliente = $2',
+      'UPDATE public.clientes SET id_sucursal = $1 WHERE id_cliente = $2',
       [parsedSucursal, parsedCliente]
     );
   } catch (error) {
     if (error?.code === '42703') return;
     throw error;
   }
+};
+
+const ensureClientesSucursalesTableAtomic = async (client) => {
+  try {
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS public.clientes_sucursales (
+        id_cliente INTEGER NOT NULL REFERENCES public.clientes(id_cliente) ON DELETE CASCADE,
+        id_sucursal INTEGER NOT NULL REFERENCES public.sucursales(id_sucursal) ON DELETE RESTRICT,
+        estado BOOLEAN NOT NULL DEFAULT TRUE,
+        es_principal BOOLEAN NOT NULL DEFAULT FALSE,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT timezone('America/Tegucigalpa', now()),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT timezone('America/Tegucigalpa', now()),
+        PRIMARY KEY (id_cliente, id_sucursal)
+      )
+    `);
+    await client.query('CREATE INDEX IF NOT EXISTS idx_clientes_sucursales_id_sucursal ON public.clientes_sucursales(id_sucursal)');
+    await client.query('CREATE INDEX IF NOT EXISTS idx_clientes_sucursales_id_cliente ON public.clientes_sucursales(id_cliente)');
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+const tryUpsertClienteSucursalLink = async (client, idCliente, idSucursal, { setPrincipal = false } = {}) => {
+  const parsedCliente = parsePositiveInt(idCliente);
+  const parsedSucursal = parsePositiveInt(idSucursal);
+  if (!parsedCliente || !parsedSucursal) return;
+  try {
+    await client.query(
+      `INSERT INTO public.clientes_sucursales (id_cliente, id_sucursal, estado, es_principal)
+       VALUES ($1, $2, TRUE, $3)
+       ON CONFLICT (id_cliente, id_sucursal)
+       DO UPDATE SET
+         estado = TRUE,
+         es_principal = CASE
+           WHEN EXCLUDED.es_principal THEN TRUE
+           ELSE public.clientes_sucursales.es_principal
+         END,
+         updated_at = timezone('America/Tegucigalpa', now())`,
+      [parsedCliente, parsedSucursal, Boolean(setPrincipal)]
+    );
+    if (setPrincipal) {
+      await client.query(
+        `UPDATE public.clientes_sucursales
+         SET es_principal = CASE WHEN id_sucursal = $2 THEN TRUE ELSE FALSE END,
+             updated_at = timezone('America/Tegucigalpa', now())
+         WHERE id_cliente = $1
+           AND COALESCE(estado, TRUE) = TRUE`,
+        [parsedCliente, parsedSucursal]
+      );
+    }
+  } catch (error) {
+    if (['42P01', '42P10'].includes(error?.code)) {
+      const bootstrapped = await ensureClientesSucursalesTableAtomic(client);
+      if (!bootstrapped) return;
+      try {
+        await client.query(
+          `INSERT INTO public.clientes_sucursales (id_cliente, id_sucursal, estado, es_principal)
+           VALUES ($1, $2, TRUE, $3)
+           ON CONFLICT (id_cliente, id_sucursal)
+           DO UPDATE SET
+             estado = TRUE,
+             es_principal = CASE
+               WHEN EXCLUDED.es_principal THEN TRUE
+               ELSE public.clientes_sucursales.es_principal
+             END,
+             updated_at = timezone('America/Tegucigalpa', now())`,
+          [parsedCliente, parsedSucursal, Boolean(setPrincipal)]
+        );
+        if (setPrincipal) {
+          await client.query(
+            `UPDATE public.clientes_sucursales
+             SET es_principal = CASE WHEN id_sucursal = $2 THEN TRUE ELSE FALSE END,
+                 updated_at = timezone('America/Tegucigalpa', now())
+             WHERE id_cliente = $1
+               AND COALESCE(estado, TRUE) = TRUE`,
+            [parsedCliente, parsedSucursal]
+          );
+        }
+      } catch (retryError) {
+        if (['42P01', '42703', '42P10'].includes(retryError?.code)) return;
+        throw retryError;
+      }
+      return;
+    }
+    if (error?.code === '42703') {
+      try {
+        await client.query(
+          `INSERT INTO public.clientes_sucursales (id_cliente, id_sucursal)
+           VALUES ($1, $2)
+           ON CONFLICT (id_cliente, id_sucursal) DO NOTHING`,
+          [parsedCliente, parsedSucursal]
+        );
+      } catch (fallbackError) {
+        if (['42P01', '42703', '42P10'].includes(fallbackError?.code)) return;
+        throw fallbackError;
+      }
+      return;
+    }
+    throw error;
+  }
+};
+
+const syncClienteEmpresaContext = async (client, idCliente, idEmpresaCliente, idEmpresaTenant = null) => {
+  const parsedCliente = parsePositiveInt(idCliente);
+  const parsedEmpresaCliente = parsePositiveInt(idEmpresaCliente);
+  if (!parsedCliente || !parsedEmpresaCliente) return;
+
+  const hasEmpresaCliente = await hasClienteEmpresaField(client, { forceRefresh: true });
+  if (!hasEmpresaCliente) return;
+
+  const parsedTenant = parsePositiveInt(idEmpresaTenant);
+  if (parsedTenant) {
+    await client.query(
+      `UPDATE public.clientes
+       SET id_empresa = $1,
+           id_empresa_cliente = $2
+       WHERE id_cliente = $3`,
+      [parsedTenant, parsedEmpresaCliente, parsedCliente]
+    );
+  } else {
+    await client.query(
+      `UPDATE public.clientes
+       SET id_empresa_cliente = COALESCE(id_empresa_cliente, $1)
+       WHERE id_cliente = $2`,
+      [parsedEmpresaCliente, parsedCliente]
+    );
+  }
+};
+
+const validateAtomicSucursalInput = (payload) => {
+  if (!isPlainObject(payload)) return { ok: true, parsed: null };
+  const hasField = Object.prototype.hasOwnProperty.call(payload, 'id_sucursal');
+  if (!hasField) return { ok: true, parsed: null };
+  const raw = payload.id_sucursal;
+  if (raw === null || raw === undefined || raw === '') return { ok: true, parsed: null };
+  const parsed = parsePositiveInt(raw);
+  if (!parsed) return { ok: false, parsed: null };
+  return { ok: true, parsed };
+};
+
+const linkClienteToSucursales = async ({
+  client,
+  idCliente,
+  effectiveSucursalId
+}) => {
+  const targetSucursal = parsePositiveInt(effectiveSucursalId);
+  if (!targetSucursal) return [];
+
+  await trySetClienteSucursal(client, idCliente, targetSucursal);
+  await tryUpsertClienteSucursalLink(client, idCliente, targetSucursal, {
+    setPrincipal: true
+  });
+  return [targetSucursal];
+};
+
+const findReusableClienteAtomic = async (client, { idPersona = null, idEmpresaCliente = null } = {}) => {
+  const parsedPersona = parsePositiveInt(idPersona);
+  const parsedEmpresa = parsePositiveInt(idEmpresaCliente);
+
+  if (parsedPersona) {
+    const rs = await client.query(
+      `SELECT c.id_cliente
+       FROM public.clientes c
+       WHERE c.id_persona = $1
+       ORDER BY c.id_cliente ASC
+       LIMIT 1`,
+      [parsedPersona]
+    );
+    const found = parsePositiveInt(rs.rows?.[0]?.id_cliente);
+    if (found) return found;
+  }
+
+  if (parsedEmpresa) {
+    const hasEmpresaCliente = await hasClienteEmpresaField(client, { forceRefresh: true });
+    const empresaRelationExpr = hasEmpresaCliente
+      ? 'COALESCE(c.id_empresa_cliente, CASE WHEN c.id_persona IS NULL THEN c.id_empresa ELSE NULL END)'
+      : 'c.id_empresa';
+    const empresaOnlyGuard = hasEmpresaCliente ? '' : ' AND c.id_persona IS NULL';
+    const rs = await client.query(
+      `SELECT c.id_cliente
+       FROM public.clientes c
+       WHERE ${empresaRelationExpr} = $1${empresaOnlyGuard}
+       ORDER BY c.id_cliente ASC
+       LIMIT 1`,
+      [parsedEmpresa]
+    );
+    const found = parsePositiveInt(rs.rows?.[0]?.id_cliente);
+    if (found) return found;
+  }
+
+  return null;
 };
 
 const atomicService = {
@@ -384,16 +833,33 @@ const atomicService = {
 
     try {
       await client.query('BEGIN');
+      const { tenantId: resolvedTenantId, isSuperAdmin } = await resolveTenantContextForRequest(req, client);
+      if (!resolvedTenantId && !isSuperAdmin) {
+        const error = new Error('No se pudo resolver la empresa del usuario para crear el cliente.');
+        error.httpStatus = 403;
+        throw error;
+      }
+      const requestWithTenant = resolvedTenantId
+        ? {
+            ...req,
+            user: {
+              ...(req.user || {}),
+              id_empresa: resolvedTenantId
+            }
+          }
+        : req;
 
       let idPersona = parsePositiveInt(body.id_persona ?? clientePayload.id_persona);
-      let idEmpresa = parsePositiveInt(body.id_empresa ?? clientePayload.id_empresa);
+      let idEmpresa = parsePositiveInt(
+        body.id_empresa_cliente ?? clientePayload.id_empresa_cliente ?? body.id_empresa ?? clientePayload.id_empresa
+      );
       let personaCreada = false;
       let empresaCreada = false;
 
       if (origen === 'empresa') {
         const empresaResult = await resolveOrCreateEmpresa({
           client,
-          req,
+          req: requestWithTenant,
           idEmpresa,
           empresaPayload: body.empresa,
           allowClientesContext: true
@@ -404,7 +870,7 @@ const atomicService = {
       } else {
         const personaResult = await resolveOrCreatePersona({
           client,
-          req,
+          req: requestWithTenant,
           idPersona,
           personaPayload: body.persona,
           allowClientesContext: true
@@ -414,11 +880,43 @@ const atomicService = {
         idEmpresa = null;
       }
 
-      const normalizedCliente = normalizeClienteAtomicPayload({
+      const userSucursalId = parsePositiveInt(req.user?.id_sucursal);
+
+      const supportsEmpresaClienteInFn = await fnGuardarClienteSupportsEmpresaCliente(client);
+
+      let normalizedCliente = normalizeClienteAtomicPayload({
         ...clientePayload,
         id_persona: idPersona,
-        id_empresa: idEmpresa
+        id_empresa_cliente: idEmpresa
       });
+      const tenantId = resolvedTenantId;
+      if (tenantId && supportsEmpresaClienteInFn && !isSuperAdmin) {
+        normalizedCliente = {
+          ...normalizedCliente,
+          id_empresa: tenantId
+        };
+      }
+
+      const sucursalValidation = validateAtomicSucursalInput(clientePayload);
+      if (!sucursalValidation.ok) {
+        const error = new Error('id_sucursal debe ser un entero positivo.');
+        error.httpStatus = 400;
+        throw error;
+      }
+
+      const payloadSucursalId = parsePositiveInt(normalizedCliente.id_sucursal);
+      const effectiveSucursalId = payloadSucursalId || userSucursalId || null;
+      if (!effectiveSucursalId) {
+        const error = new Error('No se pudo resolver la sucursal del cliente. Selecciona una sucursal valida.');
+        error.httpStatus = 400;
+        throw error;
+      }
+      if (effectiveSucursalId) {
+        normalizedCliente = {
+          ...normalizedCliente,
+          id_sucursal: effectiveSucursalId
+        };
+      }
 
       const idTipoCliente = parsePositiveInt(normalizedCliente.id_tipo_cliente);
       if (!idTipoCliente) {
@@ -454,26 +952,131 @@ const atomicService = {
         }
       }
 
-      if ((normalizedCliente.id_persona ? 1 : 0) + (normalizedCliente.id_empresa ? 1 : 0) !== 1) {
+      const empresaRelacionId = parsePositiveInt(normalizedCliente.id_empresa_cliente ?? idEmpresa);
+      if ((normalizedCliente.id_persona ? 1 : 0) + (empresaRelacionId ? 1 : 0) !== 1) {
         const error = new Error('Cliente atomico requiere exactamente una relacion: persona o empresa');
         error.httpStatus = 400;
         throw error;
       }
 
-      const createResult = await client.query('SELECT fn_guardar_cliente($1::json) AS id_cliente', [
-        JSON.stringify(normalizedCliente)
-      ]);
+      if (empresaRelacionId) {
+        normalizedCliente.id_persona = null;
+      }
 
-      const idCliente = parsePositiveInt(createResult.rows?.[0]?.id_cliente);
+      const reusableClienteId = await findReusableClienteAtomic(client, {
+        idPersona: normalizedCliente.id_persona,
+        idEmpresaCliente: empresaRelacionId
+      });
+      if (reusableClienteId) {
+        if (empresaRelacionId) {
+          await syncClienteEmpresaContext(
+            client,
+            reusableClienteId,
+            empresaRelacionId,
+            !isSuperAdmin ? tenantId : null
+          );
+        }
+        const sucursalLinks = await linkClienteToSucursales({
+          client,
+          idCliente: reusableClienteId,
+          effectiveSucursalId: normalizedCliente.id_sucursal
+        });
+
+        let clienteVinculado = null;
+        try {
+          clienteVinculado = await findClienteDetail(client, reusableClienteId);
+        } catch (error) {
+          console.warn('Clientes atomico: no se pudo cargar detalle post-vinculacion:', error?.message || error);
+        }
+
+        await client.query('COMMIT');
+        return {
+          status: 200,
+          body: {
+            ok: true,
+            error: false,
+            vinculado: true,
+            message: 'Cliente existente vinculado a esta sucursal.',
+            data: {
+              ...buildAtomicSuccessData({
+                entidadTipo: 'cliente',
+                entidad: clienteVinculado,
+                idPrincipal: reusableClienteId,
+                idPersona: normalizedCliente.id_persona ?? null,
+                idEmpresa: empresaRelacionId ?? null,
+                personaCreada,
+                empresaCreada
+              }),
+              id_cliente: reusableClienteId,
+              id_sucursales_vinculadas: sucursalLinks,
+              cliente: clienteVinculado
+            }
+          }
+        };
+      }
+
+      const clienteFnPayload = { ...normalizedCliente };
+      if (supportsEmpresaClienteInFn) {
+        clienteFnPayload.id_empresa_cliente = empresaRelacionId;
+      } else {
+        delete clienteFnPayload.id_empresa_cliente;
+        if (empresaRelacionId) clienteFnPayload.id_empresa = empresaRelacionId;
+      }
+
+      let createResult;
+      try {
+        createResult = await client.query('SELECT public.fn_guardar_cliente($1::json) AS id_cliente', [
+          JSON.stringify(clienteFnPayload)
+        ]);
+      } catch (error) {
+        // Compatibilidad en caliente: si la funcion sigue en contrato legacy, reintenta con id_empresa.
+        if (supportsEmpresaClienteInFn && empresaRelacionId && isLegacyClienteRelationError(error)) {
+          const legacyPayload = { ...clienteFnPayload, id_empresa: empresaRelacionId };
+          delete legacyPayload.id_empresa_cliente;
+          createResult = await client.query('SELECT public.fn_guardar_cliente($1::json) AS id_cliente', [
+            JSON.stringify(legacyPayload)
+          ]);
+          fnGuardarClienteSupportsEmpresaClienteCache = false;
+        } else {
+          throw error;
+        }
+      }
+
+      const idCliente = extractIdFromUnknown(createResult.rows?.[0]?.id_cliente, [
+        'id_cliente',
+        'id',
+        'cliente_id'
+      ]) || extractIdFromUnknown(createResult.rows?.[0]?.resultado, [
+        'id_cliente',
+        'id',
+        'cliente_id'
+      ]);
       if (!idCliente) {
         const error = new Error('No se pudo crear cliente en flujo atomico');
         error.httpStatus = 500;
         throw error;
       }
 
-      await trySetClienteSucursal(client, idCliente, normalizedCliente.id_sucursal);
+      if (empresaRelacionId) {
+        await syncClienteEmpresaContext(
+          client,
+          idCliente,
+          empresaRelacionId,
+          !isSuperAdmin ? tenantId : null
+        );
+      }
+      const sucursalLinks = await linkClienteToSucursales({
+        client,
+        idCliente,
+        effectiveSucursalId: normalizedCliente.id_sucursal
+      });
 
-      const cliente = await findClienteDetail(client, idCliente);
+      let cliente = null;
+      try {
+        cliente = await findClienteDetail(client, idCliente);
+      } catch (error) {
+        console.warn('Clientes atomico: no se pudo cargar detalle post-creacion:', error?.message || error);
+      }
 
       await client.query('COMMIT');
 
@@ -489,11 +1092,12 @@ const atomicService = {
               entidad: cliente,
               idPrincipal: idCliente,
               idPersona: normalizedCliente.id_persona ?? null,
-              idEmpresa: normalizedCliente.id_empresa ?? null,
+              idEmpresa: empresaRelacionId ?? null,
               personaCreada,
               empresaCreada
             }),
             id_cliente: idCliente,
+            id_sucursales_vinculadas: sucursalLinks,
             cliente
           }
         }
