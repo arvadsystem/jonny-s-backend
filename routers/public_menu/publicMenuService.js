@@ -53,12 +53,24 @@ const PUBLIC_EXTRA_OPTIONS = Object.freeze([
     keywords: HAMBURGUESA_KEYWORDS
   }
 ]);
+const ORDER_TYPES_REQUIRING_TRANSFER_PROOF = new Set(['pickup', 'delivery']);
+const MAX_PUBLIC_ORDER_DESCRIPTION_LENGTH = 240;
 
 // Crea errores HTTP controlados para que el controlador responda con status consistente.
 const buildHttpError = (status, message) => {
   const error = new Error(message);
   error.status = status;
   return error;
+};
+
+const normalizeCompactText = (value, maxLength = 120) => {
+  const clean = String(value ?? '')
+    .trim()
+    .replace(/\s+/g, ' ');
+
+  if (!clean) return '';
+  const limit = Number.isInteger(maxLength) && maxLength > 0 ? maxLength : 120;
+  return clean.slice(0, limit);
 };
 
 const normalizeTextKey = (value) =>
@@ -550,6 +562,64 @@ const buildLineObservation = ({ extras = [], salsasPorUnidad = [] }) => {
   return `PUBCFG:v1|${chunks.join('|')}`.slice(0, 200);
 };
 
+const normalizePublicOrderBusinessContext = ({ tipoPedido, business = {} }) => {
+  const contactoRaw = business?.contacto && typeof business.contacto === 'object'
+    ? business.contacto
+    : {};
+  const entregaRaw = business?.entrega && typeof business.entrega === 'object'
+    ? business.entrega
+    : {};
+  const pagoRaw = business?.pago && typeof business.pago === 'object'
+    ? business.pago
+    : {};
+
+  return {
+    contacto: {
+      nombre: normalizeCompactText(contactoRaw.nombre, 120),
+      telefono: normalizeCompactText(contactoRaw.telefono, 30)
+    },
+    entrega: {
+      direccion: normalizeCompactText(entregaRaw.direccion, 240),
+      referencia: normalizeCompactText(entregaRaw.referencia, 160)
+    },
+    pago: {
+      metodo: normalizeCompactText(pagoRaw.metodo, 40),
+      comprobante_transferencia: normalizeCompactText(pagoRaw.comprobante_transferencia, 180)
+    },
+    requiresTransferProof: ORDER_TYPES_REQUIRING_TRANSFER_PROOF.has(String(tipoPedido || ''))
+  };
+};
+
+const buildPublicOrderDescription = ({ origen, tipoPedido, businessContext }) => {
+  const safeOrigin = normalizeCompactText(origen || 'public-menu', 60) || 'public-menu';
+  const base = `[${safeOrigin}] pedido web`;
+  const chunks = [];
+
+  if (businessContext?.contacto?.telefono) {
+    chunks.push(`tel:${businessContext.contacto.telefono}`);
+  }
+
+  if (businessContext?.pago?.comprobante_transferencia) {
+    chunks.push(`comp:${businessContext.pago.comprobante_transferencia}`);
+  }
+
+  if (String(tipoPedido || '') === 'delivery') {
+    if (businessContext?.entrega?.direccion) {
+      chunks.push(`dir:${businessContext.entrega.direccion}`);
+    }
+
+    if (businessContext?.entrega?.referencia) {
+      chunks.push(`ref:${businessContext.entrega.referencia}`);
+    }
+  }
+
+  if (chunks.length === 0) {
+    return base.slice(0, MAX_PUBLIC_ORDER_DESCRIPTION_LENGTH);
+  }
+
+  return `${base} | ${chunks.join(' | ')}`.slice(0, MAX_PUBLIC_ORDER_DESCRIPTION_LENGTH);
+};
+
 const validateAndResolveLineConfiguration = ({ catalog, line }) => {
   const extraOptions = Array.isArray(catalog?.extras_opciones) ? catalog.extras_opciones : [];
   const extraOptionById = new Map(extraOptions.map((option) => [String(option.id_extra), option]));
@@ -727,6 +797,7 @@ export const createPublicOrderService = async ({
   idSucursal,
   tipoPedido,
   origen = 'public-menu',
+  business = {},
   items = [],
   auth = {}
 }) => {
@@ -734,6 +805,23 @@ export const createPublicOrderService = async ({
   const idCliente = toPositiveInt(auth?.idCliente);
   if (!idUsuario || !idCliente) {
     throw buildHttpError(401, 'Sesion de cliente invalida para registrar el pedido.');
+  }
+
+  const businessContext = normalizePublicOrderBusinessContext({
+    tipoPedido,
+    business
+  });
+
+  if (businessContext.requiresTransferProof && !businessContext.pago.comprobante_transferencia) {
+    throw buildHttpError(400, 'Debes adjuntar referencia o comprobante de transferencia.');
+  }
+
+  if (businessContext.requiresTransferProof && !businessContext.contacto.telefono) {
+    throw buildHttpError(400, 'Debes enviar telefono de contacto para pickup/delivery.');
+  }
+
+  if (String(tipoPedido || '') === 'delivery' && !businessContext.entrega.direccion) {
+    throw buildHttpError(400, 'Debes enviar direccion de entrega para pedidos delivery.');
   }
 
   const activeMenu = await fetchActiveMenuByBranchQuery(idSucursal);
@@ -824,7 +912,11 @@ export const createPublicOrderService = async ({
   }
 
   const descripcionEnvio = SERVICE_TYPE_BY_ORDER_TYPE[tipoPedido] || 'LOCAL';
-  const descripcionPedido = `[${origen}] pedido web`;
+  const descripcionPedido = buildPublicOrderDescription({
+    origen,
+    tipoPedido,
+    businessContext
+  });
 
   const client = await pool.connect();
   try {
@@ -868,6 +960,7 @@ export const createPublicOrderService = async ({
       id_cliente: Number(idCliente),
       id_menu: Number(activeMenu.id_menu),
       tipo_pedido: tipoPedido,
+      business: businessContext,
       estado: 'PENDIENTE',
       total,
       total_items: normalizedLines.reduce((sum, line) => sum + Number(line.cantidad || 0), 0),
