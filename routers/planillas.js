@@ -624,6 +624,203 @@ const syncDetalleSalarioBaseFromEmpleado = async ({
   return { updated: result.rowCount || 0 };
 };
 
+const PLANILLA_DETALLE_AUTO_SYNC_ALLOWED_STATES = new Set(['BORRADOR', 'CALCULADA']);
+
+const dedupeDetallePlanillaByEmpleado = async ({ db = pool, idPlanilla }) => {
+  const safePlanillaId = parsePositiveInt(idPlanilla);
+  if (!safePlanillaId) {
+    return { duplicated: 0, moved: 0, deleted: 0 };
+  }
+
+  const dedupeResult = await db.query(
+    `
+      WITH ranked AS (
+        SELECT
+          dp.id_detalle_planilla,
+          dp.id_empleado,
+          FIRST_VALUE(dp.id_detalle_planilla) OVER (
+            PARTITION BY dp.id_planilla, dp.id_empleado
+            ORDER BY dp.id_detalle_planilla ASC
+          ) AS keep_id,
+          ROW_NUMBER() OVER (
+            PARTITION BY dp.id_planilla, dp.id_empleado
+            ORDER BY dp.id_detalle_planilla ASC
+          ) AS rn
+        FROM public.detalle_planilla dp
+        WHERE dp.id_planilla = $1
+      ),
+      duplicates AS (
+        SELECT id_detalle_planilla, keep_id
+        FROM ranked
+        WHERE rn > 1
+      ),
+      moved AS (
+        UPDATE public.movimiento_planilla mp
+        SET id_detalle_planilla = d.keep_id
+        FROM duplicates d
+        WHERE mp.id_detalle_planilla = d.id_detalle_planilla
+        RETURNING mp.id_movimiento_planilla
+      ),
+      deleted AS (
+        DELETE FROM public.detalle_planilla dp
+        USING duplicates d
+        WHERE dp.id_detalle_planilla = d.id_detalle_planilla
+        RETURNING dp.id_detalle_planilla
+      )
+      SELECT
+        (SELECT COUNT(*) FROM duplicates) AS duplicated_count,
+        (SELECT COUNT(*) FROM moved) AS moved_count,
+        (SELECT COUNT(*) FROM deleted) AS deleted_count
+    `,
+    [safePlanillaId]
+  );
+
+  const row = dedupeResult.rows?.[0] || {};
+  return {
+    duplicated: Number(row.duplicated_count || 0),
+    moved: Number(row.moved_count || 0),
+    deleted: Number(row.deleted_count || 0)
+  };
+};
+
+const syncDetalleEmpleadosActivosBySucursal = async ({
+  db = pool,
+  idPlanilla,
+  force = false
+}) => {
+  const safePlanillaId = parsePositiveInt(idPlanilla);
+  if (!safePlanillaId) {
+    return { inserted: 0, skipped: true, reason: 'INVALID_PLANILLA' };
+  }
+
+  const scopeResult = await db.query(
+    `
+      SELECT
+        p.id_sucursal,
+        COALESCE(ep.descripcion, '')::varchar AS estado_planilla
+      FROM public.planillas p
+      LEFT JOIN public.estado_planilla ep
+        ON ep.id_estado_planilla = p.id_estado_planilla
+      WHERE p.id_planilla = $1
+      LIMIT 1
+    `,
+    [safePlanillaId]
+  );
+
+  const scopeRow = scopeResult.rows?.[0];
+  if (!scopeRow) {
+    return { inserted: 0, skipped: true, reason: 'PLANILLA_NOT_FOUND' };
+  }
+
+  const idSucursal = parsePositiveInt(scopeRow.id_sucursal);
+  if (!idSucursal) {
+    return { inserted: 0, skipped: true, reason: 'INVALID_SUCURSAL' };
+  }
+
+  const estadoNormalizado = normalizeEstadoAlias(scopeRow.estado_planilla);
+  const canSync =
+    force || !estadoNormalizado || PLANILLA_DETALLE_AUTO_SYNC_ALLOWED_STATES.has(estadoNormalizado);
+  if (!canSync) {
+    return {
+      inserted: 0,
+      skipped: true,
+      reason: 'PLANILLA_STATE_LOCKED',
+      estado: estadoNormalizado
+    };
+  }
+
+  const dedupe = await dedupeDetallePlanillaByEmpleado({ db, idPlanilla: safePlanillaId });
+
+  const insertResult = await db.query(
+    `
+      WITH planilla_lock AS (
+        SELECT p.id_planilla
+        FROM public.planillas p
+        WHERE p.id_planilla = $1
+        FOR UPDATE
+      ),
+      defaults AS (
+        SELECT
+          COALESCE(
+            (
+              SELECT dp.dias_laborados
+              FROM public.detalle_planilla dp
+              WHERE dp.id_planilla = $1
+              ORDER BY dp.id_detalle_planilla ASC
+              LIMIT 1
+            ),
+            30
+          ) AS dias_laborados_default,
+          COALESCE(
+            (
+              SELECT dp.horas_laboradas
+              FROM public.detalle_planilla dp
+              WHERE dp.id_planilla = $1
+              ORDER BY dp.id_detalle_planilla ASC
+              LIMIT 1
+            ),
+            240
+          ) AS horas_laboradas_default
+      )
+      INSERT INTO public.detalle_planilla (
+        salario_base,
+        dias_laborados,
+        horas_laboradas,
+        total_deducciones,
+        total_bonos,
+        neto_pagar,
+        id_planilla,
+        id_horas_extra,
+        id_empleado,
+        observaciones
+      )
+      SELECT
+        COALESCE(e.salario_base, 0),
+        d.dias_laborados_default,
+        d.horas_laboradas_default,
+        0,
+        0,
+        COALESCE(e.salario_base, 0),
+        $1,
+        NULL,
+        e.id_empleado,
+        'Sincronizado automaticamente por cambio de personal en sucursal'
+      FROM public.empleados e
+      CROSS JOIN defaults d
+      CROSS JOIN planilla_lock pl
+      WHERE e.estado = TRUE
+        AND e.id_sucursal = $2
+        AND NOT EXISTS (
+          SELECT 1
+          FROM public.detalle_planilla dp
+          WHERE dp.id_planilla = $1
+            AND dp.id_empleado = e.id_empleado
+        )
+      RETURNING id_detalle_planilla
+    `,
+    [safePlanillaId, idSucursal]
+  );
+
+  if (dedupe.deleted > 0) {
+    await db.query(
+      `
+        SELECT public.fn_recalcular_detalle_planilla(dp.id_detalle_planilla)
+        FROM public.detalle_planilla dp
+        WHERE dp.id_planilla = $1
+      `,
+      [safePlanillaId]
+    );
+  }
+
+  return {
+    inserted: insertResult.rowCount || 0,
+    deduped: dedupe.deleted,
+    skipped: false,
+    estado: estadoNormalizado,
+    id_sucursal: idSucursal
+  };
+};
+
 const toTimestampSafe = (value) => {
   const parsed = new Date(value ?? 0).getTime();
   return Number.isFinite(parsed) ? parsed : 0;
@@ -1458,6 +1655,7 @@ const planillaService = {
       return { status: scopeValidation.status, body: scopeValidation.body };
     }
 
+    await syncDetalleEmpleadosActivosBySucursal({ idPlanilla });
     await syncDetalleSalarioBaseFromEmpleado({ idPlanilla });
     const rows = await queryFunctionRows(PLANILLA_ENDPOINT_CONTRACT.recalcularPlanilla, [idPlanilla]);
     return {
@@ -1479,6 +1677,9 @@ const planillaService = {
     if (!scopeValidation.ok) {
       return { status: scopeValidation.status, body: scopeValidation.body };
     }
+
+    await syncDetalleEmpleadosActivosBySucursal({ idPlanilla });
+    await syncDetalleSalarioBaseFromEmpleado({ idPlanilla });
 
     const pagination = parsePagination(req.query || {});
     if (!pagination) {
@@ -1599,6 +1800,9 @@ const planillaService = {
       return { status: scopeValidation.status, body: scopeValidation.body };
     }
 
+    await syncDetalleEmpleadosActivosBySucursal({ idPlanilla });
+    await syncDetalleSalarioBaseFromEmpleado({ idPlanilla });
+
     const rows = await queryFunctionRows(PLANILLA_ENDPOINT_CONTRACT.resumen, [idPlanilla]);
     const resumenBase = rows[0] || {};
 
@@ -1634,6 +1838,9 @@ const planillaService = {
     if (!scopeValidation.ok) {
       return { status: scopeValidation.status, body: scopeValidation.body };
     }
+
+    await syncDetalleEmpleadosActivosBySucursal({ idPlanilla });
+    await syncDetalleSalarioBaseFromEmpleado({ idPlanilla });
 
     const data = await queryFunctionScalar(PLANILLA_ENDPOINT_CONTRACT.completa, [idPlanilla]);
     return { status: 200, body: { error: false, data } };
@@ -2114,6 +2321,7 @@ const planillaService = {
       recalcular = parsedRecalcular;
     }
     if (recalcular) {
+      await syncDetalleEmpleadosActivosBySucursal({ idPlanilla });
       await syncDetalleSalarioBaseFromEmpleado({ idPlanilla });
     }
     await queryFunctionScalar(PLANILLA_ENDPOINT_CONTRACT.actualizarEstado, [
