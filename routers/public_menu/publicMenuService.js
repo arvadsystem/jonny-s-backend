@@ -568,6 +568,46 @@ const buildLineObservation = ({ extras = [], salsasPorUnidad = [] }) => {
   return `PUBCFG:v1|${chunks.join('|')}`.slice(0, 200);
 };
 
+const buildLineStructuredConfig = ({
+  line = {},
+  catalog = {},
+  configuration = {},
+  precioUnitario = 0,
+  subtotal = 0
+}) => {
+  const extras = [...(Array.isArray(configuration?.extras) ? configuration.extras : [])]
+    .map((entry) => ({
+      id_extra: String(entry?.id_extra || ''),
+      codigo: String(entry?.codigo || entry?.id_extra || ''),
+      nombre: String(entry?.nombre || 'Extra'),
+      precio_adicional: roundMoney(entry?.precio_adicional || 0)
+    }))
+    .filter((entry) => entry.id_extra)
+    .sort((left, right) => left.id_extra.localeCompare(right.id_extra));
+
+  const salsasPorUnidad = [...(Array.isArray(configuration?.salsas_por_unidad) ? configuration.salsas_por_unidad : [])]
+    .map((entry) => ({
+      id_salsa: Number(entry?.id_salsa || 0),
+      cantidad: Number(entry?.cantidad || 0)
+    }))
+    .filter((entry) => Number.isInteger(entry.id_salsa) && entry.id_salsa > 0 && Number.isInteger(entry.cantidad) && entry.cantidad > 0)
+    .sort((left, right) => left.id_salsa - right.id_salsa);
+
+  // Snapshot inmutable de la linea para trazabilidad operativa (cocina/ventas/auditoria).
+  return {
+    schema_version: 'menu_publico_linea_v1',
+    id_detalle_menu: Number(catalog?.id_detalle_menu || line?.id_detalle_menu || 0),
+    tipo_item: String(catalog?.tipo_item || line?.tipo_item || 'PRODUCTO'),
+    nombre_item: String(catalog?.nombre || line?.nombre || 'Item'),
+    cantidad: Number(line?.cantidad || 0),
+    precio_unitario: roundMoney(precioUnitario || 0),
+    subtotal_linea: roundMoney(subtotal || 0),
+    extras,
+    salsas_por_unidad: salsasPorUnidad,
+    salsas_requeridas: Number(configuration?.salsas_requeridas || 0)
+  };
+};
+
 const normalizePublicOrderBusinessContext = ({ tipoPedido, business = {} }) => {
   const contactoRaw = business?.contacto && typeof business.contacto === 'object'
     ? business.contacto
@@ -893,6 +933,13 @@ export const createPublicOrderService = async ({
       extras: configuration.extras,
       salsasPorUnidad: configuration.salsas_por_unidad
     });
+    const configuracionMenu = buildLineStructuredConfig({
+      line,
+      catalog,
+      configuration,
+      precioUnitario,
+      subtotal
+    });
 
     return {
       id_detalle_menu: Number(catalog.id_detalle_menu),
@@ -905,6 +952,7 @@ export const createPublicOrderService = async ({
       precio_unitario: roundMoney(precioUnitario),
       subtotal,
       observacion,
+      configuracion_menu: configuracionMenu,
       extras: configuration.extras,
       salsas_por_unidad: configuration.salsas_por_unidad,
       salsas_requeridas: configuration.salsas_requeridas
@@ -959,7 +1007,8 @@ export const createPublicOrderService = async ({
         id_pedido: idPedido,
         id_combo: line.id_combo,
         id_receta: line.id_receta,
-        observacion: line.observacion
+        observacion: line.observacion,
+        configuracion_menu: line.configuracion_menu
       });
     }
 
@@ -986,6 +1035,7 @@ export const createPublicOrderService = async ({
         cantidad: line.cantidad,
         precio_unitario: line.precio_unitario,
         subtotal: line.subtotal,
+        configuracion_menu: line.configuracion_menu,
         extras: line.extras,
         salsas_por_unidad: line.salsas_por_unidad,
         salsas_requeridas: line.salsas_requeridas

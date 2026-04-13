@@ -513,29 +513,56 @@ export const insertPublicPedidoQuery = async (client, payload) => {
 
 // Inserta una linea de detalle para pedido publico.
 export const insertPublicPedidoDetalleQuery = async (client, payload) => {
+  const hasConfiguracionMenuColumn = await hasColumn('detalle_pedido', 'configuracion_menu');
+
+  const columns = [
+    'sub_total_pedido',
+    'total_pedido',
+    'id_producto',
+    'id_pedido',
+    'id_descuento',
+    'estado',
+    'id_combo',
+    'id_receta',
+    'observacion'
+  ];
+  const params = [
+    payload.sub_total_pedido,
+    payload.total_pedido,
+    payload.id_producto,
+    payload.id_pedido,
+    null,
+    true,
+    payload.id_combo,
+    payload.id_receta,
+    payload.observacion
+  ];
+  const values = [
+    '$1',
+    '$2',
+    '$3',
+    '$4',
+    '$5',
+    '$6',
+    '$7',
+    '$8',
+    '$9'
+  ];
+
+  // Item 11: persistimos configuracion estructurada del menu cuando el esquema lo soporta.
+  if (hasConfiguracionMenuColumn) {
+    columns.push('configuracion_menu');
+    params.push(payload.configuracion_menu ? JSON.stringify(payload.configuracion_menu) : null);
+    values.push(`$${params.length}::jsonb`);
+  }
+
   await client.query(
     `
       INSERT INTO detalle_pedido (
-        sub_total_pedido,
-        total_pedido,
-        id_producto,
-        id_pedido,
-        id_descuento,
-        estado,
-        id_combo,
-        id_receta,
-        observacion
+        ${columns.join(',\n        ')}
       )
-      VALUES ($1, $2, $3, $4, NULL, true, $5, $6, $7);
+      VALUES (${values.join(', ')});
     `,
-    [
-      payload.sub_total_pedido,
-      payload.total_pedido,
-      payload.id_producto,
-      payload.id_pedido,
-      payload.id_combo,
-      payload.id_receta,
-      payload.observacion
-    ]
+    params
   );
 };
