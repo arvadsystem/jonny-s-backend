@@ -61,12 +61,22 @@ const PUBLIC_EXTRA_OPTIONS = Object.freeze([
 ]);
 const ORDER_TYPES_REQUIRING_TRANSFER_PROOF = new Set(['pickup', 'delivery']);
 const MAX_PUBLIC_ORDER_DESCRIPTION_LENGTH = 240;
+const PUBLIC_MENU_DEMO_ENV_TRUE_VALUES = new Set(['1', 'true', 'yes', 'on']);
 
 // Crea errores HTTP controlados para que el controlador responda con status consistente.
 const buildHttpError = (status, message) => {
   const error = new Error(message);
   error.status = status;
   return error;
+};
+
+// Flag temporal para pruebas: permite registrar pedidos aunque el item marque no disponible.
+const isPublicMenuDemoAllowUnavailableOrdersEnabled = () => {
+  const rawValue = String(process.env.PUBLIC_MENU_DEMO_ALLOW_UNAVAILABLE_ORDERS || '')
+    .trim()
+    .toLowerCase();
+
+  return PUBLIC_MENU_DEMO_ENV_TRUE_VALUES.has(rawValue);
 };
 
 const normalizeCompactText = (value, maxLength = 120) => {
@@ -636,9 +646,9 @@ const normalizePublicOrderBusinessContext = ({ tipoPedido, business = {} }) => {
   };
 };
 
-const buildPublicOrderDescription = ({ origen, tipoPedido, businessContext }) => {
+const buildPublicOrderDescription = ({ origen, tipoPedido, businessContext, demoMode = false }) => {
   const safeOrigin = normalizeCompactText(origen || 'public-menu', 60) || 'public-menu';
-  const base = `[${safeOrigin}] pedido web`;
+  const base = `${demoMode ? '[DEMO] ' : ''}[${safeOrigin}] pedido web`;
   const chunks = [];
 
   if (businessContext?.contacto?.telefono) {
@@ -881,6 +891,8 @@ export const createPublicOrderService = async ({
   }
 
   const rows = await fetchCatalogRowsByMenuQuery(Number(activeMenu.id_menu));
+  // Se calcula una sola vez para toda la transaccion y evita lecturas repetidas de process.env.
+  const allowUnavailableItemsForDemo = isPublicMenuDemoAllowUnavailableOrdersEnabled();
   const sauceConfigByDetail = await buildCatalogSauceConfigByDetail(rows);
 
   const recipeIds = rows
@@ -916,7 +928,7 @@ export const createPublicOrderService = async ({
       throw buildHttpError(400, `El item ${line.id_detalle_menu} no pertenece al menu vigente de la sucursal.`);
     }
 
-    if (!catalog?.disponibilidad?.available) {
+    if (!catalog?.disponibilidad?.available && !allowUnavailableItemsForDemo) {
       throw buildHttpError(409, `El item ${catalog.nombre} no esta disponible actualmente.`);
     }
 
@@ -973,7 +985,8 @@ export const createPublicOrderService = async ({
   const descripcionPedido = buildPublicOrderDescription({
     origen,
     tipoPedido,
-    businessContext
+    businessContext,
+    demoMode: allowUnavailableItemsForDemo
   });
 
   const client = await pool.connect();
@@ -1025,6 +1038,7 @@ export const createPublicOrderService = async ({
       business: businessContext,
       estado: 'PENDIENTE',
       estado_pago: INITIAL_ORDER_PAYMENT_STATE,
+      demo_mode: allowUnavailableItemsForDemo,
       total,
       total_items: normalizedLines.reduce((sum, line) => sum + Number(line.cantidad || 0), 0),
       fecha_hora_pedido: pedido?.fecha_hora_pedido || null,

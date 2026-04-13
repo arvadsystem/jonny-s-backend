@@ -6,6 +6,7 @@
   "scripts": {
     "start": "node app.js",
     "dev": "node --watch app.js",
+    "qa:menu-publico": "node scripts/qa-menu-publico.js",
     "rbac:personas:dry-run": "node scripts/sync-personas-rbac.js",
     "rbac:personas:sync": "node scripts/sync-personas-rbac.js --apply",
     "test": "echo \"Error: no test specified\" && exit 1"
