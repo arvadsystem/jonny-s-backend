@@ -169,6 +169,56 @@ const readRequestPermissions = async (req) => {
   return payload;
 };
 
+const readRequestRoles = async (req) => {
+  if (req?.__roleAccess) return req.__roleAccess;
+
+  const idUsuario = resolveRequestUserId(req);
+  if (!idUsuario) {
+    const empty = {
+      idUsuario: null,
+      isSuperAdmin: false,
+      roles: new Set()
+    };
+    req.__roleAccess = empty;
+    return empty;
+  }
+
+  const sql = `
+    SELECT
+      COALESCE(
+        BOOL_OR(UPPER(REGEXP_REPLACE(TRIM(r.nombre), '[\\s-]+', '_', 'g')) = 'SUPER_ADMIN'),
+        FALSE
+      ) AS is_super_admin,
+      COALESCE(
+        ARRAY_REMOVE(
+          ARRAY_AGG(DISTINCT UPPER(REGEXP_REPLACE(TRIM(r.nombre), '[\\s-]+', '_', 'g'))),
+          NULL
+        ),
+        ARRAY[]::text[]
+      ) AS roles
+    FROM roles_usuarios ru
+    INNER JOIN roles r ON r.id_rol = ru.id_rol
+    WHERE ru.id_usuario = $1
+  `;
+
+  const result = await pool.query(sql, [idUsuario]);
+  const access = result.rows?.[0] || {};
+  const roles = new Set(
+    (Array.isArray(access.roles) ? access.roles : [])
+      .map(normalizeRoleName)
+      .filter(Boolean)
+  );
+
+  const payload = {
+    idUsuario,
+    isSuperAdmin: Boolean(access.is_super_admin),
+    roles
+  };
+
+  req.__roleAccess = payload;
+  return payload;
+};
+
 export const requestHasAnyPermission = async (req, requiredPermission) => {
   const requiredPermissions = normalizeRequiredPermissions(requiredPermission);
   if (requiredPermissions.length === 0) return true;
@@ -176,6 +226,19 @@ export const requestHasAnyPermission = async (req, requiredPermission) => {
   const access = await readRequestPermissions(req);
   if (access.isSuperAdmin) return true;
   return requiredPermissions.some((permission) => access.permissions.has(permission));
+};
+
+export const requestHasAnyRole = async (req, requiredRoles) => {
+  const normalizedRequiredRoles = (Array.isArray(requiredRoles) ? requiredRoles : [requiredRoles])
+    .map(normalizeRoleName)
+    .filter(Boolean);
+
+  if (normalizedRequiredRoles.length === 0) return true;
+
+  const access = await readRequestRoles(req);
+  if (access.isSuperAdmin) return true;
+
+  return normalizedRequiredRoles.some((role) => access.roles.has(role));
 };
 
 export const isRequestUserSuperAdmin = async (req) => {

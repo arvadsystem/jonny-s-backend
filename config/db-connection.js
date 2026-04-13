@@ -19,13 +19,23 @@ const pool = new Pool({
   },
 });
 
-pool.connect((err, client, release) => {
-  if (err) {
-    console.error('Error al conectar con la base de datos:', err.stack);
-  } else {
-    console.log('¡Conexión exitosa a Supabase!');
-    release();
-  }
+// Capturar errores inesperados del pool (conexiones idle que mueren)
+// para que no crasheen el proceso.
+pool.on('error', (err) => {
+  console.error('❌ [pool] Error inesperado en conexión idle:', err.message);
 });
+
+// Promesa de "readiness": permite que app.js espere la conexión
+// antes de aceptar requests.
+export const dbReady = pool.connect()
+  .then((client) => {
+    console.log('✅ ¡Conexión exitosa a Supabase!');
+    client.release();
+    return true;
+  })
+  .catch((err) => {
+    console.error('❌ Error al conectar con la base de datos:', err.message);
+    return false;
+  });
 
 export default pool;

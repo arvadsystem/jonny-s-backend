@@ -231,6 +231,24 @@ router.post('/api/public/register', registerLimiter, async (req, res) => {
       );
     }
 
+    await client.query(
+      `
+        INSERT INTO usuarios_clientes (
+          id_usuario,
+          id_cliente,
+          estado,
+          fecha_vinculacion,
+          fecha_actualizacion
+        )
+        VALUES ($1, $2, true, NOW(), NOW())
+        ON CONFLICT (id_usuario, id_cliente) DO UPDATE
+        SET
+          estado = true,
+          fecha_actualizacion = NOW()
+      `,
+      [nuevoUsuario.id_usuario, id_cliente]
+    );
+
     // 7. Registrar identidad_auth (email_verificado: false)
     await client.query(
       `INSERT INTO identidades_auth (id_usuario, auth_user_id, provider, email_login, email_verificado, activo)
@@ -279,7 +297,10 @@ router.post('/api/public/register', registerLimiter, async (req, res) => {
       return res.status(400).json({ error: true, message: 'El correo electrónico ya está registrado en el sistema de autenticación.' });
     }
 
-    return res.status(500).json({ error: true, message: error.message || 'Error interno al registrar cliente' });
+    return res.status(500).json({
+      error: true,
+      message: 'No se pudo completar el registro del cliente.'
+    });
   } finally {
     client.release();
   }
@@ -595,6 +616,26 @@ router.post('/api/public/google-callback', async (req, res) => {
           await client.query(
             `INSERT INTO roles_usuarios (id_rol, id_usuario) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
             [rolRes.rows[0].id_rol, id_usuario]
+          );
+        }
+
+        if (id_cliente) {
+          await client.query(
+            `
+              INSERT INTO usuarios_clientes (
+                id_usuario,
+                id_cliente,
+                estado,
+                fecha_vinculacion,
+                fecha_actualizacion
+              )
+              VALUES ($1, $2, true, NOW(), NOW())
+              ON CONFLICT (id_usuario, id_cliente) DO UPDATE
+              SET
+                estado = true,
+                fecha_actualizacion = NOW()
+            `,
+            [id_usuario, id_cliente]
           );
         }
 
