@@ -33,6 +33,12 @@ const SERVICE_TYPE_BY_ORDER_TYPE = Object.freeze({
   pickup: 'PARA_LLEVAR',
   delivery: 'DELIVERY'
 });
+const DELIVERY_TYPE_BY_ORDER_TYPE = Object.freeze({
+  'dine-in': 'LOCAL',
+  pickup: 'RECOGER',
+  delivery: 'DELIVERY'
+});
+const INITIAL_ORDER_PAYMENT_STATE = 'PENDIENTE';
 
 const ORDER_STATE_ALIASES = Object.freeze([
   'pendiente',
@@ -908,10 +914,14 @@ export const createPublicOrderService = async ({
   const total = roundMoney(normalizedLines.reduce((sum, line) => sum + line.subtotal, 0));
   const idEstadoPedido = await resolvePendingStateId();
   if (!idEstadoPedido) {
-    throw buildHttpError(500, 'No existe estado PENDIENTE en estados_pedido.');
+    throw buildHttpError(
+      409,
+      'Configuracion incompleta: no existe estado inicial PENDIENTE/POR PAGAR para pedidos.'
+    );
   }
 
   const descripcionEnvio = SERVICE_TYPE_BY_ORDER_TYPE[tipoPedido] || 'LOCAL';
+  const tipoEntrega = DELIVERY_TYPE_BY_ORDER_TYPE[tipoPedido] || 'LOCAL';
   const descripcionPedido = buildPublicOrderDescription({
     origen,
     tipoPedido,
@@ -931,7 +941,9 @@ export const createPublicOrderService = async ({
       id_estado_pedido: idEstadoPedido,
       id_sucursal: Number(idSucursal),
       id_cliente: Number(idCliente),
-      id_usuario: Number(idUsuario)
+      id_usuario: Number(idUsuario),
+      estado_pago: INITIAL_ORDER_PAYMENT_STATE,
+      tipo_entrega: tipoEntrega
     });
 
     const idPedido = Number(pedido?.id_pedido || 0);
@@ -960,8 +972,10 @@ export const createPublicOrderService = async ({
       id_cliente: Number(idCliente),
       id_menu: Number(activeMenu.id_menu),
       tipo_pedido: tipoPedido,
+      tipo_entrega: tipoEntrega,
       business: businessContext,
       estado: 'PENDIENTE',
+      estado_pago: INITIAL_ORDER_PAYMENT_STATE,
       total,
       total_items: normalizedLines.reduce((sum, line) => sum + Number(line.cantidad || 0), 0),
       fecha_hora_pedido: pedido?.fecha_hora_pedido || null,

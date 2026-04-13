@@ -462,35 +462,50 @@ export const fetchFallbackOrderUserIdQuery = async () => {
 
 // Inserta cabecera de pedido publico y devuelve ID generado.
 export const insertPublicPedidoQuery = async (client, payload) => {
+  const [hasEstadoPagoColumn, hasTipoEntregaColumn] = await Promise.all([
+    hasColumn('pedidos', 'estado_pago'),
+    hasColumn('pedidos', 'tipo_entrega')
+  ]);
+
+  const columns = ['fecha_hora_pedido'];
+  const values = ['CURRENT_TIMESTAMP'];
+  const params = [];
+  const pushValue = (column, value) => {
+    params.push(value);
+    columns.push(column);
+    values.push(`$${params.length}`);
+  };
+
+  // Base minima requerida para pedidos del menu publico.
+  pushValue('descripcion_pedido', payload.descripcion_pedido);
+  pushValue('descripcion_envio', payload.descripcion_envio);
+  pushValue('sub_total', payload.sub_total);
+  pushValue('isv', payload.isv);
+  pushValue('total', payload.total);
+  pushValue('id_estado_pedido', payload.id_estado_pedido);
+  pushValue('id_sucursal', payload.id_sucursal);
+  pushValue('id_cliente', payload.id_cliente);
+  pushValue('id_usuario', payload.id_usuario);
+  pushValue('origen_pedido', payload.origen_pedido || 'MENU');
+
+  // Refuerzo item 9: forzamos estado de pago/tipo de entrega si el esquema los soporta.
+  if (hasEstadoPagoColumn) {
+    pushValue('estado_pago', payload.estado_pago || 'PENDIENTE');
+  }
+
+  if (hasTipoEntregaColumn) {
+    pushValue('tipo_entrega', payload.tipo_entrega || 'LOCAL');
+  }
+
   const result = await client.query(
     `
       INSERT INTO pedidos (
-        descripcion_pedido,
-        descripcion_envio,
-        fecha_hora_pedido,
-        sub_total,
-        isv,
-        total,
-        id_estado_pedido,
-        id_sucursal,
-        id_cliente,
-        id_usuario,
-        origen_pedido
+        ${columns.join(',\n        ')}
       )
-      VALUES ($1, $2, CURRENT_TIMESTAMP, $3, $4, $5, $6, $7, $8, $9, 'MENU')
+      VALUES (${values.join(', ')})
       RETURNING id_pedido, fecha_hora_pedido;
     `,
-    [
-      payload.descripcion_pedido,
-      payload.descripcion_envio,
-      payload.sub_total,
-      payload.isv,
-      payload.total,
-      payload.id_estado_pedido,
-      payload.id_sucursal,
-      payload.id_cliente,
-      payload.id_usuario
-    ]
+    params
   );
 
   return result.rows[0] || null;

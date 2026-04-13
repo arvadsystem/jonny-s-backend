@@ -130,6 +130,7 @@ const mapMenuSummary = (row) => ({
   nombre_sucursal: row.nombre_sucursal || '',
   fecha_inicio: row.fecha_inicio || null
 });
+const SHARED_MENU_WARNING_PREFIX = 'Atencion: este menu esta compartido entre sucursales.';
 
 const toDateTimeOrNull = (value) => {
   if (value === undefined || value === null || String(value).trim() === '') return null;
@@ -285,6 +286,103 @@ const getBranchesForPublication = async () => {
     id_menu: row.id_menu ? Number(row.id_menu) : null,
     fecha_inicio_menu: row.fecha_inicio || null
   }));
+};
+
+// Detecta en cuantas sucursales esta activo actualmente un menu.
+// Esto permite advertir impacto transversal al editar publicacion.
+const getActiveBranchesByMenu = async (idMenu) => {
+  const result = await pool.query(
+    `
+      SELECT
+        s.id_sucursal,
+        s.nombre_sucursal,
+        COALESCE(vsi.texto_direccion, '') AS direccion,
+        mv.id_menu_vigente,
+        mv.fecha_inicio
+      FROM sucursales s
+      LEFT JOIN v_sucursales_info vsi
+        ON vsi.id_sucursal = s.id_sucursal
+      INNER JOIN LATERAL (
+        SELECT
+          mvv.id_menu_vigente,
+          mvv.id_menu,
+          mvv.fecha_inicio
+        FROM menu_vigente mvv
+        INNER JOIN menu m
+          ON m.id_menu = mvv.id_menu
+        WHERE mvv.id_sucursal = s.id_sucursal
+          AND COALESCE(mvv.estado, true) = true
+          AND COALESCE(m.estado, true) = true
+          AND COALESCE(mvv.fecha_inicio, NOW()) <= NOW()
+        ORDER BY mvv.fecha_inicio DESC, mvv.id_menu_vigente DESC
+        LIMIT 1
+      ) mv ON true
+      WHERE mv.id_menu = $1
+        AND COALESCE(s.estado, true) = true
+      ORDER BY s.id_sucursal ASC;
+    `,
+    [idMenu]
+  );
+
+  return (result.rows || []).map((row) => ({
+    id_sucursal: Number(row.id_sucursal),
+    nombre_sucursal: row.nombre_sucursal || `Sucursal #${row.id_sucursal}`,
+    direccion: row.direccion || '',
+    id_menu_vigente: Number(row.id_menu_vigente),
+    fecha_inicio_menu: row.fecha_inicio || null
+  }));
+};
+
+const buildSharedMenuImpact = ({ idMenu, idSucursal, branches = [] }) => {
+  const normalizedBranches = Array.isArray(branches) ? branches : [];
+  const currentSucursalId = toPositiveInt(idSucursal);
+  const totalBranches = normalizedBranches.length;
+  const isShared = totalBranches > 1;
+
+  const currentBranch = currentSucursalId
+    ? normalizedBranches.find((branch) => Number(branch.id_sucursal) === currentSucursalId) || null
+    : null;
+  const otherBranches = currentSucursalId
+    ? normalizedBranches.filter((branch) => Number(branch.id_sucursal) !== currentSucursalId)
+    : normalizedBranches;
+
+  const warningMessage = isShared
+    ? `${SHARED_MENU_WARNING_PREFIX} Cambios en menu #${idMenu} impactan ${totalBranches} sucursales activas.`
+    : '';
+
+  return {
+    id_menu: Number(idMenu),
+    is_shared: isShared,
+    total_sucursales_activas: totalBranches,
+    sucursal_actual_en_scope: Boolean(currentBranch),
+    sucursal_actual: currentBranch,
+    sucursales_activas: normalizedBranches,
+    sucursales_activas_excluyendo_actual: otherBranches,
+    warning_message: warningMessage
+  };
+};
+
+const resolveSharedMenuImpact = async ({ idMenu, idSucursal }) => {
+  const safeMenuId = toPositiveInt(idMenu);
+  if (!safeMenuId) {
+    return {
+      id_menu: null,
+      is_shared: false,
+      total_sucursales_activas: 0,
+      sucursal_actual_en_scope: false,
+      sucursal_actual: null,
+      sucursales_activas: [],
+      sucursales_activas_excluyendo_actual: [],
+      warning_message: ''
+    };
+  }
+
+  const branches = await getActiveBranchesByMenu(safeMenuId);
+  return buildSharedMenuImpact({
+    idMenu: safeMenuId,
+    idSucursal,
+    branches
+  });
 };
 
 const fetchBaseCatalogByMenu = async (idMenu, departmentIds) => {
@@ -893,6 +991,14 @@ router.post('/programacion', async (req, res) => {
     await client.query('COMMIT');
 
     const activeMenu = await getActiveMenuByBranch(idSucursal);
+    const sharedMenuImpact = await resolveSharedMenuImpact({
+      idMenu: Number(inserted.id_menu),
+      idSucursal
+    });
+    const warnings = [];
+    if (sharedMenuImpact.is_shared) {
+      warnings.push(sharedMenuImpact.warning_message);
+    }
 
     return res.status(200).json({
       ok: true,
@@ -905,7 +1011,9 @@ router.post('/programacion', async (req, res) => {
           fecha_inicio: inserted.fecha_inicio,
           estado: parseBoolean(inserted.estado)
         },
-        menu_activo_actual: activeMenu ? mapMenuSummary(activeMenu) : null
+        menu_activo_actual: activeMenu ? mapMenuSummary(activeMenu) : null,
+        shared_menu_impact: sharedMenuImpact,
+        warnings
       }
     });
   } catch (error) {
@@ -970,15 +1078,17 @@ router.get('/catalogo', async (req, res) => {
           menu: null,
           capabilities,
           warnings,
+          shared_menu_impact: null,
           items: []
         }
       });
     }
 
     const targetMenuId = Number(resolvedMenu.id_menu);
-    const [baseRows, detailRows] = await Promise.all([
+    const [baseRows, detailRows, sharedMenuImpact] = await Promise.all([
       fetchBaseCatalogByMenu(targetMenuId, departmentIds),
-      fetchDetalleRowsByMenu({ idMenu: targetMenuId, capabilities })
+      fetchDetalleRowsByMenu({ idMenu: targetMenuId, capabilities }),
+      resolveSharedMenuImpact({ idMenu: targetMenuId, idSucursal })
     ]);
 
     const detailRowsByKey = buildDetailRowsByKey(detailRows);
@@ -987,6 +1097,9 @@ router.get('/catalogo', async (req, res) => {
     if (mapped.duplicateKeys.length > 0) {
       warnings.push(`Existen duplicados en detalle_menu: ${mapped.duplicateKeys.join(', ')}`);
     }
+    if (sharedMenuImpact.is_shared) {
+      warnings.push(sharedMenuImpact.warning_message);
+    }
 
     return res.status(200).json({
       ok: true,
@@ -994,6 +1107,7 @@ router.get('/catalogo', async (req, res) => {
         menu: mapMenuSummary(resolvedMenu),
         capabilities,
         warnings,
+        shared_menu_impact: sharedMenuImpact,
         items: mapped.items
       }
     });
@@ -1047,6 +1161,8 @@ router.get('/preview', async (req, res) => {
         ok: true,
         data: {
           menu: null,
+          warnings: [],
+          shared_menu_impact: null,
           stats: { total: 0, disponibles: 0, agotados: 0 },
           items: []
         }
@@ -1054,9 +1170,10 @@ router.get('/preview', async (req, res) => {
     }
 
     const targetMenuId = Number(resolvedMenu.id_menu);
-    const [baseRows, detailRows] = await Promise.all([
+    const [baseRows, detailRows, sharedMenuImpact] = await Promise.all([
       fetchBaseCatalogByMenu(targetMenuId, departmentIds),
-      fetchDetalleRowsByMenu({ idMenu: targetMenuId, capabilities })
+      fetchDetalleRowsByMenu({ idMenu: targetMenuId, capabilities }),
+      resolveSharedMenuImpact({ idMenu: targetMenuId, idSucursal })
     ]);
 
     const detailRowsByKey = buildDetailRowsByKey(detailRows);
@@ -1073,11 +1190,17 @@ router.get('/preview', async (req, res) => {
       });
 
     const disponibles = previewItems.filter((item) => Boolean(item?.disponibilidad?.available)).length;
+    const warnings = [];
+    if (sharedMenuImpact.is_shared) {
+      warnings.push(sharedMenuImpact.warning_message);
+    }
 
     return res.status(200).json({
       ok: true,
       data: {
         menu: mapMenuSummary(resolvedMenu),
+        warnings,
+        shared_menu_impact: sharedMenuImpact,
         stats: {
           total: previewItems.length,
           disponibles,
@@ -1121,12 +1244,13 @@ router.put('/catalogo', async (req, res) => {
     }
 
     const capabilities = await getDetalleMenuCapabilities();
-    const [detailRows, stateByKey] = await Promise.all([
+    const [detailRows, stateByKey, sharedMenuImpact] = await Promise.all([
       fetchDetalleRowsByMenu({ idMenu: targetMenuId, capabilities }),
       fetchDraftStateByType({
         idMenu: targetMenuId,
         normalizedItems: normalized.data
-      })
+      }),
+      resolveSharedMenuImpact({ idMenu: targetMenuId, idSucursal })
     ]);
 
     const detailRowsByKey = buildDetailRowsByKey(detailRows);
@@ -1212,13 +1336,20 @@ router.put('/catalogo', async (req, res) => {
     if (visibleCount === 0) {
       warnings.push('La sucursal quedo sin items visibles para el cliente.');
     }
+    if (sharedMenuImpact.is_shared) {
+      warnings.push(sharedMenuImpact.warning_message);
+    }
 
     return res.status(200).json({
       ok: true,
       message: 'Publicacion guardada correctamente.',
       data: {
         visible_count: visibleCount,
-        warnings
+        warnings,
+        shared_menu_impact: sharedMenuImpact,
+        applied_scope: sharedMenuImpact.is_shared
+          ? 'MENU_COMPARTIDO_ENTRE_SUCURSALES'
+          : 'MENU_EXCLUSIVO_DE_SUCURSAL'
       }
     });
   } catch (error) {
