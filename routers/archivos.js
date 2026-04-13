@@ -17,8 +17,16 @@ import {
 const router = express.Router();
 
 const BASE64_BODY_REGEX = /^[A-Za-z0-9+/]+={0,2}$/;
+const SQLSTATE_UNDEFINED_TABLE = '42P01';
+const SQLSTATE_UNDEFINED_COLUMN = '42703';
+const ARCHIVO_INVALID_ID_MESSAGE = 'id_archivo invalido.';
+const ARCHIVO_NOT_FOUND_MESSAGE = 'Archivo no encontrado.';
+const ARCHIVO_IN_USE_MESSAGE = 'No se pudo limpiar la imagen porque esta siendo utilizada en otros modulos del sistema.';
+const ARCHIVO_CLEANUP_SUCCESS_MESSAGE = 'Archivo temporal limpiado correctamente.';
+const ARCHIVO_CLEANUP_PENDING_MESSAGE = 'La imagen temporal fue desactivada y quedo pendiente su limpieza fisica.';
 
 const getSafeUploadErrorMessage = (fallback = 'No se pudo procesar el archivo.') => fallback;
+const getSafeArchivoCleanupErrorMessage = (fallback = 'No se pudo limpiar la imagen temporal.') => fallback;
 
 const normalizeOriginalName = (value, defaultName = 'archivo') => {
   const trimmed = String(value || '').trim();
@@ -78,6 +86,115 @@ const decodeBase64File = (base64Body, maxBytes = MAX_IMAGE_BYTES) => {
   }
 
   return { ok: true, buffer };
+};
+
+const isSkippableSchemaError = (error) =>
+  error?.code === SQLSTATE_UNDEFINED_TABLE || error?.code === SQLSTATE_UNDEFINED_COLUMN;
+
+const safeReferenceCount = async ({ label, query, params }, db = pool) => {
+  try {
+    const result = await db.query(query, Array.isArray(params) ? params : []);
+    const total = Number.parseInt(String(result.rows?.[0]?.total ?? '0'), 10);
+    return {
+      modulo: label,
+      checked: true,
+      total: Number.isNaN(total) ? 0 : total
+    };
+  } catch (error) {
+    if (isSkippableSchemaError(error)) {
+      console.warn(`[archivos] referencia omitida (${label}):`, error.message);
+      return { modulo: label, checked: false, total: 0 };
+    }
+    throw error;
+  }
+};
+
+const getArchivoReferenceSummary = async (idArchivo, db = pool) => {
+  const checks = await Promise.all([
+    safeReferenceCount(
+      {
+        label: 'productos',
+        params: [idArchivo],
+        query: 'SELECT COUNT(*)::int AS total FROM public.productos WHERE id_archivo_imagen_principal = $1'
+      },
+      db
+    ),
+    safeReferenceCount(
+      {
+        label: 'insumos',
+        params: [idArchivo],
+        query: 'SELECT COUNT(*)::int AS total FROM public.insumos WHERE id_archivo_imagen_principal = $1'
+      },
+      db
+    ),
+    safeReferenceCount(
+      {
+        label: 'recetas',
+        params: [idArchivo],
+        query: 'SELECT COUNT(*)::int AS total FROM public.recetas WHERE id_archivo = $1'
+      },
+      db
+    ),
+    safeReferenceCount(
+      {
+        label: 'combos',
+        params: [idArchivo],
+        query: 'SELECT COUNT(*)::int AS total FROM public.combos WHERE id_archivo = $1'
+      },
+      db
+    ),
+    safeReferenceCount(
+      {
+        label: 'ordenes_compra',
+        params: [idArchivo],
+        query: 'SELECT COUNT(*)::int AS total FROM public.orden_compras WHERE id_archivo_factura_recepcion = $1'
+      },
+      db
+    ),
+    safeReferenceCount(
+      {
+        label: 'compras',
+        params: [idArchivo],
+        query: 'SELECT COUNT(*)::int AS total FROM public.compras WHERE id_archivo_transferencia = $1'
+      },
+      db
+    )
+  ]);
+
+  const blockingModules = checks
+    .filter((entry) => entry.checked && entry.total > 0)
+    .map((entry) => ({ modulo: entry.modulo, total: entry.total }));
+
+  return {
+    hasReferences: blockingModules.length > 0,
+    summary: {
+      blocking_modules: blockingModules,
+      checks
+    }
+  };
+};
+
+const parseStoredStoragePath = (rawValue) => {
+  const input = String(rawValue || '').trim();
+  if (!input) return null;
+
+  let candidate = input;
+  if (/^https?:\/\//i.test(candidate)) {
+    try {
+      const parsed = new URL(candidate);
+      candidate = decodeURIComponent(String(parsed.pathname || '').replace(/^\/+/, ''));
+    } catch {
+      return null;
+    }
+  }
+
+  const parts = candidate.split('/').filter(Boolean);
+  if (parts.length < 2) return null;
+
+  return {
+    bucket: parts[0],
+    filePath: parts.slice(1).join('/')
+  };
 };
 
 /**
@@ -231,6 +348,116 @@ router.get('/archivos/:id/ver', async (req, res) => {
   } catch (err) {
     console.error('Error visualizando archivo:', err);
     return res.status(500).json({ ok: false, message: 'Error interno al procesar el archivo.' });
+  }
+});
+
+/**
+ * DELETE /archivos/:id
+ * Cleanup compensatorio para uploads que no llegaron a vincularse.
+ * - Bloquea si el archivo esta referenciado en otros modulos.
+ * - Desactiva en BD (estado=false) y luego intenta limpiar storage.
+ */
+router.delete('/archivos/:id', async (req, res) => {
+  const idArchivo = Number.parseInt(String(req.params?.id ?? ''), 10);
+  if (!Number.isInteger(idArchivo) || idArchivo <= 0) {
+    return res.status(400).json({ ok: false, error: true, code: 'INVALID_ARCHIVO_ID', message: ARCHIVO_INVALID_ID_MESSAGE });
+  }
+
+  const client = await pool.connect();
+  let txStarted = false;
+  try {
+    await client.query('BEGIN');
+    txStarted = true;
+
+    const archivoResult = await client.query(
+      `
+        SELECT id_archivo, url_publica, COALESCE(estado, true) AS estado
+        FROM public.archivos
+        WHERE id_archivo = $1
+        LIMIT 1
+        FOR UPDATE
+      `,
+      [idArchivo]
+    );
+
+    if (archivoResult.rowCount === 0) {
+      await client.query('ROLLBACK');
+      txStarted = false;
+      return res.status(404).json({ ok: false, error: true, code: 'ARCHIVO_NOT_FOUND', message: ARCHIVO_NOT_FOUND_MESSAGE });
+    }
+
+    const dependencySummary = await getArchivoReferenceSummary(idArchivo, client);
+    if (dependencySummary.hasReferences) {
+      await client.query('ROLLBACK');
+      txStarted = false;
+      return res.status(409).json({
+        ok: false,
+        error: true,
+        code: 'ARCHIVO_IN_USE',
+        message: ARCHIVO_IN_USE_MESSAGE,
+        dependency_summary: dependencySummary.summary
+      });
+    }
+
+    const archivo = archivoResult.rows[0];
+    let softDeleteApplied = true;
+    try {
+      await client.query(
+        'UPDATE public.archivos SET estado = false WHERE id_archivo = $1',
+        [idArchivo]
+      );
+    } catch (updateError) {
+      if (updateError?.code !== SQLSTATE_UNDEFINED_COLUMN) throw updateError;
+      softDeleteApplied = false;
+      await client.query(
+        'DELETE FROM public.archivos WHERE id_archivo = $1',
+        [idArchivo]
+      );
+    }
+
+    await client.query('COMMIT');
+    txStarted = false;
+
+    let cleanupPending = false;
+    const storagePath = parseStoredStoragePath(archivo?.url_publica);
+    const canRemoveFromStorage =
+      storagePath &&
+      (storagePath.bucket === SUPABASE_ASSETS_BUCKET || storagePath.bucket === SUPABASE_ADMIN_BUCKET);
+
+    if (canRemoveFromStorage) {
+      const { error: removeError } = await supabase.storage
+        .from(storagePath.bucket)
+        .remove([storagePath.filePath]);
+
+      if (removeError) {
+        cleanupPending = true;
+        console.error('Error limpiando archivo en storage:', removeError);
+      }
+    }
+
+    return res.status(200).json({
+      ok: true,
+      error: false,
+      id_archivo: idArchivo,
+      soft_deleted: softDeleteApplied,
+      cleanup_pending: cleanupPending,
+      message: cleanupPending
+        ? ARCHIVO_CLEANUP_PENDING_MESSAGE
+        : ARCHIVO_CLEANUP_SUCCESS_MESSAGE
+    });
+  } catch (error) {
+    if (txStarted) {
+      try { await client.query('ROLLBACK'); } catch {}
+    }
+    console.error('Error limpiando archivo:', error);
+    return res.status(500).json({
+      ok: false,
+      error: true,
+      code: 'ARCHIVO_CLEANUP_FAILED',
+      message: getSafeArchivoCleanupErrorMessage()
+    });
+  } finally {
+    client.release();
   }
 });
 

@@ -139,7 +139,12 @@ export const attachImagenPrincipalUrls = async (pool, req, rows) => {
   }
 
   const archivosResult = await pool.query(
-    'SELECT id_archivo, url_publica FROM archivos WHERE id_archivo = ANY($1::int[])',
+    `
+      SELECT id_archivo, url_publica
+      FROM archivos
+      WHERE id_archivo = ANY($1::int[])
+        AND COALESCE(estado, true) = true
+    `,
     [uniqueArchivoIds]
   );
 
