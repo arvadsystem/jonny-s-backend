@@ -400,13 +400,13 @@ export const fetchAllowedSauceRowsByRecipeIdsQuery = async (recipeIds = []) => {
         s.id_salsa,
         s.nombre,
         s.nivel_picante,
-        s.orden
+        s.orden,
+        COALESCE(s.estado, true) AS disponible
       FROM receta_salsa rs
       INNER JOIN salsas s
         ON s.id_salsa = rs.id_salsa
       WHERE rs.id_receta = ANY($1::int[])
         AND COALESCE(rs.estado, true) = true
-        AND COALESCE(s.estado, true) = true
       ORDER BY rs.id_receta, s.orden, s.nombre;
     `,
     [recipeIds]

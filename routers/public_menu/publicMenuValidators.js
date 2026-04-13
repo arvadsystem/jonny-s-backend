@@ -12,7 +12,8 @@ const MAX_ORDER_TEXT = Object.freeze({
   CONTACT_PHONE: 30,
   DELIVERY_ADDRESS: 240,
   DELIVERY_REFERENCE: 160,
-  TRANSFER_RECEIPT: 180
+  TRANSFER_RECEIPT: 180,
+  ITEM_NOTE: 100
 });
 
 // Convierte cualquier valor a entero positivo. Devuelve null si no cumple.
@@ -260,11 +261,15 @@ export const validateCreateOrderBody = (req, res, next) => {
       .map(normalizeSauceSelection)
       .filter(Boolean);
 
+    // Nota del cliente por item (ej. "sin cebolla"), limitada para evitar abuso.
+    const nota = normalizeCompactText(row.nota ?? row.observacion_cliente ?? '', MAX_ORDER_TEXT.ITEM_NOTE);
+
     items.push({
       id_detalle_menu: idDetalleMenu,
       cantidad,
       extras,
-      salsas_por_unidad: salsasPorUnidad
+      salsas_por_unidad: salsasPorUnidad,
+      nota
     });
   }
 
