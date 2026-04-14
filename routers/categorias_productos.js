@@ -45,6 +45,14 @@ const normalizeBooleanInput = (value) => {
 // IMPACT: solo cambia copy de errores 500; logs del servidor se mantienen.
 const safeServerErrorMessage = (fallback = 'No se pudo completar la acción. Verifica los datos e intenta de nuevo.') => fallback;
 
+// NEW: helpers de payload para endurecer validaciones sin cambiar contratos del módulo.
+// WHY: prevenir entradas con estructura inválida o campos inesperados en create/edición completa.
+// IMPACT: solo aplica a POST y PUT /edicion.
+const PRODUCT_CATEGORY_CREATE_ALLOWED_FIELDS = new Set(['nombre_categoria', 'codigo_categoria', 'descripcion', 'estado']);
+const PRODUCT_CATEGORY_FULL_EDIT_ALLOWED_FIELDS = new Set(['id_categoria_producto', 'nombre_categoria', 'codigo_categoria', 'descripcion', 'estado']);
+const isPlainObject = (value) => Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+const hasOnlyAllowedFields = (payload, allowedSet) => Object.keys(payload).every((key) => allowedSet.has(key));
+
 // ------------------------------------------------------------------------------------
 // GET: Obtener categorias_productos
 // ------------------------------------------------------------------------------------
@@ -75,7 +83,49 @@ router.get('/categorias_productos', async (req, res) => {
 router.post('/categorias_productos', async (req, res) => {
   try {
     const tabla = 'categorias_productos';
-    const datos = req.body;
+    const datosEntrada = req.body;
+    if (!isPlainObject(datosEntrada)) {
+      return res.status(400).json({ error: true, message: 'Payload invalido.' });
+    }
+    if (!hasOnlyAllowedFields(datosEntrada, PRODUCT_CATEGORY_CREATE_ALLOWED_FIELDS)) {
+      return res.status(400).json({ error: true, message: 'El payload contiene campos no permitidos.' });
+    }
+
+    const nombre = String(datosEntrada?.nombre_categoria ?? '').trim();
+    const codigo = String(datosEntrada?.codigo_categoria ?? '').trim();
+    const descripcion = datosEntrada?.descripcion === undefined || datosEntrada?.descripcion === null
+      ? ''
+      : String(datosEntrada.descripcion).trim();
+
+    if (!nombre) {
+      return res.status(400).json({ error: true, message: 'nombre_categoria es obligatorio.' });
+    }
+    if (!codigo) {
+      return res.status(400).json({ error: true, message: 'codigo_categoria es obligatorio.' });
+    }
+    if (nombre.length < 2 || nombre.length > 50) {
+      return res.status(400).json({ error: true, message: 'nombre_categoria debe tener entre 2 y 50 caracteres.' });
+    }
+    if (codigo.length < 2 || codigo.length > 10) {
+      return res.status(400).json({ error: true, message: 'codigo_categoria debe tener entre 2 y 10 caracteres.' });
+    }
+    if (!/^[A-Z0-9_-]+$/.test(codigo)) {
+      return res.status(400).json({ error: true, message: 'codigo_categoria solo permite mayusculas, numeros, - o _.' });
+    }
+
+    // NEW: hardening de longitud para descripcion en alta.
+    // WHY: evitar rechazo por BD y responder error controlado al cliente.
+    // IMPACT: solo bloquea descripciones mayores a 50 caracteres.
+    if (descripcion.length > 50) {
+      return res.status(400).json({ error: true, message: 'La descripcion no puede exceder 50 caracteres.' });
+    }
+
+    const datos = {
+      ...datosEntrada,
+      nombre_categoria: nombre,
+      codigo_categoria: codigo,
+      descripcion
+    };
 
     const query = 'CALL pa_insert($1, $2)';
     await pool.query(query, [tabla, datos]);
@@ -89,6 +139,101 @@ router.post('/categorias_productos', async (req, res) => {
 });
 
 // ------------------------------------------------------------------------------------
+// PUT: Actualizar categoria_producto completa (edicion atomica)
+// ------------------------------------------------------------------------------------
+router.put('/categorias_productos/edicion', async (req, res) => {
+  try {
+    const datosEntrada = req.body;
+    if (!isPlainObject(datosEntrada)) {
+      return res.status(400).json({ error: true, message: 'Payload invalido.' });
+    }
+    if (!hasOnlyAllowedFields(datosEntrada, PRODUCT_CATEGORY_FULL_EDIT_ALLOWED_FIELDS)) {
+      return res.status(400).json({ error: true, message: 'El payload contiene campos no permitidos.' });
+    }
+
+    const {
+      id_categoria_producto,
+      nombre_categoria,
+      codigo_categoria,
+      descripcion,
+      estado
+    } = datosEntrada;
+
+    const categoriaId = Number(id_categoria_producto);
+    if (!isPositiveIntegerId(categoriaId)) {
+      return res.status(400).json({ error: true, message: 'id_categoria_producto debe ser un entero mayor a 0.' });
+    }
+
+    const nombre = String(nombre_categoria ?? '').trim();
+    const codigo = String(codigo_categoria ?? '').trim();
+    const descripcionNormalizada = descripcion === undefined || descripcion === null
+      ? ''
+      : String(descripcion).trim();
+    const estadoNormalizado = normalizeBooleanInput(estado);
+
+    if (!nombre) {
+      return res.status(400).json({ error: true, message: 'nombre_categoria es obligatorio.' });
+    }
+    if (!codigo) {
+      return res.status(400).json({ error: true, message: 'codigo_categoria es obligatorio.' });
+    }
+    if (nombre.length < 2 || nombre.length > 50) {
+      return res.status(400).json({ error: true, message: 'nombre_categoria debe tener entre 2 y 50 caracteres.' });
+    }
+    if (codigo.length < 2 || codigo.length > 10) {
+      return res.status(400).json({ error: true, message: 'codigo_categoria debe tener entre 2 y 10 caracteres.' });
+    }
+    if (!/^[A-Z0-9_-]+$/.test(codigo)) {
+      return res.status(400).json({ error: true, message: 'codigo_categoria solo permite mayusculas, numeros, - o _.' });
+    }
+    if (descripcionNormalizada.length > 50) {
+      return res.status(400).json({ error: true, message: 'La descripcion no puede exceder 50 caracteres.' });
+    }
+    if (estadoNormalizado === null) {
+      return res.status(400).json({ error: true, message: 'estado invalido.' });
+    }
+
+    // NEW: conserva la misma regla de negocio para inactivar cuando hay productos activos asociados.
+    // WHY: mantener consistencia con DELETE y PUT por campo.
+    // IMPACT: solo bloquea cuando la edicion intenta dejar `estado=false` y existen dependencias activas.
+    if (estadoNormalizado === false) {
+      const productosActivosRes = await pool.query(
+        'SELECT COUNT(1)::int AS total FROM productos WHERE id_categoria_producto = $1 AND estado = true',
+        [categoriaId]
+      );
+      const totalProductosActivos = Number(productosActivosRes.rows?.[0]?.total ?? 0);
+      if (totalProductosActivos > 0) {
+        return res.status(409).json({
+          error: true,
+          code: 'CATEGORY_HAS_ACTIVE_PRODUCTS',
+          message: CATEGORY_HAS_ACTIVE_PRODUCTS_MESSAGE
+        });
+      }
+    }
+
+    const updateRes = await pool.query(
+      `UPDATE categorias_productos
+       SET nombre_categoria = $1,
+           codigo_categoria = $2,
+           descripcion = $3,
+           estado = $4
+       WHERE id_categoria_producto = $5`,
+      [nombre, codigo, descripcionNormalizada, estadoNormalizado, categoriaId]
+    );
+
+    if (updateRes.rowCount === 0) {
+      return res.status(404).json({ error: true, message: 'Categoría no encontrada.' });
+    }
+
+    res.status(200).json({ message: 'Categoría actualizada correctamente.' });
+
+  } catch (err) {
+    console.error('Error en edicion atomica de categoria_producto:', err.message);
+    res.status(500).json({ error: true, message: safeServerErrorMessage() });
+  }
+});
+
+// ------------------------------------------------------------------------------------
 // PUT: Actualizar categoria_producto (actualiza 1 campo)
 // ------------------------------------------------------------------------------------
 router.put('/categorias_productos', async (req, res) => {
@@ -97,6 +242,31 @@ router.put('/categorias_productos', async (req, res) => {
 
     if (!campo || valor === undefined || !id_campo || id_valor === undefined) {
       return res.status(400).json({ error: true, message: 'Faltan campos obligatorios' });
+    }
+
+    const isTextField = campo === 'nombre_categoria' || campo === 'codigo_categoria' || campo === 'descripcion';
+    const valorSaneado = isTextField ? String(valor ?? '').trim() : valor;
+
+    if (campo === 'nombre_categoria' && !valorSaneado) {
+      return res.status(400).json({ error: true, message: 'nombre_categoria es obligatorio.' });
+    }
+    if (campo === 'codigo_categoria' && !valorSaneado) {
+      return res.status(400).json({ error: true, message: 'codigo_categoria es obligatorio.' });
+    }
+    if (campo === 'nombre_categoria' && (String(valorSaneado).length < 2 || String(valorSaneado).length > 50)) {
+      return res.status(400).json({ error: true, message: 'nombre_categoria debe tener entre 2 y 50 caracteres.' });
+    }
+    if (campo === 'codigo_categoria' && (String(valorSaneado).length < 2 || String(valorSaneado).length > 10)) {
+      return res.status(400).json({ error: true, message: 'codigo_categoria debe tener entre 2 y 10 caracteres.' });
+    }
+    if (campo === 'codigo_categoria' && !/^[A-Z0-9_-]+$/.test(String(valorSaneado))) {
+      return res.status(400).json({ error: true, message: 'codigo_categoria solo permite mayusculas, numeros, - o _.' });
+    }
+    // NEW: hardening de longitud para descripcion en update por campo.
+    // WHY: evitar llegar a BD con un valor que excede el limite real.
+    // IMPACT: solo aplica cuando `campo` es `descripcion`.
+    if (campo === 'descripcion' && String(valorSaneado).length > 50) {
+      return res.status(400).json({ error: true, message: 'La descripcion no puede exceder 50 caracteres.' });
     }
 
     // NEW: aplica la misma regla de bloqueo en PUT cuando el frontend intenta inactivar via `estado=false`.
@@ -136,7 +306,7 @@ router.put('/categorias_productos', async (req, res) => {
     await pool.query(query, [
       tabla,
       campo,
-      String(valor),
+      String(valorSaneado),
       id_campo,
       String(id_valor)
     ]);

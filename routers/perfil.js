@@ -5,8 +5,56 @@
 
 import express from 'express';
 import pool from '../config/db-connection.js';
+import jwt from 'jsonwebtoken';
+import JWT_SECRET from '../config/jwt.js';
+import { ensurePasswordChangedAtColumn } from '../utils/security/passwordExpiration.js';
 
 const router = express.Router();
+const LEGACY_BCRYPT_PREFIX_RE = /^\$2[abxy]?\$/i;
+
+const cookieConfig = () => {
+  const isProd = process.env.NODE_ENV === 'production';
+  return {
+    sameSite: isProd ? 'none' : 'lax',
+    secure: isProd,
+    path: '/',
+  };
+};
+
+const verifyStoredPassword = async (plainPassword, storedPassword) => {
+  const plain = String(plainPassword ?? '');
+  const stored = String(storedPassword ?? '');
+  if (!plain || !stored) return false;
+
+  if (plain === stored) return true;
+  if (!LEGACY_BCRYPT_PREFIX_RE.test(stored)) return false;
+
+  const result = await pool.query(
+    'SELECT crypt($1::text, $2::text) = $2::text AS ok',
+    [plain, stored]
+  );
+  return Boolean(result.rows?.[0]?.ok);
+};
+
+const issueUpdatedAccessToken = (req, res) => {
+  const currentUser = req.user || {};
+  const payload = {
+    id_usuario: currentUser.id_usuario,
+    nombre_usuario: currentUser.nombre_usuario,
+    rol: currentUser.rol,
+    id_sucursal: currentUser.id_sucursal,
+    sid: currentUser.sid,
+    must_change_password: false,
+  };
+
+  const token = jwt.sign(payload, JWT_SECRET, { expiresIn: '8h' });
+  const base = cookieConfig();
+  res.cookie('access_token', token, {
+    ...base,
+    httpOnly: true,
+    maxAge: 1000 * 60 * 60 * 8,
+  });
+};
 
 /**
  * GET /perfil
@@ -14,6 +62,8 @@ const router = express.Router();
  */
 router.get('/perfil', async (req, res) => {
   try {
+    await ensurePasswordChangedAtColumn();
+
     const user = req.user; // lo setea authRequired
     const idUsuario = user?.id_usuario;
 
@@ -28,6 +78,8 @@ router.get('/perfil', async (req, res) => {
         u.nombre_usuario,
         u.estado,
         u.foto_perfil,
+        u.fecha_cambio_clave,
+        u.fecha_creacion,
         e.id_empleado,
         p.id_persona,
         p.nombre,
@@ -75,11 +127,21 @@ router.get('/perfil', async (req, res) => {
     `;
     const ultimo = await pool.query(sqlUltimoAcceso, [idUsuario]);
 
+    // Conteo historico de sesiones exitosas del usuario
+    const sqlSesionesTotales = `
+      SELECT COUNT(*)::int AS total
+      FROM logins
+      WHERE id_usuario = $1 AND exito = TRUE
+    `;
+    const sesionesTotalesRes = await pool.query(sqlSesionesTotales, [idUsuario]);
+    const sesionesTotales = Number(sesionesTotalesRes.rows[0]?.total || 0);
+
     return res.json({
       error: false,
       perfil: perfil.rows[0],
       roles: roles.rows,
-      ultimo_acceso: ultimo.rows[0] || null
+      ultimo_acceso: ultimo.rows[0] || null,
+      sesiones_totales: sesionesTotales
     });
   } catch (err) {
     console.error('GET /perfil error:', err);
@@ -270,53 +332,73 @@ import { validatePasswordPolicy } from '../utils/security/passwordPolicy.js';
  */
 router.put('/perfil/password', async (req, res) => {
   try {
-    const user = req.user;
-    const idUsuario = user?.id_usuario;
-
-    if (!idUsuario) {
+    const idUsuario = Number.parseInt(String(req.user?.id_usuario ?? ''), 10);
+    if (!Number.isInteger(idUsuario) || idUsuario <= 0) {
       return res.status(401).json({ error: true, message: 'No autorizado' });
     }
 
-    const { clave_actual, clave_nueva } = req.body;
+    const claveActual = String(
+      req.body?.clave_actual
+      ?? req.body?.password_actual
+      ?? ''
+    ).trim();
+    const claveNueva = String(
+      req.body?.clave_nueva
+      ?? req.body?.password_nueva
+      ?? ''
+    ).trim();
 
-    if (!clave_actual || !clave_nueva) {
+    if (!claveActual || !claveNueva) {
       return res.status(400).json({ error: true, message: 'clave_actual y clave_nueva son requeridas' });
     }
 
-    // 1) Validar política (HU81)
-    const policyCheck = await validatePasswordPolicy(clave_nueva);
-    if (!policyCheck.ok) {
-      return res.status(400).json({ error: true, message: policyCheck.message });
-    }
+    await ensurePasswordChangedAtColumn();
 
-    // 2) Validar clave actual (por ahora en texto plano, como tu sistema actual)
-    const qUser = `SELECT clave FROM usuarios WHERE id_usuario = $1 LIMIT 1`;
+    // 1) Validar clave actual (soporta hash bcrypt y legado plano).
+    const qUser = 'SELECT id_usuario, clave FROM usuarios WHERE id_usuario = $1 LIMIT 1';
     const rUser = await pool.query(qUser, [idUsuario]);
 
     if (rUser.rows.length === 0) {
       return res.status(404).json({ error: true, message: 'Usuario no encontrado' });
     }
 
-    const claveBD = rUser.rows[0].clave;
-
-    if (String(claveBD) !== String(clave_actual)) {
+    const claveBD = String(rUser.rows[0]?.clave ?? '');
+    const passwordOk = await verifyStoredPassword(claveActual, claveBD);
+    if (!passwordOk) {
       return res.status(400).json({ error: true, message: 'La contraseña actual no es correcta' });
     }
 
-    // 3) Evitar que ponga la misma clave
-    if (String(clave_actual) === String(clave_nueva)) {
+    // 2) Evitar que ponga la misma clave (incluso si la actual esta hasheada).
+    const samePassword = await verifyStoredPassword(claveNueva, claveBD);
+    if (samePassword) {
       return res.status(400).json({ error: true, message: 'La nueva contraseña no puede ser igual a la actual' });
     }
 
-    // 4) Actualizar clave
-    await pool.query(`UPDATE usuarios SET clave = $1 WHERE id_usuario = $2`, [clave_nueva, idUsuario]);
+    // 3) Reutilizar politicas existentes del modulo de seguridad.
+    const policyCheck = await validatePasswordPolicy(claveNueva);
+    if (!policyCheck?.ok) {
+      return res.status(400).json({ error: true, message: policyCheck?.message || 'La contraseña no cumple la politica' });
+    }
 
+    // 4) Actualizar hash + limpiar forzado + fecha de ultimo cambio.
+    await pool.query(
+      `
+        UPDATE usuarios
+        SET
+          clave = crypt($1::text, gen_salt('bf')),
+          must_change_password = FALSE,
+          fecha_cambio_clave = timezone('America/Tegucigalpa', now())
+        WHERE id_usuario = $2
+      `,
+      [claveNueva, idUsuario]
+    );
+
+    issueUpdatedAccessToken(req, res);
     return res.json({ error: false, message: 'Contraseña actualizada correctamente' });
   } catch (err) {
     console.error('PUT /perfil/password error:', err);
     return res.status(500).json({ error: true, message: 'Error interno del servidor' });
   }
 });
-
 
 export default router;

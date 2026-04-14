@@ -1,9 +1,14 @@
-import express from 'express';
+﻿import express from 'express';
 import pool from '../config/db-connection.js';
 import { attachImagenPrincipalUrls } from '../utils/uploads.js';
 import { resolveRequestUserSucursalScope } from '../utils/sucursalScope.js';
+import { checkPermission } from '../middleware/checkPermission.js';
 
 const router = express.Router();
+const PRODUCTOS_LIST_PERMISSIONS = ['INVENTARIO_PRODUCTOS_VER', 'INVENTARIO_PRODUCTOS_DETALLE_VER'];
+const PRODUCTOS_CREATE_PERMISSIONS = ['INVENTARIO_PRODUCTOS_CREAR'];
+const PRODUCTOS_EDIT_PERMISSIONS = ['INVENTARIO_PRODUCTOS_EDITAR'];
+const PRODUCTOS_DELETE_PERMISSIONS = ['INVENTARIO_PRODUCTOS_ELIMINAR', 'INVENTARIO_PRODUCTOS_ESTADO_CAMBIAR'];
 
 // NUEVO: allowlist de campos para prevenir updates/inserts arbitrarios
 const CAMPOS_PERMITIDOS_PRODUCTOS = new Set([
@@ -27,6 +32,19 @@ const CAMPOS_PERMITIDOS_PRODUCTOS_POST = new Set([
   ...CAMPOS_PERMITIDOS_PRODUCTOS,
   'id_almacenes'
 ]);
+const PRODUCTOS_UPDATE_FIELD_COLUMN_MAP = Object.freeze({
+  nombre_producto: 'nombre_producto',
+  precio: 'precio',
+  stock_minimo: 'stock_minimo',
+  descripcion_producto: 'descripcion_producto',
+  fecha_ingreso_producto: 'fecha_ingreso_producto',
+  fecha_caducidad: 'fecha_caducidad',
+  id_categoria_producto: 'id_categoria_producto',
+  id_almacen: 'id_almacen',
+  id_tipo_departamento: 'id_tipo_departamento',
+  id_archivo_imagen_principal: 'id_archivo_imagen_principal',
+  estado: 'estado'
+});
 
 // NUEVO: codigos de conflicto SQL para responder 409 en constraints
 const CODIGOS_CONFLICTO_CONSTRAINT = new Set(['23503', '23505', '23514', '23502']);
@@ -35,16 +53,36 @@ const CODIGOS_CONFLICTO_CONSTRAINT = new Set(['23503', '23505', '23514', '23502'
 // IMPACT: solo manejo de errores en el router de Productos; no cambia consultas exitosas.
 const CODIGO_SQL_OUT_OF_RANGE = '22003';
 // NEW: limite superior de INTEGER (int4) usado por IDs en la BD/SPs actuales.
-// WHY: bloquear IDs fuera de rango antes de ejecutar `pa_update` / `pa_delete`.
+// WHY: bloquear IDs fuera de rango antes de ejecutar updates/deletes en SQL.
 // IMPACT: valida requests invalidos y responde 400 en lugar de dejar que fallen con 500.
 const MAX_INT32_DB_ID = 2147483647;
 const SQLSTATE_UNDEFINED_TABLE = '42P01';
+const SQLSTATE_UNDEFINED_COLUMN = '42703';
 const PRODUCTOS_DUPLICATE_CONSTRAINT = 'uq_productos_nombre_categoria_departamento_norm';
-const PRODUCTOS_DUPLICATE_MESSAGE = 'Ya existe un producto con el mismo nombre, categoría y departamento.';
-const SINGLE_ALMACEN_TEMP_MESSAGE = 'Temporalmente solo se permite un almacén por producto o insumo.';
+const PRODUCTOS_DUPLICATE_MESSAGE = 'Ya existe un producto con el mismo nombre, categoria y departamento.';
+const PRODUCTOS_DATE_ORDER_MESSAGE = 'La fecha de caducidad no puede ser menor que la fecha de ingreso del producto.';
+const SINGLE_ALMACEN_TEMP_MESSAGE = 'Temporalmente solo se permite un almacen por producto o insumo.';
+const PRODUCTOS_DELETE_BLOCKED_MESSAGE = 'No se puede inactivar el producto porque esta siendo utilizado en otros modulos del sistema.';
+const PRODUCTOS_DELETE_BLOCKING_OC_STATES = ['PENDIENTE', 'APROBADA', 'EN_COMPRA'];
 // NEW: query param opt-in para incluir inactivos en listados administrativos.
 // WHY: el GET de productos debe devolver activos por defecto tras adoptar soft delete.
 // IMPACT: mantiene compatibilidad con `?incluir_inactivos=1` sin crear endpoint nuevo.
+const PRODUCTOS_SCOPE_FORBIDDEN_MESSAGE = 'No tiene permisos para operar sobre recursos fuera de su sucursal.';
+const PRODUCTOS_SCOPE_MISSING_BRANCHES_MESSAGE = 'El empleado no tiene sucursales asignadas.';
+const PRODUCTOS_NOT_FOUND_MESSAGE = 'Producto no encontrado.';
+const ALMACEN_NOT_FOUND_MESSAGE = 'Almacen no encontrado.';
+const PRODUCTOS_DEFAULT_PAGE = 1;
+const PRODUCTOS_DEFAULT_PAGE_SIZE = 10;
+const PRODUCTOS_MAX_PAGE_SIZE = 100;
+const PRODUCTOS_SORT_ALLOWLIST = Object.freeze({
+  recientes: 'p.id_producto DESC',
+  nombre_asc: 'LOWER(COALESCE(p.nombre_producto, \'\')) ASC, p.id_producto DESC',
+  nombre_desc: 'LOWER(COALESCE(p.nombre_producto, \'\')) DESC, p.id_producto DESC',
+  precio_asc: 'COALESCE(p.precio, 0) ASC, p.id_producto DESC',
+  precio_desc: 'COALESCE(p.precio, 0) DESC, p.id_producto DESC',
+  stock_asc: 'COALESCE(p.cantidad, 0) ASC, p.id_producto DESC',
+  stock_desc: 'COALESCE(p.cantidad, 0) DESC, p.id_producto DESC'
+});
 const shouldIncludeInactive = (query) => String(query?.incluir_inactivos ?? '').trim() === '1';
 
 // AM: parse opcional de IDs positivos para filtros de catalogo por sucursal/almacen.
@@ -54,69 +92,229 @@ const parseOptionalPositiveId = (value) => {
   return esEnteroPositivoInt32(parsed) ? parsed : null;
 };
 
-// AM: normaliza lista de almacenes del item usando pivote (id_almacenes) o fallback legacy (id_almacen).
-const resolveRowAlmacenes = (row) => {
-  const fromArray = Array.isArray(row?.id_almacenes)
-    ? row.id_almacenes
-      .map((id) => Number.parseInt(String(id ?? ''), 10))
-      .filter((id) => esEnteroPositivoInt32(id))
-    : [];
-  if (fromArray.length > 0) return Array.from(new Set(fromArray));
+const hasQueryKey = (query, key) =>
+  Object.prototype.hasOwnProperty.call(query || {}, key) &&
+  query[key] !== undefined &&
+  query[key] !== null &&
+  String(query[key]).trim() !== '';
 
-  const fallback = Number.parseInt(String(row?.id_almacen ?? ''), 10);
-  return esEnteroPositivoInt32(fallback) ? [fallback] : [];
+const parsePositiveIntParam = (raw, fallback, min = 1, max = Number.MAX_SAFE_INTEGER) => {
+  const value = String(raw ?? '').trim();
+  if (!value) return { ok: true, value: fallback };
+  const parsed = Number.parseInt(value, 10);
+  if (!Number.isSafeInteger(parsed) || parsed < min || parsed > max) {
+    return { ok: false, value: null };
+  }
+  return { ok: true, value: parsed };
 };
 
-// AM: aplica filtros opcionales por id_sucursal/id_almacen para catalogos de OC sin romper contratos legacy.
-const filterProductosByCatalogScope = async (rows, query, db = pool) => {
-  const idAlmacen = parseOptionalPositiveId(query?.id_almacen);
-  const idSucursal = parseOptionalPositiveId(query?.id_sucursal);
-  const allowedSucursales = Array.isArray(query?._allowedSucursalIds) ? query._allowedSucursalIds : [];
-
-  if ((query?.id_almacen ?? '') !== '' && query?.id_almacen !== undefined && idAlmacen === null) {
-    return { ok: false, message: 'id_almacen invalido.' };
-  }
-  if ((query?.id_sucursal ?? '') !== '' && query?.id_sucursal !== undefined && idSucursal === null) {
-    return { ok: false, message: 'id_sucursal invalido.' };
+const parseEstadoFiltroProductos = (query) => {
+  const raw = String(query?.estado ?? '').trim().toLowerCase();
+  if (!raw) {
+    return shouldIncludeInactive(query) ? 'todos' : 'activo';
   }
 
-  if (!idAlmacen && !idSucursal && allowedSucursales.length === 0) return { ok: true, rows };
+  if (raw === 'todos' || raw === 'all') return 'todos';
+  if (raw === 'activo' || raw === 'activos' || raw === 'true' || raw === '1') return 'activo';
+  if (raw === 'inactivo' || raw === 'inactivos' || raw === 'false' || raw === '0') return 'inactivo';
+  return null;
+};
 
-  let allowedWarehouseSet = null;
-  const targetSucursales = idSucursal ? [idSucursal] : allowedSucursales;
-  
-  if (targetSucursales.length > 0) {
-    const allowed = await db.query(
-      `
-        SELECT a.id_almacen
-        FROM public.almacenes a
-        WHERE a.id_sucursal = ANY($1::int[])
-          AND COALESCE(a.estado, true) = true
-      `,
-      [targetSucursales]
-    );
-    allowedWarehouseSet = new Set(
-      (allowed.rows || [])
-        .map((row) => Number.parseInt(String(row?.id_almacen ?? ''), 10))
+const parseStockFiltroProductos = (query) => {
+  const raw = String(query?.stock ?? '').trim().toLowerCase();
+  if (!raw || raw === 'todos' || raw === 'all') return 'todos';
+  if (raw === 'con_stock' || raw === 'constock') return 'con_stock';
+  if (raw === 'sin_stock' || raw === 'sinstock') return 'sin_stock';
+  return null;
+};
+
+const parseSortProductos = (query) => {
+  const raw = String(query?.sort ?? query?.sortBy ?? '').trim().toLowerCase();
+  if (!raw) return 'recientes';
+  if (!Object.prototype.hasOwnProperty.call(PRODUCTOS_SORT_ALLOWLIST, raw)) return null;
+  return raw;
+};
+
+function normalizeScopeSucursalIds(rawIds) {
+  return Array.from(
+    new Set(
+      (Array.isArray(rawIds) ? rawIds : [])
+        .map((id) => Number.parseInt(String(id ?? '').trim(), 10))
         .filter((id) => esEnteroPositivoInt32(id))
-    );
+    )
+  );
+}
+
+async function getAllowedBranchIdsForUser(req, db = pool) {
+  if (req?.__productosSucursalScope) {
+    return req.__productosSucursalScope;
   }
 
-  const filtered = (Array.isArray(rows) ? rows : []).filter((row) => {
-    const rowAlmacenes = resolveRowAlmacenes(row);
-    
-    // Si no tenemos un set de almacenes permitidos (Super Admin sin sucursal), 
-    // mostramos todo lo que este activo.
-    if (!allowedWarehouseSet && !idAlmacen) return true;
+  const scope = await resolveRequestUserSucursalScope(req, db);
+  const payload = {
+    isSuperAdmin: Boolean(scope?.isSuperAdmin),
+    allowedSucursalIds: normalizeScopeSucursalIds(scope?.allowedSucursalIds)
+  };
 
-    if (rowAlmacenes.length === 0) return false;
-    if (idAlmacen && !rowAlmacenes.includes(idAlmacen)) return false;
-    if (allowedWarehouseSet && !rowAlmacenes.some((id) => allowedWarehouseSet.has(id))) return false;
-    return true;
-  });
+  if (req) req.__productosSucursalScope = payload;
+  return payload;
+}
 
-  return { ok: true, rows: filtered };
-};
+async function assertAlmacenesInScope(req, rawAlmacenes, db = pool) {
+  const idAlmacenes = Array.from(
+    new Set(
+      (Array.isArray(rawAlmacenes) ? rawAlmacenes : [])
+        .map((id) => Number.parseInt(String(id ?? '').trim(), 10))
+        .filter((id) => esEnteroPositivoInt32(id))
+    )
+  );
+
+  if (idAlmacenes.length === 0) {
+    return { ok: false, status: 400, message: 'Debe seleccionar al menos un id_almacen.' };
+  }
+
+  const scope = await getAllowedBranchIdsForUser(req, db);
+  if (!scope.isSuperAdmin && scope.allowedSucursalIds.length === 0) {
+    return { ok: false, status: 403, message: PRODUCTOS_SCOPE_MISSING_BRANCHES_MESSAGE };
+  }
+
+  const almacenesResult = await db.query(
+    `
+      SELECT a.id_almacen, a.id_sucursal
+      FROM public.almacenes a
+      WHERE a.id_almacen = ANY($1::int[])
+    `,
+    [idAlmacenes]
+  );
+
+  if (almacenesResult.rowCount !== idAlmacenes.length) {
+    return { ok: false, status: 404, message: ALMACEN_NOT_FOUND_MESSAGE };
+  }
+
+  if (!scope.isSuperAdmin) {
+    const allowedSet = new Set(scope.allowedSucursalIds);
+    const hasUnauthorizedWarehouse = (almacenesResult.rows || []).some((row) => {
+      const idSucursal = Number.parseInt(String(row?.id_sucursal ?? ''), 10);
+      return !esEnteroPositivoInt32(idSucursal) || !allowedSet.has(idSucursal);
+    });
+
+    if (hasUnauthorizedWarehouse) {
+      return { ok: false, status: 403, message: PRODUCTOS_SCOPE_FORBIDDEN_MESSAGE };
+    }
+  }
+
+  return { ok: true, status: 200, rows: almacenesResult.rows || [] };
+}
+
+async function assertProductoInScope(req, idProducto, db = pool) {
+  const producto = await getProductoById(idProducto, db);
+  if (!producto) {
+    return { ok: false, status: 404, message: PRODUCTOS_NOT_FOUND_MESSAGE };
+  }
+
+  const scope = await getAllowedBranchIdsForUser(req, db);
+  if (!scope.isSuperAdmin && scope.allowedSucursalIds.length === 0) {
+    return { ok: false, status: 403, message: PRODUCTOS_SCOPE_MISSING_BRANCHES_MESSAGE };
+  }
+
+  if (!scope.isSuperAdmin) {
+    const idSucursal = Number.parseInt(String(producto?.id_sucursal ?? ''), 10);
+    if (!esEnteroPositivoInt32(idSucursal) || !scope.allowedSucursalIds.includes(idSucursal)) {
+      return { ok: false, status: 403, message: PRODUCTOS_SCOPE_FORBIDDEN_MESSAGE };
+    }
+  }
+
+  return { ok: true, status: 200, producto };
+}
+
+function isSkippableDependencySchemaError(err) {
+  return err?.code === SQLSTATE_UNDEFINED_TABLE || err?.code === SQLSTATE_UNDEFINED_COLUMN;
+}
+
+async function safeDependencyCount({ label, query, params }, db = pool) {
+  try {
+    const result = await db.query(query, Array.isArray(params) ? params : []);
+    const total = Number.parseInt(String(result.rows?.[0]?.total ?? '0'), 10);
+    return {
+      label,
+      checked: true,
+      total: Number.isNaN(total) ? 0 : total
+    };
+  } catch (err) {
+    if (isSkippableDependencySchemaError(err)) {
+      console.warn(`[productos] dependencia omitida (${label}):`, err.message);
+      return { label, checked: false, total: 0 };
+    }
+    throw err;
+  }
+}
+
+async function getProductoDependencySummary(idProducto, db = pool) {
+  const checks = await Promise.all([
+    safeDependencyCount(
+      {
+        label: 'menu_publicado',
+        params: [idProducto],
+        query: `
+          SELECT COUNT(*)::int AS total
+          FROM public.detalle_menu dm
+          INNER JOIN public.menu m ON m.id_menu = dm.id_menu
+          WHERE dm.id_producto = $1
+            AND COALESCE(dm.estado, true) = true
+            AND COALESCE(m.estado, true) = true
+        `
+      },
+      db
+    ),
+    safeDependencyCount(
+      {
+        label: 'ordenes_compra_en_proceso',
+        params: [idProducto, PRODUCTOS_DELETE_BLOCKING_OC_STATES],
+        query: `
+          SELECT COUNT(*)::int AS total
+          FROM public.detalle_orden_compras doc
+          INNER JOIN public.orden_compras oc
+            ON oc.id_orden_compra = doc.id_orden_compra
+          WHERE doc.id_producto = $1
+            AND UPPER(COALESCE(oc.estado_flujo, '')) = ANY($2::text[])
+        `
+      },
+      db
+    )
+  ]);
+
+  const normalizedChecks = checks.map((row) => ({
+    modulo: row.label,
+    checked: row.checked,
+    total: row.total
+  }));
+
+  const blocking = normalizedChecks.filter((row) => row.checked && row.total > 0);
+  return {
+    hasBlockingDependencies: blocking.length > 0,
+    summary: {
+      blocking_modules: blocking.map((row) => ({
+        modulo: row.modulo,
+        total: row.total
+      })),
+      checks: normalizedChecks
+    }
+  };
+}
+
+async function assertProductoCanBeDeactivated(idProducto, db = pool) {
+  const dependencySummary = await getProductoDependencySummary(idProducto, db);
+  if (dependencySummary.hasBlockingDependencies) {
+    return {
+      ok: false,
+      status: 409,
+      message: PRODUCTOS_DELETE_BLOCKED_MESSAGE,
+      summary: dependencySummary.summary
+    };
+  }
+
+  return { ok: true, status: 200 };
+}
 
 // NUEVO: helper para detectar valores vacios en campos opcionales
 const esVacio = (valor) =>
@@ -202,6 +400,27 @@ function esFechaValida(valor) {
   if (Number.isNaN(fecha.getTime())) return false;
 
   return fecha.toISOString().slice(0, 10) === limpio;
+}
+
+function validarCoherenciaFechasProducto({ fechaIngreso, fechaCaducidad }) {
+  const ingreso = typeof fechaIngreso === 'string' ? fechaIngreso.trim() : '';
+  const caducidad = typeof fechaCaducidad === 'string' ? fechaCaducidad.trim() : '';
+
+  if (!ingreso || !caducidad) {
+    return { ok: true };
+  }
+
+  if (!esFechaValida(ingreso) || !esFechaValida(caducidad)) {
+    return { ok: true };
+  }
+
+  const ingresoTime = new Date(`${ingreso}T00:00:00Z`).getTime();
+  const caducidadTime = new Date(`${caducidad}T00:00:00Z`).getTime();
+  if (caducidadTime < ingresoTime) {
+    return { ok: false, message: PRODUCTOS_DATE_ORDER_MESSAGE };
+  }
+
+  return { ok: true };
 }
 
 // NUEVO: valida y normaliza cada campo permitido de productos
@@ -358,7 +577,7 @@ async function validarExistenciaFk(campo, valor, db = pool) {
     if (valor === null) return true;
 
     const r = await db.query(
-      'SELECT 1 FROM archivos WHERE id_archivo = $1 LIMIT 1',
+      'SELECT 1 FROM archivos WHERE id_archivo = $1 AND COALESCE(estado, true) = true LIMIT 1',
       [valor]
     );
     return r.rowCount > 0;
@@ -389,79 +608,39 @@ async function validarAlmacenOperativo(idAlmacen, db = pool) {
   return { ok: true };
 }
 
-// NUEVO: existencia de producto para respuesta 404 en PUT
-async function existeProductoPorId(idProducto) {
-  const r = await pool.query(
-    'SELECT 1 FROM productos WHERE id_producto = $1 LIMIT 1',
-    [idProducto]
-  );
-  return r.rowCount > 0;
-}
-
 // AM: carga snapshot completo del producto para soportar edicion multi-almacen sin perder campos opcionales.
 async function getProductoById(idProducto, db = pool) {
   const r = await db.query(
     `SELECT
-      id_producto,
-      nombre_producto,
-      precio,
-      cantidad,
-      stock_minimo,
-      descripcion_producto,
-      fecha_ingreso_producto,
-      fecha_caducidad,
-      id_categoria_producto,
-      id_almacen,
-      id_tipo_departamento,
-      estado,
-      id_archivo_imagen_principal
-    FROM productos
-    WHERE id_producto = $1
+      p.id_producto,
+      p.nombre_producto,
+      p.precio,
+      p.cantidad,
+      p.stock_minimo,
+      p.descripcion_producto,
+      p.fecha_ingreso_producto,
+      p.fecha_caducidad,
+      p.id_categoria_producto,
+      p.id_almacen,
+      p.id_tipo_departamento,
+      p.estado,
+      p.id_archivo_imagen_principal,
+      a.id_sucursal
+    FROM productos p
+    LEFT JOIN public.almacenes a ON a.id_almacen = p.id_almacen
+    WHERE p.id_producto = $1
     LIMIT 1`,
     [idProducto]
   );
   return r.rows[0] || null;
 }
 
-// AM: busca un producto "equivalente" por llave de negocio operativa (nombre + categoria + depto opcional + almacen).
-// AM: se usa para sincronizar seleccion de varios almacenes en edicion sin crear duplicados innecesarios.
-async function findProductoByUniqueKey(
-  {
-    nombre_producto,
-    id_categoria_producto,
-    id_tipo_departamento,
-    id_almacen,
-    excludeId = null
-  },
-  db = pool
-) {
-  const params = [
-    String(nombre_producto ?? '').trim().toLowerCase(),
-    id_categoria_producto,
-    id_tipo_departamento ?? null,
-    id_almacen
-  ];
-
-  let sql = `
-    SELECT id_producto
-    FROM productos
-    WHERE lower(trim(nombre_producto)) = $1
-      AND id_categoria_producto = $2
-      AND (
-        (id_tipo_departamento IS NULL AND $3::integer IS NULL)
-        OR id_tipo_departamento = $3::integer
-      )
-      AND id_almacen = $4
-  `;
-
-  if (excludeId !== null && excludeId !== undefined) {
-    params.push(excludeId);
-    sql += ' AND id_producto <> $5';
-  }
-
-  sql += ' ORDER BY id_producto DESC LIMIT 1';
-  const r = await db.query(sql, params);
-  return r.rows[0] || null;
+async function getHydratedProductoById(req, idProducto, db = pool) {
+  const producto = await getProductoById(idProducto, db);
+  if (!producto) return null;
+  const rowsWithAlmacenes = await attachProductoAlmacenes([producto], db);
+  const rowsWithImagen = await attachImagenPrincipalUrls(db, req, rowsWithAlmacenes);
+  return rowsWithImagen?.[0] || producto;
 }
 
 // AM: busca producto general (sin amarrarlo a un almacen) para evitar duplicados por sucursal en modelo multi-asignacion.
@@ -612,7 +791,7 @@ async function attachProductoAlmacenes(rows, db = pool) {
 }
 
 // AM: update explicito de todo el registro para sincronizacion multi-almacen.
-// AM: evita encadenar muchos `pa_update` y mantiene una sola transaccion atomica.
+// AM: evita encadenar multiples updates parciales y mantiene una sola transaccion atomica.
 async function updateProductoCompleto(idProducto, data, db = pool) {
   await db.query(
     `UPDATE productos
@@ -646,27 +825,24 @@ async function updateProductoCompleto(idProducto, data, db = pool) {
   );
 }
 
-// NEW: actualiza campos opcionales a SQL NULL sin pasar por `pa_update`.
-// WHY: `pa_update` serializa valores con `%L` y convertiria `null` en el texto `"null"`, rompiendo FKs integer.
-// IMPACT: solo se usa al limpiar FKs opcionales; el resto del flujo PUT conserva `pa_update` intacto.
-async function updateProductoFieldToNull(idProducto, campo) {
-  if (campo === 'id_archivo_imagen_principal') {
-    await pool.query(
-      'UPDATE productos SET id_archivo_imagen_principal = NULL WHERE id_producto = $1',
-      [idProducto]
-    );
-    return true;
+// NEW: persistencia explicita por campo para PUT /productos sin procedimientos genericos.
+// WHY: mejorar trazabilidad y seguridad en un modulo sensible de inventario.
+// IMPACT: reemplaza `pa_update` con SQL parametrizado y allowlist de columnas.
+async function updateProductoField(idProducto, campo, valor, db = pool) {
+  const column = PRODUCTOS_UPDATE_FIELD_COLUMN_MAP[campo];
+  if (!column) {
+    return { ok: false, updated: false };
   }
 
-  if (campo === 'id_tipo_departamento') {
-    await pool.query(
-      'UPDATE productos SET id_tipo_departamento = NULL WHERE id_producto = $1',
-      [idProducto]
-    );
-    return true;
-  }
+  const result = await db.query(
+    `UPDATE public.productos
+     SET ${column} = $1
+     WHERE id_producto = $2
+     RETURNING id_producto`,
+    [valor, idProducto]
+  );
 
-  return false;
+  return { ok: true, updated: result.rowCount > 0 };
 }
 
 // NUEVO: helper para clasificar errores SQL de constraint como conflicto
@@ -684,7 +860,7 @@ function getProductosConstraintConflictMessage(err) {
 // NEW: sanitiza mensajes internos de BD para respuestas HTTP del router de Productos.
 // WHY: evitar exponer detalles como `out of range for type integer` al frontend/usuario.
 // IMPACT: solo cambia el texto de errores internos; status codes y logging del servidor se mantienen.
-function getSafeProductosServerErrorMessage(err, fallback = 'No se pudo completar la acción. Verifica los datos e intenta de nuevo.') {
+function getSafeProductosServerErrorMessage(err, fallback = 'No se pudo completar la accion. Verifica los datos e intenta de nuevo.') {
   const raw = String(err?.message || '').toLowerCase();
   if (err?.code === CODIGO_SQL_OUT_OF_RANGE) return fallback;
   if (raw.includes('out of range') && raw.includes('integer')) return fallback;
@@ -692,53 +868,214 @@ function getSafeProductosServerErrorMessage(err, fallback = 'No se pudo completa
 }
 
 // GET: Obtener productos
-router.get('/productos', async (req, res) => {
+router.get('/productos', checkPermission(PRODUCTOS_LIST_PERMISSIONS), async (req, res) => {
   try {
-    const scope = await resolveRequestUserSucursalScope(req);
     const queryPayload = { ...req.query };
+    const scope = await getAllowedBranchIdsForUser(req, pool);
+    if (!scope.isSuperAdmin && scope.allowedSucursalIds.length === 0) {
+      return res.status(403).json({ error: true, message: PRODUCTOS_SCOPE_MISSING_BRANCHES_MESSAGE });
+    }
 
-    if (!scope.isSuperAdmin) {
-      if (!scope.allowedSucursalIds || scope.allowedSucursalIds.length === 0) {
-        return res.status(403).json({ error: true, message: 'El empleado no tiene sucursales asignadas.' });
-      }
-      
-      const requestedSucursal = parseOptionalPositiveId(req.query.id_sucursal);
-      if (requestedSucursal) {
-        if (!scope.allowedSucursalIds.includes(requestedSucursal)) {
-          return res.status(403).json({ error: true, message: 'No tiene acceso a la sucursal solicitada.' });
-        }
+    const requestedSucursalHasValue = hasQueryKey(queryPayload, 'id_sucursal');
+    const requestedSucursal = parseOptionalPositiveId(queryPayload.id_sucursal);
+    if (requestedSucursalHasValue && requestedSucursal === null) {
+      return res.status(400).json({ error: true, message: 'id_sucursal invalido.' });
+    }
+
+    if (!scope.isSuperAdmin && requestedSucursal && !scope.allowedSucursalIds.includes(requestedSucursal)) {
+      return res.status(403).json({ error: true, message: 'No tiene acceso a la sucursal solicitada.' });
+    }
+
+    const requestedAlmacenHasValue = hasQueryKey(queryPayload, 'id_almacen');
+    const requestedAlmacen = parseOptionalPositiveId(queryPayload.id_almacen);
+    if (requestedAlmacenHasValue && requestedAlmacen === null) {
+      return res.status(400).json({ error: true, message: 'id_almacen invalido.' });
+    }
+
+    const requestedCategoriaHasValue =
+      hasQueryKey(queryPayload, 'id_categoria_producto') || hasQueryKey(queryPayload, 'id_categoria');
+    const requestedCategoria = parseOptionalPositiveId(
+      queryPayload.id_categoria_producto ?? queryPayload.id_categoria
+    );
+    if (requestedCategoriaHasValue && requestedCategoria === null) {
+      return res.status(400).json({ error: true, message: 'id_categoria_producto invalido.' });
+    }
+
+    const requestedDeptoHasValue = hasQueryKey(queryPayload, 'id_tipo_departamento');
+    const requestedDeptoRaw = String(queryPayload.id_tipo_departamento ?? '').trim().toLowerCase();
+    const requestedDeptoIsNullFilter =
+      requestedDeptoHasValue &&
+      (requestedDeptoRaw === 'null' || requestedDeptoRaw === 'sin_departamento' || requestedDeptoRaw === 'none');
+    const requestedDepto = requestedDeptoIsNullFilter
+      ? null
+      : parseOptionalPositiveId(queryPayload.id_tipo_departamento);
+    if (requestedDeptoHasValue && !requestedDeptoIsNullFilter && requestedDepto === null) {
+      return res.status(400).json({ error: true, message: 'id_tipo_departamento invalido.' });
+    }
+
+    const estadoFiltro = parseEstadoFiltroProductos(queryPayload);
+    if (!estadoFiltro) {
+      return res.status(400).json({ error: true, message: 'estado invalido. Use activo, inactivo o todos.' });
+    }
+
+    const stockFiltro = parseStockFiltroProductos(queryPayload);
+    if (!stockFiltro) {
+      return res.status(400).json({ error: true, message: 'stock invalido. Use con_stock, sin_stock o todos.' });
+    }
+
+    const sortKey = parseSortProductos(queryPayload);
+    if (!sortKey) {
+      return res.status(400).json({ error: true, message: 'sort invalido.' });
+    }
+
+    const rawSearch = queryPayload.q ?? queryPayload.search ?? queryPayload.busqueda ?? '';
+    const search = String(rawSearch ?? '').trim();
+
+    const wantsPaginated =
+      hasQueryKey(queryPayload, 'page') ||
+      hasQueryKey(queryPayload, 'pageSize') ||
+      hasQueryKey(queryPayload, 'page_size') ||
+      hasQueryKey(queryPayload, 'limit');
+
+    const pageParsed = parsePositiveIntParam(
+      queryPayload.page,
+      PRODUCTOS_DEFAULT_PAGE,
+      1,
+      100000
+    );
+    if (!pageParsed.ok) {
+      return res.status(400).json({ error: true, message: 'page invalido.' });
+    }
+
+    const pageSizeParsed = parsePositiveIntParam(
+      queryPayload.pageSize ?? queryPayload.page_size ?? queryPayload.limit,
+      PRODUCTOS_DEFAULT_PAGE_SIZE,
+      1,
+      PRODUCTOS_MAX_PAGE_SIZE
+    );
+    if (!pageSizeParsed.ok) {
+      return res.status(400).json({
+        error: true,
+        message: `pageSize invalido. Debe estar entre 1 y ${PRODUCTOS_MAX_PAGE_SIZE}.`
+      });
+    }
+
+    const page = pageParsed.value;
+    const pageSize = pageSizeParsed.value;
+
+    const whereClauses = [];
+    const whereParams = [];
+
+    if (estadoFiltro === 'activo') whereClauses.push('COALESCE(p.estado, true) = true');
+    if (estadoFiltro === 'inactivo') whereClauses.push('COALESCE(p.estado, true) = false');
+    if (requestedCategoria !== null) {
+      whereParams.push(requestedCategoria);
+      whereClauses.push(`p.id_categoria_producto = $${whereParams.length}`);
+    }
+    if (requestedAlmacen !== null) {
+      whereParams.push(requestedAlmacen);
+      whereClauses.push(`p.id_almacen = $${whereParams.length}`);
+    }
+    if (requestedDeptoHasValue) {
+      if (requestedDeptoIsNullFilter) {
+        whereClauses.push('p.id_tipo_departamento IS NULL');
       } else {
-        // En productos se permite enviar id_sucursal=X para filtrar, 
-        // si no envia, pero está capado, debería listar de sus almacenes permitidos.
-        // Pero filterProductosByCatalogScope por ahora toma 1 sucursal,
-        // esto requiere que si scope.allowedSucursalIds tiene varias sucursales y no pide una, filtre por todas.
-        queryPayload._allowedSucursalIds = scope.allowedSucursalIds;
+        whereParams.push(requestedDepto);
+        whereClauses.push(`p.id_tipo_departamento = $${whereParams.length}`);
       }
     }
-
-    const tabla = 'productos';
-
-    // AJUSTE: se incluye estado para compatibilidad con soft delete
-    const columnas =
-      'id_producto, nombre_producto, precio, cantidad, stock_minimo, descripcion_producto, fecha_ingreso_producto, fecha_caducidad, id_categoria_producto, id_almacen, id_tipo_departamento, estado, id_archivo_imagen_principal';
-
-    const query = 'SELECT function_select($1, $2) as resultado';
-    const result = await pool.query(query, [tabla, columnas]);
-
-    const baseDatos = result.rows[0].resultado || [];
-    // NEW: activos por defecto; admin puede solicitar incluir inactivos.
-    // WHY: alinear GET /productos con inactivacion via `estado=false`.
-    // IMPACT: no rompe clientes actuales; amplia el contrato con query param opcional.
-    const datos = shouldIncludeInactive(queryPayload) ? baseDatos : baseDatos.filter(isRowActive);
-    const datosConAlmacenes = await attachProductoAlmacenes(datos, pool);
-    
-    // Filtro legacy o multi sucursal
-    const scopedFilter = await filterProductosByCatalogScope(datosConAlmacenes, queryPayload, pool);
-    if (!scopedFilter.ok) {
-      return res.status(400).json({ error: true, message: scopedFilter.message || 'Filtros de catalogo invalidos.' });
+    if (stockFiltro === 'con_stock') whereClauses.push('COALESCE(p.cantidad, 0) > 0');
+    if (stockFiltro === 'sin_stock') whereClauses.push('COALESCE(p.cantidad, 0) <= 0');
+    if (requestedSucursal !== null) {
+      whereParams.push(requestedSucursal);
+      whereClauses.push(`a.id_sucursal = $${whereParams.length}`);
+    } else if (!scope.isSuperAdmin) {
+      whereParams.push(scope.allowedSucursalIds);
+      whereClauses.push(`a.id_sucursal = ANY($${whereParams.length}::int[])`);
     }
-    const datosConImagen = await attachImagenPrincipalUrls(pool, req, scopedFilter.rows || []);
-    res.status(200).json(datosConImagen);
+    if (search) {
+      const like = `%${search}%`;
+      whereParams.push(like);
+      const p = whereParams.length;
+      whereClauses.push(`
+        (
+          COALESCE(p.nombre_producto, '') ILIKE $${p}
+          OR COALESCE(p.descripcion_producto, '') ILIKE $${p}
+          OR COALESCE(cp.nombre_categoria, '') ILIKE $${p}
+          OR COALESCE(a.nombre, '') ILIKE $${p}
+        )
+      `);
+    }
+
+    const whereSql = whereClauses.length > 0 ? `WHERE ${whereClauses.join(' AND ')}` : '';
+    const fromSql = `
+      FROM public.productos p
+      LEFT JOIN public.almacenes a
+        ON a.id_almacen = p.id_almacen
+      LEFT JOIN public.categorias_productos cp
+        ON cp.id_categoria_producto = p.id_categoria_producto
+      ${whereSql}
+    `;
+    const orderBySql = PRODUCTOS_SORT_ALLOWLIST[sortKey] || PRODUCTOS_SORT_ALLOWLIST.recientes;
+
+    let total = 0;
+    if (wantsPaginated) {
+      const totalResult = await pool.query(
+        `SELECT COUNT(*)::int AS total ${fromSql}`,
+        whereParams
+      );
+      total = Number.parseInt(String(totalResult.rows?.[0]?.total ?? '0'), 10) || 0;
+    }
+
+    const dataParams = [...whereParams];
+    const paginationSql = wantsPaginated
+      ? (() => {
+          dataParams.push(pageSize);
+          dataParams.push((page - 1) * pageSize);
+          return `LIMIT $${dataParams.length - 1} OFFSET $${dataParams.length}`;
+        })()
+      : '';
+
+    const dataResult = await pool.query(
+      `
+        SELECT
+          p.id_producto,
+          p.nombre_producto,
+          p.precio,
+          p.cantidad,
+          p.stock_minimo,
+          p.descripcion_producto,
+          p.fecha_ingreso_producto,
+          p.fecha_caducidad,
+          p.id_categoria_producto,
+          p.id_almacen,
+          p.id_tipo_departamento,
+          p.estado,
+          p.id_archivo_imagen_principal
+        ${fromSql}
+        ORDER BY ${orderBySql}
+        ${paginationSql}
+      `,
+      dataParams
+    );
+
+    const rows = dataResult.rows || [];
+    const rowsWithAlmacenes = await attachProductoAlmacenes(rows, pool);
+    const items = await attachImagenPrincipalUrls(pool, req, rowsWithAlmacenes);
+
+    if (!wantsPaginated) {
+      return res.status(200).json(items);
+    }
+
+    const totalPages = total === 0 ? 1 : Math.ceil(total / pageSize);
+    return res.status(200).json({
+      error: false,
+      items,
+      total,
+      page,
+      pageSize,
+      totalPages
+    });
 
   } catch (err) {
     console.error('Error al obtener productos:', err.message);
@@ -747,10 +1084,9 @@ router.get('/productos', async (req, res) => {
 });
 
 // POST: Crear producto
-router.post('/productos', async (req, res) => {
+router.post('/productos', checkPermission(PRODUCTOS_CREATE_PERMISSIONS), async (req, res) => {
   const client = await pool.connect();
   try {
-    const tabla = 'productos';
     const datosEntrada = req.body;
 
     // VALIDACION: body debe ser objeto valido
@@ -773,7 +1109,6 @@ router.post('/productos', async (req, res) => {
     const camposRequeridos = [
       'nombre_producto',
       'precio',
-      'cantidad',
       'id_categoria_producto'
     ];
 
@@ -785,11 +1120,11 @@ router.post('/productos', async (req, res) => {
       });
     }
 
-    // NUEVO: normalizacion unificada del payload antes de pa_insert
+    // NUEVO: normalizacion unificada del payload antes de persistir
     const datosNormalizados = {};
 
     for (const campo of keys) {
-      if (campo === 'id_almacenes') continue;
+      if (campo === 'id_almacenes' || campo === 'cantidad') continue;
       const resultado = validarCampoProducto(campo, datosEntrada[campo]);
       if (!resultado.valido) {
         return res.status(400).json({ error: true, message: resultado.message });
@@ -797,9 +1132,25 @@ router.post('/productos', async (req, res) => {
       datosNormalizados[campo] = resultado.valor;
     }
 
+    // NEW: el CRUD de catalogo no debe aceptar ni persistir stock operativo desde el cliente.
+    // WHY: separar alta de producto vs movimientos de inventario/kardex.
+    // IMPACT: altas nuevas siempre inician con cantidad 0 sin depender del payload del frontend.
+    datosNormalizados.cantidad = 0;
+
     // AJUSTE: stock_minimo opcional con default 0 si no viene
     if (!Object.prototype.hasOwnProperty.call(datosNormalizados, 'stock_minimo')) {
       datosNormalizados.stock_minimo = 0;
+    }
+
+    const fechasCreateValidation = validarCoherenciaFechasProducto({
+      fechaIngreso: datosNormalizados.fecha_ingreso_producto,
+      fechaCaducidad: datosNormalizados.fecha_caducidad
+    });
+    if (!fechasCreateValidation.ok) {
+      return res.status(400).json({
+        error: true,
+        message: fechasCreateValidation.message
+      });
     }
 
     // VALIDACION: existencia FK categoria
@@ -825,6 +1176,14 @@ router.post('/productos', async (req, res) => {
 
     const idAlmacenes = almacenesParse.ids;
     datosNormalizados.id_almacen = idAlmacenes[0];
+
+    const almacenesScopeValidation = await assertAlmacenesInScope(req, idAlmacenes, client);
+    if (!almacenesScopeValidation.ok) {
+      return res.status(almacenesScopeValidation.status).json({
+        error: true,
+        message: almacenesScopeValidation.message
+      });
+    }
 
     // VALIDACION: existencia FK tipo_departamento solo si viene con valor
     if (Object.prototype.hasOwnProperty.call(datosNormalizados, 'id_tipo_departamento')) {
@@ -889,20 +1248,44 @@ router.post('/productos', async (req, res) => {
       id_almacen: idAlmacenes[0]
     };
 
-    const query = 'CALL pa_insert($1, $2)';
-    await client.query(query, [tabla, payloadPrimary]);
-
-    const inserted = await findProductoByUniqueKey(
-      {
-        nombre_producto: payloadPrimary.nombre_producto,
-        id_categoria_producto: payloadPrimary.id_categoria_producto,
-        id_tipo_departamento: payloadPrimary.id_tipo_departamento ?? null,
-        id_almacen: payloadPrimary.id_almacen
-      },
-      client
+    const insertResult = await client.query(
+      `
+        INSERT INTO public.productos (
+          nombre_producto,
+          precio,
+          cantidad,
+          stock_minimo,
+          descripcion_producto,
+          fecha_ingreso_producto,
+          fecha_caducidad,
+          id_categoria_producto,
+          id_almacen,
+          id_tipo_departamento,
+          estado,
+          id_archivo_imagen_principal
+        )
+        VALUES (
+          $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12
+        )
+        RETURNING id_producto
+      `,
+      [
+        payloadPrimary.nombre_producto,
+        payloadPrimary.precio,
+        0,
+        payloadPrimary.stock_minimo ?? 0,
+        payloadPrimary.descripcion_producto ?? '',
+        payloadPrimary.fecha_ingreso_producto ?? null,
+        payloadPrimary.fecha_caducidad ?? null,
+        payloadPrimary.id_categoria_producto,
+        payloadPrimary.id_almacen,
+        payloadPrimary.id_tipo_departamento ?? null,
+        payloadPrimary.estado ?? true,
+        payloadPrimary.id_archivo_imagen_principal ?? null
+      ]
     );
 
-    const idProductoCreado = Number.parseInt(String(inserted?.id_producto ?? ''), 10);
+    const idProductoCreado = Number.parseInt(String(insertResult.rows?.[0]?.id_producto ?? ''), 10);
     if (!esEnteroPositivoInt32(idProductoCreado)) {
       await client.query('ROLLBACK');
       return res.status(500).json({
@@ -912,12 +1295,23 @@ router.post('/productos', async (req, res) => {
     }
 
     await syncProductoAlmacenes(idProductoCreado, idAlmacenes, client);
+
+    const productoResponse = await getHydratedProductoById(req, idProductoCreado, client);
+    if (!productoResponse) {
+      await client.query('ROLLBACK');
+      return res.status(500).json({
+        error: true,
+        message: 'No se pudo cargar el producto recien creado.'
+      });
+    }
+
     await client.query('COMMIT');
 
     res.status(201).json({
+      error: false,
       message: 'Producto creado exitosamente.',
       id_producto: idProductoCreado,
-      id_almacenes: idAlmacenes
+      producto: productoResponse
     });
 
   } catch (err) {
@@ -938,9 +1332,9 @@ router.post('/productos', async (req, res) => {
   }
 });
 
-// AM: actualizacion completa del producto sincronizando uno o varios almacenes en una sola transaccion.
-// AM: conserva el endpoint `PUT /productos` por campo para compatibilidad y agrega flujo especifico multi-almacen.
-router.put('/productos/multi-almacen', async (req, res) => {
+// AM: endpoint legado de compatibilidad para sincronizacion multi-almacen.
+// AM: el flujo principal actual de UI opera en mono-almacen y usa `PUT /productos` por campo.
+router.put('/productos/multi-almacen', checkPermission(PRODUCTOS_EDIT_PERMISSIONS), async (req, res) => {
   const client = await pool.connect();
   try {
     const idProducto = Number.parseInt(String(req.body?.id_producto ?? ''), 10);
@@ -948,10 +1342,14 @@ router.put('/productos/multi-almacen', async (req, res) => {
       return res.status(400).json({ error: true, message: 'id_producto invalido.' });
     }
 
-    const actual = await getProductoById(idProducto, client);
-    if (!actual) {
-      return res.status(404).json({ error: true, message: 'Producto no encontrado.' });
+    const productoScopeValidation = await assertProductoInScope(req, idProducto, client);
+    if (!productoScopeValidation.ok) {
+      return res.status(productoScopeValidation.status).json({
+        error: true,
+        message: productoScopeValidation.message
+      });
     }
+    const actual = productoScopeValidation.producto;
     if (!isRowActive(actual)) {
       return res.status(400).json({ error: true, message: 'El producto esta inactivo.' });
     }
@@ -962,7 +1360,7 @@ router.put('/productos/multi-almacen', async (req, res) => {
     if (Object.prototype.hasOwnProperty.call(datosEntrada, 'cantidad')) {
       return res.status(400).json({
         error: true,
-        message: 'La cantidad no puede editarse desde este módulo. Use movimientos de inventario.'
+        message: 'La cantidad no puede modificarse desde el catálogo de productos.'
       });
     }
 
@@ -1008,6 +1406,17 @@ router.put('/productos/multi-almacen', async (req, res) => {
       datosNormalizados[campo] = resultado.valor;
     }
 
+    const fechasEditMultiValidation = validarCoherenciaFechasProducto({
+      fechaIngreso: datosNormalizados.fecha_ingreso_producto,
+      fechaCaducidad: datosNormalizados.fecha_caducidad
+    });
+    if (!fechasEditMultiValidation.ok) {
+      return res.status(400).json({
+        error: true,
+        message: fechasEditMultiValidation.message
+      });
+    }
+
     const camposRequeridos = ['nombre_producto', 'precio', 'stock_minimo', 'id_categoria_producto'];
     const faltantes = camposRequeridos.filter((campo) => !Object.prototype.hasOwnProperty.call(datosNormalizados, campo));
     if (faltantes.length > 0) {
@@ -1028,6 +1437,14 @@ router.put('/productos/multi-almacen', async (req, res) => {
       });
     }
     const idAlmacenes = almacenesParse.ids;
+
+    const almacenesScopeValidation = await assertAlmacenesInScope(req, idAlmacenes, client);
+    if (!almacenesScopeValidation.ok) {
+      return res.status(almacenesScopeValidation.status).json({
+        error: true,
+        message: almacenesScopeValidation.message
+      });
+    }
 
     const existeCategoria = await validarExistenciaFk('id_categoria_producto', datosNormalizados.id_categoria_producto, client);
     if (!existeCategoria) {
@@ -1118,7 +1535,9 @@ router.put('/productos/multi-almacen', async (req, res) => {
 });
 
 // PUT: Actualizar producto (1 campo)
-router.put('/productos', async (req, res) => {
+router.put('/productos', checkPermission(PRODUCTOS_EDIT_PERMISSIONS), async (req, res) => {
+  const client = await pool.connect();
+  let txStarted = false;
   try {
     const { campo, valor, id_campo, id_valor } = req.body || {};
 
@@ -1145,7 +1564,14 @@ router.put('/productos', async (req, res) => {
     if (campo === 'cantidad') {
       return res.status(400).json({
         error: true,
-        message: 'La cantidad no puede editarse desde este módulo. Use movimientos de inventario.'
+        message: 'La cantidad no puede modificarse desde el catálogo de productos.'
+      });
+    }
+
+    if (campo === 'id_almacen') {
+      return res.status(409).json({
+        error: true,
+        message: 'El almacén del producto no puede modificarse desde la edición de catálogo.'
       });
     }
 
@@ -1158,23 +1584,42 @@ router.put('/productos', async (req, res) => {
       });
     }
 
-    // AJUSTE: 404 si el producto objetivo no existe
-    const existeProducto = await existeProductoPorId(idProducto);
-    if (!existeProducto) {
-      return res.status(404).json({
+    const productoScopeValidation = await assertProductoInScope(req, idProducto, client);
+    if (!productoScopeValidation.ok) {
+      return res.status(productoScopeValidation.status).json({
         error: true,
-        message: 'Producto no encontrado.'
+        message: productoScopeValidation.message
       });
     }
+    const productoActual = productoScopeValidation.producto;
 
     const resultado = validarCampoProducto(campo, valor);
     if (!resultado.valido) {
       return res.status(400).json({ error: true, message: resultado.message });
     }
 
+    if (campo === 'fecha_ingreso_producto' || campo === 'fecha_caducidad') {
+      const fechasPutValidation = validarCoherenciaFechasProducto({
+        fechaIngreso:
+          campo === 'fecha_ingreso_producto'
+            ? resultado.valor
+            : toDateOnlyString(productoActual.fecha_ingreso_producto),
+        fechaCaducidad:
+          campo === 'fecha_caducidad'
+            ? resultado.valor
+            : toDateOnlyString(productoActual.fecha_caducidad)
+      });
+      if (!fechasPutValidation.ok) {
+        return res.status(400).json({
+          error: true,
+          message: fechasPutValidation.message
+        });
+      }
+    }
+
     // VALIDACION: FK categoria si se actualiza
     if (campo === 'id_categoria_producto') {
-      const existeCategoria = await validarExistenciaFk('id_categoria_producto', resultado.valor);
+      const existeCategoria = await validarExistenciaFk('id_categoria_producto', resultado.valor, client);
       if (!existeCategoria) {
         return res.status(400).json({
           error: true,
@@ -1183,34 +1628,9 @@ router.put('/productos', async (req, res) => {
       }
     }
 
-    // VALIDACION: FK almacen si se actualiza
-    if (campo === 'id_almacen') {
-      const productoActual = await getProductoById(idProducto, pool);
-      if (!productoActual) {
-        return res.status(404).json({
-          error: true,
-          message: 'Producto no encontrado.'
-        });
-      }
-      if (!isRowActive(productoActual)) {
-        return res.status(400).json({
-          error: true,
-          message: 'El producto esta inactivo.'
-        });
-      }
-
-      const almacenOperativo = await validarAlmacenOperativo(resultado.valor);
-      if (!almacenOperativo.ok) {
-        return res.status(400).json({
-          error: true,
-          message: almacenOperativo.message
-        });
-      }
-    }
-
     // VALIDACION: FK tipo_departamento solo cuando trae valor
     if (campo === 'id_tipo_departamento') {
-      const existeTipoDep = await validarExistenciaFk('id_tipo_departamento', resultado.valor);
+      const existeTipoDep = await validarExistenciaFk('id_tipo_departamento', resultado.valor, client);
       if (!existeTipoDep) {
         return res.status(400).json({
           error: true,
@@ -1220,7 +1640,7 @@ router.put('/productos', async (req, res) => {
     }
 
     if (campo === 'id_archivo_imagen_principal') {
-      const existeArchivo = await validarExistenciaFk('id_archivo_imagen_principal', resultado.valor);
+      const existeArchivo = await validarExistenciaFk('id_archivo_imagen_principal', resultado.valor, client);
       if (!existeArchivo) {
         return res.status(400).json({
           error: true,
@@ -1229,25 +1649,70 @@ router.put('/productos', async (req, res) => {
       }
     }
 
-    // NEW: desvincula FKs opcionales con SQL NULL real cuando el frontend limpia la imagen/campo.
-    // WHY: evita el error `invalid input syntax for type integer: "null"` reportado al quitar imagen.
-    // IMPACT: `Quitar imagen` y limpieza de departamento opcional funcionan sin tocar el contrato del endpoint.
-    if (resultado.valor === null && await updateProductoFieldToNull(idProducto, campo)) {
-      return res.status(200).json({ message: 'Producto actualizado correctamente.' });
+    if (campo === 'nombre_producto' || campo === 'id_categoria_producto' || campo === 'id_tipo_departamento') {
+      const duplicateGeneral = await findProductoByGeneralKey(
+        {
+          nombre_producto: campo === 'nombre_producto' ? resultado.valor : productoActual.nombre_producto,
+          id_categoria_producto: campo === 'id_categoria_producto' ? resultado.valor : productoActual.id_categoria_producto,
+          id_tipo_departamento: campo === 'id_tipo_departamento'
+            ? resultado.valor
+            : (productoActual.id_tipo_departamento ?? null),
+          excludeId: idProducto
+        },
+        client
+      );
+
+      if (duplicateGeneral) {
+        return res.status(409).json({
+          error: true,
+          message: PRODUCTOS_DUPLICATE_MESSAGE
+        });
+      }
     }
 
-    const tabla = 'productos';
-    const query = 'CALL pa_update($1, $2, $3, $4, $5)';
-    await pool.query(query, [tabla, campo, String(resultado.valor), id_campo, String(idProducto)]);
+    await client.query('BEGIN');
+    txStarted = true;
 
-    if (campo === 'id_almacen') {
-      // AM: al mover almacen primario por endpoint legacy, se preserva coherencia en tabla de asignaciones multi-almacen.
-      await syncProductoAlmacenes(idProducto, [resultado.valor], pool);
+    const updateResult = await updateProductoField(idProducto, campo, resultado.valor, client);
+    if (!updateResult.ok) {
+      await client.query('ROLLBACK');
+      txStarted = false;
+      return res.status(400).json({
+        error: true,
+        message: `Campo no permitido para actualizar: ${campo}`
+      });
+    }
+    if (!updateResult.updated) {
+      await client.query('ROLLBACK');
+      txStarted = false;
+      return res.status(404).json({
+        error: true,
+        message: PRODUCTOS_NOT_FOUND_MESSAGE
+      });
     }
 
-    res.status(200).json({ message: 'Producto actualizado correctamente.' });
+    const productoResponse = await getHydratedProductoById(req, idProducto, client);
+    if (!productoResponse) {
+      await client.query('ROLLBACK');
+      txStarted = false;
+      return res.status(500).json({
+        error: true,
+        message: 'No se pudo cargar el producto actualizado.'
+      });
+    }
+
+    await client.query('COMMIT');
+    txStarted = false;
+    res.status(200).json({
+      error: false,
+      message: 'Producto actualizado correctamente.',
+      producto: productoResponse
+    });
 
   } catch (err) {
+    if (txStarted) {
+      try { await client.query('ROLLBACK'); } catch {}
+    }
     console.error('Error al actualizar producto:', err.message);
 
     // AJUSTE: respuesta 409 para conflictos de FK/constraints
@@ -1259,11 +1724,13 @@ router.put('/productos', async (req, res) => {
     }
 
     res.status(500).json({ error: true, message: getSafeProductosServerErrorMessage(err) });
+  } finally {
+    client.release();
   }
 });
 
 // DELETE: Inactivar producto (soft delete)
-router.delete('/productos', async (req, res) => {
+router.delete('/productos', checkPermission(PRODUCTOS_DELETE_PERMISSIONS), async (req, res) => {
   try {
     // NEW: fallback compatible para obtener id del producto desde body/query/params sin romper firmas actuales.
     // WHY: evita `ReferenceError` y tolera clientes legacy que envian distintos nombres del ID.
@@ -1285,7 +1752,7 @@ router.delete('/productos', async (req, res) => {
       return res.status(400).json({
         error: true,
         code: 'INVALID_PRODUCT_ID',
-        message: 'ID de producto inválido.'
+        message: 'ID de producto invalido.'
       });
     }
 
@@ -1295,25 +1762,47 @@ router.delete('/productos', async (req, res) => {
       return res.status(400).json({
         error: true,
         code: 'INVALID_PRODUCT_ID',
-        message: 'ID de producto inválido.'
+        message: 'ID de producto invalido.'
       });
     }
 
-    // NEW: 404 explicito antes de inactivar.
-    // WHY: responder consistente sin depender del comportamiento interno de los SPs.
-    // IMPACT: solo afecta requests hacia IDs inexistentes.
-    const existeProducto = await existeProductoPorId(idProducto);
-    if (!existeProducto) {
+    const productoScopeValidation = await assertProductoInScope(req, idProducto, pool);
+    if (!productoScopeValidation.ok) {
+      const code = productoScopeValidation.status === 404 ? 'PRODUCT_NOT_FOUND' : 'FORBIDDEN';
+      return res.status(productoScopeValidation.status).json({
+        error: true,
+        code,
+        message: productoScopeValidation.message
+      });
+    }
+
+    const dependencyValidation = await assertProductoCanBeDeactivated(idProducto, pool);
+    if (!dependencyValidation.ok) {
+      return res.status(dependencyValidation.status).json({
+        error: true,
+        code: 'PRODUCT_IN_USE',
+        message: dependencyValidation.message,
+        dependency_summary: dependencyValidation.summary
+      });
+    }
+
+    const softDeleteResult = await pool.query(
+      `
+        UPDATE public.productos
+        SET estado = false
+        WHERE id_producto = $1
+        RETURNING id_producto
+      `,
+      [idProducto]
+    );
+
+    if (softDeleteResult.rowCount === 0) {
       return res.status(404).json({
         error: true,
         code: 'PRODUCT_NOT_FOUND',
-        message: 'Producto no encontrado.'
+        message: PRODUCTOS_NOT_FOUND_MESSAGE
       });
     }
-
-    const tabla = 'productos';
-    const query = 'CALL pa_update($1, $2, $3, $4, $5)';
-    await pool.query(query, [tabla, 'estado', 'false', columna_id, String(idProducto)]);
 
     return res.status(200).json({ error: false, message: 'Producto inactivado.' });
 
@@ -1325,9 +1814,10 @@ router.delete('/productos', async (req, res) => {
     return res.status(500).json({
       error: true,
       code: 'INTERNAL_ERROR',
-      message: 'No se pudo completar la acción. Intenta de nuevo.'
+      message: 'No se pudo completar la accion. Intenta de nuevo.'
     });
   }
 });
 
 export default router;
+

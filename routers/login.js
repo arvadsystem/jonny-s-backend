@@ -8,6 +8,10 @@ import {
   internalLoginAccountIpLimiter
 } from '../middleware/rateLimiter.js';
 import JWT_SECRET from '../config/jwt.js';
+import {
+  evaluatePasswordExpiration,
+  ensurePasswordChangedAtColumn,
+} from '../utils/security/passwordExpiration.js';
 
 // helpers de HU78
 import { getClientIp, parseUserAgent } from '../utils/security/clientInfo.js';
@@ -86,6 +90,30 @@ const getUserAuthzSnapshot = async (idUsuario) => {
   };
 };
 
+const buildPasswordPolicyFlags = (passwordExpiration) => {
+  const ageDays = Number.isInteger(passwordExpiration?.ageDays)
+    ? passwordExpiration.ageDays
+    : null;
+  const excludedByClienteRole = Boolean(passwordExpiration?.excludedByClienteRole);
+
+  const recommendation30d =
+    !excludedByClienteRole && ageDays !== null && ageDays >= 30;
+  const warning58d =
+    !excludedByClienteRole && ageDays !== null && ageDays >= 58 && ageDays < 60;
+  const daysToExpire =
+    !excludedByClienteRole && ageDays !== null
+      ? Math.max(0, 60 - ageDays)
+      : null;
+
+  return {
+    password_age_days: ageDays,
+    password_recommend_change: recommendation30d,
+    password_warning_58d: warning58d,
+    password_days_to_expire: daysToExpire,
+    password_policy_excluded: excludedByClienteRole,
+  };
+};
+
 const cookieConfig = () => {
   const isProd = process.env.NODE_ENV === 'production';
   return {
@@ -156,6 +184,8 @@ router.post('/login', internalLoginIpLimiter, internalLoginAccountIpLimiter, asy
   const { dispositivo, navegador, sistema_operativo } = parseUserAgent(user_agent);
 
   try {
+    await ensurePasswordChangedAtColumn();
+
     const query = `
       SELECT u.*, e.id_sucursal 
       FROM usuarios u 
@@ -205,7 +235,7 @@ router.post('/login', internalLoginIpLimiter, internalLoginAccountIpLimiter, asy
       nombre_usuario: usuarioEncontrado.nombre_usuario,
       rol: usuarioEncontrado.id_empleado,
       id_sucursal: usuarioEncontrado.id_sucursal, // <-- INYECTAR SUCURSAL
-      must_change_password: resolveMustChangePassword(usuarioEncontrado),
+      must_change_password: false,
       sid: id_sesion // HU79: id de sesión actual
     };
 
@@ -216,8 +246,19 @@ router.post('/login', internalLoginIpLimiter, internalLoginAccountIpLimiter, asy
       console.error('Error resolviendo roles/permisos en /login:', authzError);
     }
 
+    const passwordExpiration = evaluatePasswordExpiration({
+      roles: authz.roles,
+      tipoUsuario: usuarioEncontrado?.tipo_usuario,
+      mustChangePassword: resolveMustChangePassword(usuarioEncontrado),
+      passwordChangedAt: usuarioEncontrado?.fecha_cambio_clave,
+      createdAt: usuarioEncontrado?.fecha_creacion
+    });
+    payload.must_change_password = passwordExpiration.mustChangePassword;
+    const passwordPolicyFlags = buildPasswordPolicyFlags(passwordExpiration);
+
     const usuarioResponse = {
       ...payload,
+      ...passwordPolicyFlags,
       roles: authz.roles,
       permisos: authz.permisos
     };
@@ -305,21 +346,56 @@ router.post('/logout', authRequired, async (req, res) => {
   return res.json({ message: 'Logout exitoso' });
 });
 
-router.get('/me', authRequired, async (req, res) => {
+router.get('/me', authRequired, requireActiveSession, async (req, res) => {
   // Re-emite CSRF por si el frontend refresca y lo perdió
   const csrfToken = issueCsrf(res);
   const usuario = { ...(req.user || {}) };
   const idUsuario = Number.parseInt(String(usuario?.id_usuario ?? ''), 10);
 
+  let authz = { roles: [], permisos: [] };
   try {
     if (Number.isInteger(idUsuario) && idUsuario > 0) {
+      authz = await getUserAuthzSnapshot(idUsuario);
+    }
+  } catch (authzError) {
+    console.error('Error resolviendo roles/permisos en /me:', authzError);
+  }
+
+  try {
+    await ensurePasswordChangedAtColumn();
+
+    if (Number.isInteger(idUsuario) && idUsuario > 0) {
       const result = await pool.query(
-        'SELECT id_usuario, nombre_usuario, tipo_usuario, estado, must_change_password, id_empleado, id_cliente, foto_perfil FROM usuarios WHERE id_usuario = $1 LIMIT 1',
+        `
+          SELECT
+            id_usuario,
+            nombre_usuario,
+            tipo_usuario,
+            estado,
+            must_change_password,
+            id_empleado,
+            id_cliente,
+            foto_perfil,
+            fecha_creacion,
+            fecha_cambio_clave
+          FROM usuarios
+          WHERE id_usuario = $1
+          LIMIT 1
+        `,
         [idUsuario]
       );
 
       if (result.rows.length > 0) {
-        usuario.must_change_password = resolveMustChangePassword(result.rows[0]);
+        const row = result.rows[0];
+        const passwordExpiration = evaluatePasswordExpiration({
+          roles: authz.roles,
+          tipoUsuario: row?.tipo_usuario,
+          mustChangePassword: resolveMustChangePassword(row),
+          passwordChangedAt: row?.fecha_cambio_clave,
+          createdAt: row?.fecha_creacion
+        });
+        usuario.must_change_password = passwordExpiration.mustChangePassword;
+        Object.assign(usuario, buildPasswordPolicyFlags(passwordExpiration));
       } else if (!Object.prototype.hasOwnProperty.call(usuario, 'must_change_password')) {
         usuario.must_change_password = false;
       }
@@ -331,13 +407,12 @@ router.get('/me', authRequired, async (req, res) => {
     }
   }
 
-  let authz = { roles: [], permisos: [] };
-  try {
-    if (Number.isInteger(idUsuario) && idUsuario > 0) {
-      authz = await getUserAuthzSnapshot(idUsuario);
-    }
-  } catch (authzError) {
-    console.error('Error resolviendo roles/permisos en /me:', authzError);
+  if (!Object.prototype.hasOwnProperty.call(usuario, 'password_age_days')) {
+    usuario.password_age_days = null;
+    usuario.password_recommend_change = false;
+    usuario.password_warning_58d = false;
+    usuario.password_days_to_expire = null;
+    usuario.password_policy_excluded = false;
   }
 
   usuario.roles = authz.roles;

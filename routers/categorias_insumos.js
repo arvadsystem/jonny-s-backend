@@ -45,6 +45,14 @@ const normalizeBooleanInput = (value) => {
 // IMPACT: solo cambia el copy de errores 500.
 const safeServerErrorMessage = (fallback = 'No se pudo completar la acción. Verifica los datos e intenta de nuevo.') => fallback;
 
+// NEW: helpers de payload para endurecer validaciones sin cambiar contratos del módulo.
+// WHY: prevenir entradas con estructura inválida o campos inesperados en create/edición completa.
+// IMPACT: solo aplica a POST y PUT /edicion.
+const INPUT_CATEGORY_CREATE_ALLOWED_FIELDS = new Set(['nombre_categoria', 'codigo_categoria', 'descripcion', 'estado']);
+const INPUT_CATEGORY_FULL_EDIT_ALLOWED_FIELDS = new Set(['id_categoria_insumo', 'nombre_categoria', 'codigo_categoria', 'descripcion', 'estado']);
+const isPlainObject = (value) => Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+const hasOnlyAllowedFields = (payload, allowedSet) => Object.keys(payload).every((key) => allowedSet.has(key));
+
 // ------------------------------------------------------------------------------------
 // GET: Obtener categorias_insumos
 // ------------------------------------------------------------------------------------
@@ -74,7 +82,36 @@ router.get('/categorias_insumos', async (req, res) => {
 router.post('/categorias_insumos', async (req, res) => {
   try {
     const tabla = 'categorias_insumos';
-    const datos = req.body;
+    const datosEntrada = req.body;
+    if (!isPlainObject(datosEntrada)) {
+      return res.status(400).json({ error: true, message: 'Payload invalido.' });
+    }
+    if (!hasOnlyAllowedFields(datosEntrada, INPUT_CATEGORY_CREATE_ALLOWED_FIELDS)) {
+      return res.status(400).json({ error: true, message: 'El payload contiene campos no permitidos.' });
+    }
+
+    const nombre = String(datosEntrada?.nombre_categoria ?? '').trim();
+    const codigo = String(datosEntrada?.codigo_categoria ?? '').trim();
+    const descripcion = datosEntrada?.descripcion === undefined || datosEntrada?.descripcion === null
+      ? ''
+      : String(datosEntrada.descripcion).trim();
+
+    if (!nombre) {
+      return res.status(400).json({ error: true, message: 'nombre_categoria es obligatorio.' });
+    }
+    if (!codigo) {
+      return res.status(400).json({ error: true, message: 'codigo_categoria es obligatorio.' });
+    }
+    if (descripcion.length > 150) {
+      return res.status(400).json({ error: true, message: 'La descripcion no puede exceder 150 caracteres.' });
+    }
+
+    const datos = {
+      ...datosEntrada,
+      nombre_categoria: nombre,
+      codigo_categoria: codigo,
+      descripcion
+    };
 
     const query = 'CALL pa_insert($1, $2)';
     await pool.query(query, [tabla, datos]);
@@ -82,6 +119,91 @@ router.post('/categorias_insumos', async (req, res) => {
     res.status(201).json({ message: 'Categoría de insumo creada exitosamente.' });
   } catch (err) {
     console.error('Error al crear categoria_insumo:', err.message);
+    res.status(500).json({ error: true, message: safeServerErrorMessage() });
+  }
+});
+
+// ------------------------------------------------------------------------------------
+// PUT: Actualizar categoria_insumo completa (edicion atomica)
+// ------------------------------------------------------------------------------------
+router.put('/categorias_insumos/edicion', async (req, res) => {
+  try {
+    const datosEntrada = req.body;
+    if (!isPlainObject(datosEntrada)) {
+      return res.status(400).json({ error: true, message: 'Payload invalido.' });
+    }
+    if (!hasOnlyAllowedFields(datosEntrada, INPUT_CATEGORY_FULL_EDIT_ALLOWED_FIELDS)) {
+      return res.status(400).json({ error: true, message: 'El payload contiene campos no permitidos.' });
+    }
+
+    const {
+      id_categoria_insumo,
+      nombre_categoria,
+      codigo_categoria,
+      descripcion,
+      estado
+    } = datosEntrada;
+
+    const categoriaId = Number(id_categoria_insumo);
+    if (!isPositiveIntegerId(categoriaId)) {
+      return res.status(400).json({ error: true, message: 'id_categoria_insumo debe ser un entero mayor a 0.' });
+    }
+
+    const nombre = String(nombre_categoria ?? '').trim();
+    const codigo = String(codigo_categoria ?? '').trim();
+    const descripcionNormalizada = descripcion === undefined || descripcion === null
+      ? ''
+      : String(descripcion).trim();
+    const estadoNormalizado = normalizeBooleanInput(estado);
+
+    if (!nombre) {
+      return res.status(400).json({ error: true, message: 'nombre_categoria es obligatorio.' });
+    }
+    if (!codigo) {
+      return res.status(400).json({ error: true, message: 'codigo_categoria es obligatorio.' });
+    }
+    if (descripcionNormalizada.length > 150) {
+      return res.status(400).json({ error: true, message: 'La descripcion no puede exceder 150 caracteres.' });
+    }
+    if (estadoNormalizado === null) {
+      return res.status(400).json({ error: true, message: 'estado invalido.' });
+    }
+
+    // NEW: conserva la misma regla de negocio para inactivar cuando hay insumos activos asociados.
+    // WHY: mantener consistencia con DELETE y PUT por campo.
+    // IMPACT: solo bloquea cuando la edicion intenta dejar `estado=false` y hay dependencias activas.
+    if (estadoNormalizado === false) {
+      const insumosActivosRes = await pool.query(
+        'SELECT COUNT(1)::int AS total FROM insumos WHERE id_categoria_insumo = $1 AND estado = true',
+        [categoriaId]
+      );
+      const totalInsumosActivos = Number(insumosActivosRes.rows?.[0]?.total ?? 0);
+      if (totalInsumosActivos > 0) {
+        return res.status(409).json({
+          error: true,
+          code: 'CATEGORY_INSUMO_HAS_ACTIVE_ITEMS',
+          message: CATEGORY_INSUMO_HAS_ACTIVE_ITEMS_MESSAGE
+        });
+      }
+    }
+
+    const updateRes = await pool.query(
+      `UPDATE categorias_insumos
+       SET nombre_categoria = $1,
+           codigo_categoria = $2,
+           descripcion = $3,
+           estado = $4
+       WHERE id_categoria_insumo = $5`,
+      [nombre, codigo, descripcionNormalizada, estadoNormalizado, categoriaId]
+    );
+
+    if (updateRes.rowCount === 0) {
+      return res.status(404).json({ error: true, code: 'CATEGORY_INSUMO_NOT_FOUND', message: 'Categoría de insumo no encontrada.' });
+    }
+
+    res.status(200).json({ message: 'Categoría de insumo actualizada correctamente.' });
+  } catch (err) {
+    console.error('Error en edicion atomica de categoria_insumo:', err.message);
     res.status(500).json({ error: true, message: safeServerErrorMessage() });
   }
 });
@@ -95,6 +217,19 @@ router.put('/categorias_insumos', async (req, res) => {
 
     if (!campo || valor === undefined || !id_campo || id_valor === undefined) {
       return res.status(400).json({ error: true, message: 'Faltan campos obligatorios' });
+    }
+
+    const isTextField = campo === 'nombre_categoria' || campo === 'codigo_categoria' || campo === 'descripcion';
+    const valorSaneado = isTextField ? String(valor ?? '').trim() : valor;
+
+    if (campo === 'nombre_categoria' && !valorSaneado) {
+      return res.status(400).json({ error: true, message: 'nombre_categoria es obligatorio.' });
+    }
+    if (campo === 'codigo_categoria' && !valorSaneado) {
+      return res.status(400).json({ error: true, message: 'codigo_categoria es obligatorio.' });
+    }
+    if (campo === 'descripcion' && String(valorSaneado).length > 150) {
+      return res.status(400).json({ error: true, message: 'La descripcion no puede exceder 150 caracteres.' });
     }
 
     // NEW: aplica la misma regla de bloqueo en PUT cuando el frontend intenta inactivar via `estado=false`.
@@ -134,7 +269,7 @@ router.put('/categorias_insumos', async (req, res) => {
     await pool.query(query, [
       tabla,
       campo,
-      String(valor),
+      String(valorSaneado),
       id_campo,
       String(id_valor)
     ]);

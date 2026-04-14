@@ -1,6 +1,46 @@
 import pool from '../config/db-connection.js';
 import { isRequestUserSuperAdmin } from '../middleware/checkPermission.js';
 
+const SHOULD_INCLUDE_ERROR_STACK = ['development', 'dev', 'local'].includes(
+  String(process.env.NODE_ENV || '')
+    .trim()
+    .toLowerCase()
+);
+
+const truncateLogValue = (value, maxLength = 240) => {
+  const normalized = String(value ?? '').trim();
+  if (!normalized) return '';
+  if (normalized.length <= maxLength) return normalized;
+  return `${normalized.slice(0, maxLength)}...`;
+};
+
+const sanitizeErrorForLog = (error) => {
+  const payload = {
+    name: truncateLogValue(error?.name || 'Error', 120) || 'Error',
+    code: truncateLogValue(error?.code || '', 80) || null,
+    message: truncateLogValue(error?.message || 'Unexpected error', 260) || 'Unexpected error'
+  };
+
+  if (SHOULD_INCLUDE_ERROR_STACK && typeof error?.stack === 'string') {
+    payload.stack = truncateLogValue(
+      error.stack
+        .split('\n')
+        .slice(0, 5)
+        .join('\n'),
+      900
+    );
+  }
+
+  return payload;
+};
+
+const logScopeWarning = (context, error) => {
+  console.warn('[sucursalScope] warning', {
+    context: truncateLogValue(context || 'Unhandled context', 160) || 'Unhandled context',
+    ...sanitizeErrorForLog(error)
+  });
+};
+
 const parsePositiveInt = (value) => {
   const parsed = Number.parseInt(String(value ?? ''), 10);
   return Number.isInteger(parsed) && parsed > 0 ? parsed : null;

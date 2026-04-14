@@ -54,7 +54,6 @@ const parseBooleanFilter = (value) => {
 };
 
 const resolveUserId = (req) => req.user?.id_usuario ?? null;
-const normalizeSearchText = (value) => String(value ?? '').trim().toLowerCase();
 const hasOwn = (obj, key) => Object.prototype.hasOwnProperty.call(obj, key);
 const hasTextValue = (value) => value !== null && value !== undefined && String(value).trim() !== '';
 const rollbackQuietly = async (client) => {
@@ -118,35 +117,6 @@ const mapEmpleadoListRow = (row) => {
     correo,
     direccion
   };
-};
-
-const empleadoMatchesSearch = (empleado, normalizedSearch) => {
-  if (!normalizedSearch) return true;
-
-  const haystack = [
-    empleado.id_empleado,
-    empleado.salario_base,
-    empleado.cargo,
-    empleado.persona_nombre,
-    empleado.persona_apellido,
-    empleado.persona_nombre_completo,
-    empleado.nombre,
-    empleado.apellido,
-    empleado.nombre_completo,
-    empleado.persona_dni,
-    empleado.dni,
-    empleado.telefono,
-    empleado.correo,
-    empleado.direccion,
-    empleado.sucursal_nombre,
-    empleado.nombre_sucursal,
-    empleado.sucursal
-  ]
-    .map((value) => String(value ?? ''))
-    .join(' ')
-    .toLowerCase();
-
-  return haystack.includes(normalizedSearch);
 };
 
 const mapDbError = (err) => {
@@ -223,6 +193,8 @@ const getSchemaCapabilities = async () => {
           to_regclass('public.personas') AS personas_table,
           to_regclass('public.sucursales') AS sucursales_table,
           to_regclass('public.direcciones') AS direcciones_table,
+          to_regclass('public.telefonos') AS telefonos_table,
+          to_regclass('public.correos') AS correos_table,
           to_regclass('public.bitacoras') AS bitacoras_table
       `;
 
@@ -255,6 +227,8 @@ const getSchemaCapabilities = async () => {
         hasTenantField: columns.has('id_empresa'),
         hasPersonasTable: Boolean(relatedTables.personas_table),
         hasDireccionesTable: Boolean(relatedTables.direcciones_table),
+        hasTelefonosTable: Boolean(relatedTables.telefonos_table),
+        hasCorreosTable: Boolean(relatedTables.correos_table),
         hasPersonaTenantField: personasColumns.has('id_empresa'),
         hasSucursalesTable,
         sucursalNameField,
@@ -273,6 +247,206 @@ const empleadoRepository = {
   async list() {
     const result = await pool.query('SELECT * FROM empleados_listar()');
     return result.rows;
+  },
+
+  async searchWithPagination({
+    capabilities,
+    page,
+    limit,
+    searchTerm = '',
+    estado = null,
+    idSucursal = null,
+    tenantId = null
+  }) {
+    const filters = [];
+    const params = [];
+
+    const pushFilter = (fragment, value) => {
+      params.push(value);
+      filters.push(fragment.replaceAll('$IDX', `$${params.length}`));
+    };
+
+    if (searchTerm) {
+      const value = `%${searchTerm}%`;
+      const searchFragments = [
+        'e.id_empleado::TEXT ILIKE $IDX',
+        "COALESCE(e.salario_base::TEXT, '') ILIKE $IDX",
+        "COALESCE(e.cargo, '') ILIKE $IDX",
+        "COALESCE(e.nombre_referencia, '') ILIKE $IDX",
+        "COALESCE(e.telefono_referencia, '') ILIKE $IDX"
+      ];
+
+      if (capabilities.hasPersonasTable) {
+        searchFragments.push("COALESCE(p.nombre, '') ILIKE $IDX");
+        searchFragments.push("COALESCE(p.apellido, '') ILIKE $IDX");
+        searchFragments.push("NULLIF(TRIM(CONCAT(COALESCE(p.nombre, ''), ' ', COALESCE(p.apellido, ''))), '') ILIKE $IDX");
+        searchFragments.push("NULLIF(TRIM(CONCAT(COALESCE(p.apellido, ''), ' ', COALESCE(p.nombre, ''))), '') ILIKE $IDX");
+        searchFragments.push("COALESCE(p.dni::TEXT, '') ILIKE $IDX");
+        if (capabilities.hasTelefonosTable) {
+          searchFragments.push("COALESCE(telf.telefono, '') ILIKE $IDX");
+        }
+        if (capabilities.hasCorreosTable) {
+          searchFragments.push("COALESCE(cor.direccion_correo, '') ILIKE $IDX");
+        }
+        if (capabilities.hasDireccionesTable) {
+          searchFragments.push("COALESCE(dir.direccion, '') ILIKE $IDX");
+        }
+      }
+
+      if (capabilities.hasSucursalesTable && capabilities.sucursalNameField) {
+        searchFragments.push(`COALESCE(s.${capabilities.sucursalNameField}, '') ILIKE $IDX`);
+      }
+
+      if (capabilities.softDeleteField) {
+        searchFragments.push(`COALESCE(e.${capabilities.softDeleteField}::TEXT, '') ILIKE $IDX`);
+      }
+
+      pushFilter(`(${searchFragments.join(' OR ')})`, value);
+    }
+
+    if (estado !== null && capabilities.softDeleteField) {
+      pushFilter(`e.${capabilities.softDeleteField} = $IDX`, estado);
+    }
+
+    if (idSucursal) {
+      pushFilter('e.id_sucursal = $IDX', idSucursal);
+    }
+
+    if (tenantId) {
+      if (capabilities.hasTenantField) {
+        pushFilter('e.id_empresa = $IDX', tenantId);
+      } else if (capabilities.hasPersonasTable && capabilities.hasPersonaTenantField) {
+        pushFilter('p.id_empresa = $IDX', tenantId);
+      }
+    }
+
+    const fields = [
+      'e.id_empleado',
+      'e.fecha_ingreso',
+      'e.salario_base',
+      'e.cargo',
+      'e.nombre_referencia',
+      'e.telefono_referencia',
+      'e.id_sucursal',
+      'e.id_persona'
+    ];
+
+    if (capabilities.hasTenantField) {
+      fields.push('e.id_empresa');
+    } else {
+      fields.push('NULL::INT AS id_empresa');
+    }
+
+    if (capabilities.softDeleteField) {
+      fields.push(`e.${capabilities.softDeleteField}`);
+      if (capabilities.softDeleteField !== 'estado') {
+        fields.push(`e.${capabilities.softDeleteField} AS estado`);
+      }
+    } else {
+      fields.push('NULL::BOOLEAN AS estado');
+    }
+
+    if (capabilities.hasPersonasTable) {
+      fields.push('p.nombre AS persona_nombre');
+      fields.push('p.apellido AS persona_apellido');
+      fields.push('p.dni AS persona_dni');
+      fields.push(`TRIM(CONCAT(COALESCE(p.nombre, ''), ' ', COALESCE(p.apellido, ''))) AS persona_nombre_completo`);
+      if (capabilities.hasTelefonosTable) {
+        fields.push('telf.telefono');
+      } else {
+        fields.push('NULL::TEXT AS telefono');
+      }
+      if (capabilities.hasCorreosTable) {
+        fields.push('cor.direccion_correo AS correo');
+      } else {
+        fields.push('NULL::TEXT AS correo');
+      }
+      if (capabilities.hasDireccionesTable) {
+        fields.push('dir.direccion');
+      } else {
+        fields.push('NULL::TEXT AS direccion');
+      }
+      if (capabilities.hasPersonaTenantField) {
+        fields.push('p.id_empresa AS persona_id_empresa');
+      } else {
+        fields.push('NULL::INT AS persona_id_empresa');
+      }
+    } else {
+      fields.push('NULL::TEXT AS persona_nombre');
+      fields.push('NULL::TEXT AS persona_apellido');
+      fields.push('NULL::TEXT AS persona_dni');
+      fields.push('NULL::TEXT AS persona_nombre_completo');
+      fields.push('NULL::TEXT AS telefono');
+      fields.push('NULL::TEXT AS correo');
+      fields.push('NULL::TEXT AS direccion');
+      fields.push('NULL::INT AS persona_id_empresa');
+    }
+
+    if (capabilities.hasSucursalesTable && capabilities.sucursalNameField) {
+      fields.push(`s.${capabilities.sucursalNameField} AS sucursal_nombre`);
+    } else {
+      fields.push('NULL::TEXT AS sucursal_nombre');
+    }
+
+    const joins = [];
+    if (capabilities.hasPersonasTable) {
+      joins.push('LEFT JOIN public.personas p ON p.id_persona = e.id_persona');
+      if (capabilities.hasTelefonosTable) {
+        joins.push('LEFT JOIN public.telefonos telf ON telf.id_telefono = p.id_telefono');
+      }
+      if (capabilities.hasCorreosTable) {
+        joins.push('LEFT JOIN public.correos cor ON cor.id_correo = p.id_correo');
+      }
+      if (capabilities.hasDireccionesTable) {
+        joins.push('LEFT JOIN public.direcciones dir ON dir.id_direccion = p.id_direccion');
+      }
+    }
+    if (capabilities.hasSucursalesTable && capabilities.sucursalNameField) {
+      joins.push('LEFT JOIN public.sucursales s ON s.id_sucursal = e.id_sucursal');
+    }
+
+    const where = filters.length ? `WHERE ${filters.join(' AND ')}` : '';
+    const joinsSql = joins.length ? `\n${joins.join('\n')}` : '';
+    const offset = (page - 1) * limit;
+    const dataParams = [...params, limit, offset];
+    const fieldsWithTotal = [...fields, 'COUNT(*) OVER()::INT AS __total__'];
+
+    const dataQuery = `
+      SELECT ${fieldsWithTotal.join(', ')}
+      FROM public.empleados e${joinsSql}
+      ${where}
+      ORDER BY e.id_empleado ASC
+      LIMIT $${params.length + 1}
+      OFFSET $${params.length + 2}
+    `;
+
+    const dataResult = await pool.query(dataQuery, dataParams);
+    let total = Number(dataResult.rows?.[0]?.__total__) || 0;
+
+    const data = dataResult.rows.map((row) => {
+      const { __total__, ...empleado } = row;
+      if (!capabilities.softDeleteField) return empleado;
+
+      const estadoActual = parseBooleanFilter(String(empleado?.[capabilities.softDeleteField] ?? empleado?.estado));
+      const safeEstado = estadoActual === null ? false : Boolean(estadoActual);
+      return {
+        ...empleado,
+        [capabilities.softDeleteField]: safeEstado,
+        estado: safeEstado
+      };
+    });
+
+    if (data.length === 0) {
+      const totalQuery = `
+        SELECT COUNT(*)::INT AS total
+        FROM public.empleados e${joinsSql}
+        ${where}
+      `;
+      const totalResult = await pool.query(totalQuery, params);
+      total = Number(totalResult.rows?.[0]?.total) || 0;
+    }
+
+    return { data, total };
   },
 
   async findDetailById(idEmpleado) {
@@ -381,41 +555,6 @@ const empleadoRepository = {
     );
   },
 
-  async listTenantEmpleadoIds(tenantId, capabilities) {
-    if (!tenantId) return null;
-
-    if (capabilities.hasTenantField) {
-      const tenantRows = await pool.query(
-        'SELECT id_empleado FROM empleados WHERE id_empresa = $1',
-        [tenantId]
-      );
-      return new Set(
-        tenantRows.rows
-          .map((row) => parsePositiveInt(row.id_empleado))
-          .filter(Boolean)
-      );
-    }
-
-    if (capabilities.hasPersonasTable && capabilities.hasPersonaTenantField) {
-      const tenantRows = await pool.query(
-        `
-          SELECT e.id_empleado
-          FROM empleados e
-          INNER JOIN personas p ON p.id_persona = e.id_persona
-          WHERE p.id_empresa = $1
-        `,
-        [tenantId]
-      );
-      return new Set(
-        tenantRows.rows
-          .map((row) => parsePositiveInt(row.id_empleado))
-          .filter(Boolean)
-      );
-    }
-
-    return null;
-  },
-
   async updateField(idEmpleado, campo, valor, db = pool) {
     await db.query(
       'CALL pa_update($1::TEXT, $2::TEXT, $3::TEXT, $4::TEXT, $5::TEXT)',
@@ -491,37 +630,16 @@ const empleadoService = {
     }
 
     const tenantId = parsePositiveInt(req.user?.id_empresa);
-    const normalizedSearch = normalizeSearchText(effectiveSearch);
-    const allRows = await empleadoRepository.backfillDirecciones(
-      await empleadoRepository.list(),
-      capabilities
-    );
-    const tenantEmpleadoIds = await empleadoRepository.listTenantEmpleadoIds(tenantId, capabilities);
-
-    let filteredRows = allRows
-      .map(mapEmpleadoListRow)
-      .filter((row) => {
-        if (!tenantEmpleadoIds) return true;
-        return tenantEmpleadoIds.has(parsePositiveInt(row.id_empleado));
-      })
-      .filter((row) => {
-        if (estado === null) return true;
-        const rowSoftDeleteValue =
-          capabilities.softDeleteField && row[capabilities.softDeleteField] !== undefined
-            ? row[capabilities.softDeleteField]
-            : row.estado;
-        return Boolean(rowSoftDeleteValue) === estado;
-      })
-      .filter((row) => {
-        if (!idSucursal) return true;
-        return parsePositiveInt(row.id_sucursal) === idSucursal;
-      })
-      .filter((row) => empleadoMatchesSearch(row, normalizedSearch))
-      .sort((a, b) => Number(a.id_empleado) - Number(b.id_empleado));
-
-    const total = filteredRows.length;
-    const offset = (page - 1) * limit;
-    const data = filteredRows.slice(offset, offset + limit);
+    const { data: pagedRows, total } = await empleadoRepository.searchWithPagination({
+      capabilities,
+      page,
+      limit,
+      searchTerm: effectiveSearch,
+      estado,
+      idSucursal,
+      tenantId
+    });
+    const data = (await empleadoRepository.backfillDirecciones(pagedRows, capabilities)).map(mapEmpleadoListRow);
 
     return {
       status: 200,

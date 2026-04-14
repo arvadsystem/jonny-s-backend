@@ -43,6 +43,7 @@ import tipoDepartamentoRoutes from './routers/tipos_departamentos.js';
 import movimientosInventarioRoutes from './routers/movimientos_inventario.js';
 import perfilRoutes from './routers/perfil.js';
 import mobiliarioRoutes from './routers/mobiliario.js';
+import emailCampaignRoutes from './routers/email_campaigns.js';
 
 // Seguridad
 import seguridadSesionesRoutes from './routers/Seguridad/sesiones.js';
@@ -64,7 +65,9 @@ import cajasRoutes from './routers/cajas.js';
 import { authRequired, csrfProtect } from './middleware/auth.js';
 import { touchSessionMiddleware } from './middleware/touchSession.js';
 import { requireActiveSession } from './middleware/requireActiveSession.js';
+import { requirePasswordChange } from './middleware/requirePasswordChange.js';
 import { MAX_IMAGE_JSON_LIMIT, UPLOADS_DIR } from './utils/uploads.js';
+import { startEmailCampaignScheduler } from './jobs/emailCampaignScheduler.js';
 
 // Parametros
 import catalogosRoutes from './routers/Parametros/catalogos.js';
@@ -126,10 +129,12 @@ app.use(publicClienteRoutes);
 // ✅ 3) A partir de aquí: todo protegido
 app.use(authRequired);               // 1) valida JWT
 app.use(requireActiveSession);       // 2) valida sesión activa en BD
+app.use(requirePasswordChange);      // fuerza cambio de contrasena cuando aplica
 app.use(touchSessionMiddleware);     // 3) actualiza ultima_actividad
 app.use(csrfProtect);                // 4) CSRF para no-GET
 app.use(globalAuditMiddleware);      // 5) auditoria global (intencion real + diff puntual)
 app.use(perfilRoutes);
+app.use(emailCampaignRoutes);
 
 // Admin: CRUD de recetas para panel administrativo (rutas relativas en router).
 app.use('/api/admin/recetas', adminRecetasRouter);
@@ -199,6 +204,7 @@ app.use(menuPosRouter); // Monta las rutas del POS Menú
 app.use(movimientosInventarioRoutes);
 
 const PORT = process.env.PORT || 3001;
+startEmailCampaignScheduler();
 app.listen(PORT, () => {
   console.log(`Servidor activo en el puerto ${PORT}`);
 });
