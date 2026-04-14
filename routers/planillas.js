@@ -10,6 +10,7 @@ import {
 
 const router = express.Router();
 
+// API cap intentionally fixed to 100; consumers should paginate to gather complete datasets.
 const MAX_LIMIT = 100;
 const DEFAULT_LIMIT = 10;
 
@@ -93,6 +94,19 @@ const REGISTRAR_ADELANTO_ALLOWED_FIELDS = new Set([
   'id_empleado',
   'fecha',
   'monto',
+  'id_sucursal'
+]);
+const ACTUALIZAR_ADELANTO_ALLOWED_FIELDS = new Set([
+  'id_empleado',
+  'fecha',
+  'monto',
+  'observacion',
+  'motivo',
+  'id_sucursal'
+]);
+const ANULAR_ADELANTO_ALLOWED_FIELDS = new Set([
+  'motivo',
+  'observacion',
   'id_sucursal'
 ]);
 const REGISTRAR_HORAS_EXTRA_ALLOWED_FIELDS = new Set([
@@ -183,6 +197,36 @@ const normalizeTimestampInput = (value) => {
   const parsed = new Date(text);
   if (Number.isNaN(parsed.getTime())) return null;
   return parsed.toISOString();
+};
+
+const todayLocalDateKey = () => {
+  const now = new Date();
+  const year = now.getFullYear();
+  const month = String(now.getMonth() + 1).padStart(2, '0');
+  const day = String(now.getDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
+};
+
+const normalizeDateOnlyKey = (value) => {
+  const text = sanitizeText(value, 40);
+  if (!text) return null;
+
+  const directDateMatch = /^(\d{4})-(\d{2})-(\d{2})$/.exec(text);
+  if (directDateMatch) {
+    return `${directDateMatch[1]}-${directDateMatch[2]}-${directDateMatch[3]}`;
+  }
+
+  const parsed = new Date(text);
+  if (Number.isNaN(parsed.getTime())) return null;
+  return `${parsed.getUTCFullYear()}-${String(parsed.getUTCMonth() + 1).padStart(2, '0')}-${String(
+    parsed.getUTCDate()
+  ).padStart(2, '0')}`;
+};
+
+const isFutureDateInput = (value) => {
+  const dateKey = normalizeDateOnlyKey(value);
+  if (!dateKey) return false;
+  return dateKey > todayLocalDateKey();
 };
 
 const normalizeEstadoAlias = (value) => {
@@ -552,12 +596,281 @@ const validatePlanillaSucursalScope = async (idPlanilla, rawIdSucursal, options 
   return { ok: true, scope, idSucursal };
 };
 
+const syncDetalleSalarioBaseFromEmpleado = async ({
+  db = pool,
+  idPlanilla,
+  idDetallePlanilla = null
+}) => {
+  const safePlanillaId = parsePositiveInt(idPlanilla);
+  if (!safePlanillaId) return { updated: 0 };
+
+  const safeDetalleId = idDetallePlanilla === null ? null : parsePositiveInt(idDetallePlanilla);
+  if (idDetallePlanilla !== null && !safeDetalleId) return { updated: 0 };
+
+  const result = await db.query(
+    `
+      UPDATE public.detalle_planilla dp
+      SET salario_base = COALESCE(e.salario_base, 0)
+      FROM public.empleados e
+      WHERE dp.id_planilla = $1
+        AND dp.id_empleado = e.id_empleado
+        AND ($2::int IS NULL OR dp.id_detalle_planilla = $2::int)
+        AND COALESCE(dp.salario_base, 0) IS DISTINCT FROM COALESCE(e.salario_base, 0)
+      RETURNING dp.id_detalle_planilla
+    `,
+    [safePlanillaId, safeDetalleId]
+  );
+
+  return { updated: result.rowCount || 0 };
+};
+
+const PLANILLA_DETALLE_AUTO_SYNC_ALLOWED_STATES = new Set(['BORRADOR', 'CALCULADA']);
+
+const dedupeDetallePlanillaByEmpleado = async ({ db = pool, idPlanilla }) => {
+  const safePlanillaId = parsePositiveInt(idPlanilla);
+  if (!safePlanillaId) {
+    return { duplicated: 0, moved: 0, deleted: 0 };
+  }
+
+  const dedupeResult = await db.query(
+    `
+      WITH ranked AS (
+        SELECT
+          dp.id_detalle_planilla,
+          dp.id_empleado,
+          FIRST_VALUE(dp.id_detalle_planilla) OVER (
+            PARTITION BY dp.id_planilla, dp.id_empleado
+            ORDER BY dp.id_detalle_planilla ASC
+          ) AS keep_id,
+          ROW_NUMBER() OVER (
+            PARTITION BY dp.id_planilla, dp.id_empleado
+            ORDER BY dp.id_detalle_planilla ASC
+          ) AS rn
+        FROM public.detalle_planilla dp
+        WHERE dp.id_planilla = $1
+      ),
+      duplicates AS (
+        SELECT id_detalle_planilla, keep_id
+        FROM ranked
+        WHERE rn > 1
+      ),
+      moved AS (
+        UPDATE public.movimiento_planilla mp
+        SET id_detalle_planilla = d.keep_id
+        FROM duplicates d
+        WHERE mp.id_detalle_planilla = d.id_detalle_planilla
+        RETURNING mp.id_movimiento_planilla
+      ),
+      deleted AS (
+        DELETE FROM public.detalle_planilla dp
+        USING duplicates d
+        WHERE dp.id_detalle_planilla = d.id_detalle_planilla
+        RETURNING dp.id_detalle_planilla
+      )
+      SELECT
+        (SELECT COUNT(*) FROM duplicates) AS duplicated_count,
+        (SELECT COUNT(*) FROM moved) AS moved_count,
+        (SELECT COUNT(*) FROM deleted) AS deleted_count
+    `,
+    [safePlanillaId]
+  );
+
+  const row = dedupeResult.rows?.[0] || {};
+  return {
+    duplicated: Number(row.duplicated_count || 0),
+    moved: Number(row.moved_count || 0),
+    deleted: Number(row.deleted_count || 0)
+  };
+};
+
+const syncDetalleEmpleadosActivosBySucursal = async ({
+  db = pool,
+  idPlanilla,
+  force = false
+}) => {
+  const safePlanillaId = parsePositiveInt(idPlanilla);
+  if (!safePlanillaId) {
+    return { inserted: 0, skipped: true, reason: 'INVALID_PLANILLA' };
+  }
+
+  const scopeResult = await db.query(
+    `
+      SELECT
+        p.id_sucursal,
+        COALESCE(ep.descripcion, '')::varchar AS estado_planilla
+      FROM public.planillas p
+      LEFT JOIN public.estado_planilla ep
+        ON ep.id_estado_planilla = p.id_estado_planilla
+      WHERE p.id_planilla = $1
+      LIMIT 1
+    `,
+    [safePlanillaId]
+  );
+
+  const scopeRow = scopeResult.rows?.[0];
+  if (!scopeRow) {
+    return { inserted: 0, skipped: true, reason: 'PLANILLA_NOT_FOUND' };
+  }
+
+  const idSucursal = parsePositiveInt(scopeRow.id_sucursal);
+  if (!idSucursal) {
+    return { inserted: 0, skipped: true, reason: 'INVALID_SUCURSAL' };
+  }
+
+  const estadoNormalizado = normalizeEstadoAlias(scopeRow.estado_planilla);
+  const canSync =
+    force || !estadoNormalizado || PLANILLA_DETALLE_AUTO_SYNC_ALLOWED_STATES.has(estadoNormalizado);
+  if (!canSync) {
+    return {
+      inserted: 0,
+      skipped: true,
+      reason: 'PLANILLA_STATE_LOCKED',
+      estado: estadoNormalizado
+    };
+  }
+
+  const dedupe = await dedupeDetallePlanillaByEmpleado({ db, idPlanilla: safePlanillaId });
+
+  const insertResult = await db.query(
+    `
+      WITH planilla_lock AS (
+        SELECT p.id_planilla
+        FROM public.planillas p
+        WHERE p.id_planilla = $1
+        FOR UPDATE
+      ),
+      defaults AS (
+        SELECT
+          COALESCE(
+            (
+              SELECT dp.dias_laborados
+              FROM public.detalle_planilla dp
+              WHERE dp.id_planilla = $1
+              ORDER BY dp.id_detalle_planilla ASC
+              LIMIT 1
+            ),
+            30
+          ) AS dias_laborados_default,
+          COALESCE(
+            (
+              SELECT dp.horas_laboradas
+              FROM public.detalle_planilla dp
+              WHERE dp.id_planilla = $1
+              ORDER BY dp.id_detalle_planilla ASC
+              LIMIT 1
+            ),
+            240
+          ) AS horas_laboradas_default
+      )
+      INSERT INTO public.detalle_planilla (
+        salario_base,
+        dias_laborados,
+        horas_laboradas,
+        total_deducciones,
+        total_bonos,
+        neto_pagar,
+        id_planilla,
+        id_horas_extra,
+        id_empleado,
+        observaciones
+      )
+      SELECT
+        COALESCE(e.salario_base, 0),
+        d.dias_laborados_default,
+        d.horas_laboradas_default,
+        0,
+        0,
+        COALESCE(e.salario_base, 0),
+        $1,
+        NULL,
+        e.id_empleado,
+        'Sincronizado automaticamente por cambio de personal en sucursal'
+      FROM public.empleados e
+      CROSS JOIN defaults d
+      CROSS JOIN planilla_lock pl
+      WHERE e.estado = TRUE
+        AND e.id_sucursal = $2
+        AND NOT EXISTS (
+          SELECT 1
+          FROM public.detalle_planilla dp
+          WHERE dp.id_planilla = $1
+            AND dp.id_empleado = e.id_empleado
+        )
+      RETURNING id_detalle_planilla
+    `,
+    [safePlanillaId, idSucursal]
+  );
+
+  if (dedupe.deleted > 0) {
+    await db.query(
+      `
+        SELECT public.fn_recalcular_detalle_planilla(dp.id_detalle_planilla)
+        FROM public.detalle_planilla dp
+        WHERE dp.id_planilla = $1
+      `,
+      [safePlanillaId]
+    );
+  }
+
+  return {
+    inserted: insertResult.rowCount || 0,
+    deduped: dedupe.deleted,
+    skipped: false,
+    estado: estadoNormalizado,
+    id_sucursal: idSucursal
+  };
+};
+
 const toTimestampSafe = (value) => {
   const parsed = new Date(value ?? 0).getTime();
   return Number.isFinite(parsed) ? parsed : 0;
 };
 
+const resolveEmpleadoDniMap = async (employeeIds = []) => {
+  const safeEmployeeIds = [...new Set((employeeIds || []).map(parsePositiveInt).filter(Boolean))];
+  if (!safeEmployeeIds.length) return new Map();
+
+  try {
+    const result = await pool.query(
+      `
+        SELECT
+          e.id_empleado,
+          p.dni
+        FROM public.empleados e
+        LEFT JOIN public.personas p
+          ON p.id_persona = e.id_persona
+        WHERE e.id_empleado = ANY($1::int[])
+      `,
+      [safeEmployeeIds]
+    );
+
+    return new Map(
+      (result.rows || [])
+        .map((row) => [parsePositiveInt(row.id_empleado), sanitizeText(row.dni, 40)])
+        .filter(([idEmpleado]) => Boolean(idEmpleado))
+    );
+  } catch {
+    return new Map();
+  }
+};
+
 const buildMovimientosDataset = async ({ idPlanilla, idDetalle = null }) => {
+  const planillaPeriodoResult = await pool.query(
+    `
+      SELECT
+        date_trunc('month', p.fecha_creacion)::timestamp AS periodo_inicio,
+        (date_trunc('month', p.fecha_creacion) + interval '1 month')::timestamp AS periodo_fin,
+        p.fecha_creacion
+      FROM public.planillas p
+      WHERE p.id_planilla = $1
+      LIMIT 1
+    `,
+    [idPlanilla]
+  );
+  const planillaPeriodoInicio = planillaPeriodoResult.rows?.[0]?.periodo_inicio || null;
+  const planillaPeriodoFin = planillaPeriodoResult.rows?.[0]?.periodo_fin || null;
+  const planillaPeriodoKey = toMonthKey(planillaPeriodoResult.rows?.[0]?.fecha_creacion || planillaPeriodoInicio);
+
   const detalleRows = await queryFunctionRows(PLANILLA_ENDPOINT_CONTRACT.detalle, [idPlanilla]);
 
   const detalleById = new Map();
@@ -601,6 +914,9 @@ const buildMovimientosDataset = async ({ idPlanilla, idDetalle = null }) => {
 
   const movimientosRows = detalleChunks.flat().map((row) => ({
     ...row,
+    id_planilla: idPlanilla,
+    periodo_movimiento: planillaPeriodoKey || null,
+    fecha_periodo: planillaPeriodoInicio,
     tipo: row.tipo || row.tipo_movimiento,
     fecha: row.fecha || row.fecha_registro,
     es_monetario: true,
@@ -648,6 +964,7 @@ const buildMovimientosDataset = async ({ idPlanilla, idDetalle = null }) => {
       id_movimiento_planilla: null,
       id_movimiento: `he-${row.id_horas_extra}`,
       id_detalle_planilla: detalleEmpleado?.id_detalle_planilla || null,
+      id_planilla: idPlanilla,
       id_empleado: empleadoId,
       tipo_movimiento: 'H.E. TIEMPO',
       tipo: 'H.E. TIEMPO',
@@ -661,6 +978,8 @@ const buildMovimientosDataset = async ({ idPlanilla, idDetalle = null }) => {
         row.observacion,
         255
       ) || (isCompensada ? 'Compensada con tiempo libre.' : 'Pendiente de compensacion.'),
+      periodo_movimiento: planillaPeriodoKey || null,
+      fecha_periodo: planillaPeriodoInicio,
       fecha: fechaMovimiento,
       fecha_registro: fechaMovimiento,
       origen_movimiento: 'HORAS_EXTRA',
@@ -694,7 +1013,9 @@ const buildMovimientosDataset = async ({ idPlanilla, idDetalle = null }) => {
     return {
       id_movimiento_planilla: null,
       id_movimiento: `ad-${row.id_adelanto_aplicacion}`,
+      id_adelanto_salario: idAdelanto || null,
       id_detalle_planilla: detalleEmpleado?.id_detalle_planilla || null,
+      id_planilla: idPlanilla,
       id_empleado: empleadoId,
       tipo_movimiento: 'ADELANTO',
       tipo: 'ADELANTO',
@@ -704,6 +1025,8 @@ const buildMovimientosDataset = async ({ idPlanilla, idDetalle = null }) => {
       monto: Number.isFinite(montoAplicado) ? montoAplicado : 0,
       es_monetario: true,
       observacion: 'Aplicado automaticamente al detalle de planilla.',
+      periodo_movimiento: planillaPeriodoKey || null,
+      fecha_periodo: planillaPeriodoInicio,
       fecha: row.fecha,
       fecha_registro: row.fecha,
       origen_movimiento: 'ADELANTO',
@@ -711,7 +1034,65 @@ const buildMovimientosDataset = async ({ idPlanilla, idDetalle = null }) => {
     };
   });
 
-  return [...movimientosRows, ...adelantosRows, ...horasExtraRows].sort(
+  const adelantosEliminadosResult = await pool.query(
+    `
+      SELECT
+        a.id_adelanto_salario,
+        a.id_empleado,
+        a.fecha,
+        a.monto,
+        a.saldo,
+        a.estado
+      FROM public.adelantos_salario a
+      WHERE a.id_empleado = ANY($1::int[])
+        AND (
+          $2::timestamp IS NULL
+          OR $3::timestamp IS NULL
+          OR (a.fecha >= $2::timestamp AND a.fecha < $3::timestamp)
+        )
+        AND COALESCE(a.estado, FALSE) = FALSE
+        AND COALESCE(a.saldo, 0) <= 0
+        AND NOT EXISTS (
+          SELECT 1
+          FROM public.adelanto_aplicacion aa
+          WHERE aa.id_adelanto_salario = a.id_adelanto_salario
+        )
+      ORDER BY a.fecha DESC, a.id_adelanto_salario DESC
+    `,
+    [employeeIds, planillaPeriodoInicio, planillaPeriodoFin]
+  );
+
+  const adelantosEliminadosRows = (adelantosEliminadosResult.rows || []).map((row) => {
+    const empleadoId = parsePositiveInt(row.id_empleado);
+    const detalleEmpleado = empleadoId ? detalleByEmpleado.get(empleadoId) : null;
+    const idAdelanto = parsePositiveInt(row.id_adelanto_salario);
+    const monto = Number(row.monto ?? 0);
+
+    return {
+      id_movimiento_planilla: null,
+      id_movimiento: `ad-del-${idAdelanto || 0}`,
+      id_adelanto_salario: idAdelanto || null,
+      id_detalle_planilla: detalleEmpleado?.id_detalle_planilla || null,
+      id_empleado: empleadoId,
+      tipo_movimiento: 'ADELANTO',
+      tipo: 'ADELANTO',
+      concepto: idAdelanto ? `Adelanto eliminado (AD-${idAdelanto})` : 'Adelanto eliminado',
+      monto: Number.isFinite(monto) ? monto : 0,
+      es_monetario: true,
+      observacion: '[ELIMINADO_AD] Adelanto eliminado desde historial de planilla.',
+      id_planilla: idPlanilla,
+      periodo_movimiento: planillaPeriodoKey || null,
+      fecha_periodo: planillaPeriodoInicio,
+      fecha: row.fecha,
+      fecha_registro: row.fecha,
+      origen_movimiento: 'ADELANTO',
+      anulado: true,
+      activo: false,
+      anulable: false
+    };
+  });
+
+  return [...movimientosRows, ...adelantosRows, ...adelantosEliminadosRows, ...horasExtraRows].sort(
     (left, right) =>
       toTimestampSafe(right.fecha_registro || right.fecha) -
       toTimestampSafe(left.fecha_registro || left.fecha)
@@ -723,6 +1104,82 @@ const createRequestError = (message, httpStatus = 400, code = 'VALIDATION_ERROR'
   err.httpStatus = httpStatus;
   err.code = code;
   return err;
+};
+
+const MONEY_VALIDATION_EPSILON = 0.000001;
+
+const formatMoneyForMessage = (value = 0) => {
+  const safe = Number.isFinite(value) ? value : 0;
+  return `L ${safe.toLocaleString('es-HN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+};
+
+const resolveNetoDisponibleDetalle = async ({ db = pool, idDetallePlanilla, idPlanilla, idEmpleado }) => {
+  if (!idDetallePlanilla || !idPlanilla || !idEmpleado) return null;
+
+  const totalsResult = await db.query(
+    `
+      WITH bonos AS (
+        SELECT COALESCE(SUM(mp.monto), 0) AS total_bonos
+        FROM public.movimiento_planilla mp
+        WHERE mp.id_detalle_planilla = $1
+          AND UPPER(TRIM(mp.tipo_movimiento)) = 'BONO'
+          AND COALESCE(mp.estado, TRUE) = TRUE
+      ),
+      deducciones_mov AS (
+        SELECT COALESCE(SUM(mp.monto), 0) AS total_deducciones_mov
+        FROM public.movimiento_planilla mp
+        WHERE mp.id_detalle_planilla = $1
+          AND UPPER(TRIM(mp.tipo_movimiento)) = 'DEDUCCION'
+          AND COALESCE(mp.estado, TRUE) = TRUE
+      ),
+      adelantos AS (
+        SELECT COALESCE(SUM(aa.monto_aplicado), 0) AS total_adelantos
+        FROM public.adelanto_aplicacion aa
+        INNER JOIN public.adelantos_salario a
+          ON a.id_adelanto_salario = aa.id_adelanto_salario
+        WHERE aa.id_planilla = $2
+          AND a.id_empleado = $3
+      )
+      SELECT
+        COALESCE(dp.salario_base, 0) AS salario_base,
+        COALESCE(bonos.total_bonos, 0) AS total_bonos,
+        COALESCE(deducciones_mov.total_deducciones_mov, 0) AS total_deducciones_mov,
+        COALESCE(adelantos.total_adelantos, 0) AS total_adelantos,
+        COALESCE(dp.neto_pagar, 0) AS neto_actual
+      FROM public.detalle_planilla dp, bonos, deducciones_mov, adelantos
+      WHERE dp.id_detalle_planilla = $1
+      LIMIT 1
+    `,
+    [idDetallePlanilla, idPlanilla, idEmpleado]
+  );
+
+  const totals = totalsResult.rows?.[0] || null;
+  if (!totals) return null;
+
+  const salarioBase = Number(totals.salario_base ?? 0);
+  const totalBonos = Number(totals.total_bonos ?? 0);
+  const totalDeduccionesMov = Number(totals.total_deducciones_mov ?? 0);
+  const totalAdelantos = Number(totals.total_adelantos ?? 0);
+  const netoCalculado = salarioBase + totalBonos - totalDeduccionesMov - totalAdelantos;
+
+  if (Number.isFinite(netoCalculado)) return netoCalculado;
+
+  const netoActual = Number(totals.neto_actual ?? 0);
+  return Number.isFinite(netoActual) ? netoActual : null;
+};
+
+const assertAdelantoDentroNetoDisponible = (monto, netoDisponible) => {
+  const montoSafe = Number(monto ?? 0);
+  const netoSafe = Number(netoDisponible ?? 0);
+  if (!Number.isFinite(montoSafe) || montoSafe <= 0) return;
+  const netoFinal = Number.isFinite(netoSafe) ? Math.max(0, netoSafe) : 0;
+  if (montoSafe - netoFinal > MONEY_VALIDATION_EPSILON) {
+    throw createRequestError(
+      `El monto del adelanto no puede superar el neto a pagar disponible (${formatMoneyForMessage(netoFinal)}).`,
+      409,
+      'ADELANTO_NETO_INSUFICIENTE'
+    );
+  }
 };
 
 const applyAdelantoFallback = async ({ idAdelanto, idPlanilla, montoAplicar = null }) => {
@@ -785,6 +1242,13 @@ const applyAdelantoFallback = async ({ idAdelanto, idPlanilla, montoAplicar = nu
     }
 
     const idDetallePlanilla = parsePositiveInt(detalleResult.rows[0].id_detalle_planilla);
+    if (!idDetallePlanilla) {
+      throw createRequestError(
+        'No se pudo identificar el detalle de planilla del empleado para validar el adelanto.',
+        409,
+        'RELATION_ERROR'
+      );
+    }
     const montoAplicado = Number.isFinite(montoAplicar) && montoAplicar > 0 ? montoAplicar : saldoActual;
 
     if (!Number.isFinite(montoAplicado) || montoAplicado <= 0) {
@@ -798,6 +1262,14 @@ const applyAdelantoFallback = async ({ idAdelanto, idPlanilla, montoAplicar = nu
         'ADELANTO_MONTO_INVALIDO'
       );
     }
+
+    const netoDisponible = await resolveNetoDisponibleDetalle({
+      db: client,
+      idDetallePlanilla,
+      idPlanilla,
+      idEmpleado
+    });
+    assertAdelantoDentroNetoDisponible(montoAplicado, netoDisponible);
 
     const existing = await client.query(
       `
@@ -843,6 +1315,11 @@ const applyAdelantoFallback = async ({ idAdelanto, idPlanilla, montoAplicar = nu
 
     let netoActualizado = null;
     try {
+      await syncDetalleSalarioBaseFromEmpleado({
+        db: client,
+        idPlanilla,
+        idDetallePlanilla
+      });
       const recalc = await client.query(
         'SELECT public.fn_recalcular_detalle_planilla($1) AS neto_actualizado',
         [idDetallePlanilla]
@@ -930,10 +1407,49 @@ const getRequiredEstadoPermission = (descripcion = '') => {
   return null;
 };
 
+const mapStatusToErrorCode = (status = 500) => {
+  if (status === 400) return 'VALIDATION_ERROR';
+  if (status === 401) return 'UNAUTHORIZED';
+  if (status === 403) return 'FORBIDDEN';
+  if (status === 404) return 'NOT_FOUND';
+  if (status === 409) return 'CONFLICT_ERROR';
+  return 'INTERNAL_ERROR';
+};
+
+const decodeMojibakeText = (value = '') => {
+  const text = String(value ?? '');
+  if (!/[ÃÂ]/.test(text)) return text;
+  try {
+    const decoded = Buffer.from(text, 'latin1').toString('utf8');
+    if (decoded && !decoded.includes('�')) return decoded;
+  } catch {
+    // noop
+  }
+  return text;
+};
+
+const normalizeServiceErrorBody = (status = 500, body = null) => {
+  const source = body && typeof body === 'object' ? body : {};
+  const safeStatus = Number.isInteger(status) ? status : 500;
+  const message = sanitizeApiErrorMessage(
+    decodeMojibakeText(source.message || source.mensaje),
+    safeStatus
+  );
+  return buildErrorBody({
+    code: String(source.code || mapStatusToErrorCode(safeStatus)).trim() || mapStatusToErrorCode(safeStatus),
+    message,
+    details: source.details && typeof source.details === 'object' ? source.details : undefined
+  });
+};
+
 const asyncHandler = (handler) => async (req, res) => {
   try {
     const result = await handler(req, res);
-    return res.status(result.status).json(result.body);
+    const status = Number.isInteger(result?.status) ? result.status : 500;
+    if (status >= 400) {
+      return res.status(status).json(normalizeServiceErrorBody(status, result?.body));
+    }
+    return res.status(status).json(result?.body ?? { error: false });
   } catch (err) {
     const httpStatus = Number.isInteger(err?.httpStatus) ? err.httpStatus : null;
     if (httpStatus && httpStatus >= 400 && httpStatus < 500) {
@@ -1139,6 +1655,8 @@ const planillaService = {
       return { status: scopeValidation.status, body: scopeValidation.body };
     }
 
+    await syncDetalleEmpleadosActivosBySucursal({ idPlanilla });
+    await syncDetalleSalarioBaseFromEmpleado({ idPlanilla });
     const rows = await queryFunctionRows(PLANILLA_ENDPOINT_CONTRACT.recalcularPlanilla, [idPlanilla]);
     return {
       status: 200,
@@ -1160,12 +1678,17 @@ const planillaService = {
       return { status: scopeValidation.status, body: scopeValidation.body };
     }
 
+    await syncDetalleEmpleadosActivosBySucursal({ idPlanilla });
+    await syncDetalleSalarioBaseFromEmpleado({ idPlanilla });
+
     const pagination = parsePagination(req.query || {});
     if (!pagination) {
       return { status: 400, body: { error: true, message: 'page y limit deben ser enteros positivos' } };
     }
 
     const rows = await queryFunctionRows(PLANILLA_ENDPOINT_CONTRACT.detalle, [idPlanilla]);
+    const employeeIds = [...new Set((rows || []).map((row) => parsePositiveInt(row.id_empleado)).filter(Boolean))];
+    const dniMap = await resolveEmpleadoDniMap(employeeIds);
 
     const horasResult = await pool.query(
       `
@@ -1219,8 +1742,14 @@ const planillaService = {
       const idEmpleado = parsePositiveInt(row.id_empleado);
       const horasPendientes = idEmpleado ? Number(horasPendientesMap.get(idEmpleado) ?? 0) : 0;
       const adelantosAplicados = idEmpleado ? Number(adelantosMap.get(idEmpleado) ?? 0) : 0;
+      const resolvedDni = sanitizeText(
+        row.dni || row.persona_dni || row.dni_persona || row.numero_dni || (idEmpleado ? dniMap.get(idEmpleado) : ''),
+        40
+      );
       return {
         ...row,
+        dni: resolvedDni || null,
+        persona_dni: resolvedDni || null,
         he_tiempo: Number.isFinite(horasPendientes) ? horasPendientes : 0,
         horas_extra_tiempo: Number.isFinite(horasPendientes) ? horasPendientes : 0,
         total_adelantos_aplicados: Number.isFinite(adelantosAplicados) ? adelantosAplicados : 0,
@@ -1233,6 +1762,7 @@ const planillaService = {
       const haystack = [
         row.id_empleado,
         row.nombre_completo,
+        row.dni,
         row.sucursal,
         row.cargo,
         row.salario_base,
@@ -1270,6 +1800,9 @@ const planillaService = {
       return { status: scopeValidation.status, body: scopeValidation.body };
     }
 
+    await syncDetalleEmpleadosActivosBySucursal({ idPlanilla });
+    await syncDetalleSalarioBaseFromEmpleado({ idPlanilla });
+
     const rows = await queryFunctionRows(PLANILLA_ENDPOINT_CONTRACT.resumen, [idPlanilla]);
     const resumenBase = rows[0] || {};
 
@@ -1305,6 +1838,9 @@ const planillaService = {
     if (!scopeValidation.ok) {
       return { status: scopeValidation.status, body: scopeValidation.body };
     }
+
+    await syncDetalleEmpleadosActivosBySucursal({ idPlanilla });
+    await syncDetalleSalarioBaseFromEmpleado({ idPlanilla });
 
     const data = await queryFunctionScalar(PLANILLA_ENDPOINT_CONTRACT.completa, [idPlanilla]);
     return { status: 200, body: { error: false, data } };
@@ -1478,6 +2014,16 @@ const planillaService = {
         body: buildErrorBody({
           code: 'VALIDATION_ERROR',
           message: 'La fecha enviada no es valida.'
+        })
+      };
+    }
+
+    if (req.body?.fecha !== undefined && fecha && isFutureDateInput(req.body?.fecha)) {
+      return {
+        status: 400,
+        body: buildErrorBody({
+          code: 'VALIDATION_ERROR',
+          message: 'La fecha no puede ser mayor al dia actual.'
         })
       };
     }
@@ -1690,6 +2236,10 @@ const planillaService = {
 
       idDetallePlanilla = parsePositiveInt(detalleResult.rows?.[0]?.id_detalle_planilla);
       if (idDetallePlanilla) {
+        await syncDetalleSalarioBaseFromEmpleado({
+          idPlanilla,
+          idDetallePlanilla
+        });
         netoActualizado = await queryFunctionScalar(PLANILLA_ENDPOINT_CONTRACT.recalcularDetalle, [idDetallePlanilla]);
       }
     }
@@ -1769,6 +2319,10 @@ const planillaService = {
         };
       }
       recalcular = parsedRecalcular;
+    }
+    if (recalcular) {
+      await syncDetalleEmpleadosActivosBySucursal({ idPlanilla });
+      await syncDetalleSalarioBaseFromEmpleado({ idPlanilla });
     }
     await queryFunctionScalar(PLANILLA_ENDPOINT_CONTRACT.actualizarEstado, [
       idPlanilla,
@@ -1964,12 +2518,144 @@ const planillaService = {
       return { status: scopeValidation.status, body: scopeValidation.body };
     }
 
+    const adelantoScopeResult = await pool.query(
+      `
+        SELECT
+          a.id_adelanto_salario,
+          a.id_empleado,
+          a.saldo,
+          a.estado
+        FROM public.adelantos_salario a
+        WHERE a.id_adelanto_salario = $1
+        LIMIT 1
+      `,
+      [idAdelanto]
+    );
+
+    if (!adelantoScopeResult.rows?.length) {
+      return {
+        status: 404,
+        body: buildErrorBody({
+          code: 'NOT_FOUND',
+          message: 'El adelanto indicado no existe.'
+        })
+      };
+    }
+
+    const adelantoScope = adelantoScopeResult.rows[0];
+    const idEmpleadoAdelanto = parsePositiveInt(adelantoScope.id_empleado);
+    const saldoActual = Number(adelantoScope.saldo ?? 0);
+    const estadoActivo = adelantoScope.estado === true;
+
+    if (!idEmpleadoAdelanto) {
+      return {
+        status: 409,
+        body: buildErrorBody({
+          code: 'RELATION_ERROR',
+          message: 'El adelanto no tiene empleado asociado.'
+        })
+      };
+    }
+
+    if (!estadoActivo) {
+      return {
+        status: 409,
+        body: buildErrorBody({
+          code: 'ADELANTO_INACTIVO',
+          message: 'El adelanto esta inactivo o ya fue liquidado.'
+        })
+      };
+    }
+
+    if (!Number.isFinite(saldoActual) || saldoActual <= 0) {
+      return {
+        status: 409,
+        body: buildErrorBody({
+          code: 'ADELANTO_SIN_SALDO',
+          message: 'El adelanto no tiene saldo disponible.'
+        })
+      };
+    }
+
+    const montoAplicarEfectivo = Number.isFinite(montoAplicar) && montoAplicar > 0 ? montoAplicar : saldoActual;
+    if (!Number.isFinite(montoAplicarEfectivo) || montoAplicarEfectivo <= 0) {
+      return {
+        status: 400,
+        body: buildErrorBody({
+          code: 'VALIDATION_ERROR',
+          message: 'El monto a aplicar debe ser mayor que 0.'
+        })
+      };
+    }
+
+    if (montoAplicarEfectivo > saldoActual) {
+      return {
+        status: 409,
+        body: buildErrorBody({
+          code: 'ADELANTO_MONTO_INVALIDO',
+          message: 'El monto a aplicar no puede superar el saldo disponible del adelanto.'
+        })
+      };
+    }
+
+    const detalleScopeResult = await pool.query(
+      `
+        SELECT dp.id_detalle_planilla
+        FROM public.detalle_planilla dp
+        WHERE dp.id_planilla = $1
+          AND dp.id_empleado = $2
+        LIMIT 1
+      `,
+      [idPlanilla, idEmpleadoAdelanto]
+    );
+
+    if (!detalleScopeResult.rows?.length) {
+      return {
+        status: 409,
+        body: buildErrorBody({
+          code: 'PLANILLA_SCOPE_MISMATCH',
+          message: 'El empleado asociado al adelanto no pertenece a la planilla seleccionada.'
+        })
+      };
+    }
+
+    const idDetallePlanilla = parsePositiveInt(detalleScopeResult.rows[0].id_detalle_planilla);
+    if (!idDetallePlanilla) {
+      return {
+        status: 409,
+        body: buildErrorBody({
+          code: 'RELATION_ERROR',
+          message: 'No se pudo identificar el detalle de planilla del empleado para validar el adelanto.'
+        })
+      };
+    }
+    const netoDisponible = await resolveNetoDisponibleDetalle({
+      db: pool,
+      idDetallePlanilla,
+      idPlanilla,
+      idEmpleado: idEmpleadoAdelanto
+    });
+    try {
+      assertAdelantoDentroNetoDisponible(montoAplicarEfectivo, netoDisponible);
+    } catch (error) {
+      if (error?.httpStatus) {
+        return {
+          status: error.httpStatus,
+          body: buildErrorBody({
+            code: error.code || 'ADELANTO_NETO_INSUFICIENTE',
+            message: error.message
+          })
+        };
+      }
+      throw error;
+    }
+
     let data = null;
     try {
       const rows = await queryFunctionRows(PLANILLA_ENDPOINT_CONTRACT.aplicarAdelanto, [
         idAdelanto,
         idPlanilla,
-        montoAplicar
+        montoAplicarEfectivo
       ]);
       data = rows[0] || null;
     } catch (err) {
@@ -1978,7 +2664,7 @@ const planillaService = {
         data = await applyAdelantoFallback({
           idAdelanto,
           idPlanilla,
-          montoAplicar
+          montoAplicar: montoAplicarEfectivo
         });
       } else {
         throw err;
@@ -2033,6 +2719,16 @@ const planillaService = {
       };
     }
 
+    if (req.body?.fecha !== undefined && fecha && isFutureDateInput(req.body?.fecha)) {
+      return {
+        status: 400,
+        body: buildErrorBody({
+          code: 'VALIDATION_ERROR',
+          message: 'La fecha no puede ser mayor al dia actual.'
+        })
+      };
+    }
+
     const scopeValidation = await validatePlanillaSucursalScope(idPlanilla, req.body?.id_sucursal);
     if (!scopeValidation.ok) {
       return { status: scopeValidation.status, body: scopeValidation.body };
@@ -2048,6 +2744,38 @@ const planillaService = {
           message: 'El empleado no pertenece al detalle de la planilla seleccionada.'
         })
       };
+    }
+
+    const detalleEmpleado = (detalleRows || []).find((row) => parsePositiveInt(row.id_empleado) === idEmpleado);
+    const idDetallePlanilla = parsePositiveInt(detalleEmpleado?.id_detalle_planilla);
+    if (!idDetallePlanilla) {
+      return {
+        status: 409,
+        body: buildErrorBody({
+          code: 'RELATION_ERROR',
+          message: 'No se pudo identificar el detalle de planilla del empleado para validar el adelanto.'
+        })
+      };
+    }
+    const netoDisponible = await resolveNetoDisponibleDetalle({
+      db: pool,
+      idDetallePlanilla,
+      idPlanilla,
+      idEmpleado
+    });
+    try {
+      assertAdelantoDentroNetoDisponible(monto, netoDisponible);
+    } catch (error) {
+      if (error?.httpStatus) {
+        return {
+          status: error.httpStatus,
+          body: buildErrorBody({
+            code: error.code || 'ADELANTO_NETO_INSUFICIENTE',
+            message: error.message
+          })
+        };
+      }
+      throw error;
     }
 
     const insertResult = await pool.query(
@@ -2085,6 +2813,368 @@ const planillaService = {
         data: insertResult.rows?.[0] || null
       }
     };
+  },
+
+  async actualizarAdelanto(req) {
+    const unknownFields = unknownFieldsFromPayload(req.body, ACTUALIZAR_ADELANTO_ALLOWED_FIELDS);
+    if (unknownFields.length) {
+      return {
+        status: 400,
+        body: buildErrorBody({
+          code: 'UNKNOWN_FIELDS',
+          message: 'El payload contiene campos no permitidos.',
+          details: { fields: unknownFields }
+        })
+      };
+    }
+
+    const idPlanilla = parsePositiveInt(req.params.id_planilla);
+    const idAdelanto = parsePositiveInt(req.params.id_adelanto);
+    const idEmpleadoPayload = parsePositiveInt(req.body?.id_empleado);
+    const monto = parsePositiveNumber(req.body?.monto);
+    const fecha = normalizeTimestampInput(req.body?.fecha);
+
+    if (!idPlanilla || !idAdelanto || !monto) {
+      return {
+        status: 400,
+        body: buildErrorBody({
+          code: 'VALIDATION_ERROR',
+          message: 'id_planilla, id_adelanto y monto son requeridos.'
+        })
+      };
+    }
+
+    if (req.body?.fecha !== undefined && !fecha) {
+      return {
+        status: 400,
+        body: buildErrorBody({
+          code: 'VALIDATION_ERROR',
+          message: 'La fecha enviada no es valida.'
+        })
+      };
+    }
+
+    if (req.body?.fecha !== undefined && fecha && isFutureDateInput(req.body?.fecha)) {
+      return {
+        status: 400,
+        body: buildErrorBody({
+          code: 'VALIDATION_ERROR',
+          message: 'La fecha no puede ser mayor al dia actual.'
+        })
+      };
+    }
+
+    const scopeValidation = await validatePlanillaSucursalScope(idPlanilla, req.body?.id_sucursal);
+    if (!scopeValidation.ok) {
+      return { status: scopeValidation.status, body: scopeValidation.body };
+    }
+
+    const detalleRows = await queryFunctionRows(PLANILLA_ENDPOINT_CONTRACT.detalle, [idPlanilla]);
+    const detalleEmpleadoIds = new Set(
+      (detalleRows || [])
+        .map((row) => parsePositiveInt(row.id_empleado))
+        .filter((value) => value > 0)
+    );
+
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+
+      const adelantoResult = await client.query(
+        `
+          SELECT
+            a.id_adelanto_salario,
+            a.id_empleado,
+            a.fecha,
+            a.monto,
+            a.saldo,
+            a.estado,
+            e.id_sucursal
+          FROM public.adelantos_salario a
+          INNER JOIN public.empleados e
+            ON e.id_empleado = a.id_empleado
+          WHERE a.id_adelanto_salario = $1
+          FOR UPDATE
+        `,
+        [idAdelanto]
+      );
+
+      if (!adelantoResult.rows?.length) {
+        throw createRequestError('El adelanto indicado no existe.', 404, 'NOT_FOUND');
+      }
+
+      const adelanto = adelantoResult.rows[0];
+      const idEmpleado = parsePositiveInt(adelanto.id_empleado);
+      const saldoActual = Number(adelanto.saldo ?? 0);
+      const estadoActual = adelanto.estado === true;
+      const idSucursalAdelanto = parsePositiveInt(adelanto.id_sucursal);
+
+      if (!idEmpleado) {
+        throw createRequestError('El adelanto no tiene empleado asociado.', 409, 'RELATION_ERROR');
+      }
+
+      if (idEmpleadoPayload && idEmpleadoPayload !== idEmpleado) {
+        throw createRequestError(
+          'No se puede cambiar el empleado de un adelanto ya registrado.',
+          409,
+          'ADELANTO_EMPLEADO_INMUTABLE'
+        );
+      }
+
+      if (!detalleEmpleadoIds.has(idEmpleado)) {
+        throw createRequestError(
+          'El empleado del adelanto no pertenece al detalle de la planilla seleccionada.',
+          409,
+          'PLANILLA_SCOPE_MISMATCH'
+        );
+      }
+
+      const detalleEmpleado = (detalleRows || []).find((row) => parsePositiveInt(row.id_empleado) === idEmpleado);
+      const idDetallePlanilla = parsePositiveInt(detalleEmpleado?.id_detalle_planilla);
+      if (!idDetallePlanilla) {
+        throw createRequestError(
+          'No se pudo identificar el detalle de planilla del empleado para validar el adelanto.',
+          409,
+          'RELATION_ERROR'
+        );
+      }
+      const netoDisponible = await resolveNetoDisponibleDetalle({
+        db: client,
+        idDetallePlanilla,
+        idPlanilla,
+        idEmpleado
+      });
+      assertAdelantoDentroNetoDisponible(monto, netoDisponible);
+
+      if (scopeValidation.idSucursal && idSucursalAdelanto && scopeValidation.idSucursal !== idSucursalAdelanto) {
+        throw createRequestError(
+          'El adelanto no pertenece a la sucursal activa.',
+          409,
+          'SUCURSAL_SCOPE_MISMATCH'
+        );
+      }
+
+      if (!estadoActual || !Number.isFinite(saldoActual) || saldoActual <= 0) {
+        throw createRequestError(
+          'Solo se pueden editar adelantos pendientes con saldo disponible.',
+          409,
+          'ADELANTO_NO_EDITABLE'
+        );
+      }
+
+      const aplicacionesResult = await client.query(
+        `
+          SELECT
+            COALESCE(SUM(aa.monto_aplicado), 0) AS total_aplicado
+          FROM public.adelanto_aplicacion aa
+          WHERE aa.id_adelanto_salario = $1
+        `,
+        [idAdelanto]
+      );
+
+      const totalAplicado = Number(aplicacionesResult.rows?.[0]?.total_aplicado ?? 0);
+      if (Number.isFinite(totalAplicado) && totalAplicado > monto) {
+        throw createRequestError(
+          `El monto no puede ser menor a lo ya aplicado (${totalAplicado.toFixed(2)}).`,
+          409,
+          'ADELANTO_MONTO_INVALIDO'
+        );
+      }
+
+      const nuevoSaldo = Math.max(0, monto - (Number.isFinite(totalAplicado) ? totalAplicado : 0));
+      const nuevoEstado = nuevoSaldo > 0;
+
+      const updateResult = await client.query(
+        `
+          UPDATE public.adelantos_salario
+          SET
+            monto = $2,
+            saldo = $3,
+            estado = $4,
+            fecha = COALESCE($5::timestamp, fecha)
+          WHERE id_adelanto_salario = $1
+          RETURNING
+            id_adelanto_salario,
+            id_empleado,
+            fecha,
+            monto,
+            saldo,
+            estado
+        `,
+        [idAdelanto, monto, nuevoSaldo, nuevoEstado, fecha]
+      );
+
+      await client.query('COMMIT');
+
+      return {
+        status: 200,
+        body: {
+          error: false,
+          message: 'Adelanto pendiente actualizado correctamente.',
+          data: updateResult.rows?.[0] || null
+        }
+      };
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
+  },
+
+  async anularAdelanto(req) {
+    const unknownFields = unknownFieldsFromPayload(req.body, ANULAR_ADELANTO_ALLOWED_FIELDS);
+    if (unknownFields.length) {
+      return {
+        status: 400,
+        body: buildErrorBody({
+          code: 'UNKNOWN_FIELDS',
+          message: 'El payload contiene campos no permitidos.',
+          details: { fields: unknownFields }
+        })
+      };
+    }
+
+    const idPlanilla = parsePositiveInt(req.params.id_planilla);
+    const idAdelanto = parsePositiveInt(req.params.id_adelanto);
+    if (!idPlanilla || !idAdelanto) {
+      return {
+        status: 400,
+        body: buildErrorBody({
+          code: 'VALIDATION_ERROR',
+          message: 'id_planilla e id_adelanto son requeridos.'
+        })
+      };
+    }
+
+    const scopeValidation = await validatePlanillaSucursalScope(idPlanilla, req.body?.id_sucursal);
+    if (!scopeValidation.ok) {
+      return { status: scopeValidation.status, body: scopeValidation.body };
+    }
+
+    const detalleRows = await queryFunctionRows(PLANILLA_ENDPOINT_CONTRACT.detalle, [idPlanilla]);
+    const detalleEmpleadoIds = new Set(
+      (detalleRows || [])
+        .map((row) => parsePositiveInt(row.id_empleado))
+        .filter((value) => value > 0)
+    );
+
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+
+      const adelantoResult = await client.query(
+        `
+          SELECT
+            a.id_adelanto_salario,
+            a.id_empleado,
+            a.fecha,
+            a.monto,
+            a.saldo,
+            a.estado,
+            e.id_sucursal
+          FROM public.adelantos_salario a
+          INNER JOIN public.empleados e
+            ON e.id_empleado = a.id_empleado
+          WHERE a.id_adelanto_salario = $1
+          FOR UPDATE
+        `,
+        [idAdelanto]
+      );
+
+      if (!adelantoResult.rows?.length) {
+        throw createRequestError('El adelanto indicado no existe.', 404, 'NOT_FOUND');
+      }
+
+      const adelanto = adelantoResult.rows[0];
+      const idEmpleado = parsePositiveInt(adelanto.id_empleado);
+      const saldoActual = Number(adelanto.saldo ?? 0);
+      const estadoActual = adelanto.estado === true;
+      const idSucursalAdelanto = parsePositiveInt(adelanto.id_sucursal);
+
+      if (!idEmpleado) {
+        throw createRequestError('El adelanto no tiene empleado asociado.', 409, 'RELATION_ERROR');
+      }
+
+      if (!detalleEmpleadoIds.has(idEmpleado)) {
+        throw createRequestError(
+          'El empleado del adelanto no pertenece al detalle de la planilla seleccionada.',
+          409,
+          'PLANILLA_SCOPE_MISMATCH'
+        );
+      }
+
+      if (scopeValidation.idSucursal && idSucursalAdelanto && scopeValidation.idSucursal !== idSucursalAdelanto) {
+        throw createRequestError(
+          'El adelanto no pertenece a la sucursal activa.',
+          409,
+          'SUCURSAL_SCOPE_MISMATCH'
+        );
+      }
+
+      if (!estadoActual || !Number.isFinite(saldoActual) || saldoActual <= 0) {
+        throw createRequestError(
+          'Solo se pueden eliminar adelantos pendientes con saldo disponible.',
+          409,
+          'ADELANTO_NO_ELIMINABLE'
+        );
+      }
+
+      const aplicacionesResult = await client.query(
+        `
+          SELECT
+            COUNT(*)::int AS total_aplicaciones,
+            COALESCE(SUM(aa.monto_aplicado), 0) AS total_aplicado
+          FROM public.adelanto_aplicacion aa
+          WHERE aa.id_adelanto_salario = $1
+        `,
+        [idAdelanto]
+      );
+
+      const totalAplicaciones = Number(aplicacionesResult.rows?.[0]?.total_aplicaciones ?? 0);
+      const totalAplicado = Number(aplicacionesResult.rows?.[0]?.total_aplicado ?? 0);
+      if ((Number.isFinite(totalAplicaciones) && totalAplicaciones > 0) || (Number.isFinite(totalAplicado) && totalAplicado > 0)) {
+        throw createRequestError(
+          'No se puede eliminar el adelanto porque ya tiene aplicaciones registradas.',
+          409,
+          'ADELANTO_CON_APLICACIONES'
+        );
+      }
+
+      const updateResult = await client.query(
+        `
+          UPDATE public.adelantos_salario
+          SET
+            saldo = 0,
+            estado = FALSE
+          WHERE id_adelanto_salario = $1
+          RETURNING
+            id_adelanto_salario,
+            id_empleado,
+            fecha,
+            monto,
+            saldo,
+            estado
+        `,
+        [idAdelanto]
+      );
+
+      await client.query('COMMIT');
+
+      return {
+        status: 200,
+        body: {
+          error: false,
+          message: 'Adelanto eliminado correctamente.',
+          data: updateResult.rows?.[0] || null
+        }
+      };
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
   },
 
   async registrarMovimiento(req) {
@@ -2352,6 +3442,10 @@ const planillaService = {
       };
     }
 
+    await syncDetalleSalarioBaseFromEmpleado({
+      idPlanilla,
+      idDetallePlanilla: idDetalle
+    });
     const netoActualizado = await queryFunctionScalar(PLANILLA_ENDPOINT_CONTRACT.recalcularDetalle, [idDetalle]);
 
     return {
@@ -2381,6 +3475,8 @@ router.get('/planillas/sucursales/:id_sucursal/adelantos-pendientes', checkPermi
 router.get('/planillas/:id_planilla/adelantos-aplicables', checkPermission(PLANILLAS_ADELANTOS_PERMISSIONS), asyncHandler(planillaService.adelantosAplicables));
 router.post('/planillas/:id_planilla/adelantos/registrar', checkPermission(PLANILLAS_ADELANTOS_PERMISSIONS), asyncHandler(planillaService.registrarAdelanto));
 router.post('/planillas/:id_planilla/adelantos/aplicar', checkPermission(PLANILLAS_ADELANTOS_PERMISSIONS), asyncHandler(planillaService.aplicarAdelanto));
+router.post('/planillas/:id_planilla/adelantos/:id_adelanto/actualizar', checkPermission(PLANILLAS_ADELANTOS_PERMISSIONS), asyncHandler(planillaService.actualizarAdelanto));
+router.post('/planillas/:id_planilla/adelantos/:id_adelanto/anular', checkPermission(PLANILLAS_ADELANTOS_PERMISSIONS), asyncHandler(planillaService.anularAdelanto));
 router.post('/planillas/:id_planilla/movimientos', checkPermission(PLANILLAS_MOVIMIENTO_REGISTER_PERMISSIONS), asyncHandler(planillaService.registrarMovimiento));
 router.get('/planillas/:id_planilla/movimientos', checkPermission(PLANILLAS_DETAIL_PERMISSIONS), asyncHandler(planillaService.listarMovimientos));
 router.get('/planillas/:id_planilla/movimientos/:id_detalle', checkPermission(PLANILLAS_DETAIL_PERMISSIONS), asyncHandler(planillaService.listarMovimientosDetalle));

@@ -13,7 +13,7 @@ import {
 const isPlainObject = (value) => value !== null && typeof value === 'object' && !Array.isArray(value);
 
 const parsePositiveInt = (value) => {
-  const parsed = Number.parseInt(value, 10);
+  const parsed = Number.parseInt(String(value ?? ''), 10);
   return Number.isInteger(parsed) && parsed > 0 ? parsed : null;
 };
 const PERSONA_ALLOWED_FIELDS = new Set([
@@ -39,6 +39,7 @@ const EMPRESA_ALLOWED_FIELDS = new Set([
   'rtn',
   'nombre_empresa',
   'nombre',
+  'estado',
   'texto_direccion',
   'texto_telefono',
   'texto_correo',
@@ -55,6 +56,20 @@ const toNullableTrimmed = (value) => {
   return text || null;
 };
 
+const parseBooleanValue = (value) => {
+  if (typeof value === 'boolean') return value;
+  if (typeof value === 'number') {
+    if (value === 1) return true;
+    if (value === 0) return false;
+    return null;
+  }
+  if (typeof value !== 'string') return null;
+  const normalized = value.trim().toLowerCase();
+  if (['true', '1', 't', 'si', 'activo'].includes(normalized)) return true;
+  if (['false', '0', 'f', 'no', 'inactivo'].includes(normalized)) return false;
+  return null;
+};
+
 const safeParseJson = (value) => {
   if (value === null || value === undefined) return null;
   if (typeof value === 'object') return value;
@@ -69,28 +84,69 @@ const safeParseJson = (value) => {
 };
 
 const extractIdFromUnknown = (value, candidateKeys = []) => {
-  const direct = parsePositiveInt(value);
-  if (direct) return direct;
+  const seen = new Set();
+  const dynamicKeys = [
+    ...candidateKeys,
+    'resultado',
+    'id',
+    'id_persona',
+    'persona_id',
+    'id_persona_creada',
+    'id_empresa',
+    'empresa_id',
+    'id_empresa_creada',
+    'id_cliente',
+    'cliente_id'
+  ];
 
-  const parsed = safeParseJson(value);
-  const parsedDirect = parsePositiveInt(parsed);
-  if (parsedDirect) return parsedDirect;
+  const walk = (node, depth = 0) => {
+    if (depth > 5 || node === null || node === undefined) return null;
 
-  if (!isPlainObject(parsed)) return null;
+    const direct = parsePositiveInt(node);
+    if (direct) return direct;
 
-  for (const key of candidateKeys) {
-    const candidate = parsePositiveInt(parsed[key]);
-    if (candidate) return candidate;
-  }
-
-  if (isPlainObject(parsed.data)) {
-    for (const key of candidateKeys) {
-      const candidate = parsePositiveInt(parsed.data[key]);
-      if (candidate) return candidate;
+    if (typeof node === 'string') {
+      const parsedNode = safeParseJson(node);
+      if (parsedNode !== node) {
+        const nested = walk(parsedNode, depth + 1);
+        if (nested) return nested;
+      }
+      return null;
     }
-  }
 
-  return null;
+    if (Array.isArray(node)) {
+      for (const item of node) {
+        const nested = walk(item, depth + 1);
+        if (nested) return nested;
+      }
+      return null;
+    }
+
+    if (!isPlainObject(node)) return null;
+    if (seen.has(node)) return null;
+    seen.add(node);
+
+    for (const key of dynamicKeys) {
+      if (!Object.prototype.hasOwnProperty.call(node, key)) continue;
+      const nested = walk(node[key], depth + 1);
+      if (nested) return nested;
+    }
+
+    const heuristicIdKeys = Object.keys(node).filter((key) => /(^id$|^id_|_id$)/i.test(String(key)));
+    for (const key of heuristicIdKeys) {
+      const nested = walk(node[key], depth + 1);
+      if (nested) return nested;
+    }
+
+    for (const nestedValue of Object.values(node)) {
+      const nested = walk(nestedValue, depth + 1);
+      if (nested) return nested;
+    }
+
+    return null;
+  };
+
+  return walk(value, 0);
 };
 
 const getPersonaTenantId = async (client, idPersona) => {
@@ -153,6 +209,11 @@ const validateEmpresaPayload = (payload = {}) => {
 
   const correo = toNullableTrimmed(payload.texto_correo ?? payload.correo ?? payload.email ?? payload.direccion_correo);
   if (correo && !isSafeEmail(correo)) return 'correo de empresa no es valido.';
+
+  if (Object.prototype.hasOwnProperty.call(payload, 'estado')) {
+    const estado = parseBooleanValue(payload.estado);
+    if (estado === null) return 'estado de empresa debe ser booleano.';
+  }
 
   return null;
 };
@@ -220,6 +281,7 @@ export const normalizeClienteAtomicPayload = (payload) => {
     puntos: payload.puntos,
     id_tipo_cliente: parsePositiveInt(payload.id_tipo_cliente),
     id_persona: parsePositiveInt(payload.id_persona),
+    id_empresa_cliente: parsePositiveInt(payload.id_empresa_cliente ?? payload.id_empresa),
     id_empresa: parsePositiveInt(payload.id_empresa),
     id_sucursal: parsePositiveInt(payload.id_sucursal),
     estado: payload.estado
@@ -295,11 +357,39 @@ export const resolveOrCreatePersona = async ({ client, req, idPersona, personaPa
     JSON.stringify(normalizedPersona)
   ]);
 
-  const idPersonaCreada = extractIdFromUnknown(createResult.rows?.[0]?.resultado, [
+  let idPersonaCreada = extractIdFromUnknown(createResult.rows?.[0]?.resultado, [
     'id_persona',
     'id',
     'persona_id'
   ]);
+
+  if (!idPersonaCreada && normalizedPersona.dni) {
+    const fallbackByDni = await client.query(
+      `
+        SELECT p.id_persona
+        FROM public.personas p
+        WHERE LOWER(TRIM(COALESCE(p.dni::TEXT, ''))) = LOWER(TRIM($1::TEXT))
+        ORDER BY p.id_persona DESC
+        LIMIT 1
+      `,
+      [normalizedPersona.dni]
+    );
+    idPersonaCreada = parsePositiveInt(fallbackByDni.rows?.[0]?.id_persona);
+  }
+  if (!idPersonaCreada && normalizedPersona.nombre && normalizedPersona.apellido) {
+    const fallbackByName = await client.query(
+      `
+        SELECT p.id_persona
+        FROM public.personas p
+        WHERE LOWER(TRIM(COALESCE(p.nombre, ''))) = LOWER(TRIM($1::TEXT))
+          AND LOWER(TRIM(COALESCE(p.apellido, ''))) = LOWER(TRIM($2::TEXT))
+        ORDER BY p.id_persona DESC
+        LIMIT 1
+      `,
+      [normalizedPersona.nombre, normalizedPersona.apellido]
+    );
+    idPersonaCreada = parsePositiveInt(fallbackByName.rows?.[0]?.id_persona);
+  }
 
   if (!idPersonaCreada) {
     const error = new Error('No se pudo obtener id_persona de la creacion atomica');
@@ -366,7 +456,44 @@ export const resolveOrCreateEmpresa = async ({ client, req, idEmpresa, empresaPa
     JSON.stringify(normalizedEmpresa)
   ]);
 
-  const idEmpresaCreada = parsePositiveInt(createResult.rows?.[0]?.id_empresa);
+  let idEmpresaCreada = extractIdFromUnknown(createResult.rows?.[0]?.id_empresa, [
+    'id_empresa',
+    'id',
+    'empresa_id'
+  ]);
+  if (!idEmpresaCreada) {
+    idEmpresaCreada = extractIdFromUnknown(createResult.rows?.[0]?.resultado, [
+      'id_empresa',
+      'id',
+      'empresa_id'
+    ]);
+  }
+  if (!idEmpresaCreada && normalizedEmpresa.rtn) {
+    const fallbackByRtn = await client.query(
+      `
+        SELECT e.id_empresa
+        FROM public.empresas e
+        WHERE LOWER(TRIM(COALESCE(e.rtn::TEXT, ''))) = LOWER(TRIM($1::TEXT))
+        ORDER BY e.id_empresa DESC
+        LIMIT 1
+      `,
+      [normalizedEmpresa.rtn]
+    );
+    idEmpresaCreada = parsePositiveInt(fallbackByRtn.rows?.[0]?.id_empresa);
+  }
+  if (!idEmpresaCreada && normalizedEmpresa.nombre_empresa) {
+    const fallbackByName = await client.query(
+      `
+        SELECT e.id_empresa
+        FROM public.empresas e
+        WHERE LOWER(TRIM(COALESCE(e.nombre_empresa, ''))) = LOWER(TRIM($1::TEXT))
+        ORDER BY e.id_empresa DESC
+        LIMIT 1
+      `,
+      [normalizedEmpresa.nombre_empresa]
+    );
+    idEmpresaCreada = parsePositiveInt(fallbackByName.rows?.[0]?.id_empresa);
+  }
   if (!idEmpresaCreada) {
     const error = new Error('No se pudo obtener id_empresa de la creacion atomica');
     error.httpStatus = 500;
