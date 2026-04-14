@@ -4,13 +4,256 @@
  */
 
 import express from 'express';
+import crypto from 'node:crypto';
+import fs from 'fs/promises';
+import path from 'path';
 import pool from '../config/db-connection.js';
 import jwt from 'jsonwebtoken';
 import JWT_SECRET from '../config/jwt.js';
 import { ensurePasswordChangedAtColumn } from '../utils/security/passwordExpiration.js';
+import { supabase } from '../services/supabaseClient.js';
+import {
+  ALLOWED_IMAGE_MIME_TYPES,
+  SUPABASE_ASSETS_BUCKET,
+  buildAbsolutePublicUrl,
+  UPLOADS_DIR,
+  detectImageMimeTypeFromBuffer
+} from '../utils/uploads.js';
 
 const router = express.Router();
 const LEGACY_BCRYPT_PREFIX_RE = /^\$2[abxy]?\$/i;
+const PERFIL_FOTO_PERFIL_MAX_LENGTH = 500;
+const PERFIL_IMAGE_MAX_BYTES = 20 * 1024 * 1024;
+const PERFIL_SUPABASE_SUBDIR = 'usuarios';
+const PERFIL_LEGACY_UPLOADS_SUBDIR = 'usuarios';
+const PERFIL_UPLOADS_PREFIX = '/uploads/usuarios/';
+const PERFIL_BASE64_BODY_REGEX = /^[A-Za-z0-9+/]+={0,2}$/;
+const PERFIL_DATA_URL_PARSE_RE = /^data:(image\/(?:png|jpe?g|webp));base64,([A-Za-z0-9+/=]+)$/i;
+const PERFIL_IMAGE_DATA_URL_RE = /^data:image\/(png|jpe?g|webp);base64,[A-Za-z0-9+/=]+$/i;
+const PERFIL_IMAGE_URL_RE = /^(https?:\/\/|\/uploads\/)/i;
+
+const normalizePerfilText = (value) => {
+  if (value === null || value === undefined) return '';
+  return String(value).trim();
+};
+
+const estimatePerfilDataUrlBytes = (dataUrl) => {
+  const safe = normalizePerfilText(dataUrl);
+  const commaIndex = safe.indexOf(',');
+  if (commaIndex < 0) return 0;
+
+  const base64 = safe.slice(commaIndex + 1);
+  const paddingMatch = base64.match(/=+$/);
+  const padding = paddingMatch ? paddingMatch[0].length : 0;
+  return Math.floor((base64.length * 3) / 4) - padding;
+};
+
+const validatePerfilPhotoPayload = (fotoPerfil) => {
+  if (fotoPerfil === null || fotoPerfil === undefined || normalizePerfilText(fotoPerfil) === '') {
+    return { ok: true, value: '', kind: 'empty' };
+  }
+
+  const value = normalizePerfilText(fotoPerfil);
+  const isDataImage = PERFIL_IMAGE_DATA_URL_RE.test(value);
+  const isShortUrl = PERFIL_IMAGE_URL_RE.test(value);
+
+  if (isDataImage) {
+    const estimatedBytes = estimatePerfilDataUrlBytes(value);
+    if (estimatedBytes <= 0) {
+      return {
+        ok: false,
+        status: 400,
+        message: 'Formato de foto no valido. Use una URL (http/https o /uploads/...) o una imagen mas ligera.',
+      };
+    }
+
+    if (estimatedBytes > PERFIL_IMAGE_MAX_BYTES) {
+      return {
+        ok: false,
+        status: 413,
+        message: 'La imagen supera el limite de 20 MB.',
+      };
+    }
+
+    return { ok: true, value, kind: 'data_url' };
+  }
+
+  if (value.length > PERFIL_FOTO_PERFIL_MAX_LENGTH) {
+    return {
+      ok: false,
+      status: 413,
+      message: 'URL de imagen demasiado larga. Maximo 500 caracteres.',
+    };
+  }
+
+  if (isShortUrl) {
+    return { ok: true, value, kind: 'url' };
+  }
+
+  return {
+    ok: false,
+    status: 400,
+    message: 'Formato de foto no valido. Use una URL (http/https o /uploads/...) o una imagen mas ligera.',
+  };
+};
+
+const parsePerfilDataImagePayload = (dataUrl) => {
+  const value = normalizePerfilText(dataUrl);
+  const match = value.match(PERFIL_DATA_URL_PARSE_RE);
+  if (!match) {
+    return {
+      ok: false,
+      status: 400,
+      message: 'Formato de foto no valido. Use una URL (http/https o /uploads/...) o una imagen mas ligera.',
+    };
+  }
+
+  return {
+    ok: true,
+    mimeType: String(match[1] || '').toLowerCase(),
+    base64Body: String(match[2] || ''),
+  };
+};
+
+const decodePerfilBase64Image = (base64Body) => {
+  const normalized = String(base64Body || '').replace(/\s+/g, '');
+  if (!normalized || normalized.length % 4 !== 0 || !PERFIL_BASE64_BODY_REGEX.test(normalized)) {
+    return {
+      ok: false,
+      status: 400,
+      message: 'Formato de foto no valido. Use una URL (http/https o /uploads/...) o una imagen mas ligera.',
+    };
+  }
+
+  const buffer = Buffer.from(normalized, 'base64');
+  if (!Buffer.isBuffer(buffer) || buffer.length <= 0) {
+    return {
+      ok: false,
+      status: 400,
+      message: 'Formato de foto no valido. Use una URL (http/https o /uploads/...) o una imagen mas ligera.',
+    };
+  }
+
+  if (buffer.length > PERFIL_IMAGE_MAX_BYTES) {
+    return {
+      ok: false,
+      status: 413,
+      message: 'La imagen supera el limite de 20 MB.',
+    };
+  }
+
+  return { ok: true, buffer };
+};
+
+const buildPerfilSupabaseStoragePath = (fileName) => `${PERFIL_SUPABASE_SUBDIR}/${fileName}`;
+const buildPerfilDbStoredPath = (storagePath) => `${SUPABASE_ASSETS_BUCKET}/${storagePath}`;
+
+const parsePerfilStoredStoragePath = (rawValue) => {
+  const input = normalizePerfilText(rawValue);
+  if (!input) return null;
+
+  let candidate = input;
+  if (/^https?:\/\//i.test(candidate)) {
+    try {
+      const parsed = new URL(candidate);
+      candidate = decodeURIComponent(String(parsed.pathname || '')).replace(/^\/+/, '');
+      const publicMarker = 'storage/v1/object/public/';
+      const markerIndex = candidate.indexOf(publicMarker);
+      if (markerIndex >= 0) {
+        candidate = candidate.slice(markerIndex + publicMarker.length);
+      }
+    } catch {
+      return null;
+    }
+  }
+
+  const parts = candidate.split('/').filter(Boolean);
+  if (parts.length < 2) return null;
+
+  return {
+    bucket: parts[0],
+    filePath: parts.slice(1).join('/')
+  };
+};
+
+const storePerfilPhotoDataUrlInSupabase = async (dataUrl) => {
+  const parsed = parsePerfilDataImagePayload(dataUrl);
+  if (!parsed.ok) return parsed;
+
+  const decoded = decodePerfilBase64Image(parsed.base64Body);
+  if (!decoded.ok) return decoded;
+
+  const detectedMimeType = detectImageMimeTypeFromBuffer(decoded.buffer);
+  const declaredMimeType = parsed.mimeType;
+  const effectiveMimeType = detectedMimeType || declaredMimeType;
+
+  if (!effectiveMimeType || !Object.prototype.hasOwnProperty.call(ALLOWED_IMAGE_MIME_TYPES, effectiveMimeType)) {
+    return {
+      ok: false,
+      status: 400,
+      message: 'Solo se permiten imagenes JPG, PNG o WEBP.',
+    };
+  }
+
+  if (declaredMimeType && detectedMimeType && declaredMimeType !== detectedMimeType) {
+    return {
+      ok: false,
+      status: 400,
+      message: 'El tipo de archivo de la imagen no coincide con su contenido.',
+    };
+  }
+
+  const extension = ALLOWED_IMAGE_MIME_TYPES[effectiveMimeType];
+  const fileName = `perfil-${Date.now()}-${crypto.randomUUID()}.${extension}`;
+  const storagePath = buildPerfilSupabaseStoragePath(fileName);
+  const storedPath = buildPerfilDbStoredPath(storagePath);
+
+  const { error: uploadError } = await supabase.storage
+    .from(SUPABASE_ASSETS_BUCKET)
+    .upload(storagePath, decoded.buffer, {
+      contentType: effectiveMimeType,
+      cacheControl: '3600',
+      upsert: false
+    });
+
+  if (uploadError) {
+    console.error('PUT /perfil storage upload error:', uploadError);
+    return {
+      ok: false,
+      status: 500,
+      message: 'No se pudo guardar la imagen en Storage.',
+    };
+  }
+
+  return {
+    ok: true,
+    storedPath,
+    uploadedStoragePath: storagePath,
+  };
+};
+
+const tryDeletePerfilStoredFile = async (storedPath) => {
+  const safe = normalizePerfilText(storedPath);
+  if (!safe) return;
+
+  const storagePath = parsePerfilStoredStoragePath(safe);
+  if (
+    storagePath &&
+    storagePath.bucket === SUPABASE_ASSETS_BUCKET &&
+    storagePath.filePath.startsWith(`${PERFIL_SUPABASE_SUBDIR}/`)
+  ) {
+    await supabase.storage.from(storagePath.bucket).remove([storagePath.filePath]).catch(() => null);
+    return;
+  }
+
+  if (!safe.startsWith(PERFIL_UPLOADS_PREFIX)) return;
+
+  const fileName = safe.slice(PERFIL_UPLOADS_PREFIX.length).trim();
+  if (!fileName || fileName.includes('/') || fileName.includes('\\')) return;
+
+  const absolutePath = path.join(UPLOADS_DIR, PERFIL_LEGACY_UPLOADS_SUBDIR, fileName);
+  await fs.unlink(absolutePath).catch(() => null);
+};
 
 const cookieConfig = () => {
   const isProd = process.env.NODE_ENV === 'production';
@@ -136,9 +379,16 @@ router.get('/perfil', async (req, res) => {
     const sesionesTotalesRes = await pool.query(sqlSesionesTotales, [idUsuario]);
     const sesionesTotales = Number(sesionesTotalesRes.rows[0]?.total || 0);
 
+    const perfilRow = perfil.rows[0] || {};
+    const fotoPerfilResolved = buildAbsolutePublicUrl(req, perfilRow.foto_perfil);
+    const perfilPayload = {
+      ...perfilRow,
+      foto_perfil: fotoPerfilResolved || ''
+    };
+
     return res.json({
       error: false,
-      perfil: perfil.rows[0],
+      perfil: perfilPayload,
       roles: roles.rows,
       ultimo_acceso: ultimo.rows[0] || null,
       sesiones_totales: sesionesTotales
@@ -156,6 +406,9 @@ router.get('/perfil', async (req, res) => {
  */
 router.put('/perfil', async (req, res) => {
   const client = await pool.connect();
+  let uploadedPhotoStoragePath = '';
+  let previousStoredPhoto = '';
+  let nextStoredPhoto = '';
 
   try {
     const user = req.user;
@@ -182,7 +435,18 @@ router.put('/perfil', async (req, res) => {
 
       // usuarios
       foto_perfil
-    } = req.body;
+    } = req.body || {};
+
+    let photoUpdatePlan = null;
+    if (foto_perfil !== undefined) {
+      photoUpdatePlan = validatePerfilPhotoPayload(foto_perfil);
+      if (!photoUpdatePlan.ok) {
+        return res.status(photoUpdatePlan.status || 400).json({
+          error: true,
+          message: photoUpdatePlan.message
+        });
+      }
+    }
 
     await client.query('BEGIN');
 
@@ -191,6 +455,7 @@ router.put('/perfil', async (req, res) => {
       SELECT
         u.id_usuario,
         u.id_empleado,
+        u.foto_perfil,
         e.id_persona,
         p.id_telefono,
         p.id_correo,
@@ -301,17 +566,42 @@ router.put('/perfil', async (req, res) => {
     }
 
     // 6) Actualizar foto en USUARIOS (si viene)
-    if (foto_perfil !== undefined) {
+    if (photoUpdatePlan) {
+      previousStoredPhoto = normalizePerfilText(idsRes.rows[0].foto_perfil);
+      let valueToPersist = photoUpdatePlan.value;
+
+      if (photoUpdatePlan.kind === 'data_url') {
+        const storedPhoto = await storePerfilPhotoDataUrlInSupabase(photoUpdatePlan.value);
+        if (!storedPhoto.ok) {
+          await client.query('ROLLBACK');
+          return res.status(storedPhoto.status || 400).json({ error: true, message: storedPhoto.message });
+        }
+
+        uploadedPhotoStoragePath = storedPhoto.uploadedStoragePath || '';
+        valueToPersist = storedPhoto.storedPath;
+      }
+
+      nextStoredPhoto = normalizePerfilText(valueToPersist);
       await client.query(
         'UPDATE usuarios SET foto_perfil = $1 WHERE id_usuario = $2',
-        [foto_perfil, idUsuario]
+        [valueToPersist, idUsuario]
       );
     }
 
     await client.query('COMMIT');
+    uploadedPhotoStoragePath = '';
+    if (photoUpdatePlan && previousStoredPhoto && previousStoredPhoto !== nextStoredPhoto) {
+      await tryDeletePerfilStoredFile(previousStoredPhoto);
+    }
     return res.json({ error: false, message: 'Perfil actualizado correctamente' });
   } catch (err) {
-    await client.query('ROLLBACK');
+    try { await client.query('ROLLBACK'); } catch (_) { /* ignore */ }
+    if (uploadedPhotoStoragePath) {
+      await supabase.storage.from(SUPABASE_ASSETS_BUCKET).remove([uploadedPhotoStoragePath]).catch(() => null);
+    }
+    if (err?.code === '22001') {
+      return res.status(413).json({ error: true, message: 'URL de imagen demasiado larga. Maximo 500 caracteres.' });
+    }
     console.error('PUT /perfil error:', err);
     return res.status(500).json({ error: true, message: 'Error interno del servidor' });
   } finally {
