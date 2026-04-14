@@ -91,6 +91,14 @@ const getUserAuthzSnapshot = async (idUsuario) => {
   };
 };
 
+const normalizeRoleName = (value) =>
+  String(value ?? '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .trim()
+    .replace(/[\s-]+/g, '_')
+    .toUpperCase();
+
 const buildPasswordPolicyFlags = (passwordExpiration) => {
   const ageDays = Number.isInteger(passwordExpiration?.ageDays)
     ? passwordExpiration.ageDays
@@ -245,6 +253,80 @@ router.post('/login', internalLoginIpLimiter, internalLoginAccountIpLimiter, asy
       authz = await getUserAuthzSnapshot(usuarioEncontrado.id_usuario);
     } catch (authzError) {
       console.error('Error resolviendo roles/permisos en /login:', authzError);
+    }
+
+    const normalizedRoles = Array.isArray(authz.roles)
+      ? authz.roles.map(normalizeRoleName).filter(Boolean)
+      : [];
+    const tipoUsuarioNormalizado = normalizeRoleName(usuarioEncontrado?.tipo_usuario);
+    const isClienteScope =
+      tipoUsuarioNormalizado === 'CLIENTE' || normalizedRoles.includes('CLIENTE');
+    const hasInternalRole = normalizedRoles.some((roleName) => roleName !== 'CLIENTE');
+
+    if (!usuarioEncontrado?.estado) {
+      await closeSession(id_sesion, 'account_disabled').catch(() => {});
+      await insertLoginLog({
+        id_usuario: usuarioEncontrado.id_usuario,
+        id_sesion: null,
+        ip_origen,
+        nombre_usuario_intentado: nombre_usuario,
+        user_agent,
+        dispositivo,
+        navegador,
+        sistema_operativo,
+        ubicacion: null,
+        exito: false,
+        mensaje_error: 'Cuenta desactivada'
+      }).catch(() => {});
+      return res.status(403).json({
+        error: true,
+        code: 'ACCOUNT_DISABLED',
+        message: 'La cuenta está desactivada.'
+      });
+    }
+
+    if (isClienteScope) {
+      await closeSession(id_sesion, 'scope_cliente').catch(() => {});
+      await insertLoginLog({
+        id_usuario: usuarioEncontrado.id_usuario,
+        id_sesion: null,
+        ip_origen,
+        nombre_usuario_intentado: nombre_usuario,
+        user_agent,
+        dispositivo,
+        navegador,
+        sistema_operativo,
+        ubicacion: null,
+        exito: false,
+        mensaje_error: 'Acceso interno no permitido para rol cliente'
+      }).catch(() => {});
+      return res.status(403).json({
+        error: true,
+        code: 'ACCOUNT_SCOPE_INVALID',
+        message: 'Este acceso corresponde a cuentas de cliente.'
+      });
+    }
+
+    if (!hasInternalRole) {
+      await closeSession(id_sesion, 'without_roles').catch(() => {});
+      await insertLoginLog({
+        id_usuario: usuarioEncontrado.id_usuario,
+        id_sesion: null,
+        ip_origen,
+        nombre_usuario_intentado: nombre_usuario,
+        user_agent,
+        dispositivo,
+        navegador,
+        sistema_operativo,
+        ubicacion: null,
+        exito: false,
+        mensaje_error: 'Usuario sin roles internos asignados'
+      }).catch(() => {});
+      return res.status(403).json({
+        error: true,
+        code: 'ACCOUNT_WITHOUT_ROLES',
+        message: 'La cuenta no tiene roles internos asignados.'
+      });
     }
 
     const passwordExpiration = evaluatePasswordExpiration({

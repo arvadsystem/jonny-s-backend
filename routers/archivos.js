@@ -7,6 +7,7 @@ import {
   MAX_FILE_BYTES_BY_BUCKET,
   MAX_IMAGE_BYTES,
   INVENTARIO_UPLOADS_SUBDIR,
+  SUCURSALES_UPLOADS_SUBDIR,
   ADMIN_UPLOADS_SUBDIR,
   SUPABASE_ASSETS_BUCKET,
   SUPABASE_ADMIN_BUCKET,
@@ -31,8 +32,17 @@ const getSafeArchivoCleanupErrorMessage = (fallback = 'No se pudo limpiar la ima
 const normalizeOriginalName = (value, defaultName = 'archivo') => {
   const trimmed = String(value || '').trim();
   if (!trimmed) return defaultName;
-  // Eliminar caracteres peligrosos y limitar longitud
-  return trimmed.replace(/[<>:"/\\|?*\u0000-\u001f]+/g, '-').slice(0, 100) || defaultName;
+
+  const withoutExtension = trimmed.replace(/\.[a-z0-9]{1,8}$/i, '');
+  const safe = withoutExtension
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 80);
+
+  return safe || defaultName;
 };
 
 const parseUploadPayload = (payload) => {
@@ -248,9 +258,14 @@ router.post('/archivos', async (req, res) => {
     const extension = allowedMimesForBucket[effectiveMimeType];
     const prefix = targetBucket === SUPABASE_ADMIN_BUCKET ? 'admin' : 'asset';
     const safeOriginalName = normalizeOriginalName(payload?.nombre_original ?? payload?.nombreOriginal, prefix);
-    const uniqueFileName = `${safeOriginalName}_${Date.now()}_${crypto.randomUUID().slice(0, 8)}.${extension}`;
-    
-    const subDir = targetBucket === SUPABASE_ADMIN_BUCKET ? ADMIN_UPLOADS_SUBDIR : INVENTARIO_UPLOADS_SUBDIR;
+    const uniqueFileName = `${safeOriginalName}-${Date.now()}-${crypto.randomUUID().slice(0, 8)}.${extension}`;
+
+    const contextoRaw = String(payload?.contexto || payload?.modulo || '').trim().toLowerCase();
+    const subDir = targetBucket === SUPABASE_ADMIN_BUCKET
+      ? ADMIN_UPLOADS_SUBDIR
+      : contextoRaw === 'sucursales'
+        ? SUCURSALES_UPLOADS_SUBDIR
+        : INVENTARIO_UPLOADS_SUBDIR;
     supabaseFilePath = `${subDir}/${uniqueFileName}`;
 
     // 5. Subir a Supabase Storage (usando service_role para bypass RLS en subida)

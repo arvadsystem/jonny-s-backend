@@ -38,7 +38,8 @@ const DELIVERY_TYPE_BY_ORDER_TYPE = Object.freeze({
   pickup: 'RECOGER',
   delivery: 'DELIVERY'
 });
-const INITIAL_ORDER_PAYMENT_STATE = 'PENDIENTE';
+const INITIAL_ORDER_PAYMENT_STATE = 'PENDIENTE_VALIDACION';
+const ORDER_PAYMENT_VALIDATION_WINDOW_MINUTES = 10;
 
 const ORDER_STATE_ALIASES = Object.freeze([
   'pendiente',
@@ -982,6 +983,7 @@ export const createPublicOrderService = async ({
   });
 
   const total = roundMoney(normalizedLines.reduce((sum, line) => sum + line.subtotal, 0));
+  const validacionPagoVenceAt = new Date(Date.now() + ORDER_PAYMENT_VALIDATION_WINDOW_MINUTES * 60 * 1000);
   const idEstadoPedido = await resolvePendingStateId();
   if (!idEstadoPedido) {
     throw buildHttpError(
@@ -1013,7 +1015,8 @@ export const createPublicOrderService = async ({
       id_cliente: Number(idCliente),
       id_usuario: Number(idUsuario),
       estado_pago: INITIAL_ORDER_PAYMENT_STATE,
-      tipo_entrega: tipoEntrega
+      tipo_entrega: tipoEntrega,
+      validacion_pago_vence_at: validacionPagoVenceAt
     });
 
     const idPedido = Number(pedido?.id_pedido || 0);
@@ -1047,6 +1050,7 @@ export const createPublicOrderService = async ({
       business: businessContext,
       estado: 'PENDIENTE',
       estado_pago: INITIAL_ORDER_PAYMENT_STATE,
+      validacion_pago_vence_at: validacionPagoVenceAt.toISOString(),
       total,
       total_items: normalizedLines.reduce((sum, line) => sum + Number(line.cantidad || 0), 0),
       fecha_hora_pedido: pedido?.fecha_hora_pedido || null,
