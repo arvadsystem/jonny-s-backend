@@ -3,7 +3,10 @@ import pool from '../config/db-connection.js';
 import jwt from 'jsonwebtoken';
 import crypto from 'crypto';
 import { authRequired } from '../middleware/auth.js';
-import { loginLimiter } from '../middleware/rateLimiter.js';
+import {
+  internalLoginIpLimiter,
+  internalLoginAccountIpLimiter
+} from '../middleware/rateLimiter.js';
 import JWT_SECRET from '../config/jwt.js';
 
 // helpers de HU78
@@ -137,7 +140,7 @@ const verifyLoginPassword = async (plainPassword, storedPassword, userId) => {
   return Boolean(result.rows?.[0]?.ok);
 };
 
-router.post('/login', loginLimiter, async (req, res) => {
+router.post('/login', internalLoginIpLimiter, internalLoginAccountIpLimiter, async (req, res) => {
   const { nombre_usuario, clave } = req.body;
 
   if (!JWT_SECRET) {

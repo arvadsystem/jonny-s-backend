@@ -14,10 +14,15 @@ import jwt from 'jsonwebtoken';
 import crypto from 'crypto';
 import pool from '../config/db-connection.js';
 import JWT_SECRET from '../config/jwt.js';
-import { loginLimiter, registerLimiter, forgotPasswordLimiter } from '../middleware/rateLimiter.js';
+import {
+  publicLoginIpLimiter,
+  publicLoginAccountIpLimiter,
+  registerLimiter,
+  forgotPasswordLimiter
+} from '../middleware/rateLimiter.js';
 import { getClientIp, parseUserAgent } from '../utils/security/clientInfo.js';
 import { insertLoginLog } from '../utils/security/loginLogger.js';
-import { createSession } from '../utils/security/sessionService.js';
+import { createSession, closeAllUserSessions } from '../utils/security/sessionService.js';
 import { enviarVerificacion, enviarRecuperacion } from '../utils/emailService.js';
 
 const router = express.Router();
@@ -48,6 +53,17 @@ const emitirAppJwt = (usuario, id_sesion) => {
     sid: id_sesion
   };
   return jwt.sign(payload, JWT_SECRET, { expiresIn: '8h' });
+};
+
+const normalizeIdentifier = (value) => String(value || '').trim();
+const normalizeEmail = (value) => normalizeIdentifier(value).toLowerCase();
+
+const validatePasswordPolicy = (clave) => {
+  const password = String(clave || '');
+  if (password.length < 10) return 'La contraseña debe tener al menos 10 caracteres';
+  if (!/[A-Z]/.test(password)) return 'La contraseña debe incluir al menos una mayúscula';
+  if (!/[0-9]/.test(password)) return 'La contraseña debe incluir al menos un número';
+  return '';
 };
 
 /**
@@ -142,7 +158,10 @@ const autenticarConSupabase = async (email, password) => {
 
 // ── POST /api/public/register ─────────────────────────────────────────
 router.post('/api/public/register', registerLimiter, async (req, res) => {
-  const { email, clave, nombre, apellido } = req.body;
+  const { clave } = req.body;
+  const email = normalizeEmail(req.body?.email);
+  const nombre = normalizeIdentifier(req.body?.nombre);
+  const apellido = normalizeIdentifier(req.body?.apellido);
 
   if (!email || !clave || !nombre || !apellido) {
     return res.status(400).json({ error: true, message: 'Todos los campos son obligatorios (Nombre, Apellido, Email y Contraseña)' });
@@ -307,8 +326,9 @@ router.post('/api/public/register', registerLimiter, async (req, res) => {
 });
 
 // ── POST /api/public/login ────────────────────────────────────────────
-router.post('/api/public/login', loginLimiter, async (req, res) => {
-  const { identifier, clave } = req.body;
+router.post('/api/public/login', publicLoginIpLimiter, publicLoginAccountIpLimiter, async (req, res) => {
+  const identifier = normalizeIdentifier(req.body?.identifier ?? req.body?.email);
+  const { clave } = req.body;
   if (!identifier || !clave) {
     return res.status(400).json({ error: true, message: 'Usuario/email y contraseña son requeridos' });
   }
@@ -316,6 +336,9 @@ router.post('/api/public/login', loginLimiter, async (req, res) => {
   const ip_origen = getClientIp(req);
   const user_agent = req.get('user-agent') || null;
   const { dispositivo, navegador, sistema_operativo } = parseUserAgent(user_agent);
+
+  const attemptedIdentifier = identifier;
+  let resolvedEmail = '';
 
   try {
     let email = identifier;
@@ -330,10 +353,24 @@ router.post('/api/public/login', loginLimiter, async (req, res) => {
         [identifier]
       );
       if (uRes.rows.length === 0) {
+        await insertLoginLog({
+          id_usuario: null,
+          id_sesion: null,
+          ip_origen,
+          nombre_usuario_intentado: attemptedIdentifier,
+          user_agent,
+          dispositivo,
+          navegador,
+          sistema_operativo,
+          ubicacion: null,
+          exito: false,
+          mensaje_error: 'Credenciales inválidas'
+        }).catch(() => {});
         return res.status(401).json({ error: true, message: 'Credenciales inválidas' });
       }
       email = uRes.rows[0].email_login;
     }
+    resolvedEmail = email;
 
     // 1. Autenticar contra Supabase
     const { auth_user_id } = await autenticarConSupabase(email, clave);
@@ -345,7 +382,7 @@ router.post('/api/public/login', loginLimiter, async (req, res) => {
     );
 
     if (identRes.rows.length === 0) {
-      return res.status(404).json({ error: true, message: 'No existe una cuenta interna asociada a ese correo' });
+      return res.status(401).json({ error: true, message: 'Credenciales inválidas' });
     }
 
     const id_usuario = identRes.rows[0].id_usuario;
@@ -390,11 +427,11 @@ router.post('/api/public/login', loginLimiter, async (req, res) => {
       csrfToken
     });
   } catch (error) {
-    console.error('[public/login] Error:', error);
+    console.error('[public/login] Authentication failed');
     await insertLoginLog({
-      id_usuario: null, id_sesion: null, ip_origen, nombre_usuario_intentado: email,
+      id_usuario: null, id_sesion: null, ip_origen, nombre_usuario_intentado: resolvedEmail || attemptedIdentifier,
       user_agent, dispositivo, navegador, sistema_operativo, ubicacion: null,
-      exito: false, mensaje_error: error.message
+      exito: false, mensaje_error: 'Credenciales inválidas'
     }).catch(() => {});
     return res.status(401).json({ error: true, message: 'Credenciales inválidas' });
   }
@@ -402,7 +439,7 @@ router.post('/api/public/login', loginLimiter, async (req, res) => {
 
 // ── POST /api/public/forgot-password ─────────────────────────────────
 router.post('/api/public/forgot-password', forgotPasswordLimiter, async (req, res) => {
-  const { email } = req.body;
+  const email = normalizeEmail(req.body?.email);
   if (!email) {
     return res.status(400).json({ error: true, message: 'Email requerido' });
   }
@@ -443,6 +480,62 @@ router.post('/api/public/forgot-password', forgotPasswordLimiter, async (req, re
   } catch (error) {
     console.error('[public/forgot-password] Error:', error);
     return res.status(500).json({ error: true, message: 'Error al procesar la solicitud' });
+  }
+});
+
+// ── POST /api/public/reset-password ───────────────────────────────────────────
+router.post('/api/public/reset-password', forgotPasswordLimiter, async (req, res) => {
+  const accessToken = normalizeIdentifier(req.body?.access_token);
+  const nuevaClave = String(req.body?.nueva_clave || '');
+
+  if (!accessToken || !nuevaClave) {
+    return res.status(400).json({ error: true, message: 'Token y nueva contraseña son requeridos.' });
+  }
+
+  const passwordPolicyError = validatePasswordPolicy(nuevaClave);
+  if (passwordPolicyError) {
+    return res.status(400).json({ error: true, message: passwordPolicyError });
+  }
+
+  try {
+    const anonKey = process.env.SUPABASE_ANON_KEY || SUPABASE_SERVICE_KEY;
+    const updateRes = await fetch(`${SUPABASE_URL}/auth/v1/user`, {
+      method: 'PUT',
+      headers: {
+        'Content-Type': 'application/json',
+        apikey: anonKey,
+        Authorization: `Bearer ${accessToken}`
+      },
+      body: JSON.stringify({ password: nuevaClave })
+    });
+
+    const updateData = await updateRes.json().catch(() => ({}));
+    if (!updateRes.ok) {
+      return res.status(400).json({
+        error: true,
+        message: 'El enlace de recuperación no es válido o expiró.'
+      });
+    }
+
+    const authUserId = updateData?.id;
+    if (authUserId) {
+      const userRes = await pool.query(
+        `SELECT ia.id_usuario
+         FROM identidades_auth ia
+         WHERE ia.auth_user_id = $1
+         LIMIT 1`,
+        [authUserId]
+      );
+
+      if (userRes.rows.length > 0) {
+        await closeAllUserSessions(userRes.rows[0].id_usuario, 'password_reset').catch(() => {});
+      }
+    }
+
+    return res.json({ message: 'Contraseña actualizada correctamente.' });
+  } catch (_error) {
+    console.error('[public/reset-password] Failed to reset password');
+    return res.status(500).json({ error: true, message: 'No se pudo restablecer la contraseña.' });
   }
 });
 

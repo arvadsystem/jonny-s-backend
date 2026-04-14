@@ -9,6 +9,7 @@ import { resolveRequestUserSucursalScope } from '../utils/sucursalScope.js';
 
 const router = express.Router();
 const CAJAS_SCOPE_PERMISSION = 'VENTAS_CAJAS_MULTISUCURSAL_VER';
+const ADMIN_ROLE_CODES = ['ADMIN', 'ADMINISTRADOR', 'SUPER_ADMIN'];
 
 const CATALOGS = Object.freeze({
   SESSION_STATES: { table: 'public.cat_cajas_sesiones_estados', id: 'id_estado_sesion_caja' },
@@ -26,6 +27,7 @@ const USER_DISPLAY_SQL = `
     u.nombre_usuario
   )
 `;
+const ROLE_NORMALIZED_SQL = `UPPER(REGEXP_REPLACE(TRIM(r.nombre), '[\\s-]+', '_', 'g'))`;
 
 const parsePositiveInt = (value) => {
   const parsed = Number.parseInt(String(value ?? ''), 10);
@@ -50,6 +52,17 @@ const normalizeText = (value, maxLength = 500) => {
 
 const parseBooleanish = (value) =>
   value === true || value === 'true' || value === 1 || value === '1';
+
+const parseBooleanWithDefault = (value, fallback = false) => {
+  if (value === undefined || value === null || value === '') return Boolean(fallback);
+  return parseBooleanish(value);
+};
+
+const normalizeCajaCode = (value, maxLength = 40) => {
+  const normalized = normalizeText(value, maxLength);
+  if (!normalized) return null;
+  return normalized.toUpperCase();
+};
 
 const createCajaError = (httpStatus, code, publicMessage) => {
   const error = new Error(publicMessage);
@@ -151,10 +164,309 @@ const assertSucursalAllowed = (scopeContext, idSucursal) => {
 };
 
 const ensureAdminOrSuperAdmin = async (req) => {
-  const isAllowed = await requestHasAnyRole(req, ['ADMIN', 'SUPER_ADMIN']);
+  const isAllowed = await requestHasAnyRole(req, ADMIN_ROLE_CODES);
   if (!isAllowed) {
     throw createCajaError(403, 'VENTAS_CAJAS_ROLE_FORBIDDEN', 'Accion exclusiva para ADMIN o SUPER_ADMIN.');
   }
+};
+
+const ensureActiveAssignmentBusinessRules = async (
+  client,
+  {
+    idCaja,
+    idUsuario,
+    idSucursal,
+    puedeResponsable,
+    estado = true,
+    excludeAssignmentId = null
+  }
+) => {
+  if (!parseBooleanish(estado)) return;
+
+  const userConflictResult = await client.query(
+    `
+      SELECT cua.id_caja_usuario_autorizado
+      FROM public.cajas_usuarios_autorizados cua
+      INNER JOIN public.cajas c ON c.id_caja = cua.id_caja
+      WHERE cua.id_usuario = $1
+        AND cua.id_caja <> $2
+        AND COALESCE(cua.estado, true) = true
+        AND COALESCE(c.estado, true) = true
+        AND ($3::int IS NULL OR cua.id_caja_usuario_autorizado <> $3)
+      LIMIT 1
+      FOR UPDATE
+    `,
+    [idUsuario, idCaja, excludeAssignmentId]
+  );
+  if (userConflictResult.rowCount > 0) {
+    throw createCajaError(
+      409,
+      'VENTAS_CAJAS_ASSIGN_USER_ACTIVE_DUPLICATE',
+      'El usuario ya tiene otra caja activa asignada.'
+    );
+  }
+
+  if (!parseBooleanish(puedeResponsable)) return;
+
+  const responsibleConflictResult = await client.query(
+    `
+      SELECT cua.id_caja_usuario_autorizado
+      FROM public.cajas_usuarios_autorizados cua
+      INNER JOIN public.usuarios u ON u.id_usuario = cua.id_usuario
+      INNER JOIN public.empleados e ON e.id_empleado = u.id_empleado
+      INNER JOIN public.cajas c ON c.id_caja = cua.id_caja
+      WHERE cua.id_caja = $1
+        AND COALESCE(cua.estado, true) = true
+        AND COALESCE(cua.puede_responsable, false) = true
+        AND COALESCE(c.estado, true) = true
+        AND e.id_sucursal = $2
+        AND ($3::int IS NULL OR cua.id_caja_usuario_autorizado <> $3)
+      LIMIT 1
+      FOR UPDATE
+    `,
+    [idCaja, idSucursal, excludeAssignmentId]
+  );
+  if (responsibleConflictResult.rowCount > 0) {
+    throw createCajaError(
+      409,
+      'VENTAS_CAJAS_ASSIGN_RESPONSABLE_DUPLICATE',
+      'La caja ya tiene un responsable activo asignado.'
+    );
+  }
+};
+
+const fetchCajeroEmployeeById = async (client, idUsuario) => {
+  const result = await client.query(
+    `
+      SELECT DISTINCT u.id_usuario, u.nombre_usuario, e.id_empleado, e.id_sucursal,
+             COALESCE(
+               NULLIF(TRIM(CONCAT_WS(' ', per.nombre, per.apellido)), ''),
+               u.nombre_usuario
+             ) AS nombre_completo
+      FROM public.usuarios u
+      INNER JOIN public.empleados e ON e.id_empleado = u.id_empleado
+      INNER JOIN public.roles_usuarios ru ON ru.id_usuario = u.id_usuario
+      INNER JOIN public.roles r ON r.id_rol = ru.id_rol
+      LEFT JOIN public.personas per ON per.id_persona = e.id_persona
+       WHERE u.id_usuario = $1
+         AND COALESCE(u.estado, true) = true
+         AND COALESCE(e.estado, true) = true
+         AND ${ROLE_NORMALIZED_SQL} = 'CAJERO'
+       LIMIT 1
+     `,
+    [idUsuario]
+  );
+  return result.rows[0] || null;
+};
+
+const userBelongsToSucursal = async (client, idUsuario, idSucursal) => {
+  const targetSucursal = parsePositiveInt(idSucursal);
+  if (!targetSucursal) return false;
+
+  const allowedIds = new Set();
+  const appendRows = (rows) => {
+    (Array.isArray(rows) ? rows : []).forEach((row) => {
+      const parsed = parsePositiveInt(row?.id_sucursal);
+      if (parsed) allowedIds.add(parsed);
+    });
+  };
+
+  const baseResult = await client.query(
+    `
+      SELECT e.id_sucursal
+      FROM public.usuarios u
+      INNER JOIN public.empleados e ON e.id_empleado = u.id_empleado
+      WHERE u.id_usuario = $1
+        AND e.id_sucursal IS NOT NULL
+    `,
+    [idUsuario]
+  );
+  appendRows(baseResult.rows);
+
+  const optionalQueries = [
+    {
+      relation: 'public.v_usuarios_sucursales_scope',
+      sql: `
+        SELECT vus.id_sucursal
+        FROM public.v_usuarios_sucursales_scope vus
+        WHERE vus.id_usuario = $1
+      `
+    },
+    {
+      relation: 'public.empleados_sucursales',
+      sql: `
+        SELECT es.id_sucursal
+        FROM public.usuarios u
+        INNER JOIN public.empleados_sucursales es ON es.id_empleado = u.id_empleado
+        WHERE u.id_usuario = $1
+      `
+    },
+    {
+      relation: 'public.usuarios_sucursales',
+      sql: `
+        SELECT us.id_sucursal
+        FROM public.usuarios_sucursales us
+        WHERE us.id_usuario = $1
+      `
+    }
+  ];
+
+  for (const queryDef of optionalQueries) {
+    const relationResult = await client.query('SELECT to_regclass($1) AS relation_name', [queryDef.relation]);
+    if (!relationResult.rows?.[0]?.relation_name) {
+      continue;
+    }
+
+    const result = await client.query(queryDef.sql, [idUsuario]);
+    appendRows(result.rows);
+  }
+
+  return allowedIds.has(targetSucursal);
+};
+
+const assertUserBelongsToSucursal = async (client, idUsuario, idSucursal) => {
+  const belongs = await userBelongsToSucursal(client, idUsuario, idSucursal);
+  if (!belongs) {
+    throw createCajaError(
+      409,
+      'VENTAS_CAJAS_USER_SCOPE_MISMATCH',
+      'El usuario seleccionado no pertenece a la sucursal operativa de la caja.'
+    );
+  }
+};
+
+const upsertCajaAuthorization = async (
+  client,
+  {
+    idCaja,
+    idSucursal,
+    idUsuario,
+    puedeResponsable = true,
+    puedeAuxiliar = true,
+    observacion = null
+  }
+) => {
+  const normalizedObservacion = normalizeText(observacion, 300);
+  const activeResult = await client.query(
+    `
+      SELECT id_caja_usuario_autorizado
+      FROM public.cajas_usuarios_autorizados
+      WHERE id_caja = $1
+        AND id_usuario = $2
+        AND COALESCE(estado, true) = true
+      LIMIT 1
+      FOR UPDATE
+    `,
+    [idCaja, idUsuario]
+  );
+
+  const excludedAssignmentId = Number(activeResult.rows?.[0]?.id_caja_usuario_autorizado || 0) || null;
+  await ensureActiveAssignmentBusinessRules(client, {
+    idCaja,
+    idUsuario,
+    idSucursal,
+    puedeResponsable,
+    estado: true,
+    excludeAssignmentId: excludedAssignmentId
+  });
+
+  if (activeResult.rowCount > 0) {
+    const idAsignacion = Number(activeResult.rows[0].id_caja_usuario_autorizado);
+    await client.query(
+      `
+        UPDATE public.cajas_usuarios_autorizados
+        SET id_sucursal = $1,
+            puede_responsable = $2,
+            puede_auxiliar = $3,
+            observacion = $4,
+            fecha_actualizacion = NOW()
+        WHERE id_caja_usuario_autorizado = $5
+      `,
+      [idSucursal, Boolean(puedeResponsable), Boolean(puedeAuxiliar), normalizedObservacion, idAsignacion]
+    );
+    return idAsignacion;
+  }
+
+  const inactiveResult = await client.query(
+    `
+      SELECT id_caja_usuario_autorizado
+      FROM public.cajas_usuarios_autorizados
+      WHERE id_caja = $1
+        AND id_usuario = $2
+        AND COALESCE(estado, true) = false
+      ORDER BY id_caja_usuario_autorizado DESC
+      LIMIT 1
+      FOR UPDATE
+    `,
+    [idCaja, idUsuario]
+  );
+
+  if (inactiveResult.rowCount > 0) {
+    const idAsignacion = Number(inactiveResult.rows[0].id_caja_usuario_autorizado);
+    await client.query(
+      `
+        UPDATE public.cajas_usuarios_autorizados
+        SET id_sucursal = $1,
+            puede_responsable = $2,
+            puede_auxiliar = $3,
+            estado = true,
+            observacion = $4,
+            fecha_actualizacion = NOW()
+        WHERE id_caja_usuario_autorizado = $5
+      `,
+      [idSucursal, Boolean(puedeResponsable), Boolean(puedeAuxiliar), normalizedObservacion, idAsignacion]
+    );
+    return idAsignacion;
+  }
+
+  const insertResult = await client.query(
+    `
+      INSERT INTO public.cajas_usuarios_autorizados (
+        id_caja,
+        id_sucursal,
+        id_usuario,
+        puede_responsable,
+        puede_auxiliar,
+        estado,
+        observacion,
+        fecha_creacion,
+        fecha_actualizacion
+      )
+      VALUES ($1, $2, $3, $4, $5, true, $6, NOW(), NOW())
+      RETURNING id_caja_usuario_autorizado
+    `,
+    [
+      idCaja,
+      idSucursal,
+      idUsuario,
+      Boolean(puedeResponsable),
+      Boolean(puedeAuxiliar),
+      normalizedObservacion
+    ]
+  );
+
+  return Number(insertResult.rows?.[0]?.id_caja_usuario_autorizado || 0) || null;
+};
+
+const fetchCajaDefaultResponsible = async (client, idCaja, idSucursal) => {
+  const result = await client.query(
+    `
+      SELECT cua.id_usuario
+      FROM public.cajas_usuarios_autorizados cua
+      INNER JOIN public.usuarios u ON u.id_usuario = cua.id_usuario
+      INNER JOIN public.empleados e ON e.id_empleado = u.id_empleado
+      WHERE cua.id_caja = $1
+        AND cua.id_sucursal = $2
+        AND COALESCE(cua.estado, true) = true
+        AND COALESCE(cua.puede_responsable, false) = true
+        AND COALESCE(u.estado, true) = true
+        AND COALESCE(e.estado, true) = true
+      ORDER BY cua.fecha_actualizacion DESC, cua.id_caja_usuario_autorizado DESC
+      LIMIT 1
+    `,
+    [idCaja, idSucursal]
+  );
+  return Number(result.rows?.[0]?.id_usuario || 0) || null;
 };
 
 const fetchCajaById = async (client, idCaja) => {
@@ -255,7 +567,7 @@ const ensureSessionParticipant = async (
     return participant;
   }
 
-  if (allowAdminBypass && req && (await requestHasAnyRole(req, ['ADMIN', 'SUPER_ADMIN']))) {
+  if (allowAdminBypass && req && (await requestHasAnyRole(req, ADMIN_ROLE_CODES))) {
     return null;
   }
 
@@ -455,6 +767,724 @@ router.get('/ventas/cajas/catalogos', checkPermission(['VENTAS_CAJAS_MODULO_VER'
   }
 });
 
+router.get('/ventas/cajas/usuarios', checkPermission(['VENTAS_CAJAS_LISTADO_VER', 'VENTAS_CAJAS_PARTICIPANTES_GESTIONAR']), async (req, res) => {
+  try {
+    const requestedSucursalId = parseNullablePositiveInt(req.query.id_sucursal);
+    const scopeContext = await getScopeContext(req, pool, requestedSucursalId, true);
+    const targetSucursalId = parsePositiveInt(scopeContext.targetSucursalId || requestedSucursalId);
+
+    if (!targetSucursalId) {
+      throw createCajaError(400, 'VENTAS_CAJAS_SCOPE_REQUIRED', 'Debe indicar una sucursal para listar usuarios.');
+    }
+    assertSucursalAllowed(scopeContext, targetSucursalId);
+
+    const result = await pool.query(
+      `
+        SELECT DISTINCT u.id_usuario, u.nombre_usuario,
+               COALESCE(
+                 NULLIF(TRIM(CONCAT_WS(' ', per.nombre, per.apellido)), ''),
+                 u.nombre_usuario
+               ) AS nombre_completo
+        FROM public.usuarios u
+        INNER JOIN public.empleados e ON e.id_empleado = u.id_empleado
+        INNER JOIN public.roles_usuarios ru ON ru.id_usuario = u.id_usuario
+        INNER JOIN public.roles r ON r.id_rol = ru.id_rol
+        LEFT JOIN public.personas per ON per.id_persona = e.id_persona
+        WHERE COALESCE(u.estado, true) = true
+          AND COALESCE(e.estado, true) = true
+          AND e.id_sucursal = $1
+          AND ${ROLE_NORMALIZED_SQL} = 'CAJERO'
+        ORDER BY nombre_completo ASC
+      `,
+      [targetSucursalId]
+    );
+
+    return res.status(200).json(result.rows);
+  } catch (err) {
+    return sendInternalError(res, err, 'VENTAS_CAJAS_USERS_LIST_ERROR', 'No se pudieron listar los usuarios disponibles.');
+  }
+});
+
+router.get('/ventas/cajas/listado', checkPermission(['VENTAS_CAJAS_LISTADO_VER']), async (req, res) => {
+  try {
+    const requestedSucursalId = parseNullablePositiveInt(req.query.id_sucursal);
+    const scopeContext = await getScopeContext(req, pool, requestedSucursalId, true);
+    const includeInactive = parseBooleanWithDefault(req.query.incluir_inactivas, false);
+    const search = normalizeText(req.query.search, 100)?.toUpperCase() || '';
+
+    const filters = [];
+    const params = [];
+    const pushFilter = (fragment, value) => {
+      params.push(value);
+      filters.push(fragment.replace('$IDX', `$${params.length}`));
+    };
+
+    if (scopeContext.targetSucursalId) {
+      pushFilter('c.id_sucursal = $IDX', scopeContext.targetSucursalId);
+    } else if (!scopeContext.isSuperAdmin) {
+      pushFilter('c.id_sucursal = ANY($IDX::int[])', scopeContext.allowedSucursalIds);
+    }
+
+    if (!includeInactive) {
+      filters.push('COALESCE(c.estado, true) = true');
+    }
+    if (search) {
+      pushFilter(
+        `(UPPER(COALESCE(c.codigo_caja, '')) LIKE '%' || $IDX || '%' OR UPPER(COALESCE(c.nombre_caja, '')) LIKE '%' || $IDX || '%')`,
+        search
+      );
+    }
+
+    const whereClause = filters.length ? `WHERE ${filters.join(' AND ')}` : '';
+    const result = await pool.query(
+      `
+        SELECT c.id_caja, c.id_sucursal, c.codigo_caja, c.nombre_caja, c.observacion,
+               COALESCE(c.permite_auxiliares, true) AS permite_auxiliares,
+               COALESCE(c.estado, true) AS estado,
+               c.fecha_actualizacion,
+               s.nombre_sucursal,
+               COALESCE(assign.asignaciones_activas, 0) AS asignaciones_activas,
+               COALESCE(assign.responsables_activos, 0) AS responsables_activos,
+               COALESCE(assign.auxiliares_activos, 0) AS auxiliares_activos
+        FROM public.cajas c
+        INNER JOIN public.sucursales s ON s.id_sucursal = c.id_sucursal
+        LEFT JOIN LATERAL (
+          SELECT
+            COUNT(*) FILTER (WHERE COALESCE(cua.estado, true) = true) AS asignaciones_activas,
+            COUNT(*) FILTER (
+              WHERE COALESCE(cua.estado, true) = true
+                AND COALESCE(cua.puede_responsable, false) = true
+            ) AS responsables_activos,
+            COUNT(*) FILTER (
+              WHERE COALESCE(cua.estado, true) = true
+                AND COALESCE(cua.puede_auxiliar, false) = true
+            ) AS auxiliares_activos
+          FROM public.cajas_usuarios_autorizados cua
+          WHERE cua.id_caja = c.id_caja
+        ) assign ON true
+        ${whereClause}
+        ORDER BY c.id_sucursal ASC, c.nombre_caja ASC, c.id_caja ASC
+      `,
+      params
+    );
+
+    return res.status(200).json(result.rows);
+  } catch (err) {
+    return sendInternalError(res, err, 'VENTAS_CAJAS_CATALOG_LIST_ERROR', 'No se pudo listar el catalogo de cajas.');
+  }
+});
+
+router.get('/ventas/cajas/listado/:id', checkPermission(['VENTAS_CAJAS_LISTADO_VER', 'VENTAS_CAJAS_DETALLE_VER']), async (req, res) => {
+  try {
+    const idCaja = parsePositiveInt(req.params.id);
+    if (!idCaja) throw createCajaError(400, 'VENTAS_CAJAS_CAJA_ID_INVALID', 'El id de caja es invalido.');
+
+    const scopeContext = await getScopeContext(req, pool, null, true);
+    const caja = await pool.query(
+      `
+        SELECT c.id_caja, c.id_sucursal, c.codigo_caja, c.nombre_caja, c.observacion,
+               COALESCE(c.permite_auxiliares, true) AS permite_auxiliares,
+               COALESCE(c.estado, true) AS estado,
+               c.fecha_actualizacion, s.nombre_sucursal
+        FROM public.cajas c
+        INNER JOIN public.sucursales s ON s.id_sucursal = c.id_sucursal
+        WHERE c.id_caja = $1
+        LIMIT 1
+      `,
+      [idCaja]
+    );
+
+    if (caja.rowCount === 0) {
+      throw createCajaError(404, 'VENTAS_CAJAS_CAJA_NOT_FOUND', 'La caja seleccionada no existe.');
+    }
+
+    const rowCaja = caja.rows[0];
+    assertSucursalAllowed(scopeContext, rowCaja.id_sucursal);
+
+    const asignaciones = await pool.query(
+      `
+        SELECT cua.id_caja_usuario_autorizado, cua.id_caja, cua.id_sucursal, cua.id_usuario,
+               COALESCE(cua.puede_responsable, false) AS puede_responsable,
+               COALESCE(cua.puede_auxiliar, false) AS puede_auxiliar,
+               COALESCE(cua.estado, true) AS estado,
+               cua.observacion, cua.fecha_creacion, cua.fecha_actualizacion,
+               u.nombre_usuario,
+               COALESCE(
+                 NULLIF(TRIM(CONCAT_WS(' ', per.nombre, per.apellido)), ''),
+                 u.nombre_usuario
+               ) AS nombre_completo
+        FROM public.cajas_usuarios_autorizados cua
+        INNER JOIN public.usuarios u ON u.id_usuario = cua.id_usuario
+        LEFT JOIN public.empleados e ON e.id_empleado = u.id_empleado
+        LEFT JOIN public.personas per ON per.id_persona = e.id_persona
+        WHERE cua.id_caja = $1
+        ORDER BY COALESCE(cua.estado, true) DESC, cua.fecha_actualizacion DESC, cua.id_caja_usuario_autorizado DESC
+      `,
+      [idCaja]
+    );
+
+    return res.status(200).json({ caja: rowCaja, asignaciones: asignaciones.rows });
+  } catch (err) {
+    return sendInternalError(res, err, 'VENTAS_CAJAS_CATALOG_DETAIL_ERROR', 'No se pudo obtener el detalle de la caja.');
+  }
+});
+
+router.post('/ventas/cajas/listado', checkPermission(['VENTAS_CAJAS_PARTICIPANTES_GESTIONAR']), async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await ensureAdminOrSuperAdmin(req);
+
+    const requestedSucursalId = parseNullablePositiveInt(req.body.id_sucursal);
+    const scopeContext = await getScopeContext(req, client, requestedSucursalId, true);
+    const targetSucursalId = parsePositiveInt(scopeContext.targetSucursalId || requestedSucursalId);
+
+    if (!targetSucursalId) {
+      throw createCajaError(400, 'VENTAS_CAJAS_SCOPE_REQUIRED', 'Debe indicar la sucursal para crear la caja.');
+    }
+    assertSucursalAllowed(scopeContext, targetSucursalId);
+
+    const nombreCaja = normalizeText(req.body.nombre_caja, 120);
+    const codigoCaja = normalizeCajaCode(req.body.codigo_caja, 40);
+    const observacion = normalizeText(req.body.observacion, 300);
+    const permiteAuxiliares = parseBooleanWithDefault(req.body.permite_auxiliares, true);
+
+    if (!nombreCaja) {
+      throw createCajaError(400, 'VENTAS_CAJAS_NAME_REQUIRED', 'Debe indicar el nombre de la caja.');
+    }
+
+    if (codigoCaja) {
+      const duplicateCode = await client.query(
+        `
+          SELECT id_caja
+          FROM public.cajas
+          WHERE id_sucursal = $1
+            AND UPPER(TRIM(COALESCE(codigo_caja, ''))) = $2
+          LIMIT 1
+          FOR UPDATE
+        `,
+        [targetSucursalId, codigoCaja]
+      );
+      if (duplicateCode.rowCount > 0) {
+        throw createCajaError(409, 'VENTAS_CAJAS_CODE_DUPLICATE', 'Ya existe una caja con ese codigo en la sucursal seleccionada.');
+      }
+    }
+
+    const insertCajaResult = await client.query(
+      `
+        INSERT INTO public.cajas (
+          id_sucursal, id_usuario, codigo_caja, nombre_caja, observacion,
+          permite_auxiliares, estado, fecha_actualizacion
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, true, NOW())
+        RETURNING id_caja
+      `,
+      [targetSucursalId, scopeContext.idUsuario, codigoCaja, nombreCaja, observacion, permiteAuxiliares]
+    );
+    const idCaja = Number(insertCajaResult.rows?.[0]?.id_caja || 0) || null;
+    if (!idCaja) {
+      throw createCajaError(500, 'VENTAS_CAJAS_INSERT_ID_ERROR', 'No se pudo determinar el identificador de la caja creada.');
+    }
+
+    const asignacionInicial = req.body.asignacion_inicial && typeof req.body.asignacion_inicial === 'object'
+      ? req.body.asignacion_inicial
+      : {};
+    const idUsuarioAsignado = parseNullablePositiveInt(asignacionInicial.id_usuario);
+
+    let idCajaUsuarioAutorizado = null;
+    if (idUsuarioAsignado) {
+      const user = await fetchCajeroEmployeeById(client, idUsuarioAsignado);
+      if (!user) {
+        throw createCajaError(
+          404,
+          'VENTAS_CAJAS_ASSIGN_USER_NOT_FOUND',
+          'El usuario indicado debe ser un empleado activo con rol CAJERO.'
+        );
+      }
+      if (Number.parseInt(String(user.id_sucursal || ''), 10) !== targetSucursalId) {
+        throw createCajaError(
+          409,
+          'VENTAS_CAJAS_USER_SCOPE_MISMATCH',
+          'El usuario seleccionado no pertenece a la sucursal operativa de la caja.'
+        );
+      }
+
+      const puedeResponsable = parseBooleanWithDefault(asignacionInicial.puede_responsable, true);
+      const puedeAuxiliar = parseBooleanWithDefault(asignacionInicial.puede_auxiliar, true);
+      if (!puedeResponsable && !puedeAuxiliar) {
+        throw createCajaError(400, 'VENTAS_CAJAS_ASSIGN_ROLE_REQUIRED', 'La asignacion debe habilitar al menos un rol operativo.');
+      }
+
+      idCajaUsuarioAutorizado = await upsertCajaAuthorization(client, {
+        idCaja,
+        idSucursal: targetSucursalId,
+        idUsuario: idUsuarioAsignado,
+        puedeResponsable,
+        puedeAuxiliar,
+        observacion: asignacionInicial.observacion
+      });
+    }
+
+    const abrirSesionPayload = req.body.abrir_sesion && typeof req.body.abrir_sesion === 'object'
+      ? req.body.abrir_sesion
+      : null;
+    const shouldOpenSession = parseBooleanWithDefault(
+      abrirSesionPayload ? abrirSesionPayload.habilitar : req.body.abrir_sesion,
+      false
+    );
+
+    let idSesionCaja = null;
+    if (shouldOpenSession) {
+      const responsableId =
+        parseNullablePositiveInt(abrirSesionPayload?.id_usuario_responsable)
+        || idUsuarioAsignado
+        || scopeContext.idUsuario;
+      const montoApertura = parseNonNegativeAmount(abrirSesionPayload?.monto_apertura ?? 0);
+      const observacionApertura = normalizeText(abrirSesionPayload?.observacion_apertura, 500);
+      if (montoApertura === null) {
+        throw createCajaError(400, 'VENTAS_CAJAS_APERTURA_AMOUNT_INVALID', 'monto_apertura debe ser un numero mayor o igual a 0.');
+      }
+
+      const responsableUser = await fetchCajeroEmployeeById(client, responsableId);
+      if (!responsableUser) {
+        throw createCajaError(
+          404,
+          'VENTAS_CAJAS_RESPONSABLE_NOT_FOUND',
+          'El responsable indicado debe ser un empleado activo con rol CAJERO.'
+        );
+      }
+      if (Number.parseInt(String(responsableUser.id_sucursal || ''), 10) !== targetSucursalId) {
+        throw createCajaError(
+          409,
+          'VENTAS_CAJAS_USER_SCOPE_MISMATCH',
+          'El responsable seleccionado no pertenece a la sucursal operativa de la caja.'
+        );
+      }
+
+      await upsertCajaAuthorization(client, {
+        idCaja,
+        idSucursal: targetSucursalId,
+        idUsuario: responsableId,
+        puedeResponsable: true,
+        puedeAuxiliar: true,
+        observacion: 'Asignacion automatica para apertura inicial'
+      });
+
+      idSesionCaja = await createOpenSessionTransaction({
+        client,
+        scopeContext,
+        idCaja,
+        responsableId,
+        montoApertura,
+        observacionApertura
+      });
+    }
+
+    await client.query('COMMIT');
+    return res.status(201).json({
+      message: shouldOpenSession
+        ? 'Caja creada, asignada y sesion abierta correctamente.'
+        : 'Caja creada correctamente.',
+      id_caja: idCaja,
+      id_caja_usuario_autorizado: idCajaUsuarioAutorizado,
+      id_sesion_caja: idSesionCaja
+    });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    if (Number.isInteger(err?.httpStatus) && err.httpStatus >= 400 && err.httpStatus < 500) {
+      return res.status(err.httpStatus).json({
+        error: true,
+        code: err.code || 'VENTAS_CAJAS_CATALOG_CREATE_ERROR',
+        message: err.publicMessage || 'No se pudo crear la caja.'
+      });
+    }
+    console.error('[cajas] create listado error:', err);
+    return res.status(500).json({
+      error: true,
+      code: 'VENTAS_CAJAS_CATALOG_CREATE_ERROR',
+      message: 'No se pudo crear la caja.'
+    });
+  } finally {
+    client.release();
+  }
+});
+
+router.patch('/ventas/cajas/listado/:id', checkPermission(['VENTAS_CAJAS_PARTICIPANTES_GESTIONAR']), async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await ensureAdminOrSuperAdmin(req);
+
+    const idCaja = parsePositiveInt(req.params.id);
+    if (!idCaja) throw createCajaError(400, 'VENTAS_CAJAS_CAJA_ID_INVALID', 'El id de caja es invalido.');
+
+    const cajaResult = await client.query(
+      `
+        SELECT id_caja, id_sucursal, codigo_caja, nombre_caja, observacion,
+               COALESCE(estado, true) AS estado,
+               COALESCE(permite_auxiliares, true) AS permite_auxiliares
+        FROM public.cajas
+        WHERE id_caja = $1
+        LIMIT 1
+        FOR UPDATE
+      `,
+      [idCaja]
+    );
+    if (cajaResult.rowCount === 0) {
+      throw createCajaError(404, 'VENTAS_CAJAS_CAJA_NOT_FOUND', 'La caja seleccionada no existe.');
+    }
+
+    const currentCaja = cajaResult.rows[0];
+    const requestedSucursalId = parseNullablePositiveInt(req.body.id_sucursal) || currentCaja.id_sucursal;
+    const scopeContext = await getScopeContext(req, client, requestedSucursalId, true);
+    assertSucursalAllowed(scopeContext, requestedSucursalId);
+
+    const hasNombre = Object.prototype.hasOwnProperty.call(req.body, 'nombre_caja');
+    const hasCodigo = Object.prototype.hasOwnProperty.call(req.body, 'codigo_caja');
+    const hasEstado = Object.prototype.hasOwnProperty.call(req.body, 'estado');
+    const hasObservacion = Object.prototype.hasOwnProperty.call(req.body, 'observacion');
+    const hasPermiteAuxiliares = Object.prototype.hasOwnProperty.call(req.body, 'permite_auxiliares');
+    const hasSucursal = Object.prototype.hasOwnProperty.call(req.body, 'id_sucursal');
+
+    if (!hasNombre && !hasCodigo && !hasEstado && !hasObservacion && !hasPermiteAuxiliares && !hasSucursal) {
+      throw createCajaError(400, 'VENTAS_CAJAS_UPDATE_EMPTY', 'Debe enviar al menos un campo para actualizar.');
+    }
+
+    const nombreCaja = hasNombre ? normalizeText(req.body.nombre_caja, 120) : currentCaja.nombre_caja;
+    const codigoCaja = hasCodigo ? normalizeCajaCode(req.body.codigo_caja, 40) : currentCaja.codigo_caja;
+    const observacion = hasObservacion ? normalizeText(req.body.observacion, 300) : currentCaja.observacion;
+    const estado = hasEstado ? parseBooleanWithDefault(req.body.estado, true) : parseBooleanWithDefault(currentCaja.estado, true);
+    const permiteAuxiliares = hasPermiteAuxiliares
+      ? parseBooleanWithDefault(req.body.permite_auxiliares, true)
+      : parseBooleanWithDefault(currentCaja.permite_auxiliares, true);
+
+    if (!nombreCaja) {
+      throw createCajaError(400, 'VENTAS_CAJAS_NAME_REQUIRED', 'Debe indicar el nombre de la caja.');
+    }
+
+    if (codigoCaja) {
+      const duplicateCode = await client.query(
+        `
+          SELECT id_caja
+          FROM public.cajas
+          WHERE id_sucursal = $1
+            AND UPPER(TRIM(COALESCE(codigo_caja, ''))) = $2
+            AND id_caja <> $3
+          LIMIT 1
+          FOR UPDATE
+        `,
+        [requestedSucursalId, codigoCaja, idCaja]
+      );
+      if (duplicateCode.rowCount > 0) {
+        throw createCajaError(409, 'VENTAS_CAJAS_CODE_DUPLICATE', 'Ya existe una caja con ese codigo en la sucursal seleccionada.');
+      }
+    }
+
+    await client.query(
+      `
+        UPDATE public.cajas
+        SET id_sucursal = $1,
+            codigo_caja = $2,
+            nombre_caja = $3,
+            observacion = $4,
+            estado = $5,
+            permite_auxiliares = $6,
+            fecha_actualizacion = NOW()
+        WHERE id_caja = $7
+      `,
+      [requestedSucursalId, codigoCaja, nombreCaja, observacion, estado, permiteAuxiliares, idCaja]
+    );
+
+    await client.query('COMMIT');
+    return res.status(200).json({ message: 'Caja actualizada correctamente.' });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    return sendInternalError(res, err, 'VENTAS_CAJAS_CATALOG_UPDATE_ERROR', 'No se pudo actualizar la caja.');
+  } finally {
+    client.release();
+  }
+});
+
+router.get('/ventas/cajas/asignaciones', checkPermission(['VENTAS_CAJAS_LISTADO_VER', 'VENTAS_CAJAS_PARTICIPANTES_GESTIONAR']), async (req, res) => {
+  try {
+    const requestedSucursalId = parseNullablePositiveInt(req.query.id_sucursal);
+    const scopeContext = await getScopeContext(req, pool, requestedSucursalId, true);
+    const idCaja = parseNullablePositiveInt(req.query.id_caja);
+    const includeInactive = parseBooleanWithDefault(req.query.incluir_inactivas, false);
+    const includeInactiveCajas = parseBooleanWithDefault(req.query.incluir_cajas_inactivas, false);
+
+    if (idCaja) {
+      const caja = await fetchCajaById(pool, idCaja);
+      if (!caja) throw createCajaError(404, 'VENTAS_CAJAS_CAJA_NOT_FOUND', 'La caja seleccionada no existe.');
+      assertSucursalAllowed(scopeContext, caja.id_sucursal);
+    }
+
+    const filters = [];
+    const params = [];
+    const pushFilter = (fragment, value) => {
+      params.push(value);
+      filters.push(fragment.replace('$IDX', `$${params.length}`));
+    };
+
+    if (scopeContext.targetSucursalId) {
+      pushFilter('cua.id_sucursal = $IDX', scopeContext.targetSucursalId);
+    } else if (!scopeContext.isSuperAdmin) {
+      pushFilter('cua.id_sucursal = ANY($IDX::int[])', scopeContext.allowedSucursalIds);
+    }
+    if (!includeInactive) {
+      filters.push('COALESCE(cua.estado, true) = true');
+    }
+    if (!includeInactiveCajas) {
+      filters.push('COALESCE(c.estado, true) = true');
+    }
+    if (idCaja) {
+      pushFilter('cua.id_caja = $IDX', idCaja);
+    }
+
+    const whereClause = filters.length ? `WHERE ${filters.join(' AND ')}` : '';
+    const result = await pool.query(
+      `
+        SELECT cua.id_caja_usuario_autorizado, cua.id_caja, cua.id_sucursal, cua.id_usuario,
+               COALESCE(cua.puede_responsable, false) AS puede_responsable,
+               COALESCE(cua.puede_auxiliar, false) AS puede_auxiliar,
+               COALESCE(cua.estado, true) AS estado,
+               cua.observacion, cua.fecha_creacion, cua.fecha_actualizacion,
+               c.codigo_caja, c.nombre_caja,
+               s.nombre_sucursal,
+               u.nombre_usuario,
+               COALESCE(
+                 NULLIF(TRIM(CONCAT_WS(' ', per.nombre, per.apellido)), ''),
+                 u.nombre_usuario
+               ) AS nombre_completo
+        FROM public.cajas_usuarios_autorizados cua
+        INNER JOIN public.cajas c ON c.id_caja = cua.id_caja
+        INNER JOIN public.sucursales s ON s.id_sucursal = cua.id_sucursal
+        INNER JOIN public.usuarios u ON u.id_usuario = cua.id_usuario
+        LEFT JOIN public.empleados e ON e.id_empleado = u.id_empleado
+        LEFT JOIN public.personas per ON per.id_persona = e.id_persona
+        ${whereClause}
+        ORDER BY COALESCE(cua.estado, true) DESC, c.nombre_caja ASC, nombre_completo ASC
+      `,
+      params
+    );
+
+    return res.status(200).json(result.rows);
+  } catch (err) {
+    return sendInternalError(res, err, 'VENTAS_CAJAS_ASSIGNMENTS_LIST_ERROR', 'No se pudieron listar las asignaciones de cajas.');
+  }
+});
+
+router.post('/ventas/cajas/asignaciones', checkPermission(['VENTAS_CAJAS_PARTICIPANTES_GESTIONAR']), async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await ensureAdminOrSuperAdmin(req);
+
+    const idCaja = parsePositiveInt(req.body.id_caja);
+    const idUsuario = parsePositiveInt(req.body.id_usuario);
+    const puedeResponsable = parseBooleanWithDefault(req.body.puede_responsable, true);
+    const puedeAuxiliar = parseBooleanWithDefault(req.body.puede_auxiliar, true);
+    if (!idCaja || !idUsuario) {
+      throw createCajaError(400, 'VENTAS_CAJAS_ASSIGN_DATA_INVALID', 'Debe indicar una caja y un usuario validos.');
+    }
+    if (!puedeResponsable && !puedeAuxiliar) {
+      throw createCajaError(400, 'VENTAS_CAJAS_ASSIGN_ROLE_REQUIRED', 'Debe habilitar al menos un rol operativo.');
+    }
+
+    const caja = await fetchCajaById(client, idCaja);
+    if (!caja) throw createCajaError(404, 'VENTAS_CAJAS_CAJA_NOT_FOUND', 'La caja seleccionada no existe.');
+
+    const scopeContext = await getScopeContext(req, client, caja.id_sucursal, true);
+    assertSucursalAllowed(scopeContext, caja.id_sucursal);
+
+    const user = await fetchCajeroEmployeeById(client, idUsuario);
+    if (!user) {
+      throw createCajaError(
+        404,
+        'VENTAS_CAJAS_ASSIGN_USER_NOT_FOUND',
+        'El usuario indicado debe ser un empleado activo con rol CAJERO.'
+      );
+    }
+    if (Number.parseInt(String(user.id_sucursal || ''), 10) !== Number(caja.id_sucursal)) {
+      throw createCajaError(
+        409,
+        'VENTAS_CAJAS_USER_SCOPE_MISMATCH',
+        'El usuario seleccionado no pertenece a la sucursal operativa de la caja.'
+      );
+    }
+
+    await ensureActiveAssignmentBusinessRules(client, {
+      idCaja,
+      idUsuario,
+      idSucursal: caja.id_sucursal,
+      puedeResponsable,
+      estado: true,
+      excludeAssignmentId: null
+    });
+
+    const idCajaUsuarioAutorizado = await upsertCajaAuthorization(client, {
+      idCaja,
+      idSucursal: caja.id_sucursal,
+      idUsuario,
+      puedeResponsable,
+      puedeAuxiliar,
+      observacion: req.body.observacion
+    });
+
+    await client.query('COMMIT');
+    return res.status(201).json({
+      message: 'Asignacion de caja registrada correctamente.',
+      id_caja_usuario_autorizado: idCajaUsuarioAutorizado
+    });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    return sendInternalError(res, err, 'VENTAS_CAJAS_ASSIGN_CREATE_ERROR', 'No se pudo registrar la asignacion de caja.');
+  } finally {
+    client.release();
+  }
+});
+
+router.patch('/ventas/cajas/asignaciones/:id', checkPermission(['VENTAS_CAJAS_PARTICIPANTES_GESTIONAR']), async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await ensureAdminOrSuperAdmin(req);
+
+    const idAsignacion = parsePositiveInt(req.params.id);
+    if (!idAsignacion) {
+      throw createCajaError(400, 'VENTAS_CAJAS_ASSIGNMENT_ID_INVALID', 'El id de asignacion es invalido.');
+    }
+
+    const assignmentResult = await client.query(
+      `
+        SELECT id_caja_usuario_autorizado, id_caja, id_sucursal, id_usuario,
+               COALESCE(puede_responsable, false) AS puede_responsable,
+               COALESCE(puede_auxiliar, false) AS puede_auxiliar,
+               COALESCE(estado, true) AS estado,
+               observacion
+        FROM public.cajas_usuarios_autorizados
+        WHERE id_caja_usuario_autorizado = $1
+        LIMIT 1
+        FOR UPDATE
+      `,
+      [idAsignacion]
+    );
+    if (assignmentResult.rowCount === 0) {
+      throw createCajaError(404, 'VENTAS_CAJAS_ASSIGNMENT_NOT_FOUND', 'La asignacion indicada no existe.');
+    }
+
+    const assignment = assignmentResult.rows[0];
+    const scopeContext = await getScopeContext(req, client, assignment.id_sucursal, true);
+    assertSucursalAllowed(scopeContext, assignment.id_sucursal);
+
+    const hasPuedeResponsable = Object.prototype.hasOwnProperty.call(req.body, 'puede_responsable');
+    const hasPuedeAuxiliar = Object.prototype.hasOwnProperty.call(req.body, 'puede_auxiliar');
+    const hasEstado = Object.prototype.hasOwnProperty.call(req.body, 'estado');
+    const hasObservacion = Object.prototype.hasOwnProperty.call(req.body, 'observacion');
+
+    if (!hasPuedeResponsable && !hasPuedeAuxiliar && !hasEstado && !hasObservacion) {
+      throw createCajaError(400, 'VENTAS_CAJAS_ASSIGNMENT_UPDATE_EMPTY', 'Debe enviar al menos un campo para actualizar.');
+    }
+
+    const puedeResponsable = hasPuedeResponsable
+      ? parseBooleanWithDefault(req.body.puede_responsable, false)
+      : parseBooleanWithDefault(assignment.puede_responsable, false);
+    const puedeAuxiliar = hasPuedeAuxiliar
+      ? parseBooleanWithDefault(req.body.puede_auxiliar, false)
+      : parseBooleanWithDefault(assignment.puede_auxiliar, false);
+    const estado = hasEstado
+      ? parseBooleanWithDefault(req.body.estado, true)
+      : parseBooleanWithDefault(assignment.estado, true);
+    const observacion = hasObservacion ? normalizeText(req.body.observacion, 300) : assignment.observacion;
+
+    if (estado && !puedeResponsable && !puedeAuxiliar) {
+      throw createCajaError(400, 'VENTAS_CAJAS_ASSIGN_ROLE_REQUIRED', 'La asignacion activa debe habilitar al menos un rol.');
+    }
+
+    await ensureActiveAssignmentBusinessRules(client, {
+      idCaja: assignment.id_caja,
+      idUsuario: assignment.id_usuario,
+      idSucursal: assignment.id_sucursal,
+      puedeResponsable,
+      estado,
+      excludeAssignmentId: idAsignacion
+    });
+
+    await client.query(
+      `
+        UPDATE public.cajas_usuarios_autorizados
+        SET puede_responsable = $1,
+            puede_auxiliar = $2,
+            estado = $3,
+            observacion = $4,
+            fecha_actualizacion = NOW()
+        WHERE id_caja_usuario_autorizado = $5
+      `,
+      [puedeResponsable, puedeAuxiliar, estado, observacion, idAsignacion]
+    );
+
+    await client.query('COMMIT');
+    return res.status(200).json({ message: 'Asignacion de caja actualizada correctamente.' });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    return sendInternalError(res, err, 'VENTAS_CAJAS_ASSIGN_UPDATE_ERROR', 'No se pudo actualizar la asignacion de caja.');
+  } finally {
+    client.release();
+  }
+});
+
+router.patch('/ventas/cajas/asignaciones/:id/inactivar', checkPermission(['VENTAS_CAJAS_PARTICIPANTES_GESTIONAR']), async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await ensureAdminOrSuperAdmin(req);
+
+    const idAsignacion = parsePositiveInt(req.params.id);
+    if (!idAsignacion) {
+      throw createCajaError(400, 'VENTAS_CAJAS_ASSIGNMENT_ID_INVALID', 'El id de asignacion es invalido.');
+    }
+
+    const assignmentResult = await client.query(
+      `
+        SELECT id_caja_usuario_autorizado, id_sucursal, COALESCE(estado, true) AS estado
+        FROM public.cajas_usuarios_autorizados
+        WHERE id_caja_usuario_autorizado = $1
+        LIMIT 1
+        FOR UPDATE
+      `,
+      [idAsignacion]
+    );
+    if (assignmentResult.rowCount === 0) {
+      throw createCajaError(404, 'VENTAS_CAJAS_ASSIGNMENT_NOT_FOUND', 'La asignacion indicada no existe.');
+    }
+
+    const assignment = assignmentResult.rows[0];
+    const scopeContext = await getScopeContext(req, client, assignment.id_sucursal, true);
+    assertSucursalAllowed(scopeContext, assignment.id_sucursal);
+
+    if (!parseBooleanish(assignment.estado)) {
+      throw createCajaError(409, 'VENTAS_CAJAS_ASSIGNMENT_ALREADY_INACTIVE', 'La asignacion ya se encuentra inactiva.');
+    }
+
+    await client.query(
+      `
+        UPDATE public.cajas_usuarios_autorizados
+        SET estado = false, fecha_actualizacion = NOW()
+        WHERE id_caja_usuario_autorizado = $1
+      `,
+      [idAsignacion]
+    );
+
+    await client.query('COMMIT');
+    return res.status(200).json({ message: 'Asignacion de caja inactivada correctamente.' });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    return sendInternalError(res, err, 'VENTAS_CAJAS_ASSIGN_INACTIVATE_ERROR', 'No se pudo inactivar la asignacion de caja.');
+  } finally {
+    client.release();
+  }
+});
+
 router.get('/ventas/cajas/sesiones', checkPermission(['VENTAS_CAJAS_LISTADO_VER']), async (req, res) => {
   try {
     const requestedSucursalId = parseNullablePositiveInt(req.query.id_sucursal);
@@ -533,75 +1563,124 @@ router.get('/ventas/cajas/sesiones/:id/reporte', checkPermission(['VENTAS_CAJAS_
   sessionDetailHandler(req, res, 'VENTAS_CAJAS_REPORTE_ERROR', 'No se pudo obtener el reporte de la sesion de caja.')
 );
 
+const createOpenSessionTransaction = async ({
+  client,
+  scopeContext,
+  idCaja,
+  responsableId,
+  montoApertura,
+  observacionApertura
+}) => {
+  const caja = await fetchCajaById(client, idCaja);
+  if (!caja || !parseBooleanish(caja.estado)) {
+    throw createCajaError(404, 'VENTAS_CAJAS_CAJA_NOT_FOUND', 'La caja seleccionada no existe.');
+  }
+
+  assertSucursalAllowed(scopeContext, caja.id_sucursal);
+  await assertCajaAuthorization(client, idCaja, responsableId, 'RESPONSABLE');
+
+  const idEstadoAbierta = await getCatalogId(client, 'SESSION_STATES', 'ABIERTA');
+  const openSessionResult = await client.query(
+    `SELECT id_sesion_caja FROM public.cajas_sesiones WHERE id_caja = $1 AND id_estado_sesion_caja = $2 LIMIT 1 FOR UPDATE`,
+    [idCaja, idEstadoAbierta]
+  );
+  if (openSessionResult.rowCount > 0) {
+    throw createCajaError(409, 'VENTAS_CAJAS_SESSION_ALREADY_OPEN', 'La caja ya tiene una sesion abierta.');
+  }
+
+  const responsibleOpenSessionResult = await client.query(
+    `SELECT cs.id_sesion_caja FROM public.cajas_sesiones cs WHERE cs.id_usuario_responsable = $1 AND cs.id_estado_sesion_caja = $2 LIMIT 1`,
+    [responsableId, idEstadoAbierta]
+  );
+  if (responsibleOpenSessionResult.rowCount > 0) {
+    throw createCajaError(409, 'VENTAS_CAJAS_RESPONSABLE_BUSY', 'El responsable ya tiene una sesion de caja abierta.');
+  }
+
+  const idRolResponsable = await getCatalogId(client, 'PARTICIPATION_ROLES', 'RESPONSABLE');
+  const idTipoApertura = await getCatalogId(client, 'MOVEMENT_TYPES', 'APERTURA');
+
+  const sessionInsert = await client.query(
+    `
+      INSERT INTO public.cajas_sesiones (
+        id_caja, id_sucursal, id_usuario_responsable, id_estado_sesion_caja, id_usuario_apertura,
+        fecha_apertura, monto_apertura, observacion_apertura, fecha_creacion, fecha_actualizacion
+      )
+      VALUES ($1, $2, $3, $4, $5, NOW(), $6, $7, NOW(), NOW())
+      RETURNING id_sesion_caja
+    `,
+    [idCaja, caja.id_sucursal, responsableId, idEstadoAbierta, scopeContext.idUsuario, montoApertura, observacionApertura]
+  );
+  const idSesionCaja = Number(sessionInsert.rows?.[0]?.id_sesion_caja || 0) || null;
+  if (!idSesionCaja) {
+    throw createCajaError(500, 'VENTAS_CAJAS_SESSION_ID_ERROR', 'No se pudo determinar el identificador de la sesion abierta.');
+  }
+
+  await client.query(
+    `
+      INSERT INTO public.cajas_sesiones_participantes (
+        id_sesion_caja, id_usuario, id_rol_participacion_caja, fecha_inicio, activo, observacion, fecha_creacion, fecha_actualizacion
+      )
+      VALUES ($1, $2, $3, NOW(), true, $4, NOW(), NOW())
+    `,
+    [idSesionCaja, responsableId, idRolResponsable, 'Responsable de apertura']
+  );
+
+  if (montoApertura > 0 && idTipoApertura) {
+    await client.query(
+      `
+        INSERT INTO public.cajas_movimientos (
+          id_sesion_caja, id_caja, id_sucursal, id_tipo_movimiento_caja, id_usuario_ejecutor,
+          monto, observacion, fecha_movimiento, fecha_creacion
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), NOW())
+      `,
+      [idSesionCaja, idCaja, caja.id_sucursal, idTipoApertura, scopeContext.idUsuario, montoApertura, observacionApertura || 'Apertura de sesion de caja']
+    );
+  }
+
+  return idSesionCaja;
+};
+
 const openSessionHandler = async (req, res) => {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
     const idCaja = parsePositiveInt(req.body.id_caja);
+    const requestedSucursalId = parseNullablePositiveInt(req.body.id_sucursal);
     const montoApertura = parseNonNegativeAmount(req.body.monto_apertura ?? 0);
     const observacionApertura = normalizeText(req.body.observacion_apertura, 500);
     const requestedResponsableId = parseNullablePositiveInt(req.body.id_usuario_responsable);
     if (!idCaja) throw createCajaError(400, 'VENTAS_CAJAS_CAJA_REQUIRED', 'Debe indicar una caja valida.');
     if (montoApertura === null) throw createCajaError(400, 'VENTAS_CAJAS_APERTURA_AMOUNT_INVALID', 'monto_apertura debe ser un numero mayor o igual a 0.');
 
-    const scopeContext = await getScopeContext(req, client);
+    const scopeContext = await getScopeContext(req, client, requestedSucursalId, true);
+    let responsableId = requestedResponsableId || scopeContext.idUsuario;
     const caja = await fetchCajaById(client, idCaja);
-    if (!caja || !parseBooleanish(caja.estado)) throw createCajaError(404, 'VENTAS_CAJAS_CAJA_NOT_FOUND', 'La caja seleccionada no existe.');
-    assertSucursalAllowed(scopeContext, caja.id_sucursal);
-
-    const responsableId = requestedResponsableId || scopeContext.idUsuario;
-    await assertCajaAuthorization(client, idCaja, responsableId, 'RESPONSABLE');
-
-    const idEstadoAbierta = await getCatalogId(client, 'SESSION_STATES', 'ABIERTA');
-    const openSessionResult = await client.query(
-      `SELECT id_sesion_caja FROM public.cajas_sesiones WHERE id_caja = $1 AND id_estado_sesion_caja = $2 LIMIT 1 FOR UPDATE`,
-      [idCaja, idEstadoAbierta]
-    );
-    if (openSessionResult.rowCount > 0) throw createCajaError(409, 'VENTAS_CAJAS_SESSION_ALREADY_OPEN', 'La caja ya tiene una sesion abierta.');
-
-    const responsibleOpenSessionResult = await client.query(
-      `SELECT cs.id_sesion_caja FROM public.cajas_sesiones cs WHERE cs.id_usuario_responsable = $1 AND cs.id_estado_sesion_caja = $2 LIMIT 1`,
-      [responsableId, idEstadoAbierta]
-    );
-    if (responsibleOpenSessionResult.rowCount > 0) throw createCajaError(409, 'VENTAS_CAJAS_RESPONSABLE_BUSY', 'El responsable ya tiene una sesion de caja abierta.');
-
-    const idRolResponsable = await getCatalogId(client, 'PARTICIPATION_ROLES', 'RESPONSABLE');
-    const idTipoApertura = await getCatalogId(client, 'MOVEMENT_TYPES', 'APERTURA');
-    const insertSession = await client.query(
-      `
-        INSERT INTO public.cajas_sesiones (
-          id_caja, id_sucursal, id_usuario_responsable, id_estado_sesion_caja, id_usuario_apertura,
-          fecha_apertura, monto_apertura, observacion_apertura, fecha_creacion, fecha_actualizacion
-        )
-        VALUES ($1, $2, $3, $4, $5, NOW(), $6, $7, NOW(), NOW())
-        RETURNING id_sesion_caja
-      `,
-      [idCaja, caja.id_sucursal, responsableId, idEstadoAbierta, scopeContext.idUsuario, montoApertura, observacionApertura]
-    );
-
-    const idSesionCaja = Number(insertSession.rows[0].id_sesion_caja);
-    await client.query(
-      `
-        INSERT INTO public.cajas_sesiones_participantes (
-          id_sesion_caja, id_usuario, id_rol_participacion_caja, fecha_inicio, activo, observacion, fecha_creacion, fecha_actualizacion
-        )
-        VALUES ($1, $2, $3, NOW(), true, $4, NOW(), NOW())
-      `,
-      [idSesionCaja, responsableId, idRolResponsable, 'Responsable de apertura']
-    );
-
-    if (montoApertura > 0 && idTipoApertura) {
-      await client.query(
-        `
-          INSERT INTO public.cajas_movimientos (
-            id_sesion_caja, id_caja, id_sucursal, id_tipo_movimiento_caja, id_usuario_ejecutor,
-            monto, observacion, fecha_movimiento, fecha_creacion
-          )
-          VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), NOW())
-        `,
-        [idSesionCaja, idCaja, caja.id_sucursal, idTipoApertura, scopeContext.idUsuario, montoApertura, observacionApertura || 'Apertura de sesion de caja']
-      );
+    if (!caja) {
+      throw createCajaError(404, 'VENTAS_CAJAS_CAJA_NOT_FOUND', 'La caja seleccionada no existe.');
     }
+    if (!requestedResponsableId) {
+      const selfAuthorization = await fetchCajaAuthorization(client, idCaja, scopeContext.idUsuario);
+      if (!parseBooleanish(selfAuthorization?.puede_responsable)) {
+        const fallbackResponsable = await fetchCajaDefaultResponsible(client, idCaja, caja.id_sucursal);
+        if (!fallbackResponsable) {
+          throw createCajaError(
+            409,
+            'VENTAS_CAJAS_RESPONSABLE_REQUIRED',
+            'La caja no tiene un responsable autorizado activo. Asigna un responsable antes de abrir sesion.'
+          );
+        }
+        responsableId = fallbackResponsable;
+      }
+    }
+    const idSesionCaja = await createOpenSessionTransaction({
+      client,
+      scopeContext,
+      idCaja,
+      responsableId,
+      montoApertura,
+      observacionApertura
+    });
 
     await client.query('COMMIT');
     return res.status(201).json({ message: 'Sesion de caja iniciada correctamente.', id_sesion_caja: idSesionCaja });
@@ -648,6 +1727,18 @@ const closeSessionHandler = async (req, res) => {
       throw createCajaError(403, 'VENTAS_CAJAS_DIFFERENCE_FORBIDDEN', 'No tiene permiso para resolver diferencias de cierre.');
     }
 
+    let idResolucionFinal = idResolucion;
+    if (!idResolucionFinal && Math.abs(diferencia) === 0) {
+      idResolucionFinal = await getCatalogId(client, 'RESOLUTIONS', 'CAJA_CUADRA');
+      if (!idResolucionFinal) {
+        throw createCajaError(
+          409,
+          'VENTAS_CAJAS_RESOLUTION_DEFAULT_MISSING',
+          'No se encontro la resolucion por defecto para cierres cuadrados.'
+        );
+      }
+    }
+
     const idEstadoCerrada = await getCatalogId(client, 'SESSION_STATES', 'CERRADA');
     const closeResult = await client.query(
       `
@@ -662,7 +1753,7 @@ const closeSessionHandler = async (req, res) => {
       `,
       [
         idSesionCaja, session.id_caja, session.id_sucursal, session.id_usuario_responsable, scopeContext.idUsuario,
-        idResolucion, idArqueoFinal, Number(session.monto_apertura || 0), Number(resumen.ventas_efectivo || 0),
+        idResolucionFinal, idArqueoFinal, Number(session.monto_apertura || 0), Number(resumen.ventas_efectivo || 0),
         Number(resumen.ventas_no_efectivo || 0), Number(resumen.ingresos_manuales || 0), Number(resumen.egresos_manuales || 0),
         montoTeorico, montoDeclaradoCierre, diferencia, observacionCierre
       ]
@@ -801,7 +1892,7 @@ router.post('/ventas/cajas/sesiones/:id/participantes', checkPermission(['VENTAS
     const scopeContext = await getScopeContext(req, client, null, true);
     const session = await ensureOpenSession(client, idSesionCaja, { forUpdate: true });
     assertSucursalAllowed(scopeContext, session.id_sucursal);
-    if (!(await requestHasAnyRole(req, ['ADMIN', 'SUPER_ADMIN'])) && Number(session.id_usuario_responsable) !== Number(scopeContext.idUsuario)) {
+    if (!(await requestHasAnyRole(req, ADMIN_ROLE_CODES)) && Number(session.id_usuario_responsable) !== Number(scopeContext.idUsuario)) {
       throw createCajaError(403, 'VENTAS_CAJAS_PARTICIPANT_ASSIGN_FORBIDDEN', 'Solo el responsable de la sesion o un administrador puede gestionar participantes.');
     }
     if (Number(session.id_usuario_responsable) === Number(idUsuarioParticipante) && roleCode !== 'RESPONSABLE') {
@@ -851,7 +1942,7 @@ const inactivateParticipantHandler = async ({ req, res, byUserId = false }) => {
     const scopeContext = await getScopeContext(req, client, null, true);
     const session = await ensureOpenSession(client, idSesionCaja, { forUpdate: true });
     assertSucursalAllowed(scopeContext, session.id_sucursal);
-    if (!(await requestHasAnyRole(req, ['ADMIN', 'SUPER_ADMIN'])) && Number(session.id_usuario_responsable) !== Number(scopeContext.idUsuario)) {
+    if (!(await requestHasAnyRole(req, ADMIN_ROLE_CODES)) && Number(session.id_usuario_responsable) !== Number(scopeContext.idUsuario)) {
       throw createCajaError(403, 'VENTAS_CAJAS_PARTICIPANT_REMOVE_FORBIDDEN', 'Solo el responsable de la sesion o un administrador puede inactivar participantes.');
     }
 
