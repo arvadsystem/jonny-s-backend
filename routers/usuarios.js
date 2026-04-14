@@ -514,14 +514,28 @@ const v2GetCapabilities = async () => {
 const v2MapUsuarioRow = (row) => {
   if (!row) return null;
 
+  const resolvedNombreCompleto = v2NormalizeText(
+    row.nombre_completo
+      || row.nombre_completo_empleado
+      || row.nombre_completo_cliente
+  );
+
   const empleado = {
     id_empleado: row.id_empleado ?? null,
-    nombre_completo: v2NormalizeText(row.nombre_completo),
-    dni: row.dni ?? null,
-    telefono: row.telefono ?? null,
-    correo: row.correo ?? null,
+    nombre_completo: v2NormalizeText(row.nombre_completo_empleado),
+    dni: row.dni_empleado ?? null,
+    telefono: row.telefono_empleado ?? null,
+    correo: row.correo_empleado ?? null,
     sucursal: row.sucursal_nombre ?? null,
     sucursal_nombre: row.sucursal_nombre ?? null,
+  };
+
+  const cliente = {
+    id_cliente: row.id_cliente ?? null,
+    nombre_completo: v2NormalizeText(row.nombre_completo_cliente),
+    dni: row.dni_cliente ?? null,
+    telefono: row.telefono_cliente ?? null,
+    correo: row.correo_cliente ?? null,
   };
 
   const rawRoles = Array.isArray(row.roles) ? row.roles : [];
@@ -547,15 +561,18 @@ const v2MapUsuarioRow = (row) => {
     estado: row.estado,
     foto_perfil: row.foto_perfil ?? '',
     fecha_creacion: row.fecha_creacion ?? null,
+    tipo_usuario: row.tipo_usuario ?? null,
     id_empleado: row.id_empleado ?? null,
-    nombre_completo: empleado.nombre_completo,
-    dni: empleado.dni,
-    telefono: empleado.telefono,
-    correo: empleado.correo,
-    sucursal_nombre: empleado.sucursal_nombre,
+    id_cliente: row.id_cliente ?? null,
+    nombre_completo: resolvedNombreCompleto,
+    dni: empleado.dni || cliente.dni || null,
+    telefono: empleado.telefono || cliente.telefono || null,
+    correo: empleado.correo || cliente.correo || null,
+    sucursal_nombre: row.id_cliente ? null : empleado.sucursal_nombre,
     roles,
     rol,
     empleado,
+    cliente,
   };
 };
 
@@ -567,20 +584,34 @@ const v2FetchUsuarioById = async (idUsuario, queryRunner = pool) => {
       u.estado,
       u.foto_perfil,
       u.fecha_creacion,
+      u.tipo_usuario,
       e.id_empleado,
-      TRIM(CONCAT(COALESCE(p.nombre, ''), ' ', COALESCE(p.apellido, ''))) AS nombre_completo,
-      p.dni,
-      t.telefono,
-      c.direccion_correo AS correo,
+      cl.id_cliente,
+      TRIM(CONCAT(COALESCE(pe.nombre, ''), ' ', COALESCE(pe.apellido, ''))) AS nombre_completo_empleado,
+      TRIM(CONCAT(COALESCE(pc.nombre, ''), ' ', COALESCE(pc.apellido, ''))) AS nombre_completo_cliente,
+      COALESCE(
+        TRIM(CONCAT(COALESCE(pe.nombre, ''), ' ', COALESCE(pe.apellido, ''))),
+        TRIM(CONCAT(COALESCE(pc.nombre, ''), ' ', COALESCE(pc.apellido, '')))
+      ) AS nombre_completo,
+      pe.dni AS dni_empleado,
+      pc.dni AS dni_cliente,
+      te.telefono AS telefono_empleado,
+      tc.telefono AS telefono_cliente,
+      ce.direccion_correo AS correo_empleado,
+      cc.direccion_correo AS correo_cliente,
       s.nombre_sucursal AS sucursal_nombre,
       roles_info.id_rol,
       roles_info.rol_nombre,
       roles_info.roles
     FROM usuarios u
     LEFT JOIN empleados e ON e.id_empleado = u.id_empleado
-    LEFT JOIN personas p ON p.id_persona = e.id_persona
-    LEFT JOIN telefonos t ON t.id_telefono = p.id_telefono
-    LEFT JOIN correos c ON c.id_correo = p.id_correo
+    LEFT JOIN personas pe ON pe.id_persona = e.id_persona
+    LEFT JOIN telefonos te ON te.id_telefono = pe.id_telefono
+    LEFT JOIN correos ce ON ce.id_correo = pe.id_correo
+    LEFT JOIN clientes cl ON cl.id_cliente = u.id_cliente
+    LEFT JOIN personas pc ON pc.id_persona = cl.id_persona
+    LEFT JOIN telefonos tc ON tc.id_telefono = pc.id_telefono
+    LEFT JOIN correos cc ON cc.id_correo = pc.id_correo
     LEFT JOIN sucursales s ON s.id_sucursal = e.id_sucursal
     LEFT JOIN LATERAL (
       SELECT
@@ -683,12 +714,53 @@ const v2FindEmployeeForUser = async (idEmpleado, queryRunner = pool) => {
   return result.rows[0] || null;
 };
 
+const v2FindClienteForUser = async (idCliente, queryRunner = pool) => {
+  const query = `
+    SELECT
+      c.id_cliente,
+      p.nombre,
+      p.apellido,
+      p.dni,
+      t.telefono,
+      co.direccion_correo AS correo
+    FROM clientes c
+    LEFT JOIN personas p ON p.id_persona = c.id_persona
+    LEFT JOIN telefonos t ON t.id_telefono = p.id_telefono
+    LEFT JOIN correos co ON co.id_correo = p.id_correo
+    WHERE c.id_cliente = $1
+    LIMIT 1
+  `;
+
+  const result = await queryRunner.query(query, [idCliente]);
+  return result.rows[0] || null;
+};
+
 const v2FindRoleById = async (idRol, queryRunner = pool) => {
   const result = await queryRunner.query(
     'SELECT id_rol, nombre FROM roles WHERE id_rol = $1 LIMIT 1',
     [idRol]
   );
   return result.rows[0] || null;
+};
+
+const v2FindClienteRoleId = async (queryRunner = pool) => {
+  const result = await queryRunner.query(
+    `SELECT id_rol FROM roles WHERE UPPER(TRIM(nombre)) = 'CLIENTE' LIMIT 1`
+  );
+  return Number.isInteger(result.rows?.[0]?.id_rol) ? result.rows[0].id_rol : null;
+};
+
+const v2NormalizeUsuarioTarget = (payload = {}) => {
+  const raw = String(
+    payload?.tipo_objetivo
+    ?? payload?.tipo_usuario_objetivo
+    ?? payload?.tipo
+    ?? 'EMPLEADO'
+  ).trim().toUpperCase();
+
+  if (!raw || raw === 'EMPLEADO') return 'EMPLEADO';
+  if (raw === 'CLIENTE') return 'CLIENTE';
+  return null;
 };
 
 const v2NormalizeRoleIdsInput = (payload = {}) => {
@@ -783,11 +855,16 @@ router.get('/usuarios/v2/list', checkPermission(USUARIOS_LIST_PERMISSIONS), asyn
       params.push(`%${q}%`);
       whereParts.push(`(
         u.nombre_usuario ILIKE $${params.length}
-        OR COALESCE(p.nombre, '') ILIKE $${params.length}
-        OR COALESCE(p.apellido, '') ILIKE $${params.length}
-        OR COALESCE(p.dni::text, '') ILIKE $${params.length}
-        OR COALESCE(t.telefono, '') ILIKE $${params.length}
-        OR COALESCE(c.direccion_correo, '') ILIKE $${params.length}
+        OR COALESCE(pe.nombre, '') ILIKE $${params.length}
+        OR COALESCE(pe.apellido, '') ILIKE $${params.length}
+        OR COALESCE(pe.dni::text, '') ILIKE $${params.length}
+        OR COALESCE(te.telefono, '') ILIKE $${params.length}
+        OR COALESCE(ce.direccion_correo, '') ILIKE $${params.length}
+        OR COALESCE(pc.nombre, '') ILIKE $${params.length}
+        OR COALESCE(pc.apellido, '') ILIKE $${params.length}
+        OR COALESCE(pc.dni::text, '') ILIKE $${params.length}
+        OR COALESCE(tc.telefono, '') ILIKE $${params.length}
+        OR COALESCE(cc.direccion_correo, '') ILIKE $${params.length}
         OR COALESCE(s.nombre_sucursal, '') ILIKE $${params.length}
         OR COALESCE(roles_info.roles_nombres, '') ILIKE $${params.length}
       )`);
@@ -799,9 +876,13 @@ router.get('/usuarios/v2/list', checkPermission(USUARIOS_LIST_PERMISSIONS), asyn
       SELECT COUNT(*)::int AS total
       FROM usuarios u
       LEFT JOIN empleados e ON e.id_empleado = u.id_empleado
-      LEFT JOIN personas p ON p.id_persona = e.id_persona
-      LEFT JOIN telefonos t ON t.id_telefono = p.id_telefono
-      LEFT JOIN correos c ON c.id_correo = p.id_correo
+      LEFT JOIN personas pe ON pe.id_persona = e.id_persona
+      LEFT JOIN telefonos te ON te.id_telefono = pe.id_telefono
+      LEFT JOIN correos ce ON ce.id_correo = pe.id_correo
+      LEFT JOIN clientes cl ON cl.id_cliente = u.id_cliente
+      LEFT JOIN personas pc ON pc.id_persona = cl.id_persona
+      LEFT JOIN telefonos tc ON tc.id_telefono = pc.id_telefono
+      LEFT JOIN correos cc ON cc.id_correo = pc.id_correo
       LEFT JOIN sucursales s ON s.id_sucursal = e.id_sucursal
       LEFT JOIN LATERAL (
         SELECT STRING_AGG(r2.nombre, ', ' ORDER BY r2.id_rol ASC) AS roles_nombres
@@ -819,20 +900,34 @@ router.get('/usuarios/v2/list', checkPermission(USUARIOS_LIST_PERMISSIONS), asyn
         u.estado,
         u.foto_perfil,
         u.fecha_creacion,
+        u.tipo_usuario,
         e.id_empleado,
-        TRIM(CONCAT(COALESCE(p.nombre, ''), ' ', COALESCE(p.apellido, ''))) AS nombre_completo,
-        p.dni,
-        t.telefono,
-        c.direccion_correo AS correo,
+        cl.id_cliente,
+        TRIM(CONCAT(COALESCE(pe.nombre, ''), ' ', COALESCE(pe.apellido, ''))) AS nombre_completo_empleado,
+        TRIM(CONCAT(COALESCE(pc.nombre, ''), ' ', COALESCE(pc.apellido, ''))) AS nombre_completo_cliente,
+        COALESCE(
+          TRIM(CONCAT(COALESCE(pe.nombre, ''), ' ', COALESCE(pe.apellido, ''))),
+          TRIM(CONCAT(COALESCE(pc.nombre, ''), ' ', COALESCE(pc.apellido, '')))
+        ) AS nombre_completo,
+        pe.dni AS dni_empleado,
+        pc.dni AS dni_cliente,
+        te.telefono AS telefono_empleado,
+        tc.telefono AS telefono_cliente,
+        ce.direccion_correo AS correo_empleado,
+        cc.direccion_correo AS correo_cliente,
         s.nombre_sucursal AS sucursal_nombre,
         roles_info.id_rol,
         roles_info.rol_nombre,
         roles_info.roles
       FROM usuarios u
       LEFT JOIN empleados e ON e.id_empleado = u.id_empleado
-      LEFT JOIN personas p ON p.id_persona = e.id_persona
-      LEFT JOIN telefonos t ON t.id_telefono = p.id_telefono
-      LEFT JOIN correos c ON c.id_correo = p.id_correo
+      LEFT JOIN personas pe ON pe.id_persona = e.id_persona
+      LEFT JOIN telefonos te ON te.id_telefono = pe.id_telefono
+      LEFT JOIN correos ce ON ce.id_correo = pe.id_correo
+      LEFT JOIN clientes cl ON cl.id_cliente = u.id_cliente
+      LEFT JOIN personas pc ON pc.id_persona = cl.id_persona
+      LEFT JOIN telefonos tc ON tc.id_telefono = pc.id_telefono
+      LEFT JOIN correos cc ON cc.id_correo = pc.id_correo
       LEFT JOIN sucursales s ON s.id_sucursal = e.id_sucursal
       LEFT JOIN LATERAL (
         SELECT
@@ -881,21 +976,49 @@ router.post('/usuarios/v2/create', checkPermission(USUARIOS_CREATE_PERMISSIONS),
   const client = await pool.connect();
 
   try {
+    const targetType = v2NormalizeUsuarioTarget(req.body);
+    if (!targetType) {
+      return res.status(400).json({ error: true, message: 'tipo_objetivo debe ser CLIENTE o EMPLEADO' });
+    }
     const idEmpleado = v2ParsePositiveInt(req.body?.id_empleado);
-    if (!idEmpleado) {
+    const idCliente = v2ParsePositiveInt(req.body?.id_cliente);
+
+    if (targetType === 'EMPLEADO' && !idEmpleado) {
       return res.status(400).json({ error: true, message: 'id_empleado es obligatorio y debe ser positivo' });
     }
-
-    const roleSelection = v2NormalizeRoleIdsInput(req.body);
-    if (roleSelection.invalid || !roleSelection.roleIds.length) {
-      return res.status(400).json({ error: true, message: 'Debe enviar al menos un rol valido en id_roles o id_rol' });
+    if (targetType === 'CLIENTE' && !idCliente) {
+      return res.status(400).json({ error: true, message: 'id_cliente es obligatorio y debe ser positivo' });
     }
-    const canAssignRoles = await requestHasAnyPermission(req, USUARIOS_ROLE_ASSIGN_PERMISSIONS);
-    if (!canAssignRoles) {
-      return res.status(403).json({
-        error: true,
-        message: 'Acceso denegado: permisos insuficientes para asignar roles'
-      });
+    if (targetType === 'CLIENTE' && idEmpleado) {
+      return res.status(400).json({ error: true, message: 'No se permite id_empleado cuando tipo_objetivo=CLIENTE' });
+    }
+    if (targetType === 'EMPLEADO' && idCliente) {
+      return res.status(400).json({ error: true, message: 'No se permite id_cliente cuando tipo_objetivo=EMPLEADO' });
+    }
+    if (targetType === 'CLIENTE' && req.body?.id_sucursal !== undefined && req.body?.id_sucursal !== null && String(req.body.id_sucursal).trim() !== '') {
+      return res.status(400).json({ error: true, message: 'id_sucursal no aplica para usuarios cliente' });
+    }
+
+    let roleIds = [];
+    if (targetType === 'CLIENTE') {
+      const clienteRoleId = await v2FindClienteRoleId(client);
+      if (!clienteRoleId) {
+        return res.status(500).json({ error: true, message: 'No se encontro el rol Cliente en la base de datos' });
+      }
+      roleIds = [clienteRoleId];
+    } else {
+      const roleSelection = v2NormalizeRoleIdsInput(req.body);
+      if (roleSelection.invalid || !roleSelection.roleIds.length) {
+        return res.status(400).json({ error: true, message: 'Debe enviar al menos un rol valido en id_roles o id_rol' });
+      }
+      const canAssignRoles = await requestHasAnyPermission(req, USUARIOS_ROLE_ASSIGN_PERMISSIONS);
+      if (!canAssignRoles) {
+        return res.status(403).json({
+          error: true,
+          message: 'Acceso denegado: permisos insuficientes para asignar roles'
+        });
+      }
+      roleIds = roleSelection.roleIds;
     }
 
     let estado = true;
@@ -917,40 +1040,71 @@ router.post('/usuarios/v2/create', checkPermission(USUARIOS_CREATE_PERMISSIONS),
 
     await client.query('BEGIN');
 
-    const roles = await v2FindRolesByIds(roleSelection.roleIds, client);
-    if (roles.length !== roleSelection.roleIds.length) {
+    const roles = await v2FindRolesByIds(roleIds, client);
+    if (roles.length !== roleIds.length) {
       await client.query('ROLLBACK');
       return res.status(400).json({ error: true, message: 'Uno o mas roles no existen' });
     }
 
-    const empleado = await v2FindEmployeeForUser(idEmpleado, client);
-    if (!empleado) {
-      await client.query('ROLLBACK');
-      return res.status(404).json({ error: true, message: 'Empleado no encontrado' });
+    let generatedUsername = '';
+    let targetIdField = 'id_empleado';
+    let targetIdValue = idEmpleado;
+
+    if (targetType === 'EMPLEADO') {
+      const empleado = await v2FindEmployeeForUser(idEmpleado, client);
+      if (!empleado) {
+        await client.query('ROLLBACK');
+        return res.status(404).json({ error: true, message: 'Empleado no encontrado' });
+      }
+
+      const duplicateEmployee = await client.query(
+        'SELECT id_usuario FROM usuarios WHERE id_empleado = $1 LIMIT 1',
+        [idEmpleado]
+      );
+
+      if (duplicateEmployee.rows.length > 0) {
+        await client.query('ROLLBACK');
+        return res.status(409).json({ error: true, message: 'Empleado ya tiene usuario' });
+      }
+
+      generatedUsername = await v2BuildUniqueUsername({
+        nombre: empleado.nombre,
+        apellido: empleado.apellido,
+        idEmpleado,
+        queryRunner: client,
+      });
+    } else {
+      const cliente = await v2FindClienteForUser(idCliente, client);
+      if (!cliente) {
+        await client.query('ROLLBACK');
+        return res.status(404).json({ error: true, message: 'Cliente no encontrado' });
+      }
+
+      const duplicateCliente = await client.query(
+        'SELECT id_usuario FROM usuarios WHERE id_cliente = $1 LIMIT 1',
+        [idCliente]
+      );
+
+      if (duplicateCliente.rows.length > 0) {
+        await client.query('ROLLBACK');
+        return res.status(409).json({ error: true, message: 'Cliente ya tiene usuario' });
+      }
+
+      generatedUsername = await v2BuildUniqueUsername({
+        nombre: cliente.nombre,
+        apellido: cliente.apellido,
+        idEmpleado: idCliente,
+        queryRunner: client,
+      });
+      targetIdField = 'id_cliente';
+      targetIdValue = idCliente;
     }
-
-    const duplicateEmployee = await client.query(
-      'SELECT id_usuario FROM usuarios WHERE id_empleado = $1 LIMIT 1',
-      [idEmpleado]
-    );
-
-    if (duplicateEmployee.rows.length > 0) {
-      await client.query('ROLLBACK');
-      return res.status(409).json({ error: true, message: 'Empleado ya tiene usuario' });
-    }
-
-    const generatedUsername = await v2BuildUniqueUsername({
-      nombre: empleado.nombre,
-      apellido: empleado.apellido,
-      idEmpleado,
-      queryRunner: client,
-    });
 
     const passwordForStorage = await v2BuildPasswordForStorage(plainPassword, client);
     const capabilities = await v2GetCapabilities();
 
-    const insertColumns = ['nombre_usuario', 'clave', 'estado', 'id_empleado'];
-    const insertValues = [generatedUsername, passwordForStorage, estado, idEmpleado];
+    const insertColumns = ['nombre_usuario', 'clave', 'estado', targetIdField, 'tipo_usuario'];
+    const insertValues = [generatedUsername, passwordForStorage, estado, targetIdValue, targetType];
     const insertFragments = insertValues.map((_, idx) => `$${idx + 1}`);
 
     if (capabilities.hasFechaCreacion) {
@@ -978,7 +1132,7 @@ router.post('/usuarios/v2/create', checkPermission(USUARIOS_CREATE_PERMISSIONS),
       throw new Error('No se pudo obtener el id del usuario creado');
     }
 
-    await v2ReplaceUserRoles(idUsuarioCreado, roleSelection.roleIds, client);
+    await v2ReplaceUserRoles(idUsuarioCreado, roleIds, client);
 
     const usuarioCreado = await v2FetchUsuarioById(idUsuarioCreado, client);
 
@@ -1318,61 +1472,119 @@ router.post('/usuarios/v2/generate', checkPermission(USUARIOS_CREATE_PERMISSIONS
   let temporaryPassword = '';
 
   try {
+    const targetType = v2NormalizeUsuarioTarget(req.body);
+    if (!targetType) {
+      return res.status(400).json({ error: true, message: 'tipo_objetivo debe ser CLIENTE o EMPLEADO' });
+    }
     const idEmpleado = v2ParsePositiveInt(req.body?.id_empleado);
-    const roleSelection = v2NormalizeRoleIdsInput(req.body);
+    const idCliente = v2ParsePositiveInt(req.body?.id_cliente);
 
-    if (!idEmpleado) {
+    if (targetType === 'EMPLEADO' && !idEmpleado) {
       return res.status(400).json({ error: true, message: 'id_empleado es obligatorio y debe ser positivo' });
     }
-
-    if (roleSelection.invalid || !roleSelection.roleIds.length) {
-      return res.status(400).json({ error: true, message: 'Debe enviar al menos un rol valido en id_roles o id_rol' });
+    if (targetType === 'CLIENTE' && !idCliente) {
+      return res.status(400).json({ error: true, message: 'id_cliente es obligatorio y debe ser positivo' });
     }
-    const canAssignRoles = await requestHasAnyPermission(req, USUARIOS_ROLE_ASSIGN_PERMISSIONS);
-    if (!canAssignRoles) {
-      return res.status(403).json({
-        error: true,
-        message: 'Acceso denegado: permisos insuficientes para asignar roles'
-      });
+    if (targetType === 'CLIENTE' && idEmpleado) {
+      return res.status(400).json({ error: true, message: 'No se permite id_empleado cuando tipo_objetivo=CLIENTE' });
+    }
+    if (targetType === 'EMPLEADO' && idCliente) {
+      return res.status(400).json({ error: true, message: 'No se permite id_cliente cuando tipo_objetivo=EMPLEADO' });
+    }
+    if (targetType === 'CLIENTE' && req.body?.id_sucursal !== undefined && req.body?.id_sucursal !== null && String(req.body.id_sucursal).trim() !== '') {
+      return res.status(400).json({ error: true, message: 'id_sucursal no aplica para usuarios cliente' });
+    }
+
+    let roleIds = [];
+    if (targetType === 'CLIENTE') {
+      const clienteRoleId = await v2FindClienteRoleId(client);
+      if (!clienteRoleId) {
+        return res.status(500).json({ error: true, message: 'No se encontro el rol Cliente en la base de datos' });
+      }
+      roleIds = [clienteRoleId];
+    } else {
+      const roleSelection = v2NormalizeRoleIdsInput(req.body);
+      if (roleSelection.invalid || !roleSelection.roleIds.length) {
+        return res.status(400).json({ error: true, message: 'Debe enviar al menos un rol valido en id_roles o id_rol' });
+      }
+      const canAssignRoles = await requestHasAnyPermission(req, USUARIOS_ROLE_ASSIGN_PERMISSIONS);
+      if (!canAssignRoles) {
+        return res.status(403).json({
+          error: true,
+          message: 'Acceso denegado: permisos insuficientes para asignar roles'
+        });
+      }
+      roleIds = roleSelection.roleIds;
     }
 
     await client.query('BEGIN');
 
-    const roles = await v2FindRolesByIds(roleSelection.roleIds, client);
-    if (roles.length !== roleSelection.roleIds.length) {
+    const roles = await v2FindRolesByIds(roleIds, client);
+    if (roles.length !== roleIds.length) {
       await client.query('ROLLBACK');
       return res.status(400).json({ error: true, message: 'Uno o mas roles no existen' });
     }
 
-    const empleado = await v2FindEmployeeForUser(idEmpleado, client);
-    if (!empleado) {
-      await client.query('ROLLBACK');
-      return res.status(404).json({ error: true, message: 'Empleado no encontrado' });
+    let generatedUsername = '';
+    let targetIdField = 'id_empleado';
+    let targetIdValue = idEmpleado;
+
+    if (targetType === 'EMPLEADO') {
+      const empleado = await v2FindEmployeeForUser(idEmpleado, client);
+      if (!empleado) {
+        await client.query('ROLLBACK');
+        return res.status(404).json({ error: true, message: 'Empleado no encontrado' });
+      }
+
+      const duplicateEmployee = await client.query(
+        'SELECT id_usuario FROM usuarios WHERE id_empleado = $1 LIMIT 1',
+        [idEmpleado]
+      );
+
+      if (duplicateEmployee.rows.length > 0) {
+        await client.query('ROLLBACK');
+        return res.status(409).json({ error: true, message: 'Empleado ya tiene usuario' });
+      }
+
+      generatedUsername = await v2BuildUniqueUsername({
+        nombre: empleado.nombre,
+        apellido: empleado.apellido,
+        idEmpleado,
+        queryRunner: client,
+      });
+    } else {
+      const cliente = await v2FindClienteForUser(idCliente, client);
+      if (!cliente) {
+        await client.query('ROLLBACK');
+        return res.status(404).json({ error: true, message: 'Cliente no encontrado' });
+      }
+
+      const duplicateCliente = await client.query(
+        'SELECT id_usuario FROM usuarios WHERE id_cliente = $1 LIMIT 1',
+        [idCliente]
+      );
+
+      if (duplicateCliente.rows.length > 0) {
+        await client.query('ROLLBACK');
+        return res.status(409).json({ error: true, message: 'Cliente ya tiene usuario' });
+      }
+
+      generatedUsername = await v2BuildUniqueUsername({
+        nombre: cliente.nombre,
+        apellido: cliente.apellido,
+        idEmpleado: idCliente,
+        queryRunner: client,
+      });
+      targetIdField = 'id_cliente';
+      targetIdValue = idCliente;
     }
-
-    const duplicateEmployee = await client.query(
-      'SELECT id_usuario FROM usuarios WHERE id_empleado = $1 LIMIT 1',
-      [idEmpleado]
-    );
-
-    if (duplicateEmployee.rows.length > 0) {
-      await client.query('ROLLBACK');
-      return res.status(409).json({ error: true, message: 'Empleado ya tiene usuario' });
-    }
-
-    const generatedUsername = await v2BuildUniqueUsername({
-      nombre: empleado.nombre,
-      apellido: empleado.apellido,
-      idEmpleado,
-      queryRunner: client,
-    });
 
     temporaryPassword = await v2GenerateTemporaryPassword();
     const passwordForStorage = await v2BuildPasswordForStorage(temporaryPassword, client);
     const capabilities = await v2GetCapabilities();
 
-    const insertColumns = ['nombre_usuario', 'clave', 'estado', 'id_empleado'];
-    const insertValues = [generatedUsername, passwordForStorage, true, idEmpleado];
+    const insertColumns = ['nombre_usuario', 'clave', 'estado', targetIdField, 'tipo_usuario'];
+    const insertValues = [generatedUsername, passwordForStorage, true, targetIdValue, targetType];
     const insertFragments = insertValues.map((_, idx) => `$${idx + 1}`);
 
     if (capabilities.hasFechaCreacion) {
@@ -1400,7 +1612,7 @@ router.post('/usuarios/v2/generate', checkPermission(USUARIOS_CREATE_PERMISSIONS
       throw new Error('No se pudo obtener el id del usuario creado');
     }
 
-    await v2ReplaceUserRoles(idUsuarioCreado, roleSelection.roleIds, client);
+    await v2ReplaceUserRoles(idUsuarioCreado, roleIds, client);
 
     createdUser = await v2FetchUsuarioById(idUsuarioCreado, client);
     await client.query('COMMIT');
@@ -1414,6 +1626,8 @@ router.post('/usuarios/v2/generate', checkPermission(USUARIOS_CREATE_PERMISSIONS
         fecha_creacion: createdUser?.fecha_creacion,
         foto_perfil: createdUser?.foto_perfil || '',
         id_empleado: createdUser?.id_empleado,
+        id_cliente: createdUser?.id_cliente,
+        tipo_usuario: createdUser?.tipo_usuario,
       },
       temp_password: temporaryPassword,
     });
