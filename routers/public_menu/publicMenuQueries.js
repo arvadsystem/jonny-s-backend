@@ -400,13 +400,13 @@ export const fetchAllowedSauceRowsByRecipeIdsQuery = async (recipeIds = []) => {
         s.id_salsa,
         s.nombre,
         s.nivel_picante,
-        s.orden
+        s.orden,
+        COALESCE(s.estado, true) AS disponible
       FROM receta_salsa rs
       INNER JOIN salsas s
         ON s.id_salsa = rs.id_salsa
       WHERE rs.id_receta = ANY($1::int[])
         AND COALESCE(rs.estado, true) = true
-        AND COALESCE(s.estado, true) = true
       ORDER BY rs.id_receta, s.orden, s.nombre;
     `,
     [recipeIds]
@@ -462,34 +462,50 @@ export const fetchFallbackOrderUserIdQuery = async () => {
 
 // Inserta cabecera de pedido publico y devuelve ID generado.
 export const insertPublicPedidoQuery = async (client, payload) => {
+  const [hasEstadoPagoColumn, hasTipoEntregaColumn] = await Promise.all([
+    hasColumn('pedidos', 'estado_pago'),
+    hasColumn('pedidos', 'tipo_entrega')
+  ]);
+
+  const columns = ['fecha_hora_pedido'];
+  const values = ['CURRENT_TIMESTAMP'];
+  const params = [];
+  const pushValue = (column, value) => {
+    params.push(value);
+    columns.push(column);
+    values.push(`$${params.length}`);
+  };
+
+  // Base minima requerida para pedidos del menu publico.
+  pushValue('descripcion_pedido', payload.descripcion_pedido);
+  pushValue('descripcion_envio', payload.descripcion_envio);
+  pushValue('sub_total', payload.sub_total);
+  pushValue('isv', payload.isv);
+  pushValue('total', payload.total);
+  pushValue('id_estado_pedido', payload.id_estado_pedido);
+  pushValue('id_sucursal', payload.id_sucursal);
+  pushValue('id_cliente', payload.id_cliente);
+  pushValue('id_usuario', payload.id_usuario);
+  pushValue('origen_pedido', payload.origen_pedido || 'MENU');
+
+  // Refuerzo item 9: forzamos estado de pago/tipo de entrega si el esquema los soporta.
+  if (hasEstadoPagoColumn) {
+    pushValue('estado_pago', payload.estado_pago || 'PENDIENTE');
+  }
+
+  if (hasTipoEntregaColumn) {
+    pushValue('tipo_entrega', payload.tipo_entrega || 'LOCAL');
+  }
+
   const result = await client.query(
     `
       INSERT INTO pedidos (
-        descripcion_pedido,
-        descripcion_envio,
-        fecha_hora_pedido,
-        sub_total,
-        isv,
-        total,
-        id_estado_pedido,
-        id_sucursal,
-        id_cliente,
-        id_usuario,
-        origen_pedido
+        ${columns.join(',\n        ')}
       )
-      VALUES ($1, $2, CURRENT_TIMESTAMP, $3, $4, $5, $6, $7, NULL, $8, 'MENU')
+      VALUES (${values.join(', ')})
       RETURNING id_pedido, fecha_hora_pedido;
     `,
-    [
-      payload.descripcion_pedido,
-      payload.descripcion_envio,
-      payload.sub_total,
-      payload.isv,
-      payload.total,
-      payload.id_estado_pedido,
-      payload.id_sucursal,
-      payload.id_usuario
-    ]
+    params
   );
 
   return result.rows[0] || null;
@@ -497,29 +513,56 @@ export const insertPublicPedidoQuery = async (client, payload) => {
 
 // Inserta una linea de detalle para pedido publico.
 export const insertPublicPedidoDetalleQuery = async (client, payload) => {
+  const hasConfiguracionMenuColumn = await hasColumn('detalle_pedido', 'configuracion_menu');
+
+  const columns = [
+    'sub_total_pedido',
+    'total_pedido',
+    'id_producto',
+    'id_pedido',
+    'id_descuento',
+    'estado',
+    'id_combo',
+    'id_receta',
+    'observacion'
+  ];
+  const params = [
+    payload.sub_total_pedido,
+    payload.total_pedido,
+    payload.id_producto,
+    payload.id_pedido,
+    null,
+    true,
+    payload.id_combo,
+    payload.id_receta,
+    payload.observacion
+  ];
+  const values = [
+    '$1',
+    '$2',
+    '$3',
+    '$4',
+    '$5',
+    '$6',
+    '$7',
+    '$8',
+    '$9'
+  ];
+
+  // Item 11: persistimos configuracion estructurada del menu cuando el esquema lo soporta.
+  if (hasConfiguracionMenuColumn) {
+    columns.push('configuracion_menu');
+    params.push(payload.configuracion_menu ? JSON.stringify(payload.configuracion_menu) : null);
+    values.push(`$${params.length}::jsonb`);
+  }
+
   await client.query(
     `
       INSERT INTO detalle_pedido (
-        sub_total_pedido,
-        total_pedido,
-        id_producto,
-        id_pedido,
-        id_descuento,
-        estado,
-        id_combo,
-        id_receta,
-        observacion
+        ${columns.join(',\n        ')}
       )
-      VALUES ($1, $2, $3, $4, NULL, true, $5, $6, $7);
+      VALUES (${values.join(', ')});
     `,
-    [
-      payload.sub_total_pedido,
-      payload.total_pedido,
-      payload.id_producto,
-      payload.id_pedido,
-      payload.id_combo,
-      payload.id_receta,
-      payload.observacion
-    ]
+    params
   );
 };

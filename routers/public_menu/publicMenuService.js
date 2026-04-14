@@ -8,7 +8,6 @@ import {
   fetchComboRecipeComponentsQuery,
   fetchComboAvailabilityQuery,
   fetchEstadoPedidoRowsQuery,
-  fetchFallbackOrderUserIdQuery,
   fetchPublicBranchesQuery,
   fetchRecipeAvailabilityQuery,
   fetchSauceRuleRowsByRecipeIdsQuery,
@@ -34,8 +33,22 @@ const SERVICE_TYPE_BY_ORDER_TYPE = Object.freeze({
   pickup: 'PARA_LLEVAR',
   delivery: 'DELIVERY'
 });
+const DELIVERY_TYPE_BY_ORDER_TYPE = Object.freeze({
+  'dine-in': 'LOCAL',
+  pickup: 'RECOGER',
+  delivery: 'DELIVERY'
+});
+const INITIAL_ORDER_PAYMENT_STATE = 'PENDIENTE';
 
-const ORDER_STATE_ALIASES = Object.freeze(['pendiente']);
+const ORDER_STATE_ALIASES = Object.freeze([
+  'pendiente',
+  'pendientes',
+  'pendiente_/_por_pagar',
+  'pendientes_/_por_pagar',
+  'por_pagar',
+  'pendiente_por_pagar'
+]);
+const PENDING_STATE_ID_PRIORITY = 1;
 const HAMBURGUESA_KEYWORDS = Object.freeze(['hamburguesa', 'burger', 'smash']);
 const PUBLIC_EXTRA_OPTIONS = Object.freeze([
   {
@@ -46,12 +59,25 @@ const PUBLIC_EXTRA_OPTIONS = Object.freeze([
     keywords: HAMBURGUESA_KEYWORDS
   }
 ]);
+const ORDER_TYPES_REQUIRING_TRANSFER_PROOF = new Set(['pickup', 'delivery']);
+const MAX_PUBLIC_ORDER_DESCRIPTION_LENGTH = 240;
+const MAX_PUBLIC_ITEM_NOTE_LENGTH = 100;
 
 // Crea errores HTTP controlados para que el controlador responda con status consistente.
 const buildHttpError = (status, message) => {
   const error = new Error(message);
   error.status = status;
   return error;
+};
+
+const normalizeCompactText = (value, maxLength = 120) => {
+  const clean = String(value ?? '')
+    .trim()
+    .replace(/\s+/g, ' ');
+
+  if (!clean) return '';
+  const limit = Number.isInteger(maxLength) && maxLength > 0 ? maxLength : 120;
+  return clean.slice(0, limit);
 };
 
 const normalizeTextKey = (value) =>
@@ -209,7 +235,8 @@ const buildCatalogSauceConfigByDetail = async (catalogRows = []) => {
       id_salsa: Number(row.id_salsa),
       nombre: row.nombre,
       nivel_picante: Number(row.nivel_picante || 0),
-      orden: Number(row.orden || 0)
+      orden: Number(row.orden || 0),
+      disponible: Boolean(row?.disponible ?? true)
     });
   }
 
@@ -421,8 +448,21 @@ const mapMenuSummary = (row) => ({
 
 const resolvePendingStateId = async () => {
   const rows = await fetchEstadoPedidoRowsQuery();
-  const match = rows.find((row) => ORDER_STATE_ALIASES.includes(normalizeTextKey(row?.descripcion)));
-  const id = Number(match?.id_estado_pedido || 0);
+  // Regla de compatibilidad con tablero Ventas:
+  // El carril "Pendientes / Por pagar" consume actualmente id_estado_pedido = 1.
+  // Priorizamos ese ID para que los pedidos del menú público entren en la primera columna.
+  const priorityById = rows.find(
+    (row) => Number(row?.id_estado_pedido || 0) === PENDING_STATE_ID_PRIORITY
+  );
+  if (priorityById) {
+    return Number(priorityById.id_estado_pedido);
+  }
+
+  // Fallback defensivo por descripción (instalaciones con catálogo distinto).
+  const matchByAlias = rows.find((row) =>
+    ORDER_STATE_ALIASES.includes(normalizeTextKey(row?.descripcion))
+  );
+  const id = Number(matchByAlias?.id_estado_pedido || 0);
   return id > 0 ? id : null;
 };
 
@@ -453,7 +493,7 @@ const normalizeRequestedSauces = (rawSauces = []) => {
     .sort((left, right) => left.id_salsa - right.id_salsa);
 };
 
-const buildRequestedConfigSignature = ({ extras = [], salsas_por_unidad = [] }) => {
+const buildRequestedConfigSignature = ({ extras = [], salsas_por_unidad = [], nota = '' }) => {
   const extrasToken = normalizeRequestedExtras(extras)
     .map((entry) => entry.id_extra)
     .sort()
@@ -463,7 +503,9 @@ const buildRequestedConfigSignature = ({ extras = [], salsas_por_unidad = [] }) 
     .map((entry) => `${entry.id_salsa}:${entry.cantidad}`)
     .join('|');
 
-  return `${extrasToken}::${saucesToken}`;
+  // Incluimos la nota para evitar fusionar lineas con configuraciones iguales pero instrucciones distintas.
+  const noteToken = normalizeCompactText(nota, MAX_PUBLIC_ITEM_NOTE_LENGTH);
+  return `${extrasToken}::${saucesToken}::${noteToken}`;
 };
 
 const normalizeRequestedOrderItems = (items = []) => {
@@ -476,7 +518,8 @@ const normalizeRequestedOrderItems = (items = []) => {
 
     const signature = buildRequestedConfigSignature({
       extras: row?.extras,
-      salsas_por_unidad: row?.salsas_por_unidad
+      salsas_por_unidad: row?.salsas_por_unidad,
+      nota: row?.nota
     });
     const lineKey = `${idDetalleMenu}::${signature}`;
     const current = merged.get(lineKey);
@@ -486,7 +529,8 @@ const normalizeRequestedOrderItems = (items = []) => {
         id_detalle_menu: idDetalleMenu,
         cantidad,
         extras: normalizeRequestedExtras(row?.extras),
-        salsas_por_unidad: normalizeRequestedSauces(row?.salsas_por_unidad)
+        salsas_por_unidad: normalizeRequestedSauces(row?.salsas_por_unidad),
+        nota: normalizeCompactText(row?.nota, MAX_PUBLIC_ITEM_NOTE_LENGTH)
       });
       return;
     }
@@ -500,7 +544,7 @@ const normalizeRequestedOrderItems = (items = []) => {
   }));
 };
 
-const buildLineObservation = ({ extras = [], salsasPorUnidad = [] }) => {
+const buildLineObservation = ({ extras = [], salsasPorUnidad = [], nota = '' }) => {
   const extrasToken = (Array.isArray(extras) ? extras : [])
     .map((entry) => {
       const code = normalizeTextKey(entry?.codigo || entry?.id_extra || '');
@@ -525,9 +569,111 @@ const buildLineObservation = ({ extras = [], salsasPorUnidad = [] }) => {
   const chunks = [];
   if (extrasToken) chunks.push(`extras=${extrasToken}`);
   if (saucesToken) chunks.push(`salsas=${saucesToken}`);
+  if (normalizeCompactText(nota, MAX_PUBLIC_ITEM_NOTE_LENGTH)) {
+    chunks.push(`nota=${normalizeCompactText(nota, MAX_PUBLIC_ITEM_NOTE_LENGTH)}`);
+  }
   if (chunks.length === 0) return null;
 
   return `PUBCFG:v1|${chunks.join('|')}`.slice(0, 200);
+};
+
+const buildLineStructuredConfig = ({
+  line = {},
+  catalog = {},
+  configuration = {},
+  precioUnitario = 0,
+  subtotal = 0
+}) => {
+  const extras = [...(Array.isArray(configuration?.extras) ? configuration.extras : [])]
+    .map((entry) => ({
+      id_extra: String(entry?.id_extra || ''),
+      codigo: String(entry?.codigo || entry?.id_extra || ''),
+      nombre: String(entry?.nombre || 'Extra'),
+      precio_adicional: roundMoney(entry?.precio_adicional || 0)
+    }))
+    .filter((entry) => entry.id_extra)
+    .sort((left, right) => left.id_extra.localeCompare(right.id_extra));
+
+  const salsasPorUnidad = [...(Array.isArray(configuration?.salsas_por_unidad) ? configuration.salsas_por_unidad : [])]
+    .map((entry) => ({
+      id_salsa: Number(entry?.id_salsa || 0),
+      cantidad: Number(entry?.cantidad || 0)
+    }))
+    .filter((entry) => Number.isInteger(entry.id_salsa) && entry.id_salsa > 0 && Number.isInteger(entry.cantidad) && entry.cantidad > 0)
+    .sort((left, right) => left.id_salsa - right.id_salsa);
+
+  // Snapshot inmutable de la linea para trazabilidad operativa (cocina/ventas/auditoria).
+  return {
+    schema_version: 'menu_publico_linea_v1',
+    id_detalle_menu: Number(catalog?.id_detalle_menu || line?.id_detalle_menu || 0),
+    tipo_item: String(catalog?.tipo_item || line?.tipo_item || 'PRODUCTO'),
+    nombre_item: String(catalog?.nombre || line?.nombre || 'Item'),
+    cantidad: Number(line?.cantidad || 0),
+    precio_unitario: roundMoney(precioUnitario || 0),
+    subtotal_linea: roundMoney(subtotal || 0),
+    extras,
+    salsas_por_unidad: salsasPorUnidad,
+    salsas_requeridas: Number(configuration?.salsas_requeridas || 0),
+    nota_cliente: normalizeCompactText(line?.nota, MAX_PUBLIC_ITEM_NOTE_LENGTH)
+  };
+};
+
+const normalizePublicOrderBusinessContext = ({ tipoPedido, business = {} }) => {
+  const contactoRaw = business?.contacto && typeof business.contacto === 'object'
+    ? business.contacto
+    : {};
+  const entregaRaw = business?.entrega && typeof business.entrega === 'object'
+    ? business.entrega
+    : {};
+  const pagoRaw = business?.pago && typeof business.pago === 'object'
+    ? business.pago
+    : {};
+
+  return {
+    contacto: {
+      nombre: normalizeCompactText(contactoRaw.nombre, 120),
+      telefono: normalizeCompactText(contactoRaw.telefono, 30)
+    },
+    entrega: {
+      direccion: normalizeCompactText(entregaRaw.direccion, 240),
+      referencia: normalizeCompactText(entregaRaw.referencia, 160)
+    },
+    pago: {
+      metodo: normalizeCompactText(pagoRaw.metodo, 40),
+      comprobante_transferencia: normalizeCompactText(pagoRaw.comprobante_transferencia, 180)
+    },
+    requiresTransferProof: ORDER_TYPES_REQUIRING_TRANSFER_PROOF.has(String(tipoPedido || ''))
+  };
+};
+
+const buildPublicOrderDescription = ({ origen, tipoPedido, businessContext }) => {
+  const safeOrigin = normalizeCompactText(origen || 'public-menu', 60) || 'public-menu';
+  const base = `[${safeOrigin}] pedido web`;
+  const chunks = [];
+
+  if (businessContext?.contacto?.telefono) {
+    chunks.push(`tel:${businessContext.contacto.telefono}`);
+  }
+
+  if (businessContext?.pago?.comprobante_transferencia) {
+    chunks.push(`comp:${businessContext.pago.comprobante_transferencia}`);
+  }
+
+  if (String(tipoPedido || '') === 'delivery') {
+    if (businessContext?.entrega?.direccion) {
+      chunks.push(`dir:${businessContext.entrega.direccion}`);
+    }
+
+    if (businessContext?.entrega?.referencia) {
+      chunks.push(`ref:${businessContext.entrega.referencia}`);
+    }
+  }
+
+  if (chunks.length === 0) {
+    return base.slice(0, MAX_PUBLIC_ORDER_DESCRIPTION_LENGTH);
+  }
+
+  return `${base} | ${chunks.join(' | ')}`.slice(0, MAX_PUBLIC_ORDER_DESCRIPTION_LENGTH);
 };
 
 const validateAndResolveLineConfiguration = ({ catalog, line }) => {
@@ -553,14 +699,24 @@ const validateAndResolveLineConfiguration = ({ catalog, line }) => {
   );
 
   const allowedSauces = Array.isArray(catalog?.salsas_permitidas) ? catalog.salsas_permitidas : [];
-  const allowedSauceIds = new Set(allowedSauces.map((entry) => Number(entry.id_salsa)));
+  const allowedSauceMap = new Map(
+    allowedSauces.map((entry) => [Number(entry.id_salsa), Boolean(entry?.disponible ?? true)])
+  );
   const selectedSauces = normalizeRequestedSauces(line?.salsas_por_unidad);
 
   for (const selected of selectedSauces) {
-    if (!allowedSauceIds.has(Number(selected.id_salsa))) {
+    const sauceId = Number(selected.id_salsa);
+    if (!allowedSauceMap.has(sauceId)) {
       throw buildHttpError(
         400,
         `El item ${catalog.nombre} no permite la salsa ${selected.id_salsa} para esta configuracion.`
+      );
+    }
+
+    if (!allowedSauceMap.get(sauceId)) {
+      throw buildHttpError(
+        409,
+        `La salsa ${selected.id_salsa} no esta disponible actualmente para ${catalog.nombre}.`
       );
     }
   }
@@ -701,8 +857,39 @@ export const getPublicCatalogItemDetailService = async ({ idSucursal, idDetalleM
   };
 };
 
-// Servicio: registrar pedido enviado desde el menu publico (sin login dashboard).
-export const createPublicOrderService = async ({ idSucursal, tipoPedido, origen = 'public-menu', items = [] }) => {
+// Servicio: registrar pedido enviado desde el menu publico.
+// Regla: pedido asociado al cliente autenticado (sin usuario fallback).
+export const createPublicOrderService = async ({
+  idSucursal,
+  tipoPedido,
+  origen = 'public-menu',
+  business = {},
+  items = [],
+  auth = {}
+}) => {
+  const idUsuario = toPositiveInt(auth?.idUsuario);
+  const idCliente = toPositiveInt(auth?.idCliente);
+  if (!idUsuario || !idCliente) {
+    throw buildHttpError(401, 'Sesion de cliente invalida para registrar el pedido.');
+  }
+
+  const businessContext = normalizePublicOrderBusinessContext({
+    tipoPedido,
+    business
+  });
+
+  if (businessContext.requiresTransferProof && !businessContext.pago.comprobante_transferencia) {
+    throw buildHttpError(400, 'Debes adjuntar referencia o comprobante de transferencia.');
+  }
+
+  if (businessContext.requiresTransferProof && !businessContext.contacto.telefono) {
+    throw buildHttpError(400, 'Debes enviar telefono de contacto para pickup/delivery.');
+  }
+
+  if (String(tipoPedido || '') === 'delivery' && !businessContext.entrega.direccion) {
+    throw buildHttpError(400, 'Debes enviar direccion de entrega para pedidos delivery.');
+  }
+
   const activeMenu = await fetchActiveMenuByBranchQuery(idSucursal);
   if (!activeMenu) {
     throw buildHttpError(409, 'La sucursal no tiene menu vigente activo para registrar pedidos.');
@@ -764,7 +951,15 @@ export const createPublicOrderService = async ({ idSucursal, tipoPedido, origen 
     const subtotal = roundMoney(precioUnitario * cantidad);
     const observacion = buildLineObservation({
       extras: configuration.extras,
-      salsasPorUnidad: configuration.salsas_por_unidad
+      salsasPorUnidad: configuration.salsas_por_unidad,
+      nota: line?.nota
+    });
+    const configuracionMenu = buildLineStructuredConfig({
+      line,
+      catalog,
+      configuration,
+      precioUnitario,
+      subtotal
     });
 
     return {
@@ -778,25 +973,30 @@ export const createPublicOrderService = async ({ idSucursal, tipoPedido, origen 
       precio_unitario: roundMoney(precioUnitario),
       subtotal,
       observacion,
+      configuracion_menu: configuracionMenu,
       extras: configuration.extras,
       salsas_por_unidad: configuration.salsas_por_unidad,
-      salsas_requeridas: configuration.salsas_requeridas
+      salsas_requeridas: configuration.salsas_requeridas,
+      nota: normalizeCompactText(line?.nota, MAX_PUBLIC_ITEM_NOTE_LENGTH)
     };
   });
 
   const total = roundMoney(normalizedLines.reduce((sum, line) => sum + line.subtotal, 0));
   const idEstadoPedido = await resolvePendingStateId();
   if (!idEstadoPedido) {
-    throw buildHttpError(500, 'No existe estado PENDIENTE en estados_pedido.');
-  }
-
-  const idUsuario = await fetchFallbackOrderUserIdQuery();
-  if (!idUsuario) {
-    throw buildHttpError(500, 'No hay usuario disponible para registrar pedidos publicos.');
+    throw buildHttpError(
+      409,
+      'Configuracion incompleta: no existe estado inicial PENDIENTE/POR PAGAR para pedidos.'
+    );
   }
 
   const descripcionEnvio = SERVICE_TYPE_BY_ORDER_TYPE[tipoPedido] || 'LOCAL';
-  const descripcionPedido = `[${origen}] pedido web`;
+  const tipoEntrega = DELIVERY_TYPE_BY_ORDER_TYPE[tipoPedido] || 'LOCAL';
+  const descripcionPedido = buildPublicOrderDescription({
+    origen,
+    tipoPedido,
+    businessContext
+  });
 
   const client = await pool.connect();
   try {
@@ -810,7 +1010,10 @@ export const createPublicOrderService = async ({ idSucursal, tipoPedido, origen 
       total,
       id_estado_pedido: idEstadoPedido,
       id_sucursal: Number(idSucursal),
-      id_usuario: Number(idUsuario)
+      id_cliente: Number(idCliente),
+      id_usuario: Number(idUsuario),
+      estado_pago: INITIAL_ORDER_PAYMENT_STATE,
+      tipo_entrega: tipoEntrega
     });
 
     const idPedido = Number(pedido?.id_pedido || 0);
@@ -826,7 +1029,8 @@ export const createPublicOrderService = async ({ idSucursal, tipoPedido, origen 
         id_pedido: idPedido,
         id_combo: line.id_combo,
         id_receta: line.id_receta,
-        observacion: line.observacion
+        observacion: line.observacion,
+        configuracion_menu: line.configuracion_menu
       });
     }
 
@@ -836,9 +1040,13 @@ export const createPublicOrderService = async ({ idSucursal, tipoPedido, origen 
       id_pedido: idPedido,
       numero_ticket: buildTicketNumber(idPedido),
       id_sucursal: Number(idSucursal),
+      id_cliente: Number(idCliente),
       id_menu: Number(activeMenu.id_menu),
       tipo_pedido: tipoPedido,
+      tipo_entrega: tipoEntrega,
+      business: businessContext,
       estado: 'PENDIENTE',
+      estado_pago: INITIAL_ORDER_PAYMENT_STATE,
       total,
       total_items: normalizedLines.reduce((sum, line) => sum + Number(line.cantidad || 0), 0),
       fecha_hora_pedido: pedido?.fecha_hora_pedido || null,
@@ -849,6 +1057,7 @@ export const createPublicOrderService = async ({ idSucursal, tipoPedido, origen 
         cantidad: line.cantidad,
         precio_unitario: line.precio_unitario,
         subtotal: line.subtotal,
+        configuracion_menu: line.configuracion_menu,
         extras: line.extras,
         salsas_por_unidad: line.salsas_por_unidad,
         salsas_requeridas: line.salsas_requeridas
