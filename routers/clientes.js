@@ -1103,6 +1103,26 @@ const clienteRepository = {
     return result.rows.length > 0;
   },
 
+  async resolveTipoClienteIdForInsert(idTipoCliente, capabilities, db = pool) {
+    const preferred = parseNullablePositiveInt(idTipoCliente);
+    if (!capabilities?.hasTipoClienteTable) return preferred;
+
+    if (preferred && (await this.tipoClienteExists(preferred, capabilities, db))) {
+      return preferred;
+    }
+
+    const defaultGeneral = await db.query(
+      'SELECT id_tipo_cliente FROM public.tipo_cliente WHERE id_tipo_cliente = 2 LIMIT 1'
+    );
+    const idGeneral = parsePositiveInt(defaultGeneral.rows?.[0]?.id_tipo_cliente);
+    if (idGeneral) return idGeneral;
+
+    const firstAvailable = await db.query(
+      'SELECT id_tipo_cliente FROM public.tipo_cliente ORDER BY id_tipo_cliente ASC LIMIT 1'
+    );
+    return parsePositiveInt(firstAvailable.rows?.[0]?.id_tipo_cliente);
+  },
+
   async syncEmpresaClienteContext(idCliente, empresaClienteId, tenantId, capabilities, db = pool) {
     const parsedCliente = parsePositiveInt(idCliente);
     const parsedEmpresaCliente = parsePositiveInt(empresaClienteId);
@@ -1545,13 +1565,6 @@ const clienteService = {
       }
     }
 
-    if (!insertData.id_tipo_cliente || !(await clienteRepository.tipoClienteExists(insertData.id_tipo_cliente, capabilities))) {
-      return {
-        status: 400,
-        body: buildErrorBody({ code: 'VALIDATION_ERROR', message: 'id_tipo_cliente no es valido.' })
-      };
-    }
-
     if (personaId && !(await clienteRepository.personaExists(personaId))) {
       return {
         status: 404,
@@ -1650,6 +1663,26 @@ const clienteService = {
           }
         };
       }
+
+      const resolvedTipoClienteId = await clienteRepository.resolveTipoClienteIdForInsert(
+        insertData.id_tipo_cliente,
+        capabilities,
+        client
+      );
+
+      if (capabilities.hasTipoClienteTable && !resolvedTipoClienteId) {
+        await client.query('ROLLBACK');
+        return {
+          status: 400,
+          body: buildErrorBody({
+            code: 'VALIDATION_ERROR',
+            message: 'No existe un tipo de cliente disponible para crear el registro.'
+          })
+        };
+      }
+
+      if (resolvedTipoClienteId) insertData.id_tipo_cliente = resolvedTipoClienteId;
+      else delete insertData.id_tipo_cliente;
 
       const createdIdRaw = await clienteRepository.create(insertData, client);
       const createdId = parsePositiveInt(createdIdRaw);

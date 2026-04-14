@@ -227,6 +227,32 @@ const hasClienteEmpresaField = async (client, { forceRefresh = false } = {}) => 
   return hasClienteEmpresaFieldCache;
 };
 
+const resolveTipoClienteIdAtomic = async (client, preferredId) => {
+  const preferred = parsePositiveInt(preferredId);
+  const tableExistsRs = await client.query(`SELECT to_regclass('public.tipo_cliente') AS regclass`);
+  const hasTipoClienteTable = Boolean(tableExistsRs.rows?.[0]?.regclass);
+  if (!hasTipoClienteTable) return preferred;
+
+  if (preferred) {
+    const existsRs = await client.query(
+      'SELECT 1 FROM public.tipo_cliente WHERE id_tipo_cliente = $1 LIMIT 1',
+      [preferred]
+    );
+    if (existsRs.rows.length > 0) return preferred;
+  }
+
+  const generalRs = await client.query(
+    'SELECT id_tipo_cliente FROM public.tipo_cliente WHERE id_tipo_cliente = 2 LIMIT 1'
+  );
+  const generalId = parsePositiveInt(generalRs.rows?.[0]?.id_tipo_cliente);
+  if (generalId) return generalId;
+
+  const firstRs = await client.query(
+    'SELECT id_tipo_cliente FROM public.tipo_cliente ORDER BY id_tipo_cliente ASC LIMIT 1'
+  );
+  return parsePositiveInt(firstRs.rows?.[0]?.id_tipo_cliente);
+};
+
 const fnGuardarClienteSupportsEmpresaCliente = async (client, { forceRefresh = false } = {}) => {
   const now = Date.now();
   const shouldRefresh = forceRefresh
@@ -918,13 +944,6 @@ const atomicService = {
         };
       }
 
-      const idTipoCliente = parsePositiveInt(normalizedCliente.id_tipo_cliente);
-      if (!idTipoCliente) {
-        const error = new Error('id_tipo_cliente es requerido y debe ser entero positivo');
-        error.httpStatus = 400;
-        throw error;
-      }
-
       if (Object.prototype.hasOwnProperty.call(clientePayload, 'puntos')) {
         const rawPuntos = Number(clientePayload.puntos);
         if (!Number.isFinite(rawPuntos) || rawPuntos < 0) {
@@ -1014,6 +1033,14 @@ const atomicService = {
           }
         };
       }
+
+      const resolvedTipoClienteId = await resolveTipoClienteIdAtomic(client, normalizedCliente.id_tipo_cliente);
+      if (!resolvedTipoClienteId) {
+        const error = new Error('No existe un tipo de cliente disponible para crear el registro');
+        error.httpStatus = 400;
+        throw error;
+      }
+      normalizedCliente.id_tipo_cliente = resolvedTipoClienteId;
 
       const clienteFnPayload = { ...normalizedCliente };
       if (supportsEmpresaClienteInFn) {
