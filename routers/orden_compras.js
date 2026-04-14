@@ -1,5 +1,4 @@
 import express from 'express';
-import pool from '../config/db-connection.js';
 import { checkPermission } from '../middleware/checkPermission.js';
 
 const router = express.Router();
@@ -23,21 +22,7 @@ const blockLegacyWrite = (_req, res) => {
 
 // GET: Obtener orden_compras
 router.get('/orden_compras', checkPermission(PERM_OC_VIEW_LEGACY), async (req, res) => {
-  try {
-    const tabla = 'orden_compras';
-    // AM: incluye correlativo visible de negocio sin reemplazar el id tecnico interno.
-    const columnas = 'id_orden_compra, numero_oc_visible, id_usuario, fecha, estado';
-
-    const query = 'SELECT function_select($1, $2) as resultado';
-    const result = await pool.query(query, [tabla, columnas]);
-
-    const datos = result.rows[0].resultado || [];
-    res.status(200).json(datos);
-
-  } catch (err) {
-    console.error('Error al obtener orden_compras:', err.message);
-    res.status(500).json({ error: true, message: err.message });
-  }
+  return blockLegacyWrite(req, res);
 });
 
 // POST: Crear orden_compra

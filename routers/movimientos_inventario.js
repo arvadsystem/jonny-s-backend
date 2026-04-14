@@ -1,5 +1,7 @@
 import express from 'express';
 import pool from '../config/db-connection.js';
+import { checkPermission } from '../middleware/checkPermission.js';
+import { resolveRequestUserSucursalScope } from '../utils/sucursalScope.js';
 
 const router = express.Router();
 
@@ -9,6 +11,15 @@ const router = express.Router();
 // VISTA: public.v_kardex_detalle
 // ==============================
 const VALID_TIPOS = new Set(['ENTRADA', 'SALIDA', 'AJUSTE']);
+const MOVIMIENTOS_VIEW_PERMISSIONS = ['INVENTARIO_MOVIMIENTOS_VER'];
+const MOVIMIENTOS_CREATE_PERMISSIONS = ['INVENTARIO_MOVIMIENTOS_CREAR'];
+const MOVIMIENTOS_EDIT_PERMISSIONS = ['INVENTARIO_MOVIMIENTOS_EDITAR'];
+const MOVIMIENTOS_DELETE_PERMISSIONS = ['INVENTARIO_MOVIMIENTOS_ELIMINAR'];
+const MOVIMIENTOS_DEFAULT_PAGE = 1;
+const MOVIMIENTOS_DEFAULT_PAGE_SIZE = 10;
+const MOVIMIENTOS_MAX_PAGE_SIZE = 100;
+const MOVIMIENTOS_REFERENCIAS_DEFAULT_LIMIT = 200;
+const MOVIMIENTOS_REFERENCIAS_MAX_LIMIT = 500;
 const ITEM_TIPO_MAP = new Map([
   ['producto', 'Producto'],
   ['insumo', 'Insumo'],
@@ -16,6 +27,10 @@ const ITEM_TIPO_MAP = new Map([
   ['Insumo', 'Insumo']
 ]);
 const APPEND_ONLY_MESSAGE = 'KARDEX NO PERMITE EDITAR/ELIMINAR. CREE UN NUEVO MOVIMIENTO.';
+const MOVIMIENTOS_SCOPE_FORBIDDEN_MESSAGE =
+  'No tiene permisos para operar sobre recursos fuera de su sucursal.';
+const MOVIMIENTOS_SCOPE_MISSING_BRANCHES_MESSAGE = 'El empleado no tiene sucursales asignadas.';
+const MOVIMIENTOS_ALMACEN_NOT_FOUND_MESSAGE = 'Almacen no encontrado.';
 
 const hasValue = (value) =>
   value !== undefined &&
@@ -37,9 +52,66 @@ const sendValidationError = (res, message, details) =>
 const sendConflictError = (res, message) =>
   sendError(res, 409, 'CONFLICT', message);
 
-const sendInternalError = (res, context, error) => {
-  console.error(`[movimientos_inventario] ${context}:`, error);
-  return sendError(res, 500, 'INTERNAL_ERROR', 'No se pudo completar la operacion solicitada.');
+const SHOULD_INCLUDE_ERROR_STACK = ['development', 'dev', 'local'].includes(
+  String(process.env.NODE_ENV || '')
+    .trim()
+    .toLowerCase()
+);
+
+const truncateLogValue = (value, maxLength = 280) => {
+  const normalized = String(value ?? '').trim();
+  if (!normalized) return '';
+  if (normalized.length <= maxLength) return normalized;
+  return `${normalized.slice(0, maxLength)}...`;
+};
+
+const looksSensitiveErrorMessage = (message) =>
+  /\b(select|insert|update|delete|from|where|join)\b/i.test(String(message || '')) ||
+  /public\./i.test(String(message || ''));
+
+const sanitizeErrorForLog = (error) => {
+  const rawMessage = truncateLogValue(error?.message || 'Unexpected error');
+  const safeMessage = looksSensitiveErrorMessage(rawMessage)
+    ? 'Database error details hidden.'
+    : rawMessage;
+
+  const safeError = {
+    name: truncateLogValue(error?.name || 'Error', 120) || 'Error',
+    code: truncateLogValue(error?.code || '', 80) || null,
+    message: safeMessage
+  };
+
+  if (SHOULD_INCLUDE_ERROR_STACK && typeof error?.stack === 'string') {
+    safeError.stack = truncateLogValue(
+      error.stack
+        .split('\n')
+        .slice(0, 6)
+        .join('\n'),
+      1200
+    );
+  }
+
+  return safeError;
+};
+
+const logRouterError = (context, error, { category = 'INTERNAL_ERROR' } = {}) => {
+  const safeContext = truncateLogValue(context || 'Unhandled context', 160) || 'Unhandled context';
+  const safeError = sanitizeErrorForLog(error);
+  console.error('[movimientos_inventario] error', {
+    category,
+    context: safeContext,
+    ...safeError
+  });
+};
+
+const sendInternalError = (
+  res,
+  context,
+  error,
+  publicMessage = 'Error interno al consultar movimientos de inventario.'
+) => {
+  logRouterError(context, error, { category: 'INTERNAL_ERROR' });
+  return sendError(res, 500, 'INTERNAL_ERROR', publicMessage);
 };
 
 const isPositiveIntegerId = (value) => Number.isSafeInteger(value) && value > 0;
@@ -77,6 +149,103 @@ const parseRequiredPositiveInt = (rawValue, fieldName) => {
   }
 
   return { ok: true, value: normalizedValue, error: null };
+};
+
+const normalizeScopeSucursalIds = (rawIds) =>
+  Array.from(
+    new Set(
+      (Array.isArray(rawIds) ? rawIds : [])
+        .map((value) => Number.parseInt(String(value ?? '').trim(), 10))
+        .filter((value) => Number.isInteger(value) && value > 0)
+    )
+  );
+
+const getRequestMovimientosScope = async (req, db = pool) => {
+  if (req?.__movimientosScope) return req.__movimientosScope;
+
+  const resolvedScope = await resolveRequestUserSucursalScope(req, db);
+  const scope = {
+    isSuperAdmin: Boolean(resolvedScope?.isSuperAdmin),
+    allowedSucursalIds: normalizeScopeSucursalIds(resolvedScope?.allowedSucursalIds)
+  };
+
+  if (req) req.__movimientosScope = scope;
+  return scope;
+};
+
+const ensureMovimientosScopeAvailable = (res, scope) => {
+  if (scope?.isSuperAdmin) return true;
+  if (Array.isArray(scope?.allowedSucursalIds) && scope.allowedSucursalIds.length > 0) return true;
+
+  sendError(res, 403, 'FORBIDDEN', MOVIMIENTOS_SCOPE_MISSING_BRANCHES_MESSAGE);
+  return false;
+};
+
+const ensureMovimientosSucursalInScope = (res, scope, idSucursal) => {
+  if (scope?.isSuperAdmin) return true;
+  if (!Array.isArray(scope?.allowedSucursalIds) || scope.allowedSucursalIds.length === 0) {
+    sendError(res, 403, 'FORBIDDEN', MOVIMIENTOS_SCOPE_MISSING_BRANCHES_MESSAGE);
+    return false;
+  }
+
+  if (!scope.allowedSucursalIds.includes(Number(idSucursal))) {
+    sendError(res, 403, 'FORBIDDEN', MOVIMIENTOS_SCOPE_FORBIDDEN_MESSAGE);
+    return false;
+  }
+
+  return true;
+};
+
+const findAlmacenScopeRowById = async (idAlmacen, db = pool) => {
+  const result = await db.query(
+    `
+      SELECT id_almacen, id_sucursal
+      FROM public.almacenes
+      WHERE id_almacen = $1
+      LIMIT 1
+    `,
+    [idAlmacen]
+  );
+
+  return result.rows?.[0] || null;
+};
+
+const ensureAlmacenIdInMovimientosScope = async (
+  req,
+  res,
+  idAlmacen,
+  {
+    scope = null,
+    db = pool,
+    notFoundMessage = MOVIMIENTOS_ALMACEN_NOT_FOUND_MESSAGE,
+    shouldMaskOutOfScope = true
+  } = {}
+) => {
+  const resolvedScope = scope || (await getRequestMovimientosScope(req, db));
+  if (!ensureMovimientosScopeAvailable(res, resolvedScope)) {
+    return { ok: false, scope: resolvedScope, almacen: null };
+  }
+
+  if (resolvedScope.isSuperAdmin) {
+    return { ok: true, scope: resolvedScope, almacen: await findAlmacenScopeRowById(idAlmacen, db) };
+  }
+
+  const almacen = await findAlmacenScopeRowById(idAlmacen, db);
+  if (!almacen) {
+    return { ok: true, scope: resolvedScope, almacen: null };
+  }
+
+  const idSucursal = Number.parseInt(String(almacen?.id_sucursal ?? '').trim(), 10);
+  if (!Number.isInteger(idSucursal) || !resolvedScope.allowedSucursalIds.includes(idSucursal)) {
+    if (shouldMaskOutOfScope) {
+      sendError(res, 404, 'NOT_FOUND', notFoundMessage);
+    } else {
+      sendError(res, 403, 'FORBIDDEN', MOVIMIENTOS_SCOPE_FORBIDDEN_MESSAGE);
+    }
+    return { ok: false, scope: resolvedScope, almacen: null };
+  }
+
+  return { ok: true, scope: resolvedScope, almacen };
 };
 
 const parseOptionalTipo = (rawValue) => {
@@ -158,6 +327,84 @@ const parseOptionalText = (rawValue) => {
 
   const normalizedValue = String(rawValue).trim();
   return normalizedValue ? { provided: true, value: normalizedValue } : { provided: false, value: null };
+};
+
+const parseReferenciaItemTipo = (rawValue) => {
+  if (!hasValue(rawValue)) {
+    return { ok: false, error: 'item_tipo es obligatorio. Use producto o insumo.' };
+  }
+
+  const normalizedValue = String(rawValue).trim().toLowerCase();
+  if (!['producto', 'insumo'].includes(normalizedValue)) {
+    return { ok: false, error: 'item_tipo debe ser producto o insumo.' };
+  }
+
+  return { ok: true, value: normalizedValue };
+};
+
+const parseReferencesLimit = (query = {}) => {
+  const parsed = parseOptionalPositiveInt(query?.limit ?? query?.pageSize ?? query?.page_size, 'limit');
+  if (parsed.error) {
+    return { ok: false, error: parsed.error };
+  }
+
+  const limit = parsed.provided ? parsed.value : MOVIMIENTOS_REFERENCIAS_DEFAULT_LIMIT;
+  if (limit > MOVIMIENTOS_REFERENCIAS_MAX_LIMIT) {
+    return {
+      ok: false,
+      error: `limit no puede ser mayor a ${MOVIMIENTOS_REFERENCIAS_MAX_LIMIT}.`
+    };
+  }
+
+  return { ok: true, value: limit };
+};
+
+const parsePaginationQuery = (query = {}) => {
+  const pageResult = parseOptionalPositiveInt(query?.page, 'page');
+  if (pageResult.error) {
+    return { ok: false, error: pageResult.error };
+  }
+
+  const rawPageSize = query?.pageSize ?? query?.page_size ?? query?.limit;
+  const pageSizeResult = parseOptionalPositiveInt(rawPageSize, 'pageSize');
+  if (pageSizeResult.error) {
+    return { ok: false, error: pageSizeResult.error };
+  }
+
+  const page = pageResult.provided ? pageResult.value : MOVIMIENTOS_DEFAULT_PAGE;
+  const pageSize = pageSizeResult.provided ? pageSizeResult.value : MOVIMIENTOS_DEFAULT_PAGE_SIZE;
+
+  if (pageSize > MOVIMIENTOS_MAX_PAGE_SIZE) {
+    return {
+      ok: false,
+      error: `pageSize no puede ser mayor a ${MOVIMIENTOS_MAX_PAGE_SIZE}.`
+    };
+  }
+
+  return {
+    ok: true,
+    page,
+    pageSize,
+    offset: (page - 1) * pageSize
+  };
+};
+
+const buildPaginatedPayload = ({ items, page, pageSize, total }) => {
+  const safeItems = Array.isArray(items) ? items : [];
+  const safeTotal = Number.isInteger(Number(total)) ? Number(total) : 0;
+  const totalPages = Math.max(1, Math.ceil(safeTotal / pageSize));
+
+  return {
+    ok: true,
+    items: safeItems,
+    data: safeItems,
+    pagination: {
+      page,
+      pageSize,
+      total: safeTotal,
+      totalPages
+    }
+  };
 };
 
 // NEW: CENTRALIZA LA VALIDACION DEL PAYLOAD DE ALTA PARA RESPETAR EL KARDEX APPEND-ONLY.
@@ -387,9 +634,14 @@ const normalizeMovimientoDbError = (error) => {
   return null;
 };
 
-// GET: OBTENER MOVIMIENTOS LEGADO
-router.get('/movimientos_inventario', async (req, res) => {
+// GET: REFERENCIAS OPERATIVAS PARA FORMULARIO DE MOVIMIENTOS
+router.get('/movimientos_inventario/referencias', checkPermission(MOVIMIENTOS_VIEW_PERMISSIONS), async (req, res) => {
   try {
+    const itemTipo = parseReferenciaItemTipo(req.query?.item_tipo);
+    if (!itemTipo.ok) {
+      return sendValidationError(res, itemTipo.error);
+    }
+
     const idAlmacenFilter = parseOptionalPositiveInt(req.query?.id_almacen, 'id_almacen');
     if (idAlmacenFilter.error) {
       return sendValidationError(res, idAlmacenFilter.error);
@@ -400,7 +652,138 @@ router.get('/movimientos_inventario', async (req, res) => {
       return sendValidationError(res, idSucursalFilter.error);
     }
 
-    const query = `
+    const scope = await getRequestMovimientosScope(req);
+    if (!ensureMovimientosScopeAvailable(res, scope)) {
+      return;
+    }
+    if (
+      idSucursalFilter.provided &&
+      !ensureMovimientosSucursalInScope(res, scope, idSucursalFilter.value)
+    ) {
+      return;
+    }
+    if (idAlmacenFilter.provided) {
+      const almacenScopeCheck = await ensureAlmacenIdInMovimientosScope(
+        req,
+        res,
+        idAlmacenFilter.value,
+        { scope, shouldMaskOutOfScope: true }
+      );
+      if (!almacenScopeCheck.ok) return;
+    }
+
+    if (!idAlmacenFilter.provided && !idSucursalFilter.provided) {
+      return sendValidationError(res, 'Debe enviar id_almacen o id_sucursal para cargar referencias.');
+    }
+
+    const parsedLimit = parseReferencesLimit(req.query || {});
+    if (!parsedLimit.ok) {
+      return sendValidationError(res, parsedLimit.error);
+    }
+
+    const baseWhere = `
+      WHERE COALESCE(item.estado, true) = true
+        AND COALESCE(a.estado, true) = true
+        AND ($1::int IS NULL OR item.id_almacen = $1)
+        AND ($2::int IS NULL OR a.id_sucursal = $2)
+        AND ($4::boolean = true OR a.id_sucursal = ANY($5::int[]))
+    `;
+
+    const queryByItemType = itemTipo.value === 'producto'
+      ? `
+        SELECT
+          item.id_producto,
+          item.nombre_producto,
+          item.id_almacen
+        FROM public.productos item
+        INNER JOIN public.almacenes a ON a.id_almacen = item.id_almacen
+        ${baseWhere}
+        ORDER BY item.nombre_producto ASC, item.id_producto ASC
+        LIMIT $3
+      `
+      : `
+        SELECT
+          item.id_insumo,
+          item.nombre_insumo,
+          item.id_almacen
+        FROM public.insumos item
+        INNER JOIN public.almacenes a ON a.id_almacen = item.id_almacen
+        ${baseWhere}
+        ORDER BY item.nombre_insumo ASC, item.id_insumo ASC
+        LIMIT $3
+      `;
+
+    const queryResult = await pool.query(queryByItemType, [
+      idAlmacenFilter.value,
+      idSucursalFilter.value,
+      parsedLimit.value,
+      scope.isSuperAdmin,
+      scope.allowedSucursalIds
+    ]);
+
+    return res.status(200).json({
+      ok: true,
+      item_tipo: itemTipo.value,
+      items: queryResult.rows || []
+    });
+  } catch (error) {
+    return sendInternalError(res, 'Error al obtener referencias de movimientos', error);
+  }
+});
+
+// GET: OBTENER MOVIMIENTOS LEGADO
+router.get('/movimientos_inventario', checkPermission(MOVIMIENTOS_VIEW_PERMISSIONS), async (req, res) => {
+  try {
+    const pagination = parsePaginationQuery(req.query || {});
+    if (!pagination.ok) {
+      return sendValidationError(res, pagination.error);
+    }
+
+    const idAlmacenFilter = parseOptionalPositiveInt(req.query?.id_almacen, 'id_almacen');
+    if (idAlmacenFilter.error) {
+      return sendValidationError(res, idAlmacenFilter.error);
+    }
+
+    const idSucursalFilter = parseOptionalPositiveInt(req.query?.id_sucursal, 'id_sucursal');
+    if (idSucursalFilter.error) {
+      return sendValidationError(res, idSucursalFilter.error);
+    }
+
+    const scope = await getRequestMovimientosScope(req);
+    if (!ensureMovimientosScopeAvailable(res, scope)) {
+      return;
+    }
+    if (
+      idSucursalFilter.provided &&
+      !ensureMovimientosSucursalInScope(res, scope, idSucursalFilter.value)
+    ) {
+      return;
+    }
+
+    if (idAlmacenFilter.provided) {
+      const almacenScopeCheck = await ensureAlmacenIdInMovimientosScope(
+        req,
+        res,
+        idAlmacenFilter.value,
+        { scope, shouldMaskOutOfScope: true }
+      );
+      if (!almacenScopeCheck.ok) return;
+    }
+
+    const whereClause = `
+      WHERE ($1::int IS NULL OR m.id_almacen = $1)
+        AND ($2::int IS NULL OR a.id_sucursal = $2)
+        AND ($3::boolean = true OR a.id_sucursal = ANY($4::int[]))
+    `;
+
+    const countQuery = `
+      SELECT COUNT(*)::int AS total
+      FROM movimientos_inventario m
+      LEFT JOIN almacenes a ON a.id_almacen = m.id_almacen
+      ${whereClause}
+    `;
+
+    const dataQuery = `
       SELECT
         m.id_movimiento,
         m.fecha_mov,
@@ -414,21 +797,47 @@ router.get('/movimientos_inventario', async (req, res) => {
         m.descripcion
       FROM movimientos_inventario m
       LEFT JOIN almacenes a ON a.id_almacen = m.id_almacen
-      WHERE ($1::int IS NULL OR m.id_almacen = $1)
-        AND ($2::int IS NULL OR a.id_sucursal = $2)
-      ORDER BY m.fecha_mov DESC
+      ${whereClause}
+      ORDER BY m.fecha_mov DESC, m.id_movimiento DESC
+      LIMIT $5 OFFSET $6
     `;
 
-    const result = await pool.query(query, [idAlmacenFilter.value, idSucursalFilter.value]);
-    res.status(200).json(result.rows || []);
+    const baseParams = [
+      idAlmacenFilter.value,
+      idSucursalFilter.value,
+      scope.isSuperAdmin,
+      scope.allowedSucursalIds
+    ];
+    const countResult = await pool.query(countQuery, baseParams);
+    const total = Number(countResult.rows?.[0]?.total ?? 0);
+
+    const result = await pool.query(dataQuery, [
+      ...baseParams,
+      pagination.pageSize,
+      pagination.offset
+    ]);
+
+    return res.status(200).json(
+      buildPaginatedPayload({
+        items: result.rows || [],
+        page: pagination.page,
+        pageSize: pagination.pageSize,
+        total
+      })
+    );
   } catch (error) {
     return sendInternalError(res, 'Error al obtener movimientos_inventario', error);
   }
 });
 
 // GET: OBTENER KARDEX DESDE LA VISTA DE DETALLE
-router.get('/kardex', async (req, res) => {
+router.get('/kardex', checkPermission(MOVIMIENTOS_VIEW_PERMISSIONS), async (req, res) => {
   try {
+    const pagination = parsePaginationQuery(req.query || {});
+    if (!pagination.ok) {
+      return sendValidationError(res, pagination.error);
+    }
+
     const idAlmacenFilter = parseOptionalPositiveInt(req.query?.id_almacen, 'id_almacen');
     if (idAlmacenFilter.error) {
       return sendValidationError(res, idAlmacenFilter.error);
@@ -437,6 +846,26 @@ router.get('/kardex', async (req, res) => {
     const idSucursalFilter = parseOptionalPositiveInt(req.query?.id_sucursal, 'id_sucursal');
     if (idSucursalFilter.error) {
       return sendValidationError(res, idSucursalFilter.error);
+    }
+
+    const scope = await getRequestMovimientosScope(req);
+    if (!ensureMovimientosScopeAvailable(res, scope)) {
+      return;
+    }
+    if (
+      idSucursalFilter.provided &&
+      !ensureMovimientosSucursalInScope(res, scope, idSucursalFilter.value)
+    ) {
+      return;
+    }
+    if (idAlmacenFilter.provided) {
+      const almacenScopeCheck = await ensureAlmacenIdInMovimientosScope(
+        req,
+        res,
+        idAlmacenFilter.value,
+        { scope, shouldMaskOutOfScope: true }
+      );
+      if (!almacenScopeCheck.ok) return;
     }
 
     const tipoFilter = parseOptionalTipo(req.query?.tipo);
@@ -470,12 +899,7 @@ router.get('/kardex', async (req, res) => {
 
     const textFilter = parseOptionalText(req.query?.q);
 
-    // NEW: CONSULTA FIJA SOBRE LA VISTA PARA SOPORTAR FILTROS SIN SQL DINAMICO.
-    // WHY: EL KARDEX YA TRAE NOMBRES, SUCURSALES, SALDOS E IMPACTO LISTOS PARA LA UI.
-    // IMPACT: GET /KARDEX RESPONDE FILAS DE LA VISTA TAL CUAL, ORDENADAS POR FECHA E ID.
-    const query = `
-      SELECT *
-      FROM public.v_kardex_detalle
+    const whereClause = `
       WHERE ($1::int IS NULL OR id_almacen = $1)
         AND ($2::int IS NULL OR id_sucursal = $2)
         AND ($3::text IS NULL OR tipo = $3)
@@ -490,10 +914,27 @@ router.get('/kardex', async (req, res) => {
             OR COALESCE(ref_origen, '') ILIKE '%' || $8 || '%'
           )
         )
-      ORDER BY fecha_mov DESC, id_movimiento DESC
+        AND ($9::boolean = true OR id_sucursal = ANY($10::int[]))
     `;
 
-    const result = await pool.query(query, [
+    const countQuery = `
+      SELECT COUNT(*)::int AS total
+      FROM public.v_kardex_detalle
+      ${whereClause}
+    `;
+
+    // NEW: CONSULTA FIJA SOBRE LA VISTA PARA SOPORTAR FILTROS SIN SQL DINAMICO.
+    // WHY: EL KARDEX YA TRAE NOMBRES, SUCURSALES, SALDOS E IMPACTO LISTOS PARA LA UI.
+    // IMPACT: GET /KARDEX RESPONDE FILAS DE LA VISTA TAL CUAL, ORDENADAS POR FECHA E ID.
+    const dataQuery = `
+      SELECT *
+      FROM public.v_kardex_detalle
+      ${whereClause}
+      ORDER BY fecha_mov DESC, id_movimiento DESC
+      LIMIT $11 OFFSET $12
+    `;
+
+    const params = [
       idAlmacenFilter.value,
       idSucursalFilter.value,
       tipoFilter.value,
@@ -501,21 +942,49 @@ router.get('/kardex', async (req, res) => {
       itemIdFilter.value,
       desdeFilter.value,
       hastaFilter.value,
-      textFilter.value
+      textFilter.value,
+      scope.isSuperAdmin,
+      scope.allowedSucursalIds
+    ];
+
+    const countResult = await pool.query(countQuery, params);
+    const total = Number(countResult.rows?.[0]?.total ?? 0);
+
+    const result = await pool.query(dataQuery, [
+      ...params,
+      pagination.pageSize,
+      pagination.offset
     ]);
 
-    res.status(200).json(result.rows || []);
+    return res.status(200).json(
+      buildPaginatedPayload({
+        items: result.rows || [],
+        page: pagination.page,
+        pageSize: pagination.pageSize,
+        total
+      })
+    );
   } catch (error) {
     return sendInternalError(res, 'Error al obtener kardex', error);
   }
 });
 
 // POST: CREAR MOVIMIENTO
-router.post('/movimientos_inventario', async (req, res) => {
+router.post('/movimientos_inventario', checkPermission(MOVIMIENTOS_CREATE_PERMISSIONS), async (req, res) => {
   try {
     const normalized = normalizeMovimientoPayload(req.body || {});
     if (!normalized.ok) {
       return sendValidationError(res, normalized.errors[0], normalized.errors);
+    }
+
+    const scopeCheck = await ensureAlmacenIdInMovimientosScope(
+      req,
+      res,
+      normalized.values.id_almacen,
+      { shouldMaskOutOfScope: true }
+    );
+    if (!scopeCheck.ok) {
+      return;
     }
 
     const operationalValidation = await validateOperationalEntities(
@@ -546,7 +1015,16 @@ router.post('/movimientos_inventario', async (req, res) => {
       descripcion: normalized.values.descripcion
     });
 
-    const kardexRow = createdId ? await getKardexRowByMovimientoId(pool, createdId) : null;
+    if (!createdId) {
+      return sendInternalError(
+        res,
+        'Error al crear movimiento_inventario (insert sin id_movimiento)',
+        new Error('insert_movimiento_without_id'),
+        'Error interno al crear movimiento de inventario.'
+      );
+    }
+
+    const kardexRow = await getKardexRowByMovimientoId(pool, createdId);
 
     res.status(201).json({
       message: 'Movimiento creado exitosamente.',
@@ -566,12 +1044,12 @@ router.post('/movimientos_inventario', async (req, res) => {
 });
 
 // PUT: BLOQUEADO POR KARDEX APPEND-ONLY
-router.put('/movimientos_inventario', async (_req, res) => {
+router.put('/movimientos_inventario', checkPermission(MOVIMIENTOS_EDIT_PERMISSIONS), async (_req, res) => {
   res.status(405).json({ ok: false, error: true, code: 'METHOD_NOT_ALLOWED', message: APPEND_ONLY_MESSAGE });
 });
 
 // DELETE: BLOQUEADO POR KARDEX APPEND-ONLY
-router.delete('/movimientos_inventario', async (_req, res) => {
+router.delete('/movimientos_inventario', checkPermission(MOVIMIENTOS_DELETE_PERMISSIONS), async (_req, res) => {
   res.status(405).json({ ok: false, error: true, code: 'METHOD_NOT_ALLOWED', message: APPEND_ONLY_MESSAGE });
 });
 

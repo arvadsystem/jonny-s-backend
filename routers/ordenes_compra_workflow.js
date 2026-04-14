@@ -1,6 +1,8 @@
 import express from 'express';
 import pool from '../config/db-connection.js';
 import { checkPermission, isRequestUserSuperAdmin } from '../middleware/checkPermission.js';
+import { supabase } from '../services/supabaseClient.js';
+import { SUPABASE_ADMIN_BUCKET, buildAbsolutePublicUrl } from '../utils/uploads.js';
 
 const router = express.Router();
 
@@ -47,6 +49,7 @@ const MAX_LIMIT = 100;
 const DEFAULT_LIMIT = 20;
 const MAX_TEXT_LEN = 1000;
 const MAX_SHORT_TEXT_LEN = 250;
+const OC_EVIDENCE_SIGNED_URL_TTL_SECONDS = 900;
 // AM: lock transaccional para asignar correlativo visible de OC sin carreras concurrentes.
 const OC_VISIBLE_NUMBER_LOCK_KEY = 830051;
 const DISCOUNT_MODE_MONTO = 'MONTO';
@@ -258,8 +261,30 @@ const isOcSchemaError = (error) => {
   );
 };
 
+const buildSafeWorkflowErrorLog = (error) => {
+  const message = normalizeText(error?.message, 300) || 'Unhandled workflow error.';
+  const detail = normalizeText(error?.detail, 300);
+  const hint = normalizeText(error?.hint, 200);
+  const where = normalizeText(error?.where, 200);
+  const constraint = normalizeText(error?.constraint, 120);
+  const table = normalizeText(error?.table, 80);
+  const routine = normalizeText(error?.routine, 80);
+
+  return {
+    code: normalizeText(error?.code, 20) || null,
+    name: normalizeText(error?.name, 60) || null,
+    message,
+    detail: detail || null,
+    hint: hint || null,
+    where: where || null,
+    constraint: constraint || null,
+    table: table || null,
+    routine: routine || null
+  };
+};
+
 const sendServerError = (res, context, error) => {
-  console.error(`[ordenes_compra_workflow] ${context}:`, error);
+  console.error(`[ordenes_compra_workflow] ${context}:`, buildSafeWorkflowErrorLog(error));
 
   const warehouseMismatchData = parseWarehouseMismatchDataFromDbError(error);
   if (warehouseMismatchData) {
@@ -305,8 +330,11 @@ const assertStateTransition = (currentState, expectedState) => currentState === 
 
 const resolveScope = (rawScope) => {
   const normalized = String(rawScope ?? '').trim().toLowerCase();
-  if (!normalized || normalized === 'mine' || normalized === 'propias') return 'mine';
-  if (normalized === 'all' || normalized === 'todas') return 'all';
+  // AM: compatibilidad retroactiva; "mine/propias" se interpreta como scope de sucursal.
+  if (!normalized || normalized === 'mine' || normalized === 'propias' || normalized === 'branch' || normalized === 'sucursal') {
+    return 'branch';
+  }
+  if (normalized === 'all' || normalized === 'todas' || normalized === 'global') return 'all';
   return null;
 };
 
@@ -918,6 +946,53 @@ const getOrderEvidenceHistory = async (idOrdenCompra, queryRunner = pool) => {
   }
 };
 
+const getArchivoById = async (idArchivo, queryRunner = pool) => {
+  const result = await queryRunner.query(
+    `
+      SELECT id_archivo, url_publica, tipo_archivo
+      FROM public.archivos
+      WHERE id_archivo = $1
+        AND COALESCE(estado, true) = true
+      LIMIT 1
+    `,
+    [idArchivo]
+  );
+  return result.rows?.[0] || null;
+};
+
+const resolveEvidenceAccessUrl = async (req, storedPath) => {
+  const normalized = String(storedPath || '').trim();
+  if (!normalized) return { url: null, signed: false, expiresIn: null };
+  if (/^https?:\/\//i.test(normalized)) {
+    return { url: normalized, signed: false, expiresIn: null };
+  }
+
+  const [bucket, ...pathParts] = normalized.replace(/^\/+/, '').split('/');
+  const filePath = pathParts.join('/');
+
+  if (bucket === SUPABASE_ADMIN_BUCKET && filePath) {
+    const { data, error } = await supabase.storage
+      .from(SUPABASE_ADMIN_BUCKET)
+      .createSignedUrl(filePath, OC_EVIDENCE_SIGNED_URL_TTL_SECONDS);
+
+    if (error || !data?.signedUrl) {
+      throw new Error('No se pudo generar la URL firmada de evidencia.');
+    }
+
+    return {
+      url: data.signedUrl,
+      signed: true,
+      expiresIn: OC_EVIDENCE_SIGNED_URL_TTL_SECONDS
+    };
+  }
+
+  return {
+    url: buildAbsolutePublicUrl(req, normalized),
+    signed: false,
+    expiresIn: null
+  };
+};
+
 const getOrderItemRequestByIdForUpdate = async (idOrdenCompra, idSolicitudItem, queryRunner = pool) => {
   try {
     const result = await queryRunner.query(
@@ -1446,9 +1521,15 @@ router.get('/orden_compras/workflow', checkPermission(PERM_OC_VIEW), async (req,
     const idUsuario = getRequestUserId(req);
     if (!idUsuario) return sendError(res, 401, 'UNAUTHORIZED', 'No autorizado.');
 
-    const scope = resolveScope(req.query?.scope);
-    if (!scope) {
-      return sendError(res, 400, 'VALIDATION_ERROR', 'scope invalido. Use mine o all.');
+    // AM: `scope` se valida por compatibilidad con clientes legacy, pero no define el alcance real.
+    const requestedScope = resolveScope(req.query?.scope);
+    if (!requestedScope) {
+      return sendError(
+        res,
+        400,
+        'VALIDATION_ERROR',
+        'scope invalido. Use branch o all. El alcance final se define por rol.'
+      );
     }
 
     const estadoFiltroRaw = String(req.query?.estado ?? '')
@@ -1478,14 +1559,9 @@ router.get('/orden_compras/workflow', checkPermission(PERM_OC_VIEW), async (req,
     const search = normalizeText(req.query?.q, 120);
 
     const canViewAll = await canUserViewAllOrders(req, idUsuario);
-    if (scope === 'all' && !canViewAll) {
-      return sendError(
-        res,
-        403,
-        'FORBIDDEN',
-        'No tienes permiso para ver todas las ordenes. Usa scope=mine.'
-      );
-    }
+    // AM: la visibilidad real del negocio se define por rol, no por query param.
+    // AM: admins/superadmin = global; operativos = sucursal propia.
+    const effectiveScope = canViewAll ? 'all' : 'branch';
 
     let effectiveSucursalFilter = idSucursalFilter;
     if (!canViewAll) {
@@ -1514,12 +1590,7 @@ router.get('/orden_compras/workflow', checkPermission(PERM_OC_VIEW), async (req,
     const whereParts = [];
     const params = [];
 
-    if (scope === 'mine' && canViewAll) {
-      params.push(idUsuario);
-      whereParts.push(`oc.id_usuario = $${params.length}`);
-    }
-
-    if (effectiveSucursalFilter) {
+    if (effectiveScope === 'branch' && effectiveSucursalFilter) {
       params.push(effectiveSucursalFilter);
       // AM: aplica scope robusto por sucursal, incluyendo OC legacy sin almacen destino explicito.
       whereParts.push(buildOrderSucursalScopeClause('oc', `$${params.length}`));
@@ -1880,6 +1951,137 @@ router.get('/orden_compras/workflow/:id_orden_compra', checkPermission(PERM_OC_V
     return sendServerError(res, 'GET /orden_compras/workflow/:id_orden_compra', error);
   }
 });
+
+router.get(
+  '/orden_compras/workflow/:id_orden_compra/evidencias/factura',
+  checkPermission(PERM_OC_VIEW),
+  async (req, res) => {
+    try {
+      const idUsuario = getRequestUserId(req);
+      if (!idUsuario) return sendError(res, 401, 'UNAUTHORIZED', 'No autorizado.');
+
+      const idOrdenCompra = parsePositiveInt(req.params?.id_orden_compra);
+      if (!idOrdenCompra) {
+        return sendError(res, 400, 'VALIDATION_ERROR', 'id_orden_compra invalido.');
+      }
+
+      const orderRow = await getOrderById(idOrdenCompra);
+      if (!orderRow) {
+        return sendError(res, 404, 'NOT_FOUND', 'Orden de compra no encontrada.');
+      }
+
+      const canView = await validateOrderVisibility(req, idUsuario, orderRow);
+      if (!canView) {
+        return sendError(res, 403, 'FORBIDDEN', 'No tienes permiso para ver esta orden.');
+      }
+
+      const idArchivoFactura = parsePositiveInt(orderRow?.id_archivo_factura_recepcion);
+      if (!idArchivoFactura) {
+        return sendError(res, 404, 'NOT_FOUND', 'La orden no tiene factura de recepcion registrada.');
+      }
+
+      const archivoRow = await getArchivoById(idArchivoFactura);
+      if (!archivoRow) {
+        return sendError(res, 404, 'NOT_FOUND', 'La evidencia de factura no existe o no esta disponible.');
+      }
+
+      const access = await resolveEvidenceAccessUrl(req, archivoRow.url_publica);
+      if (!access?.url) {
+        return sendError(res, 404, 'NOT_FOUND', 'No se pudo resolver la evidencia de factura.');
+      }
+
+      return res.status(200).json({
+        ok: true,
+        data: {
+          id_orden_compra: idOrdenCompra,
+          tipo_evidencia: 'FACTURA_RECEPCION',
+          id_archivo: idArchivoFactura,
+          mime_type: String(archivoRow?.tipo_archivo || '').trim().toLowerCase() || null,
+          url: access.url,
+          is_signed_url: access.signed,
+          expires_in: access.expiresIn
+        }
+      });
+    } catch (error) {
+      return sendServerError(
+        res,
+        'GET /orden_compras/workflow/:id_orden_compra/evidencias/factura',
+        error
+      );
+    }
+  }
+);
+
+router.get(
+  '/orden_compras/workflow/:id_orden_compra/evidencias/transferencia',
+  checkPermission(PERM_OC_VIEW),
+  async (req, res) => {
+    try {
+      const idUsuario = getRequestUserId(req);
+      if (!idUsuario) return sendError(res, 401, 'UNAUTHORIZED', 'No autorizado.');
+
+      const idOrdenCompra = parsePositiveInt(req.params?.id_orden_compra);
+      if (!idOrdenCompra) {
+        return sendError(res, 400, 'VALIDATION_ERROR', 'id_orden_compra invalido.');
+      }
+
+      const orderRow = await getOrderById(idOrdenCompra);
+      if (!orderRow) {
+        return sendError(res, 404, 'NOT_FOUND', 'Orden de compra no encontrada.');
+      }
+
+      const canView = await validateOrderVisibility(req, idUsuario, orderRow);
+      if (!canView) {
+        return sendError(res, 403, 'FORBIDDEN', 'No tienes permiso para ver esta orden.');
+      }
+
+      const canViewAdminData = await canUserViewAdminOrderData(req, idUsuario);
+      if (!canViewAdminData) {
+        return sendError(res, 403, 'FORBIDDEN', 'No tienes permiso para ver evidencias administrativas.');
+      }
+
+      const compraActual = await getLatestCompraByOrden(idOrdenCompra);
+      const idArchivoTransferencia = parsePositiveInt(compraActual?.id_archivo_transferencia);
+      if (!idArchivoTransferencia) {
+        return sendError(res, 404, 'NOT_FOUND', 'La orden no tiene deposito/transferencia registrada.');
+      }
+
+      const archivoRow = await getArchivoById(idArchivoTransferencia);
+      if (!archivoRow) {
+        return sendError(
+          res,
+          404,
+          'NOT_FOUND',
+          'La evidencia de deposito/transferencia no existe o no esta disponible.'
+        );
+      }
+
+      const access = await resolveEvidenceAccessUrl(req, archivoRow.url_publica);
+      if (!access?.url) {
+        return sendError(res, 404, 'NOT_FOUND', 'No se pudo resolver la evidencia de deposito/transferencia.');
+      }
+
+      return res.status(200).json({
+        ok: true,
+        data: {
+          id_orden_compra: idOrdenCompra,
+          tipo_evidencia: 'DEPOSITO_TRANSFERENCIA',
+          id_archivo: idArchivoTransferencia,
+          mime_type: String(archivoRow?.tipo_archivo || '').trim().toLowerCase() || null,
+          url: access.url,
+          is_signed_url: access.signed,
+          expires_in: access.expiresIn
+        }
+      });
+    } catch (error) {
+      return sendServerError(
+        res,
+        'GET /orden_compras/workflow/:id_orden_compra/evidencias/transferencia',
+        error
+      );
+    }
+  }
+);
 
 router.post('/orden_compras/workflow', checkPermission(PERM_OC_CREATE), async (req, res) => {
   const client = await pool.connect();
@@ -2802,6 +3004,88 @@ router.post('/orden_compras/workflow/:id_orden_compra/rechazar', checkPermission
   } catch (error) {
     await withRollback(client);
     return sendServerError(res, 'POST /orden_compras/workflow/:id_orden_compra/rechazar', error);
+  } finally {
+    client.release();
+  }
+});
+
+router.post('/orden_compras/workflow/:id_orden_compra/cancelar', checkPermission(PERM_OC_VIEW_ALL), async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const idUsuario = getRequestUserId(req);
+    if (!idUsuario) return sendError(res, 401, 'UNAUTHORIZED', 'No autorizado.');
+
+    const idOrdenCompra = parsePositiveInt(req.params?.id_orden_compra);
+    if (!idOrdenCompra) {
+      return sendError(res, 400, 'VALIDATION_ERROR', 'id_orden_compra invalido.');
+    }
+
+    await client.query('BEGIN');
+    // AM: serializa liberacion de correlativo visible al cancelar para no cruzarse con altas concurrentes.
+    await acquireOcVisibleNumberLock(client);
+
+    const orderRow = await getOrderByIdForUpdate(idOrdenCompra, client);
+    if (!orderRow) {
+      await withRollback(client);
+      return sendError(res, 404, 'NOT_FOUND', 'Orden de compra no encontrada.');
+    }
+
+    const canView = await validateOrderVisibility(req, idUsuario, orderRow, client);
+    if (!canView) {
+      await withRollback(client);
+      return sendError(res, 403, 'FORBIDDEN', 'No tienes permiso para cancelar esta orden.');
+    }
+
+    const estadoActual = String(orderRow.estado_flujo || '').trim().toUpperCase();
+    const recepcionRegistrada =
+      Boolean(parsePositiveInt(orderRow.id_usuario_recepcion)) &&
+      Boolean(normalizeText(orderRow.fecha_recepcion_reportada, 80));
+
+    if (estadoActual === ESTADO_EN_COMPRA && recepcionRegistrada) {
+      await withRollback(client);
+      return sendError(
+        res,
+        409,
+        'INVALID_STATE',
+        'No se puede cancelar una orden EN_COMPRA con recepcion registrada.'
+      );
+    }
+
+    const puedeCancelarEstadoBase = [ESTADO_PENDIENTE, ESTADO_APROBADA].includes(estadoActual);
+    const puedeCancelarEnCompra = estadoActual === ESTADO_EN_COMPRA && !recepcionRegistrada;
+    if (!puedeCancelarEstadoBase && !puedeCancelarEnCompra) {
+      await withRollback(client);
+      return sendError(
+        res,
+        409,
+        'INVALID_STATE',
+        `No se puede cancelar una orden en estado ${orderRow.estado_flujo}.`
+      );
+    }
+
+    await client.query(
+      `
+        UPDATE public.orden_compras
+        SET
+          estado_flujo = $1,
+          estado = $2
+        WHERE id_orden_compra = $3
+      `,
+      [ESTADO_CANCELADA, stateToLegacyBoolean(ESTADO_CANCELADA), idOrdenCompra]
+    );
+
+    await client.query('COMMIT');
+    return res.status(200).json({
+      ok: true,
+      message: 'Orden cancelada correctamente.',
+      data: {
+        id_orden_compra: idOrdenCompra,
+        estado_flujo: ESTADO_CANCELADA
+      }
+    });
+  } catch (error) {
+    await withRollback(client);
+    return sendServerError(res, 'POST /orden_compras/workflow/:id_orden_compra/cancelar', error);
   } finally {
     client.release();
   }

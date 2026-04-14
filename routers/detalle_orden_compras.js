@@ -1,5 +1,4 @@
 import express from 'express';
-import pool from '../config/db-connection.js';
 import { checkPermission } from '../middleware/checkPermission.js';
 
 const router = express.Router();
@@ -23,21 +22,7 @@ const blockLegacyWrite = (_req, res) => {
 
 // GET: Obtener detalle_orden_compras
 router.get('/detalle_orden_compras', checkPermission(PERM_OC_VIEW_LEGACY), async (req, res) => {
-  try {
-    const tabla = 'detalle_orden_compras';
-    // AM: expone ambos tipos de item para compatibilidad con detalle mixto (insumo/producto).
-    const columnas = 'id_detalle_orden, cantidad_orden, id_orden_compra, id_insumo, id_producto';
-
-    const query = 'SELECT function_select($1, $2) as resultado';
-    const result = await pool.query(query, [tabla, columnas]);
-
-    const datos = result.rows[0].resultado || [];
-    res.status(200).json(datos);
-
-  } catch (err) {
-    console.error('Error al obtener detalle_orden_compras:', err.message);
-    res.status(500).json({ error: true, message: err.message });
-  }
+  return blockLegacyWrite(req, res);
 });
 
 // POST: Crear detalle_orden_compra
