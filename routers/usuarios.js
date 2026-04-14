@@ -2,13 +2,16 @@ import express from 'express';
 import crypto from 'node:crypto';
 import fs from 'fs/promises';
 import path from 'path';
+import jwt from 'jsonwebtoken';
 import pool from '../config/db-connection.js';
+import JWT_SECRET from '../config/jwt.js';
 import { checkPermission, requestHasAnyPermission } from '../middleware/checkPermission.js';
 import {
   ALLOWED_IMAGE_MIME_TYPES,
   UPLOADS_DIR,
   detectImageMimeTypeFromBuffer
 } from '../utils/uploads.js';
+import { ensurePasswordChangedAtColumn } from '../utils/security/passwordExpiration.js';
 
 const router = express.Router();
 const USUARIOS_LIST_PERMISSIONS = ['USUARIOS_LISTADO_VER'];
@@ -20,6 +23,39 @@ const USUARIOS_IMAGE_EDIT_PERMISSIONS = ['USUARIOS_IMAGEN_SUBIR', 'USUARIOS_IMAG
 const USUARIOS_ROLES_CATALOG_PERMISSIONS = ['USUARIOS_ROL_ASIGNAR', 'USUARIOS_CREAR', 'USUARIOS_EDITAR'];
 const USUARIOS_ROLE_ASSIGN_PERMISSIONS = ['USUARIOS_ROL_ASIGNAR'];
 const USUARIOS_CHANGE_OWN_PASSWORD_PERMISSIONS = ['USUARIOS_PASSWORD_CAMBIAR_PROPIO'];
+
+const usuariosV2CookieConfig = () => {
+  const isProd = process.env.NODE_ENV === 'production';
+  return {
+    sameSite: isProd ? 'none' : 'lax',
+    secure: isProd,
+    path: '/',
+  };
+};
+
+const issueUpdatedAccessTokenForOwnPasswordChange = (req, res, idUsuarioChanged) => {
+  const idUsuarioJwt = Number.parseInt(String(req.user?.id_usuario ?? ''), 10);
+  if (!Number.isInteger(idUsuarioJwt) || idUsuarioJwt <= 0) return;
+  if (idUsuarioJwt !== idUsuarioChanged) return;
+  if (!JWT_SECRET) return;
+
+  const payload = {
+    id_usuario: idUsuarioJwt,
+    nombre_usuario: req.user?.nombre_usuario,
+    rol: req.user?.rol,
+    id_sucursal: req.user?.id_sucursal,
+    sid: req.user?.sid,
+    must_change_password: false,
+  };
+
+  const token = jwt.sign(payload, JWT_SECRET, { expiresIn: '8h' });
+  const base = usuariosV2CookieConfig();
+  res.cookie('access_token', token, {
+    ...base,
+    httpOnly: true,
+    maxAge: 1000 * 60 * 60 * 8,
+  });
+};
 
 // ------------------------------------------------------------------------------------
 // GET: Obtener usuarios
@@ -1181,6 +1217,13 @@ router.post('/usuarios/v2/change-password', checkPermission(USUARIOS_CHANGE_OWN_
   try {
     const idUsuarioBody = v2ParsePositiveInt(req.body?.id_usuario);
     const idUsuarioJwt = v2ParsePositiveInt(req.user?.id_usuario);
+    if (idUsuarioBody && idUsuarioJwt && idUsuarioBody !== idUsuarioJwt) {
+      return res.status(403).json({
+        error: true,
+        message: 'No tiene permiso para cambiar la contrasena de otro usuario',
+      });
+    }
+
     const idUsuario = idUsuarioBody || idUsuarioJwt;
 
     if (!idUsuario) {
@@ -1200,6 +1243,8 @@ router.post('/usuarios/v2/change-password', checkPermission(USUARIOS_CHANGE_OWN_
         message: 'clave_actual y clave_nueva son requeridas',
       });
     }
+
+    await ensurePasswordChangedAtColumn();
 
     const userResult = await pool.query(
       'SELECT id_usuario, clave FROM usuarios WHERE id_usuario = $1 LIMIT 1',
@@ -1234,7 +1279,10 @@ router.post('/usuarios/v2/change-password', checkPermission(USUARIOS_CHANGE_OWN_
     const capabilities = await v2GetCapabilities();
     const passwordForStorage = await v2BuildPasswordForStorage(claveNueva);
 
-    const setParts = ['clave = $1'];
+    const setParts = [
+      'clave = $1',
+      "fecha_cambio_clave = timezone('America/Tegucigalpa', now())",
+    ];
     const values = [passwordForStorage];
 
     if (capabilities.mustChangePasswordField) {
@@ -1247,6 +1295,8 @@ router.post('/usuarios/v2/change-password', checkPermission(USUARIOS_CHANGE_OWN_
       `UPDATE usuarios SET ${setParts.join(', ')} WHERE id_usuario = $${values.length}`,
       values
     );
+
+    issueUpdatedAccessTokenForOwnPasswordChange(req, res, idUsuario);
 
     return res.status(200).json({
       error: false,

@@ -15,7 +15,7 @@ const router = express.Router();
  * GET /seguridad/configuracion/password
  * Retorna políticas actuales (password_*).
  */
-router.get('/configuracion/password', checkPermission(['SEGURIDAD_CONFIG_VER', 'SEGURIDAD_VER']), async (req, res) => {
+router.get('/configuracion/password', async (req, res) => {
   try {
     const sql = `
       SELECT clave, valor, descripcion
