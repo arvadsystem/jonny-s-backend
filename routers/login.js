@@ -3,6 +3,7 @@ import pool from '../config/db-connection.js';
 import jwt from 'jsonwebtoken';
 import crypto from 'crypto';
 import { authRequired } from '../middleware/auth.js';
+import { requireActiveSession } from '../middleware/requireActiveSession.js';
 import {
   internalLoginIpLimiter,
   internalLoginAccountIpLimiter
