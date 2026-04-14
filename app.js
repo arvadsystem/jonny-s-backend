@@ -60,6 +60,7 @@ import adminRecetasRouter from './routers/admin_recetas.js';
 import adminCombosRouter from './routers/admin_combos.js';
 import adminMenuPublicacionRouter from './routers/admin_menu_publicacion.js';
 import adminSalsasRouter from './routers/admin_salsas.js';
+import cajasRoutes from './routers/cajas.js';
 
 import { authRequired, csrfProtect } from './middleware/auth.js';
 import { touchSessionMiddleware } from './middleware/touchSession.js';
@@ -108,7 +109,11 @@ app.get('/status', async (req, res) => {
     const result = await pool.query('SELECT NOW()');
     res.json({ status: 'ok', db_time: result.rows[0] });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error('[status] Error:', err);
+    res.status(500).json({
+      error: true,
+      message: 'No se pudo verificar el estado del servicio.'
+    });
   }
 });
 
@@ -180,6 +185,7 @@ app.use(detalleComprasRoutes);
 app.use(ordenesCompraWorkflowRoutes);
 app.use(tipoDepartamentoRoutes);
 app.use(sucursalesRoutes);
+app.use(cajasRoutes);
 app.use(ventasRoutes);
 app.use(cocinaRoutes);
 

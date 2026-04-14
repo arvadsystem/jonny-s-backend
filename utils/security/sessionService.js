@@ -88,6 +88,23 @@ export async function closeSession(id_sesion, motivo_cierre = 'logout') {
 }
 
 /**
+ * Cierra todas las sesiones activas de un usuario.
+ * Util para hardening despues de reset/cambio de contrasena.
+ */
+export async function closeAllUserSessions(id_usuario, motivo_cierre = 'password_reset') {
+  const sql = `
+    UPDATE sesiones_activas
+    SET activa = FALSE,
+        fecha_cierre = ${HN_NOW_SQL},
+        motivo_cierre = $2
+    WHERE id_usuario = $1
+      AND activa = TRUE
+  `;
+  const result = await pool.query(sql, [id_usuario, motivo_cierre]);
+  return result.rowCount || 0;
+}
+
+/**
  * Cierra sesiones activas que ya superaron el umbral de inactividad.
  * Se usa en endpoints de consulta para mantener la vista de sesiones consistente.
  */

@@ -72,27 +72,59 @@ export const resolveRequestUserSucursalScope = async (req, queryRunner = pool) =
   );
 
   const userSucursalId = parsePositiveInt(sucursalResult.rows?.[0]?.id_sucursal);
-  
-  // Obtener sucursales adicionales a las que tiene acceso
-  let allowedIds = new Set();
+
+  const allowedIds = new Set();
   if (userSucursalId) {
     allowedIds.add(userSucursalId);
   }
 
   if (!isSuperAdmin) {
-    try {
-      const resultExtra = await queryRunner.query(
-        `SELECT id_sucursal FROM public.usuarios_sucursales WHERE id_usuario = $1`,
-        [idUsuario]
-      );
-      for (const row of resultExtra.rows) {
-        const parsedId = parsePositiveInt(row.id_sucursal);
-        if (parsedId) allowedIds.add(parsedId);
+    const candidateQueries = [
+      {
+        sql: `
+          SELECT vus.id_sucursal, vus.es_principal
+          FROM public.v_usuarios_sucursales_scope vus
+          WHERE vus.id_usuario = $1
+            AND COALESCE(vus.estado, true) = true
+        `,
+        params: [idUsuario]
+      },
+      {
+        sql: `
+          SELECT es.id_sucursal, es.es_principal
+          FROM public.usuarios u
+          INNER JOIN public.empleados_sucursales es
+            ON es.id_empleado = u.id_empleado
+          WHERE u.id_usuario = $1
+            AND COALESCE(es.estado, true) = true
+        `,
+        params: [idUsuario]
+      },
+      {
+        sql: `
+          SELECT us.id_sucursal, true AS es_principal
+          FROM public.usuarios_sucursales us
+          WHERE us.id_usuario = $1
+        `,
+        params: [idUsuario]
       }
-    } catch (err) {
-      // Ignorar error si la tabla no existe o hay error de DB, se usa solo userSucursalId
-      if (err.code !== '42P01') { 
-        logScopeWarning('Error obteniendo sucursales adicionales del usuario', err);
+    ];
+
+    for (const candidate of candidateQueries) {
+      try {
+        const resultExtra = await queryRunner.query(candidate.sql, candidate.params);
+        if (resultExtra.rowCount === 0) continue;
+
+        for (const row of resultExtra.rows) {
+          const parsedId = parsePositiveInt(row.id_sucursal);
+          if (parsedId) allowedIds.add(parsedId);
+        }
+
+        break;
+      } catch (err) {
+        if (!['42P01', '42703'].includes(err.code)) {
+          console.error('resolveRequestUserSucursalScope error:', err);
+        }
       }
     }
   }

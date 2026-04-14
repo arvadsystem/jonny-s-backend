@@ -2,6 +2,7 @@ import express from 'express';
 import pool from '../config/db-connection.js';
 import { checkPermission } from '../middleware/checkPermission.js';
 import { resolveRequestUserSucursalScope } from '../utils/sucursalScope.js';
+import { registerFacturaLoyaltyAccumulation } from '../services/fidelizacionService.js';
 
 const router = express.Router();
 
@@ -65,6 +66,11 @@ const parseNonNegativeNumber = (value) => {
   const parsed = Number(value);
   return Number.isFinite(parsed) && parsed >= 0 ? roundMoney(parsed) : null;
 };
+
+const sendVentasInternalError = (
+  res,
+  message = 'No se pudo procesar la solicitud de ventas.'
+) => res.status(500).json({ error: true, message });
 
 const parseBooleanInput = (value) => {
   if (value === true || value === false) return { ok: true, value };
@@ -421,39 +427,140 @@ const resolveSucursalId = async (client, requestedId) => {
   return result.rowCount > 0 ? requestedId : null;
 };
 
-const resolveCajaId = async (client, idSucursal, idUsuario) => {
-  if (!idSucursal) return null;
+const resolveMetodoPago = async (client, metodoPagoRaw) => {
+  const normalizedInput = String(metodoPagoRaw ?? '').trim();
+  if (!normalizedInput) return null;
 
-  const exactMatch = await client.query(
+  const result = await client.query(
     `
-      SELECT id_caja
-      FROM cajas
-      WHERE id_sucursal = $1
-        AND COALESCE(estado, true) = true
-        AND ($2::int IS NULL OR id_usuario = $2)
-      ORDER BY id_caja
+      SELECT
+        id_metodo_pago,
+        codigo,
+        nombre,
+        COALESCE(afecta_efectivo, false) AS afecta_efectivo
+      FROM cat_metodos_pago
+      WHERE COALESCE(estado, true) = true
+        AND (
+          UPPER(TRIM(codigo)) = UPPER($1)
+          OR LOWER(TRIM(nombre)) = LOWER($1)
+        )
       LIMIT 1
     `,
-    [idSucursal, idUsuario || null]
+    [normalizedInput]
   );
 
-  if (exactMatch.rowCount > 0) {
-    return exactMatch.rows[0].id_caja;
+  return result.rows[0] || null;
+};
+
+const resolveCajaSession = async ({
+  client,
+  idSucursal,
+  idUsuario,
+  idSesionCaja = null
+}) => {
+  if (!idSucursal || !idUsuario) {
+    return { ok: false, reason: 'MISSING_CONTEXT' };
   }
 
-  const bySucursal = await client.query(
+  const estadoResult = await client.query(
     `
-      SELECT id_caja
-      FROM cajas
-      WHERE id_sucursal = $1
-        AND COALESCE(estado, true) = true
-      ORDER BY id_caja
+      SELECT id_estado_sesion_caja
+      FROM cat_cajas_sesiones_estados
+      WHERE UPPER(TRIM(codigo)) = 'ABIERTA'
+      LIMIT 1
+    `
+  );
+  const idEstadoAbierta = Number(estadoResult.rows?.[0]?.id_estado_sesion_caja || 0) || null;
+  if (!idEstadoAbierta) {
+    return { ok: false, reason: 'OPEN_STATE_NOT_FOUND' };
+  }
+
+  const requestedSessionId = parseOptionalPositiveInt(idSesionCaja);
+  const params = [idSucursal, idUsuario, idEstadoAbierta];
+  let requestedFilter = '';
+
+  if (requestedSessionId) {
+    params.push(requestedSessionId);
+    requestedFilter = `AND cs.id_sesion_caja = $${params.length}`;
+  }
+
+  const result = await client.query(
+    `
+      SELECT
+        cs.id_caja,
+        cs.id_sesion_caja,
+        cs.id_sucursal,
+        csp.id_participacion_caja,
+        crp.codigo AS rol_participacion,
+        cua.id_caja_usuario_autorizado
+      FROM cajas_sesiones cs
+      INNER JOIN cajas_sesiones_participantes csp
+        ON csp.id_sesion_caja = cs.id_sesion_caja
+       AND csp.id_usuario = $2
+       AND COALESCE(csp.activo, true) = true
+      INNER JOIN cat_cajas_roles_participacion crp
+        ON crp.id_rol_participacion_caja = csp.id_rol_participacion_caja
+      INNER JOIN cajas_usuarios_autorizados cua
+        ON cua.id_caja = cs.id_caja
+       AND cua.id_sucursal = cs.id_sucursal
+       AND cua.id_usuario = csp.id_usuario
+       AND COALESCE(cua.estado, true) = true
+       AND (
+         (UPPER(TRIM(crp.codigo)) = 'RESPONSABLE' AND COALESCE(cua.puede_responsable, false) = true)
+         OR (UPPER(TRIM(crp.codigo)) = 'AUXILIAR' AND COALESCE(cua.puede_auxiliar, false) = true)
+       )
+      WHERE cs.id_sucursal = $1
+        AND cs.id_estado_sesion_caja = $3
+        ${requestedFilter}
+      ORDER BY cs.id_sesion_caja DESC
       LIMIT 1
     `,
-    [idSucursal]
+    params
   );
 
-  return bySucursal.rows[0]?.id_caja ?? null;
+  if (result.rowCount === 0) {
+    if (requestedSessionId) {
+      const sessionExistsResult = await client.query(
+        `
+          SELECT
+            cs.id_sesion_caja,
+            cs.id_sucursal,
+            cs.id_estado_sesion_caja,
+            EXISTS (
+              SELECT 1
+              FROM cajas_sesiones_participantes csp
+              WHERE csp.id_sesion_caja = cs.id_sesion_caja
+                AND csp.id_usuario = $2
+                AND COALESCE(csp.activo, true) = true
+            ) AS has_active_participation
+          FROM cajas_sesiones cs
+          WHERE cs.id_sesion_caja = $1
+          LIMIT 1
+        `,
+        [requestedSessionId, idUsuario]
+      );
+
+      const sessionRow = sessionExistsResult.rows?.[0];
+      if (!sessionRow) return { ok: false, reason: 'SESSION_NOT_FOUND' };
+      if (Number(sessionRow.id_sucursal || 0) !== Number(idSucursal)) {
+        return { ok: false, reason: 'SESSION_SCOPE_MISMATCH' };
+      }
+      if (Number(sessionRow.id_estado_sesion_caja || 0) !== Number(idEstadoAbierta)) {
+        return { ok: false, reason: 'SESSION_NOT_OPEN' };
+      }
+      if (!Boolean(sessionRow.has_active_participation)) {
+        return { ok: false, reason: 'SESSION_PARTICIPATION_REQUIRED' };
+      }
+      return { ok: false, reason: 'SESSION_AUTHORIZATION_REQUIRED' };
+    }
+
+    return { ok: false, reason: 'NO_ACTIVE_SESSION' };
+  }
+
+  return {
+    ok: true,
+    data: result.rows[0]
+  };
 };
 
 const fetchEstadoPedidoRows = async (client) => {
@@ -709,11 +816,12 @@ const buildVentaPayload = async ({ client, body, userId, sucursalScope }) => {
 
   const idCliente = parseOptionalPositiveInt(body.id_cliente);
   const idSucursalRequested = parseOptionalPositiveInt(body.id_sucursal);
+  const idSesionCajaRequested = parseOptionalPositiveInt(body.id_sesion_caja);
   const idEstadoPedidoRequested = parseOptionalPositiveInt(body.id_estado_pedido);
   const idDescuentoCatalogo = parseOptionalPositiveInt(body.id_descuento_catalogo);
   const descuentoLegacyInput = parseNonNegativeNumber(body.descuento ?? 0);
   const efectivoEntregadoInput = parseNonNegativeNumber(body.efectivo_entregado);
-  const metodoPago = String(body.metodo_pago || 'efectivo').trim().toLowerCase();
+  const metodoPagoInput = String(body.metodo_pago || 'EFECTIVO').trim();
 
   if (body.id_descuento_catalogo !== undefined && body.id_descuento_catalogo !== null && !idDescuentoCatalogo) {
     return {
@@ -742,13 +850,13 @@ const buildVentaPayload = async ({ client, body, userId, sucursalScope }) => {
     };
   }
 
-  if (metodoPago !== 'efectivo') {
+  if (!metodoPagoInput) {
     return {
       ok: false,
       status: 400,
       body: {
         error: true,
-        message: 'El esquema actual solo soporta ventas en efectivo.'
+        message: 'metodo_pago es obligatorio.'
       }
     };
   }
@@ -826,6 +934,18 @@ const buildVentaPayload = async ({ client, body, userId, sucursalScope }) => {
     }
   }
 
+  const metodoPago = await resolveMetodoPago(client, metodoPagoInput);
+  if (!metodoPago) {
+    return {
+      ok: false,
+      status: 400,
+      body: {
+        error: true,
+        message: 'El metodo de pago seleccionado no esta disponible.'
+      }
+    };
+  }
+
   const hydratedResult = await hydrateVentaLines(client, normalizedItemsResult.data);
   if (!hydratedResult.ok) return hydratedResult;
 
@@ -900,9 +1020,14 @@ const buildVentaPayload = async ({ client, body, userId, sucursalScope }) => {
   const subtotal = roundMoney(finalizedLines.reduce((sum, line) => sum + line.total_linea, 0));
   const isv = roundMoney(subtotal * 0.15);
   const total = roundMoney(subtotal + isv);
-  const efectivoEntregado = efectivoEntregadoInput === null ? total : efectivoEntregadoInput;
+  const metodoPagoAfectaEfectivo = parseBooleanish(metodoPago.afecta_efectivo);
+  const efectivoEntregado = metodoPagoAfectaEfectivo
+    ? efectivoEntregadoInput === null
+      ? total
+      : efectivoEntregadoInput
+    : total;
 
-  if (efectivoEntregado < total) {
+  if (metodoPagoAfectaEfectivo && efectivoEntregado < total) {
     return {
       ok: false,
       status: 400,
@@ -910,7 +1035,25 @@ const buildVentaPayload = async ({ client, body, userId, sucursalScope }) => {
     };
   }
 
-  const idCaja = await resolveCajaId(client, idSucursal, userId);
+  const sessionActiva = await resolveCajaSession({
+    client,
+    idSucursal,
+    idUsuario: userId,
+    idSesionCaja: idSesionCajaRequested
+  });
+  if (!sessionActiva.ok) {
+    return {
+      ok: false,
+      status:
+        sessionActiva.reason === 'SESSION_NOT_FOUND'
+          ? 404
+          : ['SESSION_NOT_OPEN', 'OPEN_STATE_NOT_FOUND'].includes(sessionActiva.reason)
+          ? 409
+          : 403,
+      body: { error: true, message: 'Debe abrir o tener una sesión de caja activa permitida para procesar ventas.' }
+    };
+  }
+  const { id_caja: idCaja, id_sesion_caja: idSesionCaja } = sessionActiva.data;
   const kitchenLines = finalizedLines.filter((line) => line.requiere_cocina);
   const requiresPedido = kitchenLines.length > 0;
   const pedidoLines = requiresPedido ? finalizedLines : [];
@@ -942,7 +1085,10 @@ const buildVentaPayload = async ({ client, body, userId, sucursalScope }) => {
   return {
     ok: true,
     data: {
-      metodo_pago: metodoPago,
+      metodo_pago: metodoPago.nombre,
+      id_metodo_pago: Number(metodoPago.id_metodo_pago),
+      metodo_pago_codigo: metodoPago.codigo,
+      metodo_pago_afecta_efectivo: metodoPagoAfectaEfectivo,
       descripcion_pedido: buildKitchenDescriptionSummary(
         kitchenLines,
         typeof body.descripcion_pedido === 'string' ? body.descripcion_pedido : null
@@ -955,8 +1101,9 @@ const buildVentaPayload = async ({ client, body, userId, sucursalScope }) => {
       isv,
       total,
       efectivo_entregado: efectivoEntregado,
-      cambio: roundMoney(efectivoEntregado - total),
+      cambio: metodoPagoAfectaEfectivo ? roundMoney(efectivoEntregado - total) : 0,
       id_caja: idCaja,
+      id_sesion_caja: idSesionCaja,
       id_cliente: idCliente,
       id_sucursal: idSucursal,
       id_estado_pedido: idEstadoPedido,
@@ -1062,7 +1209,7 @@ router.get('/ventas/catalogos/clientes', async (req, res) => {
     res.status(200).json(data);
   } catch (err) {
     console.error('Error al listar catalogo de clientes para ventas:', err.message);
-    res.status(500).json({ error: true, message: err.message });
+    sendVentasInternalError(res);
   }
 });
 
@@ -1117,7 +1264,7 @@ router.get('/ventas/catalogos/combos', async (req, res) => {
     res.status(200).json(result.rows);
   } catch (err) {
     console.error('Error al listar catalogo de combos para ventas:', err.message);
-    res.status(500).json({ error: true, message: err.message });
+    sendVentasInternalError(res);
   }
 });
 
@@ -1176,7 +1323,7 @@ router.get('/ventas/catalogos/recetas', async (req, res) => {
     res.status(200).json(result.rows);
   } catch (err) {
     console.error('Error al listar catalogo de recetas para ventas:', err.message);
-    res.status(500).json({ error: true, message: err.message });
+    sendVentasInternalError(res);
   }
 });
 
@@ -1197,7 +1344,7 @@ router.get('/ventas/catalogos/tipos-descuento', async (req, res) => {
     res.status(200).json(result.rows || []);
   } catch (err) {
     console.error('Error al listar tipos de descuento:', err.message);
-    res.status(500).json({ error: true, message: err.message });
+    sendVentasInternalError(res);
   }
 });
 
@@ -1218,7 +1365,7 @@ router.get('/ventas/catalogos/tipo-departamento', async (req, res) => {
     res.status(200).json(result.rows || []);
   } catch (err) {
     console.error('Error al listar tipos de departamento:', err.message);
-    res.status(500).json({ error: true, message: err.message });
+    sendVentasInternalError(res);
   }
 });
 
@@ -1244,7 +1391,7 @@ router.get('/ventas/catalogos/descuentos', async (req, res) => {
     res.status(200).json(result.rows || []);
   } catch (err) {
     console.error('Error al listar descuentos activos de catalogo:', err.message);
-    res.status(500).json({ error: true, message: err.message });
+    sendVentasInternalError(res);
   }
 });
 
@@ -1289,7 +1436,7 @@ router.get('/ventas/descuentos-catalogos', checkPermission(VENTAS_DESCUENTOS_PER
     res.status(200).json(result.rows || []);
   } catch (err) {
     console.error('Error al listar descuentos_catalogos:', err.message);
-    res.status(500).json({ error: true, message: err.message });
+    sendVentasInternalError(res);
   }
 });
 
@@ -1327,7 +1474,7 @@ router.get('/ventas/descuentos-catalogos/:id', checkPermission(VENTAS_DESCUENTOS
     return res.status(200).json(result.rows[0]);
   } catch (err) {
     console.error('Error al obtener descuento_catalogo por id:', err.message);
-    return res.status(500).json({ error: true, message: err.message });
+    return sendVentasInternalError(res);
   }
 });
 
@@ -1374,7 +1521,7 @@ router.post('/ventas/descuentos-catalogos', checkPermission(VENTAS_DESCUENTOS_WR
   } catch (err) {
     await client.query('ROLLBACK');
     console.error('Error al crear descuentos_catalogos:', err.message);
-    return res.status(500).json({ error: true, message: err.message });
+    return sendVentasInternalError(res);
   } finally {
     client.release();
   }
@@ -1430,7 +1577,7 @@ router.put('/ventas/descuentos-catalogos/:id', checkPermission(VENTAS_DESCUENTOS
   } catch (err) {
     await client.query('ROLLBACK');
     console.error('Error al actualizar descuentos_catalogos:', err.message);
-    return res.status(500).json({ error: true, message: err.message });
+    return sendVentasInternalError(res);
   } finally {
     client.release();
   }
@@ -1468,11 +1615,11 @@ router.patch('/ventas/descuentos-catalogos/:id/estado', checkPermission(VENTAS_D
     });
   } catch (err) {
     console.error('Error al cambiar estado de descuentos_catalogos:', err.message);
-    return res.status(500).json({ error: true, message: err.message });
+    return sendVentasInternalError(res);
   }
 });
 
-router.get('/ventas', async (req, res) => {
+router.get('/ventas', checkPermission(['VENTAS_VER']), async (req, res) => {
   try {
     const filters = [];
     const params = [];
@@ -1574,6 +1721,7 @@ router.get('/ventas', async (req, res) => {
         f.fecha_hora_facturacion,
         f.isv_15,
         f.isv_18,
+        fc_info.metodo_pago,
         CASE
           WHEN f.id_pedido IS NOT NULL THEN COALESCE(dp_info.total_items, 0)
           ELSE COALESCE(df_info.total_items, 0)
@@ -1596,6 +1744,14 @@ router.get('/ventas', async (req, res) => {
         LEFT JOIN descuentos d ON d.id_descuento = df.id_descuento
         WHERE df.id_factura = f.id_factura
       ) df_info ON true
+      LEFT JOIN LATERAL (
+        SELECT
+          STRING_AGG(DISTINCT cmp.nombre, ', ' ORDER BY cmp.nombre) AS metodo_pago
+        FROM facturas_cobros fc
+        INNER JOIN cat_metodos_pago cmp
+          ON cmp.id_metodo_pago = fc.id_metodo_pago
+        WHERE fc.id_factura = f.id_factura
+      ) fc_info ON true
       LEFT JOIN LATERAL (
         SELECT
           COALESCE(
@@ -1642,13 +1798,13 @@ router.get('/ventas', async (req, res) => {
     const data = result.rows.map((row) => ({
       ...row,
       numero_venta: formatVentaNumero(row.id_factura),
-      metodo_pago: 'efectivo'
+      metodo_pago: row.metodo_pago || null
     }));
 
     res.status(200).json(data);
   } catch (err) {
-    console.error('Error al listar ventas:', err.message);
-    res.status(500).json({ error: true, message: err.message });
+    console.error('Error al listar ventas:', err);
+    sendVentasInternalError(res);
   }
 });
 
@@ -1690,7 +1846,7 @@ router.get('/ventas/pedidos-menu', checkPermission(['VENTAS_VER']), async (req, 
     res.json(rows);
   } catch (error) {
     console.error('Error fetching pedidos-menu:', error.message);
-    res.status(500).json({ error: true, message: error.message });
+    sendVentasInternalError(res);
   }
 });
 
@@ -1715,11 +1871,11 @@ router.put('/ventas/pedidos-menu/:id/estado', checkPermission(['VENTAS_VER']), a
     res.json(rows[0]);
   } catch (error) {
     console.error('Error updating pedido estado:', error);
-    res.status(500).json({ error: true, message: error.message });
+    sendVentasInternalError(res);
   }
 });
 
-router.get('/ventas/:id', async (req, res) => {
+router.get('/ventas/:id', checkPermission(['VENTAS_VER']), async (req, res) => {
   try {
     const idFactura = parsePositiveInt(req.params.id);
     if (!idFactura) {
@@ -1768,6 +1924,7 @@ router.get('/ventas/:id', async (req, res) => {
         f.fecha_hora_facturacion,
         f.isv_15,
         f.isv_18,
+        fc_info.metodo_pago,
         COALESCE(df_info.total_items, 0) AS total_items,
         COALESCE(df_info.descuento_total, 0) AS descuento_total
       FROM facturas f
@@ -1778,6 +1935,14 @@ router.get('/ventas/:id', async (req, res) => {
       LEFT JOIN personas per ON per.id_persona = c.id_persona
       LEFT JOIN empresas emp ON emp.id_empresa = c.id_empresa
       LEFT JOIN usuarios u ON u.id_usuario = COALESCE(p.id_usuario, f.id_usuario)
+      LEFT JOIN LATERAL (
+        SELECT
+          STRING_AGG(DISTINCT cmp.nombre, ', ' ORDER BY cmp.nombre) AS metodo_pago
+        FROM facturas_cobros fc
+        INNER JOIN cat_metodos_pago cmp
+          ON cmp.id_metodo_pago = fc.id_metodo_pago
+        WHERE fc.id_factura = f.id_factura
+      ) fc_info ON true
       LEFT JOIN LATERAL (
         SELECT
           SUM(COALESCE(df.cantidad, 0))::int AS total_items,
@@ -1859,7 +2024,7 @@ router.get('/ventas/:id', async (req, res) => {
       return res.status(200).json({
         ...venta,
         numero_venta: formatVentaNumero(venta.id_factura),
-        metodo_pago: 'efectivo',
+        metodo_pago: venta.metodo_pago || null,
         items: buildKitchenSaleDetailItems(pedidoItemsResult.rows)
       });
     }
@@ -1895,16 +2060,16 @@ router.get('/ventas/:id', async (req, res) => {
     res.status(200).json({
       ...venta,
       numero_venta: formatVentaNumero(venta.id_factura),
-      metodo_pago: 'efectivo',
+      metodo_pago: venta.metodo_pago || null,
       items: directItems
     });
   } catch (err) {
-    console.error('Error al obtener detalle de venta:', err.message);
-    res.status(500).json({ error: true, message: err.message });
+    console.error('Error al obtener detalle de venta:', err);
+    sendVentasInternalError(res);
   }
 });
 
-router.post('/ventas', async (req, res) => {
+router.post('/ventas', checkPermission(['VENTAS_VER']), async (req, res) => {
   const client = await pool.connect();
 
   try {
@@ -2023,9 +2188,10 @@ router.post('/ventas', async (req, res) => {
           cambio,
           fecha_hora_facturacion,
           isv_15,
-          isv_18
+          isv_18,
+          id_sesion_caja
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, CURRENT_TIMESTAMP, $8, 0)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, CURRENT_TIMESTAMP, $8, 0, $9)
         RETURNING id_factura
       `,
       [
@@ -2036,11 +2202,46 @@ router.post('/ventas', async (req, res) => {
         venta.id_cliente,
         venta.efectivo_entregado,
         venta.cambio,
-        venta.isv
+        venta.isv,
+        venta.id_sesion_caja
       ]
     );
 
     const idFactura = facturaResult.rows[0].id_factura;
+
+    const idMetodoPago = parseOptionalPositiveInt(venta.id_metodo_pago);
+    if (!idMetodoPago) {
+      throw {
+        httpStatus: 409,
+        code: 'VENTAS_METODO_PAGO_INVALIDO',
+        publicMessage: 'No se pudo resolver el metodo de pago de la venta.'
+      };
+    }
+
+    await client.query(
+      `
+        INSERT INTO facturas_cobros (
+          id_factura,
+          id_sesion_caja,
+          id_caja,
+          id_sucursal,
+          id_usuario_ejecutor,
+          id_metodo_pago,
+          monto,
+          fecha_cobro,
+          fecha_creacion
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+      `,
+      [
+        idFactura,
+        venta.id_sesion_caja,
+        venta.id_caja,
+        venta.id_sucursal,
+        venta.id_usuario,
+        idMetodoPago,
+        venta.total
+      ]
+    );
 
     for (const line of venta.all_lines) {
       await client.query(
@@ -2098,6 +2299,16 @@ router.post('/ventas', async (req, res) => {
       );
     }
 
+    const acumulacionFidelizacion = await registerFacturaLoyaltyAccumulation({
+      client,
+      idFactura,
+      idPedido,
+      idCliente: venta.id_cliente,
+      idSucursal: venta.id_sucursal,
+      idUsuarioEjecutor: venta.id_usuario,
+      montoFactura: venta.total
+    });
+
     await client.query('COMMIT');
 
     res.status(201).json({
@@ -2106,12 +2317,25 @@ router.post('/ventas', async (req, res) => {
       id_pedido: idPedido,
       numero_venta: formatVentaNumero(idFactura),
       total: venta.total,
-      venta_directa: idPedido === null
+      venta_directa: idPedido === null,
+      fidelizacion: acumulacionFidelizacion.created
+        ? {
+            puntos_acumulados: acumulacionFidelizacion.points,
+            saldo_nuevo: acumulacionFidelizacion.saldoNuevo
+          }
+        : null
     });
   } catch (err) {
     await client.query('ROLLBACK');
-    console.error('Error al crear venta:', err.message);
-    res.status(500).json({ error: true, message: err.message });
+    console.error('Error al crear venta:', err);
+    if (Number.isInteger(err?.httpStatus) && err.httpStatus >= 400 && err.httpStatus < 500) {
+      return res.status(err.httpStatus).json({
+        error: true,
+        code: err.code || 'VENTAS_CREATE_ERROR',
+        message: err.publicMessage || 'No se pudo completar la venta.'
+      });
+    }
+    res.status(500).json({ error: true, message: 'No se pudo completar la venta.' });
   } finally {
     client.release();
   }
@@ -2119,4 +2343,3 @@ router.post('/ventas', async (req, res) => {
 
 
 export default router;
-
