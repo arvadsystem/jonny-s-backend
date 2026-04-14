@@ -187,6 +187,23 @@ const crearIdentidadSupabase = async (email, password) => {
   return data.id; // UUID de Supabase
 };
 
+const eliminarIdentidadSupabase = async (authUserId) => {
+  if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY || !authUserId) return;
+
+  const response = await fetch(`${SUPABASE_URL}/auth/v1/admin/users/${authUserId}`, {
+    method: 'DELETE',
+    headers: {
+      apikey: SUPABASE_SERVICE_KEY,
+      Authorization: `Bearer ${SUPABASE_SERVICE_KEY}`
+    }
+  });
+
+  if (!response.ok && response.status !== 404) {
+    const payload = await response.json().catch(() => ({}));
+    throw new Error(payload?.message || payload?.msg || 'No se pudo compensar usuario de autenticacion.');
+  }
+};
+
 /**
  * Generar link de acción (signup, recovery) vía Supabase Admin API.
  * Retorna la action_link que contiene el token.
@@ -291,6 +308,7 @@ router.post('/api/public/register', registerLimiter, async (req, res) => {
   }
 
   const client = await pool.connect();
+  let authUserIdCreated = null;
   try {
     await ensureVerificationTokenTable();
     await client.query('BEGIN');
@@ -330,6 +348,7 @@ router.post('/api/public/register', registerLimiter, async (req, res) => {
     }
 
     const auth_user_id = await crearIdentidadSupabase(email, clave);
+    authUserIdCreated = auth_user_id;
 
     const personaRes = await client.query(
       `INSERT INTO personas (nombre, apellido, genero) VALUES ($1, $2, $3) RETURNING id_persona`,
@@ -338,6 +357,9 @@ router.post('/api/public/register', registerLimiter, async (req, res) => {
     const id_persona = personaRes.rows[0].id_persona;
 
     const id_cliente = await insertarClienteSeguro(client, id_persona);
+    if (!Number.isInteger(Number(id_cliente)) || Number(id_cliente) <= 0) {
+      throw new Error('CLIENT_INSERT_FAILED');
+    }
 
     const usuarioRes = await client.query(
       `INSERT INTO usuarios (nombre_usuario, clave, estado, tipo_usuario, id_cliente, must_change_password)
@@ -414,6 +436,13 @@ router.post('/api/public/register', registerLimiter, async (req, res) => {
     });
   } catch (error) {
     await client.query('ROLLBACK').catch(() => {});
+
+    if (authUserIdCreated) {
+      await eliminarIdentidadSupabase(authUserIdCreated).catch((cleanupError) => {
+        console.error('[public/register] No se pudo compensar usuario auth:', cleanupError.message);
+      });
+    }
+
     console.error('[public/register] Error:', error);
 
     const normalizedErrorMsg = String(error?.message || '').toLowerCase();
@@ -428,26 +457,21 @@ router.post('/api/public/register', registerLimiter, async (req, res) => {
     if (isDuplicateEmail) {
       return apiError(res, 409, {
         code: 'EMAIL_ALREADY_EXISTS',
-        message: 'El correo electronico ya existe en autenticacion. Si lo eliminaste solo de la BD local, tambien debes eliminarlo de Supabase Auth > Users.',
-        field: 'email',
-        details: process.env.NODE_ENV === 'development'
-          ? (error?.payload || String(error?.message || ''))
-          : null
+        message: 'El correo electronico ya existe en autenticacion.',
+        field: 'email'
       });
     }
 
     if (error?.code === '22001') {
       return apiError(res, 400, {
         code: 'VALIDATION_ERROR',
-        message: 'Uno de los campos excede la longitud permitida por la base de datos.',
-        details: process.env.NODE_ENV === 'development' ? String(error?.message || error) : null
+        message: 'Uno de los campos excede la longitud permitida por la base de datos.'
       });
     }
 
     return apiError(res, 500, {
       code: 'REGISTER_FAILED',
-      message: 'No se pudo completar el registro del cliente.',
-      details: process.env.NODE_ENV === 'development' ? String(error?.message || error) : null
+      message: 'No se pudo completar el registro del cliente.'
     });
   } finally {
     client.release();
@@ -530,6 +554,13 @@ router.post('/api/public/login', publicLoginIpLimiter, publicLoginAccountIpLimit
       return apiError(res, 403, {
         code: 'ACCOUNT_DISABLED',
         message: 'Cuenta desactivada.'
+      });
+    }
+
+    if (String(usuario?.tipo_usuario || '').trim().toUpperCase() !== 'CLIENTE') {
+      return apiError(res, 403, {
+        code: 'ACCOUNT_SCOPE_INVALID',
+        message: 'Este acceso corresponde solo a cuentas de cliente.'
       });
     }
 
@@ -917,18 +948,17 @@ router.post('/api/public/google-callback', async (req, res) => {
       try {
         await client.query('BEGIN');
 
-        let id_persona = null;
-        if (nombre) {
-          const personaRes = await client.query(
-            `INSERT INTO personas (nombre, apellido) VALUES ($1, $2) RETURNING id_persona`,
-            [nombre, apellido]
-          );
-          id_persona = personaRes.rows[0]?.id_persona;
-        }
+        const fallbackNombre = normalizeIdentifier(nombre) || 'Cliente';
+        const fallbackApellido = normalizeIdentifier(apellido) || 'Google';
+        const personaRes = await client.query(
+          `INSERT INTO personas (nombre, apellido, genero) VALUES ($1, $2, 'O') RETURNING id_persona`,
+          [fallbackNombre, fallbackApellido]
+        );
+        const id_persona = personaRes.rows[0]?.id_persona;
 
-        let id_cliente = null;
-        if (id_persona) {
-          id_cliente = await insertarClienteSeguro(client, id_persona);
+        const id_cliente = await insertarClienteSeguro(client, id_persona);
+        if (!Number.isInteger(Number(id_cliente)) || Number(id_cliente) <= 0) {
+          throw new Error('CLIENT_INSERT_FAILED');
         }
 
         const usuarioInsert = await client.query(
@@ -946,25 +976,23 @@ router.post('/api/public/google-callback', async (req, res) => {
           );
         }
 
-        if (id_cliente) {
-          await client.query(
-            `
-              INSERT INTO usuarios_clientes (
-                id_usuario,
-                id_cliente,
-                estado,
-                fecha_vinculacion,
-                fecha_actualizacion
-              )
-              VALUES ($1, $2, true, NOW(), NOW())
-              ON CONFLICT (id_usuario, id_cliente) DO UPDATE
-              SET
-                estado = true,
-                fecha_actualizacion = NOW()
-            `,
-            [id_usuario, id_cliente]
-          );
-        }
+        await client.query(
+          `
+            INSERT INTO usuarios_clientes (
+              id_usuario,
+              id_cliente,
+              estado,
+              fecha_vinculacion,
+              fecha_actualizacion
+            )
+            VALUES ($1, $2, true, NOW(), NOW())
+            ON CONFLICT (id_usuario, id_cliente) DO UPDATE
+            SET
+              estado = true,
+              fecha_actualizacion = NOW()
+          `,
+          [id_usuario, id_cliente]
+        );
 
         await client.query(
           `INSERT INTO identidades_auth (id_usuario, auth_user_id, provider, email_login, email_verificado, activo)

@@ -1,6 +1,6 @@
 import express from 'express';
 import pool from '../config/db-connection.js';
-import { checkPermission } from '../middleware/checkPermission.js';
+import { checkPermission, requestHasAnyPermission } from '../middleware/checkPermission.js';
 import { resolveRequestUserSucursalScope } from '../utils/sucursalScope.js';
 import { registerFacturaLoyaltyAccumulation } from '../services/fidelizacionService.js';
 
@@ -21,10 +21,18 @@ const DESCUENTO_TIPO_KEYS = {
   PORCENTAJE: 'PORCENTAJE'
 };
 const ESTADO_PEDIDO_CODES = {
-  PENDIENTE: new Set(['pendiente']),
+  PENDIENTE: new Set([
+    'pendiente',
+    'pendientes',
+    'por_pagar',
+    'pendiente_por_pagar',
+    'pendiente_/_por_pagar',
+    'pendientes_/_por_pagar'
+  ]),
   EN_COCINA: new Set(['en_cocina']),
   EN_PREPARACION: new Set(['en_preparacion']),
   LISTO_PARA_ENTREGA: new Set(['listo_para_entrega']),
+  CANCELADO: new Set(['cancelado', 'cancelada', 'anulado', 'anulada']),
   COMPLETADO: new Set([
     'completada',
     'completado',
@@ -38,6 +46,12 @@ const ESTADO_PEDIDO_CODES = {
     'listo'
   ])
 };
+const PEDIDO_MENU_PAYMENT_WINDOW_MINUTES = 10;
+const PEDIDO_ESTADO_PAGO = Object.freeze({
+  PENDIENTE_VALIDACION: 'PENDIENTE_VALIDACION',
+  PAGADO_CONFIRMADO: 'PAGADO_CONFIRMADO',
+  CANCELADO_TIMEOUT: 'CANCELADO_TIMEOUT'
+});
 
 const roundMoney = (value) => Number((Number(value || 0)).toFixed(2));
 
@@ -588,6 +602,113 @@ const resolveRequestedEstadoPedidoId = async (client, requestedId) => {
   );
 
   return result.rowCount > 0 ? requestedId : null;
+};
+
+const pedidosColumnCache = new Map();
+const hasPedidosColumn = async (client, columnName) => {
+  const key = String(columnName || '').trim().toLowerCase();
+  if (!key) return false;
+  if (pedidosColumnCache.has(key)) return pedidosColumnCache.get(key);
+
+  const result = await client.query(
+    `
+      SELECT 1
+      FROM information_schema.columns
+      WHERE table_schema = 'public'
+        AND table_name = 'pedidos'
+        AND column_name = $1
+      LIMIT 1
+    `,
+    [key]
+  );
+  const exists = result.rowCount > 0;
+  pedidosColumnCache.set(key, exists);
+  return exists;
+};
+
+const resolvePedidoTransitionTargetCode = (currentCode, requestedCode) => {
+  if (!currentCode) return null;
+
+  if (currentCode === 'PENDIENTE') {
+    if (requestedCode === 'EN_COCINA') return 'EN_COCINA';
+    return null;
+  }
+
+  if (currentCode === 'EN_COCINA') {
+    if (requestedCode === 'LISTO_PARA_ENTREGA' || requestedCode === 'EN_PREPARACION') {
+      return requestedCode;
+    }
+    return null;
+  }
+
+  if (currentCode === 'EN_PREPARACION') {
+    if (requestedCode === 'LISTO_PARA_ENTREGA') return 'LISTO_PARA_ENTREGA';
+    return null;
+  }
+
+  if (currentCode === 'LISTO_PARA_ENTREGA') {
+    if (requestedCode === 'COMPLETADO') return 'COMPLETADO';
+    return null;
+  }
+
+  return null;
+};
+
+const expirePendingPublicOrders = async ({ client, allowedSucursalIds = [] }) => {
+  const hasEstadoPago = await hasPedidosColumn(client, 'estado_pago');
+  const hasValidacionVence = await hasPedidosColumn(client, 'validacion_pago_vence_at');
+  if (!hasEstadoPago || !hasValidacionVence) {
+    return { applied: false, expiredCount: 0 };
+  }
+
+  const idEstadoPendiente = await resolveEstadoPedidoIdByCode(client, 'PENDIENTE');
+  if (!idEstadoPendiente) return { applied: false, expiredCount: 0 };
+
+  const idEstadoCancelado =
+    (await resolveEstadoPedidoIdByCode(client, 'CANCELADO')) || idEstadoPendiente;
+
+  const hasCanceladoPorTimeoutAt = await hasPedidosColumn(client, 'cancelado_por_timeout_at');
+
+  const params = [
+    idEstadoPendiente,
+    PEDIDO_ESTADO_PAGO.PENDIENTE_VALIDACION,
+    PEDIDO_ESTADO_PAGO.CANCELADO_TIMEOUT,
+    idEstadoCancelado
+  ];
+
+  let sucursalClause = '';
+  if (Array.isArray(allowedSucursalIds) && allowedSucursalIds.length > 0) {
+    params.push(allowedSucursalIds);
+    sucursalClause = `AND p.id_sucursal = ANY($${params.length}::int[])`;
+  }
+
+  const timeoutSetSql = hasCanceladoPorTimeoutAt
+    ? 'cancelado_por_timeout_at = NOW(),'
+    : '';
+
+  const updateResult = await client.query(
+    `
+      UPDATE pedidos p
+      SET
+        estado_pago = $3,
+        id_estado_pedido = $4,
+        ${timeoutSetSql}
+        fecha_hora_pedido = p.fecha_hora_pedido
+      WHERE p.origen_pedido = 'MENU'
+        AND p.id_estado_pedido = $1
+        AND UPPER(TRIM(COALESCE(p.estado_pago, ''))) = $2
+        AND p.validacion_pago_vence_at IS NOT NULL
+        AND p.validacion_pago_vence_at <= NOW()
+        ${sucursalClause}
+      RETURNING p.id_pedido
+    `,
+    params
+  );
+
+  return {
+    applied: true,
+    expiredCount: updateResult.rowCount
+  };
 };
 
 const allocateDiscounts = (lineSubtotals, totalDiscount) => {
@@ -1808,70 +1929,395 @@ router.get('/ventas', checkPermission(['VENTAS_VER']), async (req, res) => {
   }
 });
 
-// --- ENPOINT DE PEDIDOS (MENÚ PÚBLICO) ---
-// Obtener pedidos pendientes (PENDIENTE, EN_COCINA, LISTO_PARA_ENTREGA)
+// --- ENDPOINTS DE PEDIDOS (MENU PUBLICO) ---
+// Gestion de validacion de pago y flujo operativo (Cocina/Entrega).
 router.get('/ventas/pedidos-menu', checkPermission(['VENTAS_VER']), async (req, res) => {
+  const client = await pool.connect();
   try {
-    const scope = await resolveRequestUserSucursalScope(req);
-    const filters = [];
-    const values = [];
-    let queryIdx = 1;
+    const scope = await resolveRequestUserSucursalScope(req, client);
+    const allowedSucursalIds = Array.isArray(scope.allowedSucursalIds)
+      ? scope.allowedSucursalIds.filter((value) => Number.isInteger(Number(value)) && Number(value) > 0).map(Number)
+      : [];
 
-    // Filter by pending/preparing/ready-to-pickup states (assuming 1, 2, 3)
-    filters.push(`p.id_estado_pedido <= 3`);
-    
-    if (scope.allowedSucursalIds && scope.allowedSucursalIds.length > 0) {
-      const placeholders = scope.allowedSucursalIds.map(() => `$${queryIdx++}`).join(', ');
-      filters.push(`p.id_sucursal IN (${placeholders})`);
-      values.push(...scope.allowedSucursalIds);
+    await expirePendingPublicOrders({ client, allowedSucursalIds });
+
+    const hasEstadoPago = await hasPedidosColumn(client, 'estado_pago');
+    const hasValidacionVence = await hasPedidosColumn(client, 'validacion_pago_vence_at');
+    const hasPagoConfirmadoAt = await hasPedidosColumn(client, 'pago_confirmado_at');
+    const hasCanceladoPorTimeoutAt = await hasPedidosColumn(client, 'cancelado_por_timeout_at');
+    const hasIdUsuarioPagoConfirmado = await hasPedidosColumn(client, 'id_usuario_pago_confirmado');
+
+    const estadoPendiente = await resolveEstadoPedidoIdByCode(client, 'PENDIENTE');
+    const estadoEnCocina = await resolveEstadoPedidoIdByCode(client, 'EN_COCINA');
+    const estadoListo = await resolveEstadoPedidoIdByCode(client, 'LISTO_PARA_ENTREGA');
+    const estadoIds = [estadoPendiente, estadoEnCocina, estadoListo].filter(Boolean);
+
+    if (estadoIds.length === 0) {
+      return res.status(200).json([]);
     }
-    
-    const whereClause = filters.length > 0 ? `WHERE ${filters.join(' AND ')}` : '';
 
-    const query = `
-      SELECT 
-        p.id_pedido, p.descripcion_pedido, p.descripcion_envio, 
-        p.fecha_hora_pedido, p.sub_total, p.isv, p.total, p.id_estado_pedido,
-        p.origen_pedido, ep.descripcion AS nombre_estado_pedido,
-        per.nombre AS nombres_cliente, per.apellido AS apellidos_cliente
-      FROM pedidos p
-      JOIN estados_pedido ep ON p.id_estado_pedido = ep.id_estado_pedido
-      LEFT JOIN clientes c ON p.id_cliente = c.id_cliente
-      LEFT JOIN personas per ON c.id_persona = per.id_persona
-      ${whereClause}
-      ORDER BY p.fecha_hora_pedido ASC
-    `;
+    const filters = [`p.id_estado_pedido = ANY($1::int[])`];
+    const params = [estadoIds];
 
-    const { rows } = await pool.query(query, values);
-    res.json(rows);
+    if (allowedSucursalIds.length > 0) {
+      params.push(allowedSucursalIds);
+      filters.push(`p.id_sucursal = ANY($${params.length}::int[])`);
+    }
+
+    if (hasEstadoPago) {
+      params.push(PEDIDO_ESTADO_PAGO.CANCELADO_TIMEOUT);
+      filters.push(`UPPER(TRIM(COALESCE(p.estado_pago, ''))) <> $${params.length}`);
+    }
+
+    const whereClause = `WHERE ${filters.join(' AND ')}`;
+
+    const estadoPagoSelect = hasEstadoPago ? 'p.estado_pago' : `NULL::text AS estado_pago`;
+    const validacionSelect = hasValidacionVence
+      ? 'p.validacion_pago_vence_at'
+      : 'NULL::timestamp AS validacion_pago_vence_at';
+    const pagoConfirmadoAtSelect = hasPagoConfirmadoAt
+      ? 'p.pago_confirmado_at'
+      : 'NULL::timestamp AS pago_confirmado_at';
+    const canceladoTimeoutSelect = hasCanceladoPorTimeoutAt
+      ? 'p.cancelado_por_timeout_at'
+      : 'NULL::timestamp AS cancelado_por_timeout_at';
+    const pagoConfirmadorSelect = hasIdUsuarioPagoConfirmado
+      ? 'p.id_usuario_pago_confirmado'
+      : 'NULL::int AS id_usuario_pago_confirmado';
+
+    const result = await client.query(
+      `
+        SELECT
+          p.id_pedido,
+          p.descripcion_pedido,
+          p.descripcion_envio,
+          p.fecha_hora_pedido,
+          p.sub_total,
+          p.isv,
+          p.total,
+          p.id_estado_pedido,
+          p.origen_pedido,
+          ep.descripcion AS nombre_estado_pedido,
+          ${estadoPagoSelect},
+          ${validacionSelect},
+          ${pagoConfirmadoAtSelect},
+          ${canceladoTimeoutSelect},
+          ${pagoConfirmadorSelect},
+          u_pago.nombre_usuario AS usuario_pago_confirmado,
+          per.nombre AS nombres_cliente,
+          per.apellido AS apellidos_cliente
+        FROM pedidos p
+        INNER JOIN estados_pedido ep ON p.id_estado_pedido = ep.id_estado_pedido
+        LEFT JOIN clientes c ON p.id_cliente = c.id_cliente
+        LEFT JOIN personas per ON c.id_persona = per.id_persona
+        LEFT JOIN usuarios u_pago ON u_pago.id_usuario = p.id_usuario_pago_confirmado
+        ${whereClause}
+        ORDER BY p.fecha_hora_pedido ASC
+      `,
+      params
+    );
+
+    const nowMs = Date.now();
+    const rows = result.rows.map((row) => {
+      const venceAt = row.validacion_pago_vence_at ? new Date(row.validacion_pago_vence_at) : null;
+      const remainingMs = venceAt ? (venceAt.getTime() - nowMs) : null;
+      const minutosRestantes = remainingMs === null ? null : Math.max(0, Math.ceil(remainingMs / 60000));
+      return {
+        ...row,
+        pago_validado: String(row.estado_pago || '').toUpperCase() === PEDIDO_ESTADO_PAGO.PAGADO_CONFIRMADO,
+        pago_expirado: String(row.estado_pago || '').toUpperCase() === PEDIDO_ESTADO_PAGO.CANCELADO_TIMEOUT,
+        minutos_restantes_pago: minutosRestantes
+      };
+    });
+
+    res.status(200).json(rows);
   } catch (error) {
-    console.error('Error fetching pedidos-menu:', error.message);
-    sendVentasInternalError(res);
+    console.error('Error fetching pedidos-menu:', error);
+    sendVentasInternalError(res, 'No se pudo cargar el tablero de pedidos.');
+  } finally {
+    client.release();
   }
 });
 
-// Actualizar estado de pedido
-router.put('/ventas/pedidos-menu/:id/estado', checkPermission(['VENTAS_VER']), async (req, res) => {
-  const { id } = req.params;
-  const { id_estado_pedido } = req.body;
+router.post('/ventas/pedidos-menu/:id/confirmar-pago', checkPermission(['VENTAS_VER']), async (req, res) => {
+  const idPedido = parsePositiveInt(req.params.id);
+  if (!idPedido) {
+    return res.status(400).json({ error: true, message: 'ID de pedido invalido.' });
+  }
 
+  const canConfirmPayment = await requestHasAnyPermission(req, [
+    'VENTAS_VER',
+    'VENTAS_CREAR',
+    'VENTAS_PEDIDOS_CONFIRMAR_PAGO'
+  ]);
+  if (!canConfirmPayment) {
+    return res.status(403).json({ error: true, message: 'No tienes permisos para confirmar pagos.' });
+  }
+
+  const client = await pool.connect();
   try {
-    const query = `
-      UPDATE pedidos
-      SET id_estado_pedido = $1
-      WHERE id_pedido = $2
-      RETURNING *
-    `;
-    const { rows } = await pool.query(query, [id_estado_pedido, id]);
+    await client.query('BEGIN');
+    const scope = await resolveRequestUserSucursalScope(req, client);
+    const allowedSucursalIds = Array.isArray(scope.allowedSucursalIds)
+      ? scope.allowedSucursalIds.filter((value) => Number.isInteger(Number(value)) && Number(value) > 0).map(Number)
+      : [];
 
-    if (rows.length === 0) {
-      return res.status(404).json({ error: true, message: 'Pedido no encontrado' });
+    await expirePendingPublicOrders({ client, allowedSucursalIds });
+
+    const hasEstadoPago = await hasPedidosColumn(client, 'estado_pago');
+    const hasPagoConfirmadoAt = await hasPedidosColumn(client, 'pago_confirmado_at');
+    const hasValidacionVence = await hasPedidosColumn(client, 'validacion_pago_vence_at');
+    const hasIdUsuarioPagoConfirmado = await hasPedidosColumn(client, 'id_usuario_pago_confirmado');
+
+    if (!hasEstadoPago) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({
+        error: true,
+        message: 'El esquema actual no soporta validacion de pago de pedidos.'
+      });
     }
 
-    res.json(rows[0]);
+    const estadoPendiente = await resolveEstadoPedidoIdByCode(client, 'PENDIENTE');
+    if (!estadoPendiente) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({ error: true, message: 'No existe estado PENDIENTE para pedidos.' });
+    }
+
+    const pedidoResult = await client.query(
+      `
+        SELECT id_pedido, id_estado_pedido, id_sucursal, estado_pago, validacion_pago_vence_at
+        FROM pedidos
+        WHERE id_pedido = $1
+        FOR UPDATE
+      `,
+      [idPedido]
+    );
+
+    if (pedidoResult.rowCount === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: true, message: 'Pedido no encontrado.' });
+    }
+
+    const pedido = pedidoResult.rows[0];
+    const pedidoSucursalId = Number(pedido.id_sucursal || 0);
+    if (
+      allowedSucursalIds.length > 0 &&
+      !allowedSucursalIds.includes(pedidoSucursalId)
+    ) {
+      await client.query('ROLLBACK');
+      return res.status(403).json({ error: true, message: 'No puedes confirmar pagos de otra sucursal.' });
+    }
+
+    if (Number(pedido.id_estado_pedido || 0) !== Number(estadoPendiente)) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({
+        error: true,
+        message: 'Solo se puede confirmar pago de pedidos pendientes de validacion.'
+      });
+    }
+
+    const estadoPagoActual = String(pedido.estado_pago || '').toUpperCase();
+    if (estadoPagoActual === PEDIDO_ESTADO_PAGO.PAGADO_CONFIRMADO) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({ error: true, message: 'El pago de este pedido ya fue confirmado.' });
+    }
+
+    if (estadoPagoActual === PEDIDO_ESTADO_PAGO.CANCELADO_TIMEOUT) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({ error: true, message: 'El pedido ya fue cancelado por vencimiento de pago.' });
+    }
+
+    if (hasValidacionVence && pedido.validacion_pago_vence_at) {
+      const venceAt = new Date(pedido.validacion_pago_vence_at).getTime();
+      if (Number.isFinite(venceAt) && venceAt <= Date.now()) {
+        await client.query(
+          `
+            UPDATE pedidos
+            SET estado_pago = $2
+            WHERE id_pedido = $1
+          `,
+          [idPedido, PEDIDO_ESTADO_PAGO.CANCELADO_TIMEOUT]
+        );
+        await client.query('COMMIT');
+        return res.status(409).json({
+          error: true,
+          message: 'La ventana de validacion de pago expiro (10 minutos).'
+        });
+      }
+    }
+
+    const updateFields = ['estado_pago = $2'];
+    const updateParams = [idPedido, PEDIDO_ESTADO_PAGO.PAGADO_CONFIRMADO];
+    if (hasPagoConfirmadoAt) {
+      updateFields.push('pago_confirmado_at = NOW()');
+    }
+    if (hasIdUsuarioPagoConfirmado) {
+      const idUsuarioConfirma = parsePositiveInt(req.user?.id_usuario);
+      if (idUsuarioConfirma) {
+        updateParams.push(idUsuarioConfirma);
+        updateFields.push(`id_usuario_pago_confirmado = $${updateParams.length}`);
+      }
+    }
+
+    await client.query(
+      `
+        UPDATE pedidos
+        SET ${updateFields.join(', ')}
+        WHERE id_pedido = $1
+      `,
+      updateParams
+    );
+
+    await client.query('COMMIT');
+
+    return res.status(200).json({
+      ok: true,
+      id_pedido: idPedido,
+      estado_pago: PEDIDO_ESTADO_PAGO.PAGADO_CONFIRMADO,
+      message: 'Pago confirmado correctamente.'
+    });
   } catch (error) {
+    try { await client.query('ROLLBACK'); } catch {}
+    console.error('Error confirmando pago de pedido:', error);
+    return sendVentasInternalError(res, 'No se pudo confirmar el pago del pedido.');
+  } finally {
+    client.release();
+  }
+});
+
+router.put('/ventas/pedidos-menu/:id/estado', checkPermission(['VENTAS_VER']), async (req, res) => {
+  const idPedido = parsePositiveInt(req.params.id);
+  if (!idPedido) {
+    return res.status(400).json({ error: true, message: 'ID de pedido invalido.' });
+  }
+
+  const requestedTargetCode = String(req.body?.estado_destino || '').trim().toUpperCase();
+  const requestedLegacyStateId = parseOptionalPositiveInt(req.body?.id_estado_pedido);
+
+  if (!requestedTargetCode && !requestedLegacyStateId) {
+    return res.status(400).json({
+      error: true,
+      message: 'Debes enviar estado_destino o id_estado_pedido para avanzar el pedido.'
+    });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const scope = await resolveRequestUserSucursalScope(req, client);
+    const allowedSucursalIds = Array.isArray(scope.allowedSucursalIds)
+      ? scope.allowedSucursalIds.filter((value) => Number.isInteger(Number(value)) && Number(value) > 0).map(Number)
+      : [];
+
+    await expirePendingPublicOrders({ client, allowedSucursalIds });
+
+    const hasEstadoPago = await hasPedidosColumn(client, 'estado_pago');
+    const hasValidacionVence = await hasPedidosColumn(client, 'validacion_pago_vence_at');
+
+    const estadoRows = await fetchEstadoPedidoRows(client);
+    const estadoCodeById = new Map(
+      estadoRows.map((row) => [Number(row.id_estado_pedido), Object.entries(ESTADO_PEDIDO_CODES).find(([, aliases]) => aliases.has(normalizeTextKey(row.descripcion)))?.[0] || null])
+    );
+
+    const pedidoResult = await client.query(
+      `
+        SELECT id_pedido, id_estado_pedido, id_sucursal, estado_pago, validacion_pago_vence_at
+        FROM pedidos
+        WHERE id_pedido = $1
+        FOR UPDATE
+      `,
+      [idPedido]
+    );
+
+    if (pedidoResult.rowCount === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: true, message: 'Pedido no encontrado.' });
+    }
+
+    const pedido = pedidoResult.rows[0];
+    const pedidoSucursalId = Number(pedido.id_sucursal || 0);
+    if (allowedSucursalIds.length > 0 && !allowedSucursalIds.includes(pedidoSucursalId)) {
+      await client.query('ROLLBACK');
+      return res.status(403).json({ error: true, message: 'No puedes operar pedidos de otra sucursal.' });
+    }
+
+    const currentCode = estadoCodeById.get(Number(pedido.id_estado_pedido)) || null;
+
+    let targetCode = requestedTargetCode || null;
+    if (!targetCode && requestedLegacyStateId) {
+      targetCode = estadoCodeById.get(Number(requestedLegacyStateId)) || null;
+    }
+
+    const normalizedTargetCode = resolvePedidoTransitionTargetCode(currentCode, targetCode);
+    if (!normalizedTargetCode) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({
+        error: true,
+        message: 'La transicion solicitada no es valida para el estado actual del pedido.'
+      });
+    }
+
+    if (normalizedTargetCode === 'EN_COCINA' && hasEstadoPago) {
+      const estadoPago = String(pedido.estado_pago || '').toUpperCase();
+      if (estadoPago !== PEDIDO_ESTADO_PAGO.PAGADO_CONFIRMADO) {
+        await client.query('ROLLBACK');
+        return res.status(409).json({
+          error: true,
+          message: 'No se puede enviar a cocina sin confirmar el pago.'
+        });
+      }
+
+      if (hasValidacionVence && pedido.validacion_pago_vence_at) {
+        const venceAt = new Date(pedido.validacion_pago_vence_at).getTime();
+        if (Number.isFinite(venceAt) && venceAt <= Date.now()) {
+          await client.query(
+            `
+              UPDATE pedidos
+              SET estado_pago = $2
+              WHERE id_pedido = $1
+            `,
+            [idPedido, PEDIDO_ESTADO_PAGO.CANCELADO_TIMEOUT]
+          );
+          await client.query('COMMIT');
+          return res.status(409).json({
+            error: true,
+            message: 'El pedido ya vencio por timeout de validacion de pago.'
+          });
+        }
+      }
+    }
+
+    const targetStateId = await resolveEstadoPedidoIdByCode(client, normalizedTargetCode);
+    if (!targetStateId) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({
+        error: true,
+        message: `No existe estado ${normalizedTargetCode} en catalogo de pedidos.`
+      });
+    }
+
+    await client.query(
+      `
+        UPDATE pedidos
+        SET id_estado_pedido = $2
+        WHERE id_pedido = $1
+      `,
+      [idPedido, targetStateId]
+    );
+
+    await client.query('COMMIT');
+    return res.status(200).json({
+      ok: true,
+      id_pedido: idPedido,
+      estado_anterior: currentCode,
+      estado_actual: normalizedTargetCode
+    });
+  } catch (error) {
+    try { await client.query('ROLLBACK'); } catch {}
     console.error('Error updating pedido estado:', error);
-    sendVentasInternalError(res);
+    return sendVentasInternalError(res, 'No se pudo actualizar el estado del pedido.');
+  } finally {
+    client.release();
   }
 });
 

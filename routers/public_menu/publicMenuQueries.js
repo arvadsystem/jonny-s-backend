@@ -462,9 +462,10 @@ export const fetchFallbackOrderUserIdQuery = async () => {
 
 // Inserta cabecera de pedido publico y devuelve ID generado.
 export const insertPublicPedidoQuery = async (client, payload) => {
-  const [hasEstadoPagoColumn, hasTipoEntregaColumn] = await Promise.all([
+  const [hasEstadoPagoColumn, hasTipoEntregaColumn, hasValidacionPagoVenceAtColumn] = await Promise.all([
     hasColumn('pedidos', 'estado_pago'),
-    hasColumn('pedidos', 'tipo_entrega')
+    hasColumn('pedidos', 'tipo_entrega'),
+    hasColumn('pedidos', 'validacion_pago_vence_at')
   ]);
 
   const columns = ['fecha_hora_pedido'];
@@ -490,11 +491,15 @@ export const insertPublicPedidoQuery = async (client, payload) => {
 
   // Refuerzo item 9: forzamos estado de pago/tipo de entrega si el esquema los soporta.
   if (hasEstadoPagoColumn) {
-    pushValue('estado_pago', payload.estado_pago || 'PENDIENTE');
+    pushValue('estado_pago', payload.estado_pago || 'PENDIENTE_VALIDACION');
   }
 
   if (hasTipoEntregaColumn) {
     pushValue('tipo_entrega', payload.tipo_entrega || 'LOCAL');
+  }
+
+  if (hasValidacionPagoVenceAtColumn) {
+    pushValue('validacion_pago_vence_at', payload.validacion_pago_vence_at || null);
   }
 
   const result = await client.query(

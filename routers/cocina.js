@@ -336,6 +336,7 @@ router.get('/cocina/pedidos', checkPermission(COCINA_VIEW_PERMISSIONS), async (r
             p.descripcion_pedido,
             p.descripcion_envio,
             p.fecha_hora_pedido,
+            p.visible_en_cocina_at,
             p.total,
             p.sub_total,
             p.isv,
@@ -392,7 +393,7 @@ router.get('/cocina/pedidos', checkPermission(COCINA_VIEW_PERMISSIONS), async (r
       for (const row of result.rows) {
         if (!grouped.has(row.id_pedido)) {
           const estadoCode = resolveEstadoCode(row.estado_descripcion);
-          const fechaRef = row.fecha_hora_facturacion || row.fecha_hora_pedido;
+          const fechaRef = row.visible_en_cocina_at || row.fecha_hora_facturacion || row.fecha_hora_pedido;
           const fechaMs = fechaRef ? new Date(fechaRef).getTime() : null;
           const minutosEnEspera = fechaMs ? Math.floor((now - fechaMs) / 60000) : null;
           const estaProximoAExpirar =
@@ -411,6 +412,7 @@ router.get('/cocina/pedidos', checkPermission(COCINA_VIEW_PERMISSIONS), async (r
             descripcion_pedido: row.descripcion_pedido || null,
             descripcion_envio: row.descripcion_envio || null,
             fecha_hora_pedido: row.fecha_hora_pedido,
+            visible_en_cocina_at: row.visible_en_cocina_at || row.fecha_hora_facturacion || row.fecha_hora_pedido,
             fecha_hora_facturacion: row.fecha_hora_facturacion || row.fecha_hora_pedido,
             minutos_en_espera: minutosEnEspera,
             esta_proximo_a_expirar: estaProximoAExpirar,
@@ -599,7 +601,12 @@ router.put('/cocina/pedidos/:id/estado', checkPermission(COCINA_VIEW_PERMISSIONS
 
       // ── 9. Actualizar estado ───────────────────────────────────────
       await client.query(
-        'UPDATE pedidos SET id_estado_pedido = $1 WHERE id_pedido = $2',
+        `
+          UPDATE pedidos
+          SET id_estado_pedido = $1,
+              visible_en_cocina_at = COALESCE(visible_en_cocina_at, fecha_hora_pedido, NOW())
+          WHERE id_pedido = $2
+        `,
         [idEstadoDestino, idPedido]
       );
 
@@ -635,12 +642,7 @@ router.put('/cocina/pedidos/:id/estado', checkPermission(COCINA_VIEW_PERMISSIONS
       client.release();
     }
   } catch (err) {
-    try {
-      const fs = await import('fs');
-      fs.writeFileSync('C:\\Users\\academico\\Documents\\unah\\implementacion de sistemas\\Backend\\jonnys\\last_error.txt', err.stack || err.message || String(err));
-    } catch (e) { /* ignore */ }
-    
-    console.error(`[ERROR ${correlationId}] PUT /cocina/pedidos/:id/estado:`, err.message, err.stack?.split('\n')[1]);
+    console.error(`[ERROR ${correlationId}] PUT /cocina/pedidos/:id/estado:`, err.message);
     res.status(500).json({
       error: true,
       message: 'Error interno del servidor',
@@ -650,4 +652,3 @@ router.put('/cocina/pedidos/:id/estado', checkPermission(COCINA_VIEW_PERMISSIONS
 });
 
 export default router;
-

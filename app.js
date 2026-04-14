@@ -61,6 +61,7 @@ import adminCombosRouter from './routers/admin_combos.js';
 import adminMenuPublicacionRouter from './routers/admin_menu_publicacion.js';
 import adminSalsasRouter from './routers/admin_salsas.js';
 import cajasRoutes from './routers/cajas.js';
+import fidelizacionRoutes from './routers/fidelizacion.js';
 
 import { authRequired, csrfProtect } from './middleware/auth.js';
 import { touchSessionMiddleware } from './middleware/touchSession.js';
@@ -188,6 +189,7 @@ app.use(sucursalesRoutes);
 app.use(cajasRoutes);
 app.use(ventasRoutes);
 app.use(cocinaRoutes);
+app.use(fidelizacionRoutes);
 
 // MODULO PERSONAS
 app.use(personasRoutes);
