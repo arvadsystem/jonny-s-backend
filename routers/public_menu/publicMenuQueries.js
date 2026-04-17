@@ -539,6 +539,10 @@ export const insertPublicPedidoQuery = async (client, payload) => {
     columns.push(column);
     values.push(`$${params.length}`);
   };
+  const pushExpression = (column, expression) => {
+    columns.push(column);
+    values.push(expression);
+  };
 
   // Base minima requerida para pedidos del menu publico.
   pushValue('descripcion_pedido', payload.descripcion_pedido);
@@ -562,7 +566,13 @@ export const insertPublicPedidoQuery = async (client, payload) => {
   }
 
   if (hasValidacionPagoVenceAtColumn) {
-    pushValue('validacion_pago_vence_at', payload.validacion_pago_vence_at || null);
+    // Usa hora del motor de BD para evitar desfases de zona horaria entre app y DB.
+    // Si viene valor explicito, lo respeta; si no, define ventana de 10 minutos en SQL.
+    if (payload.validacion_pago_vence_at) {
+      pushValue('validacion_pago_vence_at', payload.validacion_pago_vence_at);
+    } else {
+      pushExpression('validacion_pago_vence_at', "NOW() + INTERVAL '10 minutes'");
+    }
   }
 
   const result = await client.query(

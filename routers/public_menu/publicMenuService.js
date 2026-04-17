@@ -52,7 +52,6 @@ const ORDER_STATE_ALIASES = Object.freeze([
   'por_pagar',
   'pendiente_por_pagar'
 ]);
-const PENDING_STATE_ID_PRIORITY = 1;
 const HAMBURGUESA_KEYWORDS = Object.freeze(['hamburguesa', 'burger', 'smash']);
 const PUBLIC_EXTRA_OPTIONS = Object.freeze([
   {
@@ -376,16 +375,31 @@ const buildCatalogSauceConfigByDetail = async (catalogRows = []) => {
       }
     }
 
-    const salsasPermitidas = sortSauceOptions(Array.from(unionSauces.values()));
-    const salsasRequiereSeleccion = salsasComponentes.some((component) =>
-      (component.reglas || []).some((rule) => Number(rule?.salsas_requeridas || 0) > 0)
+    const requiredFromRules = calculateRequiredSaucesForQuantity(salsasComponentes, 1);
+    const fallbackRequired = calculateFallbackWingSauceRequirement({
+      nombre: row?.nombre_item,
+      descripcion: row?.descripcion_item,
+      quantity: 1
+    });
+    const requiredSaucesBase = Math.max(
+      Number(requiredFromRules || 0),
+      Number(fallbackRequired || 0)
     );
+
+    let salsasPermitidas = sortSauceOptions(Array.from(unionSauces.values()));
+    if (salsasPermitidas.length === 0 && requiredSaucesBase > 0) {
+      // Si inferimos requerimiento por texto (ej. "18 alitas") y no hay mapeo receta_salsa,
+      // exponemos el catalogo publico de salsas activas para permitir la seleccion.
+      salsasPermitidas = sortSauceOptions(fallbackSauceCatalog);
+    }
+
+    const salsasRequiereSeleccion = requiredSaucesBase > 0;
 
     configByDetail.set(idDetalleMenu, {
       salsas_componentes: salsasComponentes,
       salsas_permitidas: salsasPermitidas,
       salsas_requiere_seleccion: salsasRequiereSeleccion,
-      salsas_requeridas_base: calculateRequiredSaucesForQuantity(salsasComponentes, 1)
+      salsas_requeridas_base: requiredSaucesBase
     });
   }
 
@@ -533,17 +547,8 @@ const mapMenuSummary = (row) => ({
 
 const resolvePendingStateId = async () => {
   const rows = await fetchEstadoPedidoRowsQuery();
-  // Regla de compatibilidad con tablero Ventas:
-  // El carril "Pendientes / Por pagar" consume actualmente id_estado_pedido = 1.
-  // Priorizamos ese ID para que los pedidos del menú público entren en la primera columna.
-  const priorityById = rows.find(
-    (row) => Number(row?.id_estado_pedido || 0) === PENDING_STATE_ID_PRIORITY
-  );
-  if (priorityById) {
-    return Number(priorityById.id_estado_pedido);
-  }
-
-  // Fallback defensivo por descripción (instalaciones con catálogo distinto).
+  // Regla robusta: resolver por descripcion canonica para no depender del ID numerico.
+  // En algunos entornos el id=1 NO es "PENDIENTE" (por ejemplo EN_PREPARACION).
   const matchByAlias = rows.find((row) =>
     ORDER_STATE_ALIASES.includes(normalizeTextKey(row?.descripcion))
   );
