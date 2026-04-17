@@ -168,7 +168,7 @@ export function esErrorConflictoConstraint(err) {
 }
 
 export function getSafeServerErrorMessage(err, fallback = 'No se pudo completar la accion. Verifica los datos e intenta de nuevo.') {
-  return String(err?.message || fallback);
+  return fallback;
 }
 
 export function validarEstructuraPayloadReceta(payload, { soloEstadoUsuario = false } = {}) {

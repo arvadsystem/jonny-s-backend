@@ -1,8 +1,11 @@
 ﻿import express from 'express';
 import pool from '../config/db-connection.js';
+import { checkPermission } from '../middleware/checkPermission.js';
 import { resolveMenuDepartmentIds } from './menu_departamentos.js';
 
 const router = express.Router();
+const MENU_VIEW_PERMISSIONS = ['MENU_VER'];
+const MENU_MUTATION_PERMISSIONS = ['MENU_VER'];
 
 const ITEM_TYPES = Object.freeze({
   PRODUCTO: 'PRODUCTO',
@@ -776,7 +779,7 @@ const getVisibleCountByMenu = async ({ idMenu, capabilities, client }) => {
 };
 
 // Lista sucursales operativas para el selector de publicaciÃƒÂ³n.
-router.get('/sucursales', async (_req, res) => {
+router.get('/sucursales', checkPermission(MENU_VIEW_PERMISSIONS), async (_req, res) => {
   try {
     const rows = await getBranchesForPublication();
     return res.status(200).json({ ok: true, data: rows });
@@ -788,7 +791,7 @@ router.get('/sucursales', async (_req, res) => {
 
 // Retorna el catÃƒÂ¡logo unificado con estado actual de publicaciÃƒÂ³n por sucursal.
 // Lista menus disponibles para programar vigencias por sucursal.
-router.get('/menus', async (_req, res) => {
+router.get('/menus', checkPermission(MENU_VIEW_PERMISSIONS), async (_req, res) => {
   try {
     const rows = await getMenusForProgramming();
     return res.status(200).json({ ok: true, data: rows });
@@ -799,7 +802,7 @@ router.get('/menus', async (_req, res) => {
 });
 
 // Crea un menu nuevo para temporadas desde el panel admin sin SQL manual.
-router.post('/menus', async (req, res) => {
+router.post('/menus', checkPermission(MENU_MUTATION_PERMISSIONS), async (req, res) => {
   try {
     const nombreMenu = String(req.body?.nombre_menu ?? '').replace(/\s+/g, ' ').trim();
     const descripcionRaw = String(req.body?.descripcion ?? '').trim();
@@ -871,7 +874,7 @@ router.post('/menus', async (req, res) => {
 });
 
 // Programa un menu por sucursal para una fecha/hora especifica.
-router.post('/programacion', async (req, res) => {
+router.post('/programacion', checkPermission(MENU_MUTATION_PERMISSIONS), async (req, res) => {
   const client = await pool.connect();
   try {
     const idSucursal = toPositiveInt(req.body?.id_sucursal);
@@ -1025,7 +1028,7 @@ router.post('/programacion', async (req, res) => {
   }
 });
 
-router.get('/catalogo', async (req, res) => {
+router.get('/catalogo', checkPermission(MENU_VIEW_PERMISSIONS), async (req, res) => {
   try {
     const idSucursal = toPositiveInt(req.query.id_sucursal);
     const idMenuQuery = toPositiveInt(req.query.id_menu);
@@ -1118,7 +1121,7 @@ router.get('/catalogo', async (req, res) => {
 });
 
 // Preview administrativo del menu por sucursal/menu seleccionado.
-router.get('/preview', async (req, res) => {
+router.get('/preview', checkPermission(MENU_VIEW_PERMISSIONS), async (req, res) => {
   try {
     const idSucursal = toPositiveInt(req.query.id_sucursal);
     const idMenuQuery = toPositiveInt(req.query.id_menu);
@@ -1216,7 +1219,7 @@ router.get('/preview', async (req, res) => {
 });
 
 // Guarda cambios de publicacion para una sucursal en el menu vigente.
-router.put('/catalogo', async (req, res) => {
+router.put('/catalogo', checkPermission(MENU_MUTATION_PERMISSIONS), async (req, res) => {
   const client = await pool.connect();
   try {
     const idSucursal = toPositiveInt(req.query.id_sucursal);
@@ -1362,5 +1365,8 @@ router.put('/catalogo', async (req, res) => {
 });
 
 export default router;
+
+
+
 
 

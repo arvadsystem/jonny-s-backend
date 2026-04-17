@@ -415,6 +415,26 @@ export const fetchAllowedSauceRowsByRecipeIdsQuery = async (recipeIds = []) => {
   return result.rows;
 };
 
+// Catalogo publico de salsas activas para fallback cuando una receta/combo exige salsas
+// pero no tiene mapeo puntual en receta_salsa.
+export const fetchPublicActiveSaucesQuery = async () => {
+  const result = await pool.query(
+    `
+      SELECT
+        s.id_salsa,
+        s.nombre,
+        s.nivel_picante,
+        s.orden,
+        true AS disponible
+      FROM salsas s
+      WHERE COALESCE(s.estado, true) = true
+      ORDER BY s.orden, s.nombre;
+    `
+  );
+
+  return result.rows;
+};
+
 // Reglas de cuantas salsas son requeridas por rango de unidades.
 export const fetchSauceRuleRowsByRecipeIdsQuery = async (recipeIds = []) => {
   if (!Array.isArray(recipeIds) || recipeIds.length === 0) return [];
@@ -458,6 +478,49 @@ export const fetchFallbackOrderUserIdQuery = async () => {
 
   const result = await pool.query(query);
   return result.rows[0]?.id_usuario ? Number(result.rows[0].id_usuario) : null;
+};
+
+// Bloquea por llave de idempotencia dentro de la transaccion actual para evitar doble insercion concurrente.
+export const acquirePublicOrderIdempotencyLockQuery = async (client, { idCliente, idempotencyKey }) => {
+  await client.query(
+    `
+      SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2));
+    `,
+    [String(idCliente), String(idempotencyKey)]
+  );
+};
+
+// Busca un pedido ya creado con la misma llave de idempotencia para devolver respuesta estable en reintentos.
+export const fetchPedidoByIdempotencyKeyQuery = async (
+  client,
+  {
+    idCliente,
+    idSucursal,
+    idempotencyKey
+  }
+) => {
+  const result = await client.query(
+    `
+      SELECT
+        p.id_pedido,
+        p.fecha_hora_pedido,
+        p.total
+      FROM pedidos p
+      WHERE p.id_cliente = $1
+        AND p.id_sucursal = $2
+        AND COALESCE(p.origen_pedido, 'MENU') = 'MENU'
+        AND p.descripcion_pedido ILIKE $3
+      ORDER BY p.id_pedido DESC
+      LIMIT 1;
+    `,
+    [
+      Number(idCliente),
+      Number(idSucursal),
+      `%idem:${String(idempotencyKey)}%`
+    ]
+  );
+
+  return result.rows[0] || null;
 };
 
 // Inserta cabecera de pedido publico y devuelve ID generado.

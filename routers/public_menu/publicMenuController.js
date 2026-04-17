@@ -80,6 +80,7 @@ export const createPublicOrderController = async (req, res) => {
       idSucursal,
       tipoPedido,
       origen,
+      idempotencyKey,
       business,
       items,
       auth
@@ -88,14 +89,18 @@ export const createPublicOrderController = async (req, res) => {
       idSucursal,
       tipoPedido,
       origen,
+      idempotencyKey,
       business,
       items,
       auth
     });
 
-    return res.status(201).json({
+    const replayed = Boolean(data?.idempotency?.replayed);
+    return res.status(replayed ? 200 : 201).json({
       ok: true,
-      message: 'Pedido registrado correctamente.',
+      message: replayed
+        ? 'Pedido ya registrado previamente; se devuelve el resultado original.'
+        : 'Pedido registrado correctamente.',
       data
     });
   } catch (error) {

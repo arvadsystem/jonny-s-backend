@@ -8,6 +8,7 @@ const ORDER_TYPES_REQUIRING_TRANSFER_PROOF = new Set(['pickup', 'delivery']);
 const TRANSFER_METHOD_ALIASES = new Set(['transferencia', 'transferencia_bancaria', 'transfer']);
 const MAX_ORDER_TEXT = Object.freeze({
   ORIGEN: 60,
+  IDEMPOTENCY_KEY: 120,
   CONTACT_NAME: 120,
   CONTACT_PHONE: 30,
   DELIVERY_ADDRESS: 240,
@@ -40,6 +41,11 @@ const normalizeCompactText = (value, maxLength) => {
   if (!Number.isInteger(maxLength) || maxLength <= 0) return clean;
   return clean.slice(0, maxLength);
 };
+
+const normalizeIdempotencyKey = (value) =>
+  normalizeCompactText(value, MAX_ORDER_TEXT.IDEMPOTENCY_KEY)
+    .toLowerCase()
+    .replace(/[^a-z0-9:_-]/g, '');
 
 const normalizeTransferMethod = (value) => {
   const clean = normalizeCompactText(value, 40).toLowerCase();
@@ -212,6 +218,7 @@ export const validateCreateOrderBody = (req, res, next) => {
   const idSucursal = toPositiveInt(body.id_sucursal);
   const tipoPedido = String(body.tipo_pedido || '').trim().toLowerCase();
   const origen = normalizeCompactText(body.origen || 'public-menu', MAX_ORDER_TEXT.ORIGEN) || 'public-menu';
+  const idempotencyKey = normalizeIdempotencyKey(body.idempotency_key);
   const rawItems = Array.isArray(body.items) ? body.items : [];
 
   if (!idSucursal) {
@@ -220,6 +227,14 @@ export const validateCreateOrderBody = (req, res, next) => {
 
   if (!tipoPedido || !PUBLIC_ORDER_TYPES.has(tipoPedido)) {
     return sendValidationError(req, res, 'tipo_pedido invalido. Valores permitidos: dine-in, pickup, delivery.');
+  }
+
+  if (!idempotencyKey || idempotencyKey.length < 12) {
+    return sendValidationError(
+      req,
+      res,
+      'idempotency_key es obligatorio y debe tener al menos 12 caracteres validos.'
+    );
   }
 
   if (rawItems.length === 0) {
@@ -278,6 +293,7 @@ export const validateCreateOrderBody = (req, res, next) => {
     idSucursal,
     tipoPedido,
     origen,
+    idempotencyKey,
     business: businessContextResult?.data || {
       contacto: { nombre: '', telefono: '' },
       entrega: { direccion: '', referencia: '' },

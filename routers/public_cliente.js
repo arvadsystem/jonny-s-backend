@@ -6,8 +6,7 @@
  *   POST /api/public/forgot-password  — recuperación de contraseña (SMTP propio)
  *   POST /api/public/verify-email     — verificar email desde link enviado
  *   POST /api/public/google-callback  — callback OAuth Google
- *   GET  /api/public/menu             — menú público (sin auth)
- *   GET  /api/public/menu/:id         — detalle de ítem del menú (sin auth)
+ *   GET  /api/public/menu*            — DEPRECATED (migrado a /api/public-menu/*)
  */
 import express from 'express';
 import jwt from 'jsonwebtoken';
@@ -1045,63 +1044,22 @@ router.post('/api/public/google-callback', async (req, res) => {
   }
 });
 
-// ── GET /api/public/menu ──────────────────────────────────────────────
+// ── LEGACY DEPRECATED: /api/public/menu* ──────────────────────────────
+// Flujo oficial activo: /api/public-menu/*
 router.get('/api/public/menu', async (_req, res) => {
-  try {
-    const result = await pool.query(`
-      SELECT
-        m.id_menu,
-        m.nombre,
-        m.descripcion,
-        m.precio,
-        m.id_sucursal,
-        a.url_publica AS imagen_url,
-        cm.nombre AS categoria
-      FROM menu m
-      LEFT JOIN archivos a ON a.id_archivo = m.id_archivo
-      LEFT JOIN categorias_productos cm ON cm.id_categoria_producto = m.id_categoria_producto
-      WHERE m.disponible = true OR m.disponible IS NULL
-      ORDER BY cm.nombre, m.nombre
-    `);
-    return res.json({ menu: result.rows });
-  } catch (error) {
-    console.error('[public/menu] Error:', error);
-    return res.status(500).json({ error: true, message: 'Error al cargar el menú' });
-  }
+  return res.status(410).json({
+    error: true,
+    code: 'PUBLIC_MENU_LEGACY_DEPRECATED',
+    message: 'Este endpoint fue descontinuado. Usa /api/public-menu/catalogo con id_sucursal y tipo_pedido.'
+  });
 });
 
-// ── GET /api/public/menu/:id ──────────────────────────────────────────
-router.get('/api/public/menu/:id', async (req, res) => {
-  const id = Number.parseInt(req.params.id, 10);
-  if (!Number.isInteger(id) || id <= 0) {
-    return res.status(400).json({ error: true, message: 'ID inválido' });
-  }
-
-  try {
-    const result = await pool.query(`
-      SELECT
-        m.id_menu,
-        m.nombre,
-        m.descripcion,
-        m.precio,
-        m.id_sucursal,
-        a.url_publica AS imagen_url,
-        cm.nombre AS categoria
-      FROM menu m
-      LEFT JOIN archivos a ON a.id_archivo = m.id_archivo
-      LEFT JOIN categorias_productos cm ON cm.id_categoria_producto = m.id_categoria_producto
-      WHERE m.id_menu = $1
-    `, [id]);
-
-    if (result.rows.length === 0) {
-      return res.status(404).json({ error: true, message: 'Ítem no encontrado' });
-    }
-
-    return res.json({ item: result.rows[0] });
-  } catch (error) {
-    console.error('[public/menu/:id] Error:', error);
-    return res.status(500).json({ error: true, message: 'Error al cargar el ítem' });
-  }
+router.get('/api/public/menu/:id', async (_req, res) => {
+  return res.status(410).json({
+    error: true,
+    code: 'PUBLIC_MENU_LEGACY_DEPRECATED',
+    message: 'Este endpoint fue descontinuado. Usa /api/public-menu/items/:id_detalle_menu con id_sucursal.'
+  });
 });
 
 export default router;

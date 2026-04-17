@@ -1,5 +1,6 @@
 import express from 'express';
 import pool from '../config/db-connection.js';
+import { checkPermission } from '../middleware/checkPermission.js';
 import {
   actualizarCampoReceta,
   esEnteroPositivo,
@@ -17,6 +18,14 @@ import {
 } from './admin_recetas_helpers.js';
 
 const router = express.Router();
+const MENU_VIEW_PERMISSIONS = ['MENU_VER'];
+const MENU_MUTATION_PERMISSIONS = ['MENU_VER'];
+
+// Seguridad: el actor se resuelve siempre desde el token autenticado.
+const resolveActorUserId = (req) => {
+  const parsed = Number(req?.user?.id_usuario);
+  return esEnteroPositivo(parsed) ? parsed : null;
+};
 
 const toSafeFileBaseName = (value) => {
   const sanitized = String(value || '')
@@ -108,7 +117,7 @@ const registrarArchivoDesdeUrlPublica = async ({ nombreReceta, urlPublica, idUsu
 };
 
 // GET: listar recetas.
-router.get('/', async (req, res) => {
+router.get('/', checkPermission(MENU_VIEW_PERMISSIONS), async (req, res) => {
   try {
     const result = await pool.query(
       `
@@ -144,7 +153,7 @@ router.get('/', async (req, res) => {
 });
 
 // GET: obtener receta por id.
-router.get('/:id_receta', async (req, res) => {
+router.get('/:id_receta', checkPermission(MENU_VIEW_PERMISSIONS), async (req, res) => {
   try {
     const idReceta = Number(req.params.id_receta);
     if (!esEnteroPositivo(idReceta)) {
@@ -164,14 +173,22 @@ router.get('/:id_receta', async (req, res) => {
 });
 
 // POST: crear receta.
-router.post('/', async (req, res) => {
+router.post('/', checkPermission(MENU_MUTATION_PERMISSIONS), async (req, res) => {
   try {
-    const payloadValidation = validarEstructuraPayloadReceta(req.body);
+    const actorUserId = resolveActorUserId(req);
+    if (!actorUserId) {
+      return res.status(401).json({ error: true, message: 'Sesion invalida. Vuelve a iniciar sesion.' });
+    }
+
+    // Transicion segura: id_usuario del cliente se ignora y se fuerza desde req.user.
+    const payloadConActor = { ...(req.body || {}), id_usuario: actorUserId };
+
+    const payloadValidation = validarEstructuraPayloadReceta(payloadConActor);
     if (!payloadValidation.ok) {
       return res.status(400).json({ error: true, message: payloadValidation.message });
     }
 
-    const normalizacion = normalizarPayloadReceta(req.body);
+    const normalizacion = normalizarPayloadReceta(payloadConActor);
     if (!normalizacion.ok) {
       return res.status(400).json({ error: true, message: normalizacion.message });
     }
@@ -183,7 +200,7 @@ router.post('/', async (req, res) => {
       const idArchivoGenerado = await registrarArchivoDesdeUrlPublica({
         nombreReceta: datosNormalizados.nombre_receta,
         urlPublica: urlImagenPublica,
-        idUsuario: datosNormalizados.id_usuario
+        idUsuario: actorUserId
       });
 
       if (!esEnteroPositivo(idArchivoGenerado)) {
@@ -252,10 +269,15 @@ router.post('/', async (req, res) => {
 });
 
 // PUT: actualizar receta completa por id.
-router.put('/:id_receta', async (req, res) => {
+router.put('/:id_receta', checkPermission(MENU_MUTATION_PERMISSIONS), async (req, res) => {
   const client = await pool.connect();
 
   try {
+    const actorUserId = resolveActorUserId(req);
+    if (!actorUserId) {
+      return res.status(401).json({ error: true, message: 'Sesion invalida. Vuelve a iniciar sesion.' });
+    }
+
     const idReceta = Number(req.params.id_receta);
     if (!esEnteroPositivo(idReceta)) {
       return res.status(400).json({ error: true, message: 'id_receta invalido.' });
@@ -266,12 +288,15 @@ router.put('/:id_receta', async (req, res) => {
       return res.status(404).json({ error: true, message: 'Receta no encontrada.' });
     }
 
-    const payloadValidation = validarEstructuraPayloadReceta(req.body);
+    // Transicion segura: id_usuario del cliente se ignora y se fuerza desde req.user.
+    const payloadConActor = { ...(req.body || {}), id_usuario: actorUserId };
+
+    const payloadValidation = validarEstructuraPayloadReceta(payloadConActor);
     if (!payloadValidation.ok) {
       return res.status(400).json({ error: true, message: payloadValidation.message });
     }
 
-    const normalizacion = normalizarPayloadReceta(req.body);
+    const normalizacion = normalizarPayloadReceta(payloadConActor);
     if (!normalizacion.ok) {
       return res.status(400).json({ error: true, message: normalizacion.message });
     }
@@ -283,7 +308,7 @@ router.put('/:id_receta', async (req, res) => {
       const idArchivoGenerado = await registrarArchivoDesdeUrlPublica({
         nombreReceta: datosNormalizados.nombre_receta,
         urlPublica: urlImagenPublica,
-        idUsuario: datosNormalizados.id_usuario
+        idUsuario: actorUserId
       });
 
       if (!esEnteroPositivo(idArchivoGenerado)) {
@@ -341,11 +366,16 @@ router.put('/:id_receta', async (req, res) => {
   }
 });
 
-// PATCH: actualizar solo estado e id_usuario por id.
-router.patch('/:id_receta/estado', async (req, res) => {
+// PATCH: actualizar solo estado por id; id_usuario se toma de req.user.
+router.patch('/:id_receta/estado', checkPermission(MENU_MUTATION_PERMISSIONS), async (req, res) => {
   const client = await pool.connect();
 
   try {
+    const actorUserId = resolveActorUserId(req);
+    if (!actorUserId) {
+      return res.status(401).json({ error: true, message: 'Sesion invalida. Vuelve a iniciar sesion.' });
+    }
+
     const idReceta = Number(req.params.id_receta);
     if (!esEnteroPositivo(idReceta)) {
       return res.status(400).json({ error: true, message: 'id_receta invalido.' });
@@ -356,17 +386,20 @@ router.patch('/:id_receta/estado', async (req, res) => {
       return res.status(404).json({ error: true, message: 'Receta no encontrada.' });
     }
 
-    const payloadValidation = validarEstructuraPayloadReceta(req.body, { soloEstadoUsuario: true });
+    // Compatibilidad: si el cliente envia id_usuario se ignora silenciosamente.
+    const payloadConActor = { ...(req.body || {}), id_usuario: actorUserId };
+
+    const payloadValidation = validarEstructuraPayloadReceta(payloadConActor, { soloEstadoUsuario: true });
     if (!payloadValidation.ok) {
       return res.status(400).json({ error: true, message: payloadValidation.message });
     }
 
-    const estadoValidation = validarCampoReceta('estado', req.body.estado);
+    const estadoValidation = validarCampoReceta('estado', payloadConActor.estado);
     if (!estadoValidation.valido) {
       return res.status(400).json({ error: true, message: estadoValidation.message });
     }
 
-    const usuarioValidation = validarCampoReceta('id_usuario', req.body.id_usuario);
+    const usuarioValidation = validarCampoReceta('id_usuario', actorUserId);
     if (!usuarioValidation.valido) {
       return res.status(400).json({ error: true, message: usuarioValidation.message });
     }

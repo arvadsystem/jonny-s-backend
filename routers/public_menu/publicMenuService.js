@@ -1,6 +1,7 @@
 ﻿import pool from '../../config/db-connection.js';
 import {
   PUBLIC_ITEM_TYPES,
+  acquirePublicOrderIdempotencyLockQuery,
   fetchActiveMenuByBranchQuery,
   fetchAllowedSauceRowsByRecipeIdsQuery,
   fetchCatalogItemByIdQuery,
@@ -8,6 +9,8 @@ import {
   fetchComboRecipeComponentsQuery,
   fetchComboAvailabilityQuery,
   fetchEstadoPedidoRowsQuery,
+  fetchPublicActiveSaucesQuery,
+  fetchPedidoByIdempotencyKeyQuery,
   fetchPublicBranchesQuery,
   fetchRecipeAvailabilityQuery,
   fetchSauceRuleRowsByRecipeIdsQuery,
@@ -63,6 +66,8 @@ const PUBLIC_EXTRA_OPTIONS = Object.freeze([
 const ORDER_TYPES_REQUIRING_TRANSFER_PROOF = new Set(['pickup', 'delivery']);
 const MAX_PUBLIC_ORDER_DESCRIPTION_LENGTH = 240;
 const MAX_PUBLIC_ITEM_NOTE_LENGTH = 100;
+const MAX_PUBLIC_ORDER_IDEMPOTENCY_LENGTH = 120;
+const WINGS_SAUCE_KEYWORDS = Object.freeze(['alita', 'alitas', 'tender', 'tenders']);
 
 // Crea errores HTTP controlados para que el controlador responda con status consistente.
 const buildHttpError = (status, message) => {
@@ -81,6 +86,11 @@ const normalizeCompactText = (value, maxLength = 120) => {
   return clean.slice(0, limit);
 };
 
+const normalizeIdempotencyKey = (value) =>
+  normalizeCompactText(value, MAX_PUBLIC_ORDER_IDEMPOTENCY_LENGTH)
+    .toLowerCase()
+    .replace(/[^a-z0-9:_-]/g, '');
+
 const normalizeTextKey = (value) =>
   String(value || '')
     .normalize('NFD')
@@ -95,6 +105,46 @@ const normalizeSearchText = (value) =>
     .replace(/[\u0300-\u036f]/g, '')
     .trim()
     .toLowerCase();
+
+const inferSauceUnitsBaseFromText = (...sources) => {
+  const text = normalizeSearchText(sources.filter(Boolean).join(' '));
+  if (!text) return 1;
+
+  // Regla de negocio: solo aplicamos inferencia por texto para familias de alitas/tenders.
+  const containsKeyword = WINGS_SAUCE_KEYWORDS.some((keyword) => text.includes(keyword));
+  if (!containsKeyword) return 1;
+
+  // Prioriza patrones comunes del negocio: "24 uds", "24 piezas", "24 pzas".
+  const match =
+    text.match(/\b(\d{1,3})\s*(?:alitas?|tenders?)\b/i) ||
+    text.match(/\b(\d{1,3})\s*(?:uds?|unidades?|pzas?|piezas?)\b/i) ||
+    text.match(/\((\d{1,3})\s*(?:uds?|unidades?|pzas?|piezas?)\)/i);
+
+  const units = Number(match?.[1] || 0);
+  if (!Number.isFinite(units) || units <= 0) return 1;
+  return Math.max(1, Math.floor(units));
+};
+
+const calculateFallbackWingSauceRequirement = ({
+  nombre = '',
+  descripcion = '',
+  quantity = 1
+}) => {
+  const baseUnits = inferSauceUnitsBaseFromText(nombre, descripcion);
+  if (baseUnits <= 1) return 0;
+  const totalUnits = Math.max(1, Number(quantity || 1)) * baseUnits;
+  return Math.max(0, Math.ceil(totalUnits / 6));
+};
+
+const resolveRequiredSaucesByCatalog = ({ catalog = {}, quantity = 1 }) => {
+  const fromComponents = calculateRequiredSaucesForQuantity(catalog?.salsas_componentes, quantity);
+  if (fromComponents > 0) return fromComponents;
+  return calculateFallbackWingSauceRequirement({
+    nombre: catalog?.nombre,
+    descripcion: catalog?.descripcion,
+    quantity
+  });
+};
 
 const hasAnyKeyword = (rawText, keywords = []) => {
   const source = normalizeSearchText(rawText);
@@ -157,10 +207,14 @@ const findMatchingSalsaRule = (rules, unidades) => {
   }) || null;
 };
 
+const hasSauceRequirementRules = (rules = []) =>
+  (Array.isArray(rules) ? rules : []).some((rule) => Number(rule?.salsas_requeridas || 0) > 0);
+
 const calculateRequiredSaucesForQuantity = (components, quantity = 1) => (
   (Array.isArray(components) ? components : []).reduce((total, component) => {
     const multiplier = Math.max(1, Number(component?.multiplicador || 1));
-    const units = Math.max(1, Number(quantity || 1)) * multiplier;
+    const baseUnits = Math.max(1, Number(component?.unidades_base || 1));
+    const units = Math.max(1, Number(quantity || 1)) * multiplier * baseUnits;
     const rule = findMatchingSalsaRule(component?.reglas, units);
     return total + Number(rule?.salsas_requeridas || 0);
   }, 0)
@@ -225,6 +279,9 @@ const buildCatalogSauceConfigByDetail = async (catalogRows = []) => {
       fetchSauceRuleRowsByRecipeIdsQuery(allRecipeIds)
     ])
     : [[], []];
+  const fallbackSauceCatalog = allRecipeIds.length > 0
+    ? await fetchPublicActiveSaucesQuery()
+    : [];
 
   const allowedSaucesByRecipe = new Map();
   for (const row of allowedSauceRows) {
@@ -269,7 +326,16 @@ const buildCatalogSauceConfigByDetail = async (catalogRows = []) => {
       id_receta: recipeId,
       nombre_receta: row.nombre_receta,
       multiplicador: Math.max(1, Number(row?.multiplicador || 1)),
-      salsas_permitidas: sortSauceOptions(allowedSaucesByRecipe.get(recipeId) || []),
+      // Base de unidades por componente (ej. alitas 6/12/24) para reglas de salsas.
+      unidades_base: inferSauceUnitsBaseFromText(row?.nombre_receta),
+      salsas_permitidas: (() => {
+        const rules = rulesByRecipe.get(recipeId) || [];
+        const recipeAllowedSauces = allowedSaucesByRecipe.get(recipeId) || [];
+        if (recipeAllowedSauces.length === 0 && hasSauceRequirementRules(rules)) {
+          return sortSauceOptions(fallbackSauceCatalog);
+        }
+        return sortSauceOptions(recipeAllowedSauces);
+      })(),
       reglas: rulesByRecipe.get(recipeId) || []
     });
   }
@@ -287,7 +353,16 @@ const buildCatalogSauceConfigByDetail = async (catalogRows = []) => {
         id_receta: recipeId,
         nombre_receta: row.nombre_item || row.descripcion_item || 'Receta',
         multiplicador: 1,
-        salsas_permitidas: sortSauceOptions(allowedSaucesByRecipe.get(recipeId) || []),
+        // Base de unidades para items directos (alitas/tenders) segun nombre/descripcion.
+        unidades_base: inferSauceUnitsBaseFromText(row?.nombre_item, row?.descripcion_item),
+        salsas_permitidas: (() => {
+          const rules = rulesByRecipe.get(recipeId) || [];
+          const recipeAllowedSauces = allowedSaucesByRecipe.get(recipeId) || [];
+          if (recipeAllowedSauces.length === 0 && hasSauceRequirementRules(rules)) {
+            return sortSauceOptions(fallbackSauceCatalog);
+          }
+          return sortSauceOptions(recipeAllowedSauces);
+        })(),
         reglas: rulesByRecipe.get(recipeId) || []
       }];
     } else if (Number(row?.id_combo || 0) > 0) {
@@ -395,6 +470,15 @@ const mapCatalogItem = ({
     salsas_requiere_seleccion: false,
     salsas_requeridas_base: 0
   };
+  const fallbackRequiredSauces = calculateFallbackWingSauceRequirement({
+    nombre: row?.nombre_item,
+    descripcion: row?.descripcion_item,
+    quantity: 1
+  });
+  const requiredSaucesBase = Math.max(
+    Number(itemSauceConfig.salsas_requeridas_base || 0),
+    Number(fallbackRequiredSauces || 0)
+  );
   const extrasOpciones = getCatalogItemExtraOptions({
     nombre: row?.nombre_item,
     descripcion: row?.descripcion_item,
@@ -425,8 +509,8 @@ const mapCatalogItem = ({
     extras_opciones: extrasOpciones,
     salsas_componentes: itemSauceConfig.salsas_componentes,
     salsas_permitidas: itemSauceConfig.salsas_permitidas,
-    salsas_requiere_seleccion: itemSauceConfig.salsas_requiere_seleccion,
-    salsas_requeridas_base: Number(itemSauceConfig.salsas_requeridas_base || 0),
+    salsas_requiere_seleccion: itemSauceConfig.salsas_requiere_seleccion || requiredSaucesBase > 0,
+    salsas_requeridas_base: Number(requiredSaucesBase || 0),
     visible: toBoolean(row.visible),
     orden: Number(row.orden || 0)
   };
@@ -647,10 +731,19 @@ const normalizePublicOrderBusinessContext = ({ tipoPedido, business = {} }) => {
   };
 };
 
-const buildPublicOrderDescription = ({ origen, tipoPedido, businessContext }) => {
+const buildPublicOrderDescription = ({
+  origen,
+  tipoPedido,
+  businessContext,
+  idempotencyKey
+}) => {
   const safeOrigin = normalizeCompactText(origen || 'public-menu', 60) || 'public-menu';
   const base = `[${safeOrigin}] pedido web`;
   const chunks = [];
+  if (idempotencyKey) {
+    // Marcador persistido para poder recuperar el mismo pedido ante reintentos/reconexiones.
+    chunks.push(`idem:${idempotencyKey}`);
+  }
 
   if (businessContext?.contacto?.telefono) {
     chunks.push(`tel:${businessContext.contacto.telefono}`);
@@ -676,6 +769,55 @@ const buildPublicOrderDescription = ({ origen, tipoPedido, businessContext }) =>
 
   return `${base} | ${chunks.join(' | ')}`.slice(0, MAX_PUBLIC_ORDER_DESCRIPTION_LENGTH);
 };
+
+const buildPublicOrderResult = ({
+  idPedido,
+  idSucursal,
+  idCliente,
+  idMenu,
+  tipoPedido,
+  tipoEntrega,
+  businessContext,
+  validacionPagoVenceAt,
+  total,
+  normalizedLines = [],
+  fechaHoraPedido = null,
+  idempotencyKey = '',
+  replayed = false
+}) => ({
+  id_pedido: Number(idPedido),
+  numero_ticket: buildTicketNumber(idPedido),
+  id_sucursal: Number(idSucursal),
+  id_cliente: Number(idCliente),
+  id_menu: Number(idMenu || 0) || null,
+  tipo_pedido: tipoPedido,
+  tipo_entrega: tipoEntrega,
+  business: businessContext,
+  estado: 'PENDIENTE',
+  estado_pago: INITIAL_ORDER_PAYMENT_STATE,
+  validacion_pago_vence_at: validacionPagoVenceAt
+    ? new Date(validacionPagoVenceAt).toISOString()
+    : null,
+  total: roundMoney(total || 0),
+  total_items: normalizedLines.reduce((sum, line) => sum + Number(line.cantidad || 0), 0),
+  fecha_hora_pedido: fechaHoraPedido || null,
+  idempotency: {
+    key: idempotencyKey || null,
+    replayed: Boolean(replayed)
+  },
+  items: normalizedLines.map((line) => ({
+    id_detalle_menu: line.id_detalle_menu,
+    tipo_item: line.tipo_item,
+    nombre: line.nombre,
+    cantidad: line.cantidad,
+    precio_unitario: line.precio_unitario,
+    subtotal: line.subtotal,
+    configuracion_menu: line.configuracion_menu,
+    extras: line.extras,
+    salsas_por_unidad: line.salsas_por_unidad,
+    salsas_requeridas: line.salsas_requeridas
+  }))
+});
 
 const validateAndResolveLineConfiguration = ({ catalog, line }) => {
   const extraOptions = Array.isArray(catalog?.extras_opciones) ? catalog.extras_opciones : [];
@@ -726,11 +868,18 @@ const validateAndResolveLineConfiguration = ({ catalog, line }) => {
     (sum, entry) => sum + Number(entry.cantidad || 0),
     0
   );
-  const requiredSauces = calculateRequiredSaucesForQuantity(
-    catalog?.salsas_componentes,
-    Number(line?.cantidad || 1)
-  );
-  const requiresSelection = catalog?.salsas_requiere_seleccion === true;
+  const requiredSauces = resolveRequiredSaucesByCatalog({
+    catalog,
+    quantity: Number(line?.cantidad || 1)
+  });
+  const requiresSelection = catalog?.salsas_requiere_seleccion === true || requiredSauces > 0;
+
+  if (requiresSelection && requiredSauces > 0 && allowedSauces.length === 0) {
+    throw buildHttpError(
+      409,
+      `El item ${catalog.nombre} requiere salsas, pero no tiene salsas disponibles.`
+    );
+  }
 
   if (requiresSelection && requiredSauces > 0 && selectedSauceCount !== requiredSauces) {
     throw buildHttpError(
@@ -864,6 +1013,7 @@ export const createPublicOrderService = async ({
   idSucursal,
   tipoPedido,
   origen = 'public-menu',
+  idempotencyKey = '',
   business = {},
   items = [],
   auth = {}
@@ -872,6 +1022,10 @@ export const createPublicOrderService = async ({
   const idCliente = toPositiveInt(auth?.idCliente);
   if (!idUsuario || !idCliente) {
     throw buildHttpError(401, 'Sesion de cliente invalida para registrar el pedido.');
+  }
+  const safeIdempotencyKey = normalizeIdempotencyKey(idempotencyKey);
+  if (!safeIdempotencyKey || safeIdempotencyKey.length < 12) {
+    throw buildHttpError(400, 'idempotency_key invalido para registrar el pedido.');
   }
 
   const businessContext = normalizePublicOrderBusinessContext({
@@ -889,6 +1043,51 @@ export const createPublicOrderService = async ({
 
   if (String(tipoPedido || '') === 'delivery' && !businessContext.entrega.direccion) {
     throw buildHttpError(400, 'Debes enviar direccion de entrega para pedidos delivery.');
+  }
+
+  // Primera verificacion de idempotencia: si ya existe el pedido, devolvemos el original
+  // sin recalcular catalogo para soportar reintentos despues de cambios operativos.
+  {
+    const replayClient = await pool.connect();
+    try {
+      await replayClient.query('BEGIN');
+      await acquirePublicOrderIdempotencyLockQuery(replayClient, {
+        idCliente,
+        idempotencyKey: safeIdempotencyKey
+      });
+
+      const existing = await fetchPedidoByIdempotencyKeyQuery(replayClient, {
+        idCliente,
+        idSucursal,
+        idempotencyKey: safeIdempotencyKey
+      });
+
+      await replayClient.query('COMMIT');
+
+      if (existing?.id_pedido) {
+        const idPedido = Number(existing.id_pedido);
+        return buildPublicOrderResult({
+          idPedido,
+          idSucursal,
+          idCliente,
+          idMenu: null,
+          tipoPedido,
+          tipoEntrega: DELIVERY_TYPE_BY_ORDER_TYPE[tipoPedido] || 'LOCAL',
+          businessContext,
+          validacionPagoVenceAt: null,
+          total: Number(existing?.total || 0),
+          normalizedLines: [],
+          fechaHoraPedido: existing?.fecha_hora_pedido || null,
+          idempotencyKey: safeIdempotencyKey,
+          replayed: true
+        });
+      }
+    } catch (error) {
+      await replayClient.query('ROLLBACK');
+      throw error;
+    } finally {
+      replayClient.release();
+    }
   }
 
   const activeMenu = await fetchActiveMenuByBranchQuery(idSucursal);
@@ -997,12 +1196,42 @@ export const createPublicOrderService = async ({
   const descripcionPedido = buildPublicOrderDescription({
     origen,
     tipoPedido,
-    businessContext
+    businessContext,
+    idempotencyKey: safeIdempotencyKey
   });
 
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
+    await acquirePublicOrderIdempotencyLockQuery(client, {
+      idCliente,
+      idempotencyKey: safeIdempotencyKey
+    });
+
+    // Segunda verificacion en la misma transaccion de escritura para cerrar carrera entre nodos/procesos.
+    const existingInWriteTx = await fetchPedidoByIdempotencyKeyQuery(client, {
+      idCliente,
+      idSucursal,
+      idempotencyKey: safeIdempotencyKey
+    });
+    if (existingInWriteTx?.id_pedido) {
+      await client.query('COMMIT');
+      return buildPublicOrderResult({
+        idPedido: Number(existingInWriteTx.id_pedido),
+        idSucursal,
+        idCliente,
+        idMenu: Number(activeMenu.id_menu || 0) || null,
+        tipoPedido,
+        tipoEntrega,
+        businessContext,
+        validacionPagoVenceAt: existingInWriteTx?.validacion_pago_vence_at || null,
+        total: Number(existingInWriteTx?.total || total),
+        normalizedLines: [],
+        fechaHoraPedido: existingInWriteTx?.fecha_hora_pedido || null,
+        idempotencyKey: safeIdempotencyKey,
+        replayed: true
+      });
+    }
 
     const pedido = await insertPublicPedidoQuery(client, {
       descripcion_pedido: descripcionPedido,
@@ -1039,34 +1268,21 @@ export const createPublicOrderService = async ({
 
     await client.query('COMMIT');
 
-    return {
-      id_pedido: idPedido,
-      numero_ticket: buildTicketNumber(idPedido),
-      id_sucursal: Number(idSucursal),
-      id_cliente: Number(idCliente),
-      id_menu: Number(activeMenu.id_menu),
-      tipo_pedido: tipoPedido,
-      tipo_entrega: tipoEntrega,
-      business: businessContext,
-      estado: 'PENDIENTE',
-      estado_pago: INITIAL_ORDER_PAYMENT_STATE,
-      validacion_pago_vence_at: validacionPagoVenceAt.toISOString(),
+    return buildPublicOrderResult({
+      idPedido,
+      idSucursal,
+      idCliente,
+      idMenu: Number(activeMenu.id_menu || 0) || null,
+      tipoPedido,
+      tipoEntrega,
+      businessContext,
+      validacionPagoVenceAt,
       total,
-      total_items: normalizedLines.reduce((sum, line) => sum + Number(line.cantidad || 0), 0),
-      fecha_hora_pedido: pedido?.fecha_hora_pedido || null,
-      items: normalizedLines.map((line) => ({
-        id_detalle_menu: line.id_detalle_menu,
-        tipo_item: line.tipo_item,
-        nombre: line.nombre,
-        cantidad: line.cantidad,
-        precio_unitario: line.precio_unitario,
-        subtotal: line.subtotal,
-        configuracion_menu: line.configuracion_menu,
-        extras: line.extras,
-        salsas_por_unidad: line.salsas_por_unidad,
-        salsas_requeridas: line.salsas_requeridas
-      }))
-    };
+      normalizedLines,
+      fechaHoraPedido: pedido?.fecha_hora_pedido || null,
+      idempotencyKey: safeIdempotencyKey,
+      replayed: false
+    });
   } catch (error) {
     await client.query('ROLLBACK');
     throw error;
