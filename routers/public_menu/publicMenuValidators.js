@@ -9,6 +9,7 @@ const TRANSFER_METHOD_ALIASES = new Set(['transferencia', 'transferencia_bancari
 const MAX_ORDER_TEXT = Object.freeze({
   ORIGEN: 60,
   IDEMPOTENCY_KEY: 120,
+  DINE_IN_TABLE: 40,
   CONTACT_NAME: 120,
   CONTACT_PHONE: 30,
   DELIVERY_ADDRESS: 240,
@@ -60,6 +61,7 @@ const normalizeOrderBusinessContext = ({ body, tipoPedido }) => {
   const contactoRaw = body?.contacto && typeof body.contacto === 'object' ? body.contacto : {};
   const entregaRaw = body?.entrega && typeof body.entrega === 'object' ? body.entrega : {};
   const pagoRaw = body?.pago && typeof body.pago === 'object' ? body.pago : {};
+  const servicioRaw = body?.servicio && typeof body.servicio === 'object' ? body.servicio : {};
 
   const contacto = {
     nombre: normalizeCompactText(
@@ -94,6 +96,13 @@ const normalizeOrderBusinessContext = ({ body, tipoPedido }) => {
     )
   };
 
+  const servicio = {
+    mesa: normalizeCompactText(
+      servicioRaw.mesa ?? body?.mesa,
+      MAX_ORDER_TEXT.DINE_IN_TABLE
+    )
+  };
+
   // Regla de negocio: pickup/delivery requieren comprobante de transferencia.
   const requiresTransferProof = ORDER_TYPES_REQUIRING_TRANSFER_PROOF.has(tipoPedido);
   if (requiresTransferProof && !pago.comprobante_transferencia) {
@@ -116,6 +125,20 @@ const normalizeOrderBusinessContext = ({ body, tipoPedido }) => {
     };
   }
 
+  // Regla de negocio: delivery exige referencia para ubicacion precisa.
+  if (tipoPedido === 'delivery' && !entrega.referencia) {
+    return {
+      error: 'Debes enviar referencia de entrega para pedidos delivery.'
+    };
+  }
+
+  // Regla de negocio: dine-in exige numero/referencia de mesa.
+  if (tipoPedido === 'dine-in' && !servicio.mesa) {
+    return {
+      error: 'Debes indicar la mesa para pedidos comer en restaurante.'
+    };
+  }
+
   if (requiresTransferProof && pago.metodo && !TRANSFER_METHOD_ALIASES.has(pago.metodo)) {
     return {
       error: 'metodo_pago invalido para pickup/delivery. Usa transferencia.'
@@ -130,7 +153,8 @@ const normalizeOrderBusinessContext = ({ body, tipoPedido }) => {
     data: {
       contacto,
       entrega,
-      pago
+      pago,
+      servicio
     }
   };
 };
@@ -297,7 +321,8 @@ export const validateCreateOrderBody = (req, res, next) => {
     business: businessContextResult?.data || {
       contacto: { nombre: '', telefono: '' },
       entrega: { direccion: '', referencia: '' },
-      pago: { metodo: '', comprobante_transferencia: '' }
+      pago: { metodo: '', comprobante_transferencia: '' },
+      servicio: { mesa: '' }
     },
     items
   };

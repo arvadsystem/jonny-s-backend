@@ -5,7 +5,11 @@ import {
   getPublicCatalogItemDetailService,
   getPublicCatalogService
 } from './publicMenuService.js';
-import { sendPublicMenuClientError, sendPublicMenuError } from './publicMenuResponse.js';
+import {
+  getPublicMenuRequestId,
+  sendPublicMenuClientError,
+  sendPublicMenuError
+} from './publicMenuResponse.js';
 
 // Respuesta de error uniforme y saneada para controladores del modulo.
 const handleControllerError = (req, res, error, fallbackMessage) =>
@@ -18,7 +22,11 @@ const handleControllerError = (req, res, error, fallbackMessage) =>
 export const getPublicBranchesController = async (req, res) => {
   try {
     const data = await getPublicBranchesService();
-    return res.status(200).json({ ok: true, data });
+    return res.status(200).json({
+      ok: true,
+      request_id: getPublicMenuRequestId(req, res),
+      data
+    });
   } catch (error) {
     return handleControllerError(req, res, error, 'No se pudieron listar sucursales publicas.');
   }
@@ -37,7 +45,11 @@ export const getActiveMenuByBranchController = async (req, res) => {
       });
     }
 
-    return res.status(200).json({ ok: true, data });
+    return res.status(200).json({
+      ok: true,
+      request_id: getPublicMenuRequestId(req, res),
+      data
+    });
   } catch (error) {
     return handleControllerError(req, res, error, 'No se pudo resolver el menu vigente de la sucursal.');
   }
@@ -52,7 +64,11 @@ export const getPublicCatalogController = async (req, res) => {
       tipoPedido
     });
 
-    return res.status(200).json({ ok: true, data });
+    return res.status(200).json({
+      ok: true,
+      request_id: getPublicMenuRequestId(req, res),
+      data
+    });
   } catch (error) {
     return handleControllerError(req, res, error, 'No se pudo construir el catalogo publico.');
   }
@@ -67,7 +83,11 @@ export const getPublicCatalogItemDetailController = async (req, res) => {
       idDetalleMenu
     });
 
-    return res.status(200).json({ ok: true, data });
+    return res.status(200).json({
+      ok: true,
+      request_id: getPublicMenuRequestId(req, res),
+      data
+    });
   } catch (error) {
     return handleControllerError(req, res, error, 'No se pudo obtener el detalle del item publico.');
   }
@@ -98,6 +118,7 @@ export const createPublicOrderController = async (req, res) => {
     const replayed = Boolean(data?.idempotency?.replayed);
     return res.status(replayed ? 200 : 201).json({
       ok: true,
+      request_id: getPublicMenuRequestId(req, res),
       message: replayed
         ? 'Pedido ya registrado previamente; se devuelve el resultado original.'
         : 'Pedido registrado correctamente.',

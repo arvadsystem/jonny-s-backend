@@ -1,4 +1,5 @@
-﻿import pool from '../../config/db-connection.js';
+import pool from '../../config/db-connection.js';
+import { createHash } from 'crypto';
 import {
   PUBLIC_ITEM_TYPES,
   acquirePublicOrderIdempotencyLockQuery,
@@ -255,7 +256,7 @@ const getCatalogItemExtraOptions = ({ nombre, descripcion, categoriaNombre, tipo
     .map(normalizeExtraOption);
 };
 
-const buildCatalogSauceConfigByDetail = async (catalogRows = []) => {
+const buildCatalogSauceConfigByDetail = async (catalogRows = [], db = pool) => {
   const directRecipeIds = toUniquePositiveIntArray(
     catalogRows.map((row) => row?.id_receta)
   );
@@ -264,7 +265,7 @@ const buildCatalogSauceConfigByDetail = async (catalogRows = []) => {
   );
 
   const comboComponentRows = comboIds.length > 0
-    ? await fetchComboRecipeComponentsQuery(comboIds)
+    ? await fetchComboRecipeComponentsQuery(comboIds, db)
     : [];
 
   const allRecipeIds = toUniquePositiveIntArray([
@@ -274,12 +275,12 @@ const buildCatalogSauceConfigByDetail = async (catalogRows = []) => {
 
   const [allowedSauceRows, sauceRuleRows] = allRecipeIds.length > 0
     ? await Promise.all([
-      fetchAllowedSauceRowsByRecipeIdsQuery(allRecipeIds),
-      fetchSauceRuleRowsByRecipeIdsQuery(allRecipeIds)
+      fetchAllowedSauceRowsByRecipeIdsQuery(allRecipeIds, db),
+      fetchSauceRuleRowsByRecipeIdsQuery(allRecipeIds, db)
     ])
     : [[], []];
   const fallbackSauceCatalog = allRecipeIds.length > 0
-    ? await fetchPublicActiveSaucesQuery()
+    ? await fetchPublicActiveSaucesQuery(db)
     : [];
 
   const allowedSaucesByRecipe = new Map();
@@ -545,8 +546,8 @@ const mapMenuSummary = (row) => ({
   fecha_inicio: row.fecha_inicio
 });
 
-const resolvePendingStateId = async () => {
-  const rows = await fetchEstadoPedidoRowsQuery();
+const resolvePendingStateId = async (db = pool) => {
+  const rows = await fetchEstadoPedidoRowsQuery(db);
   // Regla robusta: resolver por descripcion canonica para no depender del ID numerico.
   // En algunos entornos el id=1 NO es "PENDIENTE" (por ejemplo EN_PREPARACION).
   const matchByAlias = rows.find((row) =>
@@ -718,6 +719,9 @@ const normalizePublicOrderBusinessContext = ({ tipoPedido, business = {} }) => {
   const pagoRaw = business?.pago && typeof business.pago === 'object'
     ? business.pago
     : {};
+  const servicioRaw = business?.servicio && typeof business.servicio === 'object'
+    ? business.servicio
+    : {};
 
   return {
     contacto: {
@@ -732,7 +736,180 @@ const normalizePublicOrderBusinessContext = ({ tipoPedido, business = {} }) => {
       metodo: normalizeCompactText(pagoRaw.metodo, 40),
       comprobante_transferencia: normalizeCompactText(pagoRaw.comprobante_transferencia, 180)
     },
+    servicio: {
+      mesa: normalizeCompactText(servicioRaw.mesa, 40)
+    },
     requiresTransferProof: ORDER_TYPES_REQUIRING_TRANSFER_PROOF.has(String(tipoPedido || ''))
+  };
+};
+
+const buildIdempotencyPayloadSignature = ({
+  idSucursal,
+  tipoPedido,
+  businessContext,
+  requestedItems
+}) => {
+  const items = (Array.isArray(requestedItems) ? requestedItems : [])
+    .map((line) => ({
+      id_detalle_menu: Number(line?.id_detalle_menu || 0),
+      cantidad: Number(line?.cantidad || 0),
+      extras: normalizeRequestedExtras(line?.extras)
+        .map((entry) => String(entry.id_extra || ''))
+        .sort(),
+      salsas_por_unidad: normalizeRequestedSauces(line?.salsas_por_unidad),
+      nota: normalizeCompactText(line?.nota, MAX_PUBLIC_ITEM_NOTE_LENGTH)
+    }))
+    .sort((left, right) => left.id_detalle_menu - right.id_detalle_menu);
+
+  const canonical = JSON.stringify({
+    id_sucursal: Number(idSucursal || 0),
+    tipo_pedido: String(tipoPedido || ''),
+    business: {
+      contacto: {
+        nombre: normalizeCompactText(businessContext?.contacto?.nombre, 120),
+        telefono: normalizeCompactText(businessContext?.contacto?.telefono, 30)
+      },
+      entrega: {
+        direccion: normalizeCompactText(businessContext?.entrega?.direccion, 240),
+        referencia: normalizeCompactText(businessContext?.entrega?.referencia, 160)
+      },
+      pago: {
+        metodo: normalizeCompactText(businessContext?.pago?.metodo, 40),
+        comprobante_transferencia: normalizeCompactText(businessContext?.pago?.comprobante_transferencia, 180)
+      },
+      servicio: {
+        mesa: normalizeCompactText(businessContext?.servicio?.mesa, 40)
+      }
+    },
+    items
+  });
+
+  return createHash('sha256').update(canonical).digest('hex').slice(0, 24);
+};
+
+const readMarkerValueFromDescription = ({ description = '', marker = '' }) => {
+  const safeDescription = String(description || '');
+  const safeMarker = String(marker || '').trim().toLowerCase();
+  if (!safeMarker) return '';
+
+  const normalized = safeDescription.toLowerCase();
+  const index = normalized.indexOf(`${safeMarker}:`);
+  if (index < 0) return '';
+
+  const rest = safeDescription.slice(index + safeMarker.length + 1);
+  const value = String(rest.split('|')[0] || '').trim();
+  return normalizeCompactText(value, 64).toLowerCase();
+};
+
+const assertIdempotencyPayloadCompatibility = ({ existingOrder, requestSignature }) => {
+  if (!existingOrder?.id_pedido) return;
+  const storedSignature = readMarkerValueFromDescription({
+    description: existingOrder?.descripcion_pedido,
+    marker: 'sig'
+  });
+
+  // Compatibilidad retroactiva: pedidos antiguos pueden no tener firma persistida.
+  if (!storedSignature) return;
+
+  if (storedSignature !== String(requestSignature || '').toLowerCase()) {
+    throw buildHttpError(
+      409,
+      'La idempotency_key ya fue usada con un payload distinto. Genera una nueva llave para reintentar.'
+    );
+  }
+};
+
+const materializePublicOrderSnapshot = async ({ idSucursal, requestedItems = [], db = pool }) => {
+  const activeMenu = await fetchActiveMenuByBranchQuery(idSucursal, db);
+  if (!activeMenu) {
+    throw buildHttpError(409, 'La sucursal no tiene menu vigente activo para registrar pedidos.');
+  }
+
+  const rows = await fetchCatalogRowsByMenuQuery(Number(activeMenu.id_menu), db);
+  const sauceConfigByDetail = await buildCatalogSauceConfigByDetail(rows, db);
+
+  const recipeIds = rows
+    .filter((row) => row.tipo_item === PUBLIC_ITEM_TYPES.RECETA && row.id_receta)
+    .map((row) => Number(row.id_receta));
+
+  const comboIds = rows
+    .filter((row) => row.tipo_item === PUBLIC_ITEM_TYPES.COMBO && row.id_combo)
+    .map((row) => Number(row.id_combo));
+
+  const [recipeAvailabilityRows, comboAvailabilityRows] = await Promise.all([
+    fetchRecipeAvailabilityQuery([...new Set(recipeIds)], db),
+    fetchComboAvailabilityQuery([...new Set(comboIds)], db)
+  ]);
+
+  const recipeAvailabilityMap = toAvailabilityMap(recipeAvailabilityRows, 'id_receta');
+  const comboAvailabilityMap = toAvailabilityMap(comboAvailabilityRows, 'id_combo');
+
+  const catalogItems = rows.map((row) =>
+    mapCatalogItem({
+      row,
+      recipeAvailabilityMap,
+      comboAvailabilityMap,
+      sauceConfigByDetail
+    })
+  );
+
+  const catalogByDetail = new Map(catalogItems.map((item) => [Number(item.id_detalle_menu), item]));
+
+  const normalizedLines = requestedItems.map((line) => {
+    const catalog = catalogByDetail.get(Number(line.id_detalle_menu));
+    if (!catalog) {
+      throw buildHttpError(400, `El item ${line.id_detalle_menu} no pertenece al menu vigente de la sucursal.`);
+    }
+
+    if (!catalog?.disponibilidad?.available) {
+      throw buildHttpError(409, `El item ${catalog.nombre} no esta disponible actualmente.`);
+    }
+
+    const configuration = validateAndResolveLineConfiguration({ catalog, line });
+    const precioBase = toNumberOrNull(catalog?.precio?.final);
+    if (precioBase === null || precioBase <= 0) {
+      throw buildHttpError(400, `El item ${catalog.nombre} no tiene precio valido para registrar pedido.`);
+    }
+
+    const cantidad = toPositiveInt(line.cantidad);
+    const precioUnitario = roundMoney(Number(precioBase || 0) + Number(configuration.extra_unit_amount || 0));
+    const subtotal = roundMoney(precioUnitario * cantidad);
+    const observacion = buildLineObservation({
+      extras: configuration.extras,
+      salsasPorUnidad: configuration.salsas_por_unidad,
+      nota: line?.nota
+    });
+    const configuracionMenu = buildLineStructuredConfig({
+      line,
+      catalog,
+      configuration,
+      precioUnitario,
+      subtotal
+    });
+
+    return {
+      id_detalle_menu: Number(catalog.id_detalle_menu),
+      tipo_item: String(catalog.tipo_item || 'PRODUCTO'),
+      id_producto: catalog.id_producto ? Number(catalog.id_producto) : null,
+      id_combo: catalog.id_combo ? Number(catalog.id_combo) : null,
+      id_receta: catalog.id_receta ? Number(catalog.id_receta) : null,
+      nombre: catalog.nombre,
+      cantidad,
+      precio_unitario: roundMoney(precioUnitario),
+      subtotal,
+      observacion,
+      configuracion_menu: configuracionMenu,
+      extras: configuration.extras,
+      salsas_por_unidad: configuration.salsas_por_unidad,
+      salsas_requeridas: configuration.salsas_requeridas,
+      nota: normalizeCompactText(line?.nota, MAX_PUBLIC_ITEM_NOTE_LENGTH)
+    };
+  });
+
+  return {
+    activeMenu,
+    normalizedLines,
+    total: roundMoney(normalizedLines.reduce((sum, line) => sum + line.subtotal, 0))
   };
 };
 
@@ -1050,8 +1227,27 @@ export const createPublicOrderService = async ({
     throw buildHttpError(400, 'Debes enviar direccion de entrega para pedidos delivery.');
   }
 
-  // Primera verificacion de idempotencia: si ya existe el pedido, devolvemos el original
-  // sin recalcular catalogo para soportar reintentos despues de cambios operativos.
+  if (String(tipoPedido || '') === 'delivery' && !businessContext.entrega.referencia) {
+    throw buildHttpError(400, 'Debes enviar referencia de entrega para pedidos delivery.');
+  }
+
+  if (String(tipoPedido || '') === 'dine-in' && !businessContext.servicio?.mesa) {
+    throw buildHttpError(400, 'Debes indicar la mesa para pedidos comer en restaurante.');
+  }
+
+  const requestedItems = normalizeRequestedOrderItems(items);
+  if (requestedItems.length === 0) {
+    throw buildHttpError(400, 'No hay items validos para registrar el pedido.');
+  }
+  const requestSignature = buildIdempotencyPayloadSignature({
+    idSucursal,
+    tipoPedido,
+    businessContext,
+    requestedItems
+  });
+
+  // Primera verificacion de idempotencia: responde rapido a reintentos legitimos
+  // y bloquea reuse de llave con payload alterado.
   {
     const replayClient = await pool.connect();
     try {
@@ -1066,20 +1262,23 @@ export const createPublicOrderService = async ({
         idSucursal,
         idempotencyKey: safeIdempotencyKey
       });
+      assertIdempotencyPayloadCompatibility({
+        existingOrder: existing,
+        requestSignature
+      });
 
       await replayClient.query('COMMIT');
 
       if (existing?.id_pedido) {
-        const idPedido = Number(existing.id_pedido);
         return buildPublicOrderResult({
-          idPedido,
+          idPedido: Number(existing.id_pedido),
           idSucursal,
           idCliente,
           idMenu: null,
           tipoPedido,
           tipoEntrega: DELIVERY_TYPE_BY_ORDER_TYPE[tipoPedido] || 'LOCAL',
           businessContext,
-          validacionPagoVenceAt: null,
+          validacionPagoVenceAt: existing?.validacion_pago_vence_at || null,
           total: Number(existing?.total || 0),
           normalizedLines: [],
           fechaHoraPedido: existing?.fecha_hora_pedido || null,
@@ -1095,116 +1294,8 @@ export const createPublicOrderService = async ({
     }
   }
 
-  const activeMenu = await fetchActiveMenuByBranchQuery(idSucursal);
-  if (!activeMenu) {
-    throw buildHttpError(409, 'La sucursal no tiene menu vigente activo para registrar pedidos.');
-  }
-
-  const requestedItems = normalizeRequestedOrderItems(items);
-  if (requestedItems.length === 0) {
-    throw buildHttpError(400, 'No hay items validos para registrar el pedido.');
-  }
-
-  const rows = await fetchCatalogRowsByMenuQuery(Number(activeMenu.id_menu));
-  const sauceConfigByDetail = await buildCatalogSauceConfigByDetail(rows);
-
-  const recipeIds = rows
-    .filter((row) => row.tipo_item === PUBLIC_ITEM_TYPES.RECETA && row.id_receta)
-    .map((row) => Number(row.id_receta));
-
-  const comboIds = rows
-    .filter((row) => row.tipo_item === PUBLIC_ITEM_TYPES.COMBO && row.id_combo)
-    .map((row) => Number(row.id_combo));
-
-  const [recipeAvailabilityRows, comboAvailabilityRows] = await Promise.all([
-    fetchRecipeAvailabilityQuery([...new Set(recipeIds)]),
-    fetchComboAvailabilityQuery([...new Set(comboIds)])
-  ]);
-
-  const recipeAvailabilityMap = toAvailabilityMap(recipeAvailabilityRows, 'id_receta');
-  const comboAvailabilityMap = toAvailabilityMap(comboAvailabilityRows, 'id_combo');
-
-  const catalogItems = rows.map((row) =>
-    mapCatalogItem({
-      row,
-      recipeAvailabilityMap,
-      comboAvailabilityMap,
-      sauceConfigByDetail
-    })
-  );
-
-  const catalogByDetail = new Map(catalogItems.map((item) => [Number(item.id_detalle_menu), item]));
-
-  const normalizedLines = requestedItems.map((line) => {
-    const catalog = catalogByDetail.get(Number(line.id_detalle_menu));
-    if (!catalog) {
-      throw buildHttpError(400, `El item ${line.id_detalle_menu} no pertenece al menu vigente de la sucursal.`);
-    }
-
-    if (!catalog?.disponibilidad?.available) {
-      throw buildHttpError(409, `El item ${catalog.nombre} no esta disponible actualmente.`);
-    }
-
-    const configuration = validateAndResolveLineConfiguration({ catalog, line });
-    const precioBase = toNumberOrNull(catalog?.precio?.final);
-    if (precioBase === null || precioBase <= 0) {
-      throw buildHttpError(400, `El item ${catalog.nombre} no tiene precio valido para registrar pedido.`);
-    }
-
-    const cantidad = toPositiveInt(line.cantidad);
-    const precioUnitario = roundMoney(Number(precioBase || 0) + Number(configuration.extra_unit_amount || 0));
-    const subtotal = roundMoney(precioUnitario * cantidad);
-    const observacion = buildLineObservation({
-      extras: configuration.extras,
-      salsasPorUnidad: configuration.salsas_por_unidad,
-      nota: line?.nota
-    });
-    const configuracionMenu = buildLineStructuredConfig({
-      line,
-      catalog,
-      configuration,
-      precioUnitario,
-      subtotal
-    });
-
-    return {
-      id_detalle_menu: Number(catalog.id_detalle_menu),
-      tipo_item: String(catalog.tipo_item || 'PRODUCTO'),
-      id_producto: catalog.id_producto ? Number(catalog.id_producto) : null,
-      id_combo: catalog.id_combo ? Number(catalog.id_combo) : null,
-      id_receta: catalog.id_receta ? Number(catalog.id_receta) : null,
-      nombre: catalog.nombre,
-      cantidad,
-      precio_unitario: roundMoney(precioUnitario),
-      subtotal,
-      observacion,
-      configuracion_menu: configuracionMenu,
-      extras: configuration.extras,
-      salsas_por_unidad: configuration.salsas_por_unidad,
-      salsas_requeridas: configuration.salsas_requeridas,
-      nota: normalizeCompactText(line?.nota, MAX_PUBLIC_ITEM_NOTE_LENGTH)
-    };
-  });
-
-  const total = roundMoney(normalizedLines.reduce((sum, line) => sum + line.subtotal, 0));
-  const validacionPagoVenceAt = new Date(Date.now() + ORDER_PAYMENT_VALIDATION_WINDOW_MINUTES * 60 * 1000);
-  const idEstadoPedido = await resolvePendingStateId();
-  if (!idEstadoPedido) {
-    throw buildHttpError(
-      409,
-      'Configuracion incompleta: no existe estado inicial PENDIENTE/POR PAGAR para pedidos.'
-    );
-  }
-
   const descripcionEnvio = SERVICE_TYPE_BY_ORDER_TYPE[tipoPedido] || 'LOCAL';
   const tipoEntrega = DELIVERY_TYPE_BY_ORDER_TYPE[tipoPedido] || 'LOCAL';
-  const descripcionPedido = buildPublicOrderDescription({
-    origen,
-    tipoPedido,
-    businessContext,
-    idempotencyKey: safeIdempotencyKey
-  });
-
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -1219,24 +1310,56 @@ export const createPublicOrderService = async ({
       idSucursal,
       idempotencyKey: safeIdempotencyKey
     });
+    assertIdempotencyPayloadCompatibility({
+      existingOrder: existingInWriteTx,
+      requestSignature
+    });
     if (existingInWriteTx?.id_pedido) {
       await client.query('COMMIT');
       return buildPublicOrderResult({
         idPedido: Number(existingInWriteTx.id_pedido),
         idSucursal,
         idCliente,
-        idMenu: Number(activeMenu.id_menu || 0) || null,
+        idMenu: null,
         tipoPedido,
         tipoEntrega,
         businessContext,
         validacionPagoVenceAt: existingInWriteTx?.validacion_pago_vence_at || null,
-        total: Number(existingInWriteTx?.total || total),
+        total: Number(existingInWriteTx?.total || 0),
         normalizedLines: [],
         fechaHoraPedido: existingInWriteTx?.fecha_hora_pedido || null,
         idempotencyKey: safeIdempotencyKey,
         replayed: true
       });
     }
+
+    // Validacion final transaccional: el pedido se calcula con el estado actual de BD
+    // en la misma transaccion que inserta cabecera y detalle.
+    const {
+      activeMenu,
+      normalizedLines,
+      total
+    } = await materializePublicOrderSnapshot({
+      idSucursal,
+      requestedItems,
+      db: client
+    });
+
+    const idEstadoPedido = await resolvePendingStateId(client);
+    if (!idEstadoPedido) {
+      throw buildHttpError(
+        409,
+        'Configuracion incompleta: no existe estado inicial PENDIENTE/POR PAGAR para pedidos.'
+      );
+    }
+
+    const validacionPagoVenceAt = new Date(Date.now() + ORDER_PAYMENT_VALIDATION_WINDOW_MINUTES * 60 * 1000);
+    const descripcionPedido = buildPublicOrderDescription({
+      origen,
+      tipoPedido,
+      businessContext,
+      idempotencyKey: safeIdempotencyKey
+    });
 
     const pedido = await insertPublicPedidoQuery(client, {
       descripcion_pedido: descripcionPedido,
