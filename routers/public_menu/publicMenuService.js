@@ -63,7 +63,9 @@ const PUBLIC_EXTRA_OPTIONS = Object.freeze([
     keywords: HAMBURGUESA_KEYWORDS
   }
 ]);
-const ORDER_TYPES_REQUIRING_TRANSFER_PROOF = new Set(['pickup', 'delivery']);
+const ORDER_TYPES_REQUIRING_TRANSFER_PROOF = new Set(['delivery']);
+const TRANSFER_METHOD_ALIASES = new Set(['transferencia', 'transferencia_bancaria', 'transfer']);
+const CASH_METHOD_ALIASES = new Set(['caja', 'efectivo', 'cash']);
 const MAX_PUBLIC_ORDER_DESCRIPTION_LENGTH = 240;
 const MAX_PUBLIC_ITEM_NOTE_LENGTH = 100;
 const MAX_PUBLIC_ORDER_IDEMPOTENCY_LENGTH = 120;
@@ -1216,11 +1218,32 @@ export const createPublicOrderService = async ({
   });
 
   if (businessContext.requiresTransferProof && !businessContext.pago.comprobante_transferencia) {
-    throw buildHttpError(400, 'Debes adjuntar referencia o comprobante de transferencia.');
+    throw buildHttpError(400, 'Debes adjuntar referencia o comprobante de transferencia para delivery.');
   }
 
-  if (businessContext.requiresTransferProof && !businessContext.contacto.telefono) {
+  if ((String(tipoPedido || '') === 'pickup' || String(tipoPedido || '') === 'delivery') && !businessContext.contacto.telefono) {
     throw buildHttpError(400, 'Debes enviar telefono de contacto para pickup/delivery.');
+  }
+
+  if (String(tipoPedido || '') === 'pickup' && !businessContext.pago?.metodo) {
+    throw buildHttpError(400, 'Debes seleccionar metodo de pago para pickup: caja o transferencia.');
+  }
+
+  if (
+    String(tipoPedido || '') === 'pickup' &&
+    businessContext.pago?.metodo &&
+    !TRANSFER_METHOD_ALIASES.has(String(businessContext.pago.metodo || '').toLowerCase()) &&
+    !CASH_METHOD_ALIASES.has(String(businessContext.pago.metodo || '').toLowerCase())
+  ) {
+    throw buildHttpError(400, 'metodo_pago invalido para pickup. Usa caja o transferencia.');
+  }
+
+  if (
+    String(tipoPedido || '') === 'delivery' &&
+    businessContext.pago?.metodo &&
+    !TRANSFER_METHOD_ALIASES.has(String(businessContext.pago.metodo || '').toLowerCase())
+  ) {
+    throw buildHttpError(400, 'metodo_pago invalido para delivery. Usa transferencia.');
   }
 
   if (String(tipoPedido || '') === 'delivery' && !businessContext.entrega.direccion) {

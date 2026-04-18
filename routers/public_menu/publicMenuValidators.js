@@ -4,8 +4,9 @@ import { sendPublicMenuClientError } from './publicMenuResponse.js';
 // Mantiene parsing de parametros en un solo lugar para evitar duplicaciones en controladores.
 
 const PUBLIC_ORDER_TYPES = new Set(['dine-in', 'pickup', 'delivery']);
-const ORDER_TYPES_REQUIRING_TRANSFER_PROOF = new Set(['pickup', 'delivery']);
+const ORDER_TYPES_REQUIRING_TRANSFER_PROOF = new Set(['delivery']);
 const TRANSFER_METHOD_ALIASES = new Set(['transferencia', 'transferencia_bancaria', 'transfer']);
+const CASH_METHOD_ALIASES = new Set(['caja', 'efectivo', 'cash']);
 const MAX_ORDER_TEXT = Object.freeze({
   ORIGEN: 60,
   IDEMPOTENCY_KEY: 120,
@@ -103,16 +104,16 @@ const normalizeOrderBusinessContext = ({ body, tipoPedido }) => {
     )
   };
 
-  // Regla de negocio: pickup/delivery requieren comprobante de transferencia.
+  // Regla de negocio: delivery requiere comprobante de transferencia.
   const requiresTransferProof = ORDER_TYPES_REQUIRING_TRANSFER_PROOF.has(tipoPedido);
   if (requiresTransferProof && !pago.comprobante_transferencia) {
     return {
-      error: 'Debes adjuntar referencia o comprobante de transferencia para pickup y delivery.'
+      error: 'Debes adjuntar referencia o comprobante de transferencia para delivery.'
     };
   }
 
-  // Regla de negocio: pickup/delivery exigen al menos un telefono de contacto.
-  if (requiresTransferProof && !contacto.telefono) {
+  // Regla de negocio: pickup y delivery exigen telefono de contacto.
+  if ((tipoPedido === 'pickup' || tipoPedido === 'delivery') && !contacto.telefono) {
     return {
       error: 'Debes enviar telefono de contacto para pickup y delivery.'
     };
@@ -139,13 +140,30 @@ const normalizeOrderBusinessContext = ({ body, tipoPedido }) => {
     };
   }
 
-  if (requiresTransferProof && pago.metodo && !TRANSFER_METHOD_ALIASES.has(pago.metodo)) {
+  if (tipoPedido === 'pickup' && !pago.metodo) {
     return {
-      error: 'metodo_pago invalido para pickup/delivery. Usa transferencia.'
+      error: 'Debes seleccionar metodo_pago para pickup: caja o transferencia.'
     };
   }
 
-  if (requiresTransferProof && !pago.metodo) {
+  if (
+    tipoPedido === 'pickup' &&
+    pago.metodo &&
+    !TRANSFER_METHOD_ALIASES.has(pago.metodo) &&
+    !CASH_METHOD_ALIASES.has(pago.metodo)
+  ) {
+    return {
+      error: 'metodo_pago invalido para pickup. Usa caja o transferencia.'
+    };
+  }
+
+  if (tipoPedido === 'delivery' && pago.metodo && !TRANSFER_METHOD_ALIASES.has(pago.metodo)) {
+    return {
+      error: 'metodo_pago invalido para delivery. Usa transferencia.'
+    };
+  }
+
+  if (tipoPedido === 'delivery' && !pago.metodo) {
     pago.metodo = 'transferencia';
   }
 
