@@ -365,6 +365,16 @@ const buildSharedMenuImpact = ({ idMenu, idSucursal, branches = [] }) => {
   };
 };
 
+const getCatalogImageCapabilities = async () => {
+  const [hasProductoArchivoImagen] = await Promise.all([
+    hasColumn('productos', 'id_archivo_imagen_principal')
+  ]);
+
+  return {
+    hasProductoArchivoImagen
+  };
+};
+
 const resolveSharedMenuImpact = async ({ idMenu, idSucursal }) => {
   const safeMenuId = toPositiveInt(idMenu);
   if (!safeMenuId) {
@@ -388,7 +398,7 @@ const resolveSharedMenuImpact = async ({ idMenu, idSucursal }) => {
   });
 };
 
-const fetchBaseCatalogByMenu = async (idMenu, departmentIds) => {
+const fetchBaseCatalogByMenu = async (idMenu, departmentIds, imageCapabilities = {}) => {
   const recipeExcludedDepartmentIds = Array.isArray(departmentIds?.recipeExcludedDepartmentIds)
     ? departmentIds.recipeExcludedDepartmentIds
     : [];
@@ -396,6 +406,17 @@ const fetchBaseCatalogByMenu = async (idMenu, departmentIds) => {
     ? departmentIds.comboDepartmentId
     : null;
   const productCategoryAliases = [...MENU_PRODUCT_CATEGORY_ALIASES];
+  const hasProductoArchivoImagen = Boolean(imageCapabilities?.hasProductoArchivoImagen);
+  const productImageSelect = hasProductoArchivoImagen
+    ? 'a_producto.url_publica::text AS url_imagen_publica'
+    : 'NULL::text AS url_imagen_publica';
+  const productImageJoin = hasProductoArchivoImagen
+    ? `
+      LEFT JOIN archivos a_producto
+        ON a_producto.id_archivo = p.id_archivo_imagen_principal
+       AND (a_producto.estado = true OR a_producto.estado IS NULL)
+    `
+    : '';
 
   const result = await pool.query(
     `
@@ -404,8 +425,12 @@ const fetchBaseCatalogByMenu = async (idMenu, departmentIds) => {
         r.id_receta::int AS id_item_origen,
         r.nombre_receta::text AS nombre_item,
         COALESCE(r.estado, true) AS estado_item,
-        r.precio::numeric AS precio_base
+        r.precio::numeric AS precio_base,
+        a_receta.url_publica::text AS url_imagen_publica
       FROM recetas r
+      LEFT JOIN archivos a_receta
+        ON a_receta.id_archivo = r.id_archivo
+       AND (a_receta.estado = true OR a_receta.estado IS NULL)
       WHERE r.id_menu = $1
         AND r.id_tipo_departamento IS NOT NULL
         AND r.id_tipo_departamento <> ALL($2::int[])
@@ -417,8 +442,12 @@ const fetchBaseCatalogByMenu = async (idMenu, departmentIds) => {
         c.id_combo::int AS id_item_origen,
         COALESCE(NULLIF(c.nombre_combo, ''), NULLIF(c.descripcion, ''), CONCAT('Combo #', c.id_combo::text))::text AS nombre_item,
         COALESCE(c.estado, true) AS estado_item,
-        c.precio::numeric AS precio_base
+        c.precio::numeric AS precio_base,
+        a_combo.url_publica::text AS url_imagen_publica
       FROM combos c
+      LEFT JOIN archivos a_combo
+        ON a_combo.id_archivo = c.id_archivo
+       AND (a_combo.estado = true OR a_combo.estado IS NULL)
       WHERE c.id_menu = $1
         AND c.id_tipo_departamento = $3
 
@@ -429,10 +458,12 @@ const fetchBaseCatalogByMenu = async (idMenu, departmentIds) => {
         p.id_producto::int AS id_item_origen,
         p.nombre_producto::text AS nombre_item,
         COALESCE(p.estado, true) AS estado_item,
-        p.precio::numeric AS precio_base
+        p.precio::numeric AS precio_base,
+        ${productImageSelect}
       FROM productos p
       LEFT JOIN categorias_productos cp
         ON cp.id_categoria_producto = p.id_categoria_producto
+      ${productImageJoin}
       WHERE COALESCE(cp.estado, true) = true
         AND LOWER(REGEXP_REPLACE(TRIM(COALESCE(cp.nombre_categoria, '')), '\\s*/\\s*', '/', 'g')) = ANY($4::text[])
 
@@ -524,6 +555,8 @@ const mapCatalogForAdmin = ({ baseRows, detailRowsByKey }) => {
       nombre_item: row.nombre_item || `${tipoItem} #${idItemOrigen}`,
       categoria_nombre: row.categoria_nombre || tipoItem,
       estado_item: parseBoolean(row.estado_item),
+      // Conserva URL de imagen para panel tecnico y validaciones de publicacion.
+      url_imagen_publica: String(row?.url_imagen_publica || '').trim(),
       precio_base: row.precio_base !== null ? Number(row.precio_base) : null,
       id_detalle_menu: detail?.id_detalle_menu ? Number(detail.id_detalle_menu) : null,
       publicado: Boolean(detail),
@@ -559,6 +592,7 @@ const mapPreviewItemFromAdminCatalog = (item) => {
     tipo_item: item?.tipo_item || 'ITEM',
     id_item_base: Number(item?.id_item_origen || 0) || null,
     nombre: item?.nombre_item || 'Item sin nombre',
+    imagen_url: String(item?.url_imagen_publica || '').trim(),
     categoria: {
       id_tipo_departamento: null,
       nombre: item?.categoria_nombre || item?.tipo_item || 'Sin categoria'
@@ -1036,8 +1070,9 @@ router.get('/catalogo', checkPermission(MENU_VIEW_PERMISSIONS), async (req, res)
       return res.status(400).json({ ok: false, message: 'id_sucursal es obligatorio y debe ser entero positivo.' });
     }
 
-    const [capabilities, departmentIds, activeMenu, branch] = await Promise.all([
+    const [capabilities, imageCapabilities, departmentIds, activeMenu, branch] = await Promise.all([
       getDetalleMenuCapabilities(),
+      getCatalogImageCapabilities(),
       // Evita IDs hardcodeados y usa la configuracion real de tipo_departamento.
       resolveMenuDepartmentIds(),
       getActiveMenuByBranch(idSucursal),
@@ -1089,7 +1124,7 @@ router.get('/catalogo', checkPermission(MENU_VIEW_PERMISSIONS), async (req, res)
 
     const targetMenuId = Number(resolvedMenu.id_menu);
     const [baseRows, detailRows, sharedMenuImpact] = await Promise.all([
-      fetchBaseCatalogByMenu(targetMenuId, departmentIds),
+      fetchBaseCatalogByMenu(targetMenuId, departmentIds, imageCapabilities),
       fetchDetalleRowsByMenu({ idMenu: targetMenuId, capabilities }),
       resolveSharedMenuImpact({ idMenu: targetMenuId, idSucursal })
     ]);
@@ -1129,8 +1164,9 @@ router.get('/preview', checkPermission(MENU_VIEW_PERMISSIONS), async (req, res) 
       return res.status(400).json({ ok: false, message: 'id_sucursal es obligatorio y debe ser entero positivo.' });
     }
 
-    const [capabilities, departmentIds, activeMenu, branch] = await Promise.all([
+    const [capabilities, imageCapabilities, departmentIds, activeMenu, branch] = await Promise.all([
       getDetalleMenuCapabilities(),
+      getCatalogImageCapabilities(),
       resolveMenuDepartmentIds(),
       getActiveMenuByBranch(idSucursal),
       getBranchById(idSucursal)
@@ -1174,7 +1210,7 @@ router.get('/preview', checkPermission(MENU_VIEW_PERMISSIONS), async (req, res) 
 
     const targetMenuId = Number(resolvedMenu.id_menu);
     const [baseRows, detailRows, sharedMenuImpact] = await Promise.all([
-      fetchBaseCatalogByMenu(targetMenuId, departmentIds),
+      fetchBaseCatalogByMenu(targetMenuId, departmentIds, imageCapabilities),
       fetchDetalleRowsByMenu({ idMenu: targetMenuId, capabilities }),
       resolveSharedMenuImpact({ idMenu: targetMenuId, idSucursal })
     ]);
