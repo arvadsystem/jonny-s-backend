@@ -3,6 +3,7 @@ import pool from '../config/db-connection.js'; // Pool de conexión PostgreSQL
 import { checkPermission } from '../middleware/checkPermission.js';
 import menuPosCatalogoRouter from './menu_pos_catalogo.js'; // Subrouter de catÃ¡logo POS
 import { resolveMenuDepartmentIds } from './menu_departamentos.js';
+import { SUPABASE_ADMIN_BUCKET, SUPABASE_ASSETS_BUCKET } from '../utils/uploads.js';
 
 const router = express.Router(); // Inicializa router
 const MENU_VIEW_PERMISSIONS = ['MENU_VER'];
@@ -86,6 +87,46 @@ const normalizeDriveImageUrl = (rawUrl) => {
     : '';
 
   return `https://drive.google.com/thumbnail?id=${encodeURIComponent(fileId)}&sz=w1200${resourceKeySuffix}`;
+};
+
+// Normaliza URL publica de Supabase al formato interno "bucket/ruta".
+// Mantener este formato en BD facilita usar el mismo contrato de imagen que otros modulos.
+const toSupabaseBucketPathFromPublicUrl = (rawUrl) => {
+  const safeUrl = String(rawUrl || '').trim();
+  if (!safeUrl) return '';
+
+  if (safeUrl.startsWith(`${SUPABASE_ASSETS_BUCKET}/`) || safeUrl.startsWith(`${SUPABASE_ADMIN_BUCKET}/`)) {
+    return safeUrl;
+  }
+
+  try {
+    const parsed = new URL(safeUrl);
+    const decodedPath = decodeURIComponent(String(parsed.pathname || ''));
+    const publicObjectMarker = '/storage/v1/object/public/';
+    const markerIndex = decodedPath.indexOf(publicObjectMarker);
+    if (markerIndex < 0) return '';
+
+    const remainder = decodedPath.slice(markerIndex + publicObjectMarker.length).replace(/^\/+/, '');
+    const parts = remainder.split('/').filter(Boolean);
+    if (parts.length < 2) return '';
+
+    const bucket = String(parts[0] || '').trim();
+    const filePath = parts.slice(1).join('/');
+    if (!bucket || !filePath) return '';
+
+    return `${bucket}/${filePath}`;
+  } catch {
+    return '';
+  }
+};
+
+// Canoniza URL para imagen de menu:
+// 1) Si viene URL publica de Supabase, la convertimos a "bucket/ruta".
+// 2) Si no, mantenemos fallback de Google Drive para compatibilidad.
+const normalizeMenuImageUrlForStorage = (rawUrl) => {
+  const supabaseBucketPath = toSupabaseBucketPathFromPublicUrl(rawUrl);
+  if (supabaseBucketPath) return supabaseBucketPath;
+  return normalizeDriveImageUrl(rawUrl);
 };
 
 // NUEVO: helper para soportar boolean real o representaciones string/nÃºmero
@@ -245,6 +286,7 @@ router.post('/menu-pos/archivos/upload', checkPermission(MENU_MUTATION_PERMISSIO
     const {
       nombre_original,
       url_publica,
+      bucket = SUPABASE_ASSETS_BUCKET,
       tipo_archivo = null,
       tamano_bytes = null,
       id_usuario = null
@@ -254,6 +296,15 @@ router.post('/menu-pos/archivos/upload', checkPermission(MENU_MUTATION_PERMISSIO
       return res.status(400).json({
         ok: false,
         message: 'Faltan campos obligatorios: nombre_original, url_publica'
+      });
+    }
+
+    const normalizedBucket = String(bucket || SUPABASE_ASSETS_BUCKET).trim() || SUPABASE_ASSETS_BUCKET;
+    // Las imagenes del menu publico deben vivir en el bucket publico oficial.
+    if (normalizedBucket !== SUPABASE_ASSETS_BUCKET) {
+      return res.status(400).json({
+        ok: false,
+        message: `Bucket invalido para imagenes de menu. Usa '${SUPABASE_ASSETS_BUCKET}'.`
       });
     }
 
@@ -292,9 +343,26 @@ router.post('/menu-pos/archivos/upload', checkPermission(MENU_MUTATION_PERMISSIO
       ) VALUES ($1, $2, $3, $4, true, $5)
       RETURNING id_archivo, nombre_original, url_publica, tipo_archivo, tamano_bytes, fecha_creacion, estado, id_usuario;
     `;
+
+    const normalizedUrl = normalizeMenuImageUrlForStorage(url_publica);
+    if (!String(normalizedUrl || '').trim()) {
+      return res.status(400).json({
+        ok: false,
+        message: 'No se pudo normalizar la URL de imagen enviada.'
+      });
+    }
+
+    // Proteccion adicional: evita registrar documentos privados en flujo de menu.
+    if (String(normalizedUrl).startsWith(`${SUPABASE_ADMIN_BUCKET}/`)) {
+      return res.status(400).json({
+        ok: false,
+        message: `No se permite el bucket privado '${SUPABASE_ADMIN_BUCKET}' para imagenes de menu.`
+      });
+    }
+
     const result = await pool.query(insertQuery, [
       String(nombre_original),
-      normalizeDriveImageUrl(url_publica),
+      normalizedUrl,
       tipo_archivo ? String(tipo_archivo) : null,
       size,
       idUser
