@@ -22,7 +22,7 @@ import {
 } from '../middleware/rateLimiter.js';
 import { getClientIp, parseUserAgent } from '../utils/security/clientInfo.js';
 import { insertLoginLog } from '../utils/security/loginLogger.js';
-import { createSession, closeAllUserSessions } from '../utils/security/sessionService.js';
+import { createSession } from '../utils/security/sessionService.js';
 import { enviarVerificacion, enviarRecuperacion } from '../utils/emailService.js';
 
 const router = express.Router();
@@ -53,78 +53,6 @@ const emitirAppJwt = (usuario, id_sesion) => {
     sid: id_sesion
   };
   return jwt.sign(payload, JWT_SECRET, { expiresIn: '8h' });
-};
-
-const normalizeIdentifier = (value) => String(value || '').trim();
-const normalizeEmail = (value) => normalizeIdentifier(value).toLowerCase();
-const normalizeGenero = (value) => {
-  const raw = String(value || '').trim().toUpperCase();
-  if (!raw) return '';
-  // BD actual usa genero tipo CHAR(1) en personas: M/F/O.
-  if (['M', 'MASCULINO', 'HOMBRE', 'MALE'].includes(raw)) return 'M';
-  if (['F', 'FEMENINO', 'MUJER', 'FEMALE'].includes(raw)) return 'F';
-  if (['O', 'OTRO', 'NO_BINARIO', 'NB'].includes(raw)) return 'O';
-  return '';
-};
-
-const validatePasswordPolicy = (clave) => {
-  const password = String(clave || '');
-  if (password.length < 10) return 'La contraseña debe tener al menos 10 caracteres';
-  if (!/[A-Z]/.test(password)) return 'La contraseña debe incluir al menos una mayúscula';
-  if (!/[0-9]/.test(password)) return 'La contraseña debe incluir al menos un número';
-  return '';
-};
-
-const apiError = (res, status, { code, message, field = null, details = null }) =>
-  res.status(status).json({
-    error: true,
-    code: String(code || 'UNEXPECTED_ERROR'),
-    message: String(message || 'Ocurrio un error'),
-    field,
-    details
-  });
-
-const apiSuccess = (res, status, payload = {}) =>
-  res.status(status).json({
-    error: false,
-    ...payload
-  });
-
-const hashVerificationToken = (token) =>
-  crypto.createHash('sha256').update(String(token || '')).digest('hex');
-
-const generateVerificationToken = () => crypto.randomBytes(48).toString('base64url');
-
-let ensureVerificationTokenTablePromise = null;
-const ensureVerificationTokenTable = async () => {
-  if (!ensureVerificationTokenTablePromise) {
-    ensureVerificationTokenTablePromise = (async () => {
-      await pool.query(`
-        CREATE TABLE IF NOT EXISTS public.verificacion_cuentas_tokens (
-          id_token BIGSERIAL PRIMARY KEY,
-          id_usuario INTEGER NOT NULL REFERENCES public.usuarios(id_usuario) ON DELETE CASCADE,
-          token_hash TEXT NOT NULL UNIQUE,
-          token_expires_at TIMESTAMP NOT NULL,
-          used_at TIMESTAMP NULL,
-          request_ip TEXT NULL,
-          user_agent TEXT NULL,
-          created_at TIMESTAMP NOT NULL DEFAULT NOW()
-        )
-      `);
-      await pool.query(
-        `CREATE INDEX IF NOT EXISTS idx_verificacion_tokens_usuario
-         ON public.verificacion_cuentas_tokens (id_usuario)`
-      );
-      await pool.query(
-        `CREATE INDEX IF NOT EXISTS idx_verificacion_tokens_exp
-         ON public.verificacion_cuentas_tokens (token_expires_at)`
-      );
-    })().catch((error) => {
-      ensureVerificationTokenTablePromise = null;
-      throw error;
-    });
-  }
-  return ensureVerificationTokenTablePromise;
 };
 
 /**
@@ -170,38 +98,9 @@ const crearIdentidadSupabase = async (email, password) => {
     },
     body: JSON.stringify({ email, password, email_confirm: false })
   });
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) {
-    const rawMessage =
-      data?.msg
-      || data?.message
-      || data?.error_description
-      || data?.error
-      || `Supabase Auth error HTTP ${res.status}`;
-    const error = new Error(String(rawMessage));
-    error.status = res.status;
-    error.code = data?.code || null;
-    error.payload = data;
-    throw error;
-  }
+  const data = await res.json();
+  if (!res.ok) throw new Error(data?.message || 'Error al crear identidad en Supabase');
   return data.id; // UUID de Supabase
-};
-
-const eliminarIdentidadSupabase = async (authUserId) => {
-  if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY || !authUserId) return;
-
-  const response = await fetch(`${SUPABASE_URL}/auth/v1/admin/users/${authUserId}`, {
-    method: 'DELETE',
-    headers: {
-      apikey: SUPABASE_SERVICE_KEY,
-      Authorization: `Bearer ${SUPABASE_SERVICE_KEY}`
-    }
-  });
-
-  if (!response.ok && response.status !== 404) {
-    const payload = await response.json().catch(() => ({}));
-    throw new Error(payload?.message || payload?.msg || 'No se pudo compensar usuario de autenticacion.');
-  }
 };
 
 /**
@@ -224,23 +123,6 @@ const generarLinkSupabase = async (type, email, options = {}) => {
   return data; // contiene action_link, hashed_token, redirect_to, etc.
 };
 
-const confirmarIdentidadSupabase = async (authUserId) => {
-  if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY || !authUserId) return;
-  const response = await fetch(`${SUPABASE_URL}/auth/v1/admin/users/${authUserId}`, {
-    method: 'PUT',
-    headers: {
-      'Content-Type': 'application/json',
-      apikey: SUPABASE_SERVICE_KEY,
-      Authorization: `Bearer ${SUPABASE_SERVICE_KEY}`
-    },
-    body: JSON.stringify({ email_confirm: true })
-  });
-  if (!response.ok) {
-    const payload = await response.json().catch(() => ({}));
-    throw new Error(payload?.message || payload?.msg || 'No se pudo confirmar usuario en Supabase');
-  }
-};
-
 const insertarClienteSeguro = async (queryRunner, idPersona) => {
   try {
     const result = await queryRunner.query(
@@ -248,7 +130,7 @@ const insertarClienteSeguro = async (queryRunner, idPersona) => {
       [idPersona]
     );
     return result.rows[0]?.id_cliente ?? null;
-  } catch (error) {
+  } catch (_error) {
     const fallback = await queryRunner.query(
       `INSERT INTO clientes (id_persona, id_tipo_cliente, fecha_ingreso, puntos)
        VALUES ($1, 2, CURRENT_DATE, 0) RETURNING id_cliente`,
@@ -282,50 +164,39 @@ const autenticarConSupabase = async (email, password) => {
 
 // ── POST /api/public/register ─────────────────────────────────────────
 router.post('/api/public/register', registerLimiter, async (req, res) => {
-  const { clave } = req.body || {};
-  const email = normalizeEmail(req.body?.email);
-  const nombre = normalizeIdentifier(req.body?.nombre);
-  const apellido = normalizeIdentifier(req.body?.apellido);
-  const genero = normalizeGenero(req.body?.genero);
-  const ip_origen = getClientIp(req);
-  const user_agent = req.get('user-agent') || null;
+  const { email, clave, nombre, apellido } = req.body;
 
-  if (!email || !clave || !nombre || !apellido || !genero) {
-    return apiError(res, 400, {
-      code: 'VALIDATION_ERROR',
-      message: 'Nombre, apellido, genero, email y contrasena son obligatorios.',
-      field: !genero ? 'genero' : null
-    });
+  if (!email || !clave || !nombre || !apellido) {
+    return res.status(400).json({ error: true, message: 'Todos los campos son obligatorios (Nombre, Apellido, Email y Contraseña)' });
   }
 
-  const passwordPolicyError = validatePasswordPolicy(clave);
-  if (passwordPolicyError) {
-    return apiError(res, 400, {
-      code: 'PASSWORD_POLICY_FAILED',
-      message: passwordPolicyError,
-      field: 'clave'
-    });
+  // Validaciones de seguridad desde configuracion_sistema (Hardcoded basados en DB actual para este servicio, o se pueden prefetched)
+  // password_min_length: 10, upper: true, number: true
+  if (clave.length < 10) {
+    return res.status(400).json({ error: true, message: 'La contraseña debe tener al menos 10 caracteres' });
+  }
+  if (!/[A-Z]/.test(clave)) {
+    return res.status(400).json({ error: true, message: 'La contraseña debe incluir al menos una mayúscula' });
+  }
+  if (!/[0-9]/.test(clave)) {
+    return res.status(400).json({ error: true, message: 'La contraseña debe incluir al menos un número' });
   }
 
   const client = await pool.connect();
-  let authUserIdCreated = null;
   try {
-    await ensureVerificationTokenTable();
     await client.query('BEGIN');
 
+    // 1. Verificar que no exista ese email ya registrado
     const emailExiste = await client.query(
       `SELECT ia.id_identidad_auth FROM identidades_auth ia WHERE ia.email_login = $1`,
       [email]
     );
     if (emailExiste.rows.length > 0) {
       await client.query('ROLLBACK');
-      return apiError(res, 409, {
-        code: 'EMAIL_ALREADY_EXISTS',
-        message: 'El correo ya esta registrado.',
-        field: 'email'
-      });
+      return res.status(409).json({ error: true, message: 'El correo ya está registrado' });
     }
 
+    // 1.5 Generar nombre de usuario automático
     const firstLetter = nombre.trim().charAt(0).toLowerCase();
     const surname = apellido.trim().split(' ')[0].toLowerCase().replace(/[^a-z]/g, '');
     let nombreUsuario = '';
@@ -333,34 +204,39 @@ router.post('/api/public/register', registerLimiter, async (req, res) => {
     let attempts = 0;
 
     while (!isUnique && attempts < 10) {
-      const digits = Math.floor(100 + Math.random() * 900);
+      const digits = Math.floor(100 + Math.random() * 900); // 3 dígitos
       nombreUsuario = `${firstLetter}${surname}${digits}`;
-
+      
       const checkU = await client.query(`SELECT id_usuario FROM usuarios WHERE nombre_usuario = $1`, [nombreUsuario]);
       if (checkU.rows.length === 0) {
         isUnique = true;
       }
-      attempts += 1;
+      attempts++;
     }
 
     if (!isUnique) {
-      throw new Error('No se pudo generar un nombre de usuario unico. Intente de nuevo.');
+      throw new Error('No se pudo generar un nombre de usuario único. Intente de nuevo.');
     }
 
+    // 2. Crear identidad en Supabase (SIN confirmar email)
     const auth_user_id = await crearIdentidadSupabase(email, clave);
-    authUserIdCreated = auth_user_id;
 
+    // 3. Crear persona
     const personaRes = await client.query(
-      `INSERT INTO personas (nombre, apellido, genero) VALUES ($1, $2, $3) RETURNING id_persona`,
-      [nombre, apellido, genero]
+      `INSERT INTO personas (nombre, apellido) VALUES ($1, $2) RETURNING id_persona`,
+      [nombre, apellido]
     );
     const id_persona = personaRes.rows[0].id_persona;
 
-    const id_cliente = await insertarClienteSeguro(client, id_persona);
-    if (!Number.isInteger(Number(id_cliente)) || Number(id_cliente) <= 0) {
-      throw new Error('CLIENT_INSERT_FAILED');
-    }
+    // 4. Crear registro en clientes (id_tipo_cliente=2 = 'General')
+    const clienteRes = await client.query(
+      `INSERT INTO clientes (id_persona, id_tipo_cliente, fecha_ingreso, puntos)
+       VALUES ($1, 2, CURRENT_DATE, 0) RETURNING id_cliente`,
+      [id_persona]
+    );
+    const id_cliente = clienteRes.rows[0].id_cliente;
 
+    // 5. Crear usuario interno (estado: false hasta verificar email)
     const usuarioRes = await client.query(
       `INSERT INTO usuarios (nombre_usuario, clave, estado, tipo_usuario, id_cliente, must_change_password)
        VALUES ($1, 'SUPABASE_AUTH', false, 'CLIENTE', $2, false) RETURNING id_usuario, nombre_usuario, tipo_usuario, id_cliente`,
@@ -368,7 +244,8 @@ router.post('/api/public/register', registerLimiter, async (req, res) => {
     );
     const nuevoUsuario = usuarioRes.rows[0];
 
-    const rolRes = await client.query(`SELECT id_rol FROM roles WHERE UPPER(TRIM(nombre)) = 'CLIENTE' LIMIT 1`);
+    // 6. Asignar rol Cliente
+    const rolRes = await client.query(`SELECT id_rol FROM roles WHERE nombre = 'Cliente' LIMIT 1`);
     if (rolRes.rows.length > 0) {
       await client.query(
         `INSERT INTO roles_usuarios (id_rol, id_usuario) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
@@ -394,12 +271,14 @@ router.post('/api/public/register', registerLimiter, async (req, res) => {
       [nuevoUsuario.id_usuario, id_cliente]
     );
 
+    // 7. Registrar identidad_auth (email_verificado: false)
     await client.query(
       `INSERT INTO identidades_auth (id_usuario, auth_user_id, provider, email_login, email_verificado, activo)
        VALUES ($1, $2, 'email', $3, false, true)`,
       [nuevoUsuario.id_usuario, auth_user_id, email]
     );
 
+    // 8. Registrar correo del usuario en tabla correos (ahora con id_persona)
     if (id_persona) {
       await client.query(
         `INSERT INTO correos (id_persona, direccion_correo) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
@@ -407,70 +286,41 @@ router.post('/api/public/register', registerLimiter, async (req, res) => {
       ).catch(() => {});
     }
 
-    const verificationToken = generateVerificationToken();
-    const verificationTokenHash = hashVerificationToken(verificationToken);
-    await client.query(
-      `INSERT INTO verificacion_cuentas_tokens (
-        id_usuario,
-        token_hash,
-        token_expires_at,
-        request_ip,
-        user_agent
-      )
-      VALUES ($1, $2, NOW() + INTERVAL '24 hours', $3, $4)`,
-      [nuevoUsuario.id_usuario, verificationTokenHash, ip_origen, user_agent]
-    );
-
     await client.query('COMMIT');
 
-    const verificationLink = `${FRONTEND_ORIGIN}/auth/callback?verify_token=${encodeURIComponent(verificationToken)}`;
+    // 9. Generar link de verificación vía Supabase Admin y enviar por SMTP propio
+    // redirect_to apunta a /auth/callback donde el frontend procesará el token
     try {
-      await enviarVerificacion(email, nombre || '', verificationLink, nuevoUsuario.id_usuario);
+      const linkData = await generarLinkSupabase('signup', email, {
+        redirect_to: `${FRONTEND_ORIGIN}/auth/callback`
+      });
+      const actionLink = linkData.action_link || linkData.properties?.action_link;
+
+      if (actionLink) {
+        await enviarVerificacion(email, nombre || '', actionLink, nuevoUsuario.id_usuario);
+      } else {
+        console.warn('[public/register] No se obtuvo action_link de Supabase, email no enviado');
+      }
     } catch (emailErr) {
-      console.error('[public/register] Error enviando correo de verificacion:', emailErr.message);
+      // No fallar el registro si el correo no se pudo enviar
+      console.error('[public/register] Error enviando correo de verificación:', emailErr.message);
     }
 
-    return apiSuccess(res, 201, {
-      message: 'Te hemos enviado un correo de verificacion. Revisa tu bandeja de entrada para activar tu cuenta.',
+    return res.status(201).json({
+      message: 'Te hemos enviado un correo de verificación. Revisa tu bandeja de entrada para activar tu cuenta.',
       requiresVerification: true
     });
   } catch (error) {
     await client.query('ROLLBACK').catch(() => {});
-
-    if (authUserIdCreated) {
-      await eliminarIdentidadSupabase(authUserIdCreated).catch((cleanupError) => {
-        console.error('[public/register] No se pudo compensar usuario auth:', cleanupError.message);
-      });
-    }
-
     console.error('[public/register] Error:', error);
 
-    const normalizedErrorMsg = String(error?.message || '').toLowerCase();
-    const isDuplicateEmail =
-      normalizedErrorMsg.includes('user already registered')
-      || normalizedErrorMsg.includes('has already been registered')
-      || normalizedErrorMsg.includes('already exists')
-      || normalizedErrorMsg.includes('already registered')
-      || normalizedErrorMsg.includes('duplicate')
-      || normalizedErrorMsg.includes('email_exists');
-
-    if (isDuplicateEmail) {
-      return apiError(res, 409, {
-        code: 'EMAIL_ALREADY_EXISTS',
-        message: 'El correo electronico ya existe en autenticacion.',
-        field: 'email'
-      });
+    // Si el error viene de Supabase Auth (ej. usuario ya existe)
+    if (error.message?.includes('User already registered') || error.message?.includes('already exists')) {
+      return res.status(400).json({ error: true, message: 'El correo electrónico ya está registrado en el sistema de autenticación.' });
     }
 
-    if (error?.code === '22001') {
-      return apiError(res, 400, {
-        code: 'VALIDATION_ERROR',
-        message: 'Uno de los campos excede la longitud permitida por la base de datos.'
-      });
-    }
-
-    return apiError(res, 500, {
-      code: 'REGISTER_FAILED',
+    return res.status(500).json({
+      error: true,
       message: 'No se pudo completar el registro del cliente.'
     });
   } finally {
@@ -478,69 +328,49 @@ router.post('/api/public/register', registerLimiter, async (req, res) => {
   }
 });
 
+// ── POST /api/public/login ────────────────────────────────────────────
 router.post('/api/public/login', publicLoginIpLimiter, publicLoginAccountIpLimiter, async (req, res) => {
-  const identifier = normalizeIdentifier(req.body?.identifier ?? req.body?.email);
-  const { clave } = req.body || {};
+  const { identifier, clave } = req.body;
   if (!identifier || !clave) {
-    return apiError(res, 400, {
-      code: 'VALIDATION_ERROR',
-      message: 'Usuario/email y contrasena son requeridos.'
-    });
+    return res.status(400).json({ error: true, message: 'Usuario/email y contraseña son requeridos' });
   }
 
   const ip_origen = getClientIp(req);
   const user_agent = req.get('user-agent') || null;
   const { dispositivo, navegador, sistema_operativo } = parseUserAgent(user_agent);
-
   const attemptedIdentifier = identifier;
-  let resolvedEmail = '';
+  let resolvedIdentifier = identifier;
 
   try {
     let email = identifier;
 
+    // Si el identifier NO es un email, buscar el email asociado en la tabla correos o identidades_auth
     if (!identifier.includes('@')) {
       const uRes = await pool.query(
-        `SELECT ia.email_login
-         FROM usuarios u
-         JOIN identidades_auth ia ON u.id_usuario = ia.id_usuario
+        `SELECT ia.email_login 
+         FROM usuarios u 
+         JOIN identidades_auth ia ON u.id_usuario = ia.id_usuario 
          WHERE u.nombre_usuario = $1 LIMIT 1`,
         [identifier]
       );
       if (uRes.rows.length === 0) {
-        await insertLoginLog({
-          id_usuario: null,
-          id_sesion: null,
-          ip_origen,
-          nombre_usuario_intentado: attemptedIdentifier,
-          user_agent,
-          dispositivo,
-          navegador,
-          sistema_operativo,
-          ubicacion: null,
-          exito: false,
-          mensaje_error: 'Credenciales invalidas'
-        }).catch(() => {});
-        return apiError(res, 401, {
-          code: 'INVALID_CREDENTIALS',
-          message: 'Credenciales invalidas.'
-        });
+        return res.status(401).json({ error: true, message: 'Credenciales inválidas' });
       }
       email = uRes.rows[0].email_login;
     }
+    resolvedIdentifier = email;
 
-    resolvedEmail = email;
+    // 1. Autenticar contra Supabase
     const { auth_user_id } = await autenticarConSupabase(email, clave);
 
+    // 2. Buscar identity y usuario interno
     const identRes = await pool.query(
       `SELECT ia.id_usuario FROM identidades_auth ia WHERE ia.auth_user_id = $1 LIMIT 1`,
       [auth_user_id]
     );
 
     if (identRes.rows.length === 0) {
-      return apiError(res, 401, {
-        code: 'INVALID_CREDENTIALS',
-        message: 'Credenciales invalidas.'
-      });
+      return res.status(404).json({ error: true, message: 'No existe una cuenta interna asociada a ese correo' });
     }
 
     const id_usuario = identRes.rows[0].id_usuario;
@@ -551,24 +381,16 @@ router.post('/api/public/login', publicLoginIpLimiter, publicLoginAccountIpLimit
     const usuario = usuarioRes.rows[0];
 
     if (!usuario || !usuario.estado) {
-      return apiError(res, 403, {
-        code: 'ACCOUNT_DISABLED',
-        message: 'Cuenta desactivada.'
-      });
+      return res.status(403).json({ error: true, message: 'Cuenta desactivada' });
     }
 
-    if (String(usuario?.tipo_usuario || '').trim().toUpperCase() !== 'CLIENTE') {
-      return apiError(res, 403, {
-        code: 'ACCOUNT_SCOPE_INVALID',
-        message: 'Este acceso corresponde solo a cuentas de cliente.'
-      });
-    }
-
+    // 3. Actualizar última autenticación
     await pool.query(
       `UPDATE identidades_auth SET ultima_autenticacion = NOW() WHERE auth_user_id = $1`,
       [auth_user_id]
     );
 
+    // 4. Sesión y JWT
     const id_sesion = await createSession({
       id_usuario, ip_origen, user_agent, dispositivo, navegador, sistema_operativo, ubicacion: null
     });
@@ -585,7 +407,7 @@ router.post('/api/public/login', publicLoginIpLimiter, publicLoginAccountIpLimit
       user_agent, dispositivo, navegador, sistema_operativo, ubicacion: null, exito: true, mensaje_error: null
     });
 
-    return apiSuccess(res, 200, {
+    return res.json({
       message: 'Login exitoso',
       usuario: { ...usuario, roles: authz.roles, permisos: authz.permisos },
       roles: authz.roles,
@@ -593,40 +415,19 @@ router.post('/api/public/login', publicLoginIpLimiter, publicLoginAccountIpLimit
       csrfToken
     });
   } catch (error) {
-    const supabaseMessage = String(error?.message || '').toLowerCase();
-    const isNotVerified = supabaseMessage.includes('email not confirmed') || supabaseMessage.includes('not confirmed');
-
+    console.error('[public/login] Error:', error);
     await insertLoginLog({
-      id_usuario: null,
-      id_sesion: null,
-      ip_origen,
-      nombre_usuario_intentado: resolvedEmail || attemptedIdentifier,
-      user_agent,
-      dispositivo,
-      navegador,
-      sistema_operativo,
-      ubicacion: null,
-      exito: false,
-      mensaje_error: isNotVerified ? 'Email no verificado' : 'Credenciales invalidas'
+      id_usuario: null, id_sesion: null, ip_origen, nombre_usuario_intentado: resolvedIdentifier || attemptedIdentifier,
+      user_agent, dispositivo, navegador, sistema_operativo, ubicacion: null,
+      exito: false, mensaje_error: error.message
     }).catch(() => {});
-
-    if (isNotVerified) {
-      return apiError(res, 403, {
-        code: 'EMAIL_NOT_VERIFIED',
-        message: 'Debes verificar tu correo antes de iniciar sesion.'
-      });
-    }
-
-    return apiError(res, 401, {
-      code: 'INVALID_CREDENTIALS',
-      message: 'Credenciales invalidas.'
-    });
+    return res.status(401).json({ error: true, message: 'Credenciales inválidas' });
   }
 });
 
 // ── POST /api/public/forgot-password ─────────────────────────────────
 router.post('/api/public/forgot-password', forgotPasswordLimiter, async (req, res) => {
-  const email = normalizeEmail(req.body?.email);
+  const { email } = req.body;
   if (!email) {
     return res.status(400).json({ error: true, message: 'Email requerido' });
   }
@@ -670,62 +471,6 @@ router.post('/api/public/forgot-password', forgotPasswordLimiter, async (req, re
   }
 });
 
-// ── POST /api/public/reset-password ───────────────────────────────────────────
-router.post('/api/public/reset-password', forgotPasswordLimiter, async (req, res) => {
-  const accessToken = normalizeIdentifier(req.body?.access_token);
-  const nuevaClave = String(req.body?.nueva_clave || '');
-
-  if (!accessToken || !nuevaClave) {
-    return res.status(400).json({ error: true, message: 'Token y nueva contraseña son requeridos.' });
-  }
-
-  const passwordPolicyError = validatePasswordPolicy(nuevaClave);
-  if (passwordPolicyError) {
-    return res.status(400).json({ error: true, message: passwordPolicyError });
-  }
-
-  try {
-    const anonKey = process.env.SUPABASE_ANON_KEY || SUPABASE_SERVICE_KEY;
-    const updateRes = await fetch(`${SUPABASE_URL}/auth/v1/user`, {
-      method: 'PUT',
-      headers: {
-        'Content-Type': 'application/json',
-        apikey: anonKey,
-        Authorization: `Bearer ${accessToken}`
-      },
-      body: JSON.stringify({ password: nuevaClave })
-    });
-
-    const updateData = await updateRes.json().catch(() => ({}));
-    if (!updateRes.ok) {
-      return res.status(400).json({
-        error: true,
-        message: 'El enlace de recuperación no es válido o expiró.'
-      });
-    }
-
-    const authUserId = updateData?.id;
-    if (authUserId) {
-      const userRes = await pool.query(
-        `SELECT ia.id_usuario
-         FROM identidades_auth ia
-         WHERE ia.auth_user_id = $1
-         LIMIT 1`,
-        [authUserId]
-      );
-
-      if (userRes.rows.length > 0) {
-        await closeAllUserSessions(userRes.rows[0].id_usuario, 'password_reset').catch(() => {});
-      }
-    }
-
-    return res.json({ message: 'Contraseña actualizada correctamente.' });
-  } catch (_error) {
-    console.error('[public/reset-password] Failed to reset password');
-    return res.status(500).json({ error: true, message: 'No se pudo restablecer la contraseña.' });
-  }
-});
-
 // ── POST /api/public/verify-email ────────────────────────────────────
 /**
  * Soporta dos flujos:
@@ -734,102 +479,20 @@ router.post('/api/public/reset-password', forgotPasswordLimiter, async (req, res
  * B) token_hash + type: Flujo manual donde enviamos el token a Supabase para verificar.
  */
 router.post('/api/public/verify-email', async (req, res) => {
-  const token = normalizeIdentifier(req.body?.token ?? req.body?.verify_token);
-  const { token_hash, type, access_token } = req.body || {};
+  const { token_hash, type, access_token } = req.body;
+
+  // Validar que venga al menos un forma de verificación
+  if (!access_token && (!token_hash || !type)) {
+    return res.status(400).json({ error: true, message: 'Se requiere access_token o (token_hash + type)' });
+  }
 
   try {
-    await ensureVerificationTokenTable();
-
-    if (token) {
-      const tokenHash = hashVerificationToken(token);
-      const client = await pool.connect();
-      try {
-        await client.query('BEGIN');
-
-        const tokenRes = await client.query(
-          `SELECT vt.id_token, vt.id_usuario, vt.token_expires_at, vt.used_at,
-                  ia.auth_user_id
-           FROM verificacion_cuentas_tokens vt
-           INNER JOIN identidades_auth ia ON ia.id_usuario = vt.id_usuario
-           WHERE vt.token_hash = $1
-           LIMIT 1
-           FOR UPDATE`,
-          [tokenHash]
-        );
-
-        if (!tokenRes.rows.length) {
-          await client.query('ROLLBACK');
-          return apiError(res, 400, {
-            code: 'INVALID_TOKEN',
-            message: 'El token de verificacion no es valido.',
-            field: 'token'
-          });
-        }
-
-        const row = tokenRes.rows[0];
-        if (row.used_at) {
-          await client.query('ROLLBACK');
-          return apiError(res, 409, {
-            code: 'TOKEN_ALREADY_USED',
-            message: 'El token de verificacion ya fue utilizado.',
-            field: 'token'
-          });
-        }
-
-        const exp = new Date(row.token_expires_at);
-        if (Number.isNaN(exp.getTime()) || exp.getTime() <= Date.now()) {
-          await client.query('ROLLBACK');
-          return apiError(res, 400, {
-            code: 'TOKEN_EXPIRED',
-            message: 'El token de verificacion expiro. Solicita uno nuevo.',
-            field: 'token'
-          });
-        }
-
-        await confirmarIdentidadSupabase(row.auth_user_id);
-
-        await client.query(`UPDATE usuarios SET estado = true WHERE id_usuario = $1`, [row.id_usuario]);
-        await client.query(
-          `UPDATE identidades_auth
-           SET email_verificado = true,
-               ultima_autenticacion = NOW()
-           WHERE id_usuario = $1`,
-          [row.id_usuario]
-        );
-        await client.query(
-          `UPDATE verificacion_cuentas_tokens
-           SET used_at = NOW()
-           WHERE id_token = $1`,
-          [row.id_token]
-        );
-
-        await client.query('COMMIT');
-
-        return apiSuccess(res, 200, {
-          code: 'EMAIL_VERIFIED',
-          message: 'Email verificado exitosamente. Ya puedes iniciar sesion.',
-          verified: true
-        });
-      } catch (error) {
-        await client.query('ROLLBACK').catch(() => {});
-        throw error;
-      } finally {
-        client.release();
-      }
-    }
-
-    if (!access_token && (!token_hash || !type)) {
-      return apiError(res, 400, {
-        code: 'VALIDATION_ERROR',
-        message: 'Se requiere token o (access_token) o (token_hash + type).'
-      });
-    }
-
     const anonKey = process.env.SUPABASE_ANON_KEY || SUPABASE_SERVICE_KEY;
     let authUserId = null;
     let email = null;
 
     if (access_token) {
+      // ── Flujo A: access_token ya válido (Supabase ya confirmó el email) ───
       const userRes = await fetch(`${SUPABASE_URL}/auth/v1/user`, {
         headers: {
           apikey: anonKey,
@@ -838,28 +501,21 @@ router.post('/api/public/verify-email', async (req, res) => {
       });
 
       if (!userRes.ok) {
-        return apiError(res, 400, {
-          code: 'INVALID_TOKEN',
-          message: 'Token de verificacion invalido o expirado.',
-          field: 'access_token'
-        });
+        return res.status(400).json({ error: true, message: 'Token de verificación inválido o expirado' });
       }
 
       const userData = await userRes.json();
       authUserId = userData.id;
       email = userData.email;
     } else {
+      // ── Flujo B: token_hash + type ───────────────────────────
       const verifyRes = await fetch(
         `${SUPABASE_URL}/auth/v1/verify?token=${token_hash}&type=${type}`,
         { method: 'GET', headers: { apikey: anonKey } }
       );
 
       if (!verifyRes.ok) {
-        return apiError(res, 400, {
-          code: 'INVALID_TOKEN',
-          message: 'Token invalido o expirado.',
-          field: 'token_hash'
-        });
+        return res.status(400).json({ error: true, message: 'Token inválido o expirado' });
       }
 
       const verifyData = await verifyRes.json();
@@ -867,37 +523,43 @@ router.post('/api/public/verify-email', async (req, res) => {
       email = verifyData?.user?.email || verifyData?.email;
     }
 
+    if (!authUserId && !email) {
+      return res.status(400).json({ error: true, message: 'No se pudo identificar al usuario verificado' });
+    }
+
+    // Buscar identidad local
     const identQuery = authUserId
       ? await pool.query(`SELECT id_usuario FROM identidades_auth WHERE auth_user_id = $1 LIMIT 1`, [authUserId])
       : await pool.query(`SELECT id_usuario FROM identidades_auth WHERE email_login = $1 LIMIT 1`, [email]);
 
-    if (!identQuery.rows.length) {
-      return apiSuccess(res, 200, {
-        message: 'Email verificado. Inicia sesion para continuar.',
-        verified: true
-      });
+    if (identQuery.rows.length === 0) {
+      console.warn('[verify-email] No se encontró identidad local para:', authUserId || email);
+      // Aun así respondemos OK para no bloquear si Supabase ya validó
+      return res.json({ message: 'Email verificado. Inicia sesión para continuar.', verified: true });
     }
 
     const id_usuario = identQuery.rows[0].id_usuario;
+
+    // Activar usuario y marcar email como verificado en BD local
     await pool.query(`UPDATE usuarios SET estado = true WHERE id_usuario = $1`, [id_usuario]);
     await pool.query(
       `UPDATE identidades_auth SET email_verificado = true, ultima_autenticacion = NOW() WHERE id_usuario = $1`,
       [id_usuario]
     );
 
-    return apiSuccess(res, 200, {
-      message: 'Email verificado exitosamente. Ya puedes iniciar sesion.',
+    console.log(`[verify-email] Usuario ${id_usuario} activado correctamente`);
+
+    return res.json({
+      message: 'Email verificado exitosamente. Ya puedes iniciar sesión.',
       verified: true
     });
   } catch (error) {
     console.error('[public/verify-email] Error:', error);
-    return apiError(res, 500, {
-      code: 'VERIFY_EMAIL_FAILED',
-      message: 'Error al verificar email',
-      details: process.env.NODE_ENV === 'development' ? String(error?.message || error) : null
-    });
+    return res.status(500).json({ error: true, message: 'Error al verificar email' });
   }
 });
+
+// ── POST /api/public/google-callback ─────────────────────────────────
 router.post('/api/public/google-callback', async (req, res) => {
   const { access_token, refresh_token } = req.body;
   if (!access_token) {
@@ -948,13 +610,14 @@ router.post('/api/public/google-callback', async (req, res) => {
       try {
         await client.query('BEGIN');
 
-        const fallbackNombre = normalizeIdentifier(nombre) || 'Cliente';
-        const fallbackApellido = normalizeIdentifier(apellido) || 'Google';
-        const personaRes = await client.query(
-          `INSERT INTO personas (nombre, apellido, genero) VALUES ($1, $2, 'O') RETURNING id_persona`,
-          [fallbackNombre, fallbackApellido]
-        );
-        const id_persona = personaRes.rows[0]?.id_persona;
+        let id_persona = null;
+        if (nombre) {
+          const personaRes = await client.query(
+            `INSERT INTO personas (nombre, apellido) VALUES ($1, $2) RETURNING id_persona`,
+            [nombre, apellido]
+          );
+          id_persona = personaRes.rows[0]?.id_persona ?? null;
+        }
 
         const id_cliente = await insertarClienteSeguro(client, id_persona);
         if (!Number.isInteger(Number(id_cliente)) || Number(id_cliente) <= 0) {
@@ -976,23 +639,25 @@ router.post('/api/public/google-callback', async (req, res) => {
           );
         }
 
-        await client.query(
-          `
-            INSERT INTO usuarios_clientes (
-              id_usuario,
-              id_cliente,
-              estado,
-              fecha_vinculacion,
-              fecha_actualizacion
-            )
-            VALUES ($1, $2, true, NOW(), NOW())
-            ON CONFLICT (id_usuario, id_cliente) DO UPDATE
-            SET
-              estado = true,
-              fecha_actualizacion = NOW()
-          `,
-          [id_usuario, id_cliente]
-        );
+        if (id_cliente) {
+          await client.query(
+            `
+              INSERT INTO usuarios_clientes (
+                id_usuario,
+                id_cliente,
+                estado,
+                fecha_vinculacion,
+                fecha_actualizacion
+              )
+              VALUES ($1, $2, true, NOW(), NOW())
+              ON CONFLICT (id_usuario, id_cliente) DO UPDATE
+              SET
+                estado = true,
+                fecha_actualizacion = NOW()
+            `,
+            [id_usuario, id_cliente]
+          );
+        }
 
         await client.query(
           `INSERT INTO identidades_auth (id_usuario, auth_user_id, provider, email_login, email_verificado, activo)
