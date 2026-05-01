@@ -6,25 +6,74 @@ import { SUPABASE_ADMIN_BUCKET, buildAbsolutePublicUrl } from '../utils/uploads.
 
 const router = express.Router();
 
-// AM: permisos minimos del nuevo flujo de ordenes de compra.
-const PERM_OC_CREATE = ['INVENTARIO_ORDENES_COMPRA_CREAR'];
-const PERM_OC_VIEW = [
+// AM: Fase 4B.2 - permisos granulares OC con fallback legacy equivalente por endpoint.
+const PERM_OC_CREATE = ['INVENTARIO_OC_CREAR_SOLICITUD', 'INVENTARIO_ORDENES_COMPRA_CREAR'];
+const PERM_OC_VIEW_FLOW = [
+  'INVENTARIO_OC_VER_FLUJO',
   'INVENTARIO_ORDENES_COMPRA_VER',
-  'INVENTARIO_ORDENES_COMPRA_CREAR',
   'INVENTARIO_ORDENES_COMPRA_VER_TODAS'
 ];
-const PERM_OC_VIEW_ALL = ['INVENTARIO_ORDENES_COMPRA_VER_TODAS'];
-const PERM_OC_REVIEW = ['INVENTARIO_ORDENES_COMPRA_GESTIONAR'];
-const PERM_OC_CONVERT = ['INVENTARIO_ORDENES_COMPRA_CONVERTIR'];
-const PERM_OC_SUPPLY = ['INVENTARIO_ORDENES_COMPRA_ABASTECER'];
+const PERM_OC_VIEW_DETAIL = [
+  'INVENTARIO_OC_VER_DETALLE',
+  'INVENTARIO_OC_VER_HISTORIAL',
+  'INVENTARIO_ORDENES_COMPRA_VER',
+  'INVENTARIO_ORDENES_COMPRA_VER_TODAS'
+];
+const PERM_OC_VIEW_EVIDENCIAS = [
+  'INVENTARIO_OC_VER_EVIDENCIAS',
+  'INVENTARIO_ORDENES_COMPRA_VER',
+  'INVENTARIO_ORDENES_COMPRA_VER_TODAS'
+];
+const PERM_OC_VIEW_ALL = [
+  'INVENTARIO_OC_VER_FLUJO',
+  'INVENTARIO_OC_VER_DETALLE',
+  'INVENTARIO_OC_VER_HISTORIAL',
+  'INVENTARIO_ORDENES_COMPRA_VER_TODAS'
+];
+const PERM_OC_EDIT_REQUEST = ['INVENTARIO_OC_EDITAR_SOLICITUD', 'INVENTARIO_ORDENES_COMPRA_GESTIONAR'];
+const PERM_OC_APPROVE = ['INVENTARIO_OC_APROBAR', 'INVENTARIO_ORDENES_COMPRA_GESTIONAR'];
+const PERM_OC_REJECT = ['INVENTARIO_OC_RECHAZAR', 'INVENTARIO_ORDENES_COMPRA_GESTIONAR'];
+const PERM_OC_CANCEL = [
+  'INVENTARIO_OC_CANCELAR',
+  'INVENTARIO_ORDENES_COMPRA_VER_TODAS',
+  'INVENTARIO_ORDENES_COMPRA_GESTIONAR'
+];
+const PERM_OC_CONVERT = ['INVENTARIO_OC_CONVERTIR_CONTINUAR', 'INVENTARIO_ORDENES_COMPRA_CONVERTIR'];
+const PERM_OC_SUPPLY = ['INVENTARIO_OC_ABASTECER', 'INVENTARIO_ORDENES_COMPRA_ABASTECER'];
+const PERM_OC_UPLOAD_FACTURA = ['INVENTARIO_OC_SUBIR_FACTURA', 'INVENTARIO_ORDENES_COMPRA_RECEPCIONAR'];
+const PERM_OC_UPLOAD_DEPOSITO = ['INVENTARIO_OC_SUBIR_DEPOSITO', 'INVENTARIO_ORDENES_COMPRA_CONVERTIR'];
 // AM: recepcion de sucursal solo para perfiles operativos con permiso explicito.
-const PERM_OC_RECEIVE = ['INVENTARIO_ORDENES_COMPRA_RECEPCIONAR'];
+const PERM_OC_RECEIVE = ['INVENTARIO_OC_RECEPCIONAR', 'INVENTARIO_ORDENES_COMPRA_RECEPCIONAR'];
+const PERM_OC_RECEIVE_OR_UPLOAD_FACTURA = Array.from(new Set([...PERM_OC_RECEIVE, ...PERM_OC_UPLOAD_FACTURA]));
+const PERM_OC_CONVERT_OR_UPLOAD_DEPOSITO = Array.from(new Set([...PERM_OC_CONVERT, ...PERM_OC_UPLOAD_DEPOSITO]));
+const PERM_OC_REVIEW_ITEM_REQUEST = ['INVENTARIO_OC_REVISAR_SOLICITUD_ITEM', 'INVENTARIO_ORDENES_COMPRA_GESTIONAR'];
+const PERM_OC_ATTEND_ITEM_REQUEST = ['INVENTARIO_OC_ATENDER_SOLICITUD_ITEM', 'INVENTARIO_ORDENES_COMPRA_GESTIONAR'];
 // AM: permisos que habilitan ver informacion administrativa completa de OC (compra/proveedor/transferencia).
 const PERM_OC_ADMIN_DETAIL_VIEW = Array.from(
-  new Set([...PERM_OC_REVIEW, ...PERM_OC_CONVERT, ...PERM_OC_SUPPLY, ...PERM_OC_VIEW_ALL])
+  new Set([
+    ...PERM_OC_VIEW_EVIDENCIAS,
+    'INVENTARIO_OC_VER_HISTORIAL',
+    ...PERM_OC_EDIT_REQUEST,
+    ...PERM_OC_CONVERT,
+    ...PERM_OC_UPLOAD_DEPOSITO,
+    ...PERM_OC_SUPPLY,
+    ...PERM_OC_VIEW_ALL
+  ])
 );
 // AM: actor administrativo del workflow (puede revisar/decidir solicitudes operativas de OC).
-const PERM_OC_ADMIN_WORKFLOW = Array.from(new Set([...PERM_OC_REVIEW, ...PERM_OC_CONVERT, ...PERM_OC_SUPPLY]));
+const PERM_OC_ADMIN_WORKFLOW = Array.from(
+  new Set([
+    ...PERM_OC_EDIT_REQUEST,
+    ...PERM_OC_APPROVE,
+    ...PERM_OC_REJECT,
+    ...PERM_OC_CANCEL,
+    ...PERM_OC_CONVERT,
+    ...PERM_OC_UPLOAD_DEPOSITO,
+    ...PERM_OC_SUPPLY,
+    ...PERM_OC_REVIEW_ITEM_REQUEST,
+    ...PERM_OC_ATTEND_ITEM_REQUEST
+  ])
+);
 
 const ESTADO_PENDIENTE = 'PENDIENTE';
 const ESTADO_APROBADA = 'APROBADA';
@@ -1516,7 +1565,7 @@ router.get('/orden_compras/workflow/contexto_creacion', checkPermission(PERM_OC_
   }
 });
 
-router.get('/orden_compras/workflow', checkPermission(PERM_OC_VIEW), async (req, res) => {
+router.get('/orden_compras/workflow', checkPermission(PERM_OC_VIEW_FLOW), async (req, res) => {
   try {
     const idUsuario = getRequestUserId(req);
     if (!idUsuario) return sendError(res, 401, 'UNAUTHORIZED', 'No autorizado.');
@@ -1900,7 +1949,7 @@ router.get('/orden_compras/workflow', checkPermission(PERM_OC_VIEW), async (req,
   }
 });
 
-router.get('/orden_compras/workflow/:id_orden_compra', checkPermission(PERM_OC_VIEW), async (req, res) => {
+router.get('/orden_compras/workflow/:id_orden_compra', checkPermission(PERM_OC_VIEW_DETAIL), async (req, res) => {
   try {
     const idUsuario = getRequestUserId(req);
     if (!idUsuario) return sendError(res, 401, 'UNAUTHORIZED', 'No autorizado.');
@@ -1954,7 +2003,7 @@ router.get('/orden_compras/workflow/:id_orden_compra', checkPermission(PERM_OC_V
 
 router.get(
   '/orden_compras/workflow/:id_orden_compra/evidencias/factura',
-  checkPermission(PERM_OC_VIEW),
+  checkPermission(PERM_OC_VIEW_EVIDENCIAS),
   async (req, res) => {
     try {
       const idUsuario = getRequestUserId(req);
@@ -2014,7 +2063,7 @@ router.get(
 
 router.get(
   '/orden_compras/workflow/:id_orden_compra/evidencias/transferencia',
-  checkPermission(PERM_OC_VIEW),
+  checkPermission(PERM_OC_VIEW_EVIDENCIAS),
   async (req, res) => {
     try {
       const idUsuario = getRequestUserId(req);
@@ -2266,7 +2315,7 @@ router.post('/orden_compras/workflow', checkPermission(PERM_OC_CREATE), async (r
   }
 });
 
-router.put('/orden_compras/workflow/:id_orden_compra/detalles', checkPermission(PERM_OC_REVIEW), async (req, res) => {
+router.put('/orden_compras/workflow/:id_orden_compra/detalles', checkPermission(PERM_OC_EDIT_REQUEST), async (req, res) => {
   const client = await pool.connect();
   try {
     const idUsuario = getRequestUserId(req);
@@ -2553,7 +2602,7 @@ router.put('/orden_compras/workflow/:id_orden_compra/detalles', checkPermission(
 
 router.post(
   '/orden_compras/workflow/:id_orden_compra/solicitudes_item/:id_solicitud_item/revisar',
-  checkPermission(PERM_OC_REVIEW),
+  checkPermission(PERM_OC_REVIEW_ITEM_REQUEST),
   async (req, res) => {
     const client = await pool.connect();
     try {
@@ -2694,7 +2743,7 @@ router.post(
 
 router.post(
   '/orden_compras/workflow/:id_orden_compra/solicitudes_item/:id_solicitud_item/atender',
-  checkPermission(PERM_OC_REVIEW),
+  checkPermission(PERM_OC_ATTEND_ITEM_REQUEST),
   async (req, res) => {
     const client = await pool.connect();
     try {
@@ -2842,7 +2891,7 @@ router.post(
   }
 );
 
-router.post('/orden_compras/workflow/:id_orden_compra/aprobar', checkPermission(PERM_OC_REVIEW), async (req, res) => {
+router.post('/orden_compras/workflow/:id_orden_compra/aprobar', checkPermission(PERM_OC_APPROVE), async (req, res) => {
   const client = await pool.connect();
   try {
     const idUsuario = getRequestUserId(req);
@@ -2933,7 +2982,7 @@ router.post('/orden_compras/workflow/:id_orden_compra/aprobar', checkPermission(
   }
 });
 
-router.post('/orden_compras/workflow/:id_orden_compra/rechazar', checkPermission(PERM_OC_REVIEW), async (req, res) => {
+router.post('/orden_compras/workflow/:id_orden_compra/rechazar', checkPermission(PERM_OC_REJECT), async (req, res) => {
   const client = await pool.connect();
   try {
     const idUsuario = getRequestUserId(req);
@@ -3009,7 +3058,7 @@ router.post('/orden_compras/workflow/:id_orden_compra/rechazar', checkPermission
   }
 });
 
-router.post('/orden_compras/workflow/:id_orden_compra/cancelar', checkPermission(PERM_OC_VIEW_ALL), async (req, res) => {
+router.post('/orden_compras/workflow/:id_orden_compra/cancelar', checkPermission(PERM_OC_CANCEL), async (req, res) => {
   const client = await pool.connect();
   try {
     const idUsuario = getRequestUserId(req);
@@ -3091,7 +3140,7 @@ router.post('/orden_compras/workflow/:id_orden_compra/cancelar', checkPermission
   }
 });
 
-router.post('/orden_compras/workflow/:id_orden_compra/convertir', checkPermission(PERM_OC_CONVERT), async (req, res) => {
+router.post('/orden_compras/workflow/:id_orden_compra/convertir', checkPermission(PERM_OC_CONVERT_OR_UPLOAD_DEPOSITO), async (req, res) => {
   const client = await pool.connect();
   try {
     const idUsuario = getRequestUserId(req);
@@ -3678,7 +3727,7 @@ router.post('/orden_compras/workflow/:id_orden_compra/convertir', checkPermissio
   }
 });
 
-router.post('/orden_compras/workflow/:id_orden_compra/recepcion', checkPermission(PERM_OC_RECEIVE), async (req, res) => {
+router.post('/orden_compras/workflow/:id_orden_compra/recepcion', checkPermission(PERM_OC_RECEIVE_OR_UPLOAD_FACTURA), async (req, res) => {
   const client = await pool.connect();
   try {
     const idUsuario = getRequestUserId(req);
