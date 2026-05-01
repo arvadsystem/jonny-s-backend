@@ -1,5 +1,6 @@
 import pool from '../../config/db-connection.js';
 import { createHash } from 'crypto';
+import { buildAbsolutePublicUrl } from '../../utils/uploads.js';
 import {
   PUBLIC_ITEM_TYPES,
   acquirePublicOrderIdempotencyLockQuery,
@@ -13,6 +14,7 @@ import {
   fetchPublicActiveSaucesQuery,
   fetchPedidoByIdempotencyKeyQuery,
   fetchPublicBranchesQuery,
+  fetchPublicMenuExtrasByRecipeIdsQuery,
   fetchRecipeAvailabilityQuery,
   fetchSauceRuleRowsByRecipeIdsQuery,
   insertPublicPedidoDetalleQuery,
@@ -70,6 +72,7 @@ const MAX_PUBLIC_ORDER_DESCRIPTION_LENGTH = 240;
 const MAX_PUBLIC_ITEM_NOTE_LENGTH = 100;
 const MAX_PUBLIC_ORDER_IDEMPOTENCY_LENGTH = 120;
 const WINGS_SAUCE_KEYWORDS = Object.freeze(['alita', 'alitas', 'tender', 'tenders']);
+const LEGACY_GOOGLE_IMAGE_RE = /(?:drive\.google\.com|drive\.usercontent\.google\.com|googleusercontent\.com)/i;
 
 // Crea errores HTTP controlados para que el controlador responda con status consistente.
 const buildHttpError = (status, message) => {
@@ -100,6 +103,12 @@ const normalizeTextKey = (value) =>
     .trim()
     .toLowerCase()
     .replace(/\s+/g, '_');
+
+const resolvePublicCatalogImageUrl = (rawUrl) => {
+  const value = String(rawUrl || '').trim();
+  if (!value || LEGACY_GOOGLE_IMAGE_RE.test(value)) return '';
+  return buildAbsolutePublicUrl(null, value) || value;
+};
 
 const normalizeSearchText = (value) =>
   String(value || '')
@@ -240,7 +249,7 @@ const normalizeExtraOption = (option) => ({
   precio_adicional: roundMoney(option?.precio_adicional || 0)
 });
 
-const getCatalogItemExtraOptions = ({ nombre, descripcion, categoriaNombre, tipoItem }) => {
+const getFallbackCatalogItemExtraOptions = ({ nombre, descripcion, categoriaNombre, tipoItem }) => {
   if (String(tipoItem || '') !== PUBLIC_ITEM_TYPES.RECETA) {
     return [];
   }
@@ -256,6 +265,28 @@ const getCatalogItemExtraOptions = ({ nombre, descripcion, categoriaNombre, tipo
       hasAnyKeyword(safeCategory, option.keywords)
     ))
     .map(normalizeExtraOption);
+};
+
+const buildCatalogExtrasByRecipe = async (catalogRows = [], db = pool) => {
+  const recipeIds = toUniquePositiveIntArray(
+    catalogRows
+      .filter((row) => String(row?.tipo_item || '') === PUBLIC_ITEM_TYPES.RECETA)
+      .map((row) => row?.id_receta)
+  );
+
+  const rows = await fetchPublicMenuExtrasByRecipeIdsQuery(recipeIds, db);
+  const grouped = new Map();
+
+  rows.forEach((row) => {
+    const idReceta = Number(row?.id_receta || 0);
+    if (!idReceta) return;
+    const extra = normalizeExtraOption(row);
+    if (!extra.id_extra) return;
+    if (!grouped.has(idReceta)) grouped.set(idReceta, []);
+    grouped.get(idReceta).push(extra);
+  });
+
+  return grouped;
 };
 
 const buildCatalogSauceConfigByDetail = async (catalogRows = [], db = pool) => {
@@ -475,7 +506,8 @@ const mapCatalogItem = ({
   row,
   recipeAvailabilityMap,
   comboAvailabilityMap,
-  sauceConfigByDetail = new Map()
+  sauceConfigByDetail = new Map(),
+  extrasByRecipe = new Map()
 }) => {
   const price = resolvePricePayload(row);
   const availability = row.tipo_item === PUBLIC_ITEM_TYPES.PRODUCTO
@@ -496,7 +528,8 @@ const mapCatalogItem = ({
     Number(itemSauceConfig.salsas_requeridas_base || 0),
     Number(fallbackRequiredSauces || 0)
   );
-  const extrasOpciones = getCatalogItemExtraOptions({
+  const dbExtras = extrasByRecipe.get(Number(row?.id_receta || 0)) || [];
+  const extrasOpciones = dbExtras.length > 0 ? dbExtras : getFallbackCatalogItemExtraOptions({
     nombre: row?.nombre_item,
     descripcion: row?.descripcion_item,
     categoriaNombre: row?.categoria_nombre,
@@ -520,7 +553,7 @@ const mapCatalogItem = ({
       id_tipo_departamento: row.id_tipo_departamento ? Number(row.id_tipo_departamento) : null,
       nombre: row.categoria_nombre || 'Sin categoria'
     },
-    imagen_url: row.url_imagen || '',
+    imagen_url: resolvePublicCatalogImageUrl(row.url_imagen),
     precio: price,
     disponibilidad: finalAvailability,
     extras_opciones: extrasOpciones,
@@ -1111,7 +1144,10 @@ export const getPublicCatalogService = async ({ idSucursal, tipoPedido = null })
   }
 
   const rows = await fetchCatalogRowsByMenuQuery(Number(activeMenu.id_menu));
-  const sauceConfigByDetail = await buildCatalogSauceConfigByDetail(rows);
+  const [sauceConfigByDetail, extrasByRecipe] = await Promise.all([
+    buildCatalogSauceConfigByDetail(rows),
+    buildCatalogExtrasByRecipe(rows)
+  ]);
 
   const recipeIds = rows
     .filter((row) => row.tipo_item === PUBLIC_ITEM_TYPES.RECETA && row.id_receta)
@@ -1134,7 +1170,8 @@ export const getPublicCatalogService = async ({ idSucursal, tipoPedido = null })
       row,
       recipeAvailabilityMap,
       comboAvailabilityMap,
-      sauceConfigByDetail
+      sauceConfigByDetail,
+      extrasByRecipe
     })
   );
 
@@ -1167,7 +1204,10 @@ export const getPublicCatalogItemDetailService = async ({ idSucursal, idDetalleM
   if (!row) {
     throw buildHttpError(404, 'El item no existe en el menu vigente de esta sucursal.');
   }
-  const sauceConfigByDetail = await buildCatalogSauceConfigByDetail([row]);
+  const [sauceConfigByDetail, extrasByRecipe] = await Promise.all([
+    buildCatalogSauceConfigByDetail([row]),
+    buildCatalogExtrasByRecipe([row])
+  ]);
 
   const recipeIds = row.id_receta ? [Number(row.id_receta)] : [];
   const comboIds = row.id_combo ? [Number(row.id_combo)] : [];
@@ -1186,7 +1226,8 @@ export const getPublicCatalogItemDetailService = async ({ idSucursal, idDetalleM
       row,
       recipeAvailabilityMap,
       comboAvailabilityMap,
-      sauceConfigByDetail
+      sauceConfigByDetail,
+      extrasByRecipe
     })
   };
 };
@@ -1252,10 +1293,6 @@ export const createPublicOrderService = async ({
 
   if (String(tipoPedido || '') === 'delivery' && !businessContext.entrega.referencia) {
     throw buildHttpError(400, 'Debes enviar referencia de entrega para pedidos delivery.');
-  }
-
-  if (String(tipoPedido || '') === 'dine-in' && !businessContext.servicio?.mesa) {
-    throw buildHttpError(400, 'Debes indicar la mesa para pedidos comer en restaurante.');
   }
 
   const requestedItems = normalizeRequestedOrderItems(items);

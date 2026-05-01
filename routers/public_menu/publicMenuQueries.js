@@ -31,6 +31,27 @@ const hasColumn = async (tableName, columnName) => {
   return exists;
 };
 
+const hasTable = async (tableName) => {
+  const cacheKey = `table.${String(tableName || '').trim().toLowerCase()}`;
+  if (schemaColumnCache.has(cacheKey)) {
+    return schemaColumnCache.get(cacheKey);
+  }
+
+  const result = await pool.query(
+    `
+      SELECT 1
+      FROM information_schema.tables
+      WHERE table_schema = 'public'
+        AND table_name = $1
+      LIMIT 1;
+    `,
+    [tableName]
+  );
+  const exists = result.rowCount > 0;
+  schemaColumnCache.set(cacheKey, exists);
+  return exists;
+};
+
 // Lista sucursales activas para entrada publica del flujo.
 export const fetchPublicBranchesQuery = async () => {
   const query = `
@@ -218,6 +239,43 @@ export const fetchCatalogRowsByMenuQuery = async (idMenu, db = pool) => {
     hasDetalleVisibleColumn
   });
   const result = await db.query(query, [idMenu]);
+  return result.rows;
+};
+
+export const fetchPublicMenuExtrasByRecipeIdsQuery = async (recipeIds = [], db = pool) => {
+  const ids = [...new Set((Array.isArray(recipeIds) ? recipeIds : [])
+    .map((value) => Number.parseInt(String(value ?? ''), 10))
+    .filter((value) => Number.isInteger(value) && value > 0))];
+
+  if (ids.length === 0) return [];
+
+  const [hasExtrasTable, hasRecipeLinkTable] = await Promise.all([
+    hasTable('menu_extras'),
+    hasTable('menu_extra_receta')
+  ]);
+
+  if (!hasExtrasTable || !hasRecipeLinkTable) return [];
+
+  const result = await db.query(
+    `
+      SELECT
+        mer.id_receta,
+        me.id_extra,
+        me.codigo,
+        me.nombre,
+        me.precio_adicional,
+        COALESCE(mer.orden, me.orden, 0) AS orden
+      FROM menu_extra_receta mer
+      INNER JOIN menu_extras me
+        ON me.id_extra = mer.id_extra
+       AND COALESCE(me.estado, true) = true
+      WHERE mer.id_receta = ANY($1::int[])
+        AND COALESCE(mer.estado, true) = true
+      ORDER BY mer.id_receta ASC, COALESCE(mer.orden, me.orden, 2147483647), me.nombre ASC;
+    `,
+    [ids]
+  );
+
   return result.rows;
 };
 

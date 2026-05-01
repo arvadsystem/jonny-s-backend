@@ -49,9 +49,41 @@ const emitirAppJwt = (usuario, id_sesion) => {
     nombre_usuario: usuario.nombre_usuario,
     tipo_usuario: usuario.tipo_usuario,
     id_cliente: usuario.id_cliente,
+    nombre_cliente: usuario.nombre_cliente,
+    apellido_cliente: usuario.apellido_cliente,
+    nombre_completo_cliente: usuario.nombre_completo_cliente,
+    nombre_completo: usuario.nombre_completo_cliente,
     sid: id_sesion
   };
   return jwt.sign(payload, JWT_SECRET, { expiresIn: '8h' });
+};
+
+const CLIENTE_USUARIO_SELECT = `
+  SELECT
+    u.id_usuario,
+    u.nombre_usuario,
+    u.tipo_usuario,
+    u.id_cliente,
+    u.estado,
+    u.must_change_password,
+    c.id_persona,
+    p.nombre AS nombre_cliente,
+    p.apellido AS apellido_cliente,
+    NULLIF(TRIM(CONCAT_WS(' ', p.nombre, p.apellido)), '') AS nombre_completo_cliente,
+    NULLIF(TRIM(CONCAT_WS(' ', p.nombre, p.apellido)), '') AS nombre_completo
+  FROM usuarios u
+  LEFT JOIN clientes c ON c.id_cliente = u.id_cliente
+  LEFT JOIN personas p ON p.id_persona = c.id_persona
+`;
+
+const getClienteUsuarioById = async (idUsuario) => {
+  const result = await pool.query(
+    `${CLIENTE_USUARIO_SELECT}
+     WHERE u.id_usuario = $1
+     LIMIT 1`,
+    [idUsuario]
+  );
+  return result.rows[0] || null;
 };
 
 const normalizeIdentifier = (value) => String(value || '').trim();
@@ -543,11 +575,7 @@ router.post('/api/public/login', publicLoginIpLimiter, publicLoginAccountIpLimit
     }
 
     const id_usuario = identRes.rows[0].id_usuario;
-    const usuarioRes = await pool.query(
-      `SELECT id_usuario, nombre_usuario, tipo_usuario, id_cliente, estado, must_change_password FROM usuarios WHERE id_usuario = $1`,
-      [id_usuario]
-    );
-    const usuario = usuarioRes.rows[0];
+    const usuario = await getClienteUsuarioById(id_usuario);
 
     if (!usuario || !usuario.estado) {
       return apiError(res, 403, {
@@ -1009,11 +1037,7 @@ router.post('/api/public/google-callback', async (req, res) => {
     }
 
     // Emitir sesión y JWT
-    const usuarioRes2 = await pool.query(
-      `SELECT id_usuario, nombre_usuario, tipo_usuario, id_cliente, estado, must_change_password FROM usuarios WHERE id_usuario = $1`,
-      [id_usuario]
-    );
-    const usuario = usuarioRes2.rows[0];
+    const usuario = await getClienteUsuarioById(id_usuario);
 
     const id_sesion = await createSession({
       id_usuario, ip_origen, user_agent, dispositivo, navegador, sistema_operativo, ubicacion: null

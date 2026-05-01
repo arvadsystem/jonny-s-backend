@@ -91,6 +91,28 @@ const getUserAuthzSnapshot = async (idUsuario) => {
   };
 };
 
+const getClienteNameSnapshot = async (idUsuario) => {
+  const userId = Number.parseInt(String(idUsuario ?? ''), 10);
+  if (!Number.isInteger(userId) || userId <= 0) return null;
+
+  const result = await pool.query(
+    `
+      SELECT
+        p.nombre AS nombre_cliente,
+        p.apellido AS apellido_cliente,
+        NULLIF(TRIM(CONCAT_WS(' ', p.nombre, p.apellido)), '') AS nombre_completo_cliente
+      FROM usuarios u
+      LEFT JOIN clientes c ON c.id_cliente = u.id_cliente
+      LEFT JOIN personas p ON p.id_persona = c.id_persona
+      WHERE u.id_usuario = $1
+      LIMIT 1
+    `,
+    [userId]
+  );
+
+  return result.rows[0] || null;
+};
+
 const normalizeRoleName = (value) =>
   String(value ?? '')
     .normalize('NFD')
@@ -470,6 +492,24 @@ router.get('/me', authRequired, requireActiveSession, async (req, res) => {
 
       if (result.rows.length > 0) {
         const row = result.rows[0];
+        Object.assign(usuario, {
+          id_cliente: row.id_cliente,
+          tipo_usuario: row.tipo_usuario,
+          foto_perfil: row.foto_perfil
+        });
+
+        if (String(row?.tipo_usuario || '').trim().toUpperCase() === 'CLIENTE') {
+          const clienteName = await getClienteNameSnapshot(idUsuario);
+          if (clienteName) {
+            Object.assign(usuario, {
+              nombre_cliente: clienteName.nombre_cliente,
+              apellido_cliente: clienteName.apellido_cliente,
+              nombre_completo_cliente: clienteName.nombre_completo_cliente,
+              nombre_completo: clienteName.nombre_completo_cliente || usuario.nombre_completo
+            });
+          }
+        }
+
         const passwordExpiration = evaluatePasswordExpiration({
           roles: authz.roles,
           tipoUsuario: row?.tipo_usuario,

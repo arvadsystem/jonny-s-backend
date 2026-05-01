@@ -133,13 +133,6 @@ const normalizeOrderBusinessContext = ({ body, tipoPedido }) => {
     };
   }
 
-  // Regla de negocio: dine-in exige numero/referencia de mesa.
-  if (tipoPedido === 'dine-in' && !servicio.mesa) {
-    return {
-      error: 'Debes indicar la mesa para pedidos comer en restaurante.'
-    };
-  }
-
   if (tipoPedido === 'pickup' && !pago.metodo) {
     return {
       error: 'Debes seleccionar metodo_pago para pickup: caja o transferencia.'
