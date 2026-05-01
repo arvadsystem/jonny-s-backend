@@ -1,5 +1,6 @@
 import express from 'express';
 import pool from '../config/db-connection.js';
+import { checkPermission } from '../middleware/checkPermission.js';
 import {
   actualizarComboConDetalle,
   actualizarEstadoCombo,
@@ -24,14 +25,22 @@ import {
 } from './admin_combos_helpers.js';
 
 const router = express.Router();
+const MENU_VIEW_PERMISSIONS = ['MENU_VER'];
+const MENU_MUTATION_PERMISSIONS = ['MENU_VER'];
 
 const parseComboId = (value) => {
   const parsed = Number(value);
   return esEnteroPositivo(parsed) ? parsed : null;
 };
 
+// Seguridad: el actor se resuelve siempre desde el token autenticado.
+const resolveActorUserId = (req) => {
+  const parsed = Number(req?.user?.id_usuario);
+  return esEnteroPositivo(parsed) ? parsed : null;
+};
+
 // GET: listar combos admin.
-router.get('/', async (req, res) => {
+router.get('/', checkPermission(MENU_VIEW_PERMISSIONS), async (req, res) => {
   try {
     const baseDatos = await listarCombosAdmin();
     const datos = shouldIncludeInactive(req.query) ? baseDatos : baseDatos.filter(isRowActive);
@@ -43,7 +52,7 @@ router.get('/', async (req, res) => {
 });
 
 // GET: catalogo de recetas activas para armar detalle de combo.
-router.get('/catalogos/recetas', async (req, res) => {
+router.get('/catalogos/recetas', checkPermission(MENU_VIEW_PERMISSIONS), async (req, res) => {
   try {
     const recetas = await listarRecetasParaCombos();
     return res.status(200).json(recetas);
@@ -54,7 +63,7 @@ router.get('/catalogos/recetas', async (req, res) => {
 });
 
 // GET: obtener combo por id.
-router.get('/:id_combo', async (req, res) => {
+router.get('/:id_combo', checkPermission(MENU_VIEW_PERMISSIONS), async (req, res) => {
   try {
     const idCombo = parseComboId(req.params.id_combo);
     if (!idCombo) {
@@ -76,16 +85,24 @@ router.get('/:id_combo', async (req, res) => {
 });
 
 // POST: crear combo.
-router.post('/', async (req, res) => {
+router.post('/', checkPermission(MENU_MUTATION_PERMISSIONS), async (req, res) => {
   const client = await pool.connect();
 
   try {
-    const payloadValidation = validarEstructuraPayloadCombo(req.body);
+    const actorUserId = resolveActorUserId(req);
+    if (!actorUserId) {
+      return res.status(401).json({ error: true, message: 'Sesion invalida. Vuelve a iniciar sesion.' });
+    }
+
+    // Transicion segura: id_usuario del cliente se ignora y se fuerza desde req.user.
+    const payloadConActor = { ...(req.body || {}), id_usuario: actorUserId };
+
+    const payloadValidation = validarEstructuraPayloadCombo(payloadConActor);
     if (!payloadValidation.ok) {
       return res.status(400).json({ error: true, message: payloadValidation.message });
     }
 
-    const detalleNormalizacion = normalizarDetalleCombo(req.body?.detalle);
+    const detalleNormalizacion = normalizarDetalleCombo(payloadConActor?.detalle);
     if (!detalleNormalizacion.ok) {
       return res.status(400).json({ error: true, message: detalleNormalizacion.message });
     }
@@ -96,7 +113,7 @@ router.post('/', async (req, res) => {
       });
     }
 
-    const normalizacion = await normalizarPayloadCombo(req.body);
+    const normalizacion = await normalizarPayloadCombo(payloadConActor);
     if (!normalizacion.ok) {
       return res.status(400).json({ error: true, message: normalizacion.message });
     }
@@ -135,10 +152,15 @@ router.post('/', async (req, res) => {
 });
 
 // PUT: actualizar combo completo por id.
-router.put('/:id_combo', async (req, res) => {
+router.put('/:id_combo', checkPermission(MENU_MUTATION_PERMISSIONS), async (req, res) => {
   const client = await pool.connect();
 
   try {
+    const actorUserId = resolveActorUserId(req);
+    if (!actorUserId) {
+      return res.status(401).json({ error: true, message: 'Sesion invalida. Vuelve a iniciar sesion.' });
+    }
+
     const idCombo = parseComboId(req.params.id_combo);
     if (!idCombo) {
       return res.status(400).json({ error: true, message: 'id_combo invalido.' });
@@ -149,17 +171,20 @@ router.put('/:id_combo', async (req, res) => {
       return res.status(404).json({ error: true, message: 'Combo no encontrado.' });
     }
 
-    const payloadValidation = validarEstructuraPayloadCombo(req.body);
+    // Transicion segura: id_usuario del cliente se ignora y se fuerza desde req.user.
+    const payloadConActor = { ...(req.body || {}), id_usuario: actorUserId };
+
+    const payloadValidation = validarEstructuraPayloadCombo(payloadConActor);
     if (!payloadValidation.ok) {
       return res.status(400).json({ error: true, message: payloadValidation.message });
     }
 
-    const detalleNormalizacion = normalizarDetalleCombo(req.body?.detalle);
+    const detalleNormalizacion = normalizarDetalleCombo(payloadConActor?.detalle);
     if (!detalleNormalizacion.ok) {
       return res.status(400).json({ error: true, message: detalleNormalizacion.message });
     }
 
-    const normalizacion = await normalizarPayloadCombo(req.body);
+    const normalizacion = await normalizarPayloadCombo(payloadConActor);
     if (!normalizacion.ok) {
       return res.status(400).json({ error: true, message: normalizacion.message });
     }
@@ -199,11 +224,16 @@ router.put('/:id_combo', async (req, res) => {
   }
 });
 
-// PATCH: actualizar solo estado e id_usuario por id.
-router.patch('/:id_combo/estado', async (req, res) => {
+// PATCH: actualizar solo estado por id; id_usuario se toma de req.user.
+router.patch('/:id_combo/estado', checkPermission(MENU_MUTATION_PERMISSIONS), async (req, res) => {
   const client = await pool.connect();
 
   try {
+    const actorUserId = resolveActorUserId(req);
+    if (!actorUserId) {
+      return res.status(401).json({ error: true, message: 'Sesion invalida. Vuelve a iniciar sesion.' });
+    }
+
     const idCombo = parseComboId(req.params.id_combo);
     if (!idCombo) {
       return res.status(400).json({ error: true, message: 'id_combo invalido.' });
@@ -214,17 +244,20 @@ router.patch('/:id_combo/estado', async (req, res) => {
       return res.status(404).json({ error: true, message: 'Combo no encontrado.' });
     }
 
-    const payloadValidation = validarEstructuraPayloadCombo(req.body, { soloEstadoUsuario: true });
+    // Compatibilidad: si el cliente envia id_usuario se ignora silenciosamente.
+    const payloadConActor = { ...(req.body || {}), id_usuario: actorUserId };
+
+    const payloadValidation = validarEstructuraPayloadCombo(payloadConActor, { soloEstadoUsuario: true });
     if (!payloadValidation.ok) {
       return res.status(400).json({ error: true, message: payloadValidation.message });
     }
 
-    const estadoValidation = validarCampoCombo('estado', req.body.estado);
+    const estadoValidation = validarCampoCombo('estado', payloadConActor.estado);
     if (!estadoValidation.valido) {
       return res.status(400).json({ error: true, message: estadoValidation.message });
     }
 
-    const usuarioValidation = validarCampoCombo('id_usuario', req.body.id_usuario);
+    const usuarioValidation = validarCampoCombo('id_usuario', actorUserId);
     if (!usuarioValidation.valido) {
       return res.status(400).json({ error: true, message: usuarioValidation.message });
     }
@@ -257,7 +290,7 @@ router.patch('/:id_combo/estado', async (req, res) => {
 });
 
 // POST: agregar receta al detalle del combo.
-router.post('/:id_combo/detalle', async (req, res) => {
+router.post('/:id_combo/detalle', checkPermission(MENU_MUTATION_PERMISSIONS), async (req, res) => {
   const client = await pool.connect();
 
   try {
@@ -309,7 +342,7 @@ router.post('/:id_combo/detalle', async (req, res) => {
 });
 
 // DELETE logico: quitar receta del combo (desactiva detalle).
-router.delete('/:id_combo/detalle/:id_detalle_combo', async (req, res) => {
+router.delete('/:id_combo/detalle/:id_detalle_combo', checkPermission(MENU_MUTATION_PERMISSIONS), async (req, res) => {
   const client = await pool.connect();
 
   try {

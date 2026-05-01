@@ -1964,11 +1964,6 @@ router.get('/ventas/pedidos-menu', checkPermission(['VENTAS_VER']), async (req, 
       filters.push(`p.id_sucursal = ANY($${params.length}::int[])`);
     }
 
-    if (hasEstadoPago) {
-      params.push(PEDIDO_ESTADO_PAGO.CANCELADO_TIMEOUT);
-      filters.push(`UPPER(TRIM(COALESCE(p.estado_pago, ''))) <> $${params.length}`);
-    }
-
     const whereClause = `WHERE ${filters.join(' AND ')}`;
 
     const estadoPagoSelect = hasEstadoPago ? 'p.estado_pago' : `NULL::text AS estado_pago`;
