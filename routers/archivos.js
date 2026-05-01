@@ -1,6 +1,7 @@
 import crypto from 'crypto';
 import express from 'express';
 import pool from '../config/db-connection.js';
+import { checkPermission } from '../middleware/checkPermission.js';
 import { supabase } from '../services/supabaseClient.js';
 import {
   ALLOWED_MIME_TYPES_BY_BUCKET,
@@ -16,6 +17,9 @@ import {
 } from '../utils/uploads.js';
 
 const router = express.Router();
+const ARCHIVOS_VIEW_PERMISSIONS = ['INVENTARIO_ARCHIVOS_VER', 'INVENTARIO_VER'];
+const ARCHIVOS_UPLOAD_PERMISSIONS = ['INVENTARIO_ARCHIVOS_SUBIR', 'INVENTARIO_PRODUCTOS_IMAGEN_SUBIR', 'INVENTARIO_VER'];
+const ARCHIVOS_DELETE_PERMISSIONS = ['INVENTARIO_ARCHIVOS_ELIMINAR', 'INVENTARIO_PRODUCTOS_IMAGEN_ELIMINAR', 'INVENTARIO_VER'];
 
 const BASE64_BODY_REGEX = /^[A-Za-z0-9+/]+={0,2}$/;
 const SQLSTATE_UNDEFINED_TABLE = '42P01';
@@ -212,7 +216,7 @@ const parseStoredStoragePath = (rawValue) => {
  * Sube un archivo a un bucket de Supabase.
  * Params: { bucket, data_url | base64, nombre_original }
  */
-router.post('/archivos', async (req, res) => {
+router.post('/archivos', checkPermission(ARCHIVOS_UPLOAD_PERMISSIONS), async (req, res) => {
   let supabaseFilePath = '';
   const targetBucket = String(req.body?.bucket || SUPABASE_ASSETS_BUCKET).trim() || SUPABASE_ASSETS_BUCKET;
   
@@ -326,7 +330,7 @@ router.post('/archivos', async (req, res) => {
  * GET /archivos/:id/ver
  * Resuelve la URL de un archivo. Si es privado (admin-docs), genera una URL firmada.
  */
-router.get('/archivos/:id/ver', async (req, res) => {
+router.get('/archivos/:id/ver', checkPermission(ARCHIVOS_VIEW_PERMISSIONS), async (req, res) => {
   const idArchivo = req.params.id;
 
   try {
@@ -372,7 +376,7 @@ router.get('/archivos/:id/ver', async (req, res) => {
  * - Bloquea si el archivo esta referenciado en otros modulos.
  * - Desactiva en BD (estado=false) y luego intenta limpiar storage.
  */
-router.delete('/archivos/:id', async (req, res) => {
+router.delete('/archivos/:id', checkPermission(ARCHIVOS_DELETE_PERMISSIONS), async (req, res) => {
   const idArchivo = Number.parseInt(String(req.params?.id ?? ''), 10);
   if (!Number.isInteger(idArchivo) || idArchivo <= 0) {
     return res.status(400).json({ ok: false, error: true, code: 'INVALID_ARCHIVO_ID', message: ARCHIVO_INVALID_ID_MESSAGE });

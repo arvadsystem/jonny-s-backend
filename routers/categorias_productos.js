@@ -1,7 +1,12 @@
 import express from 'express';
 import pool from '../config/db-connection.js';
+import { checkPermission } from '../middleware/checkPermission.js';
 
 const router = express.Router();
+const CATEGORIAS_PRODUCTOS_VIEW_PERMISSIONS = ['INVENTARIO_CATEGORIAS_VER'];
+const CATEGORIAS_PRODUCTOS_CREATE_PERMISSIONS = ['INVENTARIO_CATEGORIAS_CREAR'];
+const CATEGORIAS_PRODUCTOS_EDIT_PERMISSIONS = ['INVENTARIO_CATEGORIAS_EDITAR'];
+const CATEGORIAS_PRODUCTOS_STATE_PERMISSIONS = ['INVENTARIO_CATEGORIAS_ESTADO_CAMBIAR', 'INVENTARIO_CATEGORIAS_ELIMINAR'];
 
 // NEW: mensaje estandar para bloqueo de inactivacion por productos activos asociados.
 // WHY: alinear backend con la regla de negocio y el copy requerido por frontend.
@@ -56,7 +61,7 @@ const hasOnlyAllowedFields = (payload, allowedSet) => Object.keys(payload).every
 // ------------------------------------------------------------------------------------
 // GET: Obtener categorias_productos
 // ------------------------------------------------------------------------------------
-router.get('/categorias_productos', async (req, res) => {
+router.get('/categorias_productos', checkPermission(CATEGORIAS_PRODUCTOS_VIEW_PERMISSIONS), async (req, res) => {
   try {
     const tabla = 'categorias_productos';
     const columnas = 'id_categoria_producto, nombre_categoria, codigo_categoria, descripcion, estado';
@@ -80,7 +85,7 @@ router.get('/categorias_productos', async (req, res) => {
 // ------------------------------------------------------------------------------------
 // POST: Crear categoria_producto
 // ------------------------------------------------------------------------------------
-router.post('/categorias_productos', async (req, res) => {
+router.post('/categorias_productos', checkPermission(CATEGORIAS_PRODUCTOS_CREATE_PERMISSIONS), async (req, res) => {
   try {
     const tabla = 'categorias_productos';
     const datosEntrada = req.body;
@@ -141,7 +146,7 @@ router.post('/categorias_productos', async (req, res) => {
 // ------------------------------------------------------------------------------------
 // PUT: Actualizar categoria_producto completa (edicion atomica)
 // ------------------------------------------------------------------------------------
-router.put('/categorias_productos/edicion', async (req, res) => {
+router.put('/categorias_productos/edicion', checkPermission(CATEGORIAS_PRODUCTOS_EDIT_PERMISSIONS), async (req, res) => {
   try {
     const datosEntrada = req.body;
     if (!isPlainObject(datosEntrada)) {
@@ -236,7 +241,7 @@ router.put('/categorias_productos/edicion', async (req, res) => {
 // ------------------------------------------------------------------------------------
 // PUT: Actualizar categoria_producto (actualiza 1 campo)
 // ------------------------------------------------------------------------------------
-router.put('/categorias_productos', async (req, res) => {
+router.put('/categorias_productos', checkPermission(CATEGORIAS_PRODUCTOS_EDIT_PERMISSIONS), async (req, res) => {
   try {
     const { campo, valor, id_campo, id_valor } = req.body || {};
 
@@ -322,7 +327,7 @@ router.put('/categorias_productos', async (req, res) => {
 // ------------------------------------------------------------------------------------
 // DELETE: Inactivar categoria_producto (soft delete)
 // ------------------------------------------------------------------------------------
-router.delete('/categorias_productos', async (req, res) => {
+router.delete('/categorias_productos', checkPermission(CATEGORIAS_PRODUCTOS_STATE_PERMISSIONS), async (req, res) => {
   try {
     const { columna_id, valor_id } = req.body || {};
 
