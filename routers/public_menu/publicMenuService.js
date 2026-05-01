@@ -2,6 +2,7 @@
 import {
   PUBLIC_ITEM_TYPES,
   fetchActiveMenuByBranchQuery,
+  fetchBranchOperationalSnapshotQuery,
   fetchAllowedSauceRowsByRecipeIdsQuery,
   fetchCatalogItemByIdQuery,
   fetchCatalogRowsByMenuQuery,
@@ -14,6 +15,7 @@ import {
   insertPublicPedidoDetalleQuery,
   insertPublicPedidoQuery
 } from './publicMenuQueries.js';
+import { buildAbsolutePublicUrl } from '../../utils/uploads.js';
 
 // Tabla de mensajes legibles para no exponer codigos internos al frontend.
 const AVAILABILITY_REASON_LABEL = Object.freeze({
@@ -169,12 +171,120 @@ const calculateRequiredSaucesForQuantity = (components, quantity = 1) => (
 // Normaliza booleans provenientes de PG.
 const toBoolean = (value) => value === true || value === 'true' || value === 1 || value === '1';
 
+const pad2 = (value) => String(value).padStart(2, '0');
+const buildIsoDateLocal = (date) =>
+  `${date.getFullYear()}-${pad2(date.getMonth() + 1)}-${pad2(date.getDate())}`;
+const toDiaSemana = (date) => {
+  const jsDay = date.getDay(); // 0 domingo ... 6 sabado
+  return jsDay === 0 ? 7 : jsDay; // 1 lunes ... 7 domingo
+};
+const normalizeTimeLabel = (value) => {
+  const raw = String(value || '').trim();
+  if (!raw) return '';
+  return raw.length >= 5 ? raw.slice(0, 5) : raw;
+};
+
+const isWithinWindow = ({ now, startHHMM, endHHMM }) => {
+  if (!startHHMM || !endHHMM) return false;
+  const [startHour, startMinute] = startHHMM.split(':').map((part) => Number(part));
+  const [endHour, endMinute] = endHHMM.split(':').map((part) => Number(part));
+  if (!Number.isFinite(startHour) || !Number.isFinite(startMinute) || !Number.isFinite(endHour) || !Number.isFinite(endMinute)) {
+    return false;
+  }
+  const nowMinutes = now.getHours() * 60 + now.getMinutes();
+  const startMinutes = startHour * 60 + startMinute;
+  const endMinutes = endHour * 60 + endMinute;
+  return nowMinutes >= startMinutes && nowMinutes < endMinutes;
+};
+
+const resolveBranchOperationalStatus = ({ row, snapshot, now }) => {
+  const fallback = {
+    isOpen: toBoolean(row?.estado),
+    schedule: 'Horario no disponible',
+    statusLabel: toBoolean(row?.estado) ? 'Abierta' : 'Cerrada',
+    estadoOperativo: toBoolean(row?.estado) ? 'ABIERTA' : 'CERRADA'
+  };
+
+  if (!snapshot) return fallback;
+
+  if (snapshot?.fecha_especial) {
+    if (toBoolean(snapshot.fe_cerrado)) {
+      return {
+        isOpen: false,
+        schedule: 'Cerrado hoy',
+        statusLabel: 'Cerrada',
+        estadoOperativo: 'CERRADA_ESPECIAL'
+      };
+    }
+    const start = normalizeTimeLabel(snapshot.fe_hora_inicio);
+    const end = normalizeTimeLabel(snapshot.fe_hora_final);
+    if (!start || !end) {
+      return {
+        isOpen: false,
+        schedule: 'Horario especial no disponible',
+        statusLabel: 'Cerrada',
+        estadoOperativo: 'SIN_HORARIO_ESPECIAL'
+      };
+    }
+    const isOpen = isWithinWindow({ now, startHHMM: start, endHHMM: end });
+    return {
+      isOpen,
+      schedule: `Horario especial: ${start} - ${end}`,
+      statusLabel: isOpen ? 'Abierta' : 'Cerrada',
+      estadoOperativo: isOpen ? 'ABIERTA_ESPECIAL' : 'CERRADA_ESPECIAL'
+    };
+  }
+
+  if (!toBoolean(snapshot?.sh_estado)) {
+    return {
+      isOpen: false,
+      schedule: 'Horario no disponible',
+      statusLabel: 'Cerrada',
+      estadoOperativo: 'SIN_HORARIO'
+    };
+  }
+
+  if (toBoolean(snapshot?.sh_cerrado)) {
+    return {
+      isOpen: false,
+      schedule: 'Cerrado hoy',
+      statusLabel: 'Cerrada',
+      estadoOperativo: 'CERRADA'
+    };
+  }
+
+  const start = normalizeTimeLabel(snapshot.sh_hora_inicio);
+  const end = normalizeTimeLabel(snapshot.sh_hora_final);
+  if (!start || !end) {
+    return {
+      isOpen: false,
+      schedule: 'Horario no disponible',
+      statusLabel: 'Cerrada',
+      estadoOperativo: 'SIN_HORARIO'
+    };
+  }
+
+  const isOpen = isWithinWindow({ now, startHHMM: start, endHHMM: end });
+  return {
+    isOpen,
+    schedule: `${start} - ${end}`,
+    statusLabel: isOpen ? 'Abierta' : 'Cerrada',
+    estadoOperativo: isOpen ? 'ABIERTA' : 'CERRADA'
+  };
+};
+
 // Convierte filas de sucursales al contrato publico.
-const mapBranch = (row) => ({
+const mapBranch = (row, operationalStatus) => ({
   id: Number(row.id_sucursal),
   name: row.nombre_sucursal,
   address: row.direccion || 'Direccion no disponible',
-  isOpen: toBoolean(row.estado)
+  estado: toBoolean(row.estado),
+  id_archivo_imagen: Number(row?.id_archivo_imagen || 0) || null,
+  url_imagen: buildAbsolutePublicUrl(null, row?.url_imagen || null),
+  isOpen: operationalStatus.isOpen,
+  horario: operationalStatus.schedule,
+  status_label: operationalStatus.statusLabel,
+  estado_operativo: operationalStatus.estadoOperativo
 });
 
 const normalizeExtraOption = (option) => ({
@@ -750,7 +860,30 @@ const validateAndResolveLineConfiguration = ({ catalog, line }) => {
 // Servicio: listar sucursales publicas.
 export const getPublicBranchesService = async () => {
   const rows = await fetchPublicBranchesQuery();
-  return rows.map(mapBranch);
+  const branchIds = rows
+    .map((row) => Number(row?.id_sucursal || 0))
+    .filter((value) => Number.isInteger(value) && value > 0);
+
+  if (branchIds.length === 0) return [];
+
+  const now = new Date();
+  const snapshotRows = await fetchBranchOperationalSnapshotQuery({
+    branchIds,
+    diaSemana: toDiaSemana(now),
+    fechaISO: buildIsoDateLocal(now)
+  });
+  const snapshotByBranchId = new Map(
+    snapshotRows.map((row) => [Number(row?.id_sucursal || 0), row])
+  );
+
+  return rows.map((row) => {
+    const status = resolveBranchOperationalStatus({
+      row,
+      snapshot: snapshotByBranchId.get(Number(row?.id_sucursal || 0)),
+      now
+    });
+    return mapBranch(row, status);
+  });
 };
 
 // Servicio: obtener menu vigente por sucursal.
