@@ -40,7 +40,8 @@ const CLIENTE_ATOMIC_ALLOWED_FIELDS = new Set([
   'id_empresa',
   'id_sucursal',
   'estado',
-  'origen'
+  'origen',
+  'strict_base_create'
 ]);
 const TIPO_CLIENTE_LABEL_CANDIDATES = ['tipo_cliente', 'descripcion', 'nombre'];
 let tipoClienteLabelColumnCache = null;
@@ -347,6 +348,18 @@ const asyncHandler = (handler) => async (req, res) => {
 
     const mapped = mapDbError(err);
     if (mapped) {
+      if (mapped.status >= 500) {
+        console.error('Personas atomic mapped DB error:', {
+          status: mapped.status,
+          mappedCode: mapped.code,
+          mappedMessage: mapped.message,
+          dbCode: err?.code,
+          dbMessage: err?.message,
+          dbDetail: err?.detail,
+          dbHint: err?.hint,
+          dbWhere: err?.where
+        });
+      }
       return res.status(mapped.status).json(
         buildErrorBody({ code: mapped.code, message: mapped.message })
       );
@@ -689,6 +702,95 @@ const findReusableClienteAtomic = async (client, { idPersona = null, idEmpresaCl
   return null;
 };
 
+const findExistingPersonaByDni = async (client, { dni, tenantId = null } = {}) => {
+  const normalizedDni = toTrimmedText(dni);
+  if (!normalizedDni) return null;
+
+  const tenantScope = parsePositiveInt(tenantId);
+  let row = null;
+
+  // Intento con alcance por tenant cuando el esquema lo soporta.
+  if (tenantScope) {
+    try {
+      const tenantScopedRs = await client.query(
+        `
+          SELECT
+            p.id_persona,
+            p.nombre,
+            p.apellido,
+            p.dni
+          FROM public.personas p
+          WHERE LOWER(TRIM(COALESCE(p.dni::TEXT, ''))) = LOWER(TRIM($1::TEXT))
+            AND p.id_empresa = $2
+          ORDER BY p.id_persona ASC
+          LIMIT 1
+        `,
+        [normalizedDni, tenantScope]
+      );
+      row = tenantScopedRs.rows?.[0] || null;
+    } catch (error) {
+      // Compatibilidad: algunas instalaciones legacy no tienen personas.id_empresa.
+      if (String(error?.code || '') !== '42703') throw error;
+    }
+  }
+
+  // Fallback sin filtro de tenant para no romper el flujo atomico en esquemas legacy.
+  if (!row) {
+    const genericRs = await client.query(
+      `
+        SELECT
+          p.id_persona,
+          p.nombre,
+          p.apellido,
+          p.dni
+        FROM public.personas p
+        WHERE LOWER(TRIM(COALESCE(p.dni::TEXT, ''))) = LOWER(TRIM($1::TEXT))
+        ORDER BY p.id_persona ASC
+        LIMIT 1
+      `,
+      [normalizedDni]
+    );
+    row = genericRs.rows?.[0] || null;
+  }
+
+  if (!row) return null;
+  return {
+    id_persona: parsePositiveInt(row.id_persona),
+    nombre: toTrimmedText(row.nombre),
+    apellido: toTrimmedText(row.apellido),
+    dni: toTrimmedText(row.dni)
+  };
+};
+
+const findExistingEmpresaByRtn = async (client, { rtn, tenantId = null } = {}) => {
+  const normalizedRtn = toTrimmedText(rtn);
+  if (!normalizedRtn) return null;
+
+  const tenantScope = parsePositiveInt(tenantId);
+  const rs = await client.query(
+    `
+      SELECT
+        e.id_empresa,
+        e.nombre_empresa,
+        e.rtn
+      FROM public.empresas e
+      WHERE LOWER(TRIM(COALESCE(e.rtn::TEXT, ''))) = LOWER(TRIM($1::TEXT))
+        AND ($2::int IS NULL OR e.id_empresa = $2)
+      ORDER BY e.id_empresa ASC
+      LIMIT 1
+    `,
+    [normalizedRtn, tenantScope]
+  );
+
+  const row = rs.rows?.[0];
+  if (!row) return null;
+  return {
+    id_empresa: parsePositiveInt(row.id_empresa),
+    nombre_empresa: toTrimmedText(row.nombre_empresa),
+    rtn: toTrimmedText(row.rtn)
+  };
+};
+
 const atomicService = {
   async createEmpleado(req) {
     const body = isPlainObject(req.body) ? req.body : {};
@@ -844,6 +946,9 @@ const atomicService = {
 
     const origenRaw = String(body.origen ?? clientePayload.origen ?? '').trim().toLowerCase();
     const origen = origenRaw === 'empresa' ? 'empresa' : origenRaw === 'persona' ? 'persona' : null;
+    const strictBaseCreateRaw = body.strict_base_create ?? clientePayload.strict_base_create;
+    const hasStrictBaseCreate = strictBaseCreateRaw !== undefined && strictBaseCreateRaw !== null && strictBaseCreateRaw !== '';
+    const strictBaseCreate = hasStrictBaseCreate ? parseBooleanValue(strictBaseCreateRaw) : false;
 
     if (!origen) {
       return {
@@ -851,6 +956,15 @@ const atomicService = {
         body: buildErrorBody({
           code: 'VALIDATION_ERROR',
           message: 'origen debe ser "persona" o "empresa".'
+        })
+      };
+    }
+    if (hasStrictBaseCreate && strictBaseCreate === null) {
+      return {
+        status: 400,
+        body: buildErrorBody({
+          code: 'VALIDATION_ERROR',
+          message: 'strict_base_create debe ser booleano.'
         })
       };
     }
@@ -879,15 +993,80 @@ const atomicService = {
       let idEmpresa = parsePositiveInt(
         body.id_empresa_cliente ?? clientePayload.id_empresa_cliente ?? body.id_empresa ?? clientePayload.id_empresa
       );
+      const personaPayload = isPlainObject(body.persona) ? body.persona : null;
+      const empresaPayload = isPlainObject(body.empresa) ? body.empresa : null;
       let personaCreada = false;
       let empresaCreada = false;
+
+      if (strictBaseCreate === true && !idPersona && origen === 'persona') {
+        const duplicatePersona = await findExistingPersonaByDni(client, {
+          dni: personaPayload?.dni,
+          tenantId: resolvedTenantId
+        });
+
+        if (duplicatePersona?.id_persona) {
+          await client.query('ROLLBACK');
+          const nombreCompleto = [duplicatePersona.nombre, duplicatePersona.apellido]
+            .map((item) => String(item || '').trim())
+            .filter(Boolean)
+            .join(' ');
+          return {
+            status: 409,
+            body: buildErrorBody({
+              code: 'DUPLICATE_BASE',
+              message: 'Ya existe una persona con ese DNI. Puedes vincular el registro existente.',
+              details: {
+                origen: 'persona',
+                suggested_relation: {
+                  id_persona: duplicatePersona.id_persona
+                },
+                base: {
+                  id_persona: duplicatePersona.id_persona,
+                  nombre_completo: nombreCompleto || null,
+                  dni: duplicatePersona.dni || null
+                }
+              }
+            })
+          };
+        }
+      }
+
+      if (strictBaseCreate === true && !idEmpresa && origen === 'empresa') {
+        const duplicateEmpresa = await findExistingEmpresaByRtn(client, {
+          rtn: empresaPayload?.rtn,
+          tenantId: resolvedTenantId
+        });
+
+        if (duplicateEmpresa?.id_empresa) {
+          await client.query('ROLLBACK');
+          return {
+            status: 409,
+            body: buildErrorBody({
+              code: 'DUPLICATE_BASE',
+              message: 'Ya existe una empresa con ese RTN. Puedes vincular el registro existente.',
+              details: {
+                origen: 'empresa',
+                suggested_relation: {
+                  id_empresa: duplicateEmpresa.id_empresa,
+                  id_empresa_cliente: duplicateEmpresa.id_empresa
+                },
+                base: {
+                  id_empresa: duplicateEmpresa.id_empresa,
+                  nombre_empresa: duplicateEmpresa.nombre_empresa || null,
+                  rtn: duplicateEmpresa.rtn || null
+                }
+              }
+            })
+          };
+        }
+      }
 
       if (origen === 'empresa') {
         const empresaResult = await resolveOrCreateEmpresa({
           client,
           req: requestWithTenant,
           idEmpresa,
-          empresaPayload: body.empresa,
+          empresaPayload,
           allowClientesContext: true
         });
         idEmpresa = empresaResult.idEmpresa;
@@ -898,7 +1077,7 @@ const atomicService = {
           client,
           req: requestWithTenant,
           idPersona,
-          personaPayload: body.persona,
+          personaPayload,
           allowClientesContext: true
         });
         idPersona = personaResult.idPersona;
@@ -932,11 +1111,6 @@ const atomicService = {
 
       const payloadSucursalId = parsePositiveInt(normalizedCliente.id_sucursal);
       const effectiveSucursalId = payloadSucursalId || userSucursalId || null;
-      if (!effectiveSucursalId) {
-        const error = new Error('No se pudo resolver la sucursal del cliente. Selecciona una sucursal valida.');
-        error.httpStatus = 400;
-        throw error;
-      }
       if (effectiveSucursalId) {
         normalizedCliente = {
           ...normalizedCliente,
@@ -1139,6 +1313,8 @@ const atomicService = {
 };
 
 router.post('/empleados/atomico', checkPermission(EMPLEADOS_CREATE_PERMISSIONS), asyncHandler(atomicService.createEmpleado));
+router.post('/empleados/full-create', checkPermission(EMPLEADOS_CREATE_PERMISSIONS), asyncHandler(atomicService.createEmpleado));
 router.post('/clientes/atomico', checkPermission(CLIENTES_CREATE_PERMISSIONS), asyncHandler(atomicService.createCliente));
+router.post('/clientes/full-create', checkPermission(CLIENTES_CREATE_PERMISSIONS), asyncHandler(atomicService.createCliente));
 
 export default router;

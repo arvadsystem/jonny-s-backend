@@ -518,7 +518,7 @@ const v2MapUsuarioRow = (row) => {
     row.nombre_completo
       || row.nombre_completo_empleado
       || row.nombre_completo_cliente
-  );
+  ) || v2NormalizeText(row.nombre_usuario) || `Usuario ${row.id_usuario ?? ''}`.trim();
 
   const empleado = {
     id_empleado: row.id_empleado ?? null,
@@ -532,7 +532,7 @@ const v2MapUsuarioRow = (row) => {
 
   const cliente = {
     id_cliente: row.id_cliente ?? null,
-    nombre_completo: v2NormalizeText(row.nombre_completo_cliente),
+    nombre_completo: v2NormalizeText(row.nombre_completo_cliente) || v2NormalizeText(row.nombre_empresa_cliente),
     dni: row.dni_cliente ?? null,
     telefono: row.telefono_cliente ?? null,
     correo: row.correo_cliente ?? null,
@@ -588,10 +588,16 @@ const v2FetchUsuarioById = async (idUsuario, queryRunner = pool) => {
       e.id_empleado,
       cl.id_cliente,
       TRIM(CONCAT(COALESCE(pe.nombre, ''), ' ', COALESCE(pe.apellido, ''))) AS nombre_completo_empleado,
-      TRIM(CONCAT(COALESCE(pc.nombre, ''), ' ', COALESCE(pc.apellido, ''))) AS nombre_completo_cliente,
       COALESCE(
-        TRIM(CONCAT(COALESCE(pe.nombre, ''), ' ', COALESCE(pe.apellido, ''))),
-        TRIM(CONCAT(COALESCE(pc.nombre, ''), ' ', COALESCE(pc.apellido, '')))
+        NULLIF(TRIM(CONCAT(COALESCE(pc.nombre, ''), ' ', COALESCE(pc.apellido, ''))), ''),
+        NULLIF(TRIM(COALESCE(ec.nombre_empresa, '')), '')
+      ) AS nombre_completo_cliente,
+      ec.nombre_empresa AS nombre_empresa_cliente,
+      COALESCE(
+        NULLIF(TRIM(CONCAT(COALESCE(pe.nombre, ''), ' ', COALESCE(pe.apellido, ''))), ''),
+        NULLIF(TRIM(CONCAT(COALESCE(pc.nombre, ''), ' ', COALESCE(pc.apellido, ''))), ''),
+        NULLIF(TRIM(COALESCE(ec.nombre_empresa, '')), ''),
+        NULLIF(TRIM(COALESCE(u.nombre_usuario, '')), '')
       ) AS nombre_completo,
       pe.dni AS dni_empleado,
       pc.dni AS dni_cliente,
@@ -610,6 +616,7 @@ const v2FetchUsuarioById = async (idUsuario, queryRunner = pool) => {
     LEFT JOIN correos ce ON ce.id_correo = pe.id_correo
     LEFT JOIN clientes cl ON cl.id_cliente = u.id_cliente
     LEFT JOIN personas pc ON pc.id_persona = cl.id_persona
+    LEFT JOIN empresas ec ON ec.id_empresa = cl.id_empresa
     LEFT JOIN telefonos tc ON tc.id_telefono = pc.id_telefono
     LEFT JOIN correos cc ON cc.id_correo = pc.id_correo
     LEFT JOIN sucursales s ON s.id_sucursal = e.id_sucursal
@@ -865,6 +872,7 @@ router.get('/usuarios/v2/list', checkPermission(USUARIOS_LIST_PERMISSIONS), asyn
         OR COALESCE(pc.dni::text, '') ILIKE $${params.length}
         OR COALESCE(tc.telefono, '') ILIKE $${params.length}
         OR COALESCE(cc.direccion_correo, '') ILIKE $${params.length}
+        OR COALESCE(ec.nombre_empresa, '') ILIKE $${params.length}
         OR COALESCE(s.nombre_sucursal, '') ILIKE $${params.length}
         OR COALESCE(roles_info.roles_nombres, '') ILIKE $${params.length}
       )`);
@@ -881,6 +889,7 @@ router.get('/usuarios/v2/list', checkPermission(USUARIOS_LIST_PERMISSIONS), asyn
       LEFT JOIN correos ce ON ce.id_correo = pe.id_correo
       LEFT JOIN clientes cl ON cl.id_cliente = u.id_cliente
       LEFT JOIN personas pc ON pc.id_persona = cl.id_persona
+      LEFT JOIN empresas ec ON ec.id_empresa = cl.id_empresa
       LEFT JOIN telefonos tc ON tc.id_telefono = pc.id_telefono
       LEFT JOIN correos cc ON cc.id_correo = pc.id_correo
       LEFT JOIN sucursales s ON s.id_sucursal = e.id_sucursal
@@ -904,10 +913,16 @@ router.get('/usuarios/v2/list', checkPermission(USUARIOS_LIST_PERMISSIONS), asyn
         e.id_empleado,
         cl.id_cliente,
         TRIM(CONCAT(COALESCE(pe.nombre, ''), ' ', COALESCE(pe.apellido, ''))) AS nombre_completo_empleado,
-        TRIM(CONCAT(COALESCE(pc.nombre, ''), ' ', COALESCE(pc.apellido, ''))) AS nombre_completo_cliente,
         COALESCE(
-          TRIM(CONCAT(COALESCE(pe.nombre, ''), ' ', COALESCE(pe.apellido, ''))),
-          TRIM(CONCAT(COALESCE(pc.nombre, ''), ' ', COALESCE(pc.apellido, '')))
+          NULLIF(TRIM(CONCAT(COALESCE(pc.nombre, ''), ' ', COALESCE(pc.apellido, ''))), ''),
+          NULLIF(TRIM(COALESCE(ec.nombre_empresa, '')), '')
+        ) AS nombre_completo_cliente,
+        ec.nombre_empresa AS nombre_empresa_cliente,
+        COALESCE(
+          NULLIF(TRIM(CONCAT(COALESCE(pe.nombre, ''), ' ', COALESCE(pe.apellido, ''))), ''),
+          NULLIF(TRIM(CONCAT(COALESCE(pc.nombre, ''), ' ', COALESCE(pc.apellido, ''))), ''),
+          NULLIF(TRIM(COALESCE(ec.nombre_empresa, '')), ''),
+          NULLIF(TRIM(COALESCE(u.nombre_usuario, '')), '')
         ) AS nombre_completo,
         pe.dni AS dni_empleado,
         pc.dni AS dni_cliente,
@@ -926,6 +941,7 @@ router.get('/usuarios/v2/list', checkPermission(USUARIOS_LIST_PERMISSIONS), asyn
       LEFT JOIN correos ce ON ce.id_correo = pe.id_correo
       LEFT JOIN clientes cl ON cl.id_cliente = u.id_cliente
       LEFT JOIN personas pc ON pc.id_persona = cl.id_persona
+      LEFT JOIN empresas ec ON ec.id_empresa = cl.id_empresa
       LEFT JOIN telefonos tc ON tc.id_telefono = pc.id_telefono
       LEFT JOIN correos cc ON cc.id_correo = pc.id_correo
       LEFT JOIN sucursales s ON s.id_sucursal = e.id_sucursal
