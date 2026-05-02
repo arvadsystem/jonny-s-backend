@@ -5,7 +5,7 @@ import { validarYDescontarPedido } from '../services/inventarioPedidoService.js'
 import { checkPermission } from '../middleware/checkPermission.js';
 
 const router = express.Router();
-const INSUMOS_LIST_PERMISSIONS = ['INVENTARIO_INSUMOS_VER'];
+const INSUMOS_LIST_PERMISSIONS = ['INVENTARIO_INSUMOS_VER', 'INVENTARIO_INSUMOS_DETALLE_VER'];
 const INSUMOS_CREATE_PERMISSIONS = ['INVENTARIO_INSUMOS_CREAR'];
 const INSUMOS_EDIT_PERMISSIONS = ['INVENTARIO_INSUMOS_EDITAR'];
 const INSUMOS_STATE_PERMISSIONS = ['INVENTARIO_INSUMOS_ESTADO_CAMBIAR'];
@@ -226,7 +226,7 @@ const getInsumosConstraintConflictMessage = (err) => {
 // POR QUE ESTA AQUI:
 // - Este router ya es el punto de entrada natural del modulo INSUMOS.
 // - Se evita tocar VENTAS y otros dominios en esta etapa.
-router.post('/inventario/descontar-por-pedido', async (req, res) => {
+router.post('/inventario/descontar-por-pedido', checkPermission(INSUMOS_EDIT_PERMISSIONS), async (req, res) => {
   try {
     const result = await validarYDescontarPedido(req.body || {}, {
       id_usuario: req?.user?.id_usuario
