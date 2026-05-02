@@ -118,7 +118,8 @@ const parseFilters = (query = {}) => {
       id_sucursal: idSucursal,
       id_caja: idCaja,
       id_usuario: idUsuario,
-      estado: filters.estado || null
+      estado: filters.estado || null,
+      metodo_pago: filters.metodo_pago || null
     }
   };
 };
@@ -137,7 +138,7 @@ const sendPhaseOnePayload = (res, reportKey, filters) => {
   });
 };
 
-const buildVentasResumenWhere = ({ parsedFilters, scope, params }) => {
+const buildVentasScopeWhere = ({ parsedFilters, scope, params }) => {
   const where = [];
 
   if (parsedFilters.fecha_inicio) {
@@ -192,7 +193,7 @@ const getVentasResumen = async (req, res, filters, parsedFilters) => {
   const scope = await resolveRequestUserSucursalScope(req);
   const params = [];
 
-  const built = buildVentasResumenWhere({ parsedFilters, scope, params });
+  const built = buildVentasScopeWhere({ parsedFilters, scope, params });
   if (built.forbidden) {
     return res.status(403).json({ error: true, message: 'No tiene sucursales asignadas para consultar este reporte.' });
   }
@@ -304,6 +305,145 @@ const getVentasResumen = async (req, res, filters, parsedFilters) => {
   });
 };
 
+const getVentasMetodosPago = async (req, res, filters, parsedFilters) => {
+  const scope = await resolveRequestUserSucursalScope(req);
+  const params = [];
+  const built = buildVentasScopeWhere({ parsedFilters, scope, params });
+
+  if (built.forbidden) {
+    return res.status(403).json({ error: true, message: 'No tiene sucursales asignadas para consultar este reporte.' });
+  }
+
+  if (parsedFilters.metodo_pago) {
+    params.push(`%${parsedFilters.metodo_pago}%`);
+    built.whereClause = built.whereClause
+      ? `${built.whereClause} AND (cmp.nombre ILIKE $${params.length} OR cmp.codigo ILIKE $${params.length})`
+      : `WHERE (cmp.nombre ILIKE $${params.length} OR cmp.codigo ILIKE $${params.length})`;
+  }
+
+  const query = `
+    WITH cobros_base AS (
+      SELECT
+        f.id_factura,
+        COALESCE(p.fecha_hora_pedido, f.fecha_hora_facturacion)::date AS fecha,
+        COALESCE(p.id_sucursal, f.id_sucursal) AS id_sucursal,
+        COALESCE(p.id_usuario, f.id_usuario) AS id_usuario,
+        f.id_caja,
+        COALESCE(ep.descripcion, 'VENTA DIRECTA') AS estado_pedido,
+        cmp.id_metodo_pago,
+        cmp.codigo AS metodo_pago_codigo,
+        cmp.nombre AS metodo_pago_nombre,
+        COALESCE(fc.monto, 0)::numeric(14,2) AS monto
+      FROM facturas f
+      INNER JOIN facturas_cobros fc ON fc.id_factura = f.id_factura
+      INNER JOIN cat_metodos_pago cmp ON cmp.id_metodo_pago = fc.id_metodo_pago
+      LEFT JOIN pedidos p ON p.id_pedido = f.id_pedido
+      LEFT JOIN estados_pedido ep ON ep.id_estado_pedido = p.id_estado_pedido
+      ${built.whereClause}
+    )
+    SELECT * FROM cobros_base
+    ORDER BY fecha ASC, id_factura ASC, metodo_pago_nombre ASC
+  `;
+
+  const result = await pool.query(query, params);
+  const rows = Array.isArray(result.rows) ? result.rows : [];
+
+  const byMethod = new Map();
+  const byDayMethod = new Map();
+  let totalGeneral = 0;
+
+  rows.forEach((row) => {
+    const methodKey = String(row.metodo_pago_codigo || row.metodo_pago_nombre || row.id_metodo_pago);
+    const methodName = String(row.metodo_pago_nombre || 'Sin metodo');
+    const monto = Number(row.monto || 0);
+    const facturaId = Number(row.id_factura || 0);
+    const fecha = String(row.fecha || '');
+
+    totalGeneral += monto;
+
+    if (!byMethod.has(methodKey)) {
+      byMethod.set(methodKey, {
+        metodo_pago: methodName,
+        metodo_pago_codigo: String(row.metodo_pago_codigo || ''),
+        cantidad_ventas: 0,
+        total_vendido: 0,
+        _facturas: new Set()
+      });
+    }
+
+    const bucket = byMethod.get(methodKey);
+    bucket.total_vendido += monto;
+    if (facturaId > 0) bucket._facturas.add(facturaId);
+
+    const dayMethodKey = `${fecha}__${methodKey}`;
+    if (!byDayMethod.has(dayMethodKey)) {
+      byDayMethod.set(dayMethodKey, {
+        fecha,
+        metodo_pago: methodName,
+        metodo_pago_codigo: String(row.metodo_pago_codigo || ''),
+        cantidad_ventas: 0,
+        total_vendido: 0,
+        _facturas: new Set()
+      });
+    }
+    const dayBucket = byDayMethod.get(dayMethodKey);
+    dayBucket.total_vendido += monto;
+    if (facturaId > 0) dayBucket._facturas.add(facturaId);
+  });
+
+  const resumenMetodos = [...byMethod.values()]
+    .map((item) => {
+      const cantidadVentas = item._facturas.size;
+      const totalVendido = roundMoney(item.total_vendido);
+      const porcentaje = totalGeneral > 0 ? roundMoney((item.total_vendido / totalGeneral) * 100) : 0;
+      const ticketPromedio = cantidadVentas > 0 ? roundMoney(item.total_vendido / cantidadVentas) : 0;
+      return {
+        metodo_pago: item.metodo_pago,
+        metodo_pago_codigo: item.metodo_pago_codigo,
+        cantidad_ventas: cantidadVentas,
+        total_vendido: totalVendido,
+        porcentaje_sobre_total: porcentaje,
+        ticket_promedio: ticketPromedio
+      };
+    })
+    .sort((a, b) => b.total_vendido - a.total_vendido);
+
+  const serieDiariaMetodo = [...byDayMethod.values()]
+    .map((item) => ({
+      fecha: item.fecha,
+      metodo_pago: item.metodo_pago,
+      metodo_pago_codigo: item.metodo_pago_codigo,
+      cantidad_ventas: item._facturas.size,
+      total_vendido: roundMoney(item.total_vendido)
+    }))
+    .sort((a, b) => {
+      if (a.fecha === b.fecha) return a.metodo_pago.localeCompare(b.metodo_pago, 'es', { sensitivity: 'base' });
+      return String(a.fecha).localeCompare(String(b.fecha));
+    });
+
+  const totalVentasUnicas = new Set(rows.map((row) => Number(row.id_factura || 0)).filter(Boolean)).size;
+
+  return res.json({
+    ok: true,
+    reporte: 'ventas_metodos_pago',
+    fase: 'fase_2b_real',
+    filtros: filters,
+    data: {
+      kpis: {
+        total_general: roundMoney(totalGeneral),
+        total_ventas: totalVentasUnicas,
+        metodos_activos: resumenMetodos.length
+      },
+      resumen_por_metodo: resumenMetodos,
+      serie_diaria_por_metodo: serieDiariaMetodo
+    },
+    meta: {
+      fuente_canonica: 'facturas + facturas_cobros + cat_metodos_pago (+ pedidos/estados_pedido para filtros)',
+      generado_en: new Date().toISOString()
+    }
+  });
+};
+
 router.use('/reportes', checkPermission(BASE_PERMISSION));
 
 Object.entries(REPORT_DEFINITIONS).forEach(([path, config]) => {
@@ -316,6 +456,9 @@ Object.entries(REPORT_DEFINITIONS).forEach(([path, config]) => {
 
       if (config.key === 'ventas_resumen') {
         return await getVentasResumen(req, res, parsed.filters, parsed.parsed);
+      }
+      if (config.key === 'ventas_metodos_pago') {
+        return await getVentasMetodosPago(req, res, parsed.filters, parsed.parsed);
       }
 
       return sendPhaseOnePayload(res, config.key, parsed.filters);
