@@ -122,8 +122,8 @@ const parseFilters = (query = {}) => {
   }
 
   const tipoItem = String(filters.tipo_item || '').trim().toLowerCase();
-  if (tipoItem && !['producto', 'insumo', 'todos'].includes(tipoItem)) {
-    return { ok: false, message: 'El filtro tipo_item solo permite: producto, insumo o todos.' };
+  if (tipoItem && !['producto', 'insumo', 'combo', 'receta', 'todos'].includes(tipoItem)) {
+    return { ok: false, message: 'El filtro tipo_item solo permite: producto, insumo, combo, receta o todos.' };
   }
 
   const soloCriticosRaw = String(filters.solo_criticos || '').trim().toLowerCase();
@@ -1241,6 +1241,301 @@ const getVentasDescuentos = async (req, res, filters, parsedFilters) => {
   });
 };
 
+const getVentasItems = async (req, res, filters, parsedFilters) => {
+  const scope = await resolveRequestUserSucursalScope(req);
+  const params = [];
+  const where = [];
+
+  const tipoItem = String(parsedFilters.tipo_item || 'todos').trim().toLowerCase();
+  if (!['producto', 'combo', 'receta', 'todos'].includes(tipoItem)) {
+    return res.status(400).json({
+      error: true,
+      message: 'El filtro tipo_item solo permite: producto, combo, receta o todos.'
+    });
+  }
+
+  if (parsedFilters.fecha_inicio) {
+    params.push(parsedFilters.fecha_inicio);
+    where.push(`base.fecha >= $${params.length}::date`);
+  }
+
+  if (parsedFilters.fecha_fin) {
+    params.push(parsedFilters.fecha_fin);
+    where.push(`base.fecha <= $${params.length}::date`);
+  }
+
+  if (parsedFilters.id_sucursal) {
+    params.push(parsedFilters.id_sucursal);
+    where.push(`base.id_sucursal = $${params.length}`);
+  } else if (!scope.isSuperAdmin) {
+    const allowed = Array.isArray(scope.allowedSucursalIds)
+      ? scope.allowedSucursalIds.map((value) => parsePositiveInt(value)).filter(Boolean)
+      : [];
+    if (allowed.length === 0) {
+      return res.status(403).json({ error: true, message: 'No tiene sucursales asignadas para consultar este reporte.' });
+    }
+    params.push(allowed);
+    where.push(`base.id_sucursal = ANY($${params.length}::int[])`);
+  }
+
+  if (parsedFilters.id_caja) {
+    params.push(parsedFilters.id_caja);
+    where.push(`base.id_caja = $${params.length}`);
+  }
+
+  if (parsedFilters.id_usuario) {
+    params.push(parsedFilters.id_usuario);
+    where.push(`base.id_usuario = $${params.length}`);
+  }
+
+  if (tipoItem !== 'todos') {
+    params.push(tipoItem.toUpperCase());
+    where.push(`base.tipo_item = $${params.length}`);
+  }
+
+  if (parsedFilters.estado) {
+    params.push(`%${parsedFilters.estado}%`);
+    where.push(`COALESCE(base.estado, 'VENTA DIRECTA') ILIKE $${params.length}`);
+  }
+
+  if (parsedFilters.item) {
+    const itemId = parsePositiveInt(parsedFilters.item);
+    if (itemId) {
+      params.push(itemId);
+      where.push(`base.id_item = $${params.length}`);
+    } else {
+      params.push(`%${parsedFilters.item}%`);
+      where.push(`COALESCE(base.nombre_item, '') ILIKE $${params.length}`);
+    }
+  }
+
+  if (parsedFilters.categoria) {
+    if (tipoItem === 'combo' || tipoItem === 'receta') {
+      return res.status(400).json({
+        error: true,
+        message: 'El filtro categoria solo aplica para tipo_item producto en este reporte.'
+      });
+    }
+    const categoriaId = parsePositiveInt(parsedFilters.categoria);
+    if (categoriaId) {
+      params.push(categoriaId);
+      where.push(`base.tipo_item = 'PRODUCTO' AND base.id_categoria_producto = $${params.length}`);
+    } else {
+      params.push(`%${parsedFilters.categoria}%`);
+      where.push(`base.tipo_item = 'PRODUCTO' AND COALESCE(base.categoria, '') ILIKE $${params.length}`);
+    }
+  }
+
+  const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
+
+  const query = `
+    WITH ventas_directas_items AS (
+      SELECT
+        COALESCE(p.fecha_hora_pedido, f.fecha_hora_facturacion)::date AS fecha,
+        COALESCE(p.id_sucursal, f.id_sucursal) AS id_sucursal,
+        COALESCE(s.nombre_sucursal, 'Sin sucursal') AS sucursal,
+        f.id_caja,
+        CASE
+          WHEN c.id_caja IS NULL THEN 'Sin caja'
+          WHEN COALESCE(c.codigo_caja, '') = '' THEN COALESCE(c.nombre_caja, 'Caja')
+          ELSE CONCAT(c.codigo_caja, ' - ', COALESCE(c.nombre_caja, 'Caja'))
+        END AS caja,
+        COALESCE(p.id_usuario, f.id_usuario) AS id_usuario,
+        COALESCE(u.nombre_usuario, 'Sin usuario') AS usuario,
+        f.id_factura,
+        COALESCE(df.id_pedido, f.id_pedido) AS id_pedido,
+        COALESCE(ep.descripcion, 'VENTA DIRECTA') AS estado,
+        'PRODUCTO'::text AS tipo_item,
+        prod.id_producto AS id_item,
+        COALESCE(prod.nombre_producto, CONCAT('Producto #', prod.id_producto)) AS nombre_item,
+        prod.id_categoria_producto,
+        cp.nombre_categoria AS categoria,
+        COALESCE(df.cantidad, 0)::numeric(14,2) AS cantidad,
+        COALESCE(df.sub_total, 0)::numeric(14,2) AS subtotal,
+        COALESCE(d.monto_descuento, 0)::numeric(14,2) AS descuento,
+        COALESCE(df.total_detalle, 0)::numeric(14,2) AS total
+      FROM facturas f
+      INNER JOIN detalle_facturas df ON df.id_factura = f.id_factura
+      INNER JOIN productos prod ON prod.id_producto = df.id_producto
+      LEFT JOIN categorias_productos cp ON cp.id_categoria_producto = prod.id_categoria_producto
+      LEFT JOIN descuentos d ON d.id_descuento = df.id_descuento
+      LEFT JOIN pedidos p ON p.id_pedido = COALESCE(df.id_pedido, f.id_pedido)
+      LEFT JOIN estados_pedido ep ON ep.id_estado_pedido = p.id_estado_pedido
+      LEFT JOIN sucursales s ON s.id_sucursal = COALESCE(p.id_sucursal, f.id_sucursal)
+      LEFT JOIN cajas c ON c.id_caja = f.id_caja
+      LEFT JOIN usuarios u ON u.id_usuario = COALESCE(p.id_usuario, f.id_usuario)
+    ),
+    ventas_pedido_items AS (
+      SELECT
+        COALESCE(p.fecha_hora_pedido, f.fecha_hora_facturacion)::date AS fecha,
+        COALESCE(p.id_sucursal, f.id_sucursal) AS id_sucursal,
+        COALESCE(s.nombre_sucursal, 'Sin sucursal') AS sucursal,
+        f.id_caja,
+        CASE
+          WHEN c.id_caja IS NULL THEN 'Sin caja'
+          WHEN COALESCE(c.codigo_caja, '') = '' THEN COALESCE(c.nombre_caja, 'Caja')
+          ELSE CONCAT(c.codigo_caja, ' - ', COALESCE(c.nombre_caja, 'Caja'))
+        END AS caja,
+        COALESCE(p.id_usuario, f.id_usuario) AS id_usuario,
+        COALESCE(u.nombre_usuario, 'Sin usuario') AS usuario,
+        f.id_factura,
+        p.id_pedido,
+        COALESCE(ep.descripcion, 'VENTA DIRECTA') AS estado,
+        CASE
+          WHEN dp.id_producto IS NOT NULL THEN 'PRODUCTO'
+          WHEN dp.id_combo IS NOT NULL THEN 'COMBO'
+          WHEN dp.id_receta IS NOT NULL THEN 'RECETA'
+          ELSE 'OTRO'
+        END AS tipo_item,
+        COALESCE(dp.id_producto, dp.id_combo, dp.id_receta) AS id_item,
+        COALESCE(prod.nombre_producto, cb.nombre_combo, rc.nombre_receta, 'Item') AS nombre_item,
+        prod.id_categoria_producto,
+        cp.nombre_categoria AS categoria,
+        COALESCE(
+          CASE
+            WHEN dp.id_producto IS NOT NULL THEN GREATEST(
+              1,
+              ROUND(
+                COALESCE(NULLIF(dp.sub_total_pedido, 0), dp.total_pedido, 0)
+                / NULLIF(prod.precio, 0)
+              )::int
+            )
+            WHEN dp.id_combo IS NOT NULL THEN GREATEST(
+              1,
+              ROUND(
+                COALESCE(NULLIF(dp.sub_total_pedido, 0), dp.total_pedido, 0)
+                / NULLIF(cb.precio, 0)
+              )::int
+            )
+            WHEN dp.id_receta IS NOT NULL THEN GREATEST(
+              1,
+              ROUND(
+                COALESCE(NULLIF(dp.sub_total_pedido, 0), dp.total_pedido, 0)
+                / NULLIF(rc.precio, 0)
+              )::int
+            )
+            ELSE 1
+          END,
+          1
+        )::numeric(14,2) AS cantidad,
+        COALESCE(dp.sub_total_pedido, 0)::numeric(14,2) AS subtotal,
+        COALESCE(d2.monto_descuento, 0)::numeric(14,2) AS descuento,
+        COALESCE(dp.total_pedido, 0)::numeric(14,2) AS total
+      FROM facturas f
+      INNER JOIN pedidos p ON p.id_pedido = f.id_pedido
+      INNER JOIN detalle_pedido dp ON dp.id_pedido = p.id_pedido
+      LEFT JOIN productos prod ON prod.id_producto = dp.id_producto
+      LEFT JOIN categorias_productos cp ON cp.id_categoria_producto = prod.id_categoria_producto
+      LEFT JOIN combos cb ON cb.id_combo = dp.id_combo
+      LEFT JOIN recetas rc ON rc.id_receta = dp.id_receta
+      LEFT JOIN descuentos d2 ON d2.id_descuento = dp.id_descuento
+      LEFT JOIN estados_pedido ep ON ep.id_estado_pedido = p.id_estado_pedido
+      LEFT JOIN sucursales s ON s.id_sucursal = COALESCE(p.id_sucursal, f.id_sucursal)
+      LEFT JOIN cajas c ON c.id_caja = f.id_caja
+      LEFT JOIN usuarios u ON u.id_usuario = COALESCE(p.id_usuario, f.id_usuario)
+    ),
+    base AS (
+      SELECT * FROM ventas_directas_items
+      UNION ALL
+      SELECT * FROM ventas_pedido_items
+    ),
+    filtrado AS (
+      SELECT *
+      FROM base
+      ${whereSql}
+    )
+    SELECT *
+    FROM filtrado
+    ORDER BY fecha DESC, id_factura DESC, tipo_item ASC, nombre_item ASC
+  `;
+
+  const result = await pool.query(query, params);
+  const rows = Array.isArray(result.rows) ? result.rows : [];
+
+  const totalVendido = rows.reduce((sum, row) => sum + Number(row.total || 0), 0);
+  const facturasUnicas = new Set(rows.map((row) => Number(row.id_factura || 0)).filter(Boolean));
+  const itemsUnicos = new Set(
+    rows
+      .filter((row) => row.id_item !== null && row.id_item !== undefined)
+      .map((row) => `${String(row.tipo_item || '').toUpperCase()}-${row.id_item}`)
+  );
+
+  const resumenMap = new Map();
+  rows.forEach((row) => {
+    const key = `${String(row.tipo_item || '').toUpperCase()}-${row.id_item || 'na'}`;
+    if (!resumenMap.has(key)) {
+      resumenMap.set(key, {
+        tipo_item: String(row.tipo_item || '').toUpperCase(),
+        id_item: row.id_item || null,
+        nombre_item: row.nombre_item || 'Item',
+        categoria: row.categoria || 'Sin categoría',
+        cantidad_vendida: 0,
+        subtotal: 0,
+        descuento: 0,
+        total: 0,
+        _facturas: new Set()
+      });
+    }
+    const bucket = resumenMap.get(key);
+    bucket.cantidad_vendida += Number(row.cantidad || 0);
+    bucket.subtotal += Number(row.subtotal || 0);
+    bucket.descuento += Number(row.descuento || 0);
+    bucket.total += Number(row.total || 0);
+    if (row.id_factura) bucket._facturas.add(Number(row.id_factura));
+  });
+
+  const resumenItems = [...resumenMap.values()]
+    .map((item) => ({
+      tipo_item: item.tipo_item,
+      id_item: item.id_item,
+      nombre_item: item.nombre_item,
+      categoria: item.categoria,
+      cantidad_vendida: Number(item.cantidad_vendida.toFixed(2)),
+      ventas: item._facturas.size,
+      subtotal: roundMoney(item.subtotal),
+      descuento: roundMoney(item.descuento),
+      total: roundMoney(item.total)
+    }))
+    .sort((a, b) => b.total - a.total);
+
+  return res.json({
+    ok: true,
+    reporte: 'ventas_items',
+    fase: 'fase_4b_real',
+    filtros: filters,
+    data: {
+      kpis: {
+        total_vendido: roundMoney(totalVendido),
+        ventas: facturasUnicas.size,
+        lineas: rows.length,
+        cantidad_items: itemsUnicos.size,
+        ticket_promedio: facturasUnicas.size > 0 ? roundMoney(totalVendido / facturasUnicas.size) : 0
+      },
+      resumen_items: resumenItems,
+      detalle: rows.map((row) => ({
+        fecha: row.fecha,
+        sucursal: row.sucursal,
+        caja: row.caja,
+        usuario: row.usuario,
+        factura: row.id_factura,
+        pedido: row.id_pedido,
+        tipo_item: row.tipo_item,
+        item: row.nombre_item,
+        categoria: row.categoria || 'Sin categoría',
+        cantidad: Number(Number(row.cantidad || 0).toFixed(2)),
+        subtotal: roundMoney(row.subtotal),
+        descuento: roundMoney(row.descuento),
+        total: roundMoney(row.total),
+        estado: row.estado || 'VENTA DIRECTA'
+      }))
+    },
+    meta: {
+      fuente_canonica: 'facturas + detalle_facturas + pedidos + detalle_pedido + productos + combos + recetas + categorias_productos',
+      generado_en: new Date().toISOString()
+    }
+  });
+};
+
 router.use('/reportes', checkPermission(BASE_PERMISSION));
 
 Object.entries(REPORT_DEFINITIONS).forEach(([path, config]) => {
@@ -1271,6 +1566,9 @@ Object.entries(REPORT_DEFINITIONS).forEach(([path, config]) => {
       }
       if (config.key === 'ventas_descuentos') {
         return await getVentasDescuentos(req, res, parsed.filters, parsed.parsed);
+      }
+      if (config.key === 'ventas_items') {
+        return await getVentasItems(req, res, parsed.filters, parsed.parsed);
       }
 
       return sendPhaseOnePayload(res, config.key, parsed.filters);
