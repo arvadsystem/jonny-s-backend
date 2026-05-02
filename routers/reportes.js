@@ -46,10 +46,13 @@ const FILTER_KEYS = Object.freeze([
   'fecha_inicio',
   'fecha_fin',
   'sucursal',
+  'almacen',
   'caja',
   'usuario',
   'metodo_pago',
   'tipo_diferencia',
+  'tipo_item',
+  'solo_criticos',
   'producto',
   'categoria',
   'estado',
@@ -105,9 +108,32 @@ const parseFilters = (query = {}) => {
     return { ok: false, message: 'El filtro caja debe ser un ID numerico valido.' };
   }
 
+  const idAlmacen = filters.almacen ? parsePositiveInt(filters.almacen) : null;
+  if (filters.almacen && !idAlmacen) {
+    return { ok: false, message: 'El filtro almacen debe ser un ID numerico valido.' };
+  }
+
   const idUsuario = filters.usuario ? parsePositiveInt(filters.usuario) : null;
   if (filters.usuario && !idUsuario) {
     return { ok: false, message: 'El filtro usuario debe ser un ID numerico valido.' };
+  }
+
+  const tipoItem = String(filters.tipo_item || '').trim().toLowerCase();
+  if (tipoItem && !['producto', 'insumo', 'todos'].includes(tipoItem)) {
+    return { ok: false, message: 'El filtro tipo_item solo permite: producto, insumo o todos.' };
+  }
+
+  const soloCriticosRaw = String(filters.solo_criticos || '').trim().toLowerCase();
+  const soloCriticos =
+    soloCriticosRaw === ''
+      ? null
+      : ['1', 'true', 'si', 'sí', 'yes'].includes(soloCriticosRaw)
+        ? true
+        : ['0', 'false', 'no'].includes(soloCriticosRaw)
+          ? false
+          : null;
+  if (soloCriticosRaw && soloCriticos === null) {
+    return { ok: false, message: 'El filtro solo_criticos debe ser true/false, 1/0 o si/no.' };
   }
 
   return {
@@ -117,11 +143,15 @@ const parseFilters = (query = {}) => {
       fecha_inicio: fechaInicio,
       fecha_fin: fechaFin,
       id_sucursal: idSucursal,
+      id_almacen: idAlmacen,
       id_caja: idCaja,
       id_usuario: idUsuario,
       estado: filters.estado || null,
       metodo_pago: filters.metodo_pago || null,
-      tipo_diferencia: filters.tipo_diferencia || null
+      tipo_diferencia: filters.tipo_diferencia || null,
+      tipo_item: tipoItem || null,
+      solo_criticos: soloCriticos,
+      categoria: filters.categoria || null
     }
   };
 };
@@ -714,6 +744,186 @@ const getCajaDiferencias = async (req, res, filters, parsedFilters) => {
   });
 };
 
+const getInventarioStockCritico = async (req, res, filters, parsedFilters) => {
+  const scope = await resolveRequestUserSucursalScope(req);
+  const params = [];
+  const where = [];
+  const tipoItem = parsedFilters.tipo_item || 'todos';
+
+  if (parsedFilters.id_sucursal) {
+    params.push(parsedFilters.id_sucursal);
+    where.push(`base.id_sucursal = $${params.length}`);
+  } else if (!scope.isSuperAdmin) {
+    const allowed = Array.isArray(scope.allowedSucursalIds)
+      ? scope.allowedSucursalIds.map((value) => parsePositiveInt(value)).filter(Boolean)
+      : [];
+    if (allowed.length === 0) {
+      return res.status(403).json({ error: true, message: 'No tiene sucursales asignadas para consultar este reporte.' });
+    }
+    params.push(allowed);
+    where.push(`base.id_sucursal = ANY($${params.length}::int[])`);
+  }
+
+  if (parsedFilters.id_almacen) {
+    params.push(parsedFilters.id_almacen);
+    where.push(`base.id_almacen = $${params.length}`);
+  }
+
+  if (parsedFilters.categoria) {
+    const categoriaId = parsePositiveInt(parsedFilters.categoria);
+    if (categoriaId) {
+      params.push(categoriaId);
+      where.push(`(
+        (base.tipo_item = 'PRODUCTO' AND base.id_categoria = $${params.length})
+        OR
+        (base.tipo_item = 'INSUMO' AND base.id_categoria = $${params.length})
+      )`);
+    } else {
+      params.push(`%${parsedFilters.categoria}%`);
+      where.push(`COALESCE(base.categoria, '') ILIKE $${params.length}`);
+    }
+  }
+
+  if (tipoItem === 'producto') where.push(`base.tipo_item = 'PRODUCTO'`);
+  if (tipoItem === 'insumo') where.push(`base.tipo_item = 'INSUMO'`);
+
+  if (parsedFilters.estado) {
+    const estadoFiltro = String(parsedFilters.estado).trim().toLowerCase();
+    if (['activo', 'activos'].includes(estadoFiltro)) where.push('base.estado_activo = true');
+    else if (['inactivo', 'inactivos'].includes(estadoFiltro)) where.push('base.estado_activo = false');
+  }
+
+  const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
+  const onlyCriticosSql = parsedFilters.solo_criticos === true
+    ? `WHERE estado_calculado IN ('AGOTADO', 'CRITICO', 'BAJO STOCK')`
+    : '';
+
+  const query = `
+    WITH productos_rel AS (
+      SELECT DISTINCT pa.id_producto, pa.id_almacen
+      FROM public.productos_almacenes pa
+      UNION
+      SELECT p.id_producto, p.id_almacen
+      FROM public.productos p
+      WHERE p.id_almacen IS NOT NULL
+    ),
+    insumos_rel AS (
+      SELECT DISTINCT ia.id_insumo, ia.id_almacen
+      FROM public.insumos_almacenes ia
+      UNION
+      SELECT i.id_insumo, i.id_almacen
+      FROM public.insumos i
+      WHERE i.id_almacen IS NOT NULL
+    ),
+    base AS (
+      SELECT
+        'PRODUCTO'::text AS tipo_item,
+        p.id_producto AS id_item,
+        p.nombre_producto AS nombre_item,
+        p.id_categoria_producto AS id_categoria,
+        cp.nombre_categoria AS categoria,
+        a.id_almacen,
+        a.nombre AS almacen,
+        a.id_sucursal,
+        s.nombre_sucursal AS sucursal,
+        COALESCE(p.cantidad, 0)::numeric(14,2) AS cantidad_actual,
+        COALESCE(p.stock_minimo, 0)::numeric(14,2) AS stock_minimo,
+        COALESCE(p.estado, true) AS estado_activo
+      FROM public.productos p
+      INNER JOIN productos_rel pr ON pr.id_producto = p.id_producto
+      LEFT JOIN public.almacenes a ON a.id_almacen = pr.id_almacen
+      LEFT JOIN public.sucursales s ON s.id_sucursal = a.id_sucursal
+      LEFT JOIN public.categorias_productos cp ON cp.id_categoria_producto = p.id_categoria_producto
+
+      UNION ALL
+
+      SELECT
+        'INSUMO'::text AS tipo_item,
+        i.id_insumo AS id_item,
+        i.nombre_insumo AS nombre_item,
+        i.id_categoria_insumo AS id_categoria,
+        ci.nombre_categoria AS categoria,
+        a.id_almacen,
+        a.nombre AS almacen,
+        a.id_sucursal,
+        s.nombre_sucursal AS sucursal,
+        COALESCE(i.cantidad, 0)::numeric(14,2) AS cantidad_actual,
+        COALESCE(i.stock_minimo, 0)::numeric(14,2) AS stock_minimo,
+        COALESCE(i.estado, true) AS estado_activo
+      FROM public.insumos i
+      INNER JOIN insumos_rel ir ON ir.id_insumo = i.id_insumo
+      LEFT JOIN public.almacenes a ON a.id_almacen = ir.id_almacen
+      LEFT JOIN public.sucursales s ON s.id_sucursal = a.id_sucursal
+      LEFT JOIN public.categorias_insumos ci ON ci.id_categoria_insumo = i.id_categoria_insumo
+    ),
+    filtrado AS (
+      SELECT
+        base.*,
+        (base.cantidad_actual - base.stock_minimo)::numeric(14,2) AS diferencia_minimo,
+        CASE
+          WHEN base.cantidad_actual <= 0 THEN 'AGOTADO'
+          WHEN base.cantidad_actual <= base.stock_minimo THEN 'CRITICO'
+          WHEN base.stock_minimo > 0 AND base.cantidad_actual <= (base.stock_minimo * 1.20) THEN 'BAJO STOCK'
+          ELSE 'NORMAL'
+        END AS estado_calculado
+      FROM base
+      ${whereSql}
+    )
+    SELECT *
+    FROM filtrado
+    ${onlyCriticosSql}
+    ORDER BY tipo_item ASC, estado_calculado ASC, nombre_item ASC
+  `;
+
+  const result = await pool.query(query, params);
+  const rows = Array.isArray(result.rows) ? result.rows : [];
+
+  const metrics = rows.reduce(
+    (acc, row) => {
+      const estado = String(row.estado_calculado || 'NORMAL');
+      if (estado === 'CRITICO' || estado === 'AGOTADO' || estado === 'BAJO STOCK') acc.criticos += 1;
+      if (estado === 'AGOTADO') acc.agotados += 1;
+      if (estado === 'BAJO STOCK') acc.bajoStock += 1;
+      if (estado === 'CRITICO' && row.tipo_item === 'PRODUCTO') acc.productosCriticos += 1;
+      if (estado === 'CRITICO' && row.tipo_item === 'INSUMO') acc.insumosCriticos += 1;
+      return acc;
+    },
+    { criticos: 0, agotados: 0, bajoStock: 0, productosCriticos: 0, insumosCriticos: 0 }
+  );
+
+  return res.json({
+    ok: true,
+    reporte: 'inventario_stock_critico',
+    fase: 'fase_3a_real',
+    filtros: filters,
+    data: {
+      kpis: {
+        total_items_revisados: rows.length,
+        total_criticos: metrics.criticos,
+        total_agotados: metrics.agotados,
+        total_stock_bajo: metrics.bajoStock,
+        productos_criticos: metrics.productosCriticos,
+        insumos_criticos: metrics.insumosCriticos
+      },
+      items: rows.map((row) => ({
+        tipo_item: row.tipo_item,
+        nombre: row.nombre_item,
+        categoria: row.categoria || 'Sin categoria',
+        almacen: row.almacen || 'Sin almacen',
+        sucursal: row.sucursal || 'Sin sucursal',
+        cantidad_actual: Number(row.cantidad_actual || 0),
+        stock_minimo: Number(row.stock_minimo || 0),
+        diferencia_minimo: Number(row.diferencia_minimo || 0),
+        estado: row.estado_calculado
+      }))
+    },
+    meta: {
+      fuente_canonica: 'productos + insumos + almacenes + sucursales + categorias + relaciones *_almacenes',
+      generado_en: new Date().toISOString()
+    }
+  });
+};
+
 router.use('/reportes', checkPermission(BASE_PERMISSION));
 
 Object.entries(REPORT_DEFINITIONS).forEach(([path, config]) => {
@@ -735,6 +945,9 @@ Object.entries(REPORT_DEFINITIONS).forEach(([path, config]) => {
       }
       if (config.key === 'caja_diferencias') {
         return await getCajaDiferencias(req, res, parsed.filters, parsed.parsed);
+      }
+      if (config.key === 'inventario_stock_critico') {
+        return await getInventarioStockCritico(req, res, parsed.filters, parsed.parsed);
       }
 
       return sendPhaseOnePayload(res, config.key, parsed.filters);
