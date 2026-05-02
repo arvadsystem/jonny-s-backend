@@ -53,6 +53,7 @@ const FILTER_KEYS = Object.freeze([
   'tipo_diferencia',
   'tipo_item',
   'solo_criticos',
+  'item',
   'producto',
   'categoria',
   'estado',
@@ -151,7 +152,9 @@ const parseFilters = (query = {}) => {
       tipo_diferencia: filters.tipo_diferencia || null,
       tipo_item: tipoItem || null,
       solo_criticos: soloCriticos,
-      categoria: filters.categoria || null
+      categoria: filters.categoria || null,
+      tipo_movimiento: filters.tipo_movimiento || null,
+      item: filters.item || null
     }
   };
 };
@@ -924,6 +927,145 @@ const getInventarioStockCritico = async (req, res, filters, parsedFilters) => {
   });
 };
 
+const getInventarioKardex = async (req, res, filters, parsedFilters) => {
+  if (parsedFilters.categoria) {
+    return res.status(400).json({
+      error: true,
+      message: 'El filtro categoria no aplica para Kardex en esta fase.'
+    });
+  }
+
+  const scope = await resolveRequestUserSucursalScope(req);
+  const params = [];
+  const where = [];
+
+  if (parsedFilters.fecha_inicio) {
+    params.push(parsedFilters.fecha_inicio);
+    where.push(`k.fecha_mov::date >= $${params.length}::date`);
+  }
+
+  if (parsedFilters.fecha_fin) {
+    params.push(parsedFilters.fecha_fin);
+    where.push(`k.fecha_mov::date <= $${params.length}::date`);
+  }
+
+  if (parsedFilters.id_sucursal) {
+    params.push(parsedFilters.id_sucursal);
+    where.push(`k.id_sucursal = $${params.length}`);
+  } else if (!scope.isSuperAdmin) {
+    const allowed = Array.isArray(scope.allowedSucursalIds)
+      ? scope.allowedSucursalIds.map((value) => parsePositiveInt(value)).filter(Boolean)
+      : [];
+    if (allowed.length === 0) {
+      return res.status(403).json({ error: true, message: 'No tiene sucursales asignadas para consultar este reporte.' });
+    }
+    params.push(allowed);
+    where.push(`k.id_sucursal = ANY($${params.length}::int[])`);
+  }
+
+  if (parsedFilters.id_almacen) {
+    params.push(parsedFilters.id_almacen);
+    where.push(`k.id_almacen = $${params.length}`);
+  }
+
+  if (parsedFilters.tipo_movimiento) {
+    params.push(`%${parsedFilters.tipo_movimiento}%`);
+    where.push(`COALESCE(k.tipo, '') ILIKE $${params.length}`);
+  }
+
+  const tipoItem = String(parsedFilters.tipo_item || 'todos').trim().toLowerCase();
+  if (!['producto', 'insumo', 'todos'].includes(tipoItem)) {
+    return res.status(400).json({ error: true, message: 'El filtro tipo_item solo permite: producto, insumo o todos.' });
+  }
+  if (tipoItem !== 'todos') {
+    params.push(tipoItem);
+    where.push(`LOWER(COALESCE(k.item_tipo, '')) = $${params.length}`);
+  }
+
+  if (parsedFilters.item) {
+    const itemId = parsePositiveInt(parsedFilters.item);
+    if (itemId) {
+      params.push(itemId);
+      where.push(`k.item_id = $${params.length}`);
+    } else {
+      params.push(`%${parsedFilters.item}%`);
+      where.push(`COALESCE(k.item_nombre, '') ILIKE $${params.length}`);
+    }
+  }
+
+  const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
+  const shouldLimit = !parsedFilters.fecha_inicio && !parsedFilters.fecha_fin && !parsedFilters.item;
+  const limitSql = shouldLimit ? 'LIMIT 1000' : '';
+
+  const query = `
+    SELECT
+      k.id_movimiento,
+      k.fecha_mov,
+      k.tipo,
+      k.cantidad,
+      k.saldo_antes,
+      k.saldo_despues,
+      k.es_legacy,
+      k.id_almacen,
+      k.nombre_almacen,
+      k.id_sucursal,
+      k.nombre_sucursal,
+      k.id_producto,
+      k.nombre_producto,
+      k.id_insumo,
+      k.nombre_insumo,
+      k.item_tipo,
+      k.item_id,
+      k.item_nombre,
+      k.impacto,
+      k.ref_origen,
+      k.id_ref,
+      k.descripcion
+    FROM public.v_kardex_detalle k
+    ${whereSql}
+    ORDER BY k.fecha_mov DESC, k.id_movimiento DESC
+    ${limitSql}
+  `;
+
+  const result = await pool.query(query, params);
+  const rows = Array.isArray(result.rows) ? result.rows : [];
+
+  const metrics = rows.reduce(
+    (acc, row) => {
+      const tipo = String(row.tipo || '').trim().toUpperCase();
+      if (tipo === 'ENTRADA') acc.entradas += 1;
+      else if (tipo === 'SALIDA') acc.salidas += 1;
+      else acc.ajustesOtros += 1;
+      if (row.item_id !== null && row.item_id !== undefined) acc.items.add(`${String(row.item_tipo || '').toLowerCase()}-${row.item_id}`);
+      return acc;
+    },
+    { entradas: 0, salidas: 0, ajustesOtros: 0, items: new Set() }
+  );
+
+  return res.json({
+    ok: true,
+    reporte: 'inventario_kardex',
+    fase: 'fase_3b_real',
+    filtros: filters,
+    data: {
+      kpis: {
+        total_movimientos: rows.length,
+        entradas: metrics.entradas,
+        salidas: metrics.salidas,
+        ajustes_otros: metrics.ajustesOtros,
+        items_unicos: metrics.items.size
+      },
+      movimientos: rows
+    },
+    meta: {
+      fuente_canonica: 'v_kardex_detalle',
+      limitado: shouldLimit,
+      limite: shouldLimit ? 1000 : null,
+      generado_en: new Date().toISOString()
+    }
+  });
+};
+
 router.use('/reportes', checkPermission(BASE_PERMISSION));
 
 Object.entries(REPORT_DEFINITIONS).forEach(([path, config]) => {
@@ -948,6 +1090,9 @@ Object.entries(REPORT_DEFINITIONS).forEach(([path, config]) => {
       }
       if (config.key === 'inventario_stock_critico') {
         return await getInventarioStockCritico(req, res, parsed.filters, parsed.parsed);
+      }
+      if (config.key === 'inventario_kardex') {
+        return await getInventarioKardex(req, res, parsed.filters, parsed.parsed);
       }
 
       return sendPhaseOnePayload(res, config.key, parsed.filters);
