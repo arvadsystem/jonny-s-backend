@@ -2,6 +2,7 @@
 import pool from '../config/db-connection.js';
 import { checkPermission, requestHasAnyPermission } from '../middleware/checkPermission.js';
 import { resolveRequestUserSucursalScope } from '../utils/sucursalScope.js';
+import PDFDocument from 'pdfkit';
 
 const router = express.Router();
 
@@ -248,6 +249,90 @@ const buildExportFileName = ({ reportKey, parsedFilters }) => {
   const range = from || to ? `_${from || 'inicio'}_${to || 'fin'}` : '';
   return `${base}${range}_${toDateStamp()}.csv`;
 };
+
+const buildPdfFileName = ({ reportKey, parsedFilters }) => {
+  const base = `reporte_${String(reportKey || 'general').toLowerCase()}`;
+  const from = parsedFilters?.fecha_inicio || '';
+  const to = parsedFilters?.fecha_fin || '';
+  const range = from || to ? `_${from || 'inicio'}_${to || 'fin'}` : '';
+  return `${base}${range}_${toDateStamp()}.pdf`;
+};
+
+const renderPdfLine = (doc, label, value) => {
+  const text = `${label}: ${value ?? ''}`;
+  doc.fontSize(9).fillColor('#111827').text(text, { width: 520 });
+};
+
+const renderPdfTable = ({ doc, title, rows, maxRows = 200 }) => {
+  doc.moveDown(0.6);
+  doc.fontSize(11).fillColor('#111827').text(title);
+  doc.moveDown(0.2);
+
+  if (!Array.isArray(rows) || rows.length === 0) {
+    doc.fontSize(9).fillColor('#6b7280').text('Sin datos.');
+    return;
+  }
+
+  const headers = [...new Set(rows.flatMap((row) => Object.keys(row || {})))].slice(0, 8);
+  doc.fontSize(8).fillColor('#111827').text(headers.join(' | '), { width: 520 });
+  doc.moveDown(0.2);
+
+  const limitedRows = rows.slice(0, maxRows);
+  limitedRows.forEach((row) => {
+    const line = headers.map((key) => String(row?.[key] ?? '')).join(' | ');
+    doc.fontSize(8).fillColor('#374151').text(line, { width: 520 });
+  });
+
+  if (rows.length > maxRows) {
+    doc.moveDown(0.3);
+    doc.fontSize(8).fillColor('#b45309').text(`Nota: se muestran ${maxRows} filas de ${rows.length} por control de tamaño.`);
+  }
+};
+
+const buildReportPdfBuffer = ({ reportKey, payload }) => new Promise((resolve, reject) => {
+  try {
+    const doc = new PDFDocument({ size: 'A4', margin: 36 });
+    const chunks = [];
+
+    doc.on('data', (chunk) => chunks.push(chunk));
+    doc.on('end', () => resolve(Buffer.concat(chunks)));
+    doc.on('error', reject);
+
+    const data = payload?.data || {};
+    const filtros = payload?.filtros || {};
+    const kpis = data?.kpis || {};
+
+    doc.fontSize(16).fillColor('#111827').text('Jonny’s SmartOrden');
+    doc.fontSize(12).fillColor('#1f2937').text(`Reporte: ${reportKey}`);
+    doc.moveDown(0.4);
+    renderPdfLine(doc, 'Generado', new Date().toISOString());
+    renderPdfLine(doc, 'Filtros', JSON.stringify(filtros));
+
+    if (kpis && typeof kpis === 'object' && Object.keys(kpis).length > 0) {
+      doc.moveDown(0.6);
+      doc.fontSize(11).fillColor('#111827').text('KPIs principales');
+      Object.entries(kpis).forEach(([key, value]) => renderPdfLine(doc, key, value));
+    }
+
+    const arraySections = Object.entries(data).filter(
+      ([key, value]) => key !== 'kpis' && Array.isArray(value)
+    );
+
+    arraySections.forEach(([key, rows]) => {
+      if (doc.y > 700) doc.addPage();
+      renderPdfTable({ doc, title: key, rows, maxRows: 200 });
+    });
+
+    if (arraySections.length === 0) {
+      doc.moveDown(0.8);
+      doc.fontSize(9).fillColor('#6b7280').text('Sin datos tabulares para este reporte.');
+    }
+
+    doc.end();
+  } catch (error) {
+    reject(error);
+  }
+});
 
 const buildVentasScopeWhere = ({ parsedFilters, scope, params }) => {
   const where = [];
@@ -1693,6 +1778,63 @@ router.get('/reportes/exportar/excel', checkPermission([BASE_PERMISSION, 'REPORT
     res.setHeader('Content-Type', 'text/csv; charset=utf-8');
     res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
     return res.status(200).send(csvContent);
+  } catch (error) {
+    return res.status(500).json({ error: true, message: 'No se pudo exportar el reporte solicitado.' });
+  }
+});
+
+router.get('/reportes/exportar/pdf', checkPermission([BASE_PERMISSION, 'REPORTES_EXPORTAR_PDF']), async (req, res) => {
+  try {
+    const reportKeyInput = normalizeReportKeyInput(req.query?.reporte);
+    const reportDefinition = Object.values(REPORT_DEFINITIONS).find((item) => item.key === reportKeyInput);
+
+    if (!reportDefinition) {
+      return res.status(400).json({
+        error: true,
+        message: 'El parametro reporte es invalido para exportacion.'
+      });
+    }
+
+    const hasReportPermission = await requestHasAnyPermission(req, reportDefinition.permissions);
+    if (!hasReportPermission) {
+      return res.status(403).json({
+        error: true,
+        message: 'Acceso denegado: permisos insuficientes'
+      });
+    }
+
+    const parsed = parseFilters(req.query || {});
+    if (!parsed.ok) {
+      return res.status(400).json({ error: true, message: parsed.message });
+    }
+
+    const capture = createCaptureResponse();
+    await executeReportByKey({
+      key: reportDefinition.key,
+      req,
+      res: capture.api,
+      filters: parsed.filters,
+      parsedFilters: parsed.parsed
+    });
+
+    if (capture.state.statusCode >= 400) {
+      return res.status(capture.state.statusCode).json(
+        capture.state.body || { error: true, message: 'No se pudo generar el reporte solicitado.' }
+      );
+    }
+
+    const pdfBuffer = await buildReportPdfBuffer({
+      reportKey: reportDefinition.key,
+      payload: capture.state.body
+    });
+    const filename = buildPdfFileName({
+      reportKey: reportDefinition.key,
+      parsedFilters: parsed.parsed
+    });
+
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    return res.status(200).send(pdfBuffer);
   } catch (error) {
     return res.status(500).json({ error: true, message: 'No se pudo exportar el reporte solicitado.' });
   }
