@@ -8,6 +8,7 @@ import {
   MAX_IMAGE_BYTES,
   INVENTARIO_UPLOADS_SUBDIR,
   SUCURSALES_UPLOADS_SUBDIR,
+  CARRUSEL_UPLOADS_SUBDIR,
   ADMIN_UPLOADS_SUBDIR,
   SUPABASE_ASSETS_BUCKET,
   SUPABASE_ADMIN_BUCKET,
@@ -28,6 +29,40 @@ const ARCHIVO_CLEANUP_PENDING_MESSAGE = 'La imagen temporal fue desactivada y qu
 
 const getSafeUploadErrorMessage = (fallback = 'No se pudo procesar el archivo.') => fallback;
 const getSafeArchivoCleanupErrorMessage = (fallback = 'No se pudo limpiar la imagen temporal.') => fallback;
+
+const ensureSupabaseBucket = async (bucketName) => {
+  const bucket = String(bucketName || '').trim();
+  if (!bucket) throw new Error('Bucket invalido.');
+
+  const { data: existingBucket, error: getBucketError } = await supabase.storage.getBucket(bucket);
+  if (existingBucket && !getBucketError) return;
+
+  const notFound =
+    getBucketError &&
+    (
+      Number(getBucketError?.statusCode || getBucketError?.status || 0) === 404 ||
+      /not\s*found|does\s*not\s*exist/i.test(String(getBucketError?.message || ''))
+    );
+
+  if (getBucketError && !notFound) {
+    console.error(`Error verificando bucket ${bucket}:`, getBucketError);
+    throw new Error('No se pudo verificar el bucket de almacenamiento.');
+  }
+
+  const { error: createBucketError } = await supabase.storage.createBucket(bucket, {
+    public: bucket === SUPABASE_ASSETS_BUCKET,
+    fileSizeLimit: MAX_FILE_BYTES_BY_BUCKET[bucket],
+    allowedMimeTypes: Object.keys(ALLOWED_MIME_TYPES_BY_BUCKET[bucket] || {})
+  });
+
+  if (
+    createBucketError &&
+    !/already\s*exists|duplicate/i.test(String(createBucketError?.message || ''))
+  ) {
+    console.error(`Error creando bucket ${bucket}:`, createBucketError);
+    throw new Error('No se pudo crear el bucket de almacenamiento.');
+  }
+};
 
 const normalizeOriginalName = (value, defaultName = 'archivo') => {
   const trimmed = String(value || '').trim();
@@ -265,10 +300,13 @@ router.post('/archivos', async (req, res) => {
       ? ADMIN_UPLOADS_SUBDIR
       : contextoRaw === 'sucursales'
         ? SUCURSALES_UPLOADS_SUBDIR
-        : INVENTARIO_UPLOADS_SUBDIR;
+        : contextoRaw === 'carrusel'
+          ? CARRUSEL_UPLOADS_SUBDIR
+          : INVENTARIO_UPLOADS_SUBDIR;
     supabaseFilePath = `${subDir}/${uniqueFileName}`;
 
     // 5. Subir a Supabase Storage (usando service_role para bypass RLS en subida)
+    await ensureSupabaseBucket(targetBucket);
     const { error: uploadError } = await supabase.storage
       .from(targetBucket)
       .upload(supabaseFilePath, decoded.buffer, {
