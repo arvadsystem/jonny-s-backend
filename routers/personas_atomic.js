@@ -180,20 +180,16 @@ const getTipoClienteLabelColumn = async (client, { forceRefresh = false } = {}) 
   if (!shouldRefresh) return tipoClienteLabelColumnCache;
 
   tipoClienteLabelCheckedAt = now;
-  try {
-    const rs = await client.query(
-      `
-        SELECT column_name
-        FROM information_schema.columns
-        WHERE table_schema = 'public'
-          AND table_name = 'tipo_cliente'
-      `
-    );
-    const columns = new Set((rs.rows || []).map((row) => String(row.column_name || '').trim()));
-    tipoClienteLabelColumnCache = TIPO_CLIENTE_LABEL_CANDIDATES.find((name) => columns.has(name)) || null;
-  } catch {
-    tipoClienteLabelColumnCache = null;
-  }
+  const rs = await client.query(
+    `
+      SELECT column_name
+      FROM information_schema.columns
+      WHERE table_schema = 'public'
+        AND table_name = 'tipo_cliente'
+    `
+  );
+  const columns = new Set((rs.rows || []).map((row) => String(row.column_name || '').trim()));
+  tipoClienteLabelColumnCache = TIPO_CLIENTE_LABEL_CANDIDATES.find((name) => columns.has(name)) || null;
 
   return tipoClienteLabelColumnCache;
 };
@@ -209,21 +205,17 @@ const hasClienteEmpresaField = async (client, { forceRefresh = false } = {}) => 
   }
 
   hasClienteEmpresaFieldCheckedAt = now;
-  try {
-    const rs = await client.query(
-      `
-        SELECT 1
-        FROM information_schema.columns
-        WHERE table_schema = 'public'
-          AND table_name = 'clientes'
-          AND column_name = 'id_empresa_cliente'
-        LIMIT 1
-      `
-    );
-    hasClienteEmpresaFieldCache = Boolean(rs.rows?.length);
-  } catch {
-    hasClienteEmpresaFieldCache = false;
-  }
+  const rs = await client.query(
+    `
+      SELECT 1
+      FROM information_schema.columns
+      WHERE table_schema = 'public'
+        AND table_name = 'clientes'
+        AND column_name = 'id_empresa_cliente'
+      LIMIT 1
+    `
+  );
+  hasClienteEmpresaFieldCache = Boolean(rs.rows?.length);
 
   return hasClienteEmpresaFieldCache;
 };
@@ -265,16 +257,22 @@ const fnGuardarClienteSupportsEmpresaCliente = async (client, { forceRefresh = f
   }
 
   fnGuardarClienteSupportCheckedAt = now;
-  try {
-    const rs = await client.query(
-      "SELECT pg_get_functiondef('public.fn_guardar_cliente(json)'::regprocedure) AS ddl"
-    );
-    const ddl = String(rs.rows?.[0]?.ddl || '').toLowerCase();
-    fnGuardarClienteSupportsEmpresaClienteCache = ddl.includes('id_empresa_cliente');
-  } catch {
-    // Fallback seguro: usar deteccion de columna.
+  const regprocRs = await client.query(
+    "SELECT to_regprocedure('public.fn_guardar_cliente(json)') AS regproc"
+  );
+  const regproc = regprocRs.rows?.[0]?.regproc;
+
+  if (!regproc) {
+    // Contrato legacy o firma distinta: fallback seguro por esquema.
     fnGuardarClienteSupportsEmpresaClienteCache = await hasClienteEmpresaField(client, { forceRefresh });
+    return fnGuardarClienteSupportsEmpresaClienteCache;
   }
+
+  const rs = await client.query(
+    "SELECT pg_get_functiondef(to_regprocedure('public.fn_guardar_cliente(json)')) AS ddl"
+  );
+  const ddl = String(rs.rows?.[0]?.ddl || '').toLowerCase();
+  fnGuardarClienteSupportsEmpresaClienteCache = ddl.includes('id_empresa_cliente');
 
   return fnGuardarClienteSupportsEmpresaClienteCache;
 };
@@ -315,6 +313,28 @@ const rollbackQuietly = async (client) => {
     await client.query('ROLLBACK');
   } catch {
     // noop: preserve original error
+  }
+};
+
+const runRecoverableDbStep = async (client, callback) => {
+  const savepointName = `sp_personas_atomic_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+  await client.query(`SAVEPOINT ${savepointName}`);
+  try {
+    const result = await callback();
+    await client.query(`RELEASE SAVEPOINT ${savepointName}`);
+    return { ok: true, result };
+  } catch (error) {
+    try {
+      await client.query(`ROLLBACK TO SAVEPOINT ${savepointName}`);
+    } catch {
+      // noop: preserve original error
+    }
+    try {
+      await client.query(`RELEASE SAVEPOINT ${savepointName}`);
+    } catch {
+      // noop: preserve original error
+    }
+    return { ok: false, error };
   }
 };
 
@@ -391,41 +411,43 @@ const buildAtomicSuccessData = ({ entidadTipo, entidad, idPrincipal, idPersona =
 });
 
 const findEmpleadoDetail = async (client, idEmpleado) => {
-  try {
-    const rs = await client.query('SELECT * FROM empleados_listar() WHERE id_empleado = $1 LIMIT 1', [idEmpleado]);
-    return rs.rows?.[0] || null;
-  } catch {
-    const rs = await client.query(
-      `
-        SELECT
-          e.id_empleado,
-          e.id_persona,
-          e.id_sucursal,
-          e.fecha_ingreso,
-          e.salario_base,
-          e.estado,
-          e.cargo,
-          e.nombre_referencia,
-          e.telefono_referencia,
-          TRIM(COALESCE(p.nombre, '') || ' ' || COALESCE(p.apellido, '')) AS nombre_completo,
-          p.dni,
-          t.telefono,
-          c.direccion_correo AS correo,
-          d.direccion,
-          s.nombre_sucursal AS sucursal
-        FROM public.empleados e
-        LEFT JOIN public.personas p ON p.id_persona = e.id_persona
-        LEFT JOIN public.telefonos t ON t.id_telefono = p.id_telefono
-        LEFT JOIN public.correos c ON c.id_correo = p.id_correo
-        LEFT JOIN public.direcciones d ON d.id_direccion = p.id_direccion
-        LEFT JOIN public.sucursales s ON s.id_sucursal = e.id_sucursal
-        WHERE e.id_empleado = $1
-        LIMIT 1
-      `,
-      [idEmpleado]
-    );
-    return rs.rows?.[0] || null;
+  const listAttempt = await runRecoverableDbStep(client, async () =>
+    client.query('SELECT * FROM empleados_listar() WHERE id_empleado = $1 LIMIT 1', [idEmpleado])
+  );
+  if (listAttempt.ok) {
+    return listAttempt.result?.rows?.[0] || null;
   }
+
+  const rs = await client.query(
+    `
+      SELECT
+        e.id_empleado,
+        e.id_persona,
+        e.id_sucursal,
+        e.fecha_ingreso,
+        e.salario_base,
+        e.estado,
+        e.cargo,
+        e.nombre_referencia,
+        e.telefono_referencia,
+        TRIM(COALESCE(p.nombre, '') || ' ' || COALESCE(p.apellido, '')) AS nombre_completo,
+        p.dni,
+        t.telefono,
+        c.direccion_correo AS correo,
+        d.direccion,
+        s.nombre_sucursal AS sucursal
+      FROM public.empleados e
+      LEFT JOIN public.personas p ON p.id_persona = e.id_persona
+      LEFT JOIN public.telefonos t ON t.id_telefono = p.id_telefono
+      LEFT JOIN public.correos c ON c.id_correo = p.id_correo
+      LEFT JOIN public.direcciones d ON d.id_direccion = p.id_direccion
+      LEFT JOIN public.sucursales s ON s.id_sucursal = e.id_sucursal
+      WHERE e.id_empleado = $1
+      LIMIT 1
+    `,
+    [idEmpleado]
+  );
+  return rs.rows?.[0] || null;
 };
 
 const findClienteDetail = async (client, idCliente) => {
@@ -466,31 +488,41 @@ const findClienteDetail = async (client, idCliente) => {
   const idTipoCliente = parsePositiveInt(row.id_tipo_cliente);
   if (!idTipoCliente) return row;
 
-  try {
-    let labelColumn = await getTipoClienteLabelColumn(client);
+  let labelColumn = await getTipoClienteLabelColumn(client);
+  if (!labelColumn) return row;
+
+  let tipoRs = null;
+  const firstAttempt = await runRecoverableDbStep(client, async () =>
+    client.query(
+      `SELECT ${labelColumn} AS tipo_cliente FROM public.tipo_cliente WHERE id_tipo_cliente = $1 LIMIT 1`,
+      [idTipoCliente]
+    )
+  );
+
+  if (firstAttempt.ok) {
+    tipoRs = firstAttempt.result;
+  } else if (isSchemaMissingError(firstAttempt.error)) {
+    labelColumn = await getTipoClienteLabelColumn(client, { forceRefresh: true });
     if (!labelColumn) return row;
 
-    let tipoRs;
-    try {
-      tipoRs = await client.query(
+    const secondAttempt = await runRecoverableDbStep(client, async () =>
+      client.query(
         `SELECT ${labelColumn} AS tipo_cliente FROM public.tipo_cliente WHERE id_tipo_cliente = $1 LIMIT 1`,
         [idTipoCliente]
-      );
-    } catch (error) {
-      if (!isSchemaMissingError(error)) throw error;
-      labelColumn = await getTipoClienteLabelColumn(client, { forceRefresh: true });
-      if (!labelColumn) return row;
-      tipoRs = await client.query(
-        `SELECT ${labelColumn} AS tipo_cliente FROM public.tipo_cliente WHERE id_tipo_cliente = $1 LIMIT 1`,
-        [idTipoCliente]
-      );
-    }
+      )
+    );
 
-    const tipoLabel = toTrimmedText(tipoRs.rows?.[0]?.tipo_cliente);
-    if (tipoLabel) row.tipo_cliente = tipoLabel;
-  } catch (error) {
-    if (!isSchemaMissingError(error)) throw error;
+    if (!secondAttempt.ok) {
+      if (!isSchemaMissingError(secondAttempt.error)) throw secondAttempt.error;
+      return row;
+    }
+    tipoRs = secondAttempt.result;
+  } else {
+    throw firstAttempt.error;
   }
+
+  const tipoLabel = toTrimmedText(tipoRs?.rows?.[0]?.tipo_cliente);
+  if (tipoLabel) row.tipo_cliente = tipoLabel;
 
   return row;
 };
@@ -499,19 +531,20 @@ const trySetClienteSucursal = async (client, idCliente, idSucursal) => {
   const parsedCliente = parsePositiveInt(idCliente);
   const parsedSucursal = parsePositiveInt(idSucursal);
   if (!parsedCliente || !parsedSucursal) return;
-  try {
-    await client.query(
+  const updateAttempt = await runRecoverableDbStep(client, async () =>
+    client.query(
       'UPDATE public.clientes SET id_sucursal = $1 WHERE id_cliente = $2',
       [parsedSucursal, parsedCliente]
-    );
-  } catch (error) {
-    if (error?.code === '42703') return;
-    throw error;
+    )
+  );
+  if (!updateAttempt.ok) {
+    if (updateAttempt.error?.code === '42703') return;
+    throw updateAttempt.error;
   }
 };
 
 const ensureClientesSucursalesTableAtomic = async (client) => {
-  try {
+  const setupAttempt = await runRecoverableDbStep(client, async () => {
     await client.query(`
       CREATE TABLE IF NOT EXISTS public.clientes_sucursales (
         id_cliente INTEGER NOT NULL REFERENCES public.clientes(id_cliente) ON DELETE CASCADE,
@@ -526,16 +559,15 @@ const ensureClientesSucursalesTableAtomic = async (client) => {
     await client.query('CREATE INDEX IF NOT EXISTS idx_clientes_sucursales_id_sucursal ON public.clientes_sucursales(id_sucursal)');
     await client.query('CREATE INDEX IF NOT EXISTS idx_clientes_sucursales_id_cliente ON public.clientes_sucursales(id_cliente)');
     return true;
-  } catch {
-    return false;
-  }
+  });
+  return setupAttempt.ok;
 };
 
 const tryUpsertClienteSucursalLink = async (client, idCliente, idSucursal, { setPrincipal = false } = {}) => {
   const parsedCliente = parsePositiveInt(idCliente);
   const parsedSucursal = parsePositiveInt(idSucursal);
   if (!parsedCliente || !parsedSucursal) return;
-  try {
+  const executePrimaryUpsert = async () => {
     await client.query(
       `INSERT INTO public.clientes_sucursales (id_cliente, id_sucursal, estado, es_principal)
        VALUES ($1, $2, TRUE, $3)
@@ -559,56 +591,40 @@ const tryUpsertClienteSucursalLink = async (client, idCliente, idSucursal, { set
         [parsedCliente, parsedSucursal]
       );
     }
-  } catch (error) {
-    if (['42P01', '42P10'].includes(error?.code)) {
-      const bootstrapped = await ensureClientesSucursalesTableAtomic(client);
-      if (!bootstrapped) return;
-      try {
-        await client.query(
-          `INSERT INTO public.clientes_sucursales (id_cliente, id_sucursal, estado, es_principal)
-           VALUES ($1, $2, TRUE, $3)
-           ON CONFLICT (id_cliente, id_sucursal)
-           DO UPDATE SET
-             estado = TRUE,
-             es_principal = CASE
-               WHEN EXCLUDED.es_principal THEN TRUE
-               ELSE public.clientes_sucursales.es_principal
-             END,
-             updated_at = timezone('America/Tegucigalpa', now())`,
-          [parsedCliente, parsedSucursal, Boolean(setPrincipal)]
-        );
-        if (setPrincipal) {
-          await client.query(
-            `UPDATE public.clientes_sucursales
-             SET es_principal = CASE WHEN id_sucursal = $2 THEN TRUE ELSE FALSE END,
-                 updated_at = timezone('America/Tegucigalpa', now())
-             WHERE id_cliente = $1
-               AND COALESCE(estado, TRUE) = TRUE`,
-            [parsedCliente, parsedSucursal]
-          );
-        }
-      } catch (retryError) {
-        if (['42P01', '42703', '42P10'].includes(retryError?.code)) return;
-        throw retryError;
-      }
-      return;
+  };
+
+  const firstAttempt = await runRecoverableDbStep(client, executePrimaryUpsert);
+  if (firstAttempt.ok) return;
+
+  const firstError = firstAttempt.error;
+  if (['42P01', '42P10'].includes(firstError?.code)) {
+    const bootstrapped = await ensureClientesSucursalesTableAtomic(client);
+    if (!bootstrapped) return;
+    const retryAttempt = await runRecoverableDbStep(client, executePrimaryUpsert);
+    if (!retryAttempt.ok) {
+      if (['42P01', '42703', '42P10'].includes(retryAttempt.error?.code)) return;
+      throw retryAttempt.error;
     }
-    if (error?.code === '42703') {
-      try {
-        await client.query(
-          `INSERT INTO public.clientes_sucursales (id_cliente, id_sucursal)
-           VALUES ($1, $2)
-           ON CONFLICT (id_cliente, id_sucursal) DO NOTHING`,
-          [parsedCliente, parsedSucursal]
-        );
-      } catch (fallbackError) {
-        if (['42P01', '42703', '42P10'].includes(fallbackError?.code)) return;
-        throw fallbackError;
-      }
-      return;
-    }
-    throw error;
+    return;
   }
+
+  if (firstError?.code === '42703') {
+    const fallbackAttempt = await runRecoverableDbStep(client, async () =>
+      client.query(
+        `INSERT INTO public.clientes_sucursales (id_cliente, id_sucursal)
+         VALUES ($1, $2)
+         ON CONFLICT (id_cliente, id_sucursal) DO NOTHING`,
+        [parsedCliente, parsedSucursal]
+      )
+    );
+    if (!fallbackAttempt.ok) {
+      if (['42P01', '42703', '42P10'].includes(fallbackAttempt.error?.code)) return;
+      throw fallbackAttempt.error;
+    }
+    return;
+  }
+
+  throw firstError;
 };
 
 const syncClienteEmpresaContext = async (client, idCliente, idEmpresaCliente, idEmpresaTenant = null) => {
@@ -711,8 +727,8 @@ const findExistingPersonaByDni = async (client, { dni, tenantId = null } = {}) =
 
   // Intento con alcance por tenant cuando el esquema lo soporta.
   if (tenantScope) {
-    try {
-      const tenantScopedRs = await client.query(
+    const tenantScopedAttempt = await runRecoverableDbStep(client, async () =>
+      client.query(
         `
           SELECT
             p.id_persona,
@@ -726,11 +742,13 @@ const findExistingPersonaByDni = async (client, { dni, tenantId = null } = {}) =
           LIMIT 1
         `,
         [normalizedDni, tenantScope]
-      );
-      row = tenantScopedRs.rows?.[0] || null;
-    } catch (error) {
+      )
+    );
+    if (tenantScopedAttempt.ok) {
+      row = tenantScopedAttempt.result?.rows?.[0] || null;
+    } else {
       // Compatibilidad: algunas instalaciones legacy no tienen personas.id_empresa.
-      if (String(error?.code || '') !== '42703') throw error;
+      if (String(tenantScopedAttempt.error?.code || '') !== '42703') throw tenantScopedAttempt.error;
     }
   }
 
@@ -1225,22 +1243,30 @@ const atomicService = {
       }
 
       let createResult;
-      try {
-        createResult = await client.query('SELECT public.fn_guardar_cliente($1::json) AS id_cliente', [
+      const createAttempt = await runRecoverableDbStep(client, async () =>
+        client.query('SELECT public.fn_guardar_cliente($1::json) AS id_cliente', [
           JSON.stringify(clienteFnPayload)
-        ]);
-      } catch (error) {
+        ])
+      );
+
+      if (createAttempt.ok) {
+        createResult = createAttempt.result;
+      } else if (supportsEmpresaClienteInFn && empresaRelacionId && isLegacyClienteRelationError(createAttempt.error)) {
         // Compatibilidad en caliente: si la funcion sigue en contrato legacy, reintenta con id_empresa.
-        if (supportsEmpresaClienteInFn && empresaRelacionId && isLegacyClienteRelationError(error)) {
-          const legacyPayload = { ...clienteFnPayload, id_empresa: empresaRelacionId };
-          delete legacyPayload.id_empresa_cliente;
-          createResult = await client.query('SELECT public.fn_guardar_cliente($1::json) AS id_cliente', [
+        const legacyPayload = { ...clienteFnPayload, id_empresa: empresaRelacionId };
+        delete legacyPayload.id_empresa_cliente;
+
+        const legacyAttempt = await runRecoverableDbStep(client, async () =>
+          client.query('SELECT public.fn_guardar_cliente($1::json) AS id_cliente', [
             JSON.stringify(legacyPayload)
-          ]);
-          fnGuardarClienteSupportsEmpresaClienteCache = false;
-        } else {
-          throw error;
-        }
+          ])
+        );
+
+        if (!legacyAttempt.ok) throw legacyAttempt.error;
+        createResult = legacyAttempt.result;
+        fnGuardarClienteSupportsEmpresaClienteCache = false;
+      } else {
+        throw createAttempt.error;
       }
 
       const idCliente = extractIdFromUnknown(createResult.rows?.[0]?.id_cliente, [

@@ -241,6 +241,32 @@ const buildListaValores = (capabilities, { includeOptional = true } = {}) => {
   return fields.join(', ');
 };
 
+const PERSONAS_REL_STATE_JOIN = `
+  LEFT JOIN LATERAL (
+    SELECT BOOL_OR(rel_estado) AS rel_estado
+    FROM (
+      SELECT e.estado AS rel_estado
+      FROM public.empleados e
+      WHERE e.id_persona = p.id_persona
+      UNION ALL
+      SELECT c.estado AS rel_estado
+      FROM public.clientes c
+      WHERE c.id_persona = p.id_persona
+      UNION ALL
+      SELECT u_emp.estado AS rel_estado
+      FROM public.usuarios u_emp
+      INNER JOIN public.empleados e_rel ON e_rel.id_empleado = u_emp.id_empleado
+      WHERE e_rel.id_persona = p.id_persona
+      UNION ALL
+      SELECT u_cli.estado AS rel_estado
+      FROM public.usuarios u_cli
+      INNER JOIN public.clientes c_rel ON c_rel.id_cliente = u_cli.id_cliente
+      WHERE c_rel.id_persona = p.id_persona
+    ) rel_rows
+  ) rel_state ON TRUE
+`;
+const PERSONAS_RELATED_STATE_EXPR = 'COALESCE(rel_state.rel_estado, TRUE)';
+
 const parseBooleanFilter = (value) => {
   if (value === undefined) return null;
   if (typeof value === 'boolean') return value;
@@ -458,6 +484,11 @@ const personaRepository = {
     if (capabilities.softDeleteField && !BASE_FIELDS.includes(capabilities.softDeleteField)) {
       fields.push(`p.${capabilities.softDeleteField}`);
     }
+    if (capabilities.softDeleteField) {
+      fields.push(`p.${capabilities.softDeleteField} AS estado`);
+    } else {
+      fields.push(`${PERSONAS_RELATED_STATE_EXPR} AS estado`);
+    }
     if (capabilities.hasTenantField && !BASE_FIELDS.includes('id_empresa')) {
       fields.push('p.id_empresa');
     }
@@ -466,11 +497,16 @@ const personaRepository = {
     fields.push('cor.direccion_correo');
     fields.push('cor.direccion_correo AS correo');
 
-    const fromClause = `
+    const dataFromClause = `
       FROM personas p
       LEFT JOIN telefonos telf ON telf.id_telefono = p.id_telefono
       LEFT JOIN direcciones dir ON dir.id_direccion = p.id_direccion
       LEFT JOIN correos cor ON (cor.id_correo = p.id_correo OR (p.id_correo IS NULL AND cor.id_persona = p.id_persona))
+      ${PERSONAS_REL_STATE_JOIN}
+    `;
+    const baseFromClause = `
+      FROM personas p
+      ${PERSONAS_REL_STATE_JOIN}
     `;
 
     const whereParams = [];
@@ -511,6 +547,9 @@ const personaRepository = {
     ) {
       whereParams.push(estado);
       whereParts.push(`p.${capabilities.softDeleteField} = $${whereParams.length}`);
+    } else if (estado !== null && !capabilities.softDeleteField) {
+      whereParams.push(estado);
+      whereParts.push(`${PERSONAS_RELATED_STATE_EXPR} = $${whereParams.length}`);
     }
 
     if (tenantId && capabilities.hasTenantField) {
@@ -550,7 +589,7 @@ const personaRepository = {
 
     const dataQuery = `
       SELECT ${fields.join(', ')}
-      ${fromClause}
+      ${dataFromClause}
       ${whereClause}
       ORDER BY ${orderByClause}
       LIMIT $${limitParamIndex}
@@ -558,11 +597,11 @@ const personaRepository = {
     `;
 
     const countFromClause = searchTerm
-      ? fromClause
-      : 'FROM personas p';
+      ? dataFromClause
+      : (estado !== null && !capabilities.softDeleteField ? baseFromClause : 'FROM personas p');
 
     const totalQuery = `
-      SELECT COUNT(*)::INT AS total
+      SELECT COUNT(DISTINCT p.id_persona)::INT AS total
       ${countFromClause}
       ${whereClause}
     `;
@@ -581,37 +620,41 @@ const personaRepository = {
   async getGlobalStats({ capabilities, tenantId = null, estado = null }) {
     const whereParts = [];
     const params = [];
+    const usesSoftDeleteField =
+      Boolean(capabilities.softDeleteField) && OPTIONAL_SOFT_DELETE_FIELDS.includes(capabilities.softDeleteField);
 
-    if (
-      estado !== null
-      && capabilities.softDeleteField
-      && OPTIONAL_SOFT_DELETE_FIELDS.includes(capabilities.softDeleteField)
-    ) {
+    if (estado !== null && usesSoftDeleteField) {
       params.push(estado);
-      whereParts.push(`${capabilities.softDeleteField} = $${params.length}`);
+      whereParts.push(`p.${capabilities.softDeleteField} = $${params.length}`);
+    } else if (estado !== null && !usesSoftDeleteField) {
+      params.push(estado);
+      whereParts.push(`${PERSONAS_RELATED_STATE_EXPR} = $${params.length}`);
     }
 
     if (tenantId && capabilities.hasTenantField) {
       params.push(tenantId);
-      whereParts.push(`id_empresa = $${params.length}`);
+      whereParts.push(`p.id_empresa = $${params.length}`);
     }
 
     const whereClause = whereParts.length ? `WHERE ${whereParts.join(' AND ')}` : '';
-    const activeExpr = capabilities.softDeleteField
-      ? `SUM(CASE WHEN ${capabilities.softDeleteField} = true THEN 1 ELSE 0 END)::INT AS activas`
-      : 'COUNT(*)::INT AS activas';
-    const inactiveExpr = capabilities.softDeleteField
-      ? `SUM(CASE WHEN ${capabilities.softDeleteField} = false THEN 1 ELSE 0 END)::INT AS inactivas`
-      : '0::INT AS inactivas';
+    const activeExpr = usesSoftDeleteField
+      ? `SUM(CASE WHEN p.${capabilities.softDeleteField} = true THEN 1 ELSE 0 END)::INT AS activas`
+      : `SUM(CASE WHEN ${PERSONAS_RELATED_STATE_EXPR} = true THEN 1 ELSE 0 END)::INT AS activas`;
+    const inactiveExpr = usesSoftDeleteField
+      ? `SUM(CASE WHEN p.${capabilities.softDeleteField} = false THEN 1 ELSE 0 END)::INT AS inactivas`
+      : `SUM(CASE WHEN ${PERSONAS_RELATED_STATE_EXPR} = false THEN 1 ELSE 0 END)::INT AS inactivas`;
+    const statsFromClause = usesSoftDeleteField
+      ? 'FROM personas p'
+      : `FROM personas p ${PERSONAS_REL_STATE_JOIN}`;
 
     const query = `
       SELECT
         COUNT(*)::INT AS total,
         ${activeExpr},
         ${inactiveExpr},
-        SUM(CASE WHEN LOWER(COALESCE(genero, '')) IN ('f', 'femenino', 'female', 'mujer') THEN 1 ELSE 0 END)::INT AS femenino,
-        SUM(CASE WHEN LOWER(COALESCE(genero, '')) IN ('m', 'masculino', 'male', 'hombre') THEN 1 ELSE 0 END)::INT AS masculino
-      FROM personas
+        SUM(CASE WHEN LOWER(COALESCE(p.genero, '')) IN ('f', 'femenino', 'female', 'mujer') THEN 1 ELSE 0 END)::INT AS femenino,
+        SUM(CASE WHEN LOWER(COALESCE(p.genero, '')) IN ('m', 'masculino', 'male', 'hombre') THEN 1 ELSE 0 END)::INT AS masculino
+      ${statsFromClause}
       ${whereClause}
     `;
 
@@ -792,13 +835,6 @@ const personaService = {
 
     if (req.query.estado !== undefined && estado === null) {
       return { status: 400, body: { error: true, message: 'El filtro estado debe ser booleano' } };
-    }
-
-    if (req.query.estado !== undefined && !capabilities.softDeleteField) {
-      return {
-        status: 400,
-        body: { error: true, message: 'La tabla personas no soporta filtro por estado' }
-      };
     }
 
     const tenantId = parsePositiveInt(req.user?.id_empresa);
