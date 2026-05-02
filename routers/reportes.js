@@ -1,6 +1,6 @@
 ﻿import express from 'express';
 import pool from '../config/db-connection.js';
-import { checkPermission } from '../middleware/checkPermission.js';
+import { checkPermission, requestHasAnyPermission } from '../middleware/checkPermission.js';
 import { resolveRequestUserSucursalScope } from '../utils/sucursalScope.js';
 
 const router = express.Router();
@@ -71,6 +71,7 @@ const parsePositiveInt = (value) => {
 };
 
 const roundMoney = (value) => Number(Number(value || 0).toFixed(2));
+const toDateStamp = () => new Date().toISOString().slice(0, 10);
 
 const normalizeFilterValue = (value) => {
   if (value === undefined || value === null) return null;
@@ -174,6 +175,78 @@ const sendPhaseOnePayload = (res, reportKey, filters) => {
       generado_en: new Date().toISOString()
     }
   });
+};
+
+const normalizeReportKeyInput = (value) =>
+  String(value || '')
+    .trim()
+    .toLowerCase()
+    .replace(/-/g, '_');
+
+const csvEscape = (value) => {
+  if (value === null || value === undefined) return '';
+  const text = String(value).replace(/\r?\n/g, ' ').trim();
+  if (/[",;]/.test(text)) return `"${text.replace(/"/g, '""')}"`;
+  return text;
+};
+
+const buildCsvFromRows = (rows = []) => {
+  if (!Array.isArray(rows) || rows.length === 0) return '';
+  const headers = [...new Set(rows.flatMap((row) => Object.keys(row || {})))];
+  const headerLine = headers.map(csvEscape).join(';');
+  const lines = rows.map((row) =>
+    headers
+      .map((key) => csvEscape(row?.[key] ?? ''))
+      .join(';')
+  );
+  return [headerLine, ...lines].join('\n');
+};
+
+const buildExcelCompatibleCsv = ({ reportKey, payload }) => {
+  const sections = [];
+  const data = payload?.data || {};
+  const filtros = payload?.filtros || {};
+  const kpis = data?.kpis || null;
+
+  sections.push(`Reporte;${csvEscape(reportKey)}`);
+  sections.push(`Generado;${csvEscape(new Date().toISOString())}`);
+  sections.push(`Filtros;${csvEscape(JSON.stringify(filtros))}`);
+
+  if (kpis && typeof kpis === 'object') {
+    sections.push('');
+    sections.push('KPIs');
+    sections.push('Metrica;Valor');
+    Object.entries(kpis).forEach(([key, value]) => {
+      sections.push(`${csvEscape(key)};${csvEscape(value)}`);
+    });
+  }
+
+  const arraySections = Object.entries(data).filter(
+    ([key, value]) => key !== 'kpis' && Array.isArray(value)
+  );
+
+  arraySections.forEach(([key, value]) => {
+    sections.push('');
+    sections.push(key);
+    const csv = buildCsvFromRows(value);
+    sections.push(csv || 'Sin datos');
+  });
+
+  if (arraySections.length === 0) {
+    sections.push('');
+    sections.push('Detalle');
+    sections.push('Sin datos para exportar');
+  }
+
+  return `\uFEFF${sections.join('\n')}\n`;
+};
+
+const buildExportFileName = ({ reportKey, parsedFilters }) => {
+  const base = `reporte_${String(reportKey || 'general').toLowerCase()}`;
+  const from = parsedFilters?.fecha_inicio || '';
+  const to = parsedFilters?.fecha_fin || '';
+  const range = from || to ? `_${from || 'inicio'}_${to || 'fin'}` : '';
+  return `${base}${range}_${toDateStamp()}.csv`;
 };
 
 const buildVentasScopeWhere = ({ parsedFilters, scope, params }) => {
@@ -1536,6 +1609,95 @@ const getVentasItems = async (req, res, filters, parsedFilters) => {
   });
 };
 
+const executeReportByKey = async ({ key, req, res, filters, parsedFilters }) => {
+  if (key === 'ventas_resumen') return await getVentasResumen(req, res, filters, parsedFilters);
+  if (key === 'ventas_metodos_pago') return await getVentasMetodosPago(req, res, filters, parsedFilters);
+  if (key === 'caja_cierres') return await getCajaCierres(req, res, filters, parsedFilters);
+  if (key === 'caja_diferencias') return await getCajaDiferencias(req, res, filters, parsedFilters);
+  if (key === 'inventario_stock_critico') return await getInventarioStockCritico(req, res, filters, parsedFilters);
+  if (key === 'inventario_kardex') return await getInventarioKardex(req, res, filters, parsedFilters);
+  if (key === 'ventas_descuentos') return await getVentasDescuentos(req, res, filters, parsedFilters);
+  if (key === 'ventas_items') return await getVentasItems(req, res, filters, parsedFilters);
+  return sendPhaseOnePayload(res, key, filters);
+};
+
+const createCaptureResponse = () => {
+  const state = { statusCode: 200, body: null };
+  return {
+    state,
+    api: {
+      status(code) {
+        state.statusCode = code;
+        return this;
+      },
+      json(payload) {
+        state.body = payload;
+        return payload;
+      },
+      setHeader() {
+        return this;
+      }
+    }
+  };
+};
+
+router.get('/reportes/exportar/excel', checkPermission([BASE_PERMISSION, 'REPORTES_EXPORTAR_EXCEL']), async (req, res) => {
+  try {
+    const reportKeyInput = normalizeReportKeyInput(req.query?.reporte);
+    const reportDefinition = Object.values(REPORT_DEFINITIONS).find((item) => item.key === reportKeyInput);
+
+    if (!reportDefinition) {
+      return res.status(400).json({
+        error: true,
+        message: 'El parametro reporte es invalido para exportacion.'
+      });
+    }
+
+    const hasReportPermission = await requestHasAnyPermission(req, reportDefinition.permissions);
+    if (!hasReportPermission) {
+      return res.status(403).json({
+        error: true,
+        message: 'Acceso denegado: permisos insuficientes'
+      });
+    }
+
+    const parsed = parseFilters(req.query || {});
+    if (!parsed.ok) {
+      return res.status(400).json({ error: true, message: parsed.message });
+    }
+
+    const capture = createCaptureResponse();
+    await executeReportByKey({
+      key: reportDefinition.key,
+      req,
+      res: capture.api,
+      filters: parsed.filters,
+      parsedFilters: parsed.parsed
+    });
+
+    if (capture.state.statusCode >= 400) {
+      return res.status(capture.state.statusCode).json(
+        capture.state.body || { error: true, message: 'No se pudo generar el reporte solicitado.' }
+      );
+    }
+
+    const csvContent = buildExcelCompatibleCsv({
+      reportKey: reportDefinition.key,
+      payload: capture.state.body
+    });
+    const filename = buildExportFileName({
+      reportKey: reportDefinition.key,
+      parsedFilters: parsed.parsed
+    });
+
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    return res.status(200).send(csvContent);
+  } catch (error) {
+    return res.status(500).json({ error: true, message: 'No se pudo exportar el reporte solicitado.' });
+  }
+});
+
 router.use('/reportes', checkPermission(BASE_PERMISSION));
 
 Object.entries(REPORT_DEFINITIONS).forEach(([path, config]) => {
@@ -1545,33 +1707,13 @@ Object.entries(REPORT_DEFINITIONS).forEach(([path, config]) => {
       if (!parsed.ok) {
         return res.status(400).json({ error: true, message: parsed.message });
       }
-
-      if (config.key === 'ventas_resumen') {
-        return await getVentasResumen(req, res, parsed.filters, parsed.parsed);
-      }
-      if (config.key === 'ventas_metodos_pago') {
-        return await getVentasMetodosPago(req, res, parsed.filters, parsed.parsed);
-      }
-      if (config.key === 'caja_cierres') {
-        return await getCajaCierres(req, res, parsed.filters, parsed.parsed);
-      }
-      if (config.key === 'caja_diferencias') {
-        return await getCajaDiferencias(req, res, parsed.filters, parsed.parsed);
-      }
-      if (config.key === 'inventario_stock_critico') {
-        return await getInventarioStockCritico(req, res, parsed.filters, parsed.parsed);
-      }
-      if (config.key === 'inventario_kardex') {
-        return await getInventarioKardex(req, res, parsed.filters, parsed.parsed);
-      }
-      if (config.key === 'ventas_descuentos') {
-        return await getVentasDescuentos(req, res, parsed.filters, parsed.parsed);
-      }
-      if (config.key === 'ventas_items') {
-        return await getVentasItems(req, res, parsed.filters, parsed.parsed);
-      }
-
-      return sendPhaseOnePayload(res, config.key, parsed.filters);
+      return await executeReportByKey({
+        key: config.key,
+        req,
+        res,
+        filters: parsed.filters,
+        parsedFilters: parsed.parsed
+      });
     } catch (error) {
       return res.status(500).json({ error: true, message: 'No se pudo generar el reporte solicitado.' });
     }
