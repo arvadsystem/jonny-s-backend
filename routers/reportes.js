@@ -59,6 +59,8 @@ const FILTER_KEYS = Object.freeze([
   'estado',
   'proveedor',
   'tipo_movimiento'
+  ,
+  'tipo_descuento'
 ]);
 
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
@@ -154,7 +156,8 @@ const parseFilters = (query = {}) => {
       solo_criticos: soloCriticos,
       categoria: filters.categoria || null,
       tipo_movimiento: filters.tipo_movimiento || null,
-      item: filters.item || null
+      item: filters.item || null,
+      tipo_descuento: filters.tipo_descuento || null
     }
   };
 };
@@ -1066,6 +1069,178 @@ const getInventarioKardex = async (req, res, filters, parsedFilters) => {
   });
 };
 
+const getVentasDescuentos = async (req, res, filters, parsedFilters) => {
+  const scope = await resolveRequestUserSucursalScope(req);
+  const params = [];
+  const where = [];
+
+  if (parsedFilters.fecha_inicio) {
+    params.push(parsedFilters.fecha_inicio);
+    where.push(`(COALESCE(p.fecha_hora_pedido, f.fecha_hora_facturacion))::date >= $${params.length}::date`);
+  }
+
+  if (parsedFilters.fecha_fin) {
+    params.push(parsedFilters.fecha_fin);
+    where.push(`(COALESCE(p.fecha_hora_pedido, f.fecha_hora_facturacion))::date <= $${params.length}::date`);
+  }
+
+  if (parsedFilters.id_sucursal) {
+    params.push(parsedFilters.id_sucursal);
+    where.push(`COALESCE(p.id_sucursal, f.id_sucursal) = $${params.length}`);
+  } else if (!scope.isSuperAdmin) {
+    const allowed = Array.isArray(scope.allowedSucursalIds)
+      ? scope.allowedSucursalIds.map((value) => parsePositiveInt(value)).filter(Boolean)
+      : [];
+    if (allowed.length === 0) {
+      return res.status(403).json({ error: true, message: 'No tiene sucursales asignadas para consultar este reporte.' });
+    }
+    params.push(allowed);
+    where.push(`COALESCE(p.id_sucursal, f.id_sucursal) = ANY($${params.length}::int[])`);
+  }
+
+  if (parsedFilters.id_caja) {
+    params.push(parsedFilters.id_caja);
+    where.push(`f.id_caja = $${params.length}`);
+  }
+
+  if (parsedFilters.id_usuario) {
+    params.push(parsedFilters.id_usuario);
+    where.push(`COALESCE(p.id_usuario, f.id_usuario) = $${params.length}`);
+  }
+
+  if (parsedFilters.estado) {
+    params.push(`%${parsedFilters.estado}%`);
+    where.push(`COALESCE(ep.descripcion, 'VENTA DIRECTA') ILIKE $${params.length}`);
+  }
+
+  if (parsedFilters.tipo_descuento) {
+    const tipoId = parsePositiveInt(parsedFilters.tipo_descuento);
+    if (tipoId) {
+      params.push(tipoId);
+      where.push(`td.id_tipo_descuento = $${params.length}`);
+    } else {
+      const tipoText = String(parsedFilters.tipo_descuento || '').trim();
+      if (!/^[\p{L}\p{N}\s._-]+$/u.test(tipoText)) {
+        return res.status(400).json({ error: true, message: 'El filtro tipo_descuento contiene caracteres no permitidos.' });
+      }
+      params.push(`%${tipoText}%`);
+      where.push(`COALESCE(td.nombre_tipo_descuento, '') ILIKE $${params.length}`);
+    }
+  }
+
+  const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
+
+  const detailQuery = `
+    SELECT
+      COALESCE(p.fecha_hora_pedido, f.fecha_hora_facturacion)::date AS fecha,
+      COALESCE(p.id_sucursal, f.id_sucursal) AS id_sucursal,
+      COALESCE(s.nombre_sucursal, 'Sin sucursal') AS sucursal,
+      f.id_caja,
+      CASE
+        WHEN c.id_caja IS NULL THEN 'Sin caja'
+        WHEN COALESCE(c.codigo_caja, '') = '' THEN COALESCE(c.nombre_caja, 'Caja')
+        ELSE CONCAT(c.codigo_caja, ' - ', COALESCE(c.nombre_caja, 'Caja'))
+      END AS caja,
+      COALESCE(p.id_usuario, f.id_usuario) AS id_usuario,
+      COALESCE(u.nombre_usuario, 'Sin usuario') AS usuario,
+      f.id_factura,
+      f.id_pedido,
+      COALESCE(
+        NULLIF(trim(concat_ws(' ', per.nombre, per.apellido)), ''),
+        emp.nombre_empresa,
+        'Consumidor final'
+      ) AS cliente,
+      COALESCE(td.id_tipo_descuento, 0) AS id_tipo_descuento,
+      COALESCE(td.nombre_tipo_descuento, 'SIN TIPO') AS tipo_descuento,
+      COALESCE(dc.nombre_descuento, 'DESCUENTO MANUAL') AS nombre_descuento,
+      COALESCE(d.monto_descuento, 0)::numeric(14,2) AS descuento,
+      COALESCE(df.sub_total, 0)::numeric(14,2) AS subtotal_linea,
+      COALESCE(df.total_detalle, 0)::numeric(14,2) AS total_linea,
+      COALESCE(ep.descripcion, 'VENTA DIRECTA') AS estado
+    FROM facturas f
+    INNER JOIN detalle_facturas df ON df.id_factura = f.id_factura
+    INNER JOIN descuentos d ON d.id_descuento = df.id_descuento
+    LEFT JOIN descuentos_catalogos dc ON dc.id_descuento_catalogo = d.id_descuento_catalogo
+    LEFT JOIN tipo_descuentos td ON td.id_tipo_descuento = dc.id_tipo_descuento
+    LEFT JOIN pedidos p ON p.id_pedido = f.id_pedido
+    LEFT JOIN estados_pedido ep ON ep.id_estado_pedido = p.id_estado_pedido
+    LEFT JOIN sucursales s ON s.id_sucursal = COALESCE(p.id_sucursal, f.id_sucursal)
+    LEFT JOIN cajas c ON c.id_caja = f.id_caja
+    LEFT JOIN usuarios u ON u.id_usuario = COALESCE(p.id_usuario, f.id_usuario)
+    LEFT JOIN clientes cl ON cl.id_cliente = COALESCE(p.id_cliente, f.id_cliente)
+    LEFT JOIN personas per ON per.id_persona = cl.id_persona
+    LEFT JOIN empresas emp ON emp.id_empresa = cl.id_empresa
+    ${whereSql}
+    ORDER BY fecha DESC, f.id_factura DESC, df.id_detalle_factura DESC
+  `;
+
+  const result = await pool.query(detailQuery, params);
+  const rows = Array.isArray(result.rows) ? result.rows : [];
+
+  const totalDescuento = rows.reduce((sum, row) => sum + Number(row.descuento || 0), 0);
+  const facturasUnicas = new Set(rows.map((row) => Number(row.id_factura || 0)).filter(Boolean));
+
+  const byTipo = new Map();
+  rows.forEach((row) => {
+    const key = `${row.id_tipo_descuento}-${row.tipo_descuento}`;
+    if (!byTipo.has(key)) {
+      byTipo.set(key, {
+        tipo_descuento: row.tipo_descuento || 'SIN TIPO',
+        cantidad_lineas: 0,
+        _ventas: new Set(),
+        total_descuento: 0
+      });
+    }
+    const bucket = byTipo.get(key);
+    bucket.cantidad_lineas += 1;
+    if (row.id_factura) bucket._ventas.add(Number(row.id_factura));
+    bucket.total_descuento += Number(row.descuento || 0);
+  });
+
+  const resumenTipo = [...byTipo.values()]
+    .map((item) => ({
+      tipo_descuento: item.tipo_descuento,
+      cantidad_lineas: item.cantidad_lineas,
+      ventas: item._ventas.size,
+      total_descuento: roundMoney(item.total_descuento)
+    }))
+    .sort((a, b) => b.total_descuento - a.total_descuento);
+
+  return res.json({
+    ok: true,
+    reporte: 'ventas_descuentos',
+    fase: 'fase_4a_real',
+    filtros: filters,
+    data: {
+      kpis: {
+        total_descuento: roundMoney(totalDescuento),
+        ventas_con_descuento: facturasUnicas.size,
+        lineas_con_descuento: rows.length,
+        ticket_promedio_descuento: facturasUnicas.size > 0 ? roundMoney(totalDescuento / facturasUnicas.size) : 0
+      },
+      resumen_tipo_descuento: resumenTipo,
+      detalle: rows.map((row) => ({
+        fecha: row.fecha,
+        sucursal: row.sucursal,
+        caja: row.caja,
+        usuario: row.usuario,
+        factura: row.id_factura,
+        pedido: row.id_pedido,
+        cliente: row.cliente,
+        tipo_descuento: row.tipo_descuento,
+        descuento: roundMoney(row.descuento),
+        subtotal_linea: roundMoney(row.subtotal_linea),
+        total_linea: roundMoney(row.total_linea),
+        estado: row.estado
+      }))
+    },
+    meta: {
+      fuente_canonica: 'facturas + detalle_facturas + descuentos + descuentos_catalogos + tipo_descuentos + pedidos',
+      generado_en: new Date().toISOString()
+    }
+  });
+};
+
 router.use('/reportes', checkPermission(BASE_PERMISSION));
 
 Object.entries(REPORT_DEFINITIONS).forEach(([path, config]) => {
@@ -1093,6 +1268,9 @@ Object.entries(REPORT_DEFINITIONS).forEach(([path, config]) => {
       }
       if (config.key === 'inventario_kardex') {
         return await getInventarioKardex(req, res, parsed.filters, parsed.parsed);
+      }
+      if (config.key === 'ventas_descuentos') {
+        return await getVentasDescuentos(req, res, parsed.filters, parsed.parsed);
       }
 
       return sendPhaseOnePayload(res, config.key, parsed.filters);
