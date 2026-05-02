@@ -12,6 +12,7 @@ import {
   detectImageMimeTypeFromBuffer
 } from '../utils/uploads.js';
 import { ensurePasswordChangedAtColumn } from '../utils/security/passwordExpiration.js';
+import { enviarCorreo } from '../utils/emailService.js';
 
 const router = express.Router();
 const USUARIOS_LIST_PERMISSIONS = ['USUARIOS_LISTADO_VER'];
@@ -262,6 +263,10 @@ const v2NormalizeText = (value) => {
   if (value === null || value === undefined) return '';
   return String(value).trim();
 };
+
+const v2NormalizeEmail = (value) => v2NormalizeText(value).toLowerCase();
+const V2_SAFE_EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
+const v2IsSafeEmail = (value) => V2_SAFE_EMAIL_RE.test(v2NormalizeEmail(value));
 
 const v2ValidateCreatePassword = (plainPassword) => {
   const value = String(plainPassword ?? '');
@@ -685,6 +690,114 @@ const v2FetchUsuarioById = async (idUsuario, queryRunner = pool) => {
 
   const result = await queryRunner.query(query, [idUsuario]);
   return v2MapUsuarioRow(result.rows[0] || null);
+};
+
+const v2ResolveUsuarioEmail = async (idUsuario, queryRunner = pool) => {
+  const result = await queryRunner.query(
+    `
+      SELECT
+        COALESCE(
+          NULLIF(TRIM(ce_link.direccion_correo), ''),
+          NULLIF(TRIM(ce_persona.direccion_correo), ''),
+          NULLIF(TRIM(cc_link.direccion_correo), ''),
+          NULLIF(TRIM(cc_persona.direccion_correo), '')
+        ) AS correo
+      FROM usuarios u
+      LEFT JOIN empleados e ON e.id_empleado = u.id_empleado
+      LEFT JOIN personas pe ON pe.id_persona = e.id_persona
+      LEFT JOIN correos ce_link ON ce_link.id_correo = pe.id_correo
+      LEFT JOIN correos ce_persona ON (pe.id_correo IS NULL AND ce_persona.id_persona = pe.id_persona)
+      LEFT JOIN clientes cl ON cl.id_cliente = u.id_cliente
+      LEFT JOIN personas pc ON pc.id_persona = cl.id_persona
+      LEFT JOIN correos cc_link ON cc_link.id_correo = pc.id_correo
+      LEFT JOIN correos cc_persona ON (pc.id_correo IS NULL AND cc_persona.id_persona = pc.id_persona)
+      WHERE u.id_usuario = $1
+      LIMIT 1
+    `,
+    [idUsuario]
+  );
+
+  return v2NormalizeEmail(result.rows?.[0]?.correo);
+};
+
+const v2BuildTemporaryPasswordEmailHtml = ({
+  displayName,
+  username,
+  temporaryPassword,
+  mode = 'create',
+}) => {
+  const safeName = v2NormalizeText(displayName) || 'usuario';
+  const safeUsername = v2NormalizeText(username) || 'N/D';
+  const safePassword = v2NormalizeText(temporaryPassword) || 'N/D';
+  const modeLabel = mode === 'reset'
+    ? 'Hemos generado una nueva contrasena temporal para tu cuenta.'
+    : 'Tu cuenta fue creada y se genero una contrasena temporal.';
+
+  return `
+<!DOCTYPE html>
+<html lang="es">
+<head><meta charset="UTF-8"></head>
+<body style="margin:0; padding:0; background:#0e0704; font-family:Arial,sans-serif;">
+  <table width="100%" cellpadding="0" cellspacing="0" style="max-width:620px; margin:28px auto; background:#1a1108; border:1px solid rgba(212,165,116,0.25); border-radius:14px;">
+    <tr>
+      <td style="padding:28px 32px; color:#fdfaf5;">
+        <h2 style="margin:0 0 10px; color:#d4a574;">Credenciales temporales</h2>
+        <p style="margin:0 0 16px; color:rgba(255,255,255,0.82); line-height:1.5;">
+          Hola ${safeName},<br/>${modeLabel}
+        </p>
+        <div style="background:#24170f; border:1px solid rgba(212,165,116,0.28); border-radius:10px; padding:16px;">
+          <p style="margin:0 0 8px; color:rgba(255,255,255,0.8);"><strong>Usuario:</strong> ${safeUsername}</p>
+          <p style="margin:0; color:rgba(255,255,255,0.8);"><strong>Contrasena temporal:</strong> ${safePassword}</p>
+        </div>
+        <p style="margin:16px 0 0; color:rgba(255,255,255,0.68); line-height:1.5;">
+          Por seguridad, inicia sesion y cambia la contrasena en tu primer acceso.
+        </p>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>`;
+};
+
+const v2SendTemporaryPasswordEmail = async ({
+  idUsuario,
+  username,
+  displayName,
+  temporaryPassword,
+  mode = 'create',
+  queryRunner = pool,
+}) => {
+  const id = v2ParsePositiveInt(idUsuario);
+  if (!id) {
+    return { sent: false, skipped: true, reason: 'INVALID_USER_ID', to: null };
+  }
+
+  const targetEmail = await v2ResolveUsuarioEmail(id, queryRunner);
+  if (!v2IsSafeEmail(targetEmail)) {
+    return { sent: false, skipped: true, reason: 'EMAIL_NOT_AVAILABLE', to: null };
+  }
+
+  const subject = mode === 'reset'
+    ? 'Nueva contrasena temporal - Jonnys SmartOrder'
+    : 'Credenciales temporales - Jonnys SmartOrder';
+  const html = v2BuildTemporaryPasswordEmailHtml({
+    displayName,
+    username,
+    temporaryPassword,
+    mode,
+  });
+
+  try {
+    await enviarCorreo(targetEmail, subject, html, {
+      id_usuario: id,
+      tipo_correo: mode === 'reset' ? 'credenciales_temporales_reset' : 'credenciales_temporales_creacion',
+      fromKey: 'ACCESO',
+    });
+    return { sent: true, skipped: false, to: targetEmail };
+  } catch (error) {
+    console.error('[usuarios/v2] Error enviando contrasena temporal por correo:', error?.message || error);
+    return { sent: false, skipped: false, reason: 'SMTP_SEND_FAILED', to: targetEmail };
+  }
 };
 
 const v2UsernameExists = async (nombreUsuario, { excludeId = null, queryRunner = pool } = {}) => {
@@ -1685,6 +1798,14 @@ router.post('/usuarios/v2/generate', checkPermission(USUARIOS_CREATE_PERMISSIONS
     createdUser = await v2FetchUsuarioById(idUsuarioCreado, client);
     await client.query('COMMIT');
 
+    const emailNotification = await v2SendTemporaryPasswordEmail({
+      idUsuario: createdUser?.id_usuario,
+      username: createdUser?.nombre_usuario,
+      displayName: createdUser?.nombre_completo,
+      temporaryPassword,
+      mode: 'create',
+    });
+
     return res.status(201).json({
       ok: true,
       usuario: {
@@ -1698,6 +1819,7 @@ router.post('/usuarios/v2/generate', checkPermission(USUARIOS_CREATE_PERMISSIONS
         tipo_usuario: createdUser?.tipo_usuario,
       },
       temp_password: temporaryPassword,
+      email_notification: emailNotification,
     });
   } catch (err) {
     try { await client.query('ROLLBACK'); } catch (_) { /* ignore */ }
@@ -1738,10 +1860,19 @@ router.post('/usuarios/v2/reset-password/:id_usuario', checkPermission(USUARIOS_
       values
     );
 
+    const emailNotification = await v2SendTemporaryPasswordEmail({
+      idUsuario: currentUser?.id_usuario,
+      username: currentUser?.nombre_usuario,
+      displayName: currentUser?.nombre_completo,
+      temporaryPassword,
+      mode: 'reset',
+    });
+
     return res.status(200).json({
       ok: true,
       nombre_usuario: currentUser?.nombre_usuario || null,
       temp_password: temporaryPassword,
+      email_notification: emailNotification,
     });
   } catch (err) {
     console.error('Error en /usuarios/v2/reset-password/:id_usuario:', err.message);

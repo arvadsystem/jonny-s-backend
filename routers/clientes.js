@@ -1956,14 +1956,18 @@ const clienteService = {
       };
     }
 
-    const nextTipoClienteId = Object.prototype.hasOwnProperty.call(rawUpdates, 'id_tipo_cliente')
+    const touchesTipoCliente = Object.prototype.hasOwnProperty.call(rawUpdates, 'id_tipo_cliente');
+    const nextTipoClienteId = touchesTipoCliente
       ? parseNullablePositiveInt(rawUpdates.id_tipo_cliente)
       : parseNullablePositiveInt(current.id_tipo_cliente);
-    if (!nextTipoClienteId || !(await clienteRepository.tipoClienteExists(nextTipoClienteId, capabilities))) {
-      return {
-        status: 400,
-        body: buildErrorBody({ code: 'VALIDATION_ERROR', message: 'id_tipo_cliente no es valido.' })
-      };
+    if (touchesTipoCliente) {
+      if (!nextTipoClienteId || !(await clienteRepository.tipoClienteExists(nextTipoClienteId, capabilities))) {
+        return {
+          status: 400,
+          body: buildErrorBody({ code: 'VALIDATION_ERROR', message: 'id_tipo_cliente no es valido.' })
+        };
+      }
+      rawUpdates.id_tipo_cliente = nextTipoClienteId;
     }
 
     if (touchesPersona) rawUpdates.id_persona = nextPersonaId;
@@ -1974,10 +1978,6 @@ const clienteService = {
         rawUpdates.id_empresa = nextEmpresaId;
       }
     }
-    if (Object.prototype.hasOwnProperty.call(rawUpdates, 'id_tipo_cliente')) {
-      rawUpdates.id_tipo_cliente = nextTipoClienteId;
-    }
-
     const functionPayload = normalizeClienteFunctionPayload(rawUpdates);
     if (capabilities.hasEmpresaClienteField && Object.prototype.hasOwnProperty.call(functionPayload, 'id_empresa')) {
       delete functionPayload.id_empresa;
