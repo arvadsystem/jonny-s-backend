@@ -16,6 +16,9 @@ const parsePositiveInt = (value) => {
   const parsed = Number.parseInt(String(value ?? ''), 10);
   return Number.isInteger(parsed) && parsed > 0 ? parsed : null;
 };
+const ENTITY_COMPOSER_SCHEMA_CACHE_TTL_MS = 60_000;
+let personasTenantColumnCache = null;
+let personasTenantColumnCheckedAt = 0;
 const PERSONA_ALLOWED_FIELDS = new Set([
   'id_persona',
   'nombre',
@@ -149,22 +152,43 @@ const extractIdFromUnknown = (value, candidateKeys = []) => {
   return walk(value, 0);
 };
 
+const hasPersonasTenantColumn = async (client, { forceRefresh = false } = {}) => {
+  const now = Date.now();
+  const shouldRefresh = forceRefresh
+    || !personasTenantColumnCheckedAt
+    || (now - personasTenantColumnCheckedAt) > ENTITY_COMPOSER_SCHEMA_CACHE_TTL_MS;
+
+  if (!shouldRefresh && personasTenantColumnCache !== null) {
+    return personasTenantColumnCache;
+  }
+
+  personasTenantColumnCheckedAt = now;
+  const rs = await client.query(
+    `
+      SELECT 1
+      FROM information_schema.columns
+      WHERE table_schema = 'public'
+        AND table_name = 'personas'
+        AND column_name = 'id_empresa'
+      LIMIT 1
+    `
+  );
+  personasTenantColumnCache = Boolean(rs.rows?.length);
+  return personasTenantColumnCache;
+};
+
 const getPersonaTenantId = async (client, idPersona) => {
-  try {
-    const rs = await client.query('SELECT id_empresa FROM personas WHERE id_persona = $1 LIMIT 1', [idPersona]);
-    return parsePositiveInt(rs.rows?.[0]?.id_empresa);
-  } catch {
+  const hasTenantColumn = await hasPersonasTenantColumn(client);
+  if (!hasTenantColumn) {
     return null;
   }
+  const rs = await client.query('SELECT id_empresa FROM personas WHERE id_persona = $1 LIMIT 1', [idPersona]);
+  return parsePositiveInt(rs.rows?.[0]?.id_empresa);
 };
 
 const getEmpresaTenantId = async (client, idEmpresa) => {
-  try {
-    const rs = await client.query('SELECT id_empresa FROM empresas WHERE id_empresa = $1 LIMIT 1', [idEmpresa]);
-    return parsePositiveInt(rs.rows?.[0]?.id_empresa);
-  } catch {
-    return null;
-  }
+  const rs = await client.query('SELECT id_empresa FROM empresas WHERE id_empresa = $1 LIMIT 1', [idEmpresa]);
+  return parsePositiveInt(rs.rows?.[0]?.id_empresa);
 };
 
 const validatePersonaPayload = (payload = {}) => {

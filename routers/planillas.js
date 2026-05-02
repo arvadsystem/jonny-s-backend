@@ -70,14 +70,19 @@ const GENERAR_ALLOWED_FIELDS = new Set([
   'periodo',
   'id_estado_planilla',
   'dias_laborados',
-  'horas_laboradas'
+  'horas_laboradas',
+  'tipo_periodo',
+  'quincena'
 ]);
 const ESTADO_ALLOWED_FIELDS = new Set([
   'id_estado_planilla',
   'id_estado',
   'estado',
   'recalcular',
-  'id_sucursal'
+  'id_sucursal',
+  'tipo_periodo',
+  'quincena',
+  'usuario_accion'
 ]);
 const ANULAR_ALLOWED_FIELDS = new Set(['usuario_accion', 'motivo', 'id_sucursal']);
 const ANULAR_MOVIMIENTO_ALLOWED_FIELDS = new Set(['usuario_accion', 'motivo', 'id_planilla', 'id_sucursal']);
@@ -88,7 +93,9 @@ const APLICAR_ADELANTO_ALLOWED_FIELDS = new Set([
   'id_adelanto_salario',
   'monto_aplicar',
   'monto',
-  'id_sucursal'
+  'id_sucursal',
+  'tipo_periodo',
+  'quincena'
 ]);
 const REGISTRAR_ADELANTO_ALLOWED_FIELDS = new Set([
   'id_empleado',
@@ -117,9 +124,16 @@ const REGISTRAR_HORAS_EXTRA_ALLOWED_FIELDS = new Set([
   'id_sucursal',
   'id_tipo_hora',
   'id_factor_horas_extras',
-  'tarifa_base'
+  'tarifa_base',
+  'tipo_periodo',
+  'quincena'
 ]);
-const COMPENSAR_HORAS_EXTRA_ALLOWED_FIELDS = new Set(['observacion', 'id_sucursal']);
+const COMPENSAR_HORAS_EXTRA_ALLOWED_FIELDS = new Set([
+  'observacion',
+  'id_sucursal',
+  'tipo_periodo',
+  'quincena'
+]);
 const MOVIMIENTO_ALLOWED_FIELDS = new Set([
   'id_detalle',
   'id_detalle_planilla',
@@ -128,19 +142,65 @@ const MOVIMIENTO_ALLOWED_FIELDS = new Set([
   'concepto',
   'monto',
   'observacion',
-  'id_sucursal'
+  'id_sucursal',
+  'tipo_periodo',
+  'quincena'
 ]);
 
-const LIST_QUERY_ALLOWED_FIELDS = new Set(['page', 'limit', 'id_sucursal', 'periodo', 'search', 'q', 'estado', '_ts']);
-const DETALLE_QUERY_ALLOWED_FIELDS = new Set(['page', 'limit', 'search', 'q', 'id_sucursal', '_ts']);
-const RESUMEN_QUERY_ALLOWED_FIELDS = new Set(['id_sucursal', '_ts']);
-const COMPLETA_QUERY_ALLOWED_FIELDS = new Set(['id_sucursal', '_ts']);
-const HORAS_EXTRA_QUERY_ALLOWED_FIELDS = new Set(['page', 'limit', 'id_empleado', 'estado', 'id_sucursal', '_ts']);
+const LIST_QUERY_ALLOWED_FIELDS = new Set([
+  'page',
+  'limit',
+  'id_sucursal',
+  'periodo',
+  'search',
+  'q',
+  'estado',
+  'tipo_periodo',
+  'quincena',
+  '_ts'
+]);
+const DETALLE_QUERY_ALLOWED_FIELDS = new Set([
+  'page',
+  'limit',
+  'search',
+  'q',
+  'id_sucursal',
+  'tipo_periodo',
+  'quincena',
+  '_ts'
+]);
+const RESUMEN_QUERY_ALLOWED_FIELDS = new Set(['id_sucursal', 'tipo_periodo', 'quincena', '_ts']);
+const COMPLETA_QUERY_ALLOWED_FIELDS = new Set(['id_sucursal', 'tipo_periodo', 'quincena', '_ts']);
+const HORAS_EXTRA_QUERY_ALLOWED_FIELDS = new Set([
+  'page',
+  'limit',
+  'id_empleado',
+  'estado',
+  'id_sucursal',
+  'tipo_periodo',
+  'quincena',
+  '_ts'
+]);
 const EMPLEADOS_ACTIVOS_QUERY_ALLOWED_FIELDS = new Set(['page', 'limit', 'search', 'q', '_ts']);
 const ADELANTOS_PENDIENTES_QUERY_ALLOWED_FIELDS = new Set(['page', 'limit', 'search', 'q', 'periodo', '_ts']);
 const ADELANTOS_APLICABLES_QUERY_ALLOWED_FIELDS = new Set(['page', 'limit', 'id_detalle', 'id_sucursal', '_ts']);
-const MOVIMIENTOS_QUERY_ALLOWED_FIELDS = new Set(['page', 'limit', 'id_detalle', 'id_sucursal', '_ts']);
-const MOVIMIENTOS_DETALLE_QUERY_ALLOWED_FIELDS = new Set(['page', 'limit', 'id_sucursal', '_ts']);
+const MOVIMIENTOS_QUERY_ALLOWED_FIELDS = new Set([
+  'page',
+  'limit',
+  'id_detalle',
+  'id_sucursal',
+  'tipo_periodo',
+  'quincena',
+  '_ts'
+]);
+const MOVIMIENTOS_DETALLE_QUERY_ALLOWED_FIELDS = new Set([
+  'page',
+  'limit',
+  'id_sucursal',
+  'tipo_periodo',
+  'quincena',
+  '_ts'
+]);
 const AUDITORIA_QUERY_ALLOWED_FIELDS = new Set(['page', 'limit', 'entidad', 'id_sucursal', '_ts']);
 
 let planillaFunctionCatalogPromise;
@@ -150,6 +210,92 @@ const HORAS_EXTRA_ID_COLUMN_CANDIDATES = Object.freeze([
   'id_horas_extras',
   'id_horas_extra'
 ]);
+const TIPO_PERIODO = Object.freeze({
+  MENSUAL: 'MENSUAL',
+  QUINCENAL: 'QUINCENAL'
+});
+const QUINCENA_ESTADO_AUDITORIA_ACCION = 'ESTADO_QUINCENA';
+const QUINCENA_ESTADO_AUDITORIA_ENTIDAD = 'PLANILLA_QUINCENAL';
+const QUINCENA_ADELANTO_AUDITORIA_ACCION = 'ADELANTO_QUINCENA';
+const QUINCENA_ADELANTO_AUDITORIA_ENTIDAD = 'PLANILLA_ADELANTO';
+
+const normalizeTipoPeriodo = (value) => {
+  if (value === null || value === undefined || value === '') return TIPO_PERIODO.MENSUAL;
+  const normalized = String(value).trim().toUpperCase();
+  if (!normalized) return TIPO_PERIODO.MENSUAL;
+  if (normalized === TIPO_PERIODO.MENSUAL) return TIPO_PERIODO.MENSUAL;
+  if (normalized === TIPO_PERIODO.QUINCENAL) return TIPO_PERIODO.QUINCENAL;
+  return null;
+};
+
+const normalizeTipoPeriodoStrict = (value) => {
+  if (value === null || value === undefined || value === '') return null;
+  const normalized = String(value).trim().toUpperCase();
+  if (!normalized) return null;
+  if (normalized === TIPO_PERIODO.MENSUAL) return TIPO_PERIODO.MENSUAL;
+  if (normalized === TIPO_PERIODO.QUINCENAL) return TIPO_PERIODO.QUINCENAL;
+  return null;
+};
+
+const normalizeQuincena = (value) => {
+  if (value === null || value === undefined || value === '') return null;
+  const parsed = parsePositiveInt(value);
+  if (!parsed) return null;
+  if (parsed !== 1 && parsed !== 2) return null;
+  return parsed;
+};
+
+const parseQuincenaFromText = (value) => {
+  const text = String(value ?? '').trim().toLowerCase();
+  if (!text) return null;
+  if (/(^|\b)q\s*1(\b|$)/i.test(text) || /quincena\s*1/i.test(text)) return 1;
+  if (/(^|\b)q\s*2(\b|$)/i.test(text) || /quincena\s*2/i.test(text)) return 2;
+  return null;
+};
+
+const resolveRowQuincena = (row = {}) => {
+  const direct = normalizeQuincena(
+    row?.quincena ??
+      row?.numero_quincena ??
+      row?.id_quincena ??
+      row?.quincena_numero
+  );
+  if (direct) return direct;
+
+  const textSources = [
+    row?.subperiodo,
+    row?.periodo_subtipo,
+    row?.descripcion_periodo,
+    row?.periodo_label,
+    row?.codigo_planilla
+  ];
+  for (const source of textSources) {
+    const parsed = parseQuincenaFromText(source);
+    if (parsed) return parsed;
+  }
+
+  const periodStart = normalizeDateOnlyKey(row?.periodo_inicio ?? row?.fecha_inicio_periodo);
+  if (periodStart) {
+    const day = Number.parseInt(periodStart.slice(8, 10), 10);
+    if (Number.isInteger(day)) return day <= 15 ? 1 : 2;
+  }
+
+  return null;
+};
+
+const resolveRowTipoPeriodo = (row = {}) => {
+  const direct = normalizeTipoPeriodoStrict(
+    row?.tipo_periodo ??
+      row?.periodo_tipo ??
+      row?.tipoPeriodo
+  );
+  if (direct) return direct;
+
+  const resolvedQuincena = resolveRowQuincena(row);
+  if (resolvedQuincena === 1 || resolvedQuincena === 2) return TIPO_PERIODO.QUINCENAL;
+
+  return TIPO_PERIODO.MENSUAL;
+};
 
 const parsePositiveInt = (value) => {
   if (value === null || value === undefined) return null;
@@ -250,6 +396,476 @@ const toMonthKey = (value) => {
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return null;
   return `${date.getUTCFullYear()}-${String(date.getUTCMonth() + 1).padStart(2, '0')}`;
+};
+
+const getDaysInMonth = (dateValue) => {
+  const baseDate = new Date(dateValue);
+  if (Number.isNaN(baseDate.getTime())) return 30;
+  return new Date(Date.UTC(baseDate.getUTCFullYear(), baseDate.getUTCMonth() + 1, 0)).getUTCDate();
+};
+
+const resolveQuincenaWindow = (dateValue, quincena) => {
+  const baseDate = new Date(dateValue);
+  if (Number.isNaN(baseDate.getTime())) return null;
+
+  const year = baseDate.getUTCFullYear();
+  const month = baseDate.getUTCMonth();
+  const lastDay = getDaysInMonth(baseDate);
+  const normalizedQuincena = quincena === 2 ? 2 : 1;
+  const startDay = normalizedQuincena === 1 ? 1 : 16;
+  const endDay = normalizedQuincena === 1 ? Math.min(15, lastDay) : lastDay;
+
+  const start = new Date(Date.UTC(year, month, startDay));
+  const end = new Date(Date.UTC(year, month, endDay));
+  const totalDays = Math.max(1, lastDay);
+  const quincenaDays = Math.max(1, endDay - startDay + 1);
+
+  return {
+    quincena: normalizedQuincena,
+    inicio: start.toISOString().slice(0, 10),
+    fin: end.toISOString().slice(0, 10),
+    dias_quincena: quincenaDays,
+    dias_mes: totalDays,
+    factor: quincenaDays / totalDays
+  };
+};
+
+const buildPeriodoMeta = ({ fechaPlanilla, tipoPeriodo, quincena = null, diasLaborados, horasLaboradas }) => {
+  if (tipoPeriodo !== TIPO_PERIODO.QUINCENAL) {
+    return {
+      tipo_periodo: TIPO_PERIODO.MENSUAL,
+      quincena: null,
+      periodo_inicio: null,
+      periodo_fin: null,
+      dias_laborados: diasLaborados,
+      horas_laboradas: horasLaboradas,
+      factor_prorrateo: 1
+    };
+  }
+
+  const quincenaWindow = resolveQuincenaWindow(fechaPlanilla, quincena || 1);
+  return {
+    tipo_periodo: TIPO_PERIODO.QUINCENAL,
+    quincena: quincenaWindow?.quincena || 1,
+    periodo_inicio: quincenaWindow?.inicio || null,
+    periodo_fin: quincenaWindow?.fin || null,
+    dias_laborados: diasLaborados,
+    horas_laboradas: horasLaboradas,
+    factor_prorrateo: quincenaWindow?.factor || 0.5
+  };
+};
+
+const resolvePeriodoContextInput = ({
+  rawTipoPeriodo,
+  rawQuincena,
+  defaultTipoPeriodo = TIPO_PERIODO.MENSUAL
+} = {}) => {
+  const hasTipoPeriodo =
+    rawTipoPeriodo !== undefined &&
+    rawTipoPeriodo !== null &&
+    String(rawTipoPeriodo).trim() !== '';
+
+  const tipoPeriodo = hasTipoPeriodo
+    ? normalizeTipoPeriodoStrict(rawTipoPeriodo)
+    : defaultTipoPeriodo;
+  if (hasTipoPeriodo && !tipoPeriodo) {
+    return { error: 'tipo_periodo invalido. Use mensual o quincenal.' };
+  }
+
+  const hasQuincena =
+    rawQuincena !== undefined &&
+    rawQuincena !== null &&
+    String(rawQuincena).trim() !== '';
+  const quincena = hasQuincena ? normalizeQuincena(rawQuincena) : null;
+  if (hasQuincena && quincena === null) {
+    return { error: 'quincena invalida. Use 1 o 2.' };
+  }
+
+  if (tipoPeriodo === TIPO_PERIODO.QUINCENAL && quincena === null) {
+    return { error: 'quincena es requerida cuando tipo_periodo es quincenal.' };
+  }
+
+  return {
+    hasTipoPeriodo,
+    hasQuincena,
+    tipo_periodo: tipoPeriodo || TIPO_PERIODO.MENSUAL,
+    quincena
+  };
+};
+
+const roundTo = (value, digits = 2) => {
+  const safe = Number(value);
+  if (!Number.isFinite(safe)) return 0;
+  const base = 10 ** digits;
+  return Math.round((safe + Number.EPSILON) * base) / base;
+};
+
+const resolveQuincenaFromDateLike = (value) => {
+  const normalizedDate = normalizeDateOnlyKey(value);
+  if (!normalizedDate) return null;
+  const day = Number.parseInt(normalizedDate.slice(8, 10), 10);
+  if (!Number.isInteger(day)) return null;
+  return day <= 15 ? 1 : 2;
+};
+
+const resolveQuincenaFromRowContext = (row = {}) => {
+  const fromNumeric = normalizeQuincena(
+    row?.quincena_resuelta ??
+      row?.quincena ??
+      row?.numero_quincena ??
+      row?.id_quincena
+  );
+  if (fromNumeric) return fromNumeric;
+
+  const textSources = [
+    row?.observacion,
+    row?.concepto,
+    row?.descripcion,
+    row?.periodo_subtipo,
+    row?.periodo_label
+  ];
+  for (const source of textSources) {
+    const fromText = parseQuincenaFromText(source);
+    if (fromText) return fromText;
+  }
+
+  const dateSources = [row?.fecha, row?.fecha_registro, row?.fecha_compensacion, row?.fecha_aplicacion];
+  for (const source of dateSources) {
+    const fromDate = resolveQuincenaFromDateLike(source);
+    if (fromDate) return fromDate;
+  }
+
+  return null;
+};
+
+const buildQuincenaContextTag = (quincena) => {
+  const safe = normalizeQuincena(quincena);
+  if (!safe) return '';
+  return `[QCTX:Q${safe}]`;
+};
+
+const appendQuincenaContextTag = (text, quincena) => {
+  const tag = buildQuincenaContextTag(quincena);
+  const base = sanitizeText(text, 255) || '';
+  if (!tag) return base || null;
+  if (base.includes(tag)) return base;
+  const merged = base ? `${base} ${tag}` : tag;
+  return sanitizeText(merged, 255) || tag;
+};
+
+const filterRowsByPeriodoContext = ({ rows = [], tipoPeriodo = TIPO_PERIODO.MENSUAL, quincena = null } = {}) => {
+  const safeRows = Array.isArray(rows) ? rows : [];
+  if (tipoPeriodo !== TIPO_PERIODO.QUINCENAL) return safeRows;
+  const resolvedQuincena = normalizeQuincena(quincena);
+  if (!resolvedQuincena) return safeRows;
+
+  return safeRows.filter((row) => resolveQuincenaFromRowContext(row) === resolvedQuincena);
+};
+
+const aggregateDetalleMetricsFromMovimientos = ({ detalleRows = [], movimientosRows = [] } = {}) => {
+  const detailToEmpleado = new Map();
+  const metricsByEmpleado = new Map();
+
+  const ensureMetric = (idEmpleado) => {
+    const normalized = parsePositiveInt(idEmpleado);
+    if (!normalized) return null;
+    if (!metricsByEmpleado.has(normalized)) {
+      metricsByEmpleado.set(normalized, {
+        bonos: 0,
+        deducciones: 0,
+        adelantos: 0,
+        horasPendientes: 0
+      });
+    }
+    return metricsByEmpleado.get(normalized);
+  };
+
+  (Array.isArray(detalleRows) ? detalleRows : []).forEach((row) => {
+    const idDetalle = parsePositiveInt(row?.id_detalle_planilla ?? row?.id_detalle);
+    const idEmpleado = parsePositiveInt(row?.id_empleado);
+    if (idDetalle && idEmpleado) {
+      detailToEmpleado.set(idDetalle, idEmpleado);
+    }
+    ensureMetric(idEmpleado);
+  });
+
+  (Array.isArray(movimientosRows) ? movimientosRows : []).forEach((row) => {
+    if (row?.anulado === true || row?.activo === false) return;
+
+    const idDetalle = parsePositiveInt(row?.id_detalle_planilla ?? row?.id_detalle);
+    const idEmpleadoDirecto = parsePositiveInt(row?.id_empleado);
+    const idEmpleado = idEmpleadoDirecto || (idDetalle ? detailToEmpleado.get(idDetalle) : null);
+    const metric = ensureMetric(idEmpleado);
+    if (!metric) return;
+
+    const tipo = String(row?.tipo_movimiento ?? row?.tipo ?? '').trim().toUpperCase();
+    const monto = Number(row?.monto ?? 0);
+    const montoSeguro = Number.isFinite(monto) ? monto : 0;
+
+    if (tipo === 'BONO') {
+      metric.bonos += montoSeguro;
+      return;
+    }
+
+    if (tipo === 'DEDUCCION') {
+      metric.deducciones += montoSeguro;
+      return;
+    }
+
+    if (tipo === 'ADELANTO') {
+      metric.adelantos += montoSeguro;
+      return;
+    }
+
+    if (tipo === 'H.E. TIEMPO' && row?.compensada !== true) {
+      metric.horasPendientes += montoSeguro;
+    }
+  });
+
+  return metricsByEmpleado;
+};
+
+const parseQuincenaEstadoAuditPayload = (descripcion) => {
+  const raw = String(descripcion ?? '').trim();
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw);
+    const quincena = normalizeQuincena(parsed?.quincena);
+    const estado = normalizeEstadoAlias(parsed?.estado);
+    if (!quincena || !estado) return null;
+    return {
+      quincena,
+      estado,
+      id_estado_planilla: parsePositiveInt(parsed?.id_estado_planilla)
+    };
+  } catch {
+    return null;
+  }
+};
+
+const listQuincenaEstadoAuditByPlanillaIds = async (planillaIds = []) => {
+  const safeIds = Array.from(
+    new Set((Array.isArray(planillaIds) ? planillaIds : []).map((id) => parsePositiveInt(id)).filter(Boolean))
+  );
+  if (!safeIds.length) return new Map();
+
+  const query = `
+    SELECT
+      id_referencia,
+      descripcion,
+      fecha_registro,
+      id_auditoria_planilla
+    FROM public.auditoria_planilla
+    WHERE accion = $1
+      AND entidad = $2
+      AND id_referencia = ANY($3::int[])
+    ORDER BY fecha_registro DESC, id_auditoria_planilla DESC
+  `;
+
+  let rows = [];
+  try {
+    const result = await pool.query(query, [
+      QUINCENA_ESTADO_AUDITORIA_ACCION,
+      QUINCENA_ESTADO_AUDITORIA_ENTIDAD,
+      safeIds
+    ]);
+    rows = result.rows || [];
+  } catch {
+    return new Map();
+  }
+
+  const mapByPlanilla = new Map();
+  for (const row of rows) {
+    const idPlanilla = parsePositiveInt(row?.id_referencia);
+    if (!idPlanilla) continue;
+
+    const payload = parseQuincenaEstadoAuditPayload(row?.descripcion);
+    if (!payload?.quincena || !payload?.estado) continue;
+
+    const planillaKey = String(idPlanilla);
+    if (!mapByPlanilla.has(planillaKey)) {
+      mapByPlanilla.set(planillaKey, new Map());
+    }
+
+    const planillaMap = mapByPlanilla.get(planillaKey);
+    if (!planillaMap.has(payload.quincena)) {
+      planillaMap.set(payload.quincena, payload);
+    }
+  }
+
+  return mapByPlanilla;
+};
+
+const resolveContextualEstadoQuincena = ({
+  baseEstado,
+  quincena,
+  auditEstadoMap
+}) => {
+  const normalizedBaseEstado = normalizeEstadoAlias(baseEstado);
+  const normalizedQuincena = normalizeQuincena(quincena);
+
+  if (!normalizedQuincena) {
+    return {
+      estado: normalizedBaseEstado,
+      id_estado_planilla: null
+    };
+  }
+
+  const auditPayload = auditEstadoMap?.get?.(normalizedQuincena);
+  if (auditPayload?.estado) {
+    return {
+      estado: normalizeEstadoAlias(auditPayload.estado),
+      id_estado_planilla: parsePositiveInt(auditPayload.id_estado_planilla)
+    };
+  }
+
+  // Compatibilidad: si solo se pago la primera quincena y la planilla mensual quedo PAGADA,
+  // no se debe reflejar automaticamente como PAGADA en Q2.
+  if (normalizedQuincena === 2 && normalizedBaseEstado === 'PAGADA') {
+    return {
+      estado: 'CALCULADA',
+      id_estado_planilla: null
+    };
+  }
+
+  return {
+    estado: normalizedBaseEstado,
+    id_estado_planilla: null
+  };
+};
+
+const registerQuincenaEstadoAudit = async ({
+  idPlanilla,
+  quincena,
+  estado,
+  idEstadoPlanilla = null,
+  usuarioAccion = 'sistema'
+}) => {
+  const safePlanillaId = parsePositiveInt(idPlanilla);
+  const safeQuincena = normalizeQuincena(quincena);
+  const safeEstado = normalizeEstadoAlias(estado);
+  if (!safePlanillaId || !safeQuincena || !safeEstado) return;
+
+  const payload = {
+    quincena: safeQuincena,
+    estado: safeEstado,
+    id_estado_planilla: parsePositiveInt(idEstadoPlanilla),
+    usuario: sanitizeText(usuarioAccion, 100) || 'sistema',
+    ts: new Date().toISOString()
+  };
+
+  try {
+    await pool.query(
+      `
+        INSERT INTO public.auditoria_planilla (
+          accion,
+          entidad,
+          id_referencia,
+          descripcion,
+          usuario_accion
+        )
+        VALUES ($1, $2, $3, $4, $5)
+      `,
+      [
+        QUINCENA_ESTADO_AUDITORIA_ACCION,
+        QUINCENA_ESTADO_AUDITORIA_ENTIDAD,
+        safePlanillaId,
+        JSON.stringify(payload),
+        payload.usuario
+      ]
+    );
+  } catch {
+    // No bloqueamos el flujo principal por fallas de auditoria.
+  }
+};
+
+const registerQuincenaAdelantoAudit = async ({
+  idPlanilla,
+  idAdelantoSalario,
+  quincena,
+  usuarioAccion = 'sistema'
+}) => {
+  const safePlanillaId = parsePositiveInt(idPlanilla);
+  const safeAdelantoId = parsePositiveInt(idAdelantoSalario);
+  const safeQuincena = normalizeQuincena(quincena);
+  if (!safePlanillaId || !safeAdelantoId || !safeQuincena) return;
+
+  const payload = {
+    id_adelanto_salario: safeAdelantoId,
+    quincena: safeQuincena,
+    usuario: sanitizeText(usuarioAccion, 100) || 'sistema',
+    ts: new Date().toISOString()
+  };
+
+  try {
+    await pool.query(
+      `
+        INSERT INTO public.auditoria_planilla (
+          accion,
+          entidad,
+          id_referencia,
+          descripcion,
+          usuario_accion
+        )
+        VALUES ($1, $2, $3, $4, $5)
+      `,
+      [
+        QUINCENA_ADELANTO_AUDITORIA_ACCION,
+        QUINCENA_ADELANTO_AUDITORIA_ENTIDAD,
+        safePlanillaId,
+        JSON.stringify(payload),
+        payload.usuario
+      ]
+    );
+  } catch {
+    // No bloqueamos el flujo principal por fallas de auditoria.
+  }
+};
+
+const listQuincenaAdelantoAuditByPlanillaId = async (idPlanilla) => {
+  const safePlanillaId = parsePositiveInt(idPlanilla);
+  if (!safePlanillaId) return new Map();
+
+  const query = `
+    SELECT
+      descripcion,
+      fecha_registro,
+      id_auditoria_planilla
+    FROM public.auditoria_planilla
+    WHERE accion = $1
+      AND entidad = $2
+      AND id_referencia = $3
+    ORDER BY fecha_registro DESC, id_auditoria_planilla DESC
+  `;
+
+  let rows = [];
+  try {
+    const result = await pool.query(query, [
+      QUINCENA_ADELANTO_AUDITORIA_ACCION,
+      QUINCENA_ADELANTO_AUDITORIA_ENTIDAD,
+      safePlanillaId
+    ]);
+    rows = result.rows || [];
+  } catch {
+    return new Map();
+  }
+
+  const map = new Map();
+  for (const row of rows) {
+    try {
+      const payload = JSON.parse(String(row?.descripcion ?? '{}'));
+      const idAdelanto = parsePositiveInt(payload?.id_adelanto_salario);
+      const quincena = normalizeQuincena(payload?.quincena);
+      if (!idAdelanto || !quincena) continue;
+      if (!map.has(idAdelanto)) {
+        map.set(idAdelanto, quincena);
+      }
+    } catch {
+      // noop
+    }
+  }
+
+  return map;
 };
 
 const parsePagination = (query = {}) => {
@@ -854,7 +1470,12 @@ const resolveEmpleadoDniMap = async (employeeIds = []) => {
   }
 };
 
-const buildMovimientosDataset = async ({ idPlanilla, idDetalle = null }) => {
+const buildMovimientosDataset = async ({
+  idPlanilla,
+  idDetalle = null,
+  tipoPeriodo = TIPO_PERIODO.MENSUAL,
+  quincena = null
+} = {}) => {
   const planillaPeriodoResult = await pool.query(
     `
       SELECT
@@ -921,7 +1542,11 @@ const buildMovimientosDataset = async ({ idPlanilla, idDetalle = null }) => {
     fecha: row.fecha || row.fecha_registro,
     es_monetario: true,
     anulable: parsePositiveInt(row.id_movimiento_planilla) !== null,
-    origen_movimiento: 'MOVIMIENTO'
+    origen_movimiento: 'MOVIMIENTO',
+    quincena_resuelta: resolveQuincenaFromRowContext({
+      ...row,
+      fecha: row.fecha || row.fecha_registro
+    })
   }));
 
   const employeeIds = [...new Set(detalleScope.map((row) => parsePositiveInt(row.id_empleado)).filter(Boolean))];
@@ -983,9 +1608,16 @@ const buildMovimientosDataset = async ({ idPlanilla, idDetalle = null }) => {
       fecha: fechaMovimiento,
       fecha_registro: fechaMovimiento,
       origen_movimiento: 'HORAS_EXTRA',
-      anulable: false
+      anulable: false,
+      quincena_resuelta: resolveQuincenaFromRowContext({
+        observacion: row.observacion,
+        fecha: fechaMovimiento
+      })
     };
   });
+
+  const adelantoQuincenaAuditMap =
+    tipoPeriodo === TIPO_PERIODO.QUINCENAL ? await listQuincenaAdelantoAuditByPlanillaId(idPlanilla) : new Map();
 
   const adelantosResult = await pool.query(
     `
@@ -1010,6 +1642,8 @@ const buildMovimientosDataset = async ({ idPlanilla, idDetalle = null }) => {
     const detalleEmpleado = empleadoId ? detalleByEmpleado.get(empleadoId) : null;
     const montoAplicado = Number(row.monto_aplicado ?? 0);
     const idAdelanto = parsePositiveInt(row.id_adelanto_salario);
+    const quincenaAudit = idAdelanto ? normalizeQuincena(adelantoQuincenaAuditMap.get(idAdelanto)) : null;
+    const quincenaResuelta = quincenaAudit || resolveQuincenaFromRowContext({ fecha: row.fecha });
     return {
       id_movimiento_planilla: null,
       id_movimiento: `ad-${row.id_adelanto_aplicacion}`,
@@ -1030,7 +1664,8 @@ const buildMovimientosDataset = async ({ idPlanilla, idDetalle = null }) => {
       fecha: row.fecha,
       fecha_registro: row.fecha,
       origen_movimiento: 'ADELANTO',
-      anulable: false
+      anulable: false,
+      quincena_resuelta: quincenaResuelta
     };
   });
 
@@ -1088,11 +1723,19 @@ const buildMovimientosDataset = async ({ idPlanilla, idDetalle = null }) => {
       origen_movimiento: 'ADELANTO',
       anulado: true,
       activo: false,
-      anulable: false
+      anulable: false,
+      quincena_resuelta: resolveQuincenaFromRowContext({ fecha: row.fecha })
     };
   });
 
-  return [...movimientosRows, ...adelantosRows, ...adelantosEliminadosRows, ...horasExtraRows].sort(
+  const mergedRows = [...movimientosRows, ...adelantosRows, ...adelantosEliminadosRows, ...horasExtraRows];
+  const scopedRows = filterRowsByPeriodoContext({
+    rows: mergedRows,
+    tipoPeriodo,
+    quincena
+  });
+
+  return scopedRows.sort(
     (left, right) =>
       toTimestampSafe(right.fecha_registro || right.fecha) -
       toTimestampSafe(left.fecha_registro || left.fecha)
@@ -1509,12 +2152,30 @@ const planillaService = {
     const estado = req.query.estado === undefined
       ? null
       : normalizeEstadoAlias(sanitizeText(req.query.estado, 60));
+    const shouldFilterTipoPeriodo =
+      req.query.tipo_periodo !== undefined &&
+      req.query.tipo_periodo !== null &&
+      String(req.query.tipo_periodo).trim() !== '';
+    const tipoPeriodo = normalizeTipoPeriodo(req.query.tipo_periodo);
+    if (req.query.tipo_periodo !== undefined && !tipoPeriodo) {
+      return { status: 400, body: { error: true, message: 'tipo_periodo invalido. Use mensual o quincenal.' } };
+    }
+    const quincena = normalizeQuincena(req.query.quincena);
+    if (req.query.quincena !== undefined && quincena === null) {
+      return { status: 400, body: { error: true, message: 'quincena invalida. Use 1 o 2.' } };
+    }
+    if (tipoPeriodo === TIPO_PERIODO.QUINCENAL && quincena === null) {
+      return { status: 400, body: { error: true, message: 'quincena es requerida para tipo_periodo quincenal.' } };
+    }
 
     if (req.query.estado !== undefined && !estado) {
       return { status: 400, body: { error: true, message: 'estado invalido' } };
     }
 
     const periodoKey = periodo ? toMonthKey(periodo) : null;
+
+    const shouldResolveQuincenaContext =
+      shouldFilterTipoPeriodo && tipoPeriodo === TIPO_PERIODO.QUINCENAL;
 
     const filtered = rows.filter((row) => {
       if (idSucursal && parsePositiveInt(row.id_sucursal) !== idSucursal) return false;
@@ -1524,7 +2185,7 @@ const planillaService = {
         if (rowMonth !== periodoKey) return false;
       }
 
-      if (estado) {
+      if (estado && !shouldResolveQuincenaContext) {
         const estadoPlanilla = normalizeEstadoAlias(row.estado_planilla ?? row.estado);
         if (estadoPlanilla !== estado) return false;
       }
@@ -1543,14 +2204,82 @@ const planillaService = {
         if (!haystack.includes(search.toLowerCase())) return false;
       }
 
+      if (shouldFilterTipoPeriodo) {
+        const rowTipoPeriodo = resolveRowTipoPeriodo(row);
+        const rowQuincena = resolveRowQuincena(row);
+
+        if (tipoPeriodo === TIPO_PERIODO.QUINCENAL) {
+          // Compatibilidad: la planilla fisica sigue siendo mensual.
+          // Si el row no expone quincena explicita, se mantiene visible para resolver estado contextual.
+          if (rowQuincena !== null && quincena !== null && rowQuincena !== quincena) return false;
+        } else if (tipoPeriodo === TIPO_PERIODO.MENSUAL) {
+          if (rowTipoPeriodo !== TIPO_PERIODO.MENSUAL) return false;
+        }
+      }
+
       return true;
     });
+
+    const quincenaEstadoAuditByPlanilla = shouldResolveQuincenaContext
+      ? await listQuincenaEstadoAuditByPlanillaIds(filtered.map((row) => row?.id_planilla))
+      : new Map();
+
+    const rowsWithPeriodoMeta = filtered.map((row) => {
+      const rowTipoPeriodo = resolveRowTipoPeriodo(row);
+      const rowQuincena = rowTipoPeriodo === TIPO_PERIODO.QUINCENAL ? resolveRowQuincena(row) : null;
+      const resolvedTipoPeriodo = shouldResolveQuincenaContext
+        ? TIPO_PERIODO.QUINCENAL
+        : rowTipoPeriodo;
+      const resolvedQuincena = shouldResolveQuincenaContext
+        ? quincena
+        : rowQuincena;
+      const rowPeriodoMeta = buildPeriodoMeta({
+        fechaPlanilla: row?.fecha_creacion,
+        tipoPeriodo: resolvedTipoPeriodo,
+        quincena: resolvedQuincena,
+        diasLaborados: null,
+        horasLaboradas: null
+      });
+
+      const baseEstado = normalizeEstadoAlias(row.estado_planilla ?? row.estado);
+      const contextualEstado = shouldResolveQuincenaContext
+        ? resolveContextualEstadoQuincena({
+            baseEstado,
+            quincena: resolvedQuincena,
+            auditEstadoMap: quincenaEstadoAuditByPlanilla.get(String(parsePositiveInt(row?.id_planilla) || 0))
+          })
+        : { estado: baseEstado, id_estado_planilla: parsePositiveInt(row?.id_estado_planilla) };
+
+      return {
+        ...row,
+        tipo_periodo: shouldResolveQuincenaContext
+          ? TIPO_PERIODO.QUINCENAL
+          : row?.tipo_periodo ?? rowPeriodoMeta.tipo_periodo,
+        quincena: row?.quincena ?? resolvedQuincena ?? rowPeriodoMeta.quincena,
+        periodo_inicio: row?.periodo_inicio ?? rowPeriodoMeta.periodo_inicio,
+        periodo_fin: row?.periodo_fin ?? rowPeriodoMeta.periodo_fin,
+        dias_laborados: row?.dias_laborados ?? rowPeriodoMeta.dias_laborados,
+        horas_laboradas: row?.horas_laboradas ?? rowPeriodoMeta.horas_laboradas,
+        factor_prorrateo: row?.factor_prorrateo ?? rowPeriodoMeta.factor_prorrateo,
+        estado_planilla: contextualEstado.estado || row?.estado_planilla,
+        estado: contextualEstado.estado || row?.estado,
+        id_estado_planilla:
+          parsePositiveInt(contextualEstado.id_estado_planilla) || parsePositiveInt(row?.id_estado_planilla) || null
+      };
+    });
+
+    const finalRows =
+      estado && shouldResolveQuincenaContext
+        ? rowsWithPeriodoMeta.filter(
+            (row) => normalizeEstadoAlias(row?.estado_planilla ?? row?.estado) === estado
+          )
+        : rowsWithPeriodoMeta;
 
     return {
       status: 200,
       body: {
         error: false,
-        ...paginateRows(filtered, pagination.page, pagination.limit)
+        ...paginateRows(finalRows, pagination.page, pagination.limit)
       }
     };
   },
@@ -1580,6 +2309,35 @@ const planillaService = {
     }
 
     const fechaPlanilla = normalizePeriodo(req.body?.periodo) || new Date().toISOString().slice(0, 10);
+    const tipoPeriodo = normalizeTipoPeriodo(req.body?.tipo_periodo);
+    if (!tipoPeriodo) {
+      return {
+        status: 400,
+        body: buildErrorBody({
+          code: 'VALIDATION_ERROR',
+          message: 'tipo_periodo invalido. Use mensual o quincenal.'
+        })
+      };
+    }
+    const quincena = normalizeQuincena(req.body?.quincena);
+    if (req.body?.quincena !== undefined && quincena === null) {
+      return {
+        status: 400,
+        body: buildErrorBody({
+          code: 'VALIDATION_ERROR',
+          message: 'quincena invalida. Use 1 o 2.'
+        })
+      };
+    }
+    if (tipoPeriodo === TIPO_PERIODO.QUINCENAL && quincena === null) {
+      return {
+        status: 400,
+        body: buildErrorBody({
+          code: 'VALIDATION_ERROR',
+          message: 'quincena es requerida cuando tipo_periodo es quincenal.'
+        })
+      };
+    }
     const idEstadoPlanilla =
       parsePositiveInt(req.body?.id_estado_planilla) ||
       (await resolveDefaultEstadoPlanillaId());
@@ -1592,8 +2350,31 @@ const planillaService = {
         })
       };
     }
-    const diasLaborados = parsePositiveNumber(req.body?.dias_laborados) || 30;
-    const horasLaboradas = parsePositiveNumber(req.body?.horas_laboradas) || 240;
+    const monthlyDias = parsePositiveNumber(req.body?.dias_laborados) || 30;
+    const monthlyHoras = parsePositiveNumber(req.body?.horas_laboradas) || 240;
+    let diasLaborados = monthlyDias;
+    let horasLaboradas = monthlyHoras;
+    let periodoMeta = buildPeriodoMeta({
+      fechaPlanilla,
+      tipoPeriodo,
+      quincena,
+      diasLaborados,
+      horasLaboradas
+    });
+
+    if (tipoPeriodo === TIPO_PERIODO.QUINCENAL) {
+      const quincenaWindow = resolveQuincenaWindow(fechaPlanilla, quincena || 1);
+      const factor = quincenaWindow?.factor || 0.5;
+      diasLaborados = Number((monthlyDias * factor).toFixed(2));
+      horasLaboradas = Number((monthlyHoras * factor).toFixed(2));
+      periodoMeta = buildPeriodoMeta({
+        fechaPlanilla,
+        tipoPeriodo,
+        quincena,
+        diasLaborados,
+        horasLaboradas
+      });
+    }
 
     let idPlanilla;
     try {
@@ -1614,7 +2395,7 @@ const planillaService = {
             body: {
               error: false,
               message: 'La planilla ya existia para ese periodo y sucursal.',
-              data: { id_planilla: existingId, existente: true }
+              data: { id_planilla: existingId, existente: true, ...periodoMeta }
             }
           };
         }
@@ -1627,7 +2408,7 @@ const planillaService = {
       body: {
         error: false,
         message: 'Planilla generada correctamente',
-        data: { id_planilla: idPlanilla }
+        data: { id_planilla: idPlanilla, ...periodoMeta }
       }
     };
   },
@@ -1677,6 +2458,21 @@ const planillaService = {
     if (!scopeValidation.ok) {
       return { status: scopeValidation.status, body: scopeValidation.body };
     }
+    const periodoContext = resolvePeriodoContextInput({
+      rawTipoPeriodo: req.query?.tipo_periodo,
+      rawQuincena: req.query?.quincena
+    });
+    if (periodoContext.error) {
+      return {
+        status: 400,
+        body: buildErrorBody({
+          code: 'VALIDATION_ERROR',
+          message: periodoContext.error
+        })
+      };
+    }
+    const tipoPeriodoContext = periodoContext.tipo_periodo;
+    const quincenaContext = periodoContext.quincena;
 
     await syncDetalleEmpleadosActivosBySucursal({ idPlanilla });
     await syncDetalleSalarioBaseFromEmpleado({ idPlanilla });
@@ -1738,7 +2534,7 @@ const planillaService = {
 
     const search = sanitizeText(req.query.search ?? req.query.q, 120);
 
-    const enrichedRows = rows.map((row) => {
+    let enrichedRows = rows.map((row) => {
       const idEmpleado = parsePositiveInt(row.id_empleado);
       const horasPendientes = idEmpleado ? Number(horasPendientesMap.get(idEmpleado) ?? 0) : 0;
       const adelantosAplicados = idEmpleado ? Number(adelantosMap.get(idEmpleado) ?? 0) : 0;
@@ -1756,6 +2552,63 @@ const planillaService = {
         adelantos: Number.isFinite(adelantosAplicados) ? adelantosAplicados : 0
       };
     });
+
+    if (tipoPeriodoContext === TIPO_PERIODO.QUINCENAL) {
+      const movimientosContextRows = await buildMovimientosDataset({
+        idPlanilla,
+        tipoPeriodo: tipoPeriodoContext,
+        quincena: quincenaContext
+      });
+      const metricsByEmpleado = aggregateDetalleMetricsFromMovimientos({
+        detalleRows: rows,
+        movimientosRows: movimientosContextRows
+      });
+
+      enrichedRows = rows.map((row) => {
+        const idEmpleado = parsePositiveInt(row.id_empleado);
+        const resolvedDni = sanitizeText(
+          row.dni ||
+            row.persona_dni ||
+            row.dni_persona ||
+            row.numero_dni ||
+            (idEmpleado ? dniMap.get(idEmpleado) : ''),
+          40
+        );
+        const metrics = metricsByEmpleado.get(idEmpleado) || {
+          bonos: 0,
+          deducciones: 0,
+          adelantos: 0,
+          horasPendientes: 0
+        };
+        const salarioBase = roundTo(Number(row?.salario_base ?? 0));
+        const totalBonos = roundTo(metrics.bonos);
+        const totalDeduccionesSinAdelantos = roundTo(metrics.deducciones);
+        const totalAdelantos = roundTo(metrics.adelantos);
+        const totalDeducciones = roundTo(totalDeduccionesSinAdelantos + totalAdelantos);
+        const neto = roundTo(salarioBase + totalBonos - totalDeducciones);
+        const horasPendientes = roundTo(metrics.horasPendientes);
+
+        return {
+          ...row,
+          dni: resolvedDni || null,
+          persona_dni: resolvedDni || null,
+          total_bonos: totalBonos,
+          bonos: totalBonos,
+          total_deducciones_sin_adelantos: totalDeduccionesSinAdelantos,
+          deducciones_sin_adelantos: totalDeduccionesSinAdelantos,
+          total_deducciones: totalDeducciones,
+          deducciones: totalDeducciones,
+          total_adelantos_aplicados: totalAdelantos,
+          total_adelantos: totalAdelantos,
+          adelantos: totalAdelantos,
+          he_tiempo: horasPendientes,
+          horas_extra_tiempo: horasPendientes,
+          neto_pagar: neto,
+          total_neto_pagar: neto,
+          neto
+        };
+      });
+    }
 
     const filtered = enrichedRows.filter((row) => {
       if (!search) return true;
@@ -1799,9 +2652,90 @@ const planillaService = {
     if (!scopeValidation.ok) {
       return { status: scopeValidation.status, body: scopeValidation.body };
     }
+    const periodoContext = resolvePeriodoContextInput({
+      rawTipoPeriodo: req.query?.tipo_periodo,
+      rawQuincena: req.query?.quincena
+    });
+    if (periodoContext.error) {
+      return {
+        status: 400,
+        body: buildErrorBody({
+          code: 'VALIDATION_ERROR',
+          message: periodoContext.error
+        })
+      };
+    }
+    const tipoPeriodoContext = periodoContext.tipo_periodo;
+    const quincenaContext = periodoContext.quincena;
 
     await syncDetalleEmpleadosActivosBySucursal({ idPlanilla });
     await syncDetalleSalarioBaseFromEmpleado({ idPlanilla });
+
+    if (tipoPeriodoContext === TIPO_PERIODO.QUINCENAL) {
+      const detalleRows = await queryFunctionRows(PLANILLA_ENDPOINT_CONTRACT.detalle, [idPlanilla]);
+      const movimientosContextRows = await buildMovimientosDataset({
+        idPlanilla,
+        tipoPeriodo: tipoPeriodoContext,
+        quincena: quincenaContext
+      });
+      const metricsByEmpleado = aggregateDetalleMetricsFromMovimientos({
+        detalleRows,
+        movimientosRows: movimientosContextRows
+      });
+
+      const resumenContextual = (Array.isArray(detalleRows) ? detalleRows : []).reduce(
+        (acc, row) => {
+          const idEmpleado = parsePositiveInt(row?.id_empleado);
+          const metrics = metricsByEmpleado.get(idEmpleado) || {
+            bonos: 0,
+            deducciones: 0,
+            adelantos: 0
+          };
+          const salarioBase = roundTo(Number(row?.salario_base ?? 0));
+          const bonos = roundTo(metrics.bonos);
+          const deduccionesSinAdelantos = roundTo(metrics.deducciones);
+          const adelantos = roundTo(metrics.adelantos);
+          const deducciones = roundTo(deduccionesSinAdelantos + adelantos);
+          const neto = roundTo(salarioBase + bonos - deducciones);
+
+          acc.total_salario_base += salarioBase;
+          acc.total_bonos += bonos;
+          acc.total_deducciones_sin_adelantos += deduccionesSinAdelantos;
+          acc.total_adelantos_aplicados += adelantos;
+          acc.total_deducciones += deducciones;
+          acc.total_neto_pagar += neto;
+          acc.total_empleados += 1;
+          return acc;
+        },
+        {
+          total_salario_base: 0,
+          total_bonos: 0,
+          total_deducciones_sin_adelantos: 0,
+          total_adelantos_aplicados: 0,
+          total_adelantos: 0,
+          total_deducciones: 0,
+          total_neto_pagar: 0,
+          total_neto: 0,
+          total_empleados: 0
+        }
+      );
+
+      const data = {
+        ...resumenContextual,
+        total_salario_base: roundTo(resumenContextual.total_salario_base),
+        total_bonos: roundTo(resumenContextual.total_bonos),
+        total_deducciones_sin_adelantos: roundTo(resumenContextual.total_deducciones_sin_adelantos),
+        total_adelantos_aplicados: roundTo(resumenContextual.total_adelantos_aplicados),
+        total_adelantos: roundTo(resumenContextual.total_adelantos_aplicados),
+        total_deducciones: roundTo(resumenContextual.total_deducciones),
+        total_neto_pagar: roundTo(resumenContextual.total_neto_pagar),
+        total_neto: roundTo(resumenContextual.total_neto_pagar),
+        tipo_periodo: TIPO_PERIODO.QUINCENAL,
+        quincena: quincenaContext
+      };
+
+      return { status: 200, body: { error: false, data } };
+    }
 
     const rows = await queryFunctionRows(PLANILLA_ENDPOINT_CONTRACT.resumen, [idPlanilla]);
     const resumenBase = rows[0] || {};
@@ -1881,6 +2815,19 @@ const planillaService = {
         body: buildErrorBody({ code: 'VALIDATION_ERROR', message: 'estado invalido. Use PENDIENTE o COMPENSADA.' })
       };
     }
+    const periodoContext = resolvePeriodoContextInput({
+      rawTipoPeriodo: req.query?.tipo_periodo,
+      rawQuincena: req.query?.quincena
+    });
+    if (periodoContext.error) {
+      return {
+        status: 400,
+        body: buildErrorBody({
+          code: 'VALIDATION_ERROR',
+          message: periodoContext.error
+        })
+      };
+    }
 
     const scopeValidation = await validatePlanillaSucursalScope(idPlanilla, req.query?.id_sucursal);
     if (!scopeValidation.ok) {
@@ -1919,14 +2866,19 @@ const planillaService = {
     );
 
     const rows = rowsResult.rows || [];
+    const rowsByPeriodo = filterRowsByPeriodoContext({
+      rows,
+      tipoPeriodo: periodoContext.tipo_periodo,
+      quincena: periodoContext.quincena
+    });
     const filteredRows =
       estado === 'PENDIENTE'
-        ? rows.filter((row) => !row.compensada)
+        ? rowsByPeriodo.filter((row) => !row.compensada)
         : estado === 'COMPENSADA'
-          ? rows.filter((row) => row.compensada)
-          : rows;
+          ? rowsByPeriodo.filter((row) => row.compensada)
+          : rowsByPeriodo;
 
-    const summary = rows.reduce(
+    const summary = rowsByPeriodo.reduce(
       (acc, row) => {
         const horas = Number(row?.horas ?? 0);
         if (!Number.isFinite(horas)) return acc;
@@ -1944,7 +2896,7 @@ const planillaService = {
         total_horas: 0,
         compensadas_horas: 0,
         pendientes_horas: 0,
-        total_registros: rows.length,
+        total_registros: rowsByPeriodo.length,
         compensadas_registros: 0,
         pendientes_registros: 0
       }
@@ -1977,7 +2929,7 @@ const planillaService = {
     const idEmpleado = parsePositiveInt(req.body?.id_empleado);
     const horas = parsePositiveNumber(req.body?.horas);
     const fecha = normalizeTimestampInput(req.body?.fecha);
-    const observacion = sanitizeText(req.body?.observacion, 255);
+    const observacionInput = sanitizeText(req.body?.observacion, 255);
     const idTipoHora = req.body?.id_tipo_hora === undefined ? null : parsePositiveInt(req.body?.id_tipo_hora);
     const idFactorHorasExtras =
       req.body?.id_factor_horas_extras === undefined
@@ -1997,6 +2949,23 @@ const planillaService = {
         })
       };
     }
+    const periodoContext = resolvePeriodoContextInput({
+      rawTipoPeriodo: req.body?.tipo_periodo,
+      rawQuincena: req.body?.quincena
+    });
+    if (periodoContext.error) {
+      return {
+        status: 400,
+        body: buildErrorBody({
+          code: 'VALIDATION_ERROR',
+          message: periodoContext.error
+        })
+      };
+    }
+    const observacion =
+      periodoContext.tipo_periodo === TIPO_PERIODO.QUINCENAL
+        ? appendQuincenaContextTag(observacionInput, periodoContext.quincena)
+        : observacionInput;
 
     if (horas <= 0 || horas > 24) {
       return {
@@ -2149,6 +3118,19 @@ const planillaService = {
         body: buildErrorBody({ code: 'VALIDATION_ERROR', message: 'id_planilla e id_horas_extra son requeridos.' })
       };
     }
+    const periodoContext = resolvePeriodoContextInput({
+      rawTipoPeriodo: req.body?.tipo_periodo,
+      rawQuincena: req.body?.quincena
+    });
+    if (periodoContext.error) {
+      return {
+        status: 400,
+        body: buildErrorBody({
+          code: 'VALIDATION_ERROR',
+          message: periodoContext.error
+        })
+      };
+    }
 
     const scopeValidation = await validatePlanillaSucursalScope(idPlanilla, req.body?.id_sucursal);
     if (!scopeValidation.ok) {
@@ -2192,7 +3174,11 @@ const planillaService = {
       };
     }
 
-    const observacion = sanitizeText(req.body?.observacion, 255);
+    const observacionInput = sanitizeText(req.body?.observacion, 255);
+    const observacion =
+      periodoContext.tipo_periodo === TIPO_PERIODO.QUINCENAL
+        ? appendQuincenaContextTag(observacionInput, periodoContext.quincena)
+        : observacionInput;
 
     const updateResult = await pool.query(
       `
@@ -2279,6 +3265,43 @@ const planillaService = {
       };
     }
 
+    const hasTipoPeriodoInPayload =
+      req.body?.tipo_periodo !== undefined &&
+      req.body?.tipo_periodo !== null &&
+      String(req.body?.tipo_periodo).trim() !== '';
+    const tipoPeriodoPayload = hasTipoPeriodoInPayload
+      ? normalizeTipoPeriodoStrict(req.body?.tipo_periodo)
+      : null;
+    if (hasTipoPeriodoInPayload && !tipoPeriodoPayload) {
+      return {
+        status: 400,
+        body: buildErrorBody({
+          code: 'VALIDATION_ERROR',
+          message: 'tipo_periodo invalido. Use mensual o quincenal.'
+        })
+      };
+    }
+    const quincenaPayload = normalizeQuincena(req.body?.quincena);
+    if (req.body?.quincena !== undefined && quincenaPayload === null) {
+      return {
+        status: 400,
+        body: buildErrorBody({
+          code: 'VALIDATION_ERROR',
+          message: 'quincena invalida. Use 1 o 2.'
+        })
+      };
+    }
+    const isQuincenalContext = tipoPeriodoPayload === TIPO_PERIODO.QUINCENAL;
+    if (isQuincenalContext && quincenaPayload === null) {
+      return {
+        status: 400,
+        body: buildErrorBody({
+          code: 'VALIDATION_ERROR',
+          message: 'quincena es requerida cuando tipo_periodo es quincenal.'
+        })
+      };
+    }
+
     const scopeValidation = await validatePlanillaSucursalScope(idPlanilla, req.body?.id_sucursal);
     if (!scopeValidation.ok) {
       return { status: scopeValidation.status, body: scopeValidation.body };
@@ -2329,6 +3352,16 @@ const planillaService = {
       estadoInfo.idEstado,
       recalcular
     ]);
+
+    if (isQuincenalContext && quincenaPayload) {
+      await registerQuincenaEstadoAudit({
+        idPlanilla,
+        quincena: quincenaPayload,
+        estado: estadoInfo.descripcion,
+        idEstadoPlanilla: estadoInfo.idEstado,
+        usuarioAccion: sanitizeText(req.body?.usuario_accion, 100) || String(req.user?.id_usuario || 'sistema')
+      });
+    }
 
     return {
       status: 200,
@@ -2512,6 +3545,19 @@ const planillaService = {
     if (!idPlanilla || !idAdelanto) {
       return { status: 400, body: { error: true, message: 'id_planilla e id_adelanto son requeridos' } };
     }
+    const periodoContext = resolvePeriodoContextInput({
+      rawTipoPeriodo: req.body?.tipo_periodo,
+      rawQuincena: req.body?.quincena
+    });
+    if (periodoContext.error) {
+      return {
+        status: 400,
+        body: buildErrorBody({
+          code: 'VALIDATION_ERROR',
+          message: periodoContext.error
+        })
+      };
+    }
 
     const scopeValidation = await validatePlanillaSucursalScope(idPlanilla, req.body?.id_sucursal);
     if (!scopeValidation.ok) {
@@ -2669,6 +3715,15 @@ const planillaService = {
       } else {
         throw err;
       }
+    }
+
+    if (periodoContext.tipo_periodo === TIPO_PERIODO.QUINCENAL && periodoContext.quincena) {
+      await registerQuincenaAdelantoAudit({
+        idPlanilla,
+        idAdelantoSalario: idAdelanto,
+        quincena: periodoContext.quincena,
+        usuarioAccion: String(req.user?.id_usuario || 'sistema')
+      });
     }
 
     return {
@@ -3195,7 +4250,7 @@ const planillaService = {
     const tipo = sanitizeText(req.body?.tipo ?? req.body?.tipo_movimiento, 20);
     const concepto = sanitizeText(req.body?.concepto, 100);
     const monto = parsePositiveNumber(req.body?.monto);
-    const observacion = sanitizeText(req.body?.observacion, 255);
+    const observacionInput = sanitizeText(req.body?.observacion, 255);
 
     if (!idPlanilla || !idDetalle || !tipo || !concepto || !monto) {
       return {
@@ -3203,6 +4258,23 @@ const planillaService = {
         body: { error: true, message: 'id_planilla, id_detalle, tipo, concepto y monto son requeridos' }
       };
     }
+    const periodoContext = resolvePeriodoContextInput({
+      rawTipoPeriodo: req.body?.tipo_periodo,
+      rawQuincena: req.body?.quincena
+    });
+    if (periodoContext.error) {
+      return {
+        status: 400,
+        body: buildErrorBody({
+          code: 'VALIDATION_ERROR',
+          message: periodoContext.error
+        })
+      };
+    }
+    const observacion =
+      periodoContext.tipo_periodo === TIPO_PERIODO.QUINCENAL
+        ? appendQuincenaContextTag(observacionInput, periodoContext.quincena)
+        : observacionInput;
 
     const scopeValidation = await validatePlanillaSucursalScope(idPlanilla, req.body?.id_sucursal);
     if (!scopeValidation.ok) {
@@ -3249,6 +4321,19 @@ const planillaService = {
     if (!scopeValidation.ok) {
       return { status: scopeValidation.status, body: scopeValidation.body };
     }
+    const periodoContext = resolvePeriodoContextInput({
+      rawTipoPeriodo: req.query?.tipo_periodo,
+      rawQuincena: req.query?.quincena
+    });
+    if (periodoContext.error) {
+      return {
+        status: 400,
+        body: buildErrorBody({
+          code: 'VALIDATION_ERROR',
+          message: periodoContext.error
+        })
+      };
+    }
 
     const pagination = parsePagination(req.query || {});
     if (!pagination) {
@@ -3260,7 +4345,12 @@ const planillaService = {
       return { status: 400, body: { error: true, message: 'id_detalle invalido' } };
     }
 
-    const rows = await buildMovimientosDataset({ idPlanilla, idDetalle });
+    const rows = await buildMovimientosDataset({
+      idPlanilla,
+      idDetalle,
+      tipoPeriodo: periodoContext.tipo_periodo,
+      quincena: periodoContext.quincena
+    });
 
     return {
       status: 200,
@@ -3283,13 +4373,31 @@ const planillaService = {
     if (!scopeValidation.ok) {
       return { status: scopeValidation.status, body: scopeValidation.body };
     }
+    const periodoContext = resolvePeriodoContextInput({
+      rawTipoPeriodo: req.query?.tipo_periodo,
+      rawQuincena: req.query?.quincena
+    });
+    if (periodoContext.error) {
+      return {
+        status: 400,
+        body: buildErrorBody({
+          code: 'VALIDATION_ERROR',
+          message: periodoContext.error
+        })
+      };
+    }
 
     const pagination = parsePagination(req.query || {});
     if (!pagination) {
       return { status: 400, body: { error: true, message: 'page y limit deben ser enteros positivos' } };
     }
 
-    const rows = await queryFunctionRows(PLANILLA_ENDPOINT_CONTRACT.movimientosDetalle, [idDetalle]);
+    const rows = await buildMovimientosDataset({
+      idPlanilla,
+      idDetalle,
+      tipoPeriodo: periodoContext.tipo_periodo,
+      quincena: periodoContext.quincena
+    });
     const filtered = rows.filter((row) => parsePositiveInt(row.id_planilla) === idPlanilla);
 
     return {
