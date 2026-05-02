@@ -3,6 +3,7 @@ import pool from '../config/db-connection.js';
 import { checkPermission, requestHasAnyPermission } from '../middleware/checkPermission.js';
 import { resolveRequestUserSucursalScope } from '../utils/sucursalScope.js';
 import PDFDocument from 'pdfkit';
+import { sendReportEmail } from '../services/smtpMailer.js';
 
 const router = express.Router();
 
@@ -65,6 +66,10 @@ const FILTER_KEYS = Object.freeze([
 ]);
 
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/i;
+const MAX_RECIPIENTS = 10;
+const MAX_SUBJECT_LENGTH = 240;
+const MAX_MESSAGE_LENGTH = 2000;
 
 const parsePositiveInt = (value) => {
   const parsed = Number.parseInt(String(value ?? ''), 10);
@@ -183,6 +188,37 @@ const normalizeReportKeyInput = (value) =>
     .trim()
     .toLowerCase()
     .replace(/-/g, '_');
+
+const parseEmailRecipients = (value) => {
+  if (!Array.isArray(value)) {
+    return { ok: false, message: 'El campo destinatarios debe ser un arreglo de correos.' };
+  }
+
+  const recipients = [];
+  const seen = new Set();
+
+  value.forEach((item) => {
+    const normalized = String(item ?? '').trim().toLowerCase();
+    if (!normalized || seen.has(normalized)) return;
+    seen.add(normalized);
+    recipients.push(normalized);
+  });
+
+  if (recipients.length < 1) {
+    return { ok: false, message: 'Debes indicar al menos un destinatario.' };
+  }
+
+  if (recipients.length > MAX_RECIPIENTS) {
+    return { ok: false, message: `Solo se permiten hasta ${MAX_RECIPIENTS} destinatarios por envio.` };
+  }
+
+  const invalid = recipients.find((email) => !EMAIL_RE.test(email));
+  if (invalid) {
+    return { ok: false, message: `El correo ${invalid} no es valido.` };
+  }
+
+  return { ok: true, recipients };
+};
 
 const csvEscape = (value) => {
   if (value === null || value === undefined) return '';
@@ -1837,6 +1873,136 @@ router.get('/reportes/exportar/pdf', checkPermission([BASE_PERMISSION, 'REPORTES
     return res.status(200).send(pdfBuffer);
   } catch (error) {
     return res.status(500).json({ error: true, message: 'No se pudo exportar el reporte solicitado.' });
+  }
+});
+
+router.post('/reportes/enviar-correo', checkPermission([BASE_PERMISSION, 'REPORTES_ENVIAR_CORREO']), async (req, res) => {
+  try {
+    const payload = req.body && typeof req.body === 'object' ? req.body : {};
+    const reportKeyInput = normalizeReportKeyInput(payload.reporte);
+    const reportDefinition = Object.values(REPORT_DEFINITIONS).find((item) => item.key === reportKeyInput);
+
+    if (!reportDefinition) {
+      return res.status(400).json({
+        error: true,
+        message: 'El campo reporte es invalido.'
+      });
+    }
+
+    const formato = String(payload.formato || '').trim().toLowerCase();
+    if (!['pdf', 'excel'].includes(formato)) {
+      return res.status(400).json({
+        error: true,
+        message: 'El campo formato solo permite pdf o excel.'
+      });
+    }
+
+    if (payload.confirmado !== true) {
+      return res.status(400).json({
+        error: true,
+        message: 'Debes confirmar explicitamente el envio antes de continuar.'
+      });
+    }
+
+    const recipientsValidation = parseEmailRecipients(payload.destinatarios);
+    if (!recipientsValidation.ok) {
+      return res.status(400).json({ error: true, message: recipientsValidation.message });
+    }
+
+    const hasReportPermission = await requestHasAnyPermission(req, reportDefinition.permissions);
+    if (!hasReportPermission) {
+      return res.status(403).json({
+        error: true,
+        message: 'Acceso denegado: permisos insuficientes'
+      });
+    }
+
+    const formatPermission = formato === 'pdf' ? 'REPORTES_EXPORTAR_PDF' : 'REPORTES_EXPORTAR_EXCEL';
+    const hasFormatPermission = await requestHasAnyPermission(req, [formatPermission]);
+    if (!hasFormatPermission) {
+      return res.status(403).json({
+        error: true,
+        message: 'Acceso denegado: no tienes permiso para enviar este formato.'
+      });
+    }
+
+    const parsed = parseFilters(payload.filtros || {});
+    if (!parsed.ok) {
+      return res.status(400).json({ error: true, message: parsed.message });
+    }
+
+    const rawSubject = String(payload.asunto || '').trim();
+    if (!rawSubject) {
+      return res.status(400).json({
+        error: true,
+        message: 'El asunto es obligatorio.'
+      });
+    }
+    const subject = rawSubject.slice(0, MAX_SUBJECT_LENGTH);
+
+    const messageRaw = String(payload.mensaje || '').trim();
+    const message = messageRaw.slice(0, MAX_MESSAGE_LENGTH);
+
+    const capture = createCaptureResponse();
+    await executeReportByKey({
+      key: reportDefinition.key,
+      req,
+      res: capture.api,
+      filters: parsed.filters,
+      parsedFilters: parsed.parsed
+    });
+
+    if (capture.state.statusCode >= 400) {
+      return res.status(capture.state.statusCode).json(
+        capture.state.body || { error: true, message: 'No se pudo generar el reporte solicitado.' }
+      );
+    }
+
+    const attachmentFilename = formato === 'pdf'
+      ? buildPdfFileName({ reportKey: reportDefinition.key, parsedFilters: parsed.parsed })
+      : buildExportFileName({ reportKey: reportDefinition.key, parsedFilters: parsed.parsed });
+
+    const attachmentContent = formato === 'pdf'
+      ? await buildReportPdfBuffer({ reportKey: reportDefinition.key, payload: capture.state.body })
+      : Buffer.from(
+          buildExcelCompatibleCsv({ reportKey: reportDefinition.key, payload: capture.state.body }),
+          'utf8'
+        );
+
+    const htmlBody = `
+      <div style="font-family: Arial, sans-serif; color: #1f2937;">
+        <h3 style="margin-bottom:8px;">Reporte ${reportDefinition.key}</h3>
+        <p style="margin:0 0 8px;">${message || 'Se adjunta el reporte solicitado.'}</p>
+        <p style="margin:0; font-size:12px; color:#6b7280;">Generado el ${new Date().toISOString()}</p>
+      </div>
+    `;
+
+    await sendReportEmail({
+      to: recipientsValidation.recipients,
+      subject,
+      html: htmlBody,
+      text: `${message || 'Se adjunta el reporte solicitado.'}\n\nReporte: ${reportDefinition.key}`,
+      attachments: [
+        {
+          filename: attachmentFilename,
+          content: attachmentContent,
+          contentType: formato === 'pdf' ? 'application/pdf' : 'text/csv; charset=utf-8'
+        }
+      ]
+    });
+
+    return res.status(200).json({
+      ok: true,
+      enviado: true,
+      reporte: reportDefinition.key,
+      formato,
+      destinatarios: recipientsValidation.recipients.length
+    });
+  } catch (error) {
+    return res.status(500).json({
+      error: true,
+      message: 'No se pudo enviar el reporte por correo.'
+    });
   }
 });
 

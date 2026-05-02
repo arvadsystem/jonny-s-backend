@@ -131,3 +131,20 @@ export const sendCampaignEmail = async ({ to, subject, html }) => {
     html
   });
 };
+
+export const sendReportEmail = async ({ to, subject, html, text, attachments = [] }) => {
+  const transporter = getTransporter();
+  const sender = getSmtpSenderIdentity();
+
+  return transporter.sendMail({
+    from: {
+      name: sender.name,
+      address: sender.email
+    },
+    to,
+    subject,
+    ...(text ? { text } : {}),
+    ...(html ? { html } : {}),
+    ...(Array.isArray(attachments) && attachments.length > 0 ? { attachments } : {})
+  });
+};
