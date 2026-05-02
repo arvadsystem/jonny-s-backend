@@ -444,6 +444,161 @@ const getVentasMetodosPago = async (req, res, filters, parsedFilters) => {
   });
 };
 
+const buildCajaCierresScopeWhere = ({ parsedFilters, scope, params }) => {
+  const where = [];
+
+  if (parsedFilters.fecha_inicio) {
+    params.push(parsedFilters.fecha_inicio);
+    where.push(`vw.fecha_cierre::date >= $${params.length}::date`);
+  }
+
+  if (parsedFilters.fecha_fin) {
+    params.push(parsedFilters.fecha_fin);
+    where.push(`vw.fecha_cierre::date <= $${params.length}::date`);
+  }
+
+  if (parsedFilters.id_sucursal) {
+    params.push(parsedFilters.id_sucursal);
+    where.push(`vw.id_sucursal = $${params.length}`);
+  } else if (!scope.isSuperAdmin) {
+    const allowed = Array.isArray(scope.allowedSucursalIds)
+      ? scope.allowedSucursalIds.map((value) => parsePositiveInt(value)).filter(Boolean)
+      : [];
+
+    if (allowed.length === 0) {
+      return { forbidden: true, whereClause: '', params };
+    }
+
+    params.push(allowed);
+    where.push(`vw.id_sucursal = ANY($${params.length}::int[])`);
+  }
+
+  if (parsedFilters.id_caja) {
+    params.push(parsedFilters.id_caja);
+    where.push(`vw.id_caja = $${params.length}`);
+  }
+
+  if (parsedFilters.id_usuario) {
+    params.push(parsedFilters.id_usuario);
+    where.push(`(vw.id_usuario_responsable = $${params.length} OR vw.id_usuario_cierre = $${params.length})`);
+  }
+
+  if (parsedFilters.estado) {
+    params.push(`%${parsedFilters.estado}%`);
+    where.push(`COALESCE(resolucion.nombre, 'SIN RESOLUCION') ILIKE $${params.length}`);
+  }
+
+  return {
+    forbidden: false,
+    whereClause: where.length ? `WHERE ${where.join(' AND ')}` : '',
+    params
+  };
+};
+
+const getCajaCierres = async (req, res, filters, parsedFilters) => {
+  const scope = await resolveRequestUserSucursalScope(req);
+  const params = [];
+  const built = buildCajaCierresScopeWhere({ parsedFilters, scope, params });
+
+  if (built.forbidden) {
+    return res.status(403).json({ error: true, message: 'No tiene sucursales asignadas para consultar este reporte.' });
+  }
+
+  const query = `
+    SELECT
+      vw.id_cierre_caja,
+      vw.id_sucursal,
+      vw.id_caja,
+      vw.id_usuario_responsable,
+      vw.id_usuario_cierre,
+      vw.fecha_apertura,
+      vw.fecha_cierre,
+      COALESCE(vw.monto_teorico_cierre, cc.monto_teorico_cierre, 0)::numeric(14,2) AS total_esperado,
+      COALESCE(vw.monto_declarado_cierre, cc.monto_declarado_cierre, 0)::numeric(14,2) AS total_contado,
+      COALESCE(vw.diferencia_cierre, cc.diferencia, 0)::numeric(14,2) AS diferencia,
+      c.codigo_caja,
+      c.nombre_caja,
+      s.nombre_sucursal,
+      COALESCE(NULLIF(TRIM(CONCAT_WS(' ', per_resp.nombre, per_resp.apellido)), ''), resp.nombre_usuario) AS responsable,
+      COALESCE(NULLIF(TRIM(CONCAT_WS(' ', per_cierre.nombre, per_cierre.apellido)), ''), cierre.nombre_usuario) AS usuario_cierre,
+      COALESCE(resolucion.nombre, 'SIN RESOLUCION') AS estado_cierre
+    FROM public.vw_cajas_cierres_resumen vw
+    INNER JOIN public.cajas_cierres cc ON cc.id_cierre_caja = vw.id_cierre_caja
+    INNER JOIN public.cajas c ON c.id_caja = vw.id_caja
+    INNER JOIN public.sucursales s ON s.id_sucursal = vw.id_sucursal
+    INNER JOIN public.usuarios resp ON resp.id_usuario = vw.id_usuario_responsable
+    LEFT JOIN public.empleados e_resp ON e_resp.id_empleado = resp.id_empleado
+    LEFT JOIN public.personas per_resp ON per_resp.id_persona = e_resp.id_persona
+    INNER JOIN public.usuarios cierre ON cierre.id_usuario = vw.id_usuario_cierre
+    LEFT JOIN public.empleados e_cierre ON e_cierre.id_empleado = cierre.id_empleado
+    LEFT JOIN public.personas per_cierre ON per_cierre.id_persona = e_cierre.id_persona
+    LEFT JOIN public.cat_cajas_resoluciones_cierre resolucion ON resolucion.id_resolucion_cierre_caja = cc.id_resolucion_cierre_caja
+    ${built.whereClause}
+    ORDER BY vw.fecha_cierre DESC, vw.id_cierre_caja DESC
+  `;
+
+  const result = await pool.query(query, params);
+  const rows = Array.isArray(result.rows) ? result.rows : [];
+
+  const totals = rows.reduce(
+    (acc, row) => {
+      const esperado = Number(row.total_esperado || 0);
+      const contado = Number(row.total_contado || 0);
+      const diferencia = Number(row.diferencia || 0);
+      const hasDifference = Math.abs(diferencia) > 0.009;
+
+      acc.totalEsperado += esperado;
+      acc.totalContado += contado;
+      acc.totalDiferencia += diferencia;
+      if (hasDifference) acc.conDiferencia += 1;
+      else acc.sinDiferencia += 1;
+      return acc;
+    },
+    {
+      totalEsperado: 0,
+      totalContado: 0,
+      totalDiferencia: 0,
+      conDiferencia: 0,
+      sinDiferencia: 0
+    }
+  );
+
+  return res.json({
+    ok: true,
+    reporte: 'caja_cierres',
+    fase: 'fase_2c_real',
+    filtros: filters,
+    data: {
+      kpis: {
+        cantidad_cierres: rows.length,
+        total_esperado: roundMoney(totals.totalEsperado),
+        total_contado: roundMoney(totals.totalContado),
+        diferencia_total: roundMoney(totals.totalDiferencia),
+        cierres_con_diferencia: totals.conDiferencia,
+        cierres_sin_diferencia: totals.sinDiferencia
+      },
+      cierres: rows.map((row) => ({
+        id_cierre_caja: row.id_cierre_caja,
+        fecha_apertura: row.fecha_apertura,
+        fecha_cierre: row.fecha_cierre,
+        sucursal: row.nombre_sucursal,
+        caja: row.nombre_caja,
+        codigo_caja: row.codigo_caja,
+        responsable: row.responsable,
+        usuario_cierre: row.usuario_cierre,
+        total_esperado: roundMoney(row.total_esperado),
+        total_contado: roundMoney(row.total_contado),
+        diferencia: roundMoney(row.diferencia),
+        estado_cierre: row.estado_cierre
+      }))
+    },
+    meta: {
+      fuente_canonica: 'vw_cajas_cierres_resumen + cajas_cierres + cajas + sucursales + usuarios',
+      generado_en: new Date().toISOString()
+    }
+  });
+};
+
 router.use('/reportes', checkPermission(BASE_PERMISSION));
 
 Object.entries(REPORT_DEFINITIONS).forEach(([path, config]) => {
@@ -459,6 +614,9 @@ Object.entries(REPORT_DEFINITIONS).forEach(([path, config]) => {
       }
       if (config.key === 'ventas_metodos_pago') {
         return await getVentasMetodosPago(req, res, parsed.filters, parsed.parsed);
+      }
+      if (config.key === 'caja_cierres') {
+        return await getCajaCierres(req, res, parsed.filters, parsed.parsed);
       }
 
       return sendPhaseOnePayload(res, config.key, parsed.filters);
