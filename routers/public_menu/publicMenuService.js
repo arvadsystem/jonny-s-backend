@@ -602,6 +602,34 @@ const normalizeRequestedExtras = (rawExtras = []) => {
   return uniqueIds.map((id_extra) => ({ id_extra }));
 };
 
+const resolveExtraOptionByRequestedId = (extraOptions = [], requestedId = '') => {
+  const safeRequestedId = String(requestedId || '').trim();
+  if (!safeRequestedId) return null;
+
+  const directMatch = extraOptions.find((option) => String(option?.id_extra || '').trim() === safeRequestedId);
+  if (directMatch) return directMatch;
+
+  const fallbackOption = PUBLIC_EXTRA_OPTIONS.find((option) => String(option?.id_extra || '').trim() === safeRequestedId);
+  if (!fallbackOption?.codigo) return null;
+
+  return extraOptions.find(
+    (option) => normalizeTextKey(option?.codigo || '') === normalizeTextKey(fallbackOption.codigo)
+  ) || null;
+};
+
+const buildExtraOptionIndex = (extraOptions = []) => {
+  const index = new Map();
+
+  (Array.isArray(extraOptions) ? extraOptions : []).forEach((option) => {
+    const id = String(option?.id_extra || '').trim();
+    const codigo = normalizeTextKey(option?.codigo || '');
+    if (id) index.set(id, option);
+    if (codigo) index.set(codigo, option);
+  });
+
+  return index;
+};
+
 const normalizeRequestedSauces = (rawSauces = []) => {
   const merged = new Map();
 
@@ -861,7 +889,10 @@ const materializePublicOrderSnapshot = async ({ idSucursal, requestedItems = [],
   }
 
   const rows = await fetchCatalogRowsByMenuQuery(Number(activeMenu.id_menu), db);
-  const sauceConfigByDetail = await buildCatalogSauceConfigByDetail(rows, db);
+  const [sauceConfigByDetail, extrasByRecipe] = await Promise.all([
+    buildCatalogSauceConfigByDetail(rows, db),
+    buildCatalogExtrasByRecipe(rows, db)
+  ]);
 
   const recipeIds = rows
     .filter((row) => row.tipo_item === PUBLIC_ITEM_TYPES.RECETA && row.id_receta)
@@ -884,7 +915,8 @@ const materializePublicOrderSnapshot = async ({ idSucursal, requestedItems = [],
       row,
       recipeAvailabilityMap,
       comboAvailabilityMap,
-      sauceConfigByDetail
+      sauceConfigByDetail,
+      extrasByRecipe
     })
   );
 
@@ -1038,11 +1070,14 @@ const buildPublicOrderResult = ({
 
 const validateAndResolveLineConfiguration = ({ catalog, line }) => {
   const extraOptions = Array.isArray(catalog?.extras_opciones) ? catalog.extras_opciones : [];
-  const extraOptionById = new Map(extraOptions.map((option) => [String(option.id_extra), option]));
+  const extraOptionById = buildExtraOptionIndex(extraOptions);
   const selectedExtraIds = normalizeRequestedExtras(line?.extras).map((entry) => entry.id_extra);
 
   const resolvedExtras = selectedExtraIds.map((idExtra) => {
-    const option = extraOptionById.get(String(idExtra));
+    const option =
+      extraOptionById.get(String(idExtra).trim()) ||
+      extraOptionById.get(normalizeTextKey(idExtra)) ||
+      resolveExtraOptionByRequestedId(extraOptions, idExtra);
     if (!option) {
       throw buildHttpError(400, `El item ${catalog.nombre} no permite el extra solicitado (${idExtra}).`);
     }

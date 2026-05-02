@@ -12,6 +12,7 @@ export const UPLOADS_DIR = path.resolve(__dirname, '..', 'uploads');
 export const UPLOADS_PUBLIC_PREFIX = '/uploads';
 export const INVENTARIO_UPLOADS_SUBDIR = 'inventario';
 export const SUCURSALES_UPLOADS_SUBDIR = 'sucursales';
+export const CARRUSEL_UPLOADS_SUBDIR = 'carrusel';
 export const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
 export const MAX_IMAGE_JSON_LIMIT = '10mb';
 
