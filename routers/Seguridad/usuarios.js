@@ -12,6 +12,7 @@ import pool from '../../config/db-connection.js';
 import { checkPermission, isRequestUserSuperAdmin } from '../../middleware/checkPermission.js';
 import { timestampAsHNToISO, toHNWallTimestamp } from '../../utils/dates.js';
 import { insertSecurityAuditLog } from './auditLogger.js';
+import { securityReadLimiter, securityWriteLimiter } from './securityRateLimit.js';
 
 const router = express.Router();
 
@@ -43,6 +44,7 @@ const PERMISOS_BITACORAS_VER = [
   'SEGURIDAD_USUARIOS_AUDITORIA_VER',
   'SEGURIDAD_SESIONES_VER_GLOBAL'
 ];
+const MAX_SEARCH_LEN = 120;
 
 // =====================================================
 // Helpers
@@ -268,6 +270,9 @@ const normalizeLoginEstado = (raw) => {
   return null;
 };
 
+const sanitizeSearchTerm = (value) =>
+  String(value ?? '').trim().slice(0, MAX_SEARCH_LEN);
+
 // =====================================================
 // HU1085: Listado global de usuarios
 // =====================================================
@@ -280,7 +285,7 @@ const normalizeLoginEstado = (raw) => {
  * - limit (default 10)
  * - offset (default 0)
  */
-router.get('/usuarios/global', checkPermission(PERMISOS_USUARIOS_VER), async (req, res) => {
+router.get('/usuarios/global', securityReadLimiter, checkPermission(PERMISOS_USUARIOS_VER), async (req, res) => {
   try {
     const user = req.user || req.usuario;
 
@@ -291,7 +296,7 @@ router.get('/usuarios/global', checkPermission(PERMISOS_USUARIOS_VER), async (re
     // 🔒 Solo Super Admin
     if (!(await requireSuperAdmin(req, res))) return;
 
-    const buscar = String(req.query.buscar ?? '').trim();
+    const buscar = sanitizeSearchTerm(req.query.buscar);
     const estadoBool = normalizeEstado(req.query.estado);
 
     const limit = clampInt(req.query.limit, 10, 1, 50);
@@ -403,7 +408,7 @@ router.get('/usuarios/global', checkPermission(PERMISOS_USUARIOS_VER), async (re
  * GET /seguridad/usuarios/:id/detalle
  * HU1887: Perfil resumido del usuario para auditoria.
  */
-router.get('/usuarios/:id/detalle', checkPermission(PERMISOS_USUARIOS_VER), async (req, res) => {
+router.get('/usuarios/:id/detalle', securityReadLimiter, checkPermission(PERMISOS_USUARIOS_VER), async (req, res) => {
   try {
     const actor = req.user || req.usuario;
     if (!actor?.id_usuario) {
@@ -515,7 +520,7 @@ router.get('/usuarios/:id/detalle', checkPermission(PERMISOS_USUARIOS_VER), asyn
  * GET /seguridad/usuarios/:id/sesiones
  * HU1887: Sesiones de un usuario especifico.
  */
-router.get('/usuarios/:id/sesiones', checkPermission(PERMISOS_USUARIOS_SESIONES), async (req, res) => {
+router.get('/usuarios/:id/sesiones', securityReadLimiter, checkPermission(PERMISOS_USUARIOS_SESIONES), async (req, res) => {
   try {
     const actor = req.user || req.usuario;
     if (!actor?.id_usuario) {
@@ -596,7 +601,7 @@ router.get('/usuarios/:id/sesiones', checkPermission(PERMISOS_USUARIOS_SESIONES)
  * GET /seguridad/usuarios/:id/logins
  * HU1887: Logins de usuario seleccionado (exitosos y fallidos), con filtros.
  */
-router.get('/usuarios/:id/logins', checkPermission(PERMISOS_USUARIOS_LOGINS), async (req, res) => {
+router.get('/usuarios/:id/logins', securityReadLimiter, checkPermission(PERMISOS_USUARIOS_LOGINS), async (req, res) => {
   try {
     const actor = req.user || req.usuario;
     if (!actor?.id_usuario) {
@@ -708,7 +713,7 @@ router.get('/usuarios/:id/logins', checkPermission(PERMISOS_USUARIOS_LOGINS), as
  * - limit (default 10)
  * - offset (default 0)
  */
-router.get('/bitacoras', checkPermission(PERMISOS_BITACORAS_VER), async (req, res) => {
+router.get('/bitacoras', securityReadLimiter, checkPermission(PERMISOS_BITACORAS_VER), async (req, res) => {
   try {
     const actor = req.user || req.usuario;
     if (!actor?.id_usuario) {
@@ -723,7 +728,7 @@ router.get('/bitacoras', checkPermission(PERMISOS_BITACORAS_VER), async (req, re
 
     const limit = clampInt(req.query.limit, 10, 1, 100);
     const offset = clampInt(req.query.offset, 0, 0, 1_000_000);
-    const usuarioTerm = String(req.query.usuario ?? '').trim();
+    const usuarioTerm = sanitizeSearchTerm(req.query.usuario);
     const actorId = parsePositiveInt(usuarioTerm);
 
     const where = [];
@@ -853,7 +858,7 @@ router.get('/bitacoras', checkPermission(PERMISOS_BITACORAS_VER), async (req, re
  * POST /seguridad/usuarios/:id/sesiones/cerrar
  * HU1888: Cierra todas las sesiones activas de un usuario (forzado por Super Admin).
  */
-router.post('/usuarios/:id/sesiones/cerrar', checkPermission(PERMISOS_USUARIOS_CERRAR), async (req, res) => {
+router.post('/usuarios/:id/sesiones/cerrar', securityWriteLimiter, checkPermission(PERMISOS_USUARIOS_CERRAR), async (req, res) => {
   try {
     const actor = req.user || req.usuario;
     if (!actor?.id_usuario) {

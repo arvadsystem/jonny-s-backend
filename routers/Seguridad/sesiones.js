@@ -14,8 +14,11 @@ import { closeInactiveSessions, closeSession } from '../../utils/security/sessio
 import { checkPermission, isRequestUserSuperAdmin } from '../../middleware/checkPermission.js';
 import { timestampAsHNToISO } from '../../utils/dates.js';
 import { insertSecurityAuditLog } from './auditLogger.js';
+import { securityReadLimiter, securityWriteLimiter } from './securityRateLimit.js';
 
 const router = express.Router();
+const MAX_SEARCH_LEN = 120;
+const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 // =====================================================
 // Helpers
@@ -75,6 +78,12 @@ const buildBuscarClause = (buscar, startIdx) => {
   };
 };
 
+const sanitizeSearchTerm = (value) =>
+  String(value ?? '').trim().slice(0, MAX_SEARCH_LEN);
+
+const isValidSessionId = (value) =>
+  UUID_REGEX.test(String(value ?? '').trim());
+
 // =====================================================
 // HU79: Sesiones del usuario actual
 // =====================================================
@@ -85,6 +94,7 @@ const buildBuscarClause = (buscar, startIdx) => {
  */
 router.get(
   '/sesiones',
+  securityReadLimiter,
   checkPermission(['SEGURIDAD_VER', 'SEGURIDAD_SESIONES_VER', 'SEGURIDAD_SESIONES_VER_GLOBAL']),
   async (req, res) => {
   try {
@@ -138,6 +148,7 @@ router.get(
  */
 router.post(
   '/sesiones/cerrar',
+  securityWriteLimiter,
   checkPermission(['SEGURIDAD_SESIONES_CERRAR', 'SEGURIDAD_SESIONES_CERRAR_OTRAS']),
   async (req, res) => {
   try {
@@ -149,6 +160,9 @@ router.post(
     }
     if (!id_sesion) {
       return res.status(400).json({ error: true, message: 'id_sesion es requerido' });
+    }
+    if (!isValidSessionId(id_sesion)) {
+      return res.status(400).json({ error: true, message: 'id_sesion invalido' });
     }
 
     // ✅ Verifica que la sesión pertenece al usuario
@@ -191,6 +205,7 @@ router.post(
  */
 router.post(
   '/sesiones/cerrar-otras',
+  securityWriteLimiter,
   checkPermission(['SEGURIDAD_SESIONES_CERRAR', 'SEGURIDAD_SESIONES_CERRAR_OTRAS']),
   async (req, res) => {
   try {
@@ -254,6 +269,7 @@ router.post(
  */
 router.get(
   '/sesiones/global',
+  securityReadLimiter,
   checkPermission(['SEGURIDAD_VER', 'SEGURIDAD_SESIONES_VER_GLOBAL']),
   async (req, res) => {
   try {
@@ -267,7 +283,7 @@ router.get(
 
     await closeInactiveSessions();
 
-    const buscar = String(req.query.buscar ?? '').trim();
+    const buscar = sanitizeSearchTerm(req.query.buscar);
     const limit = clampInt(req.query.limit, 10, 1, 50);
     const offset = clampInt(req.query.offset, 0, 0, 1_000_000);
 
@@ -351,6 +367,7 @@ router.get(
  */
 router.post(
   '/sesiones/cerrar-global',
+  securityWriteLimiter,
   checkPermission(['SEGURIDAD_SESIONES_CERRAR_GLOBAL', 'SEGURIDAD_SESIONES_CERRAR']),
   async (req, res) => {
     try {
@@ -369,6 +386,9 @@ router.post(
 
       if (!id_sesion) {
         return res.status(400).json({ error: true, message: 'id_sesion es requerido' });
+      }
+      if (!isValidSessionId(id_sesion)) {
+        return res.status(400).json({ error: true, message: 'id_sesion invalido' });
       }
 
       // ⛔ Evitar cerrar la sesión actual del Super Admin
@@ -435,6 +455,7 @@ router.post(
  */
 router.post(
   '/sesiones/cerrar-global-menos-actual',
+  securityWriteLimiter,
   checkPermission([
     'SEGURIDAD_SESIONES_CERRAR_GLOBAL_MENOS_ACTUAL',
     'SEGURIDAD_SESIONES_CERRAR_GLOBAL',
