@@ -55,12 +55,23 @@ const hasTable = async (tableName) => {
 // Lista sucursales activas para entrada publica del flujo.
 export const fetchPublicBranchesQuery = async () => {
   const query = `
+    WITH clock AS (
+      SELECT (NOW() AT TIME ZONE 'America/Tegucigalpa')::time AS hora_actual
+    )
     SELECT
       s.id_sucursal,
       s.nombre_sucursal,
       COALESCE(vsi.texto_direccion, 'Direccion no disponible') AS direccion,
-      COALESCE(s.estado, true) AS estado
+      COALESCE(s.estado, true) AS estado,
+      s.hora_inicio,
+      s.hora_final,
+      CASE
+        WHEN s.hora_inicio IS NULL OR s.hora_final IS NULL THEN false
+        WHEN s.hora_final > s.hora_inicio THEN clock.hora_actual >= s.hora_inicio AND clock.hora_actual < s.hora_final
+        ELSE clock.hora_actual >= s.hora_inicio OR clock.hora_actual < s.hora_final
+      END AS abierto_por_horario
     FROM sucursales s
+    CROSS JOIN clock
     LEFT JOIN v_sucursales_info vsi
       ON vsi.id_sucursal = s.id_sucursal
     WHERE COALESCE(s.estado, true) = true
@@ -240,6 +251,36 @@ export const fetchCatalogRowsByMenuQuery = async (idMenu, db = pool) => {
   });
   const result = await db.query(query, [idMenu]);
   return result.rows;
+};
+
+// Disponibilidad puntual de una sucursal para validar pedidos publicos.
+export const fetchPublicBranchAvailabilityByIdQuery = async (idSucursal, db = pool) => {
+  const query = `
+    WITH clock AS (
+      SELECT (NOW() AT TIME ZONE 'America/Tegucigalpa')::time AS hora_actual
+    )
+    SELECT
+      s.id_sucursal,
+      s.nombre_sucursal,
+      COALESCE(vsi.texto_direccion, 'Direccion no disponible') AS direccion,
+      COALESCE(s.estado, true) AS estado,
+      s.hora_inicio,
+      s.hora_final,
+      CASE
+        WHEN s.hora_inicio IS NULL OR s.hora_final IS NULL THEN false
+        WHEN s.hora_final > s.hora_inicio THEN clock.hora_actual >= s.hora_inicio AND clock.hora_actual < s.hora_final
+        ELSE clock.hora_actual >= s.hora_inicio OR clock.hora_actual < s.hora_final
+      END AS abierto_por_horario
+    FROM sucursales s
+    CROSS JOIN clock
+    LEFT JOIN v_sucursales_info vsi
+      ON vsi.id_sucursal = s.id_sucursal
+    WHERE s.id_sucursal = $1
+    LIMIT 1;
+  `;
+
+  const result = await db.query(query, [idSucursal]);
+  return result.rows[0] || null;
 };
 
 export const fetchPublicMenuExtrasByRecipeIdsQuery = async (recipeIds = [], db = pool) => {
