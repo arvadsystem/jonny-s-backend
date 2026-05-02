@@ -49,6 +49,7 @@ const FILTER_KEYS = Object.freeze([
   'caja',
   'usuario',
   'metodo_pago',
+  'tipo_diferencia',
   'producto',
   'categoria',
   'estado',
@@ -119,7 +120,8 @@ const parseFilters = (query = {}) => {
       id_caja: idCaja,
       id_usuario: idUsuario,
       estado: filters.estado || null,
-      metodo_pago: filters.metodo_pago || null
+      metodo_pago: filters.metodo_pago || null,
+      tipo_diferencia: filters.tipo_diferencia || null
     }
   };
 };
@@ -449,17 +451,17 @@ const buildCajaCierresScopeWhere = ({ parsedFilters, scope, params }) => {
 
   if (parsedFilters.fecha_inicio) {
     params.push(parsedFilters.fecha_inicio);
-    where.push(`vw.fecha_cierre::date >= $${params.length}::date`);
+    where.push(`cc.fecha_cierre::date >= $${params.length}::date`);
   }
 
   if (parsedFilters.fecha_fin) {
     params.push(parsedFilters.fecha_fin);
-    where.push(`vw.fecha_cierre::date <= $${params.length}::date`);
+    where.push(`cc.fecha_cierre::date <= $${params.length}::date`);
   }
 
   if (parsedFilters.id_sucursal) {
     params.push(parsedFilters.id_sucursal);
-    where.push(`vw.id_sucursal = $${params.length}`);
+    where.push(`cc.id_sucursal = $${params.length}`);
   } else if (!scope.isSuperAdmin) {
     const allowed = Array.isArray(scope.allowedSucursalIds)
       ? scope.allowedSucursalIds.map((value) => parsePositiveInt(value)).filter(Boolean)
@@ -470,17 +472,17 @@ const buildCajaCierresScopeWhere = ({ parsedFilters, scope, params }) => {
     }
 
     params.push(allowed);
-    where.push(`vw.id_sucursal = ANY($${params.length}::int[])`);
+    where.push(`cc.id_sucursal = ANY($${params.length}::int[])`);
   }
 
   if (parsedFilters.id_caja) {
     params.push(parsedFilters.id_caja);
-    where.push(`vw.id_caja = $${params.length}`);
+    where.push(`cc.id_caja = $${params.length}`);
   }
 
   if (parsedFilters.id_usuario) {
     params.push(parsedFilters.id_usuario);
-    where.push(`(vw.id_usuario_responsable = $${params.length} OR vw.id_usuario_cierre = $${params.length})`);
+    where.push(`(cc.id_usuario_responsable = $${params.length} OR cc.id_usuario_cierre = $${params.length})`);
   }
 
   if (parsedFilters.estado) {
@@ -506,35 +508,34 @@ const getCajaCierres = async (req, res, filters, parsedFilters) => {
 
   const query = `
     SELECT
-      vw.id_cierre_caja,
-      vw.id_sucursal,
-      vw.id_caja,
-      vw.id_usuario_responsable,
-      vw.id_usuario_cierre,
-      vw.fecha_apertura,
-      vw.fecha_cierre,
-      COALESCE(vw.monto_teorico_cierre, cc.monto_teorico_cierre, 0)::numeric(14,2) AS total_esperado,
-      COALESCE(vw.monto_declarado_cierre, cc.monto_declarado_cierre, 0)::numeric(14,2) AS total_contado,
-      COALESCE(vw.diferencia_cierre, cc.diferencia, 0)::numeric(14,2) AS diferencia,
+      cc.id_cierre_caja,
+      cc.id_sucursal,
+      cc.id_caja,
+      cc.id_usuario_responsable,
+      cc.id_usuario_cierre,
+      NULL::timestamp AS fecha_apertura,
+      cc.fecha_cierre,
+      COALESCE(cc.monto_teorico_cierre, 0)::numeric(14,2) AS total_esperado,
+      COALESCE(cc.monto_declarado_cierre, 0)::numeric(14,2) AS total_contado,
+      COALESCE(cc.diferencia, 0)::numeric(14,2) AS diferencia,
       c.codigo_caja,
       c.nombre_caja,
       s.nombre_sucursal,
       COALESCE(NULLIF(TRIM(CONCAT_WS(' ', per_resp.nombre, per_resp.apellido)), ''), resp.nombre_usuario) AS responsable,
       COALESCE(NULLIF(TRIM(CONCAT_WS(' ', per_cierre.nombre, per_cierre.apellido)), ''), cierre.nombre_usuario) AS usuario_cierre,
       COALESCE(resolucion.nombre, 'SIN RESOLUCION') AS estado_cierre
-    FROM public.vw_cajas_cierres_resumen vw
-    INNER JOIN public.cajas_cierres cc ON cc.id_cierre_caja = vw.id_cierre_caja
-    INNER JOIN public.cajas c ON c.id_caja = vw.id_caja
-    INNER JOIN public.sucursales s ON s.id_sucursal = vw.id_sucursal
-    INNER JOIN public.usuarios resp ON resp.id_usuario = vw.id_usuario_responsable
+    FROM public.cajas_cierres cc
+    INNER JOIN public.cajas c ON c.id_caja = cc.id_caja
+    INNER JOIN public.sucursales s ON s.id_sucursal = cc.id_sucursal
+    INNER JOIN public.usuarios resp ON resp.id_usuario = cc.id_usuario_responsable
     LEFT JOIN public.empleados e_resp ON e_resp.id_empleado = resp.id_empleado
     LEFT JOIN public.personas per_resp ON per_resp.id_persona = e_resp.id_persona
-    INNER JOIN public.usuarios cierre ON cierre.id_usuario = vw.id_usuario_cierre
+    LEFT JOIN public.usuarios cierre ON cierre.id_usuario = cc.id_usuario_cierre
     LEFT JOIN public.empleados e_cierre ON e_cierre.id_empleado = cierre.id_empleado
     LEFT JOIN public.personas per_cierre ON per_cierre.id_persona = e_cierre.id_persona
     LEFT JOIN public.cat_cajas_resoluciones_cierre resolucion ON resolucion.id_resolucion_cierre_caja = cc.id_resolucion_cierre_caja
     ${built.whereClause}
-    ORDER BY vw.fecha_cierre DESC, vw.id_cierre_caja DESC
+    ORDER BY cc.fecha_cierre DESC, cc.id_cierre_caja DESC
   `;
 
   const result = await pool.query(query, params);
@@ -593,7 +594,121 @@ const getCajaCierres = async (req, res, filters, parsedFilters) => {
       }))
     },
     meta: {
-      fuente_canonica: 'vw_cajas_cierres_resumen + cajas_cierres + cajas + sucursales + usuarios',
+      fuente_canonica: 'cajas_cierres + cajas + sucursales + usuarios + cat_cajas_resoluciones_cierre',
+      generado_en: new Date().toISOString()
+    }
+  });
+};
+
+const getCajaDiferencias = async (req, res, filters, parsedFilters) => {
+  const scope = await resolveRequestUserSucursalScope(req);
+  const params = [];
+  const built = buildCajaCierresScopeWhere({ parsedFilters, scope, params });
+
+  if (built.forbidden) {
+    return res.status(403).json({ error: true, message: 'No tiene sucursales asignadas para consultar este reporte.' });
+  }
+
+  const tipoDiferencia = String(parsedFilters.tipo_diferencia || '').trim().toLowerCase();
+  if (tipoDiferencia && !['faltante', 'sobrante'].includes(tipoDiferencia)) {
+    return res.status(400).json({
+      error: true,
+      message: 'El filtro tipo_diferencia solo permite: faltante o sobrante.'
+    });
+  }
+
+  let tipoWhere = 'AND ABS(COALESCE(cc.diferencia, 0)) > 0.009';
+  if (tipoDiferencia === 'faltante') {
+    tipoWhere += ' AND COALESCE(cc.diferencia, 0) < 0';
+  } else if (tipoDiferencia === 'sobrante') {
+    tipoWhere += ' AND COALESCE(cc.diferencia, 0) > 0';
+  }
+
+  const query = `
+    SELECT
+      cc.id_cierre_caja,
+      cc.id_sucursal,
+      cc.id_caja,
+      cc.id_usuario_responsable,
+      cc.id_usuario_cierre,
+      cc.fecha_cierre,
+      COALESCE(cc.monto_teorico_cierre, 0)::numeric(14,2) AS total_esperado,
+      COALESCE(cc.monto_declarado_cierre, 0)::numeric(14,2) AS total_contado,
+      COALESCE(cc.diferencia, 0)::numeric(14,2) AS diferencia,
+      c.codigo_caja,
+      c.nombre_caja,
+      s.nombre_sucursal,
+      COALESCE(NULLIF(TRIM(CONCAT_WS(' ', per_resp.nombre, per_resp.apellido)), ''), resp.nombre_usuario) AS responsable,
+      COALESCE(resolucion.nombre, 'SIN RESOLUCION') AS estado_resolucion,
+      COALESCE(cc.observacion, '') AS observacion
+    FROM public.cajas_cierres cc
+    INNER JOIN public.cajas c ON c.id_caja = cc.id_caja
+    INNER JOIN public.sucursales s ON s.id_sucursal = cc.id_sucursal
+    INNER JOIN public.usuarios resp ON resp.id_usuario = cc.id_usuario_responsable
+    LEFT JOIN public.empleados e_resp ON e_resp.id_empleado = resp.id_empleado
+    LEFT JOIN public.personas per_resp ON per_resp.id_persona = e_resp.id_persona
+    LEFT JOIN public.cat_cajas_resoluciones_cierre resolucion ON resolucion.id_resolucion_cierre_caja = cc.id_resolucion_cierre_caja
+    ${built.whereClause ? `${built.whereClause} ${tipoWhere}` : `WHERE 1=1 ${tipoWhere}`}
+    ORDER BY cc.fecha_cierre DESC, cc.id_cierre_caja DESC
+  `;
+
+  const result = await pool.query(query, params);
+  const rows = Array.isArray(result.rows) ? result.rows : [];
+
+  const totals = rows.reduce(
+    (acc, row) => {
+      const diferencia = Number(row.diferencia || 0);
+      const abs = Math.abs(diferencia);
+      acc.totalAbsoluto += abs;
+      if (diferencia < 0) {
+        acc.totalFaltantes += abs;
+        acc.cantidadFaltantes += 1;
+      } else if (diferencia > 0) {
+        acc.totalSobrantes += diferencia;
+        acc.cantidadSobrantes += 1;
+      }
+      return acc;
+    },
+    {
+      totalAbsoluto: 0,
+      totalFaltantes: 0,
+      totalSobrantes: 0,
+      cantidadFaltantes: 0,
+      cantidadSobrantes: 0
+    }
+  );
+
+  return res.json({
+    ok: true,
+    reporte: 'caja_diferencias',
+    fase: 'fase_2d_real',
+    filtros: filters,
+    data: {
+      kpis: {
+        cantidad_diferencias: rows.length,
+        total_diferencia_absoluta: roundMoney(totals.totalAbsoluto),
+        total_faltantes: roundMoney(totals.totalFaltantes),
+        total_sobrantes: roundMoney(totals.totalSobrantes),
+        cantidad_faltantes: totals.cantidadFaltantes,
+        cantidad_sobrantes: totals.cantidadSobrantes
+      },
+      diferencias: rows.map((row) => ({
+        id_cierre_caja: row.id_cierre_caja,
+        fecha_cierre: row.fecha_cierre,
+        sucursal: row.nombre_sucursal,
+        caja: row.nombre_caja,
+        codigo_caja: row.codigo_caja,
+        responsable: row.responsable,
+        total_esperado: roundMoney(row.total_esperado),
+        total_contado: roundMoney(row.total_contado),
+        diferencia: roundMoney(row.diferencia),
+        tipo_diferencia: Number(row.diferencia || 0) < 0 ? 'FALTANTE' : 'SOBRANTE',
+        estado_resolucion: row.estado_resolucion,
+        observacion: row.observacion || ''
+      }))
+    },
+    meta: {
+      fuente_canonica: 'cajas_cierres + cajas + sucursales + usuarios + cat_cajas_resoluciones_cierre',
       generado_en: new Date().toISOString()
     }
   });
@@ -617,6 +732,9 @@ Object.entries(REPORT_DEFINITIONS).forEach(([path, config]) => {
       }
       if (config.key === 'caja_cierres') {
         return await getCajaCierres(req, res, parsed.filters, parsed.parsed);
+      }
+      if (config.key === 'caja_diferencias') {
+        return await getCajaDiferencias(req, res, parsed.filters, parsed.parsed);
       }
 
       return sendPhaseOnePayload(res, config.key, parsed.filters);
