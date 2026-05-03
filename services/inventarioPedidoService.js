@@ -2,7 +2,12 @@ import pool from '../config/db-connection.js';
 import { normalizePedidoPayload, toPositiveInt } from './pedidoPayloadValidator.js';
 import { resolvePedidoConsumo } from './pedidoConsumoResolver.js';
 import { validarStockConBloqueo } from './inventarioStockValidator.js';
-import { fetchExistingPedidoMovement, registrarMovimientosPedido } from './inventarioMovimientoService.js';
+import {
+  MOVEMENT_REF,
+  SHORTAGE_MOVEMENT_REF,
+  fetchExistingPedidoMovement,
+  registrarMovimientosPedido
+} from './inventarioMovimientoService.js';
 
 // Orquestador de descuento por pedido (modulo INSUMOS).
 // -----------------------------------------------------
@@ -49,10 +54,17 @@ export const validarYDescontarPedido = async (payload, options = {}) => {
 
   const { id_sucursal: idSucursal, id_pedido: idPedido, items } = normalized.value;
   const actorUserId = toPositiveInt(options?.id_usuario) || null;
+  const allowNegativeStock = options?.allowNegativeStock === true;
+  const shortageMode = String(options?.shortageMode || '').trim().toUpperCase();
+  const movementRefForShortage = shortageMode === SHORTAGE_MOVEMENT_REF
+    ? SHORTAGE_MOVEMENT_REF
+    : MOVEMENT_REF;
+  const externalClient = options?.dbClient || null;
 
-  const client = await pool.connect();
+  const client = externalClient || (await pool.connect());
+  const manageTransaction = !externalClient;
   try {
-    await client.query('BEGIN');
+    if (manageTransaction) await client.query('BEGIN');
 
     await ensureBranchExists(client, idSucursal);
 
@@ -85,17 +97,40 @@ export const validarYDescontarPedido = async (payload, options = {}) => {
       ...(Array.isArray(stockResult.faltantes) ? stockResult.faltantes : [])
     ];
 
-    if (faltantes.length > 0) {
-      await client.query('ROLLBACK');
+    const configFaults = faltantes.filter(
+      (item) => String(item?.motivo || '').trim().toUpperCase() !== 'STOCK_INSUFICIENTE'
+    );
+    const stockShortages = faltantes.filter(
+      (item) => String(item?.motivo || '').trim().toUpperCase() === 'STOCK_INSUFICIENTE'
+    );
+
+    if (configFaults.length > 0) {
+      if (manageTransaction) await client.query('ROLLBACK');
+      return {
+        ok: false,
+        code: 'CONFIGURACION_INVENTARIO_INVALIDA',
+        message: 'No se pudo descontar inventario por configuracion incompleta de productos/recetas/combos/almacen.',
+        id_pedido: idPedido,
+        id_sucursal: idSucursal,
+        faltantes: configFaults
+      };
+    }
+
+    if (stockShortages.length > 0 && !allowNegativeStock) {
+      if (manageTransaction) await client.query('ROLLBACK');
       return {
         ok: false,
         code: 'STOCK_O_CONFIG_INSUFICIENTE',
         message: 'No se pudo descontar inventario porque faltan recursos o hay configuraciones incompletas.',
         id_pedido: idPedido,
         id_sucursal: idSucursal,
-        faltantes
+        faltantes: stockShortages
       };
     }
+
+    const shortagesByResource = new Map(
+      stockShortages.map((item) => [`${item.tipo_recurso}:${item.id_recurso}`, item])
+    );
 
     // 4) Registrar movimientos de salida ligados al pedido.
     await registrarMovimientosPedido({
@@ -105,17 +140,28 @@ export const validarYDescontarPedido = async (payload, options = {}) => {
       productoQtyMap: consumoResult.consumo.productoQtyMap,
       insumoQtyMap: consumoResult.consumo.insumoQtyMap,
       productosById: stockResult.lockedRows.productosById,
-      insumosById: stockResult.lockedRows.insumosById
+      insumosById: stockResult.lockedRows.insumosById,
+      refOrigen: stockShortages.length > 0 ? movementRefForShortage : MOVEMENT_REF,
+      shortagesByResource
     });
 
-    await client.query('COMMIT');
+    if (manageTransaction) await client.query('COMMIT');
 
     return {
       ok: true,
       code: 'DESCUENTO_OK',
-      message: 'Inventario descontado correctamente.',
+      message: stockShortages.length > 0
+        ? 'Inventario descontado con faltantes auditados.'
+        : 'Inventario descontado correctamente.',
       id_pedido: idPedido,
       id_sucursal: idSucursal,
+      warning: stockShortages.length > 0
+        ? {
+            code: 'FALTANTE_COCINA',
+            message: 'Pedido descontado con stock insuficiente auditado.',
+            faltantes: stockShortages
+          }
+        : null,
       resumen: {
         productos_afectados: consumoResult.consumo.productoQtyMap.size,
         insumos_afectados: consumoResult.consumo.insumoQtyMap.size,
@@ -124,13 +170,13 @@ export const validarYDescontarPedido = async (payload, options = {}) => {
     };
   } catch (error) {
     try {
-      await client.query('ROLLBACK');
+      if (manageTransaction) await client.query('ROLLBACK');
     } catch {
       // Si el rollback falla, se mantiene el error original.
     }
     throw error;
   } finally {
-    client.release();
+    if (manageTransaction) client.release();
   }
 };
 

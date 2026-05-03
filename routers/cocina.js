@@ -7,6 +7,7 @@ import {
 } from '../middleware/checkPermission.js';
 import { resolveRequestUserSucursalScope } from '../utils/sucursalScope.js';
 import { enviarCorreo } from '../utils/emailService.js';
+import { validarYDescontarPedido } from '../services/inventarioPedidoService.js';
 
 const router = express.Router();
 
@@ -49,6 +50,7 @@ const TRANSITIONS = {
 
 // Desde LISTO_PARA_ENTREGA también se puede marcar como NO_ENTREGADO
 const EXTRA_TRANSITIONS = {
+  EN_COCINA: ['LISTO_PARA_ENTREGA'],
   LISTO_PARA_ENTREGA: ['COMPLETADO', 'NO_ENTREGADO']
 };
 
@@ -90,6 +92,84 @@ const inferKitchenItemQuantity = (rawSubtotal, rawUnitPrice) => {
   if (!Number.isFinite(unitPrice) || unitPrice <= 0) return 1;
   const inferred = Math.round(subtotal / unitPrice);
   return Number.isInteger(inferred) && inferred > 0 ? inferred : 1;
+};
+
+const buildPedidoConsumoPayload = async (client, idPedido, idSucursal) => {
+  const detailsResult = await client.query(
+    `
+      SELECT
+        dp.id_producto,
+        dp.id_combo,
+        dp.id_receta,
+        COALESCE(dp.sub_total_pedido, 0) AS sub_total_item,
+        COALESCE(
+          CASE
+            WHEN dp.id_producto IS NOT NULL THEN prod.precio
+            WHEN dp.id_combo IS NOT NULL THEN combo.precio
+            WHEN dp.id_receta IS NOT NULL THEN rec.precio
+            ELSE NULL
+          END,
+          NULLIF(COALESCE(dp.sub_total_pedido, 0), 0),
+          NULLIF(COALESCE(dp.total_pedido, 0), 0),
+          0
+        ) AS precio_unitario
+      FROM public.detalle_pedido dp
+      LEFT JOIN public.productos prod ON prod.id_producto = dp.id_producto
+      LEFT JOIN public.combos combo ON combo.id_combo = dp.id_combo
+      LEFT JOIN public.recetas rec ON rec.id_receta = dp.id_receta
+      WHERE dp.id_pedido = $1
+        AND COALESCE(dp.estado, true) = true
+      ORDER BY dp.id_detalle_pedido
+    `,
+    [idPedido]
+  );
+
+  if (detailsResult.rowCount === 0) {
+    return {
+      ok: false,
+      status: 409,
+      body: {
+        error: true,
+        code: 'PEDIDO_SIN_DETALLE',
+        message: 'No se pudo descontar inventario porque el pedido no tiene detalle valido.'
+      }
+    };
+  }
+
+  const items = detailsResult.rows
+    .map((row) => {
+      const idProducto = parsePositiveInt(row.id_producto);
+      const idCombo = parsePositiveInt(row.id_combo);
+      const idReceta = parsePositiveInt(row.id_receta);
+      const quantity = inferKitchenItemQuantity(row.sub_total_item, row.precio_unitario);
+
+      if (idProducto) return { tipo_item: 'PRODUCTO', id_item: idProducto, cantidad: quantity };
+      if (idCombo) return { tipo_item: 'COMBO', id_item: idCombo, cantidad: quantity };
+      if (idReceta) return { tipo_item: 'RECETA', id_item: idReceta, cantidad: quantity };
+      return null;
+    })
+    .filter(Boolean);
+
+  if (!items.length) {
+    return {
+      ok: false,
+      status: 409,
+      body: {
+        error: true,
+        code: 'PEDIDO_SIN_ITEMS_VALIDOS',
+        message: 'No se pudo descontar inventario porque el pedido no tiene items validos para consumo.'
+      }
+    };
+  }
+
+  return {
+    ok: true,
+    payload: {
+      id_sucursal: idSucursal,
+      id_pedido: idPedido,
+      items
+    }
+  };
 };
 
 const inferTipoServicio = (descripcionEnvio) => {
@@ -599,6 +679,36 @@ router.put('/cocina/pedidos/:id/estado', checkPermission(COCINA_VIEW_PERMISSIONS
         });
       }
 
+      let inventoryResult = null;
+      const shouldDiscountInventory = estadoDestino === 'LISTO_PARA_ENTREGA';
+      if (shouldDiscountInventory) {
+        const consumoPayloadResult = await buildPedidoConsumoPayload(client, idPedido, pedidoSucursalId);
+        if (!consumoPayloadResult.ok) {
+          await client.query('ROLLBACK');
+          return res.status(consumoPayloadResult.status).json(consumoPayloadResult.body);
+        }
+
+        inventoryResult = await validarYDescontarPedido(consumoPayloadResult.payload, {
+          id_usuario: req?.user?.id_usuario,
+          allowNegativeStock: true,
+          shortageMode: 'FALTANTE_COCINA',
+          dbClient: client
+        });
+
+        if (!inventoryResult?.ok) {
+          await client.query('ROLLBACK');
+          const isConfigError = String(inventoryResult.code || '').toUpperCase() === 'CONFIGURACION_INVENTARIO_INVALIDA';
+          return res.status(409).json({
+            error: true,
+            code: inventoryResult.code || 'INVENTARIO_ERROR',
+            message: isConfigError
+              ? 'No se pudo marcar como listo por configuracion incompleta de receta/combo/inventario.'
+              : (inventoryResult.message || 'No se pudo descontar inventario para el pedido.'),
+            faltantes: Array.isArray(inventoryResult.faltantes) ? inventoryResult.faltantes : []
+          });
+        }
+      }
+
       // ── 9. Actualizar estado ───────────────────────────────────────
       await client.query(
         `
@@ -633,7 +743,8 @@ router.put('/cocina/pedidos/:id/estado', checkPermission(COCINA_VIEW_PERMISSIONS
         message: 'Estado de pedido actualizado correctamente.',
         id_pedido: idPedido,
         estado_anterior: estadoActual,
-        estado_actual: estadoDestino
+        estado_actual: estadoDestino,
+        warning: inventoryResult?.warning || null
       });
     } catch (dbErr) {
       try { await client.query('ROLLBACK'); } catch { /* ignorar */ }
