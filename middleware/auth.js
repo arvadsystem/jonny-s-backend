@@ -5,6 +5,33 @@ const JWT_SECRET = process.env.JWT_SECRET || (process.env.NODE_ENV === 'producti
 
 const SAFE_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
 const CSRF_TOKEN_RE = /^[a-f0-9]{64}$/i;
+const normalizeSameSite = (value, fallback) => {
+  const normalized = String(value || '').trim().toLowerCase();
+  if (normalized === 'none' || normalized === 'lax' || normalized === 'strict') {
+    return normalized;
+  }
+  return fallback;
+};
+
+const accessTokenCookieOptions = () => {
+  const isProd = process.env.NODE_ENV === 'production';
+  return {
+    path: '/',
+    secure: String(process.env.AUTH_COOKIE_SECURE || '').toLowerCase() === 'true' || isProd,
+    sameSite: normalizeSameSite(process.env.AUTH_COOKIE_SAMESITE, isProd ? 'none' : 'lax'),
+    domain: String(process.env.AUTH_COOKIE_DOMAIN || '').trim() || undefined
+  };
+};
+
+const csrfTokenCookieOptions = () => {
+  const isProd = process.env.NODE_ENV === 'production';
+  return {
+    path: '/',
+    secure: String(process.env.CSRF_COOKIE_SECURE || '').toLowerCase() === 'true' || isProd,
+    sameSite: normalizeSameSite(process.env.CSRF_COOKIE_SAMESITE, isProd ? 'none' : 'lax'),
+    domain: String(process.env.CSRF_COOKIE_DOMAIN || '').trim() || undefined
+  };
+};
 
 const decodeCookieValue = (value) => {
   const raw = String(value ?? '').trim();
@@ -59,12 +86,8 @@ export const authRequired = (req, res, next) => {
     return next();
   } catch (err) {
     // Si el token expiró o es inválido, limpiamos cookies
-    const isProd = process.env.NODE_ENV === 'production';
-    const sameSite = isProd ? 'none' : 'lax';
-    const secure = isProd;
-
-    res.clearCookie('access_token', { path: '/', sameSite, secure });
-    res.clearCookie('csrf_token', { path: '/', sameSite, secure });
+    res.clearCookie('access_token', accessTokenCookieOptions());
+    res.clearCookie('csrf_token', csrfTokenCookieOptions());
 
     return res.status(401).json({ error: true, message: 'Sesión expirada o inválida' });
   }
