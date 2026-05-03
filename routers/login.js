@@ -154,8 +154,17 @@ const cookieConfig = () => {
   };
 };
 
-const issueCsrf = (res) => {
-  const csrfToken = crypto.randomBytes(32).toString('hex');
+const CSRF_TOKEN_RE = /^[a-f0-9]{64}$/i;
+
+const getExistingCsrfToken = (req) => {
+  const token = String(req?.cookies?.csrf_token || '').trim();
+  if (!token) return null;
+  return CSRF_TOKEN_RE.test(token) ? token : null;
+};
+
+const issueCsrf = (req, res, { reuseIfPresent = false } = {}) => {
+  const existingToken = reuseIfPresent ? getExistingCsrfToken(req) : null;
+  const csrfToken = existingToken || crypto.randomBytes(32).toString('hex');
   const base = cookieConfig();
 
   res.cookie('csrf_token', csrfToken, {
@@ -378,7 +387,7 @@ router.post('/login', internalLoginIpLimiter, internalLoginAccountIpLimiter, asy
       maxAge: 1000 * 60 * 60 * 8
     });
 
-    const csrfToken = issueCsrf(res);
+    const csrfToken = issueCsrf(req, res);
 
     // Login exitoso: registrar intento
     await insertLoginLog({
@@ -452,8 +461,7 @@ router.post('/logout', authRequired, async (req, res) => {
 });
 
 router.get('/me', authRequired, requireActiveSession, async (req, res) => {
-  // Re-emite CSRF por si el frontend refresca y lo perdió
-  const csrfToken = issueCsrf(res);
+  const csrfToken = issueCsrf(req, res, { reuseIfPresent: true });
   const usuario = { ...(req.user || {}) };
   const idUsuario = Number.parseInt(String(usuario?.id_usuario ?? ''), 10);
 
