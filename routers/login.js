@@ -145,22 +145,50 @@ const buildPasswordPolicyFlags = (passwordExpiration) => {
   };
 };
 
-const cookieConfig = () => {
+const normalizeSameSite = (value, fallback) => {
+  const normalized = String(value || '').trim().toLowerCase();
+  if (normalized === 'none' || normalized === 'lax' || normalized === 'strict') {
+    return normalized;
+  }
+  return fallback;
+};
+
+const authCookieOptions = () => {
   const isProd = process.env.NODE_ENV === 'production';
   return {
-    sameSite: isProd ? 'none' : 'lax',
-    secure: isProd,
+    httpOnly: true,
+    secure: String(process.env.AUTH_COOKIE_SECURE || '').toLowerCase() === 'true' || isProd,
+    sameSite: normalizeSameSite(process.env.AUTH_COOKIE_SAMESITE, isProd ? 'none' : 'lax'),
+    domain: String(process.env.AUTH_COOKIE_DOMAIN || '').trim() || undefined,
     path: '/'
   };
 };
 
-const issueCsrf = (res) => {
-  const csrfToken = crypto.randomBytes(32).toString('hex');
-  const base = cookieConfig();
+const csrfCookieOptions = () => {
+  const isProd = process.env.NODE_ENV === 'production';
+  return {
+    httpOnly: false,
+    secure: String(process.env.CSRF_COOKIE_SECURE || '').toLowerCase() === 'true' || isProd,
+    sameSite: normalizeSameSite(process.env.CSRF_COOKIE_SAMESITE, isProd ? 'none' : 'lax'),
+    domain: String(process.env.CSRF_COOKIE_DOMAIN || '').trim() || undefined,
+    path: '/'
+  };
+};
+
+const CSRF_TOKEN_RE = /^[a-f0-9]{64}$/i;
+
+const getExistingCsrfToken = (req) => {
+  const token = String(req?.cookies?.csrf_token || '').trim();
+  if (!token) return null;
+  return CSRF_TOKEN_RE.test(token) ? token : null;
+};
+
+const issueCsrf = (req, res, { reuseIfPresent = false } = {}) => {
+  const existingToken = reuseIfPresent ? getExistingCsrfToken(req) : null;
+  const csrfToken = existingToken || crypto.randomBytes(32).toString('hex');
 
   res.cookie('csrf_token', csrfToken, {
-    ...base,
-    httpOnly: false,
+    ...csrfCookieOptions(),
     maxAge: 1000 * 60 * 60 * 8 // 8h
   });
 
@@ -370,15 +398,12 @@ router.post('/login', internalLoginIpLimiter, internalLoginAccountIpLimiter, asy
 
     const token = jwt.sign(payload, JWT_SECRET, { expiresIn: '8h' });
 
-    const base = cookieConfig();
-
     res.cookie('access_token', token, {
-      ...base,
-      httpOnly: true,
+      ...authCookieOptions(),
       maxAge: 1000 * 60 * 60 * 8
     });
 
-    const csrfToken = issueCsrf(res);
+    const csrfToken = issueCsrf(req, res);
 
     // Login exitoso: registrar intento
     await insertLoginLog({
@@ -452,8 +477,7 @@ router.post('/logout', authRequired, async (req, res) => {
 });
 
 router.get('/me', authRequired, requireActiveSession, async (req, res) => {
-  // Re-emite CSRF por si el frontend refresca y lo perdió
-  const csrfToken = issueCsrf(res);
+  const csrfToken = issueCsrf(req, res, { reuseIfPresent: true });
   const usuario = { ...(req.user || {}) };
   const idUsuario = Number.parseInt(String(usuario?.id_usuario ?? ''), 10);
 

@@ -24,7 +24,7 @@ const router = express.Router();
 const LEGACY_BCRYPT_PREFIX_RE = /^\$2[abxy]?\$/i;
 const PERFIL_FOTO_PERFIL_MAX_LENGTH = 500;
 const PERFIL_IMAGE_MAX_BYTES = 20 * 1024 * 1024;
-const PERFIL_SUPABASE_SUBDIR = 'usuarios';
+const PERFIL_SUPABASE_SUBDIR = 'FotoPerfil_Usuarios';
 const PERFIL_LEGACY_UPLOADS_SUBDIR = 'usuarios';
 const PERFIL_UPLOADS_PREFIX = '/uploads/usuarios/';
 const PERFIL_BASE64_BODY_REGEX = /^[A-Za-z0-9+/]+={0,2}$/;

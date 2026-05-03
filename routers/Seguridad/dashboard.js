@@ -8,6 +8,7 @@ import pool from '../../config/db-connection.js';
 import { checkPermission, isRequestUserSuperAdmin } from '../../middleware/checkPermission.js';
 import { timestampAsHNToISO } from '../../utils/dates.js';
 import { closeInactiveSessions } from '../../utils/security/sessionService.js';
+import { securityReadLimiter } from './securityRateLimit.js';
 
 const router = express.Router();
 
@@ -512,7 +513,7 @@ const getSummary = async (req, res) => {
  * GET /api/security/dashboard (si se monta en /api/security)
  * GET /api/security/summary
  */
-router.get('/dashboard', checkPermission(PERMISOS_DASHBOARD_VER), getSummary);
-router.get('/summary', checkPermission(PERMISOS_DASHBOARD_VER), getSummary);
+router.get('/dashboard', securityReadLimiter, checkPermission(PERMISOS_DASHBOARD_VER), getSummary);
+router.get('/summary', securityReadLimiter, checkPermission(PERMISOS_DASHBOARD_VER), getSummary);
 
 export default router;
