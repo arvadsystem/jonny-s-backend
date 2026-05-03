@@ -619,7 +619,8 @@ const mapCatalogItem = ({
     descripcion: row.descripcion_item || '',
     categoria: {
       id_tipo_departamento: row.id_tipo_departamento ? Number(row.id_tipo_departamento) : null,
-      nombre: row.categoria_nombre || 'Sin categoria'
+      nombre: row.categoria_nombre || 'Sin categoria',
+      nombre_producto: row.producto_categoria_nombre || ''
     },
     imagen_url: resolvePublicCatalogImageUrl(row.url_imagen),
     precio: price,
