@@ -21,6 +21,7 @@ import {
   insertPublicPedidoDetalleQuery,
   insertPublicPedidoQuery
 } from './publicMenuQueries.js';
+import { getPublicMenuHeroCarouselConfig } from '../../services/publicMenuHeroCarouselConfigService.js';
 
 // Tabla de mensajes legibles para no exponer codigos internos al frontend.
 const AVAILABILITY_REASON_LABEL = Object.freeze({
@@ -1222,6 +1223,9 @@ export const getPublicBranchesService = async () => {
   const rows = await fetchPublicBranchesQuery();
   return rows.map(mapBranch);
 };
+
+// AM: servicio para obtener configuracion global del carrusel hero.
+export const getPublicHeroCarouselConfigService = async () => getPublicMenuHeroCarouselConfig();
 
 // Servicio: obtener menu vigente por sucursal.
 export const getMenuVigenteByBranchService = async (idSucursal) => {
