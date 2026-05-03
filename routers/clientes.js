@@ -314,6 +314,7 @@ const normalizeClienteDto = (row, softDeleteField = null) => {
       row?.origen_label,
       origenCliente === 'empresa' ? 'Cliente Empresa' : 'Cliente Persona'
     ),
+    nombre_completo: nombrePrincipal,
     nombre_principal: nombrePrincipal,
     subtitulo_principal: firstNonEmptyValue(
       row?.subtitulo_principal,
@@ -338,6 +339,10 @@ const normalizeClienteDto = (row, softDeleteField = null) => {
     tipo_cliente: tipoCliente || null,
     puntos: puntos,
     fecha_ingreso: fechaIngreso,
+    persona_genero: firstNonEmptyValue(row?.persona_genero, row?.genero) || null,
+    genero: firstNonEmptyValue(row?.persona_genero, row?.genero) || null,
+    persona_fecha_nacimiento: firstNonEmptyValue(row?.persona_fecha_nacimiento, row?.fecha_nacimiento) || null,
+    fecha_nacimiento: firstNonEmptyValue(row?.persona_fecha_nacimiento, row?.fecha_nacimiento) || null,
     estado: estado,
     id_persona: row?.id_persona ?? null,
     id_empresa_cliente: row?.id_empresa_cliente ?? row?.id_empresa_relacion ?? null,
@@ -728,6 +733,10 @@ const clienteRepository = {
       fields.push('p.nombre AS persona_nombre');
       fields.push('p.apellido AS persona_apellido');
       fields.push('p.dni AS persona_dni');
+      fields.push('p.genero AS persona_genero');
+      fields.push('p.fecha_nacimiento AS persona_fecha_nacimiento');
+      fields.push('p.genero AS genero');
+      fields.push('p.fecha_nacimiento AS fecha_nacimiento');
       fields.push(`TRIM(CONCAT(COALESCE(p.nombre, ''), ' ', COALESCE(p.apellido, ''))) AS persona_nombre_completo`);
       fields.push('telf_p.telefono AS persona_telefono');
       fields.push('telf_p.telefono AS telefono_persona');
@@ -749,6 +758,10 @@ const clienteRepository = {
       fields.push('NULL::TEXT AS persona_nombre');
       fields.push('NULL::TEXT AS persona_apellido');
       fields.push('NULL::TEXT AS persona_dni');
+      fields.push('NULL::TEXT AS persona_genero');
+      fields.push('NULL::DATE AS persona_fecha_nacimiento');
+      fields.push('NULL::TEXT AS genero');
+      fields.push('NULL::DATE AS fecha_nacimiento');
       fields.push('NULL::TEXT AS persona_nombre_completo');
       fields.push('NULL::TEXT AS persona_telefono');
       fields.push('NULL::TEXT AS telefono_persona');
@@ -926,6 +939,10 @@ const clienteRepository = {
       fields.push('p.nombre AS persona_nombre');
       fields.push('p.apellido AS persona_apellido');
       fields.push('p.dni AS persona_dni');
+      fields.push('p.genero AS persona_genero');
+      fields.push('p.fecha_nacimiento AS persona_fecha_nacimiento');
+      fields.push('p.genero AS genero');
+      fields.push('p.fecha_nacimiento AS fecha_nacimiento');
       fields.push(`TRIM(CONCAT(COALESCE(p.nombre, ''), ' ', COALESCE(p.apellido, ''))) AS persona_nombre_completo`);
       fields.push('telf.telefono AS persona_telefono');
       fields.push('telf.telefono AS telefono_persona');
@@ -1313,8 +1330,6 @@ const clienteService = {
     const searchName = typeof req.query.nombre === 'string' ? req.query.nombre.trim() : '';
     const effectiveSearch = search || searchQuery || searchName;
     const estado = parseBooleanFilter(req.query.estado);
-    const idSucursal = req.query.id_sucursal === undefined ? null : parsePositiveInt(req.query.id_sucursal);
-
     if (req.query.estado !== undefined && estado === null) {
       return {
         status: 400,
@@ -1322,16 +1337,7 @@ const clienteService = {
       };
     }
 
-    if (req.query.id_sucursal !== undefined && !idSucursal) {
-      return {
-        status: 400,
-        body: buildErrorBody({ code: 'VALIDATION_ERROR', message: 'El filtro id_sucursal debe ser entero positivo' })
-      };
-    }
-
-    if (idSucursal && !capabilities.hasClientesSucursalesTable) {
-      capabilities = await getSchemaCapabilities({ forceRefresh: true });
-    }
+    // FASE 7: clientes deja de depender de sucursal; mantenemos compatibilidad ignorando el query id_sucursal.
 
     if (effectiveSearch && effectiveSearch.length > 120) {
       return {
@@ -1351,15 +1357,6 @@ const clienteService = {
     }
 
     const tenantId = await resolveTenantIdForRequest(req);
-    const hasLegacySucursalSources = Boolean(
-      capabilities.hasClienteSucursalField
-      || (capabilities.hasPersonasTable && capabilities.hasPersonaSucursalField)
-      || (capabilities.hasEmpresasTable && capabilities.hasEmpresaSucursalField)
-      || capabilities.hasDerivedSucursalFromEmpleado
-      || capabilities.hasDerivedSucursalFromCreator
-    );
-    const sucursalFilterSupported = Boolean(capabilities.hasClientesSucursalesTable || hasLegacySucursalSources);
-
     const { data, total } = await clienteRepository.searchWithPagination({
       capabilities,
       page,
@@ -1367,7 +1364,7 @@ const clienteService = {
       searchTerm: effectiveSearch,
       estado,
       tenantId,
-      idSucursal: sucursalFilterSupported ? idSucursal : null
+      idSucursal: null
     });
 
     const normalizedData = (Array.isArray(data) ? data : []).map((row) =>
@@ -1382,15 +1379,9 @@ const clienteService = {
         page,
         limit,
         scope_info: {
-          id_sucursal: idSucursal,
-          applied: idSucursal ? sucursalFilterSupported : false,
-          mode: idSucursal
-            ? (
-              capabilities.hasClientesSucursalesTable
-                ? 'strict_link'
-                : (sucursalFilterSupported ? 'legacy_derived' : 'unsupported')
-            )
-            : 'none'
+          id_sucursal: null,
+          applied: false,
+          mode: 'disabled'
         }
       }
     };
@@ -1965,14 +1956,18 @@ const clienteService = {
       };
     }
 
-    const nextTipoClienteId = Object.prototype.hasOwnProperty.call(rawUpdates, 'id_tipo_cliente')
+    const touchesTipoCliente = Object.prototype.hasOwnProperty.call(rawUpdates, 'id_tipo_cliente');
+    const nextTipoClienteId = touchesTipoCliente
       ? parseNullablePositiveInt(rawUpdates.id_tipo_cliente)
       : parseNullablePositiveInt(current.id_tipo_cliente);
-    if (!nextTipoClienteId || !(await clienteRepository.tipoClienteExists(nextTipoClienteId, capabilities))) {
-      return {
-        status: 400,
-        body: buildErrorBody({ code: 'VALIDATION_ERROR', message: 'id_tipo_cliente no es valido.' })
-      };
+    if (touchesTipoCliente) {
+      if (!nextTipoClienteId || !(await clienteRepository.tipoClienteExists(nextTipoClienteId, capabilities))) {
+        return {
+          status: 400,
+          body: buildErrorBody({ code: 'VALIDATION_ERROR', message: 'id_tipo_cliente no es valido.' })
+        };
+      }
+      rawUpdates.id_tipo_cliente = nextTipoClienteId;
     }
 
     if (touchesPersona) rawUpdates.id_persona = nextPersonaId;
@@ -1983,10 +1978,6 @@ const clienteService = {
         rawUpdates.id_empresa = nextEmpresaId;
       }
     }
-    if (Object.prototype.hasOwnProperty.call(rawUpdates, 'id_tipo_cliente')) {
-      rawUpdates.id_tipo_cliente = nextTipoClienteId;
-    }
-
     const functionPayload = normalizeClienteFunctionPayload(rawUpdates);
     if (capabilities.hasEmpresaClienteField && Object.prototype.hasOwnProperty.call(functionPayload, 'id_empresa')) {
       delete functionPayload.id_empresa;

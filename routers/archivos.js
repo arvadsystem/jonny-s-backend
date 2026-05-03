@@ -1,6 +1,7 @@
 import crypto from 'crypto';
 import express from 'express';
 import pool from '../config/db-connection.js';
+import { checkPermission } from '../middleware/checkPermission.js';
 import { supabase } from '../services/supabaseClient.js';
 import {
   ALLOWED_MIME_TYPES_BY_BUCKET,
@@ -8,6 +9,7 @@ import {
   MAX_IMAGE_BYTES,
   INVENTARIO_UPLOADS_SUBDIR,
   SUCURSALES_UPLOADS_SUBDIR,
+  CARRUSEL_UPLOADS_SUBDIR,
   ADMIN_UPLOADS_SUBDIR,
   SUPABASE_ASSETS_BUCKET,
   SUPABASE_ADMIN_BUCKET,
@@ -16,6 +18,9 @@ import {
 } from '../utils/uploads.js';
 
 const router = express.Router();
+const ARCHIVOS_VIEW_PERMISSIONS = ['INVENTARIO_ARCHIVOS_VER', 'INVENTARIO_VER'];
+const ARCHIVOS_UPLOAD_PERMISSIONS = ['INVENTARIO_ARCHIVOS_SUBIR', 'INVENTARIO_PRODUCTOS_IMAGEN_SUBIR', 'INVENTARIO_VER'];
+const ARCHIVOS_DELETE_PERMISSIONS = ['INVENTARIO_ARCHIVOS_ELIMINAR', 'INVENTARIO_PRODUCTOS_IMAGEN_ELIMINAR', 'INVENTARIO_VER'];
 
 const BASE64_BODY_REGEX = /^[A-Za-z0-9+/]+={0,2}$/;
 const SQLSTATE_UNDEFINED_TABLE = '42P01';
@@ -28,6 +33,40 @@ const ARCHIVO_CLEANUP_PENDING_MESSAGE = 'La imagen temporal fue desactivada y qu
 
 const getSafeUploadErrorMessage = (fallback = 'No se pudo procesar el archivo.') => fallback;
 const getSafeArchivoCleanupErrorMessage = (fallback = 'No se pudo limpiar la imagen temporal.') => fallback;
+
+const ensureSupabaseBucket = async (bucketName) => {
+  const bucket = String(bucketName || '').trim();
+  if (!bucket) throw new Error('Bucket invalido.');
+
+  const { data: existingBucket, error: getBucketError } = await supabase.storage.getBucket(bucket);
+  if (existingBucket && !getBucketError) return;
+
+  const notFound =
+    getBucketError &&
+    (
+      Number(getBucketError?.statusCode || getBucketError?.status || 0) === 404 ||
+      /not\s*found|does\s*not\s*exist/i.test(String(getBucketError?.message || ''))
+    );
+
+  if (getBucketError && !notFound) {
+    console.error(`Error verificando bucket ${bucket}:`, getBucketError);
+    throw new Error('No se pudo verificar el bucket de almacenamiento.');
+  }
+
+  const { error: createBucketError } = await supabase.storage.createBucket(bucket, {
+    public: bucket === SUPABASE_ASSETS_BUCKET,
+    fileSizeLimit: MAX_FILE_BYTES_BY_BUCKET[bucket],
+    allowedMimeTypes: Object.keys(ALLOWED_MIME_TYPES_BY_BUCKET[bucket] || {})
+  });
+
+  if (
+    createBucketError &&
+    !/already\s*exists|duplicate/i.test(String(createBucketError?.message || ''))
+  ) {
+    console.error(`Error creando bucket ${bucket}:`, createBucketError);
+    throw new Error('No se pudo crear el bucket de almacenamiento.');
+  }
+};
 
 const normalizeOriginalName = (value, defaultName = 'archivo') => {
   const trimmed = String(value || '').trim();
@@ -212,7 +251,7 @@ const parseStoredStoragePath = (rawValue) => {
  * Sube un archivo a un bucket de Supabase.
  * Params: { bucket, data_url | base64, nombre_original }
  */
-router.post('/archivos', async (req, res) => {
+router.post('/archivos', checkPermission(ARCHIVOS_UPLOAD_PERMISSIONS), async (req, res) => {
   let supabaseFilePath = '';
   const targetBucket = String(req.body?.bucket || SUPABASE_ASSETS_BUCKET).trim() || SUPABASE_ASSETS_BUCKET;
   
@@ -272,10 +311,13 @@ router.post('/archivos', async (req, res) => {
       ? ADMIN_UPLOADS_SUBDIR
       : contextoRaw === 'sucursales'
         ? SUCURSALES_UPLOADS_SUBDIR
-        : INVENTARIO_UPLOADS_SUBDIR;
+        : contextoRaw === 'carrusel'
+          ? CARRUSEL_UPLOADS_SUBDIR
+          : INVENTARIO_UPLOADS_SUBDIR;
     supabaseFilePath = `${subDir}/${uniqueFileName}`;
 
     // 5. Subir a Supabase Storage (usando service_role para bypass RLS en subida)
+    await ensureSupabaseBucket(targetBucket);
     const { error: uploadError } = await supabase.storage
       .from(targetBucket)
       .upload(supabaseFilePath, decoded.buffer, {
@@ -333,7 +375,7 @@ router.post('/archivos', async (req, res) => {
  * GET /archivos/:id/ver
  * Resuelve la URL de un archivo. Si es privado (admin-docs), genera una URL firmada.
  */
-router.get('/archivos/:id/ver', async (req, res) => {
+router.get('/archivos/:id/ver', checkPermission(ARCHIVOS_VIEW_PERMISSIONS), async (req, res) => {
   const idArchivo = req.params.id;
 
   try {
@@ -379,7 +421,7 @@ router.get('/archivos/:id/ver', async (req, res) => {
  * - Bloquea si el archivo esta referenciado en otros modulos.
  * - Desactiva en BD (estado=false) y luego intenta limpiar storage.
  */
-router.delete('/archivos/:id', async (req, res) => {
+router.delete('/archivos/:id', checkPermission(ARCHIVOS_DELETE_PERMISSIONS), async (req, res) => {
   const idArchivo = Number.parseInt(String(req.params?.id ?? ''), 10);
   if (!Number.isInteger(idArchivo) || idArchivo <= 0) {
     return res.status(400).json({ ok: false, error: true, code: 'INVALID_ARCHIVO_ID', message: ARCHIVO_INVALID_ID_MESSAGE });

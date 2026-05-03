@@ -1,7 +1,12 @@
 import express from 'express';
 import pool from '../config/db-connection.js';
+import { checkPermission } from '../middleware/checkPermission.js';
 
 const router = express.Router();
+const CATEGORIAS_INSUMOS_VIEW_PERMISSIONS = ['INVENTARIO_CATEGORIAS_INSUMOS_VER'];
+const CATEGORIAS_INSUMOS_CREATE_PERMISSIONS = ['INVENTARIO_CATEGORIAS_INSUMOS_CREAR'];
+const CATEGORIAS_INSUMOS_EDIT_PERMISSIONS = ['INVENTARIO_CATEGORIAS_INSUMOS_EDITAR'];
+const CATEGORIAS_INSUMOS_STATE_PERMISSIONS = ['INVENTARIO_CATEGORIAS_INSUMOS_ESTADO_CAMBIAR', 'INVENTARIO_CATEGORIAS_INSUMOS_ELIMINAR'];
 
 // NEW: mensaje estándar para bloqueo de inactivación por insumos activos asociados.
 // WHY: alinear backend con la regla de negocio para categorías de insumos.
@@ -56,7 +61,7 @@ const hasOnlyAllowedFields = (payload, allowedSet) => Object.keys(payload).every
 // ------------------------------------------------------------------------------------
 // GET: Obtener categorias_insumos
 // ------------------------------------------------------------------------------------
-router.get('/categorias_insumos', async (req, res) => {
+router.get('/categorias_insumos', checkPermission(CATEGORIAS_INSUMOS_VIEW_PERMISSIONS), async (req, res) => {
   try {
     const tabla = 'categorias_insumos';
     const columnas = 'id_categoria_insumo, nombre_categoria, codigo_categoria, descripcion, estado';
@@ -79,7 +84,7 @@ router.get('/categorias_insumos', async (req, res) => {
 // ------------------------------------------------------------------------------------
 // POST: Crear categoria_insumo
 // ------------------------------------------------------------------------------------
-router.post('/categorias_insumos', async (req, res) => {
+router.post('/categorias_insumos', checkPermission(CATEGORIAS_INSUMOS_CREATE_PERMISSIONS), async (req, res) => {
   try {
     const tabla = 'categorias_insumos';
     const datosEntrada = req.body;
@@ -126,7 +131,7 @@ router.post('/categorias_insumos', async (req, res) => {
 // ------------------------------------------------------------------------------------
 // PUT: Actualizar categoria_insumo completa (edicion atomica)
 // ------------------------------------------------------------------------------------
-router.put('/categorias_insumos/edicion', async (req, res) => {
+router.put('/categorias_insumos/edicion', checkPermission(CATEGORIAS_INSUMOS_EDIT_PERMISSIONS), async (req, res) => {
   try {
     const datosEntrada = req.body;
     if (!isPlainObject(datosEntrada)) {
@@ -211,7 +216,7 @@ router.put('/categorias_insumos/edicion', async (req, res) => {
 // ------------------------------------------------------------------------------------
 // PUT: Actualizar categoria_insumo (actualiza 1 campo)
 // ------------------------------------------------------------------------------------
-router.put('/categorias_insumos', async (req, res) => {
+router.put('/categorias_insumos', checkPermission(CATEGORIAS_INSUMOS_EDIT_PERMISSIONS), async (req, res) => {
   try {
     const { campo, valor, id_campo, id_valor } = req.body || {};
 
@@ -284,7 +289,7 @@ router.put('/categorias_insumos', async (req, res) => {
 // ------------------------------------------------------------------------------------
 // DELETE: Inactivar categoria_insumo (soft delete)
 // ------------------------------------------------------------------------------------
-router.delete('/categorias_insumos', async (req, res) => {
+router.delete('/categorias_insumos', checkPermission(CATEGORIAS_INSUMOS_STATE_PERMISSIONS), async (req, res) => {
   try {
     const { columna_id, valor_id } = req.body || {};
 

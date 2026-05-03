@@ -1,21 +1,25 @@
-﻿import pool from '../../config/db-connection.js';
+import pool from '../../config/db-connection.js';
+import { createHash } from 'crypto';
+import { buildAbsolutePublicUrl } from '../../utils/uploads.js';
 import {
   PUBLIC_ITEM_TYPES,
+  acquirePublicOrderIdempotencyLockQuery,
   fetchActiveMenuByBranchQuery,
-  fetchBranchOperationalSnapshotQuery,
   fetchAllowedSauceRowsByRecipeIdsQuery,
   fetchCatalogItemByIdQuery,
   fetchCatalogRowsByMenuQuery,
   fetchComboRecipeComponentsQuery,
   fetchComboAvailabilityQuery,
   fetchEstadoPedidoRowsQuery,
+  fetchPublicActiveSaucesQuery,
+  fetchPedidoByIdempotencyKeyQuery,
   fetchPublicBranchesQuery,
+  fetchPublicMenuExtrasByRecipeIdsQuery,
   fetchRecipeAvailabilityQuery,
   fetchSauceRuleRowsByRecipeIdsQuery,
   insertPublicPedidoDetalleQuery,
   insertPublicPedidoQuery
 } from './publicMenuQueries.js';
-import { buildAbsolutePublicUrl } from '../../utils/uploads.js';
 
 // Tabla de mensajes legibles para no exponer codigos internos al frontend.
 const AVAILABILITY_REASON_LABEL = Object.freeze({
@@ -51,7 +55,6 @@ const ORDER_STATE_ALIASES = Object.freeze([
   'por_pagar',
   'pendiente_por_pagar'
 ]);
-const PENDING_STATE_ID_PRIORITY = 1;
 const HAMBURGUESA_KEYWORDS = Object.freeze(['hamburguesa', 'burger', 'smash']);
 const PUBLIC_EXTRA_OPTIONS = Object.freeze([
   {
@@ -62,9 +65,14 @@ const PUBLIC_EXTRA_OPTIONS = Object.freeze([
     keywords: HAMBURGUESA_KEYWORDS
   }
 ]);
-const ORDER_TYPES_REQUIRING_TRANSFER_PROOF = new Set(['pickup', 'delivery']);
+const ORDER_TYPES_REQUIRING_TRANSFER_PROOF = new Set(['delivery']);
+const TRANSFER_METHOD_ALIASES = new Set(['transferencia', 'transferencia_bancaria', 'transfer']);
+const CASH_METHOD_ALIASES = new Set(['caja', 'efectivo', 'cash']);
 const MAX_PUBLIC_ORDER_DESCRIPTION_LENGTH = 240;
 const MAX_PUBLIC_ITEM_NOTE_LENGTH = 100;
+const MAX_PUBLIC_ORDER_IDEMPOTENCY_LENGTH = 120;
+const WINGS_SAUCE_KEYWORDS = Object.freeze(['alita', 'alitas', 'tender', 'tenders']);
+const LEGACY_GOOGLE_IMAGE_RE = /(?:drive\.google\.com|drive\.usercontent\.google\.com|googleusercontent\.com)/i;
 
 // Crea errores HTTP controlados para que el controlador responda con status consistente.
 const buildHttpError = (status, message) => {
@@ -83,6 +91,11 @@ const normalizeCompactText = (value, maxLength = 120) => {
   return clean.slice(0, limit);
 };
 
+const normalizeIdempotencyKey = (value) =>
+  normalizeCompactText(value, MAX_PUBLIC_ORDER_IDEMPOTENCY_LENGTH)
+    .toLowerCase()
+    .replace(/[^a-z0-9:_-]/g, '');
+
 const normalizeTextKey = (value) =>
   String(value || '')
     .normalize('NFD')
@@ -91,12 +104,58 @@ const normalizeTextKey = (value) =>
     .toLowerCase()
     .replace(/\s+/g, '_');
 
+const resolvePublicCatalogImageUrl = (rawUrl) => {
+  const value = String(rawUrl || '').trim();
+  if (!value || LEGACY_GOOGLE_IMAGE_RE.test(value)) return '';
+  return buildAbsolutePublicUrl(null, value) || value;
+};
+
 const normalizeSearchText = (value) =>
   String(value || '')
     .normalize('NFD')
     .replace(/[\u0300-\u036f]/g, '')
     .trim()
     .toLowerCase();
+
+const inferSauceUnitsBaseFromText = (...sources) => {
+  const text = normalizeSearchText(sources.filter(Boolean).join(' '));
+  if (!text) return 1;
+
+  // Regla de negocio: solo aplicamos inferencia por texto para familias de alitas/tenders.
+  const containsKeyword = WINGS_SAUCE_KEYWORDS.some((keyword) => text.includes(keyword));
+  if (!containsKeyword) return 1;
+
+  // Prioriza patrones comunes del negocio: "24 uds", "24 piezas", "24 pzas".
+  const match =
+    text.match(/\b(\d{1,3})\s*(?:alitas?|tenders?)\b/i) ||
+    text.match(/\b(\d{1,3})\s*(?:uds?|unidades?|pzas?|piezas?)\b/i) ||
+    text.match(/\((\d{1,3})\s*(?:uds?|unidades?|pzas?|piezas?)\)/i);
+
+  const units = Number(match?.[1] || 0);
+  if (!Number.isFinite(units) || units <= 0) return 1;
+  return Math.max(1, Math.floor(units));
+};
+
+const calculateFallbackWingSauceRequirement = ({
+  nombre = '',
+  descripcion = '',
+  quantity = 1
+}) => {
+  const baseUnits = inferSauceUnitsBaseFromText(nombre, descripcion);
+  if (baseUnits <= 1) return 0;
+  const totalUnits = Math.max(1, Number(quantity || 1)) * baseUnits;
+  return Math.max(0, Math.ceil(totalUnits / 6));
+};
+
+const resolveRequiredSaucesByCatalog = ({ catalog = {}, quantity = 1 }) => {
+  const fromComponents = calculateRequiredSaucesForQuantity(catalog?.salsas_componentes, quantity);
+  if (fromComponents > 0) return fromComponents;
+  return calculateFallbackWingSauceRequirement({
+    nombre: catalog?.nombre,
+    descripcion: catalog?.descripcion,
+    quantity
+  });
+};
 
 const hasAnyKeyword = (rawText, keywords = []) => {
   const source = normalizeSearchText(rawText);
@@ -159,10 +218,14 @@ const findMatchingSalsaRule = (rules, unidades) => {
   }) || null;
 };
 
+const hasSauceRequirementRules = (rules = []) =>
+  (Array.isArray(rules) ? rules : []).some((rule) => Number(rule?.salsas_requeridas || 0) > 0);
+
 const calculateRequiredSaucesForQuantity = (components, quantity = 1) => (
   (Array.isArray(components) ? components : []).reduce((total, component) => {
     const multiplier = Math.max(1, Number(component?.multiplicador || 1));
-    const units = Math.max(1, Number(quantity || 1)) * multiplier;
+    const baseUnits = Math.max(1, Number(component?.unidades_base || 1));
+    const units = Math.max(1, Number(quantity || 1)) * multiplier * baseUnits;
     const rule = findMatchingSalsaRule(component?.reglas, units);
     return total + Number(rule?.salsas_requeridas || 0);
   }, 0)
@@ -171,120 +234,12 @@ const calculateRequiredSaucesForQuantity = (components, quantity = 1) => (
 // Normaliza booleans provenientes de PG.
 const toBoolean = (value) => value === true || value === 'true' || value === 1 || value === '1';
 
-const pad2 = (value) => String(value).padStart(2, '0');
-const buildIsoDateLocal = (date) =>
-  `${date.getFullYear()}-${pad2(date.getMonth() + 1)}-${pad2(date.getDate())}`;
-const toDiaSemana = (date) => {
-  const jsDay = date.getDay(); // 0 domingo ... 6 sabado
-  return jsDay === 0 ? 7 : jsDay; // 1 lunes ... 7 domingo
-};
-const normalizeTimeLabel = (value) => {
-  const raw = String(value || '').trim();
-  if (!raw) return '';
-  return raw.length >= 5 ? raw.slice(0, 5) : raw;
-};
-
-const isWithinWindow = ({ now, startHHMM, endHHMM }) => {
-  if (!startHHMM || !endHHMM) return false;
-  const [startHour, startMinute] = startHHMM.split(':').map((part) => Number(part));
-  const [endHour, endMinute] = endHHMM.split(':').map((part) => Number(part));
-  if (!Number.isFinite(startHour) || !Number.isFinite(startMinute) || !Number.isFinite(endHour) || !Number.isFinite(endMinute)) {
-    return false;
-  }
-  const nowMinutes = now.getHours() * 60 + now.getMinutes();
-  const startMinutes = startHour * 60 + startMinute;
-  const endMinutes = endHour * 60 + endMinute;
-  return nowMinutes >= startMinutes && nowMinutes < endMinutes;
-};
-
-const resolveBranchOperationalStatus = ({ row, snapshot, now }) => {
-  const fallback = {
-    isOpen: toBoolean(row?.estado),
-    schedule: 'Horario no disponible',
-    statusLabel: toBoolean(row?.estado) ? 'Abierta' : 'Cerrada',
-    estadoOperativo: toBoolean(row?.estado) ? 'ABIERTA' : 'CERRADA'
-  };
-
-  if (!snapshot) return fallback;
-
-  if (snapshot?.fecha_especial) {
-    if (toBoolean(snapshot.fe_cerrado)) {
-      return {
-        isOpen: false,
-        schedule: 'Cerrado hoy',
-        statusLabel: 'Cerrada',
-        estadoOperativo: 'CERRADA_ESPECIAL'
-      };
-    }
-    const start = normalizeTimeLabel(snapshot.fe_hora_inicio);
-    const end = normalizeTimeLabel(snapshot.fe_hora_final);
-    if (!start || !end) {
-      return {
-        isOpen: false,
-        schedule: 'Horario especial no disponible',
-        statusLabel: 'Cerrada',
-        estadoOperativo: 'SIN_HORARIO_ESPECIAL'
-      };
-    }
-    const isOpen = isWithinWindow({ now, startHHMM: start, endHHMM: end });
-    return {
-      isOpen,
-      schedule: `Horario especial: ${start} - ${end}`,
-      statusLabel: isOpen ? 'Abierta' : 'Cerrada',
-      estadoOperativo: isOpen ? 'ABIERTA_ESPECIAL' : 'CERRADA_ESPECIAL'
-    };
-  }
-
-  if (!toBoolean(snapshot?.sh_estado)) {
-    return {
-      isOpen: false,
-      schedule: 'Horario no disponible',
-      statusLabel: 'Cerrada',
-      estadoOperativo: 'SIN_HORARIO'
-    };
-  }
-
-  if (toBoolean(snapshot?.sh_cerrado)) {
-    return {
-      isOpen: false,
-      schedule: 'Cerrado hoy',
-      statusLabel: 'Cerrada',
-      estadoOperativo: 'CERRADA'
-    };
-  }
-
-  const start = normalizeTimeLabel(snapshot.sh_hora_inicio);
-  const end = normalizeTimeLabel(snapshot.sh_hora_final);
-  if (!start || !end) {
-    return {
-      isOpen: false,
-      schedule: 'Horario no disponible',
-      statusLabel: 'Cerrada',
-      estadoOperativo: 'SIN_HORARIO'
-    };
-  }
-
-  const isOpen = isWithinWindow({ now, startHHMM: start, endHHMM: end });
-  return {
-    isOpen,
-    schedule: `${start} - ${end}`,
-    statusLabel: isOpen ? 'Abierta' : 'Cerrada',
-    estadoOperativo: isOpen ? 'ABIERTA' : 'CERRADA'
-  };
-};
-
 // Convierte filas de sucursales al contrato publico.
-const mapBranch = (row, operationalStatus) => ({
+const mapBranch = (row) => ({
   id: Number(row.id_sucursal),
   name: row.nombre_sucursal,
   address: row.direccion || 'Direccion no disponible',
-  estado: toBoolean(row.estado),
-  id_archivo_imagen: Number(row?.id_archivo_imagen || 0) || null,
-  url_imagen: buildAbsolutePublicUrl(null, row?.url_imagen || null),
-  isOpen: operationalStatus.isOpen,
-  horario: operationalStatus.schedule,
-  status_label: operationalStatus.statusLabel,
-  estado_operativo: operationalStatus.estadoOperativo
+  isOpen: toBoolean(row.estado)
 });
 
 const normalizeExtraOption = (option) => ({
@@ -294,7 +249,7 @@ const normalizeExtraOption = (option) => ({
   precio_adicional: roundMoney(option?.precio_adicional || 0)
 });
 
-const getCatalogItemExtraOptions = ({ nombre, descripcion, categoriaNombre, tipoItem }) => {
+const getFallbackCatalogItemExtraOptions = ({ nombre, descripcion, categoriaNombre, tipoItem }) => {
   if (String(tipoItem || '') !== PUBLIC_ITEM_TYPES.RECETA) {
     return [];
   }
@@ -312,7 +267,29 @@ const getCatalogItemExtraOptions = ({ nombre, descripcion, categoriaNombre, tipo
     .map(normalizeExtraOption);
 };
 
-const buildCatalogSauceConfigByDetail = async (catalogRows = []) => {
+const buildCatalogExtrasByRecipe = async (catalogRows = [], db = pool) => {
+  const recipeIds = toUniquePositiveIntArray(
+    catalogRows
+      .filter((row) => String(row?.tipo_item || '') === PUBLIC_ITEM_TYPES.RECETA)
+      .map((row) => row?.id_receta)
+  );
+
+  const rows = await fetchPublicMenuExtrasByRecipeIdsQuery(recipeIds, db);
+  const grouped = new Map();
+
+  rows.forEach((row) => {
+    const idReceta = Number(row?.id_receta || 0);
+    if (!idReceta) return;
+    const extra = normalizeExtraOption(row);
+    if (!extra.id_extra) return;
+    if (!grouped.has(idReceta)) grouped.set(idReceta, []);
+    grouped.get(idReceta).push(extra);
+  });
+
+  return grouped;
+};
+
+const buildCatalogSauceConfigByDetail = async (catalogRows = [], db = pool) => {
   const directRecipeIds = toUniquePositiveIntArray(
     catalogRows.map((row) => row?.id_receta)
   );
@@ -321,7 +298,7 @@ const buildCatalogSauceConfigByDetail = async (catalogRows = []) => {
   );
 
   const comboComponentRows = comboIds.length > 0
-    ? await fetchComboRecipeComponentsQuery(comboIds)
+    ? await fetchComboRecipeComponentsQuery(comboIds, db)
     : [];
 
   const allRecipeIds = toUniquePositiveIntArray([
@@ -331,10 +308,13 @@ const buildCatalogSauceConfigByDetail = async (catalogRows = []) => {
 
   const [allowedSauceRows, sauceRuleRows] = allRecipeIds.length > 0
     ? await Promise.all([
-      fetchAllowedSauceRowsByRecipeIdsQuery(allRecipeIds),
-      fetchSauceRuleRowsByRecipeIdsQuery(allRecipeIds)
+      fetchAllowedSauceRowsByRecipeIdsQuery(allRecipeIds, db),
+      fetchSauceRuleRowsByRecipeIdsQuery(allRecipeIds, db)
     ])
     : [[], []];
+  const fallbackSauceCatalog = allRecipeIds.length > 0
+    ? await fetchPublicActiveSaucesQuery(db)
+    : [];
 
   const allowedSaucesByRecipe = new Map();
   for (const row of allowedSauceRows) {
@@ -379,7 +359,16 @@ const buildCatalogSauceConfigByDetail = async (catalogRows = []) => {
       id_receta: recipeId,
       nombre_receta: row.nombre_receta,
       multiplicador: Math.max(1, Number(row?.multiplicador || 1)),
-      salsas_permitidas: sortSauceOptions(allowedSaucesByRecipe.get(recipeId) || []),
+      // Base de unidades por componente (ej. alitas 6/12/24) para reglas de salsas.
+      unidades_base: inferSauceUnitsBaseFromText(row?.nombre_receta),
+      salsas_permitidas: (() => {
+        const rules = rulesByRecipe.get(recipeId) || [];
+        const recipeAllowedSauces = allowedSaucesByRecipe.get(recipeId) || [];
+        if (recipeAllowedSauces.length === 0 && hasSauceRequirementRules(rules)) {
+          return sortSauceOptions(fallbackSauceCatalog);
+        }
+        return sortSauceOptions(recipeAllowedSauces);
+      })(),
       reglas: rulesByRecipe.get(recipeId) || []
     });
   }
@@ -397,7 +386,16 @@ const buildCatalogSauceConfigByDetail = async (catalogRows = []) => {
         id_receta: recipeId,
         nombre_receta: row.nombre_item || row.descripcion_item || 'Receta',
         multiplicador: 1,
-        salsas_permitidas: sortSauceOptions(allowedSaucesByRecipe.get(recipeId) || []),
+        // Base de unidades para items directos (alitas/tenders) segun nombre/descripcion.
+        unidades_base: inferSauceUnitsBaseFromText(row?.nombre_item, row?.descripcion_item),
+        salsas_permitidas: (() => {
+          const rules = rulesByRecipe.get(recipeId) || [];
+          const recipeAllowedSauces = allowedSaucesByRecipe.get(recipeId) || [];
+          if (recipeAllowedSauces.length === 0 && hasSauceRequirementRules(rules)) {
+            return sortSauceOptions(fallbackSauceCatalog);
+          }
+          return sortSauceOptions(recipeAllowedSauces);
+        })(),
         reglas: rulesByRecipe.get(recipeId) || []
       }];
     } else if (Number(row?.id_combo || 0) > 0) {
@@ -411,16 +409,31 @@ const buildCatalogSauceConfigByDetail = async (catalogRows = []) => {
       }
     }
 
-    const salsasPermitidas = sortSauceOptions(Array.from(unionSauces.values()));
-    const salsasRequiereSeleccion = salsasComponentes.some((component) =>
-      (component.reglas || []).some((rule) => Number(rule?.salsas_requeridas || 0) > 0)
+    const requiredFromRules = calculateRequiredSaucesForQuantity(salsasComponentes, 1);
+    const fallbackRequired = calculateFallbackWingSauceRequirement({
+      nombre: row?.nombre_item,
+      descripcion: row?.descripcion_item,
+      quantity: 1
+    });
+    const requiredSaucesBase = Math.max(
+      Number(requiredFromRules || 0),
+      Number(fallbackRequired || 0)
     );
+
+    let salsasPermitidas = sortSauceOptions(Array.from(unionSauces.values()));
+    if (salsasPermitidas.length === 0 && requiredSaucesBase > 0) {
+      // Si inferimos requerimiento por texto (ej. "18 alitas") y no hay mapeo receta_salsa,
+      // exponemos el catalogo publico de salsas activas para permitir la seleccion.
+      salsasPermitidas = sortSauceOptions(fallbackSauceCatalog);
+    }
+
+    const salsasRequiereSeleccion = requiredSaucesBase > 0;
 
     configByDetail.set(idDetalleMenu, {
       salsas_componentes: salsasComponentes,
       salsas_permitidas: salsasPermitidas,
       salsas_requiere_seleccion: salsasRequiereSeleccion,
-      salsas_requeridas_base: calculateRequiredSaucesForQuantity(salsasComponentes, 1)
+      salsas_requeridas_base: requiredSaucesBase
     });
   }
 
@@ -493,7 +506,8 @@ const mapCatalogItem = ({
   row,
   recipeAvailabilityMap,
   comboAvailabilityMap,
-  sauceConfigByDetail = new Map()
+  sauceConfigByDetail = new Map(),
+  extrasByRecipe = new Map()
 }) => {
   const price = resolvePricePayload(row);
   const availability = row.tipo_item === PUBLIC_ITEM_TYPES.PRODUCTO
@@ -505,7 +519,17 @@ const mapCatalogItem = ({
     salsas_requiere_seleccion: false,
     salsas_requeridas_base: 0
   };
-  const extrasOpciones = getCatalogItemExtraOptions({
+  const fallbackRequiredSauces = calculateFallbackWingSauceRequirement({
+    nombre: row?.nombre_item,
+    descripcion: row?.descripcion_item,
+    quantity: 1
+  });
+  const requiredSaucesBase = Math.max(
+    Number(itemSauceConfig.salsas_requeridas_base || 0),
+    Number(fallbackRequiredSauces || 0)
+  );
+  const dbExtras = extrasByRecipe.get(Number(row?.id_receta || 0)) || [];
+  const extrasOpciones = dbExtras.length > 0 ? dbExtras : getFallbackCatalogItemExtraOptions({
     nombre: row?.nombre_item,
     descripcion: row?.descripcion_item,
     categoriaNombre: row?.categoria_nombre,
@@ -529,14 +553,14 @@ const mapCatalogItem = ({
       id_tipo_departamento: row.id_tipo_departamento ? Number(row.id_tipo_departamento) : null,
       nombre: row.categoria_nombre || 'Sin categoria'
     },
-    imagen_url: row.url_imagen || '',
+    imagen_url: resolvePublicCatalogImageUrl(row.url_imagen),
     precio: price,
     disponibilidad: finalAvailability,
     extras_opciones: extrasOpciones,
     salsas_componentes: itemSauceConfig.salsas_componentes,
     salsas_permitidas: itemSauceConfig.salsas_permitidas,
-    salsas_requiere_seleccion: itemSauceConfig.salsas_requiere_seleccion,
-    salsas_requeridas_base: Number(itemSauceConfig.salsas_requeridas_base || 0),
+    salsas_requiere_seleccion: itemSauceConfig.salsas_requiere_seleccion || requiredSaucesBase > 0,
+    salsas_requeridas_base: Number(requiredSaucesBase || 0),
     visible: toBoolean(row.visible),
     orden: Number(row.orden || 0)
   };
@@ -557,19 +581,10 @@ const mapMenuSummary = (row) => ({
   fecha_inicio: row.fecha_inicio
 });
 
-const resolvePendingStateId = async () => {
-  const rows = await fetchEstadoPedidoRowsQuery();
-  // Regla de compatibilidad con tablero Ventas:
-  // El carril "Pendientes / Por pagar" consume actualmente id_estado_pedido = 1.
-  // Priorizamos ese ID para que los pedidos del menú público entren en la primera columna.
-  const priorityById = rows.find(
-    (row) => Number(row?.id_estado_pedido || 0) === PENDING_STATE_ID_PRIORITY
-  );
-  if (priorityById) {
-    return Number(priorityById.id_estado_pedido);
-  }
-
-  // Fallback defensivo por descripción (instalaciones con catálogo distinto).
+const resolvePendingStateId = async (db = pool) => {
+  const rows = await fetchEstadoPedidoRowsQuery(db);
+  // Regla robusta: resolver por descripcion canonica para no depender del ID numerico.
+  // En algunos entornos el id=1 NO es "PENDIENTE" (por ejemplo EN_PREPARACION).
   const matchByAlias = rows.find((row) =>
     ORDER_STATE_ALIASES.includes(normalizeTextKey(row?.descripcion))
   );
@@ -585,6 +600,34 @@ const normalizeRequestedExtras = (rawExtras = []) => {
   )];
 
   return uniqueIds.map((id_extra) => ({ id_extra }));
+};
+
+const resolveExtraOptionByRequestedId = (extraOptions = [], requestedId = '') => {
+  const safeRequestedId = String(requestedId || '').trim();
+  if (!safeRequestedId) return null;
+
+  const directMatch = extraOptions.find((option) => String(option?.id_extra || '').trim() === safeRequestedId);
+  if (directMatch) return directMatch;
+
+  const fallbackOption = PUBLIC_EXTRA_OPTIONS.find((option) => String(option?.id_extra || '').trim() === safeRequestedId);
+  if (!fallbackOption?.codigo) return null;
+
+  return extraOptions.find(
+    (option) => normalizeTextKey(option?.codigo || '') === normalizeTextKey(fallbackOption.codigo)
+  ) || null;
+};
+
+const buildExtraOptionIndex = (extraOptions = []) => {
+  const index = new Map();
+
+  (Array.isArray(extraOptions) ? extraOptions : []).forEach((option) => {
+    const id = String(option?.id_extra || '').trim();
+    const codigo = normalizeTextKey(option?.codigo || '');
+    if (id) index.set(id, option);
+    if (codigo) index.set(codigo, option);
+  });
+
+  return index;
 };
 
 const normalizeRequestedSauces = (rawSauces = []) => {
@@ -739,6 +782,9 @@ const normalizePublicOrderBusinessContext = ({ tipoPedido, business = {} }) => {
   const pagoRaw = business?.pago && typeof business.pago === 'object'
     ? business.pago
     : {};
+  const servicioRaw = business?.servicio && typeof business.servicio === 'object'
+    ? business.servicio
+    : {};
 
   return {
     contacto: {
@@ -753,289 +799,100 @@ const normalizePublicOrderBusinessContext = ({ tipoPedido, business = {} }) => {
       metodo: normalizeCompactText(pagoRaw.metodo, 40),
       comprobante_transferencia: normalizeCompactText(pagoRaw.comprobante_transferencia, 180)
     },
+    servicio: {
+      mesa: normalizeCompactText(servicioRaw.mesa, 40)
+    },
     requiresTransferProof: ORDER_TYPES_REQUIRING_TRANSFER_PROOF.has(String(tipoPedido || ''))
   };
 };
 
-const buildPublicOrderDescription = ({ origen, tipoPedido, businessContext }) => {
-  const safeOrigin = normalizeCompactText(origen || 'public-menu', 60) || 'public-menu';
-  const base = `[${safeOrigin}] pedido web`;
-  const chunks = [];
-
-  if (businessContext?.contacto?.telefono) {
-    chunks.push(`tel:${businessContext.contacto.telefono}`);
-  }
-
-  if (businessContext?.pago?.comprobante_transferencia) {
-    chunks.push(`comp:${businessContext.pago.comprobante_transferencia}`);
-  }
-
-  if (String(tipoPedido || '') === 'delivery') {
-    if (businessContext?.entrega?.direccion) {
-      chunks.push(`dir:${businessContext.entrega.direccion}`);
-    }
-
-    if (businessContext?.entrega?.referencia) {
-      chunks.push(`ref:${businessContext.entrega.referencia}`);
-    }
-  }
-
-  if (chunks.length === 0) {
-    return base.slice(0, MAX_PUBLIC_ORDER_DESCRIPTION_LENGTH);
-  }
-
-  return `${base} | ${chunks.join(' | ')}`.slice(0, MAX_PUBLIC_ORDER_DESCRIPTION_LENGTH);
-};
-
-const validateAndResolveLineConfiguration = ({ catalog, line }) => {
-  const extraOptions = Array.isArray(catalog?.extras_opciones) ? catalog.extras_opciones : [];
-  const extraOptionById = new Map(extraOptions.map((option) => [String(option.id_extra), option]));
-  const selectedExtraIds = normalizeRequestedExtras(line?.extras).map((entry) => entry.id_extra);
-
-  const resolvedExtras = selectedExtraIds.map((idExtra) => {
-    const option = extraOptionById.get(String(idExtra));
-    if (!option) {
-      throw buildHttpError(400, `El item ${catalog.nombre} no permite el extra solicitado (${idExtra}).`);
-    }
-    return {
-      id_extra: String(option.id_extra),
-      codigo: String(option.codigo || option.id_extra),
-      nombre: String(option.nombre || 'Extra'),
-      precio_adicional: roundMoney(option.precio_adicional || 0)
-    };
-  });
-
-  const extraUnitAmount = roundMoney(
-    resolvedExtras.reduce((sum, entry) => sum + Number(entry.precio_adicional || 0), 0)
-  );
-
-  const allowedSauces = Array.isArray(catalog?.salsas_permitidas) ? catalog.salsas_permitidas : [];
-  const allowedSauceMap = new Map(
-    allowedSauces.map((entry) => [Number(entry.id_salsa), Boolean(entry?.disponible ?? true)])
-  );
-  const selectedSauces = normalizeRequestedSauces(line?.salsas_por_unidad);
-
-  for (const selected of selectedSauces) {
-    const sauceId = Number(selected.id_salsa);
-    if (!allowedSauceMap.has(sauceId)) {
-      throw buildHttpError(
-        400,
-        `El item ${catalog.nombre} no permite la salsa ${selected.id_salsa} para esta configuracion.`
-      );
-    }
-
-    if (!allowedSauceMap.get(sauceId)) {
-      throw buildHttpError(
-        409,
-        `La salsa ${selected.id_salsa} no esta disponible actualmente para ${catalog.nombre}.`
-      );
-    }
-  }
-
-  const selectedSauceCount = selectedSauces.reduce(
-    (sum, entry) => sum + Number(entry.cantidad || 0),
-    0
-  );
-  const requiredSauces = calculateRequiredSaucesForQuantity(
-    catalog?.salsas_componentes,
-    Number(line?.cantidad || 1)
-  );
-  const requiresSelection = catalog?.salsas_requiere_seleccion === true;
-
-  if (requiresSelection && requiredSauces > 0 && selectedSauceCount !== requiredSauces) {
-    throw buildHttpError(
-      400,
-      `El item ${catalog.nombre} requiere ${requiredSauces} salsa(s) para la cantidad seleccionada.`
-    );
-  }
-
-  return {
-    extras: resolvedExtras,
-    salsas_por_unidad: selectedSauces,
-    extra_unit_amount: extraUnitAmount,
-    salsas_requeridas: Number(requiredSauces || 0)
-  };
-};
-
-// Servicio: listar sucursales publicas.
-export const getPublicBranchesService = async () => {
-  const rows = await fetchPublicBranchesQuery();
-  const branchIds = rows
-    .map((row) => Number(row?.id_sucursal || 0))
-    .filter((value) => Number.isInteger(value) && value > 0);
-
-  if (branchIds.length === 0) return [];
-
-  const now = new Date();
-  const snapshotRows = await fetchBranchOperationalSnapshotQuery({
-    branchIds,
-    diaSemana: toDiaSemana(now),
-    fechaISO: buildIsoDateLocal(now)
-  });
-  const snapshotByBranchId = new Map(
-    snapshotRows.map((row) => [Number(row?.id_sucursal || 0), row])
-  );
-
-  return rows.map((row) => {
-    const status = resolveBranchOperationalStatus({
-      row,
-      snapshot: snapshotByBranchId.get(Number(row?.id_sucursal || 0)),
-      now
-    });
-    return mapBranch(row, status);
-  });
-};
-
-// Servicio: obtener menu vigente por sucursal.
-export const getMenuVigenteByBranchService = async (idSucursal) => {
-  const activeMenu = await fetchActiveMenuByBranchQuery(idSucursal);
-  if (!activeMenu) return null;
-  return mapMenuSummary(activeMenu);
-};
-
-// Servicio: construir catalogo publico real usando menu_vigente + detalle_menu.
-export const getPublicCatalogService = async ({ idSucursal, tipoPedido = null }) => {
-  const activeMenu = await fetchActiveMenuByBranchQuery(idSucursal);
-
-  if (!activeMenu) {
-    return {
-      menu: null,
-      tipo_pedido: tipoPedido,
-      stats: {
-        total: 0,
-        disponibles: 0,
-        agotados: 0
-      },
-      items: []
-    };
-  }
-
-  const rows = await fetchCatalogRowsByMenuQuery(Number(activeMenu.id_menu));
-  const sauceConfigByDetail = await buildCatalogSauceConfigByDetail(rows);
-
-  const recipeIds = rows
-    .filter((row) => row.tipo_item === PUBLIC_ITEM_TYPES.RECETA && row.id_receta)
-    .map((row) => Number(row.id_receta));
-
-  const comboIds = rows
-    .filter((row) => row.tipo_item === PUBLIC_ITEM_TYPES.COMBO && row.id_combo)
-    .map((row) => Number(row.id_combo));
-
-  const [recipeAvailabilityRows, comboAvailabilityRows] = await Promise.all([
-    fetchRecipeAvailabilityQuery([...new Set(recipeIds)]),
-    fetchComboAvailabilityQuery([...new Set(comboIds)])
-  ]);
-
-  const recipeAvailabilityMap = toAvailabilityMap(recipeAvailabilityRows, 'id_receta');
-  const comboAvailabilityMap = toAvailabilityMap(comboAvailabilityRows, 'id_combo');
-
-  const items = rows.map((row) =>
-    mapCatalogItem({
-      row,
-      recipeAvailabilityMap,
-      comboAvailabilityMap,
-      sauceConfigByDetail
-    })
-  );
-
-  const disponibles = items.filter((item) => item.disponibilidad.available).length;
-
-  return {
-    menu: mapMenuSummary(activeMenu),
-    tipo_pedido: tipoPedido,
-    stats: {
-      total: items.length,
-      disponibles,
-      agotados: items.length - disponibles
-    },
-    items
-  };
-};
-
-// Servicio: detalle de un item puntual del menu vigente por sucursal.
-export const getPublicCatalogItemDetailService = async ({ idSucursal, idDetalleMenu }) => {
-  const activeMenu = await fetchActiveMenuByBranchQuery(idSucursal);
-  if (!activeMenu) {
-    throw buildHttpError(404, 'No existe menu vigente para la sucursal seleccionada.');
-  }
-
-  const row = await fetchCatalogItemByIdQuery({
-    idMenu: Number(activeMenu.id_menu),
-    idDetalleMenu
-  });
-
-  if (!row) {
-    throw buildHttpError(404, 'El item no existe en el menu vigente de esta sucursal.');
-  }
-  const sauceConfigByDetail = await buildCatalogSauceConfigByDetail([row]);
-
-  const recipeIds = row.id_receta ? [Number(row.id_receta)] : [];
-  const comboIds = row.id_combo ? [Number(row.id_combo)] : [];
-
-  const [recipeAvailabilityRows, comboAvailabilityRows] = await Promise.all([
-    fetchRecipeAvailabilityQuery(recipeIds),
-    fetchComboAvailabilityQuery(comboIds)
-  ]);
-
-  const recipeAvailabilityMap = toAvailabilityMap(recipeAvailabilityRows, 'id_receta');
-  const comboAvailabilityMap = toAvailabilityMap(comboAvailabilityRows, 'id_combo');
-
-  return {
-    menu: mapMenuSummary(activeMenu),
-    item: mapCatalogItem({
-      row,
-      recipeAvailabilityMap,
-      comboAvailabilityMap,
-      sauceConfigByDetail
-    })
-  };
-};
-
-// Servicio: registrar pedido enviado desde el menu publico.
-// Regla: pedido asociado al cliente autenticado (sin usuario fallback).
-export const createPublicOrderService = async ({
+const buildIdempotencyPayloadSignature = ({
   idSucursal,
   tipoPedido,
-  origen = 'public-menu',
-  business = {},
-  items = [],
-  auth = {}
+  businessContext,
+  requestedItems
 }) => {
-  const idUsuario = toPositiveInt(auth?.idUsuario);
-  const idCliente = toPositiveInt(auth?.idCliente);
-  if (!idUsuario || !idCliente) {
-    throw buildHttpError(401, 'Sesion de cliente invalida para registrar el pedido.');
-  }
+  const items = (Array.isArray(requestedItems) ? requestedItems : [])
+    .map((line) => ({
+      id_detalle_menu: Number(line?.id_detalle_menu || 0),
+      cantidad: Number(line?.cantidad || 0),
+      extras: normalizeRequestedExtras(line?.extras)
+        .map((entry) => String(entry.id_extra || ''))
+        .sort(),
+      salsas_por_unidad: normalizeRequestedSauces(line?.salsas_por_unidad),
+      nota: normalizeCompactText(line?.nota, MAX_PUBLIC_ITEM_NOTE_LENGTH)
+    }))
+    .sort((left, right) => left.id_detalle_menu - right.id_detalle_menu);
 
-  const businessContext = normalizePublicOrderBusinessContext({
-    tipoPedido,
-    business
+  const canonical = JSON.stringify({
+    id_sucursal: Number(idSucursal || 0),
+    tipo_pedido: String(tipoPedido || ''),
+    business: {
+      contacto: {
+        nombre: normalizeCompactText(businessContext?.contacto?.nombre, 120),
+        telefono: normalizeCompactText(businessContext?.contacto?.telefono, 30)
+      },
+      entrega: {
+        direccion: normalizeCompactText(businessContext?.entrega?.direccion, 240),
+        referencia: normalizeCompactText(businessContext?.entrega?.referencia, 160)
+      },
+      pago: {
+        metodo: normalizeCompactText(businessContext?.pago?.metodo, 40),
+        comprobante_transferencia: normalizeCompactText(businessContext?.pago?.comprobante_transferencia, 180)
+      },
+      servicio: {
+        mesa: normalizeCompactText(businessContext?.servicio?.mesa, 40)
+      }
+    },
+    items
   });
 
-  if (businessContext.requiresTransferProof && !businessContext.pago.comprobante_transferencia) {
-    throw buildHttpError(400, 'Debes adjuntar referencia o comprobante de transferencia.');
-  }
+  return createHash('sha256').update(canonical).digest('hex').slice(0, 24);
+};
 
-  if (businessContext.requiresTransferProof && !businessContext.contacto.telefono) {
-    throw buildHttpError(400, 'Debes enviar telefono de contacto para pickup/delivery.');
-  }
+const readMarkerValueFromDescription = ({ description = '', marker = '' }) => {
+  const safeDescription = String(description || '');
+  const safeMarker = String(marker || '').trim().toLowerCase();
+  if (!safeMarker) return '';
 
-  if (String(tipoPedido || '') === 'delivery' && !businessContext.entrega.direccion) {
-    throw buildHttpError(400, 'Debes enviar direccion de entrega para pedidos delivery.');
-  }
+  const normalized = safeDescription.toLowerCase();
+  const index = normalized.indexOf(`${safeMarker}:`);
+  if (index < 0) return '';
 
-  const activeMenu = await fetchActiveMenuByBranchQuery(idSucursal);
+  const rest = safeDescription.slice(index + safeMarker.length + 1);
+  const value = String(rest.split('|')[0] || '').trim();
+  return normalizeCompactText(value, 64).toLowerCase();
+};
+
+const assertIdempotencyPayloadCompatibility = ({ existingOrder, requestSignature }) => {
+  if (!existingOrder?.id_pedido) return;
+  const storedSignature = readMarkerValueFromDescription({
+    description: existingOrder?.descripcion_pedido,
+    marker: 'sig'
+  });
+
+  // Compatibilidad retroactiva: pedidos antiguos pueden no tener firma persistida.
+  if (!storedSignature) return;
+
+  if (storedSignature !== String(requestSignature || '').toLowerCase()) {
+    throw buildHttpError(
+      409,
+      'La idempotency_key ya fue usada con un payload distinto. Genera una nueva llave para reintentar.'
+    );
+  }
+};
+
+const materializePublicOrderSnapshot = async ({ idSucursal, requestedItems = [], db = pool }) => {
+  const activeMenu = await fetchActiveMenuByBranchQuery(idSucursal, db);
   if (!activeMenu) {
     throw buildHttpError(409, 'La sucursal no tiene menu vigente activo para registrar pedidos.');
   }
 
-  const requestedItems = normalizeRequestedOrderItems(items);
-  if (requestedItems.length === 0) {
-    throw buildHttpError(400, 'No hay items validos para registrar el pedido.');
-  }
-
-  const rows = await fetchCatalogRowsByMenuQuery(Number(activeMenu.id_menu));
-  const sauceConfigByDetail = await buildCatalogSauceConfigByDetail(rows);
+  const rows = await fetchCatalogRowsByMenuQuery(Number(activeMenu.id_menu), db);
+  const [sauceConfigByDetail, extrasByRecipe] = await Promise.all([
+    buildCatalogSauceConfigByDetail(rows, db),
+    buildCatalogExtrasByRecipe(rows, db)
+  ]);
 
   const recipeIds = rows
     .filter((row) => row.tipo_item === PUBLIC_ITEM_TYPES.RECETA && row.id_receta)
@@ -1046,8 +903,8 @@ export const createPublicOrderService = async ({
     .map((row) => Number(row.id_combo));
 
   const [recipeAvailabilityRows, comboAvailabilityRows] = await Promise.all([
-    fetchRecipeAvailabilityQuery([...new Set(recipeIds)]),
-    fetchComboAvailabilityQuery([...new Set(comboIds)])
+    fetchRecipeAvailabilityQuery([...new Set(recipeIds)], db),
+    fetchComboAvailabilityQuery([...new Set(comboIds)], db)
   ]);
 
   const recipeAvailabilityMap = toAvailabilityMap(recipeAvailabilityRows, 'id_receta');
@@ -1058,7 +915,8 @@ export const createPublicOrderService = async ({
       row,
       recipeAvailabilityMap,
       comboAvailabilityMap,
-      sauceConfigByDetail
+      sauceConfigByDetail,
+      extrasByRecipe
     })
   );
 
@@ -1115,27 +973,488 @@ export const createPublicOrderService = async ({
     };
   });
 
-  const total = roundMoney(normalizedLines.reduce((sum, line) => sum + line.subtotal, 0));
-  const validacionPagoVenceAt = new Date(Date.now() + ORDER_PAYMENT_VALIDATION_WINDOW_MINUTES * 60 * 1000);
-  const idEstadoPedido = await resolvePendingStateId();
-  if (!idEstadoPedido) {
+  return {
+    activeMenu,
+    normalizedLines,
+    total: roundMoney(normalizedLines.reduce((sum, line) => sum + line.subtotal, 0))
+  };
+};
+
+const buildPublicOrderDescription = ({
+  origen,
+  tipoPedido,
+  businessContext,
+  idempotencyKey
+}) => {
+  const safeOrigin = normalizeCompactText(origen || 'public-menu', 60) || 'public-menu';
+  const base = `[${safeOrigin}] pedido web`;
+  const chunks = [];
+  if (idempotencyKey) {
+    // Marcador persistido para poder recuperar el mismo pedido ante reintentos/reconexiones.
+    chunks.push(`idem:${idempotencyKey}`);
+  }
+
+  if (businessContext?.contacto?.telefono) {
+    chunks.push(`tel:${businessContext.contacto.telefono}`);
+  }
+
+  if (businessContext?.pago?.comprobante_transferencia) {
+    chunks.push(`comp:${businessContext.pago.comprobante_transferencia}`);
+  }
+
+  if (String(tipoPedido || '') === 'delivery') {
+    if (businessContext?.entrega?.direccion) {
+      chunks.push(`dir:${businessContext.entrega.direccion}`);
+    }
+
+    if (businessContext?.entrega?.referencia) {
+      chunks.push(`ref:${businessContext.entrega.referencia}`);
+    }
+  }
+
+  if (chunks.length === 0) {
+    return base.slice(0, MAX_PUBLIC_ORDER_DESCRIPTION_LENGTH);
+  }
+
+  return `${base} | ${chunks.join(' | ')}`.slice(0, MAX_PUBLIC_ORDER_DESCRIPTION_LENGTH);
+};
+
+const buildPublicOrderResult = ({
+  idPedido,
+  idSucursal,
+  idCliente,
+  idMenu,
+  tipoPedido,
+  tipoEntrega,
+  businessContext,
+  validacionPagoVenceAt,
+  total,
+  normalizedLines = [],
+  fechaHoraPedido = null,
+  idempotencyKey = '',
+  replayed = false
+}) => ({
+  id_pedido: Number(idPedido),
+  numero_ticket: buildTicketNumber(idPedido),
+  id_sucursal: Number(idSucursal),
+  id_cliente: Number(idCliente),
+  id_menu: Number(idMenu || 0) || null,
+  tipo_pedido: tipoPedido,
+  tipo_entrega: tipoEntrega,
+  business: businessContext,
+  estado: 'PENDIENTE',
+  estado_pago: INITIAL_ORDER_PAYMENT_STATE,
+  validacion_pago_vence_at: validacionPagoVenceAt
+    ? new Date(validacionPagoVenceAt).toISOString()
+    : null,
+  total: roundMoney(total || 0),
+  total_items: normalizedLines.reduce((sum, line) => sum + Number(line.cantidad || 0), 0),
+  fecha_hora_pedido: fechaHoraPedido || null,
+  idempotency: {
+    key: idempotencyKey || null,
+    replayed: Boolean(replayed)
+  },
+  items: normalizedLines.map((line) => ({
+    id_detalle_menu: line.id_detalle_menu,
+    tipo_item: line.tipo_item,
+    nombre: line.nombre,
+    cantidad: line.cantidad,
+    precio_unitario: line.precio_unitario,
+    subtotal: line.subtotal,
+    configuracion_menu: line.configuracion_menu,
+    extras: line.extras,
+    salsas_por_unidad: line.salsas_por_unidad,
+    salsas_requeridas: line.salsas_requeridas
+  }))
+});
+
+const validateAndResolveLineConfiguration = ({ catalog, line }) => {
+  const extraOptions = Array.isArray(catalog?.extras_opciones) ? catalog.extras_opciones : [];
+  const extraOptionById = buildExtraOptionIndex(extraOptions);
+  const selectedExtraIds = normalizeRequestedExtras(line?.extras).map((entry) => entry.id_extra);
+
+  const resolvedExtras = selectedExtraIds.map((idExtra) => {
+    const option =
+      extraOptionById.get(String(idExtra).trim()) ||
+      extraOptionById.get(normalizeTextKey(idExtra)) ||
+      resolveExtraOptionByRequestedId(extraOptions, idExtra);
+    if (!option) {
+      throw buildHttpError(400, `El item ${catalog.nombre} no permite el extra solicitado (${idExtra}).`);
+    }
+    return {
+      id_extra: String(option.id_extra),
+      codigo: String(option.codigo || option.id_extra),
+      nombre: String(option.nombre || 'Extra'),
+      precio_adicional: roundMoney(option.precio_adicional || 0)
+    };
+  });
+
+  const extraUnitAmount = roundMoney(
+    resolvedExtras.reduce((sum, entry) => sum + Number(entry.precio_adicional || 0), 0)
+  );
+
+  const allowedSauces = Array.isArray(catalog?.salsas_permitidas) ? catalog.salsas_permitidas : [];
+  const allowedSauceMap = new Map(
+    allowedSauces.map((entry) => [Number(entry.id_salsa), Boolean(entry?.disponible ?? true)])
+  );
+  const selectedSauces = normalizeRequestedSauces(line?.salsas_por_unidad);
+
+  for (const selected of selectedSauces) {
+    const sauceId = Number(selected.id_salsa);
+    if (!allowedSauceMap.has(sauceId)) {
+      throw buildHttpError(
+        400,
+        `El item ${catalog.nombre} no permite la salsa ${selected.id_salsa} para esta configuracion.`
+      );
+    }
+
+    if (!allowedSauceMap.get(sauceId)) {
+      throw buildHttpError(
+        409,
+        `La salsa ${selected.id_salsa} no esta disponible actualmente para ${catalog.nombre}.`
+      );
+    }
+  }
+
+  const selectedSauceCount = selectedSauces.reduce(
+    (sum, entry) => sum + Number(entry.cantidad || 0),
+    0
+  );
+  const requiredSauces = resolveRequiredSaucesByCatalog({
+    catalog,
+    quantity: Number(line?.cantidad || 1)
+  });
+  const requiresSelection = catalog?.salsas_requiere_seleccion === true || requiredSauces > 0;
+
+  if (requiresSelection && requiredSauces > 0 && allowedSauces.length === 0) {
     throw buildHttpError(
       409,
-      'Configuracion incompleta: no existe estado inicial PENDIENTE/POR PAGAR para pedidos.'
+      `El item ${catalog.nombre} requiere salsas, pero no tiene salsas disponibles.`
     );
+  }
+
+  if (requiresSelection && requiredSauces > 0 && selectedSauceCount !== requiredSauces) {
+    throw buildHttpError(
+      400,
+      `El item ${catalog.nombre} requiere ${requiredSauces} salsa(s) para la cantidad seleccionada.`
+    );
+  }
+
+  return {
+    extras: resolvedExtras,
+    salsas_por_unidad: selectedSauces,
+    extra_unit_amount: extraUnitAmount,
+    salsas_requeridas: Number(requiredSauces || 0)
+  };
+};
+
+// Servicio: listar sucursales publicas.
+export const getPublicBranchesService = async () => {
+  const rows = await fetchPublicBranchesQuery();
+  return rows.map(mapBranch);
+};
+
+// Servicio: obtener menu vigente por sucursal.
+export const getMenuVigenteByBranchService = async (idSucursal) => {
+  const activeMenu = await fetchActiveMenuByBranchQuery(idSucursal);
+  if (!activeMenu) return null;
+  return mapMenuSummary(activeMenu);
+};
+
+// Servicio: construir catalogo publico real usando menu_vigente + detalle_menu.
+export const getPublicCatalogService = async ({ idSucursal, tipoPedido = null }) => {
+  const activeMenu = await fetchActiveMenuByBranchQuery(idSucursal);
+
+  if (!activeMenu) {
+    return {
+      menu: null,
+      tipo_pedido: tipoPedido,
+      stats: {
+        total: 0,
+        disponibles: 0,
+        agotados: 0
+      },
+      items: []
+    };
+  }
+
+  const rows = await fetchCatalogRowsByMenuQuery(Number(activeMenu.id_menu));
+  const [sauceConfigByDetail, extrasByRecipe] = await Promise.all([
+    buildCatalogSauceConfigByDetail(rows),
+    buildCatalogExtrasByRecipe(rows)
+  ]);
+
+  const recipeIds = rows
+    .filter((row) => row.tipo_item === PUBLIC_ITEM_TYPES.RECETA && row.id_receta)
+    .map((row) => Number(row.id_receta));
+
+  const comboIds = rows
+    .filter((row) => row.tipo_item === PUBLIC_ITEM_TYPES.COMBO && row.id_combo)
+    .map((row) => Number(row.id_combo));
+
+  const [recipeAvailabilityRows, comboAvailabilityRows] = await Promise.all([
+    fetchRecipeAvailabilityQuery([...new Set(recipeIds)]),
+    fetchComboAvailabilityQuery([...new Set(comboIds)])
+  ]);
+
+  const recipeAvailabilityMap = toAvailabilityMap(recipeAvailabilityRows, 'id_receta');
+  const comboAvailabilityMap = toAvailabilityMap(comboAvailabilityRows, 'id_combo');
+
+  const items = rows.map((row) =>
+    mapCatalogItem({
+      row,
+      recipeAvailabilityMap,
+      comboAvailabilityMap,
+      sauceConfigByDetail,
+      extrasByRecipe
+    })
+  );
+
+  const disponibles = items.filter((item) => item.disponibilidad.available).length;
+
+  return {
+    menu: mapMenuSummary(activeMenu),
+    tipo_pedido: tipoPedido,
+    stats: {
+      total: items.length,
+      disponibles,
+      agotados: items.length - disponibles
+    },
+    items
+  };
+};
+
+// Servicio: detalle de un item puntual del menu vigente por sucursal.
+export const getPublicCatalogItemDetailService = async ({ idSucursal, idDetalleMenu }) => {
+  const activeMenu = await fetchActiveMenuByBranchQuery(idSucursal);
+  if (!activeMenu) {
+    throw buildHttpError(404, 'No existe menu vigente para la sucursal seleccionada.');
+  }
+
+  const row = await fetchCatalogItemByIdQuery({
+    idMenu: Number(activeMenu.id_menu),
+    idDetalleMenu
+  });
+
+  if (!row) {
+    throw buildHttpError(404, 'El item no existe en el menu vigente de esta sucursal.');
+  }
+  const [sauceConfigByDetail, extrasByRecipe] = await Promise.all([
+    buildCatalogSauceConfigByDetail([row]),
+    buildCatalogExtrasByRecipe([row])
+  ]);
+
+  const recipeIds = row.id_receta ? [Number(row.id_receta)] : [];
+  const comboIds = row.id_combo ? [Number(row.id_combo)] : [];
+
+  const [recipeAvailabilityRows, comboAvailabilityRows] = await Promise.all([
+    fetchRecipeAvailabilityQuery(recipeIds),
+    fetchComboAvailabilityQuery(comboIds)
+  ]);
+
+  const recipeAvailabilityMap = toAvailabilityMap(recipeAvailabilityRows, 'id_receta');
+  const comboAvailabilityMap = toAvailabilityMap(comboAvailabilityRows, 'id_combo');
+
+  return {
+    menu: mapMenuSummary(activeMenu),
+    item: mapCatalogItem({
+      row,
+      recipeAvailabilityMap,
+      comboAvailabilityMap,
+      sauceConfigByDetail,
+      extrasByRecipe
+    })
+  };
+};
+
+// Servicio: registrar pedido enviado desde el menu publico.
+// Regla: pedido asociado al cliente autenticado (sin usuario fallback).
+export const createPublicOrderService = async ({
+  idSucursal,
+  tipoPedido,
+  origen = 'public-menu',
+  idempotencyKey = '',
+  business = {},
+  items = [],
+  auth = {}
+}) => {
+  const idUsuario = toPositiveInt(auth?.idUsuario);
+  const idCliente = toPositiveInt(auth?.idCliente);
+  if (!idUsuario || !idCliente) {
+    throw buildHttpError(401, 'Sesion de cliente invalida para registrar el pedido.');
+  }
+  const safeIdempotencyKey = normalizeIdempotencyKey(idempotencyKey);
+  if (!safeIdempotencyKey || safeIdempotencyKey.length < 12) {
+    throw buildHttpError(400, 'idempotency_key invalido para registrar el pedido.');
+  }
+
+  const businessContext = normalizePublicOrderBusinessContext({
+    tipoPedido,
+    business
+  });
+
+  if (businessContext.requiresTransferProof && !businessContext.pago.comprobante_transferencia) {
+    throw buildHttpError(400, 'Debes adjuntar referencia o comprobante de transferencia para delivery.');
+  }
+
+  if ((String(tipoPedido || '') === 'pickup' || String(tipoPedido || '') === 'delivery') && !businessContext.contacto.telefono) {
+    throw buildHttpError(400, 'Debes enviar telefono de contacto para pickup/delivery.');
+  }
+
+  if (String(tipoPedido || '') === 'pickup' && !businessContext.pago?.metodo) {
+    throw buildHttpError(400, 'Debes seleccionar metodo de pago para pickup: caja o transferencia.');
+  }
+
+  if (
+    String(tipoPedido || '') === 'pickup' &&
+    businessContext.pago?.metodo &&
+    !TRANSFER_METHOD_ALIASES.has(String(businessContext.pago.metodo || '').toLowerCase()) &&
+    !CASH_METHOD_ALIASES.has(String(businessContext.pago.metodo || '').toLowerCase())
+  ) {
+    throw buildHttpError(400, 'metodo_pago invalido para pickup. Usa caja o transferencia.');
+  }
+
+  if (
+    String(tipoPedido || '') === 'delivery' &&
+    businessContext.pago?.metodo &&
+    !TRANSFER_METHOD_ALIASES.has(String(businessContext.pago.metodo || '').toLowerCase())
+  ) {
+    throw buildHttpError(400, 'metodo_pago invalido para delivery. Usa transferencia.');
+  }
+
+  if (String(tipoPedido || '') === 'delivery' && !businessContext.entrega.direccion) {
+    throw buildHttpError(400, 'Debes enviar direccion de entrega para pedidos delivery.');
+  }
+
+  if (String(tipoPedido || '') === 'delivery' && !businessContext.entrega.referencia) {
+    throw buildHttpError(400, 'Debes enviar referencia de entrega para pedidos delivery.');
+  }
+
+  const requestedItems = normalizeRequestedOrderItems(items);
+  if (requestedItems.length === 0) {
+    throw buildHttpError(400, 'No hay items validos para registrar el pedido.');
+  }
+  const requestSignature = buildIdempotencyPayloadSignature({
+    idSucursal,
+    tipoPedido,
+    businessContext,
+    requestedItems
+  });
+
+  // Primera verificacion de idempotencia: responde rapido a reintentos legitimos
+  // y bloquea reuse de llave con payload alterado.
+  {
+    const replayClient = await pool.connect();
+    try {
+      await replayClient.query('BEGIN');
+      await acquirePublicOrderIdempotencyLockQuery(replayClient, {
+        idCliente,
+        idempotencyKey: safeIdempotencyKey
+      });
+
+      const existing = await fetchPedidoByIdempotencyKeyQuery(replayClient, {
+        idCliente,
+        idSucursal,
+        idempotencyKey: safeIdempotencyKey
+      });
+      assertIdempotencyPayloadCompatibility({
+        existingOrder: existing,
+        requestSignature
+      });
+
+      await replayClient.query('COMMIT');
+
+      if (existing?.id_pedido) {
+        return buildPublicOrderResult({
+          idPedido: Number(existing.id_pedido),
+          idSucursal,
+          idCliente,
+          idMenu: null,
+          tipoPedido,
+          tipoEntrega: DELIVERY_TYPE_BY_ORDER_TYPE[tipoPedido] || 'LOCAL',
+          businessContext,
+          validacionPagoVenceAt: existing?.validacion_pago_vence_at || null,
+          total: Number(existing?.total || 0),
+          normalizedLines: [],
+          fechaHoraPedido: existing?.fecha_hora_pedido || null,
+          idempotencyKey: safeIdempotencyKey,
+          replayed: true
+        });
+      }
+    } catch (error) {
+      await replayClient.query('ROLLBACK');
+      throw error;
+    } finally {
+      replayClient.release();
+    }
   }
 
   const descripcionEnvio = SERVICE_TYPE_BY_ORDER_TYPE[tipoPedido] || 'LOCAL';
   const tipoEntrega = DELIVERY_TYPE_BY_ORDER_TYPE[tipoPedido] || 'LOCAL';
-  const descripcionPedido = buildPublicOrderDescription({
-    origen,
-    tipoPedido,
-    businessContext
-  });
-
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
+    await acquirePublicOrderIdempotencyLockQuery(client, {
+      idCliente,
+      idempotencyKey: safeIdempotencyKey
+    });
+
+    // Segunda verificacion en la misma transaccion de escritura para cerrar carrera entre nodos/procesos.
+    const existingInWriteTx = await fetchPedidoByIdempotencyKeyQuery(client, {
+      idCliente,
+      idSucursal,
+      idempotencyKey: safeIdempotencyKey
+    });
+    assertIdempotencyPayloadCompatibility({
+      existingOrder: existingInWriteTx,
+      requestSignature
+    });
+    if (existingInWriteTx?.id_pedido) {
+      await client.query('COMMIT');
+      return buildPublicOrderResult({
+        idPedido: Number(existingInWriteTx.id_pedido),
+        idSucursal,
+        idCliente,
+        idMenu: null,
+        tipoPedido,
+        tipoEntrega,
+        businessContext,
+        validacionPagoVenceAt: existingInWriteTx?.validacion_pago_vence_at || null,
+        total: Number(existingInWriteTx?.total || 0),
+        normalizedLines: [],
+        fechaHoraPedido: existingInWriteTx?.fecha_hora_pedido || null,
+        idempotencyKey: safeIdempotencyKey,
+        replayed: true
+      });
+    }
+
+    // Validacion final transaccional: el pedido se calcula con el estado actual de BD
+    // en la misma transaccion que inserta cabecera y detalle.
+    const {
+      activeMenu,
+      normalizedLines,
+      total
+    } = await materializePublicOrderSnapshot({
+      idSucursal,
+      requestedItems,
+      db: client
+    });
+
+    const idEstadoPedido = await resolvePendingStateId(client);
+    if (!idEstadoPedido) {
+      throw buildHttpError(
+        409,
+        'Configuracion incompleta: no existe estado inicial PENDIENTE/POR PAGAR para pedidos.'
+      );
+    }
+
+    const validacionPagoVenceAt = new Date(Date.now() + ORDER_PAYMENT_VALIDATION_WINDOW_MINUTES * 60 * 1000);
+    const descripcionPedido = buildPublicOrderDescription({
+      origen,
+      tipoPedido,
+      businessContext,
+      idempotencyKey: safeIdempotencyKey
+    });
 
     const pedido = await insertPublicPedidoQuery(client, {
       descripcion_pedido: descripcionPedido,
@@ -1172,34 +1491,21 @@ export const createPublicOrderService = async ({
 
     await client.query('COMMIT');
 
-    return {
-      id_pedido: idPedido,
-      numero_ticket: buildTicketNumber(idPedido),
-      id_sucursal: Number(idSucursal),
-      id_cliente: Number(idCliente),
-      id_menu: Number(activeMenu.id_menu),
-      tipo_pedido: tipoPedido,
-      tipo_entrega: tipoEntrega,
-      business: businessContext,
-      estado: 'PENDIENTE',
-      estado_pago: INITIAL_ORDER_PAYMENT_STATE,
-      validacion_pago_vence_at: validacionPagoVenceAt.toISOString(),
+    return buildPublicOrderResult({
+      idPedido,
+      idSucursal,
+      idCliente,
+      idMenu: Number(activeMenu.id_menu || 0) || null,
+      tipoPedido,
+      tipoEntrega,
+      businessContext,
+      validacionPagoVenceAt,
       total,
-      total_items: normalizedLines.reduce((sum, line) => sum + Number(line.cantidad || 0), 0),
-      fecha_hora_pedido: pedido?.fecha_hora_pedido || null,
-      items: normalizedLines.map((line) => ({
-        id_detalle_menu: line.id_detalle_menu,
-        tipo_item: line.tipo_item,
-        nombre: line.nombre,
-        cantidad: line.cantidad,
-        precio_unitario: line.precio_unitario,
-        subtotal: line.subtotal,
-        configuracion_menu: line.configuracion_menu,
-        extras: line.extras,
-        salsas_por_unidad: line.salsas_por_unidad,
-        salsas_requeridas: line.salsas_requeridas
-      }))
-    };
+      normalizedLines,
+      fechaHoraPedido: pedido?.fecha_hora_pedido || null,
+      idempotencyKey: safeIdempotencyKey,
+      replayed: false
+    });
   } catch (error) {
     await client.query('ROLLBACK');
     throw error;

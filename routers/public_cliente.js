@@ -2,12 +2,12 @@
  * public_cliente.js
  * Rutas públicas para el flujo de cliente web:
  *   POST /api/public/register        — auto-registro de cliente (con verificación email)
+ *   POST /api/public/resend-verification — reenvío de verificación de cuenta
  *   POST /api/public/login            — login de cliente (email+clave vía Supabase)
  *   POST /api/public/forgot-password  — recuperación de contraseña (SMTP propio)
  *   POST /api/public/verify-email     — verificar email desde link enviado
  *   POST /api/public/google-callback  — callback OAuth Google
- *   GET  /api/public/menu             — menú público (sin auth)
- *   GET  /api/public/menu/:id         — detalle de ítem del menú (sin auth)
+ *   GET  /api/public/menu*            — DEPRECATED (migrado a /api/public-menu/*)
  */
 import express from 'express';
 import jwt from 'jsonwebtoken';
@@ -18,18 +18,78 @@ import {
   publicLoginIpLimiter,
   publicLoginAccountIpLimiter,
   registerLimiter,
-  forgotPasswordLimiter
+  forgotPasswordLimiter,
+  resendVerificationLimiter
 } from '../middleware/rateLimiter.js';
 import { getClientIp, parseUserAgent } from '../utils/security/clientInfo.js';
 import { insertLoginLog } from '../utils/security/loginLogger.js';
-import { createSession } from '../utils/security/sessionService.js';
+import { createSession, closeAllUserSessions } from '../utils/security/sessionService.js';
 import { enviarVerificacion, enviarRecuperacion } from '../utils/emailService.js';
 
 const router = express.Router();
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
-const FRONTEND_ORIGIN = process.env.FRONTEND_ORIGIN || 'http://localhost:5173';
+const IS_PRODUCTION = String(process.env.NODE_ENV || '').toLowerCase() === 'production';
+
+const normalizeOrigin = (value) => {
+  const raw = String(value || '').trim();
+  if (!raw) return '';
+  try {
+    const parsed = new URL(raw);
+    if (!['http:', 'https:'].includes(parsed.protocol)) return '';
+    return `${parsed.protocol}//${parsed.host}`;
+  } catch {
+    return '';
+  }
+};
+
+const FRONTEND_ORIGIN =
+  normalizeOrigin(process.env.FRONTEND_ORIGIN) ||
+  (IS_PRODUCTION ? '' : 'http://localhost:5173');
+
+const BACKEND_PUBLIC_ORIGIN = normalizeOrigin(
+  process.env.BACKEND_PUBLIC_ORIGIN || process.env.API_PUBLIC_ORIGIN
+);
+
+const resolveRequestOrigin = (req) => {
+  const protoHeader = String(req.headers['x-forwarded-proto'] || '')
+    .split(',')[0]
+    .trim()
+    .toLowerCase();
+  const hostHeader = String(req.headers['x-forwarded-host'] || req.get('host') || '')
+    .split(',')[0]
+    .trim();
+  if (!hostHeader) return '';
+  const protocol = protoHeader || req.protocol || 'http';
+  return normalizeOrigin(`${protocol}://${hostHeader}`);
+};
+
+const resolveFrontendOrigin = (req) => {
+  if (FRONTEND_ORIGIN) return FRONTEND_ORIGIN;
+  if (IS_PRODUCTION) return '';
+  return resolveRequestOrigin(req);
+};
+
+const resolveBackendOrigin = (req) => {
+  if (BACKEND_PUBLIC_ORIGIN) return BACKEND_PUBLIC_ORIGIN;
+  if (IS_PRODUCTION) return '';
+  return resolveRequestOrigin(req);
+};
+
+const buildUrlWithParams = (origin, path, params = {}) => {
+  if (!origin) return '';
+  try {
+    const url = new URL(path, `${origin}/`);
+    Object.entries(params).forEach(([key, value]) => {
+      if (value === null || value === undefined || value === '') return;
+      url.searchParams.set(key, String(value));
+    });
+    return url.toString();
+  } catch {
+    return '';
+  }
+};
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
@@ -50,9 +110,283 @@ const emitirAppJwt = (usuario, id_sesion) => {
     nombre_usuario: usuario.nombre_usuario,
     tipo_usuario: usuario.tipo_usuario,
     id_cliente: usuario.id_cliente,
+    nombre_cliente: usuario.nombre_cliente,
+    apellido_cliente: usuario.apellido_cliente,
+    nombre_completo_cliente: usuario.nombre_completo_cliente,
+    nombre_completo: usuario.nombre_completo_cliente,
     sid: id_sesion
   };
   return jwt.sign(payload, JWT_SECRET, { expiresIn: '8h' });
+};
+
+const CLIENTE_USUARIO_SELECT = `
+  SELECT
+    u.id_usuario,
+    u.nombre_usuario,
+    u.tipo_usuario,
+    u.id_cliente,
+    u.estado,
+    u.must_change_password,
+    c.id_persona,
+    p.nombre AS nombre_cliente,
+    p.apellido AS apellido_cliente,
+    NULLIF(TRIM(CONCAT_WS(' ', p.nombre, p.apellido)), '') AS nombre_completo_cliente,
+    NULLIF(TRIM(CONCAT_WS(' ', p.nombre, p.apellido)), '') AS nombre_completo
+  FROM usuarios u
+  LEFT JOIN clientes c ON c.id_cliente = u.id_cliente
+  LEFT JOIN personas p ON p.id_persona = c.id_persona
+`;
+
+const getClienteUsuarioById = async (idUsuario) => {
+  const result = await pool.query(
+    `${CLIENTE_USUARIO_SELECT}
+     WHERE u.id_usuario = $1
+     LIMIT 1`,
+    [idUsuario]
+  );
+  return result.rows[0] || null;
+};
+
+const normalizeIdentifier = (value) => String(value || '').trim();
+const normalizeEmail = (value) => normalizeIdentifier(value).toLowerCase();
+const normalizeGenero = (value) => {
+  const raw = String(value || '').trim().toUpperCase();
+  if (!raw) return '';
+  // BD actual usa genero tipo CHAR(1) en personas: M/F/O.
+  if (['M', 'MASCULINO', 'HOMBRE', 'MALE'].includes(raw)) return 'M';
+  if (['F', 'FEMENINO', 'MUJER', 'FEMALE'].includes(raw)) return 'F';
+  if (['O', 'OTRO', 'NO_BINARIO', 'NB'].includes(raw)) return 'O';
+  return '';
+};
+
+const MAX_PERSON_NAME_LENGTH = 70;
+const MAX_EMAIL_LENGTH = 254;
+const MAX_USERNAME_LENGTH = 60;
+
+const normalizeShortText = (value, maxLength = 120) =>
+  String(value || '')
+    .trim()
+    .replace(/\s+/g, ' ')
+    .slice(0, Math.max(1, Number(maxLength) || 120));
+
+const normalizePersonName = (value, fallback = '') => {
+  const normalized = normalizeShortText(value, MAX_PERSON_NAME_LENGTH);
+  if (normalized) return normalized;
+  return normalizeShortText(fallback, MAX_PERSON_NAME_LENGTH) || '';
+};
+
+const splitEmailLocalPart = (email) => {
+  const localPart = String(email || '').split('@')[0] || '';
+  return localPart
+    .replace(/[^a-zA-Z0-9._-]/g, ' ')
+    .split(/[._\-\s]+/)
+    .map((part) => normalizeShortText(part, MAX_PERSON_NAME_LENGTH))
+    .filter(Boolean);
+};
+
+const resolvePersonaNames = ({ nombre, apellido, email }) => {
+  const emailParts = splitEmailLocalPart(email);
+  const fallbackNombre = emailParts[0] || 'Cliente';
+  const fallbackApellido = emailParts.slice(1).join(' ') || 'Web';
+  return {
+    nombre: normalizePersonName(nombre, fallbackNombre),
+    apellido: normalizePersonName(apellido, fallbackApellido)
+  };
+};
+
+const sanitizeUsernameToken = (value) =>
+  String(value || '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]/g, '');
+
+const buildUsernameSeed = ({ nombre, apellido, email }) => {
+  const fromNombre = sanitizeUsernameToken(nombre).slice(0, 1);
+  const fromApellido = sanitizeUsernameToken(apellido).slice(0, 16);
+  const fromEmail = sanitizeUsernameToken(String(email || '').split('@')[0]).slice(0, 16);
+  const base = `${fromNombre}${fromApellido}` || fromEmail || 'cliente';
+  return base.slice(0, 24);
+};
+
+const resolveSupabaseProfile = ({ email = '', userData = null }) => {
+  const metadata =
+    (userData && typeof userData === 'object' && userData.user_metadata && typeof userData.user_metadata === 'object'
+      ? userData.user_metadata
+      : {}) || {};
+  const fullName = normalizeShortText(metadata.full_name || metadata.name || '', MAX_PERSON_NAME_LENGTH * 2);
+  const fullNameParts = fullName.split(/\s+/).filter(Boolean);
+  const parsedNombre = normalizePersonName(metadata.nombre || fullNameParts[0] || '', '');
+  const parsedApellido = normalizePersonName(
+    metadata.apellido || fullNameParts.slice(1).join(' ') || '',
+    ''
+  );
+  const parsedGenero = normalizeGenero(metadata.genero || metadata.gender || '');
+  const fallbackNames = resolvePersonaNames({ nombre: parsedNombre, apellido: parsedApellido, email });
+  return {
+    nombre: fallbackNames.nombre,
+    apellido: fallbackNames.apellido,
+    genero: parsedGenero || 'O'
+  };
+};
+
+const validatePasswordPolicy = (clave) => {
+  const password = String(clave || '');
+  if (password.length < 10) return 'La contraseña debe tener al menos 10 caracteres';
+  if (!/[A-Z]/.test(password)) return 'La contraseña debe incluir al menos una mayúscula';
+  if (!/[0-9]/.test(password)) return 'La contraseña debe incluir al menos un número';
+  return '';
+};
+
+const apiError = (res, status, { code, message, field = null, details = null }) =>
+  res.status(status).json({
+    error: true,
+    code: String(code || 'UNEXPECTED_ERROR'),
+    message: String(message || 'Ocurrio un error'),
+    field,
+    details
+  });
+
+const apiSuccess = (res, status, payload = {}) =>
+  res.status(status).json({
+    error: false,
+    ...payload
+  });
+
+const hashVerificationToken = (token) =>
+  crypto.createHash('sha256').update(String(token || '')).digest('hex');
+
+const generateVerificationToken = () => crypto.randomBytes(48).toString('base64url');
+
+let ensureVerificationTokenTablePromise = null;
+const ensureVerificationTokenTable = async () => {
+  if (!ensureVerificationTokenTablePromise) {
+    ensureVerificationTokenTablePromise = (async () => {
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS public.verificacion_cuentas_tokens (
+          id_token BIGSERIAL PRIMARY KEY,
+          id_usuario INTEGER NOT NULL REFERENCES public.usuarios(id_usuario) ON DELETE CASCADE,
+          token_hash TEXT NOT NULL UNIQUE,
+          token_expires_at TIMESTAMP NOT NULL,
+          used_at TIMESTAMP NULL,
+          request_ip TEXT NULL,
+          user_agent TEXT NULL,
+          created_at TIMESTAMP NOT NULL DEFAULT NOW()
+        )
+      `);
+      await pool.query(
+        `CREATE INDEX IF NOT EXISTS idx_verificacion_tokens_usuario
+         ON public.verificacion_cuentas_tokens (id_usuario)`
+      );
+      await pool.query(
+        `CREATE INDEX IF NOT EXISTS idx_verificacion_tokens_exp
+         ON public.verificacion_cuentas_tokens (token_expires_at)`
+      );
+    })().catch((error) => {
+      ensureVerificationTokenTablePromise = null;
+      throw error;
+    });
+  }
+  return ensureVerificationTokenTablePromise;
+};
+
+const activateAccountFromVerificationToken = async (rawToken) => {
+  const token = normalizeIdentifier(rawToken);
+  if (!token) {
+    return {
+      ok: false,
+      status: 400,
+      code: 'VALIDATION_ERROR',
+      message: 'Token de verificacion requerido.',
+      field: 'token'
+    };
+  }
+
+  await ensureVerificationTokenTable();
+
+  const tokenHash = hashVerificationToken(token);
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const tokenRes = await client.query(
+      `SELECT vt.id_token, vt.id_usuario, vt.token_expires_at, vt.used_at,
+              ia.auth_user_id
+       FROM verificacion_cuentas_tokens vt
+       INNER JOIN identidades_auth ia ON ia.id_usuario = vt.id_usuario
+       WHERE vt.token_hash = $1
+       LIMIT 1
+       FOR UPDATE`,
+      [tokenHash]
+    );
+
+    if (!tokenRes.rows.length) {
+      await client.query('ROLLBACK');
+      return {
+        ok: false,
+        status: 400,
+        code: 'INVALID_TOKEN',
+        message: 'El token de verificacion no es valido.',
+        field: 'token'
+      };
+    }
+
+    const row = tokenRes.rows[0];
+    if (row.used_at) {
+      await client.query('ROLLBACK');
+      return {
+        ok: false,
+        status: 409,
+        code: 'TOKEN_ALREADY_USED',
+        message: 'El token de verificacion ya fue utilizado.',
+        field: 'token'
+      };
+    }
+
+    const exp = new Date(row.token_expires_at);
+    if (Number.isNaN(exp.getTime()) || exp.getTime() <= Date.now()) {
+      await client.query('ROLLBACK');
+      return {
+        ok: false,
+        status: 400,
+        code: 'TOKEN_EXPIRED',
+        message: 'El token de verificacion expiro. Solicita uno nuevo.',
+        field: 'token'
+      };
+    }
+
+    await confirmarIdentidadSupabase(row.auth_user_id);
+
+    await client.query(`UPDATE usuarios SET estado = true WHERE id_usuario = $1`, [row.id_usuario]);
+    await client.query(
+      `UPDATE identidades_auth
+       SET email_verificado = true,
+           ultima_autenticacion = NOW()
+       WHERE id_usuario = $1`,
+      [row.id_usuario]
+    );
+    await client.query(
+      `UPDATE verificacion_cuentas_tokens
+       SET used_at = NOW()
+       WHERE id_token = $1`,
+      [row.id_token]
+    );
+
+    await client.query('COMMIT');
+
+    return {
+      ok: true,
+      status: 200,
+      code: 'EMAIL_VERIFIED',
+      message: 'Email verificado exitosamente. Ya puedes iniciar sesion.',
+      verified: true
+    };
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw error;
+  } finally {
+    client.release();
+  }
 };
 
 /**
@@ -98,9 +432,38 @@ const crearIdentidadSupabase = async (email, password) => {
     },
     body: JSON.stringify({ email, password, email_confirm: false })
   });
-  const data = await res.json();
-  if (!res.ok) throw new Error(data?.message || 'Error al crear identidad en Supabase');
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const rawMessage =
+      data?.msg
+      || data?.message
+      || data?.error_description
+      || data?.error
+      || `Supabase Auth error HTTP ${res.status}`;
+    const error = new Error(String(rawMessage));
+    error.status = res.status;
+    error.code = data?.code || null;
+    error.payload = data;
+    throw error;
+  }
   return data.id; // UUID de Supabase
+};
+
+const eliminarIdentidadSupabase = async (authUserId) => {
+  if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY || !authUserId) return;
+
+  const response = await fetch(`${SUPABASE_URL}/auth/v1/admin/users/${authUserId}`, {
+    method: 'DELETE',
+    headers: {
+      apikey: SUPABASE_SERVICE_KEY,
+      Authorization: `Bearer ${SUPABASE_SERVICE_KEY}`
+    }
+  });
+
+  if (!response.ok && response.status !== 404) {
+    const payload = await response.json().catch(() => ({}));
+    throw new Error(payload?.message || payload?.msg || 'No se pudo compensar usuario de autenticacion.');
+  }
 };
 
 /**
@@ -123,21 +486,203 @@ const generarLinkSupabase = async (type, email, options = {}) => {
   return data; // contiene action_link, hashed_token, redirect_to, etc.
 };
 
-const insertarClienteSeguro = async (queryRunner, idPersona) => {
+const confirmarIdentidadSupabase = async (authUserId) => {
+  if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY || !authUserId) return;
+  const response = await fetch(`${SUPABASE_URL}/auth/v1/admin/users/${authUserId}`, {
+    method: 'PUT',
+    headers: {
+      'Content-Type': 'application/json',
+      apikey: SUPABASE_SERVICE_KEY,
+      Authorization: `Bearer ${SUPABASE_SERVICE_KEY}`
+    },
+    body: JSON.stringify({ email_confirm: true })
+  });
+  if (!response.ok) {
+    const payload = await response.json().catch(() => ({}));
+    throw new Error(payload?.message || payload?.msg || 'No se pudo confirmar usuario en Supabase');
+  }
+};
+
+const resolveDefaultTipoClienteId = async (queryRunner) => {
   try {
+    const preferred = await queryRunner.query(
+      'SELECT id_tipo_cliente FROM public.tipo_cliente WHERE id_tipo_cliente = 2 LIMIT 1'
+    );
+    const preferredId = Number.parseInt(String(preferred.rows?.[0]?.id_tipo_cliente ?? ''), 10);
+    if (Number.isInteger(preferredId) && preferredId > 0) return preferredId;
+  } catch {
+    // Tabla tipo_cliente no disponible o esquema distinto.
+  }
+
+  try {
+    const firstAvailable = await queryRunner.query(
+      'SELECT id_tipo_cliente FROM public.tipo_cliente ORDER BY id_tipo_cliente ASC LIMIT 1'
+    );
+    const firstId = Number.parseInt(String(firstAvailable.rows?.[0]?.id_tipo_cliente ?? ''), 10);
+    if (Number.isInteger(firstId) && firstId > 0) return firstId;
+  } catch {
+    // Tabla tipo_cliente no disponible o esquema distinto.
+  }
+
+  return null;
+};
+
+const insertarClienteSeguro = async (queryRunner, idPersona) => {
+  const defaultTipoClienteId = await resolveDefaultTipoClienteId(queryRunner);
+  const attempts = [];
+
+  if (defaultTipoClienteId) {
+    attempts.push(async () => {
+      const result = await queryRunner.query(
+        `INSERT INTO clientes (id_persona, id_tipo_cliente, fecha_ingreso, puntos)
+         VALUES ($1, $2, CURRENT_DATE, 0)
+         RETURNING id_cliente`,
+        [idPersona, defaultTipoClienteId]
+      );
+      return result.rows[0]?.id_cliente ?? null;
+    });
+  }
+
+  attempts.push(async () => {
     const result = await queryRunner.query(
       `INSERT INTO clientes (id_persona) VALUES ($1) RETURNING id_cliente`,
       [idPersona]
     );
     return result.rows[0]?.id_cliente ?? null;
-  } catch (_error) {
+  });
+
+  attempts.push(async () => {
     const fallback = await queryRunner.query(
       `INSERT INTO clientes (id_persona, id_tipo_cliente, fecha_ingreso, puntos)
        VALUES ($1, 2, CURRENT_DATE, 0) RETURNING id_cliente`,
       [idPersona]
     );
     return fallback.rows[0]?.id_cliente ?? null;
+  });
+
+  let lastError = null;
+  for (const attempt of attempts) {
+    try {
+      const idCliente = await attempt();
+      if (Number.isInteger(Number(idCliente)) && Number(idCliente) > 0) {
+        return idCliente;
+      }
+    } catch (error) {
+      lastError = error;
+    }
   }
+
+  throw lastError || new Error('CLIENT_INSERT_FAILED');
+};
+
+const buildUniqueClienteUsername = async (queryRunner, profile) => {
+  const seed = buildUsernameSeed(profile);
+
+  for (let attempt = 0; attempt < 60; attempt += 1) {
+    const digits = Math.floor(100 + Math.random() * 900);
+    const candidate = `${seed}${digits}`.slice(0, MAX_USERNAME_LENGTH);
+    const exists = await queryRunner.query(
+      `SELECT 1 FROM usuarios WHERE nombre_usuario = $1 LIMIT 1`,
+      [candidate]
+    );
+    if (exists.rows.length === 0) return candidate;
+  }
+
+  return `cli${Date.now().toString(36)}${Math.floor(10 + Math.random() * 90)}`.slice(0, MAX_USERNAME_LENGTH);
+};
+
+const createLocalClienteAccount = async (
+  queryRunner,
+  {
+    email,
+    authUserId,
+    nombre,
+    apellido,
+    genero = 'O',
+    provider = 'email',
+    emailVerificado = false,
+    estadoUsuario = false,
+    passwordMarker = 'SUPABASE_AUTH'
+  }
+) => {
+  const safeEmail = normalizeShortText(normalizeEmail(email), MAX_EMAIL_LENGTH);
+  if (!safeEmail) throw new Error('EMAIL_REQUIRED');
+  if (!authUserId) throw new Error('AUTH_USER_REQUIRED');
+
+  const names = resolvePersonaNames({ nombre, apellido, email: safeEmail });
+  const safeGenero = normalizeGenero(genero) || 'O';
+  const nombreUsuario = await buildUniqueClienteUsername(queryRunner, {
+    nombre: names.nombre,
+    apellido: names.apellido,
+    email: safeEmail
+  });
+
+  const personaRes = await queryRunner.query(
+    `INSERT INTO personas (nombre, apellido, genero) VALUES ($1, $2, $3) RETURNING id_persona`,
+    [names.nombre, names.apellido, safeGenero]
+  );
+  const id_persona = personaRes.rows[0]?.id_persona ?? null;
+  if (!id_persona) throw new Error('PERSONA_INSERT_FAILED');
+
+  const id_cliente = await insertarClienteSeguro(queryRunner, id_persona);
+  if (!Number.isInteger(Number(id_cliente)) || Number(id_cliente) <= 0) {
+    throw new Error('CLIENT_INSERT_FAILED');
+  }
+
+  const usuarioRes = await queryRunner.query(
+    `INSERT INTO usuarios (nombre_usuario, clave, estado, tipo_usuario, id_cliente, must_change_password)
+     VALUES ($1, $2, $3, 'CLIENTE', $4, false)
+     RETURNING id_usuario, nombre_usuario, tipo_usuario, id_cliente, estado, must_change_password`,
+    [nombreUsuario, passwordMarker, Boolean(estadoUsuario), id_cliente]
+  );
+  const usuario = usuarioRes.rows[0];
+  if (!usuario?.id_usuario) throw new Error('USER_INSERT_FAILED');
+
+  const rolRes = await queryRunner.query(
+    `SELECT id_rol FROM roles WHERE UPPER(TRIM(nombre)) = 'CLIENTE' LIMIT 1`
+  );
+  if (rolRes.rows.length > 0) {
+    await queryRunner.query(
+      `INSERT INTO roles_usuarios (id_rol, id_usuario) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
+      [rolRes.rows[0].id_rol, usuario.id_usuario]
+    );
+  }
+
+  await queryRunner.query(
+    `
+      INSERT INTO usuarios_clientes (
+        id_usuario,
+        id_cliente,
+        estado,
+        fecha_vinculacion,
+        fecha_actualizacion
+      )
+      VALUES ($1, $2, true, NOW(), NOW())
+      ON CONFLICT (id_usuario, id_cliente) DO UPDATE
+      SET
+        estado = true,
+        fecha_actualizacion = NOW()
+    `,
+    [usuario.id_usuario, id_cliente]
+  );
+
+  await queryRunner.query(
+    `INSERT INTO identidades_auth (id_usuario, auth_user_id, provider, email_login, email_verificado, activo)
+     VALUES ($1, $2, $3, $4, $5, true)`,
+    [usuario.id_usuario, authUserId, provider, safeEmail, Boolean(emailVerificado)]
+  );
+
+  await queryRunner.query(
+    `INSERT INTO correos (id_persona, direccion_correo) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
+    [id_persona, safeEmail]
+  ).catch(() => {});
+
+  return {
+    usuario,
+    id_usuario: usuario.id_usuario,
+    id_persona,
+    id_cliente
+  };
 };
 
 /**
@@ -164,163 +709,146 @@ const autenticarConSupabase = async (email, password) => {
 
 // ── POST /api/public/register ─────────────────────────────────────────
 router.post('/api/public/register', registerLimiter, async (req, res) => {
-  const { email, clave, nombre, apellido } = req.body;
+  const { clave } = req.body || {};
+  const email = normalizeEmail(req.body?.email);
+  const nombre = normalizeIdentifier(req.body?.nombre);
+  const apellido = normalizeIdentifier(req.body?.apellido);
+  const genero = normalizeGenero(req.body?.genero);
+  const ip_origen = getClientIp(req);
+  const user_agent = req.get('user-agent') || null;
 
-  if (!email || !clave || !nombre || !apellido) {
-    return res.status(400).json({ error: true, message: 'Todos los campos son obligatorios (Nombre, Apellido, Email y Contraseña)' });
+  if (!email || !clave || !nombre || !apellido || !genero) {
+    return apiError(res, 400, {
+      code: 'VALIDATION_ERROR',
+      message: 'Nombre, apellido, genero, email y contrasena son obligatorios.',
+      field: !genero ? 'genero' : null
+    });
   }
 
-  // Validaciones de seguridad desde configuracion_sistema (Hardcoded basados en DB actual para este servicio, o se pueden prefetched)
-  // password_min_length: 10, upper: true, number: true
-  if (clave.length < 10) {
-    return res.status(400).json({ error: true, message: 'La contraseña debe tener al menos 10 caracteres' });
-  }
-  if (!/[A-Z]/.test(clave)) {
-    return res.status(400).json({ error: true, message: 'La contraseña debe incluir al menos una mayúscula' });
-  }
-  if (!/[0-9]/.test(clave)) {
-    return res.status(400).json({ error: true, message: 'La contraseña debe incluir al menos un número' });
+  const passwordPolicyError = validatePasswordPolicy(clave);
+  if (passwordPolicyError) {
+    return apiError(res, 400, {
+      code: 'PASSWORD_POLICY_FAILED',
+      message: passwordPolicyError,
+      field: 'clave'
+    });
   }
 
   const client = await pool.connect();
+  let authUserIdCreated = null;
   try {
+    await ensureVerificationTokenTable();
     await client.query('BEGIN');
 
-    // 1. Verificar que no exista ese email ya registrado
     const emailExiste = await client.query(
       `SELECT ia.id_identidad_auth FROM identidades_auth ia WHERE ia.email_login = $1`,
       [email]
     );
     if (emailExiste.rows.length > 0) {
       await client.query('ROLLBACK');
-      return res.status(409).json({ error: true, message: 'El correo ya está registrado' });
+      return apiError(res, 409, {
+        code: 'EMAIL_ALREADY_EXISTS',
+        message: 'El correo ya esta registrado.',
+        field: 'email'
+      });
     }
 
-    // 1.5 Generar nombre de usuario automático
-    const firstLetter = nombre.trim().charAt(0).toLowerCase();
-    const surname = apellido.trim().split(' ')[0].toLowerCase().replace(/[^a-z]/g, '');
-    let nombreUsuario = '';
-    let isUnique = false;
-    let attempts = 0;
+    const personaProfile = resolvePersonaNames({ nombre, apellido, email });
 
-    while (!isUnique && attempts < 10) {
-      const digits = Math.floor(100 + Math.random() * 900); // 3 dígitos
-      nombreUsuario = `${firstLetter}${surname}${digits}`;
-      
-      const checkU = await client.query(`SELECT id_usuario FROM usuarios WHERE nombre_usuario = $1`, [nombreUsuario]);
-      if (checkU.rows.length === 0) {
-        isUnique = true;
-      }
-      attempts++;
-    }
-
-    if (!isUnique) {
-      throw new Error('No se pudo generar un nombre de usuario único. Intente de nuevo.');
-    }
-
-    // 2. Crear identidad en Supabase (SIN confirmar email)
     const auth_user_id = await crearIdentidadSupabase(email, clave);
+    authUserIdCreated = auth_user_id;
 
-    // 3. Crear persona
-    const personaRes = await client.query(
-      `INSERT INTO personas (nombre, apellido) VALUES ($1, $2) RETURNING id_persona`,
-      [nombre, apellido]
-    );
-    const id_persona = personaRes.rows[0].id_persona;
+    const createdAccount = await createLocalClienteAccount(client, {
+      email,
+      authUserId: auth_user_id,
+      nombre: personaProfile.nombre,
+      apellido: personaProfile.apellido,
+      genero,
+      provider: 'email',
+      emailVerificado: false,
+      estadoUsuario: false,
+      passwordMarker: 'SUPABASE_AUTH'
+    });
+    const nuevoUsuario = createdAccount.usuario;
 
-    // 4. Crear registro en clientes (id_tipo_cliente=2 = 'General')
-    const clienteRes = await client.query(
-      `INSERT INTO clientes (id_persona, id_tipo_cliente, fecha_ingreso, puntos)
-       VALUES ($1, 2, CURRENT_DATE, 0) RETURNING id_cliente`,
-      [id_persona]
-    );
-    const id_cliente = clienteRes.rows[0].id_cliente;
-
-    // 5. Crear usuario interno (estado: false hasta verificar email)
-    const usuarioRes = await client.query(
-      `INSERT INTO usuarios (nombre_usuario, clave, estado, tipo_usuario, id_cliente, must_change_password)
-       VALUES ($1, 'SUPABASE_AUTH', false, 'CLIENTE', $2, false) RETURNING id_usuario, nombre_usuario, tipo_usuario, id_cliente`,
-      [nombreUsuario, id_cliente]
-    );
-    const nuevoUsuario = usuarioRes.rows[0];
-
-    // 6. Asignar rol Cliente
-    const rolRes = await client.query(`SELECT id_rol FROM roles WHERE nombre = 'Cliente' LIMIT 1`);
-    if (rolRes.rows.length > 0) {
-      await client.query(
-        `INSERT INTO roles_usuarios (id_rol, id_usuario) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
-        [rolRes.rows[0].id_rol, nuevoUsuario.id_usuario]
-      );
-    }
-
+    const verificationToken = generateVerificationToken();
+    const verificationTokenHash = hashVerificationToken(verificationToken);
     await client.query(
-      `
-        INSERT INTO usuarios_clientes (
-          id_usuario,
-          id_cliente,
-          estado,
-          fecha_vinculacion,
-          fecha_actualizacion
-        )
-        VALUES ($1, $2, true, NOW(), NOW())
-        ON CONFLICT (id_usuario, id_cliente) DO UPDATE
-        SET
-          estado = true,
-          fecha_actualizacion = NOW()
-      `,
-      [nuevoUsuario.id_usuario, id_cliente]
+      `INSERT INTO verificacion_cuentas_tokens (
+        id_usuario,
+        token_hash,
+        token_expires_at,
+        request_ip,
+        user_agent
+      )
+      VALUES ($1, $2, NOW() + INTERVAL '24 hours', $3, $4)`,
+      [nuevoUsuario.id_usuario, verificationTokenHash, ip_origen, user_agent]
     );
-
-    // 7. Registrar identidad_auth (email_verificado: false)
-    await client.query(
-      `INSERT INTO identidades_auth (id_usuario, auth_user_id, provider, email_login, email_verificado, activo)
-       VALUES ($1, $2, 'email', $3, false, true)`,
-      [nuevoUsuario.id_usuario, auth_user_id, email]
-    );
-
-    // 8. Registrar correo del usuario en tabla correos (ahora con id_persona)
-    if (id_persona) {
-      await client.query(
-        `INSERT INTO correos (id_persona, direccion_correo) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
-        [id_persona, email]
-      ).catch(() => {});
-    }
 
     await client.query('COMMIT');
 
-    // 9. Generar link de verificación vía Supabase Admin y enviar por SMTP propio
-    // redirect_to apunta a /auth/callback donde el frontend procesará el token
-    try {
-      const linkData = await generarLinkSupabase('signup', email, {
-        redirect_to: `${FRONTEND_ORIGIN}/auth/callback`
+    const verificationLink =
+      buildUrlWithParams(resolveBackendOrigin(req), '/api/public/verify-email-link', {
+        token: verificationToken
+      }) ||
+      buildUrlWithParams(resolveFrontendOrigin(req), '/auth/callback', {
+        verify_token: verificationToken
       });
-      const actionLink = linkData.action_link || linkData.properties?.action_link;
 
-      if (actionLink) {
-        await enviarVerificacion(email, nombre || '', actionLink, nuevoUsuario.id_usuario);
-      } else {
-        console.warn('[public/register] No se obtuvo action_link de Supabase, email no enviado');
+    if (!verificationLink) {
+      console.error(
+        '[public/register] No se pudo resolver URL de verificacion. Configura FRONTEND_ORIGIN o BACKEND_PUBLIC_ORIGIN.'
+      );
+    }
+    try {
+      if (verificationLink) {
+        await enviarVerificacion(email, nombre || '', verificationLink, nuevoUsuario.id_usuario);
       }
     } catch (emailErr) {
-      // No fallar el registro si el correo no se pudo enviar
-      console.error('[public/register] Error enviando correo de verificación:', emailErr.message);
+      console.error('[public/register] Error enviando correo de verificacion:', emailErr.message);
     }
 
-    return res.status(201).json({
-      message: 'Te hemos enviado un correo de verificación. Revisa tu bandeja de entrada para activar tu cuenta.',
+    return apiSuccess(res, 201, {
+      message: 'Te hemos enviado un correo de verificacion. Revisa tu bandeja de entrada para activar tu cuenta.',
       requiresVerification: true
     });
   } catch (error) {
     await client.query('ROLLBACK').catch(() => {});
-    console.error('[public/register] Error:', error);
 
-    // Si el error viene de Supabase Auth (ej. usuario ya existe)
-    if (error.message?.includes('User already registered') || error.message?.includes('already exists')) {
-      return res.status(400).json({ error: true, message: 'El correo electrónico ya está registrado en el sistema de autenticación.' });
+    if (authUserIdCreated) {
+      await eliminarIdentidadSupabase(authUserIdCreated).catch((cleanupError) => {
+        console.error('[public/register] No se pudo compensar usuario auth:', cleanupError.message);
+      });
     }
 
-    return res.status(500).json({
-      error: true,
+    console.error('[public/register] Error:', error);
+
+    const normalizedErrorMsg = String(error?.message || '').toLowerCase();
+    const isDuplicateEmail =
+      normalizedErrorMsg.includes('user already registered')
+      || normalizedErrorMsg.includes('has already been registered')
+      || normalizedErrorMsg.includes('already exists')
+      || normalizedErrorMsg.includes('already registered')
+      || normalizedErrorMsg.includes('duplicate')
+      || normalizedErrorMsg.includes('email_exists');
+
+    if (isDuplicateEmail) {
+      return apiError(res, 409, {
+        code: 'EMAIL_ALREADY_EXISTS',
+        message: 'El correo electronico ya existe en autenticacion.',
+        field: 'email'
+      });
+    }
+
+    if (error?.code === '22001') {
+      return apiError(res, 400, {
+        code: 'VALIDATION_ERROR',
+        message: 'Uno de los campos excede la longitud permitida por la base de datos.'
+      });
+    }
+
+    return apiError(res, 500, {
+      code: 'REGISTER_FAILED',
       message: 'No se pudo completar el registro del cliente.'
     });
   } finally {
@@ -328,69 +856,212 @@ router.post('/api/public/register', registerLimiter, async (req, res) => {
   }
 });
 
-// ── POST /api/public/login ────────────────────────────────────────────
+router.post('/api/public/resend-verification', resendVerificationLimiter, async (req, res) => {
+  const identifier = normalizeIdentifier(req.body?.identifier ?? req.body?.email);
+  const isEmailIdentifier = identifier.includes('@');
+  const normalizedLookup = isEmailIdentifier ? normalizeEmail(identifier) : identifier;
+  const ip_origen = getClientIp(req);
+  const user_agent = req.get('user-agent') || null;
+
+  if (!normalizedLookup) {
+    return apiError(res, 400, {
+      code: 'VALIDATION_ERROR',
+      message: 'Correo o usuario requerido.',
+      field: 'identifier'
+    });
+  }
+
+  const genericMessage =
+    'Si la cuenta existe y esta pendiente de verificacion, enviaremos un nuevo correo de verificacion.';
+
+  try {
+    await ensureVerificationTokenTable();
+
+    const accountRes = await pool.query(
+      `SELECT
+          ia.id_usuario,
+          ia.email_login,
+          ia.email_verificado,
+          ia.provider,
+          u.estado,
+          COALESCE(p.nombre, '') AS nombre
+       FROM identidades_auth ia
+       INNER JOIN usuarios u ON u.id_usuario = ia.id_usuario
+       LEFT JOIN clientes c ON c.id_cliente = u.id_cliente
+       LEFT JOIN personas p ON p.id_persona = c.id_persona
+       WHERE (
+         ($2::boolean = true AND ia.email_login = $1)
+         OR
+         ($2::boolean = false AND LOWER(u.nombre_usuario) = LOWER($1))
+       )
+       ORDER BY ia.id_identidad_auth DESC
+       LIMIT 1`,
+      [normalizedLookup, isEmailIdentifier]
+    );
+
+    if (!accountRes.rows.length) {
+      return apiSuccess(res, 200, { message: genericMessage });
+    }
+
+    const account = accountRes.rows[0];
+    const provider = String(account.provider || '').trim().toLowerCase();
+    const emailVerificado = Boolean(account.email_verificado);
+    const usuarioActivo = Boolean(account.estado);
+    const safeEmail = normalizeEmail(account.email_login);
+
+    if (!safeEmail || provider !== 'email' || emailVerificado || usuarioActivo) {
+      return apiSuccess(res, 200, { message: genericMessage });
+    }
+
+    const dbClient = await pool.connect();
+    let verificationToken = '';
+    try {
+      await dbClient.query('BEGIN');
+
+      await dbClient.query(
+        `UPDATE verificacion_cuentas_tokens
+         SET used_at = NOW()
+         WHERE id_usuario = $1
+           AND used_at IS NULL`,
+        [account.id_usuario]
+      );
+
+      verificationToken = generateVerificationToken();
+      const verificationTokenHash = hashVerificationToken(verificationToken);
+      await dbClient.query(
+        `INSERT INTO verificacion_cuentas_tokens (
+          id_usuario,
+          token_hash,
+          token_expires_at,
+          request_ip,
+          user_agent
+        )
+        VALUES ($1, $2, NOW() + INTERVAL '24 hours', $3, $4)`,
+        [account.id_usuario, verificationTokenHash, ip_origen, user_agent]
+      );
+
+      await dbClient.query('COMMIT');
+    } catch (dbError) {
+      await dbClient.query('ROLLBACK').catch(() => {});
+      throw dbError;
+    } finally {
+      dbClient.release();
+    }
+
+    const verificationLink =
+      buildUrlWithParams(resolveBackendOrigin(req), '/api/public/verify-email-link', {
+        token: verificationToken
+      }) ||
+      buildUrlWithParams(resolveFrontendOrigin(req), '/auth/callback', {
+        verify_token: verificationToken
+      });
+
+    if (verificationLink) {
+      try {
+        await enviarVerificacion(safeEmail, account.nombre || '', verificationLink, account.id_usuario);
+      } catch (emailErr) {
+        console.error('[public/resend-verification] Error enviando correo de verificacion:', emailErr.message);
+      }
+    } else {
+      console.error(
+        '[public/resend-verification] No se pudo resolver URL de verificacion. Configura FRONTEND_ORIGIN o BACKEND_PUBLIC_ORIGIN.'
+      );
+    }
+
+    return apiSuccess(res, 200, { message: genericMessage });
+  } catch (error) {
+    console.error('[public/resend-verification] Error:', error);
+    return apiSuccess(res, 200, { message: genericMessage });
+  }
+});
+
 router.post('/api/public/login', publicLoginIpLimiter, publicLoginAccountIpLimiter, async (req, res) => {
-  const { identifier, clave } = req.body;
+  const identifier = normalizeIdentifier(req.body?.identifier ?? req.body?.email);
+  const { clave } = req.body || {};
   if (!identifier || !clave) {
-    return res.status(400).json({ error: true, message: 'Usuario/email y contraseña son requeridos' });
+    return apiError(res, 400, {
+      code: 'VALIDATION_ERROR',
+      message: 'Usuario/email y contrasena son requeridos.'
+    });
   }
 
   const ip_origen = getClientIp(req);
   const user_agent = req.get('user-agent') || null;
   const { dispositivo, navegador, sistema_operativo } = parseUserAgent(user_agent);
+
   const attemptedIdentifier = identifier;
-  let resolvedIdentifier = identifier;
+  let resolvedEmail = '';
 
   try {
     let email = identifier;
 
-    // Si el identifier NO es un email, buscar el email asociado en la tabla correos o identidades_auth
     if (!identifier.includes('@')) {
       const uRes = await pool.query(
-        `SELECT ia.email_login 
-         FROM usuarios u 
-         JOIN identidades_auth ia ON u.id_usuario = ia.id_usuario 
+        `SELECT ia.email_login
+         FROM usuarios u
+         JOIN identidades_auth ia ON u.id_usuario = ia.id_usuario
          WHERE u.nombre_usuario = $1 LIMIT 1`,
         [identifier]
       );
       if (uRes.rows.length === 0) {
-        return res.status(401).json({ error: true, message: 'Credenciales inválidas' });
+        await insertLoginLog({
+          id_usuario: null,
+          id_sesion: null,
+          ip_origen,
+          nombre_usuario_intentado: attemptedIdentifier,
+          user_agent,
+          dispositivo,
+          navegador,
+          sistema_operativo,
+          ubicacion: null,
+          exito: false,
+          mensaje_error: 'Credenciales invalidas'
+        }).catch(() => {});
+        return apiError(res, 401, {
+          code: 'INVALID_CREDENTIALS',
+          message: 'Credenciales invalidas.'
+        });
       }
       email = uRes.rows[0].email_login;
     }
-    resolvedIdentifier = email;
 
-    // 1. Autenticar contra Supabase
+    resolvedEmail = email;
     const { auth_user_id } = await autenticarConSupabase(email, clave);
 
-    // 2. Buscar identity y usuario interno
     const identRes = await pool.query(
       `SELECT ia.id_usuario FROM identidades_auth ia WHERE ia.auth_user_id = $1 LIMIT 1`,
       [auth_user_id]
     );
 
     if (identRes.rows.length === 0) {
-      return res.status(404).json({ error: true, message: 'No existe una cuenta interna asociada a ese correo' });
+      return apiError(res, 401, {
+        code: 'INVALID_CREDENTIALS',
+        message: 'Credenciales invalidas.'
+      });
     }
 
     const id_usuario = identRes.rows[0].id_usuario;
-    const usuarioRes = await pool.query(
-      `SELECT id_usuario, nombre_usuario, tipo_usuario, id_cliente, estado, must_change_password FROM usuarios WHERE id_usuario = $1`,
-      [id_usuario]
-    );
-    const usuario = usuarioRes.rows[0];
+    const usuario = await getClienteUsuarioById(id_usuario);
 
     if (!usuario || !usuario.estado) {
-      return res.status(403).json({ error: true, message: 'Cuenta desactivada' });
+      return apiError(res, 403, {
+        code: 'ACCOUNT_DISABLED',
+        message: 'Cuenta desactivada.'
+      });
     }
 
-    // 3. Actualizar última autenticación
+    if (String(usuario?.tipo_usuario || '').trim().toUpperCase() !== 'CLIENTE') {
+      return apiError(res, 403, {
+        code: 'ACCOUNT_SCOPE_INVALID',
+        message: 'Este acceso corresponde solo a cuentas de cliente.'
+      });
+    }
+
     await pool.query(
       `UPDATE identidades_auth SET ultima_autenticacion = NOW() WHERE auth_user_id = $1`,
       [auth_user_id]
     );
 
-    // 4. Sesión y JWT
     const id_sesion = await createSession({
       id_usuario, ip_origen, user_agent, dispositivo, navegador, sistema_operativo, ubicacion: null
     });
@@ -407,7 +1078,7 @@ router.post('/api/public/login', publicLoginIpLimiter, publicLoginAccountIpLimit
       user_agent, dispositivo, navegador, sistema_operativo, ubicacion: null, exito: true, mensaje_error: null
     });
 
-    return res.json({
+    return apiSuccess(res, 200, {
       message: 'Login exitoso',
       usuario: { ...usuario, roles: authz.roles, permisos: authz.permisos },
       roles: authz.roles,
@@ -415,19 +1086,40 @@ router.post('/api/public/login', publicLoginIpLimiter, publicLoginAccountIpLimit
       csrfToken
     });
   } catch (error) {
-    console.error('[public/login] Error:', error);
+    const supabaseMessage = String(error?.message || '').toLowerCase();
+    const isNotVerified = supabaseMessage.includes('email not confirmed') || supabaseMessage.includes('not confirmed');
+
     await insertLoginLog({
-      id_usuario: null, id_sesion: null, ip_origen, nombre_usuario_intentado: resolvedIdentifier || attemptedIdentifier,
-      user_agent, dispositivo, navegador, sistema_operativo, ubicacion: null,
-      exito: false, mensaje_error: error.message
+      id_usuario: null,
+      id_sesion: null,
+      ip_origen,
+      nombre_usuario_intentado: resolvedEmail || attemptedIdentifier,
+      user_agent,
+      dispositivo,
+      navegador,
+      sistema_operativo,
+      ubicacion: null,
+      exito: false,
+      mensaje_error: isNotVerified ? 'Email no verificado' : 'Credenciales invalidas'
     }).catch(() => {});
-    return res.status(401).json({ error: true, message: 'Credenciales inválidas' });
+
+    if (isNotVerified) {
+      return apiError(res, 403, {
+        code: 'EMAIL_NOT_VERIFIED',
+        message: 'Debes verificar tu correo antes de iniciar sesion.'
+      });
+    }
+
+    return apiError(res, 401, {
+      code: 'INVALID_CREDENTIALS',
+      message: 'Credenciales invalidas.'
+    });
   }
 });
 
 // ── POST /api/public/forgot-password ─────────────────────────────────
 router.post('/api/public/forgot-password', forgotPasswordLimiter, async (req, res) => {
-  const { email } = req.body;
+  const email = normalizeEmail(req.body?.email);
   if (!email) {
     return res.status(400).json({ error: true, message: 'Email requerido' });
   }
@@ -450,8 +1142,16 @@ router.post('/api/public/forgot-password', forgotPasswordLimiter, async (req, re
 
     // Generar link de recuperación vía Supabase Admin API y enviar por SMTP propio
     try {
+      const frontendOrigin = resolveFrontendOrigin(req);
+      const redirectTo =
+        buildUrlWithParams(frontendOrigin, '/reset-password') ||
+        (IS_PRODUCTION ? '' : buildUrlWithParams('http://localhost:5173', '/reset-password'));
+
+      if (!redirectTo) {
+        throw new Error('FRONTEND_ORIGIN_NOT_CONFIGURED');
+      }
       const linkData = await generarLinkSupabase('recovery', email, {
-        redirect_to: `${FRONTEND_ORIGIN}/reset-password`
+        redirect_to: redirectTo
       });
       const actionLink = linkData.action_link || linkData.properties?.action_link;
 
@@ -471,6 +1171,62 @@ router.post('/api/public/forgot-password', forgotPasswordLimiter, async (req, re
   }
 });
 
+// ── POST /api/public/reset-password ───────────────────────────────────────────
+router.post('/api/public/reset-password', forgotPasswordLimiter, async (req, res) => {
+  const accessToken = normalizeIdentifier(req.body?.access_token);
+  const nuevaClave = String(req.body?.nueva_clave || '');
+
+  if (!accessToken || !nuevaClave) {
+    return res.status(400).json({ error: true, message: 'Token y nueva contraseña son requeridos.' });
+  }
+
+  const passwordPolicyError = validatePasswordPolicy(nuevaClave);
+  if (passwordPolicyError) {
+    return res.status(400).json({ error: true, message: passwordPolicyError });
+  }
+
+  try {
+    const anonKey = process.env.SUPABASE_ANON_KEY || SUPABASE_SERVICE_KEY;
+    const updateRes = await fetch(`${SUPABASE_URL}/auth/v1/user`, {
+      method: 'PUT',
+      headers: {
+        'Content-Type': 'application/json',
+        apikey: anonKey,
+        Authorization: `Bearer ${accessToken}`
+      },
+      body: JSON.stringify({ password: nuevaClave })
+    });
+
+    const updateData = await updateRes.json().catch(() => ({}));
+    if (!updateRes.ok) {
+      return res.status(400).json({
+        error: true,
+        message: 'El enlace de recuperación no es válido o expiró.'
+      });
+    }
+
+    const authUserId = updateData?.id;
+    if (authUserId) {
+      const userRes = await pool.query(
+        `SELECT ia.id_usuario
+         FROM identidades_auth ia
+         WHERE ia.auth_user_id = $1
+         LIMIT 1`,
+        [authUserId]
+      );
+
+      if (userRes.rows.length > 0) {
+        await closeAllUserSessions(userRes.rows[0].id_usuario, 'password_reset').catch(() => {});
+      }
+    }
+
+    return res.json({ message: 'Contraseña actualizada correctamente.' });
+  } catch (_error) {
+    console.error('[public/reset-password] Failed to reset password');
+    return res.status(500).json({ error: true, message: 'No se pudo restablecer la contraseña.' });
+  }
+});
+
 // ── POST /api/public/verify-email ────────────────────────────────────
 /**
  * Soporta dos flujos:
@@ -478,21 +1234,98 @@ router.post('/api/public/forgot-password', forgotPasswordLimiter, async (req, re
  *    de sesión. Solo necesitamos activar el usuario local.
  * B) token_hash + type: Flujo manual donde enviamos el token a Supabase para verificar.
  */
-router.post('/api/public/verify-email', async (req, res) => {
-  const { token_hash, type, access_token } = req.body;
-
-  // Validar que venga al menos un forma de verificación
-  if (!access_token && (!token_hash || !type)) {
-    return res.status(400).json({ error: true, message: 'Se requiere access_token o (token_hash + type)' });
-  }
+router.get('/api/public/verify-email-link', async (req, res) => {
+  const token = normalizeIdentifier(req.query?.token ?? req.query?.verify_token);
+  const frontendOrigin = resolveFrontendOrigin(req);
+  const loginVerifiedUrl = buildUrlWithParams(frontendOrigin, '/auth/login', { verified: 1 });
 
   try {
+    const tokenResult = await activateAccountFromVerificationToken(token);
+    if (!tokenResult.ok) {
+      if (loginVerifiedUrl) {
+        const retryUrl = buildUrlWithParams(frontendOrigin, '/auth/login', {
+          verify_error: tokenResult.code || 'INVALID_TOKEN'
+        });
+        if (retryUrl) return res.redirect(302, retryUrl);
+      }
+
+      return res.status(tokenResult.status || 400).type('html').send(`
+        <!DOCTYPE html>
+        <html lang="es">
+          <head><meta charset="utf-8"><title>Verificacion de cuenta</title></head>
+          <body style="font-family:Arial,sans-serif;padding:24px;">
+            <h2>No se pudo verificar el correo</h2>
+            <p>${tokenResult.message || 'El token no es valido o ya expiro.'}</p>
+          </body>
+        </html>
+      `);
+    }
+
+    if (loginVerifiedUrl) {
+      return res.redirect(302, loginVerifiedUrl);
+    }
+
+    return res.status(200).type('html').send(`
+      <!DOCTYPE html>
+      <html lang="es">
+        <head><meta charset="utf-8"><title>Cuenta verificada</title></head>
+        <body style="font-family:Arial,sans-serif;padding:24px;">
+          <h2>Cuenta verificada correctamente</h2>
+          <p>Ya puedes iniciar sesion.</p>
+        </body>
+      </html>
+    `);
+  } catch (error) {
+    console.error('[public/verify-email-link] Error:', error);
+    return res.status(500).type('html').send(`
+      <!DOCTYPE html>
+      <html lang="es">
+        <head><meta charset="utf-8"><title>Error de verificacion</title></head>
+        <body style="font-family:Arial,sans-serif;padding:24px;">
+          <h2>Error al verificar el correo</h2>
+          <p>Intenta de nuevo mas tarde.</p>
+        </body>
+      </html>
+    `);
+  }
+});
+
+router.post('/api/public/verify-email', async (req, res) => {
+  const token = normalizeIdentifier(req.body?.token ?? req.body?.verify_token);
+  const { token_hash, type, access_token } = req.body || {};
+
+  try {
+    await ensureVerificationTokenTable();
+
+    if (token) {
+      const tokenResult = await activateAccountFromVerificationToken(token);
+      if (!tokenResult.ok) {
+        return apiError(res, tokenResult.status, {
+          code: tokenResult.code,
+          message: tokenResult.message,
+          field: tokenResult.field || 'token'
+        });
+      }
+      return apiSuccess(res, tokenResult.status || 200, {
+        code: tokenResult.code || 'EMAIL_VERIFIED',
+        message: tokenResult.message || 'Email verificado exitosamente.',
+        verified: true
+      });
+    }
+
+    if (!access_token && (!token_hash || !type)) {
+      return apiError(res, 400, {
+        code: 'VALIDATION_ERROR',
+        message: 'Se requiere token o (access_token) o (token_hash + type).'
+      });
+    }
+
     const anonKey = process.env.SUPABASE_ANON_KEY || SUPABASE_SERVICE_KEY;
     let authUserId = null;
     let email = null;
+    let supabaseUserPayload = null;
 
     if (access_token) {
-      // ── Flujo A: access_token ya válido (Supabase ya confirmó el email) ───
       const userRes = await fetch(`${SUPABASE_URL}/auth/v1/user`, {
         headers: {
           apikey: anonKey,
@@ -501,65 +1334,95 @@ router.post('/api/public/verify-email', async (req, res) => {
       });
 
       if (!userRes.ok) {
-        return res.status(400).json({ error: true, message: 'Token de verificación inválido o expirado' });
+        return apiError(res, 400, {
+          code: 'INVALID_TOKEN',
+          message: 'Token de verificacion invalido o expirado.',
+          field: 'access_token'
+        });
       }
 
       const userData = await userRes.json();
       authUserId = userData.id;
       email = userData.email;
+      supabaseUserPayload = userData;
     } else {
-      // ── Flujo B: token_hash + type ───────────────────────────
       const verifyRes = await fetch(
         `${SUPABASE_URL}/auth/v1/verify?token=${token_hash}&type=${type}`,
         { method: 'GET', headers: { apikey: anonKey } }
       );
 
       if (!verifyRes.ok) {
-        return res.status(400).json({ error: true, message: 'Token inválido o expirado' });
+        return apiError(res, 400, {
+          code: 'INVALID_TOKEN',
+          message: 'Token invalido o expirado.',
+          field: 'token_hash'
+        });
       }
 
       const verifyData = await verifyRes.json();
       authUserId = verifyData?.user?.id || verifyData?.id;
       email = verifyData?.user?.email || verifyData?.email;
+      supabaseUserPayload = verifyData?.user || verifyData || null;
     }
 
-    if (!authUserId && !email) {
-      return res.status(400).json({ error: true, message: 'No se pudo identificar al usuario verificado' });
-    }
-
-    // Buscar identidad local
     const identQuery = authUserId
       ? await pool.query(`SELECT id_usuario FROM identidades_auth WHERE auth_user_id = $1 LIMIT 1`, [authUserId])
       : await pool.query(`SELECT id_usuario FROM identidades_auth WHERE email_login = $1 LIMIT 1`, [email]);
 
-    if (identQuery.rows.length === 0) {
-      console.warn('[verify-email] No se encontró identidad local para:', authUserId || email);
-      // Aun así respondemos OK para no bloquear si Supabase ya validó
-      return res.json({ message: 'Email verificado. Inicia sesión para continuar.', verified: true });
+    let id_usuario = identQuery.rows[0]?.id_usuario || null;
+
+    if (!id_usuario) {
+      if (!authUserId || !email) {
+        return apiSuccess(res, 200, {
+          message: 'Email verificado. Inicia sesion para continuar.',
+          verified: true
+        });
+      }
+
+      const client = await pool.connect();
+      try {
+        await client.query('BEGIN');
+        const profile = resolveSupabaseProfile({ email, userData: supabaseUserPayload });
+        const createdAccount = await createLocalClienteAccount(client, {
+          email,
+          authUserId,
+          nombre: profile.nombre,
+          apellido: profile.apellido,
+          genero: profile.genero,
+          provider: 'email',
+          emailVerificado: true,
+          estadoUsuario: true,
+          passwordMarker: 'SUPABASE_AUTH'
+        });
+        id_usuario = createdAccount.id_usuario;
+        await client.query('COMMIT');
+      } catch (creationError) {
+        await client.query('ROLLBACK').catch(() => {});
+        throw creationError;
+      } finally {
+        client.release();
+      }
     }
 
-    const id_usuario = identQuery.rows[0].id_usuario;
-
-    // Activar usuario y marcar email como verificado en BD local
     await pool.query(`UPDATE usuarios SET estado = true WHERE id_usuario = $1`, [id_usuario]);
     await pool.query(
       `UPDATE identidades_auth SET email_verificado = true, ultima_autenticacion = NOW() WHERE id_usuario = $1`,
       [id_usuario]
     );
 
-    console.log(`[verify-email] Usuario ${id_usuario} activado correctamente`);
-
-    return res.json({
-      message: 'Email verificado exitosamente. Ya puedes iniciar sesión.',
+    return apiSuccess(res, 200, {
+      message: 'Email verificado exitosamente. Ya puedes iniciar sesion.',
       verified: true
     });
   } catch (error) {
     console.error('[public/verify-email] Error:', error);
-    return res.status(500).json({ error: true, message: 'Error al verificar email' });
+    return apiError(res, 500, {
+      code: 'VERIFY_EMAIL_FAILED',
+      message: 'Error al verificar email',
+      details: process.env.NODE_ENV === 'development' ? String(error?.message || error) : null
+    });
   }
 });
-
-// ── POST /api/public/google-callback ─────────────────────────────────
 router.post('/api/public/google-callback', async (req, res) => {
   const { access_token, refresh_token } = req.body;
   if (!access_token) {
@@ -586,8 +1449,7 @@ router.post('/api/public/google-callback', async (req, res) => {
     const supaUser = await userRes.json();
     const auth_user_id = supaUser.id;
     const email = supaUser.email;
-    const fullName = supaUser.user_metadata?.full_name || supaUser.user_metadata?.name || '';
-    const [nombre = '', apellido = ''] = fullName.split(' ', 2);
+    const profile = resolveSupabaseProfile({ email, userData: supaUser });
 
     // Buscar si ya existe identidad local
     const identRes = await pool.query(
@@ -610,60 +1472,18 @@ router.post('/api/public/google-callback', async (req, res) => {
       try {
         await client.query('BEGIN');
 
-        let id_persona = null;
-        if (nombre) {
-          const personaRes = await client.query(
-            `INSERT INTO personas (nombre, apellido) VALUES ($1, $2) RETURNING id_persona`,
-            [nombre, apellido]
-          );
-          id_persona = personaRes.rows[0]?.id_persona ?? null;
-        }
-
-        const id_cliente = await insertarClienteSeguro(client, id_persona);
-        if (!Number.isInteger(Number(id_cliente)) || Number(id_cliente) <= 0) {
-          throw new Error('CLIENT_INSERT_FAILED');
-        }
-
-        const usuarioInsert = await client.query(
-          `INSERT INTO usuarios (nombre_usuario, clave, estado, tipo_usuario, id_cliente, must_change_password)
-           VALUES ($1, 'GOOGLE_AUTH', true, 'CLIENTE', $2, false) RETURNING id_usuario`,
-          [email, id_cliente]
-        );
-        id_usuario = usuarioInsert.rows[0].id_usuario;
-
-        const rolRes = await client.query(`SELECT id_rol FROM roles WHERE nombre = 'Cliente' LIMIT 1`);
-        if (rolRes.rows.length > 0) {
-          await client.query(
-            `INSERT INTO roles_usuarios (id_rol, id_usuario) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
-            [rolRes.rows[0].id_rol, id_usuario]
-          );
-        }
-
-        if (id_cliente) {
-          await client.query(
-            `
-              INSERT INTO usuarios_clientes (
-                id_usuario,
-                id_cliente,
-                estado,
-                fecha_vinculacion,
-                fecha_actualizacion
-              )
-              VALUES ($1, $2, true, NOW(), NOW())
-              ON CONFLICT (id_usuario, id_cliente) DO UPDATE
-              SET
-                estado = true,
-                fecha_actualizacion = NOW()
-            `,
-            [id_usuario, id_cliente]
-          );
-        }
-
-        await client.query(
-          `INSERT INTO identidades_auth (id_usuario, auth_user_id, provider, email_login, email_verificado, activo)
-           VALUES ($1, $2, 'google', $3, true, true)`,
-          [id_usuario, auth_user_id, email]
-        );
+        const createdAccount = await createLocalClienteAccount(client, {
+          email,
+          authUserId: auth_user_id,
+          nombre: profile.nombre,
+          apellido: profile.apellido,
+          genero: profile.genero,
+          provider: 'google',
+          emailVerificado: true,
+          estadoUsuario: true,
+          passwordMarker: 'GOOGLE_AUTH'
+        });
+        id_usuario = createdAccount.id_usuario;
 
         await client.query('COMMIT');
       } catch (err) {
@@ -675,11 +1495,7 @@ router.post('/api/public/google-callback', async (req, res) => {
     }
 
     // Emitir sesión y JWT
-    const usuarioRes2 = await pool.query(
-      `SELECT id_usuario, nombre_usuario, tipo_usuario, id_cliente, estado, must_change_password FROM usuarios WHERE id_usuario = $1`,
-      [id_usuario]
-    );
-    const usuario = usuarioRes2.rows[0];
+    const usuario = await getClienteUsuarioById(id_usuario);
 
     const id_sesion = await createSession({
       id_usuario, ip_origen, user_agent, dispositivo, navegador, sistema_operativo, ubicacion: null
@@ -710,63 +1526,22 @@ router.post('/api/public/google-callback', async (req, res) => {
   }
 });
 
-// ── GET /api/public/menu ──────────────────────────────────────────────
+// ── LEGACY DEPRECATED: /api/public/menu* ──────────────────────────────
+// Flujo oficial activo: /api/public-menu/*
 router.get('/api/public/menu', async (_req, res) => {
-  try {
-    const result = await pool.query(`
-      SELECT
-        m.id_menu,
-        m.nombre,
-        m.descripcion,
-        m.precio,
-        m.id_sucursal,
-        a.url_publica AS imagen_url,
-        cm.nombre AS categoria
-      FROM menu m
-      LEFT JOIN archivos a ON a.id_archivo = m.id_archivo
-      LEFT JOIN categorias_productos cm ON cm.id_categoria_producto = m.id_categoria_producto
-      WHERE m.disponible = true OR m.disponible IS NULL
-      ORDER BY cm.nombre, m.nombre
-    `);
-    return res.json({ menu: result.rows });
-  } catch (error) {
-    console.error('[public/menu] Error:', error);
-    return res.status(500).json({ error: true, message: 'Error al cargar el menú' });
-  }
+  return res.status(410).json({
+    error: true,
+    code: 'PUBLIC_MENU_LEGACY_DEPRECATED',
+    message: 'Este endpoint fue descontinuado. Usa /api/public-menu/catalogo con id_sucursal y tipo_pedido.'
+  });
 });
 
-// ── GET /api/public/menu/:id ──────────────────────────────────────────
-router.get('/api/public/menu/:id', async (req, res) => {
-  const id = Number.parseInt(req.params.id, 10);
-  if (!Number.isInteger(id) || id <= 0) {
-    return res.status(400).json({ error: true, message: 'ID inválido' });
-  }
-
-  try {
-    const result = await pool.query(`
-      SELECT
-        m.id_menu,
-        m.nombre,
-        m.descripcion,
-        m.precio,
-        m.id_sucursal,
-        a.url_publica AS imagen_url,
-        cm.nombre AS categoria
-      FROM menu m
-      LEFT JOIN archivos a ON a.id_archivo = m.id_archivo
-      LEFT JOIN categorias_productos cm ON cm.id_categoria_producto = m.id_categoria_producto
-      WHERE m.id_menu = $1
-    `, [id]);
-
-    if (result.rows.length === 0) {
-      return res.status(404).json({ error: true, message: 'Ítem no encontrado' });
-    }
-
-    return res.json({ item: result.rows[0] });
-  } catch (error) {
-    console.error('[public/menu/:id] Error:', error);
-    return res.status(500).json({ error: true, message: 'Error al cargar el ítem' });
-  }
+router.get('/api/public/menu/:id', async (_req, res) => {
+  return res.status(410).json({
+    error: true,
+    code: 'PUBLIC_MENU_LEGACY_DEPRECATED',
+    message: 'Este endpoint fue descontinuado. Usa /api/public-menu/items/:id_detalle_menu con id_sucursal.'
+  });
 });
 
 export default router;

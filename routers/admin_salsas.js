@@ -1,15 +1,14 @@
 ﻿import express from 'express';
 import pool from '../config/db-connection.js';
+import { checkPermission } from '../middleware/checkPermission.js';
 
 const router = express.Router();
+const MENU_VIEW_PERMISSIONS = ['MENU_VER'];
+const MENU_MUTATION_PERMISSIONS = ['MENU_VER'];
 
 const columnMetaCache = new Map();
 
 const getSafeServerErrorMessage = (error, fallback = 'Error interno del servidor.') => {
-  if (!error) return fallback;
-  if (typeof error.message === 'string' && error.message.trim()) {
-    return error.message.trim();
-  }
   return fallback;
 };
 
@@ -54,6 +53,9 @@ const toPositiveInt = (value) => {
   const parsed = Number(value);
   return Number.isInteger(parsed) && parsed > 0 ? parsed : null;
 };
+
+// Seguridad: el actor se resuelve siempre desde el token autenticado.
+const resolveActorUserId = (req) => toPositiveInt(req?.user?.id_usuario);
 
 const toIntOrNull = (value, options = {}) => {
   if (value === undefined || value === null || value === '') {
@@ -127,16 +129,6 @@ const buildInsertStatement = ({ tableName, data = {}, raw = {}, returning = '' }
     text: `INSERT INTO ${tableName} (${columns.join(', ')}) VALUES (${placeholders.join(', ')})${returningClause};`,
     params
   };
-};
-
-const getFallbackUserId = async () => {
-  const usuariosTieneEstado = await hasColumn('usuarios', 'estado');
-  const result = await pool.query(
-    usuariosTieneEstado
-      ? 'SELECT id_usuario FROM usuarios WHERE COALESCE(estado, true) = true ORDER BY id_usuario LIMIT 1;'
-      : 'SELECT id_usuario FROM usuarios ORDER BY id_usuario LIMIT 1;'
-  );
-  return toPositiveInt(result.rows?.[0]?.id_usuario);
 };
 
 const ensureUsuarioExists = async (idUsuario) => {
@@ -241,7 +233,7 @@ const normalizeRulesPayload = (rows) => {
   return { ok: true, data: normalized };
 };
 
-router.get('/', async (req, res) => {
+router.get('/', checkPermission(MENU_VIEW_PERMISSIONS), async (req, res) => {
   try {
     const [salsasTieneEstado, salsasTieneNivelPicante, salsasTieneOrden] = await Promise.all([
       hasColumn('salsas', 'estado'),
@@ -275,7 +267,7 @@ router.get('/', async (req, res) => {
   }
 });
 
-router.get('/catalogos/recetas', async (req, res) => {
+router.get('/catalogos/recetas', checkPermission(MENU_VIEW_PERMISSIONS), async (req, res) => {
   try {
     const recetasTieneEstado = await hasColumn('recetas', 'estado');
     const result = await pool.query(
@@ -297,7 +289,7 @@ router.get('/catalogos/recetas', async (req, res) => {
   }
 });
 
-router.get('/recetas/:id_receta/config', async (req, res) => {
+router.get('/recetas/:id_receta/config', checkPermission(MENU_VIEW_PERMISSIONS), async (req, res) => {
   try {
     const idReceta = toPositiveInt(req.params.id_receta);
     if (!idReceta) {
@@ -377,9 +369,17 @@ router.get('/recetas/:id_receta/config', async (req, res) => {
   }
 });
 
-router.post('/', async (req, res) => {
+router.post('/', checkPermission(MENU_MUTATION_PERMISSIONS), async (req, res) => {
   try {
-    const normalizacion = normalizeSalsaPayload(req.body, { partial: false });
+    const actorUserId = resolveActorUserId(req);
+    if (!actorUserId) {
+      return res.status(401).json({ error: true, message: 'Sesion invalida. Vuelve a iniciar sesion.' });
+    }
+
+    // Transicion segura: id_usuario del cliente se ignora silenciosamente.
+    const payloadSinUsuario = { ...(req.body || {}) };
+    delete payloadSinUsuario.id_usuario;
+    const normalizacion = normalizeSalsaPayload(payloadSinUsuario, { partial: false });
     if (!normalizacion.ok) {
       return res.status(400).json({ error: true, message: normalizacion.message });
     }
@@ -408,16 +408,8 @@ router.post('/', async (req, res) => {
       return res.status(409).json({ error: true, message: 'Ya existe una salsa activa con ese nombre.' });
     }
 
-    let resolvedUserId = data.id_usuario;
-    if (idUsuarioMeta.exists && !resolvedUserId) {
-      resolvedUserId = await getFallbackUserId();
-    }
-    if (idUsuarioMeta.exists && idUsuarioMeta.isNullable === false && !idUsuarioMeta.hasDefault && !resolvedUserId) {
-      return res.status(400).json({
-        error: true,
-        message: 'No se pudo resolver id_usuario para crear salsa. Envia id_usuario.'
-      });
-    }
+    // Transicion segura: id_usuario del cliente se ignora y se fuerza desde req.user.
+    let resolvedUserId = actorUserId;
     if (resolvedUserId) {
       const userExists = await ensureUsuarioExists(resolvedUserId);
       if (!userExists) {
@@ -459,8 +451,13 @@ router.post('/', async (req, res) => {
   }
 });
 
-router.put('/:id_salsa', async (req, res) => {
+router.put('/:id_salsa', checkPermission(MENU_MUTATION_PERMISSIONS), async (req, res) => {
   try {
+    const actorUserId = resolveActorUserId(req);
+    if (!actorUserId) {
+      return res.status(401).json({ error: true, message: 'Sesion invalida. Vuelve a iniciar sesion.' });
+    }
+
     const idSalsa = toPositiveInt(req.params.id_salsa);
     if (!idSalsa) {
       return res.status(400).json({ error: true, message: 'id_salsa invalido.' });
@@ -471,7 +468,10 @@ router.put('/:id_salsa', async (req, res) => {
       return res.status(404).json({ error: true, message: 'Salsa no encontrada.' });
     }
 
-    const normalizacion = normalizeSalsaPayload(req.body, { partial: false });
+    // Transicion segura: id_usuario del cliente se ignora silenciosamente.
+    const payloadSinUsuario = { ...(req.body || {}) };
+    delete payloadSinUsuario.id_usuario;
+    const normalizacion = normalizeSalsaPayload(payloadSinUsuario, { partial: false });
     if (!normalizacion.ok) {
       return res.status(400).json({ error: true, message: normalizacion.message });
     }
@@ -500,7 +500,8 @@ router.put('/:id_salsa', async (req, res) => {
       return res.status(409).json({ error: true, message: 'Ya existe otra salsa activa con ese nombre.' });
     }
 
-    let resolvedUserId = data.id_usuario;
+    // Transicion segura: id_usuario del cliente se ignora y se fuerza desde req.user.
+    let resolvedUserId = actorUserId;
     if (idUsuarioMeta.exists && resolvedUserId) {
       const userExists = await ensureUsuarioExists(resolvedUserId);
       if (!userExists) {
@@ -541,8 +542,13 @@ router.put('/:id_salsa', async (req, res) => {
   }
 });
 
-router.patch('/:id_salsa/estado', async (req, res) => {
+router.patch('/:id_salsa/estado', checkPermission(MENU_MUTATION_PERMISSIONS), async (req, res) => {
   try {
+    const actorUserId = resolveActorUserId(req);
+    if (!actorUserId) {
+      return res.status(401).json({ error: true, message: 'Sesion invalida. Vuelve a iniciar sesion.' });
+    }
+
     const idSalsa = toPositiveInt(req.params.id_salsa);
     if (!idSalsa) {
       return res.status(400).json({ error: true, message: 'id_salsa invalido.' });
@@ -568,7 +574,8 @@ router.patch('/:id_salsa/estado', async (req, res) => {
       return res.status(404).json({ error: true, message: 'Salsa no encontrada.' });
     }
 
-    let resolvedUserId = toPositiveInt(req.body?.id_usuario);
+    // Transicion segura: id_usuario del cliente se ignora y se fuerza desde req.user.
+    let resolvedUserId = actorUserId;
     if (idUsuarioMeta.exists && resolvedUserId) {
       const userExists = await ensureUsuarioExists(resolvedUserId);
       if (!userExists) {
@@ -604,10 +611,15 @@ router.patch('/:id_salsa/estado', async (req, res) => {
   }
 });
 
-router.put('/recetas/:id_receta/config', async (req, res) => {
+router.put('/recetas/:id_receta/config', checkPermission(MENU_MUTATION_PERMISSIONS), async (req, res) => {
   const client = await pool.connect();
 
   try {
+    const actorUserId = resolveActorUserId(req);
+    if (!actorUserId) {
+      return res.status(401).json({ error: true, message: 'Sesion invalida. Vuelve a iniciar sesion.' });
+    }
+
     const idReceta = toPositiveInt(req.params.id_receta);
     if (!idReceta) {
       return res.status(400).json({ error: true, message: 'id_receta invalido.' });
@@ -663,10 +675,8 @@ router.put('/recetas/:id_receta/config', async (req, res) => {
       }
     }
 
-    let resolvedUserId = toPositiveInt(req.body?.id_usuario);
-    if (!resolvedUserId && (recetaSalsaTieneUsuario || reglasTieneUsuario)) {
-      resolvedUserId = await getFallbackUserId();
-    }
+    // Transicion segura: id_usuario del cliente se ignora y se fuerza desde req.user.
+    let resolvedUserId = actorUserId;
     if ((recetaSalsaTieneUsuario || reglasTieneUsuario) && resolvedUserId) {
       const userExists = await ensureUsuarioExists(resolvedUserId);
       if (!userExists) {
@@ -750,4 +760,7 @@ router.put('/recetas/:id_receta/config', async (req, res) => {
 });
 
 export default router;
+
+
+
 

@@ -4,10 +4,13 @@ import { sendPublicMenuClientError } from './publicMenuResponse.js';
 // Mantiene parsing de parametros en un solo lugar para evitar duplicaciones en controladores.
 
 const PUBLIC_ORDER_TYPES = new Set(['dine-in', 'pickup', 'delivery']);
-const ORDER_TYPES_REQUIRING_TRANSFER_PROOF = new Set(['pickup', 'delivery']);
+const ORDER_TYPES_REQUIRING_TRANSFER_PROOF = new Set(['delivery']);
 const TRANSFER_METHOD_ALIASES = new Set(['transferencia', 'transferencia_bancaria', 'transfer']);
+const CASH_METHOD_ALIASES = new Set(['caja', 'efectivo', 'cash']);
 const MAX_ORDER_TEXT = Object.freeze({
   ORIGEN: 60,
+  IDEMPOTENCY_KEY: 120,
+  DINE_IN_TABLE: 40,
   CONTACT_NAME: 120,
   CONTACT_PHONE: 30,
   DELIVERY_ADDRESS: 240,
@@ -41,6 +44,11 @@ const normalizeCompactText = (value, maxLength) => {
   return clean.slice(0, maxLength);
 };
 
+const normalizeIdempotencyKey = (value) =>
+  normalizeCompactText(value, MAX_ORDER_TEXT.IDEMPOTENCY_KEY)
+    .toLowerCase()
+    .replace(/[^a-z0-9:_-]/g, '');
+
 const normalizeTransferMethod = (value) => {
   const clean = normalizeCompactText(value, 40).toLowerCase();
   if (!clean) return '';
@@ -54,6 +62,7 @@ const normalizeOrderBusinessContext = ({ body, tipoPedido }) => {
   const contactoRaw = body?.contacto && typeof body.contacto === 'object' ? body.contacto : {};
   const entregaRaw = body?.entrega && typeof body.entrega === 'object' ? body.entrega : {};
   const pagoRaw = body?.pago && typeof body.pago === 'object' ? body.pago : {};
+  const servicioRaw = body?.servicio && typeof body.servicio === 'object' ? body.servicio : {};
 
   const contacto = {
     nombre: normalizeCompactText(
@@ -88,16 +97,23 @@ const normalizeOrderBusinessContext = ({ body, tipoPedido }) => {
     )
   };
 
-  // Regla de negocio: pickup/delivery requieren comprobante de transferencia.
+  const servicio = {
+    mesa: normalizeCompactText(
+      servicioRaw.mesa ?? body?.mesa,
+      MAX_ORDER_TEXT.DINE_IN_TABLE
+    )
+  };
+
+  // Regla de negocio: delivery requiere comprobante de transferencia.
   const requiresTransferProof = ORDER_TYPES_REQUIRING_TRANSFER_PROOF.has(tipoPedido);
   if (requiresTransferProof && !pago.comprobante_transferencia) {
     return {
-      error: 'Debes adjuntar referencia o comprobante de transferencia para pickup y delivery.'
+      error: 'Debes adjuntar referencia o comprobante de transferencia para delivery.'
     };
   }
 
-  // Regla de negocio: pickup/delivery exigen al menos un telefono de contacto.
-  if (requiresTransferProof && !contacto.telefono) {
+  // Regla de negocio: pickup y delivery exigen telefono de contacto.
+  if ((tipoPedido === 'pickup' || tipoPedido === 'delivery') && !contacto.telefono) {
     return {
       error: 'Debes enviar telefono de contacto para pickup y delivery.'
     };
@@ -110,13 +126,37 @@ const normalizeOrderBusinessContext = ({ body, tipoPedido }) => {
     };
   }
 
-  if (requiresTransferProof && pago.metodo && !TRANSFER_METHOD_ALIASES.has(pago.metodo)) {
+  // Regla de negocio: delivery exige referencia para ubicacion precisa.
+  if (tipoPedido === 'delivery' && !entrega.referencia) {
     return {
-      error: 'metodo_pago invalido para pickup/delivery. Usa transferencia.'
+      error: 'Debes enviar referencia de entrega para pedidos delivery.'
     };
   }
 
-  if (requiresTransferProof && !pago.metodo) {
+  if (tipoPedido === 'pickup' && !pago.metodo) {
+    return {
+      error: 'Debes seleccionar metodo_pago para pickup: caja o transferencia.'
+    };
+  }
+
+  if (
+    tipoPedido === 'pickup' &&
+    pago.metodo &&
+    !TRANSFER_METHOD_ALIASES.has(pago.metodo) &&
+    !CASH_METHOD_ALIASES.has(pago.metodo)
+  ) {
+    return {
+      error: 'metodo_pago invalido para pickup. Usa caja o transferencia.'
+    };
+  }
+
+  if (tipoPedido === 'delivery' && pago.metodo && !TRANSFER_METHOD_ALIASES.has(pago.metodo)) {
+    return {
+      error: 'metodo_pago invalido para delivery. Usa transferencia.'
+    };
+  }
+
+  if (tipoPedido === 'delivery' && !pago.metodo) {
     pago.metodo = 'transferencia';
   }
 
@@ -124,7 +164,8 @@ const normalizeOrderBusinessContext = ({ body, tipoPedido }) => {
     data: {
       contacto,
       entrega,
-      pago
+      pago,
+      servicio
     }
   };
 };
@@ -212,6 +253,7 @@ export const validateCreateOrderBody = (req, res, next) => {
   const idSucursal = toPositiveInt(body.id_sucursal);
   const tipoPedido = String(body.tipo_pedido || '').trim().toLowerCase();
   const origen = normalizeCompactText(body.origen || 'public-menu', MAX_ORDER_TEXT.ORIGEN) || 'public-menu';
+  const idempotencyKey = normalizeIdempotencyKey(body.idempotency_key);
   const rawItems = Array.isArray(body.items) ? body.items : [];
 
   if (!idSucursal) {
@@ -220,6 +262,14 @@ export const validateCreateOrderBody = (req, res, next) => {
 
   if (!tipoPedido || !PUBLIC_ORDER_TYPES.has(tipoPedido)) {
     return sendValidationError(req, res, 'tipo_pedido invalido. Valores permitidos: dine-in, pickup, delivery.');
+  }
+
+  if (!idempotencyKey || idempotencyKey.length < 12) {
+    return sendValidationError(
+      req,
+      res,
+      'idempotency_key es obligatorio y debe tener al menos 12 caracteres validos.'
+    );
   }
 
   if (rawItems.length === 0) {
@@ -278,10 +328,12 @@ export const validateCreateOrderBody = (req, res, next) => {
     idSucursal,
     tipoPedido,
     origen,
+    idempotencyKey,
     business: businessContextResult?.data || {
       contacto: { nombre: '', telefono: '' },
       entrega: { direccion: '', referencia: '' },
-      pago: { metodo: '', comprobante_transferencia: '' }
+      pago: { metodo: '', comprobante_transferencia: '' },
+      servicio: { mesa: '' }
     },
     items
   };

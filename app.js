@@ -52,11 +52,13 @@ import seguridadLoginsRoutes from './routers/Seguridad/logins.js';
 import seguridadPermisosRoutes from './routers/Seguridad/permisos.js';
 import seguridadUsuariosRoutes from './routers/Seguridad/usuarios.js';
 import seguridadDashboardRoutes from './routers/Seguridad/dashboard.js';
+import seguridadNotificacionesRoutes from './routers/Seguridad/notificaciones.js';
 import { globalAuditMiddleware } from './routers/Seguridad/globalAuditInterceptor.js';
 import rolesPermisosRoutes from './routers/roles_permisos.js';
 
 import archivosRoutes from './routers/archivos.js';
 import adminRecetasRouter from './routers/admin_recetas.js';
+import adminExtrasRouter from './routers/admin_extras.js';
 import adminCombosRouter from './routers/admin_combos.js';
 import adminMenuPublicacionRouter from './routers/admin_menu_publicacion.js';
 import adminSalsasRouter from './routers/admin_salsas.js';
@@ -187,6 +189,8 @@ app.use(emailCampaignRoutes);
 
 // Admin: CRUD de recetas para panel administrativo (rutas relativas en router).
 app.use('/api/admin/recetas', adminRecetasRouter);
+// Admin: CRUD de extras opcionales del menu.
+app.use('/api/admin/extras', adminExtrasRouter);
 // Admin: CRUD de combos para panel administrativo (rutas relativas en router).
 app.use('/api/admin/combos', adminCombosRouter);
 // Admin: publicacion de menu por sucursal (visible, precio_publico y orden).
@@ -201,6 +205,7 @@ app.use('/seguridad', seguridadLoginsRoutes);
 app.use('/seguridad', seguridadPermisosRoutes);
 app.use('/seguridad', seguridadUsuariosRoutes);
 app.use('/seguridad', seguridadDashboardRoutes);
+app.use('/seguridad', seguridadNotificacionesRoutes);
 app.use('/api/security', seguridadDashboardRoutes);
 app.use('/api/roles-permisos', rolesPermisosRoutes);
 

@@ -31,6 +31,27 @@ const hasColumn = async (tableName, columnName) => {
   return exists;
 };
 
+const hasTable = async (tableName) => {
+  const cacheKey = `table.${String(tableName || '').trim().toLowerCase()}`;
+  if (schemaColumnCache.has(cacheKey)) {
+    return schemaColumnCache.get(cacheKey);
+  }
+
+  const result = await pool.query(
+    `
+      SELECT 1
+      FROM information_schema.tables
+      WHERE table_schema = 'public'
+        AND table_name = $1
+      LIMIT 1;
+    `,
+    [tableName]
+  );
+  const exists = result.rowCount > 0;
+  schemaColumnCache.set(cacheKey, exists);
+  return exists;
+};
+
 // Lista sucursales activas para entrada publica del flujo.
 export const fetchPublicBranchesQuery = async () => {
   const query = `
@@ -112,7 +133,7 @@ export const fetchBranchOperationalSnapshotQuery = async ({
 };
 
 // Obtiene el menu vigente activo por sucursal (el mas reciente por fecha_inicio).
-export const fetchActiveMenuByBranchQuery = async (idSucursal) => {
+export const fetchActiveMenuByBranchQuery = async (idSucursal, db = pool) => {
   const query = `
     SELECT
       mv.id_menu_vigente,
@@ -136,7 +157,7 @@ export const fetchActiveMenuByBranchQuery = async (idSucursal) => {
     LIMIT 1;
   `;
 
-  const result = await pool.query(query, [idSucursal]);
+  const result = await db.query(query, [idSucursal]);
   return result.rows[0] || null;
 };
 
@@ -256,7 +277,7 @@ const buildCatalogSql = ({
 };
 
 // Lista todos los items publicados en detalle_menu para un menu especifico.
-export const fetchCatalogRowsByMenuQuery = async (idMenu) => {
+export const fetchCatalogRowsByMenuQuery = async (idMenu, db = pool) => {
   const [
     hasProductImageColumn,
     hasDetalleRecetaColumn,
@@ -278,12 +299,49 @@ export const fetchCatalogRowsByMenuQuery = async (idMenu) => {
     hasDetallePrecioPublicoColumn,
     hasDetalleVisibleColumn
   });
-  const result = await pool.query(query, [idMenu]);
+  const result = await db.query(query, [idMenu]);
+  return result.rows;
+};
+
+export const fetchPublicMenuExtrasByRecipeIdsQuery = async (recipeIds = [], db = pool) => {
+  const ids = [...new Set((Array.isArray(recipeIds) ? recipeIds : [])
+    .map((value) => Number.parseInt(String(value ?? ''), 10))
+    .filter((value) => Number.isInteger(value) && value > 0))];
+
+  if (ids.length === 0) return [];
+
+  const [hasExtrasTable, hasRecipeLinkTable] = await Promise.all([
+    hasTable('menu_extras'),
+    hasTable('menu_extra_receta')
+  ]);
+
+  if (!hasExtrasTable || !hasRecipeLinkTable) return [];
+
+  const result = await db.query(
+    `
+      SELECT
+        mer.id_receta,
+        me.id_extra,
+        me.codigo,
+        me.nombre,
+        me.precio_adicional,
+        COALESCE(mer.orden, me.orden, 0) AS orden
+      FROM menu_extra_receta mer
+      INNER JOIN menu_extras me
+        ON me.id_extra = mer.id_extra
+       AND COALESCE(me.estado, true) = true
+      WHERE mer.id_receta = ANY($1::int[])
+        AND COALESCE(mer.estado, true) = true
+      ORDER BY mer.id_receta ASC, COALESCE(mer.orden, me.orden, 2147483647), me.nombre ASC;
+    `,
+    [ids]
+  );
+
   return result.rows;
 };
 
 // Obtiene un item de detalle_menu validado por menu vigente/sucursal.
-export const fetchCatalogItemByIdQuery = async ({ idMenu, idDetalleMenu }) => {
+export const fetchCatalogItemByIdQuery = async ({ idMenu, idDetalleMenu }, db = pool) => {
   const [
     hasProductImageColumn,
     hasDetalleRecetaColumn,
@@ -308,12 +366,12 @@ export const fetchCatalogItemByIdQuery = async ({ idMenu, idDetalleMenu }) => {
     withLimit: true
   });
 
-  const result = await pool.query(query, [idMenu, idDetalleMenu]);
+  const result = await db.query(query, [idMenu, idDetalleMenu]);
   return result.rows[0] || null;
 };
 
 // Calcula disponibilidad por receta en base a detalle_recetas + insumos reales.
-export const fetchRecipeAvailabilityQuery = async (recipeIds = []) => {
+export const fetchRecipeAvailabilityQuery = async (recipeIds = [], db = pool) => {
   if (!Array.isArray(recipeIds) || recipeIds.length === 0) return [];
 
   const query = `
@@ -352,12 +410,12 @@ export const fetchRecipeAvailabilityQuery = async (recipeIds = []) => {
     WHERE r.id_receta = ANY($1::int[]);
   `;
 
-  const result = await pool.query(query, [recipeIds]);
+  const result = await db.query(query, [recipeIds]);
   return result.rows;
 };
 
 // Calcula disponibilidad por combo en base a sus recetas componentes y stock de insumos.
-export const fetchComboAvailabilityQuery = async (comboIds = []) => {
+export const fetchComboAvailabilityQuery = async (comboIds = [], db = pool) => {
   if (!Array.isArray(comboIds) || comboIds.length === 0) return [];
 
   const query = `
@@ -412,23 +470,23 @@ export const fetchComboAvailabilityQuery = async (comboIds = []) => {
     WHERE c.id_combo = ANY($1::int[]);
   `;
 
-  const result = await pool.query(query, [comboIds]);
+  const result = await db.query(query, [comboIds]);
   return result.rows;
 };
 
 // Catalogo de estados de pedido para resolver estado inicial en flujo publico.
-export const fetchEstadoPedidoRowsQuery = async () => {
-  const result = await pool.query(
+export const fetchEstadoPedidoRowsQuery = async (db = pool) => {
+  const result = await db.query(
     'SELECT id_estado_pedido, descripcion FROM estados_pedido ORDER BY id_estado_pedido'
   );
   return result.rows;
 };
 
 // Componentes receta por combo para calcular reglas de salsas por unidades reales.
-export const fetchComboRecipeComponentsQuery = async (comboIds = []) => {
+export const fetchComboRecipeComponentsQuery = async (comboIds = [], db = pool) => {
   if (!Array.isArray(comboIds) || comboIds.length === 0) return [];
 
-  const result = await pool.query(
+  const result = await db.query(
     `
       SELECT
         dc.id_combo,
@@ -451,10 +509,10 @@ export const fetchComboRecipeComponentsQuery = async (comboIds = []) => {
 };
 
 // Salsas permitidas por receta activa.
-export const fetchAllowedSauceRowsByRecipeIdsQuery = async (recipeIds = []) => {
+export const fetchAllowedSauceRowsByRecipeIdsQuery = async (recipeIds = [], db = pool) => {
   if (!Array.isArray(recipeIds) || recipeIds.length === 0) return [];
 
-  const result = await pool.query(
+  const result = await db.query(
     `
       SELECT
         rs.id_receta,
@@ -476,11 +534,31 @@ export const fetchAllowedSauceRowsByRecipeIdsQuery = async (recipeIds = []) => {
   return result.rows;
 };
 
+// Catalogo publico de salsas activas para fallback cuando una receta/combo exige salsas
+// pero no tiene mapeo puntual en receta_salsa.
+export const fetchPublicActiveSaucesQuery = async (db = pool) => {
+  const result = await db.query(
+    `
+      SELECT
+        s.id_salsa,
+        s.nombre,
+        s.nivel_picante,
+        s.orden,
+        true AS disponible
+      FROM salsas s
+      WHERE COALESCE(s.estado, true) = true
+      ORDER BY s.orden, s.nombre;
+    `
+  );
+
+  return result.rows;
+};
+
 // Reglas de cuantas salsas son requeridas por rango de unidades.
-export const fetchSauceRuleRowsByRecipeIdsQuery = async (recipeIds = []) => {
+export const fetchSauceRuleRowsByRecipeIdsQuery = async (recipeIds = [], db = pool) => {
   if (!Array.isArray(recipeIds) || recipeIds.length === 0) return [];
 
-  const result = await pool.query(
+  const result = await db.query(
     `
       SELECT
         id_regla,
@@ -521,6 +599,51 @@ export const fetchFallbackOrderUserIdQuery = async () => {
   return result.rows[0]?.id_usuario ? Number(result.rows[0].id_usuario) : null;
 };
 
+// Bloquea por llave de idempotencia dentro de la transaccion actual para evitar doble insercion concurrente.
+export const acquirePublicOrderIdempotencyLockQuery = async (client, { idCliente, idempotencyKey }) => {
+  await client.query(
+    `
+      SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2));
+    `,
+    [String(idCliente), String(idempotencyKey)]
+  );
+};
+
+// Busca un pedido ya creado con la misma llave de idempotencia para devolver respuesta estable en reintentos.
+export const fetchPedidoByIdempotencyKeyQuery = async (
+  client,
+  {
+    idCliente,
+    idSucursal,
+    idempotencyKey
+  }
+) => {
+  const result = await client.query(
+    `
+      SELECT
+        p.id_pedido,
+        p.fecha_hora_pedido,
+        p.validacion_pago_vence_at,
+        p.descripcion_pedido,
+        p.total
+      FROM pedidos p
+      WHERE p.id_cliente = $1
+        AND p.id_sucursal = $2
+        AND COALESCE(p.origen_pedido, 'MENU') = 'MENU'
+        AND p.descripcion_pedido ILIKE $3
+      ORDER BY p.id_pedido DESC
+      LIMIT 1;
+    `,
+    [
+      Number(idCliente),
+      Number(idSucursal),
+      `%idem:${String(idempotencyKey)}%`
+    ]
+  );
+
+  return result.rows[0] || null;
+};
+
 // Inserta cabecera de pedido publico y devuelve ID generado.
 export const insertPublicPedidoQuery = async (client, payload) => {
   const [hasEstadoPagoColumn, hasTipoEntregaColumn, hasValidacionPagoVenceAtColumn] = await Promise.all([
@@ -536,6 +659,10 @@ export const insertPublicPedidoQuery = async (client, payload) => {
     params.push(value);
     columns.push(column);
     values.push(`$${params.length}`);
+  };
+  const pushExpression = (column, expression) => {
+    columns.push(column);
+    values.push(expression);
   };
 
   // Base minima requerida para pedidos del menu publico.
@@ -560,7 +687,13 @@ export const insertPublicPedidoQuery = async (client, payload) => {
   }
 
   if (hasValidacionPagoVenceAtColumn) {
-    pushValue('validacion_pago_vence_at', payload.validacion_pago_vence_at || null);
+    // Usa hora del motor de BD para evitar desfases de zona horaria entre app y DB.
+    // Si viene valor explicito, lo respeta; si no, define ventana de 10 minutos en SQL.
+    if (payload.validacion_pago_vence_at) {
+      pushValue('validacion_pago_vence_at', payload.validacion_pago_vence_at);
+    } else {
+      pushExpression('validacion_pago_vence_at', "NOW() + INTERVAL '10 minutes'");
+    }
   }
 
   const result = await client.query(
