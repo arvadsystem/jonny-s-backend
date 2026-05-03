@@ -293,13 +293,20 @@ router.post('/archivos', checkPermission(ARCHIVOS_UPLOAD_PERMISSIONS), async (re
       });
     }
 
+    const contextoRaw = String(payload?.contexto || payload?.modulo || '').trim().toLowerCase();
+    if (contextoRaw === 'sucursales' && !['image/jpeg', 'image/png'].includes(effectiveMimeType)) {
+      return res.status(400).json({
+        ok: false,
+        message: 'Solo se permiten imagenes JPG o PNG para sucursales.'
+      });
+    }
+
     // 4. Generar nombre unico (UUID + Timestamp)
     const extension = allowedMimesForBucket[effectiveMimeType];
     const prefix = targetBucket === SUPABASE_ADMIN_BUCKET ? 'admin' : 'asset';
     const safeOriginalName = normalizeOriginalName(payload?.nombre_original ?? payload?.nombreOriginal, prefix);
     const uniqueFileName = `${safeOriginalName}-${Date.now()}-${crypto.randomUUID().slice(0, 8)}.${extension}`;
 
-    const contextoRaw = String(payload?.contexto || payload?.modulo || '').trim().toLowerCase();
     const subDir = targetBucket === SUPABASE_ADMIN_BUCKET
       ? ADMIN_UPLOADS_SUBDIR
       : contextoRaw === 'sucursales'

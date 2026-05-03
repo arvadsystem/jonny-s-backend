@@ -78,7 +78,27 @@ import catalogosRoutes from './routers/Parametros/catalogos.js';
 const app = express();
 const USUARIOS_PHOTO_JSON_LIMIT = '30mb';
 
-const FRONTEND_ORIGIN = process.env.FRONTEND_ORIGIN || 'http://localhost:5173';
+const DEFAULT_DEV_ORIGINS = [
+  'http://localhost:5173',
+  'http://127.0.0.1:5173'
+];
+
+const getAllowedOrigins = () => {
+  const envOrigins = String(process.env.FRONTEND_ORIGINS || '')
+    .split(',')
+    .map((origin) => origin.trim())
+    .filter(Boolean);
+
+  if (envOrigins.length > 0) return envOrigins;
+
+  const singleOrigin = String(process.env.FRONTEND_ORIGIN || '').trim();
+  if (singleOrigin) return [singleOrigin];
+
+  return DEFAULT_DEV_ORIGINS;
+};
+
+const allowedOrigins = getAllowedOrigins();
+const isAllowedOrigin = (origin) => allowedOrigins.includes(String(origin || '').trim());
 
 // ✅ (Opcional) proxy - no afecta el login
 app.set('trust proxy', 1);
@@ -87,7 +107,11 @@ app.set('trust proxy', 1);
 app.use(helmet());
 app.use(
   cors({
-    origin: FRONTEND_ORIGIN,
+    origin: (origin, callback) => {
+      if (!origin) return callback(null, true);
+      if (isAllowedOrigin(origin)) return callback(null, true);
+      return callback(new Error('Origen no permitido por CORS'));
+    },
     credentials: true,
     methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'X-CSRF-Token']
@@ -100,6 +124,30 @@ app.use(
 app.use('/usuarios/v2/photo', express.json({ limit: USUARIOS_PHOTO_JSON_LIMIT }));
 app.use(express.json({ limit: MAX_IMAGE_JSON_LIMIT }));
 app.use(cookieParser());
+
+app.use((err, req, res, next) => {
+  if (err?.message === 'Origen no permitido por CORS') {
+    const method = req?.method || 'UNKNOWN';
+    const route = req?.originalUrl || req?.url || '-';
+    const origin = req?.headers?.origin || '-';
+    console.warn(`[cors] origen bloqueado ${origin} en ${method} ${route}`);
+    return res.status(403).json({
+      ok: false,
+      message: 'Origen no permitido.'
+    });
+  }
+
+  if (err?.type === 'entity.parse.failed' || err instanceof SyntaxError) {
+    const method = req?.method || 'UNKNOWN';
+    const route = req?.originalUrl || req?.url || '-';
+    console.warn(`[json] payload invalido en ${method} ${route}`);
+    return res.status(400).json({
+      ok: false,
+      message: 'El cuerpo de la solicitud no tiene un formato JSON válido.'
+    });
+  }
+  return next(err);
+});
 
 // NEW: exposicion publica de `/uploads` para thumbnails e imagen principal de inventario.
 // WHY: los registros en `archivos.url_publica` apuntan a archivos locales servidos por Express.

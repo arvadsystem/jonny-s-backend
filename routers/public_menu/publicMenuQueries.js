@@ -59,15 +59,76 @@ export const fetchPublicBranchesQuery = async () => {
       s.id_sucursal,
       s.nombre_sucursal,
       COALESCE(vsi.texto_direccion, 'Direccion no disponible') AS direccion,
-      COALESCE(s.estado, true) AS estado
+      COALESCE(s.estado, true) AS estado,
+      s.id_archivo_imagen,
+      a.url_publica AS url_imagen
     FROM sucursales s
     LEFT JOIN v_sucursales_info vsi
       ON vsi.id_sucursal = s.id_sucursal
+    LEFT JOIN archivos a
+      ON a.id_archivo = s.id_archivo_imagen
+     AND COALESCE(a.estado, true) = true
     WHERE COALESCE(s.estado, true) = true
     ORDER BY s.id_sucursal ASC;
   `;
 
   const result = await pool.query(query);
+  return result.rows;
+};
+
+// Obtiene horario regular del dia y fecha especial vigente para cada sucursal.
+export const fetchBranchOperationalSnapshotQuery = async ({
+  branchIds = [],
+  diaSemana,
+  fechaISO
+}) => {
+  if (!Array.isArray(branchIds) || branchIds.length === 0) return [];
+
+  const query = `
+    SELECT
+      s.id_sucursal,
+      fe.fecha AS fecha_especial,
+      fe.tipo AS tipo_fecha_especial,
+      fe.cerrado AS fe_cerrado,
+      fe.hora_inicio AS fe_hora_inicio,
+      fe.hora_final AS fe_hora_final,
+      fe.estado AS fe_estado,
+      sh.cerrado AS sh_cerrado,
+      sh.hora_inicio AS sh_hora_inicio,
+      sh.hora_final AS sh_hora_final,
+      sh.estado AS sh_estado
+    FROM public.sucursales s
+    LEFT JOIN LATERAL (
+      SELECT
+        f.fecha,
+        f.tipo,
+        f.cerrado,
+        f.hora_inicio,
+        f.hora_final,
+        f.estado
+      FROM public.sucursales_fechas_especiales f
+      WHERE f.id_sucursal = s.id_sucursal
+        AND f.fecha = $2::date
+        AND COALESCE(f.estado, true) = true
+      ORDER BY f.id_fecha_especial DESC
+      LIMIT 1
+    ) fe ON true
+    LEFT JOIN LATERAL (
+      SELECT
+        h.cerrado,
+        h.hora_inicio,
+        h.hora_final,
+        h.estado
+      FROM public.sucursales_horarios h
+      WHERE h.id_sucursal = s.id_sucursal
+        AND h.dia_semana = $3
+        AND COALESCE(h.estado, true) = true
+      LIMIT 1
+    ) sh ON true
+    WHERE s.id_sucursal = ANY($1::int[]);
+  `;
+
+  const result = await pool.query(query, [branchIds, fechaISO, diaSemana]);
   return result.rows;
 };
 
