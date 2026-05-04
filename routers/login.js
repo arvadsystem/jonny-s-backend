@@ -458,8 +458,6 @@ router.post('/login', internalLoginIpLimiter, internalLoginAccountIpLimiter, asy
  * usando el sid del JWT, y luego limpiar cookies.
  */
 router.post('/logout', authRequired, async (req, res) => {
-  const base = cookieConfig();
-
   try {
     const sid = req.user?.sid;
     if (sid) {
@@ -467,11 +465,10 @@ router.post('/logout', authRequired, async (req, res) => {
     }
   } catch (err) {
     console.error('Error cerrando sesión en BD (logout):', err);
-    // No bloqueamos el logout aunque falle el cierre en BD
   }
 
-  res.clearCookie('access_token', base);
-  res.clearCookie('csrf_token', base);
+  res.clearCookie('access_token', authCookieOptions());
+  res.clearCookie('csrf_token', csrfCookieOptions());
 
   return res.json({ message: 'Logout exitoso' });
 });
