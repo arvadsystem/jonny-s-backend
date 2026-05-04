@@ -13,6 +13,7 @@ import {
   fetchEstadoPedidoRowsQuery,
   fetchPublicActiveSaucesQuery,
   fetchPedidoByIdempotencyKeyQuery,
+  fetchPublicBranchAvailabilityByIdQuery,
   fetchPublicBranchesQuery,
   fetchPublicMenuExtrasByRecipeIdsQuery,
   fetchRecipeAvailabilityQuery,
@@ -20,6 +21,7 @@ import {
   insertPublicPedidoDetalleQuery,
   insertPublicPedidoQuery
 } from './publicMenuQueries.js';
+import { getPublicMenuHeroCarouselConfig } from '../../services/publicMenuHeroCarouselConfigService.js';
 
 // Tabla de mensajes legibles para no exponer codigos internos al frontend.
 const AVAILABILITY_REASON_LABEL = Object.freeze({
@@ -234,13 +236,80 @@ const calculateRequiredSaucesForQuantity = (components, quantity = 1) => (
 // Normaliza booleans provenientes de PG.
 const toBoolean = (value) => value === true || value === 'true' || value === 1 || value === '1';
 
+const normalizeTimeValue = (value) => {
+  const text = String(value || '').trim();
+  const match = text.match(/^(\d{1,2}):(\d{2})/);
+  if (!match) return '';
+  return `${match[1].padStart(2, '0')}:${match[2]}`;
+};
+
+const formatTimeLabel = (value) => {
+  const normalized = normalizeTimeValue(value);
+  if (!normalized) return '';
+  const [hourText, minuteText] = normalized.split(':');
+  const hour = Number(hourText);
+  if (!Number.isFinite(hour)) return normalized;
+  const suffix = hour >= 12 ? 'PM' : 'AM';
+  const hour12 = hour % 12 || 12;
+  return `${hour12}:${minuteText} ${suffix}`;
+};
+
+const buildBranchScheduleLabel = ({ opensAt, closesAt }) => {
+  const openLabel = formatTimeLabel(opensAt);
+  const closeLabel = formatTimeLabel(closesAt);
+  if (!openLabel || !closeLabel) return '';
+  return `${openLabel} - ${closeLabel}`;
+};
+
+const buildBranchClosedReason = ({ isActive, opensAt, closesAt }) => {
+  if (!isActive) return 'Sucursal no disponible';
+  const schedule = buildBranchScheduleLabel({ opensAt, closesAt });
+  if (!schedule) return '';
+  return `Disponible de ${schedule}`;
+};
+
 // Convierte filas de sucursales al contrato publico.
-const mapBranch = (row) => ({
-  id: Number(row.id_sucursal),
-  name: row.nombre_sucursal,
-  address: row.direccion || 'Direccion no disponible',
-  isOpen: toBoolean(row.estado)
-});
+const mapBranch = (row) => {
+  const isActive = toBoolean(row?.estado);
+  const opensAt = normalizeTimeValue(row?.hora_inicio);
+  const closesAt = normalizeTimeValue(row?.hora_final);
+  const hasSchedule = Boolean(opensAt && closesAt);
+  const isOpen = isActive && (hasSchedule ? toBoolean(row?.abierto_por_horario) : true);
+  const schedule = buildBranchScheduleLabel({ opensAt, closesAt }) || 'Horario por confirmar';
+
+  return {
+    id: Number(row.id_sucursal),
+    name: row.nombre_sucursal,
+    address: row.direccion || 'Direccion no disponible',
+    isActive,
+    isOpen,
+    acceptsOrders: isOpen,
+    opensAt,
+    closesAt,
+    schedule,
+    statusLabel: isOpen ? (hasSchedule ? 'Abierto ahora' : 'Disponible') : 'Cerrado',
+    closedReason: isOpen ? '' : buildBranchClosedReason({ isActive, opensAt, closesAt })
+  };
+};
+
+const assertBranchAcceptsPublicOrders = async (idSucursal) => {
+  const branchRow = await fetchPublicBranchAvailabilityByIdQuery(idSucursal);
+  if (!branchRow) {
+    throw buildHttpError(404, 'La sucursal seleccionada no existe.');
+  }
+
+  const branch = mapBranch(branchRow);
+  if (!branch.isActive) {
+    throw buildHttpError(409, 'La sucursal seleccionada no esta disponible para pedidos.');
+  }
+
+  if (!branch.isOpen) {
+    const detail = branch.closedReason ? ` ${branch.closedReason}.` : '';
+    throw buildHttpError(409, `La sucursal esta cerrada en este momento.${detail}`);
+  }
+
+  return branch;
+};
 
 const normalizeExtraOption = (option) => ({
   id_extra: String(option?.id_extra || '').trim(),
@@ -551,7 +620,8 @@ const mapCatalogItem = ({
     descripcion: row.descripcion_item || '',
     categoria: {
       id_tipo_departamento: row.id_tipo_departamento ? Number(row.id_tipo_departamento) : null,
-      nombre: row.categoria_nombre || 'Sin categoria'
+      nombre: row.categoria_nombre || 'Sin categoria',
+      nombre_producto: row.producto_categoria_nombre || ''
     },
     imagen_url: resolvePublicCatalogImageUrl(row.url_imagen),
     precio: price,
@@ -1154,6 +1224,9 @@ export const getPublicBranchesService = async () => {
   return rows.map(mapBranch);
 };
 
+// AM: servicio para obtener configuracion global del carrusel hero.
+export const getPublicHeroCarouselConfigService = async () => getPublicMenuHeroCarouselConfig();
+
 // Servicio: obtener menu vigente por sucursal.
 export const getMenuVigenteByBranchService = async (idSucursal) => {
   const activeMenu = await fetchActiveMenuByBranchQuery(idSucursal);
@@ -1334,6 +1407,9 @@ export const createPublicOrderService = async ({
   if (requestedItems.length === 0) {
     throw buildHttpError(400, 'No hay items validos para registrar el pedido.');
   }
+
+  await assertBranchAcceptsPublicOrders(idSucursal);
+
   const requestSignature = buildIdempotencyPayloadSignature({
     idSucursal,
     tipoPedido,

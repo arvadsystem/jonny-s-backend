@@ -55,14 +55,25 @@ const hasTable = async (tableName) => {
 // Lista sucursales activas para entrada publica del flujo.
 export const fetchPublicBranchesQuery = async () => {
   const query = `
+    WITH clock AS (
+      SELECT (NOW() AT TIME ZONE 'America/Tegucigalpa')::time AS hora_actual
+    )
     SELECT
       s.id_sucursal,
       s.nombre_sucursal,
       COALESCE(vsi.texto_direccion, 'Direccion no disponible') AS direccion,
       COALESCE(s.estado, true) AS estado,
+      s.hora_inicio,
+      s.hora_final,
+      CASE
+        WHEN s.hora_inicio IS NULL OR s.hora_final IS NULL THEN false
+        WHEN s.hora_final > s.hora_inicio THEN clock.hora_actual >= s.hora_inicio AND clock.hora_actual < s.hora_final
+        ELSE clock.hora_actual >= s.hora_inicio OR clock.hora_actual < s.hora_final
+      END AS abierto_por_horario,
       s.id_archivo_imagen,
       a.url_publica AS url_imagen
     FROM sucursales s
+    CROSS JOIN clock
     LEFT JOIN v_sucursales_info vsi
       ON vsi.id_sucursal = s.id_sucursal
     LEFT JOIN archivos a
@@ -240,7 +251,24 @@ const buildCatalogSql = ({
         WHEN ${detalleComboExpr} IS NOT NULL THEN c.id_tipo_departamento
         ELSE NULL
       END AS id_tipo_departamento,
-      COALESCE(td.nombre_departamento, cp.nombre_categoria) AS categoria_nombre,
+      cp.nombre_categoria AS producto_categoria_nombre,
+      CASE
+        WHEN dm.id_producto IS NOT NULL
+          AND (
+            LOWER(TRIM(COALESCE(cp.nombre_categoria, ''))) LIKE '%snack%'
+            OR LOWER(TRIM(COALESCE(p.nombre_producto, ''))) LIKE '%snack%'
+            OR LOWER(TRIM(COALESCE(p.descripcion_producto, ''))) LIKE '%snack%'
+          )
+          THEN 'Snacks'
+        WHEN dm.id_producto IS NOT NULL
+          AND (
+            LOWER(TRIM(COALESCE(cp.nombre_categoria, ''))) LIKE '%helado%'
+            OR LOWER(TRIM(COALESCE(p.nombre_producto, ''))) LIKE '%helado%'
+            OR LOWER(TRIM(COALESCE(p.descripcion_producto, ''))) LIKE '%helado%'
+          )
+          THEN 'Helados'
+        ELSE COALESCE(td.nombre_departamento, cp.nombre_categoria)
+      END AS categoria_nombre,
       CASE
         WHEN dm.id_producto IS NOT NULL THEN ${productImageSelect}
         WHEN ${detalleRecetaExpr} IS NOT NULL THEN a_receta.url_publica
@@ -301,6 +329,36 @@ export const fetchCatalogRowsByMenuQuery = async (idMenu, db = pool) => {
   });
   const result = await db.query(query, [idMenu]);
   return result.rows;
+};
+
+// Disponibilidad puntual de una sucursal para validar pedidos publicos.
+export const fetchPublicBranchAvailabilityByIdQuery = async (idSucursal, db = pool) => {
+  const query = `
+    WITH clock AS (
+      SELECT (NOW() AT TIME ZONE 'America/Tegucigalpa')::time AS hora_actual
+    )
+    SELECT
+      s.id_sucursal,
+      s.nombre_sucursal,
+      COALESCE(vsi.texto_direccion, 'Direccion no disponible') AS direccion,
+      COALESCE(s.estado, true) AS estado,
+      s.hora_inicio,
+      s.hora_final,
+      CASE
+        WHEN s.hora_inicio IS NULL OR s.hora_final IS NULL THEN false
+        WHEN s.hora_final > s.hora_inicio THEN clock.hora_actual >= s.hora_inicio AND clock.hora_actual < s.hora_final
+        ELSE clock.hora_actual >= s.hora_inicio OR clock.hora_actual < s.hora_final
+      END AS abierto_por_horario
+    FROM sucursales s
+    CROSS JOIN clock
+    LEFT JOIN v_sucursales_info vsi
+      ON vsi.id_sucursal = s.id_sucursal
+    WHERE s.id_sucursal = $1
+    LIMIT 1;
+  `;
+
+  const result = await db.query(query, [idSucursal]);
+  return result.rows[0] || null;
 };
 
 export const fetchPublicMenuExtrasByRecipeIdsQuery = async (recipeIds = [], db = pool) => {

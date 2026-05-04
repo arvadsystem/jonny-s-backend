@@ -64,6 +64,7 @@ import adminMenuPublicacionRouter from './routers/admin_menu_publicacion.js';
 import adminSalsasRouter from './routers/admin_salsas.js';
 import cajasRoutes from './routers/cajas.js';
 import fidelizacionRoutes from './routers/fidelizacion.js';
+import reportesRoutes from './routers/reportes.js';
 
 import { authRequired, csrfProtect } from './middleware/auth.js';
 import { touchSessionMiddleware } from './middleware/touchSession.js';
@@ -82,26 +83,29 @@ const DEFAULT_DEV_ORIGINS = [
   'http://localhost:5173',
   'http://127.0.0.1:5173'
 ];
+const normalizeOrigin = (origin) => String(origin || '').trim().replace(/\/+$/, '');
 
 const getAllowedOrigins = () => {
   const envOrigins = String(process.env.FRONTEND_ORIGINS || '')
     .split(',')
-    .map((origin) => origin.trim())
+    .map((origin) => normalizeOrigin(origin))
     .filter(Boolean);
 
   if (envOrigins.length > 0) return envOrigins;
 
-  const singleOrigin = String(process.env.FRONTEND_ORIGIN || '').trim();
+  const singleOrigin = normalizeOrigin(process.env.FRONTEND_ORIGIN || '');
   if (singleOrigin) return [singleOrigin];
 
-  return DEFAULT_DEV_ORIGINS;
+  return DEFAULT_DEV_ORIGINS.map((origin) => normalizeOrigin(origin));
 };
 
 const allowedOrigins = getAllowedOrigins();
-const isAllowedOrigin = (origin) => allowedOrigins.includes(String(origin || '').trim());
+const isAllowedOrigin = (origin) => allowedOrigins.includes(normalizeOrigin(origin));
 
 // ✅ (Opcional) proxy - no afecta el login
-app.set('trust proxy', 1);
+if (String(process.env.TRUST_PROXY || '').toLowerCase() === 'true') {
+  app.set('trust proxy', 1);
+}
 
 // ✅ 1) Middlewares base SIEMPRE antes de auth
 app.use(helmet());
@@ -114,7 +118,7 @@ app.use(
     },
     credentials: true,
     methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'X-CSRF-Token']
+    allowedHeaders: ['Content-Type', 'X-CSRF-Token', 'Authorization', 'X-Requested-With']
   })
 );
 
@@ -243,6 +247,7 @@ app.use(cajasRoutes);
 app.use(ventasRoutes);
 app.use(cocinaRoutes);
 app.use(fidelizacionRoutes);
+app.use(reportesRoutes);
 
 // MODULO PERSONAS
 app.use(personasRoutes);

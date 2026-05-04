@@ -2,6 +2,7 @@ import express from 'express';
 import {
   getActiveMenuByBranchController,
   getPublicBranchesController,
+  getPublicHeroCarouselConfigController,
   getPublicCatalogController,
   getPublicCatalogItemDetailController
 } from './publicMenuController.js';
@@ -27,6 +28,13 @@ publicMenuReadRouter.get(
   '/sucursales',
   publicMenuBranchesReadLimiter,
   getPublicBranchesController
+);
+
+// AM: configuracion global del carrusel hero administrada por panel backend.
+publicMenuReadRouter.get(
+  '/carrusel-config',
+  publicMenuCatalogReadLimiter,
+  getPublicHeroCarouselConfigController
 );
 
 // Menu vigente activo por sucursal.

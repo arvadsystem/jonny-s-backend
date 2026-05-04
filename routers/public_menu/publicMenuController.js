@@ -1,5 +1,6 @@
 import {
   createPublicOrderService,
+  getPublicHeroCarouselConfigService,
   getMenuVigenteByBranchService,
   getPublicBranchesService,
   getPublicCatalogItemDetailService,
@@ -29,6 +30,20 @@ export const getPublicBranchesController = async (req, res) => {
     });
   } catch (error) {
     return handleControllerError(req, res, error, 'No se pudieron listar sucursales publicas.');
+  }
+};
+
+// AM: GET /public-menu/carrusel-config
+export const getPublicHeroCarouselConfigController = async (req, res) => {
+  try {
+    const data = await getPublicHeroCarouselConfigService();
+    return res.status(200).json({
+      ok: true,
+      request_id: getPublicMenuRequestId(req, res),
+      data
+    });
+  } catch (error) {
+    return handleControllerError(req, res, error, 'No se pudo cargar la configuracion del carrusel.');
   }
 };
 
