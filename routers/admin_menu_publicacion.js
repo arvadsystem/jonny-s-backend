@@ -874,7 +874,15 @@ router.put('/carrusel-config', checkPermission(MENU_MUTATION_PERMISSIONS), async
   } catch (error) {
     await client.query('ROLLBACK');
     console.error('admin_menu_publicacion PUT /carrusel-config:', error.message);
-    return res.status(500).json({ ok: false, message: 'No se pudo guardar la configuracion del carrusel.' });
+    const safeStatus = Number.isInteger(error?.status) && error.status >= 400 && error.status < 500
+      ? error.status
+      : 500;
+    return res.status(safeStatus).json({
+      ok: false,
+      message: safeStatus < 500
+        ? String(error?.message || 'No se pudo guardar la configuracion del carrusel.')
+        : 'No se pudo guardar la configuracion del carrusel.'
+    });
   } finally {
     client.release();
   }

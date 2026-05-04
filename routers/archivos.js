@@ -358,6 +358,7 @@ router.post('/archivos', checkPermission(ARCHIVOS_UPLOAD_PERMISSIONS), async (re
     return res.status(201).json({
       ok: true,
       id_archivo: inserted.id_archivo ?? null,
+      storage_path: inserted.url_publica || pathForDb,
       url_publica: resolvedUrl,
       requires_signed_url: targetBucket === SUPABASE_ADMIN_BUCKET
     });
