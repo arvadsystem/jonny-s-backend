@@ -1524,10 +1524,11 @@ const hydrateVentaLines = async (client, normalizedItems) => {
     )
   ];
 
-  const [productoMap, comboMap, recetaMap] = await Promise.all([
+  const [productoMap, comboMap, recetaMap, complementContext] = await Promise.all([
     fetchProductoMap(client, productoIds, { forUpdate: true }),
     fetchComboMap(client, comboIds),
-    fetchRecetaMap(client, recetaIds)
+    fetchRecetaMap(client, recetaIds),
+    buildVentaComplementContext({ client, normalizedItems })
   ]);
 
   const productoQtyById = aggregateProductoQuantities(normalizedItems);
