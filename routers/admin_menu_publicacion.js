@@ -2,6 +2,10 @@
 import pool from '../config/db-connection.js';
 import { checkPermission } from '../middleware/checkPermission.js';
 import { resolveMenuDepartmentIds } from './menu_departamentos.js';
+import {
+  getPublicMenuHeroCarouselConfig,
+  savePublicMenuHeroCarouselConfig
+} from '../services/publicMenuHeroCarouselConfigService.js';
 
 const router = express.Router();
 const MENU_VIEW_PERMISSIONS = ['MENU_VER'];
@@ -832,6 +836,47 @@ router.get('/menus', checkPermission(MENU_VIEW_PERMISSIONS), async (_req, res) =
   } catch (error) {
     console.error('admin_menu_publicacion /menus:', error.message);
     return res.status(500).json({ ok: false, message: 'No se pudieron cargar los menus disponibles.' });
+  }
+});
+
+// AM: lee configuracion global del carrusel hero usada por menu publico.
+router.get('/carrusel-config', checkPermission(MENU_VIEW_PERMISSIONS), async (_req, res) => {
+  try {
+    const config = await getPublicMenuHeroCarouselConfig();
+    return res.status(200).json({ ok: true, data: config });
+  } catch (error) {
+    console.error('admin_menu_publicacion GET /carrusel-config:', error.message);
+    return res.status(500).json({ ok: false, message: 'No se pudo cargar la configuracion del carrusel.' });
+  }
+});
+
+// AM: guarda configuracion global del carrusel hero para todas las sucursales.
+router.put('/carrusel-config', checkPermission(MENU_MUTATION_PERMISSIONS), async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const payload = req.body;
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+      return res.status(400).json({ ok: false, message: 'Payload invalido para guardar el carrusel.' });
+    }
+
+    await client.query('BEGIN');
+    const config = await savePublicMenuHeroCarouselConfig({
+      client,
+      config: payload
+    });
+    await client.query('COMMIT');
+
+    return res.status(200).json({
+      ok: true,
+      message: 'Carrusel global guardado correctamente.',
+      data: config
+    });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    console.error('admin_menu_publicacion PUT /carrusel-config:', error.message);
+    return res.status(500).json({ ok: false, message: 'No se pudo guardar la configuracion del carrusel.' });
+  } finally {
+    client.release();
   }
 });
 
