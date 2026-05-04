@@ -10,6 +10,12 @@ import {
   createVentaReversion,
   listFacturaReversiones
 } from '../services/ventasReversionService.js';
+import {
+  fetchAllowedSauceRowsByRecipeIdsQuery,
+  fetchComboRecipeComponentsQuery,
+  fetchPublicActiveSaucesQuery,
+  fetchSauceRuleRowsByRecipeIdsQuery
+} from './public_menu/publicMenuQueries.js';
 
 const router = express.Router();
 
@@ -73,6 +79,9 @@ const PEDIDO_ESTADO_PAGO = Object.freeze({
 const REVERSION_ALERT_EMAIL = 'gersonmz@jonnyshn.com';
 const REVERSION_FAILURE_EMAIL_COOLDOWN_MS = 60 * 1000;
 const reversionFailureEmailCooldown = new Map();
+const VENTA_COMPLEMENTO_TIPO_SALSAS = 'SALSAS';
+const WINGS_SAUCE_KEYWORDS = Object.freeze(['alita', 'alitas', 'tender', 'tenders']);
+const schemaColumnCache = new Map();
 
 const roundMoney = (value) => Number((Number(value || 0)).toFixed(2));
 const normalizeTipoItem = (value) => {
@@ -121,6 +130,25 @@ const parseOptionalDateTime = (value) => {
   return Number.isNaN(date.getTime()) ? null : date;
 };
 
+const hasColumn = async (client, tableName, columnName) => {
+  const key = `${String(tableName || '').trim().toLowerCase()}.${String(columnName || '').trim().toLowerCase()}`;
+  if (schemaColumnCache.has(key)) return schemaColumnCache.get(key);
+
+  const result = await client.query(
+    `
+      SELECT 1
+      FROM information_schema.columns
+      WHERE table_schema = 'public'
+        AND table_name = $1
+        AND column_name = $2
+      LIMIT 1
+    `,
+    [tableName, columnName]
+  );
+  const exists = result.rowCount > 0;
+  schemaColumnCache.set(key, exists);
+  return exists;
+};
 const hasDiscountIntentInPayload = (body) => {
   if (!isPlainObject(body)) return false;
 
@@ -192,6 +220,169 @@ const normalizeTextKey = (value) =>
     .trim()
     .toLowerCase()
     .replace(/\s+/g, '_');
+
+const normalizeSearchText = (value) =>
+  String(value || '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .trim()
+    .toLowerCase();
+const sortSauceOptions = (items) => (
+  [...(Array.isArray(items) ? items : [])].sort((left, right) => {
+    const orderA = Number(left?.orden || 0);
+    const orderB = Number(right?.orden || 0);
+    if (orderA !== orderB) return orderA - orderB;
+    return String(left?.nombre || '').localeCompare(String(right?.nombre || ''), 'es', {
+      sensitivity: 'base'
+    });
+  })
+);
+const inferSauceUnitsBaseFromText = (...sources) => {
+  const text = normalizeSearchText(sources.filter(Boolean).join(' '));
+  if (!text) return 1;
+  const containsKeyword = WINGS_SAUCE_KEYWORDS.some((keyword) => text.includes(keyword));
+  if (!containsKeyword) return 1;
+  const match =
+    text.match(/\b(\d{1,3})\s*(?:alitas?|tenders?)\b/i) ||
+    text.match(/\b(\d{1,3})\s*(?:uds?|unidades?|pzas?|piezas?)\b/i) ||
+    text.match(/\((\d{1,3})\s*(?:uds?|unidades?|pzas?|piezas?)\)/i);
+  const units = Number(match?.[1] || 0);
+  if (!Number.isFinite(units) || units <= 0) return 1;
+  return Math.max(1, Math.floor(units));
+};
+const calculateFallbackWingSauceRequirement = ({ nombre = '', descripcion = '', quantity = 1 }) => {
+  const baseUnits = inferSauceUnitsBaseFromText(nombre, descripcion);
+  if (baseUnits <= 1) return 0;
+  const totalUnits = Math.max(1, Number(quantity || 1)) * baseUnits;
+  return Math.max(0, Math.ceil(totalUnits / 6));
+};
+const findMatchingSalsaRule = (rules, unidades) => {
+  const units = Number(unidades);
+  if (!Number.isFinite(units) || units <= 0) return null;
+  const orderedRules = [...(Array.isArray(rules) ? rules : [])].sort((left, right) => (
+    Number(left?.min_unidades || 0) - Number(right?.min_unidades || 0)
+  ));
+  return orderedRules.find((rule) => {
+    const min = Number(rule?.min_unidades || 0);
+    const max = rule?.max_unidades === null || rule?.max_unidades === undefined
+      ? null
+      : Number(rule.max_unidades);
+    if (!Number.isFinite(min) || units < min) return false;
+    if (max !== null && Number.isFinite(max) && units > max) return false;
+    return true;
+  }) || null;
+};
+const parseComplementosPayload = (value) => {
+  if (value === undefined || value === null) return { ok: true, data: [] };
+  if (!Array.isArray(value)) {
+    return { ok: false, message: 'complementos debe ser una lista valida.' };
+  }
+  const dedupe = new Set();
+  for (const entry of value) {
+    if (!isPlainObject(entry)) {
+      return { ok: false, message: 'Cada complemento debe ser un objeto valido.' };
+    }
+    const idComplemento = parseOptionalPositiveInt(entry.id_complemento);
+    if (!idComplemento) {
+      return { ok: false, message: 'Cada complemento debe incluir id_complemento entero mayor a 0.' };
+    }
+    dedupe.add(Number(idComplemento));
+  }
+  return { ok: true, data: [...dedupe].sort((a, b) => a - b) };
+};
+const buildComplementSnapshot = (line) => {
+  const selected = Array.isArray(line?.complementos_detalle) ? line.complementos_detalle : [];
+  if (selected.length === 0) return null;
+  return {
+    tipo: VENTA_COMPLEMENTO_TIPO_SALSAS,
+    seleccion: selected.map((entry) => ({
+      id_complemento: Number(entry?.id_complemento || 0),
+      id_salsa: Number(entry?.id_salsa || entry?.id_complemento || 0),
+      nombre: String(entry?.nombre || 'Complemento').trim()
+    })).filter((entry) => entry.id_complemento > 0)
+  };
+};
+const buildComplementLineConfig = (line) => {
+  const selected = Array.isArray(line?.complementos_detalle) ? line.complementos_detalle : [];
+  const metadata = line?.complementos_metadata;
+  if (!selected.length && !metadata?.requiere_complementos) return null;
+  return {
+    tipo_complemento: VENTA_COMPLEMENTO_TIPO_SALSAS,
+    requiere_complementos: Boolean(metadata?.requiere_complementos),
+    minimo_complementos: Number(metadata?.minimo_complementos || 0),
+    maximo_complementos: Number(metadata?.maximo_complementos || 0),
+    complementos: selected.map((entry) => ({
+      id_complemento: Number(entry?.id_complemento || 0),
+      id_salsa: Number(entry?.id_salsa || entry?.id_complemento || 0),
+      nombre: String(entry?.nombre || 'Complemento').trim()
+    })).filter((entry) => entry.id_complemento > 0)
+  };
+};
+const buildRecipeSauceRequirement = ({ recipeName = '', recipeDescription = '', rules = [], quantity = 1 }) => {
+  const unitsBase = Math.max(1, inferSauceUnitsBaseFromText(recipeName, recipeDescription));
+  const units = Math.max(1, Number(quantity || 1)) * unitsBase;
+  const rule = findMatchingSalsaRule(rules, units);
+  if (rule) {
+    return Number(rule?.salsas_requeridas || 0);
+  }
+  // AM: fallback acotado solo para familias alitas/tenders cuando no hay reglas formales.
+  return calculateFallbackWingSauceRequirement({
+    nombre: recipeName,
+    descripcion: recipeDescription,
+    quantity
+  });
+};
+const resolveRecetaComplementMetadata = ({ receta = {}, quantity = 1, allowedSauces = [], rules = [], fallbackSauces = [] }) => {
+  const required = Math.max(0, buildRecipeSauceRequirement({
+    recipeName: receta?.nombre_receta,
+    recipeDescription: receta?.descripcion,
+    rules,
+    quantity
+  }));
+  let available = sortSauceOptions(allowedSauces);
+  if (required > 0 && available.length === 0) {
+    available = sortSauceOptions(fallbackSauces);
+  }
+  return {
+    requiere_complementos: required > 0,
+    tipo_complemento: VENTA_COMPLEMENTO_TIPO_SALSAS,
+    minimo_complementos: required,
+    maximo_complementos: required,
+    complementos_disponibles: available
+  };
+};
+const resolveComboComplementMetadata = ({ combo = {}, quantity = 1, components = [], saucesByRecipe = new Map(), rulesByRecipe = new Map(), fallbackSauces = [] }) => {
+  const unionSauces = new Map();
+  let required = 0;
+  for (const component of Array.isArray(components) ? components : []) {
+    const idReceta = Number(component?.id_receta || 0);
+    if (!idReceta) continue;
+    const allowed = saucesByRecipe.get(idReceta) || [];
+    for (const sauce of allowed) {
+      const key = Number(sauce?.id_salsa || 0);
+      if (key > 0) unionSauces.set(key, sauce);
+    }
+    const rules = rulesByRecipe.get(idReceta) || [];
+    const multiplier = Math.max(1, Number(component?.multiplicador || 1));
+    required += Math.max(0, buildRecipeSauceRequirement({
+      recipeName: component?.nombre_receta,
+      recipeDescription: component?.nombre_receta,
+      rules,
+      quantity: Math.max(1, Number(quantity || 1)) * multiplier
+    }));
+  }
+  let available = sortSauceOptions(Array.from(unionSauces.values()));
+  if (required > 0 && available.length === 0) {
+    available = sortSauceOptions(fallbackSauces);
+  }
+  return {
+    requiere_complementos: required > 0,
+    tipo_complemento: VENTA_COMPLEMENTO_TIPO_SALSAS,
+    minimo_complementos: required,
+    maximo_complementos: required,
+    complementos_disponibles: available
+  };
+};
 
 const normalizeRoleName = (value) =>
   String(value ?? '')
@@ -583,6 +774,11 @@ const normalizeVentaItems = (items) => {
       };
     }
 
+    const complementosResult = parseComplementosPayload(item.complementos);
+    if (!complementosResult.ok) {
+      return { ok: false, message: complementosResult.message };
+    }
+
     normalized.push({
       kind,
       cantidad,
@@ -590,7 +786,8 @@ const normalizeVentaItems = (items) => {
       id_combo: kind === 'COMBO' ? entityId : null,
       id_receta: kind === 'RECETA' ? entityId : null,
       observacion: normalizeObservation(item.observacion),
-      id_descuento_catalogo_linea: idDescuentoCatalogoLinea
+      id_descuento_catalogo_linea: idDescuentoCatalogoLinea,
+      complementos: complementosResult.data
     });
   }
 
@@ -637,6 +834,7 @@ const fetchRecetaMap = async (client, ids) => {
       SELECT
         r.id_receta,
         r.nombre_receta,
+        r.descripcion,
         r.estado,
         r.precio
       FROM recetas r
@@ -863,7 +1061,8 @@ const resolveCajaSession = async ({
   client,
   idSucursal,
   idUsuario,
-  idSesionCaja = null
+  idSesionCaja = null,
+  isSuperAdmin = false
 }) => {
   if (!idSucursal || !idUsuario) {
     return { ok: false, reason: 'MISSING_CONTEXT' };
@@ -892,36 +1091,59 @@ const resolveCajaSession = async ({
   }
 
   const result = await client.query(
-    `
-      SELECT
-        cs.id_caja,
-        cs.id_sesion_caja,
-        cs.id_sucursal,
-        csp.id_participacion_caja,
-        crp.codigo AS rol_participacion,
-        cua.id_caja_usuario_autorizado
-      FROM cajas_sesiones cs
-      INNER JOIN cajas_sesiones_participantes csp
-        ON csp.id_sesion_caja = cs.id_sesion_caja
-       AND csp.id_usuario = $2
-       AND COALESCE(csp.activo, true) = true
-      INNER JOIN cat_cajas_roles_participacion crp
-        ON crp.id_rol_participacion_caja = csp.id_rol_participacion_caja
-      INNER JOIN cajas_usuarios_autorizados cua
-        ON cua.id_caja = cs.id_caja
-       AND cua.id_sucursal = cs.id_sucursal
-       AND cua.id_usuario = csp.id_usuario
-       AND COALESCE(cua.estado, true) = true
-       AND (
-         (UPPER(TRIM(crp.codigo)) = 'RESPONSABLE' AND COALESCE(cua.puede_responsable, false) = true)
-         OR (UPPER(TRIM(crp.codigo)) = 'AUXILIAR' AND COALESCE(cua.puede_auxiliar, false) = true)
-       )
-      WHERE cs.id_sucursal = $1
-        AND cs.id_estado_sesion_caja = $3
-        ${requestedFilter}
-      ORDER BY cs.id_sesion_caja DESC
-      LIMIT 1
-    `,
+    isSuperAdmin
+      ? `
+        SELECT
+          cs.id_caja,
+          cs.id_sesion_caja,
+          cs.id_sucursal,
+          csp.id_participacion_caja,
+          crp.codigo AS rol_participacion,
+          NULL::bigint AS id_caja_usuario_autorizado
+        FROM cajas_sesiones cs
+        INNER JOIN cajas_sesiones_participantes csp
+          ON csp.id_sesion_caja = cs.id_sesion_caja
+         AND csp.id_usuario = $2
+         AND COALESCE(csp.activo, true) = true
+        INNER JOIN cat_cajas_roles_participacion crp
+          ON crp.id_rol_participacion_caja = csp.id_rol_participacion_caja
+        WHERE cs.id_sucursal = $1
+          AND cs.id_estado_sesion_caja = $3
+          AND UPPER(TRIM(crp.codigo)) IN ('RESPONSABLE', 'AUXILIAR')
+          ${requestedFilter}
+        ORDER BY cs.id_sesion_caja DESC
+        LIMIT 1
+      `
+      : `
+        SELECT
+          cs.id_caja,
+          cs.id_sesion_caja,
+          cs.id_sucursal,
+          csp.id_participacion_caja,
+          crp.codigo AS rol_participacion,
+          cua.id_caja_usuario_autorizado
+        FROM cajas_sesiones cs
+        INNER JOIN cajas_sesiones_participantes csp
+          ON csp.id_sesion_caja = cs.id_sesion_caja
+         AND csp.id_usuario = $2
+         AND COALESCE(csp.activo, true) = true
+        INNER JOIN cat_cajas_roles_participacion crp
+          ON crp.id_rol_participacion_caja = csp.id_rol_participacion_caja
+        INNER JOIN cajas_usuarios_autorizados cua
+          ON cua.id_caja = cs.id_caja
+         AND cua.id_sucursal = cs.id_sucursal
+         AND cua.id_usuario = csp.id_usuario
+         AND COALESCE(cua.estado, true) = true
+         AND (
+           (UPPER(TRIM(crp.codigo)) = 'RESPONSABLE' AND COALESCE(cua.puede_responsable, false) = true)
+           OR (UPPER(TRIM(crp.codigo)) = 'AUXILIAR' AND COALESCE(cua.puede_auxiliar, false) = true)
+         )
+        WHERE cs.id_sucursal = $1
+          AND cs.id_estado_sesion_caja = $3
+          ${requestedFilter}
+        ORDER BY cs.id_sesion_caja DESC
+        LIMIT 1
+      `,
     params
   );
 
@@ -1127,6 +1349,158 @@ const allocateDiscounts = (lineSubtotals, totalDiscount) => {
   });
 };
 
+const buildVentaComplementContext = async ({ client, normalizedItems }) => {
+  const recipeIds = [...new Set(
+    (Array.isArray(normalizedItems) ? normalizedItems : [])
+      .filter((item) => item.kind === 'RECETA')
+      .map((item) => Number(item.id_receta || 0))
+      .filter((id) => id > 0)
+  )];
+  const comboIds = [...new Set(
+    (Array.isArray(normalizedItems) ? normalizedItems : [])
+      .filter((item) => item.kind === 'COMBO')
+      .map((item) => Number(item.id_combo || 0))
+      .filter((id) => id > 0)
+  )];
+
+  const comboComponents = await fetchComboRecipeComponentsQuery(comboIds, client);
+  const componentRecipeIds = comboComponents
+    .map((row) => Number(row?.id_receta || 0))
+    .filter((id) => id > 0);
+  const allRecipeIds = [...new Set([...recipeIds, ...componentRecipeIds])];
+
+  const [allowedSauceRows, sauceRuleRows, fallbackSauces] = await Promise.all([
+    fetchAllowedSauceRowsByRecipeIdsQuery(allRecipeIds, client),
+    fetchSauceRuleRowsByRecipeIdsQuery(allRecipeIds, client),
+    fetchPublicActiveSaucesQuery(client)
+  ]);
+
+  const saucesByRecipe = new Map();
+  for (const row of allowedSauceRows) {
+    const recipeId = Number(row?.id_receta || 0);
+    if (!recipeId) continue;
+    if (!saucesByRecipe.has(recipeId)) saucesByRecipe.set(recipeId, []);
+    saucesByRecipe.get(recipeId).push({
+      id_complemento: Number(row.id_salsa),
+      id_salsa: Number(row.id_salsa),
+      nombre: String(row.nombre || 'Salsa').trim(),
+      nivel_picante: Number(row.nivel_picante || 0),
+      orden: Number(row.orden || 0),
+      disponible: row.disponible !== false
+    });
+  }
+
+  const rulesByRecipe = new Map();
+  for (const row of sauceRuleRows) {
+    const recipeId = Number(row?.id_receta || 0);
+    if (!recipeId) continue;
+    if (!rulesByRecipe.has(recipeId)) rulesByRecipe.set(recipeId, []);
+    rulesByRecipe.get(recipeId).push({
+      min_unidades: Number(row?.min_unidades || 0),
+      max_unidades:
+        row?.max_unidades === null || row?.max_unidades === undefined ? null : Number(row.max_unidades),
+      salsas_requeridas: Number(row?.salsas_requeridas || 0)
+    });
+  }
+
+  const comboComponentsByCombo = new Map();
+  for (const row of comboComponents) {
+    const comboId = Number(row?.id_combo || 0);
+    if (!comboId) continue;
+    if (!comboComponentsByCombo.has(comboId)) comboComponentsByCombo.set(comboId, []);
+    comboComponentsByCombo.get(comboId).push({
+      id_receta: Number(row?.id_receta || 0),
+      multiplicador: Math.max(1, Number(row?.multiplicador || 1)),
+      nombre_receta: String(row?.nombre_receta || '').trim()
+    });
+  }
+
+  const normalizedFallbackSauces = sortSauceOptions((Array.isArray(fallbackSauces) ? fallbackSauces : []).map((row) => ({
+    id_complemento: Number(row.id_salsa),
+    id_salsa: Number(row.id_salsa),
+    nombre: String(row.nombre || 'Salsa').trim(),
+    nivel_picante: Number(row.nivel_picante || 0),
+    orden: Number(row.orden || 0),
+    disponible: true
+  })));
+
+  return {
+    saucesByRecipe,
+    rulesByRecipe,
+    comboComponentsByCombo,
+    fallbackSauces: normalizedFallbackSauces
+  };
+};
+
+const resolveLineComplementos = ({ item, receta, combo, context }) => {
+  if (item.kind === 'PRODUCTO') {
+    if (Array.isArray(item.complementos) && item.complementos.length > 0) {
+      return { ok: false, message: 'Uno o m?s complementos seleccionados no son v?lidos para este item.' };
+    }
+    return {
+      ok: true,
+      metadata: {
+        requiere_complementos: false,
+        tipo_complemento: null,
+        minimo_complementos: 0,
+        maximo_complementos: 0,
+        complementos_disponibles: []
+      },
+      selected: []
+    };
+  }
+
+  let metadata;
+  if (item.kind === 'RECETA') {
+    metadata = resolveRecetaComplementMetadata({
+      receta,
+      quantity: item.cantidad,
+      allowedSauces: context.saucesByRecipe.get(Number(item.id_receta || 0)) || [],
+      rules: context.rulesByRecipe.get(Number(item.id_receta || 0)) || [],
+      fallbackSauces: context.fallbackSauces
+    });
+  } else {
+    metadata = resolveComboComplementMetadata({
+      combo,
+      quantity: item.cantidad,
+      components: context.comboComponentsByCombo.get(Number(item.id_combo || 0)) || [],
+      saucesByRecipe: context.saucesByRecipe,
+      rulesByRecipe: context.rulesByRecipe,
+      fallbackSauces: context.fallbackSauces
+    });
+  }
+
+  const selectedIds = Array.isArray(item.complementos) ? item.complementos : [];
+  const allowedMap = new Map(
+    (Array.isArray(metadata.complementos_disponibles) ? metadata.complementos_disponibles : [])
+      .map((entry) => [Number(entry?.id_complemento || entry?.id_salsa || 0), entry])
+      .filter(([id]) => id > 0)
+  );
+
+  const selected = [];
+  for (const idRaw of selectedIds) {
+    const id = Number(idRaw || 0);
+    const found = allowedMap.get(id);
+    if (!found || found.disponible === false) {
+      return { ok: false, message: 'Uno o m?s complementos seleccionados no son v?lidos para este item.' };
+    }
+    selected.push({ id_complemento: id, id_salsa: id, nombre: String(found.nombre || 'Salsa').trim() });
+  }
+
+  const min = Math.max(0, Number(metadata.minimo_complementos || 0));
+  const max = Math.max(min, Number(metadata.maximo_complementos || 0));
+  if (metadata.requiere_complementos && selected.length < min) {
+    return { ok: false, message: 'Debe seleccionar los complementos requeridos para este item.' };
+  }
+  if (max > 0 && selected.length > max) {
+    return { ok: false, message: 'Debe seleccionar los complementos requeridos para este item.' };
+  }
+  if (!metadata.requiere_complementos && selected.length > 0) {
+    return { ok: false, message: 'Uno o m?s complementos seleccionados no son v?lidos para este item.' };
+  }
+
+  return { ok: true, metadata, selected };
+};
 const hydrateVentaLines = async (client, normalizedItems) => {
   const productoIds = [
     ...new Set(
@@ -1216,6 +1590,19 @@ const hydrateVentaLines = async (client, normalizedItems) => {
         };
       }
 
+      const complementosResult = resolveLineComplementos({
+        item,
+        receta: null,
+        combo: null,
+        context: complementContext
+      });
+      if (!complementosResult.ok) {
+        return {
+          ok: false,
+          status: 400,
+          body: { error: true, message: complementosResult.message }
+        };
+      }
       lines.push({
         kind: 'PRODUCTO',
         requiere_cocina: false,
@@ -1228,7 +1615,9 @@ const hydrateVentaLines = async (client, normalizedItems) => {
         cantidad: item.cantidad,
         precio_unitario: precioUnitario,
         sub_total: subTotal,
-        observacion: item.observacion
+        observacion: item.observacion,
+        complementos_metadata: complementosResult.metadata,
+        complementos_detalle: complementosResult.selected
       });
       subTotals.push(subTotal);
       continue;
@@ -1255,6 +1644,19 @@ const hydrateVentaLines = async (client, normalizedItems) => {
       const precioUnitario = roundMoney(combo.precio);
       const subTotal = roundMoney(precioUnitario * item.cantidad);
 
+      const complementosResult = resolveLineComplementos({
+        item,
+        receta: null,
+        combo,
+        context: complementContext
+      });
+      if (!complementosResult.ok) {
+        return {
+          ok: false,
+          status: 400,
+          body: { error: true, message: complementosResult.message }
+        };
+      }
       lines.push({
         kind: 'COMBO',
         requiere_cocina: true,
@@ -1267,7 +1669,9 @@ const hydrateVentaLines = async (client, normalizedItems) => {
         cantidad: item.cantidad,
         precio_unitario: precioUnitario,
         sub_total: subTotal,
-        observacion: item.observacion
+        observacion: item.observacion,
+        complementos_metadata: complementosResult.metadata,
+        complementos_detalle: complementosResult.selected
       });
       subTotals.push(subTotal);
       continue;
@@ -1293,6 +1697,19 @@ const hydrateVentaLines = async (client, normalizedItems) => {
     const precioUnitario = roundMoney(receta.precio);
     const subTotal = roundMoney(precioUnitario * item.cantidad);
 
+    const complementosResult = resolveLineComplementos({
+      item,
+      receta,
+      combo: null,
+      context: complementContext
+    });
+    if (!complementosResult.ok) {
+      return {
+        ok: false,
+        status: 400,
+        body: { error: true, message: complementosResult.message }
+      };
+    }
     lines.push({
       kind: 'RECETA',
       requiere_cocina: true,
@@ -1305,7 +1722,9 @@ const hydrateVentaLines = async (client, normalizedItems) => {
       cantidad: item.cantidad,
       precio_unitario: precioUnitario,
       sub_total: subTotal,
-      observacion: item.observacion
+      observacion: item.observacion,
+      complementos_metadata: complementosResult.metadata,
+      complementos_detalle: complementosResult.selected
     });
     subTotals.push(subTotal);
   }
@@ -1610,7 +2029,8 @@ const buildVentaPayload = async ({ client, body, userId, sucursalScope, canApply
     client,
     idSucursal,
     idUsuario: userId,
-    idSesionCaja: idSesionCajaRequested
+    idSesionCaja: idSesionCajaRequested,
+    isSuperAdmin: Boolean(sucursalScope?.isSuperAdmin)
   });
   if (!sessionActiva.ok) {
     return {
@@ -1621,7 +2041,7 @@ const buildVentaPayload = async ({ client, body, userId, sucursalScope, canApply
           : ['SESSION_NOT_OPEN', 'OPEN_STATE_NOT_FOUND'].includes(sessionActiva.reason)
           ? 409
           : 403,
-      body: { error: true, message: 'Debe abrir o tener una sesiÃ³n de caja activa permitida para procesar ventas.' }
+      body: { error: true, message: sessionActiva.reason === 'SESSION_SCOPE_MISMATCH' ? 'La caja seleccionada no pertenece a la sucursal de la venta.' : 'Debe abrir o tener una sesión de caja activa permitida para procesar ventas.', code: sessionActiva.reason || 'NO_ACTIVE_SESSION' }
     };
   }
   const { id_caja: idCaja, id_sesion_caja: idSesionCaja } = sessionActiva.data;
@@ -1876,7 +2296,42 @@ router.get('/ventas/catalogos/combos', async (req, res) => {
     `;
 
     const result = await pool.query(query, params);
-    res.status(200).json(result.rows);
+    const comboRows = Array.isArray(result.rows) ? result.rows : [];
+    const complementContext = await buildVentaComplementContext({
+      client: pool,
+      normalizedItems: comboRows.map((row) => ({
+        kind: 'COMBO',
+        id_combo: Number(row?.id_combo || 0),
+        cantidad: 1,
+        complementos: []
+      }))
+    });
+
+    const data = comboRows.map((row) => {
+      const metadata = resolveComboComplementMetadata({
+        combo: row,
+        quantity: 1,
+        components: complementContext.comboComponentsByCombo.get(Number(row?.id_combo || 0)) || [],
+        saucesByRecipe: complementContext.saucesByRecipe,
+        rulesByRecipe: complementContext.rulesByRecipe,
+        fallbackSauces: complementContext.fallbackSauces
+      });
+
+      return {
+        ...row,
+        requiere_complementos: Boolean(metadata.requiere_complementos),
+        tipo_complemento: metadata.tipo_complemento || VENTA_COMPLEMENTO_TIPO_SALSAS,
+        minimo_complementos: Number(metadata.minimo_complementos || 0),
+        maximo_complementos: Number(metadata.maximo_complementos || 0),
+        complementos_disponibles: (Array.isArray(metadata.complementos_disponibles) ? metadata.complementos_disponibles : []).map((entry) => ({
+          id_complemento: Number(entry?.id_complemento || entry?.id_salsa || 0),
+          nombre: String(entry?.nombre || 'Salsa').trim(),
+          disponible: entry?.disponible !== false
+        })).filter((entry) => entry.id_complemento > 0)
+      };
+    });
+
+    res.status(200).json(data);
   } catch (err) {
     console.error('Error al listar catalogo de combos para ventas:', err.message);
     sendVentasInternalError(res);
@@ -1918,6 +2373,7 @@ router.get('/ventas/catalogos/recetas', async (req, res) => {
       SELECT DISTINCT
         r.id_receta,
         r.nombre_receta,
+        r.descripcion,
         r.estado,
         r.precio,
         r.id_archivo,
@@ -1935,7 +2391,41 @@ router.get('/ventas/catalogos/recetas', async (req, res) => {
     `;
 
     const result = await pool.query(query, params);
-    res.status(200).json(result.rows);
+    const recetaRows = Array.isArray(result.rows) ? result.rows : [];
+    const complementContext = await buildVentaComplementContext({
+      client: pool,
+      normalizedItems: recetaRows.map((row) => ({
+        kind: 'RECETA',
+        id_receta: Number(row?.id_receta || 0),
+        cantidad: 1,
+        complementos: []
+      }))
+    });
+
+    const data = recetaRows.map((row) => {
+      const metadata = resolveRecetaComplementMetadata({
+        receta: row,
+        quantity: 1,
+        allowedSauces: complementContext.saucesByRecipe.get(Number(row?.id_receta || 0)) || [],
+        rules: complementContext.rulesByRecipe.get(Number(row?.id_receta || 0)) || [],
+        fallbackSauces: complementContext.fallbackSauces
+      });
+
+      return {
+        ...row,
+        requiere_complementos: Boolean(metadata.requiere_complementos),
+        tipo_complemento: metadata.tipo_complemento || VENTA_COMPLEMENTO_TIPO_SALSAS,
+        minimo_complementos: Number(metadata.minimo_complementos || 0),
+        maximo_complementos: Number(metadata.maximo_complementos || 0),
+        complementos_disponibles: (Array.isArray(metadata.complementos_disponibles) ? metadata.complementos_disponibles : []).map((entry) => ({
+          id_complemento: Number(entry?.id_complemento || entry?.id_salsa || 0),
+          nombre: String(entry?.nombre || 'Salsa').trim(),
+          disponible: entry?.disponible !== false
+        })).filter((entry) => entry.id_complemento > 0)
+      };
+    });
+
+    res.status(200).json(data);
   } catch (err) {
     console.error('Error al listar catalogo de recetas para ventas:', err.message);
     sendVentasInternalError(res);
@@ -3693,39 +4183,83 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
 
     idPedido = pedidoResult.rows[0].id_pedido;
 
+    const hasDetallePedidoConfiguracionMenu = await hasColumn(
+      client,
+      'detalle_pedido',
+      'configuracion_menu'
+    );
+
     const pedidoLineRefs = [];
     for (const line of venta.pedido_lines) {
-      const insertedDetallePedido = await client.query(
-        `
-          INSERT INTO detalle_pedido (
-            sub_total_pedido,
-            total_pedido,
-            id_producto,
-            id_pedido,
-            id_descuento,
-            estado,
-            id_combo,
-            id_receta,
-            observacion
-          )
-          VALUES ($1, $2, $3, $4, $5, true, $6, $7, $8)
-          RETURNING id_detalle_pedido
-        `,
-        [
-          line.sub_total,
-          line.total_linea,
-          line.id_producto,
-          idPedido,
-          line.id_descuento,
-          line.id_combo,
-          line.id_receta,
-          line.observacion
-        ]
-      );
+      const configuracionMenu = buildComplementLineConfig(line);
+
+      let insertedDetallePedido;
+      if (hasDetallePedidoConfiguracionMenu) {
+        insertedDetallePedido = await client.query(
+          `
+            INSERT INTO detalle_pedido (
+              sub_total_pedido,
+              total_pedido,
+              id_producto,
+              id_pedido,
+              id_descuento,
+              estado,
+              id_combo,
+              id_receta,
+              observacion,
+              configuracion_menu
+            )
+            VALUES ($1, $2, $3, $4, $5, true, $6, $7, $8, $9::jsonb)
+            RETURNING id_detalle_pedido
+          `,
+          [
+            line.sub_total,
+            line.total_linea,
+            line.id_producto,
+            idPedido,
+            line.id_descuento,
+            line.id_combo,
+            line.id_receta,
+            line.observacion,
+            configuracionMenu ? JSON.stringify(configuracionMenu) : null
+          ]
+        );
+      } else {
+        insertedDetallePedido = await client.query(
+          `
+            INSERT INTO detalle_pedido (
+              sub_total_pedido,
+              total_pedido,
+              id_producto,
+              id_pedido,
+              id_descuento,
+              estado,
+              id_combo,
+              id_receta,
+              observacion
+            )
+            VALUES ($1, $2, $3, $4, $5, true, $6, $7, $8)
+            RETURNING id_detalle_pedido
+          `,
+          [
+            line.sub_total,
+            line.total_linea,
+            line.id_producto,
+            idPedido,
+            line.id_descuento,
+            line.id_combo,
+            line.id_receta,
+            line.observacion
+          ]
+        );
+      }
+
+      const complementSnapshot = buildComplementSnapshot(line);
       pedidoLineRefs.push({
         ...line,
         id_detalle_pedido: Number(insertedDetallePedido.rows?.[0]?.id_detalle_pedido || 0),
         tipo_item: normalizeTipoItem(line.kind),
+        configuracion_menu: configuracionMenu,
         origen_snapshot: {
           tipo_item: normalizeTipoItem(line.kind),
           nombre_item: line.nombre_item || null,
@@ -3737,11 +4271,10 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
           total_detalle: roundMoney(line.total_linea),
           descuento: roundMoney(line.descuento),
           observacion: line.observacion || null,
-          componentes: null
+          componentes: complementSnapshot
         }
       });
     }
-
     const facturaResult = await client.query(
       `
         INSERT INTO facturas (
@@ -3815,6 +4348,7 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
 
     for (const [index, line] of venta.all_lines.entries()) {
       const pedidoRef = pedidoLineRefs[index] || null;
+      const complementSnapshot = buildComplementSnapshot(line);
       const detalleFacturaResult = await client.query(
         `
           INSERT INTO detalle_facturas (
@@ -3860,7 +4394,7 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
               total_detalle: roundMoney(line.total_linea),
               descuento: roundMoney(line.descuento),
               observacion: line.observacion || null,
-              componentes: null
+              componentes: complementSnapshot
             }
           )
         ]
@@ -3908,7 +4442,7 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
                 total_detalle: roundMoney(line.total_linea),
                 descuento: roundMoney(line.descuento),
                 observacion: line.observacion || null,
-                componentes: null
+                componentes: complementSnapshot
               }
             )
           ]
@@ -3961,3 +4495,4 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
 
 
 export default router;
+
