@@ -97,3 +97,16 @@ export const forgotPasswordLimiter = buildLimiter({
     message: 'Demasiados intentos. Intenta de nuevo en 15 minutos.'
   }
 });
+
+/**
+ * Limiter para reenvio de verificacion: controla spam por cuenta + IP.
+ */
+export const resendVerificationLimiter = buildLimiter({
+  windowMs: 15 * 60 * 1000,
+  max: 4,
+  keyGenerator: (req) => `${safeIp(req)}|${resolveLoginIdentifier(req)}`,
+  message: {
+    error: true,
+    message: 'Demasiados reenvios de verificacion. Intenta de nuevo en 15 minutos.'
+  }
+});

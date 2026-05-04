@@ -91,6 +91,28 @@ const getUserAuthzSnapshot = async (idUsuario) => {
   };
 };
 
+const getClienteNameSnapshot = async (idUsuario) => {
+  const userId = Number.parseInt(String(idUsuario ?? ''), 10);
+  if (!Number.isInteger(userId) || userId <= 0) return null;
+
+  const result = await pool.query(
+    `
+      SELECT
+        p.nombre AS nombre_cliente,
+        p.apellido AS apellido_cliente,
+        NULLIF(TRIM(CONCAT_WS(' ', p.nombre, p.apellido)), '') AS nombre_completo_cliente
+      FROM usuarios u
+      LEFT JOIN clientes c ON c.id_cliente = u.id_cliente
+      LEFT JOIN personas p ON p.id_persona = c.id_persona
+      WHERE u.id_usuario = $1
+      LIMIT 1
+    `,
+    [userId]
+  );
+
+  return result.rows[0] || null;
+};
+
 const normalizeRoleName = (value) =>
   String(value ?? '')
     .normalize('NFD')
@@ -123,22 +145,50 @@ const buildPasswordPolicyFlags = (passwordExpiration) => {
   };
 };
 
-const cookieConfig = () => {
+const normalizeSameSite = (value, fallback) => {
+  const normalized = String(value || '').trim().toLowerCase();
+  if (normalized === 'none' || normalized === 'lax' || normalized === 'strict') {
+    return normalized;
+  }
+  return fallback;
+};
+
+const authCookieOptions = () => {
   const isProd = process.env.NODE_ENV === 'production';
   return {
-    sameSite: isProd ? 'none' : 'lax',
-    secure: isProd,
+    httpOnly: true,
+    secure: String(process.env.AUTH_COOKIE_SECURE || '').toLowerCase() === 'true' || isProd,
+    sameSite: normalizeSameSite(process.env.AUTH_COOKIE_SAMESITE, isProd ? 'none' : 'lax'),
+    domain: String(process.env.AUTH_COOKIE_DOMAIN || '').trim() || undefined,
     path: '/'
   };
 };
 
-const issueCsrf = (res) => {
-  const csrfToken = crypto.randomBytes(32).toString('hex');
-  const base = cookieConfig();
+const csrfCookieOptions = () => {
+  const isProd = process.env.NODE_ENV === 'production';
+  return {
+    httpOnly: false,
+    secure: String(process.env.CSRF_COOKIE_SECURE || '').toLowerCase() === 'true' || isProd,
+    sameSite: normalizeSameSite(process.env.CSRF_COOKIE_SAMESITE, isProd ? 'none' : 'lax'),
+    domain: String(process.env.CSRF_COOKIE_DOMAIN || '').trim() || undefined,
+    path: '/'
+  };
+};
+
+const CSRF_TOKEN_RE = /^[a-f0-9]{64}$/i;
+
+const getExistingCsrfToken = (req) => {
+  const token = String(req?.cookies?.csrf_token || '').trim();
+  if (!token) return null;
+  return CSRF_TOKEN_RE.test(token) ? token : null;
+};
+
+const issueCsrf = (req, res, { reuseIfPresent = false } = {}) => {
+  const existingToken = reuseIfPresent ? getExistingCsrfToken(req) : null;
+  const csrfToken = existingToken || crypto.randomBytes(32).toString('hex');
 
   res.cookie('csrf_token', csrfToken, {
-    ...base,
-    httpOnly: false,
+    ...csrfCookieOptions(),
     maxAge: 1000 * 60 * 60 * 8 // 8h
   });
 
@@ -348,15 +398,12 @@ router.post('/login', internalLoginIpLimiter, internalLoginAccountIpLimiter, asy
 
     const token = jwt.sign(payload, JWT_SECRET, { expiresIn: '8h' });
 
-    const base = cookieConfig();
-
     res.cookie('access_token', token, {
-      ...base,
-      httpOnly: true,
+      ...authCookieOptions(),
       maxAge: 1000 * 60 * 60 * 8
     });
 
-    const csrfToken = issueCsrf(res);
+    const csrfToken = issueCsrf(req, res);
 
     // Login exitoso: registrar intento
     await insertLoginLog({
@@ -411,8 +458,6 @@ router.post('/login', internalLoginIpLimiter, internalLoginAccountIpLimiter, asy
  * usando el sid del JWT, y luego limpiar cookies.
  */
 router.post('/logout', authRequired, async (req, res) => {
-  const base = cookieConfig();
-
   try {
     const sid = req.user?.sid;
     if (sid) {
@@ -420,18 +465,16 @@ router.post('/logout', authRequired, async (req, res) => {
     }
   } catch (err) {
     console.error('Error cerrando sesión en BD (logout):', err);
-    // No bloqueamos el logout aunque falle el cierre en BD
   }
 
-  res.clearCookie('access_token', base);
-  res.clearCookie('csrf_token', base);
+  res.clearCookie('access_token', authCookieOptions());
+  res.clearCookie('csrf_token', csrfCookieOptions());
 
   return res.json({ message: 'Logout exitoso' });
 });
 
 router.get('/me', authRequired, requireActiveSession, async (req, res) => {
-  // Re-emite CSRF por si el frontend refresca y lo perdió
-  const csrfToken = issueCsrf(res);
+  const csrfToken = issueCsrf(req, res, { reuseIfPresent: true });
   const usuario = { ...(req.user || {}) };
   const idUsuario = Number.parseInt(String(usuario?.id_usuario ?? ''), 10);
 
@@ -470,6 +513,24 @@ router.get('/me', authRequired, requireActiveSession, async (req, res) => {
 
       if (result.rows.length > 0) {
         const row = result.rows[0];
+        Object.assign(usuario, {
+          id_cliente: row.id_cliente,
+          tipo_usuario: row.tipo_usuario,
+          foto_perfil: row.foto_perfil
+        });
+
+        if (String(row?.tipo_usuario || '').trim().toUpperCase() === 'CLIENTE') {
+          const clienteName = await getClienteNameSnapshot(idUsuario);
+          if (clienteName) {
+            Object.assign(usuario, {
+              nombre_cliente: clienteName.nombre_cliente,
+              apellido_cliente: clienteName.apellido_cliente,
+              nombre_completo_cliente: clienteName.nombre_completo_cliente,
+              nombre_completo: clienteName.nombre_completo_cliente || usuario.nombre_completo
+            });
+          }
+        }
+
         const passwordExpiration = evaluatePasswordExpiration({
           roles: authz.roles,
           tipoUsuario: row?.tipo_usuario,

@@ -7,11 +7,28 @@ import express from "express";
 import pool from "../../config/db-connection.js";
 import { checkPermission } from "../../middleware/checkPermission.js";
 import { timestampAsHNToISO, toHNWallTimestamp } from "../../utils/dates.js";
+import { securityReadLimiter } from "./securityRateLimit.js";
 const router = express.Router();
 
 const PERMISO_VER = ["SEGURIDAD_LOGINS_VER", "SEGURIDAD_VER"];
+const MAX_SEARCH_LEN = 120;
 
-router.get("/logins", checkPermission(PERMISO_VER), async (req, res) => {
+const clampInt = (value, def, min, max) => {
+  const n = Number.parseInt(String(value ?? ""), 10);
+  if (Number.isNaN(n)) return def;
+  return Math.max(min, Math.min(max, n));
+};
+
+const parsePositiveIntOrNull = (value) => {
+  if (value === null || value === undefined || String(value).trim() === "") return null;
+  const n = Number.parseInt(String(value), 10);
+  return Number.isInteger(n) && n > 0 ? n : null;
+};
+
+const sanitizeSearchTerm = (value) =>
+  String(value ?? "").trim().slice(0, MAX_SEARCH_LEN);
+
+router.get("/logins", securityReadLimiter, checkPermission(PERMISO_VER), async (req, res) => {
   try {
     const {
       estado,
@@ -23,8 +40,14 @@ router.get("/logins", checkPermission(PERMISO_VER), async (req, res) => {
       offset,
     } = req.query;
 
-    const lim = Math.min(Number(limit) || 10, 200);
-    const off = Number(offset) || 0;
+    const lim = clampInt(limit, 10, 1, 200);
+    const off = clampInt(offset, 0, 0, 1_000_000);
+    const idUsuario = parsePositiveIntOrNull(id_usuario);
+    const usuarioTerm = sanitizeSearchTerm(usuario);
+
+    if (id_usuario !== undefined && id_usuario !== null && String(id_usuario).trim() !== "" && idUsuario === null) {
+      return res.status(400).json({ error: true, message: "id_usuario invalido" });
+    }
 
     const where = [];
     const params = [];
@@ -58,14 +81,14 @@ router.get("/logins", checkPermission(PERMISO_VER), async (req, res) => {
       }
     }
 
-    if (id_usuario) {
+    if (idUsuario !== null) {
       where.push(`l.id_usuario = $${i++}`);
-      params.push(Number(id_usuario));
+      params.push(idUsuario);
     }
 
-    if (usuario) {
+    if (usuarioTerm) {
       where.push(`(u.nombre_usuario ILIKE $${i++} OR l.nombre_usuario_intentado ILIKE $${i++})`);
-      const like = `%${usuario}%`;
+      const like = `%${usuarioTerm}%`;
       params.push(like, like);
     }
 

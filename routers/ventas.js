@@ -3,13 +3,24 @@ import pool from '../config/db-connection.js';
 import { checkPermission, requestHasAnyPermission } from '../middleware/checkPermission.js';
 import { resolveRequestUserSucursalScope } from '../utils/sucursalScope.js';
 import { registerFacturaLoyaltyAccumulation } from '../services/fidelizacionService.js';
+import { generarCodigoDocumento } from '../services/facturacionCorrelativoService.js';
+import { enviarCorreo } from '../utils/emailService.js';
+import { getClientIp, parseUserAgent } from '../utils/security/clientInfo.js';
+import {
+  createVentaReversion,
+  listFacturaReversiones
+} from '../services/ventasReversionService.js';
 
 const router = express.Router();
 
 const VENTA_DIRECTA_LABEL = 'VENTA DIRECTA';
 const TEGUCIGALPA_TZ = 'America/Tegucigalpa';
-const VENTAS_LIMITED_DAYS = 3;
-const VENTAS_HISTORY_LIMITED_ROLES = new Set(['CAJERO']);
+const VENTAS_DEFAULT_PAGE = 1;
+const VENTAS_DEFAULT_PAGE_SIZE = 30;
+const VENTAS_MAX_PAGE_SIZE = 50;
+const VENTAS_HISTORY_ADMIN_ROLES = new Set(['SUPER_ADMIN', 'ADMINISTRADOR', 'ADMIN']);
+const VENTAS_HISTORY_CAJERO_ROLE = 'CAJERO';
+const VENTAS_LIMIT_72H_CUTOFF_SQL = `(NOW() AT TIME ZONE '${TEGUCIGALPA_TZ}') - INTERVAL '72 hours'`;
 const VENTAS_DESCUENTOS_PERMISSIONS = ['VENTAS_DESCUENTOS_CATALOGO_VER'];
 const VENTAS_DESCUENTOS_WRITE_PERMISSIONS = [
   'VENTAS_DESCUENTOS_CATALOGO_CREAR',
@@ -20,6 +31,13 @@ const DESCUENTO_TIPO_KEYS = {
   MONTO_FIJO: 'MONTO_FIJO',
   PORCENTAJE: 'PORCENTAJE'
 };
+const DESCUENTO_ALCANCE_KEYS = {
+  FACTURA_COMPLETA: 'FACTURA_COMPLETA',
+  PRODUCTO: 'PRODUCTO',
+  RECETA: 'RECETA',
+  COMBO: 'COMBO'
+};
+const VENTAS_DESCUENTO_APLICAR_PERMISSION = 'VENTAS_DESCUENTO_APLICAR';
 const ESTADO_PEDIDO_CODES = {
   PENDIENTE: new Set([
     'pendiente',
@@ -52,8 +70,17 @@ const PEDIDO_ESTADO_PAGO = Object.freeze({
   PAGADO_CONFIRMADO: 'PAGADO_CONFIRMADO',
   CANCELADO_TIMEOUT: 'CANCELADO_TIMEOUT'
 });
+const REVERSION_ALERT_EMAIL = 'gersonmz@jonnyshn.com';
+const REVERSION_FAILURE_EMAIL_COOLDOWN_MS = 60 * 1000;
+const reversionFailureEmailCooldown = new Map();
 
 const roundMoney = (value) => Number((Number(value || 0)).toFixed(2));
+const normalizeTipoItem = (value) => {
+  const normalized = String(value || '').trim().toUpperCase();
+  return ['PRODUCTO', 'RECETA', 'COMBO', 'MIXTO', 'ITEM'].includes(normalized)
+    ? normalized
+    : 'ITEM';
+};
 
 const parsePositiveInt = (value) => {
   const parsed = Number.parseInt(value, 10);
@@ -81,6 +108,49 @@ const parseNonNegativeNumber = (value) => {
   return Number.isFinite(parsed) && parsed >= 0 ? roundMoney(parsed) : null;
 };
 
+const normalizeDescuentoAlcance = (value) => {
+  const normalized = String(value || '')
+    .trim()
+    .toUpperCase();
+  return Object.values(DESCUENTO_ALCANCE_KEYS).includes(normalized) ? normalized : null;
+};
+
+const parseOptionalDateTime = (value) => {
+  if (value === undefined || value === null || value === '') return null;
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? null : date;
+};
+
+const hasDiscountIntentInPayload = (body) => {
+  if (!isPlainObject(body)) return false;
+
+  if (body.id_descuento_catalogo !== undefined && body.id_descuento_catalogo !== null && String(body.id_descuento_catalogo).trim() !== '') {
+    return true;
+  }
+  if (body.descuento !== undefined && Number(body.descuento || 0) > 0) {
+    return true;
+  }
+
+  const descuentosLinea = Array.isArray(body.descuentos_linea) ? body.descuentos_linea : [];
+  if (descuentosLinea.length > 0) return true;
+  if (Array.isArray(body.promociones) && body.promociones.length > 0) return true;
+
+  const items = Array.isArray(body.items) ? body.items : [];
+  return items.some((item) => {
+    if (!isPlainObject(item)) return false;
+    if (item.id_descuento_catalogo !== undefined && item.id_descuento_catalogo !== null && String(item.id_descuento_catalogo).trim() !== '') {
+      return true;
+    }
+    if (item.descuento !== undefined && Number(item.descuento || 0) > 0) {
+      return true;
+    }
+    if (Array.isArray(item.promociones) && item.promociones.length > 0) {
+      return true;
+    }
+    return false;
+  });
+};
+
 const sendVentasInternalError = (
   res,
   message = 'No se pudo procesar la solicitud de ventas.'
@@ -105,6 +175,8 @@ const isPlainObject = (value) =>
   value !== null && typeof value === 'object' && !Array.isArray(value);
 
 const formatVentaNumero = (idVenta) => `VTA-${String(idVenta).padStart(5, '0')}`;
+const resolveVentaNumero = (row) =>
+  String(row?.codigo_venta || '').trim() || formatVentaNumero(row?.id_factura);
 
 const normalizeClienteNombre = (cliente) => {
   const nombrePersona = [cliente?.nombre, cliente?.apellido].filter(Boolean).join(' ').trim();
@@ -134,17 +206,237 @@ const getRequestRoleSet = (req) =>
       .filter(Boolean)
   );
 
-const shouldLimitVentasHistoryByRole = (req) => {
-  const roleSet = getRequestRoleSet(req);
-  if (roleSet.size === 0) return false;
-  return [...roleSet].some((role) => VENTAS_HISTORY_LIMITED_ROLES.has(role));
+const parseBoundedPositiveInt = (value, { fallback, min = 1, max = Number.MAX_SAFE_INTEGER }) => {
+  const parsed = Number.parseInt(String(value ?? ''), 10);
+  if (!Number.isInteger(parsed)) return fallback;
+  if (parsed < min) return min;
+  if (parsed > max) return max;
+  return parsed;
 };
 
-const getVentasHistorySqlFilter = (tableAliasExpr = "COALESCE(p.fecha_hora_pedido, f.fecha_hora_facturacion)") =>
-  `(${tableAliasExpr} AT TIME ZONE '${TEGUCIGALPA_TZ}')::date >= ((NOW() AT TIME ZONE '${TEGUCIGALPA_TZ}')::date - INTERVAL '${VENTAS_LIMITED_DAYS - 1} day')::date`;
+const parseOptionalDateInput = (value) => {
+  if (value === undefined || value === null || value === '') return null;
+  const normalized = String(value).trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(normalized)) return '__INVALID_DATE__';
+  return normalized;
+};
+
+const coercePositiveIntArray = (value) =>
+  [...new Set((Array.isArray(value) ? value : [])
+    .map((item) => Number.parseInt(String(item ?? ''), 10))
+    .filter((item) => Number.isInteger(item) && item > 0))];
+
+const resolveVentasAssignedSucursalIds = async ({ idUsuario, fallbackIds, queryRunner }) => {
+  const allowedIds = new Set(coercePositiveIntArray(fallbackIds));
+  const normalizedUserId = parsePositiveInt(idUsuario);
+  if (!normalizedUserId) return [...allowedIds];
+
+  const candidateQueries = [
+    {
+      sql: `
+        SELECT vus.id_sucursal
+        FROM public.v_usuarios_sucursales_scope vus
+        WHERE vus.id_usuario = $1
+          AND COALESCE(vus.estado, true) = true
+      `,
+      params: [normalizedUserId]
+    },
+    {
+      sql: `
+        SELECT es.id_sucursal
+        FROM public.usuarios u
+        INNER JOIN public.empleados_sucursales es
+          ON es.id_empleado = u.id_empleado
+        WHERE u.id_usuario = $1
+          AND COALESCE(es.estado, true) = true
+      `,
+      params: [normalizedUserId]
+    },
+    {
+      sql: `
+        SELECT us.id_sucursal
+        FROM public.usuarios_sucursales us
+        WHERE us.id_usuario = $1
+      `,
+      params: [normalizedUserId]
+    },
+    {
+      sql: `
+        SELECT e.id_sucursal
+        FROM public.usuarios u
+        INNER JOIN public.empleados e
+          ON e.id_empleado = u.id_empleado
+        WHERE u.id_usuario = $1
+          AND e.id_sucursal IS NOT NULL
+        LIMIT 1
+      `,
+      params: [normalizedUserId]
+    }
+  ];
+
+  for (const candidate of candidateQueries) {
+    try {
+      const result = await queryRunner.query(candidate.sql, candidate.params);
+      if (result.rowCount === 0) continue;
+      for (const row of result.rows) {
+        const parsedId = parsePositiveInt(row.id_sucursal);
+        if (parsedId) allowedIds.add(parsedId);
+      }
+    } catch (err) {
+      if (!['42P01', '42703'].includes(err.code)) {
+        console.error('resolveVentasAssignedSucursalIds error:', err);
+      }
+    }
+  }
+
+  return [...allowedIds];
+};
+
+const resolveVentasHistoryScope = async (req, queryRunner = pool) => {
+  const baseScope = await resolveRequestUserSucursalScope(req, queryRunner);
+  const roleSet = getRequestRoleSet(req);
+  const isSuperAdmin = Boolean(baseScope.isSuperAdmin);
+  const isAdminHistoryRole = [...roleSet].some((role) =>
+    VENTAS_HISTORY_ADMIN_ROLES.has(role)
+  );
+  const isCajero = roleSet.has(VENTAS_HISTORY_CAJERO_ROLE);
+  const limitedToLast72Hours = !isSuperAdmin && !isAdminHistoryRole;
+
+  let allowedSucursalIds = [];
+  if (isSuperAdmin) {
+    const result = await queryRunner.query(
+      `
+        SELECT id_sucursal
+        FROM public.sucursales
+        WHERE COALESCE(estado, true) = true
+        ORDER BY id_sucursal
+      `
+    );
+    allowedSucursalIds = result.rows
+      .map((row) => parseOptionalPositiveInt(row.id_sucursal))
+      .filter(Boolean);
+  } else {
+    const empleadoSucursalId = parseOptionalPositiveInt(baseScope.userSucursalId);
+    if (empleadoSucursalId) {
+      allowedSucursalIds = [empleadoSucursalId];
+    }
+  }
+
+  return {
+    idUsuario: baseScope.idUsuario,
+    roles: [...roleSet],
+    isSuperAdmin,
+    isAdminHistoryRole,
+    isCajero,
+    limitedToLast72Hours,
+    allowedSucursalIds,
+    userSucursalId: parseOptionalPositiveInt(baseScope.userSucursalId)
+  };
+};
 
 const parseBooleanish = (value) =>
   value === true || value === 'true' || value === 1 || value === '1';
+
+const shouldSendReversionFailureEmail = ({ idUsuario, idFactura }) => {
+  const key = `${Number(idUsuario || 0)}:${Number(idFactura || 0)}`;
+  const now = Date.now();
+  const previous = reversionFailureEmailCooldown.get(key) || 0;
+  if (now - previous < REVERSION_FAILURE_EMAIL_COOLDOWN_MS) {
+    return false;
+  }
+  reversionFailureEmailCooldown.set(key, now);
+  return true;
+};
+
+const registerReversionFailureAttempt = async ({
+  idFactura,
+  idUsuario,
+  idSucursal,
+  motivo,
+  errorCode,
+  errorMessagePublic,
+  ipOrigen,
+  userAgent,
+  dispositivo
+}) => {
+  try {
+    await pool.query(
+      `
+        INSERT INTO public.facturas_reversiones_intentos (
+          id_factura,
+          id_usuario,
+          id_sucursal,
+          motivo,
+          error_code,
+          error_message_publico,
+          ip_origen,
+          user_agent,
+          dispositivo
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+      `,
+      [
+        parseOptionalPositiveInt(idFactura),
+        parseOptionalPositiveInt(idUsuario),
+        parseOptionalPositiveInt(idSucursal),
+        String(motivo || '').trim().toUpperCase() || null,
+        String(errorCode || 'VENTAS_REVERSION_ERROR').slice(0, 100),
+        String(errorMessagePublic || 'No se pudo completar la reversión.').slice(0, 300),
+        String(ipOrigen || '-').slice(0, 80),
+        String(userAgent || 'Desconocido').slice(0, 500),
+        String(dispositivo || 'Desconocido').slice(0, 80)
+      ]
+    );
+  } catch (auditErr) {
+    console.error('Error registrando intento fallido de reversión:', auditErr);
+  }
+};
+
+const sendReversionSuccessEmail = async ({ payload }) => {
+  const html = `
+    <h2>Reversión registrada</h2>
+    <p><strong>Resultado:</strong> EXITOSA</p>
+    <p><strong>Código reversión:</strong> ${payload.codigo_reversion}</p>
+    <p><strong>Venta:</strong> ${payload.codigo_venta}</p>
+    <p><strong>Usuario:</strong> ${payload.usuario || '-'}</p>
+    <p><strong>Sucursal:</strong> ${payload.id_sucursal}</p>
+    <p><strong>Caja original:</strong> ${payload.id_caja_original || '-'}</p>
+    <p><strong>Caja actual:</strong> ${payload.id_caja_actual || '-'}</p>
+    <p><strong>Motivo:</strong> ${payload.motivo}</p>
+    <p><strong>Tipo:</strong> ${payload.tipo_reversion}</p>
+    <p><strong>Monto reversado:</strong> L ${roundMoney(payload.monto_reversado)}</p>
+    <p><strong>Fecha operación:</strong> ${payload.fecha_operacion}</p>
+    <p><strong>IP:</strong> ${payload.ip_origen}</p>
+    <p><strong>User-Agent:</strong> ${payload.user_agent}</p>
+  `;
+  await enviarCorreo(
+    REVERSION_ALERT_EMAIL,
+    `Reversión registrada - ${payload.codigo_reversion} / ${payload.codigo_venta}`,
+    html,
+    { id_usuario: payload.id_usuario, tipo_correo: 'reversion_exito', fromKey: 'ADMON' }
+  );
+};
+
+const sendReversionFailureEmail = async ({ payload }) => {
+  const html = `
+    <h2>Intento fallido de reversión</h2>
+    <p><strong>Resultado:</strong> FALLIDA</p>
+    <p><strong>Venta:</strong> ${payload.codigo_venta || `VTA-${String(payload.id_factura).padStart(5, '0')}`}</p>
+    <p><strong>Usuario:</strong> ${payload.usuario || '-'}</p>
+    <p><strong>Sucursal:</strong> ${payload.id_sucursal || '-'}</p>
+    <p><strong>Motivo solicitado:</strong> ${payload.motivo || '-'}</p>
+    <p><strong>Error controlado:</strong> ${payload.error || 'No se pudo completar la reversión.'}</p>
+    <p><strong>Fecha/hora:</strong> ${new Date().toISOString()}</p>
+    <p><strong>IP:</strong> ${payload.ip_origen || '-'}</p>
+    <p><strong>User-Agent:</strong> ${payload.user_agent || '-'}</p>
+  `;
+  await enviarCorreo(
+    REVERSION_ALERT_EMAIL,
+    `Intento fallido de reversión - ${payload.codigo_venta || `VTA-${String(payload.id_factura).padStart(5, '0')}`}`,
+    html,
+    { id_usuario: payload.id_usuario, tipo_correo: 'reversion_fallida', fromKey: 'ADMON' }
+  );
+};
 
 const parseEntityIdentifier = (value, fieldName) => {
   if (
@@ -208,7 +500,7 @@ const inferKitchenItemQuantity = (rawSubtotal, rawUnitPrice) => {
 const buildDirectSaleDetailItems = (rows) =>
   rows.map((row) => ({
     ...row,
-    tipo_item: 'PRODUCTO',
+    tipo_item: String(row.tipo_item || 'PRODUCTO').toUpperCase(),
     nombre_item: row.nombre_item || row.nombre_producto || 'Producto',
     nombre_producto: row.nombre_producto || row.nombre_item || 'Producto',
     cantidad: Number(row.cantidad ?? 0) || 0,
@@ -224,7 +516,10 @@ const buildKitchenSaleDetailItems = (rows) =>
     ...row,
     nombre_item: row.nombre_item || 'Item de cocina',
     nombre_producto: row.nombre_item || 'Item de cocina',
-    cantidad: inferKitchenItemQuantity(row.sub_total, row.precio_unitario),
+    cantidad:
+      Number(row.cantidad ?? 0) > 0
+        ? Number(row.cantidad)
+        : inferKitchenItemQuantity(row.sub_total, row.precio_unitario),
     precio_unitario: roundMoney(row.precio_unitario),
     sub_total: roundMoney(row.sub_total),
     total_linea: roundMoney(row.total_linea),
@@ -276,13 +571,26 @@ const normalizeVentaItems = (items) => {
     }
 
     const [kind, entityId] = presentIds[0];
+    const idDescuentoCatalogoLinea = parseOptionalPositiveInt(item.id_descuento_catalogo);
+    if (
+      item.id_descuento_catalogo !== undefined &&
+      item.id_descuento_catalogo !== null &&
+      !idDescuentoCatalogoLinea
+    ) {
+      return {
+        ok: false,
+        message: 'id_descuento_catalogo por linea debe ser entero mayor a 0.'
+      };
+    }
+
     normalized.push({
       kind,
       cantidad,
       id_producto: kind === 'PRODUCTO' ? entityId : null,
       id_combo: kind === 'COMBO' ? entityId : null,
       id_receta: kind === 'RECETA' ? entityId : null,
-      observacion: normalizeObservation(item.observacion)
+      observacion: normalizeObservation(item.observacion),
+      id_descuento_catalogo_linea: idDescuentoCatalogoLinea
     });
   }
 
@@ -384,6 +692,13 @@ const fetchDiscountCatalogById = async (client, idDescuentoCatalogo) => {
         dc.nombre_descuento,
         dc.valor_descuento,
         dc.estado,
+        dc.alcance,
+        dc.id_producto,
+        dc.id_receta,
+        dc.id_combo,
+        dc.id_sucursal,
+        dc.fecha_inicio,
+        dc.fecha_fin,
         dc.id_tipo_descuento,
         td.nombre_tipo_descuento,
         td.estado AS tipo_estado
@@ -418,6 +733,84 @@ const computeDiscountValue = ({ subtotalBruto, valorDescuento, tipoDescuentoKey 
   }
 
   return roundMoney(Math.min(safeSubtotal, safeValor));
+};
+
+const validateCatalogDiscountAvailability = ({
+  discountCatalog,
+  idSucursal,
+  subtotalObjetivo,
+  alcanceEsperado = null,
+  line = null
+}) => {
+  if (!discountCatalog) {
+    return { ok: false, status: 400, code: 'VENTAS_DESCUENTO_CATALOGO_NO_EXISTE', message: 'El descuento enviado no existe.' };
+  }
+  if (!parseBooleanish(discountCatalog.estado)) {
+    return { ok: false, status: 409, code: 'VENTAS_DESCUENTO_INACTIVO', message: 'El descuento seleccionado esta inactivo.' };
+  }
+  if (!parseBooleanish(discountCatalog.tipo_estado)) {
+    return { ok: false, status: 409, code: 'VENTAS_DESCUENTO_INACTIVO', message: 'El tipo de descuento seleccionado esta inactivo.' };
+  }
+
+  const alcance = normalizeDescuentoAlcance(discountCatalog.alcance || DESCUENTO_ALCANCE_KEYS.FACTURA_COMPLETA);
+  if (!alcance) {
+    return { ok: false, status: 409, code: 'VENTAS_DESCUENTO_ALCANCE_INVALIDO', message: 'El descuento tiene alcance invalido.' };
+  }
+  if (alcanceEsperado && alcance !== alcanceEsperado) {
+    return { ok: false, status: 409, code: 'VENTAS_DESCUENTO_ITEM_NO_APLICA', message: 'El descuento no aplica al item seleccionado.' };
+  }
+
+  const startsAt = parseOptionalDateTime(discountCatalog.fecha_inicio);
+  const endsAt = parseOptionalDateTime(discountCatalog.fecha_fin);
+  const now = new Date();
+  if (startsAt && now < startsAt) {
+    return { ok: false, status: 409, code: 'VENTAS_DESCUENTO_VENCIDO', message: 'El descuento aun no esta vigente.' };
+  }
+  if (endsAt && now > endsAt) {
+    return { ok: false, status: 409, code: 'VENTAS_DESCUENTO_VENCIDO', message: 'El descuento ya vencio.' };
+  }
+
+  const idSucursalDescuento = parseOptionalPositiveInt(discountCatalog.id_sucursal);
+  if (idSucursalDescuento && Number(idSucursalDescuento) !== Number(idSucursal)) {
+    return { ok: false, status: 409, code: 'VENTAS_DESCUENTO_SUCURSAL_NO_VALIDA', message: 'El descuento no aplica para la sucursal de la venta.' };
+  }
+
+  const tipoDescuentoKey = resolveDiscountTypeKey(discountCatalog.nombre_tipo_descuento);
+  if (!tipoDescuentoKey) {
+    return { ok: false, status: 409, code: 'VENTAS_DESCUENTO_ALCANCE_INVALIDO', message: 'El tipo de descuento seleccionado no es soportado.' };
+  }
+
+  const subtotalBase = roundMoney(Math.max(0, Number(subtotalObjetivo || 0)));
+  const montoCalculado = computeDiscountValue({
+    subtotalBruto: subtotalBase,
+    valorDescuento: discountCatalog.valor_descuento,
+    tipoDescuentoKey
+  });
+  if (montoCalculado < 0) {
+    return { ok: false, status: 409, code: 'VENTAS_DESCUENTO_MONTO_INVALIDO', message: 'El descuento tiene un monto invalido.' };
+  }
+  if (montoCalculado > subtotalBase) {
+    return { ok: false, status: 409, code: 'VENTAS_DESCUENTO_SUPERA_SUBTOTAL', message: 'El descuento supera el subtotal permitido.' };
+  }
+
+  if (line) {
+    if (alcance === DESCUENTO_ALCANCE_KEYS.PRODUCTO && Number(discountCatalog.id_producto || 0) !== Number(line.id_producto || 0)) {
+      return { ok: false, status: 409, code: 'VENTAS_DESCUENTO_ITEM_NO_APLICA', message: 'El descuento de producto no aplica a esta linea.' };
+    }
+    if (alcance === DESCUENTO_ALCANCE_KEYS.RECETA && Number(discountCatalog.id_receta || 0) !== Number(line.id_receta || 0)) {
+      return { ok: false, status: 409, code: 'VENTAS_DESCUENTO_ITEM_NO_APLICA', message: 'El descuento de receta no aplica a esta linea.' };
+    }
+    if (alcance === DESCUENTO_ALCANCE_KEYS.COMBO && Number(discountCatalog.id_combo || 0) !== Number(line.id_combo || 0)) {
+      return { ok: false, status: 409, code: 'VENTAS_DESCUENTO_ITEM_NO_APLICA', message: 'El descuento de combo no aplica a esta linea.' };
+    }
+  }
+
+  return {
+    ok: true,
+    alcance,
+    tipoDescuentoKey,
+    montoCalculado
+  };
 };
 
 const aggregateProductoQuantities = (normalizedItems) => {
@@ -829,12 +1222,13 @@ const hydrateVentaLines = async (client, normalizedItems) => {
         id_producto: item.id_producto,
         id_combo: null,
         id_receta: null,
+        id_descuento_catalogo_linea: item.id_descuento_catalogo_linea ?? null,
         id_almacen: idAlmacen,
         nombre_item: producto.nombre_producto,
         cantidad: item.cantidad,
         precio_unitario: precioUnitario,
         sub_total: subTotal,
-        observacion: null
+        observacion: item.observacion
       });
       subTotals.push(subTotal);
       continue;
@@ -867,6 +1261,7 @@ const hydrateVentaLines = async (client, normalizedItems) => {
         id_producto: null,
         id_combo: item.id_combo,
         id_receta: null,
+        id_descuento_catalogo_linea: item.id_descuento_catalogo_linea ?? null,
         id_almacen: null,
         nombre_item: combo.descripcion || `Combo #${item.id_combo}`,
         cantidad: item.cantidad,
@@ -904,6 +1299,7 @@ const hydrateVentaLines = async (client, normalizedItems) => {
       id_producto: null,
       id_combo: null,
       id_receta: item.id_receta,
+      id_descuento_catalogo_linea: item.id_descuento_catalogo_linea ?? null,
       id_almacen: null,
       nombre_item: receta.nombre_receta || `Receta #${item.id_receta}`,
       cantidad: item.cantidad,
@@ -917,7 +1313,7 @@ const hydrateVentaLines = async (client, normalizedItems) => {
   return { ok: true, data: { lines, subTotals } };
 };
 
-const buildVentaPayload = async ({ client, body, userId, sucursalScope }) => {
+const buildVentaPayload = async ({ client, body, userId, sucursalScope, canApplyDiscount }) => {
   if (!isPlainObject(body)) {
     return {
       ok: false,
@@ -1074,51 +1470,61 @@ const buildVentaPayload = async ({ client, body, userId, sucursalScope }) => {
   const subtotalBruto = roundMoney(subTotals.reduce((sum, value) => sum + value, 0));
   let descuentoTotal = descuentoLegacyInput || 0;
   let appliedDiscountCatalog = null;
+  const hasGlobalCatalogDiscount = Boolean(idDescuentoCatalogo);
+  const hasLegacyDiscount = Number(descuentoLegacyInput || 0) > 0;
+  const hasLineDiscountAttempt = lines.some((line) => Number(line.id_descuento_catalogo_linea || 0) > 0);
+  const hasDiscountAttempt = hasGlobalCatalogDiscount || hasLegacyDiscount || hasLineDiscountAttempt;
+
+  if (hasDiscountAttempt && !canApplyDiscount) {
+    return {
+      ok: false,
+      status: 403,
+      body: {
+        error: true,
+        code: 'VENTAS_DESCUENTO_NO_AUTORIZADO',
+        message: 'No tienes permiso para aplicar descuentos en ventas.'
+      }
+    };
+  }
+
+  if ((hasGlobalCatalogDiscount || hasLegacyDiscount) && hasLineDiscountAttempt) {
+    return {
+      ok: false,
+      status: 409,
+      body: {
+        error: true,
+        code: 'VENTAS_DESCUENTO_ACUMULACION_NO_PERMITIDA',
+        message: 'No se permite combinar descuento global con descuentos por linea.'
+      }
+    };
+  }
 
   if (idDescuentoCatalogo) {
     const discountCatalog = await fetchDiscountCatalogById(client, idDescuentoCatalogo);
-    if (!discountCatalog) {
-      return {
-        ok: false,
-        status: 400,
-        body: { error: true, message: 'id_descuento_catalogo no existe.' }
-      };
-    }
-
-    if (!parseBooleanish(discountCatalog.estado)) {
-      return {
-        ok: false,
-        status: 409,
-        body: { error: true, message: 'El descuento seleccionado esta inactivo.' }
-      };
-    }
-
-    if (!parseBooleanish(discountCatalog.tipo_estado)) {
-      return {
-        ok: false,
-        status: 409,
-        body: { error: true, message: 'El tipo de descuento seleccionado esta inactivo.' }
-      };
-    }
-
-    const tipoDescuentoKey = resolveDiscountTypeKey(discountCatalog.nombre_tipo_descuento);
-    if (!tipoDescuentoKey) {
-      return {
-        ok: false,
-        status: 409,
-        body: { error: true, message: 'El tipo de descuento seleccionado no es soportado.' }
-      };
-    }
-
-    descuentoTotal = computeDiscountValue({
-      subtotalBruto,
-      valorDescuento: discountCatalog.valor_descuento,
-      tipoDescuentoKey
+    const validatedGlobalDiscount = validateCatalogDiscountAvailability({
+      discountCatalog,
+      idSucursal,
+      subtotalObjetivo: subtotalBruto,
+      alcanceEsperado: DESCUENTO_ALCANCE_KEYS.FACTURA_COMPLETA
     });
+    if (!validatedGlobalDiscount.ok) {
+      return {
+        ok: false,
+        status: validatedGlobalDiscount.status,
+        body: {
+          error: true,
+          code: validatedGlobalDiscount.code,
+          message: validatedGlobalDiscount.message
+        }
+      };
+    }
+
+    descuentoTotal = validatedGlobalDiscount.montoCalculado;
     appliedDiscountCatalog = {
       id_descuento_catalogo: Number(discountCatalog.id_descuento_catalogo),
       id_tipo_descuento: Number(discountCatalog.id_tipo_descuento),
-      tipo_descuento_key: tipoDescuentoKey
+      tipo_descuento_key: validatedGlobalDiscount.tipoDescuentoKey,
+      alcance: validatedGlobalDiscount.alcance
     };
   }
 
@@ -1131,12 +1537,56 @@ const buildVentaPayload = async ({ client, body, userId, sucursalScope }) => {
   }
 
   const descuentosPorLinea = allocateDiscounts(subTotals, descuentoTotal);
+  const descuentosLineaMap = new Map();
+  const descuentosCatalogoLineaMap = new Map();
+
+  if (hasLineDiscountAttempt) {
+    for (let index = 0; index < lines.length; index += 1) {
+      const line = lines[index];
+      const idDescuentoLinea = parseOptionalPositiveInt(line.id_descuento_catalogo_linea);
+      if (!idDescuentoLinea) continue;
+
+      const discountCatalog = await fetchDiscountCatalogById(client, idDescuentoLinea);
+      const expectedScope = line.kind;
+      const validatedLineDiscount = validateCatalogDiscountAvailability({
+        discountCatalog,
+        idSucursal,
+        subtotalObjetivo: line.sub_total,
+        alcanceEsperado: expectedScope,
+        line
+      });
+      if (!validatedLineDiscount.ok) {
+        return {
+          ok: false,
+          status: validatedLineDiscount.status,
+          body: {
+            error: true,
+            code: validatedLineDiscount.code,
+            message: validatedLineDiscount.message
+          }
+        };
+      }
+
+      descuentosLineaMap.set(index, validatedLineDiscount.montoCalculado);
+      descuentosCatalogoLineaMap.set(index, Number(discountCatalog.id_descuento_catalogo));
+    }
+  }
+
   const finalizedLines = lines.map((line, index) => ({
     ...line,
-    id_descuento_catalogo: appliedDiscountCatalog?.id_descuento_catalogo ?? null,
-    descuento: descuentosPorLinea[index],
-    total_linea: roundMoney(line.sub_total - descuentosPorLinea[index])
+    id_descuento_catalogo:
+      hasLineDiscountAttempt
+        ? descuentosCatalogoLineaMap.get(index) || null
+        : appliedDiscountCatalog?.id_descuento_catalogo ?? null,
+    descuento: hasLineDiscountAttempt
+      ? roundMoney(descuentosLineaMap.get(index) || 0)
+      : descuentosPorLinea[index],
+    total_linea: hasLineDiscountAttempt
+      ? roundMoney(line.sub_total - roundMoney(descuentosLineaMap.get(index) || 0))
+      : roundMoney(line.sub_total - descuentosPorLinea[index])
   }));
+
+  descuentoTotal = roundMoney(finalizedLines.reduce((sum, line) => sum + Number(line.descuento || 0), 0));
 
   const subtotal = roundMoney(finalizedLines.reduce((sum, line) => sum + line.total_linea, 0));
   const isv = roundMoney(subtotal * 0.15);
@@ -1176,9 +1626,10 @@ const buildVentaPayload = async ({ client, body, userId, sucursalScope }) => {
   }
   const { id_caja: idCaja, id_sesion_caja: idSesionCaja } = sessionActiva.data;
   const kitchenLines = finalizedLines.filter((line) => line.requiere_cocina);
-  const requiresPedido = kitchenLines.length > 0;
-  const pedidoLines = requiresPedido ? finalizedLines : [];
-  const directLines = requiresPedido ? [] : finalizedLines;
+  // Fase 4.2: toda venta nueva debe pasar por cocina, incluyendo PRODUCTO directo.
+  const requiresPedido = finalizedLines.length > 0;
+  const pedidoLines = finalizedLines;
+  const directLines = [];
   const pedidoSubtotal = roundMoney(
     pedidoLines.reduce((sum, line) => sum + line.total_linea, 0)
   );
@@ -1253,6 +1704,13 @@ const validateDescuentoCatalogoPayload = async (client, payload, options = {}) =
       : String(payload.descripcion).trim() || null;
   const valorDescuento = parseNonNegativeNumber(payload.valor_descuento);
   const tipoResult = parseRequiredPositiveInt(payload.id_tipo_descuento, 'id_tipo_descuento');
+  const alcance = normalizeDescuentoAlcance(payload.alcance || DESCUENTO_ALCANCE_KEYS.FACTURA_COMPLETA);
+  const idProducto = parseOptionalPositiveInt(payload.id_producto);
+  const idReceta = parseOptionalPositiveInt(payload.id_receta);
+  const idCombo = parseOptionalPositiveInt(payload.id_combo);
+  const idSucursal = parseOptionalPositiveInt(payload.id_sucursal);
+  const fechaInicio = payload.fecha_inicio ? String(payload.fecha_inicio).trim() : null;
+  const fechaFin = payload.fecha_fin ? String(payload.fecha_fin).trim() : null;
 
   if (!nombre) {
     return { ok: false, status: 400, message: 'nombre_descuento es obligatorio.' };
@@ -1262,6 +1720,35 @@ const validateDescuentoCatalogoPayload = async (client, payload, options = {}) =
   }
   if (!tipoResult.ok) {
     return { ok: false, status: 400, message: tipoResult.message };
+  }
+  if (!alcance) {
+    return { ok: false, status: 400, message: 'alcance invalido.' };
+  }
+
+  const idsObjetivo = [idProducto, idReceta, idCombo].filter(Boolean);
+  if (alcance === DESCUENTO_ALCANCE_KEYS.PRODUCTO && !idProducto) {
+    return { ok: false, status: 400, message: 'id_producto es obligatorio para alcance PRODUCTO.' };
+  }
+  if (alcance === DESCUENTO_ALCANCE_KEYS.RECETA && !idReceta) {
+    return { ok: false, status: 400, message: 'id_receta es obligatorio para alcance RECETA.' };
+  }
+  if (alcance === DESCUENTO_ALCANCE_KEYS.COMBO && !idCombo) {
+    return { ok: false, status: 400, message: 'id_combo es obligatorio para alcance COMBO.' };
+  }
+  if (alcance === DESCUENTO_ALCANCE_KEYS.FACTURA_COMPLETA && idsObjetivo.length > 0) {
+    return { ok: false, status: 400, message: 'FACTURA_COMPLETA no permite id_producto/id_receta/id_combo.' };
+  }
+  if (alcance !== DESCUENTO_ALCANCE_KEYS.FACTURA_COMPLETA && idsObjetivo.length !== 1) {
+    return { ok: false, status: 400, message: 'Debe enviar un unico objetivo para el alcance seleccionado.' };
+  }
+  if (fechaInicio && parseOptionalDateTime(fechaInicio) === null) {
+    return { ok: false, status: 400, message: 'fecha_inicio invalida.' };
+  }
+  if (fechaFin && parseOptionalDateTime(fechaFin) === null) {
+    return { ok: false, status: 400, message: 'fecha_fin invalida.' };
+  }
+  if (fechaInicio && fechaFin && new Date(fechaFin) < new Date(fechaInicio)) {
+    return { ok: false, status: 400, message: 'fecha_fin no puede ser menor a fecha_inicio.' };
   }
 
   const tipoResultRow = await client.query(
@@ -1293,6 +1780,13 @@ const validateDescuentoCatalogoPayload = async (client, payload, options = {}) =
       nombre_descuento: nombre,
       descripcion,
       valor_descuento: valorDescuento,
+      alcance,
+      id_producto: idProducto,
+      id_receta: idReceta,
+      id_combo: idCombo,
+      id_sucursal: idSucursal,
+      fecha_inicio: fechaInicio,
+      fecha_fin: fechaFin,
       id_tipo_descuento: tipoResult.value,
       estado: estadoParsed.value,
       mode
@@ -1499,6 +1993,13 @@ router.get('/ventas/catalogos/descuentos', async (req, res) => {
           dc.nombre_descuento,
           dc.descripcion,
           dc.valor_descuento,
+          dc.alcance,
+          dc.id_producto,
+          dc.id_receta,
+          dc.id_combo,
+          dc.id_sucursal,
+          dc.fecha_inicio,
+          dc.fecha_fin,
           dc.id_tipo_descuento,
           td.nombre_tipo_descuento
         FROM descuentos_catalogos dc
@@ -1541,13 +2042,28 @@ router.get('/ventas/descuentos-catalogos', checkPermission(VENTAS_DESCUENTOS_PER
           dc.nombre_descuento,
           dc.descripcion,
           dc.valor_descuento,
+          dc.alcance,
+          dc.id_producto,
+          dc.id_receta,
+          dc.id_combo,
+          dc.id_sucursal,
+          dc.fecha_inicio,
+          dc.fecha_fin,
           dc.id_tipo_descuento,
           td.nombre_tipo_descuento,
+          p.nombre_producto,
+          r.nombre_receta,
+          COALESCE(cb.nombre_combo, cb.descripcion) AS nombre_combo,
+          s.nombre_sucursal,
           dc.estado,
           dc.fecha_creacion,
           dc.id_usuario
         FROM descuentos_catalogos dc
         INNER JOIN tipo_descuentos td ON td.id_tipo_descuento = dc.id_tipo_descuento
+        LEFT JOIN productos p ON p.id_producto = dc.id_producto
+        LEFT JOIN recetas r ON r.id_receta = dc.id_receta
+        LEFT JOIN combos cb ON cb.id_combo = dc.id_combo
+        LEFT JOIN sucursales s ON s.id_sucursal = dc.id_sucursal
         ${whereSql}
         ORDER BY dc.id_descuento_catalogo DESC
       `,
@@ -1575,13 +2091,28 @@ router.get('/ventas/descuentos-catalogos/:id', checkPermission(VENTAS_DESCUENTOS
           dc.nombre_descuento,
           dc.descripcion,
           dc.valor_descuento,
+          dc.alcance,
+          dc.id_producto,
+          dc.id_receta,
+          dc.id_combo,
+          dc.id_sucursal,
+          dc.fecha_inicio,
+          dc.fecha_fin,
           dc.id_tipo_descuento,
           td.nombre_tipo_descuento,
+          p.nombre_producto,
+          r.nombre_receta,
+          COALESCE(cb.nombre_combo, cb.descripcion) AS nombre_combo,
+          s.nombre_sucursal,
           dc.estado,
           dc.fecha_creacion,
           dc.id_usuario
         FROM descuentos_catalogos dc
         INNER JOIN tipo_descuentos td ON td.id_tipo_descuento = dc.id_tipo_descuento
+        LEFT JOIN productos p ON p.id_producto = dc.id_producto
+        LEFT JOIN recetas r ON r.id_receta = dc.id_receta
+        LEFT JOIN combos cb ON cb.id_combo = dc.id_combo
+        LEFT JOIN sucursales s ON s.id_sucursal = dc.id_sucursal
         WHERE dc.id_descuento_catalogo = $1
         LIMIT 1
       `,
@@ -1616,18 +2147,32 @@ router.post('/ventas/descuentos-catalogos', checkPermission(VENTAS_DESCUENTOS_WR
           nombre_descuento,
           descripcion,
           valor_descuento,
+          alcance,
+          id_producto,
+          id_receta,
+          id_combo,
+          id_sucursal,
+          fecha_inicio,
+          fecha_fin,
           id_tipo_descuento,
           estado,
           fecha_creacion,
           id_usuario
         )
-        VALUES ($1, $2, $3, $4, $5, NOW(), $6)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NOW(), $13)
         RETURNING id_descuento_catalogo
       `,
       [
         validated.data.nombre_descuento,
         validated.data.descripcion,
         validated.data.valor_descuento,
+        validated.data.alcance,
+        validated.data.id_producto,
+        validated.data.id_receta,
+        validated.data.id_combo,
+        validated.data.id_sucursal,
+        validated.data.fecha_inicio,
+        validated.data.fecha_fin,
         validated.data.id_tipo_descuento,
         validated.data.estado,
         req.user?.id_usuario ?? null
@@ -1679,14 +2224,28 @@ router.put('/ventas/descuentos-catalogos/:id', checkPermission(VENTAS_DESCUENTOS
           nombre_descuento = $1,
           descripcion = $2,
           valor_descuento = $3,
-          id_tipo_descuento = $4,
-          estado = $5
-        WHERE id_descuento_catalogo = $6
+          alcance = $4,
+          id_producto = $5,
+          id_receta = $6,
+          id_combo = $7,
+          id_sucursal = $8,
+          fecha_inicio = $9,
+          fecha_fin = $10,
+          id_tipo_descuento = $11,
+          estado = $12
+        WHERE id_descuento_catalogo = $13
       `,
       [
         validated.data.nombre_descuento,
         validated.data.descripcion,
         validated.data.valor_descuento,
+        validated.data.alcance,
+        validated.data.id_producto,
+        validated.data.id_receta,
+        validated.data.id_combo,
+        validated.data.id_sucursal,
+        validated.data.fecha_inicio,
+        validated.data.fecha_fin,
         validated.data.id_tipo_descuento,
         validated.data.estado,
         id
@@ -1744,42 +2303,82 @@ router.get('/ventas', checkPermission(['VENTAS_VER']), async (req, res) => {
   try {
     const filters = [];
     const params = [];
-
     const pushFilter = (fragment, value) => {
       params.push(value);
-      filters.push(fragment.replace('$IDX', `$${params.length}`));
+      filters.push(fragment.replaceAll('$IDX', `$${params.length}`));
     };
 
-    const q = typeof req.query.q === 'string' ? req.query.q.trim() : '';
+    const page = parseBoundedPositiveInt(req.query.page, {
+      fallback: VENTAS_DEFAULT_PAGE,
+      min: 1
+    });
+    const pageSize = parseBoundedPositiveInt(req.query.pageSize, {
+      fallback: VENTAS_DEFAULT_PAGE_SIZE,
+      min: 1,
+      max: VENTAS_MAX_PAGE_SIZE
+    });
+    const offset = (page - 1) * pageSize;
+
+    const scope = await resolveVentasHistoryScope(req);
+    if (!scope.allowedSucursalIds.length) {
+      return res.status(403).json({ error: true, message: 'El empleado no tiene sucursales asignadas.' });
+    }
+
+    const searchFromQ = typeof req.query.q === 'string' ? req.query.q.trim() : '';
+    const searchFromSearch = typeof req.query.search === 'string' ? req.query.search.trim() : '';
+    const search = searchFromQ || searchFromSearch || '';
+    const codigoVenta = typeof req.query.codigoVenta === 'string' ? req.query.codigoVenta.trim() : '';
+    const metodoPago = typeof req.query.metodoPago === 'string' ? req.query.metodoPago.trim() : '';
+    const cliente = typeof req.query.cliente === 'string' ? req.query.cliente.trim() : '';
+    const estado = typeof req.query.estado === 'string' ? req.query.estado.trim() : '';
+
+    const fechaDesde = parseOptionalDateInput(req.query.fechaDesde);
+    const fechaHasta = parseOptionalDateInput(req.query.fechaHasta);
+    if (fechaDesde === '__INVALID_DATE__' || fechaHasta === '__INVALID_DATE__') {
+      return res.status(400).json({
+        error: true,
+        code: 'VENTAS_FECHA_INVALIDA',
+        message: 'fechaDesde y fechaHasta deben tener formato YYYY-MM-DD.'
+      });
+    }
+
     const idEstadoPedido = parseOptionalPositiveInt(req.query.id_estado_pedido);
-    let idSucursal = parseOptionalPositiveInt(req.query.id_sucursal);
     const idCliente = parseOptionalPositiveInt(req.query.id_cliente);
+    const idSucursalRaw = req.query.idSucursal ?? req.query.id_sucursal;
+    const idSucursalRequested = parseOptionalPositiveInt(idSucursalRaw);
 
-    const scope = await resolveRequestUserSucursalScope(req);
-    const isSuperAdmin = Boolean(scope.isSuperAdmin);
-    const userSucursalId = parseOptionalPositiveInt(scope.userSucursalId);
-
-    if (!isSuperAdmin) {
-      if (!scope.allowedSucursalIds || scope.allowedSucursalIds.length === 0) {
-        return res.status(403).json({ error: true, message: 'El empleado no tiene sucursales asignadas.' });
+    let idSucursalEffective = null;
+    if (scope.isSuperAdmin) {
+      idSucursalEffective = idSucursalRequested;
+      if (idSucursalEffective && !scope.allowedSucursalIds.includes(idSucursalEffective)) {
+        return res.status(403).json({ error: true, message: 'No tiene acceso a la sucursal solicitada.' });
       }
-      
-      if (idSucursal) {
-        if (!scope.allowedSucursalIds.includes(idSucursal)) {
-          return res.status(403).json({ error: true, message: 'No tiene acceso a la sucursal solicitada.' });
-        }
-      } else {
-        // Si no pasa idSucursal, filtramos por todas las permitidas
-        pushFilter('COALESCE(p.id_sucursal, f.id_sucursal) = ANY($IDX::int[])', scope.allowedSucursalIds);
+    } else {
+      idSucursalEffective = scope.userSucursalId;
+      if (!idSucursalEffective) {
+        return res.status(403).json({ error: true, message: 'El empleado no tiene sucursal vinculada.' });
       }
     }
-    if (q) {
-      const qLike = `%${q}%`;
+
+    if (idSucursalEffective) {
+      pushFilter('COALESCE(p.id_sucursal, f.id_sucursal) = $IDX', idSucursalEffective);
+    } else {
+      pushFilter('COALESCE(p.id_sucursal, f.id_sucursal) = ANY($IDX::int[])', scope.allowedSucursalIds);
+    }
+
+    if (scope.limitedToLast72Hours) {
+      filters.push(`f.fecha_hora_facturacion IS NOT NULL`);
+      filters.push(`f.fecha_hora_facturacion >= ${VENTAS_LIMIT_72H_CUTOFF_SQL}`);
+    }
+
+    if (search) {
+      const qLike = `%${search}%`;
       pushFilter(
         `
           (
             f.id_factura::text ILIKE $IDX
             OR COALESCE(f.id_pedido::text, '') ILIKE $IDX
+            OR COALESCE(f.codigo_venta, '') ILIKE $IDX
             OR COALESCE(ep.descripcion, '${VENTA_DIRECTA_LABEL}') ILIKE $IDX
             OR COALESCE(s.nombre_sucursal, '') ILIKE $IDX
             OR COALESCE(u.nombre_usuario, '') ILIKE $IDX
@@ -1790,27 +2389,131 @@ router.get('/ventas', checkPermission(['VENTAS_VER']), async (req, res) => {
       );
     }
 
-    if (idEstadoPedido) {
-      pushFilter('p.id_estado_pedido = $IDX', idEstadoPedido);
+    if (codigoVenta) {
+      pushFilter('COALESCE(f.codigo_venta, \'\') ILIKE $IDX', `%${codigoVenta}%`);
     }
 
-    if (idSucursal) {
-      pushFilter('COALESCE(p.id_sucursal, f.id_sucursal) = $IDX', idSucursal);
+    if (metodoPago) {
+      pushFilter(
+        `
+          EXISTS (
+            SELECT 1
+            FROM facturas_cobros fc_q
+            INNER JOIN cat_metodos_pago cmp_q
+              ON cmp_q.id_metodo_pago = fc_q.id_metodo_pago
+            WHERE fc_q.id_factura = f.id_factura
+              AND (
+                cmp_q.nombre ILIKE $IDX
+                OR COALESCE(cmp_q.codigo, '') ILIKE $IDX
+              )
+          )
+        `,
+        `%${metodoPago}%`
+      );
+    }
+
+    if (cliente) {
+      pushFilter(
+        `
+          COALESCE(
+            NULLIF(trim(concat_ws(' ', per.nombre, per.apellido)), ''),
+            emp.nombre_empresa,
+            'Consumidor final'
+          ) ILIKE $IDX
+        `,
+        `%${cliente}%`
+      );
+    }
+
+    if (estado) {
+      pushFilter('COALESCE(ep.descripcion, $IDX) ILIKE $IDX', `%${estado}%`);
+    }
+
+    if (idEstadoPedido) {
+      pushFilter('p.id_estado_pedido = $IDX', idEstadoPedido);
     }
 
     if (idCliente) {
       pushFilter('COALESCE(p.id_cliente, f.id_cliente) = $IDX', idCliente);
     }
 
-    if (shouldLimitVentasHistoryByRole(req)) {
-      filters.push(getVentasHistorySqlFilter('COALESCE(p.fecha_hora_pedido, f.fecha_hora_facturacion)'));
+    if (fechaDesde) {
+      pushFilter('(f.fecha_hora_facturacion)::date >= $IDX::date', fechaDesde);
+    }
+    if (fechaHasta) {
+      pushFilter('(f.fecha_hora_facturacion)::date <= $IDX::date', fechaHasta);
     }
 
     const whereClause = filters.length ? `WHERE ${filters.join(' AND ')}` : '';
 
-    const query = `
+    const baseJoinClause = `
+      FROM facturas f
+      LEFT JOIN pedidos p ON p.id_pedido = f.id_pedido
+      LEFT JOIN estados_pedido ep ON ep.id_estado_pedido = p.id_estado_pedido
+      LEFT JOIN sucursales s ON s.id_sucursal = COALESCE(p.id_sucursal, f.id_sucursal)
+      LEFT JOIN direcciones ds ON ds.id_direccion = s.id_direccion
+      LEFT JOIN telefonos ts ON ts.id_telefono = s.id_telefono
+      LEFT JOIN correos csuc ON csuc.id_correo = s.id_correo
+      LEFT JOIN clientes c ON c.id_cliente = COALESCE(p.id_cliente, f.id_cliente)
+      LEFT JOIN personas per ON per.id_persona = c.id_persona
+      LEFT JOIN empresas emp ON emp.id_empresa = c.id_empresa
+      LEFT JOIN usuarios u ON u.id_usuario = COALESCE(p.id_usuario, f.id_usuario)
+    `;
+
+    const countQuery = `
+      SELECT COUNT(*)::int AS total
+      ${baseJoinClause}
+      ${whereClause}
+    `;
+
+    const summaryQuery = `
+      SELECT
+        COUNT(*)::int AS ventas,
+        COALESCE(
+          SUM(
+            COALESCE(
+              p.total,
+              COALESCE(df_info.subtotal_neto, 0) + COALESCE(f.isv_15, 0) + COALESCE(f.isv_18, 0)
+            )
+          ),
+          0
+        )::numeric(14,2) AS total_vendido,
+        COALESCE(
+          SUM(
+            CASE
+              WHEN p.id_pedido IS NULL THEN 1
+              WHEN LOWER(COALESCE(ep.descripcion, '')) IN (
+                'completada',
+                'completado',
+                'finalizada',
+                'finalizado',
+                'pagada',
+                'pagado',
+                'cerrada',
+                'cerrado',
+                'lista',
+                'listo'
+              ) THEN 1
+              ELSE 0
+            END
+          ),
+          0
+        )::int AS completadas
+      ${baseJoinClause}
+      LEFT JOIN LATERAL (
+        SELECT
+          COALESCE(SUM(df.total_detalle), 0)::numeric(12,2) AS subtotal_neto
+        FROM detalle_facturas df
+        WHERE df.id_factura = f.id_factura
+      ) df_info ON true
+      ${whereClause}
+    `;
+
+    const dataQuery = `
       SELECT
         f.id_factura,
+        f.codigo_venta,
+        f.fecha_operacion,
         f.id_pedido,
         p.descripcion_pedido,
         p.descripcion_envio,
@@ -1828,6 +2531,9 @@ router.get('/ventas', checkPermission(['VENTAS_VER']), async (req, res) => {
         END AS estado_pedido,
         COALESCE(p.id_sucursal, f.id_sucursal) AS id_sucursal,
         s.nombre_sucursal,
+        ds.direccion AS sucursal_direccion,
+        ts.telefono AS sucursal_telefono,
+        csuc.direccion_correo AS sucursal_correo,
         COALESCE(p.id_cliente, f.id_cliente) AS id_cliente,
         COALESCE(
           NULLIF(trim(concat_ws(' ', per.nombre, per.apellido)), ''),
@@ -1848,14 +2554,7 @@ router.get('/ventas', checkPermission(['VENTAS_VER']), async (req, res) => {
           ELSE COALESCE(df_info.total_items, 0)
         END AS total_items,
         COALESCE(df_info.descuento_total, 0) AS descuento_total
-      FROM facturas f
-      LEFT JOIN pedidos p ON p.id_pedido = f.id_pedido
-      LEFT JOIN estados_pedido ep ON ep.id_estado_pedido = p.id_estado_pedido
-      LEFT JOIN sucursales s ON s.id_sucursal = COALESCE(p.id_sucursal, f.id_sucursal)
-      LEFT JOIN clientes c ON c.id_cliente = COALESCE(p.id_cliente, f.id_cliente)
-      LEFT JOIN personas per ON per.id_persona = c.id_persona
-      LEFT JOIN empresas emp ON emp.id_empresa = c.id_empresa
-      LEFT JOIN usuarios u ON u.id_usuario = COALESCE(p.id_usuario, f.id_usuario)
+      ${baseJoinClause}
       LEFT JOIN LATERAL (
         SELECT
           SUM(COALESCE(df.cantidad, 0))::int AS total_items,
@@ -1912,17 +2611,61 @@ router.get('/ventas', checkPermission(['VENTAS_VER']), async (req, res) => {
           AND COALESCE(dp.estado, true) = true
       ) dp_info ON true
       ${whereClause}
-      ORDER BY f.id_factura DESC
+      ORDER BY f.fecha_hora_facturacion DESC, f.id_factura DESC
+      LIMIT $${params.length + 1}
+      OFFSET $${params.length + 2}
     `;
 
-    const result = await pool.query(query, params);
+    const countResult = await pool.query(countQuery, params);
+    const summaryResult = await pool.query(summaryQuery, params);
+    const total = Number.parseInt(String(countResult.rows?.[0]?.total ?? '0'), 10) || 0;
+    const totalPages = total > 0 ? Math.ceil(total / pageSize) : 1;
+    const queryParams = [...params, pageSize, offset];
+    const result = await pool.query(dataQuery, queryParams);
+    const summaryRow = summaryResult.rows?.[0] || {};
+    const summaryVentas = Number.parseInt(String(summaryRow.ventas ?? '0'), 10) || 0;
+    const summaryTotalVendido = roundMoney(summaryRow.total_vendido);
+    const summaryCompletadas = Number.parseInt(String(summaryRow.completadas ?? '0'), 10) || 0;
+    const summaryPendientes = Math.max(summaryVentas - summaryCompletadas, 0);
+    const summaryTicketPromedio = summaryVentas > 0
+      ? roundMoney(summaryTotalVendido / summaryVentas)
+      : 0;
+
     const data = result.rows.map((row) => ({
       ...row,
-      numero_venta: formatVentaNumero(row.id_factura),
+      numero_venta: resolveVentaNumero(row),
       metodo_pago: row.metodo_pago || null
     }));
 
-    res.status(200).json(data);
+    res.status(200).json({
+      success: true,
+      data,
+      pagination: {
+        page,
+        pageSize,
+        total,
+        totalPages,
+        hasNextPage: page < totalPages,
+        hasPreviousPage: page > 1
+      },
+      summary: {
+        ventas: summaryVentas,
+        totalVendido: summaryTotalVendido,
+        ticketPromedio: summaryTicketPromedio,
+        completadas: summaryCompletadas,
+        pendientes: summaryPendientes
+      },
+      filters: {
+        scope: {
+          canSelectSucursal: scope.isSuperAdmin,
+          selectedSucursalId: idSucursalEffective,
+          userSucursalId: scope.userSucursalId,
+          limitedByRole: scope.limitedToLast72Hours,
+          limitedToLast72Hours: scope.limitedToLast72Hours,
+          allowedSucursalIds: scope.allowedSucursalIds
+        }
+      }
+    });
   } catch (err) {
     console.error('Error al listar ventas:', err);
     sendVentasInternalError(res);
@@ -1962,11 +2705,6 @@ router.get('/ventas/pedidos-menu', checkPermission(['VENTAS_VER']), async (req, 
     if (allowedSucursalIds.length > 0) {
       params.push(allowedSucursalIds);
       filters.push(`p.id_sucursal = ANY($${params.length}::int[])`);
-    }
-
-    if (hasEstadoPago) {
-      params.push(PEDIDO_ESTADO_PAGO.CANCELADO_TIMEOUT);
-      filters.push(`UPPER(TRIM(COALESCE(p.estado_pago, ''))) <> $${params.length}`);
     }
 
     const whereClause = `WHERE ${filters.join(' AND ')}`;
@@ -2321,6 +3059,254 @@ router.put('/ventas/pedidos-menu/:id/estado', checkPermission(['VENTAS_VER']), a
   }
 });
 
+router.get('/ventas/:id/reversiones', checkPermission(['VENTAS_VER']), async (req, res) => {
+  try {
+    const idFactura = parsePositiveInt(req.params.id);
+    if (!idFactura) {
+      return res.status(400).json({ error: true, message: 'ID de venta invalido.' });
+    }
+
+    const idUsuario = parsePositiveInt(req.user?.id_usuario);
+    if (!idUsuario) {
+      return res.status(401).json({ error: true, message: 'No autorizado.' });
+    }
+
+    const rows = await listFacturaReversiones({
+      idFactura,
+      idUsuario
+    });
+
+    return res.status(200).json({ data: rows });
+  } catch (error) {
+    if (Number.isInteger(error?.httpStatus) && error.httpStatus >= 400 && error.httpStatus < 500) {
+      return res.status(error.httpStatus).json({
+        error: true,
+        code: error.code || 'VENTAS_REVERSION_LIST_ERROR',
+        message: error.publicMessage || 'No se pudo obtener las reversiones.'
+      });
+    }
+
+    console.error('Error al listar reversiones de venta:', error);
+    return sendVentasInternalError(res, 'No se pudo obtener las reversiones de la venta.');
+  }
+});
+
+router.post('/ventas/:id/reversiones', checkPermission(['VENTAS_REVERSION_CREAR']), async (req, res) => {
+  const idFactura = parsePositiveInt(req.params.id);
+  if (!idFactura) {
+    return res.status(400).json({ error: true, message: 'ID de venta invalido.' });
+  }
+
+  const idUsuario = parsePositiveInt(req.user?.id_usuario);
+  if (!idUsuario) {
+    return res.status(401).json({ error: true, message: 'No autorizado.' });
+  }
+
+  const rawUserAgent = String(req.headers?.['user-agent'] || '');
+  const userAgent = rawUserAgent.slice(0, 500);
+  const ipOrigen = String(getClientIp(req) || '-').slice(0, 80);
+  const deviceInfo = parseUserAgent(rawUserAgent);
+  const dispositivo = String(deviceInfo?.dispositivo || 'Desconocido').slice(0, 80);
+
+  try {
+    const result = await createVentaReversion({
+      idFactura,
+      body: req.body,
+      req,
+      idUsuario
+    });
+
+    try {
+      await sendReversionSuccessEmail({
+        payload: {
+          ...result,
+          usuario: req.user?.nombre_usuario || req.user?.usuario || String(idUsuario),
+          id_usuario: idUsuario,
+          ip_origen: result?.auditoria?.ip_origen || ipOrigen,
+          user_agent: result?.auditoria?.user_agent || userAgent
+        }
+      });
+      try {
+        await pool.query(
+          `
+            UPDATE public.facturas_reversiones
+            SET correo_notificado = true,
+                notificado_en = NOW(),
+                error_notificacion = NULL
+            WHERE id_reversion = $1
+          `,
+          [result.id_reversion]
+        );
+      } catch (updateErr) {
+        console.error('Error actualizando notificación de reversión exitosa:', updateErr);
+      }
+    } catch (mailError) {
+      console.error('Error enviando correo de reversión exitosa:', mailError);
+      try {
+        await pool.query(
+          `
+            UPDATE public.facturas_reversiones
+            SET correo_notificado = false,
+                error_notificacion = $2
+            WHERE id_reversion = $1
+          `,
+          [result.id_reversion, String(mailError?.message || 'Fallo de notificación').slice(0, 500)]
+        );
+      } catch (updateErr) {
+        console.error('Error actualizando estado de notificación de reversión:', updateErr);
+      }
+    }
+
+    return res.status(201).json({
+      success: true,
+      data: result,
+      message: 'Reversión registrada correctamente.'
+    });
+  } catch (error) {
+    if (Number.isInteger(error?.httpStatus) && error.httpStatus >= 400 && error.httpStatus < 500) {
+      await registerReversionFailureAttempt({
+        idFactura,
+        idUsuario,
+        idSucursal: req.user?.id_sucursal,
+        motivo: req.body?.motivo || null,
+        errorCode: error.code || 'VENTAS_REVERSION_ERROR',
+        errorMessagePublic: error.publicMessage || 'No se pudo completar la reversión.',
+        ipOrigen,
+        userAgent,
+        dispositivo
+      });
+
+      if (shouldSendReversionFailureEmail({ idUsuario, idFactura })) {
+        sendReversionFailureEmail({
+          payload: {
+            id_factura: idFactura,
+            motivo: req.body?.motivo || null,
+            error: error.publicMessage || error.message,
+            codigo_venta: req.body?.codigo_venta || null,
+            usuario: req.user?.nombre_usuario || req.user?.usuario || String(idUsuario),
+            id_usuario: idUsuario,
+            id_sucursal: req.user?.id_sucursal || null,
+            ip_origen: ipOrigen,
+            user_agent: userAgent,
+            dispositivo
+          }
+        }).catch((mailError) => {
+          console.error('Error enviando correo de reversión fallida:', mailError);
+        });
+      }
+
+      return res.status(error.httpStatus).json({
+        error: true,
+        code: error.code || 'VENTAS_REVERSION_ERROR',
+        message: error.publicMessage || 'No se pudo completar la reversión.'
+      });
+    }
+
+    console.error('Error interno en reversión de venta:', error);
+    return sendVentasInternalError(res, 'No se pudo completar la reversión de venta.');
+  }
+});
+
+router.get('/ventas/buscar', checkPermission(['VENTAS_VER']), async (req, res) => {
+  try {
+    const codigoVenta = String(req.query.codigo_venta || '').trim().toUpperCase();
+    const fechaOperacion = parseOptionalDateInput(req.query.fecha_operacion);
+    const idSucursalRequested = parseOptionalPositiveInt(req.query.id_sucursal);
+
+    if (!codigoVenta) {
+      return res.status(400).json({ error: true, message: 'Ingresa el código de venta.' });
+    }
+    if (!fechaOperacion || fechaOperacion === '__INVALID_DATE__') {
+      return res.status(400).json({ error: true, message: 'Selecciona la fecha de operación.' });
+    }
+
+    const scope = await resolveVentasHistoryScope(req);
+    if (!scope.allowedSucursalIds.length) {
+      return res.status(403).json({ error: true, message: 'El empleado no tiene sucursal asignada.' });
+    }
+
+    let idSucursalEffective = null;
+    if (scope.isSuperAdmin) {
+      idSucursalEffective = idSucursalRequested;
+      if (!idSucursalEffective) {
+        return res.status(400).json({ error: true, message: 'Selecciona la sucursal.' });
+      }
+      if (!scope.allowedSucursalIds.includes(idSucursalEffective)) {
+        return res.status(403).json({ error: true, message: 'No tiene acceso a la sucursal solicitada.' });
+      }
+    } else {
+      idSucursalEffective = scope.userSucursalId;
+      if (!idSucursalEffective) {
+        return res.status(403).json({ error: true, message: 'El empleado no tiene sucursal asignada.' });
+      }
+      if (idSucursalRequested && idSucursalRequested !== idSucursalEffective) {
+        return res.status(403).json({
+          error: 'SUCURSAL_NO_AUTORIZADA',
+          message: 'No tienes permiso para consultar ventas de esta sucursal.'
+        });
+      }
+    }
+
+    const result = await pool.query(
+      `
+        SELECT
+          f.id_factura,
+          COALESCE(NULLIF(TRIM(f.codigo_venta), ''), 'VTA-' || LPAD(f.id_factura::text, 5, '0')) AS codigo_venta,
+          f.fecha_operacion::date AS fecha_operacion,
+          f.id_sucursal,
+          s.nombre_sucursal AS sucursal,
+          COALESCE(
+            NULLIF(TRIM(CONCAT_WS(' ', per.nombre, per.apellido)), ''),
+            emp.nombre_empresa,
+            'Consumidor final'
+          ) AS cliente,
+          COALESCE(
+            (
+              SELECT SUM(COALESCE(df.total_detalle, 0))
+              FROM detalle_facturas df
+              WHERE df.id_factura = f.id_factura
+            ),
+            0
+          )::numeric(12,2) AS total
+        FROM facturas f
+        LEFT JOIN sucursales s ON s.id_sucursal = f.id_sucursal
+        LEFT JOIN clientes c ON c.id_cliente = f.id_cliente
+        LEFT JOIN personas per ON per.id_persona = c.id_persona
+        LEFT JOIN empresas emp ON emp.id_empresa = c.id_empresa
+        WHERE UPPER(COALESCE(f.codigo_venta, '')) = $1
+          AND f.fecha_operacion = $2::date
+          AND f.id_sucursal = $3
+        LIMIT 1
+      `,
+      [codigoVenta, fechaOperacion, idSucursalEffective]
+    );
+
+    if (!result.rowCount) {
+      return res.status(404).json({
+        error: true,
+        message: 'No se encontró una venta con ese código, fecha y sucursal.'
+      });
+    }
+
+    const row = result.rows[0];
+    return res.status(200).json({
+      data: {
+        id_factura: Number(row.id_factura),
+        codigo_venta: row.codigo_venta,
+        fecha_operacion: row.fecha_operacion,
+        id_sucursal: Number(row.id_sucursal),
+        sucursal: row.sucursal || `Sucursal ${row.id_sucursal}`,
+        cliente: row.cliente || 'Consumidor final',
+        total: roundMoney(row.total),
+        items: []
+      }
+    });
+  } catch (err) {
+    console.error('Error en búsqueda exacta de ventas:', err);
+    return sendVentasInternalError(res);
+  }
+});
+
 router.get('/ventas/:id', checkPermission(['VENTAS_VER']), async (req, res) => {
   try {
     const idFactura = parsePositiveInt(req.params.id);
@@ -2328,17 +3314,15 @@ router.get('/ventas/:id', checkPermission(['VENTAS_VER']), async (req, res) => {
       return res.status(400).json({ error: true, message: 'ID de venta invalido.' });
     }
 
-    const enforceRoleRange = shouldLimitVentasHistoryByRole(req);
-    const scope = await resolveRequestUserSucursalScope(req);
-    const isSuperAdmin = Boolean(scope.isSuperAdmin);
-    const userSucursalId = parseOptionalPositiveInt(scope.userSucursalId);
-
-    if (!isSuperAdmin && !userSucursalId) {
-      return res.status(403).json({ error: true, message: 'El empleado no tiene sucursal asignada.' });
+    const scope = await resolveVentasHistoryScope(req);
+    if (!scope.allowedSucursalIds.length) {
+      return res.status(403).json({ error: true, message: 'El empleado no tiene sucursales asignadas.' });
     }
     const headerQuery = `
       SELECT
         f.id_factura,
+        f.codigo_venta,
+        f.fecha_operacion,
         f.id_pedido,
         p.descripcion_pedido,
         p.descripcion_envio,
@@ -2362,28 +3346,87 @@ router.get('/ventas/:id', checkPermission(['VENTAS_VER']), async (req, res) => {
           emp.nombre_empresa,
           'Consumidor final'
         ) AS cliente_nombre,
+        COALESCE(NULLIF(trim(per.rtn), ''), NULLIF(trim(emp.rtn), '')) AS cliente_rtn,
         COALESCE(p.id_usuario, f.id_usuario) AS id_usuario,
         u.nombre_usuario,
         f.id_caja,
+        cj.nombre_caja,
+        cj.codigo_caja,
+        f.id_sesion_caja,
         f.efectivo_entregado,
         f.cambio,
         f.fecha_hora_facturacion,
         f.isv_15,
         f.isv_18,
+        COALESCE(df_info.subtotal_neto, 0) AS gravado_15,
+        0::numeric(12,2) AS gravado_18,
+        0::numeric(12,2) AS exento,
+        (COALESCE(f.isv_15, 0) + COALESCE(f.isv_18, 0))::numeric(12,2) AS total_isv,
         fc_info.metodo_pago,
+        fc_info.codigo_transaccion,
+        NULL::varchar AS banco,
+        NULL::numeric AS exonerado,
+        emp_info.nombre_empresa AS nombre_emisor,
+        emp_info.rtn AS rtn_emisor,
+        frc.cai,
+        frc.numero_desde,
+        frc.numero_hasta,
+        frc.fecha_limite_emision,
+        cfg.modo_fiscal,
+        cfg.ancho_ticket_mm,
+        cfg.mostrar_logo_ticket,
         COALESCE(df_info.total_items, 0) AS total_items,
         COALESCE(df_info.descuento_total, 0) AS descuento_total
       FROM facturas f
       LEFT JOIN pedidos p ON p.id_pedido = f.id_pedido
       LEFT JOIN estados_pedido ep ON ep.id_estado_pedido = p.id_estado_pedido
       LEFT JOIN sucursales s ON s.id_sucursal = COALESCE(p.id_sucursal, f.id_sucursal)
+      LEFT JOIN direcciones ds ON ds.id_direccion = s.id_direccion
+      LEFT JOIN telefonos ts ON ts.id_telefono = s.id_telefono
+      LEFT JOIN correos csuc ON csuc.id_correo = s.id_correo
       LEFT JOIN clientes c ON c.id_cliente = COALESCE(p.id_cliente, f.id_cliente)
       LEFT JOIN personas per ON per.id_persona = c.id_persona
       LEFT JOIN empresas emp ON emp.id_empresa = c.id_empresa
       LEFT JOIN usuarios u ON u.id_usuario = COALESCE(p.id_usuario, f.id_usuario)
+      LEFT JOIN cajas cj ON cj.id_caja = f.id_caja
+      LEFT JOIN LATERAL (
+        SELECT e.nombre_empresa, e.rtn
+        FROM empresas e
+        WHERE COALESCE(e.estado, true) = true
+        ORDER BY e.id_empresa
+        LIMIT 1
+      ) emp_info ON true
       LEFT JOIN LATERAL (
         SELECT
-          STRING_AGG(DISTINCT cmp.nombre, ', ' ORDER BY cmp.nombre) AS metodo_pago
+          frc.id_rango_cai,
+          frc.cai,
+          frc.numero_desde,
+          frc.numero_hasta,
+          frc.fecha_limite_emision
+        FROM facturacion_rangos_cai frc
+        WHERE frc.id_sucursal = COALESCE(p.id_sucursal, f.id_sucursal)
+          AND COALESCE(UPPER(TRIM(frc.estado)), 'ACTIVO') IN ('ACTIVO', 'VIGENTE')
+        ORDER BY frc.id_rango_cai DESC
+        LIMIT 1
+      ) frc ON true
+      LEFT JOIN LATERAL (
+        SELECT
+          cfg.modo_fiscal,
+          cfg.ancho_ticket_mm,
+          cfg.mostrar_logo_ticket
+        FROM facturacion_config_sucursal cfg
+        WHERE cfg.id_sucursal = COALESCE(p.id_sucursal, f.id_sucursal)
+          AND COALESCE(cfg.activo, true) = true
+        ORDER BY cfg.id_config DESC
+        LIMIT 1
+      ) cfg ON true
+      LEFT JOIN LATERAL (
+        SELECT
+          STRING_AGG(DISTINCT cmp.nombre, ', ' ORDER BY cmp.nombre) AS metodo_pago,
+          STRING_AGG(
+            DISTINCT NULLIF(TRIM(fc.referencia), ''),
+            ', ' ORDER BY NULLIF(TRIM(fc.referencia), '')
+          ) AS codigo_transaccion
         FROM facturas_cobros fc
         INNER JOIN cat_metodos_pago cmp
           ON cmp.id_metodo_pago = fc.id_metodo_pago
@@ -2401,20 +3444,19 @@ router.get('/ventas/:id', checkPermission(['VENTAS_VER']), async (req, res) => {
       WHERE f.id_factura = $1
         AND (
           $2::boolean = false
-          OR ${getVentasHistorySqlFilter('COALESCE(p.fecha_hora_pedido, f.fecha_hora_facturacion)')}
+          OR (
+            f.fecha_hora_facturacion IS NOT NULL
+            AND f.fecha_hora_facturacion >= ${VENTAS_LIMIT_72H_CUTOFF_SQL}
+          )
         )
-        AND (
-          $3::boolean = true
-          OR COALESCE(p.id_sucursal, f.id_sucursal) = $4
-        )
+        AND COALESCE(p.id_sucursal, f.id_sucursal) = ANY($3::int[])
       LIMIT 1
     `;
 
     const headerResult = await pool.query(headerQuery, [
       idFactura,
-      enforceRoleRange,
-      isSuperAdmin,
-      userSucursalId
+      scope.limitedToLast72Hours,
+      scope.allowedSucursalIds
     ]);
     if (headerResult.rowCount === 0) {
       return res.status(404).json({ error: true, message: 'Venta no encontrada.' });
@@ -2426,18 +3468,36 @@ router.get('/ventas/:id', checkPermission(['VENTAS_VER']), async (req, res) => {
       const pedidoItemsResult = await pool.query(
         `
           SELECT
-            dp.id_detalle_pedido AS id_detalle,
+            df.id_detalle_factura AS id_detalle,
+            COALESCE(dfo.id_detalle_pedido, df.id_detalle_pedido::int) AS id_detalle_pedido,
             CASE
+              WHEN NULLIF(TRIM(dfo.tipo_item), '') IS NOT NULL THEN UPPER(TRIM(dfo.tipo_item))
+              WHEN NULLIF(TRIM(df.tipo_item), '') IS NOT NULL THEN UPPER(TRIM(df.tipo_item))
               WHEN dp.id_producto IS NOT NULL THEN 'PRODUCTO'
               WHEN dp.id_combo IS NOT NULL THEN 'COMBO'
               WHEN dp.id_receta IS NOT NULL THEN 'RECETA'
               ELSE 'ITEM'
             END AS tipo_item,
-            dp.id_producto,
-            dp.id_combo,
-            dp.id_receta,
-            COALESCE(prod.nombre_producto, combo.descripcion, rec.nombre_receta, 'Item de cocina') AS nombre_item,
-            COALESCE(prod.nombre_producto, combo.descripcion, rec.nombre_receta, 'Item de cocina') AS nombre_producto,
+            COALESCE(dfo.id_producto, df.id_producto, dp.id_producto) AS id_producto,
+            COALESCE(dfo.id_combo, df.id_combo::int, dp.id_combo) AS id_combo,
+            COALESCE(dfo.id_receta, df.id_receta::int, dp.id_receta) AS id_receta,
+            COALESCE(
+              dfo.origen_snapshot->>'nombre_item',
+              df.origen_snapshot->>'nombre_item',
+              prod.nombre_producto,
+              combo.descripcion,
+              rec.nombre_receta,
+              'Item de cocina'
+            ) AS nombre_item,
+            COALESCE(
+              dfo.origen_snapshot->>'nombre_item',
+              df.origen_snapshot->>'nombre_item',
+              prod.nombre_producto,
+              combo.descripcion,
+              rec.nombre_receta,
+              'Item de cocina'
+            ) AS nombre_producto,
+            COALESCE(df.cantidad, 1) AS cantidad,
             COALESCE(
               CASE
                 WHEN dp.id_producto IS NOT NULL THEN prod.precio
@@ -2451,25 +3511,34 @@ router.get('/ventas/:id', checkPermission(['VENTAS_VER']), async (req, res) => {
               END,
               0
             ) AS precio_unitario,
-            COALESCE(dp.sub_total_pedido, 0) AS sub_total,
-            COALESCE(dp.total_pedido, COALESCE(dp.sub_total_pedido, 0)) AS total_linea,
+            COALESCE(df.sub_total, dp.sub_total_pedido, 0) AS sub_total,
+            COALESCE(df.sub_total, dp.sub_total_pedido, 0) AS subtotal_linea,
+            COALESCE(df.total_detalle, dp.total_pedido, COALESCE(dp.sub_total_pedido, 0)) AS total_linea,
             COALESCE(d.monto_descuento, 0) AS descuento,
-            dp.observacion
-          FROM detalle_pedido dp
-          LEFT JOIN productos prod ON prod.id_producto = dp.id_producto
-          LEFT JOIN combos combo ON combo.id_combo = dp.id_combo
-          LEFT JOIN recetas rec ON rec.id_receta = dp.id_receta
-          LEFT JOIN descuentos d ON d.id_descuento = dp.id_descuento
-          WHERE dp.id_pedido = $1
-            AND COALESCE(dp.estado, true) = true
-          ORDER BY dp.id_detalle_pedido
+            COALESCE(d.monto_descuento, 0) AS descuento_linea,
+            NULL::numeric AS isv_15_linea,
+            NULL::numeric AS isv_18_linea,
+            NULL::numeric AS exento_linea,
+            NULL::numeric AS exonerado_linea,
+            dp.observacion,
+            COALESCE(dfo.origen_snapshot, df.origen_snapshot) AS origen_snapshot
+          FROM detalle_facturas df
+          LEFT JOIN detalle_facturas_origen dfo
+            ON dfo.id_detalle_factura = df.id_detalle_factura
+          LEFT JOIN detalle_pedido dp ON dp.id_detalle_pedido = df.id_detalle_pedido
+          LEFT JOIN productos prod ON prod.id_producto = COALESCE(dfo.id_producto, df.id_producto, dp.id_producto)
+          LEFT JOIN combos combo ON combo.id_combo = COALESCE(dfo.id_combo, df.id_combo::int, dp.id_combo)
+          LEFT JOIN recetas rec ON rec.id_receta = COALESCE(dfo.id_receta, df.id_receta::int, dp.id_receta)
+          LEFT JOIN descuentos d ON d.id_descuento = df.id_descuento
+          WHERE df.id_factura = $1
+          ORDER BY df.id_detalle_factura
         `,
-        [venta.id_pedido]
+        [venta.id_factura]
       );
 
       return res.status(200).json({
         ...venta,
-        numero_venta: formatVentaNumero(venta.id_factura),
+        numero_venta: resolveVentaNumero(venta),
         metodo_pago: venta.metodo_pago || null,
         items: buildKitchenSaleDetailItems(pedidoItemsResult.rows)
       });
@@ -2479,23 +3548,32 @@ router.get('/ventas/:id', checkPermission(['VENTAS_VER']), async (req, res) => {
       `
         SELECT
           df.id_detalle_factura AS id_detalle,
-          'PRODUCTO' AS tipo_item,
-          df.id_producto,
-          NULL::int AS id_combo,
-          NULL::int AS id_receta,
-          p.nombre_producto AS nombre_item,
-          p.nombre_producto,
+          COALESCE(dfo.id_detalle_pedido, df.id_detalle_pedido::int) AS id_detalle_pedido,
+          COALESCE(NULLIF(TRIM(dfo.tipo_item), ''), NULLIF(TRIM(df.tipo_item), ''), 'PRODUCTO') AS tipo_item,
+          COALESCE(dfo.id_producto, df.id_producto) AS id_producto,
+          COALESCE(dfo.id_combo, df.id_combo::int) AS id_combo,
+          COALESCE(dfo.id_receta, df.id_receta::int) AS id_receta,
+          COALESCE(dfo.origen_snapshot->>'nombre_item', df.origen_snapshot->>'nombre_item', p.nombre_producto, 'Producto') AS nombre_item,
+          COALESCE(dfo.origen_snapshot->>'nombre_item', df.origen_snapshot->>'nombre_item', p.nombre_producto, 'Producto') AS nombre_producto,
           COALESCE(df.cantidad, 1) AS cantidad,
           COALESCE(df.precio_unitario, p.precio, 0) AS precio_unitario,
           COALESCE(df.sub_total, 0) AS sub_total,
+          COALESCE(df.sub_total, 0) AS subtotal_linea,
           COALESCE(df.total_detalle, 0) AS total_linea,
           COALESCE(d.monto_descuento, 0) AS descuento,
-          NULL::varchar(200) AS observacion
+          COALESCE(d.monto_descuento, 0) AS descuento_linea,
+          NULL::numeric AS isv_15_linea,
+          NULL::numeric AS isv_18_linea,
+          NULL::numeric AS exento_linea,
+          NULL::numeric AS exonerado_linea,
+          NULL::varchar(200) AS observacion,
+          COALESCE(dfo.origen_snapshot, df.origen_snapshot) AS origen_snapshot
         FROM detalle_facturas df
-        LEFT JOIN productos p ON p.id_producto = df.id_producto
+        LEFT JOIN detalle_facturas_origen dfo
+          ON dfo.id_detalle_factura = df.id_detalle_factura
+        LEFT JOIN productos p ON p.id_producto = COALESCE(dfo.id_producto, df.id_producto)
         LEFT JOIN descuentos d ON d.id_descuento = df.id_descuento
         WHERE df.id_factura = $1
-          AND df.id_producto IS NOT NULL
         ORDER BY df.id_detalle_factura
       `,
       [venta.id_factura]
@@ -2505,7 +3583,7 @@ router.get('/ventas/:id', checkPermission(['VENTAS_VER']), async (req, res) => {
 
     res.status(200).json({
       ...venta,
-      numero_venta: formatVentaNumero(venta.id_factura),
+      numero_venta: resolveVentaNumero(venta),
       metodo_pago: venta.metodo_pago || null,
       items: directItems
     });
@@ -2515,7 +3593,17 @@ router.get('/ventas/:id', checkPermission(['VENTAS_VER']), async (req, res) => {
   }
 });
 
-router.post('/ventas', checkPermission(['VENTAS_VER']), async (req, res) => {
+router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
+  const discountIntent = hasDiscountIntentInPayload(req.body);
+  const canApplyDiscount = await requestHasAnyPermission(req, [VENTAS_DESCUENTO_APLICAR_PERMISSION]);
+  if (discountIntent && !canApplyDiscount) {
+    return res.status(403).json({
+      error: true,
+      code: 'VENTAS_DESCUENTO_NO_AUTORIZADO',
+      message: 'No tienes permiso para aplicar descuentos en ventas.'
+    });
+  }
+
   const client = await pool.connect();
 
   try {
@@ -2527,7 +3615,8 @@ router.post('/ventas', checkPermission(['VENTAS_VER']), async (req, res) => {
       client,
       body: req.body,
       userId,
-      sucursalScope: scope
+      sucursalScope: scope,
+      canApplyDiscount
     });
 
     if (!prepared.ok) {
@@ -2537,6 +3626,11 @@ router.post('/ventas', checkPermission(['VENTAS_VER']), async (req, res) => {
 
     const venta = prepared.data;
     const allLines = [...venta.all_lines];
+    const correlativoVenta = await generarCodigoDocumento({
+      client,
+      idSucursal: venta.id_sucursal,
+      tipoDocumento: 'VENTA'
+    });
 
     for (const line of allLines) {
       let idDescuento = null;
@@ -2558,68 +3652,94 @@ router.post('/ventas', checkPermission(['VENTAS_VER']), async (req, res) => {
 
     let idPedido = null;
 
-    if (venta.requires_pedido) {
-      const pedidoResult = await client.query(
+    if (!venta.requires_pedido || !Array.isArray(venta.pedido_lines) || venta.pedido_lines.length === 0) {
+      throw {
+        httpStatus: 409,
+        code: 'VENTAS_PEDIDO_REQUERIDO',
+        publicMessage: 'No se pudo completar la venta: se requiere pedido de cocina.'
+      };
+    }
+
+    const pedidoResult = await client.query(
+      `
+        INSERT INTO pedidos (
+          descripcion_pedido,
+          descripcion_envio,
+          fecha_hora_pedido,
+          sub_total,
+          isv,
+          total,
+          id_estado_pedido,
+          id_sucursal,
+          id_cliente,
+          id_usuario,
+          origen_pedido
+        )
+        VALUES ($1, $2, (NOW() AT TIME ZONE 'America/Tegucigalpa'), $3, $4, $5, $6, $7, $8, $9, 'CAJA')
+        RETURNING id_pedido
+      `,
+      [
+        venta.descripcion_pedido,
+        venta.descripcion_envio,
+        venta.pedido_subtotal,
+        venta.pedido_isv,
+        venta.pedido_total,
+        venta.id_estado_pedido,
+        venta.id_sucursal,
+        venta.id_cliente,
+        venta.id_usuario
+      ]
+    );
+
+    idPedido = pedidoResult.rows[0].id_pedido;
+
+    const pedidoLineRefs = [];
+    for (const line of venta.pedido_lines) {
+      const insertedDetallePedido = await client.query(
         `
-          INSERT INTO pedidos (
-            descripcion_pedido,
-            descripcion_envio,
-            fecha_hora_pedido,
-            sub_total,
-            isv,
-            total,
-            id_estado_pedido,
-            id_sucursal,
-            id_cliente,
-            id_usuario,
-            origen_pedido
+          INSERT INTO detalle_pedido (
+            sub_total_pedido,
+            total_pedido,
+            id_producto,
+            id_pedido,
+            id_descuento,
+            estado,
+            id_combo,
+            id_receta,
+            observacion
           )
-          VALUES ($1, $2, CURRENT_TIMESTAMP, $3, $4, $5, $6, $7, $8, $9, 'CAJA')
-          RETURNING id_pedido
+          VALUES ($1, $2, $3, $4, $5, true, $6, $7, $8)
+          RETURNING id_detalle_pedido
         `,
         [
-          venta.descripcion_pedido,
-          venta.descripcion_envio,
-          venta.pedido_subtotal,
-          venta.pedido_isv,
-          venta.pedido_total,
-          venta.id_estado_pedido,
-          venta.id_sucursal,
-          venta.id_cliente,
-          venta.id_usuario
+          line.sub_total,
+          line.total_linea,
+          line.id_producto,
+          idPedido,
+          line.id_descuento,
+          line.id_combo,
+          line.id_receta,
+          line.observacion
         ]
       );
-
-      idPedido = pedidoResult.rows[0].id_pedido;
-
-      for (const line of venta.pedido_lines) {
-        await client.query(
-          `
-            INSERT INTO detalle_pedido (
-              sub_total_pedido,
-              total_pedido,
-              id_producto,
-              id_pedido,
-              id_descuento,
-              estado,
-              id_combo,
-              id_receta,
-              observacion
-            )
-            VALUES ($1, $2, $3, $4, $5, true, $6, $7, $8)
-          `,
-          [
-            line.sub_total,
-            line.total_linea,
-            line.id_producto,
-            idPedido,
-            line.id_descuento,
-            line.id_combo,
-            line.id_receta,
-            line.observacion
-          ]
-        );
-      }
+      pedidoLineRefs.push({
+        ...line,
+        id_detalle_pedido: Number(insertedDetallePedido.rows?.[0]?.id_detalle_pedido || 0),
+        tipo_item: normalizeTipoItem(line.kind),
+        origen_snapshot: {
+          tipo_item: normalizeTipoItem(line.kind),
+          nombre_item: line.nombre_item || null,
+          id_producto: line.id_producto || null,
+          id_receta: line.id_receta || null,
+          id_combo: line.id_combo || null,
+          cantidad: Number(line.cantidad || 0),
+          precio_unitario: roundMoney(line.precio_unitario),
+          total_detalle: roundMoney(line.total_linea),
+          descuento: roundMoney(line.descuento),
+          observacion: line.observacion || null,
+          componentes: null
+        }
+      });
     }
 
     const facturaResult = await client.query(
@@ -2630,6 +3750,8 @@ router.post('/ventas', checkPermission(['VENTAS_VER']), async (req, res) => {
           id_sucursal,
           id_usuario,
           id_cliente,
+          codigo_venta,
+          fecha_operacion,
           efectivo_entregado,
           cambio,
           fecha_hora_facturacion,
@@ -2637,7 +3759,7 @@ router.post('/ventas', checkPermission(['VENTAS_VER']), async (req, res) => {
           isv_18,
           id_sesion_caja
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, CURRENT_TIMESTAMP, $8, 0, $9)
+        VALUES ($1, $2, $3, $4, $5, $6, $7::date, $8, $9, (NOW() AT TIME ZONE 'America/Tegucigalpa'), $10, 0, $11)
         RETURNING id_factura
       `,
       [
@@ -2646,6 +3768,8 @@ router.post('/ventas', checkPermission(['VENTAS_VER']), async (req, res) => {
         venta.id_sucursal,
         venta.id_usuario,
         venta.id_cliente,
+        correlativoVenta.codigo,
+        correlativoVenta.fecha_operacion,
         venta.efectivo_entregado,
         venta.cambio,
         venta.isv,
@@ -2676,7 +3800,7 @@ router.post('/ventas', checkPermission(['VENTAS_VER']), async (req, res) => {
           monto,
           fecha_cobro,
           fecha_creacion
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, (NOW() AT TIME ZONE 'America/Tegucigalpa'), (NOW() AT TIME ZONE 'America/Tegucigalpa'))
       `,
       [
         idFactura,
@@ -2689,8 +3813,9 @@ router.post('/ventas', checkPermission(['VENTAS_VER']), async (req, res) => {
       ]
     );
 
-    for (const line of venta.all_lines) {
-      await client.query(
+    for (const [index, line] of venta.all_lines.entries()) {
+      const pedidoRef = pedidoLineRefs[index] || null;
+      const detalleFacturaResult = await client.query(
         `
           INSERT INTO detalle_facturas (
             id_factura,
@@ -2700,9 +3825,15 @@ router.post('/ventas', checkPermission(['VENTAS_VER']), async (req, res) => {
             precio_unitario,
             sub_total,
             total_detalle,
-            id_pedido
+            id_pedido,
+            id_detalle_pedido,
+            tipo_item,
+            id_receta,
+            id_combo,
+            origen_snapshot
           )
-          VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13::jsonb)
+          RETURNING id_detalle_factura
         `,
         [
           idFactura,
@@ -2712,37 +3843,77 @@ router.post('/ventas', checkPermission(['VENTAS_VER']), async (req, res) => {
           line.precio_unitario,
           line.sub_total,
           line.total_linea,
-          idPedido
-        ]
-      );
-    }
-
-    for (const line of venta.all_lines) {
-      if (line.kind !== 'PRODUCTO') continue;
-      if (!line.id_almacen || !line.id_producto || !line.cantidad) continue;
-
-      await client.query(
-        `
-          INSERT INTO movimientos_inventario (
-            tipo,
-            cantidad,
-            id_almacen,
-            id_producto,
-            id_insumo,
-            ref_origen,
-            id_ref,
-            descripcion
+          idPedido,
+          pedidoRef?.id_detalle_pedido || null,
+          pedidoRef?.tipo_item || normalizeTipoItem(line.kind),
+          line.id_receta,
+          line.id_combo,
+          JSON.stringify(
+            pedidoRef?.origen_snapshot || {
+              tipo_item: normalizeTipoItem(line.kind),
+              nombre_item: line.nombre_item || null,
+              id_producto: line.id_producto || null,
+              id_receta: line.id_receta || null,
+              id_combo: line.id_combo || null,
+              cantidad: Number(line.cantidad || 0),
+              precio_unitario: roundMoney(line.precio_unitario),
+              total_detalle: roundMoney(line.total_linea),
+              descuento: roundMoney(line.descuento),
+              observacion: line.observacion || null,
+              componentes: null
+            }
           )
-          VALUES ('SALIDA', $1, $2, $3, NULL, 'VENTA', $4, $5)
-        `,
-        [
-          Number(line.cantidad),
-          Number(line.id_almacen),
-          Number(line.id_producto),
-          Number(idFactura),
-          `Salida por venta ${formatVentaNumero(idFactura)}`
         ]
       );
+
+      const idDetalleFactura = Number(detalleFacturaResult.rows?.[0]?.id_detalle_factura || 0);
+      if (idDetalleFactura > 0) {
+        await client.query(
+          `
+            INSERT INTO public.detalle_facturas_origen (
+              id_detalle_factura,
+              id_detalle_pedido,
+              tipo_item,
+              id_producto,
+              id_receta,
+              id_combo,
+              origen_snapshot
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
+            ON CONFLICT (id_detalle_factura)
+            DO UPDATE SET
+              id_detalle_pedido = EXCLUDED.id_detalle_pedido,
+              tipo_item = EXCLUDED.tipo_item,
+              id_producto = EXCLUDED.id_producto,
+              id_receta = EXCLUDED.id_receta,
+              id_combo = EXCLUDED.id_combo,
+              origen_snapshot = EXCLUDED.origen_snapshot
+          `,
+          [
+            idDetalleFactura,
+            pedidoRef?.id_detalle_pedido || null,
+            pedidoRef?.tipo_item || normalizeTipoItem(line.kind),
+            line.id_producto || null,
+            line.id_receta || null,
+            line.id_combo || null,
+            JSON.stringify(
+              pedidoRef?.origen_snapshot || {
+                tipo_item: normalizeTipoItem(line.kind),
+                nombre_item: line.nombre_item || null,
+                id_producto: line.id_producto || null,
+                id_receta: line.id_receta || null,
+                id_combo: line.id_combo || null,
+                cantidad: Number(line.cantidad || 0),
+                precio_unitario: roundMoney(line.precio_unitario),
+                total_detalle: roundMoney(line.total_linea),
+                descuento: roundMoney(line.descuento),
+                observacion: line.observacion || null,
+                componentes: null
+              }
+            )
+          ]
+        );
+      }
     }
 
     const acumulacionFidelizacion = await registerFacturaLoyaltyAccumulation({
@@ -2761,7 +3932,8 @@ router.post('/ventas', checkPermission(['VENTAS_VER']), async (req, res) => {
       message: 'Venta creada exitosamente.',
       id_factura: idFactura,
       id_pedido: idPedido,
-      numero_venta: formatVentaNumero(idFactura),
+      numero_venta: correlativoVenta.codigo,
+      codigo_venta: correlativoVenta.codigo,
       total: venta.total,
       venta_directa: idPedido === null,
       fidelizacion: acumulacionFidelizacion.created

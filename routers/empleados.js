@@ -111,6 +111,7 @@ const mapEmpleadoListRow = (row) => {
     persona_apellido: personaApellido,
     persona_dni: personaDni,
     persona_nombre_completo: personaNombreCompleto,
+    nombre_completo: personaNombreCompleto,
     sucursal_nombre: sucursalNombre,
     nombre_sucursal: row.nombre_sucursal ?? sucursalNombre,
     telefono,

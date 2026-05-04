@@ -8,12 +8,24 @@ const { Pool, types } = pg;
 types.setTypeParser(1114, (val) => val);
 types.setTypeParser(1082, (val) => val);
 
+const parsePositiveInt = (value, fallback) => {
+  const parsed = Number.parseInt(String(value ?? '').trim(), 10);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
+};
+
 const pool = new Pool({
   host: process.env.DB_HOST,
   port: Number(process.env.DB_PORT || 5432),
   user: process.env.DB_USER,
   password: process.env.DB_PASSWORD,
   database: process.env.DB_NAME || 'postgres',
+
+  // Supabase session pooler en QA está limitando a pool_size 15.
+  // Debe quedar por debajo del límite porque hay consultas paralelas y scheduler.
+  max: parsePositiveInt(process.env.DB_POOL_MAX, 8),
+  idleTimeoutMillis: parsePositiveInt(process.env.DB_IDLE_TIMEOUT_MS, 10000),
+  connectionTimeoutMillis: parsePositiveInt(process.env.DB_CONNECTION_TIMEOUT_MS, 5000),
+
   ssl: {
     rejectUnauthorized: false,
   },

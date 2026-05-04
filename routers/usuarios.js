@@ -12,6 +12,7 @@ import {
   detectImageMimeTypeFromBuffer
 } from '../utils/uploads.js';
 import { ensurePasswordChangedAtColumn } from '../utils/security/passwordExpiration.js';
+import { enviarCorreo } from '../utils/emailService.js';
 
 const router = express.Router();
 const USUARIOS_LIST_PERMISSIONS = ['USUARIOS_LISTADO_VER'];
@@ -23,6 +24,14 @@ const USUARIOS_IMAGE_EDIT_PERMISSIONS = ['USUARIOS_IMAGEN_SUBIR', 'USUARIOS_IMAG
 const USUARIOS_ROLES_CATALOG_PERMISSIONS = ['USUARIOS_ROL_ASIGNAR', 'USUARIOS_CREAR', 'USUARIOS_EDITAR'];
 const USUARIOS_ROLE_ASSIGN_PERMISSIONS = ['USUARIOS_ROL_ASIGNAR'];
 const USUARIOS_CHANGE_OWN_PASSWORD_PERMISSIONS = ['USUARIOS_PASSWORD_CAMBIAR_PROPIO'];
+const USUARIOS_LEGACY_ROUTES_ENABLED = String(process.env.USUARIOS_LEGACY_ROUTES_ENABLED ?? 'false').trim().toLowerCase() === 'true';
+
+const sendLegacyUsuariosRouteDisabled = (res) =>
+  res.status(410).json({
+    error: true,
+    code: 'USUARIOS_LEGACY_DISABLED',
+    message: 'Endpoint legado deshabilitado. Use /usuarios/v2/*',
+  });
 
 const usuariosV2CookieConfig = () => {
   const isProd = process.env.NODE_ENV === 'production';
@@ -62,12 +71,15 @@ const issueUpdatedAccessTokenForOwnPasswordChange = (req, res, idUsuarioChanged)
 // ------------------------------------------------------------------------------------
 // GET: Obtener usuarios
 router.get('/usuarios', checkPermission(USUARIOS_LIST_PERMISSIONS), async (req, res) => {
+    if (!USUARIOS_LEGACY_ROUTES_ENABLED) {
+        return sendLegacyUsuariosRouteDisabled(res);
+    }
     try {
         const tabla = 'usuarios';
         
         // CORRECCIÓN AQUÍ: Cambiamos 'cod_usuario' por 'id_usuario'
         // También aseguramos que 'clave' y 'estado' estén bien escritos.
-        const columnas = 'id_usuario, nombre_usuario, clave, estado, id_empleado'; 
+        const columnas = 'id_usuario, nombre_usuario, estado, id_empleado'; 
 
         // Llamamos a la función
         const query = 'SELECT function_select($1, $2) as resultado';
@@ -79,7 +91,7 @@ router.get('/usuarios', checkPermission(USUARIOS_LIST_PERMISSIONS), async (req, 
 
     } catch (err) {
         console.error('Error al obtener usuarios:', err.message);
-        res.status(500).json({ error: true, message: err.message });
+        res.status(500).json({ error: true, message: 'Error interno del servidor' });
     }
 });
 
@@ -87,6 +99,9 @@ router.get('/usuarios', checkPermission(USUARIOS_LIST_PERMISSIONS), async (req, 
 // POST: Crear nuevo usuario
 // ------------------------------------------------------------------------------------
 router.post('/usuarios', checkPermission(USUARIOS_CREATE_PERMISSIONS), async (req, res) => {
+    if (!USUARIOS_LEGACY_ROUTES_ENABLED) {
+        return sendLegacyUsuariosRouteDisabled(res);
+    }
     try {
         const tabla = 'usuarios';
         const datosUsuario = req.body; 
@@ -108,19 +123,41 @@ Desde Postman debes enviar el JSON con las llaves correctas:
 
     } catch (err) {
         console.error('Error al crear usuario:', err.message);
-        res.status(500).json({ error: true, message: err.message });
+        res.status(500).json({ error: true, message: 'Error interno del servidor' });
     }
 });
+
+const USUARIOS_LEGACY_ALLOWED_UPDATE_FIELDS = new Set([
+  'nombre_usuario',
+  'estado',
+  'id_empleado',
+  'id_cliente',
+  'tipo_usuario',
+  'foto_perfil'
+]);
+const USUARIOS_LEGACY_ALLOWED_ID_FIELDS = new Set(['id_usuario']);
 
 // ------------------------------------------------------------------------------------
 // PUT: Actualizar usuario
 // ------------------------------------------------------------------------------------
 router.put('/usuarios', checkPermission(USUARIOS_EDIT_PERMISSIONS), async (req, res) => {
+    if (!USUARIOS_LEGACY_ROUTES_ENABLED) {
+        return sendLegacyUsuariosRouteDisabled(res);
+    }
     try {
         const { campo, valor, id_campo, id_valor } = req.body;
 
         if (!campo || valor === undefined || !id_campo || id_valor === undefined) {
             return res.status(400).json({ error: true, message: 'Faltan campos obligatorios' });
+        }
+
+        const safeCampo = String(campo).trim().toLowerCase();
+        const safeIdCampo = String(id_campo).trim().toLowerCase();
+        if (!USUARIOS_LEGACY_ALLOWED_UPDATE_FIELDS.has(safeCampo)) {
+            return res.status(400).json({ error: true, message: `Campo no permitido: ${campo}` });
+        }
+        if (!USUARIOS_LEGACY_ALLOWED_ID_FIELDS.has(safeIdCampo)) {
+            return res.status(400).json({ error: true, message: `Identificador no permitido: ${id_campo}` });
         }
 
         const tabla = 'usuarios';
@@ -138,13 +175,13 @@ router.put('/usuarios', checkPermission(USUARIOS_EDIT_PERMISSIONS), async (req, 
         const strValorCondicion = String(id_valor);
 
         const query = 'CALL pa_update($1, $2, $3, $4, $5)';
-        await pool.query(query, [tabla, campo, strNuevoDato, id_campo, strValorCondicion]);
+        await pool.query(query, [tabla, safeCampo, strNuevoDato, safeIdCampo, strValorCondicion]);
 
         res.status(200).json({ message: 'Usuario actualizado correctamente.' });
 
     } catch (err) {
         console.error('Error al actualizar:', err.message);
-        res.status(500).json({ error: true, message: err.message });
+        res.status(500).json({ error: true, message: 'Error interno del servidor' });
     }
 });
 
@@ -152,6 +189,9 @@ router.put('/usuarios', checkPermission(USUARIOS_EDIT_PERMISSIONS), async (req, 
 // DELETE: Eliminar usuario
 // ------------------------------------------------------------------------------------
 router.delete('/usuarios', checkPermission(USUARIOS_DELETE_PERMISSIONS), async (req, res) => {
+    if (!USUARIOS_LEGACY_ROUTES_ENABLED) {
+        return sendLegacyUsuariosRouteDisabled(res);
+    }
     try {
         const { columna_id, valor_id } = req.body;
         // En Postman enviarías: { "columna_id": "id_usuario", "valor_id": 1 }
@@ -160,17 +200,22 @@ router.delete('/usuarios', checkPermission(USUARIOS_DELETE_PERMISSIONS), async (
             return res.status(400).json({ error: true, message: 'Faltan datos para eliminar' });
         }
 
+        const safeColumnaId = String(columna_id).trim().toLowerCase();
+        if (!USUARIOS_LEGACY_ALLOWED_ID_FIELDS.has(safeColumnaId)) {
+            return res.status(400).json({ error: true, message: `Identificador no permitido: ${columna_id}` });
+        }
+
         const tabla = 'usuarios';
         const strValorId = String(valor_id);
 
         const query = 'CALL pa_delete($1, $2, $3)';
-        await pool.query(query, [tabla, columna_id, strValorId]);
+        await pool.query(query, [tabla, safeColumnaId, strValorId]);
 
         res.status(200).json({ message: 'Usuario eliminado.' });
 
     } catch (err) {
         console.error('Error al eliminar:', err.message);
-        res.status(500).json({ error: true, message: err.message });
+        res.status(500).json({ error: true, message: 'Error interno del servidor' });
     }
 });
 export default router;
@@ -218,6 +263,10 @@ const v2NormalizeText = (value) => {
   if (value === null || value === undefined) return '';
   return String(value).trim();
 };
+
+const v2NormalizeEmail = (value) => v2NormalizeText(value).toLowerCase();
+const V2_SAFE_EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
+const v2IsSafeEmail = (value) => V2_SAFE_EMAIL_RE.test(v2NormalizeEmail(value));
 
 const v2ValidateCreatePassword = (plainPassword) => {
   const value = String(plainPassword ?? '');
@@ -518,7 +567,7 @@ const v2MapUsuarioRow = (row) => {
     row.nombre_completo
       || row.nombre_completo_empleado
       || row.nombre_completo_cliente
-  );
+  ) || v2NormalizeText(row.nombre_usuario) || `Usuario ${row.id_usuario ?? ''}`.trim();
 
   const empleado = {
     id_empleado: row.id_empleado ?? null,
@@ -532,7 +581,7 @@ const v2MapUsuarioRow = (row) => {
 
   const cliente = {
     id_cliente: row.id_cliente ?? null,
-    nombre_completo: v2NormalizeText(row.nombre_completo_cliente),
+    nombre_completo: v2NormalizeText(row.nombre_completo_cliente) || v2NormalizeText(row.nombre_empresa_cliente),
     dni: row.dni_cliente ?? null,
     telefono: row.telefono_cliente ?? null,
     correo: row.correo_cliente ?? null,
@@ -588,10 +637,16 @@ const v2FetchUsuarioById = async (idUsuario, queryRunner = pool) => {
       e.id_empleado,
       cl.id_cliente,
       TRIM(CONCAT(COALESCE(pe.nombre, ''), ' ', COALESCE(pe.apellido, ''))) AS nombre_completo_empleado,
-      TRIM(CONCAT(COALESCE(pc.nombre, ''), ' ', COALESCE(pc.apellido, ''))) AS nombre_completo_cliente,
       COALESCE(
-        TRIM(CONCAT(COALESCE(pe.nombre, ''), ' ', COALESCE(pe.apellido, ''))),
-        TRIM(CONCAT(COALESCE(pc.nombre, ''), ' ', COALESCE(pc.apellido, '')))
+        NULLIF(TRIM(CONCAT(COALESCE(pc.nombre, ''), ' ', COALESCE(pc.apellido, ''))), ''),
+        NULLIF(TRIM(COALESCE(ec.nombre_empresa, '')), '')
+      ) AS nombre_completo_cliente,
+      ec.nombre_empresa AS nombre_empresa_cliente,
+      COALESCE(
+        NULLIF(TRIM(CONCAT(COALESCE(pe.nombre, ''), ' ', COALESCE(pe.apellido, ''))), ''),
+        NULLIF(TRIM(CONCAT(COALESCE(pc.nombre, ''), ' ', COALESCE(pc.apellido, ''))), ''),
+        NULLIF(TRIM(COALESCE(ec.nombre_empresa, '')), ''),
+        NULLIF(TRIM(COALESCE(u.nombre_usuario, '')), '')
       ) AS nombre_completo,
       pe.dni AS dni_empleado,
       pc.dni AS dni_cliente,
@@ -610,6 +665,7 @@ const v2FetchUsuarioById = async (idUsuario, queryRunner = pool) => {
     LEFT JOIN correos ce ON ce.id_correo = pe.id_correo
     LEFT JOIN clientes cl ON cl.id_cliente = u.id_cliente
     LEFT JOIN personas pc ON pc.id_persona = cl.id_persona
+    LEFT JOIN empresas ec ON ec.id_empresa = cl.id_empresa
     LEFT JOIN telefonos tc ON tc.id_telefono = pc.id_telefono
     LEFT JOIN correos cc ON cc.id_correo = pc.id_correo
     LEFT JOIN sucursales s ON s.id_sucursal = e.id_sucursal
@@ -634,6 +690,114 @@ const v2FetchUsuarioById = async (idUsuario, queryRunner = pool) => {
 
   const result = await queryRunner.query(query, [idUsuario]);
   return v2MapUsuarioRow(result.rows[0] || null);
+};
+
+const v2ResolveUsuarioEmail = async (idUsuario, queryRunner = pool) => {
+  const result = await queryRunner.query(
+    `
+      SELECT
+        COALESCE(
+          NULLIF(TRIM(ce_link.direccion_correo), ''),
+          NULLIF(TRIM(ce_persona.direccion_correo), ''),
+          NULLIF(TRIM(cc_link.direccion_correo), ''),
+          NULLIF(TRIM(cc_persona.direccion_correo), '')
+        ) AS correo
+      FROM usuarios u
+      LEFT JOIN empleados e ON e.id_empleado = u.id_empleado
+      LEFT JOIN personas pe ON pe.id_persona = e.id_persona
+      LEFT JOIN correos ce_link ON ce_link.id_correo = pe.id_correo
+      LEFT JOIN correos ce_persona ON (pe.id_correo IS NULL AND ce_persona.id_persona = pe.id_persona)
+      LEFT JOIN clientes cl ON cl.id_cliente = u.id_cliente
+      LEFT JOIN personas pc ON pc.id_persona = cl.id_persona
+      LEFT JOIN correos cc_link ON cc_link.id_correo = pc.id_correo
+      LEFT JOIN correos cc_persona ON (pc.id_correo IS NULL AND cc_persona.id_persona = pc.id_persona)
+      WHERE u.id_usuario = $1
+      LIMIT 1
+    `,
+    [idUsuario]
+  );
+
+  return v2NormalizeEmail(result.rows?.[0]?.correo);
+};
+
+const v2BuildTemporaryPasswordEmailHtml = ({
+  displayName,
+  username,
+  temporaryPassword,
+  mode = 'create',
+}) => {
+  const safeName = v2NormalizeText(displayName) || 'usuario';
+  const safeUsername = v2NormalizeText(username) || 'N/D';
+  const safePassword = v2NormalizeText(temporaryPassword) || 'N/D';
+  const modeLabel = mode === 'reset'
+    ? 'Hemos generado una nueva contrasena temporal para tu cuenta.'
+    : 'Tu cuenta fue creada y se genero una contrasena temporal.';
+
+  return `
+<!DOCTYPE html>
+<html lang="es">
+<head><meta charset="UTF-8"></head>
+<body style="margin:0; padding:0; background:#0e0704; font-family:Arial,sans-serif;">
+  <table width="100%" cellpadding="0" cellspacing="0" style="max-width:620px; margin:28px auto; background:#1a1108; border:1px solid rgba(212,165,116,0.25); border-radius:14px;">
+    <tr>
+      <td style="padding:28px 32px; color:#fdfaf5;">
+        <h2 style="margin:0 0 10px; color:#d4a574;">Credenciales temporales</h2>
+        <p style="margin:0 0 16px; color:rgba(255,255,255,0.82); line-height:1.5;">
+          Hola ${safeName},<br/>${modeLabel}
+        </p>
+        <div style="background:#24170f; border:1px solid rgba(212,165,116,0.28); border-radius:10px; padding:16px;">
+          <p style="margin:0 0 8px; color:rgba(255,255,255,0.8);"><strong>Usuario:</strong> ${safeUsername}</p>
+          <p style="margin:0; color:rgba(255,255,255,0.8);"><strong>Contrasena temporal:</strong> ${safePassword}</p>
+        </div>
+        <p style="margin:16px 0 0; color:rgba(255,255,255,0.68); line-height:1.5;">
+          Por seguridad, inicia sesion y cambia la contrasena en tu primer acceso.
+        </p>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>`;
+};
+
+const v2SendTemporaryPasswordEmail = async ({
+  idUsuario,
+  username,
+  displayName,
+  temporaryPassword,
+  mode = 'create',
+  queryRunner = pool,
+}) => {
+  const id = v2ParsePositiveInt(idUsuario);
+  if (!id) {
+    return { sent: false, skipped: true, reason: 'INVALID_USER_ID', to: null };
+  }
+
+  const targetEmail = await v2ResolveUsuarioEmail(id, queryRunner);
+  if (!v2IsSafeEmail(targetEmail)) {
+    return { sent: false, skipped: true, reason: 'EMAIL_NOT_AVAILABLE', to: null };
+  }
+
+  const subject = mode === 'reset'
+    ? 'Nueva contrasena temporal - Jonnys SmartOrder'
+    : 'Credenciales temporales - Jonnys SmartOrder';
+  const html = v2BuildTemporaryPasswordEmailHtml({
+    displayName,
+    username,
+    temporaryPassword,
+    mode,
+  });
+
+  try {
+    await enviarCorreo(targetEmail, subject, html, {
+      id_usuario: id,
+      tipo_correo: mode === 'reset' ? 'credenciales_temporales_reset' : 'credenciales_temporales_creacion',
+      fromKey: 'ACCESO',
+    });
+    return { sent: true, skipped: false, to: targetEmail };
+  } catch (error) {
+    console.error('[usuarios/v2] Error enviando contrasena temporal por correo:', error?.message || error);
+    return { sent: false, skipped: false, reason: 'SMTP_SEND_FAILED', to: targetEmail };
+  }
 };
 
 const v2UsernameExists = async (nombreUsuario, { excludeId = null, queryRunner = pool } = {}) => {
@@ -847,6 +1011,10 @@ router.get('/usuarios/v2/list', checkPermission(USUARIOS_LIST_PERMISSIONS), asyn
     const limit = Math.min(requestedLimit, USUARIOS_V2_MAX_LIMIT);
     const offset = (page - 1) * limit;
     const q = v2NormalizeText(req.query.q ?? req.query.search ?? req.query.nombre);
+    const estado = req.query.estado === undefined ? null : v2ParseBoolean(req.query.estado);
+    if (req.query.estado !== undefined && estado === null) {
+      return res.status(400).json({ error: true, message: 'estado debe ser booleano' });
+    }
 
     const params = [];
     const whereParts = [];
@@ -865,9 +1033,14 @@ router.get('/usuarios/v2/list', checkPermission(USUARIOS_LIST_PERMISSIONS), asyn
         OR COALESCE(pc.dni::text, '') ILIKE $${params.length}
         OR COALESCE(tc.telefono, '') ILIKE $${params.length}
         OR COALESCE(cc.direccion_correo, '') ILIKE $${params.length}
+        OR COALESCE(ec.nombre_empresa, '') ILIKE $${params.length}
         OR COALESCE(s.nombre_sucursal, '') ILIKE $${params.length}
         OR COALESCE(roles_info.roles_nombres, '') ILIKE $${params.length}
       )`);
+    }
+    if (estado !== null) {
+      params.push(estado);
+      whereParts.push(`u.estado = $${params.length}`);
     }
 
     const whereSql = whereParts.length ? `WHERE ${whereParts.join(' AND ')}` : '';
@@ -881,6 +1054,7 @@ router.get('/usuarios/v2/list', checkPermission(USUARIOS_LIST_PERMISSIONS), asyn
       LEFT JOIN correos ce ON ce.id_correo = pe.id_correo
       LEFT JOIN clientes cl ON cl.id_cliente = u.id_cliente
       LEFT JOIN personas pc ON pc.id_persona = cl.id_persona
+      LEFT JOIN empresas ec ON ec.id_empresa = cl.id_empresa
       LEFT JOIN telefonos tc ON tc.id_telefono = pc.id_telefono
       LEFT JOIN correos cc ON cc.id_correo = pc.id_correo
       LEFT JOIN sucursales s ON s.id_sucursal = e.id_sucursal
@@ -904,10 +1078,16 @@ router.get('/usuarios/v2/list', checkPermission(USUARIOS_LIST_PERMISSIONS), asyn
         e.id_empleado,
         cl.id_cliente,
         TRIM(CONCAT(COALESCE(pe.nombre, ''), ' ', COALESCE(pe.apellido, ''))) AS nombre_completo_empleado,
-        TRIM(CONCAT(COALESCE(pc.nombre, ''), ' ', COALESCE(pc.apellido, ''))) AS nombre_completo_cliente,
         COALESCE(
-          TRIM(CONCAT(COALESCE(pe.nombre, ''), ' ', COALESCE(pe.apellido, ''))),
-          TRIM(CONCAT(COALESCE(pc.nombre, ''), ' ', COALESCE(pc.apellido, '')))
+          NULLIF(TRIM(CONCAT(COALESCE(pc.nombre, ''), ' ', COALESCE(pc.apellido, ''))), ''),
+          NULLIF(TRIM(COALESCE(ec.nombre_empresa, '')), '')
+        ) AS nombre_completo_cliente,
+        ec.nombre_empresa AS nombre_empresa_cliente,
+        COALESCE(
+          NULLIF(TRIM(CONCAT(COALESCE(pe.nombre, ''), ' ', COALESCE(pe.apellido, ''))), ''),
+          NULLIF(TRIM(CONCAT(COALESCE(pc.nombre, ''), ' ', COALESCE(pc.apellido, ''))), ''),
+          NULLIF(TRIM(COALESCE(ec.nombre_empresa, '')), ''),
+          NULLIF(TRIM(COALESCE(u.nombre_usuario, '')), '')
         ) AS nombre_completo,
         pe.dni AS dni_empleado,
         pc.dni AS dni_cliente,
@@ -926,6 +1106,7 @@ router.get('/usuarios/v2/list', checkPermission(USUARIOS_LIST_PERMISSIONS), asyn
       LEFT JOIN correos ce ON ce.id_correo = pe.id_correo
       LEFT JOIN clientes cl ON cl.id_cliente = u.id_cliente
       LEFT JOIN personas pc ON pc.id_persona = cl.id_persona
+      LEFT JOIN empresas ec ON ec.id_empresa = cl.id_empresa
       LEFT JOIN telefonos tc ON tc.id_telefono = pc.id_telefono
       LEFT JOIN correos cc ON cc.id_correo = pc.id_correo
       LEFT JOIN sucursales s ON s.id_sucursal = e.id_sucursal
@@ -1617,6 +1798,14 @@ router.post('/usuarios/v2/generate', checkPermission(USUARIOS_CREATE_PERMISSIONS
     createdUser = await v2FetchUsuarioById(idUsuarioCreado, client);
     await client.query('COMMIT');
 
+    const emailNotification = await v2SendTemporaryPasswordEmail({
+      idUsuario: createdUser?.id_usuario,
+      username: createdUser?.nombre_usuario,
+      displayName: createdUser?.nombre_completo,
+      temporaryPassword,
+      mode: 'create',
+    });
+
     return res.status(201).json({
       ok: true,
       usuario: {
@@ -1630,6 +1819,7 @@ router.post('/usuarios/v2/generate', checkPermission(USUARIOS_CREATE_PERMISSIONS
         tipo_usuario: createdUser?.tipo_usuario,
       },
       temp_password: temporaryPassword,
+      email_notification: emailNotification,
     });
   } catch (err) {
     try { await client.query('ROLLBACK'); } catch (_) { /* ignore */ }
@@ -1670,10 +1860,19 @@ router.post('/usuarios/v2/reset-password/:id_usuario', checkPermission(USUARIOS_
       values
     );
 
+    const emailNotification = await v2SendTemporaryPasswordEmail({
+      idUsuario: currentUser?.id_usuario,
+      username: currentUser?.nombre_usuario,
+      displayName: currentUser?.nombre_completo,
+      temporaryPassword,
+      mode: 'reset',
+    });
+
     return res.status(200).json({
       ok: true,
       nombre_usuario: currentUser?.nombre_usuario || null,
       temp_password: temporaryPassword,
+      email_notification: emailNotification,
     });
   } catch (err) {
     console.error('Error en /usuarios/v2/reset-password/:id_usuario:', err.message);

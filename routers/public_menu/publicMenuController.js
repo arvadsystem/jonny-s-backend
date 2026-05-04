@@ -1,11 +1,16 @@
 import {
   createPublicOrderService,
+  getPublicHeroCarouselConfigService,
   getMenuVigenteByBranchService,
   getPublicBranchesService,
   getPublicCatalogItemDetailService,
   getPublicCatalogService
 } from './publicMenuService.js';
-import { sendPublicMenuClientError, sendPublicMenuError } from './publicMenuResponse.js';
+import {
+  getPublicMenuRequestId,
+  sendPublicMenuClientError,
+  sendPublicMenuError
+} from './publicMenuResponse.js';
 
 // Respuesta de error uniforme y saneada para controladores del modulo.
 const handleControllerError = (req, res, error, fallbackMessage) =>
@@ -18,9 +23,27 @@ const handleControllerError = (req, res, error, fallbackMessage) =>
 export const getPublicBranchesController = async (req, res) => {
   try {
     const data = await getPublicBranchesService();
-    return res.status(200).json({ ok: true, data });
+    return res.status(200).json({
+      ok: true,
+      request_id: getPublicMenuRequestId(req, res),
+      data
+    });
   } catch (error) {
     return handleControllerError(req, res, error, 'No se pudieron listar sucursales publicas.');
+  }
+};
+
+// AM: GET /public-menu/carrusel-config
+export const getPublicHeroCarouselConfigController = async (req, res) => {
+  try {
+    const data = await getPublicHeroCarouselConfigService();
+    return res.status(200).json({
+      ok: true,
+      request_id: getPublicMenuRequestId(req, res),
+      data
+    });
+  } catch (error) {
+    return handleControllerError(req, res, error, 'No se pudo cargar la configuracion del carrusel.');
   }
 };
 
@@ -37,7 +60,11 @@ export const getActiveMenuByBranchController = async (req, res) => {
       });
     }
 
-    return res.status(200).json({ ok: true, data });
+    return res.status(200).json({
+      ok: true,
+      request_id: getPublicMenuRequestId(req, res),
+      data
+    });
   } catch (error) {
     return handleControllerError(req, res, error, 'No se pudo resolver el menu vigente de la sucursal.');
   }
@@ -52,7 +79,11 @@ export const getPublicCatalogController = async (req, res) => {
       tipoPedido
     });
 
-    return res.status(200).json({ ok: true, data });
+    return res.status(200).json({
+      ok: true,
+      request_id: getPublicMenuRequestId(req, res),
+      data
+    });
   } catch (error) {
     return handleControllerError(req, res, error, 'No se pudo construir el catalogo publico.');
   }
@@ -67,7 +98,11 @@ export const getPublicCatalogItemDetailController = async (req, res) => {
       idDetalleMenu
     });
 
-    return res.status(200).json({ ok: true, data });
+    return res.status(200).json({
+      ok: true,
+      request_id: getPublicMenuRequestId(req, res),
+      data
+    });
   } catch (error) {
     return handleControllerError(req, res, error, 'No se pudo obtener el detalle del item publico.');
   }
@@ -80,6 +115,7 @@ export const createPublicOrderController = async (req, res) => {
       idSucursal,
       tipoPedido,
       origen,
+      idempotencyKey,
       business,
       items,
       auth
@@ -88,14 +124,19 @@ export const createPublicOrderController = async (req, res) => {
       idSucursal,
       tipoPedido,
       origen,
+      idempotencyKey,
       business,
       items,
       auth
     });
 
-    return res.status(201).json({
+    const replayed = Boolean(data?.idempotency?.replayed);
+    return res.status(replayed ? 200 : 201).json({
       ok: true,
-      message: 'Pedido registrado correctamente.',
+      request_id: getPublicMenuRequestId(req, res),
+      message: replayed
+        ? 'Pedido ya registrado previamente; se devuelve el resultado original.'
+        : 'Pedido registrado correctamente.',
       data
     });
   } catch (error) {

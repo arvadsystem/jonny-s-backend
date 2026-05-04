@@ -1,5 +1,6 @@
 import express from "express";
 import pool from "../../config/db-connection.js";
+import { securityReadLimiter } from "./securityRateLimit.js";
 
 const router = express.Router();
 
@@ -7,7 +8,7 @@ const router = express.Router();
  * GET /seguridad/permisos
  * Devuelve permisos del usuario autenticado.
  */
-router.get("/permisos", async (req, res) => {
+router.get("/permisos", securityReadLimiter, async (req, res) => {
   try {
     const idUsuario = req.user?.id_usuario;
 
