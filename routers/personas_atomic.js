@@ -48,6 +48,8 @@ let tipoClienteLabelColumnCache = null;
 let tipoClienteLabelCheckedAt = 0;
 let hasClienteEmpresaFieldCache = null;
 let hasClienteEmpresaFieldCheckedAt = 0;
+let hasClienteSucursalFieldCache = null;
+let hasClienteSucursalFieldCheckedAt = 0;
 let fnGuardarClienteSupportsEmpresaClienteCache = null;
 let fnGuardarClienteSupportCheckedAt = 0;
 const ATOMIC_SCHEMA_CACHE_TTL_MS = 60_000;
@@ -218,6 +220,31 @@ const hasClienteEmpresaField = async (client, { forceRefresh = false } = {}) => 
   hasClienteEmpresaFieldCache = Boolean(rs.rows?.length);
 
   return hasClienteEmpresaFieldCache;
+};
+
+const hasClienteSucursalField = async (client, { forceRefresh = false } = {}) => {
+  const now = Date.now();
+  const shouldRefresh = forceRefresh
+    || !hasClienteSucursalFieldCheckedAt
+    || (now - hasClienteSucursalFieldCheckedAt) > ATOMIC_SCHEMA_CACHE_TTL_MS;
+
+  if (!shouldRefresh && hasClienteSucursalFieldCache !== null) {
+    return hasClienteSucursalFieldCache;
+  }
+
+  hasClienteSucursalFieldCheckedAt = now;
+  const rs = await client.query(
+    `
+      SELECT 1
+      FROM information_schema.columns
+      WHERE table_schema = 'public'
+        AND table_name = 'clientes'
+        AND column_name = 'id_sucursal'
+      LIMIT 1
+    `
+  );
+  hasClienteSucursalFieldCache = Boolean(rs.rows?.length);
+  return hasClienteSucursalFieldCache;
 };
 
 const resolveTipoClienteIdAtomic = async (client, preferredId) => {
@@ -455,6 +482,9 @@ const findClienteDetail = async (client, idCliente) => {
   if (await hasClienteEmpresaField(client)) {
     empresaRelationExpr = 'COALESCE(c.id_empresa_cliente, CASE WHEN c.id_persona IS NULL THEN c.id_empresa ELSE NULL END)';
   }
+  const clienteSucursalExpr = (await hasClienteSucursalField(client))
+    ? 'c.id_sucursal'
+    : 'NULL::INT';
 
   const rs = await client.query(
     `
@@ -463,7 +493,7 @@ const findClienteDetail = async (client, idCliente) => {
         c.id_persona,
         ${empresaRelationExpr} AS id_empresa_cliente,
         c.id_empresa,
-        c.id_sucursal,
+        ${clienteSucursalExpr} AS id_sucursal,
         c.id_tipo_cliente,
         c.fecha_ingreso,
         c.puntos,
