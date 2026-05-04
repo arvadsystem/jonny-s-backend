@@ -195,33 +195,56 @@ const ensureActiveAssignmentBusinessRules = async (
     idUsuario,
     idSucursal,
     puedeResponsable,
+    targetRoleCodes = [],
+    actorIsSuperAdmin = false,
     estado = true,
     excludeAssignmentId = null
   }
 ) => {
   if (!parseBooleanish(estado)) return;
-
-  const userConflictResult = await client.query(
-    `
-      SELECT cua.id_caja_usuario_autorizado
-      FROM public.cajas_usuarios_autorizados cua
-      INNER JOIN public.cajas c ON c.id_caja = cua.id_caja
-      WHERE cua.id_usuario = $1
-        AND cua.id_caja <> $2
-        AND COALESCE(cua.estado, true) = true
-        AND COALESCE(c.estado, true) = true
-        AND ($3::int IS NULL OR cua.id_caja_usuario_autorizado <> $3)
-      LIMIT 1
-      FOR UPDATE
-    `,
-    [idUsuario, idCaja, excludeAssignmentId]
+  const normalizedTargetRoleCodes = new Set(
+    (Array.isArray(targetRoleCodes) ? targetRoleCodes : [])
+      .map((value) => String(value || '').trim().toUpperCase())
+      .filter(Boolean)
   );
-  if (userConflictResult.rowCount > 0) {
-    throw createCajaError(
-      409,
-      'VENTAS_CAJAS_ASSIGN_USER_ACTIVE_DUPLICATE',
-      'El usuario ya tiene otra caja activa asignada.'
+  const targetIsSuperAdmin = normalizedTargetRoleCodes.has('SUPER_ADMIN');
+
+  if (!(actorIsSuperAdmin && targetIsSuperAdmin)) {
+    const userConflictResult = await client.query(
+      `
+        SELECT
+          cua.id_caja_usuario_autorizado,
+          cua.id_caja,
+          c.codigo_caja,
+          c.nombre_caja,
+          s.id_sucursal,
+          s.nombre_sucursal
+        FROM public.cajas_usuarios_autorizados cua
+        INNER JOIN public.cajas c ON c.id_caja = cua.id_caja
+        INNER JOIN public.sucursales s ON s.id_sucursal = c.id_sucursal
+        WHERE cua.id_usuario = $1
+          AND cua.id_caja <> $2
+          AND COALESCE(cua.estado, true) = true
+          AND COALESCE(c.estado, true) = true
+          AND ($3::int IS NULL OR cua.id_caja_usuario_autorizado <> $3)
+        LIMIT 1
+        FOR UPDATE
+      `,
+      [idUsuario, idCaja, excludeAssignmentId]
     );
+    if (userConflictResult.rowCount > 0) {
+      const conflict = userConflictResult.rows[0] || {};
+      const codigoCaja = normalizeText(conflict.codigo_caja, 80);
+      const nombreCaja = normalizeText(conflict.nombre_caja, 120);
+      const nombreSucursal = normalizeText(conflict.nombre_sucursal, 120);
+      const cajaLabel = [nombreCaja, codigoCaja ? `(${codigoCaja})` : null].filter(Boolean).join(' ');
+      const ubicacionLabel = nombreSucursal ? ` en ${nombreSucursal}` : '';
+      throw createCajaError(
+        409,
+        'VENTAS_CAJAS_ASSIGN_USER_ACTIVE_DUPLICATE',
+        `El usuario ya tiene otra caja activa asignada${cajaLabel ? `: ${cajaLabel}` : ''}${ubicacionLabel}.`
+      );
+    }
   }
 
   if (!parseBooleanish(puedeResponsable)) return;
@@ -253,28 +276,71 @@ const ensureActiveAssignmentBusinessRules = async (
   }
 };
 
-const fetchCajeroEmployeeById = async (client, idUsuario) => {
+const fetchAssignableCajaUserById = async (client, idUsuario) => {
   const result = await client.query(
     `
-      SELECT DISTINCT u.id_usuario, u.nombre_usuario, e.id_empleado, e.id_sucursal,
+      SELECT u.id_usuario, u.nombre_usuario, e.id_empleado, e.id_sucursal,
              COALESCE(
                NULLIF(TRIM(CONCAT_WS(' ', per.nombre, per.apellido)), ''),
                u.nombre_usuario
-             ) AS nombre_completo
+             ) AS nombre_completo,
+             ARRAY_AGG(DISTINCT ${ROLE_NORMALIZED_SQL}) AS roles_normalizados
       FROM public.usuarios u
       INNER JOIN public.empleados e ON e.id_empleado = u.id_empleado
       INNER JOIN public.roles_usuarios ru ON ru.id_usuario = u.id_usuario
       INNER JOIN public.roles r ON r.id_rol = ru.id_rol
       LEFT JOIN public.personas per ON per.id_persona = e.id_persona
-       WHERE u.id_usuario = $1
-         AND COALESCE(u.estado, true) = true
-         AND COALESCE(e.estado, true) = true
-         AND ${ROLE_NORMALIZED_SQL} = 'CAJERO'
-       LIMIT 1
+      WHERE u.id_usuario = $1
+        AND COALESCE(u.estado, true) = true
+        AND COALESCE(e.estado, true) = true
+      GROUP BY u.id_usuario, u.nombre_usuario, e.id_empleado, e.id_sucursal, per.nombre, per.apellido
+      LIMIT 1
      `,
     [idUsuario]
   );
-  return result.rows[0] || null;
+  const user = result.rows[0] || null;
+  if (!user) return null;
+  const roleCodes = Array.isArray(user.roles_normalizados)
+    ? user.roles_normalizados.map((value) => String(value || '').trim().toUpperCase()).filter(Boolean)
+    : [];
+  return {
+    ...user,
+    roles_normalizados: roleCodes
+  };
+};
+
+const normalizeRoleCodes = (roleCodes) =>
+  (Array.isArray(roleCodes) ? roleCodes : [])
+    .map((value) => String(value || '').trim().toUpperCase())
+    .filter(Boolean);
+
+const hasAnyRoleCode = (roleCodes, candidates) => {
+  const normalizedRoles = new Set(normalizeRoleCodes(roleCodes));
+  return (Array.isArray(candidates) ? candidates : []).some((candidate) =>
+    normalizedRoles.has(String(candidate || '').trim().toUpperCase())
+  );
+};
+
+const isCajaUserCajero = (roleCodes) => hasAnyRoleCode(roleCodes, ['CAJERO']);
+
+const isCajaUserAdminLike = (roleCodes) =>
+  hasAnyRoleCode(roleCodes, ['SUPER_ADMIN', 'ADMIN', 'ADMINISTRADOR']);
+
+const requestIsSuperAdminReal = async (client, req) => {
+  const idUsuario = parsePositiveInt(req?.user?.id_usuario);
+  if (!idUsuario) return false;
+  const result = await client.query(
+    `
+      SELECT 1
+      FROM public.roles_usuarios ru
+      INNER JOIN public.roles r ON r.id_rol = ru.id_rol
+      WHERE ru.id_usuario = $1
+        AND ${ROLE_NORMALIZED_SQL} = 'SUPER_ADMIN'
+      LIMIT 1
+    `,
+    [idUsuario]
+  );
+  return result.rowCount > 0;
 };
 
 const findDetallePlanillaByUsuarioAndMonth = async ({
@@ -686,7 +752,7 @@ const assertCajaAuthorization = async (client, idCaja, idUsuario, roleCode) => {
 const fetchSessionBase = async (client, idSesionCaja, { forUpdate = false } = {}) => {
   const result = await client.query(
     `
-      SELECT cs.*, c.codigo_caja, c.nombre_caja, s.nombre_sucursal,
+      SELECT cs.*, c.codigo_caja, c.nombre_caja, COALESCE(c.estado, true) AS caja_estado, s.nombre_sucursal,
              estado.codigo AS estado_codigo, estado.nombre AS estado_nombre
       FROM public.cajas_sesiones cs
       INNER JOIN public.cajas c ON c.id_caja = cs.id_caja
@@ -838,12 +904,47 @@ const buildSessionDetailPayload = async (client, session) => {
       )
     ]);
 
-  const cobrosPorUsuario = cobrosResult.rows;
+  const participantsByUserId = new Map();
+  for (const participante of participantesResult.rows) {
+    const participantUserId = Number(participante?.id_usuario || 0);
+    if (!participantUserId) continue;
+    participantsByUserId.set(participantUserId, participante);
+  }
+
+  const cobrosPorUsuario = cobrosResult.rows
+    .map((row) => {
+      const idUsuarioEjecutor = Number(row?.id_usuario_ejecutor || 0);
+      if (!idUsuarioEjecutor) return null;
+
+      const participante = participantsByUserId.get(idUsuarioEjecutor) || null;
+      const participantRoleCode = String(participante?.rol_codigo || '').trim().toUpperCase();
+      const fallbackRoleCode =
+        idUsuarioEjecutor === Number(session.id_usuario_responsable) ? 'RESPONSABLE' : 'EJECUTOR';
+      const rolParticipacion = participantRoleCode || fallbackRoleCode;
+      const esResponsable = rolParticipacion === 'RESPONSABLE';
+      const esAuxiliar = rolParticipacion === 'AUXILIAR';
+
+      return {
+        ...row,
+        id_usuario_ejecutor: idUsuarioEjecutor,
+        cobros_registrados: Number(
+          row?.cobros_registrados ?? row?.cantidad_cobros ?? row?.total_cobros ?? 0
+        ),
+        total_cobrado: Number(row?.total_cobrado || 0),
+        total_efectivo: Number(row?.total_efectivo || 0),
+        total_no_efectivo: Number(row?.total_no_efectivo || 0),
+        rol_participacion: rolParticipacion,
+        es_responsable: esResponsable,
+        es_auxiliar: esAuxiliar
+      };
+    })
+    .filter(Boolean);
+
   const totalResponsable = cobrosPorUsuario
-    .filter((row) => Number(row.id_usuario_ejecutor) === Number(session.id_usuario_responsable))
+    .filter((row) => row.es_responsable)
     .reduce((sum, row) => sum + Number(row.total_cobrado || 0), 0);
   const totalAuxiliares = cobrosPorUsuario
-    .filter((row) => Number(row.id_usuario_ejecutor) !== Number(session.id_usuario_responsable))
+    .filter((row) => row.es_auxiliar || !row.es_responsable)
     .reduce((sum, row) => sum + Number(row.total_cobrado || 0), 0);
 
   return {
@@ -951,13 +1052,23 @@ router.get('/ventas/cajas/usuarios', checkPermission(['VENTAS_CAJAS_LISTADO_VER'
     }
     assertSucursalAllowed(scopeContext, targetSucursalId);
 
+    const rolOperativo = String(req.query.rol_operativo || '').trim().toUpperCase();
+    if (!['RESPONSABLE', 'AUXILIAR'].includes(rolOperativo)) {
+      throw createCajaError(
+        400,
+        'VENTAS_CAJAS_ROLE_OPERATIVO_INVALID',
+        'Debe indicar un rol operativo valido: RESPONSABLE o AUXILIAR.'
+      );
+    }
+
     const result = await pool.query(
       `
-        SELECT DISTINCT u.id_usuario, u.nombre_usuario,
+        SELECT u.id_usuario, u.nombre_usuario,
                COALESCE(
                  NULLIF(TRIM(CONCAT_WS(' ', per.nombre, per.apellido)), ''),
                  u.nombre_usuario
-               ) AS nombre_completo
+               ) AS nombre_completo,
+               ARRAY_AGG(DISTINCT ${ROLE_NORMALIZED_SQL}) AS roles_normalizados
         FROM public.usuarios u
         INNER JOIN public.empleados e ON e.id_empleado = u.id_empleado
         INNER JOIN public.roles_usuarios ru ON ru.id_usuario = u.id_usuario
@@ -965,16 +1076,89 @@ router.get('/ventas/cajas/usuarios', checkPermission(['VENTAS_CAJAS_LISTADO_VER'
         LEFT JOIN public.personas per ON per.id_persona = e.id_persona
         WHERE COALESCE(u.estado, true) = true
           AND COALESCE(e.estado, true) = true
-          AND e.id_sucursal = $1
-          AND ${ROLE_NORMALIZED_SQL} = 'CAJERO'
+          AND (
+            (
+              $2 = 'AUXILIAR'
+              AND EXISTS (
+                  SELECT 1
+                  FROM public.roles_usuarios ru_super
+                  INNER JOIN public.roles r_super ON r_super.id_rol = ru_super.id_rol
+                  WHERE ru_super.id_usuario = u.id_usuario
+                  AND UPPER(REGEXP_REPLACE(TRIM(r_super.nombre), '[\\s-]+', '_', 'g')) = 'SUPER_ADMIN'
+              )
+            )
+            OR
+            e.id_sucursal = $1
+            OR EXISTS (
+              SELECT 1
+              FROM public.v_usuarios_sucursales_scope vus
+              WHERE vus.id_usuario = u.id_usuario
+                AND COALESCE(vus.estado, true) = true
+                AND vus.id_sucursal = $1
+            )
+            OR EXISTS (
+              SELECT 1
+              FROM public.empleados_sucursales es
+              WHERE es.id_empleado = u.id_empleado
+                AND COALESCE(es.estado, true) = true
+                AND es.id_sucursal = $1
+            )
+            OR EXISTS (
+              SELECT 1
+              FROM public.usuarios_sucursales us
+              WHERE us.id_usuario = u.id_usuario
+                AND us.id_sucursal = $1
+            )
+          )
+        GROUP BY u.id_usuario, u.nombre_usuario, per.nombre, per.apellido
         ORDER BY nombre_completo ASC
       `,
-      [targetSucursalId]
+      [targetSucursalId, rolOperativo]
     );
 
-    return res.status(200).json(result.rows);
+    let rows = result.rows;
+    if (rolOperativo === 'RESPONSABLE') {
+      rows = rows.filter((row) => isCajaUserCajero(row.roles_normalizados));
+    }
+    return res.status(200).json(rows);
   } catch (err) {
     return sendInternalError(res, err, 'VENTAS_CAJAS_USERS_LIST_ERROR', 'No se pudieron listar los usuarios disponibles.');
+  }
+});
+
+router.get('/ventas/cajas/sesiones-abiertas', checkPermission(['VENTAS_CAJAS_LISTADO_VER']), async (req, res) => {
+  try {
+    const idSucursal = parsePositiveInt(req.query.id_sucursal);
+    if (!idSucursal) {
+      throw createCajaError(400, 'VENTAS_CAJAS_SCOPE_REQUIRED', 'Debe indicar id_sucursal.');
+    }
+    const scopeContext = await getScopeContext(req, pool, idSucursal, true);
+    assertSucursalAllowed(scopeContext, idSucursal);
+    if (!(await requestIsSuperAdminReal(pool, req))) {
+      throw createCajaError(403, 'VENTAS_CAJAS_ROLE_FORBIDDEN', 'Accion exclusiva para SUPER_ADMIN.');
+    }
+    const idEstadoAbierta = await getCatalogId(pool, 'SESSION_STATES', 'ABIERTA');
+    const result = await pool.query(
+      `
+        SELECT cs.id_sesion_caja, cs.id_caja, cs.id_sucursal, cs.fecha_apertura,
+               c.codigo_caja, c.nombre_caja, s.nombre_sucursal,
+               ${USER_DISPLAY_SQL} AS responsable_nombre
+        FROM public.cajas_sesiones cs
+        INNER JOIN public.cajas c ON c.id_caja = cs.id_caja
+        INNER JOIN public.sucursales s ON s.id_sucursal = cs.id_sucursal
+        INNER JOIN public.usuarios u ON u.id_usuario = cs.id_usuario_responsable
+        LEFT JOIN public.empleados e ON e.id_empleado = u.id_empleado
+        LEFT JOIN public.personas per ON per.id_persona = e.id_persona
+        WHERE cs.id_sucursal = $1
+          AND cs.id_estado_sesion_caja = $2
+          AND COALESCE(c.estado, true) = true
+        ORDER BY cs.fecha_apertura DESC, cs.id_sesion_caja DESC
+      `,
+      [idSucursal, idEstadoAbierta]
+    );
+    return res.status(200).json(result.rows);
+  } catch (err) {
+    return sendInternalError(res, err, 'VENTAS_CAJAS_OPEN_SESSIONS_LIST_ERROR', 'No se pudieron listar las sesiones abiertas.');
   }
 });
 
@@ -1166,12 +1350,12 @@ router.post('/ventas/cajas/listado', checkPermission(['VENTAS_CAJAS_PARTICIPANTE
 
     let idCajaUsuarioAutorizado = null;
     if (idUsuarioAsignado) {
-      const user = await fetchCajeroEmployeeById(client, idUsuarioAsignado);
+      const user = await fetchAssignableCajaUserById(client, idUsuarioAsignado);
       if (!user) {
         throw createCajaError(
           404,
           'VENTAS_CAJAS_ASSIGN_USER_NOT_FOUND',
-          'El usuario indicado debe ser un empleado activo con rol CAJERO.'
+          'El usuario indicado debe ser un empleado activo.'
         );
       }
       if (Number.parseInt(String(user.id_sucursal || ''), 10) !== targetSucursalId) {
@@ -1184,8 +1368,16 @@ router.post('/ventas/cajas/listado', checkPermission(['VENTAS_CAJAS_PARTICIPANTE
 
       const puedeResponsable = parseBooleanWithDefault(asignacionInicial.puede_responsable, true);
       const puedeAuxiliar = parseBooleanWithDefault(asignacionInicial.puede_auxiliar, true);
-      if (!puedeResponsable && !puedeAuxiliar) {
-        throw createCajaError(400, 'VENTAS_CAJAS_ASSIGN_ROLE_REQUIRED', 'La asignacion debe habilitar al menos un rol operativo.');
+      if ((puedeResponsable && puedeAuxiliar) || (!puedeResponsable && !puedeAuxiliar)) {
+        throw createCajaError(400, 'VENTAS_CAJAS_ASSIGN_ROLE_EXCLUSIVE', 'Debe seleccionar solo un rol operativo: responsable o auxiliar.');
+      }
+      const actorIsSuperAdmin = await requestIsSuperAdminReal(client, req);
+      const userRoles = Array.isArray(user.roles_normalizados) ? user.roles_normalizados : [];
+      if (puedeResponsable && !isCajaUserCajero(userRoles)) {
+        throw createCajaError(400, 'VENTAS_CAJAS_RESPONSABLE_ROLE_INVALID', 'El responsable de caja debe ser un usuario con rol cajero.');
+      }
+      if (puedeAuxiliar && !actorIsSuperAdmin && isCajaUserAdminLike(userRoles)) {
+        throw createCajaError(403, 'VENTAS_CAJAS_ASSIGN_ROLE_FORBIDDEN', 'Solo super_admin puede asignar usuarios administradores como auxiliares.');
       }
 
       idCajaUsuarioAutorizado = await upsertCajaAuthorization(client, {
@@ -1218,12 +1410,12 @@ router.post('/ventas/cajas/listado', checkPermission(['VENTAS_CAJAS_PARTICIPANTE
         throw createCajaError(400, 'VENTAS_CAJAS_APERTURA_AMOUNT_INVALID', 'monto_apertura debe ser un numero mayor o igual a 0.');
       }
 
-      const responsableUser = await fetchCajeroEmployeeById(client, responsableId);
+      const responsableUser = await fetchAssignableCajaUserById(client, responsableId);
       if (!responsableUser) {
         throw createCajaError(
           404,
           'VENTAS_CAJAS_RESPONSABLE_NOT_FOUND',
-          'El responsable indicado debe ser un empleado activo con rol CAJERO.'
+          'El responsable indicado debe ser un empleado activo.'
         );
       }
       if (Number.parseInt(String(responsableUser.id_sucursal || ''), 10) !== targetSucursalId) {
@@ -1233,13 +1425,16 @@ router.post('/ventas/cajas/listado', checkPermission(['VENTAS_CAJAS_PARTICIPANTE
           'El responsable seleccionado no pertenece a la sucursal operativa de la caja.'
         );
       }
+      if (!isCajaUserCajero(responsableUser.roles_normalizados)) {
+        throw createCajaError(400, 'VENTAS_CAJAS_RESPONSABLE_ROLE_INVALID', 'El responsable de caja debe ser un usuario con rol cajero.');
+      }
 
       await upsertCajaAuthorization(client, {
         idCaja,
         idSucursal: targetSucursalId,
         idUsuario: responsableId,
         puedeResponsable: true,
-        puedeAuxiliar: true,
+        puedeAuxiliar: false,
         observacion: 'Asignacion automatica para apertura inicial'
       });
 
@@ -1460,8 +1655,8 @@ router.post('/ventas/cajas/asignaciones', checkPermission(['VENTAS_CAJAS_PARTICI
     if (!idCaja || !idUsuario) {
       throw createCajaError(400, 'VENTAS_CAJAS_ASSIGN_DATA_INVALID', 'Debe indicar una caja y un usuario validos.');
     }
-    if (!puedeResponsable && !puedeAuxiliar) {
-      throw createCajaError(400, 'VENTAS_CAJAS_ASSIGN_ROLE_REQUIRED', 'Debe habilitar al menos un rol operativo.');
+    if ((puedeResponsable && puedeAuxiliar) || (!puedeResponsable && !puedeAuxiliar)) {
+      throw createCajaError(400, 'VENTAS_CAJAS_ASSIGN_ROLE_EXCLUSIVE', 'Debe seleccionar solo un rol operativo: responsable o auxiliar.');
     }
 
     const caja = await fetchCajaById(client, idCaja);
@@ -1470,13 +1665,22 @@ router.post('/ventas/cajas/asignaciones', checkPermission(['VENTAS_CAJAS_PARTICI
     const scopeContext = await getScopeContext(req, client, caja.id_sucursal, true);
     assertSucursalAllowed(scopeContext, caja.id_sucursal);
 
-    const user = await fetchCajeroEmployeeById(client, idUsuario);
+    const user = await fetchAssignableCajaUserById(client, idUsuario);
     if (!user) {
       throw createCajaError(
         404,
         'VENTAS_CAJAS_ASSIGN_USER_NOT_FOUND',
-        'El usuario indicado debe ser un empleado activo con rol CAJERO.'
+        'El usuario indicado debe ser un empleado activo.'
       );
+    }
+    const actorIsSuperAdmin = await requestIsSuperAdminReal(client, req);
+    const userRoles = Array.isArray(user.roles_normalizados) ? user.roles_normalizados : [];
+    const userIsSuperOrAdmin = isCajaUserAdminLike(userRoles);
+    if (puedeResponsable && !isCajaUserCajero(userRoles)) {
+      throw createCajaError(400, 'VENTAS_CAJAS_RESPONSABLE_ROLE_INVALID', 'El responsable de caja debe ser un usuario con rol cajero.');
+    }
+    if (puedeAuxiliar && !actorIsSuperAdmin && userIsSuperOrAdmin) {
+      throw createCajaError(403, 'VENTAS_CAJAS_ASSIGN_ROLE_FORBIDDEN', 'Solo super_admin puede asignar usuarios administradores como auxiliares.');
     }
     if (Number.parseInt(String(user.id_sucursal || ''), 10) !== Number(caja.id_sucursal)) {
       throw createCajaError(
@@ -1491,6 +1695,8 @@ router.post('/ventas/cajas/asignaciones', checkPermission(['VENTAS_CAJAS_PARTICI
       idUsuario,
       idSucursal: caja.id_sucursal,
       puedeResponsable,
+      targetRoleCodes: userRoles,
+      actorIsSuperAdmin,
       estado: true,
       excludeAssignmentId: null
     });
@@ -1570,8 +1776,18 @@ router.patch('/ventas/cajas/asignaciones/:id', checkPermission(['VENTAS_CAJAS_PA
       : parseBooleanWithDefault(assignment.estado, true);
     const observacion = hasObservacion ? normalizeText(req.body.observacion, 300) : assignment.observacion;
 
-    if (estado && !puedeResponsable && !puedeAuxiliar) {
-      throw createCajaError(400, 'VENTAS_CAJAS_ASSIGN_ROLE_REQUIRED', 'La asignacion activa debe habilitar al menos un rol.');
+    if (estado && ((puedeResponsable && puedeAuxiliar) || (!puedeResponsable && !puedeAuxiliar))) {
+      throw createCajaError(400, 'VENTAS_CAJAS_ASSIGN_ROLE_EXCLUSIVE', 'Debe seleccionar solo un rol operativo: responsable o auxiliar.');
+    }
+    const assignmentUser = await fetchAssignableCajaUserById(client, assignment.id_usuario);
+    const actorIsSuperAdmin = await requestIsSuperAdminReal(client, req);
+    const assignmentUserRoles = Array.isArray(assignmentUser?.roles_normalizados) ? assignmentUser.roles_normalizados : [];
+    const assignmentIsSuperOrAdmin = isCajaUserAdminLike(assignmentUserRoles);
+    if (estado && puedeResponsable && !isCajaUserCajero(assignmentUserRoles)) {
+      throw createCajaError(400, 'VENTAS_CAJAS_RESPONSABLE_ROLE_INVALID', 'El responsable de caja debe ser un usuario con rol cajero.');
+    }
+    if (estado && puedeAuxiliar && !actorIsSuperAdmin && assignmentIsSuperOrAdmin) {
+      throw createCajaError(403, 'VENTAS_CAJAS_ASSIGN_ROLE_FORBIDDEN', 'Solo super_admin puede asignar usuarios administradores como auxiliares.');
     }
 
     await ensureActiveAssignmentBusinessRules(client, {
@@ -1579,6 +1795,8 @@ router.patch('/ventas/cajas/asignaciones/:id', checkPermission(['VENTAS_CAJAS_PA
       idUsuario: assignment.id_usuario,
       idSucursal: assignment.id_sucursal,
       puedeResponsable,
+      targetRoleCodes: assignmentUserRoles,
+      actorIsSuperAdmin,
       estado,
       excludeAssignmentId: idAsignacion
     });
@@ -1606,7 +1824,7 @@ router.patch('/ventas/cajas/asignaciones/:id', checkPermission(['VENTAS_CAJAS_PA
   }
 });
 
-router.patch('/ventas/cajas/asignaciones/:id/inactivar', checkPermission(['VENTAS_CAJAS_PARTICIPANTES_GESTIONAR']), async (req, res) => {
+const deactivateAsignacionHandler = async (req, res) => {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -1619,7 +1837,7 @@ router.patch('/ventas/cajas/asignaciones/:id/inactivar', checkPermission(['VENTA
 
     const assignmentResult = await client.query(
       `
-        SELECT id_caja_usuario_autorizado, id_sucursal, COALESCE(estado, true) AS estado
+        SELECT id_caja_usuario_autorizado, id_sucursal, COALESCE(estado, true) AS estado, observacion
         FROM public.cajas_usuarios_autorizados
         WHERE id_caja_usuario_autorizado = $1
         LIMIT 1
@@ -1639,13 +1857,20 @@ router.patch('/ventas/cajas/asignaciones/:id/inactivar', checkPermission(['VENTA
       throw createCajaError(409, 'VENTAS_CAJAS_ASSIGNMENT_ALREADY_INACTIVE', 'La asignacion ya se encuentra inactiva.');
     }
 
+    const nextObservation = normalizeText(
+      assignment.observacion
+        ? `${assignment.observacion}. Asignacion desactivada manualmente.`
+        : 'Asignacion desactivada manualmente.',
+      300
+    );
+
     await client.query(
       `
         UPDATE public.cajas_usuarios_autorizados
-        SET estado = false, fecha_actualizacion = NOW()
+        SET estado = false, observacion = $2, fecha_actualizacion = NOW()
         WHERE id_caja_usuario_autorizado = $1
       `,
-      [idAsignacion]
+      [idAsignacion, nextObservation]
     );
 
     await client.query('COMMIT');
@@ -1656,7 +1881,10 @@ router.patch('/ventas/cajas/asignaciones/:id/inactivar', checkPermission(['VENTA
   } finally {
     client.release();
   }
-});
+};
+
+router.patch('/ventas/cajas/asignaciones/:id/inactivar', checkPermission(['VENTAS_CAJAS_PARTICIPANTES_GESTIONAR']), deactivateAsignacionHandler);
+router.patch('/ventas/cajas/asignaciones/:id/desactivar', checkPermission(['VENTAS_CAJAS_PARTICIPANTES_GESTIONAR']), deactivateAsignacionHandler);
 
 router.get('/ventas/cajas/sesiones', checkPermission(['VENTAS_CAJAS_LISTADO_VER']), async (req, res) => {
   try {
@@ -2377,6 +2605,107 @@ router.post('/ventas/cajas/sesiones/:id/participantes', checkPermission(['VENTAS
   }
 });
 
+router.post('/ventas/cajas/sesiones/:id/auto-auxiliar', checkPermission(['VENTAS_CREAR']), async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const idSesionCaja = parsePositiveInt(req.params.id);
+    const idSucursal = parsePositiveInt(req.body?.id_sucursal);
+    if (!idSesionCaja || !idSucursal) {
+      throw createCajaError(400, 'VENTAS_CAJAS_AUTO_AUXILIAR_DATA_INVALID', 'Debe indicar una sesion de caja e id_sucursal validos.');
+    }
+    if (!(await requestIsSuperAdminReal(client, req))) {
+      throw createCajaError(403, 'VENTAS_CAJAS_ROLE_FORBIDDEN', 'Accion exclusiva para SUPER_ADMIN.');
+    }
+
+    const scopeContext = await getScopeContext(req, client, idSucursal, true);
+    assertSucursalAllowed(scopeContext, idSucursal);
+    const idUsuario = parsePositiveInt(scopeContext.idUsuario);
+    const session = await ensureOpenSession(client, idSesionCaja, { forUpdate: true });
+    if (!parseBooleanish(session.caja_estado)) {
+      throw createCajaError(409, 'VENTAS_CAJAS_CAJA_INACTIVA', 'La caja de la sesion seleccionada no esta activa.');
+    }
+    if (Number(session.id_sucursal) !== Number(idSucursal)) {
+      throw createCajaError(409, 'VENTAS_CAJAS_SCOPE_MISMATCH', 'La caja seleccionada no pertenece a la sucursal de la venta.');
+    }
+
+    const roleAuxiliarId = await getCatalogId(client, 'PARTICIPATION_ROLES', 'AUXILIAR');
+    if (!roleAuxiliarId) {
+      throw createCajaError(409, 'VENTAS_CAJAS_AUXILIAR_ROLE_NOT_FOUND', 'No se encontro el rol operativo AUXILIAR.');
+    }
+
+    const existingResult = await client.query(
+      `
+        SELECT csp.id_participacion_caja, csp.id_rol_participacion_caja, crp.codigo AS rol_codigo
+        FROM public.cajas_sesiones_participantes csp
+        INNER JOIN public.cat_cajas_roles_participacion crp ON crp.id_rol_participacion_caja = csp.id_rol_participacion_caja
+        WHERE csp.id_sesion_caja = $1
+          AND csp.id_usuario = $2
+          AND COALESCE(csp.activo, true) = true
+        LIMIT 1
+        FOR UPDATE
+      `,
+      [idSesionCaja, idUsuario]
+    );
+
+    if (existingResult.rowCount === 0) {
+      const inactiveResult = await client.query(
+        `
+          SELECT id_participacion_caja
+          FROM public.cajas_sesiones_participantes
+          WHERE id_sesion_caja = $1
+            AND id_usuario = $2
+            AND COALESCE(activo, true) = false
+          ORDER BY id_participacion_caja DESC
+          LIMIT 1
+          FOR UPDATE
+        `,
+        [idSesionCaja, idUsuario]
+      );
+      if (inactiveResult.rowCount > 0) {
+        await client.query(
+          `
+            UPDATE public.cajas_sesiones_participantes
+            SET id_rol_participacion_caja = $1,
+                fecha_inicio = NOW(),
+                fecha_fin = NULL,
+                activo = true,
+                observacion = $2,
+                fecha_actualizacion = NOW()
+            WHERE id_participacion_caja = $3
+          `,
+          [roleAuxiliarId, 'Autoasignacion operativa desde modulo de ventas para procesar venta.', inactiveResult.rows[0].id_participacion_caja]
+        );
+      } else {
+        await client.query(
+          `
+            INSERT INTO public.cajas_sesiones_participantes (
+              id_sesion_caja, id_usuario, id_rol_participacion_caja, fecha_inicio, activo, observacion, fecha_creacion, fecha_actualizacion
+            )
+            VALUES ($1, $2, $3, NOW(), true, $4, NOW(), NOW())
+          `,
+          [idSesionCaja, idUsuario, roleAuxiliarId, 'Autoasignacion operativa desde modulo de ventas para procesar venta.']
+        );
+      }
+    }
+
+    await client.query('COMMIT');
+    return res.status(200).json({
+      id_sesion_caja: session.id_sesion_caja,
+      id_caja: session.id_caja,
+      id_sucursal: session.id_sucursal,
+      codigo_caja: session.codigo_caja,
+      nombre_caja: session.nombre_caja,
+      rol_codigo: 'AUXILIAR'
+    });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    return sendInternalError(res, err, 'VENTAS_CAJAS_AUTO_AUXILIAR_ERROR', 'No se pudo registrar la autoasignacion temporal.');
+  } finally {
+    client.release();
+  }
+});
+
 const inactivateParticipantHandler = async ({ req, res, byUserId = false }) => {
   const client = await pool.connect();
   try {
@@ -2653,3 +2982,4 @@ router.patch('/ventas/cajas/incidencias/:id', checkPermission(['VENTAS_CAJAS_INC
 });
 
 export default router;
+
