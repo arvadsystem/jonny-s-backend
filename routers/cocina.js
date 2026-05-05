@@ -63,6 +63,9 @@ const COCINA_TRANSITION_PERMISSION_BY_STATE = Object.freeze({
 
 // Tiempo máximo en minutos antes de considerar un pedido como "próximo a expirar"
 const EXPIRY_WARN_MINUTES = parseInt(process.env.COCINA_EXPIRY_WARN_MINUTES || '45', 10);
+const INVENTARIO_CONFIG_WARNING_CODE = 'CONFIGURACION_INVENTARIO_INCOMPLETA';
+const INVENTARIO_CONFIG_WARNING_MESSAGE = 'Pedido marcado como listo. Se notifico a administracion por configuracion incompleta de inventario.';
+const schemaColumnCache = new Map();
 
 // ══════════════════════════════════════════════════════════════════════
 // Helpers internos
@@ -79,6 +82,26 @@ const normalizeTextKey = (value) =>
 const parsePositiveInt = (value) => {
   const parsed = Number.parseInt(String(value ?? ''), 10);
   return Number.isInteger(parsed) && parsed > 0 ? parsed : null;
+};
+
+const hasColumn = async (client, tableName, columnName) => {
+  const key = `${String(tableName || '').trim().toLowerCase()}.${String(columnName || '').trim().toLowerCase()}`;
+  if (schemaColumnCache.has(key)) return schemaColumnCache.get(key);
+
+  const result = await client.query(
+    `
+      SELECT 1
+      FROM information_schema.columns
+      WHERE table_schema = 'public'
+        AND table_name = $1
+        AND column_name = $2
+      LIMIT 1
+    `,
+    [tableName, columnName]
+  );
+  const exists = result.rowCount > 0;
+  schemaColumnCache.set(key, exists);
+  return exists;
 };
 
 const roundMoney = (value) => Number(Number(value || 0).toFixed(2));
@@ -196,6 +219,22 @@ const splitObservationSegments = (value) => {
     .filter(Boolean);
 };
 
+const extractConfigMenuModifications = (configuracionMenu, itemTipo) => {
+  const source = configuracionMenu && typeof configuracionMenu === 'object'
+    ? configuracionMenu
+    : null;
+  const complementos = Array.isArray(source?.complementos) ? source.complementos : [];
+  if (!complementos.length) return [];
+
+  return complementos
+    .map((entry) => String(entry?.nombre || '').trim())
+    .filter(Boolean)
+    .map((nombre) => {
+      if (String(itemTipo || '').toUpperCase() === 'COMBO') return `Salsa alitas: ${nombre}`;
+      return `Salsa: ${nombre}`;
+    });
+};
+
 const stripItemPrefix = (note, itemName) => {
   const source = String(note || '').trim();
   if (!source) return '';
@@ -263,6 +302,65 @@ const buildEstadoCodeByIdMap = (rows) => {
     }
   });
   return map;
+};
+
+const normalizeWarningFault = (fault) => ({
+  tipo_recurso: String(fault?.tipo_recurso || '').trim().toLowerCase() || 'desconocido',
+  id_recurso: Number(fault?.id_recurso ?? 0) || null,
+  nombre: String(fault?.nombre || '').trim() || null,
+  motivo: String(fault?.motivo || '').trim().toUpperCase() || 'CONFIGURACION_DESCONOCIDA'
+});
+
+const buildInventoryIncidentPayload = ({
+  idPedido,
+  idSucursal,
+  idUsuarioCocina,
+  numeroTicket,
+  faltantes
+}) => {
+  const normalizedFaults = (Array.isArray(faltantes) ? faltantes : []).map(normalizeWarningFault);
+  return {
+    idPedido,
+    codigoVenta: numeroTicket || buildTicketNumber(idPedido),
+    idSucursal: Number(idSucursal ?? 0) || null,
+    idUsuarioCocina: Number(idUsuarioCocina ?? 0) || null,
+    tipoIncidencia: INVENTARIO_CONFIG_WARNING_CODE,
+    mensaje: 'Configuración incompleta detectada al marcar pedido como listo en cocina.',
+    detalle: {
+      warning_code: INVENTARIO_CONFIG_WARNING_CODE,
+      total_faltantes: normalizedFaults.length,
+      faltantes: normalizedFaults
+    }
+  };
+};
+
+const insertCocinaIncident = async (client, payload) => {
+  await client.query(
+    `
+      INSERT INTO public.incidencias_cocina (
+        id_pedido,
+        codigo_venta,
+        id_sucursal,
+        id_usuario_cocina,
+        tipo_incidencia,
+        severidad,
+        origen,
+        detalle,
+        mensaje,
+        estado
+      )
+      VALUES ($1, $2, $3, $4, $5, 'ADVERTENCIA', 'COCINA', $6::jsonb, $7, 'PENDIENTE')
+    `,
+    [
+      payload.idPedido,
+      payload.codigoVenta,
+      payload.idSucursal,
+      payload.idUsuarioCocina,
+      payload.tipoIncidencia,
+      JSON.stringify(payload.detalle || {}),
+      payload.mensaje
+    ]
+  );
 };
 
 /**
@@ -406,6 +504,7 @@ router.get('/cocina/pedidos', checkPermission(COCINA_VIEW_PERMISSIONS), async (r
       }
 
       const whereClause = filters.length ? `WHERE ${filters.join(' AND ')}` : '';
+      const hasDetallePedidoConfiguracionMenu = await hasColumn(client, 'detalle_pedido', 'configuracion_menu');
 
       const result = await client.query(
         `
@@ -434,6 +533,7 @@ router.get('/cocina/pedidos', checkPermission(COCINA_VIEW_PERMISSIONS), async (r
             dp.id_combo,
             dp.id_receta,
             dp.observacion,
+            ${hasDetallePedidoConfiguracionMenu ? 'dp.configuracion_menu,' : 'NULL::jsonb AS configuracion_menu,'}
             COALESCE(prod.nombre_producto, combo.descripcion, rec.nombre_receta, 'Item de cocina') AS nombre_item,
             COALESCE(
               CASE
@@ -522,6 +622,7 @@ router.get('/cocina/pedidos', checkPermission(COCINA_VIEW_PERMISSIONS), async (r
             nombre_item: row.nombre_item || 'Item de cocina',
             cantidad,
             observacion: row.observacion || null,
+            configuracion_menu: row.configuracion_menu || null,
             modificaciones: []
           });
           pedido.total_items += cantidad;
@@ -541,11 +642,17 @@ router.get('/cocina/pedidos', checkPermission(COCINA_VIEW_PERMISSIONS), async (r
                   itemName: item.nombre_item,
                   totalItems
                 });
+            const modificacionesConfiguracion = extractConfigMenuModifications(
+              item.configuracion_menu,
+              item.tipo_item
+            );
+            const modificacionesFinales = [...modificacionesConfiguracion, ...modificaciones];
+            const modificacionesUnicas = [...new Set(modificacionesFinales)];
 
             return {
               ...item,
               observacion: item.observacion,
-              modificaciones
+              modificaciones: modificacionesUnicas
             };
           })
         };
@@ -680,6 +787,7 @@ router.put('/cocina/pedidos/:id/estado', checkPermission(COCINA_VIEW_PERMISSIONS
       }
 
       let inventoryResult = null;
+      let inventoryConfigWarning = null;
       const shouldDiscountInventory = estadoDestino === 'LISTO_PARA_ENTREGA';
       if (shouldDiscountInventory) {
         const consumoPayloadResult = await buildPedidoConsumoPayload(client, idPedido, pedidoSucursalId);
@@ -696,15 +804,23 @@ router.put('/cocina/pedidos/:id/estado', checkPermission(COCINA_VIEW_PERMISSIONS
         });
 
         if (!inventoryResult?.ok) {
-          await client.query('ROLLBACK');
           const isConfigError = String(inventoryResult.code || '').toUpperCase() === 'CONFIGURACION_INVENTARIO_INVALIDA';
-          return res.status(409).json({
-            error: true,
-            code: inventoryResult.code || 'INVENTARIO_ERROR',
-            message: isConfigError
-              ? 'No se pudo marcar como listo por configuracion incompleta de receta/combo/inventario.'
-              : (inventoryResult.message || 'No se pudo descontar inventario para el pedido.'),
-            faltantes: Array.isArray(inventoryResult.faltantes) ? inventoryResult.faltantes : []
+          if (!isConfigError) {
+            await client.query('ROLLBACK');
+            return res.status(409).json({
+              error: true,
+              code: inventoryResult.code || 'INVENTARIO_ERROR',
+              message: inventoryResult.message || 'No se pudo descontar inventario para el pedido.',
+              faltantes: Array.isArray(inventoryResult.faltantes) ? inventoryResult.faltantes : []
+            });
+          }
+
+          inventoryConfigWarning = buildInventoryIncidentPayload({
+            idPedido,
+            idSucursal: pedidoSucursalId,
+            idUsuarioCocina: req?.user?.id_usuario,
+            numeroTicket: buildTicketNumber(idPedido),
+            faltantes: inventoryResult.faltantes
           });
         }
       }
@@ -719,6 +835,10 @@ router.put('/cocina/pedidos/:id/estado', checkPermission(COCINA_VIEW_PERMISSIONS
         `,
         [idEstadoDestino, idPedido]
       );
+
+      if (inventoryConfigWarning) {
+        await insertCocinaIncident(client, inventoryConfigWarning);
+      }
 
       await client.query('COMMIT');
 
@@ -740,11 +860,14 @@ router.put('/cocina/pedidos/:id/estado', checkPermission(COCINA_VIEW_PERMISSIONS
       }
 
       return res.status(200).json({
-        message: 'Estado de pedido actualizado correctamente.',
+        ok: true,
+        message: inventoryConfigWarning ? INVENTARIO_CONFIG_WARNING_MESSAGE : 'Estado de pedido actualizado correctamente.',
         id_pedido: idPedido,
         estado_anterior: estadoActual,
         estado_actual: estadoDestino,
-        warning: inventoryResult?.warning || null
+        warning: inventoryConfigWarning ? true : Boolean(inventoryResult?.warning),
+        warning_code: inventoryConfigWarning ? INVENTARIO_CONFIG_WARNING_CODE : null,
+        warning_detail: inventoryResult?.warning || null
       });
     } catch (dbErr) {
       try { await client.query('ROLLBACK'); } catch { /* ignorar */ }
