@@ -1742,6 +1742,17 @@ const buildVentaPayload = async ({ client, body, userId, sucursalScope, canApply
     };
   }
 
+  if (body.pagos !== undefined || Array.isArray(body.metodo_pago)) {
+    return {
+      ok: false,
+      status: 400,
+      body: {
+        error: true,
+        message: 'Los pagos mixtos todavia no estan habilitados. Use metodo_pago unico.'
+      }
+    };
+  }
+
   const normalizedItemsResult = normalizeVentaItems(body.items);
   if (!normalizedItemsResult.ok) {
     return {
@@ -1759,6 +1770,10 @@ const buildVentaPayload = async ({ client, body, userId, sucursalScope, canApply
   const descuentoLegacyInput = parseNonNegativeNumber(body.descuento ?? 0);
   const efectivoEntregadoInput = parseNonNegativeNumber(body.efectivo_entregado);
   const metodoPagoInput = String(body.metodo_pago || 'EFECTIVO').trim();
+  const referenciaPagoInput =
+    body.referencia_pago === undefined || body.referencia_pago === null
+      ? null
+      : String(body.referencia_pago).trim() || null;
 
   if (body.id_descuento_catalogo !== undefined && body.id_descuento_catalogo !== null && !idDescuentoCatalogo) {
     return {
@@ -1872,6 +1887,7 @@ const buildVentaPayload = async ({ client, body, userId, sucursalScope, canApply
   }
 
   const metodoPago = await resolveMetodoPago(client, metodoPagoInput);
+  const metodoPagoAfectaEfectivo = parseBooleanish(metodoPago?.afecta_efectivo);
   if (!metodoPago) {
     return {
       ok: false,
@@ -1879,6 +1895,17 @@ const buildVentaPayload = async ({ client, body, userId, sucursalScope, canApply
       body: {
         error: true,
         message: 'El metodo de pago seleccionado no esta disponible.'
+      }
+    };
+  }
+
+  if (!metodoPagoAfectaEfectivo && !referenciaPagoInput) {
+    return {
+      ok: false,
+      status: 400,
+      body: {
+        error: true,
+        message: 'referencia_pago es obligatoria para pagos con tarjeta o transferencia.'
       }
     };
   }
@@ -2011,12 +2038,11 @@ const buildVentaPayload = async ({ client, body, userId, sucursalScope, canApply
   const subtotal = roundMoney(finalizedLines.reduce((sum, line) => sum + line.total_linea, 0));
   const isv = roundMoney(subtotal * 0.15);
   const total = roundMoney(subtotal + isv);
-  const metodoPagoAfectaEfectivo = parseBooleanish(metodoPago.afecta_efectivo);
   const efectivoEntregado = metodoPagoAfectaEfectivo
     ? efectivoEntregadoInput === null
       ? total
       : efectivoEntregadoInput
-    : total;
+    : null;
 
   if (metodoPagoAfectaEfectivo && efectivoEntregado < total) {
     return {
@@ -2093,8 +2119,9 @@ const buildVentaPayload = async ({ client, body, userId, sucursalScope, canApply
       subtotal,
       isv,
       total,
-      efectivo_entregado: efectivoEntregado,
+      efectivo_entregado: metodoPagoAfectaEfectivo ? efectivoEntregado : null,
       cambio: metodoPagoAfectaEfectivo ? roundMoney(efectivoEntregado - total) : 0,
+      referencia_pago: metodoPagoAfectaEfectivo ? null : referenciaPagoInput,
       id_caja: idCaja,
       id_sesion_caja: idSesionCaja,
       id_cliente: idCliente,
@@ -2214,6 +2241,97 @@ const validateDescuentoCatalogoPayload = async (client, payload, options = {}) =
     }
   };
 };
+
+router.get('/ventas/catalogos/categorias', async (req, res) => {
+  try {
+    const scope = await resolveRequestUserSucursalScope(req);
+    const isSuperAdmin = Boolean(scope.isSuperAdmin);
+    const idSucursal = parseOptionalPositiveInt(req.query.id_sucursal);
+
+    if (!isSuperAdmin) {
+      if (!scope.allowedSucursalIds || scope.allowedSucursalIds.length === 0) {
+        return res.status(403).json({ error: true, message: 'El empleado no tiene sucursales asignadas.' });
+      }
+      if (idSucursal && !scope.allowedSucursalIds.includes(idSucursal)) {
+        return res.status(403).json({ error: true, message: 'No tiene acceso a la sucursal solicitada.' });
+      }
+    }
+
+    const result = await pool.query(
+      `
+        SELECT cp.id_categoria_producto, cp.nombre_categoria, COALESCE(cp.estado, true) AS estado
+        FROM public.categorias_productos cp
+        WHERE COALESCE(cp.estado, true) = true
+        ORDER BY cp.nombre_categoria ASC, cp.id_categoria_producto ASC
+      `
+    );
+
+    return res.status(200).json(Array.isArray(result.rows) ? result.rows : []);
+  } catch (err) {
+    console.error('Error al listar catalogo de categorias para ventas:', err.message);
+    return sendVentasInternalError(res);
+  }
+});
+
+router.get('/ventas/catalogos/productos', async (req, res) => {
+  try {
+    const scope = await resolveRequestUserSucursalScope(req);
+    const isSuperAdmin = Boolean(scope.isSuperAdmin);
+    const idSucursal = parseOptionalPositiveInt(req.query.id_sucursal);
+
+    if (!isSuperAdmin) {
+      if (!scope.allowedSucursalIds || scope.allowedSucursalIds.length === 0) {
+        return res.status(403).json({ error: true, message: 'El empleado no tiene sucursales asignadas.' });
+      }
+      if (idSucursal && !scope.allowedSucursalIds.includes(idSucursal)) {
+        return res.status(403).json({ error: true, message: 'No tiene acceso a la sucursal solicitada.' });
+      }
+    }
+
+    let whereClause = '';
+    const params = [];
+
+    if (idSucursal) {
+      params.push(idSucursal);
+      whereClause = 'AND al.id_sucursal = $1';
+    } else if (!isSuperAdmin) {
+      const allowedSucursalIds = coercePositiveIntArray(scope.allowedSucursalIds);
+      if (allowedSucursalIds.length === 0) {
+        return res.status(403).json({ error: true, message: 'El empleado no tiene sucursales asignadas.' });
+      }
+      params.push(allowedSucursalIds);
+      whereClause = 'AND al.id_sucursal = ANY($1::int[])';
+    }
+
+    const query = `
+      SELECT DISTINCT
+        p.id_producto,
+        p.nombre_producto,
+        p.descripcion_producto,
+        p.precio,
+        p.cantidad,
+        p.estado,
+        p.id_categoria_producto,
+        p.id_tipo_departamento,
+        p.id_archivo_imagen_principal,
+        al.id_sucursal,
+        a.url_publica AS imagen_principal_url
+      FROM public.productos p
+      LEFT JOIN public.almacenes al ON al.id_almacen = p.id_almacen
+      LEFT JOIN public.archivos a ON a.id_archivo = p.id_archivo_imagen_principal AND (a.estado = true OR a.estado IS NULL)
+      WHERE COALESCE(p.estado, true) = true
+        AND COALESCE(al.estado, true) = true
+      ${whereClause}
+      ORDER BY p.nombre_producto ASC, p.id_producto ASC
+    `;
+
+    const result = await pool.query(query, params);
+    return res.status(200).json(Array.isArray(result.rows) ? result.rows : []);
+  } catch (err) {
+    console.error('Error al listar catalogo de productos para ventas:', err.message);
+    return sendVentasInternalError(res);
+  }
+});
 
 router.get('/ventas/catalogos/clientes', async (req, res) => {
   try {
@@ -4332,9 +4450,10 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
           id_usuario_ejecutor,
           id_metodo_pago,
           monto,
+          referencia,
           fecha_cobro,
           fecha_creacion
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, (NOW() AT TIME ZONE 'America/Tegucigalpa'), (NOW() AT TIME ZONE 'America/Tegucigalpa'))
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, (NOW() AT TIME ZONE 'America/Tegucigalpa'), (NOW() AT TIME ZONE 'America/Tegucigalpa'))
       `,
       [
         idFactura,
@@ -4343,7 +4462,8 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
         venta.id_sucursal,
         venta.id_usuario,
         idMetodoPago,
-        venta.total
+        venta.total,
+        venta.referencia_pago
       ]
     );
 
@@ -4496,4 +4616,6 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
 
 
 export default router;
+
+
 
