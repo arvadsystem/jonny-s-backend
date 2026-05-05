@@ -48,6 +48,8 @@ let tipoClienteLabelColumnCache = null;
 let tipoClienteLabelCheckedAt = 0;
 let hasClienteEmpresaFieldCache = null;
 let hasClienteEmpresaFieldCheckedAt = 0;
+let hasClienteSucursalFieldCache = null;
+let hasClienteSucursalFieldCheckedAt = 0;
 let fnGuardarClienteSupportsEmpresaClienteCache = null;
 let fnGuardarClienteSupportCheckedAt = 0;
 const ATOMIC_SCHEMA_CACHE_TTL_MS = 60_000;
@@ -57,6 +59,19 @@ const isPlainObject = (value) => value !== null && typeof value === 'object' && 
 const parsePositiveInt = (value) => {
   const parsed = Number.parseInt(String(value ?? ''), 10);
   return Number.isInteger(parsed) && parsed > 0 ? parsed : null;
+};
+
+const getCurrentDateInTegucigalpa = () => {
+  try {
+    return new Intl.DateTimeFormat('en-CA', {
+      timeZone: 'America/Tegucigalpa',
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit'
+    }).format(new Date());
+  } catch {
+    return new Date().toISOString().slice(0, 10);
+  }
 };
 
 const safeParseJson = (value) => {
@@ -218,6 +233,31 @@ const hasClienteEmpresaField = async (client, { forceRefresh = false } = {}) => 
   hasClienteEmpresaFieldCache = Boolean(rs.rows?.length);
 
   return hasClienteEmpresaFieldCache;
+};
+
+const hasClienteSucursalField = async (client, { forceRefresh = false } = {}) => {
+  const now = Date.now();
+  const shouldRefresh = forceRefresh
+    || !hasClienteSucursalFieldCheckedAt
+    || (now - hasClienteSucursalFieldCheckedAt) > ATOMIC_SCHEMA_CACHE_TTL_MS;
+
+  if (!shouldRefresh && hasClienteSucursalFieldCache !== null) {
+    return hasClienteSucursalFieldCache;
+  }
+
+  hasClienteSucursalFieldCheckedAt = now;
+  const rs = await client.query(
+    `
+      SELECT 1
+      FROM information_schema.columns
+      WHERE table_schema = 'public'
+        AND table_name = 'clientes'
+        AND column_name = 'id_sucursal'
+      LIMIT 1
+    `
+  );
+  hasClienteSucursalFieldCache = Boolean(rs.rows?.length);
+  return hasClienteSucursalFieldCache;
 };
 
 const resolveTipoClienteIdAtomic = async (client, preferredId) => {
@@ -455,6 +495,9 @@ const findClienteDetail = async (client, idCliente) => {
   if (await hasClienteEmpresaField(client)) {
     empresaRelationExpr = 'COALESCE(c.id_empresa_cliente, CASE WHEN c.id_persona IS NULL THEN c.id_empresa ELSE NULL END)';
   }
+  const clienteSucursalExpr = (await hasClienteSucursalField(client))
+    ? 'c.id_sucursal'
+    : 'NULL::INT';
 
   const rs = await client.query(
     `
@@ -463,7 +506,7 @@ const findClienteDetail = async (client, idCliente) => {
         c.id_persona,
         ${empresaRelationExpr} AS id_empresa_cliente,
         c.id_empresa,
-        c.id_sucursal,
+        ${clienteSucursalExpr} AS id_sucursal,
         c.id_tipo_cliente,
         c.fecha_ingreso,
         c.puntos,
@@ -1136,23 +1179,13 @@ const atomicService = {
         };
       }
 
-      if (Object.prototype.hasOwnProperty.call(clientePayload, 'puntos')) {
-        const rawPuntos = Number(clientePayload.puntos);
-        if (!Number.isFinite(rawPuntos) || rawPuntos < 0) {
-          const error = new Error('puntos debe ser un numero mayor o igual a 0');
-          error.httpStatus = 400;
-          throw error;
-        }
-      }
-
-      if (Object.prototype.hasOwnProperty.call(clientePayload, 'fecha_ingreso')) {
-        const fechaIngreso = toTrimmedText(clientePayload.fecha_ingreso);
-        if (fechaIngreso && (!isValidDateOnly(fechaIngreso) || isFutureDateOnly(fechaIngreso))) {
-          const error = new Error('fecha_ingreso invalida');
-          error.httpStatus = 400;
-          throw error;
-        }
-      }
+      // Alta de clientes: backend controla campos comerciales base.
+      // No se confia en payload para fecha/puntos/tipo en este flujo.
+      normalizedCliente = {
+        ...normalizedCliente,
+        fecha_ingreso: getCurrentDateInTegucigalpa(),
+        puntos: 0
+      };
 
       if (Object.prototype.hasOwnProperty.call(clientePayload, 'estado')) {
         const parsedEstado = parseBooleanValue(clientePayload.estado);
@@ -1226,7 +1259,7 @@ const atomicService = {
         };
       }
 
-      const resolvedTipoClienteId = await resolveTipoClienteIdAtomic(client, normalizedCliente.id_tipo_cliente);
+      const resolvedTipoClienteId = await resolveTipoClienteIdAtomic(client, 2);
       if (!resolvedTipoClienteId) {
         const error = new Error('No existe un tipo de cliente disponible para crear el registro');
         error.httpStatus = 400;

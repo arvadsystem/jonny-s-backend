@@ -109,8 +109,8 @@ const requireSuperAdmin = async (req, res) => {
   return true;
 };
 
-const hasBitacorasTable = async () => {
-  const result = await pool.query(`SELECT to_regclass('public.bitacoras') AS reg`);
+const hasBitacorasTable = async (dbClient = pool) => {
+  const result = await dbClient.query(`SELECT to_regclass('public.bitacoras') AS reg`);
   return Boolean(result.rows?.[0]?.reg);
 };
 
@@ -368,6 +368,7 @@ const RECENT_ACTIVITY_SQL = `
 `;
 
 const getSummary = async (req, res) => {
+  let dbClient = null;
   try {
     const actor = req.user || req.usuario;
     if (!actor?.id_usuario) {
@@ -387,7 +388,9 @@ const getSummary = async (req, res) => {
         ${rangeConfig.rangeStartSql} AS range_start
     `;
 
-    const windowResult = await pool.query(windowSql);
+    dbClient = await pool.connect();
+
+    const windowResult = await dbClient.query(windowSql);
     const nowHn = windowResult.rows?.[0]?.now_hn || null;
     const rangeStart = windowResult.rows?.[0]?.range_start || null;
 
@@ -397,33 +400,22 @@ const getSummary = async (req, res) => {
 
     const loginsSeriesSql = buildLoginsSeriesSql(rangeConfig);
     const sesionesSeriesSql = buildSesionesSeriesSql(rangeConfig);
-    const includeActivity = await hasBitacorasTable();
+    const includeActivity = await hasBitacorasTable(dbClient);
 
-    const recentActivityPromise = includeActivity
-      ? pool.query(RECENT_ACTIVITY_SQL, [rangeStart, RECENT_ACTIVITY_LIMIT])
-      : Promise.resolve({ rows: [] });
-
-    const [
-      summaryResult,
-      loginsSeriesResult,
-      sesionesSeriesResult,
-      topIpsResult,
-      blockedUsersResult,
-      suspiciousUsersResult,
-      recentActivityResult
-    ] = await Promise.all([
-      pool.query(SUMMARY_SQL, [rangeStart]),
-      pool.query(loginsSeriesSql, [rangeStart, nowHn]),
-      pool.query(sesionesSeriesSql, [rangeStart, nowHn]),
-      pool.query(TOP_IPS_SQL, [rangeStart, TOP_IPS_LIMIT]),
-      pool.query(BLOCKED_USERS_SQL, [rangeStart, BLOCKED_USERS_LIMIT]),
-      pool.query(SUSPICIOUS_USERS_SQL, [
-        rangeStart,
-        SUSPICIOUS_MIN_CONSECUTIVE_FAILS,
-        SUSPICIOUS_USERS_LIMIT
-      ]),
-      recentActivityPromise
+    // Ejecutar con un solo cliente evita picos de conexiones en poolers con limite bajo de sesiones.
+    const summaryResult = await dbClient.query(SUMMARY_SQL, [rangeStart]);
+    const loginsSeriesResult = await dbClient.query(loginsSeriesSql, [rangeStart, nowHn]);
+    const sesionesSeriesResult = await dbClient.query(sesionesSeriesSql, [rangeStart, nowHn]);
+    const topIpsResult = await dbClient.query(TOP_IPS_SQL, [rangeStart, TOP_IPS_LIMIT]);
+    const blockedUsersResult = await dbClient.query(BLOCKED_USERS_SQL, [rangeStart, BLOCKED_USERS_LIMIT]);
+    const suspiciousUsersResult = await dbClient.query(SUSPICIOUS_USERS_SQL, [
+      rangeStart,
+      SUSPICIOUS_MIN_CONSECUTIVE_FAILS,
+      SUSPICIOUS_USERS_LIMIT
     ]);
+    const recentActivityResult = includeActivity
+      ? await dbClient.query(RECENT_ACTIVITY_SQL, [rangeStart, RECENT_ACTIVITY_LIMIT])
+      : { rows: [] };
 
     const resumen = summaryResult.rows?.[0] || {};
     const loginsFallidos = toSafeInt(resumen.logins_fallidos);
@@ -504,6 +496,8 @@ const getSummary = async (req, res) => {
   } catch (err) {
     console.error('GET /api/security/summary error:', err);
     return res.status(500).json({ error: true, message: 'Error interno del servidor' });
+  } finally {
+    if (dbClient) dbClient.release();
   }
 };
 

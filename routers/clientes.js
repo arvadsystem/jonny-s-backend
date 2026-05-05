@@ -158,6 +158,19 @@ const parseNullablePositiveInt = (value) => {
   return parsePositiveInt(value);
 };
 
+const getCurrentDateInTegucigalpa = () => {
+  try {
+    return new Intl.DateTimeFormat('en-CA', {
+      timeZone: 'America/Tegucigalpa',
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit'
+    }).format(new Date());
+  } catch {
+    return new Date().toISOString().slice(0, 10);
+  }
+};
+
 const normalizeDocKey = (value) => {
   const text = String(value ?? '').trim().toLowerCase();
   return text || null;
@@ -1460,20 +1473,6 @@ const clienteService = {
       };
     }
 
-    if (!validatePuntosValue(payload.puntos)) {
-      return {
-        status: 400,
-        body: buildErrorBody({ code: 'VALIDATION_ERROR', message: 'puntos debe ser un entero mayor o igual a 0.' })
-      };
-    }
-
-    if (!validateFechaIngreso(payload.fecha_ingreso)) {
-      return {
-        status: 400,
-        body: buildErrorBody({ code: 'VALIDATION_ERROR', message: 'fecha_ingreso no es valida.' })
-      };
-    }
-
     const insertData = normalizeClienteFunctionPayload(payload);
     const idUsuario = resolveUserId(req);
     const tenantId = await resolveTenantIdForRequest(req);
@@ -1585,6 +1584,11 @@ const clienteService = {
 
     if (capabilities.hasCreatedBy && idUsuario) insertData.created_by = idUsuario;
     if (capabilities.hasUpdatedBy && idUsuario) insertData.updated_by = idUsuario;
+    // Alta de cliente controlada por backend:
+    // - fecha de ingreso = hoy
+    // - puntos iniciales = 0
+    insertData.fecha_ingreso = getCurrentDateInTegucigalpa();
+    insertData.puntos = 0;
 
     const client = await pool.connect();
     try {
@@ -1656,7 +1660,7 @@ const clienteService = {
       }
 
       const resolvedTipoClienteId = await clienteRepository.resolveTipoClienteIdForInsert(
-        insertData.id_tipo_cliente,
+        2,
         capabilities,
         client
       );

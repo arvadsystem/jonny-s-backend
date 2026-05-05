@@ -4,6 +4,11 @@ import { checkPermission, requestHasAnyPermission } from '../middleware/checkPer
 import { resolveRequestUserSucursalScope } from '../utils/sucursalScope.js';
 import { registerFacturaLoyaltyAccumulation } from '../services/fidelizacionService.js';
 import { generarCodigoDocumento } from '../services/facturacionCorrelativoService.js';
+import {
+  aplicarSnapshotEnFactura,
+  normalizarDatosTicketDesdeSnapshot,
+  obtenerConfigFacturacionParaVenta
+} from '../services/facturacionSnapshotService.js';
 import { enviarCorreo } from '../utils/emailService.js';
 import { getClientIp, parseUserAgent } from '../utils/security/clientInfo.js';
 import {
@@ -179,7 +184,56 @@ const hasDiscountIntentInPayload = (body) => {
     return false;
   });
 };
-
+const mergeVentaWithFacturacion = (venta = {}, facturacion = {}) => {
+  const emisor = facturacion?.emisor || {};
+  const ticket = facturacion?.ticket || {};
+  return {
+    ...venta,
+    facturacion: {
+      emisor: {
+        nombre_emisor: emisor?.nombre_emisor || "JONNY'S",
+        rtn_emisor: emisor?.rtn_emisor || null,
+        direccion_emisor: emisor?.direccion_emisor || null,
+        telefono_emisor: emisor?.telefono_emisor || null,
+        correo_emisor: emisor?.correo_emisor || null,
+        logo_url: emisor?.logo_url || null
+      },
+      ticket: {
+        ancho_ticket_mm: Number(ticket?.ancho_ticket_mm) === 58 ? 58 : 80,
+        mostrar_logo_ticket: Boolean(ticket?.mostrar_logo_ticket),
+        mostrar_rtn: Boolean(ticket?.mostrar_rtn),
+        mostrar_direccion: Boolean(ticket?.mostrar_direccion),
+        mostrar_telefono: Boolean(ticket?.mostrar_telefono),
+        mostrar_correo: Boolean(ticket?.mostrar_correo),
+        texto_encabezado_ticket: ticket?.texto_encabezado_ticket || null,
+        texto_pie_ticket: ticket?.texto_pie_ticket || 'Gracias por su compra'
+      },
+      fiscal: {
+        modo_fiscal: 'NO_INTEGRADO',
+        cai: '0',
+        numero_factura_fiscal: '0'
+      }
+    },
+    nombre_emisor: emisor?.nombre_emisor || "JONNY'S",
+    rtn_emisor: emisor?.rtn_emisor || null,
+    sucursal_direccion: emisor?.direccion_emisor || null,
+    sucursal_telefono: emisor?.telefono_emisor || null,
+    sucursal_correo: emisor?.correo_emisor || null,
+    logo_url: emisor?.logo_url || null,
+    ancho_ticket_mm: Number(ticket?.ancho_ticket_mm) === 58 ? 58 : 80,
+    mostrar_logo_ticket: Boolean(ticket?.mostrar_logo_ticket),
+    mostrar_rtn: Boolean(ticket?.mostrar_rtn),
+    mostrar_direccion: Boolean(ticket?.mostrar_direccion),
+    mostrar_telefono: Boolean(ticket?.mostrar_telefono),
+    mostrar_correo: Boolean(ticket?.mostrar_correo),
+    texto_encabezado_ticket: ticket?.texto_encabezado_ticket || null,
+    texto_pie_ticket: ticket?.texto_pie_ticket || 'Gracias por su compra',
+    modo_fiscal: 'NO_INTEGRADO',
+    cai: '0',
+    numero_factura_fiscal: '0',
+    id_rango_cai: null
+  };
+};
 const sendVentasInternalError = (
   res,
   message = 'No se pudo procesar la solicitud de ventas.'
@@ -3858,6 +3912,10 @@ router.get('/ventas/:id', checkPermission(['VENTAS_VER']), async (req, res) => {
         f.fecha_hora_facturacion,
         f.isv_15,
         f.isv_18,
+        f.id_config_facturacion,
+        f.id_rango_cai,
+        f.numero_factura_fiscal,
+        f.facturacion_snapshot,
         COALESCE(df_info.subtotal_neto, 0) AS gravado_15,
         0::numeric(12,2) AS gravado_18,
         0::numeric(12,2) AS exento,
@@ -3963,6 +4021,11 @@ router.get('/ventas/:id', checkPermission(['VENTAS_VER']), async (req, res) => {
     }
 
     const venta = headerResult.rows[0];
+    const facturacionNormalizada = await normalizarDatosTicketDesdeSnapshot({
+      client: pool,
+      factura: venta
+    });
+    Object.assign(venta, mergeVentaWithFacturacion(venta, facturacionNormalizada));
 
     if (venta.id_pedido) {
       const pedidoItemsResult = await pool.query(
@@ -4321,6 +4384,13 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
     );
 
     const idFactura = facturaResult.rows[0].id_factura;
+    const facturacionVenta = await obtenerConfigFacturacionParaVenta(client, venta.id_sucursal);
+    await aplicarSnapshotEnFactura(
+      client,
+      idFactura,
+      facturacionVenta.snapshot,
+      facturacionVenta.idConfig
+    );
 
     const idMetodoPago = parseOptionalPositiveInt(venta.id_metodo_pago);
     if (!idMetodoPago) {
@@ -4505,6 +4575,7 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
 
 
 export default router;
+
 
 
 

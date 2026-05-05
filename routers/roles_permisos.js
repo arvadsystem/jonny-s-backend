@@ -371,18 +371,13 @@ router.post('/roles', checkPermission(ROLES_PERMISOS_ROLES_CREATE_PERMISSIONS), 
       return res.status(409).json({ error: true, message: 'Ya existe un rol con ese nombre' });
     }
 
-    const nextIdResult = await client.query(
-      'SELECT COALESCE(MAX(id_rol), 0)::int + 1 AS next_id FROM roles'
-    );
-    const nextId = Number(nextIdResult.rows[0]?.next_id || 0);
-
     const insertResult = await client.query(
       `
-        INSERT INTO roles (id_rol, nombre)
-        VALUES ($1, $2)
+        INSERT INTO roles (nombre)
+        VALUES ($1)
         RETURNING id_rol, nombre
       `,
-      [nextId, nombreNormalizado]
+      [nombreNormalizado]
     );
 
     await client.query('COMMIT');

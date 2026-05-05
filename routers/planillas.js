@@ -134,6 +134,15 @@ const COMPENSAR_HORAS_EXTRA_ALLOWED_FIELDS = new Set([
   'tipo_periodo',
   'quincena'
 ]);
+const ACTUALIZAR_HORAS_EXTRA_ALLOWED_FIELDS = new Set([
+  'id_empleado',
+  'fecha',
+  'horas',
+  'observacion',
+  'id_sucursal',
+  'tipo_periodo',
+  'quincena'
+]);
 const MOVIMIENTO_ALLOWED_FIELDS = new Set([
   'id_detalle',
   'id_detalle_planilla',
@@ -1241,6 +1250,89 @@ const syncDetalleSalarioBaseFromEmpleado = async ({
 };
 
 const PLANILLA_DETALLE_AUTO_SYNC_ALLOWED_STATES = new Set(['BORRADOR', 'CALCULADA']);
+const PLANILLA_ALLOWED_ROLE_TOKENS_LIST = Object.freeze([
+  'ADMINISTRADOR',
+  'CAJERO',
+  'MESERO',
+  'SUPERVISOR',
+  'GERENTE',
+  'AUXILIAR COCINA',
+  'AUXILIAR DE COCINA',
+  'COCINERO'
+]);
+const PLANILLA_ALLOWED_ROLE_TOKENS = new Set(PLANILLA_ALLOWED_ROLE_TOKENS_LIST);
+
+const normalizePlanillaRoleToken = (value) =>
+  String(value ?? '')
+    .trim()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toUpperCase()
+    .replace(/[^A-Z0-9]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+const resolveEmpleadoRoleLabel = (row = {}) =>
+  sanitizeText(
+    row?.cargo ??
+      row?.rol_nombre ??
+      row?.nombre_rol ??
+      row?.rol ??
+      row?.puesto ??
+      row?.tipo_empleado,
+    120
+  ) || '';
+
+const resolveEmpleadoSalarioBase = (row = {}) => {
+  const salary = Number(
+    row?.salario_base ??
+      row?.salario ??
+      row?.sueldo_base ??
+      row?.sueldo
+  );
+  return Number.isFinite(salary) ? salary : 0;
+};
+
+const isEmpleadoPlanillable = (row = {}) => {
+  const salary = resolveEmpleadoSalarioBase(row);
+  if (!(salary > 0)) return false;
+
+  const roleToken = normalizePlanillaRoleToken(resolveEmpleadoRoleLabel(row));
+  if (!roleToken) return false;
+  return PLANILLA_ALLOWED_ROLE_TOKENS.has(roleToken);
+};
+
+const filterPlanillableEmpleadoRows = (rows = []) =>
+  (Array.isArray(rows) ? rows : []).filter((row) => isEmpleadoPlanillable(row));
+
+const buildResumenFromDetalleRows = (rows = []) => {
+  const safeRows = Array.isArray(rows) ? rows : [];
+  return safeRows.reduce(
+    (acc, row) => {
+      const salarioBase = roundTo(Number(row?.salario_base ?? 0));
+      const bonos = roundTo(Number(row?.total_bonos ?? row?.bonos ?? 0));
+      const deducciones = roundTo(Number(row?.total_deducciones ?? row?.deducciones ?? 0));
+      const neto = roundTo(
+        Number(row?.neto_pagar ?? row?.total_neto_pagar ?? row?.neto ?? salarioBase + bonos - deducciones)
+      );
+
+      acc.total_salario_base += salarioBase;
+      acc.total_bonos += bonos;
+      acc.total_deducciones += deducciones;
+      acc.total_neto_pagar += neto;
+      acc.total_empleados += 1;
+      return acc;
+    },
+    {
+      total_salario_base: 0,
+      total_bonos: 0,
+      total_deducciones: 0,
+      total_neto_pagar: 0,
+      total_neto: 0,
+      total_empleados: 0
+    }
+  );
+};
 
 const dedupeDetallePlanillaByEmpleado = async ({ db = pool, idPlanilla }) => {
   const safePlanillaId = parsePositiveInt(idPlanilla);
@@ -1299,6 +1391,48 @@ const dedupeDetallePlanillaByEmpleado = async ({ db = pool, idPlanilla }) => {
   };
 };
 
+const cleanupDetalleNoPlanillableBySucursal = async ({ db = pool, idPlanilla, idSucursal }) => {
+  const safePlanillaId = parsePositiveInt(idPlanilla);
+  const safeSucursalId = parsePositiveInt(idSucursal);
+  if (!safePlanillaId || !safeSucursalId) return { removed: 0 };
+
+  const result = await db.query(
+    `
+      WITH candidate_rows AS (
+        SELECT
+          dp.id_detalle_planilla
+        FROM public.detalle_planilla dp
+        INNER JOIN public.empleados e
+          ON e.id_empleado = dp.id_empleado
+        WHERE dp.id_planilla = $1
+          AND (
+            e.estado IS DISTINCT FROM TRUE
+            OR e.id_sucursal IS DISTINCT FROM $2
+            OR COALESCE(e.salario_base, 0) <= 0
+            OR regexp_replace(
+              translate(upper(trim(COALESCE(e.cargo, ''))), 'ÁÉÍÓÚÜÑ', 'AEIOUUN'),
+              '\\s+',
+              ' ',
+              'g'
+            ) <> ALL($3::text[])
+          )
+          AND NOT EXISTS (
+            SELECT 1
+            FROM public.movimiento_planilla mp
+            WHERE mp.id_detalle_planilla = dp.id_detalle_planilla
+          )
+      )
+      DELETE FROM public.detalle_planilla dp
+      USING candidate_rows c
+      WHERE dp.id_detalle_planilla = c.id_detalle_planilla
+      RETURNING dp.id_detalle_planilla
+    `,
+    [safePlanillaId, safeSucursalId, PLANILLA_ALLOWED_ROLE_TOKENS_LIST]
+  );
+
+  return { removed: result.rowCount || 0 };
+};
+
 const syncDetalleEmpleadosActivosBySucursal = async ({
   db = pool,
   idPlanilla,
@@ -1346,6 +1480,11 @@ const syncDetalleEmpleadosActivosBySucursal = async ({
   }
 
   const dedupe = await dedupeDetallePlanillaByEmpleado({ db, idPlanilla: safePlanillaId });
+  const cleanup = await cleanupDetalleNoPlanillableBySucursal({
+    db,
+    idPlanilla: safePlanillaId,
+    idSucursal
+  });
 
   const insertResult = await db.query(
     `
@@ -1406,6 +1545,13 @@ const syncDetalleEmpleadosActivosBySucursal = async ({
       CROSS JOIN planilla_lock pl
       WHERE e.estado = TRUE
         AND e.id_sucursal = $2
+        AND COALESCE(e.salario_base, 0) > 0
+        AND regexp_replace(
+          translate(upper(trim(COALESCE(e.cargo, ''))), 'ÁÉÍÓÚÜÑ', 'AEIOUUN'),
+          '\\s+',
+          ' ',
+          'g'
+        ) = ANY($3::text[])
         AND NOT EXISTS (
           SELECT 1
           FROM public.detalle_planilla dp
@@ -1414,10 +1560,10 @@ const syncDetalleEmpleadosActivosBySucursal = async ({
         )
       RETURNING id_detalle_planilla
     `,
-    [safePlanillaId, idSucursal]
+    [safePlanillaId, idSucursal, PLANILLA_ALLOWED_ROLE_TOKENS_LIST]
   );
 
-  if (dedupe.deleted > 0) {
+  if (dedupe.deleted > 0 || cleanup.removed > 0) {
     await db.query(
       `
         SELECT public.fn_recalcular_detalle_planilla(dp.id_detalle_planilla)
@@ -1431,6 +1577,7 @@ const syncDetalleEmpleadosActivosBySucursal = async ({
   return {
     inserted: insertResult.rowCount || 0,
     deduped: dedupe.deleted,
+    removed_non_planillable: cleanup.removed,
     skipped: false,
     estado: estadoNormalizado,
     id_sucursal: idSucursal
@@ -2482,7 +2629,8 @@ const planillaService = {
       return { status: 400, body: { error: true, message: 'page y limit deben ser enteros positivos' } };
     }
 
-    const rows = await queryFunctionRows(PLANILLA_ENDPOINT_CONTRACT.detalle, [idPlanilla]);
+    const rawRows = await queryFunctionRows(PLANILLA_ENDPOINT_CONTRACT.detalle, [idPlanilla]);
+    const rows = filterPlanillableEmpleadoRows(rawRows);
     const employeeIds = [...new Set((rows || []).map((row) => parsePositiveInt(row.id_empleado)).filter(Boolean))];
     const dniMap = await resolveEmpleadoDniMap(employeeIds);
 
@@ -2672,7 +2820,8 @@ const planillaService = {
     await syncDetalleSalarioBaseFromEmpleado({ idPlanilla });
 
     if (tipoPeriodoContext === TIPO_PERIODO.QUINCENAL) {
-      const detalleRows = await queryFunctionRows(PLANILLA_ENDPOINT_CONTRACT.detalle, [idPlanilla]);
+      const detalleRowsRaw = await queryFunctionRows(PLANILLA_ENDPOINT_CONTRACT.detalle, [idPlanilla]);
+      const detalleRows = filterPlanillableEmpleadoRows(detalleRowsRaw);
       const movimientosContextRows = await buildMovimientosDataset({
         idPlanilla,
         tipoPeriodo: tipoPeriodoContext,
@@ -2739,6 +2888,9 @@ const planillaService = {
 
     const rows = await queryFunctionRows(PLANILLA_ENDPOINT_CONTRACT.resumen, [idPlanilla]);
     const resumenBase = rows[0] || {};
+    const detalleRowsRaw = await queryFunctionRows(PLANILLA_ENDPOINT_CONTRACT.detalle, [idPlanilla]);
+    const detalleRows = filterPlanillableEmpleadoRows(detalleRowsRaw);
+    const resumenDesdeDetalle = buildResumenFromDetalleRows(detalleRows);
 
     const adelantosResult = await pool.query(
       `
@@ -2752,6 +2904,12 @@ const planillaService = {
     const totalAdelantosAplicados = Number(adelantosResult.rows?.[0]?.total_adelantos_aplicados ?? 0);
     const data = {
       ...resumenBase,
+      total_salario_base: roundTo(resumenDesdeDetalle.total_salario_base),
+      total_bonos: roundTo(resumenDesdeDetalle.total_bonos),
+      total_deducciones: roundTo(resumenDesdeDetalle.total_deducciones),
+      total_neto_pagar: roundTo(resumenDesdeDetalle.total_neto_pagar),
+      total_neto: roundTo(resumenDesdeDetalle.total_neto_pagar),
+      total_empleados: resumenDesdeDetalle.total_empleados,
       total_adelantos_aplicados: Number.isFinite(totalAdelantosAplicados) ? totalAdelantosAplicados : 0,
       total_adelantos: Number.isFinite(totalAdelantosAplicados) ? totalAdelantosAplicados : 0
     };
@@ -2777,6 +2935,32 @@ const planillaService = {
     await syncDetalleSalarioBaseFromEmpleado({ idPlanilla });
 
     const data = await queryFunctionScalar(PLANILLA_ENDPOINT_CONTRACT.completa, [idPlanilla]);
+    if (data && typeof data === 'object') {
+      const detailKeys = ['detalle', 'detalle_planilla', 'items', 'rows'];
+      detailKeys.forEach((key) => {
+        if (Array.isArray(data[key])) {
+          data[key] = filterPlanillableEmpleadoRows(data[key]);
+        }
+      });
+
+      const resumenKey = data?.resumen && typeof data.resumen === 'object' ? 'resumen' : null;
+      if (resumenKey) {
+        const sourceRows =
+          (Array.isArray(data.detalle) && data.detalle) ||
+          (Array.isArray(data.detalle_planilla) && data.detalle_planilla) ||
+          [];
+        const resumenDesdeDetalle = buildResumenFromDetalleRows(sourceRows);
+        data[resumenKey] = {
+          ...data[resumenKey],
+          total_salario_base: roundTo(resumenDesdeDetalle.total_salario_base),
+          total_bonos: roundTo(resumenDesdeDetalle.total_bonos),
+          total_deducciones: roundTo(resumenDesdeDetalle.total_deducciones),
+          total_neto_pagar: roundTo(resumenDesdeDetalle.total_neto_pagar),
+          total_neto: roundTo(resumenDesdeDetalle.total_neto_pagar),
+          total_empleados: resumenDesdeDetalle.total_empleados
+        };
+      }
+    }
     return { status: 200, body: { error: false, data } };
   },
 
@@ -3244,6 +3428,215 @@ const planillaService = {
     };
   },
 
+  async actualizarHoraExtra(req) {
+    const unknownFields = unknownFieldsFromPayload(req.body, ACTUALIZAR_HORAS_EXTRA_ALLOWED_FIELDS);
+    if (unknownFields.length) {
+      return {
+        status: 400,
+        body: buildErrorBody({
+          code: 'UNKNOWN_FIELDS',
+          message: 'El payload contiene campos no permitidos.',
+          details: { fields: unknownFields }
+        })
+      };
+    }
+
+    const idPlanilla = parsePositiveInt(req.params.id_planilla);
+    const idHoraExtra = parsePositiveInt(req.params.id_horas_extra);
+    const idEmpleadoPayload = parsePositiveInt(req.body?.id_empleado);
+    const fecha = normalizeTimestampInput(req.body?.fecha);
+    const horasPayload = req.body?.horas;
+    const horas = req.body?.horas === undefined ? null : parsePositiveNumber(horasPayload);
+    const observacion = sanitizeText(req.body?.observacion, 255);
+
+    if (!idPlanilla || !idHoraExtra) {
+      return {
+        status: 400,
+        body: buildErrorBody({
+          code: 'VALIDATION_ERROR',
+          message: 'id_planilla e id_horas_extra son requeridos.'
+        })
+      };
+    }
+
+    if (req.body?.id_empleado !== undefined && !idEmpleadoPayload) {
+      return {
+        status: 400,
+        body: buildErrorBody({
+          code: 'VALIDATION_ERROR',
+          message: 'id_empleado invalido.'
+        })
+      };
+    }
+
+    if (req.body?.fecha !== undefined && !fecha) {
+      return {
+        status: 400,
+        body: buildErrorBody({
+          code: 'VALIDATION_ERROR',
+          message: 'La fecha enviada no es valida.'
+        })
+      };
+    }
+
+    if (req.body?.fecha !== undefined && fecha && isFutureDateInput(req.body?.fecha)) {
+      return {
+        status: 400,
+        body: buildErrorBody({
+          code: 'VALIDATION_ERROR',
+          message: 'La fecha no puede ser mayor al dia actual.'
+        })
+      };
+    }
+
+    if (req.body?.horas !== undefined && !horas) {
+      return {
+        status: 400,
+        body: buildErrorBody({
+          code: 'VALIDATION_ERROR',
+          message: 'horas invalido.'
+        })
+      };
+    }
+
+    const scopeValidation = await validatePlanillaSucursalScope(idPlanilla, req.body?.id_sucursal);
+    if (!scopeValidation.ok) {
+      return { status: scopeValidation.status, body: scopeValidation.body };
+    }
+
+    const horasExtraIdColumn = await resolveHorasExtraIdColumn();
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+
+      const currentResult = await client.query(
+        `
+          SELECT
+            he.${horasExtraIdColumn} AS id_horas_extras,
+            he.${horasExtraIdColumn} AS id_horas_extra,
+            he.id_planilla,
+            he.id_empleado,
+            he.fecha,
+            he.horas,
+            he.compensada,
+            he.fecha_compensacion,
+            he.observacion
+          FROM public.horas_extras he
+          WHERE he.${horasExtraIdColumn} = $1
+            AND he.id_planilla = $2
+          LIMIT 1
+          FOR UPDATE
+        `,
+        [idHoraExtra, idPlanilla]
+      );
+
+      const current = currentResult.rows?.[0];
+      if (!current) {
+        throw createRequestError('La hora extra indicada no pertenece a esta planilla.', 404, 'NOT_FOUND');
+      }
+
+      const idEmpleado = idEmpleadoPayload || parsePositiveInt(current.id_empleado);
+      if (!idEmpleado) {
+        throw createRequestError('No se pudo resolver el empleado de la hora extra.', 400, 'VALIDATION_ERROR');
+      }
+
+      const detalleRows = await queryFunctionRows(PLANILLA_ENDPOINT_CONTRACT.detalle, [idPlanilla]);
+      const detalleValido = detalleRows.some((row) => parsePositiveInt(row.id_empleado) === idEmpleado);
+      if (!detalleValido) {
+        throw createRequestError(
+          'El empleado no pertenece al detalle de la planilla seleccionada.',
+          404,
+          'NOT_FOUND'
+        );
+      }
+
+      const updatedResult = await client.query(
+        `
+          UPDATE public.horas_extras
+          SET
+            id_empleado = $1,
+            fecha = COALESCE($2::timestamp, fecha),
+            horas = COALESCE($3, horas),
+            observacion = COALESCE($4, observacion)
+          WHERE ${horasExtraIdColumn} = $5
+            AND id_planilla = $6
+          RETURNING
+            ${horasExtraIdColumn} AS id_horas_extras,
+            ${horasExtraIdColumn} AS id_horas_extra,
+            id_planilla,
+            id_empleado,
+            fecha,
+            horas,
+            compensada,
+            fecha_compensacion,
+            observacion
+        `,
+        [idEmpleado, fecha, horas, observacion, idHoraExtra, idPlanilla]
+      );
+
+      const updated = updatedResult.rows?.[0] || null;
+      const affectedEmpleadoIds = Array.from(
+        new Set([parsePositiveInt(current.id_empleado), parsePositiveInt(updated?.id_empleado)].filter(Boolean))
+      );
+
+      const detalleRecalculado = [];
+      for (const affectedIdEmpleado of affectedEmpleadoIds) {
+        const detalleResult = await client.query(
+          `
+            SELECT id_detalle_planilla
+            FROM public.detalle_planilla
+            WHERE id_planilla = $1
+              AND id_empleado = $2
+            ORDER BY id_detalle_planilla DESC
+            LIMIT 1
+          `,
+          [idPlanilla, affectedIdEmpleado]
+        );
+        const idDetallePlanilla = parsePositiveInt(detalleResult.rows?.[0]?.id_detalle_planilla);
+        if (!idDetallePlanilla) continue;
+
+        await syncDetalleSalarioBaseFromEmpleado({
+          db: client,
+          idPlanilla,
+          idDetallePlanilla
+        });
+
+        const netoActualizado = await queryFunctionScalar(PLANILLA_ENDPOINT_CONTRACT.recalcularDetalle, [
+          idDetallePlanilla
+        ]);
+
+        detalleRecalculado.push({
+          id_empleado: affectedIdEmpleado,
+          id_detalle_planilla: idDetallePlanilla,
+          neto_actualizado: netoActualizado
+        });
+      }
+
+      await client.query('COMMIT');
+
+      return {
+        status: 200,
+        body: {
+          error: false,
+          message: 'Hora extra actualizada correctamente.',
+          data: {
+            ...updated,
+            detalle_recalculado: detalleRecalculado
+          }
+        }
+      };
+    } catch (error) {
+      try {
+        await client.query('ROLLBACK');
+      } catch (rollbackError) {
+        console.error('Horas extra actualizar rollback error:', rollbackError.message);
+      }
+      throw error;
+    } finally {
+      client.release();
+    }
+  },
+
   async actualizarEstado(req) {
     const unknownFields = unknownFieldsFromPayload(req.body, ESTADO_ALLOWED_FIELDS);
     if (unknownFields.length) {
@@ -3421,7 +3814,8 @@ const planillaService = {
       return { status: 400, body: { error: true, message: 'page y limit deben ser enteros positivos' } };
     }
 
-    const rows = await queryFunctionRows(PLANILLA_ENDPOINT_CONTRACT.empleadosActivos, [idSucursal]);
+    const rowsRaw = await queryFunctionRows(PLANILLA_ENDPOINT_CONTRACT.empleadosActivos, [idSucursal]);
+    const rows = filterPlanillableEmpleadoRows(rowsRaw);
     const search = sanitizeText(req.query.search ?? req.query.q, 120);
     const filtered = rows.filter((row) => {
       if (!search) return true;
@@ -4576,6 +4970,7 @@ router.get('/planillas/:id_planilla/completa', checkPermission(PLANILLAS_DETAIL_
 router.get('/planillas/:id_planilla/horas-extra', checkPermission(PLANILLAS_DETAIL_PERMISSIONS), asyncHandler(planillaService.listarHorasExtra));
 router.post('/planillas/:id_planilla/horas-extra/registrar', checkPermission(PLANILLAS_RECALCULAR_PERMISSIONS), asyncHandler(planillaService.registrarHoraExtra));
 router.post('/planillas/:id_planilla/horas-extra/:id_horas_extra/compensar', checkPermission(PLANILLAS_RECALCULAR_PERMISSIONS), asyncHandler(planillaService.compensarHoraExtra));
+router.post('/planillas/:id_planilla/horas-extra/:id_horas_extra/actualizar', checkPermission(PLANILLAS_RECALCULAR_PERMISSIONS), asyncHandler(planillaService.actualizarHoraExtra));
 router.put('/planillas/:id_planilla/estado', checkPermission(PLANILLAS_ESTADO_PERMISSIONS), asyncHandler(planillaService.actualizarEstado));
 router.post('/planillas/:id_planilla/anular', checkPermission(['PLANILLAS_ANULAR']), asyncHandler(planillaService.anularPlanilla));
 router.get('/planillas/sucursales/:id_sucursal/empleados-activos', checkPermission(PLANILLAS_DETAIL_PERMISSIONS), asyncHandler(planillaService.empleadosActivos));
