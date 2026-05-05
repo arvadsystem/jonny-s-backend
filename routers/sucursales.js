@@ -7,6 +7,19 @@ import {
   SUPABASE_ASSETS_BUCKET,
   SUCURSALES_UPLOADS_SUBDIR
 } from '../utils/uploads.js';
+import {
+  FacturacionConfigSucursalService,
+  obtenerConfiguracionPorSucursal,
+  actualizarConfiguracionSucursal,
+  obtenerPreviewFacturacionSucursal
+} from '../services/facturacionConfigSucursalService.js';
+import {
+  FacturacionCaiSucursalService,
+  listarRangosCaiPorSucursal,
+  crearRangoCaiSucursal,
+  activarRangoCaiSucursal,
+  desactivarRangoCaiSucursal
+} from '../services/facturacionCaiSucursalService.js';
 
 const router = express.Router();
 
@@ -44,6 +57,11 @@ const SUCURSALES_VIEW_PERMISSIONS = ['SUCURSALES_VER'];
 const SUCURSALES_CREATE_PERMISSIONS = ['SUCURSALES_CREAR'];
 const SUCURSALES_EDIT_PERMISSIONS = ['SUCURSALES_EDITAR'];
 const SUCURSALES_HORARIOS_MANAGE_PERMISSIONS = ['SUCURSALES_HORARIOS_GESTIONAR'];
+const SUCURSALES_FACTURACION_VIEW_PERMISSIONS = ['SUCURSALES_FACTURACION_VER'];
+const SUCURSALES_FACTURACION_EDIT_PERMISSIONS = ['SUCURSALES_FACTURACION_EDITAR'];
+const SUCURSALES_FACTURACION_PREVIEW_PERMISSIONS = ['SUCURSALES_FACTURACION_PREVIEW_VER'];
+const SUCURSALES_FACTURACION_CAI_VIEW_PERMISSIONS = ['SUCURSALES_FACTURACION_CAI_VER', 'SUCURSALES_FACTURACION_CAI_GESTIONAR'];
+const SUCURSALES_FACTURACION_CAI_MANAGE_PERMISSIONS = ['SUCURSALES_FACTURACION_CAI_GESTIONAR'];
 const SQLSTATE_UNIQUE_VIOLATION = '23505';
 const VALID_FECHA_ESPECIAL_TYPES = new Set(['FERIADO', 'CIERRE_ESPECIAL', 'HORARIO_ESPECIAL']);
 const VALID_PHONE_RE = /^[\d+\-()\s]+$/;
@@ -392,6 +410,263 @@ const tryDeleteOldStorageObject = async (storedPath) => {
   }
   return { attempted: true, removed: true };
 };
+
+router.get(
+  '/sucursales/:idSucursal/facturacion-config',
+  checkPermission(SUCURSALES_FACTURACION_VIEW_PERMISSIONS),
+  async (req, res) => {
+    try {
+      const data = await obtenerConfiguracionPorSucursal(req.params?.idSucursal);
+      return res.status(200).json({ success: true, data });
+    } catch (err) {
+      if (err instanceof FacturacionConfigSucursalService.ServiceError) {
+        if (err.status === 400) {
+          return res.status(400).json({
+            success: false,
+            message: 'Datos inválidos para la configuración de facturación.',
+            errors: Array.isArray(err.details) ? err.details : []
+          });
+        }
+        if (err.status === 404) {
+          return res.status(404).json({ success: false, message: 'La sucursal indicada no existe.' });
+        }
+        return res.status(err.status || 500).json({
+          success: false,
+          message: 'No fue posible procesar la configuración de facturación.'
+        });
+      }
+      console.error('[sucursales] facturacion-config get error:', err?.message || err);
+      return res.status(500).json({
+        success: false,
+        message: 'No fue posible procesar la configuración de facturación.'
+      });
+    }
+  }
+);
+
+router.put(
+  '/sucursales/:idSucursal/facturacion-config',
+  checkPermission(SUCURSALES_FACTURACION_EDIT_PERMISSIONS),
+  async (req, res) => {
+    try {
+      const data = await actualizarConfiguracionSucursal(req.params?.idSucursal, req.body || {});
+      return res.status(200).json({
+        success: true,
+        message: 'Configuración de facturación actualizada correctamente.',
+        data
+      });
+    } catch (err) {
+      if (err instanceof FacturacionConfigSucursalService.ServiceError) {
+        if (err.status === 400) {
+          return res.status(400).json({
+            success: false,
+            message: 'Datos inválidos para la configuración de facturación.',
+            errors: Array.isArray(err.details) ? err.details : []
+          });
+        }
+        if (err.status === 404) {
+          return res.status(404).json({ success: false, message: 'La sucursal indicada no existe.' });
+        }
+        return res.status(err.status || 500).json({
+          success: false,
+          message: 'No fue posible procesar la configuración de facturación.'
+        });
+      }
+      console.error('[sucursales] facturacion-config put error:', err?.message || err);
+      return res.status(500).json({
+        success: false,
+        message: 'No fue posible procesar la configuración de facturación.'
+      });
+    }
+  }
+);
+
+router.get(
+  '/sucursales/:idSucursal/facturacion-preview',
+  checkPermission(SUCURSALES_FACTURACION_PREVIEW_PERMISSIONS),
+  async (req, res) => {
+    try {
+      const data = await obtenerPreviewFacturacionSucursal(req.params?.idSucursal);
+      return res.status(200).json({ success: true, data });
+    } catch (err) {
+      if (err instanceof FacturacionConfigSucursalService.ServiceError) {
+        if (err.status === 400) {
+          return res.status(400).json({
+            success: false,
+            message: 'Datos inválidos para la configuración de facturación.',
+            errors: Array.isArray(err.details) ? err.details : []
+          });
+        }
+        if (err.status === 404) {
+          return res.status(404).json({ success: false, message: 'La sucursal indicada no existe.' });
+        }
+        return res.status(err.status || 500).json({
+          success: false,
+          message: 'No fue posible procesar la configuración de facturación.'
+        });
+      }
+      console.error('[sucursales] facturacion-preview get error:', err?.message || err);
+      return res.status(500).json({
+        success: false,
+        message: 'No fue posible procesar la configuración de facturación.'
+      });
+    }
+  }
+);
+
+router.get(
+  '/sucursales/:idSucursal/facturacion-rangos-cai',
+  checkPermission(SUCURSALES_FACTURACION_CAI_VIEW_PERMISSIONS),
+  async (req, res) => {
+    try {
+      const data = await listarRangosCaiPorSucursal(req.params?.idSucursal);
+      return res.status(200).json({ success: true, data });
+    } catch (err) {
+      if (err instanceof FacturacionCaiSucursalService.ServiceError) {
+        if (err.status === 400) {
+          return res.status(400).json({
+            success: false,
+            message: 'Datos invalidos para la gestion de rangos CAI.',
+            errors: Array.isArray(err.details) ? err.details : []
+          });
+        }
+        if (err.status === 404) {
+          return res.status(404).json({ success: false, message: 'La sucursal indicada no existe.' });
+        }
+        return res.status(err.status || 500).json({
+          success: false,
+          message: 'No fue posible procesar los rangos CAI.'
+        });
+      }
+      console.error('[sucursales] facturacion-rangos-cai list error:', err?.message || err);
+      return res.status(500).json({
+        success: false,
+        message: 'No fue posible procesar los rangos CAI.'
+      });
+    }
+  }
+);
+
+router.post(
+  '/sucursales/:idSucursal/facturacion-rangos-cai',
+  checkPermission(SUCURSALES_FACTURACION_CAI_MANAGE_PERMISSIONS),
+  async (req, res) => {
+    try {
+      const actorUserId = Number.parseInt(String(req?.user?.id_usuario ?? ''), 10);
+      const data = await crearRangoCaiSucursal(req.params?.idSucursal, req.body || {}, actorUserId);
+      return res.status(201).json({
+        success: true,
+        message: 'Rango CAI creado correctamente.',
+        data
+      });
+    } catch (err) {
+      if (err instanceof FacturacionCaiSucursalService.ServiceError) {
+        if (err.status === 400) {
+          return res.status(400).json({
+            success: false,
+            message: 'Datos invalidos para la gestion de rangos CAI.',
+            errors: Array.isArray(err.details) ? err.details : []
+          });
+        }
+        if (err.status === 404) {
+          return res.status(404).json({ success: false, message: 'La sucursal indicada no existe.' });
+        }
+        if (err.status === 409) {
+          return res.status(409).json({ success: false, message: err.message || 'El rango CAI ya existe.' });
+        }
+        return res.status(err.status || 500).json({
+          success: false,
+          message: 'No fue posible procesar los rangos CAI.'
+        });
+      }
+      console.error('[sucursales] facturacion-rangos-cai create error:', err?.message || err);
+      return res.status(500).json({
+        success: false,
+        message: 'No fue posible procesar los rangos CAI.'
+      });
+    }
+  }
+);
+
+router.patch(
+  '/sucursales/:idSucursal/facturacion-rangos-cai/:idRango/activar',
+  checkPermission(SUCURSALES_FACTURACION_CAI_MANAGE_PERMISSIONS),
+  async (req, res) => {
+    try {
+      const data = await activarRangoCaiSucursal(req.params?.idSucursal, req.params?.idRango);
+      return res.status(200).json({
+        success: true,
+        message: 'Rango CAI activado correctamente.',
+        data
+      });
+    } catch (err) {
+      if (err instanceof FacturacionCaiSucursalService.ServiceError) {
+        if (err.status === 400) {
+          return res.status(400).json({
+            success: false,
+            message: 'Datos invalidos para la gestion de rangos CAI.',
+            errors: Array.isArray(err.details) ? err.details : []
+          });
+        }
+        if (err.status === 404) {
+          if (String(err.message || '').toLowerCase().includes('rango cai')) {
+            return res.status(404).json({ success: false, message: 'El rango CAI no existe para la sucursal indicada.' });
+          }
+          return res.status(404).json({ success: false, message: 'La sucursal indicada no existe.' });
+        }
+        return res.status(err.status || 500).json({
+          success: false,
+          message: 'No fue posible procesar los rangos CAI.'
+        });
+      }
+      console.error('[sucursales] facturacion-rangos-cai activar error:', err?.message || err);
+      return res.status(500).json({
+        success: false,
+        message: 'No fue posible procesar los rangos CAI.'
+      });
+    }
+  }
+);
+
+router.patch(
+  '/sucursales/:idSucursal/facturacion-rangos-cai/:idRango/desactivar',
+  checkPermission(SUCURSALES_FACTURACION_CAI_MANAGE_PERMISSIONS),
+  async (req, res) => {
+    try {
+      const data = await desactivarRangoCaiSucursal(req.params?.idSucursal, req.params?.idRango);
+      return res.status(200).json({
+        success: true,
+        message: 'Rango CAI desactivado correctamente.',
+        data
+      });
+    } catch (err) {
+      if (err instanceof FacturacionCaiSucursalService.ServiceError) {
+        if (err.status === 400) {
+          return res.status(400).json({
+            success: false,
+            message: 'Datos invalidos para la gestion de rangos CAI.',
+            errors: Array.isArray(err.details) ? err.details : []
+          });
+        }
+        if (err.status === 404) {
+          if (String(err.message || '').toLowerCase().includes('rango cai')) {
+            return res.status(404).json({ success: false, message: 'El rango CAI no existe para la sucursal indicada.' });
+          }
+          return res.status(404).json({ success: false, message: 'La sucursal indicada no existe.' });
+        }
+        return res.status(err.status || 500).json({
+          success: false,
+          message: 'No fue posible procesar los rangos CAI.'
+        });
+      }
+      console.error('[sucursales] facturacion-rangos-cai desactivar error:', err?.message || err);
+      return res.status(500).json({
+        success: false,
+        message: 'No fue posible procesar los rangos CAI.'
+      });
+    }
+  }
+);
 
 router.get('/sucursales', async (req, res) => {
   try {

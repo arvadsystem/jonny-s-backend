@@ -61,6 +61,19 @@ const parsePositiveInt = (value) => {
   return Number.isInteger(parsed) && parsed > 0 ? parsed : null;
 };
 
+const getCurrentDateInTegucigalpa = () => {
+  try {
+    return new Intl.DateTimeFormat('en-CA', {
+      timeZone: 'America/Tegucigalpa',
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit'
+    }).format(new Date());
+  } catch {
+    return new Date().toISOString().slice(0, 10);
+  }
+};
+
 const safeParseJson = (value) => {
   if (value === null || value === undefined) return null;
   if (typeof value !== 'string') return value;
@@ -1166,23 +1179,13 @@ const atomicService = {
         };
       }
 
-      if (Object.prototype.hasOwnProperty.call(clientePayload, 'puntos')) {
-        const rawPuntos = Number(clientePayload.puntos);
-        if (!Number.isFinite(rawPuntos) || rawPuntos < 0) {
-          const error = new Error('puntos debe ser un numero mayor o igual a 0');
-          error.httpStatus = 400;
-          throw error;
-        }
-      }
-
-      if (Object.prototype.hasOwnProperty.call(clientePayload, 'fecha_ingreso')) {
-        const fechaIngreso = toTrimmedText(clientePayload.fecha_ingreso);
-        if (fechaIngreso && (!isValidDateOnly(fechaIngreso) || isFutureDateOnly(fechaIngreso))) {
-          const error = new Error('fecha_ingreso invalida');
-          error.httpStatus = 400;
-          throw error;
-        }
-      }
+      // Alta de clientes: backend controla campos comerciales base.
+      // No se confia en payload para fecha/puntos/tipo en este flujo.
+      normalizedCliente = {
+        ...normalizedCliente,
+        fecha_ingreso: getCurrentDateInTegucigalpa(),
+        puntos: 0
+      };
 
       if (Object.prototype.hasOwnProperty.call(clientePayload, 'estado')) {
         const parsedEstado = parseBooleanValue(clientePayload.estado);
@@ -1256,7 +1259,7 @@ const atomicService = {
         };
       }
 
-      const resolvedTipoClienteId = await resolveTipoClienteIdAtomic(client, normalizedCliente.id_tipo_cliente);
+      const resolvedTipoClienteId = await resolveTipoClienteIdAtomic(client, 2);
       if (!resolvedTipoClienteId) {
         const error = new Error('No existe un tipo de cliente disponible para crear el registro');
         error.httpStatus = 400;
