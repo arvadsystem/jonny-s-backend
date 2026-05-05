@@ -68,7 +68,8 @@ const ESTADO_PEDIDO_CODES = {
     'cerrado',
     'lista',
     'listo'
-  ])
+  ]),
+  NO_ENTREGADO: new Set(['no_entregado'])
 };
 const PEDIDO_MENU_PAYMENT_WINDOW_MINUTES = 10;
 const PEDIDO_ESTADO_PAGO = Object.freeze({
@@ -1263,6 +1264,7 @@ const resolvePedidoTransitionTargetCode = (currentCode, requestedCode) => {
 
   if (currentCode === 'LISTO_PARA_ENTREGA') {
     if (requestedCode === 'COMPLETADO') return 'COMPLETADO';
+    if (requestedCode === 'NO_ENTREGADO') return 'NO_ENTREGADO';
     return null;
   }
 
@@ -3653,11 +3655,18 @@ router.put('/ventas/pedidos-menu/:id/estado', checkPermission(['VENTAS_VER']), a
     );
 
     await client.query('COMMIT');
+    const successMessage = normalizedTargetCode === 'NO_ENTREGADO'
+      ? 'Pedido marcado como no entregado correctamente.'
+      : normalizedTargetCode === 'COMPLETADO'
+        ? 'Pedido completado correctamente.'
+        : 'Estado de pedido actualizado correctamente.';
+
     return res.status(200).json({
       ok: true,
       id_pedido: idPedido,
       estado_anterior: currentCode,
-      estado_actual: normalizedTargetCode
+      estado_actual: normalizedTargetCode,
+      message: successMessage
     });
   } catch (error) {
     try { await client.query('ROLLBACK'); } catch {}
