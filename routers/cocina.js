@@ -106,7 +106,13 @@ const hasColumn = async (client, tableName, columnName) => {
 
 const roundMoney = (value) => Number(Number(value || 0).toFixed(2));
 
-const buildTicketNumber = (idPedido) => `VTA-${String(idPedido).padStart(5, '0')}`;
+const buildTicketNumber = (idPedido, idFactura, codigoVenta) => {
+  const codigo = String(codigoVenta || '').trim();
+  if (codigo) return codigo;
+  const baseId = parsePositiveInt(idFactura) || parsePositiveInt(idPedido);
+  if (!baseId) return 'VTA-S/N';
+  return `VTA-${String(baseId).padStart(5, '0')}`;
+};
 
 const inferKitchenItemQuantity = (rawSubtotal, rawUnitPrice) => {
   const subtotal = Number(rawSubtotal || 0);
@@ -488,6 +494,25 @@ router.get('/cocina/pedidos', checkPermission(COCINA_VIEW_PERMISSIONS), async (r
         filters.push(`p.id_sucursal = ${pushParam(requestedSucursalId)}`);
       }
 
+      if (isSuperAdmin && !requestedSucursalId) {
+        return res.status(400).json({
+          error: true,
+          message: 'Selecciona una sucursal para consultar el tablero de cocina.'
+        });
+      }
+
+      const operationalDateExpr = `(NOW() AT TIME ZONE 'America/Tegucigalpa')::date`;
+      filters.push(`
+        (
+          (f.id_factura IS NOT NULL AND f.fecha_operacion::date = ${operationalDateExpr})
+          OR
+          (
+            f.id_factura IS NULL
+            AND (p.fecha_hora_pedido::date = ${operationalDateExpr})
+          )
+        )
+      `);
+
       const q = typeof req.query.q === 'string' ? req.query.q.trim() : '';
       if (q) {
         const qLike = `%${q}%`;
@@ -528,6 +553,9 @@ router.get('/cocina/pedidos', checkPermission(COCINA_VIEW_PERMISSIONS), async (r
               'Consumidor final'
             ) AS cliente_nombre,
             f.fecha_hora_facturacion,
+            f.fecha_operacion,
+            f.id_factura,
+            f.codigo_venta,
             dp.id_detalle_pedido,
             dp.id_producto,
             dp.id_combo,
@@ -562,7 +590,10 @@ router.get('/cocina/pedidos', checkPermission(COCINA_VIEW_PERMISSIONS), async (r
           LEFT JOIN combos combo ON combo.id_combo = dp.id_combo
           LEFT JOIN recetas rec ON rec.id_receta = dp.id_receta
           ${whereClause}
-          ORDER BY p.fecha_hora_pedido ASC, dp.id_detalle_pedido ASC
+          ORDER BY
+            COALESCE(p.visible_en_cocina_at, f.fecha_hora_facturacion, p.fecha_hora_pedido) ASC,
+            p.id_pedido ASC,
+            dp.id_detalle_pedido ASC
         `,
         params
       );
@@ -581,7 +612,7 @@ router.get('/cocina/pedidos', checkPermission(COCINA_VIEW_PERMISSIONS), async (r
 
           grouped.set(row.id_pedido, {
             id_pedido: Number(row.id_pedido),
-            numero_ticket: buildTicketNumber(row.id_pedido),
+            numero_ticket: buildTicketNumber(row.id_pedido, row.id_factura, row.codigo_venta),
             id_sucursal: Number(row.id_sucursal ?? 0) || null,
             nombre_sucursal: row.nombre_sucursal || 'Sucursal no definida',
             id_estado_pedido: Number(row.id_estado_pedido ?? 0) || null,
