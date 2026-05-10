@@ -668,7 +668,7 @@ router.patch(
   }
 );
 
-router.get('/sucursales', async (req, res) => {
+router.get('/sucursales', checkPermission(SUCURSALES_VIEW_PERMISSIONS), async (req, res) => {
   try {
     const tabla = 'v_sucursales_info';
     const columnas =
