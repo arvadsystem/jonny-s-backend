@@ -66,6 +66,8 @@ const EXPIRY_WARN_MINUTES = parseInt(process.env.COCINA_EXPIRY_WARN_MINUTES || '
 const INVENTARIO_CONFIG_WARNING_CODE = 'CONFIGURACION_INVENTARIO_INCOMPLETA';
 const INVENTARIO_CONFIG_WARNING_MESSAGE = 'Pedido marcado como listo. Se notifico a administracion por configuracion incompleta de inventario.';
 const schemaColumnCache = new Map();
+const NO_SUCURSAL_ASSIGNMENT_MESSAGE =
+  'No tienes una sucursal asignada para visualizar Cocina. Contacta al administrador.';
 
 // ══════════════════════════════════════════════════════════════════════
 // Helpers internos
@@ -457,7 +459,7 @@ router.get('/cocina/pedidos', checkPermission(COCINA_VIEW_PERMISSIONS), async (r
 
       if (!isSuperAdmin) {
         if (!userSucursalId) {
-          return res.status(403).json({ error: true, message: 'El empleado no tiene sucursal asignada.' });
+          return res.status(403).json({ error: true, message: NO_SUCURSAL_ASSIGNMENT_MESSAGE });
         }
         // Siempre forzamos la sucursal del empleado — nunca permite ver otras
         requestedSucursalId = userSucursalId;
@@ -734,7 +736,7 @@ router.put('/cocina/pedidos/:id/estado', checkPermission(COCINA_VIEW_PERMISSIONS
     const userSucursalId = parsePositiveInt(scope.userSucursalId);
 
     if (!isSuperAdmin && !userSucursalId) {
-      return res.status(403).json({ error: true, message: 'El empleado no tiene sucursal asignada.' });
+      return res.status(403).json({ error: true, message: NO_SUCURSAL_ASSIGNMENT_MESSAGE });
     }
 
     // ── 3. Abrir transacción solo para las operaciones de DB ───────────
