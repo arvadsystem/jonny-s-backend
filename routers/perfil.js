@@ -12,6 +12,7 @@ import jwt from 'jsonwebtoken';
 import JWT_SECRET from '../config/jwt.js';
 import { ensurePasswordChangedAtColumn } from '../utils/security/passwordExpiration.js';
 import { supabase } from '../services/supabaseClient.js';
+import { passwordChangeLimiter } from '../middleware/rateLimiter.js';
 import {
   ALLOWED_IMAGE_MIME_TYPES,
   SUPABASE_ASSETS_BUCKET,
@@ -31,6 +32,7 @@ const PERFIL_BASE64_BODY_REGEX = /^[A-Za-z0-9+/]+={0,2}$/;
 const PERFIL_DATA_URL_PARSE_RE = /^data:(image\/(?:png|jpe?g|webp));base64,([A-Za-z0-9+/=]+)$/i;
 const PERFIL_IMAGE_DATA_URL_RE = /^data:image\/(png|jpe?g|webp);base64,[A-Za-z0-9+/=]+$/i;
 const PERFIL_IMAGE_URL_RE = /^(https?:\/\/|\/uploads\/)/i;
+const PASSWORD_HISTORY_KEEP = 5;
 
 const normalizePerfilText = (value) => {
   if (value === null || value === undefined) return '';
@@ -620,7 +622,7 @@ import { validatePasswordPolicy } from '../utils/security/passwordPolicy.js';
  *   "clave_nueva": "...."
  * }
  */
-router.put('/perfil/password', async (req, res) => {
+router.put('/perfil/password', passwordChangeLimiter, async (req, res) => {
   try {
     const idUsuario = Number.parseInt(String(req.user?.id_usuario ?? ''), 10);
     if (!Number.isInteger(idUsuario) || idUsuario <= 0) {
@@ -644,51 +646,119 @@ router.put('/perfil/password', async (req, res) => {
 
     await ensurePasswordChangedAtColumn();
 
-    // 1) Validar clave actual (soporta hash bcrypt y legado plano).
-    const qUser = 'SELECT id_usuario, clave FROM usuarios WHERE id_usuario = $1 LIMIT 1';
-    const rUser = await pool.query(qUser, [idUsuario]);
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
 
-    if (rUser.rows.length === 0) {
-      return res.status(404).json({ error: true, message: 'Usuario no encontrado' });
+      const qUser = 'SELECT id_usuario, clave FROM usuarios WHERE id_usuario = $1 LIMIT 1 FOR UPDATE';
+      const rUser = await client.query(qUser, [idUsuario]);
+
+      if (rUser.rows.length === 0) {
+        await client.query('ROLLBACK');
+        return res.status(404).json({ error: true, message: 'Usuario no encontrado' });
+      }
+
+      const claveBD = String(rUser.rows[0]?.clave ?? '');
+      const passwordOk = await verifyStoredPassword(claveActual, claveBD);
+      if (!passwordOk) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ error: true, message: 'La contrasena actual no es correcta' });
+      }
+
+      const samePassword = await verifyStoredPassword(claveNueva, claveBD);
+      if (samePassword) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ error: true, message: 'La nueva contrasena no puede ser igual a la actual' });
+      }
+
+      const policyCheck = await validatePasswordPolicy(claveNueva);
+      if (!policyCheck?.ok) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ error: true, message: policyCheck?.message || 'La contrasena no cumple la politica' });
+      }
+
+      const reuseResult = await client.query(
+        `
+          WITH ultimas AS (
+            SELECT h.password_hash
+            FROM usuarios_password_history h
+            WHERE h.id_usuario = $1
+            ORDER BY h.fecha_creacion DESC, h.id_historial DESC
+            LIMIT $3
+          )
+          SELECT EXISTS(
+            SELECT 1
+            FROM ultimas
+            WHERE crypt($2::text, password_hash) = password_hash
+          ) AS reused
+        `,
+        [idUsuario, claveNueva, PASSWORD_HISTORY_KEEP]
+      );
+
+      if (Boolean(reuseResult.rows?.[0]?.reused)) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({
+          error: true,
+          message: 'La nueva contrasena ya fue utilizada recientemente. Elige una diferente',
+        });
+      }
+
+      if (claveBD) {
+        await client.query(
+          `
+            INSERT INTO usuarios_password_history (id_usuario, password_hash)
+            VALUES ($1, $2)
+          `,
+          [idUsuario, claveBD]
+        );
+      }
+
+      await client.query(
+        `
+          UPDATE usuarios
+          SET
+            clave = crypt($1::text, gen_salt('bf')),
+            must_change_password = FALSE,
+            fecha_cambio_clave = timezone('America/Tegucigalpa', now())
+          WHERE id_usuario = $2
+        `,
+        [claveNueva, idUsuario]
+      );
+
+      await client.query(
+        `
+          DELETE FROM usuarios_password_history
+          WHERE id_historial IN (
+            SELECT id_historial FROM (
+              SELECT id_historial,
+                     ROW_NUMBER() OVER (
+                       PARTITION BY id_usuario
+                       ORDER BY fecha_creacion DESC, id_historial DESC
+                     ) AS rn
+              FROM usuarios_password_history
+              WHERE id_usuario = $1
+            ) t
+            WHERE t.rn > $2
+          )
+        `,
+        [idUsuario, PASSWORD_HISTORY_KEEP]
+      );
+
+      await client.query('COMMIT');
+    } catch (txError) {
+      try { await client.query('ROLLBACK'); } catch {}
+      throw txError;
+    } finally {
+      client.release();
     }
-
-    const claveBD = String(rUser.rows[0]?.clave ?? '');
-    const passwordOk = await verifyStoredPassword(claveActual, claveBD);
-    if (!passwordOk) {
-      return res.status(400).json({ error: true, message: 'La contraseña actual no es correcta' });
-    }
-
-    // 2) Evitar que ponga la misma clave (incluso si la actual esta hasheada).
-    const samePassword = await verifyStoredPassword(claveNueva, claveBD);
-    if (samePassword) {
-      return res.status(400).json({ error: true, message: 'La nueva contraseña no puede ser igual a la actual' });
-    }
-
-    // 3) Reutilizar politicas existentes del modulo de seguridad.
-    const policyCheck = await validatePasswordPolicy(claveNueva);
-    if (!policyCheck?.ok) {
-      return res.status(400).json({ error: true, message: policyCheck?.message || 'La contraseña no cumple la politica' });
-    }
-
-    // 4) Actualizar hash + limpiar forzado + fecha de ultimo cambio.
-    await pool.query(
-      `
-        UPDATE usuarios
-        SET
-          clave = crypt($1::text, gen_salt('bf')),
-          must_change_password = FALSE,
-          fecha_cambio_clave = timezone('America/Tegucigalpa', now())
-        WHERE id_usuario = $2
-      `,
-      [claveNueva, idUsuario]
-    );
 
     issueUpdatedAccessToken(req, res);
-    return res.json({ error: false, message: 'Contraseña actualizada correctamente' });
+    return res.json({ error: false, message: 'Contrasena actualizada correctamente' });
   } catch (err) {
-    console.error('PUT /perfil/password error:', err);
+    console.error('PUT /perfil/password error:', err?.message || err);
     return res.status(500).json({ error: true, message: 'Error interno del servidor' });
   }
 });
 
 export default router;
+

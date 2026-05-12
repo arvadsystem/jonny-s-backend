@@ -110,3 +110,21 @@ export const resendVerificationLimiter = buildLimiter({
     message: 'Demasiados reenvios de verificacion. Intenta de nuevo en 15 minutos.'
   }
 });
+
+/**
+ * Limiter especifico para cambio de contrasena autenticado.
+ * Protege contra abuso de intentos con sesion comprometida.
+ */
+export const passwordChangeLimiter = buildLimiter({
+  windowMs: 15 * 60 * 1000,
+  max: 6,
+  skipSuccessfulRequests: true,
+  keyGenerator: (req) => {
+    const userId = String(req?.user?.id_usuario || '').trim();
+    return `${safeIp(req)}|${userId || 'anon'}`;
+  },
+  message: {
+    error: true,
+    message: 'Demasiados intentos de cambio de contrasena. Intenta nuevamente en 15 minutos.'
+  }
+});
