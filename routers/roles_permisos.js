@@ -134,7 +134,7 @@ router.get('/permisos', checkPermission(ROLES_PERMISOS_PERMISOS_LIST_PERMISSIONS
   try {
     const result = await pool.query(
       `
-        SELECT id_permiso, nombre_permiso
+        SELECT id_permiso, nombre_permiso, descripcion
         FROM permisos
         ORDER BY id_permiso
       `
@@ -171,7 +171,7 @@ router.get('/rol/:id_rol', checkPermission(ROLES_PERMISOS_ROLES_DETAIL_PERMISSIO
       `
         SELECT COUNT(*)::int AS total
         FROM permisos p
-        ${hasSearch ? 'WHERE p.nombre_permiso ILIKE $1' : ''}
+        ${hasSearch ? 'WHERE p.nombre_permiso ILIKE $1 OR COALESCE(p.descripcion, \'\') ILIKE $1' : ''}
       `,
       hasSearch ? [`%${search}%`] : []
     );
@@ -186,7 +186,7 @@ router.get('/rol/:id_rol', checkPermission(ROLES_PERMISOS_ROLES_DETAIL_PERMISSIO
 
     if (hasSearch) {
       queryParams.push(`%${search}%`);
-      searchParamRef = `WHERE p.nombre_permiso ILIKE $2`;
+      searchParamRef = `WHERE p.nombre_permiso ILIKE $2 OR COALESCE(p.descripcion, '') ILIKE $2`;
       limitParamRef = '$3';
       offsetParamRef = '$4';
     }
@@ -199,6 +199,7 @@ router.get('/rol/:id_rol', checkPermission(ROLES_PERMISOS_ROLES_DETAIL_PERMISSIO
         SELECT
           p.id_permiso,
           p.nombre_permiso,
+          p.descripcion,
           CASE
             WHEN rp.id_rol IS NOT NULL THEN TRUE
             ELSE FALSE
