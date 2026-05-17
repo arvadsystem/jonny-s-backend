@@ -71,12 +71,28 @@ const normalizeCajaCode = (value, maxLength = 40) => {
   return normalized.toUpperCase();
 };
 
-const createCajaError = (httpStatus, code, publicMessage) => {
+const createCajaError = (httpStatus, code, publicMessage, details = null) => {
   const error = new Error(publicMessage);
   error.httpStatus = httpStatus;
   error.code = code;
   error.publicMessage = publicMessage;
+  if (details && typeof details === 'object') error.details = details;
   return error;
+};
+
+const createArqueoObservationRequiredError = (methodCode, message = null) => {
+  const normalizedMethodCode = normalizeCajaCode(methodCode, 40) || 'EFECTIVO';
+  return createCajaError(
+    400,
+    'VENTAS_CAJAS_ARQUEO_OBSERVACION_REQUIRED',
+    message || `Debe indicar observación para ${normalizedMethodCode} cuando existe diferencia.`,
+    {
+      metodo_pago_codigo: normalizedMethodCode,
+      field: 'observacion',
+      focus_target: `arqueos.${normalizedMethodCode}.observacion`,
+      step: normalizedMethodCode
+    }
+  );
 };
 
 const sendInternalError = (
@@ -88,11 +104,13 @@ const sendInternalError = (
   console.error('[cajas]', err);
 
   if (Number.isInteger(err?.httpStatus) && err.httpStatus >= 400 && err.httpStatus < 500) {
-    return res.status(err.httpStatus).json({
+    const payload = {
       error: true,
       code: err.code || defaultCode,
       message: err.publicMessage || defaultMessage
-    });
+    };
+    if (err.details && typeof err.details === 'object') payload.details = err.details;
+    return res.status(err.httpStatus).json(payload);
   }
 
   return res.status(500).json({
@@ -339,11 +357,7 @@ const buildSegmentedArqueoComputation = async ({
       );
     }
     if (requiereRevision && !observacionMetodo) {
-      throw createCajaError(
-        400,
-        'VENTAS_CAJAS_ARQUEO_OBSERVACION_REQUIRED',
-        `Debe indicar observacion para ${code} cuando existe diferencia.`
-      );
+      throw createArqueoObservationRequiredError(code);
     }
 
     totalTeorico = roundMoney(totalTeorico + montoTeoricoMetodo);
@@ -573,6 +587,77 @@ const requestIsRestrictedCajero = async (req) => {
   if (!isCajero) return false;
   return !(await requestHasAnyRole(req, ADMIN_ROLE_CODES));
 };
+
+const isCashierOnlyRequest = async (req) => requestIsRestrictedCajero(req);
+
+const maskCajaFinancialMethod = (row = {}) => ({
+  ...row,
+  visible_para_cajero: false,
+  comparacion_visible: false,
+  monto_teorico: null,
+  diferencia: null
+});
+
+const maskCajaFinancialSummary = (row = {}) => ({
+  ...row,
+  visible_para_cajero: false,
+  comparacion_visible: false,
+  ventas_efectivo: null,
+  ventas_no_efectivo: null,
+  monto_ventas_efectivo: null,
+  monto_ventas_no_efectivo: null,
+  ingresos_manuales: null,
+  egresos_manuales: null,
+  monto_ingresos_manuales: null,
+  monto_egresos_manuales: null,
+  efectivo_teorico: null,
+  total_teorico: null,
+  monto_teorico: null,
+  monto_teorico_cierre: null,
+  diferencia: null,
+  diferencia_cierre: null,
+  ultimo_arqueo_cierre: row?.ultimo_arqueo_cierre
+    ? maskCajaFinancialMethod(row.ultimo_arqueo_cierre)
+    : row?.ultimo_arqueo_cierre
+});
+
+const maskCajaCobroUsuarioForCajero = (row = {}) => ({
+  ...row,
+  visible_para_cajero: false,
+  comparacion_visible: false,
+  total_efectivo: null,
+  total_no_efectivo: null,
+  ventas_efectivo: null,
+  ventas_no_efectivo: null
+});
+
+const maskCajaSessionRowForCajero = (row = {}) => maskCajaFinancialSummary(row);
+
+const maskCajaClosePreviewForCajero = (computation) => ({
+  message: 'Vista previa de cierre calculada correctamente.',
+  comparacion_visible: false,
+  resumen: {
+    total_declarado: computation?.monto_declarado_total ?? null
+  },
+  observaciones_requeridas: []
+});
+
+const maskCajaCloseResponseForCajero = (payload = {}) => ({
+  ...payload,
+  visible_para_cajero: false,
+  comparacion_visible: false,
+  diferencia: null,
+  arqueos_metodos: (Array.isArray(payload.arqueos_metodos) ? payload.arqueos_metodos : []).map(maskCajaFinancialMethod)
+});
+
+const maskCajaDetailPayloadForCajero = (payload = {}) => ({
+  ...payload,
+  resumen_operativo: maskCajaFinancialSummary(payload.resumen_operativo || {}),
+  cobros_por_usuario: (Array.isArray(payload.cobros_por_usuario) ? payload.cobros_por_usuario : []).map(maskCajaCobroUsuarioForCajero),
+  arqueos: (Array.isArray(payload.arqueos) ? payload.arqueos : []).map(maskCajaFinancialMethod),
+  arqueos_metodos: (Array.isArray(payload.arqueos_metodos) ? payload.arqueos_metodos : []).map(maskCajaFinancialMethod),
+  cierre: payload.cierre ? maskCajaFinancialSummary(payload.cierre) : payload.cierre
+});
 
 const requestIsSuperAdminReal = async (client, req) => {
   const idUsuario = parsePositiveInt(req?.user?.id_usuario);
@@ -2522,7 +2607,7 @@ router.get('/ventas/cajas/sesiones', checkPermission(['VENTAS_CAJAS_LISTADO_VER'
   try {
     const requestedSucursalId = parseNullablePositiveInt(req.query.id_sucursal);
     const scopeContext = await getScopeContext(req, pool, requestedSucursalId, true);
-    const isRestrictedCajero = await requestIsRestrictedCajero(req);
+    const isRestrictedCajero = await isCashierOnlyRequest(req);
     const filters = [];
     const params = [];
     const pushFilter = (fragment, value) => {
@@ -2582,7 +2667,10 @@ router.get('/ventas/cajas/sesiones', checkPermission(['VENTAS_CAJAS_LISTADO_VER'
       params
     );
 
-    return res.status(200).json(result.rows);
+    const rows = isRestrictedCajero
+      ? result.rows.map(maskCajaSessionRowForCajero)
+      : result.rows;
+    return res.status(200).json(rows);
   } catch (err) {
     return sendInternalError(res, err, 'VENTAS_CAJAS_SESIONES_LIST_ERROR', 'No se pudieron listar las sesiones de caja.');
   }
@@ -2596,7 +2684,10 @@ const sessionDetailHandler = async (req, res, defaultCode, defaultMessage) => {
     const session = await fetchSessionBase(pool, idSesionCaja);
     if (!session) throw createCajaError(404, 'VENTAS_CAJAS_SESSION_NOT_FOUND', 'La sesion de caja no existe.');
     assertSucursalAllowed(scopeContext, session.id_sucursal);
-    return res.status(200).json(await buildSessionDetailPayload(pool, session));
+    const payload = await buildSessionDetailPayload(pool, session);
+    return res.status(200).json(
+      (await isCashierOnlyRequest(req)) ? maskCajaDetailPayloadForCajero(payload) : payload
+    );
   } catch (err) {
     return sendInternalError(res, err, defaultCode, defaultMessage);
   }
@@ -2983,6 +3074,9 @@ const closeSessionHandler = async (req, res) => {
       }
 
       diferencia = Number((montoDeclaradoCierre - montoTeorico).toFixed(2));
+      if (Math.abs(diferencia) > 0 && !observacionCierre) {
+        throw createArqueoObservationRequiredError('EFECTIVO');
+      }
       if (Math.abs(diferencia) > 0 && !idResolucion) {
         throw createCajaError(400, 'VENTAS_CAJAS_RESOLUTION_REQUIRED', 'Debe seleccionar una resolucion de cierre cuando existe diferencia.');
       }
@@ -3116,7 +3210,7 @@ const closeSessionHandler = async (req, res) => {
     });
 
     await client.query('COMMIT');
-    return res.status(200).json({
+    const responsePayload = {
       message: 'Cierre de caja registrado correctamente.',
       id_cierre_caja: idCierreCaja,
       diferencia,
@@ -3124,7 +3218,10 @@ const closeSessionHandler = async (req, res) => {
       estado_revision: 'PENDIENTE_REVISION',
       arqueos_metodos: arqueosPersistir,
       payroll_sync: payrollSync
-    });
+    };
+    return res.status(200).json(
+      (await isCashierOnlyRequest(req)) ? maskCajaCloseResponseForCajero(responsePayload) : responsePayload
+    );
   } catch (err) {
     await client.query('ROLLBACK');
     return sendInternalError(res, err, 'VENTAS_CAJAS_CLOSE_ERROR', 'No se pudo cerrar la sesion de caja.');
@@ -3164,7 +3261,7 @@ router.post('/ventas/cajas/sesiones/:id/cierre-preview', checkPermission(['VENTA
       threshold
     });
 
-    return res.status(200).json({
+    const responsePayload = {
       message: 'Vista previa de cierre calculada correctamente.',
       threshold,
       arqueos_metodos: computation.rows,
@@ -3173,7 +3270,10 @@ router.post('/ventas/cajas/sesiones/:id/cierre-preview', checkPermission(['VENTA
         total_declarado: computation.monto_declarado_total,
         diferencia_total: computation.diferencia_total
       }
-    });
+    };
+    return res.status(200).json(
+      (await isCashierOnlyRequest(req)) ? maskCajaClosePreviewForCajero(computation) : responsePayload
+    );
   } catch (err) {
     return sendInternalError(res, err, 'VENTAS_CAJAS_CLOSE_PREVIEW_ERROR', 'No se pudo calcular la vista previa del cierre.');
   } finally {
@@ -3404,7 +3504,8 @@ router.get('/ventas/cajas/reportes/resumen', checkPermission(['VENTAS_CAJAS_REPO
       params
     );
 
-    return res.status(200).json(result.rows);
+    const isRestrictedCajero = await isCashierOnlyRequest(req);
+    return res.status(200).json(isRestrictedCajero ? result.rows.map(maskCajaSessionRowForCajero) : result.rows);
   } catch (err) {
     return sendInternalError(res, err, 'VENTAS_CAJAS_REPORT_SUMMARY_ERROR', 'No se pudo generar el resumen de cajas.');
   }
@@ -3452,7 +3553,8 @@ router.get('/ventas/cajas/reportes/cierres', checkPermission(['VENTAS_CAJAS_REPO
       params
     );
 
-    return res.status(200).json(result.rows);
+    const isRestrictedCajero = await isCashierOnlyRequest(req);
+    return res.status(200).json(isRestrictedCajero ? result.rows.map(maskCajaSessionRowForCajero) : result.rows);
   } catch (err) {
     return sendInternalError(res, err, 'VENTAS_CAJAS_REPORT_CLOSES_ERROR', 'No se pudo generar el reporte de cierres.');
   }
@@ -3731,7 +3833,8 @@ router.get('/ventas/cajas/sesiones/:id/arqueos', checkPermission(['VENTAS_CAJAS_
     if (!session) throw createCajaError(404, 'VENTAS_CAJAS_SESSION_NOT_FOUND', 'La sesion de caja no existe.');
     assertSucursalAllowed(scopeContext, session.id_sucursal);
     const result = await pool.query(`SELECT a.*, tipo.codigo AS tipo_codigo, tipo.nombre AS tipo_nombre FROM public.cajas_arqueos a INNER JOIN public.cat_cajas_arqueos_tipos tipo ON tipo.id_tipo_arqueo_caja = a.id_tipo_arqueo_caja WHERE a.id_sesion_caja = $1 ORDER BY a.fecha_arqueo DESC, a.id_arqueo_caja DESC`, [idSesionCaja]);
-    return res.status(200).json(result.rows);
+    const isRestrictedCajero = await isCashierOnlyRequest(req);
+    return res.status(200).json(isRestrictedCajero ? result.rows.map(maskCajaFinancialMethod) : result.rows);
   } catch (err) {
     return sendInternalError(res, err, 'VENTAS_CAJAS_ARQUEO_LIST_ERROR', 'No se pudieron obtener los arqueos de la sesion.');
   }
