@@ -163,27 +163,25 @@ const hasColumn = async (client, tableName, columnName) => {
 const hasDiscountIntentInPayload = (body) => {
   if (!isPlainObject(body)) return false;
 
-  if (body.id_descuento_catalogo !== undefined && body.id_descuento_catalogo !== null && String(body.id_descuento_catalogo).trim() !== '') {
+  if (parseOptionalPositiveInt(body.id_descuento_catalogo)) {
     return true;
   }
-  if (body.descuento !== undefined && Number(body.descuento || 0) > 0) {
+  if (parseNonNegativeNumber(body.descuento ?? 0) > 0) {
     return true;
   }
 
   const descuentosLinea = Array.isArray(body.descuentos_linea) ? body.descuentos_linea : [];
-  if (descuentosLinea.length > 0) return true;
-  if (Array.isArray(body.promociones) && body.promociones.length > 0) return true;
+  if (descuentosLinea.some((item) => parseOptionalPositiveInt(item?.id_descuento_catalogo))) {
+    return true;
+  }
 
   const items = Array.isArray(body.items) ? body.items : [];
   return items.some((item) => {
     if (!isPlainObject(item)) return false;
-    if (item.id_descuento_catalogo !== undefined && item.id_descuento_catalogo !== null && String(item.id_descuento_catalogo).trim() !== '') {
+    if (parseOptionalPositiveInt(item.id_descuento_catalogo)) {
       return true;
     }
-    if (item.descuento !== undefined && Number(item.descuento || 0) > 0) {
-      return true;
-    }
-    if (Array.isArray(item.promociones) && item.promociones.length > 0) {
+    if (parseNonNegativeNumber(item.descuento ?? 0) > 0) {
       return true;
     }
     return false;

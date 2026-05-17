@@ -610,6 +610,8 @@ const maskCajaFinancialSummary = (row = {}) => ({
   egresos_manuales: null,
   monto_ingresos_manuales: null,
   monto_egresos_manuales: null,
+  total_responsable: null,
+  total_auxiliares: null,
   efectivo_teorico: null,
   total_teorico: null,
   monto_teorico: null,
