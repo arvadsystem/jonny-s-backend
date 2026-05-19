@@ -1313,11 +1313,13 @@ const resolvePedidoTransitionTargetCode = (currentCode, requestedCode) => {
     if (requestedCode === 'LISTO_PARA_ENTREGA' || requestedCode === 'EN_PREPARACION') {
       return requestedCode;
     }
+    if (requestedCode === 'COMPLETADO' || requestedCode === 'NO_ENTREGADO') return requestedCode;
     return null;
   }
 
   if (currentCode === 'EN_PREPARACION') {
     if (requestedCode === 'LISTO_PARA_ENTREGA') return 'LISTO_PARA_ENTREGA';
+    if (requestedCode === 'COMPLETADO' || requestedCode === 'NO_ENTREGADO') return requestedCode;
     return null;
   }
 
@@ -1328,6 +1330,15 @@ const resolvePedidoTransitionTargetCode = (currentCode, requestedCode) => {
   }
 
   return null;
+};
+
+const isPedidoKdsVencido = (pedido) => {
+  const startedAt = pedido?.kds_started_at ? new Date(pedido.kds_started_at) : null;
+  const expectedMinutes = Number(pedido?.kds_expected_minutes ?? 0);
+  if (!(startedAt instanceof Date) || Number.isNaN(startedAt.getTime())) return false;
+  if (!Number.isFinite(expectedMinutes) || expectedMinutes <= 0) return false;
+  const expireAtMs = startedAt.getTime() + (expectedMinutes * 60 * 1000);
+  return Date.now() >= expireAtMs;
 };
 
 const expirePendingPublicOrders = async ({ client, allowedSucursalIds = [] }) => {
@@ -2561,7 +2572,7 @@ const buildVentaPayload = async ({ client, body, userId, sucursalScope, canApply
           : ['SESSION_NOT_OPEN', 'OPEN_STATE_NOT_FOUND'].includes(sessionActiva.reason)
           ? 409
           : 403,
-      body: { error: true, message: sessionActiva.reason === 'SESSION_SCOPE_MISMATCH' ? 'La caja seleccionada no pertenece a la sucursal de la venta.' : 'Debe abrir o tener una sesión de caja activa permitida para procesar ventas.', code: sessionActiva.reason || 'NO_ACTIVE_SESSION' }
+      body: { error: true, message: sessionActiva.reason === 'SESSION_SCOPE_MISMATCH' ? 'La caja seleccionada no pertenece a la sucursal de la venta.' : 'Debe abrir o tener una sesiï¿½n de caja activa permitida para procesar ventas.', code: sessionActiva.reason || 'NO_ACTIVE_SESSION' }
     };
   }
   const { id_caja: idCaja, id_sesion_caja: idSesionCaja } = sessionActiva.data;
@@ -3791,11 +3802,15 @@ router.get('/ventas/pedidos-menu', checkPermission(['VENTAS_VER']), async (req, 
     const hasPagoConfirmadoAt = await hasPedidosColumn(client, 'pago_confirmado_at');
     const hasCanceladoPorTimeoutAt = await hasPedidosColumn(client, 'cancelado_por_timeout_at');
     const hasIdUsuarioPagoConfirmado = await hasPedidosColumn(client, 'id_usuario_pago_confirmado');
+    const hasKdsStartedAt = await hasPedidosColumn(client, 'kds_started_at');
+    const hasKdsExpectedMinutes = await hasPedidosColumn(client, 'kds_expected_minutes');
+    const hasKdsExpectedRule = await hasPedidosColumn(client, 'kds_expected_rule');
 
     const estadoPendiente = await resolveEstadoPedidoIdByCode(client, 'PENDIENTE');
     const estadoEnCocina = await resolveEstadoPedidoIdByCode(client, 'EN_COCINA');
+    const estadoEnPreparacion = await resolveEstadoPedidoIdByCode(client, 'EN_PREPARACION');
     const estadoListo = await resolveEstadoPedidoIdByCode(client, 'LISTO_PARA_ENTREGA');
-    const estadoIds = [estadoPendiente, estadoEnCocina, estadoListo].filter(Boolean);
+    const estadoIds = [estadoPendiente, estadoEnCocina, estadoEnPreparacion, estadoListo].filter(Boolean);
 
     if (estadoIds.length === 0) {
       return res.status(200).json([]);
@@ -3824,6 +3839,18 @@ router.get('/ventas/pedidos-menu', checkPermission(['VENTAS_VER']), async (req, 
     const pagoConfirmadorSelect = hasIdUsuarioPagoConfirmado
       ? 'p.id_usuario_pago_confirmado'
       : 'NULL::int AS id_usuario_pago_confirmado';
+    const kdsStartedAtSelect = hasKdsStartedAt
+      ? 'p.kds_started_at'
+      : 'NULL::timestamptz AS kds_started_at';
+    const kdsExpectedMinutesSelect = hasKdsExpectedMinutes
+      ? 'p.kds_expected_minutes'
+      : 'NULL::int AS kds_expected_minutes';
+    const kdsExpectedRuleSelect = hasKdsExpectedRule
+      ? 'p.kds_expected_rule'
+      : 'NULL::text AS kds_expected_rule';
+    const kdsVencidoSelect = hasKdsStartedAt && hasKdsExpectedMinutes
+      ? "(p.kds_started_at IS NOT NULL AND p.kds_expected_minutes IS NOT NULL AND NOW() >= p.kds_started_at + (p.kds_expected_minutes * INTERVAL '1 minute')) AS kds_vencido"
+      : 'FALSE AS kds_vencido';
 
     const result = await client.query(
       `
@@ -3843,11 +3870,17 @@ router.get('/ventas/pedidos-menu', checkPermission(['VENTAS_VER']), async (req, 
           ${pagoConfirmadoAtSelect},
           ${canceladoTimeoutSelect},
           ${pagoConfirmadorSelect},
+          ${kdsStartedAtSelect},
+          ${kdsExpectedMinutesSelect},
+          ${kdsExpectedRuleSelect},
+          ${kdsVencidoSelect},
+          COALESCE(NULLIF(TRIM(f.codigo_venta), ''), NULL) AS codigo_venta,
           u_pago.nombre_usuario AS usuario_pago_confirmado,
           per.nombre AS nombres_cliente,
           per.apellido AS apellidos_cliente
         FROM pedidos p
         INNER JOIN estados_pedido ep ON p.id_estado_pedido = ep.id_estado_pedido
+        LEFT JOIN facturas f ON f.id_pedido = p.id_pedido
         LEFT JOIN clientes c ON p.id_cliente = c.id_cliente
         LEFT JOIN personas per ON c.id_persona = per.id_persona
         LEFT JOIN usuarios u_pago ON u_pago.id_usuario = p.id_usuario_pago_confirmado
@@ -4053,15 +4086,19 @@ router.put('/ventas/pedidos-menu/:id/estado', checkPermission(['VENTAS_VER']), a
 
     const hasEstadoPago = await hasPedidosColumn(client, 'estado_pago');
     const hasValidacionVence = await hasPedidosColumn(client, 'validacion_pago_vence_at');
+    const hasKdsStartedAt = await hasPedidosColumn(client, 'kds_started_at');
+    const hasKdsExpectedMinutes = await hasPedidosColumn(client, 'kds_expected_minutes');
 
     const estadoRows = await fetchEstadoPedidoRows(client);
     const estadoCodeById = new Map(
       estadoRows.map((row) => [Number(row.id_estado_pedido), Object.entries(ESTADO_PEDIDO_CODES).find(([, aliases]) => aliases.has(normalizeTextKey(row.descripcion)))?.[0] || null])
     );
+    const kdsStartedAtSelect = hasKdsStartedAt ? 'kds_started_at' : 'NULL::timestamptz AS kds_started_at';
+    const kdsExpectedMinutesSelect = hasKdsExpectedMinutes ? 'kds_expected_minutes' : 'NULL::int AS kds_expected_minutes';
 
     const pedidoResult = await client.query(
       `
-        SELECT id_pedido, id_estado_pedido, id_sucursal, estado_pago, validacion_pago_vence_at
+        SELECT id_pedido, id_estado_pedido, id_sucursal, estado_pago, validacion_pago_vence_at, ${kdsStartedAtSelect}, ${kdsExpectedMinutesSelect}
         FROM pedidos
         WHERE id_pedido = $1
         FOR UPDATE
@@ -4093,7 +4130,26 @@ router.put('/ventas/pedidos-menu/:id/estado', checkPermission(['VENTAS_VER']), a
       await client.query('ROLLBACK');
       return res.status(409).json({
         error: true,
-        message: 'La transicion solicitada no es valida para el estado actual del pedido.'
+        message: 'La transiciï¿½n solicitada no es vï¿½lida para el estado actual del pedido.'
+      });
+    }
+    if (normalizedTargetCode === 'LISTO_PARA_ENTREGA') {
+      await client.query('ROLLBACK');
+      return res.status(409).json({
+        error: true,
+        message: 'El pedido solo puede marcarse como listo desde Cocina.'
+      });
+    }
+
+    if (
+      (currentCode === 'EN_COCINA' || currentCode === 'EN_PREPARACION')
+      && (normalizedTargetCode === 'COMPLETADO' || normalizedTargetCode === 'NO_ENTREGADO')
+      && !isPedidoKdsVencido(pedido)
+    ) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({
+        error: true,
+        message: 'El pedido aï¿½n se encuentra dentro del tiempo operativo de cocina.'
       });
     }
 

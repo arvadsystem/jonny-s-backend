@@ -11,9 +11,9 @@ import { validarYDescontarPedido } from '../services/inventarioPedidoService.js'
 
 const router = express.Router();
 
-// ══════════════════════════════════════════════════════════════════════
+// �"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"�
 // Constantes del módulo
-// ══════════════════════════════════════════════════════════════════════
+// �"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"�
 
 const ESTADO_PEDIDO_CODES = {
   EN_COCINA: new Set(['en_cocina', 'en_cocina_pendiente']),
@@ -35,6 +35,7 @@ const ESTADO_PEDIDO_CODES = {
 };
 
 const BOARD_CODES = ['EN_COCINA', 'EN_PREPARACION', 'LISTO_PARA_ENTREGA'];
+const KDS_VISIBLE_CODES = ['EN_COCINA', 'EN_PREPARACION'];
 const COLUMN_BY_CODE = {
   EN_COCINA: 'PENDIENTES',
   EN_PREPARACION: 'EN_PREPARACION',
@@ -68,10 +69,16 @@ const INVENTARIO_CONFIG_WARNING_MESSAGE = 'Pedido marcado como listo. Se notific
 const schemaColumnCache = new Map();
 const NO_SUCURSAL_ASSIGNMENT_MESSAGE =
   'No tienes una sucursal asignada para visualizar Cocina. Contacta al administrador.';
+const KDS_EXPECTED_RULES = Object.freeze([
+  { code: 'RANGO_0_10', min: 0, max: 10, minutes: 25 },
+  { code: 'RANGO_11_15', min: 11, max: 15, minutes: 30 },
+  { code: 'RANGO_16_25', min: 16, max: 25, minutes: 45 },
+  { code: 'RANGO_26_PLUS', min: 26, max: Number.POSITIVE_INFINITY, minutes: 50 }
+]);
 
-// ══════════════════════════════════════════════════════════════════════
+// �"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"�
 // Helpers internos
-// ══════════════════════════════════════════════════════════════════════
+// �"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"�
 
 const normalizeTextKey = (value) =>
   String(value || '')
@@ -84,6 +91,112 @@ const normalizeTextKey = (value) =>
 const parsePositiveInt = (value) => {
   const parsed = Number.parseInt(String(value ?? ''), 10);
   return Number.isInteger(parsed) && parsed > 0 ? parsed : null;
+};
+
+const resolveKdsRuleByActiveCount = (activeCount) => {
+  const safeCount = Math.max(0, Number(activeCount) || 0);
+  return (
+    KDS_EXPECTED_RULES.find((rule) => safeCount >= rule.min && safeCount <= rule.max) ||
+    KDS_EXPECTED_RULES[KDS_EXPECTED_RULES.length - 1]
+  );
+};
+
+const resolveOperationalDateValue = (value) => {
+  if (!value) return null;
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return null;
+  const tegucigalpaDate = new Date(
+    date.toLocaleString('en-US', { timeZone: 'America/Tegucigalpa' })
+  );
+  return tegucigalpaDate.toISOString().slice(0, 10);
+};
+
+const assignPersistedKdsTiming = async ({
+  client,
+  pedidoId,
+  idSucursal,
+  activeEstadoIds,
+  operationalDate
+}) => {
+  const safePedidoId = parsePositiveInt(pedidoId);
+  const safeSucursalId = parsePositiveInt(idSucursal);
+  if (!safePedidoId || !safeSucursalId) return null;
+  if (!Array.isArray(activeEstadoIds) || activeEstadoIds.length === 0) return null;
+
+  const existingResult = await client.query(
+    `
+      SELECT
+        kds_started_at,
+        kds_expected_minutes,
+        kds_expected_rule,
+        visible_en_cocina_at,
+        fecha_hora_pedido
+      FROM public.pedidos
+      WHERE id_pedido = $1
+      LIMIT 1
+    `,
+    [safePedidoId]
+  );
+  if (existingResult.rowCount === 0) return null;
+
+  const existing = existingResult.rows[0];
+  const hasPersistedTiming =
+    existing.kds_started_at && parsePositiveInt(existing.kds_expected_minutes) && existing.kds_expected_rule;
+  if (hasPersistedTiming) {
+    return {
+      kds_started_at: existing.kds_started_at,
+      kds_expected_minutes: Number(existing.kds_expected_minutes),
+      kds_expected_rule: existing.kds_expected_rule
+    };
+  }
+
+  const operationalDateValue =
+    resolveOperationalDateValue(operationalDate) ||
+    new Date().toLocaleDateString('en-CA', { timeZone: 'America/Tegucigalpa' });
+
+  const activeCountResult = await client.query(
+    `
+      SELECT COUNT(*)::int AS total
+      FROM public.pedidos p
+      INNER JOIN public.facturas f ON f.id_pedido = p.id_pedido
+      WHERE p.id_sucursal = $1
+        AND p.id_estado_pedido = ANY($2::int[])
+        AND f.fecha_operacion::date = $3::date
+        AND COALESCE(NULLIF(TRIM(f.codigo_venta), ''), NULL) IS NOT NULL
+    `,
+    [safeSucursalId, activeEstadoIds, operationalDateValue]
+  );
+  const activeCount = Number(activeCountResult.rows?.[0]?.total ?? 0) || 0;
+  const rule = resolveKdsRuleByActiveCount(activeCount);
+
+  const updatedResult = await client.query(
+    `
+      UPDATE public.pedidos
+      SET
+        kds_started_at = COALESCE(
+          kds_started_at,
+          CASE
+            WHEN visible_en_cocina_at IS NOT NULL
+              THEN visible_en_cocina_at AT TIME ZONE 'America/Tegucigalpa'
+            WHEN fecha_hora_pedido IS NOT NULL
+              THEN fecha_hora_pedido AT TIME ZONE 'America/Tegucigalpa'
+            ELSE NOW()
+          END
+        ),
+        kds_expected_minutes = COALESCE(kds_expected_minutes, $2::int),
+        kds_expected_rule = COALESCE(kds_expected_rule, $3)
+      WHERE id_pedido = $1
+      RETURNING kds_started_at, kds_expected_minutes, kds_expected_rule
+    `,
+    [safePedidoId, rule.minutes, rule.code]
+  );
+
+  if (updatedResult.rowCount === 0) return null;
+  return {
+    kds_started_at: updatedResult.rows[0].kds_started_at,
+    kds_expected_minutes: Number(updatedResult.rows[0].kds_expected_minutes ?? 0) || null,
+    kds_expected_rule: updatedResult.rows[0].kds_expected_rule || null
+  };
 };
 
 const hasColumn = async (client, tableName, columnName) => {
@@ -373,7 +486,7 @@ const insertCocinaIncident = async (client, payload) => {
 
 /**
  * Envía correo de alerta cuando un pedido lleva demasiado tiempo sin ser atendido.
- * No lanza error — falla silenciosamente para no interrumpir el flujo de cocina.
+ * No lanza error � falla silenciosamente para no interrumpir el flujo de cocina.
  */
 const tryEnviarAlertaExpiracion = async (idPedido, numeroTicket, sucursalNombre, minutosEspera) => {
   try {
@@ -391,7 +504,7 @@ const tryEnviarAlertaExpiracion = async (idPedido, numeroTicket, sucursalNombre,
         <h1 style="color:#d4a574;font-size:26px;margin:0 0 6px;">JONNY'S</h1>
         <p style="color:rgba(255,255,255,0.4);font-size:11px;letter-spacing:3px;margin:0 0 32px;">SMARTORDER · COCINA</p>
         <div style="background:rgba(219,65,65,0.15);border:1px solid rgba(219,65,65,0.3);border-radius:12px;padding:20px;margin-bottom:24px;">
-          <h2 style="color:#f87171;font-size:18px;margin:0 0 8px;">⚠️ Pedido con tiempo de espera excesivo</h2>
+          <h2 style="color:#f87171;font-size:18px;margin:0 0 8px;">�a�️ Pedido con tiempo de espera excesivo</h2>
           <p style="color:rgba(255,255,255,0.7);font-size:14px;margin:0;">
             El pedido <strong style="color:#fbbf24;">${numeroTicket}</strong> en <strong style="color:#fbbf24;">${sucursalNombre}</strong>
             lleva <strong style="color:#f87171;">${minutosEspera} minutos</strong> sin ser atendido.
@@ -406,7 +519,7 @@ const tryEnviarAlertaExpiracion = async (idPedido, numeroTicket, sucursalNombre,
     <tr>
       <td style="padding:16px 36px;border-top:1px solid rgba(255,255,255,0.06);text-align:center;">
         <p style="color:rgba(255,255,255,0.2);font-size:11px;margin:0;">
-          © ${new Date().getFullYear()} Jonny's Restaurant · Honduras — Alerta automática del KDS
+          © ${new Date().getFullYear()} Jonny's Restaurant · Honduras � Alerta automática del KDS
         </p>
       </td>
     </tr>
@@ -416,7 +529,7 @@ const tryEnviarAlertaExpiracion = async (idPedido, numeroTicket, sucursalNombre,
 
     await enviarCorreo(
       destinatario,
-      `⚠️ Pedido ${numeroTicket} lleva ${minutosEspera} min en espera — ${sucursalNombre}`,
+      `�a�️ Pedido ${numeroTicket} lleva ${minutosEspera} min en espera � ${sucursalNombre}`,
       html,
       { tipo_correo: 'alerta_cocina', fromKey: 'PEDIDOS' }
     );
@@ -426,11 +539,11 @@ const tryEnviarAlertaExpiracion = async (idPedido, numeroTicket, sucursalNombre,
   }
 };
 
-// ══════════════════════════════════════════════════════════════════════
+// �"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"�
 // GET /cocina/pedidos
 // Retorna los pedidos activos del tablero KDS.
 // Para usuarios no-super_admin fuerza la sucursal del empleado.
-// ══════════════════════════════════════════════════════════════════════
+// �"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"�
 router.get('/cocina/pedidos', checkPermission(COCINA_VIEW_PERMISSIONS), async (req, res) => {
   const correlationId = crypto.randomUUID().slice(0, 8);
   try {
@@ -439,7 +552,7 @@ router.get('/cocina/pedidos', checkPermission(COCINA_VIEW_PERMISSIONS), async (r
     try {
       const estadoRows = await fetchEstadoCatalog(client);
       const estadoIdMap = buildEstadoIdMap(estadoRows);
-      const availableBoardCodes = BOARD_CODES.filter((code) => estadoIdMap.has(code));
+      const availableBoardCodes = KDS_VISIBLE_CODES.filter((code) => estadoIdMap.has(code));
 
       if (availableBoardCodes.length === 0) {
         return res.status(200).json([]);
@@ -461,15 +574,15 @@ router.get('/cocina/pedidos', checkPermission(COCINA_VIEW_PERMISSIONS), async (r
         if (!userSucursalId) {
           return res.status(403).json({ error: true, message: NO_SUCURSAL_ASSIGNMENT_MESSAGE });
         }
-        // Siempre forzamos la sucursal del empleado — nunca permite ver otras
+        // Siempre forzamos la sucursal del empleado � nunca permite ver otras
         requestedSucursalId = userSucursalId;
       }
 
       const requestedEstado = req.query.estado
         ? String(req.query.estado).trim().toUpperCase()
         : null;
-      if (requestedEstado && !BOARD_CODES.includes(requestedEstado)) {
-        return res.status(400).json({ error: true, message: 'estado invalido para el tablero KDS.' });
+      if (requestedEstado && !KDS_VISIBLE_CODES.includes(requestedEstado)) {
+        return res.status(400).json({ error: true, message: 'estado inválido para el tablero KDS.' });
       }
 
       const filters = [];
@@ -504,16 +617,9 @@ router.get('/cocina/pedidos', checkPermission(COCINA_VIEW_PERMISSIONS), async (r
       }
 
       const operationalDateExpr = `(NOW() AT TIME ZONE 'America/Tegucigalpa')::date`;
-      filters.push(`
-        (
-          (f.id_factura IS NOT NULL AND f.fecha_operacion::date = ${operationalDateExpr})
-          OR
-          (
-            f.id_factura IS NULL
-            AND (p.fecha_hora_pedido::date = ${operationalDateExpr})
-          )
-        )
-      `);
+      filters.push(`f.fecha_operacion::date = ${operationalDateExpr}`);
+      filters.push(`COALESCE(NULLIF(TRIM(f.codigo_venta), ''), NULL) IS NOT NULL`);
+      filters.push(`f.id_sucursal = p.id_sucursal`);
 
       const q = typeof req.query.q === 'string' ? req.query.q.trim() : '';
       if (q) {
@@ -532,6 +638,13 @@ router.get('/cocina/pedidos', checkPermission(COCINA_VIEW_PERMISSIONS), async (r
 
       const whereClause = filters.length ? `WHERE ${filters.join(' AND ')}` : '';
       const hasDetallePedidoConfiguracionMenu = await hasColumn(client, 'detalle_pedido', 'configuracion_menu');
+      const hasKdsStartedAt = await hasColumn(client, 'pedidos', 'kds_started_at');
+      const hasKdsExpectedMinutes = await hasColumn(client, 'pedidos', 'kds_expected_minutes');
+      const hasKdsExpectedRule = await hasColumn(client, 'pedidos', 'kds_expected_rule');
+      const hasKdsTimingColumns = hasKdsStartedAt && hasKdsExpectedMinutes && hasKdsExpectedRule;
+      const activeKdsEstadoIds = ['EN_COCINA', 'EN_PREPARACION']
+        .map((code) => estadoIdMap.get(code))
+        .filter((value) => Number.isInteger(value) && value > 0);
 
       const result = await client.query(
         `
@@ -543,6 +656,9 @@ router.get('/cocina/pedidos', checkPermission(COCINA_VIEW_PERMISSIONS), async (r
             p.descripcion_envio,
             p.fecha_hora_pedido,
             p.visible_en_cocina_at,
+            ${hasKdsStartedAt ? 'p.kds_started_at,' : 'NULL::timestamptz AS kds_started_at,'}
+            ${hasKdsExpectedMinutes ? 'p.kds_expected_minutes,' : 'NULL::int AS kds_expected_minutes,'}
+            ${hasKdsExpectedRule ? 'p.kds_expected_rule,' : 'NULL::text AS kds_expected_rule,'}
             p.total,
             p.sub_total,
             p.isv,
@@ -584,7 +700,7 @@ router.get('/cocina/pedidos', checkPermission(COCINA_VIEW_PERMISSIONS), async (r
           LEFT JOIN clientes c ON c.id_cliente = p.id_cliente
           LEFT JOIN personas per ON per.id_persona = c.id_persona
           LEFT JOIN empresas emp ON emp.id_empresa = c.id_empresa
-          LEFT JOIN facturas f ON f.id_pedido = p.id_pedido
+          INNER JOIN facturas f ON f.id_pedido = p.id_pedido
           LEFT JOIN detalle_pedido dp
             ON dp.id_pedido = p.id_pedido
            AND COALESCE(dp.estado, true) = true
@@ -614,7 +730,8 @@ router.get('/cocina/pedidos', checkPermission(COCINA_VIEW_PERMISSIONS), async (r
 
           grouped.set(row.id_pedido, {
             id_pedido: Number(row.id_pedido),
-            numero_ticket: buildTicketNumber(row.id_pedido, row.id_factura, row.codigo_venta),
+            numero_ticket: String(row.codigo_venta || '').trim(),
+            codigo_venta: String(row.codigo_venta || '').trim(),
             id_sucursal: Number(row.id_sucursal ?? 0) || null,
             nombre_sucursal: row.nombre_sucursal || 'Sucursal no definida',
             id_estado_pedido: Number(row.id_estado_pedido ?? 0) || null,
@@ -624,8 +741,12 @@ router.get('/cocina/pedidos', checkPermission(COCINA_VIEW_PERMISSIONS), async (r
             tipo_servicio: inferTipoServicio(row.descripcion_envio),
             descripcion_pedido: row.descripcion_pedido || null,
             descripcion_envio: row.descripcion_envio || null,
+            fecha_operacion: row.fecha_operacion || null,
             fecha_hora_pedido: row.fecha_hora_pedido,
             visible_en_cocina_at: row.visible_en_cocina_at || row.fecha_hora_facturacion || row.fecha_hora_pedido,
+            kds_started_at: row.kds_started_at || null,
+            kds_expected_minutes: parsePositiveInt(row.kds_expected_minutes),
+            kds_expected_rule: row.kds_expected_rule || null,
             fecha_hora_facturacion: row.fecha_hora_facturacion || row.fecha_hora_pedido,
             minutos_en_espera: minutosEnEspera,
             esta_proximo_a_expirar: estaProximoAExpirar,
@@ -659,6 +780,32 @@ router.get('/cocina/pedidos', checkPermission(COCINA_VIEW_PERMISSIONS), async (r
             modificaciones: []
           });
           pedido.total_items += cantidad;
+        }
+      }
+
+      if (hasKdsTimingColumns && activeKdsEstadoIds.length > 0) {
+        const orderedPedidos = Array.from(grouped.values()).sort((left, right) => {
+          const leftDate = new Date(left.visible_en_cocina_at || left.fecha_hora_pedido || 0).getTime();
+          const rightDate = new Date(right.visible_en_cocina_at || right.fecha_hora_pedido || 0).getTime();
+          return leftDate - rightDate;
+        });
+
+        for (const pedido of orderedPedidos) {
+          if (pedido.kds_started_at && parsePositiveInt(pedido.kds_expected_minutes) && pedido.kds_expected_rule) {
+            continue;
+          }
+          const persistedTiming = await assignPersistedKdsTiming({
+            client,
+            pedidoId: pedido.id_pedido,
+            idSucursal: pedido.id_sucursal,
+            activeEstadoIds: activeKdsEstadoIds,
+            operationalDate: pedido.fecha_operacion || pedido.fecha_hora_pedido || null
+          });
+          if (!persistedTiming) continue;
+          pedido.kds_started_at = persistedTiming.kds_started_at || pedido.kds_started_at;
+          pedido.kds_expected_minutes =
+            parsePositiveInt(persistedTiming.kds_expected_minutes) || pedido.kds_expected_minutes;
+          pedido.kds_expected_rule = persistedTiming.kds_expected_rule || pedido.kds_expected_rule;
         }
       }
 
@@ -696,7 +843,7 @@ router.get('/cocina/pedidos', checkPermission(COCINA_VIEW_PERMISSIONS), async (r
       client.release();
     }
   } catch (err) {
-    // Log completo solo en servidor — nunca al cliente
+    // Log completo solo en servidor � nunca al cliente
     console.error(`[ERROR ${correlationId}] GET /cocina/pedidos:`, err);
     res.status(500).json({
       error: true,
@@ -706,16 +853,16 @@ router.get('/cocina/pedidos', checkPermission(COCINA_VIEW_PERMISSIONS), async (r
   }
 });
 
-// ══════════════════════════════════════════════════════════════════════
+// �"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"�
 // PUT /cocina/pedidos/:id/estado
 // Avanza o marca como No Entregado un pedido del KDS.
 // Valida permisos por estado Y por sucursal del empleado.
-// ══════════════════════════════════════════════════════════════════════
+// �"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"�
 router.put('/cocina/pedidos/:id/estado', checkPermission(COCINA_VIEW_PERMISSIONS), async (req, res) => {
   const correlationId = crypto.randomUUID().slice(0, 8);
 
   try {
-    // ── 1. Validar inputs ──────────────────────────────────────────────
+    // ���� 1. Validar inputs ��������������������������������������������������������������������������������������������
     const idPedido = parsePositiveInt(req.params.id);
     if (!idPedido) {
       return res.status(400).json({ error: true, message: 'ID de pedido invalido.' });
@@ -727,7 +874,7 @@ router.put('/cocina/pedidos/:id/estado', checkPermission(COCINA_VIEW_PERMISSIONS
       return res.status(400).json({ error: true, message: 'estado_destino invalido.' });
     }
 
-    // ── 2. Resolver scope ANTES de abrir transacción ───────────────────
+    // ���� 2. Resolver scope ANTES de abrir transacción ��������������������������������������
     // resolveRequestUserSucursalScope y requestHasAnyPermission usan pool
     // internamente. Llamarlos DENTRO de un BEGIN con el mismo client puede
     // contaminar la conexión si cualquier consulta auxiliar falla.
@@ -739,7 +886,7 @@ router.put('/cocina/pedidos/:id/estado', checkPermission(COCINA_VIEW_PERMISSIONS
       return res.status(403).json({ error: true, message: NO_SUCURSAL_ASSIGNMENT_MESSAGE });
     }
 
-    // ── 3. Abrir transacción solo para las operaciones de DB ───────────
+    // ���� 3. Abrir transacción solo para las operaciones de DB ����������������������
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
@@ -748,7 +895,7 @@ router.put('/cocina/pedidos/:id/estado', checkPermission(COCINA_VIEW_PERMISSIONS
       const estadoIdMap = buildEstadoIdMap(estadoRows);
       const estadoCodeByIdMap = buildEstadoCodeByIdMap(estadoRows);
 
-      // ── 4. Leer pedido con bloqueo ─────────────────────────────────
+      // ���� 4. Leer pedido con bloqueo ������������������������������������������������������������������
       const pedidoResult = await client.query(
         `SELECT p.id_pedido, p.id_estado_pedido, p.id_sucursal,
                 p.fecha_hora_pedido, s.nombre_sucursal
@@ -767,7 +914,7 @@ router.put('/cocina/pedidos/:id/estado', checkPermission(COCINA_VIEW_PERMISSIONS
       const pedido = pedidoResult.rows[0];
       const pedidoSucursalId = parsePositiveInt(pedido.id_sucursal);
 
-      // ── 5. Verificar scope de sucursal ─────────────────────────────
+      // ���� 5. Verificar scope de sucursal ����������������������������������������������������������
       if (!isSuperAdmin && pedidoSucursalId !== userSucursalId) {
         await client.query('ROLLBACK');
         return res.status(403).json({
@@ -776,7 +923,7 @@ router.put('/cocina/pedidos/:id/estado', checkPermission(COCINA_VIEW_PERMISSIONS
         });
       }
 
-      // ── 6. Verificar estado actual y transición válida ─────────────
+      // ���� 6. Verificar estado actual y transición válida ��������������������������
       const estadoActual = estadoCodeByIdMap.get(Number(pedido.id_estado_pedido ?? 0)) || null;
 
       if (!estadoActual || !TRANSITIONS[estadoActual]) {
@@ -784,6 +931,20 @@ router.put('/cocina/pedidos/:id/estado', checkPermission(COCINA_VIEW_PERMISSIONS
         return res.status(409).json({
           error: true,
           message: 'El pedido no esta en un estado valido para operar desde cocina.'
+        });
+      }
+
+      if (estadoActual === estadoDestino) {
+        await client.query('ROLLBACK');
+        return res.status(200).json({
+          ok: true,
+          message: 'El pedido ya se encuentra en el estado solicitado.',
+          id_pedido: idPedido,
+          estado_anterior: estadoActual,
+          estado_actual: estadoDestino,
+          warning: false,
+          warning_code: null,
+          warning_detail: null
         });
       }
 
@@ -798,7 +959,7 @@ router.put('/cocina/pedidos/:id/estado', checkPermission(COCINA_VIEW_PERMISSIONS
         });
       }
 
-      // ── 7. Verificar permiso específico (usa pool interno, no client) ─
+      // ���� 7. Verificar permiso específico (usa pool interno, no client) ��
       const transitionPermission = COCINA_TRANSITION_PERMISSION_BY_STATE[estadoActual];
       const canChangeTransition = await requestHasAnyPermission(req, transitionPermission);
       if (!canChangeTransition) {
@@ -809,7 +970,7 @@ router.put('/cocina/pedidos/:id/estado', checkPermission(COCINA_VIEW_PERMISSIONS
         });
       }
 
-      // ── 8. Obtener ID del estado destino ───────────────────────────
+      // ���� 8. Obtener ID del estado destino ������������������������������������������������������
       const idEstadoDestino = estadoIdMap.get(estadoDestino);
       if (!idEstadoDestino) {
         await client.query('ROLLBACK');
@@ -821,6 +982,7 @@ router.put('/cocina/pedidos/:id/estado', checkPermission(COCINA_VIEW_PERMISSIONS
 
       let inventoryResult = null;
       let inventoryConfigWarning = null;
+      let inventoryAlreadyDiscounted = false;
       const shouldDiscountInventory = estadoDestino === 'LISTO_PARA_ENTREGA';
       if (shouldDiscountInventory) {
         const consumoPayloadResult = await buildPedidoConsumoPayload(client, idPedido, pedidoSucursalId);
@@ -829,14 +991,22 @@ router.put('/cocina/pedidos/:id/estado', checkPermission(COCINA_VIEW_PERMISSIONS
           return res.status(consumoPayloadResult.status).json(consumoPayloadResult.body);
         }
 
-        inventoryResult = await validarYDescontarPedido(consumoPayloadResult.payload, {
-          id_usuario: req?.user?.id_usuario,
-          allowNegativeStock: true,
-          shortageMode: 'FALTANTE_COCINA',
-          dbClient: client
-        });
+        try {
+          inventoryResult = await validarYDescontarPedido(consumoPayloadResult.payload, {
+            id_usuario: req?.user?.id_usuario,
+            allowNegativeStock: true,
+            shortageMode: 'FALTANTE_COCINA',
+            dbClient: client
+          });
+        } catch (inventoryError) {
+          const errorCode = String(inventoryError?.code || '').trim().toUpperCase();
+          if (errorCode !== 'PEDIDO_YA_DESCONTADO') {
+            throw inventoryError;
+          }
+          inventoryAlreadyDiscounted = true;
+        }
 
-        if (!inventoryResult?.ok) {
+        if (!inventoryAlreadyDiscounted && !inventoryResult?.ok) {
           const isConfigError = String(inventoryResult.code || '').toUpperCase() === 'CONFIGURACION_INVENTARIO_INVALIDA';
           if (!isConfigError) {
             await client.query('ROLLBACK');
@@ -858,7 +1028,7 @@ router.put('/cocina/pedidos/:id/estado', checkPermission(COCINA_VIEW_PERMISSIONS
         }
       }
 
-      // ── 9. Actualizar estado ───────────────────────────────────────
+      // ���� 9. Actualizar estado ������������������������������������������������������������������������������
       await client.query(
         `
           UPDATE pedidos
@@ -875,7 +1045,7 @@ router.put('/cocina/pedidos/:id/estado', checkPermission(COCINA_VIEW_PERMISSIONS
 
       await client.query('COMMIT');
 
-      // ── 10. Alerta de expiración (fire-and-forget, fuera de la tx) ─
+      // ���� 10. Alerta de expiración (fire-and-forget, fuera de la tx) ��
       if (estadoDestino === 'NO_ENTREGADO' || estadoDestino === 'COMPLETADO') {
         const fechaRef = pedido.fecha_hora_pedido;
         const minutosEnEspera = fechaRef
@@ -894,12 +1064,20 @@ router.put('/cocina/pedidos/:id/estado', checkPermission(COCINA_VIEW_PERMISSIONS
 
       return res.status(200).json({
         ok: true,
-        message: inventoryConfigWarning ? INVENTARIO_CONFIG_WARNING_MESSAGE : 'Estado de pedido actualizado correctamente.',
+        message: inventoryConfigWarning
+          ? INVENTARIO_CONFIG_WARNING_MESSAGE
+          : inventoryAlreadyDiscounted
+            ? 'Pedido marcado como listo. El inventario ya había sido descontado previamente.'
+            : 'Estado de pedido actualizado correctamente.',
         id_pedido: idPedido,
         estado_anterior: estadoActual,
         estado_actual: estadoDestino,
-        warning: inventoryConfigWarning ? true : Boolean(inventoryResult?.warning),
-        warning_code: inventoryConfigWarning ? INVENTARIO_CONFIG_WARNING_CODE : null,
+        warning: inventoryConfigWarning ? true : Boolean(inventoryResult?.warning || inventoryAlreadyDiscounted),
+        warning_code: inventoryConfigWarning
+          ? INVENTARIO_CONFIG_WARNING_CODE
+          : inventoryAlreadyDiscounted
+            ? 'INVENTARIO_YA_DESCONTADO'
+            : null,
         warning_detail: inventoryResult?.warning || null
       });
     } catch (dbErr) {
@@ -919,3 +1097,4 @@ router.put('/cocina/pedidos/:id/estado', checkPermission(COCINA_VIEW_PERMISSIONS
 });
 
 export default router;
+
