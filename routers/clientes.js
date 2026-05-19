@@ -15,7 +15,7 @@ import {
 const router = express.Router();
 const CLIENTES_LIST_PERMISSIONS = ['CLIENTES_LISTADO_VER'];
 const CLIENTES_DETAIL_PERMISSIONS = ['CLIENTES_DETALLE_VER'];
-const CLIENTES_CREATE_PERMISSIONS = ['CLIENTES_CREAR'];
+const CLIENTES_CREATE_PERMISSIONS = ['CLIENTES_CREAR', 'CLIENTES_CREAR_DESDE_CLIENTES'];
 const CLIENTES_EDIT_PERMISSIONS = ['CLIENTES_EDITAR'];
 const CLIENTES_DELETE_PERMISSIONS = ['CLIENTES_ELIMINAR'];
 
@@ -183,6 +183,24 @@ const resolveTenantIdForRequest = async (req) => {
 
   const tenantFromToken = parsePositiveInt(req.user?.id_empresa ?? req.user?.id_empresa_contexto);
   if (tenantFromToken) return tenantFromToken;
+  const idSucursalToken = parsePositiveInt(req.user?.id_sucursal);
+  if (idSucursalToken) {
+    try {
+      const bySucursal = await pool.query(
+        `
+          SELECT id_empresa
+          FROM public.sucursales
+          WHERE id_sucursal = $1
+          LIMIT 1
+        `,
+        [idSucursalToken]
+      );
+      const tenantFromSucursal = parsePositiveInt(bySucursal.rows?.[0]?.id_empresa);
+      if (tenantFromSucursal) return tenantFromSucursal;
+    } catch {
+      // noop
+    }
+  }
 
   const idUsuario = resolveUserId(req);
   if (!idUsuario) return null;
@@ -191,16 +209,43 @@ const resolveTenantIdForRequest = async (req) => {
     const tenantResult = await pool.query(
       `
         SELECT
-          COALESCE(u.id_empresa, p_emp.id_empresa) AS id_empresa_resuelta
+          COALESCE(
+            u.id_empresa,
+            p_emp.id_empresa,
+            c.id_empresa_cliente,
+            s_emp.id_empresa
+          ) AS id_empresa_resuelta
         FROM public.usuarios u
         LEFT JOIN public.empleados e ON e.id_empleado = u.id_empleado
         LEFT JOIN public.personas p_emp ON p_emp.id_persona = e.id_persona
+        LEFT JOIN public.clientes c ON c.id_cliente = u.id_cliente
+        LEFT JOIN public.sucursales s_emp ON s_emp.id_sucursal = e.id_sucursal
         WHERE u.id_usuario = $1
         LIMIT 1
       `,
       [idUsuario]
     );
     return parsePositiveInt(tenantResult.rows?.[0]?.id_empresa_resuelta);
+  } catch {
+    // noop
+  }
+
+  // Fallback final para cajero: empresa desde asignacion activa de caja.
+  try {
+    const tenantByCaja = await pool.query(
+      `
+        SELECT s.id_empresa
+        FROM public.cajas_usuarios_autorizados cua
+        INNER JOIN public.cajas c ON c.id_caja = cua.id_caja
+        INNER JOIN public.sucursales s ON s.id_sucursal = c.id_sucursal
+        WHERE cua.id_usuario = $1
+          AND COALESCE(cua.estado, true) = true
+        ORDER BY cua.fecha_actualizacion DESC, cua.id_caja_usuario_autorizado DESC
+        LIMIT 1
+      `,
+      [idUsuario]
+    );
+    return parsePositiveInt(tenantByCaja.rows?.[0]?.id_empresa);
   } catch {
     return null;
   }

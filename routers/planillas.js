@@ -39,11 +39,23 @@ const PLANILLAS_VIEW_PERMISSIONS = ['PLANILLAS_LISTADO_VER'];
 const PLANILLAS_DETAIL_PERMISSIONS = ['PLANILLAS_DETALLE_VER'];
 const PLANILLAS_GENERATE_PERMISSIONS = ['PLANILLAS_GENERAR'];
 const PLANILLAS_RECALCULAR_PERMISSIONS = ['PLANILLAS_RECALCULAR'];
-const PLANILLAS_ADELANTOS_PERMISSIONS = ['PLANILLAS_ADELANTOS_APLICAR'];
+const PLANILLAS_ADELANTOS_APLICAR_PERMISSIONS = ['PLANILLAS_ADELANTOS_APLICAR'];
+const PLANILLAS_ADELANTOS_REGISTRAR_PERMISSIONS = ['PLANILLAS_ADELANTOS_REGISTRAR', 'PLANILLAS_ADELANTOS_APLICAR'];
+const PLANILLAS_ADELANTOS_ANULAR_PERMISSIONS = ['PLANILLAS_ADELANTOS_ANULAR', 'PLANILLAS_ADELANTOS_APLICAR'];
 const PLANILLAS_MOVIMIENTO_REGISTER_PERMISSIONS = ['PLANILLAS_MOVIMIENTO_REGISTRAR'];
+const PLANILLAS_MOVIMIENTO_EDIT_PERMISSIONS = ['PLANILLAS_MOVIMIENTO_EDITAR', 'PLANILLAS_MOVIMIENTO_REGISTRAR'];
 const PLANILLAS_MOVIMIENTO_ANULAR_PERMISSIONS = ['PLANILLAS_MOVIMIENTO_ANULAR'];
-const PLANILLAS_ESTADO_PERMISSIONS = ['PLANILLAS_CERRAR', 'PLANILLAS_PAGAR', 'PLANILLAS_ANULAR'];
+const PLANILLAS_ESTADO_PERMISSIONS = [
+  'PLANILLAS_CERRAR',
+  'PLANILLAS_REABRIR',
+  'PLANILLAS_APROBAR',
+  'PLANILLAS_PAGAR',
+  'PLANILLAS_PAGO_REVERSAR',
+  'PLANILLAS_ANULAR'
+];
 const PLANILLAS_AUDITORIA_PERMISSIONS = ['PLANILLAS_AUDITORIA_VER'];
+const PLANILLAS_EXPORT_PERMISSIONS = ['PLANILLAS_EXPORTAR'];
+const PLANILLAS_SUMMARY_COSTS_PERMISSIONS = ['PLANILLAS_RESUMEN_VER_COSTOS'];
 
 const PLANILLA_ENDPOINT_CONTRACT = Object.freeze({
   list: 'fn_listar_planillas_por_sucursal',
@@ -1256,6 +1268,9 @@ const PLANILLA_ALLOWED_ROLE_TOKENS_LIST = Object.freeze([
   'MESERO',
   'SUPERVISOR',
   'GERENTE',
+  'ENCARGADO',
+  'JEFE COCINA',
+  'JEFE DE COCINA',
   'AUXILIAR COCINA',
   'AUXILIAR DE COCINA',
   'COCINERO'
@@ -2191,8 +2206,10 @@ const applyAdelantoFallback = async ({ idAdelanto, idPlanilla, montoAplicar = nu
 
 const getRequiredEstadoPermission = (descripcion = '') => {
   const normalized = String(descripcion || '').trim().toUpperCase();
-  if (normalized === 'CERRADA' || normalized === 'CALCULADA') return 'PLANILLAS_CERRAR';
+  if (normalized === 'CALCULADA') return 'PLANILLAS_APROBAR';
+  if (normalized === 'CERRADA') return 'PLANILLAS_CERRAR';
   if (normalized === 'PAGADA') return 'PLANILLAS_PAGAR';
+  if (normalized === 'BORRADOR') return 'PLANILLAS_REABRIR';
   if (normalized === 'ANULADA') return 'PLANILLAS_ANULAR';
   return null;
 };
@@ -4965,27 +4982,28 @@ router.get('/planillas', checkPermission(PLANILLAS_VIEW_PERMISSIONS), asyncHandl
 router.post('/planillas/generar', checkPermission(PLANILLAS_GENERATE_PERMISSIONS), asyncHandler(planillaService.generar));
 router.post('/planillas/:id_planilla/recalcular', checkPermission(PLANILLAS_RECALCULAR_PERMISSIONS), asyncHandler(planillaService.recalcularPlanilla));
 router.get('/planillas/:id_planilla/detalle', checkPermission(PLANILLAS_DETAIL_PERMISSIONS), asyncHandler(planillaService.detalle));
-router.get('/planillas/:id_planilla/resumen', checkPermission(PLANILLAS_DETAIL_PERMISSIONS), asyncHandler(planillaService.resumen));
-router.get('/planillas/:id_planilla/completa', checkPermission(PLANILLAS_DETAIL_PERMISSIONS), asyncHandler(planillaService.completa));
+router.get('/planillas/:id_planilla/resumen', checkPermission([...PLANILLAS_DETAIL_PERMISSIONS, ...PLANILLAS_SUMMARY_COSTS_PERMISSIONS]), asyncHandler(planillaService.resumen));
+router.get('/planillas/:id_planilla/completa', checkPermission([...PLANILLAS_DETAIL_PERMISSIONS, ...PLANILLAS_SUMMARY_COSTS_PERMISSIONS]), asyncHandler(planillaService.completa));
 router.get('/planillas/:id_planilla/horas-extra', checkPermission(PLANILLAS_DETAIL_PERMISSIONS), asyncHandler(planillaService.listarHorasExtra));
 router.post('/planillas/:id_planilla/horas-extra/registrar', checkPermission(PLANILLAS_RECALCULAR_PERMISSIONS), asyncHandler(planillaService.registrarHoraExtra));
 router.post('/planillas/:id_planilla/horas-extra/:id_horas_extra/compensar', checkPermission(PLANILLAS_RECALCULAR_PERMISSIONS), asyncHandler(planillaService.compensarHoraExtra));
-router.post('/planillas/:id_planilla/horas-extra/:id_horas_extra/actualizar', checkPermission(PLANILLAS_RECALCULAR_PERMISSIONS), asyncHandler(planillaService.actualizarHoraExtra));
+router.post('/planillas/:id_planilla/horas-extra/:id_horas_extra/actualizar', checkPermission(PLANILLAS_MOVIMIENTO_EDIT_PERMISSIONS), asyncHandler(planillaService.actualizarHoraExtra));
 router.put('/planillas/:id_planilla/estado', checkPermission(PLANILLAS_ESTADO_PERMISSIONS), asyncHandler(planillaService.actualizarEstado));
 router.post('/planillas/:id_planilla/anular', checkPermission(['PLANILLAS_ANULAR']), asyncHandler(planillaService.anularPlanilla));
 router.get('/planillas/sucursales/:id_sucursal/empleados-activos', checkPermission(PLANILLAS_DETAIL_PERMISSIONS), asyncHandler(planillaService.empleadosActivos));
-router.get('/planillas/sucursales/:id_sucursal/adelantos-pendientes', checkPermission(PLANILLAS_ADELANTOS_PERMISSIONS), asyncHandler(planillaService.adelantosPendientes));
-router.get('/planillas/:id_planilla/adelantos-aplicables', checkPermission(PLANILLAS_ADELANTOS_PERMISSIONS), asyncHandler(planillaService.adelantosAplicables));
-router.post('/planillas/:id_planilla/adelantos/registrar', checkPermission(PLANILLAS_ADELANTOS_PERMISSIONS), asyncHandler(planillaService.registrarAdelanto));
-router.post('/planillas/:id_planilla/adelantos/aplicar', checkPermission(PLANILLAS_ADELANTOS_PERMISSIONS), asyncHandler(planillaService.aplicarAdelanto));
-router.post('/planillas/:id_planilla/adelantos/:id_adelanto/actualizar', checkPermission(PLANILLAS_ADELANTOS_PERMISSIONS), asyncHandler(planillaService.actualizarAdelanto));
-router.post('/planillas/:id_planilla/adelantos/:id_adelanto/anular', checkPermission(PLANILLAS_ADELANTOS_PERMISSIONS), asyncHandler(planillaService.anularAdelanto));
+router.get('/planillas/sucursales/:id_sucursal/adelantos-pendientes', checkPermission(PLANILLAS_ADELANTOS_APLICAR_PERMISSIONS), asyncHandler(planillaService.adelantosPendientes));
+router.get('/planillas/:id_planilla/adelantos-aplicables', checkPermission(PLANILLAS_ADELANTOS_APLICAR_PERMISSIONS), asyncHandler(planillaService.adelantosAplicables));
+router.post('/planillas/:id_planilla/adelantos/registrar', checkPermission(PLANILLAS_ADELANTOS_REGISTRAR_PERMISSIONS), asyncHandler(planillaService.registrarAdelanto));
+router.post('/planillas/:id_planilla/adelantos/aplicar', checkPermission(PLANILLAS_ADELANTOS_APLICAR_PERMISSIONS), asyncHandler(planillaService.aplicarAdelanto));
+router.post('/planillas/:id_planilla/adelantos/:id_adelanto/actualizar', checkPermission(PLANILLAS_ADELANTOS_REGISTRAR_PERMISSIONS), asyncHandler(planillaService.actualizarAdelanto));
+router.post('/planillas/:id_planilla/adelantos/:id_adelanto/anular', checkPermission(PLANILLAS_ADELANTOS_ANULAR_PERMISSIONS), asyncHandler(planillaService.anularAdelanto));
 router.post('/planillas/:id_planilla/movimientos', checkPermission(PLANILLAS_MOVIMIENTO_REGISTER_PERMISSIONS), asyncHandler(planillaService.registrarMovimiento));
 router.get('/planillas/:id_planilla/movimientos', checkPermission(PLANILLAS_DETAIL_PERMISSIONS), asyncHandler(planillaService.listarMovimientos));
 router.get('/planillas/:id_planilla/movimientos/:id_detalle', checkPermission(PLANILLAS_DETAIL_PERMISSIONS), asyncHandler(planillaService.listarMovimientosDetalle));
 router.post('/planillas/movimientos/:id_movimiento/anular', checkPermission(PLANILLAS_MOVIMIENTO_ANULAR_PERMISSIONS), asyncHandler(planillaService.anularMovimiento));
 router.get('/planillas/:id_planilla/auditoria', checkPermission(PLANILLAS_AUDITORIA_PERMISSIONS), asyncHandler(planillaService.auditoria));
 router.post('/planillas/:id_planilla/detalle/:id_detalle/recalcular', checkPermission(PLANILLAS_RECALCULAR_PERMISSIONS), asyncHandler(planillaService.recalcularDetalle));
+router.get('/planillas/:id_planilla/export', checkPermission(PLANILLAS_EXPORT_PERMISSIONS), asyncHandler(planillaService.completa));
 
 export default router;
 

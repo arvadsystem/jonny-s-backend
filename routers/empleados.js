@@ -32,6 +32,16 @@ const FUNCTION_UPDATE_FIELDS = new Set([
   'nombre_referencia',
   'telefono_referencia'
 ]);
+const EMPLEADO_ALLOWED_CARGO_OPTIONS = Object.freeze([
+  'Encargado',
+  'Cajero',
+  'Jefe de cocina',
+  'Asistente de cocina'
+  , 'Mesero'
+]);
+const EMPLEADO_CARGO_ALIASES = Object.freeze({
+  'jefe cocina': 'Jefe de cocina'
+});
 
 let schemaCapabilitiesPromise;
 
@@ -62,6 +72,22 @@ const rollbackQuietly = async (client) => {
   } catch {
     // noop
   }
+};
+
+const normalizeCargoKey = (value) =>
+  String(value ?? '')
+    .trim()
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/\s+/g, ' ');
+
+const resolveAllowedCargoValue = (value) => {
+  const normalized = normalizeCargoKey(value);
+  if (!normalized) return '';
+  if (EMPLEADO_CARGO_ALIASES[normalized]) return EMPLEADO_CARGO_ALIASES[normalized];
+  const match = EMPLEADO_ALLOWED_CARGO_OPTIONS.find((item) => normalizeCargoKey(item) === normalized);
+  return match || '';
 };
 
 const normalizeLegacyUpdatePayload = (body) => {
@@ -162,6 +188,16 @@ const validateEmpleadoPayload = (payload = {}, { requirePersona = false, require
     const name = String(payload.nombre_referencia ?? '').trim();
     if (name && !isSafeHumanName(name)) {
       errors.push({ field: 'nombre_referencia', message: 'nombre_referencia solo puede contener letras y espacios.' });
+    }
+  }
+
+  if (Object.prototype.hasOwnProperty.call(payload, 'cargo')) {
+    const rawCargo = String(payload.cargo ?? '').trim();
+    if (rawCargo && !resolveAllowedCargoValue(rawCargo)) {
+      errors.push({
+        field: 'cargo',
+        message: 'cargo no permitido. Use: Encargado, Cajero, Jefe cocina o Asistente de cocina.'
+      });
     }
   }
 
@@ -729,6 +765,10 @@ const empleadoService = {
     }
 
     const insertData = { ...payload };
+    if (hasOwn(insertData, 'cargo')) {
+      const normalizedCargo = resolveAllowedCargoValue(insertData.cargo);
+      insertData.cargo = normalizedCargo || '';
+    }
     const idUsuario = resolveUserId(req);
     const tenantId = parsePositiveInt(req.user?.id_empresa);
 
@@ -844,6 +884,10 @@ const empleadoService = {
     const payload = Object.fromEntries(
       Object.entries(rawPayload).filter(([campo, valor]) => campo && valor !== undefined)
     );
+    if (hasOwn(payload, 'cargo')) {
+      const normalizedCargo = resolveAllowedCargoValue(payload.cargo);
+      payload.cargo = normalizedCargo || '';
+    }
 
     const unknownFields = unknownFieldsFromPayload(payload, allowedFields);
     if (unknownFields.length) {

@@ -19,7 +19,7 @@ import {
 const router = express.Router();
 
 const EMPLEADOS_CREATE_PERMISSIONS = ['EMPLEADOS_CREAR'];
-const CLIENTES_CREATE_PERMISSIONS = ['CLIENTES_CREAR'];
+const CLIENTES_CREATE_PERMISSIONS = ['CLIENTES_CREAR', 'CLIENTES_CREAR_DESDE_CLIENTES'];
 const EMPLEADO_ATOMIC_ALLOWED_FIELDS = new Set([
   'fecha_ingreso',
   'salario_base',
@@ -31,6 +31,16 @@ const EMPLEADO_ATOMIC_ALLOWED_FIELDS = new Set([
   'telefono_referencia',
   'id_empresa'
 ]);
+const EMPLEADO_ALLOWED_CARGO_OPTIONS = Object.freeze([
+  'Encargado',
+  'Cajero',
+  'Jefe de cocina',
+  'Asistente de cocina',
+  'Mesero'
+]);
+const EMPLEADO_CARGO_ALIASES = Object.freeze({
+  'jefe cocina': 'Jefe de cocina'
+});
 const CLIENTE_ATOMIC_ALLOWED_FIELDS = new Set([
   'fecha_ingreso',
   'puntos',
@@ -59,6 +69,22 @@ const isPlainObject = (value) => value !== null && typeof value === 'object' && 
 const parsePositiveInt = (value) => {
   const parsed = Number.parseInt(String(value ?? ''), 10);
   return Number.isInteger(parsed) && parsed > 0 ? parsed : null;
+};
+
+const normalizeCargoKey = (value) =>
+  String(value ?? '')
+    .trim()
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/\s+/g, ' ');
+
+const resolveAllowedCargoValue = (value) => {
+  const normalized = normalizeCargoKey(value);
+  if (!normalized) return '';
+  if (EMPLEADO_CARGO_ALIASES[normalized]) return EMPLEADO_CARGO_ALIASES[normalized];
+  const match = EMPLEADO_ALLOWED_CARGO_OPTIONS.find((item) => normalizeCargoKey(item) === normalized);
+  return match || '';
 };
 
 const getCurrentDateInTegucigalpa = () => {
@@ -162,16 +188,45 @@ const resolveTenantContextForRequest = async (req, client = pool) => {
   }
 
   const idUsuario = parsePositiveInt(req?.user?.id_usuario);
+  const idSucursalToken = parsePositiveInt(req?.user?.id_sucursal);
+
+  if (idSucursalToken) {
+    try {
+      const bySucursal = await client.query(
+        `
+          SELECT id_empresa
+          FROM public.sucursales
+          WHERE id_sucursal = $1
+          LIMIT 1
+        `,
+        [idSucursalToken]
+      );
+      const tenantFromSucursal = parsePositiveInt(bySucursal.rows?.[0]?.id_empresa);
+      if (tenantFromSucursal) {
+        return { tenantId: tenantFromSucursal, isSuperAdmin };
+      }
+    } catch {
+      // noop
+    }
+  }
+
   if (!idUsuario) return { tenantId: null, isSuperAdmin };
 
   try {
     const tenantResult = await client.query(
       `
         SELECT
-          COALESCE(u.id_empresa, p_emp.id_empresa) AS id_empresa_resuelta
+          COALESCE(
+            u.id_empresa,
+            p_emp.id_empresa,
+            c.id_empresa_cliente,
+            s_emp.id_empresa
+          ) AS id_empresa_resuelta
         FROM public.usuarios u
         LEFT JOIN public.empleados e ON e.id_empleado = u.id_empleado
         LEFT JOIN public.personas p_emp ON p_emp.id_persona = e.id_persona
+        LEFT JOIN public.clientes c ON c.id_cliente = u.id_cliente
+        LEFT JOIN public.sucursales s_emp ON s_emp.id_sucursal = e.id_sucursal
         WHERE u.id_usuario = $1
         LIMIT 1
       `,
@@ -182,7 +237,51 @@ const resolveTenantContextForRequest = async (req, client = pool) => {
       isSuperAdmin
     };
   } catch {
-    return { tenantId: null, isSuperAdmin };
+    // noop
+  }
+
+  // Fallback final para cajero: resolver empresa desde asignacion activa de caja.
+  try {
+    const tenantByCaja = await client.query(
+      `
+        SELECT s.id_empresa
+        FROM public.cajas_usuarios_autorizados cua
+        INNER JOIN public.cajas c ON c.id_caja = cua.id_caja
+        INNER JOIN public.sucursales s ON s.id_sucursal = c.id_sucursal
+        WHERE cua.id_usuario = $1
+          AND COALESCE(cua.estado, true) = true
+        ORDER BY cua.fecha_actualizacion DESC, cua.id_caja_usuario_autorizado DESC
+        LIMIT 1
+      `,
+      [idUsuario]
+    );
+    const tenantFromCaja = parsePositiveInt(tenantByCaja.rows?.[0]?.id_empresa);
+    if (tenantFromCaja) {
+      return { tenantId: tenantFromCaja, isSuperAdmin };
+    }
+  } catch {
+    // noop
+  }
+
+  return { tenantId: null, isSuperAdmin };
+};
+
+const resolveTenantFromSucursalHint = async (client, hintSucursalId) => {
+  const idSucursal = parsePositiveInt(hintSucursalId);
+  if (!idSucursal) return null;
+  try {
+    const result = await client.query(
+      `
+        SELECT id_empresa
+        FROM public.sucursales
+        WHERE id_sucursal = $1
+        LIMIT 1
+      `,
+      [idSucursal]
+    );
+    return parsePositiveInt(result.rows?.[0]?.id_empresa);
+  } catch {
+    return null;
   }
 };
 
@@ -895,17 +994,6 @@ const atomicService = {
         allowClientesContext: false
       });
 
-      const normalizedEmpleado = normalizeEmpleadoAtomicPayload({
-        ...empleadoPayload,
-        id_persona: idPersona
-      });
-
-      if (!normalizedEmpleado.id_persona || !normalizedEmpleado.id_sucursal) {
-        const error = new Error('Empleado atomico requiere id_persona e id_sucursal validos');
-        error.httpStatus = 400;
-        throw error;
-      }
-
       if (Object.prototype.hasOwnProperty.call(empleadoPayload, 'salario_base')) {
         const salarioBase = Number(empleadoPayload.salario_base);
         if (!Number.isFinite(salarioBase) || salarioBase < 0) {
@@ -931,6 +1019,32 @@ const atomicService = {
           error.httpStatus = 400;
           throw error;
         }
+      }
+
+      if (Object.prototype.hasOwnProperty.call(empleadoPayload, 'cargo')) {
+        const rawCargo = String(empleadoPayload.cargo ?? '').trim();
+        if (rawCargo) {
+          const normalizedCargo = resolveAllowedCargoValue(rawCargo);
+          if (!normalizedCargo) {
+            const error = new Error('cargo no permitido. Use: Encargado, Cajero, Jefe cocina o Asistente de cocina');
+            error.httpStatus = 400;
+            throw error;
+          }
+          empleadoPayload.cargo = normalizedCargo;
+        } else {
+          empleadoPayload.cargo = '';
+        }
+      }
+
+      const normalizedEmpleado = normalizeEmpleadoAtomicPayload({
+        ...empleadoPayload,
+        id_persona: idPersona
+      });
+
+      if (!normalizedEmpleado.id_persona || !normalizedEmpleado.id_sucursal) {
+        const error = new Error('Empleado atomico requiere id_persona e id_sucursal validos');
+        error.httpStatus = 400;
+        throw error;
       }
 
       const createResult = await client.query('SELECT empleados_crear($1::json) AS id_empleado', [
@@ -1034,7 +1148,17 @@ const atomicService = {
 
     try {
       await client.query('BEGIN');
-      const { tenantId: resolvedTenantId, isSuperAdmin } = await resolveTenantContextForRequest(req, client);
+      const { tenantId: resolvedTenantIdRaw, isSuperAdmin } = await resolveTenantContextForRequest(req, client);
+      let resolvedTenantId = resolvedTenantIdRaw;
+      if (!resolvedTenantId && !isSuperAdmin) {
+        const rawBody = isPlainObject(req.body) ? req.body : {};
+        const bodyCliente = isPlainObject(rawBody.cliente) ? rawBody.cliente : {};
+        const hintedSucursalId =
+          parsePositiveInt(req?.user?.id_sucursal)
+          || parsePositiveInt(bodyCliente?.id_sucursal)
+          || parsePositiveInt(rawBody?.id_sucursal);
+        resolvedTenantId = await resolveTenantFromSucursalHint(client, hintedSucursalId);
+      }
       if (!resolvedTenantId && !isSuperAdmin) {
         const error = new Error('No se pudo resolver la empresa del usuario para crear el cliente.');
         error.httpStatus = 403;

@@ -63,10 +63,25 @@ export const evaluatePasswordExpiration = ({
 };
 
 const ensureColumnWithRunner = async (queryRunner) => {
-  await queryRunner.query(`
-    ALTER TABLE public.usuarios
-    ADD COLUMN IF NOT EXISTS ${PASSWORD_CHANGED_AT_COLUMN} timestamp without time zone
-  `);
+  const result = await queryRunner.query(
+    `
+      SELECT 1
+      FROM information_schema.columns
+      WHERE table_schema = 'public'
+        AND table_name = 'usuarios'
+        AND column_name = $1
+      LIMIT 1
+    `,
+    [PASSWORD_CHANGED_AT_COLUMN]
+  );
+
+  if (!result.rows.length) {
+    const error = new Error(
+      `Falta la columna requerida public.usuarios.${PASSWORD_CHANGED_AT_COLUMN}. Ejecuta la migracion SQL correspondiente.`
+    );
+    error.code = 'PASSWORD_CHANGED_AT_COLUMN_MISSING';
+    throw error;
+  }
 };
 
 export const ensurePasswordChangedAtColumn = async (queryRunner = pool) => {

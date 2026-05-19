@@ -1197,7 +1197,7 @@ const buildSessionDetailPayload = async (client, session) => {
   };
 };
 
-router.get('/ventas/cajas/sesion-activa', checkPermission(['VENTAS_CAJAS_MODULO_VER', 'VENTAS_CAJAS_LISTADO_VER']), async (req, res) => {
+router.get('/ventas/cajas/sesion-activa', checkPermission(['VENTAS_CAJAS_LISTADO_VER']), async (req, res) => {
   try {
     const scopeContext = await getScopeContext(req, pool);
     const idEstadoAbierta = await getCatalogId(pool, 'SESSION_STATES', 'ABIERTA');
@@ -1226,7 +1226,7 @@ router.get('/ventas/cajas/sesion-activa', checkPermission(['VENTAS_CAJAS_MODULO_
   }
 });
 
-router.get('/ventas/cajas/catalogos', checkPermission(['VENTAS_CAJAS_MODULO_VER', 'VENTAS_CAJAS_LISTADO_VER']), async (req, res) => {
+router.get('/ventas/cajas/catalogos', checkPermission(['VENTAS_CAJAS_LISTADO_VER']), async (req, res) => {
   try {
     const requestedSucursalId = parseNullablePositiveInt(req.query.id_sucursal);
     const scopeContext = await getScopeContext(req, pool, requestedSucursalId, true);
@@ -1813,7 +1813,7 @@ router.patch('/ventas/cajas/listado/:id', checkPermission(['VENTAS_CAJAS_PARTICI
   }
 });
 
-router.get('/ventas/cajas/asignaciones', checkPermission(['VENTAS_CAJAS_LISTADO_VER', 'VENTAS_CAJAS_PARTICIPANTES_GESTIONAR', 'VENTAS_CAJAS_SESION_ABRIR']), async (req, res) => {
+router.get('/ventas/cajas/asignaciones', checkPermission(['VENTAS_CAJAS_PARTICIPANTES_GESTIONAR']), async (req, res) => {
   try {
     const requestedSucursalId = parseNullablePositiveInt(req.query.id_sucursal);
     const scopeContext = await getScopeContext(req, pool, requestedSucursalId, true);
@@ -2158,6 +2158,7 @@ router.get('/ventas/cajas/sesiones', checkPermission(['VENTAS_CAJAS_LISTADO_VER'
   try {
     const requestedSucursalId = parseNullablePositiveInt(req.query.id_sucursal);
     const scopeContext = await getScopeContext(req, pool, requestedSucursalId, true);
+    const isCajero = await requestHasAnyRole(req, ['CAJERO']);
     const filters = [];
     const params = [];
     const pushFilter = (fragment, value) => {
@@ -2167,6 +2168,19 @@ router.get('/ventas/cajas/sesiones', checkPermission(['VENTAS_CAJAS_LISTADO_VER'
 
     if (scopeContext.targetSucursalId) pushFilter('cs.id_sucursal = $IDX', scopeContext.targetSucursalId);
     else if (!scopeContext.isSuperAdmin) pushFilter('cs.id_sucursal = ANY($IDX::int[])', scopeContext.allowedSucursalIds);
+    if (isCajero && !scopeContext.isSuperAdmin) {
+      pushFilter(
+        `EXISTS (
+          SELECT 1
+          FROM public.cajas_usuarios_autorizados cua
+          WHERE cua.id_caja = cs.id_caja
+            AND cua.id_usuario = $IDX
+            AND COALESCE(cua.estado, true) = true
+            AND (COALESCE(cua.puede_responsable, false) = true OR COALESCE(cua.puede_auxiliar, false) = true)
+        )`,
+        scopeContext.idUsuario
+      );
+    }
 
     const idCaja = parseNullablePositiveInt(req.query.id_caja);
     const idResponsable = parseNullablePositiveInt(req.query.id_usuario_responsable);

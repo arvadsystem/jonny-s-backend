@@ -6,8 +6,10 @@ import jwt from 'jsonwebtoken';
 import pool from '../config/db-connection.js';
 import JWT_SECRET from '../config/jwt.js';
 import { checkPermission, requestHasAnyPermission } from '../middleware/checkPermission.js';
+import { supabase } from '../services/supabaseClient.js';
 import {
   ALLOWED_IMAGE_MIME_TYPES,
+  SUPABASE_ASSETS_BUCKET,
   UPLOADS_DIR,
   detectImageMimeTypeFromBuffer
 } from '../utils/uploads.js';
@@ -229,6 +231,7 @@ const USUARIOS_V2_FOTO_PERFIL_MAX_LENGTH = 500;
 const USUARIOS_V2_IMAGE_MAX_BYTES = 20 * 1024 * 1024;
 const USUARIOS_V2_UPLOADS_SUBDIR = 'usuarios';
 const USUARIOS_V2_UPLOADS_PREFIX = '/uploads/usuarios/';
+const USUARIOS_V2_SUPABASE_SUBDIR = 'usuarios';
 const USUARIOS_V2_BASE64_BODY_REGEX = /^[A-Za-z0-9+/]+={0,2}$/;
 const USUARIOS_V2_DATA_URL_PARSE_RE = /^data:(image\/(?:png|jpe?g|webp));base64,([A-Za-z0-9+/=]+)$/i;
 const USUARIOS_V2_PASSWORD_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789';
@@ -363,6 +366,20 @@ const v2EnsureUsuariosUploadsDir = async () => {
 };
 
 const v2BuildUsuariosStoredPath = (fileName) => `${USUARIOS_V2_UPLOADS_PREFIX}${fileName}`;
+const v2BuildUsuariosSupabaseStoragePath = (fileName) => `${USUARIOS_V2_SUPABASE_SUBDIR}/${fileName}`;
+const v2BuildUsuariosSupabaseDbPath = (storagePath) => `${SUPABASE_ASSETS_BUCKET}/${storagePath}`;
+const v2ResolvePublicImageUrl = (rawValue) => {
+  const normalized = v2NormalizeText(rawValue);
+  if (!normalized) return '';
+  if (/^https?:\/\//i.test(normalized)) return normalized;
+  if (normalized.startsWith(`${SUPABASE_ASSETS_BUCKET}/`)) {
+    const supabaseUrl = String(process.env.SUPABASE_URL || '').trim().replace(/\/+$/, '');
+    if (supabaseUrl) {
+      return `${supabaseUrl}/storage/v1/object/public/${normalized}`;
+    }
+  }
+  return normalized;
+};
 
 const v2StorePhotoDataUrlAsFile = async (dataUrl) => {
   const parsed = v2ParseDataImagePayload(dataUrl);
@@ -406,8 +423,104 @@ const v2StorePhotoDataUrlAsFile = async (dataUrl) => {
   };
 };
 
+const v2ParseUsuariosStoredStoragePath = (rawValue) => {
+  const input = v2NormalizeText(rawValue);
+  if (!input) return null;
+
+  let candidate = input;
+  if (/^https?:\/\//i.test(candidate)) {
+    try {
+      const parsed = new URL(candidate);
+      candidate = decodeURIComponent(String(parsed.pathname || '')).replace(/^\/+/, '');
+      const publicMarker = 'storage/v1/object/public/';
+      const markerIndex = candidate.indexOf(publicMarker);
+      if (markerIndex >= 0) {
+        candidate = candidate.slice(markerIndex + publicMarker.length);
+      }
+    } catch {
+      return null;
+    }
+  }
+
+  const parts = candidate.split('/').filter(Boolean);
+  if (parts.length < 2) return null;
+
+  return {
+    bucket: parts[0],
+    filePath: parts.slice(1).join('/')
+  };
+};
+
+const v2StorePhotoDataUrlInSupabase = async (dataUrl) => {
+  const parsed = v2ParseDataImagePayload(dataUrl);
+  if (!parsed.ok) return parsed;
+
+  const decoded = v2DecodeBase64Image(parsed.base64Body);
+  if (!decoded.ok) return decoded;
+
+  const detectedMimeType = detectImageMimeTypeFromBuffer(decoded.buffer);
+  const declaredMimeType = parsed.mimeType;
+  const effectiveMimeType = detectedMimeType || declaredMimeType;
+
+  if (!effectiveMimeType || !Object.prototype.hasOwnProperty.call(ALLOWED_IMAGE_MIME_TYPES, effectiveMimeType)) {
+    return {
+      ok: false,
+      status: 400,
+      message: 'Solo se permiten imagenes JPG, PNG o WEBP.',
+    };
+  }
+
+  if (declaredMimeType && detectedMimeType && declaredMimeType !== detectedMimeType) {
+    return {
+      ok: false,
+      status: 400,
+      message: 'El tipo de archivo de la imagen no coincide con su contenido.',
+    };
+  }
+
+  const extension = ALLOWED_IMAGE_MIME_TYPES[effectiveMimeType];
+  const fileName = `usuario-${Date.now()}-${crypto.randomUUID()}.${extension}`;
+  const storagePath = v2BuildUsuariosSupabaseStoragePath(fileName);
+  const storedPath = v2BuildUsuariosSupabaseDbPath(storagePath);
+
+  const { error: uploadError } = await supabase.storage
+    .from(SUPABASE_ASSETS_BUCKET)
+    .upload(storagePath, decoded.buffer, {
+      contentType: effectiveMimeType,
+      cacheControl: '3600',
+      upsert: false
+    });
+
+  if (uploadError) {
+    console.error('PUT /usuarios/v2/photo storage upload error:', uploadError);
+    return {
+      ok: false,
+      status: 500,
+      message: 'No se pudo guardar la imagen en Storage.',
+    };
+  }
+
+  return {
+    ok: true,
+    storedPath,
+    uploadedStoragePath: storagePath,
+  };
+};
+
 const v2TryDeleteUsuariosStoredFile = async (storedPath) => {
   const safe = v2NormalizeText(storedPath);
+  if (!safe) return;
+
+  const storagePath = v2ParseUsuariosStoredStoragePath(safe);
+  if (
+    storagePath &&
+    storagePath.bucket === SUPABASE_ASSETS_BUCKET &&
+    storagePath.filePath.startsWith(`${USUARIOS_V2_SUPABASE_SUBDIR}/`)
+  ) {
+    await supabase.storage.from(storagePath.bucket).remove([storagePath.filePath]).catch(() => null);
+    return;
+  }
+
   if (!safe.startsWith(USUARIOS_V2_UPLOADS_PREFIX)) return;
 
   const fileName = safe.slice(USUARIOS_V2_UPLOADS_PREFIX.length).trim();
@@ -608,7 +721,7 @@ const v2MapUsuarioRow = (row) => {
     id_usuario: row.id_usuario,
     nombre_usuario: row.nombre_usuario,
     estado: row.estado,
-    foto_perfil: row.foto_perfil ?? '',
+    foto_perfil: v2ResolvePublicImageUrl(row.foto_perfil),
     fecha_creacion: row.fecha_creacion ?? null,
     tipo_usuario: row.tipo_usuario ?? null,
     id_empleado: row.id_empleado ?? null,
@@ -1433,7 +1546,7 @@ router.put('/usuarios/v2/update/:id_usuario', checkPermission(USUARIOS_EDIT_PERM
 });
 
 router.put('/usuarios/v2/photo/:id_usuario', checkPermission(USUARIOS_IMAGE_EDIT_PERMISSIONS), async (req, res) => {
-  let writtenFileAbsolutePath = '';
+  let uploadedPhotoStoragePath = '';
   try {
     const idUsuario = v2ParsePositiveInt(req.params.id_usuario);
     if (!idUsuario) {
@@ -1464,12 +1577,12 @@ router.put('/usuarios/v2/photo/:id_usuario', checkPermission(USUARIOS_IMAGE_EDIT
     let valueToPersist = photoValidation.value;
 
     if (photoValidation.kind === 'data_url') {
-      const storedPhoto = await v2StorePhotoDataUrlAsFile(photoValidation.value);
+      const storedPhoto = await v2StorePhotoDataUrlInSupabase(photoValidation.value);
       if (!storedPhoto.ok) {
         return res.status(storedPhoto.status || 400).json({ error: true, message: storedPhoto.message });
       }
 
-      writtenFileAbsolutePath = storedPhoto.writtenFileAbsolutePath || '';
+      uploadedPhotoStoragePath = storedPhoto.uploadedStoragePath || '';
       valueToPersist = storedPhoto.storedPath;
     }
 
@@ -1479,8 +1592,8 @@ router.put('/usuarios/v2/photo/:id_usuario', checkPermission(USUARIOS_IMAGE_EDIT
     );
 
     if (!result.rowCount) {
-      if (writtenFileAbsolutePath) {
-        await fs.unlink(writtenFileAbsolutePath).catch(() => null);
+      if (uploadedPhotoStoragePath) {
+        await supabase.storage.from(SUPABASE_ASSETS_BUCKET).remove([uploadedPhotoStoragePath]).catch(() => null);
       }
       return res.status(404).json({ error: true, message: 'Usuario no encontrado' });
     }
@@ -1496,8 +1609,8 @@ router.put('/usuarios/v2/photo/:id_usuario', checkPermission(USUARIOS_IMAGE_EDIT
       usuario: updated,
     });
   } catch (err) {
-    if (writtenFileAbsolutePath) {
-      await fs.unlink(writtenFileAbsolutePath).catch(() => null);
+    if (uploadedPhotoStoragePath) {
+      await supabase.storage.from(SUPABASE_ASSETS_BUCKET).remove([uploadedPhotoStoragePath]).catch(() => null);
     }
     if (err?.code === '22001') {
       return res.status(413).json({ error: true, message: 'URL de imagen demasiado larga. Maximo 500 caracteres.' });
