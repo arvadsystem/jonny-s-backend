@@ -154,6 +154,7 @@ const getCatalogCodeById = async (client, catalogKey, id) => {
 const ALLOWED_NEW_ARQUEO_CODES = new Set(['CIERRE', 'EXTRAORDINARIO']);
 const SEGMENTED_ARQUEO_METHOD_CODES = ['EFECTIVO', 'TARJETA', 'TRANSFERENCIA'];
 const EGRESO_MOVEMENT_TYPE_CODES = ['EGRESO_MANUAL', 'EGRESO', 'RETIRO', 'SALIDA_CAJA'];
+const INGRESO_MOVEMENT_TYPE_CODES = ['INGRESO_MANUAL', 'INGRESO', 'ENTRADA_CAJA', 'ENTRADA', 'AJUSTE_POSITIVO'];
 const CLOSE_DIFFERENCE_THRESHOLD = Number.isFinite(Number(process.env.CAJAS_CIERRE_DIFERENCIA_UMBRAL))
   ? Number(process.env.CAJAS_CIERRE_DIFERENCIA_UMBRAL)
   : 0;
@@ -1495,6 +1496,53 @@ const resolveEgresoMovimientoTipo = async (client, requestedTipoId = null) => {
   return row;
 };
 
+const resolveIngresoMovimientoTipo = async (client, requestedTipoId = null) => {
+  const idTipoMovimientoCaja = parseNullablePositiveInt(requestedTipoId);
+  if (idTipoMovimientoCaja) {
+    const result = await client.query(
+      `
+        SELECT id_tipo_movimiento_caja, codigo, nombre, signo, COALESCE(estado, true) AS estado
+        FROM public.cat_cajas_movimientos_tipos
+        WHERE id_tipo_movimiento_caja = $1
+        LIMIT 1
+      `,
+      [idTipoMovimientoCaja]
+    );
+    const row = result.rows?.[0] || null;
+    const codigo = String(row?.codigo || '').trim().toUpperCase();
+    if (!row) {
+      throw createCajaError(400, 'VENTAS_CAJAS_INGRESO_TIPO_INVALIDO', 'El tipo de ingreso indicado no existe.');
+    }
+    if (!row.estado || Number(row.signo) !== 1 || codigo === 'APERTURA') {
+      throw createCajaError(400, 'VENTAS_CAJAS_INGRESO_TIPO_INVALIDO', 'El tipo de movimiento debe estar activo y ser de ingreso manual.');
+    }
+    return row;
+  }
+
+  const result = await client.query(
+    `
+      SELECT id_tipo_movimiento_caja, codigo, nombre, signo, COALESCE(estado, true) AS estado
+      FROM public.cat_cajas_movimientos_tipos
+      WHERE COALESCE(estado, true) = true
+        AND signo = 1
+        AND UPPER(TRIM(codigo)) <> 'APERTURA'
+        AND UPPER(TRIM(codigo)) = ANY($1::text[])
+      ORDER BY array_position($1::text[], UPPER(TRIM(codigo))), id_tipo_movimiento_caja ASC
+      LIMIT 1
+    `,
+    [INGRESO_MOVEMENT_TYPE_CODES]
+  );
+  const row = result.rows?.[0] || null;
+  if (!row) {
+    throw createCajaError(
+      409,
+      'VENTAS_CAJAS_INGRESO_TIPO_NO_CONFIGURADO',
+      'No hay un tipo de movimiento de ingreso activo configurado para caja.'
+    );
+  }
+  return row;
+};
+
 const insertCajaEgresoMovimiento = async ({
   client,
   session,
@@ -1542,6 +1590,56 @@ const insertCajaEgresoMovimiento = async ({
     id_caja: Number(session.id_caja),
     id_sucursal: Number(session.id_sucursal),
     monto: montoEgreso
+  };
+};
+
+const insertCajaIngresoMovimiento = async ({
+  client,
+  session,
+  idUsuarioEjecutor,
+  monto,
+  observacion,
+  referencia,
+  idTipoMovimientoCaja = null
+}) => {
+  const montoIngreso = parseNonNegativeAmount(monto);
+  const observacionIngreso = normalizeText(observacion, 500);
+  const referenciaIngreso = normalizeText(referencia, 120);
+  if (montoIngreso === null || montoIngreso <= 0) {
+    throw createCajaError(400, 'VENTAS_CAJAS_INGRESO_MONTO_INVALIDO', 'monto debe ser un numero mayor a 0.');
+  }
+  if (!observacionIngreso) {
+    throw createCajaError(400, 'VENTAS_CAJAS_INGRESO_OBSERVACION_REQUIRED', 'La observacion del ingreso es obligatoria.');
+  }
+
+  const tipoMovimiento = await resolveIngresoMovimientoTipo(client, idTipoMovimientoCaja);
+  const insertResult = await client.query(
+    `
+      INSERT INTO public.cajas_movimientos (
+        id_sesion_caja, id_caja, id_sucursal, id_tipo_movimiento_caja,
+        id_usuario_ejecutor, monto, observacion, referencia, fecha_movimiento, fecha_creacion
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW())
+      RETURNING id_movimiento_caja
+    `,
+    [
+      session.id_sesion_caja,
+      session.id_caja,
+      session.id_sucursal,
+      tipoMovimiento.id_tipo_movimiento_caja,
+      idUsuarioEjecutor,
+      montoIngreso,
+      observacionIngreso,
+      referenciaIngreso
+    ]
+  );
+
+  return {
+    id_movimiento_caja: Number(insertResult.rows?.[0]?.id_movimiento_caja || 0) || null,
+    id_sesion_caja: Number(session.id_sesion_caja),
+    id_caja: Number(session.id_caja),
+    id_sucursal: Number(session.id_sucursal),
+    monto: montoIngreso
   };
 };
 
@@ -1740,13 +1838,36 @@ const buildSessionDetailPayload = async (client, session) => {
       ),
       client.query(
         `
-          SELECT m.*, tipo.codigo AS tipo_codigo, tipo.nombre AS tipo_nombre
+          SELECT m.*,
+                 tipo.codigo AS tipo_codigo,
+                 tipo.nombre AS tipo_nombre,
+                 tipo.signo,
+                 tipo.afecta_efectivo,
+                 u.nombre_usuario AS usuario_ejecutor_alias,
+                 u.nombre_usuario,
+                 ${USER_DISPLAY_SQL} AS usuario_ejecutor_nombre,
+                 COALESCE(
+                   crp.codigo,
+                   CASE WHEN m.id_usuario_ejecutor = $2 THEN 'RESPONSABLE' ELSE 'EJECUTOR' END
+                 ) AS rol_participacion_codigo,
+                 COALESCE(
+                   crp.nombre,
+                   CASE WHEN m.id_usuario_ejecutor = $2 THEN 'Responsable' ELSE 'Ejecutor' END
+                 ) AS rol_participacion_nombre
           FROM public.cajas_movimientos m
           INNER JOIN public.cat_cajas_movimientos_tipos tipo ON tipo.id_tipo_movimiento_caja = m.id_tipo_movimiento_caja
+          LEFT JOIN public.usuarios u ON u.id_usuario = m.id_usuario_ejecutor
+          LEFT JOIN public.empleados e ON e.id_empleado = u.id_empleado
+          LEFT JOIN public.personas per ON per.id_persona = e.id_persona
+          LEFT JOIN public.cajas_sesiones_participantes csp
+            ON csp.id_sesion_caja = m.id_sesion_caja
+           AND csp.id_usuario = m.id_usuario_ejecutor
+          LEFT JOIN public.cat_cajas_roles_participacion crp
+            ON crp.id_rol_participacion_caja = csp.id_rol_participacion_caja
           WHERE m.id_sesion_caja = $1
           ORDER BY m.fecha_movimiento DESC, m.id_movimiento_caja DESC
         `,
-        [session.id_sesion_caja]
+        [session.id_sesion_caja, session.id_usuario_responsable]
       ),
       client.query(
         `
@@ -3265,6 +3386,42 @@ router.post('/ventas/cajas/mi-sesion/egresos', checkPermission(['VENTAS_CAJAS_MO
   }
 });
 
+router.post('/ventas/cajas/mi-sesion/ingresos', checkPermission(['VENTAS_CAJAS_MOVIMIENTO_MANUAL_REGISTRAR']), async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const scopeContext = await getScopeContext(req, client, null, true);
+    const userOpenSession = await fetchUsuarioSesionAbierta(client, scopeContext.idUsuario, { forUpdate: true });
+    if (!userOpenSession?.id_sesion_caja) {
+      throw createCajaError(404, 'VENTAS_CAJAS_SESION_ACTIVA_NO_ENCONTRADA', 'No tienes una sesion de caja abierta.');
+    }
+    const session = await ensureOpenSession(client, userOpenSession.id_sesion_caja, { forUpdate: true });
+    assertSucursalAllowed(scopeContext, session.id_sucursal);
+    await ensureSessionParticipant(client, session.id_sesion_caja, scopeContext.idUsuario, { req, scopeContext });
+
+    const movimiento = await insertCajaIngresoMovimiento({
+      client,
+      session,
+      idUsuarioEjecutor: scopeContext.idUsuario,
+      monto: req.body.monto,
+      observacion: req.body.observacion,
+      referencia: req.body.referencia,
+      idTipoMovimientoCaja: req.body.id_tipo_movimiento_caja
+    });
+
+    await client.query('COMMIT');
+    return res.status(201).json({
+      message: 'Ingreso de caja registrado correctamente.',
+      ...movimiento
+    });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    return sendInternalError(res, err, 'VENTAS_CAJAS_INGRESO_CREATE_ERROR', 'No se pudo registrar el ingreso de caja.');
+  } finally {
+    client.release();
+  }
+});
+
 router.post('/ventas/cajas/sesiones/:id/egresos', checkPermission(['VENTAS_CAJAS_MOVIMIENTO_MANUAL_REGISTRAR']), async (req, res) => {
   const client = await pool.connect();
   try {
@@ -3294,6 +3451,40 @@ router.post('/ventas/cajas/sesiones/:id/egresos', checkPermission(['VENTAS_CAJAS
   } catch (err) {
     await client.query('ROLLBACK');
     return sendInternalError(res, err, 'VENTAS_CAJAS_EGRESO_CREATE_ERROR', 'No se pudo registrar el egreso de caja.');
+  } finally {
+    client.release();
+  }
+});
+
+router.post('/ventas/cajas/sesiones/:id/ingresos', checkPermission(['VENTAS_CAJAS_MOVIMIENTO_MANUAL_REGISTRAR']), async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const idSesionCaja = parsePositiveInt(req.params.id);
+    if (!idSesionCaja) throw createCajaError(400, 'VENTAS_CAJAS_SESSION_ID_INVALID', 'El id de sesion es invalido.');
+    const scopeContext = await getScopeContext(req, client, null, true);
+    const session = await ensureOpenSession(client, idSesionCaja, { forUpdate: true });
+    assertSucursalAllowed(scopeContext, session.id_sucursal);
+    await ensureSessionParticipant(client, idSesionCaja, scopeContext.idUsuario, { allowAdminBypass: true, req, scopeContext });
+
+    const movimiento = await insertCajaIngresoMovimiento({
+      client,
+      session,
+      idUsuarioEjecutor: scopeContext.idUsuario,
+      monto: req.body.monto,
+      observacion: req.body.observacion,
+      referencia: req.body.referencia,
+      idTipoMovimientoCaja: req.body.id_tipo_movimiento_caja
+    });
+
+    await client.query('COMMIT');
+    return res.status(201).json({
+      message: 'Ingreso de caja registrado correctamente.',
+      ...movimiento
+    });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    return sendInternalError(res, err, 'VENTAS_CAJAS_INGRESO_CREATE_ERROR', 'No se pudo registrar el ingreso de caja.');
   } finally {
     client.release();
   }
