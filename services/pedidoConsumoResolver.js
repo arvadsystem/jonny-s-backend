@@ -24,6 +24,27 @@ const mapById = (rows, fieldName) => {
   return map;
 };
 
+const schemaColumnCache = new Map();
+const hasColumn = async (client, tableName, columnName) => {
+  const key = `${String(tableName || '').trim().toLowerCase()}.${String(columnName || '').trim().toLowerCase()}`;
+  if (schemaColumnCache.has(key)) return schemaColumnCache.get(key);
+
+  const rs = await client.query(
+    `
+      SELECT 1
+      FROM information_schema.columns
+      WHERE table_schema = 'public'
+        AND table_name = $1
+        AND column_name = $2
+      LIMIT 1
+    `,
+    [tableName, columnName]
+  );
+  const exists = rs.rowCount > 0;
+  schemaColumnCache.set(key, exists);
+  return exists;
+};
+
 const fetchRecetasByIds = async (client, ids) => {
   if (!ids.length) return [];
   const rs = await client.query(
@@ -55,12 +76,16 @@ const fetchCombosByIds = async (client, ids) => {
 
 const fetchComboRecipeComponents = async (client, comboIds) => {
   if (!comboIds.length) return [];
+  const hasDetalleComboCantidad = await hasColumn(client, 'detalle_combo', 'cantidad');
+  const comboQtyExpr = hasDetalleComboCantidad
+    ? 'GREATEST(COALESCE(dc.cantidad, 1), 1)::numeric'
+    : '1::numeric';
   const rs = await client.query(
     `
       SELECT
         dc.id_combo,
         dc.id_receta,
-        GREATEST(COALESCE(dc.cantidad, 1), 1)::numeric AS receta_factor
+        ${comboQtyExpr} AS receta_factor
       FROM public.detalle_combo dc
       WHERE dc.id_combo = ANY($1::int[])
         AND dc.id_receta IS NOT NULL
@@ -73,12 +98,16 @@ const fetchComboRecipeComponents = async (client, comboIds) => {
 
 const fetchRecipeInsumoComponents = async (client, recipeIds) => {
   if (!recipeIds.length) return [];
+  const hasDetalleRecetasCant = await hasColumn(client, 'detalle_recetas', 'cant');
+  const insumoFactorExpr = hasDetalleRecetasCant
+    ? 'COALESCE(dr.cant, 0)::numeric'
+    : '0::numeric';
   const rs = await client.query(
     `
       SELECT
         dr.id_receta,
         dr.id_insumo,
-        COALESCE(dr.cant, 0)::numeric AS insumo_factor
+        ${insumoFactorExpr} AS insumo_factor
       FROM public.detalle_recetas dr
       WHERE dr.id_receta = ANY($1::int[])
         AND dr.id_insumo IS NOT NULL
