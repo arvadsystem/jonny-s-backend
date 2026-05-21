@@ -1,4 +1,5 @@
 import express from 'express';
+import { performance } from 'node:perf_hooks';
 import pool from '../config/db-connection.js';
 import { checkPermission, requestHasAnyPermission } from '../middleware/checkPermission.js';
 import { resolveRequestUserSucursalScope } from '../utils/sucursalScope.js';
@@ -82,6 +83,120 @@ const PEDIDO_ESTADO_PAGO = Object.freeze({
   PAGADO_CONFIRMADO: 'PAGADO_CONFIRMADO',
   CANCELADO_TIMEOUT: 'CANCELADO_TIMEOUT'
 });
+const VENTAS_PERF_STAGE_NAMES = [
+  'auth_context_ms',
+  'auth_permission_ms',
+  'auth_scope_ms',
+  'auth_caja_ms',
+  'auth_sesion_caja_ms',
+  'auth_caja_sesion_combined_ms',
+  'auth_payload_context_ms',
+  'auth_payload_context_combined_ms',
+  'payload_build_ms',
+  'totals_ms',
+  'totals_catalogos_ms',
+  'totals_items_ms',
+  'totals_productos_ms',
+  'totals_recetas_ms',
+  'totals_combos_ms',
+  'totals_descuentos_ms',
+  'totals_impuestos_ms',
+  'totals_build_ms',
+  'pedido_ms',
+  'detalle_pedido_ms',
+  'detalle_pedido_descuentos_ms',
+  'detalle_pedido_lookup_ms',
+  'detalle_pedido_reuse_hydrated_ms',
+  'detalle_pedido_insert_ms',
+  'factura_ms',
+  'factura_correlativo_ms',
+  'factura_correlativo_config_ms',
+  'factura_correlativo_rango_ms',
+  'factura_correlativo_numero_ms',
+  'factura_insert_ms',
+  'factura_snapshot_ms',
+  'factura_snapshot_config_ms',
+  'factura_snapshot_sucursal_ms',
+  'factura_snapshot_build_ms',
+  'detalle_factura_ms',
+  'detalle_factura_descuentos_ms',
+  'detalle_factura_lookup_ms',
+  'detalle_factura_insert_ms',
+  'detalle_factura_origen_ms',
+  'cobro_ms',
+  'inventario_ms',
+  'fidelizacion_ms',
+  'ticket_response_build_ms',
+  'pre_rpc_total_ms',
+  'rpc_payload_build_ms',
+  'rpc_call_ms',
+  'post_rpc_total_ms',
+  'post_rpc_fidelizacion_ms',
+  'post_rpc_response_ms',
+  'node_before_rpc_ms',
+  'node_after_rpc_ms',
+  'rpc_total_ms',
+  'commit_ms'
+];
+
+const isVentasPerfEnabled = () =>
+  String(process.env.VENTAS_PERF_LOGS || '').trim().toLowerCase() === 'true';
+
+function isVentasRpcTransactionEnabled() {
+  return String(process.env.VENTAS_USE_RPC_TRANSACTION || '')
+    .trim()
+    .toLowerCase() === 'true';
+}
+
+const buildBatchPlaceholders = (rowCount, columnCount, castsByColumn = {}) =>
+  Array.from({ length: rowCount }, (_, rowIndex) => {
+    const placeholders = Array.from({ length: columnCount }, (_, columnIndex) => {
+      const paramIndex = rowIndex * columnCount + columnIndex + 1;
+      return `$${paramIndex}${castsByColumn[columnIndex] || ''}`;
+    });
+    return `(${placeholders.join(', ')})`;
+  }).join(', ');
+const measureVentasPerf = async (perf, name, task) => {
+  const startedAt = perf?.now?.() || 0;
+  try {
+    return await task();
+  } finally {
+    perf?.add?.(name, startedAt);
+  }
+};
+const createVentasPerfTracker = () => {
+  const enabled = isVentasPerfEnabled();
+  const startedAt = enabled ? performance.now() : 0;
+  const measures = Object.create(null);
+
+  return {
+    enabled,
+    now() {
+      return enabled ? performance.now() : 0;
+    },
+    add(name, startedAtMs) {
+      if (!enabled || !startedAtMs) return;
+      const elapsed = Math.max(0, Math.round(performance.now() - startedAtMs));
+      measures[name] = (measures[name] || 0) + elapsed;
+    },
+    summary(extra = {}) {
+      const stages = VENTAS_PERF_STAGE_NAMES.reduce((acc, name) => {
+        acc[name] = measures[name] || 0;
+        return acc;
+      }, {});
+
+      return {
+        ...extra,
+        total_ms: enabled ? Math.max(0, Math.round(performance.now() - startedAt)) : 0,
+        ...stages
+      };
+    },
+    log(extra = {}) {
+      if (!enabled) return;
+      console.info('[ventas:perf]', this.summary(extra));
+    }
+  };
+};
 const PEDIDO_PENDIENTE_ESTADO_PAGO = 'PENDIENTE_PAGO';
 const PEDIDO_PAGADO_CONFIRMADO_ESTADO_PAGO = 'PAGADO_CONFIRMADO';
 const PEDIDO_PENDIENTE_ESTADO_DELIVERY = 'PENDIENTE';
@@ -776,6 +891,457 @@ const buildKitchenSaleDetailItems = (rows) =>
     observacion: normalizeObservation(row.observacion)
   }));
 
+const fetchCreateVentaDetailContext = async (client, { idCliente, idUsuario, idCaja }) => {
+  const result = await client.query(
+    `
+      WITH input AS (
+        SELECT $1::int AS id_cliente, $2::int AS id_usuario, $3::int AS id_caja
+      )
+      SELECT
+        COALESCE(
+          NULLIF(trim(concat_ws(' ', per.nombre, per.apellido)), ''),
+          emp.nombre_empresa,
+          'Consumidor final'
+        ) AS cliente_nombre,
+        COALESCE(NULLIF(trim(per.rtn), ''), NULLIF(trim(emp.rtn), '')) AS cliente_rtn,
+        u.nombre_usuario,
+        cj.nombre_caja,
+        cj.codigo_caja
+      FROM input i
+      LEFT JOIN clientes c ON c.id_cliente = i.id_cliente
+      LEFT JOIN personas per ON per.id_persona = c.id_persona
+      LEFT JOIN empresas emp ON emp.id_empresa = c.id_empresa
+      LEFT JOIN usuarios u ON u.id_usuario = i.id_usuario
+      LEFT JOIN cajas cj ON cj.id_caja = i.id_caja
+    `,
+    [idCliente || null, idUsuario || null, idCaja || null]
+  );
+
+  const row = result.rows?.[0] || {};
+  return {
+    cliente_nombre: row.cliente_nombre || 'Consumidor final',
+    cliente_rtn: row.cliente_rtn || null,
+    nombre_usuario: row.nombre_usuario || null,
+    nombre_caja: row.nombre_caja || null,
+    codigo_caja: row.codigo_caja || null
+  };
+};
+
+const buildCreatedVentaDetailItems = ({ detalleFacturaRows, detalleFacturaRowsInserted }) =>
+  buildKitchenSaleDetailItems(
+    (Array.isArray(detalleFacturaRows) ? detalleFacturaRows : []).map((entry, index) => {
+      const line = entry.line || {};
+      const inserted = detalleFacturaRowsInserted?.[index] || {};
+      const origenSnapshot = inserted.origen_snapshot || entry.origenSnapshot || {};
+      const tipoItem = inserted.tipo_item || entry.tipoItem || normalizeTipoItem(line.kind);
+
+      return {
+        id_detalle: Number(inserted.id_detalle_factura || 0) || null,
+        id_detalle_factura: Number(inserted.id_detalle_factura || 0) || null,
+        id_detalle_pedido: Number(inserted.id_detalle_pedido || entry.pedidoRef?.id_detalle_pedido || 0) || null,
+        tipo_item: tipoItem,
+        id_producto: Number(inserted.id_producto || line.id_producto || 0) || null,
+        id_combo: Number(inserted.id_combo || line.id_combo || 0) || null,
+        id_receta: Number(inserted.id_receta || line.id_receta || 0) || null,
+        nombre_item: origenSnapshot.nombre_item || line.nombre_item || 'Item de cocina',
+        nombre_producto: origenSnapshot.nombre_item || line.nombre_item || 'Item de cocina',
+        cantidad: Number(line.cantidad || 0),
+        precio_unitario: roundMoney(line.precio_unitario),
+        sub_total: roundMoney(line.sub_total),
+        subtotal_linea: roundMoney(line.sub_total),
+        total_linea: roundMoney(line.total_linea),
+        descuento: roundMoney(line.descuento),
+        descuento_linea: roundMoney(line.descuento),
+        isv_15_linea: null,
+        isv_18_linea: null,
+        exento_linea: null,
+        exonerado_linea: null,
+        observacion: line.observacion || null,
+        origen_snapshot: origenSnapshot
+      };
+    })
+  );
+
+const buildCreateVentaDetailResponse = ({
+  idFactura,
+  idPedido,
+  venta,
+  correlativoVenta,
+  fechaHoraPedido,
+  fechaHoraFacturacion,
+  facturacion,
+  context,
+  items,
+  fidelizacion
+}) => {
+  const numeroVenta = correlativoVenta.codigo;
+  const subtotal = roundMoney(venta.subtotal);
+  const descuento = roundMoney(venta.descuento);
+  const isv = roundMoney(venta.isv);
+  const total = roundMoney(venta.total);
+  const totalItems = (Array.isArray(items) ? items : []).reduce(
+    (acc, item) => acc + (Number(item?.cantidad ?? 0) || 0),
+    0
+  );
+  const facturacionNormalizada = mergeVentaWithFacturacion(
+    {
+      id_sucursal: venta.id_sucursal,
+      facturacion_snapshot: facturacion
+    },
+    facturacion
+  );
+
+  return {
+    message: 'Venta creada exitosamente.',
+    id_factura: idFactura,
+    id_pedido: idPedido,
+    numero_venta: numeroVenta,
+    codigo_venta: numeroVenta,
+    fecha: fechaHoraFacturacion || fechaHoraPedido || null,
+    fecha_operacion: correlativoVenta.fecha_operacion,
+    fecha_hora_pedido: fechaHoraPedido || fechaHoraFacturacion || null,
+    fecha_hora_facturacion: fechaHoraFacturacion || fechaHoraPedido || null,
+    id_sucursal: venta.id_sucursal,
+    nombre_sucursal: context?.nombre_sucursal || null,
+    id_cliente: venta.id_cliente,
+    cliente_nombre: context?.cliente_nombre || 'Consumidor final',
+    cliente_rtn: context?.cliente_rtn || null,
+    id_usuario: venta.id_usuario,
+    nombre_usuario: context?.nombre_usuario || null,
+    id_caja: venta.id_caja,
+    nombre_caja: context?.nombre_caja || null,
+    codigo_caja: context?.codigo_caja || null,
+    id_sesion_caja: venta.id_sesion_caja,
+    metodo_pago: venta.metodo_pago,
+    metodo_pago_codigo: venta.metodo_pago_codigo,
+    codigo_transaccion: venta.referencia_pago || null,
+    referencia: venta.referencia_pago || null,
+    efectivo_entregado: venta.efectivo_entregado,
+    cambio: venta.cambio,
+    sub_total: subtotal,
+    subtotal,
+    descuento_total: descuento,
+    descuento,
+    isv,
+    impuesto: isv,
+    isv_15: isv,
+    isv_18: 0,
+    total_isv: isv,
+    gravado_15: subtotal,
+    gravado_18: 0,
+    exento: 0,
+    exonerado: null,
+    total,
+    total_items: totalItems,
+    estado_pedido: 'EN_COCINA',
+    venta_directa: idPedido === null,
+    ticket_ready: true,
+    cliente: {
+      id_cliente: venta.id_cliente,
+      nombre: context?.cliente_nombre || 'Consumidor final',
+      rtn: context?.cliente_rtn || null
+    },
+    caja: {
+      id_caja: venta.id_caja,
+      nombre_caja: context?.nombre_caja || null,
+      codigo_caja: context?.codigo_caja || null,
+      id_sesion_caja: venta.id_sesion_caja
+    },
+    sucursal: {
+      id_sucursal: venta.id_sucursal,
+      nombre_sucursal: context?.nombre_sucursal || null
+    },
+    pedido: {
+      id_pedido: idPedido,
+      descripcion_pedido: venta.descripcion_pedido,
+      descripcion_envio: venta.descripcion_envio,
+      estado_pedido: 'EN_COCINA'
+    },
+    pagos: [
+      {
+        metodo_pago: venta.metodo_pago,
+        metodo_pago_codigo: venta.metodo_pago_codigo,
+        monto: total,
+        referencia: venta.referencia_pago || null
+      }
+    ],
+    items,
+    ...facturacionNormalizada,
+    fidelizacion: fidelizacion?.created
+      ? {
+          puntos_acumulados: fidelizacion.points,
+          saldo_nuevo: fidelizacion.saldoNuevo
+        }
+      : null
+  };
+};
+
+const buildVentaRpcItems = (venta) =>
+  (Array.isArray(venta?.all_lines) ? venta.all_lines : []).map((line, index) => {
+    const tipoItem = normalizeTipoItem(line.kind);
+    const configuracionMenu = buildComplementLineConfig(line);
+    const complementSnapshot = buildComplementSnapshot(line);
+    const origenSnapshot = {
+      tipo_item: tipoItem,
+      nombre_item: line.nombre_item || null,
+      id_producto: line.id_producto || null,
+      id_receta: line.id_receta || null,
+      id_combo: line.id_combo || null,
+      cantidad: Number(line.cantidad || 0),
+      precio_unitario: roundMoney(line.precio_unitario),
+      total_detalle: roundMoney(line.total_linea),
+      descuento: roundMoney(line.descuento),
+      observacion: line.observacion || null,
+      componentes: complementSnapshot
+    };
+
+    return {
+      item_index: index,
+      tipo_item: tipoItem,
+      id_producto: line.id_producto || null,
+      id_receta: line.id_receta || null,
+      id_combo: line.id_combo || null,
+      id_descuento_catalogo: line.id_descuento_catalogo || null,
+      cantidad: Number(line.cantidad || 0),
+      precio_unitario: roundMoney(line.precio_unitario),
+      sub_total: roundMoney(line.sub_total),
+      total_linea: roundMoney(line.total_linea),
+      descuento: roundMoney(line.descuento),
+      observacion: line.observacion || null,
+      configuracion_menu: configuracionMenu,
+      origen_snapshot: origenSnapshot,
+      nombre_item: line.nombre_item || null
+    };
+  });
+
+const buildVentaRpcPayload = ({ venta, correlativoVenta, facturacionVenta, facturacionNormalizada }) => ({
+  pedido: {
+    descripcion_pedido: venta.descripcion_pedido,
+    descripcion_envio: venta.descripcion_envio,
+    sub_total: venta.pedido_subtotal,
+    isv: venta.pedido_isv,
+    total: venta.pedido_total,
+    id_estado_pedido: venta.id_estado_pedido,
+    id_sucursal: venta.id_sucursal,
+    id_cliente: venta.id_cliente,
+    id_usuario: venta.id_usuario
+  },
+  factura: {
+    id_caja: venta.id_caja,
+    id_sucursal: venta.id_sucursal,
+    id_usuario: venta.id_usuario,
+    id_cliente: venta.id_cliente,
+    codigo_venta: correlativoVenta.codigo,
+    fecha_operacion: correlativoVenta.fecha_operacion,
+    efectivo_entregado: venta.efectivo_entregado,
+    cambio: venta.cambio,
+    isv_15: venta.isv,
+    id_sesion_caja: venta.id_sesion_caja
+  },
+  cobro: {
+    id_metodo_pago: venta.id_metodo_pago,
+    monto: venta.total,
+    referencia: venta.referencia_pago || null
+  },
+  venta: {
+    id_sucursal: venta.id_sucursal,
+    id_cliente: venta.id_cliente,
+    id_usuario: venta.id_usuario,
+    id_caja: venta.id_caja,
+    id_sesion_caja: venta.id_sesion_caja,
+    metodo_pago: venta.metodo_pago,
+    metodo_pago_codigo: venta.metodo_pago_codigo,
+    referencia_pago: venta.referencia_pago || null,
+    efectivo_entregado: venta.efectivo_entregado,
+    cambio: venta.cambio,
+    descripcion_pedido: venta.descripcion_pedido,
+    descripcion_envio: venta.descripcion_envio,
+    subtotal: venta.subtotal,
+    descuento: venta.descuento,
+    isv: venta.isv,
+    total: venta.total
+  },
+  correlativo: {
+    codigo: correlativoVenta.codigo,
+    fecha_operacion: correlativoVenta.fecha_operacion
+  },
+  snapshot_fiscal: {
+    id_config_facturacion: facturacionVenta.idConfig || null,
+    facturacion_snapshot: facturacionVenta.snapshot || {}
+  },
+  ticket_facturacion: facturacionNormalizada || {},
+  items: buildVentaRpcItems(venta)
+});
+
+const VENTAS_FIDELIZACION_ADVISORY_LOCK_CLASS = 724201;
+
+const logVentasFidelizacionAsyncPerf = (payload) => {
+  if (!isVentasPerfEnabled()) return;
+  console.info('[ventas:perf:fidelizacion_async]', payload);
+};
+
+const registerVentaFidelizacionAfterCommit = async ({
+  idFactura,
+  idPedido = null,
+  idCliente = null,
+  idSucursal = null,
+  idUsuarioEjecutor = null,
+  montoFactura = 0
+}) => {
+  const facturaId = parseOptionalPositiveInt(idFactura);
+  const startedAt = performance.now();
+
+  if (!facturaId || !parseOptionalPositiveInt(idCliente) || !parseOptionalPositiveInt(idSucursal)) {
+    logVentasFidelizacionAsyncPerf({
+      id_factura: facturaId || null,
+      post_rpc_fidelizacion_ms: Math.max(0, Math.round(performance.now() - startedAt)),
+      created: false,
+      reason: 'MISSING_REQUIRED_DATA'
+    });
+    return;
+  }
+
+  let client = null;
+  let transactionStarted = false;
+
+  try {
+    client = await pool.connect();
+    await client.query('BEGIN');
+    transactionStarted = true;
+    await client.query(
+      'SELECT pg_advisory_xact_lock($1::int, $2::int)',
+      [VENTAS_FIDELIZACION_ADVISORY_LOCK_CLASS, facturaId]
+    );
+
+    const result = await registerFacturaLoyaltyAccumulation({
+      client,
+      idFactura: facturaId,
+      idPedido,
+      idCliente,
+      idSucursal,
+      idUsuarioEjecutor,
+      montoFactura
+    });
+
+    await client.query('COMMIT');
+    transactionStarted = false;
+
+    logVentasFidelizacionAsyncPerf({
+      id_factura: facturaId,
+      post_rpc_fidelizacion_ms: Math.max(0, Math.round(performance.now() - startedAt)),
+      created: Boolean(result?.created),
+      reason: result?.reason || null
+    });
+  } catch (err) {
+    if (transactionStarted) {
+      try {
+        await client.query('ROLLBACK');
+      } catch (_) {
+        // La venta ya fue confirmada; este rollback solo protege el trabajo diferido.
+      }
+    }
+    console.error('[ventas:fidelizacion_async] error:', {
+      id_factura: facturaId,
+      code: err?.code || err?.name || 'FIDELIZACION_ASYNC_ERROR'
+    });
+  } finally {
+    if (client) client.release();
+  }
+};
+const createVentaWithRpcTransaction = async ({ client, venta, perf, requestStartedAt = 0 }) => {
+  const rpcTotalStart = perf?.now?.() || 0;
+
+  const correlativoStart = perf?.now?.() || 0;
+  const correlativoVenta = await generarCodigoDocumento({
+    client,
+    idSucursal: venta.id_sucursal,
+    tipoDocumento: 'VENTA',
+    perf
+  });
+  perf?.add?.('factura_correlativo_ms', correlativoStart);
+  perf?.add?.('factura_ms', correlativoStart);
+
+  const facturaSnapshotStart = perf?.now?.() || 0;
+  const facturacionVenta = await obtenerConfigFacturacionParaVenta(client, venta.id_sucursal, {
+    perf
+  });
+  const facturacionNormalizada = await normalizarDatosTicketDesdeSnapshot({
+    client,
+    factura: {
+      id_sucursal: venta.id_sucursal,
+      facturacion_snapshot: facturacionVenta.snapshot
+    }
+  });
+  perf?.add?.('factura_snapshot_ms', facturaSnapshotStart);
+  perf?.add?.('factura_ms', facturaSnapshotStart);
+
+  const rpcPayloadBuildStart = perf?.now?.() || 0;
+  const rpcPayload = buildVentaRpcPayload({
+    venta,
+    correlativoVenta,
+    facturacionVenta,
+    facturacionNormalizada
+  });
+  const rpcActor = {
+    id_usuario: venta.id_usuario,
+    id_sucursal: venta.id_sucursal,
+    id_caja: venta.id_caja,
+    id_sesion_caja: venta.id_sesion_caja
+  };
+  perf?.add?.('rpc_payload_build_ms', rpcPayloadBuildStart);
+  perf?.add?.('pre_rpc_total_ms', rpcTotalStart);
+  if (requestStartedAt) {
+    perf?.add?.('node_before_rpc_ms', requestStartedAt);
+  }
+
+  const rpcCallStart = perf?.now?.() || 0;
+  const rpcResult = await client.query(
+    'SELECT public.registrar_venta_pos_v1($1::jsonb, $2::jsonb) AS response',
+    [JSON.stringify(rpcPayload), JSON.stringify(rpcActor)]
+  );
+  perf?.add?.('rpc_call_ms', rpcCallStart);
+  const afterRpcStart = perf?.now?.() || 0;
+
+  const postRpcResponseStart = perf?.now?.() || 0;
+  const response = rpcResult.rows?.[0]?.response;
+  if (!isPlainObject(response) || !response.ticket_ready) {
+    throw {
+      httpStatus: 500,
+      code: 'VENTAS_RPC_RESPONSE_INVALID',
+      publicMessage: 'La venta fue procesada por RPC, pero la respuesta del ticket no es valida.'
+    };
+  }
+
+  const idFactura = parseOptionalPositiveInt(response.id_factura);
+  if (!idFactura) {
+    throw {
+      httpStatus: 500,
+      code: 'VENTAS_RPC_FACTURA_INVALIDA',
+      publicMessage: 'La venta fue procesada por RPC, pero no devolvio factura valida.'
+    };
+  }
+
+  const responsePayload = {
+    ...response,
+    fidelizacion: null
+  };
+  perf?.add?.('post_rpc_response_ms', postRpcResponseStart);
+  perf?.add?.('post_rpc_total_ms', afterRpcStart);
+  perf?.add?.('rpc_total_ms', rpcTotalStart);
+
+  return {
+    response: responsePayload,
+    afterRpcStart,
+    fidelizacionJob: {
+      idFactura,
+      idPedido: parseOptionalPositiveInt(response.id_pedido),
+      idCliente: venta.id_cliente,
+      idSucursal: venta.id_sucursal,
+      idUsuarioEjecutor: venta.id_usuario,
+      montoFactura: venta.total
+    }
+  };
+};
 const normalizeVentaItems = (items) => {
   if (!Array.isArray(items) || items.length === 0) {
     return { ok: false, message: 'Debe enviar al menos un item en la venta.' };
@@ -904,6 +1470,94 @@ const fetchRecetaMap = async (client, ids) => {
   return new Map(result.rows.map((row) => [Number(row.id_receta), row]));
 };
 
+const fetchVentaCatalogMaps = async (client, { productoIds = [], comboIds = [], recetaIds = [], lockProductos = true } = {}) => {
+  const uniqueProductoIds = [...new Set((Array.isArray(productoIds) ? productoIds : []).filter(Boolean))];
+  const uniqueComboIds = [...new Set((Array.isArray(comboIds) ? comboIds : []).filter(Boolean))];
+  const uniqueRecetaIds = [...new Set((Array.isArray(recetaIds) ? recetaIds : []).filter(Boolean))];
+
+  if (uniqueProductoIds.length === 0 && uniqueComboIds.length === 0 && uniqueRecetaIds.length === 0) {
+    return {
+      productoMap: new Map(),
+      comboMap: new Map(),
+      recetaMap: new Map()
+    };
+  }
+
+  const ctes = [];
+  const selects = [];
+  const params = [];
+  const addArrayParam = (values) => {
+    params.push(values);
+    return `$${params.length}::int[]`;
+  };
+
+  if (uniqueProductoIds.length > 0) {
+    const productosParam = addArrayParam(uniqueProductoIds);
+    const forUpdateClause = lockProductos ? 'FOR UPDATE' : '';
+    ctes.push(`
+      productos_rows AS (
+        SELECT id_producto, nombre_producto, precio, estado, cantidad, id_almacen
+        FROM productos
+        WHERE id_producto = ANY(${productosParam})
+        ${forUpdateClause}
+      )
+    `);
+    selects.push(`COALESCE((SELECT jsonb_agg(to_jsonb(pr)) FROM productos_rows pr), '[]'::jsonb) AS productos`);
+  } else {
+    selects.push(`'[]'::jsonb AS productos`);
+  }
+
+  if (uniqueComboIds.length > 0) {
+    const combosParam = addArrayParam(uniqueComboIds);
+    ctes.push(`
+      combos_rows AS (
+        SELECT id_combo, descripcion, precio, estado
+        FROM combos
+        WHERE id_combo = ANY(${combosParam})
+      )
+    `);
+    selects.push(`COALESCE((SELECT jsonb_agg(to_jsonb(cr)) FROM combos_rows cr), '[]'::jsonb) AS combos`);
+  } else {
+    selects.push(`'[]'::jsonb AS combos`);
+  }
+
+  if (uniqueRecetaIds.length > 0) {
+    const recetasParam = addArrayParam(uniqueRecetaIds);
+    ctes.push(`
+      recetas_rows AS (
+        SELECT
+          r.id_receta,
+          r.nombre_receta,
+          r.descripcion,
+          r.estado,
+          r.precio
+        FROM recetas r
+        WHERE r.id_receta = ANY(${recetasParam})
+      )
+    `);
+    selects.push(`COALESCE((SELECT jsonb_agg(to_jsonb(rr)) FROM recetas_rows rr), '[]'::jsonb) AS recetas`);
+  } else {
+    selects.push(`'[]'::jsonb AS recetas`);
+  }
+
+  const result = await client.query(
+    `
+      WITH ${ctes.join(',')}
+      SELECT ${selects.join(', ')}
+    `,
+    params
+  );
+  const row = result.rows?.[0] || {};
+  const productos = Array.isArray(row.productos) ? row.productos : [];
+  const combos = Array.isArray(row.combos) ? row.combos : [];
+  const recetas = Array.isArray(row.recetas) ? row.recetas : [];
+
+  return {
+    productoMap: new Map(productos.map((item) => [Number(item.id_producto), item])),
+    comboMap: new Map(combos.map((item) => [Number(item.id_combo), item])),
+    recetaMap: new Map(recetas.map((item) => [Number(item.id_receta), item]))
+  };
+};
 const fetchClienteInfo = async (client, idCliente) => {
   if (!idCliente) return null;
 
@@ -979,6 +1633,40 @@ const resolveDiscountTypeKey = (value) => {
   return null;
 };
 
+const fetchDiscountCatalogMapByIds = async (client, ids) => {
+  const uniqueIds = [...new Set((Array.isArray(ids) ? ids : [])
+    .map((id) => parseOptionalPositiveInt(id))
+    .filter(Boolean))];
+  if (uniqueIds.length === 0) return new Map();
+
+  const result = await client.query(
+    `
+      SELECT
+        dc.id_descuento_catalogo,
+        dc.nombre_descuento,
+        dc.valor_descuento,
+        dc.estado,
+        dc.alcance,
+        dc.id_producto,
+        dc.id_receta,
+        dc.id_combo,
+        dc.id_sucursal,
+        dc.fecha_inicio,
+        dc.fecha_fin,
+        dc.id_tipo_descuento,
+        td.nombre_tipo_descuento,
+        td.estado AS tipo_estado
+      FROM descuentos_catalogos dc
+      INNER JOIN tipo_descuentos td
+        ON td.id_tipo_descuento = dc.id_tipo_descuento
+      WHERE dc.id_descuento_catalogo = ANY($1::int[])
+      ORDER BY dc.id_descuento_catalogo ASC
+    `,
+    [uniqueIds]
+  );
+
+  return new Map(result.rows.map((row) => [Number(row.id_descuento_catalogo), row]));
+};
 const computeDiscountValue = ({ subtotalBruto, valorDescuento, tipoDescuentoKey }) => {
   const safeSubtotal = roundMoney(Math.max(0, subtotalBruto));
   const safeValor = roundMoney(Math.max(0, Number(valorDescuento || 0)));
@@ -1115,6 +1803,92 @@ const resolveMetodoPago = async (client, metodoPagoRaw) => {
   return result.rows[0] || null;
 };
 
+const resolveVentaContextForCreate = async (client, req, payload = {}) => {
+  const idSucursalTarget = parseOptionalPositiveInt(payload.idSucursalTarget);
+  const idEstadoPedidoRequested = parseOptionalPositiveInt(payload.idEstadoPedidoRequested);
+  const idCliente = parseOptionalPositiveInt(payload.idCliente);
+  const metodoPagoInput = String(payload.metodoPagoInput || '').trim();
+  const estadoEnCocinaAliases = [...(ESTADO_PEDIDO_CODES.EN_COCINA || new Set())];
+
+  const result = await client.query(
+    `
+      WITH input AS (
+        SELECT
+          $1::int AS id_sucursal_target,
+          $2::int AS id_estado_pedido_requested,
+          $3::int AS id_cliente,
+          $4::text AS metodo_pago_input,
+          $5::text[] AS estado_en_cocina_aliases
+      ),
+      sucursal AS (
+        SELECT s.id_sucursal
+        FROM sucursales s
+        INNER JOIN input i ON i.id_sucursal_target = s.id_sucursal
+        WHERE COALESCE(s.estado, true) = true
+        LIMIT 1
+      ),
+      estado_solicitado AS (
+        SELECT ep.id_estado_pedido
+        FROM estados_pedido ep
+        INNER JOIN input i ON i.id_estado_pedido_requested = ep.id_estado_pedido
+        WHERE i.id_estado_pedido_requested IS NOT NULL
+        LIMIT 1
+      ),
+      estado_cocina AS (
+        SELECT ep.id_estado_pedido
+        FROM estados_pedido ep
+        CROSS JOIN input i
+        WHERE LOWER(REGEXP_REPLACE(TRIM(COALESCE(ep.descripcion, '')), '\\s+', '_', 'g')) = ANY(i.estado_en_cocina_aliases)
+        ORDER BY ep.id_estado_pedido
+        LIMIT 1
+      ),
+      cliente AS (
+        SELECT c.id_cliente
+        FROM clientes c
+        INNER JOIN input i ON i.id_cliente = c.id_cliente
+        WHERE i.id_cliente IS NOT NULL
+        LIMIT 1
+      ),
+      metodo AS (
+        SELECT
+          mp.id_metodo_pago,
+          mp.codigo,
+          mp.nombre,
+          COALESCE(mp.afecta_efectivo, false) AS afecta_efectivo
+        FROM cat_metodos_pago mp
+        CROSS JOIN input i
+        WHERE COALESCE(mp.estado, true) = true
+          AND (
+            UPPER(TRIM(mp.codigo)) = UPPER(i.metodo_pago_input)
+            OR LOWER(TRIM(mp.nombre)) = LOWER(i.metodo_pago_input)
+          )
+        LIMIT 1
+      )
+      SELECT
+        (SELECT id_sucursal FROM sucursal) AS id_sucursal,
+        (SELECT id_estado_pedido FROM estado_solicitado) AS id_estado_pedido_solicitado,
+        (SELECT id_estado_pedido FROM estado_cocina) AS id_estado_pedido_cocina,
+        (SELECT id_cliente FROM cliente) AS id_cliente,
+        (SELECT row_to_json(m) FROM metodo m) AS metodo_pago
+    `,
+    [
+      idSucursalTarget,
+      idEstadoPedidoRequested,
+      idCliente,
+      metodoPagoInput,
+      estadoEnCocinaAliases
+    ]
+  );
+
+  const row = result.rows?.[0] || {};
+  return {
+    idSucursal: parseOptionalPositiveInt(row.id_sucursal),
+    requestedEstadoPedido: parseOptionalPositiveInt(row.id_estado_pedido_solicitado),
+    estadoPedidoEnCocina: parseOptionalPositiveInt(row.id_estado_pedido_cocina),
+    cliente: idCliente && row.id_cliente ? { id_cliente: parseOptionalPositiveInt(row.id_cliente) } : null,
+    metodoPago: row.metodo_pago || null
+  };
+};
 const resolveCajaSession = async ({
   client,
   idSucursal,
@@ -1126,21 +1900,8 @@ const resolveCajaSession = async ({
     return { ok: false, reason: 'MISSING_CONTEXT' };
   }
 
-  const estadoResult = await client.query(
-    `
-      SELECT id_estado_sesion_caja
-      FROM cat_cajas_sesiones_estados
-      WHERE UPPER(TRIM(codigo)) = 'ABIERTA'
-      LIMIT 1
-    `
-  );
-  const idEstadoAbierta = Number(estadoResult.rows?.[0]?.id_estado_sesion_caja || 0) || null;
-  if (!idEstadoAbierta) {
-    return { ok: false, reason: 'OPEN_STATE_NOT_FOUND' };
-  }
-
   const requestedSessionId = parseOptionalPositiveInt(idSesionCaja);
-  const params = [idSucursal, idUsuario, idEstadoAbierta];
+  const params = [idSucursal, idUsuario];
   let requestedFilter = '';
 
   if (requestedSessionId) {
@@ -1151,61 +1912,105 @@ const resolveCajaSession = async ({
   const result = await client.query(
     isSuperAdmin
       ? `
+        WITH estado_abierta AS (
+          SELECT id_estado_sesion_caja
+          FROM cat_cajas_sesiones_estados
+          WHERE UPPER(TRIM(codigo)) = 'ABIERTA'
+          LIMIT 1
+        ),
+        session_match AS (
+          SELECT
+            cs.id_caja,
+            cs.id_sesion_caja,
+            cs.id_sucursal,
+            csp.id_participacion_caja,
+            crp.codigo AS rol_participacion,
+            NULL::bigint AS id_caja_usuario_autorizado
+          FROM estado_abierta ea
+          INNER JOIN cajas_sesiones cs
+            ON cs.id_estado_sesion_caja = ea.id_estado_sesion_caja
+          INNER JOIN cajas_sesiones_participantes csp
+            ON csp.id_sesion_caja = cs.id_sesion_caja
+           AND csp.id_usuario = $2
+           AND COALESCE(csp.activo, true) = true
+          INNER JOIN cat_cajas_roles_participacion crp
+            ON crp.id_rol_participacion_caja = csp.id_rol_participacion_caja
+          WHERE cs.id_sucursal = $1
+            AND UPPER(TRIM(crp.codigo)) IN ('RESPONSABLE', 'AUXILIAR')
+            ${requestedFilter}
+          ORDER BY cs.id_sesion_caja DESC
+          LIMIT 1
+        )
         SELECT
-          cs.id_caja,
-          cs.id_sesion_caja,
-          cs.id_sucursal,
-          csp.id_participacion_caja,
-          crp.codigo AS rol_participacion,
-          NULL::bigint AS id_caja_usuario_autorizado
-        FROM cajas_sesiones cs
-        INNER JOIN cajas_sesiones_participantes csp
-          ON csp.id_sesion_caja = cs.id_sesion_caja
-         AND csp.id_usuario = $2
-         AND COALESCE(csp.activo, true) = true
-        INNER JOIN cat_cajas_roles_participacion crp
-          ON crp.id_rol_participacion_caja = csp.id_rol_participacion_caja
-        WHERE cs.id_sucursal = $1
-          AND cs.id_estado_sesion_caja = $3
-          AND UPPER(TRIM(crp.codigo)) IN ('RESPONSABLE', 'AUXILIAR')
-          ${requestedFilter}
-        ORDER BY cs.id_sesion_caja DESC
-        LIMIT 1
+          (SELECT id_estado_sesion_caja FROM estado_abierta) AS id_estado_abierta,
+          sm.id_caja,
+          sm.id_sesion_caja,
+          sm.id_sucursal,
+          sm.id_participacion_caja,
+          sm.rol_participacion,
+          sm.id_caja_usuario_autorizado
+        FROM (SELECT 1) keep_row
+        LEFT JOIN session_match sm ON true
       `
       : `
+        WITH estado_abierta AS (
+          SELECT id_estado_sesion_caja
+          FROM cat_cajas_sesiones_estados
+          WHERE UPPER(TRIM(codigo)) = 'ABIERTA'
+          LIMIT 1
+        ),
+        session_match AS (
+          SELECT
+            cs.id_caja,
+            cs.id_sesion_caja,
+            cs.id_sucursal,
+            csp.id_participacion_caja,
+            crp.codigo AS rol_participacion,
+            cua.id_caja_usuario_autorizado
+          FROM estado_abierta ea
+          INNER JOIN cajas_sesiones cs
+            ON cs.id_estado_sesion_caja = ea.id_estado_sesion_caja
+          INNER JOIN cajas_sesiones_participantes csp
+            ON csp.id_sesion_caja = cs.id_sesion_caja
+           AND csp.id_usuario = $2
+           AND COALESCE(csp.activo, true) = true
+          INNER JOIN cat_cajas_roles_participacion crp
+            ON crp.id_rol_participacion_caja = csp.id_rol_participacion_caja
+          INNER JOIN cajas_usuarios_autorizados cua
+            ON cua.id_caja = cs.id_caja
+           AND cua.id_sucursal = cs.id_sucursal
+           AND cua.id_usuario = csp.id_usuario
+           AND COALESCE(cua.estado, true) = true
+           AND (
+             (UPPER(TRIM(crp.codigo)) = 'RESPONSABLE' AND COALESCE(cua.puede_responsable, false) = true)
+             OR (UPPER(TRIM(crp.codigo)) = 'AUXILIAR' AND COALESCE(cua.puede_auxiliar, false) = true)
+           )
+          WHERE cs.id_sucursal = $1
+            ${requestedFilter}
+          ORDER BY cs.id_sesion_caja DESC
+          LIMIT 1
+        )
         SELECT
-          cs.id_caja,
-          cs.id_sesion_caja,
-          cs.id_sucursal,
-          csp.id_participacion_caja,
-          crp.codigo AS rol_participacion,
-          cua.id_caja_usuario_autorizado
-        FROM cajas_sesiones cs
-        INNER JOIN cajas_sesiones_participantes csp
-          ON csp.id_sesion_caja = cs.id_sesion_caja
-         AND csp.id_usuario = $2
-         AND COALESCE(csp.activo, true) = true
-        INNER JOIN cat_cajas_roles_participacion crp
-          ON crp.id_rol_participacion_caja = csp.id_rol_participacion_caja
-        INNER JOIN cajas_usuarios_autorizados cua
-          ON cua.id_caja = cs.id_caja
-         AND cua.id_sucursal = cs.id_sucursal
-         AND cua.id_usuario = csp.id_usuario
-         AND COALESCE(cua.estado, true) = true
-         AND (
-           (UPPER(TRIM(crp.codigo)) = 'RESPONSABLE' AND COALESCE(cua.puede_responsable, false) = true)
-           OR (UPPER(TRIM(crp.codigo)) = 'AUXILIAR' AND COALESCE(cua.puede_auxiliar, false) = true)
-         )
-        WHERE cs.id_sucursal = $1
-          AND cs.id_estado_sesion_caja = $3
-          ${requestedFilter}
-        ORDER BY cs.id_sesion_caja DESC
-        LIMIT 1
+          (SELECT id_estado_sesion_caja FROM estado_abierta) AS id_estado_abierta,
+          sm.id_caja,
+          sm.id_sesion_caja,
+          sm.id_sucursal,
+          sm.id_participacion_caja,
+          sm.rol_participacion,
+          sm.id_caja_usuario_autorizado
+        FROM (SELECT 1) keep_row
+        LEFT JOIN session_match sm ON true
       `,
     params
   );
 
-  if (result.rowCount === 0) {
+  const row = result.rows?.[0] || {};
+  const idEstadoAbierta = Number(row.id_estado_abierta || 0) || null;
+  if (!idEstadoAbierta) {
+    return { ok: false, reason: 'OPEN_STATE_NOT_FOUND' };
+  }
+
+  if (!row.id_sesion_caja) {
     if (requestedSessionId) {
       const sessionExistsResult = await client.query(
         `
@@ -1246,10 +2051,16 @@ const resolveCajaSession = async ({
 
   return {
     ok: true,
-    data: result.rows[0]
+    data: {
+      id_caja: row.id_caja,
+      id_sesion_caja: row.id_sesion_caja,
+      id_sucursal: row.id_sucursal,
+      id_participacion_caja: row.id_participacion_caja,
+      rol_participacion: row.rol_participacion,
+      id_caja_usuario_autorizado: row.id_caja_usuario_autorizado
+    }
   };
 };
-
 const fetchEstadoPedidoRows = async (client) => {
   const result = await client.query(
     'SELECT id_estado_pedido, descripcion FROM estados_pedido ORDER BY id_estado_pedido'
@@ -1419,7 +2230,7 @@ const allocateDiscounts = (lineSubtotals, totalDiscount) => {
   });
 };
 
-const buildVentaComplementContext = async ({ client, normalizedItems }) => {
+const buildVentaComplementContext = async ({ client, normalizedItems, perf = null, recetaMap = new Map() }) => {
   const recipeIds = [...new Set(
     (Array.isArray(normalizedItems) ? normalizedItems : [])
       .filter((item) => item.kind === 'RECETA')
@@ -1433,17 +2244,31 @@ const buildVentaComplementContext = async ({ client, normalizedItems }) => {
       .filter((id) => id > 0)
   )];
 
-  const comboComponents = await fetchComboRecipeComponentsQuery(comboIds, client);
+  if (recipeIds.length === 0 && comboIds.length === 0) {
+    return {
+      saucesByRecipe: new Map(),
+      rulesByRecipe: new Map(),
+      comboComponentsByCombo: new Map(),
+      fallbackSauces: []
+    };
+  }
+
+  const comboComponents = await measureVentasPerf(
+    perf,
+    'totals_combos_ms',
+    () => fetchComboRecipeComponentsQuery(comboIds, client)
+  );
   const componentRecipeIds = comboComponents
     .map((row) => Number(row?.id_receta || 0))
     .filter((id) => id > 0);
   const allRecipeIds = [...new Set([...recipeIds, ...componentRecipeIds])];
 
-  const [allowedSauceRows, sauceRuleRows, fallbackSauces] = await Promise.all([
-    fetchAllowedSauceRowsByRecipeIdsQuery(allRecipeIds, client),
-    fetchSauceRuleRowsByRecipeIdsQuery(allRecipeIds, client),
-    fetchPublicActiveSaucesQuery(client)
-  ]);
+  const [allowedSauceRows, sauceRuleRows] = allRecipeIds.length > 0
+    ? await Promise.all([
+      fetchAllowedSauceRowsByRecipeIdsQuery(allRecipeIds, client),
+      fetchSauceRuleRowsByRecipeIdsQuery(allRecipeIds, client)
+    ])
+    : [[], []];
 
   const saucesByRecipe = new Map();
   for (const row of allowedSauceRows) {
@@ -1485,6 +2310,53 @@ const buildVentaComplementContext = async ({ client, normalizedItems }) => {
     });
   }
 
+  let needsFallbackSauces = false;
+  for (const item of Array.isArray(normalizedItems) ? normalizedItems : []) {
+    if (item.kind === 'RECETA') {
+      const recipeId = Number(item.id_receta || 0);
+      const receta = recetaMap.get(recipeId) || {};
+      const allowed = saucesByRecipe.get(recipeId) || [];
+      const rules = rulesByRecipe.get(recipeId) || [];
+      const required = Math.max(0, buildRecipeSauceRequirement({
+        recipeName: receta?.nombre_receta,
+        recipeDescription: receta?.descripcion,
+        rules,
+        quantity: item.cantidad
+      }));
+      if (required > 0 && allowed.length === 0) {
+        needsFallbackSauces = true;
+        break;
+      }
+    }
+
+    if (item.kind === 'COMBO') {
+      const components = comboComponentsByCombo.get(Number(item.id_combo || 0)) || [];
+      const unionSauces = new Map();
+      let required = 0;
+      for (const component of components) {
+        const idReceta = Number(component?.id_receta || 0);
+        if (!idReceta) continue;
+        for (const sauce of saucesByRecipe.get(idReceta) || []) {
+          const key = Number(sauce?.id_salsa || 0);
+          if (key > 0) unionSauces.set(key, sauce);
+        }
+        const rules = rulesByRecipe.get(idReceta) || [];
+        const multiplier = Math.max(1, Number(component?.multiplicador || 1));
+        required += Math.max(0, buildRecipeSauceRequirement({
+          recipeName: component?.nombre_receta,
+          recipeDescription: component?.nombre_receta,
+          rules,
+          quantity: Math.max(1, Number(item.cantidad || 1)) * multiplier
+        }));
+      }
+      if (required > 0 && unionSauces.size === 0) {
+        needsFallbackSauces = true;
+        break;
+      }
+    }
+  }
+
+  const fallbackSauces = needsFallbackSauces ? await fetchPublicActiveSaucesQuery(client) : [];
   const normalizedFallbackSauces = sortSauceOptions((Array.isArray(fallbackSauces) ? fallbackSauces : []).map((row) => ({
     id_complemento: Number(row.id_salsa),
     id_salsa: Number(row.id_salsa),
@@ -1571,7 +2443,7 @@ const resolveLineComplementos = ({ item, receta, combo, context }) => {
 
   return { ok: true, metadata, selected };
 };
-const hydrateVentaLines = async (client, normalizedItems) => {
+const hydrateVentaLines = async (client, normalizedItems, perf = null) => {
   const productoIds = [
     ...new Set(
       normalizedItems
@@ -1594,13 +2466,27 @@ const hydrateVentaLines = async (client, normalizedItems) => {
     )
   ];
 
-  const [productoMap, comboMap, recetaMap, complementContext] = await Promise.all([
-    fetchProductoMap(client, productoIds, { forUpdate: true }),
-    fetchComboMap(client, comboIds),
-    fetchRecetaMap(client, recetaIds),
-    buildVentaComplementContext({ client, normalizedItems })
-  ]);
+  const catalogosStart = perf?.now?.() || 0;
+  const { productoMap, comboMap, recetaMap } = await fetchVentaCatalogMaps(client, {
+    productoIds,
+    comboIds,
+    recetaIds,
+    lockProductos: true
+  });
+  perf?.add?.('totals_catalogos_ms', catalogosStart);
+  if (productoIds.length > 0) perf?.add?.('totals_productos_ms', catalogosStart);
+  if (comboIds.length > 0) perf?.add?.('totals_combos_ms', catalogosStart);
+  if (recetaIds.length > 0) perf?.add?.('totals_recetas_ms', catalogosStart);
 
+  const complementContext = await buildVentaComplementContext({
+    client,
+    normalizedItems,
+    perf,
+    recetaMap,
+    comboMap
+  });
+
+  const totalsItemsStart = perf?.now?.() || 0;
   const productoQtyById = aggregateProductoQuantities(normalizedItems);
   for (const [idProducto, requestedQty] of productoQtyById.entries()) {
     const producto = productoMap.get(idProducto);
@@ -1800,6 +2686,7 @@ const hydrateVentaLines = async (client, normalizedItems) => {
     subTotals.push(subTotal);
   }
 
+  perf?.add?.('totals_items_ms', totalsItemsStart);
   return { ok: true, data: { lines, subTotals } };
 };
 
@@ -2235,7 +3122,8 @@ const updatePedidoLegacyPagoConfirmado = async ({ client, idPedido, userId }) =>
   await client.query('UPDATE pedidos SET ' + assignments.join(', ') + ' WHERE id_pedido = $1', params);
 };
 
-const buildVentaPayload = async ({ client, body, userId, sucursalScope, canApplyDiscount }) => {
+const buildVentaPayload = async ({ client, body, userId, sucursalScope, canApplyDiscount, perf = null }) => {
+  const payloadBuildStart = perf?.now?.() || 0;
   if (!isPlainObject(body)) {
     return {
       ok: false,
@@ -2315,6 +3203,9 @@ const buildVentaPayload = async ({ client, body, userId, sucursalScope, canApply
     };
   }
 
+  perf?.add?.('payload_build_ms', payloadBuildStart);
+  const authContextStart = perf?.now?.() || 0;
+
   if (!userId) {
     return {
       ok: false,
@@ -2356,7 +3247,16 @@ const buildVentaPayload = async ({ client, body, userId, sucursalScope, canApply
     idSucursalTarget = userSucursalId;
   }
 
-  const idSucursal = await resolveSucursalId(client, idSucursalTarget);
+  const payloadContextCombinedStart = perf?.now?.() || 0;
+  const ventaContext = await resolveVentaContextForCreate(client, null, {
+    idSucursalTarget,
+    idEstadoPedidoRequested,
+    idCliente,
+    metodoPagoInput
+  });
+  perf?.add?.('auth_payload_context_combined_ms', payloadContextCombinedStart);
+
+  const idSucursal = ventaContext.idSucursal;
   if (!idSucursal) {
     return {
       ok: false,
@@ -2368,7 +3268,7 @@ const buildVentaPayload = async ({ client, body, userId, sucursalScope, canApply
     };
   }
 
-  const requestedEstadoPedido = await resolveRequestedEstadoPedidoId(client, idEstadoPedidoRequested);
+  const requestedEstadoPedido = ventaContext.requestedEstadoPedido;
   if (idEstadoPedidoRequested && !requestedEstadoPedido) {
     return {
       ok: false,
@@ -2377,18 +3277,15 @@ const buildVentaPayload = async ({ client, body, userId, sucursalScope, canApply
     };
   }
 
-  if (idCliente) {
-    const cliente = await fetchClienteInfo(client, idCliente);
-    if (!cliente) {
-      return {
-        ok: false,
-        status: 400,
-        body: { error: true, message: 'id_cliente no existe.' }
-      };
-    }
+  if (idCliente && !ventaContext.cliente) {
+    return {
+      ok: false,
+      status: 400,
+      body: { error: true, message: 'id_cliente no existe.' }
+    };
   }
 
-  const metodoPago = await resolveMetodoPago(client, metodoPagoInput);
+  const metodoPago = ventaContext.metodoPago;
   const metodoPagoAfectaEfectivo = parseBooleanish(metodoPago?.afecta_efectivo);
   if (!metodoPago) {
     return {
@@ -2411,8 +3308,11 @@ const buildVentaPayload = async ({ client, body, userId, sucursalScope, canApply
       }
     };
   }
+  perf?.add?.('auth_context_ms', authContextStart);
+  perf?.add?.('auth_payload_context_ms', authContextStart);
+  const totalsStart = perf?.now?.() || 0;
 
-  const hydratedResult = await hydrateVentaLines(client, normalizedItemsResult.data);
+  const hydratedResult = await hydrateVentaLines(client, normalizedItemsResult.data, perf);
   if (!hydratedResult.ok) return hydratedResult;
 
   const { lines, subTotals } = hydratedResult.data;
@@ -2448,8 +3348,14 @@ const buildVentaPayload = async ({ client, body, userId, sucursalScope, canApply
     };
   }
 
+  const totalsDescuentosStart = perf?.now?.() || 0;
+  const discountCatalogIds = [
+    idDescuentoCatalogo,
+    ...lines.map((line) => parseOptionalPositiveInt(line.id_descuento_catalogo_linea))
+  ].filter(Boolean);
+  const discountCatalogMap = await fetchDiscountCatalogMapByIds(client, discountCatalogIds);
   if (idDescuentoCatalogo) {
-    const discountCatalog = await fetchDiscountCatalogById(client, idDescuentoCatalogo);
+    const discountCatalog = discountCatalogMap.get(idDescuentoCatalogo) || null;
     const validatedGlobalDiscount = validateCatalogDiscountAvailability({
       discountCatalog,
       idSucursal,
@@ -2495,7 +3401,7 @@ const buildVentaPayload = async ({ client, body, userId, sucursalScope, canApply
       const idDescuentoLinea = parseOptionalPositiveInt(line.id_descuento_catalogo_linea);
       if (!idDescuentoLinea) continue;
 
-      const discountCatalog = await fetchDiscountCatalogById(client, idDescuentoLinea);
+      const discountCatalog = discountCatalogMap.get(idDescuentoLinea) || null;
       const expectedScope = line.kind;
       const validatedLineDiscount = validateCatalogDiscountAvailability({
         discountCatalog,
@@ -2521,6 +3427,9 @@ const buildVentaPayload = async ({ client, body, userId, sucursalScope, canApply
     }
   }
 
+  perf?.add?.('totals_descuentos_ms', totalsDescuentosStart);
+  const totalsBuildStart = perf?.now?.() || 0;
+
   const finalizedLines = lines.map((line, index) => ({
     ...line,
     id_descuento_catalogo:
@@ -2536,6 +3445,8 @@ const buildVentaPayload = async ({ client, body, userId, sucursalScope, canApply
   }));
 
   descuentoTotal = roundMoney(finalizedLines.reduce((sum, line) => sum + Number(line.descuento || 0), 0));
+  perf?.add?.('totals_build_ms', totalsBuildStart);
+  const totalsImpuestosStart = perf?.now?.() || 0;
 
   const subtotal = roundMoney(finalizedLines.reduce((sum, line) => sum + line.total_linea, 0));
   const isv = roundMoney(subtotal * 0.15);
@@ -2554,6 +3465,12 @@ const buildVentaPayload = async ({ client, body, userId, sucursalScope, canApply
     };
   }
 
+  perf?.add?.('totals_impuestos_ms', totalsImpuestosStart);
+  perf?.add?.('totals_ms', totalsStart);
+  const cajaContextStart = perf?.now?.() || 0;
+  const sesionCajaStart = perf?.now?.() || 0;
+  const cajaSesionCombinedStart = perf?.now?.() || 0;
+
   const sessionActiva = await resolveCajaSession({
     client,
     idSucursal,
@@ -2561,6 +3478,8 @@ const buildVentaPayload = async ({ client, body, userId, sucursalScope, canApply
     idSesionCaja: idSesionCajaRequested,
     isSuperAdmin: Boolean(sucursalScope?.isSuperAdmin)
   });
+  perf?.add?.('auth_sesion_caja_ms', sesionCajaStart);
+  perf?.add?.('auth_caja_sesion_combined_ms', cajaSesionCombinedStart);
   if (!sessionActiva.ok) {
     return {
       ok: false,
@@ -2587,8 +3506,7 @@ const buildVentaPayload = async ({ client, body, userId, sucursalScope, canApply
 
   let idEstadoPedido = null;
   if (requiresPedido) {
-    idEstadoPedido =
-      requestedEstadoPedido || (await resolveEstadoPedidoIdByCode(client, 'EN_COCINA'));
+    idEstadoPedido = requestedEstadoPedido || ventaContext.estadoPedidoEnCocina;
 
     if (!idEstadoPedido) {
       return {
@@ -2602,6 +3520,9 @@ const buildVentaPayload = async ({ client, body, userId, sucursalScope, canApply
       };
     }
   }
+
+  perf?.add?.('auth_context_ms', cajaContextStart);
+  perf?.add?.('auth_caja_ms', cajaContextStart);
 
   return {
     ok: true,
@@ -5654,9 +6575,30 @@ router.post('/ventas/pedidos/:id/registrar-pago', checkPermission(['VENTAS_CREAR
 });
 
 router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
+  const ventasPerf = createVentasPerfTracker();
+  const ventasPerfContext = {
+    id_usuario: null,
+    id_sucursal: null,
+    id_caja: null,
+    id_sesion_caja: null,
+    items_count: Array.isArray(req.body?.items) ? req.body.items.length : 0,
+    rpc_enabled: isVentasRpcTransactionEnabled()
+  };
+  const authContextStart = ventasPerf.now();
   const discountIntent = hasDiscountIntentInPayload(req.body);
-  const canApplyDiscount = await requestHasAnyPermission(req, [VENTAS_DESCUENTO_APLICAR_PERMISSION]);
+  let canApplyDiscount = false;
+  if (discountIntent) {
+    const authPermissionStart = ventasPerf.now();
+    canApplyDiscount = await requestHasAnyPermission(req, [VENTAS_DESCUENTO_APLICAR_PERMISSION]);
+    ventasPerf.add('auth_permission_ms', authPermissionStart);
+  }
   if (discountIntent && !canApplyDiscount) {
+    ventasPerf.add('auth_context_ms', authContextStart);
+    ventasPerf.log({
+      ...ventasPerfContext,
+      status: 403,
+      error_code: 'VENTAS_DESCUENTO_NO_AUTORIZADO'
+    });
     return res.status(403).json({
       error: true,
       code: 'VENTAS_DESCUENTO_NO_AUTORIZADO',
@@ -5669,29 +6611,73 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
   try {
     await client.query('BEGIN');
 
+    const authScopeStart = ventasPerf.now();
     const scope = await resolveRequestUserSucursalScope(req, client);
+    ventasPerf.add('auth_scope_ms', authScopeStart);
     const userId = parseOptionalPositiveInt(scope.idUsuario);
+    ventasPerfContext.id_usuario = userId || null;
+    ventasPerf.add('auth_context_ms', authContextStart);
+
     const prepared = await buildVentaPayload({
       client,
       body: req.body,
       userId,
       sucursalScope: scope,
-      canApplyDiscount
+      canApplyDiscount,
+      perf: ventasPerf
     });
 
     if (!prepared.ok) {
       await client.query('ROLLBACK');
+      ventasPerf.log({
+        ...ventasPerfContext,
+        status: prepared.status,
+        error_code: prepared.body?.code || null
+      });
       return res.status(prepared.status).json(prepared.body);
     }
 
     const venta = prepared.data;
     const allLines = [...venta.all_lines];
+    Object.assign(ventasPerfContext, {
+      id_usuario: parseOptionalPositiveInt(venta.id_usuario) || userId || null,
+      id_sucursal: parseOptionalPositiveInt(venta.id_sucursal),
+      id_caja: parseOptionalPositiveInt(venta.id_caja),
+      id_sesion_caja: parseOptionalPositiveInt(venta.id_sesion_caja),
+      items_count: allLines.length
+    });
+
+    if (isVentasRpcTransactionEnabled()) {
+      const rpcCreateResult = await createVentaWithRpcTransaction({
+        client,
+        venta,
+        perf: ventasPerf,
+        requestStartedAt: authContextStart
+      });
+
+      const commitStart = ventasPerf.now();
+      await client.query('COMMIT');
+      ventasPerf.add('commit_ms', commitStart);
+
+      res.status(201).json(rpcCreateResult.response);
+      ventasPerf.add('node_after_rpc_ms', rpcCreateResult.afterRpcStart);
+      ventasPerf.log(ventasPerfContext);
+
+      void registerVentaFidelizacionAfterCommit(rpcCreateResult.fidelizacionJob);
+      return;
+    }
+
+    const correlativoStart = ventasPerf.now();
     const correlativoVenta = await generarCodigoDocumento({
       client,
       idSucursal: venta.id_sucursal,
-      tipoDocumento: 'VENTA'
+      tipoDocumento: 'VENTA',
+      perf: ventasPerf
     });
+    ventasPerf.add('factura_correlativo_ms', correlativoStart);
+    ventasPerf.add('factura_ms', correlativoStart);
 
+    const descuentosStart = ventasPerf.now();
     for (const line of allLines) {
       let idDescuento = null;
 
@@ -5709,6 +6695,8 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
 
       line.id_descuento = idDescuento;
     }
+    ventasPerf.add('detalle_pedido_descuentos_ms', descuentosStart);
+    ventasPerf.add('totals_ms', descuentosStart);
 
     let idPedido = null;
 
@@ -5720,6 +6708,7 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
       };
     }
 
+    const pedidoStart = ventasPerf.now();
     const pedidoResult = await client.query(
       `
         INSERT INTO pedidos (
@@ -5736,7 +6725,7 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
           origen_pedido
         )
         VALUES ($1, $2, (NOW() AT TIME ZONE 'America/Tegucigalpa'), $3, $4, $5, $6, $7, $8, $9, 'CAJA')
-        RETURNING id_pedido
+        RETURNING id_pedido, fecha_hora_pedido
       `,
       [
         venta.descripcion_pedido,
@@ -5751,21 +6740,57 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
       ]
     );
 
-    idPedido = pedidoResult.rows[0].id_pedido;
+    idPedido = Number(pedidoResult.rows[0].id_pedido);
+    const fechaHoraPedido = pedidoResult.rows[0].fecha_hora_pedido || null;
+    ventasPerf.add('pedido_ms', pedidoStart);
 
+    const detallePedidoStart = ventasPerf.now();
+    const detallePedidoLookupStart = ventasPerf.now();
+    const detallePedidoSchemaCacheKey = 'detalle_pedido.configuracion_menu';
+    const hasDetallePedidoConfigCache = schemaColumnCache.has(detallePedidoSchemaCacheKey);
     const hasDetallePedidoConfiguracionMenu = await hasColumn(
       client,
       'detalle_pedido',
       'configuracion_menu'
     );
+    if (hasDetallePedidoConfigCache) {
+      ventasPerf.add('detalle_pedido_reuse_hydrated_ms', detallePedidoLookupStart);
+    } else {
+      ventasPerf.add('detalle_pedido_lookup_ms', detallePedidoLookupStart);
+    }
 
+    const detallePedidoInsertStart = ventasPerf.now();
+    const detallePedidoRows = venta.pedido_lines.map((line) => ({
+      line,
+      configuracionMenu: buildComplementLineConfig(line),
+      complementSnapshot: buildComplementSnapshot(line)
+    }));
     const pedidoLineRefs = [];
-    for (const line of venta.pedido_lines) {
-      const configuracionMenu = buildComplementLineConfig(line);
 
-      let insertedDetallePedido;
+    if (detallePedidoRows.length > 0) {
+      const detallePedidoParams = [];
+      let detallePedidoValues;
+      let detallePedidoResult;
+
       if (hasDetallePedidoConfiguracionMenu) {
-        insertedDetallePedido = await client.query(
+        detallePedidoValues = detallePedidoRows.map((_, index) => {
+          const base = index * 9;
+          return `($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}, true, $${base + 6}, $${base + 7}, $${base + 8}, $${base + 9}::jsonb)`;
+        }).join(', ');
+        for (const { line, configuracionMenu } of detallePedidoRows) {
+          detallePedidoParams.push(
+            line.sub_total,
+            line.total_linea,
+            line.id_producto,
+            idPedido,
+            line.id_descuento,
+            line.id_combo,
+            line.id_receta,
+            line.observacion,
+            configuracionMenu ? JSON.stringify(configuracionMenu) : null
+          );
+        }
+        detallePedidoResult = await client.query(
           `
             INSERT INTO detalle_pedido (
               sub_total_pedido,
@@ -5779,10 +6804,18 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
               observacion,
               configuracion_menu
             )
-            VALUES ($1, $2, $3, $4, $5, true, $6, $7, $8, $9::jsonb)
+            VALUES ${detallePedidoValues}
             RETURNING id_detalle_pedido
           `,
-          [
+          detallePedidoParams
+        );
+      } else {
+        detallePedidoValues = detallePedidoRows.map((_, index) => {
+          const base = index * 8;
+          return `($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}, true, $${base + 6}, $${base + 7}, $${base + 8})`;
+        }).join(', ');
+        for (const { line } of detallePedidoRows) {
+          detallePedidoParams.push(
             line.sub_total,
             line.total_linea,
             line.id_producto,
@@ -5790,12 +6823,10 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
             line.id_descuento,
             line.id_combo,
             line.id_receta,
-            line.observacion,
-            configuracionMenu ? JSON.stringify(configuracionMenu) : null
-          ]
-        );
-      } else {
-        insertedDetallePedido = await client.query(
+            line.observacion
+          );
+        }
+        detallePedidoResult = await client.query(
           `
             INSERT INTO detalle_pedido (
               sub_total_pedido,
@@ -5808,43 +6839,39 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
               id_receta,
               observacion
             )
-            VALUES ($1, $2, $3, $4, $5, true, $6, $7, $8)
+            VALUES ${detallePedidoValues}
             RETURNING id_detalle_pedido
           `,
-          [
-            line.sub_total,
-            line.total_linea,
-            line.id_producto,
-            idPedido,
-            line.id_descuento,
-            line.id_combo,
-            line.id_receta,
-            line.observacion
-          ]
+          detallePedidoParams
         );
       }
 
-      const complementSnapshot = buildComplementSnapshot(line);
-      pedidoLineRefs.push({
-        ...line,
-        id_detalle_pedido: Number(insertedDetallePedido.rows?.[0]?.id_detalle_pedido || 0),
-        tipo_item: normalizeTipoItem(line.kind),
-        configuracion_menu: configuracionMenu,
-        origen_snapshot: {
+      detallePedidoRows.forEach(({ line, configuracionMenu, complementSnapshot }, index) => {
+        const insertedDetallePedido = detallePedidoResult.rows?.[index] || {};
+        pedidoLineRefs.push({
+          ...line,
+          id_detalle_pedido: Number(insertedDetallePedido.id_detalle_pedido || 0),
           tipo_item: normalizeTipoItem(line.kind),
-          nombre_item: line.nombre_item || null,
-          id_producto: line.id_producto || null,
-          id_receta: line.id_receta || null,
-          id_combo: line.id_combo || null,
-          cantidad: Number(line.cantidad || 0),
-          precio_unitario: roundMoney(line.precio_unitario),
-          total_detalle: roundMoney(line.total_linea),
-          descuento: roundMoney(line.descuento),
-          observacion: line.observacion || null,
-          componentes: complementSnapshot
-        }
+          configuracion_menu: configuracionMenu,
+          origen_snapshot: {
+            tipo_item: normalizeTipoItem(line.kind),
+            nombre_item: line.nombre_item || null,
+            id_producto: line.id_producto || null,
+            id_receta: line.id_receta || null,
+            id_combo: line.id_combo || null,
+            cantidad: Number(line.cantidad || 0),
+            precio_unitario: roundMoney(line.precio_unitario),
+            total_detalle: roundMoney(line.total_linea),
+            descuento: roundMoney(line.descuento),
+            observacion: line.observacion || null,
+            componentes: complementSnapshot
+          }
+        });
       });
     }
+    ventasPerf.add('detalle_pedido_insert_ms', detallePedidoInsertStart);
+    ventasPerf.add('detalle_pedido_ms', detallePedidoStart);
+    const facturaInsertStart = ventasPerf.now();
     const facturaResult = await client.query(
       `
         INSERT INTO facturas (
@@ -5863,7 +6890,7 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
           id_sesion_caja
         )
         VALUES ($1, $2, $3, $4, $5, $6, $7::date, $8, $9, (NOW() AT TIME ZONE 'America/Tegucigalpa'), $10, 0, $11)
-        RETURNING id_factura
+        RETURNING id_factura, fecha_hora_facturacion, fecha_operacion
       `,
       [
         venta.id_caja,
@@ -5880,15 +6907,26 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
       ]
     );
 
-    const idFactura = facturaResult.rows[0].id_factura;
-    const facturacionVenta = await obtenerConfigFacturacionParaVenta(client, venta.id_sucursal);
+    const facturaRow = facturaResult.rows[0] || {};
+    const idFactura = Number(facturaRow.id_factura || 0);
+    const fechaHoraFacturacion = facturaRow.fecha_hora_facturacion || fechaHoraPedido || null;
+    ventasPerf.add('factura_insert_ms', facturaInsertStart);
+    ventasPerf.add('factura_ms', facturaInsertStart);
+
+    const facturaSnapshotStart = ventasPerf.now();
+    const facturacionVenta = await obtenerConfigFacturacionParaVenta(client, venta.id_sucursal, {
+      perf: ventasPerf
+    });
     await aplicarSnapshotEnFactura(
       client,
       idFactura,
       facturacionVenta.snapshot,
       facturacionVenta.idConfig
     );
+    ventasPerf.add('factura_snapshot_ms', facturaSnapshotStart);
+    ventasPerf.add('factura_ms', facturaSnapshotStart);
 
+    const cobroStart = ventasPerf.now();
     const idMetodoPago = parseOptionalPositiveInt(venta.id_metodo_pago);
     if (!idMetodoPago) {
       throw {
@@ -5924,11 +6962,61 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
         venta.referencia_pago
       ]
     );
+    ventasPerf.add('cobro_ms', cobroStart);
 
-    for (const [index, line] of venta.all_lines.entries()) {
+    const detalleFacturaStart = ventasPerf.now();
+    const detalleFacturaRows = venta.all_lines.map((line, index) => {
       const pedidoRef = pedidoLineRefs[index] || null;
       const complementSnapshot = buildComplementSnapshot(line);
-      const detalleFacturaResult = await client.query(
+      const tipoItem = pedidoRef?.tipo_item || normalizeTipoItem(line.kind);
+      const origenSnapshot = pedidoRef?.origen_snapshot || {
+        tipo_item: tipoItem,
+        nombre_item: line.nombre_item || null,
+        id_producto: line.id_producto || null,
+        id_receta: line.id_receta || null,
+        id_combo: line.id_combo || null,
+        cantidad: Number(line.cantidad || 0),
+        precio_unitario: roundMoney(line.precio_unitario),
+        total_detalle: roundMoney(line.total_linea),
+        descuento: roundMoney(line.descuento),
+        observacion: line.observacion || null,
+        componentes: complementSnapshot
+      };
+
+      return {
+        line,
+        pedidoRef,
+        tipoItem,
+        origenSnapshot
+      };
+    });
+
+    let detalleFacturaResult = { rows: [] };
+    if (detalleFacturaRows.length > 0) {
+      const detalleFacturaInsertStart = ventasPerf.now();
+      const detalleFacturaParams = [];
+      const detalleFacturaValues = buildBatchPlaceholders(detalleFacturaRows.length, 13, {
+        12: '::jsonb'
+      });
+      for (const { line, pedidoRef, tipoItem, origenSnapshot } of detalleFacturaRows) {
+        detalleFacturaParams.push(
+          idFactura,
+          line.id_producto,
+          line.id_descuento,
+          line.cantidad,
+          line.precio_unitario,
+          line.sub_total,
+          line.total_linea,
+          idPedido,
+          pedidoRef?.id_detalle_pedido || null,
+          tipoItem,
+          line.id_receta,
+          line.id_combo,
+          JSON.stringify(origenSnapshot)
+        );
+      }
+
+      detalleFacturaResult = await client.query(
         `
           INSERT INTO detalle_facturas (
             id_factura,
@@ -5945,42 +7033,41 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
             id_combo,
             origen_snapshot
           )
-          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13::jsonb)
-          RETURNING id_detalle_factura
+          VALUES ${detalleFacturaValues}
+          RETURNING
+            id_detalle_factura,
+            id_detalle_pedido,
+            tipo_item,
+            id_producto,
+            id_receta,
+            id_combo,
+            origen_snapshot
         `,
-        [
-          idFactura,
-          line.id_producto,
-          line.id_descuento,
-          line.cantidad,
-          line.precio_unitario,
-          line.sub_total,
-          line.total_linea,
-          idPedido,
-          pedidoRef?.id_detalle_pedido || null,
-          pedidoRef?.tipo_item || normalizeTipoItem(line.kind),
-          line.id_receta,
-          line.id_combo,
-          JSON.stringify(
-            pedidoRef?.origen_snapshot || {
-              tipo_item: normalizeTipoItem(line.kind),
-              nombre_item: line.nombre_item || null,
-              id_producto: line.id_producto || null,
-              id_receta: line.id_receta || null,
-              id_combo: line.id_combo || null,
-              cantidad: Number(line.cantidad || 0),
-              precio_unitario: roundMoney(line.precio_unitario),
-              total_detalle: roundMoney(line.total_linea),
-              descuento: roundMoney(line.descuento),
-              observacion: line.observacion || null,
-              componentes: complementSnapshot
-            }
-          )
-        ]
+        detalleFacturaParams
       );
+      ventasPerf.add('detalle_factura_insert_ms', detalleFacturaInsertStart);
 
-      const idDetalleFactura = Number(detalleFacturaResult.rows?.[0]?.id_detalle_factura || 0);
-      if (idDetalleFactura > 0) {
+      const detalleFacturaOrigenStart = ventasPerf.now();
+      const detalleFacturaOrigenRows = detalleFacturaResult.rows.filter((row) =>
+        Number(row.id_detalle_factura || 0) > 0
+      );
+      if (detalleFacturaOrigenRows.length > 0) {
+        const detalleFacturaOrigenParams = [];
+        const detalleFacturaOrigenValues = buildBatchPlaceholders(detalleFacturaOrigenRows.length, 7, {
+          6: '::jsonb'
+        });
+        for (const row of detalleFacturaOrigenRows) {
+          detalleFacturaOrigenParams.push(
+            Number(row.id_detalle_factura || 0),
+            row.id_detalle_pedido || null,
+            row.tipo_item || 'ITEM',
+            row.id_producto || null,
+            row.id_receta || null,
+            row.id_combo || null,
+            JSON.stringify(row.origen_snapshot || {})
+          );
+        }
+
         await client.query(
           `
             INSERT INTO public.detalle_facturas_origen (
@@ -5992,7 +7079,7 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
               id_combo,
               origen_snapshot
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
+            VALUES ${detalleFacturaOrigenValues}
             ON CONFLICT (id_detalle_factura)
             DO UPDATE SET
               id_detalle_pedido = EXCLUDED.id_detalle_pedido,
@@ -6002,33 +7089,13 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
               id_combo = EXCLUDED.id_combo,
               origen_snapshot = EXCLUDED.origen_snapshot
           `,
-          [
-            idDetalleFactura,
-            pedidoRef?.id_detalle_pedido || null,
-            pedidoRef?.tipo_item || normalizeTipoItem(line.kind),
-            line.id_producto || null,
-            line.id_receta || null,
-            line.id_combo || null,
-            JSON.stringify(
-              pedidoRef?.origen_snapshot || {
-                tipo_item: normalizeTipoItem(line.kind),
-                nombre_item: line.nombre_item || null,
-                id_producto: line.id_producto || null,
-                id_receta: line.id_receta || null,
-                id_combo: line.id_combo || null,
-                cantidad: Number(line.cantidad || 0),
-                precio_unitario: roundMoney(line.precio_unitario),
-                total_detalle: roundMoney(line.total_linea),
-                descuento: roundMoney(line.descuento),
-                observacion: line.observacion || null,
-                componentes: complementSnapshot
-              }
-            )
-          ]
+          detalleFacturaOrigenParams
         );
       }
+      ventasPerf.add('detalle_factura_origen_ms', detalleFacturaOrigenStart);
     }
-
+    ventasPerf.add('detalle_factura_ms', detalleFacturaStart);
+    const fidelizacionStart = ventasPerf.now();
     const acumulacionFidelizacion = await registerFacturaLoyaltyAccumulation({
       client,
       idFactura,
@@ -6038,26 +7105,53 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
       idUsuarioEjecutor: venta.id_usuario,
       montoFactura: venta.total
     });
+    ventasPerf.add('fidelizacion_ms', fidelizacionStart);
 
-    await client.query('COMMIT');
-
-    res.status(201).json({
-      message: 'Venta creada exitosamente.',
-      id_factura: idFactura,
-      id_pedido: idPedido,
-      numero_venta: correlativoVenta.codigo,
-      codigo_venta: correlativoVenta.codigo,
-      total: venta.total,
-      venta_directa: idPedido === null,
-      fidelizacion: acumulacionFidelizacion.created
-        ? {
-            puntos_acumulados: acumulacionFidelizacion.points,
-            saldo_nuevo: acumulacionFidelizacion.saldoNuevo
-          }
-        : null
+    const ticketResponseStart = ventasPerf.now();
+    const facturacionNormalizada = await normalizarDatosTicketDesdeSnapshot({
+      client,
+      factura: {
+        id_sucursal: venta.id_sucursal,
+        facturacion_snapshot: facturacionVenta.snapshot
+      }
     });
+    const createDetailContext = await fetchCreateVentaDetailContext(client, {
+      idCliente: venta.id_cliente,
+      idUsuario: venta.id_usuario,
+      idCaja: venta.id_caja
+    });
+    createDetailContext.nombre_sucursal = facturacionVenta.sucursal?.nombre_sucursal || null;
+    const createDetailItems = buildCreatedVentaDetailItems({
+      detalleFacturaRows,
+      detalleFacturaRowsInserted: detalleFacturaResult.rows
+    });
+    const createVentaResponse = buildCreateVentaDetailResponse({
+      idFactura,
+      idPedido,
+      venta,
+      correlativoVenta,
+      fechaHoraPedido,
+      fechaHoraFacturacion,
+      facturacion: facturacionNormalizada,
+      context: createDetailContext,
+      items: createDetailItems,
+      fidelizacion: acumulacionFidelizacion
+    });
+    ventasPerf.add('ticket_response_build_ms', ticketResponseStart);
+
+    const commitStart = ventasPerf.now();
+    await client.query('COMMIT');
+    ventasPerf.add('commit_ms', commitStart);
+    ventasPerf.log(ventasPerfContext);
+
+    res.status(201).json(createVentaResponse);
   } catch (err) {
     await client.query('ROLLBACK');
+    ventasPerf.log({
+      ...ventasPerfContext,
+      status: Number.isInteger(err?.httpStatus) ? err.httpStatus : 500,
+      error_code: err?.code || 'VENTAS_CREATE_ERROR'
+    });
     console.error('Error al crear venta:', err);
     if (Number.isInteger(err?.httpStatus) && err.httpStatus >= 400 && err.httpStatus < 500) {
       return res.status(err.httpStatus).json({

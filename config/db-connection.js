@@ -20,11 +20,11 @@ const pool = new Pool({
   password: process.env.DB_PASSWORD,
   database: process.env.DB_NAME || 'postgres',
 
-  // Supabase session pooler en QA está limitando a pool_size 15.
-  // Debe quedar por debajo del límite porque hay consultas paralelas y scheduler.
-  max: parsePositiveInt(process.env.DB_POOL_MAX, 8),
-  idleTimeoutMillis: parsePositiveInt(process.env.DB_IDLE_TIMEOUT_MS, 10000),
-  connectionTimeoutMillis: parsePositiveInt(process.env.DB_CONNECTION_TIMEOUT_MS, 5000),
+  // Pool configurable para Supabase Pro; mantener por debajo del limite global
+  // porque pueden convivir requests, jobs y conexiones administrativas.
+  max: parsePositiveInt(process.env.DB_POOL_MAX, 15),
+  idleTimeoutMillis: parsePositiveInt(process.env.DB_IDLE_TIMEOUT_MS, 30000),
+  connectionTimeoutMillis: parsePositiveInt(process.env.DB_CONNECTION_TIMEOUT_MS, 3000),
 
   ssl: {
     rejectUnauthorized: false,
