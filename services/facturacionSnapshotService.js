@@ -48,7 +48,7 @@ const readSucursalContext = async (client, idSucursal) => {
 };
 
 const ensureConfigRow = async (client, idSucursal, sucursal) => {
-  await client.query(
+  const result = await client.query(
     `
       INSERT INTO public.facturacion_config_sucursal (
         id_sucursal,
@@ -99,6 +99,30 @@ const ensureConfigRow = async (client, idSucursal, sucursal) => {
         false
       )
       ON CONFLICT (id_sucursal) DO NOTHING
+      RETURNING
+        id_config,
+        id_sucursal,
+        prefijo_venta,
+        prefijo_reversion,
+        longitud_correlativo,
+        reinicio_diario,
+        modo_fiscal,
+        mostrar_logo_ticket,
+        ancho_ticket_mm,
+        activo,
+        nombre_emisor,
+        rtn_emisor,
+        direccion_emisor,
+        telefono_emisor,
+        correo_emisor,
+        logo_url,
+        id_archivo_logo,
+        texto_encabezado_ticket,
+        texto_pie_ticket,
+        mostrar_rtn,
+        mostrar_direccion,
+        mostrar_telefono,
+        mostrar_correo
     `,
     [
       idSucursal,
@@ -109,6 +133,7 @@ const ensureConfigRow = async (client, idSucursal, sucursal) => {
       DEFAULT_FOOTER
     ]
   );
+  return result.rows?.[0] || null;
 };
 
 const readConfigBySucursal = async (client, idSucursal) => {
@@ -146,6 +171,117 @@ const readConfigBySucursal = async (client, idSucursal) => {
     [idSucursal]
   );
   return result.rows?.[0] || null;
+};
+
+const readSucursalFacturacionContext = async (client, idSucursal) => {
+  const result = await client.query(
+    `
+      SELECT
+        v.id_sucursal,
+        v.nombre_sucursal,
+        v.texto_direccion,
+        v.texto_telefono,
+        v.texto_correo,
+        cfg.id_config AS cfg_id_config,
+        cfg.id_sucursal AS cfg_id_sucursal,
+        cfg.prefijo_venta AS cfg_prefijo_venta,
+        cfg.prefijo_reversion AS cfg_prefijo_reversion,
+        cfg.longitud_correlativo AS cfg_longitud_correlativo,
+        cfg.reinicio_diario AS cfg_reinicio_diario,
+        cfg.modo_fiscal AS cfg_modo_fiscal,
+        cfg.mostrar_logo_ticket AS cfg_mostrar_logo_ticket,
+        cfg.ancho_ticket_mm AS cfg_ancho_ticket_mm,
+        cfg.activo AS cfg_activo,
+        cfg.nombre_emisor AS cfg_nombre_emisor,
+        cfg.rtn_emisor AS cfg_rtn_emisor,
+        cfg.direccion_emisor AS cfg_direccion_emisor,
+        cfg.telefono_emisor AS cfg_telefono_emisor,
+        cfg.correo_emisor AS cfg_correo_emisor,
+        cfg.logo_url AS cfg_logo_url,
+        cfg.id_archivo_logo AS cfg_id_archivo_logo,
+        cfg.texto_encabezado_ticket AS cfg_texto_encabezado_ticket,
+        cfg.texto_pie_ticket AS cfg_texto_pie_ticket,
+        cfg.mostrar_rtn AS cfg_mostrar_rtn,
+        cfg.mostrar_direccion AS cfg_mostrar_direccion,
+        cfg.mostrar_telefono AS cfg_mostrar_telefono,
+        cfg.mostrar_correo AS cfg_mostrar_correo
+      FROM public.v_sucursales_info v
+      LEFT JOIN LATERAL (
+        SELECT
+          id_config,
+          id_sucursal,
+          prefijo_venta,
+          prefijo_reversion,
+          longitud_correlativo,
+          reinicio_diario,
+          modo_fiscal,
+          mostrar_logo_ticket,
+          ancho_ticket_mm,
+          activo,
+          nombre_emisor,
+          rtn_emisor,
+          direccion_emisor,
+          telefono_emisor,
+          correo_emisor,
+          logo_url,
+          id_archivo_logo,
+          texto_encabezado_ticket,
+          texto_pie_ticket,
+          mostrar_rtn,
+          mostrar_direccion,
+          mostrar_telefono,
+          mostrar_correo
+        FROM public.facturacion_config_sucursal
+        WHERE id_sucursal = v.id_sucursal
+        ORDER BY COALESCE(activo, false) DESC, id_config DESC
+        LIMIT 1
+      ) cfg ON true
+      WHERE v.id_sucursal = $1
+      LIMIT 1
+    `,
+    [idSucursal]
+  );
+
+  const row = result.rows?.[0] || null;
+  if (!row) return { sucursal: null, config: null };
+
+  const sucursal = {
+    id_sucursal: row.id_sucursal,
+    nombre_sucursal: row.nombre_sucursal,
+    texto_direccion: row.texto_direccion,
+    texto_telefono: row.texto_telefono,
+    texto_correo: row.texto_correo
+  };
+
+  const config = row.cfg_id_config
+    ? {
+        id_config: row.cfg_id_config,
+        id_sucursal: row.cfg_id_sucursal,
+        prefijo_venta: row.cfg_prefijo_venta,
+        prefijo_reversion: row.cfg_prefijo_reversion,
+        longitud_correlativo: row.cfg_longitud_correlativo,
+        reinicio_diario: row.cfg_reinicio_diario,
+        modo_fiscal: row.cfg_modo_fiscal,
+        mostrar_logo_ticket: row.cfg_mostrar_logo_ticket,
+        ancho_ticket_mm: row.cfg_ancho_ticket_mm,
+        activo: row.cfg_activo,
+        nombre_emisor: row.cfg_nombre_emisor,
+        rtn_emisor: row.cfg_rtn_emisor,
+        direccion_emisor: row.cfg_direccion_emisor,
+        telefono_emisor: row.cfg_telefono_emisor,
+        correo_emisor: row.cfg_correo_emisor,
+        logo_url: row.cfg_logo_url,
+        id_archivo_logo: row.cfg_id_archivo_logo,
+        texto_encabezado_ticket: row.cfg_texto_encabezado_ticket,
+        texto_pie_ticket: row.cfg_texto_pie_ticket,
+        mostrar_rtn: row.cfg_mostrar_rtn,
+        mostrar_direccion: row.cfg_mostrar_direccion,
+        mostrar_telefono: row.cfg_mostrar_telefono,
+        mostrar_correo: row.cfg_mostrar_correo
+      }
+    : null;
+
+  return { sucursal, config };
 };
 
 const snapshotFromConfig = ({ config, sucursal, idSucursal }) => {
@@ -198,21 +334,36 @@ const snapshotFromConfig = ({ config, sucursal, idSucursal }) => {
   };
 };
 
-export const obtenerConfigFacturacionParaVenta = async (client, idSucursal) => {
+export const obtenerConfigFacturacionParaVenta = async (client, idSucursal, options = {}) => {
   const idSucursalNum = toPositiveInt(idSucursal);
   if (!idSucursalNum) {
     throw new Error('FACTURACION_SNAPSHOT_SUCURSAL_INVALIDA');
   }
 
   const db = client && typeof client.query === 'function' ? client : pool;
-  const sucursal = await readSucursalContext(db, idSucursalNum);
+  const perf = options?.perf || null;
+  const sucursalStart = perf?.now?.() || 0;
+  const context = await readSucursalFacturacionContext(db, idSucursalNum);
+  const sucursal = context.sucursal;
+  let config = context.config;
+  perf?.add?.('factura_snapshot_sucursal_ms', sucursalStart);
+
   if (!sucursal) {
     throw new Error('FACTURACION_SNAPSHOT_SUCURSAL_NOT_FOUND');
   }
 
-  await ensureConfigRow(db, idSucursalNum, sucursal);
-  const config = await readConfigBySucursal(db, idSucursalNum);
+  if (!config) {
+    const configStart = perf?.now?.() || 0;
+    config = await ensureConfigRow(db, idSucursalNum, sucursal);
+    if (!config) {
+      config = await readConfigBySucursal(db, idSucursalNum);
+    }
+    perf?.add?.('factura_snapshot_config_ms', configStart);
+  }
+
+  const buildStart = perf?.now?.() || 0;
   const snapshot = snapshotFromConfig({ config: config || {}, sucursal, idSucursal: idSucursalNum });
+  perf?.add?.('factura_snapshot_build_ms', buildStart);
 
   return {
     idSucursal: idSucursalNum,
