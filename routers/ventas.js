@@ -99,6 +99,10 @@ const VENTAS_PERF_STAGE_NAMES = [
   'totals_productos_ms',
   'totals_recetas_ms',
   'totals_combos_ms',
+  'totals_complementos_ms',
+  'totals_combo_components_ms',
+  'totals_sauce_rules_ms',
+  'totals_allowed_sauces_ms',
   'totals_descuentos_ms',
   'totals_impuestos_ms',
   'totals_build_ms',
@@ -130,6 +134,9 @@ const VENTAS_PERF_STAGE_NAMES = [
   'pre_rpc_total_ms',
   'rpc_payload_build_ms',
   'rpc_call_ms',
+  'rpc_v2_payload_build_ms',
+  'rpc_v2_call_ms',
+  'rpc_v2_total_ms',
   'post_rpc_total_ms',
   'post_rpc_fidelizacion_ms',
   'post_rpc_response_ms',
@@ -144,6 +151,12 @@ const isVentasPerfEnabled = () =>
 
 function isVentasRpcTransactionEnabled() {
   return String(process.env.VENTAS_USE_RPC_TRANSACTION || '')
+    .trim()
+    .toLowerCase() === 'true';
+}
+
+function isVentasRpcV2Enabled() {
+  return String(process.env.VENTAS_USE_RPC_V2 || '')
     .trim()
     .toLowerCase() === 'true';
 }
@@ -164,6 +177,32 @@ const measureVentasPerf = async (perf, name, task) => {
     perf?.add?.(name, startedAt);
   }
 };
+
+const VENTAS_STATIC_COMPLEMENT_CACHE_TTL_MS = 60000;
+const ventasStaticComplementCache = new Map();
+
+const buildVentasStaticCacheKey = (prefix, ids = []) => {
+  const normalizedIds = [...new Set((Array.isArray(ids) ? ids : [])
+    .map((id) => Number(id || 0))
+    .filter((id) => Number.isInteger(id) && id > 0))]
+    .sort((a, b) => a - b);
+  return `${prefix}:${normalizedIds.join(',')}`;
+};
+
+const cloneRows = (rows) => (Array.isArray(rows) ? rows.map((row) => ({ ...row })) : []);
+
+const fetchCachedVentasStaticRows = async (cacheKey, loader) => {
+  const now = Date.now();
+  const cached = ventasStaticComplementCache.get(cacheKey);
+  if (cached && now - cached.at < VENTAS_STATIC_COMPLEMENT_CACHE_TTL_MS) {
+    return cloneRows(cached.rows);
+  }
+
+  const rows = await loader();
+  ventasStaticComplementCache.set(cacheKey, { at: now, rows: cloneRows(rows) });
+  return cloneRows(rows);
+};
+
 const createVentasPerfTracker = () => {
   const enabled = isVentasPerfEnabled();
   const startedAt = enabled ? performance.now() : 0;
@@ -1173,6 +1212,53 @@ const buildVentaRpcPayload = ({ venta, correlativoVenta, facturacionVenta, factu
   items: buildVentaRpcItems(venta)
 });
 
+const buildVentaRpcV2Payload = ({ venta }) => ({
+  pedido: {
+    descripcion_pedido: venta.descripcion_pedido,
+    descripcion_envio: venta.descripcion_envio,
+    sub_total: venta.pedido_subtotal,
+    isv: venta.pedido_isv,
+    total: venta.pedido_total,
+    id_estado_pedido: venta.id_estado_pedido,
+    id_sucursal: venta.id_sucursal,
+    id_cliente: venta.id_cliente,
+    id_usuario: venta.id_usuario
+  },
+  factura: {
+    id_caja: venta.id_caja,
+    id_sucursal: venta.id_sucursal,
+    id_usuario: venta.id_usuario,
+    id_cliente: venta.id_cliente,
+    efectivo_entregado: venta.efectivo_entregado,
+    cambio: venta.cambio,
+    isv_15: venta.isv,
+    id_sesion_caja: venta.id_sesion_caja
+  },
+  cobro: {
+    id_metodo_pago: venta.id_metodo_pago,
+    monto: venta.total,
+    referencia: venta.referencia_pago || null
+  },
+  venta: {
+    id_sucursal: venta.id_sucursal,
+    id_cliente: venta.id_cliente,
+    id_usuario: venta.id_usuario,
+    id_caja: venta.id_caja,
+    id_sesion_caja: venta.id_sesion_caja,
+    metodo_pago: venta.metodo_pago,
+    metodo_pago_codigo: venta.metodo_pago_codigo,
+    referencia_pago: venta.referencia_pago || null,
+    efectivo_entregado: venta.efectivo_entregado,
+    cambio: venta.cambio,
+    descripcion_pedido: venta.descripcion_pedido,
+    descripcion_envio: venta.descripcion_envio,
+    subtotal: venta.subtotal,
+    descuento: venta.descuento,
+    isv: venta.isv,
+    total: venta.total
+  },
+  items: buildVentaRpcItems(venta)
+});
 const VENTAS_FIDELIZACION_ADVISORY_LOCK_CLASS = 724201;
 
 const logVentasFidelizacionAsyncPerf = (payload) => {
@@ -1328,6 +1414,71 @@ const createVentaWithRpcTransaction = async ({ client, venta, perf, requestStart
   perf?.add?.('post_rpc_response_ms', postRpcResponseStart);
   perf?.add?.('post_rpc_total_ms', afterRpcStart);
   perf?.add?.('rpc_total_ms', rpcTotalStart);
+
+  return {
+    response: responsePayload,
+    afterRpcStart,
+    fidelizacionJob: {
+      idFactura,
+      idPedido: parseOptionalPositiveInt(response.id_pedido),
+      idCliente: venta.id_cliente,
+      idSucursal: venta.id_sucursal,
+      idUsuarioEjecutor: venta.id_usuario,
+      montoFactura: venta.total
+    }
+  };
+};
+const createVentaWithRpcV2Transaction = async ({ client, venta, perf, requestStartedAt = 0 }) => {
+  const rpcTotalStart = perf?.now?.() || 0;
+
+  const rpcPayloadBuildStart = perf?.now?.() || 0;
+  const rpcPayload = buildVentaRpcV2Payload({ venta });
+  const rpcActor = {
+    id_usuario: venta.id_usuario,
+    id_sucursal: venta.id_sucursal,
+    id_caja: venta.id_caja,
+    id_sesion_caja: venta.id_sesion_caja
+  };
+  perf?.add?.('rpc_v2_payload_build_ms', rpcPayloadBuildStart);
+  perf?.add?.('pre_rpc_total_ms', rpcTotalStart);
+  if (requestStartedAt) {
+    perf?.add?.('node_before_rpc_ms', requestStartedAt);
+  }
+
+  const rpcCallStart = perf?.now?.() || 0;
+  const rpcResult = await client.query(
+    'SELECT public.registrar_venta_pos_v2($1::jsonb, $2::jsonb) AS response',
+    [JSON.stringify(rpcPayload), JSON.stringify(rpcActor)]
+  );
+  perf?.add?.('rpc_v2_call_ms', rpcCallStart);
+  const afterRpcStart = perf?.now?.() || 0;
+
+  const postRpcResponseStart = perf?.now?.() || 0;
+  const response = rpcResult.rows?.[0]?.response;
+  if (!isPlainObject(response) || response.ticket_ready !== true) {
+    throw {
+      httpStatus: 500,
+      code: 'VENTAS_RPC_V2_RESPONSE_INVALID',
+      publicMessage: 'La venta fue procesada por RPC V2, pero la respuesta del ticket no es valida.'
+    };
+  }
+
+  const idFactura = parseOptionalPositiveInt(response.id_factura);
+  if (!idFactura) {
+    throw {
+      httpStatus: 500,
+      code: 'VENTAS_RPC_V2_FACTURA_INVALIDA',
+      publicMessage: 'La venta fue procesada por RPC V2, pero no devolvio factura valida.'
+    };
+  }
+
+  const responsePayload = {
+    ...response,
+    fidelizacion: null
+  };
+  perf?.add?.('post_rpc_response_ms', postRpcResponseStart);
+  perf?.add?.('post_rpc_total_ms', afterRpcStart);
+  perf?.add?.('rpc_v2_total_ms', rpcTotalStart);
 
   return {
     response: responsePayload,
@@ -2231,6 +2382,7 @@ const allocateDiscounts = (lineSubtotals, totalDiscount) => {
 };
 
 const buildVentaComplementContext = async ({ client, normalizedItems, perf = null, recetaMap = new Map() }) => {
+  const complementosStart = perf?.now?.() || 0;
   const recipeIds = [...new Set(
     (Array.isArray(normalizedItems) ? normalizedItems : [])
       .filter((item) => item.kind === 'RECETA')
@@ -2244,134 +2396,170 @@ const buildVentaComplementContext = async ({ client, normalizedItems, perf = nul
       .filter((id) => id > 0)
   )];
 
-  if (recipeIds.length === 0 && comboIds.length === 0) {
-    return {
-      saucesByRecipe: new Map(),
-      rulesByRecipe: new Map(),
-      comboComponentsByCombo: new Map(),
-      fallbackSauces: []
-    };
-  }
+  try {
+    if (recipeIds.length === 0 && comboIds.length === 0) {
+      return {
+        saucesByRecipe: new Map(),
+        rulesByRecipe: new Map(),
+        comboComponentsByCombo: new Map(),
+        fallbackSauces: []
+      };
+    }
 
-  const comboComponents = await measureVentasPerf(
-    perf,
-    'totals_combos_ms',
-    () => fetchComboRecipeComponentsQuery(comboIds, client)
-  );
-  const componentRecipeIds = comboComponents
-    .map((row) => Number(row?.id_receta || 0))
-    .filter((id) => id > 0);
-  const allRecipeIds = [...new Set([...recipeIds, ...componentRecipeIds])];
+    const comboComponents = comboIds.length > 0
+      ? await measureVentasPerf(
+        perf,
+        'totals_combo_components_ms',
+        () => measureVentasPerf(
+          perf,
+          'totals_combos_ms',
+          () => fetchCachedVentasStaticRows(
+            buildVentasStaticCacheKey('combo_components', comboIds),
+            () => fetchComboRecipeComponentsQuery(comboIds, client)
+          )
+        )
+      )
+      : [];
+    const componentRecipeIds = comboComponents
+      .map((row) => Number(row?.id_receta || 0))
+      .filter((id) => id > 0);
+    const allRecipeIds = [...new Set([...recipeIds, ...componentRecipeIds])];
 
-  const [allowedSauceRows, sauceRuleRows] = allRecipeIds.length > 0
-    ? await Promise.all([
-      fetchAllowedSauceRowsByRecipeIdsQuery(allRecipeIds, client),
-      fetchSauceRuleRowsByRecipeIdsQuery(allRecipeIds, client)
-    ])
-    : [[], []];
+    const [allowedSauceRows, sauceRuleRows] = allRecipeIds.length > 0
+      ? await Promise.all([
+        measureVentasPerf(
+          perf,
+          'totals_allowed_sauces_ms',
+          () => fetchCachedVentasStaticRows(
+            buildVentasStaticCacheKey('allowed_sauces', allRecipeIds),
+            () => fetchAllowedSauceRowsByRecipeIdsQuery(allRecipeIds, client)
+          )
+        ),
+        measureVentasPerf(
+          perf,
+          'totals_sauce_rules_ms',
+          () => fetchCachedVentasStaticRows(
+            buildVentasStaticCacheKey('sauce_rules', allRecipeIds),
+            () => fetchSauceRuleRowsByRecipeIdsQuery(allRecipeIds, client)
+          )
+        )
+      ])
+      : [[], []];
 
-  const saucesByRecipe = new Map();
-  for (const row of allowedSauceRows) {
-    const recipeId = Number(row?.id_receta || 0);
-    if (!recipeId) continue;
-    if (!saucesByRecipe.has(recipeId)) saucesByRecipe.set(recipeId, []);
-    saucesByRecipe.get(recipeId).push({
+    const saucesByRecipe = new Map();
+    for (const row of allowedSauceRows) {
+      const recipeId = Number(row?.id_receta || 0);
+      if (!recipeId) continue;
+      if (!saucesByRecipe.has(recipeId)) saucesByRecipe.set(recipeId, []);
+      saucesByRecipe.get(recipeId).push({
+        id_complemento: Number(row.id_salsa),
+        id_salsa: Number(row.id_salsa),
+        nombre: String(row.nombre || 'Salsa').trim(),
+        nivel_picante: Number(row.nivel_picante || 0),
+        orden: Number(row.orden || 0),
+        disponible: row.disponible !== false
+      });
+    }
+
+    const rulesByRecipe = new Map();
+    for (const row of sauceRuleRows) {
+      const recipeId = Number(row?.id_receta || 0);
+      if (!recipeId) continue;
+      if (!rulesByRecipe.has(recipeId)) rulesByRecipe.set(recipeId, []);
+      rulesByRecipe.get(recipeId).push({
+        min_unidades: Number(row?.min_unidades || 0),
+        max_unidades:
+          row?.max_unidades === null || row?.max_unidades === undefined ? null : Number(row.max_unidades),
+        salsas_requeridas: Number(row?.salsas_requeridas || 0)
+      });
+    }
+
+    const comboComponentsByCombo = new Map();
+    for (const row of comboComponents) {
+      const comboId = Number(row?.id_combo || 0);
+      if (!comboId) continue;
+      if (!comboComponentsByCombo.has(comboId)) comboComponentsByCombo.set(comboId, []);
+      comboComponentsByCombo.get(comboId).push({
+        id_receta: Number(row?.id_receta || 0),
+        multiplicador: Math.max(1, Number(row?.multiplicador || 1)),
+        nombre_receta: String(row?.nombre_receta || '').trim()
+      });
+    }
+
+    let needsFallbackSauces = false;
+    for (const item of Array.isArray(normalizedItems) ? normalizedItems : []) {
+      if (item.kind === 'RECETA') {
+        const recipeId = Number(item.id_receta || 0);
+        const receta = recetaMap.get(recipeId) || {};
+        const allowed = saucesByRecipe.get(recipeId) || [];
+        const rules = rulesByRecipe.get(recipeId) || [];
+        const required = Math.max(0, buildRecipeSauceRequirement({
+          recipeName: receta?.nombre_receta,
+          recipeDescription: receta?.descripcion,
+          rules,
+          quantity: item.cantidad
+        }));
+        if (required > 0 && allowed.length === 0) {
+          needsFallbackSauces = true;
+          break;
+        }
+      }
+
+      if (item.kind === 'COMBO') {
+        const components = comboComponentsByCombo.get(Number(item.id_combo || 0)) || [];
+        const unionSauces = new Map();
+        let required = 0;
+        for (const component of components) {
+          const idReceta = Number(component?.id_receta || 0);
+          if (!idReceta) continue;
+          for (const sauce of saucesByRecipe.get(idReceta) || []) {
+            const key = Number(sauce?.id_salsa || 0);
+            if (key > 0) unionSauces.set(key, sauce);
+          }
+          const rules = rulesByRecipe.get(idReceta) || [];
+          const multiplier = Math.max(1, Number(component?.multiplicador || 1));
+          required += Math.max(0, buildRecipeSauceRequirement({
+            recipeName: component?.nombre_receta,
+            recipeDescription: component?.nombre_receta,
+            rules,
+            quantity: Math.max(1, Number(item.cantidad || 1)) * multiplier
+          }));
+        }
+        if (required > 0 && unionSauces.size === 0) {
+          needsFallbackSauces = true;
+          break;
+        }
+      }
+    }
+
+    const fallbackSauces = needsFallbackSauces
+      ? await measureVentasPerf(
+        perf,
+        'totals_allowed_sauces_ms',
+        () => fetchCachedVentasStaticRows(
+          'active_sauces',
+          () => fetchPublicActiveSaucesQuery(client)
+        )
+      )
+      : [];
+    const normalizedFallbackSauces = sortSauceOptions((Array.isArray(fallbackSauces) ? fallbackSauces : []).map((row) => ({
       id_complemento: Number(row.id_salsa),
       id_salsa: Number(row.id_salsa),
       nombre: String(row.nombre || 'Salsa').trim(),
       nivel_picante: Number(row.nivel_picante || 0),
       orden: Number(row.orden || 0),
-      disponible: row.disponible !== false
-    });
+      disponible: true
+    })));
+
+    return {
+      saucesByRecipe,
+      rulesByRecipe,
+      comboComponentsByCombo,
+      fallbackSauces: normalizedFallbackSauces
+    };
+  } finally {
+    perf?.add?.('totals_complementos_ms', complementosStart);
   }
-
-  const rulesByRecipe = new Map();
-  for (const row of sauceRuleRows) {
-    const recipeId = Number(row?.id_receta || 0);
-    if (!recipeId) continue;
-    if (!rulesByRecipe.has(recipeId)) rulesByRecipe.set(recipeId, []);
-    rulesByRecipe.get(recipeId).push({
-      min_unidades: Number(row?.min_unidades || 0),
-      max_unidades:
-        row?.max_unidades === null || row?.max_unidades === undefined ? null : Number(row.max_unidades),
-      salsas_requeridas: Number(row?.salsas_requeridas || 0)
-    });
-  }
-
-  const comboComponentsByCombo = new Map();
-  for (const row of comboComponents) {
-    const comboId = Number(row?.id_combo || 0);
-    if (!comboId) continue;
-    if (!comboComponentsByCombo.has(comboId)) comboComponentsByCombo.set(comboId, []);
-    comboComponentsByCombo.get(comboId).push({
-      id_receta: Number(row?.id_receta || 0),
-      multiplicador: Math.max(1, Number(row?.multiplicador || 1)),
-      nombre_receta: String(row?.nombre_receta || '').trim()
-    });
-  }
-
-  let needsFallbackSauces = false;
-  for (const item of Array.isArray(normalizedItems) ? normalizedItems : []) {
-    if (item.kind === 'RECETA') {
-      const recipeId = Number(item.id_receta || 0);
-      const receta = recetaMap.get(recipeId) || {};
-      const allowed = saucesByRecipe.get(recipeId) || [];
-      const rules = rulesByRecipe.get(recipeId) || [];
-      const required = Math.max(0, buildRecipeSauceRequirement({
-        recipeName: receta?.nombre_receta,
-        recipeDescription: receta?.descripcion,
-        rules,
-        quantity: item.cantidad
-      }));
-      if (required > 0 && allowed.length === 0) {
-        needsFallbackSauces = true;
-        break;
-      }
-    }
-
-    if (item.kind === 'COMBO') {
-      const components = comboComponentsByCombo.get(Number(item.id_combo || 0)) || [];
-      const unionSauces = new Map();
-      let required = 0;
-      for (const component of components) {
-        const idReceta = Number(component?.id_receta || 0);
-        if (!idReceta) continue;
-        for (const sauce of saucesByRecipe.get(idReceta) || []) {
-          const key = Number(sauce?.id_salsa || 0);
-          if (key > 0) unionSauces.set(key, sauce);
-        }
-        const rules = rulesByRecipe.get(idReceta) || [];
-        const multiplier = Math.max(1, Number(component?.multiplicador || 1));
-        required += Math.max(0, buildRecipeSauceRequirement({
-          recipeName: component?.nombre_receta,
-          recipeDescription: component?.nombre_receta,
-          rules,
-          quantity: Math.max(1, Number(item.cantidad || 1)) * multiplier
-        }));
-      }
-      if (required > 0 && unionSauces.size === 0) {
-        needsFallbackSauces = true;
-        break;
-      }
-    }
-  }
-
-  const fallbackSauces = needsFallbackSauces ? await fetchPublicActiveSaucesQuery(client) : [];
-  const normalizedFallbackSauces = sortSauceOptions((Array.isArray(fallbackSauces) ? fallbackSauces : []).map((row) => ({
-    id_complemento: Number(row.id_salsa),
-    id_salsa: Number(row.id_salsa),
-    nombre: String(row.nombre || 'Salsa').trim(),
-    nivel_picante: Number(row.nivel_picante || 0),
-    orden: Number(row.orden || 0),
-    disponible: true
-  })));
-
-  return {
-    saucesByRecipe,
-    rulesByRecipe,
-    comboComponentsByCombo,
-    fallbackSauces: normalizedFallbackSauces
-  };
 };
 
 const resolveLineComplementos = ({ item, receta, combo, context }) => {
@@ -6576,13 +6764,17 @@ router.post('/ventas/pedidos/:id/registrar-pago', checkPermission(['VENTAS_CREAR
 
 router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
   const ventasPerf = createVentasPerfTracker();
+  const ventasRpcV2Enabled = isVentasRpcV2Enabled();
+  const ventasRpcV1Enabled = isVentasRpcTransactionEnabled();
   const ventasPerfContext = {
     id_usuario: null,
     id_sucursal: null,
     id_caja: null,
     id_sesion_caja: null,
     items_count: Array.isArray(req.body?.items) ? req.body.items.length : 0,
-    rpc_enabled: isVentasRpcTransactionEnabled()
+    rpc_enabled: ventasRpcV2Enabled || ventasRpcV1Enabled,
+    rpc_v2_enabled: ventasRpcV2Enabled,
+    rpc_version: ventasRpcV2Enabled ? 'v2' : ventasRpcV1Enabled ? 'v1' : 'legacy'
   };
   const authContextStart = ventasPerf.now();
   const discountIntent = hasDiscountIntentInPayload(req.body);
@@ -6647,7 +6839,27 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
       items_count: allLines.length
     });
 
-    if (isVentasRpcTransactionEnabled()) {
+    if (ventasRpcV2Enabled) {
+      const rpcCreateResult = await createVentaWithRpcV2Transaction({
+        client,
+        venta,
+        perf: ventasPerf,
+        requestStartedAt: authContextStart
+      });
+
+      const commitStart = ventasPerf.now();
+      await client.query('COMMIT');
+      ventasPerf.add('commit_ms', commitStart);
+
+      res.status(201).json(rpcCreateResult.response);
+      ventasPerf.add('node_after_rpc_ms', rpcCreateResult.afterRpcStart);
+      ventasPerf.log(ventasPerfContext);
+
+      void registerVentaFidelizacionAfterCommit(rpcCreateResult.fidelizacionJob);
+      return;
+    }
+
+    if (ventasRpcV1Enabled) {
       const rpcCreateResult = await createVentaWithRpcTransaction({
         client,
         venta,
