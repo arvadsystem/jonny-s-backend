@@ -3,7 +3,7 @@ import pool from '../config/db-connection.js';
 import { checkPermission, requestHasAnyPermission } from '../middleware/checkPermission.js';
 import { resolveRequestUserSucursalScope } from '../utils/sucursalScope.js';
 import PDFDocument from 'pdfkit';
-import { sendReportEmail } from '../services/smtpMailer.js';
+import { getSmtpRuntimeInfo, isSmtpConfigured, sendReportEmail } from '../services/smtpMailer.js';
 
 const router = express.Router();
 
@@ -70,6 +70,7 @@ const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/i;
 const MAX_RECIPIENTS = 10;
 const MAX_SUBJECT_LENGTH = 240;
 const MAX_MESSAGE_LENGTH = 2000;
+const IS_DEV_LOG = String(process.env.NODE_ENV || '').trim().toLowerCase() !== 'production';
 
 const parsePositiveInt = (value) => {
   const parsed = Number.parseInt(String(value ?? ''), 10);
@@ -85,6 +86,22 @@ const normalizeFilterValue = (value) => {
   return normalized ? normalized : null;
 };
 
+const isValidCalendarDate = (value) => {
+  const text = String(value || '').trim();
+  if (!DATE_RE.test(text)) return false;
+  const [yearRaw, monthRaw, dayRaw] = text.split('-');
+  const year = Number.parseInt(yearRaw, 10);
+  const month = Number.parseInt(monthRaw, 10);
+  const day = Number.parseInt(dayRaw, 10);
+  if (!Number.isInteger(year) || !Number.isInteger(month) || !Number.isInteger(day)) return false;
+  const date = new Date(Date.UTC(year, month - 1, day));
+  return (
+    date.getUTCFullYear() === year
+    && date.getUTCMonth() + 1 === month
+    && date.getUTCDate() === day
+  );
+};
+
 const parseFilters = (query = {}) => {
   const filters = {};
 
@@ -96,12 +113,12 @@ const parseFilters = (query = {}) => {
   const fechaInicio = filters.fecha_inicio || null;
   const fechaFin = filters.fecha_fin || null;
 
-  if (fechaInicio && !DATE_RE.test(fechaInicio)) {
-    return { ok: false, message: 'La fecha_inicio debe usar formato YYYY-MM-DD.' };
+  if (fechaInicio && !isValidCalendarDate(fechaInicio)) {
+    return { ok: false, message: 'La fecha_inicio debe ser una fecha valida con formato YYYY-MM-DD.' };
   }
 
-  if (fechaFin && !DATE_RE.test(fechaFin)) {
-    return { ok: false, message: 'La fecha_fin debe usar formato YYYY-MM-DD.' };
+  if (fechaFin && !isValidCalendarDate(fechaFin)) {
+    return { ok: false, message: 'La fecha_fin debe ser una fecha valida con formato YYYY-MM-DD.' };
   }
 
   if (fechaInicio && fechaFin && fechaInicio > fechaFin) {
@@ -1878,6 +1895,29 @@ router.get('/reportes/exportar/pdf', checkPermission([BASE_PERMISSION, 'REPORTES
 
 router.post('/reportes/enviar-correo', checkPermission([BASE_PERMISSION, 'REPORTES_ENVIAR_CORREO']), async (req, res) => {
   try {
+    if (IS_DEV_LOG) {
+      const smtpInfo = getSmtpRuntimeInfo();
+      const debugPayload = req.body && typeof req.body === 'object' ? req.body : {};
+      console.log('[reportes][enviar-correo] request', {
+        id_usuario: req?.user?.id_usuario || null,
+        reporte: debugPayload?.reporte || null,
+        formato: debugPayload?.formato || null,
+        destinatarios_count: Array.isArray(debugPayload?.destinatarios) ? debugPayload.destinatarios.length : 0,
+        smtp_configured: smtpInfo.configured,
+        smtp_host: smtpInfo.host,
+        smtp_port: smtpInfo.port,
+        smtp_secure: smtpInfo.secure,
+        smtp_from_email: smtpInfo.from_email
+      });
+    }
+
+    if (!isSmtpConfigured()) {
+      return res.status(503).json({
+        error: true,
+        message: 'El servicio de correo no esta configurado en este entorno.'
+      });
+    }
+
     const payload = req.body && typeof req.body === 'object' ? req.body : {};
     const reportKeyInput = normalizeReportKeyInput(payload.reporte);
     const reportDefinition = Object.values(REPORT_DEFINITIONS).find((item) => item.key === reportKeyInput);
@@ -1977,7 +2017,7 @@ router.post('/reportes/enviar-correo', checkPermission([BASE_PERMISSION, 'REPORT
       </div>
     `;
 
-    await sendReportEmail({
+    const sendResult = await sendReportEmail({
       to: recipientsValidation.recipients,
       subject,
       html: htmlBody,
@@ -1991,6 +2031,16 @@ router.post('/reportes/enviar-correo', checkPermission([BASE_PERMISSION, 'REPORT
       ]
     });
 
+    if (IS_DEV_LOG) {
+      console.log('[reportes][enviar-correo] success', {
+        id_usuario: req?.user?.id_usuario || null,
+        reporte: reportDefinition.key,
+        formato,
+        destinatarios_count: recipientsValidation.recipients.length,
+        message_id: sendResult?.messageId || null
+      });
+    }
+
     return res.status(200).json({
       ok: true,
       enviado: true,
@@ -1999,6 +2049,24 @@ router.post('/reportes/enviar-correo', checkPermission([BASE_PERMISSION, 'REPORT
       destinatarios: recipientsValidation.recipients.length
     });
   } catch (error) {
+    if (IS_DEV_LOG) {
+      console.log('[reportes][enviar-correo] error', {
+        id_usuario: req?.user?.id_usuario || null,
+        name: error?.name || 'Error',
+        code: error?.code || null,
+        command: error?.command || null,
+        response_code: error?.responseCode || null,
+        message: String(error?.message || 'Error desconocido')
+      });
+    }
+
+    if (String(error?.message || '').toUpperCase().includes('SMTP')) {
+      return res.status(502).json({
+        error: true,
+        message: 'No se pudo enviar el reporte por correo. Verifica la configuracion SMTP.'
+      });
+    }
+
     return res.status(500).json({
       error: true,
       message: 'No se pudo enviar el reporte por correo.'

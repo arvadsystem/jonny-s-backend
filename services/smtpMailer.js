@@ -14,13 +14,40 @@ const parsePositiveIntEnv = (value, fallbackValue) => {
   return fallbackValue;
 };
 
+const extractSenderIdentity = (value) => {
+  const raw = String(value ?? '').trim();
+  if (!raw) return { name: '', email: '' };
+
+  const emailMatch = raw.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i);
+  const email = String(emailMatch?.[0] || '').trim();
+  if (!email) return { name: raw, email: '' };
+
+  const name = raw
+    .replace(email, '')
+    .replace(/[<>"]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  return { name, email };
+};
+
 const SMTP_HOST = String(process.env.SMTP_HOST ?? '').trim();
 const SMTP_PORT = parsePositiveIntEnv(process.env.SMTP_PORT, 587);
 const SMTP_SECURE = parseBooleanEnv(process.env.SMTP_SECURE, false);
 const SMTP_USER = String(process.env.SMTP_USER ?? '').trim();
 const SMTP_PASS = String(process.env.SMTP_PASS ?? '').trim();
-const SMTP_FROM_EMAIL = String(process.env.SMTP_FROM_EMAIL ?? 'noresponder@jonnyshn.com').trim();
-const SMTP_FROM_NAME = String(process.env.SMTP_FROM_NAME ?? "Jonny's").trim();
+const legacyFromIdentity = extractSenderIdentity(process.env.SMTP_FROM);
+const SMTP_FROM_EMAIL = String(
+  process.env.SMTP_FROM_EMAIL
+  ?? legacyFromIdentity.email
+  ?? 'noresponder@jonnyshn.com'
+).trim();
+const SMTP_FROM_NAME = String(
+  process.env.SMTP_FROM_NAME
+  ?? legacyFromIdentity.name
+  ?? "Jonny's"
+).trim();
+const IS_DEV_LOG = String(process.env.NODE_ENV || '').trim().toLowerCase() !== 'production';
 
 let cachedTransporter = null;
 
@@ -61,6 +88,15 @@ const getMissingSmtpFields = () => {
 };
 
 export const isSmtpConfigured = () => hasRequiredSmtpConfig();
+
+export const getSmtpRuntimeInfo = () => ({
+  configured: hasRequiredSmtpConfig(),
+  host: SMTP_HOST || null,
+  port: SMTP_PORT || null,
+  secure: SMTP_SECURE,
+  from_email: SMTP_FROM_EMAIL || null,
+  from_name: SMTP_FROM_NAME || null
+});
 
 export const getSmtpSenderIdentity = () => ({
   email: SMTP_FROM_EMAIL,
@@ -120,8 +156,7 @@ export const runSmtpDiagnostic = async () => {
 export const sendCampaignEmail = async ({ to, subject, html }) => {
   const transporter = getTransporter();
   const sender = getSmtpSenderIdentity();
-
-  return transporter.sendMail({
+  const result = await transporter.sendMail({
     from: {
       name: sender.name,
       address: sender.email
@@ -130,13 +165,23 @@ export const sendCampaignEmail = async ({ to, subject, html }) => {
     subject,
     html
   });
+
+  if (IS_DEV_LOG) {
+    console.log('[smtp][campaign] sent', {
+      to_count: Array.isArray(to) ? to.length : 1,
+      message_id: result?.messageId || null,
+      accepted: Array.isArray(result?.accepted) ? result.accepted.length : 0,
+      rejected: Array.isArray(result?.rejected) ? result.rejected.length : 0
+    });
+  }
+
+  return result;
 };
 
 export const sendReportEmail = async ({ to, subject, html, text, attachments = [] }) => {
   const transporter = getTransporter();
   const sender = getSmtpSenderIdentity();
-
-  return transporter.sendMail({
+  const result = await transporter.sendMail({
     from: {
       name: sender.name,
       address: sender.email
@@ -147,4 +192,16 @@ export const sendReportEmail = async ({ to, subject, html, text, attachments = [
     ...(html ? { html } : {}),
     ...(Array.isArray(attachments) && attachments.length > 0 ? { attachments } : {})
   });
+
+  if (IS_DEV_LOG) {
+    console.log('[smtp][report] sent', {
+      to_count: Array.isArray(to) ? to.length : 1,
+      attachments_count: Array.isArray(attachments) ? attachments.length : 0,
+      message_id: result?.messageId || null,
+      accepted: Array.isArray(result?.accepted) ? result.accepted.length : 0,
+      rejected: Array.isArray(result?.rejected) ? result.rejected.length : 0
+    });
+  }
+
+  return result;
 };
