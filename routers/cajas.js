@@ -1206,9 +1206,71 @@ const buildCajaSessionPayload = (sessionLike, fallback = {}) => {
     nombre_caja: source.nombre_caja ?? fallback.nombre_caja,
     id_sucursal: Number(source.id_sucursal ?? fallback.id_sucursal),
     nombre_sucursal: source.nombre_sucursal ?? fallback.nombre_sucursal,
+    rol_participacion: source.rol_participacion ?? source.rol_codigo ?? fallback.rol_participacion ?? fallback.rol_codigo ?? null,
     monto_apertura: roundMoney(source.monto_apertura ?? fallback.monto_apertura ?? 0),
     fecha_apertura: source.fecha_apertura ?? fallback.fecha_apertura ?? null
   };
+};
+
+const fetchMiSesionOperativaActiva = async (client, scopeContext) => {
+  const idEstadoAbierta = await getCatalogId(client, 'SESSION_STATES', 'ABIERTA');
+  const params = [scopeContext.idUsuario, idEstadoAbierta];
+  const filters = [
+    'cs.id_estado_sesion_caja = $2',
+    '(cs.id_usuario_responsable = $1 OR participante.id_participacion_caja IS NOT NULL)'
+  ];
+
+  if (scopeContext.targetSucursalId) {
+    params.push(scopeContext.targetSucursalId);
+    filters.push(`cs.id_sucursal = $${params.length}`);
+  } else if (!scopeContext.isSuperAdmin) {
+    params.push(scopeContext.allowedSucursalIds);
+    filters.push(`cs.id_sucursal = ANY($${params.length}::int[])`);
+  }
+
+  const result = await client.query(
+    `
+      SELECT
+        cs.id_sesion_caja,
+        cs.id_caja,
+        cs.id_sucursal,
+        c.codigo_caja,
+        c.nombre_caja,
+        s.nombre_sucursal,
+        COALESCE(
+          participante.rol_codigo,
+          CASE WHEN cs.id_usuario_responsable = $1 THEN 'RESPONSABLE' END
+        ) AS rol_participacion,
+        cs.fecha_apertura,
+        cs.monto_apertura
+      FROM public.cajas_sesiones cs
+      INNER JOIN public.cajas c
+        ON c.id_caja = cs.id_caja
+      INNER JOIN public.sucursales s
+        ON s.id_sucursal = cs.id_sucursal
+      LEFT JOIN LATERAL (
+        SELECT
+          csp.id_participacion_caja,
+          crp.codigo AS rol_codigo
+        FROM public.cajas_sesiones_participantes csp
+        LEFT JOIN public.cat_cajas_roles_participacion crp
+          ON crp.id_rol_participacion_caja = csp.id_rol_participacion_caja
+        WHERE csp.id_sesion_caja = cs.id_sesion_caja
+          AND csp.id_usuario = $1
+          AND COALESCE(csp.activo, true) = true
+        ORDER BY csp.fecha_inicio DESC NULLS LAST, csp.id_participacion_caja DESC
+        LIMIT 1
+      ) participante ON true
+      WHERE ${filters.join(' AND ')}
+      ORDER BY cs.fecha_apertura DESC, cs.id_sesion_caja DESC
+      LIMIT 1
+    `,
+    params
+  );
+
+  const session = result.rows?.[0] || null;
+  if (session) assertSucursalAllowed(scopeContext, session.id_sucursal);
+  return session;
 };
 
 const buildMiCajaAsignadaPayload = (assignment) => {
@@ -1992,6 +2054,27 @@ router.get('/ventas/cajas/sesion-activa', checkPermission(['VENTAS_CAJAS_LISTADO
     return res.status(200).json({ activa: true, session: result.rows[0] });
   } catch (err) {
     return sendInternalError(res, err, 'VENTAS_CAJAS_ACTIVE_SESSION_ERROR', 'No se pudo obtener la sesión activa de caja.');
+  }
+});
+
+router.get('/ventas/cajas/mi-sesion-activa', checkPermission(['VENTAS_CAJAS_SESION_ABRIR']), async (req, res) => {
+  try {
+    const hasSucursalQuery = Object.prototype.hasOwnProperty.call(req.query || {}, 'id_sucursal');
+    const requestedSucursalId = parseNullablePositiveInt(req.query.id_sucursal);
+    if (hasSucursalQuery && !requestedSucursalId) {
+      throw createCajaError(400, 'VENTAS_CAJAS_SCOPE_INVALID', 'El id de sucursal es invalido.');
+    }
+
+    const scopeContext = await getScopeContext(req, pool, requestedSucursalId, true);
+    const session = await fetchMiSesionOperativaActiva(pool, scopeContext);
+    if (!session) return res.status(200).json({ activa: false, session: null });
+
+    return res.status(200).json({
+      activa: true,
+      session: buildCajaSessionPayload(session)
+    });
+  } catch (err) {
+    return sendInternalError(res, err, 'VENTAS_CAJAS_MY_ACTIVE_SESSION_ERROR', 'No se pudo obtener la sesion activa de caja.');
   }
 });
 
