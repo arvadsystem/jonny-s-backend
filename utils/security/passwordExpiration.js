@@ -4,6 +4,12 @@ export const PASSWORD_EXPIRATION_DAYS = 60;
 export const PASSWORD_CHANGED_AT_COLUMN = 'fecha_cambio_clave';
 
 const DAY_MS = 24 * 60 * 60 * 1000;
+const PASSWORD_FORCE_EXCLUDED_ROLE_CODES = new Set([
+  'CLIENTE',
+  'P_COCINA',
+  'COCINA',
+  'AUXILIAR_COCINA'
+]);
 
 let ensurePasswordChangedAtColumnPromise = null;
 
@@ -23,10 +29,12 @@ const parseDate = (value) => {
 
 export const isClienteUser = ({ roles = [], tipoUsuario = '' } = {}) => {
   const tipo = normalizeRoleName(tipoUsuario);
-  if (tipo === 'CLIENTE') return true;
+  if (PASSWORD_FORCE_EXCLUDED_ROLE_CODES.has(tipo)) return true;
 
   const roleList = Array.isArray(roles) ? roles : [roles];
-  return roleList.map(normalizeRoleName).includes('CLIENTE');
+  return roleList
+    .map(normalizeRoleName)
+    .some((roleName) => PASSWORD_FORCE_EXCLUDED_ROLE_CODES.has(roleName));
 };
 
 export const evaluatePasswordExpiration = ({

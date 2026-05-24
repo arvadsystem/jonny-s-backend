@@ -6,6 +6,12 @@
 import pool from '../../config/db-connection.js';
 
 const HN_NOW_SQL = "timezone('America/Tegucigalpa', now())";
+const INACTIVITY_EXCLUDED_ROLE_CODES = Object.freeze([
+  'COCINA',
+  'MESERO',
+  'AUXILIAR_COCINA',
+  'P_COCINA'
+]);
 
 const parseInactivityMinutes = () => {
   const raw = Number.parseInt(String(process.env.SESSION_INACTIVITY_MINUTES ?? ''), 10);
@@ -112,14 +118,21 @@ export async function closeInactiveSessions(minutes = SESSION_INACTIVITY_MINUTES
   const safeMinutes = Number.isInteger(minutes) && minutes > 0 ? minutes : SESSION_INACTIVITY_MINUTES;
 
   const sql = `
-    UPDATE sesiones_activas
+    UPDATE sesiones_activas sa
     SET activa = FALSE,
         fecha_cierre = ${HN_NOW_SQL},
         motivo_cierre = 'inactividad'
-    WHERE activa = TRUE
-      AND ultima_actividad <= (${HN_NOW_SQL} - make_interval(mins => $1))
+    WHERE sa.activa = TRUE
+      AND sa.ultima_actividad <= (${HN_NOW_SQL} - make_interval(mins => $1))
+      AND NOT EXISTS (
+        SELECT 1
+        FROM roles_usuarios ru
+        INNER JOIN roles r ON r.id_rol = ru.id_rol
+        WHERE ru.id_usuario = sa.id_usuario
+          AND UPPER(REGEXP_REPLACE(TRIM(r.nombre), '[\\s-]+', '_', 'g')) = ANY($2::text[])
+      )
   `;
 
-  const result = await pool.query(sql, [safeMinutes]);
+  const result = await pool.query(sql, [safeMinutes, INACTIVITY_EXCLUDED_ROLE_CODES]);
   return result.rowCount || 0;
 }
