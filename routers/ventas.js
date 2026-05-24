@@ -911,6 +911,8 @@ const buildDirectSaleDetailItems = (rows) =>
     sub_total: roundMoney(row.sub_total),
     total_linea: roundMoney(row.total_linea),
     descuento: roundMoney(row.descuento),
+    descuento_linea: roundMoney(row.descuento_linea),
+    descuento_global: roundMoney(row.descuento_global),
     observacion: null
   }));
 
@@ -927,6 +929,8 @@ const buildKitchenSaleDetailItems = (rows) =>
     sub_total: roundMoney(row.sub_total),
     total_linea: roundMoney(row.total_linea),
     descuento: roundMoney(row.descuento),
+    descuento_linea: roundMoney(row.descuento_linea),
+    descuento_global: roundMoney(row.descuento_global),
     observacion: normalizeObservation(row.observacion)
   }));
 
@@ -990,7 +994,8 @@ const buildCreatedVentaDetailItems = ({ detalleFacturaRows, detalleFacturaRowsIn
         subtotal_linea: roundMoney(line.sub_total),
         total_linea: roundMoney(line.total_linea),
         descuento: roundMoney(line.descuento),
-        descuento_linea: roundMoney(line.descuento),
+        descuento_linea: roundMoney(line.descuento_linea),
+        descuento_global: roundMoney(line.descuento_global),
         isv_15_linea: null,
         isv_18_linea: null,
         exento_linea: null,
@@ -1058,9 +1063,12 @@ const buildCreateVentaDetailResponse = ({
     efectivo_entregado: venta.efectivo_entregado,
     cambio: venta.cambio,
     sub_total: subtotal,
+    subtotal_bruto: roundMoney(venta.subtotal_bruto ?? subtotal + descuento),
     subtotal,
     descuento_total: descuento,
     descuento,
+    descuento_lineas: roundMoney(venta.descuento_lineas),
+    descuento_global: roundMoney(venta.descuento_global),
     isv,
     impuesto: isv,
     isv_15: isv,
@@ -1130,6 +1138,10 @@ const buildVentaRpcItems = (venta) =>
       precio_unitario: roundMoney(line.precio_unitario),
       total_detalle: roundMoney(line.total_linea),
       descuento: roundMoney(line.descuento),
+      descuento_linea: roundMoney(line.descuento_linea),
+      descuento_global: roundMoney(line.descuento_global),
+      id_descuento_catalogo_linea: line.id_descuento_catalogo_linea_aplicado || null,
+      id_descuento_catalogo_global: line.id_descuento_catalogo_global || null,
       observacion: line.observacion || null,
       componentes: complementSnapshot
     };
@@ -1762,10 +1774,28 @@ const fetchDiscountCatalogById = async (client, idDescuentoCatalogo) => {
         dc.fecha_fin,
         dc.id_tipo_descuento,
         td.nombre_tipo_descuento,
-        td.estado AS tipo_estado
+        td.estado AS tipo_estado,
+        COALESCE(dcp.productos_ids, ARRAY[]::int[]) AS productos_ids,
+        COALESCE(dcr.recetas_ids, ARRAY[]::int[]) AS recetas_ids,
+        COALESCE(dcc.combos_ids, ARRAY[]::int[]) AS combos_ids
       FROM descuentos_catalogos dc
       INNER JOIN tipo_descuentos td
         ON td.id_tipo_descuento = dc.id_tipo_descuento
+      LEFT JOIN LATERAL (
+        SELECT ARRAY_AGG(DISTINCT rel.id_producto ORDER BY rel.id_producto)::int[] AS productos_ids
+        FROM descuentos_catalogos_productos rel
+        WHERE rel.id_descuento_catalogo = dc.id_descuento_catalogo
+      ) dcp ON true
+      LEFT JOIN LATERAL (
+        SELECT ARRAY_AGG(DISTINCT rel.id_receta ORDER BY rel.id_receta)::int[] AS recetas_ids
+        FROM descuentos_catalogos_recetas rel
+        WHERE rel.id_descuento_catalogo = dc.id_descuento_catalogo
+      ) dcr ON true
+      LEFT JOIN LATERAL (
+        SELECT ARRAY_AGG(DISTINCT rel.id_combo ORDER BY rel.id_combo)::int[] AS combos_ids
+        FROM descuentos_catalogos_combos rel
+        WHERE rel.id_descuento_catalogo = dc.id_descuento_catalogo
+      ) dcc ON true
       WHERE dc.id_descuento_catalogo = $1
       LIMIT 1
     `,
@@ -1806,10 +1836,28 @@ const fetchDiscountCatalogMapByIds = async (client, ids) => {
         dc.fecha_fin,
         dc.id_tipo_descuento,
         td.nombre_tipo_descuento,
-        td.estado AS tipo_estado
+        td.estado AS tipo_estado,
+        COALESCE(dcp.productos_ids, ARRAY[]::int[]) AS productos_ids,
+        COALESCE(dcr.recetas_ids, ARRAY[]::int[]) AS recetas_ids,
+        COALESCE(dcc.combos_ids, ARRAY[]::int[]) AS combos_ids
       FROM descuentos_catalogos dc
       INNER JOIN tipo_descuentos td
         ON td.id_tipo_descuento = dc.id_tipo_descuento
+      LEFT JOIN LATERAL (
+        SELECT ARRAY_AGG(DISTINCT rel.id_producto ORDER BY rel.id_producto)::int[] AS productos_ids
+        FROM descuentos_catalogos_productos rel
+        WHERE rel.id_descuento_catalogo = dc.id_descuento_catalogo
+      ) dcp ON true
+      LEFT JOIN LATERAL (
+        SELECT ARRAY_AGG(DISTINCT rel.id_receta ORDER BY rel.id_receta)::int[] AS recetas_ids
+        FROM descuentos_catalogos_recetas rel
+        WHERE rel.id_descuento_catalogo = dc.id_descuento_catalogo
+      ) dcr ON true
+      LEFT JOIN LATERAL (
+        SELECT ARRAY_AGG(DISTINCT rel.id_combo ORDER BY rel.id_combo)::int[] AS combos_ids
+        FROM descuentos_catalogos_combos rel
+        WHERE rel.id_descuento_catalogo = dc.id_descuento_catalogo
+      ) dcc ON true
       WHERE dc.id_descuento_catalogo = ANY($1::int[])
       ORDER BY dc.id_descuento_catalogo ASC
     `,
@@ -1889,13 +1937,31 @@ const validateCatalogDiscountAvailability = ({
   }
 
   if (line) {
-    if (alcance === DESCUENTO_ALCANCE_KEYS.PRODUCTO && Number(discountCatalog.id_producto || 0) !== Number(line.id_producto || 0)) {
+    const productosIds = coercePositiveIntArray(discountCatalog.productos_ids);
+    const recetasIds = coercePositiveIntArray(discountCatalog.recetas_ids);
+    const combosIds = coercePositiveIntArray(discountCatalog.combos_ids);
+    if (
+      alcance === DESCUENTO_ALCANCE_KEYS.PRODUCTO &&
+      !(productosIds.length > 0
+        ? productosIds.includes(Number(line.id_producto || 0))
+        : Number(discountCatalog.id_producto || 0) === Number(line.id_producto || 0))
+    ) {
       return { ok: false, status: 409, code: 'VENTAS_DESCUENTO_ITEM_NO_APLICA', message: 'El descuento de producto no aplica a esta linea.' };
     }
-    if (alcance === DESCUENTO_ALCANCE_KEYS.RECETA && Number(discountCatalog.id_receta || 0) !== Number(line.id_receta || 0)) {
+    if (
+      alcance === DESCUENTO_ALCANCE_KEYS.RECETA &&
+      !(recetasIds.length > 0
+        ? recetasIds.includes(Number(line.id_receta || 0))
+        : Number(discountCatalog.id_receta || 0) === Number(line.id_receta || 0))
+    ) {
       return { ok: false, status: 409, code: 'VENTAS_DESCUENTO_ITEM_NO_APLICA', message: 'El descuento de receta no aplica a esta linea.' };
     }
-    if (alcance === DESCUENTO_ALCANCE_KEYS.COMBO && Number(discountCatalog.id_combo || 0) !== Number(line.id_combo || 0)) {
+    if (
+      alcance === DESCUENTO_ALCANCE_KEYS.COMBO &&
+      !(combosIds.length > 0
+        ? combosIds.includes(Number(line.id_combo || 0))
+        : Number(discountCatalog.id_combo || 0) === Number(line.id_combo || 0))
+    ) {
       return { ok: false, status: 409, code: 'VENTAS_DESCUENTO_ITEM_NO_APLICA', message: 'El descuento de combo no aplica a esta linea.' };
     }
   }
@@ -3009,25 +3075,14 @@ const buildPedidoPendientePayload = async ({ client, body, userId, sucursalScope
   if (body.id_descuento_catalogo !== undefined && body.id_descuento_catalogo !== null && !idDescuentoCatalogo) return { ok: false, status: 400, body: { error: true, message: 'id_descuento_catalogo debe ser un entero mayor a 0.' } };
   if (body.descuento !== undefined && descuentoLegacyInput === null) return { ok: false, status: 400, body: { error: true, message: 'descuento debe ser un numero mayor o igual a 0.' } };
 
-  let descuentoTotal = descuentoLegacyInput || 0;
+  let descuentoGlobalTotal = 0;
   let appliedDiscountCatalog = null;
   const hasGlobalCatalogDiscount = Boolean(idDescuentoCatalogo);
   const hasLegacyDiscount = Number(descuentoLegacyInput || 0) > 0;
   const hasLineDiscountAttempt = lines.some((line) => Number(line.id_descuento_catalogo_linea || 0) > 0);
   const hasDiscountAttempt = hasGlobalCatalogDiscount || hasLegacyDiscount || hasLineDiscountAttempt;
   if (hasDiscountAttempt && !canApplyDiscount) return { ok: false, status: 403, body: { error: true, code: 'VENTAS_DESCUENTO_NO_AUTORIZADO', message: 'No tienes permiso para aplicar descuentos en ventas.' } };
-  if ((hasGlobalCatalogDiscount || hasLegacyDiscount) && hasLineDiscountAttempt) return { ok: false, status: 409, body: { error: true, code: 'VENTAS_DESCUENTO_ACUMULACION_NO_PERMITIDA', message: 'No se permite combinar descuento global con descuentos por linea.' } };
 
-  if (idDescuentoCatalogo) {
-    const discountCatalog = await fetchDiscountCatalogById(client, idDescuentoCatalogo);
-    const validatedGlobalDiscount = validateCatalogDiscountAvailability({ discountCatalog, idSucursal, subtotalObjetivo: subtotalBruto, alcanceEsperado: DESCUENTO_ALCANCE_KEYS.FACTURA_COMPLETA });
-    if (!validatedGlobalDiscount.ok) return { ok: false, status: validatedGlobalDiscount.status, body: { error: true, code: validatedGlobalDiscount.code, message: validatedGlobalDiscount.message } };
-    descuentoTotal = validatedGlobalDiscount.montoCalculado;
-    appliedDiscountCatalog = { id_descuento_catalogo: Number(discountCatalog.id_descuento_catalogo) };
-  }
-  if (descuentoTotal > subtotalBruto) return { ok: false, status: 400, body: { error: true, message: 'El descuento no puede ser mayor al subtotal.' } };
-
-  const descuentosPorLinea = allocateDiscounts(subTotals, descuentoTotal);
   const descuentosLineaMap = new Map();
   const descuentosCatalogoLineaMap = new Map();
   if (hasLineDiscountAttempt) {
@@ -3043,13 +3098,37 @@ const buildPedidoPendientePayload = async ({ client, body, userId, sucursalScope
     }
   }
 
+  const descuentoLineasTotal = roundMoney([...descuentosLineaMap.values()].reduce((sum, value) => sum + Number(value || 0), 0));
+  const subtotalDespuesLinea = roundMoney(Math.max(subtotalBruto - descuentoLineasTotal, 0));
+
+  if (idDescuentoCatalogo) {
+    const discountCatalog = await fetchDiscountCatalogById(client, idDescuentoCatalogo);
+    const validatedGlobalDiscount = validateCatalogDiscountAvailability({ discountCatalog, idSucursal, subtotalObjetivo: subtotalDespuesLinea, alcanceEsperado: DESCUENTO_ALCANCE_KEYS.FACTURA_COMPLETA });
+    if (!validatedGlobalDiscount.ok) return { ok: false, status: validatedGlobalDiscount.status, body: { error: true, code: validatedGlobalDiscount.code, message: validatedGlobalDiscount.message } };
+    descuentoGlobalTotal = validatedGlobalDiscount.montoCalculado;
+    appliedDiscountCatalog = { id_descuento_catalogo: Number(discountCatalog.id_descuento_catalogo) };
+  } else if (hasLegacyDiscount) {
+    if (descuentoLegacyInput > subtotalDespuesLinea) return { ok: false, status: 400, body: { error: true, message: 'El descuento no puede ser mayor al subtotal.' } };
+    descuentoGlobalTotal = roundMoney(descuentoLegacyInput);
+  }
+
+  const descuentosGlobalesPorLinea = allocateDiscounts(
+    lines.map((line, index) => roundMoney(line.sub_total - roundMoney(descuentosLineaMap.get(index) || 0))),
+    descuentoGlobalTotal
+  );
+
   const finalizedLines = lines.map((line, index) => ({
     ...line,
-    id_descuento_catalogo: hasLineDiscountAttempt ? descuentosCatalogoLineaMap.get(index) || null : appliedDiscountCatalog?.id_descuento_catalogo ?? null,
-    descuento: hasLineDiscountAttempt ? roundMoney(descuentosLineaMap.get(index) || 0) : descuentosPorLinea[index],
-    total_linea: hasLineDiscountAttempt ? roundMoney(line.sub_total - roundMoney(descuentosLineaMap.get(index) || 0)) : roundMoney(line.sub_total - descuentosPorLinea[index])
+    id_descuento_catalogo: descuentosCatalogoLineaMap.get(index) || appliedDiscountCatalog?.id_descuento_catalogo || null,
+    id_descuento_catalogo_linea_aplicado: descuentosCatalogoLineaMap.get(index) || null,
+    id_descuento_catalogo_global: appliedDiscountCatalog?.id_descuento_catalogo ?? null,
+    descuento_linea: roundMoney(descuentosLineaMap.get(index) || 0),
+    descuento_global: roundMoney(descuentosGlobalesPorLinea[index] || 0),
+    descuento: roundMoney(roundMoney(descuentosLineaMap.get(index) || 0) + roundMoney(descuentosGlobalesPorLinea[index] || 0)),
+    total_linea: roundMoney(line.sub_total - roundMoney(descuentosLineaMap.get(index) || 0) - roundMoney(descuentosGlobalesPorLinea[index] || 0))
   }));
 
+  const descuentoTotal = roundMoney(finalizedLines.reduce((sum, line) => sum + Number(line.descuento || 0), 0));
   const subtotal = roundMoney(finalizedLines.reduce((sum, line) => sum + line.total_linea, 0));
   const isv = roundMoney(subtotal * 0.15);
   const total = roundMoney(subtotal + isv + costoEnvio);
@@ -3099,6 +3178,11 @@ const buildPedidoPendientePayload = async ({ client, body, userId, sucursalScope
       descripcion_pedido: buildKitchenDescriptionSummary(finalizedLines, contexto.observacion_contexto),
       descripcion_envio: modalidad === 'DELIVERY' ? (delivery.direccion_entrega + ' | Ref: ' + delivery.referencia_entrega).slice(0, 250) : modalidad,
       pedido_lines: finalizedLines,
+      subtotal_bruto: subtotalBruto,
+      descuento: descuentoTotal,
+      descuento_lineas: descuentoLineasTotal,
+      descuento_global: descuentoGlobalTotal,
+      id_descuento_catalogo: appliedDiscountCatalog?.id_descuento_catalogo ?? null,
       subtotal,
       isv,
       costo_envio: costoEnvio,
@@ -3143,6 +3227,10 @@ const buildPedidoFacturaSnapshot = (row, quantity, tipoItem, precioUnitario, sub
   sub_total: roundMoney(subTotal),
   total_detalle: roundMoney(totalDetalle),
   descuento: roundMoney(roundMoney(subTotal) - roundMoney(totalDetalle)),
+  descuento_linea: roundMoney(row.descuento_linea),
+  descuento_global: roundMoney(row.descuento_global),
+  id_descuento_catalogo_linea: row.id_descuento_catalogo_linea || null,
+  id_descuento_catalogo_global: row.id_descuento_catalogo_global || null,
   observacion: row.observacion || null,
   origen: 'PEDIDO_PENDIENTE'
 });
@@ -3505,7 +3593,7 @@ const buildVentaPayload = async ({ client, body, userId, sucursalScope, canApply
 
   const { lines, subTotals } = hydratedResult.data;
   const subtotalBruto = roundMoney(subTotals.reduce((sum, value) => sum + value, 0));
-  let descuentoTotal = descuentoLegacyInput || 0;
+  let descuentoGlobalTotal = 0;
   let appliedDiscountCatalog = null;
   const hasGlobalCatalogDiscount = Boolean(idDescuentoCatalogo);
   const hasLegacyDiscount = Number(descuentoLegacyInput || 0) > 0;
@@ -3524,62 +3612,12 @@ const buildVentaPayload = async ({ client, body, userId, sucursalScope, canApply
     };
   }
 
-  if ((hasGlobalCatalogDiscount || hasLegacyDiscount) && hasLineDiscountAttempt) {
-    return {
-      ok: false,
-      status: 409,
-      body: {
-        error: true,
-        code: 'VENTAS_DESCUENTO_ACUMULACION_NO_PERMITIDA',
-        message: 'No se permite combinar descuento global con descuentos por linea.'
-      }
-    };
-  }
-
   const totalsDescuentosStart = perf?.now?.() || 0;
   const discountCatalogIds = [
     idDescuentoCatalogo,
     ...lines.map((line) => parseOptionalPositiveInt(line.id_descuento_catalogo_linea))
   ].filter(Boolean);
   const discountCatalogMap = await fetchDiscountCatalogMapByIds(client, discountCatalogIds);
-  if (idDescuentoCatalogo) {
-    const discountCatalog = discountCatalogMap.get(idDescuentoCatalogo) || null;
-    const validatedGlobalDiscount = validateCatalogDiscountAvailability({
-      discountCatalog,
-      idSucursal,
-      subtotalObjetivo: subtotalBruto,
-      alcanceEsperado: DESCUENTO_ALCANCE_KEYS.FACTURA_COMPLETA
-    });
-    if (!validatedGlobalDiscount.ok) {
-      return {
-        ok: false,
-        status: validatedGlobalDiscount.status,
-        body: {
-          error: true,
-          code: validatedGlobalDiscount.code,
-          message: validatedGlobalDiscount.message
-        }
-      };
-    }
-
-    descuentoTotal = validatedGlobalDiscount.montoCalculado;
-    appliedDiscountCatalog = {
-      id_descuento_catalogo: Number(discountCatalog.id_descuento_catalogo),
-      id_tipo_descuento: Number(discountCatalog.id_tipo_descuento),
-      tipo_descuento_key: validatedGlobalDiscount.tipoDescuentoKey,
-      alcance: validatedGlobalDiscount.alcance
-    };
-  }
-
-  if (descuentoTotal > subtotalBruto) {
-    return {
-      ok: false,
-      status: 400,
-      body: { error: true, message: 'El descuento no puede ser mayor al subtotal.' }
-    };
-  }
-
-  const descuentosPorLinea = allocateDiscounts(subTotals, descuentoTotal);
   const descuentosLineaMap = new Map();
   const descuentosCatalogoLineaMap = new Map();
 
@@ -3615,24 +3653,67 @@ const buildVentaPayload = async ({ client, body, userId, sucursalScope, canApply
     }
   }
 
+  const descuentoLineasTotal = roundMoney([...descuentosLineaMap.values()].reduce((sum, value) => sum + Number(value || 0), 0));
+  const subtotalDespuesLinea = roundMoney(Math.max(subtotalBruto - descuentoLineasTotal, 0));
+
+  if (idDescuentoCatalogo) {
+    const discountCatalog = discountCatalogMap.get(idDescuentoCatalogo) || null;
+    const validatedGlobalDiscount = validateCatalogDiscountAvailability({
+      discountCatalog,
+      idSucursal,
+      subtotalObjetivo: subtotalDespuesLinea,
+      alcanceEsperado: DESCUENTO_ALCANCE_KEYS.FACTURA_COMPLETA
+    });
+    if (!validatedGlobalDiscount.ok) {
+      return {
+        ok: false,
+        status: validatedGlobalDiscount.status,
+        body: {
+          error: true,
+          code: validatedGlobalDiscount.code,
+          message: validatedGlobalDiscount.message
+        }
+      };
+    }
+
+    descuentoGlobalTotal = validatedGlobalDiscount.montoCalculado;
+    appliedDiscountCatalog = {
+      id_descuento_catalogo: Number(discountCatalog.id_descuento_catalogo),
+      id_tipo_descuento: Number(discountCatalog.id_tipo_descuento),
+      tipo_descuento_key: validatedGlobalDiscount.tipoDescuentoKey,
+      alcance: validatedGlobalDiscount.alcance
+    };
+  } else if (hasLegacyDiscount) {
+    if (descuentoLegacyInput > subtotalDespuesLinea) {
+      return {
+        ok: false,
+        status: 400,
+        body: { error: true, message: 'El descuento no puede ser mayor al subtotal.' }
+      };
+    }
+    descuentoGlobalTotal = roundMoney(descuentoLegacyInput);
+  }
+
   perf?.add?.('totals_descuentos_ms', totalsDescuentosStart);
   const totalsBuildStart = perf?.now?.() || 0;
 
+  const descuentosGlobalesPorLinea = allocateDiscounts(
+    lines.map((line, index) => roundMoney(line.sub_total - roundMoney(descuentosLineaMap.get(index) || 0))),
+    descuentoGlobalTotal
+  );
+
   const finalizedLines = lines.map((line, index) => ({
     ...line,
-    id_descuento_catalogo:
-      hasLineDiscountAttempt
-        ? descuentosCatalogoLineaMap.get(index) || null
-        : appliedDiscountCatalog?.id_descuento_catalogo ?? null,
-    descuento: hasLineDiscountAttempt
-      ? roundMoney(descuentosLineaMap.get(index) || 0)
-      : descuentosPorLinea[index],
-    total_linea: hasLineDiscountAttempt
-      ? roundMoney(line.sub_total - roundMoney(descuentosLineaMap.get(index) || 0))
-      : roundMoney(line.sub_total - descuentosPorLinea[index])
+    id_descuento_catalogo: descuentosCatalogoLineaMap.get(index) || appliedDiscountCatalog?.id_descuento_catalogo || null,
+    id_descuento_catalogo_linea_aplicado: descuentosCatalogoLineaMap.get(index) || null,
+    id_descuento_catalogo_global: appliedDiscountCatalog?.id_descuento_catalogo ?? null,
+    descuento_linea: roundMoney(descuentosLineaMap.get(index) || 0),
+    descuento_global: roundMoney(descuentosGlobalesPorLinea[index] || 0),
+    descuento: roundMoney(roundMoney(descuentosLineaMap.get(index) || 0) + roundMoney(descuentosGlobalesPorLinea[index] || 0)),
+    total_linea: roundMoney(line.sub_total - roundMoney(descuentosLineaMap.get(index) || 0) - roundMoney(descuentosGlobalesPorLinea[index] || 0))
   }));
 
-  descuentoTotal = roundMoney(finalizedLines.reduce((sum, line) => sum + Number(line.descuento || 0), 0));
+  const descuentoTotal = roundMoney(finalizedLines.reduce((sum, line) => sum + Number(line.descuento || 0), 0));
   perf?.add?.('totals_build_ms', totalsBuildStart);
   const totalsImpuestosStart = perf?.now?.() || 0;
 
@@ -3726,7 +3807,10 @@ const buildVentaPayload = async ({ client, body, userId, sucursalScope, canApply
       descripcion_envio:
         typeof body.descripcion_envio === 'string' ? body.descripcion_envio.trim() : null,
       descuento: descuentoTotal,
+      descuento_lineas: descuentoLineasTotal,
+      descuento_global: descuentoGlobalTotal,
       id_descuento_catalogo: appliedDiscountCatalog?.id_descuento_catalogo ?? null,
+      subtotal_bruto: subtotalBruto,
       subtotal,
       isv,
       total,
@@ -3750,6 +3834,32 @@ const buildVentaPayload = async ({ client, body, userId, sucursalScope, canApply
   };
 };
 
+const normalizeDescuentoObjetivosPayload = (payload, alcance) => {
+  const objetivos = isPlainObject(payload?.objetivos) ? payload.objetivos : {};
+  const productos = coercePositiveIntArray(objetivos.productos);
+  const recetas = coercePositiveIntArray(objetivos.recetas);
+  const combos = coercePositiveIntArray(objetivos.combos);
+  const legacyProducto = parseOptionalPositiveInt(payload?.id_producto);
+  const legacyReceta = parseOptionalPositiveInt(payload?.id_receta);
+  const legacyCombo = parseOptionalPositiveInt(payload?.id_combo);
+
+  if (alcance === DESCUENTO_ALCANCE_KEYS.PRODUCTO && productos.length === 0 && legacyProducto) {
+    productos.push(legacyProducto);
+  }
+  if (alcance === DESCUENTO_ALCANCE_KEYS.RECETA && recetas.length === 0 && legacyReceta) {
+    recetas.push(legacyReceta);
+  }
+  if (alcance === DESCUENTO_ALCANCE_KEYS.COMBO && combos.length === 0 && legacyCombo) {
+    combos.push(legacyCombo);
+  }
+
+  return {
+    productos: alcance === DESCUENTO_ALCANCE_KEYS.PRODUCTO ? coercePositiveIntArray(productos) : [],
+    recetas: alcance === DESCUENTO_ALCANCE_KEYS.RECETA ? coercePositiveIntArray(recetas) : [],
+    combos: alcance === DESCUENTO_ALCANCE_KEYS.COMBO ? coercePositiveIntArray(combos) : []
+  };
+};
+
 const validateDescuentoCatalogoPayload = async (client, payload, options = {}) => {
   const mode = options.mode || 'create';
   if (!isPlainObject(payload)) {
@@ -3764,9 +3874,6 @@ const validateDescuentoCatalogoPayload = async (client, payload, options = {}) =
   const valorDescuento = parseNonNegativeNumber(payload.valor_descuento);
   const tipoResult = parseRequiredPositiveInt(payload.id_tipo_descuento, 'id_tipo_descuento');
   const alcance = normalizeDescuentoAlcance(payload.alcance || DESCUENTO_ALCANCE_KEYS.FACTURA_COMPLETA);
-  const idProducto = parseOptionalPositiveInt(payload.id_producto);
-  const idReceta = parseOptionalPositiveInt(payload.id_receta);
-  const idCombo = parseOptionalPositiveInt(payload.id_combo);
   const idSucursal = parseOptionalPositiveInt(payload.id_sucursal);
   const fechaInicio = payload.fecha_inicio ? String(payload.fecha_inicio).trim() : null;
   const fechaFin = payload.fecha_fin ? String(payload.fecha_fin).trim() : null;
@@ -3784,21 +3891,19 @@ const validateDescuentoCatalogoPayload = async (client, payload, options = {}) =
     return { ok: false, status: 400, message: 'alcance invalido.' };
   }
 
-  const idsObjetivo = [idProducto, idReceta, idCombo].filter(Boolean);
-  if (alcance === DESCUENTO_ALCANCE_KEYS.PRODUCTO && !idProducto) {
-    return { ok: false, status: 400, message: 'id_producto es obligatorio para alcance PRODUCTO.' };
+  const objetivos = normalizeDescuentoObjetivosPayload(payload, alcance);
+  const objetivosCount = objetivos.productos.length + objetivos.recetas.length + objetivos.combos.length;
+  if (alcance === DESCUENTO_ALCANCE_KEYS.PRODUCTO && objetivos.productos.length === 0) {
+    return { ok: false, status: 400, message: 'Selecciona al menos un producto para alcance PRODUCTO.' };
   }
-  if (alcance === DESCUENTO_ALCANCE_KEYS.RECETA && !idReceta) {
-    return { ok: false, status: 400, message: 'id_receta es obligatorio para alcance RECETA.' };
+  if (alcance === DESCUENTO_ALCANCE_KEYS.RECETA && objetivos.recetas.length === 0) {
+    return { ok: false, status: 400, message: 'Selecciona al menos una receta para alcance RECETA.' };
   }
-  if (alcance === DESCUENTO_ALCANCE_KEYS.COMBO && !idCombo) {
-    return { ok: false, status: 400, message: 'id_combo es obligatorio para alcance COMBO.' };
+  if (alcance === DESCUENTO_ALCANCE_KEYS.COMBO && objetivos.combos.length === 0) {
+    return { ok: false, status: 400, message: 'Selecciona al menos un combo para alcance COMBO.' };
   }
-  if (alcance === DESCUENTO_ALCANCE_KEYS.FACTURA_COMPLETA && idsObjetivo.length > 0) {
-    return { ok: false, status: 400, message: 'FACTURA_COMPLETA no permite id_producto/id_receta/id_combo.' };
-  }
-  if (alcance !== DESCUENTO_ALCANCE_KEYS.FACTURA_COMPLETA && idsObjetivo.length !== 1) {
-    return { ok: false, status: 400, message: 'Debe enviar un unico objetivo para el alcance seleccionado.' };
+  if (alcance === DESCUENTO_ALCANCE_KEYS.FACTURA_COMPLETA && objetivosCount > 0) {
+    return { ok: false, status: 400, message: 'FACTURA_COMPLETA no permite objetivos de producto, receta o combo.' };
   }
   if (fechaInicio && parseOptionalDateTime(fechaInicio) === null) {
     return { ok: false, status: 400, message: 'fecha_inicio invalida.' };
@@ -3840,17 +3945,101 @@ const validateDescuentoCatalogoPayload = async (client, payload, options = {}) =
       descripcion,
       valor_descuento: valorDescuento,
       alcance,
-      id_producto: idProducto,
-      id_receta: idReceta,
-      id_combo: idCombo,
       id_sucursal: idSucursal,
       fecha_inicio: fechaInicio,
       fecha_fin: fechaFin,
       id_tipo_descuento: tipoResult.value,
       estado: estadoParsed.value,
+      objetivos,
       mode
     }
   };
+};
+
+const buildDescuentoCatalogoRpcPayload = ({ idDescuentoCatalogo = null, data, idUsuario }) => ({
+  id_descuento_catalogo: idDescuentoCatalogo || null,
+  nombre_descuento: data.nombre_descuento,
+  descripcion: data.descripcion,
+  valor_descuento: data.valor_descuento,
+  id_tipo_descuento: data.id_tipo_descuento,
+  estado: data.estado,
+  id_usuario: idUsuario || null,
+  alcance: data.alcance,
+  id_sucursal: data.id_sucursal,
+  fecha_inicio: data.fecha_inicio,
+  fecha_fin: data.fecha_fin,
+  objetivos: data.objetivos || { productos: [], recetas: [], combos: [] }
+});
+
+const upsertDescuentoCatalogoConObjetivos = async ({ client, payload, actor }) => {
+  const result = await client.query(
+    'SELECT public.upsert_descuento_catalogo_con_objetivos($1::jsonb, $2::jsonb) AS response',
+    [JSON.stringify(payload), JSON.stringify(actor)]
+  );
+  const response = result.rows?.[0]?.response || {};
+  if (response?.error) {
+    return {
+      ok: false,
+      status: Number(response.status || response.statusCode || 400) || 400,
+      body: {
+        error: true,
+        code: response.code || 'DESCUENTO_CATALOGO_UPSERT_ERROR',
+        message: response.message || 'No se pudo guardar el descuento de catalogo.'
+      }
+    };
+  }
+  return { ok: true, response };
+};
+
+const parseJsonArrayValue = (value) => {
+  if (Array.isArray(value)) return value;
+  if (typeof value !== 'string' || !value.trim()) return [];
+  try {
+    const parsed = JSON.parse(value);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch (_) {
+    return [];
+  }
+};
+
+const buildDescuentoObjetivoLabel = (row) => {
+  const alcance = normalizeDescuentoAlcance(row?.alcance) || DESCUENTO_ALCANCE_KEYS.FACTURA_COMPLETA;
+  if (alcance === DESCUENTO_ALCANCE_KEYS.FACTURA_COMPLETA) return 'Factura completa';
+
+  const objetivos = row?.objetivos || {};
+  const key = alcance === DESCUENTO_ALCANCE_KEYS.PRODUCTO
+    ? 'productos'
+    : alcance === DESCUENTO_ALCANCE_KEYS.RECETA
+      ? 'recetas'
+      : 'combos';
+  const rows = parseJsonArrayValue(objetivos[key]);
+  if (rows.length === 1) {
+    return rows[0]?.nombre_producto || rows[0]?.nombre_receta || rows[0]?.nombre_combo || `${alcance} seleccionado`;
+  }
+  if (rows.length > 1) {
+    const label = alcance === DESCUENTO_ALCANCE_KEYS.PRODUCTO ? 'productos' : alcance === DESCUENTO_ALCANCE_KEYS.RECETA ? 'recetas' : 'combos';
+    return `${rows.length} ${label} seleccionados`;
+  }
+  return '--';
+};
+
+const normalizeDescuentoCatalogoRow = (row) => {
+  const productos = parseJsonArrayValue(row?.productos);
+  const recetas = parseJsonArrayValue(row?.recetas);
+  const combos = parseJsonArrayValue(row?.combos);
+  const objetivos = { productos, recetas, combos };
+  const normalized = {
+    ...row,
+    objetivos,
+    objetivos_count: {
+      productos: productos.length,
+      recetas: recetas.length,
+      combos: combos.length,
+      total: productos.length + recetas.length + combos.length
+    }
+  };
+  normalized.objetivo = buildDescuentoObjetivoLabel(normalized);
+  return normalized;
 };
 
 router.get('/ventas/catalogos/categorias', async (req, res) => {
@@ -4010,16 +4199,65 @@ router.get('/ventas/catalogos/combos', async (req, res) => {
     }
 
     const query = `
+      WITH combo_departamento_counts AS (
+        SELECT
+          dc.id_combo,
+          r.id_tipo_departamento,
+          td.nombre_departamento,
+          COUNT(*)::int AS total_componentes
+        FROM detalle_combo dc
+        INNER JOIN recetas r
+          ON r.id_receta = dc.id_receta
+        LEFT JOIN tipo_departamento td
+          ON td.id_tipo_departamento = r.id_tipo_departamento
+        WHERE COALESCE(dc.estado, true) = true
+          AND COALESCE(r.estado, true) = true
+          AND r.id_tipo_departamento IS NOT NULL
+        GROUP BY dc.id_combo, r.id_tipo_departamento, td.nombre_departamento
+      ),
+      combo_departamento_principal AS (
+        SELECT DISTINCT ON (id_combo)
+          id_combo,
+          id_tipo_departamento,
+          nombre_departamento
+        FROM combo_departamento_counts
+        ORDER BY id_combo, total_componentes DESC, id_tipo_departamento ASC
+      ),
+      combo_departamentos AS (
+        SELECT
+          id_combo,
+          ARRAY_AGG(id_tipo_departamento ORDER BY id_tipo_departamento) AS departamentos_ids,
+          JSONB_AGG(
+            JSONB_BUILD_OBJECT(
+              'id_tipo_departamento', id_tipo_departamento,
+              'nombre_tipo_departamento', nombre_departamento
+            )
+            ORDER BY id_tipo_departamento
+          ) AS departamentos
+        FROM combo_departamento_counts
+        GROUP BY id_combo
+      )
       SELECT DISTINCT
         c.id_combo, 
         c.descripcion, 
         c.precio, 
         c.estado,
         c.id_archivo,
-        c.id_tipo_departamento,
+        COALESCE(c.id_tipo_departamento, cdp.id_tipo_departamento) AS id_tipo_departamento,
+        COALESCE(td.nombre_departamento, cdp.nombre_departamento) AS nombre_tipo_departamento,
+        cdp.id_tipo_departamento AS id_tipo_departamento_principal,
+        cdp.nombre_departamento AS nombre_tipo_departamento_principal,
+        COALESCE(cd.departamentos_ids, ARRAY[]::int[]) AS departamentos_ids,
+        COALESCE(cd.departamentos, '[]'::jsonb) AS departamentos,
         a.url_publica AS imagen_principal_url
       FROM combos c
       LEFT JOIN archivos a ON a.id_archivo = c.id_archivo AND (a.estado = true OR a.estado IS NULL)
+      LEFT JOIN tipo_departamento td
+        ON td.id_tipo_departamento = c.id_tipo_departamento
+      LEFT JOIN combo_departamento_principal cdp
+        ON cdp.id_combo = c.id_combo
+      LEFT JOIN combo_departamentos cd
+        ON cd.id_combo = c.id_combo
       ${joinClause}
       WHERE COALESCE(c.estado, true) = true ${whereClause}
       ORDER BY c.descripcion ASC, c.id_combo ASC
@@ -4221,16 +4459,79 @@ router.get('/ventas/catalogos/descuentos', async (req, res) => {
           dc.fecha_inicio,
           dc.fecha_fin,
           dc.id_tipo_descuento,
-          td.nombre_tipo_descuento
+          td.nombre_tipo_descuento,
+          COALESCE(objp.productos, '[]'::jsonb) AS productos,
+          COALESCE(objr.recetas, '[]'::jsonb) AS recetas,
+          COALESCE(objc.combos, '[]'::jsonb) AS combos,
+          COALESCE(objp.productos_ids, ARRAY[]::int[]) AS productos_ids,
+          COALESCE(objr.recetas_ids, ARRAY[]::int[]) AS recetas_ids,
+          COALESCE(objc.combos_ids, ARRAY[]::int[]) AS combos_ids
         FROM descuentos_catalogos dc
         INNER JOIN tipo_descuentos td
           ON td.id_tipo_descuento = dc.id_tipo_descuento
+        LEFT JOIN LATERAL (
+          SELECT
+            COALESCE(jsonb_agg(jsonb_build_object('id_producto', x.id_producto, 'nombre_producto', x.nombre_producto) ORDER BY x.nombre_producto), '[]'::jsonb) AS productos,
+            COALESCE(array_agg(x.id_producto ORDER BY x.id_producto), ARRAY[]::int[]) AS productos_ids
+          FROM (
+            SELECT DISTINCT p.id_producto, p.nombre_producto
+            FROM descuentos_catalogos_productos rel
+            INNER JOIN productos p ON p.id_producto = rel.id_producto
+            WHERE rel.id_descuento_catalogo = dc.id_descuento_catalogo
+            UNION
+            SELECT p.id_producto, p.nombre_producto
+            FROM productos p
+            WHERE p.id_producto = dc.id_producto
+              AND NOT EXISTS (
+                SELECT 1 FROM descuentos_catalogos_productos rel
+                WHERE rel.id_descuento_catalogo = dc.id_descuento_catalogo
+              )
+          ) x
+        ) objp ON true
+        LEFT JOIN LATERAL (
+          SELECT
+            COALESCE(jsonb_agg(jsonb_build_object('id_receta', x.id_receta, 'nombre_receta', x.nombre_receta) ORDER BY x.nombre_receta), '[]'::jsonb) AS recetas,
+            COALESCE(array_agg(x.id_receta ORDER BY x.id_receta), ARRAY[]::int[]) AS recetas_ids
+          FROM (
+            SELECT DISTINCT r.id_receta, r.nombre_receta
+            FROM descuentos_catalogos_recetas rel
+            INNER JOIN recetas r ON r.id_receta = rel.id_receta
+            WHERE rel.id_descuento_catalogo = dc.id_descuento_catalogo
+            UNION
+            SELECT r.id_receta, r.nombre_receta
+            FROM recetas r
+            WHERE r.id_receta = dc.id_receta
+              AND NOT EXISTS (
+                SELECT 1 FROM descuentos_catalogos_recetas rel
+                WHERE rel.id_descuento_catalogo = dc.id_descuento_catalogo
+              )
+          ) x
+        ) objr ON true
+        LEFT JOIN LATERAL (
+          SELECT
+            COALESCE(jsonb_agg(jsonb_build_object('id_combo', x.id_combo, 'nombre_combo', x.nombre_combo) ORDER BY x.nombre_combo), '[]'::jsonb) AS combos,
+            COALESCE(array_agg(x.id_combo ORDER BY x.id_combo), ARRAY[]::int[]) AS combos_ids
+          FROM (
+            SELECT DISTINCT cb.id_combo, COALESCE(cb.nombre_combo, cb.descripcion) AS nombre_combo
+            FROM descuentos_catalogos_combos rel
+            INNER JOIN combos cb ON cb.id_combo = rel.id_combo
+            WHERE rel.id_descuento_catalogo = dc.id_descuento_catalogo
+            UNION
+            SELECT cb.id_combo, COALESCE(cb.nombre_combo, cb.descripcion) AS nombre_combo
+            FROM combos cb
+            WHERE cb.id_combo = dc.id_combo
+              AND NOT EXISTS (
+                SELECT 1 FROM descuentos_catalogos_combos rel
+                WHERE rel.id_descuento_catalogo = dc.id_descuento_catalogo
+              )
+          ) x
+        ) objc ON true
         WHERE COALESCE(dc.estado, true) = true
           AND COALESCE(td.estado, true) = true
         ORDER BY dc.nombre_descuento ASC, dc.id_descuento_catalogo ASC
       `
     );
-    res.status(200).json(result.rows || []);
+    res.status(200).json((result.rows || []).map(normalizeDescuentoCatalogoRow));
   } catch (err) {
     console.error('Error al listar descuentos activos de catalogo:', err.message);
     sendVentasInternalError(res);
@@ -4274,6 +4575,9 @@ router.get('/ventas/descuentos-catalogos', checkPermission(VENTAS_DESCUENTOS_PER
           p.nombre_producto,
           r.nombre_receta,
           COALESCE(cb.nombre_combo, cb.descripcion) AS nombre_combo,
+          COALESCE(objp.productos, '[]'::jsonb) AS productos,
+          COALESCE(objr.recetas, '[]'::jsonb) AS recetas,
+          COALESCE(objc.combos, '[]'::jsonb) AS combos,
           s.nombre_sucursal,
           dc.estado,
           dc.fecha_creacion,
@@ -4284,13 +4588,55 @@ router.get('/ventas/descuentos-catalogos', checkPermission(VENTAS_DESCUENTOS_PER
         LEFT JOIN recetas r ON r.id_receta = dc.id_receta
         LEFT JOIN combos cb ON cb.id_combo = dc.id_combo
         LEFT JOIN sucursales s ON s.id_sucursal = dc.id_sucursal
+        LEFT JOIN LATERAL (
+          SELECT COALESCE(jsonb_agg(jsonb_build_object('id_producto', x.id_producto, 'nombre_producto', x.nombre_producto) ORDER BY x.nombre_producto), '[]'::jsonb) AS productos
+          FROM (
+            SELECT DISTINCT p2.id_producto, p2.nombre_producto
+            FROM descuentos_catalogos_productos rel
+            INNER JOIN productos p2 ON p2.id_producto = rel.id_producto
+            WHERE rel.id_descuento_catalogo = dc.id_descuento_catalogo
+            UNION
+            SELECT p2.id_producto, p2.nombre_producto
+            FROM productos p2
+            WHERE p2.id_producto = dc.id_producto
+              AND NOT EXISTS (SELECT 1 FROM descuentos_catalogos_productos rel WHERE rel.id_descuento_catalogo = dc.id_descuento_catalogo)
+          ) x
+        ) objp ON true
+        LEFT JOIN LATERAL (
+          SELECT COALESCE(jsonb_agg(jsonb_build_object('id_receta', x.id_receta, 'nombre_receta', x.nombre_receta) ORDER BY x.nombre_receta), '[]'::jsonb) AS recetas
+          FROM (
+            SELECT DISTINCT r2.id_receta, r2.nombre_receta
+            FROM descuentos_catalogos_recetas rel
+            INNER JOIN recetas r2 ON r2.id_receta = rel.id_receta
+            WHERE rel.id_descuento_catalogo = dc.id_descuento_catalogo
+            UNION
+            SELECT r2.id_receta, r2.nombre_receta
+            FROM recetas r2
+            WHERE r2.id_receta = dc.id_receta
+              AND NOT EXISTS (SELECT 1 FROM descuentos_catalogos_recetas rel WHERE rel.id_descuento_catalogo = dc.id_descuento_catalogo)
+          ) x
+        ) objr ON true
+        LEFT JOIN LATERAL (
+          SELECT COALESCE(jsonb_agg(jsonb_build_object('id_combo', x.id_combo, 'nombre_combo', x.nombre_combo) ORDER BY x.nombre_combo), '[]'::jsonb) AS combos
+          FROM (
+            SELECT DISTINCT cb2.id_combo, COALESCE(cb2.nombre_combo, cb2.descripcion) AS nombre_combo
+            FROM descuentos_catalogos_combos rel
+            INNER JOIN combos cb2 ON cb2.id_combo = rel.id_combo
+            WHERE rel.id_descuento_catalogo = dc.id_descuento_catalogo
+            UNION
+            SELECT cb2.id_combo, COALESCE(cb2.nombre_combo, cb2.descripcion) AS nombre_combo
+            FROM combos cb2
+            WHERE cb2.id_combo = dc.id_combo
+              AND NOT EXISTS (SELECT 1 FROM descuentos_catalogos_combos rel WHERE rel.id_descuento_catalogo = dc.id_descuento_catalogo)
+          ) x
+        ) objc ON true
         ${whereSql}
         ORDER BY dc.id_descuento_catalogo DESC
       `,
       params
     );
 
-    res.status(200).json(result.rows || []);
+    res.status(200).json((result.rows || []).map(normalizeDescuentoCatalogoRow));
   } catch (err) {
     console.error('Error al listar descuentos_catalogos:', err.message);
     sendVentasInternalError(res);
@@ -4323,6 +4669,9 @@ router.get('/ventas/descuentos-catalogos/:id', checkPermission(VENTAS_DESCUENTOS
           p.nombre_producto,
           r.nombre_receta,
           COALESCE(cb.nombre_combo, cb.descripcion) AS nombre_combo,
+          COALESCE(objp.productos, '[]'::jsonb) AS productos,
+          COALESCE(objr.recetas, '[]'::jsonb) AS recetas,
+          COALESCE(objc.combos, '[]'::jsonb) AS combos,
           s.nombre_sucursal,
           dc.estado,
           dc.fecha_creacion,
@@ -4333,6 +4682,48 @@ router.get('/ventas/descuentos-catalogos/:id', checkPermission(VENTAS_DESCUENTOS
         LEFT JOIN recetas r ON r.id_receta = dc.id_receta
         LEFT JOIN combos cb ON cb.id_combo = dc.id_combo
         LEFT JOIN sucursales s ON s.id_sucursal = dc.id_sucursal
+        LEFT JOIN LATERAL (
+          SELECT COALESCE(jsonb_agg(jsonb_build_object('id_producto', x.id_producto, 'nombre_producto', x.nombre_producto) ORDER BY x.nombre_producto), '[]'::jsonb) AS productos
+          FROM (
+            SELECT DISTINCT p2.id_producto, p2.nombre_producto
+            FROM descuentos_catalogos_productos rel
+            INNER JOIN productos p2 ON p2.id_producto = rel.id_producto
+            WHERE rel.id_descuento_catalogo = dc.id_descuento_catalogo
+            UNION
+            SELECT p2.id_producto, p2.nombre_producto
+            FROM productos p2
+            WHERE p2.id_producto = dc.id_producto
+              AND NOT EXISTS (SELECT 1 FROM descuentos_catalogos_productos rel WHERE rel.id_descuento_catalogo = dc.id_descuento_catalogo)
+          ) x
+        ) objp ON true
+        LEFT JOIN LATERAL (
+          SELECT COALESCE(jsonb_agg(jsonb_build_object('id_receta', x.id_receta, 'nombre_receta', x.nombre_receta) ORDER BY x.nombre_receta), '[]'::jsonb) AS recetas
+          FROM (
+            SELECT DISTINCT r2.id_receta, r2.nombre_receta
+            FROM descuentos_catalogos_recetas rel
+            INNER JOIN recetas r2 ON r2.id_receta = rel.id_receta
+            WHERE rel.id_descuento_catalogo = dc.id_descuento_catalogo
+            UNION
+            SELECT r2.id_receta, r2.nombre_receta
+            FROM recetas r2
+            WHERE r2.id_receta = dc.id_receta
+              AND NOT EXISTS (SELECT 1 FROM descuentos_catalogos_recetas rel WHERE rel.id_descuento_catalogo = dc.id_descuento_catalogo)
+          ) x
+        ) objr ON true
+        LEFT JOIN LATERAL (
+          SELECT COALESCE(jsonb_agg(jsonb_build_object('id_combo', x.id_combo, 'nombre_combo', x.nombre_combo) ORDER BY x.nombre_combo), '[]'::jsonb) AS combos
+          FROM (
+            SELECT DISTINCT cb2.id_combo, COALESCE(cb2.nombre_combo, cb2.descripcion) AS nombre_combo
+            FROM descuentos_catalogos_combos rel
+            INNER JOIN combos cb2 ON cb2.id_combo = rel.id_combo
+            WHERE rel.id_descuento_catalogo = dc.id_descuento_catalogo
+            UNION
+            SELECT cb2.id_combo, COALESCE(cb2.nombre_combo, cb2.descripcion) AS nombre_combo
+            FROM combos cb2
+            WHERE cb2.id_combo = dc.id_combo
+              AND NOT EXISTS (SELECT 1 FROM descuentos_catalogos_combos rel WHERE rel.id_descuento_catalogo = dc.id_descuento_catalogo)
+          ) x
+        ) objc ON true
         WHERE dc.id_descuento_catalogo = $1
         LIMIT 1
       `,
@@ -4343,7 +4734,7 @@ router.get('/ventas/descuentos-catalogos/:id', checkPermission(VENTAS_DESCUENTOS
       return res.status(404).json({ error: true, message: 'Descuento de catalogo no encontrado.' });
     }
 
-    return res.status(200).json(result.rows[0]);
+    return res.status(200).json(normalizeDescuentoCatalogoRow(result.rows[0]));
   } catch (err) {
     console.error('Error al obtener descuento_catalogo por id:', err.message);
     return sendVentasInternalError(res);
@@ -4353,59 +4744,29 @@ router.get('/ventas/descuentos-catalogos/:id', checkPermission(VENTAS_DESCUENTOS
 router.post('/ventas/descuentos-catalogos', checkPermission(VENTAS_DESCUENTOS_WRITE_PERMISSIONS), async (req, res) => {
   const client = await pool.connect();
   try {
-    await client.query('BEGIN');
-
     const validated = await validateDescuentoCatalogoPayload(client, req.body, { mode: 'create' });
     if (!validated.ok) {
-      await client.query('ROLLBACK');
       return res.status(validated.status).json({ error: true, message: validated.message });
     }
-
-    const created = await client.query(
-      `
-        INSERT INTO descuentos_catalogos (
-          nombre_descuento,
-          descripcion,
-          valor_descuento,
-          alcance,
-          id_producto,
-          id_receta,
-          id_combo,
-          id_sucursal,
-          fecha_inicio,
-          fecha_fin,
-          id_tipo_descuento,
-          estado,
-          fecha_creacion,
-          id_usuario
-        )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NOW(), $13)
-        RETURNING id_descuento_catalogo
-      `,
-      [
-        validated.data.nombre_descuento,
-        validated.data.descripcion,
-        validated.data.valor_descuento,
-        validated.data.alcance,
-        validated.data.id_producto,
-        validated.data.id_receta,
-        validated.data.id_combo,
-        validated.data.id_sucursal,
-        validated.data.fecha_inicio,
-        validated.data.fecha_fin,
-        validated.data.id_tipo_descuento,
-        validated.data.estado,
-        req.user?.id_usuario ?? null
-      ]
-    );
-
-    await client.query('COMMIT');
+    const scope = await resolveRequestUserSucursalScope(req, client);
+    const actorUserId = parseOptionalPositiveInt(scope.idUsuario) || parseOptionalPositiveInt(req.user?.id_usuario);
+    const rpcPayload = buildDescuentoCatalogoRpcPayload({
+      data: validated.data,
+      idUsuario: actorUserId
+    });
+    const rpcResult = await upsertDescuentoCatalogoConObjetivos({
+      client,
+      payload: rpcPayload,
+      actor: { id_usuario: actorUserId || null }
+    });
+    if (!rpcResult.ok) return res.status(rpcResult.status).json(rpcResult.body);
+    const response = rpcResult.response || {};
     return res.status(201).json({
       message: 'Descuento de catalogo creado exitosamente.',
-      id_descuento_catalogo: created.rows[0].id_descuento_catalogo
+      id_descuento_catalogo: response.id_descuento_catalogo || response.id || response.data?.id_descuento_catalogo || null,
+      response
     });
   } catch (err) {
-    await client.query('ROLLBACK');
     console.error('Error al crear descuentos_catalogos:', err.message);
     return sendVentasInternalError(res);
   } finally {
@@ -4421,61 +4782,37 @@ router.put('/ventas/descuentos-catalogos/:id', checkPermission(VENTAS_DESCUENTOS
       return res.status(400).json({ error: true, message: 'ID de descuento catalogo invalido.' });
     }
 
-    await client.query('BEGIN');
     const existing = await client.query(
       'SELECT id_descuento_catalogo FROM descuentos_catalogos WHERE id_descuento_catalogo = $1 LIMIT 1',
       [id]
     );
     if (existing.rowCount === 0) {
-      await client.query('ROLLBACK');
       return res.status(404).json({ error: true, message: 'Descuento de catalogo no encontrado.' });
     }
 
     const validated = await validateDescuentoCatalogoPayload(client, req.body, { mode: 'update' });
     if (!validated.ok) {
-      await client.query('ROLLBACK');
       return res.status(validated.status).json({ error: true, message: validated.message });
     }
-
-    await client.query(
-      `
-        UPDATE descuentos_catalogos
-        SET
-          nombre_descuento = $1,
-          descripcion = $2,
-          valor_descuento = $3,
-          alcance = $4,
-          id_producto = $5,
-          id_receta = $6,
-          id_combo = $7,
-          id_sucursal = $8,
-          fecha_inicio = $9,
-          fecha_fin = $10,
-          id_tipo_descuento = $11,
-          estado = $12
-        WHERE id_descuento_catalogo = $13
-      `,
-      [
-        validated.data.nombre_descuento,
-        validated.data.descripcion,
-        validated.data.valor_descuento,
-        validated.data.alcance,
-        validated.data.id_producto,
-        validated.data.id_receta,
-        validated.data.id_combo,
-        validated.data.id_sucursal,
-        validated.data.fecha_inicio,
-        validated.data.fecha_fin,
-        validated.data.id_tipo_descuento,
-        validated.data.estado,
-        id
-      ]
-    );
-
-    await client.query('COMMIT');
-    return res.status(200).json({ message: 'Descuento de catalogo actualizado correctamente.' });
+    const scope = await resolveRequestUserSucursalScope(req, client);
+    const actorUserId = parseOptionalPositiveInt(scope.idUsuario) || parseOptionalPositiveInt(req.user?.id_usuario);
+    const rpcPayload = buildDescuentoCatalogoRpcPayload({
+      idDescuentoCatalogo: id,
+      data: validated.data,
+      idUsuario: actorUserId
+    });
+    const rpcResult = await upsertDescuentoCatalogoConObjetivos({
+      client,
+      payload: rpcPayload,
+      actor: { id_usuario: actorUserId || null }
+    });
+    if (!rpcResult.ok) return res.status(rpcResult.status).json(rpcResult.body);
+    return res.status(200).json({
+      message: 'Descuento de catalogo actualizado correctamente.',
+      id_descuento_catalogo: id,
+      response: rpcResult.response
+    });
   } catch (err) {
-    await client.query('ROLLBACK');
     console.error('Error al actualizar descuentos_catalogos:', err.message);
     return sendVentasInternalError(res);
   } finally {
@@ -4901,8 +5238,35 @@ router.get('/ventas/pedidos-menu', checkPermission(['VENTAS_VER']), async (req, 
     const allowedSucursalIds = Array.isArray(scope.allowedSucursalIds)
       ? scope.allowedSucursalIds.filter((value) => Number.isInteger(Number(value)) && Number(value) > 0).map(Number)
       : [];
+    const requestedSucursalId = parseOptionalPositiveInt(req.query.id_sucursal ?? req.query.idSucursal);
+    const isSuperAdmin = Boolean(scope.isSuperAdmin);
+    const userSucursalId = parseOptionalPositiveInt(scope.userSucursalId);
+    const effectiveAllowedSucursalIds = allowedSucursalIds.length > 0
+      ? allowedSucursalIds
+      : userSucursalId
+        ? [userSucursalId]
+        : [];
 
-    await expirePendingPublicOrders({ client, allowedSucursalIds });
+    if (requestedSucursalId) {
+      if (isSuperAdmin) {
+        const validSucursalId = await resolveSucursalId(client, requestedSucursalId);
+        if (!validSucursalId) {
+          return res.status(404).json({ error: true, message: 'Sucursal no disponible.' });
+        }
+      } else if (!effectiveAllowedSucursalIds.includes(requestedSucursalId)) {
+        return res.status(403).json({ error: true, message: 'No puedes consultar pedidos de otra sucursal.' });
+      }
+    } else if (!isSuperAdmin && effectiveAllowedSucursalIds.length === 0) {
+      return res.status(403).json({ error: true, message: 'No tienes una sucursal asignada para consultar pedidos.' });
+    }
+
+    const effectiveSucursalIds = requestedSucursalId
+      ? [requestedSucursalId]
+      : isSuperAdmin
+        ? []
+        : effectiveAllowedSucursalIds;
+
+    await expirePendingPublicOrders({ client, allowedSucursalIds: effectiveSucursalIds });
 
     const hasEstadoPago = await hasPedidosColumn(client, 'estado_pago');
     const hasValidacionVence = await hasPedidosColumn(client, 'validacion_pago_vence_at');
@@ -4926,8 +5290,11 @@ router.get('/ventas/pedidos-menu', checkPermission(['VENTAS_VER']), async (req, 
     const filters = [`p.id_estado_pedido = ANY($1::int[])`];
     const params = [estadoIds];
 
-    if (allowedSucursalIds.length > 0) {
-      params.push(allowedSucursalIds);
+    if (requestedSucursalId) {
+      params.push(requestedSucursalId);
+      filters.push(`p.id_sucursal = $${params.length}`);
+    } else if (effectiveSucursalIds.length > 0) {
+      params.push(effectiveSucursalIds);
       filters.push(`p.id_sucursal = ANY($${params.length}::int[])`);
     }
 
@@ -4969,8 +5336,10 @@ router.get('/ventas/pedidos-menu', checkPermission(['VENTAS_VER']), async (req, 
           p.sub_total,
           p.isv,
           p.total,
+          p.id_sucursal,
           p.id_estado_pedido,
           p.origen_pedido,
+          f.id_factura,
           ep.descripcion AS nombre_estado_pedido,
           ${estadoPagoSelect},
           ${validacionSelect},
@@ -4982,15 +5351,74 @@ router.get('/ventas/pedidos-menu', checkPermission(['VENTAS_VER']), async (req, 
           ${kdsExpectedRuleSelect},
           ${kdsVencidoSelect},
           COALESCE(NULLIF(TRIM(f.codigo_venta), ''), NULL) AS codigo_venta,
+          s.nombre_sucursal,
+          fc_info.metodo_pago,
+          COALESCE(dp_info.items, '[]'::jsonb) AS items,
           u_pago.nombre_usuario AS usuario_pago_confirmado,
           per.nombre AS nombres_cliente,
           per.apellido AS apellidos_cliente
         FROM pedidos p
         INNER JOIN estados_pedido ep ON p.id_estado_pedido = ep.id_estado_pedido
         LEFT JOIN facturas f ON f.id_pedido = p.id_pedido
+        LEFT JOIN sucursales s ON s.id_sucursal = p.id_sucursal
         LEFT JOIN clientes c ON p.id_cliente = c.id_cliente
         LEFT JOIN personas per ON c.id_persona = per.id_persona
         LEFT JOIN usuarios u_pago ON u_pago.id_usuario = p.id_usuario_pago_confirmado
+        LEFT JOIN LATERAL (
+          SELECT
+            STRING_AGG(DISTINCT cmp.nombre, ', ' ORDER BY cmp.nombre) AS metodo_pago
+          FROM facturas_cobros fc
+          INNER JOIN cat_metodos_pago cmp
+            ON cmp.id_metodo_pago = fc.id_metodo_pago
+          WHERE fc.id_factura = f.id_factura
+        ) fc_info ON true
+        LEFT JOIN LATERAL (
+          SELECT
+            jsonb_agg(
+              jsonb_build_object(
+                'id_detalle', dp.id_detalle_pedido,
+                'id_detalle_pedido', dp.id_detalle_pedido,
+                'tipo_item',
+                  CASE
+                    WHEN dp.id_producto IS NOT NULL THEN 'PRODUCTO'
+                    WHEN dp.id_combo IS NOT NULL THEN 'COMBO'
+                    WHEN dp.id_receta IS NOT NULL THEN 'RECETA'
+                    ELSE 'ITEM'
+                  END,
+                'id_producto', dp.id_producto,
+                'id_combo', dp.id_combo,
+                'id_receta', dp.id_receta,
+                'nombre_item', COALESCE(prod.nombre_producto, combo.nombre_combo, combo.descripcion, rec.nombre_receta, 'Item de pedido'),
+                'nombre_producto', COALESCE(prod.nombre_producto, combo.nombre_combo, combo.descripcion, rec.nombre_receta, 'Item de pedido'),
+                'cantidad',
+                  CASE
+                    WHEN COALESCE(prod.precio, combo.precio, rec.precio, 0) > 0
+                      THEN GREATEST(1, ROUND(COALESCE(dp.sub_total_pedido, dp.total_pedido, 0) / COALESCE(prod.precio, combo.precio, rec.precio, 1))::int)
+                    ELSE 1
+                  END,
+                'precio_unitario',
+                  COALESCE(
+                    prod.precio,
+                    combo.precio,
+                    rec.precio,
+                    NULLIF(COALESCE(dp.sub_total_pedido, dp.total_pedido, 0), 0),
+                    0
+                  ),
+                'sub_total', COALESCE(dp.sub_total_pedido, 0),
+                'total_linea', COALESCE(dp.total_pedido, dp.sub_total_pedido, 0),
+                'descuento', COALESCE(d.monto_descuento, 0),
+                'observacion', dp.observacion
+              )
+              ORDER BY dp.id_detalle_pedido
+            ) AS items
+          FROM detalle_pedido dp
+          LEFT JOIN productos prod ON prod.id_producto = dp.id_producto
+          LEFT JOIN combos combo ON combo.id_combo = dp.id_combo
+          LEFT JOIN recetas rec ON rec.id_receta = dp.id_receta
+          LEFT JOIN descuentos d ON d.id_descuento = dp.id_descuento
+          WHERE dp.id_pedido = p.id_pedido
+            AND COALESCE(dp.estado, true) = true
+        ) dp_info ON true
         ${whereClause}
         ORDER BY p.fecha_hora_pedido ASC
       `,
@@ -5798,7 +6226,8 @@ router.get('/ventas/:id', checkPermission(['VENTAS_VER']), async (req, res) => {
             COALESCE(df.sub_total, dp.sub_total_pedido, 0) AS subtotal_linea,
             COALESCE(df.total_detalle, dp.total_pedido, COALESCE(dp.sub_total_pedido, 0)) AS total_linea,
             COALESCE(d.monto_descuento, 0) AS descuento,
-            COALESCE(d.monto_descuento, 0) AS descuento_linea,
+            COALESCE(NULLIF(COALESCE(dfo.origen_snapshot, df.origen_snapshot)->>'descuento_linea', '')::numeric, COALESCE(d.monto_descuento, 0)) AS descuento_linea,
+            COALESCE(NULLIF(COALESCE(dfo.origen_snapshot, df.origen_snapshot)->>'descuento_global', '')::numeric, 0) AS descuento_global,
             NULL::numeric AS isv_15_linea,
             NULL::numeric AS isv_18_linea,
             NULL::numeric AS exento_linea,
@@ -5844,7 +6273,8 @@ router.get('/ventas/:id', checkPermission(['VENTAS_VER']), async (req, res) => {
           COALESCE(df.sub_total, 0) AS subtotal_linea,
           COALESCE(df.total_detalle, 0) AS total_linea,
           COALESCE(d.monto_descuento, 0) AS descuento,
-          COALESCE(d.monto_descuento, 0) AS descuento_linea,
+          COALESCE(NULLIF(COALESCE(dfo.origen_snapshot, df.origen_snapshot)->>'descuento_linea', '')::numeric, COALESCE(d.monto_descuento, 0)) AS descuento_linea,
+          COALESCE(NULLIF(COALESCE(dfo.origen_snapshot, df.origen_snapshot)->>'descuento_global', '')::numeric, 0) AS descuento_global,
           NULL::numeric AS isv_15_linea,
           NULL::numeric AS isv_18_linea,
           NULL::numeric AS exento_linea,
@@ -7075,6 +7505,10 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
             precio_unitario: roundMoney(line.precio_unitario),
             total_detalle: roundMoney(line.total_linea),
             descuento: roundMoney(line.descuento),
+            descuento_linea: roundMoney(line.descuento_linea),
+            descuento_global: roundMoney(line.descuento_global),
+            id_descuento_catalogo_linea: line.id_descuento_catalogo_linea_aplicado || null,
+            id_descuento_catalogo_global: line.id_descuento_catalogo_global || null,
             observacion: line.observacion || null,
             componentes: complementSnapshot
           }
@@ -7191,6 +7625,10 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
         precio_unitario: roundMoney(line.precio_unitario),
         total_detalle: roundMoney(line.total_linea),
         descuento: roundMoney(line.descuento),
+        descuento_linea: roundMoney(line.descuento_linea),
+        descuento_global: roundMoney(line.descuento_global),
+        id_descuento_catalogo_linea: line.id_descuento_catalogo_linea_aplicado || null,
+        id_descuento_catalogo_global: line.id_descuento_catalogo_global || null,
         observacion: line.observacion || null,
         componentes: complementSnapshot
       };
