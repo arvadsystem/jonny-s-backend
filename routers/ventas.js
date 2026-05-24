@@ -439,6 +439,52 @@ const normalizeSearchText = (value) =>
     .replace(/[\u0300-\u036f]/g, '')
     .trim()
     .toLowerCase();
+
+const buildEstadoPedidoSqlKey = (columnExpression) =>
+  `LOWER(REGEXP_REPLACE(TRIM(COALESCE(${columnExpression}, '')), '\\s+', '_', 'g'))`;
+
+const getVentaEstadoFilter = (value) => {
+  const key = normalizeTextKey(value).toUpperCase();
+  const estadoPedidoSqlKey = buildEstadoPedidoSqlKey('ep.descripcion');
+  const toAliases = (...codes) =>
+    codes.flatMap((code) => [...(ESTADO_PEDIDO_CODES[code] || new Set())]);
+
+  if (!key) return null;
+
+  if (key === 'VENTA_DIRECTA') {
+    return { fragment: 'p.id_pedido IS NULL' };
+  }
+
+  if (key === 'EN_COCINA') {
+    return {
+      fragment: `${estadoPedidoSqlKey} = ANY($IDX::text[])`,
+      value: toAliases('EN_COCINA', 'EN_PREPARACION')
+    };
+  }
+
+  if (key === 'LISTO' || key === 'LISTO_PARA_ENTREGA') {
+    return {
+      fragment: `${estadoPedidoSqlKey} = ANY($IDX::text[])`,
+      value: toAliases('LISTO_PARA_ENTREGA')
+    };
+  }
+
+  if (key === 'COMPLETADA' || key === 'COMPLETADAS' || key === 'COMPLETADO') {
+    return {
+      fragment: `(p.id_pedido IS NULL OR ${estadoPedidoSqlKey} = ANY($IDX::text[]))`,
+      value: toAliases('COMPLETADO')
+    };
+  }
+
+  if (key === 'PENDIENTE' || key === 'PENDIENTES') {
+    return {
+      fragment: `${estadoPedidoSqlKey} = ANY($IDX::text[])`,
+      value: toAliases('PENDIENTE')
+    };
+  }
+
+  return null;
+};
 const sortSauceOptions = (items) => (
   [...(Array.isArray(items) ? items : [])].sort((left, right) => {
     const orderA = Number(left?.orden || 0);
@@ -4983,7 +5029,16 @@ router.get('/ventas', checkPermission(['VENTAS_VER']), async (req, res) => {
     }
 
     if (estado) {
-      pushFilter('COALESCE(ep.descripcion, $IDX) ILIKE $IDX', `%${estado}%`);
+      const estadoFilter = getVentaEstadoFilter(estado);
+      if (estadoFilter) {
+        if (Object.prototype.hasOwnProperty.call(estadoFilter, 'value')) {
+          pushFilter(estadoFilter.fragment, estadoFilter.value);
+        } else {
+          filters.push(estadoFilter.fragment);
+        }
+      } else {
+        pushFilter('COALESCE(ep.descripcion, $IDX) ILIKE $IDX', `%${estado}%`);
+      }
     }
 
     if (idEstadoPedido) {
@@ -5110,7 +5165,9 @@ router.get('/ventas', checkPermission(['VENTAS_VER']), async (req, res) => {
           WHEN f.id_pedido IS NOT NULL THEN COALESCE(dp_info.total_items, 0)
           ELSE COALESCE(df_info.total_items, 0)
         END AS total_items,
-        COALESCE(df_info.descuento_total, 0) AS descuento_total
+        COALESCE(df_info.descuento_total, 0) AS descuento_total,
+        COALESCE(rev_info.reversiones_count, 0) AS reversiones_count,
+        COALESCE(rev_info.monto_reversado_total, 0) AS monto_reversado_total
       ${baseJoinClause}
       LEFT JOIN LATERAL (
         SELECT
@@ -5129,6 +5186,13 @@ router.get('/ventas', checkPermission(['VENTAS_VER']), async (req, res) => {
           ON cmp.id_metodo_pago = fc.id_metodo_pago
         WHERE fc.id_factura = f.id_factura
       ) fc_info ON true
+      LEFT JOIN LATERAL (
+        SELECT
+          COUNT(*)::int AS reversiones_count,
+          COALESCE(SUM(fr.monto_reversado), 0)::numeric(12,2) AS monto_reversado_total
+        FROM public.facturas_reversiones fr
+        WHERE fr.id_factura_original = f.id_factura
+      ) rev_info ON true
       LEFT JOIN LATERAL (
         SELECT
           COALESCE(
@@ -6174,6 +6238,13 @@ router.get('/ventas/:id', checkPermission(['VENTAS_VER']), async (req, res) => {
       factura: venta
     });
     Object.assign(venta, mergeVentaWithFacturacion(venta, facturacionNormalizada));
+    const idUsuarioDetalle = parsePositiveInt(req.user?.id_usuario);
+    const reversiones = idUsuarioDetalle
+      ? await listFacturaReversiones({
+        idFactura: venta.id_factura,
+        idUsuario: idUsuarioDetalle
+      })
+      : [];
 
     if (venta.id_pedido) {
       const pedidoItemsResult = await pool.query(
@@ -6252,7 +6323,8 @@ router.get('/ventas/:id', checkPermission(['VENTAS_VER']), async (req, res) => {
         ...venta,
         numero_venta: resolveVentaNumero(venta),
         metodo_pago: venta.metodo_pago || null,
-        items: buildKitchenSaleDetailItems(pedidoItemsResult.rows)
+        items: buildKitchenSaleDetailItems(pedidoItemsResult.rows),
+        reversiones
       });
     }
 
@@ -6298,7 +6370,8 @@ router.get('/ventas/:id', checkPermission(['VENTAS_VER']), async (req, res) => {
       ...venta,
       numero_venta: resolveVentaNumero(venta),
       metodo_pago: venta.metodo_pago || null,
-      items: directItems
+      items: directItems,
+      reversiones
     });
   } catch (err) {
     console.error('Error al obtener detalle de venta:', err);

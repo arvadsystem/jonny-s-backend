@@ -656,9 +656,50 @@ export const listFacturaReversiones = async ({ idFactura, idUsuario }) => {
           fr.id_sesion_caja_original,
           fr.id_caja_actual,
           fr.id_sesion_caja_actual,
-          u.nombre_usuario AS usuario
+          u.nombre_usuario AS usuario,
+          COALESCE(lineas_info.lineas, '[]'::json) AS lineas
         FROM public.facturas_reversiones fr
         LEFT JOIN public.usuarios u ON u.id_usuario = fr.creada_por
+        LEFT JOIN LATERAL (
+          SELECT JSON_AGG(
+            JSON_BUILD_OBJECT(
+              'id_detalle_factura', rd.id_detalle_factura,
+              'tipo_item', rd.tipo_item,
+              'id_producto', rd.id_producto,
+              'id_receta', rd.id_receta,
+              'id_combo', rd.id_combo,
+              'nombre_item', COALESCE(
+                dfo.origen_snapshot->>'nombre_item',
+                df.origen_snapshot->>'nombre_item',
+                prod.nombre_producto,
+                rec.nombre_receta,
+                combo.descripcion,
+                'Item'
+              ),
+              'cantidad_revertida', rd.cantidad_revertida,
+              'precio_unitario_original', rd.precio_unitario_original,
+              'subtotal_revertido', rd.subtotal_revertido,
+              'descuento_revertido', rd.descuento_revertido,
+              'isv_15_revertido', rd.isv_15_revertido,
+              'isv_18_revertido', rd.isv_18_revertido,
+              'total_revertido', rd.total_revertido,
+              'devuelve_inventario', rd.devuelve_inventario
+            )
+            ORDER BY rd.id_reversion_detalle
+          ) AS lineas
+          FROM public.facturas_reversiones_detalle rd
+          LEFT JOIN public.detalle_facturas df
+            ON df.id_detalle_factura = rd.id_detalle_factura
+          LEFT JOIN public.detalle_facturas_origen dfo
+            ON dfo.id_detalle_factura = rd.id_detalle_factura
+          LEFT JOIN public.productos prod
+            ON prod.id_producto = COALESCE(rd.id_producto, dfo.id_producto, df.id_producto)
+          LEFT JOIN public.recetas rec
+            ON rec.id_receta = COALESCE(rd.id_receta, dfo.id_receta, df.id_receta::int)
+          LEFT JOIN public.combos combo
+            ON combo.id_combo = COALESCE(rd.id_combo, dfo.id_combo, df.id_combo::int)
+          WHERE rd.id_reversion = fr.id_reversion
+        ) lineas_info ON true
         WHERE fr.id_factura_original = $1
         ORDER BY fr.id_reversion DESC
       `,
