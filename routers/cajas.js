@@ -1,6 +1,7 @@
 import express from 'express';
-import { sendReportEmail } from '../services/smtpMailer.js';
+import { enviarCorreo } from '../utils/emailService.js';
 import pool from '../config/db-connection.js';
+import { getClientIp } from '../utils/security/clientInfo.js';
 import {
   checkPermission,
   requestHasAnyPermission,
@@ -11,6 +12,7 @@ import { resolveRequestUserSucursalScope } from '../utils/sucursalScope.js';
 const router = express.Router();
 const CAJAS_SCOPE_PERMISSION = 'VENTAS_CAJAS_MULTISUCURSAL_VER';
 const ADMIN_ROLE_CODES = ['ADMIN', 'ADMINISTRADOR', 'SUPER_ADMIN'];
+const CAJA_APERTURA_EMAIL_TO = 'gersonmz@jonnyshn.com';
 
 const CATALOGS = Object.freeze({
   SESSION_STATES: { table: 'public.cat_cajas_sesiones_estados', id: 'id_estado_sesion_caja' },
@@ -70,12 +72,28 @@ const normalizeCajaCode = (value, maxLength = 40) => {
   return normalized.toUpperCase();
 };
 
-const createCajaError = (httpStatus, code, publicMessage) => {
+const createCajaError = (httpStatus, code, publicMessage, details = null) => {
   const error = new Error(publicMessage);
   error.httpStatus = httpStatus;
   error.code = code;
   error.publicMessage = publicMessage;
+  if (details && typeof details === 'object') error.details = details;
   return error;
+};
+
+const createArqueoObservationRequiredError = (methodCode, message = null) => {
+  const normalizedMethodCode = normalizeCajaCode(methodCode, 40) || 'EFECTIVO';
+  return createCajaError(
+    400,
+    'VENTAS_CAJAS_ARQUEO_OBSERVACION_REQUIRED',
+    message || `Debe indicar observación para ${normalizedMethodCode} cuando existe diferencia.`,
+    {
+      metodo_pago_codigo: normalizedMethodCode,
+      field: 'observacion',
+      focus_target: `arqueos.${normalizedMethodCode}.observacion`,
+      step: normalizedMethodCode
+    }
+  );
 };
 
 const sendInternalError = (
@@ -84,15 +102,22 @@ const sendInternalError = (
   defaultCode = 'VENTAS_CAJAS_INTERNAL_ERROR',
   defaultMessage = 'No se pudo procesar la solicitud de Gestion de cajas.'
 ) => {
-  console.error('[cajas]', err);
-
   if (Number.isInteger(err?.httpStatus) && err.httpStatus >= 400 && err.httpStatus < 500) {
-    return res.status(err.httpStatus).json({
-      error: true,
+    console.warn('[cajas]', {
+      status: err.httpStatus,
       code: err.code || defaultCode,
       message: err.publicMessage || defaultMessage
     });
+    const payload = {
+      error: true,
+      code: err.code || defaultCode,
+      message: err.publicMessage || defaultMessage
+    };
+    if (err.details && typeof err.details === 'object') payload.details = err.details;
+    return res.status(err.httpStatus).json(payload);
   }
+
+  console.error('[cajas]', err);
 
   return res.status(500).json({
     error: true,
@@ -128,6 +153,8 @@ const getCatalogCodeById = async (client, catalogKey, id) => {
 
 const ALLOWED_NEW_ARQUEO_CODES = new Set(['CIERRE', 'EXTRAORDINARIO']);
 const SEGMENTED_ARQUEO_METHOD_CODES = ['EFECTIVO', 'TARJETA', 'TRANSFERENCIA'];
+const EGRESO_MOVEMENT_TYPE_CODES = ['EGRESO_MANUAL', 'EGRESO', 'RETIRO', 'SALIDA_CAJA'];
+const INGRESO_MOVEMENT_TYPE_CODES = ['INGRESO_MANUAL', 'INGRESO', 'ENTRADA_CAJA', 'ENTRADA', 'AJUSTE_POSITIVO'];
 const CLOSE_DIFFERENCE_THRESHOLD = Number.isFinite(Number(process.env.CAJAS_CIERRE_DIFERENCIA_UMBRAL))
   ? Number(process.env.CAJAS_CIERRE_DIFERENCIA_UMBRAL)
   : 0;
@@ -135,6 +162,33 @@ const CLOSE_DIFFERENCE_THRESHOLD = Number.isFinite(Number(process.env.CAJAS_CIER
 const roundMoney = (value) => Number((Number(value || 0)).toFixed(2));
 
 const normalizeMethodCode = (value) => String(value || '').trim().toUpperCase();
+
+const resolveArqueoResultado = (diferencia) => {
+  const normalized = roundMoney(diferencia);
+  if (normalized === 0) return 'CUADRADO';
+  return normalized < 0 ? 'FALTANTE' : 'SOBRANTE';
+};
+
+const escapeHtml = (value) =>
+  String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+
+const formatMoneyLabel = (value) => `L ${roundMoney(value).toFixed(2)}`;
+
+const formatDateTimeLabel = (value) => {
+  if (!value) return 'No disponible';
+  const date = new Date(value);
+  if (!Number.isFinite(date.getTime())) return String(value);
+  return new Intl.DateTimeFormat('es-HN', {
+    dateStyle: 'medium',
+    timeStyle: 'short',
+    timeZone: 'America/Tegucigalpa'
+  }).format(date);
+};
 
 const fetchSegmentedMethodCatalog = async (client) => {
   const result = await client.query(
@@ -244,7 +298,8 @@ const buildSegmentedArqueoComputation = async ({
   client,
   idSesionCaja,
   payloadRows,
-  threshold
+  threshold,
+  requireObservacionOnDifference = true
 }) => {
   const methodCatalog = await fetchSegmentedMethodCatalog(client);
   const methodCodes = new Set(methodCatalog.map((row) => normalizeMethodCode(row.codigo)));
@@ -316,12 +371,8 @@ const buildSegmentedArqueoComputation = async ({
         `Debe indicar cantidad_referencias para ${code} cuando existen ventas del metodo.`
       );
     }
-    if (requiereRevision && !observacionMetodo) {
-      throw createCajaError(
-        400,
-        'VENTAS_CAJAS_ARQUEO_OBSERVACION_REQUIRED',
-        `Debe indicar observacion para ${code} cuando existe diferencia.`
-      );
+    if (requireObservacionOnDifference && requiereRevision && !observacionMetodo) {
+      throw createArqueoObservationRequiredError(code);
     }
 
     totalTeorico = roundMoney(totalTeorico + montoTeoricoMetodo);
@@ -335,6 +386,9 @@ const buildSegmentedArqueoComputation = async ({
       cantidad_referencias: cantidadReferenciasMetodo,
       observacion: observacionMetodo,
       requiere_revision: requiereRevision,
+      observacion_requerida: requiereRevision,
+      observacion_presente: Boolean(observacionMetodo),
+      resultado: resolveArqueoResultado(diferenciaMetodo),
       completado_automaticamente: autoComplete
     });
   }
@@ -545,6 +599,90 @@ const isCajaUserCajero = (roleCodes) => hasAnyRoleCode(roleCodes, ['CAJERO']);
 
 const isCajaUserAdminLike = (roleCodes) =>
   hasAnyRoleCode(roleCodes, ['SUPER_ADMIN', 'ADMIN', 'ADMINISTRADOR']);
+
+const requestIsRestrictedCajero = async (req) => {
+  const isCajero = await requestHasAnyRole(req, ['CAJERO']);
+  if (!isCajero) return false;
+  return !(await requestHasAnyRole(req, ADMIN_ROLE_CODES));
+};
+
+const isCashierOnlyRequest = async (req) => requestIsRestrictedCajero(req);
+
+const isOperationalCajaDetailContext = (value) => {
+  const normalized = String(value || '').trim().toUpperCase();
+  return ['ARQUEO', 'CIERRE', 'OPERACION'].includes(normalized);
+};
+
+const maskCajaFinancialMethod = (row = {}) => ({
+  ...row,
+  visible_para_cajero: false,
+  comparacion_visible: false,
+  monto_teorico: null,
+  diferencia: null
+});
+
+const maskCajaFinancialSummary = (row = {}) => ({
+  ...row,
+  visible_para_cajero: false,
+  comparacion_visible: false,
+  ventas_efectivo: null,
+  ventas_no_efectivo: null,
+  monto_ventas_efectivo: null,
+  monto_ventas_no_efectivo: null,
+  ingresos_manuales: null,
+  egresos_manuales: null,
+  monto_ingresos_manuales: null,
+  monto_egresos_manuales: null,
+  total_responsable: null,
+  total_auxiliares: null,
+  efectivo_teorico: null,
+  total_teorico: null,
+  monto_teorico: null,
+  monto_teorico_cierre: null,
+  diferencia: null,
+  diferencia_cierre: null,
+  ultimo_arqueo_cierre: row?.ultimo_arqueo_cierre
+    ? maskCajaFinancialMethod(row.ultimo_arqueo_cierre)
+    : row?.ultimo_arqueo_cierre
+});
+
+const maskCajaCobroUsuarioForCajero = (row = {}) => ({
+  ...row,
+  visible_para_cajero: false,
+  comparacion_visible: false,
+  total_efectivo: null,
+  total_no_efectivo: null,
+  ventas_efectivo: null,
+  ventas_no_efectivo: null
+});
+
+const maskCajaSessionRowForCajero = (row = {}) => maskCajaFinancialSummary(row);
+
+const maskCajaClosePreviewForCajero = (computation) => ({
+  message: 'Vista previa de cierre calculada correctamente.',
+  comparacion_visible: false,
+  resumen: {
+    total_declarado: computation?.monto_declarado_total ?? null
+  },
+  observaciones_requeridas: []
+});
+
+const maskCajaCloseResponseForCajero = (payload = {}) => ({
+  ...payload,
+  visible_para_cajero: false,
+  comparacion_visible: false,
+  diferencia: null,
+  arqueos_metodos: (Array.isArray(payload.arqueos_metodos) ? payload.arqueos_metodos : []).map(maskCajaFinancialMethod)
+});
+
+const maskCajaDetailPayloadForCajero = (payload = {}) => ({
+  ...payload,
+  resumen_operativo: maskCajaFinancialSummary(payload.resumen_operativo || {}),
+  cobros_por_usuario: (Array.isArray(payload.cobros_por_usuario) ? payload.cobros_por_usuario : []).map(maskCajaCobroUsuarioForCajero),
+  arqueos: (Array.isArray(payload.arqueos) ? payload.arqueos : []).map(maskCajaFinancialMethod),
+  arqueos_metodos: (Array.isArray(payload.arqueos_metodos) ? payload.arqueos_metodos : []).map(maskCajaFinancialMethod),
+  cierre: payload.cierre ? maskCajaFinancialSummary(payload.cierre) : payload.cierre
+});
 
 const requestIsSuperAdminReal = async (client, req) => {
   const idUsuario = parsePositiveInt(req?.user?.id_usuario);
@@ -969,6 +1107,351 @@ const assertCajaAuthorization = async (client, idCaja, idUsuario, roleCode) => {
   return authorization;
 };
 
+const fetchMiCajaAsignadaActiva = async (client, scopeContext, { forUpdate = false } = {}) => {
+  const idEstadoAbierta = await getCatalogId(client, 'SESSION_STATES', 'ABIERTA');
+  const params = [scopeContext.idUsuario, idEstadoAbierta];
+  const filters = [
+    'cua.id_usuario = $1',
+    'COALESCE(cua.estado, true) = true',
+    'COALESCE(c.estado, true) = true',
+    '(COALESCE(cua.puede_responsable, false) = true OR COALESCE(cua.puede_auxiliar, false) = true)'
+  ];
+
+  if (scopeContext.targetSucursalId && !scopeContext.hasMultisucursalAccess) {
+    params.push(scopeContext.targetSucursalId);
+    filters.push(`c.id_sucursal = $${params.length}`);
+  } else if (!scopeContext.isSuperAdmin) {
+    params.push(scopeContext.allowedSucursalIds);
+    filters.push(`c.id_sucursal = ANY($${params.length}::int[])`);
+  }
+
+  const result = await client.query(
+    `
+      SELECT
+        cua.id_caja_usuario_autorizado,
+        cua.id_caja,
+        c.codigo_caja,
+        c.nombre_caja,
+        c.id_sucursal,
+        s.nombre_sucursal,
+        COALESCE(cua.puede_responsable, false) AS puede_responsable,
+        COALESCE(cua.puede_auxiliar, false) AS puede_auxiliar,
+        sesion_usuario.id_sesion_caja,
+        sesion_usuario.estado_codigo,
+        sesion_usuario.fecha_apertura,
+        sesion_usuario.monto_apertura,
+        sesion_caja.id_sesion_caja AS id_sesion_caja_abierta,
+        sesion_caja.id_usuario_responsable AS id_usuario_responsable_abierta,
+        sesion_caja.fecha_apertura AS fecha_apertura_abierta,
+        sesion_caja.monto_apertura AS monto_apertura_abierta
+      FROM public.cajas_usuarios_autorizados cua
+      INNER JOIN public.cajas c ON c.id_caja = cua.id_caja
+      INNER JOIN public.sucursales s ON s.id_sucursal = c.id_sucursal
+      LEFT JOIN LATERAL (
+        SELECT
+          cs.id_sesion_caja,
+          estado.codigo AS estado_codigo,
+          cs.fecha_apertura,
+          cs.monto_apertura
+        FROM public.cajas_sesiones cs
+        INNER JOIN public.cat_cajas_sesiones_estados estado
+          ON estado.id_estado_sesion_caja = cs.id_estado_sesion_caja
+        WHERE cs.id_caja = cua.id_caja
+          AND cs.id_estado_sesion_caja = $2
+          AND (
+            cs.id_usuario_responsable = $1
+            OR EXISTS (
+              SELECT 1
+              FROM public.cajas_sesiones_participantes csp
+              WHERE csp.id_sesion_caja = cs.id_sesion_caja
+                AND csp.id_usuario = $1
+                AND COALESCE(csp.activo, true) = true
+            )
+          )
+        ORDER BY cs.fecha_apertura DESC, cs.id_sesion_caja DESC
+        LIMIT 1
+      ) sesion_usuario ON true
+      LEFT JOIN LATERAL (
+        SELECT cs.id_sesion_caja, cs.id_usuario_responsable, cs.fecha_apertura, cs.monto_apertura
+        FROM public.cajas_sesiones cs
+        WHERE cs.id_caja = cua.id_caja
+          AND cs.id_estado_sesion_caja = $2
+        ORDER BY cs.fecha_apertura DESC, cs.id_sesion_caja DESC
+        LIMIT 1
+      ) sesion_caja ON true
+      WHERE ${filters.join(' AND ')}
+      ORDER BY
+        COALESCE(cua.puede_responsable, false) DESC,
+        COALESCE(cua.puede_auxiliar, false) DESC,
+        cua.fecha_actualizacion DESC,
+        cua.id_caja_usuario_autorizado DESC
+      LIMIT 1
+      ${forUpdate ? 'FOR UPDATE OF cua' : ''}
+    `,
+    params
+  );
+
+  const row = result.rows?.[0] || null;
+  if (row) assertSucursalAllowed(scopeContext, row.id_sucursal);
+  return row;
+};
+
+const buildCajaSessionPayload = (sessionLike, fallback = {}) => {
+  const source = sessionLike || fallback;
+  if (!source?.id_sesion_caja) return {};
+  return {
+    id_sesion_caja: Number(source.id_sesion_caja),
+    id_caja: Number(source.id_caja ?? fallback.id_caja),
+    codigo_caja: source.codigo_caja ?? fallback.codigo_caja,
+    nombre_caja: source.nombre_caja ?? fallback.nombre_caja,
+    id_sucursal: Number(source.id_sucursal ?? fallback.id_sucursal),
+    nombre_sucursal: source.nombre_sucursal ?? fallback.nombre_sucursal,
+    rol_participacion: source.rol_participacion ?? source.rol_codigo ?? fallback.rol_participacion ?? fallback.rol_codigo ?? null,
+    monto_apertura: roundMoney(source.monto_apertura ?? fallback.monto_apertura ?? 0),
+    fecha_apertura: source.fecha_apertura ?? fallback.fecha_apertura ?? null
+  };
+};
+
+const fetchMiSesionOperativaActiva = async (client, scopeContext) => {
+  const idEstadoAbierta = await getCatalogId(client, 'SESSION_STATES', 'ABIERTA');
+  const params = [scopeContext.idUsuario, idEstadoAbierta];
+  const filters = [
+    'cs.id_estado_sesion_caja = $2',
+    '(cs.id_usuario_responsable = $1 OR participante.id_participacion_caja IS NOT NULL)'
+  ];
+
+  if (scopeContext.targetSucursalId) {
+    params.push(scopeContext.targetSucursalId);
+    filters.push(`cs.id_sucursal = $${params.length}`);
+  } else if (!scopeContext.isSuperAdmin) {
+    params.push(scopeContext.allowedSucursalIds);
+    filters.push(`cs.id_sucursal = ANY($${params.length}::int[])`);
+  }
+
+  const result = await client.query(
+    `
+      SELECT
+        cs.id_sesion_caja,
+        cs.id_caja,
+        cs.id_sucursal,
+        c.codigo_caja,
+        c.nombre_caja,
+        s.nombre_sucursal,
+        COALESCE(
+          participante.rol_codigo,
+          CASE WHEN cs.id_usuario_responsable = $1 THEN 'RESPONSABLE' END
+        ) AS rol_participacion,
+        cs.fecha_apertura,
+        cs.monto_apertura
+      FROM public.cajas_sesiones cs
+      INNER JOIN public.cajas c
+        ON c.id_caja = cs.id_caja
+      INNER JOIN public.sucursales s
+        ON s.id_sucursal = cs.id_sucursal
+      LEFT JOIN LATERAL (
+        SELECT
+          csp.id_participacion_caja,
+          crp.codigo AS rol_codigo
+        FROM public.cajas_sesiones_participantes csp
+        LEFT JOIN public.cat_cajas_roles_participacion crp
+          ON crp.id_rol_participacion_caja = csp.id_rol_participacion_caja
+        WHERE csp.id_sesion_caja = cs.id_sesion_caja
+          AND csp.id_usuario = $1
+          AND COALESCE(csp.activo, true) = true
+        ORDER BY csp.fecha_inicio DESC NULLS LAST, csp.id_participacion_caja DESC
+        LIMIT 1
+      ) participante ON true
+      WHERE ${filters.join(' AND ')}
+      ORDER BY cs.fecha_apertura DESC, cs.id_sesion_caja DESC
+      LIMIT 1
+    `,
+    params
+  );
+
+  const session = result.rows?.[0] || null;
+  if (session) assertSucursalAllowed(scopeContext, session.id_sucursal);
+  return session;
+};
+
+const buildMiCajaAsignadaPayload = (assignment) => {
+  const sessionForUser = assignment.id_sesion_caja
+    ? buildCajaSessionPayload(
+        {
+          id_sesion_caja: assignment.id_sesion_caja,
+          id_caja: assignment.id_caja,
+          codigo_caja: assignment.codigo_caja,
+          nombre_caja: assignment.nombre_caja,
+          id_sucursal: assignment.id_sucursal,
+          nombre_sucursal: assignment.nombre_sucursal,
+          monto_apertura: assignment.monto_apertura,
+          fecha_apertura: assignment.fecha_apertura
+        }
+      )
+    : null;
+
+  const sessionOpenedByOther = !sessionForUser && assignment.id_sesion_caja_abierta
+    ? buildCajaSessionPayload(
+        {
+          id_sesion_caja: assignment.id_sesion_caja_abierta,
+          id_caja: assignment.id_caja,
+          codigo_caja: assignment.codigo_caja,
+          nombre_caja: assignment.nombre_caja,
+          id_sucursal: assignment.id_sucursal,
+          nombre_sucursal: assignment.nombre_sucursal,
+          monto_apertura: assignment.monto_apertura_abierta,
+          fecha_apertura: assignment.fecha_apertura_abierta
+        }
+      )
+    : null;
+
+  return {
+    id_caja: Number(assignment.id_caja),
+    codigo_caja: assignment.codigo_caja,
+    nombre_caja: assignment.nombre_caja,
+    id_sucursal: Number(assignment.id_sucursal),
+    nombre_sucursal: assignment.nombre_sucursal,
+    puede_responsable: Boolean(assignment.puede_responsable),
+    puede_auxiliar: Boolean(assignment.puede_auxiliar),
+    estado_operativo: sessionForUser
+      ? 'SESION_ACTIVA_USUARIO'
+      : sessionOpenedByOther
+        ? 'ABIERTA_POR_OTRO_RESPONSABLE'
+        : 'ASIGNADA_SIN_SESION',
+    puede_operar: Boolean(sessionForUser),
+    puede_abrir: Boolean(!sessionForUser && !sessionOpenedByOther && assignment.puede_responsable),
+    caja_abierta_por_otro_responsable: Boolean(sessionOpenedByOther),
+    id_usuario_responsable_abierta: sessionOpenedByOther
+      ? Number(assignment.id_usuario_responsable_abierta)
+      : null,
+    ...(sessionForUser
+      ? {
+          ...sessionForUser,
+          estado_codigo: assignment.estado_codigo
+        }
+      : {}),
+    ...(sessionOpenedByOther
+      ? {
+          sesion_abierta: sessionOpenedByOther
+        }
+      : {})
+  };
+};
+
+const fetchUsuarioSesionAbierta = async (client, idUsuario, { forUpdate = false } = {}) => {
+  const idEstadoAbierta = await getCatalogId(client, 'SESSION_STATES', 'ABIERTA');
+  const result = await client.query(
+    `
+      SELECT cs.id_sesion_caja, cs.id_caja, cs.id_sucursal, cs.fecha_apertura, cs.monto_apertura
+      FROM public.cajas_sesiones cs
+      WHERE cs.id_estado_sesion_caja = $2
+        AND (
+          cs.id_usuario_responsable = $1
+          OR EXISTS (
+            SELECT 1
+            FROM public.cajas_sesiones_participantes csp
+            WHERE csp.id_sesion_caja = cs.id_sesion_caja
+              AND csp.id_usuario = $1
+              AND COALESCE(csp.activo, true) = true
+          )
+        )
+      ORDER BY cs.fecha_apertura DESC, cs.id_sesion_caja DESC
+      LIMIT 1
+      ${forUpdate ? 'FOR UPDATE OF cs' : ''}
+    `,
+    [idUsuario, idEstadoAbierta]
+  );
+  return result.rows?.[0] || null;
+};
+
+const fetchCajaOpeningEmailPayload = async (client, idSesionCaja) => {
+  const result = await client.query(
+    `
+      SELECT
+        cs.id_sesion_caja,
+        cs.id_caja,
+        cs.id_sucursal,
+        cs.id_usuario_responsable,
+        cs.fecha_apertura,
+        cs.monto_apertura,
+        cs.observacion_apertura,
+        c.codigo_caja,
+        c.nombre_caja,
+        s.nombre_sucursal,
+        u.nombre_usuario,
+        ${USER_DISPLAY_SQL} AS empleado_nombre,
+        COALESCE(
+          NULLIF(STRING_AGG(DISTINCT ${ROLE_NORMALIZED_SQL}, ', ') FILTER (WHERE r.id_rol IS NOT NULL), ''),
+          'Sin rol'
+        ) AS roles_usuario
+      FROM public.cajas_sesiones cs
+      INNER JOIN public.cajas c ON c.id_caja = cs.id_caja
+      INNER JOIN public.sucursales s ON s.id_sucursal = cs.id_sucursal
+      INNER JOIN public.usuarios u ON u.id_usuario = cs.id_usuario_responsable
+      LEFT JOIN public.empleados e ON e.id_empleado = u.id_empleado
+      LEFT JOIN public.personas per ON per.id_persona = e.id_persona
+      LEFT JOIN public.roles_usuarios ru ON ru.id_usuario = u.id_usuario
+      LEFT JOIN public.roles r ON r.id_rol = ru.id_rol
+      WHERE cs.id_sesion_caja = $1
+      GROUP BY
+        cs.id_sesion_caja,
+        cs.id_caja,
+        cs.id_sucursal,
+        cs.id_usuario_responsable,
+        cs.fecha_apertura,
+        cs.monto_apertura,
+        cs.observacion_apertura,
+        c.codigo_caja,
+        c.nombre_caja,
+        s.nombre_sucursal,
+        u.nombre_usuario,
+        per.nombre,
+        per.apellido
+      LIMIT 1
+    `,
+    [idSesionCaja]
+  );
+  return result.rows?.[0] || null;
+};
+
+const buildCajaAperturaEmailHtml = (payload) => `
+<!DOCTYPE html>
+<html lang="es">
+<head><meta charset="UTF-8"></head>
+<body style="font-family:Arial,sans-serif; color:#1f2933; line-height:1.5;">
+  <h2 style="margin:0 0 12px;">Apertura de caja</h2>
+  <p>Se registro una nueva apertura de caja en JONNY'S SmartOrder.</p>
+  <table cellpadding="6" cellspacing="0" style="border-collapse:collapse;">
+    <tr><td><strong>Empleado</strong></td><td>${escapeHtml(payload.empleado_nombre || 'No disponible')}</td></tr>
+    <tr><td><strong>Rol</strong></td><td>${escapeHtml(payload.roles_usuario || 'No disponible')}</td></tr>
+    <tr><td><strong>Usuario</strong></td><td>${escapeHtml(payload.nombre_usuario || 'No disponible')}</td></tr>
+    <tr><td><strong>Codigo de caja</strong></td><td>${escapeHtml(payload.codigo_caja || payload.id_caja)}</td></tr>
+    <tr><td><strong>Nombre de caja</strong></td><td>${escapeHtml(payload.nombre_caja || 'No disponible')}</td></tr>
+    <tr><td><strong>Sucursal</strong></td><td>${escapeHtml(payload.nombre_sucursal || payload.id_sucursal)}</td></tr>
+    <tr><td><strong>Valor inicial</strong></td><td>${escapeHtml(formatMoneyLabel(payload.monto_apertura))}</td></tr>
+    <tr><td><strong>Fecha/hora</strong></td><td>${escapeHtml(formatDateTimeLabel(payload.fecha_apertura))}</td></tr>
+    <tr><td><strong>Observacion</strong></td><td>${escapeHtml(payload.observacion_apertura || 'N/A')}</td></tr>
+  </table>
+</body>
+</html>`;
+
+const sendCajaAperturaEmail = async (idSesionCaja) => {
+  const payload = await fetchCajaOpeningEmailPayload(pool, idSesionCaja);
+  if (!payload) {
+    console.warn('[cajas] No se encontro informacion para correo de apertura de caja.', { idSesionCaja });
+    return;
+  }
+  await enviarCorreo(
+    CAJA_APERTURA_EMAIL_TO,
+    'Nueva sesion de caja aperturada',
+    buildCajaAperturaEmailHtml(payload),
+    {
+      id_usuario: payload.id_usuario_responsable,
+      tipo_correo: 'caja_apertura',
+      fromKey: 'ADMON'
+    }
+  );
+};
+
 const fetchSessionBase = async (client, idSesionCaja, { forUpdate = false } = {}) => {
   const result = await client.query(
     `
@@ -1028,6 +1511,329 @@ const ensureSessionParticipant = async (
   }
 
   throw createCajaError(403, 'VENTAS_CAJAS_PARTICIPANT_REQUIRED', 'El usuario autenticado no participa activamente en la sesion de caja.');
+};
+
+const resolveEgresoMovimientoTipo = async (client, requestedTipoId = null) => {
+  const idTipoMovimientoCaja = parseNullablePositiveInt(requestedTipoId);
+  if (idTipoMovimientoCaja) {
+    const result = await client.query(
+      `
+        SELECT id_tipo_movimiento_caja, codigo, nombre, signo, COALESCE(estado, true) AS estado
+        FROM public.cat_cajas_movimientos_tipos
+        WHERE id_tipo_movimiento_caja = $1
+        LIMIT 1
+      `,
+      [idTipoMovimientoCaja]
+    );
+    const row = result.rows?.[0] || null;
+    if (!row) {
+      throw createCajaError(400, 'VENTAS_CAJAS_EGRESO_TIPO_INVALIDO', 'El tipo de egreso indicado no existe.');
+    }
+    if (!row.estado || Number(row.signo) !== -1) {
+      throw createCajaError(400, 'VENTAS_CAJAS_EGRESO_TIPO_INVALIDO', 'El tipo de movimiento debe estar activo y ser de egreso.');
+    }
+    return row;
+  }
+
+  const result = await client.query(
+    `
+      SELECT id_tipo_movimiento_caja, codigo, nombre, signo, COALESCE(estado, true) AS estado
+      FROM public.cat_cajas_movimientos_tipos
+      WHERE COALESCE(estado, true) = true
+        AND signo = -1
+        AND UPPER(TRIM(codigo)) = ANY($1::text[])
+      ORDER BY array_position($1::text[], UPPER(TRIM(codigo))), id_tipo_movimiento_caja ASC
+      LIMIT 1
+    `,
+    [EGRESO_MOVEMENT_TYPE_CODES]
+  );
+  const row = result.rows?.[0] || null;
+  if (!row) {
+    throw createCajaError(
+      409,
+      'VENTAS_CAJAS_EGRESO_TIPO_NO_CONFIGURADO',
+      'No hay un tipo de movimiento de egreso activo configurado para caja.'
+    );
+  }
+  return row;
+};
+
+const resolveIngresoMovimientoTipo = async (client, requestedTipoId = null) => {
+  const idTipoMovimientoCaja = parseNullablePositiveInt(requestedTipoId);
+  if (idTipoMovimientoCaja) {
+    const result = await client.query(
+      `
+        SELECT id_tipo_movimiento_caja, codigo, nombre, signo, COALESCE(estado, true) AS estado
+        FROM public.cat_cajas_movimientos_tipos
+        WHERE id_tipo_movimiento_caja = $1
+        LIMIT 1
+      `,
+      [idTipoMovimientoCaja]
+    );
+    const row = result.rows?.[0] || null;
+    const codigo = String(row?.codigo || '').trim().toUpperCase();
+    if (!row) {
+      throw createCajaError(400, 'VENTAS_CAJAS_INGRESO_TIPO_INVALIDO', 'El tipo de ingreso indicado no existe.');
+    }
+    if (!row.estado || Number(row.signo) !== 1 || codigo === 'APERTURA') {
+      throw createCajaError(400, 'VENTAS_CAJAS_INGRESO_TIPO_INVALIDO', 'El tipo de movimiento debe estar activo y ser de ingreso manual.');
+    }
+    return row;
+  }
+
+  const result = await client.query(
+    `
+      SELECT id_tipo_movimiento_caja, codigo, nombre, signo, COALESCE(estado, true) AS estado
+      FROM public.cat_cajas_movimientos_tipos
+      WHERE COALESCE(estado, true) = true
+        AND signo = 1
+        AND UPPER(TRIM(codigo)) <> 'APERTURA'
+        AND UPPER(TRIM(codigo)) = ANY($1::text[])
+      ORDER BY array_position($1::text[], UPPER(TRIM(codigo))), id_tipo_movimiento_caja ASC
+      LIMIT 1
+    `,
+    [INGRESO_MOVEMENT_TYPE_CODES]
+  );
+  const row = result.rows?.[0] || null;
+  if (!row) {
+    throw createCajaError(
+      409,
+      'VENTAS_CAJAS_INGRESO_TIPO_NO_CONFIGURADO',
+      'No hay un tipo de movimiento de ingreso activo configurado para caja.'
+    );
+  }
+  return row;
+};
+
+const insertCajaEgresoMovimiento = async ({
+  client,
+  session,
+  idUsuarioEjecutor,
+  monto,
+  observacion,
+  referencia,
+  idTipoMovimientoCaja = null
+}) => {
+  const montoEgreso = parseNonNegativeAmount(monto);
+  const observacionEgreso = normalizeText(observacion, 500);
+  const referenciaEgreso = normalizeText(referencia, 120);
+  if (montoEgreso === null || montoEgreso <= 0) {
+    throw createCajaError(400, 'VENTAS_CAJAS_EGRESO_MONTO_INVALIDO', 'monto debe ser un numero mayor a 0.');
+  }
+  if (!observacionEgreso) {
+    throw createCajaError(400, 'VENTAS_CAJAS_EGRESO_OBSERVACION_REQUIRED', 'La observacion del egreso es obligatoria.');
+  }
+
+  const tipoMovimiento = await resolveEgresoMovimientoTipo(client, idTipoMovimientoCaja);
+  const insertResult = await client.query(
+    `
+      INSERT INTO public.cajas_movimientos (
+        id_sesion_caja, id_caja, id_sucursal, id_tipo_movimiento_caja,
+        id_usuario_ejecutor, monto, observacion, referencia, fecha_movimiento, fecha_creacion
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW())
+      RETURNING id_movimiento_caja
+    `,
+    [
+      session.id_sesion_caja,
+      session.id_caja,
+      session.id_sucursal,
+      tipoMovimiento.id_tipo_movimiento_caja,
+      idUsuarioEjecutor,
+      montoEgreso,
+      observacionEgreso,
+      referenciaEgreso
+    ]
+  );
+
+  return {
+    id_movimiento_caja: Number(insertResult.rows?.[0]?.id_movimiento_caja || 0) || null,
+    id_sesion_caja: Number(session.id_sesion_caja),
+    id_caja: Number(session.id_caja),
+    id_sucursal: Number(session.id_sucursal),
+    monto: montoEgreso
+  };
+};
+
+const insertCajaIngresoMovimiento = async ({
+  client,
+  session,
+  idUsuarioEjecutor,
+  monto,
+  observacion,
+  referencia,
+  idTipoMovimientoCaja = null
+}) => {
+  const montoIngreso = parseNonNegativeAmount(monto);
+  const observacionIngreso = normalizeText(observacion, 500);
+  const referenciaIngreso = normalizeText(referencia, 120);
+  if (montoIngreso === null || montoIngreso <= 0) {
+    throw createCajaError(400, 'VENTAS_CAJAS_INGRESO_MONTO_INVALIDO', 'monto debe ser un numero mayor a 0.');
+  }
+  if (!observacionIngreso) {
+    throw createCajaError(400, 'VENTAS_CAJAS_INGRESO_OBSERVACION_REQUIRED', 'La observacion del ingreso es obligatoria.');
+  }
+
+  const tipoMovimiento = await resolveIngresoMovimientoTipo(client, idTipoMovimientoCaja);
+  const insertResult = await client.query(
+    `
+      INSERT INTO public.cajas_movimientos (
+        id_sesion_caja, id_caja, id_sucursal, id_tipo_movimiento_caja,
+        id_usuario_ejecutor, monto, observacion, referencia, fecha_movimiento, fecha_creacion
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW())
+      RETURNING id_movimiento_caja
+    `,
+    [
+      session.id_sesion_caja,
+      session.id_caja,
+      session.id_sucursal,
+      tipoMovimiento.id_tipo_movimiento_caja,
+      idUsuarioEjecutor,
+      montoIngreso,
+      observacionIngreso,
+      referenciaIngreso
+    ]
+  );
+
+  return {
+    id_movimiento_caja: Number(insertResult.rows?.[0]?.id_movimiento_caja || 0) || null,
+    id_sesion_caja: Number(session.id_sesion_caja),
+    id_caja: Number(session.id_caja),
+    id_sucursal: Number(session.id_sucursal),
+    monto: montoIngreso
+  };
+};
+
+const persistCloseValidationAttempt = async ({
+  client,
+  session,
+  idUsuarioValida,
+  computation,
+  payloadRows,
+  observacionCierre,
+  origen,
+  ipOrigen,
+  userAgent
+}) => {
+  await client.query('SELECT pg_advisory_xact_lock(8152026, $1::integer)', [session.id_sesion_caja]);
+  const attemptResult = await client.query(
+    `
+      SELECT COALESCE(MAX(numero_intento), 0) + 1 AS numero_intento
+      FROM public.cajas_cierres_validaciones
+      WHERE id_sesion_caja = $1
+    `,
+    [session.id_sesion_caja]
+  );
+  const numeroIntento = Number(attemptResult.rows?.[0]?.numero_intento || 1);
+  const hayDiferencia = computation.rows.some((row) => roundMoney(row.diferencia) !== 0);
+  const payloadDeclarado = {
+    arqueos: Array.isArray(payloadRows) ? payloadRows : [],
+    observacion_cierre: observacionCierre || null
+  };
+  const resultado = {
+    resumen: {
+      total_teorico: computation.monto_teorico_total,
+      total_declarado: computation.monto_declarado_total,
+      diferencia_total: computation.diferencia_total,
+      hay_diferencia: hayDiferencia
+    },
+    metodos: computation.rows
+  };
+
+  const validationResult = await client.query(
+    `
+      INSERT INTO public.cajas_cierres_validaciones (
+        id_sesion_caja, id_caja, id_sucursal, id_usuario_valida, numero_intento,
+        origen, total_teorico, total_declarado, diferencia_total, hay_diferencia,
+        payload_declarado_json, resultado_json, observacion_general, ip_origen, user_agent,
+        fecha_validacion, fecha_creacion
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, $12::jsonb, $13, $14, $15, NOW(), NOW())
+      RETURNING id_validacion_cierre
+    `,
+    [
+      session.id_sesion_caja,
+      session.id_caja,
+      session.id_sucursal,
+      idUsuarioValida,
+      numeroIntento,
+      normalizeCajaCode(origen, 80) || 'REVISION_DIFERENCIAS',
+      computation.monto_teorico_total,
+      computation.monto_declarado_total,
+      computation.diferencia_total,
+      hayDiferencia,
+      JSON.stringify(payloadDeclarado),
+      JSON.stringify(resultado),
+      observacionCierre || null,
+      normalizeText(ipOrigen, 120),
+      normalizeText(userAgent, 300)
+    ]
+  );
+  const idValidacionCierre = Number(validationResult.rows?.[0]?.id_validacion_cierre || 0) || null;
+
+  for (const row of computation.rows) {
+    await client.query(
+      `
+        INSERT INTO public.cajas_cierres_validaciones_metodos (
+          id_validacion_cierre, id_metodo_pago, metodo_pago_codigo, monto_teorico,
+          monto_declarado, diferencia, cantidad_referencias, resultado,
+          requiere_revision, observacion, fecha_creacion
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())
+      `,
+      [
+        idValidacionCierre,
+        row.id_metodo_pago,
+        row.metodo_pago_codigo,
+        row.monto_teorico,
+        row.monto_declarado,
+        row.diferencia,
+        row.cantidad_referencias,
+        row.resultado,
+        row.requiere_revision,
+        row.observacion
+      ]
+    );
+  }
+
+  return {
+    id_validacion_cierre: idValidacionCierre,
+    numero_intento: numeroIntento,
+    hay_diferencia: hayDiferencia
+  };
+};
+
+const buildCloseValidationResponse = ({ validation, computation, isCashierOnly }) => {
+  const base = {
+    message: 'Diferencias revisadas correctamente.',
+    id_validacion_cierre: validation.id_validacion_cierre,
+    numero_intento: validation.numero_intento,
+    comparacion_visible: true,
+    teorico_visible: !isCashierOnly,
+    resumen: {
+      total_declarado: computation.monto_declarado_total,
+      diferencia_total: computation.diferencia_total,
+      hay_diferencia: validation.hay_diferencia
+    },
+    metodos: computation.rows.map((row) => ({
+      metodo_pago_codigo: row.metodo_pago_codigo,
+      monto_declarado: row.monto_declarado,
+      diferencia: row.diferencia,
+      resultado: row.resultado,
+      requiere_revision: row.requiere_revision,
+      observacion_requerida: row.observacion_requerida,
+      observacion_presente: row.observacion_presente,
+      cantidad_referencias: row.cantidad_referencias,
+      ...(isCashierOnly ? {} : { monto_teorico: row.monto_teorico })
+    }))
+  };
+
+  if (!isCashierOnly) {
+    base.resumen.total_teorico = computation.monto_teorico_total;
+  }
+
+  return base;
 };
 
 const buildSessionDetailPayload = async (client, session) => {
@@ -1094,13 +1900,36 @@ const buildSessionDetailPayload = async (client, session) => {
       ),
       client.query(
         `
-          SELECT m.*, tipo.codigo AS tipo_codigo, tipo.nombre AS tipo_nombre
+          SELECT m.*,
+                 tipo.codigo AS tipo_codigo,
+                 tipo.nombre AS tipo_nombre,
+                 tipo.signo,
+                 tipo.afecta_efectivo,
+                 u.nombre_usuario AS usuario_ejecutor_alias,
+                 u.nombre_usuario,
+                 ${USER_DISPLAY_SQL} AS usuario_ejecutor_nombre,
+                 COALESCE(
+                   crp.codigo,
+                   CASE WHEN m.id_usuario_ejecutor = $2 THEN 'RESPONSABLE' ELSE 'EJECUTOR' END
+                 ) AS rol_participacion_codigo,
+                 COALESCE(
+                   crp.nombre,
+                   CASE WHEN m.id_usuario_ejecutor = $2 THEN 'Responsable' ELSE 'Ejecutor' END
+                 ) AS rol_participacion_nombre
           FROM public.cajas_movimientos m
           INNER JOIN public.cat_cajas_movimientos_tipos tipo ON tipo.id_tipo_movimiento_caja = m.id_tipo_movimiento_caja
+          LEFT JOIN public.usuarios u ON u.id_usuario = m.id_usuario_ejecutor
+          LEFT JOIN public.empleados e ON e.id_empleado = u.id_empleado
+          LEFT JOIN public.personas per ON per.id_persona = e.id_persona
+          LEFT JOIN public.cajas_sesiones_participantes csp
+            ON csp.id_sesion_caja = m.id_sesion_caja
+           AND csp.id_usuario = m.id_usuario_ejecutor
+          LEFT JOIN public.cat_cajas_roles_participacion crp
+            ON crp.id_rol_participacion_caja = csp.id_rol_participacion_caja
           WHERE m.id_sesion_caja = $1
           ORDER BY m.fecha_movimiento DESC, m.id_movimiento_caja DESC
         `,
-        [session.id_sesion_caja]
+        [session.id_sesion_caja, session.id_usuario_responsable]
       ),
       client.query(
         `
@@ -1204,14 +2033,16 @@ router.get('/ventas/cajas/sesion-activa', checkPermission(['VENTAS_CAJAS_LISTADO
     const result = await pool.query(
       `
         SELECT cs.id_sesion_caja, cs.id_caja, cs.id_sucursal, cs.fecha_apertura, cs.monto_apertura,
-               cs.id_usuario_responsable, c.codigo_caja, c.nombre_caja, s.nombre_sucursal, crp.codigo AS rol_codigo
+               cs.id_usuario_responsable, c.codigo_caja, c.nombre_caja, s.nombre_sucursal,
+               COALESCE(crp.codigo, CASE WHEN cs.id_usuario_responsable = $1 THEN 'RESPONSABLE' END) AS rol_codigo
         FROM public.cajas_sesiones cs
-        INNER JOIN public.cajas_sesiones_participantes csp ON csp.id_sesion_caja = cs.id_sesion_caja
+        LEFT JOIN public.cajas_sesiones_participantes csp ON csp.id_sesion_caja = cs.id_sesion_caja
           AND csp.id_usuario = $1 AND COALESCE(csp.activo, true) = true
-        INNER JOIN public.cat_cajas_roles_participacion crp ON crp.id_rol_participacion_caja = csp.id_rol_participacion_caja
+        LEFT JOIN public.cat_cajas_roles_participacion crp ON crp.id_rol_participacion_caja = csp.id_rol_participacion_caja
         INNER JOIN public.cajas c ON c.id_caja = cs.id_caja
         INNER JOIN public.sucursales s ON s.id_sucursal = cs.id_sucursal
         WHERE cs.id_estado_sesion_caja = $2
+          AND (cs.id_usuario_responsable = $1 OR csp.id_participacion_caja IS NOT NULL)
         ORDER BY cs.fecha_apertura DESC, cs.id_sesion_caja DESC
         LIMIT 1
       `,
@@ -1222,7 +2053,51 @@ router.get('/ventas/cajas/sesion-activa', checkPermission(['VENTAS_CAJAS_LISTADO
     assertSucursalAllowed(scopeContext, result.rows[0].id_sucursal);
     return res.status(200).json({ activa: true, session: result.rows[0] });
   } catch (err) {
-    return sendInternalError(res, err, 'VENTAS_CAJAS_ACTIVE_SESSION_ERROR', 'No se pudo obtener la sesion activa de caja.');
+    return sendInternalError(res, err, 'VENTAS_CAJAS_ACTIVE_SESSION_ERROR', 'No se pudo obtener la sesión activa de caja.');
+  }
+});
+
+router.get('/ventas/cajas/mi-sesion-activa', checkPermission(['VENTAS_CAJAS_SESION_ABRIR']), async (req, res) => {
+  try {
+    const hasSucursalQuery = Object.prototype.hasOwnProperty.call(req.query || {}, 'id_sucursal');
+    const requestedSucursalId = parseNullablePositiveInt(req.query.id_sucursal);
+    if (hasSucursalQuery && !requestedSucursalId) {
+      throw createCajaError(400, 'VENTAS_CAJAS_SCOPE_INVALID', 'El id de sucursal es invalido.');
+    }
+
+    const scopeContext = await getScopeContext(req, pool, requestedSucursalId, true);
+    const session = await fetchMiSesionOperativaActiva(pool, scopeContext);
+    if (!session) return res.status(200).json({ activa: false, session: null });
+
+    return res.status(200).json({
+      activa: true,
+      session: buildCajaSessionPayload(session)
+    });
+  } catch (err) {
+    return sendInternalError(res, err, 'VENTAS_CAJAS_MY_ACTIVE_SESSION_ERROR', 'No se pudo obtener la sesion activa de caja.');
+  }
+});
+
+router.get('/ventas/cajas/mi-asignacion-activa', checkPermission(['VENTAS_CAJAS_SESION_ABRIR']), async (req, res) => {
+  try {
+    const scopeContext = await getScopeContext(req, pool, null, true);
+    const assignment = await fetchMiCajaAsignadaActiva(pool, scopeContext);
+    if (!assignment) {
+      console.info('[cajas] asignacion activa directa no encontrada', {
+        id_usuario: scopeContext.idUsuario,
+        id_sucursal_scope: scopeContext.targetSucursalId || null,
+        sucursales_permitidas: scopeContext.allowedSucursalIds.length
+      });
+      throw createCajaError(
+        404,
+        'CAJA_ASIGNACION_NO_ENCONTRADA',
+        'No tienes una caja asignada activa.'
+      );
+    }
+
+    return res.status(200).json(buildMiCajaAsignadaPayload(assignment));
+  } catch (err) {
+    return sendInternalError(res, err, 'VENTAS_CAJAS_MY_ASSIGNMENT_ERROR', 'No se pudo obtener la caja asignada.');
   }
 });
 
@@ -1230,6 +2105,7 @@ router.get('/ventas/cajas/catalogos', checkPermission(['VENTAS_CAJAS_LISTADO_VER
   try {
     const requestedSucursalId = parseNullablePositiveInt(req.query.id_sucursal);
     const scopeContext = await getScopeContext(req, pool, requestedSucursalId, true);
+    const isRestrictedCajero = await requestIsRestrictedCajero(req);
 
     const cajasParams = [];
     const cajasFilters = ['COALESCE(c.estado, true) = true'];
@@ -1239,6 +2115,19 @@ router.get('/ventas/cajas/catalogos', checkPermission(['VENTAS_CAJAS_LISTADO_VER
     } else if (!scopeContext.isSuperAdmin) {
       cajasParams.push(scopeContext.allowedSucursalIds);
       cajasFilters.push(`c.id_sucursal = ANY($${cajasParams.length}::int[])`);
+    }
+    if (isRestrictedCajero) {
+      cajasParams.push(scopeContext.idUsuario);
+      cajasFilters.push(`
+        EXISTS (
+          SELECT 1
+          FROM public.cajas_usuarios_autorizados cua
+          WHERE cua.id_caja = c.id_caja
+            AND cua.id_usuario = $${cajasParams.length}
+            AND COALESCE(cua.estado, true) = true
+            AND (COALESCE(cua.puede_responsable, false) = true OR COALESCE(cua.puede_auxiliar, false) = true)
+        )
+      `);
     }
 
     const [cajas, estados, roles, movimientos, metodosPago, resoluciones, tiposArqueo] =
@@ -1268,7 +2157,7 @@ router.get('/ventas/cajas/catalogos', checkPermission(['VENTAS_CAJAS_LISTADO_VER
       tipos_arqueo: tiposArqueo.rows
     });
   } catch (err) {
-    return sendInternalError(res, err, 'VENTAS_CAJAS_CATALOGS_ERROR', 'No se pudieron obtener los catalogos de Gestion de cajas.');
+    return sendInternalError(res, err, 'VENTAS_CAJAS_CATALOGS_ERROR', 'No se pudieron obtener los catálogos de Gestión de cajas.');
   }
 });
 
@@ -1397,6 +2286,7 @@ router.get('/ventas/cajas/listado', checkPermission(['VENTAS_CAJAS_LISTADO_VER']
   try {
     const requestedSucursalId = parseNullablePositiveInt(req.query.id_sucursal);
     const scopeContext = await getScopeContext(req, pool, requestedSucursalId, true);
+    const isRestrictedCajero = await requestIsRestrictedCajero(req);
     const includeInactive = parseBooleanWithDefault(req.query.incluir_inactivas, false);
     const search = normalizeText(req.query.search, 100)?.toUpperCase() || '';
 
@@ -1413,8 +2303,21 @@ router.get('/ventas/cajas/listado', checkPermission(['VENTAS_CAJAS_LISTADO_VER']
       pushFilter('c.id_sucursal = ANY($IDX::int[])', scopeContext.allowedSucursalIds);
     }
 
-    if (!includeInactive) {
+    if (!includeInactive || isRestrictedCajero) {
       filters.push('COALESCE(c.estado, true) = true');
+    }
+    if (isRestrictedCajero) {
+      pushFilter(
+        `EXISTS (
+          SELECT 1
+          FROM public.cajas_usuarios_autorizados cua
+          WHERE cua.id_caja = c.id_caja
+            AND cua.id_usuario = $IDX
+            AND COALESCE(cua.estado, true) = true
+            AND (COALESCE(cua.puede_responsable, false) = true OR COALESCE(cua.puede_auxiliar, false) = true)
+        )`,
+        scopeContext.idUsuario
+      );
     }
     if (search) {
       pushFilter(
@@ -2158,7 +3061,7 @@ router.get('/ventas/cajas/sesiones', checkPermission(['VENTAS_CAJAS_LISTADO_VER'
   try {
     const requestedSucursalId = parseNullablePositiveInt(req.query.id_sucursal);
     const scopeContext = await getScopeContext(req, pool, requestedSucursalId, true);
-    const isCajero = await requestHasAnyRole(req, ['CAJERO']);
+    const isRestrictedCajero = await isCashierOnlyRequest(req);
     const filters = [];
     const params = [];
     const pushFilter = (fragment, value) => {
@@ -2168,7 +3071,7 @@ router.get('/ventas/cajas/sesiones', checkPermission(['VENTAS_CAJAS_LISTADO_VER'
 
     if (scopeContext.targetSucursalId) pushFilter('cs.id_sucursal = $IDX', scopeContext.targetSucursalId);
     else if (!scopeContext.isSuperAdmin) pushFilter('cs.id_sucursal = ANY($IDX::int[])', scopeContext.allowedSucursalIds);
-    if (isCajero && !scopeContext.isSuperAdmin) {
+    if (isRestrictedCajero) {
       pushFilter(
         `EXISTS (
           SELECT 1
@@ -2218,7 +3121,10 @@ router.get('/ventas/cajas/sesiones', checkPermission(['VENTAS_CAJAS_LISTADO_VER'
       params
     );
 
-    return res.status(200).json(result.rows);
+    const rows = isRestrictedCajero
+      ? result.rows.map(maskCajaSessionRowForCajero)
+      : result.rows;
+    return res.status(200).json(rows);
   } catch (err) {
     return sendInternalError(res, err, 'VENTAS_CAJAS_SESIONES_LIST_ERROR', 'No se pudieron listar las sesiones de caja.');
   }
@@ -2232,7 +3138,20 @@ const sessionDetailHandler = async (req, res, defaultCode, defaultMessage) => {
     const session = await fetchSessionBase(pool, idSesionCaja);
     if (!session) throw createCajaError(404, 'VENTAS_CAJAS_SESSION_NOT_FOUND', 'La sesion de caja no existe.');
     assertSucursalAllowed(scopeContext, session.id_sucursal);
-    return res.status(200).json(await buildSessionDetailPayload(pool, session));
+    const isRestrictedCajero = await isCashierOnlyRequest(req);
+    const isOpenSession = String(session.estado_codigo || '').trim().toUpperCase() === 'ABIERTA';
+    const allowOperationalPayload = isOperationalCajaDetailContext(req.query?.contexto || req.query?.context);
+    if (isRestrictedCajero && isOpenSession && !allowOperationalPayload) {
+      throw createCajaError(
+        403,
+        'VENTAS_CAJAS_DETALLE_ABIERTO_NO_PERMITIDO',
+        'El detalle operativo de una sesión abierta solo está disponible para administradores.'
+      );
+    }
+    const payload = await buildSessionDetailPayload(pool, session);
+    return res.status(200).json(
+      isRestrictedCajero ? maskCajaDetailPayloadForCajero(payload) : payload
+    );
   } catch (err) {
     return sendInternalError(res, err, defaultCode, defaultMessage);
   }
@@ -2268,7 +3187,7 @@ const createOpenSessionTransaction = async ({
     [idCaja, idEstadoAbierta]
   );
   if (openSessionResult.rowCount > 0) {
-    throw createCajaError(409, 'VENTAS_CAJAS_SESSION_ALREADY_OPEN', 'La caja ya tiene una sesion abierta.');
+    throw createCajaError(409, 'VENTAS_CAJAS_SESSION_ALREADY_OPEN', 'La caja ya tiene una sesión abierta.');
   }
 
   const responsibleOpenSessionResult = await client.query(
@@ -2276,7 +3195,7 @@ const createOpenSessionTransaction = async ({
     [responsableId, idEstadoAbierta]
   );
   if (responsibleOpenSessionResult.rowCount > 0) {
-    throw createCajaError(409, 'VENTAS_CAJAS_RESPONSABLE_BUSY', 'El responsable ya tiene una sesion de caja abierta.');
+    throw createCajaError(409, 'VENTAS_CAJAS_RESPONSABLE_BUSY', 'El responsable ya tiene una sesión de caja abierta.');
   }
 
   const idRolResponsable = await getCatalogId(client, 'PARTICIPATION_ROLES', 'RESPONSABLE');
@@ -2295,7 +3214,7 @@ const createOpenSessionTransaction = async ({
   );
   const idSesionCaja = Number(sessionInsert.rows?.[0]?.id_sesion_caja || 0) || null;
   if (!idSesionCaja) {
-    throw createCajaError(500, 'VENTAS_CAJAS_SESSION_ID_ERROR', 'No se pudo determinar el identificador de la sesion abierta.');
+    throw createCajaError(500, 'VENTAS_CAJAS_SESSION_ID_ERROR', 'No se pudo determinar el identificador de la sesión abierta.');
   }
 
   await client.query(
@@ -2317,7 +3236,7 @@ const createOpenSessionTransaction = async ({
         )
         VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), NOW())
       `,
-      [idSesionCaja, idCaja, caja.id_sucursal, idTipoApertura, scopeContext.idUsuario, montoApertura, observacionApertura || 'Apertura de sesion de caja']
+      [idSesionCaja, idCaja, caja.id_sucursal, idTipoApertura, scopeContext.idUsuario, montoApertura, observacionApertura || 'Apertura de sesión de caja']
     );
   }
 
@@ -2337,6 +3256,14 @@ const openSessionHandler = async (req, res) => {
     if (montoApertura === null) throw createCajaError(400, 'VENTAS_CAJAS_APERTURA_AMOUNT_INVALID', 'monto_apertura debe ser un numero mayor o igual a 0.');
 
     const scopeContext = await getScopeContext(req, client, requestedSucursalId, true);
+    if (await requestIsRestrictedCajero(req)) {
+      throw createCajaError(
+        403,
+        'CAJA_FLUJO_ASIGNACION_DIRECTA_REQUERIDO',
+        'Los usuarios cajeros deben abrir únicamente su caja asignada desde el flujo personal de caja.'
+      );
+    }
+
     let responsableId = requestedResponsableId || scopeContext.idUsuario;
     const caja = await fetchCajaById(client, idCaja);
     if (!caja) {
@@ -2350,7 +3277,7 @@ const openSessionHandler = async (req, res) => {
           throw createCajaError(
             409,
             'VENTAS_CAJAS_RESPONSABLE_REQUIRED',
-            'La caja no tiene un responsable autorizado activo. Asigna un responsable antes de abrir sesion.'
+            'La caja no tiene un responsable autorizado activo. Asigna un responsable antes de abrir sesión.'
           );
         }
         responsableId = fallbackResponsable;
@@ -2368,24 +3295,283 @@ const openSessionHandler = async (req, res) => {
     await client.query('COMMIT');
 
     try {
-      await sendReportEmail({
-        to: 'gersonmz@jonnyshn.com',
-        subject: `Nueva sesión de caja aperturada`, 
-        html: `<p>Se ha aperturado la caja ID: ${idCaja}</p><p>Usuario Responsable ID: ${responsableId}</p><p>Monto de Apertura: ${montoApertura}</p><p>Observación: ${observacionApertura || 'N/A'}</p>`
-      });
-    } catch(e) { console.error('Email error:', e); }
+      await sendCajaAperturaEmail(idSesionCaja);
+    } catch (emailError) {
+      console.error('[cajas] Error enviando correo de apertura:', emailError.message);
+    }
 
-    return res.status(201).json({ message: 'Sesion de caja iniciada correctamente.', id_sesion_caja: idSesionCaja });
+    return res.status(201).json({ message: 'Sesión de caja iniciada correctamente.', id_sesion_caja: idSesionCaja });
   } catch (err) {
     await client.query('ROLLBACK');
-    return sendInternalError(res, err, 'VENTAS_CAJAS_OPEN_ERROR', 'No se pudo abrir la sesion de caja.');
+    return sendInternalError(res, err, 'VENTAS_CAJAS_OPEN_ERROR', 'No se pudo abrir la sesión de caja.');
   } finally {
     client.release();
   }
 };
 
+const openMyAssignedSessionHandler = async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const body = req.body || {};
+    if (Object.prototype.hasOwnProperty.call(body, 'id_caja')) {
+      throw createCajaError(
+        400,
+        'CAJA_ID_CAJA_NO_PERMITIDA',
+        'No envies id_caja para abrir tu caja asignada.'
+      );
+    }
+
+    const montoApertura = parseNonNegativeAmount(body.monto_apertura);
+    const observacionApertura = normalizeText(body.observacion_apertura, 500);
+    if (montoApertura === null) {
+      throw createCajaError(400, 'VENTAS_CAJAS_APERTURA_AMOUNT_INVALID', 'monto_apertura debe ser un número mayor o igual a 0.');
+    }
+
+    const scopeContext = await getScopeContext(req, client, null, true);
+    const assignment = await fetchMiCajaAsignadaActiva(client, scopeContext, { forUpdate: true });
+    if (!assignment) {
+      throw createCajaError(
+        404,
+        'CAJA_ASIGNACION_NO_ENCONTRADA',
+        'No tienes una caja asignada activa.'
+      );
+    }
+
+    if (assignment.id_sesion_caja) {
+      const session = await fetchSessionBase(client, assignment.id_sesion_caja, { forUpdate: true });
+      await client.query('COMMIT');
+      return res.status(200).json({
+        code: 'CAJA_SESION_USUARIO_YA_ABIERTA',
+        message: 'Ya participas en una sesión de caja abierta.',
+        ...buildCajaSessionPayload(session, assignment)
+      });
+    }
+
+    if (assignment.id_sesion_caja_abierta) {
+      await client.query('COMMIT');
+      return res.status(409).json({
+        error: true,
+        code: 'CAJA_SESION_ABIERTA_POR_OTRO_RESPONSABLE',
+        message: 'La caja asignada ya tiene una sesión abierta por otro responsable y tu usuario no participa en ella.',
+        sesion_abierta: buildCajaSessionPayload(
+          {
+            id_sesion_caja: assignment.id_sesion_caja_abierta,
+            id_caja: assignment.id_caja,
+            codigo_caja: assignment.codigo_caja,
+            nombre_caja: assignment.nombre_caja,
+            id_sucursal: assignment.id_sucursal,
+            nombre_sucursal: assignment.nombre_sucursal,
+            monto_apertura: assignment.monto_apertura_abierta,
+            fecha_apertura: assignment.fecha_apertura_abierta
+          }
+        ),
+        id_usuario_responsable: Number(assignment.id_usuario_responsable_abierta)
+      });
+    }
+
+    if (!parseBooleanish(assignment.puede_responsable)) {
+      throw createCajaError(
+        403,
+        'CAJA_ASIGNACION_RESPONSABLE_REQUERIDA',
+        'Tu asignación activa no permite abrir esta caja como responsable.'
+      );
+    }
+
+    const userOpenSession = await fetchUsuarioSesionAbierta(client, scopeContext.idUsuario, { forUpdate: true });
+    if (userOpenSession) {
+      const session = await fetchSessionBase(client, userOpenSession.id_sesion_caja, { forUpdate: true });
+      await client.query('COMMIT');
+      return res.status(409).json({
+        error: true,
+        code: 'CAJA_SESION_USUARIO_YA_ABIERTA',
+        message: 'Ya participas en una sesión de caja abierta.',
+        sesion_abierta: buildCajaSessionPayload(session, userOpenSession)
+      });
+    }
+
+    const idSesionCaja = await createOpenSessionTransaction({
+      client,
+      scopeContext,
+      idCaja: assignment.id_caja,
+      responsableId: scopeContext.idUsuario,
+      montoApertura,
+      observacionApertura
+    });
+    const session = await fetchSessionBase(client, idSesionCaja);
+
+    await client.query('COMMIT');
+
+    try {
+      await sendCajaAperturaEmail(idSesionCaja);
+    } catch (emailError) {
+      console.error('[cajas] Error enviando correo de apertura:', emailError.message);
+    }
+
+    return res.status(201).json({
+      message: 'Sesión de caja iniciada correctamente.',
+      ...buildCajaSessionPayload(session, {
+        id_sesion_caja: idSesionCaja,
+        id_caja: assignment.id_caja,
+        codigo_caja: assignment.codigo_caja,
+        nombre_caja: assignment.nombre_caja,
+        id_sucursal: assignment.id_sucursal,
+        nombre_sucursal: assignment.nombre_sucursal,
+        monto_apertura: montoApertura
+      })
+    });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    return sendInternalError(res, err, 'VENTAS_CAJAS_MY_OPEN_ERROR', 'No se pudo abrir tu caja asignada.');
+  } finally {
+    client.release();
+  }
+};
+
+router.post('/ventas/cajas/mi-sesion/abrir', checkPermission(['VENTAS_CAJAS_SESION_ABRIR']), openMyAssignedSessionHandler);
 router.post('/ventas/cajas/sesiones', checkPermission(['VENTAS_CAJAS_SESION_ABRIR']), openSessionHandler);
 router.post('/ventas/cajas/sesiones/abrir', checkPermission(['VENTAS_CAJAS_SESION_ABRIR']), openSessionHandler);
+
+router.post('/ventas/cajas/mi-sesion/egresos', checkPermission(['VENTAS_CAJAS_MOVIMIENTO_MANUAL_REGISTRAR']), async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const scopeContext = await getScopeContext(req, client, null, true);
+    const userOpenSession = await fetchUsuarioSesionAbierta(client, scopeContext.idUsuario, { forUpdate: true });
+    if (!userOpenSession?.id_sesion_caja) {
+      throw createCajaError(404, 'VENTAS_CAJAS_SESION_ACTIVA_NO_ENCONTRADA', 'No tienes una sesion de caja abierta.');
+    }
+    const session = await ensureOpenSession(client, userOpenSession.id_sesion_caja, { forUpdate: true });
+    assertSucursalAllowed(scopeContext, session.id_sucursal);
+    await ensureSessionParticipant(client, session.id_sesion_caja, scopeContext.idUsuario, { req, scopeContext });
+
+    const movimiento = await insertCajaEgresoMovimiento({
+      client,
+      session,
+      idUsuarioEjecutor: scopeContext.idUsuario,
+      monto: req.body.monto,
+      observacion: req.body.observacion,
+      referencia: req.body.referencia,
+      idTipoMovimientoCaja: req.body.id_tipo_movimiento_caja
+    });
+
+    await client.query('COMMIT');
+    return res.status(201).json({
+      message: 'Egreso de caja registrado correctamente.',
+      ...movimiento
+    });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    return sendInternalError(res, err, 'VENTAS_CAJAS_EGRESO_CREATE_ERROR', 'No se pudo registrar el egreso de caja.');
+  } finally {
+    client.release();
+  }
+});
+
+router.post('/ventas/cajas/mi-sesion/ingresos', checkPermission(['VENTAS_CAJAS_MOVIMIENTO_MANUAL_REGISTRAR']), async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const scopeContext = await getScopeContext(req, client, null, true);
+    const userOpenSession = await fetchUsuarioSesionAbierta(client, scopeContext.idUsuario, { forUpdate: true });
+    if (!userOpenSession?.id_sesion_caja) {
+      throw createCajaError(404, 'VENTAS_CAJAS_SESION_ACTIVA_NO_ENCONTRADA', 'No tienes una sesion de caja abierta.');
+    }
+    const session = await ensureOpenSession(client, userOpenSession.id_sesion_caja, { forUpdate: true });
+    assertSucursalAllowed(scopeContext, session.id_sucursal);
+    await ensureSessionParticipant(client, session.id_sesion_caja, scopeContext.idUsuario, { req, scopeContext });
+
+    const movimiento = await insertCajaIngresoMovimiento({
+      client,
+      session,
+      idUsuarioEjecutor: scopeContext.idUsuario,
+      monto: req.body.monto,
+      observacion: req.body.observacion,
+      referencia: req.body.referencia,
+      idTipoMovimientoCaja: req.body.id_tipo_movimiento_caja
+    });
+
+    await client.query('COMMIT');
+    return res.status(201).json({
+      message: 'Ingreso de caja registrado correctamente.',
+      ...movimiento
+    });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    return sendInternalError(res, err, 'VENTAS_CAJAS_INGRESO_CREATE_ERROR', 'No se pudo registrar el ingreso de caja.');
+  } finally {
+    client.release();
+  }
+});
+
+router.post('/ventas/cajas/sesiones/:id/egresos', checkPermission(['VENTAS_CAJAS_MOVIMIENTO_MANUAL_REGISTRAR']), async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const idSesionCaja = parsePositiveInt(req.params.id);
+    if (!idSesionCaja) throw createCajaError(400, 'VENTAS_CAJAS_SESSION_ID_INVALID', 'El id de sesion es invalido.');
+    const scopeContext = await getScopeContext(req, client, null, true);
+    const session = await ensureOpenSession(client, idSesionCaja, { forUpdate: true });
+    assertSucursalAllowed(scopeContext, session.id_sucursal);
+    await ensureSessionParticipant(client, idSesionCaja, scopeContext.idUsuario, { allowAdminBypass: true, req, scopeContext });
+
+    const movimiento = await insertCajaEgresoMovimiento({
+      client,
+      session,
+      idUsuarioEjecutor: scopeContext.idUsuario,
+      monto: req.body.monto,
+      observacion: req.body.observacion,
+      referencia: req.body.referencia,
+      idTipoMovimientoCaja: req.body.id_tipo_movimiento_caja
+    });
+
+    await client.query('COMMIT');
+    return res.status(201).json({
+      message: 'Egreso de caja registrado correctamente.',
+      ...movimiento
+    });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    return sendInternalError(res, err, 'VENTAS_CAJAS_EGRESO_CREATE_ERROR', 'No se pudo registrar el egreso de caja.');
+  } finally {
+    client.release();
+  }
+});
+
+router.post('/ventas/cajas/sesiones/:id/ingresos', checkPermission(['VENTAS_CAJAS_MOVIMIENTO_MANUAL_REGISTRAR']), async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const idSesionCaja = parsePositiveInt(req.params.id);
+    if (!idSesionCaja) throw createCajaError(400, 'VENTAS_CAJAS_SESSION_ID_INVALID', 'El id de sesion es invalido.');
+    const scopeContext = await getScopeContext(req, client, null, true);
+    const session = await ensureOpenSession(client, idSesionCaja, { forUpdate: true });
+    assertSucursalAllowed(scopeContext, session.id_sucursal);
+    await ensureSessionParticipant(client, idSesionCaja, scopeContext.idUsuario, { allowAdminBypass: true, req, scopeContext });
+
+    const movimiento = await insertCajaIngresoMovimiento({
+      client,
+      session,
+      idUsuarioEjecutor: scopeContext.idUsuario,
+      monto: req.body.monto,
+      observacion: req.body.observacion,
+      referencia: req.body.referencia,
+      idTipoMovimientoCaja: req.body.id_tipo_movimiento_caja
+    });
+
+    await client.query('COMMIT');
+    return res.status(201).json({
+      message: 'Ingreso de caja registrado correctamente.',
+      ...movimiento
+    });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    return sendInternalError(res, err, 'VENTAS_CAJAS_INGRESO_CREATE_ERROR', 'No se pudo registrar el ingreso de caja.');
+  } finally {
+    client.release();
+  }
+});
 
 const closeSessionHandler = async (req, res) => {
   const client = await pool.connect();
@@ -2396,6 +3582,7 @@ const closeSessionHandler = async (req, res) => {
     const observacionCierre = normalizeText(req.body.observacion_cierre, 500);
     const idResolucion = parseNullablePositiveInt(req.body.id_resolucion_cierre_caja);
     const idArqueoFinal = parseNullablePositiveInt(req.body.id_arqueo_final);
+    const idValidacionCierre = parseNullablePositiveInt(req.body.id_validacion_cierre);
 
     if (!idSesionCaja) throw createCajaError(400, 'VENTAS_CAJAS_SESSION_ID_INVALID', 'El id de sesion es invalido.');
     const scopeContext = await getScopeContext(req, client, null, true);
@@ -2492,6 +3679,9 @@ const closeSessionHandler = async (req, res) => {
       }
 
       diferencia = Number((montoDeclaradoCierre - montoTeorico).toFixed(2));
+      if (Math.abs(diferencia) > 0 && !observacionCierre) {
+        throw createArqueoObservationRequiredError('EFECTIVO');
+      }
       if (Math.abs(diferencia) > 0 && !idResolucion) {
         throw createCajaError(400, 'VENTAS_CAJAS_RESOLUTION_REQUIRED', 'Debe seleccionar una resolucion de cierre cuando existe diferencia.');
       }
@@ -2529,6 +3719,27 @@ const closeSessionHandler = async (req, res) => {
       }
     }
 
+    if (idValidacionCierre) {
+      const validationResult = await client.query(
+        `
+          SELECT id_validacion_cierre, id_cierre_caja
+          FROM public.cajas_cierres_validaciones
+          WHERE id_validacion_cierre = $1
+            AND id_sesion_caja = $2
+          LIMIT 1
+          FOR UPDATE
+        `,
+        [idValidacionCierre, idSesionCaja]
+      );
+      const validation = validationResult.rows?.[0] || null;
+      if (!validation) {
+        throw createCajaError(404, 'VENTAS_CAJAS_VALIDACION_CIERRE_NOT_FOUND', 'La validacion de cierre no pertenece a esta sesion.');
+      }
+      if (validation.id_cierre_caja) {
+        throw createCajaError(409, 'VENTAS_CAJAS_VALIDACION_CIERRE_ALREADY_LINKED', 'La validacion de cierre ya fue asociada a un cierre.');
+      }
+    }
+
     const idEstadoCerrada = await getCatalogId(client, 'SESSION_STATES', 'CERRADA');
     const closeResult = await client.query(
       `
@@ -2549,6 +3760,18 @@ const closeSessionHandler = async (req, res) => {
       ]
     );
     const idCierreCaja = Number(closeResult.rows?.[0]?.id_cierre_caja || 0) || null;
+
+    if (idCierreCaja && idValidacionCierre) {
+      await client.query(
+        `
+          UPDATE public.cajas_cierres_validaciones
+          SET id_cierre_caja = $1
+          WHERE id_validacion_cierre = $2
+            AND id_sesion_caja = $3
+        `,
+        [idCierreCaja, idValidacionCierre, idSesionCaja]
+      );
+    }
 
     if (idCierreCaja && Array.isArray(arqueosPersistir) && arqueosPersistir.length > 0) {
       for (const row of arqueosPersistir) {
@@ -2625,7 +3848,7 @@ const closeSessionHandler = async (req, res) => {
     });
 
     await client.query('COMMIT');
-    return res.status(200).json({
+    const responsePayload = {
       message: 'Cierre de caja registrado correctamente.',
       id_cierre_caja: idCierreCaja,
       diferencia,
@@ -2633,7 +3856,10 @@ const closeSessionHandler = async (req, res) => {
       estado_revision: 'PENDIENTE_REVISION',
       arqueos_metodos: arqueosPersistir,
       payroll_sync: payrollSync
-    });
+    };
+    return res.status(200).json(
+      (await isCashierOnlyRequest(req)) ? maskCajaCloseResponseForCajero(responsePayload) : responsePayload
+    );
   } catch (err) {
     await client.query('ROLLBACK');
     return sendInternalError(res, err, 'VENTAS_CAJAS_CLOSE_ERROR', 'No se pudo cerrar la sesion de caja.');
@@ -2644,6 +3870,58 @@ const closeSessionHandler = async (req, res) => {
 
 router.patch('/ventas/cajas/sesiones/:id/cerrar', checkPermission(['VENTAS_CAJAS_SESION_CERRAR']), closeSessionHandler);
 router.post('/ventas/cajas/sesiones/:id/cerrar', checkPermission(['VENTAS_CAJAS_SESION_CERRAR']), closeSessionHandler);
+
+router.post('/ventas/cajas/sesiones/:id/cierre-validaciones', checkPermission(['VENTAS_CAJAS_SESION_CERRAR']), async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const idSesionCaja = parsePositiveInt(req.params.id);
+    if (!idSesionCaja) throw createCajaError(400, 'VENTAS_CAJAS_SESSION_ID_INVALID', 'El id de sesion es invalido.');
+    const scopeContext = await getScopeContext(req, client, null, true);
+    const session = await ensureOpenSession(client, idSesionCaja, { forUpdate: false });
+    assertSucursalAllowed(scopeContext, session.id_sucursal);
+    await ensureSessionParticipant(client, idSesionCaja, scopeContext.idUsuario, { allowAdminBypass: true, req, scopeContext });
+
+    const threshold = Number.isFinite(CLOSE_DIFFERENCE_THRESHOLD) && CLOSE_DIFFERENCE_THRESHOLD >= 0
+      ? CLOSE_DIFFERENCE_THRESHOLD
+      : 0;
+    const payloadRows = Array.isArray(req.body?.arqueos) ? req.body.arqueos : [];
+    const observacionCierre = normalizeText(req.body?.observacion_cierre, 500);
+    const computation = await buildSegmentedArqueoComputation({
+      client,
+      idSesionCaja,
+      payloadRows,
+      threshold,
+      requireObservacionOnDifference: false
+    });
+
+    const validation = await persistCloseValidationAttempt({
+      client,
+      session,
+      idUsuarioValida: scopeContext.idUsuario,
+      computation,
+      payloadRows,
+      observacionCierre,
+      origen: req.body?.origen,
+      ipOrigen: getClientIp(req),
+      userAgent: req.get('user-agent') || null
+    });
+
+    await client.query('COMMIT');
+    return res.status(201).json(
+      buildCloseValidationResponse({
+        validation,
+        computation,
+        isCashierOnly: await isCashierOnlyRequest(req)
+      })
+    );
+  } catch (err) {
+    await client.query('ROLLBACK');
+    return sendInternalError(res, err, 'VENTAS_CAJAS_CLOSE_VALIDATION_ERROR', 'No se pudo registrar la revision de diferencias.');
+  } finally {
+    client.release();
+  }
+});
 
 router.post('/ventas/cajas/sesiones/:id/cierre-preview', checkPermission(['VENTAS_CAJAS_SESION_CERRAR']), async (req, res) => {
   const client = await pool.connect();
@@ -2673,7 +3951,7 @@ router.post('/ventas/cajas/sesiones/:id/cierre-preview', checkPermission(['VENTA
       threshold
     });
 
-    return res.status(200).json({
+    const responsePayload = {
       message: 'Vista previa de cierre calculada correctamente.',
       threshold,
       arqueos_metodos: computation.rows,
@@ -2682,7 +3960,10 @@ router.post('/ventas/cajas/sesiones/:id/cierre-preview', checkPermission(['VENTA
         total_declarado: computation.monto_declarado_total,
         diferencia_total: computation.diferencia_total
       }
-    });
+    };
+    return res.status(200).json(
+      (await isCashierOnlyRequest(req)) ? maskCajaClosePreviewForCajero(computation) : responsePayload
+    );
   } catch (err) {
     return sendInternalError(res, err, 'VENTAS_CAJAS_CLOSE_PREVIEW_ERROR', 'No se pudo calcular la vista previa del cierre.');
   } finally {
@@ -2913,7 +4194,8 @@ router.get('/ventas/cajas/reportes/resumen', checkPermission(['VENTAS_CAJAS_REPO
       params
     );
 
-    return res.status(200).json(result.rows);
+    const isRestrictedCajero = await isCashierOnlyRequest(req);
+    return res.status(200).json(isRestrictedCajero ? result.rows.map(maskCajaSessionRowForCajero) : result.rows);
   } catch (err) {
     return sendInternalError(res, err, 'VENTAS_CAJAS_REPORT_SUMMARY_ERROR', 'No se pudo generar el resumen de cajas.');
   }
@@ -2961,7 +4243,8 @@ router.get('/ventas/cajas/reportes/cierres', checkPermission(['VENTAS_CAJAS_REPO
       params
     );
 
-    return res.status(200).json(result.rows);
+    const isRestrictedCajero = await isCashierOnlyRequest(req);
+    return res.status(200).json(isRestrictedCajero ? result.rows.map(maskCajaSessionRowForCajero) : result.rows);
   } catch (err) {
     return sendInternalError(res, err, 'VENTAS_CAJAS_REPORT_CLOSES_ERROR', 'No se pudo generar el reporte de cierres.');
   }
@@ -3240,7 +4523,8 @@ router.get('/ventas/cajas/sesiones/:id/arqueos', checkPermission(['VENTAS_CAJAS_
     if (!session) throw createCajaError(404, 'VENTAS_CAJAS_SESSION_NOT_FOUND', 'La sesion de caja no existe.');
     assertSucursalAllowed(scopeContext, session.id_sucursal);
     const result = await pool.query(`SELECT a.*, tipo.codigo AS tipo_codigo, tipo.nombre AS tipo_nombre FROM public.cajas_arqueos a INNER JOIN public.cat_cajas_arqueos_tipos tipo ON tipo.id_tipo_arqueo_caja = a.id_tipo_arqueo_caja WHERE a.id_sesion_caja = $1 ORDER BY a.fecha_arqueo DESC, a.id_arqueo_caja DESC`, [idSesionCaja]);
-    return res.status(200).json(result.rows);
+    const isRestrictedCajero = await isCashierOnlyRequest(req);
+    return res.status(200).json(isRestrictedCajero ? result.rows.map(maskCajaFinancialMethod) : result.rows);
   } catch (err) {
     return sendInternalError(res, err, 'VENTAS_CAJAS_ARQUEO_LIST_ERROR', 'No se pudieron obtener los arqueos de la sesion.');
   }
@@ -3251,7 +4535,7 @@ router.post('/ventas/cajas/sesiones/:id/movimientos', checkPermission(['VENTAS_C
   try {
     await client.query('BEGIN');
     const idSesionCaja = parsePositiveInt(req.params.id);
-    const idTipoMovimientoCaja = parsePositiveInt(req.body.id_tipo_movimiento_caja);
+    let idTipoMovimientoCaja = parsePositiveInt(req.body.id_tipo_movimiento_caja);
     const monto = parseNonNegativeAmount(req.body.monto);
     const observacion = normalizeText(req.body.observacion, 500);
     const referencia = normalizeText(req.body.referencia, 120);
@@ -3262,6 +4546,10 @@ router.post('/ventas/cajas/sesiones/:id/movimientos', checkPermission(['VENTAS_C
     const session = await ensureOpenSession(client, idSesionCaja);
     assertSucursalAllowed(scopeContext, session.id_sucursal);
     await ensureSessionParticipant(client, idSesionCaja, scopeContext.idUsuario, { allowAdminBypass: true, req, scopeContext });
+    if (await isCashierOnlyRequest(req)) {
+      const tipoEgreso = await resolveEgresoMovimientoTipo(client, idTipoMovimientoCaja);
+      idTipoMovimientoCaja = Number(tipoEgreso.id_tipo_movimiento_caja);
+    }
 
     const insertResult = await client.query(
       `

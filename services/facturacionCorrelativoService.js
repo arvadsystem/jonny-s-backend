@@ -41,7 +41,8 @@ export const getFechaOperacionHonduras = (baseDate = new Date()) => {
 export const generarCodigoDocumento = async ({
   client,
   idSucursal,
-  tipoDocumento
+  tipoDocumento,
+  perf = null
 }) => {
   if (!client || typeof client.query !== 'function') {
     throw new Error('FACTURACION_CORRELATIVO_CLIENT_REQUIRED');
@@ -59,35 +60,53 @@ export const generarCodigoDocumento = async ({
 
   const fechaOperacion = getFechaOperacionHonduras();
 
-  await client.query(
-    `
-      INSERT INTO public.facturacion_config_sucursal (
-        id_sucursal
-      )
-      VALUES ($1)
-      ON CONFLICT (id_sucursal) DO NOTHING
-    `,
-    [sucursalId]
-  );
-
-  const configResult = await client.query(
+  const configStart = perf?.now?.() || 0;
+  let configResult = await client.query(
     `
       SELECT
-        prefijo_venta,
-        prefijo_reversion,
-        longitud_correlativo
-      FROM public.facturacion_config_sucursal
-      WHERE id_sucursal = $1
+        cfg.prefijo_venta,
+        cfg.prefijo_reversion,
+        cfg.longitud_correlativo
+      FROM public.facturacion_config_sucursal cfg
+      WHERE cfg.id_sucursal = $1
       FOR UPDATE
     `,
     [sucursalId]
   );
 
   if (configResult.rowCount === 0) {
+    await client.query(
+      `
+        INSERT INTO public.facturacion_config_sucursal (
+          id_sucursal
+        )
+        VALUES ($1)
+        ON CONFLICT (id_sucursal) DO NOTHING
+      `,
+      [sucursalId]
+    );
+
+    configResult = await client.query(
+      `
+        SELECT
+          cfg.prefijo_venta,
+          cfg.prefijo_reversion,
+          cfg.longitud_correlativo
+        FROM public.facturacion_config_sucursal cfg
+        WHERE cfg.id_sucursal = $1
+        FOR UPDATE
+      `,
+      [sucursalId]
+    );
+  }
+
+  if (configResult.rowCount === 0) {
     throw new Error('FACTURACION_CONFIG_NOT_FOUND');
   }
 
   const config = configResult.rows[0];
+  perf?.add?.('factura_correlativo_config_ms', configStart);
+
   const correlativeLength = Math.min(
     10,
     Math.max(3, Number.parseInt(String(config.longitud_correlativo ?? '5'), 10) || 5)
@@ -98,7 +117,8 @@ export const generarCodigoDocumento = async ({
       ? sanitizePrefix(config.prefijo_venta, 'VTA')
       : sanitizePrefix(config.prefijo_reversion, 'REV');
 
-  await client.query(
+  const numeroStart = perf?.now?.() || 0;
+  const correlativoRow = await client.query(
     `
       INSERT INTO public.facturacion_correlativos_diarios (
         id_sucursal,
@@ -107,24 +127,17 @@ export const generarCodigoDocumento = async ({
         prefijo,
         ultimo_numero
       )
-      VALUES ($1, $2::date, $3, $4, 0)
-      ON CONFLICT (id_sucursal, fecha_operacion, tipo_documento) DO NOTHING
-    `,
-    [sucursalId, fechaOperacion, normalizedType, prefix]
-  );
-
-  const correlativoRow = await client.query(
-    `
-      SELECT
+      VALUES ($1, $2::date, $3, $4, 1)
+      ON CONFLICT (id_sucursal, fecha_operacion, tipo_documento)
+      DO UPDATE SET
+        ultimo_numero = public.facturacion_correlativos_diarios.ultimo_numero + 1,
+        prefijo = EXCLUDED.prefijo,
+        actualizado_en = NOW()
+      RETURNING
         id_correlativo,
         ultimo_numero
-      FROM public.facturacion_correlativos_diarios
-      WHERE id_sucursal = $1
-        AND fecha_operacion = $2::date
-        AND tipo_documento = $3
-      FOR UPDATE
     `,
-    [sucursalId, fechaOperacion, normalizedType]
+    [sucursalId, fechaOperacion, normalizedType, prefix]
   );
 
   if (correlativoRow.rowCount === 0) {
@@ -132,19 +145,8 @@ export const generarCodigoDocumento = async ({
   }
 
   const row = correlativoRow.rows[0];
-  const nextNumber = (Number.parseInt(String(row.ultimo_numero ?? '0'), 10) || 0) + 1;
-
-  await client.query(
-    `
-      UPDATE public.facturacion_correlativos_diarios
-      SET
-        ultimo_numero = $2,
-        prefijo = $3,
-        actualizado_en = NOW()
-      WHERE id_correlativo = $1
-    `,
-    [row.id_correlativo, nextNumber, prefix]
-  );
+  const nextNumber = Number.parseInt(String(row.ultimo_numero ?? '0'), 10) || 1;
+  perf?.add?.('factura_correlativo_numero_ms', numeroStart);
 
   return {
     codigo: `${prefix}-${padCorrelative(nextNumber, correlativeLength)}`,

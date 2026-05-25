@@ -6,6 +6,7 @@ import jwt from 'jsonwebtoken';
 import pool from '../config/db-connection.js';
 import JWT_SECRET from '../config/jwt.js';
 import { checkPermission, requestHasAnyPermission } from '../middleware/checkPermission.js';
+import { passwordChangeLimiter } from '../middleware/rateLimiter.js';
 import { supabase } from '../services/supabaseClient.js';
 import {
   ALLOWED_IMAGE_MIME_TYPES,
@@ -1661,7 +1662,8 @@ router.delete('/usuarios/v2/delete/:id_usuario', checkPermission(USUARIOS_DELETE
   }
 });
 
-router.post('/usuarios/v2/change-password', checkPermission(USUARIOS_CHANGE_OWN_PASSWORD_PERMISSIONS), async (req, res) => {
+router.post('/usuarios/v2/change-password', checkPermission(USUARIOS_CHANGE_OWN_PASSWORD_PERMISSIONS), passwordChangeLimiter, async (req, res) => {
+  let client = null;
   try {
     const idUsuarioBody = v2ParsePositiveInt(req.body?.id_usuario);
     const idUsuarioJwt = v2ParsePositiveInt(req.user?.id_usuario);
@@ -1694,12 +1696,16 @@ router.post('/usuarios/v2/change-password', checkPermission(USUARIOS_CHANGE_OWN_
 
     await ensurePasswordChangedAtColumn();
 
-    const userResult = await pool.query(
-      'SELECT id_usuario, clave FROM usuarios WHERE id_usuario = $1 LIMIT 1',
+    client = await pool.connect();
+    await client.query('BEGIN');
+
+    const userResult = await client.query(
+      'SELECT id_usuario, clave FROM usuarios WHERE id_usuario = $1 LIMIT 1 FOR UPDATE',
       [idUsuario]
     );
 
     if (!userResult.rows.length) {
+      await client.query('ROLLBACK');
       return res.status(404).json({ error: true, message: 'Usuario no encontrado' });
     }
 
@@ -1707,17 +1713,46 @@ router.post('/usuarios/v2/change-password', checkPermission(USUARIOS_CHANGE_OWN_
     const passwordOk = await v2VerifyPassword(claveActual, storedPassword);
 
     if (!passwordOk) {
+      await client.query('ROLLBACK');
       return res.status(400).json({ error: true, message: 'La contrasena actual no es correcta' });
     }
 
     const samePassword = await v2VerifyPassword(claveNueva, storedPassword);
     if (samePassword) {
+      await client.query('ROLLBACK');
       return res.status(400).json({ error: true, message: 'La nueva contrasena no puede ser igual a la actual' });
+    }
+
+    const reuseResult = await client.query(
+      `
+        WITH ultimas AS (
+          SELECT h.password_hash
+          FROM usuarios_password_history h
+          WHERE h.id_usuario = $1
+          ORDER BY h.fecha_creacion DESC
+          LIMIT 5
+        )
+        SELECT EXISTS (
+          SELECT 1
+          FROM ultimas u
+          WHERE crypt($2::text, u.password_hash) = u.password_hash
+        ) AS reused
+      `,
+      [idUsuario, claveNueva]
+    );
+
+    if (Boolean(reuseResult.rows?.[0]?.reused)) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({
+        error: true,
+        message: 'La nueva contrasena ya fue utilizada recientemente. Elige una diferente',
+      });
     }
 
     const { validatePasswordPolicy } = await import('../utils/security/passwordPolicy.js');
     const policyCheck = await validatePasswordPolicy(claveNueva);
     if (!policyCheck?.ok) {
+      await client.query('ROLLBACK');
       return res.status(400).json({
         error: true,
         message: policyCheck?.message || 'La contrasena no cumple la politica',
@@ -1739,10 +1774,35 @@ router.post('/usuarios/v2/change-password', checkPermission(USUARIOS_CHANGE_OWN_
 
     values.push(idUsuario);
 
-    await pool.query(
+    await client.query(
+      `
+        INSERT INTO usuarios_password_history (id_usuario, password_hash)
+        VALUES ($1, $2)
+      `,
+      [idUsuario, storedPassword]
+    );
+
+    await client.query(
       `UPDATE usuarios SET ${setParts.join(', ')} WHERE id_usuario = $${values.length}`,
       values
     );
+
+    await client.query(
+      `
+        DELETE FROM usuarios_password_history
+        WHERE id_usuario = $1
+          AND id_historial IN (
+            SELECT id_historial
+            FROM usuarios_password_history
+            WHERE id_usuario = $1
+            ORDER BY fecha_creacion DESC, id_historial DESC
+            OFFSET 5
+          )
+      `,
+      [idUsuario]
+    );
+
+    await client.query('COMMIT');
 
     issueUpdatedAccessTokenForOwnPasswordChange(req, res, idUsuario);
 
@@ -1755,8 +1815,13 @@ router.post('/usuarios/v2/change-password', checkPermission(USUARIOS_CHANGE_OWN_
         : 'TODO: agregar columna must_change_password en usuarios para forzar cambio en primer login',
     });
   } catch (err) {
+    if (client) {
+      try { await client.query('ROLLBACK'); } catch {}
+    }
     console.error('Error en /usuarios/v2/change-password:', err.message);
     return res.status(500).json({ error: true, message: 'Error interno del servidor' });
+  } finally {
+    if (client) client.release();
   }
 });
 
