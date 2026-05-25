@@ -51,12 +51,16 @@ const toNullablePositiveInt = (value) => {
   return parsed;
 };
 
-const parseBoolean = (value) => (
-  value === true ||
-  value === 1 ||
-  value === '1' ||
-  String(value ?? '').trim().toLowerCase() === 'true'
-);
+const parseBoolean = (value) => {
+  if (value === true || value === 1 || value === '1') return true;
+  if (value === false || value === 0 || value === '0') return false;
+
+  const normalized = String(value ?? '').trim().toLowerCase();
+  if (['true', 't', 'yes', 'y', 'si', 'sí', 'on'].includes(normalized)) return true;
+  if (['false', 'f', 'no', 'n', 'off'].includes(normalized)) return false;
+
+  return Boolean(value);
+};
 
 const normalizeItemType = (value) => {
   const normalized = String(value ?? '').trim().toUpperCase();
