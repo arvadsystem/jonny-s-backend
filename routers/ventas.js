@@ -3824,6 +3824,16 @@ router.get('/ventas/pedidos-menu', checkPermission(['VENTAS_VER']), async (req, 
       filters.push(`p.id_sucursal = ANY($${params.length}::int[])`);
     }
 
+    // AM: Filtro operativo diario para ocultar pedidos de dias anteriores sin alterar estados/historial.
+    const operationalDateExpr = `(NOW() AT TIME ZONE 'America/Tegucigalpa')::date`;
+    filters.push(`
+      COALESCE(
+        f.fecha_operacion::date,
+        p.visible_en_cocina_at::date,
+        p.fecha_hora_pedido::date
+      ) = ${operationalDateExpr}
+    `);
+
     const whereClause = `WHERE ${filters.join(' AND ')}`;
 
     const estadoPagoSelect = hasEstadoPago ? 'p.estado_pago' : `NULL::text AS estado_pago`;
@@ -3880,7 +3890,18 @@ router.get('/ventas/pedidos-menu', checkPermission(['VENTAS_VER']), async (req, 
           per.apellido AS apellidos_cliente
         FROM pedidos p
         INNER JOIN estados_pedido ep ON p.id_estado_pedido = ep.id_estado_pedido
-        LEFT JOIN facturas f ON f.id_pedido = p.id_pedido
+        -- AM: Usa LEFT JOIN LATERAL para tomar una sola factura por pedido y evitar cards duplicadas.
+        LEFT JOIN LATERAL (
+          SELECT f.*
+          FROM facturas f
+          WHERE f.id_pedido = p.id_pedido
+            AND f.id_sucursal = p.id_sucursal
+          ORDER BY
+            f.fecha_operacion DESC NULLS LAST,
+            f.fecha_hora_facturacion DESC NULLS LAST,
+            f.id_factura DESC
+          LIMIT 1
+        ) f ON TRUE
         LEFT JOIN clientes c ON p.id_cliente = c.id_cliente
         LEFT JOIN personas per ON c.id_persona = per.id_persona
         LEFT JOIN usuarios u_pago ON u_pago.id_usuario = p.id_usuario_pago_confirmado
