@@ -154,9 +154,10 @@ const assignPersistedKdsTiming = async ({
     resolveOperationalDateValue(operationalDate) ||
     new Date().toLocaleDateString('en-CA', { timeZone: 'America/Tegucigalpa' });
 
+  // AM: Evita sobreconteo si existe mas de una factura por pedido.
   const activeCountResult = await client.query(
     `
-      SELECT COUNT(*)::int AS total
+      SELECT COUNT(DISTINCT p.id_pedido)::int AS total
       FROM public.pedidos p
       INNER JOIN public.facturas f ON f.id_pedido = p.id_pedido
       WHERE p.id_sucursal = $1
@@ -616,10 +617,15 @@ router.get('/cocina/pedidos', checkPermission(COCINA_VIEW_PERMISSIONS), async (r
         });
       }
 
+      // AM: Filtro operativo diario sin depender obligatoriamente de factura/codigo_venta.
       const operationalDateExpr = `(NOW() AT TIME ZONE 'America/Tegucigalpa')::date`;
-      filters.push(`f.fecha_operacion::date = ${operationalDateExpr}`);
-      filters.push(`COALESCE(NULLIF(TRIM(f.codigo_venta), ''), NULL) IS NOT NULL`);
-      filters.push(`f.id_sucursal = p.id_sucursal`);
+      filters.push(`
+        COALESCE(
+          f.fecha_operacion::date,
+          p.visible_en_cocina_at::date,
+          p.fecha_hora_pedido::date
+        ) = ${operationalDateExpr}
+      `);
 
       const q = typeof req.query.q === 'string' ? req.query.q.trim() : '';
       if (q) {
@@ -700,7 +706,18 @@ router.get('/cocina/pedidos', checkPermission(COCINA_VIEW_PERMISSIONS), async (r
           LEFT JOIN clientes c ON c.id_cliente = p.id_cliente
           LEFT JOIN personas per ON per.id_persona = c.id_persona
           LEFT JOIN empresas emp ON emp.id_empresa = c.id_empresa
-          INNER JOIN facturas f ON f.id_pedido = p.id_pedido
+          -- AM: Usa LEFT JOIN LATERAL para tomar una sola factura por pedido y evitar duplicados por multiples facturas.
+          LEFT JOIN LATERAL (
+            SELECT f.*
+            FROM facturas f
+            WHERE f.id_pedido = p.id_pedido
+              AND f.id_sucursal = p.id_sucursal
+            ORDER BY
+              f.fecha_operacion DESC NULLS LAST,
+              f.fecha_hora_facturacion DESC NULLS LAST,
+              f.id_factura DESC
+            LIMIT 1
+          ) f ON TRUE
           LEFT JOIN detalle_pedido dp
             ON dp.id_pedido = p.id_pedido
            AND COALESCE(dp.estado, true) = true
@@ -722,11 +739,21 @@ router.get('/cocina/pedidos', checkPermission(COCINA_VIEW_PERMISSIONS), async (r
       for (const row of result.rows) {
         if (!grouped.has(row.id_pedido)) {
           const estadoCode = resolveEstadoCode(row.estado_descripcion);
-          const fechaRef = row.visible_en_cocina_at || row.fecha_hora_facturacion || row.fecha_hora_pedido;
-          const fechaMs = fechaRef ? new Date(fechaRef).getTime() : null;
-          const minutosEnEspera = fechaMs ? Math.floor((now - fechaMs) / 60000) : null;
+          // AM: Base del atraso prioriza kds_started_at para evitar falsos retrasos al inicializar pedidos.
+          const kdsBaseRef =
+            row.kds_started_at || row.visible_en_cocina_at || row.fecha_hora_facturacion || row.fecha_hora_pedido;
+          const kdsBaseMs = kdsBaseRef ? new Date(kdsBaseRef).getTime() : null;
+          const minutosEnEspera = Number.isFinite(kdsBaseMs)
+            ? Math.max(0, Math.floor((now - kdsBaseMs) / 60000))
+            : null;
+          // AM: Usa minutos esperados del pedido; fallback seguro solo cuando no exista kds_expected_minutes.
+          const expectedMinutes =
+            parsePositiveInt(row.kds_expected_minutes) || parsePositiveInt(EXPIRY_WARN_MINUTES) || 20;
           const estaProximoAExpirar =
-            minutosEnEspera !== null && minutosEnEspera >= EXPIRY_WARN_MINUTES;
+            minutosEnEspera !== null &&
+            Number.isInteger(expectedMinutes) &&
+            expectedMinutes > 0 &&
+            minutosEnEspera >= expectedMinutes;
 
           grouped.set(row.id_pedido, {
             id_pedido: Number(row.id_pedido),
