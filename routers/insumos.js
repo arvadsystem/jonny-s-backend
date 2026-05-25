@@ -1319,13 +1319,6 @@ router.patch('/insumos/estado', checkPermission(INSUMOS_STATE_PERMISSIONS), asyn
     if (nextEstado === null) {
       return res.status(400).json({ error: true, message: 'estado debe ser boolean (true/false o 1/0).' });
     }
-    if (nextEstado === false) {
-      return res.status(400).json({
-        error: true,
-        message: 'Para inactivar use el flujo de eliminacion/inactivacion existente (DELETE /insumos).'
-      });
-    }
-
     const actual = await getInsumoById(idInsumo, pool);
     if (!actual) {
       return res.status(404).json({ error: true, message: 'Insumo no encontrado.' });
@@ -1335,7 +1328,7 @@ router.patch('/insumos/estado', checkPermission(INSUMOS_STATE_PERMISSIONS), asyn
     await pool.query(query, [nextEstado, idInsumo]);
 
     return res.status(200).json({
-      message: 'Insumo activado.'
+      message: nextEstado ? 'Insumo activado.' : 'Insumo inactivado.'
     });
   } catch (err) {
     console.error('Error al actualizar estado de insumo:', err.message);

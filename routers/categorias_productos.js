@@ -6,7 +6,8 @@ const router = express.Router();
 const CATEGORIAS_PRODUCTOS_VIEW_PERMISSIONS = ['INVENTARIO_CATEGORIAS_VER'];
 const CATEGORIAS_PRODUCTOS_CREATE_PERMISSIONS = ['INVENTARIO_CATEGORIAS_CREAR'];
 const CATEGORIAS_PRODUCTOS_EDIT_PERMISSIONS = ['INVENTARIO_CATEGORIAS_EDITAR'];
-const CATEGORIAS_PRODUCTOS_STATE_PERMISSIONS = ['INVENTARIO_CATEGORIAS_ESTADO_CAMBIAR', 'INVENTARIO_CATEGORIAS_ELIMINAR'];
+const CATEGORIAS_PRODUCTOS_STATE_PERMISSIONS = ['INVENTARIO_CATEGORIAS_ESTADO_CAMBIAR'];
+const CATEGORIAS_PRODUCTOS_DELETE_PERMISSIONS = ['INVENTARIO_CATEGORIAS_ELIMINAR'];
 
 // NEW: mensaje estandar para bloqueo de inactivacion por productos activos asociados.
 // WHY: alinear backend con la regla de negocio y el copy requerido por frontend.
@@ -325,9 +326,62 @@ router.put('/categorias_productos', checkPermission(CATEGORIAS_PRODUCTOS_EDIT_PE
 });
 
 // ------------------------------------------------------------------------------------
+// PATCH: Cambiar estado categoria_producto (flujo dedicado activar/inactivar)
+// ------------------------------------------------------------------------------------
+router.patch('/categorias_productos/estado', checkPermission(CATEGORIAS_PRODUCTOS_STATE_PERMISSIONS), async (req, res) => {
+  try {
+    const categoriaId = Number(req.body?.id_categoria_producto);
+    if (!isPositiveIntegerId(categoriaId)) {
+      return res.status(400).json({ error: true, message: 'id_categoria_producto debe ser un entero mayor a 0.' });
+    }
+
+    const normalizedEstado = normalizeBooleanInput(req.body?.estado);
+    if (normalizedEstado === null) {
+      return res.status(400).json({ error: true, message: 'estado invalido.' });
+    }
+
+    const categoriaRes = await pool.query(
+      'SELECT 1 FROM categorias_productos WHERE id_categoria_producto = $1 LIMIT 1',
+      [categoriaId]
+    );
+    if (categoriaRes.rowCount === 0) {
+      return res.status(404).json({ error: true, message: 'CategorÃ­a no encontrada.' });
+    }
+
+    if (normalizedEstado === false) {
+      const productosActivosRes = await pool.query(
+        'SELECT COUNT(1)::int AS total FROM productos WHERE id_categoria_producto = $1 AND estado = true',
+        [categoriaId]
+      );
+      const totalProductosActivos = Number(productosActivosRes.rows?.[0]?.total ?? 0);
+      if (totalProductosActivos > 0) {
+        return res.status(409).json({
+          error: true,
+          code: 'CATEGORY_HAS_ACTIVE_PRODUCTS',
+          message: CATEGORY_HAS_ACTIVE_PRODUCTS_MESSAGE
+        });
+      }
+    }
+
+    await pool.query(
+      'UPDATE categorias_productos SET estado = $1 WHERE id_categoria_producto = $2',
+      [normalizedEstado, categoriaId]
+    );
+
+    return res.status(200).json({
+      error: false,
+      message: normalizedEstado ? 'CategorÃ­a activada.' : 'CategorÃ­a inactivada.'
+    });
+  } catch (err) {
+    console.error('Error al actualizar estado de categoria_producto:', err.message);
+    return res.status(500).json({ error: true, message: safeServerErrorMessage() });
+  }
+});
+
+// ------------------------------------------------------------------------------------
 // DELETE: Inactivar categoria_producto (soft delete)
 // ------------------------------------------------------------------------------------
-router.delete('/categorias_productos', checkPermission(CATEGORIAS_PRODUCTOS_STATE_PERMISSIONS), async (req, res) => {
+router.delete('/categorias_productos', checkPermission(CATEGORIAS_PRODUCTOS_DELETE_PERMISSIONS), async (req, res) => {
   try {
     const { columna_id, valor_id } = req.body || {};
 

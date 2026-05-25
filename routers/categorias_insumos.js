@@ -6,7 +6,8 @@ const router = express.Router();
 const CATEGORIAS_INSUMOS_VIEW_PERMISSIONS = ['INVENTARIO_CATEGORIAS_INSUMOS_VER'];
 const CATEGORIAS_INSUMOS_CREATE_PERMISSIONS = ['INVENTARIO_CATEGORIAS_INSUMOS_CREAR'];
 const CATEGORIAS_INSUMOS_EDIT_PERMISSIONS = ['INVENTARIO_CATEGORIAS_INSUMOS_EDITAR'];
-const CATEGORIAS_INSUMOS_STATE_PERMISSIONS = ['INVENTARIO_CATEGORIAS_INSUMOS_ESTADO_CAMBIAR', 'INVENTARIO_CATEGORIAS_INSUMOS_ELIMINAR'];
+const CATEGORIAS_INSUMOS_STATE_PERMISSIONS = ['INVENTARIO_CATEGORIAS_INSUMOS_ESTADO_CAMBIAR'];
+const CATEGORIAS_INSUMOS_DELETE_PERMISSIONS = ['INVENTARIO_CATEGORIAS_INSUMOS_ELIMINAR'];
 
 // NEW: mensaje estándar para bloqueo de inactivación por insumos activos asociados.
 // WHY: alinear backend con la regla de negocio para categorías de insumos.
@@ -287,9 +288,62 @@ router.put('/categorias_insumos', checkPermission(CATEGORIAS_INSUMOS_EDIT_PERMIS
 });
 
 // ------------------------------------------------------------------------------------
+// PATCH: Cambiar estado categoria_insumo (flujo dedicado activar/inactivar)
+// ------------------------------------------------------------------------------------
+router.patch('/categorias_insumos/estado', checkPermission(CATEGORIAS_INSUMOS_STATE_PERMISSIONS), async (req, res) => {
+  try {
+    const categoriaId = Number(req.body?.id_categoria_insumo);
+    if (!isPositiveIntegerId(categoriaId)) {
+      return res.status(400).json({ error: true, message: 'id_categoria_insumo debe ser un entero mayor a 0.' });
+    }
+
+    const normalizedEstado = normalizeBooleanInput(req.body?.estado);
+    if (normalizedEstado === null) {
+      return res.status(400).json({ error: true, message: 'estado invalido.' });
+    }
+
+    const categoriaRes = await pool.query(
+      'SELECT 1 FROM categorias_insumos WHERE id_categoria_insumo = $1 LIMIT 1',
+      [categoriaId]
+    );
+    if (categoriaRes.rowCount === 0) {
+      return res.status(404).json({ error: true, code: 'CATEGORY_INSUMO_NOT_FOUND', message: 'CategorÃ­a de insumo no encontrada.' });
+    }
+
+    if (normalizedEstado === false) {
+      const insumosActivosRes = await pool.query(
+        'SELECT COUNT(1)::int AS total FROM insumos WHERE id_categoria_insumo = $1 AND estado = true',
+        [categoriaId]
+      );
+      const totalInsumosActivos = Number(insumosActivosRes.rows?.[0]?.total ?? 0);
+      if (totalInsumosActivos > 0) {
+        return res.status(409).json({
+          error: true,
+          code: 'CATEGORY_INSUMO_HAS_ACTIVE_ITEMS',
+          message: CATEGORY_INSUMO_HAS_ACTIVE_ITEMS_MESSAGE
+        });
+      }
+    }
+
+    await pool.query(
+      'UPDATE categorias_insumos SET estado = $1 WHERE id_categoria_insumo = $2',
+      [normalizedEstado, categoriaId]
+    );
+
+    return res.status(200).json({
+      error: false,
+      message: normalizedEstado ? 'CategorÃ­a de insumo activada.' : 'CategorÃ­a de insumo inactivada.'
+    });
+  } catch (err) {
+    console.error('Error al actualizar estado de categoria_insumo:', err.message);
+    return res.status(500).json({ error: true, code: 'INTERNAL_ERROR', message: safeServerErrorMessage() });
+  }
+});
+
+// ------------------------------------------------------------------------------------
 // DELETE: Inactivar categoria_insumo (soft delete)
 // ------------------------------------------------------------------------------------
-router.delete('/categorias_insumos', checkPermission(CATEGORIAS_INSUMOS_STATE_PERMISSIONS), async (req, res) => {
+router.delete('/categorias_insumos', checkPermission(CATEGORIAS_INSUMOS_DELETE_PERMISSIONS), async (req, res) => {
   try {
     const { columna_id, valor_id } = req.body || {};
 
