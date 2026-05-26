@@ -1,6 +1,7 @@
 import express from 'express';
 import pool from '../config/db-connection.js';
 import { checkPermission } from '../middleware/checkPermission.js';
+import { buildAbsolutePublicUrl } from '../utils/uploads.js';
 import {
   actualizarComboConDetalle,
   actualizarEstadoCombo,
@@ -39,11 +40,17 @@ const resolveActorUserId = (req) => {
   return esEnteroPositivo(parsed) ? parsed : null;
 };
 
+const withResolvedComboImageUrl = (req, combo) => ({
+  ...combo,
+  url_imagen_publica: buildAbsolutePublicUrl(req, combo?.url_imagen_publica || null)
+});
+
 // GET: listar combos admin.
 router.get('/', checkPermission(MENU_VIEW_PERMISSIONS), async (req, res) => {
   try {
     const baseDatos = await listarCombosAdmin();
-    const datos = shouldIncludeInactive(req.query) ? baseDatos : baseDatos.filter(isRowActive);
+    const datosNormalizados = (Array.isArray(baseDatos) ? baseDatos : []).map((combo) => withResolvedComboImageUrl(req, combo));
+    const datos = shouldIncludeInactive(req.query) ? datosNormalizados : datosNormalizados.filter(isRowActive);
     return res.status(200).json(datos);
   } catch (err) {
     console.error('Error al obtener combos admin:', err.message);
@@ -77,7 +84,7 @@ router.get('/:id_combo', checkPermission(MENU_VIEW_PERMISSIONS), async (req, res
       return res.status(404).json({ error: true, message: 'Combo no encontrado.' });
     }
 
-    return res.status(200).json(combo);
+    return res.status(200).json(withResolvedComboImageUrl(req, combo));
   } catch (err) {
     console.error('Error al obtener combo por id admin:', err.message);
     return res.status(500).json({ error: true, message: getSafeServerErrorMessage(err) });
@@ -132,7 +139,7 @@ router.post('/', checkPermission(MENU_MUTATION_PERMISSIONS), async (req, res) =>
     return res.status(201).json({
       error: false,
       message: 'Combo creado exitosamente.',
-      data: comboCreado
+      data: withResolvedComboImageUrl(req, comboCreado)
     });
   } catch (err) {
     await client.query('ROLLBACK');
@@ -205,7 +212,7 @@ router.put('/:id_combo', checkPermission(MENU_MUTATION_PERMISSIONS), async (req,
     return res.status(200).json({
       error: false,
       message: 'Combo actualizado correctamente.',
-      data: comboActualizado
+      data: withResolvedComboImageUrl(req, comboActualizado)
     });
   } catch (err) {
     await client.query('ROLLBACK');
