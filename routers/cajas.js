@@ -4258,13 +4258,23 @@ router.patch('/ventas/cajas/cierres/:id/resolucion', checkPermission(['VENTAS_CA
 
     if (resolution.codigo === 'DESCUENTO_EMPLEADO') {
       const idUsuarioResponsableCaja = parsePositiveInt(cierre.id_usuario_responsable);
-      idUsuarioDeduccion = requestedUsuarioResponsableDiferencia || idUsuarioResponsableCaja;
+      idUsuarioDeduccion = idUsuarioResponsableCaja;
 
       if (!idUsuarioDeduccion) {
         throw createCajaError(
           409,
           'RESPONSABLE_CAJA_NO_DETERMINADO',
           'No se pudo determinar el responsable de la caja.'
+        );
+      }
+      if (
+        requestedUsuarioResponsableDiferencia
+        && requestedUsuarioResponsableDiferencia !== idUsuarioDeduccion
+      ) {
+        throw createCajaError(
+          400,
+          'VENTAS_CAJAS_DEDUCTION_RESPONSIBLE_ONLY',
+          'El faltante solo puede asignarse al responsable de la caja en esta version.'
         );
       }
 
