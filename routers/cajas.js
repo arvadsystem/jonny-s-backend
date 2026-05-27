@@ -234,6 +234,16 @@ const fetchSegmentedMethodCatalog = async (client) => {
 };
 
 const fetchSessionMethodFinancialSummary = async (client, idSesionCaja) => {
+  const sessionResult = await client.query(
+    `
+      SELECT monto_apertura
+      FROM public.cajas_sesiones
+      WHERE id_sesion_caja = $1
+      LIMIT 1
+    `,
+    [idSesionCaja]
+  );
+
   const salesResult = await client.query(
     `
       SELECT UPPER(TRIM(mp.codigo)) AS metodo_pago_codigo, COALESCE(SUM(fc.monto), 0)::numeric(12,2) AS monto
@@ -250,14 +260,14 @@ const fetchSessionMethodFinancialSummary = async (client, idSesionCaja) => {
       SELECT UPPER(TRIM(mp.codigo)) AS metodo_pago_codigo, COALESCE(SUM(fr.monto_reversado), 0)::numeric(12,2) AS monto
       FROM public.facturas_reversiones fr
       INNER JOIN LATERAL (
-        SELECT fc.id_metodo_pago
+        SELECT fc.id_metodo_pago, fc.id_sesion_caja
         FROM public.facturas_cobros fc
         WHERE fc.id_factura = fr.id_factura_original
         ORDER BY fc.id_factura_cobro ASC
         LIMIT 1
       ) metodo_origen ON true
       INNER JOIN public.cat_metodos_pago mp ON mp.id_metodo_pago = metodo_origen.id_metodo_pago
-      WHERE fr.id_sesion_caja_actual = $1
+      WHERE COALESCE(fr.id_sesion_caja_original, metodo_origen.id_sesion_caja) = $1
         AND UPPER(TRIM(COALESCE(fr.estado, ''))) = 'APLICADA'
       GROUP BY UPPER(TRIM(mp.codigo))
     `,
@@ -303,12 +313,49 @@ const fetchSessionMethodFinancialSummary = async (client, idSesionCaja) => {
 
   const ingresosManuales = roundMoney(movementsResult.rows?.[0]?.ingresos_manuales || 0);
   const egresosManuales = roundMoney(movementsResult.rows?.[0]?.egresos_manuales || 0);
+  const montoApertura = roundMoney(sessionResult.rows?.[0]?.monto_apertura || 0);
+
+  const salesNetByCode = new Map();
+  const methodCodes = new Set([
+    ...SEGMENTED_ARQUEO_METHOD_CODES,
+    ...salesByCode.keys(),
+    ...reversionsByCode.keys()
+  ]);
+  for (const code of methodCodes) {
+    salesNetByCode.set(
+      code,
+      roundMoney(Number(salesByCode.get(code) || 0) - Number(reversionsByCode.get(code) || 0))
+    );
+  }
+
+  const ventasEfectivoNetas = roundMoney(salesNetByCode.get('EFECTIVO') || 0);
+  const ventasTarjetaNetas = roundMoney(salesNetByCode.get('TARJETA') || 0);
+  const ventasTransferenciaNetas = roundMoney(salesNetByCode.get('TRANSFERENCIA') || 0);
+  const ventasNoEfectivoNetas = roundMoney(
+    [...salesNetByCode.entries()]
+      .filter(([code]) => code !== 'EFECTIVO')
+      .reduce((sum, [, amount]) => sum + Number(amount || 0), 0)
+  );
+  const efectivoTeorico = roundMoney(montoApertura + ventasEfectivoNetas + ingresosManuales - egresosManuales);
+  const tarjetaTeorico = ventasTarjetaNetas;
+  const transferenciaTeorico = ventasTransferenciaNetas;
+  const totalTeorico = roundMoney(efectivoTeorico + tarjetaTeorico + transferenciaTeorico);
 
   return {
     salesByCode,
     reversionsByCode,
+    salesNetByCode,
+    montoApertura,
+    ventasEfectivoNetas,
+    ventasTarjetaNetas,
+    ventasTransferenciaNetas,
+    ventasNoEfectivoNetas,
     ingresosManuales,
-    egresosManuales
+    egresosManuales,
+    efectivoTeorico,
+    tarjetaTeorico,
+    transferenciaTeorico,
+    totalTeorico
   };
 };
 
@@ -359,17 +406,17 @@ const buildSegmentedArqueoComputation = async ({
     const code = normalizeMethodCode(method.codigo);
     const salesGross = Number(financialSummary.salesByCode.get(code) || 0);
     const reversions = Number(financialSummary.reversionsByCode.get(code) || 0);
-    let montoTeoricoMetodo = roundMoney(salesGross - reversions);
+    let montoTeoricoMetodo = roundMoney(financialSummary.salesNetByCode.get(code) || 0);
     if (code === 'EFECTIVO') {
-      montoTeoricoMetodo = roundMoney(
-        montoTeoricoMetodo
-        + Number(financialSummary.ingresosManuales || 0)
-        - Number(financialSummary.egresosManuales || 0)
-      );
+      montoTeoricoMetodo = financialSummary.efectivoTeorico;
+    } else if (code === 'TARJETA') {
+      montoTeoricoMetodo = financialSummary.tarjetaTeorico;
+    } else if (code === 'TRANSFERENCIA') {
+      montoTeoricoMetodo = financialSummary.transferenciaTeorico;
     }
 
     const declaredEntry = declaredByCode.get(code);
-    const autoComplete = !declaredEntry && salesGross === 0 && reversions === 0;
+    const autoComplete = !declaredEntry && montoTeoricoMetodo === 0;
     if (!declaredEntry && !autoComplete) {
       throw createCajaError(400, 'VENTAS_CAJAS_ARQUEO_METODO_REQUIRED', `Debe declarar arqueo para ${code}.`);
     }
@@ -1958,13 +2005,35 @@ const buildSessionDetailPayload = async (client, session) => {
       ),
       client.query(
         `
-          SELECT vw.*, u.nombre_usuario, ${USER_DISPLAY_SQL} AS nombre_completo
-          FROM public.vw_cajas_sesion_cobros_por_usuario vw
-          INNER JOIN public.usuarios u ON u.id_usuario = vw.id_usuario_ejecutor
+          SELECT
+            fc.id_sesion_caja,
+            fc.id_caja,
+            fc.id_sucursal,
+            fc.id_usuario_ejecutor,
+            COUNT(*)::integer AS cobros_registrados,
+            COUNT(*)::integer AS cantidad_cobros,
+            COALESCE(SUM(CASE WHEN UPPER(TRIM(mp.codigo)) = 'EFECTIVO' THEN fc.monto ELSE 0 END), 0)::numeric(12,2) AS total_efectivo,
+            COALESCE(SUM(CASE WHEN UPPER(TRIM(mp.codigo)) <> 'EFECTIVO' THEN fc.monto ELSE 0 END), 0)::numeric(12,2) AS total_no_efectivo,
+            COALESCE(SUM(fc.monto), 0)::numeric(12,2) AS total_cobrado,
+            MIN(fc.fecha_cobro) AS primer_cobro,
+            MAX(fc.fecha_cobro) AS ultimo_cobro,
+            u.nombre_usuario,
+            ${USER_DISPLAY_SQL} AS nombre_completo
+          FROM public.facturas_cobros fc
+          INNER JOIN public.cat_metodos_pago mp ON mp.id_metodo_pago = fc.id_metodo_pago
+          INNER JOIN public.usuarios u ON u.id_usuario = fc.id_usuario_ejecutor
           LEFT JOIN public.empleados e ON e.id_empleado = u.id_empleado
           LEFT JOIN public.personas per ON per.id_persona = e.id_persona
-          WHERE vw.id_sesion_caja = $1
-          ORDER BY vw.total_cobrado DESC, vw.id_usuario_ejecutor ASC
+          WHERE fc.id_sesion_caja = $1
+          GROUP BY
+            fc.id_sesion_caja,
+            fc.id_caja,
+            fc.id_sucursal,
+            fc.id_usuario_ejecutor,
+            u.nombre_usuario,
+            per.nombre,
+            per.apellido
+          ORDER BY total_cobrado DESC, fc.id_usuario_ejecutor ASC
         `,
         [session.id_sesion_caja]
       ),
@@ -2176,6 +2245,20 @@ const buildSessionDetailPayload = async (client, session) => {
       metodos: metodosPorValidacion.get(idValidacion) || []
     };
   });
+  const financialSummary = await fetchSessionMethodFinancialSummary(client, session.id_sesion_caja);
+  const cierre = cierreResult.rows[0] || null;
+  const recuentoUsadoParaCierre = recuentos.find((row) => row.usado_para_cierre) || null;
+  const montoTeoricoTotal = roundMoney(
+    cierre?.monto_teorico_cierre
+    ?? recuentoUsadoParaCierre?.total_teorico
+    ?? financialSummary.totalTeorico
+  );
+  const montoDeclaradoTotal = cierre?.monto_declarado_cierre === null || cierre?.monto_declarado_cierre === undefined
+    ? (recuentoUsadoParaCierre?.total_declarado ?? null)
+    : roundMoney(cierre.monto_declarado_cierre);
+  const diferenciaTotal = cierre?.diferencia === null || cierre?.diferencia === undefined
+    ? (recuentoUsadoParaCierre?.diferencia_total ?? null)
+    : roundMoney(cierre.diferencia);
 
   return {
     sesion: session,
@@ -2184,6 +2267,23 @@ const buildSessionDetailPayload = async (client, session) => {
     cobros_por_usuario: cobrosPorUsuario,
     resumen_operativo: {
       ...(resumenResult.rows[0] || {}),
+      monto_apertura: financialSummary.montoApertura,
+      ventas_efectivo: financialSummary.ventasEfectivoNetas,
+      ventas_no_efectivo: financialSummary.ventasNoEfectivoNetas,
+      ventas_tarjeta: financialSummary.ventasTarjetaNetas,
+      ventas_transferencia: financialSummary.ventasTransferenciaNetas,
+      ingresos_manuales: financialSummary.ingresosManuales,
+      egresos_manuales: financialSummary.egresosManuales,
+      efectivo_teorico: financialSummary.efectivoTeorico,
+      tarjeta_teorico: financialSummary.tarjetaTeorico,
+      transferencia_teorico: financialSummary.transferenciaTeorico,
+      monto_teorico: montoTeoricoTotal,
+      monto_teorico_total: montoTeoricoTotal,
+      total_teorico: montoTeoricoTotal,
+      monto_declarado: montoDeclaradoTotal,
+      monto_declarado_total: montoDeclaradoTotal,
+      diferencia_total: diferenciaTotal,
+      diferencia_cierre: diferenciaTotal,
       total_responsable: Number(totalResponsable.toFixed(2)),
       total_auxiliares: Number(totalAuxiliares.toFixed(2)),
       responsabilidad_final_id_usuario: Number(session.id_usuario_responsable),
@@ -2195,7 +2295,7 @@ const buildSessionDetailPayload = async (client, session) => {
     recuentos,
     validaciones_cierre: recuentos,
     incidencias: [],
-    cierre: cierreResult.rows[0] || null
+    cierre
   };
 };
 
@@ -3791,9 +3891,7 @@ const closeSessionHandler = async (req, res) => {
     const session = await ensureOpenSession(client, idSesionCaja, { forUpdate: true });
     assertSucursalAllowed(scopeContext, session.id_sucursal);
 
-    const resumenResult = await client.query(`SELECT * FROM public.vw_cajas_sesiones_resumen WHERE id_sesion_caja = $1 LIMIT 1`, [idSesionCaja]);
-    const resumen = resumenResult.rows[0];
-    if (!resumen) throw createCajaError(409, 'VENTAS_CAJAS_CLOSE_SUMMARY_ERROR', 'No se pudo calcular el resumen operativo de la sesion.');
+    const resumen = await fetchSessionMethodFinancialSummary(client, idSesionCaja);
 
     if (Number(session.id_usuario_responsable) !== Number(scopeContext.idUsuario)) {
       throw createCajaError(
@@ -3810,8 +3908,9 @@ const closeSessionHandler = async (req, res) => {
     let idArqueoFinalSelected = idArqueoFinal;
     let idResolucionFinal = null;
     let diferencia = 0;
-    let montoTeorico = Number(resumen.efectivo_teorico || 0);
+    let montoTeorico = Number(resumen.totalTeorico || 0);
     let arqueosPersistir = [];
+    let validationToLink = null;
 
     if (hasSegmentedPayload) {
       const payloadRows = Array.isArray(req.body.arqueos) ? req.body.arqueos : [];
@@ -3925,6 +4024,7 @@ const closeSessionHandler = async (req, res) => {
       const validationResult = await client.query(
         `
           SELECT id_validacion_cierre, id_cierre_caja
+               , total_teorico, total_declarado, diferencia_total
           FROM public.cajas_cierres_validaciones
           WHERE id_validacion_cierre = $1
             AND id_sesion_caja = $2
@@ -3940,6 +4040,45 @@ const closeSessionHandler = async (req, res) => {
       if (validation.id_cierre_caja) {
         throw createCajaError(409, 'VENTAS_CAJAS_VALIDACION_CIERRE_ALREADY_LINKED', 'La validacion de cierre ya fue asociada a un cierre.');
       }
+      validationToLink = validation;
+      const validationMethodsResult = await client.query(
+        `
+          SELECT id_metodo_pago, metodo_pago_codigo, monto_teorico, monto_declarado,
+                 diferencia, cantidad_referencias, observacion, requiere_revision
+          FROM public.cajas_cierres_validaciones_metodos
+          WHERE id_validacion_cierre = $1
+          ORDER BY id_validacion_metodo ASC
+        `,
+        [idValidacionCierre]
+      );
+      if (validationMethodsResult.rowCount === 0) {
+        throw createCajaError(409, 'VENTAS_CAJAS_VALIDACION_CIERRE_INCOMPLETA', 'La validacion de cierre no tiene detalle por metodo.');
+      }
+      const pendingResolutionId = await getCatalogId(client, 'RESOLUTIONS', 'PENDIENTE_REVISION');
+      if (!pendingResolutionId) {
+        throw createCajaError(
+          409,
+          'VENTAS_CAJAS_RESOLUTION_PENDING_MISSING',
+          'No se encontro la resolucion PENDIENTE_REVISION.'
+        );
+      }
+      idResolucionFinal = pendingResolutionId;
+      montoTeorico = Number(validationToLink.total_teorico || 0);
+      montoDeclaradoCierre = Number(validationToLink.total_declarado || 0);
+      diferencia = Number(validationToLink.diferencia_total || 0);
+      arqueosPersistir = validationMethodsResult.rows.map((row) => ({
+        id_metodo_pago: Number(row.id_metodo_pago),
+        metodo_pago_codigo: normalizeMethodCode(row.metodo_pago_codigo),
+        monto_teorico: Number(row.monto_teorico || 0),
+        monto_declarado: Number(row.monto_declarado || 0),
+        diferencia: Number(row.diferencia || 0),
+        cantidad_referencias: row.cantidad_referencias === null || row.cantidad_referencias === undefined
+          ? null
+          : Number(row.cantidad_referencias),
+        observacion: row.observacion || null,
+        requiere_revision: Boolean(row.requiere_revision),
+        completado_automaticamente: false
+      }));
     }
 
     const idEstadoCerrada = await getCatalogId(client, 'SESSION_STATES', 'CERRADA');
@@ -3956,8 +4095,8 @@ const closeSessionHandler = async (req, res) => {
       `,
       [
         idSesionCaja, session.id_caja, session.id_sucursal, session.id_usuario_responsable, scopeContext.idUsuario,
-        idResolucionFinal, idArqueoFinalSelected, Number(session.monto_apertura || 0), Number(resumen.ventas_efectivo || 0),
-        Number(resumen.ventas_no_efectivo || 0), Number(resumen.ingresos_manuales || 0), Number(resumen.egresos_manuales || 0),
+        idResolucionFinal, idArqueoFinalSelected, Number(resumen.montoApertura || 0), Number(resumen.ventasEfectivoNetas || 0),
+        Number(resumen.ventasNoEfectivoNetas || 0), Number(resumen.ingresosManuales || 0), Number(resumen.egresosManuales || 0),
         montoTeorico, montoDeclaradoCierre, diferencia, observacionCierre
       ]
     );
@@ -4526,16 +4665,8 @@ router.patch('/ventas/cajas/cierres/:id', checkPermission(['VENTAS_CAJAS_SESION_
       throw createCajaError(400, 'VENTAS_CAJAS_CLOSE_AMOUNT_INVALID', 'Debe indicar un monto declarado valido.');
     }
 
-    const summaryResult = await client.query(
-      `SELECT * FROM public.vw_cajas_sesiones_resumen WHERE id_sesion_caja = $1 LIMIT 1`,
-      [cierre.id_sesion_caja]
-    );
-    const summary = summaryResult.rows[0];
-    if (!summary) {
-      throw createCajaError(409, 'VENTAS_CAJAS_CLOSE_SUMMARY_ERROR', 'No se pudo calcular el resumen de la sesion.');
-    }
-
-    const montoTeorico = Number(summary.efectivo_teorico || 0);
+    const summary = await fetchSessionMethodFinancialSummary(client, cierre.id_sesion_caja);
+    const montoTeorico = Number(summary.totalTeorico || 0);
     const diferencia = Number((montoDeclaradoFinal - montoTeorico).toFixed(2));
     const idResolucionCajaCuadra = await getCatalogId(client, 'RESOLUTIONS', 'CAJA_CUADRA');
     let idResolucionFinal = idResolucion ?? parseNullablePositiveInt(cierre.id_resolucion_cierre_caja);
@@ -4975,8 +5106,8 @@ router.post('/ventas/cajas/sesiones/:id/arqueos', checkPermission(['VENTAS_CAJAS
       );
     }
 
-    const resumenResult = await client.query(`SELECT efectivo_teorico FROM public.vw_cajas_sesiones_resumen WHERE id_sesion_caja = $1 LIMIT 1`, [idSesionCaja]);
-    const montoTeorico = Number(resumenResult.rows?.[0]?.efectivo_teorico || 0);
+    const resumen = await fetchSessionMethodFinancialSummary(client, idSesionCaja);
+    const montoTeorico = Number(resumen.efectivoTeorico || 0);
     const diferencia = Number((montoContado - montoTeorico).toFixed(2));
     const insertArqueo = await client.query(
       `
