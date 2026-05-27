@@ -629,6 +629,47 @@ const coercePositiveIntArray = (value) =>
     .map((item) => Number.parseInt(String(item ?? ''), 10))
     .filter((item) => Number.isInteger(item) && item > 0))];
 
+const validateVentasCatalogSucursal = async ({ scope, idSucursal, queryRunner = pool }) => {
+  if (!idSucursal) return { ok: true };
+
+  if (scope?.isSuperAdmin) {
+    const result = await queryRunner.query(
+      `
+        SELECT id_sucursal
+        FROM public.sucursales
+        WHERE id_sucursal = $1
+          AND COALESCE(estado, true) = true
+        LIMIT 1
+      `,
+      [idSucursal]
+    );
+    if (result.rowCount > 0) return { ok: true };
+    return {
+      ok: false,
+      status: 403,
+      body: { error: true, message: 'No tiene acceso a la sucursal solicitada.' }
+    };
+  }
+
+  const allowedSucursalIds = coercePositiveIntArray(scope?.allowedSucursalIds);
+  if (allowedSucursalIds.length === 0) {
+    return {
+      ok: false,
+      status: 403,
+      body: { error: true, message: 'El empleado no tiene sucursales asignadas.' }
+    };
+  }
+  if (!allowedSucursalIds.includes(idSucursal)) {
+    return {
+      ok: false,
+      status: 403,
+      body: { error: true, message: 'No tiene acceso a la sucursal solicitada.' }
+    };
+  }
+
+  return { ok: true };
+};
+
 const resolveVentasAssignedSucursalIds = async ({ idUsuario, fallbackIds, queryRunner }) => {
   const allowedIds = new Set(coercePositiveIntArray(fallbackIds));
   const normalizedUserId = parsePositiveInt(idUsuario);
@@ -3856,16 +3897,11 @@ const validateDescuentoCatalogoPayload = async (client, payload, options = {}) =
 router.get('/ventas/catalogos/categorias', async (req, res) => {
   try {
     const scope = await resolveRequestUserSucursalScope(req);
-    const isSuperAdmin = Boolean(scope.isSuperAdmin);
     const idSucursal = parseOptionalPositiveInt(req.query.id_sucursal);
 
-    if (!isSuperAdmin) {
-      if (!scope.allowedSucursalIds || scope.allowedSucursalIds.length === 0) {
-        return res.status(403).json({ error: true, message: 'El empleado no tiene sucursales asignadas.' });
-      }
-      if (idSucursal && !scope.allowedSucursalIds.includes(idSucursal)) {
-        return res.status(403).json({ error: true, message: 'No tiene acceso a la sucursal solicitada.' });
-      }
+    const sucursalValidation = await validateVentasCatalogSucursal({ scope, idSucursal });
+    if (!sucursalValidation.ok) {
+      return res.status(sucursalValidation.status).json(sucursalValidation.body);
     }
 
     const result = await pool.query(
@@ -3890,13 +3926,9 @@ router.get('/ventas/catalogos/productos', async (req, res) => {
     const isSuperAdmin = Boolean(scope.isSuperAdmin);
     const idSucursal = parseOptionalPositiveInt(req.query.id_sucursal);
 
-    if (!isSuperAdmin) {
-      if (!scope.allowedSucursalIds || scope.allowedSucursalIds.length === 0) {
-        return res.status(403).json({ error: true, message: 'El empleado no tiene sucursales asignadas.' });
-      }
-      if (idSucursal && !scope.allowedSucursalIds.includes(idSucursal)) {
-        return res.status(403).json({ error: true, message: 'No tiene acceso a la sucursal solicitada.' });
-      }
+    const sucursalValidation = await validateVentasCatalogSucursal({ scope, idSucursal });
+    if (!sucursalValidation.ok) {
+      return res.status(sucursalValidation.status).json(sucursalValidation.body);
     }
 
     let whereClause = '';
@@ -3984,15 +4016,9 @@ router.get('/ventas/catalogos/combos', async (req, res) => {
     const isSuperAdmin = Boolean(scope.isSuperAdmin);
     let idSucursal = parseOptionalPositiveInt(req.query.id_sucursal);
 
-    if (!isSuperAdmin) {
-      if (!scope.allowedSucursalIds || scope.allowedSucursalIds.length === 0) {
-        return res.status(403).json({ error: true, message: 'El empleado no tiene sucursales asignadas.' });
-      }
-      if (idSucursal) {
-        if (!scope.allowedSucursalIds.includes(idSucursal)) {
-          return res.status(403).json({ error: true, message: 'No tiene acceso a la sucursal solicitada.' });
-        }
-      }
+    const sucursalValidation = await validateVentasCatalogSucursal({ scope, idSucursal });
+    if (!sucursalValidation.ok) {
+      return res.status(sucursalValidation.status).json(sucursalValidation.body);
     }
 
     let joinClause = '';
@@ -4074,15 +4100,9 @@ router.get('/ventas/catalogos/recetas', async (req, res) => {
     const isSuperAdmin = Boolean(scope.isSuperAdmin);
     let idSucursal = parseOptionalPositiveInt(req.query.id_sucursal);
 
-    if (!isSuperAdmin) {
-      if (!scope.allowedSucursalIds || scope.allowedSucursalIds.length === 0) {
-        return res.status(403).json({ error: true, message: 'El empleado no tiene sucursales asignadas.' });
-      }
-      if (idSucursal) {
-        if (!scope.allowedSucursalIds.includes(idSucursal)) {
-          return res.status(403).json({ error: true, message: 'No tiene acceso a la sucursal solicitada.' });
-        }
-      }
+    const sucursalValidation = await validateVentasCatalogSucursal({ scope, idSucursal });
+    if (!sucursalValidation.ok) {
+      return res.status(sucursalValidation.status).json(sucursalValidation.body);
     }
 
     let joinClause = '';
@@ -4206,6 +4226,19 @@ router.get('/ventas/catalogos/tipo-departamento', async (req, res) => {
 
 router.get('/ventas/catalogos/descuentos', async (req, res) => {
   try {
+    const scope = await resolveRequestUserSucursalScope(req);
+    const idSucursal = parseOptionalPositiveInt(req.query.id_sucursal);
+    const sucursalValidation = await validateVentasCatalogSucursal({ scope, idSucursal });
+    if (!sucursalValidation.ok) {
+      return res.status(sucursalValidation.status).json(sucursalValidation.body);
+    }
+
+    const params = [];
+    const sucursalWhere = idSucursal
+      ? 'AND (dc.id_sucursal IS NULL OR dc.id_sucursal = $1)'
+      : '';
+    if (idSucursal) params.push(idSucursal);
+
     const result = await pool.query(
       `
         SELECT
@@ -4227,8 +4260,10 @@ router.get('/ventas/catalogos/descuentos', async (req, res) => {
           ON td.id_tipo_descuento = dc.id_tipo_descuento
         WHERE COALESCE(dc.estado, true) = true
           AND COALESCE(td.estado, true) = true
+          ${sucursalWhere}
         ORDER BY dc.nombre_descuento ASC, dc.id_descuento_catalogo ASC
-      `
+      `,
+      params
     );
     res.status(200).json(result.rows || []);
   } catch (err) {
