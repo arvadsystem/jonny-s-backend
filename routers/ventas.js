@@ -344,6 +344,31 @@ const hasDiscountIntentInPayload = (body) => {
 const mergeVentaWithFacturacion = (venta = {}, facturacion = {}) => {
   const emisor = facturacion?.emisor || {};
   const ticket = facturacion?.ticket || {};
+  const ticketFlags = {
+    mostrar_datos_fiscales: ticket?.mostrar_datos_fiscales !== false,
+    mostrar_cai_ticket: ticket?.mostrar_cai_ticket !== false,
+    mostrar_numero_fiscal_ticket: ticket?.mostrar_numero_fiscal_ticket !== false,
+    mostrar_codigo_interno_ticket: ticket?.mostrar_codigo_interno_ticket !== false,
+    aplicar_impuestos: Boolean(ticket?.aplicar_impuestos),
+    mostrar_impuestos_ticket: Boolean(ticket?.mostrar_impuestos_ticket),
+    mostrar_importe_exento: Boolean(ticket?.mostrar_importe_exento),
+    mostrar_importe_gravado_15: Boolean(ticket?.mostrar_importe_gravado_15),
+    mostrar_isv_15: Boolean(ticket?.mostrar_isv_15),
+    mostrar_importe_gravado_18: Boolean(ticket?.mostrar_importe_gravado_18),
+    mostrar_isv_18: Boolean(ticket?.mostrar_isv_18),
+    mostrar_total_isv: Boolean(ticket?.mostrar_total_isv),
+    mostrar_descuento_linea: ticket?.mostrar_descuento_linea !== false,
+    mostrar_descuento_porcentaje_linea: ticket?.mostrar_descuento_porcentaje_linea !== false,
+    mostrar_descuento_total: ticket?.mostrar_descuento_total !== false,
+    imprimir_comprobante_reversion: ticket?.imprimir_comprobante_reversion !== false,
+    mostrar_venta_original_reversion: ticket?.mostrar_venta_original_reversion !== false,
+    mostrar_codigo_reversion: ticket?.mostrar_codigo_reversion !== false,
+    mostrar_usuario_reversion: ticket?.mostrar_usuario_reversion !== false,
+    mostrar_caja_sesion_reversion: ticket?.mostrar_caja_sesion_reversion !== false,
+    mostrar_motivo_reversion: ticket?.mostrar_motivo_reversion !== false,
+    mostrar_detalle_reversion: ticket?.mostrar_detalle_reversion !== false,
+    mostrar_total_reversion: ticket?.mostrar_total_reversion !== false
+  };
   return {
     ...venta,
     facturacion: {
@@ -362,6 +387,7 @@ const mergeVentaWithFacturacion = (venta = {}, facturacion = {}) => {
         mostrar_direccion: Boolean(ticket?.mostrar_direccion),
         mostrar_telefono: Boolean(ticket?.mostrar_telefono),
         mostrar_correo: Boolean(ticket?.mostrar_correo),
+        ...ticketFlags,
         texto_encabezado_ticket: ticket?.texto_encabezado_ticket || null,
         texto_pie_ticket: ticket?.texto_pie_ticket || 'Gracias por su compra'
       },
@@ -383,6 +409,7 @@ const mergeVentaWithFacturacion = (venta = {}, facturacion = {}) => {
     mostrar_direccion: Boolean(ticket?.mostrar_direccion),
     mostrar_telefono: Boolean(ticket?.mostrar_telefono),
     mostrar_correo: Boolean(ticket?.mostrar_correo),
+    ...ticketFlags,
     texto_encabezado_ticket: ticket?.texto_encabezado_ticket || null,
     texto_pie_ticket: ticket?.texto_pie_ticket || 'Gracias por su compra',
     modo_fiscal: 'NO_INTEGRADO',
@@ -1067,7 +1094,7 @@ const buildCreateVentaDetailResponse = ({
   const numeroVenta = correlativoVenta.codigo;
   const subtotal = roundMoney(venta.subtotal);
   const descuento = roundMoney(venta.descuento);
-  const isv = roundMoney(venta.isv);
+  const isv = 0;
   const total = roundMoney(venta.total);
   const totalItems = (Array.isArray(items) ? items : []).reduce(
     (acc, item) => acc + (Number(item?.cantidad ?? 0) || 0),
@@ -1117,10 +1144,10 @@ const buildCreateVentaDetailResponse = ({
     descuento_global: roundMoney(venta.descuento_global),
     isv,
     impuesto: isv,
-    isv_15: isv,
+    isv_15: 0,
     isv_18: 0,
-    total_isv: isv,
-    gravado_15: subtotal,
+    total_isv: 0,
+    gravado_15: 0,
     gravado_18: 0,
     exento: 0,
     exonerado: null,
@@ -1232,7 +1259,7 @@ const buildVentaRpcPayload = ({ venta, correlativoVenta, facturacionVenta, factu
     fecha_operacion: correlativoVenta.fecha_operacion,
     efectivo_entregado: venta.efectivo_entregado,
     cambio: venta.cambio,
-    isv_15: venta.isv,
+    isv_15: 0,
     id_sesion_caja: venta.id_sesion_caja
   },
   cobro: {
@@ -1289,7 +1316,7 @@ const buildVentaRpcV2Payload = ({ venta }) => ({
     id_cliente: venta.id_cliente,
     efectivo_entregado: venta.efectivo_entregado,
     cambio: venta.cambio,
-    isv_15: venta.isv,
+    isv_15: 0,
     id_sesion_caja: venta.id_sesion_caja
   },
   cobro: {
@@ -2192,6 +2219,10 @@ const resolveCajaSession = async ({
           FROM estado_abierta ea
           INNER JOIN cajas_sesiones cs
             ON cs.id_estado_sesion_caja = ea.id_estado_sesion_caja
+          INNER JOIN cajas c
+            ON c.id_caja = cs.id_caja
+           AND c.id_sucursal = cs.id_sucursal
+           AND COALESCE(c.estado, true) = true
           INNER JOIN cajas_sesiones_participantes csp
             ON csp.id_sesion_caja = cs.id_sesion_caja
            AND csp.id_usuario = $2
@@ -2233,6 +2264,10 @@ const resolveCajaSession = async ({
           FROM estado_abierta ea
           INNER JOIN cajas_sesiones cs
             ON cs.id_estado_sesion_caja = ea.id_estado_sesion_caja
+          INNER JOIN cajas c
+            ON c.id_caja = cs.id_caja
+           AND c.id_sucursal = cs.id_sucursal
+           AND COALESCE(c.estado, true) = true
           INNER JOIN cajas_sesiones_participantes csp
             ON csp.id_sesion_caja = cs.id_sesion_caja
            AND csp.id_usuario = $2
@@ -2281,6 +2316,7 @@ const resolveCajaSession = async ({
             cs.id_sesion_caja,
             cs.id_sucursal,
             cs.id_estado_sesion_caja,
+            COALESCE(c.estado, true) AS caja_activa,
             EXISTS (
               SELECT 1
               FROM cajas_sesiones_participantes csp
@@ -2289,6 +2325,9 @@ const resolveCajaSession = async ({
                 AND COALESCE(csp.activo, true) = true
             ) AS has_active_participation
           FROM cajas_sesiones cs
+          LEFT JOIN cajas c
+            ON c.id_caja = cs.id_caja
+           AND c.id_sucursal = cs.id_sucursal
           WHERE cs.id_sesion_caja = $1
           LIMIT 1
         `,
@@ -2302,6 +2341,9 @@ const resolveCajaSession = async ({
       }
       if (Number(sessionRow.id_estado_sesion_caja || 0) !== Number(idEstadoAbierta)) {
         return { ok: false, reason: 'SESSION_NOT_OPEN' };
+      }
+      if (!Boolean(sessionRow.caja_activa)) {
+        return { ok: false, reason: 'CAJA_NOT_ACTIVE' };
       }
       if (!Boolean(sessionRow.has_active_participation)) {
         return { ok: false, reason: 'SESSION_PARTICIPATION_REQUIRED' };
@@ -3176,8 +3218,8 @@ const buildPedidoPendientePayload = async ({ client, body, userId, sucursalScope
 
   const descuentoTotal = roundMoney(finalizedLines.reduce((sum, line) => sum + Number(line.descuento || 0), 0));
   const subtotal = roundMoney(finalizedLines.reduce((sum, line) => sum + line.total_linea, 0));
-  const isv = roundMoney(subtotal * 0.15);
-  const total = roundMoney(subtotal + isv + costoEnvio);
+  const isv = 0;
+  const total = roundMoney(subtotal + costoEnvio);
   const idEstadoPedido = await resolveEstadoPedidoIdByCode(client, 'EN_COCINA');
   if (!idEstadoPedido) return { ok: false, status: 409, body: { error: true, message: 'No existe el estado EN_COCINA en estados_pedido.' } };
 
@@ -3764,8 +3806,8 @@ const buildVentaPayload = async ({ client, body, userId, sucursalScope, canApply
   const totalsImpuestosStart = perf?.now?.() || 0;
 
   const subtotal = roundMoney(finalizedLines.reduce((sum, line) => sum + line.total_linea, 0));
-  const isv = roundMoney(subtotal * 0.15);
-  const total = roundMoney(subtotal + isv);
+  const isv = 0;
+  const total = subtotal;
   const efectivoEntregado = metodoPagoAfectaEfectivo
     ? efectivoEntregadoInput === null
       ? total
@@ -3801,7 +3843,7 @@ const buildVentaPayload = async ({ client, body, userId, sucursalScope, canApply
       status:
         sessionActiva.reason === 'SESSION_NOT_FOUND'
           ? 404
-          : ['SESSION_NOT_OPEN', 'OPEN_STATE_NOT_FOUND'].includes(sessionActiva.reason)
+          : ['SESSION_NOT_OPEN', 'OPEN_STATE_NOT_FOUND', 'CAJA_NOT_ACTIVE'].includes(sessionActiva.reason)
           ? 409
           : 403,
       body: { error: true, message: sessionActiva.reason === 'SESSION_SCOPE_MISMATCH' ? 'La caja seleccionada no pertenece a la sucursal de la venta.' : 'Debe abrir o tener una sesi�n de caja activa permitida para procesar ventas.', code: sessionActiva.reason || 'NO_ACTIVE_SESSION' }
@@ -3816,8 +3858,8 @@ const buildVentaPayload = async ({ client, body, userId, sucursalScope, canApply
   const pedidoSubtotal = roundMoney(
     pedidoLines.reduce((sum, line) => sum + line.total_linea, 0)
   );
-  const pedidoIsv = roundMoney(pedidoSubtotal * 0.15);
-  const pedidoTotal = roundMoney(pedidoSubtotal + pedidoIsv);
+  const pedidoIsv = 0;
+  const pedidoTotal = pedidoSubtotal;
 
   let idEstadoPedido = null;
   if (requiresPedido) {
@@ -5084,8 +5126,9 @@ router.get('/ventas', checkPermission(['VENTAS_VER']), async (req, res) => {
         COALESCE(
           SUM(
             COALESCE(
+              df_info.subtotal_neto,
               p.total,
-              COALESCE(df_info.subtotal_neto, 0) + COALESCE(f.isv_15, 0) + COALESCE(f.isv_18, 0)
+              0
             )
           ),
           0
@@ -5131,10 +5174,11 @@ router.get('/ventas', checkPermission(['VENTAS_VER']), async (req, res) => {
         p.descripcion_envio,
         COALESCE(p.fecha_hora_pedido, f.fecha_hora_facturacion) AS fecha_hora_pedido,
         COALESCE(p.sub_total, df_info.subtotal_neto, 0) AS sub_total,
-        COALESCE(p.isv, COALESCE(f.isv_15, 0) + COALESCE(f.isv_18, 0), 0) AS isv,
+        0::numeric(12,2) AS isv,
         COALESCE(
+          df_info.subtotal_neto,
           p.total,
-          COALESCE(df_info.subtotal_neto, 0) + COALESCE(f.isv_15, 0) + COALESCE(f.isv_18, 0)
+          0
         ) AS total,
         p.id_estado_pedido,
         CASE
@@ -5158,8 +5202,8 @@ router.get('/ventas', checkPermission(['VENTAS_VER']), async (req, res) => {
         f.efectivo_entregado,
         f.cambio,
         f.fecha_hora_facturacion,
-        f.isv_15,
-        f.isv_18,
+        0::numeric(12,2) AS isv_15,
+        0::numeric(12,2) AS isv_18,
         fc_info.metodo_pago,
         CASE
           WHEN f.id_pedido IS NOT NULL THEN COALESCE(dp_info.total_items, 0)
@@ -6115,10 +6159,11 @@ router.get('/ventas/:id', checkPermission(['VENTAS_VER']), async (req, res) => {
         p.descripcion_envio,
         COALESCE(p.fecha_hora_pedido, f.fecha_hora_facturacion) AS fecha_hora_pedido,
         COALESCE(p.sub_total, df_info.subtotal_neto, 0) AS sub_total,
-        COALESCE(p.isv, COALESCE(f.isv_15, 0) + COALESCE(f.isv_18, 0), 0) AS isv,
+        0::numeric(12,2) AS isv,
         COALESCE(
+          df_info.subtotal_neto,
           p.total,
-          COALESCE(df_info.subtotal_neto, 0) + COALESCE(f.isv_15, 0) + COALESCE(f.isv_18, 0)
+          0
         ) AS total,
         p.id_estado_pedido,
         CASE
@@ -6140,19 +6185,26 @@ router.get('/ventas/:id', checkPermission(['VENTAS_VER']), async (req, res) => {
         cj.nombre_caja,
         cj.codigo_caja,
         f.id_sesion_caja,
+        UPPER(TRIM(cse_sesion.codigo)) AS caja_sesion_estado_codigo,
+        cse_sesion.nombre AS caja_sesion_estado_nombre,
+        cses.fecha_cierre AS caja_sesion_fecha_cierre,
+        COALESCE((
+          UPPER(TRIM(cse_sesion.codigo)) = 'ABIERTA'
+          AND cses.fecha_cierre IS NULL
+        ), false) AS caja_sesion_abierta,
         f.efectivo_entregado,
         f.cambio,
         f.fecha_hora_facturacion,
-        f.isv_15,
-        f.isv_18,
+        0::numeric(12,2) AS isv_15,
+        0::numeric(12,2) AS isv_18,
         f.id_config_facturacion,
         f.id_rango_cai,
         f.numero_factura_fiscal,
         f.facturacion_snapshot,
-        COALESCE(df_info.subtotal_neto, 0) AS gravado_15,
+        0::numeric(12,2) AS gravado_15,
         0::numeric(12,2) AS gravado_18,
         0::numeric(12,2) AS exento,
-        (COALESCE(f.isv_15, 0) + COALESCE(f.isv_18, 0))::numeric(12,2) AS total_isv,
+        0::numeric(12,2) AS total_isv,
         fc_info.metodo_pago,
         fc_info.codigo_transaccion,
         NULL::varchar AS banco,
@@ -6180,6 +6232,9 @@ router.get('/ventas/:id', checkPermission(['VENTAS_VER']), async (req, res) => {
       LEFT JOIN empresas emp ON emp.id_empresa = c.id_empresa
       LEFT JOIN usuarios u ON u.id_usuario = COALESCE(p.id_usuario, f.id_usuario)
       LEFT JOIN cajas cj ON cj.id_caja = f.id_caja
+      LEFT JOIN cajas_sesiones cses ON cses.id_sesion_caja = f.id_sesion_caja
+      LEFT JOIN cat_cajas_sesiones_estados cse_sesion
+        ON cse_sesion.id_estado_sesion_caja = cses.id_estado_sesion_caja
       LEFT JOIN LATERAL (
         SELECT e.nombre_empresa, e.rtn
         FROM empresas e
@@ -7115,7 +7170,7 @@ router.post('/ventas/pedidos/:id/registrar-pago', checkPermission(['VENTAS_CREAR
       [idPedido]
     );
     const costoEnvio = roundMoney(deliveryResult.rows?.[0]?.costo_envio || 0);
-    const isvPedido = roundMoney(pedido.isv || 0);
+    const isvPedido = 0;
     const totalPedido = roundMoney(pedido.total || totalPendiente);
     if (Math.abs(totalPendiente - totalPedido) > 0.05) {
       await client.query('ROLLBACK');
@@ -7205,7 +7260,7 @@ router.post('/ventas/pedidos/:id/registrar-pago', checkPermission(['VENTAS_CREAR
     const deliveryFacturado = await insertDetalleFacturaDelivery({ client, idFactura, idPedido, costoEnvio });
 
     const baseFacturada = roundMoney(detallesTotal + deliveryFacturado);
-    const totalFacturadoCalculado = roundMoney(baseFacturada + isvPedido);
+    const totalFacturadoCalculado = baseFacturada;
     if (Math.abs(totalFacturadoCalculado - totalPendiente) > 0.05) {
       await client.query('ROLLBACK');
       return res.status(409).json({ error: true, code: 'PEDIDO_FACTURA_NO_CUADRA', message: 'El detalle facturado no cuadra con el total del pedido.' });
