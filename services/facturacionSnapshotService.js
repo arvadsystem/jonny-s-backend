@@ -58,6 +58,22 @@ const resolveTicketFlags = (source = {}) =>
     [field]: toBoolean(source?.[field], TICKET_FLAG_DEFAULTS[field])
   }), {});
 
+const VISUAL_TICKET_FLAG_FIELDS = [
+  'mostrar_logo_ticket',
+  'mostrar_rtn',
+  'mostrar_direccion',
+  'mostrar_telefono',
+  'mostrar_correo',
+  ...TICKET_FLAG_FIELDS
+];
+
+const pickVisualTicketFlags = (ticket = {}) =>
+  VISUAL_TICKET_FLAG_FIELDS.reduce((acc, field) => (
+    ticket?.[field] === undefined || ticket?.[field] === null
+      ? acc
+      : { ...acc, [field]: Boolean(ticket[field]) }
+  ), {});
+
 const currentDateTimeHonduras = () =>
   new Date().toLocaleString('sv-SE', { timeZone: TEGUCIGALPA_TZ }).replace(' ', 'T');
 
@@ -628,5 +644,20 @@ export const normalizarDatosTicketDesdeSnapshot = async ({ client, factura }) =>
     }
   }
 
-  return normalizeSnapshotShape(snapshot);
+  const normalized = normalizeSnapshotShape(snapshot);
+  const idSucursal = toPositiveInt(source.id_sucursal || normalized.id_sucursal);
+
+  if (idSucursal) {
+    try {
+      const currentConfig = await obtenerConfigFacturacionParaVenta(db, idSucursal);
+      normalized.ticket = {
+        ...normalized.ticket,
+        ...pickVisualTicketFlags(currentConfig?.snapshot?.ticket)
+      };
+    } catch {
+      // Si la configuracion vigente no esta disponible, se conserva el snapshot historico.
+    }
+  }
+
+  return normalized;
 };
