@@ -8,11 +8,14 @@ const CATEGORIAS_INSUMOS_CREATE_PERMISSIONS = ['INVENTARIO_CATEGORIAS_INSUMOS_CR
 const CATEGORIAS_INSUMOS_EDIT_PERMISSIONS = ['INVENTARIO_CATEGORIAS_INSUMOS_EDITAR'];
 const CATEGORIAS_INSUMOS_STATE_PERMISSIONS = ['INVENTARIO_CATEGORIAS_INSUMOS_ESTADO_CAMBIAR'];
 const CATEGORIAS_INSUMOS_DELETE_PERMISSIONS = ['INVENTARIO_CATEGORIAS_INSUMOS_ELIMINAR'];
+const CATEGORY_ACTIVE_INSUMOS_BLOCK_CODE = 'CATEGORY_HAS_ACTIVE_INSUMOS';
+const CATEGORY_ACTIVE_INSUMOS_LEGACY_CODE = 'CATEGORY_INSUMO_HAS_ACTIVE_ITEMS';
+const CATEGORY_ACTIVE_INSUMOS_BLOCK_MESSAGE = 'No se puede inactivar la categoria porque tiene insumos activos asignados.';
+const CATEGORY_ACTIVE_INSUMOS_PREVIEW_LIMIT = 10;
 
 // NEW: mensaje estándar para bloqueo de inactivación por insumos activos asociados.
 // WHY: alinear backend con la regla de negocio para categorías de insumos.
 // IMPACT: solo respuestas 409 de DELETE /categorias_insumos; no cambia contratos de entrada.
-const CATEGORY_INSUMO_HAS_ACTIVE_ITEMS_MESSAGE = 'NO SE PUEDE INACTIVAR LA CATEGORIA PORQUE TIENE INSUMOS ASIGNADOS. REASIGNA O ACTUALIZA ESOS INSUMOS Y LUEGO INTENTA DE NUEVO.';
 
 // NEW: permite incluir inactivos solo bajo solicitud explícita.
 // WHY: GET debe devolver activos por defecto tras migrar a soft delete.
@@ -58,6 +61,51 @@ const INPUT_CATEGORY_CREATE_ALLOWED_FIELDS = new Set(['nombre_categoria', 'codig
 const INPUT_CATEGORY_FULL_EDIT_ALLOWED_FIELDS = new Set(['id_categoria_insumo', 'nombre_categoria', 'codigo_categoria', 'descripcion', 'estado']);
 const isPlainObject = (value) => Boolean(value) && typeof value === 'object' && !Array.isArray(value);
 const hasOnlyAllowedFields = (payload, allowedSet) => Object.keys(payload).every((key) => allowedSet.has(key));
+
+// AM: resumen reutilizable de insumos activos asociados para bloqueo de inactivacion.
+const getCategoriaInsumoActiveInsumosSummary = async (categoriaId) => {
+  const query = `
+    SELECT
+      i.id_insumo,
+      i.nombre_insumo,
+      COUNT(*) OVER()::int AS total_count
+    FROM insumos i
+    WHERE i.id_categoria_insumo = $1
+      AND i.estado = true
+    ORDER BY i.id_insumo ASC
+    LIMIT $2
+  `;
+  const result = await pool.query(query, [categoriaId, CATEGORY_ACTIVE_INSUMOS_PREVIEW_LIMIT]);
+  const rows = Array.isArray(result.rows) ? result.rows : [];
+  const total = Number(rows?.[0]?.total_count ?? 0);
+  const items = rows.map((row) => ({
+    id_insumo: Number(row.id_insumo),
+    nombre: String(row.nombre_insumo ?? '')
+  }));
+  const remaining = Math.max(0, total - items.length);
+  return {
+    entity: 'categoria_insumo',
+    blocking_relation: 'insumos_activos',
+    total,
+    items,
+    remaining
+  };
+};
+
+// AM: assertion centralizada para bloquear inactivacion de categoria con insumos activos.
+const assertCategoriaInsumoCanBeDeactivated = async (res, categoriaId) => {
+  const dependency_summary = await getCategoriaInsumoActiveInsumosSummary(categoriaId);
+  if (dependency_summary.total <= 0) return true;
+
+  res.status(409).json({
+    error: true,
+    code: CATEGORY_ACTIVE_INSUMOS_BLOCK_CODE,
+    legacy_code: CATEGORY_ACTIVE_INSUMOS_LEGACY_CODE,
+    message: CATEGORY_ACTIVE_INSUMOS_BLOCK_MESSAGE,
+    dependency_summary
+  });
+  return false;
+};
 
 // ------------------------------------------------------------------------------------
 // GET: Obtener categorias_insumos
@@ -179,18 +227,8 @@ router.put('/categorias_insumos/edicion', checkPermission(CATEGORIAS_INSUMOS_EDI
     // WHY: mantener consistencia con DELETE y PUT por campo.
     // IMPACT: solo bloquea cuando la edicion intenta dejar `estado=false` y hay dependencias activas.
     if (estadoNormalizado === false) {
-      const insumosActivosRes = await pool.query(
-        'SELECT COUNT(1)::int AS total FROM insumos WHERE id_categoria_insumo = $1 AND estado = true',
-        [categoriaId]
-      );
-      const totalInsumosActivos = Number(insumosActivosRes.rows?.[0]?.total ?? 0);
-      if (totalInsumosActivos > 0) {
-        return res.status(409).json({
-          error: true,
-          code: 'CATEGORY_INSUMO_HAS_ACTIVE_ITEMS',
-          message: CATEGORY_INSUMO_HAS_ACTIVE_ITEMS_MESSAGE
-        });
-      }
+      const canDeactivate = await assertCategoriaInsumoCanBeDeactivated(res, categoriaId);
+      if (!canDeactivate) return;
     }
 
     const updateRes = await pool.query(
@@ -254,18 +292,8 @@ router.put('/categorias_insumos', checkPermission(CATEGORIAS_INSUMOS_EDIT_PERMIS
         if (!isPositiveIntegerId(categoriaId)) {
           return res.status(400).json({ error: true, message: 'id_valor debe ser un entero mayor a 0.' });
         }
-        const insumosActivosRes = await pool.query(
-          'SELECT COUNT(1)::int AS total FROM insumos WHERE id_categoria_insumo = $1 AND estado = true',
-          [categoriaId]
-        );
-        const totalInsumosActivos = Number(insumosActivosRes.rows?.[0]?.total ?? 0);
-        if (totalInsumosActivos > 0) {
-          return res.status(409).json({
-            error: true,
-            code: 'CATEGORY_INSUMO_HAS_ACTIVE_ITEMS',
-            message: CATEGORY_INSUMO_HAS_ACTIVE_ITEMS_MESSAGE
-          });
-        }
+        const canDeactivate = await assertCategoriaInsumoCanBeDeactivated(res, categoriaId);
+        if (!canDeactivate) return;
       }
     }
 
@@ -311,18 +339,8 @@ router.patch('/categorias_insumos/estado', checkPermission(CATEGORIAS_INSUMOS_ST
     }
 
     if (normalizedEstado === false) {
-      const insumosActivosRes = await pool.query(
-        'SELECT COUNT(1)::int AS total FROM insumos WHERE id_categoria_insumo = $1 AND estado = true',
-        [categoriaId]
-      );
-      const totalInsumosActivos = Number(insumosActivosRes.rows?.[0]?.total ?? 0);
-      if (totalInsumosActivos > 0) {
-        return res.status(409).json({
-          error: true,
-          code: 'CATEGORY_INSUMO_HAS_ACTIVE_ITEMS',
-          message: CATEGORY_INSUMO_HAS_ACTIVE_ITEMS_MESSAGE
-        });
-      }
+      const canDeactivate = await assertCategoriaInsumoCanBeDeactivated(res, categoriaId);
+      if (!canDeactivate) return;
     }
 
     await pool.query(
@@ -380,18 +398,8 @@ router.delete('/categorias_insumos', checkPermission(CATEGORIAS_INSUMOS_DELETE_P
     // NEW: regla de negocio para bloquear inactivación si hay insumos activos asociados.
     // WHY: evitar dejar insumos activos ligados a categorías inactivas.
     // IMPACT: responde 409 con código/mensaje estándar para manejo explícito en frontend.
-    const insumosActivosRes = await pool.query(
-      'SELECT COUNT(1)::int AS total FROM insumos WHERE id_categoria_insumo = $1 AND estado = true',
-      [categoriaId]
-    );
-    const totalInsumosActivos = Number(insumosActivosRes.rows?.[0]?.total ?? 0);
-    if (totalInsumosActivos > 0) {
-      return res.status(409).json({
-        error: true,
-        code: 'CATEGORY_INSUMO_HAS_ACTIVE_ITEMS',
-        message: CATEGORY_INSUMO_HAS_ACTIVE_ITEMS_MESSAGE
-      });
-    }
+    const canDeactivate = await assertCategoriaInsumoCanBeDeactivated(res, categoriaId);
+    if (!canDeactivate) return;
 
     const tabla = 'categorias_insumos';
     const query = 'CALL pa_update($1, $2, $3, $4, $5)';

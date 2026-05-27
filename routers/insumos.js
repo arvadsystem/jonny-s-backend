@@ -1,4 +1,4 @@
-import express from 'express';
+﻿import express from 'express';
 import pool from '../config/db-connection.js';
 import { attachImagenPrincipalUrls } from '../utils/uploads.js';
 import { validarYDescontarPedido } from '../services/inventarioPedidoService.js';
@@ -14,11 +14,16 @@ const SQLSTATE_UNDEFINED_TABLE = '42P01';
 const INSUMOS_ALMACENES_TABLE_MISSING_CODE = 'INSUMOS_ALMACENES_TABLE_MISSING';
 const INSUMOS_ALMACENES_TABLE_MISSING_MESSAGE = 'Falta una estructura requerida del sistema: tabla public.insumos_almacenes. Aplica las migraciones pendientes.';
 const INSUMOS_DUPLICATE_CONSTRAINT = 'uq_insumos_nombre_categoria_unidad_norm';
-const INSUMOS_DUPLICATE_MESSAGE = 'Ya existe un insumo con ese nombre en el almacén seleccionado.';
-const SINGLE_ALMACEN_TEMP_MESSAGE = 'Temporalmente solo se permite un almacén por producto o insumo.';
+const INSUMOS_DUPLICATE_MESSAGE = 'Ya existe un insumo con ese nombre en el almacÃ©n seleccionado.';
+const SINGLE_ALMACEN_TEMP_MESSAGE = 'Temporalmente solo se permite un almacÃ©n por producto o insumo.';
 
 // AM: allowlist de campos permitidos para alta/edicion controlada de insumos.
 // AM: mantiene payload legacy (`id_almacen`) y habilita `id_almacenes` para asignacion multi-sucursal.
+const INSUMO_IN_USE_CODE = 'INSUMO_IN_USE';
+const INSUMO_IN_USE_MESSAGE = 'No se puede inactivar el insumo porque esta siendo utilizado en otros modulos del sistema.';
+const INSUMOS_DEPENDENCY_ITEMS_LIMIT = 10;
+const INSUMOS_DELETE_BLOCKING_OC_STATES = ['PENDIENTE', 'APROBADA', 'EN_COMPRA'];
+const SQLSTATE_UNDEFINED_COLUMN = '42703';
 const CAMPOS_PERMITIDOS_INSUMOS_POST = new Set([
   'nombre_insumo',
   'precio',
@@ -201,6 +206,231 @@ const isMissingInsumosAlmacenesTableError = (error) => {
   return trace.includes('insumos_almacenes');
 };
 
+const isSkippableDependencySchemaError = (error) =>
+  error?.code === SQLSTATE_UNDEFINED_TABLE || error?.code === SQLSTATE_UNDEFINED_COLUMN;
+
+// AM: conteo seguro de dependencias para no romper si hay drift de esquema.
+const safeDependencyCount = async ({ label, query, params }, db = pool) => {
+  try {
+    const result = await db.query(query, Array.isArray(params) ? params : []);
+    const total = Number.parseInt(String(result.rows?.[0]?.total ?? '0'), 10);
+    return {
+      label,
+      checked: true,
+      total: Number.isNaN(total) ? 0 : total
+    };
+  } catch (error) {
+    if (isSkippableDependencySchemaError(error)) {
+      console.warn(`[insumos] dependencia omitida (${label}):`, error.message);
+      return { label, checked: false, total: 0 };
+    }
+    throw error;
+  }
+};
+
+// AM: detalle seguro de dependencias (max 10 items) para mensajes humanos.
+const safeDependencyItems = async ({ label, query, params, mapRow }, db = pool) => {
+  try {
+    const result = await db.query(query, Array.isArray(params) ? params : []);
+    const rows = Array.isArray(result.rows) ? result.rows : [];
+    return {
+      label,
+      checked: true,
+      items: rows.map((row) => (typeof mapRow === 'function' ? mapRow(row) : row))
+    };
+  } catch (error) {
+    if (isSkippableDependencySchemaError(error)) {
+      console.warn(`[insumos] detalle dependencia omitida (${label}):`, error.message);
+      return { label, checked: false, items: [] };
+    }
+    throw error;
+  }
+};
+
+const getInsumoDependencySummary = async (idInsumo, db = pool) => {
+  const [counts, details] = await Promise.all([
+    Promise.all([
+      safeDependencyCount(
+        {
+          label: 'recetas_activas',
+          params: [idInsumo],
+          query: `
+            SELECT COUNT(DISTINCT dr.id_receta)::int AS total
+            FROM public.detalle_receta dr
+            INNER JOIN public.recetas r ON r.id_receta = dr.id_receta
+            WHERE dr.id_insumo = $1
+              AND COALESCE(dr.estado, true) = true
+              AND COALESCE(r.estado, true) = true
+          `
+        },
+        db
+      ),
+      safeDependencyCount(
+        {
+          label: 'stock_disponible',
+          params: [idInsumo],
+          query: `
+            SELECT COUNT(*)::int AS total
+            FROM public.insumos i
+            WHERE i.id_insumo = $1
+              AND COALESCE(i.cantidad, 0) > 0
+          `
+        },
+        db
+      ),
+      safeDependencyCount(
+        {
+          label: 'ordenes_compra_en_proceso',
+          params: [idInsumo, INSUMOS_DELETE_BLOCKING_OC_STATES],
+          query: `
+            SELECT COUNT(*)::int AS total
+            FROM public.detalle_orden_compras doc
+            INNER JOIN public.orden_compras oc
+              ON oc.id_orden_compra = doc.id_orden_compra
+            WHERE doc.id_insumo = $1
+              AND UPPER(COALESCE(oc.estado_flujo, '')) = ANY($2::text[])
+          `
+        },
+        db
+      )
+    ]),
+    Promise.all([
+      safeDependencyItems(
+        {
+          label: 'recetas_activas',
+          params: [idInsumo, INSUMOS_DEPENDENCY_ITEMS_LIMIT],
+          query: `
+            SELECT DISTINCT
+              r.id_receta,
+              COALESCE(NULLIF(TRIM(COALESCE(r.nombre_receta, r.nombre, '')), ''), CONCAT('Receta #', r.id_receta::text)) AS nombre
+            FROM public.detalle_receta dr
+            INNER JOIN public.recetas r ON r.id_receta = dr.id_receta
+            WHERE dr.id_insumo = $1
+              AND COALESCE(dr.estado, true) = true
+              AND COALESCE(r.estado, true) = true
+            ORDER BY r.id_receta ASC
+            LIMIT $2
+          `,
+          mapRow: (row) => ({
+            id_receta: Number(row.id_receta),
+            nombre: String(row.nombre ?? `Receta #${row.id_receta}`)
+          })
+        },
+        db
+      ),
+      safeDependencyItems(
+        {
+          label: 'stock_disponible',
+          params: [idInsumo, INSUMOS_DEPENDENCY_ITEMS_LIMIT],
+          query: `
+            SELECT
+              a.id_sucursal,
+              COALESCE(NULLIF(TRIM(COALESCE(s.nombre_sucursal, s.nombre, '')), ''), CONCAT('Sucursal #', a.id_sucursal::text)) AS sucursal,
+              i.id_almacen,
+              COALESCE(NULLIF(TRIM(COALESCE(a.nombre_almacen, a.nombre, '')), ''), CONCAT('Almacen #', i.id_almacen::text)) AS almacen,
+              COALESCE(i.cantidad, 0)::numeric AS stock
+            FROM public.insumos i
+            LEFT JOIN public.almacenes a ON a.id_almacen = i.id_almacen
+            LEFT JOIN public.sucursales s ON s.id_sucursal = a.id_sucursal
+            WHERE i.id_insumo = $1
+              AND COALESCE(i.cantidad, 0) > 0
+            ORDER BY i.id_insumo ASC
+            LIMIT $2
+          `,
+          mapRow: (row) => ({
+            id_sucursal: row.id_sucursal == null ? null : Number(row.id_sucursal),
+            sucursal: String(
+              row.sucursal
+              ?? (row.id_sucursal == null ? 'Sucursal sin asignar' : `Sucursal #${row.id_sucursal}`)
+            ),
+            id_almacen: row.id_almacen == null ? null : Number(row.id_almacen),
+            almacen: String(
+              row.almacen
+              ?? (row.id_almacen == null ? 'Almacen sin asignar' : `Almacen #${row.id_almacen}`)
+            ),
+            stock: Number(row.stock ?? 0)
+          })
+        },
+        db
+      ),
+      safeDependencyItems(
+        {
+          label: 'ordenes_compra_en_proceso',
+          params: [idInsumo, INSUMOS_DELETE_BLOCKING_OC_STATES, INSUMOS_DEPENDENCY_ITEMS_LIMIT],
+          query: `
+            SELECT DISTINCT
+              oc.id_orden_compra,
+              COALESCE(NULLIF(TRIM(COALESCE(oc.codigo_orden_compra, oc.codigo, '')), ''), CONCAT('OC #', oc.id_orden_compra::text)) AS codigo,
+              UPPER(COALESCE(oc.estado_flujo, '')) AS estado
+            FROM public.detalle_orden_compras doc
+            INNER JOIN public.orden_compras oc
+              ON oc.id_orden_compra = doc.id_orden_compra
+            WHERE doc.id_insumo = $1
+              AND UPPER(COALESCE(oc.estado_flujo, '')) = ANY($2::text[])
+            ORDER BY oc.id_orden_compra ASC
+            LIMIT $3
+          `,
+          mapRow: (row) => ({
+            id_orden_compra: Number(row.id_orden_compra),
+            codigo: String(row.codigo ?? `OC #${row.id_orden_compra}`),
+            estado: String(row.estado ?? '')
+          })
+        },
+        db
+      )
+    ])
+  ]);
+
+  const detailByLabel = new Map(details.map((row) => [row.label, row]));
+  const checks = counts.map((row) => {
+    const detail = detailByLabel.get(row.label);
+    const items = detail?.checked ? (detail.items || []) : [];
+    return {
+      label: row.label,
+      checked: row.checked,
+      total: row.total,
+      items,
+      remaining: Math.max(0, row.total - items.length)
+    };
+  });
+
+  const normalizedChecks = checks.map((row) => ({
+    modulo: row.label,
+    checked: row.checked,
+    total: row.total,
+    items: row.items,
+    remaining: row.remaining
+  }));
+
+  const blocking = normalizedChecks.filter((row) => row.checked && row.total > 0);
+  return {
+    hasBlockingDependencies: blocking.length > 0,
+    summary: {
+      entity: 'insumo',
+      blocking_modules: blocking.map((row) => ({
+        modulo: row.modulo,
+        total: row.total,
+        items: row.items,
+        remaining: row.remaining
+      })),
+      checks: normalizedChecks
+    }
+  };
+};
+
+const assertInsumoCanBeDeactivated = async (idInsumo, db = pool) => {
+  const dependencySummary = await getInsumoDependencySummary(idInsumo, db);
+  if (dependencySummary.hasBlockingDependencies) {
+    return {
+      ok: false,
+      status: 409,
+      code: INSUMO_IN_USE_CODE,
+      message: INSUMO_IN_USE_MESSAGE,
+      summary: dependencySummary.summary
+    };
+  }
+  return { ok: true, status: 200 };
+};
 const buildInsumosAlmacenesTableMissingError = (error) => {
   const wrapped = new Error(INSUMOS_ALMACENES_TABLE_MISSING_MESSAGE);
   wrapped.code = INSUMOS_ALMACENES_TABLE_MISSING_CODE;
@@ -280,12 +510,12 @@ const validateCategoriaInsumoActiva = async (rawCategoriaId, db = pool) => {
     [categoriaId]
   );
   if (result.rowCount === 0) {
-    return { ok: false, status: 400, code: 'INVALID_INSUMO_CATEGORY_ID', message: 'La categoría de insumo no existe.' };
+    return { ok: false, status: 400, code: 'INVALID_INSUMO_CATEGORY_ID', message: 'La categorÃ­a de insumo no existe.' };
   }
 
   const row = result.rows?.[0] || {};
   if (!isRowActive(row)) {
-    return { ok: false, status: 400, code: 'INACTIVE_INSUMO_CATEGORY', message: 'La categoría de insumo está inactiva.' };
+    return { ok: false, status: 400, code: 'INACTIVE_INSUMO_CATEGORY', message: 'La categorÃ­a de insumo estÃ¡ inactiva.' };
   }
 
   return { ok: true, id: categoriaId };
@@ -893,7 +1123,7 @@ router.post('/insumos', checkPermission(INSUMOS_CREATE_PERMISSIONS), async (req,
 router.put('/insumos/multi-almacen', checkPermission(INSUMOS_EDIT_PERMISSIONS), async (_req, res) => {
   return res.status(410).json({
     error: true,
-    message: 'Este endpoint ha sido descontinuado. El sistema actual de Insumos ya no soporta multi-almacén.'
+    message: 'Este endpoint ha sido descontinuado. El sistema actual de Insumos ya no soporta multi-almacÃ©n.'
   });
 });
 
@@ -929,14 +1159,14 @@ router.put('/insumos/edicion', checkPermission(INSUMOS_EDIT_PERMISSIONS), async 
     if (Object.prototype.hasOwnProperty.call(datosEntrada, 'id_almacen')) {
       return res.status(400).json({
         error: true,
-        message: 'El almacén no puede modificarse desde la edición del insumo. Use un flujo de traslado o reasignación controlada.'
+        message: 'El almacÃ©n no puede modificarse desde la ediciÃ³n del insumo. Use un flujo de traslado o reasignaciÃ³n controlada.'
       });
     }
 
     if (Object.prototype.hasOwnProperty.call(datosEntrada, 'cantidad')) {
       return res.status(400).json({
         error: true,
-        message: 'La cantidad no puede editarse desde este módulo. Use movimientos de inventario.'
+        message: 'La cantidad no puede editarse desde este mÃ³dulo. Use movimientos de inventario.'
       });
     }
 
@@ -1129,12 +1359,12 @@ router.put('/insumos', checkPermission(INSUMOS_EDIT_PERMISSIONS), async (req, re
     if (campo === 'cantidad') {
       return res.status(400).json({
         error: true,
-        message: 'La cantidad no puede editarse desde este módulo. Use movimientos de inventario.'
+        message: 'La cantidad no puede editarse desde este mÃ³dulo. Use movimientos de inventario.'
       });
     }
 
     // NEW: valida categoria de insumo solo cuando se intenta actualizar ese campo.
-    // WHY: mantener PUT genérico pero asegurando coherencia con `categorias_insumos.estado`.
+    // WHY: mantener PUT genÃ©rico pero asegurando coherencia con `categorias_insumos.estado`.
     // IMPACT: no afecta updates de otros campos.
     if (campo === 'estado') {
       return res.status(400).json({
@@ -1146,7 +1376,7 @@ router.put('/insumos', checkPermission(INSUMOS_EDIT_PERMISSIONS), async (req, re
     if (campo === 'id_almacen') {
       return res.status(400).json({
         error: true,
-        message: 'El almacén no puede modificarse desde la edición del insumo. Use un flujo de traslado o reasignación controlada.'
+        message: 'El almacÃ©n no puede modificarse desde la ediciÃ³n del insumo. Use un flujo de traslado o reasignaciÃ³n controlada.'
       });
     }
 
@@ -1324,6 +1554,19 @@ router.patch('/insumos/estado', checkPermission(INSUMOS_STATE_PERMISSIONS), asyn
       return res.status(404).json({ error: true, message: 'Insumo no encontrado.' });
     }
 
+    if (nextEstado === false) {
+      // AM: centraliza bloqueo de inactivacion para evitar bypass por PATCH estado.
+      const dependencyValidation = await assertInsumoCanBeDeactivated(idInsumo, pool);
+      if (!dependencyValidation.ok) {
+        return res.status(dependencyValidation.status).json({
+          error: true,
+          code: dependencyValidation.code,
+          message: dependencyValidation.message,
+          dependency_summary: dependencyValidation.summary
+        });
+      }
+    }
+
     const query = 'UPDATE public.insumos SET estado = $1 WHERE id_insumo = $2';
     await pool.query(query, [nextEstado, idInsumo]);
 
@@ -1365,6 +1608,17 @@ router.delete('/insumos', checkPermission(INSUMOS_DELETE_PERMISSIONS), async (re
       return res.status(404).json({ error: true, message: 'Insumo no encontrado.' });
     }
 
+    // AM: centraliza bloqueo de inactivacion para evitar bypass por DELETE.
+    const dependencyValidation = await assertInsumoCanBeDeactivated(insumoId, pool);
+    if (!dependencyValidation.ok) {
+      return res.status(dependencyValidation.status).json({
+        error: true,
+        code: dependencyValidation.code,
+        message: dependencyValidation.message,
+        dependency_summary: dependencyValidation.summary
+      });
+    }
+
     const query = 'UPDATE public.insumos SET estado = false WHERE id_insumo = $1';
     await pool.query(query, [insumoId]);
 
@@ -1377,3 +1631,6 @@ router.delete('/insumos', checkPermission(INSUMOS_DELETE_PERMISSIONS), async (re
 });
 
 export default router;
+
+
+

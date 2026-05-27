@@ -64,6 +64,7 @@ const PRODUCTOS_DATE_ORDER_MESSAGE = 'La fecha de caducidad no puede ser menor q
 const SINGLE_ALMACEN_TEMP_MESSAGE = 'Temporalmente solo se permite un almacen por producto o insumo.';
 const PRODUCTOS_DELETE_BLOCKED_MESSAGE = 'No se puede inactivar el producto porque esta siendo utilizado en otros modulos del sistema.';
 const PRODUCTOS_DELETE_BLOCKING_OC_STATES = ['PENDIENTE', 'APROBADA', 'EN_COMPRA'];
+const PRODUCTOS_DEPENDENCY_ITEMS_LIMIT = 10;
 // NEW: query param opt-in para incluir inactivos en listados administrativos.
 // WHY: el GET de productos debe devolver activos por defecto tras adoptar soft delete.
 // IMPACT: mantiene compatibilidad con `?incluir_inactivos=1` sin crear endpoint nuevo.
@@ -249,44 +250,178 @@ async function safeDependencyCount({ label, query, params }, db = pool) {
   }
 }
 
+// AM: obtiene muestra de dependencias por modulo (max 10) para mensaje humano de bloqueo.
+async function safeDependencyItems({ label, query, params, mapRow }, db = pool) {
+  try {
+    const result = await db.query(query, Array.isArray(params) ? params : []);
+    const rows = Array.isArray(result.rows) ? result.rows : [];
+    return {
+      label,
+      checked: true,
+      items: rows.map((row) => (typeof mapRow === 'function' ? mapRow(row) : row))
+    };
+  } catch (err) {
+    if (isSkippableDependencySchemaError(err)) {
+      console.warn(`[productos] detalle dependencia omitida (${label}):`, err.message);
+      return { label, checked: false, items: [] };
+    }
+    throw err;
+  }
+}
+
 async function getProductoDependencySummary(idProducto, db = pool) {
-  const checks = await Promise.all([
-    safeDependencyCount(
-      {
-        label: 'menu_publicado',
-        params: [idProducto],
-        query: `
-          SELECT COUNT(*)::int AS total
-          FROM public.detalle_menu dm
-          INNER JOIN public.menu m ON m.id_menu = dm.id_menu
-          WHERE dm.id_producto = $1
-            AND COALESCE(dm.estado, true) = true
-            AND COALESCE(m.estado, true) = true
-        `
-      },
-      db
-    ),
-    safeDependencyCount(
-      {
-        label: 'ordenes_compra_en_proceso',
-        params: [idProducto, PRODUCTOS_DELETE_BLOCKING_OC_STATES],
-        query: `
-          SELECT COUNT(*)::int AS total
-          FROM public.detalle_orden_compras doc
-          INNER JOIN public.orden_compras oc
-            ON oc.id_orden_compra = doc.id_orden_compra
-          WHERE doc.id_producto = $1
-            AND UPPER(COALESCE(oc.estado_flujo, '')) = ANY($2::text[])
-        `
-      },
-      db
-    )
+  const [counts, details] = await Promise.all([
+    Promise.all([
+      safeDependencyCount(
+        {
+          label: 'menu_publicado',
+          params: [idProducto],
+          query: `
+            SELECT COUNT(*)::int AS total
+            FROM public.detalle_menu dm
+            INNER JOIN public.menu m ON m.id_menu = dm.id_menu
+            WHERE dm.id_producto = $1
+              AND COALESCE(dm.estado, true) = true
+              AND COALESCE(m.estado, true) = true
+          `
+        },
+        db
+      ),
+      safeDependencyCount(
+        {
+          label: 'ordenes_compra_en_proceso',
+          params: [idProducto, PRODUCTOS_DELETE_BLOCKING_OC_STATES],
+          query: `
+            SELECT COUNT(*)::int AS total
+            FROM public.detalle_orden_compras doc
+            INNER JOIN public.orden_compras oc
+              ON oc.id_orden_compra = doc.id_orden_compra
+            WHERE doc.id_producto = $1
+              AND UPPER(COALESCE(oc.estado_flujo, '')) = ANY($2::text[])
+          `
+        },
+        db
+      ),
+      safeDependencyCount(
+        {
+          label: 'stock_disponible',
+          params: [idProducto],
+          query: `
+            SELECT COUNT(*)::int AS total
+            FROM public.productos p
+            WHERE p.id_producto = $1
+              AND COALESCE(p.cantidad, 0) > 0
+          `
+        },
+        db
+      )
+    ]),
+    Promise.all([
+      safeDependencyItems(
+        {
+          label: 'menu_publicado',
+          params: [idProducto, PRODUCTOS_DEPENDENCY_ITEMS_LIMIT],
+          query: `
+            SELECT DISTINCT
+              m.id_menu,
+              COALESCE(NULLIF(TRIM(COALESCE(m.nombre_menu, m.nombre, '')), ''), CONCAT('Menu #', m.id_menu::text)) AS nombre
+            FROM public.detalle_menu dm
+            INNER JOIN public.menu m ON m.id_menu = dm.id_menu
+            WHERE dm.id_producto = $1
+              AND COALESCE(dm.estado, true) = true
+              AND COALESCE(m.estado, true) = true
+            ORDER BY m.id_menu ASC
+            LIMIT $2
+          `,
+          mapRow: (row) => ({
+            id_menu: Number(row.id_menu),
+            nombre: String(row.nombre ?? `Menu #${row.id_menu}`)
+          })
+        },
+        db
+      ),
+      safeDependencyItems(
+        {
+          label: 'ordenes_compra_en_proceso',
+          params: [idProducto, PRODUCTOS_DELETE_BLOCKING_OC_STATES, PRODUCTOS_DEPENDENCY_ITEMS_LIMIT],
+          query: `
+            SELECT DISTINCT
+              oc.id_orden_compra,
+              COALESCE(NULLIF(TRIM(COALESCE(oc.codigo_orden_compra, oc.codigo, '')), ''), CONCAT('OC #', oc.id_orden_compra::text)) AS codigo,
+              UPPER(COALESCE(oc.estado_flujo, '')) AS estado
+            FROM public.detalle_orden_compras doc
+            INNER JOIN public.orden_compras oc
+              ON oc.id_orden_compra = doc.id_orden_compra
+            WHERE doc.id_producto = $1
+              AND UPPER(COALESCE(oc.estado_flujo, '')) = ANY($2::text[])
+            ORDER BY oc.id_orden_compra ASC
+            LIMIT $3
+          `,
+          mapRow: (row) => ({
+            id_orden_compra: Number(row.id_orden_compra),
+            codigo: String(row.codigo ?? `OC #${row.id_orden_compra}`),
+            estado: String(row.estado ?? '')
+          })
+        },
+        db
+      ),
+      safeDependencyItems(
+        {
+          label: 'stock_disponible',
+          params: [idProducto, PRODUCTOS_DEPENDENCY_ITEMS_LIMIT],
+          query: `
+            SELECT
+              a.id_sucursal,
+              COALESCE(NULLIF(TRIM(COALESCE(s.nombre_sucursal, s.nombre, '')), ''), CONCAT('Sucursal #', a.id_sucursal::text)) AS sucursal,
+              p.id_almacen,
+              COALESCE(NULLIF(TRIM(COALESCE(a.nombre_almacen, a.nombre, '')), ''), CONCAT('Almacen #', p.id_almacen::text)) AS almacen,
+              COALESCE(p.cantidad, 0)::numeric AS stock
+            FROM public.productos p
+            LEFT JOIN public.almacenes a ON a.id_almacen = p.id_almacen
+            LEFT JOIN public.sucursales s ON s.id_sucursal = a.id_sucursal
+            WHERE p.id_producto = $1
+              AND COALESCE(p.cantidad, 0) > 0
+            ORDER BY p.id_producto ASC
+            LIMIT $2
+          `,
+          mapRow: (row) => ({
+            id_sucursal: row.id_sucursal == null ? null : Number(row.id_sucursal),
+            sucursal: String(
+              row.sucursal
+              ?? (row.id_sucursal == null ? 'Sucursal sin asignar' : `Sucursal #${row.id_sucursal}`)
+            ),
+            id_almacen: row.id_almacen == null ? null : Number(row.id_almacen),
+            almacen: String(
+              row.almacen
+              ?? (row.id_almacen == null ? 'Almacen sin asignar' : `Almacen #${row.id_almacen}`)
+            ),
+            stock: Number(row.stock ?? 0)
+          })
+        },
+        db
+      )
+    ])
   ]);
+
+  const detailByLabel = new Map(details.map((row) => [row.label, row]));
+  const checks = counts.map((row) => {
+    const detail = detailByLabel.get(row.label);
+    const items = detail?.checked ? (detail.items || []) : [];
+    return {
+      label: row.label,
+      checked: row.checked,
+      total: row.total,
+      items,
+      remaining: Math.max(0, row.total - items.length)
+    };
+  });
 
   const normalizedChecks = checks.map((row) => ({
     modulo: row.label,
     checked: row.checked,
-    total: row.total
+    total: row.total,
+    items: row.items,
+    remaining: row.remaining
   }));
 
   const blocking = normalizedChecks.filter((row) => row.checked && row.total > 0);
@@ -295,7 +430,9 @@ async function getProductoDependencySummary(idProducto, db = pool) {
     summary: {
       blocking_modules: blocking.map((row) => ({
         modulo: row.modulo,
-        total: row.total
+        total: row.total,
+        items: row.items,
+        remaining: row.remaining
       })),
       checks: normalizedChecks
     }
@@ -1406,6 +1543,19 @@ router.put('/productos/multi-almacen', checkPermission(PRODUCTOS_EDIT_PERMISSION
       datosNormalizados[campo] = resultado.valor;
     }
 
+    // AM: evita bypass de inactivacion en flujo multi-almacen aplicando la misma validacion de DELETE.
+    if (datosNormalizados.estado === false) {
+      const dependencyValidation = await assertProductoCanBeDeactivated(idProducto, client);
+      if (!dependencyValidation.ok) {
+        return res.status(dependencyValidation.status).json({
+          error: true,
+          code: 'PRODUCT_IN_USE',
+          message: dependencyValidation.message,
+          dependency_summary: dependencyValidation.summary
+        });
+      }
+    }
+
     const fechasEditMultiValidation = validarCoherenciaFechasProducto({
       fechaIngreso: datosNormalizados.fecha_ingreso_producto,
       fechaCaducidad: datosNormalizados.fecha_caducidad
@@ -1596,6 +1746,19 @@ router.put('/productos', checkPermission(PRODUCTOS_EDIT_PERMISSIONS), async (req
     const resultado = validarCampoProducto(campo, valor);
     if (!resultado.valido) {
       return res.status(400).json({ error: true, message: resultado.message });
+    }
+
+    // AM: evita bypass de inactivacion por PUT campo=estado usando la misma regla de DELETE.
+    if (campo === 'estado' && resultado.valor === false) {
+      const dependencyValidation = await assertProductoCanBeDeactivated(idProducto, client);
+      if (!dependencyValidation.ok) {
+        return res.status(dependencyValidation.status).json({
+          error: true,
+          code: 'PRODUCT_IN_USE',
+          message: dependencyValidation.message,
+          dependency_summary: dependencyValidation.summary
+        });
+      }
     }
 
     if (campo === 'fecha_ingreso_producto' || campo === 'fecha_caducidad') {
