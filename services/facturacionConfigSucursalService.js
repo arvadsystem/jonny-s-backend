@@ -4,6 +4,32 @@ const VALID_MODO_FISCAL = new Set(['INTERNO', 'CAI_PREPARADO', 'CAI_ACTIVO']);
 const VALID_TICKET_WIDTH = new Set([58, 80]);
 const VALID_PREFIX_RE = /^[A-Za-z0-9_-]+$/;
 const SAFE_EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const TICKET_FLAG_DEFAULTS = Object.freeze({
+  mostrar_datos_fiscales: true,
+  mostrar_cai_ticket: true,
+  mostrar_numero_fiscal_ticket: true,
+  mostrar_codigo_interno_ticket: true,
+  aplicar_impuestos: false,
+  mostrar_impuestos_ticket: false,
+  mostrar_importe_exento: false,
+  mostrar_importe_gravado_15: false,
+  mostrar_isv_15: false,
+  mostrar_importe_gravado_18: false,
+  mostrar_isv_18: false,
+  mostrar_total_isv: false,
+  mostrar_descuento_linea: true,
+  mostrar_descuento_porcentaje_linea: true,
+  mostrar_descuento_total: true,
+  imprimir_comprobante_reversion: true,
+  mostrar_venta_original_reversion: true,
+  mostrar_codigo_reversion: true,
+  mostrar_usuario_reversion: true,
+  mostrar_caja_sesion_reversion: true,
+  mostrar_motivo_reversion: true,
+  mostrar_detalle_reversion: true,
+  mostrar_total_reversion: true
+});
+const TICKET_FLAG_FIELDS = Object.keys(TICKET_FLAG_DEFAULTS);
 
 class ServiceError extends Error {
   constructor(message, status = 500, details = null) {
@@ -32,6 +58,14 @@ const normalizeBoolean = (value) => {
   return null;
 };
 
+const resolveTicketFlags = (row = {}) =>
+  TICKET_FLAG_FIELDS.reduce((acc, field) => ({
+    ...acc,
+    [field]: row?.[field] === undefined || row?.[field] === null
+      ? TICKET_FLAG_DEFAULTS[field]
+      : Boolean(row[field])
+  }), {});
+
 const sanitizeOutboundConfig = (row) => ({
   id_config: Number(row?.id_config ?? 0) || null,
   id_sucursal: Number(row?.id_sucursal ?? 0) || null,
@@ -55,6 +89,7 @@ const sanitizeOutboundConfig = (row) => ({
   mostrar_direccion: Boolean(row?.mostrar_direccion),
   mostrar_telefono: Boolean(row?.mostrar_telefono),
   mostrar_correo: Boolean(row?.mostrar_correo),
+  ...resolveTicketFlags(row),
   activo: Boolean(row?.activo)
 });
 
@@ -88,9 +123,9 @@ const buildPreviewFromConfig = (config) => {
     ],
     totales: {
       subtotal: 100,
-      impuesto: 15,
+      impuesto: 0,
       descuento: 0,
-      total: 115
+      total: 100
     },
     textos: {
       encabezado: config?.texto_encabezado_ticket ?? null,
@@ -101,7 +136,8 @@ const buildPreviewFromConfig = (config) => {
       mostrar_rtn: Boolean(config?.mostrar_rtn),
       mostrar_direccion: Boolean(config?.mostrar_direccion),
       mostrar_telefono: Boolean(config?.mostrar_telefono),
-      mostrar_correo: Boolean(config?.mostrar_correo)
+      mostrar_correo: Boolean(config?.mostrar_correo),
+      ...resolveTicketFlags(config)
     }
   };
 };
@@ -155,7 +191,30 @@ const getConfigBySucursal = async (idSucursal, db = pool) => {
         mostrar_rtn,
         mostrar_direccion,
         mostrar_telefono,
-        mostrar_correo
+        mostrar_correo,
+        mostrar_datos_fiscales,
+        mostrar_cai_ticket,
+        mostrar_numero_fiscal_ticket,
+        mostrar_codigo_interno_ticket,
+        aplicar_impuestos,
+        mostrar_impuestos_ticket,
+        mostrar_importe_exento,
+        mostrar_importe_gravado_15,
+        mostrar_isv_15,
+        mostrar_importe_gravado_18,
+        mostrar_isv_18,
+        mostrar_total_isv,
+        mostrar_descuento_linea,
+        mostrar_descuento_porcentaje_linea,
+        mostrar_descuento_total,
+        imprimir_comprobante_reversion,
+        mostrar_venta_original_reversion,
+        mostrar_codigo_reversion,
+        mostrar_usuario_reversion,
+        mostrar_caja_sesion_reversion,
+        mostrar_motivo_reversion,
+        mostrar_detalle_reversion,
+        mostrar_total_reversion
       FROM public.facturacion_config_sucursal
       WHERE id_sucursal = $1
       LIMIT 1
@@ -246,6 +305,7 @@ const validateMergedConfig = (merged) => {
     'mostrar_direccion',
     'mostrar_telefono',
     'mostrar_correo',
+    ...TICKET_FLAG_FIELDS,
     'activo'
   ];
   for (const field of boolFields) {
@@ -288,6 +348,10 @@ const validateMergedConfig = (merged) => {
     mostrar_direccion: normalizeBoolean(merged.mostrar_direccion),
     mostrar_telefono: normalizeBoolean(merged.mostrar_telefono),
     mostrar_correo: normalizeBoolean(merged.mostrar_correo),
+    ...TICKET_FLAG_FIELDS.reduce((acc, field) => ({
+      ...acc,
+      [field]: normalizeBoolean(merged[field])
+    }), {}),
     activo: normalizeBoolean(merged.activo)
   };
 };
@@ -347,11 +411,38 @@ export const crearConfiguracionInicialSiNoExiste = async (idSucursal, db = pool)
           mostrar_rtn,
           mostrar_direccion,
           mostrar_telefono,
-          mostrar_correo
+          mostrar_correo,
+          mostrar_datos_fiscales,
+          mostrar_cai_ticket,
+          mostrar_numero_fiscal_ticket,
+          mostrar_codigo_interno_ticket,
+          aplicar_impuestos,
+          mostrar_impuestos_ticket,
+          mostrar_importe_exento,
+          mostrar_importe_gravado_15,
+          mostrar_isv_15,
+          mostrar_importe_gravado_18,
+          mostrar_isv_18,
+          mostrar_total_isv,
+          mostrar_descuento_linea,
+          mostrar_descuento_porcentaje_linea,
+          mostrar_descuento_total,
+          imprimir_comprobante_reversion,
+          mostrar_venta_original_reversion,
+          mostrar_codigo_reversion,
+          mostrar_usuario_reversion,
+          mostrar_caja_sesion_reversion,
+          mostrar_motivo_reversion,
+          mostrar_detalle_reversion,
+          mostrar_total_reversion
         )
         VALUES (
           $1, 'VTA', 'REV', 5, true, 'INTERNO', true, 80, true,
-          $2, null, $3, $4, $5, null, null, null, 'Gracias por su compra', true, true, true, false
+          $2, null, $3, $4, $5, null, null, null, 'Gracias por su compra', true, true, true, false,
+          true, true, true, true,
+          false, false, false, false, false, false, false, false,
+          true, true, true,
+          true, true, true, true, true, true, true, true
         )
         ON CONFLICT (id_sucursal) DO NOTHING
       `,
@@ -408,6 +499,7 @@ export const actualizarConfiguracionSucursal = async (idSucursal, payload = {}) 
     'mostrar_direccion',
     'mostrar_telefono',
     'mostrar_correo',
+    ...TICKET_FLAG_FIELDS,
     'activo'
   ];
 
@@ -443,9 +535,32 @@ export const actualizarConfiguracionSucursal = async (idSucursal, payload = {}) 
         mostrar_direccion = $18,
         mostrar_telefono = $19,
         mostrar_correo = $20,
-        activo = $21,
+        mostrar_datos_fiscales = $21,
+        mostrar_cai_ticket = $22,
+        mostrar_numero_fiscal_ticket = $23,
+        mostrar_codigo_interno_ticket = $24,
+        aplicar_impuestos = $25,
+        mostrar_impuestos_ticket = $26,
+        mostrar_importe_exento = $27,
+        mostrar_importe_gravado_15 = $28,
+        mostrar_isv_15 = $29,
+        mostrar_importe_gravado_18 = $30,
+        mostrar_isv_18 = $31,
+        mostrar_total_isv = $32,
+        mostrar_descuento_linea = $33,
+        mostrar_descuento_porcentaje_linea = $34,
+        mostrar_descuento_total = $35,
+        imprimir_comprobante_reversion = $36,
+        mostrar_venta_original_reversion = $37,
+        mostrar_codigo_reversion = $38,
+        mostrar_usuario_reversion = $39,
+        mostrar_caja_sesion_reversion = $40,
+        mostrar_motivo_reversion = $41,
+        mostrar_detalle_reversion = $42,
+        mostrar_total_reversion = $43,
+        activo = $44,
         actualizado_en = timezone('America/Tegucigalpa', now())
-      WHERE id_sucursal = $22
+      WHERE id_sucursal = $45
       RETURNING
         id_config,
         id_sucursal,
@@ -469,7 +584,30 @@ export const actualizarConfiguracionSucursal = async (idSucursal, payload = {}) 
         mostrar_rtn,
         mostrar_direccion,
         mostrar_telefono,
-        mostrar_correo
+        mostrar_correo,
+        mostrar_datos_fiscales,
+        mostrar_cai_ticket,
+        mostrar_numero_fiscal_ticket,
+        mostrar_codigo_interno_ticket,
+        aplicar_impuestos,
+        mostrar_impuestos_ticket,
+        mostrar_importe_exento,
+        mostrar_importe_gravado_15,
+        mostrar_isv_15,
+        mostrar_importe_gravado_18,
+        mostrar_isv_18,
+        mostrar_total_isv,
+        mostrar_descuento_linea,
+        mostrar_descuento_porcentaje_linea,
+        mostrar_descuento_total,
+        imprimir_comprobante_reversion,
+        mostrar_venta_original_reversion,
+        mostrar_codigo_reversion,
+        mostrar_usuario_reversion,
+        mostrar_caja_sesion_reversion,
+        mostrar_motivo_reversion,
+        mostrar_detalle_reversion,
+        mostrar_total_reversion
     `,
     [
       validated.nombre_emisor,
@@ -492,6 +630,7 @@ export const actualizarConfiguracionSucursal = async (idSucursal, payload = {}) 
       validated.mostrar_direccion,
       validated.mostrar_telefono,
       validated.mostrar_correo,
+      ...TICKET_FLAG_FIELDS.map((field) => validated[field]),
       validated.activo,
       idSucursalNum
     ]

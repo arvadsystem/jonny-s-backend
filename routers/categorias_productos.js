@@ -6,12 +6,11 @@ const router = express.Router();
 const CATEGORIAS_PRODUCTOS_VIEW_PERMISSIONS = ['INVENTARIO_CATEGORIAS_VER'];
 const CATEGORIAS_PRODUCTOS_CREATE_PERMISSIONS = ['INVENTARIO_CATEGORIAS_CREAR'];
 const CATEGORIAS_PRODUCTOS_EDIT_PERMISSIONS = ['INVENTARIO_CATEGORIAS_EDITAR'];
-const CATEGORIAS_PRODUCTOS_STATE_PERMISSIONS = ['INVENTARIO_CATEGORIAS_ESTADO_CAMBIAR', 'INVENTARIO_CATEGORIAS_ELIMINAR'];
-
-// NEW: mensaje estandar para bloqueo de inactivacion por productos activos asociados.
-// WHY: alinear backend con la regla de negocio y el copy requerido por frontend.
-// IMPACT: solo respuestas 409 de DELETE /categorias_productos; no cambia contratos de entrada.
-const CATEGORY_HAS_ACTIVE_PRODUCTS_MESSAGE = 'NO SE PUEDE INACTIVAR LA CATEGORIA PORQUE TIENE PRODUCTOS ASIGNADOS. REASIGNA O ACTUALIZA ESOS PRODUCTOS Y LUEGO INTENTA DE NUEVO.';
+const CATEGORIAS_PRODUCTOS_STATE_PERMISSIONS = ['INVENTARIO_CATEGORIAS_ESTADO_CAMBIAR'];
+const CATEGORIAS_PRODUCTOS_DELETE_PERMISSIONS = ['INVENTARIO_CATEGORIAS_ELIMINAR'];
+const CATEGORY_ACTIVE_PRODUCTS_BLOCK_CODE = 'CATEGORY_HAS_ACTIVE_PRODUCTS';
+const CATEGORY_ACTIVE_PRODUCTS_BLOCK_MESSAGE = 'No se puede inactivar la categoria porque tiene productos activos asignados.';
+const CATEGORY_ACTIVE_PRODUCTS_PREVIEW_LIMIT = 10;
 
 // NEW: permite incluir inactivos solo bajo solicitud explicita.
 // WHY: GET debe devolver activos por defecto tras cambiar a soft delete.
@@ -57,6 +56,50 @@ const PRODUCT_CATEGORY_CREATE_ALLOWED_FIELDS = new Set(['nombre_categoria', 'cod
 const PRODUCT_CATEGORY_FULL_EDIT_ALLOWED_FIELDS = new Set(['id_categoria_producto', 'nombre_categoria', 'codigo_categoria', 'descripcion', 'estado']);
 const isPlainObject = (value) => Boolean(value) && typeof value === 'object' && !Array.isArray(value);
 const hasOnlyAllowedFields = (payload, allowedSet) => Object.keys(payload).every((key) => allowedSet.has(key));
+
+// AM: resumen reutilizable de productos activos asociados para bloqueo de inactivacion.
+const getCategoriaProductoActiveProductsSummary = async (categoriaId) => {
+  const query = `
+    SELECT
+      p.id_producto,
+      p.nombre_producto,
+      COUNT(*) OVER()::int AS total_count
+    FROM productos p
+    WHERE p.id_categoria_producto = $1
+      AND p.estado = true
+    ORDER BY p.id_producto ASC
+    LIMIT $2
+  `;
+  const result = await pool.query(query, [categoriaId, CATEGORY_ACTIVE_PRODUCTS_PREVIEW_LIMIT]);
+  const rows = Array.isArray(result.rows) ? result.rows : [];
+  const total = Number(rows?.[0]?.total_count ?? 0);
+  const items = rows.map((row) => ({
+    id_producto: Number(row.id_producto),
+    nombre: String(row.nombre_producto ?? '')
+  }));
+  const remaining = Math.max(0, total - items.length);
+  return {
+    entity: 'categoria_producto',
+    blocking_relation: 'productos_activos',
+    total,
+    items,
+    remaining
+  };
+};
+
+// AM: assertion centralizada para bloquear inactivacion de categoria con productos activos.
+const assertCategoriaProductoCanBeDeactivated = async (res, categoriaId) => {
+  const dependency_summary = await getCategoriaProductoActiveProductsSummary(categoriaId);
+  if (dependency_summary.total <= 0) return true;
+
+  res.status(409).json({
+    error: true,
+    code: CATEGORY_ACTIVE_PRODUCTS_BLOCK_CODE,
+    message: CATEGORY_ACTIVE_PRODUCTS_BLOCK_MESSAGE,
+    dependency_summary
+  });
+  return false;
+};
 
 // ------------------------------------------------------------------------------------
 // GET: Obtener categorias_productos
@@ -202,18 +245,8 @@ router.put('/categorias_productos/edicion', checkPermission(CATEGORIAS_PRODUCTOS
     // WHY: mantener consistencia con DELETE y PUT por campo.
     // IMPACT: solo bloquea cuando la edicion intenta dejar `estado=false` y existen dependencias activas.
     if (estadoNormalizado === false) {
-      const productosActivosRes = await pool.query(
-        'SELECT COUNT(1)::int AS total FROM productos WHERE id_categoria_producto = $1 AND estado = true',
-        [categoriaId]
-      );
-      const totalProductosActivos = Number(productosActivosRes.rows?.[0]?.total ?? 0);
-      if (totalProductosActivos > 0) {
-        return res.status(409).json({
-          error: true,
-          code: 'CATEGORY_HAS_ACTIVE_PRODUCTS',
-          message: CATEGORY_HAS_ACTIVE_PRODUCTS_MESSAGE
-        });
-      }
+      const canDeactivate = await assertCategoriaProductoCanBeDeactivated(res, categoriaId);
+      if (!canDeactivate) return;
     }
 
     const updateRes = await pool.query(
@@ -290,18 +323,8 @@ router.put('/categorias_productos', checkPermission(CATEGORIAS_PRODUCTOS_EDIT_PE
         if (!isPositiveIntegerId(categoriaId)) {
           return res.status(400).json({ error: true, message: 'id_valor debe ser un entero mayor a 0.' });
         }
-        const productosActivosRes = await pool.query(
-          'SELECT COUNT(1)::int AS total FROM productos WHERE id_categoria_producto = $1 AND estado = true',
-          [categoriaId]
-        );
-        const totalProductosActivos = Number(productosActivosRes.rows?.[0]?.total ?? 0);
-        if (totalProductosActivos > 0) {
-          return res.status(409).json({
-            error: true,
-            code: 'CATEGORY_HAS_ACTIVE_PRODUCTS',
-            message: CATEGORY_HAS_ACTIVE_PRODUCTS_MESSAGE
-          });
-        }
+        const canDeactivate = await assertCategoriaProductoCanBeDeactivated(res, categoriaId);
+        if (!canDeactivate) return;
       }
     }
 
@@ -325,9 +348,52 @@ router.put('/categorias_productos', checkPermission(CATEGORIAS_PRODUCTOS_EDIT_PE
 });
 
 // ------------------------------------------------------------------------------------
+// PATCH: Cambiar estado categoria_producto (flujo dedicado activar/inactivar)
+// ------------------------------------------------------------------------------------
+router.patch('/categorias_productos/estado', checkPermission(CATEGORIAS_PRODUCTOS_STATE_PERMISSIONS), async (req, res) => {
+  try {
+    const categoriaId = Number(req.body?.id_categoria_producto);
+    if (!isPositiveIntegerId(categoriaId)) {
+      return res.status(400).json({ error: true, message: 'id_categoria_producto debe ser un entero mayor a 0.' });
+    }
+
+    const normalizedEstado = normalizeBooleanInput(req.body?.estado);
+    if (normalizedEstado === null) {
+      return res.status(400).json({ error: true, message: 'estado invalido.' });
+    }
+
+    const categoriaRes = await pool.query(
+      'SELECT 1 FROM categorias_productos WHERE id_categoria_producto = $1 LIMIT 1',
+      [categoriaId]
+    );
+    if (categoriaRes.rowCount === 0) {
+      return res.status(404).json({ error: true, message: 'CategorÃ­a no encontrada.' });
+    }
+
+    if (normalizedEstado === false) {
+      const canDeactivate = await assertCategoriaProductoCanBeDeactivated(res, categoriaId);
+      if (!canDeactivate) return;
+    }
+
+    await pool.query(
+      'UPDATE categorias_productos SET estado = $1 WHERE id_categoria_producto = $2',
+      [normalizedEstado, categoriaId]
+    );
+
+    return res.status(200).json({
+      error: false,
+      message: normalizedEstado ? 'CategorÃ­a activada.' : 'CategorÃ­a inactivada.'
+    });
+  } catch (err) {
+    console.error('Error al actualizar estado de categoria_producto:', err.message);
+    return res.status(500).json({ error: true, message: safeServerErrorMessage() });
+  }
+});
+
+// ------------------------------------------------------------------------------------
 // DELETE: Inactivar categoria_producto (soft delete)
 // ------------------------------------------------------------------------------------
-router.delete('/categorias_productos', checkPermission(CATEGORIAS_PRODUCTOS_STATE_PERMISSIONS), async (req, res) => {
+router.delete('/categorias_productos', checkPermission(CATEGORIAS_PRODUCTOS_DELETE_PERMISSIONS), async (req, res) => {
   try {
     const { columna_id, valor_id } = req.body || {};
 
@@ -364,18 +430,8 @@ router.delete('/categorias_productos', checkPermission(CATEGORIAS_PRODUCTOS_STAT
     // NEW: regla de negocio para bloquear inactivación si hay productos activos asociados.
     // WHY: prevenir inconsistencias operativas y cumplir el requisito funcional.
     // IMPACT: responde 409 con código/mensaje estándar; frontend puede manejarlo de forma explícita.
-    const productosActivosRes = await pool.query(
-      'SELECT COUNT(*)::int AS total FROM productos WHERE id_categoria_producto = $1 AND estado = true',
-      [categoriaId]
-    );
-    const totalProductosActivos = Number(productosActivosRes.rows?.[0]?.total ?? 0);
-    if (totalProductosActivos > 0) {
-      return res.status(409).json({
-        error: true,
-        code: 'CATEGORY_HAS_ACTIVE_PRODUCTS',
-        message: CATEGORY_HAS_ACTIVE_PRODUCTS_MESSAGE
-      });
-    }
+    const canDeactivate = await assertCategoriaProductoCanBeDeactivated(res, categoriaId);
+    if (!canDeactivate) return;
 
     const tabla = 'categorias_productos';
     const query = 'CALL pa_update($1, $2, $3, $4, $5)';

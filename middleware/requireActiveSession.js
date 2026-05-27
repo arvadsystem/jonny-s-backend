@@ -7,6 +7,12 @@
 import pool from '../config/db-connection.js';
 
 const HN_NOW_SQL = "timezone('America/Tegucigalpa', now())";
+const INACTIVITY_EXCLUDED_ROLE_CODES = Object.freeze([
+  'COCINA',
+  'MESERO',
+  'AUXILIAR_COCINA',
+  'P_COCINA'
+]);
 
 const parseInactivityMinutes = () => {
   const raw = Number.parseInt(String(process.env.SESSION_INACTIVITY_MINUTES ?? ''), 10);
@@ -40,6 +46,14 @@ export async function requireActiveSession(req, res, next) {
       SELECT
         activa,
         (
+          NOT EXISTS (
+            SELECT 1
+            FROM roles_usuarios ru
+            INNER JOIN roles r ON r.id_rol = ru.id_rol
+            WHERE ru.id_usuario = $2
+              AND UPPER(REGEXP_REPLACE(TRIM(r.nombre), '[\\s-]+', '_', 'g')) = ANY($4::text[])
+          )
+          AND
           ultima_actividad <= (${HN_NOW_SQL} - make_interval(mins => $3))
         ) AS expirada_por_inactividad
       FROM sesiones_activas
@@ -48,7 +62,12 @@ export async function requireActiveSession(req, res, next) {
       LIMIT 1
     `;
 
-    const result = await pool.query(sql, [user.sid, user.id_usuario, SESSION_INACTIVITY_MINUTES]);
+    const result = await pool.query(sql, [
+      user.sid,
+      user.id_usuario,
+      SESSION_INACTIVITY_MINUTES,
+      INACTIVITY_EXCLUDED_ROLE_CODES
+    ]);
 
     if (result.rows.length === 0) {
       // Sesion no existe -> limpiar cookies y bloquear.

@@ -90,6 +90,10 @@ const resolveOpenCajaSession = async ({ client, idSucursal, idUsuario }) => {
     `
       SELECT cs.id_sesion_caja, cs.id_caja
       FROM public.cajas_sesiones cs
+      INNER JOIN public.cajas c
+        ON c.id_caja = cs.id_caja
+       AND c.id_sucursal = cs.id_sucursal
+       AND COALESCE(c.estado, true) = true
       INNER JOIN public.cat_cajas_sesiones_estados cse
         ON cse.id_estado_sesion_caja = cs.id_estado_sesion_caja
       INNER JOIN public.cajas_sesiones_participantes csp
@@ -109,6 +113,159 @@ const resolveOpenCajaSession = async ({ client, idSucursal, idUsuario }) => {
   }
 
   return result.rows[0];
+};
+
+const assertOriginalCajaSessionOpen = async ({ client, factura }) => {
+  const idSesionCaja = parsePositiveInt(factura?.id_sesion_caja);
+  const idSucursal = parsePositiveInt(factura?.id_sucursal);
+
+  if (!idSesionCaja || !idSucursal) {
+    throw createReversionError(
+      409,
+      'VENTA_SIN_SESION_CAJA_VALIDA',
+      'La venta no tiene una sesión de caja válida para reversión.'
+    );
+  }
+
+  const result = await client.query(
+    `
+      SELECT
+        cs.id_sesion_caja,
+        cs.id_caja,
+        cs.id_sucursal,
+        cs.fecha_cierre,
+        UPPER(TRIM(cse.codigo)) AS estado_codigo,
+        COALESCE(c.estado, true) AS caja_activa
+      FROM public.cajas_sesiones cs
+      LEFT JOIN public.cat_cajas_sesiones_estados cse
+        ON cse.id_estado_sesion_caja = cs.id_estado_sesion_caja
+      LEFT JOIN public.cajas c
+        ON c.id_caja = cs.id_caja
+       AND c.id_sucursal = cs.id_sucursal
+      WHERE cs.id_sesion_caja = $1
+        AND cs.id_sucursal = $2
+      LIMIT 1
+    `,
+    [idSesionCaja, idSucursal]
+  );
+
+  if (!result.rowCount) {
+    throw createReversionError(
+      409,
+      'VENTA_SIN_SESION_CAJA_VALIDA',
+      'La venta no tiene una sesión de caja válida para reversión.'
+    );
+  }
+
+  const session = result.rows[0];
+  const facturaCajaId = parsePositiveInt(factura?.id_caja);
+  if (facturaCajaId && Number(session.id_caja) !== Number(facturaCajaId)) {
+    throw createReversionError(
+      409,
+      'VENTA_SIN_SESION_CAJA_VALIDA',
+      'La venta no tiene una sesión de caja válida para reversión.'
+    );
+  }
+
+  if (!Boolean(session.caja_activa)) {
+    throw createReversionError(
+      409,
+      'VENTA_SIN_SESION_CAJA_VALIDA',
+      'La venta no tiene una sesión de caja válida para reversión.'
+    );
+  }
+
+  if (session.estado_codigo !== 'ABIERTA' || session.fecha_cierre) {
+    throw createReversionError(
+      409,
+      'CAJA_CERRADA_REVERSA_NO_PERMITIDA',
+      'No se puede reversar porque la caja de esta venta ya fue cerrada.'
+    );
+  }
+
+  return session;
+};
+
+const assertSucursalOpenForReversion = async ({ client, idSucursal }) => {
+  const idSucursalTarget = parsePositiveInt(idSucursal);
+  if (!idSucursalTarget) {
+    throw createReversionError(
+      409,
+      'SUCURSAL_CERRADA_REVERSA_NO_PERMITIDA',
+      'No se puede reversar porque la sucursal ya está fuera de horario operativo.'
+    );
+  }
+
+  const result = await client.query(
+    `
+      WITH clock AS (
+        SELECT
+          (NOW() AT TIME ZONE 'America/Tegucigalpa')::date AS fecha_actual,
+          (NOW() AT TIME ZONE 'America/Tegucigalpa')::time AS hora_actual,
+          EXTRACT(ISODOW FROM (NOW() AT TIME ZONE 'America/Tegucigalpa'))::int AS dia_semana
+      ),
+      branch AS (
+        SELECT id_sucursal, estado, hora_inicio, hora_final
+        FROM public.sucursales
+        WHERE id_sucursal = $1
+        LIMIT 1
+      )
+      SELECT
+        b.id_sucursal,
+        CASE
+          WHEN b.id_sucursal IS NULL THEN false
+          WHEN COALESCE(b.estado, true) = false THEN false
+          WHEN fe.id_fecha_especial IS NOT NULL THEN
+            CASE
+              WHEN COALESCE(fe.cerrado, false) = true THEN false
+              WHEN fe.hora_inicio IS NULL OR fe.hora_final IS NULL THEN false
+              WHEN fe.hora_final > fe.hora_inicio THEN clock.hora_actual >= fe.hora_inicio AND clock.hora_actual < fe.hora_final
+              ELSE clock.hora_actual >= fe.hora_inicio OR clock.hora_actual < fe.hora_final
+            END
+          WHEN sh.id_horario IS NOT NULL THEN
+            CASE
+              WHEN COALESCE(sh.cerrado, false) = true THEN false
+              WHEN sh.hora_inicio IS NULL OR sh.hora_final IS NULL THEN false
+              WHEN sh.hora_final > sh.hora_inicio THEN clock.hora_actual >= sh.hora_inicio AND clock.hora_actual < sh.hora_final
+              ELSE clock.hora_actual >= sh.hora_inicio OR clock.hora_actual < sh.hora_final
+            END
+          WHEN b.hora_inicio IS NOT NULL AND b.hora_final IS NOT NULL THEN
+            CASE
+              WHEN b.hora_final > b.hora_inicio THEN clock.hora_actual >= b.hora_inicio AND clock.hora_actual < b.hora_final
+              ELSE clock.hora_actual >= b.hora_inicio OR clock.hora_actual < b.hora_final
+            END
+          ELSE true
+        END AS abierta
+      FROM clock
+      LEFT JOIN branch b ON true
+      LEFT JOIN LATERAL (
+        SELECT id_fecha_especial, cerrado, hora_inicio, hora_final
+        FROM public.sucursales_fechas_especiales
+        WHERE id_sucursal = b.id_sucursal
+          AND fecha = clock.fecha_actual
+          AND COALESCE(estado, true) = true
+        ORDER BY id_fecha_especial DESC
+        LIMIT 1
+      ) fe ON b.id_sucursal IS NOT NULL
+      LEFT JOIN LATERAL (
+        SELECT id_horario, cerrado, hora_inicio, hora_final
+        FROM public.sucursales_horarios
+        WHERE id_sucursal = b.id_sucursal
+          AND dia_semana = clock.dia_semana
+          AND COALESCE(estado, true) = true
+        LIMIT 1
+      ) sh ON b.id_sucursal IS NOT NULL
+    `,
+    [idSucursalTarget]
+  );
+
+  if (!Boolean(result.rows?.[0]?.abierta)) {
+    throw createReversionError(
+      409,
+      'SUCURSAL_CERRADA_REVERSA_NO_PERMITIDA',
+      'No se puede reversar porque la sucursal ya está fuera de horario operativo.'
+    );
+  }
 };
 
 const resolveReversionCajaMovementType = async (client) => {
@@ -656,9 +813,50 @@ export const listFacturaReversiones = async ({ idFactura, idUsuario }) => {
           fr.id_sesion_caja_original,
           fr.id_caja_actual,
           fr.id_sesion_caja_actual,
-          u.nombre_usuario AS usuario
+          u.nombre_usuario AS usuario,
+          COALESCE(lineas_info.lineas, '[]'::json) AS lineas
         FROM public.facturas_reversiones fr
         LEFT JOIN public.usuarios u ON u.id_usuario = fr.creada_por
+        LEFT JOIN LATERAL (
+          SELECT JSON_AGG(
+            JSON_BUILD_OBJECT(
+              'id_detalle_factura', rd.id_detalle_factura,
+              'tipo_item', rd.tipo_item,
+              'id_producto', rd.id_producto,
+              'id_receta', rd.id_receta,
+              'id_combo', rd.id_combo,
+              'nombre_item', COALESCE(
+                dfo.origen_snapshot->>'nombre_item',
+                df.origen_snapshot->>'nombre_item',
+                prod.nombre_producto,
+                rec.nombre_receta,
+                combo.descripcion,
+                'Item'
+              ),
+              'cantidad_revertida', rd.cantidad_revertida,
+              'precio_unitario_original', rd.precio_unitario_original,
+              'subtotal_revertido', rd.subtotal_revertido,
+              'descuento_revertido', rd.descuento_revertido,
+              'isv_15_revertido', rd.isv_15_revertido,
+              'isv_18_revertido', rd.isv_18_revertido,
+              'total_revertido', rd.total_revertido,
+              'devuelve_inventario', rd.devuelve_inventario
+            )
+            ORDER BY rd.id_reversion_detalle
+          ) AS lineas
+          FROM public.facturas_reversiones_detalle rd
+          LEFT JOIN public.detalle_facturas df
+            ON df.id_detalle_factura = rd.id_detalle_factura
+          LEFT JOIN public.detalle_facturas_origen dfo
+            ON dfo.id_detalle_factura = rd.id_detalle_factura
+          LEFT JOIN public.productos prod
+            ON prod.id_producto = COALESCE(rd.id_producto, dfo.id_producto, df.id_producto)
+          LEFT JOIN public.recetas rec
+            ON rec.id_receta = COALESCE(rd.id_receta, dfo.id_receta, df.id_receta::int)
+          LEFT JOIN public.combos combo
+            ON combo.id_combo = COALESCE(rd.id_combo, dfo.id_combo, df.id_combo::int)
+          WHERE rd.id_reversion = fr.id_reversion
+        ) lineas_info ON true
         WHERE fr.id_factura_original = $1
         ORDER BY fr.id_reversion DESC
       `,
@@ -733,6 +931,9 @@ export const createVentaReversion = async ({ idFactura, body, req, idUsuario }) 
     if (!scope.isSuperAdmin && scope.allowedSucursalIds.length > 0 && !scope.allowedSucursalIds.includes(idSucursal)) {
       throw createReversionError(403, 'VENTAS_REVERSION_SCOPE_FORBIDDEN', 'No puedes reversar una venta de otra sucursal.');
     }
+
+    await assertOriginalCajaSessionOpen({ client, factura });
+    await assertSucursalOpenForReversion({ client, idSucursal });
 
     const ageResult = await client.query(
       `SELECT CASE WHEN $1::timestamp >= (${REVERSAL_WINDOW_SQL}) THEN true ELSE false END AS in_window`,

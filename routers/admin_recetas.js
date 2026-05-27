@@ -1,6 +1,16 @@
 import express from 'express';
+import crypto from 'crypto';
 import pool from '../config/db-connection.js';
 import { checkPermission } from '../middleware/checkPermission.js';
+import { supabase } from '../services/supabaseClient.js';
+import {
+  ALLOWED_MIME_TYPES_BY_BUCKET,
+  MAX_FILE_BYTES_BY_BUCKET,
+  MAX_IMAGE_BYTES,
+  SUPABASE_ASSETS_BUCKET,
+  buildAbsolutePublicUrl,
+  detectFileMimeTypeFromBuffer
+} from '../utils/uploads.js';
 import {
   actualizarCampoReceta,
   esEnteroPositivo,
@@ -20,6 +30,8 @@ import {
 const router = express.Router();
 const MENU_VIEW_PERMISSIONS = ['MENU_VER'];
 const MENU_MUTATION_PERMISSIONS = ['MENU_VER'];
+const MENU_RECETAS_UPLOADS_SUBDIR = 'menu/recetas';
+const BASE64_BODY_REGEX = /^[A-Za-z0-9+/]+={0,2}$/;
 
 // Seguridad: el actor se resuelve siempre desde el token autenticado.
 const resolveActorUserId = (req) => {
@@ -38,57 +50,147 @@ const toSafeFileBaseName = (value) => {
   return sanitized || 'receta';
 };
 
-const getDriveFileIdFromUrl = (rawUrl) => {
-  const safeUrl = String(rawUrl || '').trim();
-  if (!safeUrl) return '';
+const ensureSupabaseAssetsBucket = async () => {
+  const { data: existingBucket, error: getBucketError } = await supabase.storage.getBucket(SUPABASE_ASSETS_BUCKET);
+  if (existingBucket && !getBucketError) return;
 
-  try {
-    const parsed = new URL(safeUrl);
-    const host = String(parsed.hostname || '').toLowerCase();
-    const isDrive =
-      host.includes('drive.google.com') ||
-      host.includes('drive.usercontent.google.com') ||
-      host.includes('lh3.googleusercontent.com');
+  const notFound =
+    getBucketError &&
+    (Number(getBucketError?.statusCode || getBucketError?.status || 0) === 404 ||
+      /not\s*found|does\s*not\s*exist/i.test(String(getBucketError?.message || '')));
 
-    if (!isDrive) return '';
+  if (getBucketError && !notFound) {
+    throw new Error('No se pudo verificar el bucket de imagenes.');
+  }
 
-    const path = String(parsed.pathname || '');
-    const fromPath =
-      path.match(/\/file\/d\/([^/?#]+)/i)?.[1] ||
-      path.match(/\/d\/([^/?#]+)/i)?.[1] ||
-      '';
-    const fromQuery = String(parsed.searchParams.get('id') || '').trim();
-    return String(fromPath || fromQuery).trim();
-  } catch {
-    return '';
+  const { error: createBucketError } = await supabase.storage.createBucket(SUPABASE_ASSETS_BUCKET, {
+    public: true,
+    fileSizeLimit: MAX_FILE_BYTES_BY_BUCKET[SUPABASE_ASSETS_BUCKET],
+    allowedMimeTypes: Object.keys(ALLOWED_MIME_TYPES_BY_BUCKET[SUPABASE_ASSETS_BUCKET] || {})
+  });
+  if (createBucketError && !/already\s*exists|duplicate/i.test(String(createBucketError?.message || ''))) {
+    throw new Error('No se pudo crear el bucket de imagenes.');
   }
 };
 
-const getDriveResourceKeyFromUrl = (rawUrl) => {
-  const safeUrl = String(rawUrl || '').trim();
-  if (!safeUrl) return '';
+const parseRecipeImagePayload = (payload) => {
+  const rawDataUrl =
+    payload?.imagen_data_url ??
+    payload?.imagenDataUrl ??
+    payload?.data_url ??
+    payload?.dataUrl ??
+    null;
+  const rawBase64 = payload?.imagen_base64 ?? payload?.imagenBase64 ?? payload?.base64 ?? null;
+  const rawMime = payload?.mime_type ?? payload?.mimeType ?? payload?.tipo_archivo ?? null;
+  const rawOriginalName = payload?.nombre_original ?? payload?.nombreOriginal ?? null;
 
-  try {
-    const parsed = new URL(safeUrl);
-    return String(parsed.searchParams.get('resourcekey') || '').trim();
-  } catch {
-    return '';
+  const dataUrl = typeof rawDataUrl === 'string' ? rawDataUrl.trim() : '';
+  if (dataUrl) {
+    const match = dataUrl.match(/^data:(image\/(?:png|jpe?g|webp));base64,([A-Za-z0-9+/=]+)$/i);
+    if (!match) {
+      return { ok: false, status: 400, message: 'La imagen debe enviarse en formato data URL base64 valido.' };
+    }
+    return {
+      ok: true,
+      hasImage: true,
+      mimeType: String(match[1] || '').trim().toLowerCase(),
+      base64Body: String(match[2] || '').trim(),
+      nombreOriginal: String(rawOriginalName || '').trim()
+    };
   }
+
+  const base64Body = typeof rawBase64 === 'string' ? rawBase64.trim() : '';
+  if (!base64Body) {
+    return { ok: true, hasImage: false, mimeType: '', base64Body: '', nombreOriginal: '' };
+  }
+
+  return {
+    ok: true,
+    hasImage: true,
+    mimeType: String(rawMime || '').trim().toLowerCase(),
+    base64Body,
+    nombreOriginal: String(rawOriginalName || '').trim()
+  };
 };
 
-const normalizeDriveImageUrl = (rawUrl) => {
-  const safeUrl = String(rawUrl || '').trim();
-  if (!safeUrl) return safeUrl;
+const decodeRecipeImageBase64 = (base64Body, maxBytes = MAX_IMAGE_BYTES) => {
+  const normalized = String(base64Body || '').replace(/\s+/g, '');
+  if (!normalized || normalized.length % 4 !== 0 || !BASE64_BODY_REGEX.test(normalized)) {
+    return { ok: false, status: 400, message: 'El contenido base64 de la imagen no es valido.' };
+  }
 
-  const fileId = getDriveFileIdFromUrl(safeUrl);
-  if (!fileId) return safeUrl;
+  const buffer = Buffer.from(normalized, 'base64');
+  if (!Buffer.isBuffer(buffer) || buffer.length === 0) {
+    return { ok: false, status: 400, message: 'La imagen enviada no contiene datos validos.' };
+  }
+  if (buffer.length > maxBytes) {
+    return { ok: false, status: 400, message: 'La imagen supera el limite permitido de 5 MB.' };
+  }
+  return { ok: true, buffer };
+};
 
-  const resourceKey = getDriveResourceKeyFromUrl(safeUrl);
-  const resourceKeySuffix = resourceKey
-    ? `&resourcekey=${encodeURIComponent(resourceKey)}`
-    : '';
+const uploadRecipeImageAndRegisterArchivo = async ({ req, imagePayload, nombreReceta, idUsuario, client }) => {
+  const allowedMimes = ALLOWED_MIME_TYPES_BY_BUCKET[SUPABASE_ASSETS_BUCKET] || {};
+  const decoded = decodeRecipeImageBase64(
+    imagePayload.base64Body,
+    MAX_FILE_BYTES_BY_BUCKET[SUPABASE_ASSETS_BUCKET] || MAX_IMAGE_BYTES
+  );
+  if (!decoded.ok) {
+    return decoded;
+  }
 
-  return `https://drive.google.com/thumbnail?id=${encodeURIComponent(fileId)}&sz=w1200${resourceKeySuffix}`;
+  const detectedMime = detectFileMimeTypeFromBuffer(decoded.buffer);
+  const effectiveMime = (detectedMime || imagePayload.mimeType || '').toLowerCase();
+  if (!effectiveMime || !Object.prototype.hasOwnProperty.call(allowedMimes, effectiveMime)) {
+    return { ok: false, status: 400, message: 'Solo se permiten imagenes JPG, PNG o WEBP.' };
+  }
+
+  await ensureSupabaseAssetsBucket();
+
+  const extension = allowedMimes[effectiveMime];
+  const safeOriginalName = toSafeFileBaseName(imagePayload.nombreOriginal || nombreReceta || 'receta');
+  const uniqueFileName = `${safeOriginalName}-${Date.now()}-${crypto.randomUUID().slice(0, 8)}.${extension}`;
+  const storagePath = `${MENU_RECETAS_UPLOADS_SUBDIR}/${uniqueFileName}`;
+
+  const { error: uploadError } = await supabase.storage
+    .from(SUPABASE_ASSETS_BUCKET)
+    .upload(storagePath, decoded.buffer, {
+      contentType: effectiveMime,
+      cacheControl: '3600',
+      upsert: false
+    });
+  if (uploadError) {
+    return { ok: false, status: 500, message: 'No se pudo subir la imagen de la receta.' };
+  }
+
+  const dbPath = `${SUPABASE_ASSETS_BUCKET}/${storagePath}`;
+  const insertResult = await client.query(
+    `
+      INSERT INTO archivos (
+        nombre_original,
+        url_publica,
+        tipo_archivo,
+        tamano_bytes,
+        estado,
+        id_usuario
+      ) VALUES ($1, $2, $3, $4, true, $5)
+      RETURNING id_archivo
+    `,
+    [safeOriginalName, dbPath, effectiveMime, decoded.buffer.length, idUsuario]
+  );
+
+  const idArchivo = Number(insertResult.rows?.[0]?.id_archivo || 0);
+  if (!esEnteroPositivo(idArchivo)) {
+    await supabase.storage.from(SUPABASE_ASSETS_BUCKET).remove([storagePath]).catch(() => null);
+    return { ok: false, status: 500, message: 'No se pudo registrar la imagen de la receta.' };
+  }
+
+  return {
+    ok: true,
+    idArchivo,
+    storagePath: dbPath,
+    urlPublica: buildAbsolutePublicUrl(req, dbPath)
+  };
 };
 
 const parsePositiveNumber = (value) => {
@@ -198,31 +300,6 @@ const reemplazarDetalleReceta = async (client, idReceta, detalle) => {
   }
 };
 
-const registrarArchivoDesdeUrlPublica = async ({ nombreReceta, urlPublica, idUsuario }) => {
-  const insertResult = await pool.query(
-    `
-      INSERT INTO archivos (
-        nombre_original,
-        url_publica,
-        tipo_archivo,
-        tamano_bytes,
-        estado,
-        id_usuario
-      ) VALUES ($1, $2, $3, $4, true, $5)
-      RETURNING id_archivo
-    `,
-    [
-      `${toSafeFileBaseName(nombreReceta)}-url`,
-      normalizeDriveImageUrl(urlPublica),
-      'image/url',
-      null,
-      idUsuario
-    ]
-  );
-
-  return Number(insertResult.rows?.[0]?.id_archivo || 0);
-};
-
 // GET: listar recetas.
 router.get('/', checkPermission(MENU_VIEW_PERMISSIONS), async (req, res) => {
   try {
@@ -257,7 +334,10 @@ router.get('/', checkPermission(MENU_VIEW_PERMISSIONS), async (req, res) => {
         ORDER BY r.id_receta DESC
       `
     );
-    const baseDatos = result.rows || [];
+    const baseDatos = (result.rows || []).map((row) => ({
+      ...row,
+      url_imagen_publica: buildAbsolutePublicUrl(req, row?.url_imagen_publica || null)
+    }));
     const datos = shouldIncludeInactive(req.query) ? baseDatos : baseDatos.filter(isRowActive);
 
     return res.status(200).json(datos);
@@ -339,6 +419,78 @@ router.get('/:id_receta/detalle', checkPermission(MENU_VIEW_PERMISSIONS), async 
   }
 });
 
+// GET: contexto completo de edicion para reducir roundtrips del modal (receta + detalle + catalogo insumos).
+router.get('/:id_receta/contexto-edicion', checkPermission(MENU_VIEW_PERMISSIONS), async (req, res) => {
+  try {
+    const idReceta = Number(req.params.id_receta);
+    if (!esEnteroPositivo(idReceta)) {
+      return res.status(400).json({ error: true, message: 'id_receta invalido.' });
+    }
+
+    const receta = await obtenerRecetaPorId(idReceta);
+    if (!receta) {
+      return res.status(404).json({ error: true, message: 'Receta no encontrada.' });
+    }
+
+    const [detalleResult, insumosCatalogResult] = await Promise.all([
+      pool.query(
+        `
+          SELECT
+            dr.id_detalle,
+            dr.id_receta,
+            dr.id_insumo,
+            i.nombre_insumo,
+            dr.cant,
+            dr.id_unidad_medida,
+            um.nombre AS unidad_nombre,
+            um.simbolo AS unidad_simbolo,
+            dr.estado
+          FROM detalle_recetas dr
+          INNER JOIN insumos i
+            ON i.id_insumo = dr.id_insumo
+          LEFT JOIN unidades_medida um
+            ON um.id_unidad_medida = dr.id_unidad_medida
+          WHERE dr.id_receta = $1
+            AND COALESCE(dr.estado, true) = true
+          ORDER BY i.nombre_insumo ASC, dr.id_detalle ASC
+        `,
+        [idReceta]
+      ),
+      pool.query(
+        `
+          SELECT
+            i.id_insumo,
+            i.nombre_insumo,
+            i.id_unidad_medida,
+            um.nombre AS unidad_nombre,
+            um.simbolo AS unidad_simbolo,
+            i.cantidad,
+            i.stock_minimo
+          FROM insumos i
+          LEFT JOIN unidades_medida um
+            ON um.id_unidad_medida = i.id_unidad_medida
+          WHERE COALESCE(i.estado, true) = true
+          ORDER BY i.nombre_insumo ASC, i.id_insumo ASC
+        `
+      )
+    ]);
+
+    return res.status(200).json({
+      receta: {
+        ...receta,
+        url_imagen_publica: buildAbsolutePublicUrl(req, receta?.url_imagen_publica || null)
+      },
+      detalle_receta: detalleResult.rows || [],
+      catalogos: {
+        insumos: insumosCatalogResult.rows || []
+      }
+    });
+  } catch (err) {
+    console.error('Error al obtener contexto de edicion de receta admin:', err.message);
+    return res.status(500).json({ error: true, message: getSafeServerErrorMessage(err) });
+  }
+});
+
 // PUT: reemplazar detalle de insumos de una receta.
 router.put('/:id_receta/detalle', checkPermission(MENU_MUTATION_PERMISSIONS), async (req, res) => {
   const client = await pool.connect();
@@ -399,7 +551,10 @@ router.get('/:id_receta', checkPermission(MENU_VIEW_PERMISSIONS), async (req, re
       return res.status(404).json({ error: true, message: 'Receta no encontrada.' });
     }
 
-    return res.status(200).json(receta);
+    return res.status(200).json({
+      ...receta,
+      url_imagen_publica: buildAbsolutePublicUrl(req, receta?.url_imagen_publica || null)
+    });
   } catch (err) {
     console.error('Error al obtener receta por id admin:', err.message);
     return res.status(500).json({ error: true, message: getSafeServerErrorMessage(err) });
@@ -427,9 +582,26 @@ router.post('/', checkPermission(MENU_MUTATION_PERMISSIONS), async (req, res) =>
     }
 
     // Transicion segura: id_usuario del cliente se ignora y se fuerza desde req.user.
+    const imagePayload = parseRecipeImagePayload(req.body || {});
+    if (!imagePayload.ok) {
+      return res.status(imagePayload.status).json({ error: true, message: imagePayload.message });
+    }
+
     const payloadConActor = { ...(req.body || {}), id_usuario: actorUserId };
     delete payloadConActor.detalle_receta;
     delete payloadConActor.detalle;
+    delete payloadConActor.imagen_data_url;
+    delete payloadConActor.imagenDataUrl;
+    delete payloadConActor.imagen_base64;
+    delete payloadConActor.imagenBase64;
+    delete payloadConActor.data_url;
+    delete payloadConActor.dataUrl;
+    delete payloadConActor.base64;
+    delete payloadConActor.mime_type;
+    delete payloadConActor.mimeType;
+    delete payloadConActor.tipo_archivo;
+    delete payloadConActor.nombre_original;
+    delete payloadConActor.nombreOriginal;
 
     const payloadValidation = validarEstructuraPayloadReceta(payloadConActor);
     if (!payloadValidation.ok) {
@@ -445,17 +617,23 @@ router.post('/', checkPermission(MENU_MUTATION_PERMISSIONS), async (req, res) =>
 
     const urlImagenPublica = String(datosNormalizados.url_imagen_publica || '').trim();
     if (urlImagenPublica) {
-      const idArchivoGenerado = await registrarArchivoDesdeUrlPublica({
-        nombreReceta: datosNormalizados.nombre_receta,
-        urlPublica: urlImagenPublica,
-        idUsuario: actorUserId
+      return res.status(400).json({
+        error: true,
+        message: 'url_imagen_publica ya no se acepta para nuevas imagenes. Envia imagen_data_url o base64.'
       });
-
-      if (!esEnteroPositivo(idArchivoGenerado)) {
-        return res.status(500).json({ error: true, message: 'No se pudo registrar la imagen en archivos.' });
+    }
+    if (imagePayload.hasImage) {
+      const uploadResult = await uploadRecipeImageAndRegisterArchivo({
+        req,
+        imagePayload,
+        nombreReceta: datosNormalizados.nombre_receta,
+        idUsuario: actorUserId,
+        client
+      });
+      if (!uploadResult.ok) {
+        return res.status(uploadResult.status).json({ error: true, message: uploadResult.message });
       }
-
-      datosNormalizados.id_archivo = idArchivoGenerado;
+      datosNormalizados.id_archivo = uploadResult.idArchivo;
     }
     delete datosNormalizados.url_imagen_publica;
 
@@ -576,9 +754,26 @@ router.put('/:id_receta', checkPermission(MENU_MUTATION_PERMISSIONS), async (req
     }
 
     // Transicion segura: id_usuario del cliente se ignora y se fuerza desde req.user.
+    const imagePayload = parseRecipeImagePayload(req.body || {});
+    if (!imagePayload.ok) {
+      return res.status(imagePayload.status).json({ error: true, message: imagePayload.message });
+    }
+
     const payloadConActor = { ...(req.body || {}), id_usuario: actorUserId };
     delete payloadConActor.detalle_receta;
     delete payloadConActor.detalle;
+    delete payloadConActor.imagen_data_url;
+    delete payloadConActor.imagenDataUrl;
+    delete payloadConActor.imagen_base64;
+    delete payloadConActor.imagenBase64;
+    delete payloadConActor.data_url;
+    delete payloadConActor.dataUrl;
+    delete payloadConActor.base64;
+    delete payloadConActor.mime_type;
+    delete payloadConActor.mimeType;
+    delete payloadConActor.tipo_archivo;
+    delete payloadConActor.nombre_original;
+    delete payloadConActor.nombreOriginal;
 
     const payloadValidation = validarEstructuraPayloadReceta(payloadConActor);
     if (!payloadValidation.ok) {
@@ -594,17 +789,23 @@ router.put('/:id_receta', checkPermission(MENU_MUTATION_PERMISSIONS), async (req
 
     const urlImagenPublica = String(datosNormalizados.url_imagen_publica || '').trim();
     if (urlImagenPublica) {
-      const idArchivoGenerado = await registrarArchivoDesdeUrlPublica({
-        nombreReceta: datosNormalizados.nombre_receta,
-        urlPublica: urlImagenPublica,
-        idUsuario: actorUserId
+      return res.status(400).json({
+        error: true,
+        message: 'url_imagen_publica ya no se acepta para nuevas imagenes. Envia imagen_data_url o base64.'
       });
-
-      if (!esEnteroPositivo(idArchivoGenerado)) {
-        return res.status(500).json({ error: true, message: 'No se pudo registrar la imagen en archivos.' });
+    }
+    if (imagePayload.hasImage) {
+      const uploadResult = await uploadRecipeImageAndRegisterArchivo({
+        req,
+        imagePayload,
+        nombreReceta: datosNormalizados.nombre_receta,
+        idUsuario: actorUserId,
+        client
+      });
+      if (!uploadResult.ok) {
+        return res.status(uploadResult.status).json({ error: true, message: uploadResult.message });
       }
-
-      datosNormalizados.id_archivo = idArchivoGenerado;
+      datosNormalizados.id_archivo = uploadResult.idArchivo;
     }
     delete datosNormalizados.url_imagen_publica;
 

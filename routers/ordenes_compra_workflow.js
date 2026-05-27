@@ -25,9 +25,7 @@ const PERM_OC_VIEW_EVIDENCIAS = [
   'INVENTARIO_ORDENES_COMPRA_VER_TODAS'
 ];
 const PERM_OC_VIEW_ALL = [
-  'INVENTARIO_OC_VER_FLUJO',
-  'INVENTARIO_OC_VER_DETALLE',
-  'INVENTARIO_OC_VER_HISTORIAL',
+  // AM: VIEW_ALL significa alcance global real; lectura basica no debe escalar sucursal.
   'INVENTARIO_ORDENES_COMPRA_VER_TODAS'
 ];
 const PERM_OC_EDIT_REQUEST = ['INVENTARIO_OC_EDITAR_SOLICITUD', 'INVENTARIO_ORDENES_COMPRA_GESTIONAR'];
@@ -98,12 +96,23 @@ const MAX_LIMIT = 100;
 const DEFAULT_LIMIT = 20;
 const MAX_TEXT_LEN = 1000;
 const MAX_SHORT_TEXT_LEN = 250;
+const MAX_PROVIDER_SUGGESTION_ITEMS = 100;
 const OC_EVIDENCE_SIGNED_URL_TTL_SECONDS = 900;
 // AM: lock transaccional para asignar correlativo visible de OC sin carreras concurrentes.
 const OC_VISIBLE_NUMBER_LOCK_KEY = 830051;
 const DISCOUNT_MODE_MONTO = 'MONTO';
 const DISCOUNT_MODE_PORCENTAJE = 'PORCENTAJE';
 const DISCOUNT_MODES = new Set([DISCOUNT_MODE_MONTO, DISCOUNT_MODE_PORCENTAJE]);
+// AM: fallback seguro para resumen de listado OC; evita tumbar el endpoint si falla solo el bloque summary.
+const EMPTY_ORDER_WORKFLOW_SUMMARY = Object.freeze({
+  total_ordenes: 0,
+  pendientes_aprobacion: 0,
+  en_compra: 0,
+  abastecidas: 0,
+  evidencias_pendientes: 0,
+  monto_total_estimado: 0,
+  monto_total_real: 0
+});
 
 const hasValue = (value) =>
   value !== undefined &&
@@ -402,22 +411,76 @@ const userHasAnyPermission = async (idUsuario, permissionNames, queryRunner = po
   return Boolean(result.rows?.[0]?.has_permission);
 };
 
-const canUserViewAllOrders = async (req, idUsuario, queryRunner = pool) => {
+// AM: normaliza nombre de rol para endurecer reglas funcionales sin depender de etiquetas exactas en BD/token.
+const normalizeRoleName = (value) =>
+  String(value ?? '')
+    .trim()
+    .replace(/[\s-]+/g, '_')
+    .toUpperCase();
+
+const ADMIN_OC_ROLE_NAMES = new Set(['SUPER_ADMIN', 'ADMIN', 'ADMINISTRADOR']);
+const OPERATIVE_OC_ROLE_NAMES = new Set([
+  'CAJERO',
+  'COCINERO',
+  'COCINERA',
+  'JEFA_COCINA',
+  'JEFE_COCINA'
+]);
+
+const getOcRoleContext = async (req, idUsuario, queryRunner = pool) => {
+  const cached = req?.__ocRoleContext;
+  if (cached?.idUsuario === idUsuario) return cached;
+
   const isSuperAdmin = await isRequestUserSuperAdmin(req);
-  if (isSuperAdmin) return true;
-  return userHasAnyPermission(idUsuario, PERM_OC_VIEW_ALL, queryRunner);
+  const tokenRoles = Array.isArray(req?.user?.roles)
+    ? req.user.roles.map(normalizeRoleName).filter(Boolean)
+    : [];
+  const roleSet = new Set(tokenRoles);
+
+  // AM: fallback a BD para sesiones/tokenes que no incluyan roles completos.
+  if (roleSet.size === 0 && idUsuario) {
+    const dbRolesResult = await queryRunner.query(
+      `
+        SELECT DISTINCT UPPER(REGEXP_REPLACE(TRIM(r.nombre), '[\\s-]+', '_', 'g')) AS role_name
+        FROM public.roles_usuarios ru
+        INNER JOIN public.roles r ON r.id_rol = ru.id_rol
+        WHERE ru.id_usuario = $1
+      `,
+      [idUsuario]
+    );
+    for (const row of dbRolesResult.rows || []) {
+      const normalized = normalizeRoleName(row?.role_name);
+      if (normalized) roleSet.add(normalized);
+    }
+  }
+
+  const isAdmin = !isSuperAdmin && Array.from(roleSet).some((role) => ADMIN_OC_ROLE_NAMES.has(role));
+  const isFullOcManager = isSuperAdmin || isAdmin;
+  const isOperativeOcActor = !isFullOcManager && Array.from(roleSet).some((role) => OPERATIVE_OC_ROLE_NAMES.has(role));
+
+  const payload = { idUsuario, isSuperAdmin, isAdmin, isFullOcManager, isOperativeOcActor, roleSet };
+  req.__ocRoleContext = payload;
+  return payload;
+};
+
+const canUserViewAllOrders = async (req, idUsuario, queryRunner = pool) => {
+  // AM: el alcance global de OC queda restringido a Admin/Super Admin por rol funcional.
+  const roleContext = await getOcRoleContext(req, idUsuario, queryRunner);
+  return roleContext.isFullOcManager;
 };
 
 const canUserManageOrderWorkflow = async (req, idUsuario, queryRunner = pool) => {
-  const isSuperAdmin = await isRequestUserSuperAdmin(req);
-  if (isSuperAdmin) return true;
-  return userHasAnyPermission(idUsuario, PERM_OC_ADMIN_WORKFLOW, queryRunner);
+  // AM: gestion administrativa de OC restringida al rol funcional Admin/Super Admin.
+  const roleContext = await getOcRoleContext(req, idUsuario, queryRunner);
+  if (!roleContext.isFullOcManager) return false;
+  return true;
 };
 
 const canUserViewAdminOrderData = async (req, idUsuario, queryRunner = pool) => {
-  const isSuperAdmin = await isRequestUserSuperAdmin(req);
-  if (isSuperAdmin) return true;
-  return userHasAnyPermission(idUsuario, PERM_OC_ADMIN_DETAIL_VIEW, queryRunner);
+  // AM: datos administrativos completos de OC se reservan para Admin/Super Admin.
+  const roleContext = await getOcRoleContext(req, idUsuario, queryRunner);
+  if (!roleContext.isFullOcManager) return false;
+  return true;
 };
 
 const sanitizeOrderForOperativeDetail = (row) => {
@@ -926,6 +989,160 @@ const getOrderDetails = async (idOrdenCompra, idCompra, queryRunner = pool) => {
   );
 
   return result.rows || [];
+};
+
+// AM: resumen confiable por proveedor para OC multi-proveedor sin depender de compra_actual singular.
+const getComprasPorProveedorSummary = async (
+  idOrdenCompra,
+  { idArchivoFacturaRecepcion = null } = {},
+  queryRunner = pool
+) => {
+  const requiredProvidersResult = await queryRunner.query(
+    `
+      SELECT
+        doc.id_proveedor_sugerido AS id_proveedor,
+        COALESCE(prov.nombre_proveedor, 'Proveedor sin definir') AS nombre_proveedor,
+        COUNT(*)::int AS total_lineas_oc,
+        COALESCE(SUM(doc.cantidad_orden), 0)::int AS total_cantidad_oc
+      FROM public.detalle_orden_compras doc
+      LEFT JOIN public.proveedores prov ON prov.id_proveedor = doc.id_proveedor_sugerido
+      WHERE doc.id_orden_compra = $1
+      GROUP BY doc.id_proveedor_sugerido, COALESCE(prov.nombre_proveedor, 'Proveedor sin definir')
+      ORDER BY doc.id_proveedor_sugerido ASC NULLS FIRST
+    `,
+    [idOrdenCompra]
+  );
+  const requiredProviderRows = requiredProvidersResult.rows || [];
+  if (requiredProviderRows.length === 0) return [];
+
+  const comprasByProviderResult = await queryRunner.query(
+    `
+      SELECT DISTINCT ON (c.id_proveedor)
+        c.id_compra,
+        c.id_proveedor,
+        c.id_archivo_transferencia,
+        c.referencia_transferencia,
+        COALESCE(NULLIF(to_jsonb(c)->>'observacion_pago', ''), NULL)::text AS observacion_pago,
+        COALESCE(NULLIF(to_jsonb(c)->>'metodo_pago', ''), NULL)::text AS metodo_pago,
+        COALESCE(NULLIF(to_jsonb(c)->>'metodo_pago_codigo', ''), NULL)::text AS metodo_pago_codigo,
+        COALESCE(NULLIF(to_jsonb(c)->>'tipo_pago', ''), NULL)::text AS tipo_pago,
+        COALESCE(NULLIF(to_jsonb(c)->>'forma_pago', ''), NULL)::text AS forma_pago,
+        prov.nombre_proveedor
+      FROM public.compras c
+      LEFT JOIN public.proveedores prov ON prov.id_proveedor = c.id_proveedor
+      WHERE c.id_orden_compra = $1
+        AND c.id_proveedor IS NOT NULL
+      ORDER BY c.id_proveedor ASC, c.id_compra DESC
+    `,
+    [idOrdenCompra]
+  );
+  const latestCompraByProvider = new Map();
+  for (const row of comprasByProviderResult.rows || []) {
+    const providerId = parsePositiveInt(row.id_proveedor);
+    if (!providerId) continue;
+    latestCompraByProvider.set(providerId, row);
+  }
+
+  const compraIds = Array.from(
+    new Set(
+      Array.from(latestCompraByProvider.values())
+        .map((row) => parsePositiveInt(row.id_compra))
+        .filter((id) => Number.isInteger(id) && id > 0)
+    )
+  );
+  const purchaseDetailByCompra = new Map();
+  if (compraIds.length > 0) {
+    const purchaseDetailAggResult = await queryRunner.query(
+      `
+        SELECT
+          dc.id_compra,
+          COUNT(*)::int AS total_lineas_compra,
+          COALESCE(SUM(dc.cantidad), 0)::int AS total_cantidad_compra
+        FROM public.detalle_compras dc
+        WHERE dc.id_compra = ANY($1::int[])
+        GROUP BY dc.id_compra
+      `,
+      [compraIds]
+    );
+    for (const row of purchaseDetailAggResult.rows || []) {
+      const idCompra = parsePositiveInt(row.id_compra);
+      if (!idCompra) continue;
+      purchaseDetailByCompra.set(idCompra, {
+        total_lineas_compra: parsePositiveInt(row.total_lineas_compra) || 0,
+        total_cantidad_compra: parseNonNegativeNumber(row.total_cantidad_compra) || 0
+      });
+    }
+  }
+
+  const hasFacturaRecepcion = Boolean(parsePositiveInt(idArchivoFacturaRecepcion));
+  return requiredProviderRows.map((requiredRow) => {
+    const providerId = parsePositiveInt(requiredRow.id_proveedor);
+    const compraProveedor = providerId ? latestCompraByProvider.get(providerId) || null : null;
+    const idCompra = parsePositiveInt(compraProveedor?.id_compra);
+    const compraAgg = idCompra
+      ? purchaseDetailByCompra.get(idCompra) || { total_lineas_compra: 0, total_cantidad_compra: 0 }
+      : { total_lineas_compra: 0, total_cantidad_compra: 0 };
+    const totalLineasOc = parsePositiveInt(requiredRow.total_lineas_oc) || 0;
+    const totalCantidadOc = parseNonNegativeNumber(requiredRow.total_cantidad_oc) || 0;
+    const totalLineasCompra = parsePositiveInt(compraAgg.total_lineas_compra) || 0;
+    const totalCantidadCompra = parseNonNegativeNumber(compraAgg.total_cantidad_compra) || 0;
+    const tieneCompra = Boolean(providerId && idCompra);
+    const cantidadesCuadran = Boolean(tieneCompra && totalCantidadCompra === totalCantidadOc);
+    const hintsRaw = [
+      compraProveedor?.metodo_pago,
+      compraProveedor?.metodo_pago_codigo,
+      compraProveedor?.tipo_pago,
+      compraProveedor?.forma_pago,
+      compraProveedor?.observacion_pago,
+      compraProveedor?.referencia_transferencia
+    ]
+      .map((value) => normalizeText(value, MAX_SHORT_TEXT_LEN))
+      .filter(Boolean);
+    const metodoPago = hintsRaw[0] || null;
+    const hasMetodoPagoHint = hintsRaw.length > 0;
+    const tieneTransferencia = Boolean(parsePositiveInt(compraProveedor?.id_archivo_transferencia));
+
+    const evidenciasPendientes = [];
+    if (!hasFacturaRecepcion) {
+      evidenciasPendientes.push('Falta factura general de la orden.');
+    }
+    if (tieneCompra && doesCompraRequireTransferEvidence(compraProveedor) && !tieneTransferencia) {
+      evidenciasPendientes.push('Falta comprobante de deposito o transferencia.');
+    }
+    if (tieneCompra && !hasMetodoPagoHint) {
+      evidenciasPendientes.push('Metodo de pago no claro para validar comprobante.');
+    }
+
+    let estadoGrupo = 'PENDIENTE';
+    if (!providerId) {
+      // AM: proveedor sin definir siempre se reporta pendiente para forzar definicion operativa previa.
+      estadoGrupo = 'PENDIENTE';
+    } else if (tieneCompra) {
+      estadoGrupo = cantidadesCuadran && totalLineasCompra > 0 ? 'CONVERTIDO' : 'EN_COMPRA';
+    }
+
+    return {
+      id_proveedor: providerId || null,
+      nombre_proveedor:
+        normalizeText(
+          requiredRow.nombre_proveedor ||
+            compraProveedor?.nombre_proveedor ||
+            (providerId ? `Proveedor #${providerId}` : 'Proveedor sin definir'),
+          MAX_SHORT_TEXT_LEN
+        ) || (providerId ? `Proveedor #${providerId}` : 'Proveedor sin definir'),
+      id_compra: idCompra || null,
+      estado_grupo: estadoGrupo,
+      total_lineas_oc: totalLineasOc,
+      total_cantidad_oc: totalCantidadOc,
+      total_lineas_compra: totalLineasCompra,
+      total_cantidad_compra: totalCantidadCompra,
+      tiene_compra: tieneCompra,
+      cantidades_cuadran: cantidadesCuadran,
+      tiene_transferencia: tieneTransferencia,
+      metodo_pago: metodoPago,
+      evidencias_pendientes: evidenciasPendientes
+    };
+  });
 };
 
 const getOrderItemRequests = async (idOrdenCompra, queryRunner = pool) => {
@@ -1504,6 +1721,49 @@ const parseGlobalDiscount = (rawTipo, rawValor) => {
   return { ok: true, descuento_tipo: descuentoTipo, descuento_valor: round2(descuentoValor) };
 };
 
+const normalizePaymentMethodText = (value) =>
+  String(value ?? '')
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .trim();
+
+// AM: regla conservadora para comprobante: si metodo no es claro, se exige transferencia/deposito.
+const doesCompraRequireTransferEvidence = (compraRow = {}) => {
+  const hints = [
+    compraRow?.metodo_pago,
+    compraRow?.metodo_pago_codigo,
+    compraRow?.tipo_pago,
+    compraRow?.forma_pago,
+    compraRow?.observacion_pago,
+    compraRow?.referencia_transferencia
+  ]
+    .map((value) => normalizePaymentMethodText(value))
+    .filter(Boolean)
+    .join(' ');
+
+  if (!hints) return true;
+  if (hints.includes('transfer') || hints.includes('deposit')) return true;
+  if (hints.includes('efectivo')) return false;
+  if (hints.includes('credito') || hints.includes('credito_fiscal')) return false;
+  return true;
+};
+
+const buildProviderItemKey = ({ idProveedor, idProducto, idInsumo, idAlmacenDestino }) =>
+  [
+    `prov:${parsePositiveInt(idProveedor) || 0}`,
+    `prod:${parsePositiveInt(idProducto) || 0}`,
+    `ins:${parsePositiveInt(idInsumo) || 0}`,
+    `alm:${parsePositiveInt(idAlmacenDestino) || 0}`
+  ].join('|');
+
+const getProviderLabel = (providerMap, idProveedor) => {
+  const key = parsePositiveInt(idProveedor) || 0;
+  const providerName = normalizeText(providerMap?.get?.(key), MAX_SHORT_TEXT_LEN);
+  if (providerName) return providerName;
+  return `#${key}`;
+};
+
 const parseItemRequestReviewAction = (value) => {
   const action = String(value ?? '')
     .trim()
@@ -1511,6 +1771,222 @@ const parseItemRequestReviewAction = (value) => {
   if (action === 'aprobar') return 'aprobar';
   if (action === 'rechazar') return 'rechazar';
   return null;
+};
+
+const parseIsoDateOnly = (value) => {
+  const text = String(value ?? '').trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(text)) return null;
+  return text;
+};
+
+const parseTriStateYesNo = (value) => {
+  const text = String(value ?? '')
+    .trim()
+    .toLowerCase();
+  if (!text) return null;
+  if (['si', 'sí', 'yes', 'true', '1'].includes(text)) return true;
+  if (['no', 'false', '0'].includes(text)) return false;
+  return null;
+};
+
+const parseProviderSuggestionItems = (rawItems) => {
+  if (!Array.isArray(rawItems) || rawItems.length === 0) {
+    return { ok: false, message: 'items debe ser un arreglo con al menos un elemento.' };
+  }
+  if (rawItems.length > MAX_PROVIDER_SUGGESTION_ITEMS) {
+    return {
+      ok: false,
+      message: `items no puede superar ${MAX_PROVIDER_SUGGESTION_ITEMS} elementos por solicitud.`
+    };
+  }
+
+  const dedupe = new Map();
+  for (const row of rawItems) {
+    const itemTipo = String(row?.item_tipo ?? '')
+      .trim()
+      .toUpperCase();
+    const idItem = parsePositiveInt(row?.id_item);
+    if (!['PRODUCTO', 'INSUMO'].includes(itemTipo)) {
+      return { ok: false, message: 'item_tipo debe ser PRODUCTO o INSUMO.' };
+    }
+    if (!idItem) {
+      return { ok: false, message: 'id_item debe ser un entero mayor a 0.' };
+    }
+    const key = `${itemTipo}:${idItem}`;
+    if (!dedupe.has(key)) {
+      dedupe.set(key, {
+        item_tipo: itemTipo,
+        id_item: idItem
+      });
+    }
+  }
+
+  return { ok: true, items: Array.from(dedupe.values()) };
+};
+
+const validateSucursalExists = async (idSucursal, queryRunner = pool) => {
+  const result = await queryRunner.query(
+    `
+      SELECT 1
+      FROM public.sucursales s
+      WHERE s.id_sucursal = $1
+        AND COALESCE(s.estado, true) = true
+      LIMIT 1
+    `,
+    [idSucursal]
+  );
+  return result.rowCount > 0;
+};
+
+// AM: resuelve proveedor sugerido por lote priorizando historial de sucursal y fallback global.
+const getSuggestedProvidersByItems = async (idSucursal, items, queryRunner = pool) => {
+  const itemTipos = items.map((item) => item.item_tipo);
+  const itemIds = items.map((item) => item.id_item);
+
+  const result = await queryRunner.query(
+    `
+      WITH input_items AS (
+        SELECT DISTINCT
+          src.item_tipo,
+          src.id_item
+        FROM UNNEST($2::text[], $3::int[]) AS src(item_tipo, id_item)
+      ),
+      history AS (
+        SELECT
+          input.item_tipo,
+          input.id_item,
+          c.id_compra,
+          c.id_proveedor,
+          prov.nombre_proveedor,
+          c.fecha,
+          alm.id_sucursal,
+          COALESCE(UPPER(NULLIF(oc.estado_flujo, '')), '') AS estado_flujo
+        FROM input_items input
+        INNER JOIN public.detalle_compras dc
+          ON (
+            (input.item_tipo = 'PRODUCTO' AND dc.id_producto = input.id_item)
+            OR (input.item_tipo = 'INSUMO' AND dc.id_insumo = input.id_item)
+          )
+        INNER JOIN public.compras c ON c.id_compra = dc.id_compra
+        INNER JOIN public.proveedores prov ON prov.id_proveedor = c.id_proveedor
+        LEFT JOIN public.almacenes alm ON alm.id_almacen = dc.id_almacen_destino
+        LEFT JOIN public.orden_compras oc ON oc.id_orden_compra = c.id_orden_compra
+        WHERE c.id_proveedor IS NOT NULL
+          AND COALESCE(c.estado, true) = true
+          AND COALESCE(prov.estado, true) = true
+      ),
+      history_agg AS (
+        SELECT
+          h.item_tipo,
+          h.id_item,
+          h.id_proveedor,
+          MAX(h.nombre_proveedor) AS nombre_proveedor,
+          COUNT(*) FILTER (WHERE h.id_sucursal = $1) AS freq_sucursal,
+          MAX(h.fecha) FILTER (WHERE h.id_sucursal = $1) AS latest_fecha_sucursal,
+          MAX(h.id_compra) FILTER (WHERE h.id_sucursal = $1) AS latest_compra_sucursal,
+          COUNT(*) FILTER (
+            WHERE h.id_sucursal = $1
+              AND h.estado_flujo IN ('ABASTECIDA', 'EN_COMPRA')
+          ) AS preferred_state_hits_sucursal,
+          COUNT(*) AS freq_global,
+          MAX(h.fecha) AS latest_fecha_global,
+          MAX(h.id_compra) AS latest_compra_global,
+          COUNT(*) FILTER (
+            WHERE h.estado_flujo IN ('ABASTECIDA', 'EN_COMPRA')
+          ) AS preferred_state_hits_global
+        FROM history h
+        GROUP BY h.item_tipo, h.id_item, h.id_proveedor
+      ),
+      best_sucursal AS (
+        SELECT
+          agg.item_tipo,
+          agg.id_item,
+          agg.id_proveedor,
+          agg.nombre_proveedor,
+          ROW_NUMBER() OVER (
+            PARTITION BY agg.item_tipo, agg.id_item
+            ORDER BY
+              CASE WHEN agg.preferred_state_hits_sucursal > 0 THEN 1 ELSE 0 END DESC,
+              agg.latest_fecha_sucursal DESC NULLS LAST,
+              agg.freq_sucursal DESC,
+              agg.latest_compra_sucursal DESC NULLS LAST,
+              agg.id_proveedor DESC
+          ) AS rn
+        FROM history_agg agg
+        WHERE agg.freq_sucursal > 0
+      ),
+      best_global AS (
+        SELECT
+          agg.item_tipo,
+          agg.id_item,
+          agg.id_proveedor,
+          agg.nombre_proveedor,
+          ROW_NUMBER() OVER (
+            PARTITION BY agg.item_tipo, agg.id_item
+            ORDER BY
+              CASE WHEN agg.preferred_state_hits_global > 0 THEN 1 ELSE 0 END DESC,
+              agg.latest_fecha_global DESC NULLS LAST,
+              agg.freq_global DESC,
+              agg.latest_compra_global DESC NULLS LAST,
+              agg.id_proveedor DESC
+          ) AS rn
+        FROM history_agg agg
+        WHERE agg.freq_global > 0
+      )
+      SELECT
+        input.item_tipo,
+        input.id_item,
+        COALESCE(bs.id_proveedor, bg.id_proveedor) AS id_proveedor_sugerido,
+        COALESCE(bs.nombre_proveedor, bg.nombre_proveedor) AS proveedor_sugerido_nombre,
+        CASE
+          WHEN bs.id_proveedor IS NOT NULL THEN 'HISTORIAL_SUCURSAL'
+          WHEN bg.id_proveedor IS NOT NULL THEN 'HISTORIAL_GLOBAL'
+          ELSE 'SIN_HISTORIAL'
+        END AS proveedor_sugerido_origen
+      FROM input_items input
+      LEFT JOIN best_sucursal bs
+        ON bs.item_tipo = input.item_tipo
+       AND bs.id_item = input.id_item
+       AND bs.rn = 1
+      LEFT JOIN best_global bg
+        ON bg.item_tipo = input.item_tipo
+       AND bg.id_item = input.id_item
+       AND bg.rn = 1
+      ORDER BY input.item_tipo ASC, input.id_item ASC
+    `,
+    [idSucursal, itemTipos, itemIds]
+  );
+
+  const map = new Map();
+  for (const row of result.rows || []) {
+    const itemTipo = String(row.item_tipo || '')
+      .trim()
+      .toUpperCase();
+    const idItem = parsePositiveInt(row.id_item);
+    if (!['PRODUCTO', 'INSUMO'].includes(itemTipo) || !idItem) continue;
+    const key = `${itemTipo}:${idItem}`;
+    map.set(key, {
+      item_tipo: itemTipo,
+      id_item: idItem,
+      id_proveedor_sugerido: parsePositiveInt(row.id_proveedor_sugerido) || null,
+      proveedor_sugerido_nombre:
+        normalizeText(row.proveedor_sugerido_nombre, MAX_SHORT_TEXT_LEN) || null,
+      proveedor_sugerido_origen: String(row.proveedor_sugerido_origen || 'SIN_HISTORIAL').trim()
+    });
+  }
+
+  return items.map((item) => {
+    const key = `${item.item_tipo}:${item.id_item}`;
+    const suggested = map.get(key);
+    if (suggested) return suggested;
+    return {
+      item_tipo: item.item_tipo,
+      id_item: item.id_item,
+      id_proveedor_sugerido: null,
+      proveedor_sugerido_nombre: null,
+      proveedor_sugerido_origen: 'SIN_HISTORIAL'
+    };
+  });
 };
 
 router.get('/orden_compras/workflow/contexto_creacion', checkPermission(PERM_OC_CREATE), async (req, res) => {
@@ -1565,6 +2041,59 @@ router.get('/orden_compras/workflow/contexto_creacion', checkPermission(PERM_OC_
   }
 });
 
+router.post('/orden_compras/workflow/proveedores-sugeridos', checkPermission(PERM_OC_CREATE), async (req, res) => {
+  try {
+    const idUsuario = getRequestUserId(req);
+    if (!idUsuario) return sendError(res, 401, 'UNAUTHORIZED', 'No autorizado.');
+
+    const idSucursal = parsePositiveInt(req.body?.id_sucursal);
+    if (!idSucursal) {
+      return sendError(res, 400, 'VALIDATION_ERROR', 'id_sucursal es obligatorio y debe ser valido.');
+    }
+
+    const parsedItems = parseProviderSuggestionItems(req.body?.items);
+    if (!parsedItems.ok) {
+      return sendError(res, 400, 'VALIDATION_ERROR', parsedItems.message);
+    }
+
+    const canViewAll = await canUserViewAllOrders(req, idUsuario);
+    const userSucursalId = await getUserSucursalId(idUsuario);
+    if (!canViewAll) {
+      if (!userSucursalId) {
+        return sendError(
+          res,
+          403,
+          'FORBIDDEN',
+          'Tu usuario no tiene sucursal asignada para consultar proveedores sugeridos.'
+        );
+      }
+      if (userSucursalId !== idSucursal) {
+        return sendError(
+          res,
+          403,
+          'FORBIDDEN',
+          'No tienes permiso para consultar proveedores sugeridos de otra sucursal.'
+        );
+      }
+    }
+
+    const sucursalExiste = await validateSucursalExists(idSucursal);
+    if (!sucursalExiste) {
+      return sendError(res, 404, 'NOT_FOUND', 'La sucursal indicada no existe o esta inactiva.');
+    }
+
+    // AM: sugerencias por lote para evitar N+1 y mantener creacion rapida en OC con muchas lineas.
+    const suggestions = await getSuggestedProvidersByItems(idSucursal, parsedItems.items);
+
+    return res.status(200).json({
+      ok: true,
+      data: suggestions
+    });
+  } catch (error) {
+    return sendServerError(res, 'POST /orden_compras/workflow/proveedores-sugeridos', error);
+  }
+});
+
 router.get('/orden_compras/workflow', checkPermission(PERM_OC_VIEW_FLOW), async (req, res) => {
   try {
     const idUsuario = getRequestUserId(req);
@@ -1603,9 +2132,43 @@ router.get('/orden_compras/workflow', checkPermission(PERM_OC_VIEW_FLOW), async 
     }
 
     const page = parsePositiveInt(req.query?.page) || 1;
-    const limit = Math.min(parsePositiveInt(req.query?.limit) || DEFAULT_LIMIT, MAX_LIMIT);
-    const offset = (page - 1) * limit;
+    // AM: paginacion profesional: page_size preferido con fallback compat a limit/pageSize legacy.
+    const rawPageSize = hasValue(req.query?.page_size)
+      ? req.query?.page_size
+      : hasValue(req.query?.pageSize)
+      ? req.query?.pageSize
+      : req.query?.limit;
+    const pageSize = Math.min(parsePositiveInt(rawPageSize) || 15, 50);
+    const offset = (page - 1) * pageSize;
     const search = normalizeText(req.query?.q, 120);
+    const idProveedorFilter = parseOptionalPositiveInt(req.query?.id_proveedor);
+    if (hasValue(req.query?.id_proveedor) && !idProveedorFilter) {
+      return sendError(res, 400, 'VALIDATION_ERROR', 'id_proveedor invalido.');
+    }
+
+    const fechaDesde = hasValue(req.query?.fecha_desde) ? parseIsoDateOnly(req.query?.fecha_desde) : null;
+    if (hasValue(req.query?.fecha_desde) && !fechaDesde) {
+      return sendError(res, 400, 'VALIDATION_ERROR', 'fecha_desde invalida. Formato esperado YYYY-MM-DD.');
+    }
+    const fechaHasta = hasValue(req.query?.fecha_hasta) ? parseIsoDateOnly(req.query?.fecha_hasta) : null;
+    if (hasValue(req.query?.fecha_hasta) && !fechaHasta) {
+      return sendError(res, 400, 'VALIDATION_ERROR', 'fecha_hasta invalida. Formato esperado YYYY-MM-DD.');
+    }
+    if (fechaDesde && fechaHasta && fechaDesde > fechaHasta) {
+      return sendError(res, 400, 'VALIDATION_ERROR', 'fecha_desde no puede ser mayor que fecha_hasta.');
+    }
+
+    const evidenciasPendientesFilter = hasValue(req.query?.evidencias_pendientes)
+      ? parseTriStateYesNo(req.query?.evidencias_pendientes)
+      : null;
+    if (hasValue(req.query?.evidencias_pendientes) && evidenciasPendientesFilter === null) {
+      return sendError(
+        res,
+        400,
+        'VALIDATION_ERROR',
+        'evidencias_pendientes invalido. Use SI/NO o true/false.'
+      );
+    }
 
     const canViewAll = await canUserViewAllOrders(req, idUsuario);
     // AM: la visibilidad real del negocio se define por rol, no por query param.
@@ -1625,15 +2188,11 @@ router.get('/orden_compras/workflow', checkPermission(PERM_OC_VIEW_FLOW), async 
       }
 
       if (idSucursalFilter && idSucursalFilter !== userSucursalId) {
-        return sendError(
-          res,
-          403,
-          'FORBIDDEN',
-          'No tienes permiso para consultar ordenes de otra sucursal.'
-        );
+        // AM: para perfiles operativos se fuerza sucursal propia y se ignora filtro externo.
+        effectiveSucursalFilter = userSucursalId;
+      } else {
+        effectiveSucursalFilter = userSucursalId;
       }
-
-      effectiveSucursalFilter = userSucursalId;
     }
 
     const whereParts = [];
@@ -1662,11 +2221,87 @@ router.get('/orden_compras/workflow', checkPermission(PERM_OC_VIEW_FLOW), async 
       whereParts.push(`oc.estado_flujo = $${params.length}`);
     }
 
+    if (idProveedorFilter) {
+      params.push(idProveedorFilter);
+      // AM: proveedor filtra por lineas sugeridas y por compras ya convertidas en la OC.
+      whereParts.push(`
+        (
+          EXISTS (
+            SELECT 1
+            FROM public.detalle_orden_compras doc_prov
+            WHERE doc_prov.id_orden_compra = oc.id_orden_compra
+              AND doc_prov.id_proveedor_sugerido = $${params.length}
+          )
+          OR EXISTS (
+            SELECT 1
+            FROM public.compras c_prov
+            WHERE c_prov.id_orden_compra = oc.id_orden_compra
+              AND c_prov.id_proveedor = $${params.length}
+          )
+        )
+      `);
+    }
+
+    if (fechaDesde) {
+      params.push(fechaDesde);
+      whereParts.push(
+        `DATE(COALESCE(NULLIF(to_jsonb(oc)->>'fecha_creacion', '')::timestamp, oc.fecha::timestamp)) >= $${params.length}::date`
+      );
+    }
+
+    if (fechaHasta) {
+      params.push(fechaHasta);
+      whereParts.push(
+        `DATE(COALESCE(NULLIF(to_jsonb(oc)->>'fecha_creacion', '')::timestamp, oc.fecha::timestamp)) <= $${params.length}::date`
+      );
+    }
+
+    if (evidenciasPendientesFilter === true) {
+      // AM: "SI" significa compra existente con factura o transferencia pendientes.
+      whereParts.push(`
+        EXISTS (
+          SELECT 1
+          FROM public.compras c_ev
+          WHERE c_ev.id_orden_compra = oc.id_orden_compra
+        )
+        AND (
+          oc.id_archivo_factura_recepcion IS NULL
+          OR EXISTS (
+            SELECT 1
+            FROM public.compras c_ev_p
+            WHERE c_ev_p.id_orden_compra = oc.id_orden_compra
+              AND c_ev_p.id_archivo_transferencia IS NULL
+          )
+        )
+      `);
+    } else if (evidenciasPendientesFilter === false) {
+      // AM: "NO" incluye ordenes sin compra (no aplica) y ordenes con evidencias completas.
+      whereParts.push(`
+        (
+          NOT EXISTS (
+            SELECT 1
+            FROM public.compras c_ev
+            WHERE c_ev.id_orden_compra = oc.id_orden_compra
+          )
+          OR (
+            oc.id_archivo_factura_recepcion IS NOT NULL
+            AND NOT EXISTS (
+              SELECT 1
+              FROM public.compras c_ev_p
+              WHERE c_ev_p.id_orden_compra = oc.id_orden_compra
+                AND c_ev_p.id_archivo_transferencia IS NULL
+            )
+          )
+        )
+      `);
+    }
+
     if (search) {
       params.push(`%${search}%`);
       whereParts.push(`
         (
           CAST(oc.id_orden_compra AS text) ILIKE $${params.length}
+          OR COALESCE(NULLIF(to_jsonb(oc)->>'numero_oc_visible', ''), '') ILIKE $${params.length}
           OR COALESCE(oc.observacion_solicitud, '') ILIKE $${params.length}
           OR COALESCE(oc.comentario_revision, '') ILIKE $${params.length}
           OR COALESCE(u.nombre_usuario, '') ILIKE $${params.length}
@@ -1686,9 +2321,101 @@ router.get('/orden_compras/workflow', checkPermission(PERM_OC_VIEW_FLOW), async 
       params
     );
     const total = Number(countResult.rows?.[0]?.total || 0);
-    const totalPages = Math.max(1, Math.ceil(total / limit));
+    let summary = {
+      ...EMPTY_ORDER_WORKFLOW_SUMMARY,
+      total_ordenes: total
+    };
+    try {
+      // AM: resumen global del conjunto filtrado completo; no depende de page ni page_size.
+      const summaryResult = await pool.query(
+        `
+          WITH filtered_orders AS (
+            SELECT
+              oc.id_orden_compra,
+              oc.estado_flujo,
+              oc.id_archivo_factura_recepcion
+            FROM public.orden_compras oc
+            LEFT JOIN public.usuarios u ON u.id_usuario = oc.id_usuario
+            ${whereSql}
+          ),
+          order_estimated AS (
+            SELECT
+              fo.id_orden_compra,
+              COALESCE(
+                SUM(
+                  COALESCE(doc.cantidad_orden, 0) * COALESCE(p.precio, i.precio, 0)
+                ),
+                0
+              )::numeric AS monto_estimado
+            FROM filtered_orders fo
+            LEFT JOIN public.detalle_orden_compras doc ON doc.id_orden_compra = fo.id_orden_compra
+            LEFT JOIN public.productos p ON p.id_producto = doc.id_producto
+            LEFT JOIN public.insumos i ON i.id_insumo = doc.id_insumo
+            GROUP BY fo.id_orden_compra
+          ),
+          order_real AS (
+            SELECT
+              fo.id_orden_compra,
+              -- AM: suma total real por OC para contemplar compras multi-proveedor dentro de la misma orden.
+              COALESCE(SUM(COALESCE(c.total, 0)), 0)::numeric AS monto_real
+            FROM filtered_orders fo
+            LEFT JOIN public.compras c ON c.id_orden_compra = fo.id_orden_compra
+            GROUP BY fo.id_orden_compra
+          )
+          SELECT
+            COUNT(*)::int AS total_ordenes,
+            COUNT(*) FILTER (WHERE UPPER(COALESCE(fo.estado_flujo, '')) = 'PENDIENTE')::int AS pendientes_aprobacion,
+            COUNT(*) FILTER (WHERE UPPER(COALESCE(fo.estado_flujo, '')) = 'EN_COMPRA')::int AS en_compra,
+            COUNT(*) FILTER (WHERE UPPER(COALESCE(fo.estado_flujo, '')) = 'ABASTECIDA')::int AS abastecidas,
+            COUNT(*) FILTER (
+              EXISTS (
+                SELECT 1
+                FROM public.compras c_ev
+                WHERE c_ev.id_orden_compra = fo.id_orden_compra
+              )
+              AND (
+                fo.id_archivo_factura_recepcion IS NULL
+                OR EXISTS (
+                  SELECT 1
+                  FROM public.compras c_ev_p
+                  WHERE c_ev_p.id_orden_compra = fo.id_orden_compra
+                    AND c_ev_p.id_archivo_transferencia IS NULL
+                )
+              )
+            )::int AS evidencias_pendientes,
+            COALESCE(SUM(est.monto_estimado), 0)::numeric AS monto_total_estimado,
+            COALESCE(SUM(real.monto_real), 0)::numeric AS monto_total_real
+          FROM filtered_orders fo
+          LEFT JOIN order_estimated est ON est.id_orden_compra = fo.id_orden_compra
+          LEFT JOIN order_real real ON real.id_orden_compra = fo.id_orden_compra
+        `,
+        params
+      );
+      const summaryRow = summaryResult.rows?.[0] || {};
+      // AM: payload estable para KPIs globales filtrados, manteniendo compatibilidad con data/pagination.
+      summary = {
+        total_ordenes: Number(summaryRow.total_ordenes || 0),
+        pendientes_aprobacion: Number(summaryRow.pendientes_aprobacion || 0),
+        en_compra: Number(summaryRow.en_compra || 0),
+        abastecidas: Number(summaryRow.abastecidas || 0),
+        evidencias_pendientes: Number(summaryRow.evidencias_pendientes || 0),
+        // AM: estimado global se calcula por lineas OC usando precio referencia de producto/insumo.
+        monto_total_estimado: round2(Number(summaryRow.monto_total_estimado || 0)),
+        // AM: real global se calcula como suma de compras por OC filtrada (multi-proveedor compatible).
+        monto_total_real: round2(Number(summaryRow.monto_total_real || 0))
+      };
+    } catch (summaryError) {
+      // AM: fallback seguro: si falla summary no debe romper listado/paginacion ni devolver 500.
+      console.error(
+        '[ordenes_compra_workflow] GET /orden_compras/workflow summary_fallback:',
+        buildSafeWorkflowErrorLog(summaryError)
+      );
+    }
+    const totalPages = Math.max(1, Math.ceil(total / pageSize));
+    const hasNext = page < totalPages;
+    const hasPrev = page > 1;
 
-    params.push(limit);
+    params.push(pageSize);
     const limitRef = `$${params.length}`;
     params.push(offset);
     const offsetRef = `$${params.length}`;
@@ -1939,10 +2666,16 @@ router.get('/orden_compras/workflow', checkPermission(PERM_OC_VIEW_FLOW), async 
       data: rowsPayload,
       pagination: {
         page,
-        limit,
+        // AM: conserva campos legacy y agrega metadata moderna para frontend de produccion.
+        limit: pageSize,
+        page_size: pageSize,
         total,
-        totalPages
-      }
+        totalPages,
+        total_pages: totalPages,
+        has_next: hasNext,
+        has_prev: hasPrev
+      },
+      summary
     });
   } catch (error) {
     return sendServerError(res, 'GET /orden_compras/workflow', error);
@@ -1980,6 +2713,15 @@ router.get('/orden_compras/workflow/:id_orden_compra', checkPermission(PERM_OC_V
     const compraActual = canViewAdminData ? await getLatestCompraByOrden(idOrdenCompra) : null;
     const detallesRaw = await getOrderDetails(idOrdenCompra, compraActual?.id_compra || null);
     const detalles = canViewAdminData ? detallesRaw : sanitizeOrderDetailsForOperative(detallesRaw);
+    const comprasPorProveedor = canViewAdminData
+      ? await getComprasPorProveedorSummary(
+          idOrdenCompra,
+          {
+            // AM: usa factura de recepcion existente para marcar evidencias pendientes de forma informativa.
+            idArchivoFacturaRecepcion: orderRowWithVisibleFlowNumber?.id_archivo_factura_recepcion
+          }
+        )
+      : [];
     const evidenciasHistorial = canViewAdminData ? await getOrderEvidenceHistory(idOrdenCompra) : [];
     const solicitudesItem = await getOrderItemRequests(idOrdenCompra);
     const ordenPayload = canViewAdminData
@@ -1991,6 +2733,8 @@ router.get('/orden_compras/workflow/:id_orden_compra', checkPermission(PERM_OC_V
       data: {
         orden: ordenPayload,
         compra_actual: compraActual || null,
+        // AM: nuevo resumen por proveedor para frontend multi-proveedor, sin romper compra_actual legacy.
+        compras_por_proveedor: comprasPorProveedor,
         detalles,
         evidencias_historial: evidenciasHistorial,
         solicitudes_item: solicitudesItem
@@ -2896,6 +3640,10 @@ router.post('/orden_compras/workflow/:id_orden_compra/aprobar', checkPermission(
   try {
     const idUsuario = getRequestUserId(req);
     if (!idUsuario) return sendError(res, 401, 'UNAUTHORIZED', 'No autorizado.');
+    const roleContext = await getOcRoleContext(req, idUsuario, client);
+    if (!roleContext.isFullOcManager) {
+      return sendError(res, 403, 'FORBIDDEN', 'No tienes permiso para aprobar órdenes de compra.');
+    }
 
     const idOrdenCompra = parsePositiveInt(req.params?.id_orden_compra);
     if (!idOrdenCompra) {
@@ -2987,6 +3735,10 @@ router.post('/orden_compras/workflow/:id_orden_compra/rechazar', checkPermission
   try {
     const idUsuario = getRequestUserId(req);
     if (!idUsuario) return sendError(res, 401, 'UNAUTHORIZED', 'No autorizado.');
+    const roleContext = await getOcRoleContext(req, idUsuario, client);
+    if (!roleContext.isFullOcManager) {
+      return sendError(res, 403, 'FORBIDDEN', 'No tienes permiso para rechazar órdenes de compra.');
+    }
 
     const idOrdenCompra = parsePositiveInt(req.params?.id_orden_compra);
     if (!idOrdenCompra) {
@@ -3063,6 +3815,7 @@ router.post('/orden_compras/workflow/:id_orden_compra/cancelar', checkPermission
   try {
     const idUsuario = getRequestUserId(req);
     if (!idUsuario) return sendError(res, 401, 'UNAUTHORIZED', 'No autorizado.');
+    const roleContext = await getOcRoleContext(req, idUsuario, client);
 
     const idOrdenCompra = parsePositiveInt(req.params?.id_orden_compra);
     if (!idOrdenCompra) {
@@ -3082,10 +3835,24 @@ router.post('/orden_compras/workflow/:id_orden_compra/cancelar', checkPermission
     const canView = await validateOrderVisibility(req, idUsuario, orderRow, client);
     if (!canView) {
       await withRollback(client);
-      return sendError(res, 403, 'FORBIDDEN', 'No tienes permiso para cancelar esta orden.');
+      return sendError(res, 403, 'FORBIDDEN', 'Solo puedes gestionar solicitudes de tu sucursal.');
     }
 
     const estadoActual = String(orderRow.estado_flujo || '').trim().toUpperCase();
+    const idUsuarioCreador = parsePositiveInt(orderRow?.id_usuario);
+
+    // AM: operativo solo puede cancelar solicitudes pendientes de su propio flujo.
+    if (!roleContext.isFullOcManager) {
+      if (estadoActual !== ESTADO_PENDIENTE) {
+        await withRollback(client);
+        return sendError(res, 403, 'FORBIDDEN', 'Solo puedes cancelar solicitudes pendientes.');
+      }
+      if (idUsuarioCreador && Number(idUsuarioCreador) !== Number(idUsuario)) {
+        await withRollback(client);
+        return sendError(res, 403, 'FORBIDDEN', 'Solo puedes cancelar solicitudes creadas por tu usuario.');
+      }
+    }
+
     const recepcionRegistrada =
       Boolean(parsePositiveInt(orderRow.id_usuario_recepcion)) &&
       Boolean(normalizeText(orderRow.fecha_recepcion_reportada, 80));
@@ -3145,6 +3912,10 @@ router.post('/orden_compras/workflow/:id_orden_compra/convertir', checkPermissio
   try {
     const idUsuario = getRequestUserId(req);
     if (!idUsuario) return sendError(res, 401, 'UNAUTHORIZED', 'No autorizado.');
+    const roleContext = await getOcRoleContext(req, idUsuario, client);
+    if (!roleContext.isFullOcManager) {
+      return sendError(res, 403, 'FORBIDDEN', 'No puedes registrar compra con este perfil.');
+    }
 
     const idOrdenCompra = parsePositiveInt(req.params?.id_orden_compra);
     if (!idOrdenCompra) {
@@ -3256,6 +4027,7 @@ router.post('/orden_compras/workflow/:id_orden_compra/convertir', checkPermissio
       }
     }
 
+    // AM: convierte/actualiza compra por proveedor dentro de la misma OC para evitar colision entre grupos.
     const compraExistenteResult = await client.query(
       `
         SELECT
@@ -3269,14 +4041,16 @@ router.post('/orden_compras/workflow/:id_orden_compra/convertir', checkPermissio
           total_detalle,
           total,
           descuento_tipo,
-          descuento_valor
+          descuento_valor,
+          COALESCE(NULLIF(to_jsonb(compras)->>'observacion_pago', ''), NULL)::text AS observacion_pago
         FROM public.compras
         WHERE id_orden_compra = $1
+          AND id_proveedor = $2
         ORDER BY id_compra DESC
         LIMIT 1
         FOR UPDATE
       `,
-      [idOrdenCompra]
+      [idOrdenCompra, idProveedor]
     );
     let compraActual = compraExistenteResult.rows?.[0] || null;
     let idCompra = parsePositiveInt(compraActual?.id_compra);
@@ -3299,6 +4073,78 @@ router.post('/orden_compras/workflow/:id_orden_compra/convertir', checkPermissio
     }
     if (isvPct === null) isvPct = 0;
 
+    const orderWarehouseConsistencyResult = await client.query(
+      `
+        SELECT
+          doc.id_detalle_orden,
+          doc.id_almacen_destino,
+          COALESCE(p.id_almacen, i.id_almacen) AS id_almacen_item
+        FROM public.detalle_orden_compras doc
+        LEFT JOIN public.productos p ON p.id_producto = doc.id_producto
+        LEFT JOIN public.insumos i ON i.id_insumo = doc.id_insumo
+        WHERE doc.id_orden_compra = $1
+        ORDER BY doc.id_detalle_orden ASC
+      `,
+      [idOrdenCompra]
+    );
+    const orderWarehouseRows = orderWarehouseConsistencyResult.rows || [];
+    const orderWarehouseIds = Array.from(
+      new Set(
+        orderWarehouseRows
+          .map((detail) => parsePositiveInt(detail.id_almacen_destino) || parsePositiveInt(detail.id_almacen_item))
+          .filter((id) => Number.isInteger(id) && id > 0)
+      )
+    );
+    if (orderWarehouseIds.length === 0) {
+      await withRollback(client);
+      return sendError(res, 409, 'CONFLICT', 'La orden no tiene un almacen operativo valido.');
+    }
+    const orderWarehouseStateRows = await client.query(
+      `
+        SELECT id_almacen, id_sucursal, COALESCE(estado, true) AS estado
+        FROM public.almacenes
+        WHERE id_almacen = ANY($1::int[])
+      `,
+      [orderWarehouseIds]
+    );
+    const byWarehouse = new Map();
+    for (const row of orderWarehouseStateRows.rows || []) {
+      byWarehouse.set(Number(row.id_almacen), row);
+    }
+    const missingOrderWarehouses = orderWarehouseIds.filter((id) => !byWarehouse.has(id));
+    if (missingOrderWarehouses.length > 0) {
+      await withRollback(client);
+      return sendError(res, 409, 'CONFLICT', 'La orden referencia almacenes que no existen.');
+    }
+    const inactiveOrderWarehouse = Array.from(byWarehouse.values()).find((row) => !Boolean(row.estado));
+    if (inactiveOrderWarehouse) {
+      await withRollback(client);
+      return sendError(
+        res,
+        409,
+        'CONFLICT',
+        `El almacen ${inactiveOrderWarehouse.id_almacen} esta inactivo y bloquea la conversion.`
+      );
+    }
+    const sucursalSet = new Set(
+      Array.from(byWarehouse.values())
+        .map((row) => parsePositiveInt(row.id_sucursal))
+        .filter((id) => Number.isInteger(id) && id > 0)
+    );
+    if (sucursalSet.size > 1) {
+      await withRollback(client);
+      return sendError(res, 409, 'CONFLICT', 'La orden mezcla almacenes de distintas sucursales.');
+    }
+    if (orderWarehouseIds.length > 1) {
+      await withRollback(client);
+      return sendError(
+        res,
+        409,
+        'CONFLICT',
+        'La orden mezcla multiples almacenes y no puede convertirse en esta fase.'
+      );
+    }
+
     const detailsResult = await client.query(
       `
         SELECT
@@ -3307,6 +4153,7 @@ router.post('/orden_compras/workflow/:id_orden_compra/convertir', checkPermissio
           doc.id_insumo,
           doc.id_producto,
           doc.id_almacen_destino,
+          doc.id_proveedor_sugerido,
           p.id_producto AS producto_existente,
           i.id_insumo AS insumo_existente,
           COALESCE(p.estado, true) AS producto_activo,
@@ -3334,14 +4181,20 @@ router.post('/orden_compras/workflow/:id_orden_compra/convertir', checkPermissio
           LIMIT 1
         ) dc_prev ON true
         WHERE doc.id_orden_compra = $1
+          AND doc.id_proveedor_sugerido = $3
         ORDER BY doc.id_detalle_orden ASC
       `,
-      [idOrdenCompra, idCompra || null]
+      [idOrdenCompra, idCompra || null, idProveedor]
     );
     const details = detailsResult.rows || [];
     if (details.length === 0) {
       await withRollback(client);
-      return sendError(res, 409, 'CONFLICT', 'La orden no tiene detalles para continuar.');
+      return sendError(
+        res,
+        409,
+        'CONFLICT',
+        'No hay lineas de la orden asociadas al proveedor seleccionado.'
+      );
     }
 
     const detailWarehouseIds = Array.from(
@@ -3539,7 +4392,7 @@ router.post('/orden_compras/workflow/:id_orden_compra/convertir', checkPermissio
     const totalCompra = round2(baseTotal + isv);
 
     if (!idCompra) {
-      // AM: crea compra administrativa base y deja persistidos montos reales para auditoria.
+      // AM: crea compra administrativa por proveedor y deja persistidos montos reales para auditoria.
       const compraResult = await client.query(
         `
           INSERT INTO public.compras (
@@ -3577,7 +4430,7 @@ router.post('/orden_compras/workflow/:id_orden_compra/convertir', checkPermissio
       );
       idCompra = Number(compraResult.rows?.[0]?.id_compra);
     } else {
-      // AM: actualiza metadata y montos administrativos sin tocar inventario en esta etapa.
+      // AM: actualiza metadata y montos administrativos del proveedor sin tocar inventario en esta etapa.
       await client.query(
         `
           UPDATE public.compras
@@ -3675,14 +4528,92 @@ router.post('/orden_compras/workflow/:id_orden_compra/convertir', checkPermissio
     const compraActualizada = compraActualizadaResult.rows?.[0] || null;
     const idArchivoTransferenciaFinal = parsePositiveInt(compraActualizada?.id_archivo_transferencia);
 
-    if (accion === 'guardar_y_abastecer' && !idArchivoTransferenciaFinal) {
-      await withRollback(client);
-      return sendError(
-        res,
-        409,
-        'CONFLICT',
-        'Para "Guardar y abastecer" debes registrar la imagen de deposito/transferencia.'
-      );
+    // AM: valida readiness global por proveedor para no marcar lista una OC con grupos pendientes.
+    const requiredProvidersResult = await client.query(
+      `
+        SELECT DISTINCT
+          doc.id_proveedor_sugerido AS id_proveedor,
+          prov.nombre_proveedor
+        FROM public.detalle_orden_compras doc
+        LEFT JOIN public.proveedores prov ON prov.id_proveedor = doc.id_proveedor_sugerido
+        WHERE doc.id_orden_compra = $1
+        ORDER BY doc.id_proveedor_sugerido ASC
+      `,
+      [idOrdenCompra]
+    );
+    const requiredProviderMap = new Map();
+    let hasInvalidProviderGroup = false;
+    for (const row of requiredProvidersResult.rows || []) {
+      const providerId = parsePositiveInt(row.id_proveedor);
+      if (!providerId) {
+        hasInvalidProviderGroup = true;
+        continue;
+      }
+      requiredProviderMap.set(providerId, normalizeText(row.nombre_proveedor, MAX_SHORT_TEXT_LEN));
+    }
+
+    const comprasByOrderResult = await client.query(
+      `
+        SELECT DISTINCT ON (c.id_proveedor)
+          c.id_compra,
+          c.id_proveedor,
+          c.id_archivo_transferencia,
+          c.referencia_transferencia,
+          COALESCE(NULLIF(to_jsonb(c)->>'observacion_pago', ''), NULL)::text AS observacion_pago
+        FROM public.compras c
+        WHERE c.id_orden_compra = $1
+          AND c.id_proveedor IS NOT NULL
+        ORDER BY c.id_proveedor ASC, c.id_compra DESC
+      `,
+      [idOrdenCompra]
+    );
+    const latestCompraByProvider = new Map();
+    for (const row of comprasByOrderResult.rows || []) {
+      const providerId = parsePositiveInt(row.id_proveedor);
+      if (!providerId) continue;
+      latestCompraByProvider.set(providerId, row);
+    }
+
+    const idArchivoFacturaRecepcion = parsePositiveInt(orderRow.id_archivo_factura_recepcion);
+    const missingProviderForSupply = [];
+    const missingTransferByProvider = [];
+    for (const providerId of requiredProviderMap.keys()) {
+      const compraProveedor = latestCompraByProvider.get(providerId);
+      if (!compraProveedor) {
+        missingProviderForSupply.push(providerId);
+        continue;
+      }
+      if (doesCompraRequireTransferEvidence(compraProveedor) && !parsePositiveInt(compraProveedor.id_archivo_transferencia)) {
+        missingTransferByProvider.push(providerId);
+      }
+    }
+
+    // AM: evidencias administrativas en convertir ya no bloquean; se acumulan como advertencias no destructivas.
+    const evidenciaWarnings = [];
+    if (accion === 'guardar_y_abastecer') {
+      if (hasInvalidProviderGroup || missingProviderForSupply.length > 0) {
+        await withRollback(client);
+        return sendError(res, 409, 'CONFLICT', 'Faltan proveedores por registrar compra.');
+      }
+      // AM: factura pendiente pasa a warning administrativo para alinear convertir con abastecer.
+      if (!idArchivoFacturaRecepcion) {
+        evidenciaWarnings.push({
+          code: 'OC_FACTURA_PENDIENTE',
+          message: 'La orden fue guardada para abastecer, pero no tiene factura adjunta.'
+        });
+      }
+      // AM: comprobante pendiente por proveedor pasa a warning administrativo y no bloquea el flujo.
+      if (missingTransferByProvider.length > 0) {
+        for (const providerIdMissing of missingTransferByProvider) {
+          const missingLabel = getProviderLabel(requiredProviderMap, providerIdMissing);
+          evidenciaWarnings.push({
+            code: 'OC_COMPROBANTE_PENDIENTE',
+            id_proveedor: providerIdMissing,
+            proveedor: missingLabel,
+            message: `La orden fue guardada para abastecer, pero no tiene comprobante de deposito o transferencia para el proveedor ${missingLabel}.`
+          });
+        }
+      }
     }
 
     const alreadyProcessed =
@@ -3693,13 +4624,23 @@ router.post('/orden_compras/workflow/:id_orden_compra/convertir', checkPermissio
         normalizeText(compraActualizada?.referencia_transferencia, MAX_TEXT_LEN) &&
       round2(Number(compraActual.total || 0)) === round2(Number(compraActualizada?.total || 0));
 
+    // AM: listo para abastecer ahora depende solo de validaciones duras; evidencias quedan como warning administrativo.
+    const readyForSupply = !hasInvalidProviderGroup && missingProviderForSupply.length === 0;
+    const hasWarnings = accion === 'guardar_y_abastecer' && evidenciaWarnings.length > 0;
+
     await client.query('COMMIT');
     return res.status(200).json({
       ok: true,
+      // AM: mantiene contrato compatible y agrega warning no bloqueante cuando faltan evidencias administrativas.
+      warning: hasWarnings,
+      warning_code: hasWarnings ? 'OC_EVIDENCIAS_PENDIENTES' : null,
       message:
         accion === 'guardar_y_abastecer'
-          ? 'Datos administrativos guardados. La orden quedo lista para abastecer.'
+          ? hasWarnings
+            ? 'Datos administrativos guardados. La orden puede abastecerse con evidencias pendientes de revision.'
+            : 'Datos administrativos guardados. La orden quedo lista para abastecer.'
           : 'Datos administrativos guardados correctamente.',
+      warnings: hasWarnings ? evidenciaWarnings : [],
       data: {
         id_orden_compra: idOrdenCompra,
         id_compra: idCompra,
@@ -3715,8 +4656,9 @@ router.post('/orden_compras/workflow/:id_orden_compra/convertir', checkPermissio
         descuento_valor: round2(Number(compraActualizada?.descuento_valor || 0)),
         isv_pct: isvPct,
         accion,
-        ready_for_supply: Boolean(idArchivoTransferenciaFinal),
-        already_processed: Boolean(alreadyProcessed)
+        ready_for_supply: readyForSupply,
+        already_processed: Boolean(alreadyProcessed),
+        evidencias_pendientes: hasWarnings ? evidenciaWarnings : []
       }
     });
   } catch (error) {
@@ -3732,6 +4674,7 @@ router.post('/orden_compras/workflow/:id_orden_compra/recepcion', checkPermissio
   try {
     const idUsuario = getRequestUserId(req);
     if (!idUsuario) return sendError(res, 401, 'UNAUTHORIZED', 'No autorizado.');
+    const roleContext = await getOcRoleContext(req, idUsuario, client);
 
     const idOrdenCompra = parsePositiveInt(req.params?.id_orden_compra);
     if (!idOrdenCompra) {
@@ -3762,10 +4705,8 @@ router.post('/orden_compras/workflow/:id_orden_compra/recepcion', checkPermissio
       return sendError(res, 403, 'FORBIDDEN', 'No tienes permiso para reportar recepcion en esta orden.');
     }
 
-    // AM: evita que perfiles administrativos de compra (convertir) ejecuten la recepcion operativa por error.
-    const userCanConvert = await userHasAnyPermission(idUsuario, PERM_OC_CONVERT, client);
-    const isSuperAdmin = await isRequestUserSuperAdmin(req);
-    if (userCanConvert && !isSuperAdmin) {
+    // AM: recepcion operativa: bloquea actores administrativos y requiere perfil operativo funcional.
+    if (roleContext.isFullOcManager) {
       await withRollback(client);
       return sendError(
         res,
@@ -3773,6 +4714,10 @@ router.post('/orden_compras/workflow/:id_orden_compra/recepcion', checkPermissio
         'FORBIDDEN',
         'La recepcion de sucursal debe ser registrada por un perfil operativo (Cocina/Cajero).'
       );
+    }
+    if (!roleContext.isOperativeOcActor) {
+      await withRollback(client);
+      return sendError(res, 403, 'FORBIDDEN', 'No tienes permiso operativo para reportar recepcion.');
     }
 
     if (![ESTADO_APROBADA, ESTADO_EN_COMPRA].includes(String(orderRow.estado_flujo || '').toUpperCase())) {
@@ -3903,6 +4848,10 @@ router.post('/orden_compras/workflow/:id_orden_compra/abastecer', checkPermissio
   try {
     const idUsuario = getRequestUserId(req);
     if (!idUsuario) return sendError(res, 401, 'UNAUTHORIZED', 'No autorizado.');
+    const roleContext = await getOcRoleContext(req, idUsuario, client);
+    if (!roleContext.isFullOcManager) {
+      return sendError(res, 403, 'FORBIDDEN', 'No puedes abastecer inventario con este perfil.');
+    }
 
     const idOrdenCompra = parsePositiveInt(req.params?.id_orden_compra);
     if (!idOrdenCompra) {
@@ -3976,68 +4925,289 @@ router.post('/orden_compras/workflow/:id_orden_compra/abastecer', checkPermissio
       );
     }
 
-    let compraRow = null;
+    // AM: determina lineas requeridas de la OC y obliga proveedor por linea para soportar agrupacion segura.
+    const requiredDetailsResult = await client.query(
+      `
+        SELECT
+          doc.id_detalle_orden,
+          doc.cantidad_orden,
+          doc.id_producto,
+          doc.id_insumo,
+          doc.id_almacen_destino,
+          doc.id_proveedor_sugerido,
+          prov.nombre_proveedor,
+          p.id_almacen AS id_almacen_producto,
+          COALESCE(p.estado, true) AS producto_activo,
+          i.id_almacen AS id_almacen_insumo,
+          COALESCE(i.estado, true) AS insumo_activo
+        FROM public.detalle_orden_compras doc
+        LEFT JOIN public.proveedores prov ON prov.id_proveedor = doc.id_proveedor_sugerido
+        LEFT JOIN public.productos p ON p.id_producto = doc.id_producto
+        LEFT JOIN public.insumos i ON i.id_insumo = doc.id_insumo
+        WHERE doc.id_orden_compra = $1
+        ORDER BY doc.id_detalle_orden ASC
+      `,
+      [idOrdenCompra]
+    );
+    const requiredDetails = requiredDetailsResult.rows || [];
+    if (requiredDetails.length === 0) {
+      await withRollback(client);
+      return sendError(res, 409, 'CONFLICT', 'La orden no tiene lineas para abastecer.');
+    }
+
+    const requiredQtyByKey = new Map();
+    const providerMap = new Map();
+    const requiredProviders = new Set();
+    const orderWarehouseIds = new Set();
+
+    for (const detail of requiredDetails) {
+      const providerId = parsePositiveInt(detail.id_proveedor_sugerido);
+      if (!providerId) {
+        await withRollback(client);
+        return sendError(res, 409, 'CONFLICT', 'Faltan proveedores por registrar compra.');
+      }
+      requiredProviders.add(providerId);
+      providerMap.set(providerId, normalizeText(detail.nombre_proveedor, MAX_SHORT_TEXT_LEN));
+
+      const cantidadOrden = parsePositiveInt(detail.cantidad_orden);
+      if (!cantidadOrden) {
+        await withRollback(client);
+        return sendError(
+          res,
+          409,
+          'CONFLICT',
+          `El detalle ${detail.id_detalle_orden} tiene cantidad invalida para abastecer.`
+        );
+      }
+
+      const itemRef = resolveOrderItemReference({
+        idProducto: detail.id_producto,
+        idInsumo: detail.id_insumo
+      });
+      if (!itemRef.item_tipo || !itemRef.id_item) {
+        await withRollback(client);
+        return sendError(
+          res,
+          409,
+          'CONFLICT',
+          `El detalle ${detail.id_detalle_orden} no define un item valido para abastecimiento.`
+        );
+      }
+
+      if (
+        itemRef.item_tipo === 'producto' &&
+        !(detail.producto_activo === true || detail.producto_activo === 1 || detail.producto_activo === '1')
+      ) {
+        await withRollback(client);
+        return sendError(res, 409, 'CONFLICT', `El producto ${itemRef.id_item} esta inactivo.`);
+      }
+      if (
+        itemRef.item_tipo === 'insumo' &&
+        !(detail.insumo_activo === true || detail.insumo_activo === 1 || detail.insumo_activo === '1')
+      ) {
+        await withRollback(client);
+        return sendError(res, 409, 'CONFLICT', `El insumo ${itemRef.id_item} esta inactivo.`);
+      }
+
+      const idAlmacenActual =
+        itemRef.item_tipo === 'producto' ? detail.id_almacen_producto : detail.id_almacen_insumo;
+      const warehouseAlignment = validateItemWarehouseAlignment({
+        idDetalle: detail.id_detalle_orden,
+        itemTipo: itemRef.item_tipo,
+        idItem: itemRef.id_item,
+        idAlmacenDestino: detail.id_almacen_destino,
+        idAlmacenActual
+      });
+      if (!warehouseAlignment.ok) {
+        await withRollback(client);
+        return sendWarehouseMismatchConflict(res, warehouseAlignment.data);
+      }
+
+      const idAlmacenDestino = parsePositiveInt(warehouseAlignment.id_almacen_resuelto);
+      if (!idAlmacenDestino) {
+        await withRollback(client);
+        return sendError(
+          res,
+          409,
+          'CONFLICT',
+          `El detalle ${detail.id_detalle_orden} no tiene almacen operativo valido.`
+        );
+      }
+      orderWarehouseIds.add(idAlmacenDestino);
+
+      const qtyKey = buildProviderItemKey({
+        idProveedor: providerId,
+        idProducto: detail.id_producto,
+        idInsumo: detail.id_insumo,
+        idAlmacenDestino
+      });
+      const currentQty = Number(requiredQtyByKey.get(qtyKey) || 0);
+      requiredQtyByKey.set(qtyKey, currentQty + cantidadOrden);
+    }
+
+    const warehouseIds = Array.from(orderWarehouseIds.values());
+    const warehouseRowsResult = await client.query(
+      `
+        SELECT id_almacen, id_sucursal, COALESCE(estado, true) AS estado
+        FROM public.almacenes
+        WHERE id_almacen = ANY($1::int[])
+      `,
+      [warehouseIds]
+    );
+    const warehousesById = new Map();
+    for (const row of warehouseRowsResult.rows || []) {
+      warehousesById.set(Number(row.id_almacen), row);
+    }
+    const missingWarehouses = warehouseIds.filter((id) => !warehousesById.has(id));
+    if (missingWarehouses.length > 0) {
+      await withRollback(client);
+      return sendError(res, 409, 'CONFLICT', 'La orden referencia almacenes inexistentes.');
+    }
+    const inactiveWarehouse = Array.from(warehousesById.values()).find((row) => !Boolean(row.estado));
+    if (inactiveWarehouse) {
+      await withRollback(client);
+      return sendError(
+        res,
+        409,
+        'CONFLICT',
+        `El almacen ${inactiveWarehouse.id_almacen} esta inactivo y no puede abastecerse.`
+      );
+    }
+    const sucursalSet = new Set(
+      Array.from(warehousesById.values())
+        .map((row) => parsePositiveInt(row.id_sucursal))
+        .filter((id) => Number.isInteger(id) && id > 0)
+    );
+    if (sucursalSet.size > 1) {
+      await withRollback(client);
+      return sendError(res, 409, 'CONFLICT', 'La orden mezcla almacenes de distintas sucursales.');
+    }
+    if (warehouseIds.length !== 1) {
+      await withRollback(client);
+      return sendError(
+        res,
+        409,
+        'CONFLICT',
+        'La orden mezcla multiples almacenes y no puede abastecerse en esta fase.'
+      );
+    }
+    const idAlmacenOperativo = warehouseIds[0];
+
+    const comprasByProviderResult = await client.query(
+      `
+        SELECT DISTINCT ON (c.id_proveedor)
+          c.id_compra,
+          c.id_orden_compra,
+          c.id_proveedor,
+          c.id_archivo_transferencia,
+          c.referencia_transferencia,
+          COALESCE(NULLIF(to_jsonb(c)->>'observacion_pago', ''), NULL)::text AS observacion_pago,
+          prov.nombre_proveedor
+        FROM public.compras c
+        LEFT JOIN public.proveedores prov ON prov.id_proveedor = c.id_proveedor
+        WHERE c.id_orden_compra = $1
+          AND c.id_proveedor IS NOT NULL
+        ORDER BY c.id_proveedor ASC, c.id_compra DESC
+      `,
+      [idOrdenCompra]
+    );
+    const latestCompraByProvider = new Map();
+    for (const row of comprasByProviderResult.rows || []) {
+      const providerId = parsePositiveInt(row.id_proveedor);
+      if (!providerId) continue;
+      latestCompraByProvider.set(providerId, row);
+      if (!providerMap.has(providerId)) {
+        providerMap.set(providerId, normalizeText(row.nombre_proveedor, MAX_SHORT_TEXT_LEN));
+      }
+    }
+
     if (idCompraBody) {
-      const result = await client.query(
-        `
-          SELECT id_compra, id_orden_compra, id_archivo_transferencia
-          FROM public.compras
-          WHERE id_compra = $1
-            AND id_orden_compra = $2
-          LIMIT 1
-        `,
-        [idCompraBody, idOrdenCompra]
+      const selectedCompraExists = (comprasByProviderResult.rows || []).some(
+        (row) => parsePositiveInt(row.id_compra) === idCompraBody
       );
-      compraRow = result.rows?.[0] || null;
-    } else {
-      compraRow = await getLatestCompraByOrden(idOrdenCompra, client);
+      if (!selectedCompraExists) {
+        await withRollback(client);
+        return sendError(res, 409, 'CONFLICT', 'La compra indicada no pertenece a la orden seleccionada.');
+      }
     }
 
-    if (!compraRow) {
+    const missingProviders = Array.from(requiredProviders.values()).filter(
+      (providerId) => !latestCompraByProvider.has(providerId)
+    );
+    if (missingProviders.length > 0) {
       await withRollback(client);
-      return sendError(
-        res,
-        409,
-        'CONFLICT',
-        'No se encontro una compra asociada para abastecer esta orden.'
-      );
+      return sendError(res, 409, 'CONFLICT', 'Faltan proveedores por registrar compra.');
     }
 
-    if (!parsePositiveInt(compraRow.id_archivo_transferencia)) {
+    // AM: evidencias pendientes pasan a advertencia administrativa y no bloquean abastecimiento.
+    const evidenciaWarnings = [];
+    const idArchivoFacturaRecepcion = parsePositiveInt(orderRow.id_archivo_factura_recepcion);
+    if (!idArchivoFacturaRecepcion) {
+      evidenciaWarnings.push({
+        code: 'OC_FACTURA_PENDIENTE',
+        message: 'La orden fue abastecida, pero no tiene factura adjunta.'
+      });
+    }
+
+    for (const providerId of requiredProviders.values()) {
+      const compraProveedor = latestCompraByProvider.get(providerId);
+      if (doesCompraRequireTransferEvidence(compraProveedor) && !parsePositiveInt(compraProveedor.id_archivo_transferencia)) {
+        const providerLabel = getProviderLabel(providerMap, providerId);
+        evidenciaWarnings.push({
+          code: 'OC_COMPROBANTE_PENDIENTE',
+          id_proveedor: providerId,
+          proveedor: providerLabel,
+          message: `La orden fue abastecida, pero no tiene comprobante de deposito o transferencia para el proveedor ${providerLabel}.`
+        });
+      }
+    }
+
+    const compraIds = Array.from(
+      new Set(
+        Array.from(latestCompraByProvider.values())
+          .map((row) => parsePositiveInt(row.id_compra))
+          .filter((id) => Number.isInteger(id) && id > 0)
+      )
+    );
+    if (compraIds.length === 0) {
       await withRollback(client);
-      return sendError(
-        res,
-        409,
-        'CONFLICT',
-        'Debes registrar primero el pago administrativo antes del abastecimiento oficial.'
-      );
+      return sendError(res, 409, 'CONFLICT', 'No se encontro una compra asociada para abastecer esta orden.');
     }
 
-    const idCompra = Number(compraRow.id_compra);
     const detalleCompraResult = await client.query(
       `
         SELECT
-          id_detalle_compra,
-          id_compra,
-          id_producto,
-          id_insumo,
-          id_almacen_destino,
-          cantidad
-        FROM public.detalle_compras
-        WHERE id_compra = $1
-        ORDER BY id_detalle_compra ASC
+          dc.id_detalle_compra,
+          dc.id_compra,
+          c.id_proveedor,
+          dc.id_producto,
+          dc.id_insumo,
+          dc.id_almacen_destino,
+          dc.cantidad
+        FROM public.detalle_compras dc
+        INNER JOIN public.compras c ON c.id_compra = dc.id_compra
+        WHERE c.id_orden_compra = $1
+          AND dc.id_compra = ANY($2::int[])
+        ORDER BY dc.id_compra ASC, dc.id_detalle_compra ASC
       `,
-      [idCompra]
+      [idOrdenCompra, compraIds]
     );
     const detalleCompra = detalleCompraResult.rows || [];
     if (detalleCompra.length === 0) {
       await withRollback(client);
-      return sendError(res, 409, 'CONFLICT', 'La compra no tiene detalles para abastecer inventario.');
+      return sendError(res, 409, 'CONFLICT', 'No hay detalles de compra para abastecer inventario.');
     }
 
-    let totalMovimientos = 0;
+    const actualQtyByKey = new Map();
+    const movimientos = [];
 
     for (const row of detalleCompra) {
+      const providerId = parsePositiveInt(row.id_proveedor);
+      if (!providerId || !requiredProviders.has(providerId)) {
+        await withRollback(client);
+        return sendError(res, 409, 'CONFLICT', 'Se detectaron detalles de compra fuera de los proveedores de la orden.');
+      }
+
       const cantidad = parsePositiveInt(row.cantidad);
       if (!cantidad) {
         await withRollback(client);
@@ -4082,7 +5252,6 @@ router.post('/orden_compras/workflow/:id_orden_compra/abastecer', checkPermissio
           return sendError(res, 409, 'CONFLICT', `El producto ${itemRef.id_item} esta inactivo.`);
         }
 
-        // AM: bloqueo explicito cuando el almacen destino de compra no coincide con el almacen real del producto.
         const warehouseAlignment = validateItemWarehouseAlignment({
           idDetalle: row.id_detalle_compra,
           itemTipo: itemRef.item_tipo,
@@ -4116,7 +5285,6 @@ router.post('/orden_compras/workflow/:id_orden_compra/abastecer', checkPermissio
           return sendError(res, 409, 'CONFLICT', `El insumo ${itemRef.id_item} esta inactivo.`);
         }
 
-        // AM: bloqueo explicito cuando el almacen destino de compra no coincide con el almacen real del insumo.
         const warehouseAlignment = validateItemWarehouseAlignment({
           idDetalle: row.id_detalle_compra,
           itemTipo: itemRef.item_tipo,
@@ -4142,41 +5310,72 @@ router.post('/orden_compras/workflow/:id_orden_compra/abastecer', checkPermissio
           `No se pudo determinar el almacen del item en detalle ${row.id_detalle_compra}.`
         );
       }
-
-      const storedWarehouse = await client.query(
-        `
-          SELECT COALESCE(estado, true) AS estado
-          FROM public.almacenes
-          WHERE id_almacen = $1
-          LIMIT 1
-        `,
-        [idAlmacen]
-      );
-      if (storedWarehouse.rowCount === 0) {
+      if (idAlmacen !== idAlmacenOperativo) {
         await withRollback(client);
         return sendError(
           res,
           409,
           'CONFLICT',
-          `No se encontro el almacen ${idAlmacen} para abastecer el detalle ${row.id_detalle_compra}.`
+          'La orden incluye detalles de compra fuera del almacen operativo de su sucursal.'
         );
       }
-      if (!Boolean(storedWarehouse.rows?.[0]?.estado)) {
+
+      const qtyKey = buildProviderItemKey({
+        idProveedor: providerId,
+        idProducto: row.id_producto,
+        idInsumo: row.id_insumo,
+        idAlmacenDestino: idAlmacen
+      });
+      const actualQty = Number(actualQtyByKey.get(qtyKey) || 0);
+      actualQtyByKey.set(qtyKey, actualQty + cantidad);
+
+      movimientos.push({
+        id_compra: parsePositiveInt(row.id_compra),
+        cantidad,
+        id_almacen: idAlmacen,
+        id_producto: idProducto,
+        id_insumo: idInsumo
+      });
+    }
+
+    for (const [requiredKey, requiredQty] of requiredQtyByKey.entries()) {
+      const actualQty = Number(actualQtyByKey.get(requiredKey) || 0);
+      if (actualQty !== Number(requiredQty || 0)) {
         await withRollback(client);
         return sendError(
           res,
           409,
           'CONFLICT',
-          `El almacen ${idAlmacen} esta inactivo y no puede abastecer el detalle ${row.id_detalle_compra}.`
+          'Las cantidades finales de compra no coinciden con las cantidades exactas requeridas en la orden.'
         );
       }
+    }
 
+    for (const actualKey of actualQtyByKey.keys()) {
+      if (!requiredQtyByKey.has(actualKey)) {
+        await withRollback(client);
+        return sendError(
+          res,
+          409,
+          'CONFLICT',
+          'Se detectaron detalles de compra que no corresponden a las lineas oficiales de la orden.'
+        );
+      }
+    }
+
+    let totalMovimientos = 0;
+    const abastecidaConPendientesEvidencia = evidenciaWarnings.length > 0;
+    for (const mov of movimientos) {
+      // AM: deja trazabilidad operativa en movimientos cuando se abastece con evidencias pendientes.
+      const observacionEvidenciaPendiente = abastecidaConPendientesEvidencia
+        ? ' - Evidencias pendientes de revision administrativa.'
+        : '';
       const descripcion = normalizeText(
-        `Abastecimiento OC #${idOrdenCompra} / Compra #${idCompra}${descripcionExtra ? ` - ${descripcionExtra}` : ''}`,
+        `Abastecimiento OC #${idOrdenCompra} / Compra #${mov.id_compra}${observacionEvidenciaPendiente}${descripcionExtra ? ` - ${descripcionExtra}` : ''}`,
         250
       );
 
-      // AM: abastece inventario respetando el flujo oficial por `movimientos_inventario`.
+      // AM: abastece inventario una sola vez por OC despues de validar integralmente todos los proveedores.
       await client.query(
         `
           INSERT INTO public.movimientos_inventario (
@@ -4191,9 +5390,8 @@ router.post('/orden_compras/workflow/:id_orden_compra/abastecer', checkPermissio
           )
           VALUES ('ENTRADA', $1, $2, $3, $4, 'ORDEN_COMPRA', $5, $6)
         `,
-        [cantidad, idAlmacen, idProducto, idInsumo, idOrdenCompra, descripcion]
+        [mov.cantidad, mov.id_almacen, mov.id_producto, mov.id_insumo, idOrdenCompra, descripcion]
       );
-
       totalMovimientos += 1;
     }
 
@@ -4212,13 +5410,27 @@ router.post('/orden_compras/workflow/:id_orden_compra/abastecer', checkPermissio
     );
 
     await client.query('COMMIT');
+    const hasWarnings = evidenciaWarnings.length > 0;
+    const warningMessage = 'La orden fue abastecida con evidencias pendientes de revision administrativa.';
     return res.status(200).json({
       ok: true,
-      message: 'Abastecimiento registrado correctamente.',
+      warning: hasWarnings,
+      warning_code: hasWarnings ? 'OC_EVIDENCIAS_PENDIENTES' : null,
+      message: hasWarnings ? 'Orden abastecida correctamente con evidencias pendientes de revision.' : 'Abastecimiento registrado correctamente.',
+      warnings: hasWarnings
+        ? [
+            ...evidenciaWarnings,
+            {
+              code: 'OC_EVIDENCIAS_PENDIENTES',
+              message: warningMessage
+            }
+          ]
+        : [],
       data: {
         id_orden_compra: idOrdenCompra,
-        id_compra: idCompra,
-        movimientos_creados: totalMovimientos
+        id_compra: idCompraBody || compraIds[0] || null,
+        movimientos_creados: totalMovimientos,
+        evidencias_pendientes: hasWarnings ? evidenciaWarnings : []
       }
     });
   } catch (error) {

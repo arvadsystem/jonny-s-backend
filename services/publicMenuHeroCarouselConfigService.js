@@ -4,12 +4,21 @@ import { CARRUSEL_UPLOADS_SUBDIR, SUPABASE_ASSETS_BUCKET } from '../utils/upload
 const HERO_CAROUSEL_CONFIG_KEY = 'menu_publico_hero_carrusel_global_v1';
 const HERO_CAROUSEL_CONFIG_VALUE_MAX_LENGTH = 200;
 const HERO_CAROUSEL_DESCRIPTION = 'Configuracion global del carrusel hero del menu publico.';
+const HERO_CONTACT_CONFIG_KEY = 'menu_publico_hero_contacto_global_v1';
+const HERO_CONTACT_CONFIG_VALUE_MAX_LENGTH = 180;
+const HERO_CONTACT_DESCRIPTION = 'Telefonos globales del bloque contacto para el landing del menu publico.';
 const HERO_CAROUSEL_MAX_ITEMS = 6;
 const HERO_CAROUSEL_MAX_TITLE_LENGTH = 120;
+const HERO_CONTACT_PHONE_MAX_LENGTH = 40;
 const HERO_CAROUSEL_ALLOWED_PREFIX = `${SUPABASE_ASSETS_BUCKET}/${CARRUSEL_UPLOADS_SUBDIR}/`;
 const SUPABASE_PUBLIC_OBJECT_MARKER = '/storage/v1/object/public/';
 const HERO_CONFIG_GLOBAL_BRANCH_KEY = '0';
 const HERO_CONFIG_VERSION = 2;
+const EMPTY_CONTACT_PHONES = Object.freeze({
+  primary: '',
+  secondary: '',
+  whatsapp: ''
+});
 
 const toBranchKey = (value) => {
   const parsed = Number.parseInt(String(value ?? '').trim(), 10);
@@ -39,6 +48,7 @@ const toPositiveUniqueIds = (values = []) => {
 };
 
 const sanitizeTitle = (value) => String(value ?? '').trim().slice(0, HERO_CAROUSEL_MAX_TITLE_LENGTH);
+const sanitizeContactPhone = (value) => String(value ?? '').trim().slice(0, HERO_CONTACT_PHONE_MAX_LENGTH);
 
 const safeParseConfig = (rawValue) => {
   if (!rawValue) return {};
@@ -47,6 +57,15 @@ const safeParseConfig = (rawValue) => {
   } catch {
     return {};
   }
+};
+
+const normalizeContactPhones = (source = {}) => {
+  const input = source && typeof source === 'object' ? source : {};
+  return {
+    primary: sanitizeContactPhone(input.primary || input.telefono_principal || input.phone_primary || ''),
+    secondary: sanitizeContactPhone(input.secondary || input.telefono_secundario || input.phone_secondary || ''),
+    whatsapp: sanitizeContactPhone(input.whatsapp || input.telefono_whatsapp || '')
+  };
 };
 
 const extractSupabaseStoragePath = (value) => {
@@ -124,7 +143,8 @@ const resolveConfigInputShape = (config = {}) => {
     return {
       byBranch: parseByBranchFromAny(source?.b || {}),
       customByBranchIds: parseCustomIdsByBranchFromCompact(source?.c || {}),
-      customByBranchRows: {}
+      customByBranchRows: {},
+      contactPhones: normalizeContactPhones(source?.contactPhones || source?.t || source)
     };
   }
 
@@ -137,8 +157,9 @@ const resolveConfigInputShape = (config = {}) => {
   const byBranch = parseByBranchFromAny(byBranchRaw);
   const customByBranchIds = parseCustomIdsByBranchFromCompact(customByBranchRaw);
   const customByBranchRows = parseCustomRowsByBranchFromLegacy(customByBranchRaw);
+  const contactPhones = normalizeContactPhones(source?.contactPhones || source?.t || source);
 
-  return { byBranch, customByBranchIds, customByBranchRows };
+  return { byBranch, customByBranchIds, customByBranchRows, contactPhones };
 };
 
 const resolveLegacyRowsToIds = async ({ executor, customByBranchRows = {}, customByBranchIds = {} }) => {
@@ -300,6 +321,59 @@ const buildPublicConfigFromRawValue = async ({ executor, rawValue }) => {
   return { byBranch, customByBranch };
 };
 
+const serializeContactPayload = (contactPhones = {}) => {
+  const normalized = normalizeContactPhones(contactPhones);
+  const serialized = JSON.stringify(normalized);
+  if (serialized.length > HERO_CONTACT_CONFIG_VALUE_MAX_LENGTH) {
+    const error = new Error('La configuracion de telefonos de contacto excede el limite permitido.');
+    error.status = 400;
+    throw error;
+  }
+  return { serialized, normalized };
+};
+
+const upsertConfigValue = async ({ executor, key, value, description }) => {
+  const updateResult = await executor.query(
+    `
+      UPDATE configuracion_sistema
+      SET valor = $1,
+          actualizado_en = CURRENT_TIMESTAMP
+      WHERE clave = $2;
+    `,
+    [value, key]
+  );
+
+  if (updateResult.rowCount === 0) {
+    await executor.query(
+      `
+        INSERT INTO configuracion_sistema (clave, valor, descripcion, actualizado_en)
+        VALUES ($1, $2, $3, CURRENT_TIMESTAMP);
+      `,
+      [key, value, description]
+    );
+  }
+};
+
+const getStoredContactPhones = async (executor) => {
+  const result = await executor.query(
+    `
+      SELECT valor
+      FROM configuracion_sistema
+      WHERE clave = $1
+      LIMIT 1;
+    `,
+    [HERO_CONTACT_CONFIG_KEY]
+  );
+
+  const rawValue = result.rows?.[0]?.valor || '';
+  const parsed = safeParseConfig(rawValue);
+  const normalized = normalizeContactPhones(parsed);
+  return {
+    ...EMPTY_CONTACT_PHONES,
+    ...normalized
+  };
+};
+
 const serializeCompactPayload = (payload) => {
   const serialized = JSON.stringify(payload);
   if (serialized.length > HERO_CAROUSEL_CONFIG_VALUE_MAX_LENGTH) {
@@ -322,7 +396,14 @@ export const getPublicMenuHeroCarouselConfig = async () => {
   );
 
   const rawValue = result.rows?.[0]?.valor || '';
-  return buildPublicConfigFromRawValue({ executor: pool, rawValue });
+  const [carouselConfig, contactPhones] = await Promise.all([
+    buildPublicConfigFromRawValue({ executor: pool, rawValue }),
+    getStoredContactPhones(pool)
+  ]);
+  return {
+    ...carouselConfig,
+    contactPhones
+  };
 };
 
 export const savePublicMenuHeroCarouselConfig = async ({ client, config }) => {
@@ -339,27 +420,27 @@ export const savePublicMenuHeroCarouselConfig = async ({ client, config }) => {
     customByBranchIds: customIds
   });
   const serialized = serializeCompactPayload(compactPayload);
+  const contactPayload = serializeContactPayload(inputShape.contactPhones);
 
-  const updateResult = await executor.query(
-    `
-      UPDATE configuracion_sistema
-      SET valor = $1,
-          actualizado_en = CURRENT_TIMESTAMP
-      WHERE clave = $2;
-    `,
-    [serialized, HERO_CAROUSEL_CONFIG_KEY]
-  );
+  await upsertConfigValue({
+    executor,
+    key: HERO_CAROUSEL_CONFIG_KEY,
+    value: serialized,
+    description: HERO_CAROUSEL_DESCRIPTION
+  });
+  await upsertConfigValue({
+    executor,
+    key: HERO_CONTACT_CONFIG_KEY,
+    value: contactPayload.serialized,
+    description: HERO_CONTACT_DESCRIPTION
+  });
 
-  if (updateResult.rowCount === 0) {
-    await executor.query(
-      `
-        INSERT INTO configuracion_sistema (clave, valor, descripcion, actualizado_en)
-        VALUES ($1, $2, $3, CURRENT_TIMESTAMP);
-      `,
-      [HERO_CAROUSEL_CONFIG_KEY, serialized, HERO_CAROUSEL_DESCRIPTION]
-    );
-  }
-
-  return buildPublicConfigFromRawValue({ executor, rawValue: serialized });
+  const carouselConfig = await buildPublicConfigFromRawValue({ executor, rawValue: serialized });
+  return {
+    ...carouselConfig,
+    contactPhones: {
+      ...EMPTY_CONTACT_PHONES,
+      ...contactPayload.normalized
+    }
+  };
 };
-

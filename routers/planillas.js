@@ -1258,7 +1258,39 @@ const syncDetalleSalarioBaseFromEmpleado = async ({
     [safePlanillaId, safeDetalleId]
   );
 
+  const updatedIds = (result.rows || [])
+    .map((row) => parsePositiveInt(row.id_detalle_planilla))
+    .filter(Boolean);
+
+  for (const idDetalle of updatedIds) {
+    await db.query('SELECT public.fn_recalcular_detalle_planilla($1)', [idDetalle]);
+  }
+
   return { updated: result.rowCount || 0 };
+};
+
+const recalculateDetallePlanillaRows = async ({
+  db = pool,
+  idPlanilla,
+  idDetallePlanilla = null
+}) => {
+  const safePlanillaId = parsePositiveInt(idPlanilla);
+  if (!safePlanillaId) return { recalculated: 0 };
+
+  const safeDetalleId = idDetallePlanilla === null ? null : parsePositiveInt(idDetallePlanilla);
+  if (idDetallePlanilla !== null && !safeDetalleId) return { recalculated: 0 };
+
+  const result = await db.query(
+    `
+      SELECT public.fn_recalcular_detalle_planilla(dp.id_detalle_planilla) AS neto_actualizado
+      FROM public.detalle_planilla dp
+      WHERE dp.id_planilla = $1
+        AND ($2::int IS NULL OR dp.id_detalle_planilla = $2::int)
+    `,
+    [safePlanillaId, safeDetalleId]
+  );
+
+  return { recalculated: result.rowCount || 0 };
 };
 
 const PLANILLA_DETALLE_AUTO_SYNC_ALLOWED_STATES = new Set(['BORRADOR', 'CALCULADA']);
@@ -2640,6 +2672,7 @@ const planillaService = {
 
     await syncDetalleEmpleadosActivosBySucursal({ idPlanilla });
     await syncDetalleSalarioBaseFromEmpleado({ idPlanilla });
+    await recalculateDetallePlanillaRows({ idPlanilla });
 
     const pagination = parsePagination(req.query || {});
     if (!pagination) {
@@ -2835,6 +2868,7 @@ const planillaService = {
 
     await syncDetalleEmpleadosActivosBySucursal({ idPlanilla });
     await syncDetalleSalarioBaseFromEmpleado({ idPlanilla });
+    await recalculateDetallePlanillaRows({ idPlanilla });
 
     if (tipoPeriodoContext === TIPO_PERIODO.QUINCENAL) {
       const detalleRowsRaw = await queryFunctionRows(PLANILLA_ENDPOINT_CONTRACT.detalle, [idPlanilla]);
@@ -2950,6 +2984,7 @@ const planillaService = {
 
     await syncDetalleEmpleadosActivosBySucursal({ idPlanilla });
     await syncDetalleSalarioBaseFromEmpleado({ idPlanilla });
+    await recalculateDetallePlanillaRows({ idPlanilla });
 
     const data = await queryFunctionScalar(PLANILLA_ENDPOINT_CONTRACT.completa, [idPlanilla]);
     if (data && typeof data === 'object') {
