@@ -3,6 +3,32 @@ import pool from '../config/db-connection.js';
 const TEGUCIGALPA_TZ = 'America/Tegucigalpa';
 const DEFAULT_BUSINESS_NAME = "JONNY'S";
 const DEFAULT_FOOTER = 'Gracias por su compra';
+const TICKET_FLAG_DEFAULTS = Object.freeze({
+  mostrar_datos_fiscales: true,
+  mostrar_cai_ticket: true,
+  mostrar_numero_fiscal_ticket: true,
+  mostrar_codigo_interno_ticket: true,
+  aplicar_impuestos: false,
+  mostrar_impuestos_ticket: false,
+  mostrar_importe_exento: false,
+  mostrar_importe_gravado_15: false,
+  mostrar_isv_15: false,
+  mostrar_importe_gravado_18: false,
+  mostrar_isv_18: false,
+  mostrar_total_isv: false,
+  mostrar_descuento_linea: true,
+  mostrar_descuento_porcentaje_linea: true,
+  mostrar_descuento_total: true,
+  imprimir_comprobante_reversion: true,
+  mostrar_venta_original_reversion: true,
+  mostrar_codigo_reversion: true,
+  mostrar_usuario_reversion: true,
+  mostrar_caja_sesion_reversion: true,
+  mostrar_motivo_reversion: true,
+  mostrar_detalle_reversion: true,
+  mostrar_total_reversion: true
+});
+const TICKET_FLAG_FIELDS = Object.keys(TICKET_FLAG_DEFAULTS);
 
 const toPositiveInt = (value) => {
   const parsed = Number.parseInt(String(value ?? ''), 10);
@@ -25,6 +51,12 @@ const toTicketWidth = (value) => {
   const width = Number.parseInt(String(value ?? ''), 10);
   return width === 58 ? 58 : 80;
 };
+
+const resolveTicketFlags = (source = {}) =>
+  TICKET_FLAG_FIELDS.reduce((acc, field) => ({
+    ...acc,
+    [field]: toBoolean(source?.[field], TICKET_FLAG_DEFAULTS[field])
+  }), {});
 
 const currentDateTimeHonduras = () =>
   new Date().toLocaleString('sv-SE', { timeZone: TEGUCIGALPA_TZ }).replace(' ', 'T');
@@ -72,7 +104,30 @@ const ensureConfigRow = async (client, idSucursal, sucursal) => {
         mostrar_rtn,
         mostrar_direccion,
         mostrar_telefono,
-        mostrar_correo
+        mostrar_correo,
+        mostrar_datos_fiscales,
+        mostrar_cai_ticket,
+        mostrar_numero_fiscal_ticket,
+        mostrar_codigo_interno_ticket,
+        aplicar_impuestos,
+        mostrar_impuestos_ticket,
+        mostrar_importe_exento,
+        mostrar_importe_gravado_15,
+        mostrar_isv_15,
+        mostrar_importe_gravado_18,
+        mostrar_isv_18,
+        mostrar_total_isv,
+        mostrar_descuento_linea,
+        mostrar_descuento_porcentaje_linea,
+        mostrar_descuento_total,
+        imprimir_comprobante_reversion,
+        mostrar_venta_original_reversion,
+        mostrar_codigo_reversion,
+        mostrar_usuario_reversion,
+        mostrar_caja_sesion_reversion,
+        mostrar_motivo_reversion,
+        mostrar_detalle_reversion,
+        mostrar_total_reversion
       )
       VALUES (
         $1,
@@ -96,7 +151,11 @@ const ensureConfigRow = async (client, idSucursal, sucursal) => {
         true,
         true,
         true,
-        false
+        false,
+        true, true, true, true,
+        false, false, false, false, false, false, false, false,
+        true, true, true,
+        true, true, true, true, true, true, true, true
       )
       ON CONFLICT (id_sucursal) DO NOTHING
       RETURNING
@@ -122,7 +181,30 @@ const ensureConfigRow = async (client, idSucursal, sucursal) => {
         mostrar_rtn,
         mostrar_direccion,
         mostrar_telefono,
-        mostrar_correo
+        mostrar_correo,
+        mostrar_datos_fiscales,
+        mostrar_cai_ticket,
+        mostrar_numero_fiscal_ticket,
+        mostrar_codigo_interno_ticket,
+        aplicar_impuestos,
+        mostrar_impuestos_ticket,
+        mostrar_importe_exento,
+        mostrar_importe_gravado_15,
+        mostrar_isv_15,
+        mostrar_importe_gravado_18,
+        mostrar_isv_18,
+        mostrar_total_isv,
+        mostrar_descuento_linea,
+        mostrar_descuento_porcentaje_linea,
+        mostrar_descuento_total,
+        imprimir_comprobante_reversion,
+        mostrar_venta_original_reversion,
+        mostrar_codigo_reversion,
+        mostrar_usuario_reversion,
+        mostrar_caja_sesion_reversion,
+        mostrar_motivo_reversion,
+        mostrar_detalle_reversion,
+        mostrar_total_reversion
     `,
     [
       idSucursal,
@@ -162,7 +244,30 @@ const readConfigBySucursal = async (client, idSucursal) => {
         mostrar_rtn,
         mostrar_direccion,
         mostrar_telefono,
-        mostrar_correo
+        mostrar_correo,
+        mostrar_datos_fiscales,
+        mostrar_cai_ticket,
+        mostrar_numero_fiscal_ticket,
+        mostrar_codigo_interno_ticket,
+        aplicar_impuestos,
+        mostrar_impuestos_ticket,
+        mostrar_importe_exento,
+        mostrar_importe_gravado_15,
+        mostrar_isv_15,
+        mostrar_importe_gravado_18,
+        mostrar_isv_18,
+        mostrar_total_isv,
+        mostrar_descuento_linea,
+        mostrar_descuento_porcentaje_linea,
+        mostrar_descuento_total,
+        imprimir_comprobante_reversion,
+        mostrar_venta_original_reversion,
+        mostrar_codigo_reversion,
+        mostrar_usuario_reversion,
+        mostrar_caja_sesion_reversion,
+        mostrar_motivo_reversion,
+        mostrar_detalle_reversion,
+        mostrar_total_reversion
       FROM public.facturacion_config_sucursal
       WHERE id_sucursal = $1
       ORDER BY COALESCE(activo, false) DESC, id_config DESC
@@ -204,7 +309,30 @@ const readSucursalFacturacionContext = async (client, idSucursal) => {
         cfg.mostrar_rtn AS cfg_mostrar_rtn,
         cfg.mostrar_direccion AS cfg_mostrar_direccion,
         cfg.mostrar_telefono AS cfg_mostrar_telefono,
-        cfg.mostrar_correo AS cfg_mostrar_correo
+        cfg.mostrar_correo AS cfg_mostrar_correo,
+        cfg.mostrar_datos_fiscales AS cfg_mostrar_datos_fiscales,
+        cfg.mostrar_cai_ticket AS cfg_mostrar_cai_ticket,
+        cfg.mostrar_numero_fiscal_ticket AS cfg_mostrar_numero_fiscal_ticket,
+        cfg.mostrar_codigo_interno_ticket AS cfg_mostrar_codigo_interno_ticket,
+        cfg.aplicar_impuestos AS cfg_aplicar_impuestos,
+        cfg.mostrar_impuestos_ticket AS cfg_mostrar_impuestos_ticket,
+        cfg.mostrar_importe_exento AS cfg_mostrar_importe_exento,
+        cfg.mostrar_importe_gravado_15 AS cfg_mostrar_importe_gravado_15,
+        cfg.mostrar_isv_15 AS cfg_mostrar_isv_15,
+        cfg.mostrar_importe_gravado_18 AS cfg_mostrar_importe_gravado_18,
+        cfg.mostrar_isv_18 AS cfg_mostrar_isv_18,
+        cfg.mostrar_total_isv AS cfg_mostrar_total_isv,
+        cfg.mostrar_descuento_linea AS cfg_mostrar_descuento_linea,
+        cfg.mostrar_descuento_porcentaje_linea AS cfg_mostrar_descuento_porcentaje_linea,
+        cfg.mostrar_descuento_total AS cfg_mostrar_descuento_total,
+        cfg.imprimir_comprobante_reversion AS cfg_imprimir_comprobante_reversion,
+        cfg.mostrar_venta_original_reversion AS cfg_mostrar_venta_original_reversion,
+        cfg.mostrar_codigo_reversion AS cfg_mostrar_codigo_reversion,
+        cfg.mostrar_usuario_reversion AS cfg_mostrar_usuario_reversion,
+        cfg.mostrar_caja_sesion_reversion AS cfg_mostrar_caja_sesion_reversion,
+        cfg.mostrar_motivo_reversion AS cfg_mostrar_motivo_reversion,
+        cfg.mostrar_detalle_reversion AS cfg_mostrar_detalle_reversion,
+        cfg.mostrar_total_reversion AS cfg_mostrar_total_reversion
       FROM public.v_sucursales_info v
       LEFT JOIN LATERAL (
         SELECT
@@ -230,7 +358,30 @@ const readSucursalFacturacionContext = async (client, idSucursal) => {
           mostrar_rtn,
           mostrar_direccion,
           mostrar_telefono,
-          mostrar_correo
+          mostrar_correo,
+          mostrar_datos_fiscales,
+          mostrar_cai_ticket,
+          mostrar_numero_fiscal_ticket,
+          mostrar_codigo_interno_ticket,
+          aplicar_impuestos,
+          mostrar_impuestos_ticket,
+          mostrar_importe_exento,
+          mostrar_importe_gravado_15,
+          mostrar_isv_15,
+          mostrar_importe_gravado_18,
+          mostrar_isv_18,
+          mostrar_total_isv,
+          mostrar_descuento_linea,
+          mostrar_descuento_porcentaje_linea,
+          mostrar_descuento_total,
+          imprimir_comprobante_reversion,
+          mostrar_venta_original_reversion,
+          mostrar_codigo_reversion,
+          mostrar_usuario_reversion,
+          mostrar_caja_sesion_reversion,
+          mostrar_motivo_reversion,
+          mostrar_detalle_reversion,
+          mostrar_total_reversion
         FROM public.facturacion_config_sucursal
         WHERE id_sucursal = v.id_sucursal
         ORDER BY COALESCE(activo, false) DESC, id_config DESC
@@ -277,7 +428,11 @@ const readSucursalFacturacionContext = async (client, idSucursal) => {
         mostrar_rtn: row.cfg_mostrar_rtn,
         mostrar_direccion: row.cfg_mostrar_direccion,
         mostrar_telefono: row.cfg_mostrar_telefono,
-        mostrar_correo: row.cfg_mostrar_correo
+        mostrar_correo: row.cfg_mostrar_correo,
+        ...TICKET_FLAG_FIELDS.reduce((acc, field) => ({
+          ...acc,
+          [field]: row[`cfg_${field}`]
+        }), {})
       }
     : null;
 
@@ -315,6 +470,7 @@ const snapshotFromConfig = ({ config, sucursal, idSucursal }) => {
       mostrar_direccion: toBoolean(config?.mostrar_direccion, true),
       mostrar_telefono: toBoolean(config?.mostrar_telefono, true),
       mostrar_correo: toBoolean(config?.mostrar_correo, false),
+      ...resolveTicketFlags(config),
       texto_encabezado_ticket: toNullableText(config?.texto_encabezado_ticket),
       texto_pie_ticket: toNullableText(config?.texto_pie_ticket) || DEFAULT_FOOTER
     },
@@ -433,6 +589,7 @@ const normalizeSnapshotShape = (snapshot) => {
       mostrar_direccion: toBoolean(ticket.mostrar_direccion, true),
       mostrar_telefono: toBoolean(ticket.mostrar_telefono, true),
       mostrar_correo: toBoolean(ticket.mostrar_correo, false),
+      ...resolveTicketFlags(ticket),
       texto_encabezado_ticket: toNullableText(ticket.texto_encabezado_ticket),
       texto_pie_ticket: toNullableText(ticket.texto_pie_ticket) || DEFAULT_FOOTER
     },
