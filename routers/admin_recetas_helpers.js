@@ -258,7 +258,7 @@ async function existeTipoDepartamento(idTipoDepartamento) {
 
 async function existeArchivo(idArchivo) {
   const result = await pool.query(
-    'SELECT 1 FROM archivos WHERE id_archivo = $1 LIMIT 1',
+    'SELECT 1 FROM archivos WHERE id_archivo = $1 AND COALESCE(estado, true) = true LIMIT 1',
     [idArchivo]
   );
   return result.rowCount > 0;
@@ -332,7 +332,7 @@ export async function validarReglasNegocioYFks(datosNormalizados) {
   if (Object.prototype.hasOwnProperty.call(datosNormalizados, 'id_archivo') && datosNormalizados.id_archivo !== null) {
     const existeFkArchivo = await existeArchivo(datosNormalizados.id_archivo);
     if (!existeFkArchivo) {
-      return { ok: false, status: 400, message: 'id_archivo no existe en archivos.' };
+      return { ok: false, status: 400, message: 'id_archivo no existe o esta inactivo en archivos.' };
     }
   }
 
