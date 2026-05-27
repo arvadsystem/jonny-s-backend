@@ -17,6 +17,7 @@ const ALMACENES_DELETE_COMPAT_PERMISSIONS = [
 const EDITABLE_FIELDS = new Set(['nombre', 'id_sucursal']);
 const CREATE_ALLOWED_FIELDS = new Set(['nombre', 'id_sucursal']);
 const ALMACEN_INACTIVATION_RECENT_MOVEMENTS_DAYS = 30;
+const ALMACEN_DEPENDENCY_DETAILS_ITEMS_LIMIT = 10;
 const ALMACEN_INACTIVATION_BLOCK_MESSAGES = Object.freeze({
   STOCK_DISPONIBLE:
     'No se puede inactivar el almacén porque tiene stock disponible.',
@@ -312,6 +313,16 @@ const parseNonNegativeNumber = (value) => {
   return parsed;
 };
 
+const buildDependencyDetailGroup = ({ total = 0, items = [] }) => {
+  const safeTotal = Number.isFinite(Number(total)) ? Math.max(0, Number(total)) : 0;
+  const safeItems = Array.isArray(items) ? items : [];
+  return {
+    total: safeTotal,
+    items: safeItems,
+    remaining: Math.max(0, safeTotal - safeItems.length)
+  };
+};
+
 const buildAlmacenInactivationDecision = ({
   stockTotal = 0,
   movimientosRecientes = 0,
@@ -329,10 +340,7 @@ const buildAlmacenInactivationDecision = ({
     reasons.push(ALMACEN_INACTIVATION_BLOCK_MESSAGES.STOCK_DISPONIBLE);
   }
 
-  if (recentMovementsAvailable && movimientosRecientes > 0) {
-    reasonCodes.push('MOVIMIENTOS_RECIENTES');
-    reasons.push(ALMACEN_INACTIVATION_BLOCK_MESSAGES.MOVIMIENTOS_RECIENTES);
-  }
+  // AM: movimientos recientes se conservan como dato operativo/informativo, pero no bloquean por si solos.
 
   if (productosActivos > 0 || insumosActivos > 0) {
     reasonCodes.push('DEPENDENCIAS_ACTIVAS');
@@ -347,10 +355,7 @@ const buildAlmacenInactivationDecision = ({
   const canInactivate = reasons.length === 0;
   const hasStock = stockTotal > 0;
   const hasActiveOperationalDependencies =
-    (recentMovementsAvailable && movimientosRecientes > 0) ||
-    productosActivos > 0 ||
-    insumosActivos > 0 ||
-    (openOrdersAvailable && ordenesCompraAbiertas > 0);
+    productosActivos > 0 || insumosActivos > 0 || (openOrdersAvailable && ordenesCompraAbiertas > 0);
 
   return {
     canInactivate,
@@ -576,12 +581,329 @@ const fetchOpenPurchaseOrdersCount = async (idAlmacen) => {
   }
 };
 
+const fetchAlmacenDependencyDetails = async (idAlmacen) => {
+  const fetchProductosActivos = async () => {
+    try {
+      const [countResult, itemsResult] = await Promise.all([
+        pool.query(
+          `SELECT COUNT(DISTINCT pa.id_producto)::int AS total
+           FROM public.productos_almacenes pa
+           INNER JOIN public.productos p ON p.id_producto = pa.id_producto
+           WHERE pa.id_almacen = $1
+             AND COALESCE(p.estado, true) = true`,
+          [idAlmacen]
+        ),
+        pool.query(
+          `SELECT DISTINCT p.id_producto,
+                  COALESCE(NULLIF(TRIM(COALESCE(p.nombre_producto, p.nombre, '')), ''), CONCAT('Producto #', p.id_producto::text)) AS nombre
+           FROM public.productos_almacenes pa
+           INNER JOIN public.productos p ON p.id_producto = pa.id_producto
+           WHERE pa.id_almacen = $1
+             AND COALESCE(p.estado, true) = true
+           ORDER BY p.id_producto ASC
+           LIMIT $2`,
+          [idAlmacen, ALMACEN_DEPENDENCY_DETAILS_ITEMS_LIMIT]
+        )
+      ]);
+      return buildDependencyDetailGroup({
+        total: Number(countResult.rows?.[0]?.total ?? 0),
+        items: (itemsResult.rows || []).map((row) => ({
+          id_producto: Number(row.id_producto),
+          nombre: String(row.nombre ?? `Producto #${row.id_producto}`)
+        }))
+      });
+    } catch (error) {
+      if (!isMissingSchemaEntityError(error)) throw error;
+      const [countResult, itemsResult] = await Promise.all([
+        pool.query(
+          `SELECT COUNT(*)::int AS total
+           FROM public.productos p
+           WHERE p.id_almacen = $1
+             AND COALESCE(p.estado, true) = true`,
+          [idAlmacen]
+        ),
+        pool.query(
+          `SELECT p.id_producto,
+                  COALESCE(NULLIF(TRIM(COALESCE(p.nombre_producto, p.nombre, '')), ''), CONCAT('Producto #', p.id_producto::text)) AS nombre
+           FROM public.productos p
+           WHERE p.id_almacen = $1
+             AND COALESCE(p.estado, true) = true
+           ORDER BY p.id_producto ASC
+           LIMIT $2`,
+          [idAlmacen, ALMACEN_DEPENDENCY_DETAILS_ITEMS_LIMIT]
+        )
+      ]);
+      return buildDependencyDetailGroup({
+        total: Number(countResult.rows?.[0]?.total ?? 0),
+        items: (itemsResult.rows || []).map((row) => ({
+          id_producto: Number(row.id_producto),
+          nombre: String(row.nombre ?? `Producto #${row.id_producto}`)
+        }))
+      });
+    }
+  };
+
+  const fetchInsumosActivos = async () => {
+    try {
+      const [countResult, itemsResult] = await Promise.all([
+        pool.query(
+          `SELECT COUNT(DISTINCT ia.id_insumo)::int AS total
+           FROM public.insumos_almacenes ia
+           INNER JOIN public.insumos i ON i.id_insumo = ia.id_insumo
+           WHERE ia.id_almacen = $1
+             AND COALESCE(i.estado, true) = true`,
+          [idAlmacen]
+        ),
+        pool.query(
+          `SELECT DISTINCT i.id_insumo,
+                  COALESCE(NULLIF(TRIM(COALESCE(i.nombre_insumo, i.nombre, '')), ''), CONCAT('Insumo #', i.id_insumo::text)) AS nombre
+           FROM public.insumos_almacenes ia
+           INNER JOIN public.insumos i ON i.id_insumo = ia.id_insumo
+           WHERE ia.id_almacen = $1
+             AND COALESCE(i.estado, true) = true
+           ORDER BY i.id_insumo ASC
+           LIMIT $2`,
+          [idAlmacen, ALMACEN_DEPENDENCY_DETAILS_ITEMS_LIMIT]
+        )
+      ]);
+      return buildDependencyDetailGroup({
+        total: Number(countResult.rows?.[0]?.total ?? 0),
+        items: (itemsResult.rows || []).map((row) => ({
+          id_insumo: Number(row.id_insumo),
+          nombre: String(row.nombre ?? `Insumo #${row.id_insumo}`)
+        }))
+      });
+    } catch (error) {
+      if (!isMissingSchemaEntityError(error)) throw error;
+      const [countResult, itemsResult] = await Promise.all([
+        pool.query(
+          `SELECT COUNT(*)::int AS total
+           FROM public.insumos i
+           WHERE i.id_almacen = $1
+             AND COALESCE(i.estado, true) = true`,
+          [idAlmacen]
+        ),
+        pool.query(
+          `SELECT i.id_insumo,
+                  COALESCE(NULLIF(TRIM(COALESCE(i.nombre_insumo, i.nombre, '')), ''), CONCAT('Insumo #', i.id_insumo::text)) AS nombre
+           FROM public.insumos i
+           WHERE i.id_almacen = $1
+             AND COALESCE(i.estado, true) = true
+           ORDER BY i.id_insumo ASC
+           LIMIT $2`,
+          [idAlmacen, ALMACEN_DEPENDENCY_DETAILS_ITEMS_LIMIT]
+        )
+      ]);
+      return buildDependencyDetailGroup({
+        total: Number(countResult.rows?.[0]?.total ?? 0),
+        items: (itemsResult.rows || []).map((row) => ({
+          id_insumo: Number(row.id_insumo),
+          nombre: String(row.nombre ?? `Insumo #${row.id_insumo}`)
+        }))
+      });
+    }
+  };
+
+  const fetchStockProductos = async () => {
+    try {
+      const [countResult, itemsResult] = await Promise.all([
+        pool.query(
+          `SELECT COUNT(DISTINCT pa.id_producto)::int AS total
+           FROM public.productos_almacenes pa
+           INNER JOIN public.productos p ON p.id_producto = pa.id_producto
+           WHERE pa.id_almacen = $1
+             AND COALESCE(p.estado, true) = true
+             AND COALESCE(p.cantidad, 0) > 0`,
+          [idAlmacen]
+        ),
+        pool.query(
+          `SELECT DISTINCT p.id_producto,
+                  COALESCE(NULLIF(TRIM(COALESCE(p.nombre_producto, p.nombre, '')), ''), CONCAT('Producto #', p.id_producto::text)) AS nombre,
+                  COALESCE(p.cantidad, 0)::numeric AS cantidad
+           FROM public.productos_almacenes pa
+           INNER JOIN public.productos p ON p.id_producto = pa.id_producto
+           WHERE pa.id_almacen = $1
+             AND COALESCE(p.estado, true) = true
+             AND COALESCE(p.cantidad, 0) > 0
+           ORDER BY p.id_producto ASC
+           LIMIT $2`,
+          [idAlmacen, ALMACEN_DEPENDENCY_DETAILS_ITEMS_LIMIT]
+        )
+      ]);
+      return buildDependencyDetailGroup({
+        total: Number(countResult.rows?.[0]?.total ?? 0),
+        items: (itemsResult.rows || []).map((row) => ({
+          id_producto: Number(row.id_producto),
+          nombre: String(row.nombre ?? `Producto #${row.id_producto}`),
+          cantidad: Number(row.cantidad ?? 0)
+        }))
+      });
+    } catch (error) {
+      if (!isMissingSchemaEntityError(error)) throw error;
+      const [countResult, itemsResult] = await Promise.all([
+        pool.query(
+          `SELECT COUNT(*)::int AS total
+           FROM public.productos p
+           WHERE p.id_almacen = $1
+             AND COALESCE(p.estado, true) = true
+             AND COALESCE(p.cantidad, 0) > 0`,
+          [idAlmacen]
+        ),
+        pool.query(
+          `SELECT p.id_producto,
+                  COALESCE(NULLIF(TRIM(COALESCE(p.nombre_producto, p.nombre, '')), ''), CONCAT('Producto #', p.id_producto::text)) AS nombre,
+                  COALESCE(p.cantidad, 0)::numeric AS cantidad
+           FROM public.productos p
+           WHERE p.id_almacen = $1
+             AND COALESCE(p.estado, true) = true
+             AND COALESCE(p.cantidad, 0) > 0
+           ORDER BY p.id_producto ASC
+           LIMIT $2`,
+          [idAlmacen, ALMACEN_DEPENDENCY_DETAILS_ITEMS_LIMIT]
+        )
+      ]);
+      return buildDependencyDetailGroup({
+        total: Number(countResult.rows?.[0]?.total ?? 0),
+        items: (itemsResult.rows || []).map((row) => ({
+          id_producto: Number(row.id_producto),
+          nombre: String(row.nombre ?? `Producto #${row.id_producto}`),
+          cantidad: Number(row.cantidad ?? 0)
+        }))
+      });
+    }
+  };
+
+  const fetchStockInsumos = async () => {
+    try {
+      const [countResult, itemsResult] = await Promise.all([
+        pool.query(
+          `SELECT COUNT(DISTINCT ia.id_insumo)::int AS total
+           FROM public.insumos_almacenes ia
+           INNER JOIN public.insumos i ON i.id_insumo = ia.id_insumo
+           WHERE ia.id_almacen = $1
+             AND COALESCE(i.estado, true) = true
+             AND COALESCE(i.cantidad, 0) > 0`,
+          [idAlmacen]
+        ),
+        pool.query(
+          `SELECT DISTINCT i.id_insumo,
+                  COALESCE(NULLIF(TRIM(COALESCE(i.nombre_insumo, i.nombre, '')), ''), CONCAT('Insumo #', i.id_insumo::text)) AS nombre,
+                  COALESCE(i.cantidad, 0)::numeric AS cantidad
+           FROM public.insumos_almacenes ia
+           INNER JOIN public.insumos i ON i.id_insumo = ia.id_insumo
+           WHERE ia.id_almacen = $1
+             AND COALESCE(i.estado, true) = true
+             AND COALESCE(i.cantidad, 0) > 0
+           ORDER BY i.id_insumo ASC
+           LIMIT $2`,
+          [idAlmacen, ALMACEN_DEPENDENCY_DETAILS_ITEMS_LIMIT]
+        )
+      ]);
+      return buildDependencyDetailGroup({
+        total: Number(countResult.rows?.[0]?.total ?? 0),
+        items: (itemsResult.rows || []).map((row) => ({
+          id_insumo: Number(row.id_insumo),
+          nombre: String(row.nombre ?? `Insumo #${row.id_insumo}`),
+          cantidad: Number(row.cantidad ?? 0)
+        }))
+      });
+    } catch (error) {
+      if (!isMissingSchemaEntityError(error)) throw error;
+      const [countResult, itemsResult] = await Promise.all([
+        pool.query(
+          `SELECT COUNT(*)::int AS total
+           FROM public.insumos i
+           WHERE i.id_almacen = $1
+             AND COALESCE(i.estado, true) = true
+             AND COALESCE(i.cantidad, 0) > 0`,
+          [idAlmacen]
+        ),
+        pool.query(
+          `SELECT i.id_insumo,
+                  COALESCE(NULLIF(TRIM(COALESCE(i.nombre_insumo, i.nombre, '')), ''), CONCAT('Insumo #', i.id_insumo::text)) AS nombre,
+                  COALESCE(i.cantidad, 0)::numeric AS cantidad
+           FROM public.insumos i
+           WHERE i.id_almacen = $1
+             AND COALESCE(i.estado, true) = true
+             AND COALESCE(i.cantidad, 0) > 0
+           ORDER BY i.id_insumo ASC
+           LIMIT $2`,
+          [idAlmacen, ALMACEN_DEPENDENCY_DETAILS_ITEMS_LIMIT]
+        )
+      ]);
+      return buildDependencyDetailGroup({
+        total: Number(countResult.rows?.[0]?.total ?? 0),
+        items: (itemsResult.rows || []).map((row) => ({
+          id_insumo: Number(row.id_insumo),
+          nombre: String(row.nombre ?? `Insumo #${row.id_insumo}`),
+          cantidad: Number(row.cantidad ?? 0)
+        }))
+      });
+    }
+  };
+
+  const fetchOrdenesCompraAbiertas = async () => {
+    try {
+      const [countResult, itemsResult] = await Promise.all([
+        pool.query(
+          `SELECT COUNT(DISTINCT doc.id_orden_compra)::int AS total
+           FROM public.detalle_orden_compras doc
+           INNER JOIN public.orden_compras oc ON oc.id_orden_compra = doc.id_orden_compra
+           WHERE doc.id_almacen_destino = $1
+             AND UPPER(COALESCE(oc.estado_flujo, '')) IN ('PENDIENTE', 'APROBADA', 'EN_COMPRA')`,
+          [idAlmacen]
+        ),
+        pool.query(
+          `SELECT DISTINCT oc.id_orden_compra,
+                  COALESCE(NULLIF(TRIM(COALESCE(oc.codigo_orden_compra, oc.codigo, '')), ''), CONCAT('OC #', oc.id_orden_compra::text)) AS codigo,
+                  UPPER(COALESCE(oc.estado_flujo, '')) AS estado
+           FROM public.detalle_orden_compras doc
+           INNER JOIN public.orden_compras oc ON oc.id_orden_compra = doc.id_orden_compra
+           WHERE doc.id_almacen_destino = $1
+             AND UPPER(COALESCE(oc.estado_flujo, '')) IN ('PENDIENTE', 'APROBADA', 'EN_COMPRA')
+           ORDER BY oc.id_orden_compra ASC
+           LIMIT $2`,
+          [idAlmacen, ALMACEN_DEPENDENCY_DETAILS_ITEMS_LIMIT]
+        )
+      ]);
+      return buildDependencyDetailGroup({
+        total: Number(countResult.rows?.[0]?.total ?? 0),
+        items: (itemsResult.rows || []).map((row) => ({
+          id_orden_compra: Number(row.id_orden_compra),
+          codigo: String(row.codigo ?? `OC #${row.id_orden_compra}`),
+          estado: String(row.estado ?? '')
+        }))
+      });
+    } catch (error) {
+      if (!isMissingSchemaEntityError(error)) throw error;
+      return buildDependencyDetailGroup({ total: 0, items: [] });
+    }
+  };
+
+  const [productosActivos, insumosActivos, stockProductos, stockInsumos, ordenesCompraAbiertas] = await Promise.all([
+    fetchProductosActivos(),
+    fetchInsumosActivos(),
+    fetchStockProductos(),
+    fetchStockInsumos(),
+    fetchOrdenesCompraAbiertas()
+  ]);
+
+  return {
+    productos_activos: productosActivos,
+    insumos_activos: insumosActivos,
+    stock_productos: stockProductos,
+    stock_insumos: stockInsumos,
+    ordenes_compra_abiertas: ordenesCompraAbiertas
+  };
+};
+
 const getAlmacenDependenciasById = async (idAlmacen) => {
   const row = await fetchAlmacenCoreDependencies(idAlmacen);
   if (!row) return { exists: false };
 
   const recentMovimientos = await fetchRecentMovimientosCount(idAlmacen);
   const openPurchaseOrders = await fetchOpenPurchaseOrdersCount(idAlmacen);
+  const dependencyDetails = await fetchAlmacenDependencyDetails(idAlmacen);
 
   const stock = {
     productos: parseNonNegativeNumber(row.stock_productos_total),
@@ -627,6 +949,7 @@ const getAlmacenDependenciasById = async (idAlmacen) => {
     counts,
     canDelete,
     stock,
+    dependencyDetails,
     ...inactivationDecision,
     ...sucursalChangeDecision,
     inactivationPolicy: {
@@ -959,6 +1282,7 @@ router.get('/almacenes/:id/dependencias', checkPermission(ALMACENES_VIEW_PERMISS
       hasStock: dependency.hasStock,
       hasActiveOperationalDependencies: dependency.hasActiveOperationalDependencies,
       stock: dependency.stock,
+      dependencyDetails: dependency.dependencyDetails,
       blockingReasonCodes: dependency.blockingReasonCodes,
       blockingReasons: dependency.blockingReasons,
       inactivationPolicy: dependency.inactivationPolicy,
@@ -1004,6 +1328,7 @@ router.patch('/almacenes/:id/inactivar', checkPermission(ALMACENES_STATE_PERMISS
           canInactivate: dependency.canInactivate,
           canDeactivate: dependency.canDeactivate,
           stock: dependency.stock,
+          dependencyDetails: dependency.dependencyDetails,
           inactivationPolicy: dependency.inactivationPolicy
         });
       }
