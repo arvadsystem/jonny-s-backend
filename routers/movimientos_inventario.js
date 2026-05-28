@@ -116,7 +116,8 @@ const sendInternalError = (
 
 const isPositiveIntegerId = (value) => Number.isSafeInteger(value) && value > 0;
 
-const isNonNegativeInteger = (value) => Number.isSafeInteger(value) && value >= 0;
+const isPositiveDecimal = (value) => Number.isFinite(value) && value > 0;
+const isNonNegativeDecimal = (value) => Number.isFinite(value) && value >= 0;
 
 // NEW: NORMALIZA IDS NUMERICOS OPCIONALES PARA QUERIES Y PAYLOADS.
 // WHY: EVITA CASTEOS IMPLICITOS, MENSAJES OPACOS DE POSTGRES Y DUPLICACION DE VALIDACIONES.
@@ -421,10 +422,12 @@ const normalizeMovimientoPayload = (payload) => {
   const cantidadRaw = Number(payload?.cantidad);
   if (!hasValue(payload?.cantidad)) {
     errors.push('cantidad es obligatoria.');
-  } else if (!Number.isSafeInteger(cantidadRaw)) {
-    errors.push('cantidad debe ser un entero.');
-  } else if (tipo === 'AJUSTE' ? !isNonNegativeInteger(cantidadRaw) : !isPositiveIntegerId(cantidadRaw)) {
-    errors.push(tipo === 'AJUSTE' ? 'cantidad debe ser un entero mayor o igual a 0.' : 'cantidad debe ser un entero mayor a 0.');
+  } else if (tipo === 'AJUSTE' ? !isNonNegativeDecimal(cantidadRaw) : !isPositiveDecimal(cantidadRaw)) {
+    errors.push(
+      tipo === 'AJUSTE'
+        ? 'La existencia final debe ser un numero mayor o igual a 0.'
+        : 'La cantidad debe ser un numero mayor que 0.'
+    );
   }
 
   const almacenResult = parseRequiredPositiveInt(payload?.id_almacen, 'id_almacen');
@@ -455,7 +458,9 @@ const normalizeMovimientoPayload = (payload) => {
     errors,
     values: {
       tipo,
-      cantidad: Number.isSafeInteger(cantidadRaw) ? cantidadRaw : null,
+      cantidad: tipo === 'AJUSTE'
+        ? (isNonNegativeDecimal(cantidadRaw) ? cantidadRaw : null)
+        : (isPositiveDecimal(cantidadRaw) ? cantidadRaw : null),
       id_almacen: almacenResult.value,
       id_producto: hasProducto ? productoResult.value : null,
       id_insumo: hasInsumo ? insumoResult.value : null,

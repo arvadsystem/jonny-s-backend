@@ -3,6 +3,8 @@ import pool from '../config/db-connection.js';
 import { checkPermission, requestHasAnyPermission } from '../middleware/checkPermission.js';
 import { resolveRequestUserSucursalScope } from '../utils/sucursalScope.js';
 import PDFDocument from 'pdfkit';
+import fs from 'fs';
+import path from 'path';
 import { getSmtpRuntimeInfo, isSmtpConfigured, sendReportEmail } from '../services/smtpMailer.js';
 
 const router = express.Router();
@@ -311,74 +313,462 @@ const buildPdfFileName = ({ reportKey, parsedFilters }) => {
   return `${base}${range}_${toDateStamp()}.pdf`;
 };
 
-const renderPdfLine = (doc, label, value) => {
-  const text = `${label}: ${value ?? ''}`;
-  doc.fontSize(9).fillColor('#111827').text(text, { width: 520 });
+const PDF_FILTER_LABELS = Object.freeze({
+  fecha_inicio: 'Fecha inicio',
+  fecha_fin: 'Fecha fin',
+  sucursal: 'Sucursal',
+  almacen: 'Almacen',
+  caja: 'Caja',
+  usuario: 'Usuario',
+  metodo_pago: 'Metodo de pago',
+  tipo_diferencia: 'Tipo diferencia',
+  tipo_item: 'Tipo item',
+  solo_criticos: 'Solo criticos',
+  item: 'Item',
+  categoria: 'Categoria',
+  estado: 'Estado',
+  tipo_movimiento: 'Tipo movimiento',
+  tipo_descuento: 'Tipo descuento'
+});
+
+const PDF_REPORT_CONFIG = Object.freeze({
+  ventas_resumen: {
+    title: 'Ventas - Resumen',
+    orientation: 'portrait',
+    sections: [
+      {
+        key: 'serie_diaria',
+        title: 'Serie diaria',
+        columns: [
+          { key: 'fecha', label: 'Fecha', weight: 1.6 },
+          { key: 'cantidad_ventas', label: 'Cantidad de ventas', weight: 1, align: 'right' },
+          { key: 'subtotal', label: 'Subtotal', weight: 1.2, align: 'right', format: 'currency' },
+          { key: 'descuento', label: 'Descuento', weight: 1.2, align: 'right', format: 'currency' },
+          { key: 'impuesto', label: 'Impuesto', weight: 1.2, align: 'right', format: 'currency' },
+          { key: 'total_neto', label: 'Total neto', weight: 1.3, align: 'right', format: 'currency' },
+          { key: 'ticket_promedio', label: 'Ticket promedio', weight: 1.2, align: 'right', format: 'currency' },
+          { key: 'estado_principal', label: 'Estado principal', weight: 1.5 }
+        ]
+      },
+      {
+        key: 'desglose_por_estado',
+        title: 'Desglose por estado',
+        columns: [
+          { key: 'estado', label: 'Estado', weight: 2 },
+          { key: 'cantidad_ventas', label: 'Ventas', weight: 1, align: 'right' },
+          { key: 'total_neto', label: 'Total neto', weight: 1.4, align: 'right', format: 'currency' }
+        ]
+      }
+    ]
+  },
+  ventas_metodos_pago: {
+    title: 'Ventas - Metodos de pago',
+    orientation: 'landscape',
+    sections: [
+      {
+        key: 'resumen_por_metodo',
+        title: 'Resumen por metodo',
+        columns: [
+          { key: 'metodo_pago', label: 'Metodo', weight: 2 },
+          { key: 'cantidad_ventas', label: 'Cantidad de ventas', weight: 1, align: 'right' },
+          { key: 'total_vendido', label: 'Total', weight: 1.4, align: 'right', format: 'currency' },
+          { key: 'porcentaje_sobre_total', label: '% participacion', weight: 1.1, align: 'right', format: 'percent' },
+          { key: 'ticket_promedio', label: 'Ticket prom.', weight: 1.2, align: 'right', format: 'currency' }
+        ]
+      }
+    ]
+  },
+  ventas_descuentos: {
+    title: 'Ventas - Descuentos aplicados',
+    orientation: 'landscape',
+    sections: [
+      {
+        key: 'detalle',
+        title: 'Detalle',
+        columns: [
+          { key: 'fecha', label: 'Fecha', weight: 1.1 },
+          { key: 'sucursal', label: 'Sucursal', weight: 1.4 },
+          { key: 'caja', label: 'Caja', weight: 1.3 },
+          { key: 'usuario', label: 'Usuario', weight: 1.4 },
+          { key: 'factura', label: 'Factura', weight: 0.8, align: 'right' },
+          { key: 'pedido', label: 'Pedido', weight: 0.8, align: 'right' },
+          { key: 'cliente', label: 'Cliente', weight: 1.5 },
+          { key: 'tipo_descuento', label: 'Tipo desc.', weight: 1.2 },
+          { key: 'item', label: 'Item', weight: 1.6 },
+          { key: 'subtotal_linea', label: 'Subtotal', weight: 1, align: 'right', format: 'currency' },
+          { key: 'descuento', label: 'Desc.', weight: 1, align: 'right', format: 'currency' },
+          { key: 'total_linea', label: 'Total', weight: 1, align: 'right', format: 'currency' },
+          { key: 'estado', label: 'Estado', weight: 1.2 }
+        ]
+      }
+    ]
+  },
+  ventas_items: {
+    title: 'Ventas - Ventas por item',
+    orientation: 'landscape',
+    sections: [
+      {
+        key: 'detalle',
+        title: 'Detalle por item vendido',
+        columns: [
+          { key: 'fecha', label: 'Fecha', weight: 0.9 },
+          { key: 'sucursal', label: 'Sucursal', weight: 1.1 },
+          { key: 'caja', label: 'Caja', weight: 1 },
+          { key: 'usuario', label: 'Usuario', weight: 1.1 },
+          { key: 'factura', label: 'Factura', weight: 0.65, align: 'right' },
+          { key: 'pedido', label: 'Pedido', weight: 0.65, align: 'right' },
+          { key: 'tipo_item', label: 'Tipo', weight: 0.8 },
+          { key: 'item', label: 'Item', weight: 1.5 },
+          { key: 'categoria', label: 'Categoria', weight: 1.1 },
+          { key: 'cantidad', label: 'Cant.', weight: 0.7, align: 'right', format: 'number' },
+          { key: 'precio_unitario', label: 'P. unit.', weight: 0.9, align: 'right', format: 'currency' },
+          { key: 'subtotal', label: 'Subtotal', weight: 0.9, align: 'right', format: 'currency' },
+          { key: 'descuento', label: 'Desc.', weight: 0.9, align: 'right', format: 'currency' },
+          { key: 'total', label: 'Total', weight: 0.9, align: 'right', format: 'currency' },
+          { key: 'estado', label: 'Estado', weight: 1.05 }
+        ]
+      }
+    ]
+  },
+  caja_cierres: {
+    title: 'Caja - Cierres',
+    orientation: 'landscape',
+    sections: [
+      {
+        key: 'cierres',
+        title: 'Cierres de caja',
+        columns: [
+          { key: 'fecha_cierre', label: 'Fecha cierre', weight: 1.1 },
+          { key: 'sucursal', label: 'Sucursal', weight: 1.3 },
+          { key: 'caja', label: 'Caja', weight: 1.2 },
+          { key: 'responsable', label: 'Responsable', weight: 1.3 },
+          { key: 'total_esperado', label: 'Monto esperado', weight: 1, align: 'right', format: 'currency' },
+          { key: 'total_contado', label: 'Monto contado', weight: 1, align: 'right', format: 'currency' },
+          { key: 'diferencia', label: 'Dif.', weight: 0.9, align: 'right', format: 'currency' },
+          { key: 'estado', label: 'Estado', weight: 1 },
+          { key: 'resolucion', label: 'Resolucion', weight: 1.2 },
+          { key: 'observacion', label: 'Observacion', weight: 1.6 }
+        ]
+      }
+    ]
+  },
+  caja_diferencias: {
+    title: 'Caja - Diferencias',
+    orientation: 'landscape',
+    sections: [
+      {
+        key: 'diferencias',
+        title: 'Diferencias detectadas',
+        columns: [
+          { key: 'fecha_cierre', label: 'Fecha cierre', weight: 1.1 },
+          { key: 'sucursal', label: 'Sucursal', weight: 1.2 },
+          { key: 'caja', label: 'Caja', weight: 1.2 },
+          { key: 'responsable', label: 'Responsable', weight: 1.2 },
+          { key: 'total_esperado', label: 'Monto esperado', weight: 1, align: 'right', format: 'currency' },
+          { key: 'total_contado', label: 'Monto contado', weight: 1, align: 'right', format: 'currency' },
+          { key: 'diferencia', label: 'Dif.', weight: 1, align: 'right', format: 'currency' },
+          { key: 'tipo_diferencia', label: 'Tipo diferencia', weight: 1 },
+          { key: 'resolucion', label: 'Resolucion', weight: 1.2 },
+          { key: 'observacion', label: 'Observacion', weight: 1.4 },
+          { key: 'estado', label: 'Estado', weight: 1 }
+        ]
+      }
+    ]
+  },
+  inventario_stock_critico: {
+    title: 'Inventario - Stock critico',
+    orientation: 'landscape',
+    sections: [
+      {
+        key: 'items',
+        title: 'Items criticos',
+        columns: [
+          { key: 'tipo_item', label: 'Tipo', weight: 0.9 },
+          { key: 'nombre', label: 'Nombre', weight: 1.5 },
+          { key: 'categoria', label: 'Categoria', weight: 1.1 },
+          { key: 'almacen', label: 'Almacen', weight: 1.2 },
+          { key: 'sucursal', label: 'Sucursal', weight: 1.2 },
+          { key: 'cantidad_actual', label: 'Cantidad actual', weight: 0.9, align: 'right', format: 'number' },
+          { key: 'stock_minimo', label: 'Stock minimo', weight: 0.9, align: 'right', format: 'number' },
+          { key: 'diferencia_minimo', label: 'Dif.', weight: 0.8, align: 'right', format: 'number' },
+          { key: 'estado_stock', label: 'Estado stock', weight: 1 },
+          { key: 'estado_item', label: 'Estado item', weight: 1 }
+        ]
+      }
+    ]
+  },
+  inventario_kardex: {
+    title: 'Inventario - Kardex',
+    orientation: 'landscape',
+    sections: [
+      {
+        key: 'movimientos',
+        title: 'Movimientos',
+        columns: [
+          { key: 'fecha_mov', label: 'Fecha', weight: 1.1 },
+          { key: 'nombre_sucursal', label: 'Sucursal', weight: 1.2 },
+          { key: 'nombre_almacen', label: 'Almacen', weight: 1.2 },
+          { key: 'item_tipo', label: 'Tipo item', weight: 0.9 },
+          { key: 'item_nombre', label: 'Item', weight: 1.5 },
+          { key: 'categoria', label: 'Categoria', weight: 1.1 },
+          { key: 'tipo', label: 'Tipo movimiento', weight: 0.9 },
+          { key: 'cantidad', label: 'Cantidad', weight: 0.8, align: 'right', format: 'number' },
+          { key: 'saldo_antes', label: 'Saldo ant.', weight: 0.8, align: 'right', format: 'number' },
+          { key: 'saldo_despues', label: 'Saldo act.', weight: 0.8, align: 'right', format: 'number' },
+          { key: 'referencia', label: 'Referencia', weight: 1 },
+          { key: 'origen_modulo', label: 'Origen/modulo', weight: 1 },
+          { key: 'usuario', label: 'Usuario', weight: 1 },
+          { key: 'descripcion', label: 'Descripcion', weight: 1.5 }
+        ]
+      }
+    ]
+  }
+});
+
+const resolveReportPdfConfig = (reportKey, data = {}) => {
+  const config = PDF_REPORT_CONFIG[reportKey];
+  if (config) return config;
+  const firstArrayKey = Object.keys(data || {}).find((key) => key !== 'kpis' && Array.isArray(data[key]));
+  return {
+    title: `Reporte ${reportKey}`,
+    orientation: 'portrait',
+    sections: firstArrayKey
+      ? [{ key: firstArrayKey, title: firstArrayKey, columns: [] }]
+      : []
+  };
 };
 
-const renderPdfTable = ({ doc, title, rows, maxRows = 200 }) => {
-  doc.moveDown(0.6);
-  doc.fontSize(11).fillColor('#111827').text(title);
-  doc.moveDown(0.2);
-
-  if (!Array.isArray(rows) || rows.length === 0) {
-    doc.fontSize(9).fillColor('#6b7280').text('Sin datos.');
-    return;
-  }
-
-  const headers = [...new Set(rows.flatMap((row) => Object.keys(row || {})))].slice(0, 8);
-  doc.fontSize(8).fillColor('#111827').text(headers.join(' | '), { width: 520 });
-  doc.moveDown(0.2);
-
-  const limitedRows = rows.slice(0, maxRows);
-  limitedRows.forEach((row) => {
-    const line = headers.map((key) => String(row?.[key] ?? '')).join(' | ');
-    doc.fontSize(8).fillColor('#374151').text(line, { width: 520 });
-  });
-
-  if (rows.length > maxRows) {
-    doc.moveDown(0.3);
-    doc.fontSize(8).fillColor('#b45309').text(`Nota: se muestran ${maxRows} filas de ${rows.length} por control de tamaño.`);
-  }
+const resolvePdfLogoPath = () => {
+  const candidates = [
+    path.resolve(process.cwd(), '..', 'jonny-s-smartorder', 'src', 'assets', 'images', 'logo-jonnys.png'),
+    path.resolve(process.cwd(), '..', 'jonny-s-smartorder', 'src', 'assets', 'images', 'logo-sin-fondo.png'),
+    path.resolve(process.cwd(), '..', 'jonny-s-smartorder', 'public', 'favicon-jonnys-round.png')
+  ];
+  return candidates.find((candidate) => fs.existsSync(candidate)) || null;
 };
 
-const buildReportPdfBuffer = ({ reportKey, payload }) => new Promise((resolve, reject) => {
+const formatPdfValue = (value, format) => {
+  if (value === null || value === undefined || value === '') return '-';
+  if (format === 'currency') return `L ${Number(value || 0).toFixed(2)}`;
+  if (format === 'percent') return `${Number(value || 0).toFixed(2)}%`;
+  if (format === 'number') return Number(value || 0).toFixed(2);
+  return String(value);
+};
+
+const buildHumanFilters = (filters = {}) => {
+  const entries = Object.entries(filters || {})
+    .filter(([, value]) => String(value ?? '').trim() !== '')
+    .map(([key, value]) => ({
+      label: PDF_FILTER_LABELS[key] || key,
+      value: String(value).trim()
+    }));
+  if (filters.fecha_inicio || filters.fecha_fin) {
+    const period = `${filters.fecha_inicio || '...'} a ${filters.fecha_fin || '...'}`;
+    return [{ label: 'Periodo', value: period }, ...entries.filter((entry) => entry.label !== 'Fecha inicio' && entry.label !== 'Fecha fin')];
+  }
+  return entries;
+};
+
+const truncateText = (text, maxLength = 42) => {
+  const raw = String(text ?? '');
+  if (raw.length <= maxLength) return raw;
+  return `${raw.slice(0, Math.max(0, maxLength - 1))}…`;
+};
+
+const fitTextToWidth = (doc, text, width, fontSize = 7, maxLines = 2) => {
+  const raw = String(text ?? '');
+  if (!raw) return '-';
+  const safeWidth = Math.max(24, width);
+  doc.fontSize(fontSize);
+  if (doc.heightOfString(raw, { width: safeWidth }) <= (fontSize + 1.8) * maxLines) return raw;
+  let low = 0;
+  let high = raw.length;
+  let best = '';
+  while (low <= high) {
+    const mid = Math.floor((low + high) / 2);
+    const candidate = `${raw.slice(0, mid).trimEnd()}…`;
+    if (doc.heightOfString(candidate, { width: safeWidth }) <= (fontSize + 1.8) * maxLines) {
+      best = candidate;
+      low = mid + 1;
+    } else {
+      high = mid - 1;
+    }
+  }
+  return best || truncateText(raw, 20);
+};
+
+const buildReportPdfBuffer = ({ reportKey, payload, generatedBy = null }) => new Promise((resolve, reject) => {
   try {
-    const doc = new PDFDocument({ size: 'A4', margin: 36 });
+    const data = payload?.data || {};
+    const filtros = payload?.filtros || {};
+    const kpis = data?.kpis || {};
+    const config = resolveReportPdfConfig(reportKey, data);
+    const logoPath = resolvePdfLogoPath();
+    const humanFilters = buildHumanFilters(filtros);
+    const pageLayout = config.orientation === 'landscape' ? 'landscape' : 'portrait';
+
+    const doc = new PDFDocument({ size: 'A4', layout: pageLayout, margin: 28, bufferPages: true });
     const chunks = [];
 
     doc.on('data', (chunk) => chunks.push(chunk));
     doc.on('end', () => resolve(Buffer.concat(chunks)));
     doc.on('error', reject);
 
-    const data = payload?.data || {};
-    const filtros = payload?.filtros || {};
-    const kpis = data?.kpis || {};
+    const drawHeader = () => {
+      const top = doc.page.margins.top;
+      const left = doc.page.margins.left;
+      const right = doc.page.width - doc.page.margins.right;
+      let headerY = top;
+      if (logoPath) {
+        try {
+          doc.image(logoPath, left, top - 2, { fit: [46, 46] });
+        } catch (_error) {
+          // AM: fallback textual si el logo no puede renderizarse en PDFKit.
+        }
+      }
+      doc.fontSize(18).fillColor('#0f172a').text('Jonny’s', left + 54, headerY, { continued: true });
+      doc.fontSize(14).fillColor('#334155').text(' SmartOrden');
+      headerY += 20;
+      doc.fontSize(12).fillColor('#111827').text(config.title || `Reporte ${reportKey}`, left + 54, headerY);
+      doc.fontSize(8).fillColor('#64748b').text(`Generado: ${new Date().toLocaleString('es-HN')}`, left + 54, headerY + 14);
+      if (generatedBy) {
+        doc.fontSize(8).fillColor('#64748b').text(`Usuario: ${generatedBy}`, left + 54, headerY + 26);
+      }
+      doc.moveTo(left, top + 52).lineTo(right, top + 52).strokeColor('#cbd5e1').lineWidth(1).stroke();
+      return top + 58;
+    };
 
-    doc.fontSize(16).fillColor('#111827').text('Jonny’s SmartOrden');
-    doc.fontSize(12).fillColor('#1f2937').text(`Reporte: ${reportKey}`);
-    doc.moveDown(0.4);
-    renderPdfLine(doc, 'Generado', new Date().toISOString());
-    renderPdfLine(doc, 'Filtros', JSON.stringify(filtros));
+    const drawKpis = (startY) => {
+      if (!kpis || typeof kpis !== 'object' || Object.keys(kpis).length === 0) return startY;
+      const left = doc.page.margins.left;
+      const right = doc.page.width - doc.page.margins.right;
+      const pairs = Object.entries(kpis).slice(0, 8);
+      if (!pairs.length) return startY;
+      const cardsPerRow = pageLayout === 'landscape' ? 4 : 3;
+      const gap = 8;
+      const cardHeight = 36;
+      const rows = Math.ceil(pairs.length / cardsPerRow);
+      const boxTop = startY + 6;
+      const boxHeight = (rows * cardHeight) + ((rows + 1) * gap);
+      const cardWidth = ((right - left) - ((cardsPerRow + 1) * gap)) / cardsPerRow;
+      doc.roundedRect(left, boxTop, right - left, boxHeight, 6).fillAndStroke('#f8fafc', '#e2e8f0');
+      pairs.forEach(([key, value], index) => {
+        const row = Math.floor(index / cardsPerRow);
+        const col = index % cardsPerRow;
+        const x = left + gap + (col * (cardWidth + gap));
+        const y = boxTop + gap + (row * (cardHeight + gap));
+        doc.roundedRect(x, y, cardWidth, cardHeight, 4).fillAndStroke('#ffffff', '#e2e8f0');
+        doc.fontSize(7).fillColor('#64748b').text(key.replace(/_/g, ' '), x + 6, y + 5, { width: cardWidth - 12, lineBreak: false });
+        doc.fontSize(9).fillColor('#0f172a').text(formatPdfValue(value, Number(value) === value && (key.includes('total') || key.includes('subtotal') || key.includes('ticket') || key.includes('promedio')) ? 'currency' : undefined), x + 6, y + 17, { width: cardWidth - 12, lineBreak: false });
+      });
+      return boxTop + boxHeight + 10;
+    };
 
-    if (kpis && typeof kpis === 'object' && Object.keys(kpis).length > 0) {
-      doc.moveDown(0.6);
-      doc.fontSize(11).fillColor('#111827').text('KPIs principales');
-      Object.entries(kpis).forEach(([key, value]) => renderPdfLine(doc, key, value));
-    }
+    const drawFilters = (startY) => {
+      if (humanFilters.length === 0) return startY;
+      const left = doc.page.margins.left;
+      let y = startY + 2;
+      doc.fontSize(9).fillColor('#0f172a').text('Filtros aplicados', left, y);
+      y += 12;
+      humanFilters.forEach(({ label, value }) => {
+        doc.fontSize(8).fillColor('#334155').text(`${label}: ${value}`, left, y, { width: doc.page.width - left - doc.page.margins.right });
+        y += 11;
+      });
+      return y + 2;
+    };
 
-    const arraySections = Object.entries(data).filter(
-      ([key, value]) => key !== 'kpis' && Array.isArray(value)
-    );
+    const drawTableSection = ({ section, rows, startY }) => {
+      const left = doc.page.margins.left;
+      const right = doc.page.width - doc.page.margins.right;
+      const tableWidth = right - left;
+      const columns = (Array.isArray(section.columns) && section.columns.length > 0)
+        ? section.columns
+        : [...new Set((rows || []).flatMap((row) => Object.keys(row || {})))].map((key) => ({ key, label: key, weight: 1 }));
+      const totalWeight = columns.reduce((sum, column) => sum + Number(column.weight || 1), 0) || 1;
+      const colWidths = columns.map((column) => (tableWidth * Number(column.weight || 1)) / totalWeight);
+      const headerHeight = 20;
+      let y = startY;
 
-    arraySections.forEach(([key, rows]) => {
-      if (doc.y > 700) doc.addPage();
-      renderPdfTable({ doc, title: key, rows, maxRows: 200 });
+      const ensureSpace = (requiredHeight) => {
+        const limitY = doc.page.height - doc.page.margins.bottom - 22;
+        if (y + requiredHeight <= limitY) return;
+        doc.addPage();
+        y = drawHeader();
+        y = drawFilters(y);
+        y += 4;
+        drawHeaderRow();
+      };
+
+      const drawHeaderRow = () => {
+        doc.rect(left, y, tableWidth, headerHeight).fillAndStroke('#e2e8f0', '#cbd5e1');
+        let x = left;
+        columns.forEach((column, index) => {
+          const width = colWidths[index];
+          const headerLabel = fitTextToWidth(doc, truncateText(column.label, 30), width - 8, 7, 2);
+          doc.fontSize(7).fillColor('#0f172a').text(headerLabel, x + 4, y + 4, { width: width - 8, align: column.align === 'right' ? 'right' : 'left' });
+          x += width;
+        });
+        y += headerHeight;
+      };
+
+      doc.fontSize(10).fillColor('#0f172a').text(section.title, left, y);
+      y += 14;
+      drawHeaderRow();
+
+      if (!rows.length) {
+        doc.fontSize(8).fillColor('#64748b').text('Sin datos.', left, y + 4);
+        return y + 18;
+      }
+
+      rows.forEach((row, rowIndex) => {
+        const preparedCells = columns.map((column, index) => {
+          const width = colWidths[index];
+          const raw = formatPdfValue(row?.[column.key], column.format);
+          const display = fitTextToWidth(doc, raw, width - 8, 7, 2);
+          const height = doc.heightOfString(display, { width: width - 8 });
+          return { column, width, display, height };
+        });
+        const maxHeight = Math.max(...preparedCells.map((c) => c.height), 9.5);
+        const rowHeight = Math.max(16, Math.min(28, maxHeight + 7));
+        ensureSpace(rowHeight + 2);
+        doc.rect(left, y, tableWidth, rowHeight).fillAndStroke(rowIndex % 2 === 0 ? '#ffffff' : '#f8fafc', '#e2e8f0');
+        let x = left;
+        preparedCells.forEach(({ column, width, display }, index) => {
+          doc.fontSize(7).fillColor('#111827').text(
+            display,
+            x + 4,
+            y + 3.5,
+            { width: width - 6, align: column.align === 'right' ? 'right' : 'left' }
+          );
+          x += width;
+        });
+        y += rowHeight;
+      });
+
+      return y + 8;
+    };
+
+    let cursorY = drawHeader();
+    cursorY = drawKpis(cursorY);
+    cursorY = drawFilters(cursorY);
+    cursorY += 4;
+
+    const sections = Array.isArray(config.sections) ? config.sections : [];
+    sections.forEach((section) => {
+      const rows = Array.isArray(data?.[section.key]) ? data[section.key] : [];
+      cursorY = drawTableSection({ section, rows, startY: cursorY });
     });
 
-    if (arraySections.length === 0) {
-      doc.moveDown(0.8);
-      doc.fontSize(9).fillColor('#6b7280').text('Sin datos tabulares para este reporte.');
+    if (sections.length === 0) {
+      doc.fontSize(9).fillColor('#6b7280').text('Sin datos tabulares para este reporte.', doc.page.margins.left, cursorY + 6);
+    }
+
+    const range = doc.bufferedPageRange();
+    for (let i = 0; i < range.count; i += 1) {
+      doc.switchToPage(i);
+      const pageWidth = doc.page.width;
+      const bottomY = doc.page.height - doc.page.margins.bottom + 6;
+      doc.fontSize(8).fillColor('#64748b').text(`Pagina ${i + 1} de ${range.count}`, 0, bottomY, { width: pageWidth, align: 'center' });
     }
 
     doc.end();
@@ -386,7 +776,6 @@ const buildReportPdfBuffer = ({ reportKey, payload }) => new Promise((resolve, r
     reject(error);
   }
 });
-
 const buildVentasScopeWhere = ({ parsedFilters, scope, params }) => {
   const where = [];
 
@@ -445,6 +834,12 @@ const getVentasResumen = async (req, res, filters, parsedFilters) => {
   const built = buildVentasScopeWhere({ parsedFilters, scope, params });
   if (built.forbidden) {
     return res.status(403).json({ error: true, message: 'No tiene sucursales asignadas para consultar este reporte.' });
+  }
+  if (!parsedFilters.estado) {
+    // AM: por defecto excluimos anuladas/canceladas; solo se incluyen con filtro de estado explícito.
+    built.whereClause = built.whereClause
+      ? `${built.whereClause} AND COALESCE(ep.descripcion, 'VENTA DIRECTA') !~* '(ANULAD|CANCELAD)'`
+      : `WHERE COALESCE(ep.descripcion, 'VENTA DIRECTA') !~* '(ANULAD|CANCELAD)'`;
   }
 
   const detailQuery = `
@@ -508,9 +903,21 @@ const getVentasResumen = async (req, res, filters, parsedFilters) => {
 
     if (/cancelad|anulad/i.test(estado)) canceladas += 1;
 
-    const dayBucket = byDate.get(fecha) || { fecha, cantidad_ventas: 0, total_neto: 0 };
+    const dayBucket = byDate.get(fecha) || {
+      fecha,
+      cantidad_ventas: 0,
+      subtotal: 0,
+      descuento: 0,
+      impuesto: 0,
+      total_neto: 0,
+      _estados: new Map()
+    };
     dayBucket.cantidad_ventas += 1;
+    dayBucket.subtotal += subtotalRow;
+    dayBucket.descuento += descuentosRow;
+    dayBucket.impuesto += impuestosRow;
     dayBucket.total_neto += totalRow;
+    dayBucket._estados.set(estado, Number(dayBucket._estados.get(estado) || 0) + 1);
     byDate.set(fecha, dayBucket);
 
     const stateBucket = byState.get(estado) || { estado, cantidad_ventas: 0, total_neto: 0 };
@@ -536,11 +943,22 @@ const getVentasResumen = async (req, res, filters, parsedFilters) => {
         impuestos: roundMoney(impuestos),
         total_neto: roundMoney(totalNeto),
         promedio_por_venta: roundMoney(promedioVenta),
+        subtotal_general: roundMoney(subtotal),
+        descuento_general: roundMoney(descuentos),
+        impuesto_general: roundMoney(impuestos),
+        total_neto_general: roundMoney(totalNeto),
+        ticket_promedio_general: roundMoney(promedioVenta),
         ventas_canceladas_o_anuladas: canceladas
       },
       serie_diaria: [...byDate.values()].map((item) => ({
-        ...item,
-        total_neto: roundMoney(item.total_neto)
+        fecha: item.fecha,
+        cantidad_ventas: item.cantidad_ventas,
+        subtotal: roundMoney(item.subtotal),
+        descuento: roundMoney(item.descuento),
+        impuesto: roundMoney(item.impuesto),
+        total_neto: roundMoney(item.total_neto),
+        ticket_promedio: item.cantidad_ventas > 0 ? roundMoney(item.total_neto / item.cantidad_ventas) : 0,
+        estado_principal: [...item._estados.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] || 'Sin estado'
       })),
       desglose_por_estado: [...byState.values()].map((item) => ({
         ...item,
@@ -561,6 +979,13 @@ const getVentasMetodosPago = async (req, res, filters, parsedFilters) => {
 
   if (built.forbidden) {
     return res.status(403).json({ error: true, message: 'No tiene sucursales asignadas para consultar este reporte.' });
+  }
+
+  if (!parsedFilters.estado) {
+    // AM: por defecto excluimos anuladas/canceladas; solo se incluyen cuando estado viene informado.
+    built.whereClause = built.whereClause
+      ? `${built.whereClause} AND COALESCE(ep.descripcion, 'VENTA DIRECTA') !~* '(ANULAD|CANCELAD)'`
+      : `WHERE COALESCE(ep.descripcion, 'VENTA DIRECTA') !~* '(ANULAD|CANCELAD)'`;
   }
 
   if (parsedFilters.metodo_pago) {
@@ -671,6 +1096,7 @@ const getVentasMetodosPago = async (req, res, filters, parsedFilters) => {
     });
 
   const totalVentasUnicas = new Set(rows.map((row) => Number(row.id_factura || 0)).filter(Boolean)).size;
+  const ticketPromedioGeneral = totalVentasUnicas > 0 ? roundMoney(totalGeneral / totalVentasUnicas) : 0;
 
   return res.json({
     ok: true,
@@ -681,6 +1107,7 @@ const getVentasMetodosPago = async (req, res, filters, parsedFilters) => {
       kpis: {
         total_general: roundMoney(totalGeneral),
         total_ventas: totalVentasUnicas,
+        ticket_promedio_general: ticketPromedioGeneral,
         metodos_activos: resumenMetodos.length
       },
       resumen_por_metodo: resumenMetodos,
@@ -752,6 +1179,12 @@ const getCajaCierres = async (req, res, filters, parsedFilters) => {
   if (built.forbidden) {
     return res.status(403).json({ error: true, message: 'No tiene sucursales asignadas para consultar este reporte.' });
   }
+  if (!parsedFilters.estado) {
+    // AM: por defecto excluimos cierres anulados; si estado viene informado se respeta el filtro explícito.
+    built.whereClause = built.whereClause
+      ? `${built.whereClause} AND COALESCE(resolucion.nombre, 'SIN RESOLUCION') !~* 'ANULAD'`
+      : `WHERE COALESCE(resolucion.nombre, 'SIN RESOLUCION') !~* 'ANULAD'`;
+  }
 
   const query = `
     SELECT
@@ -770,7 +1203,13 @@ const getCajaCierres = async (req, res, filters, parsedFilters) => {
       s.nombre_sucursal,
       COALESCE(NULLIF(TRIM(CONCAT_WS(' ', per_resp.nombre, per_resp.apellido)), ''), resp.nombre_usuario) AS responsable,
       COALESCE(NULLIF(TRIM(CONCAT_WS(' ', per_cierre.nombre, per_cierre.apellido)), ''), cierre.nombre_usuario) AS usuario_cierre,
-      COALESCE(resolucion.nombre, 'SIN RESOLUCION') AS estado_cierre
+      COALESCE(resolucion.nombre, 'SIN RESOLUCION') AS estado_cierre,
+      COALESCE(resolucion.nombre, 'SIN RESOLUCION') AS resolucion,
+      COALESCE(cc.observacion, '') AS observacion,
+      CASE
+        WHEN COALESCE(resolucion.nombre, '') ~* 'ANULAD' THEN 'ANULADO'
+        ELSE 'CERRADO'
+      END AS estado
     FROM public.cajas_cierres cc
     INNER JOIN public.cajas c ON c.id_caja = cc.id_caja
     INNER JOIN public.sucursales s ON s.id_sucursal = cc.id_sucursal
@@ -822,8 +1261,11 @@ const getCajaCierres = async (req, res, filters, parsedFilters) => {
         total_esperado: roundMoney(totals.totalEsperado),
         total_contado: roundMoney(totals.totalContado),
         diferencia_total: roundMoney(totals.totalDiferencia),
+        diferencia_neta: roundMoney(totals.totalDiferencia),
         cierres_con_diferencia: totals.conDiferencia,
-        cierres_sin_diferencia: totals.sinDiferencia
+        cierres_sin_diferencia: totals.sinDiferencia,
+        cantidad_con_diferencia: totals.conDiferencia,
+        cantidad_sin_diferencia: totals.sinDiferencia
       },
       cierres: rows.map((row) => ({
         id_cierre_caja: row.id_cierre_caja,
@@ -837,7 +1279,10 @@ const getCajaCierres = async (req, res, filters, parsedFilters) => {
         total_esperado: roundMoney(row.total_esperado),
         total_contado: roundMoney(row.total_contado),
         diferencia: roundMoney(row.diferencia),
-        estado_cierre: row.estado_cierre
+        estado_cierre: row.estado_cierre,
+        estado: row.estado || 'CERRADO',
+        resolucion: row.resolucion || row.estado_cierre || 'SIN RESOLUCION',
+        observacion: row.observacion || ''
       }))
     },
     meta: {
@@ -854,6 +1299,12 @@ const getCajaDiferencias = async (req, res, filters, parsedFilters) => {
 
   if (built.forbidden) {
     return res.status(403).json({ error: true, message: 'No tiene sucursales asignadas para consultar este reporte.' });
+  }
+  if (!parsedFilters.estado) {
+    // AM: por defecto excluimos anulados; si estado viene informado, se respeta el filtro explícito.
+    built.whereClause = built.whereClause
+      ? `${built.whereClause} AND COALESCE(resolucion.nombre, 'SIN RESOLUCION') !~* 'ANULAD'`
+      : `WHERE COALESCE(resolucion.nombre, 'SIN RESOLUCION') !~* 'ANULAD'`;
   }
 
   const tipoDiferencia = String(parsedFilters.tipo_diferencia || '').trim().toLowerCase();
@@ -887,7 +1338,12 @@ const getCajaDiferencias = async (req, res, filters, parsedFilters) => {
       s.nombre_sucursal,
       COALESCE(NULLIF(TRIM(CONCAT_WS(' ', per_resp.nombre, per_resp.apellido)), ''), resp.nombre_usuario) AS responsable,
       COALESCE(resolucion.nombre, 'SIN RESOLUCION') AS estado_resolucion,
-      COALESCE(cc.observacion, '') AS observacion
+      COALESCE(resolucion.nombre, 'SIN RESOLUCION') AS resolucion,
+      COALESCE(cc.observacion, '') AS observacion,
+      CASE
+        WHEN COALESCE(resolucion.nombre, '') ~* 'ANULAD' THEN 'ANULADO'
+        ELSE 'VALIDO'
+      END AS estado
     FROM public.cajas_cierres cc
     INNER JOIN public.cajas c ON c.id_caja = cc.id_caja
     INNER JOIN public.sucursales s ON s.id_sucursal = cc.id_sucursal
@@ -907,6 +1363,8 @@ const getCajaDiferencias = async (req, res, filters, parsedFilters) => {
       const diferencia = Number(row.diferencia || 0);
       const abs = Math.abs(diferencia);
       acc.totalAbsoluto += abs;
+      acc.diferenciaNeta += diferencia;
+      if (abs > acc.mayorDiferenciaAbs) acc.mayorDiferenciaAbs = abs;
       if (diferencia < 0) {
         acc.totalFaltantes += abs;
         acc.cantidadFaltantes += 1;
@@ -918,6 +1376,8 @@ const getCajaDiferencias = async (req, res, filters, parsedFilters) => {
     },
     {
       totalAbsoluto: 0,
+      diferenciaNeta: 0,
+      mayorDiferenciaAbs: 0,
       totalFaltantes: 0,
       totalSobrantes: 0,
       cantidadFaltantes: 0,
@@ -936,6 +1396,8 @@ const getCajaDiferencias = async (req, res, filters, parsedFilters) => {
         total_diferencia_absoluta: roundMoney(totals.totalAbsoluto),
         total_faltantes: roundMoney(totals.totalFaltantes),
         total_sobrantes: roundMoney(totals.totalSobrantes),
+        diferencia_neta: roundMoney(totals.diferenciaNeta),
+        mayor_diferencia_registrada: roundMoney(totals.mayorDiferenciaAbs),
         cantidad_faltantes: totals.cantidadFaltantes,
         cantidad_sobrantes: totals.cantidadSobrantes
       },
@@ -951,7 +1413,9 @@ const getCajaDiferencias = async (req, res, filters, parsedFilters) => {
         diferencia: roundMoney(row.diferencia),
         tipo_diferencia: Number(row.diferencia || 0) < 0 ? 'FALTANTE' : 'SOBRANTE',
         estado_resolucion: row.estado_resolucion,
-        observacion: row.observacion || ''
+        resolucion: row.resolucion || row.estado_resolucion || 'SIN RESOLUCION',
+        observacion: row.observacion || '',
+        estado: row.estado || 'VALIDO'
       }))
     },
     meta: {
@@ -1008,11 +1472,13 @@ const getInventarioStockCritico = async (req, res, filters, parsedFilters) => {
     const estadoFiltro = String(parsedFilters.estado).trim().toLowerCase();
     if (['activo', 'activos'].includes(estadoFiltro)) where.push('base.estado_activo = true');
     else if (['inactivo', 'inactivos'].includes(estadoFiltro)) where.push('base.estado_activo = false');
+  } else {
+    where.push('base.estado_activo = true'); // AM: por defecto excluimos items inactivos salvo filtro explícito.
   }
 
   const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
-  const onlyCriticosSql = parsedFilters.solo_criticos === true
-    ? `WHERE estado_calculado IN ('AGOTADO', 'CRITICO', 'BAJO STOCK')`
+  const onlyCriticosSql = parsedFilters.solo_criticos !== false // AM: por defecto mostramos solo sin stock/critico/bajo.
+    ? `WHERE estado_calculado IN ('SIN STOCK', 'CRITICO', 'BAJO')`
     : '';
 
   const query = `
@@ -1078,9 +1544,9 @@ const getInventarioStockCritico = async (req, res, filters, parsedFilters) => {
         base.*,
         (base.cantidad_actual - base.stock_minimo)::numeric(14,2) AS diferencia_minimo,
         CASE
-          WHEN base.cantidad_actual <= 0 THEN 'AGOTADO'
+          WHEN base.cantidad_actual <= 0 THEN 'SIN STOCK'
           WHEN base.cantidad_actual <= base.stock_minimo THEN 'CRITICO'
-          WHEN base.stock_minimo > 0 AND base.cantidad_actual <= (base.stock_minimo * 1.20) THEN 'BAJO STOCK'
+          WHEN base.stock_minimo > 0 AND base.cantidad_actual <= (base.stock_minimo * 1.20) THEN 'BAJO'
           ELSE 'NORMAL'
         END AS estado_calculado
       FROM base
@@ -1098,14 +1564,15 @@ const getInventarioStockCritico = async (req, res, filters, parsedFilters) => {
   const metrics = rows.reduce(
     (acc, row) => {
       const estado = String(row.estado_calculado || 'NORMAL');
-      if (estado === 'CRITICO' || estado === 'AGOTADO' || estado === 'BAJO STOCK') acc.criticos += 1;
-      if (estado === 'AGOTADO') acc.agotados += 1;
-      if (estado === 'BAJO STOCK') acc.bajoStock += 1;
-      if (estado === 'CRITICO' && row.tipo_item === 'PRODUCTO') acc.productosCriticos += 1;
-      if (estado === 'CRITICO' && row.tipo_item === 'INSUMO') acc.insumosCriticos += 1;
+      if (estado === 'CRITICO' || estado === 'SIN STOCK' || estado === 'BAJO') acc.criticos += 1;
+      if (estado === 'SIN STOCK') acc.agotados += 1;
+      if (estado === 'BAJO') acc.bajoStock += 1;
+      if (['CRITICO', 'SIN STOCK', 'BAJO'].includes(estado) && row.tipo_item === 'PRODUCTO') acc.productosAfectados += 1;
+      if (['CRITICO', 'SIN STOCK', 'BAJO'].includes(estado) && row.tipo_item === 'INSUMO') acc.insumosAfectados += 1;
+      if (['CRITICO', 'SIN STOCK', 'BAJO'].includes(estado)) acc.almacenesAfectados.add(String(row.id_almacen || '0'));
       return acc;
     },
-    { criticos: 0, agotados: 0, bajoStock: 0, productosCriticos: 0, insumosCriticos: 0 }
+    { criticos: 0, agotados: 0, bajoStock: 0, productosAfectados: 0, insumosAfectados: 0, almacenesAfectados: new Set() }
   );
 
   return res.json({
@@ -1116,11 +1583,17 @@ const getInventarioStockCritico = async (req, res, filters, parsedFilters) => {
     data: {
       kpis: {
         total_items_revisados: rows.length,
+        total_items_criticos_bajos: metrics.criticos,
         total_criticos: metrics.criticos,
+        total_sin_stock: metrics.agotados,
         total_agotados: metrics.agotados,
+        total_bajo_minimo: metrics.bajoStock,
         total_stock_bajo: metrics.bajoStock,
-        productos_criticos: metrics.productosCriticos,
-        insumos_criticos: metrics.insumosCriticos
+        productos_afectados: metrics.productosAfectados,
+        insumos_afectados: metrics.insumosAfectados,
+        almacenes_afectados: metrics.almacenesAfectados.size,
+        productos_criticos: metrics.productosAfectados,
+        insumos_criticos: metrics.insumosAfectados
       },
       items: rows.map((row) => ({
         tipo_item: row.tipo_item,
@@ -1131,6 +1604,8 @@ const getInventarioStockCritico = async (req, res, filters, parsedFilters) => {
         cantidad_actual: Number(row.cantidad_actual || 0),
         stock_minimo: Number(row.stock_minimo || 0),
         diferencia_minimo: Number(row.diferencia_minimo || 0),
+        estado_stock: row.estado_calculado,
+        estado_item: row.estado_activo ? 'ACTIVO' : 'INACTIVO',
         estado: row.estado_calculado
       }))
     },
@@ -1142,13 +1617,6 @@ const getInventarioStockCritico = async (req, res, filters, parsedFilters) => {
 };
 
 const getInventarioKardex = async (req, res, filters, parsedFilters) => {
-  if (parsedFilters.categoria) {
-    return res.status(400).json({
-      error: true,
-      message: 'El filtro categoria no aplica para Kardex en esta fase.'
-    });
-  }
-
   const scope = await resolveRequestUserSucursalScope(req);
   const params = [];
   const where = [];
@@ -1196,6 +1664,21 @@ const getInventarioKardex = async (req, res, filters, parsedFilters) => {
     where.push(`LOWER(COALESCE(k.item_tipo, '')) = $${params.length}`);
   }
 
+  if (parsedFilters.categoria) {
+    const categoriaId = parsePositiveInt(parsedFilters.categoria);
+    if (categoriaId) {
+      params.push(categoriaId);
+      where.push(`(
+        (LOWER(COALESCE(k.item_tipo, '')) = 'producto' AND k.id_categoria_producto = $${params.length})
+        OR
+        (LOWER(COALESCE(k.item_tipo, '')) = 'insumo' AND k.id_categoria_insumo = $${params.length})
+      )`);
+    } else {
+      params.push(`%${parsedFilters.categoria}%`);
+      where.push(`COALESCE(k.categoria, '') ILIKE $${params.length}`);
+    }
+  }
+
   if (parsedFilters.item) {
     const itemId = parsePositiveInt(parsedFilters.item);
     if (itemId) {
@@ -1231,11 +1714,37 @@ const getInventarioKardex = async (req, res, filters, parsedFilters) => {
       k.item_tipo,
       k.item_id,
       k.item_nombre,
+      k.categoria,
+      k.id_categoria_producto,
+      k.id_categoria_insumo,
       k.impacto,
       k.ref_origen,
       k.id_ref,
+      k.referencia,
+      k.origen_modulo,
+      k.usuario,
       k.descripcion
-    FROM public.v_kardex_detalle k
+    FROM (
+      SELECT
+        kd.*,
+        prod.id_categoria_producto,
+        cp.nombre_categoria AS categoria_producto,
+        ins.id_categoria_insumo,
+        ci.nombre_categoria AS categoria_insumo,
+        COALESCE(
+          CASE WHEN LOWER(COALESCE(kd.item_tipo, '')) = 'producto' THEN cp.nombre_categoria END,
+          CASE WHEN LOWER(COALESCE(kd.item_tipo, '')) = 'insumo' THEN ci.nombre_categoria END,
+          'Sin categoria'
+        ) AS categoria,
+        COALESCE(kd.ref_origen, '-') || CASE WHEN kd.id_ref IS NOT NULL THEN (' #' || kd.id_ref::text) ELSE '' END AS referencia,
+        COALESCE(kd.ref_origen, 'SISTEMA') AS origen_modulo,
+        '-'::text AS usuario
+      FROM public.v_kardex_detalle kd
+      LEFT JOIN public.productos prod ON prod.id_producto = kd.id_producto
+      LEFT JOIN public.categorias_productos cp ON cp.id_categoria_producto = prod.id_categoria_producto
+      LEFT JOIN public.insumos ins ON ins.id_insumo = kd.id_insumo
+      LEFT JOIN public.categorias_insumos ci ON ci.id_categoria_insumo = ins.id_categoria_insumo
+    ) k
     ${whereSql}
     ORDER BY k.fecha_mov DESC, k.id_movimiento DESC
     ${limitSql}
@@ -1247,13 +1756,23 @@ const getInventarioKardex = async (req, res, filters, parsedFilters) => {
   const metrics = rows.reduce(
     (acc, row) => {
       const tipo = String(row.tipo || '').trim().toUpperCase();
-      if (tipo === 'ENTRADA') acc.entradas += 1;
-      else if (tipo === 'SALIDA') acc.salidas += 1;
-      else acc.ajustesOtros += 1;
+      const cantidad = Number(row.cantidad || 0);
+      if (tipo === 'ENTRADA') {
+        acc.entradas += 1;
+        acc.cantidadEntradas += cantidad;
+      } else if (tipo === 'SALIDA') {
+        acc.salidas += 1;
+        acc.cantidadSalidas += cantidad;
+      } else {
+        acc.ajustes += 1;
+        acc.cantidadAjustes += cantidad;
+      }
+      acc.neta += Number(row.impacto || 0);
       if (row.item_id !== null && row.item_id !== undefined) acc.items.add(`${String(row.item_tipo || '').toLowerCase()}-${row.item_id}`);
+      if (row.id_almacen !== null && row.id_almacen !== undefined) acc.almacenes.add(String(row.id_almacen));
       return acc;
     },
-    { entradas: 0, salidas: 0, ajustesOtros: 0, items: new Set() }
+    { entradas: 0, salidas: 0, ajustes: 0, cantidadEntradas: 0, cantidadSalidas: 0, cantidadAjustes: 0, neta: 0, items: new Set(), almacenes: new Set() }
   );
 
   return res.json({
@@ -1264,9 +1783,15 @@ const getInventarioKardex = async (req, res, filters, parsedFilters) => {
     data: {
       kpis: {
         total_movimientos: rows.length,
+        total_entradas: metrics.entradas,
+        total_salidas: metrics.salidas,
+        total_ajustes: metrics.ajustes,
+        cantidad_neta_movida: Number(metrics.neta.toFixed(2)),
+        items_afectados: metrics.items.size,
+        almacenes_afectados: metrics.almacenes.size,
         entradas: metrics.entradas,
         salidas: metrics.salidas,
-        ajustes_otros: metrics.ajustesOtros,
+        ajustes_otros: metrics.ajustes,
         items_unicos: metrics.items.size
       },
       movimientos: rows
@@ -1322,6 +1847,9 @@ const getVentasDescuentos = async (req, res, filters, parsedFilters) => {
   if (parsedFilters.estado) {
     params.push(`%${parsedFilters.estado}%`);
     where.push(`COALESCE(ep.descripcion, 'VENTA DIRECTA') ILIKE $${params.length}`);
+  } else {
+    // AM: por defecto excluimos anuladas/canceladas para mantener el reporte limpio.
+    where.push(`COALESCE(ep.descripcion, 'VENTA DIRECTA') !~* '(ANULAD|CANCELAD)'`);
   }
 
   if (parsedFilters.tipo_descuento) {
@@ -1363,6 +1891,7 @@ const getVentasDescuentos = async (req, res, filters, parsedFilters) => {
       ) AS cliente,
       COALESCE(td.id_tipo_descuento, 0) AS id_tipo_descuento,
       COALESCE(td.nombre_tipo_descuento, 'SIN TIPO') AS tipo_descuento,
+      COALESCE(prod.nombre_producto, CONCAT('Item #', COALESCE(df.id_producto, 0))) AS item,
       COALESCE(dc.nombre_descuento, 'DESCUENTO MANUAL') AS nombre_descuento,
       COALESCE(d.monto_descuento, 0)::numeric(14,2) AS descuento,
       COALESCE(df.sub_total, 0)::numeric(14,2) AS subtotal_linea,
@@ -1371,6 +1900,7 @@ const getVentasDescuentos = async (req, res, filters, parsedFilters) => {
     FROM facturas f
     INNER JOIN detalle_facturas df ON df.id_factura = f.id_factura
     INNER JOIN descuentos d ON d.id_descuento = df.id_descuento
+    LEFT JOIN productos prod ON prod.id_producto = df.id_producto
     LEFT JOIN descuentos_catalogos dc ON dc.id_descuento_catalogo = d.id_descuento_catalogo
     LEFT JOIN tipo_descuentos td ON td.id_tipo_descuento = dc.id_tipo_descuento
     LEFT JOIN pedidos p ON p.id_pedido = f.id_pedido
@@ -1388,7 +1918,9 @@ const getVentasDescuentos = async (req, res, filters, parsedFilters) => {
   const result = await pool.query(detailQuery, params);
   const rows = Array.isArray(result.rows) ? result.rows : [];
 
+  const subtotalAfectado = rows.reduce((sum, row) => sum + Number(row.subtotal_linea || 0), 0);
   const totalDescuento = rows.reduce((sum, row) => sum + Number(row.descuento || 0), 0);
+  const totalNeto = rows.reduce((sum, row) => sum + Number(row.total_linea || 0), 0);
   const facturasUnicas = new Set(rows.map((row) => Number(row.id_factura || 0)).filter(Boolean));
 
   const byTipo = new Map();
@@ -1424,7 +1956,10 @@ const getVentasDescuentos = async (req, res, filters, parsedFilters) => {
     filtros: filters,
     data: {
       kpis: {
+        cantidad_descuentos_aplicados: rows.length,
+        subtotal_afectado: roundMoney(subtotalAfectado),
         total_descuento: roundMoney(totalDescuento),
+        total_neto_despues_descuento: roundMoney(totalNeto),
         ventas_con_descuento: facturasUnicas.size,
         lineas_con_descuento: rows.length,
         ticket_promedio_descuento: facturasUnicas.size > 0 ? roundMoney(totalDescuento / facturasUnicas.size) : 0
@@ -1439,8 +1974,9 @@ const getVentasDescuentos = async (req, res, filters, parsedFilters) => {
         pedido: row.id_pedido,
         cliente: row.cliente,
         tipo_descuento: row.tipo_descuento,
-        descuento: roundMoney(row.descuento),
+        item: row.item || 'Item',
         subtotal_linea: roundMoney(row.subtotal_linea),
+        descuento: roundMoney(row.descuento),
         total_linea: roundMoney(row.total_linea),
         estado: row.estado
       }))
@@ -1507,6 +2043,9 @@ const getVentasItems = async (req, res, filters, parsedFilters) => {
   if (parsedFilters.estado) {
     params.push(`%${parsedFilters.estado}%`);
     where.push(`COALESCE(base.estado, 'VENTA DIRECTA') ILIKE $${params.length}`);
+  } else {
+    // AM: por defecto excluimos anuladas/canceladas para no contaminar el reporte principal.
+    where.push(`COALESCE(base.estado, 'VENTA DIRECTA') !~* '(ANULAD|CANCELAD)'`);
   }
 
   if (parsedFilters.item) {
@@ -1562,6 +2101,10 @@ const getVentasItems = async (req, res, filters, parsedFilters) => {
         prod.id_categoria_producto,
         cp.nombre_categoria AS categoria,
         COALESCE(df.cantidad, 0)::numeric(14,2) AS cantidad,
+        CASE
+          WHEN COALESCE(df.cantidad, 0) = 0 THEN 0::numeric(14,2)
+          ELSE (COALESCE(df.sub_total, 0) / NULLIF(df.cantidad, 0))::numeric(14,2)
+        END AS precio_unitario,
         COALESCE(df.sub_total, 0)::numeric(14,2) AS subtotal,
         COALESCE(d.monto_descuento, 0)::numeric(14,2) AS descuento,
         COALESCE(df.total_detalle, 0)::numeric(14,2) AS total
@@ -1629,6 +2172,68 @@ const getVentasItems = async (req, res, filters, parsedFilters) => {
           END,
           1
         )::numeric(14,2) AS cantidad,
+        CASE
+          WHEN COALESCE(
+            CASE
+              WHEN dp.id_producto IS NOT NULL THEN GREATEST(
+                1,
+                ROUND(
+                  COALESCE(NULLIF(dp.sub_total_pedido, 0), dp.total_pedido, 0)
+                  / NULLIF(prod.precio, 0)
+                )::int
+              )
+              WHEN dp.id_combo IS NOT NULL THEN GREATEST(
+                1,
+                ROUND(
+                  COALESCE(NULLIF(dp.sub_total_pedido, 0), dp.total_pedido, 0)
+                  / NULLIF(cb.precio, 0)
+                )::int
+              )
+              WHEN dp.id_receta IS NOT NULL THEN GREATEST(
+                1,
+                ROUND(
+                  COALESCE(NULLIF(dp.sub_total_pedido, 0), dp.total_pedido, 0)
+                  / NULLIF(rc.precio, 0)
+                )::int
+              )
+              ELSE 1
+            END,
+            1
+          ) = 0 THEN 0::numeric(14,2)
+          ELSE (
+            COALESCE(dp.sub_total_pedido, 0)
+            / NULLIF(
+              COALESCE(
+                CASE
+                  WHEN dp.id_producto IS NOT NULL THEN GREATEST(
+                    1,
+                    ROUND(
+                      COALESCE(NULLIF(dp.sub_total_pedido, 0), dp.total_pedido, 0)
+                      / NULLIF(prod.precio, 0)
+                    )::int
+                  )
+                  WHEN dp.id_combo IS NOT NULL THEN GREATEST(
+                    1,
+                    ROUND(
+                      COALESCE(NULLIF(dp.sub_total_pedido, 0), dp.total_pedido, 0)
+                      / NULLIF(cb.precio, 0)
+                    )::int
+                  )
+                  WHEN dp.id_receta IS NOT NULL THEN GREATEST(
+                    1,
+                    ROUND(
+                      COALESCE(NULLIF(dp.sub_total_pedido, 0), dp.total_pedido, 0)
+                      / NULLIF(rc.precio, 0)
+                    )::int
+                  )
+                  ELSE 1
+                END,
+                1
+              ),
+              0
+            )
+          )::numeric(14,2)
+        END AS precio_unitario,
         COALESCE(dp.sub_total_pedido, 0)::numeric(14,2) AS subtotal,
         COALESCE(d2.monto_descuento, 0)::numeric(14,2) AS descuento,
         COALESCE(dp.total_pedido, 0)::numeric(14,2) AS total
@@ -1664,6 +2269,9 @@ const getVentasItems = async (req, res, filters, parsedFilters) => {
   const rows = Array.isArray(result.rows) ? result.rows : [];
 
   const totalVendido = rows.reduce((sum, row) => sum + Number(row.total || 0), 0);
+  const totalCantidad = rows.reduce((sum, row) => sum + Number(row.cantidad || 0), 0);
+  const totalSubtotal = rows.reduce((sum, row) => sum + Number(row.subtotal || 0), 0);
+  const totalDescuento = rows.reduce((sum, row) => sum + Number(row.descuento || 0), 0);
   const facturasUnicas = new Set(rows.map((row) => Number(row.id_factura || 0)).filter(Boolean));
   const itemsUnicos = new Set(
     rows
@@ -1717,6 +2325,10 @@ const getVentasItems = async (req, res, filters, parsedFilters) => {
     data: {
       kpis: {
         total_vendido: roundMoney(totalVendido),
+        cantidad_total_vendida: Number(totalCantidad.toFixed(2)),
+        subtotal_total: roundMoney(totalSubtotal),
+        descuento_total: roundMoney(totalDescuento),
+        total_neto: roundMoney(totalVendido),
         ventas: facturasUnicas.size,
         lineas: rows.length,
         cantidad_items: itemsUnicos.size,
@@ -1734,6 +2346,7 @@ const getVentasItems = async (req, res, filters, parsedFilters) => {
         item: row.nombre_item,
         categoria: row.categoria || 'Sin categoría',
         cantidad: Number(Number(row.cantidad || 0).toFixed(2)),
+        precio_unitario: roundMoney(row.precio_unitario),
         subtotal: roundMoney(row.subtotal),
         descuento: roundMoney(row.descuento),
         total: roundMoney(row.total),
@@ -1878,7 +2491,8 @@ router.get('/reportes/exportar/pdf', checkPermission([BASE_PERMISSION, 'REPORTES
 
     const pdfBuffer = await buildReportPdfBuffer({
       reportKey: reportDefinition.key,
-      payload: capture.state.body
+      payload: capture.state.body,
+      generatedBy: req?.user?.nombre_usuario || req?.user?.usuario || req?.user?.email || null
     });
     const filename = buildPdfFileName({
       reportKey: reportDefinition.key,
@@ -2003,7 +2617,11 @@ router.post('/reportes/enviar-correo', checkPermission([BASE_PERMISSION, 'REPORT
       : buildExportFileName({ reportKey: reportDefinition.key, parsedFilters: parsed.parsed });
 
     const attachmentContent = formato === 'pdf'
-      ? await buildReportPdfBuffer({ reportKey: reportDefinition.key, payload: capture.state.body })
+      ? await buildReportPdfBuffer({
+          reportKey: reportDefinition.key,
+          payload: capture.state.body,
+          generatedBy: req?.user?.nombre_usuario || req?.user?.usuario || req?.user?.email || null
+        })
       : Buffer.from(
           buildExcelCompatibleCsv({ reportKey: reportDefinition.key, payload: capture.state.body }),
           'utf8'

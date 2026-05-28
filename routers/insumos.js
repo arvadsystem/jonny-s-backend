@@ -175,6 +175,14 @@ const sanitizeOptionalText = (value) => {
   return String(value).trim();
 };
 
+// AM: parser decimal no negativo para cantidad/stock_minimo en insumos.
+const parseNonNegativeDecimal = (value) => {
+  if (value === undefined || value === null || String(value).trim() === '') return null;
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed < 0) return null;
+  return parsed;
+};
+
 const validateOptionalDateInput = (rawValue, fieldName) => {
   const value = sanitizeOptionalText(rawValue);
   if (value === '') return { ok: true, value: '' };
@@ -950,18 +958,18 @@ router.post('/insumos', checkPermission(INSUMOS_CREATE_PERMISSIONS), async (req,
     if (cantidadRaw === undefined || cantidadRaw === null || String(cantidadRaw).trim() === '') {
       return res.status(400).json({ error: true, message: 'cantidad es obligatoria.' });
     }
-    const cantidad = Number(cantidadRaw);
-    if (!Number.isFinite(cantidad) || !Number.isInteger(cantidad) || cantidad < 0) {
-      return res.status(400).json({ error: true, message: 'cantidad debe ser un entero mayor o igual a 0.' });
+    const cantidad = parseNonNegativeDecimal(cantidadRaw);
+    if (cantidad === null) {
+      return res.status(400).json({ error: true, message: 'cantidad debe ser un numero mayor o igual a 0.' });
     }
 
     const stockMinimoRaw = payloadBase?.stock_minimo;
     if (stockMinimoRaw === undefined || stockMinimoRaw === null || String(stockMinimoRaw).trim() === '') {
       return res.status(400).json({ error: true, message: 'stock_minimo es obligatorio.' });
     }
-    const stockMinimo = Number(stockMinimoRaw);
-    if (!Number.isInteger(stockMinimo) || stockMinimo < 0) {
-      return res.status(400).json({ error: true, message: 'stock_minimo debe ser un entero mayor o igual a 0.' });
+    const stockMinimo = parseNonNegativeDecimal(stockMinimoRaw);
+    if (stockMinimo === null) {
+      return res.status(400).json({ error: true, message: 'stock_minimo debe ser un numero mayor o igual a 0.' });
     }
 
     const fechaIngresoValidation = validateOptionalDateInput(payloadBase?.fecha_ingreso_insumo, 'fecha_ingreso_insumo');
@@ -1216,19 +1224,19 @@ router.put('/insumos/edicion', checkPermission(INSUMOS_EDIT_PERMISSIONS), async 
 
     const nombreInsumo = String(merged.nombre_insumo ?? '').trim();
     const precio = Number(merged.precio);
-    const cantidad = Number.parseInt(String(merged.cantidad ?? ''), 10);
-    const stockMinimo = Number.parseInt(String(merged.stock_minimo ?? ''), 10);
+    const cantidad = parseNonNegativeDecimal(merged.cantidad);
+    const stockMinimo = parseNonNegativeDecimal(merged.stock_minimo);
     if (nombreInsumo.length < 2 || nombreInsumo.length > 80) {
       return res.status(400).json({ error: true, message: 'nombre_insumo debe tener entre 2 y 80 caracteres.' });
     }
     if (!Number.isFinite(precio) || precio < 0) {
       return res.status(400).json({ error: true, message: 'precio debe ser un numero mayor o igual a 0.' });
     }
-    if (!Number.isInteger(cantidad) || cantidad < 0) {
-      return res.status(400).json({ error: true, message: 'cantidad debe ser un entero mayor o igual a 0.' });
+    if (cantidad === null) {
+      return res.status(400).json({ error: true, message: 'cantidad debe ser un numero mayor o igual a 0.' });
     }
-    if (!Number.isInteger(stockMinimo) || stockMinimo < 0) {
-      return res.status(400).json({ error: true, message: 'stock_minimo debe ser un entero mayor o igual a 0.' });
+    if (stockMinimo === null) {
+      return res.status(400).json({ error: true, message: 'stock_minimo debe ser un numero mayor o igual a 0.' });
     }
     const fechaIngresoValidation = validateOptionalDateInput(merged.fecha_ingreso_insumo, 'fecha_ingreso_insumo');
     if (!fechaIngresoValidation.ok) {
@@ -1408,11 +1416,11 @@ router.put('/insumos', checkPermission(INSUMOS_EDIT_PERMISSIONS), async (req, re
     if (campo === 'stock_minimo') {
       const stockMinimoRaw = valorNormalizado;
       if (stockMinimoRaw === undefined || stockMinimoRaw === null || String(stockMinimoRaw).trim() === '') {
-        return res.status(400).json({ error: true, message: 'stock_minimo debe ser un entero mayor o igual a 0.' });
+        return res.status(400).json({ error: true, message: 'stock_minimo debe ser un numero mayor o igual a 0.' });
       }
-      const stockMinimo = Number(stockMinimoRaw);
-      if (!Number.isInteger(stockMinimo) || stockMinimo < 0) {
-        return res.status(400).json({ error: true, message: 'stock_minimo debe ser un entero mayor o igual a 0.' });
+      const stockMinimo = parseNonNegativeDecimal(stockMinimoRaw);
+      if (stockMinimo === null) {
+        return res.status(400).json({ error: true, message: 'stock_minimo debe ser un numero mayor o igual a 0.' });
       }
       valorNormalizado = stockMinimo;
     }
