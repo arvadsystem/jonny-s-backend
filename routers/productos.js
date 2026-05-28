@@ -14,6 +14,7 @@ const PRODUCTOS_DELETE_PERMISSIONS = ['INVENTARIO_PRODUCTOS_ELIMINAR', 'INVENTAR
 const CAMPOS_PERMITIDOS_PRODUCTOS = new Set([
   'nombre_producto',
   'precio',
+  'costo_compra',
   'cantidad',
   'stock_minimo',
   'descripcion_producto',
@@ -35,6 +36,7 @@ const CAMPOS_PERMITIDOS_PRODUCTOS_POST = new Set([
 const PRODUCTOS_UPDATE_FIELD_COLUMN_MAP = Object.freeze({
   nombre_producto: 'nombre_producto',
   precio: 'precio',
+  costo_compra: 'costo_compra',
   stock_minimo: 'stock_minimo',
   descripcion_producto: 'descripcion_producto',
   fecha_ingreso_producto: 'fecha_ingreso_producto',
@@ -600,6 +602,20 @@ function validarCampoProducto(campo, valor) {
     return { valido: true, valor: numero };
   }
 
+  if (campo === 'costo_compra') {
+    // AM: costo_compra es opcional; null representa costo no definido.
+    if (esVacio(valor)) {
+      return { valido: true, valor: null };
+    }
+
+    const numero = Number(valor);
+    if (!Number.isFinite(numero) || numero < 0) {
+      return { valido: false, message: 'costo_compra debe ser un numero mayor o igual a 0.' };
+    }
+
+    return { valido: true, valor: numero };
+  }
+
   if (campo === 'cantidad') {
     // VALIDACION: cantidad entero >= 0
     const numero = Number(valor);
@@ -752,6 +768,7 @@ async function getProductoById(idProducto, db = pool) {
       p.id_producto,
       p.nombre_producto,
       p.precio,
+      p.costo_compra,
       p.cantidad,
       p.stock_minimo,
       p.descripcion_producto,
@@ -935,19 +952,21 @@ async function updateProductoCompleto(idProducto, data, db = pool) {
      SET
        nombre_producto = $1,
        precio = $2,
-       stock_minimo = $3,
-       descripcion_producto = $4,
-       fecha_ingreso_producto = $5,
-       fecha_caducidad = $6,
-       id_categoria_producto = $7,
-       id_almacen = $8,
-       id_tipo_departamento = $9,
-       estado = $10,
-       id_archivo_imagen_principal = $11
-     WHERE id_producto = $12`,
+       costo_compra = $3,
+       stock_minimo = $4,
+       descripcion_producto = $5,
+       fecha_ingreso_producto = $6,
+       fecha_caducidad = $7,
+       id_categoria_producto = $8,
+       id_almacen = $9,
+       id_tipo_departamento = $10,
+       estado = $11,
+       id_archivo_imagen_principal = $12
+     WHERE id_producto = $13`,
     [
       data.nombre_producto,
       data.precio,
+      data.costo_compra ?? null,
       data.stock_minimo,
       data.descripcion_producto || '',
       data.fecha_ingreso_producto || null,
@@ -1179,6 +1198,7 @@ router.get('/productos', checkPermission(PRODUCTOS_LIST_PERMISSIONS), async (req
           p.id_producto,
           p.nombre_producto,
           p.precio,
+          p.costo_compra,
           p.cantidad,
           p.stock_minimo,
           p.descripcion_producto,
@@ -1390,6 +1410,7 @@ router.post('/productos', checkPermission(PRODUCTOS_CREATE_PERMISSIONS), async (
         INSERT INTO public.productos (
           nombre_producto,
           precio,
+          costo_compra,
           cantidad,
           stock_minimo,
           descripcion_producto,
@@ -1402,13 +1423,14 @@ router.post('/productos', checkPermission(PRODUCTOS_CREATE_PERMISSIONS), async (
           id_archivo_imagen_principal
         )
         VALUES (
-          $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12
+          $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13
         )
         RETURNING id_producto
       `,
       [
         payloadPrimary.nombre_producto,
         payloadPrimary.precio,
+        payloadPrimary.costo_compra ?? null,
         0,
         payloadPrimary.stock_minimo ?? 0,
         payloadPrimary.descripcion_producto ?? '',
@@ -1513,6 +1535,9 @@ router.put('/productos/multi-almacen', checkPermission(PRODUCTOS_EDIT_PERMISSION
     const merged = {
       nombre_producto: datosEntrada.nombre_producto ?? actual.nombre_producto,
       precio: datosEntrada.precio ?? actual.precio,
+      costo_compra: Object.prototype.hasOwnProperty.call(datosEntrada, 'costo_compra')
+        ? datosEntrada.costo_compra
+        : actual.costo_compra,
       cantidad: actual.cantidad,
       stock_minimo: datosEntrada.stock_minimo ?? actual.stock_minimo ?? 0,
       descripcion_producto: datosEntrada.descripcion_producto ?? actual.descripcion_producto ?? '',
