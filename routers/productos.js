@@ -60,8 +60,10 @@ const CODIGO_SQL_OUT_OF_RANGE = '22003';
 const MAX_INT32_DB_ID = 2147483647;
 const SQLSTATE_UNDEFINED_TABLE = '42P01';
 const SQLSTATE_UNDEFINED_COLUMN = '42703';
-const PRODUCTOS_DUPLICATE_CONSTRAINT = 'uq_productos_nombre_categoria_departamento_norm';
-const PRODUCTOS_DUPLICATE_MESSAGE = 'Ya existe un producto con el mismo nombre, categoria y departamento.';
+const PRODUCTOS_DUPLICATE_CONSTRAINT = 'uq_productos_nombre_categoria_almacen_norm';
+const PRODUCTOS_DUPLICATE_CONSTRAINT_LEGACY = 'uq_productos_nombre_categoria_departamento_norm';
+const PRODUCTOS_DUPLICATE_MESSAGE = 'Ya existe un producto activo con el mismo nombre y categoria en este almacen.';
+const PRODUCTOS_DUPLICATE_CODE = 'PRODUCT_DUPLICATE_IN_WAREHOUSE';
 const PRODUCTOS_DATE_ORDER_MESSAGE = 'La fecha de caducidad no puede ser menor que la fecha de ingreso del producto.';
 const SINGLE_ALMACEN_TEMP_MESSAGE = 'Temporalmente solo se permite un almacen por producto o insumo.';
 const PRODUCTOS_DELETE_BLOCKED_MESSAGE = 'No se puede inactivar el producto porque esta siendo utilizado en otros modulos del sistema.';
@@ -797,12 +799,12 @@ async function getHydratedProductoById(req, idProducto, db = pool) {
   return rowsWithImagen?.[0] || producto;
 }
 
-// AM: busca producto general (sin amarrarlo a un almacen) para evitar duplicados por sucursal en modelo multi-asignacion.
-async function findProductoByGeneralKey(
+// AM: valida duplicado activo por llave operativa real (nombre + categoria + almacen).
+async function findProductoByWarehouseKey(
   {
     nombre_producto,
     id_categoria_producto,
-    id_tipo_departamento,
+    id_almacen,
     excludeId = null
   },
   db = pool
@@ -810,7 +812,7 @@ async function findProductoByGeneralKey(
   const params = [
     String(nombre_producto ?? '').trim().toLowerCase(),
     id_categoria_producto,
-    id_tipo_departamento ?? null
+    id_almacen
   ];
 
   let sql = `
@@ -818,10 +820,8 @@ async function findProductoByGeneralKey(
     FROM productos
     WHERE lower(trim(nombre_producto)) = $1
       AND id_categoria_producto = $2
-      AND (
-        (id_tipo_departamento IS NULL AND $3::integer IS NULL)
-        OR id_tipo_departamento = $3::integer
-      )
+      AND id_almacen = $3
+      AND COALESCE(estado, true) = true
   `;
 
   if (excludeId !== null && excludeId !== undefined) {
@@ -1009,8 +1009,19 @@ function esErrorConflictoConstraint(err) {
 function getProductosConstraintConflictMessage(err) {
   if (!err || err.code !== '23505') return '';
   const trace = String(err?.constraint || err?.detail || err?.message || '').toLowerCase();
-  if (!trace.includes(PRODUCTOS_DUPLICATE_CONSTRAINT.toLowerCase())) return '';
+  const hasDuplicateConstraint =
+    trace.includes(PRODUCTOS_DUPLICATE_CONSTRAINT.toLowerCase()) ||
+    trace.includes(PRODUCTOS_DUPLICATE_CONSTRAINT_LEGACY.toLowerCase());
+  if (!hasDuplicateConstraint) return '';
   return PRODUCTOS_DUPLICATE_MESSAGE;
+}
+
+function isProductosDuplicateConstraintError(err) {
+  const trace = String(err?.constraint || err?.detail || err?.message || '').toLowerCase();
+  return (
+    trace.includes(PRODUCTOS_DUPLICATE_CONSTRAINT.toLowerCase()) ||
+    trace.includes(PRODUCTOS_DUPLICATE_CONSTRAINT_LEGACY.toLowerCase())
+  );
 }
 
 // NEW: sanitiza mensajes internos de BD para respuestas HTTP del router de Productos.
@@ -1383,11 +1394,11 @@ router.post('/productos', checkPermission(PRODUCTOS_CREATE_PERMISSIONS), async (
       }
     }
 
-    const duplicadoGeneral = await findProductoByGeneralKey(
+    const duplicadoGeneral = await findProductoByWarehouseKey(
       {
         nombre_producto: datosNormalizados.nombre_producto,
         id_categoria_producto: datosNormalizados.id_categoria_producto,
-        id_tipo_departamento: datosNormalizados.id_tipo_departamento ?? null
+        id_almacen: idAlmacenes[0]
       },
       client
     );
@@ -1396,6 +1407,7 @@ router.post('/productos', checkPermission(PRODUCTOS_CREATE_PERMISSIONS), async (
       await client.query('ROLLBACK');
       return res.status(409).json({
         error: true,
+        code: PRODUCTOS_DUPLICATE_CODE,
         message: PRODUCTOS_DUPLICATE_MESSAGE
       });
     }
@@ -1477,11 +1489,21 @@ router.post('/productos', checkPermission(PRODUCTOS_CREATE_PERMISSIONS), async (
     try { await client.query('ROLLBACK'); } catch {}
     console.error('Error al crear producto:', err.message);
 
-    // AJUSTE: respuesta 409 para conflictos de FK/constraints
-    if (esErrorConflictoConstraint(err)) {
+    if (isProductosDuplicateConstraintError(err)) {
       return res.status(409).json({
         error: true,
-        message: getProductosConstraintConflictMessage(err) || 'No se pudo crear el producto por una restriccion de datos.'
+        code: PRODUCTOS_DUPLICATE_CODE,
+        message: PRODUCTOS_DUPLICATE_MESSAGE
+      });
+    }
+
+    // AJUSTE: respuesta 409 para conflictos de FK/constraints
+    if (esErrorConflictoConstraint(err)) {
+      const duplicateMessage = getProductosConstraintConflictMessage(err);
+      return res.status(409).json({
+        error: true,
+        code: duplicateMessage ? PRODUCTOS_DUPLICATE_CODE : undefined,
+        message: duplicateMessage || 'No se pudo crear el producto por una restriccion de datos.'
       });
     }
 
@@ -1665,11 +1687,11 @@ router.put('/productos/multi-almacen', checkPermission(PRODUCTOS_EDIT_PERMISSION
 
     await client.query('BEGIN');
 
-    const duplicateGeneral = await findProductoByGeneralKey(
+    const duplicateGeneral = await findProductoByWarehouseKey(
       {
         nombre_producto: datosNormalizados.nombre_producto,
         id_categoria_producto: datosNormalizados.id_categoria_producto,
-        id_tipo_departamento: datosNormalizados.id_tipo_departamento ?? null,
+        id_almacen: idAlmacenes[0],
         excludeId: idProducto
       },
       client
@@ -1679,6 +1701,7 @@ router.put('/productos/multi-almacen', checkPermission(PRODUCTOS_EDIT_PERMISSION
       await client.query('ROLLBACK');
       return res.status(409).json({
         error: true,
+        code: PRODUCTOS_DUPLICATE_CODE,
         message: PRODUCTOS_DUPLICATE_MESSAGE
       });
     }
@@ -1697,10 +1720,19 @@ router.put('/productos/multi-almacen', checkPermission(PRODUCTOS_EDIT_PERMISSION
   } catch (err) {
     try { await client.query('ROLLBACK'); } catch {}
     console.error('Error en PUT /productos/multi-almacen:', err.message);
-    if (esErrorConflictoConstraint(err)) {
+    if (isProductosDuplicateConstraintError(err)) {
       return res.status(409).json({
         error: true,
-        message: getProductosConstraintConflictMessage(err) || 'No se pudo sincronizar el producto por una restriccion de datos.'
+        code: PRODUCTOS_DUPLICATE_CODE,
+        message: PRODUCTOS_DUPLICATE_MESSAGE
+      });
+    }
+    if (esErrorConflictoConstraint(err)) {
+      const duplicateMessage = getProductosConstraintConflictMessage(err);
+      return res.status(409).json({
+        error: true,
+        code: duplicateMessage ? PRODUCTOS_DUPLICATE_CODE : undefined,
+        message: duplicateMessage || 'No se pudo sincronizar el producto por una restriccion de datos.'
       });
     }
     return res.status(500).json({ error: true, message: getSafeProductosServerErrorMessage(err) });
@@ -1838,13 +1870,11 @@ router.put('/productos', checkPermission(PRODUCTOS_EDIT_PERMISSIONS), async (req
     }
 
     if (campo === 'nombre_producto' || campo === 'id_categoria_producto' || campo === 'id_tipo_departamento') {
-      const duplicateGeneral = await findProductoByGeneralKey(
+      const duplicateGeneral = await findProductoByWarehouseKey(
         {
           nombre_producto: campo === 'nombre_producto' ? resultado.valor : productoActual.nombre_producto,
           id_categoria_producto: campo === 'id_categoria_producto' ? resultado.valor : productoActual.id_categoria_producto,
-          id_tipo_departamento: campo === 'id_tipo_departamento'
-            ? resultado.valor
-            : (productoActual.id_tipo_departamento ?? null),
+          id_almacen: productoActual.id_almacen,
           excludeId: idProducto
         },
         client
@@ -1853,6 +1883,7 @@ router.put('/productos', checkPermission(PRODUCTOS_EDIT_PERMISSIONS), async (req
       if (duplicateGeneral) {
         return res.status(409).json({
           error: true,
+          code: PRODUCTOS_DUPLICATE_CODE,
           message: PRODUCTOS_DUPLICATE_MESSAGE
         });
       }
@@ -1901,13 +1932,28 @@ router.put('/productos', checkPermission(PRODUCTOS_EDIT_PERMISSIONS), async (req
     if (txStarted) {
       try { await client.query('ROLLBACK'); } catch {}
     }
-    console.error('Error al actualizar producto:', err.message);
+    console.error('Error al actualizar producto:', {
+      code: err?.code ?? null,
+      constraint: err?.constraint ?? null,
+      detail: err?.detail ?? null,
+      message: err?.message ?? null
+    });
+
+    if (isProductosDuplicateConstraintError(err)) {
+      return res.status(409).json({
+        error: true,
+        code: PRODUCTOS_DUPLICATE_CODE,
+        message: PRODUCTOS_DUPLICATE_MESSAGE
+      });
+    }
 
     // AJUSTE: respuesta 409 para conflictos de FK/constraints
     if (esErrorConflictoConstraint(err)) {
+      const duplicateMessage = getProductosConstraintConflictMessage(err);
       return res.status(409).json({
         error: true,
-        message: getProductosConstraintConflictMessage(err) || 'No se pudo actualizar el producto por una restriccion de datos.'
+        code: duplicateMessage ? PRODUCTOS_DUPLICATE_CODE : undefined,
+        message: duplicateMessage || 'No se pudo actualizar el producto por una restriccion de datos.'
       });
     }
 
