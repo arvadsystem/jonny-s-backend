@@ -346,15 +346,26 @@ const extractConfigMenuModifications = (configuracionMenu, itemTipo) => {
     ? configuracionMenu
     : null;
   const complementos = Array.isArray(source?.complementos) ? source.complementos : [];
-  if (!complementos.length) return [];
+  const extras = Array.isArray(source?.extras) ? source.extras : [];
+  if (!complementos.length && !extras.length) return [];
 
-  return complementos
+  const complementosText = complementos
     .map((entry) => String(entry?.nombre || '').trim())
     .filter(Boolean)
     .map((nombre) => {
       if (String(itemTipo || '').toUpperCase() === 'COMBO') return `Salsa alitas: ${nombre}`;
       return `Salsa: ${nombre}`;
     });
+  const extrasText = extras
+    .map((entry) => {
+      const nombre = String(entry?.nombre || entry?.nombre_extra || '').trim();
+      const cantidad = Number(entry?.cantidad || 0);
+      if (!nombre || cantidad <= 0) return null;
+      return `Extra: ${nombre} x${cantidad}`;
+    })
+    .filter(Boolean);
+
+  return [...extrasText, ...complementosText];
 };
 
 const stripItemPrefix = (note, itemName) => {

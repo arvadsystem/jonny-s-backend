@@ -38,7 +38,7 @@ const toSlugCode = (value) =>
     .replace(/^_+|_+$/g, '')
     .slice(0, 80);
 
-const normalizeRecipeIds = (value) => {
+const normalizePositiveIds = (value) => {
   const rawList = Array.isArray(value) ? value : [];
   return [...new Set(rawList
     .map((item) => Number(item))
@@ -46,6 +46,11 @@ const normalizeRecipeIds = (value) => {
 };
 
 const normalizeExtraPayload = (payload = {}) => {
+  const productos = normalizePositiveIds(payload.productos || payload.id_productos);
+  if (productos.length) {
+    return { ok: false, message: 'Los extras no se asignan a productos.' };
+  }
+
   const nombre = String(payload.nombre || '').trim();
   if (!nombre) return { ok: false, message: 'El nombre del extra es obligatorio.' };
 
@@ -84,7 +89,8 @@ const normalizeExtraPayload = (payload = {}) => {
       id_unidad_medida: idUnidadMedida,
       orden: Number.isFinite(Number(payload.orden)) ? Number(payload.orden) : 0,
       estado: payload.estado === undefined ? true : Boolean(payload.estado),
-      recetas: normalizeRecipeIds(payload.recetas || payload.id_recetas)
+      recetas: normalizePositiveIds(payload.recetas || payload.id_recetas),
+      combos: normalizePositiveIds(payload.combos || payload.id_combos)
     }
   };
 };
@@ -124,6 +130,23 @@ const validateExtraFks = async (client, data) => {
     }
   }
 
+  if (data.combos.length) {
+    const combos = await client.query(
+      `
+        SELECT id_combo
+        FROM combos
+        WHERE id_combo = ANY($1::int[])
+          AND COALESCE(estado, true) = true
+      `,
+      [data.combos]
+    );
+    const found = new Set(combos.rows.map((row) => Number(row.id_combo)));
+    const missing = data.combos.filter((id) => !found.has(id));
+    if (missing.length) {
+      return { ok: false, status: 400, message: `Combos invalidos o inactivos: ${missing.join(', ')}` };
+    }
+  }
+
   return { ok: true };
 };
 
@@ -141,6 +164,23 @@ const replaceExtraRecipes = async (client, idExtra, recipeIds = []) => {
             fecha_actualizacion = NOW()
       `,
       [idExtra, idReceta, index + 1]
+    );
+  }
+};
+
+const replaceExtraCombos = async (client, idExtra, comboIds = []) => {
+  await client.query('UPDATE menu_extra_combo SET estado = false, fecha_actualizacion = NOW() WHERE id_extra = $1', [idExtra]);
+
+  for (const idCombo of comboIds) {
+    await client.query(
+      `
+        INSERT INTO menu_extra_combo (id_extra, id_combo, estado, fecha_actualizacion)
+        VALUES ($1, $2, true, NOW())
+        ON CONFLICT (id_combo, id_extra) DO UPDATE
+        SET estado = true,
+            fecha_actualizacion = NOW()
+      `,
+      [idExtra, idCombo]
     );
   }
 };
@@ -163,7 +203,8 @@ router.get('/', checkPermission(MENU_VIEW_PERMISSIONS), async (req, res) => {
           um.simbolo AS unidad_simbolo,
           me.orden,
           me.estado,
-          COALESCE(recipe_count.total_recetas, 0)::int AS total_recetas
+          COALESCE(recipe_count.total_recetas, 0)::int AS total_recetas,
+          COALESCE(combo_count.total_combos, 0)::int AS total_combos
         FROM menu_extras me
         LEFT JOIN insumos i ON i.id_insumo = me.id_insumo
         LEFT JOIN unidades_medida um ON um.id_unidad_medida = me.id_unidad_medida
@@ -173,6 +214,12 @@ router.get('/', checkPermission(MENU_VIEW_PERMISSIONS), async (req, res) => {
           WHERE COALESCE(estado, true) = true
           GROUP BY id_extra
         ) recipe_count ON recipe_count.id_extra = me.id_extra
+        LEFT JOIN (
+          SELECT id_extra, COUNT(*)::int AS total_combos
+          FROM menu_extra_combo
+          WHERE COALESCE(estado, true) = true
+          GROUP BY id_extra
+        ) combo_count ON combo_count.id_extra = me.id_extra
         WHERE ($1::boolean = true OR COALESCE(me.estado, true) = true)
         ORDER BY COALESCE(me.orden, 0), me.nombre
       `,
@@ -226,6 +273,26 @@ router.get('/catalogos/recetas', checkPermission(MENU_VIEW_PERMISSIONS), async (
   }
 });
 
+router.get('/catalogos/combos', checkPermission(MENU_VIEW_PERMISSIONS), async (req, res) => {
+  try {
+    const result = await pool.query(
+      `
+        SELECT
+          id_combo,
+          COALESCE(NULLIF(nombre_combo, ''), NULLIF(descripcion, ''), CONCAT('Combo #', id_combo::text)) AS nombre_combo,
+          precio
+        FROM combos
+        WHERE COALESCE(estado, true) = true
+        ORDER BY nombre_combo ASC
+      `
+    );
+    return res.status(200).json(result.rows || []);
+  } catch (err) {
+    console.error('Error al listar combos para extras:', err.message);
+    return res.status(500).json({ error: true, message: 'No se pudieron cargar los combos.' });
+  }
+});
+
 router.get('/:id_extra', checkPermission(MENU_VIEW_PERMISSIONS), async (req, res) => {
   try {
     const idExtra = Number(req.params.id_extra);
@@ -261,9 +328,21 @@ router.get('/:id_extra', checkPermission(MENU_VIEW_PERMISSIONS), async (req, res
       [idExtra]
     );
 
+    const combos = await pool.query(
+      `
+        SELECT id_combo
+        FROM menu_extra_combo
+        WHERE id_extra = $1
+          AND COALESCE(estado, true) = true
+        ORDER BY id_menu_extra_combo
+      `,
+      [idExtra]
+    );
+
     return res.status(200).json({
       ...extra.rows[0],
-      recetas: recetas.rows.map((row) => Number(row.id_receta))
+      recetas: recetas.rows.map((row) => Number(row.id_receta)),
+      combos: combos.rows.map((row) => Number(row.id_combo))
     });
   } catch (err) {
     console.error('Error al obtener extra admin:', err.message);
@@ -301,6 +380,7 @@ router.post('/', checkPermission(MENU_MUTATION_PERMISSIONS), async (req, res) =>
     );
     const idExtra = Number(created.rows[0].id_extra);
     await replaceExtraRecipes(client, idExtra, normalized.data.recetas);
+    await replaceExtraCombos(client, idExtra, normalized.data.combos);
     await client.query('COMMIT');
 
     return res.status(201).json({ error: false, message: 'Extra creado correctamente.', id_extra: idExtra });
@@ -363,6 +443,7 @@ router.put('/:id_extra', checkPermission(MENU_MUTATION_PERMISSIONS), async (req,
       return res.status(404).json({ error: true, message: 'Extra no encontrado.' });
     }
     await replaceExtraRecipes(client, idExtra, normalized.data.recetas);
+    await replaceExtraCombos(client, idExtra, normalized.data.combos);
     await client.query('COMMIT');
 
     return res.status(200).json({ error: false, message: 'Extra actualizado correctamente.' });
