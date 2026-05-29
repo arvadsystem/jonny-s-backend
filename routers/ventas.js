@@ -755,6 +755,9 @@ const buildComplementLineConfig = (line) => {
     requiere_complementos: Boolean(metadata?.requiere_complementos),
     minimo_complementos: Number(metadata?.minimo_complementos || 0),
     maximo_complementos: Number(metadata?.maximo_complementos || 0),
+    complementos_incompletos_autorizados: Boolean(metadata?.complementos_incompletos_autorizados),
+    complementos_recomendados: Number(metadata?.complementos_recomendados ?? metadata?.minimo_complementos ?? 0),
+    complementos_seleccionados: Number(metadata?.complementos_seleccionados ?? selected.length),
     complementos: selected.map((entry) => ({
       id_complemento: Number(entry?.id_complemento || 0),
       id_salsa: Number(entry?.id_salsa || entry?.id_complemento || 0),
@@ -1856,6 +1859,15 @@ const normalizeVentaItems = (items) => {
     if (!extrasResult.ok) {
       return { ok: false, message: extrasResult.message };
     }
+    const complementosIncompletosInput = item.complementos_incompletos_autorizados ?? item.permitir_complementos_incompletos;
+    let complementosIncompletosAutorizados = false;
+    if (complementosIncompletosInput !== undefined && complementosIncompletosInput !== null) {
+      const parsedComplementosIncompletos = parseBooleanInput(complementosIncompletosInput);
+      if (!parsedComplementosIncompletos.ok) {
+        return { ok: false, message: 'complementos_incompletos_autorizados debe ser booleano.' };
+      }
+      complementosIncompletosAutorizados = parsedComplementosIncompletos.value;
+    }
 
     normalized.push({
       kind,
@@ -1866,6 +1878,7 @@ const normalizeVentaItems = (items) => {
       observacion: normalizeObservation(item.observacion),
       id_descuento_catalogo_linea: idDescuentoCatalogoLinea,
       complementos: complementosResult.data,
+      complementos_incompletos_autorizados: complementosIncompletosAutorizados,
       extras: extrasResult.data
     });
   }
@@ -3074,6 +3087,9 @@ const resolveLineComplementos = ({ item, receta, combo, context }) => {
   const min = Math.max(0, Number(metadata.minimo_complementos || 0));
   const max = Math.max(min, Number(metadata.maximo_complementos || 0));
   const complementosIncompletos = min > 0 && selected.length < min;
+  if (metadata.requiere_complementos && complementosIncompletos && !item.complementos_incompletos_autorizados) {
+    return { ok: false, message: 'Debe seleccionar los complementos requeridos para este item.' };
+  }
   if (max > 0 && selected.length > max) {
     return { ok: false, message: 'Debe seleccionar los complementos requeridos para este item.' };
   }
@@ -3085,6 +3101,7 @@ const resolveLineComplementos = ({ item, receta, combo, context }) => {
     ok: true,
     metadata: {
       ...metadata,
+      complementos_incompletos_autorizados: Boolean(item.complementos_incompletos_autorizados),
       complementos_recomendados: min,
       complementos_seleccionados: selected.length,
       complementos_incompletos: complementosIncompletos
