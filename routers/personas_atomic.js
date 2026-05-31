@@ -26,21 +26,12 @@ const EMPLEADO_ATOMIC_ALLOWED_FIELDS = new Set([
   'estado',
   'id_sucursal',
   'id_persona',
+  'id_cargo',
   'cargo',
   'nombre_referencia',
   'telefono_referencia',
   'id_empresa'
 ]);
-const EMPLEADO_ALLOWED_CARGO_OPTIONS = Object.freeze([
-  'Encargado',
-  'Cajero',
-  'Jefe de cocina',
-  'Asistente de cocina',
-  'Mesero'
-]);
-const EMPLEADO_CARGO_ALIASES = Object.freeze({
-  'jefe cocina': 'Jefe de cocina'
-});
 const CLIENTE_ATOMIC_ALLOWED_FIELDS = new Set([
   'fecha_ingreso',
   'puntos',
@@ -71,21 +62,6 @@ const parsePositiveInt = (value) => {
   return Number.isInteger(parsed) && parsed > 0 ? parsed : null;
 };
 
-const normalizeCargoKey = (value) =>
-  String(value ?? '')
-    .trim()
-    .toLowerCase()
-    .normalize('NFD')
-    .replace(/[\u0300-\u036f]/g, '')
-    .replace(/\s+/g, ' ');
-
-const resolveAllowedCargoValue = (value) => {
-  const normalized = normalizeCargoKey(value);
-  if (!normalized) return '';
-  if (EMPLEADO_CARGO_ALIASES[normalized]) return EMPLEADO_CARGO_ALIASES[normalized];
-  const match = EMPLEADO_ALLOWED_CARGO_OPTIONS.find((item) => normalizeCargoKey(item) === normalized);
-  return match || '';
-};
 
 const getCurrentDateInTegucigalpa = () => {
   try {
@@ -1023,17 +999,7 @@ const atomicService = {
 
       if (Object.prototype.hasOwnProperty.call(empleadoPayload, 'cargo')) {
         const rawCargo = String(empleadoPayload.cargo ?? '').trim();
-        if (rawCargo) {
-          const normalizedCargo = resolveAllowedCargoValue(rawCargo);
-          if (!normalizedCargo) {
-            const error = new Error('cargo no permitido. Use: Encargado, Cajero, Jefe cocina o Asistente de cocina');
-            error.httpStatus = 400;
-            throw error;
-          }
-          empleadoPayload.cargo = normalizedCargo;
-        } else {
-          empleadoPayload.cargo = '';
-        }
+        empleadoPayload.cargo = rawCargo;
       }
 
       const normalizedEmpleado = normalizeEmpleadoAtomicPayload({

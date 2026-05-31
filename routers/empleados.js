@@ -28,20 +28,11 @@ const FUNCTION_UPDATE_FIELDS = new Set([
   'estado',
   'id_sucursal',
   'id_persona',
+  'id_cargo',
   'cargo',
   'nombre_referencia',
   'telefono_referencia'
 ]);
-const EMPLEADO_ALLOWED_CARGO_OPTIONS = Object.freeze([
-  'Encargado',
-  'Cajero',
-  'Jefe de cocina',
-  'Asistente de cocina'
-  , 'Mesero'
-]);
-const EMPLEADO_CARGO_ALIASES = Object.freeze({
-  'jefe cocina': 'Jefe de cocina'
-});
 
 let schemaCapabilitiesPromise;
 
@@ -72,22 +63,6 @@ const rollbackQuietly = async (client) => {
   } catch {
     // noop
   }
-};
-
-const normalizeCargoKey = (value) =>
-  String(value ?? '')
-    .trim()
-    .toLowerCase()
-    .normalize('NFD')
-    .replace(/[\u0300-\u036f]/g, '')
-    .replace(/\s+/g, ' ');
-
-const resolveAllowedCargoValue = (value) => {
-  const normalized = normalizeCargoKey(value);
-  if (!normalized) return '';
-  if (EMPLEADO_CARGO_ALIASES[normalized]) return EMPLEADO_CARGO_ALIASES[normalized];
-  const match = EMPLEADO_ALLOWED_CARGO_OPTIONS.find((item) => normalizeCargoKey(item) === normalized);
-  return match || '';
 };
 
 const normalizeLegacyUpdatePayload = (body) => {
@@ -191,13 +166,10 @@ const validateEmpleadoPayload = (payload = {}, { requirePersona = false, require
     }
   }
 
-  if (Object.prototype.hasOwnProperty.call(payload, 'cargo')) {
-    const rawCargo = String(payload.cargo ?? '').trim();
-    if (rawCargo && !resolveAllowedCargoValue(rawCargo)) {
-      errors.push({
-        field: 'cargo',
-        message: 'cargo no permitido. Use: Encargado, Cajero, Jefe cocina o Asistente de cocina.'
-      });
+  if (Object.prototype.hasOwnProperty.call(payload, 'id_cargo')) {
+    const idCargo = parsePositiveInt(payload.id_cargo);
+    if (payload.id_cargo !== null && payload.id_cargo !== '' && !idCargo) {
+      errors.push({ field: 'id_cargo', message: 'id_cargo debe ser entero positivo.' });
     }
   }
 
@@ -634,6 +606,137 @@ const empleadoRepository = {
 };
 
 const empleadoService = {
+  async listCargos(req) {
+    const page = req.query.page === undefined ? 1 : parsePositiveInt(req.query.page);
+    const requestedLimit = req.query.limit === undefined ? 500 : parsePositiveInt(req.query.limit);
+    if (!page || !requestedLimit) {
+      return { status: 400, body: { error: true, message: 'page y limit deben ser enteros positivos' } };
+    }
+    const limit = Math.min(requestedLimit, 1000);
+    const offset = (page - 1) * limit;
+    const q = typeof req.query.q === 'string' ? req.query.q.trim() : '';
+    const estado = parseBooleanFilter(req.query.estado);
+    if (req.query.estado !== undefined && estado === null) {
+      return { status: 400, body: { error: true, message: 'El filtro estado debe ser booleano' } };
+    }
+
+    const where = [];
+    const params = [];
+    let idx = 1;
+    if (q) {
+      where.push(`COALESCE(c.nombre_cargo, '') ILIKE $${idx++}`);
+      params.push(`%${q}%`);
+    }
+    if (estado !== null) {
+      where.push(`c.estado = $${idx++}`);
+      params.push(estado);
+    }
+    const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
+
+    const totalResult = await pool.query(`SELECT COUNT(*)::int AS total FROM public.cargos_empleados c ${whereSql}`, params);
+    params.push(limit, offset);
+    const rowsResult = await pool.query(
+      `SELECT c.id_cargo, c.nombre_cargo, c.descripcion, c.estado, c.fecha_creacion, c.fecha_actualizacion
+       FROM public.cargos_empleados c
+       ${whereSql}
+       ORDER BY c.nombre_cargo ASC
+       LIMIT $${idx++} OFFSET $${idx++}`,
+      params
+    );
+
+    return {
+      status: 200,
+      body: {
+        data: rowsResult.rows,
+        cargos: rowsResult.rows,
+        total: Number(totalResult.rows?.[0]?.total || 0),
+        page,
+        limit
+      }
+    };
+  },
+
+  async createCargo(req) {
+    const nombreCargo = String(req.body?.nombre_cargo ?? '').trim();
+    const descripcion = String(req.body?.descripcion ?? '').trim() || null;
+    const estadoRaw = req.body?.estado;
+    const estado = estadoRaw === undefined ? true : parseBooleanFilter(estadoRaw);
+
+    if (!nombreCargo) {
+      return { status: 400, body: buildErrorBody({ code: 'VALIDATION_ERROR', message: 'nombre_cargo es obligatorio.' }) };
+    }
+    if (estado === null) {
+      return { status: 400, body: buildErrorBody({ code: 'VALIDATION_ERROR', message: 'estado debe ser booleano.' }) };
+    }
+
+    const result = await pool.query(
+      `INSERT INTO public.cargos_empleados (nombre_cargo, descripcion, estado)
+       VALUES ($1, $2, $3)
+       ON CONFLICT ((LOWER(TRIM(nombre_cargo))))
+       DO UPDATE SET
+         nombre_cargo = EXCLUDED.nombre_cargo,
+         descripcion = COALESCE(EXCLUDED.descripcion, public.cargos_empleados.descripcion),
+         estado = EXCLUDED.estado,
+         fecha_actualizacion = NOW()
+       RETURNING id_cargo, nombre_cargo, descripcion, estado, fecha_creacion, fecha_actualizacion`,
+      [nombreCargo, descripcion, estado]
+    );
+
+    return { status: 201, body: { ok: true, error: false, data: result.rows[0] } };
+  },
+
+  async updateCargo(req) {
+    const idCargo = parsePositiveInt(req.params.id);
+    if (!idCargo) {
+      return { status: 400, body: buildErrorBody({ code: 'VALIDATION_ERROR', message: 'El id debe ser un entero positivo' }) };
+    }
+
+    const payload = isPlainObject(req.body) ? req.body : {};
+    const updates = [];
+    const params = [];
+    let idx = 1;
+
+    if (hasOwn(payload, 'nombre_cargo')) {
+      const nombreCargo = String(payload.nombre_cargo ?? '').trim();
+      if (!nombreCargo) {
+        return { status: 400, body: buildErrorBody({ code: 'VALIDATION_ERROR', message: 'nombre_cargo no puede estar vacio.' }) };
+      }
+      updates.push(`nombre_cargo = $${idx++}`);
+      params.push(nombreCargo);
+    }
+    if (hasOwn(payload, 'descripcion')) {
+      const descripcion = String(payload.descripcion ?? '').trim();
+      updates.push(`descripcion = $${idx++}`);
+      params.push(descripcion || null);
+    }
+    if (hasOwn(payload, 'estado')) {
+      const estado = parseBooleanFilter(payload.estado);
+      if (estado === null) {
+        return { status: 400, body: buildErrorBody({ code: 'VALIDATION_ERROR', message: 'estado debe ser booleano.' }) };
+      }
+      updates.push(`estado = $${idx++}`);
+      params.push(estado);
+    }
+
+    if (!updates.length) {
+      return { status: 400, body: buildErrorBody({ code: 'VALIDATION_ERROR', message: 'No hay cambios para actualizar.' }) };
+    }
+
+    updates.push('fecha_actualizacion = NOW()');
+    params.push(idCargo);
+    const query = `
+      UPDATE public.cargos_empleados
+      SET ${updates.join(', ')}
+      WHERE id_cargo = $${idx}
+      RETURNING id_cargo, nombre_cargo, descripcion, estado, fecha_creacion, fecha_actualizacion
+    `;
+    const result = await pool.query(query, params);
+    if (!result.rows.length) {
+      return { status: 404, body: buildErrorBody({ code: 'NOT_FOUND', message: 'Cargo no encontrado.' }) };
+    }
+    return { status: 200, body: { ok: true, error: false, data: result.rows[0] } };
+  },
+
   async list(req) {
     const capabilities = await getSchemaCapabilities();
     const page = req.query.page === undefined ? 1 : parsePositiveInt(req.query.page);
@@ -766,8 +869,7 @@ const empleadoService = {
 
     const insertData = { ...payload };
     if (hasOwn(insertData, 'cargo')) {
-      const normalizedCargo = resolveAllowedCargoValue(insertData.cargo);
-      insertData.cargo = normalizedCargo || '';
+      insertData.cargo = String(insertData.cargo ?? '').trim();
     }
     const idUsuario = resolveUserId(req);
     const tenantId = parsePositiveInt(req.user?.id_empresa);
@@ -885,8 +987,7 @@ const empleadoService = {
       Object.entries(rawPayload).filter(([campo, valor]) => campo && valor !== undefined)
     );
     if (hasOwn(payload, 'cargo')) {
-      const normalizedCargo = resolveAllowedCargoValue(payload.cargo);
-      payload.cargo = normalizedCargo || '';
+      payload.cargo = String(payload.cargo ?? '').trim();
     }
 
     const unknownFields = unknownFieldsFromPayload(payload, allowedFields);
@@ -1170,6 +1271,9 @@ const asyncHandler = (handler) => async (req, res) => {
 ======================= */
 router.get('/empleados-detalle', checkPermission(EMPLEADOS_LIST_PERMISSIONS), asyncHandler(empleadoService.list));
 router.get('/empleados', checkPermission(EMPLEADOS_LIST_PERMISSIONS), asyncHandler(empleadoService.list));
+router.get('/empleados/cargos', checkPermission(EMPLEADOS_LIST_PERMISSIONS), asyncHandler(empleadoService.listCargos));
+router.post('/empleados/cargos', checkPermission(EMPLEADOS_CREATE_PERMISSIONS), asyncHandler(empleadoService.createCargo));
+router.put('/empleados/cargos/:id', checkPermission(EMPLEADOS_EDIT_PERMISSIONS), asyncHandler(empleadoService.updateCargo));
 
 /* =======================
    GET - EMPLEADO POR ID
