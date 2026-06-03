@@ -19,6 +19,7 @@ import {
 import {
   fetchPublicActiveSaucesQuery
 } from './public_menu/publicMenuQueries.js';
+import { listarAlertasInventarioPedido } from '../services/inventarioAlertasService.js';
 
 const router = express.Router();
 
@@ -7637,6 +7638,46 @@ router.get('/ventas/buscar', checkPermission(['VENTAS_VER']), async (req, res) =
 });
 
 router.get('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), listarPedidosPendientesPago);
+
+router.get('/ventas/pedidos/:id/inventario-alertas', checkPermission(['VENTAS_VER']), async (req, res) => {
+  try {
+    const result = await listarAlertasInventarioPedido(req.params.id);
+    return res.status(200).json({
+      ok: true,
+      id_pedido: parsePositiveInt(req.params.id),
+      migration_applied: result.migration_applied,
+      total: result.alertas.length,
+      alertas: result.alertas.map((alerta) => ({
+        id_alerta: Number(alerta.id_alerta),
+        id_pedido: Number(alerta.id_pedido),
+        id_detalle_pedido: parseOptionalPositiveInt(alerta.id_detalle_pedido),
+        tipo_alerta: alerta.tipo_alerta,
+        motivo: alerta.motivo,
+        mensaje: alerta.mensaje,
+        tipo_recurso: alerta.tipo_recurso,
+        id_recurso: parseOptionalPositiveInt(alerta.id_recurso),
+        id_producto: parseOptionalPositiveInt(alerta.id_producto),
+        id_insumo: parseOptionalPositiveInt(alerta.id_insumo),
+        id_receta: parseOptionalPositiveInt(alerta.id_receta),
+        id_combo: parseOptionalPositiveInt(alerta.id_combo),
+        id_extra: parseOptionalPositiveInt(alerta.id_extra),
+        stock_disponible: alerta.stock_disponible,
+        cantidad_requerida: alerta.cantidad_requerida,
+        deficit: alerta.deficit,
+        estado: alerta.estado,
+        created_at: alerta.created_at,
+        created_by: parseOptionalPositiveInt(alerta.created_by),
+        payload: alerta.payload
+      }))
+    });
+  } catch (err) {
+    if (err?.httpStatus === 400) {
+      return res.status(400).json({ error: true, message: err.message });
+    }
+    console.error('Error al obtener alertas de inventario del pedido:', err);
+    return sendVentasInternalError(res);
+  }
+});
 
 router.get('/ventas/:id', checkPermission(['VENTAS_VER']), async (req, res) => {
   try {

@@ -8,6 +8,7 @@ import {
 import { resolveRequestUserSucursalScope } from '../utils/sucursalScope.js';
 import { enviarCorreo } from '../utils/emailService.js';
 import { validarYDescontarPedido } from '../services/inventarioPedidoService.js';
+import { registrarAlertasInventarioPedido } from '../services/inventarioAlertasService.js';
 
 const router = express.Router();
 
@@ -1117,6 +1118,14 @@ router.put('/cocina/pedidos/:id/estado', checkPermission(COCINA_VIEW_PERMISSIONS
       );
 
       await client.query('COMMIT');
+
+      if (!inventoryAlreadyDiscounted && Array.isArray(inventoryResult?.warning?.faltantes)) {
+        await registrarAlertasInventarioPedido({
+          id_pedido: idPedido,
+          id_usuario: req?.user?.id_usuario,
+          warnings: inventoryResult.warning.faltantes
+        });
+      }
 
       // ���� 10. Alerta de expiración (fire-and-forget, fuera de la tx) ��
       if (estadoDestino === 'NO_ENTREGADO' || estadoDestino === 'COMPLETADO') {
