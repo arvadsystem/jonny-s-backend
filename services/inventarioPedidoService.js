@@ -109,7 +109,7 @@ export const validarYDescontarPedido = async (payload, options = {}) => {
       return {
         ok: false,
         code: 'CONFIGURACION_INVENTARIO_INVALIDA',
-        message: 'No se pudo descontar inventario por configuracion incompleta de productos/recetas/combos/almacen.',
+        message: 'No se pudo descontar inventario por configuracion incompleta de productos/recetas/combos/extras/insumos/almacen.',
         id_pedido: idPedido,
         id_sucursal: idSucursal,
         faltantes: configFaults
@@ -151,14 +151,14 @@ export const validarYDescontarPedido = async (payload, options = {}) => {
       ok: true,
       code: 'DESCUENTO_OK',
       message: stockShortages.length > 0
-        ? 'Inventario descontado con faltantes auditados.'
+        ? 'Inventario descontado permitiendo stock negativo por consumo fisico en cocina.'
         : 'Inventario descontado correctamente.',
       id_pedido: idPedido,
       id_sucursal: idSucursal,
       warning: stockShortages.length > 0
         ? {
-            code: 'FALTANTE_COCINA',
-            message: 'Pedido descontado con stock insuficiente auditado.',
+            code: 'STOCK_INSUFICIENTE_PERMITIDO',
+            message: 'Pedido paso a preparacion y el inventario se desconto aunque el stock registrado era insuficiente.',
             faltantes: stockShortages
           }
         : null,

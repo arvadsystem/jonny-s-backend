@@ -24,6 +24,20 @@ const mapById = (rows, fieldName) => {
   return map;
 };
 
+const addContext = (map, id, item) => {
+  if (!id) return;
+  if (!map.has(id)) map.set(id, []);
+  map.get(id).push({
+    id_detalle_pedido: toPositiveInt(item?.id_detalle_pedido) || null,
+    id_producto: toPositiveInt(item?.id_producto) || null,
+    id_receta: toPositiveInt(item?.id_receta) || null,
+    id_combo: toPositiveInt(item?.id_combo) || null,
+    id_extra: toPositiveInt(item?.id_extra) || null
+  });
+};
+
+const firstContext = (map, id) => (Array.isArray(map.get(id)) ? map.get(id)[0] : {}) || {};
+
 const schemaColumnCache = new Map();
 const hasColumn = async (client, tableName, columnName) => {
   const key = `${String(tableName || '').trim().toLowerCase()}.${String(columnName || '').trim().toLowerCase()}`;
@@ -68,6 +82,27 @@ const fetchCombosByIds = async (client, ids) => {
         COALESCE(estado, true) AS estado
       FROM public.combos
       WHERE id_combo = ANY($1::int[])
+    `,
+    [ids]
+  );
+  return rs.rows;
+};
+
+const fetchExtrasByIds = async (client, ids) => {
+  if (!ids.length) return [];
+  const hasMenuExtras = await hasColumn(client, 'menu_extras', 'id_extra');
+  if (!hasMenuExtras) return [];
+  const rs = await client.query(
+    `
+      SELECT
+        id_extra,
+        codigo,
+        nombre,
+        COALESCE(estado, true) AS estado,
+        id_insumo,
+        COALESCE(cant, 0)::numeric AS insumo_factor
+      FROM public.menu_extras
+      WHERE id_extra = ANY($1::int[])
     `,
     [ids]
   );
@@ -124,25 +159,46 @@ export const resolvePedidoConsumo = async ({ client, items }) => {
   const productoQtyMap = new Map();
   const recetaQtyMap = new Map();
   const comboQtyMap = new Map();
+  const extraQtyMap = new Map();
+  const productoContextById = new Map();
+  const recetaContextById = new Map();
+  const comboContextById = new Map();
+  const extraContextById = new Map();
 
   for (const item of items) {
-    if (item.tipo_item === ITEM_TYPES.PRODUCTO) addToMapTotal(productoQtyMap, item.id_item, item.cantidad);
-    if (item.tipo_item === ITEM_TYPES.RECETA) addToMapTotal(recetaQtyMap, item.id_item, item.cantidad);
-    if (item.tipo_item === ITEM_TYPES.COMBO) addToMapTotal(comboQtyMap, item.id_item, item.cantidad);
+    if (item.tipo_item === ITEM_TYPES.PRODUCTO) {
+      addToMapTotal(productoQtyMap, item.id_item, item.cantidad);
+      addContext(productoContextById, item.id_item, item);
+    }
+    if (item.tipo_item === ITEM_TYPES.RECETA) {
+      addToMapTotal(recetaQtyMap, item.id_item, item.cantidad);
+      addContext(recetaContextById, item.id_item, item);
+    }
+    if (item.tipo_item === ITEM_TYPES.COMBO) {
+      addToMapTotal(comboQtyMap, item.id_item, item.cantidad);
+      addContext(comboContextById, item.id_item, item);
+    }
+    if (item.tipo_item === ITEM_TYPES.EXTRA) {
+      addToMapTotal(extraQtyMap, item.id_item, item.cantidad);
+      addContext(extraContextById, item.id_item, item);
+    }
   }
 
   const productoIds = [...productoQtyMap.keys()].sort((a, b) => a - b);
   const recetaIds = [...recetaQtyMap.keys()].sort((a, b) => a - b);
   const comboIds = [...comboQtyMap.keys()].sort((a, b) => a - b);
+  const extraIds = [...extraQtyMap.keys()].sort((a, b) => a - b);
 
-  const [recetasRows, combosRows, comboComponentRows] = await Promise.all([
+  const [recetasRows, combosRows, extrasRows, comboComponentRows] = await Promise.all([
     fetchRecetasByIds(client, recetaIds),
     fetchCombosByIds(client, comboIds),
+    fetchExtrasByIds(client, extraIds),
     fetchComboRecipeComponents(client, comboIds)
   ]);
 
   const recetasById = mapById(recetasRows, 'id_receta');
   const combosById = mapById(combosRows, 'id_combo');
+  const extrasById = mapById(extrasRows, 'id_extra');
 
   for (const idReceta of recetaIds) {
     const row = recetasById.get(idReceta);
@@ -150,7 +206,10 @@ export const resolvePedidoConsumo = async ({ client, items }) => {
       faltantes.push({
         tipo_recurso: 'receta',
         id_recurso: idReceta,
-        motivo: 'RECETA_NO_ENCONTRADA'
+        id_receta: idReceta,
+        ...firstContext(recetaContextById, idReceta),
+        motivo: 'RECETA_NO_ENCONTRADA',
+        mensaje: `La receta ${idReceta} no existe o no esta disponible.`
       });
       continue;
     }
@@ -158,8 +217,11 @@ export const resolvePedidoConsumo = async ({ client, items }) => {
       faltantes.push({
         tipo_recurso: 'receta',
         id_recurso: idReceta,
+        id_receta: idReceta,
+        ...firstContext(recetaContextById, idReceta),
         nombre: row.nombre_receta,
-        motivo: 'RECETA_INACTIVA'
+        motivo: 'RECETA_INACTIVA',
+        mensaje: `La receta ${row.nombre_receta || idReceta} esta inactiva.`
       });
     }
   }
@@ -170,7 +232,10 @@ export const resolvePedidoConsumo = async ({ client, items }) => {
       faltantes.push({
         tipo_recurso: 'combo',
         id_recurso: idCombo,
-        motivo: 'COMBO_NO_ENCONTRADO'
+        id_combo: idCombo,
+        ...firstContext(comboContextById, idCombo),
+        motivo: 'COMBO_NO_ENCONTRADO',
+        mensaje: `El combo ${idCombo} no existe o no esta disponible.`
       });
       continue;
     }
@@ -178,10 +243,58 @@ export const resolvePedidoConsumo = async ({ client, items }) => {
       faltantes.push({
         tipo_recurso: 'combo',
         id_recurso: idCombo,
+        id_combo: idCombo,
+        ...firstContext(comboContextById, idCombo),
         nombre: row.nombre_combo,
-        motivo: 'COMBO_INACTIVO'
+        motivo: 'COMBO_INACTIVO',
+        mensaje: `El combo ${row.nombre_combo || idCombo} esta inactivo.`
       });
     }
+  }
+
+  const insumoQtyMap = new Map();
+  for (const idExtra of extraIds) {
+    const row = extrasById.get(idExtra);
+    if (!row) {
+      faltantes.push({
+        tipo_recurso: 'extra',
+        id_recurso: idExtra,
+        id_extra: idExtra,
+        ...firstContext(extraContextById, idExtra),
+        motivo: 'EXTRA_NO_ENCONTRADO',
+        mensaje: `El extra ${idExtra} no existe o no esta disponible.`
+      });
+      continue;
+    }
+    if (!Boolean(row.estado)) {
+      faltantes.push({
+        tipo_recurso: 'extra',
+        id_recurso: idExtra,
+        id_extra: idExtra,
+        ...firstContext(extraContextById, idExtra),
+        nombre: row.nombre,
+        codigo: row.codigo || null,
+        motivo: 'EXTRA_INACTIVO',
+        mensaje: `El extra ${row.nombre || row.codigo || idExtra} esta inactivo.`
+      });
+      continue;
+    }
+    const insumoId = toPositiveInt(row.id_insumo);
+    const insumoFactor = Number(row.insumo_factor || 0);
+    if (!insumoId || insumoFactor <= 0) {
+      faltantes.push({
+        tipo_recurso: 'extra',
+        id_recurso: idExtra,
+        id_extra: idExtra,
+        ...firstContext(extraContextById, idExtra),
+        nombre: row.nombre,
+        codigo: row.codigo || null,
+        motivo: 'EXTRA_SIN_CONFIGURACION_INVENTARIO',
+        mensaje: `El extra ${row.nombre || row.codigo || idExtra} no tiene id_insumo o cantidad de consumo configurada.`
+      });
+      continue;
+    }
+    addToMapTotal(insumoQtyMap, insumoId, Number(extraQtyMap.get(idExtra) || 0) * insumoFactor);
   }
 
   const comboComponentsById = new Map();
@@ -200,8 +313,11 @@ export const resolvePedidoConsumo = async ({ client, items }) => {
       faltantes.push({
         tipo_recurso: 'combo',
         id_recurso: idCombo,
+        id_combo: idCombo,
+        ...firstContext(comboContextById, idCombo),
         nombre: combosById.get(idCombo)?.nombre_combo || null,
-        motivo: 'COMBO_SIN_COMPONENTES'
+        motivo: 'COMBO_SIN_COMPONENTES',
+        mensaje: `El combo ${combosById.get(idCombo)?.nombre_combo || idCombo} no tiene recetas/componentes configurados.`
       });
       continue;
     }
@@ -227,15 +343,17 @@ export const resolvePedidoConsumo = async ({ client, items }) => {
     });
   }
 
-  const insumoQtyMap = new Map();
   for (const idReceta of allRecipeIds) {
     const components = recipeComponentsById.get(idReceta) || [];
     if (components.length === 0) {
       faltantes.push({
         tipo_recurso: 'receta',
         id_recurso: idReceta,
+        id_receta: idReceta,
+        ...firstContext(recetaContextById, idReceta),
         nombre: recetasById.get(idReceta)?.nombre_receta || null,
-        motivo: 'RECETA_SIN_COMPONENTES'
+        motivo: 'RECETA_SIN_COMPONENTES',
+        mensaje: `La receta ${recetasById.get(idReceta)?.nombre_receta || idReceta} no tiene insumos configurados.`
       });
       continue;
     }
@@ -262,11 +380,13 @@ export const resolvePedidoConsumo = async ({ client, items }) => {
       productoQtyMap,
       recetaQtyMap,
       comboQtyMap,
+      extraQtyMap,
       insumoQtyMap
     },
     contexto: {
       combosById,
-      recetasById
+      recetasById,
+      extrasById
     }
   };
 };

@@ -64,8 +64,6 @@ const COCINA_TRANSITION_PERMISSION_BY_STATE = Object.freeze({
 
 // Tiempo máximo en minutos antes de considerar un pedido como "próximo a expirar"
 const EXPIRY_WARN_MINUTES = parseInt(process.env.COCINA_EXPIRY_WARN_MINUTES || '45', 10);
-const INVENTARIO_CONFIG_WARNING_CODE = 'CONFIGURACION_INVENTARIO_INCOMPLETA';
-const INVENTARIO_CONFIG_WARNING_MESSAGE = 'Pedido marcado como listo. Se notifico a administracion por configuracion incompleta de inventario.';
 const schemaColumnCache = new Map();
 const NO_SUCURSAL_ASSIGNMENT_MESSAGE =
   'No tienes una sucursal asignada para visualizar Cocina. Contacta al administrador.';
@@ -220,6 +218,25 @@ const hasColumn = async (client, tableName, columnName) => {
   return exists;
 };
 
+const hasTable = async (client, tableName) => {
+  const key = `table.${String(tableName || '').trim().toLowerCase()}`;
+  if (schemaColumnCache.has(key)) return schemaColumnCache.get(key);
+
+  const result = await client.query(
+    `
+      SELECT 1
+      FROM information_schema.tables
+      WHERE table_schema = 'public'
+        AND table_name = $1
+      LIMIT 1
+    `,
+    [tableName]
+  );
+  const exists = result.rowCount > 0;
+  schemaColumnCache.set(key, exists);
+  return exists;
+};
+
 const roundMoney = (value) => Number(Number(value || 0).toFixed(2));
 
 const buildTicketNumber = (idPedido, idFactura, codigoVenta) => {
@@ -240,12 +257,15 @@ const inferKitchenItemQuantity = (rawSubtotal, rawUnitPrice) => {
 };
 
 const buildPedidoConsumoPayload = async (client, idPedido, idSucursal) => {
+  const hasDetallePedidoConfiguracionMenu = await hasColumn(client, 'detalle_pedido', 'configuracion_menu');
   const detailsResult = await client.query(
     `
       SELECT
+        dp.id_detalle_pedido,
         dp.id_producto,
         dp.id_combo,
         dp.id_receta,
+        ${hasDetallePedidoConfiguracionMenu ? 'dp.configuracion_menu,' : 'NULL::jsonb AS configuracion_menu,'}
         COALESCE(dp.sub_total_pedido, 0) AS sub_total_item,
         COALESCE(
           CASE
@@ -288,12 +308,76 @@ const buildPedidoConsumoPayload = async (client, idPedido, idSucursal) => {
       const idReceta = parsePositiveInt(row.id_receta);
       const quantity = inferKitchenItemQuantity(row.sub_total_item, row.precio_unitario);
 
-      if (idProducto) return { tipo_item: 'PRODUCTO', id_item: idProducto, cantidad: quantity };
-      if (idCombo) return { tipo_item: 'COMBO', id_item: idCombo, cantidad: quantity };
-      if (idReceta) return { tipo_item: 'RECETA', id_item: idReceta, cantidad: quantity };
+      const idDetallePedido = parsePositiveInt(row.id_detalle_pedido);
+      if (idProducto) return { tipo_item: 'PRODUCTO', id_item: idProducto, id_producto: idProducto, id_detalle_pedido: idDetallePedido, cantidad: quantity };
+      if (idCombo) return { tipo_item: 'COMBO', id_item: idCombo, id_combo: idCombo, id_detalle_pedido: idDetallePedido, cantidad: quantity };
+      if (idReceta) return { tipo_item: 'RECETA', id_item: idReceta, id_receta: idReceta, id_detalle_pedido: idDetallePedido, cantidad: quantity };
       return null;
     })
     .filter(Boolean);
+
+  const extrasByDetalle = new Map();
+  for (const row of detailsResult.rows) {
+    const idDetallePedido = parsePositiveInt(row.id_detalle_pedido);
+    if (!idDetallePedido) continue;
+    const config = row.configuracion_menu && typeof row.configuracion_menu === 'object'
+      ? row.configuracion_menu
+      : null;
+    const extras = Array.isArray(config?.extras) ? config.extras : [];
+    for (const extra of extras) {
+      const idExtra = parsePositiveInt(extra?.id_extra);
+      const cantidad = Number(extra?.cantidad || 0);
+      if (!idExtra || cantidad <= 0) continue;
+      const key = `${idDetallePedido}:${idExtra}`;
+      extrasByDetalle.set(key, {
+        id_detalle_pedido: idDetallePedido,
+        id_extra: idExtra,
+        cantidad
+      });
+    }
+  }
+
+  if (await hasTable(client, 'detalle_pedido_extras')) {
+    const extraRowsResult = await client.query(
+      `
+        SELECT
+          dpe.id_detalle_pedido,
+          dpe.id_extra,
+          COALESCE(dpe.cantidad, 0)::numeric AS cantidad
+        FROM public.detalle_pedido_extras dpe
+        INNER JOIN public.detalle_pedido dp
+          ON dp.id_detalle_pedido = dpe.id_detalle_pedido
+         AND dp.id_pedido = $1
+         AND COALESCE(dp.estado, true) = true
+        WHERE COALESCE(dpe.estado, true) = true
+      `,
+      [idPedido]
+    );
+    for (const row of extraRowsResult.rows) {
+      const idDetallePedido = parsePositiveInt(row.id_detalle_pedido);
+      const idExtra = parsePositiveInt(row.id_extra);
+      const cantidad = Number(row.cantidad || 0);
+      if (!idDetallePedido || !idExtra || cantidad <= 0) continue;
+      const key = `${idDetallePedido}:${idExtra}`;
+      if (!extrasByDetalle.has(key)) {
+        extrasByDetalle.set(key, {
+          id_detalle_pedido: idDetallePedido,
+          id_extra: idExtra,
+          cantidad
+        });
+      }
+    }
+  }
+
+  for (const extra of extrasByDetalle.values()) {
+    items.push({
+      tipo_item: 'EXTRA',
+      id_item: extra.id_extra,
+      id_extra: extra.id_extra,
+      id_detalle_pedido: extra.id_detalle_pedido,
+      cantidad: extra.cantidad
+    });
+  }
 
   if (!items.length) {
     return {
@@ -435,65 +519,6 @@ const buildEstadoCodeByIdMap = (rows) => {
     }
   });
   return map;
-};
-
-const normalizeWarningFault = (fault) => ({
-  tipo_recurso: String(fault?.tipo_recurso || '').trim().toLowerCase() || 'desconocido',
-  id_recurso: Number(fault?.id_recurso ?? 0) || null,
-  nombre: String(fault?.nombre || '').trim() || null,
-  motivo: String(fault?.motivo || '').trim().toUpperCase() || 'CONFIGURACION_DESCONOCIDA'
-});
-
-const buildInventoryIncidentPayload = ({
-  idPedido,
-  idSucursal,
-  idUsuarioCocina,
-  numeroTicket,
-  faltantes
-}) => {
-  const normalizedFaults = (Array.isArray(faltantes) ? faltantes : []).map(normalizeWarningFault);
-  return {
-    idPedido,
-    codigoVenta: numeroTicket || buildTicketNumber(idPedido),
-    idSucursal: Number(idSucursal ?? 0) || null,
-    idUsuarioCocina: Number(idUsuarioCocina ?? 0) || null,
-    tipoIncidencia: INVENTARIO_CONFIG_WARNING_CODE,
-    mensaje: 'Configuración incompleta detectada al marcar pedido como listo en cocina.',
-    detalle: {
-      warning_code: INVENTARIO_CONFIG_WARNING_CODE,
-      total_faltantes: normalizedFaults.length,
-      faltantes: normalizedFaults
-    }
-  };
-};
-
-const insertCocinaIncident = async (client, payload) => {
-  await client.query(
-    `
-      INSERT INTO public.incidencias_cocina (
-        id_pedido,
-        codigo_venta,
-        id_sucursal,
-        id_usuario_cocina,
-        tipo_incidencia,
-        severidad,
-        origen,
-        detalle,
-        mensaje,
-        estado
-      )
-      VALUES ($1, $2, $3, $4, $5, 'ADVERTENCIA', 'COCINA', $6::jsonb, $7, 'PENDIENTE')
-    `,
-    [
-      payload.idPedido,
-      payload.codigoVenta,
-      payload.idSucursal,
-      payload.idUsuarioCocina,
-      payload.tipoIncidencia,
-      JSON.stringify(payload.detalle || {}),
-      payload.mensaje
-    ]
-  );
 };
 
 /**
@@ -1019,9 +1044,8 @@ router.put('/cocina/pedidos/:id/estado', checkPermission(COCINA_VIEW_PERMISSIONS
       }
 
       let inventoryResult = null;
-      let inventoryConfigWarning = null;
       let inventoryAlreadyDiscounted = false;
-      const shouldDiscountInventory = estadoDestino === 'LISTO_PARA_ENTREGA';
+      const shouldDiscountInventory = estadoDestino === 'EN_PREPARACION';
       if (shouldDiscountInventory) {
         const consumoPayloadResult = await buildPedidoConsumoPayload(client, idPedido, pedidoSucursalId);
         if (!consumoPayloadResult.ok) {
@@ -1033,35 +1057,29 @@ router.put('/cocina/pedidos/:id/estado', checkPermission(COCINA_VIEW_PERMISSIONS
           inventoryResult = await validarYDescontarPedido(consumoPayloadResult.payload, {
             id_usuario: req?.user?.id_usuario,
             allowNegativeStock: true,
-            shortageMode: 'FALTANTE_COCINA',
             dbClient: client
           });
         } catch (inventoryError) {
           const errorCode = String(inventoryError?.code || '').trim().toUpperCase();
           if (errorCode !== 'PEDIDO_YA_DESCONTADO') {
-            throw inventoryError;
+            await client.query('ROLLBACK');
+            return res.status(inventoryError?.httpStatus || 409).json({
+              error: true,
+              code: inventoryError?.code || 'INVENTARIO_ERROR',
+              message: inventoryError?.publicMessage || inventoryError?.message || 'No se pudo descontar inventario para el pedido.',
+              details: inventoryError?.details || null
+            });
           }
           inventoryAlreadyDiscounted = true;
         }
 
         if (!inventoryAlreadyDiscounted && !inventoryResult?.ok) {
-          const isConfigError = String(inventoryResult.code || '').toUpperCase() === 'CONFIGURACION_INVENTARIO_INVALIDA';
-          if (!isConfigError) {
-            await client.query('ROLLBACK');
-            return res.status(409).json({
-              error: true,
-              code: inventoryResult.code || 'INVENTARIO_ERROR',
-              message: inventoryResult.message || 'No se pudo descontar inventario para el pedido.',
-              faltantes: Array.isArray(inventoryResult.faltantes) ? inventoryResult.faltantes : []
-            });
-          }
-
-          inventoryConfigWarning = buildInventoryIncidentPayload({
-            idPedido,
-            idSucursal: pedidoSucursalId,
-            idUsuarioCocina: req?.user?.id_usuario,
-            numeroTicket: buildTicketNumber(idPedido),
-            faltantes: inventoryResult.faltantes
+          await client.query('ROLLBACK');
+          return res.status(409).json({
+            error: true,
+            code: inventoryResult.code || 'INVENTARIO_ERROR',
+            message: inventoryResult.message || 'No se pudo descontar inventario para el pedido.',
+            faltantes: Array.isArray(inventoryResult.faltantes) ? inventoryResult.faltantes : []
           });
         }
       }
@@ -1076,10 +1094,6 @@ router.put('/cocina/pedidos/:id/estado', checkPermission(COCINA_VIEW_PERMISSIONS
         `,
         [idEstadoDestino, idPedido]
       );
-
-      if (inventoryConfigWarning) {
-        await insertCocinaIncident(client, inventoryConfigWarning);
-      }
 
       await client.query('COMMIT');
 
@@ -1102,21 +1116,19 @@ router.put('/cocina/pedidos/:id/estado', checkPermission(COCINA_VIEW_PERMISSIONS
 
       return res.status(200).json({
         ok: true,
-        message: inventoryConfigWarning
-          ? INVENTARIO_CONFIG_WARNING_MESSAGE
-          : inventoryAlreadyDiscounted
-            ? 'Pedido marcado como listo. El inventario ya había sido descontado previamente.'
-            : 'Estado de pedido actualizado correctamente.',
+        message: inventoryAlreadyDiscounted
+          ? 'Pedido marcado como listo. El inventario ya habia sido descontado previamente.'
+          : 'Estado de pedido actualizado correctamente.',
         id_pedido: idPedido,
         estado_anterior: estadoActual,
         estado_actual: estadoDestino,
-        warning: inventoryConfigWarning ? true : Boolean(inventoryResult?.warning || inventoryAlreadyDiscounted),
-        warning_code: inventoryConfigWarning
-          ? INVENTARIO_CONFIG_WARNING_CODE
-          : inventoryAlreadyDiscounted
-            ? 'INVENTARIO_YA_DESCONTADO'
-            : null,
-        warning_detail: inventoryResult?.warning || null
+        warning: Boolean(inventoryResult?.warning || inventoryAlreadyDiscounted),
+        warning_code: inventoryAlreadyDiscounted
+          ? 'INVENTARIO_YA_DESCONTADO'
+          : inventoryResult?.warning?.code || null,
+        warning_detail: Array.isArray(inventoryResult?.warning?.faltantes)
+          ? inventoryResult.warning.faltantes
+          : inventoryResult?.warning || null
       });
     } catch (dbErr) {
       try { await client.query('ROLLBACK'); } catch { /* ignorar */ }

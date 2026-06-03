@@ -3363,17 +3363,7 @@ const discountPedidoExtrasInventory = async ({ client, idPedido, idSucursal, lin
       };
     }
     const total = totalsByInsumo.get(idInsumo);
-    const saldoAntes = Number(row.cantidad || 0);
     const salida = roundMoney(total.cantidad);
-    const saldoDespues = roundMoney(saldoAntes - salida);
-    await client.query(
-      `
-        UPDATE public.insumos
-        SET cantidad = $2
-        WHERE id_insumo = $1
-      `,
-      [idInsumo, saldoDespues]
-    );
     await client.query(
       `
         INSERT INTO public.movimientos_inventario (
@@ -3384,20 +3374,16 @@ const discountPedidoExtrasInventory = async ({ client, idPedido, idSucursal, lin
           id_insumo,
           ref_origen,
           id_ref,
-          descripcion,
-          saldo_antes,
-          saldo_despues
+          descripcion
         )
-        VALUES ('SALIDA', $1, $2, NULL, $3, 'PEDIDO_EXTRA', $4, $5, $6, $7)
+        VALUES ('SALIDA', $1, $2, NULL, $3, 'PEDIDO_EXTRA', $4, $5)
       `,
       [
         salida,
         Number(row.id_almacen),
         idInsumo,
         idPedido,
-        `Descuento de extras por pedido #${idPedido}: ${[...total.nombres].join(', ')}${parseOptionalPositiveInt(idUsuario) ? ` - usuario ${idUsuario}` : ''}`,
-        saldoAntes,
-        saldoDespues
+        `Descuento de extras por pedido #${idPedido}: ${[...total.nombres].join(', ')}${parseOptionalPositiveInt(idUsuario) ? ` - usuario ${idUsuario}` : ''}`
       ]
     );
   }
@@ -8535,16 +8521,6 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
       cuentaDivididaResponse = await fetchCuentaDividida(client, { idPedido });
     }
 
-    const extrasInventoryStart = ventasPerf.now();
-    await discountPedidoExtrasInventory({
-      client,
-      idPedido,
-      idSucursal: pedidoPendiente.id_sucursal,
-      lines: pedidoPendiente.pedido_lines,
-      idUsuario: pedidoPendiente.id_usuario
-    });
-    ventasPerf.add('inventario_ms', extrasInventoryStart);
-
     const contextoPedidoStart = ventasPerf.now();
     await client.query(
       `
@@ -9572,15 +9548,6 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
             publicMessage: 'La venta fue procesada por RPC V2, pero no devolvio pedido valido para descontar extras.'
           };
         }
-        const extrasInventoryStart = ventasPerf.now();
-        await discountPedidoExtrasInventory({
-          client,
-          idPedido: idPedidoRpc,
-          idSucursal: venta.id_sucursal,
-          lines: venta.pedido_lines,
-          idUsuario: venta.id_usuario
-        });
-        ventasPerf.add('inventario_ms', extrasInventoryStart);
       }
 
       const commitStart = ventasPerf.now();
@@ -9834,15 +9801,6 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
     }
     ventasPerf.add('detalle_pedido_insert_ms', detallePedidoInsertStart);
     ventasPerf.add('detalle_pedido_ms', detallePedidoStart);
-    const extrasInventoryStart = ventasPerf.now();
-    await discountPedidoExtrasInventory({
-      client,
-      idPedido,
-      idSucursal: venta.id_sucursal,
-      lines: venta.pedido_lines,
-      idUsuario: venta.id_usuario
-    });
-    ventasPerf.add('inventario_ms', extrasInventoryStart);
     const facturaInsertStart = ventasPerf.now();
     const facturaResult = await client.query(
       `

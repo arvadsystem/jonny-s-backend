@@ -137,14 +137,16 @@ El detalle tecnico debe quedar solo en logs seguros del servidor.
 - Cuando se vende un combo, el combo puede contener recetas y productos simples.
 - Los combos pueden afectar inventario de recetas, productos terminados o ambos.
 - Todo pedido debe generar entrada en cocina, incluso si incluye productos directos.
-- El inventario debe rebajarse cuando cocina marque el pedido como preparado/listo.
-- El inventario debe rebajarse aunque el pedido este pendiente de entrega, siempre que ya fue preparado/listo.
+- El inventario no debe rebajarse al crear un pedido pendiente ni necesariamente al registrar pago.
+- Para pedidos que pasan por cocina, el inventario debe rebajarse exactamente cuando el pedido cambia a EN_PREPARACION.
+- Desde EN_PREPARACION los insumos/productos se consideran fisicamente consumidos y no se revierten automaticamente por cancelacion posterior.
 
 4.2. Estado de cocina
-Cuando cocina marque un pedido como preparado/listo:
-- El sistema debe descontar inventario.
-- Si el descuento se registra correctamente, el pedido debe pasar automaticamente a LISTO_ENTREGA.
-- En frontend, debe aparecer en el recuadro o columna "Listos para entrega".
+Cuando cocina cambie un pedido de EN_COCINA a EN_PREPARACION:
+- El sistema debe validar y descontar inventario dentro de la misma transaccion del cambio de estado.
+- Si no hay stock suficiente, debe permitir el cambio a EN_PREPARACION, registrar la salida y dejar el stock en negativo si corresponde.
+- Si falta configuracion de receta/combo/extra/unidad de medida/insumo/almacen, no debe permitir el cambio a EN_PREPARACION.
+- Si el descuento se registra correctamente, el pedido queda en EN_PREPARACION y luego puede avanzar a LISTO_PARA_ENTREGA sin nuevo descuento.
 
 4.3. Stock por sucursal
 - El stock debe manejarse por sucursal.
@@ -153,28 +155,24 @@ Cuando cocina marque un pedido como preparado/listo:
 
 4.4. Stock insuficiente
 Si no hay stock suficiente al preparar un pedido:
-- El sistema NO debe bloquear la operacion de cocina.
-- Debe permitir completar la preparacion.
-- Debe permitir stock negativo de forma auditada.
-- Debe registrar un movimiento tipo FALTANTE_COCINA.
-- El faltante debe poder consultarse despues en inventario/reportes.
-- El pedido debe pasar a LISTO_ENTREGA.
+- El sistema debe permitir el cambio a EN_PREPARACION porque cocina ya inicio consumo fisico.
+- Debe registrar movimientos PEDIDO/SALIDA y permitir stock negativo.
+- Debe devolver advertencia estructurada con los faltantes.
+- Si ademas falta configuracion, debe bloquear y no registrar movimientos parciales de inventario.
 
 4.5. Cancelacion antes de preparar
 Si un pedido se cancela antes de ser preparado:
-- Debe devolver/liberar inventario automaticamente si existia reserva o movimiento previo.
-- Si la venta/pedido ya estaba confirmado, no usar rollback de base de datos despues del commit; usar movimiento compensatorio.
+- No debe revertir inventario automaticamente porque todavia no se habia descontado.
+- Si existe una correccion excepcional, debe hacerse por un flujo manual/auditable, no por cancelacion automatica.
 
 4.6. Reversion despues de preparado
 Si un pedido ya fue preparado y luego se revierte:
 - No se deben devolver insumos de recetas o combos al inventario.
 - Solo debe afectar caja.
-- Si hay producto terminado y aplica devolucion, ese producto si puede volver al inventario.
+- No se deben crear entradas automaticas de inventario por cancelacion posterior a EN_PREPARACION.
 
 4.7. Movimientos recomendados
 - SALIDA_PREPARACION.
-- ENTRADA_CANCELACION.
-- FALTANTE_COCINA.
 - ENTRADA_REV_PRODUCTO_TERMINADO.
 - AJUSTE_INVENTARIO.
 
@@ -1025,8 +1023,8 @@ Agregar pruebas o verificaciones para:
 - Confirmar pago.
 - Evitar doble confirmacion.
 - Enviar pedido a cocina.
-- Marcar preparado/listo.
-- Registrar FALTANTE_COCINA.
+- Cambiar pedido a EN_PREPARACION y descontar inventario.
+- Bloquear EN_PREPARACION si falta stock o configuracion de inventario.
 - Reversion total.
 - Reversion parcial.
 - Evitar doble reversion.
@@ -1293,12 +1291,12 @@ Codex solo debe considerar terminada una fase si cumple los criterios correspond
 - Ticket de reversion se identifica claramente como reversion.
 
 17.4. Inventario
-- Al marcar listo/preparado se descuenta inventario.
-- Si falta stock, permite stock negativo auditado.
-- Registra FALTANTE_COCINA.
-- Pedido pasa a LISTO_ENTREGA.
-- Cancelacion antes de preparar compensa/libera.
-- Reversion despues de preparado no devuelve insumos de receta/combo.
+- Al cambiar a EN_PREPARACION se descuenta inventario.
+- Si falta solo stock, permite EN_PREPARACION con stock negativo y advertencia.
+- Si falta configuracion, bloquea EN_PREPARACION.
+- LISTO_PARA_ENTREGA no descuenta inventario.
+- Cancelacion antes de EN_PREPARACION no compensa/libera porque no hubo descuento.
+- Cancelacion posterior a EN_PREPARACION no devuelve inventario automaticamente.
 
 17.5. Reversion
 - Boton "Registrar reversion" existe.

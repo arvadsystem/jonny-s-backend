@@ -44,13 +44,16 @@ const buildShortage = ({
   return {
     tipo_recurso,
     id_recurso,
+    ...(tipo_recurso === 'producto' ? { id_producto: id_recurso } : {}),
+    ...(tipo_recurso === 'insumo' ? { id_insumo: id_recurso } : {}),
     nombre,
     motivo,
     requerido: req,
     disponible,
     faltante: Math.max(req - disponible, 0),
     cantidad_actual: actual,
-    stock_minimo: minimo
+    stock_minimo: minimo,
+    mensaje: `Stock insuficiente para ${tipo_recurso} ${nombre || id_recurso}. Requerido: ${req}, disponible: ${disponible}.`
   };
 };
 
@@ -137,7 +140,9 @@ export const validarStockConBloqueo = async ({
       faltantes.push({
         tipo_recurso: 'producto',
         id_recurso: idProducto,
-        motivo: 'PRODUCTO_NO_ENCONTRADO'
+        id_producto: idProducto,
+        motivo: 'PRODUCTO_NO_ENCONTRADO',
+        mensaje: `El producto ${idProducto} no existe o no esta disponible para inventario.`
       });
       continue;
     }
@@ -145,16 +150,20 @@ export const validarStockConBloqueo = async ({
       faltantes.push({
         tipo_recurso: 'producto',
         id_recurso: idProducto,
+        id_producto: idProducto,
         nombre: row.nombre_producto,
-        motivo: 'PRODUCTO_INACTIVO'
+        motivo: 'PRODUCTO_INACTIVO',
+        mensaje: `El producto ${row.nombre_producto || idProducto} esta inactivo.`
       });
     }
     if (!toPositiveInt(row.id_almacen)) {
       faltantes.push({
         tipo_recurso: 'producto',
         id_recurso: idProducto,
+        id_producto: idProducto,
         nombre: row.nombre_producto,
-        motivo: 'PRODUCTO_SIN_ALMACEN'
+        motivo: 'PRODUCTO_SIN_ALMACEN',
+        mensaje: `El producto ${row.nombre_producto || idProducto} no tiene almacen configurado.`
       });
     }
   }
@@ -165,7 +174,9 @@ export const validarStockConBloqueo = async ({
       faltantes.push({
         tipo_recurso: 'insumo',
         id_recurso: idInsumo,
-        motivo: 'INSUMO_NO_ENCONTRADO'
+        id_insumo: idInsumo,
+        motivo: 'INSUMO_NO_ENCONTRADO',
+        mensaje: `El insumo ${idInsumo} no existe o no esta disponible para inventario.`
       });
       continue;
     }
@@ -173,16 +184,20 @@ export const validarStockConBloqueo = async ({
       faltantes.push({
         tipo_recurso: 'insumo',
         id_recurso: idInsumo,
+        id_insumo: idInsumo,
         nombre: row.nombre_insumo,
-        motivo: 'INSUMO_INACTIVO'
+        motivo: 'INSUMO_INACTIVO',
+        mensaje: `El insumo ${row.nombre_insumo || idInsumo} esta inactivo.`
       });
     }
     if (!toPositiveInt(row.id_almacen)) {
       faltantes.push({
         tipo_recurso: 'insumo',
         id_recurso: idInsumo,
+        id_insumo: idInsumo,
         nombre: row.nombre_insumo,
-        motivo: 'INSUMO_SIN_ALMACEN'
+        motivo: 'INSUMO_SIN_ALMACEN',
+        mensaje: `El insumo ${row.nombre_insumo || idInsumo} no tiene almacen configurado.`
       });
     }
   }
@@ -206,7 +221,9 @@ export const validarStockConBloqueo = async ({
       faltantes.push({
         tipo_recurso: 'almacen',
         id_recurso: idAlmacen,
-        motivo: 'ALMACEN_NO_ENCONTRADO'
+        id_almacen: idAlmacen,
+        motivo: 'ALMACEN_NO_ENCONTRADO',
+        mensaje: `El almacen ${idAlmacen} no existe.`
       });
       continue;
     }
@@ -214,14 +231,18 @@ export const validarStockConBloqueo = async ({
       faltantes.push({
         tipo_recurso: 'almacen',
         id_recurso: idAlmacen,
-        motivo: 'ALMACEN_INACTIVO'
+        id_almacen: idAlmacen,
+        motivo: 'ALMACEN_INACTIVO',
+        mensaje: `El almacen ${idAlmacen} esta inactivo.`
       });
     }
     if (Number(almacen.id_sucursal || 0) !== Number(idSucursal)) {
       faltantes.push({
         tipo_recurso: 'almacen',
         id_recurso: idAlmacen,
-        motivo: 'ALMACEN_DE_OTRA_SUCURSAL'
+        id_almacen: idAlmacen,
+        motivo: 'ALMACEN_DE_OTRA_SUCURSAL',
+        mensaje: `El almacen ${idAlmacen} no pertenece a la sucursal del pedido.`
       });
     }
   }
