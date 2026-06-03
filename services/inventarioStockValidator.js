@@ -119,9 +119,13 @@ export const validarStockConBloqueo = async ({
   client,
   idSucursal,
   productoQtyMap,
-  insumoQtyMap
+  insumoQtyMap,
+  allowCrossBranchWarehouse = false
 }) => {
   const faltantes = [];
+  const advertencias = [];
+  const excludedProductIds = new Set();
+  const excludedInsumoIds = new Set();
 
   const productoIds = [...productoQtyMap.keys()].sort((a, b) => a - b);
   const insumoIds = [...insumoQtyMap.keys()].sort((a, b) => a - b);
@@ -137,6 +141,7 @@ export const validarStockConBloqueo = async ({
   for (const idProducto of productoIds) {
     const row = productosById.get(idProducto);
     if (!row) {
+      excludedProductIds.add(idProducto);
       faltantes.push({
         tipo_recurso: 'producto',
         id_recurso: idProducto,
@@ -147,6 +152,7 @@ export const validarStockConBloqueo = async ({
       continue;
     }
     if (!Boolean(row.estado)) {
+      excludedProductIds.add(idProducto);
       faltantes.push({
         tipo_recurso: 'producto',
         id_recurso: idProducto,
@@ -157,6 +163,7 @@ export const validarStockConBloqueo = async ({
       });
     }
     if (!toPositiveInt(row.id_almacen)) {
+      excludedProductIds.add(idProducto);
       faltantes.push({
         tipo_recurso: 'producto',
         id_recurso: idProducto,
@@ -171,6 +178,7 @@ export const validarStockConBloqueo = async ({
   for (const idInsumo of insumoIds) {
     const row = insumosById.get(idInsumo);
     if (!row) {
+      excludedInsumoIds.add(idInsumo);
       faltantes.push({
         tipo_recurso: 'insumo',
         id_recurso: idInsumo,
@@ -181,6 +189,7 @@ export const validarStockConBloqueo = async ({
       continue;
     }
     if (!Boolean(row.estado)) {
+      excludedInsumoIds.add(idInsumo);
       faltantes.push({
         tipo_recurso: 'insumo',
         id_recurso: idInsumo,
@@ -191,6 +200,7 @@ export const validarStockConBloqueo = async ({
       });
     }
     if (!toPositiveInt(row.id_almacen)) {
+      excludedInsumoIds.add(idInsumo);
       faltantes.push({
         tipo_recurso: 'insumo',
         id_recurso: idInsumo,
@@ -214,10 +224,37 @@ export const validarStockConBloqueo = async ({
 
   const almacenesRows = await fetchAlmacenesByIds(client, [...almacenesEnUso].sort((a, b) => a - b));
   const almacenesById = mapById(almacenesRows, 'id_almacen');
+  const productoIdsByAlmacen = new Map();
+  const insumoIdsByAlmacen = new Map();
+
+  for (const row of productosRows) {
+    const almacenId = toPositiveInt(row?.id_almacen);
+    const idProducto = toPositiveInt(row?.id_producto);
+    if (!almacenId || !idProducto) continue;
+    if (!productoIdsByAlmacen.has(almacenId)) productoIdsByAlmacen.set(almacenId, []);
+    productoIdsByAlmacen.get(almacenId).push(idProducto);
+  }
+  for (const row of insumosRows) {
+    const almacenId = toPositiveInt(row?.id_almacen);
+    const idInsumo = toPositiveInt(row?.id_insumo);
+    if (!almacenId || !idInsumo) continue;
+    if (!insumoIdsByAlmacen.has(almacenId)) insumoIdsByAlmacen.set(almacenId, []);
+    insumoIdsByAlmacen.get(almacenId).push(idInsumo);
+  }
+
+  const excludeResourcesByWarehouse = (idAlmacen) => {
+    for (const idProducto of productoIdsByAlmacen.get(idAlmacen) || []) {
+      excludedProductIds.add(idProducto);
+    }
+    for (const idInsumo of insumoIdsByAlmacen.get(idAlmacen) || []) {
+      excludedInsumoIds.add(idInsumo);
+    }
+  };
 
   for (const idAlmacen of almacenesEnUso) {
     const almacen = almacenesById.get(idAlmacen);
     if (!almacen) {
+      excludeResourcesByWarehouse(idAlmacen);
       faltantes.push({
         tipo_recurso: 'almacen',
         id_recurso: idAlmacen,
@@ -228,6 +265,7 @@ export const validarStockConBloqueo = async ({
       continue;
     }
     if (!Boolean(almacen.estado)) {
+      excludeResourcesByWarehouse(idAlmacen);
       faltantes.push({
         tipo_recurso: 'almacen',
         id_recurso: idAlmacen,
@@ -237,19 +275,26 @@ export const validarStockConBloqueo = async ({
       });
     }
     if (Number(almacen.id_sucursal || 0) !== Number(idSucursal)) {
-      faltantes.push({
+      excludeResourcesByWarehouse(idAlmacen);
+      const warning = {
         tipo_recurso: 'almacen',
         id_recurso: idAlmacen,
         id_almacen: idAlmacen,
         motivo: 'ALMACEN_DE_OTRA_SUCURSAL',
-        mensaje: `El almacen ${idAlmacen} no pertenece a la sucursal del pedido.`
-      });
+        mensaje: `El almacen ${idAlmacen} no pertenece a la sucursal del pedido; no se descuenta desde otra sucursal.`
+      };
+      if (allowCrossBranchWarehouse) {
+        advertencias.push(warning);
+      } else {
+        faltantes.push(warning);
+      }
     }
   }
 
   for (const idProducto of productoIds) {
     const row = productosById.get(idProducto);
     if (!row) continue;
+    if (excludedProductIds.has(idProducto)) continue;
     const requerido = Number(productoQtyMap.get(idProducto) || 0);
     if (!hasEnoughStock(row.cantidad, row.stock_minimo, requerido)) {
       faltantes.push(
@@ -269,6 +314,7 @@ export const validarStockConBloqueo = async ({
   for (const idInsumo of insumoIds) {
     const row = insumosById.get(idInsumo);
     if (!row) continue;
+    if (excludedInsumoIds.has(idInsumo)) continue;
     const requerido = Number(insumoQtyMap.get(idInsumo) || 0);
     if (!hasEnoughStock(row.cantidad, row.stock_minimo, requerido)) {
       faltantes.push(
@@ -287,9 +333,14 @@ export const validarStockConBloqueo = async ({
 
   return {
     faltantes,
+    advertencias,
     lockedRows: {
       productosById,
       insumosById
+    },
+    excludedResources: {
+      productoIds: excludedProductIds,
+      insumoIds: excludedInsumoIds
     }
   };
 };

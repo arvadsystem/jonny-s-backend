@@ -1077,6 +1077,7 @@ router.put('/cocina/pedidos/:id/estado', checkPermission(COCINA_VIEW_PERMISSIONS
           inventoryResult = await validarYDescontarPedido(consumoPayloadResult.payload, {
             id_usuario: req?.user?.id_usuario,
             allowNegativeStock: true,
+            allowIncompleteConfiguration: true,
             dbClient: client
           });
         } catch (inventoryError) {

@@ -770,7 +770,11 @@ const buildComplementLineConfig = (line) => {
       cantidad: Number(entry?.cantidad || 0),
       precio_unitario: roundMoney(entry?.precio_unitario),
       subtotal: roundMoney(entry?.subtotal),
-      id_insumo: entry?.id_insumo ? Number(entry.id_insumo) : null
+      id_insumo: entry?.id_insumo ? Number(entry.id_insumo) : null,
+      cant: Number(entry?.cant ?? entry?.cantidad_insumo ?? 0) > 0
+        ? Number(entry?.cant ?? entry?.cantidad_insumo)
+        : null,
+      id_unidad_medida: parseOptionalPositiveInt(entry?.id_unidad_medida)
     })).filter((entry) => entry.id_extra > 0 && entry.cantidad > 0)
   };
 };
@@ -3299,24 +3303,77 @@ const hasVentaExtras = (venta) =>
     (line) => Array.isArray(line?.extras_detalle) && line.extras_detalle.length > 0
   );
 
+const fetchMenuExtrasSnapshotByIds = async (client, ids = []) => {
+  const extraIds = [...new Set(
+    (Array.isArray(ids) ? ids : [])
+      .map((id) => parseOptionalPositiveInt(id))
+      .filter(Boolean)
+  )].sort((a, b) => a - b);
+  if (extraIds.length === 0) return new Map();
+  if (!(await hasTable(client, 'menu_extras'))) return new Map();
+
+  const result = await client.query(
+    `
+      SELECT
+        id_extra,
+        codigo,
+        nombre,
+        precio_adicional,
+        id_insumo,
+        cant,
+        id_unidad_medida
+      FROM public.menu_extras
+      WHERE id_extra = ANY($1::int[])
+    `,
+    [extraIds]
+  );
+
+  return new Map(
+    result.rows.map((row) => [
+      Number(row.id_extra),
+      {
+        id_extra: Number(row.id_extra),
+        codigo: String(row.codigo || '').trim() || null,
+        nombre: String(row.nombre || '').trim() || null,
+        precio_unitario: roundMoney(row.precio_adicional),
+        id_insumo: parseOptionalPositiveInt(row.id_insumo),
+        cant: Number(row.cant || 0) > 0 ? Number(row.cant) : null,
+        id_unidad_medida: parseOptionalPositiveInt(row.id_unidad_medida)
+      }
+    ])
+  );
+};
+
 const insertDetallePedidoExtras = async ({ client, idDetallePedido, extras = [] }) => {
   const detalleId = parseOptionalPositiveInt(idDetallePedido);
   const rows = (Array.isArray(extras) ? extras : []).filter((extra) => parseOptionalPositiveInt(extra?.id_extra) && Number(extra?.cantidad || 0) > 0);
   if (!detalleId || rows.length === 0) return;
   if (!(await hasTable(client, 'detalle_pedido_extras'))) return;
 
+  const rowsNeedingCatalog = rows.filter((extra) => {
+    const idInsumo = parseOptionalPositiveInt(extra.id_insumo);
+    const hasConsumption = Number(extra.cant ?? extra.cantidad_insumo ?? 0) > 0;
+    const hasUnit = Boolean(parseOptionalPositiveInt(extra.id_unidad_medida));
+    return !idInsumo || !hasConsumption || !hasUnit || !String(extra.codigo || '').trim() || !String(extra.nombre || '').trim();
+  });
+  const catalogByExtraId = await fetchMenuExtrasSnapshotByIds(
+    client,
+    rowsNeedingCatalog.map((extra) => extra.id_extra)
+  );
+
   const values = buildBatchPlaceholders(rows.length, 11);
   const params = [];
   for (const extra of rows) {
     const idExtra = Number(extra.id_extra);
-    const codigo = String(extra.codigo || '').trim() || null;
-    const nombre = String(extra.nombre || 'Extra').trim().slice(0, 120);
+    const catalog = catalogByExtraId.get(idExtra) || null;
+    const codigo = String(extra.codigo || catalog?.codigo || '').trim() || null;
+    const nombre = String(extra.nombre || catalog?.nombre || 'Extra').trim().slice(0, 120);
     const cantidad = Number(extra.cantidad);
-    const precioUnitario = roundMoney(extra.precio_unitario);
-    const subtotal = roundMoney(extra.subtotal);
-    const idInsumo = parseOptionalPositiveInt(extra.id_insumo);
-    const cant = idInsumo ? Number(extra.cant ?? extra.cantidad_insumo ?? 0) || null : null;
-    const idUnidadMedida = idInsumo ? parseOptionalPositiveInt(extra.id_unidad_medida) : null;
+    const precioUnitario = roundMoney(extra.precio_unitario ?? catalog?.precio_unitario);
+    const subtotal = roundMoney(extra.subtotal ?? precioUnitario * cantidad);
+    const idInsumo = parseOptionalPositiveInt(extra.id_insumo) || parseOptionalPositiveInt(catalog?.id_insumo);
+    const cant = idInsumo ? Number(extra.cant ?? extra.cantidad_insumo ?? catalog?.cant ?? 0) || null : null;
+    const idUnidadMedida = idInsumo ? parseOptionalPositiveInt(extra.id_unidad_medida) || parseOptionalPositiveInt(catalog?.id_unidad_medida) : null;
     params.push(
       detalleId,
       idExtra,
@@ -8443,13 +8500,11 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
       }
       const idDetallePedido = Number(detallePedidoInsert.rows?.[0]?.id_detalle_pedido || 0);
       pedidoLineRefs.push({ id_detalle_pedido: idDetallePedido });
-      if (!hasDetallePedidoConfiguracionMenu) {
-        await insertDetallePedidoExtras({
-          client,
-          idDetallePedido,
-          extras: line.extras_detalle
-        });
-      }
+      await insertDetallePedidoExtras({
+        client,
+        idDetallePedido,
+        extras: line.extras_detalle
+      });
     }
     ventasPerf.add('detalle_pedido_ms', detalleStart);
 
@@ -9733,14 +9788,12 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
           }
         });
       });
-      if (!hasDetallePedidoConfiguracionMenu) {
-        for (const ref of pedidoLineRefs) {
-          await insertDetallePedidoExtras({
-            client,
-            idDetallePedido: ref.id_detalle_pedido,
-            extras: ref.extras_detalle
-          });
-        }
+      for (const ref of pedidoLineRefs) {
+        await insertDetallePedidoExtras({
+          client,
+          idDetallePedido: ref.id_detalle_pedido,
+          extras: ref.extras_detalle
+        });
       }
     }
     ventasPerf.add('detalle_pedido_insert_ms', detallePedidoInsertStart);

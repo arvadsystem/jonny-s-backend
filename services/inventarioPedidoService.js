@@ -42,6 +42,21 @@ const ensureBranchExists = async (client, idSucursal) => {
   }
 };
 
+const normalizeExcludedIdSet = (value) => {
+  if (value instanceof Set) return value;
+  if (Array.isArray(value)) return new Set(value.map((id) => Number(id)).filter((id) => id > 0));
+  return new Set();
+};
+
+const filterQtyMap = (qtyMap, excludedIds) => {
+  const result = new Map();
+  for (const [id, qty] of qtyMap.entries()) {
+    if (excludedIds.has(Number(id))) continue;
+    result.set(id, qty);
+  }
+  return result;
+};
+
 export const validarYDescontarPedido = async (payload, options = {}) => {
   const normalized = normalizePedidoPayload(payload);
   if (!normalized.ok) {
@@ -55,6 +70,8 @@ export const validarYDescontarPedido = async (payload, options = {}) => {
   const { id_sucursal: idSucursal, id_pedido: idPedido, items } = normalized.value;
   const actorUserId = toPositiveInt(options?.id_usuario) || null;
   const allowNegativeStock = options?.allowNegativeStock === true;
+  const allowCrossBranchWarehouse = options?.allowCrossBranchWarehouse === true;
+  const allowIncompleteConfiguration = options?.allowIncompleteConfiguration === true;
   const shortageMode = String(options?.shortageMode || '').trim().toUpperCase();
   const movementRefForShortage = shortageMode === SHORTAGE_MOVEMENT_REF
     ? SHORTAGE_MOVEMENT_REF
@@ -88,7 +105,8 @@ export const validarYDescontarPedido = async (payload, options = {}) => {
       client,
       idSucursal,
       productoQtyMap: consumoResult.consumo.productoQtyMap,
-      insumoQtyMap: consumoResult.consumo.insumoQtyMap
+      insumoQtyMap: consumoResult.consumo.insumoQtyMap,
+      allowCrossBranchWarehouse
     });
 
     // 3) Si existe cualquier faltante, rollback total (sin descuentos parciales).
@@ -103,13 +121,23 @@ export const validarYDescontarPedido = async (payload, options = {}) => {
     const stockShortages = faltantes.filter(
       (item) => String(item?.motivo || '').trim().toUpperCase() === 'STOCK_INSUFICIENTE'
     );
+    const operationalWarnings = Array.isArray(stockResult.advertencias)
+      ? stockResult.advertencias
+      : [];
+    const configWarnings = allowIncompleteConfiguration ? configFaults : [];
+    const warningDetails = [
+      ...stockShortages,
+      ...operationalWarnings,
+      ...configWarnings
+    ];
 
-    if (configFaults.length > 0) {
+    if (configFaults.length > 0 && !allowIncompleteConfiguration) {
+      const firstConfigFaultMessage = String(configFaults[0]?.mensaje || '').trim();
       if (manageTransaction) await client.query('ROLLBACK');
       return {
         ok: false,
         code: 'CONFIGURACION_INVENTARIO_INVALIDA',
-        message: 'No se pudo descontar inventario por configuracion incompleta de productos/recetas/combos/extras/insumos/almacen.',
+        message: firstConfigFaultMessage || 'No se pudo descontar inventario por configuracion incompleta de productos/recetas/combos/extras/insumos/almacen.',
         id_pedido: idPedido,
         id_sucursal: idSucursal,
         faltantes: configFaults
@@ -128,6 +156,17 @@ export const validarYDescontarPedido = async (payload, options = {}) => {
       };
     }
 
+    const excludedProductIds = normalizeExcludedIdSet(stockResult.excludedResources?.productoIds);
+    const excludedInsumoIds = normalizeExcludedIdSet(stockResult.excludedResources?.insumoIds);
+    const movimientoProductoQtyMap = filterQtyMap(
+      consumoResult.consumo.productoQtyMap,
+      excludedProductIds
+    );
+    const movimientoInsumoQtyMap = filterQtyMap(
+      consumoResult.consumo.insumoQtyMap,
+      excludedInsumoIds
+    );
+    const generatedMovementCount = movimientoProductoQtyMap.size + movimientoInsumoQtyMap.size;
     const shortagesByResource = new Map(
       stockShortages.map((item) => [`${item.tipo_recurso}:${item.id_recurso}`, item])
     );
@@ -137,8 +176,8 @@ export const validarYDescontarPedido = async (payload, options = {}) => {
       client,
       idPedido,
       actorUserId,
-      productoQtyMap: consumoResult.consumo.productoQtyMap,
-      insumoQtyMap: consumoResult.consumo.insumoQtyMap,
+      productoQtyMap: movimientoProductoQtyMap,
+      insumoQtyMap: movimientoInsumoQtyMap,
       productosById: stockResult.lockedRows.productosById,
       insumosById: stockResult.lockedRows.insumosById,
       refOrigen: stockShortages.length > 0 ? movementRefForShortage : MOVEMENT_REF,
@@ -150,22 +189,26 @@ export const validarYDescontarPedido = async (payload, options = {}) => {
     return {
       ok: true,
       code: 'DESCUENTO_OK',
-      message: stockShortages.length > 0
-        ? 'Inventario descontado permitiendo stock negativo por consumo fisico en cocina.'
+      message: warningDetails.length > 0
+        ? generatedMovementCount > 0
+          ? 'Inventario descontado con advertencias operativas por consumo fisico en cocina.'
+          : 'Pedido paso a preparacion con advertencias operativas; no se generaron movimientos para recursos no descontables.'
         : 'Inventario descontado correctamente.',
       id_pedido: idPedido,
       id_sucursal: idSucursal,
-      warning: stockShortages.length > 0
+      warning: warningDetails.length > 0
         ? {
             code: 'STOCK_INSUFICIENTE_PERMITIDO',
-            message: 'Pedido paso a preparacion y el inventario se desconto aunque el stock registrado era insuficiente.',
-            faltantes: stockShortages
+            message: generatedMovementCount > 0
+              ? 'Pedido paso a preparacion y el inventario se desconto con advertencias operativas.'
+              : 'Pedido paso a preparacion con advertencias operativas de inventario.',
+            faltantes: warningDetails
           }
         : null,
       resumen: {
-        productos_afectados: consumoResult.consumo.productoQtyMap.size,
-        insumos_afectados: consumoResult.consumo.insumoQtyMap.size,
-        movimientos_generados: consumoResult.consumo.productoQtyMap.size + consumoResult.consumo.insumoQtyMap.size
+        productos_afectados: movimientoProductoQtyMap.size,
+        insumos_afectados: movimientoInsumoQtyMap.size,
+        movimientos_generados: generatedMovementCount
       }
     };
   } catch (error) {
