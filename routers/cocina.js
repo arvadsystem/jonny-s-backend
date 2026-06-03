@@ -705,6 +705,7 @@ router.get('/cocina/pedidos', checkPermission(COCINA_VIEW_PERMISSIONS), async (r
       const hasKdsExpectedMinutes = await hasColumn(client, 'pedidos', 'kds_expected_minutes');
       const hasKdsExpectedRule = await hasColumn(client, 'pedidos', 'kds_expected_rule');
       const hasKdsTimingColumns = hasKdsStartedAt && hasKdsExpectedMinutes && hasKdsExpectedRule;
+      const hasPedidosInventarioAlertas = await hasTable(client, 'pedidos_inventario_alertas');
       const activeKdsEstadoIds = ['EN_COCINA', 'EN_PREPARACION']
         .map((code) => estadoIdMap.get(code))
         .filter((value) => Number.isInteger(value) && value > 0);
@@ -728,6 +729,8 @@ router.get('/cocina/pedidos', checkPermission(COCINA_VIEW_PERMISSIONS), async (r
             p.id_sucursal,
             s.nombre_sucursal,
             p.id_cliente,
+            ${hasPedidosInventarioAlertas ? 'COALESCE(inv_alertas.total, 0)::int AS inventario_alertas_total,' : '0::int AS inventario_alertas_total,'}
+            ${hasPedidosInventarioAlertas ? 'COALESCE(inv_alertas.pendientes, 0)::int AS inventario_alertas_pendientes,' : '0::int AS inventario_alertas_pendientes,'}
             COALESCE(
               NULLIF(trim(concat_ws(' ', per.nombre, per.apellido)), ''),
               emp.nombre_empresa,
@@ -775,6 +778,15 @@ router.get('/cocina/pedidos', checkPermission(COCINA_VIEW_PERMISSIONS), async (r
               f.id_factura DESC
             LIMIT 1
           ) f ON TRUE
+          ${hasPedidosInventarioAlertas ? `
+          LEFT JOIN LATERAL (
+            SELECT
+              COUNT(*)::int AS total,
+              COUNT(*) FILTER (WHERE UPPER(COALESCE(a.estado, 'PENDIENTE')) = 'PENDIENTE')::int AS pendientes
+            FROM public.pedidos_inventario_alertas a
+            WHERE a.id_pedido = p.id_pedido
+          ) inv_alertas ON TRUE
+          ` : ''}
           LEFT JOIN detalle_pedido dp
             ON dp.id_pedido = p.id_pedido
            AND COALESCE(dp.estado, true) = true
@@ -835,6 +847,8 @@ router.get('/cocina/pedidos', checkPermission(COCINA_VIEW_PERMISSIONS), async (r
             minutos_en_espera: minutosEnEspera,
             esta_proximo_a_expirar: estaProximoAExpirar,
             total: roundMoney(row.total),
+            inventario_alertas_total: Number(row.inventario_alertas_total ?? 0) || 0,
+            inventario_alertas_pendientes: Number(row.inventario_alertas_pendientes ?? 0) || 0,
             total_items: 0,
             items: []
           });
