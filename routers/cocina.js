@@ -317,33 +317,19 @@ const buildPedidoConsumoPayload = async (client, idPedido, idSucursal) => {
     .filter(Boolean);
 
   const extrasByDetalle = new Map();
-  for (const row of detailsResult.rows) {
-    const idDetallePedido = parsePositiveInt(row.id_detalle_pedido);
-    if (!idDetallePedido) continue;
-    const config = row.configuracion_menu && typeof row.configuracion_menu === 'object'
-      ? row.configuracion_menu
-      : null;
-    const extras = Array.isArray(config?.extras) ? config.extras : [];
-    for (const extra of extras) {
-      const idExtra = parsePositiveInt(extra?.id_extra);
-      const cantidad = Number(extra?.cantidad || 0);
-      if (!idExtra || cantidad <= 0) continue;
-      const key = `${idDetallePedido}:${idExtra}`;
-      extrasByDetalle.set(key, {
-        id_detalle_pedido: idDetallePedido,
-        id_extra: idExtra,
-        cantidad
-      });
-    }
-  }
-
   if (await hasTable(client, 'detalle_pedido_extras')) {
     const extraRowsResult = await client.query(
       `
         SELECT
           dpe.id_detalle_pedido,
           dpe.id_extra,
-          COALESCE(dpe.cantidad, 0)::numeric AS cantidad
+          dpe.codigo_extra_snapshot,
+          dpe.nombre_extra_snapshot,
+          COALESCE(dpe.cantidad, 0)::numeric AS cantidad,
+          dpe.id_insumo,
+          dpe.cant,
+          dpe.id_unidad_medida,
+          dpe.origen_snapshot
         FROM public.detalle_pedido_extras dpe
         INNER JOIN public.detalle_pedido dp
           ON dp.id_detalle_pedido = dpe.id_detalle_pedido
@@ -359,13 +345,42 @@ const buildPedidoConsumoPayload = async (client, idPedido, idSucursal) => {
       const cantidad = Number(row.cantidad || 0);
       if (!idDetallePedido || !idExtra || cantidad <= 0) continue;
       const key = `${idDetallePedido}:${idExtra}`;
-      if (!extrasByDetalle.has(key)) {
-        extrasByDetalle.set(key, {
-          id_detalle_pedido: idDetallePedido,
-          id_extra: idExtra,
-          cantidad
-        });
-      }
+      extrasByDetalle.set(key, {
+        id_detalle_pedido: idDetallePedido,
+        id_extra: idExtra,
+        codigo: row.codigo_extra_snapshot || row.origen_snapshot?.codigo || null,
+        nombre: row.nombre_extra_snapshot || row.origen_snapshot?.nombre || null,
+        cantidad,
+        id_insumo: parsePositiveInt(row.id_insumo),
+        cant: Number(row.cant || 0) || null,
+        id_unidad_medida: parsePositiveInt(row.id_unidad_medida)
+      });
+    }
+  }
+
+  for (const row of detailsResult.rows) {
+    const idDetallePedido = parsePositiveInt(row.id_detalle_pedido);
+    if (!idDetallePedido) continue;
+    const config = row.configuracion_menu && typeof row.configuracion_menu === 'object'
+      ? row.configuracion_menu
+      : null;
+    const extras = Array.isArray(config?.extras) ? config.extras : [];
+    for (const extra of extras) {
+      const idExtra = parsePositiveInt(extra?.id_extra);
+      const cantidad = Number(extra?.cantidad || 0);
+      if (!idExtra || cantidad <= 0) continue;
+      const key = `${idDetallePedido}:${idExtra}`;
+      if (extrasByDetalle.has(key)) continue;
+      extrasByDetalle.set(key, {
+        id_detalle_pedido: idDetallePedido,
+        id_extra: idExtra,
+        codigo: String(extra?.codigo || '').trim() || null,
+        nombre: String(extra?.nombre || '').trim() || null,
+        cantidad,
+        id_insumo: parsePositiveInt(extra?.id_insumo),
+        cant: Number(extra?.cant ?? extra?.cantidad_insumo ?? 0) || null,
+        id_unidad_medida: parsePositiveInt(extra?.id_unidad_medida)
+      });
     }
   }
 
@@ -375,6 +390,11 @@ const buildPedidoConsumoPayload = async (client, idPedido, idSucursal) => {
       id_item: extra.id_extra,
       id_extra: extra.id_extra,
       id_detalle_pedido: extra.id_detalle_pedido,
+      codigo: extra.codigo,
+      nombre: extra.nombre,
+      id_insumo: extra.id_insumo,
+      cant: extra.cant,
+      id_unidad_medida: extra.id_unidad_medida,
       cantidad: extra.cantidad
     });
   }

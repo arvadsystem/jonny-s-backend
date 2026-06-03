@@ -32,7 +32,12 @@ const addContext = (map, id, item) => {
     id_producto: toPositiveInt(item?.id_producto) || null,
     id_receta: toPositiveInt(item?.id_receta) || null,
     id_combo: toPositiveInt(item?.id_combo) || null,
-    id_extra: toPositiveInt(item?.id_extra) || null
+    id_extra: toPositiveInt(item?.id_extra) || null,
+    id_insumo: toPositiveInt(item?.id_insumo) || null,
+    cant: Number(item?.cant || 0) > 0 ? Number(item.cant) : null,
+    id_unidad_medida: toPositiveInt(item?.id_unidad_medida) || null,
+    codigo: typeof item?.codigo === 'string' ? item.codigo.trim() || null : null,
+    nombre: typeof item?.nombre === 'string' ? item.nombre.trim() || null : null
   });
 };
 
@@ -100,7 +105,8 @@ const fetchExtrasByIds = async (client, ids) => {
         nombre,
         COALESCE(estado, true) AS estado,
         id_insumo,
-        COALESCE(cant, 0)::numeric AS insumo_factor
+        COALESCE(cant, 0)::numeric AS insumo_factor,
+        id_unidad_medida
       FROM public.menu_extras
       WHERE id_extra = ANY($1::int[])
     `,
@@ -188,11 +194,19 @@ export const resolvePedidoConsumo = async ({ client, items }) => {
   const recetaIds = [...recetaQtyMap.keys()].sort((a, b) => a - b);
   const comboIds = [...comboQtyMap.keys()].sort((a, b) => a - b);
   const extraIds = [...extraQtyMap.keys()].sort((a, b) => a - b);
+  const extraIdsWithSnapshot = new Set();
+  for (const idExtra of extraIds) {
+    const context = firstContext(extraContextById, idExtra);
+    if (toPositiveInt(context.id_insumo) && Number(context.cant || 0) > 0) {
+      extraIdsWithSnapshot.add(idExtra);
+    }
+  }
+  const extraFallbackIds = extraIds.filter((idExtra) => !extraIdsWithSnapshot.has(idExtra));
 
   const [recetasRows, combosRows, extrasRows, comboComponentRows] = await Promise.all([
     fetchRecetasByIds(client, recetaIds),
     fetchCombosByIds(client, comboIds),
-    fetchExtrasByIds(client, extraIds),
+    fetchExtrasByIds(client, extraFallbackIds),
     fetchComboRecipeComponents(client, comboIds)
   ]);
 
@@ -254,15 +268,26 @@ export const resolvePedidoConsumo = async ({ client, items }) => {
 
   const insumoQtyMap = new Map();
   for (const idExtra of extraIds) {
+    const context = firstContext(extraContextById, idExtra);
+    const snapshotInsumoId = toPositiveInt(context.id_insumo);
+    const snapshotFactor = Number(context.cant || 0);
+    const snapshotUnidadId = toPositiveInt(context.id_unidad_medida);
+    const hasSnapshotInventory = snapshotInsumoId && snapshotFactor > 0;
+
+    if (hasSnapshotInventory) {
+      addToMapTotal(insumoQtyMap, snapshotInsumoId, Number(extraQtyMap.get(idExtra) || 0) * snapshotFactor);
+      continue;
+    }
+
     const row = extrasById.get(idExtra);
     if (!row) {
       faltantes.push({
         tipo_recurso: 'extra',
         id_recurso: idExtra,
         id_extra: idExtra,
-        ...firstContext(extraContextById, idExtra),
-        motivo: 'EXTRA_NO_ENCONTRADO',
-        mensaje: `El extra ${idExtra} no existe o no esta disponible.`
+        ...context,
+        motivo: 'EXTRA_SIN_CONFIGURACION_INVENTARIO',
+        mensaje: `El extra ${context.nombre || context.codigo || idExtra} no tiene configuracion de inventario disponible.`
       });
       continue;
     }
@@ -271,7 +296,7 @@ export const resolvePedidoConsumo = async ({ client, items }) => {
         tipo_recurso: 'extra',
         id_recurso: idExtra,
         id_extra: idExtra,
-        ...firstContext(extraContextById, idExtra),
+        ...context,
         nombre: row.nombre,
         codigo: row.codigo || null,
         motivo: 'EXTRA_INACTIVO',
@@ -279,18 +304,36 @@ export const resolvePedidoConsumo = async ({ client, items }) => {
       });
       continue;
     }
-    const insumoId = toPositiveInt(row.id_insumo);
-    const insumoFactor = Number(row.insumo_factor || 0);
+    const insumoId = toPositiveInt(row?.id_insumo);
+    const insumoFactor = Number(row?.insumo_factor || 0);
+    const unidadId = snapshotUnidadId || toPositiveInt(row?.id_unidad_medida);
+    const nombre = context.nombre || row?.nombre || null;
+    const codigo = context.codigo || row?.codigo || null;
     if (!insumoId || insumoFactor <= 0) {
       faltantes.push({
         tipo_recurso: 'extra',
         id_recurso: idExtra,
         id_extra: idExtra,
-        ...firstContext(extraContextById, idExtra),
-        nombre: row.nombre,
-        codigo: row.codigo || null,
+        ...context,
+        nombre,
+        codigo,
         motivo: 'EXTRA_SIN_CONFIGURACION_INVENTARIO',
-        mensaje: `El extra ${row.nombre || row.codigo || idExtra} no tiene id_insumo o cantidad de consumo configurada.`
+        mensaje: `El extra ${nombre || codigo || idExtra} no tiene id_insumo o cantidad de consumo configurada.`
+      });
+      continue;
+    }
+    if (!unidadId) {
+      faltantes.push({
+        tipo_recurso: 'extra',
+        id_recurso: idExtra,
+        id_extra: idExtra,
+        ...context,
+        nombre,
+        codigo,
+        id_insumo: insumoId,
+        cant: insumoFactor,
+        motivo: 'EXTRA_SIN_UNIDAD_MEDIDA',
+        mensaje: `El extra ${nombre || codigo || idExtra} no tiene unidad de medida configurada.`
       });
       continue;
     }

@@ -87,7 +87,12 @@ export const normalizePedidoPayload = (payload = {}) => {
         id_producto: tipoItem === ITEM_TYPES.PRODUCTO ? idItem : toPositiveInt(row.id_producto) || null,
         id_receta: tipoItem === ITEM_TYPES.RECETA ? idItem : toPositiveInt(row.id_receta) || null,
         id_combo: tipoItem === ITEM_TYPES.COMBO ? idItem : toPositiveInt(row.id_combo) || null,
-        id_extra: tipoItem === ITEM_TYPES.EXTRA ? idItem : toPositiveInt(row.id_extra) || null
+        id_extra: tipoItem === ITEM_TYPES.EXTRA ? idItem : toPositiveInt(row.id_extra) || null,
+        id_insumo: toPositiveInt(row.id_insumo) || null,
+        cant: toPositiveNumber(row.cant ?? row.cantidad_insumo) || null,
+        id_unidad_medida: toPositiveInt(row.id_unidad_medida) || null,
+        codigo: typeof row.codigo === 'string' ? row.codigo.trim() || null : null,
+        nombre: typeof row.nombre === 'string' ? row.nombre.trim() || null : null
       });
     }
   }

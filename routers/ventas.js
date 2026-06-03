@@ -3158,6 +3158,7 @@ const buildAllowedExtrasMap = async (client, { normalizedItems = [], idSucursal 
         me.estado,
         me.id_insumo,
         me.cant,
+        me.id_unidad_medida,
         i.cantidad AS stock_disponible,
         i.id_almacen
       FROM public.menu_extra_receta mer
@@ -3175,7 +3176,7 @@ const buildAllowedExtrasMap = async (client, { normalizedItems = [], idSucursal 
         AND COALESCE(mer.estado, true) = true
         AND (me.id_insumo IS NULL OR a.id_almacen IS NOT NULL)
     `
-    : `SELECT NULL::text AS tipo, NULL::int AS id_item, NULL::int AS id_extra, NULL::text AS codigo, NULL::text AS nombre, NULL::numeric AS precio_adicional, NULL::boolean AS estado, NULL::int AS id_insumo, NULL::numeric AS cant, NULL::numeric AS stock_disponible, NULL::int AS id_almacen WHERE false`;
+    : `SELECT NULL::text AS tipo, NULL::int AS id_item, NULL::int AS id_extra, NULL::text AS codigo, NULL::text AS nombre, NULL::numeric AS precio_adicional, NULL::boolean AS estado, NULL::int AS id_insumo, NULL::numeric AS cant, NULL::int AS id_unidad_medida, NULL::numeric AS stock_disponible, NULL::int AS id_almacen WHERE false`;
   const comboSql = hasMenuExtraCombo
     ? `
       SELECT
@@ -3188,6 +3189,7 @@ const buildAllowedExtrasMap = async (client, { normalizedItems = [], idSucursal 
         me.estado,
         me.id_insumo,
         me.cant,
+        me.id_unidad_medida,
         i.cantidad AS stock_disponible,
         i.id_almacen
       FROM public.menu_extra_combo mec
@@ -3205,7 +3207,7 @@ const buildAllowedExtrasMap = async (client, { normalizedItems = [], idSucursal 
         AND COALESCE(mec.estado, true) = true
         AND (me.id_insumo IS NULL OR a.id_almacen IS NOT NULL)
     `
-    : `SELECT NULL::text AS tipo, NULL::int AS id_item, NULL::int AS id_extra, NULL::text AS codigo, NULL::text AS nombre, NULL::numeric AS precio_adicional, NULL::boolean AS estado, NULL::int AS id_insumo, NULL::numeric AS cant, NULL::numeric AS stock_disponible, NULL::int AS id_almacen WHERE false`;
+    : `SELECT NULL::text AS tipo, NULL::int AS id_item, NULL::int AS id_extra, NULL::text AS codigo, NULL::text AS nombre, NULL::numeric AS precio_adicional, NULL::boolean AS estado, NULL::int AS id_insumo, NULL::numeric AS cant, NULL::int AS id_unidad_medida, NULL::numeric AS stock_disponible, NULL::int AS id_almacen WHERE false`;
 
   const cacheKey = `extras_allowed:s=${parseOptionalPositiveInt(idSucursal) || 0}:r=${buildVentasStaticCacheKey('recipes', recetaIds)}:c=${buildVentasStaticCacheKey('combos', comboIds)}:e=${buildVentasStaticCacheKey('extras', requestedExtraIds)}`;
   const rows = await fetchCachedVentasStaticRows(
@@ -3238,6 +3240,7 @@ const buildAllowedExtrasMap = async (client, { normalizedItems = [], idSucursal 
         estado: parseBooleanish(row.estado),
         id_insumo: parseOptionalPositiveInt(row.id_insumo),
         cantidad_insumo: Number(row.cant || 0),
+        id_unidad_medida: parseOptionalPositiveInt(row.id_unidad_medida),
         stock_disponible: row.stock_disponible === null || row.stock_disponible === undefined ? null : Number(row.stock_disponible),
         id_almacen: parseOptionalPositiveInt(row.id_almacen)
       }
@@ -3281,6 +3284,8 @@ const resolveLineExtras = ({ item, allowedExtrasMap }) => {
       subtotal: lineSubtotal,
       id_insumo: extra.id_insumo,
       cantidad_insumo: extra.id_insumo ? Number(extra.cantidad_insumo || 0) : null,
+      cant: extra.id_insumo ? Number(extra.cantidad_insumo || 0) : null,
+      id_unidad_medida: extra.id_unidad_medida,
       stock_disponible: extra.stock_disponible,
       id_almacen: extra.id_almacen
     });
@@ -3294,117 +3299,46 @@ const hasVentaExtras = (venta) =>
     (line) => Array.isArray(line?.extras_detalle) && line.extras_detalle.length > 0
   );
 
-const discountPedidoExtrasInventory = async ({ client, idPedido, idSucursal, lines = [], idUsuario = null }) => {
-  const extras = [];
-  for (const line of Array.isArray(lines) ? lines : []) {
-    for (const extra of Array.isArray(line?.extras_detalle) ? line.extras_detalle : []) {
-      if (!extra?.id_insumo) continue;
-      const cantidadInsumo = Number(extra.cantidad_insumo || 0);
-      const cantidadExtra = Number(extra.cantidad || 0);
-      if (cantidadInsumo <= 0 || cantidadExtra <= 0) continue;
-      extras.push({
-        id_extra: Number(extra.id_extra),
-        nombre: String(extra.nombre || 'Extra').trim(),
-        id_insumo: Number(extra.id_insumo),
-        cantidad: cantidadInsumo * cantidadExtra
-      });
-    }
-  }
-  if (!extras.length) return;
-
-  const already = await client.query(
-    `
-      SELECT 1
-      FROM public.movimientos_inventario
-      WHERE ref_origen = 'PEDIDO_EXTRA'
-        AND id_ref = $1
-      LIMIT 1
-    `,
-    [idPedido]
-  );
-  if (already.rowCount > 0) return;
-
-  const totalsByInsumo = new Map();
-  for (const extra of extras) {
-    const current = totalsByInsumo.get(extra.id_insumo) || { cantidad: 0, nombres: new Set() };
-    current.cantidad += Number(extra.cantidad || 0);
-    current.nombres.add(extra.nombre);
-    totalsByInsumo.set(extra.id_insumo, current);
-  }
-
-  const insumoIds = [...totalsByInsumo.keys()].sort((left, right) => left - right);
-  const lockedResult = await client.query(
-    `
-      SELECT
-        i.id_insumo,
-        i.nombre_insumo,
-        i.cantidad,
-        i.id_almacen
-      FROM public.insumos i
-      INNER JOIN public.almacenes a
-        ON a.id_almacen = i.id_almacen
-       AND a.id_sucursal = $2
-       AND COALESCE(a.estado, true) = true
-      WHERE i.id_insumo = ANY($1::int[])
-        AND COALESCE(i.estado, true) = true
-      FOR UPDATE OF i
-    `,
-    [insumoIds, idSucursal]
-  );
-  const insumosById = new Map(lockedResult.rows.map((row) => [Number(row.id_insumo), row]));
-
-  for (const idInsumo of insumoIds) {
-    const row = insumosById.get(idInsumo);
-    if (!row) {
-      throw {
-        httpStatus: 409,
-        code: 'VENTAS_EXTRA_INSUMO_INVALIDO',
-        publicMessage: 'No se pudo descontar inventario de extras por configuracion incompleta.'
-      };
-    }
-    const total = totalsByInsumo.get(idInsumo);
-    const salida = roundMoney(total.cantidad);
-    await client.query(
-      `
-        INSERT INTO public.movimientos_inventario (
-          tipo,
-          cantidad,
-          id_almacen,
-          id_producto,
-          id_insumo,
-          ref_origen,
-          id_ref,
-          descripcion
-        )
-        VALUES ('SALIDA', $1, $2, NULL, $3, 'PEDIDO_EXTRA', $4, $5)
-      `,
-      [
-        salida,
-        Number(row.id_almacen),
-        idInsumo,
-        idPedido,
-        `Descuento de extras por pedido #${idPedido}: ${[...total.nombres].join(', ')}${parseOptionalPositiveInt(idUsuario) ? ` - usuario ${idUsuario}` : ''}`
-      ]
-    );
-  }
-};
-
 const insertDetallePedidoExtras = async ({ client, idDetallePedido, extras = [] }) => {
   const detalleId = parseOptionalPositiveInt(idDetallePedido);
   const rows = (Array.isArray(extras) ? extras : []).filter((extra) => parseOptionalPositiveInt(extra?.id_extra) && Number(extra?.cantidad || 0) > 0);
   if (!detalleId || rows.length === 0) return;
   if (!(await hasTable(client, 'detalle_pedido_extras'))) return;
 
-  const values = buildBatchPlaceholders(rows.length, 6);
+  const values = buildBatchPlaceholders(rows.length, 11);
   const params = [];
   for (const extra of rows) {
+    const idExtra = Number(extra.id_extra);
+    const codigo = String(extra.codigo || '').trim() || null;
+    const nombre = String(extra.nombre || 'Extra').trim().slice(0, 120);
+    const cantidad = Number(extra.cantidad);
+    const precioUnitario = roundMoney(extra.precio_unitario);
+    const subtotal = roundMoney(extra.subtotal);
+    const idInsumo = parseOptionalPositiveInt(extra.id_insumo);
+    const cant = idInsumo ? Number(extra.cant ?? extra.cantidad_insumo ?? 0) || null : null;
+    const idUnidadMedida = idInsumo ? parseOptionalPositiveInt(extra.id_unidad_medida) : null;
     params.push(
       detalleId,
-      Number(extra.id_extra),
-      String(extra.nombre || 'Extra').trim().slice(0, 120),
-      Number(extra.cantidad),
-      roundMoney(extra.precio_unitario),
-      roundMoney(extra.subtotal)
+      idExtra,
+      codigo,
+      nombre,
+      cantidad,
+      precioUnitario,
+      subtotal,
+      idInsumo || null,
+      cant,
+      idUnidadMedida,
+      JSON.stringify({
+        id_extra: idExtra,
+        codigo,
+        nombre,
+        cantidad,
+        precio_unitario: precioUnitario,
+        subtotal,
+        id_insumo: idInsumo || null,
+        cant,
+        id_unidad_medida: idUnidadMedida
+      })
     );
   }
   await client.query(
@@ -3412,18 +3346,28 @@ const insertDetallePedidoExtras = async ({ client, idDetallePedido, extras = [] 
       INSERT INTO public.detalle_pedido_extras (
         id_detalle_pedido,
         id_extra,
+        codigo_extra_snapshot,
         nombre_extra_snapshot,
         cantidad,
         precio_unitario,
-        subtotal
+        subtotal,
+        id_insumo,
+        cant,
+        id_unidad_medida,
+        origen_snapshot
       )
       VALUES ${values}
       ON CONFLICT (id_detalle_pedido, id_extra)
       DO UPDATE SET
+        codigo_extra_snapshot = EXCLUDED.codigo_extra_snapshot,
         nombre_extra_snapshot = EXCLUDED.nombre_extra_snapshot,
         cantidad = EXCLUDED.cantidad,
         precio_unitario = EXCLUDED.precio_unitario,
         subtotal = EXCLUDED.subtotal,
+        id_insumo = EXCLUDED.id_insumo,
+        cant = EXCLUDED.cant,
+        id_unidad_medida = EXCLUDED.id_unidad_medida,
+        origen_snapshot = EXCLUDED.origen_snapshot,
         estado = true
     `,
     params
