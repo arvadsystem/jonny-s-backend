@@ -3,8 +3,10 @@ import pool from '../config/db-connection.js';
 import { checkPermission } from '../middleware/checkPermission.js';
 
 const router = express.Router();
-const MENU_VIEW_PERMISSIONS = ['MENU_VER'];
-const MENU_MUTATION_PERMISSIONS = ['MENU_VER'];
+const MENU_EXTRAS_VIEW_PERMISSIONS = ['MENU_EXTRAS_VER', 'MENU_VER'];
+const MENU_EXTRAS_CREATE_PERMISSIONS = ['MENU_EXTRAS_CREAR', 'MENU_VER'];
+const MENU_EXTRAS_EDIT_PERMISSIONS = ['MENU_EXTRAS_EDITAR', 'MENU_VER'];
+const MENU_EXTRAS_STATE_PERMISSIONS = ['MENU_EXTRAS_ESTADO_CAMBIAR', 'MENU_VER'];
 
 const isPositiveInt = (value) => {
   const parsed = Number(value);
@@ -185,7 +187,7 @@ const replaceExtraCombos = async (client, idExtra, comboIds = []) => {
   }
 };
 
-router.get('/', checkPermission(MENU_VIEW_PERMISSIONS), async (req, res) => {
+router.get('/', checkPermission(MENU_EXTRAS_VIEW_PERMISSIONS), async (req, res) => {
   try {
     const includeInactive = String(req.query?.incluir_inactivos || '') === '1';
     const result = await pool.query(
@@ -233,7 +235,7 @@ router.get('/', checkPermission(MENU_VIEW_PERMISSIONS), async (req, res) => {
   }
 });
 
-router.get('/catalogos/insumos', checkPermission(MENU_VIEW_PERMISSIONS), async (req, res) => {
+router.get('/catalogos/insumos', checkPermission(MENU_EXTRAS_VIEW_PERMISSIONS), async (req, res) => {
   try {
     const result = await pool.query(
       `
@@ -256,7 +258,7 @@ router.get('/catalogos/insumos', checkPermission(MENU_VIEW_PERMISSIONS), async (
   }
 });
 
-router.get('/catalogos/recetas', checkPermission(MENU_VIEW_PERMISSIONS), async (req, res) => {
+router.get('/catalogos/recetas', checkPermission(MENU_EXTRAS_VIEW_PERMISSIONS), async (req, res) => {
   try {
     const result = await pool.query(
       `
@@ -273,7 +275,7 @@ router.get('/catalogos/recetas', checkPermission(MENU_VIEW_PERMISSIONS), async (
   }
 });
 
-router.get('/catalogos/combos', checkPermission(MENU_VIEW_PERMISSIONS), async (req, res) => {
+router.get('/catalogos/combos', checkPermission(MENU_EXTRAS_VIEW_PERMISSIONS), async (req, res) => {
   try {
     const result = await pool.query(
       `
@@ -293,7 +295,7 @@ router.get('/catalogos/combos', checkPermission(MENU_VIEW_PERMISSIONS), async (r
   }
 });
 
-router.get('/:id_extra', checkPermission(MENU_VIEW_PERMISSIONS), async (req, res) => {
+router.get('/:id_extra', checkPermission(MENU_EXTRAS_VIEW_PERMISSIONS), async (req, res) => {
   try {
     const idExtra = Number(req.params.id_extra);
     if (!isPositiveInt(idExtra)) {
@@ -350,7 +352,7 @@ router.get('/:id_extra', checkPermission(MENU_VIEW_PERMISSIONS), async (req, res
   }
 });
 
-router.post('/', checkPermission(MENU_MUTATION_PERMISSIONS), async (req, res) => {
+router.post('/', checkPermission(MENU_EXTRAS_CREATE_PERMISSIONS), async (req, res) => {
   const client = await pool.connect();
   try {
     const normalized = normalizeExtraPayload(req.body);
@@ -396,7 +398,7 @@ router.post('/', checkPermission(MENU_MUTATION_PERMISSIONS), async (req, res) =>
   }
 });
 
-router.put('/:id_extra', checkPermission(MENU_MUTATION_PERMISSIONS), async (req, res) => {
+router.put('/:id_extra', checkPermission(MENU_EXTRAS_EDIT_PERMISSIONS), async (req, res) => {
   const client = await pool.connect();
   try {
     const idExtra = Number(req.params.id_extra);
@@ -459,7 +461,7 @@ router.put('/:id_extra', checkPermission(MENU_MUTATION_PERMISSIONS), async (req,
   }
 });
 
-router.patch('/:id_extra/estado', checkPermission(MENU_MUTATION_PERMISSIONS), async (req, res) => {
+router.patch('/:id_extra/estado', checkPermission(MENU_EXTRAS_STATE_PERMISSIONS), async (req, res) => {
   try {
     const idExtra = Number(req.params.id_extra);
     if (!isPositiveInt(idExtra)) {

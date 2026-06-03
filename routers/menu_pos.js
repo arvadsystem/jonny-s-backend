@@ -6,8 +6,11 @@ import { resolveMenuDepartmentIds } from './menu_departamentos.js';
 import { SUPABASE_ADMIN_BUCKET, SUPABASE_ASSETS_BUCKET } from '../utils/uploads.js';
 
 const router = express.Router(); // Inicializa router
-const MENU_VIEW_PERMISSIONS = ['MENU_VER'];
-const MENU_MUTATION_PERMISSIONS = ['MENU_VER'];
+const MENU_POS_VIEW_PERMISSIONS = ['MENU_POS_VER', 'MENU_VER'];
+const MENU_POS_ARCHIVOS_UPLOAD_PERMISSIONS = ['MENU_POS_ARCHIVOS_SUBIR', 'MENU_VER'];
+const MENU_POS_PRODUCT_IMAGE_PERMISSIONS = ['MENU_POS_PRODUCTOS_IMAGEN_EDITAR', 'MENU_VER'];
+const MENU_POS_COMBO_IMAGE_PERMISSIONS = ['MENU_POS_COMBOS_IMAGEN_EDITAR', 'MENU_VER'];
+const MENU_POS_ARCHIVOS_DELETE_PERMISSIONS = ['MENU_POS_ARCHIVOS_ELIMINAR', 'MENU_VER'];
 
 const getSafeServerErrorMessage = (fallback = 'Error interno del servidor.') => fallback;
 
@@ -145,7 +148,7 @@ const esProductoActivo = (estado) =>
 // GET: Categorias visibles del carrusel POS
 // URL: /menu-pos/categorias
 // =====================================================
-router.get('/menu-pos/categorias', checkPermission(MENU_VIEW_PERMISSIONS), async (req, res) => {
+router.get('/menu-pos/categorias', checkPermission(MENU_POS_VIEW_PERMISSIONS), async (req, res) => {
   try {
     // Resuelve IDs por nombre para evitar dependencia de IDs fijos.
     const departmentIds = await resolveMenuDepartmentIds();
@@ -219,7 +222,7 @@ router.get('/menu-pos/categorias', checkPermission(MENU_VIEW_PERMISSIONS), async
 // URL: /menu-pos/productos/:id_tipo_departamento
 // Ej: /menu-pos/productos/9  -> Tacos de Birria
 // =====================================================
-router.get('/menu-pos/productos/:id_tipo_departamento', checkPermission(MENU_VIEW_PERMISSIONS), async (req, res) => {
+router.get('/menu-pos/productos/:id_tipo_departamento', checkPermission(MENU_POS_VIEW_PERMISSIONS), async (req, res) => {
   try {
     // 1) Obtener id del departamento desde la URL
     const { id_tipo_departamento } = req.params;
@@ -281,7 +284,7 @@ router.use(menuPosCatalogoRouter);
 // URL: /menu-pos/archivos/upload
 // Nota: este endpoint registra metadata + URL pÃºblica (no maneja carga binaria)
 // =====================================================
-router.post('/menu-pos/archivos/upload', checkPermission(MENU_MUTATION_PERMISSIONS), async (req, res) => {
+router.post('/menu-pos/archivos/upload', checkPermission(MENU_POS_ARCHIVOS_UPLOAD_PERMISSIONS), async (req, res) => {
   try {
     const {
       nombre_original,
@@ -388,7 +391,7 @@ router.post('/menu-pos/archivos/upload', checkPermission(MENU_MUTATION_PERMISSIO
 // URL: /menu-pos/productos/:id_producto/imagen
 // Body: { id_archivo }
 // =====================================================
-router.put('/menu-pos/productos/:id_producto/imagen', checkPermission(MENU_MUTATION_PERMISSIONS), async (req, res) => {
+router.put('/menu-pos/productos/:id_producto/imagen', checkPermission(MENU_POS_PRODUCT_IMAGE_PERMISSIONS), async (req, res) => {
   try {
     const idProducto = Number(req.params.id_producto);
     const { id_archivo } = req.body || {};
@@ -475,7 +478,7 @@ router.put('/menu-pos/productos/:id_producto/imagen', checkPermission(MENU_MUTAT
 // URL: /menu-pos/combos/:id_combo/imagen
 // Body: { id_archivo }
 // =====================================================
-router.put('/menu-pos/combos/:id_combo/imagen', checkPermission(MENU_MUTATION_PERMISSIONS), async (req, res) => {
+router.put('/menu-pos/combos/:id_combo/imagen', checkPermission(MENU_POS_COMBO_IMAGE_PERMISSIONS), async (req, res) => {
   try {
     const idCombo = Number(req.params.id_combo);
     const { id_archivo } = req.body || {};
@@ -552,7 +555,7 @@ router.put('/menu-pos/combos/:id_combo/imagen', checkPermission(MENU_MUTATION_PE
 // PUT: Soft delete de archivo
 // URL: /menu-pos/archivos/:id_archivo/soft-delete
 // =====================================================
-router.put('/menu-pos/archivos/:id_archivo/soft-delete', checkPermission(MENU_MUTATION_PERMISSIONS), async (req, res) => {
+router.put('/menu-pos/archivos/:id_archivo/soft-delete', checkPermission(MENU_POS_ARCHIVOS_DELETE_PERMISSIONS), async (req, res) => {
   try {
     const idArchivo = Number(req.params.id_archivo);
 

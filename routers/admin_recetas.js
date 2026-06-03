@@ -28,8 +28,11 @@ import {
 } from './admin_recetas_helpers.js';
 
 const router = express.Router();
-const MENU_VIEW_PERMISSIONS = ['MENU_VER'];
-const MENU_MUTATION_PERMISSIONS = ['MENU_VER'];
+// AM: transicion segura a permisos granulares sin romper el acceso actual mientras se alinea BD/roles.
+const MENU_RECETAS_VIEW_PERMISSIONS = ['MENU_RECETAS_VER', 'MENU_VER'];
+const MENU_RECETAS_CREATE_PERMISSIONS = ['MENU_RECETAS_CREAR', 'MENU_VER'];
+const MENU_RECETAS_EDIT_PERMISSIONS = ['MENU_RECETAS_EDITAR', 'MENU_VER'];
+const MENU_RECETAS_STATE_PERMISSIONS = ['MENU_RECETAS_ESTADO_CAMBIAR', 'MENU_VER'];
 const MENU_RECETAS_UPLOADS_SUBDIR = 'menu/recetas';
 const BASE64_BODY_REGEX = /^[A-Za-z0-9+/]+={0,2}$/;
 
@@ -301,7 +304,7 @@ const reemplazarDetalleReceta = async (client, idReceta, detalle) => {
 };
 
 // GET: listar recetas.
-router.get('/', checkPermission(MENU_VIEW_PERMISSIONS), async (req, res) => {
+router.get('/', checkPermission(MENU_RECETAS_VIEW_PERMISSIONS), async (req, res) => {
   try {
     const result = await pool.query(
       `
@@ -348,7 +351,7 @@ router.get('/', checkPermission(MENU_VIEW_PERMISSIONS), async (req, res) => {
 });
 
 // GET: catalogo de insumos activos para armar detalle de receta.
-router.get('/catalogos/insumos', checkPermission(MENU_VIEW_PERMISSIONS), async (req, res) => {
+router.get('/catalogos/insumos', checkPermission(MENU_RECETAS_VIEW_PERMISSIONS), async (req, res) => {
   try {
     const result = await pool.query(
       `
@@ -376,7 +379,7 @@ router.get('/catalogos/insumos', checkPermission(MENU_VIEW_PERMISSIONS), async (
 });
 
 // GET: detalle de insumos de una receta.
-router.get('/:id_receta/detalle', checkPermission(MENU_VIEW_PERMISSIONS), async (req, res) => {
+router.get('/:id_receta/detalle', checkPermission(MENU_RECETAS_VIEW_PERMISSIONS), async (req, res) => {
   try {
     const idReceta = Number(req.params.id_receta);
     if (!esEnteroPositivo(idReceta)) {
@@ -420,7 +423,7 @@ router.get('/:id_receta/detalle', checkPermission(MENU_VIEW_PERMISSIONS), async 
 });
 
 // GET: contexto completo de edicion para reducir roundtrips del modal (receta + detalle + catalogo insumos).
-router.get('/:id_receta/contexto-edicion', checkPermission(MENU_VIEW_PERMISSIONS), async (req, res) => {
+router.get('/:id_receta/contexto-edicion', checkPermission(MENU_RECETAS_VIEW_PERMISSIONS), async (req, res) => {
   try {
     const idReceta = Number(req.params.id_receta);
     if (!esEnteroPositivo(idReceta)) {
@@ -492,7 +495,7 @@ router.get('/:id_receta/contexto-edicion', checkPermission(MENU_VIEW_PERMISSIONS
 });
 
 // PUT: reemplazar detalle de insumos de una receta.
-router.put('/:id_receta/detalle', checkPermission(MENU_MUTATION_PERMISSIONS), async (req, res) => {
+router.put('/:id_receta/detalle', checkPermission(MENU_RECETAS_EDIT_PERMISSIONS), async (req, res) => {
   const client = await pool.connect();
 
   try {
@@ -539,7 +542,7 @@ router.put('/:id_receta/detalle', checkPermission(MENU_MUTATION_PERMISSIONS), as
 });
 
 // GET: obtener receta por id.
-router.get('/:id_receta', checkPermission(MENU_VIEW_PERMISSIONS), async (req, res) => {
+router.get('/:id_receta', checkPermission(MENU_RECETAS_VIEW_PERMISSIONS), async (req, res) => {
   try {
     const idReceta = Number(req.params.id_receta);
     if (!esEnteroPositivo(idReceta)) {
@@ -562,7 +565,7 @@ router.get('/:id_receta', checkPermission(MENU_VIEW_PERMISSIONS), async (req, re
 });
 
 // POST: crear receta.
-router.post('/', checkPermission(MENU_MUTATION_PERMISSIONS), async (req, res) => {
+router.post('/', checkPermission(MENU_RECETAS_CREATE_PERMISSIONS), async (req, res) => {
   const client = await pool.connect();
 
   try {
@@ -724,7 +727,7 @@ router.post('/', checkPermission(MENU_MUTATION_PERMISSIONS), async (req, res) =>
 });
 
 // PUT: actualizar receta completa por id.
-router.put('/:id_receta', checkPermission(MENU_MUTATION_PERMISSIONS), async (req, res) => {
+router.put('/:id_receta', checkPermission(MENU_RECETAS_EDIT_PERMISSIONS), async (req, res) => {
   const client = await pool.connect();
 
   try {
@@ -859,7 +862,7 @@ router.put('/:id_receta', checkPermission(MENU_MUTATION_PERMISSIONS), async (req
 });
 
 // PATCH: actualizar solo estado por id; id_usuario se toma de req.user.
-router.patch('/:id_receta/estado', checkPermission(MENU_MUTATION_PERMISSIONS), async (req, res) => {
+router.patch('/:id_receta/estado', checkPermission(MENU_RECETAS_STATE_PERMISSIONS), async (req, res) => {
   const client = await pool.connect();
 
   try {

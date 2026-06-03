@@ -8,8 +8,10 @@ import {
 } from '../services/publicMenuHeroCarouselConfigService.js';
 
 const router = express.Router();
-const MENU_VIEW_PERMISSIONS = ['MENU_VER'];
-const MENU_MUTATION_PERMISSIONS = ['MENU_VER'];
+// AM: transicion segura a permisos granulares sin romper el acceso actual mientras se alinea BD/roles.
+const MENU_PUBLICACION_VIEW_PERMISSIONS = ['MENU_PUBLICACION_VER', 'MENU_VER'];
+const MENU_PUBLICACION_SAVE_PERMISSIONS = ['MENU_PUBLICACION_GUARDAR', 'MENU_VER'];
+const MENU_TEMPORADA_CREATE_PERMISSIONS = ['MENU_TEMPORADA_CREAR', 'MENU_VER'];
 
 const ITEM_TYPES = Object.freeze({
   PRODUCTO: 'PRODUCTO',
@@ -821,7 +823,7 @@ const getVisibleCountByMenu = async ({ idMenu, capabilities, client }) => {
 };
 
 // Lista sucursales operativas para el selector de publicaciÃƒÂ³n.
-router.get('/sucursales', checkPermission(MENU_VIEW_PERMISSIONS), async (_req, res) => {
+router.get('/sucursales', checkPermission(MENU_PUBLICACION_VIEW_PERMISSIONS), async (_req, res) => {
   try {
     const rows = await getBranchesForPublication();
     return res.status(200).json({ ok: true, data: rows });
@@ -833,7 +835,7 @@ router.get('/sucursales', checkPermission(MENU_VIEW_PERMISSIONS), async (_req, r
 
 // Retorna el catÃƒÂ¡logo unificado con estado actual de publicaciÃƒÂ³n por sucursal.
 // Lista menus disponibles para programar vigencias por sucursal.
-router.get('/menus', checkPermission(MENU_VIEW_PERMISSIONS), async (_req, res) => {
+router.get('/menus', checkPermission(MENU_PUBLICACION_VIEW_PERMISSIONS), async (_req, res) => {
   try {
     const rows = await getMenusForProgramming();
     return res.status(200).json({ ok: true, data: rows });
@@ -844,7 +846,7 @@ router.get('/menus', checkPermission(MENU_VIEW_PERMISSIONS), async (_req, res) =
 });
 
 // AM: lee configuracion global del carrusel hero usada por menu publico.
-router.get('/carrusel-config', checkPermission(MENU_VIEW_PERMISSIONS), async (_req, res) => {
+router.get('/carrusel-config', checkPermission(MENU_PUBLICACION_VIEW_PERMISSIONS), async (_req, res) => {
   try {
     const config = await getPublicMenuHeroCarouselConfig();
     return res.status(200).json({ ok: true, data: config });
@@ -855,7 +857,7 @@ router.get('/carrusel-config', checkPermission(MENU_VIEW_PERMISSIONS), async (_r
 });
 
 // AM: guarda configuracion global del carrusel hero para todas las sucursales.
-router.put('/carrusel-config', checkPermission(MENU_MUTATION_PERMISSIONS), async (req, res) => {
+router.put('/carrusel-config', checkPermission(MENU_PUBLICACION_SAVE_PERMISSIONS), async (req, res) => {
   const client = await pool.connect();
   try {
     const payload = req.body;
@@ -893,12 +895,15 @@ router.put('/carrusel-config', checkPermission(MENU_MUTATION_PERMISSIONS), async
 });
 
 // Crea un menu nuevo para temporadas desde el panel admin sin SQL manual.
-router.post('/menus', checkPermission(MENU_MUTATION_PERMISSIONS), async (req, res) => {
+router.post('/menus', checkPermission(MENU_TEMPORADA_CREATE_PERMISSIONS), async (req, res) => {
   try {
     const nombreMenu = String(req.body?.nombre_menu ?? '').replace(/\s+/g, ' ').trim();
     const descripcionRaw = String(req.body?.descripcion ?? '').trim();
     const descripcion = descripcionRaw || null;
     const idUsuario = getAuthenticatedUserId(req) || null;
+    if (!idUsuario) {
+      return res.status(401).json({ ok: false, message: 'No se pudo identificar el usuario autenticado para crear el menu.' });
+    }
 
     if (!nombreMenu || nombreMenu.length < 3) {
       return res.status(400).json({ ok: false, message: 'nombre_menu es obligatorio y debe tener al menos 3 caracteres.' });
@@ -965,7 +970,7 @@ router.post('/menus', checkPermission(MENU_MUTATION_PERMISSIONS), async (req, re
 });
 
 // Programa un menu por sucursal para una fecha/hora especifica.
-router.post('/programacion', checkPermission(MENU_MUTATION_PERMISSIONS), async (req, res) => {
+router.post('/programacion', checkPermission(MENU_PUBLICACION_SAVE_PERMISSIONS), async (req, res) => {
   const client = await pool.connect();
   try {
     const idSucursal = toPositiveInt(req.body?.id_sucursal);
@@ -1119,7 +1124,7 @@ router.post('/programacion', checkPermission(MENU_MUTATION_PERMISSIONS), async (
   }
 });
 
-router.get('/catalogo', checkPermission(MENU_VIEW_PERMISSIONS), async (req, res) => {
+router.get('/catalogo', checkPermission(MENU_PUBLICACION_VIEW_PERMISSIONS), async (req, res) => {
   try {
     const idSucursal = toPositiveInt(req.query.id_sucursal);
     const idMenuQuery = toPositiveInt(req.query.id_menu);
@@ -1138,6 +1143,10 @@ router.get('/catalogo', checkPermission(MENU_VIEW_PERMISSIONS), async (req, res)
 
     if (!branch) {
       return res.status(404).json({ ok: false, message: 'La sucursal no existe.' });
+    }
+
+    if (!branch.estado) {
+      return res.status(409).json({ ok: false, message: 'La sucursal esta inactiva y no admite publicacion administrativa.' });
     }
 
     const warnings = [];
@@ -1213,7 +1222,7 @@ router.get('/catalogo', checkPermission(MENU_VIEW_PERMISSIONS), async (req, res)
 });
 
 // Preview administrativo del menu por sucursal/menu seleccionado.
-router.get('/preview', checkPermission(MENU_VIEW_PERMISSIONS), async (req, res) => {
+router.get('/preview', checkPermission(MENU_PUBLICACION_VIEW_PERMISSIONS), async (req, res) => {
   try {
     const idSucursal = toPositiveInt(req.query.id_sucursal);
     const idMenuQuery = toPositiveInt(req.query.id_menu);
@@ -1231,6 +1240,10 @@ router.get('/preview', checkPermission(MENU_VIEW_PERMISSIONS), async (req, res) 
 
     if (!branch) {
       return res.status(404).json({ ok: false, message: 'La sucursal no existe.' });
+    }
+
+    if (!branch.estado) {
+      return res.status(409).json({ ok: false, message: 'La sucursal esta inactiva y no admite preview administrativo.' });
     }
 
     let resolvedMenu = activeMenu;
@@ -1312,7 +1325,7 @@ router.get('/preview', checkPermission(MENU_VIEW_PERMISSIONS), async (req, res) 
 });
 
 // Guarda cambios de publicacion para una sucursal en el menu vigente.
-router.put('/catalogo', checkPermission(MENU_MUTATION_PERMISSIONS), async (req, res) => {
+router.put('/catalogo', checkPermission(MENU_PUBLICACION_SAVE_PERMISSIONS), async (req, res) => {
   const client = await pool.connect();
   try {
     const idSucursal = toPositiveInt(req.query.id_sucursal);
@@ -1324,6 +1337,14 @@ router.put('/catalogo', checkPermission(MENU_MUTATION_PERMISSIONS), async (req, 
     const normalized = normalizeDraftItems(req.body?.items);
     if (!normalized.ok) {
       return res.status(400).json({ ok: false, message: normalized.message });
+    }
+
+    const branch = await getBranchById(idSucursal);
+    if (!branch) {
+      return res.status(404).json({ ok: false, message: 'La sucursal no existe.' });
+    }
+    if (!branch.estado) {
+      return res.status(409).json({ ok: false, message: 'La sucursal esta inactiva y no admite guardar publicacion.' });
     }
 
     const activeMenu = await getActiveMenuByBranch(idSucursal);

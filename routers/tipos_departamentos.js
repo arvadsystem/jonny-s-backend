@@ -1,12 +1,17 @@
 import express from 'express';
 import pool from '../config/db-connection.js';
+import { checkPermission } from '../middleware/checkPermission.js';
 
 const router = express.Router();
+const MENU_DEPARTAMENTOS_VIEW_PERMISSIONS = ['MENU_DEPARTAMENTOS_VER', 'MENU_VER'];
+const MENU_DEPARTAMENTOS_CREATE_PERMISSIONS = ['MENU_DEPARTAMENTOS_CREAR', 'MENU_VER'];
+const MENU_DEPARTAMENTOS_EDIT_PERMISSIONS = ['MENU_DEPARTAMENTOS_EDITAR', 'MENU_VER'];
+const MENU_DEPARTAMENTOS_DELETE_PERMISSIONS = ['MENU_DEPARTAMENTOS_ELIMINAR', 'MENU_VER'];
 
 // =====================================================
 // GET: LISTAR TIPO_DEPARTAMENTO
 // =====================================================
-router.get('/tipo_departamento', async (req, res) => {
+router.get('/tipo_departamento', checkPermission(MENU_DEPARTAMENTOS_VIEW_PERMISSIONS), async (req, res) => {
   try {
     const tabla = 'tipo_departamento';
     const columnas = 'id_tipo_departamento,nombre_departamento,descripcion,estado';
@@ -27,7 +32,7 @@ router.get('/tipo_departamento', async (req, res) => {
 // BODY ESPERADO (EJEMPLO):
 // { "nombre_departamento": "Hamburguesas", "descripcion": "...", "estado": true }
 // =====================================================
-router.post('/tipo_departamento', async (req, res) => {
+router.post('/tipo_departamento', checkPermission(MENU_DEPARTAMENTOS_CREATE_PERMISSIONS), async (req, res) => {
   try {
     const tabla = 'tipo_departamento';
     const datos = req.body;
@@ -57,7 +62,7 @@ router.post('/tipo_departamento', async (req, res) => {
 //   "id_valor": 2
 // }
 // =====================================================
-router.put('/tipo_departamento', async (req, res) => {
+router.put('/tipo_departamento', checkPermission(MENU_DEPARTAMENTOS_EDIT_PERMISSIONS), async (req, res) => {
   try {
     const { campo, valor, id_campo, id_valor } = req.body;
 
@@ -89,7 +94,7 @@ router.put('/tipo_departamento', async (req, res) => {
 // BODY ESPERADO:
 // { "columna_id": "id_tipo_departamento", "valor_id": 2 }
 // =====================================================
-router.delete('/tipo_departamento', async (req, res) => {
+router.delete('/tipo_departamento', checkPermission(MENU_DEPARTAMENTOS_DELETE_PERMISSIONS), async (req, res) => {
   try {
     const { columna_id, valor_id } = req.body;
 
