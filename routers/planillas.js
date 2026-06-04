@@ -4365,12 +4365,13 @@ const planillaService = {
       [idPlanilla]
     );
     const estadoActual = normalizeEstadoAlias(estadoActualResult.rows?.[0]?.estado_planilla);
-    if (estadoActual === 'ANULADA' && normalizeEstadoAlias(estadoInfo.descripcion) !== 'ANULADA') {
+    const estadoDestino = normalizeEstadoAlias(estadoInfo.descripcion);
+    if (estadoActual === 'ANULADA' && !['ANULADA', 'BORRADOR', 'CALCULADA'].includes(estadoDestino)) {
       return {
         status: 409,
         body: buildErrorBody({
           code: 'PLANILLA_ANULADA',
-          message: 'La planilla anulada no puede cambiar de estado.'
+          message: 'La planilla anulada solo puede reabrirse a borrador o calculada antes de continuar el flujo.'
         })
       };
     }
