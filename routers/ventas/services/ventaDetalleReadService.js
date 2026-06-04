@@ -3,6 +3,10 @@ import {
   normalizeObservation,
   parseOptionalPositiveInt
 } from '../utils/parseUtils.js';
+import {
+  VENTA_DIRECTA_LABEL,
+  VENTAS_LIMIT_72H_CUTOFF_SQL
+} from '../constants.js';
 
 const tableExistsCache = new Map();
 
@@ -152,6 +156,167 @@ export const buildKitchenSaleDetailItems = (rows) =>
     descuento_global: roundMoney(row.descuento_global),
     observacion: normalizeObservation(row.observacion)
   }));
+
+export const fetchVentaDetailHeader = async (
+  client,
+  { idFactura, limitedToLast72Hours, allowedSucursalIds }
+) =>
+  client.query(
+    `
+      SELECT
+        f.id_factura,
+        f.codigo_venta,
+        f.fecha_operacion,
+        f.id_pedido,
+        p.descripcion_pedido,
+        p.descripcion_envio,
+        COALESCE(p.fecha_hora_pedido, f.fecha_hora_facturacion) AS fecha_hora_pedido,
+        COALESCE(p.sub_total, df_info.subtotal_neto, 0) AS sub_total,
+        0::numeric(12,2) AS isv,
+        COALESCE(
+          df_info.subtotal_neto,
+          p.total,
+          0
+        ) AS total,
+        p.id_estado_pedido,
+        CASE
+          WHEN p.id_pedido IS NULL THEN '${VENTA_DIRECTA_LABEL}'
+          ELSE ep.descripcion
+        END AS estado_pedido,
+        COALESCE(p.id_sucursal, f.id_sucursal) AS id_sucursal,
+        s.nombre_sucursal,
+        COALESCE(p.id_cliente, f.id_cliente) AS id_cliente,
+        COALESCE(
+          NULLIF(trim(concat_ws(' ', per.nombre, per.apellido)), ''),
+          emp.nombre_empresa,
+          'Consumidor final'
+        ) AS cliente_nombre,
+        COALESCE(NULLIF(trim(per.rtn), ''), NULLIF(trim(emp.rtn), '')) AS cliente_rtn,
+        COALESCE(p.id_usuario, f.id_usuario) AS id_usuario,
+        u.nombre_usuario,
+        f.id_caja,
+        cj.nombre_caja,
+        cj.codigo_caja,
+        f.id_sesion_caja,
+        UPPER(TRIM(cse_sesion.codigo)) AS caja_sesion_estado_codigo,
+        cse_sesion.nombre AS caja_sesion_estado_nombre,
+        cses.fecha_cierre AS caja_sesion_fecha_cierre,
+        COALESCE((
+          UPPER(TRIM(cse_sesion.codigo)) = 'ABIERTA'
+          AND cses.fecha_cierre IS NULL
+        ), false) AS caja_sesion_abierta,
+        f.efectivo_entregado,
+        f.cambio,
+        f.fecha_hora_facturacion,
+        0::numeric(12,2) AS isv_15,
+        0::numeric(12,2) AS isv_18,
+        f.id_config_facturacion,
+        f.id_rango_cai,
+        f.numero_factura_fiscal,
+        f.facturacion_snapshot,
+        0::numeric(12,2) AS gravado_15,
+        0::numeric(12,2) AS gravado_18,
+        0::numeric(12,2) AS exento,
+        0::numeric(12,2) AS total_isv,
+        fc_info.metodo_pago,
+        fc_info.codigo_transaccion,
+        NULL::varchar AS banco,
+        NULL::numeric AS exonerado,
+        emp_info.nombre_empresa AS nombre_emisor,
+        emp_info.rtn AS rtn_emisor,
+        frc.cai,
+        frc.numero_desde,
+        frc.numero_hasta,
+        frc.fecha_limite_emision,
+        cfg.modo_fiscal,
+        cfg.ancho_ticket_mm,
+        cfg.mostrar_logo_ticket,
+        COALESCE(df_info.total_items, 0) AS total_items,
+        COALESCE(df_info.descuento_total, 0) AS descuento_total
+      FROM facturas f
+      LEFT JOIN pedidos p ON p.id_pedido = f.id_pedido
+      LEFT JOIN estados_pedido ep ON ep.id_estado_pedido = p.id_estado_pedido
+      LEFT JOIN sucursales s ON s.id_sucursal = COALESCE(p.id_sucursal, f.id_sucursal)
+      LEFT JOIN direcciones ds ON ds.id_direccion = s.id_direccion
+      LEFT JOIN telefonos ts ON ts.id_telefono = s.id_telefono
+      LEFT JOIN correos csuc ON csuc.id_correo = s.id_correo
+      LEFT JOIN clientes c ON c.id_cliente = COALESCE(p.id_cliente, f.id_cliente)
+      LEFT JOIN personas per ON per.id_persona = c.id_persona
+      LEFT JOIN empresas emp ON emp.id_empresa = c.id_empresa
+      LEFT JOIN usuarios u ON u.id_usuario = COALESCE(p.id_usuario, f.id_usuario)
+      LEFT JOIN cajas cj ON cj.id_caja = f.id_caja
+      LEFT JOIN cajas_sesiones cses ON cses.id_sesion_caja = f.id_sesion_caja
+      LEFT JOIN cat_cajas_sesiones_estados cse_sesion
+        ON cse_sesion.id_estado_sesion_caja = cses.id_estado_sesion_caja
+      LEFT JOIN LATERAL (
+        SELECT e.nombre_empresa, e.rtn
+        FROM empresas e
+        WHERE COALESCE(e.estado, true) = true
+        ORDER BY e.id_empresa
+        LIMIT 1
+      ) emp_info ON true
+      LEFT JOIN LATERAL (
+        SELECT
+          frc.id_rango_cai,
+          frc.cai,
+          frc.numero_desde,
+          frc.numero_hasta,
+          frc.fecha_limite_emision
+        FROM facturacion_rangos_cai frc
+        WHERE frc.id_sucursal = COALESCE(p.id_sucursal, f.id_sucursal)
+          AND COALESCE(UPPER(TRIM(frc.estado)), 'ACTIVO') IN ('ACTIVO', 'VIGENTE')
+        ORDER BY frc.id_rango_cai DESC
+        LIMIT 1
+      ) frc ON true
+      LEFT JOIN LATERAL (
+        SELECT
+          cfg.modo_fiscal,
+          cfg.ancho_ticket_mm,
+          cfg.mostrar_logo_ticket
+        FROM facturacion_config_sucursal cfg
+        WHERE cfg.id_sucursal = COALESCE(p.id_sucursal, f.id_sucursal)
+          AND COALESCE(cfg.activo, true) = true
+        ORDER BY cfg.id_config DESC
+        LIMIT 1
+      ) cfg ON true
+      LEFT JOIN LATERAL (
+        SELECT
+          STRING_AGG(DISTINCT cmp.nombre, ', ' ORDER BY cmp.nombre) AS metodo_pago,
+          STRING_AGG(
+            DISTINCT NULLIF(TRIM(fc.referencia), ''),
+            ', ' ORDER BY NULLIF(TRIM(fc.referencia), '')
+          ) AS codigo_transaccion
+        FROM facturas_cobros fc
+        INNER JOIN cat_metodos_pago cmp
+          ON cmp.id_metodo_pago = fc.id_metodo_pago
+        WHERE fc.id_factura = f.id_factura
+      ) fc_info ON true
+      LEFT JOIN LATERAL (
+        SELECT
+          SUM(COALESCE(df.cantidad, 0))::int AS total_items,
+          COALESCE(SUM(df.total_detalle), 0)::numeric(12,2) AS subtotal_neto,
+          COALESCE(SUM(d.monto_descuento), 0)::numeric(12,2) AS descuento_total
+        FROM detalle_facturas df
+        LEFT JOIN descuentos d ON d.id_descuento = df.id_descuento
+        WHERE df.id_factura = f.id_factura
+      ) df_info ON true
+      WHERE f.id_factura = $1
+        AND (
+          $2::boolean = false
+          OR (
+            f.fecha_hora_facturacion IS NOT NULL
+            AND f.fecha_hora_facturacion >= ${VENTAS_LIMIT_72H_CUTOFF_SQL}
+          )
+        )
+        AND COALESCE(p.id_sucursal, f.id_sucursal) = ANY($3::int[])
+      LIMIT 1
+    `,
+    [
+      idFactura,
+      limitedToLast72Hours,
+      allowedSucursalIds
+    ]
+  );
 
 export const fetchDetalleFacturaExtras = async (client, detalleFacturaIds = []) => {
   const ids = [...new Set((Array.isArray(detalleFacturaIds) ? detalleFacturaIds : [])
