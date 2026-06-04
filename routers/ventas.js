@@ -4035,6 +4035,7 @@ const fetchCuentaDividida = async (client, { idFactura = null, idPedido = null }
 };
 
 const hydrateVentaLines = async (client, normalizedItems, perf = null, options = {}) => {
+  const validateProductStock = options?.validateProductStock !== false;
   const productoIds = [
     ...new Set(
       normalizedItems
@@ -4086,27 +4087,29 @@ const hydrateVentaLines = async (client, normalizedItems, perf = null, options =
   perf?.add?.('validation_extras_ms', extrasStart);
 
   const totalsItemsStart = perf?.now?.() || 0;
-  const productoQtyById = aggregateProductoQuantities(normalizedItems);
-  for (const [idProducto, requestedQty] of productoQtyById.entries()) {
-    const producto = productoMap.get(idProducto);
-    if (!producto) {
-      return {
-        ok: false,
-        status: 400,
-        body: { error: true, message: `Producto no encontrado: ${idProducto}` }
-      };
-    }
+  if (validateProductStock) {
+    const productoQtyById = aggregateProductoQuantities(normalizedItems);
+    for (const [idProducto, requestedQty] of productoQtyById.entries()) {
+      const producto = productoMap.get(idProducto);
+      if (!producto) {
+        return {
+          ok: false,
+          status: 400,
+          body: { error: true, message: `Producto no encontrado: ${idProducto}` }
+        };
+      }
 
-    const availableQty = Number(producto.cantidad ?? 0);
-    if (availableQty < requestedQty) {
-      return {
-        ok: false,
-        status: 409,
-        body: {
-          error: true,
-          message: `Stock insuficiente para ${producto.nombre_producto || `producto ${idProducto}`}. Disponible: ${availableQty}, solicitado: ${requestedQty}.`
-        }
-      };
+      const availableQty = Number(producto.cantidad ?? 0);
+      if (availableQty < requestedQty) {
+        return {
+          ok: false,
+          status: 409,
+          body: {
+            error: true,
+            message: `Stock insuficiente para ${producto.nombre_producto || `producto ${idProducto}`}. Disponible: ${availableQty}, solicitado: ${requestedQty}.`
+          }
+        };
+      }
     }
   }
 
@@ -4448,7 +4451,10 @@ const buildPedidoPendientePayload = async ({ client, body, userId, sucursalScope
   const normalizedItemsResult = normalizeVentaItems(buildPedidoPendienteItemsBody(body));
   perf?.add?.('validation_items_ms', validationItemsStart);
   if (!normalizedItemsResult.ok) return { ok: false, status: 400, body: { error: true, message: normalizedItemsResult.message } };
-  const hydratedResult = await hydrateVentaLines(client, normalizedItemsResult.data, perf, { idSucursal });
+  const hydratedResult = await hydrateVentaLines(client, normalizedItemsResult.data, perf, {
+    idSucursal,
+    validateProductStock: false
+  });
   if (!hydratedResult.ok) return hydratedResult;
 
   const { lines, subTotals } = hydratedResult.data;
