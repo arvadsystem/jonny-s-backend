@@ -22,190 +22,70 @@ import {
 import {
   listarAlertasInventarioPedido
 } from '../services/inventarioAlertasService.js';
+import {
+  DESCUENTO_ALCANCE_KEYS,
+  DESCUENTO_TIPO_KEYS,
+  ESTADO_PEDIDO_CODES,
+  PEDIDO_ESTADO_PAGO,
+  PEDIDO_MENU_PAYMENT_WINDOW_MINUTES,
+  PEDIDO_PAGADO_CONFIRMADO_ESTADO_PAGO,
+  PEDIDO_PENDIENTE_CANALES,
+  PEDIDO_PENDIENTE_ESTADO_DELIVERY,
+  PEDIDO_PENDIENTE_ESTADO_PAGO,
+  PEDIDO_PENDIENTE_MODALIDADES,
+  REVERSION_ALERT_EMAIL,
+  REVERSION_FAILURE_EMAIL_COOLDOWN_MS,
+  VENTA_COMPLEMENTO_TIPO_SALSAS,
+  VENTA_DIRECTA_LABEL,
+  VENTAS_DEFAULT_PAGE,
+  VENTAS_DEFAULT_PAGE_SIZE,
+  VENTAS_DESCUENTO_APLICAR_PERMISSION,
+  VENTAS_DESCUENTOS_PERMISSIONS,
+  VENTAS_DESCUENTOS_WRITE_PERMISSIONS,
+  VENTAS_FIDELIZACION_ADVISORY_LOCK_CLASS,
+  VENTAS_HISTORY_ADMIN_ROLES,
+  VENTAS_HISTORY_CAJERO_ROLE,
+  VENTAS_LIMIT_72H_CUTOFF_SQL,
+  VENTAS_MAX_PAGE_SIZE,
+  WINGS_SAUCE_KEYWORDS
+} from './ventas/constants.js';
+import { roundMoney } from './ventas/utils/moneyUtils.js';
+import {
+  coercePositiveIntArray,
+  isPlainObject,
+  normalizeDescuentoAlcance,
+  normalizeObservation,
+  normalizeRoleName,
+  normalizeSearchText,
+  normalizeTextKey,
+  normalizeTipoItem,
+  parseBooleanInput,
+  parseBooleanish,
+  parseBoundedPositiveInt,
+  parseComplementosPayload,
+  parseEntityIdentifier,
+  parseJsonArrayValue,
+  parseNonNegativeNumber,
+  parseOptionalDateInput,
+  parseOptionalDateTime,
+  parseOptionalPositiveInt,
+  parsePositiveInt,
+  parseRequiredPositiveInt,
+  parseVentaExtrasPayload
+} from './ventas/utils/parseUtils.js';
+import {
+  createVentasPerfTracker,
+  isVentasPerfEnabled,
+  isVentasRpcTransactionEnabled,
+  isVentasRpcV2Enabled,
+  logVentasPerfRoute,
+  logVentasPerfStartupIfEnabled,
+  measureVentasPerf
+} from './ventas/utils/perfUtils.js';
 
 const router = express.Router();
 
-const VENTA_DIRECTA_LABEL = 'VENTA DIRECTA';
-const TEGUCIGALPA_TZ = 'America/Tegucigalpa';
-const VENTAS_DEFAULT_PAGE = 1;
-const VENTAS_DEFAULT_PAGE_SIZE = 30;
-const VENTAS_MAX_PAGE_SIZE = 50;
-const VENTAS_HISTORY_ADMIN_ROLES = new Set(['SUPER_ADMIN', 'ADMINISTRADOR', 'ADMIN']);
-const VENTAS_HISTORY_CAJERO_ROLE = 'CAJERO';
-const VENTAS_LIMIT_72H_CUTOFF_SQL = `(NOW() AT TIME ZONE '${TEGUCIGALPA_TZ}') - INTERVAL '72 hours'`;
-const VENTAS_DESCUENTOS_PERMISSIONS = ['VENTAS_DESCUENTOS_CATALOGO_VER'];
-const VENTAS_DESCUENTOS_WRITE_PERMISSIONS = [
-  'VENTAS_DESCUENTOS_CATALOGO_CREAR',
-  'VENTAS_DESCUENTOS_CATALOGO_EDITAR',
-  'VENTAS_DESCUENTOS_CATALOGO_ESTADO_CAMBIAR'
-];
-const DESCUENTO_TIPO_KEYS = {
-  MONTO_FIJO: 'MONTO_FIJO',
-  PORCENTAJE: 'PORCENTAJE'
-};
-const DESCUENTO_ALCANCE_KEYS = {
-  FACTURA_COMPLETA: 'FACTURA_COMPLETA',
-  PRODUCTO: 'PRODUCTO',
-  RECETA: 'RECETA',
-  COMBO: 'COMBO'
-};
-const VENTAS_DESCUENTO_APLICAR_PERMISSION = 'VENTAS_DESCUENTO_APLICAR';
-const ESTADO_PEDIDO_CODES = {
-  PENDIENTE: new Set([
-    'pendiente',
-    'pendientes',
-    'por_pagar',
-    'pendiente_por_pagar',
-    'pendiente_/_por_pagar',
-    'pendientes_/_por_pagar'
-  ]),
-  EN_COCINA: new Set(['en_cocina']),
-  EN_PREPARACION: new Set(['en_preparacion']),
-  LISTO_PARA_ENTREGA: new Set(['listo_para_entrega']),
-  CANCELADO: new Set(['cancelado', 'cancelada', 'anulado', 'anulada']),
-  COMPLETADO: new Set([
-    'completada',
-    'completado',
-    'finalizada',
-    'finalizado',
-    'pagada',
-    'pagado',
-    'cerrada',
-    'cerrado',
-    'lista',
-    'listo'
-  ]),
-  NO_ENTREGADO: new Set(['no_entregado'])
-};
-const PEDIDO_MENU_PAYMENT_WINDOW_MINUTES = 10;
-const PEDIDO_ESTADO_PAGO = Object.freeze({
-  PENDIENTE_VALIDACION: 'PENDIENTE_VALIDACION',
-  PAGADO_CONFIRMADO: 'PAGADO_CONFIRMADO',
-  CANCELADO_TIMEOUT: 'CANCELADO_TIMEOUT'
-});
-const VENTAS_PERF_STAGE_NAMES = [
-  'auth_context_ms',
-  'auth_permission_ms',
-  'auth_scope_ms',
-  'auth_caja_ms',
-  'auth_sesion_caja_ms',
-  'auth_caja_sesion_combined_ms',
-  'auth_payload_context_ms',
-  'auth_payload_context_combined_ms',
-  'payload_build_ms',
-  'totals_ms',
-  'totals_catalogos_ms',
-  'totals_items_ms',
-  'totals_productos_ms',
-  'totals_recetas_ms',
-  'totals_combos_ms',
-  'totals_complementos_ms',
-  'totals_combo_components_ms',
-  'totals_sauce_rules_ms',
-  'totals_allowed_sauces_ms',
-  'totals_descuentos_ms',
-  'totals_extras_ms',
-  'validation_items_ms',
-  'validation_descuentos_ms',
-  'validation_extras_ms',
-  'catalog_prefetch_ms',
-  'catalog_cache_ms',
-  'totals_impuestos_ms',
-  'totals_build_ms',
-  'pedido_pendiente_build_ms',
-  'pedido_pendiente_contexto_ms',
-  'pedido_pendiente_detalle_ms',
-  'pedido_pendiente_contacto_ms',
-  'pedido_pendiente_pago_control_ms',
-  'registrar_pago_contexto_ms',
-  'registrar_pago_factura_cobro_ms',
-  'registrar_pago_detalle_final_ms',
-  'pedido_ms',
-  'detalle_pedido_ms',
-  'detalle_pedido_descuentos_ms',
-  'detalle_pedido_lookup_ms',
-  'detalle_pedido_reuse_hydrated_ms',
-  'detalle_pedido_insert_ms',
-  'factura_ms',
-  'factura_correlativo_ms',
-  'factura_correlativo_config_ms',
-  'factura_correlativo_rango_ms',
-  'factura_correlativo_numero_ms',
-  'factura_insert_ms',
-  'factura_snapshot_ms',
-  'factura_snapshot_config_ms',
-  'factura_snapshot_sucursal_ms',
-  'factura_snapshot_build_ms',
-  'detalle_factura_ms',
-  'detalle_factura_descuentos_ms',
-  'detalle_factura_lookup_ms',
-  'detalle_factura_insert_ms',
-  'detalle_factura_origen_ms',
-  'cobro_ms',
-  'inventario_ms',
-  'fidelizacion_ms',
-  'ticket_response_build_ms',
-  'pre_rpc_total_ms',
-  'rpc_payload_build_ms',
-  'rpc_call_ms',
-  'rpc_v2_payload_build_ms',
-  'rpc_v2_call_ms',
-  'rpc_v2_total_ms',
-  'post_rpc_total_ms',
-  'post_rpc_fidelizacion_ms',
-  'post_rpc_response_ms',
-  'node_before_rpc_ms',
-  'node_after_rpc_ms',
-  'rpc_total_ms',
-  'commit_ms'
-];
-
-const parseTruthyEnv = (value) =>
-  ['true', '1', 'yes', 'on'].includes(String(value || '').trim().toLowerCase());
-
-const isVentasPerfEnabled = () =>
-  process.env.NODE_ENV !== 'production' && parseTruthyEnv(process.env.VENTAS_PERF_LOGS);
-
-let ventasPerfStartupLogged = false;
-const logVentasPerfStartupIfEnabled = () => {
-  if (ventasPerfStartupLogged || !isVentasPerfEnabled()) return;
-  ventasPerfStartupLogged = true;
-  console.info('[ventas:perf:start]', {
-    NODE_ENV: process.env.NODE_ENV || null,
-    VENTAS_PERF_LOGS: process.env.VENTAS_PERF_LOGS || null,
-    VENTAS_USE_RPC_V2: process.env.VENTAS_USE_RPC_V2 || null,
-    VENTAS_USE_RPC_TRANSACTION: process.env.VENTAS_USE_RPC_TRANSACTION || null,
-    VENTAS_CATALOG_CACHE_TTL_MS: process.env.VENTAS_CATALOG_CACHE_TTL_MS || null,
-    EMAIL_SCHEDULER_ENABLED: process.env.EMAIL_SCHEDULER_ENABLED || null
-  });
-};
-
 setImmediate(logVentasPerfStartupIfEnabled);
-
-const logVentasPerfRoute = (route, extra = {}) => {
-  if (!isVentasPerfEnabled()) return;
-  console.info('[ventas:perf:route]', {
-    route,
-    ...extra
-  });
-};
-
-const VENTAS_PERF_COUNTER_NAMES = [
-  'cache_hits',
-  'cache_misses'
-];
-
-function isVentasRpcTransactionEnabled() {
-  return String(process.env.VENTAS_USE_RPC_TRANSACTION || '')
-    .trim()
-    .toLowerCase() === 'true';
-}
-
-function isVentasRpcV2Enabled() {
-  return String(process.env.VENTAS_USE_RPC_V2 || '')
-    .trim()
-    .toLowerCase() === 'true';
-}
 
 const buildBatchPlaceholders = (rowCount, columnCount, castsByColumn = {}) =>
   Array.from({ length: rowCount }, (_, rowIndex) => {
@@ -215,14 +95,6 @@ const buildBatchPlaceholders = (rowCount, columnCount, castsByColumn = {}) =>
     });
     return `(${placeholders.join(', ')})`;
   }).join(', ');
-const measureVentasPerf = async (perf, name, task) => {
-  const startedAt = perf?.now?.() || 0;
-  try {
-    return await task();
-  } finally {
-    perf?.add?.(name, startedAt);
-  }
-};
 
 const getVentasCatalogCacheTtlMs = () => {
   const rawValue = process.env.VENTAS_CATALOG_CACHE_TTL_MS;
@@ -284,118 +156,8 @@ const fetchCachedVentasStaticValue = async (cacheKey, loader, perf = null) => {
 
 const fetchCachedVentasStaticRows = async (cacheKey, loader, perf = null) =>
   fetchCachedVentasStaticValue(cacheKey, loader, perf);
-
-const createVentasPerfTracker = () => {
-  const enabled = isVentasPerfEnabled();
-  if (enabled) logVentasPerfStartupIfEnabled();
-  const startedAt = enabled ? performance.now() : 0;
-  const measures = Object.create(null);
-  const counters = Object.create(null);
-  let logged = false;
-
-  return {
-    enabled,
-    now() {
-      return enabled ? performance.now() : 0;
-    },
-    add(name, startedAtMs) {
-      if (!enabled || !startedAtMs) return;
-      const elapsed = Math.max(0, Math.round(performance.now() - startedAtMs));
-      measures[name] = (measures[name] || 0) + elapsed;
-    },
-    inc(name, by = 1) {
-      if (!enabled) return;
-      counters[name] = (counters[name] || 0) + Number(by || 1);
-    },
-    summary(extra = {}) {
-      const stages = VENTAS_PERF_STAGE_NAMES.reduce((acc, name) => {
-        acc[name] = measures[name] || 0;
-        return acc;
-      }, {});
-      const counterSummary = VENTAS_PERF_COUNTER_NAMES.reduce((acc, name) => {
-        acc[name] = counters[name] || 0;
-        return acc;
-      }, {});
-
-      return {
-        ...extra,
-        total_ms: enabled ? Math.max(0, Math.round(performance.now() - startedAt)) : 0,
-        ...stages,
-        ...counterSummary
-      };
-    },
-    log(extra = {}) {
-      if (!enabled) return;
-      logged = true;
-      console.info('[ventas:perf]', this.summary(extra));
-    },
-    logIfMissing(extra = {}) {
-      if (!enabled || logged) return;
-      this.log(extra);
-    },
-    hasLogged() {
-      return logged;
-    }
-  };
-};
-const PEDIDO_PENDIENTE_ESTADO_PAGO = 'PENDIENTE_PAGO';
-const PEDIDO_PAGADO_CONFIRMADO_ESTADO_PAGO = 'PAGADO_CONFIRMADO';
-const PEDIDO_PENDIENTE_ESTADO_DELIVERY = 'PENDIENTE';
-const PEDIDO_PENDIENTE_CANALES = new Set(['LOCAL', 'TELEFONO', 'WHATSAPP']);
-const PEDIDO_PENDIENTE_MODALIDADES = new Set(['CONSUMO_LOCAL', 'RECOGER', 'DELIVERY']);
-const REVERSION_ALERT_EMAIL = 'gersonmz@jonnyshn.com';
-const REVERSION_FAILURE_EMAIL_COOLDOWN_MS = 60 * 1000;
 const reversionFailureEmailCooldown = new Map();
-const VENTA_COMPLEMENTO_TIPO_SALSAS = 'SALSAS';
-const WINGS_SAUCE_KEYWORDS = Object.freeze(['alita', 'alitas', 'tender', 'tenders']);
 const schemaColumnCache = new Map();
-
-const roundMoney = (value) => Number((Number(value || 0)).toFixed(2));
-const normalizeTipoItem = (value) => {
-  const normalized = String(value || '').trim().toUpperCase();
-  return ['PRODUCTO', 'RECETA', 'COMBO', 'MIXTO', 'ITEM'].includes(normalized)
-    ? normalized
-    : 'ITEM';
-};
-
-const parsePositiveInt = (value) => {
-  const parsed = Number.parseInt(value, 10);
-  return Number.isInteger(parsed) && parsed > 0 ? parsed : null;
-};
-
-const parseOptionalPositiveInt = (value) => {
-  if (value === undefined || value === null || value === '') return null;
-  return parsePositiveInt(value);
-};
-
-const parseRequiredPositiveInt = (value, fieldName) => {
-  const parsed = parsePositiveInt(value);
-  if (!parsed) {
-    return {
-      ok: false,
-      message: `${fieldName} debe ser un entero mayor a 0.`
-    };
-  }
-  return { ok: true, value: parsed };
-};
-
-const parseNonNegativeNumber = (value) => {
-  const parsed = Number(value);
-  return Number.isFinite(parsed) && parsed >= 0 ? roundMoney(parsed) : null;
-};
-
-const normalizeDescuentoAlcance = (value) => {
-  const normalized = String(value || '')
-    .trim()
-    .toUpperCase();
-  return Object.values(DESCUENTO_ALCANCE_KEYS).includes(normalized) ? normalized : null;
-};
-
-const parseOptionalDateTime = (value) => {
-  if (value === undefined || value === null || value === '') return null;
-  const date = new Date(value);
-  return Number.isNaN(date.getTime()) ? null : date;
-};
 
 const hasColumn = async (client, tableName, columnName) => {
   const key = `${String(tableName || '').trim().toLowerCase()}.${String(columnName || '').trim().toLowerCase()}`;
@@ -543,24 +305,6 @@ const sendVentasInternalError = (
   message = 'No se pudo procesar la solicitud de ventas.'
 ) => res.status(500).json({ error: true, message });
 
-const parseBooleanInput = (value) => {
-  if (value === true || value === false) return { ok: true, value };
-  if (value === 1 || value === 0) return { ok: true, value: value === 1 };
-  if (typeof value === 'string') {
-    const normalized = value.trim().toLowerCase();
-    if (['true', '1', 'si', 'yes', 'y', 'activo'].includes(normalized)) {
-      return { ok: true, value: true };
-    }
-    if (['false', '0', 'no', 'n', 'inactivo'].includes(normalized)) {
-      return { ok: true, value: false };
-    }
-  }
-  return { ok: false, value: false };
-};
-
-const isPlainObject = (value) =>
-  value !== null && typeof value === 'object' && !Array.isArray(value);
-
 const formatVentaNumero = (idVenta) => `VTA-${String(idVenta).padStart(5, '0')}`;
 const resolveVentaNumero = (row) =>
   String(row?.codigo_venta || '').trim() || formatVentaNumero(row?.id_factura);
@@ -571,21 +315,6 @@ const normalizeClienteNombre = (cliente) => {
   if (cliente?.nombre_empresa) return cliente.nombre_empresa;
   return 'Consumidor final';
 };
-
-const normalizeTextKey = (value) =>
-  String(value || '')
-    .normalize('NFD')
-    .replace(/[\u0300-\u036f]/g, '')
-    .trim()
-    .toLowerCase()
-    .replace(/\s+/g, '_');
-
-const normalizeSearchText = (value) =>
-  String(value || '')
-    .normalize('NFD')
-    .replace(/[\u0300-\u036f]/g, '')
-    .trim()
-    .toLowerCase();
 
 const buildEstadoPedidoSqlKey = (columnExpression) =>
   `LOWER(REGEXP_REPLACE(TRIM(COALESCE(${columnExpression}, '')), '\\s+', '_', 'g'))`;
@@ -676,65 +405,6 @@ const findMatchingSalsaRule = (rules, unidades) => {
     if (max !== null && Number.isFinite(max) && units > max) return false;
     return true;
   }) || null;
-};
-const parseComplementosPayload = (value) => {
-  if (value === undefined || value === null) return { ok: true, data: [] };
-  if (!Array.isArray(value)) {
-    return { ok: false, message: 'complementos debe ser una lista valida.' };
-  }
-  const dedupe = new Set();
-  for (const entry of value) {
-    if (!isPlainObject(entry)) {
-      return { ok: false, message: 'Cada complemento debe ser un objeto valido.' };
-    }
-    const idComplemento = parseOptionalPositiveInt(entry.id_complemento);
-    if (!idComplemento) {
-      return { ok: false, message: 'Cada complemento debe incluir id_complemento entero mayor a 0.' };
-    }
-    dedupe.add(Number(idComplemento));
-  }
-  return { ok: true, data: [...dedupe].sort((a, b) => a - b) };
-};
-const parseVentaExtrasPayload = (value, { kind, cantidad }) => {
-  if (value === undefined || value === null) return { ok: true, data: [] };
-  if (!Array.isArray(value)) {
-    return { ok: false, message: 'extras debe ser una lista valida.' };
-  }
-
-  if (kind === 'PRODUCTO' && value.length > 0) {
-    return { ok: false, message: 'Los productos no permiten extras.' };
-  }
-
-  const seen = new Set();
-  const normalized = [];
-  const maxCantidad = Number(cantidad || 0);
-
-  for (const entry of value) {
-    if (!isPlainObject(entry)) {
-      return { ok: false, message: 'Cada extra debe ser un objeto valido.' };
-    }
-    const idExtra = parseOptionalPositiveInt(entry.id_extra);
-    if (!idExtra) {
-      return { ok: false, message: 'Cada extra debe incluir id_extra entero mayor a 0.' };
-    }
-    if (seen.has(idExtra)) {
-      return { ok: false, message: 'No se permite duplicar el mismo extra en una linea.' };
-    }
-    const extraCantidad = parsePositiveInt(entry.cantidad);
-    if (!extraCantidad) {
-      return { ok: false, message: 'Cada extra debe incluir cantidad entera mayor a 0.' };
-    }
-    if (extraCantidad > maxCantidad) {
-      return { ok: false, message: 'La cantidad de un extra no puede ser mayor que la cantidad del item.' };
-    }
-    seen.add(idExtra);
-    normalized.push({ id_extra: idExtra, cantidad: extraCantidad });
-  }
-
-  return {
-    ok: true,
-    data: normalized.sort((left, right) => left.id_extra - right.id_extra)
-  };
 };
 const buildComplementSnapshot = (line) => {
   const selected = Array.isArray(line?.complementos_detalle) ? line.complementos_detalle : [];
@@ -847,38 +517,12 @@ const resolveComboComplementMetadata = ({ combo = {}, quantity = 1, components =
   };
 };
 
-const normalizeRoleName = (value) =>
-  String(value ?? '')
-    .trim()
-    .replace(/[\s-]+/g, '_')
-    .toUpperCase();
-
 const getRequestRoleSet = (req) =>
   new Set(
     (Array.isArray(req.user?.roles) ? req.user.roles : [])
       .map(normalizeRoleName)
       .filter(Boolean)
   );
-
-const parseBoundedPositiveInt = (value, { fallback, min = 1, max = Number.MAX_SAFE_INTEGER }) => {
-  const parsed = Number.parseInt(String(value ?? ''), 10);
-  if (!Number.isInteger(parsed)) return fallback;
-  if (parsed < min) return min;
-  if (parsed > max) return max;
-  return parsed;
-};
-
-const parseOptionalDateInput = (value) => {
-  if (value === undefined || value === null || value === '') return null;
-  const normalized = String(value).trim();
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(normalized)) return '__INVALID_DATE__';
-  return normalized;
-};
-
-const coercePositiveIntArray = (value) =>
-  [...new Set((Array.isArray(value) ? value : [])
-    .map((item) => Number.parseInt(String(item ?? ''), 10))
-    .filter((item) => Number.isInteger(item) && item > 0))];
 
 const validateVentasCatalogSucursal = async ({ scope, idSucursal, queryRunner = pool }) => {
   if (!idSucursal) return { ok: true };
@@ -1029,9 +673,6 @@ const resolveVentasHistoryScope = async (req, queryRunner = pool) => {
   };
 };
 
-const parseBooleanish = (value) =>
-  value === true || value === 'true' || value === 1 || value === '1';
-
 const shouldSendReversionFailureEmail = ({ idUsuario, idFactura }) => {
   const key = `${Number(idUsuario || 0)}:${Number(idFactura || 0)}`;
   const now = Date.now();
@@ -1131,37 +772,6 @@ const sendReversionFailureEmail = async ({ payload }) => {
     html,
     { id_usuario: payload.id_usuario, tipo_correo: 'reversion_fallida', fromKey: 'ADMON' }
   );
-};
-
-const parseEntityIdentifier = (value, fieldName) => {
-  if (
-    value === undefined ||
-    value === null ||
-    value === '' ||
-    value === 0 ||
-    value === '0'
-  ) {
-    return { ok: true, value: null };
-  }
-
-  const parsed = Number.parseInt(String(value), 10);
-  if (!Number.isInteger(parsed) || parsed <= 0) {
-    return {
-      ok: false,
-      message: `${fieldName} debe ser un entero mayor a 0 o null.`
-    };
-  }
-
-  return { ok: true, value: parsed };
-};
-
-const normalizeObservation = (value) => {
-  if (value === undefined || value === null) return null;
-
-  const normalized = String(value).replace(/\s+/g, ' ').trim();
-  if (!normalized) return null;
-
-  return normalized.slice(0, 200);
 };
 
 const buildKitchenDescriptionSummary = (lines, fallbackValue = null) => {
@@ -1570,8 +1180,6 @@ const buildVentaRpcV2Payload = ({ venta }) => ({
   },
   items: buildVentaRpcItems(venta)
 });
-const VENTAS_FIDELIZACION_ADVISORY_LOCK_CLASS = 724201;
-
 const logVentasFidelizacionAsyncPerf = (payload) => {
   if (!isVentasPerfEnabled()) return;
   console.info('[ventas:perf:fidelizacion_async]', payload);
@@ -5524,17 +5132,6 @@ const upsertDescuentoCatalogoConObjetivos = async ({ client, payload, actor }) =
     };
   }
   return { ok: true, response };
-};
-
-const parseJsonArrayValue = (value) => {
-  if (Array.isArray(value)) return value;
-  if (typeof value !== 'string' || !value.trim()) return [];
-  try {
-    const parsed = JSON.parse(value);
-    return Array.isArray(parsed) ? parsed : [];
-  } catch (_) {
-    return [];
-  }
 };
 
 const buildDescuentoObjetivoLabel = (row) => {
