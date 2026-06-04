@@ -20,8 +20,6 @@ import {
   fetchPublicActiveSaucesQuery
 } from './public_menu/publicMenuQueries.js';
 import {
-  actualizarEstadoAlertaInventario,
-  listarAlertasInventario,
   listarAlertasInventarioPedido
 } from '../services/inventarioAlertasService.js';
 
@@ -40,12 +38,6 @@ const VENTAS_DESCUENTOS_WRITE_PERMISSIONS = [
   'VENTAS_DESCUENTOS_CATALOGO_CREAR',
   'VENTAS_DESCUENTOS_CATALOGO_EDITAR',
   'VENTAS_DESCUENTOS_CATALOGO_ESTADO_CAMBIAR'
-];
-const VENTAS_INVENTARIO_ALERTAS_VIEW_PERMISSIONS = ['VENTAS_VER', 'INVENTARIO_ALERTAS_VER'];
-const VENTAS_INVENTARIO_ALERTAS_UPDATE_PERMISSIONS = [
-  'INVENTARIO_ALERTAS_STOCK_MINIMO_EDITAR',
-  'INVENTARIO_MOVIMIENTOS_EDITAR',
-  'VENTAS_CREAR'
 ];
 const DESCUENTO_TIPO_KEYS = {
   MONTO_FIJO: 'MONTO_FIJO',
@@ -7690,58 +7682,6 @@ const formatInventarioAlertaResponse = (alerta) => ({
     total: alerta.pedido_total
   },
   payload: alerta.payload
-});
-
-router.get('/ventas/inventario-alertas', checkPermission(VENTAS_INVENTARIO_ALERTAS_VIEW_PERMISSIONS), async (req, res) => {
-  try {
-    const result = await listarAlertasInventario(req.query);
-    return res.status(200).json({
-      ok: true,
-      migration_applied: result.migration_applied,
-      revision_columns_applied: result.revision_columns_applied,
-      pagination: result.pagination,
-      total: result.pagination.total,
-      alertas: result.alertas.map(formatInventarioAlertaResponse)
-    });
-  } catch (err) {
-    if (err?.httpStatus) {
-      return res.status(err.httpStatus).json({
-        error: true,
-        code: err.code,
-        message: err.message
-      });
-    }
-    console.error('Error al listar alertas de inventario:', err);
-    return sendVentasInternalError(res);
-  }
-});
-
-router.patch('/ventas/inventario-alertas/:id/estado', checkPermission(VENTAS_INVENTARIO_ALERTAS_UPDATE_PERMISSIONS), async (req, res) => {
-  try {
-    const scope = await resolveRequestUserSucursalScope(req);
-    const result = await actualizarEstadoAlertaInventario({
-      id_alerta: req.params.id,
-      estado: req.body?.estado,
-      nota_resolucion: req.body?.nota_resolucion,
-      id_usuario: parseOptionalPositiveInt(scope?.idUsuario) || parseOptionalPositiveInt(req.user?.id_usuario)
-    });
-
-    return res.status(200).json({
-      ok: true,
-      revision_columns_applied: result.revision_columns_applied,
-      alerta: formatInventarioAlertaResponse(result.alerta)
-    });
-  } catch (err) {
-    if (err?.httpStatus) {
-      return res.status(err.httpStatus).json({
-        error: true,
-        code: err.code,
-        message: err.message
-      });
-    }
-    console.error('Error al actualizar estado de alerta de inventario:', err);
-    return sendVentasInternalError(res);
-  }
 });
 
 router.get('/ventas/pedidos/:id/inventario-alertas', checkPermission(['VENTAS_VER']), async (req, res) => {
