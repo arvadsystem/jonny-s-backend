@@ -34,6 +34,16 @@ import {
   fetchVentaCatalogMaps
 } from './ventas/services/ventasReadService.js';
 import {
+  buildComplementLineConfig,
+  buildComplementSnapshot,
+  normalizeCartKey,
+  normalizeVentaItems
+} from './ventas/services/ventasPayloadService.js';
+import {
+  buildVentaRpcPayload,
+  buildVentaRpcV2Payload
+} from './ventas/services/ventasRpcPayloadService.js';
+import {
   DESCUENTO_ALCANCE_KEYS,
   DESCUENTO_TIPO_KEYS,
   ESTADO_PEDIDO_CODES,
@@ -73,16 +83,13 @@ import {
   parseBooleanInput,
   parseBooleanish,
   parseBoundedPositiveInt,
-  parseComplementosPayload,
-  parseEntityIdentifier,
   parseJsonArrayValue,
   parseNonNegativeNumber,
   parseOptionalDateInput,
   parseOptionalDateTime,
   parseOptionalPositiveInt,
   parsePositiveInt,
-  parseRequiredPositiveInt,
-  parseVentaExtrasPayload
+  parseRequiredPositiveInt
 } from './ventas/utils/parseUtils.js';
 import {
   createVentasPerfTracker,
@@ -416,51 +423,6 @@ const findMatchingSalsaRule = (rules, unidades) => {
     if (max !== null && Number.isFinite(max) && units > max) return false;
     return true;
   }) || null;
-};
-const buildComplementSnapshot = (line) => {
-  const selected = Array.isArray(line?.complementos_detalle) ? line.complementos_detalle : [];
-  if (selected.length === 0) return null;
-  return {
-    tipo: VENTA_COMPLEMENTO_TIPO_SALSAS,
-    seleccion: selected.map((entry) => ({
-      id_complemento: Number(entry?.id_complemento || 0),
-      id_salsa: Number(entry?.id_salsa || entry?.id_complemento || 0),
-      nombre: String(entry?.nombre || 'Complemento').trim()
-    })).filter((entry) => entry.id_complemento > 0)
-  };
-};
-const buildComplementLineConfig = (line) => {
-  const selected = Array.isArray(line?.complementos_detalle) ? line.complementos_detalle : [];
-  const extras = Array.isArray(line?.extras_detalle) ? line.extras_detalle : [];
-  const metadata = line?.complementos_metadata;
-  if (!selected.length && !metadata?.requiere_complementos && !extras.length) return null;
-  return {
-    tipo_complemento: VENTA_COMPLEMENTO_TIPO_SALSAS,
-    requiere_complementos: Boolean(metadata?.requiere_complementos),
-    minimo_complementos: Number(metadata?.minimo_complementos || 0),
-    maximo_complementos: Number(metadata?.maximo_complementos || 0),
-    complementos_incompletos_autorizados: Boolean(metadata?.complementos_incompletos_autorizados),
-    complementos_recomendados: Number(metadata?.complementos_recomendados ?? metadata?.minimo_complementos ?? 0),
-    complementos_seleccionados: Number(metadata?.complementos_seleccionados ?? selected.length),
-    complementos: selected.map((entry) => ({
-      id_complemento: Number(entry?.id_complemento || 0),
-      id_salsa: Number(entry?.id_salsa || entry?.id_complemento || 0),
-      nombre: String(entry?.nombre || 'Complemento').trim()
-    })).filter((entry) => entry.id_complemento > 0),
-    extras: extras.map((entry) => ({
-      id_extra: Number(entry?.id_extra || 0),
-      codigo: String(entry?.codigo || '').trim() || null,
-      nombre: String(entry?.nombre || 'Extra').trim(),
-      cantidad: Number(entry?.cantidad || 0),
-      precio_unitario: roundMoney(entry?.precio_unitario),
-      subtotal: roundMoney(entry?.subtotal),
-      id_insumo: entry?.id_insumo ? Number(entry.id_insumo) : null,
-      cant: Number(entry?.cant ?? entry?.cantidad_insumo ?? 0) > 0
-        ? Number(entry?.cant ?? entry?.cantidad_insumo)
-        : null,
-      id_unidad_medida: parseOptionalPositiveInt(entry?.id_unidad_medida)
-    })).filter((entry) => entry.id_extra > 0 && entry.cantidad > 0)
-  };
 };
 const buildRecipeSauceRequirement = ({ recipeName = '', recipeDescription = '', rules = [], quantity = 1 }) => {
   const unitsBase = Math.max(1, inferSauceUnitsBaseFromText(recipeName, recipeDescription));
@@ -1041,156 +1003,6 @@ const buildCreateVentaDetailResponse = ({
   };
 };
 
-const buildVentaRpcItems = (venta) =>
-  (Array.isArray(venta?.all_lines) ? venta.all_lines : []).map((line, index) => {
-    const tipoItem = normalizeTipoItem(line.kind);
-    const configuracionMenu = buildComplementLineConfig(line);
-    const complementSnapshot = buildComplementSnapshot(line);
-    const origenSnapshot = {
-      tipo_item: tipoItem,
-      nombre_item: line.nombre_item || null,
-      id_producto: line.id_producto || null,
-      id_receta: line.id_receta || null,
-      id_combo: line.id_combo || null,
-      cantidad: Number(line.cantidad || 0),
-      precio_unitario: roundMoney(line.precio_unitario),
-      total_detalle: roundMoney(line.total_linea),
-      subtotal_extras: roundMoney(line.subtotal_extras),
-      descuento: roundMoney(line.descuento),
-      descuento_linea: roundMoney(line.descuento_linea),
-      descuento_global: roundMoney(line.descuento_global),
-      id_descuento_catalogo_linea: line.id_descuento_catalogo_linea_aplicado || null,
-      id_descuento_catalogo_global: line.id_descuento_catalogo_global || null,
-      observacion: line.observacion || null,
-      componentes: complementSnapshot,
-      extras: Array.isArray(line.extras_detalle) ? line.extras_detalle : []
-    };
-
-    return {
-      item_index: index,
-      tipo_item: tipoItem,
-      id_producto: line.id_producto || null,
-      id_receta: line.id_receta || null,
-      id_combo: line.id_combo || null,
-      id_descuento_catalogo: line.id_descuento_catalogo || null,
-      cantidad: Number(line.cantidad || 0),
-      precio_unitario: roundMoney(line.precio_unitario),
-      sub_total: roundMoney(line.sub_total),
-      total_linea: roundMoney(line.total_linea),
-      descuento: roundMoney(line.descuento),
-      observacion: line.observacion || null,
-      configuracion_menu: configuracionMenu,
-      origen_snapshot: origenSnapshot,
-      nombre_item: line.nombre_item || null
-    };
-  });
-
-const buildVentaRpcPayload = ({ venta, correlativoVenta, facturacionVenta, facturacionNormalizada }) => ({
-  pedido: {
-    descripcion_pedido: venta.descripcion_pedido,
-    descripcion_envio: venta.descripcion_envio,
-    sub_total: venta.pedido_subtotal,
-    isv: venta.pedido_isv,
-    total: venta.pedido_total,
-    id_estado_pedido: venta.id_estado_pedido,
-    id_sucursal: venta.id_sucursal,
-    id_cliente: venta.id_cliente,
-    id_usuario: venta.id_usuario
-  },
-  factura: {
-    id_caja: venta.id_caja,
-    id_sucursal: venta.id_sucursal,
-    id_usuario: venta.id_usuario,
-    id_cliente: venta.id_cliente,
-    codigo_venta: correlativoVenta.codigo,
-    fecha_operacion: correlativoVenta.fecha_operacion,
-    efectivo_entregado: venta.efectivo_entregado,
-    cambio: venta.cambio,
-    isv_15: 0,
-    id_sesion_caja: venta.id_sesion_caja
-  },
-  cobro: {
-    id_metodo_pago: venta.id_metodo_pago,
-    monto: venta.total,
-    referencia: venta.referencia_pago || null
-  },
-  venta: {
-    id_sucursal: venta.id_sucursal,
-    id_cliente: venta.id_cliente,
-    id_usuario: venta.id_usuario,
-    id_caja: venta.id_caja,
-    id_sesion_caja: venta.id_sesion_caja,
-    metodo_pago: venta.metodo_pago,
-    metodo_pago_codigo: venta.metodo_pago_codigo,
-    referencia_pago: venta.referencia_pago || null,
-    efectivo_entregado: venta.efectivo_entregado,
-    cambio: venta.cambio,
-    descripcion_pedido: venta.descripcion_pedido,
-    descripcion_envio: venta.descripcion_envio,
-    subtotal: venta.subtotal,
-    descuento: venta.descuento,
-    isv: venta.isv,
-    total: venta.total
-  },
-  correlativo: {
-    codigo: correlativoVenta.codigo,
-    fecha_operacion: correlativoVenta.fecha_operacion
-  },
-  snapshot_fiscal: {
-    id_config_facturacion: facturacionVenta.idConfig || null,
-    facturacion_snapshot: facturacionVenta.snapshot || {}
-  },
-  ticket_facturacion: facturacionNormalizada || {},
-  items: buildVentaRpcItems(venta)
-});
-
-const buildVentaRpcV2Payload = ({ venta }) => ({
-  pedido: {
-    descripcion_pedido: venta.descripcion_pedido,
-    descripcion_envio: venta.descripcion_envio,
-    sub_total: venta.pedido_subtotal,
-    isv: venta.pedido_isv,
-    total: venta.pedido_total,
-    id_estado_pedido: venta.id_estado_pedido,
-    id_sucursal: venta.id_sucursal,
-    id_cliente: venta.id_cliente,
-    id_usuario: venta.id_usuario
-  },
-  factura: {
-    id_caja: venta.id_caja,
-    id_sucursal: venta.id_sucursal,
-    id_usuario: venta.id_usuario,
-    id_cliente: venta.id_cliente,
-    efectivo_entregado: venta.efectivo_entregado,
-    cambio: venta.cambio,
-    isv_15: 0,
-    id_sesion_caja: venta.id_sesion_caja
-  },
-  cobro: {
-    id_metodo_pago: venta.id_metodo_pago,
-    monto: venta.total,
-    referencia: venta.referencia_pago || null
-  },
-  venta: {
-    id_sucursal: venta.id_sucursal,
-    id_cliente: venta.id_cliente,
-    id_usuario: venta.id_usuario,
-    id_caja: venta.id_caja,
-    id_sesion_caja: venta.id_sesion_caja,
-    metodo_pago: venta.metodo_pago,
-    metodo_pago_codigo: venta.metodo_pago_codigo,
-    referencia_pago: venta.referencia_pago || null,
-    efectivo_entregado: venta.efectivo_entregado,
-    cambio: venta.cambio,
-    descripcion_pedido: venta.descripcion_pedido,
-    descripcion_envio: venta.descripcion_envio,
-    subtotal: venta.subtotal,
-    descuento: venta.descuento,
-    isv: venta.isv,
-    total: venta.total
-  },
-  items: buildVentaRpcItems(venta)
-});
 const logVentasFidelizacionAsyncPerf = (payload) => {
   if (!isVentasPerfEnabled()) return;
   console.info('[ventas:perf:fidelizacion_async]', payload);
@@ -1423,98 +1235,6 @@ const createVentaWithRpcV2Transaction = async ({ client, venta, perf, requestSta
     }
   };
 };
-const normalizeVentaItems = (items) => {
-  if (!Array.isArray(items) || items.length === 0) {
-    return { ok: false, message: 'Debe enviar al menos un item en la venta.' };
-  }
-
-  const normalized = [];
-
-  for (const item of items) {
-    if (!isPlainObject(item)) {
-      return { ok: false, message: 'Cada item debe ser un objeto valido.' };
-    }
-
-    const productoResult = parseEntityIdentifier(item.id_producto, 'id_producto');
-    if (!productoResult.ok) return { ok: false, message: productoResult.message };
-
-    const comboResult = parseEntityIdentifier(item.id_combo, 'id_combo');
-    if (!comboResult.ok) return { ok: false, message: comboResult.message };
-
-    const recetaResult = parseEntityIdentifier(item.id_receta, 'id_receta');
-    if (!recetaResult.ok) return { ok: false, message: recetaResult.message };
-
-    const cantidad = parsePositiveInt(item.cantidad);
-    if (!cantidad) {
-      return {
-        ok: false,
-        message: 'Cada item debe incluir cantidad entera mayor a 0.'
-      };
-    }
-
-    const presentIds = [
-      ['PRODUCTO', productoResult.value],
-      ['COMBO', comboResult.value],
-      ['RECETA', recetaResult.value]
-    ].filter(([, value]) => value !== null);
-
-    if (presentIds.length !== 1) {
-      return {
-        ok: false,
-        message:
-          'Cada item debe incluir exactamente uno entre id_producto, id_combo o id_receta.'
-      };
-    }
-
-    const [kind, entityId] = presentIds[0];
-    const idDescuentoCatalogoLinea = parseOptionalPositiveInt(item.id_descuento_catalogo);
-    if (
-      item.id_descuento_catalogo !== undefined &&
-      item.id_descuento_catalogo !== null &&
-      !idDescuentoCatalogoLinea
-    ) {
-      return {
-        ok: false,
-        message: 'id_descuento_catalogo por linea debe ser entero mayor a 0.'
-      };
-    }
-
-    const complementosResult = parseComplementosPayload(item.complementos);
-    if (!complementosResult.ok) {
-      return { ok: false, message: complementosResult.message };
-    }
-    const extrasResult = parseVentaExtrasPayload(item.extras, { kind, cantidad });
-    if (!extrasResult.ok) {
-      return { ok: false, message: extrasResult.message };
-    }
-    const complementosIncompletosInput = item.complementos_incompletos_autorizados ?? item.permitir_complementos_incompletos;
-    let complementosIncompletosAutorizados = false;
-    if (complementosIncompletosInput !== undefined && complementosIncompletosInput !== null) {
-      const parsedComplementosIncompletos = parseBooleanInput(complementosIncompletosInput);
-      if (!parsedComplementosIncompletos.ok) {
-        return { ok: false, message: 'complementos_incompletos_autorizados debe ser booleano.' };
-      }
-      complementosIncompletosAutorizados = parsedComplementosIncompletos.value;
-    }
-
-    normalized.push({
-      kind,
-      cart_key: normalizeCartKey(item.cart_key),
-      cantidad,
-      id_producto: kind === 'PRODUCTO' ? entityId : null,
-      id_combo: kind === 'COMBO' ? entityId : null,
-      id_receta: kind === 'RECETA' ? entityId : null,
-      observacion: normalizeObservation(item.observacion),
-      id_descuento_catalogo_linea: idDescuentoCatalogoLinea,
-      complementos: complementosResult.data,
-      complementos_incompletos_autorizados: complementosIncompletosAutorizados,
-      extras: extrasResult.data
-    });
-  }
-
-  return { ok: true, data: normalized };
-};
-
 const getNextTableId = async (client, tableName, idField, lock = true) => {
   if (lock) {
     await client.query(`LOCK TABLE ${tableName} IN EXCLUSIVE MODE`);
@@ -2970,11 +2690,6 @@ const fetchDetalleFacturaExtras = async (client, detalleFacturaIds = []) => {
 };
 
 const hasCuentaDivididaPayload = (body) => Array.isArray(body?.cuenta_dividida);
-
-const normalizeCartKey = (value) => {
-  const text = String(value ?? '').trim();
-  return text || null;
-};
 
 const buildCuentaDivisionPlan = ({ cuentaDividida, lines, expectedTotal }) => {
   if (!Array.isArray(cuentaDividida)) return null;
