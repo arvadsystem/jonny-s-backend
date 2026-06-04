@@ -21,6 +21,9 @@ const PERM_OC_VIEW_DETAIL = [
 ];
 const PERM_OC_VIEW_EVIDENCIAS = [
   'INVENTARIO_OC_VER_EVIDENCIAS',
+  'INVENTARIO_OC_RECEPCIONAR',
+  'INVENTARIO_OC_SUBIR_FACTURA',
+  'INVENTARIO_ORDENES_COMPRA_RECEPCIONAR',
   'INVENTARIO_ORDENES_COMPRA_VER',
   'INVENTARIO_ORDENES_COMPRA_VER_TODAS'
 ];
@@ -326,17 +329,31 @@ const buildSafeWorkflowErrorLog = (error) => {
   const where = normalizeText(error?.where, 200);
   const constraint = normalizeText(error?.constraint, 120);
   const table = normalizeText(error?.table, 80);
+  const column = normalizeText(error?.column, 80);
+  const schema = normalizeText(error?.schema, 80);
+  const dataType = normalizeText(error?.dataType, 80);
+  const severity = normalizeText(error?.severity, 40);
+  const position = normalizeText(error?.position, 40);
+  const internalPosition = normalizeText(error?.internalPosition, 40);
+  const internalQuery = normalizeText(error?.internalQuery, 200);
   const routine = normalizeText(error?.routine, 80);
 
   return {
     code: normalizeText(error?.code, 20) || null,
     name: normalizeText(error?.name, 60) || null,
+    severity: severity || null,
     message,
     detail: detail || null,
     hint: hint || null,
     where: where || null,
     constraint: constraint || null,
+    schema: schema || null,
     table: table || null,
+    column: column || null,
+    data_type: dataType || null,
+    position: position || null,
+    internal_position: internalPosition || null,
+    internal_query: internalQuery || null,
     routine: routine || null
   };
 };
@@ -347,6 +364,11 @@ const sendServerError = (res, context, error) => {
   const warehouseMismatchData = parseWarehouseMismatchDataFromDbError(error);
   if (warehouseMismatchData) {
     return sendWarehouseMismatchConflict(res, warehouseMismatchData);
+  }
+
+  // AM: normaliza conflictos de unicidad antes del mapeo de schema para evitar falsos OC_SCHEMA_MISSING.
+  if (error?.code === '23505') {
+    return sendError(res, 409, 'CONFLICT', 'La operacion genero un conflicto con datos existentes.');
   }
 
   if (isOcSchemaError(error)) {
@@ -365,10 +387,6 @@ const sendServerError = (res, context, error) => {
 
   if (error?.code === '23503') {
     return sendError(res, 400, 'VALIDATION_ERROR', 'La orden referencia datos que no existen o no son validos.');
-  }
-
-  if (error?.code === '23505') {
-    return sendError(res, 409, 'CONFLICT', 'La operacion genero un conflicto con datos existentes.');
   }
 
   return sendError(res, 500, 'INTERNAL_ERROR', 'No se pudo completar la operacion solicitada.');
@@ -421,6 +439,7 @@ const normalizeRoleName = (value) =>
 const ADMIN_OC_ROLE_NAMES = new Set(['SUPER_ADMIN', 'ADMIN', 'ADMINISTRADOR']);
 const OPERATIVE_OC_ROLE_NAMES = new Set([
   'CAJERO',
+  'COCINA',
   'COCINERO',
   'COCINERA',
   'JEFA_COCINA',
@@ -485,10 +504,14 @@ const canUserViewAdminOrderData = async (req, idUsuario, queryRunner = pool) => 
 
 const sanitizeOrderForOperativeDetail = (row) => {
   if (!row || typeof row !== 'object') return row;
+  const estadoActual = String(row?.estado_flujo || '').trim().toUpperCase();
+  const comentarioRevisionRechazo =
+    estadoActual === ESTADO_RECHAZADA ? normalizeText(row?.comentario_revision, MAX_TEXT_LEN) : null;
   // AM: cocina/cajero no deben ver acciones/metadata administrativas internas.
   return {
     ...row,
-    comentario_revision: null,
+    // AM: operativo solo puede ver el motivo cuando la orden fue rechazada.
+    comentario_revision: comentarioRevisionRechazo,
     id_usuario_revisor: null,
     revisor_nombre_usuario: null,
     fecha_revision: null,
@@ -604,7 +627,7 @@ const getNextVisibleOrderNumber = async (queryRunner = pool) => {
         SELECT DISTINCT oc.numero_oc_visible AS n
         FROM public.orden_compras oc
         WHERE oc.numero_oc_visible IS NOT NULL
-          AND UPPER(COALESCE(oc.estado_flujo, '')) NOT IN ($1, $2)
+          AND UPPER(COALESCE(oc.estado_flujo, '')) <> $1
       ),
       candidatos AS (
         SELECT generate_series(
@@ -617,7 +640,7 @@ const getNextVisibleOrderNumber = async (queryRunner = pool) => {
       LEFT JOIN usados u ON u.n = c.n
       WHERE u.n IS NULL
     `,
-    [ESTADO_RECHAZADA, ESTADO_CANCELADA]
+    [ESTADO_RECHAZADA]
   );
 
   return parsePositiveInt(result.rows?.[0]?.siguiente_numero) || 1;
@@ -1649,6 +1672,7 @@ const validateProveedor = async (idProveedor, queryRunner = pool) => {
 
 const validateArchivo = async (idArchivo, queryRunner = pool, options = {}) => {
   const expectedMimePrefix = normalizeText(options?.expectedMimePrefix, 40)?.toLowerCase() || null;
+  const allowPdf = Boolean(options?.allowPdf);
   const result = await queryRunner.query(
     `
       SELECT tipo_archivo
@@ -1665,6 +1689,7 @@ const validateArchivo = async (idArchivo, queryRunner = pool, options = {}) => {
 
   const tipoArchivo = String(result.rows?.[0]?.tipo_archivo || '').trim().toLowerCase();
   if (!tipoArchivo) return true;
+  if (allowPdf && tipoArchivo === 'application/pdf') return true;
   return tipoArchivo.startsWith(expectedMimePrefix);
 };
 
@@ -2368,7 +2393,7 @@ router.get('/orden_compras/workflow', checkPermission(PERM_OC_VIEW_FLOW), async 
             COUNT(*) FILTER (WHERE UPPER(COALESCE(fo.estado_flujo, '')) = 'EN_COMPRA')::int AS en_compra,
             COUNT(*) FILTER (WHERE UPPER(COALESCE(fo.estado_flujo, '')) = 'ABASTECIDA')::int AS abastecidas,
             COUNT(*) FILTER (
-              EXISTS (
+              WHERE EXISTS (
                 SELECT 1
                 FROM public.compras c_ev
                 WHERE c_ev.id_orden_compra = fo.id_orden_compra
@@ -3841,42 +3866,24 @@ router.post('/orden_compras/workflow/:id_orden_compra/cancelar', checkPermission
     const estadoActual = String(orderRow.estado_flujo || '').trim().toUpperCase();
     const idUsuarioCreador = parsePositiveInt(orderRow?.id_usuario);
 
-    // AM: operativo solo puede cancelar solicitudes pendientes de su propio flujo.
-    if (!roleContext.isFullOcManager) {
-      if (estadoActual !== ESTADO_PENDIENTE) {
-        await withRollback(client);
-        return sendError(res, 403, 'FORBIDDEN', 'Solo puedes cancelar solicitudes pendientes.');
-      }
-      if (idUsuarioCreador && Number(idUsuarioCreador) !== Number(idUsuario)) {
-        await withRollback(client);
-        return sendError(res, 403, 'FORBIDDEN', 'Solo puedes cancelar solicitudes creadas por tu usuario.');
-      }
-    }
-
-    const recepcionRegistrada =
-      Boolean(parsePositiveInt(orderRow.id_usuario_recepcion)) &&
-      Boolean(normalizeText(orderRow.fecha_recepcion_reportada, 80));
-
-    if (estadoActual === ESTADO_EN_COMPRA && recepcionRegistrada) {
+    if (roleContext.isFullOcManager) {
       await withRollback(client);
       return sendError(
         res,
-        409,
-        'INVALID_STATE',
-        'No se puede cancelar una orden EN_COMPRA con recepcion registrada.'
+        403,
+        'FORBIDDEN',
+        'Los perfiles administrativos no pueden cancelar ordenes. Usa rechazo con comentario.'
       );
     }
 
-    const puedeCancelarEstadoBase = [ESTADO_PENDIENTE, ESTADO_APROBADA].includes(estadoActual);
-    const puedeCancelarEnCompra = estadoActual === ESTADO_EN_COMPRA && !recepcionRegistrada;
-    if (!puedeCancelarEstadoBase && !puedeCancelarEnCompra) {
+    // AM: operativo solo puede cancelar solicitudes pendientes y propias.
+    if (estadoActual !== ESTADO_PENDIENTE) {
       await withRollback(client);
-      return sendError(
-        res,
-        409,
-        'INVALID_STATE',
-        `No se puede cancelar una orden en estado ${orderRow.estado_flujo}.`
-      );
+      return sendError(res, 403, 'FORBIDDEN', 'Solo puedes cancelar solicitudes pendientes.');
+    }
+    if (!idUsuarioCreador || Number(idUsuarioCreador) !== Number(idUsuario)) {
+      await withRollback(client);
+      return sendError(res, 403, 'FORBIDDEN', 'Solo puedes cancelar solicitudes creadas por tu usuario.');
     }
 
     await client.query(
@@ -4756,7 +4763,10 @@ router.post('/orden_compras/workflow/:id_orden_compra/recepcion', checkPermissio
     }
 
     if (idArchivoFactura && !idArchivoFacturaActual) {
-      const archivoExiste = await validateArchivo(idArchivoFactura, client, { expectedMimePrefix: 'image/' });
+      const archivoExiste = await validateArchivo(idArchivoFactura, client, {
+        expectedMimePrefix: 'image/',
+        allowPdf: true
+      });
       if (!archivoExiste) {
         await withRollback(client);
         return sendError(res, 400, 'VALIDATION_ERROR', 'La factura de recepcion no existe en archivos.');
