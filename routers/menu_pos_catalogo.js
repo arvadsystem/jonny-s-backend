@@ -1,8 +1,10 @@
 import express from 'express';
 import pool from '../config/db-connection.js';
+import { checkPermission } from '../middleware/checkPermission.js';
 import { resolveMenuDepartmentIds } from './menu_departamentos.js';
 
 const router = express.Router();
+const MENU_POS_VIEW_PERMISSIONS = ['MENU_POS_VER', 'MENU_VER'];
 
 const hasColumn = async (tableName, columnName) => {
   const query = `
@@ -231,7 +233,7 @@ const enrichCatalogItemsWithSauceConfig = async (items) => {
 // GET: Productos + combos del POS con URL de imagen
 // URL: /menu-pos/catalogo-imagenes?id_tipo_departamento=?
 // =====================================================
-router.get('/menu-pos/catalogo-imagenes', async (req, res) => {
+router.get('/menu-pos/catalogo-imagenes', checkPermission(MENU_POS_VIEW_PERMISSIONS), async (req, res) => {
   try {
     const rawIdTipoDepartamento = req.query.id_tipo_departamento;
     const idTipoDepartamento =
@@ -363,7 +365,7 @@ router.get('/menu-pos/catalogo-imagenes', async (req, res) => {
   }
 });
 
-router.get('/menu-pos/catalogo-imagenes/:id_tipo_departamento', async (req, res) => {
+router.get('/menu-pos/catalogo-imagenes/:id_tipo_departamento', checkPermission(MENU_POS_VIEW_PERMISSIONS), async (req, res) => {
   try {
     const { id_tipo_departamento } = req.params;
     const idDep = Number(id_tipo_departamento);

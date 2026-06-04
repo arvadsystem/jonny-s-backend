@@ -127,7 +127,7 @@ const mapDbError = (err) => {
   });
 };
 
-const validateEmpleadoPayload = (payload = {}, { requirePersona = false, requireSucursal = false } = {}) => {
+const validateEmpleadoPayload = (payload = {}, { requirePersona = false, requireSucursal = false, requireCargo = false } = {}) => {
   const errors = [];
 
   if (requirePersona && !parsePositiveInt(payload.id_persona)) {
@@ -170,6 +170,14 @@ const validateEmpleadoPayload = (payload = {}, { requirePersona = false, require
     const idCargo = parsePositiveInt(payload.id_cargo);
     if (payload.id_cargo !== null && payload.id_cargo !== '' && !idCargo) {
       errors.push({ field: 'id_cargo', message: 'id_cargo debe ser entero positivo.' });
+    }
+  }
+
+  if (requireCargo) {
+    const idCargo = parsePositiveInt(payload.id_cargo);
+    const cargoTexto = String(payload.cargo ?? '').trim();
+    if (!idCargo && !cargoTexto) {
+      errors.push({ field: 'cargo', message: 'Debe indicar un cargo valido para el empleado.' });
     }
   }
 
@@ -596,6 +604,14 @@ const empleadoRepository = {
     return result.rows.length > 0;
   },
 
+  async cargoExists(idCargo, db = pool) {
+    const result = await db.query(
+      'SELECT 1 FROM cargos_empleados WHERE id_cargo = $1 AND COALESCE(estado, true) = true LIMIT 1',
+      [idCargo]
+    );
+    return result.rows.length > 0;
+  },
+
   async personaTenantEmpresa(idPersona, db = pool) {
     const result = await db.query(
       'SELECT id_empresa FROM personas WHERE id_persona = $1 LIMIT 1',
@@ -855,7 +871,7 @@ const empleadoService = {
       };
     }
 
-    const validationErrors = validateEmpleadoPayload(payload, { requirePersona: true, requireSucursal: true });
+    const validationErrors = validateEmpleadoPayload(payload, { requirePersona: true, requireSucursal: true, requireCargo: true });
     if (validationErrors.length) {
       return {
         status: 400,
@@ -900,6 +916,14 @@ const empleadoService = {
       return {
         status: 404,
         body: buildErrorBody({ code: 'NOT_FOUND', message: 'La sucursal seleccionada no existe.' })
+      };
+    }
+
+    const idCargo = parsePositiveInt(insertData.id_cargo);
+    if (idCargo && !(await empleadoRepository.cargoExists(idCargo))) {
+      return {
+        status: 404,
+        body: buildErrorBody({ code: 'NOT_FOUND', message: 'El cargo seleccionado no existe o esta inactivo.' })
       };
     }
 
@@ -1092,6 +1116,16 @@ const empleadoService = {
         return {
           status: 404,
           body: buildErrorBody({ code: 'NOT_FOUND', message: 'La sucursal seleccionada no existe.' })
+        };
+      }
+    }
+
+    if (hasOwn(payload, 'id_cargo')) {
+      const nextCargoId = parsePositiveInt(payload.id_cargo);
+      if (!nextCargoId || !(await empleadoRepository.cargoExists(nextCargoId))) {
+        return {
+          status: 404,
+          body: buildErrorBody({ code: 'NOT_FOUND', message: 'El cargo seleccionado no existe o esta inactivo.' })
         };
       }
     }

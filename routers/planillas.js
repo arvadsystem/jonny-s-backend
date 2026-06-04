@@ -226,6 +226,7 @@ const AUDITORIA_QUERY_ALLOWED_FIELDS = new Set(['page', 'limit', 'entidad', 'id_
 
 let planillaFunctionCatalogPromise;
 let horasExtraIdColumnPromise;
+let planillaSchemaCapabilitiesPromise;
 
 const HORAS_EXTRA_ID_COLUMN_CANDIDATES = Object.freeze([
   'id_horas_extras',
@@ -239,6 +240,68 @@ const QUINCENA_ESTADO_AUDITORIA_ACCION = 'ESTADO_QUINCENA';
 const QUINCENA_ESTADO_AUDITORIA_ENTIDAD = 'PLANILLA_QUINCENAL';
 const QUINCENA_ADELANTO_AUDITORIA_ACCION = 'ADELANTO_QUINCENA';
 const QUINCENA_ADELANTO_AUDITORIA_ENTIDAD = 'PLANILLA_ADELANTO';
+
+const getPlanillaSchemaCapabilities = async () => {
+  if (!planillaSchemaCapabilitiesPromise) {
+    planillaSchemaCapabilitiesPromise = (async () => {
+      const result = await pool.query(
+        `
+          SELECT table_name, column_name
+          FROM information_schema.columns
+          WHERE table_schema = 'public'
+            AND (
+              (table_name = 'planillas' AND column_name = ANY($1::text[]))
+              OR (table_name = 'movimiento_planilla' AND column_name = ANY($2::text[]))
+              OR (table_name = 'adelanto_aplicacion' AND column_name = ANY($3::text[]))
+            )
+        `,
+        [
+          ['tipo_periodo', 'quincena', 'fecha_inicio', 'fecha_fin', 'periodo', 'observacion'],
+          ['tipo_periodo', 'quincena', 'fecha_aplicacion'],
+          ['tipo_periodo', 'quincena']
+        ]
+      );
+
+      const byTable = new Map();
+      for (const row of result.rows || []) {
+        const table = String(row.table_name || '').trim();
+        const column = String(row.column_name || '').trim();
+        if (!table || !column) continue;
+        if (!byTable.has(table)) byTable.set(table, new Set());
+        byTable.get(table).add(column);
+      }
+
+      const planillasColumns = byTable.get('planillas') || new Set();
+      const movimientosColumns = byTable.get('movimiento_planilla') || new Set();
+      const adelantosColumns = byTable.get('adelanto_aplicacion') || new Set();
+
+      return {
+        planillas: {
+          hasTipoPeriodo: planillasColumns.has('tipo_periodo'),
+          hasQuincena: planillasColumns.has('quincena'),
+          hasFechaInicio: planillasColumns.has('fecha_inicio'),
+          hasFechaFin: planillasColumns.has('fecha_fin'),
+          hasPeriodo: planillasColumns.has('periodo'),
+          hasObservacion: planillasColumns.has('observacion')
+        },
+        movimientoPlanilla: {
+          hasTipoPeriodo: movimientosColumns.has('tipo_periodo'),
+          hasQuincena: movimientosColumns.has('quincena'),
+          hasFechaAplicacion: movimientosColumns.has('fecha_aplicacion')
+        },
+        adelantoAplicacion: {
+          hasTipoPeriodo: adelantosColumns.has('tipo_periodo'),
+          hasQuincena: adelantosColumns.has('quincena')
+        }
+      };
+    })().catch((error) => {
+      planillaSchemaCapabilitiesPromise = null;
+      throw error;
+    });
+  }
+
+  return planillaSchemaCapabilitiesPromise;
+};
 
 const normalizeTipoPeriodo = (value) => {
   if (value === null || value === undefined || value === '') return TIPO_PERIODO.MENSUAL;
@@ -474,6 +537,55 @@ const buildPeriodoMeta = ({ fechaPlanilla, tipoPeriodo, quincena = null, diasLab
     horas_laboradas: horasLaboradas,
     factor_prorrateo: quincenaWindow?.factor || 0.5
   };
+};
+
+const buildPersistedPeriodoMeta = ({ fechaPlanilla, tipoPeriodo, quincena = null, observacion = null } = {}) => {
+  const monthKey = toMonthKey(fechaPlanilla);
+  const normalizedTipoPeriodo =
+    normalizeTipoPeriodoStrict(tipoPeriodo) || TIPO_PERIODO.MENSUAL;
+
+  if (!monthKey) {
+    return {
+      tipo_periodo: normalizedTipoPeriodo,
+      quincena: normalizedTipoPeriodo === TIPO_PERIODO.QUINCENAL ? normalizeQuincena(quincena) : null,
+      periodo: null,
+      fecha_inicio: null,
+      fecha_fin: null,
+      observacion: sanitizeText(observacion, 255)
+    };
+  }
+
+  if (normalizedTipoPeriodo === TIPO_PERIODO.QUINCENAL) {
+    const quincenaWindow = resolveQuincenaWindow(fechaPlanilla, quincena || 1);
+    return {
+      tipo_periodo: TIPO_PERIODO.QUINCENAL,
+      quincena: quincenaWindow?.quincena || 1,
+      periodo: monthKey,
+      fecha_inicio: quincenaWindow?.inicio || `${monthKey}-01`,
+      fecha_fin: quincenaWindow?.fin || `${monthKey}-15`,
+      observacion: sanitizeText(observacion, 255)
+    };
+  }
+
+  const baseDate = new Date(`${monthKey}-01T00:00:00Z`);
+  const lastDay = getDaysInMonth(baseDate);
+  return {
+    tipo_periodo: TIPO_PERIODO.MENSUAL,
+    quincena: null,
+    periodo: monthKey,
+    fecha_inicio: `${monthKey}-01`,
+    fecha_fin: `${monthKey}-${String(lastDay).padStart(2, '0')}`,
+    observacion: sanitizeText(observacion, 255)
+  };
+};
+
+const resolvePlanillaFactor = (planillaMeta = {}) => {
+  const tipoPeriodo = normalizeTipoPeriodoStrict(planillaMeta?.tipo_periodo) || TIPO_PERIODO.MENSUAL;
+  if (tipoPeriodo !== TIPO_PERIODO.QUINCENAL) return 1;
+  const explicitFactor = Number(planillaMeta?.factor_prorrateo);
+  if (Number.isFinite(explicitFactor) && explicitFactor > 0 && explicitFactor <= 1) return explicitFactor;
+  const window = resolveQuincenaWindow(planillaMeta?.fecha_inicio || planillaMeta?.periodo || planillaMeta?.fecha_creacion, planillaMeta?.quincena);
+  return window?.factor || 0.5;
 };
 
 const resolvePeriodoContextInput = ({
@@ -1128,36 +1240,110 @@ const resolveDefaultEstadoPlanillaId = async () => {
   return parsePositiveInt(fallback.rows?.[0]?.id_estado_planilla);
 };
 
-const findExistingPlanillaIdByMonthAndSucursal = async (idSucursal, fechaPlanilla) => {
-  const result = await pool.query(
+const findExistingPlanillaIdByScope = async ({
+  db = pool,
+  idSucursal,
+  fechaPlanilla,
+  tipoPeriodo = TIPO_PERIODO.MENSUAL,
+  quincena = null
+}) => {
+  const capabilities = await getPlanillaSchemaCapabilities();
+  const persistedMeta = buildPersistedPeriodoMeta({ fechaPlanilla, tipoPeriodo, quincena });
+
+  if (capabilities.planillas.hasPeriodo && capabilities.planillas.hasTipoPeriodo && capabilities.planillas.hasQuincena) {
+    const result = await db.query(
+      `
+        SELECT id_planilla
+        FROM public.planillas
+        WHERE id_sucursal = $1
+          AND COALESCE(periodo, to_char(fecha_creacion, 'YYYY-MM')) = $2
+          AND UPPER(COALESCE(tipo_periodo, 'MENSUAL')) = $3
+          AND (
+            ($4::int IS NULL AND quincena IS NULL)
+            OR quincena = $4::int
+          )
+        ORDER BY id_planilla DESC
+        LIMIT 1
+      `,
+      [idSucursal, persistedMeta.periodo, persistedMeta.tipo_periodo, persistedMeta.quincena]
+    );
+    return parsePositiveInt(result.rows?.[0]?.id_planilla);
+  }
+
+  if ((normalizeTipoPeriodoStrict(tipoPeriodo) || TIPO_PERIODO.MENSUAL) === TIPO_PERIODO.MENSUAL) {
+    const result = await db.query(
+      `
+        SELECT id_planilla
+        FROM public.planillas
+        WHERE id_sucursal = $1
+          AND date_trunc('month', fecha_creacion) = date_trunc('month', $2::timestamp)
+        ORDER BY id_planilla DESC
+        LIMIT 1
+      `,
+      [idSucursal, fechaPlanilla]
+    );
+    return parsePositiveInt(result.rows?.[0]?.id_planilla);
+  }
+
+  return null;
+};
+
+const listPlanillaMetadataByIds = async (planillaIds = [], db = pool) => {
+  const ids = [...new Set((Array.isArray(planillaIds) ? planillaIds : []).map((value) => parsePositiveInt(value)).filter(Boolean))];
+  if (!ids.length) return new Map();
+
+  const capabilities = await getPlanillaSchemaCapabilities();
+  const selectParts = [
+    'p.id_planilla',
+    'p.fecha_creacion',
+    'p.id_sucursal',
+    capabilities.planillas.hasTipoPeriodo ? "UPPER(COALESCE(p.tipo_periodo, 'MENSUAL')) AS tipo_periodo" : "'MENSUAL'::varchar AS tipo_periodo",
+    capabilities.planillas.hasQuincena ? 'p.quincena' : 'NULL::int AS quincena',
+    capabilities.planillas.hasFechaInicio ? 'p.fecha_inicio' : "date_trunc('month', p.fecha_creacion)::date AS fecha_inicio",
+    capabilities.planillas.hasFechaFin
+      ? 'p.fecha_fin'
+      : "(date_trunc('month', p.fecha_creacion) + interval '1 month - 1 day')::date AS fecha_fin",
+    capabilities.planillas.hasPeriodo ? "COALESCE(p.periodo, to_char(p.fecha_creacion, 'YYYY-MM')) AS periodo" : "to_char(p.fecha_creacion, 'YYYY-MM') AS periodo",
+    capabilities.planillas.hasObservacion ? 'p.observacion' : 'NULL::text AS observacion'
+  ];
+
+  const result = await db.query(
     `
-      SELECT id_planilla
-      FROM planillas
-      WHERE id_sucursal = $1
-        AND date_trunc('month', fecha_creacion) = date_trunc('month', $2::timestamp)
-      ORDER BY id_planilla DESC
-      LIMIT 1
+      SELECT ${selectParts.join(',\n             ')}
+      FROM public.planillas p
+      WHERE p.id_planilla = ANY($1::int[])
     `,
-    [idSucursal, fechaPlanilla]
+    [ids]
   );
-  return parsePositiveInt(result.rows?.[0]?.id_planilla);
+
+  return new Map(
+    (result.rows || []).map((row) => [
+      parsePositiveInt(row.id_planilla),
+      {
+        ...row,
+        tipo_periodo: normalizeTipoPeriodoStrict(row.tipo_periodo) || TIPO_PERIODO.MENSUAL,
+        quincena: normalizeQuincena(row.quincena),
+        periodo: String(row.periodo || '').trim() || null,
+        fecha_inicio: normalizeDateOnlyKey(row.fecha_inicio),
+        fecha_fin: normalizeDateOnlyKey(row.fecha_fin)
+      }
+    ])
+  );
 };
 
 const resolvePlanillaScope = async (idPlanilla) => {
-  const result = await pool.query(
-    `
-      SELECT id_planilla, id_sucursal
-      FROM planillas
-      WHERE id_planilla = $1
-      LIMIT 1
-    `,
-    [idPlanilla]
-  );
-
-  if (!result.rows?.length) return null;
+  const map = await listPlanillaMetadataByIds([idPlanilla]);
+  const meta = map.get(parsePositiveInt(idPlanilla));
+  if (!meta) return null;
   return {
-    id_planilla: parsePositiveInt(result.rows[0].id_planilla),
-    id_sucursal: parsePositiveInt(result.rows[0].id_sucursal)
+    id_planilla: parsePositiveInt(meta.id_planilla),
+    id_sucursal: parsePositiveInt(meta.id_sucursal),
+    tipo_periodo: meta.tipo_periodo,
+    quincena: meta.quincena,
+    periodo: meta.periodo,
+    fecha_inicio: meta.fecha_inicio,
+    fecha_fin: meta.fecha_fin,
+    fecha_creacion: meta.fecha_creacion
   };
 };
 
@@ -1187,6 +1373,237 @@ const resolveMovimientoScope = async (idMovimiento) => {
     id_planilla: parsePositiveInt(result.rows[0].id_planilla),
     id_sucursal: parsePositiveInt(result.rows[0].id_sucursal)
   };
+};
+
+const listPlanillaEligibleEmployeesBySucursal = async ({ db = pool, idSucursal }) => {
+  const safeSucursalId = parsePositiveInt(idSucursal);
+  if (!safeSucursalId) return { validRows: [], invalidRows: [] };
+
+  const result = await db.query(
+    `
+      SELECT
+        e.id_empleado,
+        e.estado,
+        e.salario_base,
+        e.id_sucursal,
+        e.id_cargo,
+        e.cargo,
+        NULLIF(TRIM(CONCAT(COALESCE(p.nombre, ''), ' ', COALESCE(p.apellido, ''))), '') AS nombre_empleado
+      FROM public.empleados e
+      LEFT JOIN public.personas p
+        ON p.id_persona = e.id_persona
+      WHERE e.id_sucursal = $1
+        AND COALESCE(e.estado, FALSE) = TRUE
+      ORDER BY e.id_empleado
+    `,
+    [safeSucursalId]
+  );
+
+  const validRows = [];
+  const invalidRows = [];
+
+  for (const row of result.rows || []) {
+    const salary = Number(row.salario_base ?? 0);
+    const hasSalary = Number.isFinite(salary) && salary > 0;
+    const hasCargo = parsePositiveInt(row.id_cargo) || sanitizeText(row.cargo, 120);
+    const reason =
+      !hasSalary ? 'SALARIO_INVALIDO' : !hasCargo ? 'CARGO_INVALIDO' : null;
+
+    if (reason) {
+      invalidRows.push({
+        id_empleado: parsePositiveInt(row.id_empleado),
+        nombre_empleado: sanitizeText(row.nombre_empleado, 180) || `Empleado ${row.id_empleado}`,
+        motivo: reason,
+        salario_base: row.salario_base,
+        cargo: row.cargo ?? null
+      });
+      continue;
+    }
+
+    validRows.push(row);
+  }
+
+  return { validRows, invalidRows };
+};
+
+const insertPlanillaRecord = async ({
+  db = pool,
+  fechaPlanilla,
+  idEstadoPlanilla,
+  idSucursal,
+  tipoPeriodo = TIPO_PERIODO.MENSUAL,
+  quincena = null,
+  observacion = null
+}) => {
+  const capabilities = await getPlanillaSchemaCapabilities();
+  const meta = buildPersistedPeriodoMeta({ fechaPlanilla, tipoPeriodo, quincena, observacion });
+
+  if (
+    capabilities.planillas.hasTipoPeriodo ||
+    capabilities.planillas.hasQuincena ||
+    capabilities.planillas.hasFechaInicio ||
+    capabilities.planillas.hasFechaFin ||
+    capabilities.planillas.hasPeriodo ||
+    capabilities.planillas.hasObservacion
+  ) {
+    const columns = ['fecha_creacion', 'id_estado_planilla', 'id_sucursal'];
+    const values = [fechaPlanilla, idEstadoPlanilla, idSucursal];
+    const placeholders = ['$1', '$2', '$3'];
+
+    const append = (enabled, column, value) => {
+      if (!enabled) return;
+      columns.push(column);
+      values.push(value);
+      placeholders.push(`$${values.length}`);
+    };
+
+    append(capabilities.planillas.hasTipoPeriodo, 'tipo_periodo', meta.tipo_periodo);
+    append(capabilities.planillas.hasQuincena, 'quincena', meta.quincena);
+    append(capabilities.planillas.hasFechaInicio, 'fecha_inicio', meta.fecha_inicio);
+    append(capabilities.planillas.hasFechaFin, 'fecha_fin', meta.fecha_fin);
+    append(capabilities.planillas.hasPeriodo, 'periodo', meta.periodo);
+    append(capabilities.planillas.hasObservacion, 'observacion', meta.observacion);
+
+    const result = await db.query(
+      `
+        INSERT INTO public.planillas (${columns.join(', ')})
+        VALUES (${placeholders.join(', ')})
+        RETURNING id_planilla
+      `,
+      values
+    );
+    return parsePositiveInt(result.rows?.[0]?.id_planilla);
+  }
+
+  const result = await db.query(
+    `
+      INSERT INTO public.planillas (fecha_creacion, id_estado_planilla, id_sucursal)
+      VALUES ($1, $2, $3)
+      RETURNING id_planilla
+    `,
+    [fechaPlanilla, idEstadoPlanilla, idSucursal]
+  );
+  return parsePositiveInt(result.rows?.[0]?.id_planilla);
+};
+
+const insertPlanillaDetalleRows = async ({
+  db = pool,
+  idPlanilla,
+  employees = [],
+  diasLaborados,
+  horasLaboradas,
+  factorProrrateo = 1,
+  observacion = 'Generada por sucursal'
+}) => {
+  const safePlanillaId = parsePositiveInt(idPlanilla);
+  const safeEmployees = Array.isArray(employees) ? employees : [];
+  if (!safePlanillaId || !safeEmployees.length) return { inserted: 0 };
+
+  let inserted = 0;
+  for (const employee of safeEmployees) {
+    const salarioBase = roundTo(Number(employee.salario_base ?? 0) * factorProrrateo);
+    if (!(salarioBase > 0)) continue;
+
+    const result = await db.query(
+      `
+        INSERT INTO public.detalle_planilla (
+          salario_base,
+          dias_laborados,
+          horas_laboradas,
+          total_deducciones,
+          total_bonos,
+          neto_pagar,
+          id_planilla,
+          id_horas_extra,
+          id_empleado,
+          observaciones
+        )
+        VALUES ($1, $2, $3, 0, 0, $1, $4, NULL, $5, $6)
+        RETURNING id_detalle_planilla
+      `,
+      [salarioBase, diasLaborados, horasLaboradas, safePlanillaId, employee.id_empleado, observacion]
+    );
+
+    if (result.rowCount) inserted += 1;
+  }
+
+  return { inserted };
+};
+
+const updateMovimientoPeriodoContext = async ({
+  db = pool,
+  idMovimientoPlanilla,
+  tipoPeriodo,
+  quincena,
+  fechaAplicacion = null
+}) => {
+  const safeId = parsePositiveInt(idMovimientoPlanilla);
+  if (!safeId) return;
+
+  const capabilities = await getPlanillaSchemaCapabilities();
+  const updates = [];
+  const values = [];
+
+  if (capabilities.movimientoPlanilla.hasTipoPeriodo) {
+    values.push(normalizeTipoPeriodoStrict(tipoPeriodo) || TIPO_PERIODO.MENSUAL);
+    updates.push(`tipo_periodo = $${values.length}`);
+  }
+  if (capabilities.movimientoPlanilla.hasQuincena) {
+    values.push(normalizeQuincena(quincena));
+    updates.push(`quincena = $${values.length}`);
+  }
+  if (capabilities.movimientoPlanilla.hasFechaAplicacion) {
+    values.push(normalizeDateOnlyKey(fechaAplicacion));
+    updates.push(`fecha_aplicacion = $${values.length}`);
+  }
+  if (!updates.length) return;
+
+  values.push(safeId);
+  await db.query(
+    `
+      UPDATE public.movimiento_planilla
+      SET ${updates.join(', ')}
+      WHERE id_movimiento_planilla = $${values.length}
+    `,
+    values
+  );
+};
+
+const updateAdelantoAplicacionPeriodoContext = async ({
+  db = pool,
+  idPlanilla,
+  idAdelantoSalario,
+  tipoPeriodo,
+  quincena
+}) => {
+  const safePlanillaId = parsePositiveInt(idPlanilla);
+  const safeAdelantoId = parsePositiveInt(idAdelantoSalario);
+  if (!safePlanillaId || !safeAdelantoId) return;
+
+  const capabilities = await getPlanillaSchemaCapabilities();
+  const updates = [];
+  const values = [];
+
+  if (capabilities.adelantoAplicacion.hasTipoPeriodo) {
+    values.push(normalizeTipoPeriodoStrict(tipoPeriodo) || TIPO_PERIODO.MENSUAL);
+    updates.push(`tipo_periodo = $${values.length}`);
+  }
+  if (capabilities.adelantoAplicacion.hasQuincena) {
+    values.push(normalizeQuincena(quincena));
+    updates.push(`quincena = $${values.length}`);
+  }
+  if (!updates.length) return;
+
+  values.push(safePlanillaId, safeAdelantoId);
+  await db.query(
+    `
+      UPDATE public.adelanto_aplicacion
+      SET ${updates.join(', ')}
+      WHERE id_planilla = $${values.length - 1}
+        AND id_adelanto_salario = $${values.length}
+    `,
+    values
+  );
 };
 
 const validatePlanillaSucursalScope = async (idPlanilla, rawIdSucursal, options = {}) => {
@@ -1244,18 +1661,28 @@ const syncDetalleSalarioBaseFromEmpleado = async ({
   const safeDetalleId = idDetallePlanilla === null ? null : parsePositiveInt(idDetallePlanilla);
   if (idDetallePlanilla !== null && !safeDetalleId) return { updated: 0 };
 
+  const planillaMetaMap = await listPlanillaMetadataByIds([safePlanillaId], db);
+  const planillaMeta = planillaMetaMap.get(safePlanillaId) || {};
+  const factor = resolvePlanillaFactor(planillaMeta);
+  const isQuincenal =
+    (normalizeTipoPeriodoStrict(planillaMeta?.tipo_periodo) || TIPO_PERIODO.MENSUAL) === TIPO_PERIODO.QUINCENAL;
+  const salarioExpr = isQuincenal
+    ? 'ROUND((COALESCE(e.salario_base, 0) * $3::numeric)::numeric, 2)'
+    : 'COALESCE(e.salario_base, 0)';
+  const queryParams = isQuincenal ? [safePlanillaId, safeDetalleId, factor] : [safePlanillaId, safeDetalleId];
+
   const result = await db.query(
     `
       UPDATE public.detalle_planilla dp
-      SET salario_base = COALESCE(e.salario_base, 0)
+      SET salario_base = ${salarioExpr}
       FROM public.empleados e
       WHERE dp.id_planilla = $1
         AND dp.id_empleado = e.id_empleado
         AND ($2::int IS NULL OR dp.id_detalle_planilla = $2::int)
-        AND COALESCE(dp.salario_base, 0) IS DISTINCT FROM COALESCE(e.salario_base, 0)
+        AND COALESCE(dp.salario_base, 0) IS DISTINCT FROM ${salarioExpr}
       RETURNING dp.id_detalle_planilla
     `,
-    [safePlanillaId, safeDetalleId]
+    queryParams
   );
 
   const updatedIds = (result.rows || [])
@@ -1291,6 +1718,26 @@ const recalculateDetallePlanillaRows = async ({
   );
 
   return { recalculated: result.rowCount || 0 };
+};
+
+const preparePlanillaReadModel = async ({
+  idPlanilla
+}) => {
+  const safePlanillaId = parsePositiveInt(idPlanilla);
+  if (!safePlanillaId) return { prepared: false, skipped: true, reason: 'INVALID_PLANILLA' };
+
+  try {
+    await syncDetalleEmpleadosActivosBySucursal({ idPlanilla: safePlanillaId });
+    await syncDetalleSalarioBaseFromEmpleado({ idPlanilla: safePlanillaId });
+    await recalculateDetallePlanillaRows({ idPlanilla: safePlanillaId });
+    return { prepared: true };
+  } catch (error) {
+    return {
+      prepared: false,
+      skipped: true,
+      reason: sanitizeApiErrorMessage(error?.message, 500) || 'READ_MODEL_PREPARE_FAILED'
+    };
+  }
 };
 
 const PLANILLA_DETALLE_AUTO_SYNC_ALLOWED_STATES = new Set(['BORRADOR', 'CALCULADA']);
@@ -1379,6 +1826,63 @@ const buildResumenFromDetalleRows = (rows = []) => {
       total_empleados: 0
     }
   );
+};
+
+const buildPlanillaResumenFallback = async ({ db = pool, idPlanilla }) => {
+  const safePlanillaId = parsePositiveInt(idPlanilla);
+  if (!safePlanillaId) return null;
+
+  const [scope, detailResult] = await Promise.all([
+    resolvePlanillaScope(safePlanillaId),
+    db.query(
+      `
+        SELECT
+          dp.id_detalle_planilla,
+          dp.id_empleado,
+          COALESCE(dp.salario_base, 0) AS salario_base,
+          COALESCE(dp.total_bonos, 0) AS total_bonos,
+          COALESCE(dp.total_deducciones, 0) AS total_deducciones,
+          COALESCE(dp.neto_pagar, 0) AS neto_pagar
+        FROM public.detalle_planilla dp
+        WHERE dp.id_planilla = $1
+      `,
+      [safePlanillaId]
+    )
+  ]);
+
+  const resumen = buildResumenFromDetalleRows(detailResult.rows || []);
+  return {
+    id_planilla: safePlanillaId,
+    id_sucursal: parsePositiveInt(scope?.id_sucursal) || null,
+    empleados_recalculados: resumen.total_empleados,
+    total_salario_base: roundTo(resumen.total_salario_base),
+    total_bonos: roundTo(resumen.total_bonos),
+    total_deducciones: roundTo(resumen.total_deducciones),
+    total_neto_pagar: roundTo(resumen.total_neto_pagar)
+  };
+};
+
+const resolveEffectivePeriodoContextForPlanilla = async ({
+  idPlanilla,
+  requestedTipoPeriodo,
+  requestedQuincena
+}) => {
+  const scope = await resolvePlanillaScope(idPlanilla);
+  const scopeTipoPeriodo = normalizeTipoPeriodoStrict(scope?.tipo_periodo);
+  const scopeQuincena = normalizeQuincena(scope?.quincena);
+  if (scopeTipoPeriodo) {
+    return {
+      tipo_periodo: scopeTipoPeriodo,
+      quincena: scopeTipoPeriodo === TIPO_PERIODO.QUINCENAL ? scopeQuincena : null
+    };
+  }
+
+  const requestedTipo = normalizeTipoPeriodoStrict(requestedTipoPeriodo) || TIPO_PERIODO.MENSUAL;
+  const requestedQ = normalizeQuincena(requestedQuincena);
+  return {
+    tipo_periodo: requestedTipo,
+    quincena: requestedTipo === TIPO_PERIODO.QUINCENAL ? requestedQ : null
+  };
 };
 
 const dedupeDetallePlanillaByEmpleado = async ({ db = pool, idPlanilla }) => {
@@ -1514,6 +2018,10 @@ const syncDetalleEmpleadosActivosBySucursal = async ({
     return { inserted: 0, skipped: true, reason: 'INVALID_SUCURSAL' };
   }
 
+  const planillaMetaMap = await listPlanillaMetadataByIds([safePlanillaId], db);
+  const planillaMeta = planillaMetaMap.get(safePlanillaId) || {};
+  const factorProrrateo = resolvePlanillaFactor(planillaMeta);
+
   const estadoNormalizado = normalizeEstadoAlias(scopeRow.estado_planilla);
   const canSync =
     force || !estadoNormalizado || PLANILLA_DETALLE_AUTO_SYNC_ALLOWED_STATES.has(estadoNormalizado);
@@ -1577,12 +2085,12 @@ const syncDetalleEmpleadosActivosBySucursal = async ({
         observaciones
       )
       SELECT
-        COALESCE(e.salario_base, 0),
+        ROUND((COALESCE(e.salario_base, 0) * $4::numeric)::numeric, 2),
         d.dias_laborados_default,
         d.horas_laboradas_default,
         0,
         0,
-        COALESCE(e.salario_base, 0),
+        ROUND((COALESCE(e.salario_base, 0) * $4::numeric)::numeric, 2),
         $1,
         NULL,
         e.id_empleado,
@@ -1607,7 +2115,7 @@ const syncDetalleEmpleadosActivosBySucursal = async ({
         )
       RETURNING id_detalle_planilla
     `,
-    [safePlanillaId, idSucursal, PLANILLA_ALLOWED_ROLE_TOKENS_LIST]
+    [safePlanillaId, idSucursal, PLANILLA_ALLOWED_ROLE_TOKENS_LIST, factorProrrateo]
   );
 
   if (dedupe.deleted > 0 || cleanup.removed > 0) {
@@ -2419,10 +2927,15 @@ const planillaService = {
     const quincenaEstadoAuditByPlanilla = shouldResolveQuincenaContext
       ? await listQuincenaEstadoAuditByPlanillaIds(filtered.map((row) => row?.id_planilla))
       : new Map();
+    const metadataByPlanilla = await listPlanillaMetadataByIds(filtered.map((row) => row?.id_planilla));
 
     const rowsWithPeriodoMeta = filtered.map((row) => {
-      const rowTipoPeriodo = resolveRowTipoPeriodo(row);
-      const rowQuincena = rowTipoPeriodo === TIPO_PERIODO.QUINCENAL ? resolveRowQuincena(row) : null;
+      const metadata = metadataByPlanilla.get(parsePositiveInt(row?.id_planilla)) || {};
+      const rowTipoPeriodo = metadata.tipo_periodo || resolveRowTipoPeriodo(row);
+      const rowQuincena =
+        rowTipoPeriodo === TIPO_PERIODO.QUINCENAL
+          ? metadata.quincena ?? resolveRowQuincena(row)
+          : null;
       const resolvedTipoPeriodo = shouldResolveQuincenaContext
         ? TIPO_PERIODO.QUINCENAL
         : rowTipoPeriodo;
@@ -2450,13 +2963,14 @@ const planillaService = {
         ...row,
         tipo_periodo: shouldResolveQuincenaContext
           ? TIPO_PERIODO.QUINCENAL
-          : row?.tipo_periodo ?? rowPeriodoMeta.tipo_periodo,
-        quincena: row?.quincena ?? resolvedQuincena ?? rowPeriodoMeta.quincena,
-        periodo_inicio: row?.periodo_inicio ?? rowPeriodoMeta.periodo_inicio,
-        periodo_fin: row?.periodo_fin ?? rowPeriodoMeta.periodo_fin,
+          : metadata.tipo_periodo ?? row?.tipo_periodo ?? rowPeriodoMeta.tipo_periodo,
+        quincena: metadata.quincena ?? row?.quincena ?? resolvedQuincena ?? rowPeriodoMeta.quincena,
+        periodo: metadata.periodo ?? toMonthKey(row?.fecha_creacion),
+        periodo_inicio: metadata.fecha_inicio ?? row?.periodo_inicio ?? rowPeriodoMeta.periodo_inicio,
+        periodo_fin: metadata.fecha_fin ?? row?.periodo_fin ?? rowPeriodoMeta.periodo_fin,
         dias_laborados: row?.dias_laborados ?? rowPeriodoMeta.dias_laborados,
         horas_laboradas: row?.horas_laboradas ?? rowPeriodoMeta.horas_laboradas,
-        factor_prorrateo: row?.factor_prorrateo ?? rowPeriodoMeta.factor_prorrateo,
+        factor_prorrateo: metadata.factor_prorrateo ?? row?.factor_prorrateo ?? rowPeriodoMeta.factor_prorrateo,
         estado_planilla: contextualEstado.estado || row?.estado_planilla,
         estado: contextualEstado.estado || row?.estado,
         id_estado_planilla:
@@ -2572,31 +3086,76 @@ const planillaService = {
       });
     }
 
+    const existingId = await findExistingPlanillaIdByScope({
+      idSucursal,
+      fechaPlanilla,
+      tipoPeriodo,
+      quincena
+    });
+    if (existingId) {
+      return {
+        status: 200,
+        body: {
+          error: false,
+          message: 'La planilla ya existia para ese periodo y sucursal.',
+          data: { id_planilla: existingId, existente: true, ...periodoMeta, periodo: toMonthKey(fechaPlanilla) }
+        }
+      };
+    }
+
+    const { validRows, invalidRows } = await listPlanillaEligibleEmployeesBySucursal({
+      idSucursal
+    });
+    if (!validRows.length) {
+      return {
+        status: 409,
+        body: buildErrorBody({
+          code: 'NO_VALID_EMPLOYEES',
+          message: 'No hay empleados activos validos para generar la planilla en esta sucursal.',
+          details: {
+            invalid_employees: invalidRows.slice(0, 25)
+          }
+        })
+      };
+    }
+
+    const client = await pool.connect();
     let idPlanilla;
     try {
-      idPlanilla = await queryFunctionScalar(PLANILLA_ENDPOINT_CONTRACT.generar, [
-        idSucursal,
+      await client.query('BEGIN');
+      idPlanilla = await insertPlanillaRecord({
+        db: client,
         fechaPlanilla,
         idEstadoPlanilla,
+        idSucursal,
+        tipoPeriodo,
+        quincena,
+        observacion:
+          tipoPeriodo === TIPO_PERIODO.QUINCENAL
+            ? `Planilla quincenal Q${quincena}`
+            : 'Planilla mensual'
+      });
+
+      const factorProrrateo = resolvePlanillaFactor(
+        buildPersistedPeriodoMeta({ fechaPlanilla, tipoPeriodo, quincena })
+      );
+
+      await insertPlanillaDetalleRows({
+        db: client,
+        idPlanilla,
+        employees: validRows,
         diasLaborados,
-        horasLaboradas
-      ]);
+        horasLaboradas,
+        factorProrrateo,
+        observacion: 'Generada por sucursal'
+      });
+
+      await client.query('COMMIT');
     } catch (error) {
-      const rawMessage = String(error?.message || '').toLowerCase();
-      if (String(error?.code || '').toUpperCase() === 'P0001' && rawMessage.includes('ya existe una planilla')) {
-        const existingId = await findExistingPlanillaIdByMonthAndSucursal(idSucursal, fechaPlanilla);
-        if (existingId) {
-          return {
-            status: 200,
-            body: {
-              error: false,
-              message: 'La planilla ya existia para ese periodo y sucursal.',
-              data: { id_planilla: existingId, existente: true, ...periodoMeta }
-            }
-          };
-        }
-      }
+      await client.query('ROLLBACK');
       throw error;
+    } finally {
+      client.release();
     }
 
     return {
@@ -2604,7 +3163,13 @@ const planillaService = {
       body: {
         error: false,
         message: 'Planilla generada correctamente',
-        data: { id_planilla: idPlanilla, ...periodoMeta }
+        data: {
+          id_planilla: idPlanilla,
+          ...periodoMeta,
+          periodo: toMonthKey(fechaPlanilla),
+          invalid_employees_skipped: invalidRows.slice(0, 25),
+          invalid_employees_count: invalidRows.length
+        }
       }
     };
   },
@@ -2632,14 +3197,48 @@ const planillaService = {
       return { status: scopeValidation.status, body: scopeValidation.body };
     }
 
-    await syncDetalleEmpleadosActivosBySucursal({ idPlanilla });
-    await syncDetalleSalarioBaseFromEmpleado({ idPlanilla });
-    const rows = await queryFunctionRows(PLANILLA_ENDPOINT_CONTRACT.recalcularPlanilla, [idPlanilla]);
-    return {
-      status: 200,
-      body: { error: false, message: 'Planilla recalculada correctamente', data: rows[0] || null }
-    };
-  },
+    const estadoActualResult = await pool.query(
+      `
+        SELECT COALESCE(ep.descripcion, '') AS estado_planilla
+        FROM public.planillas p
+        LEFT JOIN public.estado_planilla ep
+          ON ep.id_estado_planilla = p.id_estado_planilla
+        WHERE p.id_planilla = $1
+        LIMIT 1
+      `,
+      [idPlanilla]
+    );
+    const estadoActual = normalizeEstadoAlias(estadoActualResult.rows?.[0]?.estado_planilla);
+    if (['CALCULADA', 'CERRADA', 'PAGADA', 'ANULADA'].includes(estadoActual)) {
+      return {
+        status: 409,
+        body: buildErrorBody({
+          code: 'PLANILLA_STATE_LOCKED',
+          message: `La planilla en estado ${estadoActual} no puede recalcularse sin reabrirla antes.`
+        })
+      };
+    }
+
+      try {
+        await syncDetalleEmpleadosActivosBySucursal({ idPlanilla });
+        await syncDetalleSalarioBaseFromEmpleado({ idPlanilla });
+      } catch {
+        // AM: si la preparacion automatica falla en una planilla legacy, continuamos con el recalculo principal.
+      }
+
+      let data = null;
+      try {
+        const rows = await queryFunctionRows(PLANILLA_ENDPOINT_CONTRACT.recalcularPlanilla, [idPlanilla]);
+        data = rows[0] || null;
+      } catch {
+        await recalculateDetallePlanillaRows({ idPlanilla });
+        data = await buildPlanillaResumenFallback({ idPlanilla });
+      }
+      return {
+        status: 200,
+        body: { error: false, message: 'Planilla recalculada correctamente', data }
+      };
+    },
 
   async detalle(req) {
     const invalidQuery = validateAllowedQueryFields(req.query, DETALLE_QUERY_ALLOWED_FIELDS);
@@ -2670,9 +3269,7 @@ const planillaService = {
     const tipoPeriodoContext = periodoContext.tipo_periodo;
     const quincenaContext = periodoContext.quincena;
 
-    await syncDetalleEmpleadosActivosBySucursal({ idPlanilla });
-    await syncDetalleSalarioBaseFromEmpleado({ idPlanilla });
-    await recalculateDetallePlanillaRows({ idPlanilla });
+    await preparePlanillaReadModel({ idPlanilla });
 
     const pagination = parsePagination(req.query || {});
     if (!pagination) {
@@ -2866,9 +3463,7 @@ const planillaService = {
     const tipoPeriodoContext = periodoContext.tipo_periodo;
     const quincenaContext = periodoContext.quincena;
 
-    await syncDetalleEmpleadosActivosBySucursal({ idPlanilla });
-    await syncDetalleSalarioBaseFromEmpleado({ idPlanilla });
-    await recalculateDetallePlanillaRows({ idPlanilla });
+    await preparePlanillaReadModel({ idPlanilla });
 
     if (tipoPeriodoContext === TIPO_PERIODO.QUINCENAL) {
       const detalleRowsRaw = await queryFunctionRows(PLANILLA_ENDPOINT_CONTRACT.detalle, [idPlanilla]);
@@ -2982,9 +3577,7 @@ const planillaService = {
       return { status: scopeValidation.status, body: scopeValidation.body };
     }
 
-    await syncDetalleEmpleadosActivosBySucursal({ idPlanilla });
-    await syncDetalleSalarioBaseFromEmpleado({ idPlanilla });
-    await recalculateDetallePlanillaRows({ idPlanilla });
+    await preparePlanillaReadModel({ idPlanilla });
 
     const data = await queryFunctionScalar(PLANILLA_ENDPOINT_CONTRACT.completa, [idPlanilla]);
     if (data && typeof data === 'object') {
@@ -3760,6 +4353,29 @@ const planillaService = {
       };
     }
 
+    const estadoActualResult = await pool.query(
+      `
+        SELECT COALESCE(ep.descripcion, '') AS estado_planilla
+        FROM public.planillas p
+        LEFT JOIN public.estado_planilla ep
+          ON ep.id_estado_planilla = p.id_estado_planilla
+        WHERE p.id_planilla = $1
+        LIMIT 1
+      `,
+      [idPlanilla]
+    );
+    const estadoActual = normalizeEstadoAlias(estadoActualResult.rows?.[0]?.estado_planilla);
+    const estadoDestino = normalizeEstadoAlias(estadoInfo.descripcion);
+    if (estadoActual === 'ANULADA' && !['ANULADA', 'BORRADOR', 'CALCULADA'].includes(estadoDestino)) {
+      return {
+        status: 409,
+        body: buildErrorBody({
+          code: 'PLANILLA_ANULADA',
+          message: 'La planilla anulada solo puede reabrirse a borrador o calculada antes de continuar el flujo.'
+        })
+      };
+    }
+
     const requiredPermission = getRequiredEstadoPermission(estadoInfo.descripcion);
     if (requiredPermission) {
       const hasPermission = await requestHasAnyPermission(req, [requiredPermission]);
@@ -4142,35 +4758,43 @@ const planillaService = {
       throw error;
     }
 
-    let data = null;
-    try {
-      const rows = await queryFunctionRows(PLANILLA_ENDPOINT_CONTRACT.aplicarAdelanto, [
+      const effectivePeriodoContext = await resolveEffectivePeriodoContextForPlanilla({
+        idPlanilla,
+        requestedTipoPeriodo: periodoContext.tipo_periodo,
+        requestedQuincena: periodoContext.quincena
+      });
+
+      // AM: usamos la ruta de compatibilidad como flujo principal para evitar fallas de la funcion SQL legacy.
+      const data = await applyAdelantoFallback({
         idAdelanto,
         idPlanilla,
-        montoAplicarEfectivo
-      ]);
-      data = rows[0] || null;
-    } catch (err) {
-      // Fallback seguro mientras se alinea la funcion SQL en BD (caso comun: 42702 ambigua)
-      if (err?.code === '42702' || err?.code === '42883') {
-        data = await applyAdelantoFallback({
-          idAdelanto,
+        montoAplicar: montoAplicarEfectivo
+      });
+
+      if (
+        effectivePeriodoContext.tipo_periodo === TIPO_PERIODO.QUINCENAL &&
+        effectivePeriodoContext.quincena
+      ) {
+        await updateAdelantoAplicacionPeriodoContext({
           idPlanilla,
-          montoAplicar: montoAplicarEfectivo
+          idAdelantoSalario: idAdelanto,
+          tipoPeriodo: effectivePeriodoContext.tipo_periodo,
+          quincena: effectivePeriodoContext.quincena
+        });
+        await registerQuincenaAdelantoAudit({
+          idPlanilla,
+          idAdelantoSalario: idAdelanto,
+          quincena: effectivePeriodoContext.quincena,
+          usuarioAccion: String(req.user?.id_usuario || 'sistema')
         });
       } else {
-        throw err;
+        await updateAdelantoAplicacionPeriodoContext({
+          idPlanilla,
+          idAdelantoSalario: idAdelanto,
+          tipoPeriodo: effectivePeriodoContext.tipo_periodo,
+          quincena: null
+        });
       }
-    }
-
-    if (periodoContext.tipo_periodo === TIPO_PERIODO.QUINCENAL && periodoContext.quincena) {
-      await registerQuincenaAdelantoAudit({
-        idPlanilla,
-        idAdelantoSalario: idAdelanto,
-        quincena: periodoContext.quincena,
-        usuarioAccion: String(req.user?.id_usuario || 'sistema')
-      });
-    }
 
     return {
       status: 200,
@@ -4744,12 +5368,20 @@ const planillaService = {
       observacion
     ]);
 
+    const movimientoCreado = rows[0] || null;
+    await updateMovimientoPeriodoContext({
+      idMovimientoPlanilla: movimientoCreado?.id_movimiento_planilla,
+      tipoPeriodo: periodoContext.tipo_periodo,
+      quincena: periodoContext.quincena,
+      fechaAplicacion: scopeValidation.scope?.fecha_inicio || scopeValidation.scope?.fecha_creacion || new Date()
+    });
+
     return {
       status: 201,
       body: {
         error: false,
         message: 'Movimiento registrado correctamente',
-        data: rows[0] || null
+        data: movimientoCreado
       }
     };
   },

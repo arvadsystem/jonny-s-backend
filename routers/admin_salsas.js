@@ -3,8 +3,11 @@ import pool from '../config/db-connection.js';
 import { checkPermission } from '../middleware/checkPermission.js';
 
 const router = express.Router();
-const MENU_VIEW_PERMISSIONS = ['MENU_VER'];
-const MENU_MUTATION_PERMISSIONS = ['MENU_VER'];
+// AM: transicion segura a permisos granulares sin romper el acceso actual mientras se alinea BD/roles.
+const MENU_SALSAS_VIEW_PERMISSIONS = ['MENU_SALSAS_VER', 'MENU_VER'];
+const MENU_SALSAS_CREATE_PERMISSIONS = ['MENU_SALSAS_CREAR', 'MENU_VER'];
+const MENU_SALSAS_EDIT_PERMISSIONS = ['MENU_SALSAS_EDITAR', 'MENU_VER'];
+const MENU_SALSAS_STATE_PERMISSIONS = ['MENU_SALSAS_ESTADO_CAMBIAR', 'MENU_VER'];
 
 const columnMetaCache = new Map();
 
@@ -233,7 +236,51 @@ const normalizeRulesPayload = (rows) => {
   return { ok: true, data: normalized };
 };
 
-router.get('/', checkPermission(MENU_VIEW_PERMISSIONS), async (req, res) => {
+const validateRulesConsistency = (rules, allowedSauceCount) => {
+  if (!Array.isArray(rules) || rules.length === 0) {
+    return { ok: true };
+  }
+
+  if (!Number.isInteger(allowedSauceCount) || allowedSauceCount <= 0) {
+    return {
+      ok: false,
+      message: 'Debes seleccionar al menos una salsa permitida antes de guardar reglas por unidades.'
+    };
+  }
+
+  const sortedRules = [...rules]
+    .map((rule) => ({
+      min_unidades: Number(rule.min_unidades),
+      max_unidades: rule.max_unidades === null ? null : Number(rule.max_unidades),
+      salsas_requeridas: Number(rule.salsas_requeridas)
+    }))
+    .sort((left, right) => left.min_unidades - right.min_unidades);
+
+  for (let index = 0; index < sortedRules.length; index += 1) {
+    const currentRule = sortedRules[index];
+    if (currentRule.salsas_requeridas > allowedSauceCount) {
+      return {
+        ok: false,
+        message: `Regla #${index + 1}: salsas_requeridas no puede exceder las ${allowedSauceCount} salsas permitidas.`
+      };
+    }
+
+    if (index === 0) continue;
+
+    const previousRule = sortedRules[index - 1];
+    const previousMax = previousRule.max_unidades === null ? Number.POSITIVE_INFINITY : previousRule.max_unidades;
+    if (currentRule.min_unidades <= previousMax) {
+      return {
+        ok: false,
+        message: 'No se permiten rangos traslapados en las reglas de salsas por receta.'
+      };
+    }
+  }
+
+  return { ok: true };
+};
+
+router.get('/', checkPermission(MENU_SALSAS_VIEW_PERMISSIONS), async (req, res) => {
   try {
     const [salsasTieneEstado, salsasTieneNivelPicante, salsasTieneOrden] = await Promise.all([
       hasColumn('salsas', 'estado'),
@@ -267,7 +314,7 @@ router.get('/', checkPermission(MENU_VIEW_PERMISSIONS), async (req, res) => {
   }
 });
 
-router.get('/catalogos/recetas', checkPermission(MENU_VIEW_PERMISSIONS), async (req, res) => {
+router.get('/catalogos/recetas', checkPermission(MENU_SALSAS_VIEW_PERMISSIONS), async (req, res) => {
   try {
     const recetasTieneEstado = await hasColumn('recetas', 'estado');
     const result = await pool.query(
@@ -289,7 +336,7 @@ router.get('/catalogos/recetas', checkPermission(MENU_VIEW_PERMISSIONS), async (
   }
 });
 
-router.get('/recetas/:id_receta/config', checkPermission(MENU_VIEW_PERMISSIONS), async (req, res) => {
+router.get('/recetas/:id_receta/config', checkPermission(MENU_SALSAS_VIEW_PERMISSIONS), async (req, res) => {
   try {
     const idReceta = toPositiveInt(req.params.id_receta);
     if (!idReceta) {
@@ -369,7 +416,7 @@ router.get('/recetas/:id_receta/config', checkPermission(MENU_VIEW_PERMISSIONS),
   }
 });
 
-router.post('/', checkPermission(MENU_MUTATION_PERMISSIONS), async (req, res) => {
+router.post('/', checkPermission(MENU_SALSAS_CREATE_PERMISSIONS), async (req, res) => {
   try {
     const actorUserId = resolveActorUserId(req);
     if (!actorUserId) {
@@ -451,7 +498,7 @@ router.post('/', checkPermission(MENU_MUTATION_PERMISSIONS), async (req, res) =>
   }
 });
 
-router.put('/:id_salsa', checkPermission(MENU_MUTATION_PERMISSIONS), async (req, res) => {
+router.put('/:id_salsa', checkPermission(MENU_SALSAS_EDIT_PERMISSIONS), async (req, res) => {
   try {
     const actorUserId = resolveActorUserId(req);
     if (!actorUserId) {
@@ -542,7 +589,7 @@ router.put('/:id_salsa', checkPermission(MENU_MUTATION_PERMISSIONS), async (req,
   }
 });
 
-router.patch('/:id_salsa/estado', checkPermission(MENU_MUTATION_PERMISSIONS), async (req, res) => {
+router.patch('/:id_salsa/estado', checkPermission(MENU_SALSAS_STATE_PERMISSIONS), async (req, res) => {
   try {
     const actorUserId = resolveActorUserId(req);
     if (!actorUserId) {
@@ -611,7 +658,7 @@ router.patch('/:id_salsa/estado', checkPermission(MENU_MUTATION_PERMISSIONS), as
   }
 });
 
-router.put('/recetas/:id_receta/config', checkPermission(MENU_MUTATION_PERMISSIONS), async (req, res) => {
+router.put('/recetas/:id_receta/config', checkPermission(MENU_SALSAS_EDIT_PERMISSIONS), async (req, res) => {
   const client = await pool.connect();
 
   try {
@@ -640,6 +687,10 @@ router.put('/recetas/:id_receta/config', checkPermission(MENU_MUTATION_PERMISSIO
     }
 
     const reglas = reglasNormalizadas.data;
+    const reglasConsistency = validateRulesConsistency(reglas, salsasAsignadas.length);
+    if (!reglasConsistency.ok) {
+      return res.status(400).json({ error: true, message: reglasConsistency.message });
+    }
 
     const [salsasTieneEstado, recetaSalsaTieneEstado, recetaSalsaTieneUsuario, recetaSalsaTieneFechaCreacion, recetaSalsaTieneFechaModificacion, reglasTieneEstado, reglasTieneUsuario, reglasTieneFechaCreacion, reglasTieneFechaModificacion] = await Promise.all([
       hasColumn('salsas', 'estado'),

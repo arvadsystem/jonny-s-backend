@@ -26,8 +26,11 @@ import {
 } from './admin_combos_helpers.js';
 
 const router = express.Router();
-const MENU_VIEW_PERMISSIONS = ['MENU_VER'];
-const MENU_MUTATION_PERMISSIONS = ['MENU_VER'];
+const MENU_COMBOS_VIEW_PERMISSIONS = ['MENU_COMBOS_VER', 'MENU_VER'];
+const MENU_COMBOS_CREATE_PERMISSIONS = ['MENU_COMBOS_CREAR', 'MENU_VER'];
+const MENU_COMBOS_EDIT_PERMISSIONS = ['MENU_COMBOS_EDITAR', 'MENU_VER'];
+const MENU_COMBOS_STATE_PERMISSIONS = ['MENU_COMBOS_ESTADO_CAMBIAR', 'MENU_VER'];
+const MENU_COMBOS_DETAIL_EDIT_PERMISSIONS = ['MENU_COMBOS_DETALLE_EDITAR', 'MENU_COMBOS_EDITAR', 'MENU_VER'];
 
 const parseComboId = (value) => {
   const parsed = Number(value);
@@ -46,7 +49,7 @@ const withResolvedComboImageUrl = (req, combo) => ({
 });
 
 // GET: listar combos admin.
-router.get('/', checkPermission(MENU_VIEW_PERMISSIONS), async (req, res) => {
+router.get('/', checkPermission(MENU_COMBOS_VIEW_PERMISSIONS), async (req, res) => {
   try {
     const baseDatos = await listarCombosAdmin();
     const datosNormalizados = (Array.isArray(baseDatos) ? baseDatos : []).map((combo) => withResolvedComboImageUrl(req, combo));
@@ -59,7 +62,7 @@ router.get('/', checkPermission(MENU_VIEW_PERMISSIONS), async (req, res) => {
 });
 
 // GET: catalogo de recetas activas para armar detalle de combo.
-router.get('/catalogos/recetas', checkPermission(MENU_VIEW_PERMISSIONS), async (req, res) => {
+router.get('/catalogos/recetas', checkPermission(MENU_COMBOS_VIEW_PERMISSIONS), async (req, res) => {
   try {
     const recetas = await listarRecetasParaCombos();
     return res.status(200).json(recetas);
@@ -70,7 +73,7 @@ router.get('/catalogos/recetas', checkPermission(MENU_VIEW_PERMISSIONS), async (
 });
 
 // GET: obtener combo por id.
-router.get('/:id_combo', checkPermission(MENU_VIEW_PERMISSIONS), async (req, res) => {
+router.get('/:id_combo', checkPermission(MENU_COMBOS_VIEW_PERMISSIONS), async (req, res) => {
   try {
     const idCombo = parseComboId(req.params.id_combo);
     if (!idCombo) {
@@ -92,7 +95,7 @@ router.get('/:id_combo', checkPermission(MENU_VIEW_PERMISSIONS), async (req, res
 });
 
 // POST: crear combo.
-router.post('/', checkPermission(MENU_MUTATION_PERMISSIONS), async (req, res) => {
+router.post('/', checkPermission(MENU_COMBOS_CREATE_PERMISSIONS), async (req, res) => {
   const client = await pool.connect();
 
   try {
@@ -159,7 +162,7 @@ router.post('/', checkPermission(MENU_MUTATION_PERMISSIONS), async (req, res) =>
 });
 
 // PUT: actualizar combo completo por id.
-router.put('/:id_combo', checkPermission(MENU_MUTATION_PERMISSIONS), async (req, res) => {
+router.put('/:id_combo', checkPermission(MENU_COMBOS_EDIT_PERMISSIONS), async (req, res) => {
   const client = await pool.connect();
 
   try {
@@ -232,7 +235,7 @@ router.put('/:id_combo', checkPermission(MENU_MUTATION_PERMISSIONS), async (req,
 });
 
 // PATCH: actualizar solo estado por id; id_usuario se toma de req.user.
-router.patch('/:id_combo/estado', checkPermission(MENU_MUTATION_PERMISSIONS), async (req, res) => {
+router.patch('/:id_combo/estado', checkPermission(MENU_COMBOS_STATE_PERMISSIONS), async (req, res) => {
   const client = await pool.connect();
 
   try {
@@ -297,7 +300,7 @@ router.patch('/:id_combo/estado', checkPermission(MENU_MUTATION_PERMISSIONS), as
 });
 
 // POST: agregar receta al detalle del combo.
-router.post('/:id_combo/detalle', checkPermission(MENU_MUTATION_PERMISSIONS), async (req, res) => {
+router.post('/:id_combo/detalle', checkPermission(MENU_COMBOS_DETAIL_EDIT_PERMISSIONS), async (req, res) => {
   const client = await pool.connect();
 
   try {
@@ -349,7 +352,7 @@ router.post('/:id_combo/detalle', checkPermission(MENU_MUTATION_PERMISSIONS), as
 });
 
 // DELETE logico: quitar receta del combo (desactiva detalle).
-router.delete('/:id_combo/detalle/:id_detalle_combo', checkPermission(MENU_MUTATION_PERMISSIONS), async (req, res) => {
+router.delete('/:id_combo/detalle/:id_detalle_combo', checkPermission(MENU_COMBOS_DETAIL_EDIT_PERMISSIONS), async (req, res) => {
   const client = await pool.connect();
 
   try {

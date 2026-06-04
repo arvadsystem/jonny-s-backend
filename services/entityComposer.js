@@ -288,6 +288,7 @@ export const normalizeEmpleadoAtomicPayload = (payload) => {
     estado: payload.estado,
     id_sucursal: parsePositiveInt(payload.id_sucursal),
     id_persona: parsePositiveInt(payload.id_persona),
+    id_cargo: parsePositiveInt(payload.id_cargo),
     cargo: toNullableTrimmed(payload.cargo),
     nombre_referencia: toNullableTrimmed(payload.nombre_referencia),
     telefono_referencia: toNullableTrimmed(payload.telefono_referencia)
@@ -301,9 +302,6 @@ export const normalizeClienteAtomicPayload = (payload) => {
   if (!isPlainObject(payload)) return {};
 
   const normalized = {
-    fecha_ingreso: toNullableTrimmed(payload.fecha_ingreso),
-    puntos: payload.puntos,
-    id_tipo_cliente: parsePositiveInt(payload.id_tipo_cliente),
     id_persona: parsePositiveInt(payload.id_persona),
     id_empresa_cliente: parsePositiveInt(payload.id_empresa_cliente ?? payload.id_empresa),
     id_empresa: parsePositiveInt(payload.id_empresa),
