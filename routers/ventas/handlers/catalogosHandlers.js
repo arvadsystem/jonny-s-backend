@@ -1,8 +1,14 @@
 import pool from '../../../config/db-connection.js';
 import { resolveRequestUserSucursalScope } from '../../../utils/sucursalScope.js';
 import {
-  DESCUENTO_ALCANCE_KEYS
+  DESCUENTO_ALCANCE_KEYS,
+  VENTA_COMPLEMENTO_TIPO_SALSAS
 } from '../constants.js';
+import {
+  buildVentaComplementContext,
+  resolveComboComplementMetadata,
+  resolveRecetaComplementMetadata
+} from '../services/complementosCatalogService.js';
 import { roundMoney } from '../utils/moneyUtils.js';
 import {
   coercePositiveIntArray,
@@ -306,6 +312,227 @@ export const listClientesCatalogoHandler = async (req, res) => {
     res.status(200).json(data);
   } catch (err) {
     console.error('Error al listar catalogo de clientes para ventas:', err.message);
+    sendVentasInternalError(res);
+  }
+};
+
+export const listCombosCatalogoHandler = async (req, res) => {
+  try {
+    const scope = await resolveRequestUserSucursalScope(req);
+    const isSuperAdmin = Boolean(scope.isSuperAdmin);
+    const idSucursal = parseOptionalPositiveInt(req.query.id_sucursal);
+
+    const sucursalValidation = await validateVentasCatalogSucursal({ scope, idSucursal });
+    if (!sucursalValidation.ok) {
+      return res.status(sucursalValidation.status).json(sucursalValidation.body);
+    }
+
+    let joinClause = '';
+    let whereClause = '';
+    const params = [];
+
+    if (idSucursal) {
+      params.push(idSucursal);
+      joinClause = 'INNER JOIN menu_vigente mv ON mv.id_menu = c.id_menu';
+      whereClause = 'AND mv.id_sucursal = $1 AND COALESCE(mv.estado, true) = true AND (mv.fecha_inicio IS NULL OR mv.fecha_inicio <= CURRENT_TIMESTAMP)';
+    } else if (!isSuperAdmin) {
+      params.push(scope.allowedSucursalIds);
+      joinClause = 'INNER JOIN menu_vigente mv ON mv.id_menu = c.id_menu';
+      whereClause = 'AND mv.id_sucursal = ANY($1::int[]) AND COALESCE(mv.estado, true) = true AND (mv.fecha_inicio IS NULL OR mv.fecha_inicio <= CURRENT_TIMESTAMP)';
+    }
+
+    const query = `
+      WITH combo_departamento_counts AS (
+        SELECT
+          dc.id_combo,
+          r.id_tipo_departamento,
+          td.nombre_departamento,
+          COUNT(*)::int AS total_componentes
+        FROM detalle_combo dc
+        INNER JOIN recetas r
+          ON r.id_receta = dc.id_receta
+        LEFT JOIN tipo_departamento td
+          ON td.id_tipo_departamento = r.id_tipo_departamento
+        WHERE COALESCE(dc.estado, true) = true
+          AND COALESCE(r.estado, true) = true
+          AND r.id_tipo_departamento IS NOT NULL
+        GROUP BY dc.id_combo, r.id_tipo_departamento, td.nombre_departamento
+      ),
+      combo_departamento_principal AS (
+        SELECT DISTINCT ON (id_combo)
+          id_combo,
+          id_tipo_departamento,
+          nombre_departamento
+        FROM combo_departamento_counts
+        ORDER BY id_combo, total_componentes DESC, id_tipo_departamento ASC
+      ),
+      combo_departamentos AS (
+        SELECT
+          id_combo,
+          ARRAY_AGG(id_tipo_departamento ORDER BY id_tipo_departamento) AS departamentos_ids,
+          JSONB_AGG(
+            JSONB_BUILD_OBJECT(
+              'id_tipo_departamento', id_tipo_departamento,
+              'nombre_tipo_departamento', nombre_departamento
+            )
+            ORDER BY id_tipo_departamento
+          ) AS departamentos
+        FROM combo_departamento_counts
+        GROUP BY id_combo
+      )
+      SELECT DISTINCT
+        c.id_combo,
+        c.descripcion,
+        c.precio,
+        c.estado,
+        c.id_archivo,
+        COALESCE(c.id_tipo_departamento, cdp.id_tipo_departamento) AS id_tipo_departamento,
+        COALESCE(td.nombre_departamento, cdp.nombre_departamento) AS nombre_tipo_departamento,
+        cdp.id_tipo_departamento AS id_tipo_departamento_principal,
+        cdp.nombre_departamento AS nombre_tipo_departamento_principal,
+        COALESCE(cd.departamentos_ids, ARRAY[]::int[]) AS departamentos_ids,
+        COALESCE(cd.departamentos, '[]'::jsonb) AS departamentos,
+        a.url_publica AS imagen_principal_url
+      FROM combos c
+      LEFT JOIN archivos a ON a.id_archivo = c.id_archivo AND (a.estado = true OR a.estado IS NULL)
+      LEFT JOIN tipo_departamento td
+        ON td.id_tipo_departamento = c.id_tipo_departamento
+      LEFT JOIN combo_departamento_principal cdp
+        ON cdp.id_combo = c.id_combo
+      LEFT JOIN combo_departamentos cd
+        ON cd.id_combo = c.id_combo
+      ${joinClause}
+      WHERE COALESCE(c.estado, true) = true ${whereClause}
+      ORDER BY c.descripcion ASC, c.id_combo ASC
+    `;
+
+    const result = await pool.query(query, params);
+    const comboRows = Array.isArray(result.rows) ? result.rows : [];
+    const complementContext = await buildVentaComplementContext({
+      client: pool,
+      normalizedItems: comboRows.map((row) => ({
+        kind: 'COMBO',
+        id_combo: Number(row?.id_combo || 0),
+        cantidad: 1,
+        complementos: []
+      }))
+    });
+
+    const data = comboRows.map((row) => {
+      const metadata = resolveComboComplementMetadata({
+        combo: row,
+        quantity: 1,
+        components: complementContext.comboComponentsByCombo.get(Number(row?.id_combo || 0)) || [],
+        saucesByRecipe: complementContext.saucesByRecipe,
+        rulesByRecipe: complementContext.rulesByRecipe,
+        fallbackSauces: complementContext.fallbackSauces
+      });
+
+      return {
+        ...row,
+        requiere_complementos: Boolean(metadata.requiere_complementos),
+        tipo_complemento: metadata.tipo_complemento || VENTA_COMPLEMENTO_TIPO_SALSAS,
+        minimo_complementos: Number(metadata.minimo_complementos || 0),
+        maximo_complementos: Number(metadata.maximo_complementos || 0),
+        complementos_disponibles: (Array.isArray(metadata.complementos_disponibles) ? metadata.complementos_disponibles : []).map((entry) => ({
+          id_complemento: Number(entry?.id_complemento || entry?.id_salsa || 0),
+          nombre: String(entry?.nombre || 'Salsa').trim(),
+          disponible: entry?.disponible !== false
+        })).filter((entry) => entry.id_complemento > 0)
+      };
+    });
+
+    res.status(200).json(data);
+  } catch (err) {
+    console.error('Error al listar catalogo de combos para ventas:', err.message);
+    sendVentasInternalError(res);
+  }
+};
+
+export const listRecetasCatalogoHandler = async (req, res) => {
+  try {
+    const scope = await resolveRequestUserSucursalScope(req);
+    const isSuperAdmin = Boolean(scope.isSuperAdmin);
+    const idSucursal = parseOptionalPositiveInt(req.query.id_sucursal);
+
+    const sucursalValidation = await validateVentasCatalogSucursal({ scope, idSucursal });
+    if (!sucursalValidation.ok) {
+      return res.status(sucursalValidation.status).json(sucursalValidation.body);
+    }
+
+    let joinClause = '';
+    let whereClause = '';
+    const params = [];
+
+    if (idSucursal) {
+      params.push(idSucursal);
+      joinClause = 'INNER JOIN menu_vigente mv ON mv.id_menu = r.id_menu';
+      whereClause = 'AND mv.id_sucursal = $1 AND COALESCE(mv.estado, true) = true AND (mv.fecha_inicio IS NULL OR mv.fecha_inicio <= CURRENT_TIMESTAMP)';
+    } else if (!isSuperAdmin) {
+      params.push(scope.allowedSucursalIds);
+      joinClause = 'INNER JOIN menu_vigente mv ON mv.id_menu = r.id_menu';
+      whereClause = 'AND mv.id_sucursal = ANY($1::int[]) AND COALESCE(mv.estado, true) = true AND (mv.fecha_inicio IS NULL OR mv.fecha_inicio <= CURRENT_TIMESTAMP)';
+    }
+
+    const query = `
+      SELECT DISTINCT
+        r.id_receta,
+        r.nombre_receta,
+        r.descripcion,
+        r.estado,
+        r.precio,
+        r.id_archivo,
+        r.id_tipo_departamento,
+        a.url_publica AS imagen_principal_url,
+        NULL::INTEGER AS id_producto_base,
+        r.nombre_receta AS nombre_producto_base,
+        r.precio AS precio_producto_base,
+        r.estado AS estado_producto_base
+      FROM recetas r
+      LEFT JOIN archivos a ON a.id_archivo = r.id_archivo AND (a.estado = true OR a.estado IS NULL)
+      ${joinClause}
+      WHERE COALESCE(r.estado, true) = true ${whereClause}
+      ORDER BY r.nombre_receta ASC, r.id_receta ASC
+    `;
+
+    const result = await pool.query(query, params);
+    const recetaRows = Array.isArray(result.rows) ? result.rows : [];
+    const complementContext = await buildVentaComplementContext({
+      client: pool,
+      normalizedItems: recetaRows.map((row) => ({
+        kind: 'RECETA',
+        id_receta: Number(row?.id_receta || 0),
+        cantidad: 1,
+        complementos: []
+      }))
+    });
+
+    const data = recetaRows.map((row) => {
+      const metadata = resolveRecetaComplementMetadata({
+        receta: row,
+        quantity: 1,
+        allowedSauces: complementContext.saucesByRecipe.get(Number(row?.id_receta || 0)) || [],
+        rules: complementContext.rulesByRecipe.get(Number(row?.id_receta || 0)) || [],
+        fallbackSauces: complementContext.fallbackSauces
+      });
+
+      return {
+        ...row,
+        requiere_complementos: Boolean(metadata.requiere_complementos),
+        tipo_complemento: metadata.tipo_complemento || VENTA_COMPLEMENTO_TIPO_SALSAS,
+        minimo_complementos: Number(metadata.minimo_complementos || 0),
+        maximo_complementos: Number(metadata.maximo_complementos || 0),
+        complementos_disponibles: (Array.isArray(metadata.complementos_disponibles) ? metadata.complementos_disponibles : []).map((entry) => ({
+          id_complemento: Number(entry?.id_complemento || entry?.id_salsa || 0),
+          nombre: String(entry?.nombre || 'Salsa').trim(),
+          disponible: entry?.disponible !== false
+        })).filter((entry) => entry.id_complemento > 0)
+      };
+    });
+
+    res.status(200).json(data);
+  } catch (err) {
+    console.error('Error al listar catalogo de recetas para ventas:', err.message);
     sendVentasInternalError(res);
   }
 };
