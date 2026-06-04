@@ -36,6 +36,7 @@ import {
 import {
   listCategoriasCatalogoHandler,
   listClientesCatalogoHandler,
+  listDescuentosCatalogoHandler,
   listExtrasPermitidosCatalogoHandler,
   listProductosCatalogoHandler,
   listTipoDepartamentoCatalogoHandler,
@@ -4878,116 +4879,7 @@ router.get('/ventas/catalogos/tipos-descuento', listTiposDescuentoCatalogoHandle
 
 router.get('/ventas/catalogos/tipo-departamento', listTipoDepartamentoCatalogoHandler);
 
-router.get('/ventas/catalogos/descuentos', async (req, res) => {
-  try {
-    const scope = await resolveRequestUserSucursalScope(req);
-    const idSucursal = parseOptionalPositiveInt(req.query.id_sucursal);
-    const sucursalValidation = await validateVentasCatalogSucursal({ scope, idSucursal });
-    if (!sucursalValidation.ok) {
-      return res.status(sucursalValidation.status).json(sucursalValidation.body);
-    }
-
-    const params = [];
-    const sucursalWhere = idSucursal
-      ? 'AND (dc.id_sucursal IS NULL OR dc.id_sucursal = $1)'
-      : '';
-    if (idSucursal) params.push(idSucursal);
-
-    const result = await pool.query(
-      `
-        SELECT
-          dc.id_descuento_catalogo,
-          dc.nombre_descuento,
-          dc.descripcion,
-          dc.valor_descuento,
-          dc.alcance,
-          dc.id_producto,
-          dc.id_receta,
-          dc.id_combo,
-          dc.id_sucursal,
-          dc.fecha_inicio,
-          dc.fecha_fin,
-          dc.id_tipo_descuento,
-          td.nombre_tipo_descuento,
-          COALESCE(objp.productos, '[]'::jsonb) AS productos,
-          COALESCE(objr.recetas, '[]'::jsonb) AS recetas,
-          COALESCE(objc.combos, '[]'::jsonb) AS combos,
-          COALESCE(objp.productos_ids, ARRAY[]::int[]) AS productos_ids,
-          COALESCE(objr.recetas_ids, ARRAY[]::int[]) AS recetas_ids,
-          COALESCE(objc.combos_ids, ARRAY[]::int[]) AS combos_ids
-        FROM descuentos_catalogos dc
-        INNER JOIN tipo_descuentos td
-          ON td.id_tipo_descuento = dc.id_tipo_descuento
-        LEFT JOIN LATERAL (
-          SELECT
-            COALESCE(jsonb_agg(jsonb_build_object('id_producto', x.id_producto, 'nombre_producto', x.nombre_producto) ORDER BY x.nombre_producto), '[]'::jsonb) AS productos,
-            COALESCE(array_agg(x.id_producto ORDER BY x.id_producto), ARRAY[]::int[]) AS productos_ids
-          FROM (
-            SELECT DISTINCT p.id_producto, p.nombre_producto
-            FROM descuentos_catalogos_productos rel
-            INNER JOIN productos p ON p.id_producto = rel.id_producto
-            WHERE rel.id_descuento_catalogo = dc.id_descuento_catalogo
-            UNION
-            SELECT p.id_producto, p.nombre_producto
-            FROM productos p
-            WHERE p.id_producto = dc.id_producto
-              AND NOT EXISTS (
-                SELECT 1 FROM descuentos_catalogos_productos rel
-                WHERE rel.id_descuento_catalogo = dc.id_descuento_catalogo
-              )
-          ) x
-        ) objp ON true
-        LEFT JOIN LATERAL (
-          SELECT
-            COALESCE(jsonb_agg(jsonb_build_object('id_receta', x.id_receta, 'nombre_receta', x.nombre_receta) ORDER BY x.nombre_receta), '[]'::jsonb) AS recetas,
-            COALESCE(array_agg(x.id_receta ORDER BY x.id_receta), ARRAY[]::int[]) AS recetas_ids
-          FROM (
-            SELECT DISTINCT r.id_receta, r.nombre_receta
-            FROM descuentos_catalogos_recetas rel
-            INNER JOIN recetas r ON r.id_receta = rel.id_receta
-            WHERE rel.id_descuento_catalogo = dc.id_descuento_catalogo
-            UNION
-            SELECT r.id_receta, r.nombre_receta
-            FROM recetas r
-            WHERE r.id_receta = dc.id_receta
-              AND NOT EXISTS (
-                SELECT 1 FROM descuentos_catalogos_recetas rel
-                WHERE rel.id_descuento_catalogo = dc.id_descuento_catalogo
-              )
-          ) x
-        ) objr ON true
-        LEFT JOIN LATERAL (
-          SELECT
-            COALESCE(jsonb_agg(jsonb_build_object('id_combo', x.id_combo, 'nombre_combo', x.nombre_combo) ORDER BY x.nombre_combo), '[]'::jsonb) AS combos,
-            COALESCE(array_agg(x.id_combo ORDER BY x.id_combo), ARRAY[]::int[]) AS combos_ids
-          FROM (
-            SELECT DISTINCT cb.id_combo, COALESCE(cb.nombre_combo, cb.descripcion) AS nombre_combo
-            FROM descuentos_catalogos_combos rel
-            INNER JOIN combos cb ON cb.id_combo = rel.id_combo
-            WHERE rel.id_descuento_catalogo = dc.id_descuento_catalogo
-            UNION
-            SELECT cb.id_combo, COALESCE(cb.nombre_combo, cb.descripcion) AS nombre_combo
-            FROM combos cb
-            WHERE cb.id_combo = dc.id_combo
-              AND NOT EXISTS (
-                SELECT 1 FROM descuentos_catalogos_combos rel
-                WHERE rel.id_descuento_catalogo = dc.id_descuento_catalogo
-              )
-          ) x
-        ) objc ON true
-        WHERE COALESCE(dc.estado, true) = true
-          AND COALESCE(td.estado, true) = true
-          ${sucursalWhere}
-        ORDER BY dc.nombre_descuento ASC, dc.id_descuento_catalogo ASC
-      `,
-      params
-    );
-    res.status(200).json((result.rows || []).map(normalizeDescuentoCatalogoRow));
-  } catch (err) {
-    console.error('Error al listar descuentos activos de catalogo:', err.message);
-    sendVentasInternalError(res);
-  }
-});
+router.get('/ventas/catalogos/descuentos', listDescuentosCatalogoHandler);
 
 router.get('/ventas/descuentos-catalogos', checkPermission(VENTAS_DESCUENTOS_PERMISSIONS), async (req, res) => {
   try {
