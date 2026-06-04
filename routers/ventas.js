@@ -19,7 +19,11 @@ import {
 import {
   fetchPublicActiveSaucesQuery
 } from './public_menu/publicMenuQueries.js';
-import { listarAlertasInventarioPedido } from '../services/inventarioAlertasService.js';
+import {
+  actualizarEstadoAlertaInventario,
+  listarAlertasInventario,
+  listarAlertasInventarioPedido
+} from '../services/inventarioAlertasService.js';
 
 const router = express.Router();
 
@@ -36,6 +40,12 @@ const VENTAS_DESCUENTOS_WRITE_PERMISSIONS = [
   'VENTAS_DESCUENTOS_CATALOGO_CREAR',
   'VENTAS_DESCUENTOS_CATALOGO_EDITAR',
   'VENTAS_DESCUENTOS_CATALOGO_ESTADO_CAMBIAR'
+];
+const VENTAS_INVENTARIO_ALERTAS_VIEW_PERMISSIONS = ['VENTAS_VER', 'INVENTARIO_ALERTAS_VER'];
+const VENTAS_INVENTARIO_ALERTAS_UPDATE_PERMISSIONS = [
+  'INVENTARIO_ALERTAS_STOCK_MINIMO_EDITAR',
+  'INVENTARIO_MOVIMIENTOS_EDITAR',
+  'VENTAS_CREAR'
 ];
 const DESCUENTO_TIPO_KEYS = {
   MONTO_FIJO: 'MONTO_FIJO',
@@ -7639,6 +7649,95 @@ router.get('/ventas/buscar', checkPermission(['VENTAS_VER']), async (req, res) =
 
 router.get('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), listarPedidosPendientesPago);
 
+const formatInventarioAlertaResponse = (alerta) => ({
+  id_alerta: Number(alerta.id_alerta),
+  id_pedido: Number(alerta.id_pedido),
+  id_detalle_pedido: parseOptionalPositiveInt(alerta.id_detalle_pedido),
+  tipo_alerta: alerta.tipo_alerta,
+  motivo: alerta.motivo,
+  mensaje: alerta.mensaje,
+  tipo_recurso: alerta.tipo_recurso,
+  id_recurso: parseOptionalPositiveInt(alerta.id_recurso),
+  id_producto: parseOptionalPositiveInt(alerta.id_producto),
+  id_insumo: parseOptionalPositiveInt(alerta.id_insumo),
+  id_receta: parseOptionalPositiveInt(alerta.id_receta),
+  id_combo: parseOptionalPositiveInt(alerta.id_combo),
+  id_extra: parseOptionalPositiveInt(alerta.id_extra),
+  stock_disponible: alerta.stock_disponible,
+  cantidad_requerida: alerta.cantidad_requerida,
+  deficit: alerta.deficit,
+  estado: alerta.estado,
+  created_at: alerta.created_at,
+  created_by: parseOptionalPositiveInt(alerta.created_by),
+  created_by_usuario: alerta.created_by_usuario || null,
+  resolved_at: alerta.resolved_at || null,
+  resolved_by: parseOptionalPositiveInt(alerta.resolved_by),
+  resolved_by_usuario: alerta.resolved_by_usuario || null,
+  nota_resolucion: alerta.nota_resolucion || null,
+  updated_at: alerta.updated_at || null,
+  pedido: {
+    id_pedido: Number(alerta.id_pedido),
+    id_sucursal: parseOptionalPositiveInt(alerta.id_sucursal),
+    nombre_sucursal: alerta.nombre_sucursal || null,
+    estado_pedido: alerta.estado_pedido || null,
+    fecha_hora_pedido: alerta.fecha_hora_pedido || null,
+    total: alerta.pedido_total
+  },
+  payload: alerta.payload
+});
+
+router.get('/ventas/inventario-alertas', checkPermission(VENTAS_INVENTARIO_ALERTAS_VIEW_PERMISSIONS), async (req, res) => {
+  try {
+    const result = await listarAlertasInventario(req.query);
+    return res.status(200).json({
+      ok: true,
+      migration_applied: result.migration_applied,
+      revision_columns_applied: result.revision_columns_applied,
+      pagination: result.pagination,
+      total: result.pagination.total,
+      alertas: result.alertas.map(formatInventarioAlertaResponse)
+    });
+  } catch (err) {
+    if (err?.httpStatus) {
+      return res.status(err.httpStatus).json({
+        error: true,
+        code: err.code,
+        message: err.message
+      });
+    }
+    console.error('Error al listar alertas de inventario:', err);
+    return sendVentasInternalError(res);
+  }
+});
+
+router.patch('/ventas/inventario-alertas/:id/estado', checkPermission(VENTAS_INVENTARIO_ALERTAS_UPDATE_PERMISSIONS), async (req, res) => {
+  try {
+    const scope = await resolveRequestUserSucursalScope(req);
+    const result = await actualizarEstadoAlertaInventario({
+      id_alerta: req.params.id,
+      estado: req.body?.estado,
+      nota_resolucion: req.body?.nota_resolucion,
+      id_usuario: parseOptionalPositiveInt(scope?.idUsuario) || parseOptionalPositiveInt(req.user?.id_usuario)
+    });
+
+    return res.status(200).json({
+      ok: true,
+      revision_columns_applied: result.revision_columns_applied,
+      alerta: formatInventarioAlertaResponse(result.alerta)
+    });
+  } catch (err) {
+    if (err?.httpStatus) {
+      return res.status(err.httpStatus).json({
+        error: true,
+        code: err.code,
+        message: err.message
+      });
+    }
+    console.error('Error al actualizar estado de alerta de inventario:', err);
+    return sendVentasInternalError(res);
+  }
+});
+
 router.get('/ventas/pedidos/:id/inventario-alertas', checkPermission(['VENTAS_VER']), async (req, res) => {
   try {
     const result = await listarAlertasInventarioPedido(req.params.id);
@@ -7647,28 +7746,7 @@ router.get('/ventas/pedidos/:id/inventario-alertas', checkPermission(['VENTAS_VE
       id_pedido: parsePositiveInt(req.params.id),
       migration_applied: result.migration_applied,
       total: result.alertas.length,
-      alertas: result.alertas.map((alerta) => ({
-        id_alerta: Number(alerta.id_alerta),
-        id_pedido: Number(alerta.id_pedido),
-        id_detalle_pedido: parseOptionalPositiveInt(alerta.id_detalle_pedido),
-        tipo_alerta: alerta.tipo_alerta,
-        motivo: alerta.motivo,
-        mensaje: alerta.mensaje,
-        tipo_recurso: alerta.tipo_recurso,
-        id_recurso: parseOptionalPositiveInt(alerta.id_recurso),
-        id_producto: parseOptionalPositiveInt(alerta.id_producto),
-        id_insumo: parseOptionalPositiveInt(alerta.id_insumo),
-        id_receta: parseOptionalPositiveInt(alerta.id_receta),
-        id_combo: parseOptionalPositiveInt(alerta.id_combo),
-        id_extra: parseOptionalPositiveInt(alerta.id_extra),
-        stock_disponible: alerta.stock_disponible,
-        cantidad_requerida: alerta.cantidad_requerida,
-        deficit: alerta.deficit,
-        estado: alerta.estado,
-        created_at: alerta.created_at,
-        created_by: parseOptionalPositiveInt(alerta.created_by),
-        payload: alerta.payload
-      }))
+      alertas: result.alertas.map(formatInventarioAlertaResponse)
     });
   } catch (err) {
     if (err?.httpStatus === 400) {
