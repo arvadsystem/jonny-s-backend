@@ -1903,11 +1903,8 @@ const resolveLineComplementos = ({ item, receta, combo, context }) => {
   const min = Math.max(0, Number(metadata.minimo_complementos || 0));
   const max = Math.max(min, Number(metadata.maximo_complementos || 0));
   const complementosIncompletos = min > 0 && selected.length < min;
-  if (metadata.requiere_complementos && complementosIncompletos && !item.complementos_incompletos_autorizados) {
-    return { ok: false, message: 'Debe seleccionar los complementos requeridos para este item.' };
-  }
   if (max > 0 && selected.length > max) {
-    return { ok: false, message: 'Debe seleccionar los complementos requeridos para este item.' };
+    return { ok: false, message: `No puedes seleccionar mas de ${max} complemento(s) para este item.` };
   }
   if (!metadata.requiere_complementos && selected.length > 0) {
     return { ok: false, message: 'Uno o m?s complementos seleccionados no son v?lidos para este item.' };
@@ -2678,28 +2675,35 @@ const hydrateVentaLines = async (client, normalizedItems, perf = null, options =
     productoIds,
     comboIds,
     recetaIds,
-    lockProductos: true
+    lockProductos: validateProductStock === true
   });
   perf?.add?.('totals_catalogos_ms', catalogosStart);
   if (productoIds.length > 0) perf?.add?.('totals_productos_ms', catalogosStart);
   if (comboIds.length > 0) perf?.add?.('totals_combos_ms', catalogosStart);
   if (recetaIds.length > 0) perf?.add?.('totals_recetas_ms', catalogosStart);
 
-  const complementContext = await buildVentaComplementContext({
-    client,
-    normalizedItems,
-    perf,
-    recetaMap,
-    comboMap
-  });
-  const extrasStart = perf?.now?.() || 0;
-  const allowedExtrasMap = await buildAllowedExtrasMap(client, {
-    normalizedItems,
-    idSucursal: options?.idSucursal,
-    perf
-  });
-  perf?.add?.('totals_extras_ms', extrasStart);
-  perf?.add?.('validation_extras_ms', extrasStart);
+  const [complementContext, allowedExtrasMap] = await Promise.all([
+    buildVentaComplementContext({
+      client,
+      normalizedItems,
+      perf,
+      recetaMap,
+      comboMap
+    }),
+    (async () => {
+      const extrasStart = perf?.now?.() || 0;
+      try {
+        return await buildAllowedExtrasMap(client, {
+          normalizedItems,
+          idSucursal: options?.idSucursal,
+          perf
+        });
+      } finally {
+        perf?.add?.('totals_extras_ms', extrasStart);
+        perf?.add?.('validation_extras_ms', extrasStart);
+      }
+    })()
+  ]);
 
   const totalsItemsStart = perf?.now?.() || 0;
   if (validateProductStock) {
@@ -2951,6 +2955,76 @@ const normalizePedidoCatalogCode = (value) =>
     .toUpperCase()
     .replace(/[\s-]+/g, '_');
 
+const PEDIDO_PENDIENTE_STATIC_CATALOG_CACHE_DEFAULT_TTL_MS = 30000;
+const pedidoPendienteStaticCatalogCache = new Map();
+const PEDIDO_PENDIENTE_STATIC_CATALOG_LOOKUPS = new Set([
+  'cat_pedidos_canales|id_canal_pedido',
+  'cat_pedidos_modalidades_entrega|id_modalidad_entrega',
+  'cat_pedidos_estados_pago|id_estado_pago_pedido',
+  'cat_pedidos_motivos_pago_pendiente|id_motivo_pago_pendiente',
+  'cat_delivery_estados|id_estado_delivery',
+  'estados_pedido|id_estado_pedido'
+]);
+
+const getPedidoPendienteStaticCatalogCacheTtlMs = () => {
+  const ttl = Number(process.env.VENTAS_CATALOG_CACHE_TTL_MS);
+  return Number.isFinite(ttl) && ttl > 0 ? Math.round(ttl) : PEDIDO_PENDIENTE_STATIC_CATALOG_CACHE_DEFAULT_TTL_MS;
+};
+
+const clonePedidoPendienteStaticCatalogValue = (value) => {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return value;
+  return { ...value };
+};
+
+const resolvePedidoPendienteCachedStaticCatalog = async ({ tableName, idColumn, code, resolver }) => {
+  const normalizedTableName = String(tableName || '').trim().toLowerCase();
+  const normalizedIdColumn = String(idColumn || '').trim().toLowerCase();
+  const normalizedCode = normalizePedidoCatalogCode(code);
+  if (!normalizedTableName || !normalizedIdColumn || !normalizedCode) return null;
+  const lookupKey = `${normalizedTableName}|${normalizedIdColumn}`;
+  if (!PEDIDO_PENDIENTE_STATIC_CATALOG_LOOKUPS.has(lookupKey)) {
+    return resolver(normalizedCode);
+  }
+
+  const cacheKey = `${lookupKey}|${normalizedCode}`;
+  const now = Date.now();
+  const cached = pedidoPendienteStaticCatalogCache.get(cacheKey);
+  if (cached && cached.expiresAt > now) {
+    return clonePedidoPendienteStaticCatalogValue(cached.value);
+  }
+  if (cached) pedidoPendienteStaticCatalogCache.delete(cacheKey);
+
+  const value = await resolver(normalizedCode);
+  if (value) {
+    pedidoPendienteStaticCatalogCache.set(cacheKey, {
+      value: clonePedidoPendienteStaticCatalogValue(value),
+      expiresAt: now + getPedidoPendienteStaticCatalogCacheTtlMs()
+    });
+  }
+  return value;
+};
+
+const resolvePedidoPendienteStaticCatalogCode = ({ client, tableName, idColumn, code }) =>
+  resolvePedidoPendienteCachedStaticCatalog({
+    tableName,
+    idColumn,
+    code,
+    resolver: (normalizedCode) => resolveActiveCatalogCode({
+      client,
+      tableName,
+      idColumn,
+      code: normalizedCode
+    })
+  });
+
+const resolvePedidoPendienteEstadoPedidoIdByCode = (client, code) =>
+  resolvePedidoPendienteCachedStaticCatalog({
+    tableName: 'estados_pedido',
+    idColumn: 'id_estado_pedido',
+    code,
+    resolver: (normalizedCode) => resolveEstadoPedidoIdByCode(client, normalizedCode)
+  });
+
 const normalizePedidoText = (value, maxLength = 200) => {
   if (value === undefined || value === null) return null;
   const normalized = String(value).replace(/\s+/g, ' ').trim();
@@ -3042,13 +3116,23 @@ const buildPedidoPendientePayload = async ({ client, body, userId, sucursalScope
     if (missingDeliveryField) return { ok: false, status: 400, body: { error: true, message: 'delivery.' + missingDeliveryField + ' es obligatorio.' } };
   }
 
-  const [canalCatalog, modalidadCatalog, estadoPagoCatalog, motivoPagoCatalog, deliveryEstadoCatalog] = await Promise.all([
-    resolveActiveCatalogCode({ client, tableName: 'cat_pedidos_canales', idColumn: 'id_canal_pedido', code: canal }),
-    resolveActiveCatalogCode({ client, tableName: 'cat_pedidos_modalidades_entrega', idColumn: 'id_modalidad_entrega', code: modalidad }),
-    resolveActiveCatalogCode({ client, tableName: 'cat_pedidos_estados_pago', idColumn: 'id_estado_pago_pedido', code: PEDIDO_PENDIENTE_ESTADO_PAGO }),
-    resolveActiveCatalogCode({ client, tableName: 'cat_pedidos_motivos_pago_pendiente', idColumn: 'id_motivo_pago_pendiente', code: motivoPagoPendiente }),
-    modalidad === 'DELIVERY' ? resolveActiveCatalogCode({ client, tableName: 'cat_delivery_estados', idColumn: 'id_estado_delivery', code: PEDIDO_PENDIENTE_ESTADO_DELIVERY }) : Promise.resolve(null)
-  ]);
+  const staticCatalogsStart = perf?.now?.() || 0;
+  let canalCatalog = null;
+  let modalidadCatalog = null;
+  let estadoPagoCatalog = null;
+  let motivoPagoCatalog = null;
+  let deliveryEstadoCatalog = null;
+  try {
+    [canalCatalog, modalidadCatalog, estadoPagoCatalog, motivoPagoCatalog, deliveryEstadoCatalog] = await Promise.all([
+      resolvePedidoPendienteStaticCatalogCode({ client, tableName: 'cat_pedidos_canales', idColumn: 'id_canal_pedido', code: canal }),
+      resolvePedidoPendienteStaticCatalogCode({ client, tableName: 'cat_pedidos_modalidades_entrega', idColumn: 'id_modalidad_entrega', code: modalidad }),
+      resolvePedidoPendienteStaticCatalogCode({ client, tableName: 'cat_pedidos_estados_pago', idColumn: 'id_estado_pago_pedido', code: PEDIDO_PENDIENTE_ESTADO_PAGO }),
+      resolvePedidoPendienteStaticCatalogCode({ client, tableName: 'cat_pedidos_motivos_pago_pendiente', idColumn: 'id_motivo_pago_pendiente', code: motivoPagoPendiente }),
+      modalidad === 'DELIVERY' ? resolvePedidoPendienteStaticCatalogCode({ client, tableName: 'cat_delivery_estados', idColumn: 'id_estado_delivery', code: PEDIDO_PENDIENTE_ESTADO_DELIVERY }) : Promise.resolve(null)
+    ]);
+  } finally {
+    perf?.add?.('pedido_pendiente_static_catalogs_ms', staticCatalogsStart);
+  }
   if (!canalCatalog || !modalidadCatalog || !estadoPagoCatalog || !motivoPagoCatalog || (modalidad === 'DELIVERY' && !deliveryEstadoCatalog)) {
     return { ok: false, status: 409, body: { error: true, message: 'No se encontraron catalogos requeridos para crear el pedido pendiente.' } };
   }
@@ -3057,10 +3141,12 @@ const buildPedidoPendientePayload = async ({ client, body, userId, sucursalScope
   const normalizedItemsResult = normalizeVentaItems(buildPedidoPendienteItemsBody(body));
   perf?.add?.('validation_items_ms', validationItemsStart);
   if (!normalizedItemsResult.ok) return { ok: false, status: 400, body: { error: true, message: normalizedItemsResult.message } };
+  const hydrateLinesStart = perf?.now?.() || 0;
   const hydratedResult = await hydrateVentaLines(client, normalizedItemsResult.data, perf, {
     idSucursal,
     validateProductStock: false
   });
+  perf?.add?.('pedido_pendiente_hydrate_lines_ms', hydrateLinesStart);
   if (!hydratedResult.ok) return hydratedResult;
 
   const { lines, subTotals } = hydratedResult.data;
@@ -3137,7 +3223,13 @@ const buildPedidoPendientePayload = async ({ client, body, userId, sucursalScope
   const subtotal = roundMoney(finalizedLines.reduce((sum, line) => sum + line.total_linea, 0));
   const isv = 0;
   const total = roundMoney(subtotal + costoEnvio);
-  const idEstadoPedido = await resolveEstadoPedidoIdByCode(client, 'EN_COCINA');
+  const estadoPedidoStart = perf?.now?.() || 0;
+  let idEstadoPedido = null;
+  try {
+    idEstadoPedido = await resolvePedidoPendienteEstadoPedidoIdByCode(client, 'EN_COCINA');
+  } finally {
+    perf?.add?.('pedido_pendiente_static_catalogs_ms', estadoPedidoStart);
+  }
   if (!idEstadoPedido) return { ok: false, status: 409, body: { error: true, message: 'No existe el estado EN_COCINA en estados_pedido.' } };
 
   const sessionActiva = await resolveCajaSession({ client, idSucursal, idUsuario: userId, idSesionCaja: idSesionCajaRequested, isSuperAdmin });
@@ -5953,6 +6045,13 @@ async function listarPedidosPendientesPago(req, res) {
 }
 router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), async (req, res) => {
   const ventasPerf = createVentasPerfTracker();
+  const pedidoPendienteRouteStart = ventasPerf.now();
+  let pedidoPendienteTotalRouteMeasured = false;
+  const addPedidoPendienteTotalRoute = () => {
+    if (pedidoPendienteTotalRouteMeasured) return;
+    ventasPerf.add('pedido_pendiente_total_route_ms', pedidoPendienteRouteStart);
+    pedidoPendienteTotalRouteMeasured = true;
+  };
   logVentasPerfRoute('POST /ventas/pedidos-pendientes', {
     items_count: Array.isArray(req.body?.items) ? req.body.items.length : 0,
     id_sucursal: parseOptionalPositiveInt(req.body?.id_sucursal) || null
@@ -5968,6 +6067,7 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
   const discountIntent = hasDiscountIntentInPayload(req.body);
   const canApplyDiscount = await requestHasAnyPermission(req, [VENTAS_DESCUENTO_APLICAR_PERMISSION]);
   if (discountIntent && !canApplyDiscount) {
+    addPedidoPendienteTotalRoute();
     ventasPerf.log({
       ...ventasPerfContext,
       status: 403,
@@ -5995,16 +6095,23 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
     const userId = parseOptionalPositiveInt(scope.idUsuario);
     ventasPerfContext.id_usuario = userId || null;
     ventasPerf.add('auth_scope_ms', contextoStart);
+    ventasPerf.add('pedido_pendiente_scope_ms', contextoStart);
 
-    idempotencyReservation = await reserveVentasIdempotencyKey({
-      idempotencyKey,
-      operation: 'POST /ventas/pedidos-pendientes',
-      requestHash: idempotencyRequestHash,
-      idUsuario: userId,
-      idSucursal: req.body?.id_sucursal
-    });
+    const idempotencyStart = ventasPerf.now();
+    try {
+      idempotencyReservation = await reserveVentasIdempotencyKey({
+        idempotencyKey,
+        operation: 'POST /ventas/pedidos-pendientes',
+        requestHash: idempotencyRequestHash,
+        idUsuario: userId,
+        idSucursal: req.body?.id_sucursal
+      });
+    } finally {
+      ventasPerf.add('pedido_pendiente_idempotency_ms', idempotencyStart);
+    }
     if (idempotencyReservation.replay) {
       await client.query('ROLLBACK');
+      addPedidoPendienteTotalRoute();
       ventasPerf.log({ ...ventasPerfContext, status: idempotencyReservation.httpStatus || 200 });
       return res.status(idempotencyReservation.httpStatus || 200).json({
         ...(isPlainObject(idempotencyReservation.responseBody) ? idempotencyReservation.responseBody : {}),
@@ -6013,6 +6120,7 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
     }
     if (idempotencyReservation.conflict) {
       await client.query('ROLLBACK');
+      addPedidoPendienteTotalRoute();
       ventasPerf.log({
         ...ventasPerfContext,
         status: 409,
@@ -6045,6 +6153,7 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
         httpStatus: prepared.status,
         errorCode: prepared.body?.code || null
       });
+      addPedidoPendienteTotalRoute();
       ventasPerf.log({
         ...ventasPerfContext,
         status: prepared.status,
@@ -6053,12 +6162,14 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
       return res.status(prepared.status).json(prepared.body);
     }
 
+    const cuentaDivididaPlanStart = ventasPerf.now();
     const pedidoPendiente = prepared.data;
     const cuentaDivisionPlan = buildCuentaDivisionPlan({
       cuentaDividida: req.body?.cuenta_dividida,
       lines: pedidoPendiente.pedido_lines,
       expectedTotal: pedidoPendiente.total
     });
+    ventasPerf.add('pedido_pendiente_cuenta_dividida_plan_ms', cuentaDivididaPlanStart);
     Object.assign(ventasPerfContext, {
       id_sucursal: parseOptionalPositiveInt(pedidoPendiente.id_sucursal),
       id_caja: parseOptionalPositiveInt(pedidoPendiente.id_caja),
@@ -6081,7 +6192,9 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
       const commitStart = ventasPerf.now();
       await client.query('COMMIT');
       ventasPerf.add('commit_ms', commitStart);
+      ventasPerf.add('pedido_pendiente_commit_ms', commitStart);
 
+      const idempotencySuccessStart = ventasPerf.now();
       await saveVentasIdempotencySuccess({
         reservation: idempotencyReservation,
         httpStatus: 201,
@@ -6092,6 +6205,8 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
       }).catch((err) => {
         console.error('No se pudo guardar resultado idempotente RPC de pedido pendiente:', err);
       });
+      ventasPerf.add('pedido_pendiente_idempotency_success_ms', idempotencySuccessStart);
+      addPedidoPendienteTotalRoute();
       ventasPerf.log({ ...ventasPerfContext, status: 201, persistence_mode: 'rpc_v1' });
       return res.status(201).json(rpcResponseBody);
     }
@@ -6386,6 +6501,7 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
     const commitStart = ventasPerf.now();
     await client.query('COMMIT');
     ventasPerf.add('commit_ms', commitStart);
+    ventasPerf.add('pedido_pendiente_commit_ms', commitStart);
 
     const responseBody = {
       message: 'Pedido pendiente creado correctamente.',
@@ -6399,6 +6515,7 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
       monto_pendiente: pedidoPendiente.total,
       cuenta_dividida: cuentaDivididaResponse
     };
+    const idempotencySuccessStart = ventasPerf.now();
     await saveVentasIdempotencySuccess({
       reservation: idempotencyReservation,
       httpStatus: 201,
@@ -6409,7 +6526,9 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
     }).catch((err) => {
       console.error('No se pudo guardar resultado idempotente de pedido pendiente:', err);
     });
-    ventasPerf.log({ ...ventasPerfContext, status: 201 });
+    ventasPerf.add('pedido_pendiente_idempotency_success_ms', idempotencySuccessStart);
+    addPedidoPendienteTotalRoute();
+    ventasPerf.log({ ...ventasPerfContext, status: 201, persistence_mode: 'legacy' });
     return res.status(201).json(responseBody);
   } catch (err) {
     await client.query('ROLLBACK').catch((rollbackErr) => {
@@ -6422,6 +6541,7 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
     }).catch((idempotencyErr) => {
       console.error('No se pudo marcar fallo idempotente de pedido pendiente:', idempotencyErr);
     });
+    addPedidoPendienteTotalRoute();
     ventasPerf.log({
       ...ventasPerfContext,
       status: Number.isInteger(err?.httpStatus) ? err.httpStatus : 500,
@@ -6437,6 +6557,7 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
     }
     return sendVentasInternalError(res, 'No se pudo crear el pedido pendiente.');
   } finally {
+    addPedidoPendienteTotalRoute();
     ventasPerf.logIfMissing({
       ...ventasPerfContext,
       status: res.statusCode || null,
