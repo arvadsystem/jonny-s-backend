@@ -1,5 +1,6 @@
 import express from 'express';
 import { performance } from 'node:perf_hooks';
+import { createHash } from 'node:crypto';
 import pool from '../config/db-connection.js';
 import { checkPermission, requestHasAnyPermission } from '../middleware/checkPermission.js';
 import { resolveRequestUserSucursalScope } from '../utils/sucursalScope.js';
@@ -176,6 +177,192 @@ const hasTable = async (client, tableName) => {
   const exists = result.rowCount > 0;
   schemaColumnCache.set(key, exists);
   return exists;
+};
+
+const getIdempotencyKey = (req) => {
+  const raw = req.headers?.['idempotency-key'];
+  const value = Array.isArray(raw) ? raw[0] : raw;
+  const key = String(value || '').trim();
+  return key || null;
+};
+
+const stableStringify = (value) => {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map((item) => stableStringify(item)).join(',')}]`;
+
+  return `{${Object.keys(value)
+    .sort()
+    .map((key) => `${JSON.stringify(key)}:${stableStringify(value[key])}`)
+    .join(',')}}`;
+};
+
+const buildIdempotencyRequestHash = (body) =>
+  createHash('sha256')
+    .update(stableStringify(body ?? null))
+    .digest('hex');
+
+const reserveVentasIdempotencyKey = async ({
+  idempotencyKey,
+  operation,
+  requestHash,
+  idUsuario = null,
+  idSucursal = null
+}) => {
+  if (!idempotencyKey) return { enabled: false };
+
+  try {
+    const insertResult = await pool.query(
+      `
+        INSERT INTO public.ventas_idempotency_keys (
+          idempotency_key,
+          operation,
+          request_hash,
+          id_usuario,
+          id_sucursal,
+          status
+        )
+        VALUES ($1, $2, $3, $4, $5, 'IN_PROGRESS')
+        ON CONFLICT (idempotency_key) DO NOTHING
+        RETURNING idempotency_key
+      `,
+      [
+        idempotencyKey,
+        operation,
+        requestHash,
+        parseOptionalPositiveInt(idUsuario) || null,
+        parseOptionalPositiveInt(idSucursal) || null
+      ]
+    );
+
+    if (insertResult.rowCount > 0) {
+      return { enabled: true, reserved: true, idempotencyKey, requestHash };
+    }
+
+    const existingResult = await pool.query(
+      `
+        SELECT
+          idempotency_key,
+          operation,
+          request_hash,
+          status,
+          http_status,
+          response_body
+        FROM public.ventas_idempotency_keys
+        WHERE idempotency_key = $1
+        LIMIT 1
+      `,
+      [idempotencyKey]
+    );
+    const existing = existingResult.rows?.[0] || null;
+    if (!existing) {
+      return { enabled: true, conflict: true, code: 'REQUEST_ALREADY_IN_PROGRESS' };
+    }
+
+    if (existing.operation !== operation || existing.request_hash !== requestHash) {
+      return { enabled: true, conflict: true, code: 'IDEMPOTENCY_KEY_REUSED' };
+    }
+    if (String(existing.status || '').trim().toUpperCase() === 'SUCCESS') {
+      return {
+        enabled: true,
+        replay: true,
+        httpStatus: Number(existing.http_status || 200),
+        responseBody: existing.response_body || {}
+      };
+    }
+    if (String(existing.status || '').trim().toUpperCase() === 'IN_PROGRESS') {
+      return { enabled: true, conflict: true, code: 'REQUEST_ALREADY_IN_PROGRESS' };
+    }
+
+    await pool.query(
+      `
+        UPDATE public.ventas_idempotency_keys
+        SET
+          operation = $2,
+          id_usuario = COALESCE($3, id_usuario),
+          id_sucursal = COALESCE($4, id_sucursal),
+          status = 'IN_PROGRESS',
+          http_status = NULL,
+          response_body = NULL,
+          error_code = NULL,
+          updated_at = now()
+        WHERE idempotency_key = $1
+      `,
+      [
+        idempotencyKey,
+        operation,
+        parseOptionalPositiveInt(idUsuario) || null,
+        parseOptionalPositiveInt(idSucursal) || null
+      ]
+    );
+    return { enabled: true, reserved: true, idempotencyKey, requestHash };
+  } catch (err) {
+    if (err?.code === '42P01') {
+      console.warn('Tabla ventas_idempotency_keys no existe; se omite idempotencia de ventas.');
+      return { enabled: false, missingTable: true };
+    }
+    throw err;
+  }
+};
+
+const saveVentasIdempotencySuccess = async ({
+  reservation,
+  httpStatus,
+  responseBody,
+  idPedido = null,
+  idFactura = null,
+  idUsuario = null,
+  idSucursal = null
+}) => {
+  if (!reservation?.reserved) return;
+  await pool.query(
+    `
+      UPDATE public.ventas_idempotency_keys
+      SET
+        status = 'SUCCESS',
+        http_status = $2,
+        response_body = $3::jsonb,
+        id_pedido = COALESCE($4, id_pedido),
+        id_factura = COALESCE($5, id_factura),
+        id_usuario = COALESCE($6, id_usuario),
+        id_sucursal = COALESCE($7, id_sucursal),
+        error_code = NULL,
+        updated_at = now()
+      WHERE idempotency_key = $1
+    `,
+    [
+      reservation.idempotencyKey,
+      httpStatus,
+      JSON.stringify(responseBody),
+      parseOptionalPositiveInt(idPedido) || null,
+      parseOptionalPositiveInt(idFactura) || null,
+      parseOptionalPositiveInt(idUsuario) || null,
+      parseOptionalPositiveInt(idSucursal) || null
+    ]
+  );
+};
+
+const saveVentasIdempotencyFailure = async ({
+  reservation,
+  httpStatus = null,
+  errorCode = null
+}) => {
+  if (!reservation?.reserved) return;
+  await pool.query(
+    `
+      UPDATE public.ventas_idempotency_keys
+      SET
+        status = 'FAILED',
+        http_status = $2,
+        error_code = $3,
+        updated_at = now()
+      WHERE idempotency_key = $1
+    `,
+    [
+      reservation.idempotencyKey,
+      Number.isInteger(httpStatus) ? httpStatus : null,
+      errorCode || null
+    ]
+  );
 };
 const hasDiscountIntentInPayload = (body) => {
   if (!isPlainObject(body)) return false;
@@ -5759,6 +5946,11 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
   }
 
   const client = await pool.connect();
+  const idempotencyKey = getIdempotencyKey(req);
+  const idempotencyRequestHash = idempotencyKey
+    ? buildIdempotencyRequestHash(req.body)
+    : null;
+  let idempotencyReservation = null;
 
   try {
     await client.query('BEGIN');
@@ -5768,6 +5960,37 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
     const userId = parseOptionalPositiveInt(scope.idUsuario);
     ventasPerfContext.id_usuario = userId || null;
     ventasPerf.add('auth_scope_ms', contextoStart);
+
+    idempotencyReservation = await reserveVentasIdempotencyKey({
+      idempotencyKey,
+      operation: 'POST /ventas/pedidos-pendientes',
+      requestHash: idempotencyRequestHash,
+      idUsuario: userId,
+      idSucursal: req.body?.id_sucursal
+    });
+    if (idempotencyReservation.replay) {
+      await client.query('ROLLBACK');
+      ventasPerf.log({ ...ventasPerfContext, status: idempotencyReservation.httpStatus || 200 });
+      return res.status(idempotencyReservation.httpStatus || 200).json({
+        ...(isPlainObject(idempotencyReservation.responseBody) ? idempotencyReservation.responseBody : {}),
+        idempotent_replay: true
+      });
+    }
+    if (idempotencyReservation.conflict) {
+      await client.query('ROLLBACK');
+      ventasPerf.log({
+        ...ventasPerfContext,
+        status: 409,
+        error_code: idempotencyReservation.code
+      });
+      return res.status(409).json({
+        error: true,
+        code: idempotencyReservation.code,
+        message: idempotencyReservation.code === 'IDEMPOTENCY_KEY_REUSED'
+          ? 'Idempotency-Key ya fue usado con otro payload.'
+          : 'La solicitud ya esta en proceso.'
+      });
+    }
 
     const buildStart = ventasPerf.now();
     const prepared = await buildPedidoPendientePayload({
@@ -5782,6 +6005,11 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
 
     if (!prepared.ok) {
       await client.query('ROLLBACK');
+      await saveVentasIdempotencyFailure({
+        reservation: idempotencyReservation,
+        httpStatus: prepared.status,
+        errorCode: prepared.body?.code || null
+      });
       ventasPerf.log({
         ...ventasPerfContext,
         status: prepared.status,
@@ -5873,11 +6101,35 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
     const hasDetallePedidoConfiguracionMenu = await hasColumn(client, 'detalle_pedido', 'configuracion_menu');
     const detalleStart = ventasPerf.now();
     const pedidoLineRefs = [];
-    for (const line of pedidoPendiente.pedido_lines) {
-      const configuracionMenu = buildComplementLineConfig(line);
-      let detallePedidoInsert;
+    const detallePedidoRows = pedidoPendiente.pedido_lines.map((line) => ({
+      line,
+      configuracionMenu: buildComplementLineConfig(line)
+    }));
+
+    if (detallePedidoRows.length > 0) {
+      const detallePedidoParams = [];
+      let detallePedidoValues;
+      let detallePedidoResult;
+
       if (hasDetallePedidoConfiguracionMenu) {
-        detallePedidoInsert = await client.query(
+        detallePedidoValues = detallePedidoRows.map((_, index) => {
+          const base = index * 9;
+          return `($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}, true, $${base + 6}, $${base + 7}, $${base + 8}, $${base + 9}::jsonb)`;
+        }).join(', ');
+        for (const { line, configuracionMenu } of detallePedidoRows) {
+          detallePedidoParams.push(
+            line.sub_total,
+            line.total_linea,
+            line.id_producto,
+            idPedido,
+            line.id_descuento,
+            line.id_combo,
+            line.id_receta,
+            line.observacion,
+            configuracionMenu ? JSON.stringify(configuracionMenu) : null
+          );
+        }
+        detallePedidoResult = await client.query(
           `
             INSERT INTO detalle_pedido (
               sub_total_pedido,
@@ -5891,10 +6143,18 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
               observacion,
               configuracion_menu
             )
-            VALUES ($1, $2, $3, $4, $5, true, $6, $7, $8, $9::jsonb)
+            VALUES ${detallePedidoValues}
             RETURNING id_detalle_pedido
           `,
-          [
+          detallePedidoParams
+        );
+      } else {
+        detallePedidoValues = detallePedidoRows.map((_, index) => {
+          const base = index * 8;
+          return `($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}, true, $${base + 6}, $${base + 7}, $${base + 8})`;
+        }).join(', ');
+        for (const { line } of detallePedidoRows) {
+          detallePedidoParams.push(
             line.sub_total,
             line.total_linea,
             line.id_producto,
@@ -5902,12 +6162,10 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
             line.id_descuento,
             line.id_combo,
             line.id_receta,
-            line.observacion,
-            configuracionMenu ? JSON.stringify(configuracionMenu) : null
-          ]
-        );
-      } else {
-        detallePedidoInsert = await client.query(
+            line.observacion
+          );
+        }
+        detallePedidoResult = await client.query(
           `
             INSERT INTO detalle_pedido (
               sub_total_pedido,
@@ -5920,28 +6178,25 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
               id_receta,
               observacion
             )
-            VALUES ($1, $2, $3, $4, $5, true, $6, $7, $8)
+            VALUES ${detallePedidoValues}
             RETURNING id_detalle_pedido
           `,
-          [
-            line.sub_total,
-            line.total_linea,
-            line.id_producto,
-            idPedido,
-            line.id_descuento,
-            line.id_combo,
-            line.id_receta,
-            line.observacion
-          ]
+          detallePedidoParams
         );
       }
-      const idDetallePedido = Number(detallePedidoInsert.rows?.[0]?.id_detalle_pedido || 0);
-      pedidoLineRefs.push({ id_detalle_pedido: idDetallePedido });
-      await insertDetallePedidoExtras({
-        client,
-        idDetallePedido,
-        extras: line.extras_detalle
+
+      detallePedidoRows.forEach((_, index) => {
+        const idDetallePedido = Number(detallePedidoResult.rows?.[index]?.id_detalle_pedido || 0);
+        pedidoLineRefs.push({ id_detalle_pedido: idDetallePedido });
       });
+
+      for (let index = 0; index < detallePedidoRows.length; index += 1) {
+        await insertDetallePedidoExtras({
+          client,
+          idDetallePedido: pedidoLineRefs[index]?.id_detalle_pedido,
+          extras: detallePedidoRows[index].line.extras_detalle
+        });
+      }
     }
     ventasPerf.add('detalle_pedido_ms', detalleStart);
 
@@ -6079,10 +6334,29 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
       monto_pendiente: pedidoPendiente.total,
       cuenta_dividida: cuentaDivididaResponse
     };
+    await saveVentasIdempotencySuccess({
+      reservation: idempotencyReservation,
+      httpStatus: 201,
+      responseBody,
+      idPedido,
+      idUsuario: userId,
+      idSucursal: pedidoPendiente.id_sucursal
+    }).catch((err) => {
+      console.error('No se pudo guardar resultado idempotente de pedido pendiente:', err);
+    });
     ventasPerf.log({ ...ventasPerfContext, status: 201 });
     return res.status(201).json(responseBody);
   } catch (err) {
-    await client.query('ROLLBACK');
+    await client.query('ROLLBACK').catch((rollbackErr) => {
+      console.error('Error al revertir creacion de pedido pendiente:', rollbackErr);
+    });
+    await saveVentasIdempotencyFailure({
+      reservation: idempotencyReservation,
+      httpStatus: Number.isInteger(err?.httpStatus) ? err.httpStatus : 500,
+      errorCode: err?.code || null
+    }).catch((idempotencyErr) => {
+      console.error('No se pudo marcar fallo idempotente de pedido pendiente:', idempotencyErr);
+    });
     ventasPerf.log({
       ...ventasPerfContext,
       status: Number.isInteger(err?.httpStatus) ? err.httpStatus : 500,
