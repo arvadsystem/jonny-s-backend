@@ -19,6 +19,7 @@ export const logVentasPerfStartupIfEnabled = () => {
     VENTAS_PERF_LOGS: process.env.VENTAS_PERF_LOGS || null,
     VENTAS_USE_RPC_V2: process.env.VENTAS_USE_RPC_V2 || null,
     VENTAS_USE_RPC_TRANSACTION: process.env.VENTAS_USE_RPC_TRANSACTION || null,
+    PEDIDO_PENDIENTE_USE_RPC_V1: process.env.PEDIDO_PENDIENTE_USE_RPC_V1 || null,
     VENTAS_CATALOG_CACHE_TTL_MS: process.env.VENTAS_CATALOG_CACHE_TTL_MS || null,
     EMAIL_SCHEDULER_ENABLED: process.env.EMAIL_SCHEDULER_ENABLED || null
   });
@@ -40,6 +41,12 @@ export function isVentasRpcTransactionEnabled() {
 
 export function isVentasRpcV2Enabled() {
   return String(process.env.VENTAS_USE_RPC_V2 || '')
+    .trim()
+    .toLowerCase() === 'true';
+}
+
+export function isPedidoPendienteRpcV1Enabled() {
+  return String(process.env.PEDIDO_PENDIENTE_USE_RPC_V1 || '')
     .trim()
     .toLowerCase() === 'true';
 }

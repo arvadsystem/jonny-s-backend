@@ -67,6 +67,7 @@ import {
   normalizeVentaItems
 } from './ventas/services/ventasPayloadService.js';
 import {
+  buildPedidoPendienteRpcPayload,
   buildVentaRpcPayload,
   buildVentaRpcV2Payload
 } from './ventas/services/ventasRpcPayloadService.js';
@@ -118,6 +119,7 @@ import {
 } from './ventas/utils/parseUtils.js';
 import {
   createVentasPerfTracker,
+  isPedidoPendienteRpcV1Enabled,
   isVentasPerfEnabled,
   isVentasRpcTransactionEnabled,
   isVentasRpcV2Enabled,
@@ -1148,6 +1150,39 @@ const createVentaWithRpcV2Transaction = async ({ client, venta, perf, requestSta
     }
   };
 };
+
+const createPedidoPendienteWithRpcV1Transaction = async ({ client, pedidoPendiente, perf }) => {
+  const rpcTotalStart = perf?.now?.() || 0;
+  const rpcPayloadBuildStart = perf?.now?.() || 0;
+  const rpcPayload = buildPedidoPendienteRpcPayload(pedidoPendiente);
+  const rpcActor = {
+    id_usuario: pedidoPendiente.id_usuario,
+    id_sucursal: pedidoPendiente.id_sucursal,
+    id_caja: pedidoPendiente.id_caja,
+    id_sesion_caja: pedidoPendiente.id_sesion_caja
+  };
+  perf?.add?.('pedido_pendiente_rpc_payload_build_ms', rpcPayloadBuildStart);
+
+  const rpcCallStart = perf?.now?.() || 0;
+  const rpcResult = await client.query(
+    'SELECT public.registrar_pedido_pendiente_pos_v1($1::jsonb, $2::jsonb) AS response',
+    [JSON.stringify(rpcPayload), JSON.stringify(rpcActor)]
+  );
+  perf?.add?.('pedido_pendiente_rpc_call_ms', rpcCallStart);
+  perf?.add?.('pedido_pendiente_rpc_total_ms', rpcTotalStart);
+
+  const response = rpcResult.rows?.[0]?.response;
+  if (!isPlainObject(response) || !parseOptionalPositiveInt(response.id_pedido)) {
+    throw {
+      httpStatus: 500,
+      code: 'PEDIDO_PENDIENTE_RPC_RESPONSE_INVALID',
+      publicMessage: 'El pedido fue procesado por RPC, pero la respuesta no es valida.'
+    };
+  }
+
+  return response;
+};
+
 const getNextTableId = async (client, tableName, idField, lock = true) => {
   if (lock) {
     await client.query(`LOCK TABLE ${tableName} IN EXCLUSIVE MODE`);
@@ -6030,6 +6065,36 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
       id_sesion_caja: parseOptionalPositiveInt(pedidoPendiente.id_sesion_caja),
       items_count: Array.isArray(pedidoPendiente.pedido_lines) ? pedidoPendiente.pedido_lines.length : 0
     });
+
+    const shouldUsePedidoPendienteRpcV1 =
+      isPedidoPendienteRpcV1Enabled()
+      && !cuentaDivisionPlan
+      && Array.isArray(pedidoPendiente.pedido_lines)
+      && pedidoPendiente.pedido_lines.length > 0;
+
+    if (shouldUsePedidoPendienteRpcV1) {
+      const rpcResponseBody = await createPedidoPendienteWithRpcV1Transaction({
+        client,
+        pedidoPendiente,
+        perf: ventasPerf
+      });
+      const commitStart = ventasPerf.now();
+      await client.query('COMMIT');
+      ventasPerf.add('commit_ms', commitStart);
+
+      await saveVentasIdempotencySuccess({
+        reservation: idempotencyReservation,
+        httpStatus: 201,
+        responseBody: rpcResponseBody,
+        idPedido: rpcResponseBody.id_pedido,
+        idUsuario: userId,
+        idSucursal: pedidoPendiente.id_sucursal
+      }).catch((err) => {
+        console.error('No se pudo guardar resultado idempotente RPC de pedido pendiente:', err);
+      });
+      ventasPerf.log({ ...ventasPerfContext, status: 201, persistence_mode: 'rpc_v1' });
+      return res.status(201).json(rpcResponseBody);
+    }
 
     const descuentosStart = ventasPerf.now();
     for (const line of pedidoPendiente.pedido_lines) {
