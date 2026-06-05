@@ -1,4 +1,10 @@
 import pool from '../../../config/db-connection.js';
+import {
+  normalizarDatosTicketDesdeSnapshot
+} from '../../../services/facturacionSnapshotService.js';
+import {
+  listFacturaReversiones
+} from '../../../services/ventasReversionService.js';
 import { resolveRequestUserSucursalScope } from '../../../utils/sucursalScope.js';
 import {
   VENTAS_HISTORY_ADMIN_ROLES,
@@ -8,8 +14,20 @@ import { roundMoney } from '../utils/moneyUtils.js';
 import {
   normalizeRoleName,
   parseOptionalDateInput,
-  parseOptionalPositiveInt
+  parseOptionalPositiveInt,
+  parsePositiveInt
 } from '../utils/parseUtils.js';
+import {
+  buildDirectSaleDetailItems,
+  buildKitchenSaleDetailItems,
+  fetchCuentaDividida,
+  fetchDetalleFacturaExtras,
+  fetchDirectSaleDetailRows,
+  fetchKitchenSaleDetailRows,
+  fetchVentaDetailHeader,
+  mergeVentaWithFacturacion,
+  resolveVentaNumero
+} from '../services/ventaDetalleReadService.js';
 
 const sendVentasInternalError = (
   res,
@@ -162,5 +180,94 @@ export const buscarVentaHandler = async (req, res) => {
   } catch (err) {
     console.error('Error en búsqueda exacta de ventas:', err);
     return sendVentasInternalError(res);
+  }
+};
+
+export const getVentaByIdHandler = async (req, res) => {
+  try {
+    const idFactura = parsePositiveInt(req.params.id);
+    if (!idFactura) {
+      return res.status(400).json({ error: true, message: 'ID de venta invalido.' });
+    }
+
+    const scope = await resolveVentasHistoryScope(req);
+    if (!scope.allowedSucursalIds.length) {
+      return res.status(403).json({ error: true, message: 'El empleado no tiene sucursales asignadas.' });
+    }
+    const headerResult = await fetchVentaDetailHeader(pool, {
+      idFactura,
+      limitedToLast72Hours: scope.limitedToLast72Hours,
+      allowedSucursalIds: scope.allowedSucursalIds
+    });
+    if (headerResult.rowCount === 0) {
+      return res.status(404).json({ error: true, message: 'Venta no encontrada.' });
+    }
+
+    const venta = headerResult.rows[0];
+    const facturacionNormalizada = await normalizarDatosTicketDesdeSnapshot({
+      client: pool,
+      factura: venta
+    });
+    Object.assign(venta, mergeVentaWithFacturacion(venta, facturacionNormalizada));
+    const idUsuarioDetalle = parsePositiveInt(req.user?.id_usuario);
+    const reversiones = idUsuarioDetalle
+      ? await listFacturaReversiones({
+        idFactura: venta.id_factura,
+        idUsuario: idUsuarioDetalle
+      })
+      : [];
+
+    if (venta.id_pedido) {
+      const pedidoItemsResult = await fetchKitchenSaleDetailRows(pool, venta.id_factura);
+
+      const detalleFacturaExtrasById = await fetchDetalleFacturaExtras(
+        pool,
+        pedidoItemsResult.rows.map((row) => row.id_detalle)
+      );
+      const pedidoItems = buildKitchenSaleDetailItems(pedidoItemsResult.rows).map((item) => ({
+        ...item,
+        extras: detalleFacturaExtrasById.get(Number(item.id_detalle)) || []
+      }));
+      const cuentaDividida = await fetchCuentaDividida(pool, {
+        idFactura: venta.id_factura,
+        idPedido: venta.id_pedido
+      });
+
+      return res.status(200).json({
+        ...venta,
+        numero_venta: resolveVentaNumero(venta),
+        metodo_pago: venta.metodo_pago || null,
+        items: pedidoItems,
+        cuenta_dividida: cuentaDividida,
+        reversiones
+      });
+    }
+
+    const directItemsResult = await fetchDirectSaleDetailRows(pool, venta.id_factura);
+
+    const detalleFacturaExtrasById = await fetchDetalleFacturaExtras(
+      pool,
+      directItemsResult.rows.map((row) => row.id_detalle)
+    );
+    const directItems = buildDirectSaleDetailItems(directItemsResult.rows).map((item) => ({
+      ...item,
+      extras: detalleFacturaExtrasById.get(Number(item.id_detalle)) || []
+    }));
+    const cuentaDividida = await fetchCuentaDividida(pool, {
+      idFactura: venta.id_factura,
+      idPedido: venta.id_pedido
+    });
+
+    res.status(200).json({
+      ...venta,
+      numero_venta: resolveVentaNumero(venta),
+      metodo_pago: venta.metodo_pago || null,
+      items: directItems,
+      cuenta_dividida: cuentaDividida,
+      reversiones
+    });
+  } catch (err) {
+    console.error('Error al obtener detalle de venta:', err);
+    sendVentasInternalError(res);
   }
 };
