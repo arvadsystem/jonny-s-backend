@@ -22,7 +22,6 @@ import {
 } from '../services/inventarioAlertasService.js';
 import {
   fetchEstadoPedidoRows,
-  resolveActiveCatalogCode,
   resolveEstadoPedidoIdByCode,
   resolveMetodoPagoRegistroPedido,
   resolveSucursalId
@@ -179,6 +178,62 @@ const hasTable = async (client, tableName) => {
   const exists = result.rowCount > 0;
   schemaColumnCache.set(key, exists);
   return exists;
+};
+
+const PEDIDO_PENDIENTE_ALLOWED_EXTRAS_SCHEMA_TABLES = Object.freeze([
+  'menu_extras',
+  'menu_extra_receta',
+  'menu_extra_combo'
+]);
+const PEDIDO_PENDIENTE_ALLOWED_EXTRAS_SCHEMA_MIN_TTL_MS = 5 * 60 * 1000;
+const pedidoPendienteAllowedExtrasSchemaCache = new Map();
+
+const getPedidoPendienteAllowedExtrasSchemaCacheTtlMs = () => {
+  const ttl = Number(process.env.VENTAS_CATALOG_CACHE_TTL_MS);
+  const configuredTtl = Number.isFinite(ttl) && ttl > 0 ? Math.round(ttl) : 30000;
+  return Math.max(configuredTtl, PEDIDO_PENDIENTE_ALLOWED_EXTRAS_SCHEMA_MIN_TTL_MS);
+};
+
+const clonePedidoPendienteAllowedExtrasSchemaValue = (value) => ({
+  hasMenuExtras: Boolean(value?.hasMenuExtras),
+  hasMenuExtraReceta: Boolean(value?.hasMenuExtraReceta),
+  hasMenuExtraCombo: Boolean(value?.hasMenuExtraCombo)
+});
+
+const resolvePedidoPendienteAllowedExtrasSchema = async (client, perf = null) => {
+  const startedAt = perf?.now?.() || 0;
+  try {
+    const cacheKey = 'pedido_pendiente_allowed_extras_schema';
+    const now = Date.now();
+    const cached = pedidoPendienteAllowedExtrasSchemaCache.get(cacheKey);
+    if (cached && cached.expiresAt > now) {
+      return clonePedidoPendienteAllowedExtrasSchemaValue(cached.value);
+    }
+    if (cached) pedidoPendienteAllowedExtrasSchemaCache.delete(cacheKey);
+
+    const result = await client.query(
+      `
+        SELECT table_name
+        FROM information_schema.tables
+        WHERE table_schema = 'public'
+          AND table_name = ANY($1::text[])
+      `,
+      [PEDIDO_PENDIENTE_ALLOWED_EXTRAS_SCHEMA_TABLES]
+    );
+    const existingTables = new Set(result.rows.map((row) => String(row.table_name || '').trim()));
+    const value = {
+      hasMenuExtras: existingTables.has('menu_extras'),
+      hasMenuExtraReceta: existingTables.has('menu_extra_receta'),
+      hasMenuExtraCombo: existingTables.has('menu_extra_combo')
+    };
+    pedidoPendienteAllowedExtrasSchemaCache.set(cacheKey, {
+      value,
+      expiresAt: now + getPedidoPendienteAllowedExtrasSchemaCacheTtlMs()
+    });
+    return clonePedidoPendienteAllowedExtrasSchemaValue(value);
+  } finally {
+    perf?.add?.('pedido_pendiente_allowed_extras_schema_ms', startedAt);
+  }
 };
 
 const getIdempotencyKey = (req) => {
@@ -1926,7 +1981,10 @@ const resolveLineComplementos = ({ item, receta, combo, context }) => {
 const buildExtraLineKey = (kind, idItem, idExtra) =>
   `${String(kind || '').trim().toUpperCase()}:${Number(idItem || 0)}:${Number(idExtra || 0)}`;
 
-const buildAllowedExtrasMap = async (client, { normalizedItems = [], idSucursal = null, perf = null } = {}) => {
+const itemHasRequestedExtras = (item) =>
+  Array.isArray(item?.extras) && item.extras.some((extra) => parseOptionalPositiveInt(extra?.id_extra));
+
+const buildAllowedExtrasMap = async (client, { normalizedItems = [], idSucursal = null, perf = null, allowedExtrasSchema = null } = {}) => {
   const recetaIds = [...new Set(
     normalizedItems
       .filter((item) => item.kind === 'RECETA')
@@ -1940,7 +1998,7 @@ const buildAllowedExtrasMap = async (client, { normalizedItems = [], idSucursal 
       .filter((id) => id > 0)
   )];
 
-  const needsExtras = normalizedItems.some((item) => Array.isArray(item.extras) && item.extras.length > 0);
+  const needsExtras = normalizedItems.some((item) => itemHasRequestedExtras(item));
   if (!needsExtras) return new Map();
   const requestedExtraIds = [...new Set(
     normalizedItems
@@ -1949,93 +2007,87 @@ const buildAllowedExtrasMap = async (client, { normalizedItems = [], idSucursal 
       .filter((id) => id > 0)
   )];
   if (requestedExtraIds.length === 0) return new Map();
+  if (recetaIds.length === 0 && comboIds.length === 0) return new Map();
 
-  const hasMenuExtras = await hasTable(client, 'menu_extras');
-  const hasMenuExtraReceta = await hasTable(client, 'menu_extra_receta');
-  const hasMenuExtraCombo = await hasTable(client, 'menu_extra_combo');
+  const {
+    hasMenuExtras,
+    hasMenuExtraReceta,
+    hasMenuExtraCombo
+  } = allowedExtrasSchema || await resolvePedidoPendienteAllowedExtrasSchema(client, perf);
   if (!hasMenuExtras) return new Map();
+  if (!hasMenuExtraReceta && !hasMenuExtraCombo) return new Map();
 
   const params = [recetaIds, comboIds, parseOptionalPositiveInt(idSucursal), requestedExtraIds];
-  const recipeSql = hasMenuExtraReceta
-    ? `
+  const allowedItemSqlParts = [];
+  if (hasMenuExtraReceta && recetaIds.length > 0) {
+    allowedItemSqlParts.push(`
       SELECT
         'RECETA'::text AS tipo,
         mer.id_receta AS id_item,
-        me.id_extra,
-        me.codigo,
-        me.nombre,
-        me.precio_adicional,
-        me.estado,
-        me.id_insumo,
-        me.cant,
-        me.id_unidad_medida,
-        i.cantidad AS stock_disponible,
-        i.id_almacen
+        mer.id_extra,
+        COALESCE(mer.orden, 0) AS orden
       FROM public.menu_extra_receta mer
-      INNER JOIN public.menu_extras me
-        ON me.id_extra = mer.id_extra
-       AND COALESCE(me.estado, true) = true
-      LEFT JOIN public.insumos i
-        ON i.id_insumo = me.id_insumo
-       AND COALESCE(i.estado, true) = true
-      LEFT JOIN public.almacenes a
-        ON a.id_almacen = i.id_almacen
-       AND ($3::int IS NULL OR a.id_sucursal = $3::int)
       WHERE mer.id_receta = ANY($1::int[])
-        AND me.id_extra = ANY($4::int[])
+        AND mer.id_extra = ANY($4::int[])
         AND COALESCE(mer.estado, true) = true
-        AND (me.id_insumo IS NULL OR a.id_almacen IS NOT NULL)
-    `
-    : `SELECT NULL::text AS tipo, NULL::int AS id_item, NULL::int AS id_extra, NULL::text AS codigo, NULL::text AS nombre, NULL::numeric AS precio_adicional, NULL::boolean AS estado, NULL::int AS id_insumo, NULL::numeric AS cant, NULL::int AS id_unidad_medida, NULL::numeric AS stock_disponible, NULL::int AS id_almacen WHERE false`;
-  const comboSql = hasMenuExtraCombo
-    ? `
+    `);
+  }
+  if (hasMenuExtraCombo && comboIds.length > 0) {
+    allowedItemSqlParts.push(`
       SELECT
         'COMBO'::text AS tipo,
         mec.id_combo AS id_item,
-        me.id_extra,
-        me.codigo,
-        me.nombre,
-        me.precio_adicional,
-        me.estado,
-        me.id_insumo,
-        me.cant,
-        me.id_unidad_medida,
-        i.cantidad AS stock_disponible,
-        i.id_almacen
+        mec.id_extra,
+        0 AS orden
       FROM public.menu_extra_combo mec
-      INNER JOIN public.menu_extras me
-        ON me.id_extra = mec.id_extra
-       AND COALESCE(me.estado, true) = true
-      LEFT JOIN public.insumos i
-        ON i.id_insumo = me.id_insumo
-       AND COALESCE(i.estado, true) = true
-      LEFT JOIN public.almacenes a
-        ON a.id_almacen = i.id_almacen
-       AND ($3::int IS NULL OR a.id_sucursal = $3::int)
       WHERE mec.id_combo = ANY($2::int[])
-        AND me.id_extra = ANY($4::int[])
+        AND mec.id_extra = ANY($4::int[])
         AND COALESCE(mec.estado, true) = true
-        AND (me.id_insumo IS NULL OR a.id_almacen IS NOT NULL)
-    `
-    : `SELECT NULL::text AS tipo, NULL::int AS id_item, NULL::int AS id_extra, NULL::text AS codigo, NULL::text AS nombre, NULL::numeric AS precio_adicional, NULL::boolean AS estado, NULL::int AS id_insumo, NULL::numeric AS cant, NULL::int AS id_unidad_medida, NULL::numeric AS stock_disponible, NULL::int AS id_almacen WHERE false`;
+    `);
+  }
+  if (allowedItemSqlParts.length === 0) return new Map();
+  const allowedItemsSql = allowedItemSqlParts.join('\nUNION ALL\n');
 
-  const cacheKey = `extras_allowed:s=${parseOptionalPositiveInt(idSucursal) || 0}:r=${buildVentasStaticCacheKey('recipes', recetaIds)}:c=${buildVentasStaticCacheKey('combos', comboIds)}:e=${buildVentasStaticCacheKey('extras', requestedExtraIds)}`;
-  const rows = await fetchCachedVentasStaticRows(
-    cacheKey,
-    async () => {
-      const result = await client.query(
-        `
-          ${recipeSql}
-          UNION ALL
-          ${comboSql}
-          ORDER BY tipo, id_item, nombre
-        `,
-        params
-      );
-      return result.rows;
-    },
-    perf
-  );
+  const allowedExtrasQueryStart = perf?.now?.() || 0;
+  let rows = [];
+  try {
+    const result = await client.query(
+      `
+        WITH allowed_items AS (
+          ${allowedItemsSql}
+        )
+        SELECT
+          ai.tipo,
+          ai.id_item,
+          me.id_extra,
+          me.codigo,
+          me.nombre,
+          me.precio_adicional,
+          me.estado,
+          me.id_insumo,
+          me.cant,
+          me.id_unidad_medida,
+          i.cantidad AS stock_disponible,
+          i.id_almacen
+        FROM allowed_items ai
+        INNER JOIN public.menu_extras me
+          ON me.id_extra = ai.id_extra
+         AND COALESCE(me.estado, true) = true
+        LEFT JOIN public.insumos i
+          ON i.id_insumo = me.id_insumo
+         AND COALESCE(i.estado, true) = true
+        LEFT JOIN public.almacenes a
+          ON a.id_almacen = i.id_almacen
+         AND ($3::int IS NULL OR a.id_sucursal = $3::int)
+        WHERE me.id_insumo IS NULL OR a.id_almacen IS NOT NULL
+        ORDER BY ai.tipo, ai.id_item, ai.orden, me.nombre
+      `,
+      params
+    );
+    rows = result.rows;
+  } finally {
+    perf?.add?.('pedido_pendiente_allowed_extras_query_ms', allowedExtrasQueryStart);
+  }
 
   return new Map(
     rows.map((row) => [
@@ -2682,6 +2734,13 @@ const hydrateVentaLines = async (client, normalizedItems, perf = null, options =
   if (comboIds.length > 0) perf?.add?.('totals_combos_ms', catalogosStart);
   if (recetaIds.length > 0) perf?.add?.('totals_recetas_ms', catalogosStart);
 
+  const needsAllowedExtrasSchema = normalizedItems.some((item) =>
+    (item.kind === 'RECETA' || item.kind === 'COMBO') && itemHasRequestedExtras(item)
+  );
+  const allowedExtrasSchema = needsAllowedExtrasSchema
+    ? await resolvePedidoPendienteAllowedExtrasSchema(client, perf)
+    : null;
+
   const [complementContext, allowedExtrasMap] = await Promise.all([
     buildVentaComplementContext({
       client,
@@ -2696,7 +2755,8 @@ const hydrateVentaLines = async (client, normalizedItems, perf = null, options =
         return await buildAllowedExtrasMap(client, {
           normalizedItems,
           idSucursal: options?.idSucursal,
-          perf
+          perf,
+          allowedExtrasSchema
         });
       } finally {
         perf?.add?.('totals_extras_ms', extrasStart);
@@ -2976,54 +3036,201 @@ const clonePedidoPendienteStaticCatalogValue = (value) => {
   return { ...value };
 };
 
-const resolvePedidoPendienteCachedStaticCatalog = async ({ tableName, idColumn, code, resolver }) => {
+const buildPedidoPendienteStaticCatalogCacheKey = ({ tableName, idColumn, code }) => {
   const normalizedTableName = String(tableName || '').trim().toLowerCase();
   const normalizedIdColumn = String(idColumn || '').trim().toLowerCase();
   const normalizedCode = normalizePedidoCatalogCode(code);
   if (!normalizedTableName || !normalizedIdColumn || !normalizedCode) return null;
   const lookupKey = `${normalizedTableName}|${normalizedIdColumn}`;
-  if (!PEDIDO_PENDIENTE_STATIC_CATALOG_LOOKUPS.has(lookupKey)) {
-    return resolver(normalizedCode);
-  }
+  if (!PEDIDO_PENDIENTE_STATIC_CATALOG_LOOKUPS.has(lookupKey)) return null;
+  return {
+    lookupKey,
+    cacheKey: `${lookupKey}|${normalizedCode}`,
+    normalizedCode
+  };
+};
 
-  const cacheKey = `${lookupKey}|${normalizedCode}`;
-  const now = Date.now();
-  const cached = pedidoPendienteStaticCatalogCache.get(cacheKey);
+const readPedidoPendienteStaticCatalogCache = (spec, now = Date.now()) => {
+  if (!spec?.cacheKey) return null;
+  const cached = pedidoPendienteStaticCatalogCache.get(spec.cacheKey);
   if (cached && cached.expiresAt > now) {
     return clonePedidoPendienteStaticCatalogValue(cached.value);
   }
-  if (cached) pedidoPendienteStaticCatalogCache.delete(cacheKey);
-
-  const value = await resolver(normalizedCode);
-  if (value) {
-    pedidoPendienteStaticCatalogCache.set(cacheKey, {
-      value: clonePedidoPendienteStaticCatalogValue(value),
-      expiresAt: now + getPedidoPendienteStaticCatalogCacheTtlMs()
-    });
-  }
-  return value;
+  if (cached) pedidoPendienteStaticCatalogCache.delete(spec.cacheKey);
+  return null;
 };
 
-const resolvePedidoPendienteStaticCatalogCode = ({ client, tableName, idColumn, code }) =>
-  resolvePedidoPendienteCachedStaticCatalog({
+const writePedidoPendienteStaticCatalogCache = (spec, value, now = Date.now()) => {
+  if (!spec?.cacheKey || !value) return;
+  pedidoPendienteStaticCatalogCache.set(spec.cacheKey, {
+    value: clonePedidoPendienteStaticCatalogValue(value),
+    expiresAt: now + getPedidoPendienteStaticCatalogCacheTtlMs()
+  });
+};
+
+const buildPedidoPendienteStaticCatalogSpec = ({ key, tableName, idColumn, code }) => {
+  const cacheParts = buildPedidoPendienteStaticCatalogCacheKey({ tableName, idColumn, code });
+  if (!cacheParts) return null;
+  return {
+    key,
     tableName,
     idColumn,
-    code,
-    resolver: (normalizedCode) => resolveActiveCatalogCode({
-      client,
-      tableName,
-      idColumn,
-      code: normalizedCode
-    })
-  });
+    code: cacheParts.normalizedCode,
+    cacheKey: cacheParts.cacheKey
+  };
+};
 
-const resolvePedidoPendienteEstadoPedidoIdByCode = (client, code) =>
-  resolvePedidoPendienteCachedStaticCatalog({
+const buildPedidoPendienteStaticCatalogSpecs = ({ canal, modalidad, motivoPagoPendiente, includeDelivery }) => [
+  buildPedidoPendienteStaticCatalogSpec({
+    key: 'canalCatalog',
+    tableName: 'cat_pedidos_canales',
+    idColumn: 'id_canal_pedido',
+    code: canal
+  }),
+  buildPedidoPendienteStaticCatalogSpec({
+    key: 'modalidadCatalog',
+    tableName: 'cat_pedidos_modalidades_entrega',
+    idColumn: 'id_modalidad_entrega',
+    code: modalidad
+  }),
+  buildPedidoPendienteStaticCatalogSpec({
+    key: 'estadoPagoCatalog',
+    tableName: 'cat_pedidos_estados_pago',
+    idColumn: 'id_estado_pago_pedido',
+    code: PEDIDO_PENDIENTE_ESTADO_PAGO
+  }),
+  buildPedidoPendienteStaticCatalogSpec({
+    key: 'motivoPagoCatalog',
+    tableName: 'cat_pedidos_motivos_pago_pendiente',
+    idColumn: 'id_motivo_pago_pendiente',
+    code: motivoPagoPendiente
+  }),
+  includeDelivery
+    ? buildPedidoPendienteStaticCatalogSpec({
+      key: 'deliveryEstadoCatalog',
+      tableName: 'cat_delivery_estados',
+      idColumn: 'id_estado_delivery',
+      code: PEDIDO_PENDIENTE_ESTADO_DELIVERY
+    })
+    : null,
+  buildPedidoPendienteStaticCatalogSpec({
+    key: 'idEstadoPedido',
     tableName: 'estados_pedido',
     idColumn: 'id_estado_pedido',
-    code,
-    resolver: (normalizedCode) => resolveEstadoPedidoIdByCode(client, normalizedCode)
-  });
+    code: 'EN_COCINA'
+  })
+].filter(Boolean);
+
+const fetchPedidoPendienteStaticCatalogSpecs = async (client, specs) => {
+  const missingSpecs = Array.isArray(specs) ? specs : [];
+  if (missingSpecs.length === 0) return new Map();
+
+  const params = [];
+  const selects = [];
+  for (const spec of missingSpecs) {
+    if (spec.tableName === 'estados_pedido') continue;
+    params.push(spec.code);
+    const paramIndex = params.length;
+    selects.push(`
+      SELECT
+        '${spec.key}'::text AS catalog_key,
+        catalog_row.${spec.idColumn}::int AS id,
+        catalog_row.codigo::text AS code,
+        NULL::text AS descripcion
+      FROM (
+        SELECT ${spec.idColumn}, codigo
+        FROM public.${spec.tableName}
+        WHERE UPPER(TRIM(codigo)) = $${paramIndex}
+          AND COALESCE(estado, true) = true
+        LIMIT 1
+      ) catalog_row
+    `);
+  }
+
+  const needsEstadoPedido = missingSpecs.some((spec) => spec.tableName === 'estados_pedido');
+  if (needsEstadoPedido) {
+    selects.push(`
+      SELECT
+        'idEstadoPedido'::text AS catalog_key,
+        estado_row.id_estado_pedido::int AS id,
+        NULL::text AS code,
+        estado_row.descripcion::text AS descripcion
+      FROM (
+        SELECT id_estado_pedido, descripcion
+        FROM public.estados_pedido
+        ORDER BY id_estado_pedido
+      ) estado_row
+    `);
+  }
+
+  if (selects.length === 0) return new Map();
+  const result = await client.query(
+    `
+      ${selects.join('\nUNION ALL\n')}
+      ORDER BY catalog_key, id
+    `,
+    params
+  );
+
+  const fetched = new Map();
+  const specsByKey = new Map(missingSpecs.map((spec) => [spec.key, spec]));
+  for (const row of result.rows) {
+    const key = String(row.catalog_key || '').trim();
+    if (!key || fetched.has(key) || key === 'idEstadoPedido') continue;
+    const spec = specsByKey.get(key);
+    const id = parseOptionalPositiveInt(row.id);
+    if (!spec || !id) continue;
+    fetched.set(key, {
+      id,
+      codigo: String(row.code || spec.code).trim().toUpperCase()
+    });
+  }
+
+  if (needsEstadoPedido) {
+    const estadoPedidoAliases = ESTADO_PEDIDO_CODES.EN_COCINA || new Set();
+    const estadoPedidoRow = result.rows.find((row) =>
+      String(row.catalog_key || '').trim() === 'idEstadoPedido'
+      && estadoPedidoAliases.has(normalizeTextKey(row.descripcion))
+    );
+    const idEstadoPedido = parseOptionalPositiveInt(estadoPedidoRow?.id);
+    if (idEstadoPedido) fetched.set('idEstadoPedido', idEstadoPedido);
+  }
+
+  return fetched;
+};
+
+const resolvePedidoPendienteStaticCatalogs = async ({ client, canal, modalidad, motivoPagoPendiente, includeDelivery }) => {
+  const specs = buildPedidoPendienteStaticCatalogSpecs({ canal, modalidad, motivoPagoPendiente, includeDelivery });
+  const now = Date.now();
+  const resolved = {
+    canalCatalog: null,
+    modalidadCatalog: null,
+    estadoPagoCatalog: null,
+    motivoPagoCatalog: null,
+    deliveryEstadoCatalog: null,
+    idEstadoPedido: null
+  };
+  const missingSpecs = [];
+
+  for (const spec of specs) {
+    const cached = readPedidoPendienteStaticCatalogCache(spec, now);
+    if (cached) {
+      resolved[spec.key] = cached;
+      continue;
+    }
+    missingSpecs.push(spec);
+  }
+
+  const fetched = await fetchPedidoPendienteStaticCatalogSpecs(client, missingSpecs);
+  for (const spec of missingSpecs) {
+    const value = fetched.get(spec.key) || null;
+    if (!value) continue;
+    resolved[spec.key] = clonePedidoPendienteStaticCatalogValue(value);
+    writePedidoPendienteStaticCatalogCache(spec, value, now);
+  }
+
+  return resolved;
+};
 
 const normalizePedidoText = (value, maxLength = 200) => {
   if (value === undefined || value === null) return null;
@@ -3117,22 +3324,26 @@ const buildPedidoPendientePayload = async ({ client, body, userId, sucursalScope
   }
 
   const staticCatalogsStart = perf?.now?.() || 0;
-  let canalCatalog = null;
-  let modalidadCatalog = null;
-  let estadoPagoCatalog = null;
-  let motivoPagoCatalog = null;
-  let deliveryEstadoCatalog = null;
+  let staticCatalogs = null;
   try {
-    [canalCatalog, modalidadCatalog, estadoPagoCatalog, motivoPagoCatalog, deliveryEstadoCatalog] = await Promise.all([
-      resolvePedidoPendienteStaticCatalogCode({ client, tableName: 'cat_pedidos_canales', idColumn: 'id_canal_pedido', code: canal }),
-      resolvePedidoPendienteStaticCatalogCode({ client, tableName: 'cat_pedidos_modalidades_entrega', idColumn: 'id_modalidad_entrega', code: modalidad }),
-      resolvePedidoPendienteStaticCatalogCode({ client, tableName: 'cat_pedidos_estados_pago', idColumn: 'id_estado_pago_pedido', code: PEDIDO_PENDIENTE_ESTADO_PAGO }),
-      resolvePedidoPendienteStaticCatalogCode({ client, tableName: 'cat_pedidos_motivos_pago_pendiente', idColumn: 'id_motivo_pago_pendiente', code: motivoPagoPendiente }),
-      modalidad === 'DELIVERY' ? resolvePedidoPendienteStaticCatalogCode({ client, tableName: 'cat_delivery_estados', idColumn: 'id_estado_delivery', code: PEDIDO_PENDIENTE_ESTADO_DELIVERY }) : Promise.resolve(null)
-    ]);
+    staticCatalogs = await resolvePedidoPendienteStaticCatalogs({
+      client,
+      canal,
+      modalidad,
+      motivoPagoPendiente,
+      includeDelivery: modalidad === 'DELIVERY'
+    });
   } finally {
     perf?.add?.('pedido_pendiente_static_catalogs_ms', staticCatalogsStart);
   }
+  const {
+    canalCatalog,
+    modalidadCatalog,
+    estadoPagoCatalog,
+    motivoPagoCatalog,
+    deliveryEstadoCatalog,
+    idEstadoPedido
+  } = staticCatalogs || {};
   if (!canalCatalog || !modalidadCatalog || !estadoPagoCatalog || !motivoPagoCatalog || (modalidad === 'DELIVERY' && !deliveryEstadoCatalog)) {
     return { ok: false, status: 409, body: { error: true, message: 'No se encontraron catalogos requeridos para crear el pedido pendiente.' } };
   }
@@ -3223,13 +3434,6 @@ const buildPedidoPendientePayload = async ({ client, body, userId, sucursalScope
   const subtotal = roundMoney(finalizedLines.reduce((sum, line) => sum + line.total_linea, 0));
   const isv = 0;
   const total = roundMoney(subtotal + costoEnvio);
-  const estadoPedidoStart = perf?.now?.() || 0;
-  let idEstadoPedido = null;
-  try {
-    idEstadoPedido = await resolvePedidoPendienteEstadoPedidoIdByCode(client, 'EN_COCINA');
-  } finally {
-    perf?.add?.('pedido_pendiente_static_catalogs_ms', estadoPedidoStart);
-  }
   if (!idEstadoPedido) return { ok: false, status: 409, body: { error: true, message: 'No existe el estado EN_COCINA en estados_pedido.' } };
 
   const sessionActiva = await resolveCajaSession({ client, idSucursal, idUsuario: userId, idSesionCaja: idSesionCajaRequested, isSuperAdmin });
@@ -6046,48 +6250,67 @@ async function listarPedidosPendientesPago(req, res) {
 router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), async (req, res) => {
   const ventasPerf = createVentasPerfTracker();
   const pedidoPendienteRouteStart = ventasPerf.now();
+  const pedidoPendienteRoute = 'POST /ventas/pedidos-pendientes';
+  const pedidoPendienteRpcEnabled = isPedidoPendienteRpcV1Enabled();
+  let pedidoPendientePersistenceMode = 'not_reached';
+  let pedidoPendienteRpcSkipReason = null;
   let pedidoPendienteTotalRouteMeasured = false;
   const addPedidoPendienteTotalRoute = () => {
     if (pedidoPendienteTotalRouteMeasured) return;
     ventasPerf.add('pedido_pendiente_total_route_ms', pedidoPendienteRouteStart);
     pedidoPendienteTotalRouteMeasured = true;
   };
-  logVentasPerfRoute('POST /ventas/pedidos-pendientes', {
+  logVentasPerfRoute(pedidoPendienteRoute, {
     items_count: Array.isArray(req.body?.items) ? req.body.items.length : 0,
     id_sucursal: parseOptionalPositiveInt(req.body?.id_sucursal) || null
   });
   const ventasPerfContext = {
+    route: pedidoPendienteRoute,
     operation: 'pedido_pendiente',
     id_usuario: null,
     id_sucursal: parseOptionalPositiveInt(req.body?.id_sucursal) || null,
     id_caja: null,
     id_sesion_caja: parseOptionalPositiveInt(req.body?.id_sesion_caja) || null,
-    items_count: Array.isArray(req.body?.items) ? req.body.items.length : 0
+    items_count: Array.isArray(req.body?.items) ? req.body.items.length : 0,
+    rpc_enabled: pedidoPendienteRpcEnabled,
+    cuenta_dividida: hasCuentaDivididaPayload(req.body)
   };
-  const discountIntent = hasDiscountIntentInPayload(req.body);
-  const canApplyDiscount = await requestHasAnyPermission(req, [VENTAS_DESCUENTO_APLICAR_PERMISSION]);
-  if (discountIntent && !canApplyDiscount) {
-    addPedidoPendienteTotalRoute();
-    ventasPerf.log({
+  const buildPedidoPendientePerfLogContext = (extra = {}) => {
+    const context = {
       ...ventasPerfContext,
-      status: 403,
-      error_code: 'VENTAS_DESCUENTO_NO_AUTORIZADO'
-    });
-    return res.status(403).json({
-      error: true,
-      code: 'VENTAS_DESCUENTO_NO_AUTORIZADO',
-      message: 'No tienes permiso para aplicar descuentos en ventas.'
-    });
-  }
-
-  const client = await pool.connect();
+      persistence_mode: pedidoPendientePersistenceMode,
+      rpc_skip_reason: pedidoPendienteRpcSkipReason
+    };
+    if (!context.rpc_skip_reason) delete context.rpc_skip_reason;
+    return {
+      ...context,
+      ...extra
+    };
+  };
   const idempotencyKey = getIdempotencyKey(req);
   const idempotencyRequestHash = idempotencyKey
     ? buildIdempotencyRequestHash(req.body)
     : null;
   let idempotencyReservation = null;
+  let client = null;
 
   try {
+    const discountIntent = hasDiscountIntentInPayload(req.body);
+    const canApplyDiscount = await requestHasAnyPermission(req, [VENTAS_DESCUENTO_APLICAR_PERMISSION]);
+    if (discountIntent && !canApplyDiscount) {
+      addPedidoPendienteTotalRoute();
+      ventasPerf.log(buildPedidoPendientePerfLogContext({
+        status: 403,
+        error_code: 'VENTAS_DESCUENTO_NO_AUTORIZADO'
+      }));
+      return res.status(403).json({
+        error: true,
+        code: 'VENTAS_DESCUENTO_NO_AUTORIZADO',
+        message: 'No tienes permiso para aplicar descuentos en ventas.'
+      });
+    }
+
+    client = await pool.connect();
     await client.query('BEGIN');
 
     const contextoStart = ventasPerf.now();
@@ -6112,7 +6335,7 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
     if (idempotencyReservation.replay) {
       await client.query('ROLLBACK');
       addPedidoPendienteTotalRoute();
-      ventasPerf.log({ ...ventasPerfContext, status: idempotencyReservation.httpStatus || 200 });
+      ventasPerf.log(buildPedidoPendientePerfLogContext({ status: idempotencyReservation.httpStatus || 200 }));
       return res.status(idempotencyReservation.httpStatus || 200).json({
         ...(isPlainObject(idempotencyReservation.responseBody) ? idempotencyReservation.responseBody : {}),
         idempotent_replay: true
@@ -6121,11 +6344,10 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
     if (idempotencyReservation.conflict) {
       await client.query('ROLLBACK');
       addPedidoPendienteTotalRoute();
-      ventasPerf.log({
-        ...ventasPerfContext,
+      ventasPerf.log(buildPedidoPendientePerfLogContext({
         status: 409,
         error_code: idempotencyReservation.code
-      });
+      }));
       return res.status(409).json({
         error: true,
         code: idempotencyReservation.code,
@@ -6154,11 +6376,10 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
         errorCode: prepared.body?.code || null
       });
       addPedidoPendienteTotalRoute();
-      ventasPerf.log({
-        ...ventasPerfContext,
+      ventasPerf.log(buildPedidoPendientePerfLogContext({
         status: prepared.status,
         error_code: prepared.body?.code || null
-      });
+      }));
       return res.status(prepared.status).json(prepared.body);
     }
 
@@ -6176,14 +6397,16 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
       id_sesion_caja: parseOptionalPositiveInt(pedidoPendiente.id_sesion_caja),
       items_count: Array.isArray(pedidoPendiente.pedido_lines) ? pedidoPendiente.pedido_lines.length : 0
     });
+    ventasPerfContext.cuenta_dividida = Boolean(cuentaDivisionPlan);
 
     const shouldUsePedidoPendienteRpcV1 =
-      isPedidoPendienteRpcV1Enabled()
+      pedidoPendienteRpcEnabled
       && !cuentaDivisionPlan
       && Array.isArray(pedidoPendiente.pedido_lines)
       && pedidoPendiente.pedido_lines.length > 0;
 
     if (shouldUsePedidoPendienteRpcV1) {
+      pedidoPendientePersistenceMode = 'rpc_v1';
       const rpcResponseBody = await createPedidoPendienteWithRpcV1Transaction({
         client,
         pedidoPendiente,
@@ -6207,8 +6430,17 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
       });
       ventasPerf.add('pedido_pendiente_idempotency_success_ms', idempotencySuccessStart);
       addPedidoPendienteTotalRoute();
-      ventasPerf.log({ ...ventasPerfContext, status: 201, persistence_mode: 'rpc_v1' });
+      ventasPerf.log(buildPedidoPendientePerfLogContext({ status: 201 }));
       return res.status(201).json(rpcResponseBody);
+    }
+
+    pedidoPendientePersistenceMode = 'legacy';
+    if (cuentaDivisionPlan) {
+      pedidoPendienteRpcSkipReason = 'cuenta_dividida';
+    } else if (!pedidoPendienteRpcEnabled) {
+      pedidoPendienteRpcSkipReason = 'flag_disabled';
+    } else if (!Array.isArray(pedidoPendiente.pedido_lines) || pedidoPendiente.pedido_lines.length === 0) {
+      pedidoPendienteRpcSkipReason = 'no_lines';
     }
 
     const descuentosStart = ventasPerf.now();
@@ -6528,12 +6760,14 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
     });
     ventasPerf.add('pedido_pendiente_idempotency_success_ms', idempotencySuccessStart);
     addPedidoPendienteTotalRoute();
-    ventasPerf.log({ ...ventasPerfContext, status: 201, persistence_mode: 'legacy' });
+    ventasPerf.log(buildPedidoPendientePerfLogContext({ status: 201 }));
     return res.status(201).json(responseBody);
   } catch (err) {
-    await client.query('ROLLBACK').catch((rollbackErr) => {
-      console.error('Error al revertir creacion de pedido pendiente:', rollbackErr);
-    });
+    if (client) {
+      await client.query('ROLLBACK').catch((rollbackErr) => {
+        console.error('Error al revertir creacion de pedido pendiente:', rollbackErr);
+      });
+    }
     await saveVentasIdempotencyFailure({
       reservation: idempotencyReservation,
       httpStatus: Number.isInteger(err?.httpStatus) ? err.httpStatus : 500,
@@ -6542,11 +6776,10 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
       console.error('No se pudo marcar fallo idempotente de pedido pendiente:', idempotencyErr);
     });
     addPedidoPendienteTotalRoute();
-    ventasPerf.log({
-      ...ventasPerfContext,
+    ventasPerf.log(buildPedidoPendientePerfLogContext({
       status: Number.isInteger(err?.httpStatus) ? err.httpStatus : 500,
       error_code: err?.code || null
-    });
+    }));
     console.error('Error al crear pedido pendiente:', err);
     if (Number.isInteger(err?.httpStatus) && err.httpStatus >= 400 && err.httpStatus < 500) {
       return res.status(err.httpStatus).json({
@@ -6558,12 +6791,11 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
     return sendVentasInternalError(res, 'No se pudo crear el pedido pendiente.');
   } finally {
     addPedidoPendienteTotalRoute();
-    ventasPerf.logIfMissing({
-      ...ventasPerfContext,
+    ventasPerf.logIfMissing(buildPedidoPendientePerfLogContext({
       status: res.statusCode || null,
       completion: 'finally'
-    });
-    client.release();
+    }));
+    if (client) client.release();
   }
 });
 router.post('/ventas/pedidos/:id/registrar-pago', checkPermission(['VENTAS_CREAR']), async (req, res) => {
