@@ -89,6 +89,8 @@ export const VENTAS_PERF_STAGE_NAMES = [
   'pedido_pendiente_idempotency_ms',
   'pedido_pendiente_build_ms',
   'pedido_pendiente_static_catalogs_ms',
+  'pedido_pendiente_allowed_extras_schema_ms',
+  'pedido_pendiente_allowed_extras_query_ms',
   'pedido_pendiente_hydrate_lines_ms',
   'pedido_pendiente_cuenta_dividida_plan_ms',
   'pedido_pendiente_contexto_ms',
