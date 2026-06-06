@@ -18,15 +18,27 @@ import {
 } from '../utils/uploads.js';
 
 const router = express.Router();
-const ARCHIVOS_VIEW_PERMISSIONS = ['INVENTARIO_ARCHIVOS_VER', 'INVENTARIO_VER'];
+const ARCHIVOS_VIEW_PERMISSIONS = [
+  'INVENTARIO_ARCHIVOS_VER',
+  'INVENTARIO_VER',
+  'SUCURSALES_FACTURACION_VER',
+  'SUCURSALES_FACTURACION_EDITAR',
+  'SUCURSALES_FACTURACION_PREVIEW_VER'
+];
 const ARCHIVOS_UPLOAD_PERMISSIONS = [
   'INVENTARIO_ARCHIVOS_SUBIR',
   'INVENTARIO_PRODUCTOS_IMAGEN_SUBIR',
   'INVENTARIO_OC_RECEPCIONAR',
   'INVENTARIO_OC_SUBIR_FACTURA',
-  'INVENTARIO_VER'
+  'INVENTARIO_VER',
+  'SUCURSALES_FACTURACION_EDITAR'
 ];
-const ARCHIVOS_DELETE_PERMISSIONS = ['INVENTARIO_ARCHIVOS_ELIMINAR', 'INVENTARIO_PRODUCTOS_IMAGEN_ELIMINAR', 'INVENTARIO_VER'];
+const ARCHIVOS_DELETE_PERMISSIONS = [
+  'INVENTARIO_ARCHIVOS_ELIMINAR',
+  'INVENTARIO_PRODUCTOS_IMAGEN_ELIMINAR',
+  'INVENTARIO_VER',
+  'SUCURSALES_FACTURACION_EDITAR'
+];
 
 const BASE64_BODY_REGEX = /^[A-Za-z0-9+/]+={0,2}$/;
 const SQLSTATE_UNDEFINED_TABLE = '42P01';
@@ -213,6 +225,14 @@ const getArchivoReferenceSummary = async (idArchivo, db = pool) => {
         query: 'SELECT COUNT(*)::int AS total FROM public.compras WHERE id_archivo_transferencia = $1'
       },
       db
+    ),
+    safeReferenceCount(
+      {
+        label: 'facturacion_config_sucursal',
+        params: [idArchivo],
+        query: 'SELECT COUNT(*)::int AS total FROM public.facturacion_config_sucursal WHERE id_archivo_logo = $1'
+      },
+      db
     )
   ]);
 
@@ -300,6 +320,20 @@ router.post('/archivos', checkPermission(ARCHIVOS_UPLOAD_PERMISSIONS), async (re
     }
 
     const contextoRaw = String(payload?.contexto || payload?.modulo || '').trim().toLowerCase();
+    if (contextoRaw === 'facturacion-logo') {
+      if (targetBucket !== SUPABASE_ADMIN_BUCKET) {
+        return res.status(400).json({
+          ok: false,
+          message: `Los logos de facturacion deben subirse al bucket '${SUPABASE_ADMIN_BUCKET}'.`
+        });
+      }
+      if (!['image/jpeg', 'image/png', 'image/webp'].includes(effectiveMimeType)) {
+        return res.status(400).json({
+          ok: false,
+          message: 'Solo se permiten imagenes JPG, PNG o WEBP para logos de facturacion.'
+        });
+      }
+    }
     if (contextoRaw === 'sucursales' && !['image/jpeg', 'image/png'].includes(effectiveMimeType)) {
       return res.status(400).json({
         ok: false,
@@ -314,7 +348,7 @@ router.post('/archivos', checkPermission(ARCHIVOS_UPLOAD_PERMISSIONS), async (re
     const uniqueFileName = `${safeOriginalName}-${Date.now()}-${crypto.randomUUID().slice(0, 8)}.${extension}`;
 
     const subDir = targetBucket === SUPABASE_ADMIN_BUCKET
-      ? ADMIN_UPLOADS_SUBDIR
+      ? (contextoRaw === 'facturacion-logo' ? 'facturacion' : ADMIN_UPLOADS_SUBDIR)
       : contextoRaw === 'sucursales'
         ? SUCURSALES_UPLOADS_SUBDIR
         : contextoRaw === 'carrusel'

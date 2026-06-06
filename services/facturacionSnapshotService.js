@@ -1,8 +1,19 @@
 import pool from '../config/db-connection.js';
+import { supabase } from './supabaseClient.js';
+import { SUPABASE_ADMIN_BUCKET } from '../utils/uploads.js';
 
 const TEGUCIGALPA_TZ = 'America/Tegucigalpa';
 const DEFAULT_BUSINESS_NAME = "JONNY'S";
 const DEFAULT_FOOTER = 'Gracias por su compra';
+const MAX_LOGO_DATA_URL_BYTES = 1024 * 1024;
+const LOGO_ASSET_CACHE_TTL_MS = 5 * 60 * 1000;
+const LOGO_MIME_BY_EXTENSION = Object.freeze({
+  jpg: 'image/jpeg',
+  jpeg: 'image/jpeg',
+  png: 'image/png',
+  webp: 'image/webp'
+});
+const logoAssetCache = new Map();
 const TICKET_FLAG_DEFAULTS = Object.freeze({
   mostrar_datos_fiscales: true,
   mostrar_cai_ticket: true,
@@ -45,6 +56,69 @@ const toBoolean = (value, fallback = false) => {
 const toNullableText = (value) => {
   const normalized = String(value ?? '').trim();
   return normalized ? normalized : null;
+};
+
+const parseStoredStoragePath = (rawValue) => {
+  const input = String(rawValue || '').trim();
+  if (!input || /^https?:\/\//i.test(input)) return null;
+  const [bucket, ...pathParts] = input.split('/').filter(Boolean);
+  if (!bucket || pathParts.length === 0) return null;
+  return { bucket, filePath: pathParts.join('/') };
+};
+
+const getLogoMimeType = (filePath, fallback = 'image/png') => {
+  const extension = String(filePath || '').split('.').pop()?.toLowerCase();
+  return LOGO_MIME_BY_EXTENSION[extension] || fallback;
+};
+
+const resolveLogoDisplayAsset = async (rawValue) => {
+  const normalized = toNullableText(rawValue);
+  if (!normalized) return { url: null, dataUrl: null };
+  const storagePath = parseStoredStoragePath(normalized);
+  if (!storagePath || storagePath.bucket !== SUPABASE_ADMIN_BUCKET) {
+    return { url: normalized, dataUrl: null };
+  }
+
+  const cacheKey = `${storagePath.bucket}/${storagePath.filePath}`;
+  const cached = logoAssetCache.get(cacheKey);
+  if (cached && cached.expiresAt > Date.now()) {
+    return cached.asset;
+  }
+
+  const { data: signedData, error: signedError } = await supabase.storage
+    .from(SUPABASE_ADMIN_BUCKET)
+    .createSignedUrl(storagePath.filePath, 900);
+
+  const signedUrl = signedError || !signedData?.signedUrl ? null : signedData.signedUrl;
+  if (signedError || !signedUrl) {
+    console.warn('[facturacion-snapshot] logo signed url warning:', signedError?.message || 'missing signed url');
+  }
+
+  const { data: logoFile, error: downloadError } = await supabase.storage
+    .from(SUPABASE_ADMIN_BUCKET)
+    .download(storagePath.filePath);
+
+  if (downloadError || !logoFile || typeof logoFile.arrayBuffer !== 'function') {
+    console.warn('[facturacion-snapshot] logo download warning:', downloadError?.message || 'missing logo file');
+    const asset = { url: signedUrl, dataUrl: null };
+    logoAssetCache.set(cacheKey, { asset, expiresAt: Date.now() + LOGO_ASSET_CACHE_TTL_MS });
+    return asset;
+  }
+
+  const buffer = Buffer.from(await logoFile.arrayBuffer());
+  if (!buffer.length || buffer.length > MAX_LOGO_DATA_URL_BYTES) {
+    const asset = { url: signedUrl, dataUrl: null };
+    logoAssetCache.set(cacheKey, { asset, expiresAt: Date.now() + LOGO_ASSET_CACHE_TTL_MS });
+    return asset;
+  }
+
+  const mimeType = logoFile.type || getLogoMimeType(storagePath.filePath);
+  const asset = {
+    url: signedUrl,
+    dataUrl: `data:${mimeType};base64,${buffer.toString('base64')}`
+  };
+  logoAssetCache.set(cacheKey, { asset, expiresAt: Date.now() + LOGO_ASSET_CACHE_TTL_MS });
+  return asset;
 };
 
 const toTicketWidth = (value) => {
@@ -596,7 +670,8 @@ const normalizeSnapshotShape = (snapshot) => {
       direccion_emisor: toNullableText(emisor.direccion_emisor),
       telefono_emisor: toNullableText(emisor.telefono_emisor),
       correo_emisor: toNullableText(emisor.correo_emisor),
-      logo_url: toNullableText(emisor.logo_url)
+      logo_url: toNullableText(emisor.logo_url),
+      logo_data_url: toNullableText(emisor.logo_data_url)
     },
     ticket: {
       ancho_ticket_mm: toTicketWidth(ticket.ancho_ticket_mm),
@@ -646,18 +721,28 @@ export const normalizarDatosTicketDesdeSnapshot = async ({ client, factura }) =>
 
   const normalized = normalizeSnapshotShape(snapshot);
   const idSucursal = toPositiveInt(source.id_sucursal || normalized.id_sucursal);
+  let currentConfigSnapshot = null;
 
   if (idSucursal) {
     try {
       const currentConfig = await obtenerConfigFacturacionParaVenta(db, idSucursal);
+      currentConfigSnapshot = currentConfig?.snapshot || null;
       normalized.ticket = {
         ...normalized.ticket,
-        ...pickVisualTicketFlags(currentConfig?.snapshot?.ticket)
+        ...pickVisualTicketFlags(currentConfigSnapshot?.ticket)
       };
     } catch {
       // Si la configuracion vigente no esta disponible, se conserva el snapshot historico.
     }
   }
+
+  if (currentConfigSnapshot?.emisor) {
+    normalized.emisor.logo_url = toNullableText(currentConfigSnapshot.emisor.logo_url);
+  }
+
+  const logoAsset = await resolveLogoDisplayAsset(normalized.emisor.logo_url);
+  normalized.emisor.logo_url = logoAsset.url;
+  normalized.emisor.logo_data_url = logoAsset.dataUrl;
 
   return normalized;
 };

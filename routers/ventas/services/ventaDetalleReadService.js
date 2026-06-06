@@ -66,7 +66,8 @@ export const mergeVentaWithFacturacion = (venta = {}, facturacion = {}) => {
         direccion_emisor: emisor?.direccion_emisor || null,
         telefono_emisor: emisor?.telefono_emisor || null,
         correo_emisor: emisor?.correo_emisor || null,
-        logo_url: emisor?.logo_url || null
+        logo_url: emisor?.logo_url || null,
+        logo_data_url: emisor?.logo_data_url || null
       },
       ticket: {
         ancho_ticket_mm: Number(ticket?.ancho_ticket_mm) === 58 ? 58 : 80,
@@ -91,6 +92,7 @@ export const mergeVentaWithFacturacion = (venta = {}, facturacion = {}) => {
     sucursal_telefono: emisor?.telefono_emisor || null,
     sucursal_correo: emisor?.correo_emisor || null,
     logo_url: emisor?.logo_url || null,
+    logo_data_url: emisor?.logo_data_url || null,
     ancho_ticket_mm: Number(ticket?.ancho_ticket_mm) === 58 ? 58 : 80,
     mostrar_logo_ticket: Boolean(ticket?.mostrar_logo_ticket),
     mostrar_rtn: Boolean(ticket?.mostrar_rtn),
