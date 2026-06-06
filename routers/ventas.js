@@ -2026,10 +2026,11 @@ const buildAllowedExtrasMap = async (client, { normalizedItems = [], idSucursal 
         mer.id_receta AS id_item,
         mer.id_extra,
         COALESCE(mer.orden, 0) AS orden
-      FROM public.menu_extra_receta mer
-      WHERE mer.id_receta = ANY($1::int[])
-        AND mer.id_extra = ANY($4::int[])
-        AND COALESCE(mer.estado, true) = true
+      FROM typed_params p
+      INNER JOIN public.menu_extra_receta mer
+        ON mer.id_receta = ANY(p.receta_ids)
+       AND mer.id_extra = ANY(p.extra_ids)
+      WHERE COALESCE(mer.estado, true) = true
     `);
   }
   if (hasMenuExtraCombo && comboIds.length > 0) {
@@ -2039,10 +2040,11 @@ const buildAllowedExtrasMap = async (client, { normalizedItems = [], idSucursal 
         mec.id_combo AS id_item,
         mec.id_extra,
         0 AS orden
-      FROM public.menu_extra_combo mec
-      WHERE mec.id_combo = ANY($2::int[])
-        AND mec.id_extra = ANY($4::int[])
-        AND COALESCE(mec.estado, true) = true
+      FROM typed_params p
+      INNER JOIN public.menu_extra_combo mec
+        ON mec.id_combo = ANY(p.combo_ids)
+       AND mec.id_extra = ANY(p.extra_ids)
+      WHERE COALESCE(mec.estado, true) = true
     `);
   }
   if (allowedItemSqlParts.length === 0) return new Map();
@@ -2053,7 +2055,14 @@ const buildAllowedExtrasMap = async (client, { normalizedItems = [], idSucursal 
   try {
     const result = await client.query(
       `
-        WITH allowed_items AS (
+        WITH typed_params AS (
+          SELECT
+            $1::int[] AS receta_ids,
+            $2::int[] AS combo_ids,
+            $3::int AS id_sucursal,
+            $4::int[] AS extra_ids
+        ),
+        allowed_items AS (
           ${allowedItemsSql}
         )
         SELECT
@@ -2069,7 +2078,9 @@ const buildAllowedExtrasMap = async (client, { normalizedItems = [], idSucursal 
           me.id_unidad_medida,
           i.cantidad AS stock_disponible,
           i.id_almacen
-        FROM allowed_items ai
+        FROM typed_params p
+        INNER JOIN allowed_items ai
+          ON true
         INNER JOIN public.menu_extras me
           ON me.id_extra = ai.id_extra
          AND COALESCE(me.estado, true) = true
@@ -2078,7 +2089,7 @@ const buildAllowedExtrasMap = async (client, { normalizedItems = [], idSucursal 
          AND COALESCE(i.estado, true) = true
         LEFT JOIN public.almacenes a
           ON a.id_almacen = i.id_almacen
-         AND ($3::int IS NULL OR a.id_sucursal = $3::int)
+         AND (p.id_sucursal IS NULL OR a.id_sucursal = p.id_sucursal)
         WHERE me.id_insumo IS NULL OR a.id_almacen IS NOT NULL
         ORDER BY ai.tipo, ai.id_item, ai.orden, me.nombre
       `,
