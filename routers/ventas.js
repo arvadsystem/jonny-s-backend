@@ -57,7 +57,8 @@ import {
 } from './ventas/handlers/catalogosHandlers.js';
 import {
   buscarVentaHandler,
-  getVentaByIdHandler
+  getVentaByIdHandler,
+  getVentaTicketByIdHandler
 } from './ventas/handlers/ventasReadHandlers.js';
 import {
   buildComplementLineConfig,
@@ -5945,6 +5946,7 @@ router.get('/ventas/pedidos/:id/inventario-alertas', checkPermission(['VENTAS_VE
   }
 });
 
+router.get('/ventas/:id/ticket', checkPermission(['VENTAS_VER']), getVentaTicketByIdHandler);
 router.get('/ventas/:id', checkPermission(['VENTAS_VER']), getVentaByIdHandler);
 
 async function listarPedidosPendientesPago(req, res) {

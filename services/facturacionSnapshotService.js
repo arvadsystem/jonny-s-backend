@@ -693,7 +693,11 @@ const normalizeSnapshotShape = (snapshot) => {
   };
 };
 
-export const normalizarDatosTicketDesdeSnapshot = async ({ client, factura }) => {
+export const normalizarDatosTicketDesdeSnapshot = async ({
+  client,
+  factura,
+  includePrintAssets = false
+}) => {
   const db = client && typeof client.query === 'function' ? client : pool;
   const source = factura && typeof factura === 'object' ? factura : {};
 
@@ -740,9 +744,14 @@ export const normalizarDatosTicketDesdeSnapshot = async ({ client, factura }) =>
     normalized.emisor.logo_url = toNullableText(currentConfigSnapshot.emisor.logo_url);
   }
 
-  const logoAsset = await resolveLogoDisplayAsset(normalized.emisor.logo_url);
-  normalized.emisor.logo_url = logoAsset.url;
-  normalized.emisor.logo_data_url = logoAsset.dataUrl;
+  if (includePrintAssets) {
+    const logoAsset = await resolveLogoDisplayAsset(normalized.emisor.logo_url);
+    normalized.emisor.logo_url = logoAsset.url;
+    normalized.emisor.logo_data_url = logoAsset.dataUrl;
+  } else {
+    normalized.emisor.logo_url = toNullableText(normalized.emisor.logo_url);
+    normalized.emisor.logo_data_url = toNullableText(normalized.emisor.logo_data_url);
+  }
 
   return normalized;
 };
