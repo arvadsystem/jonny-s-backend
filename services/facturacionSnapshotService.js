@@ -744,13 +744,13 @@ export const normalizarDatosTicketDesdeSnapshot = async ({
     normalized.emisor.logo_url = toNullableText(currentConfigSnapshot.emisor.logo_url);
   }
 
-  if (includePrintAssets) {
+  if (includePrintAssets && normalized.ticket.mostrar_logo_ticket) {
     const logoAsset = await resolveLogoDisplayAsset(normalized.emisor.logo_url);
     normalized.emisor.logo_url = logoAsset.url;
     normalized.emisor.logo_data_url = logoAsset.dataUrl;
   } else {
     normalized.emisor.logo_url = toNullableText(normalized.emisor.logo_url);
-    normalized.emisor.logo_data_url = toNullableText(normalized.emisor.logo_data_url);
+    normalized.emisor.logo_data_url = null;
   }
 
   return normalized;

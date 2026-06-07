@@ -638,10 +638,8 @@ export const actualizarConfiguracionSucursal = async (idSucursal, payload = {}) 
   const validated = validateMergedConfig(merged);
   const logoArchivo = await ensureValidLogoArchivo(validated.id_archivo_logo);
   const nextLogoUrl = logoArchivo?.url_publica || null;
-  const oldArchivoId = asPositiveInt(currentConfig?.id_archivo_logo);
   const client = await pool.connect();
   let txOpen = false;
-  let oldLogoPathToRemove = null;
 
   try {
     await client.query('BEGIN');
@@ -776,17 +774,8 @@ export const actualizarConfiguracionSucursal = async (idSucursal, payload = {}) 
       throw new ServiceError('La sucursal indicada no existe.', 404);
     }
 
-    oldLogoPathToRemove = await disableLogoArchivoIfUnused({
-      oldArchivoId,
-      newArchivoId: validated.id_archivo_logo
-    }, client);
-
     await client.query('COMMIT');
     txOpen = false;
-
-    if (oldLogoPathToRemove) {
-      await tryRemoveStorageObject(oldLogoPathToRemove);
-    }
 
     return sanitizeOutboundConfig(updateResult.rows[0]);
   } catch (error) {

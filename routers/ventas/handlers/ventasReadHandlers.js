@@ -24,10 +24,15 @@ import {
   fetchDetalleFacturaExtras,
   fetchDirectSaleDetailRows,
   fetchKitchenSaleDetailRows,
+  fetchPedidoDeliveryDetail,
   fetchVentaDetailHeader,
   mergeVentaWithFacturacion,
   resolveVentaNumero
 } from '../services/ventaDetalleReadService.js';
+import {
+  buildVentaTicketPdfBuffer,
+  buildVentaTicketPdfFilename
+} from '../services/ventaTicketPdfService.js';
 
 const sendVentasInternalError = (
   res,
@@ -183,7 +188,7 @@ export const buscarVentaHandler = async (req, res) => {
   }
 };
 
-const buildVentaDetailPayload = async (req, {
+export const buildVentaDetailPayload = async (req, {
   idFactura,
   includePrintAssets = false
 }) => {
@@ -237,6 +242,7 @@ const buildVentaDetailPayload = async (req, {
       idFactura: venta.id_factura,
       idPedido: venta.id_pedido
     });
+    const pedidoDeliveryDetail = await fetchPedidoDeliveryDetail(pool, venta.id_pedido);
 
     return {
       status: 200,
@@ -246,6 +252,9 @@ const buildVentaDetailPayload = async (req, {
         metodo_pago: venta.metodo_pago || null,
         items: pedidoItems,
         cuenta_dividida: cuentaDividida,
+        contacto: pedidoDeliveryDetail.contacto,
+        contexto: pedidoDeliveryDetail.contexto,
+        delivery: pedidoDeliveryDetail.delivery,
         reversiones
       }
     };
@@ -311,5 +320,32 @@ export const getVentaTicketByIdHandler = async (req, res) => {
   } catch (err) {
     console.error('Error al obtener ticket de venta:', err);
     return sendVentasInternalError(res);
+  }
+};
+
+export const getVentaTicketPdfByIdHandler = async (req, res) => {
+  try {
+    const idFactura = parsePositiveInt(req.params.id);
+    if (!idFactura) {
+      return res.status(400).json({ error: true, message: 'ID de venta invalido.' });
+    }
+
+    const result = await buildVentaDetailPayload(req, {
+      idFactura,
+      includePrintAssets: true
+    });
+    if (result.status !== 200) {
+      return res.status(result.status).json(result.body);
+    }
+
+    const pdfBuffer = await buildVentaTicketPdfBuffer(result.body);
+    const filename = buildVentaTicketPdfFilename(result.body);
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `inline; filename="${filename}"`);
+    res.setHeader('Content-Length', pdfBuffer.length);
+    return res.status(200).send(pdfBuffer);
+  } catch (err) {
+    console.error('Error al generar PDF de ticket de venta:', err);
+    return sendVentasInternalError(res, 'No se pudo generar el PDF del ticket.');
   }
 };

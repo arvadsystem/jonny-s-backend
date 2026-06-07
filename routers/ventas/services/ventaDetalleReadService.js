@@ -498,6 +498,92 @@ export const fetchCuentaDividida = async (client, { idFactura = null, idPedido =
   };
 };
 
+export const fetchPedidoDeliveryDetail = async (client, idPedido) => {
+  const pedidoId = parseOptionalPositiveInt(idPedido);
+  if (!pedidoId) return { contacto: null, contexto: null, delivery: null };
+
+  const result = await client.query(
+    `
+      SELECT
+        pc.nombre_contacto,
+        pc.telefono_contacto,
+        pc.dni,
+        pc.rtn,
+        pc.correo,
+        COALESCE(cpc.codigo, p.canal) AS canal,
+        COALESCE(cme.codigo, p.tipo_entrega) AS modalidad,
+        px.observacion_contexto,
+        pd.id_pedido_delivery,
+        cde.codigo AS estado_delivery,
+        pd.costo_envio,
+        pd.nombre_receptor,
+        pd.telefono_receptor,
+        pd.direccion_entrega,
+        pd.referencia_entrega,
+        pd.observacion_delivery
+      FROM public.pedidos p
+      LEFT JOIN LATERAL (
+        SELECT pc_inner.*
+        FROM public.pedidos_contacto pc_inner
+        WHERE pc_inner.id_pedido = p.id_pedido
+        ORDER BY pc_inner.id_pedido_contacto DESC
+        LIMIT 1
+      ) pc ON true
+      LEFT JOIN LATERAL (
+        SELECT px_inner.*
+        FROM public.pedidos_contexto px_inner
+        WHERE px_inner.id_pedido = p.id_pedido
+        ORDER BY px_inner.id_pedido_contexto DESC
+        LIMIT 1
+      ) px ON true
+      LEFT JOIN public.cat_pedidos_canales cpc
+        ON cpc.id_canal_pedido = px.id_canal_pedido
+      LEFT JOIN public.cat_pedidos_modalidades_entrega cme
+        ON cme.id_modalidad_entrega = px.id_modalidad_entrega
+      LEFT JOIN LATERAL (
+        SELECT pd_inner.*
+        FROM public.pedidos_delivery pd_inner
+        WHERE pd_inner.id_pedido = p.id_pedido
+        ORDER BY pd_inner.id_pedido_delivery DESC
+        LIMIT 1
+      ) pd ON true
+      LEFT JOIN public.cat_delivery_estados cde
+        ON cde.id_estado_delivery = pd.id_estado_delivery
+      WHERE p.id_pedido = $1
+      LIMIT 1
+    `,
+    [pedidoId]
+  );
+  if (result.rowCount === 0) return { contacto: null, contexto: null, delivery: null };
+
+  const row = result.rows[0];
+  return {
+    contacto: {
+      telefono_contacto: row.telefono_contacto || null,
+      nombre_contacto: row.nombre_contacto || null,
+      dni: row.dni || null,
+      rtn: row.rtn || null,
+      correo: row.correo || null
+    },
+    contexto: {
+      canal: row.canal || null,
+      modalidad: row.modalidad || null,
+      observacion_contexto: row.observacion_contexto || null
+    },
+    delivery: row.id_pedido_delivery
+      ? {
+          estado_delivery: row.estado_delivery || null,
+          costo_envio: roundMoney(row.costo_envio),
+          nombre_receptor: row.nombre_receptor || null,
+          telefono_receptor: row.telefono_receptor || null,
+          direccion_entrega: row.direccion_entrega || null,
+          referencia_entrega: row.referencia_entrega || null,
+          observacion_delivery: row.observacion_delivery || null
+        }
+      : null
+  };
+};
+
 export const fetchKitchenSaleDetailRows = async (client, idFactura) =>
   client.query(
     `
