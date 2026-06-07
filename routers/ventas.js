@@ -57,7 +57,9 @@ import {
 } from './ventas/handlers/catalogosHandlers.js';
 import {
   buscarVentaHandler,
-  getVentaByIdHandler
+  getVentaByIdHandler,
+  getVentaTicketPdfByIdHandler,
+  getVentaTicketByIdHandler
 } from './ventas/handlers/ventasReadHandlers.js';
 import {
   buildComplementLineConfig,
@@ -2407,7 +2409,7 @@ const fetchDetallePedidoExtras = async (client, detallePedidoIds = []) => {
 
 const hasCuentaDivididaPayload = (body) => Array.isArray(body?.cuenta_dividida);
 
-const buildCuentaDivisionPlan = ({ cuentaDividida, lines, expectedTotal }) => {
+const buildCuentaDivisionPlan = ({ cuentaDividida, lines, expectedTotal, allowPartial = false }) => {
   if (!Array.isArray(cuentaDividida)) return null;
   if (!cuentaDividida.length) {
     throw {
@@ -2509,7 +2511,7 @@ const buildCuentaDivisionPlan = ({ cuentaDividida, lines, expectedTotal }) => {
     };
   });
 
-  if (assigned.size !== normalizedLines.length) {
+  if (!allowPartial && assigned.size !== normalizedLines.length) {
     throw {
       httpStatus: 400,
       code: 'CUENTA_DIVIDIDA_LINEAS_INCOMPLETAS',
@@ -2518,7 +2520,7 @@ const buildCuentaDivisionPlan = ({ cuentaDividida, lines, expectedTotal }) => {
   }
 
   const totalDivisiones = roundMoney(divisions.reduce((sum, division) => sum + Number(division.total || 0), 0));
-  if (Math.abs(totalDivisiones - roundMoney(expectedTotal)) > 0.05) {
+  if (!allowPartial && Math.abs(totalDivisiones - roundMoney(expectedTotal)) > 0.05) {
     throw {
       httpStatus: 409,
       code: 'CUENTA_DIVIDIDA_TOTAL_NO_CUADRA',
@@ -2606,9 +2608,36 @@ const persistCuentaDividida = async ({
     const persistedDivision = { ...division, id_cuenta_division: idCuentaDivision };
     persisted.push(persistedDivision);
 
+    const itemValues = [];
+    const itemParams = [];
     for (const item of division.items) {
       const refs = lineRefs[item.line_index] || {};
       const snapshot = buildCuentaDivisionItemSnapshot(item.line, refs);
+      const offset = itemParams.length;
+      itemParams.push(
+        idCuentaDivision,
+        snapshot.id_detalle_factura,
+        snapshot.id_detalle_pedido,
+        snapshot.tipo_item,
+        snapshot.id_producto,
+        snapshot.id_receta,
+        snapshot.id_combo,
+        snapshot.nombre_item_snapshot,
+        snapshot.cantidad,
+        snapshot.precio_unitario,
+        snapshot.subtotal_base,
+        snapshot.subtotal_extras,
+        snapshot.descuento_total,
+        snapshot.isv_total,
+        snapshot.total_linea,
+        JSON.stringify(snapshot.extras_snapshot),
+        JSON.stringify(snapshot.complementos_snapshot),
+        JSON.stringify(snapshot.origen_snapshot)
+      );
+      itemValues.push(`($${offset + 1}, $${offset + 2}, $${offset + 3}, $${offset + 4}, $${offset + 5}, $${offset + 6}, $${offset + 7}, $${offset + 8}, $${offset + 9}, $${offset + 10}, $${offset + 11}, $${offset + 12}, $${offset + 13}, $${offset + 14}, $${offset + 15}, $${offset + 16}::jsonb, $${offset + 17}::jsonb, $${offset + 18}::jsonb)`);
+    }
+
+    if (itemValues.length) {
       await client.query(
         `
           INSERT INTO public.ventas_cuenta_division_items (
@@ -2631,28 +2660,9 @@ const persistCuentaDividida = async ({
             complementos_snapshot,
             origen_snapshot
           )
-          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16::jsonb, $17::jsonb, $18::jsonb)
+          VALUES ${itemValues.join(', ')}
         `,
-        [
-          idCuentaDivision,
-          snapshot.id_detalle_factura,
-          snapshot.id_detalle_pedido,
-          snapshot.tipo_item,
-          snapshot.id_producto,
-          snapshot.id_receta,
-          snapshot.id_combo,
-          snapshot.nombre_item_snapshot,
-          snapshot.cantidad,
-          snapshot.precio_unitario,
-          snapshot.subtotal_base,
-          snapshot.subtotal_extras,
-          snapshot.descuento_total,
-          snapshot.isv_total,
-          snapshot.total_linea,
-          JSON.stringify(snapshot.extras_snapshot),
-          JSON.stringify(snapshot.complementos_snapshot),
-          JSON.stringify(snapshot.origen_snapshot)
-        ]
+        itemParams
       );
     }
   }
@@ -5059,6 +5069,7 @@ router.get('/ventas', checkPermission(['VENTAS_VER']), async (req, res) => {
           ELSE COALESCE(df_info.total_items, 0)
         END AS total_items,
         COALESCE(df_info.descuento_total, 0) AS descuento_total,
+        COALESCE(cuenta_info.divisiones_count, 0)::int AS cuenta_dividida_divisiones,
         COALESCE(rev_info.reversiones_count, 0) AS reversiones_count,
         COALESCE(rev_info.monto_reversado_total, 0) AS monto_reversado_total
       ${baseJoinClause}
@@ -5077,8 +5088,13 @@ router.get('/ventas', checkPermission(['VENTAS_VER']), async (req, res) => {
         FROM facturas_cobros fc
         INNER JOIN cat_metodos_pago cmp
           ON cmp.id_metodo_pago = fc.id_metodo_pago
-        WHERE fc.id_factura = f.id_factura
+          WHERE fc.id_factura = f.id_factura
       ) fc_info ON true
+      LEFT JOIN LATERAL (
+        SELECT COUNT(*)::int AS divisiones_count
+        FROM public.ventas_cuenta_divisiones vcd
+        WHERE vcd.id_pedido = f.id_pedido
+      ) cuenta_info ON true
       LEFT JOIN LATERAL (
         SELECT
           COUNT(*)::int AS reversiones_count,
@@ -5255,16 +5271,6 @@ router.get('/ventas/pedidos-menu', checkPermission(['VENTAS_VER']), async (req, 
       filters.push(`p.id_sucursal = ANY($${params.length}::int[])`);
     }
 
-    // AM: Filtro operativo diario para ocultar pedidos de dias anteriores sin alterar estados/historial.
-    const operationalDateExpr = `(NOW() AT TIME ZONE 'America/Tegucigalpa')::date`;
-    filters.push(`
-      COALESCE(
-        f.fecha_operacion::date,
-        p.visible_en_cocina_at::date,
-        p.fecha_hora_pedido::date
-      ) = ${operationalDateExpr}
-    `);
-
     const whereClause = `WHERE ${filters.join(' AND ')}`;
 
     const estadoPagoSelect = hasEstadoPago ? 'p.estado_pago' : `NULL::text AS estado_pago`;
@@ -5320,6 +5326,7 @@ router.get('/ventas/pedidos-menu', checkPermission(['VENTAS_VER']), async (req, 
           COALESCE(NULLIF(TRIM(f.codigo_venta), ''), NULL) AS codigo_venta,
           s.nombre_sucursal,
           fc_info.metodo_pago,
+          COALESCE(vcd_info.divisiones_count, 0)::int AS cuenta_dividida_divisiones,
           COALESCE(dp_info.items, '[]'::jsonb) AS items,
           u_pago.nombre_usuario AS usuario_pago_confirmado,
           per.nombre AS nombres_cliente,
@@ -5350,6 +5357,11 @@ router.get('/ventas/pedidos-menu', checkPermission(['VENTAS_VER']), async (req, 
             ON cmp.id_metodo_pago = fc.id_metodo_pago
           WHERE fc.id_factura = f.id_factura
         ) fc_info ON true
+        LEFT JOIN LATERAL (
+          SELECT COUNT(*)::int AS divisiones_count
+          FROM public.ventas_cuenta_divisiones vcd
+          WHERE vcd.id_pedido = p.id_pedido
+        ) vcd_info ON true
         LEFT JOIN LATERAL (
           SELECT
             jsonb_agg(
@@ -5945,6 +5957,8 @@ router.get('/ventas/pedidos/:id/inventario-alertas', checkPermission(['VENTAS_VE
   }
 });
 
+router.get('/ventas/:id/ticket.pdf', checkPermission(['VENTAS_VER']), getVentaTicketPdfByIdHandler);
+router.get('/ventas/:id/ticket', checkPermission(['VENTAS_VER']), getVentaTicketByIdHandler);
 router.get('/ventas/:id', checkPermission(['VENTAS_VER']), getVentaByIdHandler);
 
 async function listarPedidosPendientesPago(req, res) {
@@ -5984,7 +5998,7 @@ async function listarPedidosPendientesPago(req, res) {
     const filters = [
       'UPPER(TRIM(ppc.estado_pago_codigo)) = $1',
       'COALESCE(ppc.monto_pendiente, 0) > 0',
-      `(f.id_factura IS NULL OR EXISTS (
+      `(f.id_factura IS NULL OR COALESCE(ppc.monto_pendiente, 0) > 0 OR EXISTS (
         SELECT 1
         FROM public.ventas_cuenta_divisiones vcd_pending
         WHERE vcd_pending.id_pedido = p.id_pedido
@@ -6111,11 +6125,25 @@ async function listarPedidosPendientesPago(req, res) {
             'total', vcd.total,
             'monto_pagado', vcd.monto_pagado,
             'monto_pendiente', vcd.monto_pendiente,
-            'estado', UPPER(TRIM(vcd.estado))
+            'estado', UPPER(TRIM(vcd.estado)),
+            'items', COALESCE(vdi_info.items, '[]'::jsonb)
           )
           ORDER BY vcd.orden, vcd.id_cuenta_division
         ) AS divisiones
         FROM public.ventas_cuenta_divisiones vcd
+        LEFT JOIN LATERAL (
+          SELECT jsonb_agg(
+            jsonb_build_object(
+              'id_cuenta_division_item', vdi.id_cuenta_division_item,
+              'id_detalle_pedido', vdi.id_detalle_pedido,
+              'nombre_item', vdi.nombre_item_snapshot,
+              'total_linea', vdi.total_linea
+            )
+            ORDER BY vdi.id_cuenta_division_item
+          ) AS items
+          FROM public.ventas_cuenta_division_items vdi
+          WHERE vdi.id_cuenta_division = vcd.id_cuenta_division
+        ) vdi_info ON true
         WHERE vcd.id_pedido = p.id_pedido
       ) vcd_info ON true
     `;
@@ -6913,9 +6941,10 @@ router.post('/ventas/pedidos/:id/registrar-pago', checkPermission(['VENTAS_CREAR
         LEFT JOIN delivery_locked ON true
         LEFT JOIN estado_pagado ON true
       `,
-      [idPedido, PEDIDO_PAGADO_CONFIRMADO_ESTADO_PAGO, Boolean(idCuentaDivisionRequested)]
+      [idPedido, PEDIDO_PAGADO_CONFIRMADO_ESTADO_PAGO, Boolean(idCuentaDivisionRequested || cuentaDivididaSolicitada)]
     );
     const contextoBase = contextoBaseResult.rows?.[0] || {};
+    ventasPerf.add('registrar_pago_base_context_ms', contextoStart);
     const pedido = contextoBase.pedido || null;
     if (!pedido) {
       await client.query('ROLLBACK');
@@ -6928,6 +6957,7 @@ router.post('/ventas/pedidos/:id/registrar-pago', checkPermission(['VENTAS_CREAR
       return res.status(409).json({ error: true, code: 'PEDIDO_PAGO_CONTROL_NO_ENCONTRADO', message: 'El pedido no tiene control de pago pendiente.' });
     }
 
+    const cuentaDivididaStart = ventasPerf.now();
     let cuentaDivisionPago = null;
     if (idCuentaDivisionRequested) {
       const cuentaDivisionResult = await client.query(
@@ -6998,6 +7028,7 @@ router.post('/ventas/pedidos/:id/registrar-pago', checkPermission(['VENTAS_CREAR
       return res.status(409).json({ error: true, code: 'PEDIDO_FACTURA_EXISTENTE', message: 'El pedido ya tiene una factura asociada.' });
     }
 
+    const detallePedidoStart = ventasPerf.now();
     const detallePedidoResult = cuentaDivisionPago
       ? await client.query(
         `
@@ -7063,6 +7094,7 @@ router.post('/ventas/pedidos/:id/registrar-pago', checkPermission(['VENTAS_CREAR
         `,
         [idPedido]
       );
+    ventasPerf.add('registrar_pago_detalle_pedido_ms', detallePedidoStart);
     if (detallePedidoResult.rowCount === 0) {
       await client.query('ROLLBACK');
       return cuentaDivisionPago
@@ -7094,25 +7126,56 @@ router.post('/ventas/pedidos/:id/registrar-pago', checkPermission(['VENTAS_CREAR
           message: 'Este pedido tiene cuenta dividida. Debes enviar id_cuenta_division para cobrar una subcuenta.'
         });
       }
-      if (divisionesExistentesResult.rowCount > 0 && cuentaDivididaSolicitada) {
-        await client.query('ROLLBACK');
-        return res.status(409).json({
-          error: true,
-          code: 'CUENTA_DIVIDIDA_YA_EXISTE',
-          message: 'Este pedido ya tiene cuenta dividida registrada.'
-        });
-      }
       if (cuentaDivididaSolicitada) {
         detallePedidoExtrasByIdCache = await fetchDetallePedidoExtras(
           client,
           detallePedidoResult.rows.map((row) => row.id_detalle_pedido)
         );
-        const divisionLines = detallePedidoResult.rows.map((row) => {
+        let detallePedidoRowsDisponibles = detallePedidoResult.rows;
+        if (divisionesExistentesResult.rowCount > 0) {
+          const existingDivisionIds = divisionesExistentesResult.rows
+            .map((row) => parseOptionalPositiveInt(row.id_cuenta_division))
+            .filter(Boolean);
+          const assignedItemsResult = existingDivisionIds.length
+            ? await client.query(
+              `
+                SELECT DISTINCT id_detalle_pedido
+                FROM public.ventas_cuenta_division_items
+                WHERE id_cuenta_division = ANY($1::bigint[])
+                  AND id_detalle_pedido IS NOT NULL
+              `,
+              [existingDivisionIds]
+            )
+            : { rows: [] };
+          const assignedDetalleIds = new Set(
+            assignedItemsResult.rows
+              .map((row) => parseOptionalPositiveInt(row.id_detalle_pedido))
+              .filter(Boolean)
+          );
+          detallePedidoRowsDisponibles = detallePedidoResult.rows.filter((row) => (
+            !assignedDetalleIds.has(Number(row.id_detalle_pedido))
+          ));
+        }
+        if (!detallePedidoRowsDisponibles.length) {
+          await client.query('ROLLBACK');
+          return res.status(409).json({
+            error: true,
+            code: 'CUENTA_DIVIDIDA_SIN_LINEAS_DISPONIBLES',
+            message: 'No quedan lineas disponibles para agregar otra persona.'
+          });
+        }
+        const divisionLines = detallePedidoRowsDisponibles.map((row) => {
           const idProducto = parseOptionalPositiveInt(row.id_producto);
           const idReceta = parseOptionalPositiveInt(row.id_receta);
           const idCombo = parseOptionalPositiveInt(row.id_combo);
           const subTotal = roundMoney(row.sub_total_pedido);
           const totalLinea = roundMoney(row.total_pedido ?? row.sub_total_pedido);
+          const detalleExtras = detallePedidoExtrasByIdCache.get(Number(row.id_detalle_pedido)) || [];
+          const extrasSubtotalPersistido = roundMoney(detalleExtras.reduce((sum, extra) => sum + Number(extra.subtotal || 0), 0));
+          const extrasSubtotal = extrasSubtotalPersistido > 0
+            ? extrasSubtotalPersistido
+            : Math.max(roundMoney(totalLinea - subTotal), 0);
+          const descuentoLinea = Math.max(roundMoney(subTotal + extrasSubtotal - totalLinea), 0);
           const precioBase = roundMoney(row.precio_unitario || (subTotal > 0 ? subTotal : totalLinea));
           const cantidad = inferKitchenItemQuantity(subTotal, precioBase);
           return {
@@ -7126,17 +7189,18 @@ router.post('/ventas/pedidos/:id/registrar-pago', checkPermission(['VENTAS_CREAR
             precio_unitario: precioBase,
             base_sub_total: subTotal,
             sub_total: subTotal,
-            subtotal_extras: 0,
-            descuento: roundMoney(subTotal - totalLinea),
+            subtotal_extras: extrasSubtotal,
+            descuento: descuentoLinea,
             total_linea: totalLinea,
             observacion: row.observacion || null,
-            extras_detalle: detallePedidoExtrasByIdCache.get(Number(row.id_detalle_pedido)) || []
+            extras_detalle: detalleExtras
           };
         });
         const cuentaDivisionPlan = buildCuentaDivisionPlan({
           cuentaDividida: req.body?.cuenta_dividida,
           lines: divisionLines,
-          expectedTotal: roundMoney(pedido.total || pagoControl.monto_pendiente)
+          expectedTotal: roundMoney(pedido.total || pagoControl.monto_pendiente),
+          allowPartial: true
         });
         const persistedDivisions = await persistCuentaDividida({
           client,
@@ -7156,6 +7220,7 @@ router.post('/ventas/pedidos/:id/registrar-pago', checkPermission(['VENTAS_CREAR
         }
       }
     }
+    ventasPerf.add('registrar_pago_cuenta_dividida_ms', cuentaDivididaStart);
 
     let detallePedidoRowsFacturar = detallePedidoResult.rows;
     if (cuentaDivisionPago) {
@@ -7190,6 +7255,7 @@ router.post('/ventas/pedidos/:id/registrar-pago', checkPermission(['VENTAS_CREAR
     }
     ventasPerfContext.items_count = detallePedidoRowsFacturar.length;
 
+    const scopeSessionStart = ventasPerf.now();
     const scope = await resolveRequestUserSucursalScope(req, client);
     const userId = parseOptionalPositiveInt(scope.idUsuario);
     ventasPerfContext.id_usuario = userId || null;
@@ -7227,6 +7293,7 @@ router.post('/ventas/pedidos/:id/registrar-pago', checkPermission(['VENTAS_CREAR
           : 'Debe abrir o participar en una sesion de caja activa para registrar el pago.'
       });
     }
+    ventasPerf.add('registrar_pago_scope_session_ms', scopeSessionStart);
 
     const metodoPago = await resolveMetodoPagoRegistroPedido(client, {
       idMetodoPago: req.body?.id_metodo_pago,
@@ -7441,6 +7508,7 @@ router.post('/ventas/pedidos/:id/registrar-pago', checkPermission(['VENTAS_CREAR
       const divisionSummary = await client.query(
         `
           SELECT
+            COALESCE(SUM(total), 0)::numeric(14,2) AS total_dividido,
             COALESCE(SUM(monto_pagado), 0)::numeric(14,2) AS monto_pagado,
             COALESCE(SUM(monto_pendiente), 0)::numeric(14,2) AS monto_pendiente,
             COUNT(*) FILTER (WHERE UPPER(TRIM(estado)) = 'PENDIENTE')::int AS pendientes
@@ -7450,9 +7518,13 @@ router.post('/ventas/pedidos/:id/registrar-pago', checkPermission(['VENTAS_CREAR
         [idPedido]
       );
       const summary = divisionSummary.rows?.[0] || {};
+      const totalDividido = roundMoney(summary.total_dividido);
+      const montoPendienteSinAsignar = Math.max(roundMoney(totalPedido - totalDividido), 0);
       montoPagadoRespuesta = roundMoney(summary.monto_pagado);
-      montoPendienteRespuesta = roundMoney(summary.monto_pendiente);
-      pedidoPagadoCompleto = Number(summary.pendientes || 0) === 0 && montoPendienteRespuesta <= 0.05;
+      montoPendienteRespuesta = roundMoney(Number(summary.monto_pendiente || 0) + montoPendienteSinAsignar);
+      pedidoPagadoCompleto = Number(summary.pendientes || 0) === 0
+        && montoPendienteRespuesta <= 0.05
+        && Math.abs(totalDividido - totalPedido) <= 0.05;
       estadoPagoRespuesta = pedidoPagadoCompleto ? PEDIDO_PAGADO_CONFIRMADO_ESTADO_PAGO : PEDIDO_PENDIENTE_ESTADO_PAGO;
 
       await client.query(

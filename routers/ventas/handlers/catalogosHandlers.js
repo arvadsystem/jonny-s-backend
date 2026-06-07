@@ -291,10 +291,19 @@ export const listClientesCatalogoHandler = async (req, res) => {
         c.id_tipo_cliente,
         p.nombre,
         p.apellido,
-        e.nombre_empresa
+        p.dni,
+        p.rtn AS persona_rtn,
+        p.id_telefono AS persona_id_telefono,
+        tp.telefono AS persona_telefono,
+        e.nombre_empresa,
+        e.rtn AS empresa_rtn,
+        e.id_telefono AS empresa_id_telefono,
+        te.telefono AS empresa_telefono
       FROM clientes c
       LEFT JOIN personas p ON p.id_persona = c.id_persona
+      LEFT JOIN telefonos tp ON tp.id_telefono = p.id_telefono
       LEFT JOIN empresas e ON e.id_empresa = c.id_empresa
+      LEFT JOIN telefonos te ON te.id_telefono = e.id_telefono
       WHERE COALESCE(c.estado, true) = true
       ORDER BY
         COALESCE(NULLIF(trim(concat_ws(' ', p.nombre, p.apellido)), ''), e.nombre_empresa, c.id_cliente::text)
@@ -306,6 +315,10 @@ export const listClientesCatalogoHandler = async (req, res) => {
       id_tipo_cliente: row.id_tipo_cliente,
       estado: row.estado,
       nombre_cliente: normalizeClienteNombre(row),
+      telefono: row.persona_telefono || row.empresa_telefono || null,
+      id_telefono: row.persona_id_telefono || row.empresa_id_telefono || null,
+      dni: row.dni || null,
+      rtn: row.empresa_rtn || row.persona_rtn || null,
       es_consumidor_final: false
     }));
 
