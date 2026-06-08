@@ -52,36 +52,116 @@ const hasTable = async (tableName) => {
   return exists;
 };
 
-// Lista sucursales activas para entrada publica del flujo.
-export const fetchPublicBranchesQuery = async () => {
-  const query = `
-    WITH clock AS (
-      SELECT (NOW() AT TIME ZONE 'America/Tegucigalpa')::time AS hora_actual
-    )
+const buildPublicBranchAvailabilitySql = ({
+  includeImageColumns = false,
+  whereClause = 'WHERE COALESCE(base.estado, true) = true',
+  limitClause = ''
+} = {}) => `
+  WITH clock AS (
+    SELECT
+      (NOW() AT TIME ZONE 'America/Tegucigalpa')::time AS hora_actual,
+      (NOW() AT TIME ZONE 'America/Tegucigalpa')::date AS fecha_actual,
+      EXTRACT(ISODOW FROM (NOW() AT TIME ZONE 'America/Tegucigalpa'))::int AS dia_semana_actual
+  ),
+  branch_base AS (
     SELECT
       s.id_sucursal,
       s.nombre_sucursal,
       COALESCE(vsi.texto_direccion, 'Direccion no disponible') AS direccion,
       COALESCE(s.estado, true) AS estado,
-      s.hora_inicio,
-      s.hora_final,
+      clock.hora_actual,
       CASE
-        WHEN s.hora_inicio IS NULL OR s.hora_final IS NULL THEN false
-        WHEN s.hora_final > s.hora_inicio THEN clock.hora_actual >= s.hora_inicio AND clock.hora_actual < s.hora_final
-        ELSE clock.hora_actual >= s.hora_inicio OR clock.hora_actual < s.hora_final
-      END AS abierto_por_horario,
+        WHEN fe.id_fecha_especial IS NOT NULL THEN fe.hora_inicio
+        WHEN sh.id_horario IS NOT NULL THEN sh.hora_inicio
+        ELSE s.hora_inicio
+      END AS hora_inicio_operativa,
+      CASE
+        WHEN fe.id_fecha_especial IS NOT NULL THEN fe.hora_final
+        WHEN sh.id_horario IS NOT NULL THEN sh.hora_final
+        ELSE s.hora_final
+      END AS hora_final_operativa,
+      CASE
+        WHEN fe.id_fecha_especial IS NOT NULL THEN true
+        WHEN sh.id_horario IS NOT NULL THEN true
+        WHEN s.hora_inicio IS NOT NULL AND s.hora_final IS NOT NULL THEN true
+        ELSE false
+      END AS horario_operativo_configurado,
+      CASE
+        WHEN fe.id_fecha_especial IS NOT NULL THEN COALESCE(fe.cerrado, true)
+        WHEN sh.id_horario IS NOT NULL THEN COALESCE(sh.cerrado, true)
+        ELSE false
+      END AS cerrado_operativo
+      ${includeImageColumns ? `,
       s.id_archivo_imagen,
-      a.url_publica AS url_imagen
+      a.url_publica AS url_imagen` : ''}
     FROM sucursales s
     CROSS JOIN clock
     LEFT JOIN v_sucursales_info vsi
       ON vsi.id_sucursal = s.id_sucursal
+    LEFT JOIN LATERAL (
+      SELECT
+        f.id_fecha_especial,
+        f.cerrado,
+        f.hora_inicio,
+        f.hora_final
+      FROM public.sucursales_fechas_especiales f
+      WHERE f.id_sucursal = s.id_sucursal
+        AND f.fecha = clock.fecha_actual
+        AND COALESCE(f.estado, true) = true
+      ORDER BY f.id_fecha_especial DESC
+      LIMIT 1
+    ) fe ON true
+    LEFT JOIN LATERAL (
+      SELECT
+        h.id_horario,
+        h.cerrado,
+        h.hora_inicio,
+        h.hora_final
+      FROM public.sucursales_horarios h
+      WHERE h.id_sucursal = s.id_sucursal
+        AND h.dia_semana = clock.dia_semana_actual
+        AND COALESCE(h.estado, true) = true
+      LIMIT 1
+    ) sh ON true
+    ${includeImageColumns ? `
     LEFT JOIN archivos a
       ON a.id_archivo = s.id_archivo_imagen
-     AND COALESCE(a.estado, true) = true
-    WHERE COALESCE(s.estado, true) = true
-    ORDER BY s.id_sucursal ASC;
-  `;
+     AND COALESCE(a.estado, true) = true` : ''}
+  )
+  SELECT
+    base.id_sucursal,
+    base.nombre_sucursal,
+    base.direccion,
+    base.estado,
+    base.hora_inicio_operativa AS hora_inicio,
+    base.hora_final_operativa AS hora_final,
+    base.horario_operativo_configurado,
+    base.cerrado_operativo,
+    CASE
+      WHEN base.cerrado_operativo = true THEN false
+      WHEN base.horario_operativo_configurado = false THEN false
+      WHEN base.hora_inicio_operativa IS NULL OR base.hora_final_operativa IS NULL THEN false
+      WHEN base.hora_final_operativa > base.hora_inicio_operativa
+        THEN base.hora_actual >= base.hora_inicio_operativa
+         AND base.hora_actual < base.hora_final_operativa
+      ELSE base.hora_actual >= base.hora_inicio_operativa
+        OR base.hora_actual < base.hora_final_operativa
+    END AS abierto_por_horario
+    ${includeImageColumns ? `,
+    base.id_archivo_imagen,
+    base.url_imagen` : ''}
+  FROM branch_base base
+  ${whereClause}
+  ORDER BY base.id_sucursal ASC
+  ${limitClause};
+`;
+
+// Lista sucursales activas para entrada publica del flujo.
+export const fetchPublicBranchesQuery = async () => {
+  const query = buildPublicBranchAvailabilitySql({
+    includeImageColumns: true,
+    whereClause: 'WHERE COALESCE(base.estado, true) = true'
+  });
 
   const result = await pool.query(query);
   return result.rows;
@@ -333,29 +413,10 @@ export const fetchCatalogRowsByMenuQuery = async (idMenu, db = pool) => {
 
 // Disponibilidad puntual de una sucursal para validar pedidos publicos.
 export const fetchPublicBranchAvailabilityByIdQuery = async (idSucursal, db = pool) => {
-  const query = `
-    WITH clock AS (
-      SELECT (NOW() AT TIME ZONE 'America/Tegucigalpa')::time AS hora_actual
-    )
-    SELECT
-      s.id_sucursal,
-      s.nombre_sucursal,
-      COALESCE(vsi.texto_direccion, 'Direccion no disponible') AS direccion,
-      COALESCE(s.estado, true) AS estado,
-      s.hora_inicio,
-      s.hora_final,
-      CASE
-        WHEN s.hora_inicio IS NULL OR s.hora_final IS NULL THEN false
-        WHEN s.hora_final > s.hora_inicio THEN clock.hora_actual >= s.hora_inicio AND clock.hora_actual < s.hora_final
-        ELSE clock.hora_actual >= s.hora_inicio OR clock.hora_actual < s.hora_final
-      END AS abierto_por_horario
-    FROM sucursales s
-    CROSS JOIN clock
-    LEFT JOIN v_sucursales_info vsi
-      ON vsi.id_sucursal = s.id_sucursal
-    WHERE s.id_sucursal = $1
-    LIMIT 1;
-  `;
+  const query = buildPublicBranchAvailabilitySql({
+    whereClause: 'WHERE base.id_sucursal = $1',
+    limitClause: 'LIMIT 1'
+  });
 
   const result = await db.query(query, [idSucursal]);
   return result.rows[0] || null;

@@ -261,9 +261,18 @@ const buildBranchScheduleLabel = ({ opensAt, closesAt }) => {
   return `${openLabel} - ${closeLabel}`;
 };
 
-const buildBranchClosedReason = ({ isActive, opensAt, closesAt }) => {
+const buildBranchClosedReason = ({
+  isActive,
+  opensAt,
+  closesAt,
+  hasConfiguredSchedule = false,
+  isClosedByOperationalConfig = false
+}) => {
   if (!isActive) return 'Sucursal no disponible';
   const schedule = buildBranchScheduleLabel({ opensAt, closesAt });
+  if (!schedule && hasConfiguredSchedule && isClosedByOperationalConfig) {
+    return 'Sucursal cerrada por horario configurado';
+  }
   if (!schedule) return '';
   return `Disponible de ${schedule}`;
 };
@@ -274,8 +283,12 @@ const mapBranch = (row) => {
   const opensAt = normalizeTimeValue(row?.hora_inicio);
   const closesAt = normalizeTimeValue(row?.hora_final);
   const hasSchedule = Boolean(opensAt && closesAt);
-  const isOpen = isActive && (hasSchedule ? toBoolean(row?.abierto_por_horario) : true);
-  const schedule = buildBranchScheduleLabel({ opensAt, closesAt }) || 'Horario por confirmar';
+  const hasConfiguredSchedule = toBoolean(row?.horario_operativo_configurado);
+  const isClosedByOperationalConfig = toBoolean(row?.cerrado_operativo);
+  const isOpen = isActive && (hasConfiguredSchedule ? toBoolean(row?.abierto_por_horario) : true);
+  const schedule = buildBranchScheduleLabel({ opensAt, closesAt }) || (
+    hasConfiguredSchedule && isClosedByOperationalConfig ? 'Cerrado hoy' : 'Horario por confirmar'
+  );
 
   return {
     id: Number(row.id_sucursal),
@@ -288,7 +301,15 @@ const mapBranch = (row) => {
     closesAt,
     schedule,
     statusLabel: isOpen ? (hasSchedule ? 'Abierto ahora' : 'Disponible') : 'Cerrado',
-    closedReason: isOpen ? '' : buildBranchClosedReason({ isActive, opensAt, closesAt })
+    closedReason: isOpen
+      ? ''
+      : buildBranchClosedReason({
+        isActive,
+        opensAt,
+        closesAt,
+        hasConfiguredSchedule,
+        isClosedByOperationalConfig
+      })
   };
 };
 
