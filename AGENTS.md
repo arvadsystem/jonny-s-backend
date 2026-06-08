@@ -1,126 +1,212 @@
-# Backend AGENTS.md - Jonny’s SmartOrden
+# AGENTS.md â€” Jonny's SmartOrder Backend
 
-## Rol
+## Repository context
 
-Actúa como ingeniero backend senior especializado en Node.js, APIs REST, Supabase, seguridad, permisos, storage y estabilidad para producción.
+Repository:
 
-## Contexto backend
+```text
+arvadsystem/jonny-s-backend
+```
 
-Proyecto Jonny’s backend.
+This is the backend for Jonny's SmartOrder.
 
-Estructura detectada:
-- routers/
-- middleware/
-- services/
-- utils/
-- jobs/
-- scripts/
+Detected stack:
 
-Módulos críticos:
-- Inventario
-- Órdenes de compra
-- Productos
-- Insumos
-- Proveedores
-- Almacenes
-- Mobiliario
-- Archivos / Storage
-- Campañas de correo
-- Seguridad / Roles / Permisos
-- Ventas
-- Cocina
-- Cajas
+- Node.js.
+- Express.
+- JavaScript ES Modules.
+- PostgreSQL through `pg`.
+- Supabase JS dependency.
+- JWT.
+- Cookie parser.
+- CORS.
+- Helmet.
+- CSRF middleware.
+- Session validation.
+- Global audit middleware.
+- PDF utilities.
+- Sharp.
 
-## Reglas obligatorias
+Do not assume:
 
-1. Analizar antes de modificar.
-2. No tocar rutas, servicios, middlewares, jobs o scripts fuera del alcance solicitado.
-3. No refactorizar por preferencia personal.
-4. No cambiar contratos API sin revisar impacto frontend.
-5. Toda ruta privada debe validar autenticación.
-6. Toda operación sensible debe validar permisos, roles y scope.
-7. No confiar solo en validaciones del frontend.
-8. Validar payloads en backend.
-9. No exponer error.message, stack traces, errores SQL ni detalles técnicos al cliente.
-10. Usar respuestas controladas y mensajes seguros.
-11. Evitar errores 500 cuando el caso pueda manejarse como 400, 401, 403, 404, 409, 422 o 503.
-12. Manejar nulls, datos incompletos y migraciones parciales con fallbacks seguros.
-13. No eliminar datos si el negocio requiere inactivar, desactivar o cancelar.
-14. Mantener trazabilidad histórica en inventario, órdenes de compra, evidencias, ventas y movimientos.
-15. Los comentarios nuevos deben ser puntuales y llevar iniciales AM.
-16. No romper nada funcional existente.
+- Fastify.
+- Nest.
+- TypeScript.
+- Prisma.
+- Sequelize.
+- Another ORM.
 
-## Reglas críticas de Inventario
+## Real scripts
 
-1. Inventario es módulo crítico.
-2. No eliminar productos, insumos, proveedores, almacenes ni mobiliario si el flujo requiere inactivar.
-3. Órdenes de compra deben conservar historial completo.
-4. Facturas y depósitos deben permanecer como evidencia histórica.
-5. Evidencias de órdenes de compra pueden ser imagen o PDF.
-6. Imágenes de productos deben ser livianas, rápidas y controladas por tamaño.
-7. Validar MIME type, tamaño, bucket y permisos antes de aceptar archivos.
-8. Respetar separación de buckets:
-   - bucket público para imágenes de productos
-   - bucket privado para facturas, depósitos y documentos de órdenes de compra
-9. Para archivos privados, usar URLs firmadas cuando aplique.
-10. No mezclar documentos privados con assets públicos.
-11. No romper flujo de órdenes de compra:
-   - solicitud
-   - aprobación
-   - abastecimiento
-   - factura
-   - depósito
-   - historial
-12. Validar stock real por item y evitar inconsistencias entre solicitado, aprobado y recibido.
+Use only scripts that exist in `package.json`:
 
-## Reglas de permisos
+```bash
+npm run start
+npm run dev
+npm run qa:menu-publico
+npm run rbac:personas:dry-run
+npm run rbac:personas:sync
+```
 
-1. Super Admin debe poder auditar y operar flujos críticos.
-2. No romper permisos existentes de Admin, Cajero, Cocina u otros roles.
-3. Validar permisos por acción:
-   - ver
-   - detalle
-   - crear
-   - editar
-   - cambiar estado
-   - aprobar
-   - rechazar
-   - abastecer
-   - subir evidencia
-4. No asumir permisos nuevos sin revisar middleware y frontend.
+Current `npm test` intentionally exits with error.
 
-## Reglas para campañas de correo
+Do not use it unless the user explicitly asks.
 
-1. No enviar correos automáticamente sin instrucción explícita.
-2. Validar destinatarios antes de enviar.
-3. Mantener logs de envío.
-4. No exponer credenciales SMTP.
-5. Usar alias configurado cuando aplique.
-6. Manejar errores de envío sin romper la campaña completa.
+## Important structure
 
-## Validación obligatoria antes de cerrar
+Known important files and folders:
 
-1. Auth.
-2. Roles/permisos.
-3. Validación de payload.
-4. Manejo de errores.
-5. Status codes correctos.
-6. Contrato API.
-7. Impacto frontend.
-8. Ausencia de filtración técnica.
-9. Validación de storage si se tocan archivos.
-10. Build/test/lint si aplica.
+```text
+app.js
+config/db-connection.js
+middleware/
+routers/
+routers/ventas.js
+routers/ventas/
+routers/cajas.js
+services/
+utils/
+jobs/
+scripts/
+sql/
+```
 
-## Formato final obligatorio
+## Architecture rules
 
-A. Resumen backend  
-B. Archivos modificados  
-C. Endpoints afectados  
-D. Cambios aplicados  
-E. Validaciones realizadas  
-F. Riesgos pendientes  
-G. Impacto frontend si aplica  
-H. SQL manual si aplica  
+- Keep public routes before global auth only when intentionally public.
+- Keep protected routes behind the existing auth/session/password/CSRF/audit chain.
+- Do not alter middleware order without explicit reason.
+- Use `pg.Pool` from `config/db-connection.js`.
+- Use parameterized SQL.
+- Avoid raw SQL string interpolation from request input.
+- Use existing permission middleware.
+- Keep route handlers thin when practical.
 
-No modifiques ningún otro archivo.
-Solo crea jonny-s-backend/AGENTS.md.
+## Middleware rules
+
+Protected flow must respect:
+
+```text
+authRequired
+requireActiveSession
+requirePasswordChange
+touchSessionMiddleware
+csrfProtect
+globalAuditMiddleware
+```
+
+Do not remove or bypass these for protected business operations.
+
+## Sales/cash critical rules
+
+Before touching sales, cash, orders, payments, inventory or invoicing, inspect relevant files:
+
+```text
+routers/ventas.js
+routers/ventas/constants.js
+routers/ventas/handlers/
+routers/ventas/services/
+routers/ventas/utils/
+routers/cajas.js
+services/facturacion*
+services/fidelizacion*
+services/inventario*
+sql/
+```
+
+Do not break:
+
+- Direct sale.
+- Pending order.
+- Registering payment.
+- Payment validation.
+- Kitchen visibility.
+- Inventory discount.
+- Extras.
+- Complements.
+- Sauces.
+- Discounts.
+- Split bill.
+- Facturas.
+- Facturas cobros.
+- Cash sessions.
+- Cash closing.
+- Reversals.
+- Loyalty accumulation.
+
+## Database rules
+
+- Use transactions for multi-table writes.
+- Do not execute destructive SQL without explicit approval.
+- Put migration proposals in `sql/` when needed.
+- Check current schema before assuming columns.
+- Do not touch backup tables unless instructed.
+- Preserve existing data.
+- Review indexes for frequent filters and joins.
+- Review RLS/security advisor concerns before exposing data.
+- Use `numeric` for money and decimal quantities.
+- Avoid JavaScript floating-point drift.
+- Use existing money rounding helpers where present.
+
+## Error handling rules
+
+- Return safe public messages.
+- Include stable `code` when existing flow uses codes.
+- Log internal errors server-side.
+- Do not send raw PostgreSQL errors to frontend.
+- Do not leak stack traces.
+- Preserve existing response shapes.
+
+## Security rules
+
+- Do not expose `.env`.
+- Do not print secrets.
+- Do not expose service role keys.
+- Do not weaken CORS.
+- Do not weaken cookies.
+- Do not bypass CSRF.
+- Do not skip permission checks.
+- Validate user scope by sucursal/role where existing utilities support it.
+- Do not trust frontend values for price, permissions, totals or inventory effects.
+
+## Refactor rules
+
+- Refactor incrementally.
+- Avoid broad rewrites of `ventas.js` or `cajas.js`.
+- Extract one responsibility at a time.
+- Preserve route order.
+- Preserve endpoint path and method.
+- Preserve error contract.
+- Keep imports simple.
+- Avoid circular dependencies.
+- Avoid adding abstractions without immediate use.
+
+## Verification
+
+Preferred checks:
+
+```bash
+node --check app.js
+node --check routers/ventas.js
+node --check routers/cajas.js
+npm run qa:menu-publico
+npm run rbac:personas:dry-run
+```
+
+Only run checks relevant to changed files.
+
+Do not run endless tests.
+
+## Do not do
+
+- Do not convert to TypeScript.
+- Do not install new frameworks.
+- Do not modify production data.
+- Do not execute migrations unless explicitly authorized.
+- Do not expose secrets.
+- Do not change API contracts silently.
+- Do not remove idempotency safeguards.
+- Do not remove inventory duplicate-discount protections.
+- Do not change cash session behavior without full impact review.
+- Do not change fiscal invoice logic casually.
+- Do not touch unrelated modules.
