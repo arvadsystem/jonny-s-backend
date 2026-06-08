@@ -450,6 +450,7 @@ export const listCombosCatalogoHandler = async (req, res) => {
 
       return {
         ...row,
+        imagen_principal_url: buildAbsolutePublicUrl(req, row.imagen_principal_url),
         requiere_complementos: Boolean(metadata.requiere_complementos),
         tipo_complemento: metadata.tipo_complemento || VENTA_COMPLEMENTO_TIPO_SALSAS,
         minimo_complementos: Number(metadata.minimo_complementos || 0),
@@ -538,6 +539,7 @@ export const listRecetasCatalogoHandler = async (req, res) => {
 
       return {
         ...row,
+        imagen_principal_url: buildAbsolutePublicUrl(req, row.imagen_principal_url),
         requiere_complementos: Boolean(metadata.requiere_complementos),
         tipo_complemento: metadata.tipo_complemento || VENTA_COMPLEMENTO_TIPO_SALSAS,
         minimo_complementos: Number(metadata.minimo_complementos || 0),
