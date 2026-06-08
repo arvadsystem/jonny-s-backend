@@ -65,7 +65,12 @@ export const buildAbsolutePublicUrl = (req, rawUrl) => {
 
   // Si la URL empieza con el prefijo de supabase storage publico (ej: jonnys-assets/)
   if (normalized.startsWith(`${SUPABASE_ASSETS_BUCKET}/`)) {
-    const supabaseUrl = String(process.env.SUPABASE_URL || '').trim().replace(/\/+$/, '');
+    const supabaseUrl = String(
+      process.env.SUPABASE_URL ||
+      process.env.PUBLIC_SUPABASE_URL ||
+      process.env.SUPABASE_PUBLIC_URL ||
+      ''
+    ).trim().replace(/\/+$/, '');
     if (supabaseUrl) {
       return `${supabaseUrl}/storage/v1/object/public/${normalized}`;
     }
