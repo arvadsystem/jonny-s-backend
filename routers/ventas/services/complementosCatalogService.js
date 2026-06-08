@@ -127,6 +127,9 @@ const buildRecipeSauceRequirement = ({ recipeName = '', recipeDescription = '', 
   if (rule) {
     return Number(rule?.salsas_requeridas || 0);
   }
+  if (Array.isArray(rules) && rules.length > 0) {
+    return 0;
+  }
   // AM: fallback acotado solo para familias alitas/tenders cuando no hay reglas formales.
   return calculateFallbackWingSauceRequirement({
     nombre: recipeName,

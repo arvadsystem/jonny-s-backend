@@ -2531,6 +2531,29 @@ const buildCuentaDivisionPlan = ({ cuentaDividida, lines, expectedTotal, allowPa
   return { divisions, total: totalDivisiones };
 };
 
+const normalizeComplementosFromMenuConfig = (configuracionMenu) => {
+  const config = isPlainObject(configuracionMenu) ? configuracionMenu : null;
+  const selected = Array.isArray(config?.complementos)
+    ? config.complementos
+    : Array.isArray(config?.componentes?.seleccion)
+      ? config.componentes.seleccion
+      : [];
+  return selected.map((entry) => ({
+    id_complemento: Number(entry?.id_complemento || entry?.id_salsa || 0),
+    id_salsa: Number(entry?.id_salsa || entry?.id_complemento || 0),
+    nombre: String(entry?.nombre || 'Complemento').trim()
+  })).filter((entry) => entry.id_complemento > 0);
+};
+
+const buildComplementSnapshotFromMenuConfig = (configuracionMenu) => {
+  const seleccion = normalizeComplementosFromMenuConfig(configuracionMenu);
+  if (seleccion.length === 0) return null;
+  return {
+    tipo: VENTA_COMPLEMENTO_TIPO_SALSAS,
+    seleccion
+  };
+};
+
 const buildCuentaDivisionItemSnapshot = (line, refs = {}) => ({
   tipo_item: normalizeTipoItem(line?.kind || line?.tipo_item),
   id_producto: parseOptionalPositiveInt(line?.id_producto),
@@ -2547,7 +2570,9 @@ const buildCuentaDivisionItemSnapshot = (line, refs = {}) => ({
   isv_total: 0,
   total_linea: roundMoney(line?.total_linea),
   extras_snapshot: Array.isArray(line?.extras_detalle) ? line.extras_detalle : [],
-  complementos_snapshot: Array.isArray(line?.complementos_detalle) ? line.complementos_detalle : [],
+  complementos_snapshot: Array.isArray(line?.complementos_detalle)
+    ? line.complementos_detalle
+    : normalizeComplementosFromMenuConfig(line?.configuracion_menu),
   origen_snapshot: {
     cart_key: normalizeCartKey(line?.cart_key),
     nombre_item: line?.nombre_item || null,
@@ -3512,27 +3537,34 @@ const buildPedidoPendientePayload = async ({ client, body, userId, sucursalScope
     }
   };
 };
-const buildPedidoFacturaSnapshot = (row, quantity, tipoItem, precioUnitario, subTotal, totalDetalle) => ({
-  tipo_item: tipoItem,
-  nombre_item: row.nombre_item || null,
-  id_producto: parseOptionalPositiveInt(row.id_producto),
-  id_receta: parseOptionalPositiveInt(row.id_receta),
-  id_combo: parseOptionalPositiveInt(row.id_combo),
-  id_detalle_pedido: parseOptionalPositiveInt(row.id_detalle_pedido),
-  cantidad: Number(quantity || 1),
-  precio_unitario: roundMoney(precioUnitario),
-  sub_total: roundMoney(subTotal),
-  total_detalle: roundMoney(totalDetalle),
-  subtotal_extras: roundMoney(row.subtotal_extras),
-  descuento: roundMoney(roundMoney(subTotal) - roundMoney(totalDetalle)),
-  descuento_linea: roundMoney(row.descuento_linea),
-  descuento_global: roundMoney(row.descuento_global),
-  id_descuento_catalogo_linea: row.id_descuento_catalogo_linea || null,
-  id_descuento_catalogo_global: row.id_descuento_catalogo_global || null,
-  observacion: row.observacion || null,
-  extras: Array.isArray(row.extras_detalle) ? row.extras_detalle : [],
-  origen: 'PEDIDO_PENDIENTE'
-});
+const buildPedidoFacturaSnapshot = (row, quantity, tipoItem, precioUnitario, subTotal, totalDetalle) => {
+  const snapshot = {
+    tipo_item: tipoItem,
+    nombre_item: row.nombre_item || null,
+    id_producto: parseOptionalPositiveInt(row.id_producto),
+    id_receta: parseOptionalPositiveInt(row.id_receta),
+    id_combo: parseOptionalPositiveInt(row.id_combo),
+    id_detalle_pedido: parseOptionalPositiveInt(row.id_detalle_pedido),
+    cantidad: Number(quantity || 1),
+    precio_unitario: roundMoney(precioUnitario),
+    sub_total: roundMoney(subTotal),
+    total_detalle: roundMoney(totalDetalle),
+    subtotal_extras: roundMoney(row.subtotal_extras),
+    descuento: roundMoney(roundMoney(subTotal) - roundMoney(totalDetalle)),
+    descuento_linea: roundMoney(row.descuento_linea),
+    descuento_global: roundMoney(row.descuento_global),
+    id_descuento_catalogo_linea: row.id_descuento_catalogo_linea || null,
+    id_descuento_catalogo_global: row.id_descuento_catalogo_global || null,
+    observacion: row.observacion || null,
+    extras: Array.isArray(row.extras_detalle) ? row.extras_detalle : [],
+    origen: 'PEDIDO_PENDIENTE'
+  };
+  const componentSnapshot = buildComplementSnapshotFromMenuConfig(row.configuracion_menu);
+  if (componentSnapshot && !snapshot.componentes && !snapshot.complementos) {
+    snapshot.componentes = componentSnapshot;
+  }
+  return snapshot;
+};
 
 const prepareDetalleFacturaDesdePedido = (row, idPedido) => {
   const idProducto = parseOptionalPositiveInt(row.id_producto);
@@ -7050,6 +7082,7 @@ router.post('/ventas/pedidos/:id/registrar-pago', checkPermission(['VENTAS_CREAR
       return res.status(409).json({ error: true, code: 'PEDIDO_FACTURA_EXISTENTE', message: 'El pedido ya tiene una factura asociada.' });
     }
 
+    const hasDetallePedidoConfiguracionMenu = await hasColumn(client, 'detalle_pedido', 'configuracion_menu');
     const detallePedidoStart = ventasPerf.now();
     const detallePedidoResult = cuentaDivisionPago
       ? await client.query(
@@ -7075,6 +7108,7 @@ router.post('/ventas/pedidos/:id/registrar-pago', checkPermission(['VENTAS_CREAR
             dp.id_combo,
             dp.id_receta,
             dp.observacion,
+            ${hasDetallePedidoConfiguracionMenu ? 'dp.configuracion_menu,' : 'NULL::jsonb AS configuracion_menu,'}
             COALESCE(prod.nombre_producto, combo.nombre_combo, combo.descripcion, rec.nombre_receta, 'Item de pedido') AS nombre_item,
             COALESCE(prod.precio, combo.precio, rec.precio, NULL) AS precio_unitario,
             dis.division_item_count
@@ -7103,6 +7137,7 @@ router.post('/ventas/pedidos/:id/registrar-pago', checkPermission(['VENTAS_CREAR
             dp.id_combo,
             dp.id_receta,
             dp.observacion,
+            ${hasDetallePedidoConfiguracionMenu ? 'dp.configuracion_menu,' : 'NULL::jsonb AS configuracion_menu,'}
             COALESCE(prod.nombre_producto, combo.nombre_combo, combo.descripcion, rec.nombre_receta, 'Item de pedido') AS nombre_item,
             COALESCE(prod.precio, combo.precio, rec.precio, NULL) AS precio_unitario
           FROM public.detalle_pedido dp
@@ -7215,7 +7250,9 @@ router.post('/ventas/pedidos/:id/registrar-pago', checkPermission(['VENTAS_CREAR
             descuento: descuentoLinea,
             total_linea: totalLinea,
             observacion: row.observacion || null,
-            extras_detalle: detalleExtras
+            extras_detalle: detalleExtras,
+            complementos_detalle: normalizeComplementosFromMenuConfig(row.configuracion_menu),
+            configuracion_menu: row.configuracion_menu || null
           };
         });
         const cuentaDivisionPlan = buildCuentaDivisionPlan({
