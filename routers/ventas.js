@@ -4807,6 +4807,10 @@ router.get('/ventas', checkPermission(['VENTAS_VER']), async (req, res) => {
   try {
     const filters = [];
     const params = [];
+    const shouldIncludeMetric = (value) => {
+      const normalized = String(value ?? '').trim().toLowerCase();
+      return !['0', 'false', 'no', 'off'].includes(normalized);
+    };
     const pushFilter = (fragment, value) => {
       params.push(value);
       filters.push(fragment.replaceAll('$IDX', `$${params.length}`));
@@ -4822,6 +4826,10 @@ router.get('/ventas', checkPermission(['VENTAS_VER']), async (req, res) => {
       max: VENTAS_MAX_PAGE_SIZE
     });
     const offset = (page - 1) * pageSize;
+    const includeSummary = shouldIncludeMetric(req.query.includeSummary ?? req.query.include_summary);
+    const includePaginationTotals = shouldIncludeMetric(
+      req.query.includePaginationTotals ?? req.query.include_pagination_totals
+    );
 
     const scope = await resolveVentasHistoryScope(req);
     if (!scope.allowedSucursalIds.length) {
@@ -5146,20 +5154,32 @@ router.get('/ventas', checkPermission(['VENTAS_VER']), async (req, res) => {
       OFFSET $${params.length + 2}
     `;
 
-    const countResult = await pool.query(countQuery, params);
-    const summaryResult = await pool.query(summaryQuery, params);
-    const total = Number.parseInt(String(countResult.rows?.[0]?.total ?? '0'), 10) || 0;
-    const totalPages = total > 0 ? Math.ceil(total / pageSize) : 1;
     const queryParams = [...params, pageSize, offset];
-    const result = await pool.query(dataQuery, queryParams);
-    const summaryRow = summaryResult.rows?.[0] || {};
-    const summaryVentas = Number.parseInt(String(summaryRow.ventas ?? '0'), 10) || 0;
-    const summaryTotalVendido = roundMoney(summaryRow.total_vendido);
-    const summaryCompletadas = Number.parseInt(String(summaryRow.completadas ?? '0'), 10) || 0;
-    const summaryPendientes = Math.max(summaryVentas - summaryCompletadas, 0);
-    const summaryTicketPromedio = summaryVentas > 0
+    const [countResult, summaryResult, result] = await Promise.all([
+      includePaginationTotals ? pool.query(countQuery, params) : Promise.resolve(null),
+      includeSummary ? pool.query(summaryQuery, params) : Promise.resolve(null),
+      pool.query(dataQuery, queryParams)
+    ]);
+    const total = includePaginationTotals
+      ? Number.parseInt(String(countResult?.rows?.[0]?.total ?? '0'), 10) || 0
+      : null;
+    const totalPages = includePaginationTotals
+      ? (total > 0 ? Math.ceil(total / pageSize) : 1)
+      : null;
+    const summaryRow = summaryResult?.rows?.[0] || {};
+    const summaryVentas = includeSummary
+      ? Number.parseInt(String(summaryRow.ventas ?? '0'), 10) || 0
+      : null;
+    const summaryTotalVendido = includeSummary ? roundMoney(summaryRow.total_vendido) : null;
+    const summaryCompletadas = includeSummary
+      ? Number.parseInt(String(summaryRow.completadas ?? '0'), 10) || 0
+      : null;
+    const summaryPendientes = includeSummary ? Math.max(summaryVentas - summaryCompletadas, 0) : null;
+    const summaryTicketPromedio = includeSummary && summaryVentas > 0
       ? roundMoney(summaryTotalVendido / summaryVentas)
-      : 0;
+      : includeSummary
+        ? 0
+        : null;
 
     const data = result.rows.map((row) => ({
       ...row,
@@ -5175,16 +5195,18 @@ router.get('/ventas', checkPermission(['VENTAS_VER']), async (req, res) => {
         pageSize,
         total,
         totalPages,
-        hasNextPage: page < totalPages,
+        hasNextPage: includePaginationTotals ? page < totalPages : null,
         hasPreviousPage: page > 1
       },
-      summary: {
-        ventas: summaryVentas,
-        totalVendido: summaryTotalVendido,
-        ticketPromedio: summaryTicketPromedio,
-        completadas: summaryCompletadas,
-        pendientes: summaryPendientes
-      },
+      summary: includeSummary
+        ? {
+          ventas: summaryVentas,
+          totalVendido: summaryTotalVendido,
+          ticketPromedio: summaryTicketPromedio,
+          completadas: summaryCompletadas,
+          pendientes: summaryPendientes
+        }
+        : null,
       filters: {
         scope: {
           canSelectSucursal: scope.isSuperAdmin,
