@@ -93,9 +93,22 @@ const buildUrlWithParams = (origin, path, params = {}) => {
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
+const normalizeSameSite = (value, fallback) => {
+  const normalized = String(value || '').trim().toLowerCase();
+  if (normalized === 'none' || normalized === 'lax' || normalized === 'strict') {
+    return normalized;
+  }
+  return fallback;
+};
+
 const cookieConfig = () => {
   const isProd = process.env.NODE_ENV === 'production';
-  return { sameSite: isProd ? 'none' : 'lax', secure: isProd, path: '/' };
+  return {
+    sameSite: normalizeSameSite(process.env.AUTH_COOKIE_SAMESITE, isProd ? 'none' : 'lax'),
+    secure: String(process.env.AUTH_COOKIE_SECURE || '').toLowerCase() === 'true' || isProd,
+    domain: String(process.env.AUTH_COOKIE_DOMAIN || '').trim() || undefined,
+    path: '/'
+  };
 };
 
 const issueCsrf = (res) => {
