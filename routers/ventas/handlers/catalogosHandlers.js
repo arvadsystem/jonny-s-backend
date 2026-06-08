@@ -1,5 +1,6 @@
 import pool from '../../../config/db-connection.js';
 import { resolveRequestUserSucursalScope } from '../../../utils/sucursalScope.js';
+import { buildAbsolutePublicUrl } from '../../../utils/uploads.js';
 import {
   DESCUENTO_ALCANCE_KEYS,
   VENTA_COMPLEMENTO_TIPO_SALSAS
@@ -275,7 +276,13 @@ export const listProductosCatalogoHandler = async (req, res) => {
     `;
 
     const result = await pool.query(query, params);
-    return res.status(200).json(Array.isArray(result.rows) ? result.rows : []);
+    const data = Array.isArray(result.rows)
+      ? result.rows.map((row) => ({
+        ...row,
+        imagen_principal_url: buildAbsolutePublicUrl(req, row.imagen_principal_url)
+      }))
+      : [];
+    return res.status(200).json(data);
   } catch (err) {
     console.error('Error al listar catalogo de productos para ventas:', err.message);
     return sendVentasInternalError(res);
