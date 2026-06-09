@@ -1,16 +1,7 @@
 import express from 'express';
-import crypto from 'crypto';
 import pool from '../config/db-connection.js';
 import { checkPermission } from '../middleware/checkPermission.js';
-import { supabase } from '../services/supabaseClient.js';
-import {
-  ALLOWED_MIME_TYPES_BY_BUCKET,
-  MAX_FILE_BYTES_BY_BUCKET,
-  MAX_IMAGE_BYTES,
-  SUPABASE_ASSETS_BUCKET,
-  buildAbsolutePublicUrl,
-  detectFileMimeTypeFromBuffer
-} from '../utils/uploads.js';
+import { buildAbsolutePublicUrl } from '../utils/uploads.js';
 import {
   actualizarCampoReceta,
   esEnteroPositivo,
@@ -33,8 +24,17 @@ const MENU_RECETAS_VIEW_PERMISSIONS = ['MENU_RECETAS_VER', 'MENU_VER'];
 const MENU_RECETAS_CREATE_PERMISSIONS = ['MENU_RECETAS_CREAR', 'MENU_VER'];
 const MENU_RECETAS_EDIT_PERMISSIONS = ['MENU_RECETAS_EDITAR', 'MENU_VER'];
 const MENU_RECETAS_STATE_PERMISSIONS = ['MENU_RECETAS_ESTADO_CAMBIAR', 'MENU_VER'];
-const MENU_RECETAS_UPLOADS_SUBDIR = 'menu/recetas';
-const BASE64_BODY_REGEX = /^[A-Za-z0-9+/]+={0,2}$/;
+const RECETAS_IMAGE_CONTRACT_MESSAGE =
+  'Las imagenes de recetas deben subirse primero mediante POST /archivos y luego enviar id_archivo.';
+const LEGACY_RECIPE_IMAGE_FIELDS = [
+  'imagen_data_url',
+  'imagen_base64',
+  'data_url',
+  'base64',
+  'imagenDataUrl',
+  'imagenBase64',
+  'dataUrl'
+];
 
 // Seguridad: el actor se resuelve siempre desde el token autenticado.
 const resolveActorUserId = (req) => {
@@ -42,157 +42,23 @@ const resolveActorUserId = (req) => {
   return esEnteroPositivo(parsed) ? parsed : null;
 };
 
-const toSafeFileBaseName = (value) => {
-  const sanitized = String(value || '')
-    .trim()
-    .toLowerCase()
-    .replace(/[^a-z0-9\s-]/g, '')
-    .replace(/\s+/g, '-')
-    .replace(/-+/g, '-')
-    .replace(/^-|-$/g, '');
-  return sanitized || 'receta';
+const hasValue = (value) => {
+  if (value === undefined || value === null) return false;
+  if (typeof value === 'string') return value.trim().length > 0;
+  return true;
 };
 
-const ensureSupabaseAssetsBucket = async () => {
-  const { data: existingBucket, error: getBucketError } = await supabase.storage.getBucket(SUPABASE_ASSETS_BUCKET);
-  if (existingBucket && !getBucketError) return;
+const hasLegacyEmbeddedImagePayload = (payload) =>
+  LEGACY_RECIPE_IMAGE_FIELDS.some((field) => hasValue(payload?.[field]));
 
-  const notFound =
-    getBucketError &&
-    (Number(getBucketError?.statusCode || getBucketError?.status || 0) === 404 ||
-      /not\s*found|does\s*not\s*exist/i.test(String(getBucketError?.message || '')));
-
-  if (getBucketError && !notFound) {
-    throw new Error('No se pudo verificar el bucket de imagenes.');
-  }
-
-  const { error: createBucketError } = await supabase.storage.createBucket(SUPABASE_ASSETS_BUCKET, {
-    public: true,
-    fileSizeLimit: MAX_FILE_BYTES_BY_BUCKET[SUPABASE_ASSETS_BUCKET],
-    allowedMimeTypes: Object.keys(ALLOWED_MIME_TYPES_BY_BUCKET[SUPABASE_ASSETS_BUCKET] || {})
-  });
-  if (createBucketError && !/already\s*exists|duplicate/i.test(String(createBucketError?.message || ''))) {
-    throw new Error('No se pudo crear el bucket de imagenes.');
-  }
-};
-
-const parseRecipeImagePayload = (payload) => {
-  const rawDataUrl =
-    payload?.imagen_data_url ??
-    payload?.imagenDataUrl ??
-    payload?.data_url ??
-    payload?.dataUrl ??
-    null;
-  const rawBase64 = payload?.imagen_base64 ?? payload?.imagenBase64 ?? payload?.base64 ?? null;
-  const rawMime = payload?.mime_type ?? payload?.mimeType ?? payload?.tipo_archivo ?? null;
-  const rawOriginalName = payload?.nombre_original ?? payload?.nombreOriginal ?? null;
-
-  const dataUrl = typeof rawDataUrl === 'string' ? rawDataUrl.trim() : '';
-  if (dataUrl) {
-    const match = dataUrl.match(/^data:(image\/(?:png|jpe?g|webp));base64,([A-Za-z0-9+/=]+)$/i);
-    if (!match) {
-      return { ok: false, status: 400, message: 'La imagen debe enviarse en formato data URL base64 valido.' };
+const rejectLegacyEmbeddedImagePayload = (payload) => {
+  if (!hasLegacyEmbeddedImagePayload(payload)) return null;
+  return {
+    status: 400,
+    body: {
+      error: true,
+      message: RECETAS_IMAGE_CONTRACT_MESSAGE
     }
-    return {
-      ok: true,
-      hasImage: true,
-      mimeType: String(match[1] || '').trim().toLowerCase(),
-      base64Body: String(match[2] || '').trim(),
-      nombreOriginal: String(rawOriginalName || '').trim()
-    };
-  }
-
-  const base64Body = typeof rawBase64 === 'string' ? rawBase64.trim() : '';
-  if (!base64Body) {
-    return { ok: true, hasImage: false, mimeType: '', base64Body: '', nombreOriginal: '' };
-  }
-
-  return {
-    ok: true,
-    hasImage: true,
-    mimeType: String(rawMime || '').trim().toLowerCase(),
-    base64Body,
-    nombreOriginal: String(rawOriginalName || '').trim()
-  };
-};
-
-const decodeRecipeImageBase64 = (base64Body, maxBytes = MAX_IMAGE_BYTES) => {
-  const normalized = String(base64Body || '').replace(/\s+/g, '');
-  if (!normalized || normalized.length % 4 !== 0 || !BASE64_BODY_REGEX.test(normalized)) {
-    return { ok: false, status: 400, message: 'El contenido base64 de la imagen no es valido.' };
-  }
-
-  const buffer = Buffer.from(normalized, 'base64');
-  if (!Buffer.isBuffer(buffer) || buffer.length === 0) {
-    return { ok: false, status: 400, message: 'La imagen enviada no contiene datos validos.' };
-  }
-  if (buffer.length > maxBytes) {
-    return { ok: false, status: 400, message: 'La imagen supera el limite permitido de 5 MB.' };
-  }
-  return { ok: true, buffer };
-};
-
-const uploadRecipeImageAndRegisterArchivo = async ({ req, imagePayload, nombreReceta, idUsuario, client }) => {
-  const allowedMimes = ALLOWED_MIME_TYPES_BY_BUCKET[SUPABASE_ASSETS_BUCKET] || {};
-  const decoded = decodeRecipeImageBase64(
-    imagePayload.base64Body,
-    MAX_FILE_BYTES_BY_BUCKET[SUPABASE_ASSETS_BUCKET] || MAX_IMAGE_BYTES
-  );
-  if (!decoded.ok) {
-    return decoded;
-  }
-
-  const detectedMime = detectFileMimeTypeFromBuffer(decoded.buffer);
-  const effectiveMime = (detectedMime || imagePayload.mimeType || '').toLowerCase();
-  if (!effectiveMime || !Object.prototype.hasOwnProperty.call(allowedMimes, effectiveMime)) {
-    return { ok: false, status: 400, message: 'Solo se permiten imagenes JPG, PNG o WEBP.' };
-  }
-
-  await ensureSupabaseAssetsBucket();
-
-  const extension = allowedMimes[effectiveMime];
-  const safeOriginalName = toSafeFileBaseName(imagePayload.nombreOriginal || nombreReceta || 'receta');
-  const uniqueFileName = `${safeOriginalName}-${Date.now()}-${crypto.randomUUID().slice(0, 8)}.${extension}`;
-  const storagePath = `${MENU_RECETAS_UPLOADS_SUBDIR}/${uniqueFileName}`;
-
-  const { error: uploadError } = await supabase.storage
-    .from(SUPABASE_ASSETS_BUCKET)
-    .upload(storagePath, decoded.buffer, {
-      contentType: effectiveMime,
-      cacheControl: '3600',
-      upsert: false
-    });
-  if (uploadError) {
-    return { ok: false, status: 500, message: 'No se pudo subir la imagen de la receta.' };
-  }
-
-  const dbPath = `${SUPABASE_ASSETS_BUCKET}/${storagePath}`;
-  const insertResult = await client.query(
-    `
-      INSERT INTO archivos (
-        nombre_original,
-        url_publica,
-        tipo_archivo,
-        tamano_bytes,
-        estado,
-        id_usuario
-      ) VALUES ($1, $2, $3, $4, true, $5)
-      RETURNING id_archivo
-    `,
-    [safeOriginalName, dbPath, effectiveMime, decoded.buffer.length, idUsuario]
-  );
-
-  const idArchivo = Number(insertResult.rows?.[0]?.id_archivo || 0);
-  if (!esEnteroPositivo(idArchivo)) {
-    await supabase.storage.from(SUPABASE_ASSETS_BUCKET).remove([storagePath]).catch(() => null);
-    return { ok: false, status: 500, message: 'No se pudo registrar la imagen de la receta.' };
-  }
-
-  return {
-    ok: true,
-    idArchivo,
-    storagePath: dbPath,
-    urlPublica: buildAbsolutePublicUrl(req, dbPath)
   };
 };
 
@@ -284,6 +150,108 @@ const validarDetalleRecetaFks = async (client, detalle) => {
   return { ok: true };
 };
 
+const buildUnidadConflictoMessage = (nombreInsumo, idInsumo) => {
+  const safeName = String(nombreInsumo || '').trim();
+  if (safeName) {
+    return `El insumo "${safeName}" ya tiene una unidad definida diferente. Actualiza el detalle con la unidad correcta.`;
+  }
+  return `El insumo ${idInsumo} ya tiene una unidad definida diferente. Actualiza el detalle con la unidad correcta.`;
+};
+
+const sincronizarUnidadesInsumosDesdeDetalle = async (client, detalle) => {
+  const insumosIds = [...new Set(detalle.map((item) => item.id_insumo))];
+  const snapshotResult = await client.query(
+    `
+      SELECT id_insumo, nombre_insumo, id_unidad_medida
+      FROM insumos
+      WHERE id_insumo = ANY($1::int[])
+    `,
+    [insumosIds]
+  );
+  const snapshotMap = new Map(
+    snapshotResult.rows.map((row) => [
+      Number(row.id_insumo),
+      {
+        nombre_insumo: String(row?.nombre_insumo || '').trim(),
+        id_unidad_medida:
+          row?.id_unidad_medida === null || row?.id_unidad_medida === undefined
+            ? null
+            : Number(row.id_unidad_medida)
+      }
+    ])
+  );
+
+  for (const item of detalle) {
+    const current = snapshotMap.get(item.id_insumo);
+    if (!current) {
+      return { ok: false, status: 400, message: `El insumo ${item.id_insumo} no existe.` };
+    }
+
+    if (esEnteroPositivo(current.id_unidad_medida)) {
+      if (current.id_unidad_medida !== item.id_unidad_medida) {
+        return {
+          ok: false,
+          status: 409,
+          message: buildUnidadConflictoMessage(current.nombre_insumo, item.id_insumo)
+        };
+      }
+      continue;
+    }
+
+    const updateResult = await client.query(
+      `
+        UPDATE insumos
+        SET id_unidad_medida = $1
+        WHERE id_insumo = $2
+          AND id_unidad_medida IS NULL
+      `,
+      [item.id_unidad_medida, item.id_insumo]
+    );
+
+    if (updateResult.rowCount === 1) {
+      snapshotMap.set(item.id_insumo, {
+        ...current,
+        id_unidad_medida: item.id_unidad_medida
+      });
+      continue;
+    }
+
+    const refreshedResult = await client.query(
+      `
+        SELECT nombre_insumo, id_unidad_medida
+        FROM insumos
+        WHERE id_insumo = $1
+        LIMIT 1
+      `,
+      [item.id_insumo]
+    );
+    const refreshed = refreshedResult.rows?.[0] || null;
+    const refreshedUnidadId =
+      refreshed?.id_unidad_medida === null || refreshed?.id_unidad_medida === undefined
+        ? null
+        : Number(refreshed.id_unidad_medida);
+
+    if (esEnteroPositivo(refreshedUnidadId) && refreshedUnidadId === item.id_unidad_medida) {
+      snapshotMap.set(item.id_insumo, {
+        nombre_insumo: String(refreshed?.nombre_insumo || current.nombre_insumo || '').trim(),
+        id_unidad_medida: refreshedUnidadId
+      });
+      continue;
+    }
+
+    return {
+      ok: false,
+      status: 409,
+      message: buildUnidadConflictoMessage(
+        refreshed?.nombre_insumo || current.nombre_insumo,
+        item.id_insumo
+      )
+    };
+  }
+
+  return { ok: true };
+};
+
 const reemplazarDetalleReceta = async (client, idReceta, detalle) => {
   await client.query('UPDATE detalle_recetas SET estado = false WHERE id_receta = $1', [idReceta]);
 
@@ -358,16 +326,25 @@ router.get('/catalogos/insumos', checkPermission(MENU_RECETAS_VIEW_PERMISSIONS),
         SELECT
           i.id_insumo,
           i.nombre_insumo,
+          i.id_categoria_insumo,
+          ci.nombre_categoria,
+          i.id_almacen,
+          a.nombre AS nombre_almacen,
           i.id_unidad_medida,
           um.nombre AS unidad_nombre,
+          um.simbolo AS unidad_abreviatura,
           um.simbolo AS unidad_simbolo,
           i.cantidad,
           i.stock_minimo
         FROM insumos i
+        LEFT JOIN categorias_insumos ci
+          ON ci.id_categoria_insumo = i.id_categoria_insumo
+        LEFT JOIN almacenes a
+          ON a.id_almacen = i.id_almacen
         LEFT JOIN unidades_medida um
           ON um.id_unidad_medida = i.id_unidad_medida
         WHERE COALESCE(i.estado, true) = true
-        ORDER BY i.nombre_insumo ASC, i.id_insumo ASC
+        ORDER BY ci.nombre_categoria ASC NULLS LAST, i.nombre_insumo ASC, a.nombre ASC NULLS LAST, i.id_insumo ASC
       `
     );
 
@@ -464,16 +441,25 @@ router.get('/:id_receta/contexto-edicion', checkPermission(MENU_RECETAS_VIEW_PER
           SELECT
             i.id_insumo,
             i.nombre_insumo,
+            i.id_categoria_insumo,
+            ci.nombre_categoria,
+            i.id_almacen,
+            a.nombre AS nombre_almacen,
             i.id_unidad_medida,
             um.nombre AS unidad_nombre,
+            um.simbolo AS unidad_abreviatura,
             um.simbolo AS unidad_simbolo,
             i.cantidad,
             i.stock_minimo
           FROM insumos i
+          LEFT JOIN categorias_insumos ci
+            ON ci.id_categoria_insumo = i.id_categoria_insumo
+          LEFT JOIN almacenes a
+            ON a.id_almacen = i.id_almacen
           LEFT JOIN unidades_medida um
             ON um.id_unidad_medida = i.id_unidad_medida
           WHERE COALESCE(i.estado, true) = true
-          ORDER BY i.nombre_insumo ASC, i.id_insumo ASC
+          ORDER BY ci.nombre_categoria ASC NULLS LAST, i.nombre_insumo ASC, a.nombre ASC NULLS LAST, i.id_insumo ASC
         `
       )
     ]);
@@ -574,6 +560,11 @@ router.post('/', checkPermission(MENU_RECETAS_CREATE_PERMISSIONS), async (req, r
       return res.status(401).json({ error: true, message: 'Sesion invalida. Vuelve a iniciar sesion.' });
     }
 
+    const legacyImageError = rejectLegacyEmbeddedImagePayload(req.body || {});
+    if (legacyImageError) {
+      return res.status(legacyImageError.status).json(legacyImageError.body);
+    }
+
     const detalleValidation = normalizeDetalleRecetaPayload(req.body?.detalle_receta || req.body?.detalle || []);
     if (!detalleValidation.ok) {
       return res.status(400).json({ error: true, message: detalleValidation.message });
@@ -582,12 +573,6 @@ router.post('/', checkPermission(MENU_RECETAS_CREATE_PERMISSIONS), async (req, r
     const fkDetalleValidation = await validarDetalleRecetaFks(client, detalleValidation.detalle);
     if (!fkDetalleValidation.ok) {
       return res.status(fkDetalleValidation.status).json({ error: true, message: fkDetalleValidation.message });
-    }
-
-    // Transicion segura: id_usuario del cliente se ignora y se fuerza desde req.user.
-    const imagePayload = parseRecipeImagePayload(req.body || {});
-    if (!imagePayload.ok) {
-      return res.status(imagePayload.status).json({ error: true, message: imagePayload.message });
     }
 
     const payloadConActor = { ...(req.body || {}), id_usuario: actorUserId };
@@ -622,21 +607,8 @@ router.post('/', checkPermission(MENU_RECETAS_CREATE_PERMISSIONS), async (req, r
     if (urlImagenPublica) {
       return res.status(400).json({
         error: true,
-        message: 'url_imagen_publica ya no se acepta para nuevas imagenes. Envia imagen_data_url o base64.'
+        message: RECETAS_IMAGE_CONTRACT_MESSAGE
       });
-    }
-    if (imagePayload.hasImage) {
-      const uploadResult = await uploadRecipeImageAndRegisterArchivo({
-        req,
-        imagePayload,
-        nombreReceta: datosNormalizados.nombre_receta,
-        idUsuario: actorUserId,
-        client
-      });
-      if (!uploadResult.ok) {
-        return res.status(uploadResult.status).json({ error: true, message: uploadResult.message });
-      }
-      datosNormalizados.id_archivo = uploadResult.idArchivo;
     }
     delete datosNormalizados.url_imagen_publica;
 
@@ -660,6 +632,12 @@ router.post('/', checkPermission(MENU_RECETAS_CREATE_PERMISSIONS), async (req, r
     );
 
     await client.query('BEGIN');
+    const unidadSyncValidation = await sincronizarUnidadesInsumosDesdeDetalle(client, detalleValidation.detalle);
+    if (!unidadSyncValidation.ok) {
+      await client.query('ROLLBACK');
+      return res.status(unidadSyncValidation.status).json({ error: true, message: unidadSyncValidation.message });
+    }
+
     await client.query('CALL pa_insert($1, $2)', ['recetas', datosInsertSinNull]);
 
     const createdResult = await client.query(
@@ -736,6 +714,11 @@ router.put('/:id_receta', checkPermission(MENU_RECETAS_EDIT_PERMISSIONS), async 
       return res.status(401).json({ error: true, message: 'Sesion invalida. Vuelve a iniciar sesion.' });
     }
 
+    const legacyImageError = rejectLegacyEmbeddedImagePayload(req.body || {});
+    if (legacyImageError) {
+      return res.status(legacyImageError.status).json(legacyImageError.body);
+    }
+
     const idReceta = Number(req.params.id_receta);
     if (!esEnteroPositivo(idReceta)) {
       return res.status(400).json({ error: true, message: 'id_receta invalido.' });
@@ -754,12 +737,6 @@ router.put('/:id_receta', checkPermission(MENU_RECETAS_EDIT_PERMISSIONS), async 
     const fkDetalleValidation = await validarDetalleRecetaFks(client, detalleValidation.detalle);
     if (!fkDetalleValidation.ok) {
       return res.status(fkDetalleValidation.status).json({ error: true, message: fkDetalleValidation.message });
-    }
-
-    // Transicion segura: id_usuario del cliente se ignora y se fuerza desde req.user.
-    const imagePayload = parseRecipeImagePayload(req.body || {});
-    if (!imagePayload.ok) {
-      return res.status(imagePayload.status).json({ error: true, message: imagePayload.message });
     }
 
     const payloadConActor = { ...(req.body || {}), id_usuario: actorUserId };
@@ -794,21 +771,8 @@ router.put('/:id_receta', checkPermission(MENU_RECETAS_EDIT_PERMISSIONS), async 
     if (urlImagenPublica) {
       return res.status(400).json({
         error: true,
-        message: 'url_imagen_publica ya no se acepta para nuevas imagenes. Envia imagen_data_url o base64.'
+        message: RECETAS_IMAGE_CONTRACT_MESSAGE
       });
-    }
-    if (imagePayload.hasImage) {
-      const uploadResult = await uploadRecipeImageAndRegisterArchivo({
-        req,
-        imagePayload,
-        nombreReceta: datosNormalizados.nombre_receta,
-        idUsuario: actorUserId,
-        client
-      });
-      if (!uploadResult.ok) {
-        return res.status(uploadResult.status).json({ error: true, message: uploadResult.message });
-      }
-      datosNormalizados.id_archivo = uploadResult.idArchivo;
     }
     delete datosNormalizados.url_imagen_publica;
 
@@ -818,6 +782,11 @@ router.put('/:id_receta', checkPermission(MENU_RECETAS_EDIT_PERMISSIONS), async 
     }
 
     await client.query('BEGIN');
+    const unidadSyncValidation = await sincronizarUnidadesInsumosDesdeDetalle(client, detalleValidation.detalle);
+    if (!unidadSyncValidation.ok) {
+      await client.query('ROLLBACK');
+      return res.status(unidadSyncValidation.status).json({ error: true, message: unidadSyncValidation.message });
+    }
 
     for (const campo of Object.keys(datosNormalizados)) {
       await actualizarCampoReceta(client, idReceta, campo, datosNormalizados[campo]);
