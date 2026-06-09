@@ -20,6 +20,10 @@ const isVentasCatalogCacheEnabled = () =>
 
 const ventasStaticComplementCache = new Map();
 
+export const clearVentasComplementCatalogCache = () => {
+  ventasStaticComplementCache.clear();
+};
+
 export const buildVentasStaticCacheKey = (prefix, ids = []) => {
   const normalizedIds = [...new Set((Array.isArray(ids) ? ids : [])
     .map((id) => Number(id || 0))
