@@ -177,6 +177,34 @@ const parsePositiveDecimal4 = (value) => {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
 };
 
+const normalizeDecimal = (value, decimals) => {
+  if (value === null || value === undefined || value === '') return null;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed.toFixed(decimals) : null;
+};
+
+const nullableIntValue = (value) => {
+  const parsed = parsePositiveInt(value);
+  return parsed || null;
+};
+
+const arePurchaseSnapshotsCompatible = (existingDetail, newDetail) => {
+  if (newDetail.item_tipo === 'producto') return true;
+
+  const existingPresentationId = nullableIntValue(existingDetail?.id_presentacion_insumo);
+  const newPresentationId = nullableIntValue(newDetail?.id_presentacion_insumo);
+  if (!existingPresentationId && !newPresentationId) {
+    return nullableIntValue(existingDetail?.id_unidad_base) === nullableIntValue(newDetail?.id_unidad_base);
+  }
+
+  return (
+    existingPresentationId === newPresentationId &&
+    nullableIntValue(existingDetail?.id_unidad_base) === nullableIntValue(newDetail?.id_unidad_base) &&
+    nullableIntValue(existingDetail?.id_unidad_presentacion) === nullableIntValue(newDetail?.id_unidad_presentacion) &&
+    normalizeDecimal(existingDetail?.factor_conversion_usado, 6) === normalizeDecimal(newDetail?.factor_conversion_usado, 6)
+  );
+};
+
 const getRequestUserId = (req) => parsePositiveInt(req?.user?.id_usuario);
 
 const sendError = (res, status, code, message, extra = {}) =>
@@ -1056,7 +1084,7 @@ const getComprasPorProveedorSummary = async (
         doc.id_proveedor_sugerido AS id_proveedor,
         COALESCE(prov.nombre_proveedor, 'Proveedor sin definir') AS nombre_proveedor,
         COUNT(*)::int AS total_lineas_oc,
-        COALESCE(SUM(doc.cantidad_orden), 0)::int AS total_cantidad_oc
+        COALESCE(SUM(doc.cantidad_orden), 0::numeric) AS total_cantidad_oc
       FROM public.detalle_orden_compras doc
       LEFT JOIN public.proveedores prov ON prov.id_proveedor = doc.id_proveedor_sugerido
       WHERE doc.id_orden_compra = $1
@@ -1110,7 +1138,7 @@ const getComprasPorProveedorSummary = async (
         SELECT
           dc.id_compra,
           COUNT(*)::int AS total_lineas_compra,
-          COALESCE(SUM(dc.cantidad), 0)::int AS total_cantidad_compra
+          COALESCE(SUM(dc.cantidad), 0::numeric) AS total_cantidad_compra
         FROM public.detalle_compras dc
         WHERE dc.id_compra = ANY($1::int[])
         GROUP BY dc.id_compra
@@ -2362,10 +2390,14 @@ router.get('/orden_compras/workflow/contexto_creacion', checkPermission(PERM_OC_
           ub.simbolo AS unidad_base_simbolo,
           COALESCE(ip.es_predeterminada_compra, false) AS es_predeterminada_compra
         FROM public.insumo_presentaciones ip
+        INNER JOIN public.insumos i ON i.id_insumo = ip.id_insumo
         LEFT JOIN public.unidades_medida up ON up.id_unidad_medida = ip.id_unidad_presentacion
         LEFT JOIN public.unidades_medida ub ON ub.id_unidad_medida = ip.id_unidad_base
         WHERE COALESCE(ip.estado, true) = true
           AND COALESCE(ip.uso_compra, false) = true
+          AND COALESCE(i.estado, true) = true
+          AND i.id_unidad_medida IS NOT NULL
+          AND ip.id_unidad_base = i.id_unidad_medida
         ORDER BY ip.id_insumo ASC, COALESCE(ip.es_predeterminada_compra, false) DESC, ip.nombre_presentacion ASC
       `
     );
@@ -2794,7 +2826,7 @@ router.get('/orden_compras/workflow', checkPermission(PERM_OC_VIEW_FLOW), async 
             suc.nombre_sucursal,
             ar.url_publica AS factura_recepcion_url_publica,
             COALESCE(det.total_items, 0)::int AS total_items,
-            COALESCE(det.total_cantidad, 0)::int AS total_cantidad,
+            COALESCE(det.total_cantidad, 0::numeric) AS total_cantidad,
             COALESCE(sit.total_solicitudes_item, 0)::int AS total_solicitudes_item,
             COALESCE(sit.total_solicitudes_item_pendientes, 0)::int AS total_solicitudes_item_pendientes,
             COALESCE(sit.total_solicitudes_item_en_revision, 0)::int AS total_solicitudes_item_en_revision,
@@ -2838,7 +2870,7 @@ router.get('/orden_compras/workflow', checkPermission(PERM_OC_VIEW_FLOW), async 
           LEFT JOIN LATERAL (
             SELECT
               COUNT(*)::int AS total_items,
-              COALESCE(SUM(doc.cantidad_orden), 0)::int AS total_cantidad
+              COALESCE(SUM(doc.cantidad_orden), 0::numeric) AS total_cantidad
             FROM public.detalle_orden_compras doc
             WHERE doc.id_orden_compra = oc.id_orden_compra
           ) det ON true
@@ -2909,7 +2941,7 @@ router.get('/orden_compras/workflow', checkPermission(PERM_OC_VIEW_FLOW), async 
             suc.nombre_sucursal,
             ar.url_publica AS factura_recepcion_url_publica,
             COALESCE(det.total_items, 0)::int AS total_items,
-            COALESCE(det.total_cantidad, 0)::int AS total_cantidad,
+            COALESCE(det.total_cantidad, 0::numeric) AS total_cantidad,
             0::int AS total_solicitudes_item,
             0::int AS total_solicitudes_item_pendientes,
             0::int AS total_solicitudes_item_en_revision,
@@ -2969,7 +3001,7 @@ router.get('/orden_compras/workflow', checkPermission(PERM_OC_VIEW_FLOW), async 
           LEFT JOIN LATERAL (
             SELECT
               COUNT(*)::int AS total_items,
-              COALESCE(SUM(doc.cantidad_orden), 0)::int AS total_cantidad
+              COALESCE(SUM(doc.cantidad_orden), 0::numeric) AS total_cantidad
             FROM public.detalle_orden_compras doc
             WHERE doc.id_orden_compra = oc.id_orden_compra
           ) det ON true
@@ -3755,9 +3787,16 @@ router.put('/orden_compras/workflow/:id_orden_compra/detalles', checkPermission(
     for (const detail of parsedAdds.details) {
       const idProducto = detail.item_tipo === 'producto' ? detail.id_item : null;
       const idInsumo = detail.item_tipo === 'insumo' ? detail.id_item : null;
-      const existingRow = await client.query(
+      const existingRows = await client.query(
         `
-          SELECT id_detalle_orden, cantidad_orden, cantidad_presentacion
+          SELECT
+            id_detalle_orden,
+            cantidad_orden,
+            id_unidad_base,
+            id_presentacion_insumo,
+            cantidad_presentacion,
+            id_unidad_presentacion,
+            factor_conversion_usado
           FROM public.detalle_orden_compras
           WHERE id_orden_compra = $1
             AND (
@@ -3770,7 +3809,7 @@ router.put('/orden_compras/workflow/:id_orden_compra/detalles', checkPermission(
               ($6::bigint IS NULL AND id_presentacion_insumo IS NULL)
               OR ($6::bigint IS NOT NULL AND id_presentacion_insumo = $6)
             )
-          LIMIT 1
+          ORDER BY id_detalle_orden ASC
         `,
         [
           idOrdenCompra,
@@ -3781,34 +3820,31 @@ router.put('/orden_compras/workflow/:id_orden_compra/detalles', checkPermission(
           detail.id_presentacion_insumo || null
         ]
       );
+      const existingDetail = (existingRows.rows || []).find((row) => arePurchaseSnapshotsCompatible(row, detail));
 
-      if (existingRow.rowCount > 0) {
-        const existingDetail = existingRow.rows[0];
+      if (existingDetail) {
         if (detail.modo_unidad === 'presentacion') {
           const totalPresentacion = roundDecimal(
             Number(existingDetail.cantidad_presentacion || 0) + Number(detail.cantidad_presentacion || 0),
             4
           );
-          const totalOrden = roundDecimal(totalPresentacion * Number(detail.factor_conversion_usado), 4);
+          const totalOrden = roundDecimal(
+            Number(existingDetail.cantidad_orden || 0) + Number(detail.cantidad_orden || 0),
+            4
+          );
 
-          // AM: evita duplicar lineas; suma presentaciones y recalcula la base canonica con el factor snapshot.
+          // AM: fusiona solo snapshots identicos; conserva el factor/unidades historicas existentes.
           await client.query(
             `
               UPDATE public.detalle_orden_compras
               SET cantidad_orden = $1,
-                  cantidad_presentacion = $2,
-                  id_unidad_base = $3,
-                  id_unidad_presentacion = $4,
-                  factor_conversion_usado = $5
-              WHERE id_detalle_orden = $6
-                AND id_orden_compra = $7
+                  cantidad_presentacion = $2
+              WHERE id_detalle_orden = $3
+                AND id_orden_compra = $4
             `,
             [
               totalOrden,
               totalPresentacion,
-              detail.id_unidad_base || null,
-              detail.id_unidad_presentacion || null,
-              detail.factor_conversion_usado,
               existingDetail.id_detalle_orden,
               idOrdenCompra
             ]
@@ -3818,14 +3854,12 @@ router.put('/orden_compras/workflow/:id_orden_compra/detalles', checkPermission(
           await client.query(
             `
               UPDATE public.detalle_orden_compras
-              SET cantidad_orden = cantidad_orden + $1,
-                  id_unidad_base = COALESCE(id_unidad_base, $2::int)
-              WHERE id_detalle_orden = $3
-                AND id_orden_compra = $4
+              SET cantidad_orden = cantidad_orden + $1
+              WHERE id_detalle_orden = $2
+                AND id_orden_compra = $3
             `,
             [
               detail.cantidad_orden,
-              detail.id_unidad_base || null,
               existingDetail.id_detalle_orden,
               idOrdenCompra
             ]
