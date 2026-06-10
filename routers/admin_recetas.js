@@ -67,6 +67,18 @@ const parsePositiveNumber = (value) => {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
 };
 
+const roundDecimal = (value, decimals) => {
+  const factor = 10 ** decimals;
+  return Math.round((Number(value) + Number.EPSILON) * factor) / factor;
+};
+
+const hasPositiveInteger = (value) => esEnteroPositivo(Number(value));
+
+const formatDetalleLine = (index, insumoLabel = '') => {
+  const suffix = String(insumoLabel || '').trim();
+  return suffix ? `linea ${index + 1} (${suffix})` : `linea ${index + 1}`;
+};
+
 const normalizeDetalleRecetaPayload = (detalle) => {
   if (!Array.isArray(detalle)) {
     return { ok: false, message: 'detalle_receta debe ser una lista de insumos.' };
@@ -77,27 +89,53 @@ const normalizeDetalleRecetaPayload = (detalle) => {
 
   for (const [index, item] of detalle.entries()) {
     const idInsumo = Number(item?.id_insumo);
-    const idUnidadMedida = Number(item?.id_unidad_medida);
-    const cantidad = parsePositiveNumber(item?.cant ?? item?.cantidad);
+    const idPresentacionInsumo = Number(item?.id_presentacion_insumo);
+    const usePresentacion = esEnteroPositivo(idPresentacionInsumo);
 
     if (!esEnteroPositivo(idInsumo)) {
       return { ok: false, message: `Insumo invalido en linea ${index + 1}.` };
     }
+    if (seenInsumos.has(idInsumo)) {
+      return { ok: false, message: 'No repitas el mismo insumo en el detalle de receta.' };
+    }
+
+    if (usePresentacion) {
+      const cantidadPresentacion = parsePositiveNumber(item?.cantidad_presentacion);
+      if (cantidadPresentacion === null) {
+        return { ok: false, message: `Cantidad de presentacion invalida en linea ${index + 1}.` };
+      }
+
+      seenInsumos.add(idInsumo);
+      normalized.push({
+        row_index: index,
+        id_insumo: idInsumo,
+        modo_unidad: 'presentacion',
+        id_presentacion_insumo: idPresentacionInsumo,
+        cantidad_presentacion: roundDecimal(cantidadPresentacion, 4)
+      });
+      continue;
+    }
+
+    const idUnidadMedida = Number(item?.id_unidad_medida);
+    const cantidad = parsePositiveNumber(item?.cant ?? item?.cantidad);
     if (!esEnteroPositivo(idUnidadMedida)) {
       return { ok: false, message: `Unidad de medida invalida en linea ${index + 1}.` };
     }
     if (cantidad === null) {
       return { ok: false, message: `Cantidad invalida en linea ${index + 1}.` };
     }
-    if (seenInsumos.has(idInsumo)) {
-      return { ok: false, message: 'No repitas el mismo insumo en el detalle de receta.' };
-    }
 
     seenInsumos.add(idInsumo);
     normalized.push({
+      row_index: index,
       id_insumo: idInsumo,
+      modo_unidad: 'base',
       id_unidad_medida: idUnidadMedida,
-      cant: cantidad
+      cant: roundDecimal(cantidad, 2),
+      id_presentacion_insumo: null,
+      cantidad_presentacion: null,
+      id_unidad_presentacion: null,
+      factor_conversion_usado: null
     });
   }
 
@@ -110,35 +148,54 @@ const normalizeDetalleRecetaPayload = (detalle) => {
 
 const validarDetalleRecetaFks = async (client, detalle) => {
   const insumosIds = detalle.map((item) => item.id_insumo);
-  const unidadesIds = detalle.map((item) => item.id_unidad_medida);
+  const unidadesIds = detalle
+    .filter((item) => item.modo_unidad === 'base')
+    .map((item) => item.id_unidad_medida);
+  const presentacionesIds = detalle
+    .filter((item) => item.modo_unidad === 'presentacion')
+    .map((item) => item.id_presentacion_insumo);
 
   const insumosResult = await client.query(
     `
-      SELECT id_insumo, COALESCE(estado, true) AS estado
+      SELECT id_insumo, nombre_insumo, id_unidad_medida, COALESCE(estado, true) AS estado
       FROM insumos
       WHERE id_insumo = ANY($1::int[])
     `,
     [insumosIds]
   );
-  const insumosMap = new Map(insumosResult.rows.map((row) => [Number(row.id_insumo), Boolean(row.estado)]));
+  const insumosMap = new Map(
+    insumosResult.rows.map((row) => [
+      Number(row.id_insumo),
+      {
+        nombre_insumo: String(row?.nombre_insumo || '').trim(),
+        id_unidad_medida:
+          row?.id_unidad_medida === null || row?.id_unidad_medida === undefined
+            ? null
+            : Number(row.id_unidad_medida),
+        estado: Boolean(row.estado)
+      }
+    ])
+  );
 
   for (const idInsumo of insumosIds) {
     if (!insumosMap.has(idInsumo)) {
       return { ok: false, status: 400, message: `El insumo ${idInsumo} no existe.` };
     }
-    if (!insumosMap.get(idInsumo)) {
+    if (!insumosMap.get(idInsumo).estado) {
       return { ok: false, status: 409, message: `El insumo ${idInsumo} esta inactivo.` };
     }
   }
 
-  const unidadesResult = await client.query(
-    `
-      SELECT id_unidad_medida
-      FROM unidades_medida
-      WHERE id_unidad_medida = ANY($1::int[])
-    `,
-    [unidadesIds]
-  );
+  const unidadesResult = unidadesIds.length > 0
+    ? await client.query(
+      `
+        SELECT id_unidad_medida
+        FROM unidades_medida
+        WHERE id_unidad_medida = ANY($1::int[])
+      `,
+      [unidadesIds]
+    )
+    : { rows: [] };
   const unidadesSet = new Set(unidadesResult.rows.map((row) => Number(row.id_unidad_medida)));
 
   for (const idUnidad of unidadesIds) {
@@ -147,7 +204,99 @@ const validarDetalleRecetaFks = async (client, detalle) => {
     }
   }
 
-  return { ok: true };
+  const presentacionesResult = presentacionesIds.length > 0
+    ? await client.query(
+      `
+        SELECT
+          ip.id_presentacion,
+          ip.id_insumo,
+          ip.nombre_presentacion,
+          ip.cantidad_presentacion,
+          ip.id_unidad_presentacion,
+          up.nombre AS unidad_presentacion_nombre,
+          up.simbolo AS unidad_presentacion_simbolo,
+          ip.cantidad_base,
+          ip.id_unidad_base,
+          ub.nombre AS unidad_base_nombre,
+          ub.simbolo AS unidad_base_simbolo,
+          COALESCE(ip.uso_receta, false) AS uso_receta,
+          COALESCE(ip.es_predeterminada_receta, false) AS es_predeterminada_receta,
+          COALESCE(ip.estado, true) AS estado
+        FROM insumo_presentaciones ip
+        LEFT JOIN unidades_medida up
+          ON up.id_unidad_medida = ip.id_unidad_presentacion
+        LEFT JOIN unidades_medida ub
+          ON ub.id_unidad_medida = ip.id_unidad_base
+        WHERE ip.id_presentacion = ANY($1::bigint[])
+      `,
+      [presentacionesIds]
+    )
+    : { rows: [] };
+  const presentacionesMap = new Map(
+    presentacionesResult.rows.map((row) => [Number(row.id_presentacion), row])
+  );
+
+  const resolved = [];
+  for (const item of detalle) {
+    const insumo = insumosMap.get(item.id_insumo);
+    const lineLabel = formatDetalleLine(item.row_index, insumo?.nombre_insumo || `insumo ${item.id_insumo}`);
+
+    if (item.modo_unidad === 'base') {
+      resolved.push(item);
+      continue;
+    }
+
+    if (!hasPositiveInteger(insumo?.id_unidad_medida)) {
+      return { ok: false, status: 409, message: `El insumo de la ${lineLabel} no tiene unidad base definida.` };
+    }
+
+    const presentacion = presentacionesMap.get(item.id_presentacion_insumo);
+    if (!presentacion) {
+      return { ok: false, status: 400, message: `La presentacion de la ${lineLabel} no existe.` };
+    }
+
+    if (Number(presentacion.id_insumo) !== item.id_insumo) {
+      return { ok: false, status: 409, message: `La presentacion de la ${lineLabel} pertenece a otro insumo.` };
+    }
+    if (!Boolean(presentacion.estado)) {
+      return { ok: false, status: 409, message: `La presentacion de la ${lineLabel} esta inactiva. Elige una presentacion activa o la unidad base.` };
+    }
+    if (!Boolean(presentacion.uso_receta)) {
+      return { ok: false, status: 409, message: `La presentacion de la ${lineLabel} no esta habilitada para recetas.` };
+    }
+    if (Number(presentacion.id_unidad_base) !== Number(insumo.id_unidad_medida)) {
+      return { ok: false, status: 409, message: `La unidad base de la presentacion en la ${lineLabel} no coincide con la del insumo.` };
+    }
+    if (!hasPositiveInteger(presentacion.id_unidad_presentacion)) {
+      return { ok: false, status: 409, message: `La presentacion de la ${lineLabel} no tiene unidad de presentacion valida.` };
+    }
+
+    const cantidadConfig = parsePositiveNumber(presentacion.cantidad_presentacion);
+    const cantidadBase = parsePositiveNumber(presentacion.cantidad_base);
+    if (cantidadConfig === null || cantidadBase === null) {
+      return { ok: false, status: 409, message: `La presentacion de la ${lineLabel} tiene una conversion invalida.` };
+    }
+
+    const factorConversion = roundDecimal(cantidadBase / cantidadConfig, 6);
+    const cantidadCanonica = roundDecimal(item.cantidad_presentacion * factorConversion, 2);
+    if (cantidadCanonica <= 0) {
+      return {
+        ok: false,
+        status: 400,
+        message: `La conversion de la ${lineLabel} redondea a 0.00. Ingresa una cantidad mayor.`
+      };
+    }
+
+    resolved.push({
+      ...item,
+      id_unidad_medida: Number(insumo.id_unidad_medida),
+      cant: cantidadCanonica,
+      id_unidad_presentacion: Number(presentacion.id_unidad_presentacion),
+      factor_conversion_usado: factorConversion
+    });
+  }
+
+  return { ok: true, detalle: resolved };
 };
 
 const buildUnidadConflictoMessage = (nombreInsumo, idInsumo) => {
@@ -263,12 +412,130 @@ const reemplazarDetalleReceta = async (client, idReceta, detalle) => {
           id_insumo,
           cant,
           estado,
-          id_unidad_medida
-        ) VALUES ($1, $2, $3, true, $4)
+          id_unidad_medida,
+          cantidad_presentacion,
+          id_unidad_presentacion,
+          id_presentacion_insumo,
+          factor_conversion_usado
+        ) VALUES ($1, $2, $3, true, $4, $5, $6, $7, $8)
       `,
-      [idReceta, item.id_insumo, item.cant, item.id_unidad_medida]
+      [
+        idReceta,
+        item.id_insumo,
+        item.cant,
+        item.id_unidad_medida,
+        item.cantidad_presentacion,
+        item.id_unidad_presentacion,
+        item.id_presentacion_insumo,
+        item.factor_conversion_usado
+      ]
     );
   }
+};
+
+const buildDetalleRecetaSelect = () => `
+  SELECT
+    dr.id_detalle,
+    dr.id_receta,
+    dr.id_insumo,
+    i.nombre_insumo,
+    dr.cant,
+    dr.id_unidad_medida,
+    um.nombre AS unidad_nombre,
+    um.simbolo AS unidad_simbolo,
+    dr.id_presentacion_insumo,
+    dr.cantidad_presentacion,
+    dr.id_unidad_presentacion,
+    dr.factor_conversion_usado,
+    ip.nombre_presentacion,
+    up.nombre AS unidad_presentacion_nombre,
+    up.simbolo AS unidad_presentacion_simbolo,
+    COALESCE(ip.estado, true) AS presentacion_estado,
+    COALESCE(ip.uso_receta, false) AS presentacion_uso_receta,
+    dr.estado
+  FROM detalle_recetas dr
+  INNER JOIN insumos i
+    ON i.id_insumo = dr.id_insumo
+  LEFT JOIN unidades_medida um
+    ON um.id_unidad_medida = dr.id_unidad_medida
+  LEFT JOIN insumo_presentaciones ip
+    ON ip.id_presentacion = dr.id_presentacion_insumo
+  LEFT JOIN unidades_medida up
+    ON up.id_unidad_medida = dr.id_unidad_presentacion
+  WHERE dr.id_receta = $1
+    AND COALESCE(dr.estado, true) = true
+  ORDER BY i.nombre_insumo ASC, dr.id_detalle ASC
+`;
+
+const obtenerCatalogoInsumosRecetas = async (queryable = pool) => {
+  const result = await queryable.query(
+    `
+      SELECT
+        i.id_insumo,
+        i.nombre_insumo,
+        i.id_categoria_insumo,
+        ci.nombre_categoria,
+        i.id_almacen,
+        a.nombre AS nombre_almacen,
+        i.id_unidad_medida,
+        um.nombre AS unidad_nombre,
+        um.simbolo AS unidad_abreviatura,
+        um.simbolo AS unidad_simbolo,
+        i.cantidad,
+        i.stock_minimo
+      FROM insumos i
+      LEFT JOIN categorias_insumos ci
+        ON ci.id_categoria_insumo = i.id_categoria_insumo
+      LEFT JOIN almacenes a
+        ON a.id_almacen = i.id_almacen
+      LEFT JOIN unidades_medida um
+        ON um.id_unidad_medida = i.id_unidad_medida
+      WHERE COALESCE(i.estado, true) = true
+      ORDER BY ci.nombre_categoria ASC NULLS LAST, i.nombre_insumo ASC, a.nombre ASC NULLS LAST, i.id_insumo ASC
+    `
+  );
+  const insumos = result.rows || [];
+  const ids = insumos.map((row) => Number(row.id_insumo)).filter(esEnteroPositivo);
+  if (ids.length === 0) return insumos;
+
+  const presentacionesResult = await queryable.query(
+    `
+      SELECT
+        ip.id_presentacion,
+        ip.id_insumo,
+        ip.nombre_presentacion,
+        ip.cantidad_presentacion,
+        ip.id_unidad_presentacion,
+        up.nombre AS unidad_presentacion_nombre,
+        up.simbolo AS unidad_presentacion_simbolo,
+        ip.cantidad_base,
+        ip.id_unidad_base,
+        ub.nombre AS unidad_base_nombre,
+        ub.simbolo AS unidad_base_simbolo,
+        COALESCE(ip.es_predeterminada_receta, false) AS es_predeterminada_receta
+      FROM insumo_presentaciones ip
+      LEFT JOIN unidades_medida up
+        ON up.id_unidad_medida = ip.id_unidad_presentacion
+      LEFT JOIN unidades_medida ub
+        ON ub.id_unidad_medida = ip.id_unidad_base
+      WHERE ip.id_insumo = ANY($1::int[])
+        AND COALESCE(ip.estado, true) = true
+        AND COALESCE(ip.uso_receta, false) = true
+      ORDER BY ip.es_predeterminada_receta DESC, ip.nombre_presentacion ASC, ip.id_presentacion ASC
+    `,
+    [ids]
+  );
+  const presentacionesByInsumo = new Map();
+  for (const presentacion of presentacionesResult.rows || []) {
+    const key = Number(presentacion.id_insumo);
+    if (!presentacionesByInsumo.has(key)) presentacionesByInsumo.set(key, []);
+    presentacionesByInsumo.get(key).push(presentacion);
+  }
+
+  return insumos.map((insumo) => ({
+    ...insumo,
+    presentaciones_receta: presentacionesByInsumo.get(Number(insumo.id_insumo)) || []
+  }));
 };
 
 // GET: listar recetas.
@@ -321,34 +588,8 @@ router.get('/', checkPermission(MENU_RECETAS_VIEW_PERMISSIONS), async (req, res)
 // GET: catalogo de insumos activos para armar detalle de receta.
 router.get('/catalogos/insumos', checkPermission(MENU_RECETAS_VIEW_PERMISSIONS), async (req, res) => {
   try {
-    const result = await pool.query(
-      `
-        SELECT
-          i.id_insumo,
-          i.nombre_insumo,
-          i.id_categoria_insumo,
-          ci.nombre_categoria,
-          i.id_almacen,
-          a.nombre AS nombre_almacen,
-          i.id_unidad_medida,
-          um.nombre AS unidad_nombre,
-          um.simbolo AS unidad_abreviatura,
-          um.simbolo AS unidad_simbolo,
-          i.cantidad,
-          i.stock_minimo
-        FROM insumos i
-        LEFT JOIN categorias_insumos ci
-          ON ci.id_categoria_insumo = i.id_categoria_insumo
-        LEFT JOIN almacenes a
-          ON a.id_almacen = i.id_almacen
-        LEFT JOIN unidades_medida um
-          ON um.id_unidad_medida = i.id_unidad_medida
-        WHERE COALESCE(i.estado, true) = true
-        ORDER BY ci.nombre_categoria ASC NULLS LAST, i.nombre_insumo ASC, a.nombre ASC NULLS LAST, i.id_insumo ASC
-      `
-    );
-
-    return res.status(200).json(result.rows || []);
+    const insumos = await obtenerCatalogoInsumosRecetas(pool);
+    return res.status(200).json(insumos);
   } catch (err) {
     console.error('Error al obtener catalogo de insumos para recetas:', err.message);
     return res.status(500).json({ error: true, message: getSafeServerErrorMessage(err) });
@@ -368,29 +609,7 @@ router.get('/:id_receta/detalle', checkPermission(MENU_RECETAS_VIEW_PERMISSIONS)
       return res.status(404).json({ error: true, message: 'Receta no encontrada.' });
     }
 
-    const result = await pool.query(
-      `
-        SELECT
-          dr.id_detalle,
-          dr.id_receta,
-          dr.id_insumo,
-          i.nombre_insumo,
-          dr.cant,
-          dr.id_unidad_medida,
-          um.nombre AS unidad_nombre,
-          um.simbolo AS unidad_simbolo,
-          dr.estado
-        FROM detalle_recetas dr
-        INNER JOIN insumos i
-          ON i.id_insumo = dr.id_insumo
-        LEFT JOIN unidades_medida um
-          ON um.id_unidad_medida = dr.id_unidad_medida
-        WHERE dr.id_receta = $1
-          AND COALESCE(dr.estado, true) = true
-        ORDER BY i.nombre_insumo ASC, dr.id_detalle ASC
-      `,
-      [idReceta]
-    );
+    const result = await pool.query(buildDetalleRecetaSelect(), [idReceta]);
 
     return res.status(200).json(result.rows || []);
   } catch (err) {
@@ -412,56 +631,9 @@ router.get('/:id_receta/contexto-edicion', checkPermission(MENU_RECETAS_VIEW_PER
       return res.status(404).json({ error: true, message: 'Receta no encontrada.' });
     }
 
-    const [detalleResult, insumosCatalogResult] = await Promise.all([
-      pool.query(
-        `
-          SELECT
-            dr.id_detalle,
-            dr.id_receta,
-            dr.id_insumo,
-            i.nombre_insumo,
-            dr.cant,
-            dr.id_unidad_medida,
-            um.nombre AS unidad_nombre,
-            um.simbolo AS unidad_simbolo,
-            dr.estado
-          FROM detalle_recetas dr
-          INNER JOIN insumos i
-            ON i.id_insumo = dr.id_insumo
-          LEFT JOIN unidades_medida um
-            ON um.id_unidad_medida = dr.id_unidad_medida
-          WHERE dr.id_receta = $1
-            AND COALESCE(dr.estado, true) = true
-          ORDER BY i.nombre_insumo ASC, dr.id_detalle ASC
-        `,
-        [idReceta]
-      ),
-      pool.query(
-        `
-          SELECT
-            i.id_insumo,
-            i.nombre_insumo,
-            i.id_categoria_insumo,
-            ci.nombre_categoria,
-            i.id_almacen,
-            a.nombre AS nombre_almacen,
-            i.id_unidad_medida,
-            um.nombre AS unidad_nombre,
-            um.simbolo AS unidad_abreviatura,
-            um.simbolo AS unidad_simbolo,
-            i.cantidad,
-            i.stock_minimo
-          FROM insumos i
-          LEFT JOIN categorias_insumos ci
-            ON ci.id_categoria_insumo = i.id_categoria_insumo
-          LEFT JOIN almacenes a
-            ON a.id_almacen = i.id_almacen
-          LEFT JOIN unidades_medida um
-            ON um.id_unidad_medida = i.id_unidad_medida
-          WHERE COALESCE(i.estado, true) = true
-          ORDER BY ci.nombre_categoria ASC NULLS LAST, i.nombre_insumo ASC, a.nombre ASC NULLS LAST, i.id_insumo ASC
-        `
-      )
+    const [detalleResult, insumosCatalog] = await Promise.all([
+      pool.query(buildDetalleRecetaSelect(), [idReceta]),
+      obtenerCatalogoInsumosRecetas(pool)
     ]);
 
     return res.status(200).json({
@@ -471,7 +643,7 @@ router.get('/:id_receta/contexto-edicion', checkPermission(MENU_RECETAS_VIEW_PER
       },
       detalle_receta: detalleResult.rows || [],
       catalogos: {
-        insumos: insumosCatalogResult.rows || []
+        insumos: insumosCatalog || []
       }
     });
   } catch (err) {
@@ -504,9 +676,16 @@ router.put('/:id_receta/detalle', checkPermission(MENU_RECETAS_EDIT_PERMISSIONS)
     if (!fkValidation.ok) {
       return res.status(fkValidation.status).json({ error: true, message: fkValidation.message });
     }
+    const detalleResuelto = fkValidation.detalle;
 
     await client.query('BEGIN');
-    await reemplazarDetalleReceta(client, idReceta, normalized.detalle);
+    const unidadSyncValidation = await sincronizarUnidadesInsumosDesdeDetalle(client, detalleResuelto);
+    if (!unidadSyncValidation.ok) {
+      await client.query('ROLLBACK');
+      return res.status(unidadSyncValidation.status).json({ error: true, message: unidadSyncValidation.message });
+    }
+
+    await reemplazarDetalleReceta(client, idReceta, detalleResuelto);
     await client.query(
       `
         UPDATE recetas
@@ -574,6 +753,7 @@ router.post('/', checkPermission(MENU_RECETAS_CREATE_PERMISSIONS), async (req, r
     if (!fkDetalleValidation.ok) {
       return res.status(fkDetalleValidation.status).json({ error: true, message: fkDetalleValidation.message });
     }
+    const detalleResuelto = fkDetalleValidation.detalle;
 
     const payloadConActor = { ...(req.body || {}), id_usuario: actorUserId };
     delete payloadConActor.detalle_receta;
@@ -632,7 +812,7 @@ router.post('/', checkPermission(MENU_RECETAS_CREATE_PERMISSIONS), async (req, r
     );
 
     await client.query('BEGIN');
-    const unidadSyncValidation = await sincronizarUnidadesInsumosDesdeDetalle(client, detalleValidation.detalle);
+    const unidadSyncValidation = await sincronizarUnidadesInsumosDesdeDetalle(client, detalleResuelto);
     if (!unidadSyncValidation.ok) {
       await client.query('ROLLBACK');
       return res.status(unidadSyncValidation.status).json({ error: true, message: unidadSyncValidation.message });
@@ -657,7 +837,7 @@ router.post('/', checkPermission(MENU_RECETAS_CREATE_PERMISSIONS), async (req, r
       throw new Error('No se pudo resolver la receta creada para guardar su detalle.');
     }
 
-    await reemplazarDetalleReceta(client, idRecetaCreada, detalleValidation.detalle);
+    await reemplazarDetalleReceta(client, idRecetaCreada, detalleResuelto);
     await client.query('COMMIT');
 
     return res.status(201).json({
@@ -738,6 +918,7 @@ router.put('/:id_receta', checkPermission(MENU_RECETAS_EDIT_PERMISSIONS), async 
     if (!fkDetalleValidation.ok) {
       return res.status(fkDetalleValidation.status).json({ error: true, message: fkDetalleValidation.message });
     }
+    const detalleResuelto = fkDetalleValidation.detalle;
 
     const payloadConActor = { ...(req.body || {}), id_usuario: actorUserId };
     delete payloadConActor.detalle_receta;
@@ -782,7 +963,7 @@ router.put('/:id_receta', checkPermission(MENU_RECETAS_EDIT_PERMISSIONS), async 
     }
 
     await client.query('BEGIN');
-    const unidadSyncValidation = await sincronizarUnidadesInsumosDesdeDetalle(client, detalleValidation.detalle);
+    const unidadSyncValidation = await sincronizarUnidadesInsumosDesdeDetalle(client, detalleResuelto);
     if (!unidadSyncValidation.ok) {
       await client.query('ROLLBACK');
       return res.status(unidadSyncValidation.status).json({ error: true, message: unidadSyncValidation.message });
@@ -792,7 +973,7 @@ router.put('/:id_receta', checkPermission(MENU_RECETAS_EDIT_PERMISSIONS), async 
       await actualizarCampoReceta(client, idReceta, campo, datosNormalizados[campo]);
     }
 
-    await reemplazarDetalleReceta(client, idReceta, detalleValidation.detalle);
+    await reemplazarDetalleReceta(client, idReceta, detalleResuelto);
 
     // Se actualiza fecha_modificacion en cada PUT.
     await client.query(
