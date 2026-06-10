@@ -72,7 +72,7 @@ export const normalizeVentaItems = (items) => {
 
   const normalized = [];
 
-  for (const item of items) {
+  for (const [index, item] of items.entries()) {
     if (!isPlainObject(item)) {
       return { ok: false, message: 'Cada item debe ser un objeto valido.' };
     }
@@ -90,7 +90,7 @@ export const normalizeVentaItems = (items) => {
     if (!cantidad) {
       return {
         ok: false,
-        message: 'Cada item debe incluir cantidad entera mayor a 0.'
+        message: `La linea ${index + 1} debe incluir cantidad entera mayor a 0.`
       };
     }
 
