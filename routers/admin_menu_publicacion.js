@@ -475,7 +475,16 @@ const fetchBaseCatalogByMenu = async (idMenu, departmentIds, imageCapabilities =
         ON cp.id_categoria_producto = p.id_categoria_producto
       ${productImageJoin}
       WHERE COALESCE(cp.estado, true) = true
-        AND LOWER(REGEXP_REPLACE(TRIM(COALESCE(cp.nombre_categoria, '')), '\\s*/\\s*', '/', 'g')) = ANY($4::text[])
+        AND (
+          LOWER(REGEXP_REPLACE(TRIM(COALESCE(cp.nombre_categoria, '')), '\\s*/\\s*', '/', 'g')) = ANY($4::text[])
+          OR EXISTS (
+            SELECT 1
+            FROM detalle_menu dm_catalogo
+            WHERE dm_catalogo.id_menu = $1
+              AND dm_catalogo.id_producto = p.id_producto
+              AND COALESCE(dm_catalogo.estado, true) = true
+          )
+        )
 
       ORDER BY tipo_item, nombre_item ASC;
     `,
@@ -493,7 +502,7 @@ const fetchBaseCatalogByMenu = async (idMenu, departmentIds, imageCapabilities =
 const fetchDetalleRowsByMenu = async ({ idMenu, capabilities }) => {
   const selectIdReceta = capabilities.hasIdReceta ? 'dm.id_receta' : 'NULL::integer AS id_receta';
   const selectIdCombo = capabilities.hasIdCombo ? 'dm.id_combo' : 'NULL::integer AS id_combo';
-  const selectVisible = capabilities.hasVisible ? 'COALESCE(dm.visible, true)' : 'true AS visible';
+  const selectVisible = capabilities.hasVisible ? 'COALESCE(dm.visible, true) AS visible' : 'true AS visible';
   const selectPrecioPublico = capabilities.hasPrecioPublico ? 'dm.precio_publico' : 'NULL::numeric AS precio_publico';
   const selectOrden = capabilities.hasOrden ? 'dm.orden' : 'NULL::integer AS orden';
 
