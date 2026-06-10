@@ -737,73 +737,103 @@ const fetchDraftStateByType = async ({ idMenu, normalizedItems }) => {
   return resultMap;
 };
 
-const updateDetalleRow = async ({ client, rowId, item, capabilities }) => {
-  const updates = [];
-  const values = [];
-  let paramIndex = 1;
+// AM: Agrupa actualizaciones para evitar un round-trip SQL por cada item.
+const updateDetalleRowsBatch = async ({ client, entries, capabilities }) => {
+  if (!Array.isArray(entries) || entries.length === 0) return;
 
-  if (capabilities.hasVisible) {
-    updates.push(`visible = $${paramIndex++}`);
-    values.push(item.visible);
-    updates.push('estado = true');
-  } else {
-    updates.push(`estado = ${item.visible ? 'true' : 'false'}`);
-  }
+  const updates = capabilities.hasVisible
+    ? ['visible = input.visible', 'estado = true']
+    : ['estado = input.visible'];
 
   if (capabilities.hasPrecioPublico) {
-    updates.push(`precio_publico = $${paramIndex++}`);
-    values.push(item.precio_publico);
+    updates.push('precio_publico = input.precio_publico');
+  }
+  if (capabilities.hasOrden) {
+    updates.push('orden = COALESCE(input.orden, dm.orden)');
   }
 
-  if (capabilities.hasOrden && item.orden !== null) {
-    updates.push(`orden = $${paramIndex++}`);
-    values.push(item.orden);
-  }
+  const payload = entries.map(({ rowId, item }) => ({
+    id_detalle_menu: rowId,
+    visible: item.visible,
+    precio_publico: item.precio_publico,
+    orden: item.orden
+  }));
 
-  values.push(rowId);
   await client.query(
-    `UPDATE detalle_menu SET ${updates.join(', ')} WHERE id_detalle_menu = $${paramIndex};`,
-    values
+    `
+      WITH input AS (
+        SELECT *
+        FROM jsonb_to_recordset($1::jsonb) AS value(
+          id_detalle_menu integer,
+          visible boolean,
+          precio_publico numeric,
+          orden integer
+        )
+      )
+      UPDATE detalle_menu dm
+      SET ${updates.join(', ')}
+      FROM input
+      WHERE dm.id_detalle_menu = input.id_detalle_menu;
+    `,
+    [JSON.stringify(payload)]
   );
 };
 
-const insertDetalleRow = async ({ client, idMenu, item, capabilities }) => {
-  const columns = ['id_menu', 'estado'];
-  const values = [idMenu, true];
+// AM: Inserta publicaciones nuevas en una sola operacion SQL.
+const insertDetalleRowsBatch = async ({ client, idMenu, items, capabilities }) => {
+  if (!Array.isArray(items) || items.length === 0) return;
 
-  if (item.tipo_item === ITEM_TYPES.PRODUCTO) {
-    columns.push('id_producto');
-    values.push(item.id_item_origen);
-  } else if (item.tipo_item === ITEM_TYPES.RECETA && capabilities.hasIdReceta) {
+  const columns = ['id_menu', 'estado', 'id_producto'];
+  const selectValues = ['$2', 'true', 'input.id_producto'];
+
+  if (capabilities.hasIdReceta) {
     columns.push('id_receta');
-    values.push(item.id_item_origen);
-  } else if (item.tipo_item === ITEM_TYPES.COMBO && capabilities.hasIdCombo) {
-    columns.push('id_combo');
-    values.push(item.id_item_origen);
-  } else {
-    throw new Error(`No se puede publicar ${item.tipo_item}: la columna no existe en detalle_menu.`);
+    selectValues.push('input.id_receta');
   }
-
+  if (capabilities.hasIdCombo) {
+    columns.push('id_combo');
+    selectValues.push('input.id_combo');
+  }
   if (capabilities.hasVisible) {
     columns.push('visible');
-    values.push(item.visible);
+    selectValues.push('input.visible');
   }
   if (capabilities.hasPrecioPublico) {
     columns.push('precio_publico');
-    values.push(item.precio_publico);
+    selectValues.push('input.precio_publico');
   }
-  if (capabilities.hasOrden && item.orden !== null) {
+  if (capabilities.hasOrden) {
     columns.push('orden');
-    values.push(item.orden);
+    selectValues.push('input.orden');
   }
 
-  const placeholders = values.map((_, idx) => `$${idx + 1}`);
+  const payload = items.map((item) => ({
+    id_producto: item.tipo_item === ITEM_TYPES.PRODUCTO ? item.id_item_origen : null,
+    id_receta: item.tipo_item === ITEM_TYPES.RECETA ? item.id_item_origen : null,
+    id_combo: item.tipo_item === ITEM_TYPES.COMBO ? item.id_item_origen : null,
+    visible: item.visible,
+    precio_publico: item.precio_publico,
+    orden: item.orden
+  }));
+
   await client.query(
     `
+      WITH input AS (
+        SELECT *
+        FROM jsonb_to_recordset($1::jsonb) AS value(
+          id_producto integer,
+          id_receta integer,
+          id_combo integer,
+          visible boolean,
+          precio_publico numeric,
+          orden integer
+        )
+      )
       INSERT INTO detalle_menu (${columns.join(', ')})
-      VALUES (${placeholders.join(', ')});
+      SELECT ${selectValues.join(', ')}
+      FROM input;
     `,
-    values
+    [JSON.stringify(payload), idMenu]
   );
 };
 
@@ -1417,6 +1447,9 @@ router.put('/catalogo', checkPermission(MENU_PUBLICACION_SAVE_PERMISSIONS), asyn
 
     await client.query('BEGIN');
 
+    const existingUpdates = [];
+    const newItems = [];
+
     for (const item of normalized.data) {
       const existingRows = detailRowsByKey.get(item.key) || [];
       const existing = existingRows[0] || null;
@@ -1425,21 +1458,26 @@ router.put('/catalogo', checkPermission(MENU_PUBLICACION_SAVE_PERMISSIONS), asyn
       if (!existing && !item.visible) continue;
 
       if (existing) {
-        await updateDetalleRow({
-          client,
+        existingUpdates.push({
           rowId: Number(existing.id_detalle_menu),
-          item,
-          capabilities
+          item
         });
       } else {
-        await insertDetalleRow({
-          client,
-          idMenu: targetMenuId,
-          item,
-          capabilities
-        });
+        newItems.push(item);
       }
     }
+
+    await updateDetalleRowsBatch({
+      client,
+      entries: existingUpdates,
+      capabilities
+    });
+    await insertDetalleRowsBatch({
+      client,
+      idMenu: targetMenuId,
+      items: newItems,
+      capabilities
+    });
 
     const visibleCount = await getVisibleCountByMenu({
       idMenu: targetMenuId,
@@ -1462,6 +1500,7 @@ router.put('/catalogo', checkPermission(MENU_PUBLICACION_SAVE_PERMISSIONS), asyn
       message: 'Publicacion guardada correctamente.',
       data: {
         visible_count: visibleCount,
+        applied_count: existingUpdates.length + newItems.length,
         warnings,
         shared_menu_impact: sharedMenuImpact,
         applied_scope: sharedMenuImpact.is_shared

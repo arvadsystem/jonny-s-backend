@@ -577,17 +577,19 @@ const resolveComposedAvailability = ({ row, recipeAvailabilityMap, comboAvailabi
   return buildAvailabilityPayload({ available: false, reasonCode: 'ITEM_INACTIVO' });
 };
 
-// Regla oficial de precio final: precio_publico ?? precio_base.
+// AM: Regla oficial de precio final: override valido o precio base.
 const resolvePricePayload = (row) => {
-  const publicPrice = toNumberOrNull(row.precio_publico);
-  const basePrice = toNumberOrNull(row.precio_base);
+  const rawPublicPrice = toNumberOrNull(row.precio_publico);
+  const rawBasePrice = toNumberOrNull(row.precio_base);
+  const publicPrice = rawPublicPrice !== null && rawPublicPrice >= 0 ? rawPublicPrice : null;
+  const basePrice = rawBasePrice !== null && rawBasePrice >= 0 ? rawBasePrice : null;
   const finalPrice = publicPrice ?? basePrice;
 
   return {
     base: basePrice,
     public: publicPrice,
     final: finalPrice,
-    hasValidPrice: finalPrice !== null
+    hasValidPrice: finalPrice !== null && finalPrice >= 0
   };
 };
 
