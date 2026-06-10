@@ -124,6 +124,13 @@ const normalizeDetalleRecetaPayload = (detalle) => {
     if (cantidad === null) {
       return { ok: false, message: `Cantidad invalida en linea ${index + 1}.` };
     }
+    const cantidadRedondeada = roundDecimal(cantidad, 2);
+    if (cantidadRedondeada <= 0) {
+      return {
+        ok: false,
+        message: `La cantidad de la linea ${index + 1} redondea a 0.00. Ingresa una cantidad mayor.`
+      };
+    }
 
     seenInsumos.add(idInsumo);
     normalized.push({
@@ -131,7 +138,7 @@ const normalizeDetalleRecetaPayload = (detalle) => {
       id_insumo: idInsumo,
       modo_unidad: 'base',
       id_unidad_medida: idUnidadMedida,
-      cant: roundDecimal(cantidad, 2),
+      cant: cantidadRedondeada,
       id_presentacion_insumo: null,
       cantidad_presentacion: null,
       id_unidad_presentacion: null,
