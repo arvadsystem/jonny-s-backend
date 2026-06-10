@@ -67,41 +67,49 @@ BEGIN
       NOT VALID;
   END IF;
 
-  IF NOT EXISTS (
-    SELECT 1 FROM pg_constraint WHERE conname = 'chk_detalle_orden_compras_cantidad_positiva' AND conrelid = 'public.detalle_orden_compras'::regclass
-  ) THEN
-    ALTER TABLE public.detalle_orden_compras
-      ADD CONSTRAINT chk_detalle_orden_compras_cantidad_positiva
-      CHECK (cantidad_orden > 0)
-      NOT VALID;
-  END IF;
-
-  IF NOT EXISTS (
+  IF EXISTS (
     SELECT 1 FROM pg_constraint WHERE conname = 'chk_detalle_orden_compras_presentacion_consistente' AND conrelid = 'public.detalle_orden_compras'::regclass
   ) THEN
     ALTER TABLE public.detalle_orden_compras
-      ADD CONSTRAINT chk_detalle_orden_compras_presentacion_consistente
-      CHECK (
-        (
-          id_presentacion_insumo IS NULL
-          AND cantidad_presentacion IS NULL
-          AND id_unidad_presentacion IS NULL
-          AND factor_conversion_usado IS NULL
-        )
-        OR
-        (
-          id_presentacion_insumo IS NOT NULL
-          AND cantidad_presentacion > 0
-          AND id_unidad_presentacion IS NOT NULL
-          AND factor_conversion_usado > 0
-          AND id_insumo IS NOT NULL
-          AND id_producto IS NULL
-          AND id_unidad_base IS NOT NULL
+      DROP CONSTRAINT chk_detalle_orden_compras_presentacion_consistente;
+  END IF;
+
+  ALTER TABLE public.detalle_orden_compras
+    ADD CONSTRAINT chk_detalle_orden_compras_presentacion_consistente
+    CHECK (
+      (
+        id_presentacion_insumo IS NULL
+        AND cantidad_presentacion IS NULL
+        AND id_unidad_presentacion IS NULL
+        AND factor_conversion_usado IS NULL
+        AND (
+          id_unidad_base IS NULL
+          OR (
+            id_insumo IS NOT NULL
+            AND id_producto IS NULL
+          )
         )
       )
-      NOT VALID;
-  END IF;
+      OR
+      (
+        id_presentacion_insumo IS NOT NULL
+        AND cantidad_presentacion IS NOT NULL
+        AND cantidad_presentacion > 0
+        AND id_unidad_presentacion IS NOT NULL
+        AND factor_conversion_usado IS NOT NULL
+        AND factor_conversion_usado > 0
+        AND id_insumo IS NOT NULL
+        AND id_producto IS NULL
+        AND id_unidad_base IS NOT NULL
+      )
+    )
+    NOT VALID;
 END $$;
+
+ALTER TABLE public.detalle_orden_compras VALIDATE CONSTRAINT fk_detalle_orden_compras_unidad_base;
+ALTER TABLE public.detalle_orden_compras VALIDATE CONSTRAINT fk_detalle_orden_compras_presentacion_insumo;
+ALTER TABLE public.detalle_orden_compras VALIDATE CONSTRAINT fk_detalle_orden_compras_unidad_presentacion;
+ALTER TABLE public.detalle_orden_compras VALIDATE CONSTRAINT chk_detalle_orden_compras_presentacion_consistente;
 
 CREATE INDEX IF NOT EXISTS idx_detalle_orden_compras_presentacion_insumo
   ON public.detalle_orden_compras (id_presentacion_insumo)
@@ -184,41 +192,49 @@ BEGIN
       NOT VALID;
   END IF;
 
-  IF NOT EXISTS (
-    SELECT 1 FROM pg_constraint WHERE conname = 'chk_detalle_compras_cantidad_positiva' AND conrelid = 'public.detalle_compras'::regclass
-  ) THEN
-    ALTER TABLE public.detalle_compras
-      ADD CONSTRAINT chk_detalle_compras_cantidad_positiva
-      CHECK (cantidad > 0)
-      NOT VALID;
-  END IF;
-
-  IF NOT EXISTS (
+  IF EXISTS (
     SELECT 1 FROM pg_constraint WHERE conname = 'chk_detalle_compras_presentacion_consistente' AND conrelid = 'public.detalle_compras'::regclass
   ) THEN
     ALTER TABLE public.detalle_compras
-      ADD CONSTRAINT chk_detalle_compras_presentacion_consistente
-      CHECK (
-        (
-          id_presentacion_insumo IS NULL
-          AND cantidad_presentacion IS NULL
-          AND id_unidad_presentacion IS NULL
-          AND factor_conversion_usado IS NULL
-        )
-        OR
-        (
-          id_presentacion_insumo IS NOT NULL
-          AND cantidad_presentacion > 0
-          AND id_unidad_presentacion IS NOT NULL
-          AND factor_conversion_usado > 0
-          AND id_insumo IS NOT NULL
-          AND id_producto IS NULL
-          AND id_unidad_base IS NOT NULL
+      DROP CONSTRAINT chk_detalle_compras_presentacion_consistente;
+  END IF;
+
+  ALTER TABLE public.detalle_compras
+    ADD CONSTRAINT chk_detalle_compras_presentacion_consistente
+    CHECK (
+      (
+        id_presentacion_insumo IS NULL
+        AND cantidad_presentacion IS NULL
+        AND id_unidad_presentacion IS NULL
+        AND factor_conversion_usado IS NULL
+        AND (
+          id_unidad_base IS NULL
+          OR (
+            id_insumo IS NOT NULL
+            AND id_producto IS NULL
+          )
         )
       )
-      NOT VALID;
-  END IF;
+      OR
+      (
+        id_presentacion_insumo IS NOT NULL
+        AND cantidad_presentacion IS NOT NULL
+        AND cantidad_presentacion > 0
+        AND id_unidad_presentacion IS NOT NULL
+        AND factor_conversion_usado IS NOT NULL
+        AND factor_conversion_usado > 0
+        AND id_insumo IS NOT NULL
+        AND id_producto IS NULL
+        AND id_unidad_base IS NOT NULL
+      )
+    )
+    NOT VALID;
 END $$;
+
+ALTER TABLE public.detalle_compras VALIDATE CONSTRAINT fk_detalle_compras_unidad_base;
+ALTER TABLE public.detalle_compras VALIDATE CONSTRAINT fk_detalle_compras_presentacion_insumo;
+ALTER TABLE public.detalle_compras VALIDATE CONSTRAINT fk_detalle_compras_unidad_presentacion;
+ALTER TABLE public.detalle_compras VALIDATE CONSTRAINT chk_detalle_compras_presentacion_consistente;
 
 CREATE INDEX IF NOT EXISTS idx_detalle_compras_presentacion_insumo
   ON public.detalle_compras (id_presentacion_insumo)
