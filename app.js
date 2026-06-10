@@ -62,6 +62,7 @@ import adminExtrasRouter from './routers/admin_extras.js';
 import adminCombosRouter from './routers/admin_combos.js';
 import adminMenuPublicacionRouter from './routers/admin_menu_publicacion.js';
 import adminSalsasRouter from './routers/admin_salsas.js';
+import adminInsumoPresentacionesRouter from './routers/admin_insumo_presentaciones/index.js';
 import cajasRoutes from './routers/cajas.js';
 import fidelizacionRoutes from './routers/fidelizacion.js';
 import reportesRoutes from './routers/reportes.js';
@@ -208,6 +209,8 @@ app.use('/api/admin/combos', adminCombosRouter);
 app.use('/api/admin/menu-publicacion', adminMenuPublicacionRouter);
 // Admin: catalogo/configuracion de salsas para recetas y combos.
 app.use('/api/admin/salsas', adminSalsasRouter);
+// Admin: presentaciones/conversiones por insumo.
+app.use('/api/admin/insumos', adminInsumoPresentacionesRouter);
 
 // ✅ 4) Rutas protegidas
 app.use('/seguridad', seguridadSesionesRoutes);
