@@ -1,4 +1,5 @@
 import { toPositiveInt } from './pedidoPayloadValidator.js';
+import { isCatalogoMaestroReadsEnabled } from './catalogoMaestroReadService.js';
 
 // Validador de stock + concurrencia (locks FOR UPDATE).
 // -----------------------------------------------------
@@ -99,6 +100,158 @@ const fetchInsumosByIdsForUpdate = async (client, ids) => {
   return rs.rows;
 };
 
+const fetchInsumosMaestrosByIdsForUpdate = async (client, ids, idSucursal) => {
+  if (!ids.length) {
+    return {
+      rows: [],
+      missingIds: new Set(),
+      inactiveIds: new Set(),
+      unassignedIds: new Set(),
+      ambiguousIds: new Set(),
+      mastersById: new Map()
+    };
+  }
+
+  const mastersResult = await client.query(
+    `
+      SELECT
+        i.id_insumo,
+        i.nombre_insumo,
+        COALESCE(i.estado, true) AS estado
+      FROM public.insumos i
+      WHERE i.id_insumo = ANY($1::int[])
+      ORDER BY i.id_insumo
+    `,
+    [ids]
+  );
+  const mastersById = mapById(mastersResult.rows, 'id_insumo');
+  const missingIds = new Set();
+  const inactiveIds = new Set();
+  const activeMasterIds = [];
+
+  for (const id of ids) {
+    const master = mastersById.get(id);
+    if (!master) {
+      missingIds.add(id);
+      continue;
+    }
+    if (!Boolean(master.estado)) {
+      inactiveIds.add(id);
+      continue;
+    }
+    activeMasterIds.push(id);
+  }
+
+  if (!activeMasterIds.length) {
+    return {
+      rows: [],
+      missingIds,
+      inactiveIds,
+      unassignedIds: new Set(),
+      ambiguousIds: new Set(),
+      mastersById
+    };
+  }
+
+  const assignmentsResult = await client.query(
+    `
+      SELECT
+        mm.id_insumo_maestro,
+        COUNT(*)::int AS total_asignaciones
+      FROM public.insumos_mapeo_maestro mm
+      INNER JOIN public.almacenes a
+        ON a.id_almacen = mm.id_almacen_origen
+       AND a.id_sucursal = $2
+       AND COALESCE(a.estado, true) = true
+      INNER JOIN public.insumos_almacenes ia
+        ON ia.id_insumo = mm.id_insumo_maestro
+       AND ia.id_almacen = mm.id_almacen_origen
+       AND COALESCE(ia.estado, true) = true
+      WHERE mm.id_insumo_maestro = ANY($1::int[])
+      GROUP BY mm.id_insumo_maestro
+    `,
+    [activeMasterIds, idSucursal]
+  );
+  const assignmentCountsById = new Map(
+    (assignmentsResult.rows || []).map((row) => [
+      Number(row.id_insumo_maestro),
+      Number(row.total_asignaciones || 0)
+    ])
+  );
+  const unassignedIds = new Set();
+  const ambiguousIds = new Set();
+  const uniqueMasterIds = [];
+
+  for (const id of activeMasterIds) {
+    const count = assignmentCountsById.get(id) || 0;
+    if (count === 0) {
+      unassignedIds.add(id);
+      continue;
+    }
+    if (count > 1) {
+      ambiguousIds.add(id);
+      continue;
+    }
+    uniqueMasterIds.push(id);
+  }
+
+  if (!uniqueMasterIds.length) {
+    return {
+      rows: [],
+      missingIds,
+      inactiveIds,
+      unassignedIds,
+      ambiguousIds,
+      mastersById
+    };
+  }
+
+  const localRowsResult = await client.query(
+    `
+      SELECT
+        mm.id_insumo_maestro AS id_insumo,
+        mm.id_insumo_maestro,
+        mm.id_insumo_legacy AS id_insumo_legacy_local,
+        i.nombre_insumo,
+        COALESCE(ia.cantidad, 0)::numeric AS cantidad,
+        COALESCE(ia.stock_minimo, 0)::numeric AS stock_minimo,
+        ia.id_almacen,
+        a.id_sucursal,
+        COALESCE(ia.estado, true) AS estado
+      FROM public.insumos_mapeo_maestro mm
+      INNER JOIN public.almacenes a
+        ON a.id_almacen = mm.id_almacen_origen
+       AND a.id_sucursal = $2
+       AND COALESCE(a.estado, true) = true
+      INNER JOIN public.insumos_almacenes ia
+        ON ia.id_insumo = mm.id_insumo_maestro
+       AND ia.id_almacen = mm.id_almacen_origen
+       AND COALESCE(ia.estado, true) = true
+      INNER JOIN public.insumos i
+        ON i.id_insumo = mm.id_insumo_maestro
+      WHERE mm.id_insumo_maestro = ANY($1::int[])
+      ORDER BY mm.id_insumo_maestro
+      FOR UPDATE OF ia
+    `,
+    [uniqueMasterIds, idSucursal]
+  );
+  const lockedMasterIds = new Set(
+    (localRowsResult.rows || []).map((row) => Number(row.id_insumo_maestro || 0)).filter((id) => id > 0)
+  );
+  for (const id of uniqueMasterIds) {
+    if (!lockedMasterIds.has(id)) unassignedIds.add(id);
+  }
+
+  return {
+    rows: localRowsResult.rows || [],
+    missingIds,
+    inactiveIds,
+    unassignedIds,
+    ambiguousIds,
+    mastersById
+  };
+};
+
 const fetchAlmacenesByIds = async (client, ids) => {
   if (!ids.length) return [];
   const rs = await client.query(
@@ -129,11 +282,15 @@ export const validarStockConBloqueo = async ({
 
   const productoIds = [...productoQtyMap.keys()].sort((a, b) => a - b);
   const insumoIds = [...insumoQtyMap.keys()].sort((a, b) => a - b);
+  const useCatalogoMaestroInsumos = isCatalogoMaestroReadsEnabled();
 
-  const [productosRows, insumosRows] = await Promise.all([
+  const [productosRows, insumosFetchResult] = await Promise.all([
     fetchProductosByIdsForUpdate(client, productoIds),
-    fetchInsumosByIdsForUpdate(client, insumoIds)
+    useCatalogoMaestroInsumos
+      ? fetchInsumosMaestrosByIdsForUpdate(client, insumoIds, idSucursal)
+      : fetchInsumosByIdsForUpdate(client, insumoIds)
   ]);
+  const insumosRows = useCatalogoMaestroInsumos ? insumosFetchResult.rows : insumosFetchResult;
 
   const productosById = mapById(productosRows, 'id_producto');
   const insumosById = mapById(insumosRows, 'id_insumo');
@@ -176,6 +333,57 @@ export const validarStockConBloqueo = async ({
   }
 
   for (const idInsumo of insumoIds) {
+    if (useCatalogoMaestroInsumos) {
+      const master = insumosFetchResult.mastersById?.get(idInsumo);
+      if (insumosFetchResult.missingIds?.has(idInsumo)) {
+        excludedInsumoIds.add(idInsumo);
+        faltantes.push({
+          tipo_recurso: 'insumo',
+          id_recurso: idInsumo,
+          id_insumo: idInsumo,
+          motivo: 'INSUMO_NO_ENCONTRADO',
+          mensaje: `El insumo ${idInsumo} no existe o no esta disponible para inventario.`
+        });
+        continue;
+      }
+      if (insumosFetchResult.inactiveIds?.has(idInsumo)) {
+        excludedInsumoIds.add(idInsumo);
+        faltantes.push({
+          tipo_recurso: 'insumo',
+          id_recurso: idInsumo,
+          id_insumo: idInsumo,
+          nombre: master?.nombre_insumo,
+          motivo: 'INSUMO_INACTIVO',
+          mensaje: `El insumo ${master?.nombre_insumo || idInsumo} esta inactivo.`
+        });
+        continue;
+      }
+      if (insumosFetchResult.unassignedIds?.has(idInsumo)) {
+        excludedInsumoIds.add(idInsumo);
+        faltantes.push({
+          tipo_recurso: 'insumo',
+          id_recurso: idInsumo,
+          id_insumo: idInsumo,
+          nombre: master?.nombre_insumo,
+          motivo: 'INSUMO_MAESTRO_SIN_ASIGNACION_SUCURSAL',
+          mensaje: 'El insumo maestro no tiene una asignacion activa en la sucursal del pedido.'
+        });
+        continue;
+      }
+      if (insumosFetchResult.ambiguousIds?.has(idInsumo)) {
+        excludedInsumoIds.add(idInsumo);
+        faltantes.push({
+          tipo_recurso: 'insumo',
+          id_recurso: idInsumo,
+          id_insumo: idInsumo,
+          nombre: master?.nombre_insumo,
+          motivo: 'INSUMO_MAESTRO_ASIGNACION_AMBIGUA',
+          mensaje: 'El insumo maestro tiene mas de una asignacion activa en la sucursal.'
+        });
+        continue;
+      }
+    }
+
     const row = insumosById.get(idInsumo);
     if (!row) {
       excludedInsumoIds.add(idInsumo);
