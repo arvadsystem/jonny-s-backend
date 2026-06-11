@@ -2,6 +2,7 @@
 import pool from '../config/db-connection.js';
 import { checkPermission } from '../middleware/checkPermission.js';
 import { resolveMenuDepartmentIds } from './menu_departamentos.js';
+import { syncExistingBranchProductsIntoMenu } from '../services/menuAutoPublicationService.js';
 import {
   getPublicMenuHeroCarouselConfig,
   savePublicMenuHeroCarouselConfig
@@ -408,7 +409,7 @@ const resolveSharedMenuImpact = async ({ idMenu, idSucursal }) => {
   });
 };
 
-const fetchBaseCatalogByMenu = async (idMenu, departmentIds, imageCapabilities = {}) => {
+const fetchBaseCatalogByMenu = async (idMenu, idSucursal, departmentIds, imageCapabilities = {}) => {
   const recipeExcludedDepartmentIds = Array.isArray(departmentIds?.recipeExcludedDepartmentIds)
     ? departmentIds.recipeExcludedDepartmentIds
     : [];
@@ -473,8 +474,11 @@ const fetchBaseCatalogByMenu = async (idMenu, departmentIds, imageCapabilities =
       FROM productos p
       LEFT JOIN categorias_productos cp
         ON cp.id_categoria_producto = p.id_categoria_producto
+      LEFT JOIN almacenes ap
+        ON ap.id_almacen = p.id_almacen
       ${productImageJoin}
       WHERE COALESCE(cp.estado, true) = true
+        AND ap.id_sucursal = $5
         AND (
           LOWER(REGEXP_REPLACE(TRIM(COALESCE(cp.nombre_categoria, '')), '\\s*/\\s*', '/', 'g')) = ANY($4::text[])
           OR EXISTS (
@@ -492,14 +496,15 @@ const fetchBaseCatalogByMenu = async (idMenu, departmentIds, imageCapabilities =
       idMenu,
       recipeExcludedDepartmentIds,
       comboDepartmentId,
-      productCategoryAliases
+      productCategoryAliases,
+      idSucursal
     ]
   );
 
   return result.rows || [];
 };
 
-const fetchDetalleRowsByMenu = async ({ idMenu, capabilities }) => {
+const fetchDetalleRowsByMenu = async ({ idMenu, idSucursal, capabilities }) => {
   const selectIdReceta = capabilities.hasIdReceta ? 'dm.id_receta' : 'NULL::integer AS id_receta';
   const selectIdCombo = capabilities.hasIdCombo ? 'dm.id_combo' : 'NULL::integer AS id_combo';
   const selectVisible = capabilities.hasVisible ? 'COALESCE(dm.visible, true) AS visible' : 'true AS visible';
@@ -519,11 +524,19 @@ const fetchDetalleRowsByMenu = async ({ idMenu, capabilities }) => {
         ${selectOrden},
         COALESCE(dm.estado, true) AS estado
       FROM detalle_menu dm
+      LEFT JOIN productos p
+        ON p.id_producto = dm.id_producto
+      LEFT JOIN almacenes ap
+        ON ap.id_almacen = p.id_almacen
       WHERE dm.id_menu = $1
         AND COALESCE(dm.estado, true) = true
+        AND (
+          dm.id_producto IS NULL
+          OR ap.id_sucursal = $2
+        )
       ORDER BY dm.id_detalle_menu ASC;
     `,
-    [idMenu]
+    [idMenu, idSucursal]
   );
 
   return result.rows || [];
@@ -677,7 +690,7 @@ const normalizeDraftItems = (items) => {
   return { ok: true, data: normalized };
 };
 
-const fetchDraftStateByType = async ({ idMenu, normalizedItems }) => {
+const fetchDraftStateByType = async ({ idMenu, idSucursal, normalizedItems }) => {
   const recipeIds = [];
   const comboIds = [];
   const productIds = [];
@@ -729,11 +742,17 @@ const fetchDraftStateByType = async ({ idMenu, normalizedItems }) => {
   if (productIds.length > 0) {
     const result = await pool.query(
       `
-        SELECT id_producto AS id_item_origen, COALESCE(estado, true) AS estado_item, precio
-        FROM productos
-        WHERE id_producto = ANY($1::int[]);
+        SELECT
+          p.id_producto AS id_item_origen,
+          COALESCE(p.estado, true) AS estado_item,
+          p.precio
+        FROM productos p
+        INNER JOIN almacenes ap
+          ON ap.id_almacen = p.id_almacen
+        WHERE p.id_producto = ANY($1::int[])
+          AND ap.id_sucursal = $2;
       `,
-      [[...new Set(productIds)]]
+      [[...new Set(productIds)], idSucursal]
     );
     for (const row of result.rows || []) {
       resultMap.set(buildItemKey(ITEM_TYPES.PRODUCTO, Number(row.id_item_origen)), {
@@ -744,6 +763,34 @@ const fetchDraftStateByType = async ({ idMenu, normalizedItems }) => {
   }
 
   return resultMap;
+};
+
+const fetchCrossBranchDetalleRowsByMenu = async ({ idMenu, idSucursal }) => {
+  const safeMenuId = toPositiveInt(idMenu);
+  const safeSucursalId = toPositiveInt(idSucursal);
+  if (!safeMenuId || !safeSucursalId) return [];
+
+  const result = await pool.query(
+    `
+      SELECT
+        dm.id_detalle_menu,
+        dm.id_producto,
+        p.nombre_producto,
+        ap.id_sucursal AS id_sucursal_producto
+      FROM detalle_menu dm
+      INNER JOIN productos p
+        ON p.id_producto = dm.id_producto
+      INNER JOIN almacenes ap
+        ON ap.id_almacen = p.id_almacen
+      WHERE dm.id_menu = $1
+        AND COALESCE(dm.estado, true) = true
+        AND ap.id_sucursal <> $2
+      ORDER BY dm.id_detalle_menu ASC;
+    `,
+    [safeMenuId, safeSucursalId]
+  );
+
+  return result.rows || [];
 };
 
 // AM: Agrupa actualizaciones para evitar un round-trip SQL por cada item.
@@ -846,17 +893,25 @@ const insertDetalleRowsBatch = async ({ client, idMenu, items, capabilities }) =
   );
 };
 
-const getVisibleCountByMenu = async ({ idMenu, capabilities, client }) => {
+const getVisibleCountByMenu = async ({ idMenu, idSucursal, capabilities, client }) => {
   const countVisibleExpr = capabilities.hasVisible ? 'AND COALESCE(visible, true) = true' : '';
   const result = await client.query(
     `
       SELECT COUNT(*)::int AS total
-      FROM detalle_menu
-      WHERE id_menu = $1
-        AND COALESCE(estado, true) = true
+      FROM detalle_menu dm
+      LEFT JOIN productos p
+        ON p.id_producto = dm.id_producto
+      LEFT JOIN almacenes ap
+        ON ap.id_almacen = p.id_almacen
+      WHERE dm.id_menu = $1
+        AND COALESCE(dm.estado, true) = true
+        AND (
+          dm.id_producto IS NULL
+          OR ap.id_sucursal = $2
+        )
         ${countVisibleExpr};
     `,
-    [idMenu]
+    [idMenu, idSucursal]
   );
   return Number(result.rows?.[0]?.total || 0);
 };
@@ -1126,6 +1181,12 @@ router.post('/programacion', checkPermission(MENU_PUBLICACION_SAVE_PERMISSIONS),
       );
     }
 
+    const seededProductsCount = await syncExistingBranchProductsIntoMenu({
+      client,
+      idSucursal,
+      idMenu: Number(inserted.id_menu)
+    });
+
     await client.query('COMMIT');
 
     const activeMenu = await getActiveMenuByBranch(idSucursal);
@@ -1134,6 +1195,11 @@ router.post('/programacion', checkPermission(MENU_PUBLICACION_SAVE_PERMISSIONS),
       idSucursal
     });
     const warnings = [];
+    if (seededProductsCount > 0) {
+      warnings.push(
+        `Se agregaron ${seededProductsCount} productos existentes de la sucursal al menu para mantener el aislamiento publico.`
+      );
+    }
     if (sharedMenuImpact.is_shared) {
       warnings.push(sharedMenuImpact.warning_message);
     }
@@ -1151,6 +1217,7 @@ router.post('/programacion', checkPermission(MENU_PUBLICACION_SAVE_PERMISSIONS),
         },
         menu_activo_actual: activeMenu ? mapMenuSummary(activeMenu) : null,
         shared_menu_impact: sharedMenuImpact,
+        seeded_products_count: seededProductsCount,
         warnings
       }
     });
@@ -1228,10 +1295,11 @@ router.get('/catalogo', checkPermission(MENU_PUBLICACION_VIEW_PERMISSIONS), asyn
     }
 
     const targetMenuId = Number(resolvedMenu.id_menu);
-    const [baseRows, detailRows, sharedMenuImpact] = await Promise.all([
-      fetchBaseCatalogByMenu(targetMenuId, departmentIds, imageCapabilities),
-      fetchDetalleRowsByMenu({ idMenu: targetMenuId, capabilities }),
-      resolveSharedMenuImpact({ idMenu: targetMenuId, idSucursal })
+    const [baseRows, detailRows, sharedMenuImpact, crossBranchRows] = await Promise.all([
+      fetchBaseCatalogByMenu(targetMenuId, idSucursal, departmentIds, imageCapabilities),
+      fetchDetalleRowsByMenu({ idMenu: targetMenuId, idSucursal, capabilities }),
+      resolveSharedMenuImpact({ idMenu: targetMenuId, idSucursal }),
+      fetchCrossBranchDetalleRowsByMenu({ idMenu: targetMenuId, idSucursal })
     ]);
 
     const detailRowsByKey = buildDetailRowsByKey(detailRows);
@@ -1239,6 +1307,11 @@ router.get('/catalogo', checkPermission(MENU_PUBLICACION_VIEW_PERMISSIONS), asyn
 
     if (mapped.duplicateKeys.length > 0) {
       warnings.push(`Existen duplicados en detalle_menu: ${mapped.duplicateKeys.join(', ')}`);
+    }
+    if (crossBranchRows.length > 0) {
+      warnings.push(
+        `Se detectaron ${crossBranchRows.length} publicaciones cruzadas de productos fuera de la sucursal seleccionada. Limpia detalle_menu para evitar contaminacion historica.`
+      );
     }
     if (sharedMenuImpact.is_shared) {
       warnings.push(sharedMenuImpact.warning_message);
@@ -1318,10 +1391,11 @@ router.get('/preview', checkPermission(MENU_PUBLICACION_VIEW_PERMISSIONS), async
     }
 
     const targetMenuId = Number(resolvedMenu.id_menu);
-    const [baseRows, detailRows, sharedMenuImpact] = await Promise.all([
-      fetchBaseCatalogByMenu(targetMenuId, departmentIds, imageCapabilities),
-      fetchDetalleRowsByMenu({ idMenu: targetMenuId, capabilities }),
-      resolveSharedMenuImpact({ idMenu: targetMenuId, idSucursal })
+    const [baseRows, detailRows, sharedMenuImpact, crossBranchRows] = await Promise.all([
+      fetchBaseCatalogByMenu(targetMenuId, idSucursal, departmentIds, imageCapabilities),
+      fetchDetalleRowsByMenu({ idMenu: targetMenuId, idSucursal, capabilities }),
+      resolveSharedMenuImpact({ idMenu: targetMenuId, idSucursal }),
+      fetchCrossBranchDetalleRowsByMenu({ idMenu: targetMenuId, idSucursal })
     ]);
 
     const detailRowsByKey = buildDetailRowsByKey(detailRows);
@@ -1339,6 +1413,11 @@ router.get('/preview', checkPermission(MENU_PUBLICACION_VIEW_PERMISSIONS), async
 
     const disponibles = previewItems.filter((item) => Boolean(item?.disponibilidad?.available)).length;
     const warnings = [];
+    if (crossBranchRows.length > 0) {
+      warnings.push(
+        `Preview con aislamiento defensivo activo: existen ${crossBranchRows.length} publicaciones cruzadas fuera de la sucursal.`
+      );
+    }
     if (sharedMenuImpact.is_shared) {
       warnings.push(sharedMenuImpact.warning_message);
     }
@@ -1401,9 +1480,10 @@ router.put('/catalogo', checkPermission(MENU_PUBLICACION_SAVE_PERMISSIONS), asyn
 
     const capabilities = await getDetalleMenuCapabilities();
     const [detailRows, stateByKey, sharedMenuImpact] = await Promise.all([
-      fetchDetalleRowsByMenu({ idMenu: targetMenuId, capabilities }),
+      fetchDetalleRowsByMenu({ idMenu: targetMenuId, idSucursal, capabilities }),
       fetchDraftStateByType({
         idMenu: targetMenuId,
+        idSucursal,
         normalizedItems: normalized.data
       }),
       resolveSharedMenuImpact({ idMenu: targetMenuId, idSucursal })
@@ -1490,6 +1570,7 @@ router.put('/catalogo', checkPermission(MENU_PUBLICACION_SAVE_PERMISSIONS), asyn
 
     const visibleCount = await getVisibleCountByMenu({
       idMenu: targetMenuId,
+      idSucursal,
       capabilities,
       client
     });

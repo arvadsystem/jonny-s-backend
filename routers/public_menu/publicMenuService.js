@@ -663,6 +663,9 @@ const mapCatalogItem = ({
 const toAvailabilityMap = (rows = [], keyName) =>
   new Map(rows.map((row) => [Number(row[keyName]), row]));
 
+const isRowVisibleInPublicMenu = (row) =>
+  toBoolean(row?.visible) && toBoolean(row?.estado_item_base);
+
 // Resumen de menu vigente para reutilizar en varios endpoints.
 const mapMenuSummary = (row) => ({
   id_menu_vigente: Number(row.id_menu_vigente),
@@ -981,7 +984,7 @@ const materializePublicOrderSnapshot = async ({ idSucursal, requestedItems = [],
     throw buildHttpError(409, 'La sucursal no tiene menu vigente activo para registrar pedidos.');
   }
 
-  const rows = await fetchCatalogRowsByMenuQuery(Number(activeMenu.id_menu), db);
+  const rows = await fetchCatalogRowsByMenuQuery(Number(activeMenu.id_menu), Number(idSucursal), db);
   const [sauceConfigByDetail, extrasByRecipe] = await Promise.all([
     buildCatalogSauceConfigByDetail(rows, db),
     buildCatalogExtrasByRecipe(rows, db)
@@ -1274,7 +1277,7 @@ export const getPublicCatalogService = async ({ idSucursal, tipoPedido = null })
     };
   }
 
-  const rows = await fetchCatalogRowsByMenuQuery(Number(activeMenu.id_menu));
+  const rows = await fetchCatalogRowsByMenuQuery(Number(activeMenu.id_menu), Number(idSucursal));
   const [sauceConfigByDetail, extrasByRecipe] = await Promise.all([
     buildCatalogSauceConfigByDetail(rows),
     buildCatalogExtrasByRecipe(rows)
@@ -1296,7 +1299,9 @@ export const getPublicCatalogService = async ({ idSucursal, tipoPedido = null })
   const recipeAvailabilityMap = toAvailabilityMap(recipeAvailabilityRows, 'id_receta');
   const comboAvailabilityMap = toAvailabilityMap(comboAvailabilityRows, 'id_combo');
 
-  const items = rows.map((row) =>
+  const items = rows
+    .filter(isRowVisibleInPublicMenu)
+    .map((row) =>
     mapCatalogItem({
       row,
       recipeAvailabilityMap,
@@ -1304,7 +1309,7 @@ export const getPublicCatalogService = async ({ idSucursal, tipoPedido = null })
       sauceConfigByDetail,
       extrasByRecipe
     })
-  );
+    );
 
   const disponibles = items.filter((item) => item.disponibilidad.available).length;
 
@@ -1329,11 +1334,15 @@ export const getPublicCatalogItemDetailService = async ({ idSucursal, idDetalleM
 
   const row = await fetchCatalogItemByIdQuery({
     idMenu: Number(activeMenu.id_menu),
-    idDetalleMenu
+    idDetalleMenu,
+    idSucursal: Number(idSucursal)
   });
 
   if (!row) {
     throw buildHttpError(404, 'El item no existe en el menu vigente de esta sucursal.');
+  }
+  if (!isRowVisibleInPublicMenu(row)) {
+    throw buildHttpError(404, 'El item no esta disponible en el menu publico de esta sucursal.');
   }
   const [sauceConfigByDetail, extrasByRecipe] = await Promise.all([
     buildCatalogSauceConfigByDetail([row]),

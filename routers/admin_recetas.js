@@ -17,6 +17,10 @@ import {
   validarEstructuraPayloadReceta,
   validarReglasNegocioYFks
 } from './admin_recetas_helpers.js';
+import {
+  autoPublishNewRecipe,
+  moveRecipePublicationToMenu
+} from '../services/menuAutoPublicationService.js';
 
 const router = express.Router();
 // AM: transicion segura a permisos granulares sin romper el acceso actual mientras se alinea BD/roles.
@@ -368,6 +372,17 @@ router.get('/:id_receta/detalle', checkPermission(MENU_RECETAS_VIEW_PERMISSIONS)
       return res.status(404).json({ error: true, message: 'Receta no encontrada.' });
     }
 
+    const recetaActualResult = await client.query(
+      `
+        SELECT id_menu
+        FROM recetas
+        WHERE id_receta = $1
+        LIMIT 1
+      `,
+      [idReceta]
+    );
+    const previousMenuId = Number(recetaActualResult.rows?.[0]?.id_menu || 0) || null;
+
     const result = await pool.query(
       `
         SELECT
@@ -658,6 +673,12 @@ router.post('/', checkPermission(MENU_RECETAS_CREATE_PERMISSIONS), async (req, r
     }
 
     await reemplazarDetalleReceta(client, idRecetaCreada, detalleValidation.detalle);
+    await autoPublishNewRecipe({
+      client,
+      idMenu: datosInsertSinNull.id_menu,
+      idReceta: idRecetaCreada,
+      estadoItem: datosNormalizados.estado ?? true
+    });
     await client.query('COMMIT');
 
     return res.status(201).json({
@@ -793,6 +814,12 @@ router.put('/:id_receta', checkPermission(MENU_RECETAS_EDIT_PERMISSIONS), async 
     }
 
     await reemplazarDetalleReceta(client, idReceta, detalleValidation.detalle);
+    await moveRecipePublicationToMenu({
+      client,
+      idReceta,
+      fromMenuId: previousMenuId,
+      toMenuId: datosNormalizados.id_menu
+    });
 
     // Se actualiza fecha_modificacion en cada PUT.
     await client.query(
