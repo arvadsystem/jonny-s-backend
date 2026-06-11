@@ -5256,6 +5256,578 @@ router.get('/ventas', checkPermission(['VENTAS_VER']), async (req, res) => {
   }
 });
 
+router.get(
+  '/ventas/dashboard-resumen',
+  checkPermission([
+    'DASHBOARD_VER',
+    'VENTAS_VER',
+    'COCINA_VER',
+    'SUCURSALES_VER',
+    'INVENTARIO_PRODUCTOS_VER',
+    'INVENTARIO_INSUMOS_VER'
+  ]),
+  async (req, res) => {
+    try {
+      const scope = await resolveVentasHistoryScope(req);
+      if (!scope.allowedSucursalIds.length) {
+        return res.status(403).json({ error: true, message: 'El empleado no tiene sucursales asignadas.' });
+      }
+
+      const fechaDesde = parseOptionalDateInput(req.query.fechaDesde);
+      const fechaHasta = parseOptionalDateInput(req.query.fechaHasta);
+      if (fechaDesde === '__INVALID_DATE__' || fechaHasta === '__INVALID_DATE__') {
+        return res.status(400).json({
+          error: true,
+          code: 'VENTAS_FECHA_INVALIDA',
+          message: 'fechaDesde y fechaHasta deben tener formato YYYY-MM-DD.'
+        });
+      }
+
+      const turno = String(req.query.turno ?? req.query.turnFilter ?? 'all').trim().toLowerCase();
+      if (!['all', 'manana', 'tarde', 'noche'].includes(turno)) {
+        return res.status(400).json({
+          error: true,
+          message: 'turno debe ser all, manana, tarde o noche.'
+        });
+      }
+
+      const idSucursalRaw = req.query.idSucursal ?? req.query.id_sucursal;
+      const idSucursalRequested = parseOptionalPositiveInt(idSucursalRaw);
+
+      let idSucursalEffective = null;
+      if (scope.isSuperAdmin) {
+        idSucursalEffective = idSucursalRequested;
+        if (idSucursalEffective && !scope.allowedSucursalIds.includes(idSucursalEffective)) {
+          return res.status(403).json({ error: true, message: 'No tiene acceso a la sucursal solicitada.' });
+        }
+      } else {
+        idSucursalEffective = scope.userSucursalId;
+        if (!idSucursalEffective) {
+          return res.status(403).json({ error: true, message: 'El empleado no tiene sucursal vinculada.' });
+        }
+      }
+
+      const canViewSucursales = await requestHasAnyPermission(req, ['SUCURSALES_VER']);
+      const canViewPedidos = await requestHasAnyPermission(req, ['VENTAS_VER', 'COCINA_VER']);
+      const canViewProductos = await requestHasAnyPermission(req, ['INVENTARIO_PRODUCTOS_VER']);
+      const canViewInsumos = await requestHasAnyPermission(req, ['INVENTARIO_INSUMOS_VER']);
+      const canViewVentas = await requestHasAnyPermission(req, ['VENTAS_VER']);
+
+      const appendSucursalFilter = (filters, params, columnExpr) => {
+        if (idSucursalEffective) {
+          params.push(idSucursalEffective);
+          filters.push(`${columnExpr} = $${params.length}`);
+          return;
+        }
+
+        params.push(scope.allowedSucursalIds);
+        filters.push(`${columnExpr} = ANY($${params.length}::int[])`);
+      };
+
+      const summary = {
+        general: {
+          sucursales: null,
+          pedidos: null,
+          inventario: null
+        },
+        financial: null
+      };
+
+      if (canViewSucursales) {
+        try {
+          const sucursalFilters = ['1 = 1'];
+          const sucursalParams = [];
+          appendSucursalFilter(sucursalFilters, sucursalParams, 's.id_sucursal');
+
+          const sucursalResult = await pool.query(
+            `
+              SELECT
+                COUNT(*)::int AS total,
+                COALESCE(
+                  SUM(
+                    CASE
+                      WHEN COALESCE(s.estado, true) = true THEN 1
+                      ELSE 0
+                    END
+                  ),
+                  0
+                )::int AS activas
+              FROM public.sucursales s
+              WHERE ${sucursalFilters.join(' AND ')}
+            `,
+            sucursalParams
+          );
+
+          summary.general.sucursales = {
+            total: Number.parseInt(String(sucursalResult.rows?.[0]?.total ?? '0'), 10) || 0,
+            activas: Number.parseInt(String(sucursalResult.rows?.[0]?.activas ?? '0'), 10) || 0
+          };
+        } catch {
+          summary.general.sucursales = null;
+        }
+      }
+
+      if (canViewPedidos) {
+        try {
+          const hasVisibleEnCocinaAt = await hasPedidosColumn(pool, 'visible_en_cocina_at');
+          const pedidosOperationalDateExpr = hasVisibleEnCocinaAt
+            ? `
+              COALESCE(
+                f.fecha_operacion::date,
+                p.visible_en_cocina_at::date,
+                p.fecha_hora_pedido::date
+              )
+            `
+            : `
+              COALESCE(
+                f.fecha_operacion::date,
+                p.fecha_hora_pedido::date
+              )
+            `;
+          const pedidosOperationalTimestampExpr = hasVisibleEnCocinaAt
+            ? `
+              COALESCE(
+                f.fecha_operacion::timestamp,
+                p.visible_en_cocina_at,
+                p.fecha_hora_pedido
+              )
+            `
+            : `
+              COALESCE(
+                f.fecha_operacion::timestamp,
+                p.fecha_hora_pedido
+              )
+            `;
+          const estadoPendiente = await resolveEstadoPedidoIdByCode(pool, 'PENDIENTE');
+          const estadoEnCocina = await resolveEstadoPedidoIdByCode(pool, 'EN_COCINA');
+          const estadoEnPreparacion = await resolveEstadoPedidoIdByCode(pool, 'EN_PREPARACION');
+          const estadoListo = await resolveEstadoPedidoIdByCode(pool, 'LISTO_PARA_ENTREGA');
+          const estadoIds = [estadoPendiente, estadoEnCocina, estadoEnPreparacion, estadoListo].filter(Boolean);
+
+          if (estadoIds.length > 0) {
+            const estadoEnCocinaIds = [estadoEnCocina, estadoEnPreparacion].filter(Boolean);
+            const pedidoParams = [
+              estadoIds,
+              estadoPendiente || 0,
+              estadoEnCocinaIds,
+              estadoListo || 0
+            ];
+            const pedidoFilters = ['p.id_estado_pedido = ANY($1::int[])'];
+            appendSucursalFilter(pedidoFilters, pedidoParams, 'p.id_sucursal');
+            pedidoFilters.push(`
+              ${pedidosOperationalDateExpr} = (NOW() AT TIME ZONE 'America/Tegucigalpa')::date
+            `);
+
+            if (turno !== 'all') {
+              const hourCondition = turno === 'manana'
+                ? `EXTRACT(HOUR FROM ${pedidosOperationalTimestampExpr}) < 12`
+                : turno === 'tarde'
+                  ? `EXTRACT(HOUR FROM ${pedidosOperationalTimestampExpr}) >= 12
+                     AND EXTRACT(HOUR FROM ${pedidosOperationalTimestampExpr}) < 18`
+                  : `EXTRACT(HOUR FROM ${pedidosOperationalTimestampExpr}) >= 18`;
+              pedidoFilters.push(`(${hourCondition})`);
+            }
+
+            const pedidosWhereClause = `WHERE ${pedidoFilters.join(' AND ')}`;
+
+            const pedidosSummaryResult = await pool.query(
+              `
+                SELECT
+                  COUNT(*)::int AS total_operacion,
+                  COALESCE(SUM(CASE WHEN p.id_estado_pedido = $2 THEN 1 ELSE 0 END), 0)::int AS pendientes_pago,
+                  COALESCE(SUM(CASE WHEN p.id_estado_pedido = ANY($3::int[]) THEN 1 ELSE 0 END), 0)::int AS en_cocina,
+                  COALESCE(SUM(CASE WHEN p.id_estado_pedido = $4 THEN 1 ELSE 0 END), 0)::int AS listos_entrega
+                FROM public.pedidos p
+                LEFT JOIN LATERAL (
+                  SELECT f.*
+                  FROM public.facturas f
+                  WHERE f.id_pedido = p.id_pedido
+                    AND f.id_sucursal = p.id_sucursal
+                  ORDER BY
+                    f.fecha_operacion DESC NULLS LAST,
+                    f.fecha_hora_facturacion DESC NULLS LAST,
+                    f.id_factura DESC
+                  LIMIT 1
+                ) f ON TRUE
+                ${pedidosWhereClause}
+              `,
+              pedidoParams
+            );
+
+            const ordersFlowResult = await pool.query(
+              `
+                SELECT
+                  TO_CHAR(
+                    DATE_TRUNC('hour', ${pedidosOperationalTimestampExpr}),
+                    'HH24:00'
+                  ) AS hour,
+                  COUNT(*)::int AS pedidos
+                FROM public.pedidos p
+                LEFT JOIN LATERAL (
+                  SELECT f.*
+                  FROM public.facturas f
+                  WHERE f.id_pedido = p.id_pedido
+                    AND f.id_sucursal = p.id_sucursal
+                  ORDER BY
+                    f.fecha_operacion DESC NULLS LAST,
+                    f.fecha_hora_facturacion DESC NULLS LAST,
+                    f.id_factura DESC
+                  LIMIT 1
+                ) f ON TRUE
+                ${pedidosWhereClause}
+                GROUP BY 1
+                ORDER BY 1
+              `,
+              pedidoParams
+            );
+
+            const pedidosRow = pedidosSummaryResult.rows?.[0] || {};
+            summary.general.pedidos = {
+              totalOperacion: Number.parseInt(String(pedidosRow.total_operacion ?? '0'), 10) || 0,
+              pendientesPago: Number.parseInt(String(pedidosRow.pendientes_pago ?? '0'), 10) || 0,
+              enCocina: Number.parseInt(String(pedidosRow.en_cocina ?? '0'), 10) || 0,
+              listosEntrega: Number.parseInt(String(pedidosRow.listos_entrega ?? '0'), 10) || 0,
+              flujoHorario: ordersFlowResult.rows.map((row) => ({
+                hour: row.hour,
+                pedidos: Number.parseInt(String(row.pedidos ?? '0'), 10) || 0
+              }))
+            };
+          }
+        } catch {
+          summary.general.pedidos = null;
+        }
+      }
+
+      if (canViewProductos || canViewInsumos) {
+        try {
+          const inventoryBlocks = [];
+          const inventoryParams = [];
+
+          if (canViewProductos) {
+            const filters = ['COALESCE(p.estado, true) = true'];
+            appendSucursalFilter(filters, inventoryParams, 'a.id_sucursal');
+            inventoryBlocks.push(`
+              SELECT
+                COALESCE(SUM(CASE WHEN COALESCE(p.cantidad, 0) <= 0 THEN 1 ELSE 0 END), 0)::int AS agotados,
+                COALESCE(SUM(CASE WHEN COALESCE(p.cantidad, 0) > 0 AND COALESCE(p.cantidad, 0) <= COALESCE(p.stock_minimo, 0) THEN 1 ELSE 0 END), 0)::int AS stock_bajo,
+                COUNT(*)::int AS catalogo_activo
+              FROM public.productos p
+              LEFT JOIN public.almacenes a ON a.id_almacen = p.id_almacen
+              WHERE ${filters.join(' AND ')}
+            `);
+          }
+
+          if (canViewInsumos) {
+            const filters = ['COALESCE(i.estado, true) = true'];
+            appendSucursalFilter(filters, inventoryParams, 'a.id_sucursal');
+            inventoryBlocks.push(`
+              SELECT
+                COALESCE(SUM(CASE WHEN COALESCE(i.cantidad, 0) <= 0 THEN 1 ELSE 0 END), 0)::int AS agotados,
+                COALESCE(SUM(CASE WHEN COALESCE(i.cantidad, 0) > 0 AND COALESCE(i.cantidad, 0) <= COALESCE(i.stock_minimo, 0) THEN 1 ELSE 0 END), 0)::int AS stock_bajo,
+                COUNT(*)::int AS catalogo_activo
+              FROM public.insumos i
+              LEFT JOIN public.almacenes a ON a.id_almacen = i.id_almacen
+              WHERE ${filters.join(' AND ')}
+            `);
+          }
+
+          if (inventoryBlocks.length > 0) {
+            const inventoryResult = await pool.query(
+              `
+                SELECT
+                  COALESCE(SUM(base.agotados), 0)::int AS agotados,
+                  COALESCE(SUM(base.stock_bajo), 0)::int AS stock_bajo,
+                  COALESCE(SUM(base.catalogo_activo), 0)::int AS catalogo_activo
+                FROM (
+                  ${inventoryBlocks.join('\nUNION ALL\n')}
+                ) base
+              `,
+              inventoryParams
+            );
+
+            summary.general.inventario = {
+              agotados: Number.parseInt(String(inventoryResult.rows?.[0]?.agotados ?? '0'), 10) || 0,
+              stockBajo: Number.parseInt(String(inventoryResult.rows?.[0]?.stock_bajo ?? '0'), 10) || 0,
+              catalogoActivo: Number.parseInt(String(inventoryResult.rows?.[0]?.catalogo_activo ?? '0'), 10) || 0
+            };
+          }
+        } catch {
+          summary.general.inventario = null;
+        }
+      }
+
+      if (canViewVentas) {
+        try {
+          const filters = [];
+          const params = [];
+          const pushFilter = (fragment, value) => {
+            params.push(value);
+            filters.push(fragment.replaceAll('$IDX', `$${params.length}`));
+          };
+
+          if (idSucursalEffective) {
+            pushFilter('COALESCE(p.id_sucursal, f.id_sucursal) = $IDX', idSucursalEffective);
+          } else {
+            pushFilter('COALESCE(p.id_sucursal, f.id_sucursal) = ANY($IDX::int[])', scope.allowedSucursalIds);
+          }
+
+          if (scope.limitedToLast72Hours) {
+            filters.push(`f.fecha_hora_facturacion IS NOT NULL`);
+            filters.push(`f.fecha_hora_facturacion >= ${VENTAS_LIMIT_72H_CUTOFF_SQL}`);
+          }
+          if (fechaDesde) {
+            pushFilter('(f.fecha_hora_facturacion)::date >= $IDX::date', fechaDesde);
+          }
+          if (fechaHasta) {
+            pushFilter('(f.fecha_hora_facturacion)::date <= $IDX::date', fechaHasta);
+          }
+
+          const whereClause = filters.length ? `WHERE ${filters.join(' AND ')}` : '';
+          const financialResult = await pool.query(
+            `
+              SELECT
+                COUNT(*)::int AS ventas,
+                COALESCE(
+                  SUM(
+                    COALESCE(
+                      df_info.subtotal_neto,
+                      p.total,
+                      0
+                    )
+                  ),
+                  0
+                )::numeric(14,2) AS total_vendido,
+                COALESCE(
+                  SUM(
+                    CASE
+                      WHEN p.id_pedido IS NULL THEN 1
+                      WHEN LOWER(COALESCE(ep.descripcion, '')) IN (
+                        'completada',
+                        'completado',
+                        'finalizada',
+                        'finalizado',
+                        'pagada',
+                        'pagado',
+                        'cerrada',
+                        'cerrado',
+                        'lista',
+                        'listo'
+                      ) THEN 1
+                      ELSE 0
+                    END
+                  ),
+                  0
+                )::int AS completadas
+              FROM facturas f
+              LEFT JOIN pedidos p ON p.id_pedido = f.id_pedido
+              LEFT JOIN estados_pedido ep ON ep.id_estado_pedido = p.id_estado_pedido
+              LEFT JOIN LATERAL (
+                SELECT
+                  COALESCE(SUM(df.total_detalle), 0)::numeric(12,2) AS subtotal_neto
+                FROM detalle_facturas df
+                WHERE df.id_factura = f.id_factura
+              ) df_info ON true
+              ${whereClause}
+            `,
+            params
+          );
+
+          const financialRow = financialResult.rows?.[0] || {};
+          const ventas = Number.parseInt(String(financialRow.ventas ?? '0'), 10) || 0;
+          const totalVendido = roundMoney(financialRow.total_vendido);
+          const completadas = Number.parseInt(String(financialRow.completadas ?? '0'), 10) || 0;
+          const pendientes = Math.max(ventas - completadas, 0);
+
+          summary.financial = {
+            ventas,
+            totalVendido,
+            ticketPromedio: ventas > 0 ? roundMoney(totalVendido / ventas) : 0,
+            completadas,
+            pendientes,
+            fechaDesde: fechaDesde || null,
+            fechaHasta: fechaHasta || null
+          };
+        } catch {
+          summary.financial = null;
+        }
+      }
+
+      return res.status(200).json({
+        success: true,
+        summary,
+        filters: {
+          scope: {
+            canSelectSucursal: scope.isSuperAdmin,
+            selectedSucursalId: idSucursalEffective,
+            userSucursalId: scope.userSucursalId,
+            limitedByRole: scope.limitedToLast72Hours,
+            limitedToLast72Hours: scope.limitedToLast72Hours,
+            allowedSucursalIds: scope.allowedSucursalIds
+          },
+          turno
+        }
+      });
+    } catch (err) {
+      return sendVentasInternalError(res);
+    }
+  }
+);
+
+router.get(
+  '/ventas/dashboard-flujo-pedidos',
+  checkPermission(['DASHBOARD_VER', 'VENTAS_VER', 'COCINA_VER']),
+  async (req, res) => {
+    try {
+      const scope = await resolveVentasHistoryScope(req);
+      if (!scope.allowedSucursalIds.length) {
+        return res.status(403).json({ error: true, message: 'El empleado no tiene sucursales asignadas.' });
+      }
+
+      const fechaOperacionRaw = req.query.fechaOperacion ?? req.query.fecha_operacion;
+      const fechaOperacion = parseOptionalDateInput(fechaOperacionRaw)
+        || new Date().toLocaleDateString('en-CA', { timeZone: 'America/Tegucigalpa' });
+      if (fechaOperacion === '__INVALID_DATE__') {
+        return res.status(400).json({
+          error: true,
+          code: 'VENTAS_FECHA_INVALIDA',
+          message: 'fechaOperacion debe tener formato YYYY-MM-DD.'
+        });
+      }
+
+      const idSucursalRaw = req.query.idSucursal ?? req.query.id_sucursal;
+      const idSucursalRequested = parseOptionalPositiveInt(idSucursalRaw);
+
+      let idSucursalEffective = null;
+      if (scope.isSuperAdmin) {
+        idSucursalEffective = idSucursalRequested;
+        if (idSucursalEffective && !scope.allowedSucursalIds.includes(idSucursalEffective)) {
+          return res.status(403).json({ error: true, message: 'No tiene acceso a la sucursal solicitada.' });
+        }
+      } else {
+        idSucursalEffective = scope.userSucursalId;
+        if (!idSucursalEffective) {
+          return res.status(403).json({ error: true, message: 'El empleado no tiene sucursal vinculada.' });
+        }
+      }
+
+      const estadoPendiente = await resolveEstadoPedidoIdByCode(pool, 'PENDIENTE');
+      const estadoEnCocina = await resolveEstadoPedidoIdByCode(pool, 'EN_COCINA');
+      const estadoEnPreparacion = await resolveEstadoPedidoIdByCode(pool, 'EN_PREPARACION');
+      const estadoListo = await resolveEstadoPedidoIdByCode(pool, 'LISTO_PARA_ENTREGA');
+      const estadoIds = [estadoPendiente, estadoEnCocina, estadoEnPreparacion, estadoListo].filter(Boolean);
+      const hasVisibleEnCocinaAt = await hasPedidosColumn(pool, 'visible_en_cocina_at');
+      const pedidosOperationalDateExpr = hasVisibleEnCocinaAt
+        ? `
+          COALESCE(
+            f.fecha_operacion::date,
+            p.visible_en_cocina_at::date,
+            p.fecha_hora_pedido::date
+          )
+        `
+        : `
+          COALESCE(
+            f.fecha_operacion::date,
+            p.fecha_hora_pedido::date
+          )
+        `;
+      const pedidosOperationalTimestampExpr = hasVisibleEnCocinaAt
+        ? `
+          COALESCE(
+            f.fecha_operacion::timestamp,
+            p.visible_en_cocina_at,
+            p.fecha_hora_pedido
+          )
+        `
+        : `
+          COALESCE(
+            f.fecha_operacion::timestamp,
+            p.fecha_hora_pedido
+          )
+        `;
+
+      if (!estadoIds.length) {
+        return res.status(200).json({
+          success: true,
+          summary: {
+            fechaOperacion,
+            rows: []
+          }
+        });
+      }
+
+      const params = [estadoIds];
+      const filters = ['p.id_estado_pedido = ANY($1::int[])'];
+      if (idSucursalEffective) {
+        params.push(idSucursalEffective);
+        filters.push(`p.id_sucursal = $${params.length}`);
+      } else {
+        params.push(scope.allowedSucursalIds);
+        filters.push(`p.id_sucursal = ANY($${params.length}::int[])`);
+      }
+      params.push(fechaOperacion);
+      filters.push(`
+        ${pedidosOperationalDateExpr} = $${params.length}::date
+      `);
+
+      const result = await pool.query(
+        `
+          WITH hours AS (
+            SELECT generate_series(0, 23) AS hour_num
+          ),
+          pedidos_agrupados AS (
+            SELECT
+              EXTRACT(
+                HOUR FROM ${pedidosOperationalTimestampExpr}
+              )::int AS hour_num,
+              COUNT(*)::int AS pedidos
+            FROM public.pedidos p
+            LEFT JOIN LATERAL (
+              SELECT f.*
+              FROM public.facturas f
+              WHERE f.id_pedido = p.id_pedido
+                AND f.id_sucursal = p.id_sucursal
+              ORDER BY
+                f.fecha_operacion DESC NULLS LAST,
+                f.fecha_hora_facturacion DESC NULLS LAST,
+                f.id_factura DESC
+              LIMIT 1
+            ) f ON TRUE
+            WHERE ${filters.join(' AND ')}
+            GROUP BY 1
+          )
+          SELECT
+            LPAD(hours.hour_num::text, 2, '0') || ':00' AS hour,
+            COALESCE(pedidos_agrupados.pedidos, 0)::int AS pedidos
+          FROM hours
+          LEFT JOIN pedidos_agrupados
+            ON pedidos_agrupados.hour_num = hours.hour_num
+          ORDER BY hours.hour_num
+        `,
+        params
+      );
+
+      const totalPedidos = result.rows.reduce(
+        (acc, row) => acc + (Number.parseInt(String(row?.pedidos ?? '0'), 10) || 0),
+        0
+      );
+
+      return res.status(200).json({
+        success: true,
+        summary: {
+          fechaOperacion,
+          totalPedidos,
+          rows: result.rows.map((row) => ({
+            hour: row.hour,
+            pedidos: Number.parseInt(String(row.pedidos ?? '0'), 10) || 0
+          }))
+        }
+      });
+    } catch (err) {
+      return sendVentasInternalError(res);
+    }
+  }
+);
+
 // --- ENDPOINTS DE PEDIDOS (MENU PUBLICO) ---
 // Gestion de validacion de pago y flujo operativo (Cocina/Entrega).
 router.get('/ventas/pedidos-menu', checkPermission(['VENTAS_VER']), async (req, res) => {
@@ -5303,6 +5875,7 @@ router.get('/ventas/pedidos-menu', checkPermission(['VENTAS_VER']), async (req, 
     const hasKdsStartedAt = await hasPedidosColumn(client, 'kds_started_at');
     const hasKdsExpectedMinutes = await hasPedidosColumn(client, 'kds_expected_minutes');
     const hasKdsExpectedRule = await hasPedidosColumn(client, 'kds_expected_rule');
+    const hasVisibleEnCocinaAt = await hasPedidosColumn(client, 'visible_en_cocina_at');
 
     const estadoPendiente = await resolveEstadoPedidoIdByCode(client, 'PENDIENTE');
     const estadoEnCocina = await resolveEstadoPedidoIdByCode(client, 'EN_COCINA');
@@ -5325,6 +5898,25 @@ router.get('/ventas/pedidos-menu', checkPermission(['VENTAS_VER']), async (req, 
       filters.push(`p.id_sucursal = ANY($${params.length}::int[])`);
     }
 
+    // AM: Filtro operativo diario para ocultar pedidos de dias anteriores sin alterar estados/historial.
+    const operationalDateExpr = `(NOW() AT TIME ZONE 'America/Tegucigalpa')::date`;
+    const pedidosOperacionFechaExpr = hasVisibleEnCocinaAt
+      ? `
+        COALESCE(
+          f.fecha_operacion::date,
+          p.visible_en_cocina_at::date,
+          p.fecha_hora_pedido::date
+        )
+      `
+      : `
+        COALESCE(
+          f.fecha_operacion::date,
+          p.fecha_hora_pedido::date
+        )
+      `;
+    filters.push(`
+      ${pedidosOperacionFechaExpr} = ${operationalDateExpr}
+    `);
     const whereClause = `WHERE ${filters.join(' AND ')}`;
 
     const estadoPagoSelect = hasEstadoPago ? 'p.estado_pago' : `NULL::text AS estado_pago`;
