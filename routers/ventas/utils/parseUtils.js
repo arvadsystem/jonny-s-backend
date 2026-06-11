@@ -11,7 +11,13 @@ export const normalizeTipoItem = (value) => {
 };
 
 export const parsePositiveInt = (value) => {
-  const parsed = Number.parseInt(value, 10);
+  if (typeof value === 'number') {
+    return Number.isSafeInteger(value) && value > 0 ? value : null;
+  }
+  if (typeof value !== 'string') return null;
+  const normalized = value.trim();
+  if (!/^0*[1-9]\d*$/.test(normalized)) return null;
+  const parsed = Number(normalized);
   return Number.isInteger(parsed) && parsed > 0 ? parsed : null;
 };
 

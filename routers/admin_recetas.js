@@ -372,17 +372,6 @@ router.get('/:id_receta/detalle', checkPermission(MENU_RECETAS_VIEW_PERMISSIONS)
       return res.status(404).json({ error: true, message: 'Receta no encontrada.' });
     }
 
-    const recetaActualResult = await client.query(
-      `
-        SELECT id_menu
-        FROM recetas
-        WHERE id_receta = $1
-        LIMIT 1
-      `,
-      [idReceta]
-    );
-    const previousMenuId = Number(recetaActualResult.rows?.[0]?.id_menu || 0) || null;
-
     const result = await pool.query(
       `
         SELECT
@@ -632,7 +621,6 @@ router.post('/', checkPermission(MENU_RECETAS_CREATE_PERMISSIONS), async (req, r
       return res.status(reglasValidation.status).json({ error: true, message: reglasValidation.message });
     }
 
-    // Fechas de auditoria desde backend.
     const nowIso = new Date().toISOString();
     const datosInsert = {
       ...datosNormalizados,
@@ -640,8 +628,6 @@ router.post('/', checkPermission(MENU_RECETAS_CREATE_PERMISSIONS), async (req, r
       fecha_modificacion: nowIso
     };
 
-    // `pa_insert` usa json_each_text y omite valores NULL; por eso se excluyen
-    // campos nulos para evitar desajuste entre columnas y valores.
     const datosInsertSinNull = Object.fromEntries(
       Object.entries(datosInsert).filter(([, valor]) => valor !== null)
     );
@@ -698,7 +684,6 @@ router.post('/', checkPermission(MENU_RECETAS_CREATE_PERMISSIONS), async (req, r
         });
       }
 
-      // Mapeo explicito de conflictos conocidos para evitar mensajes genericos.
       if (err?.code === '23502' && err?.column === 'id_nivel_picante') {
         return res.status(400).json({
           error: true,
@@ -759,6 +744,17 @@ router.put('/:id_receta', checkPermission(MENU_RECETAS_EDIT_PERMISSIONS), async 
     if (!fkDetalleValidation.ok) {
       return res.status(fkDetalleValidation.status).json({ error: true, message: fkDetalleValidation.message });
     }
+
+    const recetaActualResult = await client.query(
+      `
+        SELECT id_menu
+        FROM recetas
+        WHERE id_receta = $1
+        LIMIT 1
+      `,
+      [idReceta]
+    );
+    const previousMenuId = Number(recetaActualResult.rows?.[0]?.id_menu || 0) || null;
 
     const payloadConActor = { ...(req.body || {}), id_usuario: actorUserId };
     delete payloadConActor.detalle_receta;
@@ -821,7 +817,6 @@ router.put('/:id_receta', checkPermission(MENU_RECETAS_EDIT_PERMISSIONS), async 
       toMenuId: datosNormalizados.id_menu
     });
 
-    // Se actualiza fecha_modificacion en cada PUT.
     await client.query(
       `
         UPDATE recetas
@@ -877,7 +872,6 @@ router.patch('/:id_receta/estado', checkPermission(MENU_RECETAS_STATE_PERMISSION
       return res.status(404).json({ error: true, message: 'Receta no encontrada.' });
     }
 
-    // Compatibilidad: si el cliente envia id_usuario se ignora silenciosamente.
     const payloadConActor = { ...(req.body || {}), id_usuario: actorUserId };
 
     const payloadValidation = validarEstructuraPayloadReceta(payloadConActor, { soloEstadoUsuario: true });
@@ -905,7 +899,6 @@ router.patch('/:id_receta/estado', checkPermission(MENU_RECETAS_STATE_PERMISSION
     await actualizarCampoReceta(client, idReceta, 'estado', estadoValidation.valor);
     await actualizarCampoReceta(client, idReceta, 'id_usuario', usuarioValidation.valor);
 
-    // Requisito de negocio: PATCH estado tambien refresca fecha_modificacion.
     await client.query(
       `
         UPDATE recetas

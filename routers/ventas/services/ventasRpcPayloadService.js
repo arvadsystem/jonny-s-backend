@@ -187,6 +187,7 @@ export const buildPedidoPendienteRpcPayload = (pedidoPendiente = {}) => ({
     item_index: index,
     sub_total: roundMoney(line.sub_total),
     total_linea: roundMoney(line.total_linea),
+    cantidad: Number(line.cantidad || 0),
     id_producto: line.id_producto || null,
     id_combo: line.id_combo || null,
     id_receta: line.id_receta || null,

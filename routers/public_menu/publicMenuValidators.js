@@ -282,7 +282,8 @@ export const validateCreateOrderBody = (req, res, next) => {
   }
 
   const items = [];
-  for (const rawItem of rawItems) {
+  for (let index = 0; index < rawItems.length; index += 1) {
+    const rawItem = rawItems[index];
     const row = rawItem && typeof rawItem === 'object' ? rawItem : {};
     const idDetalleMenu = toPositiveInt(row.id_detalle_menu);
     const cantidad = toPositiveInt(row.cantidad);
@@ -292,7 +293,7 @@ export const validateCreateOrderBody = (req, res, next) => {
     }
 
     if (!cantidad) {
-      return sendValidationError(req, res, 'Cada item debe incluir cantidad valida (> 0).');
+      return sendValidationError(req, res, `La linea ${index + 1} debe incluir cantidad valida (> 0).`);
     }
 
     if (row.extras !== undefined && !Array.isArray(row.extras)) {

@@ -848,6 +848,7 @@ export const insertPublicPedidoDetalleQuery = async (client, payload) => {
     'estado',
     'id_combo',
     'id_receta',
+    'cantidad',
     'observacion'
   ];
   const params = [
@@ -859,6 +860,7 @@ export const insertPublicPedidoDetalleQuery = async (client, payload) => {
     true,
     payload.id_combo,
     payload.id_receta,
+    payload.cantidad,
     payload.observacion
   ];
   const values = [
@@ -870,7 +872,8 @@ export const insertPublicPedidoDetalleQuery = async (client, payload) => {
     '$6',
     '$7',
     '$8',
-    '$9'
+    '$9',
+    '$10'
   ];
 
   // Item 11: persistimos configuracion estructurada del menu cuando el esquema lo soporta.

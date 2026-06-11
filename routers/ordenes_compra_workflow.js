@@ -165,6 +165,45 @@ const normalizeText = (value, maxLen = MAX_TEXT_LEN) => {
 };
 
 const round2 = (value) => Math.round(Number(value || 0) * 100) / 100;
+const roundDecimal = (value, decimals) => {
+  const factor = 10 ** decimals;
+  return Math.round((Number(value) + Number.EPSILON) * factor) / factor;
+};
+
+const parsePositiveDecimal4 = (value) => {
+  const text = String(value ?? '').trim();
+  if (!/^(?:\d+|\d+\.\d{1,4})$/.test(text)) return null;
+  const parsed = Number(text);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+};
+
+const normalizeDecimal = (value, decimals) => {
+  if (value === null || value === undefined || value === '') return null;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed.toFixed(decimals) : null;
+};
+
+const nullableIntValue = (value) => {
+  const parsed = parsePositiveInt(value);
+  return parsed || null;
+};
+
+const arePurchaseSnapshotsCompatible = (existingDetail, newDetail) => {
+  if (newDetail.item_tipo === 'producto') return true;
+
+  const existingPresentationId = nullableIntValue(existingDetail?.id_presentacion_insumo);
+  const newPresentationId = nullableIntValue(newDetail?.id_presentacion_insumo);
+  if (!existingPresentationId && !newPresentationId) {
+    return nullableIntValue(existingDetail?.id_unidad_base) === nullableIntValue(newDetail?.id_unidad_base);
+  }
+
+  return (
+    existingPresentationId === newPresentationId &&
+    nullableIntValue(existingDetail?.id_unidad_base) === nullableIntValue(newDetail?.id_unidad_base) &&
+    nullableIntValue(existingDetail?.id_unidad_presentacion) === nullableIntValue(newDetail?.id_unidad_presentacion) &&
+    normalizeDecimal(existingDetail?.factor_conversion_usado, 6) === normalizeDecimal(newDetail?.factor_conversion_usado, 6)
+  );
+};
 
 const getRequestUserId = (req) => parsePositiveInt(req?.user?.id_usuario);
 
@@ -960,6 +999,22 @@ const getOrderDetails = async (idOrdenCompra, idCompra, queryRunner = pool) => {
         doc.id_producto,
         doc.id_almacen_destino,
         doc.id_proveedor_sugerido,
+        doc.id_unidad_base,
+        ub.nombre AS unidad_base_nombre,
+        ub.simbolo AS unidad_base_simbolo,
+        doc.id_presentacion_insumo,
+        ip.nombre_presentacion,
+        doc.cantidad_presentacion,
+        doc.id_unidad_presentacion,
+        up.nombre AS unidad_presentacion_nombre,
+        up.simbolo AS unidad_presentacion_simbolo,
+        doc.factor_conversion_usado,
+        COALESCE(ip.estado, false) AS presentacion_estado_actual,
+        COALESCE(ip.uso_compra, false) AS presentacion_uso_compra_actual,
+        CASE
+          WHEN doc.id_presentacion_insumo IS NOT NULL THEN 'presentacion'
+          ELSE 'base'
+        END AS modo_unidad,
         CASE
           WHEN doc.id_producto IS NOT NULL THEN 'producto'
           ELSE 'insumo'
@@ -983,6 +1038,9 @@ const getOrderDetails = async (idOrdenCompra, idCompra, queryRunner = pool) => {
       LEFT JOIN public.insumos i ON i.id_insumo = doc.id_insumo
       LEFT JOIN public.proveedores prov ON prov.id_proveedor = doc.id_proveedor_sugerido
       LEFT JOIN public.almacenes ad ON ad.id_almacen = doc.id_almacen_destino
+      LEFT JOIN public.unidades_medida ub ON ub.id_unidad_medida = doc.id_unidad_base
+      LEFT JOIN public.insumo_presentaciones ip ON ip.id_presentacion = doc.id_presentacion_insumo
+      LEFT JOIN public.unidades_medida up ON up.id_unidad_medida = doc.id_unidad_presentacion
       LEFT JOIN LATERAL (
         SELECT
           dc1.id_detalle_compra,
@@ -1026,7 +1084,7 @@ const getComprasPorProveedorSummary = async (
         doc.id_proveedor_sugerido AS id_proveedor,
         COALESCE(prov.nombre_proveedor, 'Proveedor sin definir') AS nombre_proveedor,
         COUNT(*)::int AS total_lineas_oc,
-        COALESCE(SUM(doc.cantidad_orden), 0)::int AS total_cantidad_oc
+        COALESCE(SUM(doc.cantidad_orden), 0::numeric) AS total_cantidad_oc
       FROM public.detalle_orden_compras doc
       LEFT JOIN public.proveedores prov ON prov.id_proveedor = doc.id_proveedor_sugerido
       WHERE doc.id_orden_compra = $1
@@ -1080,7 +1138,7 @@ const getComprasPorProveedorSummary = async (
         SELECT
           dc.id_compra,
           COUNT(*)::int AS total_lineas_compra,
-          COALESCE(SUM(dc.cantidad), 0)::int AS total_cantidad_compra
+          COALESCE(SUM(dc.cantidad), 0::numeric) AS total_cantidad_compra
         FROM public.detalle_compras dc
         WHERE dc.id_compra = ANY($1::int[])
         GROUP BY dc.id_compra
@@ -1342,7 +1400,7 @@ const parseCreateDetails = (rawDetails) => {
       .trim()
       .toLowerCase();
     const idItem = parsePositiveInt(detail?.id_item);
-    const cantidad = parsePositiveInt(detail?.cantidad);
+    const modoUnidad = String(detail?.modo_unidad || 'base').trim().toLowerCase();
     const rawProveedorSugerido = hasValue(detail?.id_proveedor_sugerido)
       ? detail.id_proveedor_sugerido
       : detail?.id_proveedor;
@@ -1356,12 +1414,56 @@ const parseCreateDetails = (rawDetails) => {
       return { ok: false, message: 'id_item debe ser un entero mayor a 0.' };
     }
 
-    if (!cantidad) {
-      return { ok: false, message: 'cantidad debe ser un entero mayor a 0.' };
-    }
-
     if (hasValue(rawProveedorSugerido) && !idProveedorSugerido) {
       return { ok: false, message: 'id_proveedor_sugerido debe ser un entero mayor a 0.' };
+    }
+
+    if (itemTipo === 'producto') {
+      if (modoUnidad !== 'base') {
+        return { ok: false, message: 'Los productos no aceptan modo de presentacion.' };
+      }
+      if (
+        hasValue(detail?.id_presentacion_insumo) ||
+        hasValue(detail?.cantidad_presentacion) ||
+        hasValue(detail?.id_unidad_presentacion) ||
+        hasValue(detail?.factor_conversion_usado)
+      ) {
+        return { ok: false, message: 'Los productos no aceptan presentaciones de insumo.' };
+      }
+    }
+
+    if (itemTipo === 'insumo' && !['base', 'presentacion'].includes(modoUnidad)) {
+      return { ok: false, message: 'modo_unidad debe ser "base" o "presentacion".' };
+    }
+
+    const idPresentacionInsumo =
+      itemTipo === 'insumo' && modoUnidad === 'presentacion'
+        ? parsePositiveInt(detail?.id_presentacion_insumo)
+        : null;
+    const cantidadPresentacion =
+      itemTipo === 'insumo' && modoUnidad === 'presentacion'
+        ? parsePositiveDecimal4(detail?.cantidad_presentacion)
+        : null;
+    const cantidad =
+      itemTipo === 'producto'
+        ? parsePositiveInt(detail?.cantidad)
+        : modoUnidad === 'presentacion'
+          ? null
+          : parsePositiveDecimal4(detail?.cantidad);
+
+    if (itemTipo === 'producto' && !cantidad) {
+      return { ok: false, message: 'cantidad de producto debe ser un entero mayor a 0.' };
+    }
+    if (itemTipo === 'insumo' && modoUnidad === 'base' && cantidad === null) {
+      return { ok: false, message: 'cantidad de insumo debe ser decimal positivo con hasta 4 decimales.' };
+    }
+    if (itemTipo === 'insumo' && modoUnidad === 'presentacion') {
+      if (!idPresentacionInsumo) {
+        return { ok: false, message: 'id_presentacion_insumo debe ser un entero mayor a 0.' };
+      }
+      if (cantidadPresentacion === null) {
+        return { ok: false, message: 'cantidad_presentacion debe ser decimal positivo con hasta 4 decimales.' };
+      }
     }
 
     const rawAlmacenes = Array.isArray(detail?.id_almacenes)
@@ -1397,7 +1499,8 @@ const parseCreateDetails = (rawDetails) => {
     }
 
     const idAlmacenDestino = Array.from(almacenesSet)[0];
-    const key = `${itemTipo}:${idItem}:${idAlmacenDestino}:${idProveedorSugerido || 0}`;
+    const aggregationMode = itemTipo === 'insumo' ? modoUnidad : 'base';
+    const key = `${itemTipo}:${idItem}:${idAlmacenDestino}:${idProveedorSugerido || 0}:${aggregationMode}:${idPresentacionInsumo || 0}`;
     const previous = aggregatedMap.get(key);
     if (!previous) {
       aggregatedMap.set(key, {
@@ -1405,12 +1508,29 @@ const parseCreateDetails = (rawDetails) => {
         id_item: idItem,
         id_almacen_destino: idAlmacenDestino,
         id_proveedor_sugerido: idProveedorSugerido,
-        cantidad
+        modo_unidad: aggregationMode,
+        id_presentacion_insumo: idPresentacionInsumo,
+        cantidad,
+        cantidad_orden: cantidad,
+        cantidad_presentacion: cantidadPresentacion,
+        id_unidad_base: null,
+        id_unidad_presentacion: null,
+        factor_conversion_usado: null
       });
       continue;
     }
 
-    previous.cantidad += cantidad;
+    if (aggregationMode === 'presentacion') {
+      previous.cantidad_presentacion = roundDecimal(
+        Number(previous.cantidad_presentacion || 0) + Number(cantidadPresentacion || 0),
+        4
+      );
+    } else {
+      previous.cantidad = itemTipo === 'producto'
+        ? Number(previous.cantidad || 0) + Number(cantidad || 0)
+        : roundDecimal(Number(previous.cantidad || 0) + Number(cantidad || 0), 4);
+      previous.cantidad_orden = previous.cantidad;
+    }
   }
 
   return { ok: true, details: Array.from(aggregatedMap.values()) };
@@ -1654,6 +1774,207 @@ const validateCreateItemsExistence = async (details, queryRunner = pool) => {
   }
 
   return { ok: true };
+};
+
+const resolvePurchasePresentationDetails = async (details, queryRunner = pool) => {
+  const rows = Array.isArray(details) ? details : [];
+  const insumoIds = Array.from(
+    new Set(
+      rows
+        .filter((detail) => detail.item_tipo === 'insumo')
+        .map((detail) => Number(detail.id_item))
+        .filter((value) => Number.isInteger(value) && value > 0)
+    )
+  );
+  const presentationIds = Array.from(
+    new Set(
+      rows
+        .filter((detail) => detail.item_tipo === 'insumo' && detail.modo_unidad === 'presentacion')
+        .map((detail) => Number(detail.id_presentacion_insumo))
+        .filter((value) => Number.isInteger(value) && value > 0)
+    )
+  );
+
+  const insumosMap = new Map();
+  if (insumoIds.length > 0) {
+    const insumosResult = await queryRunner.query(
+      `
+        SELECT id_insumo, nombre_insumo, id_unidad_medida, COALESCE(estado, true) AS estado
+        FROM public.insumos
+        WHERE id_insumo = ANY($1::int[])
+      `,
+      [insumoIds]
+    );
+    for (const row of insumosResult.rows || []) {
+      insumosMap.set(Number(row.id_insumo), {
+        id_insumo: Number(row.id_insumo),
+        nombre_insumo: normalizeText(row.nombre_insumo, MAX_SHORT_TEXT_LEN) || `Insumo ${row.id_insumo}`,
+        id_unidad_medida: parsePositiveInt(row.id_unidad_medida),
+        estado: Boolean(row.estado)
+      });
+    }
+  }
+
+  const presentacionesMap = new Map();
+  if (presentationIds.length > 0) {
+    const presentacionesResult = await queryRunner.query(
+      `
+        SELECT
+          ip.id_presentacion,
+          ip.id_insumo,
+          ip.nombre_presentacion,
+          ip.cantidad_presentacion,
+          ip.id_unidad_presentacion,
+          ip.cantidad_base,
+          ip.id_unidad_base,
+          COALESCE(ip.uso_compra, false) AS uso_compra,
+          COALESCE(ip.estado, true) AS estado
+        FROM public.insumo_presentaciones ip
+        WHERE ip.id_presentacion = ANY($1::bigint[])
+      `,
+      [presentationIds]
+    );
+    for (const row of presentacionesResult.rows || []) {
+      presentacionesMap.set(Number(row.id_presentacion), row);
+    }
+  }
+
+  const resolved = [];
+  for (const [index, detail] of rows.entries()) {
+    const lineLabel = `linea ${index + 1}`;
+    if (detail.item_tipo === 'producto') {
+      resolved.push({
+        ...detail,
+        modo_unidad: 'base',
+        cantidad_orden: Number(detail.cantidad),
+        id_unidad_base: null,
+        id_presentacion_insumo: null,
+        cantidad_presentacion: null,
+        id_unidad_presentacion: null,
+        factor_conversion_usado: null
+      });
+      continue;
+    }
+
+    const insumo = insumosMap.get(Number(detail.id_item));
+    if (!insumo) {
+      return { ok: false, status: 400, code: 'VALIDATION_ERROR', message: `El insumo ${detail.id_item} no existe.` };
+    }
+    if (!insumo.estado) {
+      return { ok: false, status: 409, code: 'CONFLICT', message: `El insumo ${insumo.nombre_insumo} esta inactivo.` };
+    }
+
+    if (detail.modo_unidad !== 'presentacion') {
+      const cantidadOrden = roundDecimal(detail.cantidad, 4);
+      if (cantidadOrden <= 0) {
+        return {
+          ok: false,
+          status: 400,
+          code: 'VALIDATION_ERROR',
+          message: `La cantidad de la ${lineLabel} redondea a 0.0000. Ingresa una cantidad mayor.`
+        };
+      }
+      resolved.push({
+        ...detail,
+        modo_unidad: 'base',
+        cantidad: cantidadOrden,
+        cantidad_orden: cantidadOrden,
+        id_unidad_base: insumo.id_unidad_medida || null,
+        id_presentacion_insumo: null,
+        cantidad_presentacion: null,
+        id_unidad_presentacion: null,
+        factor_conversion_usado: null
+      });
+      continue;
+    }
+
+    if (!insumo.id_unidad_medida) {
+      return {
+        ok: false,
+        status: 409,
+        code: 'CONFLICT',
+        message: `El insumo ${insumo.nombre_insumo} no tiene unidad base definida para usar presentaciones.`
+      };
+    }
+
+    const presentacion = presentacionesMap.get(Number(detail.id_presentacion_insumo));
+    if (!presentacion) {
+      return {
+        ok: false,
+        status: 400,
+        code: 'VALIDATION_ERROR',
+        message: `La presentacion ${detail.id_presentacion_insumo} de la ${lineLabel} no existe.`
+      };
+    }
+    if (Number(presentacion.id_insumo) !== Number(detail.id_item)) {
+      return {
+        ok: false,
+        status: 409,
+        code: 'CONFLICT',
+        message: `La presentacion ${detail.id_presentacion_insumo} pertenece a otro insumo.`
+      };
+    }
+    if (!Boolean(presentacion.estado)) {
+      return {
+        ok: false,
+        status: 409,
+        code: 'CONFLICT',
+        message: `La presentacion ${presentacion.nombre_presentacion || detail.id_presentacion_insumo} esta inactiva.`
+      };
+    }
+    if (!Boolean(presentacion.uso_compra)) {
+      return {
+        ok: false,
+        status: 409,
+        code: 'CONFLICT',
+        message: `La presentacion ${presentacion.nombre_presentacion || detail.id_presentacion_insumo} no esta habilitada para compras.`
+      };
+    }
+    if (Number(presentacion.id_unidad_base) !== Number(insumo.id_unidad_medida)) {
+      return {
+        ok: false,
+        status: 409,
+        code: 'CONFLICT',
+        message: `La unidad base de la presentacion no coincide con el insumo ${insumo.nombre_insumo}.`
+      };
+    }
+
+    const configCantidadPresentacion = parsePositiveDecimal4(presentacion.cantidad_presentacion);
+    const configCantidadBase = parsePositiveDecimal4(presentacion.cantidad_base);
+    const idUnidadPresentacion = parsePositiveInt(presentacion.id_unidad_presentacion);
+    if (configCantidadPresentacion === null || configCantidadBase === null || !idUnidadPresentacion) {
+      return {
+        ok: false,
+        status: 409,
+        code: 'CONFLICT',
+        message: `La presentacion ${presentacion.nombre_presentacion || detail.id_presentacion_insumo} tiene una conversion invalida.`
+      };
+    }
+
+    const cantidadPresentacion = roundDecimal(detail.cantidad_presentacion, 4);
+    const factorConversion = roundDecimal(configCantidadBase / configCantidadPresentacion, 6);
+    const cantidadOrden = roundDecimal(cantidadPresentacion * factorConversion, 4);
+    if (cantidadOrden <= 0) {
+      return {
+        ok: false,
+        status: 400,
+        code: 'VALIDATION_ERROR',
+        message: `La conversion de la ${lineLabel} redondea a 0.0000. Ingresa una cantidad mayor.`
+      };
+    }
+
+    resolved.push({
+      ...detail,
+      cantidad: cantidadOrden,
+      cantidad_orden: cantidadOrden,
+      cantidad_presentacion: cantidadPresentacion,
+      id_unidad_base: insumo.id_unidad_medida,
+      id_unidad_presentacion: idUnidadPresentacion,
+      factor_conversion_usado: factorConversion
+    });
+  }
+
+  return { ok: true, details: resolved };
 };
 
 const validateProveedor = async (idProveedor, queryRunner = pool) => {
@@ -2053,12 +2374,41 @@ router.get('/orden_compras/workflow/contexto_creacion', checkPermission(PERM_OC_
       params
     );
 
+    const presentacionesResult = await pool.query(
+      `
+        SELECT
+          ip.id_presentacion,
+          ip.id_insumo,
+          ip.nombre_presentacion,
+          ip.cantidad_presentacion,
+          ip.id_unidad_presentacion,
+          up.nombre AS unidad_presentacion_nombre,
+          up.simbolo AS unidad_presentacion_simbolo,
+          ip.cantidad_base,
+          ip.id_unidad_base,
+          ub.nombre AS unidad_base_nombre,
+          ub.simbolo AS unidad_base_simbolo,
+          COALESCE(ip.es_predeterminada_compra, false) AS es_predeterminada_compra
+        FROM public.insumo_presentaciones ip
+        INNER JOIN public.insumos i ON i.id_insumo = ip.id_insumo
+        LEFT JOIN public.unidades_medida up ON up.id_unidad_medida = ip.id_unidad_presentacion
+        LEFT JOIN public.unidades_medida ub ON ub.id_unidad_medida = ip.id_unidad_base
+        WHERE COALESCE(ip.estado, true) = true
+          AND COALESCE(ip.uso_compra, false) = true
+          AND COALESCE(i.estado, true) = true
+          AND i.id_unidad_medida IS NOT NULL
+          AND ip.id_unidad_base = i.id_unidad_medida
+        ORDER BY ip.id_insumo ASC, COALESCE(ip.es_predeterminada_compra, false) DESC, ip.nombre_presentacion ASC
+      `
+    );
+
     return res.status(200).json({
       ok: true,
       data: {
         id_sucursal_usuario: userSucursalId || null,
         restringido_a_sucursal_usuario: !canViewAll,
-        almacenes_permitidos: warehousesResult.rows || []
+        almacenes_permitidos: warehousesResult.rows || [],
+        presentaciones_compra: presentacionesResult.rows || []
       }
     });
   } catch (error) {
@@ -2476,7 +2826,7 @@ router.get('/orden_compras/workflow', checkPermission(PERM_OC_VIEW_FLOW), async 
             suc.nombre_sucursal,
             ar.url_publica AS factura_recepcion_url_publica,
             COALESCE(det.total_items, 0)::int AS total_items,
-            COALESCE(det.total_cantidad, 0)::int AS total_cantidad,
+            COALESCE(det.total_cantidad, 0::numeric) AS total_cantidad,
             COALESCE(sit.total_solicitudes_item, 0)::int AS total_solicitudes_item,
             COALESCE(sit.total_solicitudes_item_pendientes, 0)::int AS total_solicitudes_item_pendientes,
             COALESCE(sit.total_solicitudes_item_en_revision, 0)::int AS total_solicitudes_item_en_revision,
@@ -2520,7 +2870,7 @@ router.get('/orden_compras/workflow', checkPermission(PERM_OC_VIEW_FLOW), async 
           LEFT JOIN LATERAL (
             SELECT
               COUNT(*)::int AS total_items,
-              COALESCE(SUM(doc.cantidad_orden), 0)::int AS total_cantidad
+              COALESCE(SUM(doc.cantidad_orden), 0::numeric) AS total_cantidad
             FROM public.detalle_orden_compras doc
             WHERE doc.id_orden_compra = oc.id_orden_compra
           ) det ON true
@@ -2591,7 +2941,7 @@ router.get('/orden_compras/workflow', checkPermission(PERM_OC_VIEW_FLOW), async 
             suc.nombre_sucursal,
             ar.url_publica AS factura_recepcion_url_publica,
             COALESCE(det.total_items, 0)::int AS total_items,
-            COALESCE(det.total_cantidad, 0)::int AS total_cantidad,
+            COALESCE(det.total_cantidad, 0::numeric) AS total_cantidad,
             0::int AS total_solicitudes_item,
             0::int AS total_solicitudes_item_pendientes,
             0::int AS total_solicitudes_item_en_revision,
@@ -2651,7 +3001,7 @@ router.get('/orden_compras/workflow', checkPermission(PERM_OC_VIEW_FLOW), async 
           LEFT JOIN LATERAL (
             SELECT
               COUNT(*)::int AS total_items,
-              COALESCE(SUM(doc.cantidad_orden), 0)::int AS total_cantidad
+              COALESCE(SUM(doc.cantidad_orden), 0::numeric) AS total_cantidad
             FROM public.detalle_orden_compras doc
             WHERE doc.id_orden_compra = oc.id_orden_compra
           ) det ON true
@@ -2944,6 +3294,12 @@ router.post('/orden_compras/workflow', checkPermission(PERM_OC_CREATE), async (r
       if (!existencia.ok) {
         return sendError(res, 400, 'VALIDATION_ERROR', existencia.message);
       }
+
+      const resolvedDetails = await resolvePurchasePresentationDetails(parsedDetails.details, client);
+      if (!resolvedDetails.ok) {
+        return sendError(res, resolvedDetails.status, resolvedDetails.code, resolvedDetails.message);
+      }
+      parsedDetails.details = resolvedDetails.details;
     }
 
     const canViewAll = await canUserViewAllOrders(req, idUsuario, client);
@@ -3028,17 +3384,27 @@ router.post('/orden_compras/workflow', checkPermission(PERM_OC_CREATE), async (r
             id_insumo,
             id_producto,
             id_proveedor_sugerido,
-            id_almacen_destino
+            id_almacen_destino,
+            id_unidad_base,
+            id_presentacion_insumo,
+            cantidad_presentacion,
+            id_unidad_presentacion,
+            factor_conversion_usado
           )
-          VALUES ($1, $2, $3, $4, $5, $6)
+          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
         `,
         [
-          detail.cantidad,
+          detail.cantidad_orden,
           idOrdenCompra,
           idInsumo,
           idProducto,
           detail.id_proveedor_sugerido || null,
-          detail.id_almacen_destino
+          detail.id_almacen_destino,
+          detail.id_unidad_base || null,
+          detail.id_presentacion_insumo || null,
+          detail.cantidad_presentacion,
+          detail.id_unidad_presentacion || null,
+          detail.factor_conversion_usado
         ]
       );
     }
@@ -3110,11 +3476,16 @@ router.put('/orden_compras/workflow/:id_orden_compra/detalles', checkPermission(
     const updates = [];
     for (const row of payloadUpdates) {
       const idDetalleOrden = parsePositiveInt(row?.id_detalle_orden);
-      const cantidad = parsePositiveInt(row?.cantidad);
-      if (!idDetalleOrden || !cantidad) {
-        return sendError(res, 400, 'VALIDATION_ERROR', 'actualizar requiere id_detalle_orden y cantidad validos.');
+      if (!idDetalleOrden) {
+        return sendError(res, 400, 'VALIDATION_ERROR', 'actualizar requiere id_detalle_orden valido.');
       }
-      updates.push({ id_detalle_orden: idDetalleOrden, cantidad });
+      updates.push({
+        id_detalle_orden: idDetalleOrden,
+        modo_unidad: hasValue(row?.modo_unidad) ? String(row.modo_unidad).trim().toLowerCase() : null,
+        cantidad_raw: row?.cantidad,
+        id_presentacion_insumo_raw: row?.id_presentacion_insumo,
+        cantidad_presentacion_raw: row?.cantidad_presentacion
+      });
     }
 
     const deleteSet = new Set();
@@ -3136,6 +3507,12 @@ router.put('/orden_compras/workflow/:id_orden_compra/detalles', checkPermission(
       if (!existenciaAdds.ok) {
         return sendError(res, 400, 'VALIDATION_ERROR', existenciaAdds.message);
       }
+
+      const resolvedAdds = await resolvePurchasePresentationDetails(parsedAdds.details, client);
+      if (!resolvedAdds.ok) {
+        return sendError(res, resolvedAdds.status, resolvedAdds.code, resolvedAdds.message);
+      }
+      parsedAdds.details = resolvedAdds.details;
 
       const canViewAllAdds = await canUserViewAllOrders(req, idUsuario, client);
       if (!canViewAllAdds) {
@@ -3209,13 +3586,24 @@ router.put('/orden_compras/workflow/:id_orden_compra/detalles', checkPermission(
 
     const detalleRows = await client.query(
       `
-        SELECT id_detalle_orden
+        SELECT
+          id_detalle_orden,
+          id_insumo,
+          id_producto,
+          id_almacen_destino,
+          id_proveedor_sugerido,
+          id_presentacion_insumo,
+          cantidad_presentacion,
+          cantidad_orden
         FROM public.detalle_orden_compras
         WHERE id_orden_compra = $1
       `,
       [idOrdenCompra]
     );
-    const currentDetailIds = new Set(detalleRows.rows.map((row) => Number(row.id_detalle_orden)));
+    const currentDetailMap = new Map(
+      detalleRows.rows.map((row) => [Number(row.id_detalle_orden), row])
+    );
+    const currentDetailIds = new Set(currentDetailMap.keys());
 
     for (const row of updates) {
       if (!currentDetailIds.has(row.id_detalle_orden)) {
@@ -3250,17 +3638,138 @@ router.put('/orden_compras/workflow/:id_orden_compra/detalles', checkPermission(
       }
     }
 
+    const updateDetailsForResolution = [];
     for (const row of updates) {
-      // AM: actualiza cantidad por linea antes de aprobar/rechazar la orden.
-      await client.query(
-        `
-          UPDATE public.detalle_orden_compras
-          SET cantidad_orden = $1
-          WHERE id_detalle_orden = $2
-            AND id_orden_compra = $3
-        `,
-        [row.cantidad, row.id_detalle_orden, idOrdenCompra]
-      );
+      const currentDetail = currentDetailMap.get(row.id_detalle_orden);
+      if (currentDetail?.id_producto) {
+        if (
+          row.modo_unidad === 'presentacion' ||
+          hasValue(row.id_presentacion_insumo_raw) ||
+          hasValue(row.cantidad_presentacion_raw)
+        ) {
+          await withRollback(client);
+          return sendError(res, 400, 'VALIDATION_ERROR', 'Los productos no aceptan presentaciones de insumo.');
+        }
+
+        const cantidadProducto = parsePositiveInt(row.cantidad_raw);
+        if (!cantidadProducto) {
+          await withRollback(client);
+          return sendError(res, 400, 'VALIDATION_ERROR', 'cantidad de producto debe ser un entero mayor a 0.');
+        }
+
+        updateDetailsForResolution.push({
+          id_detalle_orden: row.id_detalle_orden,
+          item_tipo: 'producto',
+          id_item: Number(currentDetail.id_producto),
+          id_almacen_destino: parsePositiveInt(currentDetail.id_almacen_destino),
+          id_proveedor_sugerido: parsePositiveInt(currentDetail.id_proveedor_sugerido),
+          modo_unidad: 'base',
+          cantidad: cantidadProducto
+        });
+        continue;
+      }
+
+      const idInsumo = parsePositiveInt(currentDetail?.id_insumo);
+      const currentPresentationId = parsePositiveInt(currentDetail?.id_presentacion_insumo);
+      const requestedMode = row.modo_unidad || (currentPresentationId ? 'presentacion' : 'base');
+      if (!['base', 'presentacion'].includes(requestedMode)) {
+        await withRollback(client);
+        return sendError(res, 400, 'VALIDATION_ERROR', 'modo_unidad debe ser "base" o "presentacion".');
+      }
+      if (!row.modo_unidad && currentPresentationId) {
+        await withRollback(client);
+        return sendError(
+          res,
+          400,
+          'VALIDATION_ERROR',
+          'Para actualizar una linea con presentacion debes enviar modo_unidad "presentacion" y cantidad_presentacion, o modo_unidad "base" para cambiarla a unidad base.'
+        );
+      }
+
+      if (requestedMode === 'presentacion') {
+        const idPresentacionInsumo = parsePositiveInt(row.id_presentacion_insumo_raw) || currentPresentationId;
+        const cantidadPresentacion = parsePositiveDecimal4(row.cantidad_presentacion_raw);
+        if (!idPresentacionInsumo) {
+          await withRollback(client);
+          return sendError(res, 400, 'VALIDATION_ERROR', 'id_presentacion_insumo debe ser un entero mayor a 0.');
+        }
+        if (cantidadPresentacion === null) {
+          await withRollback(client);
+          return sendError(
+            res,
+            400,
+            'VALIDATION_ERROR',
+            'cantidad_presentacion debe ser decimal positivo con hasta 4 decimales.'
+          );
+        }
+
+        updateDetailsForResolution.push({
+          id_detalle_orden: row.id_detalle_orden,
+          item_tipo: 'insumo',
+          id_item: idInsumo,
+          id_almacen_destino: parsePositiveInt(currentDetail.id_almacen_destino),
+          id_proveedor_sugerido: parsePositiveInt(currentDetail.id_proveedor_sugerido),
+          modo_unidad: 'presentacion',
+          id_presentacion_insumo: idPresentacionInsumo,
+          cantidad_presentacion: cantidadPresentacion
+        });
+      } else {
+        const cantidadInsumo = parsePositiveDecimal4(row.cantidad_raw);
+        if (cantidadInsumo === null) {
+          await withRollback(client);
+          return sendError(
+            res,
+            400,
+            'VALIDATION_ERROR',
+            'cantidad de insumo debe ser decimal positivo con hasta 4 decimales.'
+          );
+        }
+
+        updateDetailsForResolution.push({
+          id_detalle_orden: row.id_detalle_orden,
+          item_tipo: 'insumo',
+          id_item: idInsumo,
+          id_almacen_destino: parsePositiveInt(currentDetail.id_almacen_destino),
+          id_proveedor_sugerido: parsePositiveInt(currentDetail.id_proveedor_sugerido),
+          modo_unidad: 'base',
+          cantidad: cantidadInsumo
+        });
+      }
+    }
+
+    if (updateDetailsForResolution.length > 0) {
+      const resolvedUpdates = await resolvePurchasePresentationDetails(updateDetailsForResolution, client);
+      if (!resolvedUpdates.ok) {
+        await withRollback(client);
+        return sendError(res, resolvedUpdates.status, resolvedUpdates.code, resolvedUpdates.message);
+      }
+
+      for (const detail of resolvedUpdates.details) {
+        // AM: actualiza cantidad y snapshot de presentacion antes de aprobar/rechazar la orden.
+        await client.query(
+          `
+            UPDATE public.detalle_orden_compras
+            SET cantidad_orden = $1,
+                id_unidad_base = $2,
+                id_presentacion_insumo = $3,
+                cantidad_presentacion = $4,
+                id_unidad_presentacion = $5,
+                factor_conversion_usado = $6
+            WHERE id_detalle_orden = $7
+              AND id_orden_compra = $8
+          `,
+          [
+            detail.cantidad_orden,
+            detail.id_unidad_base || null,
+            detail.id_presentacion_insumo || null,
+            detail.cantidad_presentacion,
+            detail.id_unidad_presentacion || null,
+            detail.factor_conversion_usado,
+            detail.id_detalle_orden,
+            idOrdenCompra
+          ]
+        );
+      }
     }
 
     if (deleteIds.length > 0) {
@@ -3278,9 +3787,16 @@ router.put('/orden_compras/workflow/:id_orden_compra/detalles', checkPermission(
     for (const detail of parsedAdds.details) {
       const idProducto = detail.item_tipo === 'producto' ? detail.id_item : null;
       const idInsumo = detail.item_tipo === 'insumo' ? detail.id_item : null;
-      const existingRow = await client.query(
+      const existingRows = await client.query(
         `
-          SELECT id_detalle_orden, cantidad_orden
+          SELECT
+            id_detalle_orden,
+            cantidad_orden,
+            id_unidad_base,
+            id_presentacion_insumo,
+            cantidad_presentacion,
+            id_unidad_presentacion,
+            factor_conversion_usado
           FROM public.detalle_orden_compras
           WHERE id_orden_compra = $1
             AND (
@@ -3288,22 +3804,67 @@ router.put('/orden_compras/workflow/:id_orden_compra/detalles', checkPermission(
               OR ($3::int IS NOT NULL AND id_insumo = $3 AND id_producto IS NULL)
             )
             AND id_almacen_destino = $4
-          LIMIT 1
+            AND COALESCE(id_proveedor_sugerido, 0) = COALESCE($5::int, 0)
+            AND (
+              ($6::bigint IS NULL AND id_presentacion_insumo IS NULL)
+              OR ($6::bigint IS NOT NULL AND id_presentacion_insumo = $6)
+            )
+          ORDER BY id_detalle_orden ASC
         `,
-        [idOrdenCompra, idProducto, idInsumo, detail.id_almacen_destino]
+        [
+          idOrdenCompra,
+          idProducto,
+          idInsumo,
+          detail.id_almacen_destino,
+          detail.id_proveedor_sugerido || null,
+          detail.id_presentacion_insumo || null
+        ]
       );
+      const existingDetail = (existingRows.rows || []).find((row) => arePurchaseSnapshotsCompatible(row, detail));
 
-      if (existingRow.rowCount > 0) {
-        // AM: evita duplicar lineas; suma cantidad cuando el item ya existe en el mismo almacen destino.
-        await client.query(
-          `
-            UPDATE public.detalle_orden_compras
-            SET cantidad_orden = cantidad_orden + $1
-            WHERE id_detalle_orden = $2
-              AND id_orden_compra = $3
-          `,
-          [detail.cantidad, existingRow.rows[0].id_detalle_orden, idOrdenCompra]
-        );
+      if (existingDetail) {
+        if (detail.modo_unidad === 'presentacion') {
+          const totalPresentacion = roundDecimal(
+            Number(existingDetail.cantidad_presentacion || 0) + Number(detail.cantidad_presentacion || 0),
+            4
+          );
+          const totalOrden = roundDecimal(
+            Number(existingDetail.cantidad_orden || 0) + Number(detail.cantidad_orden || 0),
+            4
+          );
+
+          // AM: fusiona solo snapshots identicos; conserva el factor/unidades historicas existentes.
+          await client.query(
+            `
+              UPDATE public.detalle_orden_compras
+              SET cantidad_orden = $1,
+                  cantidad_presentacion = $2
+              WHERE id_detalle_orden = $3
+                AND id_orden_compra = $4
+            `,
+            [
+              totalOrden,
+              totalPresentacion,
+              existingDetail.id_detalle_orden,
+              idOrdenCompra
+            ]
+          );
+        } else {
+          // AM: evita duplicar lineas; suma cantidad base cuando item/proveedor/almacen coinciden.
+          await client.query(
+            `
+              UPDATE public.detalle_orden_compras
+              SET cantidad_orden = cantidad_orden + $1
+              WHERE id_detalle_orden = $2
+                AND id_orden_compra = $3
+            `,
+            [
+              detail.cantidad_orden,
+              existingDetail.id_detalle_orden,
+              idOrdenCompra
+            ]
+          );
+        }
       } else {
         // AM: permite a Admin agregar lineas nuevas en orden pendiente sin romper contrato existente.
         await client.query(
@@ -3314,17 +3875,27 @@ router.put('/orden_compras/workflow/:id_orden_compra/detalles', checkPermission(
               id_insumo,
               id_producto,
               id_proveedor_sugerido,
-              id_almacen_destino
+              id_almacen_destino,
+              id_unidad_base,
+              id_presentacion_insumo,
+              cantidad_presentacion,
+              id_unidad_presentacion,
+              factor_conversion_usado
             )
-            VALUES ($1, $2, $3, $4, $5, $6)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
           `,
           [
-            detail.cantidad,
+            detail.cantidad_orden,
             idOrdenCompra,
             idInsumo,
             idProducto,
             detail.id_proveedor_sugerido || null,
-            detail.id_almacen_destino
+            detail.id_almacen_destino,
+            detail.id_unidad_base || null,
+            detail.id_presentacion_insumo || null,
+            detail.cantidad_presentacion,
+            detail.id_unidad_presentacion || null,
+            detail.factor_conversion_usado
           ]
         );
       }

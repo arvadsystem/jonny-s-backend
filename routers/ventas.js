@@ -6618,8 +6618,8 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
 
       if (hasDetallePedidoConfiguracionMenu) {
         detallePedidoValues = detallePedidoRows.map((_, index) => {
-          const base = index * 9;
-          return `($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}, true, $${base + 6}, $${base + 7}, $${base + 8}, $${base + 9}::jsonb)`;
+          const base = index * 10;
+          return `($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}, true, $${base + 6}, $${base + 7}, $${base + 8}, $${base + 9}, $${base + 10}::jsonb)`;
         }).join(', ');
         for (const { line, configuracionMenu } of detallePedidoRows) {
           detallePedidoParams.push(
@@ -6630,6 +6630,7 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
             line.id_descuento,
             line.id_combo,
             line.id_receta,
+            line.cantidad,
             line.observacion,
             configuracionMenu ? JSON.stringify(configuracionMenu) : null
           );
@@ -6645,6 +6646,7 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
               estado,
               id_combo,
               id_receta,
+              cantidad,
               observacion,
               configuracion_menu
             )
@@ -6655,8 +6657,8 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
         );
       } else {
         detallePedidoValues = detallePedidoRows.map((_, index) => {
-          const base = index * 8;
-          return `($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}, true, $${base + 6}, $${base + 7}, $${base + 8})`;
+          const base = index * 9;
+          return `($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}, true, $${base + 6}, $${base + 7}, $${base + 8}, $${base + 9})`;
         }).join(', ');
         for (const { line } of detallePedidoRows) {
           detallePedidoParams.push(
@@ -6667,6 +6669,7 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
             line.id_descuento,
             line.id_combo,
             line.id_receta,
+            line.cantidad,
             line.observacion
           );
         }
@@ -6681,6 +6684,7 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
               estado,
               id_combo,
               id_receta,
+              cantidad,
               observacion
             )
             VALUES ${detallePedidoValues}
@@ -7959,8 +7963,8 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
 
       if (hasDetallePedidoConfiguracionMenu) {
         detallePedidoValues = detallePedidoRows.map((_, index) => {
-          const base = index * 9;
-          return `($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}, true, $${base + 6}, $${base + 7}, $${base + 8}, $${base + 9}::jsonb)`;
+          const base = index * 10;
+          return `($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}, true, $${base + 6}, $${base + 7}, $${base + 8}, $${base + 9}, $${base + 10}::jsonb)`;
         }).join(', ');
         for (const { line, configuracionMenu } of detallePedidoRows) {
           detallePedidoParams.push(
@@ -7971,6 +7975,7 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
             line.id_descuento,
             line.id_combo,
             line.id_receta,
+            line.cantidad,
             line.observacion,
             configuracionMenu ? JSON.stringify(configuracionMenu) : null
           );
@@ -7986,6 +7991,7 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
               estado,
               id_combo,
               id_receta,
+              cantidad,
               observacion,
               configuracion_menu
             )
@@ -7996,8 +8002,8 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
         );
       } else {
         detallePedidoValues = detallePedidoRows.map((_, index) => {
-          const base = index * 8;
-          return `($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}, true, $${base + 6}, $${base + 7}, $${base + 8})`;
+          const base = index * 9;
+          return `($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}, true, $${base + 6}, $${base + 7}, $${base + 8}, $${base + 9})`;
         }).join(', ');
         for (const { line } of detallePedidoRows) {
           detallePedidoParams.push(
@@ -8008,6 +8014,7 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
             line.id_descuento,
             line.id_combo,
             line.id_receta,
+            line.cantidad,
             line.observacion
           );
         }
@@ -8022,6 +8029,7 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
               estado,
               id_combo,
               id_receta,
+              cantidad,
               observacion
             )
             VALUES ${detallePedidoValues}

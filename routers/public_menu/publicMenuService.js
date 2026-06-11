@@ -1592,6 +1592,7 @@ export const createPublicOrderService = async ({
         id_pedido: idPedido,
         id_combo: line.id_combo,
         id_receta: line.id_receta,
+        cantidad: line.cantidad,
         observacion: line.observacion,
         configuracion_menu: line.configuracion_menu
       });
