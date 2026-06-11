@@ -79,6 +79,239 @@ const fetchProductosByIdsForUpdate = async (client, ids) => {
   return rs.rows;
 };
 
+const fetchProductosMaestrosByIdsForUpdate = async (client, ids, idSucursal) => {
+  if (!ids.length) {
+    return {
+      rows: [],
+      missingIds: new Set(),
+      inactiveIds: new Set(),
+      unassignedIds: new Set(),
+      ambiguousIds: new Set(),
+      duplicateIds: new Set(),
+      mastersByInputId: new Map()
+    };
+  }
+
+  const legacyResult = await client.query(
+    `
+      SELECT
+        input.id_producto AS input_id,
+        COUNT(DISTINCT pm.id_producto_maestro)::int AS total_maestros,
+        MIN(pm.id_producto_maestro)::integer AS id_producto_maestro
+      FROM UNNEST($1::int[]) AS input(id_producto)
+      LEFT JOIN public.productos_mapeo_maestro pm
+        ON pm.id_producto_legacy = input.id_producto
+       AND pm.id_producto_legacy <> pm.id_producto_maestro
+      GROUP BY input.id_producto
+    `,
+    [ids]
+  );
+  const legacyByInputId = new Map(
+    (legacyResult.rows || []).map((row) => [
+      Number(row.input_id),
+      {
+        totalMaestros: Number(row.total_maestros || 0),
+        idProductoMaestro: Number(row.id_producto_maestro || 0)
+      }
+    ])
+  );
+
+  const unresolvedAfterLegacy = [];
+  const mastersByInputId = new Map();
+  const missingIds = new Set();
+
+  for (const id of ids) {
+    const legacy = legacyByInputId.get(id);
+    if (legacy?.totalMaestros === 1 && toPositiveInt(legacy.idProductoMaestro)) {
+      mastersByInputId.set(id, legacy.idProductoMaestro);
+      continue;
+    }
+    if ((legacy?.totalMaestros || 0) > 1) {
+      missingIds.add(id);
+      continue;
+    }
+    unresolvedAfterLegacy.push(id);
+  }
+
+  if (unresolvedAfterLegacy.length) {
+    const canonicalResult = await client.query(
+      `
+        SELECT DISTINCT pm.id_producto_maestro
+        FROM public.productos_mapeo_maestro pm
+        WHERE pm.id_producto_maestro = ANY($1::int[])
+      `,
+      [unresolvedAfterLegacy]
+    );
+    const canonicalIds = new Set(
+      (canonicalResult.rows || []).map((row) => Number(row.id_producto_maestro || 0)).filter((id) => id > 0)
+    );
+    for (const id of unresolvedAfterLegacy) {
+      if (canonicalIds.has(id)) mastersByInputId.set(id, id);
+    }
+  }
+
+  const fallbackIds = ids.filter((id) => !mastersByInputId.has(id) && !missingIds.has(id));
+  const fallbackRows = await fetchProductosByIdsForUpdate(client, fallbackIds);
+
+  const activeMasterIds = [...new Set([...mastersByInputId.values()])].sort((a, b) => a - b);
+  const mastersResult = activeMasterIds.length
+    ? await client.query(
+        `
+          SELECT
+            p.id_producto,
+            p.nombre_producto,
+            COALESCE(p.estado, true) AS estado
+          FROM public.productos p
+          WHERE p.id_producto = ANY($1::int[])
+          ORDER BY p.id_producto
+        `,
+        [activeMasterIds]
+      )
+    : { rows: [] };
+  const mastersById = mapById(mastersResult.rows, 'id_producto');
+  const inactiveMasterIds = new Set();
+  const validMasterIds = [];
+
+  for (const id of activeMasterIds) {
+    const master = mastersById.get(id);
+    if (!master) {
+      for (const [inputId, masterId] of mastersByInputId.entries()) {
+        if (masterId === id) missingIds.add(inputId);
+      }
+      continue;
+    }
+    if (!Boolean(master.estado)) {
+      inactiveMasterIds.add(id);
+      continue;
+    }
+    validMasterIds.push(id);
+  }
+
+  const inputIdsByMasterId = new Map();
+  for (const [inputId, masterId] of mastersByInputId.entries()) {
+    if (!inputIdsByMasterId.has(masterId)) inputIdsByMasterId.set(masterId, []);
+    inputIdsByMasterId.get(masterId).push(inputId);
+  }
+
+  const duplicateIds = new Set();
+  for (const inputIds of inputIdsByMasterId.values()) {
+    if (inputIds.length <= 1) continue;
+    for (const id of inputIds) duplicateIds.add(id);
+  }
+
+  const duplicateMasterIds = new Set(
+    [...duplicateIds].map((id) => mastersByInputId.get(id)).filter((id) => id > 0)
+  );
+  const uniqueValidMasterIds = validMasterIds.filter((id) => !duplicateMasterIds.has(id));
+  const unassignedMasterIds = new Set();
+  const ambiguousMasterIds = new Set();
+
+  if (uniqueValidMasterIds.length) {
+    const assignmentsResult = await client.query(
+      `
+        SELECT
+          pa.id_producto AS id_producto_maestro,
+          COUNT(*)::int AS total_asignaciones
+        FROM public.productos_almacenes pa
+        INNER JOIN public.almacenes a
+          ON a.id_almacen = pa.id_almacen
+         AND a.id_sucursal = $2
+         AND COALESCE(a.estado, true) = true
+        WHERE pa.id_producto = ANY($1::int[])
+          AND COALESCE(pa.estado, true) = true
+        GROUP BY pa.id_producto
+      `,
+      [uniqueValidMasterIds, idSucursal]
+    );
+    const assignmentCountsById = new Map(
+      (assignmentsResult.rows || []).map((row) => [
+        Number(row.id_producto_maestro),
+        Number(row.total_asignaciones || 0)
+      ])
+    );
+    for (const id of uniqueValidMasterIds) {
+      const count = assignmentCountsById.get(id) || 0;
+      if (count === 0) unassignedMasterIds.add(id);
+      if (count > 1) ambiguousMasterIds.add(id);
+    }
+  }
+
+  const lockableMasterIds = uniqueValidMasterIds.filter(
+    (id) => !unassignedMasterIds.has(id) && !ambiguousMasterIds.has(id)
+  );
+  const localRowsResult = lockableMasterIds.length
+    ? await client.query(
+        `
+          SELECT
+            pa.id_producto AS id_producto_maestro,
+            pm.id_producto_legacy AS id_producto_legacy_local,
+            p.nombre_producto,
+            COALESCE(pa.cantidad, 0)::numeric AS cantidad,
+            COALESCE(pa.stock_minimo, 0)::numeric AS stock_minimo,
+            pa.id_almacen,
+            a.id_sucursal,
+            COALESCE(pa.estado, true) AS estado
+          FROM public.productos_almacenes pa
+          INNER JOIN public.almacenes a
+            ON a.id_almacen = pa.id_almacen
+           AND a.id_sucursal = $2
+           AND COALESCE(a.estado, true) = true
+          INNER JOIN public.productos p
+            ON p.id_producto = pa.id_producto
+          LEFT JOIN public.productos_mapeo_maestro pm
+            ON pm.id_producto_maestro = pa.id_producto
+           AND pm.id_almacen_origen = pa.id_almacen
+          WHERE pa.id_producto = ANY($1::int[])
+            AND COALESCE(pa.estado, true) = true
+          ORDER BY pa.id_producto
+          FOR UPDATE OF pa
+        `,
+        [lockableMasterIds, idSucursal]
+      )
+    : { rows: [] };
+  const localRowsByMasterId = mapById(localRowsResult.rows, 'id_producto_maestro');
+
+  for (const id of lockableMasterIds) {
+    if (!localRowsByMasterId.has(id)) unassignedMasterIds.add(id);
+  }
+
+  const rows = [...fallbackRows];
+  for (const [inputId, masterId] of mastersByInputId.entries()) {
+    if (duplicateIds.has(inputId)) continue;
+    const localRow = localRowsByMasterId.get(masterId);
+    if (!localRow) continue;
+    rows.push({
+      ...localRow,
+      id_producto: inputId,
+      id_producto_solicitado: inputId,
+      id_producto_maestro: masterId
+    });
+  }
+
+  return {
+    rows,
+    missingIds,
+    inactiveIds: new Set(
+      [...mastersByInputId.entries()]
+        .filter(([, masterId]) => inactiveMasterIds.has(masterId))
+        .map(([inputId]) => inputId)
+    ),
+    unassignedIds: new Set(
+      [...mastersByInputId.entries()]
+        .filter(([, masterId]) => unassignedMasterIds.has(masterId))
+        .map(([inputId]) => inputId)
+    ),
+    ambiguousIds: new Set(
+      [...mastersByInputId.entries()]
+        .filter(([, masterId]) => ambiguousMasterIds.has(masterId))
+        .map(([inputId]) => inputId)
+    ),
+    duplicateIds,
+    mastersByInputId,
+    mastersById
+  };
+};
+
 const fetchInsumosByIdsForUpdate = async (client, ids) => {
   if (!ids.length) return [];
   const rs = await client.query(
@@ -279,20 +512,91 @@ export const validarStockConBloqueo = async ({
 
   const productoIds = [...productoQtyMap.keys()].sort((a, b) => a - b);
   const insumoIds = [...insumoQtyMap.keys()].sort((a, b) => a - b);
-  const useCatalogoMaestroInsumos = isCatalogoMaestroReadsEnabled();
+  const useCatalogoMaestroReads = isCatalogoMaestroReadsEnabled();
 
-  const [productosRows, insumosFetchResult] = await Promise.all([
-    fetchProductosByIdsForUpdate(client, productoIds),
-    useCatalogoMaestroInsumos
+  const [productosFetchResult, insumosFetchResult] = await Promise.all([
+    useCatalogoMaestroReads
+      ? fetchProductosMaestrosByIdsForUpdate(client, productoIds, idSucursal)
+      : fetchProductosByIdsForUpdate(client, productoIds),
+    useCatalogoMaestroReads
       ? fetchInsumosMaestrosByIdsForUpdate(client, insumoIds, idSucursal)
       : fetchInsumosByIdsForUpdate(client, insumoIds)
   ]);
-  const insumosRows = useCatalogoMaestroInsumos ? insumosFetchResult.rows : insumosFetchResult;
+  const productosRows = useCatalogoMaestroReads ? productosFetchResult.rows : productosFetchResult;
+  const insumosRows = useCatalogoMaestroReads ? insumosFetchResult.rows : insumosFetchResult;
 
   const productosById = mapById(productosRows, 'id_producto');
   const insumosById = mapById(insumosRows, 'id_insumo');
 
   for (const idProducto of productoIds) {
+    if (useCatalogoMaestroReads) {
+      const masterId = productosFetchResult.mastersByInputId?.get(idProducto);
+      const master = masterId ? productosFetchResult.mastersById?.get(masterId) : null;
+      if (productosFetchResult.duplicateIds?.has(idProducto)) {
+        excludedProductIds.add(idProducto);
+        faltantes.push({
+          tipo_recurso: 'producto',
+          id_recurso: idProducto,
+          id_producto: idProducto,
+          id_producto_maestro: masterId || null,
+          nombre: master?.nombre_producto,
+          motivo: 'PRODUCTO_MAESTRO_DUPLICADO_EN_PEDIDO',
+          mensaje: 'El pedido contiene referencias duplicadas que corresponden al mismo producto maestro.'
+        });
+        continue;
+      }
+      if (productosFetchResult.missingIds?.has(idProducto)) {
+        excludedProductIds.add(idProducto);
+        faltantes.push({
+          tipo_recurso: 'producto',
+          id_recurso: idProducto,
+          id_producto: idProducto,
+          motivo: 'PRODUCTO_NO_ENCONTRADO',
+          mensaje: `El producto ${idProducto} no existe o no esta disponible para inventario.`
+        });
+        continue;
+      }
+      if (productosFetchResult.inactiveIds?.has(idProducto)) {
+        excludedProductIds.add(idProducto);
+        faltantes.push({
+          tipo_recurso: 'producto',
+          id_recurso: idProducto,
+          id_producto: idProducto,
+          id_producto_maestro: masterId || null,
+          nombre: master?.nombre_producto,
+          motivo: 'PRODUCTO_INACTIVO',
+          mensaje: `El producto ${master?.nombre_producto || idProducto} esta inactivo.`
+        });
+        continue;
+      }
+      if (productosFetchResult.unassignedIds?.has(idProducto)) {
+        excludedProductIds.add(idProducto);
+        faltantes.push({
+          tipo_recurso: 'producto',
+          id_recurso: idProducto,
+          id_producto: idProducto,
+          id_producto_maestro: masterId || null,
+          nombre: master?.nombre_producto,
+          motivo: 'PRODUCTO_MAESTRO_SIN_ASIGNACION_SUCURSAL',
+          mensaje: 'El producto maestro no tiene una asignacion activa en la sucursal del pedido.'
+        });
+        continue;
+      }
+      if (productosFetchResult.ambiguousIds?.has(idProducto)) {
+        excludedProductIds.add(idProducto);
+        faltantes.push({
+          tipo_recurso: 'producto',
+          id_recurso: idProducto,
+          id_producto: idProducto,
+          id_producto_maestro: masterId || null,
+          nombre: master?.nombre_producto,
+          motivo: 'PRODUCTO_MAESTRO_ASIGNACION_AMBIGUA',
+          mensaje: 'El producto maestro tiene mas de una asignacion activa en la sucursal.'
+        });
+        continue;
+      }
+    }
+
     const row = productosById.get(idProducto);
     if (!row) {
       excludedProductIds.add(idProducto);
@@ -330,7 +634,7 @@ export const validarStockConBloqueo = async ({
   }
 
   for (const idInsumo of insumoIds) {
-    if (useCatalogoMaestroInsumos) {
+    if (useCatalogoMaestroReads) {
       const master = insumosFetchResult.mastersById?.get(idInsumo);
       if (insumosFetchResult.missingIds?.has(idInsumo)) {
         excludedInsumoIds.add(idInsumo);

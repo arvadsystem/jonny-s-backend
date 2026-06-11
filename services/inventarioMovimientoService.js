@@ -70,10 +70,11 @@ export const registrarMovimientosPedido = async ({
   for (const idProducto of productoIds) {
     const row = productosById.get(idProducto);
     const shortage = shortagesByResource.get(`producto:${idProducto}`) || null;
+    const idProductoMovimiento = toPositiveInt(row?.id_producto_maestro) || toPositiveInt(row?.id_producto) || idProducto;
     await insertMovimiento(client, {
       cantidad: Number(productoQtyMap.get(idProducto) || 0),
       id_almacen: Number(row.id_almacen),
-      id_producto: idProducto,
+      id_producto: idProductoMovimiento,
       id_insumo: null,
       id_ref: idPedido,
       ref_origen: refOrigen,
