@@ -16,6 +16,16 @@ import {
   completeProductoCatalogoMaestroWrite,
   isCatalogoMaestroWriteStructureMissingError
 } from '../services/catalogoMaestroWriteService.js';
+import {
+  createCatalogoMaestroAssignment,
+  deactivateCatalogoMaestroAssignment,
+  findActiveSucursalAssignmentConflict,
+  getWarehouseAssignmentDetails,
+  listCatalogoMaestroAssignments,
+  listCatalogoMaestroAvailableWarehouses,
+  reactivateCatalogoMaestroAssignment,
+  resolveCatalogoMaestroEntity
+} from '../services/catalogoMaestroAsignacionesService.js';
 
 const router = express.Router();
 const PRODUCTOS_LIST_PERMISSIONS = ['INVENTARIO_PRODUCTOS_VER', 'INVENTARIO_PRODUCTOS_DETALLE_VER'];
@@ -89,6 +99,8 @@ const PRODUCTOS_SCOPE_FORBIDDEN_MESSAGE = 'No tiene permisos para operar sobre r
 const PRODUCTOS_SCOPE_MISSING_BRANCHES_MESSAGE = 'El empleado no tiene sucursales asignadas.';
 const PRODUCTOS_NOT_FOUND_MESSAGE = 'Producto no encontrado.';
 const ALMACEN_NOT_FOUND_MESSAGE = 'Almacen no encontrado.';
+const PRODUCTOS_ASSIGNMENT_ALREADY_ACTIVE_MESSAGE = 'El producto maestro ya tiene una asignacion activa en el almacen indicado.';
+const PRODUCTOS_ASSIGNMENT_BRANCH_CONFLICT_MESSAGE = 'El producto maestro ya tiene una asignacion activa en otra bodega de la misma sucursal.';
 const PRODUCTOS_DEFAULT_PAGE = 1;
 const PRODUCTOS_DEFAULT_PAGE_SIZE = 10;
 const PRODUCTOS_MAX_PAGE_SIZE = 100;
@@ -477,6 +489,27 @@ async function assertProductoCanBeDeactivated(idProducto, db = pool) {
   }
 
   return { ok: true, status: 200 };
+}
+
+async function resolveProductoMaestroForAssignments(rawIdProducto, db = pool) {
+  return resolveCatalogoMaestroEntity('producto', rawIdProducto, db);
+}
+
+async function getProductoAssignmentScope(req, db = pool) {
+  const scope = await getAllowedBranchIdsForUser(req, db);
+  if (!scope.isSuperAdmin && scope.allowedSucursalIds.length === 0) {
+    return {
+      ok: false,
+      status: 403,
+      message: PRODUCTOS_SCOPE_MISSING_BRANCHES_MESSAGE
+    };
+  }
+
+  return {
+    ok: true,
+    isSuperAdmin: scope.isSuperAdmin,
+    allowedSucursalIds: scope.allowedSucursalIds
+  };
 }
 
 // NUEVO: helper para detectar valores vacios en campos opcionales
@@ -1213,6 +1246,247 @@ async function listProductosDesdeCatalogoMaestro({
 }
 
 // GET: Obtener productos
+router.get('/productos/:id_producto/asignaciones', checkPermission(PRODUCTOS_LIST_PERMISSIONS), async (req, res) => {
+  try {
+    const scope = await getProductoAssignmentScope(req, pool);
+    if (!scope.ok) {
+      return res.status(scope.status).json({ error: true, message: scope.message });
+    }
+
+    const resolved = await resolveProductoMaestroForAssignments(req.params?.id_producto, pool);
+    if (!resolved.ok) {
+      return res.status(resolved.status).json({ error: true, message: resolved.message });
+    }
+
+    const asignaciones = await listCatalogoMaestroAssignments(
+      'producto',
+      resolved.masterId,
+      {
+        allowedSucursalIds: scope.isSuperAdmin ? null : scope.allowedSucursalIds
+      },
+      pool
+    );
+
+    return res.status(200).json({
+      id_producto_maestro: resolved.masterId,
+      asignaciones
+    });
+  } catch (err) {
+    console.error('Error en GET /productos/:id_producto/asignaciones:', err.message);
+    return res.status(500).json({ error: true, message: getSafeProductosServerErrorMessage(err) });
+  }
+});
+
+router.get('/productos/:id_producto/almacenes-disponibles', checkPermission(PRODUCTOS_LIST_PERMISSIONS), async (req, res) => {
+  try {
+    const scope = await getProductoAssignmentScope(req, pool);
+    if (!scope.ok) {
+      return res.status(scope.status).json({ error: true, message: scope.message });
+    }
+
+    const resolved = await resolveProductoMaestroForAssignments(req.params?.id_producto, pool);
+    if (!resolved.ok) {
+      return res.status(resolved.status).json({ error: true, message: resolved.message });
+    }
+
+    const almacenes = await listCatalogoMaestroAvailableWarehouses(
+      'producto',
+      resolved.masterId,
+      {
+        allowedSucursalIds: scope.isSuperAdmin ? null : scope.allowedSucursalIds
+      },
+      pool
+    );
+
+    return res.status(200).json({
+      id_producto_maestro: resolved.masterId,
+      almacenes_disponibles: almacenes
+    });
+  } catch (err) {
+    console.error('Error en GET /productos/:id_producto/almacenes-disponibles:', err.message);
+    return res.status(500).json({ error: true, message: getSafeProductosServerErrorMessage(err) });
+  }
+});
+
+router.post('/productos/:id_producto/asignaciones', checkPermission(PRODUCTOS_EDIT_PERMISSIONS), async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const resolved = await resolveProductoMaestroForAssignments(req.params?.id_producto, client);
+    if (!resolved.ok) {
+      return res.status(resolved.status).json({ error: true, message: resolved.message });
+    }
+
+    if (!resolved.master.estado_global) {
+      return res.status(400).json({ error: true, message: 'El producto maestro esta inactivo.' });
+    }
+
+    const stockValidation = Object.prototype.hasOwnProperty.call(req.body || {}, 'stock_minimo')
+      ? validarCampoProducto('stock_minimo', req.body?.stock_minimo)
+      : { valido: true, valor: resolved.master.stock_minimo_default ?? 0 };
+    if (!stockValidation.valido) {
+      return res.status(400).json({ error: true, message: stockValidation.message });
+    }
+
+    if (Object.prototype.hasOwnProperty.call(req.body || {}, 'activo')) {
+      const activoValidation = validarCampoProducto('estado', req.body?.activo);
+      if (!activoValidation.valido) {
+        return res.status(400).json({ error: true, message: activoValidation.message });
+      }
+      if (activoValidation.valor !== true) {
+        return res.status(400).json({ error: true, message: 'La asignacion nueva debe crearse o reactivarse en estado activo.' });
+      }
+    }
+
+    const idAlmacen = Number.parseInt(String(req.body?.id_almacen ?? ''), 10);
+    if (!esEnteroPositivoInt32(idAlmacen)) {
+      return res.status(400).json({ error: true, message: 'id_almacen invalido.' });
+    }
+
+    const scopeValidation = await assertAlmacenesInScope(req, [idAlmacen], client);
+    if (!scopeValidation.ok) {
+      return res.status(scopeValidation.status).json({
+        error: true,
+        message: scopeValidation.message
+      });
+    }
+
+    const almacenOperativo = await validarAlmacenOperativo(idAlmacen, client);
+    if (!almacenOperativo.ok) {
+      const status = String(almacenOperativo.message || '').includes('no existe') ? 404 : 400;
+      return res.status(status).json({
+        error: true,
+        message: status === 404 ? ALMACEN_NOT_FOUND_MESSAGE : almacenOperativo.message
+      });
+    }
+
+    await client.query('BEGIN');
+
+    const sameWarehouseAssignment = await getWarehouseAssignmentDetails('producto', resolved.masterId, idAlmacen, client);
+    const conflictingAssignment = await findActiveSucursalAssignmentConflict('producto', resolved.masterId, idAlmacen, client);
+    if (conflictingAssignment) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({
+        error: true,
+        code: 'PRODUCT_MASTER_BRANCH_ASSIGNMENT_CONFLICT',
+        message: PRODUCTOS_ASSIGNMENT_BRANCH_CONFLICT_MESSAGE
+      });
+    }
+
+    if (sameWarehouseAssignment?.activo) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({
+        error: true,
+        code: 'PRODUCT_MASTER_ASSIGNMENT_ALREADY_ACTIVE',
+        message: PRODUCTOS_ASSIGNMENT_ALREADY_ACTIVE_MESSAGE
+      });
+    }
+
+    if (sameWarehouseAssignment) {
+      await reactivateCatalogoMaestroAssignment(
+        'producto',
+        {
+          masterId: resolved.masterId,
+          warehouseId: idAlmacen,
+          stockMinimo: stockValidation.valor
+        },
+        client
+      );
+
+      await client.query('COMMIT');
+      return res.status(200).json({
+        error: false,
+        message: 'Asignacion local del producto maestro reactivada correctamente.',
+        id_producto_maestro: resolved.masterId,
+        id_almacen: idAlmacen
+      });
+    }
+
+    await createCatalogoMaestroAssignment(
+      'producto',
+      {
+        masterId: resolved.masterId,
+        warehouseId: idAlmacen,
+        stockMinimo: stockValidation.valor,
+        precioLocal: resolved.master.precio_local_default,
+        fechaCaducidad: resolved.master.fecha_caducidad_default,
+        activo: true
+      },
+      client
+    );
+
+    await client.query('COMMIT');
+    return res.status(201).json({
+      error: false,
+      message: 'Producto maestro asignado correctamente al almacen.',
+      id_producto_maestro: resolved.masterId,
+      id_almacen: idAlmacen
+    });
+  } catch (err) {
+    try { await client.query('ROLLBACK'); } catch {}
+    console.error('Error en POST /productos/:id_producto/asignaciones:', err.message);
+    return res.status(500).json({ error: true, message: getSafeProductosServerErrorMessage(err) });
+  } finally {
+    client.release();
+  }
+});
+
+router.patch('/productos/:id_producto/asignaciones/:id_almacen/inactivar', checkPermission(PRODUCTOS_DELETE_PERMISSIONS), async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const resolved = await resolveProductoMaestroForAssignments(req.params?.id_producto, client);
+    if (!resolved.ok) {
+      return res.status(resolved.status).json({ error: true, message: resolved.message });
+    }
+
+    const idAlmacen = Number.parseInt(String(req.params?.id_almacen ?? ''), 10);
+    if (!esEnteroPositivoInt32(idAlmacen)) {
+      return res.status(400).json({ error: true, message: 'id_almacen invalido.' });
+    }
+
+    const scopeValidation = await assertAlmacenesInScope(req, [idAlmacen], client);
+    if (!scopeValidation.ok) {
+      return res.status(scopeValidation.status).json({
+        error: true,
+        message: scopeValidation.message
+      });
+    }
+
+    const assignment = await getWarehouseAssignmentDetails('producto', resolved.masterId, idAlmacen, client);
+    if (!assignment) {
+      return res.status(404).json({
+        error: true,
+        message: 'La asignacion local del producto maestro no existe para ese almacen.'
+      });
+    }
+
+    await client.query('BEGIN');
+    await deactivateCatalogoMaestroAssignment(
+      'producto',
+      {
+        masterId: resolved.masterId,
+        warehouseId: idAlmacen
+      },
+      client
+    );
+    await client.query('COMMIT');
+
+    return res.status(200).json({
+      error: false,
+      message: assignment.activo
+        ? 'Asignacion local del producto maestro inactivada correctamente.'
+        : 'La asignacion local del producto maestro ya estaba inactiva.',
+      id_producto_maestro: resolved.masterId,
+      id_almacen: idAlmacen
+    });
+  } catch (err) {
+    try { await client.query('ROLLBACK'); } catch {}
+    console.error('Error en PATCH /productos/:id_producto/asignaciones/:id_almacen/inactivar:', err.message);
+    return res.status(500).json({ error: true, message: getSafeProductosServerErrorMessage(err) });
+  } finally {
+    client.release();
+  }
+});
+
 router.get('/productos', checkPermission(PRODUCTOS_LIST_PERMISSIONS), async (req, res) => {
   try {
     const queryPayload = { ...req.query };

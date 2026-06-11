@@ -16,6 +16,16 @@ import {
   completeInsumoCatalogoMaestroWrite,
   isCatalogoMaestroWriteStructureMissingError
 } from '../services/catalogoMaestroWriteService.js';
+import {
+  createCatalogoMaestroAssignment,
+  deactivateCatalogoMaestroAssignment,
+  findActiveSucursalAssignmentConflict,
+  getWarehouseAssignmentDetails,
+  listCatalogoMaestroAssignments,
+  listCatalogoMaestroAvailableWarehouses,
+  reactivateCatalogoMaestroAssignment,
+  resolveCatalogoMaestroEntity
+} from '../services/catalogoMaestroAsignacionesService.js';
 
 const router = express.Router();
 const INSUMOS_LIST_PERMISSIONS = ['INVENTARIO_INSUMOS_VER', 'INVENTARIO_INSUMOS_DETALLE_VER'];
@@ -28,6 +38,8 @@ const INSUMOS_ALMACENES_TABLE_MISSING_CODE = 'INSUMOS_ALMACENES_TABLE_MISSING';
 const INSUMOS_ALMACENES_TABLE_MISSING_MESSAGE = 'Falta una estructura requerida del sistema: tabla public.insumos_almacenes. Aplica las migraciones pendientes.';
 const INSUMOS_DUPLICATE_CONSTRAINT = 'uq_insumos_nombre_categoria_unidad_norm';
 const INSUMOS_DUPLICATE_MESSAGE = 'Ya existe un insumo con ese nombre en el almacÃ©n seleccionado.';
+const INSUMOS_ASSIGNMENT_ALREADY_ACTIVE_MESSAGE = 'El insumo maestro ya tiene una asignacion activa en el almacen indicado.';
+const INSUMOS_ASSIGNMENT_BRANCH_CONFLICT_MESSAGE = 'El insumo maestro ya tiene una asignacion activa en otra bodega de la misma sucursal.';
 const SINGLE_ALMACEN_TEMP_MESSAGE = 'Temporalmente solo se permite un almacÃ©n por producto o insumo.';
 
 // AM: allowlist de campos permitidos para alta/edicion controlada de insumos.
@@ -169,6 +181,69 @@ const getAllowedBranchIdsForInsumosUser = async (req, db = pool) => {
 
   if (req) req.__insumosSucursalScope = payload;
   return payload;
+};
+
+const getInsumoAssignmentScope = async (req, db = pool) => {
+  const scope = await getAllowedBranchIdsForInsumosUser(req, db);
+  if (!scope.isSuperAdmin && scope.allowedSucursalIds.length === 0) {
+    return {
+      ok: false,
+      status: 403,
+      message: INSUMOS_SCOPE_MISSING_BRANCHES_MESSAGE
+    };
+  }
+
+  return {
+    ok: true,
+    isSuperAdmin: scope.isSuperAdmin,
+    allowedSucursalIds: scope.allowedSucursalIds
+  };
+};
+
+const assertInsumoWarehouseInScope = async (req, rawWarehouseIds, db = pool) => {
+  const idAlmacenes = Array.from(
+    new Set(
+      (Array.isArray(rawWarehouseIds) ? rawWarehouseIds : [])
+        .map((id) => Number.parseInt(String(id ?? '').trim(), 10))
+        .filter((id) => isPositiveIntegerId(id))
+    )
+  );
+
+  if (idAlmacenes.length === 0) {
+    return { ok: false, status: 400, message: 'Debe seleccionar al menos un id_almacen.' };
+  }
+
+  const scope = await getAllowedBranchIdsForInsumosUser(req, db);
+  if (!scope.isSuperAdmin && scope.allowedSucursalIds.length === 0) {
+    return { ok: false, status: 403, message: INSUMOS_SCOPE_MISSING_BRANCHES_MESSAGE };
+  }
+
+  const warehousesResult = await db.query(
+    `
+      SELECT a.id_almacen, a.id_sucursal
+      FROM public.almacenes a
+      WHERE a.id_almacen = ANY($1::int[])
+    `,
+    [idAlmacenes]
+  );
+
+  if (warehousesResult.rowCount !== idAlmacenes.length) {
+    return { ok: false, status: 404, message: 'Almacen no encontrado.' };
+  }
+
+  if (!scope.isSuperAdmin) {
+    const allowedSet = new Set(scope.allowedSucursalIds);
+    const hasUnauthorizedWarehouse = (warehousesResult.rows || []).some((row) => {
+      const idSucursal = Number.parseInt(String(row?.id_sucursal ?? ''), 10);
+      return !isPositiveIntegerId(idSucursal) || !allowedSet.has(idSucursal);
+    });
+
+    if (hasUnauthorizedWarehouse) {
+      return { ok: false, status: 403, message: 'No tiene acceso a la sucursal solicitada.' };
+    }
+  }
+
+  return { ok: true, status: 200, rows: warehousesResult.rows || [] };
 };
 
 // AM: normaliza lista de almacenes del item usando pivote (id_almacenes) o fallback legacy (id_almacen).
@@ -734,6 +809,10 @@ const assertInsumoCanBeDeactivated = async (idInsumo, db = pool) => {
   }
   return { ok: true, status: 200 };
 };
+
+const resolveInsumoMaestroForAssignments = async (rawIdInsumo, db = pool) =>
+  resolveCatalogoMaestroEntity('insumo', rawIdInsumo, db);
+
 const buildInsumosAlmacenesTableMissingError = (error) => {
   const wrapped = new Error(INSUMOS_ALMACENES_TABLE_MISSING_MESSAGE);
   wrapped.code = INSUMOS_ALMACENES_TABLE_MISSING_CODE;
@@ -1161,6 +1240,251 @@ const updateInsumoCompleto = async (insumoId, data, db = pool) => {
 };
 
 // GET: Obtener insumos
+router.get('/insumos/:id_insumo/asignaciones', checkPermission(INSUMOS_LIST_PERMISSIONS), async (req, res) => {
+  try {
+    const scope = await getInsumoAssignmentScope(req, pool);
+    if (!scope.ok) {
+      return res.status(scope.status).json({ error: true, message: scope.message });
+    }
+
+    const resolved = await resolveInsumoMaestroForAssignments(req.params?.id_insumo, pool);
+    if (!resolved.ok) {
+      return res.status(resolved.status).json({ error: true, message: resolved.message });
+    }
+
+    const asignaciones = await listCatalogoMaestroAssignments(
+      'insumo',
+      resolved.masterId,
+      {
+        allowedSucursalIds: scope.isSuperAdmin ? null : scope.allowedSucursalIds
+      },
+      pool
+    );
+
+    return res.status(200).json({
+      id_insumo_maestro: resolved.masterId,
+      asignaciones
+    });
+  } catch (err) {
+    console.error('Error en GET /insumos/:id_insumo/asignaciones:', err.message);
+    return res.status(500).json({ error: true, message: safeServerErrorMessage() });
+  }
+});
+
+router.get('/insumos/:id_insumo/almacenes-disponibles', checkPermission(INSUMOS_LIST_PERMISSIONS), async (req, res) => {
+  try {
+    const scope = await getInsumoAssignmentScope(req, pool);
+    if (!scope.ok) {
+      return res.status(scope.status).json({ error: true, message: scope.message });
+    }
+
+    const resolved = await resolveInsumoMaestroForAssignments(req.params?.id_insumo, pool);
+    if (!resolved.ok) {
+      return res.status(resolved.status).json({ error: true, message: resolved.message });
+    }
+
+    const almacenes = await listCatalogoMaestroAvailableWarehouses(
+      'insumo',
+      resolved.masterId,
+      {
+        allowedSucursalIds: scope.isSuperAdmin ? null : scope.allowedSucursalIds
+      },
+      pool
+    );
+
+    return res.status(200).json({
+      id_insumo_maestro: resolved.masterId,
+      almacenes_disponibles: almacenes
+    });
+  } catch (err) {
+    console.error('Error en GET /insumos/:id_insumo/almacenes-disponibles:', err.message);
+    return res.status(500).json({ error: true, message: safeServerErrorMessage() });
+  }
+});
+
+router.post('/insumos/:id_insumo/asignaciones', checkPermission(INSUMOS_EDIT_PERMISSIONS), async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const resolved = await resolveInsumoMaestroForAssignments(req.params?.id_insumo, client);
+    if (!resolved.ok) {
+      return res.status(resolved.status).json({ error: true, message: resolved.message });
+    }
+
+    if (!resolved.master.estado_global) {
+      return res.status(400).json({ error: true, message: 'El insumo maestro esta inactivo.' });
+    }
+
+    const idAlmacen = Number.parseInt(String(req.body?.id_almacen ?? ''), 10);
+    if (!isPositiveIntegerId(idAlmacen)) {
+      return res.status(400).json({ error: true, message: 'id_almacen invalido.' });
+    }
+
+    const stockMinimo = Object.prototype.hasOwnProperty.call(req.body || {}, 'stock_minimo')
+      ? parseNonNegativeDecimal(req.body?.stock_minimo)
+      : resolved.master.stock_minimo_default ?? 0;
+    if (stockMinimo === null) {
+      return res.status(400).json({ error: true, message: 'stock_minimo debe ser un numero mayor o igual a 0.' });
+    }
+
+    if (Object.prototype.hasOwnProperty.call(req.body || {}, 'activo')) {
+      const rawActivo = req.body?.activo;
+      const normalizedActivo =
+        rawActivo === true || rawActivo === 1 || rawActivo === '1' || String(rawActivo).trim().toLowerCase() === 'true';
+      const isKnownBoolean =
+        normalizedActivo || rawActivo === false || rawActivo === 0 || rawActivo === '0' || String(rawActivo).trim().toLowerCase() === 'false';
+      if (!isKnownBoolean) {
+        return res.status(400).json({ error: true, message: 'activo debe ser boolean (true/false o 1/0).' });
+      }
+      if (!normalizedActivo) {
+        return res.status(400).json({ error: true, message: 'La asignacion nueva debe crearse o reactivarse en estado activo.' });
+      }
+    }
+
+    const scopeValidation = await assertInsumoWarehouseInScope(req, [idAlmacen], client);
+    if (!scopeValidation.ok) {
+      return res.status(scopeValidation.status).json({
+        error: true,
+        message: scopeValidation.message
+      });
+    }
+
+    const almacenValidation = await validateAlmacenActivo(idAlmacen, client);
+    if (!almacenValidation.ok) {
+      const status = String(almacenValidation.message || '').includes('no existe') ? 404 : 400;
+      return res.status(status).json({
+        error: true,
+        message: status === 404 ? 'Almacen no encontrado.' : almacenValidation.message
+      });
+    }
+
+    await client.query('BEGIN');
+
+    const sameWarehouseAssignment = await getWarehouseAssignmentDetails('insumo', resolved.masterId, idAlmacen, client);
+    const conflictingAssignment = await findActiveSucursalAssignmentConflict('insumo', resolved.masterId, idAlmacen, client);
+    if (conflictingAssignment) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({
+        error: true,
+        code: 'INSUMO_MASTER_BRANCH_ASSIGNMENT_CONFLICT',
+        message: INSUMOS_ASSIGNMENT_BRANCH_CONFLICT_MESSAGE
+      });
+    }
+
+    if (sameWarehouseAssignment?.activo) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({
+        error: true,
+        code: 'INSUMO_MASTER_ASSIGNMENT_ALREADY_ACTIVE',
+        message: INSUMOS_ASSIGNMENT_ALREADY_ACTIVE_MESSAGE
+      });
+    }
+
+    if (sameWarehouseAssignment) {
+      await reactivateCatalogoMaestroAssignment(
+        'insumo',
+        {
+          masterId: resolved.masterId,
+          warehouseId: idAlmacen,
+          stockMinimo
+        },
+        client
+      );
+
+      await client.query('COMMIT');
+      return res.status(200).json({
+        error: false,
+        message: 'Asignacion local del insumo maestro reactivada correctamente.',
+        id_insumo_maestro: resolved.masterId,
+        id_almacen: idAlmacen
+      });
+    }
+
+    await createCatalogoMaestroAssignment(
+      'insumo',
+      {
+        masterId: resolved.masterId,
+        warehouseId: idAlmacen,
+        stockMinimo,
+        precioLocal: resolved.master.precio_local_default,
+        fechaCaducidad: resolved.master.fecha_caducidad_default,
+        activo: true
+      },
+      client
+    );
+
+    await client.query('COMMIT');
+    return res.status(201).json({
+      error: false,
+      message: 'Insumo maestro asignado correctamente al almacen.',
+      id_insumo_maestro: resolved.masterId,
+      id_almacen: idAlmacen
+    });
+  } catch (err) {
+    try { await client.query('ROLLBACK'); } catch {}
+    console.error('Error en POST /insumos/:id_insumo/asignaciones:', err.message);
+    return res.status(500).json({ error: true, message: safeServerErrorMessage() });
+  } finally {
+    client.release();
+  }
+});
+
+router.patch('/insumos/:id_insumo/asignaciones/:id_almacen/inactivar', checkPermission(INSUMOS_STATE_PERMISSIONS), async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const resolved = await resolveInsumoMaestroForAssignments(req.params?.id_insumo, client);
+    if (!resolved.ok) {
+      return res.status(resolved.status).json({ error: true, message: resolved.message });
+    }
+
+    const idAlmacen = Number.parseInt(String(req.params?.id_almacen ?? ''), 10);
+    if (!isPositiveIntegerId(idAlmacen)) {
+      return res.status(400).json({ error: true, message: 'id_almacen invalido.' });
+    }
+
+    const scopeValidation = await assertInsumoWarehouseInScope(req, [idAlmacen], client);
+    if (!scopeValidation.ok) {
+      return res.status(scopeValidation.status).json({
+        error: true,
+        message: scopeValidation.message
+      });
+    }
+
+    const assignment = await getWarehouseAssignmentDetails('insumo', resolved.masterId, idAlmacen, client);
+    if (!assignment) {
+      return res.status(404).json({
+        error: true,
+        message: 'La asignacion local del insumo maestro no existe para ese almacen.'
+      });
+    }
+
+    await client.query('BEGIN');
+    await deactivateCatalogoMaestroAssignment(
+      'insumo',
+      {
+        masterId: resolved.masterId,
+        warehouseId: idAlmacen
+      },
+      client
+    );
+    await client.query('COMMIT');
+
+    return res.status(200).json({
+      error: false,
+      message: assignment.activo
+        ? 'Asignacion local del insumo maestro inactivada correctamente.'
+        : 'La asignacion local del insumo maestro ya estaba inactiva.',
+      id_insumo_maestro: resolved.masterId,
+      id_almacen: idAlmacen
+    });
+  } catch (err) {
+    try { await client.query('ROLLBACK'); } catch {}
+    console.error('Error en PATCH /insumos/:id_insumo/asignaciones/:id_almacen/inactivar:', err.message);
+    return res.status(500).json({ error: true, message: safeServerErrorMessage() });
+  } finally {
+    client.release();
+  }
+});
+
 router.get('/insumos', checkPermission(INSUMOS_LIST_PERMISSIONS), async (req, res) => {
   try {
     if (isCatalogoMaestroReadsEnabled()) {
@@ -1631,7 +1955,6 @@ router.put('/insumos/edicion', checkPermission(INSUMOS_EDIT_PERMISSIONS), async 
     }
 
     await updateInsumoCompleto(idInsumo, normalized, client);
-    await syncInsumoAlmacenes(idInsumo, [normalized.id_almacen], client);
 
     await client.query('COMMIT');
     return res.status(200).json({
