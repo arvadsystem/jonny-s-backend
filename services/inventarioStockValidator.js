@@ -156,19 +156,16 @@ const fetchInsumosMaestrosByIdsForUpdate = async (client, ids, idSucursal) => {
   const assignmentsResult = await client.query(
     `
       SELECT
-        mm.id_insumo_maestro,
+        ia.id_insumo AS id_insumo_maestro,
         COUNT(*)::int AS total_asignaciones
-      FROM public.insumos_mapeo_maestro mm
+      FROM public.insumos_almacenes ia
       INNER JOIN public.almacenes a
-        ON a.id_almacen = mm.id_almacen_origen
+        ON a.id_almacen = ia.id_almacen
        AND a.id_sucursal = $2
        AND COALESCE(a.estado, true) = true
-      INNER JOIN public.insumos_almacenes ia
-        ON ia.id_insumo = mm.id_insumo_maestro
-       AND ia.id_almacen = mm.id_almacen_origen
-       AND COALESCE(ia.estado, true) = true
-      WHERE mm.id_insumo_maestro = ANY($1::int[])
-      GROUP BY mm.id_insumo_maestro
+      WHERE ia.id_insumo = ANY($1::int[])
+        AND COALESCE(ia.estado, true) = true
+      GROUP BY ia.id_insumo
     `,
     [activeMasterIds, idSucursal]
   );
@@ -209,8 +206,8 @@ const fetchInsumosMaestrosByIdsForUpdate = async (client, ids, idSucursal) => {
   const localRowsResult = await client.query(
     `
       SELECT
-        mm.id_insumo_maestro AS id_insumo,
-        mm.id_insumo_maestro,
+        ia.id_insumo,
+        ia.id_insumo AS id_insumo_maestro,
         mm.id_insumo_legacy AS id_insumo_legacy_local,
         i.nombre_insumo,
         COALESCE(ia.cantidad, 0)::numeric AS cantidad,
@@ -218,19 +215,19 @@ const fetchInsumosMaestrosByIdsForUpdate = async (client, ids, idSucursal) => {
         ia.id_almacen,
         a.id_sucursal,
         COALESCE(ia.estado, true) AS estado
-      FROM public.insumos_mapeo_maestro mm
+      FROM public.insumos_almacenes ia
       INNER JOIN public.almacenes a
-        ON a.id_almacen = mm.id_almacen_origen
+        ON a.id_almacen = ia.id_almacen
        AND a.id_sucursal = $2
        AND COALESCE(a.estado, true) = true
-      INNER JOIN public.insumos_almacenes ia
-        ON ia.id_insumo = mm.id_insumo_maestro
-       AND ia.id_almacen = mm.id_almacen_origen
-       AND COALESCE(ia.estado, true) = true
       INNER JOIN public.insumos i
-        ON i.id_insumo = mm.id_insumo_maestro
-      WHERE mm.id_insumo_maestro = ANY($1::int[])
-      ORDER BY mm.id_insumo_maestro
+        ON i.id_insumo = ia.id_insumo
+      LEFT JOIN public.insumos_mapeo_maestro mm
+        ON mm.id_insumo_maestro = ia.id_insumo
+       AND mm.id_almacen_origen = ia.id_almacen
+      WHERE ia.id_insumo = ANY($1::int[])
+        AND COALESCE(ia.estado, true) = true
+      ORDER BY ia.id_insumo
       FOR UPDATE OF ia
     `,
     [uniqueMasterIds, idSucursal]
