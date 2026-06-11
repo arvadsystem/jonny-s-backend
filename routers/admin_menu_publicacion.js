@@ -231,6 +231,61 @@ const getMenuById = async (idMenu) => {
   };
 };
 
+const getMenuUsageSummary = async (idMenu) => {
+  const result = await pool.query(
+    `
+      SELECT
+        EXISTS(
+          SELECT 1
+          FROM menu_vigente mv
+          WHERE mv.id_menu = $1
+        ) AS has_vigencias,
+        EXISTS(
+          SELECT 1
+          FROM detalle_menu dm
+          WHERE dm.id_menu = $1
+            AND COALESCE(dm.estado, true) = true
+        ) AS has_detalle_menu,
+        EXISTS(
+          SELECT 1
+          FROM recetas r
+          WHERE r.id_menu = $1
+            AND COALESCE(r.estado, true) = true
+        ) AS has_recetas,
+        EXISTS(
+          SELECT 1
+          FROM combos c
+          WHERE c.id_menu = $1
+            AND COALESCE(c.estado, true) = true
+        ) AS has_combos;
+    `,
+    [idMenu]
+  );
+
+  const row = result.rows?.[0] || {};
+  return {
+    has_vigencias: parseBoolean(row.has_vigencias),
+    has_detalle_menu: parseBoolean(row.has_detalle_menu),
+    has_recetas: parseBoolean(row.has_recetas),
+    has_combos: parseBoolean(row.has_combos)
+  };
+};
+
+const canDeactivateMenu = (usage = {}) =>
+  !usage.has_vigencias &&
+  !usage.has_detalle_menu &&
+  !usage.has_recetas &&
+  !usage.has_combos;
+
+const buildMenuUsageBlockers = (usage = {}) => {
+  const blockers = [];
+  if (usage.has_vigencias) blockers.push('tiene vigencias registradas');
+  if (usage.has_detalle_menu) blockers.push('tiene publicaciones activas en detalle_menu');
+  if (usage.has_recetas) blockers.push('tiene recetas activas asociadas');
+  if (usage.has_combos) blockers.push('tiene combos activos asociados');
+  return blockers;
+};
+
 const getBranchById = async (idSucursal) => {
   const result = await pool.query(
     `
@@ -1060,6 +1115,138 @@ router.post('/menus', checkPermission(MENU_TEMPORADA_CREATE_PERMISSIONS), async 
   } catch (error) {
     console.error('admin_menu_publicacion POST /menus:', error.message);
     return res.status(500).json({ ok: false, message: 'No se pudo crear el menu.' });
+  }
+});
+
+router.put('/menus/:id_menu', checkPermission(MENU_PUBLICACION_SAVE_PERMISSIONS), async (req, res) => {
+  try {
+    const idMenu = toPositiveInt(req.params?.id_menu);
+    const nombreMenu = String(req.body?.nombre_menu ?? '').replace(/\s+/g, ' ').trim();
+    const descripcionRaw = String(req.body?.descripcion ?? '').trim();
+    const descripcion = descripcionRaw || null;
+
+    if (!idMenu) {
+      return res.status(400).json({ ok: false, message: 'id_menu es obligatorio.' });
+    }
+
+    if (!nombreMenu || nombreMenu.length < 3) {
+      return res.status(400).json({ ok: false, message: 'nombre_menu es obligatorio y debe tener al menos 3 caracteres.' });
+    }
+
+    if (nombreMenu.length > 120) {
+      return res.status(400).json({ ok: false, message: 'nombre_menu supera el maximo permitido (120).' });
+    }
+
+    if (descripcion && descripcion.length > 250) {
+      return res.status(400).json({ ok: false, message: 'descripcion supera el maximo permitido (250).' });
+    }
+
+    const currentMenu = await getMenuById(idMenu);
+    if (!currentMenu || !currentMenu.estado) {
+      return res.status(404).json({ ok: false, message: 'El menu no existe o esta inactivo.' });
+    }
+
+    const duplicate = await pool.query(
+      `
+        SELECT id_menu
+        FROM menu
+        WHERE id_menu <> $1
+          AND LOWER(TRIM(nombre_menu)) = LOWER(TRIM($2))
+          AND COALESCE(estado, true) = true
+        LIMIT 1;
+      `,
+      [idMenu, nombreMenu]
+    );
+
+    if (duplicate.rowCount > 0) {
+      return res.status(409).json({ ok: false, message: 'Ya existe otro menu activo con ese nombre.' });
+    }
+
+    const updated = await pool.query(
+      `
+        UPDATE menu
+        SET nombre_menu = $2,
+            descripcion = $3
+        WHERE id_menu = $1
+          AND COALESCE(estado, true) = true
+        RETURNING id_menu, nombre_menu, COALESCE(descripcion, '') AS descripcion, COALESCE(estado, true) AS estado;
+      `,
+      [idMenu, nombreMenu, descripcion]
+    );
+
+    const row = updated.rows?.[0] || null;
+    if (!row) {
+      return res.status(404).json({ ok: false, message: 'No se pudo actualizar el menu solicitado.' });
+    }
+
+    return res.status(200).json({
+      ok: true,
+      message: `Menu #${row.id_menu} actualizado correctamente.`,
+      data: {
+        menu: {
+          id_menu: Number(row.id_menu),
+          nombre_menu: row.nombre_menu || `Menu #${row.id_menu}`,
+          descripcion: row.descripcion || '',
+          estado: parseBoolean(row.estado)
+        }
+      }
+    });
+  } catch (error) {
+    console.error('admin_menu_publicacion PUT /menus/:id_menu:', error.message);
+    return res.status(500).json({ ok: false, message: 'No se pudo actualizar el menu.' });
+  }
+});
+
+router.delete('/menus/:id_menu', checkPermission(MENU_PUBLICACION_SAVE_PERMISSIONS), async (req, res) => {
+  try {
+    const idMenu = toPositiveInt(req.params?.id_menu);
+    if (!idMenu) {
+      return res.status(400).json({ ok: false, message: 'id_menu es obligatorio.' });
+    }
+
+    const currentMenu = await getMenuById(idMenu);
+    if (!currentMenu || !currentMenu.estado) {
+      return res.status(404).json({ ok: false, message: 'El menu no existe o ya esta inactivo.' });
+    }
+
+    const usage = await getMenuUsageSummary(idMenu);
+    if (!canDeactivateMenu(usage)) {
+      return res.status(409).json({
+        ok: false,
+        message: `No se puede eliminar el menu porque ${buildMenuUsageBlockers(usage).join(', ')}.`,
+        data: { usage }
+      });
+    }
+
+    const updated = await pool.query(
+      `
+        UPDATE menu
+        SET estado = false
+        WHERE id_menu = $1
+          AND COALESCE(estado, true) = true
+        RETURNING id_menu, nombre_menu;
+      `,
+      [idMenu]
+    );
+
+    const row = updated.rows?.[0] || null;
+    if (!row) {
+      return res.status(404).json({ ok: false, message: 'No se pudo eliminar el menu solicitado.' });
+    }
+
+    return res.status(200).json({
+      ok: true,
+      message: `Menu #${row.id_menu} eliminado correctamente.`,
+      data: {
+        menu: {
+          id_menu: Number(row.id_menu),
+          nombre_menu: row.nombre_menu || `Menu #${row.id_menu}`
+        }
+      }
+    });
+  } catch (error) {
+    console.error('admin_menu_publicacion DELETE /menus/:id_menu:', error.message);
+    return res.status(500).json({ ok: false, message: 'No se pudo eliminar el menu.' });
   }
 });
 
