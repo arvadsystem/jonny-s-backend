@@ -3,6 +3,7 @@ import pool from '../config/db-connection.js';
 import { attachImagenPrincipalUrls } from '../utils/uploads.js';
 import { resolveRequestUserSucursalScope } from '../utils/sucursalScope.js';
 import { checkPermission } from '../middleware/checkPermission.js';
+import { autoPublishNewProduct } from '../services/menuAutoPublicationService.js';
 
 const router = express.Router();
 const PRODUCTOS_LIST_PERMISSIONS = ['INVENTARIO_PRODUCTOS_VER', 'INVENTARIO_PRODUCTOS_DETALLE_VER'];
@@ -1466,6 +1467,13 @@ router.post('/productos', checkPermission(PRODUCTOS_CREATE_PERMISSIONS), async (
     }
 
     await syncProductoAlmacenes(idProductoCreado, idAlmacenes, client);
+    await autoPublishNewProduct({
+      client,
+      idProducto: idProductoCreado,
+      idCategoriaProducto: payloadPrimary.id_categoria_producto,
+      idAlmacen: payloadPrimary.id_almacen,
+      estadoItem: payloadPrimary.estado ?? true
+    });
 
     const productoResponse = await getHydratedProductoById(req, idProductoCreado, client);
     if (!productoResponse) {

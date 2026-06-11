@@ -282,6 +282,9 @@ const buildCatalogSql = ({
     : 'NULL::numeric(10,2)';
   const detalleVisibleExpr = hasDetalleVisibleColumn ? 'COALESCE(dm.visible, true)' : 'true';
   const detalleVisibleFilter = hasDetalleVisibleColumn ? 'AND COALESCE(dm.visible, true) = true' : '';
+  const branchProductFilter = withDetailMenuFilter
+    ? 'AND (dm.id_producto IS NULL OR ap.id_sucursal = $3)'
+    : 'AND (dm.id_producto IS NULL OR ap.id_sucursal = $2)';
 
   return `
     SELECT
@@ -360,6 +363,8 @@ const buildCatalogSql = ({
     FROM detalle_menu dm
     LEFT JOIN productos p
       ON p.id_producto = dm.id_producto
+    LEFT JOIN almacenes ap
+      ON ap.id_almacen = p.id_almacen
     LEFT JOIN categorias_productos cp
       ON cp.id_categoria_producto = p.id_categoria_producto
     ${productImageJoin}
@@ -377,6 +382,7 @@ const buildCatalogSql = ({
       ON td.id_tipo_departamento = COALESCE(p.id_tipo_departamento, r.id_tipo_departamento, c.id_tipo_departamento)
     WHERE dm.id_menu = $1
       AND COALESCE(dm.estado, true) = true
+      ${branchProductFilter}
       ${detalleVisibleFilter}
       ${withDetailMenuFilter ? 'AND dm.id_detalle_menu = $2' : ''}
     ORDER BY COALESCE(dm.orden, 2147483647), dm.id_detalle_menu
@@ -385,7 +391,7 @@ const buildCatalogSql = ({
 };
 
 // Lista todos los items publicados en detalle_menu para un menu especifico.
-export const fetchCatalogRowsByMenuQuery = async (idMenu, db = pool) => {
+export const fetchCatalogRowsByMenuQuery = async (idMenu, idSucursal, db = pool) => {
   const [
     hasProductImageColumn,
     hasDetalleRecetaColumn,
@@ -407,7 +413,7 @@ export const fetchCatalogRowsByMenuQuery = async (idMenu, db = pool) => {
     hasDetallePrecioPublicoColumn,
     hasDetalleVisibleColumn
   });
-  const result = await db.query(query, [idMenu]);
+  const result = await db.query(query, [idMenu, idSucursal]);
   return result.rows;
 };
 
@@ -460,7 +466,7 @@ export const fetchPublicMenuExtrasByRecipeIdsQuery = async (recipeIds = [], db =
 };
 
 // Obtiene un item de detalle_menu validado por menu vigente/sucursal.
-export const fetchCatalogItemByIdQuery = async ({ idMenu, idDetalleMenu }, db = pool) => {
+export const fetchCatalogItemByIdQuery = async ({ idMenu, idDetalleMenu, idSucursal }, db = pool) => {
   const [
     hasProductImageColumn,
     hasDetalleRecetaColumn,
@@ -485,7 +491,7 @@ export const fetchCatalogItemByIdQuery = async ({ idMenu, idDetalleMenu }, db = 
     withLimit: true
   });
 
-  const result = await db.query(query, [idMenu, idDetalleMenu]);
+  const result = await db.query(query, [idMenu, idDetalleMenu, idSucursal]);
   return result.rows[0] || null;
 };
 
