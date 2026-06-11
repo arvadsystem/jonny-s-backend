@@ -11,6 +11,11 @@ import {
   queryCatalogoMaestroView,
   sendCatalogoMaestroViewMissingResponse
 } from '../services/catalogoMaestroReadService.js';
+import {
+  buildCatalogoMaestroWriteStructureMissingResponse,
+  completeProductoCatalogoMaestroWrite,
+  isCatalogoMaestroWriteStructureMissingError
+} from '../services/catalogoMaestroWriteService.js';
 
 const router = express.Router();
 const PRODUCTOS_LIST_PERMISSIONS = ['INVENTARIO_PRODUCTOS_VER', 'INVENTARIO_PRODUCTOS_DETALLE_VER'];
@@ -1673,6 +1678,15 @@ router.post('/productos', checkPermission(PRODUCTOS_CREATE_PERMISSIONS), async (
     }
 
     await syncProductoAlmacenes(idProductoCreado, idAlmacenes, client);
+    await completeProductoCatalogoMaestroWrite({
+      client,
+      idProducto: idProductoCreado,
+      idAlmacen: payloadPrimary.id_almacen,
+      stockMinimo: payloadPrimary.stock_minimo ?? 0,
+      costoCompra: payloadPrimary.costo_compra ?? null,
+      fechaCaducidad: payloadPrimary.fecha_caducidad ?? null,
+      estado: payloadPrimary.estado ?? true
+    });
     await autoPublishNewProduct({
       client,
       idProducto: idProductoCreado,
@@ -1702,6 +1716,11 @@ router.post('/productos', checkPermission(PRODUCTOS_CREATE_PERMISSIONS), async (
   } catch (err) {
     try { await client.query('ROLLBACK'); } catch {}
     console.error('Error al crear producto:', err.message);
+
+    if (isCatalogoMaestroWriteStructureMissingError(err)) {
+      console.error('CATALOGO_MAESTRO_WRITE_STRUCTURE_MISSING producto:', err.cause?.message || err.message);
+      return res.status(500).json(buildCatalogoMaestroWriteStructureMissingResponse());
+    }
 
     if (isProductosDuplicateConstraintError(err)) {
       return res.status(409).json({

@@ -11,6 +11,11 @@ import {
   queryCatalogoMaestroView,
   sendCatalogoMaestroViewMissingResponse
 } from '../services/catalogoMaestroReadService.js';
+import {
+  buildCatalogoMaestroWriteStructureMissingResponse,
+  completeInsumoCatalogoMaestroWrite,
+  isCatalogoMaestroWriteStructureMissingError
+} from '../services/catalogoMaestroWriteService.js';
 
 const router = express.Router();
 const INSUMOS_LIST_PERMISSIONS = ['INVENTARIO_INSUMOS_VER', 'INVENTARIO_INSUMOS_DETALLE_VER'];
@@ -1399,6 +1404,15 @@ router.post('/insumos', checkPermission(INSUMOS_CREATE_PERMISSIONS), async (req,
     }
 
     await syncInsumoAlmacenes(idInsumoCreado, idAlmacenes, client);
+    await completeInsumoCatalogoMaestroWrite({
+      client,
+      idInsumo: idInsumoCreado,
+      idAlmacen: primaryPayload.id_almacen,
+      cantidad,
+      stockMinimo,
+      precioCompra: precio,
+      fechaCaducidad: primaryPayload.fecha_caducidad ?? null
+    });
     await client.query('COMMIT');
 
     res.status(201).json({
@@ -1410,8 +1424,9 @@ router.post('/insumos', checkPermission(INSUMOS_CREATE_PERMISSIONS), async (req,
   } catch (err) {
     try { await client.query('ROLLBACK'); } catch {}
     console.error('Error al crear insumo:', err.message);
-    if (err?.code === INSUMOS_ALMACENES_TABLE_MISSING_CODE) {
-      return res.status(500).json({ error: true, message: INSUMOS_ALMACENES_TABLE_MISSING_MESSAGE });
+    if (isCatalogoMaestroWriteStructureMissingError(err) || err?.code === INSUMOS_ALMACENES_TABLE_MISSING_CODE) {
+      console.error('CATALOGO_MAESTRO_WRITE_STRUCTURE_MISSING insumo:', err.cause?.message || err.message);
+      return res.status(500).json(buildCatalogoMaestroWriteStructureMissingResponse());
     }
     if (err?.code === '23505') {
       const duplicateMessage = getInsumosConstraintConflictMessage(err);
