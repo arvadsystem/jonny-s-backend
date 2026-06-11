@@ -21,6 +21,19 @@ import {
   autoPublishNewRecipe,
   moveRecipePublicationToMenu
 } from '../services/menuAutoPublicationService.js';
+import {
+  isCatalogoMaestroReadsEnabled,
+  isCatalogoMaestroViewMissingError,
+  logCatalogoMaestroViewMissing,
+  sendCatalogoMaestroViewMissingResponse
+} from '../services/catalogoMaestroReadService.js';
+import {
+  fetchCatalogoInsumosMaestros,
+  fetchDetalleRecetaInsumosMaestros,
+  getRecetaInsumosMaestrosErrorResponse,
+  isRecetaInsumosMaestrosControlledError,
+  normalizeDetalleRecetaInsumosMaestros
+} from '../services/recetaInsumosMaestrosService.js';
 
 const router = express.Router();
 // AM: transicion segura a permisos granulares sin romper el acceso actual mientras se alinea BD/roles.
@@ -64,6 +77,30 @@ const rejectLegacyEmbeddedImagePayload = (payload) => {
       message: RECETAS_IMAGE_CONTRACT_MESSAGE
     }
   };
+};
+
+const shouldUseCatalogoMaestroInsumos = () => isCatalogoMaestroReadsEnabled();
+
+const sendRecetaInsumosMaestrosError = (res, err, context) => {
+  if (isCatalogoMaestroViewMissingError(err)) {
+    logCatalogoMaestroViewMissing(context, err);
+    return sendCatalogoMaestroViewMissingResponse(res);
+  }
+
+  if (isRecetaInsumosMaestrosControlledError(err)) {
+    const response = getRecetaInsumosMaestrosErrorResponse(err);
+    if (response.body?.code === 'CATALOGO_MAESTRO_VIEW_MISSING') {
+      console.error(`${context}: CATALOGO_MAESTRO_VIEW_MISSING`, err.cause?.message || err.message);
+    }
+    return res.status(response.status).json(response.body);
+  }
+
+  return null;
+};
+
+const normalizeDetalleForCurrentMode = async (client, detalle) => {
+  if (!shouldUseCatalogoMaestroInsumos()) return detalle;
+  return normalizeDetalleRecetaInsumosMaestros(client, detalle);
 };
 
 const parsePositiveNumber = (value) => {
@@ -325,6 +362,11 @@ router.get('/', checkPermission(MENU_RECETAS_VIEW_PERMISSIONS), async (req, res)
 // GET: catalogo de insumos activos para armar detalle de receta.
 router.get('/catalogos/insumos', checkPermission(MENU_RECETAS_VIEW_PERMISSIONS), async (req, res) => {
   try {
+    if (shouldUseCatalogoMaestroInsumos()) {
+      const rows = await fetchCatalogoInsumosMaestros(pool);
+      return res.status(200).json(rows);
+    }
+
     const result = await pool.query(
       `
         SELECT
@@ -354,6 +396,8 @@ router.get('/catalogos/insumos', checkPermission(MENU_RECETAS_VIEW_PERMISSIONS),
 
     return res.status(200).json(result.rows || []);
   } catch (err) {
+    const handled = sendRecetaInsumosMaestrosError(res, err, 'GET /admin/recetas/catalogos/insumos');
+    if (handled) return handled;
     console.error('Error al obtener catalogo de insumos para recetas:', err.message);
     return res.status(500).json({ error: true, message: getSafeServerErrorMessage(err) });
   }
@@ -370,6 +414,11 @@ router.get('/:id_receta/detalle', checkPermission(MENU_RECETAS_VIEW_PERMISSIONS)
     const recetaExiste = await existeRecetaPorId(idReceta);
     if (!recetaExiste) {
       return res.status(404).json({ error: true, message: 'Receta no encontrada.' });
+    }
+
+    if (shouldUseCatalogoMaestroInsumos()) {
+      const detalle = await fetchDetalleRecetaInsumosMaestros(pool, idReceta);
+      return res.status(200).json(detalle);
     }
 
     const result = await pool.query(
@@ -398,6 +447,8 @@ router.get('/:id_receta/detalle', checkPermission(MENU_RECETAS_VIEW_PERMISSIONS)
 
     return res.status(200).json(result.rows || []);
   } catch (err) {
+    const handled = sendRecetaInsumosMaestrosError(res, err, 'GET /admin/recetas/:id_receta/detalle');
+    if (handled) return handled;
     console.error('Error al obtener detalle de receta admin:', err.message);
     return res.status(500).json({ error: true, message: getSafeServerErrorMessage(err) });
   }
@@ -414,6 +465,24 @@ router.get('/:id_receta/contexto-edicion', checkPermission(MENU_RECETAS_VIEW_PER
     const receta = await obtenerRecetaPorId(idReceta);
     if (!receta) {
       return res.status(404).json({ error: true, message: 'Receta no encontrada.' });
+    }
+
+    if (shouldUseCatalogoMaestroInsumos()) {
+      const [detalle, insumosCatalogo] = await Promise.all([
+        fetchDetalleRecetaInsumosMaestros(pool, idReceta),
+        fetchCatalogoInsumosMaestros(pool)
+      ]);
+
+      return res.status(200).json({
+        receta: {
+          ...receta,
+          url_imagen_publica: buildAbsolutePublicUrl(req, receta?.url_imagen_publica || null)
+        },
+        detalle_receta: detalle,
+        catalogos: {
+          insumos: insumosCatalogo
+        }
+      });
     }
 
     const [detalleResult, insumosCatalogResult] = await Promise.all([
@@ -479,6 +548,8 @@ router.get('/:id_receta/contexto-edicion', checkPermission(MENU_RECETAS_VIEW_PER
       }
     });
   } catch (err) {
+    const handled = sendRecetaInsumosMaestrosError(res, err, 'GET /admin/recetas/:id_receta/contexto-edicion');
+    if (handled) return handled;
     console.error('Error al obtener contexto de edicion de receta admin:', err.message);
     return res.status(500).json({ error: true, message: getSafeServerErrorMessage(err) });
   }
@@ -504,13 +575,15 @@ router.put('/:id_receta/detalle', checkPermission(MENU_RECETAS_EDIT_PERMISSIONS)
       return res.status(400).json({ error: true, message: normalized.message });
     }
 
-    const fkValidation = await validarDetalleRecetaFks(client, normalized.detalle);
+    const detalleNormalizado = await normalizeDetalleForCurrentMode(client, normalized.detalle);
+
+    const fkValidation = await validarDetalleRecetaFks(client, detalleNormalizado);
     if (!fkValidation.ok) {
       return res.status(fkValidation.status).json({ error: true, message: fkValidation.message });
     }
 
     await client.query('BEGIN');
-    await reemplazarDetalleReceta(client, idReceta, normalized.detalle);
+    await reemplazarDetalleReceta(client, idReceta, detalleNormalizado);
     await client.query(
       `
         UPDATE recetas
@@ -524,6 +597,8 @@ router.put('/:id_receta/detalle', checkPermission(MENU_RECETAS_EDIT_PERMISSIONS)
     return res.status(200).json({ error: false, message: 'Detalle de receta actualizado correctamente.' });
   } catch (err) {
     await client.query('ROLLBACK');
+    const handled = sendRecetaInsumosMaestrosError(res, err, 'PUT /admin/recetas/:id_receta/detalle');
+    if (handled) return handled;
     console.error('Error al actualizar detalle de receta admin:', err.message);
     return res.status(500).json({ error: true, message: getSafeServerErrorMessage(err) });
   } finally {
@@ -574,7 +649,9 @@ router.post('/', checkPermission(MENU_RECETAS_CREATE_PERMISSIONS), async (req, r
       return res.status(400).json({ error: true, message: detalleValidation.message });
     }
 
-    const fkDetalleValidation = await validarDetalleRecetaFks(client, detalleValidation.detalle);
+    const detalleNormalizado = await normalizeDetalleForCurrentMode(client, detalleValidation.detalle);
+
+    const fkDetalleValidation = await validarDetalleRecetaFks(client, detalleNormalizado);
     if (!fkDetalleValidation.ok) {
       return res.status(fkDetalleValidation.status).json({ error: true, message: fkDetalleValidation.message });
     }
@@ -633,10 +710,12 @@ router.post('/', checkPermission(MENU_RECETAS_CREATE_PERMISSIONS), async (req, r
     );
 
     await client.query('BEGIN');
-    const unidadSyncValidation = await sincronizarUnidadesInsumosDesdeDetalle(client, detalleValidation.detalle);
-    if (!unidadSyncValidation.ok) {
-      await client.query('ROLLBACK');
-      return res.status(unidadSyncValidation.status).json({ error: true, message: unidadSyncValidation.message });
+    if (!shouldUseCatalogoMaestroInsumos()) {
+      const unidadSyncValidation = await sincronizarUnidadesInsumosDesdeDetalle(client, detalleNormalizado);
+      if (!unidadSyncValidation.ok) {
+        await client.query('ROLLBACK');
+        return res.status(unidadSyncValidation.status).json({ error: true, message: unidadSyncValidation.message });
+      }
     }
 
     await client.query('CALL pa_insert($1, $2)', ['recetas', datosInsertSinNull]);
@@ -658,7 +737,7 @@ router.post('/', checkPermission(MENU_RECETAS_CREATE_PERMISSIONS), async (req, r
       throw new Error('No se pudo resolver la receta creada para guardar su detalle.');
     }
 
-    await reemplazarDetalleReceta(client, idRecetaCreada, detalleValidation.detalle);
+    await reemplazarDetalleReceta(client, idRecetaCreada, detalleNormalizado);
     await autoPublishNewRecipe({
       client,
       idMenu: datosInsertSinNull.id_menu,
@@ -674,6 +753,8 @@ router.post('/', checkPermission(MENU_RECETAS_CREATE_PERMISSIONS), async (req, r
     });
   } catch (err) {
     await client.query('ROLLBACK');
+    const handled = sendRecetaInsumosMaestrosError(res, err, 'POST /admin/recetas');
+    if (handled) return handled;
     console.error('Error al crear receta admin:', err.message);
 
     if (esErrorConflictoConstraint(err)) {
@@ -740,7 +821,9 @@ router.put('/:id_receta', checkPermission(MENU_RECETAS_EDIT_PERMISSIONS), async 
       return res.status(400).json({ error: true, message: detalleValidation.message });
     }
 
-    const fkDetalleValidation = await validarDetalleRecetaFks(client, detalleValidation.detalle);
+    const detalleNormalizado = await normalizeDetalleForCurrentMode(client, detalleValidation.detalle);
+
+    const fkDetalleValidation = await validarDetalleRecetaFks(client, detalleNormalizado);
     if (!fkDetalleValidation.ok) {
       return res.status(fkDetalleValidation.status).json({ error: true, message: fkDetalleValidation.message });
     }
@@ -799,17 +882,19 @@ router.put('/:id_receta', checkPermission(MENU_RECETAS_EDIT_PERMISSIONS), async 
     }
 
     await client.query('BEGIN');
-    const unidadSyncValidation = await sincronizarUnidadesInsumosDesdeDetalle(client, detalleValidation.detalle);
-    if (!unidadSyncValidation.ok) {
-      await client.query('ROLLBACK');
-      return res.status(unidadSyncValidation.status).json({ error: true, message: unidadSyncValidation.message });
+    if (!shouldUseCatalogoMaestroInsumos()) {
+      const unidadSyncValidation = await sincronizarUnidadesInsumosDesdeDetalle(client, detalleNormalizado);
+      if (!unidadSyncValidation.ok) {
+        await client.query('ROLLBACK');
+        return res.status(unidadSyncValidation.status).json({ error: true, message: unidadSyncValidation.message });
+      }
     }
 
     for (const campo of Object.keys(datosNormalizados)) {
       await actualizarCampoReceta(client, idReceta, campo, datosNormalizados[campo]);
     }
 
-    await reemplazarDetalleReceta(client, idReceta, detalleValidation.detalle);
+    await reemplazarDetalleReceta(client, idReceta, detalleNormalizado);
     await moveRecipePublicationToMenu({
       client,
       idReceta,
@@ -830,6 +915,8 @@ router.put('/:id_receta', checkPermission(MENU_RECETAS_EDIT_PERMISSIONS), async 
     return res.status(200).json({ error: false, message: 'Receta actualizada correctamente.' });
   } catch (err) {
     await client.query('ROLLBACK');
+    const handled = sendRecetaInsumosMaestrosError(res, err, 'PUT /admin/recetas/:id_receta');
+    if (handled) return handled;
     console.error('Error al actualizar receta admin:', err.message);
 
     if (esErrorConflictoConstraint(err)) {
