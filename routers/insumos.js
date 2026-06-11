@@ -3,6 +3,19 @@ import pool from '../config/db-connection.js';
 import { attachImagenPrincipalUrls } from '../utils/uploads.js';
 import { validarYDescontarPedido } from '../services/inventarioPedidoService.js';
 import { checkPermission } from '../middleware/checkPermission.js';
+import { resolveRequestUserSucursalScope } from '../utils/sucursalScope.js';
+import {
+  isCatalogoMaestroReadsEnabled,
+  isCatalogoMaestroViewMissingError,
+  logCatalogoMaestroViewMissing,
+  queryCatalogoMaestroView,
+  sendCatalogoMaestroViewMissingResponse
+} from '../services/catalogoMaestroReadService.js';
+import {
+  buildCatalogoMaestroWriteStructureMissingResponse,
+  completeInsumoCatalogoMaestroWrite,
+  isCatalogoMaestroWriteStructureMissingError
+} from '../services/catalogoMaestroWriteService.js';
 
 const router = express.Router();
 const INSUMOS_LIST_PERMISSIONS = ['INVENTARIO_INSUMOS_VER', 'INVENTARIO_INSUMOS_DETALLE_VER'];
@@ -24,6 +37,19 @@ const INSUMO_IN_USE_MESSAGE = 'No se puede inactivar el insumo porque esta siend
 const INSUMOS_DEPENDENCY_ITEMS_LIMIT = 10;
 const INSUMOS_DELETE_BLOCKING_OC_STATES = ['PENDIENTE', 'APROBADA', 'EN_COMPRA'];
 const SQLSTATE_UNDEFINED_COLUMN = '42703';
+const INSUMOS_SCOPE_MISSING_BRANCHES_MESSAGE = 'El empleado no tiene sucursales asignadas.';
+const INSUMOS_DEFAULT_PAGE = 1;
+const INSUMOS_DEFAULT_PAGE_SIZE = 10;
+const INSUMOS_MAX_PAGE_SIZE = 100;
+const INSUMOS_MAESTRO_SORT_ALLOWLIST = Object.freeze({
+  recientes: 'v.id_insumo_legacy DESC',
+  nombre_asc: 'LOWER(COALESCE(v.nombre_insumo, \'\')) ASC, v.id_insumo_legacy DESC',
+  nombre_desc: 'LOWER(COALESCE(v.nombre_insumo, \'\')) DESC, v.id_insumo_legacy DESC',
+  precio_asc: 'COALESCE(v.precio_compra, 0) ASC, v.id_insumo_legacy DESC',
+  precio_desc: 'COALESCE(v.precio_compra, 0) DESC, v.id_insumo_legacy DESC',
+  stock_asc: 'COALESCE(v.cantidad, 0) ASC, v.id_insumo_legacy DESC',
+  stock_desc: 'COALESCE(v.cantidad, 0) DESC, v.id_insumo_legacy DESC'
+});
 const CAMPOS_PERMITIDOS_INSUMOS_POST = new Set([
   'nombre_insumo',
   'precio',
@@ -64,6 +90,49 @@ const parseOptionalPositiveId = (value) => {
   return isPositiveIntegerId(parsed) ? parsed : null;
 };
 
+const hasQueryKey = (query, key) =>
+  Object.prototype.hasOwnProperty.call(query || {}, key) &&
+  query[key] !== undefined &&
+  query[key] !== null &&
+  String(query[key]).trim() !== '';
+
+const parsePositiveIntParam = (raw, fallback, min = 1, max = Number.MAX_SAFE_INTEGER) => {
+  const value = String(raw ?? '').trim();
+  if (!value) return { ok: true, value: fallback };
+  const parsed = Number.parseInt(value, 10);
+  if (!Number.isSafeInteger(parsed) || parsed < min || parsed > max) {
+    return { ok: false, value: null };
+  }
+  return { ok: true, value: parsed };
+};
+
+const parseEstadoFiltroInsumos = (query) => {
+  const raw = String(query?.estado ?? '').trim().toLowerCase();
+  if (!raw) {
+    return shouldIncludeInactive(query) ? 'todos' : 'activo';
+  }
+
+  if (raw === 'todos' || raw === 'all') return 'todos';
+  if (raw === 'activo' || raw === 'activos' || raw === 'true' || raw === '1') return 'activo';
+  if (raw === 'inactivo' || raw === 'inactivos' || raw === 'false' || raw === '0') return 'inactivo';
+  return null;
+};
+
+const parseStockFiltroInsumos = (query) => {
+  const raw = String(query?.stock ?? '').trim().toLowerCase();
+  if (!raw || raw === 'todos' || raw === 'all') return 'todos';
+  if (raw === 'con_stock' || raw === 'constock') return 'con_stock';
+  if (raw === 'sin_stock' || raw === 'sinstock') return 'sin_stock';
+  return null;
+};
+
+const parseSortInsumos = (query) => {
+  const raw = String(query?.sort ?? query?.sortBy ?? '').trim().toLowerCase();
+  if (!raw) return 'recientes';
+  if (!Object.prototype.hasOwnProperty.call(INSUMOS_MAESTRO_SORT_ALLOWLIST, raw)) return null;
+  return raw;
+};
+
 // NEW: normaliza el valor de `estado` para soportar boolean/string/number.
 // WHY: `function_select` puede serializar booleans de distintas formas segun el entorno.
 // IMPACT: solo afecta el filtrado del GET /insumos.
@@ -78,6 +147,29 @@ const isRowActive = (row) => {
 // WHY: evitar llamadas a BD/SP con IDs invalidos y responder 400/404 de forma consistente.
 // IMPACT: solo endurece requests mal formados; requests validos no cambian.
 const isPositiveIntegerId = (value) => Number.isSafeInteger(value) && value > 0;
+
+const normalizeScopeSucursalIds = (rawIds) => Array.from(
+  new Set(
+    (Array.isArray(rawIds) ? rawIds : [])
+      .map((id) => Number.parseInt(String(id ?? '').trim(), 10))
+      .filter((id) => isPositiveIntegerId(id))
+  )
+);
+
+const getAllowedBranchIdsForInsumosUser = async (req, db = pool) => {
+  if (req?.__insumosSucursalScope) {
+    return req.__insumosSucursalScope;
+  }
+
+  const scope = await resolveRequestUserSucursalScope(req, db);
+  const payload = {
+    isSuperAdmin: Boolean(scope?.isSuperAdmin),
+    allowedSucursalIds: normalizeScopeSucursalIds(scope?.allowedSucursalIds)
+  };
+
+  if (req) req.__insumosSucursalScope = payload;
+  return payload;
+};
 
 // AM: normaliza lista de almacenes del item usando pivote (id_almacenes) o fallback legacy (id_almacen).
 const resolveRowAlmacenes = (row) => {
@@ -207,6 +299,209 @@ const validateOptionalDateInput = (rawValue, fieldName) => {
 // WHY: alinear manejo de errores con UX y evitar detalles internos.
 // IMPACT: no cambia contratos exitosos ni status codes de validacion.
 const safeServerErrorMessage = (fallback = 'No se pudo completar la accion. Verifica los datos e intenta de nuevo.') => fallback;
+
+const mapInsumoMaestroRow = (row) => {
+  const idAlmacen = Number.parseInt(String(row?.id_almacen ?? ''), 10);
+  return {
+    ...row,
+    id_insumo: row.id_insumo == null ? row.id_insumo : Number(row.id_insumo),
+    id_insumo_maestro: row.id_insumo_maestro == null ? null : Number(row.id_insumo_maestro),
+    id_almacen: isPositiveIntegerId(idAlmacen) ? idAlmacen : row.id_almacen,
+    id_sucursal: row.id_sucursal == null ? null : Number(row.id_sucursal),
+    id_almacenes: isPositiveIntegerId(idAlmacen) ? [idAlmacen] : []
+  };
+};
+
+const listInsumosDesdeCatalogoMaestro = async (req) => {
+  const queryPayload = { ...req.query };
+  const scope = await getAllowedBranchIdsForInsumosUser(req, pool);
+  if (!scope.isSuperAdmin && scope.allowedSucursalIds.length === 0) {
+    return {
+      status: 403,
+      body: { error: true, message: INSUMOS_SCOPE_MISSING_BRANCHES_MESSAGE }
+    };
+  }
+
+  const requestedSucursalHasValue = hasQueryKey(queryPayload, 'id_sucursal');
+  const requestedSucursal = parseOptionalPositiveId(queryPayload.id_sucursal);
+  if (requestedSucursalHasValue && requestedSucursal === null) {
+    return { status: 400, body: { error: true, message: 'id_sucursal invalido.' } };
+  }
+
+  if (!scope.isSuperAdmin && requestedSucursal && !scope.allowedSucursalIds.includes(requestedSucursal)) {
+    return { status: 403, body: { error: true, message: 'No tiene acceso a la sucursal solicitada.' } };
+  }
+
+  const requestedAlmacenHasValue = hasQueryKey(queryPayload, 'id_almacen');
+  const requestedAlmacen = parseOptionalPositiveId(queryPayload.id_almacen);
+  if (requestedAlmacenHasValue && requestedAlmacen === null) {
+    return { status: 400, body: { error: true, message: 'id_almacen invalido.' } };
+  }
+
+  const requestedCategoriaHasValue =
+    hasQueryKey(queryPayload, 'id_categoria_insumo') || hasQueryKey(queryPayload, 'id_categoria');
+  const requestedCategoria = parseOptionalPositiveId(queryPayload.id_categoria_insumo ?? queryPayload.id_categoria);
+  if (requestedCategoriaHasValue && requestedCategoria === null) {
+    return { status: 400, body: { error: true, message: 'id_categoria_insumo invalido.' } };
+  }
+
+  const estadoFiltro = parseEstadoFiltroInsumos(queryPayload);
+  if (!estadoFiltro) {
+    return { status: 400, body: { error: true, message: 'estado invalido. Use activo, inactivo o todos.' } };
+  }
+
+  const stockFiltro = parseStockFiltroInsumos(queryPayload);
+  if (!stockFiltro) {
+    return { status: 400, body: { error: true, message: 'stock invalido. Use con_stock, sin_stock o todos.' } };
+  }
+
+  const sortKey = parseSortInsumos(queryPayload);
+  if (!sortKey) {
+    return { status: 400, body: { error: true, message: 'sort invalido.' } };
+  }
+
+  const wantsPaginated =
+    hasQueryKey(queryPayload, 'page') ||
+    hasQueryKey(queryPayload, 'pageSize') ||
+    hasQueryKey(queryPayload, 'page_size') ||
+    hasQueryKey(queryPayload, 'limit');
+
+  const pageParsed = parsePositiveIntParam(queryPayload.page, INSUMOS_DEFAULT_PAGE, 1, 100000);
+  if (!pageParsed.ok) {
+    return { status: 400, body: { error: true, message: 'page invalido.' } };
+  }
+
+  const pageSizeParsed = parsePositiveIntParam(
+    queryPayload.pageSize ?? queryPayload.page_size ?? queryPayload.limit,
+    INSUMOS_DEFAULT_PAGE_SIZE,
+    1,
+    INSUMOS_MAX_PAGE_SIZE
+  );
+  if (!pageSizeParsed.ok) {
+    return {
+      status: 400,
+      body: { error: true, message: `pageSize invalido. Debe estar entre 1 y ${INSUMOS_MAX_PAGE_SIZE}.` }
+    };
+  }
+
+  const whereClauses = [];
+  const whereParams = [];
+
+  if (estadoFiltro === 'activo') whereClauses.push('(v.estado_global IS TRUE AND v.estado_local IS TRUE)');
+  if (estadoFiltro === 'inactivo') whereClauses.push('NOT (v.estado_global IS TRUE AND v.estado_local IS TRUE)');
+  if (requestedCategoria !== null) {
+    whereParams.push(requestedCategoria);
+    whereClauses.push(`v.id_categoria_insumo = $${whereParams.length}`);
+  }
+  if (requestedAlmacen !== null) {
+    whereParams.push(requestedAlmacen);
+    whereClauses.push(`v.id_almacen = $${whereParams.length}`);
+  }
+  if (stockFiltro === 'con_stock') whereClauses.push('COALESCE(v.cantidad, 0) > 0');
+  if (stockFiltro === 'sin_stock') whereClauses.push('COALESCE(v.cantidad, 0) <= 0');
+  if (requestedSucursal !== null) {
+    whereParams.push(requestedSucursal);
+    whereClauses.push(`v.id_sucursal = $${whereParams.length}`);
+  } else if (!scope.isSuperAdmin) {
+    whereParams.push(scope.allowedSucursalIds);
+    whereClauses.push(`v.id_sucursal = ANY($${whereParams.length}::int[])`);
+  }
+
+  const rawSearch = queryPayload.q ?? queryPayload.search ?? queryPayload.busqueda ?? '';
+  const search = String(rawSearch ?? '').trim();
+  if (search) {
+    const like = `%${search}%`;
+    whereParams.push(like);
+    const p = whereParams.length;
+    whereClauses.push(`
+      (
+        COALESCE(v.nombre_insumo, '') ILIKE $${p}
+        OR COALESCE(v.descripcion, '') ILIKE $${p}
+        OR COALESCE(a.nombre, '') ILIKE $${p}
+      )
+    `);
+  }
+
+  const whereSql = whereClauses.length > 0 ? `WHERE ${whereClauses.join(' AND ')}` : '';
+  const fromSql = `
+    FROM public.vw_insumos_maestros_almacen v
+    LEFT JOIN public.almacenes a
+      ON a.id_almacen = v.id_almacen
+    ${whereSql}
+  `;
+  const orderBySql = INSUMOS_MAESTRO_SORT_ALLOWLIST[sortKey] || INSUMOS_MAESTRO_SORT_ALLOWLIST.recientes;
+  const page = pageParsed.value;
+  const pageSize = pageSizeParsed.value;
+
+  let total = 0;
+  if (wantsPaginated) {
+    const totalResult = await queryCatalogoMaestroView(
+      pool,
+      'public.vw_insumos_maestros_almacen',
+      `SELECT COUNT(*)::int AS total ${fromSql}`,
+      whereParams
+    );
+    total = Number.parseInt(String(totalResult.rows?.[0]?.total ?? '0'), 10) || 0;
+  }
+
+  const dataParams = [...whereParams];
+  const paginationSql = wantsPaginated
+    ? (() => {
+        dataParams.push(pageSize);
+        dataParams.push((page - 1) * pageSize);
+        return `LIMIT $${dataParams.length - 1} OFFSET $${dataParams.length}`;
+      })()
+    : '';
+
+  const dataResult = await queryCatalogoMaestroView(
+    pool,
+    'public.vw_insumos_maestros_almacen',
+    `
+      SELECT
+        v.id_insumo_legacy AS id_insumo,
+        v.id_insumo_maestro,
+        v.nombre_insumo,
+        v.precio_compra AS precio,
+        v.cantidad,
+        v.stock_minimo,
+        v.fecha_ingreso_insumo,
+        v.id_almacen,
+        v.id_sucursal,
+        v.id_categoria_insumo,
+        v.id_unidad_medida,
+        v.fecha_caducidad,
+        v.descripcion,
+        v.id_archivo_imagen_principal,
+        (v.estado_global IS TRUE AND v.estado_local IS TRUE) AS estado,
+        v.estado_global,
+        v.estado_local,
+        v.estado_migracion
+      ${fromSql}
+      ORDER BY ${orderBySql}
+      ${paginationSql}
+    `,
+    dataParams
+  );
+
+  const rows = (dataResult.rows || []).map(mapInsumoMaestroRow);
+  const items = await attachImagenPrincipalUrls(pool, req, rows);
+
+  if (!wantsPaginated) {
+    return { status: 200, body: items };
+  }
+
+  return {
+    status: 200,
+    body: {
+      error: false,
+      items,
+      total,
+      page,
+      pageSize,
+      totalPages: total === 0 ? 1 : Math.ceil(total / pageSize)
+    }
+  };
+};
 
 const isMissingInsumosAlmacenesTableError = (error) => {
   if (error?.code !== SQLSTATE_UNDEFINED_TABLE) return false;
@@ -868,6 +1163,11 @@ const updateInsumoCompleto = async (insumoId, data, db = pool) => {
 // GET: Obtener insumos
 router.get('/insumos', checkPermission(INSUMOS_LIST_PERMISSIONS), async (req, res) => {
   try {
+    if (isCatalogoMaestroReadsEnabled()) {
+      const result = await listInsumosDesdeCatalogoMaestro(req);
+      return res.status(result.status).json(result.body);
+    }
+
     const tabla = 'insumos';
 
     // COMENTARIO EN MAYUSCULAS: SE AGREGA stock_minimo PARA ALERTAS
@@ -891,6 +1191,10 @@ router.get('/insumos', checkPermission(INSUMOS_LIST_PERMISSIONS), async (req, re
     res.status(200).json(datosConImagen);
 
   } catch (err) {
+    if (isCatalogoMaestroViewMissingError(err)) {
+      logCatalogoMaestroViewMissing('GET /insumos', err);
+      return sendCatalogoMaestroViewMissingResponse(res);
+    }
     console.error('Error al obtener insumos:', err.message);
     if (err?.code === INSUMOS_ALMACENES_TABLE_MISSING_CODE) {
       return res.status(500).json({ error: true, message: INSUMOS_ALMACENES_TABLE_MISSING_MESSAGE });
@@ -1100,6 +1404,15 @@ router.post('/insumos', checkPermission(INSUMOS_CREATE_PERMISSIONS), async (req,
     }
 
     await syncInsumoAlmacenes(idInsumoCreado, idAlmacenes, client);
+    await completeInsumoCatalogoMaestroWrite({
+      client,
+      idInsumo: idInsumoCreado,
+      idAlmacen: primaryPayload.id_almacen,
+      cantidad,
+      stockMinimo,
+      precioCompra: precio,
+      fechaCaducidad: primaryPayload.fecha_caducidad ?? null
+    });
     await client.query('COMMIT');
 
     res.status(201).json({
@@ -1111,8 +1424,9 @@ router.post('/insumos', checkPermission(INSUMOS_CREATE_PERMISSIONS), async (req,
   } catch (err) {
     try { await client.query('ROLLBACK'); } catch {}
     console.error('Error al crear insumo:', err.message);
-    if (err?.code === INSUMOS_ALMACENES_TABLE_MISSING_CODE) {
-      return res.status(500).json({ error: true, message: INSUMOS_ALMACENES_TABLE_MISSING_MESSAGE });
+    if (isCatalogoMaestroWriteStructureMissingError(err) || err?.code === INSUMOS_ALMACENES_TABLE_MISSING_CODE) {
+      console.error('CATALOGO_MAESTRO_WRITE_STRUCTURE_MISSING insumo:', err.cause?.message || err.message);
+      return res.status(500).json(buildCatalogoMaestroWriteStructureMissingResponse());
     }
     if (err?.code === '23505') {
       const duplicateMessage = getInsumosConstraintConflictMessage(err);

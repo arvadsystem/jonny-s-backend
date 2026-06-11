@@ -70,10 +70,11 @@ export const registrarMovimientosPedido = async ({
   for (const idProducto of productoIds) {
     const row = productosById.get(idProducto);
     const shortage = shortagesByResource.get(`producto:${idProducto}`) || null;
+    const idProductoMovimiento = toPositiveInt(row?.id_producto_maestro) || toPositiveInt(row?.id_producto) || idProducto;
     await insertMovimiento(client, {
       cantidad: Number(productoQtyMap.get(idProducto) || 0),
       id_almacen: Number(row.id_almacen),
-      id_producto: idProducto,
+      id_producto: idProductoMovimiento,
       id_insumo: null,
       id_ref: idPedido,
       ref_origen: refOrigen,
@@ -84,11 +85,12 @@ export const registrarMovimientosPedido = async ({
   for (const idInsumo of insumoIds) {
     const row = insumosById.get(idInsumo);
     const shortage = shortagesByResource.get(`insumo:${idInsumo}`) || null;
+    const idInsumoMovimiento = toPositiveInt(row?.id_insumo_maestro) || toPositiveInt(row?.id_insumo) || idInsumo;
     await insertMovimiento(client, {
       cantidad: Number(insumoQtyMap.get(idInsumo) || 0),
       id_almacen: Number(row.id_almacen),
       id_producto: null,
-      id_insumo: idInsumo,
+      id_insumo: idInsumoMovimiento,
       id_ref: idPedido,
       ref_origen: refOrigen,
       descripcion: `Descuento por pedido #${idPedido} (insumo ${idInsumo})${shortage ? ` - faltante auditado req:${shortage.requerido} disp:${shortage.disponible} deficit:${shortage.faltante}` : ''}${toPositiveInt(actorUserId) ? ` - usuario ${actorUserId}` : ''}`

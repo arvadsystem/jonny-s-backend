@@ -1,0 +1,4 @@
+interface:
+  display_name: "Jonny's SmartOrder Engineering"
+  short_description: "Safe engineering practices for Jonny's SmartOrder"
+  default_prompt: "Use $jonnys-smartorder-engineering-practices to implement a small safe change in Jonny's SmartOrder."

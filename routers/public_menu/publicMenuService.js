@@ -261,9 +261,18 @@ const buildBranchScheduleLabel = ({ opensAt, closesAt }) => {
   return `${openLabel} - ${closeLabel}`;
 };
 
-const buildBranchClosedReason = ({ isActive, opensAt, closesAt }) => {
+const buildBranchClosedReason = ({
+  isActive,
+  opensAt,
+  closesAt,
+  hasConfiguredSchedule = false,
+  isClosedByOperationalConfig = false
+}) => {
   if (!isActive) return 'Sucursal no disponible';
   const schedule = buildBranchScheduleLabel({ opensAt, closesAt });
+  if (!schedule && hasConfiguredSchedule && isClosedByOperationalConfig) {
+    return 'Sucursal cerrada por horario configurado';
+  }
   if (!schedule) return '';
   return `Disponible de ${schedule}`;
 };
@@ -274,8 +283,12 @@ const mapBranch = (row) => {
   const opensAt = normalizeTimeValue(row?.hora_inicio);
   const closesAt = normalizeTimeValue(row?.hora_final);
   const hasSchedule = Boolean(opensAt && closesAt);
-  const isOpen = isActive && (hasSchedule ? toBoolean(row?.abierto_por_horario) : true);
-  const schedule = buildBranchScheduleLabel({ opensAt, closesAt }) || 'Horario por confirmar';
+  const hasConfiguredSchedule = toBoolean(row?.horario_operativo_configurado);
+  const isClosedByOperationalConfig = toBoolean(row?.cerrado_operativo);
+  const isOpen = isActive && (hasConfiguredSchedule ? toBoolean(row?.abierto_por_horario) : true);
+  const schedule = buildBranchScheduleLabel({ opensAt, closesAt }) || (
+    hasConfiguredSchedule && isClosedByOperationalConfig ? 'Cerrado hoy' : 'Horario por confirmar'
+  );
 
   return {
     id: Number(row.id_sucursal),
@@ -288,7 +301,15 @@ const mapBranch = (row) => {
     closesAt,
     schedule,
     statusLabel: isOpen ? (hasSchedule ? 'Abierto ahora' : 'Disponible') : 'Cerrado',
-    closedReason: isOpen ? '' : buildBranchClosedReason({ isActive, opensAt, closesAt })
+    closedReason: isOpen
+      ? ''
+      : buildBranchClosedReason({
+        isActive,
+        opensAt,
+        closesAt,
+        hasConfiguredSchedule,
+        isClosedByOperationalConfig
+      })
   };
 };
 
@@ -556,17 +577,19 @@ const resolveComposedAvailability = ({ row, recipeAvailabilityMap, comboAvailabi
   return buildAvailabilityPayload({ available: false, reasonCode: 'ITEM_INACTIVO' });
 };
 
-// Regla oficial de precio final: precio_publico ?? precio_base.
+// AM: Regla oficial de precio final: override valido o precio base.
 const resolvePricePayload = (row) => {
-  const publicPrice = toNumberOrNull(row.precio_publico);
-  const basePrice = toNumberOrNull(row.precio_base);
+  const rawPublicPrice = toNumberOrNull(row.precio_publico);
+  const rawBasePrice = toNumberOrNull(row.precio_base);
+  const publicPrice = rawPublicPrice !== null && rawPublicPrice >= 0 ? rawPublicPrice : null;
+  const basePrice = rawBasePrice !== null && rawBasePrice >= 0 ? rawBasePrice : null;
   const finalPrice = publicPrice ?? basePrice;
 
   return {
     base: basePrice,
     public: publicPrice,
     final: finalPrice,
-    hasValidPrice: finalPrice !== null
+    hasValidPrice: finalPrice !== null && finalPrice >= 0
   };
 };
 
@@ -639,6 +662,9 @@ const mapCatalogItem = ({
 // Construye mapa de disponibilidad por ID para consultas O(1) en mapeo final.
 const toAvailabilityMap = (rows = [], keyName) =>
   new Map(rows.map((row) => [Number(row[keyName]), row]));
+
+const isRowVisibleInPublicMenu = (row) =>
+  toBoolean(row?.visible) && toBoolean(row?.estado_item_base);
 
 // Resumen de menu vigente para reutilizar en varios endpoints.
 const mapMenuSummary = (row) => ({
@@ -958,7 +984,7 @@ const materializePublicOrderSnapshot = async ({ idSucursal, requestedItems = [],
     throw buildHttpError(409, 'La sucursal no tiene menu vigente activo para registrar pedidos.');
   }
 
-  const rows = await fetchCatalogRowsByMenuQuery(Number(activeMenu.id_menu), db);
+  const rows = await fetchCatalogRowsByMenuQuery(Number(activeMenu.id_menu), Number(idSucursal), db);
   const [sauceConfigByDetail, extrasByRecipe] = await Promise.all([
     buildCatalogSauceConfigByDetail(rows, db),
     buildCatalogExtrasByRecipe(rows, db)
@@ -1251,7 +1277,7 @@ export const getPublicCatalogService = async ({ idSucursal, tipoPedido = null })
     };
   }
 
-  const rows = await fetchCatalogRowsByMenuQuery(Number(activeMenu.id_menu));
+  const rows = await fetchCatalogRowsByMenuQuery(Number(activeMenu.id_menu), Number(idSucursal));
   const [sauceConfigByDetail, extrasByRecipe] = await Promise.all([
     buildCatalogSauceConfigByDetail(rows),
     buildCatalogExtrasByRecipe(rows)
@@ -1273,7 +1299,9 @@ export const getPublicCatalogService = async ({ idSucursal, tipoPedido = null })
   const recipeAvailabilityMap = toAvailabilityMap(recipeAvailabilityRows, 'id_receta');
   const comboAvailabilityMap = toAvailabilityMap(comboAvailabilityRows, 'id_combo');
 
-  const items = rows.map((row) =>
+  const items = rows
+    .filter(isRowVisibleInPublicMenu)
+    .map((row) =>
     mapCatalogItem({
       row,
       recipeAvailabilityMap,
@@ -1281,7 +1309,7 @@ export const getPublicCatalogService = async ({ idSucursal, tipoPedido = null })
       sauceConfigByDetail,
       extrasByRecipe
     })
-  );
+    );
 
   const disponibles = items.filter((item) => item.disponibilidad.available).length;
 
@@ -1306,11 +1334,15 @@ export const getPublicCatalogItemDetailService = async ({ idSucursal, idDetalleM
 
   const row = await fetchCatalogItemByIdQuery({
     idMenu: Number(activeMenu.id_menu),
-    idDetalleMenu
+    idDetalleMenu,
+    idSucursal: Number(idSucursal)
   });
 
   if (!row) {
     throw buildHttpError(404, 'El item no existe en el menu vigente de esta sucursal.');
+  }
+  if (!isRowVisibleInPublicMenu(row)) {
+    throw buildHttpError(404, 'El item no esta disponible en el menu publico de esta sucursal.');
   }
   const [sauceConfigByDetail, extrasByRecipe] = await Promise.all([
     buildCatalogSauceConfigByDetail([row]),
@@ -1560,6 +1592,7 @@ export const createPublicOrderService = async ({
         id_pedido: idPedido,
         id_combo: line.id_combo,
         id_receta: line.id_receta,
+        cantidad: line.cantidad,
         observacion: line.observacion,
         configuracion_menu: line.configuracion_menu
       });

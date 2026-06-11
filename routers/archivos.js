@@ -1,11 +1,15 @@
 import crypto from 'crypto';
 import express from 'express';
+import sharp from 'sharp';
 import pool from '../config/db-connection.js';
 import { checkPermission } from '../middleware/checkPermission.js';
 import { supabase } from '../services/supabaseClient.js';
 import {
   ALLOWED_MIME_TYPES_BY_BUCKET,
+  FACTURACION_LOGO_MAX_DIMENSION_PX,
+  FACTURACION_LOGO_RETRY_DIMENSION_PX,
   MAX_FILE_BYTES_BY_BUCKET,
+  MAX_FACTURACION_LOGO_BYTES,
   MAX_IMAGE_BYTES,
   INVENTARIO_UPLOADS_SUBDIR,
   SUCURSALES_UPLOADS_SUBDIR,
@@ -18,15 +22,27 @@ import {
 } from '../utils/uploads.js';
 
 const router = express.Router();
-const ARCHIVOS_VIEW_PERMISSIONS = ['INVENTARIO_ARCHIVOS_VER', 'INVENTARIO_VER'];
+const ARCHIVOS_VIEW_PERMISSIONS = [
+  'INVENTARIO_ARCHIVOS_VER',
+  'INVENTARIO_VER',
+  'SUCURSALES_FACTURACION_VER',
+  'SUCURSALES_FACTURACION_EDITAR',
+  'SUCURSALES_FACTURACION_PREVIEW_VER'
+];
 const ARCHIVOS_UPLOAD_PERMISSIONS = [
   'INVENTARIO_ARCHIVOS_SUBIR',
   'INVENTARIO_PRODUCTOS_IMAGEN_SUBIR',
   'INVENTARIO_OC_RECEPCIONAR',
   'INVENTARIO_OC_SUBIR_FACTURA',
-  'INVENTARIO_VER'
+  'INVENTARIO_VER',
+  'SUCURSALES_FACTURACION_EDITAR'
 ];
-const ARCHIVOS_DELETE_PERMISSIONS = ['INVENTARIO_ARCHIVOS_ELIMINAR', 'INVENTARIO_PRODUCTOS_IMAGEN_ELIMINAR', 'INVENTARIO_VER'];
+const ARCHIVOS_DELETE_PERMISSIONS = [
+  'INVENTARIO_ARCHIVOS_ELIMINAR',
+  'INVENTARIO_PRODUCTOS_IMAGEN_ELIMINAR',
+  'INVENTARIO_VER',
+  'SUCURSALES_FACTURACION_EDITAR'
+];
 
 const BASE64_BODY_REGEX = /^[A-Za-z0-9+/]+={0,2}$/;
 const SQLSTATE_UNDEFINED_TABLE = '42P01';
@@ -36,9 +52,44 @@ const ARCHIVO_NOT_FOUND_MESSAGE = 'Archivo no encontrado.';
 const ARCHIVO_IN_USE_MESSAGE = 'No se pudo limpiar la imagen porque esta siendo utilizada en otros modulos del sistema.';
 const ARCHIVO_CLEANUP_SUCCESS_MESSAGE = 'Archivo temporal limpiado correctamente.';
 const ARCHIVO_CLEANUP_PENDING_MESSAGE = 'La imagen temporal fue desactivada y quedo pendiente su limpieza fisica.';
+const FACTURACION_LOGO_OPTIMIZE_ERROR_MESSAGE = 'No se pudo optimizar el logo. Intenta con una imagen mas liviana.';
 
 const getSafeUploadErrorMessage = (fallback = 'No se pudo procesar el archivo.') => fallback;
 const getSafeArchivoCleanupErrorMessage = (fallback = 'No se pudo limpiar la imagen temporal.') => fallback;
+
+const optimizeFacturacionLogoBuffer = async (buffer) => {
+  const optimize = (dimension) => sharp(buffer, { failOn: 'warning' })
+    .rotate()
+    .resize({
+      width: dimension,
+      height: dimension,
+      fit: 'inside',
+      withoutEnlargement: true
+    })
+    .png({
+      compressionLevel: 9,
+      adaptiveFiltering: true
+    })
+    .toBuffer();
+
+  let optimizedBuffer = await optimize(FACTURACION_LOGO_MAX_DIMENSION_PX);
+  if (optimizedBuffer.length <= MAX_FACTURACION_LOGO_BYTES) {
+    return {
+      buffer: optimizedBuffer,
+      width: FACTURACION_LOGO_MAX_DIMENSION_PX
+    };
+  }
+
+  optimizedBuffer = await optimize(FACTURACION_LOGO_RETRY_DIMENSION_PX);
+  if (optimizedBuffer.length <= MAX_FACTURACION_LOGO_BYTES) {
+    return {
+      buffer: optimizedBuffer,
+      width: FACTURACION_LOGO_RETRY_DIMENSION_PX
+    };
+  }
+
+  return null;
+};
 
 const ensureSupabaseBucket = async (bucketName) => {
   const bucket = String(bucketName || '').trim();
@@ -213,6 +264,14 @@ const getArchivoReferenceSummary = async (idArchivo, db = pool) => {
         query: 'SELECT COUNT(*)::int AS total FROM public.compras WHERE id_archivo_transferencia = $1'
       },
       db
+    ),
+    safeReferenceCount(
+      {
+        label: 'facturacion_config_sucursal',
+        params: [idArchivo],
+        query: 'SELECT COUNT(*)::int AS total FROM public.facturacion_config_sucursal WHERE id_archivo_logo = $1'
+      },
+      db
     )
   ]);
 
@@ -289,8 +348,9 @@ router.post('/archivos', checkPermission(ARCHIVOS_UPLOAD_PERMISSIONS), async (re
     // 3. Validacion de MIME Type Dinamica por Bucket
     const detectedMimeType = detectFileMimeTypeFromBuffer(decoded.buffer);
     const declaredMimeType = parsedPayload.mimeType;
-    const effectiveMimeType = detectedMimeType || declaredMimeType;
+    let effectiveMimeType = detectedMimeType || declaredMimeType;
     const allowedMimesForBucket = ALLOWED_MIME_TYPES_BY_BUCKET[targetBucket];
+    let uploadBuffer = decoded.buffer;
 
     if (!effectiveMimeType || !Object.prototype.hasOwnProperty.call(allowedMimesForBucket, effectiveMimeType)) {
       return res.status(400).json({ 
@@ -300,6 +360,41 @@ router.post('/archivos', checkPermission(ARCHIVOS_UPLOAD_PERMISSIONS), async (re
     }
 
     const contextoRaw = String(payload?.contexto || payload?.modulo || '').trim().toLowerCase();
+    if (contextoRaw === 'facturacion-logo') {
+      if (targetBucket !== SUPABASE_ADMIN_BUCKET) {
+        return res.status(400).json({
+          ok: false,
+          message: `Los logos de facturacion deben subirse al bucket '${SUPABASE_ADMIN_BUCKET}'.`
+        });
+      }
+      if (!['image/jpeg', 'image/png', 'image/webp'].includes(detectedMimeType)) {
+        return res.status(400).json({
+          ok: false,
+          message: 'Solo se permiten imagenes JPG, PNG o WEBP para logos de facturacion.'
+        });
+      }
+
+      let optimizedLogo = null;
+      try {
+        optimizedLogo = await optimizeFacturacionLogoBuffer(decoded.buffer);
+      } catch (optimizeError) {
+        console.error('[archivos] error optimizando logo de facturacion:', optimizeError);
+        return res.status(400).json({
+          ok: false,
+          message: FACTURACION_LOGO_OPTIMIZE_ERROR_MESSAGE
+        });
+      }
+
+      if (!optimizedLogo?.buffer?.length) {
+        return res.status(400).json({
+          ok: false,
+          message: FACTURACION_LOGO_OPTIMIZE_ERROR_MESSAGE
+        });
+      }
+
+      uploadBuffer = optimizedLogo.buffer;
+      effectiveMimeType = 'image/png';
+    }
     if (contextoRaw === 'sucursales' && !['image/jpeg', 'image/png'].includes(effectiveMimeType)) {
       return res.status(400).json({
         ok: false,
@@ -314,7 +409,7 @@ router.post('/archivos', checkPermission(ARCHIVOS_UPLOAD_PERMISSIONS), async (re
     const uniqueFileName = `${safeOriginalName}-${Date.now()}-${crypto.randomUUID().slice(0, 8)}.${extension}`;
 
     const subDir = targetBucket === SUPABASE_ADMIN_BUCKET
-      ? ADMIN_UPLOADS_SUBDIR
+      ? (contextoRaw === 'facturacion-logo' ? 'facturacion' : ADMIN_UPLOADS_SUBDIR)
       : contextoRaw === 'sucursales'
         ? SUCURSALES_UPLOADS_SUBDIR
         : contextoRaw === 'carrusel'
@@ -326,7 +421,7 @@ router.post('/archivos', checkPermission(ARCHIVOS_UPLOAD_PERMISSIONS), async (re
     await ensureSupabaseBucket(targetBucket);
     const { error: uploadError } = await supabase.storage
       .from(targetBucket)
-      .upload(supabaseFilePath, decoded.buffer, {
+      .upload(supabaseFilePath, uploadBuffer, {
         contentType: effectiveMimeType,
         cacheControl: '3600',
         upsert: false
@@ -353,7 +448,7 @@ router.post('/archivos', checkPermission(ARCHIVOS_UPLOAD_PERMISSIONS), async (re
         id_usuario
       ) VALUES ($1, $2, $3, $4, $5)
       RETURNING id_archivo, url_publica`,
-      [safeOriginalName, pathForDb, effectiveMimeType, decoded.buffer.length, safeUserId]
+      [safeOriginalName, pathForDb, effectiveMimeType, uploadBuffer.length, safeUserId]
     );
 
     const inserted = insertResult.rows?.[0] || {};

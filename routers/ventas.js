@@ -1,5 +1,6 @@
 import express from 'express';
 import { performance } from 'node:perf_hooks';
+import { createHash } from 'node:crypto';
 import pool from '../config/db-connection.js';
 import { checkPermission, requestHasAnyPermission } from '../middleware/checkPermission.js';
 import { resolveRequestUserSucursalScope } from '../utils/sucursalScope.js';
@@ -17,195 +18,119 @@ import {
   listFacturaReversiones
 } from '../services/ventasReversionService.js';
 import {
-  fetchPublicActiveSaucesQuery
-} from './public_menu/publicMenuQueries.js';
-import {
   listarAlertasInventarioPedido
 } from '../services/inventarioAlertasService.js';
+import {
+  fetchEstadoPedidoRows,
+  resolveEstadoPedidoIdByCode,
+  resolveMetodoPagoRegistroPedido,
+  resolveSucursalId
+} from './ventas/services/catalogLookupService.js';
+import {
+  fetchClienteInfo,
+  fetchVentaCatalogMaps
+} from './ventas/services/ventasReadService.js';
+import {
+  buildKitchenSaleDetailItems,
+  fetchCuentaDividida,
+  inferKitchenItemQuantity,
+  mergeVentaWithFacturacion,
+  resolveVentaNumero
+} from './ventas/services/ventaDetalleReadService.js';
+import {
+  buildVentaComplementContext,
+  buildVentasStaticCacheKey,
+  fetchCachedVentasStaticRows,
+  resolveComboComplementMetadata,
+  resolveRecetaComplementMetadata
+} from './ventas/services/complementosCatalogService.js';
+import {
+  listCategoriasCatalogoHandler,
+  listClientesCatalogoHandler,
+  listCombosCatalogoHandler,
+  listDescuentosCatalogoHandler,
+  listExtrasPermitidosCatalogoHandler,
+  listProductosCatalogoHandler,
+  listRecetasCatalogoHandler,
+  listTipoDepartamentoCatalogoHandler,
+  listTiposDescuentoCatalogoHandler
+} from './ventas/handlers/catalogosHandlers.js';
+import {
+  buscarVentaHandler,
+  getVentaByIdHandler,
+  getVentaTicketPdfByIdHandler,
+  getVentaTicketByIdHandler
+} from './ventas/handlers/ventasReadHandlers.js';
+import {
+  buildComplementLineConfig,
+  buildComplementSnapshot,
+  normalizeCartKey,
+  normalizeVentaItems
+} from './ventas/services/ventasPayloadService.js';
+import {
+  buildPedidoPendienteRpcPayload,
+  buildVentaRpcPayload,
+  buildVentaRpcV2Payload
+} from './ventas/services/ventasRpcPayloadService.js';
+import {
+  DESCUENTO_ALCANCE_KEYS,
+  DESCUENTO_TIPO_KEYS,
+  ESTADO_PEDIDO_CODES,
+  PEDIDO_ESTADO_PAGO,
+  PEDIDO_MENU_PAYMENT_WINDOW_MINUTES,
+  PEDIDO_PAGADO_CONFIRMADO_ESTADO_PAGO,
+  PEDIDO_PENDIENTE_CANALES,
+  PEDIDO_PENDIENTE_ESTADO_DELIVERY,
+  PEDIDO_PENDIENTE_ESTADO_PAGO,
+  PEDIDO_PENDIENTE_MODALIDADES,
+  REVERSION_ALERT_EMAIL,
+  REVERSION_FAILURE_EMAIL_COOLDOWN_MS,
+  VENTA_COMPLEMENTO_TIPO_SALSAS,
+  VENTA_DIRECTA_LABEL,
+  VENTAS_DEFAULT_PAGE,
+  VENTAS_DEFAULT_PAGE_SIZE,
+  VENTAS_DESCUENTO_APLICAR_PERMISSION,
+  VENTAS_DESCUENTOS_PERMISSIONS,
+  VENTAS_DESCUENTOS_WRITE_PERMISSIONS,
+  VENTAS_FIDELIZACION_ADVISORY_LOCK_CLASS,
+  VENTAS_HISTORY_ADMIN_ROLES,
+  VENTAS_HISTORY_CAJERO_ROLE,
+  VENTAS_LIMIT_72H_CUTOFF_SQL,
+  VENTAS_MAX_PAGE_SIZE
+} from './ventas/constants.js';
+import { roundMoney } from './ventas/utils/moneyUtils.js';
+import {
+  coercePositiveIntArray,
+  isPlainObject,
+  normalizeDescuentoAlcance,
+  normalizeObservation,
+  normalizeRoleName,
+  normalizeTextKey,
+  normalizeTipoItem,
+  parseBooleanInput,
+  parseBooleanish,
+  parseBoundedPositiveInt,
+  parseJsonArrayValue,
+  parseNonNegativeNumber,
+  parseOptionalDateInput,
+  parseOptionalDateTime,
+  parseOptionalPositiveInt,
+  parsePositiveInt,
+  parseRequiredPositiveInt
+} from './ventas/utils/parseUtils.js';
+import {
+  createVentasPerfTracker,
+  isPedidoPendienteRpcV1Enabled,
+  isVentasPerfEnabled,
+  isVentasRpcTransactionEnabled,
+  isVentasRpcV2Enabled,
+  logVentasPerfRoute,
+  logVentasPerfStartupIfEnabled
+} from './ventas/utils/perfUtils.js';
 
 const router = express.Router();
 
-const VENTA_DIRECTA_LABEL = 'VENTA DIRECTA';
-const TEGUCIGALPA_TZ = 'America/Tegucigalpa';
-const VENTAS_DEFAULT_PAGE = 1;
-const VENTAS_DEFAULT_PAGE_SIZE = 30;
-const VENTAS_MAX_PAGE_SIZE = 50;
-const VENTAS_HISTORY_ADMIN_ROLES = new Set(['SUPER_ADMIN', 'ADMINISTRADOR', 'ADMIN']);
-const VENTAS_HISTORY_CAJERO_ROLE = 'CAJERO';
-const VENTAS_LIMIT_72H_CUTOFF_SQL = `(NOW() AT TIME ZONE '${TEGUCIGALPA_TZ}') - INTERVAL '72 hours'`;
-const VENTAS_DESCUENTOS_PERMISSIONS = ['VENTAS_DESCUENTOS_CATALOGO_VER'];
-const VENTAS_DESCUENTOS_WRITE_PERMISSIONS = [
-  'VENTAS_DESCUENTOS_CATALOGO_CREAR',
-  'VENTAS_DESCUENTOS_CATALOGO_EDITAR',
-  'VENTAS_DESCUENTOS_CATALOGO_ESTADO_CAMBIAR'
-];
-const DESCUENTO_TIPO_KEYS = {
-  MONTO_FIJO: 'MONTO_FIJO',
-  PORCENTAJE: 'PORCENTAJE'
-};
-const DESCUENTO_ALCANCE_KEYS = {
-  FACTURA_COMPLETA: 'FACTURA_COMPLETA',
-  PRODUCTO: 'PRODUCTO',
-  RECETA: 'RECETA',
-  COMBO: 'COMBO'
-};
-const VENTAS_DESCUENTO_APLICAR_PERMISSION = 'VENTAS_DESCUENTO_APLICAR';
-const ESTADO_PEDIDO_CODES = {
-  PENDIENTE: new Set([
-    'pendiente',
-    'pendientes',
-    'por_pagar',
-    'pendiente_por_pagar',
-    'pendiente_/_por_pagar',
-    'pendientes_/_por_pagar'
-  ]),
-  EN_COCINA: new Set(['en_cocina']),
-  EN_PREPARACION: new Set(['en_preparacion']),
-  LISTO_PARA_ENTREGA: new Set(['listo_para_entrega']),
-  CANCELADO: new Set(['cancelado', 'cancelada', 'anulado', 'anulada']),
-  COMPLETADO: new Set([
-    'completada',
-    'completado',
-    'finalizada',
-    'finalizado',
-    'pagada',
-    'pagado',
-    'cerrada',
-    'cerrado',
-    'lista',
-    'listo'
-  ]),
-  NO_ENTREGADO: new Set(['no_entregado'])
-};
-const PEDIDO_MENU_PAYMENT_WINDOW_MINUTES = 10;
-const PEDIDO_ESTADO_PAGO = Object.freeze({
-  PENDIENTE_VALIDACION: 'PENDIENTE_VALIDACION',
-  PAGADO_CONFIRMADO: 'PAGADO_CONFIRMADO',
-  CANCELADO_TIMEOUT: 'CANCELADO_TIMEOUT'
-});
-const VENTAS_PERF_STAGE_NAMES = [
-  'auth_context_ms',
-  'auth_permission_ms',
-  'auth_scope_ms',
-  'auth_caja_ms',
-  'auth_sesion_caja_ms',
-  'auth_caja_sesion_combined_ms',
-  'auth_payload_context_ms',
-  'auth_payload_context_combined_ms',
-  'payload_build_ms',
-  'totals_ms',
-  'totals_catalogos_ms',
-  'totals_items_ms',
-  'totals_productos_ms',
-  'totals_recetas_ms',
-  'totals_combos_ms',
-  'totals_complementos_ms',
-  'totals_combo_components_ms',
-  'totals_sauce_rules_ms',
-  'totals_allowed_sauces_ms',
-  'totals_descuentos_ms',
-  'totals_extras_ms',
-  'validation_items_ms',
-  'validation_descuentos_ms',
-  'validation_extras_ms',
-  'catalog_prefetch_ms',
-  'catalog_cache_ms',
-  'totals_impuestos_ms',
-  'totals_build_ms',
-  'pedido_pendiente_build_ms',
-  'pedido_pendiente_contexto_ms',
-  'pedido_pendiente_detalle_ms',
-  'pedido_pendiente_contacto_ms',
-  'pedido_pendiente_pago_control_ms',
-  'registrar_pago_contexto_ms',
-  'registrar_pago_factura_cobro_ms',
-  'registrar_pago_detalle_final_ms',
-  'pedido_ms',
-  'detalle_pedido_ms',
-  'detalle_pedido_descuentos_ms',
-  'detalle_pedido_lookup_ms',
-  'detalle_pedido_reuse_hydrated_ms',
-  'detalle_pedido_insert_ms',
-  'factura_ms',
-  'factura_correlativo_ms',
-  'factura_correlativo_config_ms',
-  'factura_correlativo_rango_ms',
-  'factura_correlativo_numero_ms',
-  'factura_insert_ms',
-  'factura_snapshot_ms',
-  'factura_snapshot_config_ms',
-  'factura_snapshot_sucursal_ms',
-  'factura_snapshot_build_ms',
-  'detalle_factura_ms',
-  'detalle_factura_descuentos_ms',
-  'detalle_factura_lookup_ms',
-  'detalle_factura_insert_ms',
-  'detalle_factura_origen_ms',
-  'cobro_ms',
-  'inventario_ms',
-  'fidelizacion_ms',
-  'ticket_response_build_ms',
-  'pre_rpc_total_ms',
-  'rpc_payload_build_ms',
-  'rpc_call_ms',
-  'rpc_v2_payload_build_ms',
-  'rpc_v2_call_ms',
-  'rpc_v2_total_ms',
-  'post_rpc_total_ms',
-  'post_rpc_fidelizacion_ms',
-  'post_rpc_response_ms',
-  'node_before_rpc_ms',
-  'node_after_rpc_ms',
-  'rpc_total_ms',
-  'commit_ms'
-];
-
-const parseTruthyEnv = (value) =>
-  ['true', '1', 'yes', 'on'].includes(String(value || '').trim().toLowerCase());
-
-const isVentasPerfEnabled = () =>
-  process.env.NODE_ENV !== 'production' && parseTruthyEnv(process.env.VENTAS_PERF_LOGS);
-
-let ventasPerfStartupLogged = false;
-const logVentasPerfStartupIfEnabled = () => {
-  if (ventasPerfStartupLogged || !isVentasPerfEnabled()) return;
-  ventasPerfStartupLogged = true;
-  console.info('[ventas:perf:start]', {
-    NODE_ENV: process.env.NODE_ENV || null,
-    VENTAS_PERF_LOGS: process.env.VENTAS_PERF_LOGS || null,
-    VENTAS_USE_RPC_V2: process.env.VENTAS_USE_RPC_V2 || null,
-    VENTAS_USE_RPC_TRANSACTION: process.env.VENTAS_USE_RPC_TRANSACTION || null,
-    VENTAS_CATALOG_CACHE_TTL_MS: process.env.VENTAS_CATALOG_CACHE_TTL_MS || null,
-    EMAIL_SCHEDULER_ENABLED: process.env.EMAIL_SCHEDULER_ENABLED || null
-  });
-};
-
 setImmediate(logVentasPerfStartupIfEnabled);
-
-const logVentasPerfRoute = (route, extra = {}) => {
-  if (!isVentasPerfEnabled()) return;
-  console.info('[ventas:perf:route]', {
-    route,
-    ...extra
-  });
-};
-
-const VENTAS_PERF_COUNTER_NAMES = [
-  'cache_hits',
-  'cache_misses'
-];
-
-function isVentasRpcTransactionEnabled() {
-  return String(process.env.VENTAS_USE_RPC_TRANSACTION || '')
-    .trim()
-    .toLowerCase() === 'true';
-}
-
-function isVentasRpcV2Enabled() {
-  return String(process.env.VENTAS_USE_RPC_V2 || '')
-    .trim()
-    .toLowerCase() === 'true';
-}
 
 const buildBatchPlaceholders = (rowCount, columnCount, castsByColumn = {}) =>
   Array.from({ length: rowCount }, (_, rowIndex) => {
@@ -215,187 +140,9 @@ const buildBatchPlaceholders = (rowCount, columnCount, castsByColumn = {}) =>
     });
     return `(${placeholders.join(', ')})`;
   }).join(', ');
-const measureVentasPerf = async (perf, name, task) => {
-  const startedAt = perf?.now?.() || 0;
-  try {
-    return await task();
-  } finally {
-    perf?.add?.(name, startedAt);
-  }
-};
 
-const getVentasCatalogCacheTtlMs = () => {
-  const rawValue = process.env.VENTAS_CATALOG_CACHE_TTL_MS;
-  const defaultValue = process.env.NODE_ENV === 'production' ? '0' : '30000';
-  const parsed = Number.parseInt(rawValue === undefined || rawValue === null || String(rawValue).trim() === '' ? defaultValue : rawValue, 10);
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
-};
-const isVentasCatalogCacheEnabled = () =>
-  getVentasCatalogCacheTtlMs() > 0;
-const ventasStaticComplementCache = new Map();
-
-const buildVentasStaticCacheKey = (prefix, ids = []) => {
-  const normalizedIds = [...new Set((Array.isArray(ids) ? ids : [])
-    .map((id) => Number(id || 0))
-    .filter((id) => Number.isInteger(id) && id > 0))]
-    .sort((a, b) => a - b);
-  return `${prefix}:${normalizedIds.join(',')}`;
-};
-
-const cloneRows = (rows) => (Array.isArray(rows) ? rows.map((row) => ({ ...row })) : []);
-
-const cloneVentasCacheValue = (value) => {
-  if (Array.isArray(value)) return cloneRows(value);
-  if (value && typeof value === 'object') {
-    return Object.fromEntries(
-      Object.entries(value).map(([key, entryValue]) => [
-        key,
-        Array.isArray(entryValue) ? cloneRows(entryValue) : entryValue
-      ])
-    );
-  }
-  return value;
-};
-
-const fetchCachedVentasStaticValue = async (cacheKey, loader, perf = null) => {
-  const cacheStart = perf?.now?.() || 0;
-  if (!isVentasCatalogCacheEnabled()) {
-    perf?.inc?.('cache_misses');
-    const value = await loader();
-    perf?.add?.('catalog_cache_ms', cacheStart);
-    return value;
-  }
-
-  const now = Date.now();
-  const cached = ventasStaticComplementCache.get(cacheKey);
-  const ttlMs = getVentasCatalogCacheTtlMs();
-  if (cached && now - cached.at < ttlMs) {
-    perf?.inc?.('cache_hits');
-    perf?.add?.('catalog_cache_ms', cacheStart);
-    return cloneVentasCacheValue(cached.value);
-  }
-
-  perf?.inc?.('cache_misses');
-  const value = await loader();
-  ventasStaticComplementCache.set(cacheKey, { at: now, value: cloneVentasCacheValue(value) });
-  perf?.add?.('catalog_cache_ms', cacheStart);
-  return cloneVentasCacheValue(value);
-};
-
-const fetchCachedVentasStaticRows = async (cacheKey, loader, perf = null) =>
-  fetchCachedVentasStaticValue(cacheKey, loader, perf);
-
-const createVentasPerfTracker = () => {
-  const enabled = isVentasPerfEnabled();
-  if (enabled) logVentasPerfStartupIfEnabled();
-  const startedAt = enabled ? performance.now() : 0;
-  const measures = Object.create(null);
-  const counters = Object.create(null);
-  let logged = false;
-
-  return {
-    enabled,
-    now() {
-      return enabled ? performance.now() : 0;
-    },
-    add(name, startedAtMs) {
-      if (!enabled || !startedAtMs) return;
-      const elapsed = Math.max(0, Math.round(performance.now() - startedAtMs));
-      measures[name] = (measures[name] || 0) + elapsed;
-    },
-    inc(name, by = 1) {
-      if (!enabled) return;
-      counters[name] = (counters[name] || 0) + Number(by || 1);
-    },
-    summary(extra = {}) {
-      const stages = VENTAS_PERF_STAGE_NAMES.reduce((acc, name) => {
-        acc[name] = measures[name] || 0;
-        return acc;
-      }, {});
-      const counterSummary = VENTAS_PERF_COUNTER_NAMES.reduce((acc, name) => {
-        acc[name] = counters[name] || 0;
-        return acc;
-      }, {});
-
-      return {
-        ...extra,
-        total_ms: enabled ? Math.max(0, Math.round(performance.now() - startedAt)) : 0,
-        ...stages,
-        ...counterSummary
-      };
-    },
-    log(extra = {}) {
-      if (!enabled) return;
-      logged = true;
-      console.info('[ventas:perf]', this.summary(extra));
-    },
-    logIfMissing(extra = {}) {
-      if (!enabled || logged) return;
-      this.log(extra);
-    },
-    hasLogged() {
-      return logged;
-    }
-  };
-};
-const PEDIDO_PENDIENTE_ESTADO_PAGO = 'PENDIENTE_PAGO';
-const PEDIDO_PAGADO_CONFIRMADO_ESTADO_PAGO = 'PAGADO_CONFIRMADO';
-const PEDIDO_PENDIENTE_ESTADO_DELIVERY = 'PENDIENTE';
-const PEDIDO_PENDIENTE_CANALES = new Set(['LOCAL', 'TELEFONO', 'WHATSAPP']);
-const PEDIDO_PENDIENTE_MODALIDADES = new Set(['CONSUMO_LOCAL', 'RECOGER', 'DELIVERY']);
-const REVERSION_ALERT_EMAIL = 'gersonmz@jonnyshn.com';
-const REVERSION_FAILURE_EMAIL_COOLDOWN_MS = 60 * 1000;
 const reversionFailureEmailCooldown = new Map();
-const VENTA_COMPLEMENTO_TIPO_SALSAS = 'SALSAS';
-const WINGS_SAUCE_KEYWORDS = Object.freeze(['alita', 'alitas', 'tender', 'tenders']);
 const schemaColumnCache = new Map();
-
-const roundMoney = (value) => Number((Number(value || 0)).toFixed(2));
-const normalizeTipoItem = (value) => {
-  const normalized = String(value || '').trim().toUpperCase();
-  return ['PRODUCTO', 'RECETA', 'COMBO', 'MIXTO', 'ITEM'].includes(normalized)
-    ? normalized
-    : 'ITEM';
-};
-
-const parsePositiveInt = (value) => {
-  const parsed = Number.parseInt(value, 10);
-  return Number.isInteger(parsed) && parsed > 0 ? parsed : null;
-};
-
-const parseOptionalPositiveInt = (value) => {
-  if (value === undefined || value === null || value === '') return null;
-  return parsePositiveInt(value);
-};
-
-const parseRequiredPositiveInt = (value, fieldName) => {
-  const parsed = parsePositiveInt(value);
-  if (!parsed) {
-    return {
-      ok: false,
-      message: `${fieldName} debe ser un entero mayor a 0.`
-    };
-  }
-  return { ok: true, value: parsed };
-};
-
-const parseNonNegativeNumber = (value) => {
-  const parsed = Number(value);
-  return Number.isFinite(parsed) && parsed >= 0 ? roundMoney(parsed) : null;
-};
-
-const normalizeDescuentoAlcance = (value) => {
-  const normalized = String(value || '')
-    .trim()
-    .toUpperCase();
-  return Object.values(DESCUENTO_ALCANCE_KEYS).includes(normalized) ? normalized : null;
-};
-
-const parseOptionalDateTime = (value) => {
-  if (value === undefined || value === null || value === '') return null;
-  const date = new Date(value);
-  return Number.isNaN(date.getTime()) ? null : date;
-};
 
 const hasColumn = async (client, tableName, columnName) => {
   const key = `${String(tableName || '').trim().toLowerCase()}.${String(columnName || '').trim().toLowerCase()}`;
@@ -434,6 +181,248 @@ const hasTable = async (client, tableName) => {
   schemaColumnCache.set(key, exists);
   return exists;
 };
+
+const PEDIDO_PENDIENTE_ALLOWED_EXTRAS_SCHEMA_TABLES = Object.freeze([
+  'menu_extras',
+  'menu_extra_receta',
+  'menu_extra_combo'
+]);
+const PEDIDO_PENDIENTE_ALLOWED_EXTRAS_SCHEMA_MIN_TTL_MS = 5 * 60 * 1000;
+const pedidoPendienteAllowedExtrasSchemaCache = new Map();
+
+const getPedidoPendienteAllowedExtrasSchemaCacheTtlMs = () => {
+  const ttl = Number(process.env.VENTAS_CATALOG_CACHE_TTL_MS);
+  const configuredTtl = Number.isFinite(ttl) && ttl > 0 ? Math.round(ttl) : 30000;
+  return Math.max(configuredTtl, PEDIDO_PENDIENTE_ALLOWED_EXTRAS_SCHEMA_MIN_TTL_MS);
+};
+
+const clonePedidoPendienteAllowedExtrasSchemaValue = (value) => ({
+  hasMenuExtras: Boolean(value?.hasMenuExtras),
+  hasMenuExtraReceta: Boolean(value?.hasMenuExtraReceta),
+  hasMenuExtraCombo: Boolean(value?.hasMenuExtraCombo)
+});
+
+const resolvePedidoPendienteAllowedExtrasSchema = async (client, perf = null) => {
+  const startedAt = perf?.now?.() || 0;
+  try {
+    const cacheKey = 'pedido_pendiente_allowed_extras_schema';
+    const now = Date.now();
+    const cached = pedidoPendienteAllowedExtrasSchemaCache.get(cacheKey);
+    if (cached && cached.expiresAt > now) {
+      return clonePedidoPendienteAllowedExtrasSchemaValue(cached.value);
+    }
+    if (cached) pedidoPendienteAllowedExtrasSchemaCache.delete(cacheKey);
+
+    const result = await client.query(
+      `
+        SELECT table_name
+        FROM information_schema.tables
+        WHERE table_schema = 'public'
+          AND table_name = ANY($1::text[])
+      `,
+      [PEDIDO_PENDIENTE_ALLOWED_EXTRAS_SCHEMA_TABLES]
+    );
+    const existingTables = new Set(result.rows.map((row) => String(row.table_name || '').trim()));
+    const value = {
+      hasMenuExtras: existingTables.has('menu_extras'),
+      hasMenuExtraReceta: existingTables.has('menu_extra_receta'),
+      hasMenuExtraCombo: existingTables.has('menu_extra_combo')
+    };
+    pedidoPendienteAllowedExtrasSchemaCache.set(cacheKey, {
+      value,
+      expiresAt: now + getPedidoPendienteAllowedExtrasSchemaCacheTtlMs()
+    });
+    return clonePedidoPendienteAllowedExtrasSchemaValue(value);
+  } finally {
+    perf?.add?.('pedido_pendiente_allowed_extras_schema_ms', startedAt);
+  }
+};
+
+const getIdempotencyKey = (req) => {
+  const raw = req.headers?.['idempotency-key'];
+  const value = Array.isArray(raw) ? raw[0] : raw;
+  const key = String(value || '').trim();
+  return key || null;
+};
+
+const stableStringify = (value) => {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map((item) => stableStringify(item)).join(',')}]`;
+
+  return `{${Object.keys(value)
+    .sort()
+    .map((key) => `${JSON.stringify(key)}:${stableStringify(value[key])}`)
+    .join(',')}}`;
+};
+
+const buildIdempotencyRequestHash = (body) =>
+  createHash('sha256')
+    .update(stableStringify(body ?? null))
+    .digest('hex');
+
+const reserveVentasIdempotencyKey = async ({
+  idempotencyKey,
+  operation,
+  requestHash,
+  idUsuario = null,
+  idSucursal = null
+}) => {
+  if (!idempotencyKey) return { enabled: false };
+
+  try {
+    const insertResult = await pool.query(
+      `
+        INSERT INTO public.ventas_idempotency_keys (
+          idempotency_key,
+          operation,
+          request_hash,
+          id_usuario,
+          id_sucursal,
+          status
+        )
+        VALUES ($1, $2, $3, $4, $5, 'IN_PROGRESS')
+        ON CONFLICT (idempotency_key) DO NOTHING
+        RETURNING idempotency_key
+      `,
+      [
+        idempotencyKey,
+        operation,
+        requestHash,
+        parseOptionalPositiveInt(idUsuario) || null,
+        parseOptionalPositiveInt(idSucursal) || null
+      ]
+    );
+
+    if (insertResult.rowCount > 0) {
+      return { enabled: true, reserved: true, idempotencyKey, requestHash };
+    }
+
+    const existingResult = await pool.query(
+      `
+        SELECT
+          idempotency_key,
+          operation,
+          request_hash,
+          status,
+          http_status,
+          response_body
+        FROM public.ventas_idempotency_keys
+        WHERE idempotency_key = $1
+        LIMIT 1
+      `,
+      [idempotencyKey]
+    );
+    const existing = existingResult.rows?.[0] || null;
+    if (!existing) {
+      return { enabled: true, conflict: true, code: 'REQUEST_ALREADY_IN_PROGRESS' };
+    }
+
+    if (existing.operation !== operation || existing.request_hash !== requestHash) {
+      return { enabled: true, conflict: true, code: 'IDEMPOTENCY_KEY_REUSED' };
+    }
+    if (String(existing.status || '').trim().toUpperCase() === 'SUCCESS') {
+      return {
+        enabled: true,
+        replay: true,
+        httpStatus: Number(existing.http_status || 200),
+        responseBody: existing.response_body || {}
+      };
+    }
+    if (String(existing.status || '').trim().toUpperCase() === 'IN_PROGRESS') {
+      return { enabled: true, conflict: true, code: 'REQUEST_ALREADY_IN_PROGRESS' };
+    }
+
+    await pool.query(
+      `
+        UPDATE public.ventas_idempotency_keys
+        SET
+          operation = $2,
+          id_usuario = COALESCE($3, id_usuario),
+          id_sucursal = COALESCE($4, id_sucursal),
+          status = 'IN_PROGRESS',
+          http_status = NULL,
+          response_body = NULL,
+          error_code = NULL,
+          updated_at = now()
+        WHERE idempotency_key = $1
+      `,
+      [
+        idempotencyKey,
+        operation,
+        parseOptionalPositiveInt(idUsuario) || null,
+        parseOptionalPositiveInt(idSucursal) || null
+      ]
+    );
+    return { enabled: true, reserved: true, idempotencyKey, requestHash };
+  } catch (err) {
+    if (err?.code === '42P01') {
+      console.warn('Tabla ventas_idempotency_keys no existe; se omite idempotencia de ventas.');
+      return { enabled: false, missingTable: true };
+    }
+    throw err;
+  }
+};
+
+const saveVentasIdempotencySuccess = async ({
+  reservation,
+  httpStatus,
+  responseBody,
+  idPedido = null,
+  idFactura = null,
+  idUsuario = null,
+  idSucursal = null
+}) => {
+  if (!reservation?.reserved) return;
+  await pool.query(
+    `
+      UPDATE public.ventas_idempotency_keys
+      SET
+        status = 'SUCCESS',
+        http_status = $2,
+        response_body = $3::jsonb,
+        id_pedido = COALESCE($4, id_pedido),
+        id_factura = COALESCE($5, id_factura),
+        id_usuario = COALESCE($6, id_usuario),
+        id_sucursal = COALESCE($7, id_sucursal),
+        error_code = NULL,
+        updated_at = now()
+      WHERE idempotency_key = $1
+    `,
+    [
+      reservation.idempotencyKey,
+      httpStatus,
+      JSON.stringify(responseBody),
+      parseOptionalPositiveInt(idPedido) || null,
+      parseOptionalPositiveInt(idFactura) || null,
+      parseOptionalPositiveInt(idUsuario) || null,
+      parseOptionalPositiveInt(idSucursal) || null
+    ]
+  );
+};
+
+const saveVentasIdempotencyFailure = async ({
+  reservation,
+  httpStatus = null,
+  errorCode = null
+}) => {
+  if (!reservation?.reserved) return;
+  await pool.query(
+    `
+      UPDATE public.ventas_idempotency_keys
+      SET
+        status = 'FAILED',
+        http_status = $2,
+        error_code = $3,
+        updated_at = now()
+      WHERE idempotency_key = $1
+    `,
+    [
+      reservation.idempotencyKey,
+      Number.isInteger(httpStatus) ? httpStatus : null,
+      errorCode || null
+    ]
+  );
+};
 const hasDiscountIntentInPayload = (body) => {
   if (!isPlainObject(body)) return false;
 
@@ -461,109 +450,10 @@ const hasDiscountIntentInPayload = (body) => {
     return false;
   });
 };
-const mergeVentaWithFacturacion = (venta = {}, facturacion = {}) => {
-  const emisor = facturacion?.emisor || {};
-  const ticket = facturacion?.ticket || {};
-  const ticketFlags = {
-    mostrar_datos_fiscales: ticket?.mostrar_datos_fiscales !== false,
-    mostrar_cai_ticket: ticket?.mostrar_cai_ticket !== false,
-    mostrar_numero_fiscal_ticket: ticket?.mostrar_numero_fiscal_ticket !== false,
-    mostrar_codigo_interno_ticket: ticket?.mostrar_codigo_interno_ticket !== false,
-    aplicar_impuestos: Boolean(ticket?.aplicar_impuestos),
-    mostrar_impuestos_ticket: Boolean(ticket?.mostrar_impuestos_ticket),
-    mostrar_importe_exento: Boolean(ticket?.mostrar_importe_exento),
-    mostrar_importe_gravado_15: Boolean(ticket?.mostrar_importe_gravado_15),
-    mostrar_isv_15: Boolean(ticket?.mostrar_isv_15),
-    mostrar_importe_gravado_18: Boolean(ticket?.mostrar_importe_gravado_18),
-    mostrar_isv_18: Boolean(ticket?.mostrar_isv_18),
-    mostrar_total_isv: Boolean(ticket?.mostrar_total_isv),
-    mostrar_descuento_linea: ticket?.mostrar_descuento_linea !== false,
-    mostrar_descuento_porcentaje_linea: ticket?.mostrar_descuento_porcentaje_linea !== false,
-    mostrar_descuento_total: ticket?.mostrar_descuento_total !== false,
-    imprimir_comprobante_reversion: ticket?.imprimir_comprobante_reversion !== false,
-    mostrar_venta_original_reversion: ticket?.mostrar_venta_original_reversion !== false,
-    mostrar_codigo_reversion: ticket?.mostrar_codigo_reversion !== false,
-    mostrar_usuario_reversion: ticket?.mostrar_usuario_reversion !== false,
-    mostrar_caja_sesion_reversion: ticket?.mostrar_caja_sesion_reversion !== false,
-    mostrar_motivo_reversion: ticket?.mostrar_motivo_reversion !== false,
-    mostrar_detalle_reversion: ticket?.mostrar_detalle_reversion !== false,
-    mostrar_total_reversion: ticket?.mostrar_total_reversion !== false
-  };
-  return {
-    ...venta,
-    facturacion: {
-      emisor: {
-        nombre_emisor: emisor?.nombre_emisor || "JONNY'S",
-        rtn_emisor: emisor?.rtn_emisor || null,
-        direccion_emisor: emisor?.direccion_emisor || null,
-        telefono_emisor: emisor?.telefono_emisor || null,
-        correo_emisor: emisor?.correo_emisor || null,
-        logo_url: emisor?.logo_url || null
-      },
-      ticket: {
-        ancho_ticket_mm: Number(ticket?.ancho_ticket_mm) === 58 ? 58 : 80,
-        mostrar_logo_ticket: Boolean(ticket?.mostrar_logo_ticket),
-        mostrar_rtn: Boolean(ticket?.mostrar_rtn),
-        mostrar_direccion: Boolean(ticket?.mostrar_direccion),
-        mostrar_telefono: Boolean(ticket?.mostrar_telefono),
-        mostrar_correo: Boolean(ticket?.mostrar_correo),
-        ...ticketFlags,
-        texto_encabezado_ticket: ticket?.texto_encabezado_ticket || null,
-        texto_pie_ticket: ticket?.texto_pie_ticket || 'Gracias por su compra'
-      },
-      fiscal: {
-        modo_fiscal: 'NO_INTEGRADO',
-        cai: '0',
-        numero_factura_fiscal: '0'
-      }
-    },
-    nombre_emisor: emisor?.nombre_emisor || "JONNY'S",
-    rtn_emisor: emisor?.rtn_emisor || null,
-    sucursal_direccion: emisor?.direccion_emisor || null,
-    sucursal_telefono: emisor?.telefono_emisor || null,
-    sucursal_correo: emisor?.correo_emisor || null,
-    logo_url: emisor?.logo_url || null,
-    ancho_ticket_mm: Number(ticket?.ancho_ticket_mm) === 58 ? 58 : 80,
-    mostrar_logo_ticket: Boolean(ticket?.mostrar_logo_ticket),
-    mostrar_rtn: Boolean(ticket?.mostrar_rtn),
-    mostrar_direccion: Boolean(ticket?.mostrar_direccion),
-    mostrar_telefono: Boolean(ticket?.mostrar_telefono),
-    mostrar_correo: Boolean(ticket?.mostrar_correo),
-    ...ticketFlags,
-    texto_encabezado_ticket: ticket?.texto_encabezado_ticket || null,
-    texto_pie_ticket: ticket?.texto_pie_ticket || 'Gracias por su compra',
-    modo_fiscal: 'NO_INTEGRADO',
-    cai: '0',
-    numero_factura_fiscal: '0',
-    id_rango_cai: null
-  };
-};
 const sendVentasInternalError = (
   res,
   message = 'No se pudo procesar la solicitud de ventas.'
 ) => res.status(500).json({ error: true, message });
-
-const parseBooleanInput = (value) => {
-  if (value === true || value === false) return { ok: true, value };
-  if (value === 1 || value === 0) return { ok: true, value: value === 1 };
-  if (typeof value === 'string') {
-    const normalized = value.trim().toLowerCase();
-    if (['true', '1', 'si', 'yes', 'y', 'activo'].includes(normalized)) {
-      return { ok: true, value: true };
-    }
-    if (['false', '0', 'no', 'n', 'inactivo'].includes(normalized)) {
-      return { ok: true, value: false };
-    }
-  }
-  return { ok: false, value: false };
-};
-
-const isPlainObject = (value) =>
-  value !== null && typeof value === 'object' && !Array.isArray(value);
-
-const formatVentaNumero = (idVenta) => `VTA-${String(idVenta).padStart(5, '0')}`;
-const resolveVentaNumero = (row) =>
-  String(row?.codigo_venta || '').trim() || formatVentaNumero(row?.id_factura);
 
 const normalizeClienteNombre = (cliente) => {
   const nombrePersona = [cliente?.nombre, cliente?.apellido].filter(Boolean).join(' ').trim();
@@ -571,21 +461,6 @@ const normalizeClienteNombre = (cliente) => {
   if (cliente?.nombre_empresa) return cliente.nombre_empresa;
   return 'Consumidor final';
 };
-
-const normalizeTextKey = (value) =>
-  String(value || '')
-    .normalize('NFD')
-    .replace(/[\u0300-\u036f]/g, '')
-    .trim()
-    .toLowerCase()
-    .replace(/\s+/g, '_');
-
-const normalizeSearchText = (value) =>
-  String(value || '')
-    .normalize('NFD')
-    .replace(/[\u0300-\u036f]/g, '')
-    .trim()
-    .toLowerCase();
 
 const buildEstadoPedidoSqlKey = (columnExpression) =>
   `LOWER(REGEXP_REPLACE(TRIM(COALESCE(${columnExpression}, '')), '\\s+', '_', 'g'))`;
@@ -632,253 +507,12 @@ const getVentaEstadoFilter = (value) => {
 
   return null;
 };
-const sortSauceOptions = (items) => (
-  [...(Array.isArray(items) ? items : [])].sort((left, right) => {
-    const orderA = Number(left?.orden || 0);
-    const orderB = Number(right?.orden || 0);
-    if (orderA !== orderB) return orderA - orderB;
-    return String(left?.nombre || '').localeCompare(String(right?.nombre || ''), 'es', {
-      sensitivity: 'base'
-    });
-  })
-);
-const inferSauceUnitsBaseFromText = (...sources) => {
-  const text = normalizeSearchText(sources.filter(Boolean).join(' '));
-  if (!text) return 1;
-  const containsKeyword = WINGS_SAUCE_KEYWORDS.some((keyword) => text.includes(keyword));
-  if (!containsKeyword) return 1;
-  const match =
-    text.match(/\b(\d{1,3})\s*(?:alitas?|tenders?)\b/i) ||
-    text.match(/\b(\d{1,3})\s*(?:uds?|unidades?|pzas?|piezas?)\b/i) ||
-    text.match(/\((\d{1,3})\s*(?:uds?|unidades?|pzas?|piezas?)\)/i);
-  const units = Number(match?.[1] || 0);
-  if (!Number.isFinite(units) || units <= 0) return 1;
-  return Math.max(1, Math.floor(units));
-};
-const calculateFallbackWingSauceRequirement = ({ nombre = '', descripcion = '', quantity = 1 }) => {
-  const baseUnits = inferSauceUnitsBaseFromText(nombre, descripcion);
-  if (baseUnits <= 1) return 0;
-  const totalUnits = Math.max(1, Number(quantity || 1)) * baseUnits;
-  return Math.max(0, Math.ceil(totalUnits / 6));
-};
-const findMatchingSalsaRule = (rules, unidades) => {
-  const units = Number(unidades);
-  if (!Number.isFinite(units) || units <= 0) return null;
-  const orderedRules = [...(Array.isArray(rules) ? rules : [])].sort((left, right) => (
-    Number(left?.min_unidades || 0) - Number(right?.min_unidades || 0)
-  ));
-  return orderedRules.find((rule) => {
-    const min = Number(rule?.min_unidades || 0);
-    const max = rule?.max_unidades === null || rule?.max_unidades === undefined
-      ? null
-      : Number(rule.max_unidades);
-    if (!Number.isFinite(min) || units < min) return false;
-    if (max !== null && Number.isFinite(max) && units > max) return false;
-    return true;
-  }) || null;
-};
-const parseComplementosPayload = (value) => {
-  if (value === undefined || value === null) return { ok: true, data: [] };
-  if (!Array.isArray(value)) {
-    return { ok: false, message: 'complementos debe ser una lista valida.' };
-  }
-  const dedupe = new Set();
-  for (const entry of value) {
-    if (!isPlainObject(entry)) {
-      return { ok: false, message: 'Cada complemento debe ser un objeto valido.' };
-    }
-    const idComplemento = parseOptionalPositiveInt(entry.id_complemento);
-    if (!idComplemento) {
-      return { ok: false, message: 'Cada complemento debe incluir id_complemento entero mayor a 0.' };
-    }
-    dedupe.add(Number(idComplemento));
-  }
-  return { ok: true, data: [...dedupe].sort((a, b) => a - b) };
-};
-const parseVentaExtrasPayload = (value, { kind, cantidad }) => {
-  if (value === undefined || value === null) return { ok: true, data: [] };
-  if (!Array.isArray(value)) {
-    return { ok: false, message: 'extras debe ser una lista valida.' };
-  }
-
-  if (kind === 'PRODUCTO' && value.length > 0) {
-    return { ok: false, message: 'Los productos no permiten extras.' };
-  }
-
-  const seen = new Set();
-  const normalized = [];
-  const maxCantidad = Number(cantidad || 0);
-
-  for (const entry of value) {
-    if (!isPlainObject(entry)) {
-      return { ok: false, message: 'Cada extra debe ser un objeto valido.' };
-    }
-    const idExtra = parseOptionalPositiveInt(entry.id_extra);
-    if (!idExtra) {
-      return { ok: false, message: 'Cada extra debe incluir id_extra entero mayor a 0.' };
-    }
-    if (seen.has(idExtra)) {
-      return { ok: false, message: 'No se permite duplicar el mismo extra en una linea.' };
-    }
-    const extraCantidad = parsePositiveInt(entry.cantidad);
-    if (!extraCantidad) {
-      return { ok: false, message: 'Cada extra debe incluir cantidad entera mayor a 0.' };
-    }
-    if (extraCantidad > maxCantidad) {
-      return { ok: false, message: 'La cantidad de un extra no puede ser mayor que la cantidad del item.' };
-    }
-    seen.add(idExtra);
-    normalized.push({ id_extra: idExtra, cantidad: extraCantidad });
-  }
-
-  return {
-    ok: true,
-    data: normalized.sort((left, right) => left.id_extra - right.id_extra)
-  };
-};
-const buildComplementSnapshot = (line) => {
-  const selected = Array.isArray(line?.complementos_detalle) ? line.complementos_detalle : [];
-  if (selected.length === 0) return null;
-  return {
-    tipo: VENTA_COMPLEMENTO_TIPO_SALSAS,
-    seleccion: selected.map((entry) => ({
-      id_complemento: Number(entry?.id_complemento || 0),
-      id_salsa: Number(entry?.id_salsa || entry?.id_complemento || 0),
-      nombre: String(entry?.nombre || 'Complemento').trim()
-    })).filter((entry) => entry.id_complemento > 0)
-  };
-};
-const buildComplementLineConfig = (line) => {
-  const selected = Array.isArray(line?.complementos_detalle) ? line.complementos_detalle : [];
-  const extras = Array.isArray(line?.extras_detalle) ? line.extras_detalle : [];
-  const metadata = line?.complementos_metadata;
-  if (!selected.length && !metadata?.requiere_complementos && !extras.length) return null;
-  return {
-    tipo_complemento: VENTA_COMPLEMENTO_TIPO_SALSAS,
-    requiere_complementos: Boolean(metadata?.requiere_complementos),
-    minimo_complementos: Number(metadata?.minimo_complementos || 0),
-    maximo_complementos: Number(metadata?.maximo_complementos || 0),
-    complementos_incompletos_autorizados: Boolean(metadata?.complementos_incompletos_autorizados),
-    complementos_recomendados: Number(metadata?.complementos_recomendados ?? metadata?.minimo_complementos ?? 0),
-    complementos_seleccionados: Number(metadata?.complementos_seleccionados ?? selected.length),
-    complementos: selected.map((entry) => ({
-      id_complemento: Number(entry?.id_complemento || 0),
-      id_salsa: Number(entry?.id_salsa || entry?.id_complemento || 0),
-      nombre: String(entry?.nombre || 'Complemento').trim()
-    })).filter((entry) => entry.id_complemento > 0),
-    extras: extras.map((entry) => ({
-      id_extra: Number(entry?.id_extra || 0),
-      codigo: String(entry?.codigo || '').trim() || null,
-      nombre: String(entry?.nombre || 'Extra').trim(),
-      cantidad: Number(entry?.cantidad || 0),
-      precio_unitario: roundMoney(entry?.precio_unitario),
-      subtotal: roundMoney(entry?.subtotal),
-      id_insumo: entry?.id_insumo ? Number(entry.id_insumo) : null,
-      cant: Number(entry?.cant ?? entry?.cantidad_insumo ?? 0) > 0
-        ? Number(entry?.cant ?? entry?.cantidad_insumo)
-        : null,
-      id_unidad_medida: parseOptionalPositiveInt(entry?.id_unidad_medida)
-    })).filter((entry) => entry.id_extra > 0 && entry.cantidad > 0)
-  };
-};
-const buildRecipeSauceRequirement = ({ recipeName = '', recipeDescription = '', rules = [], quantity = 1 }) => {
-  const unitsBase = Math.max(1, inferSauceUnitsBaseFromText(recipeName, recipeDescription));
-  const units = Math.max(1, Number(quantity || 1)) * unitsBase;
-  const rule = findMatchingSalsaRule(rules, units);
-  if (rule) {
-    return Number(rule?.salsas_requeridas || 0);
-  }
-  // AM: fallback acotado solo para familias alitas/tenders cuando no hay reglas formales.
-  return calculateFallbackWingSauceRequirement({
-    nombre: recipeName,
-    descripcion: recipeDescription,
-    quantity
-  });
-};
-const resolveRecetaComplementMetadata = ({ receta = {}, quantity = 1, allowedSauces = [], rules = [], fallbackSauces = [] }) => {
-  const required = Math.max(0, buildRecipeSauceRequirement({
-    recipeName: receta?.nombre_receta,
-    recipeDescription: receta?.descripcion,
-    rules,
-    quantity
-  }));
-  let available = sortSauceOptions(allowedSauces);
-  if (required > 0 && available.length === 0) {
-    available = sortSauceOptions(fallbackSauces);
-  }
-  return {
-    requiere_complementos: required > 0,
-    tipo_complemento: VENTA_COMPLEMENTO_TIPO_SALSAS,
-    minimo_complementos: required,
-    maximo_complementos: required,
-    complementos_disponibles: available
-  };
-};
-const resolveComboComplementMetadata = ({ combo = {}, quantity = 1, components = [], saucesByRecipe = new Map(), rulesByRecipe = new Map(), fallbackSauces = [] }) => {
-  const unionSauces = new Map();
-  let required = 0;
-  for (const component of Array.isArray(components) ? components : []) {
-    const idReceta = Number(component?.id_receta || 0);
-    if (!idReceta) continue;
-    const allowed = saucesByRecipe.get(idReceta) || [];
-    for (const sauce of allowed) {
-      const key = Number(sauce?.id_salsa || 0);
-      if (key > 0) unionSauces.set(key, sauce);
-    }
-    const rules = rulesByRecipe.get(idReceta) || [];
-    const multiplier = Math.max(1, Number(component?.multiplicador || 1));
-    required += Math.max(0, buildRecipeSauceRequirement({
-      recipeName: component?.nombre_receta,
-      recipeDescription: component?.nombre_receta,
-      rules,
-      quantity: Math.max(1, Number(quantity || 1)) * multiplier
-    }));
-  }
-  let available = sortSauceOptions(Array.from(unionSauces.values()));
-  if (required > 0 && available.length === 0) {
-    available = sortSauceOptions(fallbackSauces);
-  }
-  return {
-    requiere_complementos: required > 0,
-    tipo_complemento: VENTA_COMPLEMENTO_TIPO_SALSAS,
-    minimo_complementos: required,
-    maximo_complementos: required,
-    complementos_disponibles: available
-  };
-};
-
-const normalizeRoleName = (value) =>
-  String(value ?? '')
-    .trim()
-    .replace(/[\s-]+/g, '_')
-    .toUpperCase();
-
 const getRequestRoleSet = (req) =>
   new Set(
     (Array.isArray(req.user?.roles) ? req.user.roles : [])
       .map(normalizeRoleName)
       .filter(Boolean)
   );
-
-const parseBoundedPositiveInt = (value, { fallback, min = 1, max = Number.MAX_SAFE_INTEGER }) => {
-  const parsed = Number.parseInt(String(value ?? ''), 10);
-  if (!Number.isInteger(parsed)) return fallback;
-  if (parsed < min) return min;
-  if (parsed > max) return max;
-  return parsed;
-};
-
-const parseOptionalDateInput = (value) => {
-  if (value === undefined || value === null || value === '') return null;
-  const normalized = String(value).trim();
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(normalized)) return '__INVALID_DATE__';
-  return normalized;
-};
-
-const coercePositiveIntArray = (value) =>
-  [...new Set((Array.isArray(value) ? value : [])
-    .map((item) => Number.parseInt(String(item ?? ''), 10))
-    .filter((item) => Number.isInteger(item) && item > 0))];
 
 const validateVentasCatalogSucursal = async ({ scope, idSucursal, queryRunner = pool }) => {
   if (!idSucursal) return { ok: true };
@@ -1029,9 +663,6 @@ const resolveVentasHistoryScope = async (req, queryRunner = pool) => {
   };
 };
 
-const parseBooleanish = (value) =>
-  value === true || value === 'true' || value === 1 || value === '1';
-
 const shouldSendReversionFailureEmail = ({ idUsuario, idFactura }) => {
   const key = `${Number(idUsuario || 0)}:${Number(idFactura || 0)}`;
   const now = Date.now();
@@ -1133,37 +764,6 @@ const sendReversionFailureEmail = async ({ payload }) => {
   );
 };
 
-const parseEntityIdentifier = (value, fieldName) => {
-  if (
-    value === undefined ||
-    value === null ||
-    value === '' ||
-    value === 0 ||
-    value === '0'
-  ) {
-    return { ok: true, value: null };
-  }
-
-  const parsed = Number.parseInt(String(value), 10);
-  if (!Number.isInteger(parsed) || parsed <= 0) {
-    return {
-      ok: false,
-      message: `${fieldName} debe ser un entero mayor a 0 o null.`
-    };
-  }
-
-  return { ok: true, value: parsed };
-};
-
-const normalizeObservation = (value) => {
-  if (value === undefined || value === null) return null;
-
-  const normalized = String(value).replace(/\s+/g, ' ').trim();
-  if (!normalized) return null;
-
-  return normalized.slice(0, 200);
-};
-
 const buildKitchenDescriptionSummary = (lines, fallbackValue = null) => {
   const summary = (Array.isArray(lines) ? lines : [])
     .filter((line) => line?.requiere_cocina && line?.observacion)
@@ -1180,51 +780,6 @@ const buildKitchenDescriptionSummary = (lines, fallbackValue = null) => {
 
   return fallback || null;
 };
-
-const inferKitchenItemQuantity = (rawSubtotal, rawUnitPrice) => {
-  const subtotal = Number(rawSubtotal || 0);
-  const unitPrice = Number(rawUnitPrice || 0);
-
-  if (!Number.isFinite(subtotal) || subtotal <= 0) return 1;
-  if (!Number.isFinite(unitPrice) || unitPrice <= 0) return 1;
-
-  const inferred = Math.round(subtotal / unitPrice);
-  return Number.isInteger(inferred) && inferred > 0 ? inferred : 1;
-};
-
-const buildDirectSaleDetailItems = (rows) =>
-  rows.map((row) => ({
-    ...row,
-    tipo_item: String(row.tipo_item || 'PRODUCTO').toUpperCase(),
-    nombre_item: row.nombre_item || row.nombre_producto || 'Producto',
-    nombre_producto: row.nombre_producto || row.nombre_item || 'Producto',
-    cantidad: Number(row.cantidad ?? 0) || 0,
-    precio_unitario: roundMoney(row.precio_unitario),
-    sub_total: roundMoney(row.sub_total),
-    total_linea: roundMoney(row.total_linea),
-    descuento: roundMoney(row.descuento),
-    descuento_linea: roundMoney(row.descuento_linea),
-    descuento_global: roundMoney(row.descuento_global),
-    observacion: null
-  }));
-
-const buildKitchenSaleDetailItems = (rows) =>
-  rows.map((row) => ({
-    ...row,
-    nombre_item: row.nombre_item || 'Item de cocina',
-    nombre_producto: row.nombre_item || 'Item de cocina',
-    cantidad:
-      Number(row.cantidad ?? 0) > 0
-        ? Number(row.cantidad)
-        : inferKitchenItemQuantity(row.sub_total, row.precio_unitario),
-    precio_unitario: roundMoney(row.precio_unitario),
-    sub_total: roundMoney(row.sub_total),
-    total_linea: roundMoney(row.total_linea),
-    descuento: roundMoney(row.descuento),
-    descuento_linea: roundMoney(row.descuento_linea),
-    descuento_global: roundMoney(row.descuento_global),
-    observacion: normalizeObservation(row.observacion)
-  }));
 
 const fetchCreateVentaDetailContext = async (client, { idCliente, idUsuario, idCaja }) => {
   const result = await client.query(
@@ -1419,158 +974,6 @@ const buildCreateVentaDetailResponse = ({
       : null
   };
 };
-
-const buildVentaRpcItems = (venta) =>
-  (Array.isArray(venta?.all_lines) ? venta.all_lines : []).map((line, index) => {
-    const tipoItem = normalizeTipoItem(line.kind);
-    const configuracionMenu = buildComplementLineConfig(line);
-    const complementSnapshot = buildComplementSnapshot(line);
-    const origenSnapshot = {
-      tipo_item: tipoItem,
-      nombre_item: line.nombre_item || null,
-      id_producto: line.id_producto || null,
-      id_receta: line.id_receta || null,
-      id_combo: line.id_combo || null,
-      cantidad: Number(line.cantidad || 0),
-      precio_unitario: roundMoney(line.precio_unitario),
-      total_detalle: roundMoney(line.total_linea),
-      subtotal_extras: roundMoney(line.subtotal_extras),
-      descuento: roundMoney(line.descuento),
-      descuento_linea: roundMoney(line.descuento_linea),
-      descuento_global: roundMoney(line.descuento_global),
-      id_descuento_catalogo_linea: line.id_descuento_catalogo_linea_aplicado || null,
-      id_descuento_catalogo_global: line.id_descuento_catalogo_global || null,
-      observacion: line.observacion || null,
-      componentes: complementSnapshot,
-      extras: Array.isArray(line.extras_detalle) ? line.extras_detalle : []
-    };
-
-    return {
-      item_index: index,
-      tipo_item: tipoItem,
-      id_producto: line.id_producto || null,
-      id_receta: line.id_receta || null,
-      id_combo: line.id_combo || null,
-      id_descuento_catalogo: line.id_descuento_catalogo || null,
-      cantidad: Number(line.cantidad || 0),
-      precio_unitario: roundMoney(line.precio_unitario),
-      sub_total: roundMoney(line.sub_total),
-      total_linea: roundMoney(line.total_linea),
-      descuento: roundMoney(line.descuento),
-      observacion: line.observacion || null,
-      configuracion_menu: configuracionMenu,
-      origen_snapshot: origenSnapshot,
-      nombre_item: line.nombre_item || null
-    };
-  });
-
-const buildVentaRpcPayload = ({ venta, correlativoVenta, facturacionVenta, facturacionNormalizada }) => ({
-  pedido: {
-    descripcion_pedido: venta.descripcion_pedido,
-    descripcion_envio: venta.descripcion_envio,
-    sub_total: venta.pedido_subtotal,
-    isv: venta.pedido_isv,
-    total: venta.pedido_total,
-    id_estado_pedido: venta.id_estado_pedido,
-    id_sucursal: venta.id_sucursal,
-    id_cliente: venta.id_cliente,
-    id_usuario: venta.id_usuario
-  },
-  factura: {
-    id_caja: venta.id_caja,
-    id_sucursal: venta.id_sucursal,
-    id_usuario: venta.id_usuario,
-    id_cliente: venta.id_cliente,
-    codigo_venta: correlativoVenta.codigo,
-    fecha_operacion: correlativoVenta.fecha_operacion,
-    efectivo_entregado: venta.efectivo_entregado,
-    cambio: venta.cambio,
-    isv_15: 0,
-    id_sesion_caja: venta.id_sesion_caja
-  },
-  cobro: {
-    id_metodo_pago: venta.id_metodo_pago,
-    monto: venta.total,
-    referencia: venta.referencia_pago || null
-  },
-  venta: {
-    id_sucursal: venta.id_sucursal,
-    id_cliente: venta.id_cliente,
-    id_usuario: venta.id_usuario,
-    id_caja: venta.id_caja,
-    id_sesion_caja: venta.id_sesion_caja,
-    metodo_pago: venta.metodo_pago,
-    metodo_pago_codigo: venta.metodo_pago_codigo,
-    referencia_pago: venta.referencia_pago || null,
-    efectivo_entregado: venta.efectivo_entregado,
-    cambio: venta.cambio,
-    descripcion_pedido: venta.descripcion_pedido,
-    descripcion_envio: venta.descripcion_envio,
-    subtotal: venta.subtotal,
-    descuento: venta.descuento,
-    isv: venta.isv,
-    total: venta.total
-  },
-  correlativo: {
-    codigo: correlativoVenta.codigo,
-    fecha_operacion: correlativoVenta.fecha_operacion
-  },
-  snapshot_fiscal: {
-    id_config_facturacion: facturacionVenta.idConfig || null,
-    facturacion_snapshot: facturacionVenta.snapshot || {}
-  },
-  ticket_facturacion: facturacionNormalizada || {},
-  items: buildVentaRpcItems(venta)
-});
-
-const buildVentaRpcV2Payload = ({ venta }) => ({
-  pedido: {
-    descripcion_pedido: venta.descripcion_pedido,
-    descripcion_envio: venta.descripcion_envio,
-    sub_total: venta.pedido_subtotal,
-    isv: venta.pedido_isv,
-    total: venta.pedido_total,
-    id_estado_pedido: venta.id_estado_pedido,
-    id_sucursal: venta.id_sucursal,
-    id_cliente: venta.id_cliente,
-    id_usuario: venta.id_usuario
-  },
-  factura: {
-    id_caja: venta.id_caja,
-    id_sucursal: venta.id_sucursal,
-    id_usuario: venta.id_usuario,
-    id_cliente: venta.id_cliente,
-    efectivo_entregado: venta.efectivo_entregado,
-    cambio: venta.cambio,
-    isv_15: 0,
-    id_sesion_caja: venta.id_sesion_caja
-  },
-  cobro: {
-    id_metodo_pago: venta.id_metodo_pago,
-    monto: venta.total,
-    referencia: venta.referencia_pago || null
-  },
-  venta: {
-    id_sucursal: venta.id_sucursal,
-    id_cliente: venta.id_cliente,
-    id_usuario: venta.id_usuario,
-    id_caja: venta.id_caja,
-    id_sesion_caja: venta.id_sesion_caja,
-    metodo_pago: venta.metodo_pago,
-    metodo_pago_codigo: venta.metodo_pago_codigo,
-    referencia_pago: venta.referencia_pago || null,
-    efectivo_entregado: venta.efectivo_entregado,
-    cambio: venta.cambio,
-    descripcion_pedido: venta.descripcion_pedido,
-    descripcion_envio: venta.descripcion_envio,
-    subtotal: venta.subtotal,
-    descuento: venta.descuento,
-    isv: venta.isv,
-    total: venta.total
-  },
-  items: buildVentaRpcItems(venta)
-});
-const VENTAS_FIDELIZACION_ADVISORY_LOCK_CLASS = 724201;
 
 const logVentasFidelizacionAsyncPerf = (payload) => {
   if (!isVentasPerfEnabled()) return;
@@ -1804,260 +1207,37 @@ const createVentaWithRpcV2Transaction = async ({ client, venta, perf, requestSta
     }
   };
 };
-const normalizeVentaItems = (items) => {
-  if (!Array.isArray(items) || items.length === 0) {
-    return { ok: false, message: 'Debe enviar al menos un item en la venta.' };
-  }
 
-  const normalized = [];
+const createPedidoPendienteWithRpcV1Transaction = async ({ client, pedidoPendiente, perf }) => {
+  const rpcTotalStart = perf?.now?.() || 0;
+  const rpcPayloadBuildStart = perf?.now?.() || 0;
+  const rpcPayload = buildPedidoPendienteRpcPayload(pedidoPendiente);
+  const rpcActor = {
+    id_usuario: pedidoPendiente.id_usuario,
+    id_sucursal: pedidoPendiente.id_sucursal,
+    id_caja: pedidoPendiente.id_caja,
+    id_sesion_caja: pedidoPendiente.id_sesion_caja
+  };
+  perf?.add?.('pedido_pendiente_rpc_payload_build_ms', rpcPayloadBuildStart);
 
-  for (const item of items) {
-    if (!isPlainObject(item)) {
-      return { ok: false, message: 'Cada item debe ser un objeto valido.' };
-    }
-
-    const productoResult = parseEntityIdentifier(item.id_producto, 'id_producto');
-    if (!productoResult.ok) return { ok: false, message: productoResult.message };
-
-    const comboResult = parseEntityIdentifier(item.id_combo, 'id_combo');
-    if (!comboResult.ok) return { ok: false, message: comboResult.message };
-
-    const recetaResult = parseEntityIdentifier(item.id_receta, 'id_receta');
-    if (!recetaResult.ok) return { ok: false, message: recetaResult.message };
-
-    const cantidad = parsePositiveInt(item.cantidad);
-    if (!cantidad) {
-      return {
-        ok: false,
-        message: 'Cada item debe incluir cantidad entera mayor a 0.'
-      };
-    }
-
-    const presentIds = [
-      ['PRODUCTO', productoResult.value],
-      ['COMBO', comboResult.value],
-      ['RECETA', recetaResult.value]
-    ].filter(([, value]) => value !== null);
-
-    if (presentIds.length !== 1) {
-      return {
-        ok: false,
-        message:
-          'Cada item debe incluir exactamente uno entre id_producto, id_combo o id_receta.'
-      };
-    }
-
-    const [kind, entityId] = presentIds[0];
-    const idDescuentoCatalogoLinea = parseOptionalPositiveInt(item.id_descuento_catalogo);
-    if (
-      item.id_descuento_catalogo !== undefined &&
-      item.id_descuento_catalogo !== null &&
-      !idDescuentoCatalogoLinea
-    ) {
-      return {
-        ok: false,
-        message: 'id_descuento_catalogo por linea debe ser entero mayor a 0.'
-      };
-    }
-
-    const complementosResult = parseComplementosPayload(item.complementos);
-    if (!complementosResult.ok) {
-      return { ok: false, message: complementosResult.message };
-    }
-    const extrasResult = parseVentaExtrasPayload(item.extras, { kind, cantidad });
-    if (!extrasResult.ok) {
-      return { ok: false, message: extrasResult.message };
-    }
-    const complementosIncompletosInput = item.complementos_incompletos_autorizados ?? item.permitir_complementos_incompletos;
-    let complementosIncompletosAutorizados = false;
-    if (complementosIncompletosInput !== undefined && complementosIncompletosInput !== null) {
-      const parsedComplementosIncompletos = parseBooleanInput(complementosIncompletosInput);
-      if (!parsedComplementosIncompletos.ok) {
-        return { ok: false, message: 'complementos_incompletos_autorizados debe ser booleano.' };
-      }
-      complementosIncompletosAutorizados = parsedComplementosIncompletos.value;
-    }
-
-    normalized.push({
-      kind,
-      cart_key: normalizeCartKey(item.cart_key),
-      cantidad,
-      id_producto: kind === 'PRODUCTO' ? entityId : null,
-      id_combo: kind === 'COMBO' ? entityId : null,
-      id_receta: kind === 'RECETA' ? entityId : null,
-      observacion: normalizeObservation(item.observacion),
-      id_descuento_catalogo_linea: idDescuentoCatalogoLinea,
-      complementos: complementosResult.data,
-      complementos_incompletos_autorizados: complementosIncompletosAutorizados,
-      extras: extrasResult.data
-    });
-  }
-
-  return { ok: true, data: normalized };
-};
-
-const fetchProductoMap = async (client, ids, options = {}) => {
-  if (!ids.length) return new Map();
-
-  const forUpdateClause = options?.forUpdate ? 'FOR UPDATE' : '';
-  const result = await client.query(
-    `
-      SELECT id_producto, nombre_producto, precio, estado, cantidad, id_almacen
-      FROM productos
-      WHERE id_producto = ANY($1::int[])
-      ${forUpdateClause}
-    `,
-    [ids]
+  const rpcCallStart = perf?.now?.() || 0;
+  const rpcResult = await client.query(
+    'SELECT public.registrar_pedido_pendiente_pos_v1($1::jsonb, $2::jsonb) AS response',
+    [JSON.stringify(rpcPayload), JSON.stringify(rpcActor)]
   );
+  perf?.add?.('pedido_pendiente_rpc_call_ms', rpcCallStart);
+  perf?.add?.('pedido_pendiente_rpc_total_ms', rpcTotalStart);
 
-  return new Map(result.rows.map((row) => [Number(row.id_producto), row]));
-};
-
-const fetchComboMap = async (client, ids) => {
-  if (!ids.length) return new Map();
-
-  const result = await client.query(
-    `
-      SELECT id_combo, descripcion, precio, estado
-      FROM combos
-      WHERE id_combo = ANY($1::int[])
-    `,
-    [ids]
-  );
-
-  return new Map(result.rows.map((row) => [Number(row.id_combo), row]));
-};
-
-const fetchRecetaMap = async (client, ids) => {
-  if (!ids.length) return new Map();
-
-  const result = await client.query(
-    `
-      SELECT
-        r.id_receta,
-        r.nombre_receta,
-        r.descripcion,
-        r.estado,
-        r.precio
-      FROM recetas r
-      WHERE r.id_receta = ANY($1::int[])
-    `,
-    [ids]
-  );
-
-  return new Map(result.rows.map((row) => [Number(row.id_receta), row]));
-};
-
-const fetchVentaCatalogMaps = async (client, { productoIds = [], comboIds = [], recetaIds = [], lockProductos = true } = {}) => {
-  const uniqueProductoIds = [...new Set((Array.isArray(productoIds) ? productoIds : []).filter(Boolean))];
-  const uniqueComboIds = [...new Set((Array.isArray(comboIds) ? comboIds : []).filter(Boolean))];
-  const uniqueRecetaIds = [...new Set((Array.isArray(recetaIds) ? recetaIds : []).filter(Boolean))];
-
-  if (uniqueProductoIds.length === 0 && uniqueComboIds.length === 0 && uniqueRecetaIds.length === 0) {
-    return {
-      productoMap: new Map(),
-      comboMap: new Map(),
-      recetaMap: new Map()
+  const response = rpcResult.rows?.[0]?.response;
+  if (!isPlainObject(response) || !parseOptionalPositiveInt(response.id_pedido)) {
+    throw {
+      httpStatus: 500,
+      code: 'PEDIDO_PENDIENTE_RPC_RESPONSE_INVALID',
+      publicMessage: 'El pedido fue procesado por RPC, pero la respuesta no es valida.'
     };
   }
 
-  const ctes = [];
-  const selects = [];
-  const params = [];
-  const addArrayParam = (values) => {
-    params.push(values);
-    return `$${params.length}::int[]`;
-  };
-
-  if (uniqueProductoIds.length > 0) {
-    const productosParam = addArrayParam(uniqueProductoIds);
-    const forUpdateClause = lockProductos ? 'FOR UPDATE' : '';
-    ctes.push(`
-      productos_rows AS (
-        SELECT id_producto, nombre_producto, precio, estado, cantidad, id_almacen
-        FROM productos
-        WHERE id_producto = ANY(${productosParam})
-        ${forUpdateClause}
-      )
-    `);
-    selects.push(`COALESCE((SELECT jsonb_agg(to_jsonb(pr)) FROM productos_rows pr), '[]'::jsonb) AS productos`);
-  } else {
-    selects.push(`'[]'::jsonb AS productos`);
-  }
-
-  if (uniqueComboIds.length > 0) {
-    const combosParam = addArrayParam(uniqueComboIds);
-    ctes.push(`
-      combos_rows AS (
-        SELECT id_combo, descripcion, precio, estado
-        FROM combos
-        WHERE id_combo = ANY(${combosParam})
-      )
-    `);
-    selects.push(`COALESCE((SELECT jsonb_agg(to_jsonb(cr)) FROM combos_rows cr), '[]'::jsonb) AS combos`);
-  } else {
-    selects.push(`'[]'::jsonb AS combos`);
-  }
-
-  if (uniqueRecetaIds.length > 0) {
-    const recetasParam = addArrayParam(uniqueRecetaIds);
-    ctes.push(`
-      recetas_rows AS (
-        SELECT
-          r.id_receta,
-          r.nombre_receta,
-          r.descripcion,
-          r.estado,
-          r.precio
-        FROM recetas r
-        WHERE r.id_receta = ANY(${recetasParam})
-      )
-    `);
-    selects.push(`COALESCE((SELECT jsonb_agg(to_jsonb(rr)) FROM recetas_rows rr), '[]'::jsonb) AS recetas`);
-  } else {
-    selects.push(`'[]'::jsonb AS recetas`);
-  }
-
-  const result = await client.query(
-    `
-      WITH ${ctes.join(',')}
-      SELECT ${selects.join(', ')}
-    `,
-    params
-  );
-  const row = result.rows?.[0] || {};
-  const productos = Array.isArray(row.productos) ? row.productos : [];
-  const combos = Array.isArray(row.combos) ? row.combos : [];
-  const recetas = Array.isArray(row.recetas) ? row.recetas : [];
-
-  return {
-    productoMap: new Map(productos.map((item) => [Number(item.id_producto), item])),
-    comboMap: new Map(combos.map((item) => [Number(item.id_combo), item])),
-    recetaMap: new Map(recetas.map((item) => [Number(item.id_receta), item]))
-  };
-};
-const fetchClienteInfo = async (client, idCliente) => {
-  if (!idCliente) return null;
-
-  const result = await client.query(
-    `
-      SELECT
-        c.id_cliente,
-        c.estado,
-        c.id_tipo_cliente,
-        p.nombre,
-        p.apellido,
-        e.nombre_empresa
-      FROM clientes c
-      LEFT JOIN personas p ON p.id_persona = c.id_persona
-      LEFT JOIN empresas e ON e.id_empresa = c.id_empresa
-      WHERE c.id_cliente = $1
-      LIMIT 1
-    `,
-    [idCliente]
-  );
-
-  return result.rows[0] || null;
+  return response;
 };
 
 const getNextTableId = async (client, tableName, idField, lock = true) => {
@@ -2305,41 +1485,6 @@ const aggregateProductoQuantities = (normalizedItems) => {
     totals.set(key, prev + Number(item.cantidad || 0));
   }
   return totals;
-};
-
-const resolveSucursalId = async (client, requestedId) => {
-  if (!requestedId) return null;
-
-  const result = await client.query(
-    'SELECT id_sucursal FROM sucursales WHERE id_sucursal = $1 AND COALESCE(estado, true) = true LIMIT 1',
-    [requestedId]
-  );
-  return result.rowCount > 0 ? requestedId : null;
-};
-
-const resolveMetodoPago = async (client, metodoPagoRaw) => {
-  const normalizedInput = String(metodoPagoRaw ?? '').trim();
-  if (!normalizedInput) return null;
-
-  const result = await client.query(
-    `
-      SELECT
-        id_metodo_pago,
-        codigo,
-        nombre,
-        COALESCE(afecta_efectivo, false) AS afecta_efectivo
-      FROM cat_metodos_pago
-      WHERE COALESCE(estado, true) = true
-        AND (
-          UPPER(TRIM(codigo)) = UPPER($1)
-          OR LOWER(TRIM(nombre)) = LOWER($1)
-        )
-      LIMIT 1
-    `,
-    [normalizedInput]
-  );
-
-  return result.rows[0] || null;
 };
 
 const resolveVentaContextForCreate = async (client, req, payload = {}) => {
@@ -2615,33 +1760,6 @@ const resolveCajaSession = async ({
     }
   };
 };
-const fetchEstadoPedidoRows = async (client) => {
-  const result = await client.query(
-    'SELECT id_estado_pedido, descripcion FROM estados_pedido ORDER BY id_estado_pedido'
-  );
-  return result.rows;
-};
-
-const resolveEstadoPedidoIdByCode = async (client, code) => {
-  const aliases = ESTADO_PEDIDO_CODES[code];
-  if (!aliases || aliases.size === 0) return null;
-
-  const rows = await fetchEstadoPedidoRows(client);
-  const match = rows.find((row) => aliases.has(normalizeTextKey(row.descripcion)));
-  return match?.id_estado_pedido ?? null;
-};
-
-const resolveRequestedEstadoPedidoId = async (client, requestedId) => {
-  if (!requestedId) return null;
-
-  const result = await client.query(
-    'SELECT id_estado_pedido FROM estados_pedido WHERE id_estado_pedido = $1 LIMIT 1',
-    [requestedId]
-  );
-
-  return result.rowCount > 0 ? requestedId : null;
-};
-
 const pedidosColumnCache = new Map();
 const hasPedidosColumn = async (client, columnName) => {
   const key = String(columnName || '').trim().toLowerCase();
@@ -2784,261 +1902,6 @@ const allocateDiscounts = (lineSubtotals, totalDiscount) => {
   });
 };
 
-const buildVentaComplementCatalogCacheKey = ({ recipeIds = [], comboIds = [] }) =>
-  `complement_context:r=${buildVentasStaticCacheKey('recipes', recipeIds)}:c=${buildVentasStaticCacheKey('combos', comboIds)}`;
-
-const fetchVentaComplementCatalogSnapshot = async (client, { recipeIds = [], comboIds = [] }) => {
-  const result = await client.query(
-    `
-      WITH input AS (
-        SELECT $1::int[] AS recipe_ids, $2::int[] AS combo_ids
-      ),
-      combo_components AS (
-        SELECT
-          dc.id_combo,
-          dc.id_receta,
-          GREATEST(COALESCE(dc.cantidad, 1), 1)::int AS multiplicador,
-          r.nombre_receta,
-          COALESCE(dc.orden, dc.id_detalle_combo) AS orden
-        FROM detalle_combo dc
-        INNER JOIN recetas r
-          ON r.id_receta = dc.id_receta
-        CROSS JOIN input i
-        WHERE dc.id_combo = ANY(i.combo_ids)
-          AND dc.id_receta IS NOT NULL
-          AND COALESCE(dc.estado, true) = true
-          AND COALESCE(r.estado, true) = true
-      ),
-      all_recipe_ids AS (
-        SELECT DISTINCT id_receta
-        FROM (
-          SELECT UNNEST((SELECT recipe_ids FROM input)) AS id_receta
-          UNION ALL
-          SELECT id_receta FROM combo_components
-        ) recipes
-        WHERE id_receta IS NOT NULL
-      ),
-      allowed_sauces AS (
-        SELECT
-          rs.id_receta,
-          s.id_salsa,
-          s.nombre,
-          s.nivel_picante,
-          s.orden,
-          COALESCE(s.estado, true) AS disponible
-        FROM receta_salsa rs
-        INNER JOIN salsas s
-          ON s.id_salsa = rs.id_salsa
-        INNER JOIN all_recipe_ids ari
-          ON ari.id_receta = rs.id_receta
-        WHERE COALESCE(rs.estado, true) = true
-      ),
-      sauce_rules AS (
-        SELECT
-          rsr.id_regla,
-          rsr.id_receta,
-          rsr.min_unidades,
-          rsr.max_unidades,
-          rsr.salsas_requeridas
-        FROM reglas_salsas_receta rsr
-        INNER JOIN all_recipe_ids ari
-          ON ari.id_receta = rsr.id_receta
-        WHERE COALESCE(rsr.estado, true) = true
-      )
-      SELECT
-        COALESCE((
-          SELECT jsonb_agg(to_jsonb(cc) - 'orden' ORDER BY cc.id_combo, cc.orden)
-          FROM combo_components cc
-        ), '[]'::jsonb) AS combo_components,
-        COALESCE((
-          SELECT jsonb_agg(to_jsonb(sa) ORDER BY sa.id_receta, sa.orden, sa.nombre)
-          FROM allowed_sauces sa
-        ), '[]'::jsonb) AS allowed_sauces,
-        COALESCE((
-          SELECT jsonb_agg(to_jsonb(sr) ORDER BY sr.id_receta, sr.min_unidades, sr.max_unidades NULLS LAST, sr.id_regla)
-          FROM sauce_rules sr
-        ), '[]'::jsonb) AS sauce_rules
-    `,
-    [recipeIds, comboIds]
-  );
-  const row = result.rows?.[0] || {};
-  return {
-    comboComponents: Array.isArray(row.combo_components) ? row.combo_components : [],
-    allowedSauces: Array.isArray(row.allowed_sauces) ? row.allowed_sauces : [],
-    sauceRules: Array.isArray(row.sauce_rules) ? row.sauce_rules : []
-  };
-};
-
-const buildVentaComplementContext = async ({ client, normalizedItems, perf = null, recetaMap = new Map() }) => {
-  const complementosStart = perf?.now?.() || 0;
-  const recipeIds = [...new Set(
-    (Array.isArray(normalizedItems) ? normalizedItems : [])
-      .filter((item) => item.kind === 'RECETA')
-      .map((item) => Number(item.id_receta || 0))
-      .filter((id) => id > 0)
-  )];
-  const comboIds = [...new Set(
-    (Array.isArray(normalizedItems) ? normalizedItems : [])
-      .filter((item) => item.kind === 'COMBO')
-      .map((item) => Number(item.id_combo || 0))
-      .filter((id) => id > 0)
-  )];
-
-  try {
-    if (recipeIds.length === 0 && comboIds.length === 0) {
-      return {
-        saucesByRecipe: new Map(),
-        rulesByRecipe: new Map(),
-        comboComponentsByCombo: new Map(),
-        fallbackSauces: []
-      };
-    }
-
-    const catalogPrefetchStart = perf?.now?.() || 0;
-    const complementSnapshot = await measureVentasPerf(
-      perf,
-      'catalog_prefetch_ms',
-      () => fetchCachedVentasStaticValue(
-        buildVentaComplementCatalogCacheKey({ recipeIds, comboIds }),
-        () => fetchVentaComplementCatalogSnapshot(client, { recipeIds, comboIds }),
-        perf
-      )
-    );
-    if (comboIds.length > 0) {
-      perf?.add?.('totals_combo_components_ms', catalogPrefetchStart);
-      perf?.add?.('totals_combos_ms', catalogPrefetchStart);
-    }
-    if ((complementSnapshot.allowedSauces || []).length > 0 || recipeIds.length > 0 || comboIds.length > 0) {
-      perf?.add?.('totals_allowed_sauces_ms', catalogPrefetchStart);
-      perf?.add?.('totals_sauce_rules_ms', catalogPrefetchStart);
-    }
-    const comboComponents = Array.isArray(complementSnapshot.comboComponents)
-      ? complementSnapshot.comboComponents
-      : [];
-    const allowedSauceRows = Array.isArray(complementSnapshot.allowedSauces)
-      ? complementSnapshot.allowedSauces
-      : [];
-    const sauceRuleRows = Array.isArray(complementSnapshot.sauceRules)
-      ? complementSnapshot.sauceRules
-      : [];
-
-    const saucesByRecipe = new Map();
-    for (const row of allowedSauceRows) {
-      const recipeId = Number(row?.id_receta || 0);
-      if (!recipeId) continue;
-      if (!saucesByRecipe.has(recipeId)) saucesByRecipe.set(recipeId, []);
-      saucesByRecipe.get(recipeId).push({
-        id_complemento: Number(row.id_salsa),
-        id_salsa: Number(row.id_salsa),
-        nombre: String(row.nombre || 'Salsa').trim(),
-        nivel_picante: Number(row.nivel_picante || 0),
-        orden: Number(row.orden || 0),
-        disponible: row.disponible !== false
-      });
-    }
-
-    const rulesByRecipe = new Map();
-    for (const row of sauceRuleRows) {
-      const recipeId = Number(row?.id_receta || 0);
-      if (!recipeId) continue;
-      if (!rulesByRecipe.has(recipeId)) rulesByRecipe.set(recipeId, []);
-      rulesByRecipe.get(recipeId).push({
-        min_unidades: Number(row?.min_unidades || 0),
-        max_unidades:
-          row?.max_unidades === null || row?.max_unidades === undefined ? null : Number(row.max_unidades),
-        salsas_requeridas: Number(row?.salsas_requeridas || 0)
-      });
-    }
-
-    const comboComponentsByCombo = new Map();
-    for (const row of comboComponents) {
-      const comboId = Number(row?.id_combo || 0);
-      if (!comboId) continue;
-      if (!comboComponentsByCombo.has(comboId)) comboComponentsByCombo.set(comboId, []);
-      comboComponentsByCombo.get(comboId).push({
-        id_receta: Number(row?.id_receta || 0),
-        multiplicador: Math.max(1, Number(row?.multiplicador || 1)),
-        nombre_receta: String(row?.nombre_receta || '').trim()
-      });
-    }
-
-    let needsFallbackSauces = false;
-    for (const item of Array.isArray(normalizedItems) ? normalizedItems : []) {
-      if (item.kind === 'RECETA') {
-        const recipeId = Number(item.id_receta || 0);
-        const receta = recetaMap.get(recipeId) || {};
-        const allowed = saucesByRecipe.get(recipeId) || [];
-        const rules = rulesByRecipe.get(recipeId) || [];
-        const required = Math.max(0, buildRecipeSauceRequirement({
-          recipeName: receta?.nombre_receta,
-          recipeDescription: receta?.descripcion,
-          rules,
-          quantity: item.cantidad
-        }));
-        if (required > 0 && allowed.length === 0) {
-          needsFallbackSauces = true;
-          break;
-        }
-      }
-
-      if (item.kind === 'COMBO') {
-        const components = comboComponentsByCombo.get(Number(item.id_combo || 0)) || [];
-        const unionSauces = new Map();
-        let required = 0;
-        for (const component of components) {
-          const idReceta = Number(component?.id_receta || 0);
-          if (!idReceta) continue;
-          for (const sauce of saucesByRecipe.get(idReceta) || []) {
-            const key = Number(sauce?.id_salsa || 0);
-            if (key > 0) unionSauces.set(key, sauce);
-          }
-          const rules = rulesByRecipe.get(idReceta) || [];
-          const multiplier = Math.max(1, Number(component?.multiplicador || 1));
-          required += Math.max(0, buildRecipeSauceRequirement({
-            recipeName: component?.nombre_receta,
-            recipeDescription: component?.nombre_receta,
-            rules,
-            quantity: Math.max(1, Number(item.cantidad || 1)) * multiplier
-          }));
-        }
-        if (required > 0 && unionSauces.size === 0) {
-          needsFallbackSauces = true;
-          break;
-        }
-      }
-    }
-
-    const fallbackSauces = needsFallbackSauces
-      ? await measureVentasPerf(
-        perf,
-        'totals_allowed_sauces_ms',
-        () => fetchCachedVentasStaticRows(
-          'active_sauces',
-          () => fetchPublicActiveSaucesQuery(client),
-          perf
-        )
-      )
-      : [];
-    const normalizedFallbackSauces = sortSauceOptions((Array.isArray(fallbackSauces) ? fallbackSauces : []).map((row) => ({
-      id_complemento: Number(row.id_salsa),
-      id_salsa: Number(row.id_salsa),
-      nombre: String(row.nombre || 'Salsa').trim(),
-      nivel_picante: Number(row.nivel_picante || 0),
-      orden: Number(row.orden || 0),
-      disponible: true
-    })));
-
-    return {
-      saucesByRecipe,
-      rulesByRecipe,
-      comboComponentsByCombo,
-      fallbackSauces: normalizedFallbackSauces
-    };
-  } finally {
-    perf?.add?.('totals_complementos_ms', complementosStart);
-  }
-};
-
 const resolveLineComplementos = ({ item, receta, combo, context }) => {
   if (item.kind === 'PRODUCTO') {
     if (Array.isArray(item.complementos) && item.complementos.length > 0) {
@@ -3097,11 +1960,8 @@ const resolveLineComplementos = ({ item, receta, combo, context }) => {
   const min = Math.max(0, Number(metadata.minimo_complementos || 0));
   const max = Math.max(min, Number(metadata.maximo_complementos || 0));
   const complementosIncompletos = min > 0 && selected.length < min;
-  if (metadata.requiere_complementos && complementosIncompletos && !item.complementos_incompletos_autorizados) {
-    return { ok: false, message: 'Debe seleccionar los complementos requeridos para este item.' };
-  }
   if (max > 0 && selected.length > max) {
-    return { ok: false, message: 'Debe seleccionar los complementos requeridos para este item.' };
+    return { ok: false, message: `No puedes seleccionar mas de ${max} complemento(s) para este item.` };
   }
   if (!metadata.requiere_complementos && selected.length > 0) {
     return { ok: false, message: 'Uno o m?s complementos seleccionados no son v?lidos para este item.' };
@@ -3123,7 +1983,10 @@ const resolveLineComplementos = ({ item, receta, combo, context }) => {
 const buildExtraLineKey = (kind, idItem, idExtra) =>
   `${String(kind || '').trim().toUpperCase()}:${Number(idItem || 0)}:${Number(idExtra || 0)}`;
 
-const buildAllowedExtrasMap = async (client, { normalizedItems = [], idSucursal = null, perf = null } = {}) => {
+const itemHasRequestedExtras = (item) =>
+  Array.isArray(item?.extras) && item.extras.some((extra) => parseOptionalPositiveInt(extra?.id_extra));
+
+const buildAllowedExtrasMap = async (client, { normalizedItems = [], idSucursal = null, perf = null, allowedExtrasSchema = null } = {}) => {
   const recetaIds = [...new Set(
     normalizedItems
       .filter((item) => item.kind === 'RECETA')
@@ -3137,7 +2000,7 @@ const buildAllowedExtrasMap = async (client, { normalizedItems = [], idSucursal 
       .filter((id) => id > 0)
   )];
 
-  const needsExtras = normalizedItems.some((item) => Array.isArray(item.extras) && item.extras.length > 0);
+  const needsExtras = normalizedItems.some((item) => itemHasRequestedExtras(item));
   if (!needsExtras) return new Map();
   const requestedExtraIds = [...new Set(
     normalizedItems
@@ -3146,93 +2009,98 @@ const buildAllowedExtrasMap = async (client, { normalizedItems = [], idSucursal 
       .filter((id) => id > 0)
   )];
   if (requestedExtraIds.length === 0) return new Map();
+  if (recetaIds.length === 0 && comboIds.length === 0) return new Map();
 
-  const hasMenuExtras = await hasTable(client, 'menu_extras');
-  const hasMenuExtraReceta = await hasTable(client, 'menu_extra_receta');
-  const hasMenuExtraCombo = await hasTable(client, 'menu_extra_combo');
+  const {
+    hasMenuExtras,
+    hasMenuExtraReceta,
+    hasMenuExtraCombo
+  } = allowedExtrasSchema || await resolvePedidoPendienteAllowedExtrasSchema(client, perf);
   if (!hasMenuExtras) return new Map();
+  if (!hasMenuExtraReceta && !hasMenuExtraCombo) return new Map();
 
   const params = [recetaIds, comboIds, parseOptionalPositiveInt(idSucursal), requestedExtraIds];
-  const recipeSql = hasMenuExtraReceta
-    ? `
+  const allowedItemSqlParts = [];
+  if (hasMenuExtraReceta && recetaIds.length > 0) {
+    allowedItemSqlParts.push(`
       SELECT
         'RECETA'::text AS tipo,
         mer.id_receta AS id_item,
-        me.id_extra,
-        me.codigo,
-        me.nombre,
-        me.precio_adicional,
-        me.estado,
-        me.id_insumo,
-        me.cant,
-        me.id_unidad_medida,
-        i.cantidad AS stock_disponible,
-        i.id_almacen
-      FROM public.menu_extra_receta mer
-      INNER JOIN public.menu_extras me
-        ON me.id_extra = mer.id_extra
-       AND COALESCE(me.estado, true) = true
-      LEFT JOIN public.insumos i
-        ON i.id_insumo = me.id_insumo
-       AND COALESCE(i.estado, true) = true
-      LEFT JOIN public.almacenes a
-        ON a.id_almacen = i.id_almacen
-       AND ($3::int IS NULL OR a.id_sucursal = $3::int)
-      WHERE mer.id_receta = ANY($1::int[])
-        AND me.id_extra = ANY($4::int[])
-        AND COALESCE(mer.estado, true) = true
-        AND (me.id_insumo IS NULL OR a.id_almacen IS NOT NULL)
-    `
-    : `SELECT NULL::text AS tipo, NULL::int AS id_item, NULL::int AS id_extra, NULL::text AS codigo, NULL::text AS nombre, NULL::numeric AS precio_adicional, NULL::boolean AS estado, NULL::int AS id_insumo, NULL::numeric AS cant, NULL::int AS id_unidad_medida, NULL::numeric AS stock_disponible, NULL::int AS id_almacen WHERE false`;
-  const comboSql = hasMenuExtraCombo
-    ? `
+        mer.id_extra,
+        COALESCE(mer.orden, 0) AS orden
+      FROM typed_params p
+      INNER JOIN public.menu_extra_receta mer
+        ON mer.id_receta = ANY(p.receta_ids)
+       AND mer.id_extra = ANY(p.extra_ids)
+      WHERE COALESCE(mer.estado, true) = true
+    `);
+  }
+  if (hasMenuExtraCombo && comboIds.length > 0) {
+    allowedItemSqlParts.push(`
       SELECT
         'COMBO'::text AS tipo,
         mec.id_combo AS id_item,
-        me.id_extra,
-        me.codigo,
-        me.nombre,
-        me.precio_adicional,
-        me.estado,
-        me.id_insumo,
-        me.cant,
-        me.id_unidad_medida,
-        i.cantidad AS stock_disponible,
-        i.id_almacen
-      FROM public.menu_extra_combo mec
-      INNER JOIN public.menu_extras me
-        ON me.id_extra = mec.id_extra
-       AND COALESCE(me.estado, true) = true
-      LEFT JOIN public.insumos i
-        ON i.id_insumo = me.id_insumo
-       AND COALESCE(i.estado, true) = true
-      LEFT JOIN public.almacenes a
-        ON a.id_almacen = i.id_almacen
-       AND ($3::int IS NULL OR a.id_sucursal = $3::int)
-      WHERE mec.id_combo = ANY($2::int[])
-        AND me.id_extra = ANY($4::int[])
-        AND COALESCE(mec.estado, true) = true
-        AND (me.id_insumo IS NULL OR a.id_almacen IS NOT NULL)
-    `
-    : `SELECT NULL::text AS tipo, NULL::int AS id_item, NULL::int AS id_extra, NULL::text AS codigo, NULL::text AS nombre, NULL::numeric AS precio_adicional, NULL::boolean AS estado, NULL::int AS id_insumo, NULL::numeric AS cant, NULL::int AS id_unidad_medida, NULL::numeric AS stock_disponible, NULL::int AS id_almacen WHERE false`;
+        mec.id_extra,
+        0 AS orden
+      FROM typed_params p
+      INNER JOIN public.menu_extra_combo mec
+        ON mec.id_combo = ANY(p.combo_ids)
+       AND mec.id_extra = ANY(p.extra_ids)
+      WHERE COALESCE(mec.estado, true) = true
+    `);
+  }
+  if (allowedItemSqlParts.length === 0) return new Map();
+  const allowedItemsSql = allowedItemSqlParts.join('\nUNION ALL\n');
 
-  const cacheKey = `extras_allowed:s=${parseOptionalPositiveInt(idSucursal) || 0}:r=${buildVentasStaticCacheKey('recipes', recetaIds)}:c=${buildVentasStaticCacheKey('combos', comboIds)}:e=${buildVentasStaticCacheKey('extras', requestedExtraIds)}`;
-  const rows = await fetchCachedVentasStaticRows(
-    cacheKey,
-    async () => {
-      const result = await client.query(
-        `
-          ${recipeSql}
-          UNION ALL
-          ${comboSql}
-          ORDER BY tipo, id_item, nombre
-        `,
-        params
-      );
-      return result.rows;
-    },
-    perf
-  );
+  const allowedExtrasQueryStart = perf?.now?.() || 0;
+  let rows = [];
+  try {
+    const result = await client.query(
+      `
+        WITH typed_params AS (
+          SELECT
+            $1::int[] AS receta_ids,
+            $2::int[] AS combo_ids,
+            $3::int AS id_sucursal,
+            $4::int[] AS extra_ids
+        ),
+        allowed_items AS (
+          ${allowedItemsSql}
+        )
+        SELECT
+          ai.tipo,
+          ai.id_item,
+          me.id_extra,
+          me.codigo,
+          me.nombre,
+          me.precio_adicional,
+          me.estado,
+          me.id_insumo,
+          me.cant,
+          me.id_unidad_medida,
+          i.cantidad AS stock_disponible,
+          i.id_almacen
+        FROM typed_params p
+        INNER JOIN allowed_items ai
+          ON true
+        INNER JOIN public.menu_extras me
+          ON me.id_extra = ai.id_extra
+         AND COALESCE(me.estado, true) = true
+        LEFT JOIN public.insumos i
+          ON i.id_insumo = me.id_insumo
+         AND COALESCE(i.estado, true) = true
+        LEFT JOIN public.almacenes a
+          ON a.id_almacen = i.id_almacen
+         AND (p.id_sucursal IS NULL OR a.id_sucursal = p.id_sucursal)
+        WHERE me.id_insumo IS NULL OR a.id_almacen IS NOT NULL
+        ORDER BY ai.tipo, ai.id_item, ai.orden, me.nombre
+      `,
+      params
+    );
+    rows = result.rows;
+  } finally {
+    perf?.add?.('pedido_pendiente_allowed_extras_query_ms', allowedExtrasQueryStart);
+  }
 
   return new Map(
     rows.map((row) => [
@@ -3539,51 +2407,9 @@ const fetchDetallePedidoExtras = async (client, detallePedidoIds = []) => {
   return grouped;
 };
 
-const fetchDetalleFacturaExtras = async (client, detalleFacturaIds = []) => {
-  const ids = [...new Set((Array.isArray(detalleFacturaIds) ? detalleFacturaIds : [])
-    .map((id) => parseOptionalPositiveInt(id))
-    .filter(Boolean))];
-  if (!ids.length || !(await hasTable(client, 'detalle_factura_extras'))) return new Map();
-
-  const result = await client.query(
-    `
-      SELECT
-        id_detalle_factura,
-        id_extra,
-        nombre_extra_snapshot AS nombre,
-        cantidad,
-        precio_unitario,
-        subtotal
-      FROM public.detalle_factura_extras
-      WHERE id_detalle_factura = ANY($1::int[])
-        AND COALESCE(estado, true) = true
-      ORDER BY id_detalle_factura, id_detalle_factura_extra
-    `,
-    [ids]
-  );
-  const grouped = new Map();
-  for (const row of result.rows) {
-    const id = Number(row.id_detalle_factura);
-    if (!grouped.has(id)) grouped.set(id, []);
-    grouped.get(id).push({
-      id_extra: Number(row.id_extra),
-      nombre: row.nombre,
-      cantidad: Number(row.cantidad),
-      precio_unitario: roundMoney(row.precio_unitario),
-      subtotal: roundMoney(row.subtotal)
-    });
-  }
-  return grouped;
-};
-
 const hasCuentaDivididaPayload = (body) => Array.isArray(body?.cuenta_dividida);
 
-const normalizeCartKey = (value) => {
-  const text = String(value ?? '').trim();
-  return text || null;
-};
-
-const buildCuentaDivisionPlan = ({ cuentaDividida, lines, expectedTotal }) => {
+const buildCuentaDivisionPlan = ({ cuentaDividida, lines, expectedTotal, allowPartial = false }) => {
   if (!Array.isArray(cuentaDividida)) return null;
   if (!cuentaDividida.length) {
     throw {
@@ -3685,7 +2511,7 @@ const buildCuentaDivisionPlan = ({ cuentaDividida, lines, expectedTotal }) => {
     };
   });
 
-  if (assigned.size !== normalizedLines.length) {
+  if (!allowPartial && assigned.size !== normalizedLines.length) {
     throw {
       httpStatus: 400,
       code: 'CUENTA_DIVIDIDA_LINEAS_INCOMPLETAS',
@@ -3694,7 +2520,7 @@ const buildCuentaDivisionPlan = ({ cuentaDividida, lines, expectedTotal }) => {
   }
 
   const totalDivisiones = roundMoney(divisions.reduce((sum, division) => sum + Number(division.total || 0), 0));
-  if (Math.abs(totalDivisiones - roundMoney(expectedTotal)) > 0.05) {
+  if (!allowPartial && Math.abs(totalDivisiones - roundMoney(expectedTotal)) > 0.05) {
     throw {
       httpStatus: 409,
       code: 'CUENTA_DIVIDIDA_TOTAL_NO_CUADRA',
@@ -3703,6 +2529,29 @@ const buildCuentaDivisionPlan = ({ cuentaDividida, lines, expectedTotal }) => {
   }
 
   return { divisions, total: totalDivisiones };
+};
+
+const normalizeComplementosFromMenuConfig = (configuracionMenu) => {
+  const config = isPlainObject(configuracionMenu) ? configuracionMenu : null;
+  const selected = Array.isArray(config?.complementos)
+    ? config.complementos
+    : Array.isArray(config?.componentes?.seleccion)
+      ? config.componentes.seleccion
+      : [];
+  return selected.map((entry) => ({
+    id_complemento: Number(entry?.id_complemento || entry?.id_salsa || 0),
+    id_salsa: Number(entry?.id_salsa || entry?.id_complemento || 0),
+    nombre: String(entry?.nombre || 'Complemento').trim()
+  })).filter((entry) => entry.id_complemento > 0);
+};
+
+const buildComplementSnapshotFromMenuConfig = (configuracionMenu) => {
+  const seleccion = normalizeComplementosFromMenuConfig(configuracionMenu);
+  if (seleccion.length === 0) return null;
+  return {
+    tipo: VENTA_COMPLEMENTO_TIPO_SALSAS,
+    seleccion
+  };
 };
 
 const buildCuentaDivisionItemSnapshot = (line, refs = {}) => ({
@@ -3721,7 +2570,9 @@ const buildCuentaDivisionItemSnapshot = (line, refs = {}) => ({
   isv_total: 0,
   total_linea: roundMoney(line?.total_linea),
   extras_snapshot: Array.isArray(line?.extras_detalle) ? line.extras_detalle : [],
-  complementos_snapshot: Array.isArray(line?.complementos_detalle) ? line.complementos_detalle : [],
+  complementos_snapshot: Array.isArray(line?.complementos_detalle)
+    ? line.complementos_detalle
+    : normalizeComplementosFromMenuConfig(line?.configuracion_menu),
   origen_snapshot: {
     cart_key: normalizeCartKey(line?.cart_key),
     nombre_item: line?.nombre_item || null,
@@ -3782,9 +2633,36 @@ const persistCuentaDividida = async ({
     const persistedDivision = { ...division, id_cuenta_division: idCuentaDivision };
     persisted.push(persistedDivision);
 
+    const itemValues = [];
+    const itemParams = [];
     for (const item of division.items) {
       const refs = lineRefs[item.line_index] || {};
       const snapshot = buildCuentaDivisionItemSnapshot(item.line, refs);
+      const offset = itemParams.length;
+      itemParams.push(
+        idCuentaDivision,
+        snapshot.id_detalle_factura,
+        snapshot.id_detalle_pedido,
+        snapshot.tipo_item,
+        snapshot.id_producto,
+        snapshot.id_receta,
+        snapshot.id_combo,
+        snapshot.nombre_item_snapshot,
+        snapshot.cantidad,
+        snapshot.precio_unitario,
+        snapshot.subtotal_base,
+        snapshot.subtotal_extras,
+        snapshot.descuento_total,
+        snapshot.isv_total,
+        snapshot.total_linea,
+        JSON.stringify(snapshot.extras_snapshot),
+        JSON.stringify(snapshot.complementos_snapshot),
+        JSON.stringify(snapshot.origen_snapshot)
+      );
+      itemValues.push(`($${offset + 1}, $${offset + 2}, $${offset + 3}, $${offset + 4}, $${offset + 5}, $${offset + 6}, $${offset + 7}, $${offset + 8}, $${offset + 9}, $${offset + 10}, $${offset + 11}, $${offset + 12}, $${offset + 13}, $${offset + 14}, $${offset + 15}, $${offset + 16}::jsonb, $${offset + 17}::jsonb, $${offset + 18}::jsonb)`);
+    }
+
+    if (itemValues.length) {
       await client.query(
         `
           INSERT INTO public.ventas_cuenta_division_items (
@@ -3807,28 +2685,9 @@ const persistCuentaDividida = async ({
             complementos_snapshot,
             origen_snapshot
           )
-          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16::jsonb, $17::jsonb, $18::jsonb)
+          VALUES ${itemValues.join(', ')}
         `,
-        [
-          idCuentaDivision,
-          snapshot.id_detalle_factura,
-          snapshot.id_detalle_pedido,
-          snapshot.tipo_item,
-          snapshot.id_producto,
-          snapshot.id_receta,
-          snapshot.id_combo,
-          snapshot.nombre_item_snapshot,
-          snapshot.cantidad,
-          snapshot.precio_unitario,
-          snapshot.subtotal_base,
-          snapshot.subtotal_extras,
-          snapshot.descuento_total,
-          snapshot.isv_total,
-          snapshot.total_linea,
-          JSON.stringify(snapshot.extras_snapshot),
-          JSON.stringify(snapshot.complementos_snapshot),
-          JSON.stringify(snapshot.origen_snapshot)
-        ]
+        itemParams
       );
     }
   }
@@ -3885,147 +2744,6 @@ const insertCuentaDivisionCobros = async ({
   }
 };
 
-const fetchCuentaDividida = async (client, { idFactura = null, idPedido = null } = {}) => {
-  const facturaId = parseOptionalPositiveInt(idFactura);
-  const pedidoId = parseOptionalPositiveInt(idPedido);
-  if (!facturaId && !pedidoId) return null;
-
-  const params = [];
-  const filters = [];
-  if (facturaId) {
-    params.push(facturaId);
-    filters.push(`vcd.id_factura = $${params.length}`);
-  } else if (pedidoId) {
-    params.push(pedidoId);
-    filters.push(`vcd.id_pedido = $${params.length}`);
-  }
-
-  const divisionsResult = await client.query(
-    `
-      SELECT
-        vcd.id_cuenta_division,
-        vcd.id_factura,
-        vcd.id_pedido,
-        vcd.etiqueta,
-        vcd.orden,
-        vcd.subtotal_base,
-        vcd.subtotal_extras,
-        vcd.descuento_total,
-        vcd.isv_total,
-        vcd.total,
-        vcd.monto_pagado,
-        vcd.monto_pendiente,
-        vcd.estado
-      FROM public.ventas_cuenta_divisiones vcd
-      WHERE (${filters.join(' OR ')})
-      ORDER BY vcd.orden, vcd.id_cuenta_division
-    `,
-    params
-  );
-  if (divisionsResult.rowCount === 0) return null;
-
-  const divisionIds = divisionsResult.rows.map((row) => Number(row.id_cuenta_division)).filter(Boolean);
-  const itemsResult = await client.query(
-    `
-      SELECT *
-      FROM public.ventas_cuenta_division_items
-      WHERE id_cuenta_division = ANY($1::bigint[])
-      ORDER BY id_cuenta_division, id_cuenta_division_item
-    `,
-    [divisionIds]
-  );
-  const cobrosResult = facturaId
-    ? await client.query(
-      `
-        SELECT
-          fc.id_factura_cobro,
-          fc.id_cuenta_division,
-          fc.id_metodo_pago,
-          cmp.nombre AS metodo_pago,
-          fc.monto,
-          fc.referencia,
-          fc.observacion,
-          fc.fecha_cobro
-        FROM public.facturas_cobros fc
-        LEFT JOIN public.cat_metodos_pago cmp ON cmp.id_metodo_pago = fc.id_metodo_pago
-        WHERE fc.id_factura = $1
-          AND fc.id_cuenta_division = ANY($2::bigint[])
-        ORDER BY fc.fecha_cobro, fc.id_factura_cobro
-      `,
-      [facturaId, divisionIds]
-    )
-    : { rows: [] };
-
-  const itemsByDivision = new Map();
-  for (const row of itemsResult.rows) {
-    const id = Number(row.id_cuenta_division);
-    if (!itemsByDivision.has(id)) itemsByDivision.set(id, []);
-    itemsByDivision.get(id).push({
-      id_cuenta_division_item: Number(row.id_cuenta_division_item),
-      id_detalle_factura: parseOptionalPositiveInt(row.id_detalle_factura),
-      id_detalle_pedido: parseOptionalPositiveInt(row.id_detalle_pedido),
-      tipo_item: row.tipo_item,
-      id_producto: parseOptionalPositiveInt(row.id_producto),
-      id_receta: parseOptionalPositiveInt(row.id_receta),
-      id_combo: parseOptionalPositiveInt(row.id_combo),
-      nombre_item: row.nombre_item_snapshot,
-      cantidad: Number(row.cantidad || 0),
-      precio_unitario: roundMoney(row.precio_unitario),
-      subtotal_base: roundMoney(row.subtotal_base),
-      subtotal_extras: roundMoney(row.subtotal_extras),
-      descuento_total: roundMoney(row.descuento_total),
-      isv_total: roundMoney(row.isv_total),
-      total_linea: roundMoney(row.total_linea),
-      extras: Array.isArray(row.extras_snapshot) ? row.extras_snapshot : [],
-      complementos: Array.isArray(row.complementos_snapshot) ? row.complementos_snapshot : [],
-      origen_snapshot: row.origen_snapshot || {}
-    });
-  }
-
-  const cobrosByDivision = new Map();
-  for (const row of cobrosResult.rows) {
-    const id = Number(row.id_cuenta_division);
-    if (!cobrosByDivision.has(id)) cobrosByDivision.set(id, []);
-    cobrosByDivision.get(id).push({
-      id_factura_cobro: Number(row.id_factura_cobro),
-      id_metodo_pago: Number(row.id_metodo_pago),
-      metodo_pago: row.metodo_pago || null,
-      monto: roundMoney(row.monto),
-      referencia: row.referencia || null,
-      observacion: row.observacion || null,
-      fecha_cobro: row.fecha_cobro || null
-    });
-  }
-
-  const divisiones = divisionsResult.rows.map((row) => {
-    const id = Number(row.id_cuenta_division);
-    return {
-      id_cuenta_division: id,
-      id_factura: parseOptionalPositiveInt(row.id_factura),
-      id_pedido: parseOptionalPositiveInt(row.id_pedido),
-      etiqueta: row.etiqueta,
-      orden: Number(row.orden || 0),
-      subtotal_base: roundMoney(row.subtotal_base),
-      subtotal_extras: roundMoney(row.subtotal_extras),
-      descuento_total: roundMoney(row.descuento_total),
-      isv_total: roundMoney(row.isv_total),
-      total: roundMoney(row.total),
-      monto_pagado: roundMoney(row.monto_pagado),
-      monto_pendiente: roundMoney(row.monto_pendiente),
-      estado: String(row.estado || 'PENDIENTE').trim().toUpperCase(),
-      items: itemsByDivision.get(id) || [],
-      cobros: cobrosByDivision.get(id) || []
-    };
-  });
-
-  return {
-    divisiones,
-    total: roundMoney(divisiones.reduce((sum, division) => sum + Number(division.total || 0), 0)),
-    monto_pagado: roundMoney(divisiones.reduce((sum, division) => sum + Number(division.monto_pagado || 0), 0)),
-    monto_pendiente: roundMoney(divisiones.reduce((sum, division) => sum + Number(division.monto_pendiente || 0), 0))
-  };
-};
-
 const hydrateVentaLines = async (client, normalizedItems, perf = null, options = {}) => {
   const validateProductStock = options?.validateProductStock !== false;
   const productoIds = [
@@ -4055,28 +2773,43 @@ const hydrateVentaLines = async (client, normalizedItems, perf = null, options =
     productoIds,
     comboIds,
     recetaIds,
-    lockProductos: true
+    lockProductos: validateProductStock === true
   });
   perf?.add?.('totals_catalogos_ms', catalogosStart);
   if (productoIds.length > 0) perf?.add?.('totals_productos_ms', catalogosStart);
   if (comboIds.length > 0) perf?.add?.('totals_combos_ms', catalogosStart);
   if (recetaIds.length > 0) perf?.add?.('totals_recetas_ms', catalogosStart);
 
-  const complementContext = await buildVentaComplementContext({
-    client,
-    normalizedItems,
-    perf,
-    recetaMap,
-    comboMap
-  });
-  const extrasStart = perf?.now?.() || 0;
-  const allowedExtrasMap = await buildAllowedExtrasMap(client, {
-    normalizedItems,
-    idSucursal: options?.idSucursal,
-    perf
-  });
-  perf?.add?.('totals_extras_ms', extrasStart);
-  perf?.add?.('validation_extras_ms', extrasStart);
+  const needsAllowedExtrasSchema = normalizedItems.some((item) =>
+    (item.kind === 'RECETA' || item.kind === 'COMBO') && itemHasRequestedExtras(item)
+  );
+  const allowedExtrasSchema = needsAllowedExtrasSchema
+    ? await resolvePedidoPendienteAllowedExtrasSchema(client, perf)
+    : null;
+
+  const [complementContext, allowedExtrasMap] = await Promise.all([
+    buildVentaComplementContext({
+      client,
+      normalizedItems,
+      perf,
+      recetaMap,
+      comboMap
+    }),
+    (async () => {
+      const extrasStart = perf?.now?.() || 0;
+      try {
+        return await buildAllowedExtrasMap(client, {
+          normalizedItems,
+          idSucursal: options?.idSucursal,
+          perf,
+          allowedExtrasSchema
+        });
+      } finally {
+        perf?.add?.('totals_extras_ms', extrasStart);
+        perf?.add?.('validation_extras_ms', extrasStart);
+      }
+    })()
+  ]);
 
   const totalsItemsStart = perf?.now?.() || 0;
   if (validateProductStock) {
@@ -4328,6 +3061,223 @@ const normalizePedidoCatalogCode = (value) =>
     .toUpperCase()
     .replace(/[\s-]+/g, '_');
 
+const PEDIDO_PENDIENTE_STATIC_CATALOG_CACHE_DEFAULT_TTL_MS = 30000;
+const pedidoPendienteStaticCatalogCache = new Map();
+const PEDIDO_PENDIENTE_STATIC_CATALOG_LOOKUPS = new Set([
+  'cat_pedidos_canales|id_canal_pedido',
+  'cat_pedidos_modalidades_entrega|id_modalidad_entrega',
+  'cat_pedidos_estados_pago|id_estado_pago_pedido',
+  'cat_pedidos_motivos_pago_pendiente|id_motivo_pago_pendiente',
+  'cat_delivery_estados|id_estado_delivery',
+  'estados_pedido|id_estado_pedido'
+]);
+
+const getPedidoPendienteStaticCatalogCacheTtlMs = () => {
+  const ttl = Number(process.env.VENTAS_CATALOG_CACHE_TTL_MS);
+  return Number.isFinite(ttl) && ttl > 0 ? Math.round(ttl) : PEDIDO_PENDIENTE_STATIC_CATALOG_CACHE_DEFAULT_TTL_MS;
+};
+
+const clonePedidoPendienteStaticCatalogValue = (value) => {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return value;
+  return { ...value };
+};
+
+const buildPedidoPendienteStaticCatalogCacheKey = ({ tableName, idColumn, code }) => {
+  const normalizedTableName = String(tableName || '').trim().toLowerCase();
+  const normalizedIdColumn = String(idColumn || '').trim().toLowerCase();
+  const normalizedCode = normalizePedidoCatalogCode(code);
+  if (!normalizedTableName || !normalizedIdColumn || !normalizedCode) return null;
+  const lookupKey = `${normalizedTableName}|${normalizedIdColumn}`;
+  if (!PEDIDO_PENDIENTE_STATIC_CATALOG_LOOKUPS.has(lookupKey)) return null;
+  return {
+    lookupKey,
+    cacheKey: `${lookupKey}|${normalizedCode}`,
+    normalizedCode
+  };
+};
+
+const readPedidoPendienteStaticCatalogCache = (spec, now = Date.now()) => {
+  if (!spec?.cacheKey) return null;
+  const cached = pedidoPendienteStaticCatalogCache.get(spec.cacheKey);
+  if (cached && cached.expiresAt > now) {
+    return clonePedidoPendienteStaticCatalogValue(cached.value);
+  }
+  if (cached) pedidoPendienteStaticCatalogCache.delete(spec.cacheKey);
+  return null;
+};
+
+const writePedidoPendienteStaticCatalogCache = (spec, value, now = Date.now()) => {
+  if (!spec?.cacheKey || !value) return;
+  pedidoPendienteStaticCatalogCache.set(spec.cacheKey, {
+    value: clonePedidoPendienteStaticCatalogValue(value),
+    expiresAt: now + getPedidoPendienteStaticCatalogCacheTtlMs()
+  });
+};
+
+const buildPedidoPendienteStaticCatalogSpec = ({ key, tableName, idColumn, code }) => {
+  const cacheParts = buildPedidoPendienteStaticCatalogCacheKey({ tableName, idColumn, code });
+  if (!cacheParts) return null;
+  return {
+    key,
+    tableName,
+    idColumn,
+    code: cacheParts.normalizedCode,
+    cacheKey: cacheParts.cacheKey
+  };
+};
+
+const buildPedidoPendienteStaticCatalogSpecs = ({ canal, modalidad, motivoPagoPendiente, includeDelivery }) => [
+  buildPedidoPendienteStaticCatalogSpec({
+    key: 'canalCatalog',
+    tableName: 'cat_pedidos_canales',
+    idColumn: 'id_canal_pedido',
+    code: canal
+  }),
+  buildPedidoPendienteStaticCatalogSpec({
+    key: 'modalidadCatalog',
+    tableName: 'cat_pedidos_modalidades_entrega',
+    idColumn: 'id_modalidad_entrega',
+    code: modalidad
+  }),
+  buildPedidoPendienteStaticCatalogSpec({
+    key: 'estadoPagoCatalog',
+    tableName: 'cat_pedidos_estados_pago',
+    idColumn: 'id_estado_pago_pedido',
+    code: PEDIDO_PENDIENTE_ESTADO_PAGO
+  }),
+  buildPedidoPendienteStaticCatalogSpec({
+    key: 'motivoPagoCatalog',
+    tableName: 'cat_pedidos_motivos_pago_pendiente',
+    idColumn: 'id_motivo_pago_pendiente',
+    code: motivoPagoPendiente
+  }),
+  includeDelivery
+    ? buildPedidoPendienteStaticCatalogSpec({
+      key: 'deliveryEstadoCatalog',
+      tableName: 'cat_delivery_estados',
+      idColumn: 'id_estado_delivery',
+      code: PEDIDO_PENDIENTE_ESTADO_DELIVERY
+    })
+    : null,
+  buildPedidoPendienteStaticCatalogSpec({
+    key: 'idEstadoPedido',
+    tableName: 'estados_pedido',
+    idColumn: 'id_estado_pedido',
+    code: 'EN_COCINA'
+  })
+].filter(Boolean);
+
+const fetchPedidoPendienteStaticCatalogSpecs = async (client, specs) => {
+  const missingSpecs = Array.isArray(specs) ? specs : [];
+  if (missingSpecs.length === 0) return new Map();
+
+  const params = [];
+  const selects = [];
+  for (const spec of missingSpecs) {
+    if (spec.tableName === 'estados_pedido') continue;
+    params.push(spec.code);
+    const paramIndex = params.length;
+    selects.push(`
+      SELECT
+        '${spec.key}'::text AS catalog_key,
+        catalog_row.${spec.idColumn}::int AS id,
+        catalog_row.codigo::text AS code,
+        NULL::text AS descripcion
+      FROM (
+        SELECT ${spec.idColumn}, codigo
+        FROM public.${spec.tableName}
+        WHERE UPPER(TRIM(codigo)) = $${paramIndex}
+          AND COALESCE(estado, true) = true
+        LIMIT 1
+      ) catalog_row
+    `);
+  }
+
+  const needsEstadoPedido = missingSpecs.some((spec) => spec.tableName === 'estados_pedido');
+  if (needsEstadoPedido) {
+    selects.push(`
+      SELECT
+        'idEstadoPedido'::text AS catalog_key,
+        estado_row.id_estado_pedido::int AS id,
+        NULL::text AS code,
+        estado_row.descripcion::text AS descripcion
+      FROM (
+        SELECT id_estado_pedido, descripcion
+        FROM public.estados_pedido
+        ORDER BY id_estado_pedido
+      ) estado_row
+    `);
+  }
+
+  if (selects.length === 0) return new Map();
+  const result = await client.query(
+    `
+      ${selects.join('\nUNION ALL\n')}
+      ORDER BY catalog_key, id
+    `,
+    params
+  );
+
+  const fetched = new Map();
+  const specsByKey = new Map(missingSpecs.map((spec) => [spec.key, spec]));
+  for (const row of result.rows) {
+    const key = String(row.catalog_key || '').trim();
+    if (!key || fetched.has(key) || key === 'idEstadoPedido') continue;
+    const spec = specsByKey.get(key);
+    const id = parseOptionalPositiveInt(row.id);
+    if (!spec || !id) continue;
+    fetched.set(key, {
+      id,
+      codigo: String(row.code || spec.code).trim().toUpperCase()
+    });
+  }
+
+  if (needsEstadoPedido) {
+    const estadoPedidoAliases = ESTADO_PEDIDO_CODES.EN_COCINA || new Set();
+    const estadoPedidoRow = result.rows.find((row) =>
+      String(row.catalog_key || '').trim() === 'idEstadoPedido'
+      && estadoPedidoAliases.has(normalizeTextKey(row.descripcion))
+    );
+    const idEstadoPedido = parseOptionalPositiveInt(estadoPedidoRow?.id);
+    if (idEstadoPedido) fetched.set('idEstadoPedido', idEstadoPedido);
+  }
+
+  return fetched;
+};
+
+const resolvePedidoPendienteStaticCatalogs = async ({ client, canal, modalidad, motivoPagoPendiente, includeDelivery }) => {
+  const specs = buildPedidoPendienteStaticCatalogSpecs({ canal, modalidad, motivoPagoPendiente, includeDelivery });
+  const now = Date.now();
+  const resolved = {
+    canalCatalog: null,
+    modalidadCatalog: null,
+    estadoPagoCatalog: null,
+    motivoPagoCatalog: null,
+    deliveryEstadoCatalog: null,
+    idEstadoPedido: null
+  };
+  const missingSpecs = [];
+
+  for (const spec of specs) {
+    const cached = readPedidoPendienteStaticCatalogCache(spec, now);
+    if (cached) {
+      resolved[spec.key] = cached;
+      continue;
+    }
+    missingSpecs.push(spec);
+  }
+
+  const fetched = await fetchPedidoPendienteStaticCatalogSpecs(client, missingSpecs);
+  for (const spec of missingSpecs) {
+    const value = fetched.get(spec.key) || null;
+    if (!value) continue;
+    resolved[spec.key] = clonePedidoPendienteStaticCatalogValue(value);
+    writePedidoPendienteStaticCatalogCache(spec, value, now);
+  }
+
+  return resolved;
+};
+
 const normalizePedidoText = (value, maxLength = 200) => {
   if (value === undefined || value === null) return null;
   const normalized = String(value).replace(/\s+/g, ' ').trim();
@@ -4352,15 +3302,6 @@ const buildPedidoPendienteItemsBody = (body) => {
     if (descuentoLinea.id_descuento_catalogo === undefined || descuentoLinea.id_descuento_catalogo === null || String(descuentoLinea.id_descuento_catalogo).trim() === '') return item;
     return { ...item, id_descuento_catalogo: descuentoLinea.id_descuento_catalogo };
   });
-};
-
-const resolveActiveCatalogCode = async ({ client, tableName, idColumn, code }) => {
-  const result = await client.query(
-    '\n      SELECT ' + idColumn + ' AS id, codigo\n      FROM public.' + tableName + '\n      WHERE UPPER(TRIM(codigo)) = $1\n        AND COALESCE(estado, true) = true\n      LIMIT 1\n    ',
-    [code]
-  );
-  const row = result.rows?.[0];
-  return row ? { id: Number(row.id), codigo: String(row.codigo || code).trim().toUpperCase() } : null;
 };
 
 const mapPedidoPendienteSessionStatus = (reason) => reason === 'SESSION_SCOPE_MISMATCH' ? 403 : 409;
@@ -4428,13 +3369,27 @@ const buildPedidoPendientePayload = async ({ client, body, userId, sucursalScope
     if (missingDeliveryField) return { ok: false, status: 400, body: { error: true, message: 'delivery.' + missingDeliveryField + ' es obligatorio.' } };
   }
 
-  const [canalCatalog, modalidadCatalog, estadoPagoCatalog, motivoPagoCatalog, deliveryEstadoCatalog] = await Promise.all([
-    resolveActiveCatalogCode({ client, tableName: 'cat_pedidos_canales', idColumn: 'id_canal_pedido', code: canal }),
-    resolveActiveCatalogCode({ client, tableName: 'cat_pedidos_modalidades_entrega', idColumn: 'id_modalidad_entrega', code: modalidad }),
-    resolveActiveCatalogCode({ client, tableName: 'cat_pedidos_estados_pago', idColumn: 'id_estado_pago_pedido', code: PEDIDO_PENDIENTE_ESTADO_PAGO }),
-    resolveActiveCatalogCode({ client, tableName: 'cat_pedidos_motivos_pago_pendiente', idColumn: 'id_motivo_pago_pendiente', code: motivoPagoPendiente }),
-    modalidad === 'DELIVERY' ? resolveActiveCatalogCode({ client, tableName: 'cat_delivery_estados', idColumn: 'id_estado_delivery', code: PEDIDO_PENDIENTE_ESTADO_DELIVERY }) : Promise.resolve(null)
-  ]);
+  const staticCatalogsStart = perf?.now?.() || 0;
+  let staticCatalogs = null;
+  try {
+    staticCatalogs = await resolvePedidoPendienteStaticCatalogs({
+      client,
+      canal,
+      modalidad,
+      motivoPagoPendiente,
+      includeDelivery: modalidad === 'DELIVERY'
+    });
+  } finally {
+    perf?.add?.('pedido_pendiente_static_catalogs_ms', staticCatalogsStart);
+  }
+  const {
+    canalCatalog,
+    modalidadCatalog,
+    estadoPagoCatalog,
+    motivoPagoCatalog,
+    deliveryEstadoCatalog,
+    idEstadoPedido
+  } = staticCatalogs || {};
   if (!canalCatalog || !modalidadCatalog || !estadoPagoCatalog || !motivoPagoCatalog || (modalidad === 'DELIVERY' && !deliveryEstadoCatalog)) {
     return { ok: false, status: 409, body: { error: true, message: 'No se encontraron catalogos requeridos para crear el pedido pendiente.' } };
   }
@@ -4443,10 +3398,12 @@ const buildPedidoPendientePayload = async ({ client, body, userId, sucursalScope
   const normalizedItemsResult = normalizeVentaItems(buildPedidoPendienteItemsBody(body));
   perf?.add?.('validation_items_ms', validationItemsStart);
   if (!normalizedItemsResult.ok) return { ok: false, status: 400, body: { error: true, message: normalizedItemsResult.message } };
+  const hydrateLinesStart = perf?.now?.() || 0;
   const hydratedResult = await hydrateVentaLines(client, normalizedItemsResult.data, perf, {
     idSucursal,
     validateProductStock: false
   });
+  perf?.add?.('pedido_pendiente_hydrate_lines_ms', hydrateLinesStart);
   if (!hydratedResult.ok) return hydratedResult;
 
   const { lines, subTotals } = hydratedResult.data;
@@ -4523,7 +3480,6 @@ const buildPedidoPendientePayload = async ({ client, body, userId, sucursalScope
   const subtotal = roundMoney(finalizedLines.reduce((sum, line) => sum + line.total_linea, 0));
   const isv = 0;
   const total = roundMoney(subtotal + costoEnvio);
-  const idEstadoPedido = await resolveEstadoPedidoIdByCode(client, 'EN_COCINA');
   if (!idEstadoPedido) return { ok: false, status: 409, body: { error: true, message: 'No existe el estado EN_COCINA en estados_pedido.' } };
 
   const sessionActiva = await resolveCajaSession({ client, idSucursal, idUsuario: userId, idSesionCaja: idSesionCajaRequested, isSuperAdmin });
@@ -4581,52 +3537,34 @@ const buildPedidoPendientePayload = async ({ client, body, userId, sucursalScope
     }
   };
 };
-const resolveMetodoPagoRegistroPedido = async (client, { idMetodoPago, metodoPagoRaw }) => {
-  const parsedId = parseOptionalPositiveInt(idMetodoPago);
-  if (idMetodoPago !== undefined && idMetodoPago !== null && !parsedId) return null;
-
-  if (parsedId) {
-    const result = await client.query(
-      `
-        SELECT
-          id_metodo_pago,
-          codigo,
-          nombre,
-          COALESCE(afecta_efectivo, false) AS afecta_efectivo
-        FROM cat_metodos_pago
-        WHERE id_metodo_pago = $1
-          AND COALESCE(estado, true) = true
-        LIMIT 1
-      `,
-      [parsedId]
-    );
-    return result.rows?.[0] || null;
+const buildPedidoFacturaSnapshot = (row, quantity, tipoItem, precioUnitario, subTotal, totalDetalle) => {
+  const snapshot = {
+    tipo_item: tipoItem,
+    nombre_item: row.nombre_item || null,
+    id_producto: parseOptionalPositiveInt(row.id_producto),
+    id_receta: parseOptionalPositiveInt(row.id_receta),
+    id_combo: parseOptionalPositiveInt(row.id_combo),
+    id_detalle_pedido: parseOptionalPositiveInt(row.id_detalle_pedido),
+    cantidad: Number(quantity || 1),
+    precio_unitario: roundMoney(precioUnitario),
+    sub_total: roundMoney(subTotal),
+    total_detalle: roundMoney(totalDetalle),
+    subtotal_extras: roundMoney(row.subtotal_extras),
+    descuento: roundMoney(roundMoney(subTotal) - roundMoney(totalDetalle)),
+    descuento_linea: roundMoney(row.descuento_linea),
+    descuento_global: roundMoney(row.descuento_global),
+    id_descuento_catalogo_linea: row.id_descuento_catalogo_linea || null,
+    id_descuento_catalogo_global: row.id_descuento_catalogo_global || null,
+    observacion: row.observacion || null,
+    extras: Array.isArray(row.extras_detalle) ? row.extras_detalle : [],
+    origen: 'PEDIDO_PENDIENTE'
+  };
+  const componentSnapshot = buildComplementSnapshotFromMenuConfig(row.configuracion_menu);
+  if (componentSnapshot && !snapshot.componentes && !snapshot.complementos) {
+    snapshot.componentes = componentSnapshot;
   }
-
-  return resolveMetodoPago(client, metodoPagoRaw);
+  return snapshot;
 };
-
-const buildPedidoFacturaSnapshot = (row, quantity, tipoItem, precioUnitario, subTotal, totalDetalle) => ({
-  tipo_item: tipoItem,
-  nombre_item: row.nombre_item || null,
-  id_producto: parseOptionalPositiveInt(row.id_producto),
-  id_receta: parseOptionalPositiveInt(row.id_receta),
-  id_combo: parseOptionalPositiveInt(row.id_combo),
-  id_detalle_pedido: parseOptionalPositiveInt(row.id_detalle_pedido),
-  cantidad: Number(quantity || 1),
-  precio_unitario: roundMoney(precioUnitario),
-  sub_total: roundMoney(subTotal),
-  total_detalle: roundMoney(totalDetalle),
-  subtotal_extras: roundMoney(row.subtotal_extras),
-  descuento: roundMoney(roundMoney(subTotal) - roundMoney(totalDetalle)),
-  descuento_linea: roundMoney(row.descuento_linea),
-  descuento_global: roundMoney(row.descuento_global),
-  id_descuento_catalogo_linea: row.id_descuento_catalogo_linea || null,
-  id_descuento_catalogo_global: row.id_descuento_catalogo_global || null,
-  observacion: row.observacion || null,
-  extras: Array.isArray(row.extras_detalle) ? row.extras_detalle : [],
-  origen: 'PEDIDO_PENDIENTE'
-});
 
 const prepareDetalleFacturaDesdePedido = (row, idPedido) => {
   const idProducto = parseOptionalPositiveInt(row.id_producto);
@@ -5526,17 +4464,6 @@ const upsertDescuentoCatalogoConObjetivos = async ({ client, payload, actor }) =
   return { ok: true, response };
 };
 
-const parseJsonArrayValue = (value) => {
-  if (Array.isArray(value)) return value;
-  if (typeof value !== 'string' || !value.trim()) return [];
-  try {
-    const parsed = JSON.parse(value);
-    return Array.isArray(parsed) ? parsed : [];
-  } catch (_) {
-    return [];
-  }
-};
-
 const buildDescuentoObjetivoLabel = (row) => {
   const alcance = normalizeDescuentoAlcance(row?.alcance) || DESCUENTO_ALCANCE_KEYS.FACTURA_COMPLETA;
   if (alcance === DESCUENTO_ALCANCE_KEYS.FACTURA_COMPLETA) return 'Factura completa';
@@ -5577,563 +4504,18 @@ const normalizeDescuentoCatalogoRow = (row) => {
   return normalized;
 };
 
-router.get('/ventas/catalogos/categorias', async (req, res) => {
-  try {
-    const scope = await resolveRequestUserSucursalScope(req);
-    const idSucursal = parseOptionalPositiveInt(req.query.id_sucursal);
+router.get('/ventas/catalogos/categorias', listCategoriasCatalogoHandler);
+router.get('/ventas/catalogos/extras-permitidos', listExtrasPermitidosCatalogoHandler);
+router.get('/ventas/catalogos/productos', listProductosCatalogoHandler);
+router.get('/ventas/catalogos/clientes', listClientesCatalogoHandler);
+router.get('/ventas/catalogos/combos', listCombosCatalogoHandler);
+router.get('/ventas/catalogos/recetas', listRecetasCatalogoHandler);
 
-    const sucursalValidation = await validateVentasCatalogSucursal({ scope, idSucursal });
-    if (!sucursalValidation.ok) {
-      return res.status(sucursalValidation.status).json(sucursalValidation.body);
-    }
+router.get('/ventas/catalogos/tipos-descuento', listTiposDescuentoCatalogoHandler);
 
-    const result = await pool.query(
-      `
-        SELECT cp.id_categoria_producto, cp.nombre_categoria, COALESCE(cp.estado, true) AS estado
-        FROM public.categorias_productos cp
-        WHERE COALESCE(cp.estado, true) = true
-        ORDER BY cp.nombre_categoria ASC, cp.id_categoria_producto ASC
-      `
-    );
+router.get('/ventas/catalogos/tipo-departamento', listTipoDepartamentoCatalogoHandler);
 
-    return res.status(200).json(Array.isArray(result.rows) ? result.rows : []);
-  } catch (err) {
-    console.error('Error al listar catalogo de categorias para ventas:', err.message);
-    return sendVentasInternalError(res);
-  }
-});
-
-router.get('/ventas/catalogos/extras-permitidos', async (req, res) => {
-  const tipo = String(req.query.tipo || '').trim().toUpperCase();
-  const idItem = parseOptionalPositiveInt(req.query.id_item);
-  const idSucursal = parseOptionalPositiveInt(req.query.id_sucursal);
-
-  if (!['RECETA', 'COMBO'].includes(tipo)) {
-    return res.status(400).json({ error: true, message: 'tipo debe ser RECETA o COMBO.' });
-  }
-  if (!idItem) {
-    return res.status(400).json({ error: true, message: 'id_item debe ser entero mayor a 0.' });
-  }
-
-  try {
-    const hasMenuExtraCombo = await hasTable(pool, 'menu_extra_combo');
-    if (tipo === 'COMBO' && !hasMenuExtraCombo) {
-      return res.status(200).json([]);
-    }
-
-    const linkJoin = tipo === 'RECETA'
-      ? 'public.menu_extra_receta rel ON rel.id_extra = me.id_extra AND rel.id_receta = $1'
-      : 'public.menu_extra_combo rel ON rel.id_extra = me.id_extra AND rel.id_combo = $1';
-    const orderExpression = tipo === 'RECETA'
-      ? 'COALESCE(rel.orden, me.orden, 2147483647)'
-      : 'COALESCE(me.orden, 2147483647)';
-
-    const result = await pool.query(
-      `
-        SELECT
-          me.id_extra,
-          me.codigo,
-          me.nombre,
-          me.precio_adicional AS precio,
-          COALESCE(me.estado, true) AS estado,
-          me.id_insumo,
-          CASE WHEN me.id_insumo IS NULL THEN NULL ELSE i.cantidad END AS stock_disponible
-        FROM public.menu_extras me
-        INNER JOIN ${linkJoin}
-          AND COALESCE(rel.estado, true) = true
-        LEFT JOIN public.insumos i
-          ON i.id_insumo = me.id_insumo
-         AND COALESCE(i.estado, true) = true
-        LEFT JOIN public.almacenes a
-          ON a.id_almacen = i.id_almacen
-         AND ($2::int IS NULL OR a.id_sucursal = $2::int)
-        WHERE COALESCE(me.estado, true) = true
-          AND (me.id_insumo IS NULL OR a.id_almacen IS NOT NULL)
-        ORDER BY ${orderExpression}, me.nombre ASC
-      `,
-      [idItem, idSucursal || null]
-    );
-
-    return res.status(200).json(
-      result.rows.map((row) => ({
-        id_extra: Number(row.id_extra),
-        codigo: row.codigo,
-        nombre: row.nombre,
-        precio: roundMoney(row.precio),
-        estado: parseBooleanish(row.estado),
-        id_insumo: parseOptionalPositiveInt(row.id_insumo),
-        stock_disponible: row.stock_disponible === null || row.stock_disponible === undefined ? null : Number(row.stock_disponible)
-      }))
-    );
-  } catch (err) {
-    console.error('Error al listar extras permitidos venta:', err.message);
-    return res.status(500).json({ error: true, message: 'No se pudieron cargar los extras permitidos.' });
-  }
-});
-
-router.get('/ventas/catalogos/productos', async (req, res) => {
-  try {
-    const scope = await resolveRequestUserSucursalScope(req);
-    const isSuperAdmin = Boolean(scope.isSuperAdmin);
-    const idSucursal = parseOptionalPositiveInt(req.query.id_sucursal);
-
-    const sucursalValidation = await validateVentasCatalogSucursal({ scope, idSucursal });
-    if (!sucursalValidation.ok) {
-      return res.status(sucursalValidation.status).json(sucursalValidation.body);
-    }
-
-    let whereClause = '';
-    const params = [];
-
-    if (idSucursal) {
-      params.push(idSucursal);
-      whereClause = 'AND al.id_sucursal = $1';
-    } else if (!isSuperAdmin) {
-      const allowedSucursalIds = coercePositiveIntArray(scope.allowedSucursalIds);
-      if (allowedSucursalIds.length === 0) {
-        return res.status(403).json({ error: true, message: 'El empleado no tiene sucursales asignadas.' });
-      }
-      params.push(allowedSucursalIds);
-      whereClause = 'AND al.id_sucursal = ANY($1::int[])';
-    }
-
-    const query = `
-      SELECT DISTINCT
-        p.id_producto,
-        p.nombre_producto,
-        p.descripcion_producto,
-        p.precio,
-        p.cantidad,
-        p.estado,
-        p.id_categoria_producto,
-        p.id_tipo_departamento,
-        p.id_archivo_imagen_principal,
-        al.id_sucursal,
-        a.url_publica AS imagen_principal_url
-      FROM public.productos p
-      LEFT JOIN public.almacenes al ON al.id_almacen = p.id_almacen
-      LEFT JOIN public.archivos a ON a.id_archivo = p.id_archivo_imagen_principal AND (a.estado = true OR a.estado IS NULL)
-      WHERE COALESCE(p.estado, true) = true
-        AND COALESCE(al.estado, true) = true
-      ${whereClause}
-      ORDER BY p.nombre_producto ASC, p.id_producto ASC
-    `;
-
-    const result = await pool.query(query, params);
-    return res.status(200).json(Array.isArray(result.rows) ? result.rows : []);
-  } catch (err) {
-    console.error('Error al listar catalogo de productos para ventas:', err.message);
-    return sendVentasInternalError(res);
-  }
-});
-
-router.get('/ventas/catalogos/clientes', async (req, res) => {
-  try {
-    const query = `
-      SELECT
-        c.id_cliente,
-        c.estado,
-        c.id_tipo_cliente,
-        p.nombre,
-        p.apellido,
-        e.nombre_empresa
-      FROM clientes c
-      LEFT JOIN personas p ON p.id_persona = c.id_persona
-      LEFT JOIN empresas e ON e.id_empresa = c.id_empresa
-      WHERE COALESCE(c.estado, true) = true
-      ORDER BY
-        COALESCE(NULLIF(trim(concat_ws(' ', p.nombre, p.apellido)), ''), e.nombre_empresa, c.id_cliente::text)
-    `;
-
-    const result = await pool.query(query);
-    const data = result.rows.map((row) => ({
-      id_cliente: row.id_cliente,
-      id_tipo_cliente: row.id_tipo_cliente,
-      estado: row.estado,
-      nombre_cliente: normalizeClienteNombre(row),
-      es_consumidor_final: false
-    }));
-
-    res.status(200).json(data);
-  } catch (err) {
-    console.error('Error al listar catalogo de clientes para ventas:', err.message);
-    sendVentasInternalError(res);
-  }
-});
-
-router.get('/ventas/catalogos/combos', async (req, res) => {
-  try {
-    const scope = await resolveRequestUserSucursalScope(req);
-    const isSuperAdmin = Boolean(scope.isSuperAdmin);
-    let idSucursal = parseOptionalPositiveInt(req.query.id_sucursal);
-
-    const sucursalValidation = await validateVentasCatalogSucursal({ scope, idSucursal });
-    if (!sucursalValidation.ok) {
-      return res.status(sucursalValidation.status).json(sucursalValidation.body);
-    }
-
-    let joinClause = '';
-    let whereClause = '';
-    const params = [];
-
-    if (idSucursal) {
-      params.push(idSucursal);
-      joinClause = 'INNER JOIN menu_vigente mv ON mv.id_menu = c.id_menu';
-      whereClause = 'AND mv.id_sucursal = $1 AND COALESCE(mv.estado, true) = true AND (mv.fecha_inicio IS NULL OR mv.fecha_inicio <= CURRENT_TIMESTAMP)';
-    } else if (!isSuperAdmin) {
-      params.push(scope.allowedSucursalIds);
-      joinClause = 'INNER JOIN menu_vigente mv ON mv.id_menu = c.id_menu';
-      whereClause = 'AND mv.id_sucursal = ANY($1::int[]) AND COALESCE(mv.estado, true) = true AND (mv.fecha_inicio IS NULL OR mv.fecha_inicio <= CURRENT_TIMESTAMP)';
-    }
-
-    const query = `
-      WITH combo_departamento_counts AS (
-        SELECT
-          dc.id_combo,
-          r.id_tipo_departamento,
-          td.nombre_departamento,
-          COUNT(*)::int AS total_componentes
-        FROM detalle_combo dc
-        INNER JOIN recetas r
-          ON r.id_receta = dc.id_receta
-        LEFT JOIN tipo_departamento td
-          ON td.id_tipo_departamento = r.id_tipo_departamento
-        WHERE COALESCE(dc.estado, true) = true
-          AND COALESCE(r.estado, true) = true
-          AND r.id_tipo_departamento IS NOT NULL
-        GROUP BY dc.id_combo, r.id_tipo_departamento, td.nombre_departamento
-      ),
-      combo_departamento_principal AS (
-        SELECT DISTINCT ON (id_combo)
-          id_combo,
-          id_tipo_departamento,
-          nombre_departamento
-        FROM combo_departamento_counts
-        ORDER BY id_combo, total_componentes DESC, id_tipo_departamento ASC
-      ),
-      combo_departamentos AS (
-        SELECT
-          id_combo,
-          ARRAY_AGG(id_tipo_departamento ORDER BY id_tipo_departamento) AS departamentos_ids,
-          JSONB_AGG(
-            JSONB_BUILD_OBJECT(
-              'id_tipo_departamento', id_tipo_departamento,
-              'nombre_tipo_departamento', nombre_departamento
-            )
-            ORDER BY id_tipo_departamento
-          ) AS departamentos
-        FROM combo_departamento_counts
-        GROUP BY id_combo
-      )
-      SELECT DISTINCT
-        c.id_combo, 
-        c.descripcion, 
-        c.precio, 
-        c.estado,
-        c.id_archivo,
-        COALESCE(c.id_tipo_departamento, cdp.id_tipo_departamento) AS id_tipo_departamento,
-        COALESCE(td.nombre_departamento, cdp.nombre_departamento) AS nombre_tipo_departamento,
-        cdp.id_tipo_departamento AS id_tipo_departamento_principal,
-        cdp.nombre_departamento AS nombre_tipo_departamento_principal,
-        COALESCE(cd.departamentos_ids, ARRAY[]::int[]) AS departamentos_ids,
-        COALESCE(cd.departamentos, '[]'::jsonb) AS departamentos,
-        a.url_publica AS imagen_principal_url
-      FROM combos c
-      LEFT JOIN archivos a ON a.id_archivo = c.id_archivo AND (a.estado = true OR a.estado IS NULL)
-      LEFT JOIN tipo_departamento td
-        ON td.id_tipo_departamento = c.id_tipo_departamento
-      LEFT JOIN combo_departamento_principal cdp
-        ON cdp.id_combo = c.id_combo
-      LEFT JOIN combo_departamentos cd
-        ON cd.id_combo = c.id_combo
-      ${joinClause}
-      WHERE COALESCE(c.estado, true) = true ${whereClause}
-      ORDER BY c.descripcion ASC, c.id_combo ASC
-    `;
-
-    const result = await pool.query(query, params);
-    const comboRows = Array.isArray(result.rows) ? result.rows : [];
-    const complementContext = await buildVentaComplementContext({
-      client: pool,
-      normalizedItems: comboRows.map((row) => ({
-        kind: 'COMBO',
-        id_combo: Number(row?.id_combo || 0),
-        cantidad: 1,
-        complementos: []
-      }))
-    });
-
-    const data = comboRows.map((row) => {
-      const metadata = resolveComboComplementMetadata({
-        combo: row,
-        quantity: 1,
-        components: complementContext.comboComponentsByCombo.get(Number(row?.id_combo || 0)) || [],
-        saucesByRecipe: complementContext.saucesByRecipe,
-        rulesByRecipe: complementContext.rulesByRecipe,
-        fallbackSauces: complementContext.fallbackSauces
-      });
-
-      return {
-        ...row,
-        requiere_complementos: Boolean(metadata.requiere_complementos),
-        tipo_complemento: metadata.tipo_complemento || VENTA_COMPLEMENTO_TIPO_SALSAS,
-        minimo_complementos: Number(metadata.minimo_complementos || 0),
-        maximo_complementos: Number(metadata.maximo_complementos || 0),
-        complementos_disponibles: (Array.isArray(metadata.complementos_disponibles) ? metadata.complementos_disponibles : []).map((entry) => ({
-          id_complemento: Number(entry?.id_complemento || entry?.id_salsa || 0),
-          nombre: String(entry?.nombre || 'Salsa').trim(),
-          disponible: entry?.disponible !== false
-        })).filter((entry) => entry.id_complemento > 0)
-      };
-    });
-
-    res.status(200).json(data);
-  } catch (err) {
-    console.error('Error al listar catalogo de combos para ventas:', err.message);
-    sendVentasInternalError(res);
-  }
-});
-
-router.get('/ventas/catalogos/recetas', async (req, res) => {
-  try {
-    const scope = await resolveRequestUserSucursalScope(req);
-    const isSuperAdmin = Boolean(scope.isSuperAdmin);
-    let idSucursal = parseOptionalPositiveInt(req.query.id_sucursal);
-
-    const sucursalValidation = await validateVentasCatalogSucursal({ scope, idSucursal });
-    if (!sucursalValidation.ok) {
-      return res.status(sucursalValidation.status).json(sucursalValidation.body);
-    }
-
-    let joinClause = '';
-    let whereClause = '';
-    const params = [];
-
-    if (idSucursal) {
-      params.push(idSucursal);
-      joinClause = 'INNER JOIN menu_vigente mv ON mv.id_menu = r.id_menu';
-      whereClause = 'AND mv.id_sucursal = $1 AND COALESCE(mv.estado, true) = true AND (mv.fecha_inicio IS NULL OR mv.fecha_inicio <= CURRENT_TIMESTAMP)';
-    } else if (!isSuperAdmin) {
-      params.push(scope.allowedSucursalIds);
-      joinClause = 'INNER JOIN menu_vigente mv ON mv.id_menu = r.id_menu';
-      whereClause = 'AND mv.id_sucursal = ANY($1::int[]) AND COALESCE(mv.estado, true) = true AND (mv.fecha_inicio IS NULL OR mv.fecha_inicio <= CURRENT_TIMESTAMP)';
-    }
-
-    const query = `
-      SELECT DISTINCT
-        r.id_receta,
-        r.nombre_receta,
-        r.descripcion,
-        r.estado,
-        r.precio,
-        r.id_archivo,
-        r.id_tipo_departamento,
-        a.url_publica AS imagen_principal_url,
-        NULL::INTEGER AS id_producto_base,
-        r.nombre_receta AS nombre_producto_base,
-        r.precio AS precio_producto_base,
-        r.estado AS estado_producto_base
-      FROM recetas r
-      LEFT JOIN archivos a ON a.id_archivo = r.id_archivo AND (a.estado = true OR a.estado IS NULL)
-      ${joinClause}
-      WHERE COALESCE(r.estado, true) = true ${whereClause}
-      ORDER BY r.nombre_receta ASC, r.id_receta ASC
-    `;
-
-    const result = await pool.query(query, params);
-    const recetaRows = Array.isArray(result.rows) ? result.rows : [];
-    const complementContext = await buildVentaComplementContext({
-      client: pool,
-      normalizedItems: recetaRows.map((row) => ({
-        kind: 'RECETA',
-        id_receta: Number(row?.id_receta || 0),
-        cantidad: 1,
-        complementos: []
-      }))
-    });
-
-    const data = recetaRows.map((row) => {
-      const metadata = resolveRecetaComplementMetadata({
-        receta: row,
-        quantity: 1,
-        allowedSauces: complementContext.saucesByRecipe.get(Number(row?.id_receta || 0)) || [],
-        rules: complementContext.rulesByRecipe.get(Number(row?.id_receta || 0)) || [],
-        fallbackSauces: complementContext.fallbackSauces
-      });
-
-      return {
-        ...row,
-        requiere_complementos: Boolean(metadata.requiere_complementos),
-        tipo_complemento: metadata.tipo_complemento || VENTA_COMPLEMENTO_TIPO_SALSAS,
-        minimo_complementos: Number(metadata.minimo_complementos || 0),
-        maximo_complementos: Number(metadata.maximo_complementos || 0),
-        complementos_disponibles: (Array.isArray(metadata.complementos_disponibles) ? metadata.complementos_disponibles : []).map((entry) => ({
-          id_complemento: Number(entry?.id_complemento || entry?.id_salsa || 0),
-          nombre: String(entry?.nombre || 'Salsa').trim(),
-          disponible: entry?.disponible !== false
-        })).filter((entry) => entry.id_complemento > 0)
-      };
-    });
-
-    res.status(200).json(data);
-  } catch (err) {
-    console.error('Error al listar catalogo de recetas para ventas:', err.message);
-    sendVentasInternalError(res);
-  }
-});
-
-router.get('/ventas/catalogos/tipos-descuento', async (req, res) => {
-  try {
-    const result = await pool.query(
-      `
-        SELECT
-          td.id_tipo_descuento,
-          td.nombre_tipo_descuento,
-          td.descripcion,
-          td.estado
-        FROM tipo_descuentos td
-        WHERE COALESCE(td.estado, true) = true
-        ORDER BY td.id_tipo_descuento
-      `
-    );
-    res.status(200).json(result.rows || []);
-  } catch (err) {
-    console.error('Error al listar tipos de descuento:', err.message);
-    sendVentasInternalError(res);
-  }
-});
-
-router.get('/ventas/catalogos/tipo-departamento', async (req, res) => {
-  try {
-    const result = await pool.query(
-      `
-        SELECT
-          td.id_tipo_departamento,
-          td.nombre_departamento,
-          td.descripcion,
-          td.estado
-        FROM tipo_departamento td
-        WHERE COALESCE(td.estado, true) = true
-        ORDER BY td.nombre_departamento
-      `
-    );
-    res.status(200).json(result.rows || []);
-  } catch (err) {
-    console.error('Error al listar tipos de departamento:', err.message);
-    sendVentasInternalError(res);
-  }
-});
-
-router.get('/ventas/catalogos/descuentos', async (req, res) => {
-  try {
-    const scope = await resolveRequestUserSucursalScope(req);
-    const idSucursal = parseOptionalPositiveInt(req.query.id_sucursal);
-    const sucursalValidation = await validateVentasCatalogSucursal({ scope, idSucursal });
-    if (!sucursalValidation.ok) {
-      return res.status(sucursalValidation.status).json(sucursalValidation.body);
-    }
-
-    const params = [];
-    const sucursalWhere = idSucursal
-      ? 'AND (dc.id_sucursal IS NULL OR dc.id_sucursal = $1)'
-      : '';
-    if (idSucursal) params.push(idSucursal);
-
-    const result = await pool.query(
-      `
-        SELECT
-          dc.id_descuento_catalogo,
-          dc.nombre_descuento,
-          dc.descripcion,
-          dc.valor_descuento,
-          dc.alcance,
-          dc.id_producto,
-          dc.id_receta,
-          dc.id_combo,
-          dc.id_sucursal,
-          dc.fecha_inicio,
-          dc.fecha_fin,
-          dc.id_tipo_descuento,
-          td.nombre_tipo_descuento,
-          COALESCE(objp.productos, '[]'::jsonb) AS productos,
-          COALESCE(objr.recetas, '[]'::jsonb) AS recetas,
-          COALESCE(objc.combos, '[]'::jsonb) AS combos,
-          COALESCE(objp.productos_ids, ARRAY[]::int[]) AS productos_ids,
-          COALESCE(objr.recetas_ids, ARRAY[]::int[]) AS recetas_ids,
-          COALESCE(objc.combos_ids, ARRAY[]::int[]) AS combos_ids
-        FROM descuentos_catalogos dc
-        INNER JOIN tipo_descuentos td
-          ON td.id_tipo_descuento = dc.id_tipo_descuento
-        LEFT JOIN LATERAL (
-          SELECT
-            COALESCE(jsonb_agg(jsonb_build_object('id_producto', x.id_producto, 'nombre_producto', x.nombre_producto) ORDER BY x.nombre_producto), '[]'::jsonb) AS productos,
-            COALESCE(array_agg(x.id_producto ORDER BY x.id_producto), ARRAY[]::int[]) AS productos_ids
-          FROM (
-            SELECT DISTINCT p.id_producto, p.nombre_producto
-            FROM descuentos_catalogos_productos rel
-            INNER JOIN productos p ON p.id_producto = rel.id_producto
-            WHERE rel.id_descuento_catalogo = dc.id_descuento_catalogo
-            UNION
-            SELECT p.id_producto, p.nombre_producto
-            FROM productos p
-            WHERE p.id_producto = dc.id_producto
-              AND NOT EXISTS (
-                SELECT 1 FROM descuentos_catalogos_productos rel
-                WHERE rel.id_descuento_catalogo = dc.id_descuento_catalogo
-              )
-          ) x
-        ) objp ON true
-        LEFT JOIN LATERAL (
-          SELECT
-            COALESCE(jsonb_agg(jsonb_build_object('id_receta', x.id_receta, 'nombre_receta', x.nombre_receta) ORDER BY x.nombre_receta), '[]'::jsonb) AS recetas,
-            COALESCE(array_agg(x.id_receta ORDER BY x.id_receta), ARRAY[]::int[]) AS recetas_ids
-          FROM (
-            SELECT DISTINCT r.id_receta, r.nombre_receta
-            FROM descuentos_catalogos_recetas rel
-            INNER JOIN recetas r ON r.id_receta = rel.id_receta
-            WHERE rel.id_descuento_catalogo = dc.id_descuento_catalogo
-            UNION
-            SELECT r.id_receta, r.nombre_receta
-            FROM recetas r
-            WHERE r.id_receta = dc.id_receta
-              AND NOT EXISTS (
-                SELECT 1 FROM descuentos_catalogos_recetas rel
-                WHERE rel.id_descuento_catalogo = dc.id_descuento_catalogo
-              )
-          ) x
-        ) objr ON true
-        LEFT JOIN LATERAL (
-          SELECT
-            COALESCE(jsonb_agg(jsonb_build_object('id_combo', x.id_combo, 'nombre_combo', x.nombre_combo) ORDER BY x.nombre_combo), '[]'::jsonb) AS combos,
-            COALESCE(array_agg(x.id_combo ORDER BY x.id_combo), ARRAY[]::int[]) AS combos_ids
-          FROM (
-            SELECT DISTINCT cb.id_combo, COALESCE(cb.nombre_combo, cb.descripcion) AS nombre_combo
-            FROM descuentos_catalogos_combos rel
-            INNER JOIN combos cb ON cb.id_combo = rel.id_combo
-            WHERE rel.id_descuento_catalogo = dc.id_descuento_catalogo
-            UNION
-            SELECT cb.id_combo, COALESCE(cb.nombre_combo, cb.descripcion) AS nombre_combo
-            FROM combos cb
-            WHERE cb.id_combo = dc.id_combo
-              AND NOT EXISTS (
-                SELECT 1 FROM descuentos_catalogos_combos rel
-                WHERE rel.id_descuento_catalogo = dc.id_descuento_catalogo
-              )
-          ) x
-        ) objc ON true
-        WHERE COALESCE(dc.estado, true) = true
-          AND COALESCE(td.estado, true) = true
-          ${sucursalWhere}
-        ORDER BY dc.nombre_descuento ASC, dc.id_descuento_catalogo ASC
-      `,
-      params
-    );
-    res.status(200).json((result.rows || []).map(normalizeDescuentoCatalogoRow));
-  } catch (err) {
-    console.error('Error al listar descuentos activos de catalogo:', err.message);
-    sendVentasInternalError(res);
-  }
-});
+router.get('/ventas/catalogos/descuentos', listDescuentosCatalogoHandler);
 
 router.get('/ventas/descuentos-catalogos', checkPermission(VENTAS_DESCUENTOS_PERMISSIONS), async (req, res) => {
   try {
@@ -6457,6 +4839,10 @@ router.get('/ventas', checkPermission(['VENTAS_VER']), async (req, res) => {
   try {
     const filters = [];
     const params = [];
+    const shouldIncludeMetric = (value) => {
+      const normalized = String(value ?? '').trim().toLowerCase();
+      return !['0', 'false', 'no', 'off'].includes(normalized);
+    };
     const pushFilter = (fragment, value) => {
       params.push(value);
       filters.push(fragment.replaceAll('$IDX', `$${params.length}`));
@@ -6472,6 +4858,10 @@ router.get('/ventas', checkPermission(['VENTAS_VER']), async (req, res) => {
       max: VENTAS_MAX_PAGE_SIZE
     });
     const offset = (page - 1) * pageSize;
+    const includeSummary = shouldIncludeMetric(req.query.includeSummary ?? req.query.include_summary);
+    const includePaginationTotals = shouldIncludeMetric(
+      req.query.includePaginationTotals ?? req.query.include_pagination_totals
+    );
 
     const scope = await resolveVentasHistoryScope(req);
     if (!scope.allowedSucursalIds.length) {
@@ -6719,6 +5109,7 @@ router.get('/ventas', checkPermission(['VENTAS_VER']), async (req, res) => {
           ELSE COALESCE(df_info.total_items, 0)
         END AS total_items,
         COALESCE(df_info.descuento_total, 0) AS descuento_total,
+        COALESCE(cuenta_info.divisiones_count, 0)::int AS cuenta_dividida_divisiones,
         COALESCE(rev_info.reversiones_count, 0) AS reversiones_count,
         COALESCE(rev_info.monto_reversado_total, 0) AS monto_reversado_total
       ${baseJoinClause}
@@ -6737,8 +5128,13 @@ router.get('/ventas', checkPermission(['VENTAS_VER']), async (req, res) => {
         FROM facturas_cobros fc
         INNER JOIN cat_metodos_pago cmp
           ON cmp.id_metodo_pago = fc.id_metodo_pago
-        WHERE fc.id_factura = f.id_factura
+          WHERE fc.id_factura = f.id_factura
       ) fc_info ON true
+      LEFT JOIN LATERAL (
+        SELECT COUNT(*)::int AS divisiones_count
+        FROM public.ventas_cuenta_divisiones vcd
+        WHERE vcd.id_pedido = f.id_pedido
+      ) cuenta_info ON true
       LEFT JOIN LATERAL (
         SELECT
           COUNT(*)::int AS reversiones_count,
@@ -6790,20 +5186,32 @@ router.get('/ventas', checkPermission(['VENTAS_VER']), async (req, res) => {
       OFFSET $${params.length + 2}
     `;
 
-    const countResult = await pool.query(countQuery, params);
-    const summaryResult = await pool.query(summaryQuery, params);
-    const total = Number.parseInt(String(countResult.rows?.[0]?.total ?? '0'), 10) || 0;
-    const totalPages = total > 0 ? Math.ceil(total / pageSize) : 1;
     const queryParams = [...params, pageSize, offset];
-    const result = await pool.query(dataQuery, queryParams);
-    const summaryRow = summaryResult.rows?.[0] || {};
-    const summaryVentas = Number.parseInt(String(summaryRow.ventas ?? '0'), 10) || 0;
-    const summaryTotalVendido = roundMoney(summaryRow.total_vendido);
-    const summaryCompletadas = Number.parseInt(String(summaryRow.completadas ?? '0'), 10) || 0;
-    const summaryPendientes = Math.max(summaryVentas - summaryCompletadas, 0);
-    const summaryTicketPromedio = summaryVentas > 0
+    const [countResult, summaryResult, result] = await Promise.all([
+      includePaginationTotals ? pool.query(countQuery, params) : Promise.resolve(null),
+      includeSummary ? pool.query(summaryQuery, params) : Promise.resolve(null),
+      pool.query(dataQuery, queryParams)
+    ]);
+    const total = includePaginationTotals
+      ? Number.parseInt(String(countResult?.rows?.[0]?.total ?? '0'), 10) || 0
+      : null;
+    const totalPages = includePaginationTotals
+      ? (total > 0 ? Math.ceil(total / pageSize) : 1)
+      : null;
+    const summaryRow = summaryResult?.rows?.[0] || {};
+    const summaryVentas = includeSummary
+      ? Number.parseInt(String(summaryRow.ventas ?? '0'), 10) || 0
+      : null;
+    const summaryTotalVendido = includeSummary ? roundMoney(summaryRow.total_vendido) : null;
+    const summaryCompletadas = includeSummary
+      ? Number.parseInt(String(summaryRow.completadas ?? '0'), 10) || 0
+      : null;
+    const summaryPendientes = includeSummary ? Math.max(summaryVentas - summaryCompletadas, 0) : null;
+    const summaryTicketPromedio = includeSummary && summaryVentas > 0
       ? roundMoney(summaryTotalVendido / summaryVentas)
-      : 0;
+      : includeSummary
+        ? 0
+        : null;
 
     const data = result.rows.map((row) => ({
       ...row,
@@ -6819,16 +5227,18 @@ router.get('/ventas', checkPermission(['VENTAS_VER']), async (req, res) => {
         pageSize,
         total,
         totalPages,
-        hasNextPage: page < totalPages,
+        hasNextPage: includePaginationTotals ? page < totalPages : null,
         hasPreviousPage: page > 1
       },
-      summary: {
-        ventas: summaryVentas,
-        totalVendido: summaryTotalVendido,
-        ticketPromedio: summaryTicketPromedio,
-        completadas: summaryCompletadas,
-        pendientes: summaryPendientes
-      },
+      summary: includeSummary
+        ? {
+          ventas: summaryVentas,
+          totalVendido: summaryTotalVendido,
+          ticketPromedio: summaryTicketPromedio,
+          completadas: summaryCompletadas,
+          pendientes: summaryPendientes
+        }
+        : null,
       filters: {
         scope: {
           canSelectSucursal: scope.isSuperAdmin,
@@ -7507,7 +5917,6 @@ router.get('/ventas/pedidos-menu', checkPermission(['VENTAS_VER']), async (req, 
     filters.push(`
       ${pedidosOperacionFechaExpr} = ${operationalDateExpr}
     `);
-
     const whereClause = `WHERE ${filters.join(' AND ')}`;
 
     const estadoPagoSelect = hasEstadoPago ? 'p.estado_pago' : `NULL::text AS estado_pago`;
@@ -7563,6 +5972,7 @@ router.get('/ventas/pedidos-menu', checkPermission(['VENTAS_VER']), async (req, 
           COALESCE(NULLIF(TRIM(f.codigo_venta), ''), NULL) AS codigo_venta,
           s.nombre_sucursal,
           fc_info.metodo_pago,
+          COALESCE(vcd_info.divisiones_count, 0)::int AS cuenta_dividida_divisiones,
           COALESCE(dp_info.items, '[]'::jsonb) AS items,
           u_pago.nombre_usuario AS usuario_pago_confirmado,
           per.nombre AS nombres_cliente,
@@ -7593,6 +6003,11 @@ router.get('/ventas/pedidos-menu', checkPermission(['VENTAS_VER']), async (req, 
             ON cmp.id_metodo_pago = fc.id_metodo_pago
           WHERE fc.id_factura = f.id_factura
         ) fc_info ON true
+        LEFT JOIN LATERAL (
+          SELECT COUNT(*)::int AS divisiones_count
+          FROM public.ventas_cuenta_divisiones vcd
+          WHERE vcd.id_pedido = p.id_pedido
+        ) vcd_info ON true
         LEFT JOIN LATERAL (
           SELECT
             jsonb_agg(
@@ -8128,105 +6543,7 @@ router.post('/ventas/:id/reversiones', checkPermission(['VENTAS_REVERSION_CREAR'
   }
 });
 
-router.get('/ventas/buscar', checkPermission(['VENTAS_VER']), async (req, res) => {
-  try {
-    const codigoVenta = String(req.query.codigo_venta || '').trim().toUpperCase();
-    const fechaOperacion = parseOptionalDateInput(req.query.fecha_operacion);
-    const idSucursalRequested = parseOptionalPositiveInt(req.query.id_sucursal);
-
-    if (!codigoVenta) {
-      return res.status(400).json({ error: true, message: 'Ingresa el código de venta.' });
-    }
-    if (!fechaOperacion || fechaOperacion === '__INVALID_DATE__') {
-      return res.status(400).json({ error: true, message: 'Selecciona la fecha de operación.' });
-    }
-
-    const scope = await resolveVentasHistoryScope(req);
-    if (!scope.allowedSucursalIds.length) {
-      return res.status(403).json({ error: true, message: 'El empleado no tiene sucursal asignada.' });
-    }
-
-    let idSucursalEffective = null;
-    if (scope.isSuperAdmin) {
-      idSucursalEffective = idSucursalRequested;
-      if (!idSucursalEffective) {
-        return res.status(400).json({ error: true, message: 'Selecciona la sucursal.' });
-      }
-      if (!scope.allowedSucursalIds.includes(idSucursalEffective)) {
-        return res.status(403).json({ error: true, message: 'No tiene acceso a la sucursal solicitada.' });
-      }
-    } else {
-      idSucursalEffective = scope.userSucursalId;
-      if (!idSucursalEffective) {
-        return res.status(403).json({ error: true, message: 'El empleado no tiene sucursal asignada.' });
-      }
-      if (idSucursalRequested && idSucursalRequested !== idSucursalEffective) {
-        return res.status(403).json({
-          error: 'SUCURSAL_NO_AUTORIZADA',
-          message: 'No tienes permiso para consultar ventas de esta sucursal.'
-        });
-      }
-    }
-
-    const result = await pool.query(
-      `
-        SELECT
-          f.id_factura,
-          COALESCE(NULLIF(TRIM(f.codigo_venta), ''), 'VTA-' || LPAD(f.id_factura::text, 5, '0')) AS codigo_venta,
-          f.fecha_operacion::date AS fecha_operacion,
-          f.id_sucursal,
-          s.nombre_sucursal AS sucursal,
-          COALESCE(
-            NULLIF(TRIM(CONCAT_WS(' ', per.nombre, per.apellido)), ''),
-            emp.nombre_empresa,
-            'Consumidor final'
-          ) AS cliente,
-          COALESCE(
-            (
-              SELECT SUM(COALESCE(df.total_detalle, 0))
-              FROM detalle_facturas df
-              WHERE df.id_factura = f.id_factura
-            ),
-            0
-          )::numeric(12,2) AS total
-        FROM facturas f
-        LEFT JOIN sucursales s ON s.id_sucursal = f.id_sucursal
-        LEFT JOIN clientes c ON c.id_cliente = f.id_cliente
-        LEFT JOIN personas per ON per.id_persona = c.id_persona
-        LEFT JOIN empresas emp ON emp.id_empresa = c.id_empresa
-        WHERE UPPER(COALESCE(f.codigo_venta, '')) = $1
-          AND f.fecha_operacion = $2::date
-          AND f.id_sucursal = $3
-        LIMIT 1
-      `,
-      [codigoVenta, fechaOperacion, idSucursalEffective]
-    );
-
-    if (!result.rowCount) {
-      return res.status(404).json({
-        error: true,
-        message: 'No se encontró una venta con ese código, fecha y sucursal.'
-      });
-    }
-
-    const row = result.rows[0];
-    return res.status(200).json({
-      data: {
-        id_factura: Number(row.id_factura),
-        codigo_venta: row.codigo_venta,
-        fecha_operacion: row.fecha_operacion,
-        id_sucursal: Number(row.id_sucursal),
-        sucursal: row.sucursal || `Sucursal ${row.id_sucursal}`,
-        cliente: row.cliente || 'Consumidor final',
-        total: roundMoney(row.total),
-        items: []
-      }
-    });
-  } catch (err) {
-    console.error('Error en búsqueda exacta de ventas:', err);
-    return sendVentasInternalError(res);
-  }
-});
+router.get('/ventas/buscar', checkPermission(['VENTAS_VER']), buscarVentaHandler);
 
 router.get('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), listarPedidosPendientesPago);
 
@@ -8286,348 +6603,9 @@ router.get('/ventas/pedidos/:id/inventario-alertas', checkPermission(['VENTAS_VE
   }
 });
 
-router.get('/ventas/:id', checkPermission(['VENTAS_VER']), async (req, res) => {
-  try {
-    const idFactura = parsePositiveInt(req.params.id);
-    if (!idFactura) {
-      return res.status(400).json({ error: true, message: 'ID de venta invalido.' });
-    }
-
-    const scope = await resolveVentasHistoryScope(req);
-    if (!scope.allowedSucursalIds.length) {
-      return res.status(403).json({ error: true, message: 'El empleado no tiene sucursales asignadas.' });
-    }
-    const headerQuery = `
-      SELECT
-        f.id_factura,
-        f.codigo_venta,
-        f.fecha_operacion,
-        f.id_pedido,
-        p.descripcion_pedido,
-        p.descripcion_envio,
-        COALESCE(p.fecha_hora_pedido, f.fecha_hora_facturacion) AS fecha_hora_pedido,
-        COALESCE(p.sub_total, df_info.subtotal_neto, 0) AS sub_total,
-        0::numeric(12,2) AS isv,
-        COALESCE(
-          df_info.subtotal_neto,
-          p.total,
-          0
-        ) AS total,
-        p.id_estado_pedido,
-        CASE
-          WHEN p.id_pedido IS NULL THEN '${VENTA_DIRECTA_LABEL}'
-          ELSE ep.descripcion
-        END AS estado_pedido,
-        COALESCE(p.id_sucursal, f.id_sucursal) AS id_sucursal,
-        s.nombre_sucursal,
-        COALESCE(p.id_cliente, f.id_cliente) AS id_cliente,
-        COALESCE(
-          NULLIF(trim(concat_ws(' ', per.nombre, per.apellido)), ''),
-          emp.nombre_empresa,
-          'Consumidor final'
-        ) AS cliente_nombre,
-        COALESCE(NULLIF(trim(per.rtn), ''), NULLIF(trim(emp.rtn), '')) AS cliente_rtn,
-        COALESCE(p.id_usuario, f.id_usuario) AS id_usuario,
-        u.nombre_usuario,
-        f.id_caja,
-        cj.nombre_caja,
-        cj.codigo_caja,
-        f.id_sesion_caja,
-        UPPER(TRIM(cse_sesion.codigo)) AS caja_sesion_estado_codigo,
-        cse_sesion.nombre AS caja_sesion_estado_nombre,
-        cses.fecha_cierre AS caja_sesion_fecha_cierre,
-        COALESCE((
-          UPPER(TRIM(cse_sesion.codigo)) = 'ABIERTA'
-          AND cses.fecha_cierre IS NULL
-        ), false) AS caja_sesion_abierta,
-        f.efectivo_entregado,
-        f.cambio,
-        f.fecha_hora_facturacion,
-        0::numeric(12,2) AS isv_15,
-        0::numeric(12,2) AS isv_18,
-        f.id_config_facturacion,
-        f.id_rango_cai,
-        f.numero_factura_fiscal,
-        f.facturacion_snapshot,
-        0::numeric(12,2) AS gravado_15,
-        0::numeric(12,2) AS gravado_18,
-        0::numeric(12,2) AS exento,
-        0::numeric(12,2) AS total_isv,
-        fc_info.metodo_pago,
-        fc_info.codigo_transaccion,
-        NULL::varchar AS banco,
-        NULL::numeric AS exonerado,
-        emp_info.nombre_empresa AS nombre_emisor,
-        emp_info.rtn AS rtn_emisor,
-        frc.cai,
-        frc.numero_desde,
-        frc.numero_hasta,
-        frc.fecha_limite_emision,
-        cfg.modo_fiscal,
-        cfg.ancho_ticket_mm,
-        cfg.mostrar_logo_ticket,
-        COALESCE(df_info.total_items, 0) AS total_items,
-        COALESCE(df_info.descuento_total, 0) AS descuento_total
-      FROM facturas f
-      LEFT JOIN pedidos p ON p.id_pedido = f.id_pedido
-      LEFT JOIN estados_pedido ep ON ep.id_estado_pedido = p.id_estado_pedido
-      LEFT JOIN sucursales s ON s.id_sucursal = COALESCE(p.id_sucursal, f.id_sucursal)
-      LEFT JOIN direcciones ds ON ds.id_direccion = s.id_direccion
-      LEFT JOIN telefonos ts ON ts.id_telefono = s.id_telefono
-      LEFT JOIN correos csuc ON csuc.id_correo = s.id_correo
-      LEFT JOIN clientes c ON c.id_cliente = COALESCE(p.id_cliente, f.id_cliente)
-      LEFT JOIN personas per ON per.id_persona = c.id_persona
-      LEFT JOIN empresas emp ON emp.id_empresa = c.id_empresa
-      LEFT JOIN usuarios u ON u.id_usuario = COALESCE(p.id_usuario, f.id_usuario)
-      LEFT JOIN cajas cj ON cj.id_caja = f.id_caja
-      LEFT JOIN cajas_sesiones cses ON cses.id_sesion_caja = f.id_sesion_caja
-      LEFT JOIN cat_cajas_sesiones_estados cse_sesion
-        ON cse_sesion.id_estado_sesion_caja = cses.id_estado_sesion_caja
-      LEFT JOIN LATERAL (
-        SELECT e.nombre_empresa, e.rtn
-        FROM empresas e
-        WHERE COALESCE(e.estado, true) = true
-        ORDER BY e.id_empresa
-        LIMIT 1
-      ) emp_info ON true
-      LEFT JOIN LATERAL (
-        SELECT
-          frc.id_rango_cai,
-          frc.cai,
-          frc.numero_desde,
-          frc.numero_hasta,
-          frc.fecha_limite_emision
-        FROM facturacion_rangos_cai frc
-        WHERE frc.id_sucursal = COALESCE(p.id_sucursal, f.id_sucursal)
-          AND COALESCE(UPPER(TRIM(frc.estado)), 'ACTIVO') IN ('ACTIVO', 'VIGENTE')
-        ORDER BY frc.id_rango_cai DESC
-        LIMIT 1
-      ) frc ON true
-      LEFT JOIN LATERAL (
-        SELECT
-          cfg.modo_fiscal,
-          cfg.ancho_ticket_mm,
-          cfg.mostrar_logo_ticket
-        FROM facturacion_config_sucursal cfg
-        WHERE cfg.id_sucursal = COALESCE(p.id_sucursal, f.id_sucursal)
-          AND COALESCE(cfg.activo, true) = true
-        ORDER BY cfg.id_config DESC
-        LIMIT 1
-      ) cfg ON true
-      LEFT JOIN LATERAL (
-        SELECT
-          STRING_AGG(DISTINCT cmp.nombre, ', ' ORDER BY cmp.nombre) AS metodo_pago,
-          STRING_AGG(
-            DISTINCT NULLIF(TRIM(fc.referencia), ''),
-            ', ' ORDER BY NULLIF(TRIM(fc.referencia), '')
-          ) AS codigo_transaccion
-        FROM facturas_cobros fc
-        INNER JOIN cat_metodos_pago cmp
-          ON cmp.id_metodo_pago = fc.id_metodo_pago
-        WHERE fc.id_factura = f.id_factura
-      ) fc_info ON true
-      LEFT JOIN LATERAL (
-        SELECT
-          SUM(COALESCE(df.cantidad, 0))::int AS total_items,
-          COALESCE(SUM(df.total_detalle), 0)::numeric(12,2) AS subtotal_neto,
-          COALESCE(SUM(d.monto_descuento), 0)::numeric(12,2) AS descuento_total
-        FROM detalle_facturas df
-        LEFT JOIN descuentos d ON d.id_descuento = df.id_descuento
-        WHERE df.id_factura = f.id_factura
-      ) df_info ON true
-      WHERE f.id_factura = $1
-        AND (
-          $2::boolean = false
-          OR (
-            f.fecha_hora_facturacion IS NOT NULL
-            AND f.fecha_hora_facturacion >= ${VENTAS_LIMIT_72H_CUTOFF_SQL}
-          )
-        )
-        AND COALESCE(p.id_sucursal, f.id_sucursal) = ANY($3::int[])
-      LIMIT 1
-    `;
-
-    const headerResult = await pool.query(headerQuery, [
-      idFactura,
-      scope.limitedToLast72Hours,
-      scope.allowedSucursalIds
-    ]);
-    if (headerResult.rowCount === 0) {
-      return res.status(404).json({ error: true, message: 'Venta no encontrada.' });
-    }
-
-    const venta = headerResult.rows[0];
-    const facturacionNormalizada = await normalizarDatosTicketDesdeSnapshot({
-      client: pool,
-      factura: venta
-    });
-    Object.assign(venta, mergeVentaWithFacturacion(venta, facturacionNormalizada));
-    const idUsuarioDetalle = parsePositiveInt(req.user?.id_usuario);
-    const reversiones = idUsuarioDetalle
-      ? await listFacturaReversiones({
-        idFactura: venta.id_factura,
-        idUsuario: idUsuarioDetalle
-      })
-      : [];
-
-    if (venta.id_pedido) {
-      const pedidoItemsResult = await pool.query(
-        `
-          SELECT
-            df.id_detalle_factura AS id_detalle,
-            COALESCE(dfo.id_detalle_pedido, df.id_detalle_pedido::int) AS id_detalle_pedido,
-            CASE
-              WHEN NULLIF(TRIM(dfo.tipo_item), '') IS NOT NULL THEN UPPER(TRIM(dfo.tipo_item))
-              WHEN NULLIF(TRIM(df.tipo_item), '') IS NOT NULL THEN UPPER(TRIM(df.tipo_item))
-              WHEN dp.id_producto IS NOT NULL THEN 'PRODUCTO'
-              WHEN dp.id_combo IS NOT NULL THEN 'COMBO'
-              WHEN dp.id_receta IS NOT NULL THEN 'RECETA'
-              ELSE 'ITEM'
-            END AS tipo_item,
-            COALESCE(dfo.id_producto, df.id_producto, dp.id_producto) AS id_producto,
-            COALESCE(dfo.id_combo, df.id_combo::int, dp.id_combo) AS id_combo,
-            COALESCE(dfo.id_receta, df.id_receta::int, dp.id_receta) AS id_receta,
-            COALESCE(
-              dfo.origen_snapshot->>'nombre_item',
-              df.origen_snapshot->>'nombre_item',
-              prod.nombre_producto,
-              combo.descripcion,
-              rec.nombre_receta,
-              'Item de cocina'
-            ) AS nombre_item,
-            COALESCE(
-              dfo.origen_snapshot->>'nombre_item',
-              df.origen_snapshot->>'nombre_item',
-              prod.nombre_producto,
-              combo.descripcion,
-              rec.nombre_receta,
-              'Item de cocina'
-            ) AS nombre_producto,
-            COALESCE(df.cantidad, 1) AS cantidad,
-            COALESCE(
-              CASE
-                WHEN dp.id_producto IS NOT NULL THEN prod.precio
-                WHEN dp.id_combo IS NOT NULL THEN combo.precio
-                WHEN dp.id_receta IS NOT NULL THEN rec.precio
-                ELSE NULL
-              END,
-              CASE
-                WHEN COALESCE(dp.sub_total_pedido, 0) > 0 THEN COALESCE(dp.sub_total_pedido, 0)
-                ELSE COALESCE(dp.total_pedido, 0)
-              END,
-              0
-            ) AS precio_unitario,
-            COALESCE(df.sub_total, dp.sub_total_pedido, 0) AS sub_total,
-            COALESCE(df.sub_total, dp.sub_total_pedido, 0) AS subtotal_linea,
-            COALESCE(df.total_detalle, dp.total_pedido, COALESCE(dp.sub_total_pedido, 0)) AS total_linea,
-            COALESCE(d.monto_descuento, 0) AS descuento,
-            COALESCE(NULLIF(COALESCE(dfo.origen_snapshot, df.origen_snapshot)->>'descuento_linea', '')::numeric, COALESCE(d.monto_descuento, 0)) AS descuento_linea,
-            COALESCE(NULLIF(COALESCE(dfo.origen_snapshot, df.origen_snapshot)->>'descuento_global', '')::numeric, 0) AS descuento_global,
-            NULL::numeric AS isv_15_linea,
-            NULL::numeric AS isv_18_linea,
-            NULL::numeric AS exento_linea,
-            NULL::numeric AS exonerado_linea,
-            dp.observacion,
-            COALESCE(dfo.origen_snapshot, df.origen_snapshot) AS origen_snapshot
-          FROM detalle_facturas df
-          LEFT JOIN detalle_facturas_origen dfo
-            ON dfo.id_detalle_factura = df.id_detalle_factura
-          LEFT JOIN detalle_pedido dp ON dp.id_detalle_pedido = df.id_detalle_pedido
-          LEFT JOIN productos prod ON prod.id_producto = COALESCE(dfo.id_producto, df.id_producto, dp.id_producto)
-          LEFT JOIN combos combo ON combo.id_combo = COALESCE(dfo.id_combo, df.id_combo::int, dp.id_combo)
-          LEFT JOIN recetas rec ON rec.id_receta = COALESCE(dfo.id_receta, df.id_receta::int, dp.id_receta)
-          LEFT JOIN descuentos d ON d.id_descuento = df.id_descuento
-          WHERE df.id_factura = $1
-          ORDER BY df.id_detalle_factura
-        `,
-        [venta.id_factura]
-      );
-
-      const detalleFacturaExtrasById = await fetchDetalleFacturaExtras(
-        pool,
-        pedidoItemsResult.rows.map((row) => row.id_detalle)
-      );
-      const pedidoItems = buildKitchenSaleDetailItems(pedidoItemsResult.rows).map((item) => ({
-        ...item,
-        extras: detalleFacturaExtrasById.get(Number(item.id_detalle)) || []
-      }));
-      const cuentaDividida = await fetchCuentaDividida(pool, {
-        idFactura: venta.id_factura,
-        idPedido: venta.id_pedido
-      });
-
-      return res.status(200).json({
-        ...venta,
-        numero_venta: resolveVentaNumero(venta),
-        metodo_pago: venta.metodo_pago || null,
-        items: pedidoItems,
-        cuenta_dividida: cuentaDividida,
-        reversiones
-      });
-    }
-
-    const directItemsResult = await pool.query(
-      `
-        SELECT
-          df.id_detalle_factura AS id_detalle,
-          COALESCE(dfo.id_detalle_pedido, df.id_detalle_pedido::int) AS id_detalle_pedido,
-          COALESCE(NULLIF(TRIM(dfo.tipo_item), ''), NULLIF(TRIM(df.tipo_item), ''), 'PRODUCTO') AS tipo_item,
-          COALESCE(dfo.id_producto, df.id_producto) AS id_producto,
-          COALESCE(dfo.id_combo, df.id_combo::int) AS id_combo,
-          COALESCE(dfo.id_receta, df.id_receta::int) AS id_receta,
-          COALESCE(dfo.origen_snapshot->>'nombre_item', df.origen_snapshot->>'nombre_item', p.nombre_producto, 'Producto') AS nombre_item,
-          COALESCE(dfo.origen_snapshot->>'nombre_item', df.origen_snapshot->>'nombre_item', p.nombre_producto, 'Producto') AS nombre_producto,
-          COALESCE(df.cantidad, 1) AS cantidad,
-          COALESCE(df.precio_unitario, p.precio, 0) AS precio_unitario,
-          COALESCE(df.sub_total, 0) AS sub_total,
-          COALESCE(df.sub_total, 0) AS subtotal_linea,
-          COALESCE(df.total_detalle, 0) AS total_linea,
-          COALESCE(d.monto_descuento, 0) AS descuento,
-          COALESCE(NULLIF(COALESCE(dfo.origen_snapshot, df.origen_snapshot)->>'descuento_linea', '')::numeric, COALESCE(d.monto_descuento, 0)) AS descuento_linea,
-          COALESCE(NULLIF(COALESCE(dfo.origen_snapshot, df.origen_snapshot)->>'descuento_global', '')::numeric, 0) AS descuento_global,
-          NULL::numeric AS isv_15_linea,
-          NULL::numeric AS isv_18_linea,
-          NULL::numeric AS exento_linea,
-          NULL::numeric AS exonerado_linea,
-          NULL::varchar(200) AS observacion,
-          COALESCE(dfo.origen_snapshot, df.origen_snapshot) AS origen_snapshot
-        FROM detalle_facturas df
-        LEFT JOIN detalle_facturas_origen dfo
-          ON dfo.id_detalle_factura = df.id_detalle_factura
-        LEFT JOIN productos p ON p.id_producto = COALESCE(dfo.id_producto, df.id_producto)
-        LEFT JOIN descuentos d ON d.id_descuento = df.id_descuento
-        WHERE df.id_factura = $1
-        ORDER BY df.id_detalle_factura
-      `,
-      [venta.id_factura]
-    );
-
-    const detalleFacturaExtrasById = await fetchDetalleFacturaExtras(
-      pool,
-      directItemsResult.rows.map((row) => row.id_detalle)
-    );
-    const directItems = buildDirectSaleDetailItems(directItemsResult.rows).map((item) => ({
-      ...item,
-      extras: detalleFacturaExtrasById.get(Number(item.id_detalle)) || []
-    }));
-    const cuentaDividida = await fetchCuentaDividida(pool, {
-      idFactura: venta.id_factura,
-      idPedido: venta.id_pedido
-    });
-
-    res.status(200).json({
-      ...venta,
-      numero_venta: resolveVentaNumero(venta),
-      metodo_pago: venta.metodo_pago || null,
-      items: directItems,
-      cuenta_dividida: cuentaDividida,
-      reversiones
-    });
-  } catch (err) {
-    console.error('Error al obtener detalle de venta:', err);
-    sendVentasInternalError(res);
-  }
-});
+router.get('/ventas/:id/ticket.pdf', checkPermission(['VENTAS_VER']), getVentaTicketPdfByIdHandler);
+router.get('/ventas/:id/ticket', checkPermission(['VENTAS_VER']), getVentaTicketByIdHandler);
+router.get('/ventas/:id', checkPermission(['VENTAS_VER']), getVentaByIdHandler);
 
 async function listarPedidosPendientesPago(req, res) {
   const parsePaginationInt = (value, defaultValue) => {
@@ -8666,7 +6644,7 @@ async function listarPedidosPendientesPago(req, res) {
     const filters = [
       'UPPER(TRIM(ppc.estado_pago_codigo)) = $1',
       'COALESCE(ppc.monto_pendiente, 0) > 0',
-      `(f.id_factura IS NULL OR EXISTS (
+      `(f.id_factura IS NULL OR COALESCE(ppc.monto_pendiente, 0) > 0 OR EXISTS (
         SELECT 1
         FROM public.ventas_cuenta_divisiones vcd_pending
         WHERE vcd_pending.id_pedido = p.id_pedido
@@ -8793,11 +6771,25 @@ async function listarPedidosPendientesPago(req, res) {
             'total', vcd.total,
             'monto_pagado', vcd.monto_pagado,
             'monto_pendiente', vcd.monto_pendiente,
-            'estado', UPPER(TRIM(vcd.estado))
+            'estado', UPPER(TRIM(vcd.estado)),
+            'items', COALESCE(vdi_info.items, '[]'::jsonb)
           )
           ORDER BY vcd.orden, vcd.id_cuenta_division
         ) AS divisiones
         FROM public.ventas_cuenta_divisiones vcd
+        LEFT JOIN LATERAL (
+          SELECT jsonb_agg(
+            jsonb_build_object(
+              'id_cuenta_division_item', vdi.id_cuenta_division_item,
+              'id_detalle_pedido', vdi.id_detalle_pedido,
+              'nombre_item', vdi.nombre_item_snapshot,
+              'total_linea', vdi.total_linea
+            )
+            ORDER BY vdi.id_cuenta_division_item
+          ) AS items
+          FROM public.ventas_cuenta_division_items vdi
+          WHERE vdi.id_cuenta_division = vcd.id_cuenta_division
+        ) vdi_info ON true
         WHERE vcd.id_pedido = p.id_pedido
       ) vcd_info ON true
     `;
@@ -8942,36 +6934,68 @@ async function listarPedidosPendientesPago(req, res) {
 }
 router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), async (req, res) => {
   const ventasPerf = createVentasPerfTracker();
-  logVentasPerfRoute('POST /ventas/pedidos-pendientes', {
+  const pedidoPendienteRouteStart = ventasPerf.now();
+  const pedidoPendienteRoute = 'POST /ventas/pedidos-pendientes';
+  const pedidoPendienteRpcEnabled = isPedidoPendienteRpcV1Enabled();
+  let pedidoPendientePersistenceMode = 'not_reached';
+  let pedidoPendienteRpcSkipReason = null;
+  let pedidoPendienteTotalRouteMeasured = false;
+  const addPedidoPendienteTotalRoute = () => {
+    if (pedidoPendienteTotalRouteMeasured) return;
+    ventasPerf.add('pedido_pendiente_total_route_ms', pedidoPendienteRouteStart);
+    pedidoPendienteTotalRouteMeasured = true;
+  };
+  logVentasPerfRoute(pedidoPendienteRoute, {
     items_count: Array.isArray(req.body?.items) ? req.body.items.length : 0,
     id_sucursal: parseOptionalPositiveInt(req.body?.id_sucursal) || null
   });
   const ventasPerfContext = {
+    route: pedidoPendienteRoute,
     operation: 'pedido_pendiente',
     id_usuario: null,
     id_sucursal: parseOptionalPositiveInt(req.body?.id_sucursal) || null,
     id_caja: null,
     id_sesion_caja: parseOptionalPositiveInt(req.body?.id_sesion_caja) || null,
-    items_count: Array.isArray(req.body?.items) ? req.body.items.length : 0
+    items_count: Array.isArray(req.body?.items) ? req.body.items.length : 0,
+    rpc_enabled: pedidoPendienteRpcEnabled,
+    cuenta_dividida: hasCuentaDivididaPayload(req.body)
   };
-  const discountIntent = hasDiscountIntentInPayload(req.body);
-  const canApplyDiscount = await requestHasAnyPermission(req, [VENTAS_DESCUENTO_APLICAR_PERMISSION]);
-  if (discountIntent && !canApplyDiscount) {
-    ventasPerf.log({
+  const buildPedidoPendientePerfLogContext = (extra = {}) => {
+    const context = {
       ...ventasPerfContext,
-      status: 403,
-      error_code: 'VENTAS_DESCUENTO_NO_AUTORIZADO'
-    });
-    return res.status(403).json({
-      error: true,
-      code: 'VENTAS_DESCUENTO_NO_AUTORIZADO',
-      message: 'No tienes permiso para aplicar descuentos en ventas.'
-    });
-  }
-
-  const client = await pool.connect();
+      persistence_mode: pedidoPendientePersistenceMode,
+      rpc_skip_reason: pedidoPendienteRpcSkipReason
+    };
+    if (!context.rpc_skip_reason) delete context.rpc_skip_reason;
+    return {
+      ...context,
+      ...extra
+    };
+  };
+  const idempotencyKey = getIdempotencyKey(req);
+  const idempotencyRequestHash = idempotencyKey
+    ? buildIdempotencyRequestHash(req.body)
+    : null;
+  let idempotencyReservation = null;
+  let client = null;
 
   try {
+    const discountIntent = hasDiscountIntentInPayload(req.body);
+    const canApplyDiscount = await requestHasAnyPermission(req, [VENTAS_DESCUENTO_APLICAR_PERMISSION]);
+    if (discountIntent && !canApplyDiscount) {
+      addPedidoPendienteTotalRoute();
+      ventasPerf.log(buildPedidoPendientePerfLogContext({
+        status: 403,
+        error_code: 'VENTAS_DESCUENTO_NO_AUTORIZADO'
+      }));
+      return res.status(403).json({
+        error: true,
+        code: 'VENTAS_DESCUENTO_NO_AUTORIZADO',
+        message: 'No tienes permiso para aplicar descuentos en ventas.'
+      });
+    }
+
+    client = await pool.connect();
     await client.query('BEGIN');
 
     const contextoStart = ventasPerf.now();
@@ -8979,6 +7003,44 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
     const userId = parseOptionalPositiveInt(scope.idUsuario);
     ventasPerfContext.id_usuario = userId || null;
     ventasPerf.add('auth_scope_ms', contextoStart);
+    ventasPerf.add('pedido_pendiente_scope_ms', contextoStart);
+
+    const idempotencyStart = ventasPerf.now();
+    try {
+      idempotencyReservation = await reserveVentasIdempotencyKey({
+        idempotencyKey,
+        operation: 'POST /ventas/pedidos-pendientes',
+        requestHash: idempotencyRequestHash,
+        idUsuario: userId,
+        idSucursal: req.body?.id_sucursal
+      });
+    } finally {
+      ventasPerf.add('pedido_pendiente_idempotency_ms', idempotencyStart);
+    }
+    if (idempotencyReservation.replay) {
+      await client.query('ROLLBACK');
+      addPedidoPendienteTotalRoute();
+      ventasPerf.log(buildPedidoPendientePerfLogContext({ status: idempotencyReservation.httpStatus || 200 }));
+      return res.status(idempotencyReservation.httpStatus || 200).json({
+        ...(isPlainObject(idempotencyReservation.responseBody) ? idempotencyReservation.responseBody : {}),
+        idempotent_replay: true
+      });
+    }
+    if (idempotencyReservation.conflict) {
+      await client.query('ROLLBACK');
+      addPedidoPendienteTotalRoute();
+      ventasPerf.log(buildPedidoPendientePerfLogContext({
+        status: 409,
+        error_code: idempotencyReservation.code
+      }));
+      return res.status(409).json({
+        error: true,
+        code: idempotencyReservation.code,
+        message: idempotencyReservation.code === 'IDEMPOTENCY_KEY_REUSED'
+          ? 'Idempotency-Key ya fue usado con otro payload.'
+          : 'La solicitud ya esta en proceso.'
+      });
+    }
 
     const buildStart = ventasPerf.now();
     const prepared = await buildPedidoPendientePayload({
@@ -8993,26 +7055,78 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
 
     if (!prepared.ok) {
       await client.query('ROLLBACK');
-      ventasPerf.log({
-        ...ventasPerfContext,
+      await saveVentasIdempotencyFailure({
+        reservation: idempotencyReservation,
+        httpStatus: prepared.status,
+        errorCode: prepared.body?.code || null
+      });
+      addPedidoPendienteTotalRoute();
+      ventasPerf.log(buildPedidoPendientePerfLogContext({
         status: prepared.status,
         error_code: prepared.body?.code || null
-      });
+      }));
       return res.status(prepared.status).json(prepared.body);
     }
 
+    const cuentaDivididaPlanStart = ventasPerf.now();
     const pedidoPendiente = prepared.data;
     const cuentaDivisionPlan = buildCuentaDivisionPlan({
       cuentaDividida: req.body?.cuenta_dividida,
       lines: pedidoPendiente.pedido_lines,
       expectedTotal: pedidoPendiente.total
     });
+    ventasPerf.add('pedido_pendiente_cuenta_dividida_plan_ms', cuentaDivididaPlanStart);
     Object.assign(ventasPerfContext, {
       id_sucursal: parseOptionalPositiveInt(pedidoPendiente.id_sucursal),
       id_caja: parseOptionalPositiveInt(pedidoPendiente.id_caja),
       id_sesion_caja: parseOptionalPositiveInt(pedidoPendiente.id_sesion_caja),
       items_count: Array.isArray(pedidoPendiente.pedido_lines) ? pedidoPendiente.pedido_lines.length : 0
     });
+    ventasPerfContext.cuenta_dividida = Boolean(cuentaDivisionPlan);
+
+    const shouldUsePedidoPendienteRpcV1 =
+      pedidoPendienteRpcEnabled
+      && !cuentaDivisionPlan
+      && Array.isArray(pedidoPendiente.pedido_lines)
+      && pedidoPendiente.pedido_lines.length > 0;
+
+    if (shouldUsePedidoPendienteRpcV1) {
+      pedidoPendientePersistenceMode = 'rpc_v1';
+      const rpcResponseBody = await createPedidoPendienteWithRpcV1Transaction({
+        client,
+        pedidoPendiente,
+        perf: ventasPerf
+      });
+      const commitStart = ventasPerf.now();
+      await client.query('COMMIT');
+      ventasPerf.add('commit_ms', commitStart);
+      ventasPerf.add('pedido_pendiente_commit_ms', commitStart);
+
+      const idempotencySuccessStart = ventasPerf.now();
+      await saveVentasIdempotencySuccess({
+        reservation: idempotencyReservation,
+        httpStatus: 201,
+        responseBody: rpcResponseBody,
+        idPedido: rpcResponseBody.id_pedido,
+        idUsuario: userId,
+        idSucursal: pedidoPendiente.id_sucursal
+      }).catch((err) => {
+        console.error('No se pudo guardar resultado idempotente RPC de pedido pendiente:', err);
+      });
+      ventasPerf.add('pedido_pendiente_idempotency_success_ms', idempotencySuccessStart);
+      addPedidoPendienteTotalRoute();
+      ventasPerf.log(buildPedidoPendientePerfLogContext({ status: 201 }));
+      return res.status(201).json(rpcResponseBody);
+    }
+
+    pedidoPendientePersistenceMode = 'legacy';
+    if (cuentaDivisionPlan) {
+      pedidoPendienteRpcSkipReason = 'cuenta_dividida';
+    } else if (!pedidoPendienteRpcEnabled) {
+      pedidoPendienteRpcSkipReason = 'flag_disabled';
+    } else if (!Array.isArray(pedidoPendiente.pedido_lines) || pedidoPendiente.pedido_lines.length === 0) {
+      pedidoPendienteRpcSkipReason = 'no_lines';
+    }
 
     const descuentosStart = ventasPerf.now();
     for (const line of pedidoPendiente.pedido_lines) {
@@ -9084,11 +7198,36 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
     const hasDetallePedidoConfiguracionMenu = await hasColumn(client, 'detalle_pedido', 'configuracion_menu');
     const detalleStart = ventasPerf.now();
     const pedidoLineRefs = [];
-    for (const line of pedidoPendiente.pedido_lines) {
-      const configuracionMenu = buildComplementLineConfig(line);
-      let detallePedidoInsert;
+    const detallePedidoRows = pedidoPendiente.pedido_lines.map((line) => ({
+      line,
+      configuracionMenu: buildComplementLineConfig(line)
+    }));
+
+    if (detallePedidoRows.length > 0) {
+      const detallePedidoParams = [];
+      let detallePedidoValues;
+      let detallePedidoResult;
+
       if (hasDetallePedidoConfiguracionMenu) {
-        detallePedidoInsert = await client.query(
+        detallePedidoValues = detallePedidoRows.map((_, index) => {
+          const base = index * 10;
+          return `($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}, true, $${base + 6}, $${base + 7}, $${base + 8}, $${base + 9}, $${base + 10}::jsonb)`;
+        }).join(', ');
+        for (const { line, configuracionMenu } of detallePedidoRows) {
+          detallePedidoParams.push(
+            line.sub_total,
+            line.total_linea,
+            line.id_producto,
+            idPedido,
+            line.id_descuento,
+            line.id_combo,
+            line.id_receta,
+            line.cantidad,
+            line.observacion,
+            configuracionMenu ? JSON.stringify(configuracionMenu) : null
+          );
+        }
+        detallePedidoResult = await client.query(
           `
             INSERT INTO detalle_pedido (
               sub_total_pedido,
@@ -9099,13 +7238,22 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
               estado,
               id_combo,
               id_receta,
+              cantidad,
               observacion,
               configuracion_menu
             )
-            VALUES ($1, $2, $3, $4, $5, true, $6, $7, $8, $9::jsonb)
+            VALUES ${detallePedidoValues}
             RETURNING id_detalle_pedido
           `,
-          [
+          detallePedidoParams
+        );
+      } else {
+        detallePedidoValues = detallePedidoRows.map((_, index) => {
+          const base = index * 9;
+          return `($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}, true, $${base + 6}, $${base + 7}, $${base + 8}, $${base + 9})`;
+        }).join(', ');
+        for (const { line } of detallePedidoRows) {
+          detallePedidoParams.push(
             line.sub_total,
             line.total_linea,
             line.id_producto,
@@ -9113,12 +7261,11 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
             line.id_descuento,
             line.id_combo,
             line.id_receta,
-            line.observacion,
-            configuracionMenu ? JSON.stringify(configuracionMenu) : null
-          ]
-        );
-      } else {
-        detallePedidoInsert = await client.query(
+            line.cantidad,
+            line.observacion
+          );
+        }
+        detallePedidoResult = await client.query(
           `
             INSERT INTO detalle_pedido (
               sub_total_pedido,
@@ -9129,30 +7276,28 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
               estado,
               id_combo,
               id_receta,
+              cantidad,
               observacion
             )
-            VALUES ($1, $2, $3, $4, $5, true, $6, $7, $8)
+            VALUES ${detallePedidoValues}
             RETURNING id_detalle_pedido
           `,
-          [
-            line.sub_total,
-            line.total_linea,
-            line.id_producto,
-            idPedido,
-            line.id_descuento,
-            line.id_combo,
-            line.id_receta,
-            line.observacion
-          ]
+          detallePedidoParams
         );
       }
-      const idDetallePedido = Number(detallePedidoInsert.rows?.[0]?.id_detalle_pedido || 0);
-      pedidoLineRefs.push({ id_detalle_pedido: idDetallePedido });
-      await insertDetallePedidoExtras({
-        client,
-        idDetallePedido,
-        extras: line.extras_detalle
+
+      detallePedidoRows.forEach((_, index) => {
+        const idDetallePedido = Number(detallePedidoResult.rows?.[index]?.id_detalle_pedido || 0);
+        pedidoLineRefs.push({ id_detalle_pedido: idDetallePedido });
       });
+
+      for (let index = 0; index < detallePedidoRows.length; index += 1) {
+        await insertDetallePedidoExtras({
+          client,
+          idDetallePedido: pedidoLineRefs[index]?.id_detalle_pedido,
+          extras: detallePedidoRows[index].line.extras_detalle
+        });
+      }
     }
     ventasPerf.add('detalle_pedido_ms', detalleStart);
 
@@ -9277,6 +7422,7 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
     const commitStart = ventasPerf.now();
     await client.query('COMMIT');
     ventasPerf.add('commit_ms', commitStart);
+    ventasPerf.add('pedido_pendiente_commit_ms', commitStart);
 
     const responseBody = {
       message: 'Pedido pendiente creado correctamente.',
@@ -9290,15 +7436,39 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
       monto_pendiente: pedidoPendiente.total,
       cuenta_dividida: cuentaDivididaResponse
     };
-    ventasPerf.log({ ...ventasPerfContext, status: 201 });
+    const idempotencySuccessStart = ventasPerf.now();
+    await saveVentasIdempotencySuccess({
+      reservation: idempotencyReservation,
+      httpStatus: 201,
+      responseBody,
+      idPedido,
+      idUsuario: userId,
+      idSucursal: pedidoPendiente.id_sucursal
+    }).catch((err) => {
+      console.error('No se pudo guardar resultado idempotente de pedido pendiente:', err);
+    });
+    ventasPerf.add('pedido_pendiente_idempotency_success_ms', idempotencySuccessStart);
+    addPedidoPendienteTotalRoute();
+    ventasPerf.log(buildPedidoPendientePerfLogContext({ status: 201 }));
     return res.status(201).json(responseBody);
   } catch (err) {
-    await client.query('ROLLBACK');
-    ventasPerf.log({
-      ...ventasPerfContext,
+    if (client) {
+      await client.query('ROLLBACK').catch((rollbackErr) => {
+        console.error('Error al revertir creacion de pedido pendiente:', rollbackErr);
+      });
+    }
+    await saveVentasIdempotencyFailure({
+      reservation: idempotencyReservation,
+      httpStatus: Number.isInteger(err?.httpStatus) ? err.httpStatus : 500,
+      errorCode: err?.code || null
+    }).catch((idempotencyErr) => {
+      console.error('No se pudo marcar fallo idempotente de pedido pendiente:', idempotencyErr);
+    });
+    addPedidoPendienteTotalRoute();
+    ventasPerf.log(buildPedidoPendientePerfLogContext({
       status: Number.isInteger(err?.httpStatus) ? err.httpStatus : 500,
       error_code: err?.code || null
-    });
+    }));
     console.error('Error al crear pedido pendiente:', err);
     if (Number.isInteger(err?.httpStatus) && err.httpStatus >= 400 && err.httpStatus < 500) {
       return res.status(err.httpStatus).json({
@@ -9309,12 +7479,12 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
     }
     return sendVentasInternalError(res, 'No se pudo crear el pedido pendiente.');
   } finally {
-    ventasPerf.logIfMissing({
-      ...ventasPerfContext,
+    addPedidoPendienteTotalRoute();
+    ventasPerf.logIfMissing(buildPedidoPendientePerfLogContext({
       status: res.statusCode || null,
       completion: 'finally'
-    });
-    client.release();
+    }));
+    if (client) client.release();
   }
 });
 router.post('/ventas/pedidos/:id/registrar-pago', checkPermission(['VENTAS_CREAR']), async (req, res) => {
@@ -9421,9 +7591,10 @@ router.post('/ventas/pedidos/:id/registrar-pago', checkPermission(['VENTAS_CREAR
         LEFT JOIN delivery_locked ON true
         LEFT JOIN estado_pagado ON true
       `,
-      [idPedido, PEDIDO_PAGADO_CONFIRMADO_ESTADO_PAGO, Boolean(idCuentaDivisionRequested)]
+      [idPedido, PEDIDO_PAGADO_CONFIRMADO_ESTADO_PAGO, Boolean(idCuentaDivisionRequested || cuentaDivididaSolicitada)]
     );
     const contextoBase = contextoBaseResult.rows?.[0] || {};
+    ventasPerf.add('registrar_pago_base_context_ms', contextoStart);
     const pedido = contextoBase.pedido || null;
     if (!pedido) {
       await client.query('ROLLBACK');
@@ -9436,6 +7607,7 @@ router.post('/ventas/pedidos/:id/registrar-pago', checkPermission(['VENTAS_CREAR
       return res.status(409).json({ error: true, code: 'PEDIDO_PAGO_CONTROL_NO_ENCONTRADO', message: 'El pedido no tiene control de pago pendiente.' });
     }
 
+    const cuentaDivididaStart = ventasPerf.now();
     let cuentaDivisionPago = null;
     if (idCuentaDivisionRequested) {
       const cuentaDivisionResult = await client.query(
@@ -9506,6 +7678,8 @@ router.post('/ventas/pedidos/:id/registrar-pago', checkPermission(['VENTAS_CREAR
       return res.status(409).json({ error: true, code: 'PEDIDO_FACTURA_EXISTENTE', message: 'El pedido ya tiene una factura asociada.' });
     }
 
+    const hasDetallePedidoConfiguracionMenu = await hasColumn(client, 'detalle_pedido', 'configuracion_menu');
+    const detallePedidoStart = ventasPerf.now();
     const detallePedidoResult = cuentaDivisionPago
       ? await client.query(
         `
@@ -9530,6 +7704,7 @@ router.post('/ventas/pedidos/:id/registrar-pago', checkPermission(['VENTAS_CREAR
             dp.id_combo,
             dp.id_receta,
             dp.observacion,
+            ${hasDetallePedidoConfiguracionMenu ? 'dp.configuracion_menu,' : 'NULL::jsonb AS configuracion_menu,'}
             COALESCE(prod.nombre_producto, combo.nombre_combo, combo.descripcion, rec.nombre_receta, 'Item de pedido') AS nombre_item,
             COALESCE(prod.precio, combo.precio, rec.precio, NULL) AS precio_unitario,
             dis.division_item_count
@@ -9558,6 +7733,7 @@ router.post('/ventas/pedidos/:id/registrar-pago', checkPermission(['VENTAS_CREAR
             dp.id_combo,
             dp.id_receta,
             dp.observacion,
+            ${hasDetallePedidoConfiguracionMenu ? 'dp.configuracion_menu,' : 'NULL::jsonb AS configuracion_menu,'}
             COALESCE(prod.nombre_producto, combo.nombre_combo, combo.descripcion, rec.nombre_receta, 'Item de pedido') AS nombre_item,
             COALESCE(prod.precio, combo.precio, rec.precio, NULL) AS precio_unitario
           FROM public.detalle_pedido dp
@@ -9571,6 +7747,7 @@ router.post('/ventas/pedidos/:id/registrar-pago', checkPermission(['VENTAS_CREAR
         `,
         [idPedido]
       );
+    ventasPerf.add('registrar_pago_detalle_pedido_ms', detallePedidoStart);
     if (detallePedidoResult.rowCount === 0) {
       await client.query('ROLLBACK');
       return cuentaDivisionPago
@@ -9602,25 +7779,56 @@ router.post('/ventas/pedidos/:id/registrar-pago', checkPermission(['VENTAS_CREAR
           message: 'Este pedido tiene cuenta dividida. Debes enviar id_cuenta_division para cobrar una subcuenta.'
         });
       }
-      if (divisionesExistentesResult.rowCount > 0 && cuentaDivididaSolicitada) {
-        await client.query('ROLLBACK');
-        return res.status(409).json({
-          error: true,
-          code: 'CUENTA_DIVIDIDA_YA_EXISTE',
-          message: 'Este pedido ya tiene cuenta dividida registrada.'
-        });
-      }
       if (cuentaDivididaSolicitada) {
         detallePedidoExtrasByIdCache = await fetchDetallePedidoExtras(
           client,
           detallePedidoResult.rows.map((row) => row.id_detalle_pedido)
         );
-        const divisionLines = detallePedidoResult.rows.map((row) => {
+        let detallePedidoRowsDisponibles = detallePedidoResult.rows;
+        if (divisionesExistentesResult.rowCount > 0) {
+          const existingDivisionIds = divisionesExistentesResult.rows
+            .map((row) => parseOptionalPositiveInt(row.id_cuenta_division))
+            .filter(Boolean);
+          const assignedItemsResult = existingDivisionIds.length
+            ? await client.query(
+              `
+                SELECT DISTINCT id_detalle_pedido
+                FROM public.ventas_cuenta_division_items
+                WHERE id_cuenta_division = ANY($1::bigint[])
+                  AND id_detalle_pedido IS NOT NULL
+              `,
+              [existingDivisionIds]
+            )
+            : { rows: [] };
+          const assignedDetalleIds = new Set(
+            assignedItemsResult.rows
+              .map((row) => parseOptionalPositiveInt(row.id_detalle_pedido))
+              .filter(Boolean)
+          );
+          detallePedidoRowsDisponibles = detallePedidoResult.rows.filter((row) => (
+            !assignedDetalleIds.has(Number(row.id_detalle_pedido))
+          ));
+        }
+        if (!detallePedidoRowsDisponibles.length) {
+          await client.query('ROLLBACK');
+          return res.status(409).json({
+            error: true,
+            code: 'CUENTA_DIVIDIDA_SIN_LINEAS_DISPONIBLES',
+            message: 'No quedan lineas disponibles para agregar otra persona.'
+          });
+        }
+        const divisionLines = detallePedidoRowsDisponibles.map((row) => {
           const idProducto = parseOptionalPositiveInt(row.id_producto);
           const idReceta = parseOptionalPositiveInt(row.id_receta);
           const idCombo = parseOptionalPositiveInt(row.id_combo);
           const subTotal = roundMoney(row.sub_total_pedido);
           const totalLinea = roundMoney(row.total_pedido ?? row.sub_total_pedido);
+          const detalleExtras = detallePedidoExtrasByIdCache.get(Number(row.id_detalle_pedido)) || [];
+          const extrasSubtotalPersistido = roundMoney(detalleExtras.reduce((sum, extra) => sum + Number(extra.subtotal || 0), 0));
+          const extrasSubtotal = extrasSubtotalPersistido > 0
+            ? extrasSubtotalPersistido
+            : Math.max(roundMoney(totalLinea - subTotal), 0);
+          const descuentoLinea = Math.max(roundMoney(subTotal + extrasSubtotal - totalLinea), 0);
           const precioBase = roundMoney(row.precio_unitario || (subTotal > 0 ? subTotal : totalLinea));
           const cantidad = inferKitchenItemQuantity(subTotal, precioBase);
           return {
@@ -9634,17 +7842,20 @@ router.post('/ventas/pedidos/:id/registrar-pago', checkPermission(['VENTAS_CREAR
             precio_unitario: precioBase,
             base_sub_total: subTotal,
             sub_total: subTotal,
-            subtotal_extras: 0,
-            descuento: roundMoney(subTotal - totalLinea),
+            subtotal_extras: extrasSubtotal,
+            descuento: descuentoLinea,
             total_linea: totalLinea,
             observacion: row.observacion || null,
-            extras_detalle: detallePedidoExtrasByIdCache.get(Number(row.id_detalle_pedido)) || []
+            extras_detalle: detalleExtras,
+            complementos_detalle: normalizeComplementosFromMenuConfig(row.configuracion_menu),
+            configuracion_menu: row.configuracion_menu || null
           };
         });
         const cuentaDivisionPlan = buildCuentaDivisionPlan({
           cuentaDividida: req.body?.cuenta_dividida,
           lines: divisionLines,
-          expectedTotal: roundMoney(pedido.total || pagoControl.monto_pendiente)
+          expectedTotal: roundMoney(pedido.total || pagoControl.monto_pendiente),
+          allowPartial: true
         });
         const persistedDivisions = await persistCuentaDividida({
           client,
@@ -9664,6 +7875,7 @@ router.post('/ventas/pedidos/:id/registrar-pago', checkPermission(['VENTAS_CREAR
         }
       }
     }
+    ventasPerf.add('registrar_pago_cuenta_dividida_ms', cuentaDivididaStart);
 
     let detallePedidoRowsFacturar = detallePedidoResult.rows;
     if (cuentaDivisionPago) {
@@ -9698,6 +7910,7 @@ router.post('/ventas/pedidos/:id/registrar-pago', checkPermission(['VENTAS_CREAR
     }
     ventasPerfContext.items_count = detallePedidoRowsFacturar.length;
 
+    const scopeSessionStart = ventasPerf.now();
     const scope = await resolveRequestUserSucursalScope(req, client);
     const userId = parseOptionalPositiveInt(scope.idUsuario);
     ventasPerfContext.id_usuario = userId || null;
@@ -9735,6 +7948,7 @@ router.post('/ventas/pedidos/:id/registrar-pago', checkPermission(['VENTAS_CREAR
           : 'Debe abrir o participar en una sesion de caja activa para registrar el pago.'
       });
     }
+    ventasPerf.add('registrar_pago_scope_session_ms', scopeSessionStart);
 
     const metodoPago = await resolveMetodoPagoRegistroPedido(client, {
       idMetodoPago: req.body?.id_metodo_pago,
@@ -9949,6 +8163,7 @@ router.post('/ventas/pedidos/:id/registrar-pago', checkPermission(['VENTAS_CREAR
       const divisionSummary = await client.query(
         `
           SELECT
+            COALESCE(SUM(total), 0)::numeric(14,2) AS total_dividido,
             COALESCE(SUM(monto_pagado), 0)::numeric(14,2) AS monto_pagado,
             COALESCE(SUM(monto_pendiente), 0)::numeric(14,2) AS monto_pendiente,
             COUNT(*) FILTER (WHERE UPPER(TRIM(estado)) = 'PENDIENTE')::int AS pendientes
@@ -9958,9 +8173,13 @@ router.post('/ventas/pedidos/:id/registrar-pago', checkPermission(['VENTAS_CREAR
         [idPedido]
       );
       const summary = divisionSummary.rows?.[0] || {};
+      const totalDividido = roundMoney(summary.total_dividido);
+      const montoPendienteSinAsignar = Math.max(roundMoney(totalPedido - totalDividido), 0);
       montoPagadoRespuesta = roundMoney(summary.monto_pagado);
-      montoPendienteRespuesta = roundMoney(summary.monto_pendiente);
-      pedidoPagadoCompleto = Number(summary.pendientes || 0) === 0 && montoPendienteRespuesta <= 0.05;
+      montoPendienteRespuesta = roundMoney(Number(summary.monto_pendiente || 0) + montoPendienteSinAsignar);
+      pedidoPagadoCompleto = Number(summary.pendientes || 0) === 0
+        && montoPendienteRespuesta <= 0.05
+        && Math.abs(totalDividido - totalPedido) <= 0.05;
       estadoPagoRespuesta = pedidoPagadoCompleto ? PEDIDO_PAGADO_CONFIRMADO_ESTADO_PAGO : PEDIDO_PENDIENTE_ESTADO_PAGO;
 
       await client.query(
@@ -10336,8 +8555,8 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
 
       if (hasDetallePedidoConfiguracionMenu) {
         detallePedidoValues = detallePedidoRows.map((_, index) => {
-          const base = index * 9;
-          return `($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}, true, $${base + 6}, $${base + 7}, $${base + 8}, $${base + 9}::jsonb)`;
+          const base = index * 10;
+          return `($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}, true, $${base + 6}, $${base + 7}, $${base + 8}, $${base + 9}, $${base + 10}::jsonb)`;
         }).join(', ');
         for (const { line, configuracionMenu } of detallePedidoRows) {
           detallePedidoParams.push(
@@ -10348,6 +8567,7 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
             line.id_descuento,
             line.id_combo,
             line.id_receta,
+            line.cantidad,
             line.observacion,
             configuracionMenu ? JSON.stringify(configuracionMenu) : null
           );
@@ -10363,6 +8583,7 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
               estado,
               id_combo,
               id_receta,
+              cantidad,
               observacion,
               configuracion_menu
             )
@@ -10373,8 +8594,8 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
         );
       } else {
         detallePedidoValues = detallePedidoRows.map((_, index) => {
-          const base = index * 8;
-          return `($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}, true, $${base + 6}, $${base + 7}, $${base + 8})`;
+          const base = index * 9;
+          return `($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}, true, $${base + 6}, $${base + 7}, $${base + 8}, $${base + 9})`;
         }).join(', ');
         for (const { line } of detallePedidoRows) {
           detallePedidoParams.push(
@@ -10385,6 +8606,7 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
             line.id_descuento,
             line.id_combo,
             line.id_receta,
+            line.cantidad,
             line.observacion
           );
         }
@@ -10399,6 +8621,7 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
               estado,
               id_combo,
               id_receta,
+              cantidad,
               observacion
             )
             VALUES ${detallePedidoValues}

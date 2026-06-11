@@ -15,6 +15,9 @@ export const SUCURSALES_UPLOADS_SUBDIR = 'sucursales';
 export const CARRUSEL_UPLOADS_SUBDIR = 'carrusel';
 export const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
 export const MAX_IMAGE_JSON_LIMIT = '10mb';
+export const MAX_FACTURACION_LOGO_BYTES = 512 * 1024;
+export const FACTURACION_LOGO_MAX_DIMENSION_PX = 320;
+export const FACTURACION_LOGO_RETRY_DIMENSION_PX = 220;
 
 // NEW: configuracion de Supabase Storage.
 export const SUPABASE_ASSETS_BUCKET = 'jonnys-assets'; // Publico
@@ -62,7 +65,12 @@ export const buildAbsolutePublicUrl = (req, rawUrl) => {
 
   // Si la URL empieza con el prefijo de supabase storage publico (ej: jonnys-assets/)
   if (normalized.startsWith(`${SUPABASE_ASSETS_BUCKET}/`)) {
-    const supabaseUrl = String(process.env.SUPABASE_URL || '').trim().replace(/\/+$/, '');
+    const supabaseUrl = String(
+      process.env.SUPABASE_URL ||
+      process.env.PUBLIC_SUPABASE_URL ||
+      process.env.SUPABASE_PUBLIC_URL ||
+      ''
+    ).trim().replace(/\/+$/, '');
     if (supabaseUrl) {
       return `${supabaseUrl}/storage/v1/object/public/${normalized}`;
     }

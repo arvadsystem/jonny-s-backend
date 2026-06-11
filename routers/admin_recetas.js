@@ -1,16 +1,7 @@
 import express from 'express';
-import crypto from 'crypto';
 import pool from '../config/db-connection.js';
 import { checkPermission } from '../middleware/checkPermission.js';
-import { supabase } from '../services/supabaseClient.js';
-import {
-  ALLOWED_MIME_TYPES_BY_BUCKET,
-  MAX_FILE_BYTES_BY_BUCKET,
-  MAX_IMAGE_BYTES,
-  SUPABASE_ASSETS_BUCKET,
-  buildAbsolutePublicUrl,
-  detectFileMimeTypeFromBuffer
-} from '../utils/uploads.js';
+import { buildAbsolutePublicUrl } from '../utils/uploads.js';
 import {
   actualizarCampoReceta,
   esEnteroPositivo,
@@ -26,6 +17,23 @@ import {
   validarEstructuraPayloadReceta,
   validarReglasNegocioYFks
 } from './admin_recetas_helpers.js';
+import {
+  autoPublishNewRecipe,
+  moveRecipePublicationToMenu
+} from '../services/menuAutoPublicationService.js';
+import {
+  isCatalogoMaestroReadsEnabled,
+  isCatalogoMaestroViewMissingError,
+  logCatalogoMaestroViewMissing,
+  sendCatalogoMaestroViewMissingResponse
+} from '../services/catalogoMaestroReadService.js';
+import {
+  fetchCatalogoInsumosMaestros,
+  fetchDetalleRecetaInsumosMaestros,
+  getRecetaInsumosMaestrosErrorResponse,
+  isRecetaInsumosMaestrosControlledError,
+  normalizeDetalleRecetaInsumosMaestros
+} from '../services/recetaInsumosMaestrosService.js';
 
 const router = express.Router();
 // AM: transicion segura a permisos granulares sin romper el acceso actual mientras se alinea BD/roles.
@@ -33,8 +41,17 @@ const MENU_RECETAS_VIEW_PERMISSIONS = ['MENU_RECETAS_VER', 'MENU_VER'];
 const MENU_RECETAS_CREATE_PERMISSIONS = ['MENU_RECETAS_CREAR', 'MENU_VER'];
 const MENU_RECETAS_EDIT_PERMISSIONS = ['MENU_RECETAS_EDITAR', 'MENU_VER'];
 const MENU_RECETAS_STATE_PERMISSIONS = ['MENU_RECETAS_ESTADO_CAMBIAR', 'MENU_VER'];
-const MENU_RECETAS_UPLOADS_SUBDIR = 'menu/recetas';
-const BASE64_BODY_REGEX = /^[A-Za-z0-9+/]+={0,2}$/;
+const RECETAS_IMAGE_CONTRACT_MESSAGE =
+  'Las imagenes de recetas deben subirse primero mediante POST /archivos y luego enviar id_archivo.';
+const LEGACY_RECIPE_IMAGE_FIELDS = [
+  'imagen_data_url',
+  'imagen_base64',
+  'data_url',
+  'base64',
+  'imagenDataUrl',
+  'imagenBase64',
+  'dataUrl'
+];
 
 // Seguridad: el actor se resuelve siempre desde el token autenticado.
 const resolveActorUserId = (req) => {
@@ -42,158 +59,48 @@ const resolveActorUserId = (req) => {
   return esEnteroPositivo(parsed) ? parsed : null;
 };
 
-const toSafeFileBaseName = (value) => {
-  const sanitized = String(value || '')
-    .trim()
-    .toLowerCase()
-    .replace(/[^a-z0-9\s-]/g, '')
-    .replace(/\s+/g, '-')
-    .replace(/-+/g, '-')
-    .replace(/^-|-$/g, '');
-  return sanitized || 'receta';
+const hasValue = (value) => {
+  if (value === undefined || value === null) return false;
+  if (typeof value === 'string') return value.trim().length > 0;
+  return true;
 };
 
-const ensureSupabaseAssetsBucket = async () => {
-  const { data: existingBucket, error: getBucketError } = await supabase.storage.getBucket(SUPABASE_ASSETS_BUCKET);
-  if (existingBucket && !getBucketError) return;
+const hasLegacyEmbeddedImagePayload = (payload) =>
+  LEGACY_RECIPE_IMAGE_FIELDS.some((field) => hasValue(payload?.[field]));
 
-  const notFound =
-    getBucketError &&
-    (Number(getBucketError?.statusCode || getBucketError?.status || 0) === 404 ||
-      /not\s*found|does\s*not\s*exist/i.test(String(getBucketError?.message || '')));
-
-  if (getBucketError && !notFound) {
-    throw new Error('No se pudo verificar el bucket de imagenes.');
-  }
-
-  const { error: createBucketError } = await supabase.storage.createBucket(SUPABASE_ASSETS_BUCKET, {
-    public: true,
-    fileSizeLimit: MAX_FILE_BYTES_BY_BUCKET[SUPABASE_ASSETS_BUCKET],
-    allowedMimeTypes: Object.keys(ALLOWED_MIME_TYPES_BY_BUCKET[SUPABASE_ASSETS_BUCKET] || {})
-  });
-  if (createBucketError && !/already\s*exists|duplicate/i.test(String(createBucketError?.message || ''))) {
-    throw new Error('No se pudo crear el bucket de imagenes.');
-  }
-};
-
-const parseRecipeImagePayload = (payload) => {
-  const rawDataUrl =
-    payload?.imagen_data_url ??
-    payload?.imagenDataUrl ??
-    payload?.data_url ??
-    payload?.dataUrl ??
-    null;
-  const rawBase64 = payload?.imagen_base64 ?? payload?.imagenBase64 ?? payload?.base64 ?? null;
-  const rawMime = payload?.mime_type ?? payload?.mimeType ?? payload?.tipo_archivo ?? null;
-  const rawOriginalName = payload?.nombre_original ?? payload?.nombreOriginal ?? null;
-
-  const dataUrl = typeof rawDataUrl === 'string' ? rawDataUrl.trim() : '';
-  if (dataUrl) {
-    const match = dataUrl.match(/^data:(image\/(?:png|jpe?g|webp));base64,([A-Za-z0-9+/=]+)$/i);
-    if (!match) {
-      return { ok: false, status: 400, message: 'La imagen debe enviarse en formato data URL base64 valido.' };
+const rejectLegacyEmbeddedImagePayload = (payload) => {
+  if (!hasLegacyEmbeddedImagePayload(payload)) return null;
+  return {
+    status: 400,
+    body: {
+      error: true,
+      message: RECETAS_IMAGE_CONTRACT_MESSAGE
     }
-    return {
-      ok: true,
-      hasImage: true,
-      mimeType: String(match[1] || '').trim().toLowerCase(),
-      base64Body: String(match[2] || '').trim(),
-      nombreOriginal: String(rawOriginalName || '').trim()
-    };
-  }
-
-  const base64Body = typeof rawBase64 === 'string' ? rawBase64.trim() : '';
-  if (!base64Body) {
-    return { ok: true, hasImage: false, mimeType: '', base64Body: '', nombreOriginal: '' };
-  }
-
-  return {
-    ok: true,
-    hasImage: true,
-    mimeType: String(rawMime || '').trim().toLowerCase(),
-    base64Body,
-    nombreOriginal: String(rawOriginalName || '').trim()
   };
 };
 
-const decodeRecipeImageBase64 = (base64Body, maxBytes = MAX_IMAGE_BYTES) => {
-  const normalized = String(base64Body || '').replace(/\s+/g, '');
-  if (!normalized || normalized.length % 4 !== 0 || !BASE64_BODY_REGEX.test(normalized)) {
-    return { ok: false, status: 400, message: 'El contenido base64 de la imagen no es valido.' };
+const shouldUseCatalogoMaestroInsumos = () => isCatalogoMaestroReadsEnabled();
+
+const sendRecetaInsumosMaestrosError = (res, err, context) => {
+  if (isCatalogoMaestroViewMissingError(err)) {
+    logCatalogoMaestroViewMissing(context, err);
+    return sendCatalogoMaestroViewMissingResponse(res);
   }
 
-  const buffer = Buffer.from(normalized, 'base64');
-  if (!Buffer.isBuffer(buffer) || buffer.length === 0) {
-    return { ok: false, status: 400, message: 'La imagen enviada no contiene datos validos.' };
+  if (isRecetaInsumosMaestrosControlledError(err)) {
+    const response = getRecetaInsumosMaestrosErrorResponse(err);
+    if (response.body?.code === 'CATALOGO_MAESTRO_VIEW_MISSING') {
+      console.error(`${context}: CATALOGO_MAESTRO_VIEW_MISSING`, err.cause?.message || err.message);
+    }
+    return res.status(response.status).json(response.body);
   }
-  if (buffer.length > maxBytes) {
-    return { ok: false, status: 400, message: 'La imagen supera el limite permitido de 5 MB.' };
-  }
-  return { ok: true, buffer };
+
+  return null;
 };
 
-const uploadRecipeImageAndRegisterArchivo = async ({ req, imagePayload, nombreReceta, idUsuario, client }) => {
-  const allowedMimes = ALLOWED_MIME_TYPES_BY_BUCKET[SUPABASE_ASSETS_BUCKET] || {};
-  const decoded = decodeRecipeImageBase64(
-    imagePayload.base64Body,
-    MAX_FILE_BYTES_BY_BUCKET[SUPABASE_ASSETS_BUCKET] || MAX_IMAGE_BYTES
-  );
-  if (!decoded.ok) {
-    return decoded;
-  }
-
-  const detectedMime = detectFileMimeTypeFromBuffer(decoded.buffer);
-  const effectiveMime = (detectedMime || imagePayload.mimeType || '').toLowerCase();
-  if (!effectiveMime || !Object.prototype.hasOwnProperty.call(allowedMimes, effectiveMime)) {
-    return { ok: false, status: 400, message: 'Solo se permiten imagenes JPG, PNG o WEBP.' };
-  }
-
-  await ensureSupabaseAssetsBucket();
-
-  const extension = allowedMimes[effectiveMime];
-  const safeOriginalName = toSafeFileBaseName(imagePayload.nombreOriginal || nombreReceta || 'receta');
-  const uniqueFileName = `${safeOriginalName}-${Date.now()}-${crypto.randomUUID().slice(0, 8)}.${extension}`;
-  const storagePath = `${MENU_RECETAS_UPLOADS_SUBDIR}/${uniqueFileName}`;
-
-  const { error: uploadError } = await supabase.storage
-    .from(SUPABASE_ASSETS_BUCKET)
-    .upload(storagePath, decoded.buffer, {
-      contentType: effectiveMime,
-      cacheControl: '3600',
-      upsert: false
-    });
-  if (uploadError) {
-    return { ok: false, status: 500, message: 'No se pudo subir la imagen de la receta.' };
-  }
-
-  const dbPath = `${SUPABASE_ASSETS_BUCKET}/${storagePath}`;
-  const insertResult = await client.query(
-    `
-      INSERT INTO archivos (
-        nombre_original,
-        url_publica,
-        tipo_archivo,
-        tamano_bytes,
-        estado,
-        id_usuario
-      ) VALUES ($1, $2, $3, $4, true, $5)
-      RETURNING id_archivo
-    `,
-    [safeOriginalName, dbPath, effectiveMime, decoded.buffer.length, idUsuario]
-  );
-
-  const idArchivo = Number(insertResult.rows?.[0]?.id_archivo || 0);
-  if (!esEnteroPositivo(idArchivo)) {
-    await supabase.storage.from(SUPABASE_ASSETS_BUCKET).remove([storagePath]).catch(() => null);
-    return { ok: false, status: 500, message: 'No se pudo registrar la imagen de la receta.' };
-  }
-
-  return {
-    ok: true,
-    idArchivo,
-    storagePath: dbPath,
-    urlPublica: buildAbsolutePublicUrl(req, dbPath)
-  };
+const normalizeDetalleForCurrentMode = async (client, detalle) => {
+  if (!shouldUseCatalogoMaestroInsumos()) return detalle;
+  return normalizeDetalleRecetaInsumosMaestros(client, detalle);
 };
 
 const parsePositiveNumber = (value) => {
@@ -284,6 +191,108 @@ const validarDetalleRecetaFks = async (client, detalle) => {
   return { ok: true };
 };
 
+const buildUnidadConflictoMessage = (nombreInsumo, idInsumo) => {
+  const safeName = String(nombreInsumo || '').trim();
+  if (safeName) {
+    return `El insumo "${safeName}" ya tiene una unidad definida diferente. Actualiza el detalle con la unidad correcta.`;
+  }
+  return `El insumo ${idInsumo} ya tiene una unidad definida diferente. Actualiza el detalle con la unidad correcta.`;
+};
+
+const sincronizarUnidadesInsumosDesdeDetalle = async (client, detalle) => {
+  const insumosIds = [...new Set(detalle.map((item) => item.id_insumo))];
+  const snapshotResult = await client.query(
+    `
+      SELECT id_insumo, nombre_insumo, id_unidad_medida
+      FROM insumos
+      WHERE id_insumo = ANY($1::int[])
+    `,
+    [insumosIds]
+  );
+  const snapshotMap = new Map(
+    snapshotResult.rows.map((row) => [
+      Number(row.id_insumo),
+      {
+        nombre_insumo: String(row?.nombre_insumo || '').trim(),
+        id_unidad_medida:
+          row?.id_unidad_medida === null || row?.id_unidad_medida === undefined
+            ? null
+            : Number(row.id_unidad_medida)
+      }
+    ])
+  );
+
+  for (const item of detalle) {
+    const current = snapshotMap.get(item.id_insumo);
+    if (!current) {
+      return { ok: false, status: 400, message: `El insumo ${item.id_insumo} no existe.` };
+    }
+
+    if (esEnteroPositivo(current.id_unidad_medida)) {
+      if (current.id_unidad_medida !== item.id_unidad_medida) {
+        return {
+          ok: false,
+          status: 409,
+          message: buildUnidadConflictoMessage(current.nombre_insumo, item.id_insumo)
+        };
+      }
+      continue;
+    }
+
+    const updateResult = await client.query(
+      `
+        UPDATE insumos
+        SET id_unidad_medida = $1
+        WHERE id_insumo = $2
+          AND id_unidad_medida IS NULL
+      `,
+      [item.id_unidad_medida, item.id_insumo]
+    );
+
+    if (updateResult.rowCount === 1) {
+      snapshotMap.set(item.id_insumo, {
+        ...current,
+        id_unidad_medida: item.id_unidad_medida
+      });
+      continue;
+    }
+
+    const refreshedResult = await client.query(
+      `
+        SELECT nombre_insumo, id_unidad_medida
+        FROM insumos
+        WHERE id_insumo = $1
+        LIMIT 1
+      `,
+      [item.id_insumo]
+    );
+    const refreshed = refreshedResult.rows?.[0] || null;
+    const refreshedUnidadId =
+      refreshed?.id_unidad_medida === null || refreshed?.id_unidad_medida === undefined
+        ? null
+        : Number(refreshed.id_unidad_medida);
+
+    if (esEnteroPositivo(refreshedUnidadId) && refreshedUnidadId === item.id_unidad_medida) {
+      snapshotMap.set(item.id_insumo, {
+        nombre_insumo: String(refreshed?.nombre_insumo || current.nombre_insumo || '').trim(),
+        id_unidad_medida: refreshedUnidadId
+      });
+      continue;
+    }
+
+    return {
+      ok: false,
+      status: 409,
+      message: buildUnidadConflictoMessage(
+        refreshed?.nombre_insumo || current.nombre_insumo,
+        item.id_insumo
+      )
+    };
+  }
+
+  return { ok: true };
+};
+
 const reemplazarDetalleReceta = async (client, idReceta, detalle) => {
   await client.query('UPDATE detalle_recetas SET estado = false WHERE id_receta = $1', [idReceta]);
 
@@ -353,26 +362,42 @@ router.get('/', checkPermission(MENU_RECETAS_VIEW_PERMISSIONS), async (req, res)
 // GET: catalogo de insumos activos para armar detalle de receta.
 router.get('/catalogos/insumos', checkPermission(MENU_RECETAS_VIEW_PERMISSIONS), async (req, res) => {
   try {
+    if (shouldUseCatalogoMaestroInsumos()) {
+      const rows = await fetchCatalogoInsumosMaestros(pool);
+      return res.status(200).json(rows);
+    }
+
     const result = await pool.query(
       `
         SELECT
           i.id_insumo,
           i.nombre_insumo,
+          i.id_categoria_insumo,
+          ci.nombre_categoria,
+          i.id_almacen,
+          a.nombre AS nombre_almacen,
           i.id_unidad_medida,
           um.nombre AS unidad_nombre,
+          um.simbolo AS unidad_abreviatura,
           um.simbolo AS unidad_simbolo,
           i.cantidad,
           i.stock_minimo
         FROM insumos i
+        LEFT JOIN categorias_insumos ci
+          ON ci.id_categoria_insumo = i.id_categoria_insumo
+        LEFT JOIN almacenes a
+          ON a.id_almacen = i.id_almacen
         LEFT JOIN unidades_medida um
           ON um.id_unidad_medida = i.id_unidad_medida
         WHERE COALESCE(i.estado, true) = true
-        ORDER BY i.nombre_insumo ASC, i.id_insumo ASC
+        ORDER BY ci.nombre_categoria ASC NULLS LAST, i.nombre_insumo ASC, a.nombre ASC NULLS LAST, i.id_insumo ASC
       `
     );
 
     return res.status(200).json(result.rows || []);
   } catch (err) {
+    const handled = sendRecetaInsumosMaestrosError(res, err, 'GET /admin/recetas/catalogos/insumos');
+    if (handled) return handled;
     console.error('Error al obtener catalogo de insumos para recetas:', err.message);
     return res.status(500).json({ error: true, message: getSafeServerErrorMessage(err) });
   }
@@ -389,6 +414,11 @@ router.get('/:id_receta/detalle', checkPermission(MENU_RECETAS_VIEW_PERMISSIONS)
     const recetaExiste = await existeRecetaPorId(idReceta);
     if (!recetaExiste) {
       return res.status(404).json({ error: true, message: 'Receta no encontrada.' });
+    }
+
+    if (shouldUseCatalogoMaestroInsumos()) {
+      const detalle = await fetchDetalleRecetaInsumosMaestros(pool, idReceta);
+      return res.status(200).json(detalle);
     }
 
     const result = await pool.query(
@@ -417,6 +447,8 @@ router.get('/:id_receta/detalle', checkPermission(MENU_RECETAS_VIEW_PERMISSIONS)
 
     return res.status(200).json(result.rows || []);
   } catch (err) {
+    const handled = sendRecetaInsumosMaestrosError(res, err, 'GET /admin/recetas/:id_receta/detalle');
+    if (handled) return handled;
     console.error('Error al obtener detalle de receta admin:', err.message);
     return res.status(500).json({ error: true, message: getSafeServerErrorMessage(err) });
   }
@@ -433,6 +465,24 @@ router.get('/:id_receta/contexto-edicion', checkPermission(MENU_RECETAS_VIEW_PER
     const receta = await obtenerRecetaPorId(idReceta);
     if (!receta) {
       return res.status(404).json({ error: true, message: 'Receta no encontrada.' });
+    }
+
+    if (shouldUseCatalogoMaestroInsumos()) {
+      const [detalle, insumosCatalogo] = await Promise.all([
+        fetchDetalleRecetaInsumosMaestros(pool, idReceta),
+        fetchCatalogoInsumosMaestros(pool)
+      ]);
+
+      return res.status(200).json({
+        receta: {
+          ...receta,
+          url_imagen_publica: buildAbsolutePublicUrl(req, receta?.url_imagen_publica || null)
+        },
+        detalle_receta: detalle,
+        catalogos: {
+          insumos: insumosCatalogo
+        }
+      });
     }
 
     const [detalleResult, insumosCatalogResult] = await Promise.all([
@@ -464,16 +514,25 @@ router.get('/:id_receta/contexto-edicion', checkPermission(MENU_RECETAS_VIEW_PER
           SELECT
             i.id_insumo,
             i.nombre_insumo,
+            i.id_categoria_insumo,
+            ci.nombre_categoria,
+            i.id_almacen,
+            a.nombre AS nombre_almacen,
             i.id_unidad_medida,
             um.nombre AS unidad_nombre,
+            um.simbolo AS unidad_abreviatura,
             um.simbolo AS unidad_simbolo,
             i.cantidad,
             i.stock_minimo
           FROM insumos i
+          LEFT JOIN categorias_insumos ci
+            ON ci.id_categoria_insumo = i.id_categoria_insumo
+          LEFT JOIN almacenes a
+            ON a.id_almacen = i.id_almacen
           LEFT JOIN unidades_medida um
             ON um.id_unidad_medida = i.id_unidad_medida
           WHERE COALESCE(i.estado, true) = true
-          ORDER BY i.nombre_insumo ASC, i.id_insumo ASC
+          ORDER BY ci.nombre_categoria ASC NULLS LAST, i.nombre_insumo ASC, a.nombre ASC NULLS LAST, i.id_insumo ASC
         `
       )
     ]);
@@ -489,6 +548,8 @@ router.get('/:id_receta/contexto-edicion', checkPermission(MENU_RECETAS_VIEW_PER
       }
     });
   } catch (err) {
+    const handled = sendRecetaInsumosMaestrosError(res, err, 'GET /admin/recetas/:id_receta/contexto-edicion');
+    if (handled) return handled;
     console.error('Error al obtener contexto de edicion de receta admin:', err.message);
     return res.status(500).json({ error: true, message: getSafeServerErrorMessage(err) });
   }
@@ -514,13 +575,15 @@ router.put('/:id_receta/detalle', checkPermission(MENU_RECETAS_EDIT_PERMISSIONS)
       return res.status(400).json({ error: true, message: normalized.message });
     }
 
-    const fkValidation = await validarDetalleRecetaFks(client, normalized.detalle);
+    const detalleNormalizado = await normalizeDetalleForCurrentMode(client, normalized.detalle);
+
+    const fkValidation = await validarDetalleRecetaFks(client, detalleNormalizado);
     if (!fkValidation.ok) {
       return res.status(fkValidation.status).json({ error: true, message: fkValidation.message });
     }
 
     await client.query('BEGIN');
-    await reemplazarDetalleReceta(client, idReceta, normalized.detalle);
+    await reemplazarDetalleReceta(client, idReceta, detalleNormalizado);
     await client.query(
       `
         UPDATE recetas
@@ -534,6 +597,8 @@ router.put('/:id_receta/detalle', checkPermission(MENU_RECETAS_EDIT_PERMISSIONS)
     return res.status(200).json({ error: false, message: 'Detalle de receta actualizado correctamente.' });
   } catch (err) {
     await client.query('ROLLBACK');
+    const handled = sendRecetaInsumosMaestrosError(res, err, 'PUT /admin/recetas/:id_receta/detalle');
+    if (handled) return handled;
     console.error('Error al actualizar detalle de receta admin:', err.message);
     return res.status(500).json({ error: true, message: getSafeServerErrorMessage(err) });
   } finally {
@@ -574,20 +639,21 @@ router.post('/', checkPermission(MENU_RECETAS_CREATE_PERMISSIONS), async (req, r
       return res.status(401).json({ error: true, message: 'Sesion invalida. Vuelve a iniciar sesion.' });
     }
 
+    const legacyImageError = rejectLegacyEmbeddedImagePayload(req.body || {});
+    if (legacyImageError) {
+      return res.status(legacyImageError.status).json(legacyImageError.body);
+    }
+
     const detalleValidation = normalizeDetalleRecetaPayload(req.body?.detalle_receta || req.body?.detalle || []);
     if (!detalleValidation.ok) {
       return res.status(400).json({ error: true, message: detalleValidation.message });
     }
 
-    const fkDetalleValidation = await validarDetalleRecetaFks(client, detalleValidation.detalle);
+    const detalleNormalizado = await normalizeDetalleForCurrentMode(client, detalleValidation.detalle);
+
+    const fkDetalleValidation = await validarDetalleRecetaFks(client, detalleNormalizado);
     if (!fkDetalleValidation.ok) {
       return res.status(fkDetalleValidation.status).json({ error: true, message: fkDetalleValidation.message });
-    }
-
-    // Transicion segura: id_usuario del cliente se ignora y se fuerza desde req.user.
-    const imagePayload = parseRecipeImagePayload(req.body || {});
-    if (!imagePayload.ok) {
-      return res.status(imagePayload.status).json({ error: true, message: imagePayload.message });
     }
 
     const payloadConActor = { ...(req.body || {}), id_usuario: actorUserId };
@@ -622,21 +688,8 @@ router.post('/', checkPermission(MENU_RECETAS_CREATE_PERMISSIONS), async (req, r
     if (urlImagenPublica) {
       return res.status(400).json({
         error: true,
-        message: 'url_imagen_publica ya no se acepta para nuevas imagenes. Envia imagen_data_url o base64.'
+        message: RECETAS_IMAGE_CONTRACT_MESSAGE
       });
-    }
-    if (imagePayload.hasImage) {
-      const uploadResult = await uploadRecipeImageAndRegisterArchivo({
-        req,
-        imagePayload,
-        nombreReceta: datosNormalizados.nombre_receta,
-        idUsuario: actorUserId,
-        client
-      });
-      if (!uploadResult.ok) {
-        return res.status(uploadResult.status).json({ error: true, message: uploadResult.message });
-      }
-      datosNormalizados.id_archivo = uploadResult.idArchivo;
     }
     delete datosNormalizados.url_imagen_publica;
 
@@ -645,7 +698,6 @@ router.post('/', checkPermission(MENU_RECETAS_CREATE_PERMISSIONS), async (req, r
       return res.status(reglasValidation.status).json({ error: true, message: reglasValidation.message });
     }
 
-    // Fechas de auditoria desde backend.
     const nowIso = new Date().toISOString();
     const datosInsert = {
       ...datosNormalizados,
@@ -653,13 +705,19 @@ router.post('/', checkPermission(MENU_RECETAS_CREATE_PERMISSIONS), async (req, r
       fecha_modificacion: nowIso
     };
 
-    // `pa_insert` usa json_each_text y omite valores NULL; por eso se excluyen
-    // campos nulos para evitar desajuste entre columnas y valores.
     const datosInsertSinNull = Object.fromEntries(
       Object.entries(datosInsert).filter(([, valor]) => valor !== null)
     );
 
     await client.query('BEGIN');
+    if (!shouldUseCatalogoMaestroInsumos()) {
+      const unidadSyncValidation = await sincronizarUnidadesInsumosDesdeDetalle(client, detalleNormalizado);
+      if (!unidadSyncValidation.ok) {
+        await client.query('ROLLBACK');
+        return res.status(unidadSyncValidation.status).json({ error: true, message: unidadSyncValidation.message });
+      }
+    }
+
     await client.query('CALL pa_insert($1, $2)', ['recetas', datosInsertSinNull]);
 
     const createdResult = await client.query(
@@ -679,7 +737,13 @@ router.post('/', checkPermission(MENU_RECETAS_CREATE_PERMISSIONS), async (req, r
       throw new Error('No se pudo resolver la receta creada para guardar su detalle.');
     }
 
-    await reemplazarDetalleReceta(client, idRecetaCreada, detalleValidation.detalle);
+    await reemplazarDetalleReceta(client, idRecetaCreada, detalleNormalizado);
+    await autoPublishNewRecipe({
+      client,
+      idMenu: datosInsertSinNull.id_menu,
+      idReceta: idRecetaCreada,
+      estadoItem: datosNormalizados.estado ?? true
+    });
     await client.query('COMMIT');
 
     return res.status(201).json({
@@ -689,6 +753,8 @@ router.post('/', checkPermission(MENU_RECETAS_CREATE_PERMISSIONS), async (req, r
     });
   } catch (err) {
     await client.query('ROLLBACK');
+    const handled = sendRecetaInsumosMaestrosError(res, err, 'POST /admin/recetas');
+    if (handled) return handled;
     console.error('Error al crear receta admin:', err.message);
 
     if (esErrorConflictoConstraint(err)) {
@@ -699,7 +765,6 @@ router.post('/', checkPermission(MENU_RECETAS_CREATE_PERMISSIONS), async (req, r
         });
       }
 
-      // Mapeo explicito de conflictos conocidos para evitar mensajes genericos.
       if (err?.code === '23502' && err?.column === 'id_nivel_picante') {
         return res.status(400).json({
           error: true,
@@ -736,6 +801,11 @@ router.put('/:id_receta', checkPermission(MENU_RECETAS_EDIT_PERMISSIONS), async 
       return res.status(401).json({ error: true, message: 'Sesion invalida. Vuelve a iniciar sesion.' });
     }
 
+    const legacyImageError = rejectLegacyEmbeddedImagePayload(req.body || {});
+    if (legacyImageError) {
+      return res.status(legacyImageError.status).json(legacyImageError.body);
+    }
+
     const idReceta = Number(req.params.id_receta);
     if (!esEnteroPositivo(idReceta)) {
       return res.status(400).json({ error: true, message: 'id_receta invalido.' });
@@ -751,16 +821,23 @@ router.put('/:id_receta', checkPermission(MENU_RECETAS_EDIT_PERMISSIONS), async 
       return res.status(400).json({ error: true, message: detalleValidation.message });
     }
 
-    const fkDetalleValidation = await validarDetalleRecetaFks(client, detalleValidation.detalle);
+    const detalleNormalizado = await normalizeDetalleForCurrentMode(client, detalleValidation.detalle);
+
+    const fkDetalleValidation = await validarDetalleRecetaFks(client, detalleNormalizado);
     if (!fkDetalleValidation.ok) {
       return res.status(fkDetalleValidation.status).json({ error: true, message: fkDetalleValidation.message });
     }
 
-    // Transicion segura: id_usuario del cliente se ignora y se fuerza desde req.user.
-    const imagePayload = parseRecipeImagePayload(req.body || {});
-    if (!imagePayload.ok) {
-      return res.status(imagePayload.status).json({ error: true, message: imagePayload.message });
-    }
+    const recetaActualResult = await client.query(
+      `
+        SELECT id_menu
+        FROM recetas
+        WHERE id_receta = $1
+        LIMIT 1
+      `,
+      [idReceta]
+    );
+    const previousMenuId = Number(recetaActualResult.rows?.[0]?.id_menu || 0) || null;
 
     const payloadConActor = { ...(req.body || {}), id_usuario: actorUserId };
     delete payloadConActor.detalle_receta;
@@ -794,21 +871,8 @@ router.put('/:id_receta', checkPermission(MENU_RECETAS_EDIT_PERMISSIONS), async 
     if (urlImagenPublica) {
       return res.status(400).json({
         error: true,
-        message: 'url_imagen_publica ya no se acepta para nuevas imagenes. Envia imagen_data_url o base64.'
+        message: RECETAS_IMAGE_CONTRACT_MESSAGE
       });
-    }
-    if (imagePayload.hasImage) {
-      const uploadResult = await uploadRecipeImageAndRegisterArchivo({
-        req,
-        imagePayload,
-        nombreReceta: datosNormalizados.nombre_receta,
-        idUsuario: actorUserId,
-        client
-      });
-      if (!uploadResult.ok) {
-        return res.status(uploadResult.status).json({ error: true, message: uploadResult.message });
-      }
-      datosNormalizados.id_archivo = uploadResult.idArchivo;
     }
     delete datosNormalizados.url_imagen_publica;
 
@@ -818,14 +882,26 @@ router.put('/:id_receta', checkPermission(MENU_RECETAS_EDIT_PERMISSIONS), async 
     }
 
     await client.query('BEGIN');
+    if (!shouldUseCatalogoMaestroInsumos()) {
+      const unidadSyncValidation = await sincronizarUnidadesInsumosDesdeDetalle(client, detalleNormalizado);
+      if (!unidadSyncValidation.ok) {
+        await client.query('ROLLBACK');
+        return res.status(unidadSyncValidation.status).json({ error: true, message: unidadSyncValidation.message });
+      }
+    }
 
     for (const campo of Object.keys(datosNormalizados)) {
       await actualizarCampoReceta(client, idReceta, campo, datosNormalizados[campo]);
     }
 
-    await reemplazarDetalleReceta(client, idReceta, detalleValidation.detalle);
+    await reemplazarDetalleReceta(client, idReceta, detalleNormalizado);
+    await moveRecipePublicationToMenu({
+      client,
+      idReceta,
+      fromMenuId: previousMenuId,
+      toMenuId: datosNormalizados.id_menu
+    });
 
-    // Se actualiza fecha_modificacion en cada PUT.
     await client.query(
       `
         UPDATE recetas
@@ -839,6 +915,8 @@ router.put('/:id_receta', checkPermission(MENU_RECETAS_EDIT_PERMISSIONS), async 
     return res.status(200).json({ error: false, message: 'Receta actualizada correctamente.' });
   } catch (err) {
     await client.query('ROLLBACK');
+    const handled = sendRecetaInsumosMaestrosError(res, err, 'PUT /admin/recetas/:id_receta');
+    if (handled) return handled;
     console.error('Error al actualizar receta admin:', err.message);
 
     if (esErrorConflictoConstraint(err)) {
@@ -881,7 +959,6 @@ router.patch('/:id_receta/estado', checkPermission(MENU_RECETAS_STATE_PERMISSION
       return res.status(404).json({ error: true, message: 'Receta no encontrada.' });
     }
 
-    // Compatibilidad: si el cliente envia id_usuario se ignora silenciosamente.
     const payloadConActor = { ...(req.body || {}), id_usuario: actorUserId };
 
     const payloadValidation = validarEstructuraPayloadReceta(payloadConActor, { soloEstadoUsuario: true });
@@ -909,7 +986,6 @@ router.patch('/:id_receta/estado', checkPermission(MENU_RECETAS_STATE_PERMISSION
     await actualizarCampoReceta(client, idReceta, 'estado', estadoValidation.valor);
     await actualizarCampoReceta(client, idReceta, 'id_usuario', usuarioValidation.valor);
 
-    // Requisito de negocio: PATCH estado tambien refresca fecha_modificacion.
     await client.query(
       `
         UPDATE recetas

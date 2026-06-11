@@ -1,5 +1,7 @@
 import pool from '../../config/db-connection.js';
 import { getClientIp } from '../../utils/security/clientInfo.js';
+import { buildSecurityNotificationFromAuditRow } from './securityNotificationsShared.js';
+import { broadcastSecurityNotification } from './securityNotificationsStream.js';
 
 const MODULO_SEGURIDAD = 'SEGURIDAD';
 const DEFAULT_ACTION = 'SISTEMA_ACCION';
@@ -281,6 +283,35 @@ export const insertSecurityAuditLog = async (payload = {}) => {
     record.datos_antes,
     record.datos_despues
   ]);
+
+  const authSource = payload?.req?.user || payload?.req?.usuario || {};
+  const actorUsuario = String(
+    authSource?.nombre_usuario
+    || authSource?.email
+    || authSource?.correo
+    || ''
+  ).trim();
+  const actorNombre = String(
+    authSource?.nombre_completo
+    || authSource?.nombre
+    || authSource?.nombres
+    || ''
+  ).trim();
+
+  const liveNotification = buildSecurityNotificationFromAuditRow({
+    id_bitacora: result.rows?.[0]?.id_bitacora,
+    fecha_hora: result.rows?.[0]?.fecha_hora,
+    accion: record.accion,
+    descripcion: record.descripcion,
+    tabla_afectada: record.tabla_afectada,
+    datos_despues: record.datos_despues,
+    actor_usuario: actorUsuario,
+    actor_nombre: actorNombre
+  });
+
+  if (liveNotification) {
+    broadcastSecurityNotification(liveNotification);
+  }
 
   return {
     inserted: true,

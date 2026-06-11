@@ -24,6 +24,10 @@ import {
   validarEstructuraPayloadCombo,
   validarReglasNegocioYFks
 } from './admin_combos_helpers.js';
+import {
+  autoPublishNewCombo,
+  moveComboPublicationToMenu
+} from '../services/menuAutoPublicationService.js';
 
 const router = express.Router();
 const MENU_COMBOS_VIEW_PERMISSIONS = ['MENU_COMBOS_VER', 'MENU_VER'];
@@ -136,6 +140,12 @@ router.post('/', checkPermission(MENU_COMBOS_CREATE_PERMISSIONS), async (req, re
 
     await client.query('BEGIN');
     const idCombo = await crearComboConDetalle(client, datosNormalizados, detalleNormalizacion.data);
+    await autoPublishNewCombo({
+      client,
+      idMenu: datosNormalizados.id_menu,
+      idCombo,
+      estadoItem: datosNormalizados.estado ?? true
+    });
     await client.query('COMMIT');
 
     const comboCreado = await obtenerComboPorId(idCombo, { includeInactiveDetail: true });
@@ -181,6 +191,17 @@ router.put('/:id_combo', checkPermission(MENU_COMBOS_EDIT_PERMISSIONS), async (r
       return res.status(404).json({ error: true, message: 'Combo no encontrado.' });
     }
 
+    const comboActualResult = await client.query(
+      `
+        SELECT id_menu
+        FROM combos
+        WHERE id_combo = $1
+        LIMIT 1
+      `,
+      [idCombo]
+    );
+    const previousMenuId = Number(comboActualResult.rows?.[0]?.id_menu || 0) || null;
+
     // Transicion segura: id_usuario del cliente se ignora y se fuerza desde req.user.
     const payloadConActor = { ...(req.body || {}), id_usuario: actorUserId };
 
@@ -208,6 +229,12 @@ router.put('/:id_combo', checkPermission(MENU_COMBOS_EDIT_PERMISSIONS), async (r
     await client.query('BEGIN');
     await actualizarComboConDetalle(client, idCombo, datosNormalizados, detalleNormalizacion.data, {
       replaceDetalle: detalleNormalizacion.provided
+    });
+    await moveComboPublicationToMenu({
+      client,
+      idCombo,
+      fromMenuId: previousMenuId,
+      toMenuId: datosNormalizados.id_menu
     });
     await client.query('COMMIT');
 

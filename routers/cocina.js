@@ -88,7 +88,12 @@ const normalizeTextKey = (value) =>
     .replace(/\s+/g, '_');
 
 const parsePositiveInt = (value) => {
-  const parsed = Number.parseInt(String(value ?? ''), 10);
+  if (typeof value === 'number') {
+    return Number.isSafeInteger(value) && value > 0 ? value : null;
+  }
+  const normalized = String(value ?? '').trim();
+  if (!/^0*[1-9]\d*$/.test(normalized)) return null;
+  const parsed = Number(normalized);
   return Number.isInteger(parsed) && parsed > 0 ? parsed : null;
 };
 
@@ -248,15 +253,6 @@ const buildTicketNumber = (idPedido, idFactura, codigoVenta) => {
   return `VTA-${String(baseId).padStart(5, '0')}`;
 };
 
-const inferKitchenItemQuantity = (rawSubtotal, rawUnitPrice) => {
-  const subtotal = Number(rawSubtotal || 0);
-  const unitPrice = Number(rawUnitPrice || 0);
-  if (!Number.isFinite(subtotal) || subtotal <= 0) return 1;
-  if (!Number.isFinite(unitPrice) || unitPrice <= 0) return 1;
-  const inferred = Math.round(subtotal / unitPrice);
-  return Number.isInteger(inferred) && inferred > 0 ? inferred : 1;
-};
-
 const buildPedidoConsumoPayload = async (client, idPedido, idSucursal) => {
   const hasDetallePedidoConfiguracionMenu = await hasColumn(client, 'detalle_pedido', 'configuracion_menu');
   const detailsResult = await client.query(
@@ -266,23 +262,9 @@ const buildPedidoConsumoPayload = async (client, idPedido, idSucursal) => {
         dp.id_producto,
         dp.id_combo,
         dp.id_receta,
-        ${hasDetallePedidoConfiguracionMenu ? 'dp.configuracion_menu,' : 'NULL::jsonb AS configuracion_menu,'}
-        COALESCE(dp.sub_total_pedido, 0) AS sub_total_item,
-        COALESCE(
-          CASE
-            WHEN dp.id_producto IS NOT NULL THEN prod.precio
-            WHEN dp.id_combo IS NOT NULL THEN combo.precio
-            WHEN dp.id_receta IS NOT NULL THEN rec.precio
-            ELSE NULL
-          END,
-          NULLIF(COALESCE(dp.sub_total_pedido, 0), 0),
-          NULLIF(COALESCE(dp.total_pedido, 0), 0),
-          0
-        ) AS precio_unitario
+        dp.cantidad,
+        ${hasDetallePedidoConfiguracionMenu ? 'dp.configuracion_menu' : 'NULL::jsonb AS configuracion_menu'}
       FROM public.detalle_pedido dp
-      LEFT JOIN public.productos prod ON prod.id_producto = dp.id_producto
-      LEFT JOIN public.combos combo ON combo.id_combo = dp.id_combo
-      LEFT JOIN public.recetas rec ON rec.id_receta = dp.id_receta
       WHERE dp.id_pedido = $1
         AND COALESCE(dp.estado, true) = true
       ORDER BY dp.id_detalle_pedido
@@ -307,7 +289,7 @@ const buildPedidoConsumoPayload = async (client, idPedido, idSucursal) => {
       const idProducto = parsePositiveInt(row.id_producto);
       const idCombo = parsePositiveInt(row.id_combo);
       const idReceta = parsePositiveInt(row.id_receta);
-      const quantity = inferKitchenItemQuantity(row.sub_total_item, row.precio_unitario);
+      const quantity = parsePositiveInt(row.cantidad);
 
       const idDetallePedido = parsePositiveInt(row.id_detalle_pedido);
       if (idProducto) return { tipo_item: 'PRODUCTO', id_item: idProducto, id_producto: idProducto, id_detalle_pedido: idDetallePedido, cantidad: quantity };
@@ -316,6 +298,19 @@ const buildPedidoConsumoPayload = async (client, idPedido, idSucursal) => {
       return null;
     })
     .filter(Boolean);
+
+  const invalidQuantityRow = items.find((item) => !parsePositiveInt(item.cantidad));
+  if (invalidQuantityRow) {
+    return {
+      ok: false,
+      status: 409,
+      body: {
+        error: true,
+        code: 'PEDIDO_CANTIDAD_INVALIDA',
+        message: `La linea ${invalidQuantityRow.id_detalle_pedido || 'del pedido'} tiene cantidad invalida para descontar inventario.`
+      }
+    };
+  }
 
   const extrasByDetalle = new Map();
   if (await hasTable(client, 'detalle_pedido_extras')) {
@@ -744,21 +739,10 @@ router.get('/cocina/pedidos', checkPermission(COCINA_VIEW_PERMISSIONS), async (r
             dp.id_producto,
             dp.id_combo,
             dp.id_receta,
+            dp.cantidad,
             dp.observacion,
             ${hasDetallePedidoConfiguracionMenu ? 'dp.configuracion_menu,' : 'NULL::jsonb AS configuracion_menu,'}
             COALESCE(prod.nombre_producto, combo.descripcion, rec.nombre_receta, 'Item de cocina') AS nombre_item,
-            COALESCE(
-              CASE
-                WHEN dp.id_producto IS NOT NULL THEN prod.precio
-                WHEN dp.id_combo IS NOT NULL THEN combo.precio
-                WHEN dp.id_receta IS NOT NULL THEN rec.precio
-                ELSE NULL
-              END,
-              NULLIF(COALESCE(dp.sub_total_pedido, 0), 0),
-              NULLIF(COALESCE(dp.total_pedido, 0), 0),
-              0
-            ) AS precio_unitario,
-            COALESCE(dp.sub_total_pedido, 0) AS sub_total_item,
             COALESCE(dp.total_pedido, COALESCE(dp.sub_total_pedido, 0)) AS total_linea
           FROM pedidos p
           LEFT JOIN estados_pedido ep ON ep.id_estado_pedido = p.id_estado_pedido
@@ -857,7 +841,7 @@ router.get('/cocina/pedidos', checkPermission(COCINA_VIEW_PERMISSIONS), async (r
         const pedido = grouped.get(row.id_pedido);
 
         if (row.id_detalle_pedido) {
-          const cantidad = inferKitchenItemQuantity(row.sub_total_item, row.precio_unitario);
+          const cantidad = parsePositiveInt(row.cantidad) || 0;
           pedido.items.push({
             id_detalle: Number(row.id_detalle_pedido),
             tipo_item:

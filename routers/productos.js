@@ -3,6 +3,19 @@ import pool from '../config/db-connection.js';
 import { attachImagenPrincipalUrls } from '../utils/uploads.js';
 import { resolveRequestUserSucursalScope } from '../utils/sucursalScope.js';
 import { checkPermission } from '../middleware/checkPermission.js';
+import { autoPublishNewProduct } from '../services/menuAutoPublicationService.js';
+import {
+  isCatalogoMaestroReadsEnabled,
+  isCatalogoMaestroViewMissingError,
+  logCatalogoMaestroViewMissing,
+  queryCatalogoMaestroView,
+  sendCatalogoMaestroViewMissingResponse
+} from '../services/catalogoMaestroReadService.js';
+import {
+  buildCatalogoMaestroWriteStructureMissingResponse,
+  completeProductoCatalogoMaestroWrite,
+  isCatalogoMaestroWriteStructureMissingError
+} from '../services/catalogoMaestroWriteService.js';
 
 const router = express.Router();
 const PRODUCTOS_LIST_PERMISSIONS = ['INVENTARIO_PRODUCTOS_VER', 'INVENTARIO_PRODUCTOS_DETALLE_VER'];
@@ -87,6 +100,15 @@ const PRODUCTOS_SORT_ALLOWLIST = Object.freeze({
   precio_desc: 'COALESCE(p.precio, 0) DESC, p.id_producto DESC',
   stock_asc: 'COALESCE(p.cantidad, 0) ASC, p.id_producto DESC',
   stock_desc: 'COALESCE(p.cantidad, 0) DESC, p.id_producto DESC'
+});
+const PRODUCTOS_MAESTRO_SORT_ALLOWLIST = Object.freeze({
+  recientes: 'v.id_producto_legacy DESC',
+  nombre_asc: 'LOWER(COALESCE(v.nombre_producto, \'\')) ASC, v.id_producto_legacy DESC',
+  nombre_desc: 'LOWER(COALESCE(v.nombre_producto, \'\')) DESC, v.id_producto_legacy DESC',
+  precio_asc: 'COALESCE(v.precio_legacy, 0) ASC, v.id_producto_legacy DESC',
+  precio_desc: 'COALESCE(v.precio_legacy, 0) DESC, v.id_producto_legacy DESC',
+  stock_asc: 'COALESCE(v.cantidad, 0) ASC, v.id_producto_legacy DESC',
+  stock_desc: 'COALESCE(v.cantidad, 0) DESC, v.id_producto_legacy DESC'
 });
 const shouldIncludeInactive = (query) => String(query?.incluir_inactivos ?? '').trim() === '1';
 
@@ -1034,6 +1056,162 @@ function getSafeProductosServerErrorMessage(err, fallback = 'No se pudo completa
   return String(err?.message || fallback);
 }
 
+const mapProductoMaestroRow = (row) => {
+  const idAlmacen = Number.parseInt(String(row?.id_almacen ?? ''), 10);
+  return {
+    ...row,
+    id_producto: row.id_producto == null ? row.id_producto : Number(row.id_producto),
+    id_producto_maestro: row.id_producto_maestro == null ? null : Number(row.id_producto_maestro),
+    id_almacen: esEnteroPositivoInt32(idAlmacen) ? idAlmacen : row.id_almacen,
+    id_sucursal: row.id_sucursal == null ? null : Number(row.id_sucursal),
+    id_almacenes: esEnteroPositivoInt32(idAlmacen) ? [idAlmacen] : []
+  };
+};
+
+async function listProductosDesdeCatalogoMaestro({
+  req,
+  queryPayload,
+  scope,
+  requestedSucursal,
+  requestedAlmacen,
+  requestedCategoria,
+  requestedDeptoHasValue,
+  requestedDeptoIsNullFilter,
+  requestedDepto,
+  estadoFiltro,
+  stockFiltro,
+  sortKey,
+  search,
+  wantsPaginated,
+  page,
+  pageSize
+}) {
+  const whereClauses = [];
+  const whereParams = [];
+
+  if (estadoFiltro === 'activo') whereClauses.push('(v.estado_global IS TRUE AND v.estado_local IS TRUE)');
+  if (estadoFiltro === 'inactivo') whereClauses.push('NOT (v.estado_global IS TRUE AND v.estado_local IS TRUE)');
+  if (requestedCategoria !== null) {
+    whereParams.push(requestedCategoria);
+    whereClauses.push(`v.id_categoria_producto = $${whereParams.length}`);
+  }
+  if (requestedAlmacen !== null) {
+    whereParams.push(requestedAlmacen);
+    whereClauses.push(`v.id_almacen = $${whereParams.length}`);
+  }
+  if (requestedDeptoHasValue) {
+    if (requestedDeptoIsNullFilter) {
+      whereClauses.push('v.id_tipo_departamento IS NULL');
+    } else {
+      whereParams.push(requestedDepto);
+      whereClauses.push(`v.id_tipo_departamento = $${whereParams.length}`);
+    }
+  }
+  if (stockFiltro === 'con_stock') whereClauses.push('COALESCE(v.cantidad, 0) > 0');
+  if (stockFiltro === 'sin_stock') whereClauses.push('COALESCE(v.cantidad, 0) <= 0');
+  if (requestedSucursal !== null) {
+    whereParams.push(requestedSucursal);
+    whereClauses.push(`v.id_sucursal = $${whereParams.length}`);
+  } else if (!scope.isSuperAdmin) {
+    whereParams.push(scope.allowedSucursalIds);
+    whereClauses.push(`v.id_sucursal = ANY($${whereParams.length}::int[])`);
+  }
+  if (search) {
+    const like = `%${search}%`;
+    whereParams.push(like);
+    const p = whereParams.length;
+    whereClauses.push(`
+      (
+        COALESCE(v.nombre_producto, '') ILIKE $${p}
+        OR COALESCE(v.descripcion_producto, '') ILIKE $${p}
+        OR COALESCE(cp.nombre_categoria, '') ILIKE $${p}
+        OR COALESCE(a.nombre, '') ILIKE $${p}
+      )
+    `);
+  }
+
+  const whereSql = whereClauses.length > 0 ? `WHERE ${whereClauses.join(' AND ')}` : '';
+  const fromSql = `
+    FROM public.vw_productos_maestros_almacen v
+    LEFT JOIN public.almacenes a
+      ON a.id_almacen = v.id_almacen
+    LEFT JOIN public.categorias_productos cp
+      ON cp.id_categoria_producto = v.id_categoria_producto
+    ${whereSql}
+  `;
+  const orderBySql = PRODUCTOS_MAESTRO_SORT_ALLOWLIST[sortKey] || PRODUCTOS_MAESTRO_SORT_ALLOWLIST.recientes;
+
+  let total = 0;
+  if (wantsPaginated) {
+    const totalResult = await queryCatalogoMaestroView(
+      pool,
+      'public.vw_productos_maestros_almacen',
+      `SELECT COUNT(*)::int AS total ${fromSql}`,
+      whereParams
+    );
+    total = Number.parseInt(String(totalResult.rows?.[0]?.total ?? '0'), 10) || 0;
+  }
+
+  const dataParams = [...whereParams];
+  const paginationSql = wantsPaginated
+    ? (() => {
+        dataParams.push(pageSize);
+        dataParams.push((page - 1) * pageSize);
+        return `LIMIT $${dataParams.length - 1} OFFSET $${dataParams.length}`;
+      })()
+    : '';
+
+  const dataResult = await queryCatalogoMaestroView(
+    pool,
+    'public.vw_productos_maestros_almacen',
+    `
+      SELECT
+        v.id_producto_legacy AS id_producto,
+        v.id_producto_maestro,
+        v.nombre_producto,
+        v.precio_legacy AS precio,
+        v.costo_compra,
+        v.cantidad,
+        v.stock_minimo,
+        v.descripcion_producto,
+        v.fecha_ingreso_producto,
+        v.fecha_caducidad,
+        v.id_categoria_producto,
+        v.id_almacen,
+        v.id_sucursal,
+        v.id_tipo_departamento,
+        v.id_archivo_imagen_principal,
+        (v.estado_global IS TRUE AND v.estado_local IS TRUE) AS estado,
+        v.estado_global,
+        v.estado_local,
+        v.estado_migracion
+      ${fromSql}
+      ORDER BY ${orderBySql}
+      ${paginationSql}
+    `,
+    dataParams
+  );
+
+  const rows = (dataResult.rows || []).map(mapProductoMaestroRow);
+  const items = await attachImagenPrincipalUrls(pool, req, rows);
+
+  if (!wantsPaginated) {
+    return { paginated: false, items };
+  }
+
+  return {
+    paginated: true,
+    payload: {
+      error: false,
+      items,
+      total,
+      page,
+      pageSize,
+      totalPages: total === 0 ? 1 : Math.ceil(total / pageSize)
+    }
+  };
+}
+
 // GET: Obtener productos
 router.get('/productos', checkPermission(PRODUCTOS_LIST_PERMISSIONS), async (req, res) => {
   try {
@@ -1129,6 +1307,32 @@ router.get('/productos', checkPermission(PRODUCTOS_LIST_PERMISSIONS), async (req
 
     const page = pageParsed.value;
     const pageSize = pageSizeParsed.value;
+
+    if (isCatalogoMaestroReadsEnabled()) {
+      const result = await listProductosDesdeCatalogoMaestro({
+        req,
+        queryPayload,
+        scope,
+        requestedSucursal,
+        requestedAlmacen,
+        requestedCategoria,
+        requestedDeptoHasValue,
+        requestedDeptoIsNullFilter,
+        requestedDepto,
+        estadoFiltro,
+        stockFiltro,
+        sortKey,
+        search,
+        wantsPaginated,
+        page,
+        pageSize
+      });
+
+      if (!result.paginated) {
+        return res.status(200).json(result.items);
+      }
+      return res.status(200).json(result.payload);
+    }
 
     const whereClauses = [];
     const whereParams = [];
@@ -1246,6 +1450,14 @@ router.get('/productos', checkPermission(PRODUCTOS_LIST_PERMISSIONS), async (req
     });
 
   } catch (err) {
+    if (isCatalogoMaestroViewMissingError(err)) {
+      logCatalogoMaestroViewMissing('GET /productos', err);
+      return sendCatalogoMaestroViewMissingResponse(res);
+    }
+    if (isCatalogoMaestroReadsEnabled()) {
+      console.error('Error al obtener productos desde catalogo maestro:', err.message);
+      return res.status(500).json({ error: true, message: 'No se pudieron cargar los productos.' });
+    }
     console.error('Error al obtener productos:', err.message);
     res.status(500).json({ error: true, message: getSafeProductosServerErrorMessage(err, 'No se pudieron cargar los productos.') });
   }
@@ -1466,6 +1678,22 @@ router.post('/productos', checkPermission(PRODUCTOS_CREATE_PERMISSIONS), async (
     }
 
     await syncProductoAlmacenes(idProductoCreado, idAlmacenes, client);
+    await completeProductoCatalogoMaestroWrite({
+      client,
+      idProducto: idProductoCreado,
+      idAlmacen: payloadPrimary.id_almacen,
+      stockMinimo: payloadPrimary.stock_minimo ?? 0,
+      costoCompra: payloadPrimary.costo_compra ?? null,
+      fechaCaducidad: payloadPrimary.fecha_caducidad ?? null,
+      estado: payloadPrimary.estado ?? true
+    });
+    await autoPublishNewProduct({
+      client,
+      idProducto: idProductoCreado,
+      idCategoriaProducto: payloadPrimary.id_categoria_producto,
+      idAlmacen: payloadPrimary.id_almacen,
+      estadoItem: payloadPrimary.estado ?? true
+    });
 
     const productoResponse = await getHydratedProductoById(req, idProductoCreado, client);
     if (!productoResponse) {
@@ -1488,6 +1716,11 @@ router.post('/productos', checkPermission(PRODUCTOS_CREATE_PERMISSIONS), async (
   } catch (err) {
     try { await client.query('ROLLBACK'); } catch {}
     console.error('Error al crear producto:', err.message);
+
+    if (isCatalogoMaestroWriteStructureMissingError(err)) {
+      console.error('CATALOGO_MAESTRO_WRITE_STRUCTURE_MISSING producto:', err.cause?.message || err.message);
+      return res.status(500).json(buildCatalogoMaestroWriteStructureMissingResponse());
+    }
 
     if (isProductosDuplicateConstraintError(err)) {
       return res.status(409).json({

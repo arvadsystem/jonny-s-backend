@@ -1,6 +1,7 @@
 ﻿import express from 'express';
 import pool from '../config/db-connection.js';
 import { checkPermission } from '../middleware/checkPermission.js';
+import { clearVentasComplementCatalogCache } from './ventas/services/complementosCatalogService.js';
 
 const router = express.Router();
 // AM: transicion segura a permisos granulares sin romper el acceso actual mientras se alinea BD/roles.
@@ -132,6 +133,45 @@ const buildInsertStatement = ({ tableName, data = {}, raw = {}, returning = '' }
     text: `INSERT INTO ${tableName} (${columns.join(', ')}) VALUES (${placeholders.join(', ')})${returningClause};`,
     params
   };
+};
+
+const buildBatchInsertStatement = ({ tableName, rows = [], columns = [], raw = {} }) => {
+  if (!Array.isArray(rows) || rows.length === 0) return null;
+  const normalizedColumns = columns.filter((column) => column?.name && typeof column.getValue === 'function');
+  const rawColumns = Object.entries(raw).filter(([, expression]) => Boolean(expression));
+  if (normalizedColumns.length === 0 && rawColumns.length === 0) {
+    throw new Error(`No hay columnas para insertar en ${tableName}.`);
+  }
+
+  const params = [];
+  const values = rows.map((row) => {
+    const placeholders = normalizedColumns.map((column) => {
+      params.push(column.getValue(row));
+      return `$${params.length}`;
+    });
+    for (const [, expression] of rawColumns) {
+      placeholders.push(expression);
+    }
+    return `(${placeholders.join(', ')})`;
+  });
+
+  const columnNames = [
+    ...normalizedColumns.map((column) => column.name),
+    ...rawColumns.map(([columnName]) => columnName)
+  ];
+
+  return {
+    text: `INSERT INTO ${tableName} (${columnNames.join(', ')}) VALUES ${values.join(', ')};`,
+    params
+  };
+};
+
+const invalidateVentasComplementCatalogCache = (reason) => {
+  try {
+    clearVentasComplementCatalogCache();
+  } catch (error) {
+    console.warn(`No se pudo invalidar cache de complementos de ventas (${reason}):`, error?.message || error);
+  }
 };
 
 const ensureUsuarioExists = async (idUsuario) => {
@@ -343,11 +383,6 @@ router.get('/recetas/:id_receta/config', checkPermission(MENU_SALSAS_VIEW_PERMIS
       return res.status(400).json({ error: true, message: 'id_receta invalido.' });
     }
 
-    const receta = await ensureRecetaExists(idReceta);
-    if (!receta) {
-      return res.status(404).json({ error: true, message: 'Receta no encontrada.' });
-    }
-
     const [salsasTieneEstado, salsasTieneNivelPicante, salsasTieneOrden, recetaSalsaTieneEstado, reglasTieneEstado] = await Promise.all([
       hasColumn('salsas', 'estado'),
       hasColumn('salsas', 'nivel_picante'),
@@ -356,22 +391,26 @@ router.get('/recetas/:id_receta/config', checkPermission(MENU_SALSAS_VIEW_PERMIS
       hasColumn('reglas_salsas_receta', 'estado')
     ]);
 
-    const [catalogResult, selectedResult, rulesResult] = await Promise.all([
-      pool.query(
-        `
+    const configResult = await pool.query(
+      `
+        WITH receta_row AS (
+          SELECT r.id_receta, r.nombre_receta
+          FROM recetas r
+          WHERE r.id_receta = $1
+          LIMIT 1
+        ),
+        catalogo AS (
           SELECT
             s.id_salsa,
             s.nombre,
             ${salsasTieneNivelPicante ? 'COALESCE(s.nivel_picante, 0)' : '0'} AS nivel_picante,
             ${salsasTieneOrden ? 'COALESCE(s.orden, 0)' : '0'} AS orden,
-            ${salsasTieneEstado ? 'COALESCE(s.estado, true)' : 'true'} AS estado
+            ${salsasTieneEstado ? 'COALESCE(s.estado, true)' : 'true'} AS estado,
+            ${salsasTieneOrden ? 'COALESCE(s.orden, 2147483647)' : '0'} AS sort_orden
           FROM salsas s
           ${salsasTieneEstado ? 'WHERE COALESCE(s.estado, true) = true' : ''}
-          ORDER BY ${salsasTieneOrden ? 'COALESCE(s.orden, 2147483647),' : ''} s.nombre ASC, s.id_salsa ASC;
-        `
-      ),
-      pool.query(
-        `
+        ),
+        selected AS (
           SELECT rs.id_salsa
           FROM receta_salsa rs
           INNER JOIN salsas s
@@ -379,12 +418,8 @@ router.get('/recetas/:id_receta/config', checkPermission(MENU_SALSAS_VIEW_PERMIS
           WHERE rs.id_receta = $1
             ${recetaSalsaTieneEstado ? 'AND COALESCE(rs.estado, true) = true' : ''}
             ${salsasTieneEstado ? 'AND COALESCE(s.estado, true) = true' : ''}
-          ORDER BY rs.id_salsa ASC;
-        `,
-        [idReceta]
-      ),
-      pool.query(
-        `
+        ),
+        rules AS (
           SELECT
             r.id_regla,
             r.id_receta,
@@ -395,20 +430,44 @@ router.get('/recetas/:id_receta/config', checkPermission(MENU_SALSAS_VIEW_PERMIS
           FROM reglas_salsas_receta r
           WHERE r.id_receta = $1
             ${reglasTieneEstado ? 'AND COALESCE(r.estado, true) = true' : ''}
-          ORDER BY r.min_unidades ASC, r.max_unidades ASC NULLS LAST, r.id_regla ASC;
-        `,
-        [idReceta]
-      )
-    ]);
+        )
+        SELECT
+          (
+            SELECT jsonb_build_object(
+              'id_receta', rr.id_receta,
+              'nombre_receta', rr.nombre_receta
+            )
+            FROM receta_row rr
+          ) AS receta,
+          COALESCE((
+            SELECT jsonb_agg(to_jsonb(c) - 'sort_orden' ORDER BY ${salsasTieneOrden ? 'c.sort_orden,' : ''} c.nombre ASC, c.id_salsa ASC)
+            FROM catalogo c
+          ), '[]'::jsonb) AS salsas_catalogo,
+          COALESCE((
+            SELECT jsonb_agg(s.id_salsa ORDER BY s.id_salsa ASC)
+            FROM selected s
+          ), '[]'::jsonb) AS salsas_asignadas,
+          COALESCE((
+            SELECT jsonb_agg(to_jsonb(r) ORDER BY r.min_unidades ASC, r.max_unidades ASC NULLS LAST, r.id_regla ASC)
+            FROM rules r
+          ), '[]'::jsonb) AS reglas;
+      `,
+      [idReceta]
+    );
+
+    const config = configResult.rows?.[0] || {};
+    if (!config.receta) {
+      return res.status(404).json({ error: true, message: 'Receta no encontrada.' });
+    }
 
     return res.status(200).json({
       receta: {
-        id_receta: receta.id_receta,
-        nombre_receta: receta.nombre_receta
+        id_receta: Number(config.receta.id_receta),
+        nombre_receta: config.receta.nombre_receta
       },
-      salsas_catalogo: catalogResult.rows || [],
-      salsas_asignadas: (selectedResult.rows || []).map((row) => Number(row.id_salsa)),
-      reglas: rulesResult.rows || []
+      salsas_catalogo: Array.isArray(config.salsas_catalogo) ? config.salsas_catalogo : [],
+      salsas_asignadas: (Array.isArray(config.salsas_asignadas) ? config.salsas_asignadas : []).map((idSalsa) => Number(idSalsa)),
+      reglas: Array.isArray(config.reglas) ? config.reglas : []
     });
   } catch (err) {
     console.error('Error al obtener configuracion de salsas por receta:', err.message);
@@ -485,6 +544,7 @@ router.post('/', checkPermission(MENU_SALSAS_CREATE_PERMISSIONS), async (req, re
     });
 
     const createdResult = await pool.query(insertStatement.text, insertStatement.params);
+    invalidateVentasComplementCatalogCache('crear salsa');
     return res.status(201).json({
       error: false,
       message: 'Salsa creada correctamente.',
@@ -582,6 +642,7 @@ router.put('/:id_salsa', checkPermission(MENU_SALSAS_EDIT_PERMISSIONS), async (r
       params
     );
 
+    invalidateVentasComplementCatalogCache('actualizar salsa');
     return res.status(200).json({ error: false, message: 'Salsa actualizada correctamente.' });
   } catch (err) {
     console.error('Error al actualizar salsa admin:', err.message);
@@ -651,6 +712,7 @@ router.patch('/:id_salsa/estado', checkPermission(MENU_SALSAS_STATE_PERMISSIONS)
       params
     );
 
+    invalidateVentasComplementCatalogCache('cambiar estado de salsa');
     return res.status(200).json({ error: false, message: 'Estado de salsa actualizado correctamente.' });
   } catch (err) {
     console.error('Error al cambiar estado de salsa admin:', err.message);
@@ -739,59 +801,70 @@ router.put('/recetas/:id_receta/config', checkPermission(MENU_SALSAS_EDIT_PERMIS
 
     // Sincroniza receta_salsa desde UI: se reemplaza por el set actual.
     await client.query('DELETE FROM receta_salsa WHERE id_receta = $1;', [idReceta]);
-    for (const idSalsa of salsasAsignadas) {
-      const insertData = {
-        id_receta: idReceta,
-        id_salsa: idSalsa
-      };
-      if (recetaSalsaTieneEstado) insertData.estado = true;
-      if (recetaSalsaTieneUsuario && resolvedUserId) insertData.id_usuario = resolvedUserId;
-
-      const insertRaw = {};
+    if (salsasAsignadas.length > 0) {
+      const recetaSalsaColumns = [
+        { name: 'id_receta', getValue: () => idReceta },
+        { name: 'id_salsa', getValue: (idSalsa) => idSalsa }
+      ];
+      if (recetaSalsaTieneEstado) {
+        recetaSalsaColumns.push({ name: 'estado', getValue: () => true });
+      }
+      if (recetaSalsaTieneUsuario && resolvedUserId) {
+        recetaSalsaColumns.push({ name: 'id_usuario', getValue: () => resolvedUserId });
+      }
+      const recetaSalsaRaw = {};
       if (recetaSalsaTieneFechaCreacion) {
-        insertRaw.fecha_creacion = "timezone('America/Tegucigalpa', now())";
+        recetaSalsaRaw.fecha_creacion = "timezone('America/Tegucigalpa', now())";
       }
       if (recetaSalsaTieneFechaModificacion) {
-        insertRaw.fecha_modificacion = "timezone('America/Tegucigalpa', now())";
+        recetaSalsaRaw.fecha_modificacion = "timezone('America/Tegucigalpa', now())";
       }
-
-      const insertStatement = buildInsertStatement({
+      const insertRecetaSalsaStatement = buildBatchInsertStatement({
         tableName: 'receta_salsa',
-        data: insertData,
-        raw: insertRaw
+        rows: salsasAsignadas,
+        columns: recetaSalsaColumns,
+        raw: recetaSalsaRaw
       });
-      await client.query(insertStatement.text, insertStatement.params);
+      if (insertRecetaSalsaStatement) {
+        await client.query(insertRecetaSalsaStatement.text, insertRecetaSalsaStatement.params);
+      }
     }
 
     // Sincroniza reglas por receta desde UI: se reemplazan por el set actual.
     await client.query('DELETE FROM reglas_salsas_receta WHERE id_receta = $1;', [idReceta]);
-    for (const rule of reglas) {
-      const insertData = {
-        id_receta: idReceta,
-        min_unidades: rule.min_unidades,
-        max_unidades: rule.max_unidades,
-        salsas_requeridas: rule.salsas_requeridas
-      };
-      if (reglasTieneEstado) insertData.estado = true;
-      if (reglasTieneUsuario && resolvedUserId) insertData.id_usuario = resolvedUserId;
-
-      const insertRaw = {};
+    if (reglas.length > 0) {
+      const reglasColumns = [
+        { name: 'id_receta', getValue: () => idReceta },
+        { name: 'min_unidades', getValue: (rule) => rule.min_unidades },
+        { name: 'max_unidades', getValue: (rule) => rule.max_unidades },
+        { name: 'salsas_requeridas', getValue: (rule) => rule.salsas_requeridas }
+      ];
+      if (reglasTieneEstado) {
+        reglasColumns.push({ name: 'estado', getValue: () => true });
+      }
+      if (reglasTieneUsuario && resolvedUserId) {
+        reglasColumns.push({ name: 'id_usuario', getValue: () => resolvedUserId });
+      }
+      const reglasRaw = {};
       if (reglasTieneFechaCreacion) {
-        insertRaw.fecha_creacion = "timezone('America/Tegucigalpa', now())";
+        reglasRaw.fecha_creacion = "timezone('America/Tegucigalpa', now())";
       }
       if (reglasTieneFechaModificacion) {
-        insertRaw.fecha_modificacion = "timezone('America/Tegucigalpa', now())";
+        reglasRaw.fecha_modificacion = "timezone('America/Tegucigalpa', now())";
       }
-
-      const insertStatement = buildInsertStatement({
+      const insertReglasStatement = buildBatchInsertStatement({
         tableName: 'reglas_salsas_receta',
-        data: insertData,
-        raw: insertRaw
+        rows: reglas,
+        columns: reglasColumns,
+        raw: reglasRaw
       });
-      await client.query(insertStatement.text, insertStatement.params);
+      if (insertReglasStatement) {
+        await client.query(insertReglasStatement.text, insertReglasStatement.params);
+      }
     }
 
     await client.query('COMMIT');
+    invalidateVentasComplementCatalogCache('guardar configuracion de salsas por receta');
     return res.status(200).json({
       error: false,
       message: 'Configuracion de salsas por receta guardada correctamente.',
