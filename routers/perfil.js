@@ -11,6 +11,7 @@ import pool from '../config/db-connection.js';
 import jwt from 'jsonwebtoken';
 import JWT_SECRET from '../config/jwt.js';
 import { ensurePasswordChangedAtColumn } from '../utils/security/passwordExpiration.js';
+import { buildAuthTokenPayload, getUserAuthzSnapshot } from '../utils/security/authTokenPayload.js';
 import { supabase } from '../services/supabaseClient.js';
 import { passwordChangeLimiter } from '../middleware/rateLimiter.js';
 import {
@@ -281,16 +282,26 @@ const verifyStoredPassword = async (plainPassword, storedPassword) => {
   return Boolean(result.rows?.[0]?.ok);
 };
 
-const issueUpdatedAccessToken = (req, res) => {
+const issueUpdatedAccessToken = async (req, res) => {
   const currentUser = req.user || {};
-  const payload = {
+  let authz = { roles: [] };
+
+  try {
+    authz = await getUserAuthzSnapshot(pool, currentUser.id_usuario);
+  } catch (error) {
+    console.error('Error resolviendo roles/permisos al refrescar token en perfil:', error);
+  }
+
+  const payload = buildAuthTokenPayload({
     id_usuario: currentUser.id_usuario,
     nombre_usuario: currentUser.nombre_usuario,
-    rol: currentUser.rol,
     id_sucursal: currentUser.id_sucursal,
     sid: currentUser.sid,
     must_change_password: false,
-  };
+    rol: currentUser.rol,
+    nombre_rol: currentUser.nombre_rol,
+    roles: currentUser.roles
+  }, authz);
 
   const token = jwt.sign(payload, JWT_SECRET, { expiresIn: '8h' });
   const base = cookieConfig();
@@ -752,7 +763,7 @@ router.put('/perfil/password', passwordChangeLimiter, async (req, res) => {
       client.release();
     }
 
-    issueUpdatedAccessToken(req, res);
+    await issueUpdatedAccessToken(req, res);
     return res.json({ error: false, message: 'Contrasena actualizada correctamente' });
   } catch (err) {
     console.error('PUT /perfil/password error:', err?.message || err);

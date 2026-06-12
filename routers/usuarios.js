@@ -16,6 +16,7 @@ import {
 } from '../utils/uploads.js';
 import { ensurePasswordChangedAtColumn } from '../utils/security/passwordExpiration.js';
 import { enviarCorreo } from '../utils/emailService.js';
+import { buildAuthTokenPayload, getUserAuthzSnapshot } from '../utils/security/authTokenPayload.js';
 
 const router = express.Router();
 const USUARIOS_LIST_PERMISSIONS = ['USUARIOS_LISTADO_VER'];
@@ -45,20 +46,29 @@ const usuariosV2CookieConfig = () => {
   };
 };
 
-const issueUpdatedAccessTokenForOwnPasswordChange = (req, res, idUsuarioChanged) => {
+const issueUpdatedAccessTokenForOwnPasswordChange = async (req, res, idUsuarioChanged) => {
   const idUsuarioJwt = Number.parseInt(String(req.user?.id_usuario ?? ''), 10);
   if (!Number.isInteger(idUsuarioJwt) || idUsuarioJwt <= 0) return;
   if (idUsuarioJwt !== idUsuarioChanged) return;
   if (!JWT_SECRET) return;
 
-  const payload = {
+  let authz = { roles: [] };
+  try {
+    authz = await getUserAuthzSnapshot(pool, idUsuarioJwt);
+  } catch (error) {
+    console.error('Error resolviendo roles/permisos al refrescar token en usuarios:', error);
+  }
+
+  const payload = buildAuthTokenPayload({
     id_usuario: idUsuarioJwt,
     nombre_usuario: req.user?.nombre_usuario,
-    rol: req.user?.rol,
     id_sucursal: req.user?.id_sucursal,
     sid: req.user?.sid,
     must_change_password: false,
-  };
+    rol: req.user?.rol,
+    nombre_rol: req.user?.nombre_rol,
+    roles: req.user?.roles
+  }, authz);
 
   const token = jwt.sign(payload, JWT_SECRET, { expiresIn: '8h' });
   const base = usuariosV2CookieConfig();
@@ -1804,7 +1814,7 @@ router.post('/usuarios/v2/change-password', checkPermission(USUARIOS_CHANGE_OWN_
 
     await client.query('COMMIT');
 
-    issueUpdatedAccessTokenForOwnPasswordChange(req, res, idUsuario);
+    await issueUpdatedAccessTokenForOwnPasswordChange(req, res, idUsuario);
 
     return res.status(200).json({
       error: false,

@@ -13,6 +13,10 @@ import {
   evaluatePasswordExpiration,
   ensurePasswordChangedAtColumn,
 } from '../utils/security/passwordExpiration.js';
+import {
+  buildAuthRoleCompatFields,
+  getUserAuthzSnapshot
+} from '../utils/security/authTokenPayload.js';
 
 // helpers de HU78
 import { getClientIp, parseUserAgent } from '../utils/security/clientInfo.js';
@@ -49,46 +53,6 @@ const resolveMustChangePassword = (row) => {
   }
 
   return false;
-};
-
-const getUserAuthzSnapshot = async (idUsuario) => {
-  const userId = Number.parseInt(String(idUsuario ?? ''), 10);
-  if (!Number.isInteger(userId) || userId <= 0) {
-    return { roles: [], permisos: [] };
-  }
-
-  const [rolesResult, permisosResult] = await Promise.all([
-    pool.query(
-      `
-        SELECT DISTINCT r.nombre
-        FROM roles_usuarios ru
-        INNER JOIN roles r ON r.id_rol = ru.id_rol
-        WHERE ru.id_usuario = $1
-        ORDER BY r.nombre
-      `,
-      [userId]
-    ),
-    pool.query(
-      `
-        SELECT DISTINCT p.nombre_permiso
-        FROM roles_usuarios ru
-        INNER JOIN roles_permisos rp ON rp.id_rol = ru.id_rol
-        INNER JOIN permisos p ON p.id_permiso = rp.id_permiso
-        WHERE ru.id_usuario = $1
-        ORDER BY p.nombre_permiso
-      `,
-      [userId]
-    )
-  ]);
-
-  return {
-    roles: rolesResult.rows
-      .map((row) => String(row?.nombre || '').trim())
-      .filter(Boolean),
-    permisos: permisosResult.rows
-      .map((row) => String(row?.nombre_permiso || '').trim())
-      .filter(Boolean)
-  };
 };
 
 const getClienteNameSnapshot = async (idUsuario) => {
@@ -292,7 +256,7 @@ router.post('/login', internalLoginIpLimiter, internalLoginAccountIpLimiter, asy
     const payload = {
       id_usuario: usuarioEncontrado.id_usuario,
       nombre_usuario: usuarioEncontrado.nombre_usuario,
-      rol: usuarioEncontrado.id_empleado,
+      rol: null,
       id_sucursal: usuarioEncontrado.id_sucursal, // <-- INYECTAR SUCURSAL
       must_change_password: false,
       sid: id_sesion // HU79: id de sesión actual
@@ -300,7 +264,7 @@ router.post('/login', internalLoginIpLimiter, internalLoginAccountIpLimiter, asy
 
     let authz = { roles: [], permisos: [] };
     try {
-      authz = await getUserAuthzSnapshot(usuarioEncontrado.id_usuario);
+      authz = await getUserAuthzSnapshot(pool, usuarioEncontrado.id_usuario);
     } catch (authzError) {
       console.error('Error resolviendo roles/permisos en /login:', authzError);
     }
@@ -386,13 +350,16 @@ router.post('/login', internalLoginIpLimiter, internalLoginAccountIpLimiter, asy
       passwordChangedAt: usuarioEncontrado?.fecha_cambio_clave,
       createdAt: usuarioEncontrado?.fecha_creacion
     });
+    const roleFields = buildAuthRoleCompatFields(authz.roles, payload);
+    payload.rol = roleFields.rol;
+    payload.nombre_rol = roleFields.nombre_rol;
+    payload.roles = roleFields.roles;
     payload.must_change_password = passwordExpiration.mustChangePassword;
     const passwordPolicyFlags = buildPasswordPolicyFlags(passwordExpiration);
 
     const usuarioResponse = {
       ...payload,
       ...passwordPolicyFlags,
-      roles: authz.roles,
       permisos: authz.permisos
     };
 
@@ -481,7 +448,7 @@ router.get('/me', authRequired, requireActiveSession, async (req, res) => {
   let authz = { roles: [], permisos: [] };
   try {
     if (Number.isInteger(idUsuario) && idUsuario > 0) {
-      authz = await getUserAuthzSnapshot(idUsuario);
+      authz = await getUserAuthzSnapshot(pool, idUsuario);
     }
   } catch (authzError) {
     console.error('Error resolviendo roles/permisos en /me:', authzError);
@@ -559,8 +526,9 @@ router.get('/me', authRequired, requireActiveSession, async (req, res) => {
     usuario.password_policy_excluded = false;
   }
 
-  usuario.roles = authz.roles;
-  usuario.permisos = authz.permisos;
+  Object.assign(usuario, buildAuthRoleCompatFields(authz.roles, usuario), {
+    permisos: authz.permisos
+  });
 
   return res.json({
     usuario,
