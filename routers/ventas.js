@@ -127,6 +127,7 @@ import {
   logVentasPerfRoute,
   logVentasPerfStartupIfEnabled
 } from './ventas/utils/perfUtils.js';
+import { fetchInsumosMaestrosByIdsForUpdate } from '../services/inventarioStockValidator.js';
 
 const router = express.Router();
 
@@ -2077,22 +2078,13 @@ const buildAllowedExtrasMap = async (client, { normalizedItems = [], idSucursal 
           me.estado,
           me.id_insumo,
           me.cant,
-          me.id_unidad_medida,
-          i.cantidad AS stock_disponible,
-          i.id_almacen
+          me.id_unidad_medida
         FROM typed_params p
         INNER JOIN allowed_items ai
           ON true
         INNER JOIN public.menu_extras me
           ON me.id_extra = ai.id_extra
          AND COALESCE(me.estado, true) = true
-        LEFT JOIN public.insumos i
-          ON i.id_insumo = me.id_insumo
-         AND COALESCE(i.estado, true) = true
-        LEFT JOIN public.almacenes a
-          ON a.id_almacen = i.id_almacen
-         AND (p.id_sucursal IS NULL OR a.id_sucursal = p.id_sucursal)
-        WHERE me.id_insumo IS NULL OR a.id_almacen IS NOT NULL
         ORDER BY ai.tipo, ai.id_item, ai.orden, me.nombre
       `,
       params
@@ -2101,6 +2093,17 @@ const buildAllowedExtrasMap = async (client, { normalizedItems = [], idSucursal 
   } finally {
     perf?.add?.('pedido_pendiente_allowed_extras_query_ms', allowedExtrasQueryStart);
   }
+
+  const idSucursalNormalized = parseOptionalPositiveInt(idSucursal);
+  const extraInsumoIds = [...new Set(
+    rows.map((row) => parseOptionalPositiveInt(row.id_insumo)).filter(Boolean)
+  )];
+  const insumoInventoryById = idSucursalNormalized && extraInsumoIds.length > 0
+    ? new Map(
+        (await fetchInsumosMaestrosByIdsForUpdate(client, extraInsumoIds, idSucursalNormalized)).rows
+          .map((row) => [Number(row.id_insumo), row])
+      )
+    : new Map();
 
   return new Map(
     rows.map((row) => [
@@ -2116,8 +2119,12 @@ const buildAllowedExtrasMap = async (client, { normalizedItems = [], idSucursal 
         id_insumo: parseOptionalPositiveInt(row.id_insumo),
         cantidad_insumo: Number(row.cant || 0),
         id_unidad_medida: parseOptionalPositiveInt(row.id_unidad_medida),
-        stock_disponible: row.stock_disponible === null || row.stock_disponible === undefined ? null : Number(row.stock_disponible),
-        id_almacen: parseOptionalPositiveInt(row.id_almacen)
+        stock_disponible: parseOptionalPositiveInt(row.id_insumo)
+          ? Number(insumoInventoryById.get(parseOptionalPositiveInt(row.id_insumo))?.cantidad ?? 0)
+          : null,
+        id_almacen: parseOptionalPositiveInt(row.id_insumo)
+          ? parseOptionalPositiveInt(insumoInventoryById.get(parseOptionalPositiveInt(row.id_insumo))?.id_almacen)
+          : null
       }
     ])
   );
@@ -2773,7 +2780,8 @@ const hydrateVentaLines = async (client, normalizedItems, perf = null, options =
     productoIds,
     comboIds,
     recetaIds,
-    lockProductos: validateProductStock === true
+    lockProductos: validateProductStock === true,
+    idSucursal: options?.idSucursal
   });
   perf?.add?.('totals_catalogos_ms', catalogosStart);
   if (productoIds.length > 0) perf?.add?.('totals_productos_ms', catalogosStart);

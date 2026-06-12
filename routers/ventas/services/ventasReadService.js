@@ -1,5 +1,13 @@
+import { fetchProductosMaestrosByIdsForUpdate } from '../../../services/inventarioStockValidator.js';
+
 export const fetchProductoMap = async (client, ids, options = {}) => {
   if (!ids.length) return new Map();
+
+  const idSucursal = Number(options?.idSucursal || 0) || null;
+  if (idSucursal) {
+    const productosFetchResult = await fetchProductosMaestrosByIdsForUpdate(client, ids, idSucursal);
+    return new Map((productosFetchResult.rows || []).map((row) => [Number(row.id_producto), row]));
+  }
 
   const forUpdateClause = options?.forUpdate ? 'FOR UPDATE' : '';
   const result = await client.query(
@@ -50,14 +58,15 @@ export const fetchRecetaMap = async (client, ids) => {
   return new Map(result.rows.map((row) => [Number(row.id_receta), row]));
 };
 
-export const fetchVentaCatalogMaps = async (client, { productoIds = [], comboIds = [], recetaIds = [], lockProductos = true } = {}) => {
+export const fetchVentaCatalogMaps = async (client, { productoIds = [], comboIds = [], recetaIds = [], lockProductos = true, idSucursal = null } = {}) => {
   const uniqueProductoIds = [...new Set((Array.isArray(productoIds) ? productoIds : []).filter(Boolean))];
   const uniqueComboIds = [...new Set((Array.isArray(comboIds) ? comboIds : []).filter(Boolean))];
   const uniqueRecetaIds = [...new Set((Array.isArray(recetaIds) ? recetaIds : []).filter(Boolean))];
+  const productoMap = await fetchProductoMap(client, uniqueProductoIds, { forUpdate: lockProductos, idSucursal });
 
   if (uniqueProductoIds.length === 0 && uniqueComboIds.length === 0 && uniqueRecetaIds.length === 0) {
     return {
-      productoMap: new Map(),
+      productoMap,
       comboMap: new Map(),
       recetaMap: new Map()
     };
@@ -70,22 +79,6 @@ export const fetchVentaCatalogMaps = async (client, { productoIds = [], comboIds
     params.push(values);
     return `$${params.length}::int[]`;
   };
-
-  if (uniqueProductoIds.length > 0) {
-    const productosParam = addArrayParam(uniqueProductoIds);
-    const forUpdateClause = lockProductos ? 'FOR UPDATE' : '';
-    ctes.push(`
-      productos_rows AS (
-        SELECT id_producto, nombre_producto, precio, estado, cantidad, id_almacen
-        FROM productos
-        WHERE id_producto = ANY(${productosParam})
-        ${forUpdateClause}
-      )
-    `);
-    selects.push(`COALESCE((SELECT jsonb_agg(to_jsonb(pr)) FROM productos_rows pr), '[]'::jsonb) AS productos`);
-  } else {
-    selects.push(`'[]'::jsonb AS productos`);
-  }
 
   if (uniqueComboIds.length > 0) {
     const combosParam = addArrayParam(uniqueComboIds);
@@ -120,6 +113,14 @@ export const fetchVentaCatalogMaps = async (client, { productoIds = [], comboIds
     selects.push(`'[]'::jsonb AS recetas`);
   }
 
+  if (ctes.length === 0) {
+    return {
+      productoMap,
+      comboMap: new Map(),
+      recetaMap: new Map()
+    };
+  }
+
   const result = await client.query(
     `
       WITH ${ctes.join(',')}
@@ -128,12 +129,11 @@ export const fetchVentaCatalogMaps = async (client, { productoIds = [], comboIds
     params
   );
   const row = result.rows?.[0] || {};
-  const productos = Array.isArray(row.productos) ? row.productos : [];
   const combos = Array.isArray(row.combos) ? row.combos : [];
   const recetas = Array.isArray(row.recetas) ? row.recetas : [];
 
   return {
-    productoMap: new Map(productos.map((item) => [Number(item.id_producto), item])),
+    productoMap,
     comboMap: new Map(combos.map((item) => [Number(item.id_combo), item])),
     recetaMap: new Map(recetas.map((item) => [Number(item.id_receta), item]))
   };

@@ -79,7 +79,7 @@ const fetchProductosByIdsForUpdate = async (client, ids) => {
   return rs.rows;
 };
 
-const fetchProductosMaestrosByIdsForUpdate = async (client, ids, idSucursal) => {
+export const fetchProductosMaestrosByIdsForUpdate = async (client, ids, idSucursal) => {
   if (!ids.length) {
     return {
       rows: [],
@@ -333,7 +333,7 @@ const fetchInsumosByIdsForUpdate = async (client, ids) => {
   return rs.rows;
 };
 
-const fetchInsumosMaestrosByIdsForUpdate = async (client, ids, idSucursal) => {
+export const fetchInsumosMaestrosByIdsForUpdate = async (client, ids, idSucursal) => {
   if (!ids.length) {
     return {
       rows: [],
