@@ -1,5 +1,21 @@
 import pool from '../config/db-connection.js';
-import { resolveMenuDepartmentIds } from './menu_departamentos.js';
+
+const NOMBRES_DEPARTAMENTOS_PRODUCTOS = new Set([
+  'cervezas',
+  'cerveza',
+  'refrescos/agua',
+  'helados sarita',
+  'snacks',
+  'snack'
+]);
+
+const normalizarNombreDepartamento = (value) => String(value ?? '')
+  .trim()
+  .toLowerCase()
+  .normalize('NFD')
+  .replace(/\p{Diacritic}/gu, '')
+  .replace(/\s*\/\s*/g, '/')
+  .replace(/\s+/g, ' ');
 
 // Allowlist de campos permitidos para crear/actualizar recetas.
 const CAMPOS_PERMITIDOS_RECETAS = new Set([
@@ -229,47 +245,9 @@ export function normalizarPayloadReceta(payload) {
   return { ok: true, datos: datosNormalizados };
 }
 
-// Validaciones FK directas y explicitas segun esquema real.
-async function existeMenu(idMenu) {
-  const result = await pool.query('SELECT 1 FROM menu WHERE id_menu = $1 LIMIT 1', [idMenu]);
-  return result.rowCount > 0;
-}
-
-async function existeNivelPicante(idNivelPicante) {
-  const result = await pool.query(
-    'SELECT 1 FROM nivel_picante WHERE id_nivel_picante = $1 LIMIT 1',
-    [idNivelPicante]
-  );
-  return result.rowCount > 0;
-}
-
 export async function existeUsuario(idUsuario) {
   const result = await pool.query('SELECT 1 FROM usuarios WHERE id_usuario = $1 LIMIT 1', [idUsuario]);
   return result.rowCount > 0;
-}
-
-async function existeTipoDepartamento(idTipoDepartamento) {
-  const result = await pool.query(
-    'SELECT 1 FROM tipo_departamento WHERE id_tipo_departamento = $1 LIMIT 1',
-    [idTipoDepartamento]
-  );
-  return result.rowCount > 0;
-}
-
-async function existeArchivo(idArchivo) {
-  const result = await pool.query(
-    'SELECT 1 FROM archivos WHERE id_archivo = $1 AND COALESCE(estado, true) = true LIMIT 1',
-    [idArchivo]
-  );
-  return result.rowCount > 0;
-}
-
-async function esDepartamentoDeProductos(idTipoDepartamento) {
-  const departmentIds = await resolveMenuDepartmentIds();
-  const productDepartmentIds = Array.isArray(departmentIds?.productDepartmentIds)
-    ? departmentIds.productDepartmentIds
-    : [];
-  return productDepartmentIds.includes(Number(idTipoDepartamento));
 }
 
 export async function existeRecetaPorId(idReceta) {
@@ -306,38 +284,76 @@ export async function obtenerRecetaPorId(idReceta) {
   return result.rows[0] || null;
 }
 
-export async function validarReglasNegocioYFks(datosNormalizados) {
-  const existeFkMenu = await existeMenu(datosNormalizados.id_menu);
-  if (!existeFkMenu) {
+export async function validarReglasNegocioYFks(datosNormalizados, db = pool) {
+  const idArchivo = Object.prototype.hasOwnProperty.call(datosNormalizados, 'id_archivo')
+    ? datosNormalizados.id_archivo
+    : null;
+  const result = await db.query(
+    `
+      SELECT
+        EXISTS(SELECT 1 FROM menu WHERE id_menu = $1) AS existe_menu,
+        EXISTS(SELECT 1 FROM nivel_picante WHERE id_nivel_picante = $2) AS existe_nivel_picante,
+        EXISTS(SELECT 1 FROM usuarios WHERE id_usuario = $3) AS existe_usuario,
+        EXISTS(SELECT 1 FROM tipo_departamento WHERE id_tipo_departamento = $4) AS existe_tipo_departamento,
+        CASE
+          WHEN $5::integer IS NULL THEN true
+          ELSE EXISTS(
+            SELECT 1
+            FROM archivos
+            WHERE id_archivo = $5
+              AND COALESCE(estado, true) = true
+          )
+        END AS existe_archivo
+    `,
+    [
+      datosNormalizados.id_menu,
+      datosNormalizados.id_nivel_picante,
+      datosNormalizados.id_usuario,
+      datosNormalizados.id_tipo_departamento,
+      idArchivo
+    ]
+  );
+  const fks = result.rows?.[0] || {};
+
+  if (!fks.existe_menu) {
     return { ok: false, status: 400, message: 'id_menu no existe en menu.' };
   }
 
-  if (datosNormalizados.id_nivel_picante !== null) {
-    const existeFkNivelPicante = await existeNivelPicante(datosNormalizados.id_nivel_picante);
-    if (!existeFkNivelPicante) {
-      return { ok: false, status: 400, message: 'id_nivel_picante no existe en nivel_picante.' };
-    }
+  if (datosNormalizados.id_nivel_picante !== null && !fks.existe_nivel_picante) {
+    return { ok: false, status: 400, message: 'id_nivel_picante no existe en nivel_picante.' };
   }
 
-  const existeFkUsuario = await existeUsuario(datosNormalizados.id_usuario);
-  if (!existeFkUsuario) {
+  if (!fks.existe_usuario) {
     return { ok: false, status: 400, message: 'id_usuario no existe en usuarios.' };
   }
 
-  const existeFkTipoDepartamento = await existeTipoDepartamento(datosNormalizados.id_tipo_departamento);
-  if (!existeFkTipoDepartamento) {
+  if (!fks.existe_tipo_departamento) {
     return { ok: false, status: 400, message: 'id_tipo_departamento no existe en tipo_departamento.' };
   }
 
-  if (Object.prototype.hasOwnProperty.call(datosNormalizados, 'id_archivo') && datosNormalizados.id_archivo !== null) {
-    const existeFkArchivo = await existeArchivo(datosNormalizados.id_archivo);
-    if (!existeFkArchivo) {
-      return { ok: false, status: 400, message: 'id_archivo no existe o esta inactivo en archivos.' };
-    }
+  if (idArchivo !== null && !fks.existe_archivo) {
+    return { ok: false, status: 400, message: 'id_archivo no existe o esta inactivo en archivos.' };
   }
 
-  const departamentoEsDeProductos = await esDepartamentoDeProductos(datosNormalizados.id_tipo_departamento);
-  if (departamentoEsDeProductos) {
+  const departamentosResult = await db.query(
+    `
+      SELECT id_tipo_departamento, nombre_departamento
+      FROM tipo_departamento
+      ORDER BY id_tipo_departamento ASC
+    `
+  );
+  const primerIdPorNombre = new Map();
+  for (const row of departamentosResult.rows || []) {
+    const nombre = normalizarNombreDepartamento(row.nombre_departamento);
+    const id = Number(row.id_tipo_departamento);
+    if (nombre && esEnteroPositivo(id) && !primerIdPorNombre.has(nombre)) {
+      primerIdPorNombre.set(nombre, id);
+    }
+  }
+  const productDepartmentIds = [...NOMBRES_DEPARTAMENTOS_PRODUCTOS]
+    .map((nombre) => primerIdPorNombre.get(nombre))
+    .filter(esEnteroPositivo);
+  if (productDepartmentIds.includes(Number(datosNormalizados.id_tipo_departamento))) {
     return {
       ok: false,
       status: 409,

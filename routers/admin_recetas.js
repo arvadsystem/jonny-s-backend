@@ -36,6 +36,45 @@ import {
 } from '../services/recetaInsumosMaestrosService.js';
 
 const router = express.Router();
+const RECETAS_PERF_LOGS_ENABLED = String(process.env.RECETAS_PERF_LOGS || '').trim().toLowerCase() === 'true';
+
+const createRecetasPerfTracker = (endpoint, ingredientCount) => {
+  const startedAt = process.hrtime.bigint();
+  let validationsMs = null;
+  let writeStartedAt = null;
+  let writeMs = 0;
+  let success = false;
+  const elapsedMs = (from) => Number(process.hrtime.bigint() - from) / 1e6;
+
+  return {
+    validationsDone() {
+      if (validationsMs === null) validationsMs = elapsedMs(startedAt);
+    },
+    writeStarted() {
+      this.validationsDone();
+      writeStartedAt = process.hrtime.bigint();
+    },
+    writeDone() {
+      if (writeStartedAt) writeMs = elapsedMs(writeStartedAt);
+    },
+    succeeded() {
+      success = true;
+    },
+    finish() {
+      if (!RECETAS_PERF_LOGS_ENABLED) return;
+      const finalWriteMs = writeStartedAt && writeMs === 0 ? elapsedMs(writeStartedAt) : writeMs;
+      console.info(JSON.stringify({
+        event: 'recetas_write_perf',
+        endpoint,
+        total_ms: Number(elapsedMs(startedAt).toFixed(2)),
+        validations_ms: Number((validationsMs ?? elapsedMs(startedAt)).toFixed(2)),
+        escritura_ms: Number(finalWriteMs.toFixed(2)),
+        ingredient_count: ingredientCount,
+        result: success ? 'success' : 'error'
+      }));
+    }
+  };
+};
 // AM: transicion segura a permisos granulares sin romper el acceso actual mientras se alinea BD/roles.
 const MENU_RECETAS_VIEW_PERMISSIONS = ['MENU_RECETAS_VER', 'MENU_VER'];
 const MENU_RECETAS_CREATE_PERMISSIONS = ['MENU_RECETAS_CREAR', 'MENU_VER'];
@@ -293,10 +332,12 @@ const sincronizarUnidadesInsumosDesdeDetalle = async (client, detalle) => {
   return { ok: true };
 };
 
-const reemplazarDetalleReceta = async (client, idReceta, detalle) => {
-  await client.query('UPDATE detalle_recetas SET estado = false WHERE id_receta = $1', [idReceta]);
+const reemplazarDetalleReceta = async (client, idReceta, detalle, { desactivarAnterior = true } = {}) => {
+  if (desactivarAnterior) {
+    await client.query('UPDATE detalle_recetas SET estado = false WHERE id_receta = $1', [idReceta]);
+  }
 
-  for (const item of detalle) {
+  if (detalle.length > 0) {
     await client.query(
       `
         INSERT INTO detalle_recetas (
@@ -305,9 +346,20 @@ const reemplazarDetalleReceta = async (client, idReceta, detalle) => {
           cant,
           estado,
           id_unidad_medida
-        ) VALUES ($1, $2, $3, true, $4)
+        )
+        SELECT
+          $1,
+          item.id_insumo,
+          item.cant,
+          true,
+          item.id_unidad_medida
+        FROM jsonb_to_recordset($2::jsonb) AS item(
+          id_insumo integer,
+          cant numeric,
+          id_unidad_medida integer
+        )
       `,
-      [idReceta, item.id_insumo, item.cant, item.id_unidad_medida]
+      [idReceta, JSON.stringify(detalle)]
     );
   }
 };
@@ -632,6 +684,12 @@ router.get('/:id_receta', checkPermission(MENU_RECETAS_VIEW_PERMISSIONS), async 
 // POST: crear receta.
 router.post('/', checkPermission(MENU_RECETAS_CREATE_PERMISSIONS), async (req, res) => {
   const client = await pool.connect();
+  const perf = createRecetasPerfTracker(
+    'POST /admin/recetas',
+    Array.isArray(req.body?.detalle_receta || req.body?.detalle)
+      ? (req.body.detalle_receta || req.body.detalle).length
+      : 0
+  );
 
   try {
     const actorUserId = resolveActorUserId(req);
@@ -693,22 +751,13 @@ router.post('/', checkPermission(MENU_RECETAS_CREATE_PERMISSIONS), async (req, r
     }
     delete datosNormalizados.url_imagen_publica;
 
-    const reglasValidation = await validarReglasNegocioYFks(datosNormalizados);
+    const reglasValidation = await validarReglasNegocioYFks(datosNormalizados, client);
     if (!reglasValidation.ok) {
       return res.status(reglasValidation.status).json({ error: true, message: reglasValidation.message });
     }
 
     const nowIso = new Date().toISOString();
-    const datosInsert = {
-      ...datosNormalizados,
-      fecha_creacion: nowIso,
-      fecha_modificacion: nowIso
-    };
-
-    const datosInsertSinNull = Object.fromEntries(
-      Object.entries(datosInsert).filter(([, valor]) => valor !== null)
-    );
-
+    perf.writeStarted();
     await client.query('BEGIN');
     if (!shouldUseCatalogoMaestroInsumos()) {
       const unidadSyncValidation = await sincronizarUnidadesInsumosDesdeDetalle(client, detalleNormalizado);
@@ -718,33 +767,51 @@ router.post('/', checkPermission(MENU_RECETAS_CREATE_PERMISSIONS), async (req, r
       }
     }
 
-    await client.query('CALL pa_insert($1, $2)', ['recetas', datosInsertSinNull]);
-
     const createdResult = await client.query(
       `
-        SELECT id_receta
-        FROM recetas
-        WHERE nombre_receta = $1
-          AND id_menu = $2
-          AND COALESCE(estado, true) = $3
-        ORDER BY id_receta DESC
-        LIMIT 1
+        INSERT INTO recetas (
+          nombre_receta,
+          descripcion,
+          id_menu,
+          id_nivel_picante,
+          id_archivo,
+          fecha_creacion,
+          fecha_modificacion,
+          id_usuario,
+          estado,
+          id_tipo_departamento,
+          precio
+        ) VALUES ($1, $2, $3, $4, $5, $6, $6, $7, $8, $9, $10)
+        RETURNING id_receta
       `,
-      [datosInsertSinNull.nombre_receta, datosInsertSinNull.id_menu, datosInsertSinNull.estado]
+      [
+        datosNormalizados.nombre_receta,
+        datosNormalizados.descripcion,
+        datosNormalizados.id_menu,
+        datosNormalizados.id_nivel_picante,
+        datosNormalizados.id_archivo ?? null,
+        nowIso,
+        datosNormalizados.id_usuario,
+        datosNormalizados.estado,
+        datosNormalizados.id_tipo_departamento,
+        datosNormalizados.precio
+      ]
     );
     const idRecetaCreada = Number(createdResult.rows?.[0]?.id_receta || 0) || null;
     if (!esEnteroPositivo(idRecetaCreada)) {
       throw new Error('No se pudo resolver la receta creada para guardar su detalle.');
     }
 
-    await reemplazarDetalleReceta(client, idRecetaCreada, detalleNormalizado);
+    await reemplazarDetalleReceta(client, idRecetaCreada, detalleNormalizado, { desactivarAnterior: false });
     await autoPublishNewRecipe({
       client,
-      idMenu: datosInsertSinNull.id_menu,
+      idMenu: datosNormalizados.id_menu,
       idReceta: idRecetaCreada,
       estadoItem: datosNormalizados.estado ?? true
     });
     await client.query('COMMIT');
+    perf.writeDone();
+    perf.succeeded();
 
     return res.status(201).json({
       error: false,
@@ -787,6 +854,7 @@ router.post('/', checkPermission(MENU_RECETAS_CREATE_PERMISSIONS), async (req, r
 
     return res.status(500).json({ error: true, message: getSafeServerErrorMessage(err) });
   } finally {
+    perf.finish();
     client.release();
   }
 });
@@ -794,6 +862,12 @@ router.post('/', checkPermission(MENU_RECETAS_CREATE_PERMISSIONS), async (req, r
 // PUT: actualizar receta completa por id.
 router.put('/:id_receta', checkPermission(MENU_RECETAS_EDIT_PERMISSIONS), async (req, res) => {
   const client = await pool.connect();
+  const perf = createRecetasPerfTracker(
+    'PUT /admin/recetas/:id_receta',
+    Array.isArray(req.body?.detalle_receta || req.body?.detalle)
+      ? (req.body.detalle_receta || req.body.detalle).length
+      : 0
+  );
 
   try {
     const actorUserId = resolveActorUserId(req);
@@ -811,10 +885,19 @@ router.put('/:id_receta', checkPermission(MENU_RECETAS_EDIT_PERMISSIONS), async 
       return res.status(400).json({ error: true, message: 'id_receta invalido.' });
     }
 
-    const recetaExiste = await existeRecetaPorId(idReceta);
-    if (!recetaExiste) {
+    const recetaActualResult = await client.query(
+      `
+        SELECT id_menu
+        FROM recetas
+        WHERE id_receta = $1
+        LIMIT 1
+      `,
+      [idReceta]
+    );
+    if (recetaActualResult.rowCount === 0) {
       return res.status(404).json({ error: true, message: 'Receta no encontrada.' });
     }
+    const previousMenuId = Number(recetaActualResult.rows[0].id_menu || 0) || null;
 
     const detalleValidation = normalizeDetalleRecetaPayload(req.body?.detalle_receta || req.body?.detalle || []);
     if (!detalleValidation.ok) {
@@ -827,17 +910,6 @@ router.put('/:id_receta', checkPermission(MENU_RECETAS_EDIT_PERMISSIONS), async 
     if (!fkDetalleValidation.ok) {
       return res.status(fkDetalleValidation.status).json({ error: true, message: fkDetalleValidation.message });
     }
-
-    const recetaActualResult = await client.query(
-      `
-        SELECT id_menu
-        FROM recetas
-        WHERE id_receta = $1
-        LIMIT 1
-      `,
-      [idReceta]
-    );
-    const previousMenuId = Number(recetaActualResult.rows?.[0]?.id_menu || 0) || null;
 
     const payloadConActor = { ...(req.body || {}), id_usuario: actorUserId };
     delete payloadConActor.detalle_receta;
@@ -876,11 +948,12 @@ router.put('/:id_receta', checkPermission(MENU_RECETAS_EDIT_PERMISSIONS), async 
     }
     delete datosNormalizados.url_imagen_publica;
 
-    const reglasValidation = await validarReglasNegocioYFks(datosNormalizados);
+    const reglasValidation = await validarReglasNegocioYFks(datosNormalizados, client);
     if (!reglasValidation.ok) {
       return res.status(reglasValidation.status).json({ error: true, message: reglasValidation.message });
     }
 
+    perf.writeStarted();
     await client.query('BEGIN');
     if (!shouldUseCatalogoMaestroInsumos()) {
       const unidadSyncValidation = await sincronizarUnidadesInsumosDesdeDetalle(client, detalleNormalizado);
@@ -890,9 +963,37 @@ router.put('/:id_receta', checkPermission(MENU_RECETAS_EDIT_PERMISSIONS), async 
       }
     }
 
-    for (const campo of Object.keys(datosNormalizados)) {
-      await actualizarCampoReceta(client, idReceta, campo, datosNormalizados[campo]);
-    }
+    await client.query(
+      `
+        UPDATE recetas
+        SET
+          nombre_receta = $2,
+          descripcion = $3,
+          id_menu = $4,
+          id_nivel_picante = $5,
+          id_archivo = CASE WHEN $11 THEN $6 ELSE id_archivo END,
+          id_usuario = $7,
+          estado = $8,
+          id_tipo_departamento = $9,
+          precio = $10,
+          fecha_modificacion = timezone('America/Tegucigalpa', now())
+        WHERE id_receta = $1
+        RETURNING id_receta
+      `,
+      [
+        idReceta,
+        datosNormalizados.nombre_receta,
+        datosNormalizados.descripcion,
+        datosNormalizados.id_menu,
+        datosNormalizados.id_nivel_picante,
+        datosNormalizados.id_archivo ?? null,
+        datosNormalizados.id_usuario,
+        datosNormalizados.estado,
+        datosNormalizados.id_tipo_departamento,
+        datosNormalizados.precio,
+        Object.prototype.hasOwnProperty.call(datosNormalizados, 'id_archivo')
+      ]
+    );
 
     await reemplazarDetalleReceta(client, idReceta, detalleNormalizado);
     await moveRecipePublicationToMenu({
@@ -902,16 +1003,9 @@ router.put('/:id_receta', checkPermission(MENU_RECETAS_EDIT_PERMISSIONS), async 
       toMenuId: datosNormalizados.id_menu
     });
 
-    await client.query(
-      `
-        UPDATE recetas
-        SET fecha_modificacion = timezone('America/Tegucigalpa', now())
-        WHERE id_receta = $1
-      `,
-      [idReceta]
-    );
-
     await client.query('COMMIT');
+    perf.writeDone();
+    perf.succeeded();
     return res.status(200).json({ error: false, message: 'Receta actualizada correctamente.' });
   } catch (err) {
     await client.query('ROLLBACK');
@@ -935,6 +1029,7 @@ router.put('/:id_receta', checkPermission(MENU_RECETAS_EDIT_PERMISSIONS), async 
 
     return res.status(500).json({ error: true, message: getSafeServerErrorMessage(err) });
   } finally {
+    perf.finish();
     client.release();
   }
 });

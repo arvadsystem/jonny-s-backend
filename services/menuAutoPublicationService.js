@@ -22,38 +22,33 @@ const MENU_PRODUCT_CATEGORY_ALIASES = Object.freeze([
 
 let detalleMenuCapabilitiesPromise = null;
 
-const hasColumn = async (tableName, columnName, db = pool) => {
-  const result = await db.query(
-    `
-      SELECT 1
-      FROM information_schema.columns
-      WHERE table_schema = 'public'
-        AND table_name = $1
-        AND column_name = $2
-      LIMIT 1;
-    `,
-    [tableName, columnName]
-  );
-
-  return result.rowCount > 0;
-};
-
 const getDetalleMenuCapabilities = async (db = pool) => {
   if (!detalleMenuCapabilitiesPromise) {
-    detalleMenuCapabilitiesPromise = Promise.all([
-      hasColumn('detalle_menu', 'id_receta', db),
-      hasColumn('detalle_menu', 'id_combo', db),
-      hasColumn('detalle_menu', 'visible', db),
-      hasColumn('detalle_menu', 'precio_publico', db),
-      hasColumn('detalle_menu', 'orden', db)
-    ])
-      .then(([hasIdReceta, hasIdCombo, hasVisible, hasPrecioPublico, hasOrden]) => ({
-        hasIdReceta,
-        hasIdCombo,
-        hasVisible,
-        hasPrecioPublico,
-        hasOrden
-      }))
+    detalleMenuCapabilitiesPromise = db.query(
+      `
+        SELECT
+          COALESCE(BOOL_OR(column_name = 'id_receta'), false) AS has_id_receta,
+          COALESCE(BOOL_OR(column_name = 'id_combo'), false) AS has_id_combo,
+          COALESCE(BOOL_OR(column_name = 'visible'), false) AS has_visible,
+          COALESCE(BOOL_OR(column_name = 'precio_publico'), false) AS has_precio_publico,
+          COALESCE(BOOL_OR(column_name = 'orden'), false) AS has_orden
+        FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name = 'detalle_menu'
+          AND column_name = ANY($1::text[]);
+      `,
+      [['id_receta', 'id_combo', 'visible', 'precio_publico', 'orden']]
+    )
+      .then((result) => {
+        const row = result.rows?.[0] || {};
+        return {
+          hasIdReceta: Boolean(row.has_id_receta),
+          hasIdCombo: Boolean(row.has_id_combo),
+          hasVisible: Boolean(row.has_visible),
+          hasPrecioPublico: Boolean(row.has_precio_publico),
+          hasOrden: Boolean(row.has_orden)
+        };
+      })
       .catch((error) => {
         detalleMenuCapabilitiesPromise = null;
         throw error;
