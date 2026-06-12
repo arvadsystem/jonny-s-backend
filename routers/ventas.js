@@ -130,7 +130,7 @@ import {
   logVentasPerfRoute,
   logVentasPerfStartupIfEnabled
 } from './ventas/utils/perfUtils.js';
-import { fetchInsumosMaestrosByIdsForUpdate } from '../services/inventarioStockValidator.js';
+import { resolveExtrasInventory } from './ventas/services/extrasInventoryService.js';
 
 const router = express.Router();
 
@@ -2113,39 +2113,54 @@ const buildAllowedExtrasMap = async (client, { normalizedItems = [], idSucursal 
     perf?.add?.('pedido_pendiente_allowed_extras_query_ms', allowedExtrasQueryStart);
   }
 
-  const idSucursalNormalized = parseOptionalPositiveInt(idSucursal);
-  const extraInsumoIds = [...new Set(
-    rows.map((row) => parseOptionalPositiveInt(row.id_insumo)).filter(Boolean)
-  )];
-  const insumoInventoryById = idSucursalNormalized && extraInsumoIds.length > 0
-    ? new Map(
-        (await fetchInsumosMaestrosByIdsForUpdate(client, extraInsumoIds, idSucursalNormalized)).rows
-          .map((row) => [Number(row.id_insumo), row])
-      )
-    : new Map();
+  const uniqueExtrasById = new Map();
+  for (const row of rows) {
+    const idExtra = parseOptionalPositiveInt(row.id_extra);
+    if (idExtra && !uniqueExtrasById.has(idExtra)) uniqueExtrasById.set(idExtra, row);
+  }
+  const resolvedInventoryRows = await resolveExtrasInventory({
+    queryRunner: client,
+    extras: [...uniqueExtrasById.values()],
+    idSucursal,
+    mode: 'transactional'
+  });
+  const inventoryByExtraId = new Map(
+    resolvedInventoryRows.map((row) => [Number(row.id_extra), row])
+  );
 
   return new Map(
-    rows.map((row) => [
-      buildExtraLineKey(row.tipo, row.id_item, row.id_extra),
-      {
-        tipo: String(row.tipo || '').trim().toUpperCase(),
-        id_item: Number(row.id_item || 0),
-        id_extra: Number(row.id_extra || 0),
-        codigo: String(row.codigo || '').trim(),
-        nombre: String(row.nombre || 'Extra').trim(),
-        precio_unitario: roundMoney(row.precio_adicional),
-        estado: parseBooleanish(row.estado),
-        id_insumo: parseOptionalPositiveInt(row.id_insumo),
-        cantidad_insumo: Number(row.cant || 0),
-        id_unidad_medida: parseOptionalPositiveInt(row.id_unidad_medida),
-        stock_disponible: parseOptionalPositiveInt(row.id_insumo)
-          ? Number(insumoInventoryById.get(parseOptionalPositiveInt(row.id_insumo))?.cantidad ?? 0)
-          : null,
-        id_almacen: parseOptionalPositiveInt(row.id_insumo)
-          ? parseOptionalPositiveInt(insumoInventoryById.get(parseOptionalPositiveInt(row.id_insumo))?.id_almacen)
-          : null
-      }
-    ])
+    rows.map((row) => {
+      const inventory = inventoryByExtraId.get(Number(row.id_extra)) || {};
+      return [
+        buildExtraLineKey(row.tipo, row.id_item, row.id_extra),
+        {
+          tipo: String(row.tipo || '').trim().toUpperCase(),
+          id_item: Number(row.id_item || 0),
+          id_extra: Number(row.id_extra || 0),
+          codigo: String(row.codigo || '').trim(),
+          nombre: String(row.nombre || 'Extra').trim(),
+          precio_unitario: roundMoney(row.precio_adicional),
+          estado: parseBooleanish(row.estado),
+          id_insumo_configurado: parseOptionalPositiveInt(inventory.id_insumo_configurado),
+          id_insumo_maestro: parseOptionalPositiveInt(inventory.id_insumo_maestro),
+          id_insumo_legacy: parseOptionalPositiveInt(inventory.id_insumo_legacy),
+          id_insumo: inventory.usa_catalogo_maestro
+            ? parseOptionalPositiveInt(inventory.id_insumo_maestro)
+            : parseOptionalPositiveInt(inventory.id_insumo_legacy || inventory.id_insumo_configurado),
+          cantidad_insumo: Number(inventory.cantidad_consumo_base || 0),
+          id_unidad_medida: parseOptionalPositiveInt(inventory.id_unidad_base),
+          stock_disponible: inventory.stock_disponible === null || inventory.stock_disponible === undefined
+            ? null
+            : Number(inventory.stock_disponible),
+          id_almacen: parseOptionalPositiveInt(inventory.id_almacen),
+          inventario_configurado: Boolean(inventory.inventario_configurado),
+          disponible: Boolean(inventory.disponible),
+          motivo_no_disponible: inventory.motivo_no_disponible || null,
+          codigo_no_disponible: inventory.codigo_no_disponible || null,
+          usa_catalogo_maestro: Boolean(inventory.usa_catalogo_maestro)
+        }
+      ];
+    })
   );
 };
 
@@ -2170,9 +2185,31 @@ const resolveLineExtras = ({ item, allowedExtrasMap }) => {
     if (cantidad > Number(item.cantidad || 0)) {
       return { ok: false, message: 'La cantidad de un extra no puede ser mayor que la cantidad del item.' };
     }
-    const requiredInsumo = extra.id_insumo ? Number(extra.cantidad_insumo || 0) * cantidad : 0;
-    if (extra.id_insumo && (!extra.id_almacen || requiredInsumo <= 0)) {
-      return { ok: false, message: `El extra ${extra.nombre} no tiene configuracion de inventario completa.` };
+    if (extra.disponible !== true) {
+      return {
+        ok: false,
+        status: 409,
+        code: 'VENTAS_EXTRA_INVENTARIO_NO_DISPONIBLE',
+        message: `El extra ${extra.nombre} no esta disponible en esta sucursal: ${String(extra.motivo_no_disponible || 'requiere revisar su configuracion de inventario.').toLowerCase()}`
+      };
+    }
+    const controlsInventory = Boolean(extra.id_insumo_configurado);
+    const requiredInsumo = controlsInventory ? Number(extra.cantidad_insumo || 0) * cantidad : 0;
+    if (controlsInventory && (!extra.inventario_configurado || !extra.id_insumo || !extra.id_almacen || requiredInsumo <= 0)) {
+      return {
+        ok: false,
+        status: 409,
+        code: 'VENTAS_EXTRA_INVENTARIO_NO_DISPONIBLE',
+        message: `El extra ${extra.nombre} no esta disponible en esta sucursal: requiere revisar su configuracion de inventario.`
+      };
+    }
+    if (controlsInventory && Number(extra.stock_disponible ?? 0) < requiredInsumo) {
+      return {
+        ok: false,
+        status: 409,
+        code: 'VENTAS_EXTRA_INVENTARIO_NO_DISPONIBLE',
+        message: `No hay existencias suficientes para el extra ${extra.nombre}.`
+      };
     }
     const lineSubtotal = roundMoney(extra.precio_unitario * cantidad);
     subtotal = roundMoney(subtotal + lineSubtotal);
@@ -2183,9 +2220,9 @@ const resolveLineExtras = ({ item, allowedExtrasMap }) => {
       cantidad,
       precio_unitario: extra.precio_unitario,
       subtotal: lineSubtotal,
-      id_insumo: extra.id_insumo,
-      cantidad_insumo: extra.id_insumo ? Number(extra.cantidad_insumo || 0) : null,
-      cant: extra.id_insumo ? Number(extra.cantidad_insumo || 0) : null,
+      id_insumo: controlsInventory ? extra.id_insumo : null,
+      cantidad_insumo: controlsInventory ? Number(extra.cantidad_insumo || 0) : null,
+      cant: controlsInventory ? Number(extra.cantidad_insumo || 0) : null,
       id_unidad_medida: extra.id_unidad_medida,
       stock_disponible: extra.stock_disponible,
       id_almacen: extra.id_almacen
@@ -2929,8 +2966,8 @@ const hydrateVentaLines = async (client, normalizedItems, perf = null, options =
       if (!extrasResult.ok) {
         return {
           ok: false,
-          status: 400,
-          body: { error: true, message: extrasResult.message }
+          status: extrasResult.status || 400,
+          body: { error: true, code: extrasResult.code || undefined, message: extrasResult.message }
         };
       }
       lines.push({
@@ -3060,8 +3097,8 @@ const hydrateVentaLines = async (client, normalizedItems, perf = null, options =
     if (!extrasResult.ok) {
       return {
         ok: false,
-        status: 400,
-        body: { error: true, message: extrasResult.message }
+        status: extrasResult.status || 400,
+        body: { error: true, code: extrasResult.code || undefined, message: extrasResult.message }
       };
     }
     lines.push({

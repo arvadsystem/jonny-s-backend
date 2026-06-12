@@ -10,6 +10,7 @@ import {
   resolveComboComplementMetadata,
   resolveRecetaComplementMetadata
 } from '../services/complementosCatalogService.js';
+import { resolveExtrasInventory } from '../services/extrasInventoryService.js';
 import { roundMoney } from '../utils/moneyUtils.js';
 import {
   coercePositiveIntArray,
@@ -172,6 +173,12 @@ export const listExtrasPermitidosCatalogoHandler = async (req, res) => {
   }
 
   try {
+    const scope = await resolveRequestUserSucursalScope(req);
+    const sucursalValidation = await validateVentasCatalogSucursal({ scope, idSucursal });
+    if (!sucursalValidation.ok) {
+      return res.status(sucursalValidation.status).json(sucursalValidation.body);
+    }
+
     const hasMenuExtraCombo = await hasTable(pool, 'menu_extra_combo');
     if (tipo === 'COMBO' && !hasMenuExtraCombo) {
       return res.status(200).json([]);
@@ -193,32 +200,41 @@ export const listExtrasPermitidosCatalogoHandler = async (req, res) => {
           me.precio_adicional AS precio,
           COALESCE(me.estado, true) AS estado,
           me.id_insumo,
-          CASE WHEN me.id_insumo IS NULL THEN NULL ELSE i.cantidad END AS stock_disponible
+          me.cant,
+          me.id_unidad_medida
         FROM public.menu_extras me
         INNER JOIN ${linkJoin}
           AND COALESCE(rel.estado, true) = true
-        LEFT JOIN public.insumos i
-          ON i.id_insumo = me.id_insumo
-         AND COALESCE(i.estado, true) = true
-        LEFT JOIN public.almacenes a
-          ON a.id_almacen = i.id_almacen
-         AND ($2::int IS NULL OR a.id_sucursal = $2::int)
-        WHERE COALESCE(me.estado, true) = true
-          AND (me.id_insumo IS NULL OR a.id_almacen IS NOT NULL)
         ORDER BY ${orderExpression}, me.nombre ASC
       `,
-      [idItem, idSucursal || null]
+      [idItem]
     );
 
+    const resolvedExtras = await resolveExtrasInventory({
+      queryRunner: pool,
+      extras: result.rows,
+      idSucursal,
+      mode: 'catalog'
+    });
+
     return res.status(200).json(
-      result.rows.map((row) => ({
+      resolvedExtras.map((row) => ({
         id_extra: Number(row.id_extra),
         codigo: row.codigo,
         nombre: row.nombre,
         precio: roundMoney(row.precio),
         estado: parseBooleanish(row.estado),
-        id_insumo: parseOptionalPositiveInt(row.id_insumo),
-        stock_disponible: row.stock_disponible === null || row.stock_disponible === undefined ? null : Number(row.stock_disponible)
+        id_insumo: parseOptionalPositiveInt(row.id_insumo_configurado),
+        id_insumo_maestro: parseOptionalPositiveInt(row.id_insumo_maestro),
+        stock_disponible: row.stock_disponible === null || row.stock_disponible === undefined ? null : Number(row.stock_disponible),
+        cantidad_consumo_base: row.cantidad_consumo_base === null || row.cantidad_consumo_base === undefined
+          ? null
+          : Number(row.cantidad_consumo_base),
+        id_unidad_base: parseOptionalPositiveInt(row.id_unidad_base),
+        disponible: Boolean(row.disponible),
+        inventario_configurado: Boolean(row.inventario_configurado),
+        motivo_no_disponible: row.motivo_no_disponible || null,
+        codigo_no_disponible: row.codigo_no_disponible || null
       }))
     );
   } catch (err) {
