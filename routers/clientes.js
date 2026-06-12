@@ -611,6 +611,7 @@ const clienteRepository = {
     limit,
     searchTerm = '',
     estado = null,
+    origen = null,
     tenantId = null,
     idSucursal = null
   }) {
@@ -666,6 +667,12 @@ const clienteRepository = {
 
     if (estado !== null && capabilities.softDeleteField) {
       pushFilter(`c.${capabilities.softDeleteField} = $IDX`, estado);
+    }
+
+    if (origen === 'persona') {
+      filters.push('c.id_persona IS NOT NULL');
+    } else if (origen === 'empresa') {
+      filters.push(`c.id_persona IS NULL AND ${empresaRelationExpr} IS NOT NULL`);
     }
 
     if (idSucursal) {
@@ -1387,11 +1394,19 @@ const clienteService = {
     const searchQuery = typeof req.query.q === 'string' ? req.query.q.trim() : '';
     const searchName = typeof req.query.nombre === 'string' ? req.query.nombre.trim() : '';
     const effectiveSearch = search || searchQuery || searchName;
+    const origenRaw = typeof req.query.origen === 'string' ? req.query.origen.trim().toLowerCase() : '';
+    const origen = origenRaw === '' ? null : (origenRaw === 'persona' || origenRaw === 'empresa' ? origenRaw : null);
     const estado = parseBooleanFilter(req.query.estado);
     if (req.query.estado !== undefined && estado === null) {
       return {
         status: 400,
         body: buildErrorBody({ code: 'VALIDATION_ERROR', message: 'El filtro estado debe ser booleano' })
+      };
+    }
+    if (req.query.origen !== undefined && origen === null) {
+      return {
+        status: 400,
+        body: buildErrorBody({ code: 'VALIDATION_ERROR', message: 'El filtro origen debe ser "persona" o "empresa".' })
       };
     }
 
@@ -1421,6 +1436,7 @@ const clienteService = {
       limit,
       searchTerm: effectiveSearch,
       estado,
+      origen,
       tenantId,
       idSucursal: null
     });
