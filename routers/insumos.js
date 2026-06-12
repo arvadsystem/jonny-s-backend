@@ -26,6 +26,12 @@ import {
   reactivateCatalogoMaestroAssignment,
   resolveCatalogoMaestroEntity
 } from '../services/catalogoMaestroAsignacionesService.js';
+import {
+  buildCatalogoMaestroExistingResponse,
+  buildCatalogoMutationErrorResponse,
+  findCatalogoMaestroByNormalizedName,
+  resolveCatalogoMaestroMutationTarget
+} from '../services/catalogoMaestroMutationGuardService.js';
 
 const router = express.Router();
 const INSUMOS_LIST_PERMISSIONS = ['INVENTARIO_INSUMOS_VER', 'INVENTARIO_INSUMOS_DETALLE_VER'];
@@ -1665,6 +1671,16 @@ router.post('/insumos', checkPermission(INSUMOS_CREATE_PERMISSIONS), async (req,
 
     await client.query('BEGIN');
 
+    const existingMasterId = await findCatalogoMaestroByNormalizedName(
+      'insumo',
+      payload.nombre_insumo,
+      client
+    );
+    if (existingMasterId) {
+      await client.query('ROLLBACK');
+      return res.status(409).json(buildCatalogoMaestroExistingResponse('insumo', existingMasterId));
+    }
+
     for (const idAlmacen of idAlmacenes) {
       const almacenValidation = await validateAlmacenActivo(idAlmacen, client);
       if (!almacenValidation.ok) {
@@ -1769,7 +1785,8 @@ router.post('/insumos', checkPermission(INSUMOS_CREATE_PERMISSIONS), async (req,
 router.put('/insumos/multi-almacen', checkPermission(INSUMOS_EDIT_PERMISSIONS), async (_req, res) => {
   return res.status(410).json({
     error: true,
-    message: 'Este endpoint ha sido descontinuado. El sistema actual de Insumos ya no soporta multi-almacÃ©n.'
+    code: 'CATALOGO_MULTI_ALMACEN_DEPRECATED',
+    message: 'Este endpoint fue descontinuado. Usa Gestionar sucursales.'
   });
 });
 
@@ -1793,6 +1810,11 @@ router.put('/insumos/edicion', checkPermission(INSUMOS_EDIT_PERMISSIONS), async 
     const idInsumo = Number.parseInt(String(datosEntrada.id_insumo ?? ''), 10);
     if (!isPositiveIntegerId(idInsumo)) {
       return res.status(400).json({ error: true, message: 'id_insumo invalido.' });
+    }
+
+    const mutationTarget = await resolveCatalogoMaestroMutationTarget('insumo', idInsumo, client);
+    if (!mutationTarget.ok) {
+      return res.status(mutationTarget.status).json(buildCatalogoMutationErrorResponse(mutationTarget));
     }
 
     if (Object.prototype.hasOwnProperty.call(datosEntrada, 'estado')) {
@@ -2001,6 +2023,18 @@ router.put('/insumos', checkPermission(INSUMOS_EDIT_PERMISSIONS), async (req, re
       return res.status(400).json({ error: true, message: 'Faltan campos obligatorios' });
     }
 
+    if (!ID_CAMPOS_PERMITIDOS.has(id_campo)) {
+      return res.status(400).json({ error: true, message: 'id_campo no permitido para actualizacion.' });
+    }
+    const idInsumo = Number.parseInt(String(id_valor ?? ''), 10);
+    if (!isPositiveIntegerId(idInsumo)) {
+      return res.status(400).json({ error: true, message: 'id_valor debe ser un entero mayor a 0.' });
+    }
+    const mutationTarget = await resolveCatalogoMaestroMutationTarget('insumo', idInsumo, pool);
+    if (!mutationTarget.ok) {
+      return res.status(mutationTarget.status).json(buildCatalogoMutationErrorResponse(mutationTarget));
+    }
+
     if (campo === 'cantidad') {
       return res.status(400).json({
         error: true,
@@ -2115,25 +2149,22 @@ router.put('/insumos', checkPermission(INSUMOS_EDIT_PERMISSIONS), async (req, re
     }
 
     if (campo === 'nombre_insumo') {
-      const idInsumo = Number.parseInt(String(id_valor ?? ''), 10);
-      if (isPositiveIntegerId(idInsumo)) {
-        const insumoActualParaDuplicado = await getInsumoById(idInsumo, pool);
-        if (insumoActualParaDuplicado) {
-          const nombreFinal = String(valorNormalizado ?? '');
-          const idAlmacenFinal = Number.parseInt(String(insumoActualParaDuplicado.id_almacen ?? ''), 10);
+      const insumoActualParaDuplicado = await getInsumoById(idInsumo, pool);
+      if (insumoActualParaDuplicado) {
+        const nombreFinal = String(valorNormalizado ?? '');
+        const idAlmacenFinal = Number.parseInt(String(insumoActualParaDuplicado.id_almacen ?? ''), 10);
 
-          if (String(nombreFinal).trim() !== '' && isPositiveIntegerId(idAlmacenFinal)) {
-            const duplicateByNombreAlmacen = await findInsumoByUniqueKey(
-              {
-                nombre_insumo: nombreFinal,
-                id_almacen: idAlmacenFinal,
-                excludeId: idInsumo
-              },
-              pool
-            );
-            if (duplicateByNombreAlmacen) {
-              return res.status(409).json({ error: true, message: INSUMOS_DUPLICATE_MESSAGE });
-            }
+        if (String(nombreFinal).trim() !== '' && isPositiveIntegerId(idAlmacenFinal)) {
+          const duplicateByNombreAlmacen = await findInsumoByUniqueKey(
+            {
+              nombre_insumo: nombreFinal,
+              id_almacen: idAlmacenFinal,
+              excludeId: idInsumo
+            },
+            pool
+          );
+          if (duplicateByNombreAlmacen) {
+            return res.status(409).json({ error: true, message: INSUMOS_DUPLICATE_MESSAGE });
           }
         }
       }
@@ -2149,10 +2180,6 @@ router.put('/insumos', checkPermission(INSUMOS_EDIT_PERMISSIONS), async (req, re
     if (!CAMPOS_GENERICOS_ACTUALIZABLES.has(campo)) {
       return res.status(400).json({ error: true, message: 'campo no permitido para actualizacion.' });
     }
-    if (!ID_CAMPOS_PERMITIDOS.has(id_campo)) {
-      return res.status(400).json({ error: true, message: 'id_campo no permitido para actualizacion.' });
-    }
-
     const query = `UPDATE public.insumos SET ${campo} = $1 WHERE ${id_campo} = $2`;
     await pool.query(query, [valorNormalizado, id_valor]);
 
@@ -2180,6 +2207,11 @@ router.patch('/insumos/estado', checkPermission(INSUMOS_STATE_PERMISSIONS), asyn
     const idInsumo = Number.parseInt(String(req.body?.id_insumo ?? ''), 10);
     if (!isPositiveIntegerId(idInsumo)) {
       return res.status(400).json({ error: true, message: 'id_insumo invalido.' });
+    }
+
+    const mutationTarget = await resolveCatalogoMaestroMutationTarget('insumo', idInsumo, pool);
+    if (!mutationTarget.ok) {
+      return res.status(mutationTarget.status).json(buildCatalogoMutationErrorResponse(mutationTarget));
     }
 
     const rawEstado = req.body?.estado;
@@ -2243,6 +2275,11 @@ router.delete('/insumos', checkPermission(INSUMOS_DELETE_PERMISSIONS), async (re
     const insumoId = Number(valor_id);
     if (!isPositiveIntegerId(insumoId)) {
       return res.status(400).json({ error: true, message: 'valor_id debe ser un entero mayor a 0.' });
+    }
+
+    const mutationTarget = await resolveCatalogoMaestroMutationTarget('insumo', insumoId, pool);
+    if (!mutationTarget.ok) {
+      return res.status(mutationTarget.status).json(buildCatalogoMutationErrorResponse(mutationTarget));
     }
 
     // NEW: 404 explicito antes de inactivar.
