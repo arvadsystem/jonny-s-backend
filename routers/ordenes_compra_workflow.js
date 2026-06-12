@@ -2,6 +2,10 @@ import express from 'express';
 import pool from '../config/db-connection.js';
 import { checkPermission, isRequestUserSuperAdmin } from '../middleware/checkPermission.js';
 import { supabase } from '../services/supabaseClient.js';
+import {
+  getWarehouseAssignmentDetails,
+  resolveCatalogoMaestroEntity
+} from '../services/catalogoMaestroAsignacionesService.js';
 import { SUPABASE_ADMIN_BUCKET, buildAbsolutePublicUrl } from '../utils/uploads.js';
 
 const router = express.Router();
@@ -339,6 +343,64 @@ const validateItemWarehouseAlignment = ({
     ok: true,
     data,
     id_almacen_resuelto: warehouseDestino || warehouseActual || null
+  };
+};
+
+const isActiveFlag = (value) =>
+  value === true || value === 1 || value === '1' || String(value ?? '').trim().toLowerCase() === 'true';
+
+const resolveOcInventoryAssignment = async ({
+  queryRunner = pool,
+  itemTipo = null,
+  idItem = null,
+  idAlmacenDestino = null
+} = {}) => {
+  const entityType = itemTipo === 'producto' ? 'producto' : itemTipo === 'insumo' ? 'insumo' : null;
+  const entityId = parsePositiveInt(idItem);
+  const warehouseId = parsePositiveInt(idAlmacenDestino);
+  if (!entityType || !entityId || !warehouseId) {
+    return { ok: false, status: 409, message: 'No se pudo resolver el item o el almacen destino.' };
+  }
+
+  const resolved = await resolveCatalogoMaestroEntity(entityType, entityId, queryRunner);
+  if (!resolved?.ok) {
+    return {
+      ok: false,
+      status: resolved?.status || 409,
+      message: resolved?.message || `No se pudo resolver el ${entityType} indicado.`
+    };
+  }
+  if (!isActiveFlag(resolved.master?.estado_global)) {
+    return {
+      ok: false,
+      status: 409,
+      message: `El ${entityType} ${entityId} esta inactivo.`
+    };
+  }
+
+  const assignment = await getWarehouseAssignmentDetails(entityType, resolved.masterId, warehouseId, queryRunner);
+  if (!assignment) {
+    return {
+      ok: false,
+      status: 409,
+      message: `El ${entityType} ${entityId} no esta asignado al almacen destino ${warehouseId}.`
+    };
+  }
+  if (!assignment.activo) {
+    return {
+      ok: false,
+      status: 409,
+      message: `La asignacion local del ${entityType} ${entityId} en el almacen ${warehouseId} esta inactiva.`
+    };
+  }
+
+  return {
+    ok: true,
+    itemTipo: entityType,
+    inputId: entityId,
+    masterId: Number(resolved.masterId),
+    idAlmacen: Number(assignment.id_almacen),
+    idSucursal: Number(assignment.id_sucursal)
   };
 };
 
@@ -1688,88 +1750,22 @@ const validateCreateItemsExistence = async (details, queryRunner = pool) => {
     }
   }
 
-  // AM: valida que cada item pertenezca al almacen principal real (`id_almacen`) seleccionado.
-  // AM: evita depender de asignaciones multi-almacen en pivotes mientras el modelo temporal es 1 almacen por item.
   for (const detail of details) {
     const idAlmacenDestino = parsePositiveInt(detail?.id_almacen_destino);
     if (!idAlmacenDestino) {
       return { ok: false, message: 'Cada detalle requiere un id_almacen_destino valido.' };
     }
-
-    try {
-      if (detail.item_tipo === 'producto') {
-        const assigned = await queryRunner.query(
-          `
-            SELECT 1
-            FROM public.productos p
-            WHERE p.id_producto = $1
-              AND p.id_almacen = $2
-            LIMIT 1
-          `,
-          [detail.id_item, idAlmacenDestino]
-        );
-        if (assigned.rowCount === 0) {
-          return {
-            ok: false,
-            message: `El producto ${detail.id_item} no esta asignado al almacen destino ${idAlmacenDestino}.`
-          };
-        }
-      } else {
-        const assigned = await queryRunner.query(
-          `
-            SELECT 1
-            FROM public.insumos i
-            WHERE i.id_insumo = $1
-              AND i.id_almacen = $2
-            LIMIT 1
-          `,
-          [detail.id_item, idAlmacenDestino]
-        );
-        if (assigned.rowCount === 0) {
-          return {
-            ok: false,
-            message: `El insumo ${detail.id_item} no esta asignado al almacen destino ${idAlmacenDestino}.`
-          };
-        }
-      }
-    } catch (error) {
-      if (error?.code !== '42P01') throw error;
-
-      if (detail.item_tipo === 'producto') {
-        const legacyRow = await queryRunner.query(
-          `
-            SELECT 1
-            FROM public.productos p
-            WHERE p.id_producto = $1
-              AND p.id_almacen = $2
-            LIMIT 1
-          `,
-          [detail.id_item, idAlmacenDestino]
-        );
-        if (legacyRow.rowCount === 0) {
-          return {
-            ok: false,
-            message: `El producto ${detail.id_item} no pertenece al almacen destino ${idAlmacenDestino}.`
-          };
-        }
-      } else {
-        const legacyRow = await queryRunner.query(
-          `
-            SELECT 1
-            FROM public.insumos i
-            WHERE i.id_insumo = $1
-              AND i.id_almacen = $2
-            LIMIT 1
-          `,
-          [detail.id_item, idAlmacenDestino]
-        );
-        if (legacyRow.rowCount === 0) {
-          return {
-            ok: false,
-            message: `El insumo ${detail.id_item} no pertenece al almacen destino ${idAlmacenDestino}.`
-          };
-        }
-      }
+    const assignment = await resolveOcInventoryAssignment({
+      queryRunner,
+      itemTipo: detail.item_tipo,
+      idItem: detail.id_item,
+      idAlmacenDestino
+    });
+    if (!assignment.ok) {
+      return {
+        ok: false,
+        message: assignment.message
+      };
     }
   }
 
@@ -5516,15 +5512,9 @@ router.post('/orden_compras/workflow/:id_orden_compra/abastecer', checkPermissio
           doc.id_insumo,
           doc.id_almacen_destino,
           doc.id_proveedor_sugerido,
-          prov.nombre_proveedor,
-          p.id_almacen AS id_almacen_producto,
-          COALESCE(p.estado, true) AS producto_activo,
-          i.id_almacen AS id_almacen_insumo,
-          COALESCE(i.estado, true) AS insumo_activo
+          prov.nombre_proveedor
         FROM public.detalle_orden_compras doc
         LEFT JOIN public.proveedores prov ON prov.id_proveedor = doc.id_proveedor_sugerido
-        LEFT JOIN public.productos p ON p.id_producto = doc.id_producto
-        LEFT JOIN public.insumos i ON i.id_insumo = doc.id_insumo
         WHERE doc.id_orden_compra = $1
         ORDER BY doc.id_detalle_orden ASC
       `,
@@ -5575,36 +5565,18 @@ router.post('/orden_compras/workflow/:id_orden_compra/abastecer', checkPermissio
         );
       }
 
-      if (
-        itemRef.item_tipo === 'producto' &&
-        !(detail.producto_activo === true || detail.producto_activo === 1 || detail.producto_activo === '1')
-      ) {
-        await withRollback(client);
-        return sendError(res, 409, 'CONFLICT', `El producto ${itemRef.id_item} esta inactivo.`);
-      }
-      if (
-        itemRef.item_tipo === 'insumo' &&
-        !(detail.insumo_activo === true || detail.insumo_activo === 1 || detail.insumo_activo === '1')
-      ) {
-        await withRollback(client);
-        return sendError(res, 409, 'CONFLICT', `El insumo ${itemRef.id_item} esta inactivo.`);
-      }
-
-      const idAlmacenActual =
-        itemRef.item_tipo === 'producto' ? detail.id_almacen_producto : detail.id_almacen_insumo;
-      const warehouseAlignment = validateItemWarehouseAlignment({
-        idDetalle: detail.id_detalle_orden,
+      const inventoryAssignment = await resolveOcInventoryAssignment({
+        queryRunner: client,
         itemTipo: itemRef.item_tipo,
         idItem: itemRef.id_item,
-        idAlmacenDestino: detail.id_almacen_destino,
-        idAlmacenActual
+        idAlmacenDestino: detail.id_almacen_destino
       });
-      if (!warehouseAlignment.ok) {
+      if (!inventoryAssignment.ok) {
         await withRollback(client);
-        return sendWarehouseMismatchConflict(res, warehouseAlignment.data);
+        return sendError(res, inventoryAssignment.status || 409, 'CONFLICT', inventoryAssignment.message);
       }
 
-      const idAlmacenDestino = parsePositiveInt(warehouseAlignment.id_almacen_resuelto);
+      const idAlmacenDestino = parsePositiveInt(inventoryAssignment.idAlmacen);
       if (!idAlmacenDestino) {
         await withRollback(client);
         return sendError(
@@ -5618,8 +5590,8 @@ router.post('/orden_compras/workflow/:id_orden_compra/abastecer', checkPermissio
 
       const qtyKey = buildProviderItemKey({
         idProveedor: providerId,
-        idProducto: detail.id_producto,
-        idInsumo: detail.id_insumo,
+        idProducto: itemRef.item_tipo === 'producto' ? inventoryAssignment.masterId : null,
+        idInsumo: itemRef.item_tipo === 'insumo' ? inventoryAssignment.masterId : null,
         idAlmacenDestino
       });
       const currentQty = Number(requiredQtyByKey.get(qtyKey) || 0);
@@ -5815,71 +5787,33 @@ router.post('/orden_compras/workflow/:id_orden_compra/abastecer', checkPermissio
 
       const idAlmacenDestino = parsePositiveInt(row.id_almacen_destino);
       if (itemRef.item_tipo === 'producto') {
-        const productRow = await client.query(
-          `
-            SELECT id_almacen, COALESCE(estado, true) AS estado
-            FROM public.productos
-            WHERE id_producto = $1
-            LIMIT 1
-          `,
-          [itemRef.id_item]
-        );
-        if (productRow.rowCount === 0) {
-          await withRollback(client);
-          return sendError(res, 409, 'CONFLICT', `Producto ${itemRef.id_item} no existe para abastecer.`);
-        }
-        if (!Boolean(productRow.rows?.[0]?.estado)) {
-          await withRollback(client);
-          return sendError(res, 409, 'CONFLICT', `El producto ${itemRef.id_item} esta inactivo.`);
-        }
-
-        const warehouseAlignment = validateItemWarehouseAlignment({
-          idDetalle: row.id_detalle_compra,
+        const inventoryAssignment = await resolveOcInventoryAssignment({
+          queryRunner: client,
           itemTipo: itemRef.item_tipo,
           idItem: itemRef.id_item,
-          idAlmacenDestino,
-          idAlmacenActual: productRow.rows?.[0]?.id_almacen
+          idAlmacenDestino
         });
-        if (!warehouseAlignment.ok) {
+        if (!inventoryAssignment.ok) {
           await withRollback(client);
-          return sendWarehouseMismatchConflict(res, warehouseAlignment.data);
+          return sendError(res, inventoryAssignment.status || 409, 'CONFLICT', inventoryAssignment.message);
         }
 
-        idAlmacen = parsePositiveInt(warehouseAlignment.id_almacen_resuelto);
-        idProducto = itemRef.id_item;
+        idAlmacen = parsePositiveInt(inventoryAssignment.idAlmacen);
+        idProducto = inventoryAssignment.masterId;
       } else {
-        const insumoRow = await client.query(
-          `
-            SELECT id_almacen, COALESCE(estado, true) AS estado
-            FROM public.insumos
-            WHERE id_insumo = $1
-            LIMIT 1
-          `,
-          [itemRef.id_item]
-        );
-        if (insumoRow.rowCount === 0) {
-          await withRollback(client);
-          return sendError(res, 409, 'CONFLICT', `Insumo ${itemRef.id_item} no existe para abastecer.`);
-        }
-        if (!Boolean(insumoRow.rows?.[0]?.estado)) {
-          await withRollback(client);
-          return sendError(res, 409, 'CONFLICT', `El insumo ${itemRef.id_item} esta inactivo.`);
-        }
-
-        const warehouseAlignment = validateItemWarehouseAlignment({
-          idDetalle: row.id_detalle_compra,
+        const inventoryAssignment = await resolveOcInventoryAssignment({
+          queryRunner: client,
           itemTipo: itemRef.item_tipo,
           idItem: itemRef.id_item,
-          idAlmacenDestino,
-          idAlmacenActual: insumoRow.rows?.[0]?.id_almacen
+          idAlmacenDestino
         });
-        if (!warehouseAlignment.ok) {
+        if (!inventoryAssignment.ok) {
           await withRollback(client);
-          return sendWarehouseMismatchConflict(res, warehouseAlignment.data);
+          return sendError(res, inventoryAssignment.status || 409, 'CONFLICT', inventoryAssignment.message);
         }
 
-        idAlmacen = parsePositiveInt(warehouseAlignment.id_almacen_resuelto);
-        idInsumo = itemRef.id_item;
+        idAlmacen = parsePositiveInt(inventoryAssignment.idAlmacen);
+        idInsumo = inventoryAssignment.masterId;
       }
 
       if (!idAlmacen) {
@@ -5903,8 +5837,8 @@ router.post('/orden_compras/workflow/:id_orden_compra/abastecer', checkPermissio
 
       const qtyKey = buildProviderItemKey({
         idProveedor: providerId,
-        idProducto: row.id_producto,
-        idInsumo: row.id_insumo,
+        idProducto,
+        idInsumo,
         idAlmacenDestino: idAlmacen
       });
       const actualQty = Number(actualQtyByKey.get(qtyKey) || 0);
