@@ -111,12 +111,42 @@ export const fetchCatalogoInsumosMaestros = async (db) => {
         true AS estado,
         m.total_almacenes,
         m.id_sucursales,
-        m.id_almacenes
+        m.id_almacenes,
+        COALESCE(presentaciones.presentaciones_receta, '[]'::jsonb) AS presentaciones_receta
       FROM maestros m
       LEFT JOIN public.categorias_insumos ci
         ON ci.id_categoria_insumo = m.id_categoria_insumo
       LEFT JOIN public.unidades_medida um
         ON um.id_unidad_medida = m.id_unidad_medida
+      LEFT JOIN LATERAL (
+        SELECT JSONB_AGG(
+          JSONB_BUILD_OBJECT(
+            'id_presentacion', ip.id_presentacion,
+            'nombre_presentacion', ip.nombre_presentacion,
+            'cantidad_presentacion', ip.cantidad_presentacion,
+            'id_unidad_presentacion', ip.id_unidad_presentacion,
+            'unidad_presentacion_nombre', unidad_presentacion.nombre,
+            'unidad_presentacion_simbolo', BTRIM(unidad_presentacion.simbolo),
+            'cantidad_base', ip.cantidad_base,
+            'id_unidad_base', ip.id_unidad_base,
+            'unidad_base_nombre', unidad_base.nombre,
+            'unidad_base_simbolo', BTRIM(unidad_base.simbolo),
+            'es_predeterminada_receta', COALESCE(ip.es_predeterminada_receta, false)
+          )
+          ORDER BY
+            COALESCE(ip.es_predeterminada_receta, false) DESC,
+            ip.nombre_presentacion ASC,
+            ip.id_presentacion ASC
+        ) AS presentaciones_receta
+        FROM public.insumo_presentaciones ip
+        LEFT JOIN public.unidades_medida unidad_presentacion
+          ON unidad_presentacion.id_unidad_medida = ip.id_unidad_presentacion
+        LEFT JOIN public.unidades_medida unidad_base
+          ON unidad_base.id_unidad_medida = ip.id_unidad_base
+        WHERE ip.id_insumo = m.id_insumo_maestro
+          AND ip.estado IS TRUE
+          AND ip.uso_receta IS TRUE
+      ) presentaciones ON true
       ORDER BY ci.nombre_categoria ASC NULLS LAST, m.nombre_insumo ASC, m.id_insumo_maestro ASC
     `
   );
