@@ -160,9 +160,9 @@ export const listCatalogoMaestroAssignments = async (entityType, masterId, optio
     `
       SELECT
         a.id_almacen,
-        COALESCE(NULLIF(TRIM(COALESCE(a.nombre_almacen, a.nombre, '')), ''), CONCAT('Almacen #', a.id_almacen::text)) AS almacen,
+        COALESCE(NULLIF(TRIM(COALESCE(a.nombre, '')), ''), CONCAT('Almacen #', a.id_almacen::text)) AS almacen,
         a.id_sucursal,
-        COALESCE(NULLIF(TRIM(COALESCE(s.nombre_sucursal, s.nombre, '')), ''), CONCAT('Sucursal #', a.id_sucursal::text)) AS sucursal,
+        COALESCE(NULLIF(TRIM(COALESCE(s.nombre_sucursal, '')), ''), CONCAT('Sucursal #', a.id_sucursal::text)) AS sucursal,
         COALESCE(pa.cantidad, 0)::numeric AS cantidad,
         COALESCE(pa.stock_minimo, 0)::numeric AS stock_minimo,
         COALESCE(pa.estado, true) AS activo
@@ -205,9 +205,9 @@ export const listCatalogoMaestroAvailableWarehouses = async (entityType, masterI
       )
       SELECT
         a.id_almacen,
-        COALESCE(NULLIF(TRIM(COALESCE(a.nombre_almacen, a.nombre, '')), ''), CONCAT('Almacen #', a.id_almacen::text)) AS almacen,
+        COALESCE(NULLIF(TRIM(COALESCE(a.nombre, '')), ''), CONCAT('Almacen #', a.id_almacen::text)) AS almacen,
         a.id_sucursal,
-        COALESCE(NULLIF(TRIM(COALESCE(s.nombre_sucursal, s.nombre, '')), ''), CONCAT('Sucursal #', a.id_sucursal::text)) AS sucursal
+        COALESCE(NULLIF(TRIM(COALESCE(s.nombre_sucursal, '')), ''), CONCAT('Sucursal #', a.id_sucursal::text)) AS sucursal
       FROM public.almacenes a
       LEFT JOIN public.sucursales s
         ON s.id_sucursal = a.id_sucursal
@@ -264,8 +264,8 @@ export const findActiveSucursalAssignmentConflict = async (entityType, masterId,
       SELECT
         pa.id_almacen,
         a.id_sucursal,
-        COALESCE(NULLIF(TRIM(COALESCE(a.nombre_almacen, a.nombre, '')), ''), CONCAT('Almacen #', a.id_almacen::text)) AS almacen,
-        COALESCE(NULLIF(TRIM(COALESCE(s.nombre_sucursal, s.nombre, '')), ''), CONCAT('Sucursal #', a.id_sucursal::text)) AS sucursal
+        COALESCE(NULLIF(TRIM(COALESCE(a.nombre, '')), ''), CONCAT('Almacen #', a.id_almacen::text)) AS almacen,
+        COALESCE(NULLIF(TRIM(COALESCE(s.nombre_sucursal, '')), ''), CONCAT('Sucursal #', a.id_sucursal::text)) AS sucursal
       FROM public.${config.assignmentTable} pa
       INNER JOIN public.almacenes a
         ON a.id_almacen = pa.id_almacen
