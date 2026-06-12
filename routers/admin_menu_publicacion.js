@@ -529,8 +529,12 @@ const fetchBaseCatalogByMenu = async (idMenu, idSucursal, departmentIds, imageCa
       FROM productos p
       LEFT JOIN categorias_productos cp
         ON cp.id_categoria_producto = p.id_categoria_producto
-      LEFT JOIN almacenes ap
-        ON ap.id_almacen = p.id_almacen
+      INNER JOIN public.productos_almacenes pa
+        ON pa.id_producto = p.id_producto
+       AND COALESCE(pa.estado, true) = true
+      INNER JOIN almacenes ap
+        ON ap.id_almacen = pa.id_almacen
+       AND COALESCE(ap.estado, true) = true
       ${productImageJoin}
       WHERE COALESCE(cp.estado, true) = true
         AND ap.id_sucursal = $5
@@ -579,10 +583,26 @@ const fetchDetalleRowsByMenu = async ({ idMenu, idSucursal, capabilities }) => {
         ${selectOrden},
         COALESCE(dm.estado, true) AS estado
       FROM detalle_menu dm
-      LEFT JOIN productos p
-        ON p.id_producto = dm.id_producto
-      LEFT JOIN almacenes ap
-        ON ap.id_almacen = p.id_almacen
+      LEFT JOIN LATERAL (
+        SELECT MIN(pm.id_producto_maestro)::int AS id_producto_maestro
+        FROM public.productos_mapeo_maestro pm
+        WHERE pm.id_producto_legacy = dm.id_producto
+           OR pm.id_producto_maestro = dm.id_producto
+      ) pmr ON dm.id_producto IS NOT NULL
+      LEFT JOIN public.productos p
+        ON p.id_producto = COALESCE(pmr.id_producto_maestro, dm.id_producto)
+      LEFT JOIN LATERAL (
+        SELECT a.id_sucursal
+        FROM public.productos_almacenes pa
+        INNER JOIN public.almacenes a
+          ON a.id_almacen = pa.id_almacen
+         AND COALESCE(a.estado, true) = true
+        WHERE pa.id_producto = p.id_producto
+          AND COALESCE(pa.estado, true) = true
+          AND a.id_sucursal = $2
+        ORDER BY pa.id_almacen ASC
+        LIMIT 1
+      ) ap ON dm.id_producto IS NOT NULL
       WHERE dm.id_menu = $1
         AND COALESCE(dm.estado, true) = true
         AND (
@@ -801,9 +821,13 @@ const fetchDraftStateByType = async ({ idMenu, idSucursal, normalizedItems }) =>
           p.id_producto AS id_item_origen,
           COALESCE(p.estado, true) AS estado_item,
           p.precio
-        FROM productos p
-        INNER JOIN almacenes ap
-          ON ap.id_almacen = p.id_almacen
+        FROM public.productos p
+        INNER JOIN public.productos_almacenes pa
+          ON pa.id_producto = p.id_producto
+         AND COALESCE(pa.estado, true) = true
+        INNER JOIN public.almacenes ap
+          ON ap.id_almacen = pa.id_almacen
+         AND COALESCE(ap.estado, true) = true
         WHERE p.id_producto = ANY($1::int[])
           AND ap.id_sucursal = $2;
       `,
@@ -833,10 +857,20 @@ const fetchCrossBranchDetalleRowsByMenu = async ({ idMenu, idSucursal }) => {
         p.nombre_producto,
         ap.id_sucursal AS id_sucursal_producto
       FROM detalle_menu dm
+      INNER JOIN LATERAL (
+        SELECT MIN(pm.id_producto_maestro)::int AS id_producto_maestro
+        FROM public.productos_mapeo_maestro pm
+        WHERE pm.id_producto_legacy = dm.id_producto
+           OR pm.id_producto_maestro = dm.id_producto
+      ) pmr ON dm.id_producto IS NOT NULL
       INNER JOIN productos p
-        ON p.id_producto = dm.id_producto
+        ON p.id_producto = COALESCE(pmr.id_producto_maestro, dm.id_producto)
+      INNER JOIN public.productos_almacenes pa
+        ON pa.id_producto = p.id_producto
+       AND COALESCE(pa.estado, true) = true
       INNER JOIN almacenes ap
-        ON ap.id_almacen = p.id_almacen
+        ON ap.id_almacen = pa.id_almacen
+       AND COALESCE(ap.estado, true) = true
       WHERE dm.id_menu = $1
         AND COALESCE(dm.estado, true) = true
         AND ap.id_sucursal <> $2
@@ -954,10 +988,26 @@ const getVisibleCountByMenu = async ({ idMenu, idSucursal, capabilities, client 
     `
       SELECT COUNT(*)::int AS total
       FROM detalle_menu dm
-      LEFT JOIN productos p
-        ON p.id_producto = dm.id_producto
-      LEFT JOIN almacenes ap
-        ON ap.id_almacen = p.id_almacen
+      LEFT JOIN LATERAL (
+        SELECT MIN(pm.id_producto_maestro)::int AS id_producto_maestro
+        FROM public.productos_mapeo_maestro pm
+        WHERE pm.id_producto_legacy = dm.id_producto
+           OR pm.id_producto_maestro = dm.id_producto
+      ) pmr ON dm.id_producto IS NOT NULL
+      LEFT JOIN public.productos p
+        ON p.id_producto = COALESCE(pmr.id_producto_maestro, dm.id_producto)
+      LEFT JOIN LATERAL (
+        SELECT a.id_sucursal
+        FROM public.productos_almacenes pa
+        INNER JOIN public.almacenes a
+          ON a.id_almacen = pa.id_almacen
+         AND COALESCE(a.estado, true) = true
+        WHERE pa.id_producto = p.id_producto
+          AND COALESCE(pa.estado, true) = true
+          AND a.id_sucursal = $2
+        ORDER BY pa.id_almacen ASC
+        LIMIT 1
+      ) ap ON dm.id_producto IS NOT NULL
       WHERE dm.id_menu = $1
         AND COALESCE(dm.estado, true) = true
         AND (

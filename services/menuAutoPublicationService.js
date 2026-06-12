@@ -483,13 +483,17 @@ export const syncExistingBranchProductsIntoMenu = async ({
 
   const result = await client.query(
     `
-      SELECT p.id_producto::int AS id_producto
-      FROM productos p
-      INNER JOIN almacenes ap
-        ON ap.id_almacen = p.id_almacen
+      SELECT DISTINCT p.id_producto::int AS id_producto
+      FROM public.productos_almacenes pa
+      INNER JOIN public.almacenes ap
+        ON ap.id_almacen = pa.id_almacen
+       AND ap.id_sucursal = $1
+       AND COALESCE(ap.estado, true) = true
+      INNER JOIN public.productos p
+        ON p.id_producto = pa.id_producto
       LEFT JOIN categorias_productos cp
         ON cp.id_categoria_producto = p.id_categoria_producto
-      WHERE ap.id_sucursal = $1
+      WHERE COALESCE(pa.estado, true) = true
         AND COALESCE(p.estado, true) = true
         AND COALESCE(cp.estado, true) = true
         AND LOWER(REGEXP_REPLACE(TRIM(COALESCE(cp.nombre_categoria, '')), '\\s*/\\s*', '/', 'g')) = ANY($2::text[])

@@ -999,8 +999,8 @@ const materializePublicOrderSnapshot = async ({ idSucursal, requestedItems = [],
     .map((row) => Number(row.id_combo));
 
   const [recipeAvailabilityRows, comboAvailabilityRows] = await Promise.all([
-    fetchRecipeAvailabilityQuery([...new Set(recipeIds)], db),
-    fetchComboAvailabilityQuery([...new Set(comboIds)], db)
+    fetchRecipeAvailabilityQuery([...new Set(recipeIds)], Number(idSucursal), db),
+    fetchComboAvailabilityQuery([...new Set(comboIds)], Number(idSucursal), db)
   ]);
 
   const recipeAvailabilityMap = toAvailabilityMap(recipeAvailabilityRows, 'id_receta');
@@ -1292,8 +1292,8 @@ export const getPublicCatalogService = async ({ idSucursal, tipoPedido = null })
     .map((row) => Number(row.id_combo));
 
   const [recipeAvailabilityRows, comboAvailabilityRows] = await Promise.all([
-    fetchRecipeAvailabilityQuery([...new Set(recipeIds)]),
-    fetchComboAvailabilityQuery([...new Set(comboIds)])
+    fetchRecipeAvailabilityQuery([...new Set(recipeIds)], Number(idSucursal)),
+    fetchComboAvailabilityQuery([...new Set(comboIds)], Number(idSucursal))
   ]);
 
   const recipeAvailabilityMap = toAvailabilityMap(recipeAvailabilityRows, 'id_receta');
@@ -1353,8 +1353,8 @@ export const getPublicCatalogItemDetailService = async ({ idSucursal, idDetalleM
   const comboIds = row.id_combo ? [Number(row.id_combo)] : [];
 
   const [recipeAvailabilityRows, comboAvailabilityRows] = await Promise.all([
-    fetchRecipeAvailabilityQuery(recipeIds),
-    fetchComboAvailabilityQuery(comboIds)
+    fetchRecipeAvailabilityQuery(recipeIds, Number(idSucursal)),
+    fetchComboAvailabilityQuery(comboIds, Number(idSucursal))
   ]);
 
   const recipeAvailabilityMap = toAvailabilityMap(recipeAvailabilityRows, 'id_receta');

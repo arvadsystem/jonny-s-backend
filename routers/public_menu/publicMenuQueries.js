@@ -283,8 +283,8 @@ const buildCatalogSql = ({
   const detalleVisibleExpr = hasDetalleVisibleColumn ? 'COALESCE(dm.visible, true)' : 'true';
   const detalleVisibleFilter = hasDetalleVisibleColumn ? 'AND COALESCE(dm.visible, true) = true' : '';
   const branchProductFilter = withDetailMenuFilter
-    ? 'AND (dm.id_producto IS NULL OR ap.id_sucursal = $3)'
-    : 'AND (dm.id_producto IS NULL OR ap.id_sucursal = $2)';
+    ? 'AND (dm.id_producto IS NULL OR pa_branch.id_sucursal = $3)'
+    : 'AND (dm.id_producto IS NULL OR pa_branch.id_sucursal = $2)';
 
   return `
     SELECT
@@ -358,13 +358,32 @@ const buildCatalogSql = ({
         WHEN ${detalleComboExpr} IS NOT NULL THEN a_combo.url_publica
         ELSE NULL
       END AS url_imagen,
-      p.cantidad AS cantidad_actual,
-      p.stock_minimo
+      pa_branch.cantidad AS cantidad_actual,
+      pa_branch.stock_minimo
     FROM detalle_menu dm
+    LEFT JOIN LATERAL (
+      SELECT MIN(pm.id_producto_maestro)::int AS id_producto_maestro
+      FROM public.productos_mapeo_maestro pm
+      WHERE pm.id_producto_legacy = dm.id_producto
+         OR pm.id_producto_maestro = dm.id_producto
+    ) pmr ON dm.id_producto IS NOT NULL
     LEFT JOIN productos p
-      ON p.id_producto = dm.id_producto
-    LEFT JOIN almacenes ap
-      ON ap.id_almacen = p.id_almacen
+      ON p.id_producto = COALESCE(pmr.id_producto_maestro, dm.id_producto)
+    LEFT JOIN LATERAL (
+      SELECT
+        a.id_sucursal,
+        COALESCE(pa.cantidad, 0)::numeric AS cantidad,
+        COALESCE(pa.stock_minimo, 0)::numeric AS stock_minimo
+      FROM public.productos_almacenes pa
+      INNER JOIN public.almacenes a
+        ON a.id_almacen = pa.id_almacen
+       AND COALESCE(a.estado, true) = true
+      WHERE pa.id_producto = p.id_producto
+        AND COALESCE(pa.estado, true) = true
+        AND a.id_sucursal = ${withDetailMenuFilter ? '$3' : '$2'}
+      ORDER BY pa.id_almacen ASC
+      LIMIT 1
+    ) pa_branch ON dm.id_producto IS NOT NULL
     LEFT JOIN categorias_productos cp
       ON cp.id_categoria_producto = p.id_categoria_producto
     ${productImageJoin}
@@ -496,8 +515,9 @@ export const fetchCatalogItemByIdQuery = async ({ idMenu, idDetalleMenu, idSucur
 };
 
 // Calcula disponibilidad por receta en base a detalle_recetas + insumos reales.
-export const fetchRecipeAvailabilityQuery = async (recipeIds = [], db = pool) => {
+export const fetchRecipeAvailabilityQuery = async (recipeIds = [], idSucursal = null, db = pool) => {
   if (!Array.isArray(recipeIds) || recipeIds.length === 0) return [];
+  const branchId = Number.isInteger(Number(idSucursal)) && Number(idSucursal) > 0 ? Number(idSucursal) : null;
 
   const query = `
     SELECT
@@ -523,11 +543,27 @@ export const fetchRecipeAvailabilityQuery = async (recipeIds = [], db = pool) =>
           WHERE COALESCE(dr.estado, true) = true
             AND i.id_insumo IS NOT NULL
             AND COALESCE(i.estado, true) = true
-            AND (COALESCE(i.cantidad, 0)::numeric - COALESCE(i.stock_minimo, 0)::numeric) >= COALESCE(dr.cant, 0)
+            AND EXISTS (
+              SELECT 1
+              FROM public.insumos_almacenes ia
+              INNER JOIN public.almacenes a
+                ON a.id_almacen = ia.id_almacen
+               AND COALESCE(a.estado, true) = true
+              WHERE ia.id_insumo = i.id_insumo
+                AND COALESCE(ia.estado, true) = true
+                AND ($2::int IS NULL OR a.id_sucursal = $2)
+                AND (COALESCE(ia.cantidad, 0)::numeric - COALESCE(ia.stock_minimo, 0)::numeric) >= COALESCE(dr.cant, 0)
+            )
         ) AS componentes_disponibles
       FROM detalle_recetas dr
+      LEFT JOIN LATERAL (
+        SELECT MIN(mm.id_insumo_maestro)::int AS id_insumo_maestro
+        FROM public.insumos_mapeo_maestro mm
+        WHERE mm.id_insumo_legacy = dr.id_insumo
+           OR mm.id_insumo_maestro = dr.id_insumo
+      ) mmr ON true
       LEFT JOIN insumos i
-        ON i.id_insumo = dr.id_insumo
+        ON i.id_insumo = COALESCE(mmr.id_insumo_maestro, dr.id_insumo)
       WHERE dr.id_receta = ANY($1::int[])
       GROUP BY dr.id_receta
     ) stats
@@ -535,13 +571,14 @@ export const fetchRecipeAvailabilityQuery = async (recipeIds = [], db = pool) =>
     WHERE r.id_receta = ANY($1::int[]);
   `;
 
-  const result = await db.query(query, [recipeIds]);
+  const result = await db.query(query, [recipeIds, branchId]);
   return result.rows;
 };
 
 // Calcula disponibilidad por combo en base a sus recetas componentes y stock de insumos.
-export const fetchComboAvailabilityQuery = async (comboIds = [], db = pool) => {
+export const fetchComboAvailabilityQuery = async (comboIds = [], idSucursal = null, db = pool) => {
   if (!Array.isArray(comboIds) || comboIds.length === 0) return [];
+  const branchId = Number.isInteger(Number(idSucursal)) && Number(idSucursal) > 0 ? Number(idSucursal) : null;
 
   const query = `
     SELECT
@@ -580,12 +617,28 @@ export const fetchComboAvailabilityQuery = async (comboIds = [], db = pool) => {
             WHERE COALESCE(dr.estado, true) = true
               AND i.id_insumo IS NOT NULL
               AND COALESCE(i.estado, true) = true
-              AND (COALESCE(i.cantidad, 0)::numeric - COALESCE(i.stock_minimo, 0)::numeric)
-                  >= (COALESCE(dr.cant, 0) * GREATEST(COALESCE(dc.cantidad, 1), 1)::numeric)
+              AND EXISTS (
+                SELECT 1
+                FROM public.insumos_almacenes ia
+                INNER JOIN public.almacenes a
+                  ON a.id_almacen = ia.id_almacen
+                 AND COALESCE(a.estado, true) = true
+                WHERE ia.id_insumo = i.id_insumo
+                  AND COALESCE(ia.estado, true) = true
+                  AND ($2::int IS NULL OR a.id_sucursal = $2)
+                  AND (COALESCE(ia.cantidad, 0)::numeric - COALESCE(ia.stock_minimo, 0)::numeric)
+                    >= (COALESCE(dr.cant, 0) * GREATEST(COALESCE(dc.cantidad, 1), 1)::numeric)
+              )
           ) AS insumos_disponibles
         FROM detalle_recetas dr
+        LEFT JOIN LATERAL (
+          SELECT MIN(mm.id_insumo_maestro)::int AS id_insumo_maestro
+          FROM public.insumos_mapeo_maestro mm
+          WHERE mm.id_insumo_legacy = dr.id_insumo
+             OR mm.id_insumo_maestro = dr.id_insumo
+        ) mmr ON true
         LEFT JOIN insumos i
-          ON i.id_insumo = dr.id_insumo
+          ON i.id_insumo = COALESCE(mmr.id_insumo_maestro, dr.id_insumo)
         WHERE dr.id_receta = dc.id_receta
       ) rs ON true
       WHERE dc.id_combo = ANY($1::int[])
@@ -595,7 +648,7 @@ export const fetchComboAvailabilityQuery = async (comboIds = [], db = pool) => {
     WHERE c.id_combo = ANY($1::int[]);
   `;
 
-  const result = await db.query(query, [comboIds]);
+  const result = await db.query(query, [comboIds, branchId]);
   return result.rows;
 };
 

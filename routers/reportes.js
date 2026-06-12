@@ -1482,23 +1482,7 @@ const getInventarioStockCritico = async (req, res, filters, parsedFilters) => {
     : '';
 
   const query = `
-    WITH productos_rel AS (
-      SELECT DISTINCT pa.id_producto, pa.id_almacen
-      FROM public.productos_almacenes pa
-      UNION
-      SELECT p.id_producto, p.id_almacen
-      FROM public.productos p
-      WHERE p.id_almacen IS NOT NULL
-    ),
-    insumos_rel AS (
-      SELECT DISTINCT ia.id_insumo, ia.id_almacen
-      FROM public.insumos_almacenes ia
-      UNION
-      SELECT i.id_insumo, i.id_almacen
-      FROM public.insumos i
-      WHERE i.id_almacen IS NOT NULL
-    ),
-    base AS (
+    WITH base AS (
       SELECT
         'PRODUCTO'::text AS tipo_item,
         p.id_producto AS id_item,
@@ -1506,17 +1490,18 @@ const getInventarioStockCritico = async (req, res, filters, parsedFilters) => {
         p.id_categoria_producto AS id_categoria,
         cp.nombre_categoria AS categoria,
         a.id_almacen,
-        a.nombre AS almacen,
+        COALESCE(a.nombre_almacen, a.nombre) AS almacen,
         a.id_sucursal,
         s.nombre_sucursal AS sucursal,
-        COALESCE(p.cantidad, 0)::numeric(14,2) AS cantidad_actual,
-        COALESCE(p.stock_minimo, 0)::numeric(14,2) AS stock_minimo,
+        COALESCE(pa.cantidad, 0)::numeric(14,2) AS cantidad_actual,
+        COALESCE(pa.stock_minimo, 0)::numeric(14,2) AS stock_minimo,
         COALESCE(p.estado, true) AS estado_activo
-      FROM public.productos p
-      INNER JOIN productos_rel pr ON pr.id_producto = p.id_producto
-      LEFT JOIN public.almacenes a ON a.id_almacen = pr.id_almacen
+      FROM public.productos_almacenes pa
+      INNER JOIN public.productos p ON p.id_producto = pa.id_producto
+      INNER JOIN public.almacenes a ON a.id_almacen = pa.id_almacen
       LEFT JOIN public.sucursales s ON s.id_sucursal = a.id_sucursal
       LEFT JOIN public.categorias_productos cp ON cp.id_categoria_producto = p.id_categoria_producto
+      WHERE COALESCE(pa.estado, true) = true
 
       UNION ALL
 
@@ -1527,17 +1512,18 @@ const getInventarioStockCritico = async (req, res, filters, parsedFilters) => {
         i.id_categoria_insumo AS id_categoria,
         ci.nombre_categoria AS categoria,
         a.id_almacen,
-        a.nombre AS almacen,
+        COALESCE(a.nombre_almacen, a.nombre) AS almacen,
         a.id_sucursal,
         s.nombre_sucursal AS sucursal,
-        COALESCE(i.cantidad, 0)::numeric(14,2) AS cantidad_actual,
-        COALESCE(i.stock_minimo, 0)::numeric(14,2) AS stock_minimo,
+        COALESCE(ia.cantidad, 0)::numeric(14,2) AS cantidad_actual,
+        COALESCE(ia.stock_minimo, 0)::numeric(14,2) AS stock_minimo,
         COALESCE(i.estado, true) AS estado_activo
-      FROM public.insumos i
-      INNER JOIN insumos_rel ir ON ir.id_insumo = i.id_insumo
-      LEFT JOIN public.almacenes a ON a.id_almacen = ir.id_almacen
+      FROM public.insumos_almacenes ia
+      INNER JOIN public.insumos i ON i.id_insumo = ia.id_insumo
+      INNER JOIN public.almacenes a ON a.id_almacen = ia.id_almacen
       LEFT JOIN public.sucursales s ON s.id_sucursal = a.id_sucursal
       LEFT JOIN public.categorias_insumos ci ON ci.id_categoria_insumo = i.id_categoria_insumo
+      WHERE COALESCE(ia.estado, true) = true
     ),
     filtrado AS (
       SELECT
