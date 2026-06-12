@@ -147,6 +147,19 @@ const parsePositiveNumber = (value) => {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
 };
 
+const normalizeRecipeIngredientQuantity = (value) => {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) return null;
+
+  const normalized = Number(parsed.toFixed(4));
+  if (normalized < 0.0001) return null;
+
+  const tolerance = Number.EPSILON * Math.max(1, Math.abs(parsed)) * 8;
+  if (Math.abs(parsed - normalized) > tolerance) return null;
+
+  return normalized;
+};
+
 const normalizeDetalleRecetaPayload = (detalle) => {
   if (!Array.isArray(detalle)) {
     return { ok: false, message: 'detalle_receta debe ser una lista de insumos.' };
@@ -158,7 +171,7 @@ const normalizeDetalleRecetaPayload = (detalle) => {
   for (const [index, item] of detalle.entries()) {
     const idInsumo = Number(item?.id_insumo);
     const idUnidadMedida = Number(item?.id_unidad_medida);
-    const cantidad = parsePositiveNumber(item?.cant ?? item?.cantidad);
+    const cantidad = normalizeRecipeIngredientQuantity(item?.cant ?? item?.cantidad);
 
     if (!esEnteroPositivo(idInsumo)) {
       return { ok: false, message: `Insumo invalido en linea ${index + 1}.` };
@@ -167,7 +180,10 @@ const normalizeDetalleRecetaPayload = (detalle) => {
       return { ok: false, message: `Unidad de medida invalida en linea ${index + 1}.` };
     }
     if (cantidad === null) {
-      return { ok: false, message: `Cantidad invalida en linea ${index + 1}.` };
+      return {
+        ok: false,
+        message: 'La cantidad debe ser mayor o igual a 0.0001 y usar como máximo 4 decimales.'
+      };
     }
     if (seenInsumos.has(idInsumo)) {
       return { ok: false, message: 'No repitas el mismo insumo en el detalle de receta.' };
@@ -825,6 +841,13 @@ router.post('/', checkPermission(MENU_RECETAS_CREATE_PERMISSIONS), async (req, r
     console.error('Error al crear receta admin:', err.message);
 
     if (esErrorConflictoConstraint(err)) {
+      if (err?.constraint === 'detalle_recetas_cant_check') {
+        return res.status(400).json({
+          error: true,
+          message: 'La cantidad del ingrediente debe ser mayor que cero.'
+        });
+      }
+
       if (err?.code === '23505' && err?.constraint === 'uq_recetas_menu_nombre_activo') {
         return res.status(409).json({
           error: true,
@@ -1014,6 +1037,13 @@ router.put('/:id_receta', checkPermission(MENU_RECETAS_EDIT_PERMISSIONS), async 
     console.error('Error al actualizar receta admin:', err.message);
 
     if (esErrorConflictoConstraint(err)) {
+      if (err?.constraint === 'detalle_recetas_cant_check') {
+        return res.status(400).json({
+          error: true,
+          message: 'La cantidad del ingrediente debe ser mayor que cero.'
+        });
+      }
+
       if (err?.code === '23505' && err?.constraint === 'uq_recetas_menu_nombre_activo') {
         return res.status(409).json({
           error: true,
