@@ -1281,6 +1281,140 @@ router.get('/productos/:id_producto/almacenes-disponibles', checkPermission(PROD
   }
 });
 
+router.put('/productos/:id_producto/asignaciones', checkPermission(PRODUCTOS_EDIT_PERMISSIONS), async (req, res) => {
+  const client = await pool.connect();
+  let txStarted = false;
+  try {
+    const resolved = await resolveProductoMaestroForAssignments(req.params?.id_producto, client);
+    if (!resolved.ok) {
+      return res.status(resolved.status).json({ error: true, message: resolved.message });
+    }
+
+    if (!resolved.master.estado_global) {
+      return res.status(400).json({ error: true, message: 'El producto maestro esta inactivo.' });
+    }
+
+    const almacenesParse = parseIdAlmacenes(null, req.body?.id_almacenes);
+    if (!almacenesParse.ok || !Array.isArray(almacenesParse.ids) || almacenesParse.ids.length === 0) {
+      return res.status(400).json({
+        error: true,
+        message: almacenesParse.message || 'Debe seleccionar al menos un id_almacen.'
+      });
+    }
+
+    const idAlmacenes = almacenesParse.ids;
+    const scopeValidation = await assertAlmacenesInScope(req, idAlmacenes, client);
+    if (!scopeValidation.ok) {
+      return res.status(scopeValidation.status).json({
+        error: true,
+        message: scopeValidation.message
+      });
+    }
+
+    const selectedBranches = new Map();
+    for (const almacenRow of scopeValidation.rows || []) {
+      const idSucursal = Number.parseInt(String(almacenRow?.id_sucursal ?? ''), 10);
+      const idAlmacen = Number.parseInt(String(almacenRow?.id_almacen ?? ''), 10);
+      if (!esEnteroPositivoInt32(idSucursal)) continue;
+      if (selectedBranches.has(idSucursal)) {
+        return res.status(409).json({
+          error: true,
+          code: 'PRODUCT_MULTIPLE_WAREHOUSES_SAME_BRANCH',
+          message: 'Selecciona como maximo un almacen por sucursal.'
+        });
+      }
+      selectedBranches.set(idSucursal, idAlmacen);
+    }
+
+    for (const idAlmacen of idAlmacenes) {
+      const almacenOperativo = await validarAlmacenOperativo(idAlmacen, client);
+      if (!almacenOperativo.ok) {
+        const status = String(almacenOperativo.message || '').includes('no existe') ? 404 : 400;
+        return res.status(status).json({
+          error: true,
+          message: status === 404 ? ALMACEN_NOT_FOUND_MESSAGE : almacenOperativo.message
+        });
+      }
+    }
+
+    await client.query('BEGIN');
+    txStarted = true;
+
+    await client.query(
+      `
+        UPDATE public.productos_almacenes
+        SET estado = false,
+            fecha_actualizacion = now()
+        WHERE id_producto = $1
+          AND NOT (id_almacen = ANY($2::int[]))
+      `,
+      [resolved.masterId, idAlmacenes]
+    );
+
+    for (const idAlmacen of idAlmacenes) {
+      const sameWarehouseAssignment = await getWarehouseAssignmentDetails('producto', resolved.masterId, idAlmacen, client);
+      if (sameWarehouseAssignment) {
+        await reactivateCatalogoMaestroAssignment(
+          'producto',
+          {
+            masterId: resolved.masterId,
+            warehouseId: idAlmacen,
+            stockMinimo: resolved.master.stock_minimo_default ?? 0
+          },
+          client
+        );
+      } else {
+        await createCatalogoMaestroAssignment(
+          'producto',
+          {
+            masterId: resolved.masterId,
+            warehouseId: idAlmacen,
+            stockMinimo: resolved.master.stock_minimo_default ?? 0,
+            precioLocal: resolved.master.precio_local_default,
+            fechaCaducidad: resolved.master.fecha_caducidad_default,
+            activo: true
+          },
+          client
+        );
+      }
+    }
+
+    await client.query(
+      'UPDATE public.productos SET id_almacen = $1 WHERE id_producto = $2',
+      [idAlmacenes[0], resolved.masterId]
+    );
+
+    const productoResponse = await getHydratedProductoById(req, resolved.masterId, client);
+    if (!productoResponse) {
+      await client.query('ROLLBACK');
+      txStarted = false;
+      return res.status(500).json({
+        error: true,
+        message: 'No se pudo cargar el producto actualizado.'
+      });
+    }
+
+    await client.query('COMMIT');
+    txStarted = false;
+
+    return res.status(200).json({
+      error: false,
+      message: 'Sucursales del producto actualizadas correctamente.',
+      id_producto_maestro: resolved.masterId,
+      id_almacenes: idAlmacenes,
+      producto: productoResponse
+    });
+  } catch (err) {
+    if (txStarted) {
+      try { await client.query('ROLLBACK'); } catch {}
+    }
+    console.error('Error en PUT /productos/:id_producto/asignaciones:', err.message);
+    return res.status(500).json({ error: true, message: getSafeProductosServerErrorMessage(err) });
+  } finally {
+    client.release();
+  }
+});
+
 router.post('/productos/:id_producto/asignaciones', checkPermission(PRODUCTOS_EDIT_PERMISSIONS), async (req, res) => {
   const client = await pool.connect();
   try {
