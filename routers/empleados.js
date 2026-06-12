@@ -968,8 +968,30 @@ const empleadoService = {
         db: client
       });
 
+      const currentEmpleado = await empleadoRepository.findById(idEmpleado, capabilities, client);
+      const detailedEmpleado = await empleadoRepository.findDetailById(idEmpleado);
+      const mergedEmpleado = mapEmpleadoListRow(
+        detailedEmpleado
+          ? { ...(currentEmpleado || {}), ...detailedEmpleado }
+          : (currentEmpleado || {})
+      );
+      const [empleado] = await empleadoRepository.backfillDirecciones([mergedEmpleado], capabilities);
+
       await client.query('COMMIT');
-      return { status: 201, body: { ok: true, error: false, message: 'Empleado creado exitosamente.' } };
+      return {
+        status: 201,
+        body: {
+          ok: true,
+          error: false,
+          message: 'Empleado creado exitosamente.',
+          id_empleado: idEmpleado,
+          empleado,
+          data: {
+            id_empleado: idEmpleado,
+            empleado
+          }
+        }
+      };
     } catch (error) {
       await rollbackQuietly(client);
       throw error;
