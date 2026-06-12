@@ -560,9 +560,6 @@ function parseIdAlmacenes(rawSingle, rawMulti) {
     if (!out.includes(parsed)) out.push(parsed);
   }
 
-  if (out.length > 1) {
-    return { ok: false, message: SINGLE_ALMACEN_TEMP_MESSAGE };
-  }
   if (out.length > 0) return { ok: true, ids: out };
 
   const parsedSingle = Number.parseInt(String(rawSingle ?? '').trim(), 10);
@@ -897,7 +894,7 @@ async function findProductoByWarehouseKey(
 }
 
 // AM: sincroniza las asignaciones multi-almacen del producto sin duplicar filas de productos por sucursal.
-async function syncProductoAlmacenes(idProducto, idAlmacenes, db = pool) {
+async function syncProductoAlmacenes(idProducto, idAlmacenes, db = pool, options = {}) {
   const uniqueIds = Array.from(
     new Set(
       (Array.isArray(idAlmacenes) ? idAlmacenes : [])
@@ -908,27 +905,39 @@ async function syncProductoAlmacenes(idProducto, idAlmacenes, db = pool) {
 
   if (uniqueIds.length === 0) return;
 
-  const primaryAlmacen = uniqueIds[0];
-  const singleAlmacenIds = [primaryAlmacen];
-  await db.query('UPDATE public.productos SET id_almacen = $1 WHERE id_producto = $2', [primaryAlmacen, idProducto]);
+  await db.query('UPDATE public.productos SET id_almacen = $1 WHERE id_producto = $2', [uniqueIds[0], idProducto]);
 
   try {
     await db.query(
       `
-        INSERT INTO public.productos_almacenes (id_producto, id_almacen)
-        SELECT $1, UNNEST($2::int[])
-        ON CONFLICT (id_producto, id_almacen) DO NOTHING
+        INSERT INTO public.productos_almacenes (
+          id_producto,
+          id_almacen,
+          cantidad,
+          stock_minimo,
+          costo_compra,
+          fecha_caducidad,
+          estado,
+          fecha_actualizacion
+        )
+        SELECT $1, UNNEST($2::int[]), 0, $3, $4, $5, $6, now()
+        ON CONFLICT (id_producto, id_almacen)
+        DO UPDATE SET
+          cantidad = EXCLUDED.cantidad,
+          stock_minimo = EXCLUDED.stock_minimo,
+          costo_compra = EXCLUDED.costo_compra,
+          fecha_caducidad = EXCLUDED.fecha_caducidad,
+          estado = EXCLUDED.estado,
+          fecha_actualizacion = now()
       `,
-      [idProducto, singleAlmacenIds]
-    );
-
-    await db.query(
-      `
-        DELETE FROM public.productos_almacenes
-        WHERE id_producto = $1
-          AND id_almacen <> ALL($2::int[])
-      `,
-      [idProducto, singleAlmacenIds]
+      [
+        idProducto,
+        uniqueIds,
+        options.stockMinimo ?? 0,
+        options.costoCompra ?? null,
+        options.fechaCaducidad ?? null,
+        options.estado ?? true
+      ]
     );
   } catch (error) {
     // AM: fallback legacy cuando la tabla de asignaciones aun no existe.
@@ -1802,6 +1811,20 @@ router.post('/productos', checkPermission(PRODUCTOS_CREATE_PERMISSIONS), async (
         message: almacenesScopeValidation.message
       });
     }
+    const selectedBranches = new Map();
+    for (const almacenRow of almacenesScopeValidation.rows || []) {
+      const idSucursal = Number.parseInt(String(almacenRow?.id_sucursal ?? ''), 10);
+      const idAlmacen = Number.parseInt(String(almacenRow?.id_almacen ?? ''), 10);
+      if (!esEnteroPositivoInt32(idSucursal)) continue;
+      if (selectedBranches.has(idSucursal)) {
+        return res.status(409).json({
+          error: true,
+          code: 'PRODUCT_MULTIPLE_WAREHOUSES_SAME_BRANCH',
+          message: 'Selecciona como maximo un almacen por sucursal.'
+        });
+      }
+      selectedBranches.set(idSucursal, idAlmacen);
+    }
 
     // VALIDACION: existencia FK tipo_departamento solo si viene con valor
     if (Object.prototype.hasOwnProperty.call(datosNormalizados, 'id_tipo_departamento')) {
@@ -1854,22 +1877,24 @@ router.post('/productos', checkPermission(PRODUCTOS_CREATE_PERMISSIONS), async (
       }
     }
 
-    const duplicadoGeneral = await findProductoByWarehouseKey(
-      {
-        nombre_producto: datosNormalizados.nombre_producto,
-        id_categoria_producto: datosNormalizados.id_categoria_producto,
-        id_almacen: idAlmacenes[0]
-      },
-      client
-    );
+    for (const idAlmacen of idAlmacenes) {
+      const duplicadoGeneral = await findProductoByWarehouseKey(
+        {
+          nombre_producto: datosNormalizados.nombre_producto,
+          id_categoria_producto: datosNormalizados.id_categoria_producto,
+          id_almacen: idAlmacen
+        },
+        client
+      );
 
-    if (duplicadoGeneral) {
-      await client.query('ROLLBACK');
-      return res.status(409).json({
-        error: true,
-        code: PRODUCTOS_DUPLICATE_CODE,
-        message: PRODUCTOS_DUPLICATE_MESSAGE
-      });
+      if (duplicadoGeneral) {
+        await client.query('ROLLBACK');
+        return res.status(409).json({
+          error: true,
+          code: PRODUCTOS_DUPLICATE_CODE,
+          message: PRODUCTOS_DUPLICATE_MESSAGE
+        });
+      }
     }
 
     const payloadPrimary = {
@@ -1925,23 +1950,31 @@ router.post('/productos', checkPermission(PRODUCTOS_CREATE_PERMISSIONS), async (
       });
     }
 
-    await syncProductoAlmacenes(idProductoCreado, idAlmacenes, client);
-    await completeProductoCatalogoMaestroWrite({
-      client,
-      idProducto: idProductoCreado,
-      idAlmacen: payloadPrimary.id_almacen,
+    await syncProductoAlmacenes(idProductoCreado, idAlmacenes, client, {
       stockMinimo: payloadPrimary.stock_minimo ?? 0,
       costoCompra: payloadPrimary.costo_compra ?? null,
       fechaCaducidad: payloadPrimary.fecha_caducidad ?? null,
       estado: payloadPrimary.estado ?? true
     });
-    await autoPublishNewProduct({
+    await completeProductoCatalogoMaestroWrite({
       client,
       idProducto: idProductoCreado,
-      idCategoriaProducto: payloadPrimary.id_categoria_producto,
       idAlmacen: payloadPrimary.id_almacen,
-      estadoItem: payloadPrimary.estado ?? true
+      idAlmacenes,
+      stockMinimo: payloadPrimary.stock_minimo ?? 0,
+      costoCompra: payloadPrimary.costo_compra ?? null,
+      fechaCaducidad: payloadPrimary.fecha_caducidad ?? null,
+      estado: payloadPrimary.estado ?? true
     });
+    for (const idAlmacen of idAlmacenes) {
+      await autoPublishNewProduct({
+        client,
+        idProducto: idProductoCreado,
+        idCategoriaProducto: payloadPrimary.id_categoria_producto,
+        idAlmacen,
+        estadoItem: payloadPrimary.estado ?? true
+      });
+    }
 
     const productoResponse = await getHydratedProductoById(req, idProductoCreado, client);
     if (!productoResponse) {
@@ -1958,12 +1991,21 @@ router.post('/productos', checkPermission(PRODUCTOS_CREATE_PERMISSIONS), async (
       error: false,
       message: 'Producto creado exitosamente.',
       id_producto: idProductoCreado,
+      id_almacenes: idAlmacenes,
       producto: productoResponse
     });
 
   } catch (err) {
     try { await client.query('ROLLBACK'); } catch {}
-    console.error('Error al crear producto:', err.message);
+    console.error('Error al crear producto:', {
+      endpoint: 'POST /productos',
+      message: err?.message,
+      code: err?.code,
+      constraint: err?.constraint,
+      table: err?.table,
+      column: err?.column,
+      ...(process.env.NODE_ENV === 'development' && err?.detail ? { detail: err.detail } : {})
+    });
 
     if (isCatalogoMaestroWriteStructureMissingError(err)) {
       console.error('CATALOGO_MAESTRO_WRITE_STRUCTURE_MISSING producto:', err.cause?.message || err.message);
@@ -1988,7 +2030,11 @@ router.post('/productos', checkPermission(PRODUCTOS_CREATE_PERMISSIONS), async (
       });
     }
 
-    res.status(500).json({ error: true, message: getSafeProductosServerErrorMessage(err) });
+    res.status(500).json({
+      error: true,
+      code: 'PRODUCT_CREATE_INTERNAL_ERROR',
+      message: 'No se pudo crear el producto por un error interno. Intenta nuevamente.'
+    });
   } finally {
     client.release();
   }

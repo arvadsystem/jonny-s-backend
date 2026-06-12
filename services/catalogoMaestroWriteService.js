@@ -40,11 +40,18 @@ export const completeProductoCatalogoMaestroWrite = async ({
   client,
   idProducto,
   idAlmacen,
+  idAlmacenes,
   stockMinimo,
   costoCompra,
   fechaCaducidad,
   estado
 }) => {
+  const almacenes = [...new Set(
+    (Array.isArray(idAlmacenes) && idAlmacenes.length > 0 ? idAlmacenes : [idAlmacen])
+      .map((id) => Number.parseInt(String(id ?? '').trim(), 10))
+      .filter((id) => Number.isSafeInteger(id) && id > 0)
+  )];
+
   await queryCatalogoMaestroWrite(
     client,
     'productos_almacenes',
@@ -58,7 +65,8 @@ export const completeProductoCatalogoMaestroWrite = async ({
         fecha_caducidad,
         estado,
         fecha_actualizacion
-      ) VALUES ($1, $2, 0, $3, $4, $5, $6, now())
+      )
+      SELECT $1, UNNEST($2::int[]), 0, $3, $4, $5, $6, now()
       ON CONFLICT (id_producto, id_almacen)
       DO UPDATE SET
         cantidad = EXCLUDED.cantidad,
@@ -70,7 +78,7 @@ export const completeProductoCatalogoMaestroWrite = async ({
     `,
     [
       idProducto,
-      idAlmacen,
+      almacenes,
       stockMinimo ?? 0,
       costoCompra ?? null,
       fechaCaducidad ?? null,
