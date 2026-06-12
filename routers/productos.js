@@ -5,6 +5,7 @@ import { resolveRequestUserSucursalScope } from '../utils/sucursalScope.js';
 import { checkPermission } from '../middleware/checkPermission.js';
 import { autoPublishNewProduct } from '../services/menuAutoPublicationService.js';
 import {
+  collapseCatalogoMaestroRows,
   isCatalogoMaestroReadsEnabled,
   isCatalogoMaestroViewMissingError,
   logCatalogoMaestroViewMissing,
@@ -1060,13 +1061,20 @@ function getSafeProductosServerErrorMessage(err, fallback = 'No se pudo completa
 
 const mapProductoMaestroRow = (row) => {
   const idAlmacen = Number.parseInt(String(row?.id_almacen ?? ''), 10);
+  const idAlmacenes = Array.isArray(row?.id_almacenes)
+    ? row.id_almacenes
+        .map((id) => Number.parseInt(String(id ?? ''), 10))
+        .filter((id) => esEnteroPositivoInt32(id))
+    : [];
   return {
     ...row,
     id_producto: row.id_producto == null ? row.id_producto : Number(row.id_producto),
     id_producto_maestro: row.id_producto_maestro == null ? null : Number(row.id_producto_maestro),
     id_almacen: esEnteroPositivoInt32(idAlmacen) ? idAlmacen : row.id_almacen,
     id_sucursal: row.id_sucursal == null ? null : Number(row.id_sucursal),
-    id_almacenes: esEnteroPositivoInt32(idAlmacen) ? [idAlmacen] : []
+    id_almacenes: idAlmacenes.length > 0
+      ? [...new Set(idAlmacenes)].sort((a, b) => a - b)
+      : esEnteroPositivoInt32(idAlmacen) ? [idAlmacen] : []
   };
 };
 
@@ -1143,32 +1151,12 @@ async function listProductosDesdeCatalogoMaestro({
   `;
   const orderBySql = PRODUCTOS_MAESTRO_SORT_ALLOWLIST[sortKey] || PRODUCTOS_MAESTRO_SORT_ALLOWLIST.recientes;
 
-  let total = 0;
-  if (wantsPaginated) {
-    const totalResult = await queryCatalogoMaestroView(
-      pool,
-      'public.vw_productos_maestros_almacen',
-      `SELECT COUNT(*)::int AS total ${fromSql}`,
-      whereParams
-    );
-    total = Number.parseInt(String(totalResult.rows?.[0]?.total ?? '0'), 10) || 0;
-  }
-
-  const dataParams = [...whereParams];
-  const paginationSql = wantsPaginated
-    ? (() => {
-        dataParams.push(pageSize);
-        dataParams.push((page - 1) * pageSize);
-        return `LIMIT $${dataParams.length - 1} OFFSET $${dataParams.length}`;
-      })()
-    : '';
-
   const dataResult = await queryCatalogoMaestroView(
     pool,
     'public.vw_productos_maestros_almacen',
     `
       SELECT
-        v.id_producto_legacy AS id_producto,
+        v.id_producto_maestro AS id_producto,
         v.id_producto_maestro,
         v.nombre_producto,
         v.precio_legacy AS precio,
@@ -1189,12 +1177,19 @@ async function listProductosDesdeCatalogoMaestro({
         v.estado_migracion
       ${fromSql}
       ORDER BY ${orderBySql}
-      ${paginationSql}
     `,
-    dataParams
+    whereParams
   );
 
-  const rows = (dataResult.rows || []).map(mapProductoMaestroRow);
+  const canonicalRows = collapseCatalogoMaestroRows(dataResult.rows, {
+    masterIdField: 'id_producto_maestro',
+    publicIdField: 'id_producto'
+  });
+  const total = canonicalRows.length;
+  const paginatedRows = wantsPaginated
+    ? canonicalRows.slice((page - 1) * pageSize, page * pageSize)
+    : canonicalRows;
+  const rows = paginatedRows.map(mapProductoMaestroRow);
   const items = await attachImagenPrincipalUrls(pool, req, rows);
 
   if (!wantsPaginated) {

@@ -5,6 +5,7 @@ import { validarYDescontarPedido } from '../services/inventarioPedidoService.js'
 import { checkPermission } from '../middleware/checkPermission.js';
 import { resolveRequestUserSucursalScope } from '../utils/sucursalScope.js';
 import {
+  collapseCatalogoMaestroRows,
   isCatalogoMaestroReadsEnabled,
   isCatalogoMaestroViewMissingError,
   logCatalogoMaestroViewMissing,
@@ -383,13 +384,20 @@ const safeServerErrorMessage = (fallback = 'No se pudo completar la accion. Veri
 
 const mapInsumoMaestroRow = (row) => {
   const idAlmacen = Number.parseInt(String(row?.id_almacen ?? ''), 10);
+  const idAlmacenes = Array.isArray(row?.id_almacenes)
+    ? row.id_almacenes
+        .map((id) => Number.parseInt(String(id ?? ''), 10))
+        .filter((id) => isPositiveIntegerId(id))
+    : [];
   return {
     ...row,
     id_insumo: row.id_insumo == null ? row.id_insumo : Number(row.id_insumo),
     id_insumo_maestro: row.id_insumo_maestro == null ? null : Number(row.id_insumo_maestro),
     id_almacen: isPositiveIntegerId(idAlmacen) ? idAlmacen : row.id_almacen,
     id_sucursal: row.id_sucursal == null ? null : Number(row.id_sucursal),
-    id_almacenes: isPositiveIntegerId(idAlmacen) ? [idAlmacen] : []
+    id_almacenes: idAlmacenes.length > 0
+      ? [...new Set(idAlmacenes)].sort((a, b) => a - b)
+      : isPositiveIntegerId(idAlmacen) ? [idAlmacen] : []
   };
 };
 
@@ -514,32 +522,12 @@ const listInsumosDesdeCatalogoMaestro = async (req) => {
   const page = pageParsed.value;
   const pageSize = pageSizeParsed.value;
 
-  let total = 0;
-  if (wantsPaginated) {
-    const totalResult = await queryCatalogoMaestroView(
-      pool,
-      'public.vw_insumos_maestros_almacen',
-      `SELECT COUNT(*)::int AS total ${fromSql}`,
-      whereParams
-    );
-    total = Number.parseInt(String(totalResult.rows?.[0]?.total ?? '0'), 10) || 0;
-  }
-
-  const dataParams = [...whereParams];
-  const paginationSql = wantsPaginated
-    ? (() => {
-        dataParams.push(pageSize);
-        dataParams.push((page - 1) * pageSize);
-        return `LIMIT $${dataParams.length - 1} OFFSET $${dataParams.length}`;
-      })()
-    : '';
-
   const dataResult = await queryCatalogoMaestroView(
     pool,
     'public.vw_insumos_maestros_almacen',
     `
       SELECT
-        v.id_insumo_legacy AS id_insumo,
+        v.id_insumo_maestro AS id_insumo,
         v.id_insumo_maestro,
         v.nombre_insumo,
         v.precio_compra AS precio,
@@ -559,12 +547,19 @@ const listInsumosDesdeCatalogoMaestro = async (req) => {
         v.estado_migracion
       ${fromSql}
       ORDER BY ${orderBySql}
-      ${paginationSql}
     `,
-    dataParams
+    whereParams
   );
 
-  const rows = (dataResult.rows || []).map(mapInsumoMaestroRow);
+  const canonicalRows = collapseCatalogoMaestroRows(dataResult.rows, {
+    masterIdField: 'id_insumo_maestro',
+    publicIdField: 'id_insumo'
+  });
+  const total = canonicalRows.length;
+  const paginatedRows = wantsPaginated
+    ? canonicalRows.slice((page - 1) * pageSize, page * pageSize)
+    : canonicalRows;
+  const rows = paginatedRows.map(mapInsumoMaestroRow);
   const items = await attachImagenPrincipalUrls(pool, req, rows);
 
   if (!wantsPaginated) {

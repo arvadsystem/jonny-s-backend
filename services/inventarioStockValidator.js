@@ -64,12 +64,17 @@ const fetchProductosByIdsForUpdate = async (client, ids) => {
     `
       SELECT
         p.id_producto,
+        p.id_producto AS id_producto_maestro,
         p.nombre_producto,
+        p.precio,
         COALESCE(p.estado, true) AS estado,
         COALESCE(p.cantidad, 0)::numeric AS cantidad,
         COALESCE(p.stock_minimo, 0)::numeric AS stock_minimo,
-        p.id_almacen
+        p.id_almacen,
+        a.id_sucursal
       FROM public.productos p
+      LEFT JOIN public.almacenes a
+        ON a.id_almacen = p.id_almacen
       WHERE p.id_producto = ANY($1::int[])
       ORDER BY p.id_producto
       FOR UPDATE
@@ -160,6 +165,7 @@ export const fetchProductosMaestrosByIdsForUpdate = async (client, ids, idSucurs
           SELECT
             p.id_producto,
             p.nombre_producto,
+            p.precio,
             COALESCE(p.estado, true) AS estado
           FROM public.productos p
           WHERE p.id_producto = ANY($1::int[])
@@ -246,6 +252,7 @@ export const fetchProductosMaestrosByIdsForUpdate = async (client, ids, idSucurs
             pa.id_producto AS id_producto_maestro,
             pm.id_producto_legacy AS id_producto_legacy_local,
             p.nombre_producto,
+            p.precio,
             COALESCE(pa.cantidad, 0)::numeric AS cantidad,
             COALESCE(pa.stock_minimo, 0)::numeric AS stock_minimo,
             pa.id_almacen,

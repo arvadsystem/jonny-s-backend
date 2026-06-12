@@ -5,6 +5,31 @@ import {
   buildComplementSnapshot
 } from './ventasPayloadService.js';
 
+export const VENTA_MONTO_COBRO_INVALIDO_CODE = 'VENTA_MONTO_COBRO_INVALIDO';
+export const VENTA_MONTO_COBRO_INVALIDO_MESSAGE = 'No se pudo determinar un monto válido para la venta.';
+
+export const validateVentaMontoCobro = ({ venta, payload = null } = {}) => {
+  const directProductLines = (Array.isArray(venta?.all_lines) ? venta.all_lines : [])
+    .filter((line) => line?.kind === 'PRODUCTO');
+  const hasInvalidProductPrice = directProductLines.some((line) => {
+    const price = Number(line?.precio_unitario);
+    return !Number.isFinite(price) || price <= 0;
+  });
+  const total = Number(venta?.total);
+  const cobroMonto = payload ? Number(payload?.cobro?.monto) : total;
+
+  if (hasInvalidProductPrice || !Number.isFinite(total) || total <= 0 || !Number.isFinite(cobroMonto) || cobroMonto <= 0) {
+    return {
+      ok: false,
+      status: 409,
+      code: VENTA_MONTO_COBRO_INVALIDO_CODE,
+      message: VENTA_MONTO_COBRO_INVALIDO_MESSAGE
+    };
+  }
+
+  return { ok: true };
+};
+
 const buildVentaRpcItems = (venta) =>
   (Array.isArray(venta?.all_lines) ? venta.all_lines : []).map((line, index) => {
     const tipoItem = normalizeTipoItem(line.kind);

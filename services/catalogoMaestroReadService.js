@@ -5,7 +5,39 @@ export const CATALOGO_MAESTRO_VIEW_MISSING_CODE = 'CATALOGO_MAESTRO_VIEW_MISSING
 export const isCatalogoMaestroReadsEnabled = () =>
   String(process.env.CATALOGO_MAESTRO_READS_ENABLED || '')
     .trim()
-    .toLowerCase() === 'true';
+    .toLowerCase() !== 'false';
+
+export const collapseCatalogoMaestroRows = (
+  rows,
+  { masterIdField, publicIdField }
+) => {
+  const grouped = new Map();
+
+  for (const row of Array.isArray(rows) ? rows : []) {
+    const masterId = Number.parseInt(String(row?.[masterIdField] ?? ''), 10);
+    if (!Number.isSafeInteger(masterId) || masterId <= 0) continue;
+
+    if (!grouped.has(masterId)) {
+      grouped.set(masterId, {
+        ...row,
+        [publicIdField]: masterId,
+        [masterIdField]: masterId,
+        id_almacenes: []
+      });
+    }
+
+    const current = grouped.get(masterId);
+    const warehouseId = Number.parseInt(String(row?.id_almacen ?? ''), 10);
+    if (Number.isSafeInteger(warehouseId) && warehouseId > 0) {
+      current.id_almacenes.push(warehouseId);
+    }
+  }
+
+  return [...grouped.values()].map((row) => ({
+    ...row,
+    id_almacenes: [...new Set(row.id_almacenes)].sort((a, b) => a - b)
+  }));
+};
 
 const buildCatalogoMaestroViewMissingError = (viewName, cause) => {
   const error = new Error(`Vista maestra requerida no disponible: ${viewName}`);

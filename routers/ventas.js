@@ -70,7 +70,10 @@ import {
 import {
   buildPedidoPendienteRpcPayload,
   buildVentaRpcPayload,
-  buildVentaRpcV2Payload
+  buildVentaRpcV2Payload,
+  validateVentaMontoCobro,
+  VENTA_MONTO_COBRO_INVALIDO_CODE,
+  VENTA_MONTO_COBRO_INVALIDO_MESSAGE
 } from './ventas/services/ventasRpcPayloadService.js';
 import {
   DESCUENTO_ALCANCE_KEYS,
@@ -1083,6 +1086,14 @@ const createVentaWithRpcTransaction = async ({ client, venta, perf, requestStart
     facturacionVenta,
     facturacionNormalizada
   });
+  const amountValidation = validateVentaMontoCobro({ venta, payload: rpcPayload });
+  if (!amountValidation.ok) {
+    throw {
+      httpStatus: amountValidation.status,
+      code: amountValidation.code,
+      publicMessage: amountValidation.message
+    };
+  }
   const rpcActor = {
     id_usuario: venta.id_usuario,
     id_sucursal: venta.id_sucursal,
@@ -1148,6 +1159,14 @@ const createVentaWithRpcV2Transaction = async ({ client, venta, perf, requestSta
 
   const rpcPayloadBuildStart = perf?.now?.() || 0;
   const rpcPayload = buildVentaRpcV2Payload({ venta });
+  const amountValidation = validateVentaMontoCobro({ venta, payload: rpcPayload });
+  if (!amountValidation.ok) {
+    throw {
+      httpStatus: amountValidation.status,
+      code: amountValidation.code,
+      publicMessage: amountValidation.message
+    };
+  }
   const rpcActor = {
     id_usuario: venta.id_usuario,
     id_sucursal: venta.id_sucursal,
@@ -2869,6 +2888,17 @@ const hydrateVentaLines = async (client, normalizedItems, perf = null, options =
       }
 
       const precioUnitario = roundMoney(producto.precio);
+      if (!Number.isFinite(precioUnitario) || precioUnitario <= 0) {
+        return {
+          ok: false,
+          status: 409,
+          body: {
+            error: true,
+            code: VENTA_MONTO_COBRO_INVALIDO_CODE,
+            message: VENTA_MONTO_COBRO_INVALIDO_MESSAGE
+          }
+        };
+      }
       const subTotal = roundMoney(precioUnitario * item.cantidad);
       const idAlmacen = Number(producto.id_almacen ?? 0) || null;
       if (!idAlmacen) {
@@ -8385,6 +8415,20 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
     }
 
     const venta = prepared.data;
+    const amountValidation = validateVentaMontoCobro({ venta });
+    if (!amountValidation.ok) {
+      await client.query('ROLLBACK');
+      ventasPerf.log({
+        ...ventasPerfContext,
+        status: amountValidation.status,
+        error_code: amountValidation.code
+      });
+      return res.status(amountValidation.status).json({
+        error: true,
+        code: amountValidation.code,
+        message: amountValidation.message
+      });
+    }
     const allLines = [...venta.all_lines];
     const cuentaDivisionPlan = buildCuentaDivisionPlan({
       cuentaDividida: req.body?.cuenta_dividida,
