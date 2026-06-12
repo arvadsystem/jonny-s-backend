@@ -772,7 +772,6 @@ router.post('/', checkPermission(MENU_RECETAS_CREATE_PERMISSIONS), async (req, r
       return res.status(reglasValidation.status).json({ error: true, message: reglasValidation.message });
     }
 
-    const nowIso = new Date().toISOString();
     perf.writeStarted();
     await client.query('BEGIN');
     if (!shouldUseCatalogoMaestroInsumos()) {
@@ -797,7 +796,19 @@ router.post('/', checkPermission(MENU_RECETAS_CREATE_PERMISSIONS), async (req, r
           estado,
           id_tipo_departamento,
           precio
-        ) VALUES ($1, $2, $3, $4, $5, $6, $6, $7, $8, $9, $10)
+        ) VALUES (
+          $1,
+          $2,
+          $3,
+          $4,
+          $5,
+          timezone('America/Tegucigalpa', now()),
+          timezone('America/Tegucigalpa', now())::date,
+          $6,
+          $7,
+          $8,
+          $9
+        )
         RETURNING id_receta
       `,
       [
@@ -806,7 +817,6 @@ router.post('/', checkPermission(MENU_RECETAS_CREATE_PERMISSIONS), async (req, r
         datosNormalizados.id_menu,
         datosNormalizados.id_nivel_picante,
         datosNormalizados.id_archivo ?? null,
-        nowIso,
         datosNormalizados.id_usuario,
         datosNormalizados.estado,
         datosNormalizados.id_tipo_departamento,
@@ -838,7 +848,13 @@ router.post('/', checkPermission(MENU_RECETAS_CREATE_PERMISSIONS), async (req, r
     await client.query('ROLLBACK');
     const handled = sendRecetaInsumosMaestrosError(res, err, 'POST /admin/recetas');
     if (handled) return handled;
-    console.error('Error al crear receta admin:', err.message);
+    console.error('Error al crear receta admin:', {
+      message: err?.message,
+      code: err?.code,
+      constraint: err?.constraint,
+      column: err?.column,
+      ...(process.env.NODE_ENV === 'development' && err?.detail ? { detail: err.detail } : {})
+    });
 
     if (esErrorConflictoConstraint(err)) {
       if (err?.constraint === 'detalle_recetas_cant_check') {
@@ -875,7 +891,11 @@ router.post('/', checkPermission(MENU_RECETAS_CREATE_PERMISSIONS), async (req, r
       });
     }
 
-    return res.status(500).json({ error: true, message: getSafeServerErrorMessage(err) });
+    return res.status(500).json({
+      error: true,
+      code: 'RECETA_CREATE_INTERNAL_ERROR',
+      message: 'No se pudo crear la receta por un error interno. Intenta nuevamente.'
+    });
   } finally {
     perf.finish();
     client.release();
