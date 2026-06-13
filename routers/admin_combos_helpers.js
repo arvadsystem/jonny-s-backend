@@ -1,5 +1,7 @@
 import pool from '../config/db-connection.js';
 import { resolveMenuDepartmentIds } from './menu_departamentos.js';
+const SQLSTATE_UNDEFINED_TABLE = '42P01';
+const schemaCache = new Map();
 
 const CAMPOS_PERMITIDOS_COMBO = new Set([
   'id_menu',
@@ -30,6 +32,32 @@ const esVacio = (valor) =>
   (typeof valor === 'string' && valor.trim() === '');
 
 export const esEnteroPositivo = (valor) => Number.isSafeInteger(valor) && valor > 0;
+
+export const normalizePositiveIdList = (value) => {
+  const rawList = Array.isArray(value) ? value : [];
+  return [...new Set(rawList
+    .map((item) => Number.parseInt(String(item ?? '').trim(), 10))
+    .filter((item) => Number.isSafeInteger(item) && item > 0))];
+};
+
+const hasTable = async (client, tableName) => {
+  const key = `table:${String(tableName || '').trim().toLowerCase()}`;
+  if (schemaCache.has(key)) return schemaCache.get(key);
+
+  const result = await client.query(
+    `
+      SELECT 1
+      FROM information_schema.tables
+      WHERE table_schema = 'public'
+        AND table_name = $1
+      LIMIT 1
+    `,
+    [tableName]
+  );
+  const exists = result.rowCount > 0;
+  schemaCache.set(key, exists);
+  return exists;
+};
 
 export const isRowActive = (row) => {
   const raw = row?.estado;
@@ -313,6 +341,173 @@ export async function existeComboPorId(idCombo) {
   const result = await pool.query('SELECT 1 FROM combos WHERE id_combo = $1 LIMIT 1', [idCombo]);
   return result.rowCount > 0;
 }
+
+export async function validateComboAlmacenes(client, idAlmacenes = []) {
+  const normalized = normalizePositiveIdList(idAlmacenes);
+  if (normalized.length === 0) {
+    return { ok: false, status: 400, message: 'Selecciona al menos un almacén para el combo.' };
+  }
+
+  const tableExists = await hasTable(client, 'menu_combo_almacenes');
+  if (!tableExists) {
+    return { ok: false, status: 500, message: 'La tabla de asignaciones de combos no está disponible en la base de datos.' };
+  }
+
+  const result = await client.query(
+    `
+      SELECT
+        a.id_almacen,
+        COALESCE(a.estado, true) AS estado,
+        COALESCE(NULLIF(TRIM(COALESCE(a.nombre, '')), ''), CONCAT('Almacén #', a.id_almacen::text)) AS nombre_almacen,
+        s.id_sucursal,
+        s.nombre_sucursal,
+        COALESCE(s.estado, true) AS sucursal_estado
+      FROM public.almacenes a
+      INNER JOIN public.sucursales s
+        ON s.id_sucursal = a.id_sucursal
+      WHERE a.id_almacen = ANY($1::int[])
+    `,
+    [normalized]
+  );
+
+  const rows = result.rows || [];
+  const found = new Set(rows.map((row) => Number(row.id_almacen)));
+  const missing = normalized.filter((id) => !found.has(id));
+  if (missing.length) {
+    return { ok: false, status: 400, message: `Almacenes inválidos: ${missing.join(', ')}` };
+  }
+
+  const branchMap = new Map();
+  for (const row of rows) {
+    if (row.estado !== true || row.sucursal_estado !== true) {
+      return { ok: false, status: 409, message: 'Todos los almacenes seleccionados deben estar activos.' };
+    }
+    const idSucursal = Number(row.id_sucursal);
+    if (branchMap.has(idSucursal)) {
+      return {
+        ok: false,
+        status: 409,
+        code: 'COMBO_MULTIPLE_WAREHOUSES_SAME_BRANCH',
+        message: 'Selecciona como máximo un almacén por sucursal.'
+      };
+    }
+    branchMap.set(idSucursal, Number(row.id_almacen));
+  }
+
+  return { ok: true, rows };
+}
+
+export const replaceComboAlmacenes = async (client, idCombo, idAlmacenes = []) => {
+  const normalized = normalizePositiveIdList(idAlmacenes);
+  await client.query(
+    `
+      UPDATE public.menu_combo_almacenes
+      SET estado = false,
+          fecha_actualizacion = NOW()
+      WHERE id_combo = $1
+        AND NOT (id_almacen = ANY($2::int[]))
+    `,
+    [idCombo, normalized]
+  );
+
+  if (normalized.length === 0) return;
+
+  await client.query(
+    `
+      INSERT INTO public.menu_combo_almacenes (id_combo, id_almacen, estado, fecha_actualizacion)
+      SELECT $1, UNNEST($2::int[]), true, NOW()
+      ON CONFLICT (id_combo, id_almacen)
+      DO UPDATE SET
+        estado = true,
+        fecha_actualizacion = NOW()
+    `,
+    [idCombo, normalized]
+  );
+};
+
+export const listComboAssignments = async (client, idCombo) => {
+  try {
+    const result = await client.query(
+      `
+        SELECT
+          mca.id_combo,
+          mca.id_almacen,
+          COALESCE(mca.estado, true) AS estado,
+          COALESCE(NULLIF(TRIM(COALESCE(a.nombre, '')), ''), CONCAT('Almacén #', a.id_almacen::text)) AS nombre_almacen,
+          a.id_sucursal,
+          s.nombre_sucursal
+        FROM public.menu_combo_almacenes mca
+        INNER JOIN public.almacenes a
+          ON a.id_almacen = mca.id_almacen
+        INNER JOIN public.sucursales s
+          ON s.id_sucursal = a.id_sucursal
+        WHERE mca.id_combo = $1
+        ORDER BY s.nombre_sucursal ASC, COALESCE(NULLIF(TRIM(COALESCE(a.nombre, '')), ''), CONCAT('Almacén #', a.id_almacen::text)) ASC, a.id_almacen ASC
+      `,
+      [idCombo]
+    );
+    return result.rows || [];
+  } catch (error) {
+    if (error?.code === SQLSTATE_UNDEFINED_TABLE) return [];
+    throw error;
+  }
+};
+
+export const attachComboAlmacenes = async (client, rows = []) => {
+  const list = Array.isArray(rows) ? rows : [];
+  if (list.length === 0) return list;
+  const ids = normalizePositiveIdList(list.map((row) => row?.id_combo));
+  if (ids.length === 0) {
+    return list.map((row) => ({ ...row, id_almacenes: [], total_almacenes: 0, total_sucursales: 0, nombres_sucursales: [] }));
+  }
+
+  try {
+    const assignments = await client.query(
+      `
+        SELECT
+          mca.id_combo,
+          ARRAY_AGG(mca.id_almacen ORDER BY mca.id_almacen) FILTER (WHERE COALESCE(mca.estado, true) = true) AS id_almacenes,
+          COUNT(*) FILTER (WHERE COALESCE(mca.estado, true) = true)::int AS total_almacenes,
+          COUNT(DISTINCT a.id_sucursal) FILTER (WHERE COALESCE(mca.estado, true) = true)::int AS total_sucursales,
+          ARRAY_REMOVE(ARRAY_AGG(DISTINCT s.nombre_sucursal) FILTER (WHERE COALESCE(mca.estado, true) = true), NULL) AS nombres_sucursales
+        FROM public.menu_combo_almacenes mca
+        INNER JOIN public.almacenes a
+          ON a.id_almacen = mca.id_almacen
+        INNER JOIN public.sucursales s
+          ON s.id_sucursal = a.id_sucursal
+        WHERE mca.id_combo = ANY($1::int[])
+        GROUP BY mca.id_combo
+      `,
+      [ids]
+    );
+
+    const map = new Map((assignments.rows || []).map((row) => [
+      Number(row.id_combo),
+      {
+        id_almacenes: normalizePositiveIdList(row.id_almacenes),
+        total_almacenes: Number(row.total_almacenes || 0),
+        total_sucursales: Number(row.total_sucursales || 0),
+        nombres_sucursales: Array.isArray(row.nombres_sucursales) ? row.nombres_sucursales : []
+      }
+    ]));
+
+    return list.map((row) => {
+      const assignment = map.get(Number(row.id_combo));
+      return {
+        ...row,
+        id_almacenes: assignment?.id_almacenes || [],
+        total_almacenes: assignment?.total_almacenes || 0,
+        total_sucursales: assignment?.total_sucursales || 0,
+        nombres_sucursales: assignment?.nombres_sucursales || []
+      };
+    });
+  } catch (error) {
+    if (error?.code === SQLSTATE_UNDEFINED_TABLE) {
+      return list.map((row) => ({ ...row, id_almacenes: [], total_almacenes: 0, total_sucursales: 0, nombres_sucursales: [] }));
+    }
+    throw error;
+  }
+};
 
 export async function listarCombosAdmin() {
   const result = await pool.query(

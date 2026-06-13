@@ -6,6 +6,7 @@ import {
   actualizarComboConDetalle,
   actualizarEstadoCombo,
   agregarDetalleCombo,
+  attachComboAlmacenes,
   crearComboConDetalle,
   desactivarDetalleCombo,
   esEnteroPositivo,
@@ -15,15 +16,19 @@ import {
   existeUsuario,
   getSafeServerErrorMessage,
   isRowActive,
+  listComboAssignments,
   listarCombosAdmin,
   listarRecetasParaCombos,
   normalizarDetalleCombo,
+  normalizePositiveIdList,
   normalizarPayloadCombo,
   obtenerComboPorId,
+  replaceComboAlmacenes,
   shouldIncludeInactive,
   validarCampoCombo,
   validarEstructuraPayloadCombo,
-  validarReglasNegocioYFks
+  validarReglasNegocioYFks,
+  validateComboAlmacenes
 } from './admin_combos_helpers.js';
 import {
   autoPublishNewCombo,
@@ -57,7 +62,8 @@ const withResolvedComboImageUrl = (req, combo) => ({
 router.get('/', checkPermission(MENU_COMBOS_VIEW_PERMISSIONS), async (req, res) => {
   try {
     const baseDatos = await listarCombosAdmin();
-    const datosNormalizados = (Array.isArray(baseDatos) ? baseDatos : []).map((combo) => withResolvedComboImageUrl(req, combo));
+    const hydrated = await attachComboAlmacenes(pool, Array.isArray(baseDatos) ? baseDatos : []);
+    const datosNormalizados = hydrated.map((combo) => withResolvedComboImageUrl(req, combo));
     const datos = shouldIncludeInactive(req.query) ? datosNormalizados : datosNormalizados.filter(isRowActive);
     return res.status(200).json(datos);
   } catch (err) {
@@ -77,6 +83,210 @@ router.get('/catalogos/recetas', checkPermission(MENU_COMBOS_VIEW_PERMISSIONS), 
   }
 });
 
+router.get('/catalogos/almacenes', checkPermission(MENU_COMBOS_VIEW_PERMISSIONS), async (req, res) => {
+  try {
+    const result = await pool.query(
+      `
+        SELECT
+          a.id_almacen,
+          COALESCE(NULLIF(TRIM(COALESCE(a.nombre, '')), ''), CONCAT('Almacén #', a.id_almacen::text)) AS nombre_almacen,
+          a.id_sucursal,
+          s.nombre_sucursal,
+          COALESCE(a.estado, true) AS estado
+        FROM public.almacenes a
+        INNER JOIN public.sucursales s
+          ON s.id_sucursal = a.id_sucursal
+        WHERE COALESCE(a.estado, true) = true
+          AND COALESCE(s.estado, true) = true
+        ORDER BY s.nombre_sucursal ASC, COALESCE(NULLIF(TRIM(COALESCE(a.nombre, '')), ''), CONCAT('Almacén #', a.id_almacen::text)) ASC, a.id_almacen ASC
+      `
+    );
+    return res.status(200).json(result.rows || []);
+  } catch (err) {
+    console.error('Error al listar almacenes para combos:', err.message);
+    return res.status(500).json({ error: true, message: 'No se pudieron cargar los almacenes.' });
+  }
+});
+
+router.get('/:id_combo/asignaciones', checkPermission(MENU_COMBOS_VIEW_PERMISSIONS), async (req, res) => {
+  try {
+    const idCombo = parseComboId(req.params.id_combo);
+    if (!idCombo) {
+      return res.status(400).json({ error: true, message: 'id_combo inválido.' });
+    }
+    const comboExiste = await existeComboPorId(idCombo);
+    if (!comboExiste) {
+      return res.status(404).json({ error: true, message: 'Combo no encontrado.' });
+    }
+    const asignaciones = await listComboAssignments(pool, idCombo);
+    return res.status(200).json({ id_combo: idCombo, asignaciones });
+  } catch (err) {
+    console.error('Error al obtener asignaciones de combo:', err.message);
+    return res.status(500).json({ error: true, message: 'No se pudieron cargar las asignaciones del combo.' });
+  }
+});
+
+router.put('/:id_combo/asignaciones', checkPermission(MENU_COMBOS_EDIT_PERMISSIONS), async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const idCombo = parseComboId(req.params.id_combo);
+    if (!idCombo) {
+      return res.status(400).json({ error: true, message: 'id_combo inválido.' });
+    }
+    const comboExiste = await existeComboPorId(idCombo);
+    if (!comboExiste) {
+      return res.status(404).json({ error: true, message: 'Combo no encontrado.' });
+    }
+
+    const idAlmacenes = normalizePositiveIdList(req.body?.id_almacenes);
+    const validation = await validateComboAlmacenes(client, idAlmacenes);
+    if (!validation.ok) {
+      return res.status(validation.status).json({ error: true, code: validation.code, message: validation.message });
+    }
+
+    await client.query('BEGIN');
+    await replaceComboAlmacenes(client, idCombo, idAlmacenes);
+    const comboBase = await obtenerComboPorId(idCombo, { includeInactiveDetail: true });
+    const [combo] = await attachComboAlmacenes(client, [comboBase]);
+    await client.query('COMMIT');
+
+    return res.status(200).json({
+      error: false,
+      message: 'Sucursales del combo actualizadas correctamente.',
+      id_combo: idCombo,
+      id_almacenes: idAlmacenes,
+      data: withResolvedComboImageUrl(req, combo)
+    });
+  } catch (err) {
+    try { await client.query('ROLLBACK'); } catch {}
+    console.error('Error al reemplazar asignaciones de combo:', err.message);
+    return res.status(500).json({ error: true, message: 'No se pudieron actualizar las sucursales del combo.' });
+  } finally {
+    client.release();
+  }
+});
+
+router.post('/:id_combo/asignaciones', checkPermission(MENU_COMBOS_EDIT_PERMISSIONS), async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const idCombo = parseComboId(req.params.id_combo);
+    const idAlmacen = Number(req.body?.id_almacen);
+    if (!idCombo || !esEnteroPositivo(idAlmacen)) {
+      return res.status(400).json({ error: true, message: 'id_combo o id_almacen inválido.' });
+    }
+    const comboExiste = await existeComboPorId(idCombo);
+    if (!comboExiste) {
+      return res.status(404).json({ error: true, message: 'Combo no encontrado.' });
+    }
+
+    const validation = await validateComboAlmacenes(client, [idAlmacen]);
+    if (!validation.ok) {
+      return res.status(validation.status).json({ error: true, code: validation.code, message: validation.message });
+    }
+
+    const currentAssignments = (await listComboAssignments(client, idCombo)).filter((row) => row.estado === true);
+    const newBranchId = Number(validation.rows[0]?.id_sucursal || 0);
+    const sameBranchActive = currentAssignments.find((row) => Number(row.id_sucursal) === newBranchId && Number(row.id_almacen) !== idAlmacen);
+    if (sameBranchActive) {
+      return res.status(409).json({
+        error: true,
+        code: 'COMBO_BRANCH_ASSIGNMENT_CONFLICT',
+        message: 'Ya existe otro almacén activo para esa sucursal en este combo.'
+      });
+    }
+    const sameAssignment = currentAssignments.find((row) => Number(row.id_almacen) === idAlmacen);
+    if (sameAssignment) {
+      return res.status(409).json({
+        error: true,
+        code: 'COMBO_ASSIGNMENT_ALREADY_ACTIVE',
+        message: 'El combo ya está asignado a ese almacén.'
+      });
+    }
+
+    await client.query('BEGIN');
+    await client.query(
+      `
+        INSERT INTO public.menu_combo_almacenes (id_combo, id_almacen, estado, fecha_actualizacion)
+        VALUES ($1, $2, true, NOW())
+        ON CONFLICT (id_combo, id_almacen)
+        DO UPDATE SET estado = true, fecha_actualizacion = NOW()
+      `,
+      [idCombo, idAlmacen]
+    );
+    await client.query('COMMIT');
+
+    return res.status(201).json({
+      error: false,
+      message: 'Asignación del combo creada correctamente.',
+      id_combo: idCombo,
+      id_almacen: idAlmacen
+    });
+  } catch (err) {
+    try { await client.query('ROLLBACK'); } catch {}
+    console.error('Error al crear asignación de combo:', err.message);
+    return res.status(500).json({ error: true, message: 'No se pudo crear la asignación del combo.' });
+  } finally {
+    client.release();
+  }
+});
+
+router.patch('/:id_combo/asignaciones/:id_almacen/inactivar', checkPermission(MENU_COMBOS_EDIT_PERMISSIONS), async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const idCombo = parseComboId(req.params.id_combo);
+    const idAlmacen = Number(req.params.id_almacen);
+    if (!idCombo || !esEnteroPositivo(idAlmacen)) {
+      return res.status(400).json({ error: true, message: 'id_combo o id_almacen inválido.' });
+    }
+    const comboExiste = await existeComboPorId(idCombo);
+    if (!comboExiste) {
+      return res.status(404).json({ error: true, message: 'Combo no encontrado.' });
+    }
+
+    const assignmentResult = await client.query(
+      `
+        SELECT id_combo, id_almacen, COALESCE(estado, true) AS estado
+        FROM public.menu_combo_almacenes
+        WHERE id_combo = $1
+          AND id_almacen = $2
+        LIMIT 1
+      `,
+      [idCombo, idAlmacen]
+    );
+    if (!assignmentResult.rowCount) {
+      return res.status(404).json({ error: true, message: 'La asignación del combo no existe para ese almacén.' });
+    }
+
+    await client.query('BEGIN');
+    await client.query(
+      `
+        UPDATE public.menu_combo_almacenes
+        SET estado = false,
+            fecha_actualizacion = NOW()
+        WHERE id_combo = $1
+          AND id_almacen = $2
+      `,
+      [idCombo, idAlmacen]
+    );
+    await client.query('COMMIT');
+
+    return res.status(200).json({
+      error: false,
+      message: assignmentResult.rows[0].estado === true
+        ? 'Asignación del combo inactivada correctamente.'
+        : 'La asignación del combo ya estaba inactiva.',
+      id_combo: idCombo,
+      id_almacen: idAlmacen
+    });
+  } catch (err) {
+    try { await client.query('ROLLBACK'); } catch {}
+    console.error('Error al inactivar asignación de combo:', err.message);
+    return res.status(500).json({ error: true, message: 'No se pudo inactivar la asignación del combo.' });
+  } finally {
+    client.release();
+  }
+});
+
 // GET: obtener combo por id.
 router.get('/:id_combo', checkPermission(MENU_COMBOS_VIEW_PERMISSIONS), async (req, res) => {
   try {
@@ -91,8 +301,12 @@ router.get('/:id_combo', checkPermission(MENU_COMBOS_VIEW_PERMISSIONS), async (r
     if (!combo) {
       return res.status(404).json({ error: true, message: 'Combo no encontrado.' });
     }
-
-    return res.status(200).json(withResolvedComboImageUrl(req, combo));
+    const [hydrated] = await attachComboAlmacenes(pool, [combo]);
+    const asignaciones = await listComboAssignments(pool, idCombo);
+    return res.status(200).json({
+      ...withResolvedComboImageUrl(req, hydrated),
+      asignaciones
+    });
   } catch (err) {
     console.error('Error al obtener combo por id admin:', err.message);
     return res.status(500).json({ error: true, message: getSafeServerErrorMessage(err) });
@@ -111,6 +325,8 @@ router.post('/', checkPermission(MENU_COMBOS_CREATE_PERMISSIONS), async (req, re
 
     // Transicion segura: id_usuario del cliente se ignora y se fuerza desde req.user.
     const payloadConActor = { ...(req.body || {}), id_usuario: actorUserId };
+    const idAlmacenes = normalizePositiveIdList(payloadConActor.id_almacenes);
+    delete payloadConActor.id_almacenes;
 
     const payloadValidation = validarEstructuraPayloadCombo(payloadConActor);
     if (!payloadValidation.ok) {
@@ -138,9 +354,18 @@ router.post('/', checkPermission(MENU_COMBOS_CREATE_PERMISSIONS), async (req, re
     if (!reglasValidation.ok) {
       return res.status(reglasValidation.status).json({ error: true, message: reglasValidation.message });
     }
+    const almacenesValidation = await validateComboAlmacenes(client, idAlmacenes);
+    if (!almacenesValidation.ok) {
+      return res.status(almacenesValidation.status).json({
+        error: true,
+        code: almacenesValidation.code,
+        message: almacenesValidation.message
+      });
+    }
 
     await client.query('BEGIN');
     const idCombo = await crearComboConDetalle(client, datosNormalizados, detalleNormalizacion.data);
+    await replaceComboAlmacenes(client, idCombo, idAlmacenes);
     await autoPublishNewCombo({
       client,
       idMenu: datosNormalizados.id_menu,
@@ -150,10 +375,11 @@ router.post('/', checkPermission(MENU_COMBOS_CREATE_PERMISSIONS), async (req, re
     await client.query('COMMIT');
 
     const comboCreado = await obtenerComboPorId(idCombo, { includeInactiveDetail: true });
+    const [comboHydrated] = await attachComboAlmacenes(pool, [comboCreado]);
     return res.status(201).json({
       error: false,
       message: 'Combo creado exitosamente.',
-      data: withResolvedComboImageUrl(req, comboCreado)
+      data: withResolvedComboImageUrl(req, comboHydrated)
     });
   } catch (err) {
     await client.query('ROLLBACK');
@@ -205,6 +431,8 @@ router.put('/:id_combo', checkPermission(MENU_COMBOS_EDIT_PERMISSIONS), async (r
 
     // Transicion segura: id_usuario del cliente se ignora y se fuerza desde req.user.
     const payloadConActor = { ...(req.body || {}), id_usuario: actorUserId };
+    const idAlmacenes = normalizePositiveIdList(payloadConActor.id_almacenes);
+    delete payloadConActor.id_almacenes;
 
     const payloadValidation = validarEstructuraPayloadCombo(payloadConActor);
     if (!payloadValidation.ok) {
@@ -226,11 +454,20 @@ router.put('/:id_combo', checkPermission(MENU_COMBOS_EDIT_PERMISSIONS), async (r
     if (!reglasValidation.ok) {
       return res.status(reglasValidation.status).json({ error: true, message: reglasValidation.message });
     }
+    const almacenesValidation = await validateComboAlmacenes(client, idAlmacenes);
+    if (!almacenesValidation.ok) {
+      return res.status(almacenesValidation.status).json({
+        error: true,
+        code: almacenesValidation.code,
+        message: almacenesValidation.message
+      });
+    }
 
     await client.query('BEGIN');
     await actualizarComboConDetalle(client, idCombo, datosNormalizados, detalleNormalizacion.data, {
       replaceDetalle: detalleNormalizacion.provided
     });
+    await replaceComboAlmacenes(client, idCombo, idAlmacenes);
     await moveComboPublicationToMenu({
       client,
       idCombo,
@@ -240,10 +477,11 @@ router.put('/:id_combo', checkPermission(MENU_COMBOS_EDIT_PERMISSIONS), async (r
     await client.query('COMMIT');
 
     const comboActualizado = await obtenerComboPorId(idCombo, { includeInactiveDetail: true });
+    const [comboHydrated] = await attachComboAlmacenes(pool, [comboActualizado]);
     return res.status(200).json({
       error: false,
       message: 'Combo actualizado correctamente.',
-      data: withResolvedComboImageUrl(req, comboActualizado)
+      data: withResolvedComboImageUrl(req, comboHydrated)
     });
   } catch (err) {
     await client.query('ROLLBACK');

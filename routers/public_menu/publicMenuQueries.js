@@ -260,6 +260,8 @@ const buildCatalogSql = ({
   hasDetalleComboColumn,
   hasDetallePrecioPublicoColumn,
   hasDetalleVisibleColumn,
+  hasRecipeAssignmentTable,
+  hasComboAssignmentTable,
   withDetailMenuFilter = false,
   withLimit = false
 }) => {
@@ -282,9 +284,52 @@ const buildCatalogSql = ({
     : 'NULL::numeric(10,2)';
   const detalleVisibleExpr = hasDetalleVisibleColumn ? 'COALESCE(dm.visible, true)' : 'true';
   const detalleVisibleFilter = hasDetalleVisibleColumn ? 'AND COALESCE(dm.visible, true) = true' : '';
+  const branchParam = withDetailMenuFilter ? '$3' : '$2';
   const branchProductFilter = withDetailMenuFilter
     ? 'AND (dm.id_producto IS NULL OR pa_branch.id_sucursal = $3)'
     : 'AND (dm.id_producto IS NULL OR pa_branch.id_sucursal = $2)';
+  const recipeAssignmentFilter = hasRecipeAssignmentTable
+    ? `
+      AND (
+        ${detalleRecetaExpr} IS NULL
+        OR ${branchParam}::int IS NULL
+        OR EXISTS (
+          SELECT 1
+          FROM public.menu_receta_almacenes mra
+          INNER JOIN public.almacenes ara
+            ON ara.id_almacen = mra.id_almacen
+           AND COALESCE(ara.estado, true) = true
+          INNER JOIN public.sucursales sra
+            ON sra.id_sucursal = ara.id_sucursal
+           AND COALESCE(sra.estado, true) = true
+          WHERE mra.id_receta = ${detalleRecetaExpr}
+            AND COALESCE(mra.estado, true) = true
+            AND ara.id_sucursal = ${branchParam}
+        )
+      )
+    `
+    : '';
+  const comboAssignmentFilter = hasComboAssignmentTable
+    ? `
+      AND (
+        ${detalleComboExpr} IS NULL
+        OR ${branchParam}::int IS NULL
+        OR EXISTS (
+          SELECT 1
+          FROM public.menu_combo_almacenes mca
+          INNER JOIN public.almacenes aca
+            ON aca.id_almacen = mca.id_almacen
+           AND COALESCE(aca.estado, true) = true
+          INNER JOIN public.sucursales sca
+            ON sca.id_sucursal = aca.id_sucursal
+           AND COALESCE(sca.estado, true) = true
+          WHERE mca.id_combo = ${detalleComboExpr}
+            AND COALESCE(mca.estado, true) = true
+            AND aca.id_sucursal = ${branchParam}
+        )
+      )
+    `
+    : '';
 
   return `
     SELECT
@@ -402,6 +447,8 @@ const buildCatalogSql = ({
     WHERE dm.id_menu = $1
       AND COALESCE(dm.estado, true) = true
       ${branchProductFilter}
+      ${recipeAssignmentFilter}
+      ${comboAssignmentFilter}
       ${detalleVisibleFilter}
       ${withDetailMenuFilter ? 'AND dm.id_detalle_menu = $2' : ''}
     ORDER BY COALESCE(dm.orden, 2147483647), dm.id_detalle_menu
@@ -416,13 +463,17 @@ export const fetchCatalogRowsByMenuQuery = async (idMenu, idSucursal, db = pool)
     hasDetalleRecetaColumn,
     hasDetalleComboColumn,
     hasDetallePrecioPublicoColumn,
-    hasDetalleVisibleColumn
+    hasDetalleVisibleColumn,
+    hasRecipeAssignmentTable,
+    hasComboAssignmentTable
   ] = await Promise.all([
     hasColumn('productos', 'id_archivo_imagen_principal'),
     hasColumn('detalle_menu', 'id_receta'),
     hasColumn('detalle_menu', 'id_combo'),
     hasColumn('detalle_menu', 'precio_publico'),
-    hasColumn('detalle_menu', 'visible')
+    hasColumn('detalle_menu', 'visible'),
+    hasTable('menu_receta_almacenes'),
+    hasTable('menu_combo_almacenes')
   ]);
 
   const query = buildCatalogSql({
@@ -430,7 +481,9 @@ export const fetchCatalogRowsByMenuQuery = async (idMenu, idSucursal, db = pool)
     hasDetalleRecetaColumn,
     hasDetalleComboColumn,
     hasDetallePrecioPublicoColumn,
-    hasDetalleVisibleColumn
+    hasDetalleVisibleColumn,
+    hasRecipeAssignmentTable,
+    hasComboAssignmentTable
   });
   const result = await db.query(query, [idMenu, idSucursal]);
   return result.rows;
@@ -506,13 +559,17 @@ export const fetchCatalogItemByIdQuery = async ({ idMenu, idDetalleMenu, idSucur
     hasDetalleRecetaColumn,
     hasDetalleComboColumn,
     hasDetallePrecioPublicoColumn,
-    hasDetalleVisibleColumn
+    hasDetalleVisibleColumn,
+    hasRecipeAssignmentTable,
+    hasComboAssignmentTable
   ] = await Promise.all([
     hasColumn('productos', 'id_archivo_imagen_principal'),
     hasColumn('detalle_menu', 'id_receta'),
     hasColumn('detalle_menu', 'id_combo'),
     hasColumn('detalle_menu', 'precio_publico'),
-    hasColumn('detalle_menu', 'visible')
+    hasColumn('detalle_menu', 'visible'),
+    hasTable('menu_receta_almacenes'),
+    hasTable('menu_combo_almacenes')
   ]);
 
   const query = buildCatalogSql({
@@ -521,6 +578,8 @@ export const fetchCatalogItemByIdQuery = async ({ idMenu, idDetalleMenu, idSucur
     hasDetalleComboColumn,
     hasDetallePrecioPublicoColumn,
     hasDetalleVisibleColumn,
+    hasRecipeAssignmentTable,
+    hasComboAssignmentTable,
     withDetailMenuFilter: true,
     withLimit: true
   });
@@ -533,18 +592,38 @@ export const fetchCatalogItemByIdQuery = async ({ idMenu, idDetalleMenu, idSucur
 export const fetchRecipeAvailabilityQuery = async (recipeIds = [], idSucursal = null, db = pool) => {
   if (!Array.isArray(recipeIds) || recipeIds.length === 0) return [];
   const branchId = Number.isInteger(Number(idSucursal)) && Number(idSucursal) > 0 ? Number(idSucursal) : null;
+  const hasRecipeAssignmentTable = await hasTable('menu_receta_almacenes');
+  const recipeAssignmentDisponibleExpr = hasRecipeAssignmentTable
+    ? `
+      EXISTS (
+        SELECT 1
+        FROM public.menu_receta_almacenes mra
+        INNER JOIN public.almacenes ara
+          ON ara.id_almacen = mra.id_almacen
+         AND COALESCE(ara.estado, true) = true
+        INNER JOIN public.sucursales sra
+          ON sra.id_sucursal = ara.id_sucursal
+         AND COALESCE(sra.estado, true) = true
+        WHERE mra.id_receta = r.id_receta
+          AND COALESCE(mra.estado, true) = true
+          AND ($2::int IS NULL OR ara.id_sucursal = $2)
+      )
+    `
+    : 'true';
 
   const query = `
     SELECT
       r.id_receta,
       CASE
         WHEN COALESCE(r.estado, true) = false THEN false
+        WHEN (${recipeAssignmentDisponibleExpr}) = false THEN false
         WHEN COALESCE(stats.total_componentes, 0) = 0 THEN false
         WHEN COALESCE(stats.componentes_disponibles, 0) = COALESCE(stats.total_componentes, 0) THEN true
         ELSE false
       END AS disponible,
       CASE
         WHEN COALESCE(r.estado, true) = false THEN 'RECETA_INACTIVA'
+        WHEN (${recipeAssignmentDisponibleExpr}) = false THEN 'RECETA_SIN_ASIGNACION_SUCURSAL'
         WHEN COALESCE(stats.total_componentes, 0) = 0 THEN 'RECETA_SIN_DETALLE'
         WHEN COALESCE(stats.componentes_disponibles, 0) < COALESCE(stats.total_componentes, 0) THEN 'INSUMOS_INSUFICIENTES'
         ELSE NULL
@@ -594,18 +673,38 @@ export const fetchRecipeAvailabilityQuery = async (recipeIds = [], idSucursal = 
 export const fetchComboAvailabilityQuery = async (comboIds = [], idSucursal = null, db = pool) => {
   if (!Array.isArray(comboIds) || comboIds.length === 0) return [];
   const branchId = Number.isInteger(Number(idSucursal)) && Number(idSucursal) > 0 ? Number(idSucursal) : null;
+  const hasComboAssignmentTable = await hasTable('menu_combo_almacenes');
+  const comboAssignmentDisponibleExpr = hasComboAssignmentTable
+    ? `
+      EXISTS (
+        SELECT 1
+        FROM public.menu_combo_almacenes mca
+        INNER JOIN public.almacenes aca
+          ON aca.id_almacen = mca.id_almacen
+         AND COALESCE(aca.estado, true) = true
+        INNER JOIN public.sucursales sca
+          ON sca.id_sucursal = aca.id_sucursal
+         AND COALESCE(sca.estado, true) = true
+        WHERE mca.id_combo = c.id_combo
+          AND COALESCE(mca.estado, true) = true
+          AND ($2::int IS NULL OR aca.id_sucursal = $2)
+      )
+    `
+    : 'true';
 
   const query = `
     SELECT
       c.id_combo,
       CASE
         WHEN COALESCE(c.estado, true) = false THEN false
+        WHEN (${comboAssignmentDisponibleExpr}) = false THEN false
         WHEN COALESCE(stats.total_componentes, 0) = 0 THEN false
         WHEN COALESCE(stats.componentes_disponibles, 0) = COALESCE(stats.total_componentes, 0) THEN true
         ELSE false
       END AS disponible,
       CASE
         WHEN COALESCE(c.estado, true) = false THEN 'COMBO_INACTIVO'
+        WHEN (${comboAssignmentDisponibleExpr}) = false THEN 'COMBO_SIN_ASIGNACION_SUCURSAL'
         WHEN COALESCE(stats.total_componentes, 0) = 0 THEN 'COMBO_SIN_COMPONENTES'
         WHEN COALESCE(stats.componentes_disponibles, 0) < COALESCE(stats.total_componentes, 0) THEN 'COMPONENTES_NO_DISPONIBLES'
         ELSE NULL

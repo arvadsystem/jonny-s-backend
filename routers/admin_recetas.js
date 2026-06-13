@@ -82,6 +82,8 @@ const MENU_RECETAS_EDIT_PERMISSIONS = ['MENU_RECETAS_EDITAR', 'MENU_VER'];
 const MENU_RECETAS_STATE_PERMISSIONS = ['MENU_RECETAS_ESTADO_CAMBIAR', 'MENU_VER'];
 const RECETAS_IMAGE_CONTRACT_MESSAGE =
   'Las imagenes de recetas deben subirse primero mediante POST /archivos y luego enviar id_archivo.';
+const SQLSTATE_UNDEFINED_TABLE = '42P01';
+const schemaCache = new Map();
 const LEGACY_RECIPE_IMAGE_FIELDS = [
   'imagen_data_url',
   'imagen_base64',
@@ -116,6 +118,210 @@ const rejectLegacyEmbeddedImagePayload = (payload) => {
       message: RECETAS_IMAGE_CONTRACT_MESSAGE
     }
   };
+};
+
+const normalizePositiveIdList = (value) => {
+  const rawList = Array.isArray(value) ? value : [];
+  return [...new Set(rawList
+    .map((item) => Number.parseInt(String(item ?? '').trim(), 10))
+    .filter((item) => Number.isSafeInteger(item) && item > 0))];
+};
+
+const hasTable = async (client, tableName) => {
+  const key = `table:${String(tableName || '').trim().toLowerCase()}`;
+  if (schemaCache.has(key)) return schemaCache.get(key);
+
+  const result = await client.query(
+    `
+      SELECT 1
+      FROM information_schema.tables
+      WHERE table_schema = 'public'
+        AND table_name = $1
+      LIMIT 1
+    `,
+    [tableName]
+  );
+  const exists = result.rowCount > 0;
+  schemaCache.set(key, exists);
+  return exists;
+};
+
+const validateRecetaAlmacenes = async (client, idAlmacenes = []) => {
+  const normalized = normalizePositiveIdList(idAlmacenes);
+  if (normalized.length === 0) {
+    return { ok: false, status: 400, message: 'Selecciona al menos un almacén para la receta.' };
+  }
+
+  const tableExists = await hasTable(client, 'menu_receta_almacenes');
+  if (!tableExists) {
+    return { ok: false, status: 500, message: 'La tabla de asignaciones de recetas no está disponible en la base de datos.' };
+  }
+
+  const result = await client.query(
+    `
+      SELECT
+        a.id_almacen,
+        COALESCE(a.estado, true) AS estado,
+        COALESCE(NULLIF(TRIM(COALESCE(a.nombre, '')), ''), CONCAT('Almacén #', a.id_almacen::text)) AS nombre_almacen,
+        s.id_sucursal,
+        s.nombre_sucursal,
+        COALESCE(s.estado, true) AS sucursal_estado
+      FROM public.almacenes a
+      INNER JOIN public.sucursales s
+        ON s.id_sucursal = a.id_sucursal
+      WHERE a.id_almacen = ANY($1::int[])
+    `,
+    [normalized]
+  );
+
+  const rows = result.rows || [];
+  const found = new Set(rows.map((row) => Number(row.id_almacen)));
+  const missing = normalized.filter((id) => !found.has(id));
+  if (missing.length) {
+    return { ok: false, status: 400, message: `Almacenes inválidos: ${missing.join(', ')}` };
+  }
+
+  const branchMap = new Map();
+  for (const row of rows) {
+    if (row.estado !== true || row.sucursal_estado !== true) {
+      return { ok: false, status: 409, message: 'Todos los almacenes seleccionados deben estar activos.' };
+    }
+    const idSucursal = Number(row.id_sucursal);
+    if (branchMap.has(idSucursal)) {
+      return {
+        ok: false,
+        status: 409,
+        code: 'RECETA_MULTIPLE_WAREHOUSES_SAME_BRANCH',
+        message: 'Selecciona como máximo un almacén por sucursal.'
+      };
+    }
+    branchMap.set(idSucursal, Number(row.id_almacen));
+  }
+
+  return { ok: true, rows };
+};
+
+const replaceRecetaAlmacenes = async (client, idReceta, idAlmacenes = []) => {
+  const normalized = normalizePositiveIdList(idAlmacenes);
+  await client.query(
+    `
+      UPDATE public.menu_receta_almacenes
+      SET estado = false,
+          fecha_actualizacion = NOW()
+      WHERE id_receta = $1
+        AND NOT (id_almacen = ANY($2::int[]))
+    `,
+    [idReceta, normalized]
+  );
+
+  if (normalized.length === 0) return;
+
+  await client.query(
+    `
+      INSERT INTO public.menu_receta_almacenes (id_receta, id_almacen, estado, fecha_actualizacion)
+      SELECT $1, UNNEST($2::int[]), true, NOW()
+      ON CONFLICT (id_receta, id_almacen)
+      DO UPDATE SET
+        estado = true,
+        fecha_actualizacion = NOW()
+    `,
+    [idReceta, normalized]
+  );
+};
+
+const listRecetaAssignments = async (client, idReceta) => {
+  try {
+    const result = await client.query(
+      `
+        SELECT
+          mra.id_receta,
+          mra.id_almacen,
+          COALESCE(mra.estado, true) AS estado,
+          COALESCE(NULLIF(TRIM(COALESCE(a.nombre, '')), ''), CONCAT('Almacén #', a.id_almacen::text)) AS nombre_almacen,
+          a.id_sucursal,
+          s.nombre_sucursal
+        FROM public.menu_receta_almacenes mra
+        INNER JOIN public.almacenes a
+          ON a.id_almacen = mra.id_almacen
+        INNER JOIN public.sucursales s
+          ON s.id_sucursal = a.id_sucursal
+        WHERE mra.id_receta = $1
+        ORDER BY s.nombre_sucursal ASC, COALESCE(NULLIF(TRIM(COALESCE(a.nombre, '')), ''), CONCAT('Almacén #', a.id_almacen::text)) ASC, a.id_almacen ASC
+      `,
+      [idReceta]
+    );
+    return result.rows || [];
+  } catch (error) {
+    if (error?.code === SQLSTATE_UNDEFINED_TABLE) return [];
+    throw error;
+  }
+};
+
+const attachRecetaAlmacenes = async (client, rows = []) => {
+  const list = Array.isArray(rows) ? rows : [];
+  if (list.length === 0) return list;
+  const ids = normalizePositiveIdList(list.map((row) => row?.id_receta));
+  if (ids.length === 0) {
+    return list.map((row) => ({ ...row, id_almacenes: [], total_almacenes: 0, total_sucursales: 0, nombres_sucursales: [] }));
+  }
+
+  try {
+    const assignments = await client.query(
+      `
+        SELECT
+          mra.id_receta,
+          ARRAY_AGG(mra.id_almacen ORDER BY mra.id_almacen) FILTER (WHERE COALESCE(mra.estado, true) = true) AS id_almacenes,
+          COUNT(*) FILTER (WHERE COALESCE(mra.estado, true) = true)::int AS total_almacenes,
+          COUNT(DISTINCT a.id_sucursal) FILTER (WHERE COALESCE(mra.estado, true) = true)::int AS total_sucursales,
+          ARRAY_REMOVE(ARRAY_AGG(DISTINCT s.nombre_sucursal) FILTER (WHERE COALESCE(mra.estado, true) = true), NULL) AS nombres_sucursales
+        FROM public.menu_receta_almacenes mra
+        INNER JOIN public.almacenes a
+          ON a.id_almacen = mra.id_almacen
+        INNER JOIN public.sucursales s
+          ON s.id_sucursal = a.id_sucursal
+        WHERE mra.id_receta = ANY($1::int[])
+        GROUP BY mra.id_receta
+      `,
+      [ids]
+    );
+
+    const map = new Map((assignments.rows || []).map((row) => [
+      Number(row.id_receta),
+      {
+        id_almacenes: normalizePositiveIdList(row.id_almacenes),
+        total_almacenes: Number(row.total_almacenes || 0),
+        total_sucursales: Number(row.total_sucursales || 0),
+        nombres_sucursales: Array.isArray(row.nombres_sucursales) ? row.nombres_sucursales : []
+      }
+    ]));
+
+    return list.map((row) => {
+      const assignment = map.get(Number(row.id_receta));
+      return {
+        ...row,
+        id_almacenes: assignment?.id_almacenes || [],
+        total_almacenes: assignment?.total_almacenes || 0,
+        total_sucursales: assignment?.total_sucursales || 0,
+        nombres_sucursales: assignment?.nombres_sucursales || []
+      };
+    });
+  } catch (error) {
+    if (error?.code === SQLSTATE_UNDEFINED_TABLE) {
+      return list.map((row) => ({ ...row, id_almacenes: [], total_almacenes: 0, total_sucursales: 0, nombres_sucursales: [] }));
+    }
+    throw error;
+  }
+};
+
+const assertRecetaExists = async (client, idReceta) => {
+  const result = await client.query(
+    'SELECT id_receta, COALESCE(estado, true) AS estado FROM public.recetas WHERE id_receta = $1 LIMIT 1',
+    [idReceta]
+  );
+  if (!result.rowCount) {
+    return { ok: false, status: 404, message: 'Receta no encontrada.' };
+  }
+  return { ok: true, row: result.rows[0] };
 };
 
 const shouldUseCatalogoMaestroInsumos = () => isCatalogoMaestroReadsEnabled();
@@ -414,7 +620,8 @@ router.get('/', checkPermission(MENU_RECETAS_VIEW_PERMISSIONS), async (req, res)
         ORDER BY r.id_receta DESC
       `
     );
-    const baseDatos = (result.rows || []).map((row) => ({
+    const hydratedRows = await attachRecetaAlmacenes(pool, result.rows || []);
+    const baseDatos = hydratedRows.map((row) => ({
       ...row,
       url_imagen_publica: buildAbsolutePublicUrl(req, row?.url_imagen_publica || null)
     }));
@@ -468,6 +675,31 @@ router.get('/catalogos/insumos', checkPermission(MENU_RECETAS_VIEW_PERMISSIONS),
     if (handled) return handled;
     console.error('Error al obtener catalogo de insumos para recetas:', err.message);
     return res.status(500).json({ error: true, message: getSafeServerErrorMessage(err) });
+  }
+});
+
+router.get('/catalogos/almacenes', checkPermission(MENU_RECETAS_VIEW_PERMISSIONS), async (req, res) => {
+  try {
+    const result = await pool.query(
+      `
+        SELECT
+          a.id_almacen,
+          COALESCE(NULLIF(TRIM(COALESCE(a.nombre, '')), ''), CONCAT('Almacén #', a.id_almacen::text)) AS nombre_almacen,
+          a.id_sucursal,
+          s.nombre_sucursal,
+          COALESCE(a.estado, true) AS estado
+        FROM public.almacenes a
+        INNER JOIN public.sucursales s
+          ON s.id_sucursal = a.id_sucursal
+        WHERE COALESCE(a.estado, true) = true
+          AND COALESCE(s.estado, true) = true
+        ORDER BY s.nombre_sucursal ASC, COALESCE(NULLIF(TRIM(COALESCE(a.nombre, '')), ''), CONCAT('Almacén #', a.id_almacen::text)) ASC, a.id_almacen ASC
+      `
+    );
+    return res.status(200).json(result.rows || []);
+  } catch (err) {
+    console.error('Error al listar almacenes para recetas:', err.message);
+    return res.status(500).json({ error: true, message: 'No se pudieron cargar los almacenes.' });
   }
 });
 
@@ -530,10 +762,12 @@ router.get('/:id_receta/contexto-edicion', checkPermission(MENU_RECETAS_VIEW_PER
       return res.status(400).json({ error: true, message: 'id_receta invalido.' });
     }
 
-    const receta = await obtenerRecetaPorId(idReceta);
-    if (!receta) {
+    const recetaBase = await obtenerRecetaPorId(idReceta);
+    if (!recetaBase) {
       return res.status(404).json({ error: true, message: 'Receta no encontrada.' });
     }
+    const [receta] = await attachRecetaAlmacenes(pool, [recetaBase]);
+    const asignaciones = await listRecetaAssignments(pool, idReceta);
 
     if (shouldUseCatalogoMaestroInsumos()) {
       const [detalle, insumosCatalogo] = await Promise.all([
@@ -547,6 +781,7 @@ router.get('/:id_receta/contexto-edicion', checkPermission(MENU_RECETAS_VIEW_PER
           url_imagen_publica: buildAbsolutePublicUrl(req, receta?.url_imagen_publica || null)
         },
         detalle_receta: detalle,
+        asignaciones,
         catalogos: {
           insumos: insumosCatalogo
         }
@@ -611,6 +846,7 @@ router.get('/:id_receta/contexto-edicion', checkPermission(MENU_RECETAS_VIEW_PER
         url_imagen_publica: buildAbsolutePublicUrl(req, receta?.url_imagen_publica || null)
       },
       detalle_receta: detalleResult.rows || [],
+      asignaciones,
       catalogos: {
         insumos: insumosCatalogResult.rows || []
       }
@@ -620,6 +856,179 @@ router.get('/:id_receta/contexto-edicion', checkPermission(MENU_RECETAS_VIEW_PER
     if (handled) return handled;
     console.error('Error al obtener contexto de edicion de receta admin:', err.message);
     return res.status(500).json({ error: true, message: getSafeServerErrorMessage(err) });
+  }
+});
+
+router.get('/:id_receta/asignaciones', checkPermission(MENU_RECETAS_VIEW_PERMISSIONS), async (req, res) => {
+  try {
+    const idReceta = Number(req.params.id_receta);
+    if (!esEnteroPositivo(idReceta)) {
+      return res.status(400).json({ error: true, message: 'id_receta inválido.' });
+    }
+    const exists = await assertRecetaExists(pool, idReceta);
+    if (!exists.ok) return res.status(exists.status).json({ error: true, message: exists.message });
+    const asignaciones = await listRecetaAssignments(pool, idReceta);
+    return res.status(200).json({ id_receta: idReceta, asignaciones });
+  } catch (err) {
+    console.error('Error al obtener asignaciones de receta:', err.message);
+    return res.status(500).json({ error: true, message: 'No se pudieron cargar las asignaciones de la receta.' });
+  }
+});
+
+router.put('/:id_receta/asignaciones', checkPermission(MENU_RECETAS_EDIT_PERMISSIONS), async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const idReceta = Number(req.params.id_receta);
+    if (!esEnteroPositivo(idReceta)) {
+      return res.status(400).json({ error: true, message: 'id_receta inválido.' });
+    }
+
+    const exists = await assertRecetaExists(client, idReceta);
+    if (!exists.ok) return res.status(exists.status).json({ error: true, message: exists.message });
+
+    const idAlmacenes = normalizePositiveIdList(req.body?.id_almacenes);
+    const validation = await validateRecetaAlmacenes(client, idAlmacenes);
+    if (!validation.ok) {
+      return res.status(validation.status).json({ error: true, code: validation.code, message: validation.message });
+    }
+
+    await client.query('BEGIN');
+    await replaceRecetaAlmacenes(client, idReceta, idAlmacenes);
+    const [receta] = await attachRecetaAlmacenes(client, [await obtenerRecetaPorId(idReceta)]);
+    await client.query('COMMIT');
+
+    return res.status(200).json({
+      error: false,
+      message: 'Sucursales de la receta actualizadas correctamente.',
+      id_receta: idReceta,
+      id_almacenes: idAlmacenes,
+      receta
+    });
+  } catch (err) {
+    try { await client.query('ROLLBACK'); } catch {}
+    console.error('Error al reemplazar asignaciones de receta:', err.message);
+    return res.status(500).json({ error: true, message: 'No se pudieron actualizar las sucursales de la receta.' });
+  } finally {
+    client.release();
+  }
+});
+
+router.post('/:id_receta/asignaciones', checkPermission(MENU_RECETAS_EDIT_PERMISSIONS), async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const idReceta = Number(req.params.id_receta);
+    const idAlmacen = Number(req.body?.id_almacen);
+    if (!esEnteroPositivo(idReceta) || !esEnteroPositivo(idAlmacen)) {
+      return res.status(400).json({ error: true, message: 'id_receta o id_almacen inválido.' });
+    }
+
+    const exists = await assertRecetaExists(client, idReceta);
+    if (!exists.ok) return res.status(exists.status).json({ error: true, message: exists.message });
+
+    const validation = await validateRecetaAlmacenes(client, [idAlmacen]);
+    if (!validation.ok) {
+      return res.status(validation.status).json({ error: true, code: validation.code, message: validation.message });
+    }
+
+    const currentAssignments = (await listRecetaAssignments(client, idReceta)).filter((row) => row.estado === true);
+    const newBranchId = Number(validation.rows[0]?.id_sucursal || 0);
+    const sameBranchActive = currentAssignments.find((row) => Number(row.id_sucursal) === newBranchId && Number(row.id_almacen) !== idAlmacen);
+    if (sameBranchActive) {
+      return res.status(409).json({
+        error: true,
+        code: 'RECETA_BRANCH_ASSIGNMENT_CONFLICT',
+        message: 'Ya existe otro almacén activo para esa sucursal en esta receta.'
+      });
+    }
+    const sameAssignment = currentAssignments.find((row) => Number(row.id_almacen) === idAlmacen);
+    if (sameAssignment) {
+      return res.status(409).json({
+        error: true,
+        code: 'RECETA_ASSIGNMENT_ALREADY_ACTIVE',
+        message: 'La receta ya está asignada a ese almacén.'
+      });
+    }
+
+    await client.query('BEGIN');
+    await client.query(
+      `
+        INSERT INTO public.menu_receta_almacenes (id_receta, id_almacen, estado, fecha_actualizacion)
+        VALUES ($1, $2, true, NOW())
+        ON CONFLICT (id_receta, id_almacen)
+        DO UPDATE SET estado = true, fecha_actualizacion = NOW()
+      `,
+      [idReceta, idAlmacen]
+    );
+    await client.query('COMMIT');
+
+    return res.status(201).json({
+      error: false,
+      message: 'Asignación de la receta creada correctamente.',
+      id_receta: idReceta,
+      id_almacen: idAlmacen
+    });
+  } catch (err) {
+    try { await client.query('ROLLBACK'); } catch {}
+    console.error('Error al crear asignación de receta:', err.message);
+    return res.status(500).json({ error: true, message: 'No se pudo crear la asignación de la receta.' });
+  } finally {
+    client.release();
+  }
+});
+
+router.patch('/:id_receta/asignaciones/:id_almacen/inactivar', checkPermission(MENU_RECETAS_EDIT_PERMISSIONS), async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const idReceta = Number(req.params.id_receta);
+    const idAlmacen = Number(req.params.id_almacen);
+    if (!esEnteroPositivo(idReceta) || !esEnteroPositivo(idAlmacen)) {
+      return res.status(400).json({ error: true, message: 'id_receta o id_almacen inválido.' });
+    }
+
+    const exists = await assertRecetaExists(client, idReceta);
+    if (!exists.ok) return res.status(exists.status).json({ error: true, message: exists.message });
+
+    const assignmentResult = await client.query(
+      `
+        SELECT id_receta, id_almacen, COALESCE(estado, true) AS estado
+        FROM public.menu_receta_almacenes
+        WHERE id_receta = $1
+          AND id_almacen = $2
+        LIMIT 1
+      `,
+      [idReceta, idAlmacen]
+    );
+    if (!assignmentResult.rowCount) {
+      return res.status(404).json({ error: true, message: 'La asignación de la receta no existe para ese almacén.' });
+    }
+
+    await client.query('BEGIN');
+    await client.query(
+      `
+        UPDATE public.menu_receta_almacenes
+        SET estado = false,
+            fecha_actualizacion = NOW()
+        WHERE id_receta = $1
+          AND id_almacen = $2
+      `,
+      [idReceta, idAlmacen]
+    );
+    await client.query('COMMIT');
+
+    return res.status(200).json({
+      error: false,
+      message: assignmentResult.rows[0].estado === true
+        ? 'Asignación de la receta inactivada correctamente.'
+        : 'La asignación de la receta ya estaba inactiva.',
+      id_receta: idReceta,
+      id_almacen: idAlmacen
+    });
+  } catch (err) {
+    try { await client.query('ROLLBACK'); } catch {}
+    console.error('Error al inactivar asignación de receta:', err.message);
+    return res.status(500).json({ error: true, message: 'No se pudo inactivar la asignación de la receta.' });
+  } finally {
+    client.release();
   }
 });
 
@@ -686,10 +1095,13 @@ router.get('/:id_receta', checkPermission(MENU_RECETAS_VIEW_PERMISSIONS), async 
     if (!receta) {
       return res.status(404).json({ error: true, message: 'Receta no encontrada.' });
     }
+    const [hydrated] = await attachRecetaAlmacenes(pool, [receta]);
+    const asignaciones = await listRecetaAssignments(pool, idReceta);
 
     return res.status(200).json({
-      ...receta,
-      url_imagen_publica: buildAbsolutePublicUrl(req, receta?.url_imagen_publica || null)
+      ...hydrated,
+      url_imagen_publica: buildAbsolutePublicUrl(req, hydrated?.url_imagen_publica || null),
+      asignaciones
     });
   } catch (err) {
     console.error('Error al obtener receta por id admin:', err.message);
@@ -745,6 +1157,8 @@ router.post('/', checkPermission(MENU_RECETAS_CREATE_PERMISSIONS), async (req, r
     delete payloadConActor.tipo_archivo;
     delete payloadConActor.nombre_original;
     delete payloadConActor.nombreOriginal;
+    const idAlmacenes = normalizePositiveIdList(payloadConActor.id_almacenes);
+    delete payloadConActor.id_almacenes;
 
     const payloadValidation = validarEstructuraPayloadReceta(payloadConActor);
     if (!payloadValidation.ok) {
@@ -770,6 +1184,14 @@ router.post('/', checkPermission(MENU_RECETAS_CREATE_PERMISSIONS), async (req, r
     const reglasValidation = await validarReglasNegocioYFks(datosNormalizados, client);
     if (!reglasValidation.ok) {
       return res.status(reglasValidation.status).json({ error: true, message: reglasValidation.message });
+    }
+    const almacenesValidation = await validateRecetaAlmacenes(client, idAlmacenes);
+    if (!almacenesValidation.ok) {
+      return res.status(almacenesValidation.status).json({
+        error: true,
+        code: almacenesValidation.code,
+        message: almacenesValidation.message
+      });
     }
 
     perf.writeStarted();
@@ -829,6 +1251,7 @@ router.post('/', checkPermission(MENU_RECETAS_CREATE_PERMISSIONS), async (req, r
     }
 
     await reemplazarDetalleReceta(client, idRecetaCreada, detalleNormalizado, { desactivarAnterior: false });
+    await replaceRecetaAlmacenes(client, idRecetaCreada, idAlmacenes);
     await autoPublishNewRecipe({
       client,
       idMenu: datosNormalizados.id_menu,
@@ -969,6 +1392,8 @@ router.put('/:id_receta', checkPermission(MENU_RECETAS_EDIT_PERMISSIONS), async 
     delete payloadConActor.tipo_archivo;
     delete payloadConActor.nombre_original;
     delete payloadConActor.nombreOriginal;
+    const idAlmacenes = normalizePositiveIdList(payloadConActor.id_almacenes);
+    delete payloadConActor.id_almacenes;
 
     const payloadValidation = validarEstructuraPayloadReceta(payloadConActor);
     if (!payloadValidation.ok) {
@@ -994,6 +1419,14 @@ router.put('/:id_receta', checkPermission(MENU_RECETAS_EDIT_PERMISSIONS), async 
     const reglasValidation = await validarReglasNegocioYFks(datosNormalizados, client);
     if (!reglasValidation.ok) {
       return res.status(reglasValidation.status).json({ error: true, message: reglasValidation.message });
+    }
+    const almacenesValidation = await validateRecetaAlmacenes(client, idAlmacenes);
+    if (!almacenesValidation.ok) {
+      return res.status(almacenesValidation.status).json({
+        error: true,
+        code: almacenesValidation.code,
+        message: almacenesValidation.message
+      });
     }
 
     perf.writeStarted();
@@ -1039,6 +1472,7 @@ router.put('/:id_receta', checkPermission(MENU_RECETAS_EDIT_PERMISSIONS), async 
     );
 
     await reemplazarDetalleReceta(client, idReceta, detalleNormalizado);
+    await replaceRecetaAlmacenes(client, idReceta, idAlmacenes);
     await moveRecipePublicationToMenu({
       client,
       idReceta,

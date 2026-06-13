@@ -374,6 +374,7 @@ export const listCombosCatalogoHandler = async (req, res) => {
     const scope = await resolveRequestUserSucursalScope(req);
     const isSuperAdmin = Boolean(scope.isSuperAdmin);
     const idSucursal = parseOptionalPositiveInt(req.query.id_sucursal);
+    const hasComboAssignmentsTable = await hasTable(pool, 'menu_combo_almacenes');
 
     const sucursalValidation = await validateVentasCatalogSucursal({ scope, idSucursal });
     if (!sucursalValidation.ok) {
@@ -388,10 +389,38 @@ export const listCombosCatalogoHandler = async (req, res) => {
       params.push(idSucursal);
       joinClause = 'INNER JOIN menu_vigente mv ON mv.id_menu = c.id_menu';
       whereClause = 'AND mv.id_sucursal = $1 AND COALESCE(mv.estado, true) = true AND (mv.fecha_inicio IS NULL OR mv.fecha_inicio <= CURRENT_TIMESTAMP)';
+      if (hasComboAssignmentsTable) {
+        joinClause += `
+          INNER JOIN public.menu_combo_almacenes mca
+            ON mca.id_combo = c.id_combo
+           AND COALESCE(mca.estado, true) = true
+          INNER JOIN public.almacenes aca
+            ON aca.id_almacen = mca.id_almacen
+           AND COALESCE(aca.estado, true) = true
+           AND aca.id_sucursal = $1
+          INNER JOIN public.sucursales sca
+            ON sca.id_sucursal = aca.id_sucursal
+           AND COALESCE(sca.estado, true) = true
+        `;
+      }
     } else if (!isSuperAdmin) {
       params.push(scope.allowedSucursalIds);
       joinClause = 'INNER JOIN menu_vigente mv ON mv.id_menu = c.id_menu';
       whereClause = 'AND mv.id_sucursal = ANY($1::int[]) AND COALESCE(mv.estado, true) = true AND (mv.fecha_inicio IS NULL OR mv.fecha_inicio <= CURRENT_TIMESTAMP)';
+      if (hasComboAssignmentsTable) {
+        joinClause += `
+          INNER JOIN public.menu_combo_almacenes mca
+            ON mca.id_combo = c.id_combo
+           AND COALESCE(mca.estado, true) = true
+          INNER JOIN public.almacenes aca
+            ON aca.id_almacen = mca.id_almacen
+           AND COALESCE(aca.estado, true) = true
+           AND aca.id_sucursal = ANY($1::int[])
+          INNER JOIN public.sucursales sca
+            ON sca.id_sucursal = aca.id_sucursal
+           AND COALESCE(sca.estado, true) = true
+        `;
+      }
     }
 
     const query = `
@@ -508,6 +537,7 @@ export const listRecetasCatalogoHandler = async (req, res) => {
     const scope = await resolveRequestUserSucursalScope(req);
     const isSuperAdmin = Boolean(scope.isSuperAdmin);
     const idSucursal = parseOptionalPositiveInt(req.query.id_sucursal);
+    const hasRecipeAssignmentsTable = await hasTable(pool, 'menu_receta_almacenes');
 
     const sucursalValidation = await validateVentasCatalogSucursal({ scope, idSucursal });
     if (!sucursalValidation.ok) {
@@ -522,10 +552,38 @@ export const listRecetasCatalogoHandler = async (req, res) => {
       params.push(idSucursal);
       joinClause = 'INNER JOIN menu_vigente mv ON mv.id_menu = r.id_menu';
       whereClause = 'AND mv.id_sucursal = $1 AND COALESCE(mv.estado, true) = true AND (mv.fecha_inicio IS NULL OR mv.fecha_inicio <= CURRENT_TIMESTAMP)';
+      if (hasRecipeAssignmentsTable) {
+        joinClause += `
+          INNER JOIN public.menu_receta_almacenes mra
+            ON mra.id_receta = r.id_receta
+           AND COALESCE(mra.estado, true) = true
+          INNER JOIN public.almacenes ara
+            ON ara.id_almacen = mra.id_almacen
+           AND COALESCE(ara.estado, true) = true
+           AND ara.id_sucursal = $1
+          INNER JOIN public.sucursales sra
+            ON sra.id_sucursal = ara.id_sucursal
+           AND COALESCE(sra.estado, true) = true
+        `;
+      }
     } else if (!isSuperAdmin) {
       params.push(scope.allowedSucursalIds);
       joinClause = 'INNER JOIN menu_vigente mv ON mv.id_menu = r.id_menu';
       whereClause = 'AND mv.id_sucursal = ANY($1::int[]) AND COALESCE(mv.estado, true) = true AND (mv.fecha_inicio IS NULL OR mv.fecha_inicio <= CURRENT_TIMESTAMP)';
+      if (hasRecipeAssignmentsTable) {
+        joinClause += `
+          INNER JOIN public.menu_receta_almacenes mra
+            ON mra.id_receta = r.id_receta
+           AND COALESCE(mra.estado, true) = true
+          INNER JOIN public.almacenes ara
+            ON ara.id_almacen = mra.id_almacen
+           AND COALESCE(ara.estado, true) = true
+           AND ara.id_sucursal = ANY($1::int[])
+          INNER JOIN public.sucursales sra
+            ON sra.id_sucursal = ara.id_sucursal
+           AND COALESCE(sra.estado, true) = true
+        `;
+      }
     }
 
     const query = `
