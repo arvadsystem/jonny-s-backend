@@ -1112,26 +1112,58 @@ const syncInsumoAlmacenes = async (idInsumo, idAlmacenes, db = pool) => {
   if (uniqueIds.length === 0) return;
 
   const primaryAlmacen = uniqueIds[0];
-  const singleAlmacenIds = [primaryAlmacen];
   await db.query('UPDATE public.insumos SET id_almacen = $1 WHERE id_insumo = $2', [primaryAlmacen, idInsumo]);
 
   try {
+    const master = await getInsumoById(idInsumo, db);
+    if (!master) {
+      throw new Error('Insumo no encontrado para sincronizar almacenes.');
+    }
+
     await db.query(
       `
-        INSERT INTO public.insumos_almacenes (id_insumo, id_almacen)
-        SELECT $1, UNNEST($2::int[])
-        ON CONFLICT (id_insumo, id_almacen) DO NOTHING
+        INSERT INTO public.insumos_almacenes (
+          id_insumo,
+          id_almacen,
+          cantidad,
+          stock_minimo,
+          precio_compra,
+          fecha_caducidad,
+          estado,
+          fecha_actualizacion
+        )
+        SELECT
+          $1,
+          UNNEST($2::int[]),
+          0,
+          COALESCE($3::numeric, 0),
+          COALESCE($4::numeric, 0),
+          $5::date,
+          true,
+          now()
+        ON CONFLICT (id_insumo, id_almacen)
+        DO UPDATE SET
+          estado = true,
+          fecha_actualizacion = now()
       `,
-      [idInsumo, singleAlmacenIds]
+      [
+        idInsumo,
+        uniqueIds,
+        master.stock_minimo ?? 0,
+        master.precio ?? 0,
+        toDateOnlyString(master.fecha_caducidad) || null
+      ]
     );
 
     await db.query(
       `
-        DELETE FROM public.insumos_almacenes
+        UPDATE public.insumos_almacenes
+        SET estado = false,
+            fecha_actualizacion = now()
         WHERE id_insumo = $1
-          AND id_almacen <> ALL($2::int[])
+          AND NOT (id_almacen = ANY($2::int[]))
       `,
-      [idInsumo, singleAlmacenIds]
+      [idInsumo, uniqueIds]
     );
   } catch (error) {
     if (isMissingInsumosAlmacenesTableError(error)) {
@@ -1163,6 +1195,7 @@ const attachInsumoAlmacenes = async (rows, db = pool) => {
         SELECT ia.id_insumo, ARRAY_AGG(ia.id_almacen ORDER BY ia.id_almacen) AS id_almacenes
         FROM public.insumos_almacenes ia
         WHERE ia.id_insumo = ANY($1::int[])
+          AND COALESCE(ia.estado, true) IS TRUE
         GROUP BY ia.id_insumo
       `,
       [ids]
@@ -1300,6 +1333,163 @@ router.get('/insumos/:id_insumo/almacenes-disponibles', checkPermission(INSUMOS_
   } catch (err) {
     console.error('Error en GET /insumos/:id_insumo/almacenes-disponibles:', err.message);
     return res.status(500).json({ error: true, message: safeServerErrorMessage() });
+  }
+});
+
+router.put('/insumos/:id_insumo/asignaciones', checkPermission(INSUMOS_EDIT_PERMISSIONS), async (req, res) => {
+  const client = await pool.connect();
+  let txStarted = false;
+  try {
+    const resolved = await resolveInsumoMaestroForAssignments(req.params?.id_insumo, client);
+    if (!resolved.ok) {
+      return res.status(resolved.status).json({ error: true, message: resolved.message });
+    }
+
+    if (!resolved.master.estado_global) {
+      return res.status(400).json({ error: true, message: 'El insumo maestro esta inactivo.' });
+    }
+
+    const almacenesParse = parseIdAlmacenes(null, req.body?.id_almacenes);
+    if (!almacenesParse.ok || !Array.isArray(almacenesParse.ids) || almacenesParse.ids.length === 0) {
+      return res.status(400).json({
+        error: true,
+        message: almacenesParse.message || 'Debe seleccionar al menos un id_almacen.'
+      });
+    }
+    const idAlmacenes = almacenesParse.ids;
+
+    const scopeValidation = await assertInsumoWarehouseInScope(req, idAlmacenes, client);
+    if (!scopeValidation.ok) {
+      return res.status(scopeValidation.status).json({
+        error: true,
+        message: scopeValidation.message
+      });
+    }
+
+    const selectedBranches = new Map();
+    for (const almacenRow of scopeValidation.rows || []) {
+      const idSucursal = Number.parseInt(String(almacenRow?.id_sucursal ?? ''), 10);
+      const idAlmacen = Number.parseInt(String(almacenRow?.id_almacen ?? ''), 10);
+      if (!isPositiveIntegerId(idSucursal)) continue;
+      if (selectedBranches.has(idSucursal)) {
+        return res.status(409).json({
+          error: true,
+          code: 'INSUMO_MULTIPLE_WAREHOUSES_SAME_BRANCH',
+          message: 'Selecciona como maximo un almacen por sucursal.'
+        });
+      }
+      selectedBranches.set(idSucursal, idAlmacen);
+    }
+
+    for (const idAlmacen of idAlmacenes) {
+      const almacenValidation = await validateAlmacenActivo(idAlmacen, client);
+      if (!almacenValidation.ok) {
+        const status = String(almacenValidation.message || '').includes('no existe') ? 404 : 400;
+        return res.status(status).json({
+          error: true,
+          message: status === 404 ? 'Almacen no encontrado.' : almacenValidation.message
+        });
+      }
+    }
+
+    await client.query('BEGIN');
+    txStarted = true;
+
+    const blockedQuantityResult = await client.query(
+      `
+        SELECT id_almacen, cantidad
+        FROM public.insumos_almacenes
+        WHERE id_insumo = $1
+          AND COALESCE(estado, true) IS TRUE
+          AND NOT (id_almacen = ANY($2::int[]))
+          AND COALESCE(cantidad, 0) > 0
+        LIMIT 1
+      `,
+      [resolved.masterId, idAlmacenes]
+    );
+    if (blockedQuantityResult.rowCount > 0) {
+      await client.query('ROLLBACK');
+      txStarted = false;
+      return res.status(409).json({
+        error: true,
+        code: 'INSUMO_ASIGNACION_CON_EXISTENCIA',
+        message: 'No se puede quitar el almacen porque el insumo tiene existencia en esa asignacion.'
+      });
+    }
+
+    await client.query(
+      `
+        UPDATE public.insumos_almacenes
+        SET estado = false,
+            fecha_actualizacion = now()
+        WHERE id_insumo = $1
+          AND NOT (id_almacen = ANY($2::int[]))
+      `,
+      [resolved.masterId, idAlmacenes]
+    );
+
+    for (const idAlmacen of idAlmacenes) {
+      const sameWarehouseAssignment = await getWarehouseAssignmentDetails('insumo', resolved.masterId, idAlmacen, client);
+      if (sameWarehouseAssignment) {
+        await reactivateCatalogoMaestroAssignment(
+          'insumo',
+          {
+            masterId: resolved.masterId,
+            warehouseId: idAlmacen,
+            stockMinimo: resolved.master.stock_minimo_default ?? 0
+          },
+          client
+        );
+      } else {
+        await createCatalogoMaestroAssignment(
+          'insumo',
+          {
+            masterId: resolved.masterId,
+            warehouseId: idAlmacen,
+            stockMinimo: resolved.master.stock_minimo_default ?? 0,
+            precioLocal: resolved.master.precio_local_default,
+            fechaCaducidad: resolved.master.fecha_caducidad_default,
+            activo: true
+          },
+          client
+        );
+      }
+    }
+
+    await client.query(
+      'UPDATE public.insumos SET id_almacen = $1 WHERE id_insumo = $2',
+      [idAlmacenes[0], resolved.masterId]
+    );
+
+    const updated = await getInsumoById(resolved.masterId, client);
+    const [insumoResponse] = await attachInsumoAlmacenes(updated ? [updated] : [], client);
+    if (!insumoResponse) {
+      await client.query('ROLLBACK');
+      txStarted = false;
+      return res.status(500).json({
+        error: true,
+        message: 'No se pudo cargar el insumo actualizado.'
+      });
+    }
+
+    await client.query('COMMIT');
+    txStarted = false;
+
+    return res.status(200).json({
+      error: false,
+      message: 'Sucursales del insumo actualizadas correctamente.',
+      id_insumo_maestro: resolved.masterId,
+      id_almacenes: idAlmacenes,
+      insumo: insumoResponse
+    });
+  } catch (err) {
+    if (txStarted) {
+      try { await client.query('ROLLBACK'); } catch {}
+    }
+    console.error('Error en PUT /insumos/:id_insumo/asignaciones:', err.message);
+    return res.status(500).json({ error: true, message: safeServerErrorMessage() });
+  } finally {
+    client.release();
   }
 });
 
@@ -1455,6 +1645,26 @@ router.patch('/insumos/:id_insumo/asignaciones/:id_almacen/inactivar', checkPerm
       return res.status(404).json({
         error: true,
         message: 'La asignacion local del insumo maestro no existe para ese almacen.'
+      });
+    }
+
+    const quantityResult = await client.query(
+      `
+        SELECT cantidad
+        FROM public.insumos_almacenes
+        WHERE id_insumo = $1
+          AND id_almacen = $2
+          AND COALESCE(estado, true) IS TRUE
+        LIMIT 1
+      `,
+      [resolved.masterId, idAlmacen]
+    );
+    const currentQuantity = Number(quantityResult.rows?.[0]?.cantidad ?? 0);
+    if (Number.isFinite(currentQuantity) && currentQuantity > 0) {
+      return res.status(409).json({
+        error: true,
+        code: 'INSUMO_ASIGNACION_CON_EXISTENCIA',
+        message: 'No se puede quitar el almacen porque el insumo tiene existencia en esa asignacion.'
       });
     }
 
