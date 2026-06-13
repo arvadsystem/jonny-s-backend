@@ -3425,15 +3425,50 @@ const buildPedidoPendienteItemsBody = (body) => {
   const descuentosLinea = Array.isArray(body?.descuentos_linea) ? body.descuentos_linea : [];
   if (!descuentosLinea.length) return items;
 
+  const descuentosLineaByCartKey = new Map();
+  for (const descuentoLinea of descuentosLinea) {
+    if (!isPlainObject(descuentoLinea)) continue;
+    const cartKey = String(descuentoLinea.cart_key || '').trim();
+    const idDescuentoCatalogo = parseOptionalPositiveInt(descuentoLinea.id_descuento_catalogo);
+    if (!cartKey || !idDescuentoCatalogo) continue;
+    descuentosLineaByCartKey.set(cartKey, idDescuentoCatalogo);
+  }
+  const useLegacyIndexFallback = descuentosLineaByCartKey.size === 0;
+
   return items.map((item, index) => {
     if (!isPlainObject(item)) return item;
-    if (item.id_descuento_catalogo !== undefined && item.id_descuento_catalogo !== null && String(item.id_descuento_catalogo).trim() !== '') return item;
+    if (parseOptionalPositiveInt(item.id_descuento_catalogo)) return item;
+
+    const itemCartKey = String(item.cart_key || '').trim();
+    const descuentoByCartKey = itemCartKey ? descuentosLineaByCartKey.get(itemCartKey) : null;
+    if (descuentoByCartKey) {
+      return { ...item, id_descuento_catalogo: descuentoByCartKey };
+    }
+
+    // Compatibilidad con clientes legacy que enviaban un arreglo posicional sin cart_key.
+    if (!useLegacyIndexFallback) return item;
     const descuentoLinea = descuentosLinea[index];
     if (!isPlainObject(descuentoLinea)) return item;
-    if (descuentoLinea.id_descuento_catalogo === undefined || descuentoLinea.id_descuento_catalogo === null || String(descuentoLinea.id_descuento_catalogo).trim() === '') return item;
-    return { ...item, id_descuento_catalogo: descuentoLinea.id_descuento_catalogo };
+    const idDescuentoCatalogo = parseOptionalPositiveInt(descuentoLinea.id_descuento_catalogo);
+    if (!idDescuentoCatalogo) return item;
+    if (process.env.NODE_ENV === 'development') {
+      console.warn('[pedido_pendiente:descuento_linea_legacy_index]', {
+        index,
+        has_item_cart_key: Boolean(itemCartKey),
+        has_discount_cart_key: Boolean(String(descuentoLinea.cart_key || '').trim())
+      });
+    }
+    return { ...item, id_descuento_catalogo: idDescuentoCatalogo };
   });
 };
+
+const buildPedidoPendienteDiscountErrorBody = (validation) => ({
+  error: true,
+  code: validation.code,
+  message: validation.code === 'VENTAS_DESCUENTO_ITEM_NO_APLICA'
+    ? 'El descuento seleccionado ya no aplica a uno de los items del pedido. Revisa los descuentos del carrito.'
+    : validation.message
+});
 
 const mapPedidoPendienteSessionStatus = (reason) => reason === 'SESSION_SCOPE_MISMATCH' ? 403 : 409;
 
@@ -3569,7 +3604,13 @@ const buildPedidoPendientePayload = async ({ client, body, userId, sucursalScope
       if (!idDescuentoLinea) continue;
       const discountCatalog = discountCatalogMap.get(idDescuentoLinea) || null;
       const validatedLineDiscount = validateCatalogDiscountAvailability({ discountCatalog, idSucursal, subtotalObjetivo: line.base_sub_total ?? line.sub_total, alcanceEsperado: line.kind, line });
-      if (!validatedLineDiscount.ok) return { ok: false, status: validatedLineDiscount.status, body: { error: true, code: validatedLineDiscount.code, message: validatedLineDiscount.message } };
+      if (!validatedLineDiscount.ok) {
+        return {
+          ok: false,
+          status: validatedLineDiscount.status,
+          body: buildPedidoPendienteDiscountErrorBody(validatedLineDiscount)
+        };
+      }
       descuentosLineaMap.set(index, validatedLineDiscount.montoCalculado);
       descuentosCatalogoLineaMap.set(index, Number(discountCatalog.id_descuento_catalogo));
     }
@@ -3581,7 +3622,13 @@ const buildPedidoPendientePayload = async ({ client, body, userId, sucursalScope
   if (idDescuentoCatalogo) {
     const discountCatalog = discountCatalogMap.get(idDescuentoCatalogo) || null;
     const validatedGlobalDiscount = validateCatalogDiscountAvailability({ discountCatalog, idSucursal, subtotalObjetivo: subtotalBaseDespuesLinea, alcanceEsperado: DESCUENTO_ALCANCE_KEYS.FACTURA_COMPLETA });
-    if (!validatedGlobalDiscount.ok) return { ok: false, status: validatedGlobalDiscount.status, body: { error: true, code: validatedGlobalDiscount.code, message: validatedGlobalDiscount.message } };
+    if (!validatedGlobalDiscount.ok) {
+      return {
+        ok: false,
+        status: validatedGlobalDiscount.status,
+        body: buildPedidoPendienteDiscountErrorBody(validatedGlobalDiscount)
+      };
+    }
     descuentoGlobalTotal = validatedGlobalDiscount.montoCalculado;
     appliedDiscountCatalog = { id_descuento_catalogo: Number(discountCatalog.id_descuento_catalogo) };
   } else if (hasLegacyDiscount) {
