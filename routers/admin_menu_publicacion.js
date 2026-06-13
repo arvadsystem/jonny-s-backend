@@ -556,7 +556,7 @@ const fetchBaseCatalogByMenu = async (idMenu, idSucursal, departmentIds, imageCa
       LEFT JOIN archivos a_receta
         ON a_receta.id_archivo = r.id_archivo
        AND (a_receta.estado = true OR a_receta.estado IS NULL)
-      WHERE r.id_menu = $1
+      WHERE COALESCE(r.estado, true) = true
         AND r.id_tipo_departamento IS NOT NULL
         AND r.id_tipo_departamento <> ALL($2::int[])
 
@@ -573,7 +573,7 @@ const fetchBaseCatalogByMenu = async (idMenu, idSucursal, departmentIds, imageCa
       LEFT JOIN archivos a_combo
         ON a_combo.id_archivo = c.id_archivo
        AND (a_combo.estado = true OR a_combo.estado IS NULL)
-      WHERE c.id_menu = $1
+      WHERE COALESCE(c.estado, true) = true
         AND c.id_tipo_departamento = $3
 
       UNION ALL
@@ -842,10 +842,9 @@ const fetchDraftStateByType = async ({ idMenu, idSucursal, normalizedItems }) =>
       `
         SELECT id_receta AS id_item_origen, COALESCE(estado, true) AS estado_item, precio
         FROM recetas
-        WHERE id_menu = $1
-          AND id_receta = ANY($2::int[]);
+        WHERE id_receta = ANY($1::int[]);
       `,
-      [idMenu, [...new Set(recipeIds)]]
+      [[...new Set(recipeIds)]]
     );
     for (const row of result.rows || []) {
       resultMap.set(buildItemKey(ITEM_TYPES.RECETA, Number(row.id_item_origen)), {
@@ -860,10 +859,9 @@ const fetchDraftStateByType = async ({ idMenu, idSucursal, normalizedItems }) =>
       `
         SELECT id_combo AS id_item_origen, COALESCE(estado, true) AS estado_item, precio
         FROM combos
-        WHERE id_menu = $1
-          AND id_combo = ANY($2::int[]);
+        WHERE id_combo = ANY($1::int[]);
       `,
-      [idMenu, [...new Set(comboIds)]]
+      [[...new Set(comboIds)]]
     );
     for (const row of result.rows || []) {
       resultMap.set(buildItemKey(ITEM_TYPES.COMBO, Number(row.id_item_origen)), {
