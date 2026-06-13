@@ -1,4 +1,5 @@
 ﻿import express from 'express';
+import { randomUUID } from 'node:crypto';
 import pool from '../config/db-connection.js';
 import { checkPermission } from '../middleware/checkPermission.js';
 import { resolveMenuDepartmentIds } from './menu_departamentos.js';
@@ -63,6 +64,15 @@ const parseBoolean = (value) => {
   if (['false', 'f', 'no', 'n', 'off'].includes(normalized)) return false;
 
   return Boolean(value);
+};
+
+const parseOptionalBoolean = (value) => {
+  if (value === undefined || value === null || value === '') return false;
+  if (value === true || value === false) return value;
+  const normalized = String(value).trim().toLowerCase();
+  if (['true', '1'].includes(normalized)) return true;
+  if (['false', '0'].includes(normalized)) return false;
+  return null;
 };
 
 const normalizeItemType = (value) => {
@@ -151,6 +161,55 @@ const toDateTimeOrNull = (value) => {
   const parsed = new Date(value);
   if (Number.isNaN(parsed.getTime())) return null;
   return parsed;
+};
+
+const buildMenuProgrammingError = ({ code, message, phase, status = 500, cause = null }) => {
+  const error = new Error(message);
+  error.code = code;
+  error.phase = phase;
+  error.status = status;
+  error.cause = cause;
+  return error;
+};
+
+const sendMenuProgrammingError = (res, {
+  status,
+  code,
+  message,
+  phase,
+  correlationId
+}) => res.status(status).json({
+  ok: false,
+  code,
+  message,
+  phase,
+  correlationId
+});
+
+const getOtherBranchesActiveMenuSignature = async (client, idSucursal) => {
+  const result = await client.query(
+    `
+      SELECT COALESCE(
+        JSONB_AGG(
+          JSONB_BUILD_OBJECT(
+            'id_menu_vigente', id_menu_vigente,
+            'id_sucursal', id_sucursal,
+            'id_menu', id_menu,
+            'fecha_inicio', fecha_inicio,
+            'estado', estado
+          )
+          ORDER BY id_sucursal, id_menu_vigente
+        ),
+        '[]'::jsonb
+      ) AS signature
+      FROM menu_vigente
+      WHERE id_sucursal <> $1
+        AND COALESCE(estado, true) = true;
+    `,
+    [idSucursal]
+  );
+
+  return JSON.stringify(result.rows?.[0]?.signature || []);
 };
 
 const getMenusForProgramming = async () => {
@@ -1303,36 +1362,81 @@ router.delete('/menus/:id_menu', checkPermission(MENU_PUBLICACION_SAVE_PERMISSIO
 // Programa un menu por sucursal para una fecha/hora especifica.
 router.post('/programacion', checkPermission(MENU_PUBLICACION_SAVE_PERMISSIONS), async (req, res) => {
   const client = await pool.connect();
+  const correlationId = randomUUID();
+  let phase = 'VALIDATION';
+  let transactionStarted = false;
   try {
     const idSucursal = toPositiveInt(req.body?.id_sucursal);
     const idMenu = toPositiveInt(req.body?.id_menu);
     const idUsuario = getAuthenticatedUserId(req);
     const fechaRaw = req.body?.fecha_inicio;
     const fechaProgramada = toDateTimeOrNull(fechaRaw) || new Date();
+    const syncCatalog = parseOptionalBoolean(req.body?.sync_catalog);
 
     if (!idSucursal || !idMenu) {
-      return res.status(400).json({ ok: false, message: 'id_sucursal e id_menu son obligatorios.' });
+      return sendMenuProgrammingError(res, {
+        status: 400,
+        code: 'MENU_PROGRAMMING_VALIDATION_ERROR',
+        message: 'id_sucursal e id_menu son obligatorios.',
+        phase,
+        correlationId
+      });
     }
 
     if (!idUsuario) {
-      return res.status(400).json({ ok: false, message: 'No se pudo identificar el usuario autenticado para activar menu.' });
+      return sendMenuProgrammingError(res, {
+        status: 400,
+        code: 'MENU_PROGRAMMING_USER_REQUIRED',
+        message: 'No se pudo identificar el usuario autenticado para activar menu.',
+        phase,
+        correlationId
+      });
     }
 
     if (fechaRaw && !toDateTimeOrNull(fechaRaw)) {
-      return res.status(400).json({ ok: false, message: 'fecha_inicio tiene formato invalido.' });
+      return sendMenuProgrammingError(res, {
+        status: 400,
+        code: 'MENU_PROGRAMMING_INVALID_DATE',
+        message: 'fecha_inicio tiene formato invalido.',
+        phase,
+        correlationId
+      });
     }
 
+    if (syncCatalog === null) {
+      return sendMenuProgrammingError(res, {
+        status: 400,
+        code: 'MENU_PROGRAMMING_INVALID_SYNC_OPTION',
+        message: 'sync_catalog debe ser booleano cuando se envia.',
+        phase,
+        correlationId
+      });
+    }
+
+    phase = 'PRECHECK';
     const [branchOk, menuOk] = await Promise.all([
       existsActiveBranch(idSucursal),
       existsActiveMenu(idMenu)
     ]);
 
     if (!branchOk) {
-      return res.status(404).json({ ok: false, message: 'La sucursal no existe o esta inactiva.' });
+      return sendMenuProgrammingError(res, {
+        status: 404,
+        code: 'MENU_BRANCH_NOT_FOUND',
+        message: 'La sucursal no existe o esta inactiva.',
+        phase,
+        correlationId
+      });
     }
 
     if (!menuOk) {
-      return res.status(404).json({ ok: false, message: 'El menu no existe o esta inactivo.' });
+      return sendMenuProgrammingError(res, {
+        status: 404,
+        code: 'MENU_TARGET_NOT_FOUND',
+        message: 'El menu no existe o esta inactivo.',
+        phase,
+        correlationId
+      });
     }
 
     // Si no viene fecha, el flujo es "activar ahora". Evitamos duplicar filas si ya estaba activo.
@@ -1343,8 +1447,11 @@ router.post('/programacion', checkPermission(MENU_PUBLICACION_SAVE_PERMISSIONS),
         message: 'Ese menu ya esta activo en la sucursal.',
         data: {
           programacion: null,
-          menu_activo_actual: mapMenuSummary(activeNow)
-        }
+          menu_activo_actual: mapMenuSummary(activeNow),
+          sync_catalog: false,
+          correlationId
+        },
+        correlationId
       });
     }
 
@@ -1352,8 +1459,45 @@ router.post('/programacion', checkPermission(MENU_PUBLICACION_SAVE_PERMISSIONS),
     const activateNow = fechaProgramada <= now;
     const estadoInicial = activateNow;
 
+    phase = 'BEGIN';
     await client.query('BEGIN');
+    transactionStarted = true;
 
+    phase = 'LOCK_BRANCH';
+    await client.query('SELECT pg_advisory_xact_lock($1, $2);', [7102, idSucursal]);
+
+    phase = 'TRANSACTION_PRECHECK';
+    const transactionPrecheck = await client.query(
+      `
+        SELECT
+          EXISTS(
+            SELECT 1
+            FROM sucursales
+            WHERE id_sucursal = $1
+              AND COALESCE(estado, true) = true
+          ) AS branch_ok,
+          EXISTS(
+            SELECT 1
+            FROM menu
+            WHERE id_menu = $2
+              AND COALESCE(estado, true) = true
+          ) AS menu_ok;
+      `,
+      [idSucursal, idMenu]
+    );
+    const lockedPrecheck = transactionPrecheck.rows?.[0] || {};
+    if (!parseBoolean(lockedPrecheck.branch_ok) || !parseBoolean(lockedPrecheck.menu_ok)) {
+      throw buildMenuProgrammingError({
+        code: 'MENU_PROGRAMMING_PRECHECK_CHANGED',
+        message: 'La sucursal o el menu cambiaron antes de aplicar la vigencia.',
+        phase,
+        status: 409
+      });
+    }
+
+    const otherBranchesSignatureBefore = await getOtherBranchesActiveMenuSignature(client, idSucursal);
+
+    phase = 'CHECK_DUPLICATE';
     const duplicate = await client.query(
       `
         SELECT id_menu_vigente
@@ -1368,11 +1512,18 @@ router.post('/programacion', checkPermission(MENU_PUBLICACION_SAVE_PERMISSIONS),
 
     if (duplicate.rowCount > 0) {
       await client.query('ROLLBACK');
-      return res.status(409).json({ ok: false, message: 'Ya existe una vigencia con esa sucursal, menu y fecha.' });
+      transactionStarted = false;
+      return sendMenuProgrammingError(res, {
+        status: 409,
+        code: 'MENU_VIGENCIA_CONFLICT',
+        message: 'Ya existe una vigencia con esa sucursal, menu y fecha.',
+        phase,
+        correlationId
+      });
     }
 
-    // Para "activar ahora", apaga primero la vigencia actual y evita colisiones por llaves unicas.
     if (activateNow) {
+      phase = 'DEACTIVATE_CURRENT';
       await client.query(
         `
           UPDATE menu_vigente
@@ -1384,6 +1535,7 @@ router.post('/programacion', checkPermission(MENU_PUBLICACION_SAVE_PERMISSIONS),
       );
     }
 
+    phase = 'INSERT_VIGENCIA';
     const insertResult = await client.query(
       `
         INSERT INTO menu_vigente (
@@ -1400,11 +1552,15 @@ router.post('/programacion', checkPermission(MENU_PUBLICACION_SAVE_PERMISSIONS),
 
     const inserted = insertResult.rows?.[0] || null;
     if (!inserted) {
-      throw new Error('No se pudo crear la vigencia en menu_vigente.');
+      throw buildMenuProgrammingError({
+        code: 'MENU_VIGENCIA_INSERT_FAILED',
+        message: 'No se pudo crear la vigencia solicitada.',
+        phase
+      });
     }
 
     if (activateNow) {
-      // Si entra en vigor ya, se desactivan vigencias previas de la sucursal para evitar colisiones.
+      phase = 'ENSURE_SINGLE_ACTIVE';
       await client.query(
         `
           UPDATE menu_vigente
@@ -1418,13 +1574,70 @@ router.post('/programacion', checkPermission(MENU_PUBLICACION_SAVE_PERMISSIONS),
       );
     }
 
-    const seededProductsCount = await syncExistingBranchProductsIntoMenu({
-      client,
-      idSucursal,
-      idMenu: Number(inserted.id_menu)
-    });
+    let seededProductsCount = 0;
+    if (syncCatalog) {
+      phase = 'SYNC_CATALOG';
+      try {
+        seededProductsCount = await syncExistingBranchProductsIntoMenu({
+          client,
+          idSucursal,
+          idMenu: Number(inserted.id_menu)
+        });
+      } catch (error) {
+        throw buildMenuProgrammingError({
+          code: 'MENU_CATALOG_SYNC_FAILED',
+          message: 'La vigencia no se aplico porque fallo la sincronizacion solicitada del catalogo.',
+          phase,
+          cause: error
+        });
+      }
+    }
 
+    phase = 'POSTCHECK';
+    const postcheckResult = await client.query(
+      `
+        SELECT
+          COUNT(*) FILTER (WHERE COALESCE(estado, true) = true)::int AS active_count,
+          MAX(id_menu) FILTER (WHERE COALESCE(estado, true) = true)::int AS active_menu,
+          COUNT(*) FILTER (
+            WHERE id_menu_vigente = $2
+              AND id_menu = $3
+              AND estado = $4
+          )::int AS inserted_matches
+        FROM menu_vigente
+        WHERE id_sucursal = $1;
+      `,
+      [idSucursal, Number(inserted.id_menu_vigente), idMenu, estadoInicial]
+    );
+    const postcheck = postcheckResult.rows?.[0] || {};
+    const activeNowPostcheckFailed = activateNow && (
+      Number(postcheck.active_count) !== 1 ||
+      Number(postcheck.active_menu) !== idMenu
+    );
+    const scheduledPostcheckFailed = !activateNow && (
+      Number(postcheck.active_count) > 1 ||
+      Number(postcheck.inserted_matches) !== 1
+    );
+    if (activeNowPostcheckFailed || scheduledPostcheckFailed) {
+      throw buildMenuProgrammingError({
+        code: 'MENU_VIGENCIA_POSTCHECK_FAILED',
+        message: 'La vigencia no supero la validacion final.',
+        phase
+      });
+    }
+
+    const otherBranchesSignatureAfter = await getOtherBranchesActiveMenuSignature(client, idSucursal);
+    if (otherBranchesSignatureAfter !== otherBranchesSignatureBefore) {
+      throw buildMenuProgrammingError({
+        code: 'MENU_OTHER_BRANCH_CHANGED',
+        message: 'La operacion fue cancelada porque detecto cambios fuera de la sucursal solicitada.',
+        phase
+      });
+    }
+
+    phase = 'COMMIT';
     await client.query('COMMIT');
+    transactionStarted = false;
 
     const activeMenu = await getActiveMenuByBranch(idSucursal);
     const sharedMenuImpact = await resolveSharedMenuImpact({
@@ -1454,14 +1667,40 @@ router.post('/programacion', checkPermission(MENU_PUBLICACION_SAVE_PERMISSIONS),
         },
         menu_activo_actual: activeMenu ? mapMenuSummary(activeMenu) : null,
         shared_menu_impact: sharedMenuImpact,
+        sync_catalog: syncCatalog,
         seeded_products_count: seededProductsCount,
-        warnings
-      }
+        warnings,
+        correlationId
+      },
+      correlationId
     });
   } catch (error) {
-    await client.query('ROLLBACK');
-    console.error('admin_menu_publicacion POST /programacion:', error.message);
-    return res.status(500).json({ ok: false, message: 'No se pudo activar/programar el menu por sucursal.' });
+    if (transactionStarted) {
+      await client.query('ROLLBACK').catch(() => {});
+    }
+    const safeCode = String(error?.code || 'MENU_PROGRAMMING_FAILED');
+    const safePhase = String(error?.phase || phase || 'UNKNOWN');
+    const safeMessage = safeCode.startsWith('MENU_')
+      ? String(error?.message || 'No se pudo activar/programar el menu por sucursal.')
+      : 'No se pudo activar/programar el menu por sucursal.';
+    const status = Number.isInteger(error?.status) ? error.status : 500;
+    const internalError = error?.cause || error;
+    console.error('admin_menu_publicacion POST /programacion', {
+      correlationId,
+      phase: safePhase,
+      id_sucursal: toPositiveInt(req.body?.id_sucursal),
+      id_menu: toPositiveInt(req.body?.id_menu),
+      code: internalError?.code || safeCode,
+      constraint: internalError?.constraint || null,
+      message: internalError?.message || 'Error sin detalle'
+    });
+    return sendMenuProgrammingError(res, {
+      status,
+      code: safeCode,
+      message: safeMessage,
+      phase: safePhase,
+      correlationId
+    });
   } finally {
     client.release();
   }
