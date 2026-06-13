@@ -68,9 +68,42 @@ const groupBy = (rows, field) => {
   return grouped;
 };
 
+const loadExtraAssignmentsByBranch = async ({ queryRunner, extraIds = [], idSucursal, mode }) => {
+  const branchId = toPositiveInt(idSucursal);
+  const ids = [...new Set((Array.isArray(extraIds) ? extraIds : []).map((id) => toPositiveInt(id)).filter(Boolean))];
+  if (!branchId || ids.length === 0) return null;
+
+  try {
+    const result = await queryRunner.query(
+      `
+        SELECT mea.id_extra
+        FROM public.menu_extra_almacenes mea
+        INNER JOIN public.almacenes a
+          ON a.id_almacen = mea.id_almacen
+         AND a.id_sucursal = $2
+         AND COALESCE(a.estado, true) = true
+        WHERE mea.id_extra = ANY($1::int[])
+          AND COALESCE(mea.estado, true) = true
+        ${mode === 'transactional' ? 'FOR UPDATE OF mea' : ''}
+      `,
+      [ids, branchId]
+    );
+    return new Set((result.rows || []).map((row) => Number(row.id_extra)).filter(Boolean));
+  } catch (error) {
+    if (error?.code === '42P01') return null;
+    throw error;
+  }
+};
+
 const resolveLegacyExtrasInventory = async ({ queryRunner, extras, idSucursal }) => {
   const configuredIds = [...new Set(extras.map((extra) => toPositiveInt(extra?.id_insumo)).filter(Boolean))];
   const inventoryById = new Map();
+  const assignmentsByBranch = await loadExtraAssignmentsByBranch({
+    queryRunner,
+    extraIds: extras.map((extra) => extra?.id_extra),
+    idSucursal,
+    mode: 'catalog'
+  });
 
   if (configuredIds.length > 0) {
     const result = await queryRunner.query(
@@ -96,6 +129,9 @@ const resolveLegacyExtrasInventory = async ({ queryRunner, extras, idSucursal })
 
   return extras.map((extra) => {
     let resolved = buildBaseResult(extra, { useMasterCatalog: false, idSucursal });
+    if (assignmentsByBranch && !assignmentsByBranch.has(resolved.id_extra)) {
+      return markUnavailable(resolved, 'EXTRA_INSUMO_SIN_ASIGNACION_SUCURSAL');
+    }
     const configuredId = resolved.id_insumo_configurado;
     if (!configuredId) {
       return {
@@ -143,6 +179,12 @@ const mappingFailureCode = (status) => {
 const resolveMasterExtrasInventory = async ({ queryRunner, extras, idSucursal, mode }) => {
   const branchId = toPositiveInt(idSucursal);
   const configuredIds = [...new Set(extras.map((extra) => toPositiveInt(extra?.id_insumo)).filter(Boolean))];
+  const assignmentsByBranch = await loadExtraAssignmentsByBranch({
+    queryRunner,
+    extraIds: extras.map((extra) => extra?.id_extra),
+    idSucursal,
+    mode
+  });
   if (!branchId) {
     return extras.map((extra) => markUnavailable(
       buildBaseResult(extra, { useMasterCatalog: true, idSucursal }),
@@ -203,6 +245,9 @@ const resolveMasterExtrasInventory = async ({ queryRunner, extras, idSucursal, m
   const resolvedMasterIds = new Set();
   const preliminary = extras.map((extra) => {
     let result = buildBaseResult(extra, { useMasterCatalog: true, idSucursal: branchId });
+    if (assignmentsByBranch && !assignmentsByBranch.has(result.id_extra)) {
+      return markUnavailable(result, 'EXTRA_INSUMO_SIN_ASIGNACION_SUCURSAL');
+    }
     const configuredId = result.id_insumo_configurado;
     if (!configuredId) return markUnavailable(result, 'EXTRA_INSUMO_NO_CONFIGURADO');
 

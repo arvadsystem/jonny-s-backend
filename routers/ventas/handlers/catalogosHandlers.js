@@ -179,7 +179,10 @@ export const listExtrasPermitidosCatalogoHandler = async (req, res) => {
       return res.status(sucursalValidation.status).json(sucursalValidation.body);
     }
 
-    const hasMenuExtraCombo = await hasTable(pool, 'menu_extra_combo');
+    const [hasMenuExtraCombo, hasMenuExtraAlmacenes] = await Promise.all([
+      hasTable(pool, 'menu_extra_combo'),
+      hasTable(pool, 'menu_extra_almacenes')
+    ]);
     if (tipo === 'COMBO' && !hasMenuExtraCombo) {
       return res.status(200).json([]);
     }
@@ -190,10 +193,22 @@ export const listExtrasPermitidosCatalogoHandler = async (req, res) => {
     const orderExpression = tipo === 'RECETA'
       ? 'COALESCE(rel.orden, me.orden, 2147483647)'
       : 'COALESCE(me.orden, 2147483647)';
+    const assignmentJoin = hasMenuExtraAlmacenes && idSucursal
+      ? `
+        INNER JOIN public.menu_extra_almacenes mea
+          ON mea.id_extra = me.id_extra
+         AND COALESCE(mea.estado, true) = true
+        INNER JOIN public.almacenes aextra
+          ON aextra.id_almacen = mea.id_almacen
+         AND COALESCE(aextra.estado, true) = true
+         AND aextra.id_sucursal = $2
+      `
+      : '';
+    const params = hasMenuExtraAlmacenes && idSucursal ? [idItem, idSucursal] : [idItem];
 
     const result = await pool.query(
       `
-        SELECT
+        SELECT DISTINCT
           me.id_extra,
           me.codigo,
           me.nombre,
@@ -201,13 +216,15 @@ export const listExtrasPermitidosCatalogoHandler = async (req, res) => {
           COALESCE(me.estado, true) AS estado,
           me.id_insumo,
           me.cant,
-          me.id_unidad_medida
+          me.id_unidad_medida,
+          ${orderExpression} AS orden_catalogo
         FROM public.menu_extras me
         INNER JOIN ${linkJoin}
           AND COALESCE(rel.estado, true) = true
-        ORDER BY ${orderExpression}, me.nombre ASC
+        ${assignmentJoin}
+        ORDER BY orden_catalogo, me.nombre ASC
       `,
-      [idItem]
+      params
     );
 
     const resolvedExtras = await resolveExtrasInventory({

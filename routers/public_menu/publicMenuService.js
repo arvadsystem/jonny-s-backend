@@ -357,14 +357,14 @@ const getFallbackCatalogItemExtraOptions = ({ nombre, descripcion, categoriaNomb
     .map(normalizeExtraOption);
 };
 
-const buildCatalogExtrasByRecipe = async (catalogRows = [], db = pool) => {
+const buildCatalogExtrasByRecipe = async (catalogRows = [], idSucursal = null, db = pool) => {
   const recipeIds = toUniquePositiveIntArray(
     catalogRows
       .filter((row) => String(row?.tipo_item || '') === PUBLIC_ITEM_TYPES.RECETA)
       .map((row) => row?.id_receta)
   );
 
-  const rows = await fetchPublicMenuExtrasByRecipeIdsQuery(recipeIds, db);
+  const rows = await fetchPublicMenuExtrasByRecipeIdsQuery(recipeIds, idSucursal, db);
   const grouped = new Map();
 
   rows.forEach((row) => {
@@ -987,7 +987,7 @@ const materializePublicOrderSnapshot = async ({ idSucursal, requestedItems = [],
   const rows = await fetchCatalogRowsByMenuQuery(Number(activeMenu.id_menu), Number(idSucursal), db);
   const [sauceConfigByDetail, extrasByRecipe] = await Promise.all([
     buildCatalogSauceConfigByDetail(rows, db),
-    buildCatalogExtrasByRecipe(rows, db)
+    buildCatalogExtrasByRecipe(rows, Number(idSucursal), db)
   ]);
 
   const recipeIds = rows
@@ -1280,7 +1280,7 @@ export const getPublicCatalogService = async ({ idSucursal, tipoPedido = null })
   const rows = await fetchCatalogRowsByMenuQuery(Number(activeMenu.id_menu), Number(idSucursal));
   const [sauceConfigByDetail, extrasByRecipe] = await Promise.all([
     buildCatalogSauceConfigByDetail(rows),
-    buildCatalogExtrasByRecipe(rows)
+    buildCatalogExtrasByRecipe(rows, Number(idSucursal))
   ]);
 
   const recipeIds = rows
@@ -1346,7 +1346,7 @@ export const getPublicCatalogItemDetailService = async ({ idSucursal, idDetalleM
   }
   const [sauceConfigByDetail, extrasByRecipe] = await Promise.all([
     buildCatalogSauceConfigByDetail([row]),
-    buildCatalogExtrasByRecipe([row])
+    buildCatalogExtrasByRecipe([row], Number(idSucursal))
   ]);
 
   const recipeIds = row.id_receta ? [Number(row.id_receta)] : [];

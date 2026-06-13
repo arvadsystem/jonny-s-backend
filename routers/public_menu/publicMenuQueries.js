@@ -447,23 +447,37 @@ export const fetchPublicBranchAvailabilityByIdQuery = async (idSucursal, db = po
   return result.rows[0] || null;
 };
 
-export const fetchPublicMenuExtrasByRecipeIdsQuery = async (recipeIds = [], db = pool) => {
+export const fetchPublicMenuExtrasByRecipeIdsQuery = async (recipeIds = [], idSucursal = null, db = pool) => {
   const ids = [...new Set((Array.isArray(recipeIds) ? recipeIds : [])
     .map((value) => Number.parseInt(String(value ?? ''), 10))
     .filter((value) => Number.isInteger(value) && value > 0))];
 
   if (ids.length === 0) return [];
 
-  const [hasExtrasTable, hasRecipeLinkTable] = await Promise.all([
+  const [hasExtrasTable, hasRecipeLinkTable, hasExtraAssignmentsTable] = await Promise.all([
     hasTable('menu_extras'),
-    hasTable('menu_extra_receta')
+    hasTable('menu_extra_receta'),
+    hasTable('menu_extra_almacenes')
   ]);
 
   if (!hasExtrasTable || !hasRecipeLinkTable) return [];
+  const branchId = Number.isInteger(Number(idSucursal)) && Number(idSucursal) > 0 ? Number(idSucursal) : null;
+  const assignmentJoin = hasExtraAssignmentsTable && branchId
+    ? `
+      INNER JOIN menu_extra_almacenes mea
+        ON mea.id_extra = me.id_extra
+       AND COALESCE(mea.estado, true) = true
+      INNER JOIN almacenes a
+        ON a.id_almacen = mea.id_almacen
+       AND COALESCE(a.estado, true) = true
+       AND a.id_sucursal = $2
+    `
+    : '';
+  const params = branchId && hasExtraAssignmentsTable ? [ids, branchId] : [ids];
 
   const result = await db.query(
     `
-      SELECT
+      SELECT DISTINCT
         mer.id_receta,
         me.id_extra,
         me.codigo,
@@ -474,11 +488,12 @@ export const fetchPublicMenuExtrasByRecipeIdsQuery = async (recipeIds = [], db =
       INNER JOIN menu_extras me
         ON me.id_extra = mer.id_extra
        AND COALESCE(me.estado, true) = true
+      ${assignmentJoin}
       WHERE mer.id_receta = ANY($1::int[])
         AND COALESCE(mer.estado, true) = true
-      ORDER BY mer.id_receta ASC, COALESCE(mer.orden, me.orden, 2147483647), me.nombre ASC;
+      ORDER BY mer.id_receta ASC, orden ASC, me.nombre ASC;
     `,
-    [ids]
+    params
   );
 
   return result.rows;
