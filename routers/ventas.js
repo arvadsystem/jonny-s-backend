@@ -1922,10 +1922,31 @@ const allocateDiscounts = (lineSubtotals, totalDiscount) => {
   });
 };
 
-const resolveLineComplementos = ({ item, receta, combo, context }) => {
+const buildInvalidComplementResult = ({ item, nombreItem, allowed = [], reason }) => {
+  if (process.env.NODE_ENV === 'development' && isVentasPerfEnabled()) {
+    console.warn('[ventas:complemento-invalido]', {
+      tipo_item: item?.kind || null,
+      id_producto: parseOptionalPositiveInt(item?.id_producto),
+      id_receta: parseOptionalPositiveInt(item?.id_receta),
+      id_combo: parseOptionalPositiveInt(item?.id_combo),
+      nombre_item: nombreItem || null,
+      complementos_solicitados: Array.isArray(item?.complementos) ? item.complementos : [],
+      complementos_permitidos: allowed,
+      motivo: reason
+    });
+  }
+  return {
+    ok: false,
+    status: 400,
+    code: 'VENTAS_COMPLEMENTO_INVALIDO',
+    message: `Revisa los complementos de ${nombreItem || 'este item'}. Uno o mas ya no estan disponibles para este item.`
+  };
+};
+
+const resolveLineComplementos = ({ item, receta, combo, context, nombreItem }) => {
   if (item.kind === 'PRODUCTO') {
     if (Array.isArray(item.complementos) && item.complementos.length > 0) {
-      return { ok: false, message: 'Uno o m?s complementos seleccionados no son v?lidos para este item.' };
+      return buildInvalidComplementResult({ item, nombreItem, reason: 'PRODUCTO_NO_PERMITE_COMPLEMENTOS' });
     }
     return {
       ok: true,
@@ -1968,12 +1989,27 @@ const resolveLineComplementos = ({ item, receta, combo, context }) => {
   );
 
   const selected = [];
+  const selectedSet = new Set();
   for (const idRaw of selectedIds) {
     const id = Number(idRaw || 0);
     const found = allowedMap.get(id);
     if (!found || found.disponible === false) {
-      return { ok: false, message: 'Uno o m?s complementos seleccionados no son v?lidos para este item.' };
+      return buildInvalidComplementResult({
+        item,
+        nombreItem,
+        allowed: [...allowedMap.keys()],
+        reason: !found ? 'COMPLEMENTO_NO_PERMITIDO' : 'COMPLEMENTO_NO_DISPONIBLE'
+      });
     }
+    if (selectedSet.has(id)) {
+      return buildInvalidComplementResult({
+        item,
+        nombreItem,
+        allowed: [...allowedMap.keys()],
+        reason: 'COMPLEMENTO_DUPLICADO'
+      });
+    }
+    selectedSet.add(id);
     selected.push({ id_complemento: id, id_salsa: id, nombre: String(found.nombre || 'Salsa').trim() });
   }
 
@@ -1983,8 +2019,13 @@ const resolveLineComplementos = ({ item, receta, combo, context }) => {
   if (max > 0 && selected.length > max) {
     return { ok: false, message: `No puedes seleccionar mas de ${max} complemento(s) para este item.` };
   }
-  if (!metadata.requiere_complementos && selected.length > 0) {
-    return { ok: false, message: 'Uno o m?s complementos seleccionados no son v?lidos para este item.' };
+  if (!metadata.requiere_complementos && allowedMap.size === 0 && selected.length > 0) {
+    return buildInvalidComplementResult({
+      item,
+      nombreItem,
+      allowed: [...allowedMap.keys()],
+      reason: 'ITEM_NO_PERMITE_COMPLEMENTOS'
+    });
   }
 
   return {
@@ -2953,13 +2994,18 @@ const hydrateVentaLines = async (client, normalizedItems, perf = null, options =
         item,
         receta: null,
         combo: null,
-        context: complementContext
+        context: complementContext,
+        nombreItem: producto.nombre_producto || 'Producto'
       });
       if (!complementosResult.ok) {
         return {
           ok: false,
-          status: 400,
-          body: { error: true, message: complementosResult.message }
+          status: complementosResult.status || 400,
+          body: {
+            error: true,
+            code: complementosResult.code || undefined,
+            message: complementosResult.message
+          }
         };
       }
       const extrasResult = resolveLineExtras({ item, allowedExtrasMap });
@@ -3019,13 +3065,18 @@ const hydrateVentaLines = async (client, normalizedItems, perf = null, options =
         item,
         receta: null,
         combo,
-        context: complementContext
+        context: complementContext,
+        nombreItem: combo.descripcion || 'Combo'
       });
       if (!complementosResult.ok) {
         return {
           ok: false,
-          status: 400,
-          body: { error: true, message: complementosResult.message }
+          status: complementosResult.status || 400,
+          body: {
+            error: true,
+            code: complementosResult.code || undefined,
+            message: complementosResult.message
+          }
         };
       }
       const extrasResult = resolveLineExtras({ item, allowedExtrasMap });
@@ -3084,13 +3135,18 @@ const hydrateVentaLines = async (client, normalizedItems, perf = null, options =
       item,
       receta,
       combo: null,
-      context: complementContext
+      context: complementContext,
+      nombreItem: receta.nombre_receta || 'Receta'
     });
     if (!complementosResult.ok) {
       return {
         ok: false,
-        status: 400,
-        body: { error: true, message: complementosResult.message }
+        status: complementosResult.status || 400,
+        body: {
+          error: true,
+          code: complementosResult.code || undefined,
+          message: complementosResult.message
+        }
       };
     }
     const extrasResult = resolveLineExtras({ item, allowedExtrasMap });
