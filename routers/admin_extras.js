@@ -231,35 +231,53 @@ const validateExtraAlmacenes = async (client, idAlmacenes = []) => {
 
 const replaceExtraRecipes = async (client, idExtra, recipeIds = []) => {
   await client.query('UPDATE menu_extra_receta SET estado = false WHERE id_extra = $1', [idExtra]);
-  for (const [index, idReceta] of recipeIds.entries()) {
-    await client.query(
-      `
-        INSERT INTO menu_extra_receta (id_extra, id_receta, orden, estado, fecha_actualizacion)
-        VALUES ($1, $2, $3, true, NOW())
-        ON CONFLICT (id_extra, id_receta) DO UPDATE
-        SET estado = true,
-            orden = EXCLUDED.orden,
-            fecha_actualizacion = NOW()
-      `,
-      [idExtra, idReceta, index + 1]
-    );
-  }
+  const normalized = normalizePositiveIdList(recipeIds);
+  if (normalized.length === 0) return;
+
+  await client.query(
+    `
+      INSERT INTO menu_extra_receta (id_extra, id_receta, orden, estado, fecha_actualizacion)
+      SELECT
+        $1,
+        item.id_receta,
+        item.orden,
+        true,
+        NOW()
+      FROM jsonb_to_recordset($2::jsonb) AS item(
+        id_receta int,
+        orden int
+      )
+      ON CONFLICT (id_extra, id_receta) DO UPDATE
+      SET estado = true,
+          orden = EXCLUDED.orden,
+          fecha_actualizacion = NOW()
+    `,
+    [
+      idExtra,
+      JSON.stringify(normalized.map((idReceta, index) => ({ id_receta: idReceta, orden: index + 1 })))
+    ]
+  );
 };
 
 const replaceExtraCombos = async (client, idExtra, comboIds = []) => {
   await client.query('UPDATE menu_extra_combo SET estado = false, fecha_actualizacion = NOW() WHERE id_extra = $1', [idExtra]);
-  for (const idCombo of comboIds) {
-    await client.query(
-      `
-        INSERT INTO menu_extra_combo (id_extra, id_combo, estado, fecha_actualizacion)
-        VALUES ($1, $2, true, NOW())
-        ON CONFLICT (id_combo, id_extra) DO UPDATE
-        SET estado = true,
-            fecha_actualizacion = NOW()
-      `,
-      [idExtra, idCombo]
-    );
-  }
+  const normalized = normalizePositiveIdList(comboIds);
+  if (normalized.length === 0) return;
+
+  await client.query(
+    `
+      INSERT INTO menu_extra_combo (id_extra, id_combo, estado, fecha_actualizacion)
+      SELECT
+        $1,
+        UNNEST($2::int[]),
+        true,
+        NOW()
+      ON CONFLICT (id_combo, id_extra) DO UPDATE
+      SET estado = true,
+          fecha_actualizacion = NOW()
+    `,
+    [idExtra, normalized]
+  );
 };
 
 const replaceExtraAlmacenes = async (client, idExtra, idAlmacenes = []) => {

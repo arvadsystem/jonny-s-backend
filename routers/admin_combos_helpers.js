@@ -293,6 +293,22 @@ async function existeReceta(idReceta) {
   return result.rowCount > 0;
 }
 
+async function obtenerRecetasExistentes(recetaIds = []) {
+  const ids = [...new Set((Array.isArray(recetaIds) ? recetaIds : []).map((id) => Number(id)).filter((id) => Number.isInteger(id) && id > 0))];
+  if (ids.length === 0) return new Set();
+
+  const result = await pool.query(
+    `
+      SELECT id_receta
+      FROM recetas
+      WHERE id_receta = ANY($1::int[])
+    `,
+    [ids]
+  );
+
+  return new Set((result.rows || []).map((row) => Number(row.id_receta)).filter((id) => Number.isInteger(id) && id > 0));
+}
+
 export async function existeComboPorId(idCombo) {
   const result = await pool.query('SELECT 1 FROM combos WHERE id_combo = $1 LIMIT 1', [idCombo]);
   return result.rowCount > 0;
@@ -408,10 +424,14 @@ export async function validarReglasNegocioYFks(datosNormalizados, detalle = []) 
     }
   }
 
-  for (const item of Array.isArray(detalle) ? detalle : []) {
-    const recetaExiste = await existeReceta(item.id_receta);
-    if (!recetaExiste) {
-      return { ok: false, status: 400, message: `id_receta no existe: ${item.id_receta}` };
+  const recetaIds = (Array.isArray(detalle) ? detalle : [])
+    .map((item) => Number(item?.id_receta))
+    .filter((id) => Number.isInteger(id) && id > 0);
+  if (recetaIds.length > 0) {
+    const recetasExistentes = await obtenerRecetasExistentes(recetaIds);
+    const recetaFaltante = recetaIds.find((id) => !recetasExistentes.has(id));
+    if (recetaFaltante) {
+      return { ok: false, status: 400, message: `id_receta no existe: ${recetaFaltante}` };
     }
   }
 
@@ -419,22 +439,46 @@ export async function validarReglasNegocioYFks(datosNormalizados, detalle = []) 
 }
 
 const insertDetalleRows = async (client, idCombo, detalle) => {
-  for (const item of detalle) {
-    await client.query(
-      `
-        INSERT INTO detalle_combo (
-          id_combo,
-          id_receta,
-          cantidad,
-          orden,
-          estado,
-          fecha_creacion
-        ) VALUES ($1, $2, $3, $4, true, timezone('America/Tegucigalpa', now()))
-      `,
-      [idCombo, item.id_receta, item.cantidad, item.orden]
-    );
-  }
+  const rows = (Array.isArray(detalle) ? detalle : [])
+    .map((item) => ({
+      id_receta: Number(item?.id_receta || 0),
+      cantidad: Number(item?.cantidad || 1),
+      orden: Number(item?.orden || 1)
+    }))
+    .filter((item) => Number.isInteger(item.id_receta) && item.id_receta > 0);
+
+  if (rows.length === 0) return;
+
+  await client.query(
+    `
+      INSERT INTO detalle_combo (
+        id_combo,
+        id_receta,
+        cantidad,
+        orden,
+        estado,
+        fecha_creacion
+      )
+      SELECT
+        $1,
+        item.id_receta,
+        item.cantidad,
+        item.orden,
+        true,
+        timezone('America/Tegucigalpa', now())
+      FROM jsonb_to_recordset($2::jsonb) AS item(
+        id_receta int,
+        cantidad int,
+        orden int
+      )
+    `,
+    [idCombo, JSON.stringify(rows)]
+  );
 };
+
+export async function existeRecetaPorId(idReceta) {
+  return existeReceta(idReceta);
+}
 
 export async function crearComboConDetalle(client, datosNormalizados, detalle) {
   const insertComboResult = await client.query(

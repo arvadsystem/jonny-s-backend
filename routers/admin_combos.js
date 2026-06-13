@@ -11,6 +11,7 @@ import {
   esEnteroPositivo,
   esErrorConflictoConstraint,
   existeComboPorId,
+  existeRecetaPorId,
   existeUsuario,
   getSafeServerErrorMessage,
   isRowActive,
@@ -347,8 +348,8 @@ router.post('/:id_combo/detalle', checkPermission(MENU_COMBOS_DETAIL_EDIT_PERMIS
     }
 
     const item = detalleNormalizacion.data[0];
-    const recetaExisteResult = await pool.query('SELECT 1 FROM recetas WHERE id_receta = $1 LIMIT 1', [item.id_receta]);
-    if (recetaExisteResult.rowCount === 0) {
+    const recetaExiste = await existeRecetaPorId(item.id_receta);
+    if (!recetaExiste) {
       return res.status(400).json({ error: true, message: `id_receta no existe: ${item.id_receta}` });
     }
 
