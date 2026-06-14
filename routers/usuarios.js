@@ -28,6 +28,11 @@ const USUARIOS_IMAGE_EDIT_PERMISSIONS = ['USUARIOS_IMAGEN_SUBIR', 'USUARIOS_IMAG
 const USUARIOS_ROLES_CATALOG_PERMISSIONS = ['USUARIOS_ROL_ASIGNAR', 'USUARIOS_CREAR', 'USUARIOS_EDITAR'];
 const USUARIOS_ROLE_ASSIGN_PERMISSIONS = ['USUARIOS_ROL_ASIGNAR'];
 const USUARIOS_CHANGE_OWN_PASSWORD_PERMISSIONS = ['USUARIOS_PASSWORD_CAMBIAR_PROPIO'];
+const USUARIOS_MODAL_CATALOG_PERMISSIONS = [...new Set([
+  ...USUARIOS_LIST_PERMISSIONS,
+  ...USUARIOS_CREATE_PERMISSIONS,
+  ...USUARIOS_EDIT_PERMISSIONS,
+])];
 const USUARIOS_LEGACY_ROUTES_ENABLED = String(process.env.USUARIOS_LEGACY_ROUTES_ENABLED ?? 'false').trim().toLowerCase() === 'true';
 
 const sendLegacyUsuariosRouteDisabled = (res) =>
@@ -655,8 +660,14 @@ const v2GetCapabilities = async () => {
         FROM information_schema.columns
         WHERE table_schema = 'public' AND table_name = 'usuarios'
       `);
+      const clientesColumnsResult = await pool.query(`
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_schema = 'public' AND table_name = 'clientes'
+      `);
 
       const columns = new Set(columnsResult.rows.map((row) => row.column_name));
+      const clientesColumns = new Set(clientesColumnsResult.rows.map((row) => row.column_name));
       const mustChangeFieldCandidates = [
         'must_change_password',
         'debe_cambiar_clave',
@@ -674,6 +685,7 @@ const v2GetCapabilities = async () => {
         hasFotoPerfil: columns.has('foto_perfil'),
         hasFechaCreacion: columns.has('fecha_creacion'),
         mustChangePasswordField,
+        hasClienteEmpresaField: clientesColumns.has('id_empresa_cliente'),
       };
     })().catch((error) => {
       usuariosV2CapabilitiesPromise = null;
@@ -1111,6 +1123,149 @@ const v2ReplaceUserRoles = async (idUsuario, roleIds, queryRunner = pool) => {
   );
 };
 
+const USUARIOS_V2_SORT_SQL = Object.freeze({
+  recientes: 'u.id_usuario DESC',
+  nombre_asc: 'LOWER(COALESCE(NULLIF(TRIM(CONCAT(COALESCE(pe.nombre, \'\'), \' \', COALESCE(pe.apellido, \'\'))), \'\'), NULLIF(TRIM(CONCAT(COALESCE(pc.nombre, \'\'), \' \', COALESCE(pc.apellido, \'\'))), \'\'), NULLIF(TRIM(COALESCE(ec.nombre_empresa, \'\')), \'\'), NULLIF(TRIM(COALESCE(u.nombre_usuario, \'\')), \'\'))) ASC, u.id_usuario DESC',
+  nombre_desc: 'LOWER(COALESCE(NULLIF(TRIM(CONCAT(COALESCE(pe.nombre, \'\'), \' \', COALESCE(pe.apellido, \'\'))), \'\'), NULLIF(TRIM(CONCAT(COALESCE(pc.nombre, \'\'), \' \', COALESCE(pc.apellido, \'\'))), \'\'), NULLIF(TRIM(COALESCE(ec.nombre_empresa, \'\')), \'\'), NULLIF(TRIM(COALESCE(u.nombre_usuario, \'\')), \'\'))) DESC, u.id_usuario DESC',
+});
+
+const v2NormalizeUsuariosSort = (value) => {
+  const normalized = v2NormalizeText(value).toLowerCase();
+  if (!normalized) return 'recientes';
+  return Object.prototype.hasOwnProperty.call(USUARIOS_V2_SORT_SQL, normalized)
+    ? normalized
+    : 'recientes';
+};
+
+const v2BuildCatalogResponse = (rows, { page, limit } = {}) => {
+  const safeRows = Array.isArray(rows) ? rows : [];
+  const total = Number(safeRows?.[0]?.__total__) || 0;
+  const items = safeRows.map(({ __total__, ...row }) => row);
+  const safeLimit = Number(limit) || items.length || 1;
+  const safePage = Number(page) || 1;
+  return {
+    error: false,
+    items,
+    total,
+    page: safePage,
+    limit: safeLimit,
+    totalPages: Math.max(1, Math.ceil(total / safeLimit)),
+  };
+};
+
+const v2FindEmployeeCatalogRows = async ({ q = '', page = 1, limit = 20, queryRunner = pool } = {}) => {
+  const params = [];
+  const filters = [];
+  const normalizedSearch = v2NormalizeText(q);
+
+  if (normalizedSearch) {
+    params.push(`%${normalizedSearch}%`);
+    filters.push(`(
+      COALESCE(p.nombre, '') ILIKE $${params.length}
+      OR COALESCE(p.apellido, '') ILIKE $${params.length}
+      OR COALESCE(p.dni::text, '') ILIKE $${params.length}
+      OR COALESCE(t.telefono, '') ILIKE $${params.length}
+      OR COALESCE(c.direccion_correo, '') ILIKE $${params.length}
+      OR COALESCE(s.nombre_sucursal, '') ILIKE $${params.length}
+      OR TRIM(CONCAT(COALESCE(p.nombre, ''), ' ', COALESCE(p.apellido, ''))) ILIKE $${params.length}
+    )`);
+  }
+
+  const whereSql = filters.length ? `WHERE ${filters.join(' AND ')}` : '';
+  const offset = (page - 1) * limit;
+  const rows = await queryRunner.query(
+    `
+      SELECT
+        e.id_empleado AS id,
+        p.nombre,
+        p.apellido,
+        TRIM(CONCAT(COALESCE(p.nombre, ''), ' ', COALESCE(p.apellido, ''))) AS nombre_completo,
+        p.dni,
+        t.telefono,
+        c.direccion_correo AS correo,
+        s.nombre_sucursal AS sucursal_nombre,
+        EXISTS(
+          SELECT 1
+          FROM usuarios u_link
+          WHERE u_link.id_empleado = e.id_empleado
+        ) AS has_usuario,
+        COUNT(*) OVER()::INT AS __total__
+      FROM empleados e
+      LEFT JOIN personas p ON p.id_persona = e.id_persona
+      LEFT JOIN telefonos t ON t.id_telefono = p.id_telefono
+      LEFT JOIN correos c ON c.id_correo = p.id_correo
+      LEFT JOIN sucursales s ON s.id_sucursal = e.id_sucursal
+      ${whereSql}
+      ORDER BY has_usuario ASC, LOWER(TRIM(CONCAT(COALESCE(p.nombre, ''), ' ', COALESCE(p.apellido, '')))) ASC, e.id_empleado DESC
+      LIMIT $${params.length + 1}
+      OFFSET $${params.length + 2}
+    `,
+    [...params, limit, offset]
+  );
+
+  return rows.rows;
+};
+
+const v2FindClienteCatalogRows = async ({ q = '', page = 1, limit = 20, queryRunner = pool } = {}) => {
+  const capabilities = await v2GetCapabilities();
+  const params = [];
+  const filters = [];
+  const normalizedSearch = v2NormalizeText(q);
+  const empresaJoinExpr = capabilities.hasClienteEmpresaField
+    ? 'COALESCE(cl.id_empresa_cliente, cl.id_empresa)'
+    : 'cl.id_empresa';
+
+  if (normalizedSearch) {
+    params.push(`%${normalizedSearch}%`);
+    filters.push(`(
+      COALESCE(p.nombre, '') ILIKE $${params.length}
+      OR COALESCE(p.apellido, '') ILIKE $${params.length}
+      OR COALESCE(p.dni::text, '') ILIKE $${params.length}
+      OR COALESCE(t.telefono, '') ILIKE $${params.length}
+      OR COALESCE(cor.direccion_correo, '') ILIKE $${params.length}
+      OR COALESCE(emp.nombre_empresa, '') ILIKE $${params.length}
+      OR COALESCE(TRIM(CONCAT(COALESCE(p.nombre, ''), ' ', COALESCE(p.apellido, ''))), '') ILIKE $${params.length}
+    )`);
+  }
+
+  const whereSql = filters.length ? `WHERE ${filters.join(' AND ')}` : '';
+  const offset = (page - 1) * limit;
+  const rows = await queryRunner.query(
+    `
+      SELECT
+        cl.id_cliente AS id,
+        p.nombre,
+        p.apellido,
+        COALESCE(
+          NULLIF(TRIM(CONCAT(COALESCE(p.nombre, ''), ' ', COALESCE(p.apellido, ''))), ''),
+          NULLIF(TRIM(COALESCE(emp.nombre_empresa, '')), '')
+        ) AS nombre_completo,
+        p.dni,
+        t.telefono,
+        cor.direccion_correo AS correo,
+        emp.nombre_empresa,
+        EXISTS(
+          SELECT 1
+          FROM usuarios u_link
+          WHERE u_link.id_cliente = cl.id_cliente
+        ) AS has_usuario,
+        COUNT(*) OVER()::INT AS __total__
+      FROM clientes cl
+      LEFT JOIN personas p ON p.id_persona = cl.id_persona
+      LEFT JOIN empresas emp ON emp.id_empresa = ${empresaJoinExpr}
+      LEFT JOIN telefonos t ON t.id_telefono = COALESCE(p.id_telefono, emp.id_telefono)
+      LEFT JOIN correos cor ON cor.id_correo = COALESCE(p.id_correo, emp.id_correo)
+      ${whereSql}
+      ORDER BY has_usuario ASC, LOWER(COALESCE(NULLIF(TRIM(CONCAT(COALESCE(p.nombre, ''), ' ', COALESCE(p.apellido, ''))), ''), NULLIF(TRIM(COALESCE(emp.nombre_empresa, '')), ''))) ASC, cl.id_cliente DESC
+      LIMIT $${params.length + 1}
+      OFFSET $${params.length + 2}
+    `,
+    [...params, limit, offset]
+  );
+
+  return rows.rows;
+};
+
 router.get('/usuarios/v2/roles', checkPermission(USUARIOS_ROLES_CATALOG_PERMISSIONS), async (_req, res) => {
   try {
     const result = await pool.query(
@@ -1119,6 +1274,42 @@ router.get('/usuarios/v2/roles', checkPermission(USUARIOS_ROLES_CATALOG_PERMISSI
     return res.status(200).json(result.rows);
   } catch (err) {
     console.error('Error en /usuarios/v2/roles:', err.message);
+    return res.status(500).json({ error: true, message: 'Error interno del servidor' });
+  }
+});
+
+router.get('/usuarios/v2/catalogos/empleados', checkPermission(USUARIOS_MODAL_CATALOG_PERMISSIONS), async (req, res) => {
+  try {
+    const page = req.query.page === undefined ? 1 : v2ParsePositiveInt(req.query.page);
+    const requestedLimit = req.query.limit === undefined ? 20 : v2ParsePositiveInt(req.query.limit);
+    if (!page || !requestedLimit) {
+      return res.status(400).json({ error: true, message: 'page y limit deben ser enteros positivos' });
+    }
+
+    const limit = Math.min(requestedLimit, 50);
+    const q = v2NormalizeText(req.query.q ?? req.query.search ?? req.query.nombre);
+    const rows = await v2FindEmployeeCatalogRows({ q, page, limit });
+    return res.status(200).json(v2BuildCatalogResponse(rows, { page, limit }));
+  } catch (err) {
+    console.error('Error en /usuarios/v2/catalogos/empleados:', err.message);
+    return res.status(500).json({ error: true, message: 'Error interno del servidor' });
+  }
+});
+
+router.get('/usuarios/v2/catalogos/clientes', checkPermission(USUARIOS_MODAL_CATALOG_PERMISSIONS), async (req, res) => {
+  try {
+    const page = req.query.page === undefined ? 1 : v2ParsePositiveInt(req.query.page);
+    const requestedLimit = req.query.limit === undefined ? 20 : v2ParsePositiveInt(req.query.limit);
+    if (!page || !requestedLimit) {
+      return res.status(400).json({ error: true, message: 'page y limit deben ser enteros positivos' });
+    }
+
+    const limit = Math.min(requestedLimit, 50);
+    const q = v2NormalizeText(req.query.q ?? req.query.search ?? req.query.nombre);
+    const rows = await v2FindClienteCatalogRows({ q, page, limit });
+    return res.status(200).json(v2BuildCatalogResponse(rows, { page, limit }));
+  } catch (err) {
+    console.error('Error en /usuarios/v2/catalogos/clientes:', err.message);
     return res.status(500).json({ error: true, message: 'Error interno del servidor' });
   }
 });
@@ -1135,6 +1326,7 @@ router.get('/usuarios/v2/list', checkPermission(USUARIOS_LIST_PERMISSIONS), asyn
     const limit = Math.min(requestedLimit, USUARIOS_V2_MAX_LIMIT);
     const offset = (page - 1) * limit;
     const q = v2NormalizeText(req.query.q ?? req.query.search ?? req.query.nombre);
+    const sort = v2NormalizeUsuariosSort(req.query.sort);
     const estado = req.query.estado === undefined ? null : v2ParseBoolean(req.query.estado);
     if (req.query.estado !== undefined && estado === null) {
       return res.status(400).json({ error: true, message: 'estado debe ser booleano' });
@@ -1168,6 +1360,7 @@ router.get('/usuarios/v2/list', checkPermission(USUARIOS_LIST_PERMISSIONS), asyn
     }
 
     const whereSql = whereParts.length ? `WHERE ${whereParts.join(' AND ')}` : '';
+    const orderBySql = USUARIOS_V2_SORT_SQL[sort] || USUARIOS_V2_SORT_SQL.recientes;
 
     const countQuery = `
       SELECT COUNT(*)::int AS total
@@ -1256,13 +1449,23 @@ router.get('/usuarios/v2/list', checkPermission(USUARIOS_LIST_PERMISSIONS), asyn
       OFFSET $${params.length + 2}
     `;
 
-    const [countResult, dataResult] = await Promise.all([
+    const summaryQuery = `
+      SELECT
+        COUNT(*)::int AS total_usuarios,
+        COUNT(*) FILTER (WHERE u.estado = TRUE)::int AS usuarios_activos,
+        COUNT(*) FILTER (WHERE u.estado = FALSE)::int AS usuarios_inactivos
+      FROM usuarios u
+    `;
+
+    const [countResult, dataResult, summaryResult] = await Promise.all([
       pool.query(countQuery, params),
-      pool.query(dataQuery, [...params, limit, offset]),
+      pool.query(dataQuery.replace('ORDER BY u.id_usuario DESC', `ORDER BY ${orderBySql}`), [...params, limit, offset]),
+      pool.query(summaryQuery),
     ]);
 
     const total = countResult.rows?.[0]?.total || 0;
     const items = dataResult.rows.map(v2MapUsuarioRow);
+    const summaryRow = summaryResult.rows?.[0] || {};
 
     return res.status(200).json({
       error: false,
@@ -1270,6 +1473,17 @@ router.get('/usuarios/v2/list', checkPermission(USUARIOS_LIST_PERMISSIONS), asyn
       total,
       page,
       limit,
+      totalPages: Math.max(1, Math.ceil(total / limit)),
+      summary: {
+        total: Number(summaryRow.total_usuarios) || 0,
+        activas: Number(summaryRow.usuarios_activos) || 0,
+        inactivas: Number(summaryRow.usuarios_inactivos) || 0,
+      },
+      appliedFilters: {
+        q,
+        estado,
+        sort,
+      },
     });
   } catch (err) {
     console.error('Error en /usuarios/v2/list:', err.message);
