@@ -1153,6 +1153,23 @@ const v2BuildCatalogResponse = (rows, { page, limit } = {}) => {
   };
 };
 
+const v2NormalizeSuggestionRows = (rows) =>
+  (Array.isArray(rows) ? rows : [])
+    .map((row, index) => {
+      const label = v2NormalizeText(row?.label || row?.nombre_completo || row?.nombre_usuario);
+      const value = v2NormalizeText(row?.value || label);
+      if (!label || !value) return null;
+      return {
+        id: row?.id ?? row?.id_usuario ?? `usr-suggestion-${index}`,
+        id_usuario: row?.id_usuario ?? null,
+        label,
+        value,
+        type: v2NormalizeText(row?.type || 'usuario') || 'usuario',
+        detail: v2NormalizeText(row?.detail || ''),
+      };
+    })
+    .filter(Boolean);
+
 const v2FindEmployeeCatalogRows = async ({ q = '', page = 1, limit = 20, queryRunner = pool } = {}) => {
   const params = [];
   const filters = [];
@@ -1314,6 +1331,99 @@ router.get('/usuarios/v2/catalogos/clientes', checkPermission(USUARIOS_MODAL_CAT
   }
 });
 
+router.get('/usuarios/v2/suggestions', checkPermission(USUARIOS_LIST_PERMISSIONS), async (req, res) => {
+  try {
+    const q = v2NormalizeText(req.query.q ?? req.query.search ?? req.query.nombre);
+    if (!q || q.length < 2) {
+      return res.status(200).json({ error: false, items: [] });
+    }
+
+    const rowsResult = await pool.query(
+      `
+        SELECT *
+        FROM (
+          SELECT
+            u.id_usuario,
+            COALESCE(
+              NULLIF(TRIM(CONCAT(COALESCE(pe.nombre, ''), ' ', COALESCE(pe.apellido, ''))), ''),
+              NULLIF(TRIM(CONCAT(COALESCE(pc.nombre, ''), ' ', COALESCE(pc.apellido, ''))), ''),
+              NULLIF(TRIM(COALESCE(ec.nombre_empresa, '')), ''),
+              NULLIF(TRIM(COALESCE(u.nombre_usuario, '')), '')
+            ) AS label,
+            COALESCE(
+              NULLIF(TRIM(CONCAT(COALESCE(pe.nombre, ''), ' ', COALESCE(pe.apellido, ''))), ''),
+              NULLIF(TRIM(CONCAT(COALESCE(pc.nombre, ''), ' ', COALESCE(pc.apellido, ''))), ''),
+              NULLIF(TRIM(COALESCE(ec.nombre_empresa, '')), ''),
+              NULLIF(TRIM(COALESCE(u.nombre_usuario, '')), '')
+            ) AS value,
+            'usuario'::text AS type,
+            CONCAT_WS(
+              ' | ',
+              NULLIF(CONCAT('DNI: ', COALESCE(pe.dni::text, pc.dni::text, '')), 'DNI: '),
+              NULLIF(COALESCE(ce.direccion_correo, cc.direccion_correo, ''), ''),
+              NULLIF(CONCAT('Usuario: ', COALESCE(u.nombre_usuario, '')), 'Usuario: '),
+              NULLIF(roles_info.roles_nombres, '')
+            ) AS detail,
+            ROW_NUMBER() OVER (
+              PARTITION BY LOWER(
+                COALESCE(
+                  NULLIF(TRIM(CONCAT(COALESCE(pe.nombre, ''), ' ', COALESCE(pe.apellido, ''))), ''),
+                  NULLIF(TRIM(CONCAT(COALESCE(pc.nombre, ''), ' ', COALESCE(pc.apellido, ''))), ''),
+                  NULLIF(TRIM(COALESCE(ec.nombre_empresa, '')), ''),
+                  NULLIF(TRIM(COALESCE(u.nombre_usuario, '')), '')
+                )
+              )
+              ORDER BY u.id_usuario DESC
+            ) AS dedupe_rank
+          FROM usuarios u
+          LEFT JOIN empleados e ON e.id_empleado = u.id_empleado
+          LEFT JOIN personas pe ON pe.id_persona = e.id_persona
+          LEFT JOIN telefonos te ON te.id_telefono = pe.id_telefono
+          LEFT JOIN correos ce ON ce.id_correo = pe.id_correo
+          LEFT JOIN clientes cl ON cl.id_cliente = u.id_cliente
+          LEFT JOIN personas pc ON pc.id_persona = cl.id_persona
+          LEFT JOIN empresas ec ON ec.id_empresa = cl.id_empresa
+          LEFT JOIN telefonos tc ON tc.id_telefono = pc.id_telefono
+          LEFT JOIN correos cc ON cc.id_correo = pc.id_correo
+          LEFT JOIN LATERAL (
+            SELECT STRING_AGG(r2.nombre, ', ' ORDER BY r2.id_rol ASC) AS roles_nombres
+            FROM roles_usuarios ru2
+            INNER JOIN roles r2 ON r2.id_rol = ru2.id_rol
+            WHERE ru2.id_usuario = u.id_usuario
+          ) roles_info ON TRUE
+          WHERE (
+            u.nombre_usuario ILIKE $1
+            OR COALESCE(pe.nombre, '') ILIKE $1
+            OR COALESCE(pe.apellido, '') ILIKE $1
+            OR COALESCE(pe.dni::text, '') ILIKE $1
+            OR COALESCE(te.telefono, '') ILIKE $1
+            OR COALESCE(ce.direccion_correo, '') ILIKE $1
+            OR COALESCE(pc.nombre, '') ILIKE $1
+            OR COALESCE(pc.apellido, '') ILIKE $1
+            OR COALESCE(pc.dni::text, '') ILIKE $1
+            OR COALESCE(tc.telefono, '') ILIKE $1
+            OR COALESCE(cc.direccion_correo, '') ILIKE $1
+            OR COALESCE(ec.nombre_empresa, '') ILIKE $1
+            OR COALESCE(roles_info.roles_nombres, '') ILIKE $1
+          )
+        ) suggestions
+        WHERE suggestions.dedupe_rank = 1
+        ORDER BY LOWER(suggestions.label) ASC, suggestions.id_usuario DESC
+        LIMIT 10
+      `,
+      [`%${q}%`]
+    );
+
+    return res.status(200).json({
+      error: false,
+      items: v2NormalizeSuggestionRows(rowsResult.rows),
+    });
+  } catch (err) {
+    console.error('Error en /usuarios/v2/suggestions:', err.message);
+    return res.status(500).json({ error: true, message: 'Error interno del servidor' });
+  }
+});
+
 router.get('/usuarios/v2/list', checkPermission(USUARIOS_LIST_PERMISSIONS), async (req, res) => {
   try {
     const page = req.query.page === undefined ? 1 : v2ParsePositiveInt(req.query.page);
@@ -1334,9 +1444,15 @@ router.get('/usuarios/v2/list', checkPermission(USUARIOS_LIST_PERMISSIONS), asyn
 
     const params = [];
     const whereParts = [];
+    const countJoins = new Set();
+    let countNeedsRoleSearch = false;
 
     if (q) {
       params.push(`%${q}%`);
+      countJoins.add('empleados');
+      countJoins.add('clientes');
+      countJoins.add('sucursales');
+      countNeedsRoleSearch = true;
       whereParts.push(`(
         u.nombre_usuario ILIKE $${params.length}
         OR COALESCE(pe.nombre, '') ILIKE $${params.length}
@@ -1351,7 +1467,13 @@ router.get('/usuarios/v2/list', checkPermission(USUARIOS_LIST_PERMISSIONS), asyn
         OR COALESCE(cc.direccion_correo, '') ILIKE $${params.length}
         OR COALESCE(ec.nombre_empresa, '') ILIKE $${params.length}
         OR COALESCE(s.nombre_sucursal, '') ILIKE $${params.length}
-        OR COALESCE(roles_info.roles_nombres, '') ILIKE $${params.length}
+        OR EXISTS (
+          SELECT 1
+          FROM roles_usuarios ru_search
+          INNER JOIN roles r_search ON r_search.id_rol = ru_search.id_rol
+          WHERE ru_search.id_usuario = u.id_usuario
+            AND COALESCE(r_search.nombre, '') ILIKE $${params.length}
+        )
       )`);
     }
     if (estado !== null) {
@@ -1361,26 +1483,33 @@ router.get('/usuarios/v2/list', checkPermission(USUARIOS_LIST_PERMISSIONS), asyn
 
     const whereSql = whereParts.length ? `WHERE ${whereParts.join(' AND ')}` : '';
     const orderBySql = USUARIOS_V2_SORT_SQL[sort] || USUARIOS_V2_SORT_SQL.recientes;
+    const countJoinSqlParts = [];
+
+    if (countJoins.has('empleados')) {
+      countJoinSqlParts.push('LEFT JOIN empleados e ON e.id_empleado = u.id_empleado');
+      countJoinSqlParts.push('LEFT JOIN personas pe ON pe.id_persona = e.id_persona');
+      countJoinSqlParts.push('LEFT JOIN telefonos te ON te.id_telefono = pe.id_telefono');
+      countJoinSqlParts.push('LEFT JOIN correos ce ON ce.id_correo = pe.id_correo');
+    }
+    if (countJoins.has('clientes')) {
+      countJoinSqlParts.push('LEFT JOIN clientes cl ON cl.id_cliente = u.id_cliente');
+      countJoinSqlParts.push('LEFT JOIN personas pc ON pc.id_persona = cl.id_persona');
+      countJoinSqlParts.push('LEFT JOIN empresas ec ON ec.id_empresa = cl.id_empresa');
+      countJoinSqlParts.push('LEFT JOIN telefonos tc ON tc.id_telefono = pc.id_telefono');
+      countJoinSqlParts.push('LEFT JOIN correos cc ON cc.id_correo = pc.id_correo');
+    }
+    if (countJoins.has('sucursales')) {
+      countJoinSqlParts.push('LEFT JOIN sucursales s ON s.id_sucursal = e.id_sucursal');
+    }
+    if (countNeedsRoleSearch) {
+      // no lateral join needed in count query; role search is handled via EXISTS in WHERE.
+    }
+    const countJoinSql = countJoinSqlParts.length ? `\n      ${countJoinSqlParts.join('\n      ')}` : '';
 
     const countQuery = `
       SELECT COUNT(*)::int AS total
       FROM usuarios u
-      LEFT JOIN empleados e ON e.id_empleado = u.id_empleado
-      LEFT JOIN personas pe ON pe.id_persona = e.id_persona
-      LEFT JOIN telefonos te ON te.id_telefono = pe.id_telefono
-      LEFT JOIN correos ce ON ce.id_correo = pe.id_correo
-      LEFT JOIN clientes cl ON cl.id_cliente = u.id_cliente
-      LEFT JOIN personas pc ON pc.id_persona = cl.id_persona
-      LEFT JOIN empresas ec ON ec.id_empresa = cl.id_empresa
-      LEFT JOIN telefonos tc ON tc.id_telefono = pc.id_telefono
-      LEFT JOIN correos cc ON cc.id_correo = pc.id_correo
-      LEFT JOIN sucursales s ON s.id_sucursal = e.id_sucursal
-      LEFT JOIN LATERAL (
-        SELECT STRING_AGG(r2.nombre, ', ' ORDER BY r2.id_rol ASC) AS roles_nombres
-        FROM roles_usuarios ru2
-        INNER JOIN roles r2 ON r2.id_rol = ru2.id_rol
-        WHERE ru2.id_usuario = u.id_usuario
-      ) roles_info ON TRUE
+      ${countJoinSql}
       ${whereSql}
     `;
 
