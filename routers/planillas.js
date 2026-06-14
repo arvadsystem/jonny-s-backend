@@ -1,4 +1,5 @@
 import express from 'express';
+import PDFDocument from 'pdfkit';
 import pool from '../config/db-connection.js';
 import { checkPermission, requestHasAnyPermission } from '../middleware/checkPermission.js';
 import {
@@ -192,6 +193,20 @@ const DETALLE_QUERY_ALLOWED_FIELDS = new Set([
 ]);
 const RESUMEN_QUERY_ALLOWED_FIELDS = new Set(['id_sucursal', 'tipo_periodo', 'quincena', '_ts']);
 const COMPLETA_QUERY_ALLOWED_FIELDS = new Set(['id_sucursal', 'tipo_periodo', 'quincena', '_ts']);
+const EXPORT_PDF_QUERY_ALLOWED_FIELDS = new Set([
+  'id_sucursal',
+  'tipo_periodo',
+  'quincena',
+  'includeDetalle',
+  'includeMovimientos',
+  'includeCorreo',
+  'search',
+  'q',
+  'cargo',
+  'salario_min',
+  'salario_max',
+  '_ts'
+]);
 const HORAS_EXTRA_QUERY_ALLOWED_FIELDS = new Set([
   'page',
   'limit',
@@ -2458,6 +2473,293 @@ const formatMoneyForMessage = (value = 0) => {
   return `L ${safe.toLocaleString('es-HN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 };
 
+const parseBooleanQueryParam = (value, fallback = false) => {
+  if (value === undefined || value === null || value === '') return fallback;
+  const normalized = String(value).trim().toLowerCase();
+  if (['1', 'true', 'si', 'sí', 'yes', 'on'].includes(normalized)) return true;
+  if (['0', 'false', 'no', 'off'].includes(normalized)) return false;
+  return fallback;
+};
+
+const normalizePdfText = (value, fallback = '-') => {
+  const text = String(value ?? '').trim();
+  return text || fallback;
+};
+
+const formatMoneyForPdf = (value = 0) => {
+  const safe = Number(value ?? 0);
+  const normalized = Number.isFinite(safe) ? safe : 0;
+  return `L ${normalized.toLocaleString('es-HN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+};
+
+const formatDateForPdf = (value) => {
+  if (!value) return '-';
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return normalizePdfText(value, '-');
+  return new Intl.DateTimeFormat('es-HN', { dateStyle: 'medium' }).format(date);
+};
+
+const buildPlanillaPdfFileName = ({ idPlanilla, periodo, tipoPeriodo, quincena }) => {
+  const normalizedPeriodo =
+    String(periodo || 'sin-periodo')
+      .trim()
+      .replace(/[^A-Za-z0-9_-]+/g, '-')
+      .replace(/-+/g, '-')
+      .replace(/^-|-$/g, '') || 'sin-periodo';
+  const parts = [`planilla-PLA-${idPlanilla}`, normalizedPeriodo];
+  if (normalizeTipoPeriodoStrict(tipoPeriodo) === TIPO_PERIODO.QUINCENAL) {
+    parts.push(`Q${normalizeQuincena(quincena) || 1}`);
+  }
+  return `${parts.join('-')}.pdf`;
+};
+
+const buildExportResumenFromDetalleRows = (rows = []) =>
+  (Array.isArray(rows) ? rows : []).reduce(
+    (acc, row) => {
+      acc.total_salario_base += roundTo(Number(row?.salario_base ?? 0));
+      acc.total_bonos += roundTo(Number(row?.total_bonos ?? row?.bonos ?? 0));
+      acc.total_deducciones += roundTo(Number(row?.total_deducciones ?? row?.deducciones ?? 0));
+      acc.total_adelantos_aplicados += roundTo(
+        Number(row?.total_adelantos_aplicados ?? row?.total_adelantos ?? row?.adelantos ?? 0)
+      );
+      acc.total_neto_pagar += roundTo(Number(row?.neto_pagar ?? row?.total_neto_pagar ?? row?.neto ?? 0));
+      acc.total_empleados += 1;
+      return acc;
+    },
+    {
+      total_salario_base: 0,
+      total_bonos: 0,
+      total_deducciones: 0,
+      total_adelantos_aplicados: 0,
+      total_neto_pagar: 0,
+      total_empleados: 0
+    }
+  );
+
+const collectPdfDocumentBuffer = (doc) =>
+  new Promise((resolve, reject) => {
+    const chunks = [];
+    doc.on('data', (chunk) => chunks.push(chunk));
+    doc.on('end', () => resolve(Buffer.concat(chunks)));
+    doc.on('error', reject);
+    doc.end();
+  });
+
+const renderPlanillaPdf = async ({
+  fileName,
+  planilla,
+  resumen,
+  detalleRows,
+  movimientos,
+  includeDetalle,
+  includeMovimientos,
+  includeCorreo
+}) => {
+  const doc = new PDFDocument({ size: 'A4', layout: 'landscape', margin: 32, bufferPages: true });
+  const pageWidth = doc.page.width - doc.page.margins.left - doc.page.margins.right;
+  const bottomLimit = () => doc.page.height - doc.page.margins.bottom;
+  const left = doc.page.margins.left;
+
+  const addPageIfNeeded = (heightNeeded = 24) => {
+    if (doc.y + heightNeeded <= bottomLimit()) return false;
+    doc.addPage({ size: 'A4', layout: 'landscape', margin: 32 });
+    return true;
+  };
+
+  const writeLabelValue = (label, value) => {
+    doc.font('Helvetica-Bold').text(`${label}: `, { continued: true });
+    doc.font('Helvetica').text(normalizePdfText(value));
+  };
+
+  const drawSimpleTable = ({ title, columns, rows }) => {
+    if (!Array.isArray(rows) || rows.length === 0) return;
+
+    addPageIfNeeded(54);
+    doc.moveDown(0.5);
+    doc.font('Helvetica-Bold').fontSize(12).fillColor('#1f2937').text(title);
+    doc.moveDown(0.3);
+
+    const totalRatio = columns.reduce((sum, column) => sum + (column.width || 1), 0);
+    const widths = columns.map((column) => (pageWidth * (column.width || 1)) / totalRatio);
+    const rowPaddingX = 4;
+    const rowPaddingY = 4;
+    const lineColor = '#d1d5db';
+    const headerBg = '#f3f4f6';
+
+    const drawHeader = () => {
+      let x = left;
+      const y = doc.y;
+      const rowHeight = 20;
+      columns.forEach((column, index) => {
+        const width = widths[index];
+        doc.rect(x, y, width, rowHeight).fillAndStroke(headerBg, lineColor);
+        doc
+          .fillColor('#111827')
+          .font('Helvetica-Bold')
+          .fontSize(8)
+          .text(column.label, x + rowPaddingX, y + 6, {
+            width: width - rowPaddingX * 2,
+            align: column.align || 'left'
+          });
+        x += width;
+      });
+      doc.y = y + rowHeight + 2;
+    };
+
+    drawHeader();
+
+    rows.forEach((cells) => {
+      doc.font('Helvetica').fontSize(8);
+      const heights = cells.map((cell, index) =>
+        doc.heightOfString(normalizePdfText(cell), {
+          width: widths[index] - rowPaddingX * 2,
+          align: columns[index].align || 'left'
+        })
+      );
+      const rowHeight = Math.max(18, ...heights.map((value) => value + rowPaddingY * 2));
+      if (addPageIfNeeded(rowHeight + 4)) {
+        drawHeader();
+      }
+
+      const y = doc.y;
+      let x = left;
+      cells.forEach((cell, index) => {
+        const width = widths[index];
+        doc.rect(x, y, width, rowHeight).stroke(lineColor);
+        doc
+          .fillColor('#1f2937')
+          .font(index === 0 ? 'Helvetica-Bold' : 'Helvetica')
+          .text(normalizePdfText(cell), x + rowPaddingX, y + rowPaddingY, {
+            width: width - rowPaddingX * 2,
+            align: columns[index].align || 'left'
+          });
+        x += width;
+      });
+      doc.y = y + rowHeight;
+    });
+  };
+
+  doc.info.Title = fileName;
+  doc.info.Author = 'Jonny SmartOrder';
+  doc.font('Helvetica-Bold').fontSize(18).fillColor('#111827').text(`Planilla ${normalizePdfText(planilla.codigo)}`);
+  doc.moveDown(0.2);
+  doc.font('Helvetica').fontSize(10).fillColor('#4b5563').text(`Archivo: ${fileName}`);
+  doc.moveDown(0.5);
+  doc.fontSize(10).fillColor('#111827');
+  writeLabelValue('Sucursal', planilla.sucursal);
+  writeLabelValue('Periodo', planilla.periodo);
+  writeLabelValue('Tipo de período', planilla.tipo_periodo === TIPO_PERIODO.QUINCENAL ? 'Quincenal' : 'Mensual');
+  if (planilla.tipo_periodo === TIPO_PERIODO.QUINCENAL) {
+    writeLabelValue('Quincena', `Q${normalizeQuincena(planilla.quincena) || 1}`);
+  }
+  writeLabelValue('Estado', planilla.estado);
+  writeLabelValue('Fecha de generación', formatDateForPdf(new Date()));
+  doc.moveDown(0.8);
+
+  const summaryColumns = [
+    { label: 'Total salario base', value: formatMoneyForPdf(resumen.total_salario_base) },
+    { label: 'Total bonos', value: formatMoneyForPdf(resumen.total_bonos) },
+    { label: 'Total deducciones', value: formatMoneyForPdf(resumen.total_deducciones) },
+    { label: 'Adelantos aplicados', value: formatMoneyForPdf(resumen.total_adelantos_aplicados) },
+    { label: 'Neto a pagar', value: formatMoneyForPdf(resumen.total_neto_pagar) }
+  ];
+
+  const cardGap = 10;
+  const cardWidth = (pageWidth - cardGap * (summaryColumns.length - 1)) / summaryColumns.length;
+  const cardHeight = 46;
+  const cardTop = doc.y;
+  summaryColumns.forEach((item, index) => {
+    const x = left + index * (cardWidth + cardGap);
+    doc.roundedRect(x, cardTop, cardWidth, cardHeight, 8).fillAndStroke('#f9fafb', '#d1d5db');
+    doc.fillColor('#4b5563').font('Helvetica').fontSize(8).text(item.label, x + 8, cardTop + 8, { width: cardWidth - 16 });
+    doc.fillColor('#111827').font('Helvetica-Bold').fontSize(12).text(item.value, x + 8, cardTop + 22, {
+      width: cardWidth - 16
+    });
+  });
+  doc.y = cardTop + cardHeight + 8;
+  doc.font('Helvetica').fontSize(9).fillColor('#4b5563').text(`Empleados visibles: ${resumen.total_empleados || 0}`);
+
+  if (includeDetalle) {
+    drawSimpleTable({
+      title: 'Detalle de empleados',
+      columns: includeCorreo
+        ? [
+            { label: 'Empleado', width: 2.4 },
+            { label: 'Cargo', width: 1.5 },
+            { label: 'DNI', width: 1.3 },
+            { label: 'Correo', width: 2.1 },
+            { label: 'Sueldo', width: 1, align: 'right' },
+            { label: 'Bonos', width: 1, align: 'right' },
+            { label: 'Deducciones', width: 1.1, align: 'right' },
+            { label: 'Adelantos', width: 1.1, align: 'right' },
+            { label: 'H.E.', width: 0.8, align: 'right' },
+            { label: 'Neto', width: 1, align: 'right' }
+          ]
+        : [
+            { label: 'Empleado', width: 2.7 },
+            { label: 'Cargo', width: 1.7 },
+            { label: 'DNI', width: 1.5 },
+            { label: 'Sueldo', width: 1, align: 'right' },
+            { label: 'Bonos', width: 1, align: 'right' },
+            { label: 'Deducciones', width: 1.1, align: 'right' },
+            { label: 'Adelantos', width: 1.1, align: 'right' },
+            { label: 'H.E.', width: 0.8, align: 'right' },
+            { label: 'Neto', width: 1, align: 'right' }
+          ],
+      rows: (detalleRows || []).map((row) =>
+        includeCorreo
+          ? [
+              normalizePdfText(row?.nombre_empleado || `${row?.nombre || ''} ${row?.apellido || ''}`.trim(), 'Empleado'),
+              normalizePdfText(row?.cargo, 'Sin cargo'),
+              normalizePdfText(row?.dni, '-'),
+              normalizePdfText(row?.correo, 'Sin correo'),
+              formatMoneyForPdf(row?.salario_base),
+              formatMoneyForPdf(row?.total_bonos ?? row?.bonos),
+              formatMoneyForPdf(row?.total_deducciones ?? row?.deducciones),
+              formatMoneyForPdf(row?.total_adelantos_aplicados ?? row?.total_adelantos ?? row?.adelantos),
+              normalizePdfText(row?.he_tiempo ?? row?.horas_extra_tiempo ?? 0, '0'),
+              formatMoneyForPdf(row?.neto_pagar ?? row?.total_neto_pagar ?? row?.neto)
+            ]
+          : [
+              normalizePdfText(row?.nombre_empleado || `${row?.nombre || ''} ${row?.apellido || ''}`.trim(), 'Empleado'),
+              normalizePdfText(row?.cargo, 'Sin cargo'),
+              normalizePdfText(row?.dni, '-'),
+              formatMoneyForPdf(row?.salario_base),
+              formatMoneyForPdf(row?.total_bonos ?? row?.bonos),
+              formatMoneyForPdf(row?.total_deducciones ?? row?.deducciones),
+              formatMoneyForPdf(row?.total_adelantos_aplicados ?? row?.total_adelantos ?? row?.adelantos),
+              normalizePdfText(row?.he_tiempo ?? row?.horas_extra_tiempo ?? 0, '0'),
+              formatMoneyForPdf(row?.neto_pagar ?? row?.total_neto_pagar ?? row?.neto)
+            ]
+      )
+    });
+  }
+
+  if (includeMovimientos && Array.isArray(movimientos) && movimientos.length > 0) {
+    drawSimpleTable({
+      title: 'Movimientos',
+      columns: [
+        { label: 'Tipo', width: 1.1 },
+        { label: 'Empleado', width: 2.1 },
+        { label: 'Concepto', width: 2.5 },
+        { label: 'Monto', width: 1, align: 'right' },
+        { label: 'Observación', width: 2.6 },
+        { label: 'Fecha', width: 1.2 }
+      ],
+      rows: movimientos.map((row) => [
+        normalizePdfText(row?.tipo_movimiento || row?.tipo, '-'),
+        normalizePdfText(row?.nombre_empleado || row?.nombre_completo, row?.id_empleado ? `Empleado ${row.id_empleado}` : '-'),
+        normalizePdfText(row?.concepto, '-'),
+        row?.es_monetario === false ? normalizePdfText(row?.monto_horas ?? row?.monto, '0') : formatMoneyForPdf(row?.monto),
+        normalizePdfText(row?.observacion, '-'),
+        formatDateForPdf(row?.fecha || row?.fecha_registro)
+      ])
+    });
+  }
+
+  return collectPdfDocumentBuffer(doc);
+};
+
 const resolveNetoDisponibleDetalle = async ({ db = pool, idDetallePlanilla, idPlanilla, idEmpleado }) => {
   if (!idDetallePlanilla || !idPlanilla || !idEmpleado) return null;
 
@@ -3607,6 +3909,129 @@ const planillaService = {
       }
     }
     return { status: 200, body: { error: false, data } };
+  },
+
+  async exportPdf(req, res) {
+    const invalidQuery = validateAllowedQueryFields(req.query, EXPORT_PDF_QUERY_ALLOWED_FIELDS);
+    if (invalidQuery) {
+      return res
+        .status(invalidQuery.status || 400)
+        .json(normalizeServiceErrorBody(invalidQuery.status || 400, invalidQuery.body));
+    }
+
+    const idPlanilla = parsePositiveInt(req.params.id_planilla);
+    if (!idPlanilla) {
+      return res.status(400).json(buildErrorBody({ code: 'VALIDATION_ERROR', message: 'id_planilla invalido.' }));
+    }
+
+    const scopeValidation = await validatePlanillaSucursalScope(idPlanilla, req.query?.id_sucursal);
+    if (!scopeValidation.ok) {
+      return res
+        .status(scopeValidation.status || 400)
+        .json(normalizeServiceErrorBody(scopeValidation.status || 400, scopeValidation.body));
+    }
+
+    const periodoContext = resolvePeriodoContextInput({
+      rawTipoPeriodo: req.query?.tipo_periodo,
+      rawQuincena: req.query?.quincena
+    });
+    if (periodoContext.error) {
+      return res.status(400).json(
+        buildErrorBody({
+          code: 'VALIDATION_ERROR',
+          message: periodoContext.error
+        })
+      );
+    }
+
+    const search = sanitizeText(req.query.search ?? req.query.q, 120);
+    const cargo = sanitizeText(req.query.cargo, 120);
+    const salarioMin =
+      req.query.salario_min === undefined || req.query.salario_min === null || req.query.salario_min === ''
+        ? null
+        : Number(req.query.salario_min);
+    const salarioMax =
+      req.query.salario_max === undefined || req.query.salario_max === null || req.query.salario_max === ''
+        ? null
+        : Number(req.query.salario_max);
+
+    if (salarioMin !== null && (!Number.isFinite(salarioMin) || salarioMin < 0)) {
+      return res.status(400).json(buildErrorBody({ code: 'VALIDATION_ERROR', message: 'salario_min invalido.' }));
+    }
+    if (salarioMax !== null && (!Number.isFinite(salarioMax) || salarioMax < 0)) {
+      return res.status(400).json(buildErrorBody({ code: 'VALIDATION_ERROR', message: 'salario_max invalido.' }));
+    }
+
+    const includeDetalle = parseBooleanQueryParam(req.query.includeDetalle, true);
+    const includeMovimientos = parseBooleanQueryParam(req.query.includeMovimientos, false);
+    const includeCorreo = parseBooleanQueryParam(req.query.includeCorreo, true);
+
+    const [scope, detalleRows, movimientos] = await Promise.all([
+      resolvePlanillaScope(idPlanilla),
+      buildDetallePlanillaDataset({
+        idPlanilla,
+        tipoPeriodo: periodoContext.tipo_periodo,
+        quincena: periodoContext.quincena,
+        search,
+        cargo,
+        salarioMin,
+        salarioMax,
+        sortBy: 'nombre',
+        sortDir: 'asc'
+      }),
+      includeMovimientos
+        ? buildMovimientosDataset({
+            idPlanilla,
+            tipoPeriodo: periodoContext.tipo_periodo,
+            quincena: periodoContext.quincena
+          })
+        : Promise.resolve([])
+    ]);
+
+    if (!scope) {
+      return res.status(404).json(buildErrorBody({ code: 'NOT_FOUND', message: 'La planilla indicada no existe.' }));
+    }
+
+    if (!Array.isArray(detalleRows) || detalleRows.length === 0) {
+      return res.status(404).json(
+        buildErrorBody({
+          code: 'NOT_FOUND',
+          message: 'No hay datos en detalle para exportar con los filtros actuales.'
+        })
+      );
+    }
+
+    const resumen = buildExportResumenFromDetalleRows(detalleRows);
+    const firstRow = detalleRows[0] || {};
+    const planilla = {
+      id_planilla: idPlanilla,
+      codigo: `PLA-${idPlanilla}`,
+      sucursal: normalizePdfText(firstRow?.sucursal || firstRow?.nombre_sucursal, `Sucursal ${scope.id_sucursal}`),
+      periodo: normalizePdfText(scope.periodo, 'Sin periodo'),
+      tipo_periodo: periodoContext.tipo_periodo,
+      quincena: periodoContext.quincena,
+      estado: normalizePdfText(firstRow?.estado_planilla || firstRow?.estado || firstRow?.descripcion_estado, 'Sin estado')
+    };
+    const fileName = buildPlanillaPdfFileName({
+      idPlanilla,
+      periodo: scope.periodo,
+      tipoPeriodo: periodoContext.tipo_periodo,
+      quincena: periodoContext.quincena
+    });
+    const pdfBuffer = await renderPlanillaPdf({
+      fileName,
+      planilla,
+      resumen,
+      detalleRows,
+      movimientos,
+      includeDetalle,
+      includeMovimientos,
+      includeCorreo
+    });
+
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
+    return res.status(200).send(pdfBuffer);
   },
 
   async listarHorasExtra(req) {
@@ -5671,6 +6096,32 @@ router.post('/planillas/movimientos/:id_movimiento/anular', checkPermission(PLAN
 router.get('/planillas/:id_planilla/auditoria', checkPermission(PLANILLAS_AUDITORIA_PERMISSIONS), asyncHandler(planillaService.auditoria));
 router.post('/planillas/:id_planilla/detalle/:id_detalle/recalcular', checkPermission(PLANILLAS_RECALCULAR_PERMISSIONS), asyncHandler(planillaService.recalcularDetalle));
 router.get('/planillas/:id_planilla/export', checkPermission(PLANILLAS_EXPORT_PERMISSIONS), asyncHandler(planillaService.completa));
+router.get('/planillas/:id_planilla/export/pdf', checkPermission(PLANILLAS_EXPORT_PERMISSIONS), async (req, res) => {
+  try {
+    await planillaService.exportPdf(req, res);
+  } catch (err) {
+    if (res.headersSent) return;
+
+    const httpStatus = Number.isInteger(err?.httpStatus) ? err.httpStatus : null;
+    if (httpStatus && httpStatus >= 400 && httpStatus < 500) {
+      return res.status(httpStatus).json(
+        buildErrorBody({
+          code: err.code || 'REQUEST_ERROR',
+          message: sanitizeApiErrorMessage(err.message, httpStatus)
+        })
+      );
+    }
+
+    const mappedError = mapDbError(err);
+    if (mappedError) {
+      return res.status(mappedError.status).json(
+        buildErrorBody({ code: mappedError.code, message: mappedError.message })
+      );
+    }
+
+    return res.status(500).json(buildErrorBody({ code: 'INTERNAL_ERROR', message: 'No se pudo generar el PDF de la planilla.' }));
+  }
+});
 
 export default router;
 
