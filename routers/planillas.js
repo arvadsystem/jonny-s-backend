@@ -185,6 +185,11 @@ const DETALLE_QUERY_ALLOWED_FIELDS = new Set([
   'limit',
   'search',
   'q',
+  'cargo',
+  'salario_min',
+  'salario_max',
+  'sort_by',
+  'sort_dir',
   'id_sucursal',
   'tipo_periodo',
   'quincena',
@@ -1347,6 +1352,44 @@ const resolvePlanillaScope = async (idPlanilla) => {
   };
 };
 
+const normalizeSortDirection = (value, fallback = 'asc') => {
+  const normalized = String(value ?? '').trim().toLowerCase();
+  return normalized === 'desc' ? 'desc' : fallback;
+};
+
+const normalizeDetalleSortBy = (value) => {
+  const normalized = String(value ?? '').trim().toLowerCase();
+  if (!normalized) return 'nombre';
+  const aliases = {
+    nombre: 'nombre',
+    empleado: 'nombre',
+    dni: 'dni',
+    cargo: 'cargo',
+    salario: 'salario',
+    salario_base: 'salario',
+    bonos: 'bonos',
+    deducciones: 'deducciones',
+    adelantos: 'adelantos',
+    horas: 'horas',
+    neto: 'neto'
+  };
+  return aliases[normalized] || 'nombre';
+};
+
+const compareNullableText = (left, right) =>
+  String(left ?? '')
+    .trim()
+    .localeCompare(String(right ?? '').trim(), 'es-HN', { sensitivity: 'base', numeric: true });
+
+const compareNullableNumber = (left, right) => {
+  const a = Number(left ?? 0);
+  const b = Number(right ?? 0);
+  const safeA = Number.isFinite(a) ? a : 0;
+  const safeB = Number.isFinite(b) ? b : 0;
+  if (safeA === safeB) return 0;
+  return safeA > safeB ? 1 : -1;
+};
+
 const resolveMovimientoScope = async (idMovimiento) => {
   const result = await pool.query(
     `
@@ -1499,35 +1542,51 @@ const insertPlanillaDetalleRows = async ({
   const safeEmployees = Array.isArray(employees) ? employees : [];
   if (!safePlanillaId || !safeEmployees.length) return { inserted: 0 };
 
-  let inserted = 0;
+  const employeeIds = [];
+  const salarioBases = [];
+
   for (const employee of safeEmployees) {
-    const salarioBase = roundTo(Number(employee.salario_base ?? 0) * factorProrrateo);
-    if (!(salarioBase > 0)) continue;
-
-    const result = await db.query(
-      `
-        INSERT INTO public.detalle_planilla (
-          salario_base,
-          dias_laborados,
-          horas_laboradas,
-          total_deducciones,
-          total_bonos,
-          neto_pagar,
-          id_planilla,
-          id_horas_extra,
-          id_empleado,
-          observaciones
-        )
-        VALUES ($1, $2, $3, 0, 0, $1, $4, NULL, $5, $6)
-        RETURNING id_detalle_planilla
-      `,
-      [salarioBase, diasLaborados, horasLaboradas, safePlanillaId, employee.id_empleado, observacion]
-    );
-
-    if (result.rowCount) inserted += 1;
+    const idEmpleado = parsePositiveInt(employee?.id_empleado);
+    const salarioBase = roundTo(Number(employee?.salario_base ?? 0) * factorProrrateo);
+    if (!idEmpleado || !(salarioBase > 0)) continue;
+    employeeIds.push(idEmpleado);
+    salarioBases.push(salarioBase);
   }
 
-  return { inserted };
+  if (!employeeIds.length) return { inserted: 0 };
+
+  const result = await db.query(
+    `
+      INSERT INTO public.detalle_planilla (
+        salario_base,
+        dias_laborados,
+        horas_laboradas,
+        total_deducciones,
+        total_bonos,
+        neto_pagar,
+        id_planilla,
+        id_horas_extra,
+        id_empleado,
+        observaciones
+      )
+      SELECT
+        src.salario_base,
+        $2,
+        $3,
+        0,
+        0,
+        src.salario_base,
+        $1,
+        NULL,
+        src.id_empleado,
+        $4
+      FROM unnest($5::int[], $6::numeric[]) AS src(id_empleado, salario_base)
+      RETURNING id_detalle_planilla
+    `,
+    [safePlanillaId, diasLaborados, horasLaboradas, observacion, employeeIds, salarioBases]
+  );
+
+  return { inserted: result.rowCount || 0 };
 };
 
 const updateMovimientoPeriodoContext = async ({
@@ -2231,11 +2290,46 @@ const buildMovimientosDataset = async ({
 
   if (!detailIds.length) return [];
 
-  const detalleChunks = await Promise.all(
-    detailIds.map((detailId) => queryFunctionRows(PLANILLA_ENDPOINT_CONTRACT.movimientos, [detailId]))
+  const schemaCapabilities = await getPlanillaSchemaCapabilities();
+  const movimientoFechaExpr = schemaCapabilities.movimientoPlanilla.hasFechaAplicacion
+    ? 'mp.fecha_aplicacion'
+    : 'NULL::date';
+  const movimientoTipoPeriodoExpr = schemaCapabilities.movimientoPlanilla.hasTipoPeriodo
+    ? "UPPER(COALESCE(mp.tipo_periodo, 'MENSUAL'))"
+    : "'MENSUAL'::varchar";
+  const movimientoQuincenaExpr = schemaCapabilities.movimientoPlanilla.hasQuincena
+    ? 'mp.quincena'
+    : 'NULL::int';
+
+  const movimientosResult = await pool.query(
+    `
+      SELECT
+        mp.id_movimiento_planilla,
+        mp.id_detalle_planilla,
+        dp.id_empleado,
+        dp.id_planilla,
+        mp.tipo_movimiento,
+        mp.concepto,
+        mp.monto,
+        mp.observacion,
+        COALESCE(mp.estado, TRUE) AS estado,
+        ${movimientoTipoPeriodoExpr} AS tipo_periodo,
+        ${movimientoQuincenaExpr} AS quincena,
+        ${movimientoFechaExpr} AS fecha,
+        COALESCE(${movimientoFechaExpr}, p.fecha_creacion)::timestamp AS fecha_registro
+      FROM public.movimiento_planilla mp
+      INNER JOIN public.detalle_planilla dp
+        ON dp.id_detalle_planilla = mp.id_detalle_planilla
+      INNER JOIN public.planillas p
+        ON p.id_planilla = dp.id_planilla
+      WHERE dp.id_planilla = $1
+        AND mp.id_detalle_planilla = ANY($2::int[])
+      ORDER BY COALESCE(${movimientoFechaExpr}, p.fecha_creacion) DESC, mp.id_movimiento_planilla DESC
+    `,
+    [idPlanilla, detailIds]
   );
 
-  const movimientosRows = detalleChunks.flat().map((row) => ({
+  const movimientosRows = (movimientosResult.rows || []).map((row) => ({
     ...row,
     id_planilla: idPlanilla,
     periodo_movimiento: planillaPeriodoKey || null,
@@ -2442,6 +2536,264 @@ const buildMovimientosDataset = async ({
       toTimestampSafe(right.fecha_registro || right.fecha) -
       toTimestampSafe(left.fecha_registro || left.fecha)
   );
+};
+
+const filterDetalleDataset = ({
+  rows = [],
+  search = null,
+  cargo = null,
+  salarioMin = null,
+  salarioMax = null
+} = {}) => {
+  const searchTerm = sanitizeText(search, 120)?.toLowerCase() || '';
+  const cargoTerm = sanitizeText(cargo, 120)?.toLowerCase() || '';
+  const minSalary = salarioMin === null || salarioMin === undefined || salarioMin === '' ? null : Number(salarioMin);
+  const maxSalary = salarioMax === null || salarioMax === undefined || salarioMax === '' ? null : Number(salarioMax);
+
+  return (Array.isArray(rows) ? rows : []).filter((row) => {
+    if (searchTerm) {
+      const haystack = [
+        row?.id_empleado,
+        row?.nombre_completo,
+        row?.dni,
+        row?.sucursal,
+        row?.nombre_sucursal,
+        row?.cargo,
+        row?.telefono,
+        row?.correo,
+        row?.direccion,
+        row?.salario_base,
+        row?.total_bonos,
+        row?.total_deducciones,
+        row?.neto_pagar,
+        row?.he_tiempo,
+        row?.total_adelantos_aplicados
+      ]
+        .map((value) => String(value ?? '').toLowerCase())
+        .join(' ');
+
+      if (!haystack.includes(searchTerm)) return false;
+    }
+
+    if (cargoTerm && !String(row?.cargo ?? '').trim().toLowerCase().includes(cargoTerm)) {
+      return false;
+    }
+
+    const salario = Number(row?.salario_base ?? 0);
+    const safeSalario = Number.isFinite(salario) ? salario : 0;
+    if (Number.isFinite(minSalary) && safeSalario < minSalary) return false;
+    if (Number.isFinite(maxSalary) && safeSalario > maxSalary) return false;
+
+    return true;
+  });
+};
+
+const sortDetalleDataset = ({ rows = [], sortBy = 'nombre', sortDir = 'asc' } = {}) => {
+  const safeRows = Array.isArray(rows) ? [...rows] : [];
+  const normalizedSortBy = normalizeDetalleSortBy(sortBy);
+  const direction = normalizeSortDirection(sortDir);
+
+  safeRows.sort((left, right) => {
+    let comparison = 0;
+
+    switch (normalizedSortBy) {
+      case 'dni':
+        comparison = compareNullableText(left?.dni, right?.dni);
+        break;
+      case 'cargo':
+        comparison = compareNullableText(left?.cargo, right?.cargo);
+        break;
+      case 'salario':
+        comparison = compareNullableNumber(left?.salario_base, right?.salario_base);
+        break;
+      case 'bonos':
+        comparison = compareNullableNumber(left?.total_bonos ?? left?.bonos, right?.total_bonos ?? right?.bonos);
+        break;
+      case 'deducciones':
+        comparison = compareNullableNumber(
+          left?.total_deducciones ?? left?.deducciones,
+          right?.total_deducciones ?? right?.deducciones
+        );
+        break;
+      case 'adelantos':
+        comparison = compareNullableNumber(
+          left?.total_adelantos_aplicados ?? left?.adelantos,
+          right?.total_adelantos_aplicados ?? right?.adelantos
+        );
+        break;
+      case 'horas':
+        comparison = compareNullableNumber(left?.he_tiempo, right?.he_tiempo);
+        break;
+      case 'neto':
+        comparison = compareNullableNumber(
+          left?.neto_pagar ?? left?.total_neto_pagar ?? left?.neto,
+          right?.neto_pagar ?? right?.total_neto_pagar ?? right?.neto
+        );
+        break;
+      case 'nombre':
+      default:
+        comparison = compareNullableText(left?.nombre_completo, right?.nombre_completo);
+        break;
+    }
+
+    if (comparison === 0) {
+      comparison = compareNullableText(left?.dni, right?.dni);
+    }
+
+    return direction === 'desc' ? comparison * -1 : comparison;
+  });
+
+  return safeRows;
+};
+
+const buildDetallePlanillaDataset = async ({
+  idPlanilla,
+  tipoPeriodo = TIPO_PERIODO.MENSUAL,
+  quincena = null,
+  search = null,
+  cargo = null,
+  salarioMin = null,
+  salarioMax = null,
+  sortBy = 'nombre',
+  sortDir = 'asc'
+} = {}) => {
+  await preparePlanillaReadModel({ idPlanilla });
+
+  const rawRows = await queryFunctionRows(PLANILLA_ENDPOINT_CONTRACT.detalle, [idPlanilla]);
+  const rows = filterPlanillableEmpleadoRows(rawRows);
+  const employeeIds = [...new Set((rows || []).map((row) => parsePositiveInt(row.id_empleado)).filter(Boolean))];
+  const dniMap = await resolveEmpleadoDniMap(employeeIds);
+
+  const [horasResult, adelantosResult] = await Promise.all([
+    pool.query(
+      `
+        SELECT
+          he.id_empleado,
+          COALESCE(
+            SUM(
+              CASE
+                WHEN COALESCE(he.compensada, FALSE) = FALSE THEN COALESCE(he.horas, 0)
+                ELSE 0
+              END
+            ),
+            0
+          ) AS horas_pendientes
+        FROM public.horas_extras he
+        WHERE he.id_planilla = $1
+        GROUP BY he.id_empleado
+      `,
+      [idPlanilla]
+    ),
+    pool.query(
+      `
+        SELECT
+          a.id_empleado,
+          COALESCE(SUM(aa.monto_aplicado), 0) AS total_adelantos_aplicados
+        FROM public.adelanto_aplicacion aa
+        INNER JOIN public.adelantos_salario a
+          ON a.id_adelanto_salario = aa.id_adelanto_salario
+        WHERE aa.id_planilla = $1
+        GROUP BY a.id_empleado
+      `,
+      [idPlanilla]
+    )
+  ]);
+
+  const horasPendientesMap = new Map(
+    (horasResult.rows || [])
+      .map((row) => [parsePositiveInt(row.id_empleado), Number(row.horas_pendientes ?? 0)])
+      .filter(([idEmpleado]) => Boolean(idEmpleado))
+  );
+  const adelantosMap = new Map(
+    (adelantosResult.rows || [])
+      .map((row) => [parsePositiveInt(row.id_empleado), Number(row.total_adelantos_aplicados ?? 0)])
+      .filter(([idEmpleado]) => Boolean(idEmpleado))
+  );
+
+  let enrichedRows = rows.map((row) => {
+    const idEmpleado = parsePositiveInt(row.id_empleado);
+    const horasPendientes = idEmpleado ? Number(horasPendientesMap.get(idEmpleado) ?? 0) : 0;
+    const adelantosAplicados = idEmpleado ? Number(adelantosMap.get(idEmpleado) ?? 0) : 0;
+    const resolvedDni = sanitizeText(
+      row.dni || row.persona_dni || row.dni_persona || row.numero_dni || (idEmpleado ? dniMap.get(idEmpleado) : ''),
+      40
+    );
+
+    return {
+      ...row,
+      dni: resolvedDni || null,
+      persona_dni: resolvedDni || null,
+      he_tiempo: Number.isFinite(horasPendientes) ? horasPendientes : 0,
+      horas_extra_tiempo: Number.isFinite(horasPendientes) ? horasPendientes : 0,
+      total_adelantos_aplicados: Number.isFinite(adelantosAplicados) ? adelantosAplicados : 0,
+      adelantos: Number.isFinite(adelantosAplicados) ? adelantosAplicados : 0
+    };
+  });
+
+  if (tipoPeriodo === TIPO_PERIODO.QUINCENAL) {
+    const movimientosContextRows = await buildMovimientosDataset({
+      idPlanilla,
+      tipoPeriodo,
+      quincena
+    });
+    const metricsByEmpleado = aggregateDetalleMetricsFromMovimientos({
+      detalleRows: rows,
+      movimientosRows: movimientosContextRows
+    });
+
+    enrichedRows = rows.map((row) => {
+      const idEmpleado = parsePositiveInt(row.id_empleado);
+      const resolvedDni = sanitizeText(
+        row.dni || row.persona_dni || row.dni_persona || row.numero_dni || (idEmpleado ? dniMap.get(idEmpleado) : ''),
+        40
+      );
+      const metrics = metricsByEmpleado.get(idEmpleado) || {
+        bonos: 0,
+        deducciones: 0,
+        adelantos: 0,
+        horasPendientes: 0
+      };
+      const salarioBase = roundTo(Number(row?.salario_base ?? 0));
+      const totalBonos = roundTo(metrics.bonos);
+      const totalDeduccionesSinAdelantos = roundTo(metrics.deducciones);
+      const totalAdelantos = roundTo(metrics.adelantos);
+      const totalDeducciones = roundTo(totalDeduccionesSinAdelantos + totalAdelantos);
+      const neto = roundTo(salarioBase + totalBonos - totalDeducciones);
+      const horasPendientes = roundTo(metrics.horasPendientes);
+
+      return {
+        ...row,
+        dni: resolvedDni || null,
+        persona_dni: resolvedDni || null,
+        total_bonos: totalBonos,
+        bonos: totalBonos,
+        total_deducciones_sin_adelantos: totalDeduccionesSinAdelantos,
+        deducciones_sin_adelantos: totalDeduccionesSinAdelantos,
+        total_deducciones: totalDeducciones,
+        deducciones: totalDeducciones,
+        total_adelantos_aplicados: totalAdelantos,
+        total_adelantos: totalAdelantos,
+        adelantos: totalAdelantos,
+        he_tiempo: horasPendientes,
+        horas_extra_tiempo: horasPendientes,
+        neto_pagar: neto,
+        total_neto_pagar: neto,
+        neto
+      };
+    });
+  }
+
+  return sortDetalleDataset({
+    rows: filterDetalleDataset({
+      rows: enrichedRows,
+      search,
+      cargo,
+      salarioMin,
+      salarioMax
+    }),
+    sortBy,
+    sortDir
+  });
 };
 
 const createRequestError = (message, httpStatus = 400, code = 'VALIDATION_ERROR') => {
@@ -3269,160 +3621,37 @@ const planillaService = {
     const tipoPeriodoContext = periodoContext.tipo_periodo;
     const quincenaContext = periodoContext.quincena;
 
-    await preparePlanillaReadModel({ idPlanilla });
-
     const pagination = parsePagination(req.query || {});
     if (!pagination) {
       return { status: 400, body: { error: true, message: 'page y limit deben ser enteros positivos' } };
     }
-
-    const rawRows = await queryFunctionRows(PLANILLA_ENDPOINT_CONTRACT.detalle, [idPlanilla]);
-    const rows = filterPlanillableEmpleadoRows(rawRows);
-    const employeeIds = [...new Set((rows || []).map((row) => parsePositiveInt(row.id_empleado)).filter(Boolean))];
-    const dniMap = await resolveEmpleadoDniMap(employeeIds);
-
-    const horasResult = await pool.query(
-      `
-        SELECT
-          he.id_empleado,
-          COALESCE(
-            SUM(
-              CASE
-                WHEN COALESCE(he.compensada, FALSE) = FALSE THEN COALESCE(he.horas, 0)
-                ELSE 0
-              END
-            ),
-            0
-          ) AS horas_pendientes
-        FROM public.horas_extras he
-        WHERE he.id_planilla = $1
-        GROUP BY he.id_empleado
-      `,
-      [idPlanilla]
-    );
-
-    const horasPendientesMap = new Map(
-      (horasResult.rows || [])
-        .map((row) => [parsePositiveInt(row.id_empleado), Number(row.horas_pendientes ?? 0)])
-        .filter(([idEmpleado]) => Boolean(idEmpleado))
-    );
-
-    const adelantosResult = await pool.query(
-      `
-        SELECT
-          a.id_empleado,
-          COALESCE(SUM(aa.monto_aplicado), 0) AS total_adelantos_aplicados
-        FROM public.adelanto_aplicacion aa
-        INNER JOIN public.adelantos_salario a
-          ON a.id_adelanto_salario = aa.id_adelanto_salario
-        WHERE aa.id_planilla = $1
-        GROUP BY a.id_empleado
-      `,
-      [idPlanilla]
-    );
-
-    const adelantosMap = new Map(
-      (adelantosResult.rows || [])
-        .map((row) => [parsePositiveInt(row.id_empleado), Number(row.total_adelantos_aplicados ?? 0)])
-        .filter(([idEmpleado]) => Boolean(idEmpleado))
-    );
-
     const search = sanitizeText(req.query.search ?? req.query.q, 120);
-
-    let enrichedRows = rows.map((row) => {
-      const idEmpleado = parsePositiveInt(row.id_empleado);
-      const horasPendientes = idEmpleado ? Number(horasPendientesMap.get(idEmpleado) ?? 0) : 0;
-      const adelantosAplicados = idEmpleado ? Number(adelantosMap.get(idEmpleado) ?? 0) : 0;
-      const resolvedDni = sanitizeText(
-        row.dni || row.persona_dni || row.dni_persona || row.numero_dni || (idEmpleado ? dniMap.get(idEmpleado) : ''),
-        40
-      );
-      return {
-        ...row,
-        dni: resolvedDni || null,
-        persona_dni: resolvedDni || null,
-        he_tiempo: Number.isFinite(horasPendientes) ? horasPendientes : 0,
-        horas_extra_tiempo: Number.isFinite(horasPendientes) ? horasPendientes : 0,
-        total_adelantos_aplicados: Number.isFinite(adelantosAplicados) ? adelantosAplicados : 0,
-        adelantos: Number.isFinite(adelantosAplicados) ? adelantosAplicados : 0
-      };
-    });
-
-    if (tipoPeriodoContext === TIPO_PERIODO.QUINCENAL) {
-      const movimientosContextRows = await buildMovimientosDataset({
-        idPlanilla,
-        tipoPeriodo: tipoPeriodoContext,
-        quincena: quincenaContext
-      });
-      const metricsByEmpleado = aggregateDetalleMetricsFromMovimientos({
-        detalleRows: rows,
-        movimientosRows: movimientosContextRows
-      });
-
-      enrichedRows = rows.map((row) => {
-        const idEmpleado = parsePositiveInt(row.id_empleado);
-        const resolvedDni = sanitizeText(
-          row.dni ||
-            row.persona_dni ||
-            row.dni_persona ||
-            row.numero_dni ||
-            (idEmpleado ? dniMap.get(idEmpleado) : ''),
-          40
-        );
-        const metrics = metricsByEmpleado.get(idEmpleado) || {
-          bonos: 0,
-          deducciones: 0,
-          adelantos: 0,
-          horasPendientes: 0
-        };
-        const salarioBase = roundTo(Number(row?.salario_base ?? 0));
-        const totalBonos = roundTo(metrics.bonos);
-        const totalDeduccionesSinAdelantos = roundTo(metrics.deducciones);
-        const totalAdelantos = roundTo(metrics.adelantos);
-        const totalDeducciones = roundTo(totalDeduccionesSinAdelantos + totalAdelantos);
-        const neto = roundTo(salarioBase + totalBonos - totalDeducciones);
-        const horasPendientes = roundTo(metrics.horasPendientes);
-
-        return {
-          ...row,
-          dni: resolvedDni || null,
-          persona_dni: resolvedDni || null,
-          total_bonos: totalBonos,
-          bonos: totalBonos,
-          total_deducciones_sin_adelantos: totalDeduccionesSinAdelantos,
-          deducciones_sin_adelantos: totalDeduccionesSinAdelantos,
-          total_deducciones: totalDeducciones,
-          deducciones: totalDeducciones,
-          total_adelantos_aplicados: totalAdelantos,
-          total_adelantos: totalAdelantos,
-          adelantos: totalAdelantos,
-          he_tiempo: horasPendientes,
-          horas_extra_tiempo: horasPendientes,
-          neto_pagar: neto,
-          total_neto_pagar: neto,
-          neto
-        };
-      });
+    const cargo = sanitizeText(req.query.cargo, 120);
+    const salarioMin =
+      req.query.salario_min === undefined || req.query.salario_min === null || req.query.salario_min === ''
+        ? null
+        : Number(req.query.salario_min);
+    const salarioMax =
+      req.query.salario_max === undefined || req.query.salario_max === null || req.query.salario_max === ''
+        ? null
+        : Number(req.query.salario_max);
+    if (salarioMin !== null && (!Number.isFinite(salarioMin) || salarioMin < 0)) {
+      return { status: 400, body: { error: true, message: 'salario_min invalido.' } };
+    }
+    if (salarioMax !== null && (!Number.isFinite(salarioMax) || salarioMax < 0)) {
+      return { status: 400, body: { error: true, message: 'salario_max invalido.' } };
     }
 
-    const filtered = enrichedRows.filter((row) => {
-      if (!search) return true;
-      const haystack = [
-        row.id_empleado,
-        row.nombre_completo,
-        row.dni,
-        row.sucursal,
-        row.cargo,
-        row.salario_base,
-        row.total_bonos,
-        row.total_deducciones,
-        row.neto_pagar,
-        row.he_tiempo,
-        row.total_adelantos_aplicados
-      ]
-        .map((value) => String(value ?? '').toLowerCase())
-        .join(' ');
-      return haystack.includes(search.toLowerCase());
+    const filtered = await buildDetallePlanillaDataset({
+      idPlanilla,
+      tipoPeriodo: tipoPeriodoContext,
+      quincena: quincenaContext,
+      search,
+      cargo,
+      salarioMin,
+      salarioMax,
+      sortBy: req.query.sort_by,
+      sortDir: req.query.sort_dir
     });
 
     return {
@@ -3463,42 +3692,25 @@ const planillaService = {
     const tipoPeriodoContext = periodoContext.tipo_periodo;
     const quincenaContext = periodoContext.quincena;
 
-    await preparePlanillaReadModel({ idPlanilla });
-
     if (tipoPeriodoContext === TIPO_PERIODO.QUINCENAL) {
-      const detalleRowsRaw = await queryFunctionRows(PLANILLA_ENDPOINT_CONTRACT.detalle, [idPlanilla]);
-      const detalleRows = filterPlanillableEmpleadoRows(detalleRowsRaw);
-      const movimientosContextRows = await buildMovimientosDataset({
+      const detalleRows = await buildDetallePlanillaDataset({
         idPlanilla,
         tipoPeriodo: tipoPeriodoContext,
         quincena: quincenaContext
       });
-      const metricsByEmpleado = aggregateDetalleMetricsFromMovimientos({
-        detalleRows,
-        movimientosRows: movimientosContextRows
-      });
 
       const resumenContextual = (Array.isArray(detalleRows) ? detalleRows : []).reduce(
         (acc, row) => {
-          const idEmpleado = parsePositiveInt(row?.id_empleado);
-          const metrics = metricsByEmpleado.get(idEmpleado) || {
-            bonos: 0,
-            deducciones: 0,
-            adelantos: 0
-          };
-          const salarioBase = roundTo(Number(row?.salario_base ?? 0));
-          const bonos = roundTo(metrics.bonos);
-          const deduccionesSinAdelantos = roundTo(metrics.deducciones);
-          const adelantos = roundTo(metrics.adelantos);
-          const deducciones = roundTo(deduccionesSinAdelantos + adelantos);
-          const neto = roundTo(salarioBase + bonos - deducciones);
-
-          acc.total_salario_base += salarioBase;
-          acc.total_bonos += bonos;
-          acc.total_deducciones_sin_adelantos += deduccionesSinAdelantos;
-          acc.total_adelantos_aplicados += adelantos;
-          acc.total_deducciones += deducciones;
-          acc.total_neto_pagar += neto;
+          acc.total_salario_base += roundTo(Number(row?.salario_base ?? 0));
+          acc.total_bonos += roundTo(Number(row?.total_bonos ?? row?.bonos ?? 0));
+          acc.total_deducciones_sin_adelantos += roundTo(
+            Number(row?.total_deducciones_sin_adelantos ?? row?.deducciones_sin_adelantos ?? 0)
+          );
+          acc.total_adelantos_aplicados += roundTo(
+            Number(row?.total_adelantos_aplicados ?? row?.total_adelantos ?? row?.adelantos ?? 0)
+          );
+          acc.total_deducciones += roundTo(Number(row?.total_deducciones ?? row?.deducciones ?? 0));
+          acc.total_neto_pagar += roundTo(Number(row?.neto_pagar ?? row?.total_neto_pagar ?? row?.neto ?? 0));
           acc.total_empleados += 1;
           return acc;
         },
@@ -3532,10 +3744,11 @@ const planillaService = {
       return { status: 200, body: { error: false, data } };
     }
 
+    await preparePlanillaReadModel({ idPlanilla });
+
     const rows = await queryFunctionRows(PLANILLA_ENDPOINT_CONTRACT.resumen, [idPlanilla]);
     const resumenBase = rows[0] || {};
-    const detalleRowsRaw = await queryFunctionRows(PLANILLA_ENDPOINT_CONTRACT.detalle, [idPlanilla]);
-    const detalleRows = filterPlanillableEmpleadoRows(detalleRowsRaw);
+    const detalleRows = await buildDetallePlanillaDataset({ idPlanilla });
     const resumenDesdeDetalle = buildResumenFromDetalleRows(detalleRows);
 
     const adelantosResult = await pool.query(
