@@ -241,6 +241,7 @@ const TIPO_PERIODO = Object.freeze({
   MENSUAL: 'MENSUAL',
   QUINCENAL: 'QUINCENAL'
 });
+const QUINCENA_FIXED_FACTOR = 0.5;
 const QUINCENA_ESTADO_AUDITORIA_ACCION = 'ESTADO_QUINCENA';
 const QUINCENA_ESTADO_AUDITORIA_ENTIDAD = 'PLANILLA_QUINCENAL';
 const QUINCENA_ADELANTO_AUDITORIA_ACCION = 'ADELANTO_QUINCENA';
@@ -515,7 +516,7 @@ const resolveQuincenaWindow = (dateValue, quincena) => {
     fin: end.toISOString().slice(0, 10),
     dias_quincena: quincenaDays,
     dias_mes: totalDays,
-    factor: quincenaDays / totalDays
+    factor: QUINCENA_FIXED_FACTOR
   };
 };
 
@@ -540,7 +541,7 @@ const buildPeriodoMeta = ({ fechaPlanilla, tipoPeriodo, quincena = null, diasLab
     periodo_fin: quincenaWindow?.fin || null,
     dias_laborados: diasLaborados,
     horas_laboradas: horasLaboradas,
-    factor_prorrateo: quincenaWindow?.factor || 0.5
+    factor_prorrateo: QUINCENA_FIXED_FACTOR
   };
 };
 
@@ -587,10 +588,7 @@ const buildPersistedPeriodoMeta = ({ fechaPlanilla, tipoPeriodo, quincena = null
 const resolvePlanillaFactor = (planillaMeta = {}) => {
   const tipoPeriodo = normalizeTipoPeriodoStrict(planillaMeta?.tipo_periodo) || TIPO_PERIODO.MENSUAL;
   if (tipoPeriodo !== TIPO_PERIODO.QUINCENAL) return 1;
-  const explicitFactor = Number(planillaMeta?.factor_prorrateo);
-  if (Number.isFinite(explicitFactor) && explicitFactor > 0 && explicitFactor <= 1) return explicitFactor;
-  const window = resolveQuincenaWindow(planillaMeta?.fecha_inicio || planillaMeta?.periodo || planillaMeta?.fecha_creacion, planillaMeta?.quincena);
-  return window?.factor || 0.5;
+  return QUINCENA_FIXED_FACTOR;
 };
 
 const resolvePeriodoContextInput = ({
@@ -3425,8 +3423,7 @@ const planillaService = {
     });
 
     if (tipoPeriodo === TIPO_PERIODO.QUINCENAL) {
-      const quincenaWindow = resolveQuincenaWindow(fechaPlanilla, quincena || 1);
-      const factor = quincenaWindow?.factor || 0.5;
+      const factor = QUINCENA_FIXED_FACTOR;
       diasLaborados = Number((monthlyDias * factor).toFixed(2));
       horasLaboradas = Number((monthlyHoras * factor).toFixed(2));
       periodoMeta = buildPeriodoMeta({
