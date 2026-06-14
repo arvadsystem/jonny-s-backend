@@ -31,6 +31,7 @@ const MENU_PRODUCT_CATEGORY_ALIASES = Object.freeze([
   'gaseosas/refrescos',
   'aguas, isotónicos y energéticas',
   'aguas, isotonicos y energeticas',
+  'helados',
   'helados sarita',
   'snacks',
   'snack'
