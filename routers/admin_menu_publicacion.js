@@ -154,6 +154,18 @@ const toDateTimeOrNull = (value) => {
   return parsed;
 };
 
+const normalizePublicationType = (value) => {
+  const normalized = String(value ?? 'DEFAULT').trim().toUpperCase();
+  if (normalized === 'DEFAULT' || normalized === 'TEMPORADA') return normalized;
+  return '';
+};
+
+const toNullablePriority = (value) => {
+  if (value === undefined || value === null || String(value).trim() === '') return null;
+  const parsed = Number.parseInt(String(value).trim(), 10);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : NaN;
+};
+
 const buildMenuProgrammingError = ({ code, message, phase, status = 500, cause = null }) => {
   const error = new Error(message);
   error.code = code;
@@ -1421,7 +1433,11 @@ router.post('/programacion', checkPermission(MENU_PUBLICACION_SAVE_PERMISSIONS),
     const idMenu = toPositiveInt(req.body?.id_menu);
     const idUsuario = getAuthenticatedUserId(req);
     const fechaRaw = req.body?.fecha_inicio;
+    const fechaFinRaw = req.body?.fecha_fin;
+    const tipoPublicacion = normalizePublicationType(req.body?.tipo_publicacion);
+    const prioridadRaw = toNullablePriority(req.body?.prioridad);
     const fechaProgramada = toDateTimeOrNull(fechaRaw) || new Date();
+    const fechaFin = toDateTimeOrNull(fechaFinRaw);
     const syncCatalog = parseOptionalBoolean(req.body?.sync_catalog);
 
     if (!idSucursal || !idMenu) {
@@ -1454,11 +1470,87 @@ router.post('/programacion', checkPermission(MENU_PUBLICACION_SAVE_PERMISSIONS),
       });
     }
 
+    if (fechaFinRaw && !fechaFin) {
+      return sendMenuProgrammingError(res, {
+        status: 400,
+        code: 'MENU_PROGRAMMING_INVALID_END_DATE',
+        message: 'fecha_fin tiene formato invalido.',
+        phase,
+        correlationId
+      });
+    }
+
+    if (!tipoPublicacion) {
+      return sendMenuProgrammingError(res, {
+        status: 400,
+        code: 'MENU_PROGRAMMING_INVALID_TYPE',
+        message: 'tipo_publicacion invalido. Usa DEFAULT o TEMPORADA.',
+        phase,
+        correlationId
+      });
+    }
+
+    if (Number.isNaN(prioridadRaw)) {
+      return sendMenuProgrammingError(res, {
+        status: 400,
+        code: 'MENU_PROGRAMMING_INVALID_PRIORITY',
+        message: 'prioridad debe ser un entero positivo cuando se envia.',
+        phase,
+        correlationId
+      });
+    }
+
     if (syncCatalog === null) {
       return sendMenuProgrammingError(res, {
         status: 400,
         code: 'MENU_PROGRAMMING_INVALID_SYNC_OPTION',
         message: 'sync_catalog debe ser booleano cuando se envia.',
+        phase,
+        correlationId
+      });
+    }
+
+    const now = new Date();
+    const isDefaultPublication = tipoPublicacion === 'DEFAULT';
+    const isSeasonPublication = tipoPublicacion === 'TEMPORADA';
+    const esDefault = isDefaultPublication;
+    const prioridad = prioridadRaw ?? (isDefaultPublication ? 1000 : 100);
+
+    if (isDefaultPublication && fechaFinRaw !== undefined && fechaFinRaw !== null && String(fechaFinRaw).trim() !== '') {
+      return sendMenuProgrammingError(res, {
+        status: 400,
+        code: 'MENU_PROGRAMMING_DEFAULT_WITH_END_DATE',
+        message: 'fecha_fin no se permite para publicaciones DEFAULT.',
+        phase,
+        correlationId
+      });
+    }
+
+    if (isDefaultPublication && fechaRaw && fechaProgramada > now) {
+      return sendMenuProgrammingError(res, {
+        status: 400,
+        code: 'MENU_PROGRAMMING_DEFAULT_FUTURE_DATE',
+        message: 'DEFAULT no permite programacion futura por ahora.',
+        phase,
+        correlationId
+      });
+    }
+
+    if (isSeasonPublication && !fechaFin) {
+      return sendMenuProgrammingError(res, {
+        status: 400,
+        code: 'MENU_PROGRAMMING_SEASON_END_DATE_REQUIRED',
+        message: 'fecha_fin es obligatoria para publicaciones TEMPORADA.',
+        phase,
+        correlationId
+      });
+    }
+
+    if (isSeasonPublication && fechaFin <= fechaProgramada) {
+      return sendMenuProgrammingError(res, {
+        status: 400,
+        code: 'MENU_PROGRAMMING_SEASON_INVALID_RANGE',
+        message: 'fecha_fin debe ser mayor que fecha_inicio para publicaciones TEMPORADA.',
         phase,
         correlationId
       });
@@ -1490,9 +1582,16 @@ router.post('/programacion', checkPermission(MENU_PUBLICACION_SAVE_PERMISSIONS),
       });
     }
 
-    // Si no viene fecha, el flujo es "activar ahora". Evitamos duplicar filas si ya estaba activo.
+    // Si no viene fecha, el flujo legacy es DEFAULT "activar ahora".
+    // Evitamos duplicar solo cuando el menu resuelto actual ya coincide.
     const activeNow = await getActiveMenuByBranch(idSucursal);
-    if (!fechaRaw && activeNow && Number(activeNow.id_menu) === idMenu) {
+    if (
+      isDefaultPublication &&
+      !fechaRaw &&
+      activeNow &&
+      Number(activeNow.id_menu) === idMenu &&
+      parseBoolean(activeNow.es_default)
+    ) {
       return res.status(200).json({
         ok: true,
         message: 'Ese menu ya esta activo en la sucursal.',
@@ -1506,9 +1605,7 @@ router.post('/programacion', checkPermission(MENU_PUBLICACION_SAVE_PERMISSIONS),
       });
     }
 
-    const now = new Date();
-    const activateNow = fechaProgramada <= now;
-    const estadoInicial = activateNow;
+    const estadoInicial = true;
 
     phase = 'BEGIN';
     await client.query('BEGIN');
@@ -1548,6 +1645,55 @@ router.post('/programacion', checkPermission(MENU_PUBLICACION_SAVE_PERMISSIONS),
 
     const otherBranchesSignatureBefore = await getOtherBranchesActiveMenuSignature(client, idSucursal);
 
+    if (isSeasonPublication) {
+      phase = 'CHECK_DEFAULT_FOR_SEASON';
+      const defaultResult = await client.query(
+        `
+          SELECT id_menu_vigente
+          FROM menu_vigente
+          WHERE id_sucursal = $1
+            AND COALESCE(estado, true) = true
+            AND COALESCE(es_default, false) = true
+          LIMIT 1;
+        `,
+        [idSucursal]
+      );
+
+      if (defaultResult.rowCount === 0) {
+        throw buildMenuProgrammingError({
+          code: 'MENU_SEASON_DEFAULT_REQUIRED',
+          message: 'No se puede programar TEMPORADA sin un DEFAULT activo para la sucursal.',
+          phase,
+          status: 409
+        });
+      }
+
+      phase = 'CHECK_SEASON_OVERLAP';
+      const overlapResult = await client.query(
+        `
+          SELECT id_menu_vigente
+          FROM menu_vigente
+          WHERE id_sucursal = $1
+            AND COALESCE(estado, true) = true
+            AND COALESCE(es_default, false) = false
+            AND COALESCE(tipo_publicacion, 'TEMPORADA') = 'TEMPORADA'
+            AND fecha_inicio < $3
+            AND fecha_fin > $2
+          LIMIT 1;
+        `,
+        [idSucursal, fechaProgramada, fechaFin]
+      );
+
+      if (overlapResult.rowCount > 0) {
+        throw buildMenuProgrammingError({
+          code: 'MENU_SEASON_OVERLAP',
+          message: 'Ya existe una TEMPORADA activa que se solapa con el rango solicitado.',
+          phase,
+          status: 409
+        });
+      }
+    }
+
     phase = 'CHECK_DUPLICATE';
     const duplicate = await client.query(
       `
@@ -1556,9 +1702,10 @@ router.post('/programacion', checkPermission(MENU_PUBLICACION_SAVE_PERMISSIONS),
         WHERE id_sucursal = $1
           AND id_menu = $2
           AND fecha_inicio = $3
+          AND COALESCE(tipo_publicacion, 'DEFAULT') = $4
         LIMIT 1;
       `,
-      [idSucursal, idMenu, fechaProgramada]
+      [idSucursal, idMenu, fechaProgramada, tipoPublicacion]
     );
 
     if (duplicate.rowCount > 0) {
@@ -1573,14 +1720,15 @@ router.post('/programacion', checkPermission(MENU_PUBLICACION_SAVE_PERMISSIONS),
       });
     }
 
-    if (activateNow) {
+    if (isDefaultPublication) {
       phase = 'DEACTIVATE_CURRENT';
       await client.query(
         `
           UPDATE menu_vigente
           SET estado = false
           WHERE id_sucursal = $1
-            AND COALESCE(estado, true) = true;
+            AND COALESCE(estado, true) = true
+            AND COALESCE(es_default, false) = true;
         `,
         [idSucursal]
       );
@@ -1593,12 +1741,35 @@ router.post('/programacion', checkPermission(MENU_PUBLICACION_SAVE_PERMISSIONS),
           id_sucursal,
           id_menu,
           fecha_inicio,
+          fecha_fin,
+          tipo_publicacion,
+          es_default,
+          prioridad,
           id_usuario,
           estado
-        ) VALUES ($1, $2, $3, $4, $5)
-        RETURNING id_menu_vigente, id_sucursal, id_menu, fecha_inicio, estado;
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+        RETURNING
+          id_menu_vigente,
+          id_sucursal,
+          id_menu,
+          fecha_inicio,
+          fecha_fin,
+          tipo_publicacion,
+          es_default,
+          prioridad,
+          estado;
       `,
-      [idSucursal, idMenu, fechaProgramada, idUsuario, estadoInicial]
+      [
+        idSucursal,
+        idMenu,
+        fechaProgramada,
+        isDefaultPublication ? null : fechaFin,
+        tipoPublicacion,
+        esDefault,
+        prioridad,
+        idUsuario,
+        estadoInicial
+      ]
     );
 
     const inserted = insertResult.rows?.[0] || null;
@@ -1608,21 +1779,6 @@ router.post('/programacion', checkPermission(MENU_PUBLICACION_SAVE_PERMISSIONS),
         message: 'No se pudo crear la vigencia solicitada.',
         phase
       });
-    }
-
-    if (activateNow) {
-      phase = 'ENSURE_SINGLE_ACTIVE';
-      await client.query(
-        `
-          UPDATE menu_vigente
-          SET estado = false
-          WHERE id_sucursal = $1
-            AND id_menu_vigente <> $2
-            AND COALESCE(estado, true) = true
-            AND COALESCE(fecha_inicio, NOW()) <= $3;
-        `,
-        [idSucursal, Number(inserted.id_menu_vigente), fechaProgramada]
-      );
     }
 
     let seededProductsCount = 0;
@@ -1648,28 +1804,52 @@ router.post('/programacion', checkPermission(MENU_PUBLICACION_SAVE_PERMISSIONS),
     const postcheckResult = await client.query(
       `
         SELECT
-          COUNT(*) FILTER (WHERE COALESCE(estado, true) = true)::int AS active_count,
-          MAX(id_menu) FILTER (WHERE COALESCE(estado, true) = true)::int AS active_menu,
+          COUNT(*) FILTER (
+            WHERE COALESCE(estado, true) = true
+              AND COALESCE(es_default, false) = true
+          )::int AS active_default_count,
+          MAX(id_menu_vigente) FILTER (
+            WHERE COALESCE(estado, true) = true
+              AND COALESCE(es_default, false) = true
+          )::int AS active_default_id,
           COUNT(*) FILTER (
             WHERE id_menu_vigente = $2
               AND id_menu = $3
-              AND estado = $4
-          )::int AS inserted_matches
+              AND COALESCE(estado, true) = true
+              AND COALESCE(tipo_publicacion, 'DEFAULT') = $4
+          )::int AS inserted_matches,
+          COUNT(*) FILTER (
+            WHERE COALESCE(estado, true) = true
+              AND COALESCE(es_default, false) = false
+              AND COALESCE(tipo_publicacion, 'TEMPORADA') = 'TEMPORADA'
+              AND fecha_inicio < $6
+              AND fecha_fin > $5
+          )::int AS overlapping_seasons
         FROM menu_vigente
         WHERE id_sucursal = $1;
       `,
-      [idSucursal, Number(inserted.id_menu_vigente), idMenu, estadoInicial]
+      [
+        idSucursal,
+        Number(inserted.id_menu_vigente),
+        idMenu,
+        tipoPublicacion,
+        fechaProgramada,
+        isDefaultPublication ? fechaProgramada : fechaFin
+      ]
     );
     const postcheck = postcheckResult.rows?.[0] || {};
-    const activeNowPostcheckFailed = activateNow && (
-      Number(postcheck.active_count) !== 1 ||
-      Number(postcheck.active_menu) !== idMenu
-    );
-    const scheduledPostcheckFailed = !activateNow && (
-      Number(postcheck.active_count) > 1 ||
+
+    const defaultPostcheckFailed = isDefaultPublication && (
+      Number(postcheck.active_default_count) !== 1 ||
+      Number(postcheck.active_default_id) !== Number(inserted.id_menu_vigente) ||
       Number(postcheck.inserted_matches) !== 1
     );
-    if (activeNowPostcheckFailed || scheduledPostcheckFailed) {
+    const seasonPostcheckFailed = isSeasonPublication && (
+      Number(postcheck.active_default_count) < 1 ||
+      Number(postcheck.inserted_matches) !== 1 ||
+      Number(postcheck.overlapping_seasons) !== 1
+    );
+    if (defaultPostcheckFailed || seasonPostcheckFailed) {
       throw buildMenuProgrammingError({
         code: 'MENU_VIGENCIA_POSTCHECK_FAILED',
         message: 'La vigencia no supero la validacion final.',
@@ -1714,6 +1894,12 @@ router.post('/programacion', checkPermission(MENU_PUBLICACION_SAVE_PERMISSIONS),
           id_sucursal: Number(inserted.id_sucursal),
           id_menu: Number(inserted.id_menu),
           fecha_inicio: inserted.fecha_inicio,
+          fecha_fin: inserted.fecha_fin || null,
+          tipo_publicacion: inserted.tipo_publicacion || tipoPublicacion,
+          es_default: parseBoolean(inserted.es_default),
+          prioridad: inserted.prioridad !== null && inserted.prioridad !== undefined
+            ? Number(inserted.prioridad)
+            : prioridad,
           estado: parseBoolean(inserted.estado)
         },
         menu_activo_actual: activeMenu ? mapMenuSummary(activeMenu) : null,
