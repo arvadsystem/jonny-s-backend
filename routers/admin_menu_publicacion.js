@@ -2,7 +2,6 @@
 import { randomUUID } from 'node:crypto';
 import pool from '../config/db-connection.js';
 import { checkPermission } from '../middleware/checkPermission.js';
-import { resolveMenuDepartmentIds } from './menu_departamentos.js';
 import { syncExistingBranchProductsIntoMenu } from '../services/menuAutoPublicationService.js';
 import {
   getPublicMenuHeroCarouselConfig,
@@ -20,22 +19,6 @@ const ITEM_TYPES = Object.freeze({
   RECETA: 'RECETA',
   COMBO: 'COMBO'
 });
-
-// Fallback por categoria de inventario cuando el producto no trae id_tipo_departamento esperado.
-const MENU_PRODUCT_CATEGORY_ALIASES = Object.freeze([
-  'cervezas',
-  'cerveza',
-  'refrescos/agua',
-  'refrescos / agua',
-  'gaseosas y refrescos',
-  'gaseosas/refrescos',
-  'aguas, isotónicos y energéticas',
-  'aguas, isotonicos y energeticas',
-  'helados',
-  'helados sarita',
-  'snacks',
-  'snack'
-]);
 
 const toPositiveInt = (value) => {
   const parsed = Number.parseInt(String(value ?? '').trim(), 10);
@@ -501,6 +484,48 @@ const getCatalogImageCapabilities = async () => {
   };
 };
 
+const getMenuPublicationRules = async () => {
+  const result = await pool.query(
+    `
+      SELECT
+        tipo_item,
+        id_categoria_producto,
+        id_tipo_departamento
+      FROM public.menu_publicacion_reglas
+      WHERE COALESCE(estado, true) = true
+        AND incluir_catalogo_admin = true;
+    `
+  );
+
+  const rules = {
+    productCategoryIds: [],
+    recipeDepartmentIds: [],
+    comboDepartmentIds: []
+  };
+
+  for (const row of result.rows || []) {
+    const tipoItem = normalizeItemType(row.tipo_item);
+    if (tipoItem === ITEM_TYPES.PRODUCTO) {
+      const idCategoria = toPositiveInt(row.id_categoria_producto);
+      if (idCategoria) rules.productCategoryIds.push(idCategoria);
+    }
+    if (tipoItem === ITEM_TYPES.RECETA) {
+      const idDepartamento = toPositiveInt(row.id_tipo_departamento);
+      if (idDepartamento) rules.recipeDepartmentIds.push(idDepartamento);
+    }
+    if (tipoItem === ITEM_TYPES.COMBO) {
+      const idDepartamento = toPositiveInt(row.id_tipo_departamento);
+      if (idDepartamento) rules.comboDepartmentIds.push(idDepartamento);
+    }
+  }
+
+  return {
+    productCategoryIds: [...new Set(rules.productCategoryIds)],
+    recipeDepartmentIds: [...new Set(rules.recipeDepartmentIds)],
+    comboDepartmentIds: [...new Set(rules.comboDepartmentIds)]
+  };
+};
+
 const resolveSharedMenuImpact = async ({ idMenu, idSucursal }) => {
   const safeMenuId = toPositiveInt(idMenu);
   if (!safeMenuId) {
@@ -524,14 +549,16 @@ const resolveSharedMenuImpact = async ({ idMenu, idSucursal }) => {
   });
 };
 
-const fetchBaseCatalogByMenu = async (idMenu, idSucursal, departmentIds, imageCapabilities = {}) => {
-  const recipeExcludedDepartmentIds = Array.isArray(departmentIds?.recipeExcludedDepartmentIds)
-    ? departmentIds.recipeExcludedDepartmentIds
+const fetchBaseCatalogByMenu = async (idMenu, idSucursal, publicationRules, imageCapabilities = {}) => {
+  const productCategoryIds = Array.isArray(publicationRules?.productCategoryIds)
+    ? publicationRules.productCategoryIds
     : [];
-  const comboDepartmentId = Number.isInteger(departmentIds?.comboDepartmentId)
-    ? departmentIds.comboDepartmentId
-    : null;
-  const productCategoryAliases = [...MENU_PRODUCT_CATEGORY_ALIASES];
+  const recipeDepartmentIds = Array.isArray(publicationRules?.recipeDepartmentIds)
+    ? publicationRules.recipeDepartmentIds
+    : [];
+  const comboDepartmentIds = Array.isArray(publicationRules?.comboDepartmentIds)
+    ? publicationRules.comboDepartmentIds
+    : [];
   const hasProductoArchivoImagen = Boolean(imageCapabilities?.hasProductoArchivoImagen);
   const productImageSelect = hasProductoArchivoImagen
     ? 'a_producto.url_publica::text AS url_imagen_publica'
@@ -559,7 +586,7 @@ const fetchBaseCatalogByMenu = async (idMenu, idSucursal, departmentIds, imageCa
        AND (a_receta.estado = true OR a_receta.estado IS NULL)
       WHERE COALESCE(r.estado, true) = true
         AND r.id_tipo_departamento IS NOT NULL
-        AND r.id_tipo_departamento <> ALL($2::int[])
+        AND r.id_tipo_departamento = ANY($2::int[])
 
       UNION ALL
 
@@ -575,11 +602,11 @@ const fetchBaseCatalogByMenu = async (idMenu, idSucursal, departmentIds, imageCa
         ON a_combo.id_archivo = c.id_archivo
        AND (a_combo.estado = true OR a_combo.estado IS NULL)
       WHERE COALESCE(c.estado, true) = true
-        AND c.id_tipo_departamento = $3
+        AND c.id_tipo_departamento = ANY($3::int[])
 
       UNION ALL
 
-      SELECT
+      SELECT DISTINCT
         '${ITEM_TYPES.PRODUCTO}'::text AS tipo_item,
         p.id_producto::int AS id_item_origen,
         p.nombre_producto::text AS nombre_item,
@@ -599,7 +626,7 @@ const fetchBaseCatalogByMenu = async (idMenu, idSucursal, departmentIds, imageCa
       WHERE COALESCE(cp.estado, true) = true
         AND ap.id_sucursal = $5
         AND (
-          LOWER(REGEXP_REPLACE(TRIM(COALESCE(cp.nombre_categoria, '')), '\\s*/\\s*', '/', 'g')) = ANY($4::text[])
+          p.id_categoria_producto = ANY($4::int[])
           OR EXISTS (
             SELECT 1
             FROM detalle_menu dm_catalogo
@@ -613,9 +640,9 @@ const fetchBaseCatalogByMenu = async (idMenu, idSucursal, departmentIds, imageCa
     `,
     [
       idMenu,
-      recipeExcludedDepartmentIds,
-      comboDepartmentId,
-      productCategoryAliases,
+      recipeDepartmentIds,
+      comboDepartmentIds,
+      productCategoryIds,
       idSucursal
     ]
   );
@@ -1713,11 +1740,10 @@ router.get('/catalogo', checkPermission(MENU_PUBLICACION_VIEW_PERMISSIONS), asyn
       return res.status(400).json({ ok: false, message: 'id_sucursal es obligatorio y debe ser entero positivo.' });
     }
 
-    const [capabilities, imageCapabilities, departmentIds, activeMenu, branch] = await Promise.all([
+    const [capabilities, imageCapabilities, publicationRules, activeMenu, branch] = await Promise.all([
       getDetalleMenuCapabilities(),
       getCatalogImageCapabilities(),
-      // Evita IDs hardcodeados y usa la configuracion real de tipo_departamento.
-      resolveMenuDepartmentIds(),
+      getMenuPublicationRules(),
       getActiveMenuByBranch(idSucursal),
       getBranchById(idSucursal)
     ]);
@@ -1771,7 +1797,7 @@ router.get('/catalogo', checkPermission(MENU_PUBLICACION_VIEW_PERMISSIONS), asyn
 
     const targetMenuId = Number(resolvedMenu.id_menu);
     const [baseRows, detailRows, sharedMenuImpact, crossBranchRows] = await Promise.all([
-      fetchBaseCatalogByMenu(targetMenuId, idSucursal, departmentIds, imageCapabilities),
+      fetchBaseCatalogByMenu(targetMenuId, idSucursal, publicationRules, imageCapabilities),
       fetchDetalleRowsByMenu({ idMenu: targetMenuId, idSucursal, capabilities }),
       resolveSharedMenuImpact({ idMenu: targetMenuId, idSucursal }),
       fetchCrossBranchDetalleRowsByMenu({ idMenu: targetMenuId, idSucursal })
@@ -1817,10 +1843,10 @@ router.get('/preview', checkPermission(MENU_PUBLICACION_VIEW_PERMISSIONS), async
       return res.status(400).json({ ok: false, message: 'id_sucursal es obligatorio y debe ser entero positivo.' });
     }
 
-    const [capabilities, imageCapabilities, departmentIds, activeMenu, branch] = await Promise.all([
+    const [capabilities, imageCapabilities, publicationRules, activeMenu, branch] = await Promise.all([
       getDetalleMenuCapabilities(),
       getCatalogImageCapabilities(),
-      resolveMenuDepartmentIds(),
+      getMenuPublicationRules(),
       getActiveMenuByBranch(idSucursal),
       getBranchById(idSucursal)
     ]);
@@ -1867,7 +1893,7 @@ router.get('/preview', checkPermission(MENU_PUBLICACION_VIEW_PERMISSIONS), async
 
     const targetMenuId = Number(resolvedMenu.id_menu);
     const [baseRows, detailRows, sharedMenuImpact, crossBranchRows] = await Promise.all([
-      fetchBaseCatalogByMenu(targetMenuId, idSucursal, departmentIds, imageCapabilities),
+      fetchBaseCatalogByMenu(targetMenuId, idSucursal, publicationRules, imageCapabilities),
       fetchDetalleRowsByMenu({ idMenu: targetMenuId, idSucursal, capabilities }),
       resolveSharedMenuImpact({ idMenu: targetMenuId, idSucursal }),
       fetchCrossBranchDetalleRowsByMenu({ idMenu: targetMenuId, idSucursal })

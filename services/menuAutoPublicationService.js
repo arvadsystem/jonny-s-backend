@@ -6,20 +6,6 @@ const DETAIL_ITEM_TYPES = Object.freeze({
   COMBO: 'COMBO'
 });
 
-const MENU_PRODUCT_CATEGORY_ALIASES = Object.freeze([
-  'cervezas',
-  'cerveza',
-  'refrescos/agua',
-  'refrescos / agua',
-  'gaseosas y refrescos',
-  'gaseosas/refrescos',
-  'aguas, isotónicos y energéticas',
-  'aguas, isotonicos y energeticas',
-  'helados sarita',
-  'snacks',
-  'snack'
-]);
-
 let detalleMenuCapabilitiesPromise = null;
 
 const getDetalleMenuCapabilities = async (db = pool) => {
@@ -63,27 +49,83 @@ const toPositiveInt = (value) => {
   return Number.isInteger(parsed) && parsed > 0 ? parsed : null;
 };
 
-const resolveProductCategoryAlias = async ({ client, idCategoriaProducto }) => {
-  const id = toPositiveInt(idCategoriaProducto);
-  if (!id) return '';
+const mapPublicationRule = (row) => {
+  if (!row) return null;
+  return {
+    visibleDefault: row.visible_default !== null && row.visible_default !== undefined
+      ? Boolean(row.visible_default)
+      : true
+  };
+};
+
+const getProductAutoPublicationRule = async ({ client, idProducto, idCategoriaProducto }) => {
+  const productId = toPositiveInt(idProducto);
+  const categoryId = toPositiveInt(idCategoriaProducto);
+  if (!productId) return null;
 
   const result = await client.query(
     `
-      SELECT LOWER(REGEXP_REPLACE(TRIM(COALESCE(nombre_categoria, '')), '\\s*/\\s*', '/', 'g')) AS alias
-      FROM categorias_productos
-      WHERE id_categoria_producto = $1
-        AND COALESCE(estado, true) = true
+      SELECT mpr.visible_default
+      FROM public.productos p
+      INNER JOIN public.menu_publicacion_reglas mpr
+        ON mpr.tipo_item = $2
+       AND mpr.id_categoria_producto = p.id_categoria_producto
+       AND COALESCE(mpr.estado, true) = true
+       AND COALESCE(mpr.autopublicar, false) = true
+      WHERE p.id_producto = $1
+        AND ($3::int IS NULL OR p.id_categoria_producto = $3)
       LIMIT 1;
     `,
-    [id]
+    [productId, DETAIL_ITEM_TYPES.PRODUCTO, categoryId]
   );
 
-  return String(result.rows?.[0]?.alias || '').trim();
+  return mapPublicationRule(result.rows?.[0] || null);
 };
 
-const isProductEligibleForPublicMenu = async ({ client, idCategoriaProducto }) => {
-  const alias = await resolveProductCategoryAlias({ client, idCategoriaProducto });
-  return MENU_PRODUCT_CATEGORY_ALIASES.includes(alias);
+const getRecipeAutoPublicationRule = async ({ client, idReceta }) => {
+  const recipeId = toPositiveInt(idReceta);
+  if (!recipeId) return null;
+
+  const result = await client.query(
+    `
+      SELECT mpr.visible_default
+      FROM public.recetas r
+      INNER JOIN public.menu_publicacion_reglas mpr
+        ON mpr.tipo_item = $2
+       AND mpr.id_tipo_departamento = r.id_tipo_departamento
+       AND COALESCE(mpr.estado, true) = true
+       AND COALESCE(mpr.autopublicar, false) = true
+      WHERE r.id_receta = $1
+        AND r.id_tipo_departamento IS NOT NULL
+      LIMIT 1;
+    `,
+    [recipeId, DETAIL_ITEM_TYPES.RECETA]
+  );
+
+  return mapPublicationRule(result.rows?.[0] || null);
+};
+
+const getComboAutoPublicationRule = async ({ client, idCombo }) => {
+  const comboId = toPositiveInt(idCombo);
+  if (!comboId) return null;
+
+  const result = await client.query(
+    `
+      SELECT mpr.visible_default
+      FROM public.combos c
+      INNER JOIN public.menu_publicacion_reglas mpr
+        ON mpr.tipo_item = $2
+       AND mpr.id_tipo_departamento = c.id_tipo_departamento
+       AND COALESCE(mpr.estado, true) = true
+       AND COALESCE(mpr.autopublicar, false) = true
+      WHERE c.id_combo = $1
+        AND c.id_tipo_departamento IS NOT NULL
+      LIMIT 1;
+    `,
+    [comboId, DETAIL_ITEM_TYPES.COMBO]
+  );
+
+  return mapPublicationRule(result.rows?.[0] || null);
 };
 
 const getActivePublicMenuIdsByBranch = async ({ client, idSucursal }) => {
@@ -410,38 +452,45 @@ const ensureDetailMenuRows = async ({
 export const autoPublishNewRecipe = async ({
   client,
   idMenu,
-  idReceta,
-  estadoItem = true
-}) => ensureDetailMenuRows({
-  client,
-  menuIds: [idMenu],
-  tipoItem: DETAIL_ITEM_TYPES.RECETA,
-  idItemOrigen: idReceta,
-  visibleDefault: Boolean(estadoItem)
-});
+  idReceta
+}) => {
+  const rule = await getRecipeAutoPublicationRule({ client, idReceta });
+  if (!rule) return 0;
+
+  return ensureDetailMenuRows({
+    client,
+    menuIds: [idMenu],
+    tipoItem: DETAIL_ITEM_TYPES.RECETA,
+    idItemOrigen: idReceta,
+    visibleDefault: rule.visibleDefault
+  });
+};
 
 export const autoPublishNewCombo = async ({
   client,
   idMenu,
-  idCombo,
-  estadoItem = true
-}) => ensureDetailMenuRows({
-  client,
-  menuIds: [idMenu],
-  tipoItem: DETAIL_ITEM_TYPES.COMBO,
-  idItemOrigen: idCombo,
-  visibleDefault: Boolean(estadoItem)
-});
+  idCombo
+}) => {
+  const rule = await getComboAutoPublicationRule({ client, idCombo });
+  if (!rule) return 0;
+
+  return ensureDetailMenuRows({
+    client,
+    menuIds: [idMenu],
+    tipoItem: DETAIL_ITEM_TYPES.COMBO,
+    idItemOrigen: idCombo,
+    visibleDefault: rule.visibleDefault
+  });
+};
 
 export const autoPublishNewProduct = async ({
   client,
   idProducto,
   idCategoriaProducto,
-  idAlmacen,
-  estadoItem = true
+  idAlmacen
 }) => {
-  const eligible = await isProductEligibleForPublicMenu({ client, idCategoriaProducto });
-  if (!eligible) return 0;
+  const rule = await getProductAutoPublicationRule({ client, idProducto, idCategoriaProducto });
+  if (!rule) return 0;
 
   const warehouseResult = await client.query(
     `
@@ -463,7 +512,7 @@ export const autoPublishNewProduct = async ({
     menuIds: activeMenuIds,
     tipoItem: DETAIL_ITEM_TYPES.PRODUCTO,
     idItemOrigen: idProducto,
-    visibleDefault: Boolean(estadoItem)
+    visibleDefault: rule.visibleDefault
   });
 };
 
@@ -478,7 +527,9 @@ export const syncExistingBranchProductsIntoMenu = async ({
 
   const result = await client.query(
     `
-      SELECT DISTINCT p.id_producto::int AS id_producto
+      SELECT DISTINCT
+        p.id_producto::int AS id_producto,
+        COALESCE(mpr.visible_default, true) AS visible_default
       FROM public.productos_almacenes pa
       INNER JOIN public.almacenes ap
         ON ap.id_almacen = pa.id_almacen
@@ -486,31 +537,42 @@ export const syncExistingBranchProductsIntoMenu = async ({
        AND COALESCE(ap.estado, true) = true
       INNER JOIN public.productos p
         ON p.id_producto = pa.id_producto
-      LEFT JOIN categorias_productos cp
-        ON cp.id_categoria_producto = p.id_categoria_producto
+      INNER JOIN public.menu_publicacion_reglas mpr
+        ON mpr.tipo_item = $2
+       AND mpr.id_categoria_producto = p.id_categoria_producto
+       AND COALESCE(mpr.estado, true) = true
+       AND COALESCE(mpr.autopublicar, false) = true
       WHERE COALESCE(pa.estado, true) = true
         AND COALESCE(p.estado, true) = true
-        AND COALESCE(cp.estado, true) = true
-        AND LOWER(REGEXP_REPLACE(TRIM(COALESCE(cp.nombre_categoria, '')), '\\s*/\\s*', '/', 'g')) = ANY($2::text[])
       ORDER BY p.id_producto ASC;
     `,
-    [branchId, [...MENU_PRODUCT_CATEGORY_ALIASES]]
+    [branchId, DETAIL_ITEM_TYPES.PRODUCTO]
   );
 
-  const productIds = [...new Set((result.rows || [])
-    .map((row) => toPositiveInt(row.id_producto))
-    .filter(Boolean))];
+  const products = [];
+  const seenProductIds = new Set();
+  for (const row of result.rows || []) {
+    const idProducto = toPositiveInt(row.id_producto);
+    if (!idProducto || seenProductIds.has(idProducto)) continue;
+    seenProductIds.add(idProducto);
+    products.push({
+      idProducto,
+      visibleDefault: row.visible_default !== null && row.visible_default !== undefined
+        ? Boolean(row.visible_default)
+        : true
+    });
+  }
 
-  if (productIds.length === 0) return 0;
+  if (products.length === 0) return 0;
 
   let createdCount = 0;
-  for (const idProducto of productIds) {
+  for (const product of products) {
     createdCount += await ensureDetailMenuRows({
       client,
       menuIds: [menuId],
       tipoItem: DETAIL_ITEM_TYPES.PRODUCTO,
-      idItemOrigen: idProducto,
-      visibleDefault: true
+      idItemOrigen: product.idProducto,
+      visibleDefault: product.visibleDefault
     });
   }
 
