@@ -134,18 +134,9 @@ const getActivePublicMenuIdsByBranch = async ({ client, idSucursal }) => {
 
   const result = await client.query(
     `
-      SELECT DISTINCT mv.id_menu::int AS id_menu
-      FROM menu_vigente mv
-      INNER JOIN menu m
-        ON m.id_menu = mv.id_menu
-      INNER JOIN sucursales s
-        ON s.id_sucursal = mv.id_sucursal
-      WHERE COALESCE(mv.estado, true) = true
-        AND COALESCE(m.estado, true) = true
-        AND COALESCE(s.estado, true) = true
-        AND mv.id_sucursal = $1
-        AND mv.fecha_inicio <= NOW()
-      ORDER BY mv.id_menu ASC;
+      SELECT DISTINCT r.id_menu::int AS id_menu
+      FROM public.fn_resolver_menu_publicado($1) r
+      ORDER BY r.id_menu ASC;
     `,
     [branchId]
   );

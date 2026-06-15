@@ -106,21 +106,20 @@ const getActiveMenuByBranch = async (idSucursal) => {
   const result = await pool.query(
     `
       SELECT
-        mv.id_menu_vigente,
-        mv.id_sucursal,
-        mv.id_menu,
-        mv.fecha_inicio,
-        m.nombre_menu,
-        m.descripcion AS menu_descripcion,
+        r.id_menu_vigente,
+        r.id_sucursal,
+        r.id_menu,
+        r.fecha_inicio,
+        r.fecha_fin,
+        r.tipo_publicacion,
+        r.es_default,
+        r.prioridad,
+        r.nombre_menu,
+        COALESCE(m.descripcion, '') AS menu_descripcion,
         s.nombre_sucursal
-      FROM menu_vigente mv
-      INNER JOIN menu m ON m.id_menu = mv.id_menu
-      INNER JOIN sucursales s ON s.id_sucursal = mv.id_sucursal
-      WHERE mv.id_sucursal = $1
-        AND COALESCE(mv.estado, true) = true
-        AND COALESCE(m.estado, true) = true
-        AND COALESCE(mv.fecha_inicio, NOW()) <= NOW()
-      ORDER BY mv.fecha_inicio DESC, mv.id_menu_vigente DESC
+      FROM public.fn_resolver_menu_publicado($1) r
+      INNER JOIN menu m ON m.id_menu = r.id_menu
+      INNER JOIN sucursales s ON s.id_sucursal = r.id_sucursal
       LIMIT 1;
     `,
     [idSucursal]
@@ -136,7 +135,15 @@ const mapMenuSummary = (row) => ({
   nombre_menu: row.nombre_menu || 'Menu',
   descripcion_menu: row.menu_descripcion || '',
   nombre_sucursal: row.nombre_sucursal || '',
-  fecha_inicio: row.fecha_inicio || null
+  fecha_inicio: row.fecha_inicio || null,
+  tipo_publicacion: row.tipo_publicacion || null,
+  es_default: row.es_default !== undefined && row.es_default !== null
+    ? parseBoolean(row.es_default)
+    : null,
+  fecha_fin: row.fecha_fin || null,
+  prioridad: row.prioridad !== undefined && row.prioridad !== null
+    ? Number(row.prioridad)
+    : null
 });
 const SHARED_MENU_WARNING_PREFIX = 'Atencion: este menu esta compartido entre sucursales.';
 
@@ -365,23 +372,24 @@ const getBranchesForPublication = async () => {
         COALESCE(vsi.texto_direccion, '') AS direccion,
         mv.id_menu_vigente,
         mv.id_menu,
-        mv.fecha_inicio
+        mv.fecha_inicio,
+        mv.fecha_fin,
+        mv.tipo_publicacion,
+        mv.es_default,
+        mv.prioridad
       FROM sucursales s
       LEFT JOIN v_sucursales_info vsi
         ON vsi.id_sucursal = s.id_sucursal
       LEFT JOIN LATERAL (
         SELECT
-          mvv.id_menu_vigente,
-          mvv.id_menu,
-          mvv.fecha_inicio
-        FROM menu_vigente mvv
-        INNER JOIN menu m
-          ON m.id_menu = mvv.id_menu
-        WHERE mvv.id_sucursal = s.id_sucursal
-          AND COALESCE(mvv.estado, true) = true
-          AND COALESCE(m.estado, true) = true
-          AND COALESCE(mvv.fecha_inicio, NOW()) <= NOW()
-        ORDER BY mvv.fecha_inicio DESC, mvv.id_menu_vigente DESC
+          r.id_menu_vigente,
+          r.id_menu,
+          r.fecha_inicio,
+          r.fecha_fin,
+          r.tipo_publicacion,
+          r.es_default,
+          r.prioridad
+        FROM public.fn_resolver_menu_publicado(s.id_sucursal) r
         LIMIT 1
       ) mv ON true
       ORDER BY s.id_sucursal ASC;
@@ -396,7 +404,15 @@ const getBranchesForPublication = async () => {
     tiene_menu_vigente: Number(row.id_menu_vigente || 0) > 0,
     id_menu_vigente: row.id_menu_vigente ? Number(row.id_menu_vigente) : null,
     id_menu: row.id_menu ? Number(row.id_menu) : null,
-    fecha_inicio_menu: row.fecha_inicio || null
+    fecha_inicio_menu: row.fecha_inicio || null,
+    tipo_publicacion: row.tipo_publicacion || null,
+    es_default: row.es_default !== undefined && row.es_default !== null
+      ? parseBoolean(row.es_default)
+      : null,
+    fecha_fin: row.fecha_fin || null,
+    prioridad: row.prioridad !== undefined && row.prioridad !== null
+      ? Number(row.prioridad)
+      : null
   }));
 };
 
@@ -410,23 +426,24 @@ const getActiveBranchesByMenu = async (idMenu) => {
         s.nombre_sucursal,
         COALESCE(vsi.texto_direccion, '') AS direccion,
         mv.id_menu_vigente,
-        mv.fecha_inicio
+        mv.fecha_inicio,
+        mv.fecha_fin,
+        mv.tipo_publicacion,
+        mv.es_default,
+        mv.prioridad
       FROM sucursales s
       LEFT JOIN v_sucursales_info vsi
         ON vsi.id_sucursal = s.id_sucursal
       INNER JOIN LATERAL (
         SELECT
-          mvv.id_menu_vigente,
-          mvv.id_menu,
-          mvv.fecha_inicio
-        FROM menu_vigente mvv
-        INNER JOIN menu m
-          ON m.id_menu = mvv.id_menu
-        WHERE mvv.id_sucursal = s.id_sucursal
-          AND COALESCE(mvv.estado, true) = true
-          AND COALESCE(m.estado, true) = true
-          AND COALESCE(mvv.fecha_inicio, NOW()) <= NOW()
-        ORDER BY mvv.fecha_inicio DESC, mvv.id_menu_vigente DESC
+          r.id_menu_vigente,
+          r.id_menu,
+          r.fecha_inicio,
+          r.fecha_fin,
+          r.tipo_publicacion,
+          r.es_default,
+          r.prioridad
+        FROM public.fn_resolver_menu_publicado(s.id_sucursal) r
         LIMIT 1
       ) mv ON true
       WHERE mv.id_menu = $1
@@ -441,7 +458,15 @@ const getActiveBranchesByMenu = async (idMenu) => {
     nombre_sucursal: row.nombre_sucursal || `Sucursal #${row.id_sucursal}`,
     direccion: row.direccion || '',
     id_menu_vigente: Number(row.id_menu_vigente),
-    fecha_inicio_menu: row.fecha_inicio || null
+    fecha_inicio_menu: row.fecha_inicio || null,
+    tipo_publicacion: row.tipo_publicacion || null,
+    es_default: row.es_default !== undefined && row.es_default !== null
+      ? parseBoolean(row.es_default)
+      : null,
+    fecha_fin: row.fecha_fin || null,
+    prioridad: row.prioridad !== undefined && row.prioridad !== null
+      ? Number(row.prioridad)
+      : null
   }));
 };
 

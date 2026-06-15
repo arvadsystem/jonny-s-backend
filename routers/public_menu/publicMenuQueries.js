@@ -223,28 +223,26 @@ export const fetchBranchOperationalSnapshotQuery = async ({
   return result.rows;
 };
 
-// Obtiene el menu vigente activo por sucursal (el mas reciente por fecha_inicio).
+// Obtiene el menu publicado resuelto por la funcion oficial de BD.
 export const fetchActiveMenuByBranchQuery = async (idSucursal, db = pool) => {
   const query = `
     SELECT
-      mv.id_menu_vigente,
-      mv.id_sucursal,
-      mv.id_menu,
-      mv.fecha_inicio,
-      m.nombre_menu,
-      m.descripcion AS menu_descripcion,
-      s.nombre_sucursal
-    FROM menu_vigente mv
-    INNER JOIN menu m
-      ON m.id_menu = mv.id_menu
-    INNER JOIN sucursales s
-      ON s.id_sucursal = mv.id_sucursal
-    WHERE mv.id_sucursal = $1
-      AND COALESCE(mv.estado, true) = true
-      AND COALESCE(m.estado, true) = true
-      AND COALESCE(s.estado, true) = true
-      AND COALESCE(mv.fecha_inicio, NOW()) <= NOW()
-    ORDER BY mv.fecha_inicio DESC, mv.id_menu_vigente DESC
+      r.id_menu_vigente,
+      r.id_sucursal,
+      r.id_menu,
+      r.nombre_menu,
+      COALESCE(m.descripcion, '') AS menu_descripcion,
+      s.nombre_sucursal,
+      r.tipo_publicacion,
+      r.es_default,
+      r.fecha_inicio,
+      r.fecha_fin,
+      r.prioridad
+    FROM public.fn_resolver_menu_publicado($1) r
+    INNER JOIN public.menu m
+      ON m.id_menu = r.id_menu
+    INNER JOIN public.sucursales s
+      ON s.id_sucursal = r.id_sucursal
     LIMIT 1;
   `;
 

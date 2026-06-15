@@ -674,7 +674,15 @@ const mapMenuSummary = (row) => ({
   nombre_menu: row.nombre_menu,
   descripcion_menu: row.menu_descripcion || '',
   nombre_sucursal: row.nombre_sucursal,
-  fecha_inicio: row.fecha_inicio
+  fecha_inicio: row.fecha_inicio,
+  tipo_publicacion: row.tipo_publicacion || null,
+  es_default: row.es_default !== undefined && row.es_default !== null
+    ? toBoolean(row.es_default)
+    : null,
+  fecha_fin: row.fecha_fin || null,
+  prioridad: row.prioridad !== undefined && row.prioridad !== null
+    ? Number(row.prioridad)
+    : null
 });
 
 const resolvePendingStateId = async (db = pool) => {
