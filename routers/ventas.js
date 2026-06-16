@@ -167,6 +167,7 @@ const hasColumn = async (client, tableName, columnName) => {
   schemaColumnCache.set(key, exists);
   return exists;
 };
+
 const hasTable = async (client, tableName) => {
   const key = `table:${String(tableName || '').trim().toLowerCase()}`;
   if (schemaColumnCache.has(key)) return schemaColumnCache.get(key);
@@ -6016,6 +6017,8 @@ router.get(
 router.get('/ventas/pedidos-menu', checkPermission(['VENTAS_VER']), async (req, res) => {
   const client = await pool.connect();
   try {
+    const hasDetallePedidoConfiguracionMenu = await hasColumn(client, 'detalle_pedido', 'configuracion_menu');
+    const hasDetallePedidoExtras = await hasTable(client, 'detalle_pedido_extras');
     const scope = await resolveRequestUserSucursalScope(req, client);
     const allowedSucursalIds = Array.isArray(scope.allowedSucursalIds)
       ? scope.allowedSucursalIds.filter((value) => Number.isInteger(Number(value)) && Number(value) > 0).map(Number)
@@ -6086,7 +6089,7 @@ router.get('/ventas/pedidos-menu', checkPermission(['VENTAS_VER']), async (req, 
 
     if (search) {
       const searchOr = [];
-      const codeMatch = search.match(/^PED[-\s]?0*(\d+)$/i);
+      const codeMatch = search.match(/^(?:PED|VTA)[-\s]?0*(\d+)$/i);
       const exactId = /^\d+$/.test(search)
         ? Number.parseInt(search, 10)
         : codeMatch
@@ -6099,7 +6102,9 @@ router.get('/ventas/pedidos-menu', checkPermission(['VENTAS_VER']), async (req, 
       params.push(`%${search}%`);
       const likeIndex = params.length;
       searchOr.push(`('PED-' || LPAD(p.id_pedido::text, 5, '0')) ILIKE $${likeIndex}`);
+      searchOr.push(`('VTA-' || LPAD(p.id_pedido::text, 5, '0')) ILIKE $${likeIndex}`);
       searchOr.push(`COALESCE(NULLIF(TRIM(f.codigo_venta), ''), '') ILIKE $${likeIndex}`);
+      searchOr.push(`COALESCE(NULLIF(TRIM(f.codigo_venta), ''), 'VTA-' || LPAD(p.id_pedido::text, 5, '0')) ILIKE $${likeIndex}`);
       searchOr.push(`COALESCE(NULLIF(TRIM(CONCAT_WS(' ', per.nombre, per.apellido)), ''), '') ILIKE $${likeIndex}`);
       if (hasPedidosContacto) {
         searchOr.push(`COALESCE(pc.nombre_contacto, '') ILIKE $${likeIndex}`);
@@ -6212,7 +6217,9 @@ router.get('/ventas/pedidos-menu', checkPermission(['VENTAS_VER']), async (req, 
           ${kdsExpectedMinutesSelect},
           ${kdsExpectedRuleSelect},
           ${kdsVencidoSelect},
-          COALESCE(NULLIF(TRIM(f.codigo_venta), ''), NULL) AS codigo_venta,
+          COALESCE(NULLIF(TRIM(f.codigo_venta), ''), 'VTA-' || LPAD(p.id_pedido::text, 5, '0')) AS codigo_venta,
+          COALESCE(NULLIF(TRIM(f.codigo_venta), ''), 'VTA-' || LPAD(p.id_pedido::text, 5, '0')) AS codigo_venta_operativo,
+          'PED-' || LPAD(p.id_pedido::text, 5, '0') AS codigo_pedido,
           s.nombre_sucursal,
           fc_info.metodo_pago,
           COALESCE(vcd_info.divisiones_count, 0)::int AS cuenta_dividida_divisiones,
@@ -6288,7 +6295,19 @@ router.get('/ventas/pedidos-menu', checkPermission(['VENTAS_VER']), async (req, 
                 'sub_total', COALESCE(dp.sub_total_pedido, 0),
                 'total_linea', COALESCE(dp.total_pedido, dp.sub_total_pedido, 0),
                 'descuento', COALESCE(d.monto_descuento, 0),
-                'observacion', dp.observacion
+                'descuento_linea', COALESCE(d.monto_descuento, 0),
+                'descuento_global', 0,
+                'descuento_porcentaje_linea',
+                  CASE
+                    WHEN COALESCE(dp.sub_total_pedido, 0) > 0 AND COALESCE(d.monto_descuento, 0) > 0
+                      THEN LEAST(100, (COALESCE(d.monto_descuento, 0) / COALESCE(dp.sub_total_pedido, 1)) * 100)
+                    ELSE NULL
+                  END,
+                'observacion', dp.observacion,
+                'extras', ${hasDetallePedidoExtras
+                  ? `COALESCE(extras_info.extras, '[]'::jsonb)`
+                  : `'[]'::jsonb`},
+                'configuracion_menu', ${hasDetallePedidoConfiguracionMenu ? 'dp.configuracion_menu' : 'NULL::jsonb'}
               )
               ORDER BY dp.id_detalle_pedido
             ) AS items
@@ -6297,6 +6316,26 @@ router.get('/ventas/pedidos-menu', checkPermission(['VENTAS_VER']), async (req, 
           LEFT JOIN combos combo ON combo.id_combo = dp.id_combo
           LEFT JOIN recetas rec ON rec.id_receta = dp.id_receta
           LEFT JOIN descuentos d ON d.id_descuento = dp.id_descuento
+          ${hasDetallePedidoExtras ? `
+          LEFT JOIN LATERAL (
+            SELECT jsonb_agg(
+              jsonb_build_object(
+                'id_detalle_pedido_extra', dpe.id_detalle_pedido_extra,
+                'id_extra', dpe.id_extra,
+                'nombre', dpe.nombre_extra_snapshot,
+                'nombre_extra', dpe.nombre_extra_snapshot,
+                'cantidad', dpe.cantidad,
+                'precio_unitario', dpe.precio_unitario,
+                'precio', dpe.precio_unitario,
+                'subtotal', dpe.subtotal
+              )
+              ORDER BY dpe.id_detalle_pedido_extra
+            ) AS extras
+            FROM public.detalle_pedido_extras dpe
+            WHERE dpe.id_detalle_pedido = dp.id_detalle_pedido
+              AND COALESCE(dpe.estado, true) = true
+          ) extras_info ON true
+          ` : ''}
           WHERE dp.id_pedido = p.id_pedido
             AND COALESCE(dp.estado, true) = true
         ) dp_info ON true
@@ -6758,6 +6797,139 @@ router.post('/ventas/:id/reversiones', checkPermission(['VENTAS_REVERSION_CREAR'
 
 router.get('/ventas/buscar', checkPermission(['VENTAS_VER']), buscarVentaHandler);
 
+router.patch('/ventas/clientes/:id/telefono', checkPermission(['VENTAS_CREAR']), async (req, res) => {
+  const idCliente = parseOptionalPositiveInt(req.params.id);
+  if (!idCliente) {
+    return res.status(400).json({ error: true, message: 'id_cliente debe ser un entero mayor a 0.' });
+  }
+
+  const telefonoRaw = normalizePedidoText(req.body?.telefono, 40);
+  const telefonoDigits = normalizeTelefonoDigits(telefonoRaw);
+  if (!telefonoRaw || !telefonoDigits) {
+    return res.status(400).json({ error: true, message: 'telefono es obligatorio.' });
+  }
+  if (telefonoDigits.length !== 8) {
+    return res.status(400).json({ error: true, message: 'telefono debe tener 8 digitos.' });
+  }
+  const telefono = /^\d{4}-\d{4}$/.test(telefonoRaw)
+    ? telefonoRaw
+    : `${telefonoDigits.slice(0, 4)}-${telefonoDigits.slice(4)}`;
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const scope = await resolveRequestUserSucursalScope(req, client);
+    const allowedSucursalIds = Array.isArray(scope?.allowedSucursalIds)
+      ? scope.allowedSucursalIds.map((id) => parseOptionalPositiveInt(id)).filter(Boolean)
+      : [];
+    const userSucursalId = parseOptionalPositiveInt(scope?.userSucursalId);
+    const effectiveAllowedSucursalIds = allowedSucursalIds.length > 0 ? allowedSucursalIds : userSucursalId ? [userSucursalId] : [];
+
+    const clienteResult = await client.query(
+      `
+        SELECT
+          c.id_cliente,
+          c.estado,
+          c.id_persona,
+          c.id_empresa,
+          c.id_sucursal,
+          p.id_telefono AS persona_id_telefono,
+          tp.telefono AS persona_telefono,
+          e.id_telefono AS empresa_id_telefono,
+          te.telefono AS empresa_telefono
+        FROM public.clientes c
+        LEFT JOIN public.personas p ON p.id_persona = c.id_persona
+        LEFT JOIN public.telefonos tp ON tp.id_telefono = p.id_telefono
+        LEFT JOIN public.empresas e ON e.id_empresa = c.id_empresa
+        LEFT JOIN public.telefonos te ON te.id_telefono = e.id_telefono
+        WHERE c.id_cliente = $1
+        FOR UPDATE OF c
+      `,
+      [idCliente]
+    );
+    const cliente = clienteResult.rows?.[0] || null;
+    if (!cliente || cliente.estado === false) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: true, message: 'Cliente no encontrado.' });
+    }
+    if (!cliente.id_persona && !cliente.id_empresa) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({ error: true, message: 'No se puede actualizar telefono para consumidor final.' });
+    }
+
+    if (!scope.isSuperAdmin && effectiveAllowedSucursalIds.length > 0) {
+      let hasScope = parseOptionalPositiveInt(cliente.id_sucursal)
+        ? effectiveAllowedSucursalIds.includes(Number(cliente.id_sucursal))
+        : false;
+      if (!hasScope && await hasTable(client, 'clientes_sucursales')) {
+        const scopeResult = await client.query(
+          `
+            SELECT 1
+            FROM public.clientes_sucursales cs
+            WHERE cs.id_cliente = $1
+              AND cs.id_sucursal = ANY($2::int[])
+            LIMIT 1
+          `,
+          [idCliente, effectiveAllowedSucursalIds]
+        );
+        hasScope = scopeResult.rowCount > 0;
+      }
+      if (!hasScope) {
+        await client.query('ROLLBACK');
+        return res.status(403).json({ error: true, message: 'No tienes permiso para actualizar este cliente.' });
+      }
+    }
+
+    const target = parseOptionalPositiveInt(cliente.id_persona)
+      ? {
+          table: 'personas',
+          idField: 'id_persona',
+          id: Number(cliente.id_persona),
+          idTelefono: parseOptionalPositiveInt(cliente.persona_id_telefono),
+          telefonoActual: normalizePedidoText(cliente.persona_telefono, 40)
+        }
+      : {
+          table: 'empresas',
+          idField: 'id_empresa',
+          id: Number(cliente.id_empresa),
+          idTelefono: parseOptionalPositiveInt(cliente.empresa_id_telefono),
+          telefonoActual: normalizePedidoText(cliente.empresa_telefono, 40)
+        };
+
+    if (target.telefonoActual) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({ error: true, message: 'El cliente ya tiene telefono registrado.' });
+    }
+
+    let idTelefono = target.idTelefono;
+    if (idTelefono) {
+      await client.query(
+        'UPDATE public.telefonos SET telefono = $1 WHERE id_telefono = $2',
+        [telefono, idTelefono]
+      );
+    } else {
+      const telefonoResult = await client.query(
+        'INSERT INTO public.telefonos (telefono) VALUES ($1) RETURNING id_telefono',
+        [telefono]
+      );
+      idTelefono = Number(telefonoResult.rows?.[0]?.id_telefono || 0);
+      await client.query(
+        `UPDATE public.${target.table} SET id_telefono = $1 WHERE ${target.idField} = $2`,
+        [idTelefono, target.id]
+      );
+    }
+
+    await client.query('COMMIT');
+    return res.status(200).json({ ok: true, id_cliente: idCliente, telefono });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    console.error('Error al guardar telefono de cliente desde ventas:', error);
+    return sendVentasInternalError(res, 'No se pudo guardar el telefono del cliente.');
+  } finally {
+    client.release();
+  }
+});
+
 router.get('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), listarPedidosPendientesPago);
 
 const formatInventarioAlertaResponse = (alerta) => ({
@@ -6864,7 +7036,13 @@ async function listarPedidosPendientesPago(req, res) {
           AND UPPER(TRIM(vcd_pending.estado)) = 'PENDIENTE'
       ))`,
       'p.cancelado_por_timeout_at IS NULL',
-      "COALESCE(UPPER(TRIM(p.estado_pago)), '') NOT IN ('PAGADO_CONFIRMADO', 'CANCELADO_TIMEOUT', 'PAGO_ANULADO', 'CANCELADO', 'ANULADO')"
+      `(COALESCE(UPPER(TRIM(p.estado_pago)), '') NOT IN ('PAGADO_CONFIRMADO', 'CANCELADO_TIMEOUT', 'PAGO_ANULADO', 'CANCELADO', 'ANULADO')
+        OR EXISTS (
+          SELECT 1
+          FROM public.ventas_cuenta_divisiones vcd_pending_estado
+          WHERE vcd_pending_estado.id_pedido = p.id_pedido
+            AND UPPER(TRIM(vcd_pending_estado.estado)) = 'PENDIENTE'
+        ))`
     ];
     const params = [PEDIDO_PENDIENTE_ESTADO_PAGO];
     const excludedPedidoEstados = [
@@ -6904,7 +7082,7 @@ async function listarPedidosPendientesPago(req, res) {
 
     if (search) {
       const searchOr = [];
-      const codeMatch = search.match(/^PED[-\s]?0*(\d+)$/i);
+      const codeMatch = search.match(/^(?:PED|VTA)[-\s]?0*(\d+)$/i);
       const exactId = /^\d+$/.test(search)
         ? Number.parseInt(search, 10)
         : codeMatch
@@ -6917,6 +7095,8 @@ async function listarPedidosPendientesPago(req, res) {
       params.push('%' + search + '%');
       const likeIndex = params.length;
       searchOr.push("('PED-' || LPAD(p.id_pedido::text, 5, '0')) ILIKE $" + likeIndex);
+      searchOr.push("('VTA-' || LPAD(p.id_pedido::text, 5, '0')) ILIKE $" + likeIndex);
+      searchOr.push("COALESCE(NULLIF(TRIM(f.codigo_venta), ''), 'VTA-' || LPAD(p.id_pedido::text, 5, '0')) ILIKE $" + likeIndex);
       searchOr.push("COALESCE(pc.nombre_contacto, '') ILIKE $" + likeIndex);
       searchOr.push("COALESCE(pc.telefono_contacto, '') ILIKE $" + likeIndex);
       searchOr.push("COALESCE(pc.telefono_normalizado, '') ILIKE $" + likeIndex);
@@ -6969,7 +7149,7 @@ async function listarPedidosPendientesPago(req, res) {
       ) pd ON true
       LEFT JOIN public.cat_delivery_estados cde ON cde.id_estado_delivery = pd.id_estado_delivery
       LEFT JOIN LATERAL (
-        SELECT f_inner.id_factura
+        SELECT f_inner.id_factura, f_inner.codigo_venta
         FROM public.facturas f_inner
         WHERE f_inner.id_pedido = p.id_pedido
         ORDER BY f_inner.fecha_hora_facturacion DESC NULLS LAST, f_inner.id_factura DESC
@@ -7029,6 +7209,8 @@ async function listarPedidosPendientesPago(req, res) {
         SELECT
           p.id_pedido,
           'PED-' || LPAD(p.id_pedido::text, 5, '0') AS codigo_pedido,
+          COALESCE(NULLIF(TRIM(f.codigo_venta), ''), 'VTA-' || LPAD(p.id_pedido::text, 5, '0')) AS codigo_venta_operativo,
+          COALESCE(NULLIF(TRIM(f.codigo_venta), ''), 'VTA-' || LPAD(p.id_pedido::text, 5, '0')) AS codigo_venta,
           p.fecha_hora_pedido,
           p.origen_pedido,
           CASE
@@ -7061,6 +7243,8 @@ async function listarPedidosPendientesPago(req, res) {
     const items = result.rows.map((row) => ({
       id_pedido: Number(row.id_pedido),
       codigo_pedido: row.codigo_pedido,
+      codigo_venta_operativo: row.codigo_venta_operativo,
+      codigo_venta: row.codigo_venta,
       fecha_hora_pedido: row.fecha_hora_pedido,
       origen_pedido: row.origen_pedido,
       estado_pedido: row.estado_pedido,
@@ -7096,11 +7280,43 @@ async function listarPedidosPendientesPago(req, res) {
             END AS cantidad,
             COALESCE(prod.precio, combo.precio, rec.precio, 0)::numeric(14,2) AS precio_unitario,
             COALESCE(dp.sub_total_pedido, 0)::numeric(14,2) AS sub_total,
-            COALESCE(dp.total_pedido, dp.sub_total_pedido, 0)::numeric(14,2) AS total_linea
+            COALESCE(dp.total_pedido, dp.sub_total_pedido, 0)::numeric(14,2) AS total_linea,
+            COALESCE(d.monto_descuento, 0)::numeric(14,2) AS descuento,
+            COALESCE(d.monto_descuento, 0)::numeric(14,2) AS descuento_linea,
+            0::numeric(14,2) AS descuento_global,
+            CASE
+              WHEN COALESCE(dp.sub_total_pedido, 0) > 0 AND COALESCE(d.monto_descuento, 0) > 0
+                THEN LEAST(100, (COALESCE(d.monto_descuento, 0) / COALESCE(dp.sub_total_pedido, 1)) * 100)
+              ELSE NULL
+            END AS descuento_porcentaje_linea,
+            dp.observacion,
+            ${hasDetallePedidoConfiguracionMenu ? 'dp.configuracion_menu,' : 'NULL::jsonb AS configuracion_menu,'}
+            ${hasDetallePedidoExtras ? "COALESCE(extras_info.extras, '[]'::jsonb)" : "'[]'::jsonb"} AS extras
           FROM public.detalle_pedido dp
           LEFT JOIN public.productos prod ON prod.id_producto = dp.id_producto
           LEFT JOIN public.combos combo ON combo.id_combo = dp.id_combo
           LEFT JOIN public.recetas rec ON rec.id_receta = dp.id_receta
+          LEFT JOIN public.descuentos d ON d.id_descuento = dp.id_descuento
+          ${hasDetallePedidoExtras ? `
+          LEFT JOIN LATERAL (
+            SELECT jsonb_agg(
+              jsonb_build_object(
+                'id_detalle_pedido_extra', dpe.id_detalle_pedido_extra,
+                'id_extra', dpe.id_extra,
+                'nombre', dpe.nombre_extra_snapshot,
+                'nombre_extra', dpe.nombre_extra_snapshot,
+                'cantidad', dpe.cantidad,
+                'precio_unitario', dpe.precio_unitario,
+                'precio', dpe.precio_unitario,
+                'subtotal', dpe.subtotal
+              )
+              ORDER BY dpe.id_detalle_pedido_extra
+            ) AS extras
+            FROM public.detalle_pedido_extras dpe
+            WHERE dpe.id_detalle_pedido = dp.id_detalle_pedido
+              AND COALESCE(dpe.estado, true) = true
+          ) extras_info ON true
+          ` : ''}
           WHERE dp.id_pedido = ANY($1::int[])
             AND COALESCE(dp.estado, true) = true
           ORDER BY dp.id_pedido, dp.id_detalle_pedido
@@ -7117,7 +7333,14 @@ async function listarPedidosPendientesPago(req, res) {
           cantidad: Number(row.cantidad || 1),
           precio_unitario: roundMoney(row.precio_unitario),
           sub_total: roundMoney(row.sub_total),
-          total_linea: roundMoney(row.total_linea)
+          total_linea: roundMoney(row.total_linea),
+          descuento: roundMoney(row.descuento),
+          descuento_linea: roundMoney(row.descuento_linea),
+          descuento_global: roundMoney(row.descuento_global),
+          descuento_porcentaje_linea: row.descuento_porcentaje_linea === null ? null : Number(row.descuento_porcentaje_linea),
+          observacion: row.observacion || null,
+          configuracion_menu: row.configuracion_menu || null,
+          extras: Array.isArray(row.extras) ? row.extras : []
         });
       }
       for (const item of items) {
