@@ -1016,14 +1016,28 @@ export const insertPublicPedidoQuery = async (client, payload) => {
 };
 
 export const resolvePublicOrderCatalogContextQuery = async (client, { tipoPedido }) => {
-  const [hasCanales, hasModalidades, hasEstadosPago] = await Promise.all([
+  const [
+    hasCanales,
+    hasModalidades,
+    hasEstadosPago,
+    hasMotivosPagoPendiente
+  ] = await Promise.all([
     hasTable('cat_pedidos_canales'),
     hasTable('cat_pedidos_modalidades_entrega'),
-    hasTable('cat_pedidos_estados_pago')
+    hasTable('cat_pedidos_estados_pago'),
+    hasTable('cat_pedidos_motivos_pago_pendiente')
   ]);
 
   const normalizedTipoPedido = String(tipoPedido || '').trim().toLowerCase();
   const canalCode = 'LOCAL';
+  const motivoPagoPendienteCandidates = [
+    'PENDIENTE_PAGO',
+    'PENDIENTE_VALIDACION',
+    'VALIDACION_PAGO',
+    'PAGO_PENDIENTE',
+    'TRANSFERENCIA_PENDIENTE',
+    'PENDIENTE'
+  ];
   const modalidadCandidates = normalizedTipoPedido === 'delivery'
     ? ['DELIVERY']
     : normalizedTipoPedido === 'pickup'
@@ -1033,7 +1047,8 @@ export const resolvePublicOrderCatalogContextQuery = async (client, { tipoPedido
   const resolved = {
     id_canal_pedido: null,
     id_modalidad_entrega: null,
-    id_estado_pago_pedido: null
+    id_estado_pago_pedido: null,
+    id_motivo_pago_pendiente: null
   };
 
   if (hasCanales) {
@@ -1077,6 +1092,35 @@ export const resolvePublicOrderCatalogContextQuery = async (client, { tipoPedido
       ['PENDIENTE_VALIDACION']
     );
     resolved.id_estado_pago_pedido = Number(result.rows?.[0]?.id_estado_pago_pedido || 0) || null;
+  }
+
+  if (hasMotivosPagoPendiente) {
+    const [hasCodigoMotivo, hasNombreMotivo, hasDescripcionMotivo] = await Promise.all([
+      hasColumn('cat_pedidos_motivos_pago_pendiente', 'codigo'),
+      hasColumn('cat_pedidos_motivos_pago_pendiente', 'nombre'),
+      hasColumn('cat_pedidos_motivos_pago_pendiente', 'descripcion')
+    ]);
+    const predicates = [];
+    if (hasCodigoMotivo) predicates.push('UPPER(TRIM(codigo)) = ANY($1::text[])');
+    if (hasNombreMotivo) predicates.push('UPPER(TRIM(nombre)) = ANY($1::text[])');
+    if (hasDescripcionMotivo) predicates.push('UPPER(TRIM(descripcion)) = ANY($1::text[])');
+
+    if (predicates.length > 0) {
+      const result = await client.query(
+        `
+          SELECT id_motivo_pago_pendiente
+          FROM public.cat_pedidos_motivos_pago_pendiente
+          WHERE (${predicates.join(' OR ')})
+            AND COALESCE(estado, true) = true
+          ORDER BY
+            ${hasCodigoMotivo ? 'array_position($1::text[], UPPER(TRIM(codigo))) NULLS LAST,' : ''}
+            id_motivo_pago_pendiente ASC
+          LIMIT 1
+        `,
+        [motivoPagoPendienteCandidates]
+      );
+      resolved.id_motivo_pago_pendiente = Number(result.rows?.[0]?.id_motivo_pago_pendiente || 0) || null;
+    }
   }
 
   return resolved;
@@ -1155,11 +1199,25 @@ export const insertPublicPedidoContextoQuery = async (client, {
 export const insertPublicPedidoPagoControlQuery = async (client, {
   idPedido,
   idEstadoPagoPedido,
+  idMotivoPagoPendiente,
   total
 }) => {
   if (!(await hasTable('pedidos_pago_control')) || !idEstadoPagoPedido) return false;
 
-  const hasFechaPagoConfirmado = await hasColumn('pedidos_pago_control', 'fecha_pago_confirmado');
+  const [
+    hasMotivoPagoPendiente,
+    hasFechaPagoConfirmado
+  ] = await Promise.all([
+    hasColumn('pedidos_pago_control', 'id_motivo_pago_pendiente'),
+    hasColumn('pedidos_pago_control', 'fecha_pago_confirmado')
+  ]);
+
+  if (hasMotivoPagoPendiente && !idMotivoPagoPendiente) {
+    const error = new Error('Configuracion incompleta: no existe motivo de pago pendiente para pedidos publicos.');
+    error.status = 409;
+    throw error;
+  }
+
   const columns = [
     'id_pedido',
     'id_estado_pago_pedido',
@@ -1168,6 +1226,12 @@ export const insertPublicPedidoPagoControlQuery = async (client, {
     'monto_pendiente'
   ];
   const values = ['$1', '$2', '$3', '0', '$3'];
+  const params = [idPedido, idEstadoPagoPedido, total];
+  if (hasMotivoPagoPendiente) {
+    params.push(idMotivoPagoPendiente);
+    columns.push('id_motivo_pago_pendiente');
+    values.push(`$${params.length}`);
+  }
   if (hasFechaPagoConfirmado) {
     columns.push('fecha_pago_confirmado');
     values.push('NULL');
@@ -1180,7 +1244,7 @@ export const insertPublicPedidoPagoControlQuery = async (client, {
       )
       VALUES (${values.join(', ')})
     `,
-    [idPedido, idEstadoPagoPedido, total]
+    params
   );
   return true;
 };

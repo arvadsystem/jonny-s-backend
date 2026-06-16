@@ -1645,6 +1645,7 @@ export const createPublicOrderService = async ({
     await insertPublicPedidoPagoControlQuery(client, {
       idPedido,
       idEstadoPagoPedido: catalogContext.id_estado_pago_pedido,
+      idMotivoPagoPendiente: catalogContext.id_motivo_pago_pendiente,
       total
     });
 
