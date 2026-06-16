@@ -12,7 +12,8 @@ import { resolveRequestUserSucursalScope } from '../utils/sucursalScope.js';
 const router = express.Router();
 const CAJAS_SCOPE_PERMISSION = 'VENTAS_CAJAS_MULTISUCURSAL_VER';
 const ADMIN_ROLE_CODES = ['ADMIN', 'ADMINISTRADOR', 'SUPER_ADMIN'];
-const CAJA_APERTURA_EMAIL_TO = 'gersonmz@jonnyshn.com';
+const CAJA_ADMIN_EMAIL_TO = 'gersonmz@jonnyshn.com';
+const CAJA_APERTURA_EMAIL_TO = CAJA_ADMIN_EMAIL_TO;
 
 const CATALOGS = Object.freeze({
   SESSION_STATES: { table: 'public.cat_cajas_sesiones_estados', id: 'id_estado_sesion_caja' },
@@ -1574,6 +1575,84 @@ const sendCajaAperturaEmail = async (idSesionCaja) => {
     {
       id_usuario: payload.id_usuario_responsable,
       tipo_correo: 'caja_apertura',
+      fromKey: 'ADMON'
+    }
+  );
+};
+
+const buildCajaCierreEmailHtml = (payload) => {
+  const arqueosRows = Array.isArray(payload.arqueos) && payload.arqueos.length > 0
+    ? payload.arqueos.map((row) => `
+      <tr>
+        <td>${escapeHtml(row.metodo_pago_codigo || row.id_metodo_pago || 'N/A')}</td>
+        <td>${escapeHtml(formatMoneyLabel(row.monto_teorico))}</td>
+        <td>${escapeHtml(formatMoneyLabel(row.monto_declarado))}</td>
+        <td>${escapeHtml(formatMoneyLabel(row.diferencia))}</td>
+        <td>${escapeHtml(row.requiere_revision ? 'Si' : 'No')}</td>
+      </tr>
+    `).join('')
+    : `
+      <tr>
+        <td colspan="5" style="color:#667085;">Sin arqueos segmentados asociados.</td>
+      </tr>
+    `;
+  const auditMessage = payload.requiresAudit
+    ? 'Este cierre requiere auditoria por diferencias, recuentos o inconsistencias detectadas.'
+    : 'Este cierre no reporta diferencias pendientes de auditoria.';
+
+  return `
+<!DOCTYPE html>
+<html lang="es">
+<head><meta charset="UTF-8"></head>
+<body style="font-family:Arial,sans-serif; color:#1f2933; line-height:1.5;">
+  <h2 style="margin:0 0 12px;">Cierre de caja</h2>
+  <p>Se registro un cierre de caja en JONNY'S SmartOrder.</p>
+  <p style="font-weight:700; color:${payload.requiresAudit ? '#b42318' : '#027a48'};">${escapeHtml(auditMessage)}</p>
+  <table cellpadding="6" cellspacing="0" style="border-collapse:collapse; margin-bottom:14px;">
+    <tr><td><strong>Cierre</strong></td><td>CIE-${escapeHtml(String(payload.idCierreCaja || '').padStart(5, '0'))}</td></tr>
+    <tr><td><strong>Sesion</strong></td><td>${escapeHtml(payload.idSesionCaja || 'No disponible')}</td></tr>
+    <tr><td><strong>Codigo de caja</strong></td><td>${escapeHtml(payload.session?.codigo_caja || payload.session?.id_caja || 'No disponible')}</td></tr>
+    <tr><td><strong>Nombre de caja</strong></td><td>${escapeHtml(payload.session?.nombre_caja || 'No disponible')}</td></tr>
+    <tr><td><strong>Sucursal</strong></td><td>${escapeHtml(payload.session?.nombre_sucursal || payload.session?.id_sucursal || 'No disponible')}</td></tr>
+    <tr><td><strong>Responsable</strong></td><td>${escapeHtml(payload.session?.id_usuario_responsable || 'No disponible')}</td></tr>
+    <tr><td><strong>Usuario de cierre</strong></td><td>${escapeHtml(payload.idUsuarioCierre || 'No disponible')}</td></tr>
+    <tr><td><strong>Fecha/hora</strong></td><td>${escapeHtml(formatDateTimeLabel(payload.fechaCierre))}</td></tr>
+    <tr><td><strong>Total teorico</strong></td><td>${escapeHtml(formatMoneyLabel(payload.montoTeorico))}</td></tr>
+    <tr><td><strong>Total declarado</strong></td><td>${escapeHtml(formatMoneyLabel(payload.montoDeclaradoCierre))}</td></tr>
+    <tr><td><strong>Diferencia</strong></td><td>${escapeHtml(formatMoneyLabel(payload.diferencia))}</td></tr>
+    <tr><td><strong>Resolucion</strong></td><td>${escapeHtml(payload.resolutionCode || payload.idResolucionFinal || 'No disponible')}</td></tr>
+    <tr><td><strong>Nomina</strong></td><td>${escapeHtml(payload.payrollSync?.status || 'No aplicada')}</td></tr>
+  </table>
+  <h3 style="margin:0 0 8px;">Arqueos por metodo</h3>
+  <table cellpadding="6" cellspacing="0" style="border-collapse:collapse; width:100%; border:1px solid #eaecf0;">
+    <thead>
+      <tr style="background:#f9fafb;">
+        <th align="left">Metodo</th>
+        <th align="left">Teorico</th>
+        <th align="left">Declarado</th>
+        <th align="left">Diferencia</th>
+        <th align="left">Revision</th>
+      </tr>
+    </thead>
+    <tbody>${arqueosRows}</tbody>
+  </table>
+</body>
+</html>`;
+};
+
+const sendCajaCierreEmail = async (payload) => {
+  const subjectPrefix = payload.requiresAudit
+    ? 'Cierre de caja requiere auditoria'
+    : 'Cierre de caja registrado';
+  const cajaLabel = payload.session?.codigo_caja || payload.session?.nombre_caja || payload.idSesionCaja;
+  const sucursalLabel = payload.session?.nombre_sucursal || payload.session?.id_sucursal || 'Sucursal';
+  await enviarCorreo(
+    CAJA_ADMIN_EMAIL_TO,
+    `${subjectPrefix} - ${cajaLabel} - ${sucursalLabel}`,
+    buildCajaCierreEmailHtml(payload),
+    {
+      id_usuario: payload.session?.id_usuario_responsable,
+      tipo_correo: 'caja_cierre',
       fromKey: 'ADMON'
     }
   );
@@ -4178,17 +4257,42 @@ const closeSessionHandler = async (req, res) => {
     );
 
     const resolutionCode = await getCatalogCodeById(client, 'RESOLUTIONS', idResolucionFinal);
+    const fechaCierre = new Date().toISOString();
     const payrollSync = await syncPayrollDeductionForClose({
       client,
       idCierreCaja,
       idUsuarioResponsable: session.id_usuario_responsable,
       idSucursal: session.id_sucursal,
-      fechaCierre: new Date().toISOString(),
+      fechaCierre,
       diferencia,
       resolucionCodigo: resolutionCode
     });
 
     await client.query('COMMIT');
+    const requiresAudit =
+      Math.abs(roundMoney(diferencia)) > 0 ||
+      resolutionCode === 'PENDIENTE_REVISION' ||
+      (Array.isArray(arqueosPersistir) && arqueosPersistir.length > 0) ||
+      (Array.isArray(arqueosPersistir) && arqueosPersistir.some((row) =>
+        Boolean(row.requiere_revision) || Math.abs(roundMoney(row.diferencia)) > 0
+      ));
+    void sendCajaCierreEmail({
+      idCierreCaja,
+      idSesionCaja,
+      session,
+      idUsuarioCierre: scopeContext.idUsuario,
+      fechaCierre,
+      montoTeorico,
+      montoDeclaradoCierre,
+      diferencia,
+      idResolucionFinal,
+      resolutionCode,
+      payrollSync,
+      arqueos: arqueosPersistir,
+      requiresAudit
+    }).catch((emailError) => {
+      console.error('[cajas] Error enviando correo de cierre de caja:', emailError?.message || emailError);
+    });
     const responsePayload = {
       message: 'Cierre de caja registrado correctamente.',
       id_cierre_caja: idCierreCaja,
