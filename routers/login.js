@@ -64,10 +64,24 @@ const getClienteNameSnapshot = async (idUsuario) => {
       SELECT
         p.nombre AS nombre_cliente,
         p.apellido AS apellido_cliente,
-        NULLIF(TRIM(CONCAT_WS(' ', p.nombre, p.apellido)), '') AS nombre_completo_cliente
+        NULLIF(TRIM(CONCAT_WS(' ', p.nombre, p.apellido)), '') AS nombre_completo_cliente,
+        NULLIF(TRIM(co.direccion_correo), '') AS correo_cliente,
+        NULLIF(TRIM(t.telefono), '') AS telefono_cliente,
+        LEFT(REGEXP_REPLACE(COALESCE(t.telefono, ''), '\\D', '', 'g'), 8) AS telefono_cliente_normalizado
       FROM usuarios u
       LEFT JOIN clientes c ON c.id_cliente = u.id_cliente
       LEFT JOIN personas p ON p.id_persona = c.id_persona
+      LEFT JOIN LATERAL (
+        SELECT co_inner.direccion_correo
+        FROM correos co_inner
+        WHERE co_inner.id_correo = p.id_correo
+           OR (p.id_correo IS NULL AND co_inner.id_persona = p.id_persona)
+        ORDER BY
+          CASE WHEN co_inner.id_correo = p.id_correo THEN 0 ELSE 1 END,
+          co_inner.id_correo ASC
+        LIMIT 1
+      ) co ON true
+      LEFT JOIN telefonos t ON t.id_telefono = p.id_telefono
       WHERE u.id_usuario = $1
       LIMIT 1
     `,
@@ -493,6 +507,9 @@ router.get('/me', authRequired, requireActiveSession, async (req, res) => {
               nombre_cliente: clienteName.nombre_cliente,
               apellido_cliente: clienteName.apellido_cliente,
               nombre_completo_cliente: clienteName.nombre_completo_cliente,
+              correo_cliente: clienteName.correo_cliente,
+              telefono_cliente: clienteName.telefono_cliente,
+              telefono_cliente_normalizado: clienteName.telefono_cliente_normalizado,
               nombre_completo: clienteName.nombre_completo_cliente || usuario.nombre_completo
             });
           }
