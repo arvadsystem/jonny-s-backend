@@ -13,6 +13,7 @@ const MAX_ORDER_TEXT = Object.freeze({
   DINE_IN_TABLE: 40,
   CONTACT_NAME: 120,
   CONTACT_PHONE: 30,
+  CONTACT_EMAIL: 120,
   DELIVERY_ADDRESS: 240,
   DELIVERY_REFERENCE: 160,
   TRANSFER_RECEIPT: 180,
@@ -49,6 +50,12 @@ const normalizeIdempotencyKey = (value) =>
     .toLowerCase()
     .replace(/[^a-z0-9:_-]/g, '');
 
+const normalizeContactEmail = (value) =>
+  normalizeCompactText(value, MAX_ORDER_TEXT.CONTACT_EMAIL).toLowerCase();
+
+const isValidContactEmail = (value) =>
+  /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(value || ''));
+
 const normalizeTransferMethod = (value) => {
   const clean = normalizeCompactText(value, 40).toLowerCase();
   if (!clean) return '';
@@ -72,6 +79,9 @@ const normalizeOrderBusinessContext = ({ body, tipoPedido }) => {
     telefono: normalizeCompactText(
       contactoRaw.telefono ?? body?.telefono_contacto,
       MAX_ORDER_TEXT.CONTACT_PHONE
+    ),
+    correo: normalizeContactEmail(
+      contactoRaw.correo ?? body?.correo_contacto ?? body?.email_contacto ?? body?.email
     )
   };
 
@@ -112,10 +122,22 @@ const normalizeOrderBusinessContext = ({ body, tipoPedido }) => {
     };
   }
 
-  // Regla de negocio: pickup y delivery exigen telefono de contacto.
-  if ((tipoPedido === 'pickup' || tipoPedido === 'delivery') && !contacto.telefono) {
+  if (!contacto.nombre) {
     return {
-      error: 'Debes enviar telefono de contacto para pickup y delivery.'
+      error: 'Ingresa tu nombre completo.'
+    };
+  }
+
+  const telefonoNormalizado = String(contacto.telefono || '').replace(/\D/g, '');
+  if (telefonoNormalizado.length !== 8) {
+    return {
+      error: 'El telefono debe tener 8 digitos.'
+    };
+  }
+
+  if (!contacto.correo || !isValidContactEmail(contacto.correo)) {
+    return {
+      error: 'Ingresa un correo valido.'
     };
   }
 
@@ -331,7 +353,7 @@ export const validateCreateOrderBody = (req, res, next) => {
     origen,
     idempotencyKey,
     business: businessContextResult?.data || {
-      contacto: { nombre: '', telefono: '' },
+      contacto: { nombre: '', telefono: '', correo: '' },
       entrega: { direccion: '', referencia: '' },
       pago: { metodo: '', comprobante_transferencia: '' },
       servicio: { mesa: '' }
