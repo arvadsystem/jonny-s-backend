@@ -7019,6 +7019,23 @@ async function listarPedidosPendientesPago(req, res) {
 
   const client = await pool.connect();
   try {
+    const hasDetallePedidoConfiguracionMenu = includeItems
+      ? await hasColumn(client, 'detalle_pedido', 'configuracion_menu')
+      : false;
+    const detallePedidoExtrasColumns = includeItems && await hasTable(client, 'detalle_pedido_extras')
+      ? await Promise.all([
+        'id_detalle_pedido_extra',
+        'id_detalle_pedido',
+        'id_extra',
+        'nombre_extra_snapshot',
+        'cantidad',
+        'precio_unitario',
+        'subtotal',
+        'estado'
+      ].map((columnName) => hasColumn(client, 'detalle_pedido_extras', columnName)))
+      : [];
+    const hasDetallePedidoExtras = detallePedidoExtrasColumns.length > 0
+      && detallePedidoExtrasColumns.every(Boolean);
     const scope = await resolveRequestUserSucursalScope(req, client);
     const allowedSucursalIds = Array.isArray(scope?.allowedSucursalIds)
       ? scope.allowedSucursalIds.map((id) => parseOptionalPositiveInt(id)).filter(Boolean)
