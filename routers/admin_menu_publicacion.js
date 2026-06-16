@@ -1943,6 +1943,194 @@ router.post('/programacion', checkPermission(MENU_PUBLICACION_SAVE_PERMISSIONS),
   }
 });
 
+router.patch('/temporada-activa/cancelar', checkPermission(MENU_PUBLICACION_SAVE_PERMISSIONS), async (req, res) => {
+  const idSucursal = toPositiveInt(req.body?.id_sucursal);
+  if (!idSucursal) {
+    return res.status(400).json({ ok: false, message: 'id_sucursal es obligatorio y debe ser entero positivo.' });
+  }
+
+  let client = null;
+  let transactionStarted = false;
+
+  try {
+    const branch = await getBranchById(idSucursal);
+    if (!branch) {
+      return res.status(404).json({ ok: false, message: 'La sucursal no existe.' });
+    }
+
+    if (!branch.estado) {
+      return res.status(409).json({ ok: false, message: 'La sucursal esta inactiva.' });
+    }
+
+    const defaultResult = await pool.query(
+      `
+        SELECT id_menu_vigente
+        FROM menu_vigente
+        WHERE id_sucursal = $1
+          AND COALESCE(estado, true) = true
+          AND COALESCE(es_default, false) = true
+        LIMIT 1;
+      `,
+      [idSucursal]
+    );
+
+    if (defaultResult.rowCount === 0) {
+      return res.status(409).json({
+        ok: false,
+        message: 'No existe DEFAULT activo para esta sucursal.'
+      });
+    }
+
+    const activeSeasonResult = await pool.query(
+      `
+        SELECT id_menu_vigente
+        FROM menu_vigente
+        WHERE id_sucursal = $1
+          AND COALESCE(estado, true) = true
+          AND COALESCE(es_default, false) = false
+          AND COALESCE(tipo_publicacion, 'TEMPORADA') = 'TEMPORADA'
+          AND fecha_inicio <= NOW()
+          AND fecha_fin > NOW()
+        ORDER BY prioridad ASC, fecha_inicio DESC, id_menu_vigente DESC;
+      `,
+      [idSucursal]
+    );
+
+    if (activeSeasonResult.rowCount === 0) {
+      const activeMenu = await getActiveMenuByBranch(idSucursal);
+      return res.status(200).json({
+        ok: true,
+        message: 'No hay temporada activa para finalizar.',
+        data: {
+          temporadas_canceladas: [],
+          menu_activo_actual: activeMenu ? mapMenuSummary(activeMenu) : null
+        }
+      });
+    }
+
+    client = await pool.connect();
+    await client.query('BEGIN');
+    transactionStarted = true;
+    await client.query('SELECT pg_advisory_xact_lock($1, $2);', [7102, idSucursal]);
+
+    const lockedPrecheck = await client.query(
+      `
+        SELECT
+          EXISTS(
+            SELECT 1
+            FROM sucursales
+            WHERE id_sucursal = $1
+              AND COALESCE(estado, true) = true
+          ) AS branch_ok,
+          EXISTS(
+            SELECT 1
+            FROM menu_vigente
+            WHERE id_sucursal = $1
+              AND COALESCE(estado, true) = true
+              AND COALESCE(es_default, false) = true
+          ) AS default_ok;
+      `,
+      [idSucursal]
+    );
+    const precheck = lockedPrecheck.rows?.[0] || {};
+    if (!parseBoolean(precheck.branch_ok)) {
+      await client.query('ROLLBACK');
+      transactionStarted = false;
+      return res.status(409).json({ ok: false, message: 'La sucursal ya no esta activa.' });
+    }
+    if (!parseBoolean(precheck.default_ok)) {
+      await client.query('ROLLBACK');
+      transactionStarted = false;
+      return res.status(409).json({ ok: false, message: 'No existe DEFAULT activo para esta sucursal.' });
+    }
+
+    const lockedSeasonResult = await client.query(
+      `
+        SELECT id_menu_vigente
+        FROM menu_vigente
+        WHERE id_sucursal = $1
+          AND COALESCE(estado, true) = true
+          AND COALESCE(es_default, false) = false
+          AND COALESCE(tipo_publicacion, 'TEMPORADA') = 'TEMPORADA'
+          AND fecha_inicio <= NOW()
+          AND fecha_fin > NOW()
+        ORDER BY prioridad ASC, fecha_inicio DESC, id_menu_vigente DESC;
+      `,
+      [idSucursal]
+    );
+
+    const seasonIds = (lockedSeasonResult.rows || [])
+      .map((row) => Number(row.id_menu_vigente))
+      .filter((value) => Number.isInteger(value) && value > 0);
+
+    if (seasonIds.length === 0) {
+      await client.query('COMMIT');
+      transactionStarted = false;
+      const activeMenu = await getActiveMenuByBranch(idSucursal);
+      return res.status(200).json({
+        ok: true,
+        message: 'No hay temporada activa para finalizar.',
+        data: {
+          temporadas_canceladas: [],
+          menu_activo_actual: activeMenu ? mapMenuSummary(activeMenu) : null
+        }
+      });
+    }
+
+    const updateResult = await client.query(
+      `
+        UPDATE menu_vigente
+        SET estado = false
+        WHERE id_menu_vigente = ANY($1::int[])
+        RETURNING
+          id_menu_vigente,
+          id_sucursal,
+          id_menu,
+          fecha_inicio,
+          fecha_fin,
+          tipo_publicacion,
+          es_default,
+          prioridad,
+          estado;
+      `,
+      [seasonIds]
+    );
+
+    await client.query('COMMIT');
+    transactionStarted = false;
+
+    const activeMenu = await getActiveMenuByBranch(idSucursal);
+    return res.status(200).json({
+      ok: true,
+      message: 'Temporada activa finalizada correctamente.',
+      data: {
+        temporadas_canceladas: (updateResult.rows || []).map((row) => ({
+          id_menu_vigente: Number(row.id_menu_vigente),
+          id_sucursal: Number(row.id_sucursal),
+          id_menu: Number(row.id_menu),
+          fecha_inicio: row.fecha_inicio || null,
+          fecha_fin: row.fecha_fin || null,
+          tipo_publicacion: row.tipo_publicacion || 'TEMPORADA',
+          es_default: parseBoolean(row.es_default),
+          prioridad: row.prioridad !== undefined && row.prioridad !== null
+            ? Number(row.prioridad)
+            : null,
+          estado: parseBoolean(row.estado)
+        })),
+        menu_activo_actual: activeMenu ? mapMenuSummary(activeMenu) : null
+      }
+    });
+  } catch (error) {
+    if (transactionStarted && client) {
+      await client.query('ROLLBACK').catch(() => {});
+    }
+    console.error('admin_menu_publicacion PATCH /temporada-activa/cancelar:', error.message);
+    return res.status(500).json({ ok: false, message: 'No se pudo finalizar la temporada activa.' });
+  } finally {
+    if (client) client.release();
+  }
+});
+
 router.get('/catalogo', checkPermission(MENU_PUBLICACION_VIEW_PERMISSIONS), async (req, res) => {
   try {
     const idSucursal = toPositiveInt(req.query.id_sucursal);
