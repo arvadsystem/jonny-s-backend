@@ -6054,6 +6054,8 @@ router.get('/ventas/pedidos-menu', checkPermission(['VENTAS_VER']), async (req, 
     const hasKdsExpectedMinutes = await hasPedidosColumn(client, 'kds_expected_minutes');
     const hasKdsExpectedRule = await hasPedidosColumn(client, 'kds_expected_rule');
     const hasVisibleEnCocinaAt = await hasPedidosColumn(client, 'visible_en_cocina_at');
+    const hasPedidosContacto = await hasTable(client, 'pedidos_contacto');
+    const hasPedidosContactoCorreo = hasPedidosContacto && await hasColumn(client, 'pedidos_contacto', 'correo');
 
     const estadoPendiente = await resolveEstadoPedidoIdByCode(client, 'PENDIENTE');
     const estadoEnCocina = await resolveEstadoPedidoIdByCode(client, 'EN_COCINA');
@@ -6067,6 +6069,7 @@ router.get('/ventas/pedidos-menu', checkPermission(['VENTAS_VER']), async (req, 
 
     const filters = [`p.id_estado_pedido = ANY($1::int[])`];
     const params = [estadoIds];
+    const search = normalizePedidoText(req.query.search ?? req.query.q, 100) || '';
 
     if (requestedSucursalId) {
       params.push(requestedSucursalId);
@@ -6074,6 +6077,39 @@ router.get('/ventas/pedidos-menu', checkPermission(['VENTAS_VER']), async (req, 
     } else if (effectiveSucursalIds.length > 0) {
       params.push(effectiveSucursalIds);
       filters.push(`p.id_sucursal = ANY($${params.length}::int[])`);
+    }
+
+    if (search) {
+      const searchOr = [];
+      const codeMatch = search.match(/^PED[-\s]?0*(\d+)$/i);
+      const exactId = /^\d+$/.test(search)
+        ? Number.parseInt(search, 10)
+        : codeMatch
+          ? Number.parseInt(codeMatch[1], 10)
+          : null;
+      if (Number.isInteger(exactId) && exactId > 0) {
+        params.push(exactId);
+        searchOr.push(`p.id_pedido = $${params.length}`);
+      }
+      params.push(`%${search}%`);
+      const likeIndex = params.length;
+      searchOr.push(`('PED-' || LPAD(p.id_pedido::text, 5, '0')) ILIKE $${likeIndex}`);
+      searchOr.push(`COALESCE(NULLIF(TRIM(f.codigo_venta), ''), '') ILIKE $${likeIndex}`);
+      searchOr.push(`COALESCE(NULLIF(TRIM(CONCAT_WS(' ', per.nombre, per.apellido)), ''), '') ILIKE $${likeIndex}`);
+      if (hasPedidosContacto) {
+        searchOr.push(`COALESCE(pc.nombre_contacto, '') ILIKE $${likeIndex}`);
+        searchOr.push(`COALESCE(pc.telefono_contacto, '') ILIKE $${likeIndex}`);
+        searchOr.push(`COALESCE(pc.telefono_normalizado, '') ILIKE $${likeIndex}`);
+        if (hasPedidosContactoCorreo) {
+          searchOr.push(`COALESCE(pc.correo, '') ILIKE $${likeIndex}`);
+        }
+      }
+      const searchDigits = normalizeTelefonoDigits(search);
+      if (hasPedidosContacto && searchDigits) {
+        params.push(`%${searchDigits}%`);
+        searchOr.push(`COALESCE(pc.telefono_normalizado, '') ILIKE $${params.length}`);
+      }
+      filters.push(`(${searchOr.join(' OR ')})`);
     }
 
     // AM: Filtro operativo diario para ocultar pedidos de dias anteriores sin alterar estados/historial.
@@ -6122,6 +6158,30 @@ router.get('/ventas/pedidos-menu', checkPermission(['VENTAS_VER']), async (req, 
     const kdsVencidoSelect = hasKdsStartedAt && hasKdsExpectedMinutes
       ? "(p.kds_started_at IS NOT NULL AND p.kds_expected_minutes IS NOT NULL AND NOW() >= p.kds_started_at + (p.kds_expected_minutes * INTERVAL '1 minute')) AS kds_vencido"
       : 'FALSE AS kds_vencido';
+    const contactoSelect = hasPedidosContacto
+      ? `
+          COALESCE(pc.nombre_contacto, NULLIF(TRIM(CONCAT_WS(' ', per.nombre, per.apellido)), ''), 'Consumidor final') AS nombre_contacto,
+          pc.telefono_contacto,
+          pc.telefono_normalizado,
+          ${hasPedidosContactoCorreo ? 'pc.correo' : 'NULL::text'} AS correo_contacto
+        `
+      : `
+          COALESCE(NULLIF(TRIM(CONCAT_WS(' ', per.nombre, per.apellido)), ''), 'Consumidor final') AS nombre_contacto,
+          NULL::text AS telefono_contacto,
+          NULL::text AS telefono_normalizado,
+          NULL::text AS correo_contacto
+        `;
+    const contactoJoin = hasPedidosContacto
+      ? `
+        LEFT JOIN LATERAL (
+          SELECT pc_inner.*
+          FROM public.pedidos_contacto pc_inner
+          WHERE pc_inner.id_pedido = p.id_pedido
+          ORDER BY pc_inner.id_pedido_contacto DESC
+          LIMIT 1
+        ) pc ON true
+      `
+      : '';
 
     const result = await client.query(
       `
@@ -6154,7 +6214,8 @@ router.get('/ventas/pedidos-menu', checkPermission(['VENTAS_VER']), async (req, 
           COALESCE(dp_info.items, '[]'::jsonb) AS items,
           u_pago.nombre_usuario AS usuario_pago_confirmado,
           per.nombre AS nombres_cliente,
-          per.apellido AS apellidos_cliente
+          per.apellido AS apellidos_cliente,
+          ${contactoSelect}
         FROM pedidos p
         INNER JOIN estados_pedido ep ON p.id_estado_pedido = ep.id_estado_pedido
         -- AM: Usa LEFT JOIN LATERAL para tomar una sola factura por pedido y evitar cards duplicadas.
@@ -6173,6 +6234,7 @@ router.get('/ventas/pedidos-menu', checkPermission(['VENTAS_VER']), async (req, 
         LEFT JOIN clientes c ON p.id_cliente = c.id_cliente
         LEFT JOIN personas per ON c.id_persona = per.id_persona
         LEFT JOIN usuarios u_pago ON u_pago.id_usuario = p.id_usuario_pago_confirmado
+        ${contactoJoin}
         LEFT JOIN LATERAL (
           SELECT
             STRING_AGG(DISTINCT cmp.nombre, ', ' ORDER BY cmp.nombre) AS metodo_pago

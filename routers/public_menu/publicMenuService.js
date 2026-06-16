@@ -19,7 +19,11 @@ import {
   fetchRecipeAvailabilityQuery,
   fetchSauceRuleRowsByRecipeIdsQuery,
   insertPublicPedidoDetalleQuery,
-  insertPublicPedidoQuery
+  insertPublicPedidoContactoQuery,
+  insertPublicPedidoContextoQuery,
+  insertPublicPedidoPagoControlQuery,
+  insertPublicPedidoQuery,
+  resolvePublicOrderCatalogContextQuery
 } from './publicMenuQueries.js';
 import { getPublicMenuHeroCarouselConfig } from '../../services/publicMenuHeroCarouselConfigService.js';
 
@@ -70,6 +74,7 @@ const PUBLIC_EXTRA_OPTIONS = Object.freeze([
 const ORDER_TYPES_REQUIRING_TRANSFER_PROOF = new Set(['delivery']);
 const TRANSFER_METHOD_ALIASES = new Set(['transferencia', 'transferencia_bancaria', 'transfer']);
 const CASH_METHOD_ALIASES = new Set(['caja', 'efectivo', 'cash']);
+const PUBLIC_ORDER_CONTACT_EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const MAX_PUBLIC_ORDER_DESCRIPTION_LENGTH = 240;
 const MAX_PUBLIC_ITEM_NOTE_LENGTH = 100;
 const MAX_PUBLIC_ORDER_IDEMPOTENCY_LENGTH = 120;
@@ -893,7 +898,9 @@ const normalizePublicOrderBusinessContext = ({ tipoPedido, business = {} }) => {
   return {
     contacto: {
       nombre: normalizeCompactText(contactoRaw.nombre, 120),
-      telefono: normalizeCompactText(contactoRaw.telefono, 30)
+      telefono: normalizeCompactText(contactoRaw.telefono, 30),
+      telefono_normalizado: String(contactoRaw.telefono ?? '').replace(/\D/g, '').slice(0, 8),
+      correo: normalizeCompactText(contactoRaw.correo, 120).toLowerCase()
     },
     entrega: {
       direccion: normalizeCompactText(entregaRaw.direccion, 240),
@@ -908,6 +915,39 @@ const normalizePublicOrderBusinessContext = ({ tipoPedido, business = {} }) => {
     },
     requiresTransferProof: ORDER_TYPES_REQUIRING_TRANSFER_PROOF.has(String(tipoPedido || ''))
   };
+};
+
+const assertPublicOrderContactContext = ({ tipoPedido, businessContext }) => {
+  const normalizedTipoPedido = String(tipoPedido || '').trim().toLowerCase();
+  if (!['dine-in', 'pickup', 'delivery'].includes(normalizedTipoPedido)) return;
+
+  if (!businessContext.contacto.nombre) {
+    throw buildHttpError(400, 'Ingresa tu nombre completo.');
+  }
+
+  if (businessContext.contacto.telefono_normalizado.length !== 8) {
+    throw buildHttpError(400, 'El telefono debe tener 8 digitos.');
+  }
+
+  if (!businessContext.contacto.correo || !PUBLIC_ORDER_CONTACT_EMAIL_RE.test(businessContext.contacto.correo)) {
+    throw buildHttpError(400, 'Ingresa un correo valido.');
+  }
+};
+
+const buildPublicOrderContextObservation = ({ tipoPedido, businessContext }) => {
+  const normalizedTipoPedido = String(tipoPedido || '').trim().toLowerCase();
+  const parts = [];
+  if (normalizedTipoPedido === 'delivery') {
+    if (businessContext.entrega.direccion) parts.push(`Direccion: ${businessContext.entrega.direccion}`);
+    if (businessContext.entrega.referencia) parts.push(`Referencia: ${businessContext.entrega.referencia}`);
+  }
+  if (normalizedTipoPedido === 'pickup' && businessContext.pago.metodo) {
+    parts.push(`Pago: ${businessContext.pago.metodo}`);
+  }
+  if (normalizedTipoPedido === 'dine-in' && businessContext.servicio.mesa) {
+    parts.push(`Mesa: ${businessContext.servicio.mesa}`);
+  }
+  return normalizeCompactText(parts.join(' | '), 250);
 };
 
 const buildIdempotencyPayloadSignature = ({
@@ -934,7 +974,9 @@ const buildIdempotencyPayloadSignature = ({
     business: {
       contacto: {
         nombre: normalizeCompactText(businessContext?.contacto?.nombre, 120),
-        telefono: normalizeCompactText(businessContext?.contacto?.telefono, 30)
+        telefono: normalizeCompactText(businessContext?.contacto?.telefono, 30),
+        telefono_normalizado: normalizeCompactText(businessContext?.contacto?.telefono_normalizado, 8),
+        correo: normalizeCompactText(businessContext?.contacto?.correo, 120)
       },
       entrega: {
         direccion: normalizeCompactText(businessContext?.entrega?.direccion, 240),
@@ -1406,12 +1448,10 @@ export const createPublicOrderService = async ({
     business
   });
 
+  assertPublicOrderContactContext({ tipoPedido, businessContext });
+
   if (businessContext.requiresTransferProof && !businessContext.pago.comprobante_transferencia) {
     throw buildHttpError(400, 'Debes adjuntar referencia o comprobante de transferencia para delivery.');
-  }
-
-  if ((String(tipoPedido || '') === 'pickup' || String(tipoPedido || '') === 'delivery') && !businessContext.contacto.telefono) {
-    throw buildHttpError(400, 'Debes enviar telefono de contacto para pickup/delivery.');
   }
 
   if (String(tipoPedido || '') === 'pickup' && !businessContext.pago?.metodo) {
@@ -1583,14 +1623,30 @@ export const createPublicOrderService = async ({
       id_cliente: Number(idCliente),
       id_usuario: Number(idUsuario),
       estado_pago: INITIAL_ORDER_PAYMENT_STATE,
-      tipo_entrega: tipoEntrega,
-      validacion_pago_vence_at: validacionPagoVenceAt
+      tipo_entrega: tipoEntrega
     });
 
     const idPedido = Number(pedido?.id_pedido || 0);
     if (!idPedido) {
       throw buildHttpError(500, 'No se pudo generar el ID del pedido.');
     }
+
+    const catalogContext = await resolvePublicOrderCatalogContextQuery(client, { tipoPedido });
+    await insertPublicPedidoContactoQuery(client, {
+      idPedido,
+      contacto: businessContext.contacto
+    });
+    await insertPublicPedidoContextoQuery(client, {
+      idPedido,
+      idCanalPedido: catalogContext.id_canal_pedido,
+      idModalidadEntrega: catalogContext.id_modalidad_entrega,
+      observacionContexto: buildPublicOrderContextObservation({ tipoPedido, businessContext })
+    });
+    await insertPublicPedidoPagoControlQuery(client, {
+      idPedido,
+      idEstadoPagoPedido: catalogContext.id_estado_pago_pedido,
+      total
+    });
 
     for (const line of normalizedLines) {
       await insertPublicPedidoDetalleQuery(client, {
@@ -1616,7 +1672,7 @@ export const createPublicOrderService = async ({
       tipoPedido,
       tipoEntrega,
       businessContext,
-      validacionPagoVenceAt,
+      validacionPagoVenceAt: pedido?.validacion_pago_vence_at || validacionPagoVenceAt,
       total,
       normalizedLines,
       fechaHoraPedido: pedido?.fecha_hora_pedido || null,

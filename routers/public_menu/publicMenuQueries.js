@@ -936,14 +936,20 @@ export const fetchPedidoByIdempotencyKeyQuery = async (
 
 // Inserta cabecera de pedido publico y devuelve ID generado.
 export const insertPublicPedidoQuery = async (client, payload) => {
-  const [hasEstadoPagoColumn, hasTipoEntregaColumn, hasValidacionPagoVenceAtColumn] = await Promise.all([
+  const [
+    hasEstadoPagoColumn,
+    hasTipoEntregaColumn,
+    hasValidacionPagoVenceAtColumn,
+    hasVisibleEnCocinaAtColumn
+  ] = await Promise.all([
     hasColumn('pedidos', 'estado_pago'),
     hasColumn('pedidos', 'tipo_entrega'),
-    hasColumn('pedidos', 'validacion_pago_vence_at')
+    hasColumn('pedidos', 'validacion_pago_vence_at'),
+    hasColumn('pedidos', 'visible_en_cocina_at')
   ]);
 
   const columns = ['fecha_hora_pedido'];
-  const values = ['CURRENT_TIMESTAMP'];
+  const values = ["(NOW() AT TIME ZONE 'America/Tegucigalpa')"];
   const params = [];
   const pushValue = (column, value) => {
     params.push(value);
@@ -976,14 +982,23 @@ export const insertPublicPedidoQuery = async (client, payload) => {
     pushValue('tipo_entrega', payload.tipo_entrega || 'LOCAL');
   }
 
+  if (hasVisibleEnCocinaAtColumn) {
+    pushExpression('visible_en_cocina_at', 'NULL');
+  }
+
   if (hasValidacionPagoVenceAtColumn) {
-    // Usa hora del motor de BD para evitar desfases de zona horaria entre app y DB.
+    // Usa hora Honduras del motor de BD para alinear el tablero diario de Ventas.
     // Si viene valor explicito, lo respeta; si no, define ventana de 10 minutos en SQL.
     if (payload.validacion_pago_vence_at) {
       pushValue('validacion_pago_vence_at', payload.validacion_pago_vence_at);
     } else {
-      pushExpression('validacion_pago_vence_at', "NOW() + INTERVAL '10 minutes'");
+      pushExpression('validacion_pago_vence_at', "(NOW() AT TIME ZONE 'America/Tegucigalpa') + INTERVAL '10 minutes'");
     }
+  }
+
+  const returningColumns = ['id_pedido', 'fecha_hora_pedido'];
+  if (hasValidacionPagoVenceAtColumn) {
+    returningColumns.push('validacion_pago_vence_at');
   }
 
   const result = await client.query(
@@ -992,12 +1007,182 @@ export const insertPublicPedidoQuery = async (client, payload) => {
         ${columns.join(',\n        ')}
       )
       VALUES (${values.join(', ')})
-      RETURNING id_pedido, fecha_hora_pedido;
+      RETURNING ${returningColumns.join(', ')};
     `,
     params
   );
 
   return result.rows[0] || null;
+};
+
+export const resolvePublicOrderCatalogContextQuery = async (client, { tipoPedido }) => {
+  const [hasCanales, hasModalidades, hasEstadosPago] = await Promise.all([
+    hasTable('cat_pedidos_canales'),
+    hasTable('cat_pedidos_modalidades_entrega'),
+    hasTable('cat_pedidos_estados_pago')
+  ]);
+
+  const normalizedTipoPedido = String(tipoPedido || '').trim().toLowerCase();
+  const canalCode = 'LOCAL';
+  const modalidadCandidates = normalizedTipoPedido === 'delivery'
+    ? ['DELIVERY']
+    : normalizedTipoPedido === 'pickup'
+      ? ['RECOGER', 'PARA_LLEVAR']
+      : ['CONSUMO_LOCAL', 'LOCAL'];
+
+  const resolved = {
+    id_canal_pedido: null,
+    id_modalidad_entrega: null,
+    id_estado_pago_pedido: null
+  };
+
+  if (hasCanales) {
+    const result = await client.query(
+      `
+        SELECT id_canal_pedido
+        FROM public.cat_pedidos_canales
+        WHERE UPPER(TRIM(codigo)) = $1
+          AND COALESCE(estado, true) = true
+        LIMIT 1
+      `,
+      [canalCode]
+    );
+    resolved.id_canal_pedido = Number(result.rows?.[0]?.id_canal_pedido || 0) || null;
+  }
+
+  if (hasModalidades) {
+    const result = await client.query(
+      `
+        SELECT id_modalidad_entrega
+        FROM public.cat_pedidos_modalidades_entrega
+        WHERE UPPER(TRIM(codigo)) = ANY($1::text[])
+          AND COALESCE(estado, true) = true
+        ORDER BY array_position($1::text[], UPPER(TRIM(codigo)))
+        LIMIT 1
+      `,
+      [modalidadCandidates]
+    );
+    resolved.id_modalidad_entrega = Number(result.rows?.[0]?.id_modalidad_entrega || 0) || null;
+  }
+
+  if (hasEstadosPago) {
+    const result = await client.query(
+      `
+        SELECT id_estado_pago_pedido
+        FROM public.cat_pedidos_estados_pago
+        WHERE UPPER(TRIM(codigo)) = $1
+          AND COALESCE(estado, true) = true
+        LIMIT 1
+      `,
+      ['PENDIENTE_VALIDACION']
+    );
+    resolved.id_estado_pago_pedido = Number(result.rows?.[0]?.id_estado_pago_pedido || 0) || null;
+  }
+
+  return resolved;
+};
+
+export const insertPublicPedidoContactoQuery = async (client, { idPedido, contacto }) => {
+  if (!(await hasTable('pedidos_contacto'))) return false;
+
+  const [
+    hasNombreContacto,
+    hasTelefonoContacto,
+    hasTelefonoNormalizado,
+    hasCorreo
+  ] = await Promise.all([
+    hasColumn('pedidos_contacto', 'nombre_contacto'),
+    hasColumn('pedidos_contacto', 'telefono_contacto'),
+    hasColumn('pedidos_contacto', 'telefono_normalizado'),
+    hasColumn('pedidos_contacto', 'correo')
+  ]);
+  const columns = ['id_pedido'];
+  const params = [idPedido];
+  const values = ['$1'];
+  const pushValue = (column, value) => {
+    params.push(value);
+    columns.push(column);
+    values.push(`$${params.length}`);
+  };
+
+  if (hasNombreContacto) pushValue('nombre_contacto', contacto.nombre);
+  if (hasTelefonoContacto) pushValue('telefono_contacto', contacto.telefono);
+  if (hasTelefonoNormalizado) pushValue('telefono_normalizado', contacto.telefono_normalizado);
+  if (hasCorreo) pushValue('correo', contacto.correo);
+
+  await client.query(
+    `
+      INSERT INTO public.pedidos_contacto (
+        ${columns.join(',\n        ')}
+      )
+      VALUES (${values.join(', ')})
+    `,
+    params
+  );
+  return true;
+};
+
+export const insertPublicPedidoContextoQuery = async (client, {
+  idPedido,
+  idCanalPedido,
+  idModalidadEntrega,
+  observacionContexto
+}) => {
+  if (!(await hasTable('pedidos_contexto')) || !idCanalPedido || !idModalidadEntrega) return false;
+
+  const hasObservacionContexto = await hasColumn('pedidos_contexto', 'observacion_contexto');
+  const columns = ['id_pedido', 'id_canal_pedido', 'id_modalidad_entrega'];
+  const params = [idPedido, idCanalPedido, idModalidadEntrega];
+  const values = ['$1', '$2', '$3'];
+  if (hasObservacionContexto) {
+    params.push(observacionContexto || null);
+    columns.push('observacion_contexto');
+    values.push(`$${params.length}`);
+  }
+
+  await client.query(
+    `
+      INSERT INTO public.pedidos_contexto (
+        ${columns.join(',\n        ')}
+      )
+      VALUES (${values.join(', ')})
+    `,
+    params
+  );
+  return true;
+};
+
+export const insertPublicPedidoPagoControlQuery = async (client, {
+  idPedido,
+  idEstadoPagoPedido,
+  total
+}) => {
+  if (!(await hasTable('pedidos_pago_control')) || !idEstadoPagoPedido) return false;
+
+  const hasFechaPagoConfirmado = await hasColumn('pedidos_pago_control', 'fecha_pago_confirmado');
+  const columns = [
+    'id_pedido',
+    'id_estado_pago_pedido',
+    'monto_total',
+    'monto_pagado',
+    'monto_pendiente'
+  ];
+  const values = ['$1', '$2', '$3', '0', '$3'];
+  if (hasFechaPagoConfirmado) {
+    columns.push('fecha_pago_confirmado');
+    values.push('NULL');
+  }
+
+  await client.query(
+    `
+      INSERT INTO public.pedidos_pago_control (
+        ${columns.join(',\n        ')}
+      )
+      VALUES (${values.join(', ')})
+    `,
+    [idPedido, idEstadoPagoPedido, total]
+  );
+  return true;
 };
 
 // Inserta una linea de detalle para pedido publico.
