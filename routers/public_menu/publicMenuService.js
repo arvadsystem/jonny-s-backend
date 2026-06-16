@@ -1,6 +1,7 @@
 import pool from '../../config/db-connection.js';
 import { createHash } from 'crypto';
 import { buildAbsolutePublicUrl } from '../../utils/uploads.js';
+import { enviarCorreo } from '../../utils/emailService.js';
 import {
   PUBLIC_ITEM_TYPES,
   acquirePublicOrderIdempotencyLockQuery,
@@ -193,6 +194,76 @@ const toPositiveInt = (value) => {
 
 const roundMoney = (value) => Number(Number(value || 0).toFixed(2));
 const buildTicketNumber = (idPedido) => `VTA-${String(idPedido).padStart(5, '0')}`;
+const PUBLIC_ORDER_EMAIL_FROM_KEY = 'PEDIDOS';
+
+const escapeHtml = (value) => String(value ?? '')
+  .replace(/&/g, '&amp;')
+  .replace(/</g, '&lt;')
+  .replace(/>/g, '&gt;')
+  .replace(/"/g, '&quot;')
+  .replace(/'/g, '&#39;');
+
+const formatMoneyLabel = (value) => `L ${roundMoney(value).toFixed(2)}`;
+
+const PUBLIC_ORDER_TYPE_LABELS = Object.freeze({
+  'dine-in': 'Comer en restaurante',
+  pickup: 'Retiro en local',
+  delivery: 'Delivery'
+});
+
+const formatPublicOrderTypeLabel = (value) => (
+  PUBLIC_ORDER_TYPE_LABELS[String(value || '').trim().toLowerCase()] ||
+  normalizeCompactText(value, 50) ||
+  'Pedido'
+);
+
+const formatPublicOrderDateTimeLabel = (value) => {
+  if (!value) return '';
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return '';
+  try {
+    return new Intl.DateTimeFormat('es-HN', {
+      dateStyle: 'medium',
+      timeStyle: 'short',
+      timeZone: 'America/Tegucigalpa'
+    }).format(date);
+  } catch {
+    return date.toISOString();
+  }
+};
+
+const buildPublicOrderItemsHtml = (items = []) => {
+  const rows = (Array.isArray(items) ? items : []).map((item) => {
+    const extras = (Array.isArray(item?.extras) ? item.extras : [])
+      .map((extra) => normalizeCompactText(extra?.nombre, 80))
+      .filter(Boolean);
+    const extrasHtml = extras.length > 0
+      ? `<div style="margin-top:4px; color:rgba(255,255,255,0.48); font-size:12px;">Extras: ${escapeHtml(extras.join(', '))}</div>`
+      : '';
+
+    return `
+      <tr>
+        <td style="padding:12px 0; border-top:1px solid rgba(212,165,116,0.18); color:#fdfaf5;">
+          <strong>${Number(item?.cantidad || 0)} x ${escapeHtml(item?.nombre || 'Item')}</strong>
+          ${extrasHtml}
+        </td>
+        <td style="padding:12px 0; border-top:1px solid rgba(212,165,116,0.18); color:#fdfaf5; text-align:right; white-space:nowrap;">
+          ${escapeHtml(formatMoneyLabel(item?.subtotal))}
+        </td>
+      </tr>`;
+  });
+
+  if (rows.length === 0) {
+    return `
+      <tr>
+        <td colspan="2" style="padding:12px 0; border-top:1px solid rgba(212,165,116,0.18); color:rgba(255,255,255,0.62);">
+          Detalle no disponible para este reintento.
+        </td>
+      </tr>`;
+  }
+
+  return rows.join('');
+};
 
 const sortSauceOptions = (items) => (
   [...(Array.isArray(items) ? items : [])].sort((left, right) => {
@@ -1214,6 +1285,92 @@ const buildPublicOrderResult = ({
   }))
 });
 
+const buildPublicOrderConfirmationEmailHtml = ({ order, sucursalName = '' }) => {
+  const ticket = normalizeCompactText(order?.numero_ticket, 40) || buildTicketNumber(order?.id_pedido);
+  const typeLabel = formatPublicOrderTypeLabel(order?.tipo_pedido);
+  const contactName = normalizeCompactText(order?.business?.contacto?.nombre, 120) || 'cliente';
+  const branchLabel = normalizeCompactText(sucursalName, 120) || `Sucursal ${Number(order?.id_sucursal || 0)}`;
+  const createdAtLabel = formatPublicOrderDateTimeLabel(order?.fecha_hora_pedido);
+  const validationLimitLabel = formatPublicOrderDateTimeLabel(order?.validacion_pago_vence_at);
+  const deliveryAddress = normalizeCompactText(order?.business?.entrega?.direccion, 240);
+  const deliveryReference = normalizeCompactText(order?.business?.entrega?.referencia, 160);
+  const paymentMethod = normalizeCompactText(order?.business?.pago?.metodo, 40);
+
+  return `
+<!DOCTYPE html>
+<html lang="es">
+<head><meta charset="UTF-8"></head>
+<body style="margin:0; padding:0; background:#0e0704; font-family:Arial,sans-serif;">
+  <table width="100%" cellpadding="0" cellspacing="0" style="max-width:620px; margin:28px auto; background:#1a1108; border:1px solid rgba(212,165,116,0.25); border-radius:14px;">
+    <tr>
+      <td style="padding:28px 32px; color:#fdfaf5;">
+        <h2 style="margin:0 0 10px; color:#d4a574;">Pedido recibido</h2>
+        <p style="margin:0 0 16px; color:rgba(255,255,255,0.82); line-height:1.5;">
+          Hola ${escapeHtml(contactName)},<br/>Recibimos tu pedido y ya lo estamos preparando para validacion.
+        </p>
+        <div style="background:#24170f; border:1px solid rgba(212,165,116,0.28); border-radius:10px; padding:16px; margin-bottom:18px;">
+          <p style="margin:0 0 8px; color:rgba(255,255,255,0.8);"><strong>Codigo:</strong> ${escapeHtml(ticket)}</p>
+          <p style="margin:0 0 8px; color:rgba(255,255,255,0.8);"><strong>Sucursal:</strong> ${escapeHtml(branchLabel)}</p>
+          <p style="margin:0 0 8px; color:rgba(255,255,255,0.8);"><strong>Tipo:</strong> ${escapeHtml(typeLabel)}</p>
+          ${createdAtLabel ? `<p style="margin:0 0 8px; color:rgba(255,255,255,0.8);"><strong>Fecha:</strong> ${escapeHtml(createdAtLabel)}</p>` : ''}
+          <p style="margin:0; color:rgba(255,255,255,0.8);"><strong>Total:</strong> ${escapeHtml(formatMoneyLabel(order?.total))}</p>
+        </div>
+        <table width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse; margin:0 0 18px;">
+          <tr>
+            <td colspan="2" style="padding:0 0 8px; color:#d4a574; font-weight:bold;">Detalle del pedido</td>
+          </tr>
+          ${buildPublicOrderItemsHtml(order?.items)}
+        </table>
+        ${deliveryAddress ? `
+          <div style="background:#1d130c; border:1px solid rgba(212,165,116,0.2); border-radius:10px; padding:14px; margin-bottom:18px;">
+            <p style="margin:0 0 8px; color:rgba(255,255,255,0.8);"><strong>Direccion:</strong> ${escapeHtml(deliveryAddress)}</p>
+            ${deliveryReference ? `<p style="margin:0; color:rgba(255,255,255,0.8);"><strong>Referencia:</strong> ${escapeHtml(deliveryReference)}</p>` : ''}
+          </div>` : ''}
+        ${paymentMethod ? `
+          <p style="margin:0 0 10px; color:rgba(255,255,255,0.68); line-height:1.5;">
+            Metodo de pago seleccionado: ${escapeHtml(paymentMethod)}.
+          </p>` : ''}
+        ${validationLimitLabel ? `
+          <p style="margin:0 0 10px; color:rgba(255,255,255,0.68); line-height:1.5;">
+            La validacion del pago vence el ${escapeHtml(validationLimitLabel)}.
+          </p>` : ''}
+        <p style="margin:16px 0 0; color:rgba(255,255,255,0.68); line-height:1.5;">
+          Guarda este codigo para consultar tu pedido con el restaurante: <strong style="color:#d4a574;">${escapeHtml(ticket)}</strong>.
+        </p>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>`;
+};
+
+const sendPublicOrderConfirmationEmail = async ({ order, sucursalName = '', idUsuario = null }) => {
+  const to = normalizeCompactText(order?.business?.contacto?.correo, 120).toLowerCase();
+  if (!to || !PUBLIC_ORDER_CONTACT_EMAIL_RE.test(to)) {
+    return { sent: false, skipped: true, reason: 'EMAIL_NOT_AVAILABLE' };
+  }
+
+  const ticket = normalizeCompactText(order?.numero_ticket, 40) || buildTicketNumber(order?.id_pedido);
+  const subject = `Pedido recibido ${ticket} - Jonnys SmartOrder`;
+
+  try {
+    await enviarCorreo(to, subject, buildPublicOrderConfirmationEmailHtml({ order, sucursalName }), {
+      id_usuario: toPositiveInt(idUsuario),
+      tipo_correo: 'pedido_publico_confirmacion',
+      fromKey: PUBLIC_ORDER_EMAIL_FROM_KEY
+    });
+    return { sent: true, skipped: false, to };
+  } catch (error) {
+    console.error('[public-menu] No se pudo enviar correo de confirmacion de pedido:', error?.message || error);
+    return {
+      sent: false,
+      skipped: false,
+      reason: 'SMTP_SEND_FAILED',
+      to
+    };
+  }
+};
+
 const validateAndResolveLineConfiguration = ({ catalog, line }) => {
   const extraOptions = Array.isArray(catalog?.extras_opciones) ? catalog.extras_opciones : [];
   const extraOptionById = buildExtraOptionIndex(extraOptions);
@@ -1665,7 +1822,7 @@ export const createPublicOrderService = async ({
 
     await client.query('COMMIT');
 
-    return buildPublicOrderResult({
+    const orderResult = buildPublicOrderResult({
       idPedido,
       idSucursal,
       idCliente,
@@ -1680,6 +1837,14 @@ export const createPublicOrderService = async ({
       idempotencyKey: safeIdempotencyKey,
       replayed: false
     });
+
+    await sendPublicOrderConfirmationEmail({
+      order: orderResult,
+      sucursalName: activeMenu?.nombre_sucursal,
+      idUsuario
+    });
+
+    return orderResult;
   } catch (error) {
     await client.query('ROLLBACK');
     throw error;
