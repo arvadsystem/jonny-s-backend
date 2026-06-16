@@ -1040,6 +1040,11 @@ export const resolvePublicOrderCatalogContextQuery = async (client, { tipoPedido
     'PENDIENTE'
   ];
   const motivoPagoPendienteCandidates = [
+    ...(normalizedTipoPedido === 'delivery'
+      ? ['DELIVERY_PAGO_PENDIENTE']
+      : normalizedTipoPedido === 'pickup'
+        ? ['CLIENTE_PAGARA_AL_RETIRAR']
+        : ['CLIENTE_EN_LOCAL']),
     'PENDIENTE_PAGO',
     'PENDIENTE_VALIDACION',
     'VALIDACION_PAGO',

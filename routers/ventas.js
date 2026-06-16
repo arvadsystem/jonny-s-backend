@@ -3521,8 +3521,13 @@ const buildPedidoPendientePayload = async ({ client, body, userId, sucursalScope
   let costoEnvio = 0;
   if (modalidad === 'DELIVERY') {
     if (!isPlainObject(body.delivery)) return { ok: false, status: 400, body: { error: true, message: 'delivery es obligatorio cuando modalidad es DELIVERY.' } };
-    costoEnvio = parseNonNegativeNumber(body.delivery.costo_envio);
-    if (costoEnvio === null) return { ok: false, status: 400, body: { error: true, message: 'delivery.costo_envio debe ser numerico mayor o igual a 0.' } };
+    const hasCostoEnvioInput = body.delivery.costo_envio !== null &&
+      body.delivery.costo_envio !== undefined &&
+      String(body.delivery.costo_envio).trim() !== '';
+    if (hasCostoEnvioInput) {
+      costoEnvio = parseNonNegativeNumber(body.delivery.costo_envio);
+      if (costoEnvio === null) return { ok: false, status: 400, body: { error: true, message: 'delivery.costo_envio debe ser numerico mayor o igual a 0.' } };
+    }
     delivery = {
       costo_envio: costoEnvio,
       nombre_receptor: normalizePedidoText(body.delivery.nombre_receptor, 120),
