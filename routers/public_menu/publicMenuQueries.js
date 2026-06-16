@@ -1020,16 +1020,25 @@ export const resolvePublicOrderCatalogContextQuery = async (client, { tipoPedido
     hasCanales,
     hasModalidades,
     hasEstadosPago,
-    hasMotivosPagoPendiente
+    hasMotivosPagoPendiente,
+    hasDeliveryEstados
   ] = await Promise.all([
     hasTable('cat_pedidos_canales'),
     hasTable('cat_pedidos_modalidades_entrega'),
     hasTable('cat_pedidos_estados_pago'),
-    hasTable('cat_pedidos_motivos_pago_pendiente')
+    hasTable('cat_pedidos_motivos_pago_pendiente'),
+    hasTable('cat_delivery_estados')
   ]);
 
   const normalizedTipoPedido = String(tipoPedido || '').trim().toLowerCase();
   const canalCode = 'LOCAL';
+  const estadoPagoPendienteCandidates = [
+    'PENDIENTE_VALIDACION',
+    'PENDIENTE_PAGO',
+    'VALIDACION_PAGO',
+    'PAGO_PENDIENTE',
+    'PENDIENTE'
+  ];
   const motivoPagoPendienteCandidates = [
     'PENDIENTE_PAGO',
     'PENDIENTE_VALIDACION',
@@ -1048,7 +1057,8 @@ export const resolvePublicOrderCatalogContextQuery = async (client, { tipoPedido
     id_canal_pedido: null,
     id_modalidad_entrega: null,
     id_estado_pago_pedido: null,
-    id_motivo_pago_pendiente: null
+    id_motivo_pago_pendiente: null,
+    id_estado_delivery: null
   };
 
   if (hasCanales) {
@@ -1085,11 +1095,12 @@ export const resolvePublicOrderCatalogContextQuery = async (client, { tipoPedido
       `
         SELECT id_estado_pago_pedido
         FROM public.cat_pedidos_estados_pago
-        WHERE UPPER(TRIM(codigo)) = $1
+        WHERE UPPER(TRIM(codigo)) = ANY($1::text[])
           AND COALESCE(estado, true) = true
+        ORDER BY array_position($1::text[], UPPER(TRIM(codigo)))
         LIMIT 1
       `,
-      ['PENDIENTE_VALIDACION']
+      [estadoPagoPendienteCandidates]
     );
     resolved.id_estado_pago_pedido = Number(result.rows?.[0]?.id_estado_pago_pedido || 0) || null;
   }
@@ -1121,6 +1132,21 @@ export const resolvePublicOrderCatalogContextQuery = async (client, { tipoPedido
       );
       resolved.id_motivo_pago_pendiente = Number(result.rows?.[0]?.id_motivo_pago_pendiente || 0) || null;
     }
+  }
+
+  if (normalizedTipoPedido === 'delivery' && hasDeliveryEstados) {
+    const result = await client.query(
+      `
+        SELECT id_estado_delivery
+        FROM public.cat_delivery_estados
+        WHERE UPPER(TRIM(codigo)) = ANY($1::text[])
+          AND COALESCE(estado, true) = true
+        ORDER BY array_position($1::text[], UPPER(TRIM(codigo)))
+        LIMIT 1
+      `,
+      [['PENDIENTE', 'PENDIENTE_ASIGNACION', 'NUEVO']]
+    );
+    resolved.id_estado_delivery = Number(result.rows?.[0]?.id_estado_delivery || 0) || null;
   }
 
   return resolved;
@@ -1200,16 +1226,19 @@ export const insertPublicPedidoPagoControlQuery = async (client, {
   idPedido,
   idEstadoPagoPedido,
   idMotivoPagoPendiente,
-  total
+  total,
+  observacionPago = null
 }) => {
   if (!(await hasTable('pedidos_pago_control')) || !idEstadoPagoPedido) return false;
 
   const [
     hasMotivoPagoPendiente,
-    hasFechaPagoConfirmado
+    hasFechaPagoConfirmado,
+    hasObservacionPago
   ] = await Promise.all([
     hasColumn('pedidos_pago_control', 'id_motivo_pago_pendiente'),
-    hasColumn('pedidos_pago_control', 'fecha_pago_confirmado')
+    hasColumn('pedidos_pago_control', 'fecha_pago_confirmado'),
+    hasColumn('pedidos_pago_control', 'observacion_pago')
   ]);
 
   if (hasMotivoPagoPendiente && !idMotivoPagoPendiente) {
@@ -1236,6 +1265,11 @@ export const insertPublicPedidoPagoControlQuery = async (client, {
     columns.push('fecha_pago_confirmado');
     values.push('NULL');
   }
+  if (hasObservacionPago) {
+    params.push(observacionPago || null);
+    columns.push('observacion_pago');
+    values.push(`$${params.length}`);
+  }
 
   await client.query(
     `
@@ -1245,6 +1279,47 @@ export const insertPublicPedidoPagoControlQuery = async (client, {
       VALUES (${values.join(', ')})
     `,
     params
+  );
+  return true;
+};
+
+export const insertPublicPedidoDeliveryQuery = async (client, {
+  idPedido,
+  idEstadoDelivery,
+  delivery
+}) => {
+  if (!(await hasTable('pedidos_delivery'))) return false;
+
+  if (!idEstadoDelivery) {
+    const error = new Error('Configuracion incompleta: no existe estado inicial de delivery para pedidos publicos.');
+    error.status = 409;
+    throw error;
+  }
+
+  await client.query(
+    `
+      INSERT INTO public.pedidos_delivery (
+        id_pedido,
+        id_estado_delivery,
+        costo_envio,
+        nombre_receptor,
+        telefono_receptor,
+        direccion_entrega,
+        referencia_entrega,
+        observacion_delivery
+      )
+      VALUES ($1, $2, 0, $3, $4, $5, $6, $7)
+      ON CONFLICT (id_pedido) DO NOTHING
+    `,
+    [
+      idPedido,
+      idEstadoDelivery,
+      delivery?.nombre_receptor,
+      delivery?.telefono_receptor,
+      delivery?.direccion_entrega,
+      delivery?.referencia_entrega,
+      delivery?.observacion_delivery || null
+    ]
   );
   return true;
 };

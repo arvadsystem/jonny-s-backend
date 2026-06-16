@@ -22,6 +22,7 @@ import {
   insertPublicPedidoDetalleQuery,
   insertPublicPedidoContactoQuery,
   insertPublicPedidoContextoQuery,
+  insertPublicPedidoDeliveryQuery,
   insertPublicPedidoPagoControlQuery,
   insertPublicPedidoQuery,
   resolvePublicOrderCatalogContextQuery
@@ -1021,6 +1022,28 @@ const buildPublicOrderContextObservation = ({ tipoPedido, businessContext }) => 
   return normalizeCompactText(parts.join(' | '), 250);
 };
 
+const buildPublicOrderPaymentObservation = ({ tipoPedido, businessContext }) => {
+  const parts = [];
+  if (businessContext?.pago?.metodo) {
+    parts.push(`Metodo: ${businessContext.pago.metodo}`);
+  }
+  if (businessContext?.pago?.comprobante_transferencia) {
+    parts.push(`Referencia transferencia: ${businessContext.pago.comprobante_transferencia}`);
+  }
+  if (String(tipoPedido || '').trim().toLowerCase() === 'delivery') {
+    parts.push('Pedido desde menu publico delivery');
+  }
+  return normalizeCompactText(parts.join(' | '), 250);
+};
+
+const buildPublicOrderDeliveryPayload = ({ businessContext }) => ({
+  nombre_receptor: normalizeCompactText(businessContext?.contacto?.nombre, 120),
+  telefono_receptor: normalizeCompactText(businessContext?.contacto?.telefono, 40),
+  direccion_entrega: normalizeCompactText(businessContext?.entrega?.direccion, 250),
+  referencia_entrega: normalizeCompactText(businessContext?.entrega?.referencia, 250),
+  observacion_delivery: 'Pedido desde menu publico'
+});
+
 const buildIdempotencyPayloadSignature = ({
   idSucursal,
   tipoPedido,
@@ -1803,8 +1826,16 @@ export const createPublicOrderService = async ({
       idPedido,
       idEstadoPagoPedido: catalogContext.id_estado_pago_pedido,
       idMotivoPagoPendiente: catalogContext.id_motivo_pago_pendiente,
-      total
+      total,
+      observacionPago: buildPublicOrderPaymentObservation({ tipoPedido, businessContext })
     });
+    if (String(tipoPedido || '').trim().toLowerCase() === 'delivery') {
+      await insertPublicPedidoDeliveryQuery(client, {
+        idPedido,
+        idEstadoDelivery: catalogContext.id_estado_delivery,
+        delivery: buildPublicOrderDeliveryPayload({ businessContext })
+      });
+    }
 
     for (const line of normalizedLines) {
       await insertPublicPedidoDetalleQuery(client, {

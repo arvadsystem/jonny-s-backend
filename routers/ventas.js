@@ -6495,8 +6495,6 @@ router.put('/ventas/pedidos-menu/:id/estado', checkPermission(['VENTAS_VER']), a
 
     await expirePendingPublicOrders({ client, allowedSucursalIds });
 
-    const hasEstadoPago = await hasPedidosColumn(client, 'estado_pago');
-    const hasValidacionVence = await hasPedidosColumn(client, 'validacion_pago_vence_at');
     const hasKdsStartedAt = await hasPedidosColumn(client, 'kds_started_at');
     const hasKdsExpectedMinutes = await hasPedidosColumn(client, 'kds_expected_minutes');
 
@@ -6562,36 +6560,6 @@ router.put('/ventas/pedidos-menu/:id/estado', checkPermission(['VENTAS_VER']), a
         error: true,
         message: 'El pedido a�n se encuentra dentro del tiempo operativo de cocina.'
       });
-    }
-
-    if (normalizedTargetCode === 'EN_COCINA' && hasEstadoPago) {
-      const estadoPago = String(pedido.estado_pago || '').toUpperCase();
-      if (estadoPago !== PEDIDO_ESTADO_PAGO.PAGADO_CONFIRMADO) {
-        await client.query('ROLLBACK');
-        return res.status(409).json({
-          error: true,
-          message: 'No se puede enviar a cocina sin confirmar el pago.'
-        });
-      }
-
-      if (hasValidacionVence && pedido.validacion_pago_vence_at) {
-        const venceAt = new Date(pedido.validacion_pago_vence_at).getTime();
-        if (Number.isFinite(venceAt) && venceAt <= Date.now()) {
-          await client.query(
-            `
-              UPDATE pedidos
-              SET estado_pago = $2
-              WHERE id_pedido = $1
-            `,
-            [idPedido, PEDIDO_ESTADO_PAGO.CANCELADO_TIMEOUT]
-          );
-          await client.query('COMMIT');
-          return res.status(409).json({
-            error: true,
-            message: 'El pedido ya vencio por timeout de validacion de pago.'
-          });
-        }
-      }
     }
 
     const targetStateId = await resolveEstadoPedidoIdByCode(client, normalizedTargetCode);
