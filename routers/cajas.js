@@ -1,5 +1,6 @@
 import express from 'express';
 import { enviarCorreo } from '../utils/emailService.js';
+import { buildCajaCierrePdfBuffer, buildCajaCierrePdfFilename } from '../utils/cajaCierreReportePdf.js';
 import pool from '../config/db-connection.js';
 import { getClientIp } from '../utils/security/clientInfo.js';
 import {
@@ -1665,6 +1666,9 @@ const buildCajaCierreEmailHtml = (payload) => {
   const auditMessage = payload.requiresAudit
     ? 'Este cierre de caja requiere auditoria por inconsistencias detectadas en el recuento o diferencia de cierre.'
     : 'Este cierre de caja fue registrado sin inconsistencias pendientes de auditoria.';
+  const pdfMessage = payload.pdfAttached === false
+    ? 'No fue posible adjuntar el PDF automaticamente; el resumen del cierre se incluye en este correo.'
+    : 'Se adjunta el reporte PDF del cierre de caja para control interno.';
 
   return `
 <!DOCTYPE html>
@@ -1673,6 +1677,7 @@ const buildCajaCierreEmailHtml = (payload) => {
 <body style="font-family:Arial,sans-serif; color:#1f2933; line-height:1.5;">
   <h2 style="margin:0 0 12px;">Cierre de caja</h2>
   <p>Se registro un cierre de caja en JONNY'S SmartOrder.</p>
+  <p>${escapeHtml(pdfMessage)}</p>
   <p style="font-weight:700; color:${payload.requiresAudit ? '#b42318' : '#027a48'};">${escapeHtml(auditMessage)}</p>
   <table cellpadding="6" cellspacing="0" style="border-collapse:collapse; margin-bottom:14px;">
     <tr><td><strong>Cierre</strong></td><td>CIE-${escapeHtml(String(payload.idCierreCaja || '').padStart(5, '0'))}</td></tr>
@@ -1712,14 +1717,33 @@ const sendCajaCierreEmail = async (payload) => {
     : 'Cierre de caja registrado';
   const cajaLabel = payload.session?.codigo_caja || payload.session?.nombre_caja || payload.idSesionCaja;
   const sucursalLabel = payload.session?.nombre_sucursal || payload.session?.id_sucursal || 'Sucursal';
+  const payrollSyncLabel = formatPayrollSyncLabel(payload.payrollSync);
+  const attachments = [];
+  try {
+    const pdfPayload = { ...payload, payrollSyncLabel };
+    const pdfBuffer = await buildCajaCierrePdfBuffer(pdfPayload);
+    attachments.push({
+      filename: buildCajaCierrePdfFilename(payload.idCierreCaja),
+      content: pdfBuffer,
+      contentType: 'application/pdf'
+    });
+  } catch (pdfError) {
+    console.warn('[cajas] No se pudo generar PDF de cierre, se enviara correo sin adjunto:', pdfError?.message || pdfError);
+  }
+  const emailPayload = {
+    ...payload,
+    payrollSyncLabel,
+    pdfAttached: attachments.length > 0
+  };
   await enviarCorreo(
     CAJA_ADMIN_EMAIL_TO,
     `${subjectPrefix} - ${cajaLabel} - ${sucursalLabel}`,
-    buildCajaCierreEmailHtml(payload),
+    buildCajaCierreEmailHtml(emailPayload),
     {
       id_usuario: payload.session?.id_usuario_responsable,
       tipo_correo: 'caja_cierre',
-      fromKey: 'ADMON'
+      fromKey: 'ADMON',
+      attachments
     }
   );
 };
@@ -4367,7 +4391,12 @@ const closeSessionHandler = async (req, res) => {
       resolutionCode,
       payrollSync,
       arqueos: arqueosPersistir,
-      requiresAudit
+      requiresAudit,
+      montoApertura: Number(resumen.montoApertura || 0),
+      ventasEfectivoNetas: Number(resumen.ventasEfectivoNetas || 0),
+      ventasNoEfectivoNetas: Number(resumen.ventasNoEfectivoNetas || 0),
+      ingresosManuales: Number(resumen.ingresosManuales || 0),
+      egresosManuales: Number(resumen.egresosManuales || 0)
     }).catch((emailError) => {
       console.error('[cajas] Error enviando correo de cierre de caja:', emailError?.message || emailError);
     });

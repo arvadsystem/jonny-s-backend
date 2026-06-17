@@ -144,7 +144,12 @@ const templateRecuperacion = (linkRecuperacion) => `
  * @param {object} [meta] - Metadata para log ({id_usuario, tipo_correo})
  */
 const enviarCorreo = async (to, subject, html, meta = {}) => {
-  const { id_usuario = null, tipo_correo = 'general', fromKey = null } = meta;
+  const {
+    id_usuario = null,
+    tipo_correo = 'general',
+    fromKey = null,
+    attachments = []
+  } = meta;
 
   // Registrar intento en log
   let logId = null;
@@ -161,7 +166,11 @@ const enviarCorreo = async (to, subject, html, meta = {}) => {
 
   try {
     const fromAddress = getFromAddress(fromKey);
-    const info = await transporter.sendMail({ from: fromAddress, to, subject, html });
+    const mailOptions = { from: fromAddress, to, subject, html };
+    if (Array.isArray(attachments) && attachments.length > 0) {
+      mailOptions.attachments = attachments;
+    }
+    const info = await transporter.sendMail(mailOptions);
     console.log(`📧 [emailService] Correo enviado a ${to} (desde ${fromAddress}) — MessageId: ${info.messageId}`);
 
     // Actualizar log como exitoso
