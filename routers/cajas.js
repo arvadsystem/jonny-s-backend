@@ -1580,6 +1580,60 @@ const sendCajaAperturaEmail = async (idSesionCaja) => {
   );
 };
 
+const formatPayrollSyncLabel = (payrollSync) => {
+  if (!payrollSync) return 'No disponible';
+  const reason = String(payrollSync.reason || '').trim().toUpperCase();
+
+  if (reason === 'NOT_REQUIRED') return 'No requerida';
+  if (reason === 'UPDATED') return 'Deduccion sincronizada';
+  if (reason === 'RESPONSABLE_CAJA_NO_DETERMINADO') return 'No sincronizada: responsable no determinado';
+  if (reason === 'PLANILLA_DETAIL_NOT_FOUND') return 'No sincronizada: planilla no encontrada';
+  if (reason === 'PLANILLA_NOT_EDITABLE') return 'No sincronizada: planilla no editable';
+  if (reason === 'PAYROLL_DEDUCTION_NOT_CREATED') return 'No sincronizada: deduccion no creada';
+
+  return payrollSync.synced
+    ? `Sincronizada (${reason || 'OK'})`
+    : `No sincronizada (${reason || 'sin motivo'})`;
+};
+
+const fetchCajaCloseEmailActors = async (client, { idUsuarioResponsable, idUsuarioCierre }) => {
+  const ids = [
+    parsePositiveInt(idUsuarioResponsable),
+    parsePositiveInt(idUsuarioCierre)
+  ].filter(Boolean);
+  const uniqueIds = [...new Set(ids)];
+  if (uniqueIds.length === 0) return {};
+
+  const result = await client.query(
+    `
+      SELECT
+        u.id_usuario,
+        u.nombre_usuario,
+        ${USER_DISPLAY_SQL} AS nombre_completo
+      FROM public.usuarios u
+      LEFT JOIN public.empleados e ON e.id_empleado = u.id_empleado
+      LEFT JOIN public.personas per ON per.id_persona = e.id_persona
+      WHERE u.id_usuario = ANY($1::int[])
+    `,
+    [uniqueIds]
+  );
+  const usersById = new Map(
+    result.rows.map((row) => [Number(row.id_usuario), row])
+  );
+  const responsable = usersById.get(parsePositiveInt(idUsuarioResponsable));
+  const cierre = usersById.get(parsePositiveInt(idUsuarioCierre));
+
+  return {
+    responsable_nombre: responsable?.nombre_completo || null,
+    responsable_usuario: responsable?.nombre_usuario || null,
+    cierre_nombre: cierre?.nombre_completo || null,
+    cierre_usuario: cierre?.nombre_usuario || null
+  };
+};
+
+const resolveCajaEmailActorLabel = (actors, primaryNameKey, primaryUserKey, fallback) =>
+  actors?.[primaryNameKey] || actors?.[primaryUserKey] || fallback || 'No disponible';
+
 const buildCajaCierreEmailHtml = (payload) => {
   const arqueosRows = Array.isArray(payload.arqueos) && payload.arqueos.length > 0
     ? payload.arqueos.map((row) => `
@@ -1596,9 +1650,21 @@ const buildCajaCierreEmailHtml = (payload) => {
         <td colspan="5" style="color:#667085;">Sin arqueos segmentados asociados.</td>
       </tr>
     `;
+  const responsableLabel = resolveCajaEmailActorLabel(
+    payload.actors,
+    'responsable_nombre',
+    'responsable_usuario',
+    payload.session?.id_usuario_responsable
+  );
+  const cierreLabel = resolveCajaEmailActorLabel(
+    payload.actors,
+    'cierre_nombre',
+    'cierre_usuario',
+    payload.idUsuarioCierre
+  );
   const auditMessage = payload.requiresAudit
-    ? 'Este cierre requiere auditoria por diferencias, recuentos o inconsistencias detectadas.'
-    : 'Este cierre no reporta diferencias pendientes de auditoria.';
+    ? 'Este cierre de caja requiere auditoria por inconsistencias detectadas en el recuento o diferencia de cierre.'
+    : 'Este cierre de caja fue registrado sin inconsistencias pendientes de auditoria.';
 
   return `
 <!DOCTYPE html>
@@ -1614,14 +1680,14 @@ const buildCajaCierreEmailHtml = (payload) => {
     <tr><td><strong>Codigo de caja</strong></td><td>${escapeHtml(payload.session?.codigo_caja || payload.session?.id_caja || 'No disponible')}</td></tr>
     <tr><td><strong>Nombre de caja</strong></td><td>${escapeHtml(payload.session?.nombre_caja || 'No disponible')}</td></tr>
     <tr><td><strong>Sucursal</strong></td><td>${escapeHtml(payload.session?.nombre_sucursal || payload.session?.id_sucursal || 'No disponible')}</td></tr>
-    <tr><td><strong>Responsable</strong></td><td>${escapeHtml(payload.session?.id_usuario_responsable || 'No disponible')}</td></tr>
-    <tr><td><strong>Usuario de cierre</strong></td><td>${escapeHtml(payload.idUsuarioCierre || 'No disponible')}</td></tr>
+    <tr><td><strong>Responsable</strong></td><td>${escapeHtml(responsableLabel)}</td></tr>
+    <tr><td><strong>Usuario de cierre</strong></td><td>${escapeHtml(cierreLabel)}</td></tr>
     <tr><td><strong>Fecha/hora</strong></td><td>${escapeHtml(formatDateTimeLabel(payload.fechaCierre))}</td></tr>
     <tr><td><strong>Total teorico</strong></td><td>${escapeHtml(formatMoneyLabel(payload.montoTeorico))}</td></tr>
     <tr><td><strong>Total declarado</strong></td><td>${escapeHtml(formatMoneyLabel(payload.montoDeclaradoCierre))}</td></tr>
     <tr><td><strong>Diferencia</strong></td><td>${escapeHtml(formatMoneyLabel(payload.diferencia))}</td></tr>
     <tr><td><strong>Resolucion</strong></td><td>${escapeHtml(payload.resolutionCode || payload.idResolucionFinal || 'No disponible')}</td></tr>
-    <tr><td><strong>Nomina</strong></td><td>${escapeHtml(payload.payrollSync?.status || 'No aplicada')}</td></tr>
+    <tr><td><strong>Nomina</strong></td><td>${escapeHtml(formatPayrollSyncLabel(payload.payrollSync))}</td></tr>
   </table>
   <h3 style="margin:0 0 8px;">Arqueos por metodo</h3>
   <table cellpadding="6" cellspacing="0" style="border-collapse:collapse; width:100%; border:1px solid #eaecf0;">
@@ -4267,20 +4333,32 @@ const closeSessionHandler = async (req, res) => {
       diferencia,
       resolucionCodigo: resolutionCode
     });
+    let emailActors = {};
+    try {
+      emailActors = await fetchCajaCloseEmailActors(client, {
+        idUsuarioResponsable: session.id_usuario_responsable,
+        idUsuarioCierre: scopeContext.idUsuario
+      });
+    } catch (actorError) {
+      console.warn('[cajas] No se pudieron resolver usuarios para correo de cierre:', actorError?.message || actorError);
+    }
 
     await client.query('COMMIT');
+    const hasArqueoInconsistency = Array.isArray(arqueosPersistir)
+      ? arqueosPersistir.some((row) =>
+          Boolean(row.requiere_revision) || Math.abs(roundMoney(row.diferencia)) > 0
+        )
+      : false;
     const requiresAudit =
       Math.abs(roundMoney(diferencia)) > 0 ||
       resolutionCode === 'PENDIENTE_REVISION' ||
-      (Array.isArray(arqueosPersistir) && arqueosPersistir.length > 0) ||
-      (Array.isArray(arqueosPersistir) && arqueosPersistir.some((row) =>
-        Boolean(row.requiere_revision) || Math.abs(roundMoney(row.diferencia)) > 0
-      ));
+      hasArqueoInconsistency;
     void sendCajaCierreEmail({
       idCierreCaja,
       idSesionCaja,
       session,
       idUsuarioCierre: scopeContext.idUsuario,
+      actors: emailActors,
       fechaCierre,
       montoTeorico,
       montoDeclaradoCierre,
