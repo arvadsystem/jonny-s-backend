@@ -4699,7 +4699,7 @@ router.get('/ventas/catalogos/tipos-descuento', listTiposDescuentoCatalogoHandle
 
 router.get('/ventas/catalogos/tipo-departamento', listTipoDepartamentoCatalogoHandler);
 
-router.get('/ventas/catalogos/descuentos', listDescuentosCatalogoHandler);
+router.get('/ventas/catalogos/descuentos', checkPermission(VENTAS_DESCUENTOS_PERMISSIONS), listDescuentosCatalogoHandler);
 
 router.get('/ventas/descuentos-catalogos', checkPermission(VENTAS_DESCUENTOS_PERMISSIONS), async (req, res) => {
   try {
