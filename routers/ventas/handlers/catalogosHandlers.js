@@ -695,6 +695,7 @@ export const listTipoDepartamentoCatalogoHandler = async (req, res) => {
 export const listDescuentosCatalogoHandler = async (req, res) => {
   try {
     const scope = await resolveRequestUserSucursalScope(req);
+    const isSuperAdmin = Boolean(scope.isSuperAdmin);
     const idSucursal = parseOptionalPositiveInt(req.query.id_sucursal);
     const sucursalValidation = await validateVentasCatalogSucursal({ scope, idSucursal });
     if (!sucursalValidation.ok) {
@@ -702,10 +703,18 @@ export const listDescuentosCatalogoHandler = async (req, res) => {
     }
 
     const params = [];
-    const sucursalWhere = idSucursal
-      ? 'AND (dc.id_sucursal IS NULL OR dc.id_sucursal = $1)'
-      : '';
-    if (idSucursal) params.push(idSucursal);
+    let sucursalWhere = '';
+    if (idSucursal) {
+      params.push(idSucursal);
+      sucursalWhere = 'AND (dc.id_sucursal IS NULL OR dc.id_sucursal = $1)';
+    } else if (!isSuperAdmin) {
+      const allowedSucursalIds = coercePositiveIntArray(scope.allowedSucursalIds);
+      if (allowedSucursalIds.length === 0) {
+        return res.status(200).json([]);
+      }
+      params.push(allowedSucursalIds);
+      sucursalWhere = 'AND (dc.id_sucursal IS NULL OR dc.id_sucursal = ANY($1::int[]))';
+    }
 
     const result = await pool.query(
       `

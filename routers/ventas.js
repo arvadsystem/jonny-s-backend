@@ -6824,6 +6824,7 @@ router.patch('/ventas/clientes/:id/telefono', checkPermission(['VENTAS_CREAR']),
       : [];
     const userSucursalId = parseOptionalPositiveInt(scope?.userSucursalId);
     const effectiveAllowedSucursalIds = allowedSucursalIds.length > 0 ? allowedSucursalIds : userSucursalId ? [userSucursalId] : [];
+    const hasClienteSucursalField = await hasColumn(client, 'clientes', 'id_sucursal');
 
     const clienteResult = await client.query(
       `
@@ -6832,7 +6833,7 @@ router.patch('/ventas/clientes/:id/telefono', checkPermission(['VENTAS_CREAR']),
           c.estado,
           c.id_persona,
           c.id_empresa,
-          c.id_sucursal,
+          ${hasClienteSucursalField ? 'c.id_sucursal' : 'NULL::int AS id_sucursal'},
           p.id_telefono AS persona_id_telefono,
           tp.telefono AS persona_telefono,
           e.id_telefono AS empresa_id_telefono,
@@ -6854,7 +6855,11 @@ router.patch('/ventas/clientes/:id/telefono', checkPermission(['VENTAS_CREAR']),
     }
     if (!cliente.id_persona && !cliente.id_empresa) {
       await client.query('ROLLBACK');
-      return res.status(409).json({ error: true, message: 'No se puede actualizar telefono para consumidor final.' });
+      return res.status(409).json({
+        error: true,
+        code: 'CLIENTE_CONSUMIDOR_FINAL_NO_ACTUALIZABLE',
+        message: 'No se puede actualizar telefono para consumidor final.'
+      });
     }
 
     if (!scope.isSuperAdmin && effectiveAllowedSucursalIds.length > 0) {
@@ -6876,7 +6881,11 @@ router.patch('/ventas/clientes/:id/telefono', checkPermission(['VENTAS_CREAR']),
       }
       if (!hasScope) {
         await client.query('ROLLBACK');
-        return res.status(403).json({ error: true, message: 'No tienes permiso para actualizar este cliente.' });
+        return res.status(403).json({
+          error: true,
+          code: 'CLIENTE_TELEFONO_SCOPE_FORBIDDEN',
+          message: 'No tienes permiso para actualizar el telefono de este cliente.'
+        });
       }
     }
 
@@ -6898,7 +6907,11 @@ router.patch('/ventas/clientes/:id/telefono', checkPermission(['VENTAS_CREAR']),
 
     if (target.telefonoActual) {
       await client.query('ROLLBACK');
-      return res.status(409).json({ error: true, message: 'El cliente ya tiene telefono registrado.' });
+      return res.status(409).json({
+        error: true,
+        code: 'CLIENTE_TELEFONO_EXISTENTE',
+        message: 'El cliente ya tiene telefono registrado.'
+      });
     }
 
     let idTelefono = target.idTelefono;
