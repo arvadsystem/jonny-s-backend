@@ -7027,8 +7027,8 @@ router.get('/ventas/pedidos/:id/inventario-alertas', checkPermission(['VENTAS_VE
   }
 });
 
-router.get('/ventas/:id/ticket.pdf', checkPermission(['VENTAS_VER']), getVentaTicketPdfByIdHandler);
-router.get('/ventas/:id/ticket', checkPermission(['VENTAS_VER']), getVentaTicketByIdHandler);
+router.get('/ventas/:id/ticket.pdf', checkPermission(['VENTAS_IMPRIMIR']), getVentaTicketPdfByIdHandler);
+router.get('/ventas/:id/ticket', checkPermission(['VENTAS_IMPRIMIR']), getVentaTicketByIdHandler);
 router.get('/ventas/:id', checkPermission(['VENTAS_VER']), getVentaByIdHandler);
 
 async function listarPedidosPendientesPago(req, res) {
@@ -7288,9 +7288,17 @@ async function listarPedidosPendientesPago(req, res) {
             AND COALESCE(ppc.monto_pendiente, 0) > 0
             AND ${cobrableFacturaScopeSql}
           ) AS puede_cobrar,
-          (pd.id_pedido_delivery IS NOT NULL OR COALESCE(cme.codigo, p.tipo_entrega) = 'DELIVERY') AS es_delivery,
-          COALESCE(pd.costo_envio, 0)::numeric(14,2) AS costo_envio,
+          pd.id_pedido_delivery IS NOT NULL AS es_delivery,
+          CASE
+            WHEN pd.id_pedido_delivery IS NULL THEN NULL
+            ELSE COALESCE(pd.costo_envio, 0)::numeric(14,2)
+          END AS costo_envio,
           cde.codigo AS estado_delivery,
+          pd.nombre_receptor,
+          pd.telefono_receptor,
+          pd.direccion_entrega,
+          pd.referencia_entrega,
+          pd.observacion_delivery,
           COALESCE(vcd_info.divisiones, '[]'::jsonb) AS cuenta_dividida
         ${fromClause}
         ${whereClause}
@@ -7328,7 +7336,13 @@ async function listarPedidosPendientesPago(req, res) {
         divisiones: Array.isArray(row.cuenta_dividida) ? row.cuenta_dividida : []
       },
       es_delivery: Boolean(row.es_delivery),
-      costo_envio: roundMoney(row.costo_envio)
+      costo_envio: roundMoney(row.costo_envio),
+      estado_delivery: row.estado_delivery,
+      nombre_receptor: row.nombre_receptor,
+      telefono_receptor: row.telefono_receptor,
+      direccion_entrega: row.direccion_entrega,
+      referencia_entrega: row.referencia_entrega,
+      observacion_delivery: row.observacion_delivery
     }));
 
     if (includeItems && items.length > 0) {

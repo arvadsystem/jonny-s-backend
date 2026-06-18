@@ -243,6 +243,7 @@ export const buildVentaDetailPayload = async (req, {
       idPedido: venta.id_pedido
     });
     const pedidoDeliveryDetail = await fetchPedidoDeliveryDetail(pool, venta.id_pedido);
+    const delivery = pedidoDeliveryDetail.delivery;
 
     return {
       status: 200,
@@ -254,7 +255,16 @@ export const buildVentaDetailPayload = async (req, {
         cuenta_dividida: cuentaDividida,
         contacto: pedidoDeliveryDetail.contacto,
         contexto: pedidoDeliveryDetail.contexto,
-        delivery: pedidoDeliveryDetail.delivery,
+        es_delivery: Boolean(delivery),
+        modalidad: pedidoDeliveryDetail.contexto?.modalidad || null,
+        estado_delivery: delivery?.estado_delivery || null,
+        costo_envio: delivery?.costo_envio ?? null,
+        nombre_receptor: delivery?.nombre_receptor || null,
+        telefono_receptor: delivery?.telefono_receptor || null,
+        direccion_entrega: delivery?.direccion_entrega || null,
+        referencia_entrega: delivery?.referencia_entrega || null,
+        observacion_delivery: delivery?.observacion_delivery || null,
+        delivery,
         reversiones
       }
     };

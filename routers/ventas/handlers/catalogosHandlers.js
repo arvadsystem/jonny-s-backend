@@ -25,6 +25,18 @@ const sendVentasInternalError = (
   message = 'No se pudo procesar la solicitud de ventas.'
 ) => res.status(500).json({ error: true, message });
 
+const logDescuentosCatalogError = ({ err, req, scope, idSucursal }) => {
+  console.error('[ventas.catalogos.descuentos] error', {
+    route: `${req.method} ${req.originalUrl || req.path || '/ventas/catalogos/descuentos'}`,
+    usuario: parseOptionalPositiveInt(req.user?.id_usuario),
+    sucursal_solicitada: idSucursal || null,
+    sucursales_permitidas: coercePositiveIntArray(scope?.allowedSucursalIds),
+    postgres_code: err?.code || null,
+    message: err?.message || 'Error sin mensaje',
+    stack: err?.stack || null
+  });
+};
+
 const normalizeClienteNombre = (cliente) => {
   const nombrePersona = [cliente?.nombre, cliente?.apellido].filter(Boolean).join(' ').trim();
   if (nombrePersona) return nombrePersona;
@@ -693,10 +705,12 @@ export const listTipoDepartamentoCatalogoHandler = async (req, res) => {
 };
 
 export const listDescuentosCatalogoHandler = async (req, res) => {
+  let scope = null;
+  let idSucursal = null;
   try {
-    const scope = await resolveRequestUserSucursalScope(req);
+    scope = await resolveRequestUserSucursalScope(req);
     const isSuperAdmin = Boolean(scope.isSuperAdmin);
-    const idSucursal = parseOptionalPositiveInt(req.query.id_sucursal);
+    idSucursal = parseOptionalPositiveInt(req.query.id_sucursal);
     const sucursalValidation = await validateVentasCatalogSucursal({ scope, idSucursal });
     if (!sucursalValidation.ok) {
       return res.status(sucursalValidation.status).json(sucursalValidation.body);
@@ -807,7 +821,7 @@ export const listDescuentosCatalogoHandler = async (req, res) => {
     );
     res.status(200).json((result.rows || []).map(normalizeDescuentoCatalogoRow));
   } catch (err) {
-    console.error('Error al listar descuentos activos de catalogo:', err.message);
+    logDescuentosCatalogError({ err, req, scope, idSucursal });
     sendVentasInternalError(res);
   }
 };
