@@ -23,22 +23,36 @@ const parseBoolean = (value, fallback = false) => {
   return ['1', 'true', 'yes', 'on'].includes(String(value).trim().toLowerCase());
 };
 
+const DB_POOL_MAX_LIMIT = 24;
+
+const poolMax = parsePositiveInt(process.env.DB_POOL_MAX, 8);
+if (poolMax > DB_POOL_MAX_LIMIT) {
+  throw new Error(`DB_POOL_MAX no puede ser mayor que ${DB_POOL_MAX_LIMIT}.`);
+}
+
+const idleTimeoutMillis = parsePositiveInt(process.env.DB_IDLE_TIMEOUT_MS, 30000);
+const connectionTimeoutMillis = parsePositiveInt(process.env.DB_CONNECTION_TIMEOUT_MS, 3000);
+const keepAlive = parseBoolean(process.env.DB_KEEP_ALIVE, true);
+const keepAliveInitialDelayMillis = parseNonNegativeInt(
+  process.env.DB_KEEP_ALIVE_INITIAL_DELAY_MS,
+  10000
+);
+const applicationName = String(process.env.DB_APPLICATION_NAME || 'jonnys-backend').trim() || 'jonnys-backend';
+
 const pool = new Pool({
   host: process.env.DB_HOST,
   port: Number(process.env.DB_PORT || 5432),
   user: process.env.DB_USER,
   password: process.env.DB_PASSWORD,
   database: process.env.DB_NAME || 'postgres',
+  application_name: applicationName,
 
   // Keep the per-process pool conservative because every replica creates one.
-  max: parsePositiveInt(process.env.DB_POOL_MAX, 8),
-  idleTimeoutMillis: parsePositiveInt(process.env.DB_IDLE_TIMEOUT_MS, 30000),
-  connectionTimeoutMillis: parsePositiveInt(process.env.DB_CONNECTION_TIMEOUT_MS, 3000),
-  keepAlive: parseBoolean(process.env.DB_KEEP_ALIVE, true),
-  keepAliveInitialDelayMillis: parseNonNegativeInt(
-    process.env.DB_KEEP_ALIVE_INITIAL_DELAY_MS,
-    10000
-  ),
+  max: poolMax,
+  idleTimeoutMillis,
+  connectionTimeoutMillis,
+  keepAlive,
+  keepAliveInitialDelayMillis,
 
   ssl: {
     rejectUnauthorized: false,
@@ -50,6 +64,20 @@ const getPoolState = () => ({
   idleCount: pool.idleCount,
   waitingCount: pool.waitingCount
 });
+
+console.info('[pool] Configuracion efectiva', {
+  DB_POOL_MAX: poolMax,
+  idleTimeoutMillis,
+  connectionTimeoutMillis,
+  keepAlive,
+  ...getPoolState()
+});
+
+if (poolMax > 12) {
+  console.warn('[pool] DB_POOL_MAX alto: este valor se multiplica por cada replica del backend.', {
+    DB_POOL_MAX: poolMax
+  });
+}
 
 pool.on('error', (err) => {
   const payload = {
