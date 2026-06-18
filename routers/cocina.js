@@ -441,13 +441,25 @@ const splitObservationSegments = (value) => {
     .filter(Boolean);
 };
 
-const extractConfigMenuModifications = (configuracionMenu, itemTipo) => {
+const isTechnicalKitchenObservation = (value) => {
+  const source = String(value || '').trim();
+  if (!source) return false;
+  return (
+    source.includes('PUBCFG:v1') ||
+    /^(extras|salsas|complementos|config|cfg)=/i.test(source) ||
+    /(?:^|[|,\s])(extras|salsas|complementos)=\d+(?:\*\d+)?(?:[;,|]\d+(?:\*\d+)?)*($|[|,\s])/i.test(source)
+  );
+};
+
+const extractConfigMenuModifications = (configuracionMenu, itemTipo, salsaNameMap = new Map()) => {
   const source = configuracionMenu && typeof configuracionMenu === 'object'
     ? configuracionMenu
     : null;
   const complementos = Array.isArray(source?.complementos) ? source.complementos : [];
   const extras = Array.isArray(source?.extras) ? source.extras : [];
-  if (!complementos.length && !extras.length) return [];
+  const salsasPorUnidad = Array.isArray(source?.salsas_por_unidad) ? source.salsas_por_unidad : [];
+  const notaCliente = String(source?.nota_cliente || '').trim();
+  if (!complementos.length && !extras.length && !salsasPorUnidad.length && !notaCliente) return [];
 
   const complementosText = complementos
     .map((entry) => String(entry?.nombre || '').trim())
@@ -465,7 +477,30 @@ const extractConfigMenuModifications = (configuracionMenu, itemTipo) => {
     })
     .filter(Boolean);
 
-  return [...extrasText, ...complementosText];
+  const publicMenuSalsasText = [];
+  if (String(source?.schema_version || '') === 'menu_publico_linea_v1' && salsasPorUnidad.length) {
+    const salsaCounts = new Map();
+    for (const entry of salsasPorUnidad) {
+      const idSalsa = parsePositiveInt(entry?.id_salsa);
+      const cantidad = parsePositiveInt(entry?.cantidad) || 1;
+      if (!idSalsa || cantidad <= 0) continue;
+      const nombre = String(salsaNameMap.get(idSalsa) || `Salsa #${idSalsa}`).trim();
+      if (!nombre) continue;
+      salsaCounts.set(nombre, (salsaCounts.get(nombre) || 0) + cantidad);
+    }
+    const salsas = [...salsaCounts.entries()].map(([nombre, cantidad]) =>
+      cantidad > 1 ? `${nombre} x${cantidad}` : nombre
+    );
+    if (salsas.length) {
+      publicMenuSalsasText.push(`${salsas.length > 1 ? 'Salsas' : 'Salsa'}: ${salsas.join(', ')}`);
+    }
+  }
+
+  const notaClienteText = notaCliente && !isTechnicalKitchenObservation(notaCliente)
+    ? [`Notas: ${notaCliente}`]
+    : [];
+
+  return [...new Set([...extrasText, ...complementosText, ...publicMenuSalsasText, ...notaClienteText])];
 };
 
 const stripItemPrefix = (note, itemName) => {
@@ -774,6 +809,11 @@ router.get('/cocina/pedidos', checkPermission(COCINA_VIEW_PERMISSIONS), async (r
           LEFT JOIN detalle_pedido dp
             ON dp.id_pedido = p.id_pedido
            AND COALESCE(dp.estado, true) = true
+           AND dp.id_producto IS NULL
+           AND (
+             dp.id_combo IS NOT NULL
+             OR dp.id_receta IS NOT NULL
+           )
           LEFT JOIN productos prod ON prod.id_producto = dp.id_producto
           LEFT JOIN combos combo ON combo.id_combo = dp.id_combo
           LEFT JOIN recetas rec ON rec.id_receta = dp.id_receta
@@ -785,6 +825,39 @@ router.get('/cocina/pedidos', checkPermission(COCINA_VIEW_PERMISSIONS), async (r
         `,
         params
       );
+
+      const salsaIds = [
+        ...new Set(
+          result.rows.flatMap((row) => {
+            const config = row.configuracion_menu && typeof row.configuracion_menu === 'object'
+              ? row.configuracion_menu
+              : null;
+            const salsasPorUnidad = Array.isArray(config?.salsas_por_unidad)
+              ? config.salsas_por_unidad
+              : [];
+            return salsasPorUnidad
+              .map((entry) => parsePositiveInt(entry?.id_salsa))
+              .filter(Boolean);
+          })
+        )
+      ];
+      let salsaNameMap = new Map();
+      if (salsaIds.length) {
+        const salsasResult = await client.query(
+          `
+            SELECT id_salsa, nombre
+            FROM public.salsas
+            WHERE id_salsa = ANY($1::int[])
+              AND COALESCE(estado, true) = true
+          `,
+          [salsaIds]
+        );
+        salsaNameMap = new Map(
+          salsasResult.rows
+            .map((row) => [parsePositiveInt(row.id_salsa), String(row.nombre || '').trim()])
+            .filter(([idSalsa, nombre]) => idSalsa && nombre)
+        );
+      }
 
       const grouped = new Map();
       const now = Date.now();
@@ -891,13 +964,14 @@ router.get('/cocina/pedidos', checkPermission(COCINA_VIEW_PERMISSIONS), async (r
         }
       }
 
-      const data = Array.from(grouped.values()).map((pedido) => {
+      const data = Array.from(grouped.values()).filter((pedido) => pedido.items.length > 0).map((pedido) => {
         const pedidoNotes = extractPedidoNotes(pedido.descripcion_pedido);
         const totalItems = pedido.items.length;
         return {
           ...pedido,
           items: pedido.items.map((item) => {
-            const modificaciones = item.observacion
+            const hasTechnicalObservation = isTechnicalKitchenObservation(item.observacion);
+            const modificaciones = item.observacion && !hasTechnicalObservation
               ? splitObservationSegments(item.observacion)
               : resolveItemModifications({
                   pedidoNotes,
@@ -906,14 +980,21 @@ router.get('/cocina/pedidos', checkPermission(COCINA_VIEW_PERMISSIONS), async (r
                 });
             const modificacionesConfiguracion = extractConfigMenuModifications(
               item.configuracion_menu,
-              item.tipo_item
+              item.tipo_item,
+              salsaNameMap
             );
             const modificacionesFinales = [...modificacionesConfiguracion, ...modificaciones];
-            const modificacionesUnicas = [...new Set(modificacionesFinales)];
+            const modificacionesUnicas = [
+              ...new Set(
+                modificacionesFinales
+                  .filter(Boolean)
+                  .filter((entry) => !isTechnicalKitchenObservation(entry))
+              )
+            ];
 
             return {
               ...item,
-              observacion: item.observacion,
+              observacion: hasTechnicalObservation ? null : item.observacion,
               modificaciones: modificacionesUnicas
             };
           })
