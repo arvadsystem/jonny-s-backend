@@ -6209,6 +6209,19 @@ router.get('/ventas/pedidos-menu', checkPermission(['VENTAS_VER']), async (req, 
           f.id_factura,
           ep.descripcion AS nombre_estado_pedido,
           ${estadoPagoSelect},
+          ${hasEstadoPago ? 'p.estado_pago' : 'NULL::text'} AS estado_pago_legacy,
+          UPPER(TRIM(COALESCE(ppc.estado_pago_codigo, ''))) AS estado_pago_control,
+          COALESCE(ppc.monto_total, p.total, 0)::numeric(14,2) AS monto_total,
+          COALESCE(ppc.monto_pagado, 0)::numeric(14,2) AS monto_pagado,
+          COALESCE(ppc.monto_pendiente, 0)::numeric(14,2) AS monto_pendiente,
+          (
+            UPPER(TRIM(COALESCE(ppc.estado_pago_codigo, ''))) = '${PEDIDO_PENDIENTE_ESTADO_PAGO}'
+            AND COALESCE(ppc.monto_pendiente, 0) > 0
+            AND (
+              f.id_factura IS NULL
+              OR COALESCE(vcd_info.divisiones_pendientes_count, 0) > 0
+            )
+          ) AS puede_cobrar,
           ${validacionSelect},
           ${pagoConfirmadoAtSelect},
           ${canceladoTimeoutSelect},
@@ -6249,6 +6262,17 @@ router.get('/ventas/pedidos-menu', checkPermission(['VENTAS_VER']), async (req, 
         ${contactoJoin}
         LEFT JOIN LATERAL (
           SELECT
+            ppc_inner.*,
+            cep_inner.codigo AS estado_pago_codigo
+          FROM public.pedidos_pago_control ppc_inner
+          INNER JOIN public.cat_pedidos_estados_pago cep_inner
+            ON cep_inner.id_estado_pago_pedido = ppc_inner.id_estado_pago_pedido
+          WHERE ppc_inner.id_pedido = p.id_pedido
+          ORDER BY ppc_inner.id_pedido_pago_control DESC
+          LIMIT 1
+        ) ppc ON true
+        LEFT JOIN LATERAL (
+          SELECT
             STRING_AGG(DISTINCT cmp.nombre, ', ' ORDER BY cmp.nombre) AS metodo_pago
           FROM facturas_cobros fc
           INNER JOIN cat_metodos_pago cmp
@@ -6256,7 +6280,9 @@ router.get('/ventas/pedidos-menu', checkPermission(['VENTAS_VER']), async (req, 
           WHERE fc.id_factura = f.id_factura
         ) fc_info ON true
         LEFT JOIN LATERAL (
-          SELECT COUNT(*)::int AS divisiones_count
+          SELECT
+            COUNT(*)::int AS divisiones_count,
+            COUNT(*) FILTER (WHERE UPPER(TRIM(COALESCE(vcd.estado, ''))) = 'PENDIENTE')::int AS divisiones_pendientes_count
           FROM public.ventas_cuenta_divisiones vcd
           WHERE vcd.id_pedido = p.id_pedido
         ) vcd_info ON true
@@ -6353,7 +6379,7 @@ router.get('/ventas/pedidos-menu', checkPermission(['VENTAS_VER']), async (req, 
       return {
         ...row,
         pago_validado: String(row.estado_pago || '').toUpperCase() === PEDIDO_ESTADO_PAGO.PAGADO_CONFIRMADO,
-        pago_expirado: String(row.estado_pago || '').toUpperCase() === PEDIDO_ESTADO_PAGO.CANCELADO_TIMEOUT,
+        pago_expirado: String(row.estado_pago_legacy || row.estado_pago || '').toUpperCase() === PEDIDO_ESTADO_PAGO.CANCELADO_TIMEOUT,
         minutos_restantes_pago: minutosRestantes
       };
     });
@@ -7064,15 +7090,7 @@ async function listarPedidosPendientesPago(req, res) {
         FROM public.ventas_cuenta_divisiones vcd_pending
         WHERE vcd_pending.id_pedido = p.id_pedido
           AND UPPER(TRIM(vcd_pending.estado)) = 'PENDIENTE'
-      ))`,
-      'p.cancelado_por_timeout_at IS NULL',
-      `(COALESCE(UPPER(TRIM(p.estado_pago)), '') NOT IN ('PAGADO_CONFIRMADO', 'CANCELADO_TIMEOUT', 'PAGO_ANULADO', 'CANCELADO', 'ANULADO')
-        OR EXISTS (
-          SELECT 1
-          FROM public.ventas_cuenta_divisiones vcd_pending_estado
-          WHERE vcd_pending_estado.id_pedido = p.id_pedido
-            AND UPPER(TRIM(vcd_pending_estado.estado)) = 'PENDIENTE'
-        ))`
+      ))`
     ];
     const params = [PEDIDO_PENDIENTE_ESTADO_PAGO];
     const excludedPedidoEstados = [
@@ -7241,6 +7259,7 @@ async function listarPedidosPendientesPago(req, res) {
           'PED-' || LPAD(p.id_pedido::text, 5, '0') AS codigo_pedido,
           COALESCE(NULLIF(TRIM(f.codigo_venta), ''), 'VTA-' || LPAD(p.id_pedido::text, 5, '0')) AS codigo_venta_operativo,
           COALESCE(NULLIF(TRIM(f.codigo_venta), ''), 'VTA-' || LPAD(p.id_pedido::text, 5, '0')) AS codigo_venta,
+          f.id_factura,
           p.fecha_hora_pedido,
           p.origen_pedido,
           CASE
@@ -7249,6 +7268,8 @@ async function listarPedidosPendientesPago(req, res) {
             ELSE REPLACE(REPLACE(UPPER(TRIM(COALESCE(ep.descripcion, ''))), ' ', '_'), '-', '_')
           END AS estado_pedido,
           UPPER(TRIM(ppc.estado_pago_codigo)) AS estado_pago,
+          p.estado_pago AS estado_pago_legacy,
+          UPPER(TRIM(ppc.estado_pago_codigo)) AS estado_pago_control,
           p.id_sucursal,
           s.nombre_sucursal,
           pc.nombre_contacto,
@@ -7257,7 +7278,10 @@ async function listarPedidosPendientesPago(req, res) {
           COALESCE(cpc.codigo, p.canal) AS canal,
           COALESCE(cme.codigo, p.tipo_entrega) AS modalidad,
           COALESCE(p.total, ppc.monto_total, 0)::numeric(14,2) AS total,
+          COALESCE(ppc.monto_total, p.total, 0)::numeric(14,2) AS monto_total,
+          COALESCE(ppc.monto_pagado, 0)::numeric(14,2) AS monto_pagado,
           COALESCE(ppc.monto_pendiente, 0)::numeric(14,2) AS monto_pendiente,
+          TRUE AS puede_cobrar,
           (pd.id_pedido_delivery IS NOT NULL OR COALESCE(cme.codigo, p.tipo_entrega) = 'DELIVERY') AS es_delivery,
           COALESCE(pd.costo_envio, 0)::numeric(14,2) AS costo_envio,
           cde.codigo AS estado_delivery,
@@ -7279,6 +7303,9 @@ async function listarPedidosPendientesPago(req, res) {
       origen_pedido: row.origen_pedido,
       estado_pedido: row.estado_pedido,
       estado_pago: row.estado_pago,
+      estado_pago_legacy: row.estado_pago_legacy,
+      estado_pago_control: row.estado_pago_control,
+      id_factura: parseOptionalPositiveInt(row.id_factura),
       id_sucursal: Number(row.id_sucursal),
       nombre_sucursal: row.nombre_sucursal,
       nombre_contacto: row.nombre_contacto,
@@ -7287,7 +7314,10 @@ async function listarPedidosPendientesPago(req, res) {
       canal: row.canal,
       modalidad: row.modalidad,
       total: roundMoney(row.total),
+      monto_total: roundMoney(row.monto_total),
+      monto_pagado: roundMoney(row.monto_pagado),
       monto_pendiente: roundMoney(row.monto_pendiente),
+      puede_cobrar: Boolean(row.puede_cobrar),
       cuenta_dividida: {
         divisiones: Array.isArray(row.cuenta_dividida) ? row.cuenta_dividida : []
       },

@@ -149,6 +149,13 @@ const extractIdFromUnknown = (value, candidateKeys = []) => {
 
 const isSchemaMissingError = (error) => ['42P01', '42703'].includes(String(error?.code || '').trim());
 
+const createAtomicHttpError = (message, httpStatus, code) => {
+  const error = new Error(message);
+  error.httpStatus = httpStatus;
+  error.code = code;
+  return error;
+};
+
 const resolveTenantContextForRequest = async (req, client = pool) => {
   const isSuperAdmin = await isRequestUserSuperAdmin(req).catch(() => false);
   const fromToken = parsePositiveInt(req?.user?.id_empresa ?? req?.user?.id_empresa_contexto);
@@ -163,102 +170,11 @@ const resolveTenantContextForRequest = async (req, client = pool) => {
     return { tenantId: fromPayload || null, isSuperAdmin };
   }
 
-  const idUsuario = parsePositiveInt(req?.user?.id_usuario);
-  const idSucursalToken = parsePositiveInt(req?.user?.id_sucursal);
-
-  if (idSucursalToken) {
-    try {
-      const bySucursal = await client.query(
-        `
-          SELECT id_empresa
-          FROM public.sucursales
-          WHERE id_sucursal = $1
-          LIMIT 1
-        `,
-        [idSucursalToken]
-      );
-      const tenantFromSucursal = parsePositiveInt(bySucursal.rows?.[0]?.id_empresa);
-      if (tenantFromSucursal) {
-        return { tenantId: tenantFromSucursal, isSuperAdmin };
-      }
-    } catch {
-      // noop
-    }
-  }
-
-  if (!idUsuario) return { tenantId: null, isSuperAdmin };
-
-  try {
-    const tenantResult = await client.query(
-      `
-        SELECT
-          COALESCE(
-            u.id_empresa,
-            p_emp.id_empresa,
-            c.id_empresa_cliente,
-            s_emp.id_empresa
-          ) AS id_empresa_resuelta
-        FROM public.usuarios u
-        LEFT JOIN public.empleados e ON e.id_empleado = u.id_empleado
-        LEFT JOIN public.personas p_emp ON p_emp.id_persona = e.id_persona
-        LEFT JOIN public.clientes c ON c.id_cliente = u.id_cliente
-        LEFT JOIN public.sucursales s_emp ON s_emp.id_sucursal = e.id_sucursal
-        WHERE u.id_usuario = $1
-        LIMIT 1
-      `,
-      [idUsuario]
-    );
-    return {
-      tenantId: parsePositiveInt(tenantResult.rows?.[0]?.id_empresa_resuelta),
-      isSuperAdmin
-    };
-  } catch {
-    // noop
-  }
-
-  // Fallback final para cajero: resolver empresa desde asignacion activa de caja.
-  try {
-    const tenantByCaja = await client.query(
-      `
-        SELECT s.id_empresa
-        FROM public.cajas_usuarios_autorizados cua
-        INNER JOIN public.cajas c ON c.id_caja = cua.id_caja
-        INNER JOIN public.sucursales s ON s.id_sucursal = c.id_sucursal
-        WHERE cua.id_usuario = $1
-          AND COALESCE(cua.estado, true) = true
-        ORDER BY cua.fecha_actualizacion DESC, cua.id_caja_usuario_autorizado DESC
-        LIMIT 1
-      `,
-      [idUsuario]
-    );
-    const tenantFromCaja = parsePositiveInt(tenantByCaja.rows?.[0]?.id_empresa);
-    if (tenantFromCaja) {
-      return { tenantId: tenantFromCaja, isSuperAdmin };
-    }
-  } catch {
-    // noop
-  }
-
   return { tenantId: null, isSuperAdmin };
 };
 
 const resolveTenantFromSucursalHint = async (client, hintSucursalId) => {
-  const idSucursal = parsePositiveInt(hintSucursalId);
-  if (!idSucursal) return null;
-  try {
-    const result = await client.query(
-      `
-        SELECT id_empresa
-        FROM public.sucursales
-        WHERE id_sucursal = $1
-        LIMIT 1
-      `,
-      [idSucursal]
-    );
-    return parsePositiveInt(result.rows?.[0]?.id_empresa);
-  } catch {
-    return null;
-  }
+  return null;
 };
 
 const getTipoClienteLabelColumn = async (client, { forceRefresh = false } = {}) => {
@@ -661,26 +577,6 @@ const trySetClienteSucursal = async (client, idCliente, idSucursal) => {
   }
 };
 
-const ensureClientesSucursalesTableAtomic = async (client) => {
-  const setupAttempt = await runRecoverableDbStep(client, async () => {
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS public.clientes_sucursales (
-        id_cliente INTEGER NOT NULL REFERENCES public.clientes(id_cliente) ON DELETE CASCADE,
-        id_sucursal INTEGER NOT NULL REFERENCES public.sucursales(id_sucursal) ON DELETE RESTRICT,
-        estado BOOLEAN NOT NULL DEFAULT TRUE,
-        es_principal BOOLEAN NOT NULL DEFAULT FALSE,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT timezone('America/Tegucigalpa', now()),
-        updated_at TIMESTAMPTZ NOT NULL DEFAULT timezone('America/Tegucigalpa', now()),
-        PRIMARY KEY (id_cliente, id_sucursal)
-      )
-    `);
-    await client.query('CREATE INDEX IF NOT EXISTS idx_clientes_sucursales_id_sucursal ON public.clientes_sucursales(id_sucursal)');
-    await client.query('CREATE INDEX IF NOT EXISTS idx_clientes_sucursales_id_cliente ON public.clientes_sucursales(id_cliente)');
-    return true;
-  });
-  return setupAttempt.ok;
-};
-
 const tryUpsertClienteSucursalLink = async (client, idCliente, idSucursal, { setPrincipal = false } = {}) => {
   const parsedCliente = parsePositiveInt(idCliente);
   const parsedSucursal = parsePositiveInt(idSucursal);
@@ -716,13 +612,6 @@ const tryUpsertClienteSucursalLink = async (client, idCliente, idSucursal, { set
 
   const firstError = firstAttempt.error;
   if (['42P01', '42P10'].includes(firstError?.code)) {
-    const bootstrapped = await ensureClientesSucursalesTableAtomic(client);
-    if (!bootstrapped) return;
-    const retryAttempt = await runRecoverableDbStep(client, executePrimaryUpsert);
-    if (!retryAttempt.ok) {
-      if (['42P01', '42703', '42P10'].includes(retryAttempt.error?.code)) return;
-      throw retryAttempt.error;
-    }
     return;
   }
 
@@ -783,6 +672,79 @@ const validateAtomicSucursalInput = (payload) => {
   return { ok: true, parsed };
 };
 
+const resolveClienteSucursalScope = async ({ req, client, requestedSucursalId }) => {
+  const isSuperAdmin = await isRequestUserSuperAdmin(req).catch(() => false);
+  const requested = parsePositiveInt(requestedSucursalId);
+  const userSucursalId = parsePositiveInt(req?.user?.id_sucursal);
+
+  if (isSuperAdmin) {
+    const targetSucursalId = requested || userSucursalId;
+    if (!targetSucursalId) {
+      throw createAtomicHttpError(
+        'No se pudo resolver la sucursal para crear el cliente.',
+        403,
+        'CLIENTE_SUCURSAL_NOT_RESOLVED'
+      );
+    }
+    const exists = await client.query(
+      'SELECT 1 FROM public.sucursales WHERE id_sucursal = $1 LIMIT 1',
+      [targetSucursalId]
+    );
+    if (!exists.rows.length) {
+      throw createAtomicHttpError(
+        'La sucursal indicada no existe o no esta disponible.',
+        403,
+        'CLIENTE_SUCURSAL_FORBIDDEN'
+      );
+    }
+    return { idSucursal: targetSucursalId, isSuperAdmin };
+  }
+
+  const allowed = new Set();
+  if (userSucursalId) allowed.add(userSucursalId);
+
+  const idUsuario = parsePositiveInt(req?.user?.id_usuario);
+  if (idUsuario) {
+    const cajasScope = await runRecoverableDbStep(client, async () =>
+      client.query(
+        `
+          SELECT DISTINCT c.id_sucursal
+          FROM public.cajas_usuarios_autorizados cua
+          INNER JOIN public.cajas c ON c.id_caja = cua.id_caja
+          WHERE cua.id_usuario = $1
+            AND COALESCE(cua.estado, true) = true
+            AND c.id_sucursal IS NOT NULL
+        `,
+        [idUsuario]
+      )
+    );
+    if (cajasScope.ok) {
+      (cajasScope.result?.rows || []).forEach((row) => {
+        const idSucursal = parsePositiveInt(row.id_sucursal);
+        if (idSucursal) allowed.add(idSucursal);
+      });
+    }
+  }
+
+  if (!allowed.size) {
+    throw createAtomicHttpError(
+      'No se pudo resolver la sucursal autorizada para crear el cliente.',
+      403,
+      'CLIENTE_SUCURSAL_NOT_RESOLVED'
+    );
+  }
+
+  if (requested && !allowed.has(requested)) {
+    throw createAtomicHttpError(
+      'No tienes permiso para crear clientes en esta sucursal.',
+      403,
+      'CLIENTE_SUCURSAL_FORBIDDEN'
+    );
+  }
+
+  return { idSucursal: requested || Array.from(allowed)[0], isSuperAdmin };
+};
+
 const linkClienteToSucursales = async ({
   client,
   idCliente,
@@ -840,54 +802,21 @@ const findExistingPersonaByDni = async (client, { dni, tenantId = null } = {}) =
   const normalizedDni = toTrimmedText(dni);
   if (!normalizedDni) return null;
 
-  const tenantScope = parsePositiveInt(tenantId);
-  let row = null;
-
-  // Intento con alcance por tenant cuando el esquema lo soporta.
-  if (tenantScope) {
-    const tenantScopedAttempt = await runRecoverableDbStep(client, async () =>
-      client.query(
-        `
-          SELECT
-            p.id_persona,
-            p.nombre,
-            p.apellido,
-            p.dni
-          FROM public.personas p
-          WHERE LOWER(TRIM(COALESCE(p.dni::TEXT, ''))) = LOWER(TRIM($1::TEXT))
-            AND p.id_empresa = $2
-          ORDER BY p.id_persona ASC
-          LIMIT 1
-        `,
-        [normalizedDni, tenantScope]
-      )
-    );
-    if (tenantScopedAttempt.ok) {
-      row = tenantScopedAttempt.result?.rows?.[0] || null;
-    } else {
-      // Compatibilidad: algunas instalaciones legacy no tienen personas.id_empresa.
-      if (String(tenantScopedAttempt.error?.code || '') !== '42703') throw tenantScopedAttempt.error;
-    }
-  }
-
-  // Fallback sin filtro de tenant para no romper el flujo atomico en esquemas legacy.
-  if (!row) {
-    const genericRs = await client.query(
-      `
-        SELECT
-          p.id_persona,
-          p.nombre,
-          p.apellido,
-          p.dni
-        FROM public.personas p
-        WHERE LOWER(TRIM(COALESCE(p.dni::TEXT, ''))) = LOWER(TRIM($1::TEXT))
-        ORDER BY p.id_persona ASC
-        LIMIT 1
-      `,
-      [normalizedDni]
-    );
-    row = genericRs.rows?.[0] || null;
-  }
+  const genericRs = await client.query(
+    `
+      SELECT
+        p.id_persona,
+        p.nombre,
+        p.apellido,
+        p.dni
+      FROM public.personas p
+      WHERE LOWER(TRIM(COALESCE(p.dni::TEXT, ''))) = LOWER(TRIM($1::TEXT))
+      ORDER BY p.id_persona ASC
+      LIMIT 1
+    `,
+    [normalizedDni]
+  );
+  const row = genericRs.rows?.[0] || null;
 
   if (!row) return null;
   return {
@@ -1116,20 +1045,16 @@ const atomicService = {
       await client.query('BEGIN');
       const { tenantId: resolvedTenantIdRaw, isSuperAdmin } = await resolveTenantContextForRequest(req, client);
       let resolvedTenantId = resolvedTenantIdRaw;
-      if (!resolvedTenantId && !isSuperAdmin) {
-        const rawBody = isPlainObject(req.body) ? req.body : {};
-        const bodyCliente = isPlainObject(rawBody.cliente) ? rawBody.cliente : {};
-        const hintedSucursalId =
-          parsePositiveInt(req?.user?.id_sucursal)
-          || parsePositiveInt(bodyCliente?.id_sucursal)
-          || parsePositiveInt(rawBody?.id_sucursal);
-        resolvedTenantId = await resolveTenantFromSucursalHint(client, hintedSucursalId);
+      const sucursalValidation = validateAtomicSucursalInput(clientePayload);
+      if (!sucursalValidation.ok) {
+        throw createAtomicHttpError('id_sucursal debe ser un entero positivo.', 400, 'VALIDATION_ERROR');
       }
-      if (!resolvedTenantId && !isSuperAdmin) {
-        const error = new Error('No se pudo resolver la empresa del usuario para crear el cliente.');
-        error.httpStatus = 403;
-        throw error;
-      }
+      const sucursalScope = await resolveClienteSucursalScope({
+        req,
+        client,
+        requestedSucursalId: sucursalValidation.parsed
+      });
+
       const requestWithTenant = resolvedTenantId
         ? {
             ...req,
@@ -1164,7 +1089,7 @@ const atomicService = {
           return {
             status: 409,
             body: buildErrorBody({
-              code: 'DUPLICATE_BASE',
+              code: 'CLIENTE_DUPLICATE_DNI',
               message: 'Ya existe una persona con ese DNI. Puedes vincular el registro existente.',
               details: {
                 origen: 'persona',
@@ -1193,7 +1118,7 @@ const atomicService = {
           return {
             status: 409,
             body: buildErrorBody({
-              code: 'DUPLICATE_BASE',
+              code: 'CLIENTE_DUPLICATE_RTN',
               message: 'Ya existe una empresa con ese RTN. Puedes vincular el registro existente.',
               details: {
                 origen: 'empresa',
@@ -1236,8 +1161,6 @@ const atomicService = {
         idEmpresa = null;
       }
 
-      const userSucursalId = parsePositiveInt(req.user?.id_sucursal);
-
       const supportsEmpresaClienteInFn = await fnGuardarClienteSupportsEmpresaCliente(client);
 
       let normalizedCliente = normalizeClienteAtomicPayload({
@@ -1253,15 +1176,8 @@ const atomicService = {
         };
       }
 
-      const sucursalValidation = validateAtomicSucursalInput(clientePayload);
-      if (!sucursalValidation.ok) {
-        const error = new Error('id_sucursal debe ser un entero positivo.');
-        error.httpStatus = 400;
-        throw error;
-      }
-
       const payloadSucursalId = parsePositiveInt(normalizedCliente.id_sucursal);
-      const effectiveSucursalId = payloadSucursalId || userSucursalId || null;
+      const effectiveSucursalId = payloadSucursalId || sucursalScope.idSucursal || null;
       if (effectiveSucursalId) {
         normalizedCliente = {
           ...normalizedCliente,
@@ -1453,6 +1369,9 @@ const atomicService = {
         }
       };
     } catch (err) {
+      if (Number(err?.httpStatus) === 403 && !err.code) {
+        err.code = 'CLIENTE_CREATE_FORBIDDEN';
+      }
       await rollbackQuietly(client);
       throw err;
     } finally {
