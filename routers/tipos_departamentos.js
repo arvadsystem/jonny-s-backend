@@ -16,6 +16,7 @@ const TIPO_DEPARTAMENTO_EDITABLE_FIELDS = Object.freeze({
 });
 
 const normalizeText = (value) => String(value ?? '').trim();
+const INTEGER_MAX = 2147483647;
 
 const normalizeDepartmentCode = (value) =>
   normalizeText(value)
@@ -24,12 +25,15 @@ const normalizeDepartmentCode = (value) =>
     .toUpperCase()
     .replace(/[^A-Z0-9]+/g, '_')
     .replace(/_+/g, '_')
-    .replace(/^_|_$/g, '')
-    .slice(0, 80);
+    .replace(/^_|_$/g, '');
 
-const parsePositiveInteger = (value) => {
-  const parsed = Number.parseInt(String(value ?? '').trim(), 10);
-  return Number.isInteger(parsed) && parsed > 0 ? parsed : null;
+const parsePositiveIntegerStrict = (value) => {
+  const raw = String(value ?? '').trim();
+  if (!/^[1-9]\d*$/.test(raw)) return null;
+  const parsed = Number(raw);
+  if (!Number.isSafeInteger(parsed)) return null;
+  if (parsed > INTEGER_MAX) return null;
+  return parsed;
 };
 
 const parseBooleanStrict = (value) => {
@@ -40,24 +44,38 @@ const parseBooleanStrict = (value) => {
   return null;
 };
 
+const isPlainObject = (value) => {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+};
+
+const isScalarValue = (value) =>
+  value === null || ['string', 'number', 'boolean'].includes(typeof value);
+
+const hasOwn = (source, key) => Object.prototype.hasOwnProperty.call(source, key);
+
 const validateTipoDepartamentoPayload = (payload, { partial = false } = {}) => {
   const source = payload || {};
   const normalized = {};
 
-  if (!partial || Object.prototype.hasOwnProperty.call(source, 'nombre_departamento')) {
+  if (!partial || hasOwn(source, 'nombre_departamento')) {
+    if (!isScalarValue(source.nombre_departamento)) return { error: 'NOMBRE_DEPARTAMENTO INVALIDO' };
     const nombre = normalizeText(source.nombre_departamento);
     if (!nombre) return { error: 'NOMBRE_DEPARTAMENTO ES OBLIGATORIO' };
     if (nombre.length > 50) return { error: 'NOMBRE_DEPARTAMENTO NO PUEDE EXCEDER 50 CARACTERES' };
     normalized.nombre_departamento = nombre;
   }
 
-  if (!partial || Object.prototype.hasOwnProperty.call(source, 'descripcion')) {
+  if (!partial || hasOwn(source, 'descripcion')) {
+    if (!isScalarValue(source.descripcion)) return { error: 'DESCRIPCION INVALIDA' };
     const descripcion = normalizeText(source.descripcion);
     if (descripcion.length > 50) return { error: 'DESCRIPCION NO PUEDE EXCEDER 50 CARACTERES' };
     normalized.descripcion = descripcion;
   }
 
-  if (!partial || Object.prototype.hasOwnProperty.call(source, 'codigo_departamento')) {
+  if (!partial || hasOwn(source, 'codigo_departamento')) {
+    if (!isScalarValue(source.codigo_departamento)) return { error: 'CODIGO_DEPARTAMENTO INVALIDO' };
     const fallbackName = normalized.nombre_departamento || source.nombre_departamento;
     const codigo = normalizeDepartmentCode(source.codigo_departamento || fallbackName);
     if (!codigo) return { error: 'CODIGO_DEPARTAMENTO ES OBLIGATORIO' };
@@ -65,13 +83,17 @@ const validateTipoDepartamentoPayload = (payload, { partial = false } = {}) => {
     normalized.codigo_departamento = codigo;
   }
 
-  if (!partial || Object.prototype.hasOwnProperty.call(source, 'orden_menu')) {
-    const ordenMenu = parsePositiveInteger(source.orden_menu);
-    if (ordenMenu === null) return { error: 'ORDEN_MENU DEBE SER UN ENTERO POSITIVO' };
+  if (!partial || hasOwn(source, 'orden_menu')) {
+    if (!isScalarValue(source.orden_menu)) return { error: 'ORDEN_MENU INVALIDO' };
+    const ordenMenu = parsePositiveIntegerStrict(source.orden_menu);
+    if (ordenMenu === null) {
+      return { error: 'ORDEN_MENU DEBE SER UN ENTERO POSITIVO ENTRE 1 Y 2147483647' };
+    }
     normalized.orden_menu = ordenMenu;
   }
 
-  if (!partial || Object.prototype.hasOwnProperty.call(source, 'estado')) {
+  if (!partial || hasOwn(source, 'estado')) {
+    if (!isScalarValue(source.estado)) return { error: 'ESTADO INVALIDO' };
     const estado = parseBooleanStrict(source.estado);
     if (estado === null) return { error: 'ESTADO DEBE SER BOOLEANO' };
     normalized.estado = estado;
@@ -111,6 +133,53 @@ const ensureUniqueTipoDepartamento = async ({ nombre, codigo, idToIgnore = null 
   }
 
   return '';
+};
+
+const normalizeUpdateChanges = (body) => {
+  const legacyCampo = normalizeText(body?.campo);
+  const hasCambios = hasOwn(body || {}, 'cambios');
+  const rawCambios = hasCambios ? body.cambios : { [legacyCampo]: body?.valor };
+
+  if (!hasCambios && !legacyCampo) {
+    return { error: 'NO HAY CAMBIOS VALIDOS PARA ACTUALIZAR' };
+  }
+  if (!isPlainObject(rawCambios)) {
+    return { error: 'CAMBIOS DEBE SER UN OBJETO PLANO' };
+  }
+
+  const entries = Object.entries(rawCambios);
+  if (entries.length === 0) {
+    return { error: 'NO HAY CAMBIOS VALIDOS PARA ACTUALIZAR' };
+  }
+
+  const payload = {};
+  for (const [key, value] of entries) {
+    const field = normalizeText(key);
+    if (!field || field === '__proto__' || field === 'constructor') {
+      return { error: 'CAMPO NO PERMITIDO' };
+    }
+
+    const column = TIPO_DEPARTAMENTO_EDITABLE_FIELDS[field];
+    if (!column) {
+      return { error: 'CAMPO NO PERMITIDO' };
+    }
+
+    if (!isScalarValue(value)) {
+      return { error: 'VALOR INVALIDO' };
+    }
+
+    payload[column] = value;
+  }
+
+  const validation = validateTipoDepartamentoPayload(payload, { partial: true });
+  if (validation.error) return validation;
+
+  const normalizedEntries = Object.entries(validation.value);
+  if (normalizedEntries.length === 0) {
+    return { error: 'NO HAY CAMBIOS VALIDOS PARA ACTUALIZAR' };
+  }
+
+  return { value: validation.value };
 };
 
 // =====================================================
@@ -207,45 +276,48 @@ router.post('/tipo_departamento', checkPermission(MENU_DEPARTAMENTOS_CREATE_PERM
 // =====================================================
 router.put('/tipo_departamento', checkPermission(MENU_DEPARTAMENTOS_EDIT_PERMISSIONS), async (req, res) => {
   try {
-    const { campo, valor, id_campo, id_valor } = req.body;
+    const { id_campo, id_valor } = req.body;
 
-    if (!campo || id_valor === undefined || !id_campo) {
+    if (id_valor === undefined || !id_campo) {
       return res.status(400).json({ error: true, message: 'FALTAN CAMPOS OBLIGATORIOS' });
     }
     if (String(id_campo) !== 'id_tipo_departamento') {
       return res.status(400).json({ error: true, message: 'ID_CAMPO NO PERMITIDO' });
     }
 
-    const column = TIPO_DEPARTAMENTO_EDITABLE_FIELDS[String(campo || '').trim()];
-    if (!column) {
-      return res.status(400).json({ error: true, message: 'CAMPO NO PERMITIDO' });
-    }
-
-    const idDepartamento = parsePositiveInteger(id_valor);
+    const idDepartamento = parsePositiveIntegerStrict(id_valor);
     if (idDepartamento === null) {
       return res.status(400).json({ error: true, message: 'ID_VALOR INVALIDO' });
     }
 
-    const validation = validateTipoDepartamentoPayload({ [column]: valor }, { partial: true });
-    if (validation.error) {
-      return res.status(400).json({ error: true, message: validation.error });
+    const changesValidation = normalizeUpdateChanges(req.body);
+    if (changesValidation.error) {
+      return res.status(400).json({ error: true, message: changesValidation.error });
     }
 
-    const nextValue = validation.value[column];
+    const cambios = changesValidation.value;
     const duplicateMessage = await ensureUniqueTipoDepartamento({
-      nombre: column === 'nombre_departamento' ? nextValue : '',
-      codigo: column === 'codigo_departamento' ? nextValue : '',
+      nombre: hasOwn(cambios, 'nombre_departamento') ? cambios.nombre_departamento : '',
+      codigo: hasOwn(cambios, 'codigo_departamento') ? cambios.codigo_departamento : '',
       idToIgnore: idDepartamento,
     });
     if (duplicateMessage) {
       return res.status(409).json({ error: true, message: duplicateMessage });
     }
 
+    const updateEntries = Object.entries(cambios);
+    if (updateEntries.length === 0) {
+      return res.status(400).json({ error: true, message: 'NO HAY CAMBIOS VALIDOS PARA ACTUALIZAR' });
+    }
+    const setClauses = updateEntries.map(([column], index) => `${column} = $${index + 1}`);
+    const values = updateEntries.map(([, value]) => value);
+    values.push(idDepartamento);
+
     const result = await pool.query(
       `
         UPDATE tipo_departamento
-        SET ${column} = $1
-        WHERE id_tipo_departamento = $2
+        SET ${setClauses.join(', ')}
+        WHERE id_tipo_departamento = $${values.length}
         RETURNING
           id_tipo_departamento,
           nombre_departamento,
@@ -254,7 +326,7 @@ router.put('/tipo_departamento', checkPermission(MENU_DEPARTAMENTOS_EDIT_PERMISS
           orden_menu,
           codigo_departamento
       `,
-      [nextValue, idDepartamento]
+      values
     );
 
     if (result.rowCount === 0) {
