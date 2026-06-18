@@ -84,6 +84,7 @@ const DEFAULT_DEV_ORIGINS = [
   'http://localhost:5173',
   'http://127.0.0.1:5173'
 ];
+const IS_PRODUCTION = String(process.env.NODE_ENV || '').toLowerCase() === 'production';
 const normalizeOrigin = (origin) => String(origin || '').trim().replace(/\/+$/, '');
 
 const getAllowedOrigins = () => {
@@ -96,6 +97,8 @@ const getAllowedOrigins = () => {
 
   const singleOrigin = normalizeOrigin(process.env.FRONTEND_ORIGIN || '');
   if (singleOrigin) return [singleOrigin];
+
+  if (IS_PRODUCTION) return [];
 
   return DEFAULT_DEV_ORIGINS.map((origin) => normalizeOrigin(origin));
 };

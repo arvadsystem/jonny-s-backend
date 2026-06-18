@@ -271,36 +271,15 @@ const hashVerificationToken = (token) =>
 
 const generateVerificationToken = () => crypto.randomBytes(48).toString('base64url');
 
-let ensureVerificationTokenTablePromise = null;
-const ensureVerificationTokenTable = async () => {
-  if (!ensureVerificationTokenTablePromise) {
-    ensureVerificationTokenTablePromise = (async () => {
-      await pool.query(`
-        CREATE TABLE IF NOT EXISTS public.verificacion_cuentas_tokens (
-          id_token BIGSERIAL PRIMARY KEY,
-          id_usuario INTEGER NOT NULL REFERENCES public.usuarios(id_usuario) ON DELETE CASCADE,
-          token_hash TEXT NOT NULL UNIQUE,
-          token_expires_at TIMESTAMP NOT NULL,
-          used_at TIMESTAMP NULL,
-          request_ip TEXT NULL,
-          user_agent TEXT NULL,
-          created_at TIMESTAMP NOT NULL DEFAULT NOW()
-        )
-      `);
-      await pool.query(
-        `CREATE INDEX IF NOT EXISTS idx_verificacion_tokens_usuario
-         ON public.verificacion_cuentas_tokens (id_usuario)`
-      );
-      await pool.query(
-        `CREATE INDEX IF NOT EXISTS idx_verificacion_tokens_exp
-         ON public.verificacion_cuentas_tokens (token_expires_at)`
-      );
-    })().catch((error) => {
-      ensureVerificationTokenTablePromise = null;
-      throw error;
-    });
+const assertVerificationTokenTable = async (queryRunner = pool) => {
+  const result = await queryRunner.query(
+    "SELECT to_regclass('public.verificacion_cuentas_tokens') AS table_name"
+  );
+  if (!result.rows?.[0]?.table_name) {
+    const error = new Error('La migracion sprint5_registro_cliente_seguro.sql no esta aplicada.');
+    error.code = 'VERIFICATION_TOKEN_TABLE_MISSING';
+    throw error;
   }
-  return ensureVerificationTokenTablePromise;
 };
 
 const activateAccountFromVerificationToken = async (rawToken) => {
@@ -315,7 +294,7 @@ const activateAccountFromVerificationToken = async (rawToken) => {
     };
   }
 
-  await ensureVerificationTokenTable();
+  await assertVerificationTokenTable();
 
   const tokenHash = hashVerificationToken(token);
   const client = await pool.connect();
@@ -749,8 +728,9 @@ router.post('/api/public/register', registerLimiter, async (req, res) => {
 
   const client = await pool.connect();
   let authUserIdCreated = null;
+  let verificationEmailSent = false;
   try {
-    await ensureVerificationTokenTable();
+    await assertVerificationTokenTable();
     await client.query('BEGIN');
 
     const emailExiste = await client.query(
@@ -816,14 +796,18 @@ router.post('/api/public/register', registerLimiter, async (req, res) => {
     try {
       if (verificationLink) {
         await enviarVerificacion(email, nombre || '', verificationLink, nuevoUsuario.id_usuario);
+        verificationEmailSent = true;
       }
     } catch (emailErr) {
       console.error('[public/register] Error enviando correo de verificacion:', emailErr.message);
     }
 
     return apiSuccess(res, 201, {
-      message: 'Te hemos enviado un correo de verificacion. Revisa tu bandeja de entrada para activar tu cuenta.',
-      requiresVerification: true
+      message: verificationEmailSent
+        ? 'Te hemos enviado un correo de verificacion. Revisa tu bandeja de entrada para activar tu cuenta.'
+        : 'Cuenta creada. No se pudo enviar el correo de verificacion en este momento.',
+      requiresVerification: true,
+      verificationEmailSent
     });
   } catch (error) {
     await client.query('ROLLBACK').catch(() => {});
@@ -888,7 +872,7 @@ router.post('/api/public/resend-verification', resendVerificationLimiter, async 
     'Si la cuenta existe y esta pendiente de verificacion, enviaremos un nuevo correo de verificacion.';
 
   try {
-    await ensureVerificationTokenTable();
+    await assertVerificationTokenTable();
 
     const accountRes = await pool.query(
       `SELECT
@@ -1156,9 +1140,9 @@ router.post('/api/public/forgot-password', forgotPasswordLimiter, async (req, re
     // Generar link de recuperación vía Supabase Admin API y enviar por SMTP propio
     try {
       const frontendOrigin = resolveFrontendOrigin(req);
-      const redirectTo =
-        buildUrlWithParams(frontendOrigin, '/reset-password') ||
-        (IS_PRODUCTION ? '' : buildUrlWithParams('http://localhost:5173', '/reset-password'));
+      const redirectTo = buildUrlWithParams(frontendOrigin, '/auth/callback', {
+        next: '/reset-password'
+      });
 
       if (!redirectTo) {
         throw new Error('FRONTEND_ORIGIN_NOT_CONFIGURED');
@@ -1308,7 +1292,7 @@ router.post('/api/public/verify-email', async (req, res) => {
   const { token_hash, type, access_token } = req.body || {};
 
   try {
-    await ensureVerificationTokenTable();
+    await assertVerificationTokenTable();
 
     if (token) {
       const tokenResult = await activateAccountFromVerificationToken(token);
