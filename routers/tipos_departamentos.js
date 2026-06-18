@@ -44,6 +44,19 @@ const parseBooleanStrict = (value) => {
   return null;
 };
 
+const normalizePublicationAlias = (value) =>
+  normalizeText(value)
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/\s+/g, ' ');
+
+const truncateCodeBase = (value, suffix = '') => {
+  const safeSuffix = String(suffix || '');
+  const maxBaseLength = Math.max(1, 80 - safeSuffix.length);
+  return `${String(value || '').slice(0, maxBaseLength)}${safeSuffix}`;
+};
+
 const isPlainObject = (value) => {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
   const prototype = Object.getPrototypeOf(value);
@@ -74,7 +87,7 @@ const validateTipoDepartamentoPayload = (payload, { partial = false } = {}) => {
     normalized.descripcion = descripcion;
   }
 
-  if (!partial || hasOwn(source, 'codigo_departamento')) {
+  if (hasOwn(source, 'codigo_departamento')) {
     if (!isScalarValue(source.codigo_departamento)) return { error: 'CODIGO_DEPARTAMENTO INVALIDO' };
     const fallbackName = normalized.nombre_departamento || source.nombre_departamento;
     const codigo = normalizeDepartmentCode(source.codigo_departamento || fallbackName);
@@ -83,7 +96,7 @@ const validateTipoDepartamentoPayload = (payload, { partial = false } = {}) => {
     normalized.codigo_departamento = codigo;
   }
 
-  if (!partial || hasOwn(source, 'orden_menu')) {
+  if (hasOwn(source, 'orden_menu')) {
     if (!isScalarValue(source.orden_menu)) return { error: 'ORDEN_MENU INVALIDO' };
     const ordenMenu = parsePositiveIntegerStrict(source.orden_menu);
     if (ordenMenu === null) {
@@ -102,9 +115,9 @@ const validateTipoDepartamentoPayload = (payload, { partial = false } = {}) => {
   return { value: normalized };
 };
 
-const ensureUniqueTipoDepartamento = async ({ nombre, codigo, idToIgnore = null }) => {
+const ensureUniqueTipoDepartamento = async ({ nombre, codigo, idToIgnore = null, db = pool }) => {
   if (nombre) {
-    const result = await pool.query(
+    const result = await db.query(
       `
         SELECT id_tipo_departamento
         FROM tipo_departamento
@@ -119,7 +132,7 @@ const ensureUniqueTipoDepartamento = async ({ nombre, codigo, idToIgnore = null 
   }
 
   if (codigo) {
-    const result = await pool.query(
+    const result = await db.query(
       `
         SELECT id_tipo_departamento
         FROM tipo_departamento
@@ -133,6 +146,115 @@ const ensureUniqueTipoDepartamento = async ({ nombre, codigo, idToIgnore = null 
   }
 
   return '';
+};
+
+const getNextTipoDepartamentoOrder = async (client) => {
+  const result = await client.query(
+    `
+      SELECT COALESCE(MAX(orden_menu), 0)::int + 1 AS next_order
+      FROM tipo_departamento
+    `
+  );
+  return Number(result.rows?.[0]?.next_order || 1);
+};
+
+const buildUniqueDepartmentCode = async ({ client, nombre }) => {
+  const base = truncateCodeBase(normalizeDepartmentCode(nombre) || 'DEPARTAMENTO');
+  const result = await client.query(
+    `
+      SELECT codigo_departamento
+      FROM tipo_departamento
+      WHERE upper(trim(codigo_departamento)) = upper(trim($1))
+         OR upper(trim(codigo_departamento)) LIKE upper(trim($1)) || '\\_%' ESCAPE '\\'
+    `,
+    [base]
+  );
+  const usedCodes = new Set((result.rows || []).map((row) => normalizeDepartmentCode(row.codigo_departamento)));
+  if (!usedCodes.has(base)) return base;
+
+  let suffix = 2;
+  while (suffix <= INTEGER_MAX) {
+    const candidate = truncateCodeBase(base, `_${suffix}`);
+    if (!usedCodes.has(candidate)) return candidate;
+    suffix += 1;
+  }
+
+  throw new Error('NO SE PUDO GENERAR UN CODIGO_UNICO PARA TIPO_DEPARTAMENTO');
+};
+
+const ensureRecipePublicationRuleForDepartment = async ({ client, idDepartamento, nombre, orden }) => {
+  await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', ['menu_publicacion_reglas:tipo_departamento']);
+
+  const existing = await client.query(
+    `
+      SELECT id_menu_publicacion_regla
+      FROM public.menu_publicacion_reglas
+      WHERE tipo_item = 'RECETA'
+        AND id_tipo_departamento = $1
+      LIMIT 1
+    `,
+    [idDepartamento]
+  );
+
+  if (existing.rowCount > 0) {
+    await client.query(
+      `
+        UPDATE public.menu_publicacion_reglas
+        SET
+          incluir_catalogo_admin = true,
+          autopublicar = true,
+          visible_default = true,
+          estado = true,
+          orden = COALESCE(orden, $2),
+          fecha_actualizacion = NOW()
+        WHERE id_menu_publicacion_regla = $1
+      `,
+      [existing.rows[0].id_menu_publicacion_regla, orden]
+    );
+    return;
+  }
+
+  const idResult = await client.query(
+    `
+      SELECT COALESCE(MAX(id_menu_publicacion_regla), 0)::int + 1 AS next_id
+      FROM public.menu_publicacion_reglas
+    `
+  );
+  const nextId = Number(idResult.rows?.[0]?.next_id || 1);
+  const orderResult = await client.query(
+    `
+      SELECT COALESCE(MAX(orden), 0)::int + 1 AS next_order
+      FROM public.menu_publicacion_reglas
+      WHERE COALESCE(estado, true) = true
+    `
+  );
+  const nextOrder = Number(orderResult.rows?.[0]?.next_order || orden || 1);
+
+  await client.query(
+    `
+      INSERT INTO public.menu_publicacion_reglas (
+        id_menu_publicacion_regla,
+        tipo_item,
+        id_categoria_producto,
+        id_tipo_departamento,
+        nombre_publico,
+        alias_normalizado,
+        incluir_catalogo_admin,
+        autopublicar,
+        visible_default,
+        orden,
+        estado
+      )
+      VALUES ($1, 'RECETA', NULL, $2, $3, $4, true, true, true, $5, true)
+    `,
+    [
+      nextId,
+      idDepartamento,
+      normalizeText(nombre),
+      normalizePublicationAlias(nombre),
+      nextOrder
+    ]
+  );
 };
 
 const normalizeUpdateChanges = (body) => {
@@ -189,14 +311,49 @@ router.get('/tipo_departamento', checkPermission(MENU_DEPARTAMENTOS_VIEW_PERMISS
   try {
     const result = await pool.query(`
       SELECT
-        id_tipo_departamento,
-        nombre_departamento,
-        descripcion,
-        estado,
-        orden_menu,
-        codigo_departamento
-      FROM tipo_departamento
-      ORDER BY orden_menu ASC NULLS LAST, nombre_departamento ASC
+        td.id_tipo_departamento,
+        td.nombre_departamento,
+        td.descripcion,
+        td.estado,
+        td.orden_menu,
+        td.codigo_departamento,
+        COALESCE(recetas.cantidad_recetas, 0)::int AS cantidad_recetas,
+        COALESCE(combos.cantidad_combos, 0)::int AS cantidad_combos,
+        regla.id_menu_publicacion_regla,
+        COALESCE(regla.estado, false) AS regla_publicacion_activa,
+        CASE
+          WHEN COALESCE(td.estado, true) = false THEN 'INACTIVO'
+          WHEN regla.id_menu_publicacion_regla IS NULL THEN 'NO_PUBLICADO'
+          WHEN COALESCE(recetas.cantidad_recetas, 0) + COALESCE(combos.cantidad_combos, 0) = 0 THEN 'SIN_CONTENIDO'
+          WHEN COALESCE(regla.estado, false) = false THEN 'SIN_PUBLICACION'
+          ELSE 'VISIBLE'
+        END AS visibilidad_publica
+      FROM tipo_departamento td
+      LEFT JOIN LATERAL (
+        SELECT COUNT(*)::int AS cantidad_recetas
+        FROM recetas r
+        WHERE r.id_tipo_departamento = td.id_tipo_departamento
+          AND COALESCE(r.estado, true) = true
+      ) recetas ON true
+      LEFT JOIN LATERAL (
+        SELECT COUNT(*)::int AS cantidad_combos
+        FROM combos c
+        WHERE c.id_tipo_departamento = td.id_tipo_departamento
+          AND COALESCE(c.estado, true) = true
+      ) combos ON true
+      LEFT JOIN LATERAL (
+        SELECT
+          id_menu_publicacion_regla,
+          COALESCE(estado, true) AS estado
+        FROM public.menu_publicacion_reglas mpr
+        WHERE mpr.tipo_item IN ('RECETA', 'COMBO')
+          AND mpr.id_tipo_departamento = td.id_tipo_departamento
+        ORDER BY
+          CASE WHEN mpr.tipo_item = 'RECETA' THEN 0 ELSE 1 END,
+          mpr.id_menu_publicacion_regla ASC
+        LIMIT 1
+      ) regla ON true
+      ORDER BY td.orden_menu ASC NULLS LAST, td.nombre_departamento ASC
     `);
 
     return res.status(200).json(result.rows || []);
@@ -212,6 +369,7 @@ router.get('/tipo_departamento', checkPermission(MENU_DEPARTAMENTOS_VIEW_PERMISS
 // { "nombre_departamento": "Hamburguesas", "descripcion": "...", "estado": true }
 // =====================================================
 router.post('/tipo_departamento', checkPermission(MENU_DEPARTAMENTOS_CREATE_PERMISSIONS), async (req, res) => {
+  const client = await pool.connect();
   try {
     const validation = validateTipoDepartamentoPayload(req.body);
     if (validation.error) {
@@ -220,14 +378,31 @@ router.post('/tipo_departamento', checkPermission(MENU_DEPARTAMENTOS_CREATE_PERM
 
     const datos = validation.value;
     const duplicateMessage = await ensureUniqueTipoDepartamento({
-      nombre: datos.nombre_departamento,
-      codigo: datos.codigo_departamento,
+      nombre: datos.nombre_departamento
     });
     if (duplicateMessage) {
       return res.status(409).json({ error: true, message: duplicateMessage });
     }
 
-    const result = await pool.query(
+    await client.query('BEGIN');
+
+    const codigo = hasOwn(datos, 'codigo_departamento')
+      ? datos.codigo_departamento
+      : await buildUniqueDepartmentCode({ client, nombre: datos.nombre_departamento });
+    const ordenMenu = hasOwn(datos, 'orden_menu')
+      ? datos.orden_menu
+      : await getNextTipoDepartamentoOrder(client);
+
+    const duplicateCodeMessage = await ensureUniqueTipoDepartamento({
+      codigo,
+      db: client
+    });
+    if (duplicateCodeMessage) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({ error: true, message: duplicateCodeMessage });
+    }
+
+    const result = await client.query(
       `
         INSERT INTO tipo_departamento (
           nombre_departamento,
@@ -248,19 +423,32 @@ router.post('/tipo_departamento', checkPermission(MENU_DEPARTAMENTOS_CREATE_PERM
       [
         datos.nombre_departamento,
         datos.descripcion,
-        datos.codigo_departamento,
-        datos.orden_menu,
+        codigo,
+        ordenMenu,
         datos.estado,
       ]
     );
 
+    const created = result.rows?.[0] || null;
+    await ensureRecipePublicationRuleForDepartment({
+      client,
+      idDepartamento: created?.id_tipo_departamento,
+      nombre: created?.nombre_departamento,
+      orden: created?.orden_menu
+    });
+
+    await client.query('COMMIT');
+
     return res.status(201).json({
       message: 'TIPO_DEPARTAMENTO CREADO EXITOSAMENTE.',
-      data: result.rows?.[0] || null,
+      data: created,
     });
   } catch (err) {
+    await client.query('ROLLBACK');
     console.error('ERROR POST /tipo_departamento:', err.message);
     return res.status(500).json({ error: true, message: 'NO SE PUDO CREAR TIPO_DEPARTAMENTO' });
+  } finally {
+    client.release();
   }
 });
 

@@ -393,7 +393,7 @@ const buildCatalogSql = ({
             OR LOWER(TRIM(COALESCE(p.descripcion_producto, ''))) LIKE '%helado%'
           )
           THEN 'Helados'
-        ELSE COALESCE(td.nombre_departamento, cp.nombre_categoria)
+        ELSE COALESCE(NULLIF(TRIM(mpr.nombre_publico), ''), td.nombre_departamento, cp.nombre_categoria)
       END AS categoria_nombre,
       CASE
         WHEN dm.id_producto IS NOT NULL THEN ${productImageSelect}
@@ -442,6 +442,19 @@ const buildCatalogSql = ({
      AND COALESCE(a_combo.estado, true) = true
     LEFT JOIN tipo_departamento td
       ON td.id_tipo_departamento = COALESCE(p.id_tipo_departamento, r.id_tipo_departamento, c.id_tipo_departamento)
+    LEFT JOIN public.menu_publicacion_reglas mpr
+      ON COALESCE(mpr.estado, true) = true
+     AND (
+       (dm.id_producto IS NOT NULL
+         AND mpr.tipo_item = '${PUBLIC_ITEM_TYPES.PRODUCTO}'
+         AND mpr.id_categoria_producto = p.id_categoria_producto)
+       OR (${detalleRecetaExpr} IS NOT NULL
+         AND mpr.tipo_item = '${PUBLIC_ITEM_TYPES.RECETA}'
+         AND mpr.id_tipo_departamento = r.id_tipo_departamento)
+       OR (${detalleComboExpr} IS NOT NULL
+         AND mpr.tipo_item = '${PUBLIC_ITEM_TYPES.COMBO}'
+         AND mpr.id_tipo_departamento = c.id_tipo_departamento)
+     )
     WHERE dm.id_menu = $1
       AND COALESCE(dm.estado, true) = true
       ${branchProductFilter}
