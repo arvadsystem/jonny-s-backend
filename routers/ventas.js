@@ -7082,15 +7082,17 @@ async function listarPedidosPendientesPago(req, res) {
     const userSucursalId = parseOptionalPositiveInt(scope?.userSucursalId);
     const effectiveAllowedSucursalIds = allowedSucursalIds.length > 0 ? allowedSucursalIds : userSucursalId ? [userSucursalId] : [];
 
-    const filters = [
-      'UPPER(TRIM(ppc.estado_pago_codigo)) = $1',
-      'COALESCE(ppc.monto_pendiente, 0) > 0',
-      `(f.id_factura IS NULL OR COALESCE(ppc.monto_pendiente, 0) > 0 OR EXISTS (
+    const hasPendingSplitDivisionSql = `EXISTS (
         SELECT 1
         FROM public.ventas_cuenta_divisiones vcd_pending
         WHERE vcd_pending.id_pedido = p.id_pedido
           AND UPPER(TRIM(vcd_pending.estado)) = 'PENDIENTE'
-      ))`
+      )`;
+    const cobrableFacturaScopeSql = `(f.id_factura IS NULL OR ${hasPendingSplitDivisionSql})`;
+    const filters = [
+      'UPPER(TRIM(ppc.estado_pago_codigo)) = $1',
+      'COALESCE(ppc.monto_pendiente, 0) > 0',
+      cobrableFacturaScopeSql
     ];
     const params = [PEDIDO_PENDIENTE_ESTADO_PAGO];
     const excludedPedidoEstados = [
@@ -7281,7 +7283,11 @@ async function listarPedidosPendientesPago(req, res) {
           COALESCE(ppc.monto_total, p.total, 0)::numeric(14,2) AS monto_total,
           COALESCE(ppc.monto_pagado, 0)::numeric(14,2) AS monto_pagado,
           COALESCE(ppc.monto_pendiente, 0)::numeric(14,2) AS monto_pendiente,
-          TRUE AS puede_cobrar,
+          (
+            UPPER(TRIM(ppc.estado_pago_codigo)) = $1
+            AND COALESCE(ppc.monto_pendiente, 0) > 0
+            AND ${cobrableFacturaScopeSql}
+          ) AS puede_cobrar,
           (pd.id_pedido_delivery IS NOT NULL OR COALESCE(cme.codigo, p.tipo_entrega) = 'DELIVERY') AS es_delivery,
           COALESCE(pd.costo_envio, 0)::numeric(14,2) AS costo_envio,
           cde.codigo AS estado_delivery,

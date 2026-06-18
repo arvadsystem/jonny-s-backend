@@ -687,7 +687,13 @@ const resolveClienteSucursalScope = async ({ req, client, requestedSucursalId })
       );
     }
     const exists = await client.query(
-      'SELECT 1 FROM public.sucursales WHERE id_sucursal = $1 LIMIT 1',
+      `
+        SELECT 1
+        FROM public.sucursales
+        WHERE id_sucursal = $1
+          AND COALESCE(estado, true) = true
+        LIMIT 1
+      `,
       [targetSucursalId]
     );
     if (!exists.rows.length) {
@@ -713,6 +719,7 @@ const resolveClienteSucursalScope = async ({ req, client, requestedSucursalId })
           INNER JOIN public.cajas c ON c.id_caja = cua.id_caja
           WHERE cua.id_usuario = $1
             AND COALESCE(cua.estado, true) = true
+            AND COALESCE(c.estado, true) = true
             AND c.id_sucursal IS NOT NULL
         `,
         [idUsuario]
