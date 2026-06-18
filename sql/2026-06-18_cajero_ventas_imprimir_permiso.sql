@@ -1,36 +1,40 @@
 -- Permiso de impresion para el rol cajero.
--- Script aditivo e idempotente. No otorga VENTAS_EXPORTAR ni permisos de administracion.
+-- Script aditivo e idempotente. No crea permisos ni otorga VENTAS_EXPORTAR.
 
 BEGIN;
 
-INSERT INTO public.permisos (nombre_permiso)
-SELECT 'VENTAS_IMPRIMIR'
-WHERE NOT EXISTS (
-  SELECT 1
-  FROM public.permisos p
-  WHERE UPPER(TRIM(p.nombre_permiso)) = 'VENTAS_IMPRIMIR'
-);
-
-WITH target_roles AS (
-  SELECT r.id_rol
+DO $$
+DECLARE
+  v_id_rol_cajero integer;
+  v_id_permiso_imprimir integer;
+BEGIN
+  SELECT MIN(r.id_rol)
+  INTO v_id_rol_cajero
   FROM public.roles r
-  WHERE UPPER(REGEXP_REPLACE(TRIM(r.nombre), '[\s-]+', '_', 'g')) = 'CAJERO'
-),
-target_permissions AS (
-  SELECT p.id_permiso
+  WHERE UPPER(REGEXP_REPLACE(TRIM(r.nombre), '[\s-]+', '_', 'g')) = 'CAJERO';
+
+  IF v_id_rol_cajero IS NULL THEN
+    RAISE EXCEPTION 'No existe el rol CAJERO. No se asigno VENTAS_IMPRIMIR.';
+  END IF;
+
+  SELECT MIN(p.id_permiso)
+  INTO v_id_permiso_imprimir
   FROM public.permisos p
-  WHERE UPPER(TRIM(p.nombre_permiso)) = 'VENTAS_IMPRIMIR'
-)
-INSERT INTO public.roles_permisos (id_rol, id_permiso)
-SELECT r.id_rol, p.id_permiso
-FROM target_roles r
-CROSS JOIN target_permissions p
-WHERE NOT EXISTS (
-  SELECT 1
-  FROM public.roles_permisos rp
-  WHERE rp.id_rol = r.id_rol
-    AND rp.id_permiso = p.id_permiso
-);
+  WHERE UPPER(TRIM(p.nombre_permiso)) = 'VENTAS_IMPRIMIR';
+
+  IF v_id_permiso_imprimir IS NULL THEN
+    RAISE EXCEPTION 'No existe el permiso VENTAS_IMPRIMIR. Cree el permiso antes de asignarlo al rol CAJERO.';
+  END IF;
+
+  INSERT INTO public.roles_permisos (id_rol, id_permiso)
+  SELECT v_id_rol_cajero, v_id_permiso_imprimir
+  WHERE NOT EXISTS (
+    SELECT 1
+    FROM public.roles_permisos rp
+    WHERE rp.id_rol = v_id_rol_cajero
+      AND rp.id_permiso = v_id_permiso_imprimir
+  );
+END $$;
 
 COMMIT;
 

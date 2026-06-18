@@ -6236,6 +6236,24 @@ router.get('/ventas/pedidos-menu', checkPermission(['VENTAS_VER']), async (req, 
           s.nombre_sucursal,
           fc_info.metodo_pago,
           COALESCE(vcd_info.divisiones_count, 0)::int AS cuenta_dividida_divisiones,
+          pd.id_pedido_delivery IS NOT NULL AS es_delivery,
+          CASE
+            WHEN pd.id_pedido_delivery IS NULL THEN NULL
+            ELSE cme.codigo
+          END AS modalidad,
+          CASE
+            WHEN pd.id_pedido_delivery IS NULL THEN NULL
+            ELSE cde.codigo
+          END AS estado_delivery,
+          CASE
+            WHEN pd.id_pedido_delivery IS NULL THEN NULL
+            ELSE COALESCE(pd.costo_envio, 0)::numeric(14,2)
+          END AS costo_envio,
+          CASE WHEN pd.id_pedido_delivery IS NULL THEN NULL ELSE pd.nombre_receptor END AS nombre_receptor,
+          CASE WHEN pd.id_pedido_delivery IS NULL THEN NULL ELSE pd.telefono_receptor END AS telefono_receptor,
+          CASE WHEN pd.id_pedido_delivery IS NULL THEN NULL ELSE pd.direccion_entrega END AS direccion_entrega,
+          CASE WHEN pd.id_pedido_delivery IS NULL THEN NULL ELSE pd.referencia_entrega END AS referencia_entrega,
+          CASE WHEN pd.id_pedido_delivery IS NULL THEN NULL ELSE pd.observacion_delivery END AS observacion_delivery,
           COALESCE(dp_info.items, '[]'::jsonb) AS items,
           u_pago.nombre_usuario AS usuario_pago_confirmado,
           per.nombre AS nombres_cliente,
@@ -6260,6 +6278,24 @@ router.get('/ventas/pedidos-menu', checkPermission(['VENTAS_VER']), async (req, 
         LEFT JOIN personas per ON c.id_persona = per.id_persona
         LEFT JOIN usuarios u_pago ON u_pago.id_usuario = p.id_usuario_pago_confirmado
         ${contactoJoin}
+        LEFT JOIN LATERAL (
+          SELECT px_inner.*
+          FROM public.pedidos_contexto px_inner
+          WHERE px_inner.id_pedido = p.id_pedido
+          ORDER BY px_inner.id_pedido_contexto DESC
+          LIMIT 1
+        ) px ON true
+        LEFT JOIN public.cat_pedidos_modalidades_entrega cme
+          ON cme.id_modalidad_entrega = px.id_modalidad_entrega
+        LEFT JOIN LATERAL (
+          SELECT pd_inner.*
+          FROM public.pedidos_delivery pd_inner
+          WHERE pd_inner.id_pedido = p.id_pedido
+          ORDER BY pd_inner.id_pedido_delivery DESC
+          LIMIT 1
+        ) pd ON true
+        LEFT JOIN public.cat_delivery_estados cde
+          ON cde.id_estado_delivery = pd.id_estado_delivery
         LEFT JOIN LATERAL (
           SELECT
             ppc_inner.*,
@@ -7336,7 +7372,7 @@ async function listarPedidosPendientesPago(req, res) {
         divisiones: Array.isArray(row.cuenta_dividida) ? row.cuenta_dividida : []
       },
       es_delivery: Boolean(row.es_delivery),
-      costo_envio: roundMoney(row.costo_envio),
+      costo_envio: row.costo_envio === null || row.costo_envio === undefined ? null : roundMoney(row.costo_envio),
       estado_delivery: row.estado_delivery,
       nombre_receptor: row.nombre_receptor,
       telefono_receptor: row.telefono_receptor,
