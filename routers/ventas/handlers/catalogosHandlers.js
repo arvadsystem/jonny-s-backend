@@ -382,10 +382,11 @@ export const listClientesCatalogoHandler = async (req, res) => {
 };
 
 export const listCombosCatalogoHandler = async (req, res) => {
+  let idSucursal = null;
   try {
     const scope = await resolveRequestUserSucursalScope(req);
     const isSuperAdmin = Boolean(scope.isSuperAdmin);
-    const idSucursal = parseOptionalPositiveInt(req.query.id_sucursal);
+    idSucursal = parseOptionalPositiveInt(req.query.id_sucursal);
     const hasComboAssignmentsTable = await hasTable(pool, 'menu_combo_almacenes');
 
     const sucursalValidation = await validateVentasCatalogSucursal({ scope, idSucursal });
@@ -487,7 +488,11 @@ export const listCombosCatalogoHandler = async (req, res) => {
         cdp.nombre_departamento AS nombre_tipo_departamento_principal,
         COALESCE(cd.departamentos_ids, ARRAY[]::int[]) AS departamentos_ids,
         COALESCE(cd.departamentos, '[]'::jsonb) AS departamentos,
-        a.url_publica AS imagen_principal_url
+        a.url_publica AS imagen_principal_url,
+        COALESCE(
+          NULLIF(TRIM(c.nombre_combo), ''),
+          c.descripcion
+        ) AS nombre_orden
       FROM combos c
       LEFT JOIN archivos a ON a.id_archivo = c.id_archivo AND (a.estado = true OR a.estado IS NULL)
       LEFT JOIN tipo_departamento td
@@ -498,7 +503,7 @@ export const listCombosCatalogoHandler = async (req, res) => {
         ON cd.id_combo = c.id_combo
       ${joinClause}
       WHERE COALESCE(c.estado, true) = true ${whereClause}
-      ORDER BY COALESCE(NULLIF(TRIM(c.nombre_combo), ''), c.descripcion) ASC, c.id_combo ASC
+      ORDER BY nombre_orden ASC, c.id_combo ASC
     `;
 
     const result = await pool.query(query, params);
@@ -514,6 +519,7 @@ export const listCombosCatalogoHandler = async (req, res) => {
     });
 
     const data = comboRows.map((row) => {
+      const { nombre_orden: _nombreOrden, ...publicRow } = row;
       const metadata = resolveComboComplementMetadata({
         combo: row,
         quantity: 1,
@@ -524,7 +530,7 @@ export const listCombosCatalogoHandler = async (req, res) => {
       });
 
       return {
-        ...row,
+        ...publicRow,
         imagen_principal_url: buildAbsolutePublicUrl(req, row.imagen_principal_url),
         requiere_complementos: Boolean(metadata.requiere_complementos),
         tipo_complemento: metadata.tipo_complemento || VENTA_COMPLEMENTO_TIPO_SALSAS,
@@ -540,7 +546,11 @@ export const listCombosCatalogoHandler = async (req, res) => {
 
     res.status(200).json(data);
   } catch (err) {
-    console.error('Error al listar catalogo de combos para ventas:', err.message);
+    console.error('[ventas.catalogos.combos] error', {
+      code: err?.code || null,
+      message: err?.message || 'Error sin mensaje',
+      id_sucursal: idSucursal || null
+    });
     sendVentasInternalError(res);
   }
 };
