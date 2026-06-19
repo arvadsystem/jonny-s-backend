@@ -2,7 +2,7 @@ import express from 'express';
 import { performance } from 'node:perf_hooks';
 import { createHash } from 'node:crypto';
 import pool from '../config/db-connection.js';
-import { checkPermission, requestHasAnyPermission } from '../middleware/checkPermission.js';
+import { checkPermission, requestHasAnyPermission, requestHasAnyRole } from '../middleware/checkPermission.js';
 import { resolveRequestUserSucursalScope } from '../utils/sucursalScope.js';
 import { registerFacturaLoyaltyAccumulation } from '../services/fidelizacionService.js';
 import { generarCodigoDocumento } from '../services/facturacionCorrelativoService.js';
@@ -249,6 +249,8 @@ const getIdempotencyKey = (req) => {
   const key = String(value || '').trim();
   return key || null;
 };
+
+const REVERSION_ALLOWED_ROLES = Object.freeze(['ADMIN', 'ADMINISTRADOR', 'SUPER_ADMIN']);
 
 const stableStringify = (value) => {
   if (value === null || typeof value !== 'object') return JSON.stringify(value);
@@ -6757,8 +6759,46 @@ router.post('/ventas/:id/reversiones', checkPermission(['VENTAS_REVERSION_CREAR'
   const ipOrigen = String(getClientIp(req) || '-').slice(0, 80);
   const deviceInfo = parseUserAgent(rawUserAgent);
   const dispositivo = String(deviceInfo?.dispositivo || 'Desconocido').slice(0, 80);
+  const idempotencyKey = getIdempotencyKey(req);
+  const idempotencyRequestHash = idempotencyKey
+    ? buildIdempotencyRequestHash({ idFactura, body: req.body })
+    : null;
+  let idempotencyReservation = null;
 
   try {
+    const hasAllowedRole = await requestHasAnyRole(req, REVERSION_ALLOWED_ROLES);
+    if (!hasAllowedRole) {
+      return res.status(403).json({
+        error: true,
+        code: 'VENTAS_REVERSION_ROL_NO_AUTORIZADO',
+        message: 'Solo administradores pueden registrar reversiones.'
+      });
+    }
+
+    idempotencyReservation = await reserveVentasIdempotencyKey({
+      idempotencyKey,
+      operation: 'VENTAS_REVERSION_CREAR',
+      requestHash: idempotencyRequestHash,
+      idUsuario
+    });
+
+    if (idempotencyReservation.replay) {
+      return res.status(idempotencyReservation.httpStatus || 200).json({
+        ...(isPlainObject(idempotencyReservation.responseBody) ? idempotencyReservation.responseBody : {}),
+        replayed: true
+      });
+    }
+
+    if (idempotencyReservation.conflict) {
+      return res.status(409).json({
+        error: true,
+        code: idempotencyReservation.code,
+        message: idempotencyReservation.code === 'IDEMPOTENCY_KEY_REUSED'
+          ? 'Idempotency-Key ya fue usado con otro payload.'
+          : 'La solicitud con este Idempotency-Key esta en proceso.'
+      });
+    }
+
     const result = await createVentaReversion({
       idFactura,
       body: req.body,
@@ -6781,7 +6821,7 @@ router.post('/ventas/:id/reversiones', checkPermission(['VENTAS_REVERSION_CREAR'
           `
             UPDATE public.facturas_reversiones
             SET correo_notificado = true,
-                notificado_en = NOW(),
+                notificado_en = (NOW() AT TIME ZONE 'America/Tegucigalpa'),
                 error_notificacion = NULL
             WHERE id_reversion = $1
           `,
@@ -6807,12 +6847,31 @@ router.post('/ventas/:id/reversiones', checkPermission(['VENTAS_REVERSION_CREAR'
       }
     }
 
-    return res.status(201).json({
+    const responseBody = {
       success: true,
       data: result,
       message: 'Reversión registrada correctamente.'
+    };
+
+    await saveVentasIdempotencySuccess({
+      reservation: idempotencyReservation,
+      httpStatus: 201,
+      responseBody,
+      idFactura,
+      idUsuario,
+      idSucursal: result?.id_sucursal
     });
+
+    return res.status(201).json(responseBody);
   } catch (error) {
+    await saveVentasIdempotencyFailure({
+      reservation: idempotencyReservation,
+      httpStatus: Number.isInteger(error?.httpStatus) ? error.httpStatus : 500,
+      errorCode: error?.code || 'VENTAS_REVERSION_ERROR'
+    }).catch((idempotencyErr) => {
+      console.error('No se pudo marcar fallo idempotente de reversion:', idempotencyErr);
+    });
+
     if (Number.isInteger(error?.httpStatus) && error.httpStatus >= 400 && error.httpStatus < 500) {
       await registerReversionFailureAttempt({
         idFactura,

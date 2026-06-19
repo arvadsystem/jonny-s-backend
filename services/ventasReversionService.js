@@ -85,36 +85,6 @@ const resolveSucursalScope = async (client, idUsuario) => {
   };
 };
 
-const resolveOpenCajaSession = async ({ client, idSucursal, idUsuario }) => {
-  const result = await client.query(
-    `
-      SELECT cs.id_sesion_caja, cs.id_caja
-      FROM public.cajas_sesiones cs
-      INNER JOIN public.cajas c
-        ON c.id_caja = cs.id_caja
-       AND c.id_sucursal = cs.id_sucursal
-       AND COALESCE(c.estado, true) = true
-      INNER JOIN public.cat_cajas_sesiones_estados cse
-        ON cse.id_estado_sesion_caja = cs.id_estado_sesion_caja
-      INNER JOIN public.cajas_sesiones_participantes csp
-        ON csp.id_sesion_caja = cs.id_sesion_caja
-       AND csp.id_usuario = $2
-       AND COALESCE(csp.activo, true) = true
-      WHERE cs.id_sucursal = $1
-        AND UPPER(TRIM(cse.codigo)) = 'ABIERTA'
-      ORDER BY cs.id_sesion_caja DESC
-      LIMIT 1
-    `,
-    [idSucursal, idUsuario]
-  );
-
-  if (!result.rowCount) {
-    throw createReversionError(409, 'VENTAS_REVERSION_CAJA_ACTUAL_REQUERIDA', 'No hay una caja abierta activa para registrar la reversi\u00f3n.');
-  }
-
-  return result.rows[0];
-};
-
 const assertOriginalCajaSessionOpen = async ({ client, factura }) => {
   const idSesionCaja = parsePositiveInt(factura?.id_sesion_caja);
   const idSucursal = parsePositiveInt(factura?.id_sucursal);
@@ -184,6 +154,24 @@ const assertOriginalCajaSessionOpen = async ({ client, factura }) => {
   }
 
   return session;
+};
+
+const assertSucursalAllowedForReversion = (scope, idSucursal, action = 'crear') => {
+  const targetSucursalId = parsePositiveInt(idSucursal);
+  if (!targetSucursalId) {
+    throw createReversionError(403, 'VENTAS_REVERSION_SCOPE_INVALIDO', 'No se pudo resolver la sucursal de la venta.');
+  }
+  if (scope?.isSuperAdmin) return;
+  const allowed = Array.isArray(scope?.allowedSucursalIds)
+    ? scope.allowedSucursalIds.map((id) => parsePositiveInt(id)).filter(Boolean)
+    : [];
+  if (allowed.length === 0) {
+    throw createReversionError(403, 'VENTAS_REVERSION_SCOPE_EMPTY', 'No tienes sucursales autorizadas para reversiones.');
+  }
+  if (!allowed.includes(targetSucursalId)) {
+    const verb = action === 'consultar' ? 'consultar reversiones de' : 'reversar';
+    throw createReversionError(403, 'VENTAS_REVERSION_SCOPE_FORBIDDEN', `No puedes ${verb} una venta de otra sucursal.`);
+  }
 };
 
 const assertSucursalOpenForReversion = async ({ client, idSucursal }) => {
@@ -633,7 +621,7 @@ const revertLoyaltyForFactura = async ({
       SET
         puntos_disponibles = $1,
         puntos_acumulados_total = $2,
-        fecha_actualizacion = NOW()
+        fecha_actualizacion = (NOW() AT TIME ZONE 'America/Tegucigalpa')
       WHERE id_cliente = $3
     `,
     [nuevoSaldo, nuevoAcumulado, source.id_cliente]
@@ -699,7 +687,7 @@ const revertLoyaltyForFactura = async ({
           id_usuario_ejecutor,
           fecha_creacion
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, (NOW() AT TIME ZONE 'America/Tegucigalpa'))
       `,
       [
         source.id_cliente,
@@ -792,9 +780,7 @@ export const listFacturaReversiones = async ({ idFactura, idUsuario }) => {
 
     const factura = facturaResult.rows[0];
     const idSucursal = Number(factura.id_sucursal || 0);
-    if (!scope.isSuperAdmin && scope.allowedSucursalIds.length > 0 && !scope.allowedSucursalIds.includes(idSucursal)) {
-      throw createReversionError(403, 'VENTAS_REVERSION_SCOPE_FORBIDDEN', 'No puedes consultar reversiones de otra sucursal.');
-    }
+    assertSucursalAllowedForReversion(scope, idSucursal, 'consultar');
 
     const result = await client.query(
       `
@@ -928,11 +914,9 @@ export const createVentaReversion = async ({ idFactura, body, req, idUsuario }) 
 
     const factura = facturaResult.rows[0];
     const idSucursal = Number(factura.id_sucursal || 0);
-    if (!scope.isSuperAdmin && scope.allowedSucursalIds.length > 0 && !scope.allowedSucursalIds.includes(idSucursal)) {
-      throw createReversionError(403, 'VENTAS_REVERSION_SCOPE_FORBIDDEN', 'No puedes reversar una venta de otra sucursal.');
-    }
+    assertSucursalAllowedForReversion(scope, idSucursal, 'crear');
 
-    await assertOriginalCajaSessionOpen({ client, factura });
+    const cajaContext = await assertOriginalCajaSessionOpen({ client, factura });
     await assertSucursalOpenForReversion({ client, idSucursal });
 
     const ageResult = await client.query(
@@ -955,7 +939,6 @@ export const createVentaReversion = async ({ idFactura, body, req, idUsuario }) 
       reversedQtyMap
     });
 
-    const cajaActual = await resolveOpenCajaSession({ client, idSucursal, idUsuario: userId });
     const idTipoMovimientoCaja = await resolveReversionCajaMovementType(client);
 
     const correlativo = await generarCodigoDocumento({
@@ -1002,8 +985,8 @@ export const createVentaReversion = async ({ idFactura, body, req, idUsuario }) 
         idSucursal,
         parsePositiveInt(factura.id_caja),
         parsePositiveInt(factura.id_sesion_caja),
-        parsePositiveInt(cajaActual.id_caja),
-        parsePositiveInt(cajaActual.id_sesion_caja),
+        parsePositiveInt(cajaContext.id_caja),
+        parsePositiveInt(cajaContext.id_sesion_caja),
         tipoReversion,
         motivo,
         observacion,
@@ -1075,8 +1058,8 @@ export const createVentaReversion = async ({ idFactura, body, req, idUsuario }) 
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, (NOW() AT TIME ZONE 'America/Tegucigalpa'), (NOW() AT TIME ZONE 'America/Tegucigalpa'))
       `,
       [
-        cajaActual.id_sesion_caja,
-        cajaActual.id_caja,
+        cajaContext.id_sesion_caja,
+        cajaContext.id_caja,
         idSucursal,
         idTipoMovimientoCaja,
         userId,
@@ -1120,8 +1103,8 @@ export const createVentaReversion = async ({ idFactura, body, req, idUsuario }) 
       id_sucursal: idSucursal,
       id_caja_original: parsePositiveInt(factura.id_caja),
       id_sesion_caja_original: parsePositiveInt(factura.id_sesion_caja),
-      id_caja_actual: parsePositiveInt(cajaActual.id_caja),
-      id_sesion_caja_actual: parsePositiveInt(cajaActual.id_sesion_caja),
+      id_caja_actual: parsePositiveInt(cajaContext.id_caja),
+      id_sesion_caja_actual: parsePositiveInt(cajaContext.id_sesion_caja),
       lineas: reversionLines,
       fidelizacion: loyalty,
       auditoria: {

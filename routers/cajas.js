@@ -15,6 +15,8 @@ const CAJAS_SCOPE_PERMISSION = 'VENTAS_CAJAS_MULTISUCURSAL_VER';
 const ADMIN_ROLE_CODES = ['ADMIN', 'ADMINISTRADOR', 'SUPER_ADMIN'];
 const CAJA_ADMIN_EMAIL_TO = 'gersonmz@jonnyshn.com';
 const CAJA_APERTURA_EMAIL_TO = CAJA_ADMIN_EMAIL_TO;
+const HN_NOW_SQL = "(NOW() AT TIME ZONE 'America/Tegucigalpa')";
+const MANUAL_MOVEMENT_EXCLUDED_CODES = new Set(['APERTURA', 'REVERSION', 'REVERSO']);
 
 const CATALOGS = Object.freeze({
   SESSION_STATES: { table: 'public.cat_cajas_sesiones_estados', id: 'id_estado_sesion_caja' },
@@ -1635,6 +1637,92 @@ const fetchCajaCloseEmailActors = async (client, { idUsuarioResponsable, idUsuar
 const resolveCajaEmailActorLabel = (actors, primaryNameKey, primaryUserKey, fallback) =>
   actors?.[primaryNameKey] || actors?.[primaryUserKey] || fallback || 'No disponible';
 
+const normalizeManualMovement = (row) => ({
+  fecha_hora: row.fecha_movimiento || row.fecha_creacion || null,
+  tipo_codigo: normalizeCajaCode(row.tipo_codigo, 80) || 'N/A',
+  tipo: row.tipo_nombre || row.tipo_codigo || 'N/A',
+  monto: Number(row.monto || 0),
+  observacion: row.observacion || 'N/A',
+  referencia: row.referencia || 'N/A',
+  usuario_ejecutor: row.usuario_ejecutor_nombre || row.nombre_usuario || 'No disponible',
+  signo: Number(row.signo || 0)
+});
+
+const splitManualMovements = (rows = []) => {
+  const manualRows = (Array.isArray(rows) ? rows : [])
+    .map(normalizeManualMovement)
+    .filter((row) => !MANUAL_MOVEMENT_EXCLUDED_CODES.has(row.tipo_codigo));
+
+  return {
+    ingresos: manualRows.filter((row) => row.signo > 0),
+    egresos: manualRows.filter((row) => row.signo < 0)
+  };
+};
+
+const fetchCajaCloseManualMovements = async (client, idSesionCaja) => {
+  const result = await client.query(
+    `
+      SELECT
+        cm.fecha_movimiento,
+        cm.fecha_creacion,
+        cm.monto,
+        cm.observacion,
+        cm.referencia,
+        mt.codigo AS tipo_codigo,
+        mt.nombre AS tipo_nombre,
+        mt.signo,
+        u.nombre_usuario,
+        ${USER_DISPLAY_SQL} AS usuario_ejecutor_nombre
+      FROM public.cajas_movimientos cm
+      INNER JOIN public.cat_cajas_movimientos_tipos mt
+        ON mt.id_tipo_movimiento_caja = cm.id_tipo_movimiento_caja
+      LEFT JOIN public.usuarios u ON u.id_usuario = cm.id_usuario_ejecutor
+      LEFT JOIN public.empleados e ON e.id_empleado = u.id_empleado
+      LEFT JOIN public.personas per ON per.id_persona = e.id_persona
+      WHERE cm.id_sesion_caja = $1
+        AND UPPER(TRIM(mt.codigo)) <> ALL($2::text[])
+      ORDER BY cm.fecha_movimiento ASC, cm.id_movimiento_caja ASC
+    `,
+    [idSesionCaja, [...MANUAL_MOVEMENT_EXCLUDED_CODES]]
+  );
+
+  return splitManualMovements(result.rows);
+};
+
+const buildManualMovementEmailRows = (rows = []) => {
+  if (!Array.isArray(rows) || rows.length === 0) {
+    return '<tr><td colspan="6" style="color:#667085;">Sin movimientos manuales registrados.</td></tr>';
+  }
+
+  return rows.map((row) => `
+    <tr>
+      <td>${escapeHtml(formatDateTimeLabel(row.fecha_hora))}</td>
+      <td>${escapeHtml(row.tipo)}</td>
+      <td>${escapeHtml(formatMoneyLabel(row.monto))}</td>
+      <td>${escapeHtml(row.observacion)}</td>
+      <td>${escapeHtml(row.referencia)}</td>
+      <td>${escapeHtml(row.usuario_ejecutor)}</td>
+    </tr>
+  `).join('');
+};
+
+const buildManualMovementEmailSection = (title, rows) => `
+  <h3 style="margin:16px 0 8px;">${escapeHtml(title)}</h3>
+  <table cellpadding="6" cellspacing="0" style="border-collapse:collapse; width:100%; border:1px solid #eaecf0;">
+    <thead>
+      <tr style="background:#f9fafb;">
+        <th align="left">Fecha/hora</th>
+        <th align="left">Tipo</th>
+        <th align="left">Monto</th>
+        <th align="left">Razon u observacion</th>
+        <th align="left">Referencia</th>
+        <th align="left">Usuario ejecutor</th>
+      </tr>
+    </thead>
+    <tbody>${buildManualMovementEmailRows(rows)}</tbody>
+  </table>
+`;
+
 const buildCajaCierreEmailHtml = (payload) => {
   const arqueosRows = Array.isArray(payload.arqueos) && payload.arqueos.length > 0
     ? payload.arqueos.map((row) => `
@@ -1669,6 +1757,7 @@ const buildCajaCierreEmailHtml = (payload) => {
   const pdfMessage = payload.pdfAttached === false
     ? 'No fue posible adjuntar el PDF automaticamente; el resumen del cierre se incluye en este correo.'
     : 'Se adjunta el reporte PDF del cierre de caja para control interno.';
+  const movimientosManuales = payload.movimientosManuales || {};
 
   return `
 <!DOCTYPE html>
@@ -1707,6 +1796,8 @@ const buildCajaCierreEmailHtml = (payload) => {
     </thead>
     <tbody>${arqueosRows}</tbody>
   </table>
+  ${buildManualMovementEmailSection('Ingresos manuales', movimientosManuales.ingresos)}
+  ${buildManualMovementEmailSection('Egresos manuales', movimientosManuales.egresos)}
 </body>
 </html>`;
 };
@@ -1927,7 +2018,7 @@ const insertCajaEgresoMovimiento = async ({
         id_sesion_caja, id_caja, id_sucursal, id_tipo_movimiento_caja,
         id_usuario_ejecutor, monto, observacion, referencia, fecha_movimiento, fecha_creacion
       )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW())
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, ${HN_NOW_SQL}, ${HN_NOW_SQL})
       RETURNING id_movimiento_caja
     `,
     [
@@ -1977,7 +2068,7 @@ const insertCajaIngresoMovimiento = async ({
         id_sesion_caja, id_caja, id_sucursal, id_tipo_movimiento_caja,
         id_usuario_ejecutor, monto, observacion, referencia, fecha_movimiento, fecha_creacion
       )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW())
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, ${HN_NOW_SQL}, ${HN_NOW_SQL})
       RETURNING id_movimiento_caja
     `,
     [
@@ -3705,7 +3796,7 @@ const createOpenSessionTransaction = async ({
           id_sesion_caja, id_caja, id_sucursal, id_tipo_movimiento_caja, id_usuario_ejecutor,
           monto, observacion, fecha_movimiento, fecha_creacion
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), NOW())
+        VALUES ($1, $2, $3, $4, $5, $6, $7, ${HN_NOW_SQL}, ${HN_NOW_SQL})
       `,
       [idSesionCaja, idCaja, caja.id_sucursal, idTipoApertura, scopeContext.idUsuario, montoApertura, observacionApertura || 'Apertura de sesión de caja']
     );
@@ -4259,7 +4350,7 @@ const closeSessionHandler = async (req, res) => {
           monto_ventas_no_efectivo, monto_ingresos_manuales, monto_egresos_manuales, monto_teorico_cierre,
           monto_declarado_cierre, diferencia, observacion, fecha_creacion
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), $8, $9, $10, $11, $12, $13, $14, $15, $16, NOW())
+        VALUES ($1, $2, $3, $4, $5, $6, $7, ${HN_NOW_SQL}, $8, $9, $10, $11, $12, $13, $14, $15, $16, ${HN_NOW_SQL})
         RETURNING id_cierre_caja
       `,
       [
@@ -4292,7 +4383,7 @@ const closeSessionHandler = async (req, res) => {
               monto_teorico, monto_declarado, diferencia, cantidad_referencias, observacion,
               requiere_revision, completado_automaticamente, fecha_registro, id_usuario_registro
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, NOW(), $14)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, ${HN_NOW_SQL}, $14)
             ON CONFLICT (id_cierre_caja, id_metodo_pago)
             DO UPDATE SET
               metodo_pago_codigo = EXCLUDED.metodo_pago_codigo,
@@ -4303,7 +4394,7 @@ const closeSessionHandler = async (req, res) => {
               observacion = EXCLUDED.observacion,
               requiere_revision = EXCLUDED.requiere_revision,
               completado_automaticamente = EXCLUDED.completado_automaticamente,
-              fecha_registro = NOW(),
+              fecha_registro = ${HN_NOW_SQL},
               id_usuario_registro = EXCLUDED.id_usuario_registro
           `,
           [
@@ -4329,9 +4420,9 @@ const closeSessionHandler = async (req, res) => {
     await client.query(
       `
         UPDATE public.cajas_sesiones
-        SET id_estado_sesion_caja = $1, id_usuario_cierre = $2, fecha_cierre = NOW(),
+        SET id_estado_sesion_caja = $1, id_usuario_cierre = $2, fecha_cierre = ${HN_NOW_SQL},
             monto_teorico_cierre = $3, monto_declarado_cierre = $4, diferencia_cierre = $5,
-            id_resolucion_cierre_caja = $6, observacion_cierre = $7, fecha_actualizacion = NOW()
+            id_resolucion_cierre_caja = $6, observacion_cierre = $7, fecha_actualizacion = ${HN_NOW_SQL}
         WHERE id_sesion_caja = $8
       `,
       [idEstadoCerrada, scopeContext.idUsuario, montoTeorico, montoDeclaradoCierre, diferencia, idResolucionFinal, observacionCierre, idSesionCaja]
@@ -4340,7 +4431,7 @@ const closeSessionHandler = async (req, res) => {
     await client.query(
       `
         UPDATE public.cajas_sesiones_participantes
-        SET activo = false, fecha_fin = NOW(), fecha_actualizacion = NOW()
+        SET activo = false, fecha_fin = ${HN_NOW_SQL}, fecha_actualizacion = ${HN_NOW_SQL}
         WHERE id_sesion_caja = $1 AND COALESCE(activo, true) = true
       `,
       [idSesionCaja]
@@ -4365,6 +4456,12 @@ const closeSessionHandler = async (req, res) => {
       });
     } catch (actorError) {
       console.warn('[cajas] No se pudieron resolver usuarios para correo de cierre:', actorError?.message || actorError);
+    }
+    let movimientosManuales = { ingresos: [], egresos: [] };
+    try {
+      movimientosManuales = await fetchCajaCloseManualMovements(client, idSesionCaja);
+    } catch (movementError) {
+      console.warn('[cajas] No se pudieron resolver movimientos manuales para reporte de cierre:', movementError?.message || movementError);
     }
 
     await client.query('COMMIT');
@@ -4396,7 +4493,8 @@ const closeSessionHandler = async (req, res) => {
       ventasEfectivoNetas: Number(resumen.ventasEfectivoNetas || 0),
       ventasNoEfectivoNetas: Number(resumen.ventasNoEfectivoNetas || 0),
       ingresosManuales: Number(resumen.ingresosManuales || 0),
-      egresosManuales: Number(resumen.egresosManuales || 0)
+      egresosManuales: Number(resumen.egresosManuales || 0),
+      movimientosManuales
     }).catch((emailError) => {
       console.error('[cajas] Error enviando correo de cierre de caja:', emailError?.message || emailError);
     });
