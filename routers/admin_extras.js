@@ -30,7 +30,8 @@ const parseOptionalPositiveNumber = (value) => {
 
 const parseMoney = (value) => {
   const parsed = Number(value);
-  return Number.isFinite(parsed) && parsed >= 0 ? parsed : NaN;
+  if (!Number.isFinite(parsed) || parsed < 0) return NaN;
+  return Number((Math.round((parsed + Number.EPSILON) * 100) / 100).toFixed(2));
 };
 
 const toSlugCode = (value) =>
@@ -401,7 +402,17 @@ const getHydratedExtraById = async (client, idExtra) => {
   const extraResult = await client.query(
     `
       SELECT
-        me.*,
+        me.id_extra,
+        me.codigo,
+        me.nombre,
+        ROUND(CAST(me.precio_adicional AS numeric), 2) AS precio_adicional,
+        me.id_insumo,
+        me.cant,
+        me.id_unidad_medida,
+        me.orden,
+        me.estado,
+        me.fecha_creacion,
+        me.fecha_actualizacion,
         i.nombre_insumo,
         um.nombre AS unidad_nombre,
         um.simbolo AS unidad_simbolo
@@ -469,7 +480,7 @@ router.get('/', checkPermission(MENU_EXTRAS_VIEW_PERMISSIONS), async (req, res) 
           me.id_extra,
           me.codigo,
           me.nombre,
-          me.precio_adicional,
+          ROUND(CAST(me.precio_adicional AS numeric), 2) AS precio_adicional,
           me.id_insumo,
           i.nombre_insumo,
           me.cant,
