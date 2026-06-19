@@ -7,6 +7,8 @@ import express from 'express';
 import pool from '../../config/db-connection.js';
 
 import { checkPermission } from '../../middleware/checkPermission.js';
+import { insertSecurityAuditLog } from './auditLogger.js';
+import { securityReadLimiter, securityWriteLimiter } from './securityRateLimit.js';
 
 const router = express.Router();
 
@@ -14,7 +16,11 @@ const router = express.Router();
  * GET /seguridad/configuracion/password
  * Retorna políticas actuales (password_*).
  */
-router.get('/configuracion/password', checkPermission('SEGURIDAD_VER'), async (req, res) => {
+router.get(
+  '/configuracion/password',
+  securityReadLimiter,
+  checkPermission(['SEGURIDAD_VER', 'SEGURIDAD_CONFIG_EDITAR']),
+  async (req, res) => {
   try {
     const sql = `
       SELECT clave, valor, descripcion
@@ -30,7 +36,8 @@ router.get('/configuracion/password', checkPermission('SEGURIDAD_VER'), async (r
     console.error('GET /seguridad/configuracion/password error:', err);
     return res.status(500).json({ error: true, message: 'Error interno del servidor' });
   }
-});
+  }
+);
 
 /**
  * PUT /seguridad/configuracion/password
@@ -43,10 +50,11 @@ router.get('/configuracion/password', checkPermission('SEGURIDAD_VER'), async (r
  *   "password_require_symbol": "false"
  * }
  */
-router.put('/configuracion/password', checkPermission('SEGURIDAD_CONFIG_EDITAR'), async (req, res) => {
+router.put('/configuracion/password', securityWriteLimiter, checkPermission('SEGURIDAD_CONFIG_EDITAR'), async (req, res) => {
   const client = await pool.connect();
 
   try {
+    const actor = req.user || req.usuario;
     const allowedKeys = new Set([
       'password_min_length',
       'password_require_upper',
@@ -85,6 +93,25 @@ router.put('/configuracion/password', checkPermission('SEGURIDAD_CONFIG_EDITAR')
       }
     }
 
+    const currentPoliciesRes = await client.query(
+      `
+      SELECT clave, valor
+      FROM configuracion_sistema
+      WHERE clave = ANY($1::text[])
+      `,
+      [entries.map(([clave]) => clave)]
+    );
+
+    const datosAntes = {};
+    for (const row of currentPoliciesRes.rows) {
+      datosAntes[row.clave] = row.valor;
+    }
+
+    const datosDespues = {};
+    for (const [clave, valorRaw] of entries) {
+      datosDespues[clave] = String(valorRaw);
+    }
+
     await client.query('BEGIN');
 
     for (const [clave, valorRaw] of entries) {
@@ -102,6 +129,25 @@ router.put('/configuracion/password', checkPermission('SEGURIDAD_CONFIG_EDITAR')
     }
 
     await client.query('COMMIT');
+
+    try {
+      await insertSecurityAuditLog({
+        req,
+        actorId: actor?.id_usuario ?? null,
+        accion: 'ACTUALIZAR_POLITICAS_PASSWORD',
+        objetivo: { tabla_afectada: 'configuracion_sistema' },
+        descripcion: `Usuario ${actor?.id_usuario ?? 'N/A'} actualizo politicas de password`,
+        detalle: {
+          actor_id: actor?.id_usuario ?? null,
+          claves_actualizadas: Object.keys(datosDespues),
+          total_cambios: Object.keys(datosDespues).length
+        },
+        datosAntes,
+        datosDespues
+      });
+    } catch (auditErr) {
+      console.error('Audit log error (configuracion/password):', auditErr);
+    }
 
     return res.json({ error: false, message: 'Políticas actualizadas correctamente' });
   } catch (err) {

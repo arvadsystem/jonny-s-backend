@@ -1,0 +1,350 @@
+REGLAS DE NEGOCIO — CIERRES DE CAJA Y ARQUEOS SEGMENTADOS
+JONNYS SMARTORDER
+
+Versión: 1.0
+Alcance: Ventas, caja, cierres de caja, arqueos, métodos de pago y reversiones.
+Estado: Reglas definidas por negocio antes de implementación.
+
+============================================================
+1. PRINCIPIO GENERAL DEL CIERRE DE CAJA
+============================================================
+
+El cierre de caja debe manejar arqueos segmentados por método de pago.
+
+Un cierre de caja se compone de:
+
+1. Arqueo de efectivo.
+2. Arqueo de tarjeta.
+3. Arqueo de transferencia.
+
+El sistema debe considerar estos arqueos como partes del mismo cierre, pero cada uno debe tener su propio monto teórico, monto declarado, diferencia y observación.
+
+El cierre debe realizarse por pasos:
+
+Paso 1: Arqueo de efectivo.
+Paso 2: Arqueo de tarjeta.
+Paso 3: Arqueo de transferencia.
+Paso 4: Resumen final.
+Paso 5: Enviar cierre a revisión.
+
+============================================================
+2. REGLAS DEL ARQUEO DE EFECTIVO
+============================================================
+
+2.1. El arqueo de efectivo NO manejará denominaciones.
+No se registrarán billetes ni monedas por separado.
+
+2.2. El cajero solo debe ingresar el monto total contado en efectivo.
+
+2.3. El cajero NO debe ver el efectivo teórico antes de ingresar el efectivo contado.
+
+2.4. El sistema debe calcular internamente:
+- monto_teorico_efectivo
+- monto_declarado_efectivo
+- diferencia_efectivo
+
+2.5. Fórmula:
+diferencia_efectivo = monto_declarado_efectivo - monto_teorico_efectivo
+
+2.6. Si existe diferencia en efectivo, la observación es obligatoria.
+
+2.7. Deben guardarse como mínimo:
+- monto_teorico_efectivo
+- monto_declarado_efectivo
+- diferencia_efectivo
+- observacion_efectivo
+
+============================================================
+3. REGLAS DEL ARQUEO DE TARJETA
+============================================================
+
+3.1. La venta por tarjeta es conceptual.
+No existe integración con POS bancario ni con pasarela de pagos.
+
+3.2. Toda venta por tarjeta debe tener referencia_pago obligatoria.
+
+3.3. La tarjeta NO afecta efectivo físico.
+
+3.4. El cajero NO debe ver el total teórico de tarjeta antes de declarar.
+
+3.5. El cajero debe declarar:
+- monto_declarado_tarjeta
+- cantidad_vouchers_tarjeta
+- observacion_tarjeta
+
+3.6. El sistema debe calcular internamente:
+- monto_teorico_tarjeta
+- diferencia_tarjeta
+
+3.7. Fórmula:
+diferencia_tarjeta = monto_declarado_tarjeta - monto_teorico_tarjeta
+
+3.8. Si existe diferencia en tarjeta, la observación es obligatoria.
+
+3.9. Deben guardarse como mínimo:
+- monto_teorico_tarjeta
+- monto_declarado_tarjeta
+- diferencia_tarjeta
+- cantidad_vouchers_tarjeta
+- observacion_tarjeta
+
+============================================================
+4. REGLAS DEL ARQUEO DE TRANSFERENCIA
+============================================================
+
+4.1. La venta por transferencia es conceptual.
+No existe integración con banco ni validación automática.
+
+4.2. Toda venta por transferencia debe tener referencia_pago obligatoria.
+
+4.3. La transferencia NO afecta efectivo físico.
+
+4.4. El cajero NO debe ver el total teórico de transferencia antes de declarar.
+
+4.5. El cajero debe declarar:
+- monto_declarado_transferencia
+- cantidad_comprobantes_transferencia
+- observacion_transferencia
+
+4.6. El sistema debe calcular internamente:
+- monto_teorico_transferencia
+- diferencia_transferencia
+
+4.7. Fórmula:
+diferencia_transferencia = monto_declarado_transferencia - monto_teorico_transferencia
+
+4.8. Si existe diferencia en transferencia, la observación es obligatoria.
+
+4.9. Deben guardarse como mínimo:
+- monto_teorico_transferencia
+- monto_declarado_transferencia
+- diferencia_transferencia
+- cantidad_comprobantes_transferencia
+- observacion_transferencia
+
+============================================================
+5. MÉTODOS QUE DEBEN ARQUEARSE
+============================================================
+
+5.1. El cierre exige arqueo solo de los métodos que tuvieron ventas en la sesión.
+
+5.2. Si un método no tuvo ventas en la sesión, debe mostrarse en 0 y marcarse como completado automáticamente.
+
+5.3. Aunque un método no tenga ventas, debe aparecer en el resumen final del cierre con valores en 0 para mantener trazabilidad.
+
+============================================================
+6. VISIBILIDAD DE MONTOS TEÓRICOS
+============================================================
+
+6.1. El cajero NO debe ver montos teóricos antes de declarar.
+
+Aplica para:
+- efectivo
+- tarjeta
+- transferencia
+
+6.2. Primero declara el cajero. Luego el sistema compara.
+
+6.3. Admin y super_admin sí pueden ver los montos teóricos, diferencias y resumen completo.
+
+============================================================
+7. PERMISOS DE ARQUEO Y CIERRE
+============================================================
+
+7.1. Solo el cajero responsable de la caja puede realizar el arqueo y cierre operativo.
+
+7.2. Los auxiliares pueden vender en la caja del responsable si están autorizados, pero NO pueden hacer arqueo ni cierre.
+
+7.3. Admin y super_admin revisan y aprueban cierres, pero el arqueo operativo lo realiza el cajero responsable.
+
+7.4. Admin/super_admin no deben ser tratados como cajeros operativos por el modal automático, salvo que el flujo lo determine explícitamente.
+
+============================================================
+8. ESTADO DEL CIERRE
+============================================================
+
+8.1. Después de que el cajero realiza el cierre, el cierre queda en estado:
+PENDIENTE DE REVISIÓN
+
+8.2. El cierre NO queda aprobado automáticamente.
+
+8.3. Admin o super_admin deben revisar y aprobar el cierre.
+
+8.4. Las diferencias en cualquier método deben quedar visibles para revisión.
+
+============================================================
+9. DIFERENCIAS Y UMBRAL CONFIGURABLE
+============================================================
+
+9.1. Las diferencias en cualquier método requieren control.
+
+Métodos incluidos:
+- efectivo
+- tarjeta
+- transferencia
+
+9.2. Debe existir un umbral configurable para diferencias.
+
+9.3. Recomendación inicial:
+umbral_diferencia_cierre = 0.00
+
+9.4. Con umbral 0.00, cualquier diferencia requiere observación y queda visible para revisión.
+
+9.5. Si en el futuro el negocio define una tolerancia, puede parametrizarse, por ejemplo:
+- L. 1.00
+- L. 5.00
+- L. 10.00
+
+============================================================
+10. REPORTE DE CIERRE
+============================================================
+
+10.1. El reporte de cierre debe mostrar el desglose por método:
+
+Efectivo:
+- Efectivo sistema
+- Efectivo declarado
+- Diferencia efectivo
+
+Tarjeta:
+- Tarjeta sistema
+- Tarjeta declarado
+- Diferencia tarjeta
+
+Transferencia:
+- Transferencia sistema
+- Transferencia declarado
+- Diferencia transferencia
+
+Totales:
+- Total general sistema
+- Total general declarado
+- Diferencia general
+
+10.2. El reporte debe permitir diferenciar entre:
+- ventas brutas por método
+- reversiones por método
+- neto por método
+- egresos manuales, cuando aplique
+
+============================================================
+11. REVERSIONES DENTRO DEL CIERRE
+============================================================
+
+11.1. Las reversiones deben restar del método original de la venta.
+
+Ejemplo:
+Venta por tarjeta: L. 500
+Reversión de esa venta: -L. 500
+Neto tarjeta: L. 0
+
+11.2. Las reversiones también deben mostrarse como detalle separado.
+
+11.3. La reversión de efectivo afecta efectivo físico.
+
+11.4. La reversión de efectivo debe clasificarse como reversión, NO como egreso manual.
+
+11.5. Las reversiones de tarjeta y transferencia NO afectan efectivo físico.
+
+11.6. Las reversiones de tarjeta y transferencia deben restar del método correspondiente y mostrarse en el detalle del cierre.
+
+============================================================
+12. EGRESOS MANUALES
+============================================================
+
+12.1. Los egresos manuales son movimientos distintos a las reversiones.
+
+12.2. Un egreso manual afecta efectivo físico.
+
+12.3. Un egreso manual debe aparecer separado de las reversiones.
+
+12.4. No se debe mezclar devolución/reversión con egreso manual.
+
+============================================================
+13. RECOMENDACIÓN TÉCNICA PARA BASE DE DATOS
+============================================================
+
+13.1. No se recomienda agregar demasiadas columnas directamente a cajas_cierres para cada método.
+
+13.2. Se recomienda analizar la creación de una tabla hija para arqueos segmentados por método.
+
+Nombre sugerido:
+cajas_cierres_arqueos_metodos
+
+13.3. Campos sugeridos:
+- id_arqueo_metodo
+- id_cierre
+- id_sesion_caja
+- id_caja
+- id_sucursal
+- id_metodo_pago
+- metodo_pago_codigo
+- monto_teorico
+- monto_declarado
+- diferencia
+- cantidad_referencias
+- observacion
+- requiere_revision
+- completado_automaticamente
+- fecha_registro
+- id_usuario_registro
+
+13.4. Uso de cantidad_referencias:
+- Efectivo: NULL o 0
+- Tarjeta: cantidad de vouchers
+- Transferencia: cantidad de comprobantes
+
+13.5. Esta tabla permitiría agregar nuevos métodos de pago en el futuro sin modificar otra vez la tabla principal de cierres.
+
+============================================================
+14. REGLAS DE IMPLEMENTACIÓN
+============================================================
+
+14.1. No aplicar migraciones sin auditoría previa.
+
+14.2. No modificar cierres sin validar primero:
+- facturas
+- facturas_cobros
+- cat_metodos_pago
+- cajas
+- cajas_sesiones
+- cajas_cierres
+- cajas_arqueos
+- cajas_movimientos
+- vistas de cierre existentes
+
+14.3. No mostrar montos teóricos al cajero antes de declarar.
+
+14.4. No permitir cierre por auxiliares.
+
+14.5. No aprobar cierre automáticamente.
+
+14.6. No mezclar reversiones con egresos manuales.
+
+14.7. No implementar pagos mixtos en esta fase.
+
+14.8. Toda venta por transferencia debe tener referencia_pago.
+
+14.9. Toda venta por tarjeta debe tener referencia_pago.
+
+14.10. Tarjeta y transferencia no afectan efectivo físico.
+
+============================================================
+15. DECISIÓN FINAL DE NEGOCIO
+============================================================
+
+El cierre de caja debe ser segmentado por método de pago.
+
+El modelo funcional aprobado es:
+
+- Arqueo de efectivo: total contado, sin denominaciones.
+- Arqueo de tarjeta: total declarado, cantidad de vouchers y observación.
+- Arqueo de transferencia: total declarado, cantidad de comprobantes y observación.
+- Los montos teóricos no se muestran al cajero antes de declarar.
+- Las diferencias requieren observación.
+- El cierre queda pendiente de revisión.
+- Solo el cajero responsable cierra.
+- Los auxiliares solo venden.
+- Admin/super_admin revisan y aprueban.
+- Las reversiones restan del método original y se muestran separadas.
+- Las reversiones de efectivo afectan efectivo, pero no son egresos manuales.

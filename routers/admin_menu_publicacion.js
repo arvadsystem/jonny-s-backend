@@ -1,0 +1,2887 @@
+﻿import express from 'express';
+import { randomUUID } from 'node:crypto';
+import pool from '../config/db-connection.js';
+import { checkPermission } from '../middleware/checkPermission.js';
+import { syncExistingBranchProductsIntoMenu } from '../services/menuAutoPublicationService.js';
+import {
+  getPublicMenuHeroCarouselConfig,
+  savePublicMenuHeroCarouselConfig
+} from '../services/publicMenuHeroCarouselConfigService.js';
+
+const router = express.Router();
+// AM: transicion segura a permisos granulares sin romper el acceso actual mientras se alinea BD/roles.
+const MENU_PUBLICACION_VIEW_PERMISSIONS = ['MENU_PUBLICACION_VER', 'MENU_VER'];
+const MENU_PUBLICACION_SAVE_PERMISSIONS = ['MENU_PUBLICACION_GUARDAR', 'MENU_VER'];
+const MENU_TEMPORADA_CREATE_PERMISSIONS = ['MENU_TEMPORADA_CREAR', 'MENU_VER'];
+
+const ITEM_TYPES = Object.freeze({
+  PRODUCTO: 'PRODUCTO',
+  RECETA: 'RECETA',
+  COMBO: 'COMBO'
+});
+
+const toPositiveInt = (value) => {
+  const parsed = Number.parseInt(String(value ?? '').trim(), 10);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : null;
+};
+
+const toStrictPositiveInt = (value) => {
+  const raw = String(value ?? '').trim();
+  if (!/^[1-9]\d*$/.test(raw)) return null;
+  const parsed = Number(raw);
+  return Number.isSafeInteger(parsed) ? parsed : null;
+};
+
+const toNullableMoney = (value) => {
+  if (value === undefined || value === null || String(value).trim() === '') return null;
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed < 0) return NaN;
+  return Number(parsed.toFixed(2));
+};
+
+const toNullablePositiveInt = (value) => {
+  if (value === undefined || value === null || String(value).trim() === '') return null;
+  const parsed = Number.parseInt(String(value).trim(), 10);
+  if (!Number.isInteger(parsed) || parsed <= 0) return NaN;
+  return parsed;
+};
+
+const parseBoolean = (value) => {
+  if (value === true || value === 1 || value === '1') return true;
+  if (value === false || value === 0 || value === '0') return false;
+
+  const normalized = String(value ?? '').trim().toLowerCase();
+  if (['true', 't', 'yes', 'y', 'si', 'sí', 'on'].includes(normalized)) return true;
+  if (['false', 'f', 'no', 'n', 'off'].includes(normalized)) return false;
+
+  return Boolean(value);
+};
+
+const parseOptionalBoolean = (value) => {
+  if (value === undefined || value === null || value === '') return false;
+  if (value === true || value === false) return value;
+  const normalized = String(value).trim().toLowerCase();
+  if (['true', '1'].includes(normalized)) return true;
+  if (['false', '0'].includes(normalized)) return false;
+  return null;
+};
+
+const normalizeItemType = (value) => {
+  const normalized = String(value ?? '').trim().toUpperCase();
+  if (normalized === ITEM_TYPES.PRODUCTO) return ITEM_TYPES.PRODUCTO;
+  if (normalized === ITEM_TYPES.RECETA) return ITEM_TYPES.RECETA;
+  if (normalized === ITEM_TYPES.COMBO) return ITEM_TYPES.COMBO;
+  return '';
+};
+
+const buildItemKey = (tipoItem, idItemOrigen) => `${tipoItem}:${idItemOrigen}`;
+
+const hasColumn = async (tableName, columnName) => {
+  const result = await pool.query(
+    `
+      SELECT 1
+      FROM information_schema.columns
+      WHERE table_schema = 'public'
+        AND table_name = $1
+        AND column_name = $2
+      LIMIT 1;
+    `,
+    [tableName, columnName]
+  );
+  return result.rowCount > 0;
+};
+
+const getDetalleMenuCapabilities = async () => {
+  const [hasIdReceta, hasIdCombo, hasVisible, hasPrecioPublico, hasOrden] = await Promise.all([
+    hasColumn('detalle_menu', 'id_receta'),
+    hasColumn('detalle_menu', 'id_combo'),
+    hasColumn('detalle_menu', 'visible'),
+    hasColumn('detalle_menu', 'precio_publico'),
+    hasColumn('detalle_menu', 'orden')
+  ]);
+
+  return {
+    hasIdReceta,
+    hasIdCombo,
+    hasVisible,
+    hasPrecioPublico,
+    hasOrden
+  };
+};
+
+const getActiveMenuByBranch = async (idSucursal) => {
+  const result = await pool.query(
+    `
+      SELECT
+        r.id_menu_vigente,
+        r.id_sucursal,
+        r.id_menu,
+        r.fecha_inicio,
+        r.fecha_fin,
+        r.tipo_publicacion,
+        r.es_default,
+        r.prioridad,
+        r.nombre_menu,
+        COALESCE(m.descripcion, '') AS menu_descripcion,
+        s.nombre_sucursal
+      FROM public.fn_resolver_menu_publicado($1) r
+      INNER JOIN menu m ON m.id_menu = r.id_menu
+      INNER JOIN sucursales s ON s.id_sucursal = r.id_sucursal
+      LIMIT 1;
+    `,
+    [idSucursal]
+  );
+
+  return result.rows?.[0] || null;
+};
+
+const mapMenuSummary = (row) => ({
+  id_menu_vigente: row.id_menu_vigente ? Number(row.id_menu_vigente) : null,
+  id_menu: Number(row.id_menu),
+  id_sucursal: Number(row.id_sucursal),
+  nombre_menu: row.nombre_menu || 'Menu',
+  descripcion_menu: row.menu_descripcion || '',
+  nombre_sucursal: row.nombre_sucursal || '',
+  fecha_inicio: row.fecha_inicio || null,
+  tipo_publicacion: row.tipo_publicacion || null,
+  es_default: row.es_default !== undefined && row.es_default !== null
+    ? parseBoolean(row.es_default)
+    : null,
+  fecha_fin: row.fecha_fin || null,
+  prioridad: row.prioridad !== undefined && row.prioridad !== null
+    ? Number(row.prioridad)
+    : null
+});
+const SHARED_MENU_WARNING_PREFIX = 'Atencion: este menu esta compartido entre sucursales.';
+
+const toDateTimeOrNull = (value) => {
+  if (value === undefined || value === null || String(value).trim() === '') return null;
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) return null;
+  return parsed;
+};
+
+const normalizePublicationType = (value) => {
+  const normalized = String(value ?? 'DEFAULT').trim().toUpperCase();
+  if (normalized === 'DEFAULT' || normalized === 'TEMPORADA') return normalized;
+  return '';
+};
+
+const toNullablePriority = (value) => {
+  if (value === undefined || value === null || String(value).trim() === '') return null;
+  const parsed = Number.parseInt(String(value).trim(), 10);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : NaN;
+};
+
+const buildMenuProgrammingError = ({ code, message, phase, status = 500, cause = null }) => {
+  const error = new Error(message);
+  error.code = code;
+  error.phase = phase;
+  error.status = status;
+  error.cause = cause;
+  return error;
+};
+
+const sendMenuProgrammingError = (res, {
+  status,
+  code,
+  message,
+  phase,
+  correlationId
+}) => res.status(status).json({
+  ok: false,
+  code,
+  message,
+  phase,
+  correlationId
+});
+
+const getOtherBranchesActiveMenuSignature = async (client, idSucursal) => {
+  const result = await client.query(
+    `
+      SELECT COALESCE(
+        JSONB_AGG(
+          JSONB_BUILD_OBJECT(
+            'id_menu_vigente', id_menu_vigente,
+            'id_sucursal', id_sucursal,
+            'id_menu', id_menu,
+            'fecha_inicio', fecha_inicio,
+            'estado', estado
+          )
+          ORDER BY id_sucursal, id_menu_vigente
+        ),
+        '[]'::jsonb
+      ) AS signature
+      FROM menu_vigente
+      WHERE id_sucursal <> $1
+        AND COALESCE(estado, true) = true;
+    `,
+    [idSucursal]
+  );
+
+  return JSON.stringify(result.rows?.[0]?.signature || []);
+};
+
+const getMenusForProgramming = async () => {
+  const result = await pool.query(
+    `
+      SELECT
+        m.id_menu,
+        m.nombre_menu,
+        COALESCE(m.descripcion, '') AS descripcion,
+        COALESCE(m.estado, true) AS estado
+      FROM menu m
+      WHERE COALESCE(m.estado, true) = true
+      ORDER BY m.id_menu ASC;
+    `
+  );
+
+  return (result.rows || []).map((row) => ({
+    id_menu: Number(row.id_menu),
+    nombre_menu: row.nombre_menu || `Menu #${row.id_menu}`,
+    descripcion: row.descripcion || '',
+    estado: parseBoolean(row.estado)
+  }));
+};
+
+const existsActiveBranch = async (idSucursal) => {
+  const result = await pool.query(
+    `
+      SELECT 1
+      FROM sucursales
+      WHERE id_sucursal = $1
+        AND COALESCE(estado, true) = true
+      LIMIT 1;
+    `,
+    [idSucursal]
+  );
+
+  return result.rowCount > 0;
+};
+
+const existsActiveMenu = async (idMenu) => {
+  const result = await pool.query(
+    `
+      SELECT 1
+      FROM menu
+      WHERE id_menu = $1
+        AND COALESCE(estado, true) = true
+      LIMIT 1;
+    `,
+    [idMenu]
+  );
+
+  return result.rowCount > 0;
+};
+
+const getMenuById = async (idMenu) => {
+  const result = await pool.query(
+    `
+      SELECT
+        id_menu,
+        nombre_menu,
+        COALESCE(descripcion, '') AS descripcion,
+        COALESCE(estado, true) AS estado
+      FROM menu
+      WHERE id_menu = $1
+      LIMIT 1;
+    `,
+    [idMenu]
+  );
+
+  const row = result.rows?.[0];
+  if (!row) return null;
+
+  return {
+    id_menu: Number(row.id_menu),
+    nombre_menu: row.nombre_menu || `Menu #${row.id_menu}`,
+    descripcion: row.descripcion || '',
+    estado: parseBoolean(row.estado)
+  };
+};
+
+const getMenuUsageSummary = async (idMenu) => {
+  const result = await pool.query(
+    `
+      SELECT
+        EXISTS(
+          SELECT 1
+          FROM menu_vigente mv
+          WHERE mv.id_menu = $1
+        ) AS has_vigencias,
+        EXISTS(
+          SELECT 1
+          FROM detalle_menu dm
+          WHERE dm.id_menu = $1
+            AND COALESCE(dm.estado, true) = true
+        ) AS has_detalle_menu,
+        EXISTS(
+          SELECT 1
+          FROM recetas r
+          WHERE r.id_menu = $1
+            AND COALESCE(r.estado, true) = true
+        ) AS has_recetas,
+        EXISTS(
+          SELECT 1
+          FROM combos c
+          WHERE c.id_menu = $1
+            AND COALESCE(c.estado, true) = true
+        ) AS has_combos;
+    `,
+    [idMenu]
+  );
+
+  const row = result.rows?.[0] || {};
+  return {
+    has_vigencias: parseBoolean(row.has_vigencias),
+    has_detalle_menu: parseBoolean(row.has_detalle_menu),
+    has_recetas: parseBoolean(row.has_recetas),
+    has_combos: parseBoolean(row.has_combos)
+  };
+};
+
+const canDeactivateMenu = (usage = {}) =>
+  !usage.has_vigencias &&
+  !usage.has_detalle_menu &&
+  !usage.has_recetas &&
+  !usage.has_combos;
+
+const buildMenuUsageBlockers = (usage = {}) => {
+  const blockers = [];
+  if (usage.has_vigencias) blockers.push('tiene vigencias registradas');
+  if (usage.has_detalle_menu) blockers.push('tiene publicaciones activas en detalle_menu');
+  if (usage.has_recetas) blockers.push('tiene recetas activas asociadas');
+  if (usage.has_combos) blockers.push('tiene combos activos asociados');
+  return blockers;
+};
+
+const getBranchById = async (idSucursal) => {
+  const result = await pool.query(
+    `
+      SELECT
+        id_sucursal,
+        nombre_sucursal,
+        COALESCE(estado, true) AS estado
+      FROM sucursales
+      WHERE id_sucursal = $1
+      LIMIT 1;
+    `,
+    [idSucursal]
+  );
+
+  const row = result.rows?.[0];
+  if (!row) return null;
+
+  return {
+    id_sucursal: Number(row.id_sucursal),
+    nombre_sucursal: row.nombre_sucursal || `Sucursal #${row.id_sucursal}`,
+    estado: parseBoolean(row.estado)
+  };
+};
+
+const getAuthenticatedUserId = (req) => toPositiveInt(req?.user?.id_usuario);
+
+const getBranchesForPublication = async () => {
+  const result = await pool.query(
+    `
+      SELECT
+        s.id_sucursal,
+        s.nombre_sucursal,
+        COALESCE(s.estado, true) AS estado,
+        COALESCE(vsi.texto_direccion, '') AS direccion,
+        mv.id_menu_vigente,
+        mv.id_menu,
+        mv.fecha_inicio,
+        mv.fecha_fin,
+        mv.tipo_publicacion,
+        mv.es_default,
+        mv.prioridad
+      FROM sucursales s
+      LEFT JOIN v_sucursales_info vsi
+        ON vsi.id_sucursal = s.id_sucursal
+      LEFT JOIN LATERAL (
+        SELECT
+          r.id_menu_vigente,
+          r.id_menu,
+          r.fecha_inicio,
+          r.fecha_fin,
+          r.tipo_publicacion,
+          r.es_default,
+          r.prioridad
+        FROM public.fn_resolver_menu_publicado(s.id_sucursal) r
+        LIMIT 1
+      ) mv ON true
+      ORDER BY s.id_sucursal ASC;
+    `
+  );
+
+  return (result.rows || []).map((row) => ({
+    id_sucursal: Number(row.id_sucursal),
+    nombre_sucursal: row.nombre_sucursal,
+    estado: parseBoolean(row.estado),
+    direccion: row.direccion || '',
+    tiene_menu_vigente: Number(row.id_menu_vigente || 0) > 0,
+    id_menu_vigente: row.id_menu_vigente ? Number(row.id_menu_vigente) : null,
+    id_menu: row.id_menu ? Number(row.id_menu) : null,
+    fecha_inicio_menu: row.fecha_inicio || null,
+    tipo_publicacion: row.tipo_publicacion || null,
+    es_default: row.es_default !== undefined && row.es_default !== null
+      ? parseBoolean(row.es_default)
+      : null,
+    fecha_fin: row.fecha_fin || null,
+    prioridad: row.prioridad !== undefined && row.prioridad !== null
+      ? Number(row.prioridad)
+      : null
+  }));
+};
+
+// Detecta en cuantas sucursales esta activo actualmente un menu.
+// Esto permite advertir impacto transversal al editar publicacion.
+const getActiveBranchesByMenu = async (idMenu) => {
+  const result = await pool.query(
+    `
+      SELECT
+        s.id_sucursal,
+        s.nombre_sucursal,
+        COALESCE(vsi.texto_direccion, '') AS direccion,
+        mv.id_menu_vigente,
+        mv.fecha_inicio,
+        mv.fecha_fin,
+        mv.tipo_publicacion,
+        mv.es_default,
+        mv.prioridad
+      FROM sucursales s
+      LEFT JOIN v_sucursales_info vsi
+        ON vsi.id_sucursal = s.id_sucursal
+      INNER JOIN LATERAL (
+        SELECT
+          r.id_menu_vigente,
+          r.id_menu,
+          r.fecha_inicio,
+          r.fecha_fin,
+          r.tipo_publicacion,
+          r.es_default,
+          r.prioridad
+        FROM public.fn_resolver_menu_publicado(s.id_sucursal) r
+        LIMIT 1
+      ) mv ON true
+      WHERE mv.id_menu = $1
+        AND COALESCE(s.estado, true) = true
+      ORDER BY s.id_sucursal ASC;
+    `,
+    [idMenu]
+  );
+
+  return (result.rows || []).map((row) => ({
+    id_sucursal: Number(row.id_sucursal),
+    nombre_sucursal: row.nombre_sucursal || `Sucursal #${row.id_sucursal}`,
+    direccion: row.direccion || '',
+    id_menu_vigente: Number(row.id_menu_vigente),
+    fecha_inicio_menu: row.fecha_inicio || null,
+    tipo_publicacion: row.tipo_publicacion || null,
+    es_default: row.es_default !== undefined && row.es_default !== null
+      ? parseBoolean(row.es_default)
+      : null,
+    fecha_fin: row.fecha_fin || null,
+    prioridad: row.prioridad !== undefined && row.prioridad !== null
+      ? Number(row.prioridad)
+      : null
+  }));
+};
+
+const buildSharedMenuImpact = ({ idMenu, idSucursal, branches = [] }) => {
+  const normalizedBranches = Array.isArray(branches) ? branches : [];
+  const currentSucursalId = toPositiveInt(idSucursal);
+  const totalBranches = normalizedBranches.length;
+  const isShared = totalBranches > 1;
+
+  const currentBranch = currentSucursalId
+    ? normalizedBranches.find((branch) => Number(branch.id_sucursal) === currentSucursalId) || null
+    : null;
+  const otherBranches = currentSucursalId
+    ? normalizedBranches.filter((branch) => Number(branch.id_sucursal) !== currentSucursalId)
+    : normalizedBranches;
+
+  const warningMessage = isShared
+    ? `${SHARED_MENU_WARNING_PREFIX} Cambios en menu #${idMenu} impactan ${totalBranches} sucursales activas.`
+    : '';
+
+  return {
+    id_menu: Number(idMenu),
+    is_shared: isShared,
+    total_sucursales_activas: totalBranches,
+    sucursal_actual_en_scope: Boolean(currentBranch),
+    sucursal_actual: currentBranch,
+    sucursales_activas: normalizedBranches,
+    sucursales_activas_excluyendo_actual: otherBranches,
+    warning_message: warningMessage
+  };
+};
+
+const getCatalogImageCapabilities = async () => {
+  const [hasProductoArchivoImagen] = await Promise.all([
+    hasColumn('productos', 'id_archivo_imagen_principal')
+  ]);
+
+  return {
+    hasProductoArchivoImagen
+  };
+};
+
+const getMenuPublicationRules = async () => {
+  const result = await pool.query(
+    `
+      SELECT
+        tipo_item,
+        id_categoria_producto,
+        id_tipo_departamento
+      FROM public.menu_publicacion_reglas
+      WHERE COALESCE(estado, true) = true
+        AND incluir_catalogo_admin = true;
+    `
+  );
+
+  const rules = {
+    productCategoryIds: [],
+    recipeDepartmentIds: [],
+    comboDepartmentIds: []
+  };
+
+  for (const row of result.rows || []) {
+    const tipoItem = normalizeItemType(row.tipo_item);
+    if (tipoItem === ITEM_TYPES.PRODUCTO) {
+      const idCategoria = toPositiveInt(row.id_categoria_producto);
+      if (idCategoria) rules.productCategoryIds.push(idCategoria);
+    }
+    if (tipoItem === ITEM_TYPES.RECETA) {
+      const idDepartamento = toPositiveInt(row.id_tipo_departamento);
+      if (idDepartamento) rules.recipeDepartmentIds.push(idDepartamento);
+    }
+    if (tipoItem === ITEM_TYPES.COMBO) {
+      const idDepartamento = toPositiveInt(row.id_tipo_departamento);
+      if (idDepartamento) rules.comboDepartmentIds.push(idDepartamento);
+    }
+  }
+
+  return {
+    productCategoryIds: [...new Set(rules.productCategoryIds)],
+    recipeDepartmentIds: [...new Set(rules.recipeDepartmentIds)],
+    comboDepartmentIds: [...new Set(rules.comboDepartmentIds)]
+  };
+};
+
+const resolveSharedMenuImpact = async ({ idMenu, idSucursal }) => {
+  const safeMenuId = toPositiveInt(idMenu);
+  if (!safeMenuId) {
+    return {
+      id_menu: null,
+      is_shared: false,
+      total_sucursales_activas: 0,
+      sucursal_actual_en_scope: false,
+      sucursal_actual: null,
+      sucursales_activas: [],
+      sucursales_activas_excluyendo_actual: [],
+      warning_message: ''
+    };
+  }
+
+  const branches = await getActiveBranchesByMenu(safeMenuId);
+  return buildSharedMenuImpact({
+    idMenu: safeMenuId,
+    idSucursal,
+    branches
+  });
+};
+
+const fetchBaseCatalogByMenu = async (idMenu, idSucursal, publicationRules, imageCapabilities = {}) => {
+  const productCategoryIds = Array.isArray(publicationRules?.productCategoryIds)
+    ? publicationRules.productCategoryIds
+    : [];
+  const recipeDepartmentIds = Array.isArray(publicationRules?.recipeDepartmentIds)
+    ? publicationRules.recipeDepartmentIds
+    : [];
+  const comboDepartmentIds = Array.isArray(publicationRules?.comboDepartmentIds)
+    ? publicationRules.comboDepartmentIds
+    : [];
+  const hasProductoArchivoImagen = Boolean(imageCapabilities?.hasProductoArchivoImagen);
+  const productImageSelect = hasProductoArchivoImagen
+    ? 'a_producto.url_publica::text AS url_imagen_publica'
+    : 'NULL::text AS url_imagen_publica';
+  const productImageJoin = hasProductoArchivoImagen
+    ? `
+      LEFT JOIN archivos a_producto
+        ON a_producto.id_archivo = p.id_archivo_imagen_principal
+       AND (a_producto.estado = true OR a_producto.estado IS NULL)
+    `
+    : '';
+
+  const result = await pool.query(
+    `
+      SELECT
+        '${ITEM_TYPES.RECETA}'::text AS tipo_item,
+        r.id_receta::int AS id_item_origen,
+        r.nombre_receta::text AS nombre_item,
+        COALESCE(r.estado, true) AS estado_item,
+        r.precio::numeric AS precio_base,
+        a_receta.url_publica::text AS url_imagen_publica
+      FROM recetas r
+      LEFT JOIN archivos a_receta
+        ON a_receta.id_archivo = r.id_archivo
+       AND (a_receta.estado = true OR a_receta.estado IS NULL)
+      WHERE COALESCE(r.estado, true) = true
+        AND r.id_tipo_departamento IS NOT NULL
+        AND r.id_tipo_departamento = ANY($2::int[])
+
+      UNION ALL
+
+      SELECT
+        '${ITEM_TYPES.COMBO}'::text AS tipo_item,
+        c.id_combo::int AS id_item_origen,
+        COALESCE(NULLIF(c.nombre_combo, ''), NULLIF(c.descripcion, ''), CONCAT('Combo #', c.id_combo::text))::text AS nombre_item,
+        COALESCE(c.estado, true) AS estado_item,
+        c.precio::numeric AS precio_base,
+        a_combo.url_publica::text AS url_imagen_publica
+      FROM combos c
+      LEFT JOIN archivos a_combo
+        ON a_combo.id_archivo = c.id_archivo
+       AND (a_combo.estado = true OR a_combo.estado IS NULL)
+      WHERE COALESCE(c.estado, true) = true
+        AND c.id_tipo_departamento = ANY($3::int[])
+
+      UNION ALL
+
+      SELECT DISTINCT
+        '${ITEM_TYPES.PRODUCTO}'::text AS tipo_item,
+        p.id_producto::int AS id_item_origen,
+        p.nombre_producto::text AS nombre_item,
+        COALESCE(p.estado, true) AS estado_item,
+        p.precio::numeric AS precio_base,
+        ${productImageSelect}
+      FROM productos p
+      LEFT JOIN categorias_productos cp
+        ON cp.id_categoria_producto = p.id_categoria_producto
+      INNER JOIN public.productos_almacenes pa
+        ON pa.id_producto = p.id_producto
+       AND COALESCE(pa.estado, true) = true
+      INNER JOIN almacenes ap
+        ON ap.id_almacen = pa.id_almacen
+       AND COALESCE(ap.estado, true) = true
+      ${productImageJoin}
+      WHERE COALESCE(cp.estado, true) = true
+        AND ap.id_sucursal = $5
+        AND (
+          p.id_categoria_producto = ANY($4::int[])
+          OR EXISTS (
+            SELECT 1
+            FROM detalle_menu dm_catalogo
+            WHERE dm_catalogo.id_menu = $1
+              AND dm_catalogo.id_producto = p.id_producto
+              AND COALESCE(dm_catalogo.estado, true) = true
+          )
+        )
+
+      ORDER BY tipo_item, nombre_item ASC;
+    `,
+    [
+      idMenu,
+      recipeDepartmentIds,
+      comboDepartmentIds,
+      productCategoryIds,
+      idSucursal
+    ]
+  );
+
+  return result.rows || [];
+};
+
+const fetchDetalleRowsByMenu = async ({ idMenu, idSucursal, capabilities }) => {
+  const selectIdReceta = capabilities.hasIdReceta ? 'dm.id_receta' : 'NULL::integer AS id_receta';
+  const selectIdCombo = capabilities.hasIdCombo ? 'dm.id_combo' : 'NULL::integer AS id_combo';
+  const selectVisible = capabilities.hasVisible ? 'COALESCE(dm.visible, true) AS visible' : 'true AS visible';
+  const selectPrecioPublico = capabilities.hasPrecioPublico ? 'dm.precio_publico' : 'NULL::numeric AS precio_publico';
+  const selectOrden = capabilities.hasOrden ? 'dm.orden' : 'NULL::integer AS orden';
+
+  const result = await pool.query(
+    `
+      SELECT
+        dm.id_detalle_menu,
+        dm.id_menu,
+        dm.id_producto,
+        ${selectIdReceta},
+        ${selectIdCombo},
+        ${selectVisible},
+        ${selectPrecioPublico},
+        ${selectOrden},
+        COALESCE(dm.estado, true) AS estado
+      FROM detalle_menu dm
+      LEFT JOIN LATERAL (
+        SELECT MIN(pm.id_producto_maestro)::int AS id_producto_maestro
+        FROM public.productos_mapeo_maestro pm
+        WHERE pm.id_producto_legacy = dm.id_producto
+           OR pm.id_producto_maestro = dm.id_producto
+      ) pmr ON dm.id_producto IS NOT NULL
+      LEFT JOIN public.productos p
+        ON p.id_producto = COALESCE(pmr.id_producto_maestro, dm.id_producto)
+      LEFT JOIN LATERAL (
+        SELECT a.id_sucursal
+        FROM public.productos_almacenes pa
+        INNER JOIN public.almacenes a
+          ON a.id_almacen = pa.id_almacen
+         AND COALESCE(a.estado, true) = true
+        WHERE pa.id_producto = p.id_producto
+          AND COALESCE(pa.estado, true) = true
+          AND a.id_sucursal = $2
+        ORDER BY pa.id_almacen ASC
+        LIMIT 1
+      ) ap ON dm.id_producto IS NOT NULL
+      WHERE dm.id_menu = $1
+        AND COALESCE(dm.estado, true) = true
+        AND (
+          dm.id_producto IS NULL
+          OR ap.id_sucursal = $2
+        )
+      ORDER BY dm.id_detalle_menu ASC;
+    `,
+    [idMenu, idSucursal]
+  );
+
+  return result.rows || [];
+};
+
+const resolveDetailRowKey = (row) => {
+  if (Number(row?.id_producto || 0) > 0) {
+    return buildItemKey(ITEM_TYPES.PRODUCTO, Number(row.id_producto));
+  }
+  if (Number(row?.id_receta || 0) > 0) {
+    return buildItemKey(ITEM_TYPES.RECETA, Number(row.id_receta));
+  }
+  if (Number(row?.id_combo || 0) > 0) {
+    return buildItemKey(ITEM_TYPES.COMBO, Number(row.id_combo));
+  }
+  return '';
+};
+
+const buildDetailRowsByKey = (rows) => {
+  const map = new Map();
+  for (const row of Array.isArray(rows) ? rows : []) {
+    const key = resolveDetailRowKey(row);
+    if (!key) continue;
+    if (!map.has(key)) map.set(key, []);
+    map.get(key).push(row);
+  }
+  return map;
+};
+
+const mapCatalogForAdmin = ({ baseRows, detailRowsByKey }) => {
+  const items = [];
+  const duplicateKeys = [];
+
+  for (const row of Array.isArray(baseRows) ? baseRows : []) {
+    const tipoItem = normalizeItemType(row.tipo_item);
+    const idItemOrigen = Number(row.id_item_origen || 0);
+    if (!tipoItem || idItemOrigen <= 0) continue;
+
+    const key = buildItemKey(tipoItem, idItemOrigen);
+    const detailRows = detailRowsByKey.get(key) || [];
+    if (detailRows.length > 1) duplicateKeys.push(key);
+    const detail = detailRows[0] || null;
+
+    items.push({
+      item_key: key,
+      tipo_item: tipoItem,
+      id_item_origen: idItemOrigen,
+      nombre_item: row.nombre_item || `${tipoItem} #${idItemOrigen}`,
+      categoria_nombre: row.categoria_nombre || tipoItem,
+      estado_item: parseBoolean(row.estado_item),
+      // Conserva URL de imagen para panel tecnico y validaciones de publicacion.
+      url_imagen_publica: String(row?.url_imagen_publica || '').trim(),
+      precio_base: row.precio_base !== null ? Number(row.precio_base) : null,
+      id_detalle_menu: detail?.id_detalle_menu ? Number(detail.id_detalle_menu) : null,
+      publicado: Boolean(detail),
+      visible: detail ? parseBoolean(detail.visible) : false,
+      precio_publico: detail?.precio_publico !== null && detail?.precio_publico !== undefined
+        ? Number(detail.precio_publico)
+        : null,
+      orden: detail?.orden !== null && detail?.orden !== undefined
+        ? Number(detail.orden)
+        : null
+    });
+  }
+
+  return {
+    items,
+    duplicateKeys
+  };
+};
+
+const mapPreviewItemFromAdminCatalog = (item) => {
+  const publicPrice = item?.precio_publico !== null && item?.precio_publico !== undefined
+    ? Number(item.precio_publico)
+    : null;
+  const basePrice = item?.precio_base !== null && item?.precio_base !== undefined
+    ? Number(item.precio_base)
+    : null;
+  const finalPrice = publicPrice ?? basePrice;
+  const hasValidPrice = Number.isFinite(finalPrice) && finalPrice >= 0;
+  const isAvailable = Boolean(item?.estado_item) && hasValidPrice;
+
+  return {
+    id_detalle_menu: item?.id_detalle_menu || null,
+    tipo_item: item?.tipo_item || 'ITEM',
+    id_item_base: Number(item?.id_item_origen || 0) || null,
+    nombre: item?.nombre_item || 'Item sin nombre',
+    imagen_url: String(item?.url_imagen_publica || '').trim(),
+    categoria: {
+      id_tipo_departamento: null,
+      nombre: item?.categoria_nombre || item?.tipo_item || 'Sin categoria'
+    },
+    precio: {
+      base: Number.isFinite(basePrice) ? basePrice : null,
+      public: Number.isFinite(publicPrice) ? publicPrice : null,
+      final: hasValidPrice ? Number(finalPrice) : null
+    },
+    disponibilidad: {
+      available: isAvailable,
+      reasonCode: isAvailable ? null : 'NO_DISPONIBLE_ADMIN',
+      message: isAvailable ? 'Disponible' : 'No disponible'
+    },
+    visible: Boolean(item?.visible),
+    orden: Number(item?.orden || 0)
+  };
+};
+
+const normalizeDraftItems = (items) => {
+  if (!Array.isArray(items) || items.length === 0) {
+    return { ok: false, message: 'Debes enviar al menos un item para guardar publicaciÃƒÂ³n.', data: [] };
+  }
+
+  const normalized = [];
+  const seenKeys = new Set();
+
+  for (const raw of items) {
+    const tipoItem = normalizeItemType(raw?.tipo_item);
+    const idItemOrigen = toPositiveInt(raw?.id_item_origen);
+    if (!tipoItem || !idItemOrigen) {
+      return { ok: false, message: 'Cada item requiere tipo_item vÃƒÂ¡lido e id_item_origen positivo.', data: [] };
+    }
+
+    const visible = parseBoolean(raw?.visible);
+    const precioPublico = toNullableMoney(raw?.precio_publico);
+    if (Number.isNaN(precioPublico)) {
+      return { ok: false, message: `precio_publico invÃƒÂ¡lido para ${tipoItem} #${idItemOrigen}.`, data: [] };
+    }
+
+    const orden = toNullablePositiveInt(raw?.orden);
+    if (Number.isNaN(orden)) {
+      return { ok: false, message: `orden invÃƒÂ¡lido para ${tipoItem} #${idItemOrigen}.`, data: [] };
+    }
+
+    const key = buildItemKey(tipoItem, idItemOrigen);
+    if (seenKeys.has(key)) {
+      return { ok: false, message: `No se permiten items duplicados en payload: ${key}.`, data: [] };
+    }
+    seenKeys.add(key);
+
+    normalized.push({
+      key,
+      tipo_item: tipoItem,
+      id_item_origen: idItemOrigen,
+      id_detalle_menu: toPositiveInt(raw?.id_detalle_menu),
+      visible,
+      precio_publico: precioPublico,
+      orden
+    });
+  }
+
+  return { ok: true, data: normalized };
+};
+
+const fetchDraftStateByType = async ({ idMenu, idSucursal, normalizedItems }) => {
+  const recipeIds = [];
+  const comboIds = [];
+  const productIds = [];
+
+  for (const item of normalizedItems) {
+    if (item.tipo_item === ITEM_TYPES.RECETA) recipeIds.push(item.id_item_origen);
+    if (item.tipo_item === ITEM_TYPES.COMBO) comboIds.push(item.id_item_origen);
+    if (item.tipo_item === ITEM_TYPES.PRODUCTO) productIds.push(item.id_item_origen);
+  }
+
+  const resultMap = new Map();
+
+  if (recipeIds.length > 0) {
+    const result = await pool.query(
+      `
+        SELECT id_receta AS id_item_origen, COALESCE(estado, true) AS estado_item, precio
+        FROM recetas
+        WHERE id_receta = ANY($1::int[]);
+      `,
+      [[...new Set(recipeIds)]]
+    );
+    for (const row of result.rows || []) {
+      resultMap.set(buildItemKey(ITEM_TYPES.RECETA, Number(row.id_item_origen)), {
+        estado_item: parseBoolean(row.estado_item),
+        precio_base: row.precio !== null ? Number(row.precio) : null
+      });
+    }
+  }
+
+  if (comboIds.length > 0) {
+    const result = await pool.query(
+      `
+        SELECT id_combo AS id_item_origen, COALESCE(estado, true) AS estado_item, precio
+        FROM combos
+        WHERE id_combo = ANY($1::int[]);
+      `,
+      [[...new Set(comboIds)]]
+    );
+    for (const row of result.rows || []) {
+      resultMap.set(buildItemKey(ITEM_TYPES.COMBO, Number(row.id_item_origen)), {
+        estado_item: parseBoolean(row.estado_item),
+        precio_base: row.precio !== null ? Number(row.precio) : null
+      });
+    }
+  }
+
+  if (productIds.length > 0) {
+    const result = await pool.query(
+      `
+        SELECT
+          p.id_producto AS id_item_origen,
+          COALESCE(p.estado, true) AS estado_item,
+          p.precio
+        FROM public.productos p
+        INNER JOIN public.productos_almacenes pa
+          ON pa.id_producto = p.id_producto
+         AND COALESCE(pa.estado, true) = true
+        INNER JOIN public.almacenes ap
+          ON ap.id_almacen = pa.id_almacen
+         AND COALESCE(ap.estado, true) = true
+        WHERE p.id_producto = ANY($1::int[])
+          AND ap.id_sucursal = $2;
+      `,
+      [[...new Set(productIds)], idSucursal]
+    );
+    for (const row of result.rows || []) {
+      resultMap.set(buildItemKey(ITEM_TYPES.PRODUCTO, Number(row.id_item_origen)), {
+        estado_item: parseBoolean(row.estado_item),
+        precio_base: row.precio !== null ? Number(row.precio) : null
+      });
+    }
+  }
+
+  return resultMap;
+};
+
+const fetchCrossBranchDetalleRowsByMenu = async ({ idMenu, idSucursal }) => {
+  const safeMenuId = toPositiveInt(idMenu);
+  const safeSucursalId = toPositiveInt(idSucursal);
+  if (!safeMenuId || !safeSucursalId) return [];
+
+  const result = await pool.query(
+    `
+      SELECT
+        dm.id_detalle_menu,
+        dm.id_producto,
+        p.nombre_producto,
+        ap.id_sucursal AS id_sucursal_producto
+      FROM detalle_menu dm
+      INNER JOIN LATERAL (
+        SELECT MIN(pm.id_producto_maestro)::int AS id_producto_maestro
+        FROM public.productos_mapeo_maestro pm
+        WHERE pm.id_producto_legacy = dm.id_producto
+           OR pm.id_producto_maestro = dm.id_producto
+      ) pmr ON dm.id_producto IS NOT NULL
+      INNER JOIN productos p
+        ON p.id_producto = COALESCE(pmr.id_producto_maestro, dm.id_producto)
+      INNER JOIN public.productos_almacenes pa
+        ON pa.id_producto = p.id_producto
+       AND COALESCE(pa.estado, true) = true
+      INNER JOIN almacenes ap
+        ON ap.id_almacen = pa.id_almacen
+       AND COALESCE(ap.estado, true) = true
+      WHERE dm.id_menu = $1
+        AND COALESCE(dm.estado, true) = true
+        AND ap.id_sucursal <> $2
+      ORDER BY dm.id_detalle_menu ASC;
+    `,
+    [safeMenuId, safeSucursalId]
+  );
+
+  return result.rows || [];
+};
+
+// AM: Agrupa actualizaciones para evitar un round-trip SQL por cada item.
+const updateDetalleRowsBatch = async ({ client, entries, capabilities }) => {
+  if (!Array.isArray(entries) || entries.length === 0) return;
+
+  const updates = capabilities.hasVisible
+    ? ['visible = input.visible', 'estado = true']
+    : ['estado = input.visible'];
+
+  if (capabilities.hasPrecioPublico) {
+    updates.push('precio_publico = input.precio_publico');
+  }
+  if (capabilities.hasOrden) {
+    updates.push('orden = COALESCE(input.orden, dm.orden)');
+  }
+
+  const payload = entries.map(({ rowId, item }) => ({
+    id_detalle_menu: rowId,
+    visible: item.visible,
+    precio_publico: item.precio_publico,
+    orden: item.orden
+  }));
+
+  await client.query(
+    `
+      WITH input AS (
+        SELECT *
+        FROM jsonb_to_recordset($1::jsonb) AS value(
+          id_detalle_menu integer,
+          visible boolean,
+          precio_publico numeric,
+          orden integer
+        )
+      )
+      UPDATE detalle_menu dm
+      SET ${updates.join(', ')}
+      FROM input
+      WHERE dm.id_detalle_menu = input.id_detalle_menu;
+    `,
+    [JSON.stringify(payload)]
+  );
+};
+
+// AM: Inserta publicaciones nuevas en una sola operacion SQL.
+const insertDetalleRowsBatch = async ({ client, idMenu, items, capabilities }) => {
+  if (!Array.isArray(items) || items.length === 0) return;
+
+  const columns = ['id_menu', 'estado', 'id_producto'];
+  const selectValues = ['$2', 'true', 'input.id_producto'];
+
+  if (capabilities.hasIdReceta) {
+    columns.push('id_receta');
+    selectValues.push('input.id_receta');
+  }
+  if (capabilities.hasIdCombo) {
+    columns.push('id_combo');
+    selectValues.push('input.id_combo');
+  }
+  if (capabilities.hasVisible) {
+    columns.push('visible');
+    selectValues.push('input.visible');
+  }
+  if (capabilities.hasPrecioPublico) {
+    columns.push('precio_publico');
+    selectValues.push('input.precio_publico');
+  }
+  if (capabilities.hasOrden) {
+    columns.push('orden');
+    selectValues.push('input.orden');
+  }
+
+  const payload = items.map((item) => ({
+    id_producto: item.tipo_item === ITEM_TYPES.PRODUCTO ? item.id_item_origen : null,
+    id_receta: item.tipo_item === ITEM_TYPES.RECETA ? item.id_item_origen : null,
+    id_combo: item.tipo_item === ITEM_TYPES.COMBO ? item.id_item_origen : null,
+    visible: item.visible,
+    precio_publico: item.precio_publico,
+    orden: item.orden
+  }));
+
+  await client.query(
+    `
+      WITH input AS (
+        SELECT *
+        FROM jsonb_to_recordset($1::jsonb) AS value(
+          id_producto integer,
+          id_receta integer,
+          id_combo integer,
+          visible boolean,
+          precio_publico numeric,
+          orden integer
+        )
+      )
+      INSERT INTO detalle_menu (${columns.join(', ')})
+      SELECT ${selectValues.join(', ')}
+      FROM input;
+    `,
+    [JSON.stringify(payload), idMenu]
+  );
+};
+
+const getVisibleCountByMenu = async ({ idMenu, idSucursal, capabilities, client }) => {
+  const countVisibleExpr = capabilities.hasVisible ? 'AND COALESCE(visible, true) = true' : '';
+  const result = await client.query(
+    `
+      SELECT COUNT(*)::int AS total
+      FROM detalle_menu dm
+      LEFT JOIN LATERAL (
+        SELECT MIN(pm.id_producto_maestro)::int AS id_producto_maestro
+        FROM public.productos_mapeo_maestro pm
+        WHERE pm.id_producto_legacy = dm.id_producto
+           OR pm.id_producto_maestro = dm.id_producto
+      ) pmr ON dm.id_producto IS NOT NULL
+      LEFT JOIN public.productos p
+        ON p.id_producto = COALESCE(pmr.id_producto_maestro, dm.id_producto)
+      LEFT JOIN LATERAL (
+        SELECT a.id_sucursal
+        FROM public.productos_almacenes pa
+        INNER JOIN public.almacenes a
+          ON a.id_almacen = pa.id_almacen
+         AND COALESCE(a.estado, true) = true
+        WHERE pa.id_producto = p.id_producto
+          AND COALESCE(pa.estado, true) = true
+          AND a.id_sucursal = $2
+        ORDER BY pa.id_almacen ASC
+        LIMIT 1
+      ) ap ON dm.id_producto IS NOT NULL
+      WHERE dm.id_menu = $1
+        AND COALESCE(dm.estado, true) = true
+        AND (
+          dm.id_producto IS NULL
+          OR ap.id_sucursal = $2
+        )
+        ${countVisibleExpr};
+    `,
+    [idMenu, idSucursal]
+  );
+  return Number(result.rows?.[0]?.total || 0);
+};
+
+const normalizeCategoryOrderItems = (items) => {
+  if (!Array.isArray(items) || items.length === 0) {
+    return { ok: false, message: 'items debe ser un array no vacio.', data: [] };
+  }
+
+  const ids = new Set();
+  const orders = new Set();
+  const normalized = [];
+  const allowedKeys = new Set(['id_menu_publicacion_regla', 'orden']);
+
+  for (const raw of items) {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+      return { ok: false, message: 'Cada item debe ser un objeto.', data: [] };
+    }
+    if (Object.keys(raw).some((key) => !allowedKeys.has(key))) {
+      return { ok: false, message: 'items contiene campos no permitidos.', data: [] };
+    }
+
+    const idRegla = toStrictPositiveInt(raw.id_menu_publicacion_regla);
+    const orden = toStrictPositiveInt(raw.orden);
+    if (!idRegla || !orden) {
+      return { ok: false, message: 'Cada item requiere id_menu_publicacion_regla y orden enteros positivos.', data: [] };
+    }
+    if (ids.has(idRegla)) return { ok: false, message: 'No se permiten reglas duplicadas.', data: [] };
+    if (orders.has(orden)) return { ok: false, message: 'No se permiten ordenes duplicados.', data: [] };
+
+    ids.add(idRegla);
+    orders.add(orden);
+    normalized.push({ id_menu_publicacion_regla: idRegla, orden });
+  }
+
+  return { ok: true, data: normalized };
+};
+
+const getCategoryOrderRows = async ({ idMenu, idSucursal, db = pool }) => {
+  const result = await db.query(
+    `
+      WITH reglas AS (
+        SELECT
+          mpr.id_menu_publicacion_regla,
+          mpr.tipo_item,
+          mpr.id_categoria_producto,
+          mpr.id_tipo_departamento,
+          COALESCE(NULLIF(TRIM(mpr.nombre_publico), ''), cp.nombre_categoria, td.nombre_departamento, mpr.alias_normalizado) AS nombre_publico,
+          COALESCE(mpr.orden, 2147483647)::int AS orden,
+          COALESCE(mpr.estado, true) AS estado_regla,
+          COALESCE(cp.estado, td.estado, true) AS estado_origen
+        FROM public.menu_publicacion_reglas mpr
+        LEFT JOIN public.categorias_productos cp
+          ON cp.id_categoria_producto = mpr.id_categoria_producto
+        LEFT JOIN public.tipo_departamento td
+          ON td.id_tipo_departamento = mpr.id_tipo_departamento
+        WHERE COALESCE(mpr.incluir_catalogo_admin, true) = true
+      ),
+      publicaciones AS (
+        SELECT
+          r.id_menu_publicacion_regla,
+          COUNT(dm.id_detalle_menu)::int AS cantidad_contenido,
+          COALESCE(MIN(dm.orden), r.orden)::int AS orden_detalle
+        FROM reglas r
+        LEFT JOIN public.detalle_menu dm
+          ON dm.id_menu = $1
+         AND COALESCE(dm.estado, true) = true
+         AND COALESCE(dm.visible, true) = true
+        LEFT JOIN public.productos p
+          ON r.tipo_item = 'PRODUCTO'
+         AND dm.id_producto IS NOT NULL
+         AND p.id_producto = dm.id_producto
+         AND p.id_categoria_producto = r.id_categoria_producto
+         AND COALESCE(p.estado, true) = true
+        LEFT JOIN LATERAL (
+          SELECT 1 AS ok
+          FROM public.productos_almacenes pa
+          INNER JOIN public.almacenes a
+            ON a.id_almacen = pa.id_almacen
+           AND a.id_sucursal = $2
+           AND COALESCE(a.estado, true) = true
+          WHERE pa.id_producto = p.id_producto
+            AND COALESCE(pa.estado, true) = true
+          LIMIT 1
+        ) producto_sucursal ON r.tipo_item = 'PRODUCTO'
+        LEFT JOIN public.recetas rec
+          ON r.tipo_item = 'RECETA'
+         AND dm.id_receta IS NOT NULL
+         AND rec.id_receta = dm.id_receta
+         AND rec.id_tipo_departamento = r.id_tipo_departamento
+         AND COALESCE(rec.estado, true) = true
+        LEFT JOIN public.combos combo
+          ON r.tipo_item = 'COMBO'
+         AND dm.id_combo IS NOT NULL
+         AND combo.id_combo = dm.id_combo
+         AND combo.id_tipo_departamento = r.id_tipo_departamento
+         AND COALESCE(combo.estado, true) = true
+        WHERE
+          dm.id_detalle_menu IS NULL
+          OR (
+            (r.tipo_item = 'PRODUCTO' AND p.id_producto IS NOT NULL AND producto_sucursal.ok = 1)
+            OR (r.tipo_item = 'RECETA' AND rec.id_receta IS NOT NULL)
+            OR (r.tipo_item = 'COMBO' AND combo.id_combo IS NOT NULL)
+          )
+        GROUP BY r.id_menu_publicacion_regla, r.orden
+      )
+      SELECT
+        r.id_menu_publicacion_regla,
+        r.tipo_item,
+        r.nombre_publico,
+        COALESCE(p.orden_detalle, r.orden)::int AS orden,
+        r.estado_regla AS estado,
+        COALESCE(p.cantidad_contenido, 0)::int AS cantidad_contenido,
+        CASE
+          WHEN r.estado_regla = false OR COALESCE(r.estado_origen, true) = false THEN 'INACTIVO'
+          WHEN COALESCE(p.cantidad_contenido, 0) = 0 THEN 'SIN_CONTENIDO'
+          ELSE 'VISIBLE'
+        END AS estado_visibilidad
+      FROM reglas r
+      LEFT JOIN publicaciones p
+        ON p.id_menu_publicacion_regla = r.id_menu_publicacion_regla
+      WHERE r.estado_regla = true
+      ORDER BY COALESCE(p.orden_detalle, r.orden, 2147483647), r.nombre_publico ASC, r.id_menu_publicacion_regla ASC;
+    `,
+    [idMenu, idSucursal]
+  );
+
+  return (result.rows || []).map((row) => ({
+    id_menu_publicacion_regla: Number(row.id_menu_publicacion_regla),
+    tipo_item: row.tipo_item,
+    nombre_publico: row.nombre_publico || 'Categoria',
+    orden: Number(row.orden || 0),
+    estado: parseBoolean(row.estado),
+    cantidad_contenido: Number(row.cantidad_contenido || 0),
+    estado_visibilidad: row.estado_visibilidad || 'SIN_CONTENIDO'
+  }));
+};
+
+const updateDetailOrderForCategories = async ({ client, idMenu, idSucursal, items }) => {
+  await client.query(
+    `
+      WITH input AS (
+        SELECT *
+        FROM jsonb_to_recordset($1::jsonb) AS value(
+          id_menu_publicacion_regla integer,
+          orden integer
+        )
+      ),
+      reglas AS (
+        SELECT
+          i.orden AS categoria_orden,
+          mpr.tipo_item,
+          mpr.id_categoria_producto,
+          mpr.id_tipo_departamento
+        FROM input i
+        INNER JOIN public.menu_publicacion_reglas mpr
+          ON mpr.id_menu_publicacion_regla = i.id_menu_publicacion_regla
+      ),
+      objetivos AS (
+        SELECT
+          dm.id_detalle_menu,
+          (r.categoria_orden * 1000)
+            + ROW_NUMBER() OVER (
+              PARTITION BY r.categoria_orden
+              ORDER BY COALESCE(dm.orden, 2147483647), dm.id_detalle_menu
+            ) AS nuevo_orden
+        FROM reglas r
+        INNER JOIN public.detalle_menu dm
+          ON dm.id_menu = $2
+         AND COALESCE(dm.estado, true) = true
+        LEFT JOIN public.productos p
+          ON r.tipo_item = 'PRODUCTO'
+         AND dm.id_producto IS NOT NULL
+         AND p.id_producto = dm.id_producto
+         AND p.id_categoria_producto = r.id_categoria_producto
+        LEFT JOIN LATERAL (
+          SELECT 1 AS ok
+          FROM public.productos_almacenes pa
+          INNER JOIN public.almacenes a
+            ON a.id_almacen = pa.id_almacen
+           AND a.id_sucursal = $3
+           AND COALESCE(a.estado, true) = true
+          WHERE pa.id_producto = p.id_producto
+            AND COALESCE(pa.estado, true) = true
+          LIMIT 1
+        ) producto_sucursal ON r.tipo_item = 'PRODUCTO'
+        LEFT JOIN public.recetas rec
+          ON r.tipo_item = 'RECETA'
+         AND dm.id_receta IS NOT NULL
+         AND rec.id_receta = dm.id_receta
+         AND rec.id_tipo_departamento = r.id_tipo_departamento
+        LEFT JOIN public.combos combo
+          ON r.tipo_item = 'COMBO'
+         AND dm.id_combo IS NOT NULL
+         AND combo.id_combo = dm.id_combo
+         AND combo.id_tipo_departamento = r.id_tipo_departamento
+        WHERE
+          (r.tipo_item = 'PRODUCTO' AND p.id_producto IS NOT NULL AND producto_sucursal.ok = 1)
+          OR (r.tipo_item = 'RECETA' AND rec.id_receta IS NOT NULL)
+          OR (r.tipo_item = 'COMBO' AND combo.id_combo IS NOT NULL)
+      )
+      UPDATE public.detalle_menu dm
+      SET orden = objetivos.nuevo_orden
+      FROM objetivos
+      WHERE dm.id_detalle_menu = objetivos.id_detalle_menu;
+    `,
+    [JSON.stringify(items), idMenu, idSucursal]
+  );
+};
+
+// Lista sucursales operativas para el selector de publicaciÃƒÂ³n.
+router.get('/sucursales', checkPermission(MENU_PUBLICACION_VIEW_PERMISSIONS), async (_req, res) => {
+  try {
+    const rows = await getBranchesForPublication();
+    return res.status(200).json({ ok: true, data: rows });
+  } catch (error) {
+    console.error('admin_menu_publicacion /sucursales:', error.message);
+    return res.status(500).json({ ok: false, message: 'No se pudieron cargar sucursales.' });
+  }
+});
+
+// Retorna el catÃƒÂ¡logo unificado con estado actual de publicaciÃƒÂ³n por sucursal.
+// Lista menus disponibles para programar vigencias por sucursal.
+router.get('/menus', checkPermission(MENU_PUBLICACION_VIEW_PERMISSIONS), async (_req, res) => {
+  try {
+    const rows = await getMenusForProgramming();
+    return res.status(200).json({ ok: true, data: rows });
+  } catch (error) {
+    console.error('admin_menu_publicacion /menus:', error.message);
+    return res.status(500).json({ ok: false, message: 'No se pudieron cargar los menus disponibles.' });
+  }
+});
+
+// AM: lee configuracion global del carrusel hero usada por menu publico.
+router.get('/carrusel-config', checkPermission(MENU_PUBLICACION_VIEW_PERMISSIONS), async (_req, res) => {
+  try {
+    const config = await getPublicMenuHeroCarouselConfig();
+    return res.status(200).json({ ok: true, data: config });
+  } catch (error) {
+    console.error('admin_menu_publicacion GET /carrusel-config:', error.message);
+    return res.status(500).json({ ok: false, message: 'No se pudo cargar la configuracion del carrusel.' });
+  }
+});
+
+// AM: guarda configuracion global del carrusel hero para todas las sucursales.
+router.put('/carrusel-config', checkPermission(MENU_PUBLICACION_SAVE_PERMISSIONS), async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const payload = req.body;
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+      return res.status(400).json({ ok: false, message: 'Payload invalido para guardar el carrusel.' });
+    }
+
+    await client.query('BEGIN');
+    const config = await savePublicMenuHeroCarouselConfig({
+      client,
+      config: payload
+    });
+    await client.query('COMMIT');
+
+    return res.status(200).json({
+      ok: true,
+      message: 'Carrusel global guardado correctamente.',
+      data: config
+    });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    console.error('admin_menu_publicacion PUT /carrusel-config:', error.message);
+    const safeStatus = Number.isInteger(error?.status) && error.status >= 400 && error.status < 500
+      ? error.status
+      : 500;
+    return res.status(safeStatus).json({
+      ok: false,
+      message: safeStatus < 500
+        ? String(error?.message || 'No se pudo guardar la configuracion del carrusel.')
+        : 'No se pudo guardar la configuracion del carrusel.'
+    });
+  } finally {
+    client.release();
+  }
+});
+
+// Crea un menu nuevo para temporadas desde el panel admin sin SQL manual.
+router.post('/menus', checkPermission(MENU_TEMPORADA_CREATE_PERMISSIONS), async (req, res) => {
+  try {
+    const nombreMenu = String(req.body?.nombre_menu ?? '').replace(/\s+/g, ' ').trim();
+    const descripcionRaw = String(req.body?.descripcion ?? '').trim();
+    const descripcion = descripcionRaw || null;
+    const idUsuario = getAuthenticatedUserId(req) || null;
+    if (!idUsuario) {
+      return res.status(401).json({ ok: false, message: 'No se pudo identificar el usuario autenticado para crear el menu.' });
+    }
+
+    if (!nombreMenu || nombreMenu.length < 3) {
+      return res.status(400).json({ ok: false, message: 'nombre_menu es obligatorio y debe tener al menos 3 caracteres.' });
+    }
+
+    if (nombreMenu.length > 120) {
+      return res.status(400).json({ ok: false, message: 'nombre_menu supera el maximo permitido (120).' });
+    }
+
+    if (descripcion && descripcion.length > 250) {
+      return res.status(400).json({ ok: false, message: 'descripcion supera el maximo permitido (250).' });
+    }
+
+    const duplicate = await pool.query(
+      `
+        SELECT id_menu
+        FROM menu
+        WHERE LOWER(TRIM(nombre_menu)) = LOWER(TRIM($1))
+          AND COALESCE(estado, true) = true
+        LIMIT 1;
+      `,
+      [nombreMenu]
+    );
+
+    if (duplicate.rowCount > 0) {
+      return res.status(409).json({ ok: false, message: 'Ya existe un menu activo con ese nombre.' });
+    }
+
+    const created = await pool.query(
+      `
+        INSERT INTO menu (
+          nombre_menu,
+          descripcion,
+          estado,
+          id_usuario
+        ) VALUES ($1, $2, true, $3)
+        RETURNING id_menu, nombre_menu, COALESCE(descripcion, '') AS descripcion, COALESCE(estado, true) AS estado, fecha_creacion;
+      `,
+      [nombreMenu, descripcion, idUsuario]
+    );
+
+    const row = created.rows?.[0] || null;
+    if (!row) {
+      throw new Error('No se recibio el menu creado.');
+    }
+
+    return res.status(201).json({
+      ok: true,
+      message: `Menu #${row.id_menu} creado correctamente.`,
+      data: {
+        menu: {
+          id_menu: Number(row.id_menu),
+          nombre_menu: row.nombre_menu || `Menu #${row.id_menu}`,
+          descripcion: row.descripcion || '',
+          estado: parseBoolean(row.estado),
+          fecha_creacion: row.fecha_creacion || null
+        }
+      }
+    });
+  } catch (error) {
+    console.error('admin_menu_publicacion POST /menus:', error.message);
+    return res.status(500).json({ ok: false, message: 'No se pudo crear el menu.' });
+  }
+});
+
+router.put('/menus/:id_menu', checkPermission(MENU_PUBLICACION_SAVE_PERMISSIONS), async (req, res) => {
+  try {
+    const idMenu = toPositiveInt(req.params?.id_menu);
+    const nombreMenu = String(req.body?.nombre_menu ?? '').replace(/\s+/g, ' ').trim();
+    const descripcionRaw = String(req.body?.descripcion ?? '').trim();
+    const descripcion = descripcionRaw || null;
+
+    if (!idMenu) {
+      return res.status(400).json({ ok: false, message: 'id_menu es obligatorio.' });
+    }
+
+    if (!nombreMenu || nombreMenu.length < 3) {
+      return res.status(400).json({ ok: false, message: 'nombre_menu es obligatorio y debe tener al menos 3 caracteres.' });
+    }
+
+    if (nombreMenu.length > 120) {
+      return res.status(400).json({ ok: false, message: 'nombre_menu supera el maximo permitido (120).' });
+    }
+
+    if (descripcion && descripcion.length > 250) {
+      return res.status(400).json({ ok: false, message: 'descripcion supera el maximo permitido (250).' });
+    }
+
+    const currentMenu = await getMenuById(idMenu);
+    if (!currentMenu || !currentMenu.estado) {
+      return res.status(404).json({ ok: false, message: 'El menu no existe o esta inactivo.' });
+    }
+
+    const duplicate = await pool.query(
+      `
+        SELECT id_menu
+        FROM menu
+        WHERE id_menu <> $1
+          AND LOWER(TRIM(nombre_menu)) = LOWER(TRIM($2))
+          AND COALESCE(estado, true) = true
+        LIMIT 1;
+      `,
+      [idMenu, nombreMenu]
+    );
+
+    if (duplicate.rowCount > 0) {
+      return res.status(409).json({ ok: false, message: 'Ya existe otro menu activo con ese nombre.' });
+    }
+
+    const updated = await pool.query(
+      `
+        UPDATE menu
+        SET nombre_menu = $2,
+            descripcion = $3
+        WHERE id_menu = $1
+          AND COALESCE(estado, true) = true
+        RETURNING id_menu, nombre_menu, COALESCE(descripcion, '') AS descripcion, COALESCE(estado, true) AS estado;
+      `,
+      [idMenu, nombreMenu, descripcion]
+    );
+
+    const row = updated.rows?.[0] || null;
+    if (!row) {
+      return res.status(404).json({ ok: false, message: 'No se pudo actualizar el menu solicitado.' });
+    }
+
+    return res.status(200).json({
+      ok: true,
+      message: `Menu #${row.id_menu} actualizado correctamente.`,
+      data: {
+        menu: {
+          id_menu: Number(row.id_menu),
+          nombre_menu: row.nombre_menu || `Menu #${row.id_menu}`,
+          descripcion: row.descripcion || '',
+          estado: parseBoolean(row.estado)
+        }
+      }
+    });
+  } catch (error) {
+    console.error('admin_menu_publicacion PUT /menus/:id_menu:', error.message);
+    return res.status(500).json({ ok: false, message: 'No se pudo actualizar el menu.' });
+  }
+});
+
+router.delete('/menus/:id_menu', checkPermission(MENU_PUBLICACION_SAVE_PERMISSIONS), async (req, res) => {
+  try {
+    const idMenu = toPositiveInt(req.params?.id_menu);
+    if (!idMenu) {
+      return res.status(400).json({ ok: false, message: 'id_menu es obligatorio.' });
+    }
+
+    const currentMenu = await getMenuById(idMenu);
+    if (!currentMenu || !currentMenu.estado) {
+      return res.status(404).json({ ok: false, message: 'El menu no existe o ya esta inactivo.' });
+    }
+
+    const usage = await getMenuUsageSummary(idMenu);
+    if (!canDeactivateMenu(usage)) {
+      return res.status(409).json({
+        ok: false,
+        message: `No se puede eliminar el menu porque ${buildMenuUsageBlockers(usage).join(', ')}.`,
+        data: { usage }
+      });
+    }
+
+    const updated = await pool.query(
+      `
+        UPDATE menu
+        SET estado = false
+        WHERE id_menu = $1
+          AND COALESCE(estado, true) = true
+        RETURNING id_menu, nombre_menu;
+      `,
+      [idMenu]
+    );
+
+    const row = updated.rows?.[0] || null;
+    if (!row) {
+      return res.status(404).json({ ok: false, message: 'No se pudo eliminar el menu solicitado.' });
+    }
+
+    return res.status(200).json({
+      ok: true,
+      message: `Menu #${row.id_menu} eliminado correctamente.`,
+      data: {
+        menu: {
+          id_menu: Number(row.id_menu),
+          nombre_menu: row.nombre_menu || `Menu #${row.id_menu}`
+        }
+      }
+    });
+  } catch (error) {
+    console.error('admin_menu_publicacion DELETE /menus/:id_menu:', error.message);
+    return res.status(500).json({ ok: false, message: 'No se pudo eliminar el menu.' });
+  }
+});
+
+// Programa un menu por sucursal para una fecha/hora especifica.
+router.post('/programacion', checkPermission(MENU_PUBLICACION_SAVE_PERMISSIONS), async (req, res) => {
+  const client = await pool.connect();
+  const correlationId = randomUUID();
+  let phase = 'VALIDATION';
+  let transactionStarted = false;
+  try {
+    const idSucursal = toPositiveInt(req.body?.id_sucursal);
+    const idMenu = toPositiveInt(req.body?.id_menu);
+    const idUsuario = getAuthenticatedUserId(req);
+    const fechaRaw = req.body?.fecha_inicio;
+    const fechaFinRaw = req.body?.fecha_fin;
+    const tipoPublicacion = normalizePublicationType(req.body?.tipo_publicacion);
+    const prioridadRaw = toNullablePriority(req.body?.prioridad);
+    const fechaProgramada = toDateTimeOrNull(fechaRaw) || new Date();
+    const fechaFin = toDateTimeOrNull(fechaFinRaw);
+    const syncCatalog = parseOptionalBoolean(req.body?.sync_catalog);
+
+    if (!idSucursal || !idMenu) {
+      return sendMenuProgrammingError(res, {
+        status: 400,
+        code: 'MENU_PROGRAMMING_VALIDATION_ERROR',
+        message: 'id_sucursal e id_menu son obligatorios.',
+        phase,
+        correlationId
+      });
+    }
+
+    if (!idUsuario) {
+      return sendMenuProgrammingError(res, {
+        status: 400,
+        code: 'MENU_PROGRAMMING_USER_REQUIRED',
+        message: 'No se pudo identificar el usuario autenticado para activar menu.',
+        phase,
+        correlationId
+      });
+    }
+
+    if (fechaRaw && !toDateTimeOrNull(fechaRaw)) {
+      return sendMenuProgrammingError(res, {
+        status: 400,
+        code: 'MENU_PROGRAMMING_INVALID_DATE',
+        message: 'fecha_inicio tiene formato invalido.',
+        phase,
+        correlationId
+      });
+    }
+
+    if (fechaFinRaw && !fechaFin) {
+      return sendMenuProgrammingError(res, {
+        status: 400,
+        code: 'MENU_PROGRAMMING_INVALID_END_DATE',
+        message: 'fecha_fin tiene formato invalido.',
+        phase,
+        correlationId
+      });
+    }
+
+    if (!tipoPublicacion) {
+      return sendMenuProgrammingError(res, {
+        status: 400,
+        code: 'MENU_PROGRAMMING_INVALID_TYPE',
+        message: 'tipo_publicacion invalido. Usa DEFAULT o TEMPORADA.',
+        phase,
+        correlationId
+      });
+    }
+
+    if (Number.isNaN(prioridadRaw)) {
+      return sendMenuProgrammingError(res, {
+        status: 400,
+        code: 'MENU_PROGRAMMING_INVALID_PRIORITY',
+        message: 'prioridad debe ser un entero positivo cuando se envia.',
+        phase,
+        correlationId
+      });
+    }
+
+    if (syncCatalog === null) {
+      return sendMenuProgrammingError(res, {
+        status: 400,
+        code: 'MENU_PROGRAMMING_INVALID_SYNC_OPTION',
+        message: 'sync_catalog debe ser booleano cuando se envia.',
+        phase,
+        correlationId
+      });
+    }
+
+    const now = new Date();
+    const isDefaultPublication = tipoPublicacion === 'DEFAULT';
+    const isSeasonPublication = tipoPublicacion === 'TEMPORADA';
+    const esDefault = isDefaultPublication;
+    const prioridad = prioridadRaw ?? (isDefaultPublication ? 1000 : 100);
+
+    if (isDefaultPublication && fechaFinRaw !== undefined && fechaFinRaw !== null && String(fechaFinRaw).trim() !== '') {
+      return sendMenuProgrammingError(res, {
+        status: 400,
+        code: 'MENU_PROGRAMMING_DEFAULT_WITH_END_DATE',
+        message: 'fecha_fin no se permite para publicaciones DEFAULT.',
+        phase,
+        correlationId
+      });
+    }
+
+    if (isDefaultPublication && fechaRaw && fechaProgramada > now) {
+      return sendMenuProgrammingError(res, {
+        status: 400,
+        code: 'MENU_PROGRAMMING_DEFAULT_FUTURE_DATE',
+        message: 'DEFAULT no permite programacion futura por ahora.',
+        phase,
+        correlationId
+      });
+    }
+
+    if (isSeasonPublication && !fechaFin) {
+      return sendMenuProgrammingError(res, {
+        status: 400,
+        code: 'MENU_PROGRAMMING_SEASON_END_DATE_REQUIRED',
+        message: 'fecha_fin es obligatoria para publicaciones TEMPORADA.',
+        phase,
+        correlationId
+      });
+    }
+
+    if (isSeasonPublication && fechaFin <= fechaProgramada) {
+      return sendMenuProgrammingError(res, {
+        status: 400,
+        code: 'MENU_PROGRAMMING_SEASON_INVALID_RANGE',
+        message: 'fecha_fin debe ser mayor que fecha_inicio para publicaciones TEMPORADA.',
+        phase,
+        correlationId
+      });
+    }
+
+    phase = 'PRECHECK';
+    const [branchOk, menuOk] = await Promise.all([
+      existsActiveBranch(idSucursal),
+      existsActiveMenu(idMenu)
+    ]);
+
+    if (!branchOk) {
+      return sendMenuProgrammingError(res, {
+        status: 404,
+        code: 'MENU_BRANCH_NOT_FOUND',
+        message: 'La sucursal no existe o esta inactiva.',
+        phase,
+        correlationId
+      });
+    }
+
+    if (!menuOk) {
+      return sendMenuProgrammingError(res, {
+        status: 404,
+        code: 'MENU_TARGET_NOT_FOUND',
+        message: 'El menu no existe o esta inactivo.',
+        phase,
+        correlationId
+      });
+    }
+
+    // Si no viene fecha, el flujo legacy es DEFAULT "activar ahora".
+    // Evitamos duplicar solo cuando el menu resuelto actual ya coincide.
+    const activeNow = await getActiveMenuByBranch(idSucursal);
+    if (
+      isDefaultPublication &&
+      !fechaRaw &&
+      activeNow &&
+      Number(activeNow.id_menu) === idMenu &&
+      parseBoolean(activeNow.es_default)
+    ) {
+      return res.status(200).json({
+        ok: true,
+        message: 'Ese menu ya esta activo en la sucursal.',
+        data: {
+          programacion: null,
+          menu_activo_actual: mapMenuSummary(activeNow),
+          sync_catalog: false,
+          correlationId
+        },
+        correlationId
+      });
+    }
+
+    const estadoInicial = true;
+
+    phase = 'BEGIN';
+    await client.query('BEGIN');
+    transactionStarted = true;
+
+    phase = 'LOCK_BRANCH';
+    await client.query('SELECT pg_advisory_xact_lock($1, $2);', [7102, idSucursal]);
+
+    phase = 'TRANSACTION_PRECHECK';
+    const transactionPrecheck = await client.query(
+      `
+        SELECT
+          EXISTS(
+            SELECT 1
+            FROM sucursales
+            WHERE id_sucursal = $1
+              AND COALESCE(estado, true) = true
+          ) AS branch_ok,
+          EXISTS(
+            SELECT 1
+            FROM menu
+            WHERE id_menu = $2
+              AND COALESCE(estado, true) = true
+          ) AS menu_ok;
+      `,
+      [idSucursal, idMenu]
+    );
+    const lockedPrecheck = transactionPrecheck.rows?.[0] || {};
+    if (!parseBoolean(lockedPrecheck.branch_ok) || !parseBoolean(lockedPrecheck.menu_ok)) {
+      throw buildMenuProgrammingError({
+        code: 'MENU_PROGRAMMING_PRECHECK_CHANGED',
+        message: 'La sucursal o el menu cambiaron antes de aplicar la vigencia.',
+        phase,
+        status: 409
+      });
+    }
+
+    const otherBranchesSignatureBefore = await getOtherBranchesActiveMenuSignature(client, idSucursal);
+
+    if (isSeasonPublication) {
+      phase = 'CHECK_DEFAULT_FOR_SEASON';
+      const defaultResult = await client.query(
+        `
+          SELECT id_menu_vigente
+          FROM menu_vigente
+          WHERE id_sucursal = $1
+            AND COALESCE(estado, true) = true
+            AND COALESCE(es_default, false) = true
+          LIMIT 1;
+        `,
+        [idSucursal]
+      );
+
+      if (defaultResult.rowCount === 0) {
+        throw buildMenuProgrammingError({
+          code: 'MENU_SEASON_DEFAULT_REQUIRED',
+          message: 'No se puede programar TEMPORADA sin un DEFAULT activo para la sucursal.',
+          phase,
+          status: 409
+        });
+      }
+
+      phase = 'CHECK_SEASON_OVERLAP';
+      const overlapResult = await client.query(
+        `
+          SELECT id_menu_vigente
+          FROM menu_vigente
+          WHERE id_sucursal = $1
+            AND COALESCE(estado, true) = true
+            AND COALESCE(es_default, false) = false
+            AND COALESCE(tipo_publicacion, 'TEMPORADA') = 'TEMPORADA'
+            AND fecha_inicio < $3
+            AND fecha_fin > $2
+          LIMIT 1;
+        `,
+        [idSucursal, fechaProgramada, fechaFin]
+      );
+
+      if (overlapResult.rowCount > 0) {
+        throw buildMenuProgrammingError({
+          code: 'MENU_SEASON_OVERLAP',
+          message: 'Ya existe una TEMPORADA activa que se solapa con el rango solicitado.',
+          phase,
+          status: 409
+        });
+      }
+    }
+
+    phase = 'CHECK_DUPLICATE';
+    const duplicate = await client.query(
+      `
+        SELECT id_menu_vigente
+        FROM menu_vigente
+        WHERE id_sucursal = $1
+          AND id_menu = $2
+          AND fecha_inicio = $3
+          AND COALESCE(tipo_publicacion, 'DEFAULT') = $4
+        LIMIT 1;
+      `,
+      [idSucursal, idMenu, fechaProgramada, tipoPublicacion]
+    );
+
+    if (duplicate.rowCount > 0) {
+      await client.query('ROLLBACK');
+      transactionStarted = false;
+      return sendMenuProgrammingError(res, {
+        status: 409,
+        code: 'MENU_VIGENCIA_CONFLICT',
+        message: 'Ya existe una vigencia con esa sucursal, menu y fecha.',
+        phase,
+        correlationId
+      });
+    }
+
+    if (isDefaultPublication) {
+      phase = 'DEACTIVATE_CURRENT';
+      await client.query(
+        `
+          UPDATE menu_vigente
+          SET estado = false
+          WHERE id_sucursal = $1
+            AND COALESCE(estado, true) = true
+            AND COALESCE(es_default, false) = true;
+        `,
+        [idSucursal]
+      );
+    }
+
+    phase = 'INSERT_VIGENCIA';
+    const insertResult = await client.query(
+      `
+        INSERT INTO menu_vigente (
+          id_sucursal,
+          id_menu,
+          fecha_inicio,
+          fecha_fin,
+          tipo_publicacion,
+          es_default,
+          prioridad,
+          id_usuario,
+          estado
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+        RETURNING
+          id_menu_vigente,
+          id_sucursal,
+          id_menu,
+          fecha_inicio,
+          fecha_fin,
+          tipo_publicacion,
+          es_default,
+          prioridad,
+          estado;
+      `,
+      [
+        idSucursal,
+        idMenu,
+        fechaProgramada,
+        isDefaultPublication ? null : fechaFin,
+        tipoPublicacion,
+        esDefault,
+        prioridad,
+        idUsuario,
+        estadoInicial
+      ]
+    );
+
+    const inserted = insertResult.rows?.[0] || null;
+    if (!inserted) {
+      throw buildMenuProgrammingError({
+        code: 'MENU_VIGENCIA_INSERT_FAILED',
+        message: 'No se pudo crear la vigencia solicitada.',
+        phase
+      });
+    }
+
+    let seededProductsCount = 0;
+    if (syncCatalog) {
+      phase = 'SYNC_CATALOG';
+      try {
+        seededProductsCount = await syncExistingBranchProductsIntoMenu({
+          client,
+          idSucursal,
+          idMenu: Number(inserted.id_menu)
+        });
+      } catch (error) {
+        throw buildMenuProgrammingError({
+          code: 'MENU_CATALOG_SYNC_FAILED',
+          message: 'La vigencia no se aplico porque fallo la sincronizacion solicitada del catalogo.',
+          phase,
+          cause: error
+        });
+      }
+    }
+
+    phase = 'POSTCHECK';
+    const postcheckResult = await client.query(
+      `
+        SELECT
+          COUNT(*) FILTER (
+            WHERE COALESCE(estado, true) = true
+              AND COALESCE(es_default, false) = true
+          )::int AS active_default_count,
+          MAX(id_menu_vigente) FILTER (
+            WHERE COALESCE(estado, true) = true
+              AND COALESCE(es_default, false) = true
+          )::int AS active_default_id,
+          COUNT(*) FILTER (
+            WHERE id_menu_vigente = $2
+              AND id_menu = $3
+              AND COALESCE(estado, true) = true
+              AND COALESCE(tipo_publicacion, 'DEFAULT') = $4
+          )::int AS inserted_matches,
+          COUNT(*) FILTER (
+            WHERE COALESCE(estado, true) = true
+              AND COALESCE(es_default, false) = false
+              AND COALESCE(tipo_publicacion, 'TEMPORADA') = 'TEMPORADA'
+              AND fecha_inicio < $6
+              AND fecha_fin > $5
+          )::int AS overlapping_seasons
+        FROM menu_vigente
+        WHERE id_sucursal = $1;
+      `,
+      [
+        idSucursal,
+        Number(inserted.id_menu_vigente),
+        idMenu,
+        tipoPublicacion,
+        fechaProgramada,
+        isDefaultPublication ? fechaProgramada : fechaFin
+      ]
+    );
+    const postcheck = postcheckResult.rows?.[0] || {};
+
+    const defaultPostcheckFailed = isDefaultPublication && (
+      Number(postcheck.active_default_count) !== 1 ||
+      Number(postcheck.active_default_id) !== Number(inserted.id_menu_vigente) ||
+      Number(postcheck.inserted_matches) !== 1
+    );
+    const seasonPostcheckFailed = isSeasonPublication && (
+      Number(postcheck.active_default_count) < 1 ||
+      Number(postcheck.inserted_matches) !== 1 ||
+      Number(postcheck.overlapping_seasons) !== 1
+    );
+    if (defaultPostcheckFailed || seasonPostcheckFailed) {
+      throw buildMenuProgrammingError({
+        code: 'MENU_VIGENCIA_POSTCHECK_FAILED',
+        message: 'La vigencia no supero la validacion final.',
+        phase
+      });
+    }
+
+    const otherBranchesSignatureAfter = await getOtherBranchesActiveMenuSignature(client, idSucursal);
+    if (otherBranchesSignatureAfter !== otherBranchesSignatureBefore) {
+      throw buildMenuProgrammingError({
+        code: 'MENU_OTHER_BRANCH_CHANGED',
+        message: 'La operacion fue cancelada porque detecto cambios fuera de la sucursal solicitada.',
+        phase
+      });
+    }
+
+    phase = 'COMMIT';
+    await client.query('COMMIT');
+    transactionStarted = false;
+
+    const activeMenu = await getActiveMenuByBranch(idSucursal);
+    const sharedMenuImpact = await resolveSharedMenuImpact({
+      idMenu: Number(inserted.id_menu),
+      idSucursal
+    });
+    const warnings = [];
+    if (seededProductsCount > 0) {
+      warnings.push(
+        `Se agregaron ${seededProductsCount} productos existentes de la sucursal al menu para mantener el aislamiento publico.`
+      );
+    }
+    if (sharedMenuImpact.is_shared) {
+      warnings.push(sharedMenuImpact.warning_message);
+    }
+
+    return res.status(200).json({
+      ok: true,
+      message: fechaRaw ? 'Programacion de menu guardada correctamente.' : 'Menu activo actualizado correctamente.',
+      data: {
+        programacion: {
+          id_menu_vigente: Number(inserted.id_menu_vigente),
+          id_sucursal: Number(inserted.id_sucursal),
+          id_menu: Number(inserted.id_menu),
+          fecha_inicio: inserted.fecha_inicio,
+          fecha_fin: inserted.fecha_fin || null,
+          tipo_publicacion: inserted.tipo_publicacion || tipoPublicacion,
+          es_default: parseBoolean(inserted.es_default),
+          prioridad: inserted.prioridad !== null && inserted.prioridad !== undefined
+            ? Number(inserted.prioridad)
+            : prioridad,
+          estado: parseBoolean(inserted.estado)
+        },
+        menu_activo_actual: activeMenu ? mapMenuSummary(activeMenu) : null,
+        shared_menu_impact: sharedMenuImpact,
+        sync_catalog: syncCatalog,
+        seeded_products_count: seededProductsCount,
+        warnings,
+        correlationId
+      },
+      correlationId
+    });
+  } catch (error) {
+    if (transactionStarted) {
+      await client.query('ROLLBACK').catch(() => {});
+    }
+    const safeCode = String(error?.code || 'MENU_PROGRAMMING_FAILED');
+    const safePhase = String(error?.phase || phase || 'UNKNOWN');
+    const safeMessage = safeCode.startsWith('MENU_')
+      ? String(error?.message || 'No se pudo activar/programar el menu por sucursal.')
+      : 'No se pudo activar/programar el menu por sucursal.';
+    const status = Number.isInteger(error?.status) ? error.status : 500;
+    const internalError = error?.cause || error;
+    console.error('admin_menu_publicacion POST /programacion', {
+      correlationId,
+      phase: safePhase,
+      id_sucursal: toPositiveInt(req.body?.id_sucursal),
+      id_menu: toPositiveInt(req.body?.id_menu),
+      code: internalError?.code || safeCode,
+      constraint: internalError?.constraint || null,
+      message: internalError?.message || 'Error sin detalle'
+    });
+    return sendMenuProgrammingError(res, {
+      status,
+      code: safeCode,
+      message: safeMessage,
+      phase: safePhase,
+      correlationId
+    });
+  } finally {
+    client.release();
+  }
+});
+
+router.patch('/temporada-activa/cancelar', checkPermission(MENU_PUBLICACION_SAVE_PERMISSIONS), async (req, res) => {
+  const idSucursal = toPositiveInt(req.body?.id_sucursal);
+  if (!idSucursal) {
+    return res.status(400).json({ ok: false, message: 'id_sucursal es obligatorio y debe ser entero positivo.' });
+  }
+
+  let client = null;
+  let transactionStarted = false;
+
+  try {
+    const branch = await getBranchById(idSucursal);
+    if (!branch) {
+      return res.status(404).json({ ok: false, message: 'La sucursal no existe.' });
+    }
+
+    if (!branch.estado) {
+      return res.status(409).json({ ok: false, message: 'La sucursal esta inactiva.' });
+    }
+
+    const defaultResult = await pool.query(
+      `
+        SELECT id_menu_vigente
+        FROM menu_vigente
+        WHERE id_sucursal = $1
+          AND COALESCE(estado, true) = true
+          AND COALESCE(es_default, false) = true
+        LIMIT 1;
+      `,
+      [idSucursal]
+    );
+
+    if (defaultResult.rowCount === 0) {
+      return res.status(409).json({
+        ok: false,
+        message: 'No existe DEFAULT activo para esta sucursal.'
+      });
+    }
+
+    const activeSeasonResult = await pool.query(
+      `
+        SELECT id_menu_vigente
+        FROM menu_vigente
+        WHERE id_sucursal = $1
+          AND COALESCE(estado, true) = true
+          AND COALESCE(es_default, false) = false
+          AND COALESCE(tipo_publicacion, 'TEMPORADA') = 'TEMPORADA'
+          AND fecha_inicio <= NOW()
+          AND fecha_fin > NOW()
+        ORDER BY prioridad ASC, fecha_inicio DESC, id_menu_vigente DESC;
+      `,
+      [idSucursal]
+    );
+
+    if (activeSeasonResult.rowCount === 0) {
+      const activeMenu = await getActiveMenuByBranch(idSucursal);
+      return res.status(200).json({
+        ok: true,
+        message: 'No hay temporada activa para finalizar.',
+        data: {
+          temporadas_canceladas: [],
+          menu_activo_actual: activeMenu ? mapMenuSummary(activeMenu) : null
+        }
+      });
+    }
+
+    client = await pool.connect();
+    await client.query('BEGIN');
+    transactionStarted = true;
+    await client.query('SELECT pg_advisory_xact_lock($1, $2);', [7102, idSucursal]);
+
+    const lockedPrecheck = await client.query(
+      `
+        SELECT
+          EXISTS(
+            SELECT 1
+            FROM sucursales
+            WHERE id_sucursal = $1
+              AND COALESCE(estado, true) = true
+          ) AS branch_ok,
+          EXISTS(
+            SELECT 1
+            FROM menu_vigente
+            WHERE id_sucursal = $1
+              AND COALESCE(estado, true) = true
+              AND COALESCE(es_default, false) = true
+          ) AS default_ok;
+      `,
+      [idSucursal]
+    );
+    const precheck = lockedPrecheck.rows?.[0] || {};
+    if (!parseBoolean(precheck.branch_ok)) {
+      await client.query('ROLLBACK');
+      transactionStarted = false;
+      return res.status(409).json({ ok: false, message: 'La sucursal ya no esta activa.' });
+    }
+    if (!parseBoolean(precheck.default_ok)) {
+      await client.query('ROLLBACK');
+      transactionStarted = false;
+      return res.status(409).json({ ok: false, message: 'No existe DEFAULT activo para esta sucursal.' });
+    }
+
+    const lockedSeasonResult = await client.query(
+      `
+        SELECT id_menu_vigente
+        FROM menu_vigente
+        WHERE id_sucursal = $1
+          AND COALESCE(estado, true) = true
+          AND COALESCE(es_default, false) = false
+          AND COALESCE(tipo_publicacion, 'TEMPORADA') = 'TEMPORADA'
+          AND fecha_inicio <= NOW()
+          AND fecha_fin > NOW()
+        ORDER BY prioridad ASC, fecha_inicio DESC, id_menu_vigente DESC;
+      `,
+      [idSucursal]
+    );
+
+    const seasonIds = (lockedSeasonResult.rows || [])
+      .map((row) => Number(row.id_menu_vigente))
+      .filter((value) => Number.isInteger(value) && value > 0);
+
+    if (seasonIds.length === 0) {
+      await client.query('COMMIT');
+      transactionStarted = false;
+      const activeMenu = await getActiveMenuByBranch(idSucursal);
+      return res.status(200).json({
+        ok: true,
+        message: 'No hay temporada activa para finalizar.',
+        data: {
+          temporadas_canceladas: [],
+          menu_activo_actual: activeMenu ? mapMenuSummary(activeMenu) : null
+        }
+      });
+    }
+
+    const updateResult = await client.query(
+      `
+        UPDATE menu_vigente
+        SET estado = false
+        WHERE id_menu_vigente = ANY($1::int[])
+        RETURNING
+          id_menu_vigente,
+          id_sucursal,
+          id_menu,
+          fecha_inicio,
+          fecha_fin,
+          tipo_publicacion,
+          es_default,
+          prioridad,
+          estado;
+      `,
+      [seasonIds]
+    );
+
+    await client.query('COMMIT');
+    transactionStarted = false;
+
+    const activeMenu = await getActiveMenuByBranch(idSucursal);
+    return res.status(200).json({
+      ok: true,
+      message: 'Temporada activa finalizada correctamente.',
+      data: {
+        temporadas_canceladas: (updateResult.rows || []).map((row) => ({
+          id_menu_vigente: Number(row.id_menu_vigente),
+          id_sucursal: Number(row.id_sucursal),
+          id_menu: Number(row.id_menu),
+          fecha_inicio: row.fecha_inicio || null,
+          fecha_fin: row.fecha_fin || null,
+          tipo_publicacion: row.tipo_publicacion || 'TEMPORADA',
+          es_default: parseBoolean(row.es_default),
+          prioridad: row.prioridad !== undefined && row.prioridad !== null
+            ? Number(row.prioridad)
+            : null,
+          estado: parseBoolean(row.estado)
+        })),
+        menu_activo_actual: activeMenu ? mapMenuSummary(activeMenu) : null
+      }
+    });
+  } catch (error) {
+    if (transactionStarted && client) {
+      await client.query('ROLLBACK').catch(() => {});
+    }
+    console.error('admin_menu_publicacion PATCH /temporada-activa/cancelar:', error.message);
+    return res.status(500).json({ ok: false, message: 'No se pudo finalizar la temporada activa.' });
+  } finally {
+    if (client) client.release();
+  }
+});
+
+router.get('/categorias-orden', checkPermission(MENU_PUBLICACION_VIEW_PERMISSIONS), async (req, res) => {
+  try {
+    const idSucursal = toStrictPositiveInt(req.query.id_sucursal);
+    const idMenuQuery = toStrictPositiveInt(req.query.id_menu);
+    if (!idSucursal) {
+      return res.status(400).json({ ok: false, message: 'id_sucursal es obligatorio y debe ser entero positivo.' });
+    }
+
+    const [branch, activeMenu] = await Promise.all([
+      getBranchById(idSucursal),
+      getActiveMenuByBranch(idSucursal)
+    ]);
+
+    if (!branch) return res.status(404).json({ ok: false, message: 'La sucursal no existe.' });
+    if (!branch.estado) return res.status(409).json({ ok: false, message: 'La sucursal esta inactiva.' });
+
+    const targetMenuId = idMenuQuery || Number(activeMenu?.id_menu || 0);
+    if (!targetMenuId) {
+      return res.status(200).json({
+        ok: true,
+        data: [],
+        meta: {
+          scope: 'MENU_POR_SUCURSAL',
+          message: 'La sucursal no tiene menu vigente activo.'
+        }
+      });
+    }
+
+    if (idMenuQuery) {
+      const requestedMenu = await getMenuById(idMenuQuery);
+      if (!requestedMenu || !requestedMenu.estado) {
+        return res.status(404).json({ ok: false, message: 'El menu seleccionado no existe o esta inactivo.' });
+      }
+    }
+
+    const [data, sharedMenuImpact] = await Promise.all([
+      getCategoryOrderRows({ idMenu: targetMenuId, idSucursal }),
+      resolveSharedMenuImpact({ idMenu: targetMenuId, idSucursal })
+    ]);
+
+    return res.status(200).json({
+      ok: true,
+      data,
+      meta: {
+        scope: sharedMenuImpact.is_shared ? 'MENU_COMPARTIDO_ENTRE_SUCURSALES' : 'MENU_POR_SUCURSAL',
+        id_menu: targetMenuId,
+        id_sucursal: idSucursal,
+        shared_menu_impact: sharedMenuImpact,
+        message: sharedMenuImpact.is_shared
+          ? 'Este orden se aplica al menu compartido. Las categorias visibles pueden variar segun el menu publicado en cada sucursal.'
+          : 'Este orden se aplica al menu vigente de la sucursal seleccionada.'
+      }
+    });
+  } catch (error) {
+    console.error('admin_menu_publicacion GET /categorias-orden:', error.message);
+    return res.status(500).json({ ok: false, message: 'No se pudo cargar el orden de categorias.' });
+  }
+});
+
+router.put('/categorias-orden', checkPermission(MENU_PUBLICACION_SAVE_PERMISSIONS), async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const idSucursal = toStrictPositiveInt(req.query.id_sucursal);
+    const idMenuQuery = toStrictPositiveInt(req.query.id_menu);
+    if (!idSucursal) {
+      return res.status(400).json({ ok: false, message: 'id_sucursal es obligatorio y debe ser entero positivo.' });
+    }
+
+    const normalized = normalizeCategoryOrderItems(req.body?.items);
+    if (!normalized.ok) {
+      return res.status(400).json({ ok: false, message: normalized.message });
+    }
+
+    const [branch, activeMenu] = await Promise.all([
+      getBranchById(idSucursal),
+      getActiveMenuByBranch(idSucursal)
+    ]);
+    if (!branch) return res.status(404).json({ ok: false, message: 'La sucursal no existe.' });
+    if (!branch.estado) return res.status(409).json({ ok: false, message: 'La sucursal esta inactiva.' });
+
+    const targetMenuId = idMenuQuery || Number(activeMenu?.id_menu || 0);
+    if (!targetMenuId) {
+      return res.status(409).json({ ok: false, message: 'La sucursal no tiene menu vigente activo.' });
+    }
+    if (idMenuQuery) {
+      const requestedMenu = await getMenuById(idMenuQuery);
+      if (!requestedMenu || !requestedMenu.estado) {
+        return res.status(404).json({ ok: false, message: 'El menu seleccionado no existe o esta inactivo.' });
+      }
+    }
+
+    await client.query('BEGIN');
+    await client.query(
+      `
+        SELECT id_menu_publicacion_regla
+        FROM public.menu_publicacion_reglas
+        WHERE id_menu_publicacion_regla = ANY($1::int[])
+          AND COALESCE(estado, true) = true
+        FOR UPDATE
+      `,
+      [normalized.data.map((item) => item.id_menu_publicacion_regla)]
+    );
+
+    const currentRows = await getCategoryOrderRows({ idMenu: targetMenuId, idSucursal, db: client });
+    const existingIds = new Set(currentRows.map((row) => Number(row.id_menu_publicacion_regla)));
+    const missingIds = normalized.data
+      .map((item) => item.id_menu_publicacion_regla)
+      .filter((id) => !existingIds.has(id));
+    if (missingIds.length > 0) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({
+        ok: false,
+        message: `Reglas inexistentes o inactivas: ${missingIds.join(', ')}.`
+      });
+    }
+
+    await client.query(
+      `
+        WITH input AS (
+          SELECT *
+          FROM jsonb_to_recordset($1::jsonb) AS value(
+            id_menu_publicacion_regla integer,
+            orden integer
+          )
+        )
+        UPDATE public.menu_publicacion_reglas mpr
+        SET
+          orden = input.orden,
+          fecha_actualizacion = NOW()
+        FROM input
+        WHERE mpr.id_menu_publicacion_regla = input.id_menu_publicacion_regla
+      `,
+      [JSON.stringify(normalized.data)]
+    );
+
+    await updateDetailOrderForCategories({
+      client,
+      idMenu: targetMenuId,
+      idSucursal,
+      items: normalized.data
+    });
+
+    const data = await getCategoryOrderRows({ idMenu: targetMenuId, idSucursal, db: client });
+    await client.query('COMMIT');
+
+    return res.status(200).json({
+      ok: true,
+      message: 'ORDEN DEL MENU PUBLICO ACTUALIZADO CORRECTAMENTE.',
+      data
+    });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    console.error('admin_menu_publicacion PUT /categorias-orden:', error.message);
+    return res.status(500).json({ ok: false, message: 'No se pudo guardar el orden de categorias.' });
+  } finally {
+    client.release();
+  }
+});
+
+router.get('/catalogo', checkPermission(MENU_PUBLICACION_VIEW_PERMISSIONS), async (req, res) => {
+  try {
+    const idSucursal = toPositiveInt(req.query.id_sucursal);
+    const idMenuQuery = toPositiveInt(req.query.id_menu);
+    if (!idSucursal) {
+      return res.status(400).json({ ok: false, message: 'id_sucursal es obligatorio y debe ser entero positivo.' });
+    }
+
+    const [capabilities, imageCapabilities, publicationRules, activeMenu, branch] = await Promise.all([
+      getDetalleMenuCapabilities(),
+      getCatalogImageCapabilities(),
+      getMenuPublicationRules(),
+      getActiveMenuByBranch(idSucursal),
+      getBranchById(idSucursal)
+    ]);
+
+    if (!branch) {
+      return res.status(404).json({ ok: false, message: 'La sucursal no existe.' });
+    }
+
+    if (!branch.estado) {
+      return res.status(409).json({ ok: false, message: 'La sucursal esta inactiva y no admite publicacion administrativa.' });
+    }
+
+    const warnings = [];
+    let resolvedMenu = activeMenu;
+
+    if (idMenuQuery) {
+      const requestedMenu = await getMenuById(idMenuQuery);
+      if (!requestedMenu || !requestedMenu.estado) {
+        return res.status(404).json({ ok: false, message: 'El menu seleccionado no existe o esta inactivo.' });
+      }
+
+      const matchesActive = Number(activeMenu?.id_menu || 0) === requestedMenu.id_menu;
+      resolvedMenu = {
+        id_menu_vigente: matchesActive ? activeMenu?.id_menu_vigente ?? null : null,
+        id_menu: requestedMenu.id_menu,
+        id_sucursal: idSucursal,
+        fecha_inicio: matchesActive ? activeMenu?.fecha_inicio ?? null : null,
+        nombre_menu: requestedMenu.nombre_menu,
+        menu_descripcion: requestedMenu.descripcion || '',
+        nombre_sucursal: branch.nombre_sucursal
+      };
+
+      if (!matchesActive) {
+        warnings.push('Visualizando un menu que aun no esta activo en esta sucursal.');
+      }
+    }
+
+    if (!resolvedMenu) {
+      warnings.push('La sucursal no tiene menu vigente activo.');
+      return res.status(200).json({
+        ok: true,
+        data: {
+          menu: null,
+          capabilities,
+          warnings,
+          shared_menu_impact: null,
+          items: []
+        }
+      });
+    }
+
+    const targetMenuId = Number(resolvedMenu.id_menu);
+    const [baseRows, detailRows, sharedMenuImpact, crossBranchRows] = await Promise.all([
+      fetchBaseCatalogByMenu(targetMenuId, idSucursal, publicationRules, imageCapabilities),
+      fetchDetalleRowsByMenu({ idMenu: targetMenuId, idSucursal, capabilities }),
+      resolveSharedMenuImpact({ idMenu: targetMenuId, idSucursal }),
+      fetchCrossBranchDetalleRowsByMenu({ idMenu: targetMenuId, idSucursal })
+    ]);
+
+    const detailRowsByKey = buildDetailRowsByKey(detailRows);
+    const mapped = mapCatalogForAdmin({ baseRows, detailRowsByKey });
+
+    if (mapped.duplicateKeys.length > 0) {
+      warnings.push(`Existen duplicados en detalle_menu: ${mapped.duplicateKeys.join(', ')}`);
+    }
+    if (crossBranchRows.length > 0) {
+      warnings.push(
+        `Se detectaron ${crossBranchRows.length} publicaciones cruzadas de productos fuera de la sucursal seleccionada. Limpia detalle_menu para evitar contaminacion historica.`
+      );
+    }
+    if (sharedMenuImpact.is_shared) {
+      warnings.push(sharedMenuImpact.warning_message);
+    }
+
+    return res.status(200).json({
+      ok: true,
+      data: {
+        menu: mapMenuSummary(resolvedMenu),
+        capabilities,
+        warnings,
+        shared_menu_impact: sharedMenuImpact,
+        items: mapped.items
+      }
+    });
+  } catch (error) {
+    console.error('admin_menu_publicacion /catalogo:', error.message);
+    return res.status(500).json({ ok: false, message: 'No se pudo construir el catalogo de publicacion.' });
+  }
+});
+
+// Preview administrativo del menu por sucursal/menu seleccionado.
+router.get('/preview', checkPermission(MENU_PUBLICACION_VIEW_PERMISSIONS), async (req, res) => {
+  try {
+    const idSucursal = toPositiveInt(req.query.id_sucursal);
+    const idMenuQuery = toPositiveInt(req.query.id_menu);
+    if (!idSucursal) {
+      return res.status(400).json({ ok: false, message: 'id_sucursal es obligatorio y debe ser entero positivo.' });
+    }
+
+    const [capabilities, imageCapabilities, publicationRules, activeMenu, branch] = await Promise.all([
+      getDetalleMenuCapabilities(),
+      getCatalogImageCapabilities(),
+      getMenuPublicationRules(),
+      getActiveMenuByBranch(idSucursal),
+      getBranchById(idSucursal)
+    ]);
+
+    if (!branch) {
+      return res.status(404).json({ ok: false, message: 'La sucursal no existe.' });
+    }
+
+    if (!branch.estado) {
+      return res.status(409).json({ ok: false, message: 'La sucursal esta inactiva y no admite preview administrativo.' });
+    }
+
+    let resolvedMenu = activeMenu;
+    if (idMenuQuery) {
+      const requestedMenu = await getMenuById(idMenuQuery);
+      if (!requestedMenu || !requestedMenu.estado) {
+        return res.status(404).json({ ok: false, message: 'El menu seleccionado no existe o esta inactivo.' });
+      }
+
+      const matchesActive = Number(activeMenu?.id_menu || 0) === requestedMenu.id_menu;
+      resolvedMenu = {
+        id_menu_vigente: matchesActive ? activeMenu?.id_menu_vigente ?? null : null,
+        id_menu: requestedMenu.id_menu,
+        id_sucursal: idSucursal,
+        fecha_inicio: matchesActive ? activeMenu?.fecha_inicio ?? null : null,
+        nombre_menu: requestedMenu.nombre_menu,
+        menu_descripcion: requestedMenu.descripcion || '',
+        nombre_sucursal: branch.nombre_sucursal
+      };
+    }
+
+    if (!resolvedMenu) {
+      return res.status(200).json({
+        ok: true,
+        data: {
+          menu: null,
+          warnings: [],
+          shared_menu_impact: null,
+          stats: { total: 0, disponibles: 0, agotados: 0 },
+          items: []
+        }
+      });
+    }
+
+    const targetMenuId = Number(resolvedMenu.id_menu);
+    const [baseRows, detailRows, sharedMenuImpact, crossBranchRows] = await Promise.all([
+      fetchBaseCatalogByMenu(targetMenuId, idSucursal, publicationRules, imageCapabilities),
+      fetchDetalleRowsByMenu({ idMenu: targetMenuId, idSucursal, capabilities }),
+      resolveSharedMenuImpact({ idMenu: targetMenuId, idSucursal }),
+      fetchCrossBranchDetalleRowsByMenu({ idMenu: targetMenuId, idSucursal })
+    ]);
+
+    const detailRowsByKey = buildDetailRowsByKey(detailRows);
+    const mapped = mapCatalogForAdmin({ baseRows, detailRowsByKey });
+
+    const previewItems = mapped.items
+      .filter((item) => Boolean(item?.visible))
+      .map(mapPreviewItemFromAdminCatalog)
+      .sort((a, b) => {
+        const orderA = Number(a?.orden || 2147483647);
+        const orderB = Number(b?.orden || 2147483647);
+        if (orderA !== orderB) return orderA - orderB;
+        return String(a?.nombre || '').localeCompare(String(b?.nombre || ''));
+      });
+
+    const disponibles = previewItems.filter((item) => Boolean(item?.disponibilidad?.available)).length;
+    const warnings = [];
+    if (crossBranchRows.length > 0) {
+      warnings.push(
+        `Preview con aislamiento defensivo activo: existen ${crossBranchRows.length} publicaciones cruzadas fuera de la sucursal.`
+      );
+    }
+    if (sharedMenuImpact.is_shared) {
+      warnings.push(sharedMenuImpact.warning_message);
+    }
+
+    return res.status(200).json({
+      ok: true,
+      data: {
+        menu: mapMenuSummary(resolvedMenu),
+        warnings,
+        shared_menu_impact: sharedMenuImpact,
+        stats: {
+          total: previewItems.length,
+          disponibles,
+          agotados: previewItems.length - disponibles
+        },
+        items: previewItems
+      }
+    });
+  } catch (error) {
+    console.error('admin_menu_publicacion /preview:', error.message);
+    return res.status(500).json({ ok: false, message: 'No se pudo construir el preview administrativo.' });
+  }
+});
+
+// Guarda cambios de publicacion para una sucursal en el menu vigente.
+router.put('/catalogo', checkPermission(MENU_PUBLICACION_SAVE_PERMISSIONS), async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const idSucursal = toPositiveInt(req.query.id_sucursal);
+    const idMenuQuery = toPositiveInt(req.query.id_menu);
+    if (!idSucursal) {
+      return res.status(400).json({ ok: false, message: 'id_sucursal es obligatorio y debe ser entero positivo.' });
+    }
+
+    const normalized = normalizeDraftItems(req.body?.items);
+    if (!normalized.ok) {
+      return res.status(400).json({ ok: false, message: normalized.message });
+    }
+
+    const branch = await getBranchById(idSucursal);
+    if (!branch) {
+      return res.status(404).json({ ok: false, message: 'La sucursal no existe.' });
+    }
+    if (!branch.estado) {
+      return res.status(409).json({ ok: false, message: 'La sucursal esta inactiva y no admite guardar publicacion.' });
+    }
+
+    const activeMenu = await getActiveMenuByBranch(idSucursal);
+    const targetMenuId = idMenuQuery || Number(activeMenu?.id_menu || 0);
+    if (!targetMenuId) {
+      return res.status(409).json({ ok: false, message: 'La sucursal no tiene menu vigente activo.' });
+    }
+
+    if (idMenuQuery) {
+      const requestedMenu = await getMenuById(idMenuQuery);
+      if (!requestedMenu || !requestedMenu.estado) {
+        return res.status(404).json({ ok: false, message: 'El menu seleccionado no existe o esta inactivo.' });
+      }
+    }
+
+    const capabilities = await getDetalleMenuCapabilities();
+    const [detailRows, stateByKey, sharedMenuImpact] = await Promise.all([
+      fetchDetalleRowsByMenu({ idMenu: targetMenuId, idSucursal, capabilities }),
+      fetchDraftStateByType({
+        idMenu: targetMenuId,
+        idSucursal,
+        normalizedItems: normalized.data
+      }),
+      resolveSharedMenuImpact({ idMenu: targetMenuId, idSucursal })
+    ]);
+
+    const detailRowsByKey = buildDetailRowsByKey(detailRows);
+    const validationErrors = [];
+
+    for (const item of normalized.data) {
+      const detailRowsForKey = detailRowsByKey.get(item.key) || [];
+      if (detailRowsForKey.length > 1) {
+        validationErrors.push(`Existe duplicidad en detalle_menu para ${item.key}. Corrige antes de guardar.`);
+      }
+
+      const source = stateByKey.get(item.key);
+      if (!source) {
+        validationErrors.push(`No existe origen valido para ${item.key} en el menu seleccionado.`);
+        continue;
+      }
+
+      const finalPrice = item.precio_publico ?? source.precio_base;
+
+      if (item.visible && source.estado_item !== true) {
+        validationErrors.push(`No puedes dejar visible ${item.key} porque esta inactivo.`);
+      }
+
+      if (item.visible && (!Number.isFinite(finalPrice) || finalPrice < 0)) {
+        validationErrors.push(`Precio invalido para ${item.key}.`);
+      }
+
+      if (item.visible && (!Number.isInteger(item.orden) || item.orden <= 0)) {
+        validationErrors.push(`Orden invalido para ${item.key}. Debe ser entero positivo.`);
+      }
+
+      if (
+        (item.tipo_item === ITEM_TYPES.RECETA && !capabilities.hasIdReceta) ||
+        (item.tipo_item === ITEM_TYPES.COMBO && !capabilities.hasIdCombo)
+      ) {
+        validationErrors.push(`Tu esquema no soporta publicar ${item.tipo_item} en detalle_menu (columna faltante).`);
+      }
+    }
+
+    if (validationErrors.length > 0) {
+      return res.status(400).json({
+        ok: false,
+        message: 'Se encontraron errores de validacion.',
+        errors: validationErrors
+      });
+    }
+
+    await client.query('BEGIN');
+
+    const existingUpdates = [];
+    const newItems = [];
+
+    for (const item of normalized.data) {
+      const existingRows = detailRowsByKey.get(item.key) || [];
+      const existing = existingRows[0] || null;
+
+      // Si no existe fila y el item queda oculto, no insertamos ruido en detalle_menu.
+      if (!existing && !item.visible) continue;
+
+      if (existing) {
+        existingUpdates.push({
+          rowId: Number(existing.id_detalle_menu),
+          item
+        });
+      } else {
+        newItems.push(item);
+      }
+    }
+
+    await updateDetalleRowsBatch({
+      client,
+      entries: existingUpdates,
+      capabilities
+    });
+    await insertDetalleRowsBatch({
+      client,
+      idMenu: targetMenuId,
+      items: newItems,
+      capabilities
+    });
+
+    const visibleCount = await getVisibleCountByMenu({
+      idMenu: targetMenuId,
+      idSucursal,
+      capabilities,
+      client
+    });
+
+    await client.query('COMMIT');
+
+    const warnings = [];
+    if (visibleCount === 0) {
+      warnings.push('La sucursal quedo sin items visibles para el cliente.');
+    }
+    if (sharedMenuImpact.is_shared) {
+      warnings.push(sharedMenuImpact.warning_message);
+    }
+
+    return res.status(200).json({
+      ok: true,
+      message: 'Publicacion guardada correctamente.',
+      data: {
+        visible_count: visibleCount,
+        applied_count: existingUpdates.length + newItems.length,
+        warnings,
+        shared_menu_impact: sharedMenuImpact,
+        applied_scope: sharedMenuImpact.is_shared
+          ? 'MENU_COMPARTIDO_ENTRE_SUCURSALES'
+          : 'MENU_EXCLUSIVO_DE_SUCURSAL'
+      }
+    });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    console.error('admin_menu_publicacion PUT /catalogo:', error.message);
+    return res.status(500).json({ ok: false, message: 'No se pudo guardar la publicacion del menu.' });
+  } finally {
+    client.release();
+  }
+});
+
+export default router;
+
+
+
+
+

@@ -8,3 +8,8 @@ Thumbs.db
 
 # Archivos de variables de entorno (seguridad)
 .env
+
+# NEW: uploads locales generados por el modulo Inventario.
+# WHY: las imagenes subidas viven en disco local y no deben versionarse.
+# IMPACT: evita ruido de archivos binarios en git; no afecta la carga en runtime.
+uploads/

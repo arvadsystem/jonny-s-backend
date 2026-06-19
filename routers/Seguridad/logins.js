@@ -1,45 +1,58 @@
 /**
  * routers/seguridad/logins.js
  * HU78: Consulta de logs de login
- * - Protegido por RBAC
- * - Soporta filtros + paginación (limit/offset)
- *
- * Endpoint:
- * GET /seguridad/logins?estado=SUCCESS|FAIL&desde=YYYY-MM-DD&hasta=YYYY-MM-DD&limit=10&offset=0
  */
 
 import express from "express";
 import pool from "../../config/db-connection.js";
 import { checkPermission } from "../../middleware/checkPermission.js";
-
+import { timestampAsHNToISO, toHNWallTimestamp } from "../../utils/dates.js";
+import { securityReadLimiter } from "./securityRateLimit.js";
 const router = express.Router();
 
-// Puedes cambiarlo por otro permiso si deseas:
-// - "SEGURIDAD_VER" ya existe en tu RBAC (según tu HU82)
-const PERMISO_VER = "SEGURIDAD_VER";
+const PERMISO_VER = ["SEGURIDAD_LOGINS_VER", "SEGURIDAD_VER"];
+const MAX_SEARCH_LEN = 120;
 
-router.get("/logins", checkPermission(PERMISO_VER), async (req, res) => {
+const clampInt = (value, def, min, max) => {
+  const n = Number.parseInt(String(value ?? ""), 10);
+  if (Number.isNaN(n)) return def;
+  return Math.max(min, Math.min(max, n));
+};
+
+const parsePositiveIntOrNull = (value) => {
+  if (value === null || value === undefined || String(value).trim() === "") return null;
+  const n = Number.parseInt(String(value), 10);
+  return Number.isInteger(n) && n > 0 ? n : null;
+};
+
+const sanitizeSearchTerm = (value) =>
+  String(value ?? "").trim().slice(0, MAX_SEARCH_LEN);
+
+router.get("/logins", securityReadLimiter, checkPermission(PERMISO_VER), async (req, res) => {
   try {
     const {
-      estado,   // SUCCESS | FAIL | (vacío)
-      desde,    // YYYY-MM-DD o ISO
-      hasta,    // YYYY-MM-DD o ISO
+      estado,
+      desde,
+      hasta,
       id_usuario,
-      usuario,  // nombre_usuario_intentado o nombre_usuario real (búsqueda)
+      usuario,
       limit,
       offset,
     } = req.query;
 
-    // paginación simple con límites seguros
-    const lim = Math.min(Number(limit) || 10, 200);
-    const off = Number(offset) || 0;
+    const lim = clampInt(limit, 10, 1, 200);
+    const off = clampInt(offset, 0, 0, 1_000_000);
+    const idUsuario = parsePositiveIntOrNull(id_usuario);
+    const usuarioTerm = sanitizeSearchTerm(usuario);
 
-    // WHERE dinámico
+    if (id_usuario !== undefined && id_usuario !== null && String(id_usuario).trim() !== "" && idUsuario === null) {
+      return res.status(400).json({ error: true, message: "id_usuario invalido" });
+    }
+
     const where = [];
     const params = [];
     let i = 1;
 
-    // estado -> exito boolean
     if (estado) {
       const e = String(estado).toUpperCase();
       if (e === "SUCCESS") {
@@ -51,31 +64,36 @@ router.get("/logins", checkPermission(PERMISO_VER), async (req, res) => {
       }
     }
 
+    // ✅ filtros sobre timestamp sin TZ (HN) sin usar new Date("YYYY-MM-DD")
     if (desde) {
-      where.push(`l.fecha_hora >= $${i++}`);
-      params.push(new Date(desde));
+      const v = toHNWallTimestamp(desde, { endOfDay: false });
+      if (v) {
+        where.push(`l.fecha_hora >= $${i++}::timestamp`);
+        params.push(v);
+      }
     }
 
     if (hasta) {
-      where.push(`l.fecha_hora <= $${i++}`);
-      params.push(new Date(hasta));
+      const v = toHNWallTimestamp(hasta, { endOfDay: true });
+      if (v) {
+        where.push(`l.fecha_hora <= $${i++}::timestamp`);
+        params.push(v);
+      }
     }
 
-    if (id_usuario) {
+    if (idUsuario !== null) {
       where.push(`l.id_usuario = $${i++}`);
-      params.push(Number(id_usuario));
+      params.push(idUsuario);
     }
 
-    // búsqueda por username real o intentado (LIKE)
-    if (usuario) {
+    if (usuarioTerm) {
       where.push(`(u.nombre_usuario ILIKE $${i++} OR l.nombre_usuario_intentado ILIKE $${i++})`);
-      const like = `%${usuario}%`;
+      const like = `%${usuarioTerm}%`;
       params.push(like, like);
     }
 
     const whereSql = where.length ? `WHERE ${where.join(" AND ")}` : "";
 
-    // total
     const countSql = `
       SELECT COUNT(*)::int AS total
       FROM logins l
@@ -85,7 +103,6 @@ router.get("/logins", checkPermission(PERMISO_VER), async (req, res) => {
     const countRes = await pool.query(countSql, params);
     const total = countRes.rows[0]?.total ?? 0;
 
-    // rows
     const dataSql = `
       SELECT
         l.id_login,
@@ -108,12 +125,17 @@ router.get("/logins", checkPermission(PERMISO_VER), async (req, res) => {
 
     const dataRes = await pool.query(dataSql, [...params, lim, off]);
 
+    const rows = dataRes.rows.map((r) => ({
+      ...r,
+      fecha_hora: timestampAsHNToISO(r.fecha_hora),
+    }));
+
     return res.json({
       error: false,
       total,
       limit: lim,
       offset: off,
-      rows: dataRes.rows,
+      rows,
     });
   } catch (err) {
     console.error("GET /seguridad/logins error:", err.message);

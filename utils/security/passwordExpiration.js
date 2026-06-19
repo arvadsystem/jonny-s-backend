@@ -1,0 +1,110 @@
+import pool from '../../config/db-connection.js';
+
+export const PASSWORD_EXPIRATION_DAYS = 60;
+export const PASSWORD_CHANGED_AT_COLUMN = 'fecha_cambio_clave';
+
+const DAY_MS = 24 * 60 * 60 * 1000;
+const PASSWORD_FORCE_EXCLUDED_ROLE_CODES = new Set([
+  'CLIENTE',
+  'P_COCINA',
+  'COCINA',
+  'AUXILIAR_COCINA'
+]);
+
+let ensurePasswordChangedAtColumnPromise = null;
+
+const normalizeRoleName = (value) =>
+  String(value ?? '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .trim()
+    .replace(/[\s-]+/g, '_')
+    .toUpperCase();
+
+const parseDate = (value) => {
+  if (!value) return null;
+  const parsed = value instanceof Date ? value : new Date(value);
+  return Number.isNaN(parsed.getTime()) ? null : parsed;
+};
+
+export const isClienteUser = ({ roles = [], tipoUsuario = '' } = {}) => {
+  const tipo = normalizeRoleName(tipoUsuario);
+  if (PASSWORD_FORCE_EXCLUDED_ROLE_CODES.has(tipo)) return true;
+
+  const roleList = Array.isArray(roles) ? roles : [roles];
+  return roleList
+    .map(normalizeRoleName)
+    .some((roleName) => PASSWORD_FORCE_EXCLUDED_ROLE_CODES.has(roleName));
+};
+
+export const evaluatePasswordExpiration = ({
+  roles = [],
+  tipoUsuario = '',
+  mustChangePassword = false,
+  passwordChangedAt = null,
+  createdAt = null,
+  now = new Date(),
+  maxAgeDays = PASSWORD_EXPIRATION_DAYS,
+} = {}) => {
+  const excludedByClienteRole = isClienteUser({ roles, tipoUsuario });
+  const referenceDate = parseDate(passwordChangedAt) || parseDate(createdAt);
+  const nowDate = parseDate(now) || new Date();
+
+  let ageDays = null;
+  if (referenceDate) {
+    const diffMs = nowDate.getTime() - referenceDate.getTime();
+    ageDays = diffMs < 0 ? 0 : Math.floor(diffMs / DAY_MS);
+  }
+
+  const manualMustChange = Boolean(mustChangePassword);
+  const expiredByAge = !excludedByClienteRole && ageDays !== null && ageDays >= maxAgeDays;
+  const mustChange = !excludedByClienteRole && (manualMustChange || expiredByAge);
+
+  return {
+    excludedByClienteRole,
+    manualMustChange,
+    expiredByAge,
+    mustChangePassword: mustChange,
+    ageDays,
+    referenceDate,
+  };
+};
+
+const ensureColumnWithRunner = async (queryRunner) => {
+  const result = await queryRunner.query(
+    `
+      SELECT 1
+      FROM information_schema.columns
+      WHERE table_schema = 'public'
+        AND table_name = 'usuarios'
+        AND column_name = $1
+      LIMIT 1
+    `,
+    [PASSWORD_CHANGED_AT_COLUMN]
+  );
+
+  if (!result.rows.length) {
+    const error = new Error(
+      `Falta la columna requerida public.usuarios.${PASSWORD_CHANGED_AT_COLUMN}. Ejecuta la migracion SQL correspondiente.`
+    );
+    error.code = 'PASSWORD_CHANGED_AT_COLUMN_MISSING';
+    throw error;
+  }
+};
+
+export const ensurePasswordChangedAtColumn = async (queryRunner = pool) => {
+  if (queryRunner !== pool) {
+    await ensureColumnWithRunner(queryRunner);
+    return;
+  }
+
+  if (!ensurePasswordChangedAtColumnPromise) {
+    ensurePasswordChangedAtColumnPromise = ensureColumnWithRunner(pool).catch((error) => {
+      ensurePasswordChangedAtColumnPromise = null;
+      throw error;
+    });
+  }
+
+  await ensurePasswordChangedAtColumnPromise;
+};
+

@@ -1,25 +1,109 @@
 /**
  * routers/Seguridad/sesiones.js
  * HU79: endpoints para ver y controlar sesiones activas.
+ *
+ * ✅ Sprint 3 (HU31 adaptada):
+ * - Listado GLOBAL de sesiones ACTIVAS (solo Super Admin)
+ * - Cerrar TODAS las sesiones activas (menos la actual) (solo Super Admin)
+ * - ✅ HU84: Cerrar 1 sesión específica de otro usuario (solo Super Admin)
  */
 
 import express from 'express';
 import pool from '../../config/db-connection.js';
-import { closeSession } from '../../utils/security/sessionService.js';
-import { checkPermission } from '../../middleware/checkPermission.js';
+import { closeInactiveSessions, closeSession } from '../../utils/security/sessionService.js';
+import { checkPermission, isRequestUserSuperAdmin } from '../../middleware/checkPermission.js';
+import { timestampAsHNToISO } from '../../utils/dates.js';
+import { insertSecurityAuditLog } from './auditLogger.js';
+import { securityReadLimiter, securityWriteLimiter } from './securityRateLimit.js';
 
 const router = express.Router();
+const MAX_SEARCH_LEN = 120;
+const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+// =====================================================
+// Helpers
+// =====================================================
+const requireSuperAdmin = async (req, res) => {
+  const isSuperAdmin = await isRequestUserSuperAdmin(req);
+  if (!isSuperAdmin) {
+    res.status(403).json({ error: true, message: 'Acceso denegado: solo Super Admin' });
+    return false;
+  }
+  return true;
+};
+
+const clampInt = (value, def, min, max) => {
+  const n = Number.parseInt(String(value ?? ''), 10);
+  if (Number.isNaN(n)) return def;
+  return Math.max(min, Math.min(max, n));
+};
+
+const toHNISO = (val) => timestampAsHNToISO(val);
+
+const logSecurityEvent = async (payload) => {
+  try {
+    await insertSecurityAuditLog(payload);
+  } catch (auditErr) {
+    console.error('Audit log error (sesiones):', auditErr);
+  }
+};
+
+/**
+ * Construye cláusula de búsqueda con placeholders.
+ * @param {string} buscar
+ * @param {number} startIdx índice inicial de placeholders ($N)
+ */
+const buildBuscarClause = (buscar, startIdx) => {
+  const term = String(buscar ?? '').trim();
+  if (!term) return { sql: '', params: [], nextIdx: startIdx };
+
+  const like = `%${term}%`;
+  const params = [];
+  let i = startIdx;
+
+  const p1 = `$${i++}`; params.push(like); // usuario
+  const p2 = `$${i++}`; params.push(like); // nombre
+  const p3 = `$${i++}`; params.push(like); // apellido
+  const p4 = `$${i++}`; params.push(like); // ip
+
+  return {
+    sql: `AND (
+      u.nombre_usuario ILIKE ${p1} OR
+      COALESCE(p.nombre,'') ILIKE ${p2} OR
+      COALESCE(p.apellido,'') ILIKE ${p3} OR
+      COALESCE(sa.ip_origen,'') ILIKE ${p4}
+    )`,
+    params,
+    nextIdx: i
+  };
+};
+
+const sanitizeSearchTerm = (value) =>
+  String(value ?? '').trim().slice(0, MAX_SEARCH_LEN);
+
+const isValidSessionId = (value) =>
+  UUID_REGEX.test(String(value ?? '').trim());
+
+// =====================================================
+// HU79: Sesiones del usuario actual
+// =====================================================
 
 /**
  * GET /seguridad/sesiones
  * Lista sesiones del usuario autenticado.
  */
-router.get('/sesiones', checkPermission('SEGURIDAD_VER'), async (req, res) => {
+router.get(
+  '/sesiones',
+  securityReadLimiter,
+  checkPermission(['SEGURIDAD_VER', 'SEGURIDAD_SESIONES_VER', 'SEGURIDAD_SESIONES_VER_GLOBAL']),
+  async (req, res) => {
   try {
     const user = req.user || req.usuario;
     if (!user?.id_usuario) {
       return res.status(401).json({ error: true, message: 'No autenticado' });
     }
+
+    await closeInactiveSessions();
 
     const sql = `
       SELECT
@@ -33,26 +117,40 @@ router.get('/sesiones', checkPermission('SEGURIDAD_VER'), async (req, res) => {
         ultima_actividad,
         activa,
         fecha_cierre,
-        motivo_cierre
+        motivo_cierre,
+        (id_sesion = $2) AS es_actual
       FROM sesiones_activas
       WHERE id_usuario = $1
       ORDER BY activa DESC, ultima_actividad DESC
     `;
 
-    const result = await pool.query(sql, [user.id_usuario]);
-    return res.json({ error: false, sesiones: result.rows });
+    const result = await pool.query(sql, [user.id_usuario, user.sid]);
+
+    // ✅ timestamp sin TZ (HN) -> ISO UTC con Z
+    const sesiones = result.rows.map((s) => ({
+      ...s,
+      fecha_inicio: toHNISO(s.fecha_inicio),
+      ultima_actividad: toHNISO(s.ultima_actividad),
+      fecha_cierre: toHNISO(s.fecha_cierre)
+    }));
+
+    return res.json({ error: false, sesiones });
   } catch (err) {
     console.error('GET /seguridad/sesiones error:', err);
     return res.status(500).json({ error: true, message: 'Error interno del servidor' });
   }
-});
+  }
+);
 
 /**
  * POST /seguridad/sesiones/cerrar
- * Cierra (remotamente) una sesión por id_sesion.
  * Body: { id_sesion: "uuid..." }
  */
-router.post('/sesiones/cerrar', checkPermission('SEGURIDAD_SESIONES_CERRAR'), async (req, res) => {
+router.post(
+  '/sesiones/cerrar',
+  securityWriteLimiter,
+  checkPermission(['SEGURIDAD_SESIONES_CERRAR', 'SEGURIDAD_SESIONES_CERRAR_OTRAS']),
+  async (req, res) => {
   try {
     const user = req.user || req.usuario;
     const { id_sesion } = req.body;
@@ -63,8 +161,11 @@ router.post('/sesiones/cerrar', checkPermission('SEGURIDAD_SESIONES_CERRAR'), as
     if (!id_sesion) {
       return res.status(400).json({ error: true, message: 'id_sesion es requerido' });
     }
+    if (!isValidSessionId(id_sesion)) {
+      return res.status(400).json({ error: true, message: 'id_sesion invalido' });
+    }
 
-    // ✅ Seguridad: verifica que la sesión pertenece al usuario
+    // ✅ Verifica que la sesión pertenece al usuario
     const check = await pool.query(
       'SELECT id_sesion FROM sesiones_activas WHERE id_sesion = $1 AND id_usuario = $2',
       [id_sesion, user.id_usuario]
@@ -76,20 +177,37 @@ router.post('/sesiones/cerrar', checkPermission('SEGURIDAD_SESIONES_CERRAR'), as
 
     await closeSession(id_sesion, 'cierre_remoto');
 
-    // Nota: si cierras la sesión actual, el usuario seguirá con token hasta que lo bloqueemos
-    // (en HU79 paso 4 agregamos "validar sesión activa" en auth para forzar logout)
+    await logSecurityEvent({
+      req,
+      actorId: user.id_usuario,
+      accion: 'CERRAR_SESION',
+      objetivo: { tabla_afectada: 'sesiones_activas' },
+      descripcion: `Usuario ${user.id_usuario} cerro una sesion remota`,
+      detalle: {
+        actor_id: user.id_usuario,
+        id_sesion,
+        sid_actual: user.sid || null,
+        motivo_cierre: 'cierre_remoto'
+      }
+    });
+
     return res.json({ error: false, message: 'Sesión cerrada' });
   } catch (err) {
     console.error('POST /seguridad/sesiones/cerrar error:', err);
     return res.status(500).json({ error: true, message: 'Error interno del servidor' });
   }
-});
+  }
+);
 
 /**
  * POST /seguridad/sesiones/cerrar-otras
- * Cierra todas las sesiones activas del usuario EXCEPTO la sesión actual (sid del JWT).
+ * Cierra todas las sesiones del usuario autenticado menos la actual.
  */
-router.post('/sesiones/cerrar-otras', checkPermission('SEGURIDAD_SESIONES_CERRAR'), async (req, res) => {
+router.post(
+  '/sesiones/cerrar-otras',
+  securityWriteLimiter,
+  checkPermission(['SEGURIDAD_SESIONES_CERRAR', 'SEGURIDAD_SESIONES_CERRAR_OTRAS']),
+  async (req, res) => {
   try {
     const user = req.user || req.usuario;
     if (!user?.id_usuario) {
@@ -102,7 +220,7 @@ router.post('/sesiones/cerrar-otras', checkPermission('SEGURIDAD_SESIONES_CERRAR
     const sql = `
       UPDATE sesiones_activas
       SET activa = FALSE,
-          fecha_cierre = CURRENT_TIMESTAMP,
+          fecha_cierre = timezone('America/Tegucigalpa', now()),
           motivo_cierre = 'cierre_otras'
       WHERE id_usuario = $1
         AND activa = TRUE
@@ -110,6 +228,21 @@ router.post('/sesiones/cerrar-otras', checkPermission('SEGURIDAD_SESIONES_CERRAR
     `;
 
     const result = await pool.query(sql, [user.id_usuario, user.sid]);
+
+    await logSecurityEvent({
+      req,
+      actorId: user.id_usuario,
+      accion: 'CERRAR_OTRAS_SESIONES',
+      objetivo: { tabla_afectada: 'usuarios', id_registro: user.id_usuario },
+      descripcion: `Usuario ${user.id_usuario} cerro otras sesiones`,
+      detalle: {
+        actor_id: user.id_usuario,
+        cerradas: result.rowCount,
+        sid_actual: user.sid || null,
+        motivo_cierre: 'cierre_otras'
+      }
+    });
+
     return res.json({
       error: false,
       message: 'Otras sesiones cerradas',
@@ -119,6 +252,264 @@ router.post('/sesiones/cerrar-otras', checkPermission('SEGURIDAD_SESIONES_CERRAR
     console.error('POST /seguridad/sesiones/cerrar-otras error:', err);
     return res.status(500).json({ error: true, message: 'Error interno del servidor' });
   }
-});
+  }
+);
+
+// =====================================================
+// Sprint 3 (HU31 adaptada): Sesiones globales (solo Super Admin)
+// =====================================================
+
+/**
+ * GET /seguridad/sesiones/global
+ * Lista sesiones ACTIVAS de TODO el sistema.
+ * Query:
+ * - buscar (opcional)
+ * - limit (default 10)
+ * - offset (default 0)
+ */
+router.get(
+  '/sesiones/global',
+  securityReadLimiter,
+  checkPermission(['SEGURIDAD_VER', 'SEGURIDAD_SESIONES_VER_GLOBAL']),
+  async (req, res) => {
+  try {
+    const user = req.user || req.usuario;
+    if (!user?.id_usuario) {
+      return res.status(401).json({ error: true, message: 'No autenticado' });
+    }
+
+    // 🔒 Solo Super Admin
+    if (!(await requireSuperAdmin(req, res))) return;
+
+    await closeInactiveSessions();
+
+    const buscar = sanitizeSearchTerm(req.query.buscar);
+    const limit = clampInt(req.query.limit, 10, 1, 50);
+    const offset = clampInt(req.query.offset, 0, 0, 1_000_000);
+
+    // COUNT (placeholders empiezan en $1)
+    const buscarCount = buildBuscarClause(buscar, 1);
+
+    const sqlCount = `
+      SELECT COUNT(*)::int AS total
+      FROM sesiones_activas sa
+      INNER JOIN usuarios u ON u.id_usuario = sa.id_usuario
+      LEFT JOIN empleados e ON e.id_empleado = u.id_empleado
+      LEFT JOIN personas p ON p.id_persona = e.id_persona
+      WHERE sa.activa = TRUE
+      ${buscarCount.sql}
+    `;
+
+    // DATA (placeholders: $1 reservado para sid -> es_actual)
+    const buscarData = buildBuscarClause(buscar, 2);
+
+    const sqlData = `
+      SELECT
+        sa.id_sesion,
+        sa.id_usuario,
+        u.nombre_usuario,
+        p.nombre,
+        p.apellido,
+        sa.ip_origen,
+        sa.dispositivo,
+        sa.navegador,
+        sa.sistema_operativo,
+        sa.ubicacion,
+        sa.fecha_inicio,
+        sa.ultima_actividad,
+        sa.activa,
+        (sa.id_sesion = $1) AS es_actual
+      FROM sesiones_activas sa
+      INNER JOIN usuarios u ON u.id_usuario = sa.id_usuario
+      LEFT JOIN empleados e ON e.id_empleado = u.id_empleado
+      LEFT JOIN personas p ON p.id_persona = e.id_persona
+      WHERE sa.activa = TRUE
+      ${buscarData.sql}
+      ORDER BY sa.ultima_actividad DESC
+      LIMIT $${buscarData.nextIdx}
+      OFFSET $${buscarData.nextIdx + 1}
+    `;
+
+    const countRes = await pool.query(sqlCount, buscarCount.params);
+
+    const dataParams = [user.sid, ...buscarData.params, limit, offset];
+    const dataRes = await pool.query(sqlData, dataParams);
+
+    const rows = dataRes.rows.map((s) => ({
+      ...s,
+      fecha_inicio: toHNISO(s.fecha_inicio),
+      ultima_actividad: toHNISO(s.ultima_actividad)
+    }));
+
+    return res.json({
+      error: false,
+      total: countRes.rows?.[0]?.total ?? 0,
+      limit,
+      offset,
+      rows
+    });
+  } catch (err) {
+    console.error('GET /seguridad/sesiones/global error:', err);
+    return res.status(500).json({ error: true, message: 'Error interno del servidor' });
+  }
+  }
+);
+
+/**
+ * POST /seguridad/sesiones/cerrar-global
+ * HU84: Cierra una sesión activa específica del sistema.
+ * Body: { id_sesion: "uuid..." }
+ *
+ * Reglas:
+ * - Solo Super Admin
+ * - No permite cerrar la sesión actual (req.user.sid)
+ * - Marca activa=false y registra motivo
+ */
+router.post(
+  '/sesiones/cerrar-global',
+  securityWriteLimiter,
+  checkPermission(['SEGURIDAD_SESIONES_CERRAR_GLOBAL', 'SEGURIDAD_SESIONES_CERRAR']),
+  async (req, res) => {
+    try {
+      const user = req.user || req.usuario;
+      const { id_sesion } = req.body;
+
+      if (!user?.id_usuario) {
+        return res.status(401).json({ error: true, message: 'No autenticado' });
+      }
+      if (!user?.sid) {
+        return res.status(400).json({ error: true, message: 'Sesión actual no identificada (sid)' });
+      }
+
+      // 🔒 Solo Super Admin
+      if (!(await requireSuperAdmin(req, res))) return;
+
+      if (!id_sesion) {
+        return res.status(400).json({ error: true, message: 'id_sesion es requerido' });
+      }
+      if (!isValidSessionId(id_sesion)) {
+        return res.status(400).json({ error: true, message: 'id_sesion invalido' });
+      }
+
+      // ⛔ Evitar cerrar la sesión actual del Super Admin
+      if (String(id_sesion) === String(user.sid)) {
+        return res.status(409).json({
+          error: true,
+          message: 'No se puede cerrar la sesión actual'
+        });
+      }
+
+      // Intento de cierre (solo si está activa)
+      const sql = `
+        UPDATE sesiones_activas
+        SET activa = FALSE,
+            fecha_cierre = timezone('America/Tegucigalpa', now()),
+            motivo_cierre = 'cierre_individual_superadmin'
+        WHERE id_sesion = $1
+          AND activa = TRUE
+        RETURNING id_usuario, id_sesion
+      `;
+
+      const result = await pool.query(sql, [id_sesion]);
+
+      if (result.rowCount === 0) {
+        // Diferenciar no existe vs ya cerrada
+        const check = await pool.query('SELECT activa FROM sesiones_activas WHERE id_sesion = $1 LIMIT 1', [id_sesion]);
+        if (check.rows.length === 0) {
+          return res.status(404).json({ error: true, message: 'Sesión no encontrada' });
+        }
+        return res.status(409).json({ error: true, message: 'La sesión ya está cerrada' });
+      }
+
+      const targetUserId = result.rows?.[0]?.id_usuario ?? null;
+
+      await logSecurityEvent({
+        req,
+        actorId: user.id_usuario,
+        accion: 'CERRAR_SESION_GLOBAL',
+        objetivo: { tabla_afectada: 'usuarios', id_registro: targetUserId },
+        descripcion: 'SuperAdmin ' + user.id_usuario + ' cerro sesion global',
+        detalle: {
+          actor_id: user.id_usuario,
+          target_user_id: targetUserId,
+          id_sesion,
+          motivo_cierre: 'cierre_individual_superadmin'
+        }
+      });
+
+      return res.json({
+        error: false,
+        message: 'Sesión cerrada (cierre individual Super Admin)',
+        id_sesion
+      });
+    } catch (err) {
+      console.error('POST /seguridad/sesiones/cerrar-global error:', err);
+      return res.status(500).json({ error: true, message: 'Error interno del servidor' });
+    }
+  }
+);
+
+/**
+ * POST /seguridad/sesiones/cerrar-global-menos-actual
+ * Cierra TODAS las sesiones activas del sistema, excepto la actual.
+ */
+router.post(
+  '/sesiones/cerrar-global-menos-actual',
+  securityWriteLimiter,
+  checkPermission([
+    'SEGURIDAD_SESIONES_CERRAR_GLOBAL_MENOS_ACTUAL',
+    'SEGURIDAD_SESIONES_CERRAR_GLOBAL',
+    'SEGURIDAD_SESIONES_CERRAR'
+  ]),
+  async (req, res) => {
+    try {
+      const user = req.user || req.usuario;
+
+      if (!user?.id_usuario) {
+        return res.status(401).json({ error: true, message: 'No autenticado' });
+      }
+      if (!user?.sid) {
+        return res.status(400).json({ error: true, message: 'Sesión actual no identificada (sid)' });
+      }
+
+      // 🔒 Solo Super Admin
+      if (!(await requireSuperAdmin(req, res))) return;
+
+      const sql = `
+        UPDATE sesiones_activas
+        SET activa = FALSE,
+            fecha_cierre = timezone('America/Tegucigalpa', now()),
+            motivo_cierre = 'cierre_global_superadmin'
+        WHERE activa = TRUE
+          AND id_sesion <> $1
+      `;
+
+      const result = await pool.query(sql, [user.sid]);
+
+      await logSecurityEvent({
+        req,
+        actorId: user.id_usuario,
+        accion: 'CERRAR_SESIONES_GLOBALES',
+        objetivo: { tabla_afectada: 'sesiones_activas' },
+        descripcion: `SuperAdmin ${user.id_usuario} cerro sesiones globales`,
+        detalle: {
+          actor_id: user.id_usuario,
+          cerradas: result.rowCount,
+          sid_actual: user.sid || null,
+          motivo_cierre: 'cierre_global_superadmin'
+        }
+      });
+
+      return res.json({
+        error: false,
+        message: 'Sesiones globales cerradas (menos la actual)',
+        cerradas: result.rowCount
+      });
+    } catch (err) {
+      console.error('POST /seguridad/sesiones/cerrar-global-menos-actual error:', err);
+      return res.status(500).json({ error: true, message: 'Error interno del servidor' });
+    }
+  }
+);
 
 export default router;

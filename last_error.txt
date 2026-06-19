@@ -1,0 +1,4 @@
+error: FOR UPDATE cannot be applied to the nullable side of an outer join
+    at C:\Users\academico\Documents\unah\implementacion de sistemas\Backend\jonnys\node_modules\pg\lib\client.js:545:17
+    at process.processTicksAndRejections (node:internal/process/task_queues:105:5)
+    at async file:///C:/Users/academico/Documents/unah/implementacion%20de%20sistemas/Backend/jonnys/routers/cocina.js:530:28

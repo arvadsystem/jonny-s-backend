@@ -6,19 +6,28 @@
   "scripts": {
     "start": "node app.js",
     "dev": "node --watch app.js",
+    "qa:menu-publico": "node scripts/qa-menu-publico.js",
+    "rbac:personas:dry-run": "node scripts/sync-personas-rbac.js",
+    "rbac:personas:sync": "node scripts/sync-personas-rbac.js --apply",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "author": "",
   "license": "ISC",
   "description": "",
   "dependencies": {
+    "@supabase/supabase-js": "^2.101.1",
     "body-parser": "^2.2.2",
     "cookie-parser": "^1.4.6",
     "cors": "^2.8.5",
     "dotenv": "^16.6.1",
     "express": "^5.2.1",
+    "express-rate-limit": "^8.3.2",
+    "helmet": "^8.1.0",
     "jsonwebtoken": "^9.0.3",
-    "pg": "^8.16.3"
+    "nodemailer": "^8.0.4",
+    "pdfkit": "^0.17.2",
+    "pdfmake": "^0.3.9",
+    "pg": "^8.16.3",
+    "sharp": "^0.34.5"
   }
 }
-
