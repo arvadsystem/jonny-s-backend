@@ -476,6 +476,7 @@ export const listCombosCatalogoHandler = async (req, res) => {
       )
       SELECT DISTINCT
         c.id_combo,
+        c.nombre_combo,
         c.descripcion,
         c.precio,
         c.estado,
@@ -497,7 +498,7 @@ export const listCombosCatalogoHandler = async (req, res) => {
         ON cd.id_combo = c.id_combo
       ${joinClause}
       WHERE COALESCE(c.estado, true) = true ${whereClause}
-      ORDER BY c.descripcion ASC, c.id_combo ASC
+      ORDER BY COALESCE(NULLIF(TRIM(c.nombre_combo), ''), c.descripcion) ASC, c.id_combo ASC
     `;
 
     const result = await pool.query(query, params);

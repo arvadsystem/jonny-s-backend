@@ -2230,9 +2230,6 @@ const resolveLineExtras = ({ item, allowedExtrasMap }) => {
       return { ok: false, message: 'Uno o mas extras seleccionados no son validos para este item.' };
     }
     const cantidad = Number(entry.cantidad || 0);
-    if (cantidad > Number(item.cantidad || 0)) {
-      return { ok: false, message: 'La cantidad de un extra no puede ser mayor que la cantidad del item.' };
-    }
     if (extra.disponible !== true) {
       return {
         ok: false,
@@ -2278,6 +2275,48 @@ const resolveLineExtras = ({ item, allowedExtrasMap }) => {
   }
 
   return { ok: true, selected, subtotal };
+};
+
+const validateAggregatedExtrasInventory = (lines = []) => {
+  const usageByStockKey = new Map();
+
+  for (const line of Array.isArray(lines) ? lines : []) {
+    for (const extra of Array.isArray(line?.extras_detalle) ? line.extras_detalle : []) {
+      const idInsumo = parseOptionalPositiveInt(extra?.id_insumo);
+      const idAlmacen = parseOptionalPositiveInt(extra?.id_almacen);
+      const consumoBase = Number(extra?.cantidad_insumo ?? extra?.cant ?? 0);
+      const cantidad = Number(extra?.cantidad || 0);
+      if (!idInsumo || !idAlmacen || consumoBase <= 0 || cantidad <= 0) continue;
+
+      const stockKey = `${idInsumo}:${idAlmacen}`;
+      const current = usageByStockKey.get(stockKey) || {
+        idInsumo,
+        idAlmacen,
+        nombre: extra.nombre || 'extra',
+        stockDisponible: Number(extra.stock_disponible ?? 0),
+        requerido: 0
+      };
+      current.requerido = roundMoney(current.requerido + (consumoBase * cantidad));
+      current.stockDisponible = Math.min(current.stockDisponible, Number(extra.stock_disponible ?? 0));
+      usageByStockKey.set(stockKey, current);
+    }
+  }
+
+  for (const usage of usageByStockKey.values()) {
+    if (usage.stockDisponible < usage.requerido) {
+      return {
+        ok: false,
+        status: 409,
+        body: {
+          error: true,
+          code: 'VENTAS_EXTRA_INVENTARIO_NO_DISPONIBLE',
+          message: `No hay existencias suficientes para el extra ${usage.nombre}.`
+        }
+      };
+    }
+  }
+
+  return { ok: true };
 };
 
 const hasVentaExtras = (venta) =>
@@ -3186,6 +3225,9 @@ const hydrateVentaLines = async (client, normalizedItems, perf = null, options =
     });
     subTotals.push(subTotal);
   }
+
+  const extrasInventoryResult = validateAggregatedExtrasInventory(lines);
+  if (!extrasInventoryResult.ok) return extrasInventoryResult;
 
   perf?.add?.('totals_items_ms', totalsItemsStart);
   return { ok: true, data: { lines, subTotals } };
