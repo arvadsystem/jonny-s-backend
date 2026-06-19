@@ -131,6 +131,11 @@ import {
   logVentasPerfStartupIfEnabled
 } from './ventas/utils/perfUtils.js';
 import { resolveExtrasInventory } from './ventas/services/extrasInventoryService.js';
+import {
+  attachSalsaInventorySnapshotsToLines,
+  consumeSalsasInventoryFromSnapshots,
+  getSelectedSalsaIdsFromLines
+} from './ventas/services/salsasInventoryService.js';
 
 const router = express.Router();
 
@@ -2691,7 +2696,8 @@ const normalizeComplementosFromMenuConfig = (configuracionMenu) => {
   return selected.map((entry) => ({
     id_complemento: Number(entry?.id_complemento || entry?.id_salsa || 0),
     id_salsa: Number(entry?.id_salsa || entry?.id_complemento || 0),
-    nombre: String(entry?.nombre || 'Complemento').trim()
+    nombre: String(entry?.nombre || 'Complemento').trim(),
+    inventario: entry?.inventario || null
   })).filter((entry) => entry.id_complemento > 0);
 };
 
@@ -7718,6 +7724,11 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
 
     const cuentaDivididaPlanStart = ventasPerf.now();
     const pedidoPendiente = prepared.data;
+    await attachSalsaInventorySnapshotsToLines({
+      client,
+      lines: pedidoPendiente.pedido_lines,
+      idSucursal: pedidoPendiente.id_sucursal
+    });
     const cuentaDivisionPlan = buildCuentaDivisionPlan({
       cuentaDividida: req.body?.cuenta_dividida,
       lines: pedidoPendiente.pedido_lines,
@@ -7731,9 +7742,11 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
       items_count: Array.isArray(pedidoPendiente.pedido_lines) ? pedidoPendiente.pedido_lines.length : 0
     });
     ventasPerfContext.cuenta_dividida = Boolean(cuentaDivisionPlan);
+    const pedidoPendienteHasSalsasInventario = getSelectedSalsaIdsFromLines(pedidoPendiente.pedido_lines).length > 0;
 
     const shouldUsePedidoPendienteRpcV1 =
       pedidoPendienteRpcEnabled
+      && !pedidoPendienteHasSalsasInventario
       && !cuentaDivisionPlan
       && Array.isArray(pedidoPendiente.pedido_lines)
       && pedidoPendiente.pedido_lines.length > 0;
@@ -7770,6 +7783,8 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
     pedidoPendientePersistenceMode = 'legacy';
     if (cuentaDivisionPlan) {
       pedidoPendienteRpcSkipReason = 'cuenta_dividida';
+    } else if (pedidoPendienteHasSalsasInventario) {
+      pedidoPendienteRpcSkipReason = 'salsas_inventario';
     } else if (!pedidoPendienteRpcEnabled) {
       pedidoPendienteRpcSkipReason = 'flag_disabled';
     } else if (!Array.isArray(pedidoPendiente.pedido_lines) || pedidoPendiente.pedido_lines.length === 0) {
@@ -7842,6 +7857,14 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
       };
     }
     ventasPerf.add('pedido_ms', pedidoStart);
+    await consumeSalsasInventoryFromSnapshots({
+      client,
+      lines: pedidoPendiente.pedido_lines,
+      idUsuario: userId,
+      idReferencia: idPedido,
+      refOrigen: 'PEDIDO_PENDIENTE_SALSA',
+      descripcion: 'Salida por salsas en pedido pendiente'
+    });
 
     const hasDetallePedidoConfiguracionMenu = await hasColumn(client, 'detalle_pedido', 'configuracion_menu');
     const detalleStart = ventasPerf.now();
@@ -9025,6 +9048,11 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
     }
 
     const venta = prepared.data;
+    await attachSalsaInventorySnapshotsToLines({
+      client,
+      lines: venta.all_lines,
+      idSucursal: venta.id_sucursal
+    });
     const amountValidation = validateVentaMontoCobro({ venta });
     if (!amountValidation.ok) {
       await client.query('ROLLBACK');
@@ -9053,14 +9081,18 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
       items_count: allLines.length
     });
     const ventaHasExtras = hasVentaExtras(venta);
-    if (ventaHasExtras && ventasRpcV2Enabled) {
+    const ventaHasSalsasInventario = getSelectedSalsaIdsFromLines(venta.all_lines).length > 0;
+    if (ventaHasSalsasInventario) {
+      ventasPerfContext.rpc_enabled = false;
+      ventasPerfContext.rpc_version = 'legacy_salsas_inventario';
+    } else if (ventaHasExtras && ventasRpcV2Enabled) {
       ventasPerfContext.rpc_version = 'v2_extras';
     } else if (ventaHasExtras) {
       ventasPerfContext.rpc_enabled = false;
       ventasPerfContext.rpc_version = 'legacy_extras';
     }
 
-    if (ventasRpcV2Enabled) {
+    if (ventasRpcV2Enabled && !ventaHasSalsasInventario) {
       const rpcCreateResult = await createVentaWithRpcV2Transaction({
         client,
         venta,
@@ -9090,7 +9122,7 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
       return;
     }
 
-    if (ventasRpcV1Enabled && !ventaHasExtras) {
+    if (ventasRpcV1Enabled && !ventaHasExtras && !ventaHasSalsasInventario) {
       const rpcCreateResult = await createVentaWithRpcTransaction({
         client,
         venta,
@@ -9372,6 +9404,14 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
     const fechaHoraFacturacion = facturaRow.fecha_hora_facturacion || fechaHoraPedido || null;
     ventasPerf.add('factura_insert_ms', facturaInsertStart);
     ventasPerf.add('factura_ms', facturaInsertStart);
+    await consumeSalsasInventoryFromSnapshots({
+      client,
+      lines: venta.all_lines,
+      idUsuario: venta.id_usuario,
+      idReferencia: idFactura,
+      refOrigen: 'VENTA_SALSA',
+      descripcion: `Salida por salsas en venta ${correlativoVenta.codigo}`
+    });
 
     const facturaSnapshotStart = ventasPerf.now();
     const facturacionVenta = await obtenerConfigFacturacionParaVenta(client, venta.id_sucursal, {

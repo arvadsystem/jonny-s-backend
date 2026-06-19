@@ -1,6 +1,7 @@
 ﻿import pool from '../config/db-connection.js';
 import { generarCodigoDocumento } from './facturacionCorrelativoService.js';
 import { getClientIp, parseUserAgent } from '../utils/security/clientInfo.js';
+import { restoreSalsasInventoryFromSnapshots } from '../routers/ventas/services/salsasInventoryService.js';
 
 const REVERSAL_WINDOW_SQL = `NOW() - INTERVAL '1 hour'`;
 const VALID_MOTIVOS = new Set([
@@ -436,6 +437,7 @@ const resolveReversionLines = ({ tipoReversion, requestedLines, facturaLines, re
 
     output.push({
       id_detalle_factura: idDetalle,
+      origen_snapshot: line.origen_snapshot || null,
       tipo_item: line.tipo_item,
       id_producto: parsePositiveInt(line.id_producto),
       id_receta: parsePositiveInt(line.id_receta),
@@ -759,6 +761,33 @@ const registerInventoryReturn = async ({ client, idReversion, codigoReversion, c
       ]
     );
   }
+};
+
+const buildSalsaInventorySnapshotsForReturn = (lineas = []) => {
+  const snapshots = [];
+  for (const line of Array.isArray(lineas) ? lineas : []) {
+    const source = line?.origen_snapshot;
+    const selection = Array.isArray(source?.componentes?.seleccion)
+      ? source.componentes.seleccion
+      : Array.isArray(source?.complementos?.seleccion)
+        ? source.complementos.seleccion
+        : [];
+    const soldQty = Number(source?.cantidad || 0);
+    const reversedQty = Number(line?.cantidad_revertida || 0);
+    const ratio = soldQty > 0 && reversedQty > 0 ? Math.min(1, reversedQty / soldQty) : 1;
+    for (const entry of selection) {
+      const snapshot = entry?.inventario;
+      if (!snapshot || typeof snapshot !== 'object') continue;
+      const totalBase = Number(snapshot.cantidad_base_total || 0);
+      if (totalBase <= 0) continue;
+      snapshots.push({
+        ...snapshot,
+        cantidad_base_total: totalBase * ratio,
+        porciones: Number(snapshot.porciones || 0) * ratio
+      });
+    }
+  }
+  return snapshots;
 };
 
 export const listFacturaReversiones = async ({ idFactura, idUsuario }) => {
@@ -1096,6 +1125,13 @@ export const createVentaReversion = async ({ idFactura, body, req, idUsuario, id
       codigoReversion: correlativo.codigo,
       codigoVenta: factura.codigo_venta || `VTA-${String(facturaId).padStart(5, '0')}`,
       lineas: reversionLines
+    });
+    await restoreSalsasInventoryFromSnapshots({
+      client,
+      snapshots: buildSalsaInventorySnapshotsForReturn(reversionLines),
+      idReversion,
+      codigoReversion: correlativo.codigo,
+      codigoVenta: factura.codigo_venta || `VTA-${String(facturaId).padStart(5, '0')}`
     });
 
     const result = {
