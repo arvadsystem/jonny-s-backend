@@ -268,6 +268,7 @@ const buildIdempotencyRequestHash = (body) =>
     .digest('hex');
 
 const reserveVentasIdempotencyKey = async ({
+  client = pool,
   idempotencyKey,
   operation,
   requestHash,
@@ -277,7 +278,7 @@ const reserveVentasIdempotencyKey = async ({
   if (!idempotencyKey) return { enabled: false };
 
   try {
-    const insertResult = await pool.query(
+    const insertResult = await client.query(
       `
         INSERT INTO public.ventas_idempotency_keys (
           idempotency_key,
@@ -304,7 +305,7 @@ const reserveVentasIdempotencyKey = async ({
       return { enabled: true, reserved: true, idempotencyKey, requestHash };
     }
 
-    const existingResult = await pool.query(
+    const existingResult = await client.query(
       `
         SELECT
           idempotency_key,
@@ -316,6 +317,7 @@ const reserveVentasIdempotencyKey = async ({
         FROM public.ventas_idempotency_keys
         WHERE idempotency_key = $1
         LIMIT 1
+        FOR UPDATE
       `,
       [idempotencyKey]
     );
@@ -339,7 +341,7 @@ const reserveVentasIdempotencyKey = async ({
       return { enabled: true, conflict: true, code: 'REQUEST_ALREADY_IN_PROGRESS' };
     }
 
-    await pool.query(
+    await client.query(
       `
         UPDATE public.ventas_idempotency_keys
         SET
@@ -371,6 +373,7 @@ const reserveVentasIdempotencyKey = async ({
 };
 
 const saveVentasIdempotencySuccess = async ({
+  client = pool,
   reservation,
   httpStatus,
   responseBody,
@@ -380,7 +383,7 @@ const saveVentasIdempotencySuccess = async ({
   idSucursal = null
 }) => {
   if (!reservation?.reserved) return;
-  await pool.query(
+  await client.query(
     `
       UPDATE public.ventas_idempotency_keys
       SET
@@ -408,12 +411,13 @@ const saveVentasIdempotencySuccess = async ({
 };
 
 const saveVentasIdempotencyFailure = async ({
+  client = pool,
   reservation,
   httpStatus = null,
   errorCode = null
 }) => {
   if (!reservation?.reserved) return;
-  await pool.query(
+  await client.query(
     `
       UPDATE public.ventas_idempotency_keys
       SET
@@ -6763,7 +6767,6 @@ router.post('/ventas/:id/reversiones', checkPermission(['VENTAS_REVERSION_CREAR'
   const idempotencyRequestHash = idempotencyKey
     ? buildIdempotencyRequestHash({ idFactura, body: req.body })
     : null;
-  let idempotencyReservation = null;
 
   try {
     const hasAllowedRole = await requestHasAnyRole(req, REVERSION_ALLOWED_ROLES);
@@ -6775,36 +6778,50 @@ router.post('/ventas/:id/reversiones', checkPermission(['VENTAS_REVERSION_CREAR'
       });
     }
 
-    idempotencyReservation = await reserveVentasIdempotencyKey({
-      idempotencyKey,
-      operation: 'VENTAS_REVERSION_CREAR',
-      requestHash: idempotencyRequestHash,
-      idUsuario
+    const creation = await createVentaReversion({
+      idFactura,
+      body: req.body,
+      req,
+      idUsuario,
+      idempotency: {
+        reserve: (client) => reserveVentasIdempotencyKey({
+          client,
+          idempotencyKey,
+          operation: 'VENTAS_REVERSION_CREAR',
+          requestHash: idempotencyRequestHash,
+          idUsuario
+        }),
+        saveSuccess: (client, reservation, responseBody, result) => saveVentasIdempotencySuccess({
+          client,
+          reservation,
+          httpStatus: 201,
+          responseBody,
+          idFactura,
+          idUsuario,
+          idSucursal: result?.id_sucursal
+        })
+      }
     });
 
-    if (idempotencyReservation.replay) {
-      return res.status(idempotencyReservation.httpStatus || 200).json({
-        ...(isPlainObject(idempotencyReservation.responseBody) ? idempotencyReservation.responseBody : {}),
+    if (creation?.idempotency?.replay) {
+      return res.status(creation.idempotency.httpStatus || 200).json({
+        ...(isPlainObject(creation.idempotency.responseBody) ? creation.idempotency.responseBody : {}),
         replayed: true
       });
     }
 
-    if (idempotencyReservation.conflict) {
+    if (creation?.idempotency?.conflict) {
       return res.status(409).json({
         error: true,
-        code: idempotencyReservation.code,
-        message: idempotencyReservation.code === 'IDEMPOTENCY_KEY_REUSED'
+        code: creation.idempotency.code,
+        message: creation.idempotency.code === 'IDEMPOTENCY_KEY_REUSED'
           ? 'Idempotency-Key ya fue usado con otro payload.'
           : 'La solicitud con este Idempotency-Key esta en proceso.'
       });
     }
 
-    const result = await createVentaReversion({
-      idFactura,
-      body: req.body,
-      req,
-      idUsuario
-    });
+    const result = creation.result;
+    const responseBody = creation.responseBody;
 
     try {
       await sendReversionSuccessEmail({
@@ -6821,7 +6838,7 @@ router.post('/ventas/:id/reversiones', checkPermission(['VENTAS_REVERSION_CREAR'
           `
             UPDATE public.facturas_reversiones
             SET correo_notificado = true,
-                notificado_en = (NOW() AT TIME ZONE 'America/Tegucigalpa'),
+                notificado_en = NOW(),
                 error_notificacion = NULL
             WHERE id_reversion = $1
           `,
@@ -6847,30 +6864,8 @@ router.post('/ventas/:id/reversiones', checkPermission(['VENTAS_REVERSION_CREAR'
       }
     }
 
-    const responseBody = {
-      success: true,
-      data: result,
-      message: 'Reversión registrada correctamente.'
-    };
-
-    await saveVentasIdempotencySuccess({
-      reservation: idempotencyReservation,
-      httpStatus: 201,
-      responseBody,
-      idFactura,
-      idUsuario,
-      idSucursal: result?.id_sucursal
-    });
-
     return res.status(201).json(responseBody);
   } catch (error) {
-    await saveVentasIdempotencyFailure({
-      reservation: idempotencyReservation,
-      httpStatus: Number.isInteger(error?.httpStatus) ? error.httpStatus : 500,
-      errorCode: error?.code || 'VENTAS_REVERSION_ERROR'
-    }).catch((idempotencyErr) => {
-      console.error('No se pudo marcar fallo idempotente de reversion:', idempotencyErr);
-    });
 
     if (Number.isInteger(error?.httpStatus) && error.httpStatus >= 400 && error.httpStatus < 500) {
       await registerReversionFailureAttempt({

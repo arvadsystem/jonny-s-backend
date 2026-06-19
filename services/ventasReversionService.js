@@ -2,7 +2,7 @@
 import { generarCodigoDocumento } from './facturacionCorrelativoService.js';
 import { getClientIp, parseUserAgent } from '../utils/security/clientInfo.js';
 
-const REVERSAL_WINDOW_SQL = `(NOW() AT TIME ZONE 'America/Tegucigalpa') - INTERVAL '1 hour'`;
+const REVERSAL_WINDOW_SQL = `NOW() - INTERVAL '1 hour'`;
 const VALID_MOTIVOS = new Set([
   'PRODUCTO_EQUIVOCADO',
   'CANTIDAD_EQUIVOCADA',
@@ -369,6 +369,7 @@ const resolveAlreadyReversedQty = async (client, idFactura) => {
       FROM public.facturas_reversiones fr
       INNER JOIN public.facturas_reversiones_detalle rd ON rd.id_reversion = fr.id_reversion
       WHERE fr.id_factura_original = $1
+        AND UPPER(TRIM(COALESCE(fr.estado, ''))) = 'APLICADA'
       GROUP BY rd.id_detalle_factura
     `,
     [idFactura]
@@ -585,6 +586,7 @@ const revertLoyaltyForFactura = async ({
         SELECT COALESCE(SUM(fr.monto_reversado), 0)::numeric AS monto_reversado_acumulado
         FROM public.facturas_reversiones fr
         WHERE fr.id_factura_original = $1
+          AND UPPER(TRIM(COALESCE(fr.estado, ''))) = 'APLICADA'
       `,
       [idFactura]
     );
@@ -621,7 +623,7 @@ const revertLoyaltyForFactura = async ({
       SET
         puntos_disponibles = $1,
         puntos_acumulados_total = $2,
-        fecha_actualizacion = (NOW() AT TIME ZONE 'America/Tegucigalpa')
+        fecha_actualizacion = NOW()
       WHERE id_cliente = $3
     `,
     [nuevoSaldo, nuevoAcumulado, source.id_cliente]
@@ -687,7 +689,7 @@ const revertLoyaltyForFactura = async ({
           id_usuario_ejecutor,
           fecha_creacion
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, (NOW() AT TIME ZONE 'America/Tegucigalpa'))
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())
       `,
       [
         source.id_cliente,
@@ -855,7 +857,7 @@ export const listFacturaReversiones = async ({ idFactura, idUsuario }) => {
   }
 };
 
-export const createVentaReversion = async ({ idFactura, body, req, idUsuario }) => {
+export const createVentaReversion = async ({ idFactura, body, req, idUsuario, idempotency = null }) => {
   const facturaId = parsePositiveInt(idFactura);
   const userId = parsePositiveInt(idUsuario);
   if (!facturaId || !userId) {
@@ -885,8 +887,17 @@ export const createVentaReversion = async ({ idFactura, body, req, idUsuario }) 
   const userAgent = normalizeText(uaRaw, 500) || 'Desconocido';
 
   const client = await pool.connect();
+  let idempotencyReservation = null;
   try {
     await client.query('BEGIN');
+
+    if (typeof idempotency?.reserve === 'function') {
+      idempotencyReservation = await idempotency.reserve(client);
+      if (idempotencyReservation?.replay || idempotencyReservation?.conflict) {
+        await client.query('COMMIT');
+        return { idempotency: idempotencyReservation };
+      }
+    }
 
     const scope = await resolveSucursalScope(client, userId);
 
@@ -974,7 +985,7 @@ export const createVentaReversion = async ({ idFactura, body, req, idUsuario }) 
         )
         VALUES (
           $1, $2, $3, $4, $5, $6, $7,
-          $8, $9, $10, $11, 'REGISTRADA', $12,
+          $8, $9, $10, $11, 'APLICADA', $12,
           $13::date, $14, $15, $16, false
         )
         RETURNING id_reversion
@@ -1055,7 +1066,7 @@ export const createVentaReversion = async ({ idFactura, body, req, idUsuario }) 
           fecha_movimiento,
           fecha_creacion
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, (NOW() AT TIME ZONE 'America/Tegucigalpa'), (NOW() AT TIME ZONE 'America/Tegucigalpa'))
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW())
       `,
       [
         cajaContext.id_sesion_caja,
@@ -1087,9 +1098,7 @@ export const createVentaReversion = async ({ idFactura, body, req, idUsuario }) 
       lineas: reversionLines
     });
 
-    await client.query('COMMIT');
-
-    return {
+    const result = {
       id_reversion: idReversion,
       codigo_reversion: correlativo.codigo,
       fecha_operacion: correlativo.fecha_operacion,
@@ -1113,6 +1122,19 @@ export const createVentaReversion = async ({ idFactura, body, req, idUsuario }) 
         user_agent: userAgent
       }
     };
+    const responseBody = {
+      success: true,
+      data: result,
+      message: 'Reversión registrada correctamente.'
+    };
+
+    if (typeof idempotency?.saveSuccess === 'function') {
+      await idempotency.saveSuccess(client, idempotencyReservation, responseBody, result);
+    }
+
+    await client.query('COMMIT');
+
+    return { result, responseBody };
   } catch (error) {
     try { await client.query('ROLLBACK'); } catch {}
     if (error?.code === '23514' && error?.constraint === 'ck_facturas_reversiones_motivo') {
