@@ -24,7 +24,7 @@ import {
 import { getClientIp, parseUserAgent } from '../utils/security/clientInfo.js';
 import { insertLoginLog } from '../utils/security/loginLogger.js';
 import { createSession, closeAllUserSessions } from '../utils/security/sessionService.js';
-import { enviarVerificacion, enviarRecuperacion } from '../utils/emailService.js';
+import { enviarCorreo, enviarVerificacion, enviarRecuperacion } from '../utils/emailService.js';
 
 const router = express.Router();
 
@@ -1115,13 +1115,163 @@ router.post('/api/public/login', publicLoginIpLimiter, publicLoginAccountIpLimit
 });
 
 // ── POST /api/public/forgot-password ─────────────────────────────────
+const PUBLIC_FORGOT_PASSWORD_GENERIC_MESSAGE =
+  'Si el correo esta registrado, recibiras instrucciones de recuperacion.';
+
+const INTERNAL_TEMP_PASSWORD_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789';
+const INTERNAL_TEMP_PASSWORD_UPPER = 'ABCDEFGHJKLMNPQRSTUVWXYZ';
+const INTERNAL_TEMP_PASSWORD_NUMBERS = '23456789';
+
+const escapeHtml = (value) =>
+  String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+
+const generateInternalTemporaryPassword = async () => {
+  const length = crypto.randomInt(10, 13);
+  const chars = [
+    INTERNAL_TEMP_PASSWORD_UPPER[crypto.randomInt(0, INTERNAL_TEMP_PASSWORD_UPPER.length)],
+    INTERNAL_TEMP_PASSWORD_NUMBERS[crypto.randomInt(0, INTERNAL_TEMP_PASSWORD_NUMBERS.length)]
+  ];
+
+  while (chars.length < length) {
+    chars.push(INTERNAL_TEMP_PASSWORD_ALPHABET[crypto.randomInt(0, INTERNAL_TEMP_PASSWORD_ALPHABET.length)]);
+  }
+
+  for (let i = chars.length - 1; i > 0; i -= 1) {
+    const j = crypto.randomInt(0, i + 1);
+    [chars[i], chars[j]] = [chars[j], chars[i]];
+  }
+
+  return chars.join('');
+};
+
+const buildInternalTemporaryPasswordEmailHtml = ({ displayName, username, temporaryPassword }) => {
+  const safeName = escapeHtml(displayName || 'usuario');
+  const safeUsername = escapeHtml(username || 'N/D');
+  const safePassword = escapeHtml(temporaryPassword || 'N/D');
+
+  return `
+<!DOCTYPE html>
+<html lang="es">
+<head><meta charset="UTF-8"></head>
+<body style="margin:0; padding:0; background:#0e0704; font-family:Arial,sans-serif;">
+  <table width="100%" cellpadding="0" cellspacing="0" style="max-width:620px; margin:28px auto; background:#1a1108; border:1px solid rgba(212,165,116,0.25); border-radius:14px;">
+    <tr>
+      <td style="padding:28px 32px; color:#fdfaf5;">
+        <h2 style="margin:0 0 10px; color:#d4a574;">Credenciales temporales</h2>
+        <p style="margin:0 0 16px; color:rgba(255,255,255,0.82); line-height:1.5;">
+          Hola ${safeName},<br/>Hemos generado una nueva contrasena temporal para tu cuenta.
+        </p>
+        <div style="background:#24170f; border:1px solid rgba(212,165,116,0.28); border-radius:10px; padding:16px;">
+          <p style="margin:0 0 8px; color:rgba(255,255,255,0.8);"><strong>Usuario:</strong> ${safeUsername}</p>
+          <p style="margin:0; color:rgba(255,255,255,0.8);"><strong>Contrasena temporal:</strong> ${safePassword}</p>
+        </div>
+        <p style="margin:16px 0 0; color:rgba(255,255,255,0.68); line-height:1.5;">
+          Por seguridad, inicia sesion y cambia la contrasena en tu primer acceso.
+        </p>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>`;
+};
+
+const findActiveInternalUsersByEmail = async (email) => {
+  const result = await pool.query(
+    `
+      SELECT DISTINCT ON (u.id_usuario)
+        u.id_usuario,
+        u.nombre_usuario,
+        u.estado,
+        u.tipo_usuario,
+        COALESCE(
+          NULLIF(TRIM(CONCAT_WS(' ', pe.nombre, pe.apellido)), ''),
+          NULLIF(TRIM(u.nombre_usuario), '')
+        ) AS nombre_visible,
+        LOWER(TRIM(COALESCE(c_link.direccion_correo, c_persona.direccion_correo))) AS correo
+      FROM usuarios u
+      JOIN empleados e ON e.id_empleado = u.id_empleado
+      JOIN personas pe ON pe.id_persona = e.id_persona
+      LEFT JOIN correos c_link ON c_link.id_correo = pe.id_correo
+      LEFT JOIN correos c_persona ON c_persona.id_persona = pe.id_persona
+      WHERE LOWER(TRIM(COALESCE(c_link.direccion_correo, c_persona.direccion_correo))) = $1
+        AND COALESCE(u.estado, true) = true
+        AND UPPER(COALESCE(u.tipo_usuario, '')) <> 'CLIENTE'
+      LIMIT 2
+    `,
+    [email]
+  );
+
+  return result.rows || [];
+};
+
+const resetInternalUserPasswordFromPublicForgot = async (user) => {
+  const idUsuario = Number.parseInt(String(user?.id_usuario ?? ''), 10);
+  if (!Number.isInteger(idUsuario) || idUsuario <= 0) return;
+
+  const temporaryPassword = await generateInternalTemporaryPassword();
+  const client = await pool.connect();
+
+  try {
+    await client.query('BEGIN');
+    const updateResult = await client.query(
+      `
+        UPDATE usuarios
+        SET
+          clave = crypt($1::text, gen_salt('bf', 12)),
+          must_change_password = true,
+          fecha_cambio_clave = NULL
+        WHERE id_usuario = $2
+        RETURNING id_usuario, nombre_usuario, must_change_password
+      `,
+      [temporaryPassword, idUsuario]
+    );
+
+    if (updateResult.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return;
+    }
+
+    await client.query('COMMIT');
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {});
+    console.error('[public/forgot-password] Error regenerando contrasena temporal interna:', error?.message || error);
+    return;
+  } finally {
+    client.release();
+  }
+
+  await closeAllUserSessions(idUsuario, 'password_reset').catch(() => {});
+
+  try {
+    await enviarCorreo(
+      user.correo,
+      'Nueva contrasena temporal - Jonnys SmartOrder',
+      buildInternalTemporaryPasswordEmailHtml({
+        displayName: user.nombre_visible,
+        username: user.nombre_usuario,
+        temporaryPassword
+      }),
+      {
+        id_usuario: idUsuario,
+        tipo_correo: 'credenciales_temporales_reset',
+        fromKey: 'ACCESO'
+      }
+    );
+  } catch (error) {
+    console.error('[public/forgot-password] Error enviando credenciales temporales internas:', error?.message || error);
+  }
+};
+
 router.post('/api/public/forgot-password', forgotPasswordLimiter, async (req, res) => {
   const email = normalizeEmail(req.body?.email);
   if (!email) {
     return res.status(400).json({ error: true, message: 'Email requerido' });
   }
-
-  const genericMsg = 'Si el correo está registrado, recibirás un enlace de recuperación.';
 
   try {
     // Verificar que exista la identidad
@@ -1130,9 +1280,19 @@ router.post('/api/public/forgot-password', forgotPasswordLimiter, async (req, re
       [email]
     );
 
-    // Por seguridad: responder siempre OK aunque no exista el email
     if (identRes.rows.length === 0) {
-      return res.json({ message: genericMsg });
+      const internalUsers = await findActiveInternalUsersByEmail(email);
+
+      if (internalUsers.length > 1) {
+        console.warn('[public/forgot-password] Correo interno asociado a multiples usuarios');
+        return res.json({ message: PUBLIC_FORGOT_PASSWORD_GENERIC_MESSAGE });
+      }
+
+      if (internalUsers.length === 1) {
+        await resetInternalUserPasswordFromPublicForgot(internalUsers[0]);
+      }
+
+      return res.json({ message: PUBLIC_FORGOT_PASSWORD_GENERIC_MESSAGE });
     }
 
     const id_usuario = identRes.rows[0].id_usuario;
@@ -1161,10 +1321,10 @@ router.post('/api/public/forgot-password', forgotPasswordLimiter, async (req, re
       console.error('[public/forgot-password] Error enviando correo:', emailErr.message);
     }
 
-    return res.json({ message: genericMsg });
+    return res.json({ message: PUBLIC_FORGOT_PASSWORD_GENERIC_MESSAGE });
   } catch (error) {
     console.error('[public/forgot-password] Error:', error);
-    return res.status(500).json({ error: true, message: 'Error al procesar la solicitud' });
+    return res.json({ message: PUBLIC_FORGOT_PASSWORD_GENERIC_MESSAGE });
   }
 });
 
