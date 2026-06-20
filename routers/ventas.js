@@ -63,7 +63,10 @@ import {
 } from './ventas/handlers/ventasReadHandlers.js';
 import {
   createVentaPrintEventHandler,
-  getVentaKitchenComandaByIdHandler
+  getQzCertificateHandler,
+  getVentaKitchenComandaByIdHandler,
+  getVentasPrinterConfigHandler,
+  signQzRequestHandler
 } from './ventas/handlers/ventasPrintHandlers.js';
 import {
   buildComplementLineConfig,
@@ -7283,6 +7286,9 @@ router.get('/ventas/pedidos/:id/inventario-alertas', checkPermission(['VENTAS_VE
 router.get('/ventas/:id/ticket.pdf', checkPermission(['VENTAS_IMPRIMIR']), getVentaTicketPdfByIdHandler);
 router.get('/ventas/:id/ticket', checkPermission(['VENTAS_IMPRIMIR']), getVentaTicketByIdHandler);
 router.get('/ventas/:id/comanda', checkPermission(['VENTAS_IMPRIMIR']), getVentaKitchenComandaByIdHandler);
+router.get('/ventas/impresoras-config', checkPermission(['VENTAS_IMPRIMIR']), getVentasPrinterConfigHandler);
+router.get('/ventas/qz/certificate', checkPermission(['VENTAS_IMPRIMIR']), getQzCertificateHandler);
+router.post('/ventas/qz/sign', checkPermission(['VENTAS_IMPRIMIR']), signQzRequestHandler);
 router.post('/ventas/:id/impresiones', checkPermission(['VENTAS_IMPRIMIR']), createVentaPrintEventHandler);
 router.get('/ventas/:id', checkPermission(['VENTAS_VER']), getVentaByIdHandler);
 
