@@ -24,6 +24,7 @@ const normalizeMappingStatuses = (values) => (
 );
 
 const getBlockingMappingStatus = (statuses) => {
+  if (statuses.length === 0) return null;
   if (statuses.includes('AMBIGUO')) return 'AMBIGUO';
   if (statuses.includes('REQUIERE_REVISION')) return 'REQUIERE_REVISION';
   if (statuses.includes('PENDIENTE')) return 'PENDIENTE';
@@ -78,6 +79,7 @@ export const buildAdminSalsasInsumosCatalog = (rows) => {
     return {
       id_insumo: idInsumoMaestro,
       nombre: normalizeText(row.nombre),
+      codigo_categoria: normalizeAdminStatus(row.codigo_categoria),
       categoria: normalizeText(row.categoria_nombre),
       id_categoria_insumo: toPositiveInt(row.id_categoria_insumo),
       id_unidad_medida: toPositiveInt(row.id_unidad_medida),
@@ -110,7 +112,6 @@ export const buildAdminSalsasInsumosCatalog = (rows) => {
       metadata: {
         mapping_count: Number(row.mapping_count || 0),
         id_insumo_maestro: idInsumoMaestro,
-        ids_insumo_legacy: legacyIds,
         estados_mapeo_maestro: mappingStatuses,
         estado_mapeo_maestro: estadoMapeo,
         indicador_maestro_legacy: 'MAESTRO',

@@ -13,7 +13,6 @@ import {
   attachSalsaInventoryState,
   getInventoryStateLabel,
   getUnitDisplay,
-  isSelectableInsumoRow,
   normalizeAdminStatus,
   normalizeText
 } from './admin_salsas/services/salsaInventoryAdminStateService.js';
@@ -29,6 +28,9 @@ const MENU_SALSAS_VIEW_PERMISSIONS = ['MENU_SALSAS_VER', 'MENU_VER'];
 const MENU_SALSAS_CREATE_PERMISSIONS = ['MENU_SALSAS_CREAR', 'MENU_VER'];
 const MENU_SALSAS_EDIT_PERMISSIONS = ['MENU_SALSAS_EDITAR', 'MENU_VER'];
 const MENU_SALSAS_STATE_PERMISSIONS = ['MENU_SALSAS_ESTADO_CAMBIAR', 'MENU_VER'];
+const SALSAS_CATEGORY_CODE = 'INS-002';
+const SALSAS_CATEGORY_NAME = 'SALSAS Y ADEREZOS';
+const SALSA_INSUMO_UNIQUE_CONSTRAINT = 'ux_salsas_id_insumo_activo';
 
 const columnMetaCache = new Map();
 
@@ -313,98 +315,103 @@ const normalizeSalsaInventoryPayload = (payload = {}) => {
   };
 };
 
-const validateSalsaInventoryConfig = async (data) => {
-  if (!data.id_insumo && !data.id_unidad_consumo) return { ok: true };
+const findActiveSalsaInsumoConflict = async (idInsumo, idSalsa = null) => {
+  const result = await pool.query(
+    `
+      SELECT id_salsa, nombre
+      FROM public.salsas
+      WHERE id_insumo = $1
+        AND estado IS TRUE
+        AND ($2::int IS NULL OR id_salsa <> $2)
+      ORDER BY id_salsa
+      LIMIT 1;
+    `,
+    [idInsumo, idSalsa]
+  );
+  return result.rows[0] || null;
+};
+
+const buildSalsaInsumoConflict = (conflict) => ({
+  ok: false,
+  status: 409,
+  code: 'SALSA_INSUMO_YA_ASIGNADO',
+  message: `Este insumo ya está asignado a la salsa ${conflict?.nombre || 'indicada'}.`,
+  conflict: conflict
+    ? { id_salsa: Number(conflict.id_salsa), nombre: conflict.nombre }
+    : null
+});
+
+const isSalsaInsumoUniqueViolation = (error) => (
+  error?.code === '23505'
+  && String(error?.constraint || '').toLowerCase() === SALSA_INSUMO_UNIQUE_CONSTRAINT
+);
+
+const validateSalsaInventoryConfig = async (data, { idSalsa = null } = {}) => {
+  if (!data.id_insumo && !data.id_unidad_consumo) {
+    return { ok: false, status: 409, message: 'Completa insumo, cantidad y unidad de consumo.' };
+  }
+  if (!toPositiveNumberOrNull(data.cantidad_porcion)) {
+    return { ok: false, status: 409, message: 'La cantidad por porcion debe ser mayor a 0.' };
+  }
 
   const insumoResult = await pool.query(
     `
       SELECT
         i.id_insumo,
         i.nombre_insumo,
-        COALESCE(i.estado, true) AS estado,
         i.id_unidad_medida,
-        map.mapping_count,
-        map.id_insumo_maestro,
-        map.estado_mapeo_maestro,
-        i_master.nombre_insumo AS insumo_maestro_nombre,
-        COALESCE(i_master.estado, true) AS insumo_maestro_estado,
-        i_master.id_unidad_medida AS id_unidad_base_maestro
+        COALESCE(i.estado, true) AS estado_global,
+        master_state.es_maestro,
+        master_state.tiene_estado_local_activo,
+        ci.codigo_categoria,
+        ci.nombre_categoria,
+        ci.estado AS categoria_estado
       FROM public.insumos i
+      INNER JOIN public.categorias_insumos ci
+        ON ci.id_categoria_insumo = i.id_categoria_insumo
       LEFT JOIN LATERAL (
         SELECT
-          COUNT(*)::int AS mapping_count,
-          MIN(imm.id_insumo_maestro)::int AS id_insumo_maestro,
-          MIN(imm.estado_migracion) AS estado_mapeo_maestro
-        FROM public.insumos_mapeo_maestro imm
-        WHERE imm.id_insumo_legacy = i.id_insumo
-      ) map ON true
-      LEFT JOIN public.insumos i_master
-        ON i_master.id_insumo = CASE
-          WHEN map.mapping_count = 1 AND UPPER(TRIM(COALESCE(map.estado_mapeo_maestro, ''))) = 'VALIDADO'
-            THEN map.id_insumo_maestro
-          ELSE NULL
-        END
+          true AS es_maestro,
+          BOOL_OR(v.estado_local IS TRUE) AS tiene_estado_local_activo
+        FROM public.vw_insumos_maestros_almacen v
+        WHERE v.id_insumo_maestro = i.id_insumo
+        GROUP BY v.id_insumo_maestro
+      ) master_state ON true
       WHERE i.id_insumo = $1
       LIMIT 1
     `,
     [data.id_insumo]
   );
   if (!insumoResult.rowCount) {
-    return { ok: false, status: 400, message: 'El insumo seleccionado no existe.' };
+    return { ok: false, status: 400, message: 'El insumo maestro seleccionado no existe.' };
   }
   const insumo = insumoResult.rows[0];
-  if (insumo.estado !== true) {
+  if (
+    insumo.codigo_categoria !== SALSAS_CATEGORY_CODE
+    || normalizeAdminStatus(insumo.nombre_categoria) !== SALSAS_CATEGORY_NAME
+  ) {
+    return {
+      ok: false,
+      status: 409,
+      code: 'INSUMO_NO_ES_SALSA',
+      message: 'El insumo seleccionado no pertenece a SALSAS Y ADEREZOS.'
+    };
+  }
+  if (insumo.es_maestro !== true) {
+    return { ok: false, status: 409, message: 'El insumo seleccionado no es un insumo maestro disponible.' };
+  }
+  if (insumo.categoria_estado !== true || insumo.estado_global !== true || insumo.tiene_estado_local_activo !== true) {
     return { ok: false, status: 409, message: 'El insumo seleccionado esta inactivo.' };
   }
-  const selectable = isSelectableInsumoRow(insumo);
-  if (!selectable.selectable) {
-    return { ok: false, status: 409, message: selectable.reason || 'El insumo seleccionado no puede usarse en salsas.' };
-  }
-  const idInsumoEfectivo = toPositiveInt(insumo.id_insumo_maestro) || toPositiveInt(insumo.id_insumo);
-  const idUnidadBaseEfectiva = toPositiveInt(insumo.id_unidad_base_maestro) || toPositiveInt(insumo.id_unidad_medida);
-  if (toPositiveInt(insumo.id_insumo_maestro) && insumo.insumo_maestro_estado !== true) {
-    return { ok: false, status: 409, message: 'El insumo maestro resuelto no existe o esta inactivo.' };
-  }
+
+  const idInsumoEfectivo = toPositiveInt(insumo.id_insumo);
+  const idUnidadBaseEfectiva = toPositiveInt(insumo.id_unidad_medida);
   if (!idUnidadBaseEfectiva) {
     return { ok: false, status: 409, message: 'El insumo seleccionado no tiene unidad base configurada.' };
   }
-  if (idInsumoEfectivo !== toPositiveInt(data.id_insumo)) {
-    return {
-      ok: false,
-      status: 409,
-      message: `Selecciona el insumo maestro #${idInsumoEfectivo}; los IDs legacy no se pueden guardar en salsas.`
-    };
-  }
 
-  const duplicateMasterResult = await pool.query(
-    `
-      SELECT other.id_insumo
-      FROM public.insumos current
-      INNER JOIN public.insumos other
-        ON other.id_insumo <> current.id_insumo
-       AND other.estado IS TRUE
-       AND UPPER(REGEXP_REPLACE(BTRIM(other.nombre_insumo), '\\s+', ' ', 'g'))
-         = UPPER(REGEXP_REPLACE(BTRIM(current.nombre_insumo), '\\s+', ' ', 'g'))
-      INNER JOIN public.insumos_mapeo_maestro other_map
-        ON other_map.id_insumo_legacy = other.id_insumo
-       AND other_map.id_insumo_maestro = other.id_insumo
-       AND UPPER(TRIM(other_map.estado_migracion)) = 'VALIDADO'
-      WHERE current.id_insumo = $1
-      ORDER BY other.id_insumo
-    `,
-    [idInsumoEfectivo]
-  );
-  if (duplicateMasterResult.rowCount > 0) {
-    const conflictIds = [idInsumoEfectivo, ...duplicateMasterResult.rows.map((row) => Number(row.id_insumo))]
-      .sort((left, right) => left - right)
-      .map((id) => `#${id}`)
-      .join(', ');
-    return {
-      ok: false,
-      status: 409,
-      message: `Conflicto de datos: existen maestros VALIDADO con el mismo nombre (${conflictIds}).`
-    };
-  }
+  const activeConflict = await findActiveSalsaInsumoConflict(idInsumoEfectivo, idSalsa);
+  if (activeConflict) return buildSalsaInsumoConflict(activeConflict);
 
   const assignmentResult = await pool.query(
     `
@@ -858,24 +865,6 @@ router.get('/catalogos/insumos', checkPermission(MENU_SALSAS_VIEW_PERMISSIONS), 
       pool,
       'public.vw_insumos_maestros_almacen',
       `
-        WITH mapping_summary AS (
-          SELECT
-            imm.id_insumo_maestro,
-            COUNT(*)::int AS mapping_count,
-            COALESCE(
-              ARRAY_AGG(DISTINCT imm.id_insumo_legacy ORDER BY imm.id_insumo_legacy),
-              ARRAY[]::integer[]
-            ) AS ids_insumo_legacy,
-            COALESCE(
-              ARRAY_AGG(
-                DISTINCT UPPER(TRIM(COALESCE(imm.estado_migracion, 'PENDIENTE')))
-                ORDER BY UPPER(TRIM(COALESCE(imm.estado_migracion, 'PENDIENTE')))
-              ),
-              ARRAY[]::text[]
-            ) AS estados_mapeo_maestro
-          FROM public.insumos_mapeo_maestro imm
-          GROUP BY imm.id_insumo_maestro
-        )
         SELECT
           v.id_insumo_maestro AS id_insumo,
           v.id_insumo_maestro,
@@ -886,20 +875,16 @@ router.get('/catalogos/insumos', checkPermission(MENU_SALSAS_VIEW_PERMISSIONS), 
           um.simbolo AS unidad_simbolo,
           COALESCE(NULLIF(TRIM(um.simbolo), ''), NULLIF(TRIM(um.nombre), ''), 'unidad') AS unidad_etiqueta,
           v.id_categoria_insumo,
+          ci.codigo_categoria,
           ci.nombre_categoria AS categoria_nombre,
           (v.estado_global IS TRUE AND v.estado_local IS TRUE) AS estado,
-          COALESCE(ms.mapping_count, 0)::int AS mapping_count,
-          COALESCE(ms.ids_insumo_legacy, ARRAY[]::integer[]) AS ids_insumo_legacy,
-          COALESCE(ms.estados_mapeo_maestro, ARRAY[]::text[]) AS estados_mapeo_maestro,
           COALESCE(conv.conversiones, '[]'::jsonb) AS conversiones_disponibles,
           COALESCE(warehouses.almacenes, '[]'::jsonb) AS almacenes_disponibles
         FROM public.vw_insumos_maestros_almacen v
         LEFT JOIN public.unidades_medida um
           ON um.id_unidad_medida = v.id_unidad_medida
-        LEFT JOIN public.categorias_insumos ci
+        INNER JOIN public.categorias_insumos ci
           ON ci.id_categoria_insumo = v.id_categoria_insumo
-        LEFT JOIN mapping_summary ms
-          ON ms.id_insumo_maestro = v.id_insumo_maestro
         LEFT JOIN LATERAL (
           SELECT jsonb_agg(
             jsonb_build_object(
@@ -941,9 +926,10 @@ router.get('/catalogos/insumos', checkPermission(MENU_SALSAS_VIEW_PERMISSIONS), 
         ) warehouses ON true
         WHERE v.estado_global IS TRUE
           AND v.estado_local IS TRUE
+          AND ci.codigo_categoria = 'INS-002'
+          AND UPPER(TRIM(ci.nombre_categoria)) = 'SALSAS Y ADEREZOS'
+          AND ci.estado IS TRUE
         ORDER BY
-          CASE WHEN UPPER(TRIM(COALESCE(ci.nombre_categoria, ''))) = 'SALSAS Y ADEREZOS' THEN 0 ELSE 1 END,
-          ci.nombre_categoria ASC NULLS LAST,
           v.nombre_insumo ASC,
           v.id_insumo_maestro ASC,
           v.id_almacen ASC;
@@ -958,10 +944,8 @@ router.get('/catalogos/insumos', checkPermission(MENU_SALSAS_VIEW_PERMISSIONS), 
     for (const item of buildAdminSalsasInsumosCatalog(result.rows || [])) {
       if (!item.seleccionable) {
         grouped.bloqueados.push(item);
-      } else if (normalizeAdminStatus(item.categoria) === 'SALSAS Y ADEREZOS') {
+      } else if (item.codigo_categoria === SALSAS_CATEGORY_CODE) {
         grouped.recomendados.push(item);
-      } else {
-        grouped.otros_disponibles.push(item);
       }
     }
 
@@ -1237,7 +1221,7 @@ router.post('/', checkPermission(MENU_SALSAS_CREATE_PERMISSIONS), async (req, re
 
     if (salsasTieneNivelPicante) insertData.nivel_picante = data.nivel_picante ?? 0;
     if (salsasTieneOrden && data.orden !== null) insertData.orden = data.orden;
-    if (salsasTieneEstado) insertData.estado = data.estado === null ? true : data.estado;
+    if (salsasTieneEstado) insertData.estado = false;
     if (idUsuarioMeta.exists && resolvedUserId) insertData.id_usuario = resolvedUserId;
 
     const rawInsert = {};
@@ -1415,9 +1399,14 @@ router.put('/:id_salsa/inventario', checkPermission(MENU_SALSAS_EDIT_PERMISSIONS
 
     const data = normalizacion.data;
     if (data.id_insumo) {
-      const inventoryValidation = await validateSalsaInventoryConfig(data);
+      const inventoryValidation = await validateSalsaInventoryConfig(data, { idSalsa });
       if (!inventoryValidation.ok) {
-        return res.status(inventoryValidation.status || 400).json({ error: true, message: inventoryValidation.message });
+        return res.status(inventoryValidation.status || 400).json({
+          error: true,
+          code: inventoryValidation.code,
+          message: inventoryValidation.message,
+          ...(inventoryValidation.conflict ? { conflict: inventoryValidation.conflict } : {})
+        });
       }
     }
 
@@ -1449,6 +1438,18 @@ router.put('/:id_salsa/inventario', checkPermission(MENU_SALSAS_EDIT_PERMISSIONS
       data: inventoryState
     });
   } catch (err) {
+    if (isSalsaInsumoUniqueViolation(err)) {
+      const idInsumo = toPositiveInt(req.body?.id_insumo);
+      const idSalsa = toPositiveInt(req.params.id_salsa);
+      const conflict = idInsumo ? await findActiveSalsaInsumoConflict(idInsumo, idSalsa) : null;
+      const response = buildSalsaInsumoConflict(conflict);
+      return res.status(409).json({
+        error: true,
+        code: response.code,
+        message: response.message,
+        conflict: response.conflict
+      });
+    }
     console.error('Error al configurar inventario de salsa admin:', err.message);
     return res.status(500).json({ error: true, message: getSafeServerErrorMessage(err) });
   }
@@ -1481,9 +1482,23 @@ router.patch('/:id_salsa/estado', checkPermission(MENU_SALSAS_STATE_PERMISSIONS)
       return res.status(400).json({ error: true, message: 'Tu esquema no soporta cambiar estado en salsas.' });
     }
 
-    const salsaExiste = await pool.query('SELECT id_salsa FROM salsas WHERE id_salsa = $1 LIMIT 1;', [idSalsa]);
+    const salsaExiste = await pool.query(
+      'SELECT id_salsa, id_insumo, cantidad_porcion, id_unidad_consumo FROM salsas WHERE id_salsa = $1 LIMIT 1;',
+      [idSalsa]
+    );
     if (salsaExiste.rowCount === 0) {
       return res.status(404).json({ error: true, message: 'Salsa no encontrada.' });
+    }
+
+    if (estado === true) {
+      const inventoryValidation = await validateSalsaInventoryConfig(salsaExiste.rows[0], { idSalsa });
+      if (!inventoryValidation.ok) {
+        return res.status(409).json({
+          error: true,
+          code: 'SALSA_INVENTARIO_INCOMPLETO',
+          message: inventoryValidation.message || 'Completa la configuracion de inventario antes de activar la salsa.'
+        });
+      }
     }
 
     // Transicion segura: id_usuario del cliente se ignora y se fuerza desde req.user.
@@ -1519,6 +1534,21 @@ router.patch('/:id_salsa/estado', checkPermission(MENU_SALSAS_STATE_PERMISSIONS)
     invalidateVentasComplementCatalogCache('cambiar estado de salsa');
     return res.status(200).json({ error: false, message: 'Estado de salsa actualizado correctamente.' });
   } catch (err) {
+    if (isSalsaInsumoUniqueViolation(err)) {
+      const idSalsa = toPositiveInt(req.params.id_salsa);
+      const current = idSalsa
+        ? await pool.query('SELECT id_insumo FROM public.salsas WHERE id_salsa = $1 LIMIT 1;', [idSalsa])
+        : null;
+      const idInsumo = toPositiveInt(current?.rows?.[0]?.id_insumo);
+      const conflict = idInsumo ? await findActiveSalsaInsumoConflict(idInsumo, idSalsa) : null;
+      const response = buildSalsaInsumoConflict(conflict);
+      return res.status(409).json({
+        error: true,
+        code: response.code,
+        message: response.message,
+        conflict: response.conflict
+      });
+    }
     console.error('Error al cambiar estado de salsa admin:', err.message);
     return res.status(500).json({ error: true, message: getSafeServerErrorMessage(err) });
   }

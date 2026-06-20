@@ -9,6 +9,13 @@ const routeSource = routerSource.slice(routeStart, routeEnd);
 assert.ok(routeStart >= 0 && routeEnd > routeStart, 'la QA debe localizar el handler del catalogo de insumos');
 assert.match(routeSource, /queryCatalogoMaestroView/, 'el handler debe usar queryCatalogoMaestroView');
 assert.match(routeSource, /public\.vw_insumos_maestros_almacen/, 'el handler debe consultar la vista maestra');
+assert.match(routeSource, /ci\.codigo_categoria\s*=\s*'INS-002'/, 'el SQL debe filtrar la categoria canonica INS-002');
+assert.match(routeSource, /ci\.nombre_categoria\)\)\s*=\s*'SALSAS Y ADEREZOS'/, 'el SQL debe confirmar el nombre de la categoria canonica');
+assert.match(routeSource, /ci\.estado\s+IS\s+TRUE/, 'el SQL debe exigir categoria activa');
+assert.match(routeSource, /v\.estado_global\s+IS\s+TRUE/, 'el SQL debe exigir maestro activo');
+assert.match(routeSource, /v\.estado_local\s+IS\s+TRUE/, 'el SQL debe exigir estado local activo');
+assert.doesNotMatch(routeSource, /insumos_mapeo_maestro|id_insumo_legacy/, 'el catalogo no debe consultar ni exponer IDs legacy');
+assert.match(routeSource, /otros_disponibles:\s*\[\]/, 'el contrato debe conservar otros_disponibles vacio');
 assert.doesNotMatch(
   routeSource,
   /FROM\s+public\.insumos\s+i\b/i,
@@ -32,6 +39,7 @@ const makeRow = ({
   unidad_simbolo: 'oz',
   unidad_etiqueta: 'oz',
   id_categoria_insumo: 4,
+  codigo_categoria: 'INS-002',
   categoria_nombre: categoria,
   estado: true,
   mapping_count: legacyIds.length,
@@ -56,17 +64,17 @@ const catalog = buildAdminSalsasInsumosCatalog([
     statuses: ['VALIDADO']
   }),
   makeRow({
-    id: 205,
+    id: 31,
     nombre: 'SALSA CHIPOTLE',
     idAlmacen: 1,
-    legacyIds: [205],
+    legacyIds: [],
     statuses: ['VALIDADO']
   }),
   makeRow({
-    id: 205,
+    id: 31,
     nombre: 'SALSA CHIPOTLE',
     idAlmacen: 2,
-    legacyIds: [205],
+    legacyIds: [],
     statuses: ['VALIDADO']
   }),
   makeRow({
@@ -90,8 +98,8 @@ assert.equal(cajunRows.length, 1, '#30 y #191 SALSA CAJUN deben producir una sol
 assert.equal(cajunRows[0].id_insumo, 30, 'la opcion SALSA CAJUN debe publicar el maestro #30');
 assert.equal(cajunRows[0].seleccionable, true, 'SALSA CAJUN VALIDADA debe quedar seleccionable');
 assert.equal(cajunRows[0].estado_mapeo_maestro, 'VALIDADO');
-assert.deepEqual(cajunRows[0].metadata.ids_insumo_legacy, [191], 'el legacy #191 debe existir solo como metadata');
 assert.equal('ids_insumo_legacy' in cajunRows[0], false, 'los IDs legacy no deben exponerse al nivel visual');
+assert.equal('ids_insumo_legacy' in cajunRows[0].metadata, false, 'los IDs legacy tampoco deben exponerse como metadata');
 
 const blockedCajun = buildAdminSalsasInsumosCatalog([
   makeRow({
@@ -122,11 +130,11 @@ assert.equal(saneadas.length, 5, 'las cinco salsas saneadas deben producir cinco
 assert.ok(saneadas.every((item) => item.seleccionable), 'las cinco salsas saneadas deben quedar seleccionables');
 assert.deepEqual(saneadas.map((item) => item.id_insumo).sort((a, b) => a - b), [20, 22, 23, 24, 30]);
 
-const chipotleRows = catalog.filter((item) => item.id_insumo === 205);
+const chipotleRows = catalog.filter((item) => item.id_insumo === 31);
 assert.equal(chipotleRows.length, 1, 'un maestro VALIDADO debe aparecer una sola vez');
 assert.equal(chipotleRows[0].seleccionable, true, 'un maestro VALIDADO sin conflicto debe ser seleccionable');
 assert.equal(chipotleRows[0].indicador_maestro_legacy, 'MAESTRO', 'un automapeo debe marcarse como MAESTRO');
-assert.deepEqual(chipotleRows[0].metadata.ids_insumo_legacy, [], 'el automapeo no debe publicarse como ID legacy');
+assert.equal(chipotleRows[0].codigo_categoria, 'INS-002');
 
 const duplicateNameRows = catalog.filter((item) => [33, 190].includes(item.id_insumo));
 assert.equal(duplicateNameRows.length, 2, 'los dos maestros con el mismo nombre deben conservar trazabilidad');

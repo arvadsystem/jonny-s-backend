@@ -4,8 +4,14 @@ import { classifySalsaMapping } from '../routers/ventas/services/salsasInventory
 import { readFileSync } from 'node:fs';
 
 const routerSource = readFileSync(new URL('../routers/admin_salsas.js', import.meta.url), 'utf8');
-assert.match(routerSource, /los IDs legacy no se pueden guardar en salsas/, 'PUT inventario debe rechazar IDs legacy');
 assert.match(routerSource, /data: inventoryState/, 'PUT inventario debe responder el estado recalculado');
+assert.match(routerSource, /code:\s*'INSUMO_NO_ES_SALSA'/, 'PUT inventario debe rechazar categorias distintas de INS-002');
+assert.match(routerSource, /FROM public\.insumos i[\s\S]*INNER JOIN public\.categorias_insumos ci/, 'el validador debe unir insumos con categorias');
+assert.match(routerSource, /code:\s*'SALSA_INSUMO_YA_ASIGNADO'/, 'PUT inventario debe reportar asignacion duplicada');
+assert.match(routerSource, /ux_salsas_id_insumo_activo/, 'el router debe identificar el indice unico de salsas activas');
+assert.match(routerSource, /error\?\.code\s*===\s*'23505'/, 'el router debe capturar violaciones unicas concurrentes');
+assert.match(routerSource, /if \(salsasTieneEstado\) insertData\.estado = false/, 'una salsa nueva debe crearse inactiva');
+assert.match(routerSource, /code:\s*'SALSA_INVENTARIO_INCOMPLETO'/, 'la activacion debe bloquear inventario incompleto');
 
 const makeSalsa = (id, overrides = {}) => ({
   id_salsa: id,
