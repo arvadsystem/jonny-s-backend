@@ -47,11 +47,42 @@ const logDescuentosCatalogError = ({ err, req, scope, idSucursal }) => {
   });
 };
 
+const CLIENTE_NOMBRE_PLACEHOLDERS = new Set([
+  'sin nombre',
+  'sin apellido',
+  'sin nombres',
+  'sin apellidos',
+  'delivery',
+  'no registrado',
+  'no registra',
+  'n/a',
+  'na',
+  'null',
+  'undefined'
+]);
+
+const normalizeClienteNombrePart = (value) => {
+  const text = String(value || '').replace(/\s+/g, ' ').trim();
+  if (!text) return '';
+  const normalized = text.toLowerCase();
+  if (CLIENTE_NOMBRE_PLACEHOLDERS.has(normalized)) return '';
+  if (!/\p{L}/u.test(text)) return '';
+  if (/^0+\d{2,}$/.test(text)) return '';
+  return text;
+};
+
 const normalizeClienteNombre = (cliente) => {
-  const nombrePersona = [cliente?.nombre, cliente?.apellido].filter(Boolean).join(' ').trim();
+  const nombreEmpresa = normalizeClienteNombrePart(cliente?.nombre_empresa);
+  if (nombreEmpresa) return nombreEmpresa;
+
+  const nombrePersona = [
+    normalizeClienteNombrePart(cliente?.nombre),
+    normalizeClienteNombrePart(cliente?.apellido)
+  ].filter(Boolean).join(' ').trim();
   if (nombrePersona) return nombrePersona;
-  if (cliente?.nombre_empresa) return cliente.nombre_empresa;
-  return 'Consumidor final';
+
+  const idCliente = parseOptionalPositiveInt(cliente?.id_cliente);
+  return idCliente ? `Cliente #${idCliente}` : 'Cliente sin nombre';
 };
 
 const ventasHandlersTableCache = new Map();
@@ -316,6 +347,7 @@ export const listClientesCatalogoHandler = async (req, res) => {
         c.id_cliente,
         c.estado,
         c.id_tipo_cliente,
+        tc.tipo_cliente,
         p.nombre,
         p.apellido,
         p.dni,
@@ -331,6 +363,7 @@ export const listClientesCatalogoHandler = async (req, res) => {
       LEFT JOIN telefonos tp ON tp.id_telefono = p.id_telefono
       LEFT JOIN empresas e ON e.id_empresa = c.id_empresa
       LEFT JOIN telefonos te ON te.id_telefono = e.id_telefono
+      LEFT JOIN tipo_cliente tc ON tc.id_tipo_cliente = c.id_tipo_cliente
       WHERE COALESCE(c.estado, true) = true
         AND (
           $4 = ''
@@ -351,6 +384,27 @@ export const listClientesCatalogoHandler = async (req, res) => {
           WHEN trim(concat_ws(' ', p.nombre, p.apellido)) ILIKE $6 OR COALESCE(e.nombre_empresa, '') ILIKE $6 THEN 3
           ELSE 4
         END,
+        CASE
+          WHEN NULLIF(TRIM(COALESCE(e.nombre_empresa, '')), '') IS NOT NULL
+            AND LOWER(TRIM(COALESCE(e.nombre_empresa, ''))) NOT IN ('sin nombre', 'sin apellido', 'sin nombres', 'sin apellidos', 'delivery', 'no registrado', 'no registra', 'n/a', 'na', 'null', 'undefined')
+            AND TRIM(COALESCE(e.nombre_empresa, '')) ~ '[[:alpha:]]'
+          THEN 0
+          WHEN NULLIF(TRIM(CONCAT_WS(' ',
+            CASE
+              WHEN LOWER(TRIM(COALESCE(p.nombre, ''))) IN ('sin nombre', 'sin apellido', 'sin nombres', 'sin apellidos', 'delivery', 'no registrado', 'no registra', 'n/a', 'na', 'null', 'undefined') THEN NULL
+              WHEN TRIM(COALESCE(p.nombre, '')) !~ '[[:alpha:]]' THEN NULL
+              WHEN TRIM(COALESCE(p.nombre, '')) ~ '^0+[0-9]{2,}$' THEN NULL
+              ELSE p.nombre
+            END,
+            CASE
+              WHEN LOWER(TRIM(COALESCE(p.apellido, ''))) IN ('sin nombre', 'sin apellido', 'sin nombres', 'sin apellidos', 'delivery', 'no registrado', 'no registra', 'n/a', 'na', 'null', 'undefined') THEN NULL
+              WHEN TRIM(COALESCE(p.apellido, '')) !~ '[[:alpha:]]' THEN NULL
+              WHEN TRIM(COALESCE(p.apellido, '')) ~ '^0+[0-9]{2,}$' THEN NULL
+              ELSE p.apellido
+            END
+          )), '') IS NOT NULL THEN 0
+          ELSE 1
+        END,
         COALESCE(NULLIF(trim(concat_ws(' ', p.nombre, p.apellido)), ''), e.nombre_empresa, c.id_cliente::text),
         c.id_cliente
       LIMIT $7
@@ -368,6 +422,7 @@ export const listClientesCatalogoHandler = async (req, res) => {
     const data = result.rows.map((row) => ({
       id_cliente: row.id_cliente,
       id_tipo_cliente: row.id_tipo_cliente,
+      tipo_cliente: row.tipo_cliente || null,
       estado: row.estado,
       nombre_cliente: normalizeClienteNombre(row),
       telefono: row.persona_telefono || row.empresa_telefono || null,

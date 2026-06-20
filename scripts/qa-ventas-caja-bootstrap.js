@@ -59,6 +59,10 @@ assert.match(
   /Math\.min\(50,\s*Math\.max\(1,\s*Number\.isInteger\(parsedLimit\) \? parsedLimit : 20\)\)/,
   'clientes debe conservar limite default 20 y maximo 50'
 );
+assert.match(handlersSource, /CLIENTE_NOMBRE_PLACEHOLDERS/, 'clientes debe filtrar placeholders de nombre legacy');
+assert.match(handlersSource, /\^0\+\\d\{2,\}\$/, 'clientes no debe presentar codigos con ceros como nombre');
+assert.match(handlersSource, /Cliente #\$\{idCliente\}/, 'clientes sin nombre valido deben mostrarse como Cliente #id');
+assert.match(handlersSource, /tc\.tipo_cliente/, 'clientes debe exponer tipo de cliente como metadata secundaria');
 assert.match(handlersSource, /Math\.min\(50,/, 'clientes debe limitarse a un maximo de 50');
 assert.doesNotMatch(ventasModuleSources, /new\s+(?:Pool|Client)\s*\(/, 'Ventas no debe crear Pool ni Client');
 assert.match(routerSource, /kind === 'ITEM'/, 'Ventas debe conservar lineas de extras independientes');
