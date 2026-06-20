@@ -15,13 +15,33 @@ const ventasModuleSources = [
   handlersSource,
   readFileSync(new URL('../routers/ventas/services/complementosCatalogService.js', import.meta.url), 'utf8')
 ].join('\n');
+const extrasInventorySource = readFileSync(new URL('../routers/ventas/services/extrasInventoryService.js', import.meta.url), 'utf8');
+const ventasPayloadSource = readFileSync(new URL('../routers/ventas/services/ventasPayloadService.js', import.meta.url), 'utf8');
+const ventasRpcPayloadSource = readFileSync(new URL('../routers/ventas/services/ventasRpcPayloadService.js', import.meta.url), 'utf8');
+const ventasPrintSource = readFileSync(new URL('../routers/ventas/handlers/ventasPrintHandlers.js', import.meta.url), 'utf8');
 
 assert.match(routerSource, /router\.get\('\/ventas\/caja\/bootstrap'/, 'debe existir el bootstrap de Caja');
 assert.match(handlersSource, /r\.id_tipo_departamento\s*=\s*\$\$\{params\.length\}/, 'el departamento debe formar parte del SQL parametrizado');
 assert.match(handlersSource, /mv\.id_sucursal\s*=\s*\$1/, 'las recetas deben filtrarse por sucursal en SQL');
+assert.match(handlersSource, /fetchCajaBootstrapOperationalState/, 'bootstrap debe resolver caja y sesion operativa');
+assert.match(handlersSource, /sesion_caja:\s*operationalState\.sesion_caja/, 'bootstrap debe incluir la sesion activa');
+assert.match(handlersSource, /caja_activa:\s*operationalState\.caja_activa/, 'bootstrap debe incluir la caja activa');
+assert.match(handlersSource, /if \(!operationalState\?\.sesion_caja\)/, 'sin sesion no debe cargar catalogos');
+assert.match(handlersSource, /requiere_seleccion_sucursal:\s*true/, 'superadmin sin sesion debe poder seleccionar sucursal');
+assert.ok(
+  handlersSource.indexOf('fetchCajaBootstrapOperationalState') < handlersSource.indexOf('fetchCachedCajaBootstrap(cacheKey'),
+  'el estado operativo especifico del usuario debe resolverse fuera del cache compartido'
+);
 assert.match(handlersSource, /if \(!search[^]*return res\.status\(200\)\.json\(\[\]\)/, 'clientes sin busqueda valida deben devolver vacio');
 assert.match(handlersSource, /Math\.min\(50,/, 'clientes debe limitarse a un maximo de 50');
 assert.doesNotMatch(ventasModuleSources, /new\s+(?:Pool|Client)\s*\(/, 'Ventas no debe crear Pool ni Client');
+assert.match(routerSource, /kind === 'ITEM'/, 'Ventas debe conservar lineas de extras independientes');
+assert.match(routerSource, /id_extra/, 'Ventas debe conservar id_extra en contratos de venta');
+assert.match(extrasInventorySource, /resolveExtrasInventory/, 'Extras independientes deben validar inventario');
+assert.match(ventasPayloadSource, /\['ITEM', extraResult\.value\]/, 'payload backend debe normalizar ITEM por id_extra');
+assert.match(ventasRpcPayloadSource, /id_extra: line\.id_extra \|\| null/, 'payload RPC debe conservar id_extra');
+assert.match(ventasPrintSource, /es_linea_extra_independiente:\s*isStandaloneExtra/, 'comanda debe conservar la marca de extra independiente');
+assert.match(ventasPrintSource, /extras:\s*isStandaloneExtra \? \[\]/, 'comanda no debe duplicar ITEM como extra interno');
 
 const connectCount = (routerSource.match(/pool\.connect\(\)/g) || []).length;
 const releaseCount = (routerSource.match(/client\.release\(\)/g) || []).length;

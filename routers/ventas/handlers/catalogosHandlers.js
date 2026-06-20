@@ -684,6 +684,167 @@ export const listRecetasCatalogoHandler = async (req, res) => {
   }
 };
 
+const fetchCajaBootstrapOperationalState = async ({ idUsuario, idSucursal = null }) => {
+  const result = await pool.query(
+    `
+      WITH active_session AS (
+        SELECT
+          cs.id_sesion_caja,
+          cs.id_caja,
+          cs.id_sucursal,
+          c.codigo_caja,
+          c.nombre_caja,
+          COALESCE(c.estado, true) AS caja_estado,
+          s.nombre_sucursal,
+          estado.codigo AS estado_codigo,
+          cs.id_usuario_responsable,
+          responsable.nombre_usuario AS responsable_usuario,
+          COALESCE(
+            NULLIF(TRIM(CONCAT_WS(' ', persona.nombre, persona.apellido)), ''),
+            responsable.nombre_usuario
+          ) AS responsable_nombre,
+          COALESCE(
+            participante.rol_codigo,
+            CASE WHEN cs.id_usuario_responsable = $1 THEN 'RESPONSABLE' END
+          ) AS rol_participacion,
+          cs.fecha_apertura,
+          cs.monto_apertura
+        FROM public.cajas_sesiones cs
+        INNER JOIN public.cat_cajas_sesiones_estados estado
+          ON estado.id_estado_sesion_caja = cs.id_estado_sesion_caja
+         AND UPPER(estado.codigo) = 'ABIERTA'
+        INNER JOIN public.cajas c
+          ON c.id_caja = cs.id_caja
+         AND COALESCE(c.estado, true) = true
+        INNER JOIN public.sucursales s
+          ON s.id_sucursal = cs.id_sucursal
+         AND COALESCE(s.estado, true) = true
+        INNER JOIN public.usuarios responsable
+          ON responsable.id_usuario = cs.id_usuario_responsable
+        LEFT JOIN public.empleados empleado
+          ON empleado.id_empleado = responsable.id_empleado
+        LEFT JOIN public.personas persona
+          ON persona.id_persona = empleado.id_persona
+        LEFT JOIN LATERAL (
+          SELECT participacion.id_participacion_caja, rol.codigo AS rol_codigo
+          FROM public.cajas_sesiones_participantes participacion
+          LEFT JOIN public.cat_cajas_roles_participacion rol
+            ON rol.id_rol_participacion_caja = participacion.id_rol_participacion_caja
+          WHERE participacion.id_sesion_caja = cs.id_sesion_caja
+            AND participacion.id_usuario = $1
+            AND COALESCE(participacion.activo, true) = true
+          ORDER BY participacion.fecha_inicio DESC NULLS LAST, participacion.id_participacion_caja DESC
+          LIMIT 1
+        ) participante ON true
+        WHERE (cs.id_usuario_responsable = $1 OR participante.id_participacion_caja IS NOT NULL)
+          AND ($2::int IS NULL OR cs.id_sucursal = $2)
+        ORDER BY cs.fecha_apertura DESC, cs.id_sesion_caja DESC
+        LIMIT 1
+      ),
+      target_sucursal AS (
+        SELECT COALESCE($2::int, (SELECT id_sucursal FROM active_session)) AS id_sucursal
+      )
+      SELECT
+        sucursal.id_sucursal,
+        sucursal.nombre_sucursal,
+        sesion.id_sesion_caja,
+        sesion.estado_codigo,
+        sesion.id_usuario_responsable,
+        sesion.responsable_usuario,
+        sesion.responsable_nombre,
+        sesion.rol_participacion,
+        sesion.fecha_apertura,
+        sesion.monto_apertura,
+        COALESCE(sesion.id_caja, asignacion.id_caja) AS id_caja,
+        COALESCE(sesion.codigo_caja, caja.codigo_caja) AS codigo_caja,
+        COALESCE(sesion.nombre_caja, caja.nombre_caja) AS nombre_caja,
+        COALESCE(sesion.caja_estado, caja.estado, false) AS caja_estado,
+        COALESCE(asignacion.puede_responsable, false) AS puede_responsable,
+        COALESCE(asignacion.puede_auxiliar, false) AS puede_auxiliar
+      FROM target_sucursal objetivo
+      INNER JOIN public.sucursales sucursal
+        ON sucursal.id_sucursal = objetivo.id_sucursal
+       AND COALESCE(sucursal.estado, true) = true
+      LEFT JOIN active_session sesion
+        ON sesion.id_sucursal = sucursal.id_sucursal
+      LEFT JOIN LATERAL (
+        SELECT
+          autorizacion.id_caja,
+          autorizacion.puede_responsable,
+          autorizacion.puede_auxiliar
+        FROM public.cajas_usuarios_autorizados autorizacion
+        INNER JOIN public.cajas caja_asignada
+          ON caja_asignada.id_caja = autorizacion.id_caja
+         AND caja_asignada.id_sucursal = sucursal.id_sucursal
+         AND COALESCE(caja_asignada.estado, true) = true
+        WHERE autorizacion.id_usuario = $1
+          AND COALESCE(autorizacion.estado, true) = true
+          AND (
+            COALESCE(autorizacion.puede_responsable, false) = true
+            OR COALESCE(autorizacion.puede_auxiliar, false) = true
+          )
+        ORDER BY
+          COALESCE(autorizacion.puede_responsable, false) DESC,
+          autorizacion.fecha_actualizacion DESC,
+          autorizacion.id_caja_usuario_autorizado DESC
+        LIMIT 1
+      ) asignacion ON true
+      LEFT JOIN public.cajas caja
+        ON caja.id_caja = COALESCE(sesion.id_caja, asignacion.id_caja)
+      LIMIT 1
+    `,
+    [idUsuario, idSucursal]
+  );
+
+  const row = result.rows?.[0] || null;
+  if (!row) return null;
+
+  const cajaActiva = row.id_caja
+    ? {
+        id_caja: Number(row.id_caja),
+        id_sucursal: Number(row.id_sucursal),
+        nombre_sucursal: row.nombre_sucursal,
+        codigo_caja: row.codigo_caja,
+        nombre_caja: row.nombre_caja,
+        estado: Boolean(row.caja_estado),
+        puede_responsable: Boolean(row.puede_responsable),
+        puede_auxiliar: Boolean(row.puede_auxiliar),
+        puede_operar: Boolean(row.id_sesion_caja),
+        puede_abrir: Boolean(!row.id_sesion_caja && row.puede_responsable),
+        estado_operativo: row.id_sesion_caja ? 'SESION_ACTIVA_USUARIO' : 'ASIGNADA_SIN_SESION'
+      }
+    : null;
+  const sesionCaja = row.id_sesion_caja
+    ? {
+        id_sesion_caja: Number(row.id_sesion_caja),
+        id_caja: Number(row.id_caja),
+        id_sucursal: Number(row.id_sucursal),
+        nombre_sucursal: row.nombre_sucursal,
+        codigo_caja: row.codigo_caja,
+        nombre_caja: row.nombre_caja,
+        estado: row.estado_codigo,
+        estado_codigo: row.estado_codigo,
+        id_usuario_responsable: Number(row.id_usuario_responsable),
+        responsable_usuario: row.responsable_usuario,
+        responsable_nombre: row.responsable_nombre,
+        rol_participacion: row.rol_participacion,
+        rol_codigo: row.rol_participacion,
+        fecha_apertura: row.fecha_apertura,
+        monto_apertura: Number(row.monto_apertura || 0)
+      }
+    : null;
+
+  return {
+    id_sucursal: Number(row.id_sucursal),
+    sucursal: {
+      id_sucursal: Number(row.id_sucursal),
+      nombre_sucursal: row.nombre_sucursal
+    },
+    caja_activa: cajaActiva,
+    sesion_caja: sesionCaja
+  };
+};
+
 export const getCajaBootstrapHandler = async (req, res) => {
   const startedAt = performance.now();
   const requestId = String(req.headers['x-request-id'] || '').trim().slice(0, 80) || `vcb-${randomUUID()}`;
@@ -696,16 +857,74 @@ export const getCajaBootstrapHandler = async (req, res) => {
   try {
     idSucursal = parseOptionalPositiveInt(req.query.id_sucursal);
     idTipoDepartamento = parseOptionalPositiveInt(req.query.id_tipo_departamento);
-    if (!idSucursal) {
-      return res.status(400).json({ error: true, message: 'id_sucursal es obligatorio.' });
-    }
     if (req.query.id_tipo_departamento !== undefined && !idTipoDepartamento) {
       return res.status(400).json({ error: true, message: 'id_tipo_departamento debe ser un entero mayor a 0.' });
     }
 
     const scope = await resolveRequestUserSucursalScope(req);
+    if (!idSucursal && !scope.isSuperAdmin) {
+      idSucursal = scope.userSucursalId
+        || (scope.allowedSucursalIds.length === 1 ? Number(scope.allowedSucursalIds[0]) : null);
+    }
+    const operationalStartedAt = performance.now();
+    let operationalState = await fetchCajaBootstrapOperationalState({
+      idUsuario: scope.idUsuario,
+      idSucursal
+    });
+    sqlDurationMs += performance.now() - operationalStartedAt;
+    idSucursal = idSucursal || operationalState?.id_sucursal || null;
+    if (!idSucursal) {
+      return res.status(200).json({
+        data: {
+          id_sucursal: null,
+          sucursal: null,
+          caja_activa: null,
+          sesion_caja: null,
+          requiere_seleccion_sucursal: true,
+          departamentos: [],
+          departamento_activo: null,
+          recetas: []
+        },
+        meta: {
+          cache: 'MISS',
+          duration_ms: Number((performance.now() - startedAt).toFixed(2)),
+          sql_duration_ms: Number(sqlDurationMs.toFixed(2)),
+          mapping_duration_ms: 0
+        }
+      });
+    }
     const sucursalValidation = await validateVentasCatalogSucursal({ scope, idSucursal });
     if (!sucursalValidation.ok) return res.status(sucursalValidation.status).json(sucursalValidation.body);
+    if (!operationalState || Number(operationalState.id_sucursal) !== idSucursal) {
+      const scopedOperationalStartedAt = performance.now();
+      operationalState = await fetchCajaBootstrapOperationalState({
+        idUsuario: scope.idUsuario,
+        idSucursal
+      });
+      sqlDurationMs += performance.now() - scopedOperationalStartedAt;
+    }
+
+    if (!operationalState?.sesion_caja) {
+      const durationMs = performance.now() - startedAt;
+      return res.status(200).json({
+        data: {
+          id_sucursal: idSucursal,
+          sucursal: operationalState?.sucursal || null,
+          caja_activa: operationalState?.caja_activa || null,
+          sesion_caja: null,
+          requiere_sesion_caja: true,
+          departamentos: [],
+          departamento_activo: null,
+          recetas: []
+        },
+        meta: {
+          cache: 'MISS',
+          duration_ms: Number(durationMs.toFixed(2)),
+          sql_duration_ms: Number(sqlDurationMs.toFixed(2)),
+          mapping_duration_ms: 0
+        }
+      });
+    }
 
     const cacheKey = buildCajaBootstrapCacheKey({
       idSucursal,
@@ -751,13 +970,20 @@ export const getCajaBootstrapHandler = async (req, res) => {
     });
     cacheStatus = cached.cache;
     idTipoDepartamento = Number(cached.value.data?.departamento_activo?.id_tipo_departamento || idTipoDepartamento || 0) || null;
-    sqlDurationMs = cacheStatus === 'HIT' ? 0 : Number(cached.value.metrics?.sql_duration_ms || 0);
+    sqlDurationMs += cacheStatus === 'HIT' ? 0 : Number(cached.value.metrics?.sql_duration_ms || 0);
     mappingDurationMs = cacheStatus === 'HIT' ? 0 : Number(cached.value.metrics?.mapping_duration_ms || 0);
     recipeCount = Array.isArray(cached.value.data?.recetas) ? cached.value.data.recetas.length : 0;
     const durationMs = performance.now() - startedAt;
     res.setHeader('X-Request-Id', requestId);
     return res.status(200).json({
-      data: cached.value.data,
+      data: {
+        ...cached.value.data,
+        sucursal: operationalState.sucursal,
+        caja_activa: operationalState.caja_activa,
+        sesion_caja: operationalState.sesion_caja,
+        requiere_seleccion_sucursal: false,
+        requiere_sesion_caja: false
+      },
       meta: {
         cache: cacheStatus,
         duration_ms: Number(durationMs.toFixed(2)),
