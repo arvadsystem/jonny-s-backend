@@ -2,7 +2,7 @@ import express from 'express';
 import { performance } from 'node:perf_hooks';
 import { createHash } from 'node:crypto';
 import pool from '../config/db-connection.js';
-import { checkPermission, requestHasAnyPermission } from '../middleware/checkPermission.js';
+import { checkPermission, requestHasAnyPermission, requestHasAnyRole } from '../middleware/checkPermission.js';
 import { resolveRequestUserSucursalScope } from '../utils/sucursalScope.js';
 import { registerFacturaLoyaltyAccumulation } from '../services/fidelizacionService.js';
 import { generarCodigoDocumento } from '../services/facturacionCorrelativoService.js';
@@ -61,6 +61,10 @@ import {
   getVentaTicketPdfByIdHandler,
   getVentaTicketByIdHandler
 } from './ventas/handlers/ventasReadHandlers.js';
+import {
+  createVentaPrintEventHandler,
+  getVentaKitchenComandaByIdHandler
+} from './ventas/handlers/ventasPrintHandlers.js';
 import {
   buildComplementLineConfig,
   buildComplementSnapshot,
@@ -131,6 +135,10 @@ import {
   logVentasPerfStartupIfEnabled
 } from './ventas/utils/perfUtils.js';
 import { resolveExtrasInventory } from './ventas/services/extrasInventoryService.js';
+import {
+  attachSalsaInventorySnapshotsToLines,
+  getSelectedSalsaIdsFromLines
+} from './ventas/services/salsasInventoryService.js';
 
 const router = express.Router();
 
@@ -250,6 +258,8 @@ const getIdempotencyKey = (req) => {
   return key || null;
 };
 
+const REVERSION_ALLOWED_ROLES = Object.freeze(['ADMIN', 'ADMINISTRADOR', 'SUPER_ADMIN']);
+
 const stableStringify = (value) => {
   if (value === null || typeof value !== 'object') return JSON.stringify(value);
   if (Array.isArray(value)) return `[${value.map((item) => stableStringify(item)).join(',')}]`;
@@ -266,6 +276,7 @@ const buildIdempotencyRequestHash = (body) =>
     .digest('hex');
 
 const reserveVentasIdempotencyKey = async ({
+  client = pool,
   idempotencyKey,
   operation,
   requestHash,
@@ -275,7 +286,7 @@ const reserveVentasIdempotencyKey = async ({
   if (!idempotencyKey) return { enabled: false };
 
   try {
-    const insertResult = await pool.query(
+    const insertResult = await client.query(
       `
         INSERT INTO public.ventas_idempotency_keys (
           idempotency_key,
@@ -302,7 +313,7 @@ const reserveVentasIdempotencyKey = async ({
       return { enabled: true, reserved: true, idempotencyKey, requestHash };
     }
 
-    const existingResult = await pool.query(
+    const existingResult = await client.query(
       `
         SELECT
           idempotency_key,
@@ -314,6 +325,7 @@ const reserveVentasIdempotencyKey = async ({
         FROM public.ventas_idempotency_keys
         WHERE idempotency_key = $1
         LIMIT 1
+        FOR UPDATE
       `,
       [idempotencyKey]
     );
@@ -337,7 +349,7 @@ const reserveVentasIdempotencyKey = async ({
       return { enabled: true, conflict: true, code: 'REQUEST_ALREADY_IN_PROGRESS' };
     }
 
-    await pool.query(
+    await client.query(
       `
         UPDATE public.ventas_idempotency_keys
         SET
@@ -369,6 +381,7 @@ const reserveVentasIdempotencyKey = async ({
 };
 
 const saveVentasIdempotencySuccess = async ({
+  client = pool,
   reservation,
   httpStatus,
   responseBody,
@@ -378,7 +391,7 @@ const saveVentasIdempotencySuccess = async ({
   idSucursal = null
 }) => {
   if (!reservation?.reserved) return;
-  await pool.query(
+  await client.query(
     `
       UPDATE public.ventas_idempotency_keys
       SET
@@ -406,12 +419,13 @@ const saveVentasIdempotencySuccess = async ({
 };
 
 const saveVentasIdempotencyFailure = async ({
+  client = pool,
   reservation,
   httpStatus = null,
   errorCode = null
 }) => {
   if (!reservation?.reserved) return;
-  await pool.query(
+  await client.query(
     `
       UPDATE public.ventas_idempotency_keys
       SET
@@ -2224,9 +2238,6 @@ const resolveLineExtras = ({ item, allowedExtrasMap }) => {
       return { ok: false, message: 'Uno o mas extras seleccionados no son validos para este item.' };
     }
     const cantidad = Number(entry.cantidad || 0);
-    if (cantidad > Number(item.cantidad || 0)) {
-      return { ok: false, message: 'La cantidad de un extra no puede ser mayor que la cantidad del item.' };
-    }
     if (extra.disponible !== true) {
       return {
         ok: false,
@@ -2272,6 +2283,48 @@ const resolveLineExtras = ({ item, allowedExtrasMap }) => {
   }
 
   return { ok: true, selected, subtotal };
+};
+
+const validateAggregatedExtrasInventory = (lines = []) => {
+  const usageByStockKey = new Map();
+
+  for (const line of Array.isArray(lines) ? lines : []) {
+    for (const extra of Array.isArray(line?.extras_detalle) ? line.extras_detalle : []) {
+      const idInsumo = parseOptionalPositiveInt(extra?.id_insumo);
+      const idAlmacen = parseOptionalPositiveInt(extra?.id_almacen);
+      const consumoBase = Number(extra?.cantidad_insumo ?? extra?.cant ?? 0);
+      const cantidad = Number(extra?.cantidad || 0);
+      if (!idInsumo || !idAlmacen || consumoBase <= 0 || cantidad <= 0) continue;
+
+      const stockKey = `${idInsumo}:${idAlmacen}`;
+      const current = usageByStockKey.get(stockKey) || {
+        idInsumo,
+        idAlmacen,
+        nombre: extra.nombre || 'extra',
+        stockDisponible: Number(extra.stock_disponible ?? 0),
+        requerido: 0
+      };
+      current.requerido = roundMoney(current.requerido + (consumoBase * cantidad));
+      current.stockDisponible = Math.min(current.stockDisponible, Number(extra.stock_disponible ?? 0));
+      usageByStockKey.set(stockKey, current);
+    }
+  }
+
+  for (const usage of usageByStockKey.values()) {
+    if (usage.stockDisponible < usage.requerido) {
+      return {
+        ok: false,
+        status: 409,
+        body: {
+          error: true,
+          code: 'VENTAS_EXTRA_INVENTARIO_NO_DISPONIBLE',
+          message: `No hay existencias suficientes para el extra ${usage.nombre}.`
+        }
+      };
+    }
+  }
+
+  return { ok: true };
 };
 
 const hasVentaExtras = (venta) =>
@@ -2646,7 +2699,8 @@ const normalizeComplementosFromMenuConfig = (configuracionMenu) => {
   return selected.map((entry) => ({
     id_complemento: Number(entry?.id_complemento || entry?.id_salsa || 0),
     id_salsa: Number(entry?.id_salsa || entry?.id_complemento || 0),
-    nombre: String(entry?.nombre || 'Complemento').trim()
+    nombre: String(entry?.nombre || 'Complemento').trim(),
+    inventario: entry?.inventario || null
   })).filter((entry) => entry.id_complemento > 0);
 };
 
@@ -2897,6 +2951,7 @@ const hydrateVentaLines = async (client, normalizedItems, perf = null, options =
     buildVentaComplementContext({
       client,
       normalizedItems,
+      idSucursal: options?.idSucursal,
       perf,
       recetaMap,
       comboMap
@@ -3180,6 +3235,9 @@ const hydrateVentaLines = async (client, normalizedItems, perf = null, options =
     });
     subTotals.push(subTotal);
   }
+
+  const extrasInventoryResult = validateAggregatedExtrasInventory(lines);
+  if (!extrasInventoryResult.ok) return extrasInventoryResult;
 
   perf?.add?.('totals_items_ms', totalsItemsStart);
   return { ok: true, data: { lines, subTotals } };
@@ -6209,6 +6267,19 @@ router.get('/ventas/pedidos-menu', checkPermission(['VENTAS_VER']), async (req, 
           f.id_factura,
           ep.descripcion AS nombre_estado_pedido,
           ${estadoPagoSelect},
+          ${hasEstadoPago ? 'p.estado_pago' : 'NULL::text'} AS estado_pago_legacy,
+          UPPER(TRIM(COALESCE(ppc.estado_pago_codigo, ''))) AS estado_pago_control,
+          COALESCE(ppc.monto_total, p.total, 0)::numeric(14,2) AS monto_total,
+          COALESCE(ppc.monto_pagado, 0)::numeric(14,2) AS monto_pagado,
+          COALESCE(ppc.monto_pendiente, 0)::numeric(14,2) AS monto_pendiente,
+          (
+            UPPER(TRIM(COALESCE(ppc.estado_pago_codigo, ''))) = '${PEDIDO_PENDIENTE_ESTADO_PAGO}'
+            AND COALESCE(ppc.monto_pendiente, 0) > 0
+            AND (
+              f.id_factura IS NULL
+              OR COALESCE(vcd_info.divisiones_pendientes_count, 0) > 0
+            )
+          ) AS puede_cobrar,
           ${validacionSelect},
           ${pagoConfirmadoAtSelect},
           ${canceladoTimeoutSelect},
@@ -6223,6 +6294,24 @@ router.get('/ventas/pedidos-menu', checkPermission(['VENTAS_VER']), async (req, 
           s.nombre_sucursal,
           fc_info.metodo_pago,
           COALESCE(vcd_info.divisiones_count, 0)::int AS cuenta_dividida_divisiones,
+          pd.id_pedido_delivery IS NOT NULL AS es_delivery,
+          CASE
+            WHEN pd.id_pedido_delivery IS NULL THEN NULL
+            ELSE cme.codigo
+          END AS modalidad,
+          CASE
+            WHEN pd.id_pedido_delivery IS NULL THEN NULL
+            ELSE cde.codigo
+          END AS estado_delivery,
+          CASE
+            WHEN pd.id_pedido_delivery IS NULL THEN NULL
+            ELSE COALESCE(pd.costo_envio, 0)::numeric(14,2)
+          END AS costo_envio,
+          CASE WHEN pd.id_pedido_delivery IS NULL THEN NULL ELSE pd.nombre_receptor END AS nombre_receptor,
+          CASE WHEN pd.id_pedido_delivery IS NULL THEN NULL ELSE pd.telefono_receptor END AS telefono_receptor,
+          CASE WHEN pd.id_pedido_delivery IS NULL THEN NULL ELSE pd.direccion_entrega END AS direccion_entrega,
+          CASE WHEN pd.id_pedido_delivery IS NULL THEN NULL ELSE pd.referencia_entrega END AS referencia_entrega,
+          CASE WHEN pd.id_pedido_delivery IS NULL THEN NULL ELSE pd.observacion_delivery END AS observacion_delivery,
           COALESCE(dp_info.items, '[]'::jsonb) AS items,
           u_pago.nombre_usuario AS usuario_pago_confirmado,
           per.nombre AS nombres_cliente,
@@ -6248,6 +6337,35 @@ router.get('/ventas/pedidos-menu', checkPermission(['VENTAS_VER']), async (req, 
         LEFT JOIN usuarios u_pago ON u_pago.id_usuario = p.id_usuario_pago_confirmado
         ${contactoJoin}
         LEFT JOIN LATERAL (
+          SELECT px_inner.*
+          FROM public.pedidos_contexto px_inner
+          WHERE px_inner.id_pedido = p.id_pedido
+          ORDER BY px_inner.id_pedido_contexto DESC
+          LIMIT 1
+        ) px ON true
+        LEFT JOIN public.cat_pedidos_modalidades_entrega cme
+          ON cme.id_modalidad_entrega = px.id_modalidad_entrega
+        LEFT JOIN LATERAL (
+          SELECT pd_inner.*
+          FROM public.pedidos_delivery pd_inner
+          WHERE pd_inner.id_pedido = p.id_pedido
+          ORDER BY pd_inner.id_pedido_delivery DESC
+          LIMIT 1
+        ) pd ON true
+        LEFT JOIN public.cat_delivery_estados cde
+          ON cde.id_estado_delivery = pd.id_estado_delivery
+        LEFT JOIN LATERAL (
+          SELECT
+            ppc_inner.*,
+            cep_inner.codigo AS estado_pago_codigo
+          FROM public.pedidos_pago_control ppc_inner
+          INNER JOIN public.cat_pedidos_estados_pago cep_inner
+            ON cep_inner.id_estado_pago_pedido = ppc_inner.id_estado_pago_pedido
+          WHERE ppc_inner.id_pedido = p.id_pedido
+          ORDER BY ppc_inner.id_pedido_pago_control DESC
+          LIMIT 1
+        ) ppc ON true
+        LEFT JOIN LATERAL (
           SELECT
             STRING_AGG(DISTINCT cmp.nombre, ', ' ORDER BY cmp.nombre) AS metodo_pago
           FROM facturas_cobros fc
@@ -6256,7 +6374,9 @@ router.get('/ventas/pedidos-menu', checkPermission(['VENTAS_VER']), async (req, 
           WHERE fc.id_factura = f.id_factura
         ) fc_info ON true
         LEFT JOIN LATERAL (
-          SELECT COUNT(*)::int AS divisiones_count
+          SELECT
+            COUNT(*)::int AS divisiones_count,
+            COUNT(*) FILTER (WHERE UPPER(TRIM(COALESCE(vcd.estado, ''))) = 'PENDIENTE')::int AS divisiones_pendientes_count
           FROM public.ventas_cuenta_divisiones vcd
           WHERE vcd.id_pedido = p.id_pedido
         ) vcd_info ON true
@@ -6353,7 +6473,7 @@ router.get('/ventas/pedidos-menu', checkPermission(['VENTAS_VER']), async (req, 
       return {
         ...row,
         pago_validado: String(row.estado_pago || '').toUpperCase() === PEDIDO_ESTADO_PAGO.PAGADO_CONFIRMADO,
-        pago_expirado: String(row.estado_pago || '').toUpperCase() === PEDIDO_ESTADO_PAGO.CANCELADO_TIMEOUT,
+        pago_expirado: String(row.estado_pago_legacy || row.estado_pago || '').toUpperCase() === PEDIDO_ESTADO_PAGO.CANCELADO_TIMEOUT,
         minutos_restantes_pago: minutosRestantes
       };
     });
@@ -6695,14 +6815,65 @@ router.post('/ventas/:id/reversiones', checkPermission(['VENTAS_REVERSION_CREAR'
   const ipOrigen = String(getClientIp(req) || '-').slice(0, 80);
   const deviceInfo = parseUserAgent(rawUserAgent);
   const dispositivo = String(deviceInfo?.dispositivo || 'Desconocido').slice(0, 80);
+  const idempotencyKey = getIdempotencyKey(req);
+  const idempotencyRequestHash = idempotencyKey
+    ? buildIdempotencyRequestHash({ idFactura, body: req.body })
+    : null;
 
   try {
-    const result = await createVentaReversion({
+    const hasAllowedRole = await requestHasAnyRole(req, REVERSION_ALLOWED_ROLES);
+    if (!hasAllowedRole) {
+      return res.status(403).json({
+        error: true,
+        code: 'VENTAS_REVERSION_ROL_NO_AUTORIZADO',
+        message: 'Solo administradores pueden registrar reversiones.'
+      });
+    }
+
+    const creation = await createVentaReversion({
       idFactura,
       body: req.body,
       req,
-      idUsuario
+      idUsuario,
+      idempotency: {
+        reserve: (client) => reserveVentasIdempotencyKey({
+          client,
+          idempotencyKey,
+          operation: 'VENTAS_REVERSION_CREAR',
+          requestHash: idempotencyRequestHash,
+          idUsuario
+        }),
+        saveSuccess: (client, reservation, responseBody, result) => saveVentasIdempotencySuccess({
+          client,
+          reservation,
+          httpStatus: 201,
+          responseBody,
+          idFactura,
+          idUsuario,
+          idSucursal: result?.id_sucursal
+        })
+      }
     });
+
+    if (creation?.idempotency?.replay) {
+      return res.status(creation.idempotency.httpStatus || 200).json({
+        ...(isPlainObject(creation.idempotency.responseBody) ? creation.idempotency.responseBody : {}),
+        replayed: true
+      });
+    }
+
+    if (creation?.idempotency?.conflict) {
+      return res.status(409).json({
+        error: true,
+        code: creation.idempotency.code,
+        message: creation.idempotency.code === 'IDEMPOTENCY_KEY_REUSED'
+          ? 'Idempotency-Key ya fue usado con otro payload.'
+          : 'La solicitud con este Idempotency-Key esta en proceso.'
+      });
+    }
+
+    const result = creation.result;
+    const responseBody = creation.responseBody;
 
     try {
       await sendReversionSuccessEmail({
@@ -6745,12 +6916,9 @@ router.post('/ventas/:id/reversiones', checkPermission(['VENTAS_REVERSION_CREAR'
       }
     }
 
-    return res.status(201).json({
-      success: true,
-      data: result,
-      message: 'Reversión registrada correctamente.'
-    });
+    return res.status(201).json(responseBody);
   } catch (error) {
+
     if (Number.isInteger(error?.httpStatus) && error.httpStatus >= 400 && error.httpStatus < 500) {
       await registerReversionFailureAttempt({
         idFactura,
@@ -7001,8 +7169,10 @@ router.get('/ventas/pedidos/:id/inventario-alertas', checkPermission(['VENTAS_VE
   }
 });
 
-router.get('/ventas/:id/ticket.pdf', checkPermission(['VENTAS_VER']), getVentaTicketPdfByIdHandler);
-router.get('/ventas/:id/ticket', checkPermission(['VENTAS_VER']), getVentaTicketByIdHandler);
+router.get('/ventas/:id/ticket.pdf', checkPermission(['VENTAS_IMPRIMIR']), getVentaTicketPdfByIdHandler);
+router.get('/ventas/:id/ticket', checkPermission(['VENTAS_IMPRIMIR']), getVentaTicketByIdHandler);
+router.get('/ventas/:id/comanda', checkPermission(['VENTAS_IMPRIMIR']), getVentaKitchenComandaByIdHandler);
+router.post('/ventas/:id/impresiones', checkPermission(['VENTAS_IMPRIMIR']), createVentaPrintEventHandler);
 router.get('/ventas/:id', checkPermission(['VENTAS_VER']), getVentaByIdHandler);
 
 async function listarPedidosPendientesPago(req, res) {
@@ -7056,23 +7226,17 @@ async function listarPedidosPendientesPago(req, res) {
     const userSucursalId = parseOptionalPositiveInt(scope?.userSucursalId);
     const effectiveAllowedSucursalIds = allowedSucursalIds.length > 0 ? allowedSucursalIds : userSucursalId ? [userSucursalId] : [];
 
-    const filters = [
-      'UPPER(TRIM(ppc.estado_pago_codigo)) = $1',
-      'COALESCE(ppc.monto_pendiente, 0) > 0',
-      `(f.id_factura IS NULL OR COALESCE(ppc.monto_pendiente, 0) > 0 OR EXISTS (
+    const hasPendingSplitDivisionSql = `EXISTS (
         SELECT 1
         FROM public.ventas_cuenta_divisiones vcd_pending
         WHERE vcd_pending.id_pedido = p.id_pedido
           AND UPPER(TRIM(vcd_pending.estado)) = 'PENDIENTE'
-      ))`,
-      'p.cancelado_por_timeout_at IS NULL',
-      `(COALESCE(UPPER(TRIM(p.estado_pago)), '') NOT IN ('PAGADO_CONFIRMADO', 'CANCELADO_TIMEOUT', 'PAGO_ANULADO', 'CANCELADO', 'ANULADO')
-        OR EXISTS (
-          SELECT 1
-          FROM public.ventas_cuenta_divisiones vcd_pending_estado
-          WHERE vcd_pending_estado.id_pedido = p.id_pedido
-            AND UPPER(TRIM(vcd_pending_estado.estado)) = 'PENDIENTE'
-        ))`
+      )`;
+    const cobrableFacturaScopeSql = `(f.id_factura IS NULL OR ${hasPendingSplitDivisionSql})`;
+    const filters = [
+      'UPPER(TRIM(ppc.estado_pago_codigo)) = $1',
+      'COALESCE(ppc.monto_pendiente, 0) > 0',
+      cobrableFacturaScopeSql
     ];
     const params = [PEDIDO_PENDIENTE_ESTADO_PAGO];
     const excludedPedidoEstados = [
@@ -7241,6 +7405,7 @@ async function listarPedidosPendientesPago(req, res) {
           'PED-' || LPAD(p.id_pedido::text, 5, '0') AS codigo_pedido,
           COALESCE(NULLIF(TRIM(f.codigo_venta), ''), 'VTA-' || LPAD(p.id_pedido::text, 5, '0')) AS codigo_venta_operativo,
           COALESCE(NULLIF(TRIM(f.codigo_venta), ''), 'VTA-' || LPAD(p.id_pedido::text, 5, '0')) AS codigo_venta,
+          f.id_factura,
           p.fecha_hora_pedido,
           p.origen_pedido,
           CASE
@@ -7249,6 +7414,8 @@ async function listarPedidosPendientesPago(req, res) {
             ELSE REPLACE(REPLACE(UPPER(TRIM(COALESCE(ep.descripcion, ''))), ' ', '_'), '-', '_')
           END AS estado_pedido,
           UPPER(TRIM(ppc.estado_pago_codigo)) AS estado_pago,
+          p.estado_pago AS estado_pago_legacy,
+          UPPER(TRIM(ppc.estado_pago_codigo)) AS estado_pago_control,
           p.id_sucursal,
           s.nombre_sucursal,
           pc.nombre_contacto,
@@ -7257,10 +7424,25 @@ async function listarPedidosPendientesPago(req, res) {
           COALESCE(cpc.codigo, p.canal) AS canal,
           COALESCE(cme.codigo, p.tipo_entrega) AS modalidad,
           COALESCE(p.total, ppc.monto_total, 0)::numeric(14,2) AS total,
+          COALESCE(ppc.monto_total, p.total, 0)::numeric(14,2) AS monto_total,
+          COALESCE(ppc.monto_pagado, 0)::numeric(14,2) AS monto_pagado,
           COALESCE(ppc.monto_pendiente, 0)::numeric(14,2) AS monto_pendiente,
-          (pd.id_pedido_delivery IS NOT NULL OR COALESCE(cme.codigo, p.tipo_entrega) = 'DELIVERY') AS es_delivery,
-          COALESCE(pd.costo_envio, 0)::numeric(14,2) AS costo_envio,
+          (
+            UPPER(TRIM(ppc.estado_pago_codigo)) = $1
+            AND COALESCE(ppc.monto_pendiente, 0) > 0
+            AND ${cobrableFacturaScopeSql}
+          ) AS puede_cobrar,
+          pd.id_pedido_delivery IS NOT NULL AS es_delivery,
+          CASE
+            WHEN pd.id_pedido_delivery IS NULL THEN NULL
+            ELSE COALESCE(pd.costo_envio, 0)::numeric(14,2)
+          END AS costo_envio,
           cde.codigo AS estado_delivery,
+          pd.nombre_receptor,
+          pd.telefono_receptor,
+          pd.direccion_entrega,
+          pd.referencia_entrega,
+          pd.observacion_delivery,
           COALESCE(vcd_info.divisiones, '[]'::jsonb) AS cuenta_dividida
         ${fromClause}
         ${whereClause}
@@ -7279,6 +7461,9 @@ async function listarPedidosPendientesPago(req, res) {
       origen_pedido: row.origen_pedido,
       estado_pedido: row.estado_pedido,
       estado_pago: row.estado_pago,
+      estado_pago_legacy: row.estado_pago_legacy,
+      estado_pago_control: row.estado_pago_control,
+      id_factura: parseOptionalPositiveInt(row.id_factura),
       id_sucursal: Number(row.id_sucursal),
       nombre_sucursal: row.nombre_sucursal,
       nombre_contacto: row.nombre_contacto,
@@ -7287,12 +7472,21 @@ async function listarPedidosPendientesPago(req, res) {
       canal: row.canal,
       modalidad: row.modalidad,
       total: roundMoney(row.total),
+      monto_total: roundMoney(row.monto_total),
+      monto_pagado: roundMoney(row.monto_pagado),
       monto_pendiente: roundMoney(row.monto_pendiente),
+      puede_cobrar: Boolean(row.puede_cobrar),
       cuenta_dividida: {
         divisiones: Array.isArray(row.cuenta_dividida) ? row.cuenta_dividida : []
       },
       es_delivery: Boolean(row.es_delivery),
-      costo_envio: roundMoney(row.costo_envio)
+      costo_envio: row.costo_envio === null || row.costo_envio === undefined ? null : roundMoney(row.costo_envio),
+      estado_delivery: row.estado_delivery,
+      nombre_receptor: row.nombre_receptor,
+      telefono_receptor: row.telefono_receptor,
+      direccion_entrega: row.direccion_entrega,
+      referencia_entrega: row.referencia_entrega,
+      observacion_delivery: row.observacion_delivery
     }));
 
     if (includeItems && items.length > 0) {
@@ -7536,6 +7730,11 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
 
     const cuentaDivididaPlanStart = ventasPerf.now();
     const pedidoPendiente = prepared.data;
+    await attachSalsaInventorySnapshotsToLines({
+      client,
+      lines: pedidoPendiente.pedido_lines,
+      idSucursal: pedidoPendiente.id_sucursal
+    });
     const cuentaDivisionPlan = buildCuentaDivisionPlan({
       cuentaDividida: req.body?.cuenta_dividida,
       lines: pedidoPendiente.pedido_lines,
@@ -7549,9 +7748,11 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
       items_count: Array.isArray(pedidoPendiente.pedido_lines) ? pedidoPendiente.pedido_lines.length : 0
     });
     ventasPerfContext.cuenta_dividida = Boolean(cuentaDivisionPlan);
+    const pedidoPendienteHasSalsasInventario = getSelectedSalsaIdsFromLines(pedidoPendiente.pedido_lines).length > 0;
 
     const shouldUsePedidoPendienteRpcV1 =
       pedidoPendienteRpcEnabled
+      && !pedidoPendienteHasSalsasInventario
       && !cuentaDivisionPlan
       && Array.isArray(pedidoPendiente.pedido_lines)
       && pedidoPendiente.pedido_lines.length > 0;
@@ -7588,6 +7789,8 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
     pedidoPendientePersistenceMode = 'legacy';
     if (cuentaDivisionPlan) {
       pedidoPendienteRpcSkipReason = 'cuenta_dividida';
+    } else if (pedidoPendienteHasSalsasInventario) {
+      pedidoPendienteRpcSkipReason = 'salsas_inventario';
     } else if (!pedidoPendienteRpcEnabled) {
       pedidoPendienteRpcSkipReason = 'flag_disabled';
     } else if (!Array.isArray(pedidoPendiente.pedido_lines) || pedidoPendiente.pedido_lines.length === 0) {
@@ -7660,7 +7863,6 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
       };
     }
     ventasPerf.add('pedido_ms', pedidoStart);
-
     const hasDetallePedidoConfiguracionMenu = await hasColumn(client, 'detalle_pedido', 'configuracion_menu');
     const detalleStart = ventasPerf.now();
     const pedidoLineRefs = [];
@@ -8843,6 +9045,11 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
     }
 
     const venta = prepared.data;
+    await attachSalsaInventorySnapshotsToLines({
+      client,
+      lines: venta.all_lines,
+      idSucursal: venta.id_sucursal
+    });
     const amountValidation = validateVentaMontoCobro({ venta });
     if (!amountValidation.ok) {
       await client.query('ROLLBACK');
@@ -8871,14 +9078,18 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
       items_count: allLines.length
     });
     const ventaHasExtras = hasVentaExtras(venta);
-    if (ventaHasExtras && ventasRpcV2Enabled) {
+    const ventaHasSalsasInventario = getSelectedSalsaIdsFromLines(venta.all_lines).length > 0;
+    if (ventaHasSalsasInventario) {
+      ventasPerfContext.rpc_enabled = false;
+      ventasPerfContext.rpc_version = 'legacy_salsas_inventario';
+    } else if (ventaHasExtras && ventasRpcV2Enabled) {
       ventasPerfContext.rpc_version = 'v2_extras';
     } else if (ventaHasExtras) {
       ventasPerfContext.rpc_enabled = false;
       ventasPerfContext.rpc_version = 'legacy_extras';
     }
 
-    if (ventasRpcV2Enabled) {
+    if (ventasRpcV2Enabled && !ventaHasSalsasInventario) {
       const rpcCreateResult = await createVentaWithRpcV2Transaction({
         client,
         venta,
@@ -8908,7 +9119,7 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
       return;
     }
 
-    if (ventasRpcV1Enabled && !ventaHasExtras) {
+    if (ventasRpcV1Enabled && !ventaHasExtras && !ventaHasSalsasInventario) {
       const rpcCreateResult = await createVentaWithRpcTransaction({
         client,
         venta,
@@ -9190,7 +9401,6 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
     const fechaHoraFacturacion = facturaRow.fecha_hora_facturacion || fechaHoraPedido || null;
     ventasPerf.add('factura_insert_ms', facturaInsertStart);
     ventasPerf.add('factura_ms', facturaInsertStart);
-
     const facturaSnapshotStart = ventasPerf.now();
     const facturacionVenta = await obtenerConfigFacturacionParaVenta(client, venta.id_sucursal, {
       perf: ventasPerf

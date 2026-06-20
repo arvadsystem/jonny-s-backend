@@ -54,7 +54,8 @@ const mapPublicationRule = (row) => {
   return {
     visibleDefault: row.visible_default !== null && row.visible_default !== undefined
       ? Boolean(row.visible_default)
-      : true
+      : true,
+    orden: toPositiveInt(row.orden)
   };
 };
 
@@ -65,7 +66,7 @@ const getProductAutoPublicationRule = async ({ client, idProducto, idCategoriaPr
 
   const result = await client.query(
     `
-      SELECT mpr.visible_default
+      SELECT mpr.visible_default, mpr.orden
       FROM public.productos p
       INNER JOIN public.menu_publicacion_reglas mpr
         ON mpr.tipo_item = $2
@@ -88,7 +89,7 @@ const getRecipeAutoPublicationRule = async ({ client, idReceta }) => {
 
   const result = await client.query(
     `
-      SELECT mpr.visible_default
+      SELECT mpr.visible_default, mpr.orden
       FROM public.recetas r
       INNER JOIN public.menu_publicacion_reglas mpr
         ON mpr.tipo_item = $2
@@ -111,7 +112,7 @@ const getComboAutoPublicationRule = async ({ client, idCombo }) => {
 
   const result = await client.query(
     `
-      SELECT mpr.visible_default
+      SELECT mpr.visible_default, mpr.orden
       FROM public.combos c
       INNER JOIN public.menu_publicacion_reglas mpr
         ON mpr.tipo_item = $2
@@ -396,7 +397,8 @@ const ensureDetailMenuRows = async ({
   menuIds,
   tipoItem,
   idItemOrigen,
-  visibleDefault = true
+  visibleDefault = true,
+  preferredOrder = null
 }) => {
   const capabilities = await getDetalleMenuCapabilities(client);
   const normalizedMenuIds = [...new Set((Array.isArray(menuIds) ? menuIds : [])
@@ -424,6 +426,7 @@ const ensureDetailMenuRows = async ({
     menuIds: missingMenuIds,
     capabilities
   });
+  const orderBase = toPositiveInt(preferredOrder);
 
   const payload = missingMenuIds.map((menuId) => ({
     id_menu: menuId,
@@ -433,7 +436,7 @@ const ensureDetailMenuRows = async ({
     id_combo: tipoItem === DETAIL_ITEM_TYPES.COMBO ? idItem : null,
     visible: Boolean(visibleDefault),
     precio_publico: null,
-    orden: capabilities.hasOrden ? nextOrderByMenu.get(menuId) || 1 : null
+    orden: capabilities.hasOrden ? orderBase || nextOrderByMenu.get(menuId) || 1 : null
   }));
 
   await insertDetalleMenuRows({ client, rows: payload, capabilities });
@@ -453,7 +456,8 @@ export const autoPublishNewRecipe = async ({
     menuIds: [idMenu],
     tipoItem: DETAIL_ITEM_TYPES.RECETA,
     idItemOrigen: idReceta,
-    visibleDefault: rule.visibleDefault
+    visibleDefault: rule.visibleDefault,
+    preferredOrder: rule.orden ? rule.orden * 1000 : null
   });
 };
 
@@ -470,7 +474,8 @@ export const autoPublishNewCombo = async ({
     menuIds: [idMenu],
     tipoItem: DETAIL_ITEM_TYPES.COMBO,
     idItemOrigen: idCombo,
-    visibleDefault: rule.visibleDefault
+    visibleDefault: rule.visibleDefault,
+    preferredOrder: rule.orden ? rule.orden * 1000 : null
   });
 };
 
@@ -503,7 +508,8 @@ export const autoPublishNewProduct = async ({
     menuIds: activeMenuIds,
     tipoItem: DETAIL_ITEM_TYPES.PRODUCTO,
     idItemOrigen: idProducto,
-    visibleDefault: rule.visibleDefault
+    visibleDefault: rule.visibleDefault,
+    preferredOrder: rule.orden ? rule.orden * 1000 : null
   });
 };
 

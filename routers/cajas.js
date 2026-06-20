@@ -15,6 +15,7 @@ const CAJAS_SCOPE_PERMISSION = 'VENTAS_CAJAS_MULTISUCURSAL_VER';
 const ADMIN_ROLE_CODES = ['ADMIN', 'ADMINISTRADOR', 'SUPER_ADMIN'];
 const CAJA_ADMIN_EMAIL_TO = 'gersonmz@jonnyshn.com';
 const CAJA_APERTURA_EMAIL_TO = CAJA_ADMIN_EMAIL_TO;
+const MANUAL_MOVEMENT_EXCLUDED_CODES = new Set(['APERTURA', 'REVERSION', 'REVERSO']);
 
 const CATALOGS = Object.freeze({
   SESSION_STATES: { table: 'public.cat_cajas_sesiones_estados', id: 'id_estado_sesion_caja' },
@@ -199,9 +200,18 @@ const escapeHtml = (value) =>
 
 const formatMoneyLabel = (value) => `L ${roundMoney(value).toFixed(2)}`;
 
+const parseUtcTimestampForDisplay = (value) => {
+  if (!value || value instanceof Date) return value;
+  const text = String(value).trim();
+  if (/^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}(:\d{2})?(\.\d+)?$/.test(text)) {
+    return `${text.replace(' ', 'T')}Z`;
+  }
+  return value;
+};
+
 const formatDateTimeLabel = (value) => {
   if (!value) return 'No disponible';
-  const date = new Date(value);
+  const date = new Date(parseUtcTimestampForDisplay(value));
   if (!Number.isFinite(date.getTime())) return String(value);
   return new Intl.DateTimeFormat('es-HN', {
     dateStyle: 'medium',
@@ -259,22 +269,71 @@ const fetchSessionMethodFinancialSummary = async (client, idSesionCaja) => {
 
   const reversionsResult = await client.query(
     `
-      SELECT UPPER(TRIM(mp.codigo)) AS metodo_pago_codigo, COALESCE(SUM(fr.monto_reversado), 0)::numeric(12,2) AS monto
+      SELECT
+        fr.id_reversion,
+        COALESCE(fr.monto_reversado, 0)::numeric(12,2) AS monto_reversado,
+        fc.id_factura_cobro,
+        COALESCE(fc.monto, 0)::numeric(12,2) AS monto_cobro,
+        UPPER(TRIM(mp.codigo)) AS metodo_pago_codigo
       FROM public.facturas_reversiones fr
-      INNER JOIN LATERAL (
-        SELECT fc.id_metodo_pago, fc.id_sesion_caja
-        FROM public.facturas_cobros fc
-        WHERE fc.id_factura = fr.id_factura_original
-        ORDER BY fc.id_factura_cobro ASC
-        LIMIT 1
-      ) metodo_origen ON true
-      INNER JOIN public.cat_metodos_pago mp ON mp.id_metodo_pago = metodo_origen.id_metodo_pago
-      WHERE COALESCE(fr.id_sesion_caja_original, metodo_origen.id_sesion_caja) = $1
+      INNER JOIN public.facturas_cobros fc
+        ON fc.id_factura = fr.id_factura_original
+      INNER JOIN public.cat_metodos_pago mp
+        ON mp.id_metodo_pago = fc.id_metodo_pago
+      WHERE COALESCE(fr.id_sesion_caja_original, fc.id_sesion_caja) = $1
         AND UPPER(TRIM(COALESCE(fr.estado, ''))) = 'APLICADA'
-      GROUP BY UPPER(TRIM(mp.codigo))
+      ORDER BY fr.id_reversion ASC, fc.id_factura_cobro ASC
     `,
     [idSesionCaja]
   );
+
+  const reversionTotalsResult = await client.query(
+    `
+      SELECT
+        fr.id_reversion,
+        COALESCE(SUM(fc.monto), 0)::numeric(12,2) AS total_cobrado
+      FROM public.facturas_reversiones fr
+      INNER JOIN public.facturas_cobros fc
+        ON fc.id_factura = fr.id_factura_original
+      WHERE COALESCE(fr.id_sesion_caja_original, fc.id_sesion_caja) = $1
+        AND UPPER(TRIM(COALESCE(fr.estado, ''))) = 'APLICADA'
+      GROUP BY fr.id_reversion
+    `,
+    [idSesionCaja]
+  );
+
+  const reversionTotalsById = new Map();
+  for (const row of reversionTotalsResult.rows || []) {
+    reversionTotalsById.set(Number(row.id_reversion), roundMoney(row.total_cobrado));
+  }
+
+  const reversionRowsById = new Map();
+  for (const row of reversionsResult.rows || []) {
+    const idReversion = Number(row.id_reversion || 0);
+    if (!idReversion) continue;
+    const rows = reversionRowsById.get(idReversion) || [];
+    rows.push(row);
+    reversionRowsById.set(idReversion, rows);
+  }
+
+  const allocatedReversionsByCode = new Map();
+  for (const [idReversion, rows] of reversionRowsById.entries()) {
+    const totalCobrado = Number(reversionTotalsById.get(idReversion) || 0);
+    const montoReversado = roundMoney(rows[0]?.monto_reversado || 0);
+    if (montoReversado <= 0 || totalCobrado <= 0) continue;
+
+    let allocated = 0;
+    rows.forEach((row, index) => {
+      const code = normalizeMethodCode(row.metodo_pago_codigo);
+      if (!code) return;
+      const isLast = index === rows.length - 1;
+      const monto = isLast
+        ? roundMoney(montoReversado - allocated)
+        : roundMoney((Number(row.monto_cobro || 0) / totalCobrado) * montoReversado);
+      allocated = roundMoney(allocated + monto);
+      allocatedReversionsByCode.set(code, roundMoney(Number(allocatedReversionsByCode.get(code) || 0) + monto));
+    });
+  }
 
   const movementsResult = await client.query(
     `
@@ -309,8 +368,8 @@ const fetchSessionMethodFinancialSummary = async (client, idSesionCaja) => {
   }
 
   const reversionsByCode = new Map();
-  for (const row of reversionsResult.rows || []) {
-    reversionsByCode.set(normalizeMethodCode(row.metodo_pago_codigo), roundMoney(row.monto));
+  for (const [code, amount] of allocatedReversionsByCode.entries()) {
+    reversionsByCode.set(code, roundMoney(amount));
   }
 
   const ingresosManuales = roundMoney(movementsResult.rows?.[0]?.ingresos_manuales || 0);
@@ -1635,6 +1694,92 @@ const fetchCajaCloseEmailActors = async (client, { idUsuarioResponsable, idUsuar
 const resolveCajaEmailActorLabel = (actors, primaryNameKey, primaryUserKey, fallback) =>
   actors?.[primaryNameKey] || actors?.[primaryUserKey] || fallback || 'No disponible';
 
+const normalizeManualMovement = (row) => ({
+  fecha_hora: row.fecha_movimiento || row.fecha_creacion || null,
+  tipo_codigo: normalizeCajaCode(row.tipo_codigo, 80) || 'N/A',
+  tipo: row.tipo_nombre || row.tipo_codigo || 'N/A',
+  monto: Number(row.monto || 0),
+  observacion: row.observacion || 'N/A',
+  referencia: row.referencia || 'N/A',
+  usuario_ejecutor: row.usuario_ejecutor_nombre || row.nombre_usuario || 'No disponible',
+  signo: Number(row.signo || 0)
+});
+
+const splitManualMovements = (rows = []) => {
+  const manualRows = (Array.isArray(rows) ? rows : [])
+    .map(normalizeManualMovement)
+    .filter((row) => !MANUAL_MOVEMENT_EXCLUDED_CODES.has(row.tipo_codigo));
+
+  return {
+    ingresos: manualRows.filter((row) => row.signo > 0),
+    egresos: manualRows.filter((row) => row.signo < 0)
+  };
+};
+
+const fetchCajaCloseManualMovements = async (client, idSesionCaja) => {
+  const result = await client.query(
+    `
+      SELECT
+        cm.fecha_movimiento,
+        cm.fecha_creacion,
+        cm.monto,
+        cm.observacion,
+        cm.referencia,
+        mt.codigo AS tipo_codigo,
+        mt.nombre AS tipo_nombre,
+        mt.signo,
+        u.nombre_usuario,
+        ${USER_DISPLAY_SQL} AS usuario_ejecutor_nombre
+      FROM public.cajas_movimientos cm
+      INNER JOIN public.cat_cajas_movimientos_tipos mt
+        ON mt.id_tipo_movimiento_caja = cm.id_tipo_movimiento_caja
+      LEFT JOIN public.usuarios u ON u.id_usuario = cm.id_usuario_ejecutor
+      LEFT JOIN public.empleados e ON e.id_empleado = u.id_empleado
+      LEFT JOIN public.personas per ON per.id_persona = e.id_persona
+      WHERE cm.id_sesion_caja = $1
+        AND UPPER(TRIM(mt.codigo)) <> ALL($2::text[])
+      ORDER BY cm.fecha_movimiento ASC, cm.id_movimiento_caja ASC
+    `,
+    [idSesionCaja, [...MANUAL_MOVEMENT_EXCLUDED_CODES]]
+  );
+
+  return splitManualMovements(result.rows);
+};
+
+const buildManualMovementEmailRows = (rows = []) => {
+  if (!Array.isArray(rows) || rows.length === 0) {
+    return '<tr><td colspan="6" style="color:#667085;">Sin movimientos manuales registrados.</td></tr>';
+  }
+
+  return rows.map((row) => `
+    <tr>
+      <td>${escapeHtml(formatDateTimeLabel(row.fecha_hora))}</td>
+      <td>${escapeHtml(row.tipo)}</td>
+      <td>${escapeHtml(formatMoneyLabel(row.monto))}</td>
+      <td>${escapeHtml(row.observacion)}</td>
+      <td>${escapeHtml(row.referencia)}</td>
+      <td>${escapeHtml(row.usuario_ejecutor)}</td>
+    </tr>
+  `).join('');
+};
+
+const buildManualMovementEmailSection = (title, rows) => `
+  <h3 style="margin:16px 0 8px;">${escapeHtml(title)}</h3>
+  <table cellpadding="6" cellspacing="0" style="border-collapse:collapse; width:100%; border:1px solid #eaecf0;">
+    <thead>
+      <tr style="background:#f9fafb;">
+        <th align="left">Fecha/hora</th>
+        <th align="left">Tipo</th>
+        <th align="left">Monto</th>
+        <th align="left">Razon u observacion</th>
+        <th align="left">Referencia</th>
+        <th align="left">Usuario ejecutor</th>
+      </tr>
+    </thead>
+    <tbody>${buildManualMovementEmailRows(rows)}</tbody>
+  </table>
+`;
+
 const buildCajaCierreEmailHtml = (payload) => {
   const arqueosRows = Array.isArray(payload.arqueos) && payload.arqueos.length > 0
     ? payload.arqueos.map((row) => `
@@ -1669,6 +1814,7 @@ const buildCajaCierreEmailHtml = (payload) => {
   const pdfMessage = payload.pdfAttached === false
     ? 'No fue posible adjuntar el PDF automaticamente; el resumen del cierre se incluye en este correo.'
     : 'Se adjunta el reporte PDF del cierre de caja para control interno.';
+  const movimientosManuales = payload.movimientosManuales || {};
 
   return `
 <!DOCTYPE html>
@@ -1707,6 +1853,8 @@ const buildCajaCierreEmailHtml = (payload) => {
     </thead>
     <tbody>${arqueosRows}</tbody>
   </table>
+  ${buildManualMovementEmailSection('Ingresos manuales', movimientosManuales.ingresos)}
+  ${buildManualMovementEmailSection('Egresos manuales', movimientosManuales.egresos)}
 </body>
 </html>`;
 };
@@ -4366,6 +4514,12 @@ const closeSessionHandler = async (req, res) => {
     } catch (actorError) {
       console.warn('[cajas] No se pudieron resolver usuarios para correo de cierre:', actorError?.message || actorError);
     }
+    let movimientosManuales = { ingresos: [], egresos: [] };
+    try {
+      movimientosManuales = await fetchCajaCloseManualMovements(client, idSesionCaja);
+    } catch (movementError) {
+      console.warn('[cajas] No se pudieron resolver movimientos manuales para reporte de cierre:', movementError?.message || movementError);
+    }
 
     await client.query('COMMIT');
     const hasArqueoInconsistency = Array.isArray(arqueosPersistir)
@@ -4396,7 +4550,8 @@ const closeSessionHandler = async (req, res) => {
       ventasEfectivoNetas: Number(resumen.ventasEfectivoNetas || 0),
       ventasNoEfectivoNetas: Number(resumen.ventasNoEfectivoNetas || 0),
       ingresosManuales: Number(resumen.ingresosManuales || 0),
-      egresosManuales: Number(resumen.egresosManuales || 0)
+      egresosManuales: Number(resumen.egresosManuales || 0),
+      movimientosManuales
     }).catch((emailError) => {
       console.error('[cajas] Error enviando correo de cierre de caja:', emailError?.message || emailError);
     });

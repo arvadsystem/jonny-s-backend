@@ -25,6 +25,18 @@ const sendVentasInternalError = (
   message = 'No se pudo procesar la solicitud de ventas.'
 ) => res.status(500).json({ error: true, message });
 
+const logDescuentosCatalogError = ({ err, req, scope, idSucursal }) => {
+  console.error('[ventas.catalogos.descuentos] error', {
+    route: `${req.method} ${req.originalUrl || req.path || '/ventas/catalogos/descuentos'}`,
+    usuario: parseOptionalPositiveInt(req.user?.id_usuario),
+    sucursal_solicitada: idSucursal || null,
+    sucursales_permitidas: coercePositiveIntArray(scope?.allowedSucursalIds),
+    postgres_code: err?.code || null,
+    message: err?.message || 'Error sin mensaje',
+    stack: err?.stack || null
+  });
+};
+
 const normalizeClienteNombre = (cliente) => {
   const nombrePersona = [cliente?.nombre, cliente?.apellido].filter(Boolean).join(' ').trim();
   if (nombrePersona) return nombrePersona;
@@ -370,15 +382,19 @@ export const listClientesCatalogoHandler = async (req, res) => {
 };
 
 export const listCombosCatalogoHandler = async (req, res) => {
+  let idSucursal = null;
   try {
     const scope = await resolveRequestUserSucursalScope(req);
     const isSuperAdmin = Boolean(scope.isSuperAdmin);
-    const idSucursal = parseOptionalPositiveInt(req.query.id_sucursal);
+    idSucursal = parseOptionalPositiveInt(req.query.id_sucursal);
     const hasComboAssignmentsTable = await hasTable(pool, 'menu_combo_almacenes');
 
     const sucursalValidation = await validateVentasCatalogSucursal({ scope, idSucursal });
     if (!sucursalValidation.ok) {
       return res.status(sucursalValidation.status).json(sucursalValidation.body);
+    }
+    if (!idSucursal) {
+      return res.status(400).json({ error: true, message: 'id_sucursal es obligatorio para listar complementos.' });
     }
 
     let joinClause = '';
@@ -464,6 +480,7 @@ export const listCombosCatalogoHandler = async (req, res) => {
       )
       SELECT DISTINCT
         c.id_combo,
+        c.nombre_combo,
         c.descripcion,
         c.precio,
         c.estado,
@@ -474,7 +491,11 @@ export const listCombosCatalogoHandler = async (req, res) => {
         cdp.nombre_departamento AS nombre_tipo_departamento_principal,
         COALESCE(cd.departamentos_ids, ARRAY[]::int[]) AS departamentos_ids,
         COALESCE(cd.departamentos, '[]'::jsonb) AS departamentos,
-        a.url_publica AS imagen_principal_url
+        a.url_publica AS imagen_principal_url,
+        COALESCE(
+          NULLIF(TRIM(c.nombre_combo), ''),
+          c.descripcion
+        ) AS nombre_orden
       FROM combos c
       LEFT JOIN archivos a ON a.id_archivo = c.id_archivo AND (a.estado = true OR a.estado IS NULL)
       LEFT JOIN tipo_departamento td
@@ -485,13 +506,14 @@ export const listCombosCatalogoHandler = async (req, res) => {
         ON cd.id_combo = c.id_combo
       ${joinClause}
       WHERE COALESCE(c.estado, true) = true ${whereClause}
-      ORDER BY c.descripcion ASC, c.id_combo ASC
+      ORDER BY nombre_orden ASC, c.id_combo ASC
     `;
 
     const result = await pool.query(query, params);
     const comboRows = Array.isArray(result.rows) ? result.rows : [];
     const complementContext = await buildVentaComplementContext({
       client: pool,
+      idSucursal,
       normalizedItems: comboRows.map((row) => ({
         kind: 'COMBO',
         id_combo: Number(row?.id_combo || 0),
@@ -501,6 +523,7 @@ export const listCombosCatalogoHandler = async (req, res) => {
     });
 
     const data = comboRows.map((row) => {
+      const { nombre_orden: _nombreOrden, ...publicRow } = row;
       const metadata = resolveComboComplementMetadata({
         combo: row,
         quantity: 1,
@@ -511,7 +534,7 @@ export const listCombosCatalogoHandler = async (req, res) => {
       });
 
       return {
-        ...row,
+        ...publicRow,
         imagen_principal_url: buildAbsolutePublicUrl(req, row.imagen_principal_url),
         requiere_complementos: Boolean(metadata.requiere_complementos),
         tipo_complemento: metadata.tipo_complemento || VENTA_COMPLEMENTO_TIPO_SALSAS,
@@ -527,7 +550,11 @@ export const listCombosCatalogoHandler = async (req, res) => {
 
     res.status(200).json(data);
   } catch (err) {
-    console.error('Error al listar catalogo de combos para ventas:', err.message);
+    console.error('[ventas.catalogos.combos] error', {
+      code: err?.code || null,
+      message: err?.message || 'Error sin mensaje',
+      id_sucursal: idSucursal || null
+    });
     sendVentasInternalError(res);
   }
 };
@@ -542,6 +569,9 @@ export const listRecetasCatalogoHandler = async (req, res) => {
     const sucursalValidation = await validateVentasCatalogSucursal({ scope, idSucursal });
     if (!sucursalValidation.ok) {
       return res.status(sucursalValidation.status).json(sucursalValidation.body);
+    }
+    if (!idSucursal) {
+      return res.status(400).json({ error: true, message: 'id_sucursal es obligatorio para listar complementos.' });
     }
 
     let joinClause = '';
@@ -611,6 +641,7 @@ export const listRecetasCatalogoHandler = async (req, res) => {
     const recetaRows = Array.isArray(result.rows) ? result.rows : [];
     const complementContext = await buildVentaComplementContext({
       client: pool,
+      idSucursal,
       normalizedItems: recetaRows.map((row) => ({
         kind: 'RECETA',
         id_receta: Number(row?.id_receta || 0),
@@ -693,10 +724,12 @@ export const listTipoDepartamentoCatalogoHandler = async (req, res) => {
 };
 
 export const listDescuentosCatalogoHandler = async (req, res) => {
+  let scope = null;
+  let idSucursal = null;
   try {
-    const scope = await resolveRequestUserSucursalScope(req);
+    scope = await resolveRequestUserSucursalScope(req);
     const isSuperAdmin = Boolean(scope.isSuperAdmin);
-    const idSucursal = parseOptionalPositiveInt(req.query.id_sucursal);
+    idSucursal = parseOptionalPositiveInt(req.query.id_sucursal);
     const sucursalValidation = await validateVentasCatalogSucursal({ scope, idSucursal });
     if (!sucursalValidation.ok) {
       return res.status(sucursalValidation.status).json(sucursalValidation.body);
@@ -807,7 +840,7 @@ export const listDescuentosCatalogoHandler = async (req, res) => {
     );
     res.status(200).json((result.rows || []).map(normalizeDescuentoCatalogoRow));
   } catch (err) {
-    console.error('Error al listar descuentos activos de catalogo:', err.message);
+    logDescuentosCatalogError({ err, req, scope, idSucursal });
     sendVentasInternalError(res);
   }
 };

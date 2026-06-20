@@ -25,6 +25,13 @@ const toPositiveInt = (value) => {
   return Number.isInteger(parsed) && parsed > 0 ? parsed : null;
 };
 
+const toStrictPositiveInt = (value) => {
+  const raw = String(value ?? '').trim();
+  if (!/^[1-9]\d*$/.test(raw)) return null;
+  const parsed = Number(raw);
+  return Number.isSafeInteger(parsed) ? parsed : null;
+};
+
 const toNullableMoney = (value) => {
   if (value === undefined || value === null || String(value).trim() === '') return null;
   const parsed = Number(value);
@@ -1143,6 +1150,212 @@ const getVisibleCountByMenu = async ({ idMenu, idSucursal, capabilities, client 
   return Number(result.rows?.[0]?.total || 0);
 };
 
+const normalizeCategoryOrderItems = (items) => {
+  if (!Array.isArray(items) || items.length === 0) {
+    return { ok: false, message: 'items debe ser un array no vacio.', data: [] };
+  }
+
+  const ids = new Set();
+  const orders = new Set();
+  const normalized = [];
+  const allowedKeys = new Set(['id_menu_publicacion_regla', 'orden']);
+
+  for (const raw of items) {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+      return { ok: false, message: 'Cada item debe ser un objeto.', data: [] };
+    }
+    if (Object.keys(raw).some((key) => !allowedKeys.has(key))) {
+      return { ok: false, message: 'items contiene campos no permitidos.', data: [] };
+    }
+
+    const idRegla = toStrictPositiveInt(raw.id_menu_publicacion_regla);
+    const orden = toStrictPositiveInt(raw.orden);
+    if (!idRegla || !orden) {
+      return { ok: false, message: 'Cada item requiere id_menu_publicacion_regla y orden enteros positivos.', data: [] };
+    }
+    if (ids.has(idRegla)) return { ok: false, message: 'No se permiten reglas duplicadas.', data: [] };
+    if (orders.has(orden)) return { ok: false, message: 'No se permiten ordenes duplicados.', data: [] };
+
+    ids.add(idRegla);
+    orders.add(orden);
+    normalized.push({ id_menu_publicacion_regla: idRegla, orden });
+  }
+
+  return { ok: true, data: normalized };
+};
+
+const getCategoryOrderRows = async ({ idMenu, idSucursal, db = pool }) => {
+  const result = await db.query(
+    `
+      WITH reglas AS (
+        SELECT
+          mpr.id_menu_publicacion_regla,
+          mpr.tipo_item,
+          mpr.id_categoria_producto,
+          mpr.id_tipo_departamento,
+          COALESCE(NULLIF(TRIM(mpr.nombre_publico), ''), cp.nombre_categoria, td.nombre_departamento, mpr.alias_normalizado) AS nombre_publico,
+          COALESCE(mpr.orden, 2147483647)::int AS orden,
+          COALESCE(mpr.estado, true) AS estado_regla,
+          COALESCE(cp.estado, td.estado, true) AS estado_origen
+        FROM public.menu_publicacion_reglas mpr
+        LEFT JOIN public.categorias_productos cp
+          ON cp.id_categoria_producto = mpr.id_categoria_producto
+        LEFT JOIN public.tipo_departamento td
+          ON td.id_tipo_departamento = mpr.id_tipo_departamento
+        WHERE COALESCE(mpr.incluir_catalogo_admin, true) = true
+      ),
+      publicaciones AS (
+        SELECT
+          r.id_menu_publicacion_regla,
+          COUNT(dm.id_detalle_menu)::int AS cantidad_contenido,
+          COALESCE(MIN(dm.orden), r.orden)::int AS orden_detalle
+        FROM reglas r
+        LEFT JOIN public.detalle_menu dm
+          ON dm.id_menu = $1
+         AND COALESCE(dm.estado, true) = true
+         AND COALESCE(dm.visible, true) = true
+        LEFT JOIN public.productos p
+          ON r.tipo_item = 'PRODUCTO'
+         AND dm.id_producto IS NOT NULL
+         AND p.id_producto = dm.id_producto
+         AND p.id_categoria_producto = r.id_categoria_producto
+         AND COALESCE(p.estado, true) = true
+        LEFT JOIN LATERAL (
+          SELECT 1 AS ok
+          FROM public.productos_almacenes pa
+          INNER JOIN public.almacenes a
+            ON a.id_almacen = pa.id_almacen
+           AND a.id_sucursal = $2
+           AND COALESCE(a.estado, true) = true
+          WHERE pa.id_producto = p.id_producto
+            AND COALESCE(pa.estado, true) = true
+          LIMIT 1
+        ) producto_sucursal ON r.tipo_item = 'PRODUCTO'
+        LEFT JOIN public.recetas rec
+          ON r.tipo_item = 'RECETA'
+         AND dm.id_receta IS NOT NULL
+         AND rec.id_receta = dm.id_receta
+         AND rec.id_tipo_departamento = r.id_tipo_departamento
+         AND COALESCE(rec.estado, true) = true
+        LEFT JOIN public.combos combo
+          ON r.tipo_item = 'COMBO'
+         AND dm.id_combo IS NOT NULL
+         AND combo.id_combo = dm.id_combo
+         AND combo.id_tipo_departamento = r.id_tipo_departamento
+         AND COALESCE(combo.estado, true) = true
+        WHERE
+          dm.id_detalle_menu IS NULL
+          OR (
+            (r.tipo_item = 'PRODUCTO' AND p.id_producto IS NOT NULL AND producto_sucursal.ok = 1)
+            OR (r.tipo_item = 'RECETA' AND rec.id_receta IS NOT NULL)
+            OR (r.tipo_item = 'COMBO' AND combo.id_combo IS NOT NULL)
+          )
+        GROUP BY r.id_menu_publicacion_regla, r.orden
+      )
+      SELECT
+        r.id_menu_publicacion_regla,
+        r.tipo_item,
+        r.nombre_publico,
+        COALESCE(p.orden_detalle, r.orden)::int AS orden,
+        r.estado_regla AS estado,
+        COALESCE(p.cantidad_contenido, 0)::int AS cantidad_contenido,
+        CASE
+          WHEN r.estado_regla = false OR COALESCE(r.estado_origen, true) = false THEN 'INACTIVO'
+          WHEN COALESCE(p.cantidad_contenido, 0) = 0 THEN 'SIN_CONTENIDO'
+          ELSE 'VISIBLE'
+        END AS estado_visibilidad
+      FROM reglas r
+      LEFT JOIN publicaciones p
+        ON p.id_menu_publicacion_regla = r.id_menu_publicacion_regla
+      WHERE r.estado_regla = true
+      ORDER BY COALESCE(p.orden_detalle, r.orden, 2147483647), r.nombre_publico ASC, r.id_menu_publicacion_regla ASC;
+    `,
+    [idMenu, idSucursal]
+  );
+
+  return (result.rows || []).map((row) => ({
+    id_menu_publicacion_regla: Number(row.id_menu_publicacion_regla),
+    tipo_item: row.tipo_item,
+    nombre_publico: row.nombre_publico || 'Categoria',
+    orden: Number(row.orden || 0),
+    estado: parseBoolean(row.estado),
+    cantidad_contenido: Number(row.cantidad_contenido || 0),
+    estado_visibilidad: row.estado_visibilidad || 'SIN_CONTENIDO'
+  }));
+};
+
+const updateDetailOrderForCategories = async ({ client, idMenu, idSucursal, items }) => {
+  await client.query(
+    `
+      WITH input AS (
+        SELECT *
+        FROM jsonb_to_recordset($1::jsonb) AS value(
+          id_menu_publicacion_regla integer,
+          orden integer
+        )
+      ),
+      reglas AS (
+        SELECT
+          i.orden AS categoria_orden,
+          mpr.tipo_item,
+          mpr.id_categoria_producto,
+          mpr.id_tipo_departamento
+        FROM input i
+        INNER JOIN public.menu_publicacion_reglas mpr
+          ON mpr.id_menu_publicacion_regla = i.id_menu_publicacion_regla
+      ),
+      objetivos AS (
+        SELECT
+          dm.id_detalle_menu,
+          (r.categoria_orden * 1000)
+            + ROW_NUMBER() OVER (
+              PARTITION BY r.categoria_orden
+              ORDER BY COALESCE(dm.orden, 2147483647), dm.id_detalle_menu
+            ) AS nuevo_orden
+        FROM reglas r
+        INNER JOIN public.detalle_menu dm
+          ON dm.id_menu = $2
+         AND COALESCE(dm.estado, true) = true
+        LEFT JOIN public.productos p
+          ON r.tipo_item = 'PRODUCTO'
+         AND dm.id_producto IS NOT NULL
+         AND p.id_producto = dm.id_producto
+         AND p.id_categoria_producto = r.id_categoria_producto
+        LEFT JOIN LATERAL (
+          SELECT 1 AS ok
+          FROM public.productos_almacenes pa
+          INNER JOIN public.almacenes a
+            ON a.id_almacen = pa.id_almacen
+           AND a.id_sucursal = $3
+           AND COALESCE(a.estado, true) = true
+          WHERE pa.id_producto = p.id_producto
+            AND COALESCE(pa.estado, true) = true
+          LIMIT 1
+        ) producto_sucursal ON r.tipo_item = 'PRODUCTO'
+        LEFT JOIN public.recetas rec
+          ON r.tipo_item = 'RECETA'
+         AND dm.id_receta IS NOT NULL
+         AND rec.id_receta = dm.id_receta
+         AND rec.id_tipo_departamento = r.id_tipo_departamento
+        LEFT JOIN public.combos combo
+          ON r.tipo_item = 'COMBO'
+         AND dm.id_combo IS NOT NULL
+         AND combo.id_combo = dm.id_combo
+         AND combo.id_tipo_departamento = r.id_tipo_departamento
+        WHERE
+          (r.tipo_item = 'PRODUCTO' AND p.id_producto IS NOT NULL AND producto_sucursal.ok = 1)
+          OR (r.tipo_item = 'RECETA' AND rec.id_receta IS NOT NULL)
+          OR (r.tipo_item = 'COMBO' AND combo.id_combo IS NOT NULL)
+      )
+      UPDATE public.detalle_menu dm
+      SET orden = objetivos.nuevo_orden
+      FROM objetivos
+      WHERE dm.id_detalle_menu = objetivos.id_detalle_menu;
+    `,
+    [JSON.stringify(items), idMenu, idSucursal]
+  );
+};
+
 // Lista sucursales operativas para el selector de publicaciÃƒÂ³n.
 router.get('/sucursales', checkPermission(MENU_PUBLICACION_VIEW_PERMISSIONS), async (_req, res) => {
   try {
@@ -2128,6 +2341,165 @@ router.patch('/temporada-activa/cancelar', checkPermission(MENU_PUBLICACION_SAVE
     return res.status(500).json({ ok: false, message: 'No se pudo finalizar la temporada activa.' });
   } finally {
     if (client) client.release();
+  }
+});
+
+router.get('/categorias-orden', checkPermission(MENU_PUBLICACION_VIEW_PERMISSIONS), async (req, res) => {
+  try {
+    const idSucursal = toStrictPositiveInt(req.query.id_sucursal);
+    const idMenuQuery = toStrictPositiveInt(req.query.id_menu);
+    if (!idSucursal) {
+      return res.status(400).json({ ok: false, message: 'id_sucursal es obligatorio y debe ser entero positivo.' });
+    }
+
+    const [branch, activeMenu] = await Promise.all([
+      getBranchById(idSucursal),
+      getActiveMenuByBranch(idSucursal)
+    ]);
+
+    if (!branch) return res.status(404).json({ ok: false, message: 'La sucursal no existe.' });
+    if (!branch.estado) return res.status(409).json({ ok: false, message: 'La sucursal esta inactiva.' });
+
+    const targetMenuId = idMenuQuery || Number(activeMenu?.id_menu || 0);
+    if (!targetMenuId) {
+      return res.status(200).json({
+        ok: true,
+        data: [],
+        meta: {
+          scope: 'MENU_POR_SUCURSAL',
+          message: 'La sucursal no tiene menu vigente activo.'
+        }
+      });
+    }
+
+    if (idMenuQuery) {
+      const requestedMenu = await getMenuById(idMenuQuery);
+      if (!requestedMenu || !requestedMenu.estado) {
+        return res.status(404).json({ ok: false, message: 'El menu seleccionado no existe o esta inactivo.' });
+      }
+    }
+
+    const [data, sharedMenuImpact] = await Promise.all([
+      getCategoryOrderRows({ idMenu: targetMenuId, idSucursal }),
+      resolveSharedMenuImpact({ idMenu: targetMenuId, idSucursal })
+    ]);
+
+    return res.status(200).json({
+      ok: true,
+      data,
+      meta: {
+        scope: sharedMenuImpact.is_shared ? 'MENU_COMPARTIDO_ENTRE_SUCURSALES' : 'MENU_POR_SUCURSAL',
+        id_menu: targetMenuId,
+        id_sucursal: idSucursal,
+        shared_menu_impact: sharedMenuImpact,
+        message: sharedMenuImpact.is_shared
+          ? 'Este orden se aplica al menu compartido. Las categorias visibles pueden variar segun el menu publicado en cada sucursal.'
+          : 'Este orden se aplica al menu vigente de la sucursal seleccionada.'
+      }
+    });
+  } catch (error) {
+    console.error('admin_menu_publicacion GET /categorias-orden:', error.message);
+    return res.status(500).json({ ok: false, message: 'No se pudo cargar el orden de categorias.' });
+  }
+});
+
+router.put('/categorias-orden', checkPermission(MENU_PUBLICACION_SAVE_PERMISSIONS), async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const idSucursal = toStrictPositiveInt(req.query.id_sucursal);
+    const idMenuQuery = toStrictPositiveInt(req.query.id_menu);
+    if (!idSucursal) {
+      return res.status(400).json({ ok: false, message: 'id_sucursal es obligatorio y debe ser entero positivo.' });
+    }
+
+    const normalized = normalizeCategoryOrderItems(req.body?.items);
+    if (!normalized.ok) {
+      return res.status(400).json({ ok: false, message: normalized.message });
+    }
+
+    const [branch, activeMenu] = await Promise.all([
+      getBranchById(idSucursal),
+      getActiveMenuByBranch(idSucursal)
+    ]);
+    if (!branch) return res.status(404).json({ ok: false, message: 'La sucursal no existe.' });
+    if (!branch.estado) return res.status(409).json({ ok: false, message: 'La sucursal esta inactiva.' });
+
+    const targetMenuId = idMenuQuery || Number(activeMenu?.id_menu || 0);
+    if (!targetMenuId) {
+      return res.status(409).json({ ok: false, message: 'La sucursal no tiene menu vigente activo.' });
+    }
+    if (idMenuQuery) {
+      const requestedMenu = await getMenuById(idMenuQuery);
+      if (!requestedMenu || !requestedMenu.estado) {
+        return res.status(404).json({ ok: false, message: 'El menu seleccionado no existe o esta inactivo.' });
+      }
+    }
+
+    await client.query('BEGIN');
+    await client.query(
+      `
+        SELECT id_menu_publicacion_regla
+        FROM public.menu_publicacion_reglas
+        WHERE id_menu_publicacion_regla = ANY($1::int[])
+          AND COALESCE(estado, true) = true
+        FOR UPDATE
+      `,
+      [normalized.data.map((item) => item.id_menu_publicacion_regla)]
+    );
+
+    const currentRows = await getCategoryOrderRows({ idMenu: targetMenuId, idSucursal, db: client });
+    const existingIds = new Set(currentRows.map((row) => Number(row.id_menu_publicacion_regla)));
+    const missingIds = normalized.data
+      .map((item) => item.id_menu_publicacion_regla)
+      .filter((id) => !existingIds.has(id));
+    if (missingIds.length > 0) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({
+        ok: false,
+        message: `Reglas inexistentes o inactivas: ${missingIds.join(', ')}.`
+      });
+    }
+
+    await client.query(
+      `
+        WITH input AS (
+          SELECT *
+          FROM jsonb_to_recordset($1::jsonb) AS value(
+            id_menu_publicacion_regla integer,
+            orden integer
+          )
+        )
+        UPDATE public.menu_publicacion_reglas mpr
+        SET
+          orden = input.orden,
+          fecha_actualizacion = NOW()
+        FROM input
+        WHERE mpr.id_menu_publicacion_regla = input.id_menu_publicacion_regla
+      `,
+      [JSON.stringify(normalized.data)]
+    );
+
+    await updateDetailOrderForCategories({
+      client,
+      idMenu: targetMenuId,
+      idSucursal,
+      items: normalized.data
+    });
+
+    const data = await getCategoryOrderRows({ idMenu: targetMenuId, idSucursal, db: client });
+    await client.query('COMMIT');
+
+    return res.status(200).json({
+      ok: true,
+      message: 'ORDEN DEL MENU PUBLICO ACTUALIZADO CORRECTAMENTE.',
+      data
+    });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    console.error('admin_menu_publicacion PUT /categorias-orden:', error.message);
+    return res.status(500).json({ ok: false, message: 'No se pudo guardar el orden de categorias.' });
+  } finally {
+    client.release();
   }
 });
 

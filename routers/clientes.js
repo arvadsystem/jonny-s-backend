@@ -66,22 +66,10 @@ const isSchemaDriftError = (err) => {
   return code === '42703' || code === '42P01';
 };
 
-const ensureClientesSucursalesTable = async (db = pool) => {
+const hasClientesSucursalesTable = async (db = pool) => {
   try {
-    await db.query(`
-      CREATE TABLE IF NOT EXISTS public.clientes_sucursales (
-        id_cliente INTEGER NOT NULL REFERENCES public.clientes(id_cliente) ON DELETE CASCADE,
-        id_sucursal INTEGER NOT NULL REFERENCES public.sucursales(id_sucursal) ON DELETE RESTRICT,
-        estado BOOLEAN NOT NULL DEFAULT TRUE,
-        es_principal BOOLEAN NOT NULL DEFAULT FALSE,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT timezone('America/Tegucigalpa', now()),
-        updated_at TIMESTAMPTZ NOT NULL DEFAULT timezone('America/Tegucigalpa', now()),
-        PRIMARY KEY (id_cliente, id_sucursal)
-      )
-    `);
-    await db.query('CREATE INDEX IF NOT EXISTS idx_clientes_sucursales_id_sucursal ON public.clientes_sucursales(id_sucursal)');
-    await db.query('CREATE INDEX IF NOT EXISTS idx_clientes_sucursales_id_cliente ON public.clientes_sucursales(id_cliente)');
-    return true;
+    const result = await db.query("SELECT to_regclass('public.clientes_sucursales') AS table_name");
+    return Boolean(result.rows?.[0]?.table_name);
   } catch {
     return false;
   }
@@ -1322,8 +1310,8 @@ const clienteRepository = {
   async upsertClienteSucursalLink(idCliente, idSucursal, capabilities, db = pool, { setPrincipal = false } = {}) {
     let effectiveCapabilities = capabilities || {};
     if (!effectiveCapabilities?.hasClientesSucursalesTable) {
-      const bootstrapped = await ensureClientesSucursalesTable(db);
-      if (!bootstrapped) return;
+      const tableExists = await hasClientesSucursalesTable(db);
+      if (!tableExists) return;
       invalidateSchemaCapabilitiesCache();
       effectiveCapabilities = {
         ...effectiveCapabilities,
@@ -1564,8 +1552,8 @@ const clienteService = {
       };
     }
     if (effectiveSucursal && !canPersistSucursalScope) {
-      const bootstrapped = await ensureClientesSucursalesTable(pool);
-      if (bootstrapped) {
+      const tableExists = await hasClientesSucursalesTable(pool);
+      if (tableExists) {
         invalidateSchemaCapabilitiesCache();
         capabilities = await getSchemaCapabilities({ forceRefresh: true });
         canPersistSucursalScope = Boolean(capabilities.hasClientesSucursalesTable || capabilities.hasClienteSucursalField);

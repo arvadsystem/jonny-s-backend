@@ -28,6 +28,10 @@ import {
   resolvePublicOrderCatalogContextQuery
 } from './publicMenuQueries.js';
 import { getPublicMenuHeroCarouselConfig } from '../../services/publicMenuHeroCarouselConfigService.js';
+import {
+  attachSalsaInventorySnapshotsToPublicLines,
+  resolveSalsasInventory
+} from '../ventas/services/salsasInventoryService.js';
 
 // Tabla de mensajes legibles para no exponer codigos internos al frontend.
 const AVAILABILITY_REASON_LABEL = Object.freeze({
@@ -456,7 +460,7 @@ const buildCatalogExtrasByRecipe = async (catalogRows = [], idSucursal = null, d
   return grouped;
 };
 
-const buildCatalogSauceConfigByDetail = async (catalogRows = [], db = pool) => {
+const buildCatalogSauceConfigByDetail = async (catalogRows = [], idSucursal, db = pool) => {
   const directRecipeIds = toUniquePositiveIntArray(
     catalogRows.map((row) => row?.id_receta)
   );
@@ -475,16 +479,30 @@ const buildCatalogSauceConfigByDetail = async (catalogRows = [], db = pool) => {
 
   const [allowedSauceRows, sauceRuleRows] = allRecipeIds.length > 0
     ? await Promise.all([
-      fetchAllowedSauceRowsByRecipeIdsQuery(allRecipeIds, db),
+      fetchAllowedSauceRowsByRecipeIdsQuery(allRecipeIds, idSucursal, db),
       fetchSauceRuleRowsByRecipeIdsQuery(allRecipeIds, db)
     ])
     : [[], []];
   const fallbackSauceCatalog = allRecipeIds.length > 0
-    ? await fetchPublicActiveSaucesQuery(db)
+    ? await fetchPublicActiveSaucesQuery(idSucursal, db)
     : [];
+  const inventoryRows = [...new Map(
+    [...allowedSauceRows, ...fallbackSauceCatalog].map((row) => [Number(row.id_salsa), row])
+  ).values()];
+  const resolvedInventory = await resolveSalsasInventory({
+    queryRunner: db,
+    salsas: inventoryRows,
+    idSucursal,
+    mode: 'catalog'
+  });
+  const availableSalsaIds = new Set(
+    resolvedInventory.filter((row) => row.disponible).map((row) => Number(row.id_salsa))
+  );
+  const filteredAllowedSauceRows = allowedSauceRows.filter((row) => availableSalsaIds.has(Number(row.id_salsa)));
+  const filteredFallbackSauceCatalog = fallbackSauceCatalog.filter((row) => availableSalsaIds.has(Number(row.id_salsa)));
 
   const allowedSaucesByRecipe = new Map();
-  for (const row of allowedSauceRows) {
+  for (const row of filteredAllowedSauceRows) {
     const recipeId = Number(row?.id_receta || 0);
     if (!allowedSaucesByRecipe.has(recipeId)) {
       allowedSaucesByRecipe.set(recipeId, []);
@@ -532,7 +550,7 @@ const buildCatalogSauceConfigByDetail = async (catalogRows = [], db = pool) => {
         const rules = rulesByRecipe.get(recipeId) || [];
         const recipeAllowedSauces = allowedSaucesByRecipe.get(recipeId) || [];
         if (recipeAllowedSauces.length === 0 && hasSauceRequirementRules(rules)) {
-          return sortSauceOptions(fallbackSauceCatalog);
+          return sortSauceOptions(filteredFallbackSauceCatalog);
         }
         return sortSauceOptions(recipeAllowedSauces);
       })(),
@@ -559,7 +577,7 @@ const buildCatalogSauceConfigByDetail = async (catalogRows = [], db = pool) => {
           const rules = rulesByRecipe.get(recipeId) || [];
           const recipeAllowedSauces = allowedSaucesByRecipe.get(recipeId) || [];
           if (recipeAllowedSauces.length === 0 && hasSauceRequirementRules(rules)) {
-            return sortSauceOptions(fallbackSauceCatalog);
+            return sortSauceOptions(filteredFallbackSauceCatalog);
           }
           return sortSauceOptions(recipeAllowedSauces);
         })(),
@@ -1130,7 +1148,7 @@ const materializePublicOrderSnapshot = async ({ idSucursal, requestedItems = [],
 
   const rows = await fetchCatalogRowsByMenuQuery(Number(activeMenu.id_menu), Number(idSucursal), db);
   const [sauceConfigByDetail, extrasByRecipe] = await Promise.all([
-    buildCatalogSauceConfigByDetail(rows, db),
+    buildCatalogSauceConfigByDetail(rows, idSucursal, db),
     buildCatalogExtrasByRecipe(rows, Number(idSucursal), db)
   ]);
 
@@ -1509,7 +1527,7 @@ export const getPublicCatalogService = async ({ idSucursal, tipoPedido = null })
 
   const rows = await fetchCatalogRowsByMenuQuery(Number(activeMenu.id_menu), Number(idSucursal));
   const [sauceConfigByDetail, extrasByRecipe] = await Promise.all([
-    buildCatalogSauceConfigByDetail(rows),
+    buildCatalogSauceConfigByDetail(rows, idSucursal),
     buildCatalogExtrasByRecipe(rows, Number(idSucursal))
   ]);
 
@@ -1575,7 +1593,7 @@ export const getPublicCatalogItemDetailService = async ({ idSucursal, idDetalleM
     throw buildHttpError(404, 'El item no esta disponible en el menu publico de esta sucursal.');
   }
   const [sauceConfigByDetail, extrasByRecipe] = await Promise.all([
-    buildCatalogSauceConfigByDetail([row]),
+    buildCatalogSauceConfigByDetail([row], idSucursal),
     buildCatalogExtrasByRecipe([row], Number(idSucursal))
   ]);
 
@@ -1836,6 +1854,12 @@ export const createPublicOrderService = async ({
         delivery: buildPublicOrderDeliveryPayload({ businessContext })
       });
     }
+
+    await attachSalsaInventorySnapshotsToPublicLines({
+      client,
+      lines: normalizedLines,
+      idSucursal
+    });
 
     for (const line of normalizedLines) {
       await insertPublicPedidoDetalleQuery(client, {

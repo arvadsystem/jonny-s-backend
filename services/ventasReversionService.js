@@ -1,8 +1,9 @@
 ﻿import pool from '../config/db-connection.js';
 import { generarCodigoDocumento } from './facturacionCorrelativoService.js';
 import { getClientIp, parseUserAgent } from '../utils/security/clientInfo.js';
+import { restoreSalsasInventoryFromSnapshots } from '../routers/ventas/services/salsasInventoryService.js';
 
-const REVERSAL_WINDOW_SQL = `(NOW() AT TIME ZONE 'America/Tegucigalpa') - INTERVAL '1 hour'`;
+const REVERSAL_WINDOW_SQL = `NOW() - INTERVAL '1 hour'`;
 const VALID_MOTIVOS = new Set([
   'PRODUCTO_EQUIVOCADO',
   'CANTIDAD_EQUIVOCADA',
@@ -85,36 +86,6 @@ const resolveSucursalScope = async (client, idUsuario) => {
   };
 };
 
-const resolveOpenCajaSession = async ({ client, idSucursal, idUsuario }) => {
-  const result = await client.query(
-    `
-      SELECT cs.id_sesion_caja, cs.id_caja
-      FROM public.cajas_sesiones cs
-      INNER JOIN public.cajas c
-        ON c.id_caja = cs.id_caja
-       AND c.id_sucursal = cs.id_sucursal
-       AND COALESCE(c.estado, true) = true
-      INNER JOIN public.cat_cajas_sesiones_estados cse
-        ON cse.id_estado_sesion_caja = cs.id_estado_sesion_caja
-      INNER JOIN public.cajas_sesiones_participantes csp
-        ON csp.id_sesion_caja = cs.id_sesion_caja
-       AND csp.id_usuario = $2
-       AND COALESCE(csp.activo, true) = true
-      WHERE cs.id_sucursal = $1
-        AND UPPER(TRIM(cse.codigo)) = 'ABIERTA'
-      ORDER BY cs.id_sesion_caja DESC
-      LIMIT 1
-    `,
-    [idSucursal, idUsuario]
-  );
-
-  if (!result.rowCount) {
-    throw createReversionError(409, 'VENTAS_REVERSION_CAJA_ACTUAL_REQUERIDA', 'No hay una caja abierta activa para registrar la reversi\u00f3n.');
-  }
-
-  return result.rows[0];
-};
-
 const assertOriginalCajaSessionOpen = async ({ client, factura }) => {
   const idSesionCaja = parsePositiveInt(factura?.id_sesion_caja);
   const idSucursal = parsePositiveInt(factura?.id_sucursal);
@@ -184,6 +155,24 @@ const assertOriginalCajaSessionOpen = async ({ client, factura }) => {
   }
 
   return session;
+};
+
+const assertSucursalAllowedForReversion = (scope, idSucursal, action = 'crear') => {
+  const targetSucursalId = parsePositiveInt(idSucursal);
+  if (!targetSucursalId) {
+    throw createReversionError(403, 'VENTAS_REVERSION_SCOPE_INVALIDO', 'No se pudo resolver la sucursal de la venta.');
+  }
+  if (scope?.isSuperAdmin) return;
+  const allowed = Array.isArray(scope?.allowedSucursalIds)
+    ? scope.allowedSucursalIds.map((id) => parsePositiveInt(id)).filter(Boolean)
+    : [];
+  if (allowed.length === 0) {
+    throw createReversionError(403, 'VENTAS_REVERSION_SCOPE_EMPTY', 'No tienes sucursales autorizadas para reversiones.');
+  }
+  if (!allowed.includes(targetSucursalId)) {
+    const verb = action === 'consultar' ? 'consultar reversiones de' : 'reversar';
+    throw createReversionError(403, 'VENTAS_REVERSION_SCOPE_FORBIDDEN', `No puedes ${verb} una venta de otra sucursal.`);
+  }
 };
 
 const assertSucursalOpenForReversion = async ({ client, idSucursal }) => {
@@ -381,6 +370,7 @@ const resolveAlreadyReversedQty = async (client, idFactura) => {
       FROM public.facturas_reversiones fr
       INNER JOIN public.facturas_reversiones_detalle rd ON rd.id_reversion = fr.id_reversion
       WHERE fr.id_factura_original = $1
+        AND UPPER(TRIM(COALESCE(fr.estado, ''))) = 'APLICADA'
       GROUP BY rd.id_detalle_factura
     `,
     [idFactura]
@@ -447,6 +437,7 @@ const resolveReversionLines = ({ tipoReversion, requestedLines, facturaLines, re
 
     output.push({
       id_detalle_factura: idDetalle,
+      origen_snapshot: line.origen_snapshot || null,
       tipo_item: line.tipo_item,
       id_producto: parsePositiveInt(line.id_producto),
       id_receta: parsePositiveInt(line.id_receta),
@@ -597,6 +588,7 @@ const revertLoyaltyForFactura = async ({
         SELECT COALESCE(SUM(fr.monto_reversado), 0)::numeric AS monto_reversado_acumulado
         FROM public.facturas_reversiones fr
         WHERE fr.id_factura_original = $1
+          AND UPPER(TRIM(COALESCE(fr.estado, ''))) = 'APLICADA'
       `,
       [idFactura]
     );
@@ -771,6 +763,64 @@ const registerInventoryReturn = async ({ client, idReversion, codigoReversion, c
   }
 };
 
+const buildSalsaInventorySnapshotsForReturn = (lineas = []) => {
+  const snapshots = [];
+  for (const line of Array.isArray(lineas) ? lineas : []) {
+    const source = line?.origen_snapshot;
+    const selection = Array.isArray(source?.componentes?.seleccion)
+      ? source.componentes.seleccion
+      : Array.isArray(source?.complementos?.seleccion)
+        ? source.complementos.seleccion
+        : [];
+    const soldQty = Number(source?.cantidad || 0);
+    const reversedQty = Number(line?.cantidad_revertida || 0);
+    const ratio = soldQty > 0 && reversedQty > 0 ? Math.min(1, reversedQty / soldQty) : 1;
+    const aggregateSnapshotsSeen = new Set();
+    for (const entry of selection) {
+      const snapshot = entry?.inventario;
+      if (!snapshot || typeof snapshot !== 'object') continue;
+      const totalBase = Number(snapshot.cantidad_base_total || 0);
+      if (totalBase <= 0) continue;
+      const aggregateKey = `${Number(snapshot.id_salsa || entry?.id_salsa || 0)}:${Number(snapshot.id_insumo || 0)}:${Number(snapshot.id_almacen || 0)}`;
+      if (Number(snapshot.porciones || 0) > 1) {
+        if (aggregateSnapshotsSeen.has(aggregateKey)) continue;
+        aggregateSnapshotsSeen.add(aggregateKey);
+      }
+      snapshots.push({
+        ...snapshot,
+        cantidad_base_total: totalBase * ratio,
+        porciones: Number(snapshot.porciones || 0) * ratio
+      });
+    }
+  }
+  return snapshots;
+};
+
+const filterConsumedSalsaSnapshots = async ({ client, idPedido, idFactura, snapshots }) => {
+  const pedidoId = parsePositiveInt(idPedido);
+  const facturaId = parsePositiveInt(idFactura);
+  if (!pedidoId && !facturaId) return [];
+
+  const result = await client.query(
+    `
+      SELECT DISTINCT mi.id_insumo, mi.id_almacen
+      FROM public.movimientos_inventario mi
+      WHERE mi.tipo = 'SALIDA'
+        AND mi.id_insumo IS NOT NULL
+        AND (
+          (mi.ref_origen IN ('PEDIDO', 'FALTANTE_COCINA') AND mi.id_ref = $1)
+          OR (mi.ref_origen = 'PEDIDO_PENDIENTE_SALSA' AND mi.id_ref = $1)
+          OR (mi.ref_origen = 'VENTA_SALSA' AND mi.id_ref = $2)
+        )
+    `,
+    [pedidoId, facturaId]
+  );
+  const consumedKeys = new Set((result.rows || []).map((row) => `${Number(row.id_insumo)}:${Number(row.id_almacen)}`));
+  return (Array.isArray(snapshots) ? snapshots : []).filter((snapshot) => (
+    consumedKeys.has(`${Number(snapshot?.id_insumo)}:${Number(snapshot?.id_almacen)}`)
+  ));
+};
+
 export const listFacturaReversiones = async ({ idFactura, idUsuario }) => {
   const facturaId = parsePositiveInt(idFactura);
   const userId = parsePositiveInt(idUsuario);
@@ -792,9 +842,7 @@ export const listFacturaReversiones = async ({ idFactura, idUsuario }) => {
 
     const factura = facturaResult.rows[0];
     const idSucursal = Number(factura.id_sucursal || 0);
-    if (!scope.isSuperAdmin && scope.allowedSucursalIds.length > 0 && !scope.allowedSucursalIds.includes(idSucursal)) {
-      throw createReversionError(403, 'VENTAS_REVERSION_SCOPE_FORBIDDEN', 'No puedes consultar reversiones de otra sucursal.');
-    }
+    assertSucursalAllowedForReversion(scope, idSucursal, 'consultar');
 
     const result = await client.query(
       `
@@ -869,7 +917,7 @@ export const listFacturaReversiones = async ({ idFactura, idUsuario }) => {
   }
 };
 
-export const createVentaReversion = async ({ idFactura, body, req, idUsuario }) => {
+export const createVentaReversion = async ({ idFactura, body, req, idUsuario, idempotency = null }) => {
   const facturaId = parsePositiveInt(idFactura);
   const userId = parsePositiveInt(idUsuario);
   if (!facturaId || !userId) {
@@ -899,8 +947,17 @@ export const createVentaReversion = async ({ idFactura, body, req, idUsuario }) 
   const userAgent = normalizeText(uaRaw, 500) || 'Desconocido';
 
   const client = await pool.connect();
+  let idempotencyReservation = null;
   try {
     await client.query('BEGIN');
+
+    if (typeof idempotency?.reserve === 'function') {
+      idempotencyReservation = await idempotency.reserve(client);
+      if (idempotencyReservation?.replay || idempotencyReservation?.conflict) {
+        await client.query('COMMIT');
+        return { idempotency: idempotencyReservation };
+      }
+    }
 
     const scope = await resolveSucursalScope(client, userId);
 
@@ -928,11 +985,9 @@ export const createVentaReversion = async ({ idFactura, body, req, idUsuario }) 
 
     const factura = facturaResult.rows[0];
     const idSucursal = Number(factura.id_sucursal || 0);
-    if (!scope.isSuperAdmin && scope.allowedSucursalIds.length > 0 && !scope.allowedSucursalIds.includes(idSucursal)) {
-      throw createReversionError(403, 'VENTAS_REVERSION_SCOPE_FORBIDDEN', 'No puedes reversar una venta de otra sucursal.');
-    }
+    assertSucursalAllowedForReversion(scope, idSucursal, 'crear');
 
-    await assertOriginalCajaSessionOpen({ client, factura });
+    const cajaContext = await assertOriginalCajaSessionOpen({ client, factura });
     await assertSucursalOpenForReversion({ client, idSucursal });
 
     const ageResult = await client.query(
@@ -955,7 +1010,6 @@ export const createVentaReversion = async ({ idFactura, body, req, idUsuario }) 
       reversedQtyMap
     });
 
-    const cajaActual = await resolveOpenCajaSession({ client, idSucursal, idUsuario: userId });
     const idTipoMovimientoCaja = await resolveReversionCajaMovementType(client);
 
     const correlativo = await generarCodigoDocumento({
@@ -991,7 +1045,7 @@ export const createVentaReversion = async ({ idFactura, body, req, idUsuario }) 
         )
         VALUES (
           $1, $2, $3, $4, $5, $6, $7,
-          $8, $9, $10, $11, 'REGISTRADA', $12,
+          $8, $9, $10, $11, 'APLICADA', $12,
           $13::date, $14, $15, $16, false
         )
         RETURNING id_reversion
@@ -1002,8 +1056,8 @@ export const createVentaReversion = async ({ idFactura, body, req, idUsuario }) 
         idSucursal,
         parsePositiveInt(factura.id_caja),
         parsePositiveInt(factura.id_sesion_caja),
-        parsePositiveInt(cajaActual.id_caja),
-        parsePositiveInt(cajaActual.id_sesion_caja),
+        parsePositiveInt(cajaContext.id_caja),
+        parsePositiveInt(cajaContext.id_sesion_caja),
         tipoReversion,
         motivo,
         observacion,
@@ -1072,11 +1126,11 @@ export const createVentaReversion = async ({ idFactura, body, req, idUsuario }) 
           fecha_movimiento,
           fecha_creacion
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, (NOW() AT TIME ZONE 'America/Tegucigalpa'), (NOW() AT TIME ZONE 'America/Tegucigalpa'))
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW())
       `,
       [
-        cajaActual.id_sesion_caja,
-        cajaActual.id_caja,
+        cajaContext.id_sesion_caja,
+        cajaContext.id_caja,
         idSucursal,
         idTipoMovimientoCaja,
         userId,
@@ -1103,10 +1157,21 @@ export const createVentaReversion = async ({ idFactura, body, req, idUsuario }) 
       codigoVenta: factura.codigo_venta || `VTA-${String(facturaId).padStart(5, '0')}`,
       lineas: reversionLines
     });
+    const salsaSnapshots = await filterConsumedSalsaSnapshots({
+      client,
+      idPedido: factura.id_pedido,
+      idFactura: facturaId,
+      snapshots: buildSalsaInventorySnapshotsForReturn(reversionLines)
+    });
+    await restoreSalsasInventoryFromSnapshots({
+      client,
+      snapshots: salsaSnapshots,
+      idReversion,
+      codigoReversion: correlativo.codigo,
+      codigoVenta: factura.codigo_venta || `VTA-${String(facturaId).padStart(5, '0')}`
+    });
 
-    await client.query('COMMIT');
-
-    return {
+    const result = {
       id_reversion: idReversion,
       codigo_reversion: correlativo.codigo,
       fecha_operacion: correlativo.fecha_operacion,
@@ -1120,8 +1185,8 @@ export const createVentaReversion = async ({ idFactura, body, req, idUsuario }) 
       id_sucursal: idSucursal,
       id_caja_original: parsePositiveInt(factura.id_caja),
       id_sesion_caja_original: parsePositiveInt(factura.id_sesion_caja),
-      id_caja_actual: parsePositiveInt(cajaActual.id_caja),
-      id_sesion_caja_actual: parsePositiveInt(cajaActual.id_sesion_caja),
+      id_caja_actual: parsePositiveInt(cajaContext.id_caja),
+      id_sesion_caja_actual: parsePositiveInt(cajaContext.id_sesion_caja),
       lineas: reversionLines,
       fidelizacion: loyalty,
       auditoria: {
@@ -1130,6 +1195,19 @@ export const createVentaReversion = async ({ idFactura, body, req, idUsuario }) 
         user_agent: userAgent
       }
     };
+    const responseBody = {
+      success: true,
+      data: result,
+      message: 'Reversión registrada correctamente.'
+    };
+
+    if (typeof idempotency?.saveSuccess === 'function') {
+      await idempotency.saveSuccess(client, idempotencyReservation, responseBody, result);
+    }
+
+    await client.query('COMMIT');
+
+    return { result, responseBody };
   } catch (error) {
     try { await client.query('ROLLBACK'); } catch {}
     if (error?.code === '23514' && error?.constraint === 'ck_facturas_reversiones_motivo') {

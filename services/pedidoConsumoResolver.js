@@ -166,6 +166,9 @@ export const resolvePedidoConsumo = async ({ client, items }) => {
   const recetaQtyMap = new Map();
   const comboQtyMap = new Map();
   const extraQtyMap = new Map();
+  const insumoQtyMap = new Map();
+  const insumoWarehouseById = new Map();
+  const insumoTraceById = new Map();
   const productoContextById = new Map();
   const recetaContextById = new Map();
   const comboContextById = new Map();
@@ -187,6 +190,33 @@ export const resolvePedidoConsumo = async ({ client, items }) => {
     if (item.tipo_item === ITEM_TYPES.EXTRA) {
       addToMapTotal(extraQtyMap, item.id_item, item.cantidad);
       addContext(extraContextById, item.id_item, item);
+    }
+    if (item.tipo_item === ITEM_TYPES.SALSA) {
+      const idInsumo = toPositiveInt(item.id_insumo);
+      const idAlmacen = toPositiveInt(item.id_almacen);
+      if (!idInsumo || !idAlmacen) continue;
+      const previousWarehouse = insumoWarehouseById.get(idInsumo);
+      if (previousWarehouse && previousWarehouse !== idAlmacen) {
+        faltantes.push({
+          tipo_recurso: 'insumo',
+          id_recurso: idInsumo,
+          id_insumo: idInsumo,
+          motivo: 'SALSA_SNAPSHOT_ALMACEN_AMBIGUO',
+          mensaje: `Los snapshots de salsa para el insumo ${idInsumo} apuntan a almacenes distintos.`
+        });
+        continue;
+      }
+      insumoWarehouseById.set(idInsumo, idAlmacen);
+      addToMapTotal(insumoQtyMap, idInsumo, item.cantidad);
+      const trace = insumoTraceById.get(idInsumo) || {
+        salsaIds: new Set(),
+        detallePedidoIds: new Set(),
+        nombres: new Set()
+      };
+      if (toPositiveInt(item.id_salsa)) trace.salsaIds.add(toPositiveInt(item.id_salsa));
+      if (toPositiveInt(item.id_detalle_pedido)) trace.detallePedidoIds.add(toPositiveInt(item.id_detalle_pedido));
+      if (item.nombre) trace.nombres.add(String(item.nombre).trim());
+      insumoTraceById.set(idInsumo, trace);
     }
   }
 
@@ -266,7 +296,6 @@ export const resolvePedidoConsumo = async ({ client, items }) => {
     }
   }
 
-  const insumoQtyMap = new Map();
   for (const idExtra of extraIds) {
     const context = firstContext(extraContextById, idExtra);
     const snapshotInsumoId = toPositiveInt(context.id_insumo);
@@ -430,7 +459,9 @@ export const resolvePedidoConsumo = async ({ client, items }) => {
       combosById,
       recetasById,
       extrasById
-    }
+    },
+    insumoWarehouseById,
+    insumoTraceById
   };
 };
 

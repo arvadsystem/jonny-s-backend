@@ -7,6 +7,7 @@ import { measureVentasPerf } from '../utils/perfUtils.js';
 import {
   fetchPublicActiveSaucesQuery
 } from '../../public_menu/publicMenuQueries.js';
+import { resolveSalsasInventory } from './salsasInventoryService.js';
 
 const getVentasCatalogCacheTtlMs = () => {
   const rawValue = process.env.VENTAS_CATALOG_CACHE_TTL_MS;
@@ -195,10 +196,10 @@ export const resolveComboComplementMetadata = ({ combo = {}, quantity = 1, compo
   };
 };
 
-const buildVentaComplementCatalogCacheKey = ({ recipeIds = [], comboIds = [] }) =>
-  `complement_context:r=${buildVentasStaticCacheKey('recipes', recipeIds)}:c=${buildVentasStaticCacheKey('combos', comboIds)}`;
+export const buildVentaComplementCatalogCacheKey = ({ recipeIds = [], comboIds = [], idSucursal }) =>
+  `complement_context:s=${Number(idSucursal)}:r=${buildVentasStaticCacheKey('recipes', recipeIds)}:c=${buildVentasStaticCacheKey('combos', comboIds)}`;
 
-const fetchVentaComplementCatalogSnapshot = async (client, { recipeIds = [], comboIds = [] }) => {
+const fetchVentaComplementCatalogSnapshot = async (client, { recipeIds = [], comboIds = [], idSucursal }) => {
   const result = await client.query(
     `
       WITH input AS (
@@ -236,13 +237,22 @@ const fetchVentaComplementCatalogSnapshot = async (client, { recipeIds = [], com
           s.nombre,
           s.nivel_picante,
           s.orden,
+          s.id_insumo,
+          s.cantidad_porcion,
+          s.id_unidad_consumo,
           COALESCE(s.estado, true) AS disponible
         FROM receta_salsa rs
         INNER JOIN salsas s
           ON s.id_salsa = rs.id_salsa
         INNER JOIN all_recipe_ids ari
           ON ari.id_receta = rs.id_receta
+        INNER JOIN public.salsa_sucursales ss
+          ON ss.id_salsa = s.id_salsa
+         AND ss.id_sucursal = $3
+         AND ss.estado IS TRUE
+         AND ss.publicada IS TRUE
         WHERE COALESCE(rs.estado, true) = true
+          AND COALESCE(s.estado, true) = true
       ),
       sauce_rules AS (
         SELECT
@@ -270,7 +280,7 @@ const fetchVentaComplementCatalogSnapshot = async (client, { recipeIds = [], com
           FROM sauce_rules sr
         ), '[]'::jsonb) AS sauce_rules
     `,
-    [recipeIds, comboIds]
+    [recipeIds, comboIds, idSucursal]
   );
   const row = result.rows?.[0] || {};
   return {
@@ -280,7 +290,7 @@ const fetchVentaComplementCatalogSnapshot = async (client, { recipeIds = [], com
   };
 };
 
-export const buildVentaComplementContext = async ({ client, normalizedItems, perf = null, recetaMap = new Map() }) => {
+export const buildVentaComplementContext = async ({ client, normalizedItems, idSucursal, perf = null, recetaMap = new Map() }) => {
   const complementosStart = perf?.now?.() || 0;
   const recipeIds = [...new Set(
     (Array.isArray(normalizedItems) ? normalizedItems : [])
@@ -294,6 +304,10 @@ export const buildVentaComplementContext = async ({ client, normalizedItems, per
       .map((item) => Number(item.id_combo || 0))
       .filter((id) => id > 0)
   )];
+  const branchId = Number(idSucursal);
+  if (!Number.isInteger(branchId) || branchId <= 0) {
+    throw new TypeError('idSucursal es requerido para construir el catalogo de salsas.');
+  }
 
   try {
     if (recipeIds.length === 0 && comboIds.length === 0) {
@@ -310,8 +324,8 @@ export const buildVentaComplementContext = async ({ client, normalizedItems, per
       perf,
       'catalog_prefetch_ms',
       () => fetchCachedVentasStaticValue(
-        buildVentaComplementCatalogCacheKey({ recipeIds, comboIds }),
-        () => fetchVentaComplementCatalogSnapshot(client, { recipeIds, comboIds }),
+        buildVentaComplementCatalogCacheKey({ recipeIds, comboIds, idSucursal: branchId }),
+        () => fetchVentaComplementCatalogSnapshot(client, { recipeIds, comboIds, idSucursal: branchId }),
         perf
       )
     );
@@ -326,9 +340,18 @@ export const buildVentaComplementContext = async ({ client, normalizedItems, per
     const comboComponents = Array.isArray(complementSnapshot.comboComponents)
       ? complementSnapshot.comboComponents
       : [];
-    const allowedSauceRows = Array.isArray(complementSnapshot.allowedSauces)
+    const rawAllowedSauceRows = Array.isArray(complementSnapshot.allowedSauces)
       ? complementSnapshot.allowedSauces
       : [];
+    const uniqueAllowed = [...new Map(rawAllowedSauceRows.map((row) => [Number(row.id_salsa), row])).values()];
+    const availableAllowed = await resolveSalsasInventory({
+      queryRunner: client,
+      salsas: uniqueAllowed,
+      idSucursal: branchId,
+      mode: 'catalog'
+    });
+    const availableIds = new Set(availableAllowed.filter((row) => row.disponible).map((row) => Number(row.id_salsa)));
+    const allowedSauceRows = rawAllowedSauceRows.filter((row) => availableIds.has(Number(row.id_salsa)));
     const sauceRuleRows = Array.isArray(complementSnapshot.sauceRules)
       ? complementSnapshot.sauceRules
       : [];
@@ -424,13 +447,19 @@ export const buildVentaComplementContext = async ({ client, normalizedItems, per
         perf,
         'totals_allowed_sauces_ms',
         () => fetchCachedVentasStaticRows(
-          'active_sauces',
-          () => fetchPublicActiveSaucesQuery(client),
+          `active_sauces:s=${branchId}`,
+          () => fetchPublicActiveSaucesQuery(branchId, client),
           perf
         )
       )
       : [];
-    const normalizedFallbackSauces = sortSauceOptions((Array.isArray(fallbackSauces) ? fallbackSauces : []).map((row) => ({
+    const resolvedFallbackSauces = await resolveSalsasInventory({
+      queryRunner: client,
+      salsas: Array.isArray(fallbackSauces) ? fallbackSauces : [],
+      idSucursal: branchId,
+      mode: 'catalog'
+    });
+    const normalizedFallbackSauces = sortSauceOptions(resolvedFallbackSauces.filter((row) => row.disponible).map((row) => ({
       id_complemento: Number(row.id_salsa),
       id_salsa: Number(row.id_salsa),
       nombre: String(row.nombre || 'Salsa').trim(),

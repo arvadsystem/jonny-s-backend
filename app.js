@@ -3,7 +3,7 @@ import express from 'express';
 import cors from 'cors';
 import cookieParser from 'cookie-parser';
 import helmet from 'helmet';
-import pool from './config/db-connection.js';
+import pool, { closePool } from './config/db-connection.js';
 
 import loginRoutes from './routers/login.js';
 import publicClienteRoutes from './routers/public_cliente.js';
@@ -84,6 +84,7 @@ const DEFAULT_DEV_ORIGINS = [
   'http://localhost:5173',
   'http://127.0.0.1:5173'
 ];
+const IS_PRODUCTION = String(process.env.NODE_ENV || '').toLowerCase() === 'production';
 const normalizeOrigin = (origin) => String(origin || '').trim().replace(/\/+$/, '');
 
 const getAllowedOrigins = () => {
@@ -96,6 +97,8 @@ const getAllowedOrigins = () => {
 
   const singleOrigin = normalizeOrigin(process.env.FRONTEND_ORIGIN || '');
   if (singleOrigin) return [singleOrigin];
+
+  if (IS_PRODUCTION) return [];
 
   return DEFAULT_DEV_ORIGINS.map((origin) => normalizeOrigin(origin));
 };
@@ -275,8 +278,50 @@ app.use(movimientosInventarioRoutes);
 
 const PORT = process.env.PORT || 3001;
 startEmailCampaignScheduler();
-app.listen(PORT, () => {
+const server = app.listen(PORT, () => {
   console.log(`Servidor activo en el puerto ${PORT}`);
+});
+
+let shutdownPromise = null;
+
+const shutdown = async (signal) => {
+  if (shutdownPromise) return shutdownPromise;
+
+  console.warn(`[shutdown] Senal recibida: ${signal}. Cerrando servidor HTTP y pool PostgreSQL.`);
+
+  shutdownPromise = new Promise((resolve) => {
+    server.close((serverErr) => {
+      if (serverErr) {
+        console.error('[shutdown] Error cerrando servidor HTTP:', {
+          code: serverErr?.code || null,
+          message: serverErr?.message || 'Error de cierre'
+        });
+      }
+      resolve();
+    });
+  })
+    .then(() => closePool())
+    .then(() => {
+      console.log('[shutdown] Servidor y pool PostgreSQL cerrados.');
+      process.exit(0);
+    })
+    .catch((err) => {
+      console.error('[shutdown] Error durante cierre limpio:', {
+        code: err?.code || null,
+        message: err?.message || 'Error de cierre'
+      });
+      process.exit(1);
+    });
+
+  return shutdownPromise;
+};
+
+process.once('SIGTERM', () => {
+  void shutdown('SIGTERM');
+});
+
+process.once('SIGINT', () => {
+  void shutdown('SIGINT');
 });
 
 export default app;

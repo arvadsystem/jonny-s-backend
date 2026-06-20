@@ -57,6 +57,12 @@ const filterQtyMap = (qtyMap, excludedIds) => {
   return result;
 };
 
+const normalizePositiveIdSet = (value) => new Set(
+  [...(value instanceof Set ? value : Array.isArray(value) ? value : [])]
+    .map((id) => Number(id))
+    .filter((id) => Number.isInteger(id) && id > 0)
+);
+
 export const validarYDescontarPedido = async (payload, options = {}) => {
   const normalized = normalizePedidoPayload(payload);
   if (!normalized.ok) {
@@ -77,6 +83,7 @@ export const validarYDescontarPedido = async (payload, options = {}) => {
     ? SHORTAGE_MOVEMENT_REF
     : MOVEMENT_REF;
   const externalClient = options?.dbClient || null;
+  const strictInsumoIds = normalizePositiveIdSet(options?.strictInsumoIds);
 
   const client = externalClient || (await pool.connect());
   const manageTransaction = !externalClient;
@@ -106,6 +113,7 @@ export const validarYDescontarPedido = async (payload, options = {}) => {
       idSucursal,
       productoQtyMap: consumoResult.consumo.productoQtyMap,
       insumoQtyMap: consumoResult.consumo.insumoQtyMap,
+      expectedInsumoWarehouseById: consumoResult.insumoWarehouseById,
       allowCrossBranchWarehouse
     });
 
@@ -121,6 +129,8 @@ export const validarYDescontarPedido = async (payload, options = {}) => {
     const stockShortages = faltantes.filter(
       (item) => String(item?.motivo || '').trim().toUpperCase() === 'STOCK_INSUFICIENTE'
     );
+    const strictConfigFaults = configFaults.filter((item) => strictInsumoIds.has(Number(item?.id_insumo || item?.id_recurso)));
+    const strictStockShortages = stockShortages.filter((item) => strictInsumoIds.has(Number(item?.id_insumo || item?.id_recurso)));
     const operationalWarnings = Array.isArray(stockResult.advertencias)
       ? stockResult.advertencias
       : [];
@@ -131,8 +141,9 @@ export const validarYDescontarPedido = async (payload, options = {}) => {
       ...configWarnings
     ];
 
-    if (configFaults.length > 0 && !allowIncompleteConfiguration) {
-      const firstConfigFaultMessage = String(configFaults[0]?.mensaje || '').trim();
+    if (strictConfigFaults.length > 0 || (configFaults.length > 0 && !allowIncompleteConfiguration)) {
+      const blockingConfigFaults = strictConfigFaults.length > 0 ? strictConfigFaults : configFaults;
+      const firstConfigFaultMessage = String(blockingConfigFaults[0]?.mensaje || '').trim();
       if (manageTransaction) await client.query('ROLLBACK');
       return {
         ok: false,
@@ -140,11 +151,12 @@ export const validarYDescontarPedido = async (payload, options = {}) => {
         message: firstConfigFaultMessage || 'No se pudo descontar inventario por configuracion incompleta de productos/recetas/combos/extras/insumos/almacen.',
         id_pedido: idPedido,
         id_sucursal: idSucursal,
-        faltantes: configFaults
+        faltantes: blockingConfigFaults
       };
     }
 
-    if (stockShortages.length > 0 && !allowNegativeStock) {
+    if (strictStockShortages.length > 0 || (stockShortages.length > 0 && !allowNegativeStock)) {
+      const blockingStockShortages = strictStockShortages.length > 0 ? strictStockShortages : stockShortages;
       if (manageTransaction) await client.query('ROLLBACK');
       return {
         ok: false,
@@ -152,7 +164,7 @@ export const validarYDescontarPedido = async (payload, options = {}) => {
         message: 'No se pudo descontar inventario porque faltan recursos o hay configuraciones incompletas.',
         id_pedido: idPedido,
         id_sucursal: idSucursal,
-        faltantes: stockShortages
+        faltantes: blockingStockShortages
       };
     }
 
@@ -180,6 +192,7 @@ export const validarYDescontarPedido = async (payload, options = {}) => {
       insumoQtyMap: movimientoInsumoQtyMap,
       productosById: stockResult.lockedRows.productosById,
       insumosById: stockResult.lockedRows.insumosById,
+      insumoTraceById: consumoResult.insumoTraceById,
       refOrigen: stockShortages.length > 0 ? movementRefForShortage : MOVEMENT_REF,
       shortagesByResource
     });

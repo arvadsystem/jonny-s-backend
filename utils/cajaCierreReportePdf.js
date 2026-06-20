@@ -27,8 +27,17 @@ const formatMoney = (value) =>
     maximumFractionDigits: 2
   })}`;
 
+const parseUtcTimestampForDisplay = (value) => {
+  if (!value || value instanceof Date) return value;
+  const text = String(value).trim();
+  if (/^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}(:\d{2})?(\.\d+)?$/.test(text)) {
+    return `${text.replace(' ', 'T')}Z`;
+  }
+  return value;
+};
+
 const formatDateTime = (value = new Date()) => {
-  const date = value ? new Date(value) : new Date();
+  const date = value ? new Date(parseUtcTimestampForDisplay(value)) : new Date();
   if (Number.isNaN(date.getTime())) return 'No disponible';
   return date.toLocaleString('es-HN', {
     timeZone: 'America/Tegucigalpa',
@@ -88,6 +97,50 @@ const buildArqueosTableBody = (arqueos = []) => {
 
   return body;
 };
+
+const buildManualMovementsTableBody = (rows = []) => {
+  const body = [[
+    { text: 'Fecha/hora', style: 'tableHeader' },
+    { text: 'Tipo', style: 'tableHeader' },
+    { text: 'Monto', style: 'tableHeader', alignment: 'right' },
+    { text: 'Razon u observacion', style: 'tableHeader' },
+    { text: 'Referencia', style: 'tableHeader' },
+    { text: 'Usuario ejecutor', style: 'tableHeader' }
+  ]];
+
+  if (!Array.isArray(rows) || rows.length === 0) {
+    body.push([
+      { text: 'Sin movimientos manuales registrados.', colSpan: 6, color: '#667085' },
+      {}, {}, {}, {}, {}
+    ]);
+    return body;
+  }
+
+  rows.forEach((row) => {
+    body.push([
+      row.fecha_hora ? cleanText(formatDateTime(row.fecha_hora), 'Sin fecha') : 'Sin fecha',
+      cleanText(row.tipo, 'N/A'),
+      { text: formatMoney(row.monto), alignment: 'right' },
+      cleanText(row.observacion, 'N/A'),
+      cleanText(row.referencia, 'N/A'),
+      cleanText(row.usuario_ejecutor, 'No disponible')
+    ]);
+  });
+
+  return body;
+};
+
+const buildManualMovementSection = (title, rows = []) => [
+  { text: title, style: 'section' },
+  {
+    table: {
+      headerRows: 1,
+      widths: ['16%', '13%', '12%', '24%', '15%', '20%'],
+      body: buildManualMovementsTableBody(rows)
+    },
+    layout: 'lightHorizontalLines'
+  }
+];
 
 export const buildCajaCierrePdfFilename = (idCierreCaja) =>
   `cierre-caja-${cierreCode(idCierreCaja)}.pdf`;
@@ -204,6 +257,8 @@ export const buildCajaCierrePdfBuffer = async (payload = {}) => {
         },
         layout: 'lightHorizontalLines'
       },
+      ...buildManualMovementSection('Ingresos manuales', payload.movimientosManuales?.ingresos),
+      ...buildManualMovementSection('Egresos manuales', payload.movimientosManuales?.egresos),
       {
         text: 'Este reporte forma parte del control interno de caja.',
         margin: [0, 14, 0, 0],
