@@ -1,14 +1,22 @@
 import pool from '../../../config/db-connection.js';
+import {
+  obtenerConfiguracionImpresorasRuntime
+} from '../../../services/impresorasConfigSucursalService.js';
 import { buildVentaDetailPayload } from './ventasReadHandlers.js';
 import {
   normalizePrintEventPayload,
   registerVentaPrintEvent
 } from '../services/ventasPrintAuditService.js';
+import {
+  getQzCertificateText,
+  hasQzSigningConfigured,
+  signQzMessage
+} from '../services/qzTraySigningService.js';
 import { parsePositiveInt } from '../utils/parseUtils.js';
 
 const sendVentasInternalError = (
   res,
-  message = 'No se pudo procesar la solicitud de impresión.'
+  message = 'No se pudo procesar la solicitud de impresion.'
 ) => res.status(500).json({ error: true, message });
 
 const toKitchenExtras = (extras = []) =>
@@ -31,9 +39,15 @@ const toKitchenComplementos = (item = {}) => {
     .filter((entry) => entry.id_complemento || entry.nombre);
 };
 
-const buildVentaKitchenPrintPayload = (venta = {}) => {
+const buildVentaKitchenPrintPayload = (venta = {}, printerConfig = null) => {
+  const cocinaConfig = (Array.isArray(printerConfig?.impresoras) ? printerConfig.impresoras : [])
+    .find((item) => String(item?.tipo_impresora || '').trim().toUpperCase() === 'COCINA');
+
   const items = (Array.isArray(venta?.items) ? venta.items : []).map((item, index) => {
-    const isStandaloneExtra = Boolean(item?.origen_snapshot?.es_linea_extra_independiente);
+    const isStandaloneExtra = Boolean(
+      item?.es_linea_extra_independiente || item?.origen_snapshot?.es_linea_extra_independiente
+    );
+
     return {
       linea: index + 1,
       id_detalle: Number(item?.id_detalle || 0) || null,
@@ -70,13 +84,92 @@ const buildVentaKitchenPrintPayload = (venta = {}) => {
     total_productos: totalProductos,
     items,
     print_config: {
-      printMode: 'BROWSER',
+      printMode: cocinaConfig?.modo_impresion || 'BROWSER',
       printerType: 'COCINA',
       logicalPrinterName: 'COCINA',
-      systemPrinterName: null,
-      width_mm: 80
+      systemPrinterName: cocinaConfig?.nombre_impresora_sistema || null,
+      width_mm: Number(cocinaConfig?.ancho_mm) === 58 ? 58 : 80,
+      id_impresora: Number(cocinaConfig?.id_impresora || 0) || null,
+      ip_impresora: cocinaConfig?.ip_impresora || null,
+      puerto_impresora: Number(cocinaConfig?.puerto_impresora || 0) || 9100
     }
   };
+};
+
+export const getVentasPrinterConfigHandler = async (req, res) => {
+  try {
+    const idSucursal = parsePositiveInt(req.query?.id_sucursal);
+    const idCaja = parsePositiveInt(req.query?.id_caja);
+    if (!idSucursal) {
+      return res.status(400).json({ error: true, message: 'id_sucursal es obligatorio.' });
+    }
+
+    const data = await obtenerConfiguracionImpresorasRuntime({
+      idSucursal,
+      idCaja
+    });
+
+    return res.status(200).json(data);
+  } catch (error) {
+    console.error('Error al obtener configuracion runtime de impresoras:', error);
+    return sendVentasInternalError(res, 'No se pudo obtener la configuracion de impresion.');
+  }
+};
+
+export const getQzCertificateHandler = async (_req, res) => {
+  try {
+    const certificate = await getQzCertificateText();
+    if (!certificate) {
+      return res.status(503).json({
+        error: true,
+        code: 'QZ_SIGNING_NOT_CONFIGURED',
+        message: 'La firma segura de QZ Tray no esta configurada.'
+      });
+    }
+
+    return res.status(200).json({
+      ok: true,
+      configured: await hasQzSigningConfigured(),
+      certificate
+    });
+  } catch (error) {
+    console.error('Error al obtener certificado de QZ Tray:', error);
+    return sendVentasInternalError(res, 'No se pudo obtener el certificado de impresion.');
+  }
+};
+
+export const signQzRequestHandler = async (req, res) => {
+  try {
+    const request = String(req.body?.request || '');
+    if (!request) {
+      return res.status(400).json({
+        error: true,
+        code: 'QZ_SIGN_REQUEST_INVALID',
+        message: 'request es obligatorio.'
+      });
+    }
+
+    const signature = await signQzMessage(request);
+    return res.status(200).json({ ok: true, signature });
+  } catch (error) {
+    if (error?.code === 'QZ_SIGNING_NOT_CONFIGURED') {
+      return res.status(503).json({
+        error: true,
+        code: error.code,
+        message: 'La firma segura de QZ Tray no esta configurada.'
+      });
+    }
+    if (error?.code === 'QZ_SIGN_REQUEST_INVALID') {
+      return res.status(400).json({
+        error: true,
+        code: error.code,
+        message: 'request es obligatorio.'
+      });
+    }
+
+    console.error('Error al firmar solicitud de QZ Tray:', error);
+    return sendVentasInternalError(res, 'No se pudo firmar la solicitud de impresion.');
+  }
 };
 
 export const getVentaKitchenComandaByIdHandler = async (req, res) => {
@@ -94,7 +187,12 @@ export const getVentaKitchenComandaByIdHandler = async (req, res) => {
       return res.status(result.status).json(result.body);
     }
 
-    return res.status(200).json(buildVentaKitchenPrintPayload(result.body));
+    const printerConfig = await obtenerConfiguracionImpresorasRuntime({
+      idSucursal: result.body?.id_sucursal,
+      idCaja: result.body?.id_caja
+    }).catch(() => null);
+
+    return res.status(200).json(buildVentaKitchenPrintPayload(result.body, printerConfig));
   } catch (error) {
     console.error('Error al obtener comanda de cocina:', error);
     return sendVentasInternalError(res, 'No se pudo generar la comanda de cocina.');
@@ -136,6 +234,6 @@ export const createVentaPrintEventHandler = async (req, res) => {
     });
   } catch (error) {
     console.error('Error al registrar auditoria de impresion:', error);
-    return sendVentasInternalError(res, 'No se pudo registrar el evento de impresión.');
+    return sendVentasInternalError(res, 'No se pudo registrar el evento de impresion.');
   }
 };
