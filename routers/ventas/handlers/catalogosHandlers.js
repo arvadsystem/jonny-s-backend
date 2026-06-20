@@ -393,6 +393,9 @@ export const listCombosCatalogoHandler = async (req, res) => {
     if (!sucursalValidation.ok) {
       return res.status(sucursalValidation.status).json(sucursalValidation.body);
     }
+    if (!idSucursal) {
+      return res.status(400).json({ error: true, message: 'id_sucursal es obligatorio para listar complementos.' });
+    }
 
     let joinClause = '';
     let whereClause = '';
@@ -510,6 +513,7 @@ export const listCombosCatalogoHandler = async (req, res) => {
     const comboRows = Array.isArray(result.rows) ? result.rows : [];
     const complementContext = await buildVentaComplementContext({
       client: pool,
+      idSucursal,
       normalizedItems: comboRows.map((row) => ({
         kind: 'COMBO',
         id_combo: Number(row?.id_combo || 0),
@@ -565,6 +569,9 @@ export const listRecetasCatalogoHandler = async (req, res) => {
     const sucursalValidation = await validateVentasCatalogSucursal({ scope, idSucursal });
     if (!sucursalValidation.ok) {
       return res.status(sucursalValidation.status).json(sucursalValidation.body);
+    }
+    if (!idSucursal) {
+      return res.status(400).json({ error: true, message: 'id_sucursal es obligatorio para listar complementos.' });
     }
 
     let joinClause = '';
@@ -634,6 +641,7 @@ export const listRecetasCatalogoHandler = async (req, res) => {
     const recetaRows = Array.isArray(result.rows) ? result.rows : [];
     const complementContext = await buildVentaComplementContext({
       client: pool,
+      idSucursal,
       normalizedItems: recetaRows.map((row) => ({
         kind: 'RECETA',
         id_receta: Number(row?.id_receta || 0),

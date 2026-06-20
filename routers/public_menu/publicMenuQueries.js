@@ -812,8 +812,10 @@ export const fetchComboRecipeComponentsQuery = async (comboIds = [], db = pool) 
 };
 
 // Salsas permitidas por receta activa.
-export const fetchAllowedSauceRowsByRecipeIdsQuery = async (recipeIds = [], db = pool) => {
+export const fetchAllowedSauceRowsByRecipeIdsQuery = async (recipeIds = [], idSucursal, db = pool) => {
   if (!Array.isArray(recipeIds) || recipeIds.length === 0) return [];
+  const branchId = Number(idSucursal);
+  if (!Number.isInteger(branchId) || branchId <= 0) throw new TypeError('idSucursal es requerido para consultar salsas.');
 
   const result = await db.query(
     `
@@ -823,15 +825,24 @@ export const fetchAllowedSauceRowsByRecipeIdsQuery = async (recipeIds = [], db =
         s.nombre,
         s.nivel_picante,
         s.orden,
+        s.id_insumo,
+        s.cantidad_porcion,
+        s.id_unidad_consumo,
         COALESCE(s.estado, true) AS disponible
       FROM receta_salsa rs
       INNER JOIN salsas s
         ON s.id_salsa = rs.id_salsa
+      INNER JOIN public.salsa_sucursales ss
+        ON ss.id_salsa = s.id_salsa
+       AND ss.id_sucursal = $2
+       AND ss.estado IS TRUE
+       AND ss.publicada IS TRUE
       WHERE rs.id_receta = ANY($1::int[])
         AND COALESCE(rs.estado, true) = true
+        AND COALESCE(s.estado, true) = true
       ORDER BY rs.id_receta, s.orden, s.nombre;
     `,
-    [recipeIds]
+    [recipeIds, branchId]
   );
 
   return result.rows;
@@ -839,7 +850,9 @@ export const fetchAllowedSauceRowsByRecipeIdsQuery = async (recipeIds = [], db =
 
 // Catalogo publico de salsas activas para fallback cuando una receta/combo exige salsas
 // pero no tiene mapeo puntual en receta_salsa.
-export const fetchPublicActiveSaucesQuery = async (db = pool) => {
+export const fetchPublicActiveSaucesQuery = async (idSucursal, db = pool) => {
+  const branchId = Number(idSucursal);
+  if (!Number.isInteger(branchId) || branchId <= 0) throw new TypeError('idSucursal es requerido para consultar salsas.');
   const result = await db.query(
     `
       SELECT
@@ -847,11 +860,20 @@ export const fetchPublicActiveSaucesQuery = async (db = pool) => {
         s.nombre,
         s.nivel_picante,
         s.orden,
+        s.id_insumo,
+        s.cantidad_porcion,
+        s.id_unidad_consumo,
         true AS disponible
       FROM salsas s
+      INNER JOIN public.salsa_sucursales ss
+        ON ss.id_salsa = s.id_salsa
+       AND ss.id_sucursal = $1
+       AND ss.estado IS TRUE
+       AND ss.publicada IS TRUE
       WHERE COALESCE(s.estado, true) = true
       ORDER BY s.orden, s.nombre;
-    `
+    `,
+    [branchId]
   );
 
   return result.rows;

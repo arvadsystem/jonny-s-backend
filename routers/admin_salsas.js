@@ -17,6 +17,11 @@ import {
   normalizeAdminStatus,
   normalizeText
 } from './admin_salsas/services/salsaInventoryAdminStateService.js';
+import {
+  listSalsaSucursalPublicationState,
+  normalizeSalsaSucursalPublicationPayload,
+  saveSalsaSucursalPublicationState
+} from './admin_salsas/services/salsaSucursalPublicationService.js';
 
 const router = express.Router();
 // AM: transicion segura a permisos granulares sin romper el acceso actual mientras se alinea BD/roles.
@@ -635,6 +640,7 @@ router.get('/', checkPermission(MENU_SALSAS_VIEW_PERMISSIONS), async (req, res) 
       orden: salsasTieneOrden ? 'COALESCE(s.orden, 2147483647)' : 's.nombre'
     };
     const sortColumn = sortColumns[sortBy] || sortColumns.orden;
+    const publicationFilter = normalizeText(req.query?.publicacion).toLowerCase();
     const params = [];
     const whereParts = [];
     const addParam = (value) => {
@@ -663,6 +669,14 @@ router.get('/', checkPermission(MENU_SALSAS_VIEW_PERMISSIONS), async (req, res) 
       } else if (nivelPicante !== 0) {
         whereParts.push('false');
       }
+    }
+    if (['todas', 'parcial', 'ninguna'].includes(publicationFilter)) {
+      const condition = {
+        todas: 'publication.publicadas = publication.sucursales_activas AND publication.sucursales_activas > 0',
+        parcial: 'publication.publicadas > 0 AND publication.publicadas < publication.sucursales_activas',
+        ninguna: 'publication.publicadas = 0'
+      }[publicationFilter];
+      whereParts.push(condition);
     }
     const whereClause = whereParts.length ? `WHERE ${whereParts.join(' AND ')}` : '';
     const countParams = [...params];
@@ -701,6 +715,18 @@ router.get('/', checkPermission(MENU_SALSAS_VIEW_PERMISSIONS), async (req, res) 
           AND ip.cantidad_presentacion > 0
           AND ip.cantidad_base > 0
       ) conv ON true
+      LEFT JOIN LATERAL (
+        SELECT
+          COUNT(*)::int AS sucursales_activas,
+          COUNT(*) FILTER (
+            WHERE ss.publicada IS TRUE AND ss.estado IS TRUE
+          )::int AS publicadas
+        FROM public.sucursales su
+        LEFT JOIN public.salsa_sucursales ss
+          ON ss.id_sucursal = su.id_sucursal
+         AND ss.id_salsa = s.id_salsa
+        WHERE COALESCE(su.estado, TRUE) IS TRUE
+      ) publication ON true
     `;
 
     const selectSalsaInventoryFields = `
@@ -727,6 +753,13 @@ router.get('/', checkPermission(MENU_SALSAS_VIEW_PERMISSIONS), async (req, res) 
         COALESCE(i_master.estado, true) AS insumo_maestro_estado,
         i_master.id_unidad_medida AS id_unidad_base_maestro,
         COALESCE(conv.conversiones_aplicables, 0)::int AS conversiones_aplicables
+        ,COALESCE(publication.publicadas, 0)::int AS sucursales_publicadas
+        ,COALESCE(publication.sucursales_activas, 0)::int AS sucursales_activas
+        ,CASE
+          WHEN COALESCE(publication.publicadas, 0) = 0 THEN 'NINGUNA'
+          WHEN publication.publicadas = publication.sucursales_activas THEN 'TODAS'
+          ELSE 'PARCIAL'
+        END AS publicacion_estado
     `;
 
     const [countResult, result, summaryResult, nextOrderResult] = await Promise.all([
@@ -1096,6 +1129,59 @@ router.get('/recetas/:id_receta/config', checkPermission(MENU_SALSAS_VIEW_PERMIS
   }
 });
 
+router.get('/:id_salsa/sucursales', checkPermission(MENU_SALSAS_VIEW_PERMISSIONS), async (req, res) => {
+  try {
+    const idSalsa = toPositiveInt(req.params.id_salsa);
+    if (!idSalsa) return res.status(400).json({ error: true, message: 'id_salsa invalido.' });
+    const state = await listSalsaSucursalPublicationState(pool, idSalsa);
+    if (!state) return res.status(404).json({ error: true, message: 'Salsa no encontrada.' });
+    return res.status(200).json(state);
+  } catch (err) {
+    console.error('Error al listar publicacion de salsa por sucursal:', err.message);
+    return res.status(500).json({ error: true, message: getSafeServerErrorMessage(err) });
+  }
+});
+
+router.put('/:id_salsa/sucursales', checkPermission(MENU_SALSAS_EDIT_PERMISSIONS), async (req, res) => {
+  const idSalsa = toPositiveInt(req.params.id_salsa);
+  const actorUserId = resolveActorUserId(req);
+  const normalized = normalizeSalsaSucursalPublicationPayload(req.body);
+  if (!idSalsa) return res.status(400).json({ error: true, message: 'id_salsa invalido.' });
+  if (!actorUserId) return res.status(401).json({ error: true, message: 'Sesion invalida. Vuelve a iniciar sesion.' });
+  if (!normalized.ok) return res.status(400).json({ error: true, message: normalized.message });
+
+  let client;
+  try {
+    client = await pool.connect();
+    await client.query('BEGIN');
+    const userResult = await client.query('SELECT 1 FROM public.usuarios WHERE id_usuario = $1 LIMIT 1', [actorUserId]);
+    if (!userResult.rowCount) {
+      await client.query('ROLLBACK');
+      return res.status(401).json({ error: true, message: 'El usuario autenticado ya no existe.' });
+    }
+    const saved = await saveSalsaSucursalPublicationState({
+      client,
+      idSalsa,
+      idUsuario: actorUserId,
+      sucursales: normalized.sucursales
+    });
+    if (!saved.ok) {
+      await client.query('ROLLBACK');
+      return res.status(saved.status).json({ error: true, code: saved.code, message: saved.message });
+    }
+    await client.query('COMMIT');
+    invalidateVentasComplementCatalogCache('publicar salsa por sucursal');
+    const state = await listSalsaSucursalPublicationState(pool, idSalsa);
+    return res.status(200).json({ error: false, message: 'Publicacion actualizada correctamente.', ...state });
+  } catch (err) {
+    if (client) await client.query('ROLLBACK').catch(() => {});
+    console.error('Error al guardar publicacion de salsa por sucursal:', err.message);
+    return res.status(500).json({ error: true, message: getSafeServerErrorMessage(err) });
+  } finally {
+    client?.release();
+  }
+});
+
 router.post('/', checkPermission(MENU_SALSAS_CREATE_PERMISSIONS), async (req, res) => {
   let client = null;
   let transactionStarted = false;
@@ -1127,14 +1213,13 @@ router.post('/', checkPermission(MENU_SALSAS_CREATE_PERMISSIONS), async (req, re
       `
         SELECT id_salsa
         FROM salsas
-        WHERE LOWER(TRIM(nombre)) = LOWER(TRIM($1))
-          ${salsasTieneEstado ? 'AND COALESCE(estado, true) = true' : ''}
+        WHERE LOWER(BTRIM(nombre)) = LOWER(BTRIM($1))
         LIMIT 1;
       `,
       [data.nombre]
     );
     if (duplicateResult.rowCount > 0) {
-      return res.status(409).json({ error: true, message: 'Ya existe una salsa activa con ese nombre.' });
+      return res.status(409).json({ error: true, message: 'Ya existe una salsa con ese nombre.' });
     }
 
     // Transicion segura: id_usuario del cliente se ignora y se fuerza desde req.user.
@@ -1191,6 +1276,9 @@ router.post('/', checkPermission(MENU_SALSAS_CREATE_PERMISSIONS), async (req, re
     if (transactionStarted && client) {
       await client.query('ROLLBACK');
     }
+    if (err?.code === '23505') {
+      return res.status(409).json({ error: true, message: 'Ya existe una salsa con ese nombre.' });
+    }
     console.error('Error al crear salsa admin:', err.message);
     return res.status(500).json({ error: true, message: getSafeServerErrorMessage(err) });
   } finally {
@@ -1236,15 +1324,14 @@ router.put('/:id_salsa', checkPermission(MENU_SALSAS_EDIT_PERMISSIONS), async (r
       `
         SELECT id_salsa
         FROM salsas
-        WHERE LOWER(TRIM(nombre)) = LOWER(TRIM($1))
+        WHERE LOWER(BTRIM(nombre)) = LOWER(BTRIM($1))
           AND id_salsa <> $2
-          ${salsasTieneEstado ? 'AND COALESCE(estado, true) = true' : ''}
         LIMIT 1;
       `,
       [data.nombre, idSalsa]
     );
     if (duplicateResult.rowCount > 0) {
-      return res.status(409).json({ error: true, message: 'Ya existe otra salsa activa con ese nombre.' });
+      return res.status(409).json({ error: true, message: 'Ya existe otra salsa con ese nombre.' });
     }
 
     // Transicion segura: id_usuario del cliente se ignora y se fuerza desde req.user.
@@ -1285,6 +1372,9 @@ router.put('/:id_salsa', checkPermission(MENU_SALSAS_EDIT_PERMISSIONS), async (r
     invalidateVentasComplementCatalogCache('actualizar salsa');
     return res.status(200).json({ error: false, message: 'Salsa actualizada correctamente.' });
   } catch (err) {
+    if (err?.code === '23505') {
+      return res.status(409).json({ error: true, message: 'Ya existe otra salsa con ese nombre.' });
+    }
     console.error('Error al actualizar salsa admin:', err.message);
     return res.status(500).json({ error: true, message: getSafeServerErrorMessage(err) });
   }

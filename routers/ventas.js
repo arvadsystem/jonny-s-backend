@@ -2947,6 +2947,7 @@ const hydrateVentaLines = async (client, normalizedItems, perf = null, options =
     buildVentaComplementContext({
       client,
       normalizedItems,
+      idSucursal: options?.idSucursal,
       perf,
       recetaMap,
       comboMap

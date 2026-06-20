@@ -12,6 +12,7 @@
     "qa:admin-salsas-insumos-catalog": "node scripts/qa-admin-salsas-insumos-catalog.js",
     "qa:salsas-cocina": "node scripts/qa-salsas-cocina-contract.js",
     "qa:salsas-inventory": "node scripts/qa-salsas-inventory-trigger.js",
+    "qa:salsas-publicacion-sucursal": "node scripts/qa-salsas-publicacion-sucursal.js",
     "rbac:personas:dry-run": "node scripts/sync-personas-rbac.js",
     "rbac:personas:sync": "node scripts/sync-personas-rbac.js --apply",
     "test": "echo \"Error: no test specified\" && exit 1"

@@ -11,6 +11,7 @@ const toPositiveNumber = (value) => {
 const getSelections = (config) => {
   if (Array.isArray(config?.complementos)) return config.complementos;
   if (Array.isArray(config?.componentes?.seleccion)) return config.componentes.seleccion;
+  if (Array.isArray(config?.salsas_por_unidad)) return config.salsas_por_unidad;
   return [];
 };
 

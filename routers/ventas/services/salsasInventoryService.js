@@ -98,8 +98,10 @@ export const getSelectedSalsaIdsFromLines = (lines = []) => (
   [...new Set(normalizeSelectedSalsas(lines).map((salsa) => salsa.id_salsa).filter(Boolean))]
 );
 
-export const fetchSalsaInventoryRows = async ({ queryRunner, salsaIds = [] } = {}) => {
+export const fetchSalsaInventoryRows = async ({ queryRunner, salsaIds = [], idSucursal } = {}) => {
   if (!queryRunner?.query) throw new TypeError('queryRunner es requerido para cargar inventario de salsas.');
+  const branchId = toPositiveInventoryInt(idSucursal);
+  if (!branchId) throw createInventoryError('SALSA_SUCURSAL_REQUERIDA', 'La sucursal es obligatoria para resolver salsas.');
   const ids = [...new Set((Array.isArray(salsaIds) ? salsaIds : []).map((id) => toPositiveInventoryInt(id)).filter(Boolean))];
   if (ids.length === 0) return [];
   await assertSalsaInventorySchemaAvailable(queryRunner);
@@ -114,9 +116,15 @@ export const fetchSalsaInventoryRows = async ({ queryRunner, salsaIds = [] } = {
         COALESCE(s.cantidad_porcion, 2)::numeric AS cantidad_porcion,
         s.id_unidad_consumo
       FROM public.salsas s
+      INNER JOIN public.salsa_sucursales ss
+        ON ss.id_salsa = s.id_salsa
+       AND ss.id_sucursal = $2
+       AND ss.estado IS TRUE
+       AND ss.publicada IS TRUE
       WHERE s.id_salsa = ANY($1::int[])
+        AND COALESCE(s.estado, TRUE) IS TRUE
     `,
-    [ids]
+    [ids, branchId]
   );
   return result.rows || [];
 };
@@ -357,7 +365,8 @@ export const attachSalsaInventorySnapshotsToLines = async ({ client, lines = [],
 
   const rows = await fetchSalsaInventoryRows({
     queryRunner: client,
-    salsaIds: selected.map((salsa) => salsa.id_salsa)
+    salsaIds: selected.map((salsa) => salsa.id_salsa),
+    idSucursal
   });
   const rowsById = new Map(rows.map((row) => [Number(row.id_salsa), row]));
   const resolvedRows = await resolveSalsasInventory({
@@ -382,7 +391,7 @@ export const attachSalsaInventorySnapshotsToLines = async ({ client, lines = [],
       const source = rowsById.get(idSalsa);
       const resolved = resolvedById.get(idSalsa);
       if (!source) {
-        throw createInventoryError('VENTAS_SALSA_INVENTARIO_NO_DISPONIBLE', `La salsa ${idSalsa} no existe.`);
+        throw createInventoryError('SALSA_NO_PUBLICADA_SUCURSAL', `La salsa ${idSalsa} no esta publicada en esta sucursal.`);
       }
       if (!resolved?.disponible || !resolved.inventario_configurado) {
         throw createInventoryError(
@@ -432,6 +441,69 @@ export const attachSalsaInventorySnapshotsToLines = async ({ client, lines = [],
   }
 
   return [...usageByStockKey.values()];
+};
+
+export const attachSalsaInventorySnapshotsToPublicLines = async ({ client, lines = [], idSucursal }) => {
+  const salsaIds = [];
+  for (const line of lines) {
+    for (const salsa of Array.isArray(line?.configuracion_menu?.salsas_por_unidad)
+      ? line.configuracion_menu.salsas_por_unidad
+      : []) {
+      const idSalsa = toPositiveInventoryInt(salsa?.id_salsa || salsa?.id_complemento);
+      if (idSalsa) salsaIds.push(idSalsa);
+    }
+  }
+  if (!salsaIds.length) return [];
+  const rows = await fetchSalsaInventoryRows({ queryRunner: client, salsaIds, idSucursal });
+  const rowsById = new Map(rows.map((row) => [Number(row.id_salsa), row]));
+  const resolved = await resolveSalsasInventory({
+    queryRunner: client,
+    salsas: rows,
+    idSucursal,
+    mode: 'transactional'
+  });
+  const resolvedById = new Map(resolved.map((row) => [Number(row.id_salsa), row]));
+  const usageByStockKey = new Map();
+
+  for (const line of lines) {
+    const selections = Array.isArray(line?.configuracion_menu?.salsas_por_unidad)
+      ? line.configuracion_menu.salsas_por_unidad
+      : [];
+    line.configuracion_menu.salsas_por_unidad = selections.map((selection) => {
+      const idSalsa = toPositiveInventoryInt(selection?.id_salsa || selection?.id_complemento);
+      const source = rowsById.get(idSalsa);
+      const inventory = resolvedById.get(idSalsa);
+      if (!source) {
+        throw createInventoryError('SALSA_NO_PUBLICADA_SUCURSAL', `La salsa ${idSalsa} no esta publicada en esta sucursal.`);
+      }
+      if (!inventory?.disponible || !inventory.inventario_configurado) {
+        throw createInventoryError(
+          'VENTAS_SALSA_INVENTARIO_NO_DISPONIBLE',
+          `La salsa ${source.nombre} no esta disponible: ${String(inventory?.motivo_no_disponible || 'inventario invalido').toLowerCase()}`
+        );
+      }
+      const portions = Math.max(1, toPositiveInventoryInt(selection?.cantidad) || 1);
+      const snapshot = buildConsumptionSnapshot(inventory, portions, line?.cantidad);
+      const stockKey = `${snapshot.id_insumo}:${snapshot.id_almacen}`;
+      const usage = usageByStockKey.get(stockKey) || {
+        nombre: snapshot.nombre,
+        stockDisponible: Number(inventory.stock_disponible || 0),
+        requerido: 0
+      };
+      usage.requerido += snapshot.cantidad_base_total;
+      usageByStockKey.set(stockKey, usage);
+      return {
+        ...selection,
+        inventario: snapshot
+      };
+    });
+  }
+  for (const usage of usageByStockKey.values()) {
+    if (usage.stockDisponible < usage.requerido) {
+      throw createInventoryError('VENTAS_SALSA_STOCK_INSUFICIENTE', `No hay existencias suficientes para la salsa ${usage.nombre}.`);
+    }
+  }
+  return lines;
 };
 
 export const consumeSalsasInventoryFromSnapshots = async ({
