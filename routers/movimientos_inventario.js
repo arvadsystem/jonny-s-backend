@@ -686,23 +686,22 @@ router.get('/movimientos_inventario/referencias', checkPermission(MOVIMIENTOS_VI
       return sendValidationError(res, parsedLimit.error);
     }
 
-    const baseWhere = `
-      WHERE COALESCE(item.estado, true) = true
-        AND COALESCE(a.estado, true) = true
-        AND ($1::int IS NULL OR item.id_almacen = $1)
-        AND ($2::int IS NULL OR a.id_sucursal = $2)
-        AND ($4::boolean = true OR a.id_sucursal = ANY($5::int[]))
-    `;
-
     const queryByItemType = itemTipo.value === 'producto'
       ? `
         SELECT
           item.id_producto,
           item.nombre_producto,
-          item.id_almacen
-        FROM public.productos item
-        INNER JOIN public.almacenes a ON a.id_almacen = item.id_almacen
-        ${baseWhere}
+          pa.id_almacen,
+          COALESCE(pa.cantidad, 0)::numeric AS cantidad_disponible
+        FROM public.productos_almacenes pa
+        INNER JOIN public.productos item ON item.id_producto = pa.id_producto
+        INNER JOIN public.almacenes a ON a.id_almacen = pa.id_almacen
+        WHERE COALESCE(pa.estado, true) = true
+          AND COALESCE(item.estado, true) = true
+          AND COALESCE(a.estado, true) = true
+          AND ($1::int IS NULL OR pa.id_almacen = $1)
+          AND ($2::int IS NULL OR a.id_sucursal = $2)
+          AND ($4::boolean = true OR a.id_sucursal = ANY($5::int[]))
         ORDER BY item.nombre_producto ASC, item.id_producto ASC
         LIMIT $3
       `
@@ -710,10 +709,17 @@ router.get('/movimientos_inventario/referencias', checkPermission(MOVIMIENTOS_VI
         SELECT
           item.id_insumo,
           item.nombre_insumo,
-          item.id_almacen
-        FROM public.insumos item
-        INNER JOIN public.almacenes a ON a.id_almacen = item.id_almacen
-        ${baseWhere}
+          ia.id_almacen,
+          COALESCE(ia.cantidad, 0)::numeric AS cantidad_disponible
+        FROM public.insumos_almacenes ia
+        INNER JOIN public.insumos item ON item.id_insumo = ia.id_insumo
+        INNER JOIN public.almacenes a ON a.id_almacen = ia.id_almacen
+        WHERE COALESCE(ia.estado, true) = true
+          AND COALESCE(item.estado, true) = true
+          AND COALESCE(a.estado, true) = true
+          AND ($1::int IS NULL OR ia.id_almacen = $1)
+          AND ($2::int IS NULL OR a.id_sucursal = $2)
+          AND ($4::boolean = true OR a.id_sucursal = ANY($5::int[]))
         ORDER BY item.nombre_insumo ASC, item.id_insumo ASC
         LIMIT $3
       `;
