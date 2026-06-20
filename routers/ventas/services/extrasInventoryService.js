@@ -12,6 +12,59 @@ export const toPositiveInventoryNumber = (value) => {
 
 const normalizeMappingStatus = (value) => String(value || '').trim().toUpperCase();
 
+export const fetchVentaGlobalExtrasCatalog = async ({ queryRunner, idSucursal, extraIds = null } = {}) => {
+  if (!queryRunner?.query) throw new TypeError('queryRunner es requerido para cargar extras globales.');
+
+  const branchId = toPositiveInventoryInt(idSucursal);
+  if (!branchId) return [];
+
+  const normalizedExtraIds = Array.isArray(extraIds)
+    ? [...new Set(extraIds.map((id) => toPositiveInventoryInt(id)).filter(Boolean))]
+    : [];
+
+  const result = await queryRunner.query(
+    `
+      SELECT DISTINCT ON (me.id_extra)
+        me.id_extra,
+        me.codigo,
+        me.nombre,
+        me.precio_adicional AS precio,
+        COALESCE(me.estado, true) AS estado,
+        me.id_insumo,
+        i.nombre_insumo,
+        me.cant,
+        me.id_unidad_medida,
+        COALESCE(NULLIF(TRIM(um.simbolo), ''), NULLIF(TRIM(um.nombre), ''), 'unidad') AS unidad_medida,
+        mea.id_almacen,
+        a.id_sucursal
+      FROM public.menu_extras me
+      INNER JOIN public.menu_extra_almacenes mea
+        ON mea.id_extra = me.id_extra
+       AND COALESCE(mea.estado, true) = true
+      INNER JOIN public.almacenes a
+        ON a.id_almacen = mea.id_almacen
+       AND COALESCE(a.estado, true) = true
+       AND a.id_sucursal = $1
+      INNER JOIN public.sucursales s
+        ON s.id_sucursal = a.id_sucursal
+       AND COALESCE(s.estado, true) = true
+      LEFT JOIN public.insumos i
+        ON i.id_insumo = me.id_insumo
+      LEFT JOIN public.unidades_medida um
+        ON um.id_unidad_medida = me.id_unidad_medida
+      WHERE COALESCE(me.estado, true) = true
+        AND (
+          cardinality($2::int[]) = 0
+          OR me.id_extra = ANY($2::int[])
+        )
+      ORDER BY me.id_extra, mea.id_almacen
+    `,
+    [branchId, normalizedExtraIds]
+  );
+
+  return Array.isArray(result.rows) ? result.rows : [];
+};
+
 export const EXTRA_INVENTORY_UNAVAILABLE_MESSAGES = Object.freeze({
   EXTRA_INSUMO_NO_CONFIGURADO: 'Este extra requiere configurar su inventario.',
   EXTRA_INSUMO_NO_ENCONTRADO: 'Este extra no tiene un insumo de inventario valido.',
