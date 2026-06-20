@@ -2,6 +2,14 @@
 import pool from '../config/db-connection.js';
 import { checkPermission } from '../middleware/checkPermission.js';
 import { clearVentasComplementCatalogCache } from './ventas/services/complementosCatalogService.js';
+import {
+  attachSalsaInventoryState,
+  getInventoryStateLabel,
+  getUnitDisplay,
+  isSelectableInsumoRow,
+  normalizeAdminStatus,
+  normalizeText
+} from './admin_salsas/services/salsaInventoryAdminStateService.js';
 
 const router = express.Router();
 // AM: transicion segura a permisos granulares sin romper el acceso actual mientras se alinea BD/roles.
@@ -79,131 +87,6 @@ const toPositiveNumberOrNull = (value) => {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
 };
 
-const normalizeText = (value) => String(value || '').trim();
-
-const normalizeAdminStatus = (value) => normalizeText(value).toUpperCase();
-
-const getUnitDisplay = ({ nombre, simbolo, fallback = 'unidad' } = {}) =>
-  normalizeText(simbolo || nombre || fallback);
-
-const getInventoryStateLabel = (state) => {
-  const normalized = normalizeAdminStatus(state);
-  if (normalized === 'LISTA') return 'Lista';
-  if (normalized === 'PENDIENTE') return 'Sin configurar';
-  if (normalized === 'INSUMO_INVALIDO') return 'Revisar insumo';
-  if (normalized === 'SIN_UNIDAD_BASE') return 'Insumo sin unidad base';
-  if (normalized === 'CONVERSION_FALTANTE') return 'Revisar conversion';
-  if (normalized === 'CONVERSION_AMBIGUA') return 'Conversion ambigua';
-  return 'Sin configurar';
-};
-
-const buildInventoryState = (row = {}) => {
-  const active = row.estado === undefined ? true : row.estado === true;
-  const idInsumo = toPositiveInt(row.id_insumo);
-  const idUnidadConsumo = toPositiveInt(row.id_unidad_consumo);
-  const cantidadPorcion = toPositiveNumberOrNull(row.cantidad_porcion);
-  const idUnidadBase = toPositiveInt(row.id_unidad_base);
-  const insumoActivo = row.insumo_estado === undefined ? true : row.insumo_estado === true;
-  const conversiones = Number(row.conversiones_aplicables || 0);
-  const unidadConsumo = getUnitDisplay({
-    nombre: row.unidad_consumo_nombre,
-    simbolo: row.unidad_consumo_simbolo
-  });
-  const insumoNombre = normalizeText(row.insumo_nombre || (idInsumo ? `Insumo #${idInsumo}` : 'insumo'));
-
-  if (!active) {
-    return {
-      inventario_estado: 'PENDIENTE',
-      inventario_configurado: false,
-      inventario_mensaje: 'No aplica mientras la salsa este inactiva.',
-      resumen_consumo: 'No aplica',
-      puede_asignarse_receta: false
-    };
-  }
-  if (!idInsumo && !idUnidadConsumo) {
-    return {
-      inventario_estado: 'PENDIENTE',
-      inventario_configurado: false,
-      inventario_mensaje: 'Sin configurar',
-      resumen_consumo: 'Sin configurar',
-      puede_asignarse_receta: false
-    };
-  }
-  if (!idInsumo || !idUnidadConsumo || !cantidadPorcion) {
-    return {
-      inventario_estado: 'PENDIENTE',
-      inventario_configurado: false,
-      inventario_mensaje: 'Completa insumo, cantidad y unidad de consumo.',
-      resumen_consumo: 'Sin configurar',
-      puede_asignarse_receta: false
-    };
-  }
-  if (!row.insumo_nombre || insumoActivo !== true) {
-    return {
-      inventario_estado: 'INSUMO_INVALIDO',
-      inventario_configurado: false,
-      inventario_mensaje: 'El insumo configurado no existe o esta inactivo.',
-      resumen_consumo: 'Revisar insumo',
-      puede_asignarse_receta: false
-    };
-  }
-  if (!idUnidadBase) {
-    return {
-      inventario_estado: 'SIN_UNIDAD_BASE',
-      inventario_configurado: false,
-      inventario_mensaje: 'El insumo no tiene unidad base configurada.',
-      resumen_consumo: 'Revisar insumo',
-      puede_asignarse_receta: false
-    };
-  }
-  if (idUnidadBase !== idUnidadConsumo && conversiones === 0) {
-    return {
-      inventario_estado: 'CONVERSION_FALTANTE',
-      inventario_configurado: false,
-      inventario_mensaje: 'Falta una conversion activa para usar esa unidad.',
-      resumen_consumo: 'Revisar conversion',
-      puede_asignarse_receta: false
-    };
-  }
-  if (idUnidadBase !== idUnidadConsumo && conversiones > 1) {
-    return {
-      inventario_estado: 'CONVERSION_AMBIGUA',
-      inventario_configurado: false,
-      inventario_mensaje: 'Hay mas de una conversion activa para esa unidad.',
-      resumen_consumo: 'Revisar conversion',
-      puede_asignarse_receta: false
-    };
-  }
-
-  return {
-    inventario_estado: 'LISTA',
-    inventario_configurado: true,
-    inventario_mensaje: 'Lista para descontar inventario.',
-    resumen_consumo: `${Number(cantidadPorcion)} ${unidadConsumo} por seleccion`,
-    puede_asignarse_receta: true,
-    insumo_consumo_nombre: insumoNombre
-  };
-};
-
-const attachSalsaInventoryState = (row = {}) => {
-  const state = buildInventoryState(row);
-  return {
-    ...row,
-    ...state
-  };
-};
-
-const isSelectableInsumoRow = (row = {}) => {
-  if (row.estado !== true) return { selectable: false, reason: 'El insumo esta inactivo.' };
-  if (!toPositiveInt(row.id_unidad_medida)) return { selectable: false, reason: 'El insumo no tiene unidad base configurada.' };
-  if (Number(row.mapping_count || 0) > 1) return { selectable: false, reason: 'El insumo tiene mas de una relacion de catalogo y requiere revision.' };
-  const status = normalizeAdminStatus(row.estado_mapeo_maestro);
-  if (['PENDIENTE', 'REQUIERE_REVISION', 'AMBIGUO'].includes(status)) {
-    return { selectable: false, reason: 'El insumo requiere revision antes de usarse en salsas.' };
-  }
-  return { selectable: true, reason: '' };
-};
-
 const parseBoolean = (value) => {
   if (typeof value === 'boolean') return value;
   if (value === 1 || value === '1') return true;
@@ -225,6 +108,11 @@ const shouldIncludeInactive = (query) => {
   ).trim().toLowerCase();
 
   return ['1', 'true', 'si', 'yes', 'all'].includes(value);
+};
+
+const shouldOnlyInactive = (query) => {
+  const value = String(query?.only_inactive ?? '').trim().toLowerCase();
+  return ['1', 'true', 'si', 'yes'].includes(value);
 };
 
 const sanitizeName = (value) => String(value || '').trim();
@@ -592,11 +480,97 @@ router.get('/', checkPermission(MENU_SALSAS_VIEW_PERMISSIONS), async (req, res) 
     ]);
 
     const includeInactive = shouldIncludeInactive(req.query);
-    const whereClause = salsasTieneEstado && !includeInactive
-      ? 'WHERE COALESCE(s.estado, true) = true'
-      : '';
+    const onlyInactive = shouldOnlyInactive(req.query);
+    const page = Math.max(1, toPositiveInt(req.query?.page) || 1);
+    const rawLimit = toPositiveInt(req.query?.limit) || 10;
+    const limit = Math.min(Math.max(rawLimit, 1), 100);
+    const offset = (page - 1) * limit;
+    const search = normalizeText(req.query?.search);
+    const nivelPicante = req.query?.nivel_picante === undefined || req.query?.nivel_picante === ''
+      ? null
+      : toIntOrNull(req.query.nivel_picante, { min: 0, max: 5 });
+    const sortDir = normalizeAdminStatus(req.query?.sort_dir) === 'DESC' ? 'DESC' : 'ASC';
+    const sortBy = normalizeText(req.query?.sort_by || 'orden').toLowerCase();
+    const sortColumns = {
+      id_salsa: 's.id_salsa',
+      nombre: 's.nombre',
+      nivel_picante: salsasTieneNivelPicante ? 'COALESCE(s.nivel_picante, 0)' : '0',
+      orden: salsasTieneOrden ? 'COALESCE(s.orden, 2147483647)' : 's.nombre'
+    };
+    const sortColumn = sortColumns[sortBy] || sortColumns.orden;
+    const params = [];
+    const whereParts = [];
+    const addParam = (value) => {
+      params.push(value);
+      return `$${params.length}`;
+    };
 
-    const result = await pool.query(
+    if (salsasTieneEstado) {
+      if (onlyInactive) {
+        whereParts.push('COALESCE(s.estado, true) = false');
+      } else if (!includeInactive) {
+        whereParts.push('COALESCE(s.estado, true) = true');
+      }
+    }
+    if (search) {
+      const searchParam = addParam(`%${search}%`);
+      whereParts.push(`(
+        s.nombre ILIKE ${searchParam}
+        OR s.id_salsa::text ILIKE ${searchParam}
+        OR i.nombre_insumo ILIKE ${searchParam}
+      )`);
+    }
+    if (nivelPicante !== null) {
+      if (salsasTieneNivelPicante) {
+        whereParts.push(`COALESCE(s.nivel_picante, 0) = ${addParam(nivelPicante)}`);
+      } else if (nivelPicante !== 0) {
+        whereParts.push('false');
+      }
+    }
+    const whereClause = whereParts.length ? `WHERE ${whereParts.join(' AND ')}` : '';
+    const countParams = [...params];
+    const limitParam = addParam(limit);
+    const offsetParam = addParam(offset);
+
+    const baseJoins = `
+      LEFT JOIN public.insumos i
+        ON i.id_insumo = ${salsasTieneInsumo ? 's.id_insumo' : 'NULL'}
+      LEFT JOIN public.unidades_medida um_base
+        ON um_base.id_unidad_medida = i.id_unidad_medida
+      LEFT JOIN public.unidades_medida um_consumo
+        ON um_consumo.id_unidad_medida = ${salsasTieneUnidadConsumo ? 's.id_unidad_consumo' : 'NULL'}
+      LEFT JOIN LATERAL (
+        SELECT
+          COUNT(*)::int AS mapping_count,
+          MIN(imm.id_insumo_maestro)::int AS id_insumo_maestro,
+          MIN(imm.estado_migracion) AS estado_mapeo_maestro
+        FROM public.insumos_mapeo_maestro imm
+        WHERE imm.id_insumo_legacy = i.id_insumo
+      ) map ON true
+      LEFT JOIN LATERAL (
+        SELECT COUNT(*)::int AS conversiones_aplicables
+        FROM public.insumo_presentaciones ip
+        WHERE ip.id_insumo = i.id_insumo
+          AND ip.id_unidad_presentacion = ${salsasTieneUnidadConsumo ? 's.id_unidad_consumo' : 'NULL'}
+          AND ip.id_unidad_base = i.id_unidad_medida
+          AND ip.estado IS TRUE
+          AND ip.uso_receta IS TRUE
+          AND ip.cantidad_presentacion > 0
+          AND ip.cantidad_base > 0
+      ) conv ON true
+    `;
+
+    const [countResult, result] = await Promise.all([
+      pool.query(
+        `
+          SELECT COUNT(*)::int AS total
+          FROM salsas s
+          ${baseJoins}
+          ${whereClause};
+        `,
+        countParams
+      ),
+      pool.query(
       `
         SELECT
           s.id_salsa,
@@ -614,31 +588,32 @@ router.get('/', checkPermission(MENU_SALSAS_VIEW_PERMISSIONS), async (req, res) 
           um_base.simbolo AS unidad_base_simbolo,
           um_consumo.nombre AS unidad_consumo_nombre,
           um_consumo.simbolo AS unidad_consumo_simbolo,
+          map.mapping_count,
+          map.id_insumo_maestro,
+          map.estado_mapeo_maestro,
           COALESCE(conv.conversiones_aplicables, 0)::int AS conversiones_aplicables
         FROM salsas s
-        LEFT JOIN public.insumos i
-          ON i.id_insumo = ${salsasTieneInsumo ? 's.id_insumo' : 'NULL'}
-        LEFT JOIN public.unidades_medida um_base
-          ON um_base.id_unidad_medida = i.id_unidad_medida
-        LEFT JOIN public.unidades_medida um_consumo
-          ON um_consumo.id_unidad_medida = ${salsasTieneUnidadConsumo ? 's.id_unidad_consumo' : 'NULL'}
-        LEFT JOIN LATERAL (
-          SELECT COUNT(*)::int AS conversiones_aplicables
-          FROM public.insumo_presentaciones ip
-          WHERE ip.id_insumo = i.id_insumo
-            AND ip.id_unidad_presentacion = ${salsasTieneUnidadConsumo ? 's.id_unidad_consumo' : 'NULL'}
-            AND ip.id_unidad_base = i.id_unidad_medida
-            AND ip.estado IS TRUE
-            AND ip.uso_receta IS TRUE
-            AND ip.cantidad_presentacion > 0
-            AND ip.cantidad_base > 0
-        ) conv ON true
+        ${baseJoins}
         ${whereClause}
-        ORDER BY ${salsasTieneOrden ? 'COALESCE(s.orden, 2147483647),' : ''} s.nombre ASC, s.id_salsa ASC;
-      `
-    );
+        ORDER BY ${sortColumn} ${sortDir}, s.nombre ASC, s.id_salsa ASC
+        LIMIT ${limitParam}
+        OFFSET ${offsetParam};
+      `,
+        params
+      )
+    ]);
 
-    return res.status(200).json((result.rows || []).map(attachSalsaInventoryState));
+    const total = Number(countResult.rows?.[0]?.total || 0);
+    const totalPages = Math.max(1, Math.ceil(total / limit));
+    return res.status(200).json({
+      items: (result.rows || []).map(attachSalsaInventoryState),
+      pagination: {
+        page,
+        limit,
+        total,
+        totalPages
+      }
+    });
   } catch (err) {
     console.error('Error al listar salsas admin:', err.message);
     return res.status(500).json({ error: true, message: getSafeServerErrorMessage(err) });
@@ -739,6 +714,7 @@ router.get('/catalogos/insumos', checkPermission(MENU_SALSAS_VIEW_PERMISSIONS), 
     for (const row of result.rows || []) {
       const selectable = isSelectableInsumoRow(row);
       const categoria = normalizeText(row.categoria_nombre);
+      const estadoConfiguracion = selectable.selectable ? 'OK' : 'BLOQUEADO';
       const item = {
         id_insumo: Number(row.id_insumo),
         nombre: row.nombre,
@@ -753,12 +729,18 @@ router.get('/catalogos/insumos', checkPermission(MENU_SALSAS_VIEW_PERMISSIONS), 
         },
         seleccionable: selectable.selectable,
         motivo_bloqueo: selectable.selectable ? null : selectable.reason,
+        mapping_count: Number(row.mapping_count || 0),
+        id_insumo_maestro: toPositiveInt(row.id_insumo_maestro),
+        estado_mapeo_maestro: row.estado_mapeo_maestro || null,
+        indicador_maestro_legacy: row.indicador_maestro_legacy || null,
+        estado_configuracion: estadoConfiguracion,
         conversiones_disponibles: Array.isArray(row.conversiones_disponibles) ? row.conversiones_disponibles : [],
         metadata: {
           mapping_count: Number(row.mapping_count || 0),
           id_insumo_maestro: toPositiveInt(row.id_insumo_maestro),
           estado_mapeo_maestro: row.estado_mapeo_maestro || null,
-          indicador_maestro_legacy: row.indicador_maestro_legacy || null
+          indicador_maestro_legacy: row.indicador_maestro_legacy || null,
+          estado_configuracion: estadoConfiguracion
         }
       };
       if (!selectable.selectable) {
@@ -820,6 +802,9 @@ router.get('/recetas/:id_receta/config', checkPermission(MENU_SALSAS_VIEW_PERMIS
             um_base.simbolo AS unidad_base_simbolo,
             um_consumo.nombre AS unidad_consumo_nombre,
             um_consumo.simbolo AS unidad_consumo_simbolo,
+            map.mapping_count,
+            map.id_insumo_maestro,
+            map.estado_mapeo_maestro,
             COALESCE(conv.conversiones_aplicables, 0)::int AS conversiones_aplicables,
             ${salsasTieneOrden ? 'COALESCE(s.orden, 2147483647)' : '0'} AS sort_orden
           FROM salsas s
@@ -829,6 +814,14 @@ router.get('/recetas/:id_receta/config', checkPermission(MENU_SALSAS_VIEW_PERMIS
             ON um_base.id_unidad_medida = i.id_unidad_medida
           LEFT JOIN public.unidades_medida um_consumo
             ON um_consumo.id_unidad_medida = ${salsasTieneUnidadConsumo ? 's.id_unidad_consumo' : 'NULL'}
+          LEFT JOIN LATERAL (
+            SELECT
+              COUNT(*)::int AS mapping_count,
+              MIN(imm.id_insumo_maestro)::int AS id_insumo_maestro,
+              MIN(imm.estado_migracion) AS estado_mapeo_maestro
+            FROM public.insumos_mapeo_maestro imm
+            WHERE imm.id_insumo_legacy = i.id_insumo
+          ) map ON true
           LEFT JOIN LATERAL (
             SELECT COUNT(*)::int AS conversiones_aplicables
             FROM public.insumo_presentaciones ip
@@ -1288,12 +1281,23 @@ router.put('/recetas/:id_receta/config', checkPermission(MENU_SALSAS_EDIT_PERMIS
             i.id_unidad_medida AS id_unidad_base,
             um_consumo.nombre AS unidad_consumo_nombre,
             um_consumo.simbolo AS unidad_consumo_simbolo,
+            map.mapping_count,
+            map.id_insumo_maestro,
+            map.estado_mapeo_maestro,
             COALESCE(conv.conversiones_aplicables, 0)::int AS conversiones_aplicables
           FROM salsas s
           LEFT JOIN public.insumos i
             ON i.id_insumo = s.id_insumo
           LEFT JOIN public.unidades_medida um_consumo
             ON um_consumo.id_unidad_medida = s.id_unidad_consumo
+          LEFT JOIN LATERAL (
+            SELECT
+              COUNT(*)::int AS mapping_count,
+              MIN(imm.id_insumo_maestro)::int AS id_insumo_maestro,
+              MIN(imm.estado_migracion) AS estado_mapeo_maestro
+            FROM public.insumos_mapeo_maestro imm
+            WHERE imm.id_insumo_legacy = i.id_insumo
+          ) map ON true
           LEFT JOIN LATERAL (
             SELECT COUNT(*)::int AS conversiones_aplicables
             FROM public.insumo_presentaciones ip
