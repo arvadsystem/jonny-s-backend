@@ -94,7 +94,7 @@ export const listSalsaSucursalPublicationState = async (queryRunner, idSalsa) =>
     `
       SELECT
         su.id_sucursal,
-        su.nombre AS nombre_sucursal,
+        su.nombre_sucursal,
         COALESCE(ss.publicada, FALSE) AS publicada,
         COALESCE(ss.estado, TRUE) AS estado_publicacion
       FROM public.sucursales su
@@ -102,7 +102,7 @@ export const listSalsaSucursalPublicationState = async (queryRunner, idSalsa) =>
         ON ss.id_sucursal = su.id_sucursal
        AND ss.id_salsa = $1
       WHERE COALESCE(su.estado, TRUE) IS TRUE
-      ORDER BY su.nombre, su.id_sucursal
+      ORDER BY su.nombre_sucursal, su.id_sucursal
     `,
     [salsaId]
   );

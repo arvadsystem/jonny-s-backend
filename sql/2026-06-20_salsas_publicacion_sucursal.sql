@@ -160,10 +160,10 @@ SELECT
   ss.id_salsa,
   s.nombre,
   ss.id_sucursal,
-  su.nombre AS sucursal,
+  su.nombre_sucursal AS sucursal,
   ss.publicada,
   ss.estado
 FROM public.salsa_sucursales ss
 JOIN public.salsas s ON s.id_salsa = ss.id_salsa
 JOIN public.sucursales su ON su.id_sucursal = ss.id_sucursal
-ORDER BY s.nombre, su.nombre;
+ORDER BY s.nombre, su.nombre_sucursal;
