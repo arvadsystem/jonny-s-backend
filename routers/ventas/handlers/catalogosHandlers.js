@@ -684,7 +684,76 @@ export const listRecetasCatalogoHandler = async (req, res) => {
   }
 };
 
-const fetchCajaBootstrapOperationalState = async ({ idUsuario, idSucursal = null }) => {
+const mapCajaAvailableSession = (row) => ({
+  id_sucursal: Number(row.id_sucursal),
+  nombre_sucursal: row.nombre_sucursal,
+  id_caja: Number(row.id_caja),
+  codigo_caja: row.codigo_caja,
+  nombre_caja: row.nombre_caja,
+  id_sesion_caja: Number(row.id_sesion_caja),
+  estado_sesion: row.estado_codigo,
+  estado_codigo: row.estado_codigo,
+  fecha_apertura: row.fecha_apertura,
+  rol_participacion: row.rol_participacion || null
+});
+
+const fetchCajaBootstrapAvailableSessions = async ({ idUsuario, isSuperAdmin, idSucursal = null }) => {
+  const result = await pool.query(
+    `
+      SELECT DISTINCT ON (cs.id_sucursal, cs.id_sesion_caja)
+        cs.id_sesion_caja,
+        cs.id_caja,
+        cs.id_sucursal,
+        c.codigo_caja,
+        c.nombre_caja,
+        s.nombre_sucursal,
+        estado.codigo AS estado_codigo,
+        cs.fecha_apertura,
+        COALESCE(
+          rol.codigo,
+          CASE WHEN cs.id_usuario_responsable = $1 THEN 'RESPONSABLE' END,
+          CASE WHEN autorizacion.id_caja_usuario_autorizado IS NOT NULL THEN 'AUTORIZADO' END,
+          CASE WHEN $2::boolean THEN 'SUPER_ADMIN' END
+        ) AS rol_participacion
+      FROM public.cajas_sesiones cs
+      INNER JOIN public.cat_cajas_sesiones_estados estado
+        ON estado.id_estado_sesion_caja = cs.id_estado_sesion_caja
+       AND UPPER(estado.codigo) = 'ABIERTA'
+      INNER JOIN public.cajas c
+        ON c.id_caja = cs.id_caja
+       AND COALESCE(c.estado, true) = true
+      INNER JOIN public.sucursales s
+        ON s.id_sucursal = cs.id_sucursal
+       AND COALESCE(s.estado, true) = true
+      LEFT JOIN public.cajas_sesiones_participantes participante
+        ON participante.id_sesion_caja = cs.id_sesion_caja
+       AND participante.id_usuario = $1
+       AND COALESCE(participante.activo, true) = true
+      LEFT JOIN public.cat_cajas_roles_participacion rol
+        ON rol.id_rol_participacion_caja = participante.id_rol_participacion_caja
+      LEFT JOIN public.cajas_usuarios_autorizados autorizacion
+        ON autorizacion.id_caja = cs.id_caja
+       AND autorizacion.id_usuario = $1
+       AND COALESCE(autorizacion.estado, true) = true
+       AND (
+         COALESCE(autorizacion.puede_responsable, false) = true
+         OR COALESCE(autorizacion.puede_auxiliar, false) = true
+       )
+      WHERE ($3::int IS NULL OR cs.id_sucursal = $3)
+        AND (
+          cs.id_usuario_responsable = $1
+          OR participante.id_participacion_caja IS NOT NULL
+          OR autorizacion.id_caja_usuario_autorizado IS NOT NULL
+          OR $2::boolean = true
+        )
+      ORDER BY cs.id_sucursal, cs.id_sesion_caja, cs.fecha_apertura DESC
+    `,
+    [idUsuario, Boolean(isSuperAdmin), idSucursal]
+  );
+  return (result.rows || []).map(mapCajaAvailableSession);
+};
+
+const fetchCajaBootstrapOperationalState = async ({ idUsuario, idSucursal = null, isSuperAdmin = false }) => {
   const result = await pool.query(
     `
       WITH active_session AS (
@@ -736,7 +805,22 @@ const fetchCajaBootstrapOperationalState = async ({ idUsuario, idSucursal = null
           ORDER BY participacion.fecha_inicio DESC NULLS LAST, participacion.id_participacion_caja DESC
           LIMIT 1
         ) participante ON true
-        WHERE (cs.id_usuario_responsable = $1 OR participante.id_participacion_caja IS NOT NULL)
+        WHERE (
+            cs.id_usuario_responsable = $1
+            OR participante.id_participacion_caja IS NOT NULL
+            OR $3::boolean = true
+            OR EXISTS (
+              SELECT 1
+              FROM public.cajas_usuarios_autorizados autorizacion_operativa
+              WHERE autorizacion_operativa.id_caja = cs.id_caja
+                AND autorizacion_operativa.id_usuario = $1
+                AND COALESCE(autorizacion_operativa.estado, true) = true
+                AND (
+                  COALESCE(autorizacion_operativa.puede_responsable, false) = true
+                  OR COALESCE(autorizacion_operativa.puede_auxiliar, false) = true
+                )
+            )
+          )
           AND ($2::int IS NULL OR cs.id_sucursal = $2)
         ORDER BY cs.fecha_apertura DESC, cs.id_sesion_caja DESC
         LIMIT 1
@@ -793,7 +877,7 @@ const fetchCajaBootstrapOperationalState = async ({ idUsuario, idSucursal = null
         ON caja.id_caja = COALESCE(sesion.id_caja, asignacion.id_caja)
       LIMIT 1
     `,
-    [idUsuario, idSucursal]
+    [idUsuario, idSucursal, Boolean(isSuperAdmin)]
   );
 
   const row = result.rows?.[0] || null;
@@ -866,10 +950,44 @@ export const getCajaBootstrapHandler = async (req, res) => {
       idSucursal = scope.userSucursalId
         || (scope.allowedSucursalIds.length === 1 ? Number(scope.allowedSucursalIds[0]) : null);
     }
+    const sessionsStartedAt = performance.now();
+    const sesionesDisponibles = await fetchCajaBootstrapAvailableSessions({
+      idUsuario: scope.idUsuario,
+      isSuperAdmin: scope.isSuperAdmin,
+      idSucursal
+    });
+    sqlDurationMs += performance.now() - sessionsStartedAt;
+    if (!idSucursal && scope.isSuperAdmin) {
+      if (sesionesDisponibles.length === 1) {
+        idSucursal = Number(sesionesDisponibles[0].id_sucursal);
+      } else {
+        return res.status(200).json({
+          data: {
+            id_sucursal: null,
+            sucursal: null,
+            caja_activa: null,
+            sesion_caja: null,
+            sesiones_disponibles: sesionesDisponibles,
+            requiere_seleccion_sucursal: sesionesDisponibles.length > 1,
+            requiere_sesion_caja: sesionesDisponibles.length === 0,
+            departamentos: [],
+            departamento_activo: null,
+            recetas: []
+          },
+          meta: {
+            cache: 'MISS',
+            duration_ms: Number((performance.now() - startedAt).toFixed(2)),
+            sql_duration_ms: Number(sqlDurationMs.toFixed(2)),
+            mapping_duration_ms: 0
+          }
+        });
+      }
+    }
     const operationalStartedAt = performance.now();
     let operationalState = await fetchCajaBootstrapOperationalState({
       idUsuario: scope.idUsuario,
-      idSucursal
+      idSucursal,
+      isSuperAdmin: scope.isSuperAdmin
     });
     sqlDurationMs += performance.now() - operationalStartedAt;
     idSucursal = idSucursal || operationalState?.id_sucursal || null;
@@ -880,6 +998,7 @@ export const getCajaBootstrapHandler = async (req, res) => {
           sucursal: null,
           caja_activa: null,
           sesion_caja: null,
+          sesiones_disponibles: sesionesDisponibles,
           requiere_seleccion_sucursal: true,
           departamentos: [],
           departamento_activo: null,
@@ -899,7 +1018,8 @@ export const getCajaBootstrapHandler = async (req, res) => {
       const scopedOperationalStartedAt = performance.now();
       operationalState = await fetchCajaBootstrapOperationalState({
         idUsuario: scope.idUsuario,
-        idSucursal
+        idSucursal,
+        isSuperAdmin: scope.isSuperAdmin
       });
       sqlDurationMs += performance.now() - scopedOperationalStartedAt;
     }
@@ -912,6 +1032,7 @@ export const getCajaBootstrapHandler = async (req, res) => {
           sucursal: operationalState?.sucursal || null,
           caja_activa: operationalState?.caja_activa || null,
           sesion_caja: null,
+          sesiones_disponibles: sesionesDisponibles,
           requiere_sesion_caja: true,
           departamentos: [],
           departamento_activo: null,
@@ -981,6 +1102,7 @@ export const getCajaBootstrapHandler = async (req, res) => {
         sucursal: operationalState.sucursal,
         caja_activa: operationalState.caja_activa,
         sesion_caja: operationalState.sesion_caja,
+        sesiones_disponibles: sesionesDisponibles,
         requiere_seleccion_sucursal: false,
         requiere_sesion_caja: false
       },

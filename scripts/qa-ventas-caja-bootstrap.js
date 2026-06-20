@@ -28,6 +28,16 @@ assert.match(handlersSource, /sesion_caja:\s*operationalState\.sesion_caja/, 'bo
 assert.match(handlersSource, /caja_activa:\s*operationalState\.caja_activa/, 'bootstrap debe incluir la caja activa');
 assert.match(handlersSource, /if \(!operationalState\?\.sesion_caja\)/, 'sin sesion no debe cargar catalogos');
 assert.match(handlersSource, /requiere_seleccion_sucursal:\s*true/, 'superadmin sin sesion debe poder seleccionar sucursal');
+assert.match(handlersSource, /fetchCajaBootstrapAvailableSessions/, 'bootstrap debe descubrir todas las sesiones operables');
+assert.match(handlersSource, /cajas_sesiones_participantes/, 'descubrimiento debe incluir participantes activos');
+assert.match(handlersSource, /cajas_usuarios_autorizados/, 'descubrimiento debe incluir usuarios autorizados');
+assert.match(handlersSource, /OR \$2::boolean = true/, 'descubrimiento debe permitir superadmin');
+assert.match(
+  handlersSource,
+  /if \(!idSucursal && scope\.isSuperAdmin\)[\s\S]*sesionesDisponibles\.length === 1[\s\S]*sesionesDisponibles\.length > 1[\s\S]*departamentos: \[\][\s\S]*recetas: \[\]/,
+  'una sesion debe autoseleccionarse y multiples sesiones deben quedar en modo descubrimiento sin catalogos'
+);
+assert.match(handlersSource, /sesiones_disponibles:\s*sesionesDisponibles/, 'el contrato debe exponer sesiones disponibles');
 assert.ok(
   handlersSource.indexOf('fetchCajaBootstrapOperationalState') < handlersSource.indexOf('fetchCachedCajaBootstrap(cacheKey'),
   'el estado operativo especifico del usuario debe resolverse fuera del cache compartido'
