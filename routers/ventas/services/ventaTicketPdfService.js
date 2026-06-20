@@ -21,13 +21,13 @@ export const mmToPt = (mm) => (mm * 72) / 25.4;
 
 const resolvePageMargins = (widthMm) => (
   widthMm === 58
-    ? [mmToPt(3), mmToPt(4), mmToPt(3), mmToPt(4)]
-    : [mmToPt(4), mmToPt(4), mmToPt(5), mmToPt(4)]
+    ? [mmToPt(4), mmToPt(4), mmToPt(5), mmToPt(4)]
+    : [mmToPt(7), mmToPt(4), mmToPt(10), mmToPt(4)]
 );
 
 const getContentWidthPt = (widthMm) => {
   const margins = resolvePageMargins(widthMm);
-  return mmToPt(widthMm) - margins[0] - margins[2];
+  return Math.max(mmToPt(widthMm) - margins[0] - margins[2] - mmToPt(1.5), mmToPt(30));
 };
 
 const toMoneyNumber = (value) => {
@@ -113,10 +113,10 @@ const divider = (widthMm = 80) => ({
 
 const metaRow = (label, value, widthMm = 80) => ({
   columns: [
-    text(label, { width: widthMm === 58 ? 45 : 50, bold: true }),
+    text(label, { width: widthMm === 58 ? 38 : 42, bold: true }),
     text(value, { width: '*', alignment: 'right' })
   ],
-  columnGap: 3,
+  columnGap: 2,
   margin: [0, 1, 0, 1]
 });
 
@@ -227,7 +227,7 @@ const buildItemsBlock = (venta, widthMm) => {
     text('ITEMS', { bold: true, alignment: 'center', margin: [0, 0, 0, 2] }),
     {
       table: {
-        widths: [widthMm === 58 ? 18 : 20, '*', widthMm === 58 ? 34 : 42],
+        widths: [widthMm === 58 ? 16 : 18, '*', widthMm === 58 ? 30 : 36],
         body: buildItemRows(items, widthMm)
       },
       layout: 'lightHorizontalLines'
@@ -311,7 +311,7 @@ export const buildVentaTicketPdfBuffer = async (venta) => {
     pageMargins: resolvePageMargins(widthMm),
     defaultStyle: {
       font: 'Roboto',
-      fontSize: widthMm === 58 ? 6.5 : 7.5
+      fontSize: widthMm === 58 ? 6.2 : 7
     },
     styles: {},
     content
