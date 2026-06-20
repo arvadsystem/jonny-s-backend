@@ -658,6 +658,7 @@ router.put('/perfil/password', passwordChangeLimiter, async (req, res) => {
     await ensurePasswordChangedAtColumn();
 
     const client = await pool.connect();
+    let fechaCambioClave = null;
     try {
       await client.query('BEGIN');
 
@@ -724,7 +725,7 @@ router.put('/perfil/password', passwordChangeLimiter, async (req, res) => {
         );
       }
 
-      const updatePasswordResult = await client.query(
+      const updateResult = await client.query(
         `
           UPDATE usuarios
           SET
@@ -736,6 +737,7 @@ router.put('/perfil/password', passwordChangeLimiter, async (req, res) => {
         `,
         [claveNueva, idUsuario]
       );
+      fechaCambioClave = updateResult.rows?.[0]?.fecha_cambio_clave ?? null;
 
       await client.query(
         `
@@ -757,31 +759,23 @@ router.put('/perfil/password', passwordChangeLimiter, async (req, res) => {
       );
 
       await client.query('COMMIT');
-
-      const fechaCambioClave = updatePasswordResult.rows?.[0]?.fecha_cambio_clave ?? null;
-      const passwordExpiration = evaluatePasswordExpiration({
-        roles: req.user?.roles,
-        tipoUsuario: req.user?.tipo_usuario,
-        mustChangePassword: false,
-        passwordChangedAt: fechaCambioClave,
-        createdAt: req.user?.fecha_creacion
-      });
-      const passwordPolicyFlags = buildPasswordPolicyFlags(passwordExpiration);
-
-      await issueUpdatedAccessToken(req, res);
-      return res.json({
-        error: false,
-        message: 'Contrasena actualizada correctamente',
-        fecha_cambio_clave: fechaCambioClave,
-        must_change_password: false,
-        ...passwordPolicyFlags
-      });
     } catch (txError) {
       try { await client.query('ROLLBACK'); } catch {}
       throw txError;
     } finally {
       client.release();
     }
+
+    await issueUpdatedAccessToken(req, res);
+    return res.json({
+      error: false,
+      message: 'Contrasena actualizada correctamente',
+      fecha_cambio_clave: fechaCambioClave,
+      must_change_password: false,
+      password_expired: false,
+      password_expired_by_age: false,
+      password_change_required: false
+    });
   } catch (err) {
     console.error('PUT /perfil/password error:', err?.message || err);
     return res.status(500).json({ error: true, message: 'Error interno del servidor' });
