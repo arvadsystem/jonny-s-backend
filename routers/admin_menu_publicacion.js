@@ -7,8 +7,17 @@ import {
   getPublicMenuHeroCarouselConfig,
   savePublicMenuHeroCarouselConfig
 } from '../services/publicMenuHeroCarouselConfigService.js';
+import { clearVentasCajaBootstrapCache } from './ventas/services/cajaBootstrapCacheService.js';
 
 const router = express.Router();
+router.use((req, res, next) => {
+  if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method)) {
+    res.once('finish', () => {
+      if (res.statusCode >= 200 && res.statusCode < 400) clearVentasCajaBootstrapCache();
+    });
+  }
+  next();
+});
 // AM: transicion segura a permisos granulares sin romper el acceso actual mientras se alinea BD/roles.
 const MENU_PUBLICACION_VIEW_PERMISSIONS = ['MENU_PUBLICACION_VER', 'MENU_VER'];
 const MENU_PUBLICACION_SAVE_PERMISSIONS = ['MENU_PUBLICACION_GUARDAR', 'MENU_VER'];

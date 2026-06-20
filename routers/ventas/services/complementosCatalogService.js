@@ -8,6 +8,7 @@ import {
   fetchPublicActiveSaucesQuery
 } from '../../public_menu/publicMenuQueries.js';
 import { resolveSalsasInventory } from './salsasInventoryService.js';
+import { clearVentasCajaBootstrapCache } from './cajaBootstrapCacheService.js';
 
 const getVentasCatalogCacheTtlMs = () => {
   const rawValue = process.env.VENTAS_CATALOG_CACHE_TTL_MS;
@@ -23,6 +24,7 @@ const ventasStaticComplementCache = new Map();
 
 export const clearVentasComplementCatalogCache = () => {
   ventasStaticComplementCache.clear();
+  clearVentasCajaBootstrapCache();
 };
 
 export const buildVentasStaticCacheKey = (prefix, ids = []) => {
