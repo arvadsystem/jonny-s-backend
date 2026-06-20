@@ -1646,10 +1646,19 @@ router.delete('/menus/:id_menu', checkPermission(MENU_PUBLICACION_SAVE_PERMISSIO
 
 // Programa un menu por sucursal para una fecha/hora especifica.
 router.post('/programacion', checkPermission(MENU_PUBLICACION_SAVE_PERMISSIONS), async (req, res) => {
-  const client = await pool.connect();
+  let client = null;
+  let clientReleased = false;
   const correlationId = randomUUID();
   let phase = 'VALIDATION';
   let transactionStarted = false;
+
+  const releaseClient = () => {
+    if (client && !clientReleased) {
+      client.release();
+      clientReleased = true;
+    }
+  };
+
   try {
     const idSucursal = toPositiveInt(req.body?.id_sucursal);
     const idMenu = toPositiveInt(req.body?.id_menu);
@@ -1830,6 +1839,7 @@ router.post('/programacion', checkPermission(MENU_PUBLICACION_SAVE_PERMISSIONS),
     const estadoInicial = true;
 
     phase = 'BEGIN';
+    client = await pool.connect();
     await client.query('BEGIN');
     transactionStarted = true;
 
@@ -2091,6 +2101,7 @@ router.post('/programacion', checkPermission(MENU_PUBLICACION_SAVE_PERMISSIONS),
     phase = 'COMMIT';
     await client.query('COMMIT');
     transactionStarted = false;
+    releaseClient();
 
     const activeMenu = await getActiveMenuByBranch(idSucursal);
     const sharedMenuImpact = await resolveSharedMenuImpact({
@@ -2134,8 +2145,9 @@ router.post('/programacion', checkPermission(MENU_PUBLICACION_SAVE_PERMISSIONS),
       correlationId
     });
   } catch (error) {
-    if (transactionStarted) {
+    if (transactionStarted && client) {
       await client.query('ROLLBACK').catch(() => {});
+      transactionStarted = false;
     }
     const safeCode = String(error?.code || 'MENU_PROGRAMMING_FAILED');
     const safePhase = String(error?.phase || phase || 'UNKNOWN');
@@ -2161,7 +2173,7 @@ router.post('/programacion', checkPermission(MENU_PUBLICACION_SAVE_PERMISSIONS),
       correlationId
     });
   } finally {
-    client.release();
+    releaseClient();
   }
 });
 

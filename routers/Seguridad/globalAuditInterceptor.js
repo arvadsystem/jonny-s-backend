@@ -210,6 +210,11 @@ const inferContext = (req) => {
   };
 };
 
+const shouldSkipNativeAuditModule = (req) => {
+  const context = inferContext(req);
+  return MODULES_WITH_NATIVE_AUDIT.has(context.modulo);
+};
+
 const searchIdInObject = (obj) => {
   if (!obj || typeof obj !== 'object') return null;
 
@@ -647,6 +652,8 @@ export const globalAuditMiddleware = async (req, res, next) => {
   req.__globalAuditHookAttached = true;
 
   if (!shouldAudit(req)) return next();
+  if (shouldSkipNativeAuditModule(req)) return next();
+
   attachResponsePayloadCapture(res);
 
   try {

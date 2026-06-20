@@ -13,6 +13,7 @@
     "qa:salsas-cocina": "node scripts/qa-salsas-cocina-contract.js",
     "qa:salsas-inventory": "node scripts/qa-salsas-inventory-trigger.js",
     "qa:salsas-publicacion-sucursal": "node scripts/qa-salsas-publicacion-sucursal.js",
+    "audit:db-access": "node scripts/audit-db-access.cjs",
     "qa:ventas-caja-bootstrap": "node scripts/qa-ventas-caja-bootstrap.js",
     "rbac:personas:dry-run": "node scripts/sync-personas-rbac.js",
     "rbac:personas:sync": "node scripts/sync-personas-rbac.js --apply",
