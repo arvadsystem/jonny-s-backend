@@ -20,6 +20,11 @@ import {
   activarRangoCaiSucursal,
   desactivarRangoCaiSucursal
 } from '../services/facturacionCaiSucursalService.js';
+import {
+  ImpresorasConfigSucursalService,
+  obtenerConfiguracionImpresorasPorSucursal,
+  actualizarConfiguracionImpresorasPorSucursal
+} from '../services/impresorasConfigSucursalService.js';
 
 const router = express.Router();
 
@@ -509,6 +514,76 @@ router.get(
       return res.status(500).json({
         success: false,
         message: 'No fue posible procesar la configuración de facturación.'
+      });
+    }
+  }
+);
+
+router.get(
+  '/sucursales/:idSucursal/impresoras-config',
+  checkPermission(SUCURSALES_FACTURACION_VIEW_PERMISSIONS),
+  async (req, res) => {
+    try {
+      const data = await obtenerConfiguracionImpresorasPorSucursal(req.params?.idSucursal);
+      return res.status(200).json({ success: true, data });
+    } catch (err) {
+      if (err instanceof ImpresorasConfigSucursalService.ServiceError) {
+        if (err.status === 400) {
+          return res.status(400).json({
+            success: false,
+            message: 'Datos invalidos para la configuracion de impresoras.',
+            errors: Array.isArray(err.details) ? err.details : []
+          });
+        }
+        if (err.status === 404) {
+          return res.status(404).json({ success: false, message: 'La sucursal indicada no existe.' });
+        }
+        return res.status(err.status || 500).json({
+          success: false,
+          message: 'No fue posible procesar la configuracion de impresoras.'
+        });
+      }
+      console.error('[sucursales] impresoras-config get error:', err?.message || err);
+      return res.status(500).json({
+        success: false,
+        message: 'No fue posible procesar la configuracion de impresoras.'
+      });
+    }
+  }
+);
+
+router.put(
+  '/sucursales/:idSucursal/impresoras-config',
+  checkPermission(SUCURSALES_FACTURACION_EDIT_PERMISSIONS),
+  async (req, res) => {
+    try {
+      const data = await actualizarConfiguracionImpresorasPorSucursal(req.params?.idSucursal, req.body || {});
+      return res.status(200).json({
+        success: true,
+        message: 'Configuracion de impresoras actualizada correctamente.',
+        data
+      });
+    } catch (err) {
+      if (err instanceof ImpresorasConfigSucursalService.ServiceError) {
+        if (err.status === 400) {
+          return res.status(400).json({
+            success: false,
+            message: 'Datos invalidos para la configuracion de impresoras.',
+            errors: Array.isArray(err.details) ? err.details : []
+          });
+        }
+        if (err.status === 404) {
+          return res.status(404).json({ success: false, message: 'La sucursal indicada no existe.' });
+        }
+        return res.status(err.status || 500).json({
+          success: false,
+          message: 'No fue posible procesar la configuracion de impresoras.'
+        });
+      }
+      console.error('[sucursales] impresoras-config put error:', err?.message || err);
+      return res.status(500).json({
+        success: false,
+        message: 'No fue posible procesar la configuracion de impresoras.'
       });
     }
   }
