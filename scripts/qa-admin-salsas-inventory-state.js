@@ -11,6 +11,10 @@ const baseSalsa = {
   insumo_nombre: 'Salsa buffalo',
   insumo_estado: true,
   id_unidad_base: 7,
+  id_insumo_maestro: 44,
+  insumo_maestro_nombre: 'Salsa buffalo maestro',
+  insumo_maestro_estado: true,
+  id_unidad_base_maestro: 7,
   unidad_consumo_simbolo: 'oz',
   conversiones_aplicables: 0
 };
@@ -31,6 +35,20 @@ const assertBlocked = (label, row) => {
   assert.equal(state.inventario_estado, 'LISTA', 'mapeo VALIDADO debe quedar LISTA');
   assert.equal(state.inventario_configurado, true, 'mapeo VALIDADO debe quedar configurado');
   assert.equal(state.puede_asignarse_receta, true, 'mapeo VALIDADO debe poder asignarse');
+  assert.equal(state.id_insumo_resuelto, 44, 'mapeo VALIDADO debe resolver al insumo maestro');
+}
+
+{
+  const state = buildInventoryState({
+    ...baseSalsa,
+    id_unidad_consumo: 7,
+    id_unidad_base_maestro: 9,
+    mapping_count: 1,
+    estado_mapeo_maestro: 'VALIDADO',
+    conversiones_aplicables: 1
+  });
+  assert.equal(state.inventario_estado, 'LISTA', 'legacy VALIDADO debe validar conversion contra unidad base maestra');
+  assert.equal(state.id_insumo_resuelto, 44, 'legacy VALIDADO con unidad distinta debe resolver al maestro');
 }
 
 assertBlocked('mapeo REQUIERE_REVISION', {

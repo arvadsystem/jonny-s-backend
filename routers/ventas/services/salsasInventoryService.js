@@ -4,6 +4,7 @@ import {
   toPositiveInventoryInt,
   toPositiveInventoryNumber
 } from './extrasInventoryService.js';
+import { classifySalsaMapping } from './salsasInventoryPolicyService.js';
 
 const SALSA_MESSAGES = Object.freeze({
   SALSA_INSUMO_NO_CONFIGURADO: 'Esta salsa requiere configurar su inventario.',
@@ -28,15 +29,6 @@ const markUnavailable = (result, code, { preserveInventoryConfiguration = false 
   codigo_no_disponible: code,
   motivo_no_disponible: SALSA_MESSAGES[code] || 'Esta salsa no esta disponible.'
 });
-
-const mappingFailureCode = (status) => {
-  if (status === 'REQUIERE_REVISION') return 'SALSA_INSUMO_MAPEO_REQUIERE_REVISION';
-  if (status === 'AMBIGUO') return 'SALSA_INSUMO_MAPEO_AMBIGUO';
-  if (status === 'PENDIENTE') return 'SALSA_INSUMO_MAPEO_PENDIENTE';
-  return 'SALSA_INSUMO_MAPEO_REQUIERE_REVISION';
-};
-
-const normalizeMappingStatus = (value) => String(value || '').trim().toUpperCase();
 
 const buildBaseResult = (salsa, { idSucursal, useMasterCatalog }) => ({
   ...salsa,
@@ -207,42 +199,31 @@ export const resolveSalsasInventory = async ({
     const configuredId = result.id_insumo_configurado;
     if (!configuredId) return markUnavailable(result, 'SALSA_INSUMO_NO_CONFIGURADO');
 
-    const directInsumo = insumosById.get(configuredId);
-    const directAssignments = assignmentsByInsumo.get(configuredId) || [];
-    if (directInsumo?.estado === true && directAssignments.length === 1) {
-      resolvedMasterIds.add(configuredId);
-      return { result, masterId: configuredId, legacyId: null, insumo: directInsumo, assignment: directAssignments[0] };
-    }
-    if (directInsumo?.estado === true && directAssignments.length > 1) {
-      return markUnavailable(result, 'SALSA_INSUMO_ASIGNACION_AMBIGUA');
-    }
-    if (!useMasterCatalog) {
-      if (!directInsumo) return markUnavailable(result, 'SALSA_INSUMO_NO_ENCONTRADO');
-      if (directInsumo.estado !== true) return markUnavailable(result, 'SALSA_INSUMO_INACTIVO');
-      return markUnavailable(result, 'SALSA_INSUMO_SIN_ASIGNACION_SUCURSAL');
-    }
-
     const mappings = mappingsByLegacyId.get(configuredId) || [];
-    if (mappings.length > 1) return markUnavailable(result, 'SALSA_INSUMO_MAPEO_AMBIGUO');
-    if (mappings.length === 0) {
-      if (directInsumo && directInsumo.estado !== true) return markUnavailable(result, 'SALSA_INSUMO_INACTIVO');
-      if (directInsumo) return markUnavailable(result, 'SALSA_INSUMO_SIN_ASIGNACION_SUCURSAL');
-      return markUnavailable(result, 'SALSA_INSUMO_NO_ENCONTRADO');
-    }
+    const structural = classifySalsaMapping({
+      configuredId,
+      mappingCount: mappings.length,
+      mappingStatus: mappings[0]?.estado_migracion,
+      masterId: mappings[0]?.id_insumo_maestro,
+      masterCatalogEnabled: useMasterCatalog
+    });
+    if (!structural.ok) return markUnavailable(result, structural.code);
 
-    const mapping = mappings[0];
-    const mappingStatus = normalizeMappingStatus(mapping.estado_migracion);
-    if (mappingStatus !== 'VALIDADO') return markUnavailable(result, mappingFailureCode(mappingStatus));
-
-    const masterId = toPositiveInventoryInt(mapping.id_insumo_maestro);
-    const master = masterId ? insumosById.get(masterId) : null;
-    if (!master) return markUnavailable(result, 'SALSA_INSUMO_NO_ENCONTRADO');
-    if (master.estado !== true) return markUnavailable(result, 'SALSA_INSUMO_INACTIVO');
-    const assignments = assignmentsByInsumo.get(masterId) || [];
+    const effectiveId = toPositiveInventoryInt(structural.effectiveInsumoId);
+    const effectiveInsumo = effectiveId ? insumosById.get(effectiveId) : null;
+    if (!effectiveInsumo) return markUnavailable(result, 'SALSA_INSUMO_NO_ENCONTRADO');
+    if (effectiveInsumo.estado !== true) return markUnavailable(result, 'SALSA_INSUMO_INACTIVO');
+    const assignments = assignmentsByInsumo.get(effectiveId) || [];
     if (assignments.length === 0) return markUnavailable(result, 'SALSA_INSUMO_SIN_ASIGNACION_SUCURSAL');
     if (assignments.length > 1) return markUnavailable(result, 'SALSA_INSUMO_ASIGNACION_AMBIGUA');
-    resolvedMasterIds.add(masterId);
-    return { result, masterId, legacyId: configuredId, insumo: master, assignment: assignments[0] };
+    resolvedMasterIds.add(effectiveId);
+    return {
+      result,
+      masterId: effectiveId,
+      legacyId: structural.legacyInsumoId,
+      insumo: effectiveInsumo,
+      assignment: assignments[0]
+    };
   });
 
   const unitIds = new Set();

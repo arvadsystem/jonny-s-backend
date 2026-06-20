@@ -312,15 +312,26 @@ const validateSalsaInventoryConfig = async (data) => {
         COALESCE(i.estado, true) AS estado,
         i.id_unidad_medida,
         map.mapping_count,
-        map.estado_mapeo_maestro
+        map.id_insumo_maestro,
+        map.estado_mapeo_maestro,
+        i_master.nombre_insumo AS insumo_maestro_nombre,
+        COALESCE(i_master.estado, true) AS insumo_maestro_estado,
+        i_master.id_unidad_medida AS id_unidad_base_maestro
       FROM public.insumos i
       LEFT JOIN LATERAL (
         SELECT
           COUNT(*)::int AS mapping_count,
+          MIN(imm.id_insumo_maestro)::int AS id_insumo_maestro,
           MIN(imm.estado_migracion) AS estado_mapeo_maestro
         FROM public.insumos_mapeo_maestro imm
         WHERE imm.id_insumo_legacy = i.id_insumo
       ) map ON true
+      LEFT JOIN public.insumos i_master
+        ON i_master.id_insumo = CASE
+          WHEN map.mapping_count = 1 AND UPPER(TRIM(COALESCE(map.estado_mapeo_maestro, ''))) = 'VALIDADO'
+            THEN map.id_insumo_maestro
+          ELSE NULL
+        END
       WHERE i.id_insumo = $1
       LIMIT 1
     `,
@@ -337,7 +348,12 @@ const validateSalsaInventoryConfig = async (data) => {
   if (!selectable.selectable) {
     return { ok: false, status: 409, message: selectable.reason || 'El insumo seleccionado no puede usarse en salsas.' };
   }
-  if (!toPositiveInt(insumo.id_unidad_medida)) {
+  const idInsumoEfectivo = toPositiveInt(insumo.id_insumo_maestro) || toPositiveInt(insumo.id_insumo);
+  const idUnidadBaseEfectiva = toPositiveInt(insumo.id_unidad_base_maestro) || toPositiveInt(insumo.id_unidad_medida);
+  if (toPositiveInt(insumo.id_insumo_maestro) && insumo.insumo_maestro_estado !== true) {
+    return { ok: false, status: 409, message: 'El insumo maestro resuelto no existe o esta inactivo.' };
+  }
+  if (!idUnidadBaseEfectiva) {
     return { ok: false, status: 409, message: 'El insumo seleccionado no tiene unidad base configurada.' };
   }
 
@@ -349,7 +365,7 @@ const validateSalsaInventoryConfig = async (data) => {
     return { ok: false, status: 400, message: 'La unidad de consumo no existe.' };
   }
 
-  const idUnidadBase = toPositiveInt(insumo.id_unidad_medida);
+  const idUnidadBase = idUnidadBaseEfectiva;
   const idUnidadConsumo = toPositiveInt(data.id_unidad_consumo);
   if (idUnidadBase === idUnidadConsumo) {
     return { ok: true };
@@ -368,7 +384,7 @@ const validateSalsaInventoryConfig = async (data) => {
         AND cantidad_base > 0
       ORDER BY id_presentacion
     `,
-    [data.id_insumo, idUnidadConsumo, idUnidadBase]
+    [idInsumoEfectivo, idUnidadConsumo, idUnidadBase]
   );
   if (conversionResult.rowCount === 0) {
     return {
@@ -547,12 +563,18 @@ router.get('/', checkPermission(MENU_SALSAS_VIEW_PERMISSIONS), async (req, res) 
         FROM public.insumos_mapeo_maestro imm
         WHERE imm.id_insumo_legacy = i.id_insumo
       ) map ON true
+      LEFT JOIN public.insumos i_master
+        ON i_master.id_insumo = CASE
+          WHEN map.mapping_count = 1 AND UPPER(TRIM(COALESCE(map.estado_mapeo_maestro, ''))) = 'VALIDADO'
+            THEN map.id_insumo_maestro
+          ELSE NULL
+        END
       LEFT JOIN LATERAL (
         SELECT COUNT(*)::int AS conversiones_aplicables
         FROM public.insumo_presentaciones ip
-        WHERE ip.id_insumo = i.id_insumo
+        WHERE ip.id_insumo = COALESCE(i_master.id_insumo, i.id_insumo)
           AND ip.id_unidad_presentacion = ${salsasTieneUnidadConsumo ? 's.id_unidad_consumo' : 'NULL'}
-          AND ip.id_unidad_base = i.id_unidad_medida
+          AND ip.id_unidad_base = COALESCE(i_master.id_unidad_medida, i.id_unidad_medida)
           AND ip.estado IS TRUE
           AND ip.uso_receta IS TRUE
           AND ip.cantidad_presentacion > 0
@@ -560,7 +582,33 @@ router.get('/', checkPermission(MENU_SALSAS_VIEW_PERMISSIONS), async (req, res) 
       ) conv ON true
     `;
 
-    const [countResult, result] = await Promise.all([
+    const selectSalsaInventoryFields = `
+      SELECT
+        s.id_salsa,
+        s.nombre,
+        ${salsasTieneNivelPicante ? 'COALESCE(s.nivel_picante, 0)' : '0'} AS nivel_picante,
+        ${salsasTieneOrden ? 'COALESCE(s.orden, 0)' : '0'} AS orden,
+        ${salsasTieneEstado ? 'COALESCE(s.estado, true)' : 'true'} AS estado,
+        ${salsasTieneInsumo ? 's.id_insumo' : 'NULL::int'} AS id_insumo,
+        ${salsasTieneCantidadPorcion ? 'COALESCE(s.cantidad_porcion, 2)::numeric' : '2::numeric'} AS cantidad_porcion,
+        ${salsasTieneUnidadConsumo ? 's.id_unidad_consumo' : 'NULL::int'} AS id_unidad_consumo,
+        i.nombre_insumo AS insumo_nombre,
+        COALESCE(i.estado, true) AS insumo_estado,
+        i.id_unidad_medida AS id_unidad_base,
+        um_base.nombre AS unidad_base_nombre,
+        um_base.simbolo AS unidad_base_simbolo,
+        um_consumo.nombre AS unidad_consumo_nombre,
+        um_consumo.simbolo AS unidad_consumo_simbolo,
+        map.mapping_count,
+        map.id_insumo_maestro,
+        map.estado_mapeo_maestro,
+        i_master.nombre_insumo AS insumo_maestro_nombre,
+        COALESCE(i_master.estado, true) AS insumo_maestro_estado,
+        i_master.id_unidad_medida AS id_unidad_base_maestro,
+        COALESCE(conv.conversiones_aplicables, 0)::int AS conversiones_aplicables
+    `;
+
+    const [countResult, result, summaryResult, nextOrderResult] = await Promise.all([
       pool.query(
         `
           SELECT COUNT(*)::int AS total
@@ -572,26 +620,7 @@ router.get('/', checkPermission(MENU_SALSAS_VIEW_PERMISSIONS), async (req, res) 
       ),
       pool.query(
       `
-        SELECT
-          s.id_salsa,
-          s.nombre,
-          ${salsasTieneNivelPicante ? 'COALESCE(s.nivel_picante, 0)' : '0'} AS nivel_picante,
-          ${salsasTieneOrden ? 'COALESCE(s.orden, 0)' : '0'} AS orden,
-          ${salsasTieneEstado ? 'COALESCE(s.estado, true)' : 'true'} AS estado,
-          ${salsasTieneInsumo ? 's.id_insumo' : 'NULL::int'} AS id_insumo,
-          ${salsasTieneCantidadPorcion ? 'COALESCE(s.cantidad_porcion, 2)::numeric' : '2::numeric'} AS cantidad_porcion,
-          ${salsasTieneUnidadConsumo ? 's.id_unidad_consumo' : 'NULL::int'} AS id_unidad_consumo,
-          i.nombre_insumo AS insumo_nombre,
-          COALESCE(i.estado, true) AS insumo_estado,
-          i.id_unidad_medida AS id_unidad_base,
-          um_base.nombre AS unidad_base_nombre,
-          um_base.simbolo AS unidad_base_simbolo,
-          um_consumo.nombre AS unidad_consumo_nombre,
-          um_consumo.simbolo AS unidad_consumo_simbolo,
-          map.mapping_count,
-          map.id_insumo_maestro,
-          map.estado_mapeo_maestro,
-          COALESCE(conv.conversiones_aplicables, 0)::int AS conversiones_aplicables
+        ${selectSalsaInventoryFields}
         FROM salsas s
         ${baseJoins}
         ${whereClause}
@@ -600,11 +629,36 @@ router.get('/', checkPermission(MENU_SALSAS_VIEW_PERMISSIONS), async (req, res) 
         OFFSET ${offsetParam};
       `,
         params
+      ),
+      pool.query(
+        `
+          ${selectSalsaInventoryFields}
+          FROM salsas s
+          ${baseJoins}
+          ${whereClause};
+        `,
+        countParams
+      ),
+      pool.query(
+        `
+          SELECT ${salsasTieneOrden ? 'COALESCE(MAX(s.orden), 0) + 1' : '1'} AS next_order
+          FROM salsas s;
+        `
       )
     ]);
 
     const total = Number(countResult.rows?.[0]?.total || 0);
     const totalPages = Math.max(1, Math.ceil(total / limit));
+    const summaryRows = (summaryResult.rows || []).map(attachSalsaInventoryState);
+    const activeSummaryRows = summaryRows.filter((row) => row.estado === undefined || row.estado === true);
+    const listas = activeSummaryRows.filter((row) => row.inventario_estado === 'LISTA').length;
+    const pendientes = activeSummaryRows.filter((row) => row.inventario_estado === 'PENDIENTE' || !row.inventario_estado).length;
+    const summary = {
+      activas: activeSummaryRows.length,
+      listas,
+      pendientes,
+      errores: Math.max(0, activeSummaryRows.length - listas - pendientes)
+    };
     return res.status(200).json({
       items: (result.rows || []).map(attachSalsaInventoryState),
       pagination: {
@@ -612,7 +666,9 @@ router.get('/', checkPermission(MENU_SALSAS_VIEW_PERMISSIONS), async (req, res) 
         limit,
         total,
         totalPages
-      }
+      },
+      summary,
+      next_order: Math.max(1, Number(nextOrderResult.rows?.[0]?.next_order || 1))
     });
   } catch (err) {
     console.error('Error al listar salsas admin:', err.message);
@@ -805,6 +861,9 @@ router.get('/recetas/:id_receta/config', checkPermission(MENU_SALSAS_VIEW_PERMIS
             map.mapping_count,
             map.id_insumo_maestro,
             map.estado_mapeo_maestro,
+            i_master.nombre_insumo AS insumo_maestro_nombre,
+            COALESCE(i_master.estado, true) AS insumo_maestro_estado,
+            i_master.id_unidad_medida AS id_unidad_base_maestro,
             COALESCE(conv.conversiones_aplicables, 0)::int AS conversiones_aplicables,
             ${salsasTieneOrden ? 'COALESCE(s.orden, 2147483647)' : '0'} AS sort_orden
           FROM salsas s
@@ -822,12 +881,18 @@ router.get('/recetas/:id_receta/config', checkPermission(MENU_SALSAS_VIEW_PERMIS
             FROM public.insumos_mapeo_maestro imm
             WHERE imm.id_insumo_legacy = i.id_insumo
           ) map ON true
+          LEFT JOIN public.insumos i_master
+            ON i_master.id_insumo = CASE
+              WHEN map.mapping_count = 1 AND UPPER(TRIM(COALESCE(map.estado_mapeo_maestro, ''))) = 'VALIDADO'
+                THEN map.id_insumo_maestro
+              ELSE NULL
+            END
           LEFT JOIN LATERAL (
             SELECT COUNT(*)::int AS conversiones_aplicables
             FROM public.insumo_presentaciones ip
-            WHERE ip.id_insumo = i.id_insumo
+            WHERE ip.id_insumo = COALESCE(i_master.id_insumo, i.id_insumo)
               AND ip.id_unidad_presentacion = ${salsasTieneUnidadConsumo ? 's.id_unidad_consumo' : 'NULL'}
-              AND ip.id_unidad_base = i.id_unidad_medida
+              AND ip.id_unidad_base = COALESCE(i_master.id_unidad_medida, i.id_unidad_medida)
               AND ip.estado IS TRUE
               AND ip.uso_receta IS TRUE
               AND ip.cantidad_presentacion > 0
@@ -904,6 +969,8 @@ router.get('/recetas/:id_receta/config', checkPermission(MENU_SALSAS_VIEW_PERMIS
 });
 
 router.post('/', checkPermission(MENU_SALSAS_CREATE_PERMISSIONS), async (req, res) => {
+  let client = null;
+  let transactionStarted = false;
   try {
     const actorUserId = resolveActorUserId(req);
     if (!actorUserId) {
@@ -956,13 +1023,23 @@ router.post('/', checkPermission(MENU_SALSAS_CREATE_PERMISSIONS), async (req, re
     };
 
     if (salsasTieneNivelPicante) insertData.nivel_picante = data.nivel_picante ?? 0;
-    if (salsasTieneOrden) insertData.orden = data.orden ?? 0;
+    if (salsasTieneOrden && data.orden !== null) insertData.orden = data.orden;
     if (salsasTieneEstado) insertData.estado = data.estado === null ? true : data.estado;
     if (idUsuarioMeta.exists && resolvedUserId) insertData.id_usuario = resolvedUserId;
 
     const rawInsert = {};
     if (salsasTieneFechaCreacion) rawInsert.fecha_creacion = "timezone('America/Tegucigalpa', now())";
     if (salsasTieneFechaModificacion) rawInsert.fecha_modificacion = "timezone('America/Tegucigalpa', now())";
+
+    client = await pool.connect();
+    await client.query('BEGIN');
+    transactionStarted = true;
+
+    if (salsasTieneOrden && data.orden === null) {
+      await client.query("SELECT pg_advisory_xact_lock(hashtext('admin_salsas_orden'))");
+      const nextOrderResult = await client.query('SELECT COALESCE(MAX(orden), 0) + 1 AS next_order FROM salsas;');
+      insertData.orden = Math.max(1, Number(nextOrderResult.rows?.[0]?.next_order || 1));
+    }
 
     const insertStatement = buildInsertStatement({
       tableName: 'salsas',
@@ -971,7 +1048,9 @@ router.post('/', checkPermission(MENU_SALSAS_CREATE_PERMISSIONS), async (req, re
       returning: 'id_salsa'
     });
 
-    const createdResult = await pool.query(insertStatement.text, insertStatement.params);
+    const createdResult = await client.query(insertStatement.text, insertStatement.params);
+    await client.query('COMMIT');
+    transactionStarted = false;
     invalidateVentasComplementCatalogCache('crear salsa');
     return res.status(201).json({
       error: false,
@@ -981,8 +1060,13 @@ router.post('/', checkPermission(MENU_SALSAS_CREATE_PERMISSIONS), async (req, re
       }
     });
   } catch (err) {
+    if (transactionStarted && client) {
+      await client.query('ROLLBACK');
+    }
     console.error('Error al crear salsa admin:', err.message);
     return res.status(500).json({ error: true, message: getSafeServerErrorMessage(err) });
+  } finally {
+    if (client) client.release();
   }
 });
 
@@ -1284,6 +1368,9 @@ router.put('/recetas/:id_receta/config', checkPermission(MENU_SALSAS_EDIT_PERMIS
             map.mapping_count,
             map.id_insumo_maestro,
             map.estado_mapeo_maestro,
+            i_master.nombre_insumo AS insumo_maestro_nombre,
+            COALESCE(i_master.estado, true) AS insumo_maestro_estado,
+            i_master.id_unidad_medida AS id_unidad_base_maestro,
             COALESCE(conv.conversiones_aplicables, 0)::int AS conversiones_aplicables
           FROM salsas s
           LEFT JOIN public.insumos i
@@ -1298,12 +1385,18 @@ router.put('/recetas/:id_receta/config', checkPermission(MENU_SALSAS_EDIT_PERMIS
             FROM public.insumos_mapeo_maestro imm
             WHERE imm.id_insumo_legacy = i.id_insumo
           ) map ON true
+          LEFT JOIN public.insumos i_master
+            ON i_master.id_insumo = CASE
+              WHEN map.mapping_count = 1 AND UPPER(TRIM(COALESCE(map.estado_mapeo_maestro, ''))) = 'VALIDADO'
+                THEN map.id_insumo_maestro
+              ELSE NULL
+            END
           LEFT JOIN LATERAL (
             SELECT COUNT(*)::int AS conversiones_aplicables
             FROM public.insumo_presentaciones ip
-            WHERE ip.id_insumo = i.id_insumo
+            WHERE ip.id_insumo = COALESCE(i_master.id_insumo, i.id_insumo)
               AND ip.id_unidad_presentacion = s.id_unidad_consumo
-              AND ip.id_unidad_base = i.id_unidad_medida
+              AND ip.id_unidad_base = COALESCE(i_master.id_unidad_medida, i.id_unidad_medida)
               AND ip.estado IS TRUE
               AND ip.uso_receta IS TRUE
               AND ip.cantidad_presentacion > 0

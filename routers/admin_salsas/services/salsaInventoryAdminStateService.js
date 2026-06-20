@@ -1,3 +1,8 @@
+import {
+  resolveSalsaStructuralInventory,
+  salsaMappingFailureCode
+} from '../../ventas/services/salsasInventoryPolicyService.js';
+
 const toPositiveInt = (value) => {
   const parsed = Number(value);
   return Number.isInteger(parsed) && parsed > 0 ? parsed : null;
@@ -27,32 +32,35 @@ export const getInventoryStateLabel = (state) => {
   return 'Sin configurar';
 };
 
-const getMappingBlockReason = (row = {}) => {
-  const mappingCount = Number(row.mapping_count || 0);
-  const mappingStatus = normalizeAdminStatus(row.estado_mapeo_maestro);
-  if (mappingCount > 1) {
+const getStructuralBlockReason = (code) => {
+  if (code === 'SALSA_INSUMO_MAPEO_AMBIGUO') {
     return 'El insumo tiene mas de una relacion de catalogo y requiere revision.';
   }
-  if (mappingCount === 1 && mappingStatus !== 'VALIDADO') {
+  if (code === 'SALSA_INSUMO_MAPEO_PENDIENTE' || code === 'SALSA_INSUMO_MAPEO_REQUIERE_REVISION') {
     return 'El insumo requiere revision antes de usarse en salsas.';
+  }
+  if (code === 'SALSA_INSUMO_NO_ENCONTRADO') {
+    return 'El insumo maestro configurado no existe.';
   }
   return '';
 };
 
-export const buildInventoryState = (row = {}) => {
+export const buildInventoryState = (row = {}, { masterCatalogEnabled = true } = {}) => {
   const active = row.estado === undefined ? true : row.estado === true;
   const idInsumo = toPositiveInt(row.id_insumo);
   const idUnidadConsumo = toPositiveInt(row.id_unidad_consumo);
   const cantidadPorcion = toPositiveNumberOrNull(row.cantidad_porcion);
-  const idUnidadBase = toPositiveInt(row.id_unidad_base);
-  const insumoActivo = row.insumo_estado === undefined ? true : row.insumo_estado === true;
+  const structural = resolveSalsaStructuralInventory(row, { masterCatalogEnabled });
+  const effectiveInsumo = structural.effectiveInsumo || {};
+  const idUnidadBase = toPositiveInt(structural.effectiveUnitId);
+  const insumoActivo = effectiveInsumo.estado === undefined ? true : effectiveInsumo.estado === true;
   const conversiones = Number(row.conversiones_aplicables || 0);
-  const mappingBlockReason = getMappingBlockReason(row);
+  const structuralBlockReason = getStructuralBlockReason(structural.code);
   const unidadConsumo = getUnitDisplay({
     nombre: row.unidad_consumo_nombre,
     simbolo: row.unidad_consumo_simbolo
   });
-  const insumoNombre = normalizeText(row.insumo_nombre || (idInsumo ? `Insumo #${idInsumo}` : 'insumo'));
+  const insumoNombre = normalizeText(effectiveInsumo.nombre_insumo || (structural.effectiveInsumoId ? `Insumo #${structural.effectiveInsumoId}` : 'insumo'));
 
   if (!active) {
     return {
@@ -81,20 +89,20 @@ export const buildInventoryState = (row = {}) => {
       puede_asignarse_receta: false
     };
   }
-  if (!row.insumo_nombre || insumoActivo !== true) {
+  if (structuralBlockReason) {
     return {
       inventario_estado: 'INSUMO_INVALIDO',
       inventario_configurado: false,
-      inventario_mensaje: 'El insumo configurado no existe o esta inactivo.',
+      inventario_mensaje: structuralBlockReason,
       resumen_consumo: 'Revisar insumo',
       puede_asignarse_receta: false
     };
   }
-  if (mappingBlockReason) {
+  if (!effectiveInsumo.id_insumo || insumoActivo !== true) {
     return {
       inventario_estado: 'INSUMO_INVALIDO',
       inventario_configurado: false,
-      inventario_mensaje: mappingBlockReason,
+      inventario_mensaje: 'El insumo configurado no existe o esta inactivo.',
       resumen_consumo: 'Revisar insumo',
       puede_asignarse_receta: false
     };
@@ -133,7 +141,10 @@ export const buildInventoryState = (row = {}) => {
     inventario_mensaje: 'Lista para descontar inventario.',
     resumen_consumo: `${Number(cantidadPorcion)} ${unidadConsumo} por seleccion`,
     puede_asignarse_receta: true,
-    insumo_consumo_nombre: insumoNombre
+    insumo_consumo_nombre: insumoNombre,
+    id_insumo_resuelto: structural.effectiveInsumoId,
+    id_insumo_legacy: structural.legacyInsumoId,
+    usa_catalogo_maestro: structural.usesMaster
   };
 };
 
@@ -145,7 +156,14 @@ export const attachSalsaInventoryState = (row = {}) => ({
 export const isSelectableInsumoRow = (row = {}) => {
   if (row.estado !== true) return { selectable: false, reason: 'El insumo esta inactivo.' };
   if (!toPositiveInt(row.id_unidad_medida)) return { selectable: false, reason: 'El insumo no tiene unidad base configurada.' };
-  const mappingBlockReason = getMappingBlockReason(row);
-  if (mappingBlockReason) return { selectable: false, reason: mappingBlockReason };
+  const mappingCode = salsaMappingFailureCode(row.estado_mapeo_maestro);
+  const structuralBlockReason = getStructuralBlockReason(
+    Number(row.mapping_count || 0) > 1 ? 'SALSA_INSUMO_MAPEO_AMBIGUO' : (
+      Number(row.mapping_count || 0) === 1 && normalizeAdminStatus(row.estado_mapeo_maestro) !== 'VALIDADO'
+        ? mappingCode
+        : null
+    )
+  );
+  if (structuralBlockReason) return { selectable: false, reason: structuralBlockReason };
   return { selectable: true, reason: '' };
 };
