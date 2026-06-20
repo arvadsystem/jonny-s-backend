@@ -3,6 +3,13 @@ import pool from '../config/db-connection.js';
 import { checkPermission } from '../middleware/checkPermission.js';
 import { clearVentasComplementCatalogCache } from './ventas/services/complementosCatalogService.js';
 import {
+  isCatalogoMaestroViewMissingError,
+  logCatalogoMaestroViewMissing,
+  queryCatalogoMaestroView,
+  sendCatalogoMaestroViewMissingResponse
+} from '../services/catalogoMaestroReadService.js';
+import { buildAdminSalsasInsumosCatalog } from './admin_salsas/services/adminSalsasInsumosCatalogService.js';
+import {
   attachSalsaInventoryState,
   getInventoryStateLabel,
   getUnitDisplay,
@@ -700,38 +707,51 @@ router.get('/catalogos/recetas', checkPermission(MENU_SALSAS_VIEW_PERMISSIONS), 
 
 router.get('/catalogos/insumos', checkPermission(MENU_SALSAS_VIEW_PERMISSIONS), async (req, res) => {
   try {
-    const result = await pool.query(
+    const result = await queryCatalogoMaestroView(
+      pool,
+      'public.vw_insumos_maestros_almacen',
       `
+        WITH mapping_summary AS (
+          SELECT
+            imm.id_insumo_maestro,
+            COUNT(*)::int AS mapping_count,
+            COALESCE(
+              ARRAY_AGG(DISTINCT imm.id_insumo_legacy ORDER BY imm.id_insumo_legacy),
+              ARRAY[]::integer[]
+            ) AS ids_insumo_legacy,
+            COALESCE(
+              ARRAY_AGG(
+                DISTINCT UPPER(TRIM(COALESCE(imm.estado_migracion, 'PENDIENTE')))
+                ORDER BY UPPER(TRIM(COALESCE(imm.estado_migracion, 'PENDIENTE')))
+              ),
+              ARRAY[]::text[]
+            ) AS estados_mapeo_maestro
+          FROM public.insumos_mapeo_maestro imm
+          GROUP BY imm.id_insumo_maestro
+        )
         SELECT
-          i.id_insumo,
-          i.nombre_insumo AS nombre,
-          i.id_unidad_medida,
+          v.id_insumo_maestro AS id_insumo,
+          v.id_insumo_maestro,
+          v.nombre_insumo AS nombre,
+          v.id_almacen,
+          v.id_unidad_medida,
           um.nombre AS unidad_nombre,
           um.simbolo AS unidad_simbolo,
-          ci.id_categoria_insumo,
+          COALESCE(NULLIF(TRIM(um.simbolo), ''), NULLIF(TRIM(um.nombre), ''), 'unidad') AS unidad_etiqueta,
+          v.id_categoria_insumo,
           ci.nombre_categoria AS categoria_nombre,
-          COALESCE(i.estado, true) AS estado,
-          map.mapping_count,
-          map.id_insumo_maestro,
-          map.estado_mapeo_maestro,
-          CASE
-            WHEN map.mapping_count > 0 THEN 'LEGACY'
-            ELSE 'MAESTRO'
-          END AS indicador_maestro_legacy,
+          (v.estado_global IS TRUE AND v.estado_local IS TRUE) AS estado,
+          COALESCE(ms.mapping_count, 0)::int AS mapping_count,
+          COALESCE(ms.ids_insumo_legacy, ARRAY[]::integer[]) AS ids_insumo_legacy,
+          COALESCE(ms.estados_mapeo_maestro, ARRAY[]::text[]) AS estados_mapeo_maestro,
           COALESCE(conv.conversiones, '[]'::jsonb) AS conversiones_disponibles
-        FROM public.insumos i
+        FROM public.vw_insumos_maestros_almacen v
         LEFT JOIN public.unidades_medida um
-          ON um.id_unidad_medida = i.id_unidad_medida
+          ON um.id_unidad_medida = v.id_unidad_medida
         LEFT JOIN public.categorias_insumos ci
-          ON ci.id_categoria_insumo = i.id_categoria_insumo
-        LEFT JOIN LATERAL (
-          SELECT
-            COUNT(*)::int AS mapping_count,
-            MIN(imm.id_insumo_maestro)::int AS id_insumo_maestro,
-            MIN(imm.estado_migracion) AS estado_mapeo_maestro
-          FROM public.insumos_mapeo_maestro imm
-          WHERE imm.id_insumo_legacy = i.id_insumo
-        ) map ON true
+          ON ci.id_categoria_insumo = v.id_categoria_insumo
+        LEFT JOIN mapping_summary ms
+          ON ms.id_insumo_maestro = v.id_insumo_maestro
         LEFT JOIN LATERAL (
           SELECT jsonb_agg(
             jsonb_build_object(
@@ -747,18 +767,20 @@ router.get('/catalogos/insumos', checkPermission(MENU_SALSAS_VIEW_PERMISSIONS), 
           FROM public.insumo_presentaciones ip
           LEFT JOIN public.unidades_medida umc
             ON umc.id_unidad_medida = ip.id_unidad_presentacion
-          WHERE ip.id_insumo = i.id_insumo
+          WHERE ip.id_insumo = v.id_insumo_maestro
             AND ip.estado IS TRUE
             AND ip.uso_receta IS TRUE
             AND ip.cantidad_presentacion > 0
             AND ip.cantidad_base > 0
         ) conv ON true
-        WHERE COALESCE(i.estado, true) = true
+        WHERE v.estado_global IS TRUE
+          AND v.estado_local IS TRUE
         ORDER BY
           CASE WHEN UPPER(TRIM(COALESCE(ci.nombre_categoria, ''))) = 'SALSAS Y ADEREZOS' THEN 0 ELSE 1 END,
           ci.nombre_categoria ASC NULLS LAST,
-          i.nombre_insumo ASC,
-          i.id_insumo ASC;
+          v.nombre_insumo ASC,
+          v.id_insumo_maestro ASC,
+          v.id_almacen ASC;
       `
     );
     const grouped = {
@@ -767,41 +789,10 @@ router.get('/catalogos/insumos', checkPermission(MENU_SALSAS_VIEW_PERMISSIONS), 
       bloqueados: []
     };
 
-    for (const row of result.rows || []) {
-      const selectable = isSelectableInsumoRow(row);
-      const categoria = normalizeText(row.categoria_nombre);
-      const estadoConfiguracion = selectable.selectable ? 'OK' : 'BLOQUEADO';
-      const item = {
-        id_insumo: Number(row.id_insumo),
-        nombre: row.nombre,
-        categoria,
-        id_categoria_insumo: toPositiveInt(row.id_categoria_insumo),
-        id_unidad_medida: toPositiveInt(row.id_unidad_medida),
-        unidad_base: {
-          id_unidad_medida: toPositiveInt(row.id_unidad_medida),
-          nombre: row.unidad_nombre || null,
-          simbolo: row.unidad_simbolo || null,
-          etiqueta: getUnitDisplay({ nombre: row.unidad_nombre, simbolo: row.unidad_simbolo })
-        },
-        seleccionable: selectable.selectable,
-        motivo_bloqueo: selectable.selectable ? null : selectable.reason,
-        mapping_count: Number(row.mapping_count || 0),
-        id_insumo_maestro: toPositiveInt(row.id_insumo_maestro),
-        estado_mapeo_maestro: row.estado_mapeo_maestro || null,
-        indicador_maestro_legacy: row.indicador_maestro_legacy || null,
-        estado_configuracion: estadoConfiguracion,
-        conversiones_disponibles: Array.isArray(row.conversiones_disponibles) ? row.conversiones_disponibles : [],
-        metadata: {
-          mapping_count: Number(row.mapping_count || 0),
-          id_insumo_maestro: toPositiveInt(row.id_insumo_maestro),
-          estado_mapeo_maestro: row.estado_mapeo_maestro || null,
-          indicador_maestro_legacy: row.indicador_maestro_legacy || null,
-          estado_configuracion: estadoConfiguracion
-        }
-      };
-      if (!selectable.selectable) {
+    for (const item of buildAdminSalsasInsumosCatalog(result.rows || [])) {
+      if (!item.seleccionable) {
         grouped.bloqueados.push(item);
-      } else if (normalizeAdminStatus(categoria) === 'SALSAS Y ADEREZOS') {
+      } else if (normalizeAdminStatus(item.categoria) === 'SALSAS Y ADEREZOS') {
         grouped.recomendados.push(item);
       } else {
         grouped.otros_disponibles.push(item);
@@ -810,6 +801,10 @@ router.get('/catalogos/insumos', checkPermission(MENU_SALSAS_VIEW_PERMISSIONS), 
 
     return res.status(200).json(grouped);
   } catch (err) {
+    if (isCatalogoMaestroViewMissingError(err)) {
+      logCatalogoMaestroViewMissing('Catalogo de insumos para salsas', err);
+      return sendCatalogoMaestroViewMissingResponse(res);
+    }
     console.error('Error al listar catalogo de insumos para salsas:', err.message);
     return res.status(500).json({ error: true, message: getSafeServerErrorMessage(err) });
   }
