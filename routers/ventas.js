@@ -62,6 +62,10 @@ import {
   getVentaTicketByIdHandler
 } from './ventas/handlers/ventasReadHandlers.js';
 import {
+  createVentaPrintEventHandler,
+  getVentaKitchenComandaByIdHandler
+} from './ventas/handlers/ventasPrintHandlers.js';
+import {
   buildComplementLineConfig,
   buildComplementSnapshot,
   normalizeCartKey,
@@ -7161,6 +7165,8 @@ router.get('/ventas/pedidos/:id/inventario-alertas', checkPermission(['VENTAS_VE
 
 router.get('/ventas/:id/ticket.pdf', checkPermission(['VENTAS_IMPRIMIR']), getVentaTicketPdfByIdHandler);
 router.get('/ventas/:id/ticket', checkPermission(['VENTAS_IMPRIMIR']), getVentaTicketByIdHandler);
+router.get('/ventas/:id/comanda', checkPermission(['VENTAS_IMPRIMIR']), getVentaKitchenComandaByIdHandler);
+router.post('/ventas/:id/impresiones', checkPermission(['VENTAS_IMPRIMIR']), createVentaPrintEventHandler);
 router.get('/ventas/:id', checkPermission(['VENTAS_VER']), getVentaByIdHandler);
 
 async function listarPedidosPendientesPago(req, res) {
