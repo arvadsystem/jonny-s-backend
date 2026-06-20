@@ -306,7 +306,7 @@ export const listClientesCatalogoHandler = async (req, res) => {
     const directId = parseOptionalPositiveInt(search);
     const searchDigits = search.replace(/\D/g, '');
     const isDirectIdentifier = Boolean(directId || searchDigits.length >= 4);
-    if (!search || (!isDirectIdentifier && search.length < 2)) {
+    if (search && !isDirectIdentifier && search.length < 2) {
       return res.status(200).json([]);
     }
     const parsedLimit = Number.parseInt(String(req.query.limit ?? 20), 10);
@@ -333,7 +333,8 @@ export const listClientesCatalogoHandler = async (req, res) => {
       LEFT JOIN telefonos te ON te.id_telefono = e.id_telefono
       WHERE COALESCE(c.estado, true) = true
         AND (
-          ($2::int IS NOT NULL AND c.id_cliente = $2)
+          $4 = ''
+          OR ($2::int IS NOT NULL AND c.id_cliente = $2)
           OR COALESCE(p.dni, '') ILIKE $1
           OR COALESCE(p.rtn, '') ILIKE $1
           OR COALESCE(e.rtn, '') ILIKE $1
@@ -697,6 +698,46 @@ const mapCajaAvailableSession = (row) => ({
   rol_participacion: row.rol_participacion || null
 });
 
+const mapCajaBootstrapSucursal = (row) => ({
+  id_sucursal: Number(row.id_sucursal),
+  nombre_sucursal: row.nombre_sucursal
+});
+
+const fetchCajaBootstrapSucursalesDisponibles = async ({ scope }) => {
+  if (scope?.isSuperAdmin) {
+    const result = await pool.query(
+      `
+        SELECT s.id_sucursal, s.nombre_sucursal
+        FROM public.sucursales s
+        WHERE COALESCE(s.estado, true) = true
+        ORDER BY s.nombre_sucursal, s.id_sucursal
+      `
+    );
+    return (result.rows || []).map(mapCajaBootstrapSucursal);
+  }
+
+  const allowedIds = coercePositiveIntArray(scope?.allowedSucursalIds);
+  const userSucursalId = parseOptionalPositiveInt(scope?.userSucursalId);
+  const effectiveIds = allowedIds.length > 0
+    ? allowedIds
+    : userSucursalId
+      ? [userSucursalId]
+      : [];
+  if (effectiveIds.length === 0) return [];
+
+  const result = await pool.query(
+    `
+      SELECT s.id_sucursal, s.nombre_sucursal
+      FROM public.sucursales s
+      WHERE s.id_sucursal = ANY($1::int[])
+        AND COALESCE(s.estado, true) = true
+      ORDER BY s.nombre_sucursal, s.id_sucursal
+    `,
+    [effectiveIds]
+  );
+  return (result.rows || []).map(mapCajaBootstrapSucursal);
+};
+
 const fetchCajaBootstrapAvailableSessions = async ({ idUsuario, isSuperAdmin, idSucursal = null }) => {
   const result = await pool.query(
     `
@@ -951,11 +992,14 @@ export const getCajaBootstrapHandler = async (req, res) => {
         || (scope.allowedSucursalIds.length === 1 ? Number(scope.allowedSucursalIds[0]) : null);
     }
     const sessionsStartedAt = performance.now();
-    const sesionesDisponibles = await fetchCajaBootstrapAvailableSessions({
-      idUsuario: scope.idUsuario,
-      isSuperAdmin: scope.isSuperAdmin,
-      idSucursal
-    });
+    const [sesionesDisponibles, sucursalesDisponibles] = await Promise.all([
+      fetchCajaBootstrapAvailableSessions({
+        idUsuario: scope.idUsuario,
+        isSuperAdmin: scope.isSuperAdmin,
+        idSucursal
+      }),
+      fetchCajaBootstrapSucursalesDisponibles({ scope })
+    ]);
     sqlDurationMs += performance.now() - sessionsStartedAt;
     if (!idSucursal && scope.isSuperAdmin) {
       if (sesionesDisponibles.length === 1) {
@@ -968,7 +1012,8 @@ export const getCajaBootstrapHandler = async (req, res) => {
             caja_activa: null,
             sesion_caja: null,
             sesiones_disponibles: sesionesDisponibles,
-            requiere_seleccion_sucursal: sesionesDisponibles.length > 1,
+            sucursales_disponibles: sucursalesDisponibles,
+            requiere_seleccion_sucursal: sucursalesDisponibles.length > 1,
             requiere_sesion_caja: sesionesDisponibles.length === 0,
             departamentos: [],
             departamento_activo: null,
@@ -999,6 +1044,7 @@ export const getCajaBootstrapHandler = async (req, res) => {
           caja_activa: null,
           sesion_caja: null,
           sesiones_disponibles: sesionesDisponibles,
+          sucursales_disponibles: sucursalesDisponibles,
           requiere_seleccion_sucursal: true,
           departamentos: [],
           departamento_activo: null,
@@ -1033,6 +1079,7 @@ export const getCajaBootstrapHandler = async (req, res) => {
           caja_activa: operationalState?.caja_activa || null,
           sesion_caja: null,
           sesiones_disponibles: sesionesDisponibles,
+          sucursales_disponibles: sucursalesDisponibles,
           requiere_sesion_caja: true,
           departamentos: [],
           departamento_activo: null,
@@ -1103,6 +1150,7 @@ export const getCajaBootstrapHandler = async (req, res) => {
         caja_activa: operationalState.caja_activa,
         sesion_caja: operationalState.sesion_caja,
         sesiones_disponibles: sesionesDisponibles,
+        sucursales_disponibles: sucursalesDisponibles,
         requiere_seleccion_sucursal: false,
         requiere_sesion_caja: false
       },

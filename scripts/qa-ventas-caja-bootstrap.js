@@ -34,15 +34,31 @@ assert.match(handlersSource, /cajas_usuarios_autorizados/, 'descubrimiento debe 
 assert.match(handlersSource, /OR \$2::boolean = true/, 'descubrimiento debe permitir superadmin');
 assert.match(
   handlersSource,
-  /if \(!idSucursal && scope\.isSuperAdmin\)[\s\S]*sesionesDisponibles\.length === 1[\s\S]*sesionesDisponibles\.length > 1[\s\S]*departamentos: \[\][\s\S]*recetas: \[\]/,
-  'una sesion debe autoseleccionarse y multiples sesiones deben quedar en modo descubrimiento sin catalogos'
+  /if \(!idSucursal && scope\.isSuperAdmin\)[\s\S]*sesionesDisponibles\.length === 1[\s\S]*sucursalesDisponibles\.length > 1[\s\S]*departamentos: \[\][\s\S]*recetas: \[\]/,
+  'una sesion debe autoseleccionarse y multiples sucursales deben quedar en modo descubrimiento sin catalogos'
 );
 assert.match(handlersSource, /sesiones_disponibles:\s*sesionesDisponibles/, 'el contrato debe exponer sesiones disponibles');
+assert.match(handlersSource, /sucursales_disponibles:\s*sucursalesDisponibles/, 'el contrato debe exponer sucursales seleccionables');
+assert.match(handlersSource, /fetchCajaBootstrapSucursalesDisponibles/, 'bootstrap no debe depender del endpoint generico de sucursales');
 assert.ok(
   handlersSource.indexOf('fetchCajaBootstrapOperationalState') < handlersSource.indexOf('fetchCachedCajaBootstrap(cacheKey'),
   'el estado operativo especifico del usuario debe resolverse fuera del cache compartido'
 );
-assert.match(handlersSource, /if \(!search[^]*return res\.status\(200\)\.json\(\[\]\)/, 'clientes sin busqueda valida deben devolver vacio');
+assert.match(
+  handlersSource,
+  /if \(search && !isDirectIdentifier && search\.length < 2\)[\s\S]*return res\.status\(200\)\.json\(\[\]\)/,
+  'clientes debe bloquear solo busquedas cortas no numericas'
+);
+assert.match(
+  handlersSource,
+  /\$4 = ''[\s\S]*ORDER BY[\s\S]*c\.id_cliente[\s\S]*LIMIT \$7/,
+  'clientes debe permitir carga inicial limitada y ordenada sin busqueda'
+);
+assert.match(
+  handlersSource,
+  /Math\.min\(50,\s*Math\.max\(1,\s*Number\.isInteger\(parsedLimit\) \? parsedLimit : 20\)\)/,
+  'clientes debe conservar limite default 20 y maximo 50'
+);
 assert.match(handlersSource, /Math\.min\(50,/, 'clientes debe limitarse a un maximo de 50');
 assert.doesNotMatch(ventasModuleSources, /new\s+(?:Pool|Client)\s*\(/, 'Ventas no debe crear Pool ni Client');
 assert.match(routerSource, /kind === 'ITEM'/, 'Ventas debe conservar lineas de extras independientes');
