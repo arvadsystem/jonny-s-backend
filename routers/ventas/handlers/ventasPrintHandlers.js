@@ -16,7 +16,7 @@ import { parsePositiveInt } from '../utils/parseUtils.js';
 
 const sendVentasInternalError = (
   res,
-  message = 'No se pudo procesar la solicitud de impresión.'
+  message = 'No se pudo procesar la solicitud de impresion.'
 ) => res.status(500).json({ error: true, message });
 
 const toKitchenExtras = (extras = []) =>
@@ -42,16 +42,24 @@ const toKitchenComplementos = (item = {}) => {
 const buildVentaKitchenPrintPayload = (venta = {}, printerConfig = null) => {
   const cocinaConfig = (Array.isArray(printerConfig?.impresoras) ? printerConfig.impresoras : [])
     .find((item) => String(item?.tipo_impresora || '').trim().toUpperCase() === 'COCINA');
-  const items = (Array.isArray(venta?.items) ? venta.items : []).map((item, index) => ({
-    linea: index + 1,
-    id_detalle: Number(item?.id_detalle || 0) || null,
-    tipo_item: String(item?.tipo_item || 'ITEM').trim().toUpperCase(),
-    cantidad: Number(item?.cantidad ?? 0) || 0,
-    nombre_item: String(item?.nombre_item || item?.nombre_producto || 'Item de cocina').trim(),
-    observacion: String(item?.observacion || '').trim() || null,
-    extras: toKitchenExtras(item?.extras),
-    complementos: toKitchenComplementos(item)
-  }));
+
+  const items = (Array.isArray(venta?.items) ? venta.items : []).map((item, index) => {
+    const isStandaloneExtra = Boolean(
+      item?.es_linea_extra_independiente || item?.origen_snapshot?.es_linea_extra_independiente
+    );
+
+    return {
+      linea: index + 1,
+      id_detalle: Number(item?.id_detalle || 0) || null,
+      tipo_item: String(item?.tipo_item || 'ITEM').trim().toUpperCase(),
+      cantidad: Number(item?.cantidad ?? 0) || 0,
+      nombre_item: String(item?.nombre_item || item?.nombre_producto || 'Item de cocina').trim(),
+      observacion: String(item?.observacion || '').trim() || null,
+      es_linea_extra_independiente: isStandaloneExtra,
+      extras: isStandaloneExtra ? [] : toKitchenExtras(item?.extras),
+      complementos: toKitchenComplementos(item)
+    };
+  });
 
   const totalProductos = items.reduce((sum, item) => sum + Math.max(0, Number(item.cantidad || 0)), 0);
 
@@ -226,6 +234,6 @@ export const createVentaPrintEventHandler = async (req, res) => {
     });
   } catch (error) {
     console.error('Error al registrar auditoria de impresion:', error);
-    return sendVentasInternalError(res, 'No se pudo registrar el evento de impresión.');
+    return sendVentasInternalError(res, 'No se pudo registrar el evento de impresion.');
   }
 };

@@ -623,6 +623,7 @@ router.get('/:id_extra/asignaciones', checkPermission(MENU_EXTRAS_VIEW_PERMISSIO
 
 router.put('/:id_extra/asignaciones', checkPermission(MENU_EXTRAS_EDIT_PERMISSIONS), async (req, res) => {
   const client = await pool.connect();
+  let txStarted = false;
   try {
     const idExtra = Number(req.params.id_extra);
     if (!isPositiveInt(idExtra)) {
@@ -639,9 +640,12 @@ router.put('/:id_extra/asignaciones', checkPermission(MENU_EXTRAS_EDIT_PERMISSIO
     }
 
     await client.query('BEGIN');
+    txStarted = true;
     await replaceExtraAlmacenes(client, idExtra, idAlmacenes);
-    const extra = await getHydratedExtraById(client, idExtra);
     await client.query('COMMIT');
+    txStarted = false;
+
+    const extra = await getHydratedExtraById(pool, idExtra);
 
     return res.status(200).json({
       error: false,
@@ -651,7 +655,10 @@ router.put('/:id_extra/asignaciones', checkPermission(MENU_EXTRAS_EDIT_PERMISSIO
       extra
     });
   } catch (err) {
-    try { await client.query('ROLLBACK'); } catch {}
+    if (txStarted) {
+      try { await client.query('ROLLBACK'); } catch {}
+      txStarted = false;
+    }
     console.error('Error al reemplazar asignaciones de extra:', err.message);
     return res.status(500).json({ error: true, message: 'No se pudieron actualizar las sucursales del extra.' });
   } finally {
@@ -661,6 +668,7 @@ router.put('/:id_extra/asignaciones', checkPermission(MENU_EXTRAS_EDIT_PERMISSIO
 
 router.post('/:id_extra/asignaciones', checkPermission(MENU_EXTRAS_EDIT_PERMISSIONS), async (req, res) => {
   const client = await pool.connect();
+  let txStarted = false;
   try {
     const idExtra = Number(req.params.id_extra);
     const idAlmacen = Number(req.body?.id_almacen);
@@ -696,6 +704,7 @@ router.post('/:id_extra/asignaciones', checkPermission(MENU_EXTRAS_EDIT_PERMISSI
     }
 
     await client.query('BEGIN');
+    txStarted = true;
     await client.query(
       `
         INSERT INTO menu_extra_almacenes (id_extra, id_almacen, estado, fecha_actualizacion)
@@ -706,6 +715,7 @@ router.post('/:id_extra/asignaciones', checkPermission(MENU_EXTRAS_EDIT_PERMISSI
       [idExtra, idAlmacen]
     );
     await client.query('COMMIT');
+    txStarted = false;
 
     return res.status(201).json({
       error: false,
@@ -714,7 +724,10 @@ router.post('/:id_extra/asignaciones', checkPermission(MENU_EXTRAS_EDIT_PERMISSI
       id_almacen: idAlmacen
     });
   } catch (err) {
-    try { await client.query('ROLLBACK'); } catch {}
+    if (txStarted) {
+      try { await client.query('ROLLBACK'); } catch {}
+      txStarted = false;
+    }
     console.error('Error al crear asignacion de extra:', err.message);
     return res.status(500).json({ error: true, message: 'No se pudo crear la asignacion del extra.' });
   } finally {
@@ -724,6 +737,7 @@ router.post('/:id_extra/asignaciones', checkPermission(MENU_EXTRAS_EDIT_PERMISSI
 
 router.patch('/:id_extra/asignaciones/:id_almacen/inactivar', checkPermission(MENU_EXTRAS_DELETE_PERMISSIONS), async (req, res) => {
   const client = await pool.connect();
+  let txStarted = false;
   try {
     const idExtra = Number(req.params.id_extra);
     const idAlmacen = Number(req.params.id_almacen);
@@ -749,6 +763,7 @@ router.patch('/:id_extra/asignaciones/:id_almacen/inactivar', checkPermission(ME
     }
 
     await client.query('BEGIN');
+    txStarted = true;
     await client.query(
       `
         UPDATE menu_extra_almacenes
@@ -760,6 +775,7 @@ router.patch('/:id_extra/asignaciones/:id_almacen/inactivar', checkPermission(ME
       [idExtra, idAlmacen]
     );
     await client.query('COMMIT');
+    txStarted = false;
 
     return res.status(200).json({
       error: false,
@@ -770,7 +786,10 @@ router.patch('/:id_extra/asignaciones/:id_almacen/inactivar', checkPermission(ME
       id_almacen: idAlmacen
     });
   } catch (err) {
-    try { await client.query('ROLLBACK'); } catch {}
+    if (txStarted) {
+      try { await client.query('ROLLBACK'); } catch {}
+      txStarted = false;
+    }
     console.error('Error al inactivar asignacion de extra:', err.message);
     return res.status(500).json({ error: true, message: 'No se pudo inactivar la asignacion del extra.' });
   } finally {
@@ -795,6 +814,7 @@ router.get('/:id_extra', checkPermission(MENU_EXTRAS_VIEW_PERMISSIONS), async (r
 
 router.post('/', checkPermission(MENU_EXTRAS_CREATE_PERMISSIONS), async (req, res) => {
   const client = await pool.connect();
+  let txStarted = false;
   try {
     const normalized = normalizeExtraPayload(req.body);
     if (!normalized.ok) return res.status(400).json({ error: true, message: normalized.message });
@@ -809,6 +829,7 @@ router.post('/', checkPermission(MENU_EXTRAS_CREATE_PERMISSIONS), async (req, re
     }
 
     await client.query('BEGIN');
+    txStarted = true;
     const created = await client.query(
       `
         INSERT INTO menu_extras (
@@ -831,12 +852,17 @@ router.post('/', checkPermission(MENU_EXTRAS_CREATE_PERMISSIONS), async (req, re
     await replaceExtraRecipes(client, idExtra, normalized.data.recetas);
     await replaceExtraCombos(client, idExtra, normalized.data.combos);
     await replaceExtraAlmacenes(client, idExtra, normalized.data.id_almacenes);
-    const extra = await getHydratedExtraById(client, idExtra);
     await client.query('COMMIT');
+    txStarted = false;
+
+    const extra = await getHydratedExtraById(pool, idExtra);
 
     return res.status(201).json({ error: false, message: 'Extra creado correctamente.', id_extra: idExtra, extra });
   } catch (err) {
-    try { await client.query('ROLLBACK'); } catch {}
+    if (txStarted) {
+      try { await client.query('ROLLBACK'); } catch {}
+      txStarted = false;
+    }
     console.error('Error al crear extra admin:', err.message);
     if (err?.code === '23505') {
       return res.status(409).json({ error: true, message: 'Ya existe un extra con ese codigo.' });
@@ -849,6 +875,7 @@ router.post('/', checkPermission(MENU_EXTRAS_CREATE_PERMISSIONS), async (req, re
 
 router.put('/:id_extra', checkPermission(MENU_EXTRAS_EDIT_PERMISSIONS), async (req, res) => {
   const client = await pool.connect();
+  let txStarted = false;
   try {
     const idExtra = Number(req.params.id_extra);
     if (!isPositiveInt(idExtra)) {
@@ -870,6 +897,7 @@ router.put('/:id_extra', checkPermission(MENU_EXTRAS_EDIT_PERMISSIONS), async (r
     }
 
     await client.query('BEGIN');
+    txStarted = true;
     await client.query(
       `
         UPDATE menu_extras
@@ -899,12 +927,17 @@ router.put('/:id_extra', checkPermission(MENU_EXTRAS_EDIT_PERMISSIONS), async (r
     await replaceExtraRecipes(client, idExtra, normalized.data.recetas);
     await replaceExtraCombos(client, idExtra, normalized.data.combos);
     await replaceExtraAlmacenes(client, idExtra, normalized.data.id_almacenes);
-    const extra = await getHydratedExtraById(client, idExtra);
     await client.query('COMMIT');
+    txStarted = false;
+
+    const extra = await getHydratedExtraById(pool, idExtra);
 
     return res.status(200).json({ error: false, message: 'Extra actualizado correctamente.', extra });
   } catch (err) {
-    try { await client.query('ROLLBACK'); } catch {}
+    if (txStarted) {
+      try { await client.query('ROLLBACK'); } catch {}
+      txStarted = false;
+    }
     console.error('Error al actualizar extra admin:', err.message);
     if (err?.code === '23505') {
       return res.status(409).json({ error: true, message: 'Ya existe un extra con ese codigo.' });

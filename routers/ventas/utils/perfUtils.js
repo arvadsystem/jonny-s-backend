@@ -8,7 +8,7 @@ export const parseTruthyEnv = (value) =>
   ['true', '1', 'yes', 'on'].includes(String(value || '').trim().toLowerCase());
 
 export const isVentasPerfEnabled = () =>
-  process.env.NODE_ENV !== 'production' && parseTruthyEnv(process.env.VENTAS_PERF_LOGS);
+  parseTruthyEnv(process.env.VENTAS_PERF_LOGS);
 
 let ventasPerfStartupLogged = false;
 export const logVentasPerfStartupIfEnabled = () => {

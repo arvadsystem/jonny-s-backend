@@ -316,6 +316,15 @@ router.get('/:id_combo', checkPermission(MENU_COMBOS_VIEW_PERMISSIONS), async (r
 // POST: crear combo.
 router.post('/', checkPermission(MENU_COMBOS_CREATE_PERMISSIONS), async (req, res) => {
   const client = await pool.connect();
+  let txCommitted = false;
+  let clientReleased = false;
+
+  const releaseClient = () => {
+    if (!clientReleased) {
+      client.release();
+      clientReleased = true;
+    }
+  };
 
   try {
     const actorUserId = resolveActorUserId(req);
@@ -373,6 +382,8 @@ router.post('/', checkPermission(MENU_COMBOS_CREATE_PERMISSIONS), async (req, re
       estadoItem: datosNormalizados.estado ?? true
     });
     await client.query('COMMIT');
+    txCommitted = true;
+    releaseClient();
 
     const comboCreado = await obtenerComboPorId(idCombo, { includeInactiveDetail: true });
     const [comboHydrated] = await attachComboAlmacenes(pool, [comboCreado]);
@@ -382,7 +393,9 @@ router.post('/', checkPermission(MENU_COMBOS_CREATE_PERMISSIONS), async (req, re
       data: withResolvedComboImageUrl(req, comboHydrated)
     });
   } catch (err) {
-    await client.query('ROLLBACK');
+    if (!txCommitted && !clientReleased) {
+      await client.query('ROLLBACK');
+    }
     console.error('Error al crear combo admin:', err.message);
 
     if (esErrorConflictoConstraint(err)) {
@@ -394,13 +407,22 @@ router.post('/', checkPermission(MENU_COMBOS_CREATE_PERMISSIONS), async (req, re
 
     return res.status(500).json({ error: true, message: getSafeServerErrorMessage(err) });
   } finally {
-    client.release();
+    releaseClient();
   }
 });
 
 // PUT: actualizar combo completo por id.
 router.put('/:id_combo', checkPermission(MENU_COMBOS_EDIT_PERMISSIONS), async (req, res) => {
   const client = await pool.connect();
+  let txCommitted = false;
+  let clientReleased = false;
+
+  const releaseClient = () => {
+    if (!clientReleased) {
+      client.release();
+      clientReleased = true;
+    }
+  };
 
   try {
     const actorUserId = resolveActorUserId(req);
@@ -475,6 +497,8 @@ router.put('/:id_combo', checkPermission(MENU_COMBOS_EDIT_PERMISSIONS), async (r
       toMenuId: datosNormalizados.id_menu
     });
     await client.query('COMMIT');
+    txCommitted = true;
+    releaseClient();
 
     const comboActualizado = await obtenerComboPorId(idCombo, { includeInactiveDetail: true });
     const [comboHydrated] = await attachComboAlmacenes(pool, [comboActualizado]);
@@ -484,7 +508,9 @@ router.put('/:id_combo', checkPermission(MENU_COMBOS_EDIT_PERMISSIONS), async (r
       data: withResolvedComboImageUrl(req, comboHydrated)
     });
   } catch (err) {
-    await client.query('ROLLBACK');
+    if (!txCommitted && !clientReleased) {
+      await client.query('ROLLBACK');
+    }
     console.error('Error al actualizar combo admin:', err.message);
 
     if (esErrorConflictoConstraint(err)) {
@@ -496,7 +522,7 @@ router.put('/:id_combo', checkPermission(MENU_COMBOS_EDIT_PERMISSIONS), async (r
 
     return res.status(500).json({ error: true, message: getSafeServerErrorMessage(err) });
   } finally {
-    client.release();
+    releaseClient();
   }
 });
 

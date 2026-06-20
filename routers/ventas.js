@@ -45,6 +45,7 @@ import {
   resolveRecetaComplementMetadata
 } from './ventas/services/complementosCatalogService.js';
 import {
+  getCajaBootstrapHandler,
   listCategoriasCatalogoHandler,
   listClientesCatalogoHandler,
   listCombosCatalogoHandler,
@@ -4861,6 +4862,7 @@ const normalizeDescuentoCatalogoRow = (row) => {
 };
 
 router.get('/ventas/catalogos/categorias', listCategoriasCatalogoHandler);
+router.get('/ventas/caja/bootstrap', checkPermission(['VENTAS_CREAR']), getCajaBootstrapHandler);
 router.get('/ventas/catalogos/extras-permitidos', listExtrasPermitidosCatalogoHandler);
 router.get('/ventas/catalogos/productos', listProductosCatalogoHandler);
 router.get('/ventas/catalogos/clientes', listClientesCatalogoHandler);
