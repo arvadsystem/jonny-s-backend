@@ -76,6 +76,32 @@ const normalizeSelectedSalsas = (lines = []) => {
   return selections;
 };
 
+const SALSA_INVENTORY_SCHEMA_COLUMNS = Object.freeze(['id_insumo', 'cantidad_porcion', 'id_unidad_consumo']);
+let salsaInventorySchemaAvailable = null;
+
+const assertSalsaInventorySchemaAvailable = async (queryRunner) => {
+  if (salsaInventorySchemaAvailable === true) return;
+  const result = await queryRunner.query(
+    `
+      SELECT column_name
+      FROM information_schema.columns
+      WHERE table_schema = 'public'
+        AND table_name = 'salsas'
+        AND column_name = ANY($1::text[])
+    `,
+    [SALSA_INVENTORY_SCHEMA_COLUMNS]
+  );
+  const columns = new Set((result.rows || []).map((row) => String(row.column_name)));
+  const missing = SALSA_INVENTORY_SCHEMA_COLUMNS.filter((column) => !columns.has(column));
+  if (missing.length > 0) {
+    throw createInventoryError(
+      'VENTAS_SALSAS_INVENTARIO_SCHEMA_PENDIENTE',
+      `Inventario de salsas no disponible: faltan columnas en public.salsas (${missing.join(', ')}). Aplica la migracion versionada antes de vender salsas con inventario.`
+    );
+  }
+  salsaInventorySchemaAvailable = true;
+};
+
 export const getSelectedSalsaIdsFromLines = (lines = []) => (
   [...new Set(normalizeSelectedSalsas(lines).map((salsa) => salsa.id_salsa).filter(Boolean))]
 );
@@ -84,6 +110,7 @@ export const fetchSalsaInventoryRows = async ({ queryRunner, salsaIds = [] } = {
   if (!queryRunner?.query) throw new TypeError('queryRunner es requerido para cargar inventario de salsas.');
   const ids = [...new Set((Array.isArray(salsaIds) ? salsaIds : []).map((id) => toPositiveInventoryInt(id)).filter(Boolean))];
   if (ids.length === 0) return [];
+  await assertSalsaInventorySchemaAvailable(queryRunner);
   const result = await queryRunner.query(
     `
       SELECT
@@ -310,7 +337,21 @@ const createInventoryError = (code, message) => {
   return error;
 };
 
-const buildConsumptionSnapshot = (resolved, count) => ({
+const isStockTriggerError = (error) => {
+  const message = String(error?.message || '');
+  return /stock insuficiente/i.test(message)
+    || /no se pudo actualizar el stock/i.test(message)
+    || /insumos_almacenes/i.test(message);
+};
+
+const wrapInventoryMutationError = (error) => {
+  if (isStockTriggerError(error)) {
+    return createInventoryError('VENTAS_SALSA_STOCK_INSUFICIENTE', 'No hay existencias suficientes para salsa en inventario.');
+  }
+  return error;
+};
+
+const buildConsumptionSnapshot = (resolved, count, lineQuantity = 1) => ({
   id_complemento: resolved.id_complemento || resolved.id_salsa,
   id_salsa: resolved.id_salsa,
   nombre: String(resolved.nombre || 'Salsa').trim(),
@@ -325,6 +366,7 @@ const buildConsumptionSnapshot = (resolved, count) => ({
   id_unidad_base: resolved.id_unidad_base,
   id_almacen: resolved.id_almacen,
   porciones: count,
+  cantidad_linea: toPositiveInventoryInt(lineQuantity) || 1,
   usa_catalogo_maestro: Boolean(resolved.usa_catalogo_maestro)
 });
 
@@ -367,7 +409,9 @@ export const attachSalsaInventorySnapshotsToLines = async ({ client, lines = [],
           `La salsa ${source.nombre || idSalsa} no esta disponible en esta sucursal: ${String(resolved?.motivo_no_disponible || 'requiere revisar su configuracion de inventario.').toLowerCase()}`
         );
       }
-      const snapshot = buildConsumptionSnapshot(resolved, count);
+      // complementos_detalle ya representa el total autorizado para la linea completa.
+      // No se multiplica otra vez por cantidad para evitar sobreconsumo en RECETA/COMBO.
+      const snapshot = buildConsumptionSnapshot(resolved, count, line?.cantidad);
       if (!snapshot.id_insumo || !snapshot.id_almacen || snapshot.cantidad_base_total <= 0) {
         throw createInventoryError('VENTAS_SALSA_INVENTARIO_NO_DISPONIBLE', `La salsa ${source.nombre || idSalsa} requiere revisar su configuracion de inventario.`);
       }
@@ -439,38 +483,32 @@ export const consumeSalsasInventoryFromSnapshots = async ({
     if (!stockResult.rowCount || stock < row.cantidad) {
       throw createInventoryError('VENTAS_SALSA_STOCK_INSUFICIENTE', `No hay existencias suficientes para salsa en inventario.`);
     }
-    await client.query(
-      `
-        UPDATE public.insumos_almacenes
-        SET cantidad = cantidad - $1,
-            fecha_actualizacion = NOW()
-        WHERE id_insumo = $2
-          AND id_almacen = $3
-      `,
-      [row.cantidad, row.idInsumo, row.idAlmacen]
-    );
-    await client.query(
-      `
-        INSERT INTO public.movimientos_inventario (
-          tipo,
-          cantidad,
-          id_almacen,
-          id_insumo,
-          ref_origen,
-          id_ref,
-          descripcion
-        )
-        VALUES ('SALIDA', $1, $2, $3, $4, $5, $6)
-      `,
-      [
-        row.cantidad,
-        row.idAlmacen,
-        row.idInsumo,
-        refOrigen,
-        idReferencia,
-        `${descripcion}: ${[...row.nombres].join(', ') || 'salsas'}${toPositiveInventoryInt(idUsuario) ? ` - usuario ${idUsuario}` : ''}`
-      ]
-    );
+    try {
+      await client.query(
+        `
+          INSERT INTO public.movimientos_inventario (
+            tipo,
+            cantidad,
+            id_almacen,
+            id_insumo,
+            ref_origen,
+            id_ref,
+            descripcion
+          )
+          VALUES ('SALIDA', $1, $2, $3, $4, $5, $6)
+        `,
+        [
+          row.cantidad,
+          row.idAlmacen,
+          row.idInsumo,
+          refOrigen,
+          idReferencia,
+          `${descripcion}: ${[...row.nombres].join(', ') || 'salsas'}${toPositiveInventoryInt(idUsuario) ? ` - usuario ${idUsuario}` : ''}`
+        ]
+      );
+    } catch (error) {
+      throw wrapInventoryMutationError(error);
+    }
   }
 
   return [...usage.values()];
@@ -497,7 +535,7 @@ export const restoreSalsasInventoryFromSnapshots = async ({
   }
 
   for (const row of usage.values()) {
-    await client.query(
+    const stockResult = await client.query(
       `
         SELECT cantidad
         FROM public.insumos_almacenes
@@ -507,36 +545,33 @@ export const restoreSalsasInventoryFromSnapshots = async ({
       `,
       [row.idInsumo, row.idAlmacen]
     );
-    await client.query(
-      `
-        UPDATE public.insumos_almacenes
-        SET cantidad = COALESCE(cantidad, 0) + $1,
-            fecha_actualizacion = NOW()
-        WHERE id_insumo = $2
-          AND id_almacen = $3
-      `,
-      [row.cantidad, row.idInsumo, row.idAlmacen]
-    );
-    await client.query(
-      `
-        INSERT INTO public.movimientos_inventario (
-          tipo,
-          cantidad,
-          id_almacen,
-          id_insumo,
-          ref_origen,
-          id_ref,
-          descripcion
-        )
-        VALUES ('ENTRADA', $1, $2, $3, 'REVERSION_VENTA_SALSA', $4, $5)
-      `,
-      [
-        row.cantidad,
-        row.idAlmacen,
-        row.idInsumo,
-        idReversion,
-        `Entrada por reversion ${codigoReversion || ''} de venta ${codigoVenta || ''}: ${[...row.nombres].join(', ') || 'salsas'}`
-      ]
-    );
+    if (!stockResult.rowCount) {
+      throw createInventoryError('VENTAS_SALSA_INVENTARIO_NO_DISPONIBLE', 'No se encontro el stock de salsa para restaurar inventario.');
+    }
+    try {
+      await client.query(
+        `
+          INSERT INTO public.movimientos_inventario (
+            tipo,
+            cantidad,
+            id_almacen,
+            id_insumo,
+            ref_origen,
+            id_ref,
+            descripcion
+          )
+          VALUES ('ENTRADA', $1, $2, $3, 'REVERSION_VENTA_SALSA', $4, $5)
+        `,
+        [
+          row.cantidad,
+          row.idAlmacen,
+          row.idInsumo,
+          idReversion,
+          `Entrada por reversion ${codigoReversion || ''} de venta ${codigoVenta || ''}: ${[...row.nombres].join(', ') || 'salsas'}`
+        ]
+      );
+    } catch (error) {
+      throw wrapInventoryMutationError(error);
+    }
   }
 };

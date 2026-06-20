@@ -308,6 +308,42 @@ const validateSalsaInventoryConfig = async (data) => {
     return { ok: false, status: 400, message: 'La unidad de consumo no existe.' };
   }
 
+  const idUnidadBase = toPositiveInt(insumo.id_unidad_medida);
+  const idUnidadConsumo = toPositiveInt(data.id_unidad_consumo);
+  if (idUnidadBase === idUnidadConsumo) {
+    return { ok: true };
+  }
+
+  const conversionResult = await pool.query(
+    `
+      SELECT id_presentacion
+      FROM public.insumo_presentaciones
+      WHERE id_insumo = $1
+        AND id_unidad_presentacion = $2
+        AND id_unidad_base = $3
+        AND estado IS TRUE
+        AND uso_receta IS TRUE
+        AND cantidad_presentacion > 0
+        AND cantidad_base > 0
+      ORDER BY id_presentacion
+    `,
+    [data.id_insumo, idUnidadConsumo, idUnidadBase]
+  );
+  if (conversionResult.rowCount === 0) {
+    return {
+      ok: false,
+      status: 409,
+      message: 'No existe una conversion activa de receta para la unidad de consumo seleccionada.'
+    };
+  }
+  if (conversionResult.rowCount > 1) {
+    return {
+      ok: false,
+      status: 409,
+      message: 'Hay mas de una conversion activa de receta para esa unidad. Revisa presentaciones del insumo.'
+    };
+  }
+
   return { ok: true };
 };
 
@@ -477,12 +513,33 @@ router.get('/catalogos/insumos', checkPermission(MENU_SALSAS_VIEW_PERMISSIONS), 
           um.simbolo AS unidad_simbolo,
           ci.id_categoria_insumo,
           ci.nombre_categoria AS categoria_nombre,
-          COALESCE(i.estado, true) AS estado
+          COALESCE(i.estado, true) AS estado,
+          map.mapping_count,
+          map.id_insumo_maestro,
+          map.estado_mapeo_maestro,
+          CASE
+            WHEN map.mapping_count > 0 THEN 'LEGACY'
+            ELSE 'MAESTRO'
+          END AS indicador_maestro_legacy,
+          CASE
+            WHEN i.id_unidad_medida IS NULL THEN 'SIN_UNIDAD_BASE'
+            WHEN map.mapping_count > 1 THEN 'MAPEO_AMBIGUO'
+            WHEN map.mapping_count = 1 AND UPPER(TRIM(COALESCE(map.estado_mapeo_maestro, ''))) IN ('PENDIENTE', 'REQUIERE_REVISION', 'AMBIGUO') THEN CONCAT('MAPEO_', UPPER(TRIM(map.estado_mapeo_maestro)))
+            ELSE 'OK'
+          END AS estado_configuracion
         FROM public.insumos i
         LEFT JOIN public.unidades_medida um
           ON um.id_unidad_medida = i.id_unidad_medida
         LEFT JOIN public.categorias_insumos ci
           ON ci.id_categoria_insumo = i.id_categoria_insumo
+        LEFT JOIN LATERAL (
+          SELECT
+            COUNT(*)::int AS mapping_count,
+            MIN(imm.id_insumo_maestro)::int AS id_insumo_maestro,
+            MIN(imm.estado_migracion) AS estado_mapeo_maestro
+          FROM public.insumos_mapeo_maestro imm
+          WHERE imm.id_insumo_legacy = i.id_insumo
+        ) map ON true
         WHERE COALESCE(i.estado, true) = true
         ORDER BY
           CASE WHEN UPPER(TRIM(COALESCE(ci.nombre_categoria, ''))) = 'SALSAS Y ADEREZOS' THEN 0 ELSE 1 END,
