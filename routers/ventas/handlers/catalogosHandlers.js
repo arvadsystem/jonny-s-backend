@@ -10,7 +10,10 @@ import {
   resolveComboComplementMetadata,
   resolveRecetaComplementMetadata
 } from '../services/complementosCatalogService.js';
-import { resolveExtrasInventory } from '../services/extrasInventoryService.js';
+import {
+  fetchVentaGlobalExtrasCatalog,
+  resolveExtrasInventory
+} from '../services/extrasInventoryService.js';
 import { roundMoney } from '../utils/moneyUtils.js';
 import {
   coercePositiveIntArray,
@@ -173,16 +176,7 @@ export const listCategoriasCatalogoHandler = async (req, res) => {
 };
 
 export const listExtrasPermitidosCatalogoHandler = async (req, res) => {
-  const tipo = String(req.query.tipo || '').trim().toUpperCase();
-  const idItem = parseOptionalPositiveInt(req.query.id_item);
   const idSucursal = parseOptionalPositiveInt(req.query.id_sucursal);
-
-  if (!['RECETA', 'COMBO'].includes(tipo)) {
-    return res.status(400).json({ error: true, message: 'tipo debe ser RECETA o COMBO.' });
-  }
-  if (!idItem) {
-    return res.status(400).json({ error: true, message: 'id_item debe ser entero mayor a 0.' });
-  }
 
   try {
     const scope = await resolveRequestUserSucursalScope(req);
@@ -190,58 +184,14 @@ export const listExtrasPermitidosCatalogoHandler = async (req, res) => {
     if (!sucursalValidation.ok) {
       return res.status(sucursalValidation.status).json(sucursalValidation.body);
     }
-
-    const [hasMenuExtraCombo, hasMenuExtraAlmacenes] = await Promise.all([
-      hasTable(pool, 'menu_extra_combo'),
-      hasTable(pool, 'menu_extra_almacenes')
-    ]);
-    if (tipo === 'COMBO' && !hasMenuExtraCombo) {
-      return res.status(200).json([]);
-    }
-
-    const linkJoin = tipo === 'RECETA'
-      ? 'public.menu_extra_receta rel ON rel.id_extra = me.id_extra AND rel.id_receta = $1'
-      : 'public.menu_extra_combo rel ON rel.id_extra = me.id_extra AND rel.id_combo = $1';
-    const orderExpression = tipo === 'RECETA'
-      ? 'COALESCE(rel.orden, me.orden, 2147483647)'
-      : 'COALESCE(me.orden, 2147483647)';
-    const assignmentJoin = hasMenuExtraAlmacenes && idSucursal
-      ? `
-        INNER JOIN public.menu_extra_almacenes mea
-          ON mea.id_extra = me.id_extra
-         AND COALESCE(mea.estado, true) = true
-        INNER JOIN public.almacenes aextra
-          ON aextra.id_almacen = mea.id_almacen
-         AND COALESCE(aextra.estado, true) = true
-         AND aextra.id_sucursal = $2
-      `
-      : '';
-    const params = hasMenuExtraAlmacenes && idSucursal ? [idItem, idSucursal] : [idItem];
-
-    const result = await pool.query(
-      `
-        SELECT DISTINCT
-          me.id_extra,
-          me.codigo,
-          me.nombre,
-          me.precio_adicional AS precio,
-          COALESCE(me.estado, true) AS estado,
-          me.id_insumo,
-          me.cant,
-          me.id_unidad_medida,
-          ${orderExpression} AS orden_catalogo
-        FROM public.menu_extras me
-        INNER JOIN ${linkJoin}
-          AND COALESCE(rel.estado, true) = true
-        ${assignmentJoin}
-        ORDER BY orden_catalogo, me.nombre ASC
-      `,
-      params
-    );
+    const resultRows = await fetchVentaGlobalExtrasCatalog({
+      queryRunner: pool,
+      idSucursal
+    });
 
     const resolvedExtras = await resolveExtrasInventory({
       queryRunner: pool,
-      extras: result.rows,
+      extras: resultRows,
       idSucursal,
       mode: 'catalog'
     });
@@ -252,14 +202,23 @@ export const listExtrasPermitidosCatalogoHandler = async (req, res) => {
         codigo: row.codigo,
         nombre: row.nombre,
         precio: roundMoney(row.precio),
+        precio_adicional: roundMoney(row.precio),
         estado: parseBooleanish(row.estado),
         id_insumo: parseOptionalPositiveInt(row.id_insumo_configurado),
         id_insumo_maestro: parseOptionalPositiveInt(row.id_insumo_maestro),
+        nombre_insumo: row.nombre_insumo || null,
         stock_disponible: row.stock_disponible === null || row.stock_disponible === undefined ? null : Number(row.stock_disponible),
         cantidad_consumo_base: row.cantidad_consumo_base === null || row.cantidad_consumo_base === undefined
           ? null
           : Number(row.cantidad_consumo_base),
+        cantidad_consumo: row.cantidad_consumo_base === null || row.cantidad_consumo_base === undefined
+          ? null
+          : Number(row.cantidad_consumo_base),
         id_unidad_base: parseOptionalPositiveInt(row.id_unidad_base),
+        id_unidad_medida: parseOptionalPositiveInt(row.id_unidad_base || row.id_unidad_medida),
+        unidad_medida: row.unidad_medida || null,
+        id_almacen: parseOptionalPositiveInt(row.id_almacen),
+        id_sucursal: parseOptionalPositiveInt(idSucursal),
         disponible: Boolean(row.disponible),
         inventario_configurado: Boolean(row.inventario_configurado),
         motivo_no_disponible: row.motivo_no_disponible || null,
