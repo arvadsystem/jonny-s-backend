@@ -877,6 +877,7 @@ router.get('/:id_receta/asignaciones', checkPermission(MENU_RECETAS_VIEW_PERMISS
 
 router.put('/:id_receta/asignaciones', checkPermission(MENU_RECETAS_EDIT_PERMISSIONS), async (req, res) => {
   const client = await pool.connect();
+  let txStarted = false;
   try {
     const idReceta = Number(req.params.id_receta);
     if (!esEnteroPositivo(idReceta)) {
@@ -893,9 +894,11 @@ router.put('/:id_receta/asignaciones', checkPermission(MENU_RECETAS_EDIT_PERMISS
     }
 
     await client.query('BEGIN');
+    txStarted = true;
     await replaceRecetaAlmacenes(client, idReceta, idAlmacenes);
     const [receta] = await attachRecetaAlmacenes(client, [await obtenerRecetaPorId(idReceta)]);
     await client.query('COMMIT');
+    txStarted = false;
 
     return res.status(200).json({
       error: false,
@@ -905,7 +908,10 @@ router.put('/:id_receta/asignaciones', checkPermission(MENU_RECETAS_EDIT_PERMISS
       receta
     });
   } catch (err) {
-    try { await client.query('ROLLBACK'); } catch {}
+    if (txStarted) {
+      try { await client.query('ROLLBACK'); } catch {}
+      txStarted = false;
+    }
     console.error('Error al reemplazar asignaciones de receta:', err.message);
     return res.status(500).json({ error: true, message: 'No se pudieron actualizar las sucursales de la receta.' });
   } finally {
@@ -915,6 +921,7 @@ router.put('/:id_receta/asignaciones', checkPermission(MENU_RECETAS_EDIT_PERMISS
 
 router.post('/:id_receta/asignaciones', checkPermission(MENU_RECETAS_EDIT_PERMISSIONS), async (req, res) => {
   const client = await pool.connect();
+  let txStarted = false;
   try {
     const idReceta = Number(req.params.id_receta);
     const idAlmacen = Number(req.body?.id_almacen);
@@ -950,6 +957,7 @@ router.post('/:id_receta/asignaciones', checkPermission(MENU_RECETAS_EDIT_PERMIS
     }
 
     await client.query('BEGIN');
+    txStarted = true;
     await client.query(
       `
         INSERT INTO public.menu_receta_almacenes (id_receta, id_almacen, estado, fecha_actualizacion)
@@ -960,6 +968,7 @@ router.post('/:id_receta/asignaciones', checkPermission(MENU_RECETAS_EDIT_PERMIS
       [idReceta, idAlmacen]
     );
     await client.query('COMMIT');
+    txStarted = false;
 
     return res.status(201).json({
       error: false,
@@ -968,7 +977,10 @@ router.post('/:id_receta/asignaciones', checkPermission(MENU_RECETAS_EDIT_PERMIS
       id_almacen: idAlmacen
     });
   } catch (err) {
-    try { await client.query('ROLLBACK'); } catch {}
+    if (txStarted) {
+      try { await client.query('ROLLBACK'); } catch {}
+      txStarted = false;
+    }
     console.error('Error al crear asignación de receta:', err.message);
     return res.status(500).json({ error: true, message: 'No se pudo crear la asignación de la receta.' });
   } finally {
@@ -978,6 +990,7 @@ router.post('/:id_receta/asignaciones', checkPermission(MENU_RECETAS_EDIT_PERMIS
 
 router.patch('/:id_receta/asignaciones/:id_almacen/inactivar', checkPermission(MENU_RECETAS_EDIT_PERMISSIONS), async (req, res) => {
   const client = await pool.connect();
+  let txStarted = false;
   try {
     const idReceta = Number(req.params.id_receta);
     const idAlmacen = Number(req.params.id_almacen);
@@ -1003,6 +1016,7 @@ router.patch('/:id_receta/asignaciones/:id_almacen/inactivar', checkPermission(M
     }
 
     await client.query('BEGIN');
+    txStarted = true;
     await client.query(
       `
         UPDATE public.menu_receta_almacenes
@@ -1014,6 +1028,7 @@ router.patch('/:id_receta/asignaciones/:id_almacen/inactivar', checkPermission(M
       [idReceta, idAlmacen]
     );
     await client.query('COMMIT');
+    txStarted = false;
 
     return res.status(200).json({
       error: false,
@@ -1024,7 +1039,10 @@ router.patch('/:id_receta/asignaciones/:id_almacen/inactivar', checkPermission(M
       id_almacen: idAlmacen
     });
   } catch (err) {
-    try { await client.query('ROLLBACK'); } catch {}
+    if (txStarted) {
+      try { await client.query('ROLLBACK'); } catch {}
+      txStarted = false;
+    }
     console.error('Error al inactivar asignación de receta:', err.message);
     return res.status(500).json({ error: true, message: 'No se pudo inactivar la asignación de la receta.' });
   } finally {
@@ -1035,6 +1053,7 @@ router.patch('/:id_receta/asignaciones/:id_almacen/inactivar', checkPermission(M
 // PUT: reemplazar detalle de insumos de una receta.
 router.put('/:id_receta/detalle', checkPermission(MENU_RECETAS_EDIT_PERMISSIONS), async (req, res) => {
   const client = await pool.connect();
+  let txStarted = false;
 
   try {
     const idReceta = Number(req.params.id_receta);
@@ -1060,6 +1079,7 @@ router.put('/:id_receta/detalle', checkPermission(MENU_RECETAS_EDIT_PERMISSIONS)
     }
 
     await client.query('BEGIN');
+    txStarted = true;
     await reemplazarDetalleReceta(client, idReceta, detalleNormalizado);
     await client.query(
       `
@@ -1070,10 +1090,14 @@ router.put('/:id_receta/detalle', checkPermission(MENU_RECETAS_EDIT_PERMISSIONS)
       [idReceta]
     );
     await client.query('COMMIT');
+    txStarted = false;
 
     return res.status(200).json({ error: false, message: 'Detalle de receta actualizado correctamente.' });
   } catch (err) {
-    await client.query('ROLLBACK');
+    if (txStarted) {
+      try { await client.query('ROLLBACK'); } catch {}
+      txStarted = false;
+    }
     const handled = sendRecetaInsumosMaestrosError(res, err, 'PUT /admin/recetas/:id_receta/detalle');
     if (handled) return handled;
     console.error('Error al actualizar detalle de receta admin:', err.message);
@@ -1112,6 +1136,7 @@ router.get('/:id_receta', checkPermission(MENU_RECETAS_VIEW_PERMISSIONS), async 
 // POST: crear receta.
 router.post('/', checkPermission(MENU_RECETAS_CREATE_PERMISSIONS), async (req, res) => {
   const client = await pool.connect();
+  let txStarted = false;
   const perf = createRecetasPerfTracker(
     'POST /admin/recetas',
     Array.isArray(req.body?.detalle_receta || req.body?.detalle)
@@ -1196,10 +1221,12 @@ router.post('/', checkPermission(MENU_RECETAS_CREATE_PERMISSIONS), async (req, r
 
     perf.writeStarted();
     await client.query('BEGIN');
+    txStarted = true;
     if (!shouldUseCatalogoMaestroInsumos()) {
       const unidadSyncValidation = await sincronizarUnidadesInsumosDesdeDetalle(client, detalleNormalizado);
       if (!unidadSyncValidation.ok) {
         await client.query('ROLLBACK');
+        txStarted = false;
         return res.status(unidadSyncValidation.status).json({ error: true, message: unidadSyncValidation.message });
       }
     }
@@ -1259,6 +1286,7 @@ router.post('/', checkPermission(MENU_RECETAS_CREATE_PERMISSIONS), async (req, r
       estadoItem: datosNormalizados.estado ?? true
     });
     await client.query('COMMIT');
+    txStarted = false;
     perf.writeDone();
     perf.succeeded();
 
@@ -1268,7 +1296,10 @@ router.post('/', checkPermission(MENU_RECETAS_CREATE_PERMISSIONS), async (req, r
       id_receta: idRecetaCreada
     });
   } catch (err) {
-    await client.query('ROLLBACK');
+    if (txStarted) {
+      try { await client.query('ROLLBACK'); } catch {}
+      txStarted = false;
+    }
     const handled = sendRecetaInsumosMaestrosError(res, err, 'POST /admin/recetas');
     if (handled) return handled;
     console.error('Error al crear receta admin:', {
@@ -1328,6 +1359,7 @@ router.post('/', checkPermission(MENU_RECETAS_CREATE_PERMISSIONS), async (req, r
 // PUT: actualizar receta completa por id.
 router.put('/:id_receta', checkPermission(MENU_RECETAS_EDIT_PERMISSIONS), async (req, res) => {
   const client = await pool.connect();
+  let txStarted = false;
   const perf = createRecetasPerfTracker(
     'PUT /admin/recetas/:id_receta',
     Array.isArray(req.body?.detalle_receta || req.body?.detalle)
@@ -1431,10 +1463,12 @@ router.put('/:id_receta', checkPermission(MENU_RECETAS_EDIT_PERMISSIONS), async 
 
     perf.writeStarted();
     await client.query('BEGIN');
+    txStarted = true;
     if (!shouldUseCatalogoMaestroInsumos()) {
       const unidadSyncValidation = await sincronizarUnidadesInsumosDesdeDetalle(client, detalleNormalizado);
       if (!unidadSyncValidation.ok) {
         await client.query('ROLLBACK');
+        txStarted = false;
         return res.status(unidadSyncValidation.status).json({ error: true, message: unidadSyncValidation.message });
       }
     }
@@ -1481,11 +1515,15 @@ router.put('/:id_receta', checkPermission(MENU_RECETAS_EDIT_PERMISSIONS), async 
     });
 
     await client.query('COMMIT');
+    txStarted = false;
     perf.writeDone();
     perf.succeeded();
     return res.status(200).json({ error: false, message: 'Receta actualizada correctamente.' });
   } catch (err) {
-    await client.query('ROLLBACK');
+    if (txStarted) {
+      try { await client.query('ROLLBACK'); } catch {}
+      txStarted = false;
+    }
     const handled = sendRecetaInsumosMaestrosError(res, err, 'PUT /admin/recetas/:id_receta');
     if (handled) return handled;
     console.error('Error al actualizar receta admin:', err.message);
@@ -1521,6 +1559,7 @@ router.put('/:id_receta', checkPermission(MENU_RECETAS_EDIT_PERMISSIONS), async 
 // PATCH: actualizar solo estado por id; id_usuario se toma de req.user.
 router.patch('/:id_receta/estado', checkPermission(MENU_RECETAS_STATE_PERMISSIONS), async (req, res) => {
   const client = await pool.connect();
+  let txStarted = false;
 
   try {
     const actorUserId = resolveActorUserId(req);
@@ -1561,6 +1600,7 @@ router.patch('/:id_receta/estado', checkPermission(MENU_RECETAS_STATE_PERMISSION
     }
 
     await client.query('BEGIN');
+    txStarted = true;
 
     await actualizarCampoReceta(client, idReceta, 'estado', estadoValidation.valor);
     await actualizarCampoReceta(client, idReceta, 'id_usuario', usuarioValidation.valor);
@@ -1575,9 +1615,13 @@ router.patch('/:id_receta/estado', checkPermission(MENU_RECETAS_STATE_PERMISSION
     );
 
     await client.query('COMMIT');
+    txStarted = false;
     return res.status(200).json({ error: false, message: 'Estado de receta actualizado correctamente.' });
   } catch (err) {
-    await client.query('ROLLBACK');
+    if (txStarted) {
+      try { await client.query('ROLLBACK'); } catch {}
+      txStarted = false;
+    }
     console.error('Error al actualizar estado de receta admin:', err.message);
 
     if (esErrorConflictoConstraint(err)) {

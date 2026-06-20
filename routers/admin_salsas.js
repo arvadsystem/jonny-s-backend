@@ -1135,12 +1135,24 @@ router.put('/:id_salsa/sucursales', checkPermission(MENU_SALSAS_EDIT_PERMISSIONS
   if (!normalized.ok) return res.status(400).json({ error: true, message: normalized.message });
 
   let client;
+  let txStarted = false;
+  let clientReleased = false;
+
+  const releaseClient = () => {
+    if (client && !clientReleased) {
+      client.release();
+      clientReleased = true;
+    }
+  };
+
   try {
     client = await pool.connect();
     await client.query('BEGIN');
+    txStarted = true;
     const userResult = await client.query('SELECT 1 FROM public.usuarios WHERE id_usuario = $1 LIMIT 1', [actorUserId]);
     if (!userResult.rowCount) {
       await client.query('ROLLBACK');
+      txStarted = false;
       return res.status(401).json({ error: true, message: 'El usuario autenticado ya no existe.' });
     }
     const saved = await saveSalsaSucursalPublicationState({
@@ -1151,18 +1163,24 @@ router.put('/:id_salsa/sucursales', checkPermission(MENU_SALSAS_EDIT_PERMISSIONS
     });
     if (!saved.ok) {
       await client.query('ROLLBACK');
+      txStarted = false;
       return res.status(saved.status).json({ error: true, code: saved.code, message: saved.message });
     }
     await client.query('COMMIT');
+    txStarted = false;
+    releaseClient();
     invalidateVentasComplementCatalogCache('publicar salsa por sucursal');
     const state = await listSalsaSucursalPublicationState(pool, idSalsa);
     return res.status(200).json({ error: false, message: 'Publicacion actualizada correctamente.', ...state });
   } catch (err) {
-    if (client) await client.query('ROLLBACK').catch(() => {});
+    if (txStarted && client) {
+      try { await client.query('ROLLBACK'); } catch {}
+      txStarted = false;
+    }
     console.error('Error al guardar publicacion de salsa por sucursal:', err.message);
     return res.status(500).json({ error: true, message: getSafeServerErrorMessage(err) });
   } finally {
-    client?.release();
+    releaseClient();
   }
 });
 
