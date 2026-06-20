@@ -363,6 +363,60 @@ const validateSalsaInventoryConfig = async (data) => {
   if (!idUnidadBaseEfectiva) {
     return { ok: false, status: 409, message: 'El insumo seleccionado no tiene unidad base configurada.' };
   }
+  if (idInsumoEfectivo !== toPositiveInt(data.id_insumo)) {
+    return {
+      ok: false,
+      status: 409,
+      message: `Selecciona el insumo maestro #${idInsumoEfectivo}; los IDs legacy no se pueden guardar en salsas.`
+    };
+  }
+
+  const duplicateMasterResult = await pool.query(
+    `
+      SELECT other.id_insumo
+      FROM public.insumos current
+      INNER JOIN public.insumos other
+        ON other.id_insumo <> current.id_insumo
+       AND other.estado IS TRUE
+       AND UPPER(REGEXP_REPLACE(BTRIM(other.nombre_insumo), '\\s+', ' ', 'g'))
+         = UPPER(REGEXP_REPLACE(BTRIM(current.nombre_insumo), '\\s+', ' ', 'g'))
+      INNER JOIN public.insumos_mapeo_maestro other_map
+        ON other_map.id_insumo_legacy = other.id_insumo
+       AND other_map.id_insumo_maestro = other.id_insumo
+       AND UPPER(TRIM(other_map.estado_migracion)) = 'VALIDADO'
+      WHERE current.id_insumo = $1
+      ORDER BY other.id_insumo
+    `,
+    [idInsumoEfectivo]
+  );
+  if (duplicateMasterResult.rowCount > 0) {
+    const conflictIds = [idInsumoEfectivo, ...duplicateMasterResult.rows.map((row) => Number(row.id_insumo))]
+      .sort((left, right) => left - right)
+      .map((id) => `#${id}`)
+      .join(', ');
+    return {
+      ok: false,
+      status: 409,
+      message: `Conflicto de datos: existen maestros VALIDADO con el mismo nombre (${conflictIds}).`
+    };
+  }
+
+  const assignmentResult = await pool.query(
+    `
+      SELECT ia.id_almacen
+      FROM public.insumos_almacenes ia
+      INNER JOIN public.almacenes a
+        ON a.id_almacen = ia.id_almacen
+       AND COALESCE(a.estado, true) IS TRUE
+      WHERE ia.id_insumo = $1
+        AND COALESCE(ia.estado, true) IS TRUE
+      LIMIT 1
+    `,
+    [idInsumoEfectivo]
+  );
+  if (!assignmentResult.rowCount) {
+    return { ok: false, status: 409, message: 'El insumo maestro no tiene almacenes activos.' };
+  }
 
   const unidadResult = await pool.query(
     'SELECT id_unidad_medida FROM public.unidades_medida WHERE id_unidad_medida = $1 LIMIT 1;',
@@ -409,6 +463,66 @@ const validateSalsaInventoryConfig = async (data) => {
   }
 
   return { ok: true };
+};
+
+const fetchSalsaInventoryStateById = async (idSalsa) => {
+  const result = await pool.query(
+    `
+      SELECT
+        s.id_salsa,
+        s.nombre,
+        COALESCE(s.estado, true) AS estado,
+        s.id_insumo,
+        COALESCE(s.cantidad_porcion, 2)::numeric AS cantidad_porcion,
+        s.id_unidad_consumo,
+        i.nombre_insumo AS insumo_nombre,
+        COALESCE(i.estado, true) AS insumo_estado,
+        i.id_unidad_medida AS id_unidad_base,
+        um_base.nombre AS unidad_base_nombre,
+        um_base.simbolo AS unidad_base_simbolo,
+        um_consumo.nombre AS unidad_consumo_nombre,
+        um_consumo.simbolo AS unidad_consumo_simbolo,
+        map.mapping_count,
+        map.id_insumo_maestro,
+        map.estado_mapeo_maestro,
+        i_master.nombre_insumo AS insumo_maestro_nombre,
+        COALESCE(i_master.estado, true) AS insumo_maestro_estado,
+        i_master.id_unidad_medida AS id_unidad_base_maestro,
+        COALESCE(conv.conversiones_aplicables, 0)::int AS conversiones_aplicables
+      FROM public.salsas s
+      LEFT JOIN public.insumos i ON i.id_insumo = s.id_insumo
+      LEFT JOIN public.unidades_medida um_base ON um_base.id_unidad_medida = i.id_unidad_medida
+      LEFT JOIN public.unidades_medida um_consumo ON um_consumo.id_unidad_medida = s.id_unidad_consumo
+      LEFT JOIN LATERAL (
+        SELECT COUNT(*)::int AS mapping_count,
+          MIN(imm.id_insumo_maestro)::int AS id_insumo_maestro,
+          MIN(imm.estado_migracion) AS estado_mapeo_maestro
+        FROM public.insumos_mapeo_maestro imm
+        WHERE imm.id_insumo_legacy = i.id_insumo
+      ) map ON true
+      LEFT JOIN public.insumos i_master
+        ON i_master.id_insumo = CASE
+          WHEN map.mapping_count = 1 AND UPPER(TRIM(COALESCE(map.estado_mapeo_maestro, ''))) = 'VALIDADO'
+            THEN map.id_insumo_maestro
+          ELSE NULL
+        END
+      LEFT JOIN LATERAL (
+        SELECT COUNT(*)::int AS conversiones_aplicables
+        FROM public.insumo_presentaciones ip
+        WHERE ip.id_insumo = COALESCE(i_master.id_insumo, i.id_insumo)
+          AND ip.id_unidad_presentacion = s.id_unidad_consumo
+          AND ip.id_unidad_base = COALESCE(i_master.id_unidad_medida, i.id_unidad_medida)
+          AND ip.estado IS TRUE
+          AND ip.uso_receta IS TRUE
+          AND ip.cantidad_presentacion > 0
+          AND ip.cantidad_base > 0
+      ) conv ON true
+      WHERE s.id_salsa = $1
+      LIMIT 1
+    `,
+    [idSalsa]
+  );
+  return result.rowCount ? attachSalsaInventoryState(result.rows[0]) : null;
 };
 
 const normalizeRulesPayload = (rows) => {
@@ -744,7 +858,8 @@ router.get('/catalogos/insumos', checkPermission(MENU_SALSAS_VIEW_PERMISSIONS), 
           COALESCE(ms.mapping_count, 0)::int AS mapping_count,
           COALESCE(ms.ids_insumo_legacy, ARRAY[]::integer[]) AS ids_insumo_legacy,
           COALESCE(ms.estados_mapeo_maestro, ARRAY[]::text[]) AS estados_mapeo_maestro,
-          COALESCE(conv.conversiones, '[]'::jsonb) AS conversiones_disponibles
+          COALESCE(conv.conversiones, '[]'::jsonb) AS conversiones_disponibles,
+          COALESCE(warehouses.almacenes, '[]'::jsonb) AS almacenes_disponibles
         FROM public.vw_insumos_maestros_almacen v
         LEFT JOIN public.unidades_medida um
           ON um.id_unidad_medida = v.id_unidad_medida
@@ -760,7 +875,8 @@ router.get('/catalogos/insumos', checkPermission(MENU_SALSAS_VIEW_PERMISSIONS), 
               'unidad_nombre', umc.nombre,
               'unidad_simbolo', umc.simbolo,
               'cantidad_presentacion', ip.cantidad_presentacion,
-              'cantidad_base', ip.cantidad_base
+              'cantidad_base', ip.cantidad_base,
+              'id_unidad_base', ip.id_unidad_base
             )
             ORDER BY umc.nombre ASC, ip.id_presentacion ASC
           ) AS conversiones
@@ -773,6 +889,23 @@ router.get('/catalogos/insumos', checkPermission(MENU_SALSAS_VIEW_PERMISSIONS), 
             AND ip.cantidad_presentacion > 0
             AND ip.cantidad_base > 0
         ) conv ON true
+        LEFT JOIN LATERAL (
+          SELECT jsonb_agg(
+            jsonb_build_object(
+              'id_almacen', ia.id_almacen,
+              'id_sucursal', a.id_sucursal,
+              'cantidad', ia.cantidad,
+              'stock_minimo', ia.stock_minimo
+            )
+            ORDER BY ia.id_almacen
+          ) AS almacenes
+          FROM public.insumos_almacenes ia
+          INNER JOIN public.almacenes a
+            ON a.id_almacen = ia.id_almacen
+           AND COALESCE(a.estado, true) IS TRUE
+          WHERE ia.id_insumo = v.id_insumo_maestro
+            AND COALESCE(ia.estado, true) IS TRUE
+        ) warehouses ON true
         WHERE v.estado_global IS TRUE
           AND v.estado_local IS TRUE
         ORDER BY
@@ -1219,9 +1352,11 @@ router.put('/:id_salsa/inventario', checkPermission(MENU_SALSAS_EDIT_PERMISSIONS
     );
 
     invalidateVentasComplementCatalogCache('configurar inventario de salsa');
+    const inventoryState = await fetchSalsaInventoryStateById(idSalsa);
     return res.status(200).json({
       error: false,
-      message: data.id_insumo ? 'Consumo de salsa configurado correctamente.' : 'Configuracion de consumo retirada correctamente.'
+      message: data.id_insumo ? 'Consumo de salsa configurado correctamente.' : 'Configuracion de consumo retirada correctamente.',
+      data: inventoryState
     });
   } catch (err) {
     console.error('Error al configurar inventario de salsa admin:', err.message);

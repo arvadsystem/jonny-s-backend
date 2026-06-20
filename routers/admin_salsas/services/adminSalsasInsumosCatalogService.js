@@ -41,7 +41,12 @@ const buildMappingBlockReason = ({ masterId, legacyIds, status }) => {
   const legacyLabel = legacyIds.length > 0
     ? `los mapeos legacy ${legacyIds.map((id) => `#${id}`).join(', ')}`
     : 'su mapeo maestro';
-  return `El maestro #${masterId} esta bloqueado porque ${legacyLabel} mantiene estado ${status}.`;
+  const statusReason = status === 'AMBIGUO'
+    ? 'tiene relaciones ambiguas'
+    : status === 'PENDIENTE'
+      ? 'esta pendiente de validacion'
+      : 'requiere revision manual';
+  return `El maestro #${masterId} no esta disponible porque ${legacyLabel} ${statusReason}.`;
 };
 
 export const buildAdminSalsasInsumosCatalog = (rows) => {
@@ -92,6 +97,16 @@ export const buildAdminSalsasInsumosCatalog = (rows) => {
       conversiones_disponibles: Array.isArray(row.conversiones_disponibles)
         ? row.conversiones_disponibles
         : [],
+      almacenes: Array.isArray(row.almacenes_disponibles)
+        ? row.almacenes_disponibles
+        : [],
+      estado_estructural: {
+        activo: row.estado === true,
+        tiene_unidad_base: Boolean(toPositiveInt(row.id_unidad_medida)),
+        tiene_almacenes: Array.isArray(row.almacenes_disponibles)
+          ? row.almacenes_disponibles.length > 0
+          : Array.isArray(row.id_almacenes) && row.id_almacenes.length > 0
+      },
       metadata: {
         mapping_count: Number(row.mapping_count || 0),
         id_insumo_maestro: idInsumoMaestro,

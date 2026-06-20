@@ -133,7 +133,6 @@ import {
 import { resolveExtrasInventory } from './ventas/services/extrasInventoryService.js';
 import {
   attachSalsaInventorySnapshotsToLines,
-  consumeSalsasInventoryFromSnapshots,
   getSelectedSalsaIdsFromLines
 } from './ventas/services/salsasInventoryService.js';
 
@@ -7857,15 +7856,6 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
       };
     }
     ventasPerf.add('pedido_ms', pedidoStart);
-    await consumeSalsasInventoryFromSnapshots({
-      client,
-      lines: pedidoPendiente.pedido_lines,
-      idUsuario: userId,
-      idReferencia: idPedido,
-      refOrigen: 'PEDIDO_PENDIENTE_SALSA',
-      descripcion: 'Salida por salsas en pedido pendiente'
-    });
-
     const hasDetallePedidoConfiguracionMenu = await hasColumn(client, 'detalle_pedido', 'configuracion_menu');
     const detalleStart = ventasPerf.now();
     const pedidoLineRefs = [];
@@ -9404,15 +9394,6 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
     const fechaHoraFacturacion = facturaRow.fecha_hora_facturacion || fechaHoraPedido || null;
     ventasPerf.add('factura_insert_ms', facturaInsertStart);
     ventasPerf.add('factura_ms', facturaInsertStart);
-    await consumeSalsasInventoryFromSnapshots({
-      client,
-      lines: venta.all_lines,
-      idUsuario: venta.id_usuario,
-      idReferencia: idFactura,
-      refOrigen: 'VENTA_SALSA',
-      descripcion: `Salida por salsas en venta ${correlativoVenta.codigo}`
-    });
-
     const facturaSnapshotStart = ventasPerf.now();
     const facturacionVenta = await obtenerConfigFacturacionParaVenta(client, venta.id_sucursal, {
       perf: ventasPerf

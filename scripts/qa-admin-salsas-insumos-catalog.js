@@ -42,18 +42,18 @@ const makeRow = ({
 
 const catalog = buildAdminSalsasInsumosCatalog([
   makeRow({
-    id: 191,
+    id: 30,
     nombre: 'SALSA CAJUN',
     idAlmacen: 1,
     legacyIds: [30, 191],
-    statuses: ['REQUIERE_REVISION', 'VALIDADO']
+    statuses: ['VALIDADO']
   }),
   makeRow({
-    id: 191,
+    id: 30,
     nombre: 'SALSA CAJUN',
     idAlmacen: 2,
     legacyIds: [30, 191],
-    statuses: ['REQUIERE_REVISION', 'VALIDADO']
+    statuses: ['VALIDADO']
   }),
   makeRow({
     id: 205,
@@ -87,15 +87,40 @@ const catalog = buildAdminSalsasInsumosCatalog([
 
 const cajunRows = catalog.filter((item) => item.nombre === 'SALSA CAJUN');
 assert.equal(cajunRows.length, 1, '#30 y #191 SALSA CAJUN deben producir una sola opcion visual');
-assert.equal(cajunRows[0].id_insumo, 191, 'la opcion SALSA CAJUN debe usar el ID maestro');
-assert.equal(cajunRows[0].seleccionable, false, 'SALSA CAJUN debe seguir bloqueada con REQUIERE_REVISION');
-assert.match(
-  cajunRows[0].motivo_bloqueo,
-  /maestro #191.*legacy #30.*REQUIERE_REVISION/i,
-  'el bloqueo debe identificar maestro, legacy y estado pendiente'
-);
-assert.deepEqual(cajunRows[0].metadata.ids_insumo_legacy, [30], 'el ID legacy debe existir solo como metadata');
+assert.equal(cajunRows[0].id_insumo, 30, 'la opcion SALSA CAJUN debe publicar el maestro #30');
+assert.equal(cajunRows[0].seleccionable, true, 'SALSA CAJUN VALIDADA debe quedar seleccionable');
+assert.equal(cajunRows[0].estado_mapeo_maestro, 'VALIDADO');
+assert.deepEqual(cajunRows[0].metadata.ids_insumo_legacy, [191], 'el legacy #191 debe existir solo como metadata');
 assert.equal('ids_insumo_legacy' in cajunRows[0], false, 'los IDs legacy no deben exponerse al nivel visual');
+
+const blockedCajun = buildAdminSalsasInsumosCatalog([
+  makeRow({
+    id: 30,
+    nombre: 'SALSA CAJUN',
+    idAlmacen: 1,
+    legacyIds: [30, 191],
+    statuses: ['REQUIERE_REVISION', 'VALIDADO']
+  })
+])[0];
+assert.equal(blockedCajun.seleccionable, false, 'un mapeo REQUIERE_REVISION debe mantener bloqueado el maestro');
+assert.match(blockedCajun.motivo_bloqueo, /maestro #30.*legacy #191.*revision manual/i);
+
+const saneadas = buildAdminSalsasInsumosCatalog([
+  [22, 189, 'SALSA BARBACOA'],
+  [30, 191, 'SALSA CAJUN'],
+  [24, 193, 'SALSA HONEY HOT'],
+  [20, 195, 'SALSA MIEL MOSTAZA'],
+  [23, 125, 'SALSA SWEET CHILI']
+].flatMap(([masterId, legacyId, nombre]) => [1, 2].map((idAlmacen) => makeRow({
+  id: masterId,
+  nombre,
+  idAlmacen,
+  legacyIds: [masterId, legacyId],
+  statuses: ['VALIDADO']
+}))));
+assert.equal(saneadas.length, 5, 'las cinco salsas saneadas deben producir cinco opciones sin duplicados por almacen');
+assert.ok(saneadas.every((item) => item.seleccionable), 'las cinco salsas saneadas deben quedar seleccionables');
+assert.deepEqual(saneadas.map((item) => item.id_insumo).sort((a, b) => a - b), [20, 22, 23, 24, 30]);
 
 const chipotleRows = catalog.filter((item) => item.id_insumo === 205);
 assert.equal(chipotleRows.length, 1, 'un maestro VALIDADO debe aparecer una sola vez');

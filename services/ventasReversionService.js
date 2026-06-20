@@ -775,11 +775,17 @@ const buildSalsaInventorySnapshotsForReturn = (lineas = []) => {
     const soldQty = Number(source?.cantidad || 0);
     const reversedQty = Number(line?.cantidad_revertida || 0);
     const ratio = soldQty > 0 && reversedQty > 0 ? Math.min(1, reversedQty / soldQty) : 1;
+    const aggregateSnapshotsSeen = new Set();
     for (const entry of selection) {
       const snapshot = entry?.inventario;
       if (!snapshot || typeof snapshot !== 'object') continue;
       const totalBase = Number(snapshot.cantidad_base_total || 0);
       if (totalBase <= 0) continue;
+      const aggregateKey = `${Number(snapshot.id_salsa || entry?.id_salsa || 0)}:${Number(snapshot.id_insumo || 0)}:${Number(snapshot.id_almacen || 0)}`;
+      if (Number(snapshot.porciones || 0) > 1) {
+        if (aggregateSnapshotsSeen.has(aggregateKey)) continue;
+        aggregateSnapshotsSeen.add(aggregateKey);
+      }
       snapshots.push({
         ...snapshot,
         cantidad_base_total: totalBase * ratio,
@@ -788,6 +794,31 @@ const buildSalsaInventorySnapshotsForReturn = (lineas = []) => {
     }
   }
   return snapshots;
+};
+
+const filterConsumedSalsaSnapshots = async ({ client, idPedido, idFactura, snapshots }) => {
+  const pedidoId = parsePositiveInt(idPedido);
+  const facturaId = parsePositiveInt(idFactura);
+  if (!pedidoId && !facturaId) return [];
+
+  const result = await client.query(
+    `
+      SELECT DISTINCT mi.id_insumo, mi.id_almacen
+      FROM public.movimientos_inventario mi
+      WHERE mi.tipo = 'SALIDA'
+        AND mi.id_insumo IS NOT NULL
+        AND (
+          (mi.ref_origen IN ('PEDIDO', 'FALTANTE_COCINA') AND mi.id_ref = $1)
+          OR (mi.ref_origen = 'PEDIDO_PENDIENTE_SALSA' AND mi.id_ref = $1)
+          OR (mi.ref_origen = 'VENTA_SALSA' AND mi.id_ref = $2)
+        )
+    `,
+    [pedidoId, facturaId]
+  );
+  const consumedKeys = new Set((result.rows || []).map((row) => `${Number(row.id_insumo)}:${Number(row.id_almacen)}`));
+  return (Array.isArray(snapshots) ? snapshots : []).filter((snapshot) => (
+    consumedKeys.has(`${Number(snapshot?.id_insumo)}:${Number(snapshot?.id_almacen)}`)
+  ));
 };
 
 export const listFacturaReversiones = async ({ idFactura, idUsuario }) => {
@@ -1126,9 +1157,15 @@ export const createVentaReversion = async ({ idFactura, body, req, idUsuario, id
       codigoVenta: factura.codigo_venta || `VTA-${String(facturaId).padStart(5, '0')}`,
       lineas: reversionLines
     });
+    const salsaSnapshots = await filterConsumedSalsaSnapshots({
+      client,
+      idPedido: factura.id_pedido,
+      idFactura: facturaId,
+      snapshots: buildSalsaInventorySnapshotsForReturn(reversionLines)
+    });
     await restoreSalsasInventoryFromSnapshots({
       client,
-      snapshots: buildSalsaInventorySnapshotsForReturn(reversionLines),
+      snapshots: salsaSnapshots,
       idReversion,
       codigoReversion: correlativo.codigo,
       codigoVenta: factura.codigo_venta || `VTA-${String(facturaId).padStart(5, '0')}`

@@ -9,6 +9,10 @@ import { resolveRequestUserSucursalScope } from '../utils/sucursalScope.js';
 import { enviarCorreo } from '../utils/emailService.js';
 import { validarYDescontarPedido } from '../services/inventarioPedidoService.js';
 import { registrarAlertasInventarioPedido } from '../services/inventarioAlertasService.js';
+import {
+  buildSalsaConsumptionItemsFromPedidoDetails,
+  loadLegacySalsaConsumptionByStockKey
+} from '../services/salsasPedidoSnapshotService.js';
 
 const router = express.Router();
 
@@ -394,6 +398,24 @@ const buildPedidoConsumoPayload = async (client, idPedido, idSucursal) => {
       cantidad: extra.cantidad
     });
   }
+
+  const legacySalsaConsumption = await loadLegacySalsaConsumptionByStockKey(client, idPedido);
+  const salsaConsumption = buildSalsaConsumptionItemsFromPedidoDetails(detailsResult.rows, {
+    legacyConsumedByStockKey: legacySalsaConsumption
+  });
+  if (salsaConsumption.errors.length > 0) {
+    return {
+      ok: false,
+      status: 409,
+      body: {
+        error: true,
+        code: salsaConsumption.errors[0].code || 'SALSA_SNAPSHOT_INVALIDO',
+        message: salsaConsumption.errors[0].message || 'No se pudo validar el snapshot de inventario de salsas.',
+        details: salsaConsumption.errors
+      }
+    };
+  }
+  items.push(...salsaConsumption.items);
 
   if (!items.length) {
     return {
@@ -1154,10 +1176,17 @@ router.put('/cocina/pedidos/:id/estado', checkPermission(COCINA_VIEW_PERMISSIONS
         }
 
         try {
+          const strictSalsaInsumoIds = new Set(
+            consumoPayloadResult.payload.items
+              .filter((item) => item.tipo_item === 'SALSA')
+              .map((item) => parsePositiveInt(item.id_insumo))
+              .filter(Boolean)
+          );
           inventoryResult = await validarYDescontarPedido(consumoPayloadResult.payload, {
             id_usuario: req?.user?.id_usuario,
             allowNegativeStock: true,
             allowIncompleteConfiguration: true,
+            strictInsumoIds: strictSalsaInsumoIds,
             dbClient: client
           });
         } catch (inventoryError) {

@@ -412,7 +412,16 @@ export const attachSalsaInventorySnapshotsToLines = async ({ client, lines = [],
     line.complementos_detalle = line.complementos_detalle.map((salsa) => {
       const idSalsa = toPositiveInventoryInt(salsa?.id_salsa || salsa?.id_complemento);
       const snapshot = snapshots.find((entry) => Number(entry.id_salsa) === idSalsa);
-      return snapshot ? { ...salsa, inventario: snapshot } : salsa;
+      return snapshot
+        ? {
+            ...salsa,
+            inventario: {
+              ...snapshot,
+              cantidad_base_total: snapshot.cantidad_base_por_porcion,
+              porciones: 1
+            }
+          }
+        : salsa;
     });
   }
 

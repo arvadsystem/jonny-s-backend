@@ -11,7 +11,8 @@ export const ITEM_TYPES = Object.freeze({
   PRODUCTO: 'PRODUCTO',
   RECETA: 'RECETA',
   COMBO: 'COMBO',
-  EXTRA: 'EXTRA'
+  EXTRA: 'EXTRA',
+  SALSA: 'SALSA'
 });
 
 export const toPositiveInt = (value) => {
@@ -32,6 +33,7 @@ const normalizeItemType = (value) => {
   if (raw === ITEM_TYPES.RECETA) return ITEM_TYPES.RECETA;
   if (raw === ITEM_TYPES.COMBO) return ITEM_TYPES.COMBO;
   if (raw === ITEM_TYPES.EXTRA) return ITEM_TYPES.EXTRA;
+  if (raw === ITEM_TYPES.SALSA) return ITEM_TYPES.SALSA;
   return null;
 };
 
@@ -52,7 +54,7 @@ export const normalizePedidoPayload = (payload = {}) => {
     const cantidad = toPositiveNumber(row.cantidad);
 
     if (!tipoItem) {
-      errors.push(`items[${index}].tipo_item invalido. Use PRODUCTO, RECETA, COMBO o EXTRA.`);
+      errors.push(`items[${index}].tipo_item invalido. Use PRODUCTO, RECETA, COMBO, EXTRA o SALSA.`);
       continue;
     }
     if (!cantidad) {
@@ -77,6 +79,12 @@ export const normalizePedidoPayload = (payload = {}) => {
       idItem = toPositiveInt(row.id_extra ?? row.id_item_origen ?? row.id_item);
       if (!idItem) errors.push(`items[${index}].id_extra es obligatorio para tipo EXTRA.`);
     }
+    if (tipoItem === ITEM_TYPES.SALSA) {
+      idItem = toPositiveInt(row.id_salsa ?? row.id_item_origen ?? row.id_item);
+      if (!idItem) errors.push(`items[${index}].id_salsa es obligatorio para tipo SALSA.`);
+      if (!toPositiveInt(row.id_insumo)) errors.push(`items[${index}].id_insumo es obligatorio para tipo SALSA.`);
+      if (!toPositiveInt(row.id_almacen)) errors.push(`items[${index}].id_almacen es obligatorio para tipo SALSA.`);
+    }
 
     if (idItem) {
       items.push({
@@ -88,7 +96,9 @@ export const normalizePedidoPayload = (payload = {}) => {
         id_receta: tipoItem === ITEM_TYPES.RECETA ? idItem : toPositiveInt(row.id_receta) || null,
         id_combo: tipoItem === ITEM_TYPES.COMBO ? idItem : toPositiveInt(row.id_combo) || null,
         id_extra: tipoItem === ITEM_TYPES.EXTRA ? idItem : toPositiveInt(row.id_extra) || null,
+        id_salsa: tipoItem === ITEM_TYPES.SALSA ? idItem : toPositiveInt(row.id_salsa) || null,
         id_insumo: toPositiveInt(row.id_insumo) || null,
+        id_almacen: toPositiveInt(row.id_almacen) || null,
         cant: toPositiveNumber(row.cant ?? row.cantidad_insumo) || null,
         id_unidad_medida: toPositiveInt(row.id_unidad_medida) || null,
         codigo: typeof row.codigo === 'string' ? row.codigo.trim() || null : null,

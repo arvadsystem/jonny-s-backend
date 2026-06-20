@@ -1,6 +1,11 @@
 import assert from 'node:assert/strict';
 import { buildInventoryState } from '../routers/admin_salsas/services/salsaInventoryAdminStateService.js';
 import { classifySalsaMapping } from '../routers/ventas/services/salsasInventoryPolicyService.js';
+import { readFileSync } from 'node:fs';
+
+const routerSource = readFileSync(new URL('../routers/admin_salsas.js', import.meta.url), 'utf8');
+assert.match(routerSource, /los IDs legacy no se pueden guardar en salsas/, 'PUT inventario debe rechazar IDs legacy');
+assert.match(routerSource, /data: inventoryState/, 'PUT inventario debe responder el estado recalculado');
 
 const makeSalsa = (id, overrides = {}) => ({
   id_salsa: id,
