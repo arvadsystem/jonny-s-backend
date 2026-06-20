@@ -21,6 +21,7 @@ import {
   autoPublishNewRecipe,
   moveRecipePublicationToMenu
 } from '../services/menuAutoPublicationService.js';
+import { clearVentasCajaBootstrapCache } from './ventas/services/cajaBootstrapCacheService.js';
 import {
   isCatalogoMaestroReadsEnabled,
   isCatalogoMaestroViewMissingError,
@@ -36,6 +37,14 @@ import {
 } from '../services/recetaInsumosMaestrosService.js';
 
 const router = express.Router();
+router.use((req, res, next) => {
+  if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method)) {
+    res.once('finish', () => {
+      if (res.statusCode >= 200 && res.statusCode < 400) clearVentasCajaBootstrapCache();
+    });
+  }
+  next();
+});
 const RECETAS_PERF_LOGS_ENABLED = String(process.env.RECETAS_PERF_LOGS || '').trim().toLowerCase() === 'true';
 
 const createRecetasPerfTracker = (endpoint, ingredientCount) => {

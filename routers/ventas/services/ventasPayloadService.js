@@ -87,6 +87,8 @@ export const normalizeVentaItems = (items) => {
 
     const recetaResult = parseEntityIdentifier(item.id_receta, 'id_receta');
     if (!recetaResult.ok) return { ok: false, message: recetaResult.message };
+    const extraResult = parseEntityIdentifier(item.id_extra, 'id_extra');
+    if (!extraResult.ok) return { ok: false, message: extraResult.message };
 
     const cantidad = parsePositiveInt(item.cantidad);
     if (!cantidad) {
@@ -99,14 +101,15 @@ export const normalizeVentaItems = (items) => {
     const presentIds = [
       ['PRODUCTO', productoResult.value],
       ['COMBO', comboResult.value],
-      ['RECETA', recetaResult.value]
+      ['RECETA', recetaResult.value],
+      ['ITEM', extraResult.value]
     ].filter(([, value]) => value !== null);
 
     if (presentIds.length !== 1) {
       return {
         ok: false,
         message:
-          'Cada item debe incluir exactamente uno entre id_producto, id_combo o id_receta.'
+          'Cada item debe incluir exactamente uno entre id_producto, id_combo, id_receta o id_extra.'
       };
     }
 
@@ -148,6 +151,7 @@ export const normalizeVentaItems = (items) => {
       id_producto: kind === 'PRODUCTO' ? entityId : null,
       id_combo: kind === 'COMBO' ? entityId : null,
       id_receta: kind === 'RECETA' ? entityId : null,
+      id_extra: kind === 'ITEM' ? entityId : null,
       observacion: normalizeObservation(item.observacion),
       id_descuento_catalogo_linea: idDescuentoCatalogoLinea,
       complementos: complementosResult.data,

@@ -45,6 +45,7 @@ import {
   resolveRecetaComplementMetadata
 } from './ventas/services/complementosCatalogService.js';
 import {
+  getCajaBootstrapHandler,
   listCategoriasCatalogoHandler,
   listClientesCatalogoHandler,
   listCombosCatalogoHandler,
@@ -134,7 +135,10 @@ import {
   logVentasPerfRoute,
   logVentasPerfStartupIfEnabled
 } from './ventas/utils/perfUtils.js';
-import { resolveExtrasInventory } from './ventas/services/extrasInventoryService.js';
+import {
+  fetchVentaGlobalExtrasCatalog,
+  resolveExtrasInventory
+} from './ventas/services/extrasInventoryService.js';
 import {
   attachSalsaInventorySnapshotsToLines,
   getSelectedSalsaIdsFromLines
@@ -1959,7 +1963,7 @@ const buildInvalidComplementResult = ({ item, nombreItem, allowed = [], reason }
 };
 
 const resolveLineComplementos = ({ item, receta, combo, context, nombreItem }) => {
-  if (item.kind === 'PRODUCTO') {
+  if (item.kind === 'PRODUCTO' || item.kind === 'ITEM') {
     if (Array.isArray(item.complementos) && item.complementos.length > 0) {
       return buildInvalidComplementResult({ item, nombreItem, reason: 'PRODUCTO_NO_PERMITE_COMPLEMENTOS' });
     }
@@ -2063,19 +2067,6 @@ const itemHasRequestedExtras = (item) =>
   Array.isArray(item?.extras) && item.extras.some((extra) => parseOptionalPositiveInt(extra?.id_extra));
 
 const buildAllowedExtrasMap = async (client, { normalizedItems = [], idSucursal = null, perf = null, allowedExtrasSchema = null } = {}) => {
-  const recetaIds = [...new Set(
-    normalizedItems
-      .filter((item) => item.kind === 'RECETA')
-      .map((item) => Number(item.id_receta || 0))
-      .filter((id) => id > 0)
-  )];
-  const comboIds = [...new Set(
-    normalizedItems
-      .filter((item) => item.kind === 'COMBO')
-      .map((item) => Number(item.id_combo || 0))
-      .filter((id) => id > 0)
-  )];
-
   const needsExtras = normalizedItems.some((item) => itemHasRequestedExtras(item));
   if (!needsExtras) return new Map();
   const requestedExtraIds = [...new Set(
@@ -2085,86 +2076,19 @@ const buildAllowedExtrasMap = async (client, { normalizedItems = [], idSucursal 
       .filter((id) => id > 0)
   )];
   if (requestedExtraIds.length === 0) return new Map();
-  if (recetaIds.length === 0 && comboIds.length === 0) return new Map();
-
-  const {
-    hasMenuExtras,
-    hasMenuExtraReceta,
-    hasMenuExtraCombo
-  } = allowedExtrasSchema || await resolvePedidoPendienteAllowedExtrasSchema(client, perf);
+  const { hasMenuExtras } = allowedExtrasSchema || await resolvePedidoPendienteAllowedExtrasSchema(client, perf);
   if (!hasMenuExtras) return new Map();
-  if (!hasMenuExtraReceta && !hasMenuExtraCombo) return new Map();
-
-  const params = [recetaIds, comboIds, parseOptionalPositiveInt(idSucursal), requestedExtraIds];
-  const allowedItemSqlParts = [];
-  if (hasMenuExtraReceta && recetaIds.length > 0) {
-    allowedItemSqlParts.push(`
-      SELECT
-        'RECETA'::text AS tipo,
-        mer.id_receta AS id_item,
-        mer.id_extra,
-        COALESCE(mer.orden, 0) AS orden
-      FROM typed_params p
-      INNER JOIN public.menu_extra_receta mer
-        ON mer.id_receta = ANY(p.receta_ids)
-       AND mer.id_extra = ANY(p.extra_ids)
-      WHERE COALESCE(mer.estado, true) = true
-    `);
-  }
-  if (hasMenuExtraCombo && comboIds.length > 0) {
-    allowedItemSqlParts.push(`
-      SELECT
-        'COMBO'::text AS tipo,
-        mec.id_combo AS id_item,
-        mec.id_extra,
-        0 AS orden
-      FROM typed_params p
-      INNER JOIN public.menu_extra_combo mec
-        ON mec.id_combo = ANY(p.combo_ids)
-       AND mec.id_extra = ANY(p.extra_ids)
-      WHERE COALESCE(mec.estado, true) = true
-    `);
-  }
-  if (allowedItemSqlParts.length === 0) return new Map();
-  const allowedItemsSql = allowedItemSqlParts.join('\nUNION ALL\n');
+  const normalizedSucursalId = parseOptionalPositiveInt(idSucursal);
+  if (!normalizedSucursalId) return new Map();
 
   const allowedExtrasQueryStart = perf?.now?.() || 0;
   let rows = [];
   try {
-    const result = await client.query(
-      `
-        WITH typed_params AS (
-          SELECT
-            $1::int[] AS receta_ids,
-            $2::int[] AS combo_ids,
-            $3::int AS id_sucursal,
-            $4::int[] AS extra_ids
-        ),
-        allowed_items AS (
-          ${allowedItemsSql}
-        )
-        SELECT
-          ai.tipo,
-          ai.id_item,
-          me.id_extra,
-          me.codigo,
-          me.nombre,
-          me.precio_adicional,
-          me.estado,
-          me.id_insumo,
-          me.cant,
-          me.id_unidad_medida
-        FROM typed_params p
-        INNER JOIN allowed_items ai
-          ON true
-        INNER JOIN public.menu_extras me
-          ON me.id_extra = ai.id_extra
-         AND COALESCE(me.estado, true) = true
-        ORDER BY ai.tipo, ai.id_item, ai.orden, me.nombre
-      `,
-      params
-    );
-    rows = result.rows;
+    rows = await fetchVentaGlobalExtrasCatalog({
+      queryRunner: client,
+      idSucursal: normalizedSucursalId,
+      extraIds: requestedExtraIds
+    });
   } finally {
     perf?.add?.('pedido_pendiente_allowed_extras_query_ms', allowedExtrasQueryStart);
   }
@@ -2185,18 +2109,94 @@ const buildAllowedExtrasMap = async (client, { normalizedItems = [], idSucursal 
   );
 
   return new Map(
-    rows.map((row) => {
+    normalizedItems.flatMap((item) => {
+      const itemId = item.kind === 'RECETA' ? Number(item.id_receta || 0) : item.kind === 'COMBO' ? Number(item.id_combo || 0) : 0;
+      if (!['RECETA', 'COMBO'].includes(item.kind) || itemId <= 0) return [];
+      return rows.map((row) => {
       const inventory = inventoryByExtraId.get(Number(row.id_extra)) || {};
       return [
-        buildExtraLineKey(row.tipo, row.id_item, row.id_extra),
+        buildExtraLineKey(item.kind, itemId, row.id_extra),
         {
-          tipo: String(row.tipo || '').trim().toUpperCase(),
-          id_item: Number(row.id_item || 0),
+          tipo: String(item.kind || '').trim().toUpperCase(),
+          id_item: itemId,
           id_extra: Number(row.id_extra || 0),
           codigo: String(row.codigo || '').trim(),
           nombre: String(row.nombre || 'Extra').trim(),
-          precio_unitario: roundMoney(row.precio_adicional),
+          precio_unitario: roundMoney(row.precio),
           estado: parseBooleanish(row.estado),
+          id_insumo_configurado: parseOptionalPositiveInt(inventory.id_insumo_configurado),
+          id_insumo_maestro: parseOptionalPositiveInt(inventory.id_insumo_maestro),
+          id_insumo_legacy: parseOptionalPositiveInt(inventory.id_insumo_legacy),
+          id_insumo: inventory.usa_catalogo_maestro
+            ? parseOptionalPositiveInt(inventory.id_insumo_maestro)
+            : parseOptionalPositiveInt(inventory.id_insumo_legacy || inventory.id_insumo_configurado),
+          cantidad_insumo: Number(inventory.cantidad_consumo_base || 0),
+          id_unidad_medida: parseOptionalPositiveInt(inventory.id_unidad_base),
+          stock_disponible: inventory.stock_disponible === null || inventory.stock_disponible === undefined
+            ? null
+            : Number(inventory.stock_disponible),
+          id_almacen: parseOptionalPositiveInt(inventory.id_almacen),
+          inventario_configurado: Boolean(inventory.inventario_configurado),
+          disponible: Boolean(inventory.disponible),
+          motivo_no_disponible: inventory.motivo_no_disponible || null,
+          codigo_no_disponible: inventory.codigo_no_disponible || null,
+          usa_catalogo_maestro: Boolean(inventory.usa_catalogo_maestro)
+        }
+      ];
+      });
+    })
+  );
+};
+
+const buildStandaloneExtraCatalogMap = async (client, { normalizedItems = [], idSucursal = null, perf = null } = {}) => {
+  const normalizedSucursalId = parseOptionalPositiveInt(idSucursal);
+  if (!normalizedSucursalId) return new Map();
+
+  const standaloneExtraIds = [...new Set(
+    normalizedItems
+      .filter((item) => item.kind === 'ITEM')
+      .map((item) => parseOptionalPositiveInt(item.id_extra))
+      .filter(Boolean)
+  )];
+  if (standaloneExtraIds.length === 0) return new Map();
+
+  const extrasQueryStart = perf?.now?.() || 0;
+  let rows = [];
+  try {
+    rows = await fetchVentaGlobalExtrasCatalog({
+      queryRunner: client,
+      idSucursal: normalizedSucursalId,
+      extraIds: standaloneExtraIds
+    });
+  } finally {
+    perf?.add?.('pedido_pendiente_standalone_extras_query_ms', extrasQueryStart);
+  }
+
+  const uniqueExtrasById = new Map();
+  for (const row of rows) {
+    const idExtra = parseOptionalPositiveInt(row.id_extra);
+    if (idExtra && !uniqueExtrasById.has(idExtra)) uniqueExtrasById.set(idExtra, row);
+  }
+
+  const resolvedInventoryRows = await resolveExtrasInventory({
+    queryRunner: client,
+    extras: [...uniqueExtrasById.values()],
+    idSucursal: normalizedSucursalId,
+    mode: 'transactional'
+  });
+
+  return new Map(
+    resolvedInventoryRows.map((inventory) => {
+      const idExtra = Number(inventory.id_extra || 0);
+      const raw = uniqueExtrasById.get(idExtra) || inventory || {};
+      return [
+        idExtra,
+        {
+          id_extra: idExtra,
+          codigo: String(raw.codigo || '').trim(),
+          nombre: String(raw.nombre || 'Extra').trim(),
+          precio_unitario: roundMoney(raw.precio),
+          estado: parseBooleanish(raw.estado),
           id_insumo_configurado: parseOptionalPositiveInt(inventory.id_insumo_configurado),
           id_insumo_maestro: parseOptionalPositiveInt(inventory.id_insumo_maestro),
           id_insumo_legacy: parseOptionalPositiveInt(inventory.id_insumo_legacy),
@@ -2222,7 +2222,7 @@ const buildAllowedExtrasMap = async (client, { normalizedItems = [], idSucursal 
 
 const resolveLineExtras = ({ item, allowedExtrasMap }) => {
   const requested = Array.isArray(item.extras) ? item.extras : [];
-  if (item.kind === 'PRODUCTO') {
+  if (item.kind === 'PRODUCTO' || item.kind === 'ITEM') {
     if (requested.length > 0) return { ok: false, message: 'Los productos no permiten extras.' };
     return { ok: true, selected: [], subtotal: 0 };
   }
@@ -2926,7 +2926,6 @@ const hydrateVentaLines = async (client, normalizedItems, perf = null, options =
         .map((item) => item.id_receta)
     )
   ];
-
   const catalogosStart = perf?.now?.() || 0;
   const { productoMap, comboMap, recetaMap } = await fetchVentaCatalogMaps(client, {
     productoIds,
@@ -2947,7 +2946,7 @@ const hydrateVentaLines = async (client, normalizedItems, perf = null, options =
     ? await resolvePedidoPendienteAllowedExtrasSchema(client, perf)
     : null;
 
-  const [complementContext, allowedExtrasMap] = await Promise.all([
+  const [complementContext, allowedExtrasMap, standaloneExtraCatalogMap] = await Promise.all([
     buildVentaComplementContext({
       client,
       normalizedItems,
@@ -2969,7 +2968,12 @@ const hydrateVentaLines = async (client, normalizedItems, perf = null, options =
         perf?.add?.('totals_extras_ms', extrasStart);
         perf?.add?.('validation_extras_ms', extrasStart);
       }
-    })()
+    })(),
+    buildStandaloneExtraCatalogMap(client, {
+      normalizedItems,
+      idSucursal: options?.idSucursal,
+      perf
+    })
   ]);
 
   const totalsItemsStart = perf?.now?.() || 0;
@@ -3091,6 +3095,114 @@ const hydrateVentaLines = async (client, normalizedItems, perf = null, options =
         complementos_metadata: complementosResult.metadata,
         complementos_detalle: complementosResult.selected,
         extras_detalle: []
+      });
+      subTotals.push(subTotal);
+      continue;
+    }
+
+    if (item.kind === 'ITEM') {
+      const extra = standaloneExtraCatalogMap.get(Number(item.id_extra || 0));
+      if (!extra || extra.estado !== true) {
+        return {
+          ok: false,
+          status: 400,
+          body: { error: true, message: `Extra no encontrado: ${item.id_extra}` }
+        };
+      }
+
+      const precioUnitario = roundMoney(extra.precio_unitario);
+      if (!Number.isFinite(precioUnitario) || precioUnitario <= 0) {
+        return {
+          ok: false,
+          status: 409,
+          body: {
+            error: true,
+            code: VENTA_MONTO_COBRO_INVALIDO_CODE,
+            message: VENTA_MONTO_COBRO_INVALIDO_MESSAGE
+          }
+        };
+      }
+
+      if (extra.disponible !== true) {
+        return {
+          ok: false,
+          status: 409,
+          body: {
+            error: true,
+            code: 'VENTAS_EXTRA_INVENTARIO_NO_DISPONIBLE',
+            message: `El extra ${extra.nombre} no esta disponible en esta sucursal: ${String(extra.motivo_no_disponible || 'requiere revisar su configuracion de inventario.').toLowerCase()}`
+          }
+        };
+      }
+
+      const controlsInventory = Boolean(extra.id_insumo_configurado);
+      const requiredInsumo = controlsInventory ? Number(extra.cantidad_insumo || 0) * Number(item.cantidad || 0) : 0;
+      if (controlsInventory && (!extra.inventario_configurado || !extra.id_insumo || !extra.id_almacen || requiredInsumo <= 0)) {
+        return {
+          ok: false,
+          status: 409,
+          body: {
+            error: true,
+            code: 'VENTAS_EXTRA_INVENTARIO_NO_DISPONIBLE',
+            message: `El extra ${extra.nombre} no esta disponible en esta sucursal: requiere revisar su configuracion de inventario.`
+          }
+        };
+      }
+      if (controlsInventory && Number(extra.stock_disponible ?? 0) < requiredInsumo) {
+        return {
+          ok: false,
+          status: 409,
+          body: {
+            error: true,
+            code: 'VENTAS_EXTRA_INVENTARIO_NO_DISPONIBLE',
+            message: `No hay existencias suficientes para el extra ${extra.nombre}.`
+          }
+        };
+      }
+
+      const subTotal = roundMoney(precioUnitario * item.cantidad);
+      const standaloneExtraDetail = {
+        id_extra: extra.id_extra,
+        codigo: extra.codigo,
+        nombre: extra.nombre,
+        cantidad: Number(item.cantidad || 0),
+        precio_unitario: precioUnitario,
+        subtotal: subTotal,
+        id_insumo: controlsInventory ? extra.id_insumo : null,
+        cantidad_insumo: controlsInventory ? Number(extra.cantidad_insumo || 0) : null,
+        cant: controlsInventory ? Number(extra.cantidad_insumo || 0) : null,
+        id_unidad_medida: extra.id_unidad_medida,
+        stock_disponible: extra.stock_disponible,
+        id_almacen: extra.id_almacen
+      };
+
+      lines.push({
+        kind: 'ITEM',
+        cart_key: item.cart_key,
+        requiere_cocina: true,
+        id_producto: null,
+        id_combo: null,
+        id_receta: null,
+        id_extra: item.id_extra,
+        id_descuento_catalogo_linea: item.id_descuento_catalogo_linea ?? null,
+        id_almacen: extra.id_almacen ?? null,
+        nombre_item: extra.nombre || `Extra #${item.id_extra}`,
+        cantidad: item.cantidad,
+        precio_unitario: precioUnitario,
+        sub_total: subTotal,
+        base_sub_total: subTotal,
+        subtotal_extras: 0,
+        observacion: item.observacion,
+        complementos_metadata: {
+          requiere_complementos: false,
+          tipo_complemento: null,
+          minimo_complementos: 0,
+          maximo_complementos: 0,
+          complementos_disponibles: []
+        },
+        complementos_detalle: [],
+        extras_detalle: [standaloneExtraDetail],
+        es_linea_extra_independiente: true
       });
       subTotals.push(subTotal);
       continue;
@@ -4747,6 +4859,7 @@ const normalizeDescuentoCatalogoRow = (row) => {
 };
 
 router.get('/ventas/catalogos/categorias', listCategoriasCatalogoHandler);
+router.get('/ventas/caja/bootstrap', checkPermission(['VENTAS_CREAR']), getCajaBootstrapHandler);
 router.get('/ventas/catalogos/extras-permitidos', listExtrasPermitidosCatalogoHandler);
 router.get('/ventas/catalogos/productos', listProductosCatalogoHandler);
 router.get('/ventas/catalogos/clientes', listClientesCatalogoHandler);
@@ -9335,6 +9448,8 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
             id_producto: line.id_producto || null,
             id_receta: line.id_receta || null,
             id_combo: line.id_combo || null,
+            id_extra: line.id_extra || null,
+            es_linea_extra_independiente: Boolean(line.es_linea_extra_independiente),
             cantidad: Number(line.cantidad || 0),
             precio_unitario: roundMoney(line.precio_unitario),
             total_detalle: roundMoney(line.total_linea),
@@ -9465,6 +9580,8 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
         id_producto: line.id_producto || null,
         id_receta: line.id_receta || null,
         id_combo: line.id_combo || null,
+        id_extra: line.id_extra || null,
+        es_linea_extra_independiente: Boolean(line.es_linea_extra_independiente),
         cantidad: Number(line.cantidad || 0),
         precio_unitario: roundMoney(line.precio_unitario),
         total_detalle: roundMoney(line.total_linea),
