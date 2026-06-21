@@ -84,7 +84,7 @@ const buildVentaKitchenPrintPayload = (venta = {}, printerConfig = null) => {
     nombre_usuario: venta?.nombre_usuario || null,
     id_caja: Number(venta?.id_caja || 0) || null,
     nombre_caja: venta?.nombre_caja || venta?.codigo_caja || null,
-    cliente_nombre: venta?.cliente_nombre || null,
+    cliente_nombre: venta?.contacto?.nombre_contacto || venta?.cliente_nombre || null,
     modalidad: venta?.modalidad || venta?.contexto?.modalidad || null,
     canal: venta?.contexto?.canal || null,
     contacto: venta?.contacto || null,

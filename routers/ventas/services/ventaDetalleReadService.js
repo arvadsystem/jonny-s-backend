@@ -189,6 +189,7 @@ export const fetchVentaDetailHeader = async (
         s.nombre_sucursal,
         COALESCE(p.id_cliente, f.id_cliente) AS id_cliente,
         COALESCE(
+          NULLIF(TRIM(pc.nombre_contacto), ''),
           NULLIF(trim(concat_ws(' ', per.nombre, per.apellido)), ''),
           emp.nombre_empresa,
           'Consumidor final'
@@ -245,6 +246,13 @@ export const fetchVentaDetailHeader = async (
       LEFT JOIN clientes c ON c.id_cliente = COALESCE(p.id_cliente, f.id_cliente)
       LEFT JOIN personas per ON per.id_persona = c.id_persona
       LEFT JOIN empresas emp ON emp.id_empresa = c.id_empresa
+      LEFT JOIN LATERAL (
+        SELECT pc_inner.*
+        FROM public.pedidos_contacto pc_inner
+        WHERE pc_inner.id_pedido = p.id_pedido
+        ORDER BY pc_inner.id_pedido_contacto DESC
+        LIMIT 1
+      ) pc ON true
       LEFT JOIN usuarios u ON u.id_usuario = COALESCE(p.id_usuario, f.id_usuario)
       LEFT JOIN cajas cj ON cj.id_caja = f.id_caja
       LEFT JOIN cajas_sesiones cses ON cses.id_sesion_caja = f.id_sesion_caja
