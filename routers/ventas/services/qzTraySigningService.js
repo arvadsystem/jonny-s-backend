@@ -1,7 +1,7 @@
 import fs from 'node:fs/promises';
 import crypto from 'node:crypto';
 
-const CERT_PATH_ENV_KEYS = ['QZ_TRAY_CERTIFICATE_PATH', 'QZ_CERTIFICATE_PATH'];
+const CERT_PATH_ENV_KEYS = ['QZ_TRAY_CERTIFICATE_PATH', 'QZ_CERTIFICATE_PATH', 'QZ_CERT_PATH'];
 const CERT_TEXT_ENV_KEYS = ['QZ_TRAY_CERTIFICATE_TEXT', 'QZ_CERTIFICATE_TEXT'];
 const KEY_PATH_ENV_KEYS = ['QZ_TRAY_PRIVATE_KEY_PATH', 'QZ_PRIVATE_KEY_PATH'];
 const KEY_TEXT_ENV_KEYS = ['QZ_TRAY_PRIVATE_KEY_PEM', 'QZ_PRIVATE_KEY_PEM'];
@@ -58,6 +58,12 @@ export const hasQzSigningConfigured = async () => {
   return Boolean(certificate && privateKey);
 };
 
+export const getQzSignatureAlgorithm = () => {
+  const raw = String(process.env.QZ_SIGNATURE_ALGORITHM || 'SHA512').trim().toUpperCase();
+  if (!raw) return 'SHA512';
+  return raw.startsWith('RSA-') ? raw : `RSA-${raw}`;
+};
+
 export const signQzMessage = async (requestToSign) => {
   const privateKey = await getQzPrivateKeyText();
   if (!privateKey) {
@@ -73,7 +79,7 @@ export const signQzMessage = async (requestToSign) => {
     throw error;
   }
 
-  const signer = crypto.createSign('RSA-SHA512');
+  const signer = crypto.createSign(getQzSignatureAlgorithm());
   signer.update(payload);
   signer.end();
 
