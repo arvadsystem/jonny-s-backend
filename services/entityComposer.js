@@ -191,7 +191,7 @@ const getEmpresaTenantId = async (client, idEmpresa) => {
   return parsePositiveInt(rs.rows?.[0]?.id_empresa);
 };
 
-const validatePersonaPayload = (payload = {}) => {
+const validatePersonaPayload = (payload = {}, { allowOptionalLastName = false } = {}) => {
   if (!isPlainObject(payload)) return 'Payload de persona invalido.';
 
   const unknownFields = unknownFieldsFromPayload(payload, PERSONA_ALLOWED_FIELDS);
@@ -200,7 +200,9 @@ const validatePersonaPayload = (payload = {}) => {
   const nombre = toNullableTrimmed(payload.nombre);
   const apellido = toNullableTrimmed(payload.apellido);
   if (!nombre || !isSafeHumanName(nombre)) return 'nombre de persona no es valido.';
-  if (!apellido || !isSafeHumanName(apellido)) return 'apellido de persona no es valido.';
+  if ((!allowOptionalLastName && !apellido) || (apellido && !isSafeHumanName(apellido))) {
+    return 'apellido de persona no es valido.';
+  }
 
   const dni = toNullableTrimmed(payload.dni);
   if (dni && !isSafeDni(dni)) return 'dni de persona no es valido.';
@@ -279,6 +281,71 @@ const normalizeEmpresaPayload = (payload) => {
   return Object.fromEntries(Object.entries(normalized).filter(([, value]) => value !== null));
 };
 
+const CONTACT_LOOKUPS = Object.freeze({
+  direccion: { table: 'direcciones', idColumn: 'id_direccion', valueColumn: 'direccion' },
+  telefono: { table: 'telefonos', idColumn: 'id_telefono', valueColumn: 'telefono' },
+  correo: { table: 'correos', idColumn: 'id_correo', valueColumn: 'direccion_correo' }
+});
+
+const resolveOrCreateContactLookup = async (client, lookupKey, value) => {
+  const text = toNullableTrimmed(value);
+  if (!text) return null;
+  const lookup = CONTACT_LOOKUPS[lookupKey];
+  if (!lookup) throw new Error('Catalogo de contacto no soportado');
+  const inserted = await client.query(
+    `INSERT INTO public.${lookup.table} (${lookup.valueColumn})
+     VALUES ($1)
+     ON CONFLICT DO NOTHING
+     RETURNING ${lookup.idColumn}`,
+    [text]
+  );
+  const insertedId = parsePositiveInt(inserted.rows?.[0]?.[lookup.idColumn]);
+  if (insertedId) return insertedId;
+  const existing = await client.query(
+    `SELECT ${lookup.idColumn}
+     FROM public.${lookup.table}
+     WHERE ${lookup.valueColumn} = $1
+     ORDER BY ${lookup.idColumn} ASC
+     LIMIT 1`,
+    [text]
+  );
+  return parsePositiveInt(existing.rows?.[0]?.[lookup.idColumn]);
+};
+
+const createPersonaWithEmptyLastName = async (client, normalizedPersona) => {
+  const idDireccion = await resolveOrCreateContactLookup(client, 'direccion', normalizedPersona.texto_direccion);
+  const idTelefono = await resolveOrCreateContactLookup(client, 'telefono', normalizedPersona.texto_telefono);
+  const idCorreo = await resolveOrCreateContactLookup(client, 'correo', normalizedPersona.texto_correo);
+  const hasTenantColumn = await hasPersonasTenantColumn(client);
+  const columns = [
+    'nombre', 'apellido', 'fecha_nacimiento', 'genero', 'dni', 'rtn',
+    'id_direccion', 'id_telefono', 'id_correo'
+  ];
+  const values = [
+    normalizedPersona.nombre,
+    '',
+    normalizedPersona.fecha_nacimiento || null,
+    normalizedPersona.genero || null,
+    normalizedPersona.dni || null,
+    normalizedPersona.rtn || null,
+    idDireccion,
+    idTelefono,
+    idCorreo
+  ];
+  if (hasTenantColumn) {
+    columns.push('id_empresa');
+    values.push(parsePositiveInt(normalizedPersona.id_empresa));
+  }
+  const placeholders = values.map((_, index) => `$${index + 1}`).join(', ');
+  const result = await client.query(
+    `INSERT INTO public.personas (${columns.join(', ')})
+     VALUES (${placeholders})
+     RETURNING id_persona`,
+    values
+  );
+  return parsePositiveInt(result.rows?.[0]?.id_persona);
+};
+
 export const normalizeEmpleadoAtomicPayload = (payload) => {
   if (!isPlainObject(payload)) return {};
 
@@ -313,7 +380,14 @@ export const normalizeClienteAtomicPayload = (payload) => {
   return Object.fromEntries(Object.entries(normalized).filter(([, value]) => value !== null && value !== undefined));
 };
 
-export const resolveOrCreatePersona = async ({ client, req, idPersona, personaPayload, allowClientesContext = false }) => {
+export const resolveOrCreatePersona = async ({
+  client,
+  req,
+  idPersona,
+  personaPayload,
+  allowClientesContext = false,
+  allowOptionalLastName = false
+}) => {
   const tenantId = parsePositiveInt(req?.user?.id_empresa);
   const explicitId = parsePositiveInt(idPersona);
   if (explicitId) {
@@ -334,7 +408,7 @@ export const resolveOrCreatePersona = async ({ client, req, idPersona, personaPa
     return { idPersona: explicitId, created: false };
   }
 
-  const validationError = validatePersonaPayload(personaPayload);
+  const validationError = validatePersonaPayload(personaPayload, { allowOptionalLastName });
   if (validationError) {
     const error = new Error(validationError);
     error.httpStatus = 400;
@@ -342,14 +416,17 @@ export const resolveOrCreatePersona = async ({ client, req, idPersona, personaPa
   }
 
   const normalizedPersona = normalizePersonaPayload(personaPayload);
+  if (allowOptionalLastName && !normalizedPersona.apellido) normalizedPersona.apellido = '';
   if (!Object.keys(normalizedPersona).length) {
     const error = new Error('Debe seleccionar una persona existente o completar datos de persona nueva');
     error.httpStatus = 400;
     throw error;
   }
 
-  if (!normalizedPersona.nombre || !normalizedPersona.apellido) {
-    const error = new Error('Persona nueva requiere nombre y apellido');
+  if (!normalizedPersona.nombre || (!allowOptionalLastName && !normalizedPersona.apellido)) {
+    const error = new Error(allowOptionalLastName
+      ? 'Persona nueva requiere nombre'
+      : 'Persona nueva requiere nombre y apellido');
     error.httpStatus = 400;
     throw error;
   }
@@ -375,15 +452,19 @@ export const resolveOrCreatePersona = async ({ client, req, idPersona, personaPa
     if (!requestedTenant) normalizedPersona.id_empresa = tenantId;
   }
 
-  const createResult = await client.query('SELECT fn_guardar_persona($1::json) AS resultado', [
-    JSON.stringify(normalizedPersona)
-  ]);
-
-  let idPersonaCreada = extractIdFromUnknown(createResult.rows?.[0]?.resultado, [
-    'id_persona',
-    'id',
-    'persona_id'
-  ]);
+  let idPersonaCreada = null;
+  if (allowOptionalLastName && normalizedPersona.apellido === '') {
+    idPersonaCreada = await createPersonaWithEmptyLastName(client, normalizedPersona);
+  } else {
+    const createResult = await client.query('SELECT fn_guardar_persona($1::json) AS resultado', [
+      JSON.stringify(normalizedPersona)
+    ]);
+    idPersonaCreada = extractIdFromUnknown(createResult.rows?.[0]?.resultado, [
+      'id_persona',
+      'id',
+      'persona_id'
+    ]);
+  }
 
   if (!idPersonaCreada && normalizedPersona.dni) {
     const fallbackByDni = await client.query(

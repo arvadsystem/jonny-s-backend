@@ -334,91 +334,121 @@ export const listProductosCatalogoHandler = async (req, res) => {
 export const listClientesCatalogoHandler = async (req, res) => {
   try {
     const search = String(req.query.search || '').replace(/\s+/g, ' ').trim().slice(0, 120);
+    const normalizedSearch = search
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .toLowerCase();
     const directId = parseOptionalPositiveInt(search);
     const searchDigits = search.replace(/\D/g, '');
     const isDirectIdentifier = Boolean(directId || searchDigits.length >= 4);
+    const shortDirectIdOnly = Boolean(directId && search === searchDigits && searchDigits.length < 4);
     if (search && !isDirectIdentifier && search.length < 2) {
       return res.status(200).json([]);
     }
     const parsedLimit = Number.parseInt(String(req.query.limit ?? 20), 10);
     const limit = Math.min(50, Math.max(1, Number.isInteger(parsedLimit) ? parsedLimit : 20));
+    const allMatches = Boolean(search) && parseBooleanish(req.query.all) === true;
+    const limitClause = allMatches ? '' : 'LIMIT $8';
     const query = `
+      WITH matched AS (
+        SELECT DISTINCT
+          c.id_cliente,
+          c.estado,
+          c.id_tipo_cliente,
+          tc.tipo_cliente,
+          p.nombre,
+          p.apellido,
+          p.dni,
+          p.rtn AS persona_rtn,
+          p.id_telefono AS persona_id_telefono,
+          tp.telefono AS persona_telefono,
+          e.nombre_empresa,
+          e.rtn AS empresa_rtn,
+          e.id_telefono AS empresa_id_telefono,
+          te.telefono AS empresa_telefono,
+          CASE
+            WHEN $2::int IS NOT NULL AND c.id_cliente = $2 THEN 0
+            WHEN UPPER(COALESCE(p.dni, '')) = UPPER($4) OR UPPER(COALESCE(p.rtn, '')) = UPPER($4) OR UPPER(COALESCE(e.rtn, '')) = UPPER($4) THEN 1
+            WHEN regexp_replace(COALESCE(tp.telefono, ''), '\\D', '', 'g') = $5 OR regexp_replace(COALESCE(te.telefono, ''), '\\D', '', 'g') = $5 THEN 2
+            WHEN p.nombre ILIKE $6 OR p.apellido ILIKE $6 OR trim(concat_ws(' ', p.nombre, p.apellido)) ILIKE $6 OR COALESCE(e.nombre_empresa, '') ILIKE $6 THEN 3
+            ELSE 4
+          END AS relevance_rank,
+          CASE
+            WHEN NULLIF(TRIM(COALESCE(e.nombre_empresa, '')), '') IS NOT NULL
+              AND LOWER(TRIM(COALESCE(e.nombre_empresa, ''))) NOT IN ('sin nombre', 'sin apellido', 'sin nombres', 'sin apellidos', 'delivery', 'no registrado', 'no registra', 'n/a', 'na', 'null', 'undefined')
+              AND TRIM(COALESCE(e.nombre_empresa, '')) ~ '[[:alpha:]]'
+            THEN 0
+            WHEN NULLIF(TRIM(CONCAT_WS(' ',
+              CASE
+                WHEN LOWER(TRIM(COALESCE(p.nombre, ''))) IN ('sin nombre', 'sin apellido', 'sin nombres', 'sin apellidos', 'delivery', 'no registrado', 'no registra', 'n/a', 'na', 'null', 'undefined') THEN NULL
+                WHEN TRIM(COALESCE(p.nombre, '')) !~ '[[:alpha:]]' THEN NULL
+                WHEN TRIM(COALESCE(p.nombre, '')) ~ '^0+[0-9]{2,}$' THEN NULL
+                ELSE p.nombre
+              END,
+              CASE
+                WHEN LOWER(TRIM(COALESCE(p.apellido, ''))) IN ('sin nombre', 'sin apellido', 'sin nombres', 'sin apellidos', 'delivery', 'no registrado', 'no registra', 'n/a', 'na', 'null', 'undefined') THEN NULL
+                WHEN TRIM(COALESCE(p.apellido, '')) !~ '[[:alpha:]]' THEN NULL
+                WHEN TRIM(COALESCE(p.apellido, '')) ~ '^0+[0-9]{2,}$' THEN NULL
+                ELSE p.apellido
+              END
+            )), '') IS NOT NULL THEN 0
+            ELSE 1
+          END AS valid_name_rank,
+          LOWER(COALESCE(NULLIF(trim(concat_ws(' ', p.nombre, p.apellido)), ''), e.nombre_empresa, c.id_cliente::text)) AS sort_name
+        FROM clientes c
+        LEFT JOIN personas p ON p.id_persona = c.id_persona
+        LEFT JOIN telefonos tp ON tp.id_telefono = p.id_telefono
+        LEFT JOIN empresas e ON e.id_empresa = c.id_empresa
+        LEFT JOIN telefonos te ON te.id_telefono = e.id_telefono
+        LEFT JOIN tipo_cliente tc ON tc.id_tipo_cliente = c.id_tipo_cliente
+        WHERE COALESCE(c.estado, true) = true
+          AND (
+            $4 = ''
+            OR ($2::int IS NOT NULL AND c.id_cliente = $2)
+            OR UPPER(COALESCE(p.dni, '')) = UPPER($4)
+            OR UPPER(COALESCE(p.rtn, '')) = UPPER($4)
+            OR UPPER(COALESCE(e.rtn, '')) = UPPER($4)
+            OR COALESCE(p.dni, '') ILIKE $1
+            OR COALESCE(p.rtn, '') ILIKE $1
+            OR COALESCE(e.rtn, '') ILIKE $1
+            OR regexp_replace(COALESCE(tp.telefono, ''), '\\D', '', 'g') ILIKE $3
+            OR regexp_replace(COALESCE(te.telefono, ''), '\\D', '', 'g') ILIKE $3
+            OR p.nombre ILIKE $1
+            OR p.apellido ILIKE $1
+            OR trim(concat_ws(' ', p.nombre, p.apellido)) ILIKE $1
+            OR COALESCE(e.nombre_empresa, '') ILIKE $1
+            OR translate(lower(trim(concat_ws(' ', p.nombre, p.apellido))), 'áéíóúüñ', 'aeiouun') ILIKE $7
+            OR translate(lower(COALESCE(e.nombre_empresa, '')), 'áéíóúüñ', 'aeiouun') ILIKE $7
+          )
+      )
       SELECT
-        c.id_cliente,
-        c.estado,
-        c.id_tipo_cliente,
-        tc.tipo_cliente,
-        p.nombre,
-        p.apellido,
-        p.dni,
-        p.rtn AS persona_rtn,
-        p.id_telefono AS persona_id_telefono,
-        tp.telefono AS persona_telefono,
-        e.nombre_empresa,
-        e.rtn AS empresa_rtn,
-        e.id_telefono AS empresa_id_telefono,
-        te.telefono AS empresa_telefono
-      FROM clientes c
-      LEFT JOIN personas p ON p.id_persona = c.id_persona
-      LEFT JOIN telefonos tp ON tp.id_telefono = p.id_telefono
-      LEFT JOIN empresas e ON e.id_empresa = c.id_empresa
-      LEFT JOIN telefonos te ON te.id_telefono = e.id_telefono
-      LEFT JOIN tipo_cliente tc ON tc.id_tipo_cliente = c.id_tipo_cliente
-      WHERE COALESCE(c.estado, true) = true
-        AND (
-          $4 = ''
-          OR ($2::int IS NOT NULL AND c.id_cliente = $2)
-          OR COALESCE(p.dni, '') ILIKE $1
-          OR COALESCE(p.rtn, '') ILIKE $1
-          OR COALESCE(e.rtn, '') ILIKE $1
-          OR regexp_replace(COALESCE(tp.telefono, ''), '\\D', '', 'g') ILIKE $3
-          OR regexp_replace(COALESCE(te.telefono, ''), '\\D', '', 'g') ILIKE $3
-          OR trim(concat_ws(' ', p.nombre, p.apellido)) ILIKE $1
-          OR COALESCE(e.nombre_empresa, '') ILIKE $1
-        )
+        id_cliente, estado, id_tipo_cliente, tipo_cliente, nombre, apellido, dni,
+        persona_rtn, persona_id_telefono, persona_telefono, nombre_empresa,
+        empresa_rtn, empresa_id_telefono, empresa_telefono
+      FROM matched
       ORDER BY
-        CASE
-          WHEN $2::int IS NOT NULL AND c.id_cliente = $2 THEN 0
-          WHEN UPPER(COALESCE(p.dni, '')) = UPPER($4) OR UPPER(COALESCE(p.rtn, '')) = UPPER($4) OR UPPER(COALESCE(e.rtn, '')) = UPPER($4) THEN 1
-          WHEN regexp_replace(COALESCE(tp.telefono, ''), '\\D', '', 'g') = $5 OR regexp_replace(COALESCE(te.telefono, ''), '\\D', '', 'g') = $5 THEN 2
-          WHEN trim(concat_ws(' ', p.nombre, p.apellido)) ILIKE $6 OR COALESCE(e.nombre_empresa, '') ILIKE $6 THEN 3
-          ELSE 4
-        END,
-        CASE
-          WHEN NULLIF(TRIM(COALESCE(e.nombre_empresa, '')), '') IS NOT NULL
-            AND LOWER(TRIM(COALESCE(e.nombre_empresa, ''))) NOT IN ('sin nombre', 'sin apellido', 'sin nombres', 'sin apellidos', 'delivery', 'no registrado', 'no registra', 'n/a', 'na', 'null', 'undefined')
-            AND TRIM(COALESCE(e.nombre_empresa, '')) ~ '[[:alpha:]]'
-          THEN 0
-          WHEN NULLIF(TRIM(CONCAT_WS(' ',
-            CASE
-              WHEN LOWER(TRIM(COALESCE(p.nombre, ''))) IN ('sin nombre', 'sin apellido', 'sin nombres', 'sin apellidos', 'delivery', 'no registrado', 'no registra', 'n/a', 'na', 'null', 'undefined') THEN NULL
-              WHEN TRIM(COALESCE(p.nombre, '')) !~ '[[:alpha:]]' THEN NULL
-              WHEN TRIM(COALESCE(p.nombre, '')) ~ '^0+[0-9]{2,}$' THEN NULL
-              ELSE p.nombre
-            END,
-            CASE
-              WHEN LOWER(TRIM(COALESCE(p.apellido, ''))) IN ('sin nombre', 'sin apellido', 'sin nombres', 'sin apellidos', 'delivery', 'no registrado', 'no registra', 'n/a', 'na', 'null', 'undefined') THEN NULL
-              WHEN TRIM(COALESCE(p.apellido, '')) !~ '[[:alpha:]]' THEN NULL
-              WHEN TRIM(COALESCE(p.apellido, '')) ~ '^0+[0-9]{2,}$' THEN NULL
-              ELSE p.apellido
-            END
-          )), '') IS NOT NULL THEN 0
-          ELSE 1
-        END,
-        COALESCE(NULLIF(trim(concat_ws(' ', p.nombre, p.apellido)), ''), e.nombre_empresa, c.id_cliente::text),
-        c.id_cliente
-      LIMIT $7
+        relevance_rank,
+        valid_name_rank,
+        sort_name,
+        id_cliente
+      ${limitClause}
     `;
 
-    const result = await pool.query(query, [
-      `%${search}%`,
+    const queryValues = [
+      shortDirectIdOnly ? '%__NO_TEXT_MATCH__%' : `%${search}%`,
       directId,
-      searchDigits ? `%${searchDigits}%` : '%__NO_PHONE_MATCH__%',
+      searchDigits.length >= 4 ? `%${searchDigits}%` : '%__NO_PHONE_MATCH__%',
       search,
-      searchDigits || '__NO_PHONE_MATCH__',
-      `${search}%`,
-      limit
-    ]);
+      searchDigits.length >= 4 ? searchDigits : '__NO_PHONE_MATCH__',
+      shortDirectIdOnly ? '__NO_TEXT_MATCH__%' : `${search}%`,
+      shortDirectIdOnly ? '%__NO_TEXT_MATCH__%' : `%${normalizedSearch}%`
+    ];
+    if (!allMatches) queryValues.push(limit);
+    const result = await pool.query({
+      text: query,
+      values: queryValues,
+      query_timeout: 8_000
+    });
     const data = result.rows.map((row) => ({
       id_cliente: row.id_cliente,
       id_tipo_cliente: row.id_tipo_cliente,

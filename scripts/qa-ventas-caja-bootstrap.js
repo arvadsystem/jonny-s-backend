@@ -51,7 +51,7 @@ assert.match(
 );
 assert.match(
   handlersSource,
-  /\$4 = ''[\s\S]*ORDER BY[\s\S]*c\.id_cliente[\s\S]*LIMIT \$7/,
+  /const allMatches = Boolean\(search\)[\s\S]*const limitClause = allMatches \? '' : 'LIMIT \$8'/,
   'clientes debe permitir carga inicial limitada y ordenada sin busqueda'
 );
 assert.match(
@@ -63,7 +63,7 @@ assert.match(handlersSource, /CLIENTE_NOMBRE_PLACEHOLDERS/, 'clientes debe filtr
 assert.match(handlersSource, /\^0\+\\d\{2,\}\$/, 'clientes no debe presentar codigos con ceros como nombre');
 assert.match(handlersSource, /Cliente #\$\{idCliente\}/, 'clientes sin nombre valido deben mostrarse como Cliente #id');
 assert.match(handlersSource, /tc\.tipo_cliente/, 'clientes debe exponer tipo de cliente como metadata secundaria');
-assert.match(handlersSource, /Math\.min\(50,/, 'clientes debe limitarse a un maximo de 50');
+assert.match(handlersSource, /Boolean\(search\)[\s\S]*parseBooleanish\(req\.query\.all\)/, 'clientes debe habilitar coincidencias completas solo con search');
 assert.doesNotMatch(ventasModuleSources, /new\s+(?:Pool|Client)\s*\(/, 'Ventas no debe crear Pool ni Client');
 assert.match(routerSource, /kind === 'ITEM'/, 'Ventas debe conservar lineas de extras independientes');
 assert.match(routerSource, /id_extra/, 'Ventas debe conservar id_extra en contratos de venta');
