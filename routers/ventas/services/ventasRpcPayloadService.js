@@ -133,6 +133,8 @@ export const buildVentaRpcPayload = ({ venta, correlativoVenta, facturacionVenta
     facturacion_snapshot: facturacionVenta.snapshot || {}
   },
   ticket_facturacion: facturacionNormalizada || {},
+  contacto: venta.contacto || null,
+  contexto: venta.contexto || null,
   items: buildVentaRpcItems(venta)
 });
 
@@ -181,6 +183,8 @@ export const buildVentaRpcV2Payload = ({ venta }) => ({
     isv: venta.isv,
     total: venta.total
   },
+  contacto: venta.contacto || null,
+  contexto: venta.contexto || null,
   items: buildVentaRpcItems(venta)
 });
 
@@ -242,7 +246,9 @@ export const buildPedidoPendienteRpcPayload = (pedidoPendiente = {}) => ({
   delivery: pedidoPendiente.modalidad === 'DELIVERY'
     ? {
       id_estado_delivery: pedidoPendiente.id_estado_delivery || null,
-      costo_envio: roundMoney(pedidoPendiente.delivery?.costo_envio),
+      costo_envio: pedidoPendiente.delivery?.costo_envio === null
+        ? null
+        : roundMoney(pedidoPendiente.delivery?.costo_envio),
       nombre_receptor: pedidoPendiente.delivery?.nombre_receptor || null,
       telefono_receptor: pedidoPendiente.delivery?.telefono_receptor || null,
       direccion_entrega: pedidoPendiente.delivery?.direccion_entrega || null,

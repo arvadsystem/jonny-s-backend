@@ -3583,6 +3583,42 @@ const resolvePedidoPendienteStaticCatalogs = async ({ client, canal, modalidad, 
   return resolved;
 };
 
+const resolvePedidoContextCatalogs = async ({ client, canal, modalidad }) => {
+  const specs = [
+    buildPedidoPendienteStaticCatalogSpec({
+      key: 'canalCatalog',
+      tableName: 'cat_pedidos_canales',
+      idColumn: 'id_canal_pedido',
+      code: canal
+    }),
+    buildPedidoPendienteStaticCatalogSpec({
+      key: 'modalidadCatalog',
+      tableName: 'cat_pedidos_modalidades_entrega',
+      idColumn: 'id_modalidad_entrega',
+      code: modalidad
+    })
+  ].filter(Boolean);
+  const now = Date.now();
+  const resolved = { canalCatalog: null, modalidadCatalog: null };
+  const missingSpecs = [];
+
+  for (const spec of specs) {
+    const cached = readPedidoPendienteStaticCatalogCache(spec, now);
+    if (cached) resolved[spec.key] = cached;
+    else missingSpecs.push(spec);
+  }
+
+  const fetched = await fetchPedidoPendienteStaticCatalogSpecs(client, missingSpecs);
+  for (const spec of missingSpecs) {
+    const value = fetched.get(spec.key) || null;
+    if (!value) continue;
+    resolved[spec.key] = clonePedidoPendienteStaticCatalogValue(value);
+    writePedidoPendienteStaticCatalogCache(spec, value, now);
+  }
+
+  return resolved;
+};
+
 const normalizePedidoText = (value, maxLength = 200) => {
   if (value === undefined || value === null) return null;
   const normalized = String(value).replace(/\s+/g, ' ').trim();
@@ -3679,39 +3715,33 @@ const buildPedidoPendientePayload = async ({ client, body, userId, sucursalScope
     if (!cliente) return { ok: false, status: 400, body: { error: true, message: 'id_cliente no existe.' } };
   }
 
-  const nombreContacto = normalizePedidoText(contacto.nombre_contacto, 120) || (cliente ? normalizeClienteNombre(cliente).slice(0, 120) : null);
+  const nombreContacto = normalizePedidoText(contacto.nombre_contacto, 120);
   const telefonoContacto = normalizePedidoText(contacto.telefono_contacto, 40);
   const telefonoNormalizado = normalizeTelefonoDigits(contacto.telefono_contacto);
-  if (!idCliente && !nombreContacto) return { ok: false, status: 400, body: { error: true, message: 'contacto.nombre_contacto es obligatorio cuando id_cliente es null.' } };
-  if ((modalidad === 'RECOGER' || canal === 'TELEFONO' || canal === 'WHATSAPP') && !telefonoContacto) {
-    return { ok: false, status: 400, body: { error: true, message: 'contacto.telefono_contacto es obligatorio para este canal o modalidad.' } };
-  }
 
   const pagoPendiente = isPlainObject(body.pago_pendiente) ? body.pago_pendiente : {};
   const motivoPagoPendiente = normalizePedidoCatalogCode(pagoPendiente.motivo);
   if (!motivoPagoPendiente) return { ok: false, status: 400, body: { error: true, message: 'pago_pendiente.motivo es obligatorio.' } };
 
   let delivery = null;
-  let costoEnvio = 0;
+  let costoEnvio = null;
   if (modalidad === 'DELIVERY') {
-    if (!isPlainObject(body.delivery)) return { ok: false, status: 400, body: { error: true, message: 'delivery es obligatorio cuando modalidad es DELIVERY.' } };
-    const hasCostoEnvioInput = body.delivery.costo_envio !== null &&
-      body.delivery.costo_envio !== undefined &&
-      String(body.delivery.costo_envio).trim() !== '';
+    const deliveryInput = isPlainObject(body.delivery) ? body.delivery : {};
+    const hasCostoEnvioInput = deliveryInput.costo_envio !== null &&
+      deliveryInput.costo_envio !== undefined &&
+      String(deliveryInput.costo_envio).trim() !== '';
     if (hasCostoEnvioInput) {
-      costoEnvio = parseNonNegativeNumber(body.delivery.costo_envio);
+      costoEnvio = parseNonNegativeNumber(deliveryInput.costo_envio);
       if (costoEnvio === null) return { ok: false, status: 400, body: { error: true, message: 'delivery.costo_envio debe ser numerico mayor o igual a 0.' } };
     }
     delivery = {
       costo_envio: costoEnvio,
-      nombre_receptor: normalizePedidoText(body.delivery.nombre_receptor, 120),
-      telefono_receptor: normalizePedidoText(body.delivery.telefono_receptor, 40),
-      direccion_entrega: normalizePedidoText(body.delivery.direccion_entrega, 250),
-      referencia_entrega: normalizePedidoText(body.delivery.referencia_entrega, 250),
-      observacion_delivery: normalizePedidoText(body.delivery.observacion_delivery, 250)
+      nombre_receptor: normalizePedidoText(deliveryInput.nombre_receptor, 120),
+      telefono_receptor: normalizePedidoText(deliveryInput.telefono_receptor, 40),
+      direccion_entrega: normalizePedidoText(deliveryInput.direccion_entrega, 250),
+      referencia_entrega: normalizePedidoText(deliveryInput.referencia_entrega, 250),
+      observacion_delivery: normalizePedidoText(deliveryInput.observacion_delivery, 250)
     };
-    const missingDeliveryField = ['nombre_receptor', 'telefono_receptor', 'direccion_entrega', 'referencia_entrega'].find((field) => !delivery[field]);
-    if (missingDeliveryField) return { ok: false, status: 400, body: { error: true, message: 'delivery.' + missingDeliveryField + ' es obligatorio.' } };
   }
 
   const staticCatalogsStart = perf?.now?.() || 0;
@@ -3836,7 +3866,7 @@ const buildPedidoPendientePayload = async ({ client, body, userId, sucursalScope
   const descuentoTotal = roundMoney(finalizedLines.reduce((sum, line) => sum + Number(line.descuento || 0), 0));
   const subtotal = roundMoney(finalizedLines.reduce((sum, line) => sum + line.total_linea, 0));
   const isv = 0;
-  const total = roundMoney(subtotal + costoEnvio);
+  const total = roundMoney(subtotal + (costoEnvio || 0));
   if (!idEstadoPedido) return { ok: false, status: 409, body: { error: true, message: 'No existe el estado EN_COCINA en estados_pedido.' } };
 
   const sessionActiva = await resolveCajaSession({ client, idSucursal, idUsuario: userId, idSesionCaja: idSesionCajaRequested, isSuperAdmin });
@@ -3869,7 +3899,7 @@ const buildPedidoPendientePayload = async ({ client, body, userId, sucursalScope
       id_motivo_pago_pendiente: motivoPagoCatalog.id,
       id_estado_delivery: deliveryEstadoCatalog?.id || null,
       contacto: {
-        nombre_contacto: nombreContacto || 'Cliente registrado',
+        nombre_contacto: nombreContacto,
         telefono_contacto: telefonoContacto,
         telefono_normalizado: telefonoNormalizado,
         dni: normalizePedidoText(contacto.dni, 30),
@@ -3880,7 +3910,11 @@ const buildPedidoPendientePayload = async ({ client, body, userId, sucursalScope
       observacion_pago: normalizePedidoText(pagoPendiente.observacion_pago, 250),
       delivery,
       descripcion_pedido: buildKitchenDescriptionSummary(finalizedLines, contexto.observacion_contexto),
-      descripcion_envio: modalidad === 'DELIVERY' ? (delivery.direccion_entrega + ' | Ref: ' + delivery.referencia_entrega).slice(0, 250) : modalidad,
+      descripcion_envio: modalidad === 'DELIVERY'
+        ? [delivery.direccion_entrega, delivery.referencia_entrega ? `Ref: ${delivery.referencia_entrega}` : null]
+          .filter(Boolean)
+          .join(' | ') || null
+        : modalidad,
       pedido_lines: finalizedLines,
       subtotal_bruto: subtotalBruto,
       descuento: descuentoTotal,
@@ -4267,6 +4301,17 @@ const buildVentaPayload = async ({ client, body, userId, sucursalScope, canApply
     body.referencia_pago === undefined || body.referencia_pago === null
       ? null
       : String(body.referencia_pago).trim() || null;
+  const contextoInput = isPlainObject(body.contexto) ? body.contexto : {};
+  const canal = normalizePedidoCatalogCode(contextoInput.canal || 'LOCAL');
+  const modalidad = normalizePedidoCatalogCode(contextoInput.modalidad || 'CONSUMO_LOCAL');
+  const contactoInput = isPlainObject(body.contacto) ? body.contacto : {};
+
+  if (!PEDIDO_PENDIENTE_CANALES.has(canal)) {
+    return { ok: false, status: 400, body: { error: true, message: 'contexto.canal debe ser LOCAL, TELEFONO o WHATSAPP.' } };
+  }
+  if (!PEDIDO_PENDIENTE_MODALIDADES.has(modalidad)) {
+    return { ok: false, status: 400, body: { error: true, message: 'contexto.modalidad debe ser CONSUMO_LOCAL, RECOGER o DELIVERY.' } };
+  }
 
   if (body.id_descuento_catalogo !== undefined && body.id_descuento_catalogo !== null && !idDescuentoCatalogo) {
     return {
@@ -4385,6 +4430,15 @@ const buildVentaPayload = async ({ client, body, userId, sucursalScope, canApply
       ok: false,
       status: 400,
       body: { error: true, message: 'id_cliente no existe.' }
+    };
+  }
+
+  const { canalCatalog, modalidadCatalog } = await resolvePedidoContextCatalogs({ client, canal, modalidad });
+  if (!canalCatalog || !modalidadCatalog) {
+    return {
+      ok: false,
+      status: 409,
+      body: { error: true, message: 'No se encontraron catalogos de contexto requeridos para crear la venta.' }
     };
   }
 
@@ -4653,6 +4707,21 @@ const buildVentaPayload = async ({ client, body, userId, sucursalScope, canApply
       id_sucursal: idSucursal,
       id_estado_pedido: idEstadoPedido,
       id_usuario: userId,
+      contacto: {
+        nombre_contacto: normalizePedidoText(contactoInput.nombre_contacto, 120),
+        telefono_contacto: normalizePedidoText(contactoInput.telefono_contacto, 40),
+        telefono_normalizado: normalizeTelefonoDigits(contactoInput.telefono_contacto),
+        dni: normalizePedidoText(contactoInput.dni, 30),
+        rtn: normalizePedidoText(contactoInput.rtn, 30),
+        correo: normalizePedidoText(contactoInput.correo, 120)
+      },
+      contexto: {
+        canal,
+        modalidad,
+        id_canal_pedido: canalCatalog.id,
+        id_modalidad_entrega: modalidadCatalog.id,
+        observacion_contexto: normalizePedidoText(contextoInput.observacion_contexto, 250)
+      },
       all_lines: finalizedLines,
       direct_lines: directLines,
       pedido_lines: pedidoLines,
@@ -4660,6 +4729,84 @@ const buildVentaPayload = async ({ client, body, userId, sucursalScope, canApply
       pedido_subtotal: pedidoSubtotal,
       pedido_isv: pedidoIsv,
       pedido_total: pedidoTotal
+    }
+  };
+};
+
+const persistVentaPedidoSnapshots = async ({ client, idPedido, venta }) => {
+  const pedidoId = parseOptionalPositiveInt(idPedido);
+  if (!pedidoId) {
+    throw {
+      httpStatus: 500,
+      code: 'VENTAS_PEDIDO_SNAPSHOT_INVALIDO',
+      publicMessage: 'La venta no devolvio un pedido valido para guardar sus datos de contacto.'
+    };
+  }
+
+  await client.query(
+    `
+      INSERT INTO public.pedidos_contexto (
+        id_pedido,
+        id_canal_pedido,
+        id_modalidad_entrega,
+        id_usuario_toma,
+        id_sesion_caja_origen,
+        observacion_contexto
+      )
+      VALUES ($1, $2, $3, $4, $5, $6)
+    `,
+    [
+      pedidoId,
+      venta.contexto.id_canal_pedido,
+      venta.contexto.id_modalidad_entrega,
+      venta.id_usuario,
+      venta.id_sesion_caja,
+      venta.contexto.observacion_contexto
+    ]
+  );
+
+  await client.query(
+    `
+      INSERT INTO public.pedidos_contacto (
+        id_pedido,
+        nombre_contacto,
+        telefono_contacto,
+        telefono_normalizado,
+        dni,
+        rtn,
+        correo
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, $7)
+    `,
+    [
+      pedidoId,
+      venta.contacto.nombre_contacto,
+      venta.contacto.telefono_contacto,
+      venta.contacto.telefono_normalizado,
+      venta.contacto.dni,
+      venta.contacto.rtn,
+      venta.contacto.correo
+    ]
+  );
+};
+
+const attachVentaSnapshotsToResponse = (response, venta) => {
+  const contacto = { ...venta.contacto };
+  const contexto = {
+    canal: venta.contexto.canal,
+    modalidad: venta.contexto.modalidad,
+    observacion_contexto: venta.contexto.observacion_contexto
+  };
+  const clienteNombre = contacto.nombre_contacto || response?.cliente_nombre || 'Consumidor final';
+  return {
+    ...response,
+    cliente_nombre: clienteNombre,
+    contacto,
+    contexto,
+    cliente: {
+      ...(response?.cliente || {}),
+      id_cliente: venta.id_cliente,
+      nombre: clienteNombre
     }
   };
 };
@@ -7883,6 +8030,12 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
         pedidoPendiente,
         perf: ventasPerf
       });
+      if (pedidoPendiente.modalidad === 'DELIVERY' && pedidoPendiente.delivery?.costo_envio === null) {
+        await client.query(
+          'UPDATE public.pedidos_delivery SET costo_envio = NULL WHERE id_pedido = $1',
+          [rpcResponseBody.id_pedido]
+        );
+      }
       const commitStart = ventasPerf.now();
       await client.query('COMMIT');
       ventasPerf.add('commit_ms', commitStart);
@@ -9215,9 +9368,11 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
         perf: ventasPerf,
         requestStartedAt: authContextStart
       });
+      const idPedidoRpc = parseOptionalPositiveInt(rpcCreateResult.response?.id_pedido);
+      await persistVentaPedidoSnapshots({ client, idPedido: idPedidoRpc, venta });
       if (ventaHasExtras) {
-        const idPedidoRpc = parseOptionalPositiveInt(rpcCreateResult.fidelizacionJob?.idPedido);
-        if (!idPedidoRpc) {
+        const fidelizacionPedidoId = parseOptionalPositiveInt(rpcCreateResult.fidelizacionJob?.idPedido);
+        if (!fidelizacionPedidoId) {
           throw {
             httpStatus: 500,
             code: 'VENTAS_RPC_V2_PEDIDO_INVALIDO',
@@ -9232,7 +9387,7 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
 
       ventasPerf.add('node_after_rpc_ms', rpcCreateResult.afterRpcStart);
       ventasPerf.log({ ...ventasPerfContext, status: 201 });
-      res.status(201).json(rpcCreateResult.response);
+      res.status(201).json(attachVentaSnapshotsToResponse(rpcCreateResult.response, venta));
 
       void registerVentaFidelizacionAfterCommit(rpcCreateResult.fidelizacionJob);
       return;
@@ -9245,6 +9400,11 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
         perf: ventasPerf,
         requestStartedAt: authContextStart
       });
+      await persistVentaPedidoSnapshots({
+        client,
+        idPedido: rpcCreateResult.response?.id_pedido,
+        venta
+      });
 
       const commitStart = ventasPerf.now();
       await client.query('COMMIT');
@@ -9252,7 +9412,7 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
 
       ventasPerf.add('node_after_rpc_ms', rpcCreateResult.afterRpcStart);
       ventasPerf.log({ ...ventasPerfContext, status: 201 });
-      res.status(201).json(rpcCreateResult.response);
+      res.status(201).json(attachVentaSnapshotsToResponse(rpcCreateResult.response, venta));
 
       void registerVentaFidelizacionAfterCommit(rpcCreateResult.fidelizacionJob);
       return;
@@ -9334,6 +9494,7 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
     idPedido = Number(pedidoResult.rows[0].id_pedido);
     const fechaHoraPedido = pedidoResult.rows[0].fecha_hora_pedido || null;
     ventasPerf.add('pedido_ms', pedidoStart);
+    await persistVentaPedidoSnapshots({ client, idPedido, venta });
 
     const detallePedidoStart = ventasPerf.now();
     const detallePedidoLookupStart = ventasPerf.now();
@@ -9773,7 +9934,7 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
       detalleFacturaRows,
       detalleFacturaRowsInserted: detalleFacturaResult.rows
     });
-    const createVentaResponse = buildCreateVentaDetailResponse({
+    const createVentaResponse = attachVentaSnapshotsToResponse(buildCreateVentaDetailResponse({
       idFactura,
       idPedido,
       venta,
@@ -9785,7 +9946,7 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
       items: createDetailItems,
       fidelizacion: acumulacionFidelizacion,
       cuentaDividida: cuentaDivididaResponse
-    });
+    }), venta);
     ventasPerf.add('ticket_response_build_ms', ticketResponseStart);
 
     const commitStart = ventasPerf.now();
