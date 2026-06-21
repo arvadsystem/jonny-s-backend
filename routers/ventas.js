@@ -7432,13 +7432,13 @@ router.get('/ventas/pedidos/:id/inventario-alertas', checkPermission(['VENTAS_VE
   }
 });
 
-router.get('/ventas/:id/ticket.pdf', checkPermission(['VENTAS_IMPRIMIR']), getVentaTicketPdfByIdHandler);
-router.get('/ventas/:id/ticket', checkPermission(['VENTAS_IMPRIMIR']), getVentaTicketByIdHandler);
-router.get('/ventas/:id/comanda', checkPermission(['VENTAS_IMPRIMIR']), getVentaKitchenComandaByIdHandler);
-router.get('/ventas/impresoras-config', checkPermission(['VENTAS_IMPRIMIR']), getVentasPrinterConfigHandler);
-router.get('/ventas/qz/certificate', checkPermission(['VENTAS_IMPRIMIR']), getQzCertificateHandler);
-router.post('/ventas/qz/sign', checkPermission(['VENTAS_IMPRIMIR']), signQzRequestHandler);
-router.post('/ventas/:id/impresiones', checkPermission(['VENTAS_IMPRIMIR']), createVentaPrintEventHandler);
+router.get('/ventas/:id/ticket.pdf', checkPermission(['VENTAS_IMPRIMIR', 'VENTAS_CREAR']), getVentaTicketPdfByIdHandler);
+router.get('/ventas/:id/ticket', checkPermission(['VENTAS_IMPRIMIR', 'VENTAS_CREAR']), getVentaTicketByIdHandler);
+router.get('/ventas/:id/comanda', checkPermission(['VENTAS_IMPRIMIR', 'VENTAS_CREAR']), getVentaKitchenComandaByIdHandler);
+router.get('/ventas/impresoras-config', checkPermission(['VENTAS_IMPRIMIR', 'VENTAS_CREAR']), getVentasPrinterConfigHandler);
+router.get('/ventas/qz/certificate', checkPermission(['VENTAS_IMPRIMIR', 'VENTAS_CREAR']), getQzCertificateHandler);
+router.post('/ventas/qz/sign', checkPermission(['VENTAS_IMPRIMIR', 'VENTAS_CREAR']), signQzRequestHandler);
+router.post('/ventas/:id/impresiones', checkPermission(['VENTAS_IMPRIMIR', 'VENTAS_CREAR']), createVentaPrintEventHandler);
 router.get('/ventas/:id', checkPermission(['VENTAS_VER']), getVentaByIdHandler);
 
 async function listarPedidosPendientesPago(req, res) {
