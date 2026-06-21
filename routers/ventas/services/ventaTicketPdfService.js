@@ -74,6 +74,42 @@ const isPdfSupportedImageDataUrl = (value) =>
 const countExtras = (items = []) =>
   items.reduce((sum, item) => sum + (Array.isArray(item?.extras) ? item.extras.length : 0), 0);
 
+const getSnapshotSalsas = (item = {}) => {
+  const componentes = item?.origen_snapshot?.componentes;
+  if (Array.isArray(componentes)) return componentes;
+  if (Array.isArray(componentes?.seleccion)) return componentes.seleccion;
+
+  const complementos = item?.origen_snapshot?.complementos;
+  if (Array.isArray(complementos)) return complementos;
+  if (Array.isArray(complementos?.seleccion)) return complementos.seleccion;
+
+  return [];
+};
+
+const normalizeSalsas = (item = {}) => {
+  const directComplementos = Array.isArray(item?.complementos) ? item.complementos : [];
+  if (directComplementos.length > 0) {
+    return directComplementos
+      .map((entry, index) => ({
+        key: `${entry?.id_complemento || entry?.id_salsa || index}-${index}`,
+        nombre: cleanText(entry?.nombre) || 'Salsa'
+      }))
+      .filter((entry) => entry.nombre);
+  }
+
+  const snapshotComponentes = getSnapshotSalsas(item);
+
+  return snapshotComponentes
+    .map((entry, index) => ({
+      key: `${entry?.id_complemento || entry?.id_salsa || index}-${index}`,
+      nombre: cleanText(entry?.nombre) || 'Salsa'
+    }))
+    .filter((entry) => entry.nombre);
+};
+
+const countSalsas = (items = []) =>
+  items.reduce((sum, item) => sum + normalizeSalsas(item).length, 0);
+
 const countSplitLines = (cuentaDividida) => {
   const divisiones = Array.isArray(cuentaDividida?.divisiones) ? cuentaDividida.divisiones : [];
   return divisiones.reduce((sum, division) => (
@@ -84,6 +120,7 @@ const countSplitLines = (cuentaDividida) => {
 const estimateHeightMm = (venta = {}) => {
   const items = Array.isArray(venta.items) ? venta.items : [];
   const extrasCount = countExtras(items);
+  const salsasCount = countSalsas(items);
   const splitCount = countSplitLines(venta.cuenta_dividida);
   const fiscalBlocks = venta?.facturacion?.ticket?.mostrar_datos_fiscales === false ? 0 : 4;
   const logoBlock = venta?.facturacion?.ticket?.mostrar_logo_ticket && venta?.facturacion?.emisor?.logo_data_url ? 32 : 0;
@@ -92,6 +129,7 @@ const estimateHeightMm = (venta = {}) => {
     + logoBlock
     + items.length * 10
     + extrasCount * 5
+    + salsasCount * 4
     + splitCount * 7
     + fiscalBlocks * 4
     + deliveryBlock;
@@ -197,6 +235,7 @@ const buildItemRows = (items = [], widthMm) => {
   ]];
 
   for (const item of items) {
+    const salsas = normalizeSalsas(item);
     rows.push([
       text(item.cantidad || 1),
       text(item.nombre_item || item.nombre_producto || 'Item'),
@@ -214,6 +253,17 @@ const buildItemRows = (items = [], widthMm) => {
           })
         ]);
       }
+    }
+
+    if (salsas.length > 0) {
+      const salsaLabel = salsas.length === 1 ? 'Salsa' : 'Salsas';
+      rows.push([
+        text(''),
+        text(`${salsaLabel}: ${salsas.map((salsa) => salsa.nombre).join(', ')}`, {
+          fontSize: widthMm === 58 ? 5.5 : 6
+        }),
+        text('', { alignment: 'right' })
+      ]);
     }
   }
 
