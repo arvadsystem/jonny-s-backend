@@ -30,11 +30,19 @@ const toKitchenComplementos = (item = {}) => {
   const snapshot = item?.origen_snapshot && typeof item.origen_snapshot === 'object'
     ? item.origen_snapshot
     : {};
-  const componentes = Array.isArray(snapshot?.componentes) ? snapshot.componentes : [];
+  const componentes = Array.isArray(snapshot?.componentes)
+    ? snapshot.componentes
+    : Array.isArray(snapshot?.componentes?.seleccion)
+      ? snapshot.componentes.seleccion
+      : Array.isArray(snapshot?.complementos)
+        ? snapshot.complementos
+        : Array.isArray(snapshot?.complementos?.seleccion)
+          ? snapshot.complementos.seleccion
+          : [];
   return componentes
     .map((entry) => ({
       id_complemento: Number(entry?.id_complemento || 0) || null,
-      nombre: String(entry?.nombre || 'Complemento').trim()
+      nombre: String(entry?.nombre || 'Salsa').trim()
     }))
     .filter((entry) => entry.id_complemento || entry.nombre);
 };
