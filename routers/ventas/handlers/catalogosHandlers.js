@@ -447,6 +447,112 @@ export const listClientesCatalogoHandler = async (req, res) => {
   }
 };
 
+const fetchRecetasCatalogoData = async ({
+  req,
+  idSucursal,
+  idTipoDepartamento = null
+}) => {
+  let sqlDurationMs = 0;
+  let mappingDurationMs = 0;
+  const schemaStartedAt = performance.now();
+  const hasRecipeAssignmentsTable = await hasTable(pool, 'menu_receta_almacenes');
+  sqlDurationMs += performance.now() - schemaStartedAt;
+
+  let joinClause = 'INNER JOIN menu_vigente mv ON mv.id_menu = r.id_menu';
+  if (hasRecipeAssignmentsTable) {
+    joinClause += `
+      INNER JOIN public.menu_receta_almacenes mra
+        ON mra.id_receta = r.id_receta
+       AND COALESCE(mra.estado, true) = true
+      INNER JOIN public.almacenes ara
+        ON ara.id_almacen = mra.id_almacen
+       AND COALESCE(ara.estado, true) = true
+       AND ara.id_sucursal = $1
+      INNER JOIN public.sucursales sra
+        ON sra.id_sucursal = ara.id_sucursal
+       AND COALESCE(sra.estado, true) = true
+    `;
+  }
+
+  const params = [idSucursal];
+  let departmentClause = '';
+  if (idTipoDepartamento) {
+    params.push(idTipoDepartamento);
+    departmentClause = `AND r.id_tipo_departamento = $${params.length}`;
+  }
+
+  const sqlStartedAt = performance.now();
+  const result = await pool.query(
+    `
+      SELECT DISTINCT
+        r.id_receta,
+        r.nombre_receta,
+        r.descripcion,
+        r.estado,
+        r.precio,
+        r.id_archivo,
+        r.id_tipo_departamento,
+        a.url_publica AS imagen_principal_url,
+        NULL::INTEGER AS id_producto_base,
+        r.nombre_receta AS nombre_producto_base,
+        r.precio AS precio_producto_base,
+        r.estado AS estado_producto_base
+      FROM recetas r
+      LEFT JOIN archivos a ON a.id_archivo = r.id_archivo AND (a.estado = true OR a.estado IS NULL)
+      ${joinClause}
+      WHERE COALESCE(r.estado, true) = true
+        AND mv.id_sucursal = $1
+        AND COALESCE(mv.estado, true) = true
+        AND (mv.fecha_inicio IS NULL OR mv.fecha_inicio <= CURRENT_TIMESTAMP)
+        ${departmentClause}
+      ORDER BY r.nombre_receta ASC, r.id_receta ASC
+    `,
+    params
+  );
+  sqlDurationMs += performance.now() - sqlStartedAt;
+  const recetaRows = Array.isArray(result.rows) ? result.rows : [];
+
+  const complementStartedAt = performance.now();
+  const complementContext = await buildVentaComplementContext({
+    client: pool,
+    idSucursal,
+    normalizedItems: recetaRows.map((row) => ({
+      kind: 'RECETA',
+      id_receta: Number(row?.id_receta || 0),
+      cantidad: 1,
+      complementos: []
+    }))
+  });
+  sqlDurationMs += performance.now() - complementStartedAt;
+
+  const mappingStartedAt = performance.now();
+  const data = recetaRows.map((row) => {
+    const metadata = resolveRecetaComplementMetadata({
+      receta: row,
+      quantity: 1,
+      allowedSauces: complementContext.saucesByRecipe.get(Number(row?.id_receta || 0)) || [],
+      rules: complementContext.rulesByRecipe.get(Number(row?.id_receta || 0)) || [],
+      fallbackSauces: complementContext.fallbackSauces
+    });
+    return {
+      ...row,
+      imagen_principal_url: buildAbsolutePublicUrl(req, row.imagen_principal_url),
+      requiere_complementos: Boolean(metadata.requiere_complementos),
+      tipo_complemento: metadata.tipo_complemento || VENTA_COMPLEMENTO_TIPO_SALSAS,
+      minimo_complementos: Number(metadata.minimo_complementos || 0),
+      maximo_complementos: Number(metadata.maximo_complementos || 0),
+      complementos_disponibles: (Array.isArray(metadata.complementos_disponibles)
+        ? metadata.complementos_disponibles
+        : []).map((entry) => ({
+        id_complemento: Number(entry?.id_complemento || entry?.id_salsa || 0),
+        nombre: String(entry?.nombre || 'Salsa').trim(),
+        disponible: entry?.disponible !== false
+      })).filter((entry) => entry.id_complemento > 0)
+    };
+  });
+  mappingDurationMs += performance.now() - mappingStartedAt;
+  return { data, sqlDurationMs, mappingDurationMs };
+};
 
 export const listRecetasCatalogoHandler = async (req, res) => {
   try {
