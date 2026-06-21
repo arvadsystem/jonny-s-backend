@@ -10,10 +10,17 @@ Thumbs.db
 .env
 
 # Certificados/llaves privadas de QZ Tray
+private-key.pem
+digital-certificate.txt
+*.private.pem
+*.private-key.pem
 config/qz/*.pem
 certs/qz/*.pem
 !config/qz/*.example.pem
 !certs/qz/*.example.pem
+secrets/
+run/secrets/
+.qz-secrets/
 
 # NEW: uploads locales generados por el modulo Inventario.
 # WHY: las imagenes subidas viven en disco local y no deben versionarse.

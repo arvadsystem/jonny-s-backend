@@ -10,6 +10,8 @@ import {
 import {
   getQzCertificateText,
   hasQzSigningConfigured,
+  getQzPublicErrorMessage,
+  isQzConfigurationError,
   signQzMessage
 } from '../services/qzTraySigningService.js';
 import { parsePositiveInt } from '../utils/parseUtils.js';
@@ -127,13 +129,6 @@ export const getVentasPrinterConfigHandler = async (req, res) => {
 export const getQzCertificateHandler = async (_req, res) => {
   try {
     const certificate = await getQzCertificateText();
-    if (!certificate) {
-      return res.status(503).json({
-        error: true,
-        code: 'QZ_SIGNING_NOT_CONFIGURED',
-        message: 'La firma segura de QZ Tray no esta configurada.'
-      });
-    }
 
     return res.status(200).json({
       ok: true,
@@ -141,15 +136,30 @@ export const getQzCertificateHandler = async (_req, res) => {
       certificate
     });
   } catch (error) {
-    console.error('Error al obtener certificado de QZ Tray:', error);
+    if (isQzConfigurationError(error)) {
+      console.warn('[ventas.qz.certificate] configuracion no disponible', {
+        code: error?.code || 'QZ_SIGNING_NOT_CONFIGURED',
+        configured: false
+      });
+      return res.status(503).json({
+        error: true,
+        code: error?.code || 'QZ_SIGNING_NOT_CONFIGURED',
+        message: getQzPublicErrorMessage()
+      });
+    }
+
+    console.error('[ventas.qz.certificate] error inesperado', {
+      code: error?.code || null,
+      message: error?.message || 'Error sin mensaje'
+    });
     return sendVentasInternalError(res, 'No se pudo obtener el certificado de impresion.');
   }
 };
 
 export const signQzRequestHandler = async (req, res) => {
   try {
-    const request = String(req.body?.request || '');
-    if (!request) {
+    const request = typeof req.body?.request === 'string' ? req.body.request : '';
+    if (request.length === 0) {
       return res.status(400).json({
         error: true,
         code: 'QZ_SIGN_REQUEST_INVALID',
@@ -160,11 +170,15 @@ export const signQzRequestHandler = async (req, res) => {
     const signature = await signQzMessage(request);
     return res.status(200).json({ ok: true, signature });
   } catch (error) {
-    if (error?.code === 'QZ_SIGNING_NOT_CONFIGURED') {
+    if (isQzConfigurationError(error)) {
+      console.warn('[ventas.qz.sign] configuracion no disponible', {
+        code: error?.code || 'QZ_SIGNING_NOT_CONFIGURED',
+        configured: false
+      });
       return res.status(503).json({
         error: true,
-        code: error.code,
-        message: 'La firma segura de QZ Tray no esta configurada.'
+        code: error?.code || 'QZ_SIGNING_NOT_CONFIGURED',
+        message: getQzPublicErrorMessage()
       });
     }
     if (error?.code === 'QZ_SIGN_REQUEST_INVALID') {
@@ -175,7 +189,10 @@ export const signQzRequestHandler = async (req, res) => {
       });
     }
 
-    console.error('Error al firmar solicitud de QZ Tray:', error);
+    console.error('[ventas.qz.sign] error inesperado', {
+      code: error?.code || null,
+      message: error?.message || 'Error sin mensaje'
+    });
     return sendVentasInternalError(res, 'No se pudo firmar la solicitud de impresion.');
   }
 };
