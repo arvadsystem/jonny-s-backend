@@ -202,6 +202,66 @@ const hasTable = async (client, tableName) => {
   return exists;
 };
 
+const isColumnNullable = async (client, tableName, columnName) => {
+  const key = `nullable:${String(tableName || '').trim().toLowerCase()}.${String(columnName || '').trim().toLowerCase()}`;
+  if (schemaColumnCache.has(key)) return schemaColumnCache.get(key);
+
+  const result = await client.query(
+    `
+      SELECT is_nullable
+      FROM information_schema.columns
+      WHERE table_schema = 'public'
+        AND table_name = $1
+        AND column_name = $2
+      LIMIT 1
+    `,
+    [tableName, columnName]
+  );
+  const nullable = String(result.rows?.[0]?.is_nullable || '').trim().toUpperCase() === 'YES';
+  schemaColumnCache.set(key, nullable);
+  return nullable;
+};
+
+const normalizeLegacyRequiredText = (value, fallback = '') => {
+  const text = String(value || '').trim();
+  return text || fallback;
+};
+
+const resolvePedidoContactoSnapshotForInsert = async (client, contacto = {}) => {
+  const nombreNullable = await isColumnNullable(client, 'pedidos_contacto', 'nombre_contacto');
+  return {
+    ...contacto,
+    nombre_contacto: nombreNullable
+      ? (contacto?.nombre_contacto ?? null)
+      : normalizeLegacyRequiredText(contacto?.nombre_contacto, 'Consumidor final')
+  };
+};
+
+const resolvePedidoDeliverySnapshotForInsert = async (client, delivery = {}) => {
+  const [
+    costoNullable,
+    nombreNullable,
+    telefonoNullable,
+    direccionNullable,
+    referenciaNullable
+  ] = await Promise.all([
+    isColumnNullable(client, 'pedidos_delivery', 'costo_envio'),
+    isColumnNullable(client, 'pedidos_delivery', 'nombre_receptor'),
+    isColumnNullable(client, 'pedidos_delivery', 'telefono_receptor'),
+    isColumnNullable(client, 'pedidos_delivery', 'direccion_entrega'),
+    isColumnNullable(client, 'pedidos_delivery', 'referencia_entrega')
+  ]);
+
+  return {
+    ...delivery,
+    costo_envio: costoNullable ? (delivery?.costo_envio ?? null) : Number(delivery?.costo_envio ?? 0),
+    nombre_receptor: nombreNullable ? (delivery?.nombre_receptor ?? null) : normalizeLegacyRequiredText(delivery?.nombre_receptor),
+    telefono_receptor: telefonoNullable ? (delivery?.telefono_receptor ?? null) : normalizeLegacyRequiredText(delivery?.telefono_receptor),
+    direccion_entrega: direccionNullable ? (delivery?.direccion_entrega ?? null) : normalizeLegacyRequiredText(delivery?.direccion_entrega),
+    referencia_entrega: referenciaNullable ? (delivery?.referencia_entrega ?? null) : normalizeLegacyRequiredText(delivery?.referencia_entrega)
+  };
+};
+
 const PEDIDO_PENDIENTE_ALLOWED_EXTRAS_SCHEMA_TABLES = Object.freeze([
   'menu_extras',
   'menu_extra_receta',
@@ -4765,6 +4825,8 @@ const persistVentaPedidoSnapshots = async ({ client, idPedido, venta }) => {
     ]
   );
 
+  const contactoSnapshot = await resolvePedidoContactoSnapshotForInsert(client, venta.contacto);
+
   await client.query(
     `
       INSERT INTO public.pedidos_contacto (
@@ -4780,12 +4842,12 @@ const persistVentaPedidoSnapshots = async ({ client, idPedido, venta }) => {
     `,
     [
       pedidoId,
-      venta.contacto.nombre_contacto,
-      venta.contacto.telefono_contacto,
-      venta.contacto.telefono_normalizado,
-      venta.contacto.dni,
-      venta.contacto.rtn,
-      venta.contacto.correo
+      contactoSnapshot.nombre_contacto,
+      contactoSnapshot.telefono_contacto,
+      contactoSnapshot.telefono_normalizado,
+      contactoSnapshot.dni,
+      contactoSnapshot.rtn,
+      contactoSnapshot.correo
     ]
   );
 };
@@ -8277,6 +8339,7 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
     );
     ventasPerf.add('pedido_pendiente_contexto_ms', contextoPedidoStart);
 
+    const contactoSnapshot = await resolvePedidoContactoSnapshotForInsert(client, pedidoPendiente.contacto);
     const contactoStart = ventasPerf.now();
     await client.query(
       `
@@ -8293,12 +8356,12 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
       `,
       [
         idPedido,
-        pedidoPendiente.contacto.nombre_contacto,
-        pedidoPendiente.contacto.telefono_contacto,
-        pedidoPendiente.contacto.telefono_normalizado,
-        pedidoPendiente.contacto.dni,
-        pedidoPendiente.contacto.rtn,
-        pedidoPendiente.contacto.correo
+        contactoSnapshot.nombre_contacto,
+        contactoSnapshot.telefono_contacto,
+        contactoSnapshot.telefono_normalizado,
+        contactoSnapshot.dni,
+        contactoSnapshot.rtn,
+        contactoSnapshot.correo
       ]
     );
     ventasPerf.add('pedido_pendiente_contacto_ms', contactoStart);
@@ -8332,6 +8395,7 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
     ventasPerf.add('pedido_pendiente_pago_control_ms', pagoControlStart);
 
     if (pedidoPendiente.modalidad === 'DELIVERY') {
+      const deliverySnapshot = await resolvePedidoDeliverySnapshotForInsert(client, pedidoPendiente.delivery);
       await client.query(
         `
           INSERT INTO public.pedidos_delivery (
@@ -8349,12 +8413,12 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
         [
           idPedido,
           pedidoPendiente.id_estado_delivery,
-          pedidoPendiente.delivery.costo_envio,
-          pedidoPendiente.delivery.nombre_receptor,
-          pedidoPendiente.delivery.telefono_receptor,
-          pedidoPendiente.delivery.direccion_entrega,
-          pedidoPendiente.delivery.referencia_entrega,
-          pedidoPendiente.delivery.observacion_delivery
+          deliverySnapshot.costo_envio,
+          deliverySnapshot.nombre_receptor,
+          deliverySnapshot.telefono_receptor,
+          deliverySnapshot.direccion_entrega,
+          deliverySnapshot.referencia_entrega,
+          deliverySnapshot.observacion_delivery
         ]
       );
     }
@@ -9263,6 +9327,11 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
     rpc_v2_enabled: ventasRpcV2Enabled,
     rpc_version: ventasRpcV2Enabled ? 'v2' : ventasRpcV1Enabled ? 'v1' : 'legacy'
   };
+  const idempotencyKey = getIdempotencyKey(req);
+  const idempotencyRequestHash = idempotencyKey
+    ? buildIdempotencyRequestHash(req.body)
+    : null;
+  let idempotencyReservation = null;
   const authContextStart = ventasPerf.now();
   const discountIntent = hasDiscountIntentInPayload(req.body);
   let canApplyDiscount = false;
@@ -9297,6 +9366,41 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
     ventasPerfContext.id_usuario = userId || null;
     ventasPerf.add('auth_context_ms', authContextStart);
 
+    idempotencyReservation = await reserveVentasIdempotencyKey({
+      client,
+      idempotencyKey,
+      operation: 'POST /ventas',
+      requestHash: idempotencyRequestHash,
+      idUsuario: userId,
+      idSucursal: req.body?.id_sucursal
+    });
+    if (idempotencyReservation.replay) {
+      await client.query('ROLLBACK');
+      ventasPerf.log({
+        ...ventasPerfContext,
+        status: idempotencyReservation.httpStatus || 200
+      });
+      return res.status(idempotencyReservation.httpStatus || 200).json({
+        ...(isPlainObject(idempotencyReservation.responseBody) ? idempotencyReservation.responseBody : {}),
+        idempotent_replay: true
+      });
+    }
+    if (idempotencyReservation.conflict) {
+      await client.query('ROLLBACK');
+      ventasPerf.log({
+        ...ventasPerfContext,
+        status: 409,
+        error_code: idempotencyReservation.code
+      });
+      return res.status(409).json({
+        error: true,
+        code: idempotencyReservation.code,
+        message: idempotencyReservation.code === 'IDEMPOTENCY_KEY_REUSED'
+          ? 'Idempotency-Key ya fue usado con otro payload.'
+          : 'La solicitud ya esta en proceso.'
+      });
+    }
+
     const prepared = await buildVentaPayload({
       client,
       body: req.body,
@@ -9308,6 +9412,14 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
 
     if (!prepared.ok) {
       await client.query('ROLLBACK');
+      await saveVentasIdempotencyFailure({
+        client,
+        reservation: idempotencyReservation,
+        httpStatus: prepared.status,
+        errorCode: prepared.body?.code || null
+      }).catch((saveError) => {
+        console.error('No se pudo guardar fallo idempotente de venta:', saveError);
+      });
       ventasPerf.log({
         ...ventasPerfContext,
         status: prepared.status,
@@ -9325,6 +9437,14 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
     const amountValidation = validateVentaMontoCobro({ venta });
     if (!amountValidation.ok) {
       await client.query('ROLLBACK');
+      await saveVentasIdempotencyFailure({
+        client,
+        reservation: idempotencyReservation,
+        httpStatus: amountValidation.status,
+        errorCode: amountValidation.code
+      }).catch((saveError) => {
+        console.error('No se pudo guardar validacion fallida idempotente de venta:', saveError);
+      });
       ventasPerf.log({
         ...ventasPerfContext,
         status: amountValidation.status,
@@ -9385,6 +9505,19 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
       await client.query('COMMIT');
       ventasPerf.add('commit_ms', commitStart);
 
+      await saveVentasIdempotencySuccess({
+        client,
+        reservation: idempotencyReservation,
+        httpStatus: 201,
+        responseBody: attachVentaSnapshotsToResponse(rpcCreateResult.response, venta),
+        idPedido: idPedidoRpc,
+        idFactura: rpcCreateResult.response?.id_factura,
+        idUsuario: userId,
+        idSucursal: venta.id_sucursal
+      }).catch((saveError) => {
+        console.error('No se pudo guardar resultado idempotente RPC V2 de venta:', saveError);
+      });
+
       ventasPerf.add('node_after_rpc_ms', rpcCreateResult.afterRpcStart);
       ventasPerf.log({ ...ventasPerfContext, status: 201 });
       res.status(201).json(attachVentaSnapshotsToResponse(rpcCreateResult.response, venta));
@@ -9409,6 +9542,19 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
       const commitStart = ventasPerf.now();
       await client.query('COMMIT');
       ventasPerf.add('commit_ms', commitStart);
+
+      await saveVentasIdempotencySuccess({
+        client,
+        reservation: idempotencyReservation,
+        httpStatus: 201,
+        responseBody: attachVentaSnapshotsToResponse(rpcCreateResult.response, venta),
+        idPedido: rpcCreateResult.response?.id_pedido,
+        idFactura: rpcCreateResult.response?.id_factura,
+        idUsuario: userId,
+        idSucursal: venta.id_sucursal
+      }).catch((saveError) => {
+        console.error('No se pudo guardar resultado idempotente RPC V1 de venta:', saveError);
+      });
 
       ventasPerf.add('node_after_rpc_ms', rpcCreateResult.afterRpcStart);
       ventasPerf.log({ ...ventasPerfContext, status: 201 });
@@ -9952,11 +10098,33 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
     const commitStart = ventasPerf.now();
     await client.query('COMMIT');
     ventasPerf.add('commit_ms', commitStart);
+
+    await saveVentasIdempotencySuccess({
+      client,
+      reservation: idempotencyReservation,
+      httpStatus: 201,
+      responseBody: createVentaResponse,
+      idPedido,
+      idFactura,
+      idUsuario: venta.id_usuario || userId,
+      idSucursal: venta.id_sucursal
+    }).catch((saveError) => {
+      console.error('No se pudo guardar resultado idempotente de venta:', saveError);
+    });
+
     ventasPerf.log(ventasPerfContext);
 
     res.status(201).json(createVentaResponse);
   } catch (err) {
     await client.query('ROLLBACK');
+    await saveVentasIdempotencyFailure({
+      client,
+      reservation: idempotencyReservation,
+      httpStatus: Number.isInteger(err?.httpStatus) ? err.httpStatus : 500,
+      errorCode: err?.code || 'VENTAS_CREATE_ERROR'
+    }).catch((saveError) => {
+      console.error('No se pudo marcar fallo idempotente de venta:', saveError);
+    });
     ventasPerf.log({
       ...ventasPerfContext,
       status: Number.isInteger(err?.httpStatus) ? err.httpStatus : 500,
