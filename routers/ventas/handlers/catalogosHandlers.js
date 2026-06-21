@@ -9,7 +9,6 @@ import {
 } from '../constants.js';
 import {
   buildVentaComplementContext,
-  resolveComboComplementMetadata,
   resolveRecetaComplementMetadata
 } from '../services/complementosCatalogService.js';
 import {
@@ -154,15 +153,13 @@ const buildDescuentoObjetivoLabel = (row) => {
   const objetivos = row?.objetivos || {};
   const key = alcance === DESCUENTO_ALCANCE_KEYS.PRODUCTO
     ? 'productos'
-    : alcance === DESCUENTO_ALCANCE_KEYS.RECETA
-      ? 'recetas'
-      : 'combos';
+    : 'recetas';
   const rows = parseJsonArrayValue(objetivos[key]);
   if (rows.length === 1) {
-    return rows[0]?.nombre_producto || rows[0]?.nombre_receta || rows[0]?.nombre_combo || `${alcance} seleccionado`;
+    return rows[0]?.nombre_producto || rows[0]?.nombre_receta || `${alcance} seleccionado`;
   }
   if (rows.length > 1) {
-    const label = alcance === DESCUENTO_ALCANCE_KEYS.PRODUCTO ? 'productos' : alcance === DESCUENTO_ALCANCE_KEYS.RECETA ? 'recetas' : 'combos';
+    const label = alcance === DESCUENTO_ALCANCE_KEYS.PRODUCTO ? 'productos' : 'recetas';
     return `${rows.length} ${label} seleccionados`;
   }
   return '--';
@@ -171,16 +168,14 @@ const buildDescuentoObjetivoLabel = (row) => {
 const normalizeDescuentoCatalogoRow = (row) => {
   const productos = parseJsonArrayValue(row?.productos);
   const recetas = parseJsonArrayValue(row?.recetas);
-  const combos = parseJsonArrayValue(row?.combos);
-  const objetivos = { productos, recetas, combos };
+  const objetivos = { productos, recetas };
   const normalized = {
     ...row,
     objetivos,
     objetivos_count: {
       productos: productos.length,
       recetas: recetas.length,
-      combos: combos.length,
-      total: productos.length + recetas.length + combos.length
+      total: productos.length + recetas.length
     }
   };
   normalized.objetivo = buildDescuentoObjetivoLabel(normalized);
@@ -452,284 +447,6 @@ export const listClientesCatalogoHandler = async (req, res) => {
   }
 };
 
-export const listCombosCatalogoHandler = async (req, res) => {
-  let idSucursal = null;
-  try {
-    const scope = await resolveRequestUserSucursalScope(req);
-    const isSuperAdmin = Boolean(scope.isSuperAdmin);
-    idSucursal = parseOptionalPositiveInt(req.query.id_sucursal);
-    const hasComboAssignmentsTable = await hasTable(pool, 'menu_combo_almacenes');
-
-    const sucursalValidation = await validateVentasCatalogSucursal({ scope, idSucursal });
-    if (!sucursalValidation.ok) {
-      return res.status(sucursalValidation.status).json(sucursalValidation.body);
-    }
-    if (!idSucursal) {
-      return res.status(400).json({ error: true, message: 'id_sucursal es obligatorio para listar complementos.' });
-    }
-
-    let joinClause = '';
-    let whereClause = '';
-    const params = [];
-
-    if (idSucursal) {
-      params.push(idSucursal);
-      joinClause = 'INNER JOIN menu_vigente mv ON mv.id_menu = c.id_menu';
-      whereClause = 'AND mv.id_sucursal = $1 AND COALESCE(mv.estado, true) = true AND (mv.fecha_inicio IS NULL OR mv.fecha_inicio <= CURRENT_TIMESTAMP)';
-      if (hasComboAssignmentsTable) {
-        joinClause += `
-          INNER JOIN public.menu_combo_almacenes mca
-            ON mca.id_combo = c.id_combo
-           AND COALESCE(mca.estado, true) = true
-          INNER JOIN public.almacenes aca
-            ON aca.id_almacen = mca.id_almacen
-           AND COALESCE(aca.estado, true) = true
-           AND aca.id_sucursal = $1
-          INNER JOIN public.sucursales sca
-            ON sca.id_sucursal = aca.id_sucursal
-           AND COALESCE(sca.estado, true) = true
-        `;
-      }
-    } else if (!isSuperAdmin) {
-      params.push(scope.allowedSucursalIds);
-      joinClause = 'INNER JOIN menu_vigente mv ON mv.id_menu = c.id_menu';
-      whereClause = 'AND mv.id_sucursal = ANY($1::int[]) AND COALESCE(mv.estado, true) = true AND (mv.fecha_inicio IS NULL OR mv.fecha_inicio <= CURRENT_TIMESTAMP)';
-      if (hasComboAssignmentsTable) {
-        joinClause += `
-          INNER JOIN public.menu_combo_almacenes mca
-            ON mca.id_combo = c.id_combo
-           AND COALESCE(mca.estado, true) = true
-          INNER JOIN public.almacenes aca
-            ON aca.id_almacen = mca.id_almacen
-           AND COALESCE(aca.estado, true) = true
-           AND aca.id_sucursal = ANY($1::int[])
-          INNER JOIN public.sucursales sca
-            ON sca.id_sucursal = aca.id_sucursal
-           AND COALESCE(sca.estado, true) = true
-        `;
-      }
-    }
-
-    const query = `
-      WITH combo_departamento_counts AS (
-        SELECT
-          dc.id_combo,
-          r.id_tipo_departamento,
-          td.nombre_departamento,
-          COUNT(*)::int AS total_componentes
-        FROM detalle_combo dc
-        INNER JOIN recetas r
-          ON r.id_receta = dc.id_receta
-        LEFT JOIN tipo_departamento td
-          ON td.id_tipo_departamento = r.id_tipo_departamento
-        WHERE COALESCE(dc.estado, true) = true
-          AND COALESCE(r.estado, true) = true
-          AND r.id_tipo_departamento IS NOT NULL
-        GROUP BY dc.id_combo, r.id_tipo_departamento, td.nombre_departamento
-      ),
-      combo_departamento_principal AS (
-        SELECT DISTINCT ON (id_combo)
-          id_combo,
-          id_tipo_departamento,
-          nombre_departamento
-        FROM combo_departamento_counts
-        ORDER BY id_combo, total_componentes DESC, id_tipo_departamento ASC
-      ),
-      combo_departamentos AS (
-        SELECT
-          id_combo,
-          ARRAY_AGG(id_tipo_departamento ORDER BY id_tipo_departamento) AS departamentos_ids,
-          JSONB_AGG(
-            JSONB_BUILD_OBJECT(
-              'id_tipo_departamento', id_tipo_departamento,
-              'nombre_tipo_departamento', nombre_departamento
-            )
-            ORDER BY id_tipo_departamento
-          ) AS departamentos
-        FROM combo_departamento_counts
-        GROUP BY id_combo
-      )
-      SELECT DISTINCT
-        c.id_combo,
-        c.nombre_combo,
-        c.descripcion,
-        c.precio,
-        c.estado,
-        c.id_archivo,
-        COALESCE(c.id_tipo_departamento, cdp.id_tipo_departamento) AS id_tipo_departamento,
-        COALESCE(td.nombre_departamento, cdp.nombre_departamento) AS nombre_tipo_departamento,
-        cdp.id_tipo_departamento AS id_tipo_departamento_principal,
-        cdp.nombre_departamento AS nombre_tipo_departamento_principal,
-        COALESCE(cd.departamentos_ids, ARRAY[]::int[]) AS departamentos_ids,
-        COALESCE(cd.departamentos, '[]'::jsonb) AS departamentos,
-        a.url_publica AS imagen_principal_url,
-        COALESCE(
-          NULLIF(TRIM(c.nombre_combo), ''),
-          c.descripcion
-        ) AS nombre_orden
-      FROM combos c
-      LEFT JOIN archivos a ON a.id_archivo = c.id_archivo AND (a.estado = true OR a.estado IS NULL)
-      LEFT JOIN tipo_departamento td
-        ON td.id_tipo_departamento = c.id_tipo_departamento
-      LEFT JOIN combo_departamento_principal cdp
-        ON cdp.id_combo = c.id_combo
-      LEFT JOIN combo_departamentos cd
-        ON cd.id_combo = c.id_combo
-      ${joinClause}
-      WHERE COALESCE(c.estado, true) = true ${whereClause}
-      ORDER BY nombre_orden ASC, c.id_combo ASC
-    `;
-
-    const result = await pool.query(query, params);
-    const comboRows = Array.isArray(result.rows) ? result.rows : [];
-    const complementContext = await buildVentaComplementContext({
-      client: pool,
-      idSucursal,
-      normalizedItems: comboRows.map((row) => ({
-        kind: 'COMBO',
-        id_combo: Number(row?.id_combo || 0),
-        cantidad: 1,
-        complementos: []
-      }))
-    });
-
-    const data = comboRows.map((row) => {
-      const { nombre_orden: _nombreOrden, ...publicRow } = row;
-      const metadata = resolveComboComplementMetadata({
-        combo: row,
-        quantity: 1,
-        components: complementContext.comboComponentsByCombo.get(Number(row?.id_combo || 0)) || [],
-        saucesByRecipe: complementContext.saucesByRecipe,
-        rulesByRecipe: complementContext.rulesByRecipe,
-        fallbackSauces: complementContext.fallbackSauces
-      });
-
-      return {
-        ...publicRow,
-        imagen_principal_url: buildAbsolutePublicUrl(req, row.imagen_principal_url),
-        requiere_complementos: Boolean(metadata.requiere_complementos),
-        tipo_complemento: metadata.tipo_complemento || VENTA_COMPLEMENTO_TIPO_SALSAS,
-        minimo_complementos: Number(metadata.minimo_complementos || 0),
-        maximo_complementos: Number(metadata.maximo_complementos || 0),
-        complementos_disponibles: (Array.isArray(metadata.complementos_disponibles) ? metadata.complementos_disponibles : []).map((entry) => ({
-          id_complemento: Number(entry?.id_complemento || entry?.id_salsa || 0),
-          nombre: String(entry?.nombre || 'Salsa').trim(),
-          disponible: entry?.disponible !== false
-        })).filter((entry) => entry.id_complemento > 0)
-      };
-    });
-
-    res.status(200).json(data);
-  } catch (err) {
-    console.error('[ventas.catalogos.combos] error', {
-      code: err?.code || null,
-      message: err?.message || 'Error sin mensaje',
-      id_sucursal: idSucursal || null
-    });
-    sendVentasInternalError(res);
-  }
-};
-
-const fetchRecetasCatalogoData = async ({ req, idSucursal, idTipoDepartamento = null }) => {
-  let sqlDurationMs = 0;
-  let mappingDurationMs = 0;
-  const schemaStartedAt = performance.now();
-  const hasRecipeAssignmentsTable = await hasTable(pool, 'menu_receta_almacenes');
-  sqlDurationMs += performance.now() - schemaStartedAt;
-
-  let joinClause = 'INNER JOIN menu_vigente mv ON mv.id_menu = r.id_menu';
-  if (hasRecipeAssignmentsTable) {
-    joinClause += `
-      INNER JOIN public.menu_receta_almacenes mra
-        ON mra.id_receta = r.id_receta
-       AND COALESCE(mra.estado, true) = true
-      INNER JOIN public.almacenes ara
-        ON ara.id_almacen = mra.id_almacen
-       AND COALESCE(ara.estado, true) = true
-       AND ara.id_sucursal = $1
-      INNER JOIN public.sucursales sra
-        ON sra.id_sucursal = ara.id_sucursal
-       AND COALESCE(sra.estado, true) = true
-    `;
-  }
-
-  const params = [idSucursal];
-  let departmentClause = '';
-  if (idTipoDepartamento) {
-    params.push(idTipoDepartamento);
-    departmentClause = `AND r.id_tipo_departamento = $${params.length}`;
-  }
-
-  const sqlStartedAt = performance.now();
-  const result = await pool.query(
-    `
-      SELECT DISTINCT
-        r.id_receta,
-        r.nombre_receta,
-        r.descripcion,
-        r.estado,
-        r.precio,
-        r.id_archivo,
-        r.id_tipo_departamento,
-        a.url_publica AS imagen_principal_url,
-        NULL::INTEGER AS id_producto_base,
-        r.nombre_receta AS nombre_producto_base,
-        r.precio AS precio_producto_base,
-        r.estado AS estado_producto_base
-      FROM recetas r
-      LEFT JOIN archivos a ON a.id_archivo = r.id_archivo AND (a.estado = true OR a.estado IS NULL)
-      ${joinClause}
-      WHERE COALESCE(r.estado, true) = true
-        AND mv.id_sucursal = $1
-        AND COALESCE(mv.estado, true) = true
-        AND (mv.fecha_inicio IS NULL OR mv.fecha_inicio <= CURRENT_TIMESTAMP)
-        ${departmentClause}
-      ORDER BY r.nombre_receta ASC, r.id_receta ASC
-    `,
-    params
-  );
-  sqlDurationMs += performance.now() - sqlStartedAt;
-  const recetaRows = Array.isArray(result.rows) ? result.rows : [];
-
-  const complementStartedAt = performance.now();
-  const complementContext = await buildVentaComplementContext({
-    client: pool,
-    idSucursal,
-    normalizedItems: recetaRows.map((row) => ({
-      kind: 'RECETA',
-      id_receta: Number(row?.id_receta || 0),
-      cantidad: 1,
-      complementos: []
-    }))
-  });
-  sqlDurationMs += performance.now() - complementStartedAt;
-
-  const mappingStartedAt = performance.now();
-  const data = recetaRows.map((row) => {
-    const metadata = resolveRecetaComplementMetadata({
-      receta: row,
-      quantity: 1,
-      allowedSauces: complementContext.saucesByRecipe.get(Number(row?.id_receta || 0)) || [],
-      rules: complementContext.rulesByRecipe.get(Number(row?.id_receta || 0)) || [],
-      fallbackSauces: complementContext.fallbackSauces
-    });
-    return {
-      ...row,
-      imagen_principal_url: buildAbsolutePublicUrl(req, row.imagen_principal_url),
-      requiere_complementos: Boolean(metadata.requiere_complementos),
-      tipo_complemento: metadata.tipo_complemento || VENTA_COMPLEMENTO_TIPO_SALSAS,
-      minimo_complementos: Number(metadata.minimo_complementos || 0),
-      maximo_complementos: Number(metadata.maximo_complementos || 0),
-      complementos_disponibles: (Array.isArray(metadata.complementos_disponibles) ? metadata.complementos_disponibles : []).map((entry) => ({
-        id_complemento: Number(entry?.id_complemento || entry?.id_salsa || 0),
-        nombre: String(entry?.nombre || 'Salsa').trim(),
-        disponible: entry?.disponible !== false
-      })).filter((entry) => entry.id_complemento > 0)
-    };
-  });
-  mappingDurationMs += performance.now() - mappingStartedAt;
-  return { data, sqlDurationMs, mappingDurationMs };
-};
 
 export const listRecetasCatalogoHandler = async (req, res) => {
   try {
@@ -1342,7 +1059,6 @@ export const listDescuentosCatalogoHandler = async (req, res) => {
           dc.alcance,
           dc.id_producto,
           dc.id_receta,
-          dc.id_combo,
           dc.id_sucursal,
           dc.fecha_inicio,
           dc.fecha_fin,
@@ -1350,10 +1066,8 @@ export const listDescuentosCatalogoHandler = async (req, res) => {
           td.nombre_tipo_descuento,
           COALESCE(objp.productos, '[]'::jsonb) AS productos,
           COALESCE(objr.recetas, '[]'::jsonb) AS recetas,
-          COALESCE(objc.combos, '[]'::jsonb) AS combos,
           COALESCE(objp.productos_ids, ARRAY[]::int[]) AS productos_ids,
-          COALESCE(objr.recetas_ids, ARRAY[]::int[]) AS recetas_ids,
-          COALESCE(objc.combos_ids, ARRAY[]::int[]) AS combos_ids
+          COALESCE(objr.recetas_ids, ARRAY[]::int[]) AS recetas_ids
         FROM descuentos_catalogos dc
         INNER JOIN tipo_descuentos td
           ON td.id_tipo_descuento = dc.id_tipo_descuento
@@ -1395,25 +1109,6 @@ export const listDescuentosCatalogoHandler = async (req, res) => {
               )
           ) x
         ) objr ON true
-        LEFT JOIN LATERAL (
-          SELECT
-            COALESCE(jsonb_agg(jsonb_build_object('id_combo', x.id_combo, 'nombre_combo', x.nombre_combo) ORDER BY x.nombre_combo), '[]'::jsonb) AS combos,
-            COALESCE(array_agg(x.id_combo ORDER BY x.id_combo), ARRAY[]::int[]) AS combos_ids
-          FROM (
-            SELECT DISTINCT cb.id_combo, COALESCE(cb.nombre_combo, cb.descripcion) AS nombre_combo
-            FROM descuentos_catalogos_combos rel
-            INNER JOIN combos cb ON cb.id_combo = rel.id_combo
-            WHERE rel.id_descuento_catalogo = dc.id_descuento_catalogo
-            UNION
-            SELECT cb.id_combo, COALESCE(cb.nombre_combo, cb.descripcion) AS nombre_combo
-            FROM combos cb
-            WHERE cb.id_combo = dc.id_combo
-              AND NOT EXISTS (
-                SELECT 1 FROM descuentos_catalogos_combos rel
-                WHERE rel.id_descuento_catalogo = dc.id_descuento_catalogo
-              )
-          ) x
-        ) objc ON true
         WHERE COALESCE(dc.estado, true) = true
           AND COALESCE(td.estado, true) = true
           ${sucursalWhere}

@@ -23,21 +23,6 @@ export const fetchProductoMap = async (client, ids, options = {}) => {
   return new Map(result.rows.map((row) => [Number(row.id_producto), row]));
 };
 
-export const fetchComboMap = async (client, ids) => {
-  if (!ids.length) return new Map();
-
-  const result = await client.query(
-    `
-      SELECT id_combo, descripcion, precio, estado
-      FROM combos
-      WHERE id_combo = ANY($1::int[])
-    `,
-    [ids]
-  );
-
-  return new Map(result.rows.map((row) => [Number(row.id_combo), row]));
-};
-
 export const fetchRecetaMap = async (client, ids) => {
   if (!ids.length) return new Map();
 
@@ -58,16 +43,14 @@ export const fetchRecetaMap = async (client, ids) => {
   return new Map(result.rows.map((row) => [Number(row.id_receta), row]));
 };
 
-export const fetchVentaCatalogMaps = async (client, { productoIds = [], comboIds = [], recetaIds = [], lockProductos = true, idSucursal = null } = {}) => {
+export const fetchVentaCatalogMaps = async (client, { productoIds = [], recetaIds = [], lockProductos = true, idSucursal = null } = {}) => {
   const uniqueProductoIds = [...new Set((Array.isArray(productoIds) ? productoIds : []).filter(Boolean))];
-  const uniqueComboIds = [...new Set((Array.isArray(comboIds) ? comboIds : []).filter(Boolean))];
   const uniqueRecetaIds = [...new Set((Array.isArray(recetaIds) ? recetaIds : []).filter(Boolean))];
   const productoMap = await fetchProductoMap(client, uniqueProductoIds, { forUpdate: lockProductos, idSucursal });
 
-  if (uniqueProductoIds.length === 0 && uniqueComboIds.length === 0 && uniqueRecetaIds.length === 0) {
+  if (uniqueProductoIds.length === 0 && uniqueRecetaIds.length === 0) {
     return {
       productoMap,
-      comboMap: new Map(),
       recetaMap: new Map()
     };
   }
@@ -79,20 +62,6 @@ export const fetchVentaCatalogMaps = async (client, { productoIds = [], comboIds
     params.push(values);
     return `$${params.length}::int[]`;
   };
-
-  if (uniqueComboIds.length > 0) {
-    const combosParam = addArrayParam(uniqueComboIds);
-    ctes.push(`
-      combos_rows AS (
-        SELECT id_combo, descripcion, precio, estado
-        FROM combos
-        WHERE id_combo = ANY(${combosParam})
-      )
-    `);
-    selects.push(`COALESCE((SELECT jsonb_agg(to_jsonb(cr)) FROM combos_rows cr), '[]'::jsonb) AS combos`);
-  } else {
-    selects.push(`'[]'::jsonb AS combos`);
-  }
 
   if (uniqueRecetaIds.length > 0) {
     const recetasParam = addArrayParam(uniqueRecetaIds);
@@ -116,7 +85,6 @@ export const fetchVentaCatalogMaps = async (client, { productoIds = [], comboIds
   if (ctes.length === 0) {
     return {
       productoMap,
-      comboMap: new Map(),
       recetaMap: new Map()
     };
   }
@@ -129,12 +97,10 @@ export const fetchVentaCatalogMaps = async (client, { productoIds = [], comboIds
     params
   );
   const row = result.rows?.[0] || {};
-  const combos = Array.isArray(row.combos) ? row.combos : [];
   const recetas = Array.isArray(row.recetas) ? row.recetas : [];
 
   return {
     productoMap,
-    comboMap: new Map(combos.map((item) => [Number(item.id_combo), item])),
     recetaMap: new Map(recetas.map((item) => [Number(item.id_receta), item]))
   };
 };

@@ -69,35 +69,7 @@ const sortSauceOptions = (items) => (
 
 const enrichCatalogItemsWithSauceConfig = async (items) => {
   const directRecipeIds = toPositiveIntArray(items.map((item) => item?.id_receta));
-  const comboIds = toPositiveIntArray(items.map((item) => item?.id_combo));
-
-  let comboRecipeRows = [];
-  if (comboIds.length > 0) {
-    const comboRecipesResult = await pool.query(
-      `
-        SELECT
-          dc.id_combo,
-          dc.id_receta,
-          dc.cantidad AS multiplicador,
-          r.nombre_receta
-        FROM detalle_combo dc
-        INNER JOIN recetas r
-          ON r.id_receta = dc.id_receta
-        WHERE dc.id_combo = ANY($1::int[])
-          AND dc.id_receta IS NOT NULL
-          AND COALESCE(dc.estado, true) = true
-          AND COALESCE(r.estado, true) = true
-        ORDER BY dc.id_combo, COALESCE(dc.orden, dc.id_detalle_combo);
-      `,
-      [comboIds]
-    );
-    comboRecipeRows = comboRecipesResult.rows;
-  }
-
-  const allRecipeIds = toPositiveIntArray([
-    ...directRecipeIds,
-    ...comboRecipeRows.map((row) => row?.id_receta)
-  ]);
+  const allRecipeIds = directRecipeIds;
 
   let allowedSauceRows = [];
   let ruleRows = [];
@@ -173,23 +145,6 @@ const enrichCatalogItemsWithSauceConfig = async (items) => {
     });
   }
 
-  const comboComponentsById = new Map();
-  for (const row of comboRecipeRows) {
-    const comboId = Number(row?.id_combo || 0);
-    const recipeId = Number(row?.id_receta || 0);
-    if (!comboComponentsById.has(comboId)) {
-      comboComponentsById.set(comboId, []);
-    }
-
-    comboComponentsById.get(comboId).push({
-      id_receta: recipeId,
-      nombre_receta: row.nombre_receta,
-      multiplicador: Math.max(1, Number(row?.multiplicador || 1)),
-      salsas_permitidas: sortSauceOptions(allowedSaucesByRecipe.get(recipeId) || []),
-      reglas: rulesByRecipe.get(recipeId) || []
-    });
-  }
-
   return items.map((item) => {
     let salsasComponentes = [];
 
@@ -202,8 +157,6 @@ const enrichCatalogItemsWithSauceConfig = async (items) => {
         salsas_permitidas: sortSauceOptions(allowedSaucesByRecipe.get(recipeId) || []),
         reglas: rulesByRecipe.get(recipeId) || []
       }];
-    } else if (Number(item?.id_combo || 0) > 0) {
-      salsasComponentes = comboComponentsById.get(Number(item.id_combo)) || [];
     }
 
     const unionSauces = new Map();
@@ -230,7 +183,7 @@ const enrichCatalogItemsWithSauceConfig = async (items) => {
 
 // =====================================================
 // HU-36
-// GET: Productos + combos del POS con URL de imagen
+// GET: Productos y recetas del POS con URL de imagen
 // URL: /menu-pos/catalogo-imagenes?id_tipo_departamento=?
 // =====================================================
 router.get('/menu-pos/catalogo-imagenes', checkPermission(MENU_POS_VIEW_PERMISSIONS), async (req, res) => {
@@ -253,9 +206,6 @@ router.get('/menu-pos/catalogo-imagenes', checkPermission(MENU_POS_VIEW_PERMISSI
     const recipeExcludedDepartmentIds = Array.isArray(departmentIds?.recipeExcludedDepartmentIds)
       ? departmentIds.recipeExcludedDepartmentIds
       : [];
-    const comboDepartmentId = Number.isInteger(departmentIds?.comboDepartmentId)
-      ? departmentIds.comboDepartmentId
-      : null;
     const productDepartmentIds = Array.isArray(departmentIds?.productDepartmentIds)
       ? departmentIds.productDepartmentIds
       : [];
@@ -264,7 +214,6 @@ router.get('/menu-pos/catalogo-imagenes', checkPermission(MENU_POS_VIEW_PERMISSI
       SELECT
         NULL::INTEGER AS id_producto,
         r.id_receta,
-        NULL::INTEGER AS id_combo,
         r.nombre_receta AS nombre_producto,
         COALESCE(r.descripcion, '') AS descripcion_producto,
         r.precio,
@@ -275,8 +224,7 @@ router.get('/menu-pos/catalogo-imagenes', checkPermission(MENU_POS_VIEW_PERMISSI
         r.id_tipo_departamento,
         COALESCE(r.estado, true) AS estado,
         r.id_archivo AS id_archivo,
-        a_receta.url_publica AS url_imagen,
-        false AS es_combo
+        a_receta.url_publica AS url_imagen
       FROM recetas r
       LEFT JOIN archivos a_receta
         ON a_receta.id_archivo = r.id_archivo
@@ -289,35 +237,8 @@ router.get('/menu-pos/catalogo-imagenes', checkPermission(MENU_POS_VIEW_PERMISSI
       UNION ALL
 
       SELECT
-        NULL::INTEGER AS id_producto,
-        NULL::INTEGER AS id_receta,
-        c.id_combo,
-        COALESCE(NULLIF(c.nombre_combo, ''), NULLIF(c.descripcion, ''), CONCAT('Combo #', c.id_combo::text)) AS nombre_producto,
-        COALESCE(c.descripcion, c.nombre_combo, '') AS descripcion_producto,
-        c.precio,
-        c.cant_personas AS cantidad,
-        NULL::INTEGER AS stock_minimo,
-        NULL::INTEGER AS id_categoria_producto,
-        NULL::INTEGER AS id_almacen,
-        c.id_tipo_departamento,
-        COALESCE(c.estado, true) AS estado,
-        c.id_archivo,
-        a_combo.url_publica AS url_imagen,
-        true AS es_combo
-      FROM combos c
-      LEFT JOIN archivos a_combo
-        ON a_combo.id_archivo = c.id_archivo
-       AND (a_combo.estado = true OR a_combo.estado IS NULL)
-      WHERE COALESCE(c.estado, true) = true
-        AND ($3::INTEGER IS NOT NULL AND c.id_tipo_departamento = $3)
-        AND ($1::INTEGER IS NULL OR c.id_tipo_departamento = $1)
-
-      UNION ALL
-
-      SELECT
         p.id_producto,
         NULL::INTEGER AS id_receta,
-        NULL::INTEGER AS id_combo,
         p.nombre_producto,
         COALESCE(p.descripcion_producto, '') AS descripcion_producto,
         p.precio,
@@ -328,8 +249,7 @@ router.get('/menu-pos/catalogo-imagenes', checkPermission(MENU_POS_VIEW_PERMISSI
         p.id_tipo_departamento,
         COALESCE(p.estado, true) AS estado,
         ${productosTieneArchivo ? 'p.id_archivo_imagen_principal' : 'NULL::INTEGER'} AS id_archivo,
-        ${productosTieneArchivo ? 'a_producto.url_publica' : 'NULL::VARCHAR'} AS url_imagen,
-        false AS es_combo
+        ${productosTieneArchivo ? 'a_producto.url_publica' : 'NULL::VARCHAR'} AS url_imagen
       FROM productos p
       ${productosTieneArchivo
         ? `LEFT JOIN archivos a_producto
@@ -337,7 +257,7 @@ router.get('/menu-pos/catalogo-imagenes', checkPermission(MENU_POS_VIEW_PERMISSI
        AND (a_producto.estado = true OR a_producto.estado IS NULL)`
         : ''}
       WHERE COALESCE(p.estado, true) = true
-        AND p.id_tipo_departamento = ANY($4::INTEGER[])
+        AND p.id_tipo_departamento = ANY($3::INTEGER[])
         AND ($1::INTEGER IS NULL OR p.id_tipo_departamento = $1)
       ORDER BY nombre_producto ASC;
     `;
@@ -345,7 +265,6 @@ router.get('/menu-pos/catalogo-imagenes', checkPermission(MENU_POS_VIEW_PERMISSI
     const result = await pool.query(queryCatalogo, [
       idTipoDepartamento,
       recipeExcludedDepartmentIds,
-      comboDepartmentId,
       productDepartmentIds
     ]);
     const enrichedItems = await enrichCatalogItemsWithSauceConfig(result.rows);
@@ -429,33 +348,10 @@ router.get('/menu-pos/catalogo-imagenes/:id_tipo_departamento', checkPermission(
       [idDep]
     );
 
-    const queryCombos = `
-      SELECT
-        c.id_combo,
-        c.id_menu,
-        c.nombre_combo,
-        c.descripcion,
-        c.cant_personas,
-        c.precio,
-        c.estado,
-        c.id_archivo,
-        a.url_publica AS url_imagen
-      FROM combos c
-      LEFT JOIN archivos a
-        ON a.id_archivo = c.id_archivo
-       AND (a.estado = true OR a.estado IS NULL)
-      WHERE (c.estado = true OR c.estado IS NULL)
-        AND c.id_tipo_departamento = $1
-      ORDER BY c.id_combo DESC;
-    `;
-
-    const combosResult = await pool.query(queryCombos, [idDep]);
-
     return res.status(200).json({
       ok: true,
       productos_tiene_id_archivo_imagen_principal: productosTieneArchivo,
-      productos: productosResult.rows,
-      combos: combosResult.rows
+      productos: productosResult.rows
     });
   } catch (err) {
     console.error('Error al listar catálogo POS con imágenes (HU-36):', err.message);

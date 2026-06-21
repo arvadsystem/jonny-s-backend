@@ -112,7 +112,7 @@ assert.notEqual(keySucursal1, keySucursal2, 'el cache debe separarse por sucursa
 assert.notEqual(keySucursal1, keyDepartamento2, 'el cache debe separarse por departamento');
 
 const payloadKeys = Object.keys(cachedAgain.value.data);
-for (const forbidden of ['clientes', 'productos', 'combos', 'descuentos', 'ventas']) {
+for (const forbidden of ['clientes', 'productos', 'descuentos', 'ventas']) {
   assert.equal(payloadKeys.includes(forbidden), false, `bootstrap no debe incluir ${forbidden}`);
 }
 assert.ok(cachedAgain.value.data.recetas.every((row) => row.id_tipo_departamento === 10));

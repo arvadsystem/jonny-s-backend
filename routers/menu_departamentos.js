@@ -2,7 +2,6 @@ import pool from '../config/db-connection.js';
 
 // Nombres canonicos que gobiernan la clasificacion del modulo MENU.
 const MENU_DEPARTMENT_NAMES = Object.freeze({
-  combos: ['combos', 'combo'],
   productos: [
     'cervezas',
     'cerveza',
@@ -65,18 +64,15 @@ export const resolveMenuDepartmentIds = async () => {
     }
   }
 
-  const comboDepartmentId = getFirstMatchId(nameToId, MENU_DEPARTMENT_NAMES.combos);
   const productDepartmentIds = getIdsForNames(nameToId, MENU_DEPARTMENT_NAMES.productos);
   const extraRecipeExcludedIds = getIdsForNames(nameToId, MENU_DEPARTMENT_NAMES.excluidosRecetasExtra);
 
   const recipeExcludedDepartmentIds = toUniquePositiveIntArray([
     ...productDepartmentIds,
-    comboDepartmentId,
     ...extraRecipeExcludedIds
   ]);
 
   return {
-    comboDepartmentId,
     productDepartmentIds,
     recipeExcludedDepartmentIds
   };

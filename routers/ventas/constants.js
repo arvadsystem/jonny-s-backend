@@ -19,8 +19,7 @@ export const DESCUENTO_TIPO_KEYS = {
 export const DESCUENTO_ALCANCE_KEYS = {
   FACTURA_COMPLETA: 'FACTURA_COMPLETA',
   PRODUCTO: 'PRODUCTO',
-  RECETA: 'RECETA',
-  COMBO: 'COMBO'
+  RECETA: 'RECETA'
 };
 export const VENTAS_DESCUENTO_APLICAR_PERMISSION = 'VENTAS_DESCUENTO_APLICAR';
 export const ESTADO_PEDIDO_CODES = {
@@ -71,9 +70,7 @@ export const VENTAS_PERF_STAGE_NAMES = [
   'totals_items_ms',
   'totals_productos_ms',
   'totals_recetas_ms',
-  'totals_combos_ms',
   'totals_complementos_ms',
-  'totals_combo_components_ms',
   'totals_sauce_rules_ms',
   'totals_allowed_sauces_ms',
   'totals_descuentos_ms',

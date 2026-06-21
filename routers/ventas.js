@@ -41,14 +41,12 @@ import {
   buildVentaComplementContext,
   buildVentasStaticCacheKey,
   fetchCachedVentasStaticRows,
-  resolveComboComplementMetadata,
   resolveRecetaComplementMetadata
 } from './ventas/services/complementosCatalogService.js';
 import {
   getCajaBootstrapHandler,
   listCategoriasCatalogoHandler,
   listClientesCatalogoHandler,
-  listCombosCatalogoHandler,
   listDescuentosCatalogoHandler,
   listExtrasPermitidosCatalogoHandler,
   listProductosCatalogoHandler,
@@ -264,8 +262,7 @@ const resolvePedidoDeliverySnapshotForInsert = async (client, delivery = {}) => 
 
 const PEDIDO_PENDIENTE_ALLOWED_EXTRAS_SCHEMA_TABLES = Object.freeze([
   'menu_extras',
-  'menu_extra_receta',
-  'menu_extra_combo'
+  'menu_extra_receta'
 ]);
 const PEDIDO_PENDIENTE_ALLOWED_EXTRAS_SCHEMA_MIN_TTL_MS = 5 * 60 * 1000;
 const pedidoPendienteAllowedExtrasSchemaCache = new Map();
@@ -278,8 +275,7 @@ const getPedidoPendienteAllowedExtrasSchemaCacheTtlMs = () => {
 
 const clonePedidoPendienteAllowedExtrasSchemaValue = (value) => ({
   hasMenuExtras: Boolean(value?.hasMenuExtras),
-  hasMenuExtraReceta: Boolean(value?.hasMenuExtraReceta),
-  hasMenuExtraCombo: Boolean(value?.hasMenuExtraCombo)
+  hasMenuExtraReceta: Boolean(value?.hasMenuExtraReceta)
 });
 
 const resolvePedidoPendienteAllowedExtrasSchema = async (client, perf = null) => {
@@ -305,8 +301,7 @@ const resolvePedidoPendienteAllowedExtrasSchema = async (client, perf = null) =>
     const existingTables = new Set(result.rows.map((row) => String(row.table_name || '').trim()));
     const value = {
       hasMenuExtras: existingTables.has('menu_extras'),
-      hasMenuExtraReceta: existingTables.has('menu_extra_receta'),
-      hasMenuExtraCombo: existingTables.has('menu_extra_combo')
+      hasMenuExtraReceta: existingTables.has('menu_extra_receta')
     };
     pedidoPendienteAllowedExtrasSchemaCache.set(cacheKey, {
       value,
@@ -917,7 +912,6 @@ const buildCreatedVentaDetailItems = ({ detalleFacturaRows, detalleFacturaRowsIn
         id_detalle_pedido: Number(inserted.id_detalle_pedido || entry.pedidoRef?.id_detalle_pedido || 0) || null,
         tipo_item: tipoItem,
         id_producto: Number(inserted.id_producto || line.id_producto || 0) || null,
-        id_combo: Number(inserted.id_combo || line.id_combo || 0) || null,
         id_receta: Number(inserted.id_receta || line.id_receta || 0) || null,
         nombre_item: origenSnapshot.nombre_item || line.nombre_item || 'Item de cocina',
         nombre_producto: origenSnapshot.nombre_item || line.nombre_item || 'Item de cocina',
@@ -1365,7 +1359,6 @@ const fetchDiscountCatalogById = async (client, idDescuentoCatalogo) => {
         dc.alcance,
         dc.id_producto,
         dc.id_receta,
-        dc.id_combo,
         dc.id_sucursal,
         dc.fecha_inicio,
         dc.fecha_fin,
@@ -1373,8 +1366,7 @@ const fetchDiscountCatalogById = async (client, idDescuentoCatalogo) => {
         td.nombre_tipo_descuento,
         td.estado AS tipo_estado,
         COALESCE(dcp.productos_ids, ARRAY[]::int[]) AS productos_ids,
-        COALESCE(dcr.recetas_ids, ARRAY[]::int[]) AS recetas_ids,
-        COALESCE(dcc.combos_ids, ARRAY[]::int[]) AS combos_ids
+        COALESCE(dcr.recetas_ids, ARRAY[]::int[]) AS recetas_ids
       FROM descuentos_catalogos dc
       INNER JOIN tipo_descuentos td
         ON td.id_tipo_descuento = dc.id_tipo_descuento
@@ -1388,11 +1380,6 @@ const fetchDiscountCatalogById = async (client, idDescuentoCatalogo) => {
         FROM descuentos_catalogos_recetas rel
         WHERE rel.id_descuento_catalogo = dc.id_descuento_catalogo
       ) dcr ON true
-      LEFT JOIN LATERAL (
-        SELECT ARRAY_AGG(DISTINCT rel.id_combo ORDER BY rel.id_combo)::int[] AS combos_ids
-        FROM descuentos_catalogos_combos rel
-        WHERE rel.id_descuento_catalogo = dc.id_descuento_catalogo
-      ) dcc ON true
       WHERE dc.id_descuento_catalogo = $1
       LIMIT 1
     `,
@@ -1430,7 +1417,6 @@ const fetchDiscountCatalogMapByIds = async (client, ids, { perf = null } = {}) =
             dc.alcance,
             dc.id_producto,
             dc.id_receta,
-            dc.id_combo,
             dc.id_sucursal,
             dc.fecha_inicio,
             dc.fecha_fin,
@@ -1438,8 +1424,7 @@ const fetchDiscountCatalogMapByIds = async (client, ids, { perf = null } = {}) =
             td.nombre_tipo_descuento,
             td.estado AS tipo_estado,
             COALESCE(dcp.productos_ids, ARRAY[]::int[]) AS productos_ids,
-            COALESCE(dcr.recetas_ids, ARRAY[]::int[]) AS recetas_ids,
-            COALESCE(dcc.combos_ids, ARRAY[]::int[]) AS combos_ids
+            COALESCE(dcr.recetas_ids, ARRAY[]::int[]) AS recetas_ids
           FROM descuentos_catalogos dc
           INNER JOIN tipo_descuentos td
             ON td.id_tipo_descuento = dc.id_tipo_descuento
@@ -1453,11 +1438,6 @@ const fetchDiscountCatalogMapByIds = async (client, ids, { perf = null } = {}) =
             FROM descuentos_catalogos_recetas rel
             WHERE rel.id_descuento_catalogo = dc.id_descuento_catalogo
           ) dcr ON true
-          LEFT JOIN LATERAL (
-            SELECT ARRAY_AGG(DISTINCT rel.id_combo ORDER BY rel.id_combo)::int[] AS combos_ids
-            FROM descuentos_catalogos_combos rel
-            WHERE rel.id_descuento_catalogo = dc.id_descuento_catalogo
-          ) dcc ON true
           WHERE dc.id_descuento_catalogo = ANY($1::int[])
           ORDER BY dc.id_descuento_catalogo ASC
         `,
@@ -1543,7 +1523,6 @@ const validateCatalogDiscountAvailability = ({
   if (line) {
     const productosIds = coercePositiveIntArray(discountCatalog.productos_ids);
     const recetasIds = coercePositiveIntArray(discountCatalog.recetas_ids);
-    const combosIds = coercePositiveIntArray(discountCatalog.combos_ids);
     if (
       alcance === DESCUENTO_ALCANCE_KEYS.PRODUCTO &&
       !(productosIds.length > 0
@@ -1559,14 +1538,6 @@ const validateCatalogDiscountAvailability = ({
         : Number(discountCatalog.id_receta || 0) === Number(line.id_receta || 0))
     ) {
       return { ok: false, status: 409, code: 'VENTAS_DESCUENTO_ITEM_NO_APLICA', message: 'El descuento de receta no aplica a esta linea.' };
-    }
-    if (
-      alcance === DESCUENTO_ALCANCE_KEYS.COMBO &&
-      !(combosIds.length > 0
-        ? combosIds.includes(Number(line.id_combo || 0))
-        : Number(discountCatalog.id_combo || 0) === Number(line.id_combo || 0))
-    ) {
-      return { ok: false, status: 409, code: 'VENTAS_DESCUENTO_ITEM_NO_APLICA', message: 'El descuento de combo no aplica a esta linea.' };
     }
   }
 
@@ -2010,7 +1981,6 @@ const buildInvalidComplementResult = ({ item, nombreItem, allowed = [], reason }
       tipo_item: item?.kind || null,
       id_producto: parseOptionalPositiveInt(item?.id_producto),
       id_receta: parseOptionalPositiveInt(item?.id_receta),
-      id_combo: parseOptionalPositiveInt(item?.id_combo),
       nombre_item: nombreItem || null,
       complementos_solicitados: Array.isArray(item?.complementos) ? item.complementos : [],
       complementos_permitidos: allowed,
@@ -2025,7 +1995,7 @@ const buildInvalidComplementResult = ({ item, nombreItem, allowed = [], reason }
   };
 };
 
-const resolveLineComplementos = ({ item, receta, combo, context, nombreItem }) => {
+const resolveLineComplementos = ({ item, receta, context, nombreItem }) => {
   if (item.kind === 'PRODUCTO' || item.kind === 'ITEM') {
     if (Array.isArray(item.complementos) && item.complementos.length > 0) {
       return buildInvalidComplementResult({ item, nombreItem, reason: 'PRODUCTO_NO_PERMITE_COMPLEMENTOS' });
@@ -2043,25 +2013,13 @@ const resolveLineComplementos = ({ item, receta, combo, context, nombreItem }) =
     };
   }
 
-  let metadata;
-  if (item.kind === 'RECETA') {
-    metadata = resolveRecetaComplementMetadata({
-      receta,
-      quantity: item.cantidad,
-      allowedSauces: context.saucesByRecipe.get(Number(item.id_receta || 0)) || [],
-      rules: context.rulesByRecipe.get(Number(item.id_receta || 0)) || [],
-      fallbackSauces: context.fallbackSauces
-    });
-  } else {
-    metadata = resolveComboComplementMetadata({
-      combo,
-      quantity: item.cantidad,
-      components: context.comboComponentsByCombo.get(Number(item.id_combo || 0)) || [],
-      saucesByRecipe: context.saucesByRecipe,
-      rulesByRecipe: context.rulesByRecipe,
-      fallbackSauces: context.fallbackSauces
-    });
-  }
+  const metadata = resolveRecetaComplementMetadata({
+    receta,
+    quantity: item.cantidad,
+    allowedSauces: context.saucesByRecipe.get(Number(item.id_receta || 0)) || [],
+    rules: context.rulesByRecipe.get(Number(item.id_receta || 0)) || [],
+    fallbackSauces: context.fallbackSauces
+  });
 
   const selectedIds = Array.isArray(item.complementos) ? item.complementos : [];
   const allowedMap = new Map(
@@ -2173,8 +2131,8 @@ const buildAllowedExtrasMap = async (client, { normalizedItems = [], idSucursal 
 
   return new Map(
     normalizedItems.flatMap((item) => {
-      const itemId = item.kind === 'RECETA' ? Number(item.id_receta || 0) : item.kind === 'COMBO' ? Number(item.id_combo || 0) : 0;
-      if (!['RECETA', 'COMBO'].includes(item.kind) || itemId <= 0) return [];
+      const itemId = item.kind === 'RECETA' ? Number(item.id_receta || 0) : 0;
+      if (item.kind !== 'RECETA' || itemId <= 0) return [];
       return rows.map((row) => {
       const inventory = inventoryByExtraId.get(Number(row.id_extra)) || {};
       return [
@@ -2291,7 +2249,7 @@ const resolveLineExtras = ({ item, allowedExtrasMap }) => {
   }
   if (!requested.length) return { ok: true, selected: [], subtotal: 0 };
 
-  const idItem = item.kind === 'RECETA' ? item.id_receta : item.id_combo;
+  const idItem = item.id_receta;
   const selected = [];
   let subtotal = 0;
 
@@ -2780,7 +2738,6 @@ const buildCuentaDivisionItemSnapshot = (line, refs = {}) => ({
   tipo_item: normalizeTipoItem(line?.kind || line?.tipo_item),
   id_producto: parseOptionalPositiveInt(line?.id_producto),
   id_receta: parseOptionalPositiveInt(line?.id_receta),
-  id_combo: parseOptionalPositiveInt(line?.id_combo),
   id_detalle_factura: parseOptionalPositiveInt(refs.id_detalle_factura),
   id_detalle_pedido: parseOptionalPositiveInt(refs.id_detalle_pedido),
   nombre_item_snapshot: String(line?.nombre_item || 'Item').trim().slice(0, 160),
@@ -2868,7 +2825,6 @@ const persistCuentaDividida = async ({
         snapshot.tipo_item,
         snapshot.id_producto,
         snapshot.id_receta,
-        snapshot.id_combo,
         snapshot.nombre_item_snapshot,
         snapshot.cantidad,
         snapshot.precio_unitario,
@@ -2881,7 +2837,7 @@ const persistCuentaDividida = async ({
         JSON.stringify(snapshot.complementos_snapshot),
         JSON.stringify(snapshot.origen_snapshot)
       );
-      itemValues.push(`($${offset + 1}, $${offset + 2}, $${offset + 3}, $${offset + 4}, $${offset + 5}, $${offset + 6}, $${offset + 7}, $${offset + 8}, $${offset + 9}, $${offset + 10}, $${offset + 11}, $${offset + 12}, $${offset + 13}, $${offset + 14}, $${offset + 15}, $${offset + 16}::jsonb, $${offset + 17}::jsonb, $${offset + 18}::jsonb)`);
+      itemValues.push(`($${offset + 1}, $${offset + 2}, $${offset + 3}, $${offset + 4}, $${offset + 5}, $${offset + 6}, $${offset + 7}, $${offset + 8}, $${offset + 9}, $${offset + 10}, $${offset + 11}, $${offset + 12}, $${offset + 13}, $${offset + 14}, $${offset + 15}::jsonb, $${offset + 16}::jsonb, $${offset + 17}::jsonb)`);
     }
 
     if (itemValues.length) {
@@ -2894,7 +2850,6 @@ const persistCuentaDividida = async ({
             tipo_item,
             id_producto,
             id_receta,
-            id_combo,
             nombre_item_snapshot,
             cantidad,
             precio_unitario,
@@ -2975,13 +2930,6 @@ const hydrateVentaLines = async (client, normalizedItems, perf = null, options =
         .map((item) => item.id_producto)
     )
   ];
-  const comboIds = [
-    ...new Set(
-      normalizedItems
-        .filter((item) => item.kind === 'COMBO')
-        .map((item) => item.id_combo)
-    )
-  ];
   const recetaIds = [
     ...new Set(
       normalizedItems
@@ -2990,20 +2938,18 @@ const hydrateVentaLines = async (client, normalizedItems, perf = null, options =
     )
   ];
   const catalogosStart = perf?.now?.() || 0;
-  const { productoMap, comboMap, recetaMap } = await fetchVentaCatalogMaps(client, {
+  const { productoMap, recetaMap } = await fetchVentaCatalogMaps(client, {
     productoIds,
-    comboIds,
     recetaIds,
     lockProductos: validateProductStock === true,
     idSucursal: options?.idSucursal
   });
   perf?.add?.('totals_catalogos_ms', catalogosStart);
   if (productoIds.length > 0) perf?.add?.('totals_productos_ms', catalogosStart);
-  if (comboIds.length > 0) perf?.add?.('totals_combos_ms', catalogosStart);
   if (recetaIds.length > 0) perf?.add?.('totals_recetas_ms', catalogosStart);
 
   const needsAllowedExtrasSchema = normalizedItems.some((item) =>
-    (item.kind === 'RECETA' || item.kind === 'COMBO') && itemHasRequestedExtras(item)
+    item.kind === 'RECETA' && itemHasRequestedExtras(item)
   );
   const allowedExtrasSchema = needsAllowedExtrasSchema
     ? await resolvePedidoPendienteAllowedExtrasSchema(client, perf)
@@ -3015,8 +2961,7 @@ const hydrateVentaLines = async (client, normalizedItems, perf = null, options =
       normalizedItems,
       idSucursal: options?.idSucursal,
       perf,
-      recetaMap,
-      comboMap
+      recetaMap
     }),
     (async () => {
       const extrasStart = perf?.now?.() || 0;
@@ -3116,7 +3061,6 @@ const hydrateVentaLines = async (client, normalizedItems, perf = null, options =
       const complementosResult = resolveLineComplementos({
         item,
         receta: null,
-        combo: null,
         context: complementContext,
         nombreItem: producto.nombre_producto || 'Producto'
       });
@@ -3144,7 +3088,6 @@ const hydrateVentaLines = async (client, normalizedItems, perf = null, options =
         cart_key: item.cart_key,
         requiere_cocina: false,
         id_producto: item.id_producto,
-        id_combo: null,
         id_receta: null,
         id_descuento_catalogo_linea: item.id_descuento_catalogo_linea ?? null,
         id_almacen: idAlmacen,
@@ -3244,7 +3187,6 @@ const hydrateVentaLines = async (client, normalizedItems, perf = null, options =
         cart_key: item.cart_key,
         requiere_cocina: true,
         id_producto: null,
-        id_combo: null,
         id_receta: null,
         id_extra: item.id_extra,
         id_descuento_catalogo_linea: item.id_descuento_catalogo_linea ?? null,
@@ -3271,76 +3213,6 @@ const hydrateVentaLines = async (client, normalizedItems, perf = null, options =
       continue;
     }
 
-    if (item.kind === 'COMBO') {
-      const combo = comboMap.get(item.id_combo);
-      if (!combo) {
-        return {
-          ok: false,
-          status: 400,
-          body: { error: true, message: `Combo no encontrado: ${item.id_combo}` }
-        };
-      }
-
-      if (!parseBooleanish(combo.estado)) {
-        return {
-          ok: false,
-          status: 400,
-          body: { error: true, message: `Combo inactivo en la venta: ${item.id_combo}` }
-        };
-      }
-
-      const precioUnitario = roundMoney(combo.precio);
-      const subTotal = roundMoney(precioUnitario * item.cantidad);
-
-      const complementosResult = resolveLineComplementos({
-        item,
-        receta: null,
-        combo,
-        context: complementContext,
-        nombreItem: combo.descripcion || 'Combo'
-      });
-      if (!complementosResult.ok) {
-        return {
-          ok: false,
-          status: complementosResult.status || 400,
-          body: {
-            error: true,
-            code: complementosResult.code || undefined,
-            message: complementosResult.message
-          }
-        };
-      }
-      const extrasResult = resolveLineExtras({ item, allowedExtrasMap });
-      if (!extrasResult.ok) {
-        return {
-          ok: false,
-          status: 400,
-          body: { error: true, message: extrasResult.message }
-        };
-      }
-      lines.push({
-        kind: 'COMBO',
-        cart_key: item.cart_key,
-        requiere_cocina: true,
-        id_producto: null,
-        id_combo: item.id_combo,
-        id_receta: null,
-        id_descuento_catalogo_linea: item.id_descuento_catalogo_linea ?? null,
-        id_almacen: null,
-        nombre_item: combo.descripcion || `Combo #${item.id_combo}`,
-        cantidad: item.cantidad,
-        precio_unitario: precioUnitario,
-        sub_total: subTotal,
-        base_sub_total: subTotal,
-        subtotal_extras: extrasResult.subtotal,
-        observacion: item.observacion,
-        complementos_metadata: complementosResult.metadata,
-        complementos_detalle: complementosResult.selected,
-        extras_detalle: extrasResult.selected
-      });
-      subTotals.push(subTotal);
-      continue;
-    }
 
     const receta = recetaMap.get(item.id_receta);
     if (!receta) {
@@ -3365,7 +3237,6 @@ const hydrateVentaLines = async (client, normalizedItems, perf = null, options =
     const complementosResult = resolveLineComplementos({
       item,
       receta,
-      combo: null,
       context: complementContext,
       nombreItem: receta.nombre_receta || 'Receta'
     });
@@ -3393,7 +3264,6 @@ const hydrateVentaLines = async (client, normalizedItems, perf = null, options =
       cart_key: item.cart_key,
       requiere_cocina: true,
       id_producto: null,
-      id_combo: null,
       id_receta: item.id_receta,
       id_descuento_catalogo_linea: item.id_descuento_catalogo_linea ?? null,
       id_almacen: null,
@@ -3994,7 +3864,6 @@ const buildPedidoFacturaSnapshot = (row, quantity, tipoItem, precioUnitario, sub
     nombre_item: row.nombre_item || null,
     id_producto: parseOptionalPositiveInt(row.id_producto),
     id_receta: parseOptionalPositiveInt(row.id_receta),
-    id_combo: parseOptionalPositiveInt(row.id_combo),
     id_detalle_pedido: parseOptionalPositiveInt(row.id_detalle_pedido),
     cantidad: Number(quantity || 1),
     precio_unitario: roundMoney(precioUnitario),
@@ -4020,8 +3889,7 @@ const buildPedidoFacturaSnapshot = (row, quantity, tipoItem, precioUnitario, sub
 const prepareDetalleFacturaDesdePedido = (row, idPedido) => {
   const idProducto = parseOptionalPositiveInt(row.id_producto);
   const idReceta = parseOptionalPositiveInt(row.id_receta);
-  const idCombo = parseOptionalPositiveInt(row.id_combo);
-  const tipoItem = normalizeTipoItem(idCombo ? 'COMBO' : idReceta ? 'RECETA' : idProducto ? 'PRODUCTO' : 'ITEM');
+  const tipoItem = normalizeTipoItem(idReceta ? 'RECETA' : idProducto ? 'PRODUCTO' : 'ITEM');
   const subTotal = roundMoney(row.sub_total_pedido);
   const totalDetalle = roundMoney(row.total_pedido ?? row.sub_total_pedido);
   const precioBase = roundMoney(row.precio_unitario || (subTotal > 0 ? subTotal : totalDetalle));
@@ -4034,7 +3902,6 @@ const prepareDetalleFacturaDesdePedido = (row, idPedido) => {
     idPedido,
     idProducto,
     idReceta,
-    idCombo,
     tipoItem,
     subTotal,
     totalDetalle,
@@ -4046,7 +3913,7 @@ const prepareDetalleFacturaDesdePedido = (row, idPedido) => {
   };
 };
 
-const insertDetalleFacturaOrigenSnapshot = async ({ client, idDetalleFactura, idDetallePedido, tipoItem, idProducto, idReceta, idCombo, snapshot }) => {
+const insertDetalleFacturaOrigenSnapshot = async ({ client, idDetalleFactura, idDetallePedido, tipoItem, idProducto, idReceta, snapshot }) => {
   if (!idDetalleFactura) return;
   await client.query(
     `
@@ -4056,17 +3923,15 @@ const insertDetalleFacturaOrigenSnapshot = async ({ client, idDetalleFactura, id
         tipo_item,
         id_producto,
         id_receta,
-        id_combo,
         origen_snapshot
       )
-      VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
+      VALUES ($1, $2, $3, $4, $5, $6::jsonb)
       ON CONFLICT (id_detalle_factura)
       DO UPDATE SET
         id_detalle_pedido = EXCLUDED.id_detalle_pedido,
         tipo_item = EXCLUDED.tipo_item,
         id_producto = EXCLUDED.id_producto,
         id_receta = EXCLUDED.id_receta,
-        id_combo = EXCLUDED.id_combo,
         origen_snapshot = EXCLUDED.origen_snapshot
     `,
     [
@@ -4075,7 +3940,6 @@ const insertDetalleFacturaOrigenSnapshot = async ({ client, idDetalleFactura, id
       tipoItem,
       idProducto || null,
       idReceta || null,
-      idCombo || null,
       JSON.stringify(snapshot)
     ]
   );
@@ -4098,10 +3962,9 @@ const insertDetalleFacturaDesdePedido = async ({ client, idFactura, idPedido, ro
         id_detalle_pedido,
         tipo_item,
         id_receta,
-        id_combo,
         origen_snapshot
       )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13::jsonb)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::jsonb)
       RETURNING id_detalle_factura
     `,
     [
@@ -4116,7 +3979,6 @@ const insertDetalleFacturaDesdePedido = async ({ client, idFactura, idPedido, ro
       prepared.idDetallePedido,
       prepared.tipoItem,
       prepared.idReceta,
-      prepared.idCombo,
       JSON.stringify(prepared.snapshot)
     ]
   );
@@ -4129,7 +3991,6 @@ const insertDetalleFacturaDesdePedido = async ({ client, idFactura, idPedido, ro
     tipoItem: prepared.tipoItem,
     idProducto: prepared.idProducto,
     idReceta: prepared.idReceta,
-    idCombo: prepared.idCombo,
     snapshot: prepared.snapshot
   });
   return { totalDetalle: prepared.totalDetalle, subTotal: prepared.subTotal };
@@ -4157,10 +4018,9 @@ const insertDetalleFacturasDesdePedidoBatch = async ({ client, idFactura, idPedi
       prepared.idDetallePedido,
       prepared.tipoItem,
       prepared.idReceta,
-      prepared.idCombo,
       JSON.stringify(prepared.snapshot)
     );
-    values.push(`($${offset + 1}, $${offset + 2}, $${offset + 3}, $${offset + 4}, $${offset + 5}, $${offset + 6}, $${offset + 7}, $${offset + 8}, $${offset + 9}, $${offset + 10}, $${offset + 11}, $${offset + 12}, $${offset + 13}::jsonb)`);
+    values.push(`($${offset + 1}, $${offset + 2}, $${offset + 3}, $${offset + 4}, $${offset + 5}, $${offset + 6}, $${offset + 7}, $${offset + 8}, $${offset + 9}, $${offset + 10}, $${offset + 11}, $${offset + 12}::jsonb)`);
   });
 
   const detalleFacturaResult = await client.query(
@@ -4177,7 +4037,6 @@ const insertDetalleFacturasDesdePedidoBatch = async ({ client, idFactura, idPedi
         id_detalle_pedido,
         tipo_item,
         id_receta,
-        id_combo,
         origen_snapshot
       )
       VALUES ${values.join(', ')}
@@ -4205,10 +4064,9 @@ const insertDetalleFacturasDesdePedidoBatch = async ({ client, idFactura, idPedi
       prepared.tipoItem,
       prepared.idProducto,
       prepared.idReceta,
-      prepared.idCombo,
       JSON.stringify(prepared.snapshot)
     );
-    origenValues.push(`($${offset + 1}, $${offset + 2}, $${offset + 3}, $${offset + 4}, $${offset + 5}, $${offset + 6}, $${offset + 7}::jsonb)`);
+    origenValues.push(`($${offset + 1}, $${offset + 2}, $${offset + 3}, $${offset + 4}, $${offset + 5}, $${offset + 6}::jsonb)`);
   }
 
   if (origenValues.length) {
@@ -4220,7 +4078,6 @@ const insertDetalleFacturasDesdePedidoBatch = async ({ client, idFactura, idPedi
           tipo_item,
           id_producto,
           id_receta,
-          id_combo,
           origen_snapshot
         )
         VALUES ${origenValues.join(', ')}
@@ -4230,7 +4087,6 @@ const insertDetalleFacturasDesdePedidoBatch = async ({ client, idFactura, idPedi
           tipo_item = EXCLUDED.tipo_item,
           id_producto = EXCLUDED.id_producto,
           id_receta = EXCLUDED.id_receta,
-          id_combo = EXCLUDED.id_combo,
           origen_snapshot = EXCLUDED.origen_snapshot
       `,
       origenParams
@@ -4274,10 +4130,9 @@ const insertDetalleFacturaDelivery = async ({ client, idFactura, idPedido, costo
         id_detalle_pedido,
         tipo_item,
         id_receta,
-        id_combo,
         origen_snapshot
       )
-      VALUES ($1, NULL, NULL, 1, $2, $2, $2, $3, NULL, 'ITEM', NULL, NULL, $4::jsonb)
+      VALUES ($1, NULL, NULL, 1, $2, $2, $2, $3, NULL, 'ITEM', NULL, $4::jsonb)
       RETURNING id_detalle_factura
     `,
     [idFactura, costo, idPedido, JSON.stringify(snapshot)]
@@ -4291,7 +4146,6 @@ const insertDetalleFacturaDelivery = async ({ client, idFactura, idPedido, costo
     tipoItem: 'ITEM',
     idProducto: null,
     idReceta: null,
-    idCombo: null,
     snapshot
   });
   return costo;
@@ -4877,10 +4731,8 @@ const normalizeDescuentoObjetivosPayload = (payload, alcance) => {
   const objetivos = isPlainObject(payload?.objetivos) ? payload.objetivos : {};
   const productos = coercePositiveIntArray(objetivos.productos);
   const recetas = coercePositiveIntArray(objetivos.recetas);
-  const combos = coercePositiveIntArray(objetivos.combos);
   const legacyProducto = parseOptionalPositiveInt(payload?.id_producto);
   const legacyReceta = parseOptionalPositiveInt(payload?.id_receta);
-  const legacyCombo = parseOptionalPositiveInt(payload?.id_combo);
 
   if (alcance === DESCUENTO_ALCANCE_KEYS.PRODUCTO && productos.length === 0 && legacyProducto) {
     productos.push(legacyProducto);
@@ -4888,14 +4740,9 @@ const normalizeDescuentoObjetivosPayload = (payload, alcance) => {
   if (alcance === DESCUENTO_ALCANCE_KEYS.RECETA && recetas.length === 0 && legacyReceta) {
     recetas.push(legacyReceta);
   }
-  if (alcance === DESCUENTO_ALCANCE_KEYS.COMBO && combos.length === 0 && legacyCombo) {
-    combos.push(legacyCombo);
-  }
-
   return {
     productos: alcance === DESCUENTO_ALCANCE_KEYS.PRODUCTO ? coercePositiveIntArray(productos) : [],
-    recetas: alcance === DESCUENTO_ALCANCE_KEYS.RECETA ? coercePositiveIntArray(recetas) : [],
-    combos: alcance === DESCUENTO_ALCANCE_KEYS.COMBO ? coercePositiveIntArray(combos) : []
+    recetas: alcance === DESCUENTO_ALCANCE_KEYS.RECETA ? coercePositiveIntArray(recetas) : []
   };
 };
 
@@ -4931,18 +4778,15 @@ const validateDescuentoCatalogoPayload = async (client, payload, options = {}) =
   }
 
   const objetivos = normalizeDescuentoObjetivosPayload(payload, alcance);
-  const objetivosCount = objetivos.productos.length + objetivos.recetas.length + objetivos.combos.length;
+  const objetivosCount = objetivos.productos.length + objetivos.recetas.length;
   if (alcance === DESCUENTO_ALCANCE_KEYS.PRODUCTO && objetivos.productos.length === 0) {
     return { ok: false, status: 400, message: 'Selecciona al menos un producto para alcance PRODUCTO.' };
   }
   if (alcance === DESCUENTO_ALCANCE_KEYS.RECETA && objetivos.recetas.length === 0) {
     return { ok: false, status: 400, message: 'Selecciona al menos una receta para alcance RECETA.' };
   }
-  if (alcance === DESCUENTO_ALCANCE_KEYS.COMBO && objetivos.combos.length === 0) {
-    return { ok: false, status: 400, message: 'Selecciona al menos un combo para alcance COMBO.' };
-  }
   if (alcance === DESCUENTO_ALCANCE_KEYS.FACTURA_COMPLETA && objetivosCount > 0) {
-    return { ok: false, status: 400, message: 'FACTURA_COMPLETA no permite objetivos de producto, receta o combo.' };
+    return { ok: false, status: 400, message: 'FACTURA_COMPLETA no permite objetivos de producto o receta.' };
   }
   if (fechaInicio && parseOptionalDateTime(fechaInicio) === null) {
     return { ok: false, status: 400, message: 'fecha_inicio invalida.' };
@@ -5007,7 +4851,7 @@ const buildDescuentoCatalogoRpcPayload = ({ idDescuentoCatalogo = null, data, id
   id_sucursal: data.id_sucursal,
   fecha_inicio: data.fecha_inicio,
   fecha_fin: data.fecha_fin,
-  objetivos: data.objetivos || { productos: [], recetas: [], combos: [] }
+  objetivos: data.objetivos || { productos: [], recetas: [] }
 });
 
 const upsertDescuentoCatalogoConObjetivos = async ({ client, payload, actor }) => {
@@ -5037,15 +4881,13 @@ const buildDescuentoObjetivoLabel = (row) => {
   const objetivos = row?.objetivos || {};
   const key = alcance === DESCUENTO_ALCANCE_KEYS.PRODUCTO
     ? 'productos'
-    : alcance === DESCUENTO_ALCANCE_KEYS.RECETA
-      ? 'recetas'
-      : 'combos';
+    : 'recetas';
   const rows = parseJsonArrayValue(objetivos[key]);
   if (rows.length === 1) {
-    return rows[0]?.nombre_producto || rows[0]?.nombre_receta || rows[0]?.nombre_combo || `${alcance} seleccionado`;
+    return rows[0]?.nombre_producto || rows[0]?.nombre_receta || `${alcance} seleccionado`;
   }
   if (rows.length > 1) {
-    const label = alcance === DESCUENTO_ALCANCE_KEYS.PRODUCTO ? 'productos' : alcance === DESCUENTO_ALCANCE_KEYS.RECETA ? 'recetas' : 'combos';
+    const label = alcance === DESCUENTO_ALCANCE_KEYS.PRODUCTO ? 'productos' : 'recetas';
     return `${rows.length} ${label} seleccionados`;
   }
   return '--';
@@ -5054,16 +4896,14 @@ const buildDescuentoObjetivoLabel = (row) => {
 const normalizeDescuentoCatalogoRow = (row) => {
   const productos = parseJsonArrayValue(row?.productos);
   const recetas = parseJsonArrayValue(row?.recetas);
-  const combos = parseJsonArrayValue(row?.combos);
-  const objetivos = { productos, recetas, combos };
+  const objetivos = { productos, recetas };
   const normalized = {
     ...row,
     objetivos,
     objetivos_count: {
       productos: productos.length,
       recetas: recetas.length,
-      combos: combos.length,
-      total: productos.length + recetas.length + combos.length
+      total: productos.length + recetas.length
     }
   };
   normalized.objetivo = buildDescuentoObjetivoLabel(normalized);
@@ -5075,7 +4915,6 @@ router.get('/ventas/caja/bootstrap', checkPermission(['VENTAS_CREAR']), getCajaB
 router.get('/ventas/catalogos/extras-permitidos', listExtrasPermitidosCatalogoHandler);
 router.get('/ventas/catalogos/productos', listProductosCatalogoHandler);
 router.get('/ventas/catalogos/clientes', listClientesCatalogoHandler);
-router.get('/ventas/catalogos/combos', listCombosCatalogoHandler);
 router.get('/ventas/catalogos/recetas', listRecetasCatalogoHandler);
 
 router.get('/ventas/catalogos/tipos-descuento', listTiposDescuentoCatalogoHandler);
@@ -5112,7 +4951,6 @@ router.get('/ventas/descuentos-catalogos', checkPermission(VENTAS_DESCUENTOS_PER
           dc.alcance,
           dc.id_producto,
           dc.id_receta,
-          dc.id_combo,
           dc.id_sucursal,
           dc.fecha_inicio,
           dc.fecha_fin,
@@ -5120,10 +4958,8 @@ router.get('/ventas/descuentos-catalogos', checkPermission(VENTAS_DESCUENTOS_PER
           td.nombre_tipo_descuento,
           p.nombre_producto,
           r.nombre_receta,
-          COALESCE(cb.nombre_combo, cb.descripcion) AS nombre_combo,
           COALESCE(objp.productos, '[]'::jsonb) AS productos,
           COALESCE(objr.recetas, '[]'::jsonb) AS recetas,
-          COALESCE(objc.combos, '[]'::jsonb) AS combos,
           s.nombre_sucursal,
           dc.estado,
           dc.fecha_creacion,
@@ -5132,7 +4968,6 @@ router.get('/ventas/descuentos-catalogos', checkPermission(VENTAS_DESCUENTOS_PER
         INNER JOIN tipo_descuentos td ON td.id_tipo_descuento = dc.id_tipo_descuento
         LEFT JOIN productos p ON p.id_producto = dc.id_producto
         LEFT JOIN recetas r ON r.id_receta = dc.id_receta
-        LEFT JOIN combos cb ON cb.id_combo = dc.id_combo
         LEFT JOIN sucursales s ON s.id_sucursal = dc.id_sucursal
         LEFT JOIN LATERAL (
           SELECT COALESCE(jsonb_agg(jsonb_build_object('id_producto', x.id_producto, 'nombre_producto', x.nombre_producto) ORDER BY x.nombre_producto), '[]'::jsonb) AS productos
@@ -5162,20 +4997,6 @@ router.get('/ventas/descuentos-catalogos', checkPermission(VENTAS_DESCUENTOS_PER
               AND NOT EXISTS (SELECT 1 FROM descuentos_catalogos_recetas rel WHERE rel.id_descuento_catalogo = dc.id_descuento_catalogo)
           ) x
         ) objr ON true
-        LEFT JOIN LATERAL (
-          SELECT COALESCE(jsonb_agg(jsonb_build_object('id_combo', x.id_combo, 'nombre_combo', x.nombre_combo) ORDER BY x.nombre_combo), '[]'::jsonb) AS combos
-          FROM (
-            SELECT DISTINCT cb2.id_combo, COALESCE(cb2.nombre_combo, cb2.descripcion) AS nombre_combo
-            FROM descuentos_catalogos_combos rel
-            INNER JOIN combos cb2 ON cb2.id_combo = rel.id_combo
-            WHERE rel.id_descuento_catalogo = dc.id_descuento_catalogo
-            UNION
-            SELECT cb2.id_combo, COALESCE(cb2.nombre_combo, cb2.descripcion) AS nombre_combo
-            FROM combos cb2
-            WHERE cb2.id_combo = dc.id_combo
-              AND NOT EXISTS (SELECT 1 FROM descuentos_catalogos_combos rel WHERE rel.id_descuento_catalogo = dc.id_descuento_catalogo)
-          ) x
-        ) objc ON true
         ${whereSql}
         ORDER BY dc.id_descuento_catalogo DESC
       `,
@@ -5206,7 +5027,6 @@ router.get('/ventas/descuentos-catalogos/:id', checkPermission(VENTAS_DESCUENTOS
           dc.alcance,
           dc.id_producto,
           dc.id_receta,
-          dc.id_combo,
           dc.id_sucursal,
           dc.fecha_inicio,
           dc.fecha_fin,
@@ -5214,10 +5034,8 @@ router.get('/ventas/descuentos-catalogos/:id', checkPermission(VENTAS_DESCUENTOS
           td.nombre_tipo_descuento,
           p.nombre_producto,
           r.nombre_receta,
-          COALESCE(cb.nombre_combo, cb.descripcion) AS nombre_combo,
           COALESCE(objp.productos, '[]'::jsonb) AS productos,
           COALESCE(objr.recetas, '[]'::jsonb) AS recetas,
-          COALESCE(objc.combos, '[]'::jsonb) AS combos,
           s.nombre_sucursal,
           dc.estado,
           dc.fecha_creacion,
@@ -5226,7 +5044,6 @@ router.get('/ventas/descuentos-catalogos/:id', checkPermission(VENTAS_DESCUENTOS
         INNER JOIN tipo_descuentos td ON td.id_tipo_descuento = dc.id_tipo_descuento
         LEFT JOIN productos p ON p.id_producto = dc.id_producto
         LEFT JOIN recetas r ON r.id_receta = dc.id_receta
-        LEFT JOIN combos cb ON cb.id_combo = dc.id_combo
         LEFT JOIN sucursales s ON s.id_sucursal = dc.id_sucursal
         LEFT JOIN LATERAL (
           SELECT COALESCE(jsonb_agg(jsonb_build_object('id_producto', x.id_producto, 'nombre_producto', x.nombre_producto) ORDER BY x.nombre_producto), '[]'::jsonb) AS productos
@@ -5256,20 +5073,6 @@ router.get('/ventas/descuentos-catalogos/:id', checkPermission(VENTAS_DESCUENTOS
               AND NOT EXISTS (SELECT 1 FROM descuentos_catalogos_recetas rel WHERE rel.id_descuento_catalogo = dc.id_descuento_catalogo)
           ) x
         ) objr ON true
-        LEFT JOIN LATERAL (
-          SELECT COALESCE(jsonb_agg(jsonb_build_object('id_combo', x.id_combo, 'nombre_combo', x.nombre_combo) ORDER BY x.nombre_combo), '[]'::jsonb) AS combos
-          FROM (
-            SELECT DISTINCT cb2.id_combo, COALESCE(cb2.nombre_combo, cb2.descripcion) AS nombre_combo
-            FROM descuentos_catalogos_combos rel
-            INNER JOIN combos cb2 ON cb2.id_combo = rel.id_combo
-            WHERE rel.id_descuento_catalogo = dc.id_descuento_catalogo
-            UNION
-            SELECT cb2.id_combo, COALESCE(cb2.nombre_combo, cb2.descripcion) AS nombre_combo
-            FROM combos cb2
-            WHERE cb2.id_combo = dc.id_combo
-              AND NOT EXISTS (SELECT 1 FROM descuentos_catalogos_combos rel WHERE rel.id_descuento_catalogo = dc.id_descuento_catalogo)
-          ) x
-        ) objc ON true
         WHERE dc.id_descuento_catalogo = $1
         LIMIT 1
       `,
@@ -5721,13 +5524,6 @@ router.get('/ventas', checkPermission(['VENTAS_VER']), async (req, res) => {
                     / NULLIF(prod_dp.precio, 0)
                   )::int
                 )
-                WHEN dp.id_combo IS NOT NULL THEN GREATEST(
-                  1,
-                  ROUND(
-                    COALESCE(NULLIF(dp.sub_total_pedido, 0), dp.total_pedido, 0)
-                    / NULLIF(combo_dp.precio, 0)
-                  )::int
-                )
                 WHEN dp.id_receta IS NOT NULL THEN GREATEST(
                   1,
                   ROUND(
@@ -5742,7 +5538,6 @@ router.get('/ventas', checkPermission(['VENTAS_VER']), async (req, res) => {
           )::int AS total_items
         FROM detalle_pedido dp
         LEFT JOIN productos prod_dp ON prod_dp.id_producto = dp.id_producto
-        LEFT JOIN combos combo_dp ON combo_dp.id_combo = dp.id_combo
         LEFT JOIN recetas rec_dp ON rec_dp.id_receta = dp.id_receta
         WHERE dp.id_pedido = f.id_pedido
           AND COALESCE(dp.estado, true) = true
@@ -6714,25 +6509,22 @@ router.get('/ventas/pedidos-menu', checkPermission(['VENTAS_VER']), async (req, 
                 'tipo_item',
                   CASE
                     WHEN dp.id_producto IS NOT NULL THEN 'PRODUCTO'
-                    WHEN dp.id_combo IS NOT NULL THEN 'COMBO'
                     WHEN dp.id_receta IS NOT NULL THEN 'RECETA'
                     ELSE 'ITEM'
                   END,
                 'id_producto', dp.id_producto,
-                'id_combo', dp.id_combo,
                 'id_receta', dp.id_receta,
-                'nombre_item', COALESCE(prod.nombre_producto, combo.nombre_combo, combo.descripcion, rec.nombre_receta, 'Item de pedido'),
-                'nombre_producto', COALESCE(prod.nombre_producto, combo.nombre_combo, combo.descripcion, rec.nombre_receta, 'Item de pedido'),
+                'nombre_item', COALESCE(prod.nombre_producto, rec.nombre_receta, 'Item de pedido'),
+                'nombre_producto', COALESCE(prod.nombre_producto, rec.nombre_receta, 'Item de pedido'),
                 'cantidad',
                   CASE
-                    WHEN COALESCE(prod.precio, combo.precio, rec.precio, 0) > 0
-                      THEN GREATEST(1, ROUND(COALESCE(dp.sub_total_pedido, dp.total_pedido, 0) / COALESCE(prod.precio, combo.precio, rec.precio, 1))::int)
+                    WHEN COALESCE(prod.precio, rec.precio, 0) > 0
+                      THEN GREATEST(1, ROUND(COALESCE(dp.sub_total_pedido, dp.total_pedido, 0) / COALESCE(prod.precio, rec.precio, 1))::int)
                     ELSE 1
                   END,
                 'precio_unitario',
                   COALESCE(
                     prod.precio,
-                    combo.precio,
                     rec.precio,
                     NULLIF(COALESCE(dp.sub_total_pedido, dp.total_pedido, 0), 0),
                     0
@@ -6758,7 +6550,6 @@ router.get('/ventas/pedidos-menu', checkPermission(['VENTAS_VER']), async (req, 
             ) AS items
           FROM detalle_pedido dp
           LEFT JOIN productos prod ON prod.id_producto = dp.id_producto
-          LEFT JOIN combos combo ON combo.id_combo = dp.id_combo
           LEFT JOIN recetas rec ON rec.id_receta = dp.id_receta
           LEFT JOIN descuentos d ON d.id_descuento = dp.id_descuento
           ${hasDetallePedidoExtras ? `
@@ -7450,7 +7241,6 @@ const formatInventarioAlertaResponse = (alerta) => ({
   id_producto: parseOptionalPositiveInt(alerta.id_producto),
   id_insumo: parseOptionalPositiveInt(alerta.id_insumo),
   id_receta: parseOptionalPositiveInt(alerta.id_receta),
-  id_combo: parseOptionalPositiveInt(alerta.id_combo),
   id_extra: parseOptionalPositiveInt(alerta.id_extra),
   stock_disponible: alerta.stock_disponible,
   cantidad_requerida: alerta.cantidad_requerida,
@@ -7824,13 +7614,13 @@ async function listarPedidosPendientesPago(req, res) {
           SELECT
             dp.id_pedido,
             dp.id_detalle_pedido,
-            COALESCE(prod.nombre_producto, combo.nombre_combo, combo.descripcion, rec.nombre_receta, 'Item de pedido') AS nombre_item,
+            COALESCE(prod.nombre_producto, rec.nombre_receta, 'Item de pedido') AS nombre_item,
             CASE
-              WHEN COALESCE(prod.precio, combo.precio, rec.precio, 0) > 0
-                THEN GREATEST(1, ROUND(COALESCE(dp.sub_total_pedido, dp.total_pedido, 0) / COALESCE(prod.precio, combo.precio, rec.precio, 1))::int)
+              WHEN COALESCE(prod.precio, rec.precio, 0) > 0
+                THEN GREATEST(1, ROUND(COALESCE(dp.sub_total_pedido, dp.total_pedido, 0) / COALESCE(prod.precio, rec.precio, 1))::int)
               ELSE 1
             END AS cantidad,
-            COALESCE(prod.precio, combo.precio, rec.precio, 0)::numeric(14,2) AS precio_unitario,
+            COALESCE(prod.precio, rec.precio, 0)::numeric(14,2) AS precio_unitario,
             COALESCE(dp.sub_total_pedido, 0)::numeric(14,2) AS sub_total,
             COALESCE(dp.total_pedido, dp.sub_total_pedido, 0)::numeric(14,2) AS total_linea,
             COALESCE(d.monto_descuento, 0)::numeric(14,2) AS descuento,
@@ -7846,7 +7636,6 @@ async function listarPedidosPendientesPago(req, res) {
             ${hasDetallePedidoExtras ? "COALESCE(extras_info.extras, '[]'::jsonb)" : "'[]'::jsonb"} AS extras
           FROM public.detalle_pedido dp
           LEFT JOIN public.productos prod ON prod.id_producto = dp.id_producto
-          LEFT JOIN public.combos combo ON combo.id_combo = dp.id_combo
           LEFT JOIN public.recetas rec ON rec.id_receta = dp.id_receta
           LEFT JOIN public.descuentos d ON d.id_descuento = dp.id_descuento
           ${hasDetallePedidoExtras ? `
@@ -8212,8 +8001,8 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
 
       if (hasDetallePedidoConfiguracionMenu) {
         detallePedidoValues = detallePedidoRows.map((_, index) => {
-          const base = index * 10;
-          return `($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}, true, $${base + 6}, $${base + 7}, $${base + 8}, $${base + 9}, $${base + 10}::jsonb)`;
+          const base = index * 9;
+          return `($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}, true, $${base + 6}, $${base + 7}, $${base + 8}, $${base + 9}::jsonb)`;
         }).join(', ');
         for (const { line, configuracionMenu } of detallePedidoRows) {
           detallePedidoParams.push(
@@ -8222,7 +8011,6 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
             line.id_producto,
             idPedido,
             line.id_descuento,
-            line.id_combo,
             line.id_receta,
             line.cantidad,
             line.observacion,
@@ -8238,7 +8026,6 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
               id_pedido,
               id_descuento,
               estado,
-              id_combo,
               id_receta,
               cantidad,
               observacion,
@@ -8251,8 +8038,8 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
         );
       } else {
         detallePedidoValues = detallePedidoRows.map((_, index) => {
-          const base = index * 9;
-          return `($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}, true, $${base + 6}, $${base + 7}, $${base + 8}, $${base + 9})`;
+          const base = index * 8;
+          return `($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}, true, $${base + 6}, $${base + 7}, $${base + 8})`;
         }).join(', ');
         for (const { line } of detallePedidoRows) {
           detallePedidoParams.push(
@@ -8261,7 +8048,6 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
             line.id_producto,
             idPedido,
             line.id_descuento,
-            line.id_combo,
             line.id_receta,
             line.cantidad,
             line.observacion
@@ -8276,7 +8062,6 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
               id_pedido,
               id_descuento,
               estado,
-              id_combo,
               id_receta,
               cantidad,
               observacion
@@ -8705,12 +8490,11 @@ router.post('/ventas/pedidos/:id/registrar-pago', checkPermission(['VENTAS_CREAR
             dp.total_pedido,
             dp.id_producto,
             dp.id_descuento,
-            dp.id_combo,
             dp.id_receta,
             dp.observacion,
             ${hasDetallePedidoConfiguracionMenu ? 'dp.configuracion_menu,' : 'NULL::jsonb AS configuracion_menu,'}
-            COALESCE(prod.nombre_producto, combo.nombre_combo, combo.descripcion, rec.nombre_receta, 'Item de pedido') AS nombre_item,
-            COALESCE(prod.precio, combo.precio, rec.precio, NULL) AS precio_unitario,
+            COALESCE(prod.nombre_producto, rec.nombre_receta, 'Item de pedido') AS nombre_item,
+            COALESCE(prod.precio, rec.precio, NULL) AS precio_unitario,
             dis.division_item_count
           FROM division_items di
           CROSS JOIN division_item_summary dis
@@ -8719,7 +8503,6 @@ router.post('/ventas/pedidos/:id/registrar-pago', checkPermission(['VENTAS_CREAR
            AND dp.id_pedido = $2
            AND COALESCE(dp.estado, true) = true
           LEFT JOIN public.productos prod ON prod.id_producto = dp.id_producto
-          LEFT JOIN public.combos combo ON combo.id_combo = dp.id_combo
           LEFT JOIN public.recetas rec ON rec.id_receta = dp.id_receta
           ORDER BY di.id_cuenta_division_item
           FOR UPDATE OF dp
@@ -8734,15 +8517,13 @@ router.post('/ventas/pedidos/:id/registrar-pago', checkPermission(['VENTAS_CREAR
             dp.total_pedido,
             dp.id_producto,
             dp.id_descuento,
-            dp.id_combo,
             dp.id_receta,
             dp.observacion,
             ${hasDetallePedidoConfiguracionMenu ? 'dp.configuracion_menu,' : 'NULL::jsonb AS configuracion_menu,'}
-            COALESCE(prod.nombre_producto, combo.nombre_combo, combo.descripcion, rec.nombre_receta, 'Item de pedido') AS nombre_item,
-            COALESCE(prod.precio, combo.precio, rec.precio, NULL) AS precio_unitario
+            COALESCE(prod.nombre_producto, rec.nombre_receta, 'Item de pedido') AS nombre_item,
+            COALESCE(prod.precio, rec.precio, NULL) AS precio_unitario
           FROM public.detalle_pedido dp
           LEFT JOIN public.productos prod ON prod.id_producto = dp.id_producto
-          LEFT JOIN public.combos combo ON combo.id_combo = dp.id_combo
           LEFT JOIN public.recetas rec ON rec.id_receta = dp.id_receta
           WHERE dp.id_pedido = $1
             AND COALESCE(dp.estado, true) = true
@@ -8824,7 +8605,6 @@ router.post('/ventas/pedidos/:id/registrar-pago', checkPermission(['VENTAS_CREAR
         const divisionLines = detallePedidoRowsDisponibles.map((row) => {
           const idProducto = parseOptionalPositiveInt(row.id_producto);
           const idReceta = parseOptionalPositiveInt(row.id_receta);
-          const idCombo = parseOptionalPositiveInt(row.id_combo);
           const subTotal = roundMoney(row.sub_total_pedido);
           const totalLinea = roundMoney(row.total_pedido ?? row.sub_total_pedido);
           const detalleExtras = detallePedidoExtrasByIdCache.get(Number(row.id_detalle_pedido)) || [];
@@ -8837,10 +8617,9 @@ router.post('/ventas/pedidos/:id/registrar-pago', checkPermission(['VENTAS_CREAR
           const cantidad = inferKitchenItemQuantity(subTotal, precioBase);
           return {
             id_detalle_pedido: parseOptionalPositiveInt(row.id_detalle_pedido),
-            kind: normalizeTipoItem(idCombo ? 'COMBO' : idReceta ? 'RECETA' : idProducto ? 'PRODUCTO' : 'ITEM'),
+            kind: normalizeTipoItem(idReceta ? 'RECETA' : idProducto ? 'PRODUCTO' : 'ITEM'),
             id_producto: idProducto,
             id_receta: idReceta,
-            id_combo: idCombo,
             nombre_item: row.nombre_item || 'Item de pedido',
             cantidad,
             precio_unitario: precioBase,
@@ -9672,8 +9451,8 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
 
       if (hasDetallePedidoConfiguracionMenu) {
         detallePedidoValues = detallePedidoRows.map((_, index) => {
-          const base = index * 10;
-          return `($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}, true, $${base + 6}, $${base + 7}, $${base + 8}, $${base + 9}, $${base + 10}::jsonb)`;
+          const base = index * 9;
+          return `($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}, true, $${base + 6}, $${base + 7}, $${base + 8}, $${base + 9}::jsonb)`;
         }).join(', ');
         for (const { line, configuracionMenu } of detallePedidoRows) {
           detallePedidoParams.push(
@@ -9682,7 +9461,6 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
             line.id_producto,
             idPedido,
             line.id_descuento,
-            line.id_combo,
             line.id_receta,
             line.cantidad,
             line.observacion,
@@ -9698,7 +9476,6 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
               id_pedido,
               id_descuento,
               estado,
-              id_combo,
               id_receta,
               cantidad,
               observacion,
@@ -9711,8 +9488,8 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
         );
       } else {
         detallePedidoValues = detallePedidoRows.map((_, index) => {
-          const base = index * 9;
-          return `($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}, true, $${base + 6}, $${base + 7}, $${base + 8}, $${base + 9})`;
+          const base = index * 8;
+          return `($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}, true, $${base + 6}, $${base + 7}, $${base + 8})`;
         }).join(', ');
         for (const { line } of detallePedidoRows) {
           detallePedidoParams.push(
@@ -9721,7 +9498,6 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
             line.id_producto,
             idPedido,
             line.id_descuento,
-            line.id_combo,
             line.id_receta,
             line.cantidad,
             line.observacion
@@ -9736,7 +9512,6 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
               id_pedido,
               id_descuento,
               estado,
-              id_combo,
               id_receta,
               cantidad,
               observacion
@@ -9760,7 +9535,6 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
             nombre_item: line.nombre_item || null,
             id_producto: line.id_producto || null,
             id_receta: line.id_receta || null,
-            id_combo: line.id_combo || null,
             id_extra: line.id_extra || null,
             es_linea_extra_independiente: Boolean(line.es_linea_extra_independiente),
             cantidad: Number(line.cantidad || 0),
@@ -9892,7 +9666,6 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
         nombre_item: line.nombre_item || null,
         id_producto: line.id_producto || null,
         id_receta: line.id_receta || null,
-        id_combo: line.id_combo || null,
         id_extra: line.id_extra || null,
         es_linea_extra_independiente: Boolean(line.es_linea_extra_independiente),
         cantidad: Number(line.cantidad || 0),
@@ -9921,8 +9694,8 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
     if (detalleFacturaRows.length > 0) {
       const detalleFacturaInsertStart = ventasPerf.now();
       const detalleFacturaParams = [];
-      const detalleFacturaValues = buildBatchPlaceholders(detalleFacturaRows.length, 13, {
-        12: '::jsonb'
+      const detalleFacturaValues = buildBatchPlaceholders(detalleFacturaRows.length, 12, {
+        11: '::jsonb'
       });
       for (const { line, pedidoRef, tipoItem, origenSnapshot } of detalleFacturaRows) {
         detalleFacturaParams.push(
@@ -9937,7 +9710,6 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
           pedidoRef?.id_detalle_pedido || null,
           tipoItem,
           line.id_receta,
-          line.id_combo,
           JSON.stringify(origenSnapshot)
         );
       }
@@ -9956,7 +9728,6 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
             id_detalle_pedido,
             tipo_item,
             id_receta,
-            id_combo,
             origen_snapshot
           )
           VALUES ${detalleFacturaValues}
@@ -9966,7 +9737,6 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
             tipo_item,
             id_producto,
             id_receta,
-            id_combo,
             origen_snapshot
         `,
         detalleFacturaParams
@@ -9979,8 +9749,8 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
       );
       if (detalleFacturaOrigenRows.length > 0) {
         const detalleFacturaOrigenParams = [];
-        const detalleFacturaOrigenValues = buildBatchPlaceholders(detalleFacturaOrigenRows.length, 7, {
-          6: '::jsonb'
+        const detalleFacturaOrigenValues = buildBatchPlaceholders(detalleFacturaOrigenRows.length, 6, {
+          5: '::jsonb'
         });
         for (const row of detalleFacturaOrigenRows) {
           detalleFacturaOrigenParams.push(
@@ -9989,7 +9759,6 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
             row.tipo_item || 'ITEM',
             row.id_producto || null,
             row.id_receta || null,
-            row.id_combo || null,
             JSON.stringify(row.origen_snapshot || {})
           );
         }
@@ -10002,7 +9771,6 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
               tipo_item,
               id_producto,
               id_receta,
-              id_combo,
               origen_snapshot
             )
             VALUES ${detalleFacturaOrigenValues}
@@ -10012,7 +9780,6 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
               tipo_item = EXCLUDED.tipo_item,
               id_producto = EXCLUDED.id_producto,
               id_receta = EXCLUDED.id_receta,
-              id_combo = EXCLUDED.id_combo,
               origen_snapshot = EXCLUDED.origen_snapshot
           `,
           detalleFacturaOrigenParams

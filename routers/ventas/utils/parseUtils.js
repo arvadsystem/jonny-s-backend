@@ -5,7 +5,7 @@ import { roundMoney } from './moneyUtils.js';
 
 export const normalizeTipoItem = (value) => {
   const normalized = String(value || '').trim().toUpperCase();
-  return ['PRODUCTO', 'RECETA', 'COMBO', 'MIXTO', 'ITEM'].includes(normalized)
+  return ['PRODUCTO', 'RECETA', 'MIXTO', 'ITEM'].includes(normalized)
     ? normalized
     : 'ITEM';
 };

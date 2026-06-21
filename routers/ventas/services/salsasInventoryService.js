@@ -400,7 +400,7 @@ export const attachSalsaInventorySnapshotsToLines = async ({ client, lines = [],
         );
       }
       // complementos_detalle ya representa el total autorizado para la linea completa.
-      // No se multiplica otra vez por cantidad para evitar sobreconsumo en RECETA/COMBO.
+      // No se multiplica otra vez por cantidad para evitar sobreconsumo en RECETA.
       const snapshot = buildConsumptionSnapshot(resolved, count, line?.cantidad);
       if (!snapshot.id_insumo || !snapshot.id_almacen || snapshot.cantidad_base_total <= 0) {
         throw createInventoryError('VENTAS_SALSA_INVENTARIO_NO_DISPONIBLE', `La salsa ${source.nombre || idSalsa} requiere revisar su configuracion de inventario.`);

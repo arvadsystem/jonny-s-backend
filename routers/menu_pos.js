@@ -9,7 +9,6 @@ const router = express.Router(); // Inicializa router
 const MENU_POS_VIEW_PERMISSIONS = ['MENU_POS_VER', 'MENU_VER'];
 const MENU_POS_ARCHIVOS_UPLOAD_PERMISSIONS = ['MENU_POS_ARCHIVOS_SUBIR', 'MENU_VER'];
 const MENU_POS_PRODUCT_IMAGE_PERMISSIONS = ['MENU_POS_PRODUCTOS_IMAGEN_EDITAR', 'MENU_VER'];
-const MENU_POS_COMBO_IMAGE_PERMISSIONS = ['MENU_POS_COMBOS_IMAGEN_EDITAR', 'MENU_VER'];
 const MENU_POS_ARCHIVOS_DELETE_PERMISSIONS = ['MENU_POS_ARCHIVOS_ELIMINAR', 'MENU_VER'];
 
 const getSafeServerErrorMessage = (fallback = 'Error interno del servidor.') => fallback;
@@ -155,9 +154,6 @@ router.get('/menu-pos/categorias', checkPermission(MENU_POS_VIEW_PERMISSIONS), a
     const recipeExcludedDepartmentIds = Array.isArray(departmentIds?.recipeExcludedDepartmentIds)
       ? departmentIds.recipeExcludedDepartmentIds
       : [];
-    const comboDepartmentId = Number.isInteger(departmentIds?.comboDepartmentId)
-      ? departmentIds.comboDepartmentId
-      : null;
     const productDepartmentIds = Array.isArray(departmentIds?.productDepartmentIds)
       ? departmentIds.productDepartmentIds
       : [];
@@ -172,17 +168,10 @@ router.get('/menu-pos/categorias', checkPermission(MENU_POS_VIEW_PERMISSIONS), a
 
         UNION
 
-        SELECT c.id_tipo_departamento
-        FROM combos c
-        WHERE COALESCE(c.estado, true) = true
-          AND ($2::INTEGER IS NOT NULL AND c.id_tipo_departamento = $2)
-
-        UNION
-
         SELECT p.id_tipo_departamento
         FROM productos p
         WHERE COALESCE(p.estado, true) = true
-          AND p.id_tipo_departamento = ANY($3::INTEGER[])
+          AND p.id_tipo_departamento = ANY($2::INTEGER[])
       )
       SELECT
         td.id_tipo_departamento,
@@ -199,7 +188,6 @@ router.get('/menu-pos/categorias', checkPermission(MENU_POS_VIEW_PERMISSIONS), a
 
     const result = await pool.query(queryCategorias, [
       recipeExcludedDepartmentIds,
-      comboDepartmentId,
       productDepartmentIds
     ]);
 
@@ -468,84 +456,6 @@ router.put('/menu-pos/productos/:id_producto/imagen', checkPermission(MENU_POS_P
     return res.status(500).json({
       ok: false,
       message: getSafeServerErrorMessage('Error al asignar imagen a producto')
-    });
-  }
-});
-
-// =====================================================
-// HU-36
-// PUT: Asignar imagen a combo
-// URL: /menu-pos/combos/:id_combo/imagen
-// Body: { id_archivo }
-// =====================================================
-router.put('/menu-pos/combos/:id_combo/imagen', checkPermission(MENU_POS_COMBO_IMAGE_PERMISSIONS), async (req, res) => {
-  try {
-    const idCombo = Number(req.params.id_combo);
-    const { id_archivo } = req.body || {};
-
-    if (Number.isNaN(idCombo)) {
-      return res.status(400).json({ ok: false, message: 'id_combo invÃ¡lido' });
-    }
-
-    if (id_archivo === undefined) {
-      return res.status(400).json({
-        ok: false,
-        message: 'Debe enviar id_archivo'
-      });
-    }
-
-    const idArchivo = Number(id_archivo);
-    if (Number.isNaN(idArchivo)) {
-      return res.status(400).json({ ok: false, message: 'id_archivo invÃ¡lido' });
-    }
-
-    const archivo = await getArchivoById(idArchivo);
-    if (!archivo) {
-      return res.status(404).json({ ok: false, message: 'Archivo no encontrado.' });
-    }
-    if (archivo.estado === false) {
-      return res.status(409).json({ ok: false, message: 'No se puede asignar un archivo inactivo.' });
-    }
-
-    const comboQuery = `
-      SELECT id_combo
-      FROM combos
-      WHERE id_combo = $1
-      LIMIT 1;
-    `;
-    const comboResult = await pool.query(comboQuery, [idCombo]);
-    if (comboResult.rowCount === 0) {
-      return res.status(404).json({ ok: false, message: 'Combo no encontrado.' });
-    }
-
-    await pool.query('CALL pa_update($1, $2, $3, $4, $5)', [
-      'combos',
-      'id_archivo',
-      String(idArchivo),
-      'id_combo',
-      String(idCombo)
-    ]);
-
-    const result = await pool.query(
-      `
-        SELECT id_combo, id_archivo
-        FROM combos
-        WHERE id_combo = $1
-        LIMIT 1;
-      `,
-      [idCombo]
-    );
-
-    return res.status(200).json({
-      ok: true,
-      message: 'Imagen asignada al combo correctamente.',
-      data: result.rows[0]
-    });
-  } catch (err) {
-    console.error('Error al asignar imagen a combo (HU-36):', err.message);
-    return res.status(500).json({
-      ok: false,
-      message: getSafeServerErrorMessage('Error al asignar imagen a combo')
     });
   }
 });

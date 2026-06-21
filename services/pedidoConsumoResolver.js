@@ -3,9 +3,9 @@ import { ITEM_TYPES, toPositiveInt } from './pedidoPayloadValidator.js';
 // Resolver de consumo del pedido.
 // ------------------------------------------------
 // QUE HACE:
-// - Convierte items (producto/receta/combo) en cantidades agregadas por entidad.
-// - Expande combos -> recetas y recetas -> insumos.
-// - Acumula faltantes de configuracion (combo/receta sin componentes).
+// - Convierte items (producto/receta) en cantidades agregadas por entidad.
+// - Expande recetas -> insumos.
+// - Acumula faltantes de configuracion de recetas sin componentes.
 //
 // POR QUE SE SEPARA:
 // - Permite mantener el calculo de consumo aislado del manejo transaccional.
@@ -31,7 +31,6 @@ const addContext = (map, id, item) => {
     id_detalle_pedido: toPositiveInt(item?.id_detalle_pedido) || null,
     id_producto: toPositiveInt(item?.id_producto) || null,
     id_receta: toPositiveInt(item?.id_receta) || null,
-    id_combo: toPositiveInt(item?.id_combo) || null,
     id_extra: toPositiveInt(item?.id_extra) || null,
     id_insumo: toPositiveInt(item?.id_insumo) || null,
     cant: Number(item?.cant || 0) > 0 ? Number(item.cant) : null,
@@ -77,22 +76,6 @@ const fetchRecetasByIds = async (client, ids) => {
   return rs.rows;
 };
 
-const fetchCombosByIds = async (client, ids) => {
-  if (!ids.length) return [];
-  const rs = await client.query(
-    `
-      SELECT
-        id_combo,
-        COALESCE(NULLIF(nombre_combo, ''), NULLIF(descripcion, ''), CONCAT('Combo #', id_combo::text)) AS nombre_combo,
-        COALESCE(estado, true) AS estado
-      FROM public.combos
-      WHERE id_combo = ANY($1::int[])
-    `,
-    [ids]
-  );
-  return rs.rows;
-};
-
 const fetchExtrasByIds = async (client, ids) => {
   if (!ids.length) return [];
   const hasMenuExtras = await hasColumn(client, 'menu_extras', 'id_extra');
@@ -111,28 +94,6 @@ const fetchExtrasByIds = async (client, ids) => {
       WHERE id_extra = ANY($1::int[])
     `,
     [ids]
-  );
-  return rs.rows;
-};
-
-const fetchComboRecipeComponents = async (client, comboIds) => {
-  if (!comboIds.length) return [];
-  const hasDetalleComboCantidad = await hasColumn(client, 'detalle_combo', 'cantidad');
-  const comboQtyExpr = hasDetalleComboCantidad
-    ? 'GREATEST(COALESCE(dc.cantidad, 1), 1)::numeric'
-    : '1::numeric';
-  const rs = await client.query(
-    `
-      SELECT
-        dc.id_combo,
-        dc.id_receta,
-        ${comboQtyExpr} AS receta_factor
-      FROM public.detalle_combo dc
-      WHERE dc.id_combo = ANY($1::int[])
-        AND dc.id_receta IS NOT NULL
-        AND COALESCE(dc.estado, true) = true
-    `,
-    [comboIds]
   );
   return rs.rows;
 };
@@ -164,14 +125,12 @@ export const resolvePedidoConsumo = async ({ client, items }) => {
 
   const productoQtyMap = new Map();
   const recetaQtyMap = new Map();
-  const comboQtyMap = new Map();
   const extraQtyMap = new Map();
   const insumoQtyMap = new Map();
   const insumoWarehouseById = new Map();
   const insumoTraceById = new Map();
   const productoContextById = new Map();
   const recetaContextById = new Map();
-  const comboContextById = new Map();
   const extraContextById = new Map();
 
   for (const item of items) {
@@ -182,10 +141,6 @@ export const resolvePedidoConsumo = async ({ client, items }) => {
     if (item.tipo_item === ITEM_TYPES.RECETA) {
       addToMapTotal(recetaQtyMap, item.id_item, item.cantidad);
       addContext(recetaContextById, item.id_item, item);
-    }
-    if (item.tipo_item === ITEM_TYPES.COMBO) {
-      addToMapTotal(comboQtyMap, item.id_item, item.cantidad);
-      addContext(comboContextById, item.id_item, item);
     }
     if (item.tipo_item === ITEM_TYPES.EXTRA) {
       addToMapTotal(extraQtyMap, item.id_item, item.cantidad);
@@ -222,7 +177,6 @@ export const resolvePedidoConsumo = async ({ client, items }) => {
 
   const productoIds = [...productoQtyMap.keys()].sort((a, b) => a - b);
   const recetaIds = [...recetaQtyMap.keys()].sort((a, b) => a - b);
-  const comboIds = [...comboQtyMap.keys()].sort((a, b) => a - b);
   const extraIds = [...extraQtyMap.keys()].sort((a, b) => a - b);
   const extraIdsWithSnapshot = new Set();
   for (const idExtra of extraIds) {
@@ -233,15 +187,12 @@ export const resolvePedidoConsumo = async ({ client, items }) => {
   }
   const extraFallbackIds = extraIds.filter((idExtra) => !extraIdsWithSnapshot.has(idExtra));
 
-  const [recetasRows, combosRows, extrasRows, comboComponentRows] = await Promise.all([
+  const [recetasRows, extrasRows] = await Promise.all([
     fetchRecetasByIds(client, recetaIds),
-    fetchCombosByIds(client, comboIds),
-    fetchExtrasByIds(client, extraFallbackIds),
-    fetchComboRecipeComponents(client, comboIds)
+    fetchExtrasByIds(client, extraFallbackIds)
   ]);
 
   const recetasById = mapById(recetasRows, 'id_receta');
-  const combosById = mapById(combosRows, 'id_combo');
   const extrasById = mapById(extrasRows, 'id_extra');
 
   for (const idReceta of recetaIds) {
@@ -266,32 +217,6 @@ export const resolvePedidoConsumo = async ({ client, items }) => {
         nombre: row.nombre_receta,
         motivo: 'RECETA_INACTIVA',
         mensaje: `La receta ${row.nombre_receta || idReceta} esta inactiva.`
-      });
-    }
-  }
-
-  for (const idCombo of comboIds) {
-    const row = combosById.get(idCombo);
-    if (!row) {
-      faltantes.push({
-        tipo_recurso: 'combo',
-        id_recurso: idCombo,
-        id_combo: idCombo,
-        ...firstContext(comboContextById, idCombo),
-        motivo: 'COMBO_NO_ENCONTRADO',
-        mensaje: `El combo ${idCombo} no existe o no esta disponible.`
-      });
-      continue;
-    }
-    if (!Boolean(row.estado)) {
-      faltantes.push({
-        tipo_recurso: 'combo',
-        id_recurso: idCombo,
-        id_combo: idCombo,
-        ...firstContext(comboContextById, idCombo),
-        nombre: row.nombre_combo,
-        motivo: 'COMBO_INACTIVO',
-        mensaje: `El combo ${row.nombre_combo || idCombo} esta inactivo.`
       });
     }
   }
@@ -369,36 +294,6 @@ export const resolvePedidoConsumo = async ({ client, items }) => {
     addToMapTotal(insumoQtyMap, insumoId, Number(extraQtyMap.get(idExtra) || 0) * insumoFactor);
   }
 
-  const comboComponentsById = new Map();
-  for (const row of comboComponentRows) {
-    const comboId = Number(row?.id_combo || 0);
-    const recipeId = Number(row?.id_receta || 0);
-    const factor = Number(row?.receta_factor || 0);
-    if (!comboId || !recipeId || factor <= 0) continue;
-    if (!comboComponentsById.has(comboId)) comboComponentsById.set(comboId, []);
-    comboComponentsById.get(comboId).push({ id_receta: recipeId, receta_factor: factor });
-  }
-
-  for (const idCombo of comboIds) {
-    const components = comboComponentsById.get(idCombo) || [];
-    if (components.length === 0) {
-      faltantes.push({
-        tipo_recurso: 'combo',
-        id_recurso: idCombo,
-        id_combo: idCombo,
-        ...firstContext(comboContextById, idCombo),
-        nombre: combosById.get(idCombo)?.nombre_combo || null,
-        motivo: 'COMBO_SIN_COMPONENTES',
-        mensaje: `El combo ${combosById.get(idCombo)?.nombre_combo || idCombo} no tiene recetas/componentes configurados.`
-      });
-      continue;
-    }
-    const comboQty = Number(comboQtyMap.get(idCombo) || 0);
-    for (const component of components) {
-      addToMapTotal(recetaQtyMap, component.id_receta, comboQty * Number(component.receta_factor));
-    }
-  }
-
   const allRecipeIds = [...recetaQtyMap.keys()].sort((a, b) => a - b);
   const recipeComponentsRows = await fetchRecipeInsumoComponents(client, allRecipeIds);
   const recipeComponentsById = new Map();
@@ -451,12 +346,10 @@ export const resolvePedidoConsumo = async ({ client, items }) => {
     consumo: {
       productoQtyMap,
       recetaQtyMap,
-      comboQtyMap,
       extraQtyMap,
       insumoQtyMap
     },
     contexto: {
-      combosById,
       recetasById,
       extrasById
     },

@@ -110,7 +110,6 @@ const normalizeWarning = (warning) => {
     id_producto: toNullablePositiveInt(warning.id_producto),
     id_insumo: toNullablePositiveInt(warning.id_insumo),
     id_receta: toNullablePositiveInt(warning.id_receta),
-    id_combo: toNullablePositiveInt(warning.id_combo),
     id_extra: toNullablePositiveInt(warning.id_extra),
     stock_disponible: toNullableNumber(warning.disponible),
     cantidad_requerida: toNullableNumber(warning.requerido),
@@ -150,7 +149,6 @@ export const registrarAlertasInventarioPedido = async ({
             x.id_producto,
             x.id_insumo,
             x.id_receta,
-            x.id_combo,
             x.id_extra,
             x.stock_disponible,
             x.cantidad_requerida,
@@ -167,7 +165,6 @@ export const registrarAlertasInventarioPedido = async ({
             id_producto int,
             id_insumo int,
             id_receta int,
-            id_combo int,
             id_extra int,
             stock_disponible numeric,
             cantidad_requerida numeric,
@@ -187,7 +184,6 @@ export const registrarAlertasInventarioPedido = async ({
             id_producto,
             id_insumo,
             id_receta,
-            id_combo,
             id_extra,
             stock_disponible,
             cantidad_requerida,
@@ -206,7 +202,6 @@ export const registrarAlertasInventarioPedido = async ({
             i.id_producto,
             i.id_insumo,
             i.id_receta,
-            i.id_combo,
             i.id_extra,
             i.stock_disponible,
             i.cantidad_requerida,
@@ -225,7 +220,6 @@ export const registrarAlertasInventarioPedido = async ({
               AND COALESCE(a.id_producto, 0) = COALESCE(i.id_producto, 0)
               AND COALESCE(a.id_insumo, 0) = COALESCE(i.id_insumo, 0)
               AND COALESCE(a.id_receta, 0) = COALESCE(i.id_receta, 0)
-              AND COALESCE(a.id_combo, 0) = COALESCE(i.id_combo, 0)
               AND COALESCE(a.id_extra, 0) = COALESCE(i.id_extra, 0)
           )
           RETURNING id_alerta
@@ -271,7 +265,6 @@ export const listarAlertasInventarioPedido = async (idPedidoRaw) => {
           id_producto,
           id_insumo,
           id_receta,
-          id_combo,
           id_extra,
           stock_disponible,
           cantidad_requerida,
@@ -387,7 +380,6 @@ export const listarAlertasInventario = async (filters = {}) => {
         a.id_producto,
         a.id_insumo,
         a.id_receta,
-        a.id_combo,
         a.id_extra,
         a.stock_disponible,
         a.cantidad_requerida,

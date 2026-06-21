@@ -447,7 +447,6 @@ export const fetchCuentaDividida = async (client, { idFactura = null, idPedido =
       tipo_item: row.tipo_item,
       id_producto: parseOptionalPositiveInt(row.id_producto),
       id_receta: parseOptionalPositiveInt(row.id_receta),
-      id_combo: parseOptionalPositiveInt(row.id_combo),
       nombre_item: row.nombre_item_snapshot,
       cantidad: Number(row.cantidad || 0),
       precio_unitario: roundMoney(row.precio_unitario),
@@ -602,18 +601,15 @@ export const fetchKitchenSaleDetailRows = async (client, idFactura) =>
               WHEN NULLIF(TRIM(dfo.tipo_item), '') IS NOT NULL THEN UPPER(TRIM(dfo.tipo_item))
               WHEN NULLIF(TRIM(df.tipo_item), '') IS NOT NULL THEN UPPER(TRIM(df.tipo_item))
               WHEN dp.id_producto IS NOT NULL THEN 'PRODUCTO'
-              WHEN dp.id_combo IS NOT NULL THEN 'COMBO'
               WHEN dp.id_receta IS NOT NULL THEN 'RECETA'
               ELSE 'ITEM'
             END AS tipo_item,
             COALESCE(dfo.id_producto, df.id_producto, dp.id_producto) AS id_producto,
-            COALESCE(dfo.id_combo, df.id_combo::int, dp.id_combo) AS id_combo,
             COALESCE(dfo.id_receta, df.id_receta::int, dp.id_receta) AS id_receta,
             COALESCE(
               dfo.origen_snapshot->>'nombre_item',
               df.origen_snapshot->>'nombre_item',
               prod.nombre_producto,
-              combo.descripcion,
               rec.nombre_receta,
               'Item de cocina'
             ) AS nombre_item,
@@ -621,7 +617,6 @@ export const fetchKitchenSaleDetailRows = async (client, idFactura) =>
               dfo.origen_snapshot->>'nombre_item',
               df.origen_snapshot->>'nombre_item',
               prod.nombre_producto,
-              combo.descripcion,
               rec.nombre_receta,
               'Item de cocina'
             ) AS nombre_producto,
@@ -629,7 +624,6 @@ export const fetchKitchenSaleDetailRows = async (client, idFactura) =>
             COALESCE(
               CASE
                 WHEN dp.id_producto IS NOT NULL THEN prod.precio
-                WHEN dp.id_combo IS NOT NULL THEN combo.precio
                 WHEN dp.id_receta IS NOT NULL THEN rec.precio
                 ELSE NULL
               END,
@@ -656,7 +650,6 @@ export const fetchKitchenSaleDetailRows = async (client, idFactura) =>
             ON dfo.id_detalle_factura = df.id_detalle_factura
           LEFT JOIN detalle_pedido dp ON dp.id_detalle_pedido = df.id_detalle_pedido
           LEFT JOIN productos prod ON prod.id_producto = COALESCE(dfo.id_producto, df.id_producto, dp.id_producto)
-          LEFT JOIN combos combo ON combo.id_combo = COALESCE(dfo.id_combo, df.id_combo::int, dp.id_combo)
           LEFT JOIN recetas rec ON rec.id_receta = COALESCE(dfo.id_receta, df.id_receta::int, dp.id_receta)
           LEFT JOIN descuentos d ON d.id_descuento = df.id_descuento
           WHERE df.id_factura = $1
@@ -673,7 +666,6 @@ export const fetchDirectSaleDetailRows = async (client, idFactura) =>
           COALESCE(dfo.id_detalle_pedido, df.id_detalle_pedido::int) AS id_detalle_pedido,
           COALESCE(NULLIF(TRIM(dfo.tipo_item), ''), NULLIF(TRIM(df.tipo_item), ''), 'PRODUCTO') AS tipo_item,
           COALESCE(dfo.id_producto, df.id_producto) AS id_producto,
-          COALESCE(dfo.id_combo, df.id_combo::int) AS id_combo,
           COALESCE(dfo.id_receta, df.id_receta::int) AS id_receta,
           COALESCE(dfo.origen_snapshot->>'nombre_item', df.origen_snapshot->>'nombre_item', p.nombre_producto, 'Producto') AS nombre_item,
           COALESCE(dfo.origen_snapshot->>'nombre_item', df.origen_snapshot->>'nombre_item', p.nombre_producto, 'Producto') AS nombre_producto,

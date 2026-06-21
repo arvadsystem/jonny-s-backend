@@ -243,14 +243,6 @@ const getArchivoReferenceSummary = async (idArchivo, db = pool) => {
     ),
     safeReferenceCount(
       {
-        label: 'combos',
-        params: [idArchivo],
-        query: 'SELECT COUNT(*)::int AS total FROM public.combos WHERE id_archivo = $1'
-      },
-      db
-    ),
-    safeReferenceCount(
-      {
         label: 'ordenes_compra',
         params: [idArchivo],
         query: 'SELECT COUNT(*)::int AS total FROM public.orden_compras WHERE id_archivo_factura_recepcion = $1'

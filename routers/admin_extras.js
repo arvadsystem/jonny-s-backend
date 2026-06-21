@@ -119,7 +119,6 @@ const normalizeExtraPayload = (payload = {}) => {
       orden: Number.isFinite(Number(payload.orden)) ? Number(payload.orden) : 0,
       estado: payload.estado === undefined ? true : Boolean(payload.estado),
       recetas: normalizePositiveIdList(payload.recetas || payload.id_recetas),
-      combos: normalizePositiveIdList(payload.combos || payload.id_combos),
       id_almacenes: idAlmacenes
     }
   };
@@ -157,23 +156,6 @@ const validateExtraFks = async (client, data) => {
     const missing = data.recetas.filter((id) => !found.has(id));
     if (missing.length) {
       return { ok: false, status: 400, message: `Recetas invalidas o inactivas: ${missing.join(', ')}` };
-    }
-  }
-
-  if (data.combos.length) {
-    const combos = await client.query(
-      `
-        SELECT id_combo
-        FROM combos
-        WHERE id_combo = ANY($1::int[])
-          AND COALESCE(estado, true) = true
-      `,
-      [data.combos]
-    );
-    const found = new Set(combos.rows.map((row) => Number(row.id_combo)));
-    const missing = data.combos.filter((id) => !found.has(id));
-    if (missing.length) {
-      return { ok: false, status: 400, message: `Combos invalidos o inactivos: ${missing.join(', ')}` };
     }
   }
 
@@ -257,27 +239,6 @@ const replaceExtraRecipes = async (client, idExtra, recipeIds = []) => {
       idExtra,
       JSON.stringify(normalized.map((idReceta, index) => ({ id_receta: idReceta, orden: index + 1 })))
     ]
-  );
-};
-
-const replaceExtraCombos = async (client, idExtra, comboIds = []) => {
-  await client.query('UPDATE menu_extra_combo SET estado = false, fecha_actualizacion = NOW() WHERE id_extra = $1', [idExtra]);
-  const normalized = normalizePositiveIdList(comboIds);
-  if (normalized.length === 0) return;
-
-  await client.query(
-    `
-      INSERT INTO menu_extra_combo (id_extra, id_combo, estado, fecha_actualizacion)
-      SELECT
-        $1,
-        UNNEST($2::int[]),
-        true,
-        NOW()
-      ON CONFLICT (id_combo, id_extra) DO UPDATE
-      SET estado = true,
-          fecha_actualizacion = NOW()
-    `,
-    [idExtra, normalized]
   );
 };
 
@@ -427,7 +388,7 @@ const getHydratedExtraById = async (client, idExtra) => {
 
   if (!extraResult.rowCount) return null;
 
-  const [recetas, combos, assignments] = await Promise.all([
+  const [recetas, assignments] = await Promise.all([
     client.query(
       `
         SELECT id_receta
@@ -438,16 +399,6 @@ const getHydratedExtraById = async (client, idExtra) => {
       `,
       [idExtra]
     ),
-    client.query(
-      `
-        SELECT id_combo
-        FROM menu_extra_combo
-        WHERE id_extra = $1
-          AND COALESCE(estado, true) = true
-        ORDER BY id_menu_extra_combo
-      `,
-      [idExtra]
-    ),
     listExtraAssignments(client, idExtra)
   ]);
 
@@ -455,7 +406,6 @@ const getHydratedExtraById = async (client, idExtra) => {
   return {
     ...hydrated,
     recetas: recetas.rows.map((row) => Number(row.id_receta)),
-    combos: combos.rows.map((row) => Number(row.id_combo)),
     asignaciones: assignments
   };
 };
@@ -489,8 +439,7 @@ router.get('/', checkPermission(MENU_EXTRAS_VIEW_PERMISSIONS), async (req, res) 
           um.simbolo AS unidad_simbolo,
           me.orden,
           me.estado,
-          COALESCE(recipe_count.total_recetas, 0)::int AS total_recetas,
-          COALESCE(combo_count.total_combos, 0)::int AS total_combos
+          COALESCE(recipe_count.total_recetas, 0)::int AS total_recetas
         FROM menu_extras me
         LEFT JOIN insumos i ON i.id_insumo = me.id_insumo
         LEFT JOIN unidades_medida um ON um.id_unidad_medida = me.id_unidad_medida
@@ -500,12 +449,6 @@ router.get('/', checkPermission(MENU_EXTRAS_VIEW_PERMISSIONS), async (req, res) 
           WHERE COALESCE(estado, true) = true
           GROUP BY id_extra
         ) recipe_count ON recipe_count.id_extra = me.id_extra
-        LEFT JOIN (
-          SELECT id_extra, COUNT(*)::int AS total_combos
-          FROM menu_extra_combo
-          WHERE COALESCE(estado, true) = true
-          GROUP BY id_extra
-        ) combo_count ON combo_count.id_extra = me.id_extra
         WHERE ($1::boolean = true OR COALESCE(me.estado, true) = true)
         ORDER BY COALESCE(me.orden, 0), me.nombre
       `,
@@ -557,26 +500,6 @@ router.get('/catalogos/recetas', checkPermission(MENU_EXTRAS_VIEW_PERMISSIONS), 
   } catch (err) {
     console.error('Error al listar recetas para extras:', err.message);
     return res.status(500).json({ error: true, message: 'No se pudieron cargar las recetas.' });
-  }
-});
-
-router.get('/catalogos/combos', checkPermission(MENU_EXTRAS_VIEW_PERMISSIONS), async (req, res) => {
-  try {
-    const result = await pool.query(
-      `
-        SELECT
-          id_combo,
-          COALESCE(NULLIF(nombre_combo, ''), NULLIF(descripcion, ''), CONCAT('Combo #', id_combo::text)) AS nombre_combo,
-          precio
-        FROM combos
-        WHERE COALESCE(estado, true) = true
-        ORDER BY nombre_combo ASC
-      `
-    );
-    return res.status(200).json(result.rows || []);
-  } catch (err) {
-    console.error('Error al listar combos para extras:', err.message);
-    return res.status(500).json({ error: true, message: 'No se pudieron cargar los combos.' });
   }
 });
 
@@ -850,7 +773,6 @@ router.post('/', checkPermission(MENU_EXTRAS_CREATE_PERMISSIONS), async (req, re
     );
     const idExtra = Number(created.rows[0].id_extra);
     await replaceExtraRecipes(client, idExtra, normalized.data.recetas);
-    await replaceExtraCombos(client, idExtra, normalized.data.combos);
     await replaceExtraAlmacenes(client, idExtra, normalized.data.id_almacenes);
     await client.query('COMMIT');
     txStarted = false;
@@ -925,7 +847,6 @@ router.put('/:id_extra', checkPermission(MENU_EXTRAS_EDIT_PERMISSIONS), async (r
       ]
     );
     await replaceExtraRecipes(client, idExtra, normalized.data.recetas);
-    await replaceExtraCombos(client, idExtra, normalized.data.combos);
     await replaceExtraAlmacenes(client, idExtra, normalized.data.id_almacenes);
     await client.query('COMMIT');
     txStarted = false;

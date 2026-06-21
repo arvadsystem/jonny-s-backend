@@ -25,8 +25,7 @@ const MENU_TEMPORADA_CREATE_PERMISSIONS = ['MENU_TEMPORADA_CREAR', 'MENU_VER'];
 
 const ITEM_TYPES = Object.freeze({
   PRODUCTO: 'PRODUCTO',
-  RECETA: 'RECETA',
-  COMBO: 'COMBO'
+  RECETA: 'RECETA'
 });
 
 const toPositiveInt = (value) => {
@@ -79,7 +78,6 @@ const normalizeItemType = (value) => {
   const normalized = String(value ?? '').trim().toUpperCase();
   if (normalized === ITEM_TYPES.PRODUCTO) return ITEM_TYPES.PRODUCTO;
   if (normalized === ITEM_TYPES.RECETA) return ITEM_TYPES.RECETA;
-  if (normalized === ITEM_TYPES.COMBO) return ITEM_TYPES.COMBO;
   return '';
 };
 
@@ -101,9 +99,8 @@ const hasColumn = async (tableName, columnName) => {
 };
 
 const getDetalleMenuCapabilities = async () => {
-  const [hasIdReceta, hasIdCombo, hasVisible, hasPrecioPublico, hasOrden] = await Promise.all([
+  const [hasIdReceta, hasVisible, hasPrecioPublico, hasOrden] = await Promise.all([
     hasColumn('detalle_menu', 'id_receta'),
-    hasColumn('detalle_menu', 'id_combo'),
     hasColumn('detalle_menu', 'visible'),
     hasColumn('detalle_menu', 'precio_publico'),
     hasColumn('detalle_menu', 'orden')
@@ -111,7 +108,6 @@ const getDetalleMenuCapabilities = async () => {
 
   return {
     hasIdReceta,
-    hasIdCombo,
     hasVisible,
     hasPrecioPublico,
     hasOrden
@@ -330,12 +326,7 @@ const getMenuUsageSummary = async (idMenu) => {
           WHERE r.id_menu = $1
             AND COALESCE(r.estado, true) = true
         ) AS has_recetas,
-        EXISTS(
-          SELECT 1
-          FROM combos c
-          WHERE c.id_menu = $1
-            AND COALESCE(c.estado, true) = true
-        ) AS has_combos;
+        false AS sin_uso;
     `,
     [idMenu]
   );
@@ -344,23 +335,20 @@ const getMenuUsageSummary = async (idMenu) => {
   return {
     has_vigencias: parseBoolean(row.has_vigencias),
     has_detalle_menu: parseBoolean(row.has_detalle_menu),
-    has_recetas: parseBoolean(row.has_recetas),
-    has_combos: parseBoolean(row.has_combos)
+    has_recetas: parseBoolean(row.has_recetas)
   };
 };
 
 const canDeactivateMenu = (usage = {}) =>
   !usage.has_vigencias &&
   !usage.has_detalle_menu &&
-  !usage.has_recetas &&
-  !usage.has_combos;
+  !usage.has_recetas;
 
 const buildMenuUsageBlockers = (usage = {}) => {
   const blockers = [];
   if (usage.has_vigencias) blockers.push('tiene vigencias registradas');
   if (usage.has_detalle_menu) blockers.push('tiene publicaciones activas en detalle_menu');
   if (usage.has_recetas) blockers.push('tiene recetas activas asociadas');
-  if (usage.has_combos) blockers.push('tiene combos activos asociados');
   return blockers;
 };
 
@@ -552,8 +540,7 @@ const getMenuPublicationRules = async () => {
 
   const rules = {
     productCategoryIds: [],
-    recipeDepartmentIds: [],
-    comboDepartmentIds: []
+    recipeDepartmentIds: []
   };
 
   for (const row of result.rows || []) {
@@ -566,16 +553,11 @@ const getMenuPublicationRules = async () => {
       const idDepartamento = toPositiveInt(row.id_tipo_departamento);
       if (idDepartamento) rules.recipeDepartmentIds.push(idDepartamento);
     }
-    if (tipoItem === ITEM_TYPES.COMBO) {
-      const idDepartamento = toPositiveInt(row.id_tipo_departamento);
-      if (idDepartamento) rules.comboDepartmentIds.push(idDepartamento);
-    }
   }
 
   return {
     productCategoryIds: [...new Set(rules.productCategoryIds)],
-    recipeDepartmentIds: [...new Set(rules.recipeDepartmentIds)],
-    comboDepartmentIds: [...new Set(rules.comboDepartmentIds)]
+    recipeDepartmentIds: [...new Set(rules.recipeDepartmentIds)]
   };
 };
 
@@ -609,9 +591,6 @@ const fetchBaseCatalogByMenu = async (idMenu, idSucursal, publicationRules, imag
   const recipeDepartmentIds = Array.isArray(publicationRules?.recipeDepartmentIds)
     ? publicationRules.recipeDepartmentIds
     : [];
-  const comboDepartmentIds = Array.isArray(publicationRules?.comboDepartmentIds)
-    ? publicationRules.comboDepartmentIds
-    : [];
   const hasProductoArchivoImagen = Boolean(imageCapabilities?.hasProductoArchivoImagen);
   const productImageSelect = hasProductoArchivoImagen
     ? 'a_producto.url_publica::text AS url_imagen_publica'
@@ -643,22 +622,6 @@ const fetchBaseCatalogByMenu = async (idMenu, idSucursal, publicationRules, imag
 
       UNION ALL
 
-      SELECT
-        '${ITEM_TYPES.COMBO}'::text AS tipo_item,
-        c.id_combo::int AS id_item_origen,
-        COALESCE(NULLIF(c.nombre_combo, ''), NULLIF(c.descripcion, ''), CONCAT('Combo #', c.id_combo::text))::text AS nombre_item,
-        COALESCE(c.estado, true) AS estado_item,
-        c.precio::numeric AS precio_base,
-        a_combo.url_publica::text AS url_imagen_publica
-      FROM combos c
-      LEFT JOIN archivos a_combo
-        ON a_combo.id_archivo = c.id_archivo
-       AND (a_combo.estado = true OR a_combo.estado IS NULL)
-      WHERE COALESCE(c.estado, true) = true
-        AND c.id_tipo_departamento = ANY($3::int[])
-
-      UNION ALL
-
       SELECT DISTINCT
         '${ITEM_TYPES.PRODUCTO}'::text AS tipo_item,
         p.id_producto::int AS id_item_origen,
@@ -677,9 +640,9 @@ const fetchBaseCatalogByMenu = async (idMenu, idSucursal, publicationRules, imag
        AND COALESCE(ap.estado, true) = true
       ${productImageJoin}
       WHERE COALESCE(cp.estado, true) = true
-        AND ap.id_sucursal = $5
+        AND ap.id_sucursal = $4
         AND (
-          p.id_categoria_producto = ANY($4::int[])
+          p.id_categoria_producto = ANY($3::int[])
           OR EXISTS (
             SELECT 1
             FROM detalle_menu dm_catalogo
@@ -694,7 +657,6 @@ const fetchBaseCatalogByMenu = async (idMenu, idSucursal, publicationRules, imag
     [
       idMenu,
       recipeDepartmentIds,
-      comboDepartmentIds,
       productCategoryIds,
       idSucursal
     ]
@@ -705,7 +667,6 @@ const fetchBaseCatalogByMenu = async (idMenu, idSucursal, publicationRules, imag
 
 const fetchDetalleRowsByMenu = async ({ idMenu, idSucursal, capabilities }) => {
   const selectIdReceta = capabilities.hasIdReceta ? 'dm.id_receta' : 'NULL::integer AS id_receta';
-  const selectIdCombo = capabilities.hasIdCombo ? 'dm.id_combo' : 'NULL::integer AS id_combo';
   const selectVisible = capabilities.hasVisible ? 'COALESCE(dm.visible, true) AS visible' : 'true AS visible';
   const selectPrecioPublico = capabilities.hasPrecioPublico ? 'dm.precio_publico' : 'NULL::numeric AS precio_publico';
   const selectOrden = capabilities.hasOrden ? 'dm.orden' : 'NULL::integer AS orden';
@@ -717,7 +678,6 @@ const fetchDetalleRowsByMenu = async ({ idMenu, idSucursal, capabilities }) => {
         dm.id_menu,
         dm.id_producto,
         ${selectIdReceta},
-        ${selectIdCombo},
         ${selectVisible},
         ${selectPrecioPublico},
         ${selectOrden},
@@ -763,9 +723,6 @@ const resolveDetailRowKey = (row) => {
   }
   if (Number(row?.id_receta || 0) > 0) {
     return buildItemKey(ITEM_TYPES.RECETA, Number(row.id_receta));
-  }
-  if (Number(row?.id_combo || 0) > 0) {
-    return buildItemKey(ITEM_TYPES.COMBO, Number(row.id_combo));
   }
   return '';
 };
@@ -907,12 +864,10 @@ const normalizeDraftItems = (items) => {
 
 const fetchDraftStateByType = async ({ idMenu, idSucursal, normalizedItems }) => {
   const recipeIds = [];
-  const comboIds = [];
   const productIds = [];
 
   for (const item of normalizedItems) {
     if (item.tipo_item === ITEM_TYPES.RECETA) recipeIds.push(item.id_item_origen);
-    if (item.tipo_item === ITEM_TYPES.COMBO) comboIds.push(item.id_item_origen);
     if (item.tipo_item === ITEM_TYPES.PRODUCTO) productIds.push(item.id_item_origen);
   }
 
@@ -929,23 +884,6 @@ const fetchDraftStateByType = async ({ idMenu, idSucursal, normalizedItems }) =>
     );
     for (const row of result.rows || []) {
       resultMap.set(buildItemKey(ITEM_TYPES.RECETA, Number(row.id_item_origen)), {
-        estado_item: parseBoolean(row.estado_item),
-        precio_base: row.precio !== null ? Number(row.precio) : null
-      });
-    }
-  }
-
-  if (comboIds.length > 0) {
-    const result = await pool.query(
-      `
-        SELECT id_combo AS id_item_origen, COALESCE(estado, true) AS estado_item, precio
-        FROM combos
-        WHERE id_combo = ANY($1::int[]);
-      `,
-      [[...new Set(comboIds)]]
-    );
-    for (const row of result.rows || []) {
-      resultMap.set(buildItemKey(ITEM_TYPES.COMBO, Number(row.id_item_origen)), {
         estado_item: parseBoolean(row.estado_item),
         precio_base: row.precio !== null ? Number(row.precio) : null
       });
@@ -1073,10 +1011,6 @@ const insertDetalleRowsBatch = async ({ client, idMenu, items, capabilities }) =
     columns.push('id_receta');
     selectValues.push('input.id_receta');
   }
-  if (capabilities.hasIdCombo) {
-    columns.push('id_combo');
-    selectValues.push('input.id_combo');
-  }
   if (capabilities.hasVisible) {
     columns.push('visible');
     selectValues.push('input.visible');
@@ -1093,7 +1027,6 @@ const insertDetalleRowsBatch = async ({ client, idMenu, items, capabilities }) =
   const payload = items.map((item) => ({
     id_producto: item.tipo_item === ITEM_TYPES.PRODUCTO ? item.id_item_origen : null,
     id_receta: item.tipo_item === ITEM_TYPES.RECETA ? item.id_item_origen : null,
-    id_combo: item.tipo_item === ITEM_TYPES.COMBO ? item.id_item_origen : null,
     visible: item.visible,
     precio_publico: item.precio_publico,
     orden: item.orden
@@ -1106,7 +1039,6 @@ const insertDetalleRowsBatch = async ({ client, idMenu, items, capabilities }) =
         FROM jsonb_to_recordset($1::jsonb) AS value(
           id_producto integer,
           id_receta integer,
-          id_combo integer,
           visible boolean,
           precio_publico numeric,
           orden integer
@@ -1246,18 +1178,11 @@ const getCategoryOrderRows = async ({ idMenu, idSucursal, db = pool }) => {
          AND rec.id_receta = dm.id_receta
          AND rec.id_tipo_departamento = r.id_tipo_departamento
          AND COALESCE(rec.estado, true) = true
-        LEFT JOIN public.combos combo
-          ON r.tipo_item = 'COMBO'
-         AND dm.id_combo IS NOT NULL
-         AND combo.id_combo = dm.id_combo
-         AND combo.id_tipo_departamento = r.id_tipo_departamento
-         AND COALESCE(combo.estado, true) = true
         WHERE
           dm.id_detalle_menu IS NULL
           OR (
             (r.tipo_item = 'PRODUCTO' AND p.id_producto IS NOT NULL AND producto_sucursal.ok = 1)
             OR (r.tipo_item = 'RECETA' AND rec.id_receta IS NOT NULL)
-            OR (r.tipo_item = 'COMBO' AND combo.id_combo IS NOT NULL)
           )
         GROUP BY r.id_menu_publicacion_regla, r.orden
       )
@@ -1346,15 +1271,9 @@ const updateDetailOrderForCategories = async ({ client, idMenu, idSucursal, item
          AND dm.id_receta IS NOT NULL
          AND rec.id_receta = dm.id_receta
          AND rec.id_tipo_departamento = r.id_tipo_departamento
-        LEFT JOIN public.combos combo
-          ON r.tipo_item = 'COMBO'
-         AND dm.id_combo IS NOT NULL
-         AND combo.id_combo = dm.id_combo
-         AND combo.id_tipo_departamento = r.id_tipo_departamento
         WHERE
           (r.tipo_item = 'PRODUCTO' AND p.id_producto IS NOT NULL AND producto_sucursal.ok = 1)
           OR (r.tipo_item = 'RECETA' AND rec.id_receta IS NOT NULL)
-          OR (r.tipo_item = 'COMBO' AND combo.id_combo IS NOT NULL)
       )
       UPDATE public.detalle_menu dm
       SET orden = objetivos.nuevo_orden
@@ -2811,10 +2730,7 @@ router.put('/catalogo', checkPermission(MENU_PUBLICACION_SAVE_PERMISSIONS), asyn
         validationErrors.push(`Orden invalido para ${item.key}. Debe ser entero positivo.`);
       }
 
-      if (
-        (item.tipo_item === ITEM_TYPES.RECETA && !capabilities.hasIdReceta) ||
-        (item.tipo_item === ITEM_TYPES.COMBO && !capabilities.hasIdCombo)
-      ) {
+      if (item.tipo_item === ITEM_TYPES.RECETA && !capabilities.hasIdReceta) {
         validationErrors.push(`Tu esquema no soporta publicar ${item.tipo_item} en detalle_menu (columna faltante).`);
       }
     }

@@ -148,7 +148,7 @@ export const validarYDescontarPedido = async (payload, options = {}) => {
       return {
         ok: false,
         code: 'CONFIGURACION_INVENTARIO_INVALIDA',
-        message: firstConfigFaultMessage || 'No se pudo descontar inventario por configuracion incompleta de productos/recetas/combos/extras/insumos/almacen.',
+        message: firstConfigFaultMessage || 'No se pudo descontar inventario por configuracion incompleta de productos/recetas/extras/insumos/almacen.',
         id_pedido: idPedido,
         id_sucursal: idSucursal,
         faltantes: blockingConfigFaults

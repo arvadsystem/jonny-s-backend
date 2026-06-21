@@ -321,7 +321,6 @@ const resolveFacturaLinesForUpdate = async (client, idFactura) => {
         df.id_detalle_factura,
         COALESCE(dfo.id_producto, df.id_producto) AS id_producto,
         COALESCE(dfo.id_receta, df.id_receta::int) AS id_receta,
-        COALESCE(dfo.id_combo, df.id_combo::int) AS id_combo,
         COALESCE(dfo.id_detalle_pedido, df.id_detalle_pedido::int) AS id_detalle_pedido,
         COALESCE(dfo.origen_snapshot, df.origen_snapshot) AS origen_snapshot,
         COALESCE(df.cantidad, 0)::int AS cantidad_vendida,
@@ -441,7 +440,6 @@ const resolveReversionLines = ({ tipoReversion, requestedLines, facturaLines, re
       tipo_item: line.tipo_item,
       id_producto: parsePositiveInt(line.id_producto),
       id_receta: parsePositiveInt(line.id_receta),
-      id_combo: parsePositiveInt(line.id_combo),
       cantidad_revertida: requestedQty,
       precio_unitario_original: roundMoney(line.precio_unitario),
       subtotal_revertido: subtotal,
@@ -872,13 +870,11 @@ export const listFacturaReversiones = async ({ idFactura, idUsuario }) => {
               'tipo_item', rd.tipo_item,
               'id_producto', rd.id_producto,
               'id_receta', rd.id_receta,
-              'id_combo', rd.id_combo,
               'nombre_item', COALESCE(
                 dfo.origen_snapshot->>'nombre_item',
                 df.origen_snapshot->>'nombre_item',
                 prod.nombre_producto,
                 rec.nombre_receta,
-                combo.descripcion,
                 'Item'
               ),
               'cantidad_revertida', rd.cantidad_revertida,
@@ -901,8 +897,6 @@ export const listFacturaReversiones = async ({ idFactura, idUsuario }) => {
             ON prod.id_producto = COALESCE(rd.id_producto, dfo.id_producto, df.id_producto)
           LEFT JOIN public.recetas rec
             ON rec.id_receta = COALESCE(rd.id_receta, dfo.id_receta, df.id_receta::int)
-          LEFT JOIN public.combos combo
-            ON combo.id_combo = COALESCE(rd.id_combo, dfo.id_combo, df.id_combo::int)
           WHERE rd.id_reversion = fr.id_reversion
         ) lineas_info ON true
         WHERE fr.id_factura_original = $1
@@ -1081,7 +1075,6 @@ export const createVentaReversion = async ({ idFactura, body, req, idUsuario, id
             tipo_item,
             id_producto,
             id_receta,
-            id_combo,
             cantidad_revertida,
             precio_unitario_original,
             subtotal_revertido,
@@ -1099,7 +1092,6 @@ export const createVentaReversion = async ({ idFactura, body, req, idUsuario, id
           line.tipo_item,
           line.id_producto,
           line.id_receta,
-          line.id_combo,
           line.cantidad_revertida,
           line.precio_unitario_original,
           line.subtotal_revertido,

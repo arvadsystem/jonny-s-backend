@@ -9,8 +9,6 @@ import {
   fetchAllowedSauceRowsByRecipeIdsQuery,
   fetchCatalogItemByIdQuery,
   fetchCatalogRowsByMenuQuery,
-  fetchComboRecipeComponentsQuery,
-  fetchComboAvailabilityQuery,
   fetchEstadoPedidoRowsQuery,
   fetchPublicActiveSaucesQuery,
   fetchPedidoByIdempotencyKeyQuery,
@@ -40,9 +38,6 @@ const AVAILABILITY_REASON_LABEL = Object.freeze({
   RECETA_INACTIVA: 'Receta inactiva.',
   RECETA_SIN_DETALLE: 'Receta sin configuracion de insumos.',
   INSUMOS_INSUFICIENTES: 'Agotado por falta de insumos.',
-  COMBO_INACTIVO: 'Combo inactivo.',
-  COMBO_SIN_COMPONENTES: 'Combo sin recetas asociadas.',
-  COMPONENTES_NO_DISPONIBLES: 'Combo agotado por componentes no disponibles.',
   SIN_PRECIO: 'Item sin precio configurado.'
 });
 
@@ -464,18 +459,7 @@ const buildCatalogSauceConfigByDetail = async (catalogRows = [], idSucursal, db 
   const directRecipeIds = toUniquePositiveIntArray(
     catalogRows.map((row) => row?.id_receta)
   );
-  const comboIds = toUniquePositiveIntArray(
-    catalogRows.map((row) => row?.id_combo)
-  );
-
-  const comboComponentRows = comboIds.length > 0
-    ? await fetchComboRecipeComponentsQuery(comboIds, db)
-    : [];
-
-  const allRecipeIds = toUniquePositiveIntArray([
-    ...directRecipeIds,
-    ...comboComponentRows.map((row) => row?.id_receta)
-  ]);
+  const allRecipeIds = directRecipeIds;
 
   const [allowedSauceRows, sauceRuleRows] = allRecipeIds.length > 0
     ? await Promise.all([
@@ -532,32 +516,6 @@ const buildCatalogSauceConfigByDetail = async (catalogRows = [], idSucursal, db 
     });
   }
 
-  const comboComponentsById = new Map();
-  for (const row of comboComponentRows) {
-    const comboId = Number(row?.id_combo || 0);
-    const recipeId = Number(row?.id_receta || 0);
-    if (!comboComponentsById.has(comboId)) {
-      comboComponentsById.set(comboId, []);
-    }
-
-    comboComponentsById.get(comboId).push({
-      id_receta: recipeId,
-      nombre_receta: row.nombre_receta,
-      multiplicador: Math.max(1, Number(row?.multiplicador || 1)),
-      // Base de unidades por componente (ej. alitas 6/12/24) para reglas de salsas.
-      unidades_base: inferSauceUnitsBaseFromText(row?.nombre_receta),
-      salsas_permitidas: (() => {
-        const rules = rulesByRecipe.get(recipeId) || [];
-        const recipeAllowedSauces = allowedSaucesByRecipe.get(recipeId) || [];
-        if (recipeAllowedSauces.length === 0 && hasSauceRequirementRules(rules)) {
-          return sortSauceOptions(filteredFallbackSauceCatalog);
-        }
-        return sortSauceOptions(recipeAllowedSauces);
-      })(),
-      reglas: rulesByRecipe.get(recipeId) || []
-    });
-  }
-
   const configByDetail = new Map();
 
   for (const row of catalogRows) {
@@ -583,8 +541,6 @@ const buildCatalogSauceConfigByDetail = async (catalogRows = [], idSucursal, db 
         })(),
         reglas: rulesByRecipe.get(recipeId) || []
       }];
-    } else if (Number(row?.id_combo || 0) > 0) {
-      salsasComponentes = comboComponentsById.get(Number(row.id_combo)) || [];
     }
 
     const unionSauces = new Map();
@@ -650,8 +606,8 @@ const resolveProductAvailability = (row) => {
   return buildAvailabilityPayload({ available: true });
 };
 
-// Calcula disponibilidad para recetas/combo con mapas precomputados.
-const resolveComposedAvailability = ({ row, recipeAvailabilityMap, comboAvailabilityMap }) => {
+// Calcula disponibilidad para recetas con mapas precomputados.
+const resolveComposedAvailability = ({ row, recipeAvailabilityMap }) => {
   const isActive = toBoolean(row.estado_item_base);
   if (!isActive) {
     return buildAvailabilityPayload({ available: false, reasonCode: 'ITEM_INACTIVO' });
@@ -660,12 +616,6 @@ const resolveComposedAvailability = ({ row, recipeAvailabilityMap, comboAvailabi
   if (row.tipo_item === PUBLIC_ITEM_TYPES.RECETA) {
     const info = recipeAvailabilityMap.get(Number(row.id_receta));
     if (!info) return buildAvailabilityPayload({ available: false, reasonCode: 'RECETA_SIN_DETALLE' });
-    return buildAvailabilityPayload({ available: toBoolean(info.disponible), reasonCode: info.motivo || null });
-  }
-
-  if (row.tipo_item === PUBLIC_ITEM_TYPES.COMBO) {
-    const info = comboAvailabilityMap.get(Number(row.id_combo));
-    if (!info) return buildAvailabilityPayload({ available: false, reasonCode: 'COMBO_SIN_COMPONENTES' });
     return buildAvailabilityPayload({ available: toBoolean(info.disponible), reasonCode: info.motivo || null });
   }
 
@@ -692,14 +642,13 @@ const resolvePricePayload = (row) => {
 const mapCatalogItem = ({
   row,
   recipeAvailabilityMap,
-  comboAvailabilityMap,
   sauceConfigByDetail = new Map(),
   extrasByRecipe = new Map()
 }) => {
   const price = resolvePricePayload(row);
   const availability = row.tipo_item === PUBLIC_ITEM_TYPES.PRODUCTO
     ? resolveProductAvailability(row)
-    : resolveComposedAvailability({ row, recipeAvailabilityMap, comboAvailabilityMap });
+    : resolveComposedAvailability({ row, recipeAvailabilityMap });
   const itemSauceConfig = sauceConfigByDetail.get(Number(row?.id_detalle_menu || 0)) || {
     salsas_componentes: [],
     salsas_permitidas: [],
@@ -733,7 +682,6 @@ const mapCatalogItem = ({
     id_item_base: Number(row.id_item_base),
     id_producto: row.id_producto ? Number(row.id_producto) : null,
     id_receta: row.id_receta ? Number(row.id_receta) : null,
-    id_combo: row.id_combo ? Number(row.id_combo) : null,
     nombre: row.nombre_item || 'Item sin nombre',
     descripcion: row.descripcion_item || '',
     categoria: {
@@ -1156,23 +1104,16 @@ const materializePublicOrderSnapshot = async ({ idSucursal, requestedItems = [],
     .filter((row) => row.tipo_item === PUBLIC_ITEM_TYPES.RECETA && row.id_receta)
     .map((row) => Number(row.id_receta));
 
-  const comboIds = rows
-    .filter((row) => row.tipo_item === PUBLIC_ITEM_TYPES.COMBO && row.id_combo)
-    .map((row) => Number(row.id_combo));
-
-  const [recipeAvailabilityRows, comboAvailabilityRows] = await Promise.all([
-    fetchRecipeAvailabilityQuery([...new Set(recipeIds)], Number(idSucursal), db),
-    fetchComboAvailabilityQuery([...new Set(comboIds)], Number(idSucursal), db)
-  ]);
+  const recipeAvailabilityRows = await fetchRecipeAvailabilityQuery(
+    [...new Set(recipeIds)], Number(idSucursal), db
+  );
 
   const recipeAvailabilityMap = toAvailabilityMap(recipeAvailabilityRows, 'id_receta');
-  const comboAvailabilityMap = toAvailabilityMap(comboAvailabilityRows, 'id_combo');
 
   const catalogItems = rows.map((row) =>
     mapCatalogItem({
       row,
       recipeAvailabilityMap,
-      comboAvailabilityMap,
       sauceConfigByDetail,
       extrasByRecipe
     })
@@ -1216,7 +1157,6 @@ const materializePublicOrderSnapshot = async ({ idSucursal, requestedItems = [],
       id_detalle_menu: Number(catalog.id_detalle_menu),
       tipo_item: String(catalog.tipo_item || 'PRODUCTO'),
       id_producto: catalog.id_producto ? Number(catalog.id_producto) : null,
-      id_combo: catalog.id_combo ? Number(catalog.id_combo) : null,
       id_receta: catalog.id_receta ? Number(catalog.id_receta) : null,
       nombre: catalog.nombre,
       cantidad,
@@ -1535,17 +1475,11 @@ export const getPublicCatalogService = async ({ idSucursal, tipoPedido = null })
     .filter((row) => row.tipo_item === PUBLIC_ITEM_TYPES.RECETA && row.id_receta)
     .map((row) => Number(row.id_receta));
 
-  const comboIds = rows
-    .filter((row) => row.tipo_item === PUBLIC_ITEM_TYPES.COMBO && row.id_combo)
-    .map((row) => Number(row.id_combo));
-
-  const [recipeAvailabilityRows, comboAvailabilityRows] = await Promise.all([
-    fetchRecipeAvailabilityQuery([...new Set(recipeIds)], Number(idSucursal)),
-    fetchComboAvailabilityQuery([...new Set(comboIds)], Number(idSucursal))
-  ]);
+  const recipeAvailabilityRows = await fetchRecipeAvailabilityQuery(
+    [...new Set(recipeIds)], Number(idSucursal)
+  );
 
   const recipeAvailabilityMap = toAvailabilityMap(recipeAvailabilityRows, 'id_receta');
-  const comboAvailabilityMap = toAvailabilityMap(comboAvailabilityRows, 'id_combo');
 
   const items = rows
     .filter(isRowVisibleInPublicMenu)
@@ -1553,7 +1487,6 @@ export const getPublicCatalogService = async ({ idSucursal, tipoPedido = null })
     mapCatalogItem({
       row,
       recipeAvailabilityMap,
-      comboAvailabilityMap,
       sauceConfigByDetail,
       extrasByRecipe
     })
@@ -1598,22 +1531,15 @@ export const getPublicCatalogItemDetailService = async ({ idSucursal, idDetalleM
   ]);
 
   const recipeIds = row.id_receta ? [Number(row.id_receta)] : [];
-  const comboIds = row.id_combo ? [Number(row.id_combo)] : [];
-
-  const [recipeAvailabilityRows, comboAvailabilityRows] = await Promise.all([
-    fetchRecipeAvailabilityQuery(recipeIds, Number(idSucursal)),
-    fetchComboAvailabilityQuery(comboIds, Number(idSucursal))
-  ]);
+  const recipeAvailabilityRows = await fetchRecipeAvailabilityQuery(recipeIds, Number(idSucursal));
 
   const recipeAvailabilityMap = toAvailabilityMap(recipeAvailabilityRows, 'id_receta');
-  const comboAvailabilityMap = toAvailabilityMap(comboAvailabilityRows, 'id_combo');
 
   return {
     menu: mapMenuSummary(activeMenu),
     item: mapCatalogItem({
       row,
       recipeAvailabilityMap,
-      comboAvailabilityMap,
       sauceConfigByDetail,
       extrasByRecipe
     })
@@ -1867,7 +1793,6 @@ export const createPublicOrderService = async ({
         total_pedido: line.subtotal,
         id_producto: line.id_producto,
         id_pedido: idPedido,
-        id_combo: line.id_combo,
         id_receta: line.id_receta,
         cantidad: line.cantidad,
         observacion: line.observacion,
