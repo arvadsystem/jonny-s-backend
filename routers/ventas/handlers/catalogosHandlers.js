@@ -340,15 +340,14 @@ export const listClientesCatalogoHandler = async (req, res) => {
       .toLowerCase();
     const directId = parseOptionalPositiveInt(search);
     const searchDigits = search.replace(/\D/g, '');
+    const isNumericSearch = /^\d+$/.test(search);
     const isDirectIdentifier = Boolean(directId || searchDigits.length >= 4);
     const shortDirectIdOnly = Boolean(directId && search === searchDigits && searchDigits.length < 4);
-    if (search && !isDirectIdentifier && search.length < 2) {
-      return res.status(200).json([]);
+    const parsedLimit = Number.parseInt(String(req.query.limit ?? 100), 10);
+    const limit = Math.min(100, Math.max(1, Number.isInteger(parsedLimit) ? parsedLimit : 100));
+    if (!search || (!isNumericSearch && search.length < 2) || (isNumericSearch && !isDirectIdentifier)) {
+      return res.status(200).json({ data: [], meta: { limit, has_more: false } });
     }
-    const parsedLimit = Number.parseInt(String(req.query.limit ?? 20), 10);
-    const limit = Math.min(50, Math.max(1, Number.isInteger(parsedLimit) ? parsedLimit : 20));
-    const allMatches = Boolean(search) && parseBooleanish(req.query.all) === true;
-    const limitClause = allMatches ? '' : 'LIMIT $8';
     const query = `
       WITH matched AS (
         SELECT DISTINCT
@@ -370,30 +369,15 @@ export const listClientesCatalogoHandler = async (req, res) => {
             WHEN $2::int IS NOT NULL AND c.id_cliente = $2 THEN 0
             WHEN UPPER(COALESCE(p.dni, '')) = UPPER($4) OR UPPER(COALESCE(p.rtn, '')) = UPPER($4) OR UPPER(COALESCE(e.rtn, '')) = UPPER($4) THEN 1
             WHEN regexp_replace(COALESCE(tp.telefono, ''), '\\D', '', 'g') = $5 OR regexp_replace(COALESCE(te.telefono, ''), '\\D', '', 'g') = $5 THEN 2
-            WHEN p.nombre ILIKE $6 OR p.apellido ILIKE $6 OR trim(concat_ws(' ', p.nombre, p.apellido)) ILIKE $6 OR COALESCE(e.nombre_empresa, '') ILIKE $6 THEN 3
-            ELSE 4
+            WHEN translate(lower(trim(concat_ws(' ', p.nombre, p.apellido))), 'áéíóúüñ', 'aeiouun') = $6
+              OR translate(lower(trim(COALESCE(p.nombre, ''))), 'áéíóúüñ', 'aeiouun') = $6
+              OR translate(lower(trim(COALESCE(e.nombre_empresa, ''))), 'áéíóúüñ', 'aeiouun') = $6 THEN 3
+            WHEN translate(lower(trim(concat_ws(' ', p.nombre, p.apellido))), 'áéíóúüñ', 'aeiouun') LIKE $6 || '%'
+              OR translate(lower(trim(COALESCE(p.nombre, ''))), 'áéíóúüñ', 'aeiouun') LIKE $6 || '%'
+              OR translate(lower(trim(COALESCE(p.apellido, ''))), 'áéíóúüñ', 'aeiouun') LIKE $6 || '%'
+              OR translate(lower(trim(COALESCE(e.nombre_empresa, ''))), 'áéíóúüñ', 'aeiouun') LIKE $6 || '%' THEN 4
+            ELSE 5
           END AS relevance_rank,
-          CASE
-            WHEN NULLIF(TRIM(COALESCE(e.nombre_empresa, '')), '') IS NOT NULL
-              AND LOWER(TRIM(COALESCE(e.nombre_empresa, ''))) NOT IN ('sin nombre', 'sin apellido', 'sin nombres', 'sin apellidos', 'delivery', 'no registrado', 'no registra', 'n/a', 'na', 'null', 'undefined')
-              AND TRIM(COALESCE(e.nombre_empresa, '')) ~ '[[:alpha:]]'
-            THEN 0
-            WHEN NULLIF(TRIM(CONCAT_WS(' ',
-              CASE
-                WHEN LOWER(TRIM(COALESCE(p.nombre, ''))) IN ('sin nombre', 'sin apellido', 'sin nombres', 'sin apellidos', 'delivery', 'no registrado', 'no registra', 'n/a', 'na', 'null', 'undefined') THEN NULL
-                WHEN TRIM(COALESCE(p.nombre, '')) !~ '[[:alpha:]]' THEN NULL
-                WHEN TRIM(COALESCE(p.nombre, '')) ~ '^0+[0-9]{2,}$' THEN NULL
-                ELSE p.nombre
-              END,
-              CASE
-                WHEN LOWER(TRIM(COALESCE(p.apellido, ''))) IN ('sin nombre', 'sin apellido', 'sin nombres', 'sin apellidos', 'delivery', 'no registrado', 'no registra', 'n/a', 'na', 'null', 'undefined') THEN NULL
-                WHEN TRIM(COALESCE(p.apellido, '')) !~ '[[:alpha:]]' THEN NULL
-                WHEN TRIM(COALESCE(p.apellido, '')) ~ '^0+[0-9]{2,}$' THEN NULL
-                ELSE p.apellido
-              END
-            )), '') IS NOT NULL THEN 0
-            ELSE 1
-          END AS valid_name_rank,
           LOWER(COALESCE(NULLIF(trim(concat_ws(' ', p.nombre, p.apellido)), ''), e.nombre_empresa, c.id_cliente::text)) AS sort_name
         FROM clientes c
         LEFT JOIN personas p ON p.id_persona = c.id_persona
@@ -417,8 +401,8 @@ export const listClientesCatalogoHandler = async (req, res) => {
             OR p.apellido ILIKE $1
             OR trim(concat_ws(' ', p.nombre, p.apellido)) ILIKE $1
             OR COALESCE(e.nombre_empresa, '') ILIKE $1
-            OR translate(lower(trim(concat_ws(' ', p.nombre, p.apellido))), 'áéíóúüñ', 'aeiouun') ILIKE $7
-            OR translate(lower(COALESCE(e.nombre_empresa, '')), 'áéíóúüñ', 'aeiouun') ILIKE $7
+            OR translate(lower(trim(concat_ws(' ', p.nombre, p.apellido))), 'áéíóúüñ', 'aeiouun') LIKE '%' || $6 || '%'
+            OR translate(lower(COALESCE(e.nombre_empresa, '')), 'áéíóúüñ', 'aeiouun') LIKE '%' || $6 || '%'
           )
       )
       SELECT
@@ -428,10 +412,9 @@ export const listClientesCatalogoHandler = async (req, res) => {
       FROM matched
       ORDER BY
         relevance_rank,
-        valid_name_rank,
         sort_name,
         id_cliente
-      ${limitClause}
+      LIMIT $7
     `;
 
     const queryValues = [
@@ -440,16 +423,16 @@ export const listClientesCatalogoHandler = async (req, res) => {
       searchDigits.length >= 4 ? `%${searchDigits}%` : '%__NO_PHONE_MATCH__%',
       search,
       searchDigits.length >= 4 ? searchDigits : '__NO_PHONE_MATCH__',
-      shortDirectIdOnly ? '__NO_TEXT_MATCH__%' : `${search}%`,
-      shortDirectIdOnly ? '%__NO_TEXT_MATCH__%' : `%${normalizedSearch}%`
+      shortDirectIdOnly ? '__NO_TEXT_MATCH__' : normalizedSearch,
+      limit + 1
     ];
-    if (!allMatches) queryValues.push(limit);
     const result = await pool.query({
       text: query,
       values: queryValues,
       query_timeout: 8_000
     });
-    const data = result.rows.map((row) => ({
+    const hasMore = result.rows.length > limit;
+    const data = result.rows.slice(0, limit).map((row) => ({
       id_cliente: row.id_cliente,
       id_tipo_cliente: row.id_tipo_cliente,
       tipo_cliente: row.tipo_cliente || null,
@@ -462,7 +445,7 @@ export const listClientesCatalogoHandler = async (req, res) => {
       es_consumidor_final: false
     }));
 
-    res.status(200).json(data);
+    res.status(200).json({ data, meta: { limit, has_more: hasMore } });
   } catch (err) {
     console.error('Error al listar catalogo de clientes para ventas:', err.message);
     sendVentasInternalError(res);

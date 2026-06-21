@@ -46,24 +46,24 @@ assert.ok(
 );
 assert.match(
   handlersSource,
-  /if \(search && !isDirectIdentifier && search\.length < 2\)[\s\S]*return res\.status\(200\)\.json\(\[\]\)/,
-  'clientes debe bloquear solo busquedas cortas no numericas'
+  /if \(!search \|\| \(!isNumericSearch && search\.length < 2\)/,
+  'clientes debe omitir busqueda vacia y texto de un caracter'
 );
 assert.match(
   handlersSource,
-  /const allMatches = Boolean\(search\)[\s\S]*const limitClause = allMatches \? '' : 'LIMIT \$8'/,
-  'clientes debe permitir carga inicial limitada y ordenada sin busqueda'
+  /json\(\{ data: \[\], meta: \{ limit, has_more: false \} \}\)/,
+  'clientes no debe cargar catalogo inicial sin busqueda'
 );
 assert.match(
   handlersSource,
-  /Math\.min\(50,\s*Math\.max\(1,\s*Number\.isInteger\(parsedLimit\) \? parsedLimit : 20\)\)/,
-  'clientes debe conservar limite default 20 y maximo 50'
+  /Math\.min\(100,\s*Math\.max\(1,\s*Number\.isInteger\(parsedLimit\) \? parsedLimit : 100\)\)/,
+  'clientes debe conservar limite default y maximo 100'
 );
 assert.match(handlersSource, /CLIENTE_NOMBRE_PLACEHOLDERS/, 'clientes debe filtrar placeholders de nombre legacy');
 assert.match(handlersSource, /\^0\+\\d\{2,\}\$/, 'clientes no debe presentar codigos con ceros como nombre');
 assert.match(handlersSource, /Cliente #\$\{idCliente\}/, 'clientes sin nombre valido deben mostrarse como Cliente #id');
 assert.match(handlersSource, /tc\.tipo_cliente/, 'clientes debe exponer tipo de cliente como metadata secundaria');
-assert.match(handlersSource, /Boolean\(search\)[\s\S]*parseBooleanish\(req\.query\.all\)/, 'clientes debe habilitar coincidencias completas solo con search');
+assert.match(handlersSource, /has_more: hasMore/, 'clientes debe informar si existen mas de 100 coincidencias');
 assert.doesNotMatch(ventasModuleSources, /new\s+(?:Pool|Client)\s*\(/, 'Ventas no debe crear Pool ni Client');
 assert.match(routerSource, /kind === 'ITEM'/, 'Ventas debe conservar lineas de extras independientes');
 assert.match(routerSource, /id_extra/, 'Ventas debe conservar id_extra en contratos de venta');
