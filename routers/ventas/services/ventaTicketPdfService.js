@@ -118,12 +118,15 @@ const countSplitLines = (cuentaDividida) => {
 };
 
 const estimateHeightMm = (venta = {}) => {
+  const ticketWidth = resolveTicketWidth(venta);
   const items = Array.isArray(venta.items) ? venta.items : [];
   const extrasCount = countExtras(items);
   const salsasCount = countSalsas(items);
   const splitCount = countSplitLines(venta.cuenta_dividida);
   const fiscalBlocks = venta?.facturacion?.ticket?.mostrar_datos_fiscales === false ? 0 : 4;
-  const logoBlock = venta?.facturacion?.ticket?.mostrar_logo_ticket && venta?.facturacion?.emisor?.logo_data_url ? 32 : 0;
+  const logoBlock = venta?.facturacion?.ticket?.mostrar_logo_ticket && venta?.facturacion?.emisor?.logo_data_url
+    ? (ticketWidth === 58 ? 32 : 46)
+    : 0;
   const deliveryBlock = venta?.delivery ? 16 : 0;
   const estimated = 110
     + logoBlock
@@ -165,11 +168,13 @@ const buildHeader = (venta, widthMm) => {
   const content = [];
 
   if (ticket.mostrar_logo_ticket && isPdfSupportedImageDataUrl(emisor.logo_data_url)) {
+    const logoMaxHeightPt = mmToPt(widthMm === 58 ? 26 : 38);
+
     content.push({
       image: emisor.logo_data_url,
-      width: widthMm === 58 ? 78 : 118,
+      fit: [getContentWidthPt(widthMm), logoMaxHeightPt],
       alignment: 'center',
-      margin: [0, 2, 0, 8]
+      margin: [0, 1, 0, 8]
     });
   }
 
