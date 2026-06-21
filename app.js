@@ -59,7 +59,6 @@ import rolesPermisosRoutes from './routers/roles_permisos.js';
 import archivosRoutes from './routers/archivos.js';
 import adminRecetasRouter from './routers/admin_recetas.js';
 import adminExtrasRouter from './routers/admin_extras.js';
-import adminCombosRouter from './routers/admin_combos.js';
 import adminMenuPublicacionRouter from './routers/admin_menu_publicacion.js';
 import adminSalsasRouter from './routers/admin_salsas.js';
 import adminInsumoPresentacionesRouter from './routers/admin_insumo_presentaciones/index.js';
@@ -206,11 +205,9 @@ app.use(emailCampaignRoutes);
 app.use('/api/admin/recetas', adminRecetasRouter);
 // Admin: CRUD de extras opcionales del menu.
 app.use('/api/admin/extras', adminExtrasRouter);
-// Admin: CRUD de combos para panel administrativo (rutas relativas en router).
-app.use('/api/admin/combos', adminCombosRouter);
 // Admin: publicacion de menu por sucursal (visible, precio_publico y orden).
 app.use('/api/admin/menu-publicacion', adminMenuPublicacionRouter);
-// Admin: catalogo/configuracion de salsas para recetas y combos.
+// Admin: catalogo/configuracion de salsas para recetas.
 app.use('/api/admin/salsas', adminSalsasRouter);
 // Admin: presentaciones/conversiones por insumo.
 app.use('/api/admin/insumos', adminInsumoPresentacionesRouter);

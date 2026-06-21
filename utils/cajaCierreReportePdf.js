@@ -27,8 +27,17 @@ const formatMoney = (value) =>
     maximumFractionDigits: 2
   })}`;
 
+const parseUtcTimestampForDisplay = (value) => {
+  if (!value || value instanceof Date) return value;
+  const text = String(value).trim();
+  if (/^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}(:\d{2})?(\.\d+)?$/.test(text)) {
+    return `${text.replace(' ', 'T')}Z`;
+  }
+  return value;
+};
+
 const formatDateTime = (value = new Date()) => {
-  const date = value ? new Date(value) : new Date();
+  const date = value ? new Date(parseUtcTimestampForDisplay(value)) : new Date();
   if (Number.isNaN(date.getTime())) return 'No disponible';
   return date.toLocaleString('es-HN', {
     timeZone: 'America/Tegucigalpa',

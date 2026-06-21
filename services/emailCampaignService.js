@@ -563,9 +563,8 @@ const processCampaignById = async (idCampaign, trigger = 'manual', options = {})
   const targetStatuses = requestedStatuses.length > 0
     ? [...new Set(requestedStatuses)]
     : [RECIPIENT_STATUS.PENDING, RECIPIENT_STATUS.SENDING];
-  const db = await pool.connect();
   try {
-    const campaign = await getCampaignRow(idCampaign, db);
+    const campaign = await getCampaignRow(idCampaign);
     if (!campaign) throw new CampaignError(404, 'NOT_FOUND', 'Campana no encontrada.');
     if (normalizeStatus(campaign.status) !== CAMPAIGN_STATUS.PROCESSING) {
       throw new CampaignError(409, 'INVALID_STATE', 'La campana no esta en processing.');
@@ -574,11 +573,10 @@ const processCampaignById = async (idCampaign, trigger = 'manual', options = {})
       idCampaign,
       level: 'info',
       message: 'Procesamiento iniciado.',
-      meta: { trigger },
-      db
+      meta: { trigger }
     });
 
-    const recipientsResult = await db.query(
+    const recipientsResult = await pool.query(
       `
         SELECT id_campaign_recipient, recipient_email
         FROM public.email_campaign_recipients
@@ -591,8 +589,8 @@ const processCampaignById = async (idCampaign, trigger = 'manual', options = {})
 
     const recipients = recipientsResult.rows || [];
     if (!recipients.length) {
-      const counters = await refreshCounters(idCampaign, db);
-      await logProcessingCompleted({ idCampaign, trigger, counters, db });
+      const counters = await refreshCounters(idCampaign);
+      await logProcessingCompleted({ idCampaign, trigger, counters });
       return { id_campaign: idCampaign, trigger, counters };
     }
 
@@ -604,7 +602,7 @@ const processCampaignById = async (idCampaign, trigger = 'manual', options = {})
       for (const row of rows) {
         const idRecipient = toInt(row.id_campaign_recipient);
         if (!idRecipient) continue;
-        await db.query(
+        await pool.query(
           `
             UPDATE public.email_campaign_recipients
             SET send_status = $2, error_message = NULL, updated_at = NOW()
@@ -620,7 +618,7 @@ const processCampaignById = async (idCampaign, trigger = 'manual', options = {})
             html: campaign.html_content
           });
 
-          await db.query(
+          await pool.query(
             `
               UPDATE public.email_campaign_recipients
               SET
@@ -633,7 +631,7 @@ const processCampaignById = async (idCampaign, trigger = 'manual', options = {})
             [idRecipient, RECIPIENT_STATUS.SENT]
           );
         } catch (error) {
-          await db.query(
+          await pool.query(
             `
               UPDATE public.email_campaign_recipients
               SET
@@ -651,15 +649,13 @@ const processCampaignById = async (idCampaign, trigger = 'manual', options = {})
       if (hasMore && delay > 0) await sleep(delay);
     }
 
-    const counters = await refreshCounters(idCampaign, db);
-    await logProcessingCompleted({ idCampaign, trigger, counters, db });
+    const counters = await refreshCounters(idCampaign);
+    await logProcessingCompleted({ idCampaign, trigger, counters });
     return { id_campaign: idCampaign, trigger, counters };
   } catch (error) {
-    await markFailed(idCampaign, error?.message || 'Error procesando campana.', db, { trigger }).catch(() => {});
+    await markFailed(idCampaign, error?.message || 'Error procesando campana.', pool, { trigger }).catch(() => {});
     if (error instanceof CampaignError) throw error;
     throw new CampaignError(500, 'INTERNAL_ERROR', 'No se pudo procesar la campana.');
-  } finally {
-    db.release();
   }
 };
 

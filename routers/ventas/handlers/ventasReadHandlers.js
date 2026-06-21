@@ -249,6 +249,7 @@ export const buildVentaDetailPayload = async (req, {
       status: 200,
       body: {
         ...venta,
+        cliente_nombre: pedidoDeliveryDetail.contacto?.nombre_contacto || venta.cliente_nombre || 'Consumidor final',
         numero_venta: resolveVentaNumero(venta),
         metodo_pago: venta.metodo_pago || null,
         items: pedidoItems,

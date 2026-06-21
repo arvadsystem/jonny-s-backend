@@ -61,6 +61,7 @@ export const registrarMovimientosPedido = async ({
   insumoQtyMap,
   productosById,
   insumosById,
+  insumoTraceById = new Map(),
   refOrigen = MOVEMENT_REF,
   shortagesByResource = new Map()
 }) => {
@@ -85,6 +86,10 @@ export const registrarMovimientosPedido = async ({
   for (const idInsumo of insumoIds) {
     const row = insumosById.get(idInsumo);
     const shortage = shortagesByResource.get(`insumo:${idInsumo}`) || null;
+    const trace = insumoTraceById.get(idInsumo) || null;
+    const salsaTrace = trace
+      ? ` - salsas ${[...trace.salsaIds].sort((a, b) => a - b).map((id) => `#${id}`).join(', ')}; detalles ${[...trace.detallePedidoIds].sort((a, b) => a - b).map((id) => `#${id}`).join(', ')}`
+      : '';
     const idInsumoMovimiento = toPositiveInt(row?.id_insumo_maestro) || toPositiveInt(row?.id_insumo) || idInsumo;
     await insertMovimiento(client, {
       cantidad: Number(insumoQtyMap.get(idInsumo) || 0),
@@ -93,7 +98,7 @@ export const registrarMovimientosPedido = async ({
       id_insumo: idInsumoMovimiento,
       id_ref: idPedido,
       ref_origen: refOrigen,
-      descripcion: `Descuento por pedido #${idPedido} (insumo ${idInsumo})${shortage ? ` - faltante auditado req:${shortage.requerido} disp:${shortage.disponible} deficit:${shortage.faltante}` : ''}${toPositiveInt(actorUserId) ? ` - usuario ${actorUserId}` : ''}`
+      descripcion: `Descuento por pedido #${idPedido} (insumo ${idInsumo})${salsaTrace}${shortage ? ` - faltante auditado req:${shortage.requerido} disp:${shortage.disponible} deficit:${shortage.faltante}` : ''}${toPositiveInt(actorUserId) ? ` - usuario ${actorUserId}` : ''}`
     });
   }
 };

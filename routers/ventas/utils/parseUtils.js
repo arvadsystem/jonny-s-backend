@@ -5,7 +5,7 @@ import { roundMoney } from './moneyUtils.js';
 
 export const normalizeTipoItem = (value) => {
   const normalized = String(value || '').trim().toUpperCase();
-  return ['PRODUCTO', 'RECETA', 'COMBO', 'MIXTO', 'ITEM'].includes(normalized)
+  return ['PRODUCTO', 'RECETA', 'MIXTO', 'ITEM'].includes(normalized)
     ? normalized
     : 'ITEM';
 };
@@ -107,7 +107,7 @@ export const parseComplementosPayload = (value) => {
   return { ok: true, data: [...dedupe].sort((a, b) => a - b) };
 };
 
-export const parseVentaExtrasPayload = (value, { kind, cantidad }) => {
+export const parseVentaExtrasPayload = (value, { kind }) => {
   if (value === undefined || value === null) return { ok: true, data: [] };
   if (!Array.isArray(value)) {
     return { ok: false, message: 'extras debe ser una lista valida.' };
@@ -119,8 +119,6 @@ export const parseVentaExtrasPayload = (value, { kind, cantidad }) => {
 
   const seen = new Set();
   const normalized = [];
-  const maxCantidad = Number(cantidad || 0);
-
   for (const entry of value) {
     if (!isPlainObject(entry)) {
       return { ok: false, message: 'Cada extra debe ser un objeto valido.' };
@@ -135,9 +133,6 @@ export const parseVentaExtrasPayload = (value, { kind, cantidad }) => {
     const extraCantidad = parsePositiveInt(entry.cantidad);
     if (!extraCantidad) {
       return { ok: false, message: 'Cada extra debe incluir cantidad entera mayor a 0.' };
-    }
-    if (extraCantidad > maxCantidad) {
-      return { ok: false, message: 'La cantidad de un extra no puede ser mayor que la cantidad del item.' };
     }
     seen.add(idExtra);
     normalized.push({ id_extra: idExtra, cantidad: extraCantidad });

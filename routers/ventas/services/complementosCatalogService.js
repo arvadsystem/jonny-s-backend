@@ -7,6 +7,8 @@ import { measureVentasPerf } from '../utils/perfUtils.js';
 import {
   fetchPublicActiveSaucesQuery
 } from '../../public_menu/publicMenuQueries.js';
+import { resolveSalsasInventory } from './salsasInventoryService.js';
+import { clearVentasCajaBootstrapCache } from './cajaBootstrapCacheService.js';
 
 const getVentasCatalogCacheTtlMs = () => {
   const rawValue = process.env.VENTAS_CATALOG_CACHE_TTL_MS;
@@ -22,6 +24,7 @@ const ventasStaticComplementCache = new Map();
 
 export const clearVentasComplementCatalogCache = () => {
   ventasStaticComplementCache.clear();
+  clearVentasCajaBootstrapCache();
 };
 
 export const buildVentasStaticCacheKey = (prefix, ids = []) => {
@@ -162,72 +165,14 @@ export const resolveRecetaComplementMetadata = ({ receta = {}, quantity = 1, all
   };
 };
 
-export const resolveComboComplementMetadata = ({ combo = {}, quantity = 1, components = [], saucesByRecipe = new Map(), rulesByRecipe = new Map(), fallbackSauces = [] }) => {
-  const unionSauces = new Map();
-  let required = 0;
-  for (const component of Array.isArray(components) ? components : []) {
-    const idReceta = Number(component?.id_receta || 0);
-    if (!idReceta) continue;
-    const allowed = saucesByRecipe.get(idReceta) || [];
-    for (const sauce of allowed) {
-      const key = Number(sauce?.id_salsa || 0);
-      if (key > 0) unionSauces.set(key, sauce);
-    }
-    const rules = rulesByRecipe.get(idReceta) || [];
-    const multiplier = Math.max(1, Number(component?.multiplicador || 1));
-    required += Math.max(0, buildRecipeSauceRequirement({
-      recipeName: component?.nombre_receta,
-      recipeDescription: component?.nombre_receta,
-      rules,
-      quantity: Math.max(1, Number(quantity || 1)) * multiplier
-    }));
-  }
-  let available = sortSauceOptions(Array.from(unionSauces.values()));
-  if (required > 0 && available.length === 0) {
-    available = sortSauceOptions(fallbackSauces);
-  }
-  return {
-    requiere_complementos: required > 0,
-    tipo_complemento: VENTA_COMPLEMENTO_TIPO_SALSAS,
-    minimo_complementos: required,
-    maximo_complementos: required,
-    complementos_disponibles: available
-  };
-};
+export const buildVentaComplementCatalogCacheKey = ({ recipeIds = [], idSucursal }) =>
+  `complement_context:s=${Number(idSucursal)}:r=${buildVentasStaticCacheKey('recipes', recipeIds)}`;
 
-const buildVentaComplementCatalogCacheKey = ({ recipeIds = [], comboIds = [] }) =>
-  `complement_context:r=${buildVentasStaticCacheKey('recipes', recipeIds)}:c=${buildVentasStaticCacheKey('combos', comboIds)}`;
-
-const fetchVentaComplementCatalogSnapshot = async (client, { recipeIds = [], comboIds = [] }) => {
+const fetchVentaComplementCatalogSnapshot = async (client, { recipeIds = [], idSucursal }) => {
   const result = await client.query(
     `
-      WITH input AS (
-        SELECT $1::int[] AS recipe_ids, $2::int[] AS combo_ids
-      ),
-      combo_components AS (
-        SELECT
-          dc.id_combo,
-          dc.id_receta,
-          GREATEST(COALESCE(dc.cantidad, 1), 1)::int AS multiplicador,
-          r.nombre_receta,
-          COALESCE(dc.orden, dc.id_detalle_combo) AS orden
-        FROM detalle_combo dc
-        INNER JOIN recetas r
-          ON r.id_receta = dc.id_receta
-        CROSS JOIN input i
-        WHERE dc.id_combo = ANY(i.combo_ids)
-          AND dc.id_receta IS NOT NULL
-          AND COALESCE(dc.estado, true) = true
-          AND COALESCE(r.estado, true) = true
-      ),
-      all_recipe_ids AS (
-        SELECT DISTINCT id_receta
-        FROM (
-          SELECT UNNEST((SELECT recipe_ids FROM input)) AS id_receta
-          UNION ALL
-          SELECT id_receta FROM combo_components
-        ) recipes
-        WHERE id_receta IS NOT NULL
+      WITH all_recipe_ids AS (
+        SELECT DISTINCT UNNEST($1::int[]) AS id_receta
       ),
       allowed_sauces AS (
         SELECT
@@ -236,13 +181,20 @@ const fetchVentaComplementCatalogSnapshot = async (client, { recipeIds = [], com
           s.nombre,
           s.nivel_picante,
           s.orden,
+          s.id_insumo,
+          s.cantidad_porcion,
+          s.id_unidad_consumo,
           COALESCE(s.estado, true) AS disponible
         FROM receta_salsa rs
-        INNER JOIN salsas s
-          ON s.id_salsa = rs.id_salsa
-        INNER JOIN all_recipe_ids ari
-          ON ari.id_receta = rs.id_receta
+        INNER JOIN salsas s ON s.id_salsa = rs.id_salsa
+        INNER JOIN all_recipe_ids ari ON ari.id_receta = rs.id_receta
+        INNER JOIN public.salsa_sucursales ss
+          ON ss.id_salsa = s.id_salsa
+         AND ss.id_sucursal = $2
+         AND ss.estado IS TRUE
+         AND ss.publicada IS TRUE
         WHERE COALESCE(rs.estado, true) = true
+          AND COALESCE(s.estado, true) = true
       ),
       sauce_rules AS (
         SELECT
@@ -252,15 +204,10 @@ const fetchVentaComplementCatalogSnapshot = async (client, { recipeIds = [], com
           rsr.max_unidades,
           rsr.salsas_requeridas
         FROM reglas_salsas_receta rsr
-        INNER JOIN all_recipe_ids ari
-          ON ari.id_receta = rsr.id_receta
+        INNER JOIN all_recipe_ids ari ON ari.id_receta = rsr.id_receta
         WHERE COALESCE(rsr.estado, true) = true
       )
       SELECT
-        COALESCE((
-          SELECT jsonb_agg(to_jsonb(cc) - 'orden' ORDER BY cc.id_combo, cc.orden)
-          FROM combo_components cc
-        ), '[]'::jsonb) AS combo_components,
         COALESCE((
           SELECT jsonb_agg(to_jsonb(sa) ORDER BY sa.id_receta, sa.orden, sa.nombre)
           FROM allowed_sauces sa
@@ -270,17 +217,16 @@ const fetchVentaComplementCatalogSnapshot = async (client, { recipeIds = [], com
           FROM sauce_rules sr
         ), '[]'::jsonb) AS sauce_rules
     `,
-    [recipeIds, comboIds]
+    [recipeIds, idSucursal]
   );
   const row = result.rows?.[0] || {};
   return {
-    comboComponents: Array.isArray(row.combo_components) ? row.combo_components : [],
     allowedSauces: Array.isArray(row.allowed_sauces) ? row.allowed_sauces : [],
     sauceRules: Array.isArray(row.sauce_rules) ? row.sauce_rules : []
   };
 };
 
-export const buildVentaComplementContext = async ({ client, normalizedItems, perf = null, recetaMap = new Map() }) => {
+export const buildVentaComplementContext = async ({ client, normalizedItems, idSucursal, perf = null, recetaMap = new Map() }) => {
   const complementosStart = perf?.now?.() || 0;
   const recipeIds = [...new Set(
     (Array.isArray(normalizedItems) ? normalizedItems : [])
@@ -288,19 +234,16 @@ export const buildVentaComplementContext = async ({ client, normalizedItems, per
       .map((item) => Number(item.id_receta || 0))
       .filter((id) => id > 0)
   )];
-  const comboIds = [...new Set(
-    (Array.isArray(normalizedItems) ? normalizedItems : [])
-      .filter((item) => item.kind === 'COMBO')
-      .map((item) => Number(item.id_combo || 0))
-      .filter((id) => id > 0)
-  )];
+  const branchId = Number(idSucursal);
+  if (!Number.isInteger(branchId) || branchId <= 0) {
+    throw new TypeError('idSucursal es requerido para construir el catalogo de salsas.');
+  }
 
   try {
-    if (recipeIds.length === 0 && comboIds.length === 0) {
+    if (recipeIds.length === 0) {
       return {
         saucesByRecipe: new Map(),
         rulesByRecipe: new Map(),
-        comboComponentsByCombo: new Map(),
         fallbackSauces: []
       };
     }
@@ -310,25 +253,27 @@ export const buildVentaComplementContext = async ({ client, normalizedItems, per
       perf,
       'catalog_prefetch_ms',
       () => fetchCachedVentasStaticValue(
-        buildVentaComplementCatalogCacheKey({ recipeIds, comboIds }),
-        () => fetchVentaComplementCatalogSnapshot(client, { recipeIds, comboIds }),
+        buildVentaComplementCatalogCacheKey({ recipeIds, idSucursal: branchId }),
+        () => fetchVentaComplementCatalogSnapshot(client, { recipeIds, idSucursal: branchId }),
         perf
       )
     );
-    if (comboIds.length > 0) {
-      perf?.add?.('totals_combo_components_ms', catalogPrefetchStart);
-      perf?.add?.('totals_combos_ms', catalogPrefetchStart);
-    }
-    if ((complementSnapshot.allowedSauces || []).length > 0 || recipeIds.length > 0 || comboIds.length > 0) {
+    if ((complementSnapshot.allowedSauces || []).length > 0 || recipeIds.length > 0) {
       perf?.add?.('totals_allowed_sauces_ms', catalogPrefetchStart);
       perf?.add?.('totals_sauce_rules_ms', catalogPrefetchStart);
     }
-    const comboComponents = Array.isArray(complementSnapshot.comboComponents)
-      ? complementSnapshot.comboComponents
-      : [];
-    const allowedSauceRows = Array.isArray(complementSnapshot.allowedSauces)
+    const rawAllowedSauceRows = Array.isArray(complementSnapshot.allowedSauces)
       ? complementSnapshot.allowedSauces
       : [];
+    const uniqueAllowed = [...new Map(rawAllowedSauceRows.map((row) => [Number(row.id_salsa), row])).values()];
+    const availableAllowed = await resolveSalsasInventory({
+      queryRunner: client,
+      salsas: uniqueAllowed,
+      idSucursal: branchId,
+      mode: 'catalog'
+    });
+    const availableIds = new Set(availableAllowed.filter((row) => row.disponible).map((row) => Number(row.id_salsa)));
+    const allowedSauceRows = rawAllowedSauceRows.filter((row) => availableIds.has(Number(row.id_salsa)));
     const sauceRuleRows = Array.isArray(complementSnapshot.sauceRules)
       ? complementSnapshot.sauceRules
       : [];
@@ -361,18 +306,6 @@ export const buildVentaComplementContext = async ({ client, normalizedItems, per
       });
     }
 
-    const comboComponentsByCombo = new Map();
-    for (const row of comboComponents) {
-      const comboId = Number(row?.id_combo || 0);
-      if (!comboId) continue;
-      if (!comboComponentsByCombo.has(comboId)) comboComponentsByCombo.set(comboId, []);
-      comboComponentsByCombo.get(comboId).push({
-        id_receta: Number(row?.id_receta || 0),
-        multiplicador: Math.max(1, Number(row?.multiplicador || 1)),
-        nombre_receta: String(row?.nombre_receta || '').trim()
-      });
-    }
-
     let needsFallbackSauces = false;
     for (const item of Array.isArray(normalizedItems) ? normalizedItems : []) {
       if (item.kind === 'RECETA') {
@@ -392,31 +325,6 @@ export const buildVentaComplementContext = async ({ client, normalizedItems, per
         }
       }
 
-      if (item.kind === 'COMBO') {
-        const components = comboComponentsByCombo.get(Number(item.id_combo || 0)) || [];
-        const unionSauces = new Map();
-        let required = 0;
-        for (const component of components) {
-          const idReceta = Number(component?.id_receta || 0);
-          if (!idReceta) continue;
-          for (const sauce of saucesByRecipe.get(idReceta) || []) {
-            const key = Number(sauce?.id_salsa || 0);
-            if (key > 0) unionSauces.set(key, sauce);
-          }
-          const rules = rulesByRecipe.get(idReceta) || [];
-          const multiplier = Math.max(1, Number(component?.multiplicador || 1));
-          required += Math.max(0, buildRecipeSauceRequirement({
-            recipeName: component?.nombre_receta,
-            recipeDescription: component?.nombre_receta,
-            rules,
-            quantity: Math.max(1, Number(item.cantidad || 1)) * multiplier
-          }));
-        }
-        if (required > 0 && unionSauces.size === 0) {
-          needsFallbackSauces = true;
-          break;
-        }
-      }
     }
 
     const fallbackSauces = needsFallbackSauces
@@ -424,13 +332,19 @@ export const buildVentaComplementContext = async ({ client, normalizedItems, per
         perf,
         'totals_allowed_sauces_ms',
         () => fetchCachedVentasStaticRows(
-          'active_sauces',
-          () => fetchPublicActiveSaucesQuery(client),
+          `active_sauces:s=${branchId}`,
+          () => fetchPublicActiveSaucesQuery(branchId, client),
           perf
         )
       )
       : [];
-    const normalizedFallbackSauces = sortSauceOptions((Array.isArray(fallbackSauces) ? fallbackSauces : []).map((row) => ({
+    const resolvedFallbackSauces = await resolveSalsasInventory({
+      queryRunner: client,
+      salsas: Array.isArray(fallbackSauces) ? fallbackSauces : [],
+      idSucursal: branchId,
+      mode: 'catalog'
+    });
+    const normalizedFallbackSauces = sortSauceOptions(resolvedFallbackSauces.filter((row) => row.disponible).map((row) => ({
       id_complemento: Number(row.id_salsa),
       id_salsa: Number(row.id_salsa),
       nombre: String(row.nombre || 'Salsa').trim(),
@@ -442,7 +356,6 @@ export const buildVentaComplementContext = async ({ client, normalizedItems, per
     return {
       saucesByRecipe,
       rulesByRecipe,
-      comboComponentsByCombo,
       fallbackSauces: normalizedFallbackSauces
     };
   } finally {

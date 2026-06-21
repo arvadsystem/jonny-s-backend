@@ -47,7 +47,8 @@ const INSUMOS_DUPLICATE_CONSTRAINT = 'uq_insumos_nombre_categoria_unidad_norm';
 const INSUMOS_DUPLICATE_MESSAGE = 'Ya existe un insumo con ese nombre en el almacÃ©n seleccionado.';
 const INSUMOS_ASSIGNMENT_ALREADY_ACTIVE_MESSAGE = 'El insumo maestro ya tiene una asignacion activa en el almacen indicado.';
 const INSUMOS_ASSIGNMENT_BRANCH_CONFLICT_MESSAGE = 'El insumo maestro ya tiene una asignacion activa en otra bodega de la misma sucursal.';
-const SINGLE_ALMACEN_TEMP_MESSAGE = 'Temporalmente solo se permite un almacÃ©n por producto o insumo.';
+const INSUMOS_MULTIPLE_WAREHOUSES_SAME_BRANCH_CODE = 'INSUMO_MULTIPLE_WAREHOUSES_SAME_BRANCH';
+const INSUMOS_MULTIPLE_WAREHOUSES_SAME_BRANCH_MESSAGE = 'Selecciona como maximo un almacen por sucursal.';
 
 // AM: allowlist de campos permitidos para alta/edicion controlada de insumos.
 // AM: mantiene payload legacy (`id_almacen`) y habilita `id_almacenes` para asignacion multi-sucursal.
@@ -77,6 +78,7 @@ const CAMPOS_PERMITIDOS_INSUMOS_POST = new Set([
   'fecha_ingreso_insumo',
   'id_almacen',
   'id_almacenes',
+  'cantidades_por_almacen',
   'id_categoria_insumo',
   'id_unidad_medida',
   'fecha_caducidad',
@@ -322,9 +324,6 @@ const parseIdAlmacenes = (rawSingle, rawMulti) => {
     if (!out.includes(parsed)) out.push(parsed);
   }
 
-  if (out.length > 1) {
-    return { ok: false, message: SINGLE_ALMACEN_TEMP_MESSAGE };
-  }
   if (out.length > 0) return { ok: true, ids: out };
 
   const parsedSingle = Number.parseInt(String(rawSingle ?? '').trim(), 10);
@@ -333,6 +332,87 @@ const parseIdAlmacenes = (rawSingle, rawMulti) => {
   }
 
   return { ok: false, message: 'Debe seleccionar al menos un id_almacen.' };
+};
+
+const DECIMAL_2_RE = /^\d+(?:\.\d{1,2})?$/;
+
+const parseNonNegativeDecimal2 = (value) => {
+  if (value === undefined || value === null || String(value).trim() === '') return null;
+  const normalized = String(value).trim().replace(',', '.');
+  if (!DECIMAL_2_RE.test(normalized)) return null;
+  const parsed = Number(normalized);
+  if (!Number.isFinite(parsed) || parsed < 0) return null;
+  return parsed;
+};
+
+const decimal2ErrorMessage = (fieldName) => `${fieldName} debe ser un numero mayor o igual a 0 con maximo 2 decimales.`;
+
+const parseWarehouseQuantityValue = (value) => parseNonNegativeDecimal2(value);
+
+const parseCantidadesPorAlmacen = ({ idAlmacenes, cantidadGlobal, cantidadesPorAlmacenRaw }) => {
+  const ids = Array.isArray(idAlmacenes) ? idAlmacenes : [];
+  const selectedSet = new Set(ids);
+  const cantidadesMap = new Map();
+
+  if (cantidadesPorAlmacenRaw === undefined || cantidadesPorAlmacenRaw === null || cantidadesPorAlmacenRaw === '') {
+    if (ids.length === 1) {
+      const cantidad = parseWarehouseQuantityValue(cantidadGlobal);
+      if (cantidad === null) {
+        return { ok: false, message: decimal2ErrorMessage('cantidad') };
+      }
+      cantidadesMap.set(ids[0], cantidad);
+      return { ok: true, cantidadesMap, cantidadTotal: cantidad };
+    }
+    return {
+      ok: false,
+      message: 'Debe indicar cantidades_por_almacen para cada almacen seleccionado.'
+    };
+  }
+
+  if (Array.isArray(cantidadesPorAlmacenRaw)) {
+    for (const entry of cantidadesPorAlmacenRaw) {
+      const idAlmacen = Number.parseInt(String(entry?.id_almacen ?? '').trim(), 10);
+      if (!isPositiveIntegerId(idAlmacen)) {
+        return { ok: false, message: 'cantidades_por_almacen contiene un id_almacen invalido.' };
+      }
+      if (!selectedSet.has(idAlmacen)) {
+        return { ok: false, message: 'cantidades_por_almacen contiene almacenes no seleccionados.' };
+      }
+      const cantidad = parseWarehouseQuantityValue(entry?.cantidad);
+      if (cantidad === null) {
+        return { ok: false, message: decimal2ErrorMessage('cantidad') };
+      }
+      cantidadesMap.set(idAlmacen, cantidad);
+    }
+  } else if (typeof cantidadesPorAlmacenRaw === 'object') {
+    for (const [key, value] of Object.entries(cantidadesPorAlmacenRaw)) {
+      const idAlmacen = Number.parseInt(String(key ?? '').trim(), 10);
+      if (!isPositiveIntegerId(idAlmacen)) {
+        return { ok: false, message: 'cantidades_por_almacen contiene un id_almacen invalido.' };
+      }
+      if (!selectedSet.has(idAlmacen)) {
+        return { ok: false, message: 'cantidades_por_almacen contiene almacenes no seleccionados.' };
+      }
+      const cantidad = parseWarehouseQuantityValue(value);
+      if (cantidad === null) {
+        return { ok: false, message: decimal2ErrorMessage('cantidad') };
+      }
+      cantidadesMap.set(idAlmacen, cantidad);
+    }
+  } else {
+    return { ok: false, message: 'cantidades_por_almacen debe ser un objeto o una lista.' };
+  }
+
+  const missingIds = ids.filter((id) => !cantidadesMap.has(id));
+  if (missingIds.length > 0) {
+    return {
+      ok: false,
+      message: 'Debe indicar una cantidad para cada almacen seleccionado.'
+    };
+  }
+
+  const cantidadTotal = ids.reduce((total, id) => total + (cantidadesMap.get(id) || 0), 0);
+  return { ok: true, cantidadesMap, cantidadTotal };
 };
 
 // AM: normaliza Date/Timestamp a `YYYY-MM-DD` para reusar datos actuales en edicion multi.
@@ -1100,7 +1180,12 @@ const findInsumoByGeneralKey = async (
 };
 
 // AM: sincroniza las asignaciones multi-almacen del insumo sin duplicar filas de `insumos`.
-const syncInsumoAlmacenes = async (idInsumo, idAlmacenes, db = pool) => {
+const syncInsumoAlmacenes = async (
+  idInsumo,
+  idAlmacenes,
+  { cantidadesMap, stockMinimo, precioCompra, fechaCaducidad } = {},
+  db = pool
+) => {
   const uniqueIds = Array.from(
     new Set(
       (Array.isArray(idAlmacenes) ? idAlmacenes : [])
@@ -1112,48 +1197,45 @@ const syncInsumoAlmacenes = async (idInsumo, idAlmacenes, db = pool) => {
   if (uniqueIds.length === 0) return;
 
   const primaryAlmacen = uniqueIds[0];
-  await db.query('UPDATE public.insumos SET id_almacen = $1 WHERE id_insumo = $2', [primaryAlmacen, idInsumo]);
+  const cantidadTotal = uniqueIds.reduce((total, id) => total + (Number(cantidadesMap?.get(id) ?? 0) || 0), 0);
+  await db.query(
+    'UPDATE public.insumos SET id_almacen = $1, cantidad = $2 WHERE id_insumo = $3',
+    [primaryAlmacen, cantidadTotal, idInsumo]
+  );
 
   try {
-    const master = await getInsumoById(idInsumo, db);
-    if (!master) {
-      throw new Error('Insumo no encontrado para sincronizar almacenes.');
+    for (const idAlmacen of uniqueIds) {
+      await db.query(
+        `
+          INSERT INTO public.insumos_almacenes (
+            id_insumo,
+            id_almacen,
+            cantidad,
+            stock_minimo,
+            precio_compra,
+            fecha_caducidad,
+            estado,
+            fecha_actualizacion
+          ) VALUES ($1, $2, $3, $4, $5, $6, true, now())
+          ON CONFLICT (id_insumo, id_almacen)
+          DO UPDATE SET
+            cantidad = EXCLUDED.cantidad,
+            stock_minimo = EXCLUDED.stock_minimo,
+            precio_compra = EXCLUDED.precio_compra,
+            fecha_caducidad = EXCLUDED.fecha_caducidad,
+            estado = EXCLUDED.estado,
+            fecha_actualizacion = now()
+        `,
+        [
+          idInsumo,
+          idAlmacen,
+          Number(cantidadesMap?.get(idAlmacen) ?? 0) || 0,
+          stockMinimo,
+          precioCompra,
+          fechaCaducidad ?? null
+        ]
+      );
     }
-
-    await db.query(
-      `
-        INSERT INTO public.insumos_almacenes (
-          id_insumo,
-          id_almacen,
-          cantidad,
-          stock_minimo,
-          precio_compra,
-          fecha_caducidad,
-          estado,
-          fecha_actualizacion
-        )
-        SELECT
-          $1,
-          UNNEST($2::int[]),
-          0,
-          COALESCE($3::numeric, 0),
-          COALESCE($4::numeric, 0),
-          $5::date,
-          true,
-          now()
-        ON CONFLICT (id_insumo, id_almacen)
-        DO UPDATE SET
-          estado = true,
-          fecha_actualizacion = now()
-      `,
-      [
-        idInsumo,
-        uniqueIds,
-        master.stock_minimo ?? 0,
-        master.precio ?? 0,
-        toDateOnlyString(master.fecha_caducidad) || null
-      ]
-    );
 
     await db.query(
       `
@@ -1511,10 +1593,10 @@ router.post('/insumos/:id_insumo/asignaciones', checkPermission(INSUMOS_EDIT_PER
     }
 
     const stockMinimo = Object.prototype.hasOwnProperty.call(req.body || {}, 'stock_minimo')
-      ? parseNonNegativeDecimal(req.body?.stock_minimo)
+      ? parseNonNegativeDecimal2(req.body?.stock_minimo)
       : resolved.master.stock_minimo_default ?? 0;
     if (stockMinimo === null) {
-      return res.status(400).json({ error: true, message: 'stock_minimo debe ser un numero mayor o igual a 0.' });
+      return res.status(400).json({ error: true, message: decimal2ErrorMessage('stock_minimo') });
     }
 
     if (Object.prototype.hasOwnProperty.call(req.body || {}, 'activo')) {
@@ -1772,8 +1854,30 @@ router.post('/insumos', checkPermission(INSUMOS_CREATE_PERMISSIONS), async (req,
     }
     const idAlmacenes = almacenesParse.ids;
 
+    const scopeValidation = await assertInsumoWarehouseInScope(req, idAlmacenes, client);
+    if (!scopeValidation.ok) {
+      return res.status(scopeValidation.status).json({
+        error: true,
+        message: scopeValidation.message
+      });
+    }
+    const sucursalesSeleccionadas = new Set();
+    for (const row of scopeValidation.rows || []) {
+      const idSucursal = Number.parseInt(String(row?.id_sucursal ?? ''), 10);
+      if (!isPositiveIntegerId(idSucursal)) continue;
+      if (sucursalesSeleccionadas.has(idSucursal)) {
+        return res.status(409).json({
+          error: true,
+          code: INSUMOS_MULTIPLE_WAREHOUSES_SAME_BRANCH_CODE,
+          message: INSUMOS_MULTIPLE_WAREHOUSES_SAME_BRANCH_MESSAGE
+        });
+      }
+      sucursalesSeleccionadas.add(idSucursal);
+    }
+
     const payloadBase = { ...datos };
     delete payloadBase.id_almacenes;
+    delete payloadBase.cantidades_por_almacen;
     payloadBase.id_almacen = idAlmacenes[0];
 
     const nombreInsumo = sanitizeOptionalText(payloadBase?.nombre_insumo);
@@ -1788,27 +1892,36 @@ router.post('/insumos', checkPermission(INSUMOS_CREATE_PERMISSIONS), async (req,
     if (precioRaw === undefined || precioRaw === null || String(precioRaw).trim() === '') {
       return res.status(400).json({ error: true, message: 'precio es obligatorio.' });
     }
-    const precio = Number(precioRaw);
-    if (!Number.isFinite(precio) || precio < 0) {
-      return res.status(400).json({ error: true, message: 'precio debe ser un numero mayor o igual a 0.' });
+    const precio = parseNonNegativeDecimal2(precioRaw);
+    if (precio === null) {
+      return res.status(400).json({ error: true, message: decimal2ErrorMessage('precio') });
     }
 
     const cantidadRaw = payloadBase?.cantidad;
-    if (cantidadRaw === undefined || cantidadRaw === null || String(cantidadRaw).trim() === '') {
-      return res.status(400).json({ error: true, message: 'cantidad es obligatoria.' });
+    const cantidadGlobal = cantidadRaw === undefined || cantidadRaw === null || String(cantidadRaw).trim() === ''
+      ? null
+      : parseNonNegativeDecimal2(cantidadRaw);
+    if (cantidadGlobal === null && (cantidadRaw !== undefined && cantidadRaw !== null && String(cantidadRaw).trim() !== '')) {
+      return res.status(400).json({ error: true, message: decimal2ErrorMessage('cantidad') });
     }
-    const cantidad = parseNonNegativeDecimal(cantidadRaw);
-    if (cantidad === null) {
-      return res.status(400).json({ error: true, message: 'cantidad debe ser un numero mayor o igual a 0.' });
+    const cantidadesParse = parseCantidadesPorAlmacen({
+      idAlmacenes,
+      cantidadGlobal,
+      cantidadesPorAlmacenRaw: datos?.cantidades_por_almacen
+    });
+    if (!cantidadesParse.ok) {
+      return res.status(400).json({ error: true, message: cantidadesParse.message });
     }
+    const cantidad = cantidadesParse.cantidadTotal;
+    const cantidadesMap = cantidadesParse.cantidadesMap;
 
     const stockMinimoRaw = payloadBase?.stock_minimo;
     if (stockMinimoRaw === undefined || stockMinimoRaw === null || String(stockMinimoRaw).trim() === '') {
       return res.status(400).json({ error: true, message: 'stock_minimo es obligatorio.' });
     }
-    const stockMinimo = parseNonNegativeDecimal(stockMinimoRaw);
+    const stockMinimo = parseNonNegativeDecimal2(stockMinimoRaw);
     if (stockMinimo === null) {
-      return res.status(400).json({ error: true, message: 'stock_minimo debe ser un numero mayor o igual a 0.' });
+      return res.status(400).json({ error: true, message: decimal2ErrorMessage('stock_minimo') });
     }
 
     const fechaIngresoValidation = validateOptionalDateInput(payloadBase?.fecha_ingreso_insumo, 'fecha_ingreso_insumo');
@@ -1948,12 +2061,22 @@ router.post('/insumos', checkPermission(INSUMOS_CREATE_PERMISSIONS), async (req,
       });
     }
 
-    await syncInsumoAlmacenes(idInsumoCreado, idAlmacenes, client);
+    await syncInsumoAlmacenes(
+      idInsumoCreado,
+      idAlmacenes,
+      {
+        cantidadesMap,
+        stockMinimo,
+        precioCompra: precio,
+        fechaCaducidad: primaryPayload.fecha_caducidad ?? null
+      },
+      client
+    );
     await completeInsumoCatalogoMaestroWrite({
       client,
       idInsumo: idInsumoCreado,
       idAlmacen: primaryPayload.id_almacen,
-      cantidad,
+      cantidad: cantidadesMap.get(primaryPayload.id_almacen) ?? 0,
       stockMinimo,
       precioCompra: precio,
       fechaCaducidad: primaryPayload.fecha_caducidad ?? null
@@ -2088,20 +2211,20 @@ router.put('/insumos/edicion', checkPermission(INSUMOS_EDIT_PERMISSIONS), async 
     }
 
     const nombreInsumo = String(merged.nombre_insumo ?? '').trim();
-    const precio = Number(merged.precio);
+    const precio = parseNonNegativeDecimal2(merged.precio);
     const cantidad = parseNonNegativeDecimal(merged.cantidad);
-    const stockMinimo = parseNonNegativeDecimal(merged.stock_minimo);
+    const stockMinimo = parseNonNegativeDecimal2(merged.stock_minimo);
     if (nombreInsumo.length < 2 || nombreInsumo.length > 80) {
       return res.status(400).json({ error: true, message: 'nombre_insumo debe tener entre 2 y 80 caracteres.' });
     }
-    if (!Number.isFinite(precio) || precio < 0) {
-      return res.status(400).json({ error: true, message: 'precio debe ser un numero mayor o igual a 0.' });
+    if (precio === null) {
+      return res.status(400).json({ error: true, message: decimal2ErrorMessage('precio') });
     }
     if (cantidad === null) {
       return res.status(400).json({ error: true, message: 'cantidad debe ser un numero mayor o igual a 0.' });
     }
     if (stockMinimo === null) {
-      return res.status(400).json({ error: true, message: 'stock_minimo debe ser un numero mayor o igual a 0.' });
+      return res.status(400).json({ error: true, message: decimal2ErrorMessage('stock_minimo') });
     }
     const fechaIngresoValidation = validateOptionalDateInput(merged.fecha_ingreso_insumo, 'fecha_ingreso_insumo');
     if (!fechaIngresoValidation.ok) {
@@ -2280,11 +2403,11 @@ router.put('/insumos', checkPermission(INSUMOS_EDIT_PERMISSIONS), async (req, re
     if (campo === 'precio') {
       const precioRaw = valorNormalizado;
       if (precioRaw === undefined || precioRaw === null || String(precioRaw).trim() === '') {
-        return res.status(400).json({ error: true, message: 'precio debe ser un numero mayor o igual a 0.' });
+        return res.status(400).json({ error: true, message: decimal2ErrorMessage('precio') });
       }
-      const precio = Number(precioRaw);
-      if (!Number.isFinite(precio) || precio < 0) {
-        return res.status(400).json({ error: true, message: 'precio debe ser un numero mayor o igual a 0.' });
+      const precio = parseNonNegativeDecimal2(precioRaw);
+      if (precio === null) {
+        return res.status(400).json({ error: true, message: decimal2ErrorMessage('precio') });
       }
       valorNormalizado = precio;
     }
@@ -2292,11 +2415,11 @@ router.put('/insumos', checkPermission(INSUMOS_EDIT_PERMISSIONS), async (req, re
     if (campo === 'stock_minimo') {
       const stockMinimoRaw = valorNormalizado;
       if (stockMinimoRaw === undefined || stockMinimoRaw === null || String(stockMinimoRaw).trim() === '') {
-        return res.status(400).json({ error: true, message: 'stock_minimo debe ser un numero mayor o igual a 0.' });
+        return res.status(400).json({ error: true, message: decimal2ErrorMessage('stock_minimo') });
       }
-      const stockMinimo = parseNonNegativeDecimal(stockMinimoRaw);
+      const stockMinimo = parseNonNegativeDecimal2(stockMinimoRaw);
       if (stockMinimo === null) {
-        return res.status(400).json({ error: true, message: 'stock_minimo debe ser un numero mayor o igual a 0.' });
+        return res.status(400).json({ error: true, message: decimal2ErrorMessage('stock_minimo') });
       }
       valorNormalizado = stockMinimo;
     }

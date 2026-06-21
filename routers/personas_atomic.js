@@ -15,6 +15,12 @@ import {
   isValidDateOnly,
   isFutureDateOnly
 } from '../utils/security/personasHardening.js';
+import {
+  buildClienteCreateRequestHash,
+  getClienteCreateIdempotencyKey,
+  reserveClienteCreateIdempotency,
+  saveClienteCreateIdempotencySuccess
+} from '../services/clientesCreateIdempotencyService.js';
 
 const router = express.Router();
 
@@ -502,14 +508,22 @@ const findClienteDetail = async (client, idCliente) => {
         c.fecha_ingreso,
         c.puntos,
         c.estado,
+        p.nombre,
+        p.apellido,
         TRIM(COALESCE(p.nombre, '') || ' ' || COALESCE(p.apellido, '')) AS persona_nombre_completo,
         p.dni AS persona_dni,
+        p.rtn AS persona_rtn,
+        p.genero,
+        pt.telefono AS persona_telefono,
         e.nombre_empresa,
         e.rtn AS empresa_rtn,
+        et.telefono AS empresa_telefono,
         NULL::TEXT AS tipo_cliente
       FROM public.clientes c
       LEFT JOIN public.personas p ON p.id_persona = c.id_persona
+      LEFT JOIN public.telefonos pt ON pt.id_telefono = p.id_telefono
       LEFT JOIN public.empresas e ON e.id_empresa = ${empresaRelationExpr}
+      LEFT JOIN public.telefonos et ON et.id_telefono = e.id_telefono
       WHERE c.id_cliente = $1
       LIMIT 1
     `,
@@ -1026,6 +1040,9 @@ const atomicService = {
     const strictBaseCreateRaw = body.strict_base_create ?? clientePayload.strict_base_create;
     const hasStrictBaseCreate = strictBaseCreateRaw !== undefined && strictBaseCreateRaw !== null && strictBaseCreateRaw !== '';
     const strictBaseCreate = hasStrictBaseCreate ? parseBooleanValue(strictBaseCreateRaw) : false;
+    const quickCreateRaw = body.quick_create;
+    const hasQuickCreate = quickCreateRaw !== undefined && quickCreateRaw !== null && quickCreateRaw !== '';
+    const quickCreate = hasQuickCreate ? parseBooleanValue(quickCreateRaw) : false;
 
     if (!origen) {
       return {
@@ -1045,11 +1062,59 @@ const atomicService = {
         })
       };
     }
+    if (hasQuickCreate && quickCreate === null) {
+      return {
+        status: 400,
+        body: buildErrorBody({
+          code: 'VALIDATION_ERROR',
+          message: 'quick_create debe ser booleano.'
+        })
+      };
+    }
 
     const client = await pool.connect();
+    const idempotencyKey = getClienteCreateIdempotencyKey(req);
+    const idempotencyRequestHash = idempotencyKey
+      ? buildClienteCreateRequestHash(body)
+      : null;
+    let idempotencyReservation = null;
 
     try {
       await client.query('BEGIN');
+      idempotencyReservation = await reserveClienteCreateIdempotency({
+        client,
+        key: idempotencyKey,
+        requestHash: idempotencyRequestHash,
+        idUsuario: req?.user?.id_usuario,
+        idSucursal: clientePayload.id_sucursal ?? body.id_sucursal
+      });
+      if (idempotencyReservation.replay) {
+        await client.query('ROLLBACK');
+        return {
+          status: idempotencyReservation.httpStatus,
+          body: {
+            ...(isPlainObject(idempotencyReservation.responseBody)
+              ? idempotencyReservation.responseBody
+              : {}),
+            idempotent_replay: true
+          }
+        };
+      }
+      if (idempotencyReservation.conflict) {
+        await client.query('ROLLBACK');
+        const invalidKey = idempotencyReservation.code === 'IDEMPOTENCY_KEY_INVALID';
+        return {
+          status: invalidKey ? 400 : 409,
+          body: buildErrorBody({
+            code: idempotencyReservation.code,
+            message: invalidKey
+              ? 'Idempotency-Key no tiene un formato valido.'
+              : idempotencyReservation.code === 'IDEMPOTENCY_KEY_REUSED'
+                ? 'Idempotency-Key ya fue usado con otro payload.'
+                : 'La creacion de este cliente ya esta en proceso.'
+          })
+        };
+      }
       const { tenantId: resolvedTenantIdRaw, isSuperAdmin } = await resolveTenantContextForRequest(req, client);
       let resolvedTenantId = resolvedTenantIdRaw;
       const sucursalValidation = validateAtomicSucursalInput(clientePayload);
@@ -1161,7 +1226,8 @@ const atomicService = {
           req: requestWithTenant,
           idPersona,
           personaPayload,
-          allowClientesContext: true
+          allowClientesContext: true,
+          allowOptionalLastName: quickCreate === true
         });
         idPersona = personaResult.idPersona;
         personaCreada = personaResult.created;
@@ -1246,30 +1312,34 @@ const atomicService = {
           console.warn('Clientes atomico: no se pudo cargar detalle post-vinculacion:', error?.message || error);
         }
 
-        await client.query('COMMIT');
-        return {
-          status: 200,
-          body: {
-            ok: true,
-            error: false,
-            vinculado: true,
-            message: 'Cliente existente vinculado a esta sucursal.',
-            data: {
-              ...buildAtomicSuccessData({
-                entidadTipo: 'cliente',
-                entidad: clienteVinculado,
-                idPrincipal: reusableClienteId,
-                idPersona: normalizedCliente.id_persona ?? null,
-                idEmpresa: empresaRelacionId ?? null,
-                personaCreada,
-                empresaCreada
-              }),
-              id_cliente: reusableClienteId,
-              id_sucursales_vinculadas: sucursalLinks,
-              cliente: clienteVinculado
-            }
+        const responseBody = {
+          ok: true,
+          error: false,
+          vinculado: true,
+          message: 'Cliente existente vinculado a esta sucursal.',
+          data: {
+            ...buildAtomicSuccessData({
+              entidadTipo: 'cliente',
+              entidad: clienteVinculado,
+              idPrincipal: reusableClienteId,
+              idPersona: normalizedCliente.id_persona ?? null,
+              idEmpresa: empresaRelacionId ?? null,
+              personaCreada,
+              empresaCreada
+            }),
+            id_cliente: reusableClienteId,
+            id_sucursales_vinculadas: sucursalLinks,
+            cliente: clienteVinculado
           }
         };
+        await saveClienteCreateIdempotencySuccess({
+          client,
+          reservation: idempotencyReservation,
+          httpStatus: 200,
+          responseBody
+        });
+        await client.query('COMMIT');
+        return { status: 200, body: responseBody };
       }
 
       const resolvedTipoClienteId = await resolveTipoClienteIdAtomic(client, 2);
@@ -1351,30 +1421,34 @@ const atomicService = {
         console.warn('Clientes atomico: no se pudo cargar detalle post-creacion:', error?.message || error);
       }
 
-      await client.query('COMMIT');
-
-      return {
-        status: 201,
-        body: {
-          ok: true,
-          error: false,
-          message: 'Cliente creado en flujo atomico',
-          data: {
-            ...buildAtomicSuccessData({
-              entidadTipo: 'cliente',
-              entidad: cliente,
-              idPrincipal: idCliente,
-              idPersona: normalizedCliente.id_persona ?? null,
-              idEmpresa: empresaRelacionId ?? null,
-              personaCreada,
-              empresaCreada
-            }),
-            id_cliente: idCliente,
-            id_sucursales_vinculadas: sucursalLinks,
-            cliente
-          }
+      const responseBody = {
+        ok: true,
+        error: false,
+        message: 'Cliente creado en flujo atomico',
+        data: {
+          ...buildAtomicSuccessData({
+            entidadTipo: 'cliente',
+            entidad: cliente,
+            idPrincipal: idCliente,
+            idPersona: normalizedCliente.id_persona ?? null,
+            idEmpresa: empresaRelacionId ?? null,
+            personaCreada,
+            empresaCreada
+          }),
+          id_cliente: idCliente,
+          id_sucursales_vinculadas: sucursalLinks,
+          cliente
         }
       };
+      await saveClienteCreateIdempotencySuccess({
+        client,
+        reservation: idempotencyReservation,
+        httpStatus: 201,
+        responseBody
+      });
+      await client.query('COMMIT');
+
+      return { status: 201, body: responseBody };
     } catch (err) {
       if (Number(err?.httpStatus) === 403 && !err.code) {
         err.code = 'CLIENTE_CREATE_FORBIDDEN';

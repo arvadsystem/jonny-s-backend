@@ -2,8 +2,7 @@ import pool from '../config/db-connection.js';
 
 const DETAIL_ITEM_TYPES = Object.freeze({
   PRODUCTO: 'PRODUCTO',
-  RECETA: 'RECETA',
-  COMBO: 'COMBO'
+  RECETA: 'RECETA'
 });
 
 let detalleMenuCapabilitiesPromise = null;
@@ -14,7 +13,6 @@ const getDetalleMenuCapabilities = async (db = pool) => {
       `
         SELECT
           COALESCE(BOOL_OR(column_name = 'id_receta'), false) AS has_id_receta,
-          COALESCE(BOOL_OR(column_name = 'id_combo'), false) AS has_id_combo,
           COALESCE(BOOL_OR(column_name = 'visible'), false) AS has_visible,
           COALESCE(BOOL_OR(column_name = 'precio_publico'), false) AS has_precio_publico,
           COALESCE(BOOL_OR(column_name = 'orden'), false) AS has_orden
@@ -23,13 +21,12 @@ const getDetalleMenuCapabilities = async (db = pool) => {
           AND table_name = 'detalle_menu'
           AND column_name = ANY($1::text[]);
       `,
-      [['id_receta', 'id_combo', 'visible', 'precio_publico', 'orden']]
+      [['id_receta', 'visible', 'precio_publico', 'orden']]
     )
       .then((result) => {
         const row = result.rows?.[0] || {};
         return {
           hasIdReceta: Boolean(row.has_id_receta),
-          hasIdCombo: Boolean(row.has_id_combo),
           hasVisible: Boolean(row.has_visible),
           hasPrecioPublico: Boolean(row.has_precio_publico),
           hasOrden: Boolean(row.has_orden)
@@ -106,29 +103,6 @@ const getRecipeAutoPublicationRule = async ({ client, idReceta }) => {
   return mapPublicationRule(result.rows?.[0] || null);
 };
 
-const getComboAutoPublicationRule = async ({ client, idCombo }) => {
-  const comboId = toPositiveInt(idCombo);
-  if (!comboId) return null;
-
-  const result = await client.query(
-    `
-      SELECT mpr.visible_default, mpr.orden
-      FROM public.combos c
-      INNER JOIN public.menu_publicacion_reglas mpr
-        ON mpr.tipo_item = $2
-       AND mpr.id_tipo_departamento = c.id_tipo_departamento
-       AND COALESCE(mpr.estado, true) = true
-       AND COALESCE(mpr.autopublicar, false) = true
-      WHERE c.id_combo = $1
-        AND c.id_tipo_departamento IS NOT NULL
-      LIMIT 1;
-    `,
-    [comboId, DETAIL_ITEM_TYPES.COMBO]
-  );
-
-  return mapPublicationRule(result.rows?.[0] || null);
-};
-
 const getActivePublicMenuIdsByBranch = async ({ client, idSucursal }) => {
   const branchId = toPositiveInt(idSucursal);
   if (!branchId) return [];
@@ -150,7 +124,6 @@ const getActivePublicMenuIdsByBranch = async ({ client, idSucursal }) => {
 const resolveItemColumn = ({ tipoItem, capabilities }) => {
   if (tipoItem === DETAIL_ITEM_TYPES.PRODUCTO) return 'id_producto';
   if (tipoItem === DETAIL_ITEM_TYPES.RECETA && capabilities.hasIdReceta) return 'id_receta';
-  if (tipoItem === DETAIL_ITEM_TYPES.COMBO && capabilities.hasIdCombo) return 'id_combo';
   return '';
 };
 
@@ -231,10 +204,6 @@ const insertDetalleMenuRows = async ({ client, rows, capabilities }) => {
     columns.push('id_receta');
     selectValues.push('input.id_receta');
   }
-  if (capabilities.hasIdCombo) {
-    columns.push('id_combo');
-    selectValues.push('input.id_combo');
-  }
   if (capabilities.hasVisible) {
     columns.push('visible');
     selectValues.push('input.visible');
@@ -257,7 +226,6 @@ const insertDetalleMenuRows = async ({ client, rows, capabilities }) => {
           estado boolean,
           id_producto integer,
           id_receta integer,
-          id_combo integer,
           visible boolean,
           precio_publico numeric,
           orden integer
@@ -408,7 +376,6 @@ const ensureDetailMenuRows = async ({
 
   if (!idItem || normalizedMenuIds.length === 0) return 0;
   if (tipoItem === DETAIL_ITEM_TYPES.RECETA && !capabilities.hasIdReceta) return 0;
-  if (tipoItem === DETAIL_ITEM_TYPES.COMBO && !capabilities.hasIdCombo) return 0;
 
   const existingMenuIds = await getExistingMenuIdsForItem({
     client,
@@ -433,7 +400,6 @@ const ensureDetailMenuRows = async ({
     estado: capabilities.hasVisible ? true : Boolean(visibleDefault),
     id_producto: tipoItem === DETAIL_ITEM_TYPES.PRODUCTO ? idItem : null,
     id_receta: tipoItem === DETAIL_ITEM_TYPES.RECETA ? idItem : null,
-    id_combo: tipoItem === DETAIL_ITEM_TYPES.COMBO ? idItem : null,
     visible: Boolean(visibleDefault),
     precio_publico: null,
     orden: capabilities.hasOrden ? orderBase || nextOrderByMenu.get(menuId) || 1 : null
@@ -456,24 +422,6 @@ export const autoPublishNewRecipe = async ({
     menuIds: [idMenu],
     tipoItem: DETAIL_ITEM_TYPES.RECETA,
     idItemOrigen: idReceta,
-    visibleDefault: rule.visibleDefault,
-    preferredOrder: rule.orden ? rule.orden * 1000 : null
-  });
-};
-
-export const autoPublishNewCombo = async ({
-  client,
-  idMenu,
-  idCombo
-}) => {
-  const rule = await getComboAutoPublicationRule({ client, idCombo });
-  if (!rule) return 0;
-
-  return ensureDetailMenuRows({
-    client,
-    menuIds: [idMenu],
-    tipoItem: DETAIL_ITEM_TYPES.COMBO,
-    idItemOrigen: idCombo,
     visibleDefault: rule.visibleDefault,
     preferredOrder: rule.orden ? rule.orden * 1000 : null
   });
@@ -592,7 +540,6 @@ const movePublishedItemToMenu = async ({
     return 0;
   }
   if (tipoItem === DETAIL_ITEM_TYPES.RECETA && !capabilities.hasIdReceta) return 0;
-  if (tipoItem === DETAIL_ITEM_TYPES.COMBO && !capabilities.hasIdCombo) return 0;
 
   await deactivateDetalleMenuRowsByMenu({
     client,
@@ -665,19 +612,6 @@ export const moveRecipePublicationToMenu = async ({
   client,
   tipoItem: DETAIL_ITEM_TYPES.RECETA,
   idItemOrigen: idReceta,
-  fromMenuId,
-  toMenuId
-});
-
-export const moveComboPublicationToMenu = async ({
-  client,
-  idCombo,
-  fromMenuId,
-  toMenuId
-}) => movePublishedItemToMenu({
-  client,
-  tipoItem: DETAIL_ITEM_TYPES.COMBO,
-  idItemOrigen: idCombo,
   fromMenuId,
   toMenuId
 });

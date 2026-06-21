@@ -148,8 +148,8 @@ const parseFilters = (query = {}) => {
   }
 
   const tipoItem = String(filters.tipo_item || '').trim().toLowerCase();
-  if (tipoItem && !['producto', 'insumo', 'combo', 'receta', 'todos'].includes(tipoItem)) {
-    return { ok: false, message: 'El filtro tipo_item solo permite: producto, insumo, combo, receta o todos.' };
+  if (tipoItem && !['producto', 'insumo', 'receta', 'todos'].includes(tipoItem)) {
+    return { ok: false, message: 'El filtro tipo_item solo permite: producto, insumo, receta o todos.' };
   }
 
   const soloCriticosRaw = String(filters.solo_criticos || '').trim().toLowerCase();
@@ -1980,10 +1980,10 @@ const getVentasItems = async (req, res, filters, parsedFilters) => {
   const where = [];
 
   const tipoItem = String(parsedFilters.tipo_item || 'todos').trim().toLowerCase();
-  if (!['producto', 'combo', 'receta', 'todos'].includes(tipoItem)) {
+  if (!['producto', 'receta', 'todos'].includes(tipoItem)) {
     return res.status(400).json({
       error: true,
-      message: 'El filtro tipo_item solo permite: producto, combo, receta o todos.'
+      message: 'El filtro tipo_item solo permite: producto, receta o todos.'
     });
   }
 
@@ -2046,7 +2046,7 @@ const getVentasItems = async (req, res, filters, parsedFilters) => {
   }
 
   if (parsedFilters.categoria) {
-    if (tipoItem === 'combo' || tipoItem === 'receta') {
+    if (tipoItem === 'receta') {
       return res.status(400).json({
         error: true,
         message: 'El filtro categoria solo aplica para tipo_item producto en este reporte.'
@@ -2123,12 +2123,11 @@ const getVentasItems = async (req, res, filters, parsedFilters) => {
         COALESCE(ep.descripcion, 'VENTA DIRECTA') AS estado,
         CASE
           WHEN dp.id_producto IS NOT NULL THEN 'PRODUCTO'
-          WHEN dp.id_combo IS NOT NULL THEN 'COMBO'
           WHEN dp.id_receta IS NOT NULL THEN 'RECETA'
           ELSE 'OTRO'
         END AS tipo_item,
-        COALESCE(dp.id_producto, dp.id_combo, dp.id_receta) AS id_item,
-        COALESCE(prod.nombre_producto, cb.nombre_combo, rc.nombre_receta, 'Item') AS nombre_item,
+        COALESCE(dp.id_producto, dp.id_receta) AS id_item,
+        COALESCE(prod.nombre_producto, rc.nombre_receta, 'Item') AS nombre_item,
         prod.id_categoria_producto,
         cp.nombre_categoria AS categoria,
         COALESCE(
@@ -2138,13 +2137,6 @@ const getVentasItems = async (req, res, filters, parsedFilters) => {
               ROUND(
                 COALESCE(NULLIF(dp.sub_total_pedido, 0), dp.total_pedido, 0)
                 / NULLIF(prod.precio, 0)
-              )::int
-            )
-            WHEN dp.id_combo IS NOT NULL THEN GREATEST(
-              1,
-              ROUND(
-                COALESCE(NULLIF(dp.sub_total_pedido, 0), dp.total_pedido, 0)
-                / NULLIF(cb.precio, 0)
               )::int
             )
             WHEN dp.id_receta IS NOT NULL THEN GREATEST(
@@ -2166,13 +2158,6 @@ const getVentasItems = async (req, res, filters, parsedFilters) => {
                 ROUND(
                   COALESCE(NULLIF(dp.sub_total_pedido, 0), dp.total_pedido, 0)
                   / NULLIF(prod.precio, 0)
-                )::int
-              )
-              WHEN dp.id_combo IS NOT NULL THEN GREATEST(
-                1,
-                ROUND(
-                  COALESCE(NULLIF(dp.sub_total_pedido, 0), dp.total_pedido, 0)
-                  / NULLIF(cb.precio, 0)
                 )::int
               )
               WHEN dp.id_receta IS NOT NULL THEN GREATEST(
@@ -2198,13 +2183,6 @@ const getVentasItems = async (req, res, filters, parsedFilters) => {
                       / NULLIF(prod.precio, 0)
                     )::int
                   )
-                  WHEN dp.id_combo IS NOT NULL THEN GREATEST(
-                    1,
-                    ROUND(
-                      COALESCE(NULLIF(dp.sub_total_pedido, 0), dp.total_pedido, 0)
-                      / NULLIF(cb.precio, 0)
-                    )::int
-                  )
                   WHEN dp.id_receta IS NOT NULL THEN GREATEST(
                     1,
                     ROUND(
@@ -2228,7 +2206,6 @@ const getVentasItems = async (req, res, filters, parsedFilters) => {
       INNER JOIN detalle_pedido dp ON dp.id_pedido = p.id_pedido
       LEFT JOIN productos prod ON prod.id_producto = dp.id_producto
       LEFT JOIN categorias_productos cp ON cp.id_categoria_producto = prod.id_categoria_producto
-      LEFT JOIN combos cb ON cb.id_combo = dp.id_combo
       LEFT JOIN recetas rc ON rc.id_receta = dp.id_receta
       LEFT JOIN descuentos d2 ON d2.id_descuento = dp.id_descuento
       LEFT JOIN estados_pedido ep ON ep.id_estado_pedido = p.id_estado_pedido
@@ -2340,7 +2317,7 @@ const getVentasItems = async (req, res, filters, parsedFilters) => {
       }))
     },
     meta: {
-      fuente_canonica: 'facturas + detalle_facturas + pedidos + detalle_pedido + productos + combos + recetas + categorias_productos',
+      fuente_canonica: 'facturas + detalle_facturas + pedidos + detalle_pedido + productos + recetas + categorias_productos',
       generado_en: new Date().toISOString()
     }
   });

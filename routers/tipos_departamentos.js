@@ -318,13 +318,12 @@ router.get('/tipo_departamento', checkPermission(MENU_DEPARTAMENTOS_VIEW_PERMISS
         td.orden_menu,
         td.codigo_departamento,
         COALESCE(recetas.cantidad_recetas, 0)::int AS cantidad_recetas,
-        COALESCE(combos.cantidad_combos, 0)::int AS cantidad_combos,
         regla.id_menu_publicacion_regla,
         COALESCE(regla.estado, false) AS regla_publicacion_activa,
         CASE
           WHEN COALESCE(td.estado, true) = false THEN 'INACTIVO'
           WHEN regla.id_menu_publicacion_regla IS NULL THEN 'NO_PUBLICADO'
-          WHEN COALESCE(recetas.cantidad_recetas, 0) + COALESCE(combos.cantidad_combos, 0) = 0 THEN 'SIN_CONTENIDO'
+          WHEN COALESCE(recetas.cantidad_recetas, 0) = 0 THEN 'SIN_CONTENIDO'
           WHEN COALESCE(regla.estado, false) = false THEN 'SIN_PUBLICACION'
           ELSE 'VISIBLE'
         END AS visibilidad_publica
@@ -336,17 +335,11 @@ router.get('/tipo_departamento', checkPermission(MENU_DEPARTAMENTOS_VIEW_PERMISS
           AND COALESCE(r.estado, true) = true
       ) recetas ON true
       LEFT JOIN LATERAL (
-        SELECT COUNT(*)::int AS cantidad_combos
-        FROM combos c
-        WHERE c.id_tipo_departamento = td.id_tipo_departamento
-          AND COALESCE(c.estado, true) = true
-      ) combos ON true
-      LEFT JOIN LATERAL (
         SELECT
           id_menu_publicacion_regla,
           COALESCE(estado, true) AS estado
         FROM public.menu_publicacion_reglas mpr
-        WHERE mpr.tipo_item IN ('RECETA', 'COMBO')
+        WHERE mpr.tipo_item = 'RECETA'
           AND mpr.id_tipo_departamento = td.id_tipo_departamento
         ORDER BY
           CASE WHEN mpr.tipo_item = 'RECETA' THEN 0 ELSE 1 END,

@@ -30,7 +30,8 @@ const parseOptionalPositiveNumber = (value) => {
 
 const parseMoney = (value) => {
   const parsed = Number(value);
-  return Number.isFinite(parsed) && parsed >= 0 ? parsed : NaN;
+  if (!Number.isFinite(parsed) || parsed < 0) return NaN;
+  return Number((Math.round((parsed + Number.EPSILON) * 100) / 100).toFixed(2));
 };
 
 const toSlugCode = (value) =>
@@ -118,7 +119,6 @@ const normalizeExtraPayload = (payload = {}) => {
       orden: Number.isFinite(Number(payload.orden)) ? Number(payload.orden) : 0,
       estado: payload.estado === undefined ? true : Boolean(payload.estado),
       recetas: normalizePositiveIdList(payload.recetas || payload.id_recetas),
-      combos: normalizePositiveIdList(payload.combos || payload.id_combos),
       id_almacenes: idAlmacenes
     }
   };
@@ -156,23 +156,6 @@ const validateExtraFks = async (client, data) => {
     const missing = data.recetas.filter((id) => !found.has(id));
     if (missing.length) {
       return { ok: false, status: 400, message: `Recetas invalidas o inactivas: ${missing.join(', ')}` };
-    }
-  }
-
-  if (data.combos.length) {
-    const combos = await client.query(
-      `
-        SELECT id_combo
-        FROM combos
-        WHERE id_combo = ANY($1::int[])
-          AND COALESCE(estado, true) = true
-      `,
-      [data.combos]
-    );
-    const found = new Set(combos.rows.map((row) => Number(row.id_combo)));
-    const missing = data.combos.filter((id) => !found.has(id));
-    if (missing.length) {
-      return { ok: false, status: 400, message: `Combos invalidos o inactivos: ${missing.join(', ')}` };
     }
   }
 
@@ -256,27 +239,6 @@ const replaceExtraRecipes = async (client, idExtra, recipeIds = []) => {
       idExtra,
       JSON.stringify(normalized.map((idReceta, index) => ({ id_receta: idReceta, orden: index + 1 })))
     ]
-  );
-};
-
-const replaceExtraCombos = async (client, idExtra, comboIds = []) => {
-  await client.query('UPDATE menu_extra_combo SET estado = false, fecha_actualizacion = NOW() WHERE id_extra = $1', [idExtra]);
-  const normalized = normalizePositiveIdList(comboIds);
-  if (normalized.length === 0) return;
-
-  await client.query(
-    `
-      INSERT INTO menu_extra_combo (id_extra, id_combo, estado, fecha_actualizacion)
-      SELECT
-        $1,
-        UNNEST($2::int[]),
-        true,
-        NOW()
-      ON CONFLICT (id_combo, id_extra) DO UPDATE
-      SET estado = true,
-          fecha_actualizacion = NOW()
-    `,
-    [idExtra, normalized]
   );
 };
 
@@ -401,7 +363,17 @@ const getHydratedExtraById = async (client, idExtra) => {
   const extraResult = await client.query(
     `
       SELECT
-        me.*,
+        me.id_extra,
+        me.codigo,
+        me.nombre,
+        ROUND(CAST(me.precio_adicional AS numeric), 2) AS precio_adicional,
+        me.id_insumo,
+        me.cant,
+        me.id_unidad_medida,
+        me.orden,
+        me.estado,
+        me.fecha_creacion,
+        me.fecha_actualizacion,
         i.nombre_insumo,
         um.nombre AS unidad_nombre,
         um.simbolo AS unidad_simbolo
@@ -416,7 +388,7 @@ const getHydratedExtraById = async (client, idExtra) => {
 
   if (!extraResult.rowCount) return null;
 
-  const [recetas, combos, assignments] = await Promise.all([
+  const [recetas, assignments] = await Promise.all([
     client.query(
       `
         SELECT id_receta
@@ -427,16 +399,6 @@ const getHydratedExtraById = async (client, idExtra) => {
       `,
       [idExtra]
     ),
-    client.query(
-      `
-        SELECT id_combo
-        FROM menu_extra_combo
-        WHERE id_extra = $1
-          AND COALESCE(estado, true) = true
-        ORDER BY id_menu_extra_combo
-      `,
-      [idExtra]
-    ),
     listExtraAssignments(client, idExtra)
   ]);
 
@@ -444,7 +406,6 @@ const getHydratedExtraById = async (client, idExtra) => {
   return {
     ...hydrated,
     recetas: recetas.rows.map((row) => Number(row.id_receta)),
-    combos: combos.rows.map((row) => Number(row.id_combo)),
     asignaciones: assignments
   };
 };
@@ -469,7 +430,7 @@ router.get('/', checkPermission(MENU_EXTRAS_VIEW_PERMISSIONS), async (req, res) 
           me.id_extra,
           me.codigo,
           me.nombre,
-          me.precio_adicional,
+          ROUND(CAST(me.precio_adicional AS numeric), 2) AS precio_adicional,
           me.id_insumo,
           i.nombre_insumo,
           me.cant,
@@ -478,8 +439,7 @@ router.get('/', checkPermission(MENU_EXTRAS_VIEW_PERMISSIONS), async (req, res) 
           um.simbolo AS unidad_simbolo,
           me.orden,
           me.estado,
-          COALESCE(recipe_count.total_recetas, 0)::int AS total_recetas,
-          COALESCE(combo_count.total_combos, 0)::int AS total_combos
+          COALESCE(recipe_count.total_recetas, 0)::int AS total_recetas
         FROM menu_extras me
         LEFT JOIN insumos i ON i.id_insumo = me.id_insumo
         LEFT JOIN unidades_medida um ON um.id_unidad_medida = me.id_unidad_medida
@@ -489,12 +449,6 @@ router.get('/', checkPermission(MENU_EXTRAS_VIEW_PERMISSIONS), async (req, res) 
           WHERE COALESCE(estado, true) = true
           GROUP BY id_extra
         ) recipe_count ON recipe_count.id_extra = me.id_extra
-        LEFT JOIN (
-          SELECT id_extra, COUNT(*)::int AS total_combos
-          FROM menu_extra_combo
-          WHERE COALESCE(estado, true) = true
-          GROUP BY id_extra
-        ) combo_count ON combo_count.id_extra = me.id_extra
         WHERE ($1::boolean = true OR COALESCE(me.estado, true) = true)
         ORDER BY COALESCE(me.orden, 0), me.nombre
       `,
@@ -549,26 +503,6 @@ router.get('/catalogos/recetas', checkPermission(MENU_EXTRAS_VIEW_PERMISSIONS), 
   }
 });
 
-router.get('/catalogos/combos', checkPermission(MENU_EXTRAS_VIEW_PERMISSIONS), async (req, res) => {
-  try {
-    const result = await pool.query(
-      `
-        SELECT
-          id_combo,
-          COALESCE(NULLIF(nombre_combo, ''), NULLIF(descripcion, ''), CONCAT('Combo #', id_combo::text)) AS nombre_combo,
-          precio
-        FROM combos
-        WHERE COALESCE(estado, true) = true
-        ORDER BY nombre_combo ASC
-      `
-    );
-    return res.status(200).json(result.rows || []);
-  } catch (err) {
-    console.error('Error al listar combos para extras:', err.message);
-    return res.status(500).json({ error: true, message: 'No se pudieron cargar los combos.' });
-  }
-});
-
 router.get('/catalogos/almacenes', checkPermission(MENU_EXTRAS_VIEW_PERMISSIONS), async (req, res) => {
   try {
     const result = await pool.query(
@@ -612,6 +546,7 @@ router.get('/:id_extra/asignaciones', checkPermission(MENU_EXTRAS_VIEW_PERMISSIO
 
 router.put('/:id_extra/asignaciones', checkPermission(MENU_EXTRAS_EDIT_PERMISSIONS), async (req, res) => {
   const client = await pool.connect();
+  let txStarted = false;
   try {
     const idExtra = Number(req.params.id_extra);
     if (!isPositiveInt(idExtra)) {
@@ -628,9 +563,12 @@ router.put('/:id_extra/asignaciones', checkPermission(MENU_EXTRAS_EDIT_PERMISSIO
     }
 
     await client.query('BEGIN');
+    txStarted = true;
     await replaceExtraAlmacenes(client, idExtra, idAlmacenes);
-    const extra = await getHydratedExtraById(client, idExtra);
     await client.query('COMMIT');
+    txStarted = false;
+
+    const extra = await getHydratedExtraById(pool, idExtra);
 
     return res.status(200).json({
       error: false,
@@ -640,7 +578,10 @@ router.put('/:id_extra/asignaciones', checkPermission(MENU_EXTRAS_EDIT_PERMISSIO
       extra
     });
   } catch (err) {
-    try { await client.query('ROLLBACK'); } catch {}
+    if (txStarted) {
+      try { await client.query('ROLLBACK'); } catch {}
+      txStarted = false;
+    }
     console.error('Error al reemplazar asignaciones de extra:', err.message);
     return res.status(500).json({ error: true, message: 'No se pudieron actualizar las sucursales del extra.' });
   } finally {
@@ -650,6 +591,7 @@ router.put('/:id_extra/asignaciones', checkPermission(MENU_EXTRAS_EDIT_PERMISSIO
 
 router.post('/:id_extra/asignaciones', checkPermission(MENU_EXTRAS_EDIT_PERMISSIONS), async (req, res) => {
   const client = await pool.connect();
+  let txStarted = false;
   try {
     const idExtra = Number(req.params.id_extra);
     const idAlmacen = Number(req.body?.id_almacen);
@@ -685,6 +627,7 @@ router.post('/:id_extra/asignaciones', checkPermission(MENU_EXTRAS_EDIT_PERMISSI
     }
 
     await client.query('BEGIN');
+    txStarted = true;
     await client.query(
       `
         INSERT INTO menu_extra_almacenes (id_extra, id_almacen, estado, fecha_actualizacion)
@@ -695,6 +638,7 @@ router.post('/:id_extra/asignaciones', checkPermission(MENU_EXTRAS_EDIT_PERMISSI
       [idExtra, idAlmacen]
     );
     await client.query('COMMIT');
+    txStarted = false;
 
     return res.status(201).json({
       error: false,
@@ -703,7 +647,10 @@ router.post('/:id_extra/asignaciones', checkPermission(MENU_EXTRAS_EDIT_PERMISSI
       id_almacen: idAlmacen
     });
   } catch (err) {
-    try { await client.query('ROLLBACK'); } catch {}
+    if (txStarted) {
+      try { await client.query('ROLLBACK'); } catch {}
+      txStarted = false;
+    }
     console.error('Error al crear asignacion de extra:', err.message);
     return res.status(500).json({ error: true, message: 'No se pudo crear la asignacion del extra.' });
   } finally {
@@ -713,6 +660,7 @@ router.post('/:id_extra/asignaciones', checkPermission(MENU_EXTRAS_EDIT_PERMISSI
 
 router.patch('/:id_extra/asignaciones/:id_almacen/inactivar', checkPermission(MENU_EXTRAS_DELETE_PERMISSIONS), async (req, res) => {
   const client = await pool.connect();
+  let txStarted = false;
   try {
     const idExtra = Number(req.params.id_extra);
     const idAlmacen = Number(req.params.id_almacen);
@@ -738,6 +686,7 @@ router.patch('/:id_extra/asignaciones/:id_almacen/inactivar', checkPermission(ME
     }
 
     await client.query('BEGIN');
+    txStarted = true;
     await client.query(
       `
         UPDATE menu_extra_almacenes
@@ -749,6 +698,7 @@ router.patch('/:id_extra/asignaciones/:id_almacen/inactivar', checkPermission(ME
       [idExtra, idAlmacen]
     );
     await client.query('COMMIT');
+    txStarted = false;
 
     return res.status(200).json({
       error: false,
@@ -759,7 +709,10 @@ router.patch('/:id_extra/asignaciones/:id_almacen/inactivar', checkPermission(ME
       id_almacen: idAlmacen
     });
   } catch (err) {
-    try { await client.query('ROLLBACK'); } catch {}
+    if (txStarted) {
+      try { await client.query('ROLLBACK'); } catch {}
+      txStarted = false;
+    }
     console.error('Error al inactivar asignacion de extra:', err.message);
     return res.status(500).json({ error: true, message: 'No se pudo inactivar la asignacion del extra.' });
   } finally {
@@ -784,6 +737,7 @@ router.get('/:id_extra', checkPermission(MENU_EXTRAS_VIEW_PERMISSIONS), async (r
 
 router.post('/', checkPermission(MENU_EXTRAS_CREATE_PERMISSIONS), async (req, res) => {
   const client = await pool.connect();
+  let txStarted = false;
   try {
     const normalized = normalizeExtraPayload(req.body);
     if (!normalized.ok) return res.status(400).json({ error: true, message: normalized.message });
@@ -798,6 +752,7 @@ router.post('/', checkPermission(MENU_EXTRAS_CREATE_PERMISSIONS), async (req, re
     }
 
     await client.query('BEGIN');
+    txStarted = true;
     const created = await client.query(
       `
         INSERT INTO menu_extras (
@@ -818,14 +773,18 @@ router.post('/', checkPermission(MENU_EXTRAS_CREATE_PERMISSIONS), async (req, re
     );
     const idExtra = Number(created.rows[0].id_extra);
     await replaceExtraRecipes(client, idExtra, normalized.data.recetas);
-    await replaceExtraCombos(client, idExtra, normalized.data.combos);
     await replaceExtraAlmacenes(client, idExtra, normalized.data.id_almacenes);
-    const extra = await getHydratedExtraById(client, idExtra);
     await client.query('COMMIT');
+    txStarted = false;
+
+    const extra = await getHydratedExtraById(pool, idExtra);
 
     return res.status(201).json({ error: false, message: 'Extra creado correctamente.', id_extra: idExtra, extra });
   } catch (err) {
-    try { await client.query('ROLLBACK'); } catch {}
+    if (txStarted) {
+      try { await client.query('ROLLBACK'); } catch {}
+      txStarted = false;
+    }
     console.error('Error al crear extra admin:', err.message);
     if (err?.code === '23505') {
       return res.status(409).json({ error: true, message: 'Ya existe un extra con ese codigo.' });
@@ -838,6 +797,7 @@ router.post('/', checkPermission(MENU_EXTRAS_CREATE_PERMISSIONS), async (req, re
 
 router.put('/:id_extra', checkPermission(MENU_EXTRAS_EDIT_PERMISSIONS), async (req, res) => {
   const client = await pool.connect();
+  let txStarted = false;
   try {
     const idExtra = Number(req.params.id_extra);
     if (!isPositiveInt(idExtra)) {
@@ -859,6 +819,7 @@ router.put('/:id_extra', checkPermission(MENU_EXTRAS_EDIT_PERMISSIONS), async (r
     }
 
     await client.query('BEGIN');
+    txStarted = true;
     await client.query(
       `
         UPDATE menu_extras
@@ -886,14 +847,18 @@ router.put('/:id_extra', checkPermission(MENU_EXTRAS_EDIT_PERMISSIONS), async (r
       ]
     );
     await replaceExtraRecipes(client, idExtra, normalized.data.recetas);
-    await replaceExtraCombos(client, idExtra, normalized.data.combos);
     await replaceExtraAlmacenes(client, idExtra, normalized.data.id_almacenes);
-    const extra = await getHydratedExtraById(client, idExtra);
     await client.query('COMMIT');
+    txStarted = false;
+
+    const extra = await getHydratedExtraById(pool, idExtra);
 
     return res.status(200).json({ error: false, message: 'Extra actualizado correctamente.', extra });
   } catch (err) {
-    try { await client.query('ROLLBACK'); } catch {}
+    if (txStarted) {
+      try { await client.query('ROLLBACK'); } catch {}
+      txStarted = false;
+    }
     console.error('Error al actualizar extra admin:', err.message);
     if (err?.code === '23505') {
       return res.status(409).json({ error: true, message: 'Ya existe un extra con ese codigo.' });

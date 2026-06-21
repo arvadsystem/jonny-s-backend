@@ -1,18 +1,71 @@
 import { isCatalogoMaestroReadsEnabled } from '../../../services/catalogoMaestroReadService.js';
 
-const toPositiveInt = (value) => {
+export const toPositiveInventoryInt = (value) => {
   const parsed = Number.parseInt(String(value ?? ''), 10);
   return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : null;
 };
 
-const toPositiveNumber = (value) => {
+export const toPositiveInventoryNumber = (value) => {
   const parsed = Number(value);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
 };
 
 const normalizeMappingStatus = (value) => String(value || '').trim().toUpperCase();
 
-const UNAVAILABLE_MESSAGES = Object.freeze({
+export const fetchVentaGlobalExtrasCatalog = async ({ queryRunner, idSucursal, extraIds = null } = {}) => {
+  if (!queryRunner?.query) throw new TypeError('queryRunner es requerido para cargar extras globales.');
+
+  const branchId = toPositiveInventoryInt(idSucursal);
+  if (!branchId) return [];
+
+  const normalizedExtraIds = Array.isArray(extraIds)
+    ? [...new Set(extraIds.map((id) => toPositiveInventoryInt(id)).filter(Boolean))]
+    : [];
+
+  const result = await queryRunner.query(
+    `
+      SELECT DISTINCT ON (me.id_extra)
+        me.id_extra,
+        me.codigo,
+        me.nombre,
+        me.precio_adicional AS precio,
+        COALESCE(me.estado, true) AS estado,
+        me.id_insumo,
+        i.nombre_insumo,
+        me.cant,
+        me.id_unidad_medida,
+        COALESCE(NULLIF(TRIM(um.simbolo), ''), NULLIF(TRIM(um.nombre), ''), 'unidad') AS unidad_medida,
+        mea.id_almacen,
+        a.id_sucursal
+      FROM public.menu_extras me
+      INNER JOIN public.menu_extra_almacenes mea
+        ON mea.id_extra = me.id_extra
+       AND COALESCE(mea.estado, true) = true
+      INNER JOIN public.almacenes a
+        ON a.id_almacen = mea.id_almacen
+       AND COALESCE(a.estado, true) = true
+       AND a.id_sucursal = $1
+      INNER JOIN public.sucursales s
+        ON s.id_sucursal = a.id_sucursal
+       AND COALESCE(s.estado, true) = true
+      LEFT JOIN public.insumos i
+        ON i.id_insumo = me.id_insumo
+      LEFT JOIN public.unidades_medida um
+        ON um.id_unidad_medida = me.id_unidad_medida
+      WHERE COALESCE(me.estado, true) = true
+        AND (
+          cardinality($2::int[]) = 0
+          OR me.id_extra = ANY($2::int[])
+        )
+      ORDER BY me.id_extra, mea.id_almacen
+    `,
+    [branchId, normalizedExtraIds]
+  );
+
+  return Array.isArray(result.rows) ? result.rows : [];
+};
+
+export const EXTRA_INVENTORY_UNAVAILABLE_MESSAGES = Object.freeze({
   EXTRA_INSUMO_NO_CONFIGURADO: 'Este extra requiere configurar su inventario.',
   EXTRA_INSUMO_NO_ENCONTRADO: 'Este extra no tiene un insumo de inventario valido.',
   EXTRA_INSUMO_INACTIVO: 'El insumo de este extra esta inactivo.',
@@ -30,16 +83,16 @@ const UNAVAILABLE_MESSAGES = Object.freeze({
 
 const buildBaseResult = (extra, { useMasterCatalog, idSucursal }) => ({
   ...extra,
-  id_extra: toPositiveInt(extra?.id_extra),
-  id_insumo_configurado: toPositiveInt(extra?.id_insumo),
+  id_extra: toPositiveInventoryInt(extra?.id_extra),
+  id_insumo_configurado: toPositiveInventoryInt(extra?.id_insumo),
   id_insumo_maestro: null,
   id_insumo_legacy: null,
   id_almacen: null,
-  id_sucursal: toPositiveInt(idSucursal),
+  id_sucursal: toPositiveInventoryInt(idSucursal),
   stock_disponible: null,
   stock_minimo: null,
-  cantidad_consumo_configurada: toPositiveNumber(extra?.cant),
-  id_unidad_consumo: toPositiveInt(extra?.id_unidad_medida),
+  cantidad_consumo_configurada: toPositiveInventoryNumber(extra?.cant),
+  id_unidad_consumo: toPositiveInventoryInt(extra?.id_unidad_medida),
   cantidad_consumo_base: null,
   id_unidad_base: null,
   inventario_configurado: false,
@@ -54,13 +107,13 @@ const markUnavailable = (result, code, { preserveInventoryConfiguration = false 
   inventario_configurado: preserveInventoryConfiguration ? Boolean(result.inventario_configurado) : false,
   disponible: false,
   codigo_no_disponible: code,
-  motivo_no_disponible: UNAVAILABLE_MESSAGES[code] || 'Este extra no esta disponible.'
+  motivo_no_disponible: EXTRA_INVENTORY_UNAVAILABLE_MESSAGES[code] || 'Este extra no esta disponible.'
 });
 
-const groupBy = (rows, field) => {
+export const groupInventoryRowsBy = (rows, field) => {
   const grouped = new Map();
   for (const row of Array.isArray(rows) ? rows : []) {
-    const key = toPositiveInt(row?.[field]);
+    const key = toPositiveInventoryInt(row?.[field]);
     if (!key) continue;
     if (!grouped.has(key)) grouped.set(key, []);
     grouped.get(key).push(row);
@@ -69,8 +122,8 @@ const groupBy = (rows, field) => {
 };
 
 const loadExtraAssignmentsByBranch = async ({ queryRunner, extraIds = [], idSucursal, mode }) => {
-  const branchId = toPositiveInt(idSucursal);
-  const ids = [...new Set((Array.isArray(extraIds) ? extraIds : []).map((id) => toPositiveInt(id)).filter(Boolean))];
+  const branchId = toPositiveInventoryInt(idSucursal);
+  const ids = [...new Set((Array.isArray(extraIds) ? extraIds : []).map((id) => toPositiveInventoryInt(id)).filter(Boolean))];
   if (!branchId || ids.length === 0) return null;
 
   try {
@@ -96,7 +149,7 @@ const loadExtraAssignmentsByBranch = async ({ queryRunner, extraIds = [], idSucu
 };
 
 const resolveLegacyExtrasInventory = async ({ queryRunner, extras, idSucursal }) => {
-  const configuredIds = [...new Set(extras.map((extra) => toPositiveInt(extra?.id_insumo)).filter(Boolean))];
+  const configuredIds = [...new Set(extras.map((extra) => toPositiveInventoryInt(extra?.id_insumo)).filter(Boolean))];
   const inventoryById = new Map();
   const assignmentsByBranch = await loadExtraAssignmentsByBranch({
     queryRunner,
@@ -143,8 +196,8 @@ const resolveLegacyExtrasInventory = async ({ queryRunner, extras, idSucursal })
     const row = inventoryById.get(configuredId);
     if (!row) return markUnavailable(resolved, 'EXTRA_INSUMO_NO_ENCONTRADO');
     if (row.estado !== true) return markUnavailable(resolved, 'EXTRA_INSUMO_INACTIVO');
-    const branchId = toPositiveInt(row.id_sucursal);
-    if (!toPositiveInt(row.id_almacen) || row.almacen_estado !== true || (toPositiveInt(idSucursal) && branchId !== toPositiveInt(idSucursal))) {
+    const branchId = toPositiveInventoryInt(row.id_sucursal);
+    if (!toPositiveInventoryInt(row.id_almacen) || row.almacen_estado !== true || (toPositiveInventoryInt(idSucursal) && branchId !== toPositiveInventoryInt(idSucursal))) {
       return markUnavailable(resolved, 'EXTRA_INSUMO_SIN_ASIGNACION_SUCURSAL');
     }
     if (!resolved.cantidad_consumo_configurada) return markUnavailable(resolved, 'EXTRA_CANTIDAD_CONSUMO_INVALIDA');
@@ -153,7 +206,7 @@ const resolveLegacyExtrasInventory = async ({ queryRunner, extras, idSucursal })
     resolved = {
       ...resolved,
       id_insumo_legacy: configuredId,
-      id_almacen: toPositiveInt(row.id_almacen),
+      id_almacen: toPositiveInventoryInt(row.id_almacen),
       id_sucursal: branchId,
       stock_disponible: Number(row.cantidad ?? 0),
       stock_minimo: Number(row.stock_minimo ?? 0),
@@ -177,8 +230,8 @@ const mappingFailureCode = (status) => {
 };
 
 const resolveMasterExtrasInventory = async ({ queryRunner, extras, idSucursal, mode }) => {
-  const branchId = toPositiveInt(idSucursal);
-  const configuredIds = [...new Set(extras.map((extra) => toPositiveInt(extra?.id_insumo)).filter(Boolean))];
+  const branchId = toPositiveInventoryInt(idSucursal);
+  const configuredIds = [...new Set(extras.map((extra) => toPositiveInventoryInt(extra?.id_insumo)).filter(Boolean))];
   const assignmentsByBranch = await loadExtraAssignmentsByBranch({
     queryRunner,
     extraIds: extras.map((extra) => extra?.id_extra),
@@ -203,8 +256,8 @@ const resolveMasterExtrasInventory = async ({ queryRunner, extras, idSucursal, m
         [configuredIds]
       )
     : { rows: [] };
-  const mappingsByLegacyId = groupBy(mappingResult.rows, 'id_insumo_legacy');
-  const mappedMasterIds = (mappingResult.rows || []).map((row) => toPositiveInt(row.id_insumo_maestro)).filter(Boolean);
+  const mappingsByLegacyId = groupInventoryRowsBy(mappingResult.rows, 'id_insumo_legacy');
+  const mappedMasterIds = (mappingResult.rows || []).map((row) => toPositiveInventoryInt(row.id_insumo_maestro)).filter(Boolean);
   const candidateIds = [...new Set([...configuredIds, ...mappedMasterIds])];
 
   const [insumosResult, assignmentsResult] = candidateIds.length > 0
@@ -241,7 +294,7 @@ const resolveMasterExtrasInventory = async ({ queryRunner, extras, idSucursal, m
     : [{ rows: [] }, { rows: [] }];
 
   const insumosById = new Map((insumosResult.rows || []).map((row) => [Number(row.id_insumo), row]));
-  const assignmentsByInsumo = groupBy(assignmentsResult.rows, 'id_insumo');
+  const assignmentsByInsumo = groupInventoryRowsBy(assignmentsResult.rows, 'id_insumo');
   const resolvedMasterIds = new Set();
   const preliminary = extras.map((extra) => {
     let result = buildBaseResult(extra, { useMasterCatalog: true, idSucursal: branchId });
@@ -273,7 +326,7 @@ const resolveMasterExtrasInventory = async ({ queryRunner, extras, idSucursal, m
     const mappingStatus = normalizeMappingStatus(mapping.estado_migracion);
     if (mappingStatus !== 'VALIDADO') return markUnavailable(result, mappingFailureCode(mappingStatus));
 
-    const masterId = toPositiveInt(mapping.id_insumo_maestro);
+    const masterId = toPositiveInventoryInt(mapping.id_insumo_maestro);
     const master = masterId ? insumosById.get(masterId) : null;
     if (!master) return markUnavailable(result, 'EXTRA_INSUMO_NO_ENCONTRADO');
     if (master.estado !== true) return markUnavailable(result, 'EXTRA_INSUMO_INACTIVO');
@@ -289,7 +342,7 @@ const resolveMasterExtrasInventory = async ({ queryRunner, extras, idSucursal, m
   for (const entry of preliminary) {
     if (!entry?.result) continue;
     const consumptionUnitId = entry.result.id_unidad_consumo;
-    const baseUnitId = toPositiveInt(entry.insumo?.id_unidad_medida);
+    const baseUnitId = toPositiveInventoryInt(entry.insumo?.id_unidad_medida);
     if (consumptionUnitId) unitIds.add(consumptionUnitId);
     if (baseUnitId) unitIds.add(baseUnitId);
   }
@@ -322,7 +375,7 @@ const resolveMasterExtrasInventory = async ({ queryRunner, extras, idSucursal, m
         )
       : Promise.resolve({ rows: [] })
   ]);
-  const presentationsByInsumo = groupBy(presentationsResult.rows, 'id_insumo');
+  const presentationsByInsumo = groupInventoryRowsBy(presentationsResult.rows, 'id_insumo');
   const validUnitIds = new Set((unitsResult.rows || []).map((row) => Number(row.id_unidad_medida)));
 
   return preliminary.map((entry) => {
@@ -330,7 +383,7 @@ const resolveMasterExtrasInventory = async ({ queryRunner, extras, idSucursal, m
     let { result } = entry;
     const configuredQty = result.cantidad_consumo_configurada;
     const consumptionUnitId = result.id_unidad_consumo;
-    const baseUnitId = toPositiveInt(entry.insumo?.id_unidad_medida);
+    const baseUnitId = toPositiveInventoryInt(entry.insumo?.id_unidad_medida);
     if (!configuredQty) return markUnavailable(result, 'EXTRA_CANTIDAD_CONSUMO_INVALIDA');
     if (!consumptionUnitId || !baseUnitId || !validUnitIds.has(consumptionUnitId) || !validUnitIds.has(baseUnitId)) {
       return markUnavailable(result, 'EXTRA_UNIDAD_NO_CONFIGURADA');
@@ -339,10 +392,10 @@ const resolveMasterExtrasInventory = async ({ queryRunner, extras, idSucursal, m
     let baseQty = configuredQty;
     if (consumptionUnitId !== baseUnitId) {
       const compatible = (presentationsByInsumo.get(entry.masterId) || []).filter((row) =>
-        toPositiveInt(row.id_unidad_presentacion) === consumptionUnitId
-        && toPositiveInt(row.id_unidad_base) === baseUnitId
-        && toPositiveNumber(row.cantidad_presentacion)
-        && toPositiveNumber(row.cantidad_base)
+        toPositiveInventoryInt(row.id_unidad_presentacion) === consumptionUnitId
+        && toPositiveInventoryInt(row.id_unidad_base) === baseUnitId
+        && toPositiveInventoryNumber(row.cantidad_presentacion)
+        && toPositiveInventoryNumber(row.cantidad_base)
       );
       if (compatible.length === 0) return markUnavailable(result, 'EXTRA_UNIDAD_SIN_CONVERSION');
       if (compatible.length > 1) return markUnavailable(result, 'EXTRA_UNIDAD_CONVERSION_AMBIGUA');
@@ -354,8 +407,8 @@ const resolveMasterExtrasInventory = async ({ queryRunner, extras, idSucursal, m
       ...result,
       id_insumo_maestro: entry.masterId,
       id_insumo_legacy: entry.legacyId,
-      id_almacen: toPositiveInt(entry.assignment.id_almacen),
-      id_sucursal: toPositiveInt(entry.assignment.id_sucursal),
+      id_almacen: toPositiveInventoryInt(entry.assignment.id_almacen),
+      id_sucursal: toPositiveInventoryInt(entry.assignment.id_sucursal),
       stock_disponible: Number(entry.assignment.cantidad ?? 0),
       stock_minimo: Number(entry.assignment.stock_minimo ?? 0),
       cantidad_consumo_base: baseQty,
@@ -380,7 +433,7 @@ export const resolveExtrasInventory = async ({
   masterCatalogEnabled = isCatalogoMaestroReadsEnabled()
 } = {}) => {
   if (!queryRunner?.query) throw new TypeError('queryRunner es requerido para resolver inventario de extras.');
-  const normalizedExtras = (Array.isArray(extras) ? extras : []).filter((extra) => toPositiveInt(extra?.id_extra));
+  const normalizedExtras = (Array.isArray(extras) ? extras : []).filter((extra) => toPositiveInventoryInt(extra?.id_extra));
   if (normalizedExtras.length === 0) return [];
 
   if (masterCatalogEnabled !== true) {

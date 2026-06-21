@@ -3,8 +3,7 @@ import pool from '../../config/db-connection.js';
 // Tipo canonico usado por todo el modulo para no depender de literales sueltas.
 export const PUBLIC_ITEM_TYPES = Object.freeze({
   PRODUCTO: 'PRODUCTO',
-  RECETA: 'RECETA',
-  COMBO: 'COMBO'
+  RECETA: 'RECETA'
 });
 
 // Verifica si una columna existe para mantener compatibilidad con esquemas legacy.
@@ -250,16 +249,14 @@ export const fetchActiveMenuByBranchQuery = async (idSucursal, db = pool) => {
   return result.rows[0] || null;
 };
 
-// Query base de catalogo: mezcla producto/receta/combo desde detalle_menu (capa de publicacion).
+// Query base de catalogo: mezcla producto/receta desde detalle_menu (capa de publicacion).
 // El SQL se arma dinamico para soportar entornos donde la migracion aun no fue aplicada.
 const buildCatalogSql = ({
   hasProductImageColumn,
   hasDetalleRecetaColumn,
-  hasDetalleComboColumn,
   hasDetallePrecioPublicoColumn,
   hasDetalleVisibleColumn,
   hasRecipeAssignmentTable,
-  hasComboAssignmentTable,
   withDetailMenuFilter = false,
   withLimit = false
 }) => {
@@ -276,7 +273,6 @@ const buildCatalogSql = ({
     : '';
 
   const detalleRecetaExpr = hasDetalleRecetaColumn ? 'dm.id_receta' : 'NULL::integer';
-  const detalleComboExpr = hasDetalleComboColumn ? 'dm.id_combo' : 'NULL::integer';
   const detallePrecioPublicoExpr = hasDetallePrecioPublicoColumn
     ? 'dm.precio_publico'
     : 'NULL::numeric(10,2)';
@@ -307,28 +303,6 @@ const buildCatalogSql = ({
       )
     `
     : '';
-  const comboAssignmentFilter = hasComboAssignmentTable
-    ? `
-      AND (
-        ${detalleComboExpr} IS NULL
-        OR ${branchParam}::int IS NULL
-        OR EXISTS (
-          SELECT 1
-          FROM public.menu_combo_almacenes mca
-          INNER JOIN public.almacenes aca
-            ON aca.id_almacen = mca.id_almacen
-           AND COALESCE(aca.estado, true) = true
-          INNER JOIN public.sucursales sca
-            ON sca.id_sucursal = aca.id_sucursal
-           AND COALESCE(sca.estado, true) = true
-          WHERE mca.id_combo = ${detalleComboExpr}
-            AND COALESCE(mca.estado, true) = true
-            AND aca.id_sucursal = ${branchParam}
-        )
-      )
-    `
-    : '';
-
   return `
     SELECT
       dm.id_detalle_menu,
@@ -338,43 +312,35 @@ const buildCatalogSql = ({
       ${detalleVisibleExpr} AS visible,
       dm.id_producto,
       ${detalleRecetaExpr} AS id_receta,
-      ${detalleComboExpr} AS id_combo,
       CASE
         WHEN dm.id_producto IS NOT NULL THEN '${PUBLIC_ITEM_TYPES.PRODUCTO}'
         WHEN ${detalleRecetaExpr} IS NOT NULL THEN '${PUBLIC_ITEM_TYPES.RECETA}'
-        WHEN ${detalleComboExpr} IS NOT NULL THEN '${PUBLIC_ITEM_TYPES.COMBO}'
         ELSE NULL
       END AS tipo_item,
       CASE
         WHEN dm.id_producto IS NOT NULL THEN dm.id_producto
         WHEN ${detalleRecetaExpr} IS NOT NULL THEN ${detalleRecetaExpr}
-        WHEN ${detalleComboExpr} IS NOT NULL THEN ${detalleComboExpr}
         ELSE NULL
       END AS id_item_base,
       COALESCE(
         p.nombre_producto,
         r.nombre_receta,
-        NULLIF(c.nombre_combo, ''),
-        NULLIF(c.descripcion, ''),
         CONCAT('Item #', dm.id_detalle_menu::text)
       ) AS nombre_item,
-      COALESCE(p.descripcion_producto, r.descripcion, c.descripcion, '') AS descripcion_item,
+      COALESCE(p.descripcion_producto, r.descripcion, '') AS descripcion_item,
       CASE
         WHEN dm.id_producto IS NOT NULL THEN p.precio
         WHEN ${detalleRecetaExpr} IS NOT NULL THEN r.precio
-        WHEN ${detalleComboExpr} IS NOT NULL THEN c.precio
         ELSE NULL
       END AS precio_base,
       CASE
         WHEN dm.id_producto IS NOT NULL THEN COALESCE(p.estado, true)
         WHEN ${detalleRecetaExpr} IS NOT NULL THEN COALESCE(r.estado, true)
-        WHEN ${detalleComboExpr} IS NOT NULL THEN COALESCE(c.estado, true)
         ELSE false
       END AS estado_item_base,
       CASE
         WHEN dm.id_producto IS NOT NULL THEN p.id_tipo_departamento
         WHEN ${detalleRecetaExpr} IS NOT NULL THEN r.id_tipo_departamento
-        WHEN ${detalleComboExpr} IS NOT NULL THEN c.id_tipo_departamento
         ELSE NULL
       END AS id_tipo_departamento,
       cp.nombre_categoria AS producto_categoria_nombre,
@@ -398,7 +364,6 @@ const buildCatalogSql = ({
       CASE
         WHEN dm.id_producto IS NOT NULL THEN ${productImageSelect}
         WHEN ${detalleRecetaExpr} IS NOT NULL THEN a_receta.url_publica
-        WHEN ${detalleComboExpr} IS NOT NULL THEN a_combo.url_publica
         ELSE NULL
       END AS url_imagen,
       pa_branch.cantidad AS cantidad_actual,
@@ -435,13 +400,8 @@ const buildCatalogSql = ({
     LEFT JOIN archivos a_receta
       ON a_receta.id_archivo = r.id_archivo
      AND COALESCE(a_receta.estado, true) = true
-    LEFT JOIN combos c
-      ON c.id_combo = ${detalleComboExpr}
-    LEFT JOIN archivos a_combo
-      ON a_combo.id_archivo = c.id_archivo
-     AND COALESCE(a_combo.estado, true) = true
     LEFT JOIN tipo_departamento td
-      ON td.id_tipo_departamento = COALESCE(p.id_tipo_departamento, r.id_tipo_departamento, c.id_tipo_departamento)
+      ON td.id_tipo_departamento = COALESCE(p.id_tipo_departamento, r.id_tipo_departamento)
     LEFT JOIN public.menu_publicacion_reglas mpr
       ON COALESCE(mpr.estado, true) = true
      AND (
@@ -451,15 +411,11 @@ const buildCatalogSql = ({
        OR (${detalleRecetaExpr} IS NOT NULL
          AND mpr.tipo_item = '${PUBLIC_ITEM_TYPES.RECETA}'
          AND mpr.id_tipo_departamento = r.id_tipo_departamento)
-       OR (${detalleComboExpr} IS NOT NULL
-         AND mpr.tipo_item = '${PUBLIC_ITEM_TYPES.COMBO}'
-         AND mpr.id_tipo_departamento = c.id_tipo_departamento)
      )
     WHERE dm.id_menu = $1
       AND COALESCE(dm.estado, true) = true
       ${branchProductFilter}
       ${recipeAssignmentFilter}
-      ${comboAssignmentFilter}
       ${detalleVisibleFilter}
       ${withDetailMenuFilter ? 'AND dm.id_detalle_menu = $2' : ''}
     ORDER BY COALESCE(dm.orden, 2147483647), dm.id_detalle_menu
@@ -472,29 +428,23 @@ export const fetchCatalogRowsByMenuQuery = async (idMenu, idSucursal, db = pool)
   const [
     hasProductImageColumn,
     hasDetalleRecetaColumn,
-    hasDetalleComboColumn,
     hasDetallePrecioPublicoColumn,
     hasDetalleVisibleColumn,
-    hasRecipeAssignmentTable,
-    hasComboAssignmentTable
+    hasRecipeAssignmentTable
   ] = await Promise.all([
     hasColumn('productos', 'id_archivo_imagen_principal'),
     hasColumn('detalle_menu', 'id_receta'),
-    hasColumn('detalle_menu', 'id_combo'),
     hasColumn('detalle_menu', 'precio_publico'),
     hasColumn('detalle_menu', 'visible'),
-    hasTable('menu_receta_almacenes'),
-    hasTable('menu_combo_almacenes')
+    hasTable('menu_receta_almacenes')
   ]);
 
   const query = buildCatalogSql({
     hasProductImageColumn,
     hasDetalleRecetaColumn,
-    hasDetalleComboColumn,
     hasDetallePrecioPublicoColumn,
     hasDetalleVisibleColumn,
-    hasRecipeAssignmentTable,
-    hasComboAssignmentTable
+    hasRecipeAssignmentTable
   });
   const result = await db.query(query, [idMenu, idSucursal]);
   return result.rows;
@@ -568,29 +518,23 @@ export const fetchCatalogItemByIdQuery = async ({ idMenu, idDetalleMenu, idSucur
   const [
     hasProductImageColumn,
     hasDetalleRecetaColumn,
-    hasDetalleComboColumn,
     hasDetallePrecioPublicoColumn,
     hasDetalleVisibleColumn,
-    hasRecipeAssignmentTable,
-    hasComboAssignmentTable
+    hasRecipeAssignmentTable
   ] = await Promise.all([
     hasColumn('productos', 'id_archivo_imagen_principal'),
     hasColumn('detalle_menu', 'id_receta'),
-    hasColumn('detalle_menu', 'id_combo'),
     hasColumn('detalle_menu', 'precio_publico'),
     hasColumn('detalle_menu', 'visible'),
-    hasTable('menu_receta_almacenes'),
-    hasTable('menu_combo_almacenes')
+    hasTable('menu_receta_almacenes')
   ]);
 
   const query = buildCatalogSql({
     hasProductImageColumn,
     hasDetalleRecetaColumn,
-    hasDetalleComboColumn,
     hasDetallePrecioPublicoColumn,
     hasDetalleVisibleColumn,
     hasRecipeAssignmentTable,
-    hasComboAssignmentTable,
     withDetailMenuFilter: true,
     withLimit: true
   });
@@ -680,102 +624,6 @@ export const fetchRecipeAvailabilityQuery = async (recipeIds = [], idSucursal = 
   return result.rows;
 };
 
-// Calcula disponibilidad por combo en base a sus recetas componentes y stock de insumos.
-export const fetchComboAvailabilityQuery = async (comboIds = [], idSucursal = null, db = pool) => {
-  if (!Array.isArray(comboIds) || comboIds.length === 0) return [];
-  const branchId = Number.isInteger(Number(idSucursal)) && Number(idSucursal) > 0 ? Number(idSucursal) : null;
-  const hasComboAssignmentTable = await hasTable('menu_combo_almacenes');
-  const comboAssignmentDisponibleExpr = hasComboAssignmentTable
-    ? `
-      EXISTS (
-        SELECT 1
-        FROM public.menu_combo_almacenes mca
-        INNER JOIN public.almacenes aca
-          ON aca.id_almacen = mca.id_almacen
-         AND COALESCE(aca.estado, true) = true
-        INNER JOIN public.sucursales sca
-          ON sca.id_sucursal = aca.id_sucursal
-         AND COALESCE(sca.estado, true) = true
-        WHERE mca.id_combo = c.id_combo
-          AND COALESCE(mca.estado, true) = true
-          AND ($2::int IS NULL OR aca.id_sucursal = $2)
-      )
-    `
-    : 'true';
-
-  const query = `
-    SELECT
-      c.id_combo,
-      CASE
-        WHEN COALESCE(c.estado, true) = false THEN false
-        WHEN (${comboAssignmentDisponibleExpr}) = false THEN false
-        WHEN COALESCE(stats.total_componentes, 0) = 0 THEN false
-        WHEN COALESCE(stats.componentes_disponibles, 0) = COALESCE(stats.total_componentes, 0) THEN true
-        ELSE false
-      END AS disponible,
-      CASE
-        WHEN COALESCE(c.estado, true) = false THEN 'COMBO_INACTIVO'
-        WHEN (${comboAssignmentDisponibleExpr}) = false THEN 'COMBO_SIN_ASIGNACION_SUCURSAL'
-        WHEN COALESCE(stats.total_componentes, 0) = 0 THEN 'COMBO_SIN_COMPONENTES'
-        WHEN COALESCE(stats.componentes_disponibles, 0) < COALESCE(stats.total_componentes, 0) THEN 'COMPONENTES_NO_DISPONIBLES'
-        ELSE NULL
-      END AS motivo
-    FROM combos c
-    LEFT JOIN (
-      SELECT
-        dc.id_combo,
-        COUNT(*) FILTER (WHERE COALESCE(dc.estado, true) = true) AS total_componentes,
-        COUNT(*) FILTER (
-          WHERE COALESCE(dc.estado, true) = true
-            AND r.id_receta IS NOT NULL
-            AND COALESCE(r.estado, true) = true
-            AND COALESCE(rs.total_insumos, 0) > 0
-            AND COALESCE(rs.insumos_disponibles, 0) = COALESCE(rs.total_insumos, 0)
-        ) AS componentes_disponibles
-      FROM detalle_combo dc
-      LEFT JOIN recetas r
-        ON r.id_receta = dc.id_receta
-      LEFT JOIN LATERAL (
-        SELECT
-          COUNT(*) FILTER (WHERE COALESCE(dr.estado, true) = true) AS total_insumos,
-          COUNT(*) FILTER (
-            WHERE COALESCE(dr.estado, true) = true
-              AND i.id_insumo IS NOT NULL
-              AND COALESCE(i.estado, true) = true
-              AND EXISTS (
-                SELECT 1
-                FROM public.insumos_almacenes ia
-                INNER JOIN public.almacenes a
-                  ON a.id_almacen = ia.id_almacen
-                 AND COALESCE(a.estado, true) = true
-                WHERE ia.id_insumo = i.id_insumo
-                  AND COALESCE(ia.estado, true) = true
-                  AND ($2::int IS NULL OR a.id_sucursal = $2)
-                  AND (COALESCE(ia.cantidad, 0)::numeric - COALESCE(ia.stock_minimo, 0)::numeric)
-                    >= (COALESCE(dr.cant, 0) * GREATEST(COALESCE(dc.cantidad, 1), 1)::numeric)
-              )
-          ) AS insumos_disponibles
-        FROM detalle_recetas dr
-        LEFT JOIN LATERAL (
-          SELECT MIN(mm.id_insumo_maestro)::int AS id_insumo_maestro
-          FROM public.insumos_mapeo_maestro mm
-          WHERE mm.id_insumo_legacy = dr.id_insumo
-             OR mm.id_insumo_maestro = dr.id_insumo
-        ) mmr ON true
-        LEFT JOIN insumos i
-          ON i.id_insumo = COALESCE(mmr.id_insumo_maestro, dr.id_insumo)
-        WHERE dr.id_receta = dc.id_receta
-      ) rs ON true
-      WHERE dc.id_combo = ANY($1::int[])
-      GROUP BY dc.id_combo
-    ) stats
-      ON stats.id_combo = c.id_combo
-    WHERE c.id_combo = ANY($1::int[]);
-  `;
-
-  const result = await db.query(query, [comboIds, branchId]);
-  return result.rows;
-};
 
 // Catalogo de estados de pedido para resolver estado inicial en flujo publico.
 export const fetchEstadoPedidoRowsQuery = async (db = pool) => {
@@ -785,35 +633,12 @@ export const fetchEstadoPedidoRowsQuery = async (db = pool) => {
   return result.rows;
 };
 
-// Componentes receta por combo para calcular reglas de salsas por unidades reales.
-export const fetchComboRecipeComponentsQuery = async (comboIds = [], db = pool) => {
-  if (!Array.isArray(comboIds) || comboIds.length === 0) return [];
-
-  const result = await db.query(
-    `
-      SELECT
-        dc.id_combo,
-        dc.id_receta,
-        GREATEST(COALESCE(dc.cantidad, 1), 1)::int AS multiplicador,
-        r.nombre_receta
-      FROM detalle_combo dc
-      INNER JOIN recetas r
-        ON r.id_receta = dc.id_receta
-      WHERE dc.id_combo = ANY($1::int[])
-        AND dc.id_receta IS NOT NULL
-        AND COALESCE(dc.estado, true) = true
-        AND COALESCE(r.estado, true) = true
-      ORDER BY dc.id_combo, COALESCE(dc.orden, dc.id_detalle_combo);
-    `,
-    [comboIds]
-  );
-
-  return result.rows;
-};
 
 // Salsas permitidas por receta activa.
-export const fetchAllowedSauceRowsByRecipeIdsQuery = async (recipeIds = [], db = pool) => {
+export const fetchAllowedSauceRowsByRecipeIdsQuery = async (recipeIds = [], idSucursal, db = pool) => {
   if (!Array.isArray(recipeIds) || recipeIds.length === 0) return [];
+  const branchId = Number(idSucursal);
+  if (!Number.isInteger(branchId) || branchId <= 0) throw new TypeError('idSucursal es requerido para consultar salsas.');
 
   const result = await db.query(
     `
@@ -823,23 +648,34 @@ export const fetchAllowedSauceRowsByRecipeIdsQuery = async (recipeIds = [], db =
         s.nombre,
         s.nivel_picante,
         s.orden,
+        s.id_insumo,
+        s.cantidad_porcion,
+        s.id_unidad_consumo,
         COALESCE(s.estado, true) AS disponible
       FROM receta_salsa rs
       INNER JOIN salsas s
         ON s.id_salsa = rs.id_salsa
+      INNER JOIN public.salsa_sucursales ss
+        ON ss.id_salsa = s.id_salsa
+       AND ss.id_sucursal = $2
+       AND ss.estado IS TRUE
+       AND ss.publicada IS TRUE
       WHERE rs.id_receta = ANY($1::int[])
         AND COALESCE(rs.estado, true) = true
+        AND COALESCE(s.estado, true) = true
       ORDER BY rs.id_receta, s.orden, s.nombre;
     `,
-    [recipeIds]
+    [recipeIds, branchId]
   );
 
   return result.rows;
 };
 
-// Catalogo publico de salsas activas para fallback cuando una receta/combo exige salsas
+// Catalogo publico de salsas activas para fallback cuando una receta exige salsas
 // pero no tiene mapeo puntual en receta_salsa.
-export const fetchPublicActiveSaucesQuery = async (db = pool) => {
+export const fetchPublicActiveSaucesQuery = async (idSucursal, db = pool) => {
+  const branchId = Number(idSucursal);
+  if (!Number.isInteger(branchId) || branchId <= 0) throw new TypeError('idSucursal es requerido para consultar salsas.');
   const result = await db.query(
     `
       SELECT
@@ -847,11 +683,20 @@ export const fetchPublicActiveSaucesQuery = async (db = pool) => {
         s.nombre,
         s.nivel_picante,
         s.orden,
+        s.id_insumo,
+        s.cantidad_porcion,
+        s.id_unidad_consumo,
         true AS disponible
       FROM salsas s
+      INNER JOIN public.salsa_sucursales ss
+        ON ss.id_salsa = s.id_salsa
+       AND ss.id_sucursal = $1
+       AND ss.estado IS TRUE
+       AND ss.publicada IS TRUE
       WHERE COALESCE(s.estado, true) = true
       ORDER BY s.orden, s.nombre;
-    `
+    `,
+    [branchId]
   );
 
   return result.rows;
@@ -1042,7 +887,6 @@ export const resolvePublicOrderCatalogContextQuery = async (client, { tipoPedido
     hasTable('cat_pedidos_motivos_pago_pendiente'),
     hasTable('cat_delivery_estados')
   ]);
-
   const normalizedTipoPedido = String(tipoPedido || '').trim().toLowerCase();
   const canalCode = 'LOCAL';
   const estadoPagoPendienteCandidates = [
@@ -1353,7 +1197,6 @@ export const insertPublicPedidoDetalleQuery = async (client, payload) => {
     'id_pedido',
     'id_descuento',
     'estado',
-    'id_combo',
     'id_receta',
     'cantidad',
     'observacion'
@@ -1365,7 +1208,6 @@ export const insertPublicPedidoDetalleQuery = async (client, payload) => {
     payload.id_pedido,
     null,
     true,
-    payload.id_combo,
     payload.id_receta,
     payload.cantidad,
     payload.observacion

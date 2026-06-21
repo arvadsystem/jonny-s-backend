@@ -510,6 +510,7 @@ export const validarStockConBloqueo = async ({
   idSucursal,
   productoQtyMap,
   insumoQtyMap,
+  expectedInsumoWarehouseById = new Map(),
   allowCrossBranchWarehouse = false
 }) => {
   const faltantes = [];
@@ -724,6 +725,19 @@ export const validarStockConBloqueo = async ({
         nombre: row.nombre_insumo,
         motivo: 'INSUMO_SIN_ALMACEN',
         mensaje: `El insumo ${row.nombre_insumo || idInsumo} no tiene almacen configurado.`
+      });
+    }
+    const expectedWarehouseId = toPositiveInt(expectedInsumoWarehouseById.get(idInsumo));
+    if (expectedWarehouseId && toPositiveInt(row.id_almacen) !== expectedWarehouseId) {
+      excludedInsumoIds.add(idInsumo);
+      faltantes.push({
+        tipo_recurso: 'insumo',
+        id_recurso: idInsumo,
+        id_insumo: idInsumo,
+        id_almacen: expectedWarehouseId,
+        nombre: row.nombre_insumo,
+        motivo: 'SALSA_SNAPSHOT_ALMACEN_NO_COINCIDE',
+        mensaje: `El almacen del snapshot de salsa no coincide con la asignacion activa del insumo ${row.nombre_insumo || idInsumo}.`
       });
     }
   }

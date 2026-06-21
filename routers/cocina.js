@@ -9,6 +9,10 @@ import { resolveRequestUserSucursalScope } from '../utils/sucursalScope.js';
 import { enviarCorreo } from '../utils/emailService.js';
 import { validarYDescontarPedido } from '../services/inventarioPedidoService.js';
 import { registrarAlertasInventarioPedido } from '../services/inventarioAlertasService.js';
+import {
+  buildSalsaConsumptionItemsFromPedidoDetails,
+  loadLegacySalsaConsumptionByStockKey
+} from '../services/salsasPedidoSnapshotService.js';
 
 const router = express.Router();
 
@@ -260,7 +264,6 @@ const buildPedidoConsumoPayload = async (client, idPedido, idSucursal) => {
       SELECT
         dp.id_detalle_pedido,
         dp.id_producto,
-        dp.id_combo,
         dp.id_receta,
         dp.cantidad,
         ${hasDetallePedidoConfiguracionMenu ? 'dp.configuracion_menu' : 'NULL::jsonb AS configuracion_menu'}
@@ -287,13 +290,11 @@ const buildPedidoConsumoPayload = async (client, idPedido, idSucursal) => {
   const items = detailsResult.rows
     .map((row) => {
       const idProducto = parsePositiveInt(row.id_producto);
-      const idCombo = parsePositiveInt(row.id_combo);
       const idReceta = parsePositiveInt(row.id_receta);
       const quantity = parsePositiveInt(row.cantidad);
 
       const idDetallePedido = parsePositiveInt(row.id_detalle_pedido);
       if (idProducto) return { tipo_item: 'PRODUCTO', id_item: idProducto, id_producto: idProducto, id_detalle_pedido: idDetallePedido, cantidad: quantity };
-      if (idCombo) return { tipo_item: 'COMBO', id_item: idCombo, id_combo: idCombo, id_detalle_pedido: idDetallePedido, cantidad: quantity };
       if (idReceta) return { tipo_item: 'RECETA', id_item: idReceta, id_receta: idReceta, id_detalle_pedido: idDetallePedido, cantidad: quantity };
       return null;
     })
@@ -395,6 +396,24 @@ const buildPedidoConsumoPayload = async (client, idPedido, idSucursal) => {
     });
   }
 
+  const legacySalsaConsumption = await loadLegacySalsaConsumptionByStockKey(client, idPedido);
+  const salsaConsumption = buildSalsaConsumptionItemsFromPedidoDetails(detailsResult.rows, {
+    legacyConsumedByStockKey: legacySalsaConsumption
+  });
+  if (salsaConsumption.errors.length > 0) {
+    return {
+      ok: false,
+      status: 409,
+      body: {
+        error: true,
+        code: salsaConsumption.errors[0].code || 'SALSA_SNAPSHOT_INVALIDO',
+        message: salsaConsumption.errors[0].message || 'No se pudo validar el snapshot de inventario de salsas.',
+        details: salsaConsumption.errors
+      }
+    };
+  }
+  items.push(...salsaConsumption.items);
+
   if (!items.length) {
     return {
       ok: false,
@@ -465,7 +484,6 @@ const extractConfigMenuModifications = (configuracionMenu, itemTipo, salsaNameMa
     .map((entry) => String(entry?.nombre || '').trim())
     .filter(Boolean)
     .map((nombre) => {
-      if (String(itemTipo || '').toUpperCase() === 'COMBO') return `Salsa alitas: ${nombre}`;
       return `Salsa: ${nombre}`;
     });
   const extrasText = extras
@@ -723,7 +741,7 @@ router.get('/cocina/pedidos', checkPermission(COCINA_VIEW_PERMISSIONS), async (r
             p.id_pedido::text ILIKE ${qParam}
             OR COALESCE(s.nombre_sucursal, '') ILIKE ${qParam}
             OR COALESCE(NULLIF(trim(concat_ws(' ', per.nombre, per.apellido)), ''), emp.nombre_empresa, 'Consumidor final') ILIKE ${qParam}
-            OR COALESCE(prod.nombre_producto, combo.descripcion, rec.nombre_receta, '') ILIKE ${qParam}
+            OR COALESCE(prod.nombre_producto, rec.nombre_receta, '') ILIKE ${qParam}
             OR COALESCE(dp.observacion, p.descripcion_pedido, '') ILIKE ${qParam}
           )
         `);
@@ -772,12 +790,11 @@ router.get('/cocina/pedidos', checkPermission(COCINA_VIEW_PERMISSIONS), async (r
             f.codigo_venta,
             dp.id_detalle_pedido,
             dp.id_producto,
-            dp.id_combo,
             dp.id_receta,
             dp.cantidad,
             dp.observacion,
             ${hasDetallePedidoConfiguracionMenu ? 'dp.configuracion_menu,' : 'NULL::jsonb AS configuracion_menu,'}
-            COALESCE(prod.nombre_producto, combo.descripcion, rec.nombre_receta, 'Item de cocina') AS nombre_item,
+            COALESCE(prod.nombre_producto, rec.nombre_receta, 'Item de cocina') AS nombre_item,
             COALESCE(dp.total_pedido, COALESCE(dp.sub_total_pedido, 0)) AS total_linea
           FROM pedidos p
           LEFT JOIN estados_pedido ep ON ep.id_estado_pedido = p.id_estado_pedido
@@ -810,12 +827,8 @@ router.get('/cocina/pedidos', checkPermission(COCINA_VIEW_PERMISSIONS), async (r
             ON dp.id_pedido = p.id_pedido
            AND COALESCE(dp.estado, true) = true
            AND dp.id_producto IS NULL
-           AND (
-             dp.id_combo IS NOT NULL
-             OR dp.id_receta IS NOT NULL
-           )
+           AND dp.id_receta IS NOT NULL
           LEFT JOIN productos prod ON prod.id_producto = dp.id_producto
-          LEFT JOIN combos combo ON combo.id_combo = dp.id_combo
           LEFT JOIN recetas rec ON rec.id_receta = dp.id_receta
           ${whereClause}
           ORDER BY
@@ -920,13 +933,10 @@ router.get('/cocina/pedidos', checkPermission(COCINA_VIEW_PERMISSIONS), async (r
             tipo_item:
               row.id_producto !== null
                 ? 'PRODUCTO'
-                : row.id_combo !== null
-                  ? 'COMBO'
-                  : row.id_receta !== null
+                : row.id_receta !== null
                     ? 'RECETA'
-                    : 'ITEM',
+                  : 'ITEM',
             id_producto: Number(row.id_producto ?? 0) || null,
-            id_combo: Number(row.id_combo ?? 0) || null,
             id_receta: Number(row.id_receta ?? 0) || null,
             nombre_item: row.nombre_item || 'Item de cocina',
             cantidad,
@@ -1154,10 +1164,17 @@ router.put('/cocina/pedidos/:id/estado', checkPermission(COCINA_VIEW_PERMISSIONS
         }
 
         try {
+          const strictSalsaInsumoIds = new Set(
+            consumoPayloadResult.payload.items
+              .filter((item) => item.tipo_item === 'SALSA')
+              .map((item) => parsePositiveInt(item.id_insumo))
+              .filter(Boolean)
+          );
           inventoryResult = await validarYDescontarPedido(consumoPayloadResult.payload, {
             id_usuario: req?.user?.id_usuario,
             allowNegativeStock: true,
             allowIncompleteConfiguration: true,
+            strictInsumoIds: strictSalsaInsumoIds,
             dbClient: client
           });
         } catch (inventoryError) {

@@ -40,7 +40,8 @@ const buildVentaRpcItems = (venta) =>
       nombre_item: line.nombre_item || null,
       id_producto: line.id_producto || null,
       id_receta: line.id_receta || null,
-      id_combo: line.id_combo || null,
+      id_extra: line.id_extra || null,
+      es_linea_extra_independiente: Boolean(line.es_linea_extra_independiente),
       cantidad: Number(line.cantidad || 0),
       precio_unitario: roundMoney(line.precio_unitario),
       total_detalle: roundMoney(line.total_linea),
@@ -60,7 +61,7 @@ const buildVentaRpcItems = (venta) =>
       tipo_item: tipoItem,
       id_producto: line.id_producto || null,
       id_receta: line.id_receta || null,
-      id_combo: line.id_combo || null,
+      id_extra: line.id_extra || null,
       id_descuento_catalogo: line.id_descuento_catalogo || null,
       cantidad: Number(line.cantidad || 0),
       precio_unitario: roundMoney(line.precio_unitario),
@@ -130,6 +131,8 @@ export const buildVentaRpcPayload = ({ venta, correlativoVenta, facturacionVenta
     facturacion_snapshot: facturacionVenta.snapshot || {}
   },
   ticket_facturacion: facturacionNormalizada || {},
+  contacto: venta.contacto || null,
+  contexto: venta.contexto || null,
   items: buildVentaRpcItems(venta)
 });
 
@@ -178,6 +181,8 @@ export const buildVentaRpcV2Payload = ({ venta }) => ({
     isv: venta.isv,
     total: venta.total
   },
+  contacto: venta.contacto || null,
+  contexto: venta.contexto || null,
   items: buildVentaRpcItems(venta)
 });
 
@@ -214,8 +219,8 @@ export const buildPedidoPendienteRpcPayload = (pedidoPendiente = {}) => ({
     total_linea: roundMoney(line.total_linea),
     cantidad: Number(line.cantidad || 0),
     id_producto: line.id_producto || null,
-    id_combo: line.id_combo || null,
     id_receta: line.id_receta || null,
+    id_extra: line.id_extra || null,
     observacion: line.observacion || null,
     descuento: roundMoney(line.descuento),
     id_descuento_catalogo: line.id_descuento_catalogo || null,
@@ -238,7 +243,9 @@ export const buildPedidoPendienteRpcPayload = (pedidoPendiente = {}) => ({
   delivery: pedidoPendiente.modalidad === 'DELIVERY'
     ? {
       id_estado_delivery: pedidoPendiente.id_estado_delivery || null,
-      costo_envio: roundMoney(pedidoPendiente.delivery?.costo_envio),
+      costo_envio: pedidoPendiente.delivery?.costo_envio === null
+        ? null
+        : roundMoney(pedidoPendiente.delivery?.costo_envio),
       nombre_receptor: pedidoPendiente.delivery?.nombre_receptor || null,
       telefono_receptor: pedidoPendiente.delivery?.telefono_receptor || null,
       direccion_entrega: pedidoPendiente.delivery?.direccion_entrega || null,

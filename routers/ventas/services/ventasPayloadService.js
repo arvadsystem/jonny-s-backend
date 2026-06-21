@@ -21,7 +21,8 @@ export const buildComplementSnapshot = (line) => {
     seleccion: selected.map((entry) => ({
       id_complemento: Number(entry?.id_complemento || 0),
       id_salsa: Number(entry?.id_salsa || entry?.id_complemento || 0),
-      nombre: String(entry?.nombre || 'Complemento').trim()
+      nombre: String(entry?.nombre || 'Complemento').trim(),
+      inventario: entry?.inventario || null
     })).filter((entry) => entry.id_complemento > 0)
   };
 };
@@ -42,7 +43,8 @@ export const buildComplementLineConfig = (line) => {
     complementos: selected.map((entry) => ({
       id_complemento: Number(entry?.id_complemento || 0),
       id_salsa: Number(entry?.id_salsa || entry?.id_complemento || 0),
-      nombre: String(entry?.nombre || 'Complemento').trim()
+      nombre: String(entry?.nombre || 'Complemento').trim(),
+      inventario: entry?.inventario || null
     })).filter((entry) => entry.id_complemento > 0),
     extras: extras.map((entry) => ({
       id_extra: Number(entry?.id_extra || 0),
@@ -80,11 +82,10 @@ export const normalizeVentaItems = (items) => {
     const productoResult = parseEntityIdentifier(item.id_producto, 'id_producto');
     if (!productoResult.ok) return { ok: false, message: productoResult.message };
 
-    const comboResult = parseEntityIdentifier(item.id_combo, 'id_combo');
-    if (!comboResult.ok) return { ok: false, message: comboResult.message };
-
     const recetaResult = parseEntityIdentifier(item.id_receta, 'id_receta');
     if (!recetaResult.ok) return { ok: false, message: recetaResult.message };
+    const extraResult = parseEntityIdentifier(item.id_extra, 'id_extra');
+    if (!extraResult.ok) return { ok: false, message: extraResult.message };
 
     const cantidad = parsePositiveInt(item.cantidad);
     if (!cantidad) {
@@ -96,15 +97,15 @@ export const normalizeVentaItems = (items) => {
 
     const presentIds = [
       ['PRODUCTO', productoResult.value],
-      ['COMBO', comboResult.value],
-      ['RECETA', recetaResult.value]
+      ['RECETA', recetaResult.value],
+      ['ITEM', extraResult.value]
     ].filter(([, value]) => value !== null);
 
     if (presentIds.length !== 1) {
       return {
         ok: false,
         message:
-          'Cada item debe incluir exactamente uno entre id_producto, id_combo o id_receta.'
+          'Cada item debe incluir exactamente uno entre id_producto, id_receta o id_extra.'
       };
     }
 
@@ -125,7 +126,7 @@ export const normalizeVentaItems = (items) => {
     if (!complementosResult.ok) {
       return { ok: false, message: complementosResult.message };
     }
-    const extrasResult = parseVentaExtrasPayload(item.extras, { kind, cantidad });
+    const extrasResult = parseVentaExtrasPayload(item.extras, { kind });
     if (!extrasResult.ok) {
       return { ok: false, message: extrasResult.message };
     }
@@ -144,8 +145,8 @@ export const normalizeVentaItems = (items) => {
       cart_key: normalizeCartKey(item.cart_key),
       cantidad,
       id_producto: kind === 'PRODUCTO' ? entityId : null,
-      id_combo: kind === 'COMBO' ? entityId : null,
       id_receta: kind === 'RECETA' ? entityId : null,
+      id_extra: kind === 'ITEM' ? entityId : null,
       observacion: normalizeObservation(item.observacion),
       id_descuento_catalogo_linea: idDescuentoCatalogoLinea,
       complementos: complementosResult.data,
