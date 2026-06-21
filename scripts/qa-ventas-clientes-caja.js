@@ -22,7 +22,8 @@ const invokeCatalog = async (query) => {
   };
   await listClientesCatalogoHandler({ query, method: 'GET' }, res);
   assert.equal(statusCode, 200, `catalogo clientes respondio HTTP ${statusCode}`);
-  assert.ok(Array.isArray(body), 'catalogo clientes debe conservar respuesta array');
+  assert.ok(Array.isArray(body?.data), 'catalogo clientes debe responder data array');
+  assert.ok(body?.meta && typeof body.meta === 'object', 'catalogo clientes debe responder meta');
   return body;
 };
 
@@ -32,21 +33,28 @@ const assertUniqueClients = (rows) => {
 };
 
 try {
-  const initial = await invokeCatalog({ limit: '20' });
-  assert.ok(initial.length <= 20, 'catalogo inicial no debe superar 20 clientes');
+  const initial = await invokeCatalog({ limit: '500' });
+  assert.deepEqual(initial.data, [], 'busqueda vacia no debe devolver clientes');
+  assert.equal(initial.meta.limit, 100, 'limite no debe superar 100');
+  assert.equal(initial.meta.has_more, false, 'busqueda vacia no tiene mas resultados');
 
-  const fernando = await invokeCatalog({ search: 'fernando', all: 'true', limit: '20' });
-  const jose = await invokeCatalog({ search: 'jose', all: 'true', limit: '20' });
-  const broad = await invokeCatalog({ search: 'an', all: 'true', limit: '20' });
+  const fernandoResponse = await invokeCatalog({ search: 'fernando', limit: '100' });
+  const joseResponse = await invokeCatalog({ search: 'jose', limit: '100' });
+  const broadResponse = await invokeCatalog({ search: 'an', limit: '500' });
+  const fernando = fernandoResponse.data;
+  const jose = joseResponse.data;
+  const broad = broadResponse.data;
   assert.ok(fernando.length > 20, 'fernando debe devolver todas las coincidencias existentes');
   assert.ok(jose.length > 20, 'jose debe devolver todas las coincidencias existentes');
-  assert.ok(broad.length > 50, 'all=true no debe truncar resultados en 50');
+  assert.equal(broad.length, 100, 'catalogo debe devolver maximo 100 resultados');
+  assert.equal(broadResponse.meta.limit, 100, 'meta debe informar limite 100');
+  assert.equal(broadResponse.meta.has_more, true, 'meta debe indicar coincidencias adicionales');
   assertUniqueClients(fernando);
   assertUniqueClients(jose);
   assertUniqueClients(broad);
 
-  const joseUpper = await invokeCatalog({ search: 'JOSE', all: 'true' });
-  const joseAccent = await invokeCatalog({ search: 'José', all: 'true' });
+  const joseUpper = (await invokeCatalog({ search: 'JOSE', limit: '100' })).data;
+  const joseAccent = (await invokeCatalog({ search: 'José', limit: '100' })).data;
   assert.deepEqual(
     joseUpper.map((row) => row.id_cliente).sort((a, b) => a - b),
     jose.map((row) => row.id_cliente).sort((a, b) => a - b),
@@ -60,8 +68,9 @@ try {
 
   const fullNameSample = fernando.find((row) => String(row.nombre_cliente || '').trim().includes(' '));
   assert.ok(fullNameSample, 'se requiere muestra con nombre completo');
-  const byFullName = await invokeCatalog({ search: fullNameSample.nombre_cliente, all: 'true' });
+  const byFullName = (await invokeCatalog({ search: fullNameSample.nombre_cliente, limit: '100' })).data;
   assert.ok(byFullName.some((row) => row.id_cliente === fullNameSample.id_cliente), 'busqueda por nombre completo');
+  assert.equal(byFullName[0].id_cliente, fullNameSample.id_cliente, 'nombre exacto debe ordenar primero');
 
   const samplesResult = await pool.query(`
     (SELECT 'telefono' AS kind, c.id_cliente, t.telefono AS value
@@ -84,17 +93,18 @@ try {
       ? `${phoneDigits.slice(0, 4)}-${phoneDigits.slice(4)}`
       : samples.telefono.value;
     for (const search of [phoneDigits, phoneFormatted]) {
-      const rows = await invokeCatalog({ search, all: 'true' });
+      const rows = (await invokeCatalog({ search, limit: '100' })).data;
       assert.ok(rows.some((row) => row.id_cliente === samples.telefono.id_cliente), `busqueda por telefono ${search}`);
     }
   }
   for (const kind of ['dni', 'rtn']) {
     const sample = samples[kind];
-    const rows = await invokeCatalog({ search: sample.value, all: 'true' });
+    const rows = (await invokeCatalog({ search: sample.value, limit: '100' })).data;
     assert.ok(rows.some((row) => row.id_cliente === sample.id_cliente), `busqueda por ${kind.toUpperCase()}`);
   }
-  const byId = await invokeCatalog({ search: String(samples.telefono.id_cliente), all: 'true' });
+  const byId = (await invokeCatalog({ search: String(samples.telefono.id_cliente), limit: '100' })).data;
   assert.ok(byId.some((row) => row.id_cliente === samples.telefono.id_cliente), 'busqueda por ID exacto');
+  assert.equal(byId[0].id_cliente, samples.telefono.id_cliente, 'ID exacto debe ordenar primero');
 
   const key = 'qa-clientes-idempotency-0001';
   const hash = buildClienteCreateRequestHash({ cliente: { nombre: 'QA' }, quick_create: true });
@@ -148,10 +158,11 @@ try {
 
   console.log(JSON.stringify({
     ok: true,
-    initial: initial.length,
+    initial: initial.data.length,
     fernando: fernando.length,
     jose: jose.length,
-    broad_over_50: broad.length,
+    broad_limited: broad.length,
+    has_more: broadResponse.meta.has_more,
     idempotency_replay: replay.replay
   }));
 } finally {
