@@ -2,6 +2,10 @@
 import { generarCodigoDocumento } from './facturacionCorrelativoService.js';
 import { getClientIp, parseUserAgent } from '../utils/security/clientInfo.js';
 import { restoreSalsasInventoryFromSnapshots } from '../routers/ventas/services/salsasInventoryService.js';
+import {
+  lockCajaFinancialSessions,
+  mapCajaFinancialLockError
+} from './cajaFinancialLockService.js';
 
 const REVERSAL_WINDOW_SQL = `NOW() - INTERVAL '1 hour'`;
 const VALID_MOTIVOS = new Set([
@@ -982,6 +986,11 @@ export const createVentaReversion = async ({ idFactura, body, req, idUsuario, id
     assertSucursalAllowedForReversion(scope, idSucursal, 'crear');
 
     const cajaContext = await assertOriginalCajaSessionOpen({ client, factura });
+    await lockCajaFinancialSessions(client, [
+      factura.id_sesion_caja,
+      cajaContext.id_sesion_caja
+    ]);
+    await assertOriginalCajaSessionOpen({ client, factura });
     await assertSucursalOpenForReversion({ client, idSucursal });
 
     const ageResult = await client.query(
@@ -1202,6 +1211,7 @@ export const createVentaReversion = async ({ idFactura, body, req, idUsuario, id
     return { result, responseBody };
   } catch (error) {
     try { await client.query('ROLLBACK'); } catch {}
+    const mappedError = mapCajaFinancialLockError(error);
     if (error?.code === '23514' && error?.constraint === 'ck_facturas_reversiones_motivo') {
       throw createReversionError(
         409,
@@ -1209,7 +1219,7 @@ export const createVentaReversion = async ({ idFactura, body, req, idUsuario, id
         'El motivo seleccionado no está habilitado para reversiones.'
       );
     }
-    throw error;
+    throw mappedError;
   } finally {
     client.release();
   }

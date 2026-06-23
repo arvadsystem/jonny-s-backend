@@ -18,6 +18,10 @@ import {
   listFacturaReversiones
 } from '../services/ventasReversionService.js';
 import {
+  lockCajaFinancialSession,
+  mapCajaFinancialLockError
+} from '../services/cajaFinancialLockService.js';
+import {
   listarAlertasInventarioPedido
 } from '../services/inventarioAlertasService.js';
 import {
@@ -8734,6 +8738,7 @@ router.post('/ventas/pedidos/:id/registrar-pago', checkPermission(['VENTAS_CREAR
       });
     }
     ventasPerf.add('registrar_pago_scope_session_ms', scopeSessionStart);
+    await lockCajaFinancialSession(client, sessionActiva.data.id_sesion_caja);
 
     const metodoPago = await resolveMetodoPagoRegistroPedido(client, {
       idMetodoPago: req.body?.id_metodo_pago,
@@ -9065,17 +9070,18 @@ router.post('/ventas/pedidos/:id/registrar-pago', checkPermission(['VENTAS_CREAR
     });
   } catch (err) {
     await client.query('ROLLBACK');
+    const mappedErr = mapCajaFinancialLockError(err);
     ventasPerf.log({
       ...ventasPerfContext,
-      status: Number.isInteger(err?.httpStatus) ? err.httpStatus : 500,
-      error_code: err?.code || null
+      status: Number.isInteger(mappedErr?.httpStatus) ? mappedErr.httpStatus : 500,
+      error_code: mappedErr?.code || null
     });
-    console.error('Error al registrar pago de pedido pendiente:', err);
-    if (Number.isInteger(err?.httpStatus) && err.httpStatus >= 400 && err.httpStatus < 500) {
-      return res.status(err.httpStatus).json({
+    console.error('Error al registrar pago de pedido pendiente:', mappedErr);
+    if (Number.isInteger(mappedErr?.httpStatus) && mappedErr.httpStatus >= 400 && mappedErr.httpStatus < 500) {
+      return res.status(mappedErr.httpStatus).json({
         error: true,
-        code: err.code || 'PEDIDO_REGISTRAR_PAGO_ERROR',
-        message: err.publicMessage || 'No se pudo registrar el pago del pedido.'
+        code: mappedErr.code || 'PEDIDO_REGISTRAR_PAGO_ERROR',
+        message: mappedErr.publicMessage || 'No se pudo registrar el pago del pedido.'
       });
     }
     return res.status(500).json({ error: true, message: 'No se pudo registrar el pago del pedido.' });
@@ -9250,6 +9256,7 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
       id_sesion_caja: parseOptionalPositiveInt(venta.id_sesion_caja),
       items_count: allLines.length
     });
+    await lockCajaFinancialSession(client, venta.id_sesion_caja);
     const ventaHasExtras = hasVentaExtras(venta);
     const ventaHasSalsasInventario = getSelectedSalsaIdsFromLines(venta.all_lines).length > 0;
     if (ventaHasSalsasInventario) {
@@ -9886,25 +9893,26 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
     res.status(201).json(createVentaResponse);
   } catch (err) {
     await client.query('ROLLBACK');
+    const mappedErr = mapCajaFinancialLockError(err);
     await saveVentasIdempotencyFailure({
       client,
       reservation: idempotencyReservation,
-      httpStatus: Number.isInteger(err?.httpStatus) ? err.httpStatus : 500,
-      errorCode: err?.code || 'VENTAS_CREATE_ERROR'
+      httpStatus: Number.isInteger(mappedErr?.httpStatus) ? mappedErr.httpStatus : 500,
+      errorCode: mappedErr?.code || 'VENTAS_CREATE_ERROR'
     }).catch((saveError) => {
       console.error('No se pudo marcar fallo idempotente de venta:', saveError);
     });
     ventasPerf.log({
       ...ventasPerfContext,
-      status: Number.isInteger(err?.httpStatus) ? err.httpStatus : 500,
-      error_code: err?.code || 'VENTAS_CREATE_ERROR'
+      status: Number.isInteger(mappedErr?.httpStatus) ? mappedErr.httpStatus : 500,
+      error_code: mappedErr?.code || 'VENTAS_CREATE_ERROR'
     });
-    console.error('Error al crear venta:', err);
-    if (Number.isInteger(err?.httpStatus) && err.httpStatus >= 400 && err.httpStatus < 500) {
-      return res.status(err.httpStatus).json({
+    console.error('Error al crear venta:', mappedErr);
+    if (Number.isInteger(mappedErr?.httpStatus) && mappedErr.httpStatus >= 400 && mappedErr.httpStatus < 500) {
+      return res.status(mappedErr.httpStatus).json({
         error: true,
-        code: err.code || 'VENTAS_CREATE_ERROR',
-        message: err.publicMessage || 'No se pudo completar la venta.'
+        code: mappedErr.code || 'VENTAS_CREATE_ERROR',
+        message: mappedErr.publicMessage || 'No se pudo completar la venta.'
       });
     }
     res.status(500).json({ error: true, message: 'No se pudo completar la venta.' });

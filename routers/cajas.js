@@ -9,6 +9,10 @@ import {
   requestHasAnyRole
 } from '../middleware/checkPermission.js';
 import { resolveRequestUserSucursalScope } from '../utils/sucursalScope.js';
+import {
+  lockCajaFinancialSession,
+  mapCajaFinancialLockError
+} from '../services/cajaFinancialLockService.js';
 
 const router = express.Router();
 const CAJAS_SCOPE_PERMISSION = 'VENTAS_CAJAS_MULTISUCURSAL_VER';
@@ -143,22 +147,23 @@ const sendInternalError = (
   defaultCode = 'VENTAS_CAJAS_INTERNAL_ERROR',
   defaultMessage = 'No se pudo procesar la solicitud de Gestion de cajas.'
 ) => {
-  if (Number.isInteger(err?.httpStatus) && err.httpStatus >= 400 && err.httpStatus < 500) {
+  const mappedErr = mapCajaFinancialLockError(err);
+  if (Number.isInteger(mappedErr?.httpStatus) && mappedErr.httpStatus >= 400 && mappedErr.httpStatus < 500) {
     console.warn('[cajas]', {
-      status: err.httpStatus,
-      code: err.code || defaultCode,
-      message: err.publicMessage || defaultMessage
+      status: mappedErr.httpStatus,
+      code: mappedErr.code || defaultCode,
+      message: mappedErr.publicMessage || defaultMessage
     });
     const payload = {
       error: true,
-      code: err.code || defaultCode,
-      message: err.publicMessage || defaultMessage
+      code: mappedErr.code || defaultCode,
+      message: mappedErr.publicMessage || defaultMessage
     };
-    if (err.details && typeof err.details === 'object') payload.details = err.details;
-    return res.status(err.httpStatus).json(payload);
+    if (mappedErr.details && typeof mappedErr.details === 'object') payload.details = mappedErr.details;
+    return res.status(mappedErr.httpStatus).json(payload);
   }
 
-  console.error('[cajas]', err);
+  console.error('[cajas]', mappedErr);
 
   return res.status(500).json({
     error: true,
@@ -571,7 +576,122 @@ const buildCurrentCloseTheoreticalByCode = (summary) => new Map([
   ['TRANSFERENCIA', roundMoney(summary?.transferenciaTeorico || 0)]
 ]);
 
-const assertCloseValidationMatchesCurrentSummary = ({ validation, validationMethods, currentSummary }) => {
+const fetchSessionOperationalFingerprint = async (client, idSesionCaja, currentSummary = null) => {
+  const summary = currentSummary || await fetchSessionMethodFinancialSummary(client, idSesionCaja);
+  const cobrosResult = await client.query(
+    `
+      SELECT
+        COUNT(*)::int AS cantidad_cobros,
+        COALESCE(MAX(id_factura_cobro), 0)::int AS max_id_factura_cobro,
+        COALESCE(SUM(monto), 0)::numeric(14,2) AS total_cobros
+      FROM public.facturas_cobros
+      WHERE id_sesion_caja = $1
+    `,
+    [idSesionCaja]
+  );
+  const reversionsResult = await client.query(
+    `
+      SELECT
+        COUNT(*)::int AS cantidad_reversiones,
+        COALESCE(MAX(rev.id_reversion), 0)::int AS max_id_reversion,
+        COALESCE(SUM(rev.monto_reversado), 0)::numeric(14,2) AS total_reversado
+      FROM (
+        SELECT DISTINCT fr.id_reversion, COALESCE(fr.monto_reversado, 0)::numeric(14,2) AS monto_reversado
+        FROM public.facturas_reversiones fr
+        LEFT JOIN public.facturas_cobros fc
+          ON fc.id_factura = fr.id_factura_original
+        WHERE COALESCE(fr.id_sesion_caja_original, fc.id_sesion_caja) = $1
+          AND UPPER(TRIM(COALESCE(fr.estado, ''))) = 'APLICADA'
+      ) rev
+    `,
+    [idSesionCaja]
+  );
+  const movementsResult = await client.query(
+    `
+      SELECT
+        COUNT(*)::int AS cantidad_movimientos,
+        COALESCE(MAX(cm.id_movimiento_caja), 0)::int AS max_id_movimiento_caja,
+        COALESCE(SUM(
+          CASE
+            WHEN mt.signo = 1
+              AND UPPER(TRIM(mt.codigo)) <> 'APERTURA'
+              AND UPPER(TRIM(mt.codigo)) NOT LIKE '%REVERSION%'
+            THEN cm.monto
+            ELSE 0
+          END
+        ), 0)::numeric(14,2) AS total_ingresos_manuales,
+        COALESCE(SUM(
+          CASE
+            WHEN mt.signo = -1
+              AND UPPER(TRIM(mt.codigo)) NOT LIKE '%REVERSION%'
+            THEN cm.monto
+            ELSE 0
+          END
+        ), 0)::numeric(14,2) AS total_egresos_manuales
+      FROM public.cajas_movimientos cm
+      INNER JOIN public.cat_cajas_movimientos_tipos mt
+        ON mt.id_tipo_movimiento_caja = cm.id_tipo_movimiento_caja
+      WHERE cm.id_sesion_caja = $1
+        AND UPPER(TRIM(mt.codigo)) <> 'APERTURA'
+        AND UPPER(TRIM(mt.codigo)) NOT LIKE '%REVERSION%'
+    `,
+    [idSesionCaja]
+  );
+
+  const cobros = cobrosResult.rows?.[0] || {};
+  const reversions = reversionsResult.rows?.[0] || {};
+  const movements = movementsResult.rows?.[0] || {};
+  return {
+    cantidad_cobros: Number(cobros.cantidad_cobros || 0),
+    max_id_factura_cobro: Number(cobros.max_id_factura_cobro || 0),
+    total_cobros: roundMoney(cobros.total_cobros || 0),
+    cantidad_reversiones: Number(reversions.cantidad_reversiones || 0),
+    max_id_reversion: Number(reversions.max_id_reversion || 0),
+    total_reversado: roundMoney(reversions.total_reversado || 0),
+    cantidad_movimientos: Number(movements.cantidad_movimientos || 0),
+    max_id_movimiento_caja: Number(movements.max_id_movimiento_caja || 0),
+    total_ingresos_manuales: roundMoney(movements.total_ingresos_manuales || 0),
+    total_egresos_manuales: roundMoney(movements.total_egresos_manuales || 0),
+    efectivo_teorico: roundMoney(summary?.efectivoTeorico || 0),
+    tarjeta_teorico: roundMoney(summary?.tarjetaTeorico || 0),
+    transferencia_teorico: roundMoney(summary?.transferenciaTeorico || 0),
+    total_teorico: roundMoney(summary?.totalTeorico || 0)
+  };
+};
+
+const assertOperationalFingerprintMatches = ({ validation, currentFingerprint }) => {
+  const stored = validation?.resultado_json?.huella_operacional;
+  if (!stored || !currentFingerprint) {
+    throw createCajaError(
+      409,
+      'VENTAS_CAJAS_CLOSE_VALIDATION_STALE',
+      'La sesion cambio despues de revisar las diferencias. Debe realizar una nueva revision antes de cerrar.'
+    );
+  }
+
+  const changed = [];
+  for (const key of Object.keys(currentFingerprint)) {
+    if (roundMoney(stored[key] || 0) !== roundMoney(currentFingerprint[key] || 0)) {
+      changed.push(key);
+    }
+  }
+
+  if (changed.length > 0) {
+    throw createCajaError(
+      409,
+      'VENTAS_CAJAS_CLOSE_VALIDATION_STALE',
+      'La sesion cambio despues de revisar las diferencias. Debe realizar una nueva revision antes de cerrar.',
+      { campos: changed }
+    );
+  }
+};
+
+const assertCloseValidationMatchesCurrentSummary = ({
+  validation,
+  validationMethods,
+  currentSummary,
+  currentFingerprint
+}) => {
   const currentByCode = buildCurrentCloseTheoreticalByCode(currentSummary);
   const validationByCode = new Map(
     (Array.isArray(validationMethods) ? validationMethods : [])
@@ -611,6 +731,8 @@ const assertCloseValidationMatchesCurrentSummary = ({ validation, validationMeth
       { diferencias: staleDetails }
     );
   }
+
+  assertOperationalFingerprintMatches({ validation, currentFingerprint });
 };
 
 const getScopeContext = async (req, client, requestedSucursalId = null, allowGlobal = false) => {
@@ -2075,18 +2197,7 @@ const fetchSessionBase = async (client, idSesionCaja, { forUpdate = false } = {}
   return result.rows[0] || null;
 };
 
-const insertAssignedAuxiliariesIntoSession = async ({
-  client,
-  idSesionCaja,
-  idCaja,
-  excludeUserIds = [],
-  observacion = 'Auxiliar activo asignado al abrir sesion'
-}) => {
-  const idRolAuxiliar = await getCatalogId(client, 'PARTICIPATION_ROLES', 'AUXILIAR');
-  if (!idRolAuxiliar) {
-    throw createCajaError(409, 'VENTAS_CAJAS_AUXILIAR_ROLE_MISSING', 'No se encontro el rol de participacion AUXILIAR.');
-  }
-
+const fetchAssignedAuxiliaryCandidates = async ({ client, idCaja, excludeUserIds = [] }) => {
   const excludedIds = [...new Set(
     (Array.isArray(excludeUserIds) ? excludeUserIds : [])
       .map(parsePositiveInt)
@@ -2113,10 +2224,32 @@ const insertAssignedAuxiliariesIntoSession = async ({
     [idCaja, excludedIds]
   );
 
-  for (const candidate of candidatesResult.rows || []) {
+  return (candidatesResult.rows || []).filter((candidate) => (
+    parsePositiveInt(candidate.id_usuario) &&
+    isCajaUserAuxiliaryAllowed(candidate.roles_normalizados)
+  ));
+};
+
+const insertAssignedAuxiliariesIntoSession = async ({
+  client,
+  idSesionCaja,
+  idCaja,
+  excludeUserIds = [],
+  observacion = 'Auxiliar activo asignado al abrir sesion',
+  preselectedCandidates = null
+}) => {
+  const idRolAuxiliar = await getCatalogId(client, 'PARTICIPATION_ROLES', 'AUXILIAR');
+  if (!idRolAuxiliar) {
+    throw createCajaError(409, 'VENTAS_CAJAS_AUXILIAR_ROLE_MISSING', 'No se encontro el rol de participacion AUXILIAR.');
+  }
+
+  const candidates = Array.isArray(preselectedCandidates)
+    ? preselectedCandidates
+    : await fetchAssignedAuxiliaryCandidates({ client, idCaja, excludeUserIds });
+
+  for (const candidate of candidates) {
     const idUsuario = parsePositiveInt(candidate.id_usuario);
     if (!idUsuario || !isCajaUserAuxiliaryAllowed(candidate.roles_normalizados)) continue;
-    await assertUserNotInAnotherOpenSession(client, idUsuario, { excludeSessionId: idSesionCaja });
     await client.query(
       `
         INSERT INTO public.cajas_sesiones_participantes (
@@ -2168,6 +2301,33 @@ const assertUserNotInAnotherOpenSession = async (client, idUsuario, { excludeSes
       'VENTAS_CAJAS_USER_ALREADY_IN_OPEN_SESSION',
       'El usuario ya participa en otra sesion de caja abierta.'
     );
+  }
+};
+
+const assertUsersNotInAnotherOpenSession = async (client, ids = [], { excludeSessionId = null } = {}) => {
+  const userIds = [...new Set(
+    (Array.isArray(ids) ? ids : [])
+      .map(parsePositiveInt)
+      .filter(Boolean)
+  )].sort((a, b) => a - b);
+  if (userIds.length === 0) return;
+
+  for (const idUsuario of userIds) {
+    await lockCajaUserOpenSessionGuard(client, idUsuario);
+  }
+
+  for (const idUsuario of userIds) {
+    const openSession = await fetchUsuarioSesionAbierta(client, idUsuario, { forUpdate: true });
+    if (
+      openSession?.id_sesion_caja &&
+      (!excludeSessionId || Number(openSession.id_sesion_caja) !== Number(excludeSessionId))
+    ) {
+      throw createCajaError(
+        409,
+        'VENTAS_CAJAS_USER_ALREADY_IN_OPEN_SESSION',
+        'El usuario ya participa en otra sesion de caja abierta.'
+      );
+    }
   }
 };
 
@@ -2237,6 +2397,46 @@ const ensureSessionParticipant = async (
   }
 
   throw createCajaError(403, 'VENTAS_CAJAS_PARTICIPANT_REQUIRED', 'El usuario autenticado no participa activamente en la sesion de caja.');
+};
+
+const ensureSessionParticipantOrSuperAdminMovement = async ({
+  client,
+  session,
+  idSesionCaja,
+  scopeContext,
+  req,
+  observacion
+}) => {
+  try {
+    return await ensureSessionParticipant(client, idSesionCaja, scopeContext.idUsuario, { scopeContext });
+  } catch (err) {
+    if (err?.code !== 'VENTAS_CAJAS_PARTICIPANT_REQUIRED') throw err;
+  }
+
+  if (!(await requestIsSuperAdminReal(client, req))) {
+    throw createCajaError(
+      403,
+      'VENTAS_CAJAS_PARTICIPANT_REQUIRED',
+      'El usuario autenticado no participa activamente en la sesion de caja.'
+    );
+  }
+  if (!(await requestHasAnyPermission(req, 'VENTAS_CAJAS_MOVIMIENTO_MANUAL_REGISTRAR'))) {
+    throw createCajaError(
+      403,
+      'VENTAS_CAJAS_MOVIMIENTO_FORBIDDEN',
+      'No tiene permiso para registrar movimientos manuales de caja.'
+    );
+  }
+
+  assertSucursalAllowed(scopeContext, session.id_sucursal);
+  if (!normalizeText(observacion, 500)) {
+    throw createCajaError(
+      400,
+      'VENTAS_CAJAS_ADMIN_MOVEMENT_OBSERVATION_REQUIRED',
+      'La observacion es obligatoria para registrar movimientos en una sesion ajena.'
+    );
+  }
+  return null;
 };
 
 const resolveEgresoMovimientoTipo = async (client, requestedTipoId = null) => {
@@ -2440,7 +2640,8 @@ const persistCloseValidationAttempt = async ({
   observacionCierre,
   origen,
   ipOrigen,
-  userAgent
+  userAgent,
+  operationalFingerprint = null
 }) => {
   await client.query('SELECT pg_advisory_xact_lock(8152026, $1::integer)', [session.id_sesion_caja]);
   const attemptResult = await client.query(
@@ -2464,7 +2665,8 @@ const persistCloseValidationAttempt = async ({
       diferencia_total: computation.diferencia_total,
       hay_diferencia: hayDiferencia
     },
-    metodos: computation.rows
+    metodos: computation.rows,
+    huella_operacional: operationalFingerprint
   };
 
   const validationResult = await client.query(
@@ -2630,6 +2832,9 @@ const buildSessionDetailPayload = async (client, session) => {
               crp.codigo,
               CASE WHEN fc.id_usuario_ejecutor = $2 THEN 'RESPONSABLE' ELSE 'EJECUTOR' END
             ) AS rol_participacion_codigo,
+            csp.id_participacion_caja,
+            csp.fecha_inicio,
+            csp.fecha_fin,
             u.nombre_usuario,
             ${USER_DISPLAY_SQL} AS nombre_completo
           FROM public.facturas_cobros fc
@@ -2638,7 +2843,7 @@ const buildSessionDetailPayload = async (client, session) => {
           LEFT JOIN public.empleados e ON e.id_empleado = u.id_empleado
           LEFT JOIN public.personas per ON per.id_persona = e.id_persona
           LEFT JOIN LATERAL (
-            SELECT csp.id_rol_participacion_caja
+            SELECT csp.id_participacion_caja, csp.id_rol_participacion_caja, csp.fecha_inicio, csp.fecha_fin
             FROM public.cajas_sesiones_participantes csp
             WHERE csp.id_sesion_caja = fc.id_sesion_caja
               AND csp.id_usuario = fc.id_usuario_ejecutor
@@ -2655,6 +2860,9 @@ const buildSessionDetailPayload = async (client, session) => {
             fc.id_caja,
             fc.id_sucursal,
             fc.id_usuario_ejecutor,
+            csp.id_participacion_caja,
+            csp.fecha_inicio,
+            csp.fecha_fin,
             crp.codigo,
             u.nombre_usuario,
             per.nombre,
@@ -3096,6 +3304,7 @@ router.get('/ventas/cajas/usuarios', checkPermission(['VENTAS_CAJAS_LISTADO_VER'
         'Debe indicar un rol operativo valido: RESPONSABLE o AUXILIAR.'
       );
     }
+    const actorIsSuperAdmin = await requestIsSuperAdminReal(pool, req);
 
     const result = await pool.query(
       `
@@ -3156,7 +3365,10 @@ router.get('/ventas/cajas/usuarios', checkPermission(['VENTAS_CAJAS_LISTADO_VER'
     if (rolOperativo === 'RESPONSABLE') {
       rows = rows.filter((row) => isCajaUserCajero(row.roles_normalizados));
     } else if (rolOperativo === 'AUXILIAR') {
-      rows = rows.filter((row) => isCajaUserAuxiliaryAllowed(row.roles_normalizados));
+      rows = rows.filter((row) => (
+        isCajaUserAuxiliaryAllowed(row.roles_normalizados) &&
+        (actorIsSuperAdmin || !isCajaUserAdminLike(row.roles_normalizados))
+      ));
     }
     return res.status(200).json(rows);
   } catch (err) {
@@ -3321,12 +3533,18 @@ router.get('/ventas/cajas/listado/:id', checkPermission(['VENTAS_CAJAS_LISTADO_V
                COALESCE(
                  NULLIF(TRIM(CONCAT_WS(' ', per.nombre, per.apellido)), ''),
                  u.nombre_usuario
-               ) AS nombre_completo
+               ) AS nombre_completo,
+               ARRAY_REMOVE(ARRAY_AGG(DISTINCT ${ROLE_NORMALIZED_SQL}), NULL) AS roles_globales
         FROM public.cajas_usuarios_autorizados cua
         INNER JOIN public.usuarios u ON u.id_usuario = cua.id_usuario
+        LEFT JOIN public.roles_usuarios ru ON ru.id_usuario = u.id_usuario
+        LEFT JOIN public.roles r ON r.id_rol = ru.id_rol
         LEFT JOIN public.empleados e ON e.id_empleado = u.id_empleado
         LEFT JOIN public.personas per ON per.id_persona = e.id_persona
         WHERE cua.id_caja = $1
+        GROUP BY cua.id_caja_usuario_autorizado, cua.id_caja, cua.id_sucursal, cua.id_usuario,
+                 cua.puede_responsable, cua.puede_auxiliar, cua.estado, cua.observacion,
+                 cua.fecha_creacion, cua.fecha_actualizacion, u.nombre_usuario, per.nombre, per.apellido
         ORDER BY COALESCE(cua.estado, true) DESC, cua.fecha_actualizacion DESC, cua.id_caja_usuario_autorizado DESC
       `,
       [idCaja]
@@ -3417,13 +3635,6 @@ router.post('/ventas/cajas/listado', checkPermission(['VENTAS_CAJAS_PARTICIPANTE
           'El usuario indicado debe ser un empleado activo.'
         );
       }
-      if (Number.parseInt(String(user.id_sucursal || ''), 10) !== targetSucursalId) {
-        throw createCajaError(
-          409,
-          'VENTAS_CAJAS_USER_SCOPE_MISMATCH',
-          'El usuario seleccionado no pertenece a la sucursal operativa de la caja.'
-        );
-      }
 
       const puedeResponsable = parseBooleanWithDefault(asignacionInicial.puede_responsable, true);
       const puedeAuxiliar = parseBooleanWithDefault(asignacionInicial.puede_auxiliar, true);
@@ -3441,6 +3652,16 @@ router.post('/ventas/cajas/listado', checkPermission(['VENTAS_CAJAS_PARTICIPANTE
       if (puedeAuxiliar && !actorIsSuperAdmin && isCajaUserAdminLike(userRoles)) {
         throw createCajaError(403, 'VENTAS_CAJAS_ASSIGN_ROLE_FORBIDDEN', 'Solo super_admin puede asignar usuarios administradores como auxiliares.');
       }
+      const userSucursalMatches = Number.parseInt(String(user.id_sucursal || ''), 10) === targetSucursalId;
+      const allowGlobalSuperAdminAuxiliary = puedeAuxiliar && !puedeResponsable && actorIsSuperAdmin && isCajaUserAdminLike(userRoles);
+      if (!userSucursalMatches && !allowGlobalSuperAdminAuxiliary) {
+        throw createCajaError(
+          409,
+          'VENTAS_CAJAS_USER_SCOPE_MISMATCH',
+          'El usuario seleccionado no pertenece a la sucursal operativa de la caja.'
+        );
+      }
+      await assertUsersNotInAnotherOpenSession(client, [idUsuarioAsignado]);
 
       idCajaUsuarioAutorizado = await upsertCajaAuthorization(client, {
         idCaja,
@@ -3760,14 +3981,15 @@ router.post('/ventas/cajas/asignaciones', checkPermission(['VENTAS_CAJAS_PARTICI
     if (puedeAuxiliar && !actorIsSuperAdmin && userIsSuperOrAdmin) {
       throw createCajaError(403, 'VENTAS_CAJAS_ASSIGN_ROLE_FORBIDDEN', 'Solo super_admin puede asignar usuarios administradores como auxiliares.');
     }
-    if (Number.parseInt(String(user.id_sucursal || ''), 10) !== Number(caja.id_sucursal)) {
+    const userSucursalMatches = Number.parseInt(String(user.id_sucursal || ''), 10) === Number(caja.id_sucursal);
+    const allowGlobalSuperAdminAuxiliary = puedeAuxiliar && !puedeResponsable && actorIsSuperAdmin && userIsSuperOrAdmin;
+    if (!userSucursalMatches && !allowGlobalSuperAdminAuxiliary) {
       throw createCajaError(
         409,
         'VENTAS_CAJAS_USER_SCOPE_MISMATCH',
         'El usuario seleccionado no pertenece a la sucursal operativa de la caja.'
       );
     }
-
     await ensureActiveAssignmentBusinessRules(client, {
       idCaja,
       idUsuario,
@@ -3788,10 +4010,15 @@ router.post('/ventas/cajas/asignaciones', checkPermission(['VENTAS_CAJAS_PARTICI
       observacion: req.body.observacion
     });
 
+    const openSession = await fetchOpenSessionForCaja(client, idCaja, { forUpdate: true });
+    if (openSession?.id_sesion_caja) {
+      await assertUsersNotInAnotherOpenSession(client, [idUsuario], { excludeSessionId: openSession.id_sesion_caja });
+    } else {
+      await assertUsersNotInAnotherOpenSession(client, [idUsuario]);
+    }
+
     if (puedeAuxiliar) {
-      const openSession = await fetchOpenSessionForCaja(client, idCaja, { forUpdate: true });
       if (openSession?.id_sesion_caja) {
-        await assertUserNotInAnotherOpenSession(client, idUsuario, { excludeSessionId: openSession.id_sesion_caja });
         await insertSessionParticipant({
           client,
           idSesionCaja: openSession.id_sesion_caja,
@@ -3892,13 +4119,6 @@ router.patch('/ventas/cajas/asignaciones/:id', checkPermission(['VENTAS_CAJAS_PA
     if (!assignmentUser) {
       throw createCajaError(404, 'VENTAS_CAJAS_ASSIGN_USER_NOT_FOUND', 'El usuario indicado debe ser un empleado activo.');
     }
-    if (Number.parseInt(String(assignmentUser.id_sucursal || ''), 10) !== Number(assignment.id_sucursal)) {
-      throw createCajaError(
-        409,
-        'VENTAS_CAJAS_USER_SCOPE_MISMATCH',
-        'El usuario seleccionado no pertenece a la sucursal operativa de la caja.'
-      );
-    }
     const actorIsSuperAdmin = await requestIsSuperAdminReal(client, req);
     const assignmentUserRoles = Array.isArray(assignmentUser?.roles_normalizados) ? assignmentUser.roles_normalizados : [];
     const assignmentIsSuperOrAdmin = isCajaUserAdminLike(assignmentUserRoles);
@@ -3910,6 +4130,15 @@ router.patch('/ventas/cajas/asignaciones/:id', checkPermission(['VENTAS_CAJAS_PA
     }
     if (estado && puedeAuxiliar && !actorIsSuperAdmin && assignmentIsSuperOrAdmin) {
       throw createCajaError(403, 'VENTAS_CAJAS_ASSIGN_ROLE_FORBIDDEN', 'Solo super_admin puede asignar usuarios administradores como auxiliares.');
+    }
+    const assignmentUserSucursalMatches = Number.parseInt(String(assignmentUser.id_sucursal || ''), 10) === Number(assignment.id_sucursal);
+    const allowGlobalSuperAdminAuxiliary = estado && puedeAuxiliar && !puedeResponsable && actorIsSuperAdmin && assignmentIsSuperOrAdmin;
+    if (!assignmentUserSucursalMatches && !allowGlobalSuperAdminAuxiliary) {
+      throw createCajaError(
+        409,
+        'VENTAS_CAJAS_USER_SCOPE_MISMATCH',
+        'El usuario seleccionado no pertenece a la sucursal operativa de la caja.'
+      );
     }
 
     await ensureActiveAssignmentBusinessRules(client, {
@@ -4163,7 +4392,18 @@ const createOpenSessionTransaction = async ({
   }
 
   const idEstadoAbierta = await getCatalogId(client, 'SESSION_STATES', 'ABIERTA');
-  await assertUserNotInAnotherOpenSession(client, responsableId);
+  const assignedAuxiliaryCandidates = await fetchAssignedAuxiliaryCandidates({
+    client,
+    idCaja,
+    excludeUserIds: [responsableId]
+  });
+  await assertUsersNotInAnotherOpenSession(
+    client,
+    [
+      responsableId,
+      ...assignedAuxiliaryCandidates.map((candidate) => candidate.id_usuario)
+    ]
+  );
   const openSessionResult = await client.query(
     `SELECT id_sesion_caja FROM public.cajas_sesiones WHERE id_caja = $1 AND id_estado_sesion_caja = $2 LIMIT 1 FOR UPDATE`,
     [idCaja, idEstadoAbierta]
@@ -4223,7 +4463,8 @@ const createOpenSessionTransaction = async ({
     idSesionCaja,
     idCaja,
     excludeUserIds: [responsableId],
-    observacion: 'Auxiliar activo asignado al abrir sesion'
+    observacion: 'Auxiliar activo asignado al abrir sesion',
+    preselectedCandidates: assignedAuxiliaryCandidates
   });
 
   if (montoApertura > 0 && idTipoApertura) {
@@ -4475,6 +4716,7 @@ router.post('/ventas/cajas/mi-sesion/egresos', checkPermission(['VENTAS_CAJAS_MO
     if (!userOpenSession?.id_sesion_caja) {
       throw createCajaError(404, 'VENTAS_CAJAS_SESION_ACTIVA_NO_ENCONTRADA', 'No tienes una sesion de caja abierta.');
     }
+    await lockCajaFinancialSession(client, userOpenSession.id_sesion_caja);
     const session = await ensureOpenSession(client, userOpenSession.id_sesion_caja, { forUpdate: true });
     assertSucursalAllowed(scopeContext, session.id_sucursal);
     await ensureSessionParticipant(client, session.id_sesion_caja, scopeContext.idUsuario, { req, scopeContext });
@@ -4511,6 +4753,7 @@ router.post('/ventas/cajas/mi-sesion/ingresos', checkPermission(['VENTAS_CAJAS_M
     if (!userOpenSession?.id_sesion_caja) {
       throw createCajaError(404, 'VENTAS_CAJAS_SESION_ACTIVA_NO_ENCONTRADA', 'No tienes una sesion de caja abierta.');
     }
+    await lockCajaFinancialSession(client, userOpenSession.id_sesion_caja);
     const session = await ensureOpenSession(client, userOpenSession.id_sesion_caja, { forUpdate: true });
     assertSucursalAllowed(scopeContext, session.id_sucursal);
     await ensureSessionParticipant(client, session.id_sesion_caja, scopeContext.idUsuario, { req, scopeContext });
@@ -4545,9 +4788,17 @@ router.post('/ventas/cajas/sesiones/:id/egresos', checkPermission(['VENTAS_CAJAS
     const idSesionCaja = parsePositiveInt(req.params.id);
     if (!idSesionCaja) throw createCajaError(400, 'VENTAS_CAJAS_SESSION_ID_INVALID', 'El id de sesion es invalido.');
     const scopeContext = await getScopeContext(req, client, null, true);
+    await lockCajaFinancialSession(client, idSesionCaja);
     const session = await ensureOpenSession(client, idSesionCaja, { forUpdate: true });
     assertSucursalAllowed(scopeContext, session.id_sucursal);
-    await ensureSessionParticipant(client, idSesionCaja, scopeContext.idUsuario, { allowAdminBypass: true, req, scopeContext });
+    await ensureSessionParticipantOrSuperAdminMovement({
+      client,
+      session,
+      idSesionCaja,
+      scopeContext,
+      req,
+      observacion: req.body.observacion
+    });
 
     const movimiento = await insertCajaEgresoMovimiento({
       client,
@@ -4579,9 +4830,17 @@ router.post('/ventas/cajas/sesiones/:id/ingresos', checkPermission(['VENTAS_CAJA
     const idSesionCaja = parsePositiveInt(req.params.id);
     if (!idSesionCaja) throw createCajaError(400, 'VENTAS_CAJAS_SESSION_ID_INVALID', 'El id de sesion es invalido.');
     const scopeContext = await getScopeContext(req, client, null, true);
+    await lockCajaFinancialSession(client, idSesionCaja);
     const session = await ensureOpenSession(client, idSesionCaja, { forUpdate: true });
     assertSucursalAllowed(scopeContext, session.id_sucursal);
-    await ensureSessionParticipant(client, idSesionCaja, scopeContext.idUsuario, { allowAdminBypass: true, req, scopeContext });
+    await ensureSessionParticipantOrSuperAdminMovement({
+      client,
+      session,
+      idSesionCaja,
+      scopeContext,
+      req,
+      observacion: req.body.observacion
+    });
 
     const movimiento = await insertCajaIngresoMovimiento({
       client,
@@ -4619,17 +4878,16 @@ const closeSessionHandler = async (req, res) => {
 
     if (!idSesionCaja) throw createCajaError(400, 'VENTAS_CAJAS_SESSION_ID_INVALID', 'El id de sesion es invalido.');
     const scopeContext = await getScopeContext(req, client, null, true);
+    await lockCajaFinancialSession(client, idSesionCaja);
     const session = await ensureOpenSession(client, idSesionCaja, { forUpdate: true });
     assertSucursalAllowed(scopeContext, session.id_sucursal);
 
     const resumen = await fetchSessionMethodFinancialSummary(client, idSesionCaja);
+    const currentFingerprint = await fetchSessionOperationalFingerprint(client, idSesionCaja, resumen);
 
     await assertCanCloseCajaSession({ client, req, scopeContext, session, observacionCierre });
 
     const hasSegmentedPayload = Array.isArray(req.body.arqueos);
-    const threshold = Number.isFinite(CLOSE_DIFFERENCE_THRESHOLD) && CLOSE_DIFFERENCE_THRESHOLD >= 0
-      ? CLOSE_DIFFERENCE_THRESHOLD
-      : 0;
     let idArqueoFinalSelected = idArqueoFinal;
     let idResolucionFinal = null;
     let diferencia = 0;
@@ -4637,28 +4895,13 @@ const closeSessionHandler = async (req, res) => {
     let arqueosPersistir = [];
     let validationToLink = null;
 
-    if (hasSegmentedPayload) {
-      const payloadRows = Array.isArray(req.body.arqueos) ? req.body.arqueos : [];
-      const pendingResolutionId = await getCatalogId(client, 'RESOLUTIONS', 'PENDIENTE_REVISION');
-      if (!pendingResolutionId) {
-        throw createCajaError(
-          409,
-          'VENTAS_CAJAS_RESOLUTION_PENDING_MISSING',
-          'No se encontro la resolucion PENDIENTE_REVISION.'
-        );
-      }
-      idResolucionFinal = pendingResolutionId;
-      const computation = await buildSegmentedArqueoComputation({
-        client,
-        idSesionCaja,
-        payloadRows,
-        threshold
-      });
-      arqueosPersistir = computation.rows;
-      montoTeorico = computation.monto_teorico_total;
-      montoDeclaradoCierre = computation.monto_declarado_total;
-      diferencia = computation.diferencia_total;
-    } else {
+    if (hasSegmentedPayload && !idValidacionCierre) {
+      throw createCajaError(
+        400,
+        'VENTAS_CAJAS_CLOSE_VALIDATION_REQUIRED',
+        'Debe realizar una revision de diferencias antes de cerrar.'
+      );
+    } else if (!idValidacionCierre) {
       if (montoDeclaradoCierre === null) {
         let arqueoFinal = null;
         if (idArqueoFinalSelected) {
@@ -4746,10 +4989,18 @@ const closeSessionHandler = async (req, res) => {
     }
 
     if (idValidacionCierre) {
+      const pendingResolutionId = await getCatalogId(client, 'RESOLUTIONS', 'PENDIENTE_REVISION');
+      if (!pendingResolutionId) {
+        throw createCajaError(
+          409,
+          'VENTAS_CAJAS_RESOLUTION_PENDING_MISSING',
+          'No se encontro la resolucion PENDIENTE_REVISION.'
+        );
+      }
       const validationResult = await client.query(
         `
           SELECT id_validacion_cierre, id_cierre_caja
-               , total_teorico, total_declarado, diferencia_total
+               , total_teorico, total_declarado, diferencia_total, resultado_json
           FROM public.cajas_cierres_validaciones
           WHERE id_validacion_cierre = $1
             AND id_sesion_caja = $2
@@ -4782,16 +5033,9 @@ const closeSessionHandler = async (req, res) => {
       assertCloseValidationMatchesCurrentSummary({
         validation,
         validationMethods: validationMethodsResult.rows,
-        currentSummary: resumen
+        currentSummary: resumen,
+        currentFingerprint
       });
-      const pendingResolutionId = await getCatalogId(client, 'RESOLUTIONS', 'PENDIENTE_REVISION');
-      if (!pendingResolutionId) {
-        throw createCajaError(
-          409,
-          'VENTAS_CAJAS_RESOLUTION_PENDING_MISSING',
-          'No se encontro la resolucion PENDIENTE_REVISION.'
-        );
-      }
       idResolucionFinal = pendingResolutionId;
       montoTeorico = Number(validationToLink.total_teorico || 0);
       montoDeclaradoCierre = Number(validationToLink.total_declarado || 0);
@@ -4998,6 +5242,7 @@ router.post('/ventas/cajas/sesiones/:id/cierre-validaciones', checkPermission(['
     const idSesionCaja = parsePositiveInt(req.params.id);
     if (!idSesionCaja) throw createCajaError(400, 'VENTAS_CAJAS_SESSION_ID_INVALID', 'El id de sesion es invalido.');
     const scopeContext = await getScopeContext(req, client, null, true);
+    await lockCajaFinancialSession(client, idSesionCaja);
     const session = await ensureOpenSession(client, idSesionCaja, { forUpdate: true });
     assertSucursalAllowed(scopeContext, session.id_sucursal);
     const observacionCierre = normalizeText(req.body?.observacion_cierre, 500);
@@ -5014,6 +5259,8 @@ router.post('/ventas/cajas/sesiones/:id/cierre-validaciones', checkPermission(['
       threshold,
       requireObservacionOnDifference: false
     });
+    const financialSummary = await fetchSessionMethodFinancialSummary(client, idSesionCaja);
+    const operationalFingerprint = await fetchSessionOperationalFingerprint(client, idSesionCaja, financialSummary);
 
     const validation = await persistCloseValidationAttempt({
       client,
@@ -5024,7 +5271,8 @@ router.post('/ventas/cajas/sesiones/:id/cierre-validaciones', checkPermission(['
       observacionCierre,
       origen: req.body?.origen,
       ipOrigen: getClientIp(req),
-      userAgent: req.get('user-agent') || null
+      userAgent: req.get('user-agent') || null,
+      operationalFingerprint
     });
 
     await client.query('COMMIT');
@@ -5681,7 +5929,7 @@ router.post('/ventas/cajas/sesiones/:id/participantes', checkPermission(['VENTAS
     if (roleCode === 'AUXILIAR' && !isCajaUserAuxiliaryAllowed(participantUser.roles_normalizados)) {
       throw createCajaError(400, 'VENTAS_CAJAS_AUXILIAR_ROLE_INVALID', 'El auxiliar de caja debe tener rol CAJERO, ADMIN, ADMINISTRADOR o SUPER_ADMIN.');
     }
-    await assertUserNotInAnotherOpenSession(client, idUsuarioParticipante, { excludeSessionId: idSesionCaja });
+    await assertUsersNotInAnotherOpenSession(client, [idUsuarioParticipante], { excludeSessionId: idSesionCaja });
     await assertCajaAuthorization(client, session.id_caja, idUsuarioParticipante, roleCode);
 
     const duplicateResult = await client.query(
@@ -5756,7 +6004,7 @@ router.post('/ventas/cajas/sesiones/:id/auto-auxiliar', checkPermission(['VENTAS
     );
 
     if (existingResult.rowCount === 0) {
-      await assertUserNotInAnotherOpenSession(client, idUsuario, { excludeSessionId: idSesionCaja });
+      await assertUsersNotInAnotherOpenSession(client, [idUsuario], { excludeSessionId: idSesionCaja });
       const inactiveResult = await client.query(
         `
           SELECT id_participacion_caja
