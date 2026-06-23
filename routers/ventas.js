@@ -333,6 +333,53 @@ const stableStringify = (value) => {
     .join(',')}}`;
 };
 
+const dashboardResumenCache = new Map();
+const DASHBOARD_RESUMEN_CACHE_MAX_ENTRIES = 100;
+const getDashboardResumenCacheTtlMs = () => {
+  const ttl = Number(process.env.DASHBOARD_RESUMEN_CACHE_TTL_MS);
+  if (Number.isFinite(ttl) && ttl >= 1000) {
+    return Math.round(ttl);
+  }
+  return 15000;
+};
+
+const cloneDashboardResumenCacheValue = (value) => JSON.parse(JSON.stringify(value ?? null));
+
+const pruneDashboardResumenCache = () => {
+  const now = Date.now();
+  for (const [key, entry] of dashboardResumenCache.entries()) {
+    if (!entry || entry.expiresAt <= now) {
+      dashboardResumenCache.delete(key);
+    }
+  }
+
+  while (dashboardResumenCache.size > DASHBOARD_RESUMEN_CACHE_MAX_ENTRIES) {
+    const oldestKey = dashboardResumenCache.keys().next().value;
+    if (!oldestKey) break;
+    dashboardResumenCache.delete(oldestKey);
+  }
+};
+
+const getDashboardResumenCacheKey = ({
+  scope,
+  turno,
+  selectedDate,
+  rangeStart,
+  rangeEnd,
+  idSucursalEffective,
+  permissions
+}) => stableStringify({
+  allowedSucursalIds: Array.isArray(scope?.allowedSucursalIds) ? [...scope.allowedSucursalIds].sort((a, b) => a - b) : [],
+  idSucursalEffective: idSucursalEffective || null,
+  isSuperAdmin: Boolean(scope?.isSuperAdmin),
+  limitedToLast72Hours: Boolean(scope?.limitedToLast72Hours),
+  selectedDate,
+  rangeStart,
+  rangeEnd,
+  turno,
+  permissions
+});
+
 const buildIdempotencyRequestHash = (body) =>
   createHash('sha256')
     .update(stableStringify(body ?? null))
@@ -5619,30 +5666,25 @@ router.get('/ventas', checkPermission(['VENTAS_VER']), async (req, res) => {
   }
 });
 
-router.get(
-  '/ventas/dashboard-resumen',
-  checkPermission([
-    'DASHBOARD_VER',
-    'VENTAS_VER',
-    'COCINA_VER',
-    'SUCURSALES_VER',
-    'INVENTARIO_PRODUCTOS_VER',
-    'INVENTARIO_INSUMOS_VER'
-  ]),
-  async (req, res) => {
+const handleDashboardResumen = async (req, res) => {
     try {
       const scope = await resolveVentasHistoryScope(req);
       if (!scope.allowedSucursalIds.length) {
         return res.status(403).json({ error: true, message: 'El empleado no tiene sucursales asignadas.' });
       }
 
-      const fechaDesde = parseOptionalDateInput(req.query.fechaDesde);
-      const fechaHasta = parseOptionalDateInput(req.query.fechaHasta);
-      if (fechaDesde === '__INVALID_DATE__' || fechaHasta === '__INVALID_DATE__') {
+      const fechaDesde = parseOptionalDateInput(req.query.fechaDesde ?? req.query.fecha_desde);
+      const fechaHasta = parseOptionalDateInput(req.query.fechaHasta ?? req.query.fecha_hasta);
+      const fechaOperacion = parseOptionalDateInput(req.query.fechaOperacion ?? req.query.fecha_operacion);
+      if (
+        fechaDesde === '__INVALID_DATE__'
+        || fechaHasta === '__INVALID_DATE__'
+        || fechaOperacion === '__INVALID_DATE__'
+      ) {
         return res.status(400).json({
           error: true,
           code: 'VENTAS_FECHA_INVALIDA',
-          message: 'fechaDesde y fechaHasta deben tener formato YYYY-MM-DD.'
+          message: 'fechaDesde, fechaHasta y fechaOperacion deben tener formato YYYY-MM-DD.'
         });
       }
 
@@ -5654,9 +5696,7 @@ router.get(
         });
       }
 
-      const idSucursalRaw = req.query.idSucursal ?? req.query.id_sucursal;
-      const idSucursalRequested = parseOptionalPositiveInt(idSucursalRaw);
-
+      const idSucursalRequested = parseOptionalPositiveInt(req.query.idSucursal ?? req.query.id_sucursal);
       let idSucursalEffective = null;
       if (scope.isSuperAdmin) {
         idSucursalEffective = idSucursalRequested;
@@ -5670,69 +5710,343 @@ router.get(
         }
       }
 
-      const canViewSucursales = await requestHasAnyPermission(req, ['SUCURSALES_VER']);
-      const canViewPedidos = await requestHasAnyPermission(req, ['VENTAS_VER', 'COCINA_VER']);
-      const canViewProductos = await requestHasAnyPermission(req, ['INVENTARIO_PRODUCTOS_VER']);
-      const canViewInsumos = await requestHasAnyPermission(req, ['INVENTARIO_INSUMOS_VER']);
       const canViewVentas = await requestHasAnyPermission(req, ['VENTAS_VER']);
+      const canViewPedidos = await requestHasAnyPermission(req, ['VENTAS_VER', 'COCINA_VER']);
+      const canViewInventario = await requestHasAnyPermission(req, [
+        'INVENTARIO_VER',
+        'INVENTARIO_PRODUCTOS_VER',
+        'INVENTARIO_INSUMOS_VER'
+      ]);
+      const canViewProductos = await requestHasAnyPermission(req, ['INVENTARIO_VER', 'INVENTARIO_PRODUCTOS_VER']);
+      const canViewInsumos = await requestHasAnyPermission(req, ['INVENTARIO_VER', 'INVENTARIO_INSUMOS_VER']);
+      const canViewCompras = await requestHasAnyPermission(req, ['OC_VER_FLUJO', 'OC_VER_DETALLE', 'OC_CREAR', 'OC_GESTIONAR']);
+      const canViewCaja = await requestHasAnyPermission(req, ['VENTAS_CAJAS_LISTADO_VER', 'VENTAS_CAJAS_REPORTE_VER']);
+      const selectedDate = fechaOperacion
+        || new Date().toLocaleDateString('en-CA', { timeZone: 'America/Tegucigalpa' });
+      const rangeStart = fechaDesde || selectedDate;
+      const rangeEnd = fechaHasta || selectedDate;
+      const skipCache = ['skip', 'bypass', '1', 'true'].includes(String(req.query.cache || '').trim().toLowerCase());
+      const cacheKey = getDashboardResumenCacheKey({
+        scope,
+        turno,
+        selectedDate,
+        rangeStart,
+        rangeEnd,
+        idSucursalEffective,
+        permissions: {
+          ventas: canViewVentas,
+          pedidos: canViewPedidos,
+          inventario: canViewInventario,
+          productos: canViewProductos,
+          insumos: canViewInsumos,
+          compras: canViewCompras,
+          caja: canViewCaja
+        }
+      });
 
-      const appendSucursalFilter = (filters, params, columnExpr) => {
+      if (!skipCache) {
+        pruneDashboardResumenCache();
+        const cached = dashboardResumenCache.get(cacheKey);
+        if (cached && cached.expiresAt > Date.now()) {
+          return res.status(200).json(cloneDashboardResumenCacheValue(cached.value));
+        }
+        if (cached) {
+          dashboardResumenCache.delete(cacheKey);
+        }
+      }
+
+      let isDegradedResponse = false;
+      const hasPedidosInventarioAlertas = await hasTable(pool, 'pedidos_inventario_alertas');
+      const hasProductosAlmacenes = await hasTable(pool, 'productos_almacenes');
+      const hasInsumosAlmacenes = await hasTable(pool, 'insumos_almacenes');
+      const hasVisibleEnCocinaAt = await hasPedidosColumn(pool, 'visible_en_cocina_at');
+      const hasComprasTable = await hasTable(pool, 'compras');
+      const hasCajaCierresTable = await hasTable(pool, 'cajas_cierres');
+
+      const appendScopeFilter = (filters, params, columnExpr) => {
         if (idSucursalEffective) {
           params.push(idSucursalEffective);
           filters.push(`${columnExpr} = $${params.length}`);
           return;
         }
-
         params.push(scope.allowedSucursalIds);
         filters.push(`${columnExpr} = ANY($${params.length}::int[])`);
       };
 
-      const summary = {
-        general: {
-          sucursales: null,
-          pedidos: null,
-          inventario: null
+      const dashboardData = {
+        ventas: {
+          totalHoy: 0,
+          totalCobradoHoy: 0,
+          facturasHoy: 0,
+          ticketPromedio: 0,
+          ventasUltimosDias: [],
+          productosVendidos: [],
+          resumenPeriodo: {
+            fechaDesde: rangeStart,
+            fechaHasta: rangeEnd,
+            totalCobrado: 0,
+            facturas: 0,
+            ticketPromedio: 0
+          }
         },
-        financial: null
+        inventario: {
+          productosActivos: 0,
+          insumosActivos: 0,
+          bajoStock: 0,
+          sinStock: 0,
+          alertasPendientes: 0,
+          movimientosRecientes: []
+        },
+        pedidos: {
+          abiertos: 0,
+          pendientesPago: 0,
+          enCocina: 0,
+          listosEntrega: 0,
+          pagadosHoy: 0,
+          flujoHorario: [],
+          porSucursal: []
+        },
+        compras: {
+          ordenesPendientes: 0,
+          comprasMes: 0
+        },
+        caja: {
+          sesionesAbiertas: 0,
+          cierresPendientes: 0
+        },
+        meta: {
+          sucursales: [],
+          sucursalesDisponibles: [],
+          sucursalesResumen: {
+            total: 0,
+            activas: 0
+          },
+          fechaOperacion: selectedDate
+        }
       };
 
-      if (canViewSucursales) {
-        try {
-          const sucursalFilters = ['1 = 1'];
-          const sucursalParams = [];
-          appendSucursalFilter(sucursalFilters, sucursalParams, 's.id_sucursal');
+      try {
+        const sucursalFilters = ['1 = 1'];
+        const sucursalParams = [];
+        sucursalParams.push(scope.allowedSucursalIds);
+        sucursalFilters.push(`s.id_sucursal = ANY($${sucursalParams.length}::int[])`);
+        const sucursalResult = await pool.query(
+          `
+            SELECT
+              s.id_sucursal,
+              s.nombre_sucursal,
+              COALESCE(s.estado, true) AS estado,
+              COUNT(*) OVER()::int AS total_scope,
+              COALESCE(
+                SUM(CASE WHEN COALESCE(s.estado, true) = true THEN 1 ELSE 0 END) OVER(),
+                0
+              )::int AS activas_scope
+            FROM public.sucursales s
+            WHERE ${sucursalFilters.join(' AND ')}
+            ORDER BY s.nombre_sucursal ASC, s.id_sucursal ASC
+          `,
+          sucursalParams
+        );
+        const sucursalesDisponibles = (sucursalResult.rows || []).map((row) => ({
+          id_sucursal: Number(row.id_sucursal),
+          nombre_sucursal: row.nombre_sucursal || `Sucursal #${row.id_sucursal}`,
+          estado: Boolean(row.estado)
+        }));
+        dashboardData.meta.sucursalesDisponibles = sucursalesDisponibles;
+        dashboardData.meta.sucursales = idSucursalEffective
+          ? sucursalesDisponibles.filter((row) => row.id_sucursal === idSucursalEffective)
+          : sucursalesDisponibles;
 
-          const sucursalResult = await pool.query(
+        const sucursalesScope = dashboardData.meta.sucursales;
+        const sucursalesActivasScope = sucursalesScope.filter((row) => Boolean(row.estado)).length;
+        dashboardData.meta.sucursalesResumen = {
+          total: sucursalesScope.length,
+          activas: sucursalesActivasScope
+        };
+      } catch (error) {
+        isDegradedResponse = true;
+        console.warn('[dashboard/resumen] No se pudo cargar sucursales.', {
+          message: error?.message || 'UNKNOWN_ERROR'
+        });
+        // Mantener 0 y arreglos vacios si la lectura de sucursales falla.
+      }
+
+      if (canViewVentas) {
+        try {
+          const ventasFilters = [];
+          const ventasParams = [];
+          const pushVentasFilter = (fragment, value) => {
+            ventasParams.push(value);
+            ventasFilters.push(fragment.replaceAll('$IDX', `$${ventasParams.length}`));
+          };
+
+          if (idSucursalEffective) {
+            pushVentasFilter('f.id_sucursal = $IDX', idSucursalEffective);
+          } else {
+            pushVentasFilter('f.id_sucursal = ANY($IDX::int[])', scope.allowedSucursalIds);
+          }
+          if (scope.limitedToLast72Hours) {
+            ventasFilters.push('f.fecha_hora_facturacion IS NOT NULL');
+            ventasFilters.push(`f.fecha_hora_facturacion >= ${VENTAS_LIMIT_72H_CUTOFF_SQL}`);
+          }
+
+          const ventasWhereSql = ventasFilters.length ? `WHERE ${ventasFilters.join(' AND ')}` : '';
+          const ventasResult = await pool.query(
             `
+              WITH facturas_scope AS (
+                SELECT
+                  f.id_factura,
+                  f.id_pedido,
+                  f.id_sucursal,
+                  COALESCE(
+                    f.fecha_operacion::date,
+                    (f.fecha_hora_facturacion AT TIME ZONE 'America/Tegucigalpa')::date
+                  ) AS fecha_operacion_local
+                FROM public.facturas f
+                ${ventasWhereSql}
+              ),
+              cobros_por_factura AS (
+                SELECT
+                  fc.id_factura,
+                  COALESCE(SUM(COALESCE(fc.monto, 0)), 0)::numeric(14,2) AS monto_cobrado
+                FROM public.facturas_cobros fc
+                GROUP BY fc.id_factura
+              )
               SELECT
-                COUNT(*)::int AS total,
+                COUNT(*) FILTER (WHERE fs.fecha_operacion_local = (NOW() AT TIME ZONE 'America/Tegucigalpa')::date)::int AS facturas_hoy,
                 COALESCE(
                   SUM(
                     CASE
-                      WHEN COALESCE(s.estado, true) = true THEN 1
+                      WHEN fs.fecha_operacion_local = (NOW() AT TIME ZONE 'America/Tegucigalpa')::date
+                        THEN COALESCE(cpf.monto_cobrado, 0)
                       ELSE 0
                     END
                   ),
                   0
-                )::int AS activas
-              FROM public.sucursales s
-              WHERE ${sucursalFilters.join(' AND ')}
+                )::numeric(14,2) AS total_cobrado_hoy,
+                COUNT(*) FILTER (WHERE fs.fecha_operacion_local BETWEEN $${ventasParams.length + 1}::date AND $${ventasParams.length + 2}::date)::int AS facturas_periodo,
+                COALESCE(
+                  SUM(
+                    CASE
+                      WHEN fs.fecha_operacion_local BETWEEN $${ventasParams.length + 1}::date AND $${ventasParams.length + 2}::date
+                        THEN COALESCE(cpf.monto_cobrado, 0)
+                      ELSE 0
+                    END
+                  ),
+                  0
+                )::numeric(14,2) AS total_cobrado_periodo
+              FROM facturas_scope fs
+              LEFT JOIN cobros_por_factura cpf ON cpf.id_factura = fs.id_factura
             `,
-            sucursalParams
+            [...ventasParams, rangeStart, rangeEnd]
           );
 
-          summary.general.sucursales = {
-            total: Number.parseInt(String(sucursalResult.rows?.[0]?.total ?? '0'), 10) || 0,
-            activas: Number.parseInt(String(sucursalResult.rows?.[0]?.activas ?? '0'), 10) || 0
+          const ventasRow = ventasResult.rows?.[0] || {};
+          const facturasHoy = Number.parseInt(String(ventasRow.facturas_hoy ?? '0'), 10) || 0;
+          const totalCobradoHoy = roundMoney(ventasRow.total_cobrado_hoy);
+          const facturasPeriodo = Number.parseInt(String(ventasRow.facturas_periodo ?? '0'), 10) || 0;
+          const totalCobradoPeriodo = roundMoney(ventasRow.total_cobrado_periodo);
+
+          dashboardData.ventas.totalHoy = totalCobradoHoy;
+          dashboardData.ventas.totalCobradoHoy = totalCobradoHoy;
+          dashboardData.ventas.facturasHoy = facturasHoy;
+          dashboardData.ventas.ticketPromedio = facturasHoy > 0 ? roundMoney(totalCobradoHoy / facturasHoy) : 0;
+          dashboardData.ventas.resumenPeriodo = {
+            fechaDesde: rangeStart,
+            fechaHasta: rangeEnd,
+            totalCobrado: totalCobradoPeriodo,
+            facturas: facturasPeriodo,
+            ticketPromedio: facturasPeriodo > 0 ? roundMoney(totalCobradoPeriodo / facturasPeriodo) : 0
           };
-        } catch {
-          summary.general.sucursales = null;
+
+          const ventasUltimosDiasResult = await pool.query(
+            `
+              WITH facturas_scope AS (
+                SELECT
+                  f.id_factura,
+                  COALESCE(
+                    f.fecha_operacion::date,
+                    (f.fecha_hora_facturacion AT TIME ZONE 'America/Tegucigalpa')::date
+                  ) AS fecha_operacion_local
+                FROM public.facturas f
+                ${ventasWhereSql}
+              ),
+              cobros_por_factura AS (
+                SELECT
+                  fc.id_factura,
+                  COALESCE(SUM(COALESCE(fc.monto, 0)), 0)::numeric(14,2) AS monto_cobrado
+                FROM public.facturas_cobros fc
+                GROUP BY fc.id_factura
+              )
+              SELECT
+                fs.fecha_operacion_local::text AS fecha,
+                COUNT(*)::int AS facturas,
+                COALESCE(SUM(COALESCE(cpf.monto_cobrado, 0)), 0)::numeric(14,2) AS total_cobrado
+              FROM facturas_scope fs
+              LEFT JOIN cobros_por_factura cpf ON cpf.id_factura = fs.id_factura
+              WHERE fs.fecha_operacion_local BETWEEN ((NOW() AT TIME ZONE 'America/Tegucigalpa')::date - INTERVAL '6 days')::date
+                AND (NOW() AT TIME ZONE 'America/Tegucigalpa')::date
+              GROUP BY fs.fecha_operacion_local
+              ORDER BY fs.fecha_operacion_local ASC
+            `,
+            ventasParams
+          );
+          dashboardData.ventas.ventasUltimosDias = (ventasUltimosDiasResult.rows || []).map((row) => ({
+            fecha: row.fecha,
+            facturas: Number.parseInt(String(row.facturas ?? '0'), 10) || 0,
+            totalCobrado: roundMoney(row.total_cobrado)
+          }));
+
+          const productosVendidosResult = await pool.query(
+            `
+              WITH facturas_scope AS (
+                SELECT
+                  f.id_factura
+                FROM public.facturas f
+                ${ventasWhereSql}
+                  ${ventasWhereSql ? 'AND' : 'WHERE'}
+                  COALESCE(
+                    f.fecha_operacion::date,
+                    (f.fecha_hora_facturacion AT TIME ZONE 'America/Tegucigalpa')::date
+                  ) BETWEEN $${ventasParams.length + 1}::date AND $${ventasParams.length + 2}::date
+              )
+              SELECT
+                COALESCE(
+                  dfo.origen_snapshot->>'nombre_item',
+                  df.origen_snapshot->>'nombre_item',
+                  prod.nombre_producto,
+                  rec.nombre_receta,
+                  'Item'
+                ) AS nombre_item,
+                COALESCE(SUM(COALESCE(df.cantidad, 1)), 0)::numeric(14,2) AS cantidad,
+                COALESCE(SUM(COALESCE(df.total_detalle, df.sub_total, 0)), 0)::numeric(14,2) AS subtotal
+              FROM facturas_scope fs
+              INNER JOIN public.detalle_facturas df ON df.id_factura = fs.id_factura
+              LEFT JOIN public.detalle_facturas_origen dfo ON dfo.id_detalle_factura = df.id_detalle_factura
+              LEFT JOIN public.productos prod ON prod.id_producto = df.id_producto
+              LEFT JOIN public.recetas rec ON rec.id_receta = df.id_receta
+              GROUP BY 1
+              ORDER BY cantidad DESC, subtotal DESC, nombre_item ASC
+              LIMIT 5
+            `,
+            [...ventasParams, rangeStart, rangeEnd]
+          );
+          dashboardData.ventas.productosVendidos = (productosVendidosResult.rows || []).map((row) => ({
+            nombre: row.nombre_item || 'Item',
+            cantidad: Number(row.cantidad || 0),
+            subtotal: roundMoney(row.subtotal)
+          }));
+        } catch (error) {
+          isDegradedResponse = true;
+          console.warn('[dashboard/resumen] No se pudo cargar ventas.', {
+            message: error?.message || 'UNKNOWN_ERROR'
+          });
+          // Mantener valores por defecto si falla el bloque de ventas.
         }
       }
 
       if (canViewPedidos) {
         try {
-          const hasVisibleEnCocinaAt = await hasPedidosColumn(pool, 'visible_en_cocina_at');
           const pedidosOperationalDateExpr = hasVisibleEnCocinaAt
             ? `
               COALESCE(
@@ -5776,22 +6090,18 @@ router.get(
               estadoListo || 0
             ];
             const pedidoFilters = ['p.id_estado_pedido = ANY($1::int[])'];
-            appendSucursalFilter(pedidoFilters, pedidoParams, 'p.id_sucursal');
+            appendScopeFilter(pedidoFilters, pedidoParams, 'p.id_sucursal');
             pedidoFilters.push(`
               ${pedidosOperationalDateExpr} = (NOW() AT TIME ZONE 'America/Tegucigalpa')::date
             `);
-
             if (turno !== 'all') {
               const hourCondition = turno === 'manana'
                 ? `EXTRACT(HOUR FROM ${pedidosOperationalTimestampExpr}) < 12`
                 : turno === 'tarde'
-                  ? `EXTRACT(HOUR FROM ${pedidosOperationalTimestampExpr}) >= 12
-                     AND EXTRACT(HOUR FROM ${pedidosOperationalTimestampExpr}) < 18`
+                  ? `EXTRACT(HOUR FROM ${pedidosOperationalTimestampExpr}) >= 12 AND EXTRACT(HOUR FROM ${pedidosOperationalTimestampExpr}) < 18`
                   : `EXTRACT(HOUR FROM ${pedidosOperationalTimestampExpr}) >= 18`;
               pedidoFilters.push(`(${hourCondition})`);
             }
-
-            const pedidosWhereClause = `WHERE ${pedidoFilters.join(' AND ')}`;
 
             const pedidosSummaryResult = await pool.query(
               `
@@ -5812,18 +6122,31 @@ router.get(
                     f.id_factura DESC
                   LIMIT 1
                 ) f ON TRUE
-                ${pedidosWhereClause}
+                WHERE ${pedidoFilters.join(' AND ')}
               `,
               pedidoParams
             );
+            const pedidosRow = pedidosSummaryResult.rows?.[0] || {};
+            dashboardData.pedidos.abiertos = Number.parseInt(String(pedidosRow.total_operacion ?? '0'), 10) || 0;
+            dashboardData.pedidos.pendientesPago = Number.parseInt(String(pedidosRow.pendientes_pago ?? '0'), 10) || 0;
+            dashboardData.pedidos.enCocina = Number.parseInt(String(pedidosRow.en_cocina ?? '0'), 10) || 0;
+            dashboardData.pedidos.listosEntrega = Number.parseInt(String(pedidosRow.listos_entrega ?? '0'), 10) || 0;
+          }
 
-            const ordersFlowResult = await pool.query(
-              `
+          const flujoParams = [];
+          const flujoFilters = [];
+          appendScopeFilter(flujoFilters, flujoParams, 'p.id_sucursal');
+          flujoParams.push(selectedDate);
+          flujoFilters.push(`${pedidosOperationalDateExpr} = $${flujoParams.length}::date`);
+
+          const flujoResult = await pool.query(
+            `
+              WITH hours AS (
+                SELECT generate_series(0, 23) AS hour_num
+              ),
+              pedidos_agrupados AS (
                 SELECT
-                  TO_CHAR(
-                    DATE_TRUNC('hour', ${pedidosOperationalTimestampExpr}),
-                    'HH24:00'
-                  ) AS hour,
+                  EXTRACT(HOUR FROM ${pedidosOperationalTimestampExpr})::int AS hour_num,
                   COUNT(*)::int AS pedidos
                 FROM public.pedidos p
                 LEFT JOIN LATERAL (
@@ -5837,187 +6160,438 @@ router.get(
                     f.id_factura DESC
                   LIMIT 1
                 ) f ON TRUE
-                ${pedidosWhereClause}
+                WHERE ${flujoFilters.join(' AND ')}
                 GROUP BY 1
-                ORDER BY 1
-              `,
-              pedidoParams
-            );
+              )
+              SELECT
+                LPAD(hours.hour_num::text, 2, '0') || ':00' AS hour,
+                COALESCE(pedidos_agrupados.pedidos, 0)::int AS pedidos
+              FROM hours
+              LEFT JOIN pedidos_agrupados ON pedidos_agrupados.hour_num = hours.hour_num
+              ORDER BY hours.hour_num
+            `,
+            flujoParams
+          );
+          dashboardData.pedidos.flujoHorario = (flujoResult.rows || []).map((row) => ({
+            hour: row.hour,
+            pedidos: Number.parseInt(String(row.pedidos ?? '0'), 10) || 0
+          }));
 
-            const pedidosRow = pedidosSummaryResult.rows?.[0] || {};
-            summary.general.pedidos = {
-              totalOperacion: Number.parseInt(String(pedidosRow.total_operacion ?? '0'), 10) || 0,
-              pendientesPago: Number.parseInt(String(pedidosRow.pendientes_pago ?? '0'), 10) || 0,
-              enCocina: Number.parseInt(String(pedidosRow.en_cocina ?? '0'), 10) || 0,
-              listosEntrega: Number.parseInt(String(pedidosRow.listos_entrega ?? '0'), 10) || 0,
-              flujoHorario: ordersFlowResult.rows.map((row) => ({
-                hour: row.hour,
-                pedidos: Number.parseInt(String(row.pedidos ?? '0'), 10) || 0
-              }))
-            };
-          }
-        } catch {
-          summary.general.pedidos = null;
+          const pedidosPagadosResult = await pool.query(
+            `
+              SELECT COUNT(DISTINCT f.id_pedido)::int AS pagados_hoy
+              FROM public.facturas f
+              WHERE f.id_pedido IS NOT NULL
+                AND COALESCE(
+                  f.fecha_operacion::date,
+                  (f.fecha_hora_facturacion AT TIME ZONE 'America/Tegucigalpa')::date
+                ) = (NOW() AT TIME ZONE 'America/Tegucigalpa')::date
+                AND ${idSucursalEffective ? 'f.id_sucursal = $1' : 'f.id_sucursal = ANY($1::int[])'}
+            `,
+            [idSucursalEffective || scope.allowedSucursalIds]
+          );
+          dashboardData.pedidos.pagadosHoy = Number.parseInt(
+            String(pedidosPagadosResult.rows?.[0]?.pagados_hoy ?? '0'),
+            10
+          ) || 0;
+
+          const pedidosPorSucursalResult = await pool.query(
+            `
+              WITH pedidos_hoy AS (
+                SELECT
+                  p.id_sucursal,
+                  COUNT(*)::int AS pedidos
+                FROM public.pedidos p
+                LEFT JOIN LATERAL (
+                  SELECT f.*
+                  FROM public.facturas f
+                  WHERE f.id_pedido = p.id_pedido
+                    AND f.id_sucursal = p.id_sucursal
+                  ORDER BY
+                    f.fecha_operacion DESC NULLS LAST,
+                    f.fecha_hora_facturacion DESC NULLS LAST,
+                    f.id_factura DESC
+                  LIMIT 1
+                ) f ON TRUE
+                WHERE ${idSucursalEffective ? 'p.id_sucursal = $1' : 'p.id_sucursal = ANY($1::int[])'}
+                  AND ${pedidosOperationalDateExpr} = (NOW() AT TIME ZONE 'America/Tegucigalpa')::date
+                GROUP BY p.id_sucursal
+              )
+              SELECT
+                s.id_sucursal,
+                s.nombre_sucursal,
+                COALESCE(pedidos_hoy.pedidos, 0)::int AS pedidos
+              FROM public.sucursales s
+              LEFT JOIN pedidos_hoy ON pedidos_hoy.id_sucursal = s.id_sucursal
+              WHERE ${idSucursalEffective ? 's.id_sucursal = $1' : 's.id_sucursal = ANY($1::int[])'}
+              ORDER BY pedidos DESC, s.nombre_sucursal ASC
+            `,
+            [idSucursalEffective || scope.allowedSucursalIds]
+          );
+          dashboardData.pedidos.porSucursal = (pedidosPorSucursalResult.rows || []).map((row) => ({
+            id_sucursal: Number(row.id_sucursal),
+            nombre_sucursal: row.nombre_sucursal || `Sucursal #${row.id_sucursal}`,
+            pedidos: Number.parseInt(String(row.pedidos ?? '0'), 10) || 0
+          }));
+        } catch (error) {
+          isDegradedResponse = true;
+          console.warn('[dashboard/resumen] No se pudo cargar pedidos.', {
+            message: error?.message || 'UNKNOWN_ERROR'
+          });
+          // Mantener valores por defecto si falla el bloque de pedidos.
         }
       }
 
-      if (canViewProductos || canViewInsumos) {
+      if (canViewInventario) {
         try {
-          const inventoryBlocks = [];
-          const inventoryParams = [];
-
           if (canViewProductos) {
-            const filters = ['COALESCE(p.estado, true) = true'];
-            appendSucursalFilter(filters, inventoryParams, 'a.id_sucursal');
-            inventoryBlocks.push(`
-              SELECT
-                COALESCE(SUM(CASE WHEN COALESCE(p.cantidad, 0) <= 0 THEN 1 ELSE 0 END), 0)::int AS agotados,
-                COALESCE(SUM(CASE WHEN COALESCE(p.cantidad, 0) > 0 AND COALESCE(p.cantidad, 0) <= COALESCE(p.stock_minimo, 0) THEN 1 ELSE 0 END), 0)::int AS stock_bajo,
-                COUNT(*)::int AS catalogo_activo
-              FROM public.productos p
-              LEFT JOIN public.almacenes a ON a.id_almacen = p.id_almacen
-              WHERE ${filters.join(' AND ')}
-            `);
+            const shouldAggregateProductosByBranch = hasProductosAlmacenes && !idSucursalEffective;
+            const productoAssignmentsSql = hasProductosAlmacenes
+              ? `
+                LEFT JOIN LATERAL (
+                  SELECT
+                    COUNT(*)::int AS rows_count,
+                    COALESCE(SUM(COALESCE(pa.cantidad, 0)), 0)::numeric(14,4) AS cantidad_total
+                  FROM public.productos_almacenes pa
+                  INNER JOIN public.almacenes a ON a.id_almacen = pa.id_almacen
+                  WHERE pa.id_producto = p.id_producto
+                    AND ${idSucursalEffective ? 'a.id_sucursal = $1' : 'a.id_sucursal = ANY($1::int[])'}
+                ) pa_scope ON TRUE
+              `
+              : `
+                LEFT JOIN LATERAL (
+                  SELECT 0::int AS rows_count, 0::numeric(14,4) AS cantidad_total
+                ) pa_scope ON TRUE
+              `;
+            const productoScopeWhereSql = hasProductosAlmacenes
+              ? `
+                WHERE COALESCE(pa_scope.rows_count, 0) > 0
+              `
+              : `
+                LEFT JOIN public.almacenes a_producto_scope ON a_producto_scope.id_almacen = p.id_almacen
+                WHERE ${idSucursalEffective ? 'a_producto_scope.id_sucursal = $1' : 'a_producto_scope.id_sucursal = ANY($1::int[])'}
+              `;
+            const productosResult = shouldAggregateProductosByBranch
+              ? await pool.query(
+                `
+                  WITH productos_scope AS (
+                    SELECT
+                      a.id_sucursal,
+                      pa.id_producto,
+                      COALESCE(SUM(COALESCE(pa.cantidad, 0)), 0)::numeric(14,4) AS cantidad_total
+                    FROM public.productos_almacenes pa
+                    INNER JOIN public.almacenes a ON a.id_almacen = pa.id_almacen
+                    WHERE a.id_sucursal = ANY($1::int[])
+                    GROUP BY a.id_sucursal, pa.id_producto
+                  )
+                  SELECT
+                    COUNT(*) FILTER (WHERE COALESCE(p.estado, true) = true)::int AS activos,
+                    COUNT(*) FILTER (
+                      WHERE COALESCE(p.estado, true) = true
+                        AND COALESCE(ps.cantidad_total, 0) <= COALESCE(p.stock_minimo, 0)
+                    )::int AS bajo_stock,
+                    COUNT(*) FILTER (
+                      WHERE COALESCE(p.estado, true) = true
+                        AND COALESCE(ps.cantidad_total, 0) <= 0
+                    )::int AS sin_stock
+                  FROM productos_scope ps
+                  INNER JOIN public.productos p ON p.id_producto = ps.id_producto
+                `,
+                [scope.allowedSucursalIds]
+              )
+              : await pool.query(
+                `
+                  SELECT
+                    COUNT(*) FILTER (WHERE COALESCE(p.estado, true) = true)::int AS activos,
+                    COUNT(*) FILTER (
+                      WHERE COALESCE(p.estado, true) = true
+                        AND COALESCE(
+                          CASE
+                            WHEN COALESCE(pa_scope.rows_count, 0) > 0 THEN pa_scope.cantidad_total
+                            ELSE p.cantidad
+                          END,
+                          0
+                        ) <= COALESCE(p.stock_minimo, 0)
+                    )::int AS bajo_stock,
+                    COUNT(*) FILTER (
+                      WHERE COALESCE(p.estado, true) = true
+                        AND COALESCE(
+                          CASE
+                            WHEN COALESCE(pa_scope.rows_count, 0) > 0 THEN pa_scope.cantidad_total
+                            ELSE p.cantidad
+                          END,
+                          0
+                        ) <= 0
+                    )::int AS sin_stock
+                  FROM public.productos p
+                  ${productoAssignmentsSql}
+                  ${productoScopeWhereSql}
+                `,
+                [idSucursalEffective || scope.allowedSucursalIds]
+              );
+            dashboardData.inventario.productosActivos = Number.parseInt(
+              String(productosResult.rows?.[0]?.activos ?? '0'),
+              10
+            ) || 0;
+            dashboardData.inventario.bajoStock += Number.parseInt(
+              String(productosResult.rows?.[0]?.bajo_stock ?? '0'),
+              10
+            ) || 0;
+            dashboardData.inventario.sinStock += Number.parseInt(
+              String(productosResult.rows?.[0]?.sin_stock ?? '0'),
+              10
+            ) || 0;
           }
 
           if (canViewInsumos) {
-            const filters = ['COALESCE(i.estado, true) = true'];
-            appendSucursalFilter(filters, inventoryParams, 'a.id_sucursal');
-            inventoryBlocks.push(`
-              SELECT
-                COALESCE(SUM(CASE WHEN COALESCE(i.cantidad, 0) <= 0 THEN 1 ELSE 0 END), 0)::int AS agotados,
-                COALESCE(SUM(CASE WHEN COALESCE(i.cantidad, 0) > 0 AND COALESCE(i.cantidad, 0) <= COALESCE(i.stock_minimo, 0) THEN 1 ELSE 0 END), 0)::int AS stock_bajo,
-                COUNT(*)::int AS catalogo_activo
-              FROM public.insumos i
-              LEFT JOIN public.almacenes a ON a.id_almacen = i.id_almacen
-              WHERE ${filters.join(' AND ')}
-            `);
-          }
-
-          if (inventoryBlocks.length > 0) {
-            const inventoryResult = await pool.query(
+            const shouldAggregateInsumosByBranch = hasInsumosAlmacenes && !idSucursalEffective;
+            const insumoAssignmentsSql = hasInsumosAlmacenes
+              ? `
+                LEFT JOIN LATERAL (
+                  SELECT
+                    COUNT(*)::int AS rows_count,
+                    COALESCE(SUM(COALESCE(ia.cantidad, 0)), 0)::numeric(14,4) AS cantidad_total
+                  FROM public.insumos_almacenes ia
+                  INNER JOIN public.almacenes a ON a.id_almacen = ia.id_almacen
+                  WHERE ia.id_insumo = i.id_insumo
+                    AND ${idSucursalEffective ? 'a.id_sucursal = $1' : 'a.id_sucursal = ANY($1::int[])'}
+                ) ia_scope ON TRUE
               `
-                SELECT
-                  COALESCE(SUM(base.agotados), 0)::int AS agotados,
-                  COALESCE(SUM(base.stock_bajo), 0)::int AS stock_bajo,
-                  COALESCE(SUM(base.catalogo_activo), 0)::int AS catalogo_activo
-                FROM (
-                  ${inventoryBlocks.join('\nUNION ALL\n')}
-                ) base
+              : `
+                LEFT JOIN LATERAL (
+                  SELECT 0::int AS rows_count, 0::numeric(14,4) AS cantidad_total
+                ) ia_scope ON TRUE
+              `;
+            const insumoScopeWhereSql = hasInsumosAlmacenes
+              ? `
+                WHERE COALESCE(ia_scope.rows_count, 0) > 0
+              `
+              : `
+                LEFT JOIN public.almacenes a_insumo_scope ON a_insumo_scope.id_almacen = i.id_almacen
+                WHERE ${idSucursalEffective ? 'a_insumo_scope.id_sucursal = $1' : 'a_insumo_scope.id_sucursal = ANY($1::int[])'}
+              `;
+            const insumosResult = shouldAggregateInsumosByBranch
+              ? await pool.query(
+                `
+                  WITH insumos_scope AS (
+                    SELECT
+                      a.id_sucursal,
+                      ia.id_insumo,
+                      COALESCE(SUM(COALESCE(ia.cantidad, 0)), 0)::numeric(14,4) AS cantidad_total
+                    FROM public.insumos_almacenes ia
+                    INNER JOIN public.almacenes a ON a.id_almacen = ia.id_almacen
+                    WHERE a.id_sucursal = ANY($1::int[])
+                    GROUP BY a.id_sucursal, ia.id_insumo
+                  )
+                  SELECT
+                    COUNT(*) FILTER (WHERE COALESCE(i.estado, true) = true)::int AS activos,
+                    COUNT(*) FILTER (
+                      WHERE COALESCE(i.estado, true) = true
+                        AND COALESCE(ins_scope.cantidad_total, 0) <= COALESCE(i.stock_minimo, 0)
+                    )::int AS bajo_stock,
+                    COUNT(*) FILTER (
+                      WHERE COALESCE(i.estado, true) = true
+                        AND COALESCE(ins_scope.cantidad_total, 0) <= 0
+                    )::int AS sin_stock
+                  FROM insumos_scope ins_scope
+                  INNER JOIN public.insumos i ON i.id_insumo = ins_scope.id_insumo
+                `,
+                [scope.allowedSucursalIds]
+              )
+              : await pool.query(
+                `
+                  SELECT
+                    COUNT(*) FILTER (WHERE COALESCE(i.estado, true) = true)::int AS activos,
+                    COUNT(*) FILTER (
+                      WHERE COALESCE(i.estado, true) = true
+                        AND COALESCE(
+                          CASE
+                            WHEN COALESCE(ia_scope.rows_count, 0) > 0 THEN ia_scope.cantidad_total
+                            ELSE i.cantidad
+                          END,
+                          0
+                        ) <= COALESCE(i.stock_minimo, 0)
+                    )::int AS bajo_stock,
+                    COUNT(*) FILTER (
+                      WHERE COALESCE(i.estado, true) = true
+                        AND COALESCE(
+                          CASE
+                            WHEN COALESCE(ia_scope.rows_count, 0) > 0 THEN ia_scope.cantidad_total
+                            ELSE i.cantidad
+                          END,
+                          0
+                        ) <= 0
+                    )::int AS sin_stock
+                  FROM public.insumos i
+                  ${insumoAssignmentsSql}
+                  ${insumoScopeWhereSql}
+                `,
+                [idSucursalEffective || scope.allowedSucursalIds]
+              );
+            dashboardData.inventario.insumosActivos = Number.parseInt(
+              String(insumosResult.rows?.[0]?.activos ?? '0'),
+              10
+            ) || 0;
+            dashboardData.inventario.bajoStock += Number.parseInt(
+              String(insumosResult.rows?.[0]?.bajo_stock ?? '0'),
+              10
+            ) || 0;
+            dashboardData.inventario.sinStock += Number.parseInt(
+              String(insumosResult.rows?.[0]?.sin_stock ?? '0'),
+              10
+            ) || 0;
+          }
+
+          if (hasPedidosInventarioAlertas) {
+            const alertasResult = await pool.query(
+              `
+                SELECT COUNT(*)::int AS pendientes
+                FROM public.pedidos_inventario_alertas a
+                INNER JOIN public.pedidos p ON p.id_pedido = a.id_pedido
+                WHERE UPPER(COALESCE(a.estado, 'PENDIENTE')) = 'PENDIENTE'
+                  AND ${idSucursalEffective ? 'p.id_sucursal = $1' : 'p.id_sucursal = ANY($1::int[])'}
               `,
-              inventoryParams
+              [idSucursalEffective || scope.allowedSucursalIds]
             );
-
-            summary.general.inventario = {
-              agotados: Number.parseInt(String(inventoryResult.rows?.[0]?.agotados ?? '0'), 10) || 0,
-              stockBajo: Number.parseInt(String(inventoryResult.rows?.[0]?.stock_bajo ?? '0'), 10) || 0,
-              catalogoActivo: Number.parseInt(String(inventoryResult.rows?.[0]?.catalogo_activo ?? '0'), 10) || 0
-            };
-          }
-        } catch {
-          summary.general.inventario = null;
-        }
-      }
-
-      if (canViewVentas) {
-        try {
-          const filters = [];
-          const params = [];
-          const pushFilter = (fragment, value) => {
-            params.push(value);
-            filters.push(fragment.replaceAll('$IDX', `$${params.length}`));
-          };
-
-          if (idSucursalEffective) {
-            pushFilter('COALESCE(p.id_sucursal, f.id_sucursal) = $IDX', idSucursalEffective);
-          } else {
-            pushFilter('COALESCE(p.id_sucursal, f.id_sucursal) = ANY($IDX::int[])', scope.allowedSucursalIds);
+            dashboardData.inventario.alertasPendientes = Number.parseInt(
+              String(alertasResult.rows?.[0]?.pendientes ?? '0'),
+              10
+            ) || 0;
           }
 
-          if (scope.limitedToLast72Hours) {
-            filters.push(`f.fecha_hora_facturacion IS NOT NULL`);
-            filters.push(`f.fecha_hora_facturacion >= ${VENTAS_LIMIT_72H_CUTOFF_SQL}`);
-          }
-          if (fechaDesde) {
-            pushFilter('(f.fecha_hora_facturacion)::date >= $IDX::date', fechaDesde);
-          }
-          if (fechaHasta) {
-            pushFilter('(f.fecha_hora_facturacion)::date <= $IDX::date', fechaHasta);
-          }
-
-          const whereClause = filters.length ? `WHERE ${filters.join(' AND ')}` : '';
-          const financialResult = await pool.query(
+          const movimientosResult = await pool.query(
             `
               SELECT
-                COUNT(*)::int AS ventas,
-                COALESCE(
-                  SUM(
-                    COALESCE(
-                      df_info.subtotal_neto,
-                      p.total,
-                      0
-                    )
-                  ),
-                  0
-                )::numeric(14,2) AS total_vendido,
-                COALESCE(
-                  SUM(
-                    CASE
-                      WHEN p.id_pedido IS NULL THEN 1
-                      WHEN LOWER(COALESCE(ep.descripcion, '')) IN (
-                        'completada',
-                        'completado',
-                        'finalizada',
-                        'finalizado',
-                        'pagada',
-                        'pagado',
-                        'cerrada',
-                        'cerrado',
-                        'lista',
-                        'listo'
-                      ) THEN 1
-                      ELSE 0
-                    END
-                  ),
-                  0
-                )::int AS completadas
-              FROM facturas f
-              LEFT JOIN pedidos p ON p.id_pedido = f.id_pedido
-              LEFT JOIN estados_pedido ep ON ep.id_estado_pedido = p.id_estado_pedido
-              LEFT JOIN LATERAL (
-                SELECT
-                  COALESCE(SUM(df.total_detalle), 0)::numeric(12,2) AS subtotal_neto
-                FROM detalle_facturas df
-                WHERE df.id_factura = f.id_factura
-              ) df_info ON true
-              ${whereClause}
+                m.id_movimiento,
+                m.fecha_mov,
+                m.tipo,
+                COALESCE(m.descripcion, '') AS descripcion,
+                COALESCE(m.cantidad, 0)::numeric(14,4) AS cantidad,
+                a.id_sucursal,
+                COALESCE(prod.nombre_producto, ins.nombre_insumo, 'Movimiento') AS nombre_recurso
+              FROM public.movimientos_inventario m
+              LEFT JOIN public.almacenes a ON a.id_almacen = m.id_almacen
+              LEFT JOIN public.productos prod ON prod.id_producto = m.id_producto
+              LEFT JOIN public.insumos ins ON ins.id_insumo = m.id_insumo
+              WHERE ${idSucursalEffective ? 'a.id_sucursal = $1' : 'a.id_sucursal = ANY($1::int[])'}
+              ORDER BY m.fecha_mov DESC, m.id_movimiento DESC
+              LIMIT 10
             `,
-            params
+            [idSucursalEffective || scope.allowedSucursalIds]
           );
-
-          const financialRow = financialResult.rows?.[0] || {};
-          const ventas = Number.parseInt(String(financialRow.ventas ?? '0'), 10) || 0;
-          const totalVendido = roundMoney(financialRow.total_vendido);
-          const completadas = Number.parseInt(String(financialRow.completadas ?? '0'), 10) || 0;
-          const pendientes = Math.max(ventas - completadas, 0);
-
-          summary.financial = {
-            ventas,
-            totalVendido,
-            ticketPromedio: ventas > 0 ? roundMoney(totalVendido / ventas) : 0,
-            completadas,
-            pendientes,
-            fechaDesde: fechaDesde || null,
-            fechaHasta: fechaHasta || null
-          };
-        } catch {
-          summary.financial = null;
+          dashboardData.inventario.movimientosRecientes = (movimientosResult.rows || []).map((row) => ({
+            id_movimiento: Number(row.id_movimiento),
+            fecha_mov: row.fecha_mov,
+            tipo: row.tipo || '',
+            descripcion: row.descripcion || '',
+            cantidad: Number(row.cantidad || 0),
+            id_sucursal: Number(row.id_sucursal || 0),
+            nombre_recurso: row.nombre_recurso || 'Movimiento'
+          }));
+        } catch (error) {
+          isDegradedResponse = true;
+          console.warn('[dashboard/resumen] No se pudo cargar inventario.', {
+            message: error?.message || 'UNKNOWN_ERROR'
+          });
+          // Mantener valores por defecto si falla el bloque de inventario.
         }
       }
 
-      return res.status(200).json({
+      if (canViewCompras) {
+        try {
+          const ordenesResult = await pool.query(
+            `
+              SELECT COUNT(DISTINCT oc.id_orden_compra)::int AS ordenes_pendientes
+              FROM public.orden_compras oc
+              INNER JOIN public.detalle_orden_compras doc ON doc.id_orden_compra = oc.id_orden_compra
+              LEFT JOIN public.almacenes a_dest ON a_dest.id_almacen = doc.id_almacen_destino
+              LEFT JOIN public.productos p_doc ON p_doc.id_producto = doc.id_producto
+              LEFT JOIN public.insumos i_doc ON i_doc.id_insumo = doc.id_insumo
+              LEFT JOIN public.almacenes a_item ON a_item.id_almacen = COALESCE(p_doc.id_almacen, i_doc.id_almacen)
+              WHERE UPPER(COALESCE(oc.estado_flujo, '')) IN ('PENDIENTE', 'APROBADA', 'EN_COMPRA')
+                AND COALESCE(a_dest.id_sucursal, a_item.id_sucursal) ${idSucursalEffective ? '= $1' : '= ANY($1::int[])'}
+            `,
+            [idSucursalEffective || scope.allowedSucursalIds]
+          );
+          dashboardData.compras.ordenesPendientes = Number.parseInt(
+            String(ordenesResult.rows?.[0]?.ordenes_pendientes ?? '0'),
+            10
+          ) || 0;
+
+          if (hasComprasTable) {
+            const comprasMesResult = await pool.query(
+              `
+                SELECT COALESCE(SUM(COALESCE(c.total, 0)), 0)::numeric(14,2) AS compras_mes
+                FROM public.compras c
+                LEFT JOIN public.orden_compras oc ON oc.id_orden_compra = c.id_orden_compra
+                LEFT JOIN public.detalle_orden_compras doc ON doc.id_orden_compra = oc.id_orden_compra
+                LEFT JOIN public.almacenes a_dest ON a_dest.id_almacen = doc.id_almacen_destino
+                LEFT JOIN public.productos p_doc ON p_doc.id_producto = doc.id_producto
+                LEFT JOIN public.insumos i_doc ON i_doc.id_insumo = doc.id_insumo
+                LEFT JOIN public.almacenes a_item ON a_item.id_almacen = COALESCE(p_doc.id_almacen, i_doc.id_almacen)
+                WHERE DATE_TRUNC('month', c.fecha::timestamp) = DATE_TRUNC('month', NOW() AT TIME ZONE 'America/Tegucigalpa')
+                  AND COALESCE(a_dest.id_sucursal, a_item.id_sucursal) ${idSucursalEffective ? '= $1' : '= ANY($1::int[])'}
+              `,
+              [idSucursalEffective || scope.allowedSucursalIds]
+            );
+            dashboardData.compras.comprasMes = roundMoney(comprasMesResult.rows?.[0]?.compras_mes);
+          }
+        } catch (error) {
+          isDegradedResponse = true;
+          console.warn('[dashboard/resumen] No se pudo cargar compras.', {
+            message: error?.message || 'UNKNOWN_ERROR'
+          });
+          // Mantener valores por defecto si falla el bloque de compras.
+        }
+      }
+
+      if (canViewCaja) {
+        try {
+          const sesionesResult = await pool.query(
+            `
+              SELECT COUNT(*)::int AS sesiones_abiertas
+              FROM public.cajas_sesiones cs
+              INNER JOIN public.cat_cajas_sesiones_estados estado
+                ON estado.id_estado_sesion_caja = cs.id_estado_sesion_caja
+              WHERE UPPER(COALESCE(estado.codigo, estado.nombre, '')) = 'ABIERTA'
+                AND ${idSucursalEffective ? 'cs.id_sucursal = $1' : 'cs.id_sucursal = ANY($1::int[])'}
+            `,
+            [idSucursalEffective || scope.allowedSucursalIds]
+          );
+          dashboardData.caja.sesionesAbiertas = Number.parseInt(
+            String(sesionesResult.rows?.[0]?.sesiones_abiertas ?? '0'),
+            10
+          ) || 0;
+
+          if (hasCajaCierresTable) {
+            const cierresResult = await pool.query(
+              `
+                SELECT COUNT(*)::int AS cierres_pendientes
+                FROM public.cajas_sesiones cs
+                LEFT JOIN public.cajas_cierres cc ON cc.id_sesion_caja = cs.id_sesion_caja
+                WHERE cs.fecha_cierre IS NOT NULL
+                  AND cc.id_cierre_caja IS NULL
+                  AND ${idSucursalEffective ? 'cs.id_sucursal = $1' : 'cs.id_sucursal = ANY($1::int[])'}
+              `,
+              [idSucursalEffective || scope.allowedSucursalIds]
+            );
+            dashboardData.caja.cierresPendientes = Number.parseInt(
+              String(cierresResult.rows?.[0]?.cierres_pendientes ?? '0'),
+              10
+            ) || 0;
+          }
+        } catch (error) {
+          isDegradedResponse = true;
+          console.warn('[dashboard/resumen] No se pudo cargar caja.', {
+            message: error?.message || 'UNKNOWN_ERROR'
+          });
+          // Mantener valores por defecto si falla el bloque de caja.
+        }
+      }
+
+      const responseBody = {
         success: true,
-        summary,
+        data: dashboardData,
         filters: {
           scope: {
             canSelectSucursal: scope.isSuperAdmin,
@@ -6029,11 +6603,40 @@ router.get(
           },
           turno
         }
-      });
+      };
+
+      if (!skipCache && !isDegradedResponse) {
+        pruneDashboardResumenCache();
+        dashboardResumenCache.set(cacheKey, {
+          value: responseBody,
+          expiresAt: Date.now() + getDashboardResumenCacheTtlMs()
+        });
+      }
+
+      return res.status(200).json(responseBody);
     } catch (err) {
+      console.error('Error en GET /dashboard/resumen:', err);
       return sendVentasInternalError(res);
     }
-  }
+};
+
+router.get(
+  '/dashboard/resumen',
+  checkPermission(['DASHBOARD_VER']),
+  handleDashboardResumen
+);
+
+router.get(
+  '/ventas/dashboard-resumen',
+  checkPermission([
+    'DASHBOARD_VER',
+    'VENTAS_VER',
+    'COCINA_VER',
+    'SUCURSALES_VER',
+    'INVENTARIO_PRODUCTOS_VER',
+    'INVENTARIO_INSUMOS_VER'
+  ]),
+  handleDashboardResumen
 );
 
 router.get(
