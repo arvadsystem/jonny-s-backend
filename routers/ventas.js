@@ -22,6 +22,9 @@ import {
   mapCajaFinancialLockError
 } from '../services/cajaFinancialLockService.js';
 import {
+  validateCajaSessionOpenForFinancialWrite
+} from '../services/cajaSessionWriteGuardService.js';
+import {
   listarAlertasInventarioPedido
 } from '../services/inventarioAlertasService.js';
 import {
@@ -8739,6 +8742,12 @@ router.post('/ventas/pedidos/:id/registrar-pago', checkPermission(['VENTAS_CREAR
     }
     ventasPerf.add('registrar_pago_scope_session_ms', scopeSessionStart);
     await lockCajaFinancialSession(client, sessionActiva.data.id_sesion_caja);
+    sessionActiva.data = await validateCajaSessionOpenForFinancialWrite({
+      client,
+      idSesionCaja: sessionActiva.data.id_sesion_caja,
+      idSucursal: idSucursalPedido,
+      idUsuario: userId
+    });
 
     const metodoPago = await resolveMetodoPagoRegistroPedido(client, {
       idMetodoPago: req.body?.id_metodo_pago,
@@ -9257,6 +9266,15 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
       items_count: allLines.length
     });
     await lockCajaFinancialSession(client, venta.id_sesion_caja);
+    const validatedCajaSession = await validateCajaSessionOpenForFinancialWrite({
+      client,
+      idSesionCaja: venta.id_sesion_caja,
+      idSucursal: venta.id_sucursal,
+      idUsuario: parseOptionalPositiveInt(venta.id_usuario) || userId
+    });
+    venta.id_caja = Number(validatedCajaSession.id_caja);
+    venta.id_sesion_caja = Number(validatedCajaSession.id_sesion_caja);
+    venta.id_sucursal = Number(validatedCajaSession.id_sucursal);
     const ventaHasExtras = hasVentaExtras(venta);
     const ventaHasSalsasInventario = getSelectedSalsaIdsFromLines(venta.all_lines).length > 0;
     if (ventaHasSalsasInventario) {
