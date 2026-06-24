@@ -13,6 +13,9 @@ import {
   lockCajaFinancialSession,
   mapCajaFinancialLockError
 } from '../services/cajaFinancialLockService.js';
+import {
+  canBypassCajaSucursalForAuxiliary
+} from '../services/cajaAssignmentRulesService.js';
 
 const router = express.Router();
 const CAJAS_SCOPE_PERMISSION = 'VENTAS_CAJAS_MULTISUCURSAL_VER';
@@ -3653,7 +3656,12 @@ router.post('/ventas/cajas/listado', checkPermission(['VENTAS_CAJAS_PARTICIPANTE
         throw createCajaError(403, 'VENTAS_CAJAS_ASSIGN_ROLE_FORBIDDEN', 'Solo super_admin puede asignar usuarios administradores como auxiliares.');
       }
       const userSucursalMatches = Number.parseInt(String(user.id_sucursal || ''), 10) === targetSucursalId;
-      const allowGlobalSuperAdminAuxiliary = puedeAuxiliar && !puedeResponsable && actorIsSuperAdmin && isCajaUserAdminLike(userRoles);
+      const allowGlobalSuperAdminAuxiliary = canBypassCajaSucursalForAuxiliary({
+        actorIsSuperAdmin,
+        targetRoleCodes: userRoles,
+        puedeResponsable,
+        puedeAuxiliar
+      });
       if (!userSucursalMatches && !allowGlobalSuperAdminAuxiliary) {
         throw createCajaError(
           409,
@@ -3982,7 +3990,12 @@ router.post('/ventas/cajas/asignaciones', checkPermission(['VENTAS_CAJAS_PARTICI
       throw createCajaError(403, 'VENTAS_CAJAS_ASSIGN_ROLE_FORBIDDEN', 'Solo super_admin puede asignar usuarios administradores como auxiliares.');
     }
     const userSucursalMatches = Number.parseInt(String(user.id_sucursal || ''), 10) === Number(caja.id_sucursal);
-    const allowGlobalSuperAdminAuxiliary = puedeAuxiliar && !puedeResponsable && actorIsSuperAdmin && userIsSuperOrAdmin;
+    const allowGlobalSuperAdminAuxiliary = canBypassCajaSucursalForAuxiliary({
+      actorIsSuperAdmin,
+      targetRoleCodes: userRoles,
+      puedeResponsable,
+      puedeAuxiliar
+    });
     if (!userSucursalMatches && !allowGlobalSuperAdminAuxiliary) {
       throw createCajaError(
         409,
@@ -4132,7 +4145,12 @@ router.patch('/ventas/cajas/asignaciones/:id', checkPermission(['VENTAS_CAJAS_PA
       throw createCajaError(403, 'VENTAS_CAJAS_ASSIGN_ROLE_FORBIDDEN', 'Solo super_admin puede asignar usuarios administradores como auxiliares.');
     }
     const assignmentUserSucursalMatches = Number.parseInt(String(assignmentUser.id_sucursal || ''), 10) === Number(assignment.id_sucursal);
-    const allowGlobalSuperAdminAuxiliary = estado && puedeAuxiliar && !puedeResponsable && actorIsSuperAdmin && assignmentIsSuperOrAdmin;
+    const allowGlobalSuperAdminAuxiliary = Boolean(estado) && canBypassCajaSucursalForAuxiliary({
+      actorIsSuperAdmin,
+      targetRoleCodes: assignmentUserRoles,
+      puedeResponsable,
+      puedeAuxiliar
+    });
     if (!assignmentUserSucursalMatches && !allowGlobalSuperAdminAuxiliary) {
       throw createCajaError(
         409,
