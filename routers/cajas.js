@@ -13,6 +13,7 @@ import {
   lockCajaFinancialSession,
   mapCajaFinancialLockError
 } from '../services/cajaFinancialLockService.js';
+import { enqueueCajaCloseNotification } from '../services/cajaCloseNotificationQueue.js';
 import {
   canBypassCajaSucursalForAuxiliary
 } from '../services/cajaAssignmentRulesService.js';
@@ -358,7 +359,10 @@ const fetchSessionMethodFinancialSummary = async (client, idSesionCaja) => {
         ON fc.id_factura = fr.id_factura_original
       INNER JOIN public.cat_metodos_pago mp
         ON mp.id_metodo_pago = fc.id_metodo_pago
-      WHERE COALESCE(fr.id_sesion_caja_original, fc.id_sesion_caja) = $1
+      WHERE (
+          fr.id_sesion_caja_original = $1
+          OR (fr.id_sesion_caja_original IS NULL AND fc.id_sesion_caja = $1)
+        )
         AND UPPER(TRIM(COALESCE(fr.estado, ''))) = 'APLICADA'
       ORDER BY fr.id_reversion ASC, fc.id_factura_cobro ASC
     `,
@@ -373,7 +377,10 @@ const fetchSessionMethodFinancialSummary = async (client, idSesionCaja) => {
       FROM public.facturas_reversiones fr
       INNER JOIN public.facturas_cobros fc
         ON fc.id_factura = fr.id_factura_original
-      WHERE COALESCE(fr.id_sesion_caja_original, fc.id_sesion_caja) = $1
+      WHERE (
+          fr.id_sesion_caja_original = $1
+          OR (fr.id_sesion_caja_original IS NULL AND fc.id_sesion_caja = $1)
+        )
         AND UPPER(TRIM(COALESCE(fr.estado, ''))) = 'APLICADA'
       GROUP BY fr.id_reversion
     `,
@@ -635,7 +642,10 @@ const fetchSessionOperationalFingerprint = async (client, idSesionCaja, currentS
         FROM public.facturas_reversiones fr
         LEFT JOIN public.facturas_cobros fc
           ON fc.id_factura = fr.id_factura_original
-        WHERE COALESCE(fr.id_sesion_caja_original, fc.id_sesion_caja) = $1
+        WHERE (
+            fr.id_sesion_caja_original = $1
+            OR (fr.id_sesion_caja_original IS NULL AND fc.id_sesion_caja = $1)
+          )
           AND UPPER(TRIM(COALESCE(fr.estado, ''))) = 'APLICADA'
       ) rev
     `,
@@ -782,7 +792,7 @@ const getScopeContext = async (req, client, requestedSucursalId = null, allowGlo
     ? scope.allowedSucursalIds.map((value) => parsePositiveInt(value)).filter((value) => value !== null)
     : [];
   const hasMultisucursalAccess =
-    Boolean(scope.isSuperAdmin) || (await requestHasAnyPermission(req, CAJAS_SCOPE_PERMISSION));
+    Boolean(scope.isSuperAdmin) || (await requestHasAnyPermission(req, CAJAS_SCOPE_PERMISSION, client));
 
   let targetSucursalId = null;
   if (requestedSucursalId) {
@@ -2205,6 +2215,71 @@ const sendCajaCierreEmail = async (payload) => {
   );
 };
 
+const enqueueCajaCloseEmailNotification = ({
+  idCierreCaja,
+  idSesionCaja,
+  session,
+  idUsuarioCierre,
+  fechaCierre,
+  montoTeorico,
+  montoDeclaradoCierre,
+  diferencia,
+  idResolucionFinal,
+  resolutionCode,
+  payrollSync,
+  arqueos,
+  requiresAudit,
+  resumen
+}) => enqueueCajaCloseNotification({
+  idCierreCaja,
+  task: async () => {
+    const client = await pool.connect();
+    try {
+      let emailActors = {};
+      try {
+        emailActors = await fetchCajaCloseEmailActors(client, {
+          idUsuarioResponsable: session.id_usuario_responsable,
+          idUsuarioCierre
+        });
+      } catch (actorError) {
+        console.warn('[cajas] No se pudieron resolver usuarios para correo de cierre:', actorError?.message || actorError);
+      }
+
+      let movimientosManuales = { ingresos: [], egresos: [] };
+      try {
+        movimientosManuales = await fetchCajaCloseManualMovements(client, idSesionCaja);
+      } catch (movementError) {
+        console.warn('[cajas] No se pudieron resolver movimientos manuales para reporte de cierre:', movementError?.message || movementError);
+      }
+
+      await sendCajaCierreEmail({
+        idCierreCaja,
+        idSesionCaja,
+        session,
+        idUsuarioCierre,
+        actors: emailActors,
+        fechaCierre,
+        montoTeorico,
+        montoDeclaradoCierre,
+        diferencia,
+        idResolucionFinal,
+        resolutionCode,
+        payrollSync,
+        arqueos,
+        requiresAudit,
+        montoApertura: Number(resumen?.montoApertura || 0),
+        ventasEfectivoNetas: Number(resumen?.ventasEfectivoNetas || 0),
+        ventasNoEfectivoNetas: Number(resumen?.ventasNoEfectivoNetas || 0),
+        ingresosManuales: Number(resumen?.ingresosManuales || 0),
+        egresosManuales: Number(resumen?.egresosManuales || 0),
+        movimientosManuales
+      });
+    } finally {
+      client.release();
+    }
+  }
+});
+
 const fetchSessionBase = async (client, idSesionCaja, { forUpdate = false } = {}) => {
   const result = await client.query(
     `
@@ -2678,7 +2753,6 @@ const persistCloseValidationAttempt = async ({
   userAgent,
   operationalFingerprint = null
 }) => {
-  await client.query('SELECT pg_advisory_xact_lock(8152026, $1::integer)', [session.id_sesion_caja]);
   const attemptResult = await client.query(
     `
       SELECT COALESCE(MAX(numero_intento), 0) + 1 AS numero_intento
@@ -2735,7 +2809,7 @@ const persistCloseValidationAttempt = async ({
   );
   const idValidacionCierre = Number(validationResult.rows?.[0]?.id_validacion_cierre || 0) || null;
 
-  for (const row of computation.rows) {
+  if (idValidacionCierre && computation.rows.length > 0) {
     await client.query(
       `
         INSERT INTO public.cajas_cierres_validaciones_metodos (
@@ -2743,19 +2817,43 @@ const persistCloseValidationAttempt = async ({
           monto_declarado, diferencia, cantidad_referencias, resultado,
           requiere_revision, observacion, fecha_creacion
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())
+        SELECT
+          $1::bigint,
+          row.id_metodo_pago::integer,
+          row.metodo_pago_codigo::text,
+          row.monto_teorico::numeric,
+          row.monto_declarado::numeric,
+          row.diferencia::numeric,
+          row.cantidad_referencias::integer,
+          row.resultado::text,
+          row.requiere_revision::boolean,
+          row.observacion::text,
+          NOW()
+        FROM jsonb_to_recordset($2::jsonb) AS row(
+          id_metodo_pago integer,
+          metodo_pago_codigo text,
+          monto_teorico numeric,
+          monto_declarado numeric,
+          diferencia numeric,
+          cantidad_referencias integer,
+          resultado text,
+          requiere_revision boolean,
+          observacion text
+        )
       `,
       [
         idValidacionCierre,
-        row.id_metodo_pago,
-        row.metodo_pago_codigo,
-        row.monto_teorico,
-        row.monto_declarado,
-        row.diferencia,
-        row.cantidad_referencias,
-        row.resultado,
-        row.requiere_revision,
-        row.observacion
+        JSON.stringify(computation.rows.map((row) => ({
+          id_metodo_pago: row.id_metodo_pago,
+          metodo_pago_codigo: row.metodo_pago_codigo,
+          monto_teorico: row.monto_teorico,
+          monto_declarado: row.monto_declarado,
+          diferencia: row.diferencia,
+          cantidad_referencias: row.cantidad_referencias,
+          resultado: row.resultado,
+          requiere_revision: row.requiere_revision,
+          observacion: row.observacion
+        })))
       ]
     );
   }
@@ -4916,6 +5014,7 @@ router.post('/ventas/cajas/sesiones/:id/ingresos', checkPermission(['VENTAS_CAJA
 
 const closeSessionHandler = async (req, res) => {
   const client = await pool.connect();
+  let clientReleased = false;
   try {
     await client.query('BEGIN');
     const idSesionCaja = parsePositiveInt(req.params.id);
@@ -4954,6 +5053,14 @@ const closeSessionHandler = async (req, res) => {
         409,
         'VENTAS_CAJAS_RESOLUTION_PENDING_MISSING',
         'No se encontro la resolucion PENDIENTE_REVISION.'
+      );
+    }
+    const balancedResolutionId = await getCatalogId(client, 'RESOLUTIONS', 'CAJA_CUADRA');
+    if (!balancedResolutionId) {
+      throw createCajaError(
+        409,
+        'VENTAS_CAJAS_RESOLUTION_BALANCED_MISSING',
+        'No se encontro la resolucion CAJA_CUADRA.'
       );
     }
     const validationResult = await client.query(
@@ -4995,7 +5102,6 @@ const closeSessionHandler = async (req, res) => {
       currentSummary: resumen,
       currentFingerprint
     });
-    idResolucionFinal = pendingResolutionId;
     montoTeorico = Number(validationToLink.total_teorico || 0);
     montoDeclaradoCierre = Number(validationToLink.total_declarado || 0);
     diferencia = Number(validationToLink.diferencia_total || 0);
@@ -5012,6 +5118,9 @@ const closeSessionHandler = async (req, res) => {
       requiere_revision: Boolean(row.requiere_revision),
       completado_automaticamente: false
     }));
+    const hasMethodDifference = arqueosPersistir.some((row) => Math.abs(roundMoney(row.diferencia)) > 0);
+    const isBalancedClose = !hasMethodDifference && Math.abs(roundMoney(diferencia)) === 0;
+    idResolucionFinal = isBalancedClose ? balancedResolutionId : pendingResolutionId;
 
     const idEstadoCerrada = await getCatalogId(client, 'SESSION_STATES', 'CERRADA');
     const closeResult = await client.query(
@@ -5047,46 +5156,62 @@ const closeSessionHandler = async (req, res) => {
     }
 
     if (idCierreCaja && Array.isArray(arqueosPersistir) && arqueosPersistir.length > 0) {
-      for (const row of arqueosPersistir) {
-        await client.query(
-          `
-            INSERT INTO public.cajas_cierres_arqueos_metodos (
-              id_cierre_caja, id_sesion_caja, id_caja, id_sucursal, id_metodo_pago, metodo_pago_codigo,
-              monto_teorico, monto_declarado, diferencia, cantidad_referencias, observacion,
-              requiere_revision, completado_automaticamente, fecha_registro, id_usuario_registro
-            )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, NOW(), $14)
-            ON CONFLICT (id_cierre_caja, id_metodo_pago)
-            DO UPDATE SET
-              metodo_pago_codigo = EXCLUDED.metodo_pago_codigo,
-              monto_teorico = EXCLUDED.monto_teorico,
-              monto_declarado = EXCLUDED.monto_declarado,
-              diferencia = EXCLUDED.diferencia,
-              cantidad_referencias = EXCLUDED.cantidad_referencias,
-              observacion = EXCLUDED.observacion,
-              requiere_revision = EXCLUDED.requiere_revision,
-              completado_automaticamente = EXCLUDED.completado_automaticamente,
-              fecha_registro = NOW(),
-              id_usuario_registro = EXCLUDED.id_usuario_registro
-          `,
-          [
-            idCierreCaja,
-            idSesionCaja,
-            session.id_caja,
-            session.id_sucursal,
-            row.id_metodo_pago,
-            row.metodo_pago_codigo,
-            row.monto_teorico,
-            row.monto_declarado,
-            row.diferencia,
-            row.cantidad_referencias,
-            row.observacion,
-            row.requiere_revision,
-            row.completado_automaticamente,
-            scopeContext.idUsuario
-          ]
-        );
-      }
+      await client.query(
+        `
+          INSERT INTO public.cajas_cierres_arqueos_metodos (
+            id_cierre_caja, id_sesion_caja, id_caja, id_sucursal, id_metodo_pago, metodo_pago_codigo,
+            monto_teorico, monto_declarado, diferencia, cantidad_referencias, observacion,
+            requiere_revision, completado_automaticamente, fecha_registro, id_usuario_registro
+          )
+          SELECT
+            $1::bigint,
+            $2::bigint,
+            $3::integer,
+            $4::integer,
+            row.id_metodo_pago::integer,
+            row.metodo_pago_codigo::text,
+            row.monto_teorico::numeric,
+            row.monto_declarado::numeric,
+            row.diferencia::numeric,
+            row.cantidad_referencias::integer,
+            row.observacion::text,
+            row.requiere_revision::boolean,
+            row.completado_automaticamente::boolean,
+            NOW(),
+            $6::integer
+          FROM jsonb_to_recordset($5::jsonb) AS row(
+            id_metodo_pago integer,
+            metodo_pago_codigo text,
+            monto_teorico numeric,
+            monto_declarado numeric,
+            diferencia numeric,
+            cantidad_referencias integer,
+            observacion text,
+            requiere_revision boolean,
+            completado_automaticamente boolean
+          )
+          ON CONFLICT (id_cierre_caja, id_metodo_pago)
+          DO UPDATE SET
+            metodo_pago_codigo = EXCLUDED.metodo_pago_codigo,
+            monto_teorico = EXCLUDED.monto_teorico,
+            monto_declarado = EXCLUDED.monto_declarado,
+            diferencia = EXCLUDED.diferencia,
+            cantidad_referencias = EXCLUDED.cantidad_referencias,
+            observacion = EXCLUDED.observacion,
+            requiere_revision = EXCLUDED.requiere_revision,
+            completado_automaticamente = EXCLUDED.completado_automaticamente,
+            fecha_registro = NOW(),
+            id_usuario_registro = EXCLUDED.id_usuario_registro
+        `,
+        [
+          idCierreCaja,
+          idSesionCaja,
+          session.id_caja,
+          session.id_sucursal,
+          JSON.stringify(arqueosPersistir),
+          scopeContext.idUsuario
+        ]
+      );
     }
 
     await client.query(
@@ -5120,23 +5245,11 @@ const closeSessionHandler = async (req, res) => {
       diferencia,
       resolucionCodigo: resolutionCode
     });
-    let emailActors = {};
-    try {
-      emailActors = await fetchCajaCloseEmailActors(client, {
-        idUsuarioResponsable: session.id_usuario_responsable,
-        idUsuarioCierre: scopeContext.idUsuario
-      });
-    } catch (actorError) {
-      console.warn('[cajas] No se pudieron resolver usuarios para correo de cierre:', actorError?.message || actorError);
-    }
-    let movimientosManuales = { ingresos: [], egresos: [] };
-    try {
-      movimientosManuales = await fetchCajaCloseManualMovements(client, idSesionCaja);
-    } catch (movementError) {
-      console.warn('[cajas] No se pudieron resolver movimientos manuales para reporte de cierre:', movementError?.message || movementError);
-    }
 
     await client.query('COMMIT');
+    client.release();
+    clientReleased = true;
+
     const hasArqueoInconsistency = Array.isArray(arqueosPersistir)
       ? arqueosPersistir.some((row) =>
           Boolean(row.requiere_revision) || Math.abs(roundMoney(row.diferencia)) > 0
@@ -5146,12 +5259,11 @@ const closeSessionHandler = async (req, res) => {
       Math.abs(roundMoney(diferencia)) > 0 ||
       resolutionCode === 'PENDIENTE_REVISION' ||
       hasArqueoInconsistency;
-    void sendCajaCierreEmail({
+    const notificationQueue = enqueueCajaCloseEmailNotification({
       idCierreCaja,
       idSesionCaja,
       session,
       idUsuarioCierre: scopeContext.idUsuario,
-      actors: emailActors,
       fechaCierre,
       montoTeorico,
       montoDeclaradoCierre,
@@ -5161,32 +5273,30 @@ const closeSessionHandler = async (req, res) => {
       payrollSync,
       arqueos: arqueosPersistir,
       requiresAudit,
-      montoApertura: Number(resumen.montoApertura || 0),
-      ventasEfectivoNetas: Number(resumen.ventasEfectivoNetas || 0),
-      ventasNoEfectivoNetas: Number(resumen.ventasNoEfectivoNetas || 0),
-      ingresosManuales: Number(resumen.ingresosManuales || 0),
-      egresosManuales: Number(resumen.egresosManuales || 0),
-      movimientosManuales
-    }).catch((emailError) => {
-      console.error('[cajas] Error enviando correo de cierre de caja:', emailError?.message || emailError);
+      resumen
     });
     const responsePayload = {
       message: 'Cierre de caja registrado correctamente.',
       id_cierre_caja: idCierreCaja,
       diferencia,
       id_arqueo_final: idArqueoFinalSelected,
-      estado_revision: 'PENDIENTE_REVISION',
+      estado_revision: resolutionCode,
       arqueos_metodos: arqueosPersistir,
-      payroll_sync: payrollSync
+      payroll_sync: payrollSync,
+      notification_queue: notificationQueue
     };
     return res.status(200).json(
       (await isCashierOnlyRequest(req)) ? maskCajaCloseResponseForCajero(responsePayload) : responsePayload
     );
   } catch (err) {
-    await client.query('ROLLBACK');
+    if (!clientReleased) {
+      await client.query('ROLLBACK');
+    }
     return sendInternalError(res, err, 'VENTAS_CAJAS_CLOSE_ERROR', 'No se pudo cerrar la sesion de caja.');
   } finally {
-    client.release();
+    if (!clientReleased) {
+      client.release();
+    }
   }
 };
 

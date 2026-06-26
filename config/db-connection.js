@@ -23,7 +23,7 @@ const parseBoolean = (value, fallback = false) => {
   return ['1', 'true', 'yes', 'on'].includes(String(value).trim().toLowerCase());
 };
 
-const DB_POOL_MAX_LIMIT = 24;
+const DB_POOL_MAX_LIMIT = 12;
 
 const poolMax = parsePositiveInt(process.env.DB_POOL_MAX, 8);
 if (poolMax > DB_POOL_MAX_LIMIT) {
@@ -59,11 +59,22 @@ const pool = new Pool({
   },
 });
 
-const getPoolState = () => ({
+export const getPoolState = () => ({
   totalCount: pool.totalCount,
   idleCount: pool.idleCount,
   waitingCount: pool.waitingCount
 });
+
+export const logPoolWaitIfAny = (context = 'unspecified') => {
+  const state = getPoolState();
+  if (state.waitingCount > 0) {
+    console.warn('[pool] waiting clients detected', {
+      context,
+      ...state
+    });
+  }
+  return state;
+};
 
 console.info('[pool] Configuracion efectiva', {
   DB_POOL_MAX: poolMax,
@@ -73,11 +84,6 @@ console.info('[pool] Configuracion efectiva', {
   ...getPoolState()
 });
 
-if (poolMax > 12) {
-  console.warn('[pool] DB_POOL_MAX alto: este valor se multiplica por cada replica del backend.', {
-    DB_POOL_MAX: poolMax
-  });
-}
 
 pool.on('error', (err) => {
   const payload = {

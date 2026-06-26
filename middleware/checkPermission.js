@@ -119,7 +119,9 @@ const resolveRequestUserId = (req) => {
   return Number.isInteger(idUsuario) && idUsuario > 0 ? idUsuario : null;
 };
 
-const readRequestPermissions = async (req) => {
+const resolveQueryRunner = (queryRunner = null) => queryRunner || pool;
+
+const readRequestPermissions = async (req, queryRunner = null) => {
   if (req?.__permissionAccess) return req.__permissionAccess;
 
   const idUsuario = resolveRequestUserId(req);
@@ -150,7 +152,7 @@ const readRequestPermissions = async (req) => {
     WHERE ru.id_usuario = $1
   `;
 
-  const result = await pool.query(sql, [idUsuario]);
+  const result = await resolveQueryRunner(queryRunner).query(sql, [idUsuario]);
   const access = result.rows?.[0] || {};
   const permissions = new Set(
     (Array.isArray(access.permisos) ? access.permisos : [])
@@ -169,7 +171,7 @@ const readRequestPermissions = async (req) => {
   return payload;
 };
 
-const readRequestRoles = async (req) => {
+const readRequestRoles = async (req, queryRunner = null) => {
   if (req?.__roleAccess) return req.__roleAccess;
 
   const idUsuario = resolveRequestUserId(req);
@@ -201,7 +203,7 @@ const readRequestRoles = async (req) => {
     WHERE ru.id_usuario = $1
   `;
 
-  const result = await pool.query(sql, [idUsuario]);
+  const result = await resolveQueryRunner(queryRunner).query(sql, [idUsuario]);
   const access = result.rows?.[0] || {};
   const roles = new Set(
     (Array.isArray(access.roles) ? access.roles : [])
@@ -219,29 +221,29 @@ const readRequestRoles = async (req) => {
   return payload;
 };
 
-export const requestHasAnyPermission = async (req, requiredPermission) => {
+export const requestHasAnyPermission = async (req, requiredPermission, queryRunner = null) => {
   const requiredPermissions = normalizeRequiredPermissions(requiredPermission);
   if (requiredPermissions.length === 0) return true;
 
-  const access = await readRequestPermissions(req);
+  const access = await readRequestPermissions(req, queryRunner);
   if (access.isSuperAdmin) return true;
   return requiredPermissions.some((permission) => access.permissions.has(permission));
 };
 
-export const requestHasAnyRole = async (req, requiredRoles) => {
+export const requestHasAnyRole = async (req, requiredRoles, queryRunner = null) => {
   const normalizedRequiredRoles = (Array.isArray(requiredRoles) ? requiredRoles : [requiredRoles])
     .map(normalizeRoleName)
     .filter(Boolean);
 
   if (normalizedRequiredRoles.length === 0) return true;
 
-  const access = await readRequestRoles(req);
+  const access = await readRequestRoles(req, queryRunner);
   if (access.isSuperAdmin) return true;
 
   return normalizedRequiredRoles.some((role) => access.roles.has(role));
 };
 
-export const isRequestUserSuperAdmin = async (req) => {
+export const isRequestUserSuperAdmin = async (req, queryRunner = null) => {
   if (typeof req?.__isSuperAdmin === 'boolean') {
     return req.__isSuperAdmin;
   }
@@ -273,7 +275,7 @@ export const isRequestUserSuperAdmin = async (req) => {
     return true;
   }
 
-  const access = await readRequestPermissions(req);
+  const access = await readRequestPermissions(req, queryRunner);
   return Boolean(access.isSuperAdmin);
 };
 
