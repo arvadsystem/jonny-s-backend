@@ -36,9 +36,12 @@ describe('cajaFinancialLockService', () => {
 
   it('parsea ids bigint positivos como cadenas canonicas', () => {
     assert.equal(parsePositiveBigIntId('2147483648'), '2147483648');
+    assert.equal(parsePositiveBigIntId('9223372036854775807'), '9223372036854775807');
+    assert.equal(parsePositiveBigIntId('9223372036854775808'), null);
     assert.equal(parsePositiveBigIntId('001'), null);
     assert.equal(parsePositiveBigIntId('0'), null);
     assert.equal(parsePositiveBigIntId('1.2'), null);
+    assert.equal(typeof parsePositiveBigIntId('2147483648'), 'string');
   });
 
   it('valida timeout configurado', () => {

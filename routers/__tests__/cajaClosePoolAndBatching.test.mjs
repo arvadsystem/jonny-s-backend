@@ -31,14 +31,25 @@ describe('caja close pool and batching guards', () => {
   });
 
   it('libera el cliente antes de encolar correo, PDF o SMTP', () => {
-    const commitIndex = closeHandlerSource.indexOf("await client.query('COMMIT')");
-    const releaseIndex = closeHandlerSource.indexOf('client.release();', commitIndex);
-    const queueIndex = closeHandlerSource.indexOf('enqueueCajaCloseEmailNotification', releaseIndex);
+    const transactionIndex = closeHandlerSource.indexOf('await withDbTransaction');
+    const transactionEndIndex = closeHandlerSource.indexOf("}, { label: 'caja_close_session' })", transactionIndex);
+    const queueIndex = closeHandlerSource.indexOf('enqueueCajaCloseEmailNotification', transactionEndIndex);
 
-    assert.ok(commitIndex > 0);
-    assert.ok(releaseIndex > commitIndex);
-    assert.ok(queueIndex > releaseIndex);
-    assert.doesNotMatch(closeHandlerSource.slice(0, releaseIndex), /sendCajaCierreEmail/);
-    assert.doesNotMatch(closeHandlerSource.slice(0, releaseIndex), /buildCajaCierrePdfBuffer/);
+    assert.ok(transactionIndex > 0);
+    assert.ok(transactionEndIndex > transactionIndex);
+    assert.ok(queueIndex > transactionEndIndex);
+    assert.doesNotMatch(closeHandlerSource.slice(transactionIndex, transactionEndIndex), /sendCajaCierreEmail/);
+    assert.doesNotMatch(closeHandlerSource.slice(transactionIndex, transactionEndIndex), /buildCajaCierrePdfBuffer/);
+  });
+
+  it('usa withDbTransaction en cierre y validacion', () => {
+    assert.match(closeHandlerSource, /withDbTransaction\(async \(client\)/);
+    const validationRouteSource = source.slice(
+      source.indexOf("router.post('/ventas/cajas/sesiones/:id/cierre-validaciones'"),
+      source.indexOf("router.post('/ventas/cajas/sesiones/:id/cierre-preview'")
+    );
+    assert.match(validationRouteSource, /withDbTransaction\(async \(client\)/);
+    assert.doesNotMatch(validationRouteSource, /pool\.connect\(\)/);
+    assert.doesNotMatch(validationRouteSource, /isCashierOnlyRequest\(req\)/);
   });
 });
