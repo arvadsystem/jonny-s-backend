@@ -59,7 +59,7 @@ export const resolveRequestUserSucursalScope = async (req, queryRunner = pool) =
     };
   }
 
-  const isSuperAdmin = await isRequestUserSuperAdmin(req);
+  const isSuperAdmin = await isRequestUserSuperAdmin(req, queryRunner);
   const sucursalResult = await queryRunner.query(
     `
       SELECT e.id_sucursal

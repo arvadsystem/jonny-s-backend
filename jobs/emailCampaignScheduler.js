@@ -35,6 +35,12 @@ const schedulerTick = async () => {
 
 export const startEmailCampaignScheduler = () => {
   if (schedulerState.started) return;
+  const processRole = String(process.env.PROCESS_ROLE || 'web').trim().toLowerCase();
+  if (processRole !== 'scheduler' && String(process.env.EMAIL_SCHEDULER_ENABLED || '').trim().toLowerCase() !== 'true') {
+    schedulerState.started = true;
+    console.log('[email_campaign_scheduler] deshabilitado en replica web. Use PROCESS_ROLE=scheduler o EMAIL_SCHEDULER_ENABLED=true.');
+    return;
+  }
   if (!isEmailSchedulerEnabled()) {
     schedulerState.started = true;
     console.log('[email_campaign_scheduler] deshabilitado por EMAIL_SCHEDULER_ENABLED=false');

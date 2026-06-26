@@ -274,10 +274,20 @@ app.use(menuPosRouter); // Monta las rutas del POS Menú
 app.use(movimientosInventarioRoutes);
 
 const PORT = process.env.PORT || 3001;
-startEmailCampaignScheduler();
-const server = app.listen(PORT, () => {
-  console.log(`Servidor activo en el puerto ${PORT}`);
-});
+const PROCESS_ROLE = String(process.env.PROCESS_ROLE || 'web').trim().toLowerCase();
+
+if (PROCESS_ROLE === 'scheduler') {
+  startEmailCampaignScheduler();
+} else {
+  console.log('[email_campaign_scheduler] no iniciado en PROCESS_ROLE=web');
+}
+
+const shouldStartHttp = PROCESS_ROLE !== 'scheduler';
+const server = shouldStartHttp
+  ? app.listen(PORT, () => {
+      console.log(`Servidor activo en el puerto ${PORT}`);
+    })
+  : null;
 
 let shutdownPromise = null;
 
@@ -287,6 +297,7 @@ const shutdown = async (signal) => {
   console.warn(`[shutdown] Senal recibida: ${signal}. Cerrando servidor HTTP y pool PostgreSQL.`);
 
   shutdownPromise = new Promise((resolve) => {
+    if (!server) return resolve();
     server.close((serverErr) => {
       if (serverErr) {
         console.error('[shutdown] Error cerrando servidor HTTP:', {

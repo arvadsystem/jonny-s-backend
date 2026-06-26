@@ -1,3 +1,5 @@
+import { parsePositiveBigIntId } from './cajaFinancialLockService.js';
+
 const parsePositiveInt = (value) => {
   const parsed = Number.parseInt(String(value ?? ''), 10);
   return Number.isInteger(parsed) && parsed > 0 ? parsed : null;
@@ -17,7 +19,7 @@ export const validateCajaSessionOpenForFinancialWrite = async ({
   idSucursal,
   idUsuario
 }) => {
-  const sessionId = parsePositiveInt(idSesionCaja);
+  const sessionId = parsePositiveBigIntId(idSesionCaja);
   const sucursalId = parsePositiveInt(idSucursal);
   const userId = parsePositiveInt(idUsuario);
 
