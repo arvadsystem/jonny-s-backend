@@ -1,5 +1,6 @@
 import pg from 'pg';
 import dotenv from 'dotenv';
+import { getRuntimeConfig } from './runtime-config.js';
 
 dotenv.config();
 
@@ -23,18 +24,9 @@ const parseBoolean = (value, fallback = false) => {
   return ['1', 'true', 'yes', 'on'].includes(String(value).trim().toLowerCase());
 };
 
-const DB_POOL_MAX_LIMIT = 12;
-const PROCESS_ROLE = String(process.env.PROCESS_ROLE || 'web').trim().toLowerCase();
-const DEFAULT_POOL_MAX_BY_ROLE = Object.freeze({
-  web: 5,
-  scheduler: 2
-});
-
-const requestedPoolMax = parsePositiveInt(
-  process.env.DB_POOL_MAX,
-  DEFAULT_POOL_MAX_BY_ROLE[PROCESS_ROLE] || DEFAULT_POOL_MAX_BY_ROLE.web
-);
-const poolMax = Math.min(requestedPoolMax, DB_POOL_MAX_LIMIT);
+const runtimeConfig = getRuntimeConfig();
+const PROCESS_ROLE = runtimeConfig.processRole;
+const poolMax = runtimeConfig.dbPoolMax;
 
 const idleTimeoutMillis = parsePositiveInt(process.env.DB_IDLE_TIMEOUT_MS, 30000);
 const connectionTimeoutMillis = parsePositiveInt(process.env.DB_CONNECTION_TIMEOUT_MS, 3000);

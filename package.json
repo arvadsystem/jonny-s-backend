@@ -19,9 +19,12 @@
     "qa:ventas-clientes-caja": "node scripts/qa-ventas-clientes-caja.js",
     "rbac:personas:dry-run": "node scripts/sync-personas-rbac.js",
     "rbac:personas:sync": "node scripts/sync-personas-rbac.js --apply",
-    "test": "node --test",
+    "test": "node scripts/run-tests.mjs",
     "test:cajas": "node scripts/run-cajas-tests.mjs",
-    "check:syntax": "node scripts/check-js-syntax.mjs"
+    "check:syntax": "node scripts/check-js-syntax.mjs",
+    "docker:build": "docker build -t jonnys-backend-local .",
+    "smoke:web": "node scripts/smoke-web-runtime.mjs",
+    "smoke:scheduler": "node scripts/smoke-scheduler-runtime.mjs"
   },
   "author": "",
   "license": "ISC",

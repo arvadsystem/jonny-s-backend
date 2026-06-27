@@ -1,11 +1,11 @@
 import 'dotenv/config';
+import {
+  getRuntimeConfig,
+  resolveRuntimeEntrypoint,
+  validateRuntimeConfig
+} from './config/runtime-config.js';
 
-const PROCESS_ROLE = String(process.env.PROCESS_ROLE || 'web').trim().toLowerCase();
+const config = getRuntimeConfig();
+validateRuntimeConfig(config);
 
-if (PROCESS_ROLE === 'web') {
-  await import('./server.js');
-} else if (PROCESS_ROLE === 'scheduler') {
-  await import('./scheduler.js');
-} else {
-  throw new Error(`PROCESS_ROLE invalido: ${PROCESS_ROLE}. Use web o scheduler.`);
-}
+await import(resolveRuntimeEntrypoint(config));

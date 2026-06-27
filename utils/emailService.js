@@ -18,7 +18,7 @@ const transporter = nodemailer.createTransport({
 });
 
 // Verificar conexión al arrancar (opcional, controlado por env)
-if (process.env.SMTP_VERIFY_ON_BOOT === 'true') {
+if (process.env.SMTP_VERIFY_ON_BOOT === 'true' && process.env.NODE_ENV !== 'test') {
   transporter.verify()
     .then(() => console.log('✅ [emailService] Conexión SMTP verificada'))
     .catch((err) => console.error('❌ [emailService] Error verificando SMTP:', err.message));
