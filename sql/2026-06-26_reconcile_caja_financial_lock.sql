@@ -8,7 +8,8 @@ RETURNS bigint
 LANGUAGE sql
 IMMUTABLE
 STRICT
-SET search_path = pg_catalog, public
+PARALLEL SAFE
+SET search_path = pg_catalog
 AS $$
   SELECT ~p_id_sesion_caja;
 $$;
@@ -28,9 +29,12 @@ SECURITY DEFINER
 SET search_path = pg_catalog, public
 AS $$
 DECLARE
+  v_legacy_namespace constant integer := 8152028;
+  v_integer_max constant bigint := 2147483647;
+  v_sleep_seconds constant double precision := 0.025;
   v_timeout_ms integer;
   v_deadline timestamptz;
-  v_locked boolean := false;
+  v_bigint_lock_key bigint;
 BEGIN
   IF p_id_sesion_caja IS NULL OR p_id_sesion_caja <= 0 THEN
     RAISE EXCEPTION 'id_sesion_caja invalido'
@@ -43,22 +47,38 @@ BEGIN
       USING ERRCODE = '22023';
   END IF;
 
-  -- Transitional compatibility with the legacy two-key lock used by older deployed code.
-  PERFORM pg_advisory_xact_lock(8152028, (p_id_sesion_caja & 2147483647)::integer);
+  v_deadline :=
+    pg_catalog.clock_timestamp()
+    + pg_catalog.make_interval(
+        secs => v_timeout_ms::double precision / 1000.0
+      );
+  v_bigint_lock_key := public.fn_ventas_caja_financial_lock_key(p_id_sesion_caja);
 
-  v_deadline := clock_timestamp() + make_interval(secs => v_timeout_ms / 1000.0);
+  IF p_id_sesion_caja <= v_integer_max THEN
+    LOOP
+      EXIT WHEN pg_catalog.pg_try_advisory_xact_lock(
+        v_legacy_namespace,
+        p_id_sesion_caja::integer
+      );
+
+      IF pg_catalog.clock_timestamp() >= v_deadline THEN
+        RAISE EXCEPTION 'VENTAS_CAJA_FINANCIAL_LOCK_TIMEOUT'
+          USING ERRCODE = '55P03';
+      END IF;
+
+      PERFORM pg_catalog.pg_sleep(v_sleep_seconds);
+    END LOOP;
+  END IF;
+
   LOOP
-    v_locked := pg_try_advisory_xact_lock(public.fn_ventas_caja_financial_lock_key(p_id_sesion_caja));
-    IF v_locked THEN
-      RETURN;
-    END IF;
+    EXIT WHEN pg_catalog.pg_try_advisory_xact_lock(v_bigint_lock_key);
 
-    IF clock_timestamp() >= v_deadline THEN
+    IF pg_catalog.clock_timestamp() >= v_deadline THEN
       RAISE EXCEPTION 'VENTAS_CAJA_FINANCIAL_LOCK_TIMEOUT'
         USING ERRCODE = '55P03';
     END IF;
 
-    PERFORM pg_sleep(0.025);
+    PERFORM pg_catalog.pg_sleep(v_sleep_seconds);
   END LOOP;
 END;
 $$;
@@ -100,13 +120,13 @@ BEGIN
     cs.id_sucursal,
     cs.id_usuario_responsable,
     estado.codigo AS estado_codigo,
-    COALESCE(c.estado, true) AS caja_activa,
+    COALESCE(c.estado, false) AS caja_activa,
     EXISTS (
       SELECT 1
       FROM public.cajas_sesiones_participantes csp
       WHERE csp.id_sesion_caja = cs.id_sesion_caja
         AND csp.id_usuario = p_id_usuario_ejecutor
-        AND COALESCE(csp.activo, true) = true
+        AND csp.activo IS TRUE
     ) AS has_active_participation
   INTO v_session
   FROM public.cajas_sesiones cs
@@ -223,12 +243,12 @@ EXECUTE FUNCTION public.fn_ventas_facturas_cobros_assert_caja_session_open();
 REVOKE ALL ON FUNCTION public.fn_ventas_facturas_assert_caja_session_open() FROM PUBLIC;
 REVOKE ALL ON FUNCTION public.fn_ventas_facturas_assert_caja_session_open() FROM anon;
 REVOKE ALL ON FUNCTION public.fn_ventas_facturas_assert_caja_session_open() FROM authenticated;
-GRANT EXECUTE ON FUNCTION public.fn_ventas_facturas_assert_caja_session_open() TO service_role;
+REVOKE ALL ON FUNCTION public.fn_ventas_facturas_assert_caja_session_open() FROM service_role;
 
 REVOKE ALL ON FUNCTION public.fn_ventas_facturas_cobros_assert_caja_session_open() FROM PUBLIC;
 REVOKE ALL ON FUNCTION public.fn_ventas_facturas_cobros_assert_caja_session_open() FROM anon;
 REVOKE ALL ON FUNCTION public.fn_ventas_facturas_cobros_assert_caja_session_open() FROM authenticated;
-GRANT EXECUTE ON FUNCTION public.fn_ventas_facturas_cobros_assert_caja_session_open() TO service_role;
+REVOKE ALL ON FUNCTION public.fn_ventas_facturas_cobros_assert_caja_session_open() FROM service_role;
 
 DO $$
 BEGIN
