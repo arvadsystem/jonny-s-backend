@@ -15,50 +15,33 @@ const createClient = (responses) => ({
 describe('validateCajaSessionOpenForFinancialWrite', () => {
   it('acepta una sesion abierta cuando el usuario sigue siendo participante activo', async () => {
     const client = createClient([
-      {
-        rowCount: 1,
-        rows: [{
-          id_caja: 7,
-          id_sesion_caja: 11,
-          id_sucursal: 3,
-          id_participacion_caja: 19,
-          rol_participacion: 'AUXILIAR'
-        }]
-      }
+      { rowCount: 1, rows: [{ fn_ventas_assert_caja_session_write_open: null }] }
     ]);
 
     const row = await validateCajaSessionOpenForFinancialWrite({
       client,
       idSesionCaja: 11,
+      idCaja: 7,
       idSucursal: 3,
       idUsuario: 5
     });
 
-    assert.equal(row.id_sesion_caja, 11);
+    assert.equal(row.id_sesion_caja, '11');
+    assert.equal(row.id_caja, 7);
     assert.equal(client.calls.length, 1);
-    assert.match(client.calls[0].sql, /FOR UPDATE OF cs/);
+    assert.match(client.calls[0].sql, /fn_ventas_assert_caja_session_write_open/);
   });
 
   it('rechaza con codigo estable si la sesion se cerro mientras esperaba el lock', async () => {
     const client = createClient([
-      { rowCount: 0, rows: [] },
-      {
-        rowCount: 1,
-        rows: [{
-          id_sesion_caja: 11,
-          id_sucursal: 3,
-          estado_codigo: 'CERRADA',
-          caja_activa: true,
-          is_responsible: true,
-          has_active_participation: true
-        }]
-      }
+      Object.assign(new Error('VENTAS_CAJA_SESSION_CLOSED'), { code: 'P0001' })
     ]);
 
     await assert.rejects(
       () => validateCajaSessionOpenForFinancialWrite({
         client,
         idSesionCaja: 11,
+        idCaja: 7,
         idSucursal: 3,
         idUsuario: 5
       }),
@@ -72,24 +55,14 @@ describe('validateCajaSessionOpenForFinancialWrite', () => {
 
   it('no abre bypass para usuarios que ya no participan activamente', async () => {
     const client = createClient([
-      { rowCount: 0, rows: [] },
-      {
-        rowCount: 1,
-        rows: [{
-          id_sesion_caja: 11,
-          id_sucursal: 3,
-          estado_codigo: 'ABIERTA',
-          caja_activa: true,
-          is_responsible: false,
-          has_active_participation: false
-        }]
-      }
+      Object.assign(new Error('VENTAS_CAJA_SESSION_PARTICIPATION_REQUIRED'), { code: 'P0001' })
     ]);
 
     await assert.rejects(
       () => validateCajaSessionOpenForFinancialWrite({
         client,
         idSesionCaja: 11,
+        idCaja: 7,
         idSucursal: 3,
         idUsuario: 5
       }),
