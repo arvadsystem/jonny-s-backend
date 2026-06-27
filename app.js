@@ -275,11 +275,16 @@ app.use(movimientosInventarioRoutes);
 
 const PORT = process.env.PORT || 3001;
 const PROCESS_ROLE = String(process.env.PROCESS_ROLE || 'web').trim().toLowerCase();
+const VALID_PROCESS_ROLES = new Set(['web', 'scheduler']);
+
+if (!VALID_PROCESS_ROLES.has(PROCESS_ROLE)) {
+  throw new Error(`PROCESS_ROLE invalido: ${PROCESS_ROLE}. Use web o scheduler.`);
+}
 
 if (PROCESS_ROLE === 'scheduler') {
   startEmailCampaignScheduler();
 } else {
-  console.log('[email_campaign_scheduler] no iniciado en PROCESS_ROLE=web');
+  console.log('[email_campaign_scheduler] no iniciado en PROCESS_ROLE=web. Despliegue una instancia PROCESS_ROLE=scheduler para campanas programadas.');
 }
 
 const shouldStartHttp = PROCESS_ROLE !== 'scheduler';

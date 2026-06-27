@@ -12,8 +12,9 @@ const TRANSACTION_TIMEOUTS = Object.freeze({
   slow: parsePositiveInt(process.env.DB_SLOW_TRANSACTION_MS, 3000)
 });
 
-export const withDbTransaction = async (callback, { label = 'transaction' } = {}) => {
-  const client = await pool.connect();
+export const withDbTransaction = async (callback, { label = 'transaction', poolOverride = null } = {}) => {
+  const transactionPool = poolOverride || pool;
+  const client = await transactionPool.connect();
   const start = Date.now();
   let began = false;
 

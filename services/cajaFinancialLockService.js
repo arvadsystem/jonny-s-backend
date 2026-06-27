@@ -1,11 +1,18 @@
 const MIN_LOCK_TIMEOUT_MS = 100;
 const MAX_LOCK_TIMEOUT_MS = 60000;
 const DEFAULT_LOCK_TIMEOUT_MS = 5000;
+const MAX_PG_BIGINT = 9223372036854775807n;
 
 export const parsePositiveBigIntId = (value) => {
   const text = String(value ?? '').trim();
   if (!/^[1-9]\d*$/.test(text)) return null;
-  return text;
+  try {
+    const parsed = BigInt(text);
+    if (parsed <= 0n || parsed > MAX_PG_BIGINT) return null;
+    return parsed.toString();
+  } catch {
+    return null;
+  }
 };
 
 export const parseCajaFinancialLockTimeoutMs = (value = process.env.CAJAS_FINANCIAL_LOCK_TIMEOUT_MS) => {
