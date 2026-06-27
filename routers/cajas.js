@@ -1555,6 +1555,31 @@ const upsertCajaAuthorization = async (
   return Number(insertResult.rows?.[0]?.id_caja_usuario_autorizado || 0) || null;
 };
 
+const fetchActiveCajaAuthorizationForUpdate = async (client, idCaja, idUsuario) => {
+  const result = await client.query(
+    `
+      SELECT id_caja_usuario_autorizado,
+             COALESCE(puede_responsable, false) AS puede_responsable,
+             COALESCE(puede_auxiliar, false) AS puede_auxiliar
+      FROM public.cajas_usuarios_autorizados
+      WHERE id_caja = $1
+        AND id_usuario = $2
+        AND COALESCE(estado, true) = true
+      LIMIT 1
+      FOR UPDATE
+    `,
+    [idCaja, idUsuario]
+  );
+  return result.rows?.[0] || null;
+};
+
+const getCajaAuthorizationRoleCode = (assignment) => {
+  if (!assignment) return null;
+  if (parseBooleanish(assignment.puede_responsable)) return 'RESPONSABLE';
+  if (parseBooleanish(assignment.puede_auxiliar)) return 'AUXILIAR';
+  return null;
+};
+
 const fetchCajaDefaultResponsible = async (client, idCaja, idSucursal) => {
   const result = await client.query(
     `
@@ -3002,10 +3027,11 @@ const buildSessionDetailPayload = async (client, session) => {
             COALESCE(SUM(fc.monto), 0)::numeric(12,2) AS total_cobrado,
             MIN(fc.fecha_cobro) AS primer_cobro,
             MAX(fc.fecha_cobro) AS ultimo_cobro,
-            COALESCE(
-              crp.codigo,
-              CASE WHEN fc.id_usuario_ejecutor = $2 THEN 'RESPONSABLE' ELSE 'EJECUTOR' END
-            ) AS rol_participacion_codigo,
+            CASE
+              WHEN fc.id_usuario_ejecutor = $2 THEN 'RESPONSABLE'
+              WHEN crp.codigo IS NOT NULL THEN crp.codigo
+              ELSE 'EJECUTOR'
+            END AS rol_participacion_codigo,
             csp.id_participacion_caja,
             csp.fecha_inicio,
             csp.fecha_fin,
@@ -3021,9 +3047,15 @@ const buildSessionDetailPayload = async (client, session) => {
             FROM public.cajas_sesiones_participantes csp
             WHERE csp.id_sesion_caja = fc.id_sesion_caja
               AND csp.id_usuario = fc.id_usuario_ejecutor
-              AND fc.fecha_cobro >= COALESCE(csp.fecha_inicio, '-infinity'::timestamp)
-              AND fc.fecha_cobro < COALESCE(csp.fecha_fin, 'infinity'::timestamp)
-            ORDER BY csp.fecha_inicio DESC NULLS LAST, csp.id_participacion_caja DESC
+            ORDER BY
+              CASE
+                WHEN fc.fecha_cobro >= COALESCE(csp.fecha_inicio, '-infinity'::timestamp)
+                 AND fc.fecha_cobro < COALESCE(csp.fecha_fin, 'infinity'::timestamp)
+                THEN 0
+                ELSE 1
+              END,
+              csp.fecha_inicio DESC NULLS LAST,
+              csp.id_participacion_caja DESC
             LIMIT 1
           ) csp ON true
           LEFT JOIN public.cat_cajas_roles_participacion crp
@@ -3077,14 +3109,16 @@ const buildSessionDetailPayload = async (client, session) => {
                  u.nombre_usuario AS usuario_ejecutor_alias,
                  u.nombre_usuario,
                  ${USER_DISPLAY_SQL} AS usuario_ejecutor_nombre,
-                 COALESCE(
-                   crp.codigo,
-                   CASE WHEN m.id_usuario_ejecutor = $2 THEN 'RESPONSABLE' ELSE 'EJECUTOR' END
-                 ) AS rol_participacion_codigo,
-                 COALESCE(
-                   crp.nombre,
-                   CASE WHEN m.id_usuario_ejecutor = $2 THEN 'Responsable' ELSE 'Ejecutor' END
-                 ) AS rol_participacion_nombre
+                 CASE
+                   WHEN m.id_usuario_ejecutor = $2 THEN 'RESPONSABLE'
+                   WHEN crp.codigo IS NOT NULL THEN crp.codigo
+                   ELSE 'EJECUTOR'
+                 END AS rol_participacion_codigo,
+                 CASE
+                   WHEN m.id_usuario_ejecutor = $2 THEN 'Responsable'
+                   WHEN crp.nombre IS NOT NULL THEN crp.nombre
+                   ELSE 'Ejecutor'
+                 END AS rol_participacion_nombre
           FROM public.cajas_movimientos m
           INNER JOIN public.cat_cajas_movimientos_tipos tipo ON tipo.id_tipo_movimiento_caja = m.id_tipo_movimiento_caja
           LEFT JOIN public.usuarios u ON u.id_usuario = m.id_usuario_ejecutor
@@ -3095,9 +3129,15 @@ const buildSessionDetailPayload = async (client, session) => {
             FROM public.cajas_sesiones_participantes csp
             WHERE csp.id_sesion_caja = m.id_sesion_caja
               AND csp.id_usuario = m.id_usuario_ejecutor
-              AND m.fecha_movimiento >= COALESCE(csp.fecha_inicio, '-infinity'::timestamp)
-              AND m.fecha_movimiento < COALESCE(csp.fecha_fin, 'infinity'::timestamp)
-            ORDER BY csp.fecha_inicio DESC NULLS LAST, csp.id_participacion_caja DESC
+            ORDER BY
+              CASE
+                WHEN m.fecha_movimiento >= COALESCE(csp.fecha_inicio, '-infinity'::timestamp)
+                 AND m.fecha_movimiento < COALESCE(csp.fecha_fin, 'infinity'::timestamp)
+                THEN 0
+                ELSE 1
+              END,
+              csp.fecha_inicio DESC NULLS LAST,
+              csp.id_participacion_caja DESC
             LIMIT 1
           ) csp ON true
           LEFT JOIN public.cat_cajas_roles_participacion crp
@@ -4169,6 +4209,63 @@ router.post('/ventas/cajas/asignaciones', checkPermission(['VENTAS_CAJAS_PARTICI
         'El usuario seleccionado no pertenece a la sucursal operativa de la caja.'
       );
     }
+    const requestedRoleCode = puedeResponsable ? 'RESPONSABLE' : 'AUXILIAR';
+    const openSession = await fetchOpenSessionForCaja(client, idCaja, { forUpdate: true });
+    const activeAssignment = await fetchActiveCajaAuthorizationForUpdate(client, idCaja, idUsuario);
+    const activeAssignmentRoleCode = getCajaAuthorizationRoleCode(activeAssignment);
+
+    if (openSession?.id_sesion_caja) {
+      await assertUsersNotInAnotherOpenSession(client, [idUsuario], { excludeSessionId: openSession.id_sesion_caja });
+
+      if (
+        Number(openSession.id_usuario_responsable) === Number(idUsuario) &&
+        requestedRoleCode === 'AUXILIAR'
+      ) {
+        throw createCajaError(
+          409,
+          'VENTAS_CAJAS_ASSIGNMENT_OPEN_SESSION_LOCKED',
+          'La caja tiene una sesion abierta. No se puede convertir al responsable en auxiliar.'
+        );
+      }
+
+      if (activeAssignment?.id_caja_usuario_autorizado) {
+        if (activeAssignmentRoleCode === requestedRoleCode) {
+          await client.query('COMMIT');
+          return res.status(200).json({
+            message: 'Asignacion de caja ya registrada con el mismo rol.',
+            id_caja_usuario_autorizado: Number(activeAssignment.id_caja_usuario_autorizado)
+          });
+        }
+
+        throw createCajaError(
+          409,
+          'VENTAS_CAJAS_ASSIGNMENT_OPEN_SESSION_LOCKED',
+          'La caja tiene una sesion abierta. No se puede cambiar el rol de la asignacion.'
+        );
+      }
+
+      if (
+        requestedRoleCode === 'RESPONSABLE' &&
+        Number(openSession.id_usuario_responsable) !== Number(idUsuario)
+      ) {
+        throw createCajaError(
+          409,
+          'VENTAS_CAJAS_ASSIGNMENT_OPEN_SESSION_LOCKED',
+          'La caja tiene una sesion abierta. No se puede cambiar el responsable operativo.'
+        );
+      }
+    } else {
+      await assertUsersNotInAnotherOpenSession(client, [idUsuario]);
+    }
+
+    if (!openSession?.id_sesion_caja && activeAssignmentRoleCode === requestedRoleCode) {
+      await client.query('COMMIT');
+      return res.status(200).json({
+        message: 'Asignacion de caja ya registrada con el mismo rol.',
+        id_caja_usuario_autorizado: Number(activeAssignment.id_caja_usuario_autorizado)
+      });
+    }
+
     await ensureActiveAssignmentBusinessRules(client, {
       idCaja,
       idUsuario,
@@ -4188,13 +4285,6 @@ router.post('/ventas/cajas/asignaciones', checkPermission(['VENTAS_CAJAS_PARTICI
       puedeAuxiliar,
       observacion: req.body.observacion
     });
-
-    const openSession = await fetchOpenSessionForCaja(client, idCaja, { forUpdate: true });
-    if (openSession?.id_sesion_caja) {
-      await assertUsersNotInAnotherOpenSession(client, [idUsuario], { excludeSessionId: openSession.id_sesion_caja });
-    } else {
-      await assertUsersNotInAnotherOpenSession(client, [idUsuario]);
-    }
 
     if (puedeAuxiliar) {
       if (openSession?.id_sesion_caja) {
