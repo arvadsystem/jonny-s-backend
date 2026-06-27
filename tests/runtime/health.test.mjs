@@ -1,7 +1,11 @@
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import { after, describe, it } from 'node:test';
-import app, { setHealthCheckQueryRunnerForTests } from '../../app.js';
+
+process.env.SUPABASE_URL = process.env.SUPABASE_URL || 'https://example.supabase.co';
+process.env.SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY || 'test-service-key';
+
+const { default: app, setHealthCheckQueryRunnerForTests } = await import('../../app.js');
 
 const request = (server, path) => new Promise((resolve, reject) => {
   const address = server.address();

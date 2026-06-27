@@ -236,5 +236,120 @@ describe('email campaign scheduler runtime', () => {
 
     assert.equal(stopped.stopped, true);
     assert.equal(stopped.reason, 'STOPPED');
+    assert.equal(getEmailCampaignSchedulerState().running, false);
+    assert.equal(getEmailCampaignSchedulerState().started, false);
+  });
+
+  it('shutdown durante el primer tick finaliza antes del timeout sin crear timers', async () => {
+    const timers = createTimerHarness();
+    let releaseTick;
+    configureEmailCampaignSchedulerForTests({
+      setInterval: timers.setInterval,
+      clearInterval: timers.clearInterval,
+      processScheduledCampaigns: async () => {
+        await new Promise((resolve) => {
+          releaseTick = resolve;
+        });
+      },
+      isEmailSchedulerEnabled: () => true,
+      isSmtpConfigured: () => true,
+      log: () => {},
+      warn: () => {},
+      error: () => {}
+    });
+
+    const starting = startEmailCampaignScheduler();
+    await waitFor(() => typeof releaseTick === 'function');
+
+    const stopping = stopEmailCampaignScheduler({ timeoutMs: 1000 });
+    releaseTick();
+
+    const [started, stopped] = await Promise.all([starting, stopping]);
+
+    assert.deepEqual(started, { started: false, reason: 'STOPPING', interval_ms: 15000 });
+    assert.equal(stopped.stopped, true);
+    assert.equal(stopped.reason, 'STOPPED');
+    assert.equal(timers.intervals.length, 0);
+    assert.equal(timers.cleared.length, 0);
+    assert.equal(getEmailCampaignSchedulerState().running, false);
+    assert.equal(getEmailCampaignSchedulerState().started, false);
+  });
+
+  it('timeout durante el primer tick no marca inicio ni programa timers al completarse despues', async () => {
+    const timers = createTimerHarness();
+    let releaseTick;
+    configureEmailCampaignSchedulerForTests({
+      setInterval: timers.setInterval,
+      clearInterval: timers.clearInterval,
+      processScheduledCampaigns: async () => {
+        await new Promise((resolve) => {
+          releaseTick = resolve;
+        });
+      },
+      isEmailSchedulerEnabled: () => true,
+      isSmtpConfigured: () => true,
+      log: () => {},
+      warn: () => {},
+      error: () => {}
+    });
+
+    const starting = startEmailCampaignScheduler();
+    await waitFor(() => typeof releaseTick === 'function');
+
+    const stopped = await stopEmailCampaignScheduler({ timeoutMs: 5 });
+
+    assert.equal(stopped.stopped, false);
+    assert.equal(stopped.reason, 'ACTIVE_TICK_TIMEOUT');
+    assert.equal(stopped.running, true);
+    assert.equal(getEmailCampaignSchedulerState().running, true);
+    assert.equal(getEmailCampaignSchedulerState().started, false);
+
+    releaseTick();
+    const started = await starting;
+
+    assert.deepEqual(started, { started: false, reason: 'STOPPING', interval_ms: 15000 });
+    assert.equal(timers.intervals.length, 0);
+    assert.equal(getEmailCampaignSchedulerState().running, false);
+    assert.equal(getEmailCampaignSchedulerState().started, false);
+  });
+
+  it('mantiene estado activo si shutdown supera timeout', async () => {
+    const timers = createTimerHarness();
+    let releaseTick;
+    configureEmailCampaignSchedulerForTests({
+      setInterval: timers.setInterval,
+      clearInterval: timers.clearInterval,
+      processScheduledCampaigns: async () => {},
+      isEmailSchedulerEnabled: () => true,
+      isSmtpConfigured: () => true,
+      log: () => {},
+      warn: () => {},
+      error: () => {}
+    });
+
+    await startEmailCampaignScheduler();
+    configureEmailCampaignSchedulerForTests({
+      processScheduledCampaigns: async () => {
+        await new Promise((resolve) => {
+          releaseTick = resolve;
+        });
+      }
+    });
+
+    const running = schedulerTick();
+    await waitFor(() => typeof releaseTick === 'function');
+    const stopped = await stopEmailCampaignScheduler({ timeoutMs: 5 });
+
+    assert.equal(stopped.stopped, false);
+    assert.equal(stopped.reason, 'ACTIVE_TICK_TIMEOUT');
+    assert.equal(stopped.running, true);
+    assert.equal(getEmailCampaignSchedulerState().running, true);
+    assert.equal(getEmailCampaignSchedulerState().started, true);
+
+    releaseTick();
+    await running;
+
+    assert.equal(getEmailCampaignSchedulerState().running, false);
+    assert.equal(getEmailCampaignSchedulerState().started, false);
   });
 });

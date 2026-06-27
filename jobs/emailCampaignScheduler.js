@@ -25,7 +25,7 @@ const schedulerState = {
   runningPromise: null
 };
 
-const dependencies = {
+const defaultDependencies = {
   processScheduledCampaigns,
   isEmailSchedulerEnabled,
   isSmtpConfigured,
@@ -36,6 +36,8 @@ const dependencies = {
   warn: console.warn.bind(console),
   error: console.error.bind(console)
 };
+
+const dependencies = { ...defaultDependencies };
 
 const parsePositiveIntEnv = (value, fallback, min = 1, max = Number.MAX_SAFE_INTEGER) => {
   const parsed = Number.parseInt(String(value ?? '').trim(), 10);
@@ -95,6 +97,7 @@ export const resetEmailCampaignSchedulerForTests = () => {
   if (schedulerState.timer) dependencies.clearInterval(schedulerState.timer);
   if (schedulerState.heartbeatTimer) dependencies.clearInterval(schedulerState.heartbeatTimer);
   resetSchedulerState();
+  Object.assign(dependencies, defaultDependencies);
 };
 
 export const schedulerTick = async () => {
@@ -140,6 +143,9 @@ export const schedulerTick = async () => {
       schedulerState.lastTickCompletedAt = isoNow();
       schedulerState.running = false;
       schedulerState.runningPromise = null;
+      if (!schedulerState.acceptingTicks && !schedulerState.timer) {
+        schedulerState.started = false;
+      }
     });
 
   return schedulerState.runningPromise;
@@ -182,6 +188,13 @@ export const startEmailCampaignScheduler = async () => {
   schedulerState.intervalMs = intervalMs;
 
   await schedulerTick();
+
+  if (!schedulerState.acceptingTicks) {
+    if (!schedulerState.running) {
+      resetSchedulerState({ preserveCounters: true });
+    }
+    return { started: false, reason: 'STOPPING', interval_ms: intervalMs };
+  }
 
   schedulerState.timer = dependencies.setInterval(() => {
     void schedulerTick();
@@ -229,7 +242,14 @@ export const stopEmailCampaignScheduler = async ({ timeoutMs = DEFAULT_IDLE_TIME
   }
 
   const idle = await waitForSchedulerIdle({ timeoutMs });
-  const reason = idle.idle ? 'STOPPED' : 'STOPPED_WITH_ACTIVE_TICK_TIMEOUT';
+  if (!idle.idle) {
+    return {
+      stopped: false,
+      reason: 'ACTIVE_TICK_TIMEOUT',
+      running: schedulerState.running
+    };
+  }
+
   resetSchedulerState({ preserveCounters: true });
-  return { stopped: true, reason };
+  return { stopped: true, reason: 'STOPPED' };
 };
