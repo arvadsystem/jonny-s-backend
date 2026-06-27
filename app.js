@@ -3,7 +3,7 @@ import express from 'express';
 import cors from 'cors';
 import cookieParser from 'cookie-parser';
 import helmet from 'helmet';
-import pool from './config/db-connection.js';
+import pool, { getPoolState } from './config/db-connection.js';
 
 import loginRoutes from './routers/login.js';
 import publicClienteRoutes from './routers/public_cliente.js';
@@ -103,6 +103,26 @@ const getAllowedOrigins = () => {
 
 const allowedOrigins = getAllowedOrigins();
 const isAllowedOrigin = (origin) => allowedOrigins.includes(normalizeOrigin(origin));
+const READINESS_TIMEOUT_MS = 2000;
+let healthCheckQueryRunner = pool;
+
+export const setHealthCheckQueryRunnerForTests = (queryRunner = pool) => {
+  healthCheckQueryRunner = queryRunner;
+};
+
+const withTimeout = (promise, timeoutMs) => {
+  let timeout = null;
+  const timeoutPromise = new Promise((_, reject) => {
+    timeout = setTimeout(() => {
+      const error = new Error('READINESS_TIMEOUT');
+      error.code = 'READINESS_TIMEOUT';
+      reject(error);
+    }, timeoutMs);
+  });
+  return Promise.race([promise, timeoutPromise]).finally(() => {
+    if (timeout) clearTimeout(timeout);
+  });
+};
 
 // ✅ (Opcional) proxy - no afecta el login
 if (String(process.env.TRUST_PROXY || '').toLowerCase() === 'true') {
@@ -168,6 +188,40 @@ app.use((err, req, res, next) => {
 app.use('/uploads', express.static(UPLOADS_DIR));
 
 // ✅ 2) Rutas públicas ANTES de auth
+app.get('/health/live', (req, res) => {
+  res.status(200).json({
+    status: 'alive',
+    role: 'web',
+    timestamp: new Date().toISOString()
+  });
+});
+
+app.get('/health/ready', async (req, res) => {
+  try {
+    await withTimeout(healthCheckQueryRunner.query('SELECT 1'), READINESS_TIMEOUT_MS);
+    const poolState = getPoolState();
+    return res.status(200).json({
+      status: 'ready',
+      database: 'ok',
+      role: 'web',
+      pool: {
+        total: poolState.totalCount,
+        idle: poolState.idleCount,
+        waiting: poolState.waitingCount
+      },
+      timestamp: new Date().toISOString()
+    });
+  } catch {
+    return res.status(503).json({
+      status: 'not_ready',
+      database: 'error',
+      role: 'web',
+      timestamp: new Date().toISOString()
+    });
+  }
+});
+
+// Legacy: mantener por compatibilidad; EasyPanel debe usar /health/ready.
 app.get('/status', async (req, res) => {
   try {
     const result = await pool.query('SELECT NOW()');

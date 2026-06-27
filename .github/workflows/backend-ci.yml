@@ -25,3 +25,10 @@ jobs:
       - run: npm ci
       - run: npm run check:syntax
       - run: npm test
+      - run: docker build -t jonnys-backend-ci .
+      - name: Validate invalid runtime fails
+        run: |
+          if docker run --rm -e PROCESS_ROLE=invalid jonnys-backend-ci; then
+            echo "Expected PROCESS_ROLE=invalid container to fail"
+            exit 1
+          fi

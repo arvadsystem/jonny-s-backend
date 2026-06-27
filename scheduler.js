@@ -1,12 +1,19 @@
 import 'dotenv/config';
 import { checkDatabaseReady, closePool } from './config/db-connection.js';
+import { getRuntimeConfig } from './config/runtime-config.js';
 import {
   startEmailCampaignScheduler,
   stopEmailCampaignScheduler
 } from './jobs/emailCampaignScheduler.js';
 
+const config = getRuntimeConfig();
+
 await checkDatabaseReady();
-startEmailCampaignScheduler();
+const schedulerStart = await startEmailCampaignScheduler();
+
+if (!schedulerStart.started) {
+  throw new Error(`EMAIL_SCHEDULER_START_FAILED:${schedulerStart.reason}`);
+}
 
 let shutdownPromise = null;
 
@@ -15,7 +22,7 @@ const shutdown = async (signal) => {
 
   console.warn(`[scheduler_shutdown] Senal recibida: ${signal}. Cerrando scheduler y pool PostgreSQL.`);
   shutdownPromise = Promise.resolve()
-    .then(() => stopEmailCampaignScheduler())
+    .then(() => stopEmailCampaignScheduler({ timeoutMs: config.gracefulShutdownTimeoutMs }))
     .then(() => closePool())
     .then(() => {
       console.log('[scheduler_shutdown] Scheduler y pool PostgreSQL cerrados.');
