@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import { enqueueCajaCloseNotification } from '../cajaCloseNotificationQueue.js';
+import { processCajaCloseNotification } from '../cajaCloseNotificationService.js';
 
 const waitFor = async (predicate) => {
   const start = Date.now();
@@ -24,23 +25,55 @@ describe('cajaCloseNotificationQueue', () => {
     await waitFor(() => events.includes('task'));
   });
 
-  it('permite comprobar orden: connect, queries, release, pdf, smtp', async () => {
+  it('ejecuta la funcion real: connect, consultas, release, PDF, SMTP', async () => {
     const events = [];
-    const task = async () => {
-      events.push('connect');
-      events.push('query actors');
-      events.push('query movements');
-      events.push('release');
-      events.push('build pdf');
-      events.push('send smtp');
-    };
+    let checkedOut = false;
 
-    enqueueCajaCloseNotification({
-      idCierreCaja: `test-${Date.now()}-2`,
-      task
+    await processCajaCloseNotification({
+      idCierreCaja: 'test-close',
+      payload: { session: { id_usuario_responsable: 1 } },
+      dependencies: {
+        pool: {
+          async connect() {
+            assert.equal(checkedOut, false);
+            checkedOut = true;
+            events.push('connect');
+            return {
+              release() {
+                checkedOut = false;
+                events.push('release');
+              }
+            };
+          }
+        },
+        async fetchActors() {
+          events.push('query actors');
+          return {};
+        },
+        async fetchMovements() {
+          events.push('query movements');
+          return { ingresos: [], egresos: [] };
+        },
+        async buildPdf() {
+          assert.equal(checkedOut, false);
+          events.push('build pdf');
+          return Buffer.from('pdf');
+        },
+        buildPdfFilename() {
+          return 'cierre.pdf';
+        },
+        async sendEmail() {
+          assert.equal(checkedOut, false);
+          events.push('send smtp');
+        },
+        buildHtml() {
+          return '<p>ok</p>';
+        },
+        to: 'admin@example.com',
+        subject: 'Cierre'
+      }
     });
 
-    await waitFor(() => events.includes('send smtp'));
     assert.deepEqual(events, [
       'connect',
       'query actors',

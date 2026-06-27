@@ -121,17 +121,18 @@ const resolveRequestUserId = (req) => {
 
 const resolveQueryRunner = (queryRunner = null) => queryRunner || pool;
 
-const readRequestPermissions = async (req, queryRunner = null) => {
-  if (req?.__permissionAccess) return req.__permissionAccess;
+export const readRequestAccess = async (req, queryRunner = null) => {
+  if (req?.__accessContext) return req.__accessContext;
 
   const idUsuario = resolveRequestUserId(req);
   if (!idUsuario) {
     const empty = {
       idUsuario: null,
       isSuperAdmin: false,
+      roles: new Set(),
       permissions: new Set()
     };
-    req.__permissionAccess = empty;
+    req.__accessContext = empty;
     return empty;
   }
 
@@ -144,7 +145,14 @@ const readRequestPermissions = async (req, queryRunner = null) => {
       COALESCE(
         ARRAY_REMOVE(ARRAY_AGG(DISTINCT UPPER(TRIM(p.nombre_permiso))), NULL),
         ARRAY[]::text[]
-      ) AS permisos
+      ) AS permisos,
+      COALESCE(
+        ARRAY_REMOVE(
+          ARRAY_AGG(DISTINCT UPPER(REGEXP_REPLACE(TRIM(r.nombre), '[\\s-]+', '_', 'g'))),
+          NULL
+        ),
+        ARRAY[]::text[]
+      ) AS roles
     FROM roles_usuarios ru
     INNER JOIN roles r ON r.id_rol = ru.id_rol
     LEFT JOIN roles_permisos rp ON rp.id_rol = ru.id_rol
@@ -159,52 +167,6 @@ const readRequestPermissions = async (req, queryRunner = null) => {
       .map(normalizePermissionName)
       .filter(Boolean)
   );
-
-  const payload = {
-    idUsuario,
-    isSuperAdmin: Boolean(access.is_super_admin),
-    permissions
-  };
-
-  req.__permissionAccess = payload;
-  req.__isSuperAdmin = payload.isSuperAdmin;
-  return payload;
-};
-
-const readRequestRoles = async (req, queryRunner = null) => {
-  if (req?.__roleAccess) return req.__roleAccess;
-
-  const idUsuario = resolveRequestUserId(req);
-  if (!idUsuario) {
-    const empty = {
-      idUsuario: null,
-      isSuperAdmin: false,
-      roles: new Set()
-    };
-    req.__roleAccess = empty;
-    return empty;
-  }
-
-  const sql = `
-    SELECT
-      COALESCE(
-        BOOL_OR(UPPER(REGEXP_REPLACE(TRIM(r.nombre), '[\\s-]+', '_', 'g')) = 'SUPER_ADMIN'),
-        FALSE
-      ) AS is_super_admin,
-      COALESCE(
-        ARRAY_REMOVE(
-          ARRAY_AGG(DISTINCT UPPER(REGEXP_REPLACE(TRIM(r.nombre), '[\\s-]+', '_', 'g'))),
-          NULL
-        ),
-        ARRAY[]::text[]
-      ) AS roles
-    FROM roles_usuarios ru
-    INNER JOIN roles r ON r.id_rol = ru.id_rol
-    WHERE ru.id_usuario = $1
-  `;
-
-  const result = await resolveQueryRunner(queryRunner).query(sql, [idUsuario]);
-  const access = result.rows?.[0] || {};
   const roles = new Set(
     (Array.isArray(access.roles) ? access.roles : [])
       .map(normalizeRoleName)
@@ -214,11 +176,21 @@ const readRequestRoles = async (req, queryRunner = null) => {
   const payload = {
     idUsuario,
     isSuperAdmin: Boolean(access.is_super_admin),
-    roles
+    roles,
+    permissions
   };
 
+  req.__accessContext = payload;
+  req.__permissionAccess = payload;
   req.__roleAccess = payload;
+  req.__isSuperAdmin = payload.isSuperAdmin;
   return payload;
+};
+
+const readRequestPermissions = readRequestAccess;
+
+const readRequestRoles = async (req, queryRunner = null) => {
+  return readRequestAccess(req, queryRunner);
 };
 
 export const requestHasAnyPermission = async (req, requiredPermission, queryRunner = null) => {
@@ -255,6 +227,7 @@ export const isRequestUserSuperAdmin = async (req, queryRunner = null) => {
       isSuperAdmin: false,
       permissions: new Set()
     };
+    req.__accessContext = empty;
     req.__permissionAccess = empty;
     req.__isSuperAdmin = false;
     return false;
@@ -266,16 +239,19 @@ export const isRequestUserSuperAdmin = async (req, queryRunner = null) => {
     : [];
 
   if (tokenRoles.includes('SUPER_ADMIN')) {
-    req.__permissionAccess = {
+    req.__accessContext = {
       idUsuario,
       isSuperAdmin: true,
+      roles: new Set(['SUPER_ADMIN']),
       permissions: new Set()
     };
+    req.__permissionAccess = req.__accessContext;
+    req.__roleAccess = req.__accessContext;
     req.__isSuperAdmin = true;
     return true;
   }
 
-  const access = await readRequestPermissions(req, queryRunner);
+  const access = await readRequestAccess(req, queryRunner);
   return Boolean(access.isSuperAdmin);
 };
 
@@ -293,7 +269,7 @@ export function checkPermission(requiredPermission) {
         return next();
       }
 
-      const access = await readRequestPermissions(req);
+      const access = await readRequestAccess(req);
       const hasPermission = requiredPermissions.some((permission) =>
         access.permissions.has(permission)
       );

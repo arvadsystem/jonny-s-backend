@@ -3,7 +3,7 @@ import express from 'express';
 import cors from 'cors';
 import cookieParser from 'cookie-parser';
 import helmet from 'helmet';
-import pool, { closePool } from './config/db-connection.js';
+import pool from './config/db-connection.js';
 
 import loginRoutes from './routers/login.js';
 import publicClienteRoutes from './routers/public_cliente.js';
@@ -71,7 +71,6 @@ import { touchSessionMiddleware } from './middleware/touchSession.js';
 import { requireActiveSession } from './middleware/requireActiveSession.js';
 import { requirePasswordChange } from './middleware/requirePasswordChange.js';
 import { MAX_IMAGE_JSON_LIMIT, UPLOADS_DIR } from './utils/uploads.js';
-import { startEmailCampaignScheduler } from './jobs/emailCampaignScheduler.js';
 
 // Parametros
 import catalogosRoutes from './routers/Parametros/catalogos.js';
@@ -272,70 +271,6 @@ app.use(empresasRoutes);
 
 app.use(menuPosRouter); // Monta las rutas del POS Menú
 app.use(movimientosInventarioRoutes);
-
-const PORT = process.env.PORT || 3001;
-const PROCESS_ROLE = String(process.env.PROCESS_ROLE || 'web').trim().toLowerCase();
-const VALID_PROCESS_ROLES = new Set(['web', 'scheduler']);
-
-if (!VALID_PROCESS_ROLES.has(PROCESS_ROLE)) {
-  throw new Error(`PROCESS_ROLE invalido: ${PROCESS_ROLE}. Use web o scheduler.`);
-}
-
-if (PROCESS_ROLE === 'scheduler') {
-  startEmailCampaignScheduler();
-} else {
-  console.log('[email_campaign_scheduler] no iniciado en PROCESS_ROLE=web. Despliegue una instancia PROCESS_ROLE=scheduler para campanas programadas.');
-}
-
-const shouldStartHttp = PROCESS_ROLE !== 'scheduler';
-const server = shouldStartHttp
-  ? app.listen(PORT, () => {
-      console.log(`Servidor activo en el puerto ${PORT}`);
-    })
-  : null;
-
-let shutdownPromise = null;
-
-const shutdown = async (signal) => {
-  if (shutdownPromise) return shutdownPromise;
-
-  console.warn(`[shutdown] Senal recibida: ${signal}. Cerrando servidor HTTP y pool PostgreSQL.`);
-
-  shutdownPromise = new Promise((resolve) => {
-    if (!server) return resolve();
-    server.close((serverErr) => {
-      if (serverErr) {
-        console.error('[shutdown] Error cerrando servidor HTTP:', {
-          code: serverErr?.code || null,
-          message: serverErr?.message || 'Error de cierre'
-        });
-      }
-      resolve();
-    });
-  })
-    .then(() => closePool())
-    .then(() => {
-      console.log('[shutdown] Servidor y pool PostgreSQL cerrados.');
-      process.exit(0);
-    })
-    .catch((err) => {
-      console.error('[shutdown] Error durante cierre limpio:', {
-        code: err?.code || null,
-        message: err?.message || 'Error de cierre'
-      });
-      process.exit(1);
-    });
-
-  return shutdownPromise;
-};
-
-process.once('SIGTERM', () => {
-  void shutdown('SIGTERM');
-});
-
-process.once('SIGINT', () => {
-  void shutdown('SIGINT');
-});
 
 export default app;
 

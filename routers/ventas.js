@@ -8745,6 +8745,7 @@ router.post('/ventas/pedidos/:id/registrar-pago', checkPermission(['VENTAS_CREAR
     sessionActiva.data = await validateCajaSessionOpenForFinancialWrite({
       client,
       idSesionCaja: sessionActiva.data.id_sesion_caja,
+      idCaja: sessionActiva.data.id_caja,
       idSucursal: idSucursalPedido,
       idUsuario: userId
     });
@@ -9269,6 +9270,7 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
     const validatedCajaSession = await validateCajaSessionOpenForFinancialWrite({
       client,
       idSesionCaja: venta.id_sesion_caja,
+      idCaja: venta.id_caja,
       idSucursal: venta.id_sucursal,
       idUsuario: parseOptionalPositiveInt(venta.id_usuario) || userId
     });

@@ -5,17 +5,24 @@ const parsePositiveInt = (value, fallback) => {
   return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
 };
 
+const clampInt = (value, fallback, min, max) => {
+  const parsed = parsePositiveInt(value, fallback);
+  return Math.min(Math.max(parsed, min), max);
+};
+
 const TRANSACTION_TIMEOUTS = Object.freeze({
-  statement: parsePositiveInt(process.env.DB_TRANSACTION_STATEMENT_TIMEOUT_MS, 15000),
-  lock: parsePositiveInt(process.env.DB_TRANSACTION_LOCK_TIMEOUT_MS, 6000),
-  idle: parsePositiveInt(process.env.DB_IDLE_IN_TRANSACTION_TIMEOUT_MS, 5000),
-  slow: parsePositiveInt(process.env.DB_SLOW_TRANSACTION_MS, 3000)
+  statement: clampInt(process.env.DB_TRANSACTION_STATEMENT_TIMEOUT_MS, 15000, 1000, 60000),
+  lock: clampInt(process.env.DB_TRANSACTION_LOCK_TIMEOUT_MS, 6000, 100, 30000),
+  idle: clampInt(process.env.DB_IDLE_IN_TRANSACTION_TIMEOUT_MS, 5000, 1000, 60000),
+  slow: clampInt(process.env.DB_SLOW_TRANSACTION_MS, 3000, 100, 60000)
 });
 
 export const withDbTransaction = async (callback, { label = 'transaction', poolOverride = null } = {}) => {
   const transactionPool = poolOverride || pool;
+  const totalStart = Date.now();
   const client = await transactionPool.connect();
-  const start = Date.now();
+  const poolWaitMs = Date.now() - totalStart;
+  const transactionStart = Date.now();
   let began = false;
 
   try {
@@ -55,9 +62,27 @@ export const withDbTransaction = async (callback, { label = 'transaction', poolO
     }
     throw error;
   } finally {
-    const elapsedMs = Date.now() - start;
-    if (elapsedMs >= TRANSACTION_TIMEOUTS.slow) {
-      console.warn('[db_transaction] slow transaction', { label, elapsed_ms: elapsedMs });
+    const transactionMs = Date.now() - transactionStart;
+    const totalMs = Date.now() - totalStart;
+    const poolState = {
+      totalCount: transactionPool.totalCount,
+      idleCount: transactionPool.idleCount,
+      waitingCount: transactionPool.waitingCount
+    };
+    if (poolWaitMs > 0 || poolState.waitingCount > 0) {
+      console.warn('[db_transaction] pool wait', {
+        label,
+        pool_wait_ms: poolWaitMs,
+        ...poolState
+      });
+    }
+    if (transactionMs >= TRANSACTION_TIMEOUTS.slow) {
+      console.warn('[db_transaction] slow transaction', {
+        label,
+        pool_wait_ms: poolWaitMs,
+        transaction_ms: transactionMs,
+        total_ms: totalMs
+      });
     }
     client.release();
   }

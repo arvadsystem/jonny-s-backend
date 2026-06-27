@@ -20,7 +20,7 @@ describe('caja close pool and batching guards', () => {
   });
 
   it('inserta metodos de validacion y cierre por lote', () => {
-    assert.match(validationAttemptSource, /jsonb_to_recordset\(\$2::jsonb\)/);
+    assert.match(validationAttemptSource, /jsonb_to_recordset\(\$\d+::jsonb\)/);
     assert.match(closeHandlerSource, /jsonb_to_recordset\(\$5::jsonb\)/);
   });
 

@@ -15,7 +15,13 @@ import {
   parsePositiveBigIntId
 } from '../services/cajaFinancialLockService.js';
 import { enqueueCajaCloseNotification } from '../services/cajaCloseNotificationQueue.js';
+import { processCajaCloseNotification } from '../services/cajaCloseNotificationService.js';
 import { withDbTransaction } from '../services/dbTransactionService.js';
+import { loadCajaCloseFinancialSnapshot } from '../services/cajaCloseFinancialSnapshotService.js';
+import {
+  buildSegmentedArqueoComputation as buildSegmentedArqueoComputationFromSnapshot,
+  fingerprintValuesEqual
+} from '../services/cajaCloseComputationService.js';
 import {
   canBypassCajaSucursalForAuxiliary
 } from '../services/cajaAssignmentRulesService.js';
@@ -724,7 +730,7 @@ const assertOperationalFingerprintMatches = ({ validation, currentFingerprint })
 
   const changed = [];
   for (const key of Object.keys(currentFingerprint)) {
-    if (roundMoney(stored[key] || 0) !== roundMoney(currentFingerprint[key] || 0)) {
+    if (!fingerprintValuesEqual(key, stored[key], currentFingerprint[key])) {
       changed.push(key);
     }
   }
@@ -2246,49 +2252,54 @@ const enqueueCajaCloseEmailNotification = ({
 }) => enqueueCajaCloseNotification({
   idCierreCaja,
   task: async () => {
-    let emailActors = {};
-    let movimientosManuales = { ingresos: [], egresos: [] };
-    const client = await pool.connect();
-    try {
-      try {
-        emailActors = await fetchCajaCloseEmailActors(client, {
+    const payrollSyncLabel = describePayrollSync(payrollSync);
+    const cajaLabel = session?.nombre_caja || session?.codigo_caja || `Caja ${session?.id_caja || ''}`.trim();
+    const sucursalLabel = session?.nombre_sucursal || `Sucursal ${session?.id_sucursal || ''}`.trim();
+    const subjectPrefix = requiresAudit
+      ? 'Cierre de caja pendiente de revision'
+      : 'Cierre de caja registrado';
+
+    await processCajaCloseNotification({
+      idCierreCaja,
+      payload: {
+        idCierreCaja,
+        idSesionCaja,
+        session,
+        idUsuarioCierre,
+        fechaCierre,
+        montoTeorico,
+        montoDeclaradoCierre,
+        diferencia,
+        idResolucionFinal,
+        resolutionCode,
+        payrollSync,
+        payrollSyncLabel,
+        arqueos,
+        requiresAudit,
+        montoApertura: Number(resumen?.montoApertura || 0),
+        ventasEfectivoNetas: Number(resumen?.ventasEfectivoNetas || 0),
+        ventasNoEfectivoNetas: Number(resumen?.ventasNoEfectivoNetas || 0),
+        ingresosManuales: Number(resumen?.ingresosManuales || 0),
+        egresosManuales: Number(resumen?.egresosManuales || 0)
+      },
+      dependencies: {
+        pool,
+        to: CAJA_ADMIN_EMAIL_TO,
+        subject: `${subjectPrefix} - ${cajaLabel} - ${sucursalLabel}`,
+        fetchActors: (client) => fetchCajaCloseEmailActors(client, {
           idUsuarioResponsable: session.id_usuario_responsable,
           idUsuarioCierre
-        });
-      } catch (actorError) {
-        console.warn('[cajas] No se pudieron resolver usuarios para correo de cierre:', actorError?.message || actorError);
+        }),
+        fetchMovements: (client) => fetchCajaCloseManualMovements(client, idSesionCaja),
+        buildPdf: buildCajaCierrePdfBuffer,
+        buildPdfFilename: buildCajaCierrePdfFilename,
+        sendEmail: enviarCorreo,
+        buildHtml: (payload) => buildCajaCierreEmailHtml({
+          ...payload,
+          actors: payload.actors || {},
+          movimientosManuales: payload.movimientosManuales || { ingresos: [], egresos: [] }
+        })
       }
-
-      try {
-        movimientosManuales = await fetchCajaCloseManualMovements(client, idSesionCaja);
-      } catch (movementError) {
-        console.warn('[cajas] No se pudieron resolver movimientos manuales para reporte de cierre:', movementError?.message || movementError);
-      }
-    } finally {
-      client.release();
-    }
-
-    await sendCajaCierreEmail({
-      idCierreCaja,
-      idSesionCaja,
-      session,
-      idUsuarioCierre,
-      actors: emailActors,
-      fechaCierre,
-      montoTeorico,
-      montoDeclaradoCierre,
-      diferencia,
-      idResolucionFinal,
-      resolutionCode,
-      payrollSync,
-      arqueos,
-      requiresAudit,
-      montoApertura: Number(resumen?.montoApertura || 0),
-      ventasEfectivoNetas: Number(resumen?.ventasEfectivoNetas || 0),
-      ventasNoEfectivoNetas: Number(resumen?.ventasNoEfectivoNetas || 0),
-      ingresosManuales: Number(resumen?.ingresosManuales || 0),
-      egresosManuales: Number(resumen?.egresosManuales || 0),
-      movimientosManuales
     });
   }
 });
@@ -2766,15 +2777,6 @@ const persistCloseValidationAttempt = async ({
   userAgent,
   operationalFingerprint = null
 }) => {
-  const attemptResult = await client.query(
-    `
-      SELECT COALESCE(MAX(numero_intento), 0) + 1 AS numero_intento
-      FROM public.cajas_cierres_validaciones
-      WHERE id_sesion_caja = $1
-    `,
-    [session.id_sesion_caja]
-  );
-  const numeroIntento = Number(attemptResult.rows?.[0]?.numero_intento || 1);
   const hayDiferencia = computation.rows.some((row) => roundMoney(row.diferencia) !== 0);
   const payloadDeclarado = {
     arqueos: Array.isArray(payloadRows) ? payloadRows : [],
@@ -2791,47 +2793,38 @@ const persistCloseValidationAttempt = async ({
     huella_operacional: operationalFingerprint
   };
 
-  const validationResult = await client.query(
+  let validationResult;
+  try {
+    validationResult = await client.query(
     `
-      INSERT INTO public.cajas_cierres_validaciones (
-        id_sesion_caja, id_caja, id_sucursal, id_usuario_valida, numero_intento,
-        origen, total_teorico, total_declarado, diferencia_total, hay_diferencia,
-        payload_declarado_json, resultado_json, observacion_general, ip_origen, user_agent,
-        fecha_validacion, fecha_creacion
-      )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, $12::jsonb, $13, $14, $15, NOW(), NOW())
-      RETURNING id_validacion_cierre
-    `,
-    [
-      session.id_sesion_caja,
-      session.id_caja,
-      session.id_sucursal,
-      idUsuarioValida,
-      numeroIntento,
-      normalizeCajaCode(origen, 80) || 'REVISION_DIFERENCIAS',
-      computation.monto_teorico_total,
-      computation.monto_declarado_total,
-      computation.diferencia_total,
-      hayDiferencia,
-      JSON.stringify(payloadDeclarado),
-      JSON.stringify(resultado),
-      observacionCierre || null,
-      normalizeText(ipOrigen, 120),
-      normalizeText(userAgent, 300)
-    ]
-  );
-  const idValidacionCierre = parsePositiveBigIntId(validationResult.rows?.[0]?.id_validacion_cierre);
-
-  if (idValidacionCierre && computation.rows.length > 0) {
-    await client.query(
-      `
+      WITH next_attempt AS (
+        SELECT COALESCE(MAX(numero_intento), 0) + 1 AS numero_intento
+        FROM public.cajas_cierres_validaciones
+        WHERE id_sesion_caja = $1
+      ),
+      insert_validation AS (
+        INSERT INTO public.cajas_cierres_validaciones (
+          id_sesion_caja, id_caja, id_sucursal, id_usuario_valida, numero_intento,
+          origen, total_teorico, total_declarado, diferencia_total, hay_diferencia,
+          payload_declarado_json, resultado_json, observacion_general, ip_origen, user_agent,
+          fecha_validacion, fecha_creacion
+        )
+        SELECT
+          $1, $2, $3, $4, next_attempt.numero_intento,
+          $5, $6, $7, $8, $9,
+          $10::jsonb, $11::jsonb, $12, $13, $14,
+          NOW(), NOW()
+        FROM next_attempt
+        RETURNING id_validacion_cierre, numero_intento, hay_diferencia
+      ),
+      insert_validation_methods AS (
         INSERT INTO public.cajas_cierres_validaciones_metodos (
           id_validacion_cierre, id_metodo_pago, metodo_pago_codigo, monto_teorico,
           monto_declarado, diferencia, cantidad_referencias, resultado,
           requiere_revision, observacion, fecha_creacion
         )
         SELECT
-          $1::bigint,
+          insert_validation.id_validacion_cierre,
           row.id_metodo_pago::integer,
           row.metodo_pago_codigo::text,
           row.monto_teorico::numeric,
@@ -2842,7 +2835,8 @@ const persistCloseValidationAttempt = async ({
           row.requiere_revision::boolean,
           row.observacion::text,
           NOW()
-        FROM jsonb_to_recordset($2::jsonb) AS row(
+        FROM insert_validation
+        CROSS JOIN jsonb_to_recordset($15::jsonb) AS row(
           id_metodo_pago integer,
           metodo_pago_codigo text,
           monto_teorico numeric,
@@ -2853,28 +2847,62 @@ const persistCloseValidationAttempt = async ({
           requiere_revision boolean,
           observacion text
         )
-      `,
-      [
-        idValidacionCierre,
-        JSON.stringify(computation.rows.map((row) => ({
-          id_metodo_pago: row.id_metodo_pago,
-          metodo_pago_codigo: row.metodo_pago_codigo,
-          monto_teorico: row.monto_teorico,
-          monto_declarado: row.monto_declarado,
-          diferencia: row.diferencia,
-          cantidad_referencias: row.cantidad_referencias,
-          resultado: row.resultado,
-          requiere_revision: row.requiere_revision,
-          observacion: row.observacion
-        })))
-      ]
+        RETURNING 1
+      ),
+      final_select AS (
+        SELECT
+          insert_validation.id_validacion_cierre::text AS id_validacion_cierre,
+          insert_validation.numero_intento,
+          insert_validation.hay_diferencia
+        FROM insert_validation
+      )
+      SELECT * FROM final_select
+    `,
+    [
+      session.id_sesion_caja,
+      session.id_caja,
+      session.id_sucursal,
+      idUsuarioValida,
+      normalizeCajaCode(origen, 80) || 'REVISION_DIFERENCIAS',
+      computation.monto_teorico_total,
+      computation.monto_declarado_total,
+      computation.diferencia_total,
+      hayDiferencia,
+      JSON.stringify(payloadDeclarado),
+      JSON.stringify(resultado),
+      observacionCierre || null,
+      normalizeText(ipOrigen, 120),
+      normalizeText(userAgent, 300),
+      JSON.stringify(computation.rows.map((row) => ({
+        id_metodo_pago: row.id_metodo_pago,
+        metodo_pago_codigo: row.metodo_pago_codigo,
+        monto_teorico: row.monto_teorico,
+        monto_declarado: row.monto_declarado,
+        diferencia: row.diferencia,
+        cantidad_referencias: row.cantidad_referencias,
+        resultado: row.resultado,
+        requiere_revision: row.requiere_revision,
+        observacion: row.observacion
+      })))
+    ]
     );
+  } catch (err) {
+    if (err?.code === '23505') {
+      throw createCajaError(
+        409,
+        'VENTAS_CAJAS_CLOSE_VALIDATION_CONCURRENT_ATTEMPT',
+        'Otra revision de cierre fue registrada al mismo tiempo. Actualice e intente nuevamente.'
+      );
+    }
+    throw err;
   }
+  const validationRow = validationResult.rows?.[0] || {};
+  const idValidacionCierre = parsePositiveBigIntId(validationRow.id_validacion_cierre);
 
   return {
     id_validacion_cierre: idValidacionCierre,
-    numero_intento: numeroIntento,
-    hay_diferencia: hayDiferencia
+    numero_intento: Number(validationRow.numero_intento || 1),
+    hay_diferencia: Boolean(validationRow.hay_diferencia)
   };
 };
 
@@ -5046,15 +5074,15 @@ const closeSessionHandler = async (req, res) => {
     const session = await ensureOpenSession(client, idSesionCaja, { forUpdate: true });
     assertSucursalAllowed(scopeContext, session.id_sucursal);
 
-    const resumen = await fetchSessionMethodFinancialSummary(client, idSesionCaja);
-    const currentFingerprint = await fetchSessionOperationalFingerprint(client, idSesionCaja, resumen);
+    const snapshot = await loadCajaCloseFinancialSnapshot({ queryRunner: client, idSesionCaja });
+    const currentFingerprint = snapshot.fingerprint;
 
     await assertCanCloseCajaSession({ client, req, scopeContext, session, observacionCierre });
 
     let idArqueoFinalSelected = null;
     let idResolucionFinal = null;
     let diferencia = 0;
-    let montoTeorico = Number(resumen.totalTeorico || 0);
+    let montoTeorico = Number(snapshot.totalTeorico || 0);
     let arqueosPersistir = [];
     let validationToLink = null;
 
@@ -5110,7 +5138,7 @@ const closeSessionHandler = async (req, res) => {
     assertCloseValidationMatchesCurrentSummary({
       validation,
       validationMethods: validationMethodsResult.rows,
-      currentSummary: resumen,
+      currentSummary: snapshot,
       currentFingerprint
     });
     montoTeorico = Number(validationToLink.total_teorico || 0);
@@ -5147,8 +5175,8 @@ const closeSessionHandler = async (req, res) => {
       `,
       [
         idSesionCaja, session.id_caja, session.id_sucursal, session.id_usuario_responsable, scopeContext.idUsuario,
-        idResolucionFinal, idArqueoFinalSelected, Number(resumen.montoApertura || 0), Number(resumen.ventasEfectivoNetas || 0),
-        Number(resumen.ventasNoEfectivoNetas || 0), Number(resumen.ingresosManuales || 0), Number(resumen.egresosManuales || 0),
+        idResolucionFinal, idArqueoFinalSelected, Number(snapshot.montoApertura || 0), Number(snapshot.ventasEfectivoNetas || 0),
+        Number(snapshot.ventasNoEfectivoNetas || 0), Number(snapshot.ingresosManuales || 0), Number(snapshot.egresosManuales || 0),
         montoTeorico, montoDeclaradoCierre, diferencia, observacionCierre
       ]
     );
@@ -5245,18 +5273,12 @@ const closeSessionHandler = async (req, res) => {
       [idSesionCaja]
     );
 
-    const resolutionCode = await getCatalogCodeById(client, 'RESOLUTIONS', idResolucionFinal);
+    const resolutionCode =
+      isBalancedClose
+        ? 'CAJA_CUADRA'
+        : 'PENDIENTE_REVISION';
     const fechaCierre = new Date().toISOString();
-    const payrollSync = await syncPayrollDeductionForClose({
-      client,
-      idCierreCaja,
-      idUsuarioResponsable: session.id_usuario_responsable,
-      idSucursal: session.id_sucursal,
-      fechaCierre,
-      diferencia,
-      resolucionCodigo: resolutionCode,
-      allowExistingDeactivation: false
-    });
+    const payrollSync = { synced: true, reason: 'NOT_REQUIRED' };
 
       const hasArqueoInconsistency = Array.isArray(arqueosPersistir)
         ? arqueosPersistir.some((row) =>
@@ -5282,7 +5304,7 @@ const closeSessionHandler = async (req, res) => {
         payrollSync,
         arqueosPersistir,
         requiresAudit,
-        resumen,
+        resumen: snapshot,
         idArqueoFinalSelected,
         isCashierOnly
       };
@@ -5340,18 +5362,14 @@ router.post('/ventas/cajas/sesiones/:id/cierre-validaciones', checkPermission(['
         ? CLOSE_DIFFERENCE_THRESHOLD
         : 0;
       const payloadRows = Array.isArray(req.body?.arqueos) ? req.body.arqueos : [];
-      const computation = await buildSegmentedArqueoComputation({
-        client,
-        idSesionCaja,
+      const snapshot = await loadCajaCloseFinancialSnapshot({ queryRunner: client, idSesionCaja });
+      const computation = buildSegmentedArqueoComputationFromSnapshot({
+        snapshot,
         payloadRows,
         threshold,
         requireObservacionOnDifference: false
       });
-      const operationalFingerprint = await fetchSessionOperationalFingerprint(
-        client,
-        idSesionCaja,
-        computation.financialSummary
-      );
+      const operationalFingerprint = snapshot.fingerprint;
 
       const validation = await persistCloseValidationAttempt({
         client,
@@ -5388,7 +5406,7 @@ router.post('/ventas/cajas/sesiones/:id/cierre-validaciones', checkPermission(['
 router.post('/ventas/cajas/sesiones/:id/cierre-preview', checkPermission(['VENTAS_CAJAS_SESION_CERRAR']), async (req, res) => {
   const client = await pool.connect();
   try {
-    const idSesionCaja = parsePositiveInt(req.params.id);
+    const idSesionCaja = parsePositiveBigIntId(req.params.id);
     if (!idSesionCaja) throw createCajaError(400, 'VENTAS_CAJAS_SESSION_ID_INVALID', 'El id de sesion es invalido.');
     const scopeContext = await getScopeContext(req, client, null, true);
     const session = await ensureOpenSession(client, idSesionCaja, { forUpdate: false });
@@ -5400,11 +5418,12 @@ router.post('/ventas/cajas/sesiones/:id/cierre-preview', checkPermission(['VENTA
       ? CLOSE_DIFFERENCE_THRESHOLD
       : 0;
     const payloadRows = Array.isArray(req.body?.arqueos) ? req.body.arqueos : [];
-    const computation = await buildSegmentedArqueoComputation({
-      client,
-      idSesionCaja,
+    const snapshot = await loadCajaCloseFinancialSnapshot({ queryRunner: client, idSesionCaja });
+    const computation = buildSegmentedArqueoComputationFromSnapshot({
+      snapshot,
       payloadRows,
-      threshold
+      threshold,
+      requireObservacionOnDifference: false
     });
 
     const responsePayload = {
@@ -5448,10 +5467,6 @@ router.patch('/ventas/cajas/cierres/:id/resolucion', checkPermission(['VENTAS_CA
     if (!resolutionCode) {
       throw createCajaError(400, 'VENTAS_CAJAS_RESOLUTION_REQUIRED', 'Debe seleccionar una resolucion.');
     }
-    if (!observacion) {
-      throw createCajaError(400, 'VENTAS_CAJAS_RESOLUTION_OBSERVATION_REQUIRED', 'La observacion administrativa es obligatoria.');
-    }
-
     const closeResult = await client.query(
       `
         SELECT cc.*,
@@ -5488,6 +5503,9 @@ router.patch('/ventas/cajas/cierres/:id/resolucion', checkPermission(['VENTAS_CA
     const resolution = await getResolutionByCode(client, resolutionCode);
     if (!resolution?.id_resolucion_cierre_caja) {
       throw createCajaError(400, 'VENTAS_CAJAS_RESOLUTION_INVALID', 'La resolucion indicada no existe o esta inactiva.');
+    }
+    if (['GASTO_EMPRESA', 'DESCUENTO_EMPLEADO'].includes(resolution.codigo) && !observacion) {
+      throw createCajaError(400, 'VENTAS_CAJAS_RESOLUTION_OBSERVATION_REQUIRED', 'La observacion administrativa es obligatoria para esta resolucion.');
     }
 
     const diferencia = roundMoney(cierre.diferencia);

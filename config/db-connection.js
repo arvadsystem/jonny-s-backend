@@ -24,11 +24,17 @@ const parseBoolean = (value, fallback = false) => {
 };
 
 const DB_POOL_MAX_LIMIT = 12;
+const PROCESS_ROLE = String(process.env.PROCESS_ROLE || 'web').trim().toLowerCase();
+const DEFAULT_POOL_MAX_BY_ROLE = Object.freeze({
+  web: 5,
+  scheduler: 2
+});
 
-const poolMax = parsePositiveInt(process.env.DB_POOL_MAX, 8);
-if (poolMax > DB_POOL_MAX_LIMIT) {
-  throw new Error(`DB_POOL_MAX no puede ser mayor que ${DB_POOL_MAX_LIMIT}.`);
-}
+const requestedPoolMax = parsePositiveInt(
+  process.env.DB_POOL_MAX,
+  DEFAULT_POOL_MAX_BY_ROLE[PROCESS_ROLE] || DEFAULT_POOL_MAX_BY_ROLE.web
+);
+const poolMax = Math.min(requestedPoolMax, DB_POOL_MAX_LIMIT);
 
 const idleTimeoutMillis = parsePositiveInt(process.env.DB_IDLE_TIMEOUT_MS, 30000);
 const connectionTimeoutMillis = parsePositiveInt(process.env.DB_CONNECTION_TIMEOUT_MS, 3000);
@@ -77,6 +83,7 @@ export const logPoolWaitIfAny = (context = 'unspecified') => {
 };
 
 console.info('[pool] Configuracion efectiva', {
+  PROCESS_ROLE,
   DB_POOL_MAX: poolMax,
   idleTimeoutMillis,
   connectionTimeoutMillis,
@@ -100,19 +107,23 @@ pool.on('error', (err) => {
   console.error('[pool] Unexpected idle client error', payload);
 });
 
-export const dbReady = pool.connect()
-  .then((client) => {
+export const checkDatabaseReady = async () => {
+  let client = null;
+  try {
+    client = await pool.connect();
+    await client.query('SELECT 1');
     console.log('[db] PostgreSQL connection ready');
-    client.release();
     return true;
-  })
-  .catch((err) => {
+  } catch (err) {
     console.error('[db] PostgreSQL connection failed:', {
       code: err?.code || null,
       message: err?.message || 'Connection error'
     });
-    return false;
-  });
+    throw err;
+  } finally {
+    if (client) client.release();
+  }
+};
 
 let poolEndPromise = null;
 
