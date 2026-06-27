@@ -8,7 +8,7 @@ COPY package.json package-lock.json ./
 
 RUN npm ci --omit=dev && npm cache clean --force
 
-COPY app.js ./
+COPY app.js bootstrap.js server.js scheduler.js ./
 COPY config ./config
 COPY middleware ./middleware
 COPY routers ./routers
@@ -23,4 +23,4 @@ USER node
 
 EXPOSE 3001
 
-CMD ["node", "app.js"]
+CMD ["node", "bootstrap.js"]

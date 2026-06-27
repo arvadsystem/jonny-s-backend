@@ -7,12 +7,22 @@ const CONCURRENCY = Math.min(
   parsePositiveInt(process.env.CAJA_CLOSE_NOTIFICATION_CONCURRENCY, 1),
   2
 );
-const MAX_QUEUE_SIZE = parsePositiveInt(process.env.CAJA_CLOSE_NOTIFICATION_QUEUE_MAX, 100);
+const MAX_QUEUE_SIZE = Math.min(
+  parsePositiveInt(process.env.CAJA_CLOSE_NOTIFICATION_QUEUE_MAX, 100),
+  1000
+);
 
 const state = {
   active: 0,
   queue: [],
-  pendingCloseIds: new Set()
+  pendingCloseIds: new Set(),
+  drainResolvers: []
+};
+
+const notifyDrainers = () => {
+  if (state.active !== 0 || state.queue.length !== 0) return;
+  const resolvers = state.drainResolvers.splice(0);
+  for (const resolve of resolvers) resolve();
 };
 
 const runNext = () => {
@@ -32,6 +42,7 @@ const runNext = () => {
       .finally(() => {
         state.active -= 1;
         state.pendingCloseIds.delete(item.idCierreCaja);
+        notifyDrainers();
         runNext();
       });
   }
@@ -67,3 +78,28 @@ export const getCajaCloseNotificationQueueState = () => ({
   concurrency: CONCURRENCY,
   max_queue_size: MAX_QUEUE_SIZE
 });
+
+export const drainCajaCloseNotificationQueue = async ({ timeoutMs = 5000 } = {}) => {
+  const parsedTimeout = parsePositiveInt(timeoutMs, 5000);
+  const boundedTimeout = Math.min(parsedTimeout, 30000);
+  if (state.active === 0 && state.queue.length === 0) {
+    return { drained: true, active: 0, queued: 0 };
+  }
+
+  let timeout = null;
+  const result = await Promise.race([
+    new Promise((resolve) => {
+      state.drainResolvers.push(() => resolve({ drained: true }));
+    }),
+    new Promise((resolve) => {
+      timeout = setTimeout(() => resolve({ drained: false, reason: 'TIMEOUT' }), boundedTimeout);
+    })
+  ]);
+
+  if (timeout) clearTimeout(timeout);
+  return {
+    ...result,
+    active: state.active,
+    queued: state.queue.length
+  };
+};
