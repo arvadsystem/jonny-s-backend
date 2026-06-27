@@ -189,6 +189,13 @@ export const startEmailCampaignScheduler = async () => {
 
   await schedulerTick();
 
+  if (!schedulerState.acceptingTicks) {
+    if (!schedulerState.running) {
+      resetSchedulerState({ preserveCounters: true });
+    }
+    return { started: false, reason: 'STOPPING', interval_ms: intervalMs };
+  }
+
   schedulerState.timer = dependencies.setInterval(() => {
     void schedulerTick();
   }, intervalMs);

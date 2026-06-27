@@ -21,7 +21,14 @@ export const createSchedulerRuntime = ({
 
   const start = async () => {
     await dbReady();
+    if (shutdownPromise) {
+      return { started: false, reason: 'SHUTTING_DOWN' };
+    }
+
     const schedulerStart = await startScheduler();
+    if (shutdownPromise) {
+      return schedulerStart;
+    }
 
     if (!schedulerStart.started) {
       throw new Error(`EMAIL_SCHEDULER_START_FAILED:${schedulerStart.reason}`);
@@ -65,8 +72,6 @@ export const createSchedulerRuntime = ({
 export const schedulerRuntime = createSchedulerRuntime();
 
 if (process.env.SCHEDULER_RUNTIME_AUTOSTART_DISABLED !== 'true') {
-  await schedulerRuntime.start();
-
   process.once('SIGTERM', () => {
     void schedulerRuntime.shutdown('SIGTERM');
   });
@@ -74,4 +79,6 @@ if (process.env.SCHEDULER_RUNTIME_AUTOSTART_DISABLED !== 'true') {
   process.once('SIGINT', () => {
     void schedulerRuntime.shutdown('SIGINT');
   });
+
+  await schedulerRuntime.start();
 }

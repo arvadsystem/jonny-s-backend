@@ -100,6 +100,7 @@ describe('scheduler runtime shutdown', () => {
 
     const runtime = createSchedulerRuntime({
       runtimeConfig: { gracefulShutdownTimeoutMs: 1000 },
+      dbReady: async () => {},
       stopScheduler: stopEmailCampaignScheduler,
       closeDatabasePool: async () => {
         events.push('pool-closed');
@@ -142,6 +143,105 @@ describe('scheduler runtime shutdown', () => {
     await runtime.shutdown('SIGTERM');
 
     assert.deepEqual(events, ['exit-1']);
+  });
+
+  it('SIGTERM durante el primer tick espera fin, cierra pool y sale 0', async () => {
+    const { createSchedulerRuntime } = await import(`../../scheduler.js?case=${Date.now()}-sigterm-first-tick`);
+    const timers = createTimerHarness();
+    const events = [];
+    let releaseTick;
+
+    configureEmailCampaignSchedulerForTests({
+      setInterval: timers.setInterval,
+      clearInterval: timers.clearInterval,
+      processScheduledCampaigns: async () => {
+        events.push('first-tick-started');
+        await new Promise((resolveTick) => {
+          releaseTick = resolveTick;
+        });
+        events.push('first-tick-finished');
+      },
+      isEmailSchedulerEnabled: () => true,
+      isSmtpConfigured: () => true,
+      log: () => {},
+      warn: () => {},
+      error: () => {}
+    });
+
+    const runtime = createSchedulerRuntime({
+      runtimeConfig: { gracefulShutdownTimeoutMs: 1000 },
+      dbReady: async () => {},
+      stopScheduler: stopEmailCampaignScheduler,
+      closeDatabasePool: async () => {
+        events.push('pool-closed');
+      },
+      runtimeProcess: {
+        exit(code) {
+          events.push(`exit-${code}`);
+        }
+      }
+    });
+
+    const starting = runtime.start();
+    await waitFor(() => typeof releaseTick === 'function');
+
+    const stopping = runtime.shutdown('SIGTERM');
+    await new Promise((resolveWait) => setTimeout(resolveWait, 5));
+    assert.deepEqual(events, ['first-tick-started']);
+
+    releaseTick();
+    const [started] = await Promise.all([starting, stopping]);
+
+    assert.deepEqual(started, { started: false, reason: 'STOPPING', interval_ms: 15000 });
+    assert.deepEqual(events, ['first-tick-started', 'first-tick-finished', 'pool-closed', 'exit-0']);
+    assert.equal(timers.intervals.length, 0);
+  });
+
+  it('SIGTERM durante el primer tick sale 1 y no cierra pool si supera timeout', async () => {
+    const { createSchedulerRuntime } = await import(`../../scheduler.js?case=${Date.now()}-sigterm-first-tick-timeout`);
+    const timers = createTimerHarness();
+    const events = [];
+    let releaseTick;
+
+    configureEmailCampaignSchedulerForTests({
+      setInterval: timers.setInterval,
+      clearInterval: timers.clearInterval,
+      processScheduledCampaigns: async () => {
+        events.push('first-tick-started');
+        await new Promise((resolveTick) => {
+          releaseTick = resolveTick;
+        });
+      },
+      isEmailSchedulerEnabled: () => true,
+      isSmtpConfigured: () => true,
+      log: () => {},
+      warn: () => {},
+      error: () => {}
+    });
+
+    const runtime = createSchedulerRuntime({
+      runtimeConfig: { gracefulShutdownTimeoutMs: 5 },
+      dbReady: async () => {},
+      stopScheduler: stopEmailCampaignScheduler,
+      closeDatabasePool: async () => {
+        events.push('pool-closed');
+      },
+      runtimeProcess: {
+        exit(code) {
+          events.push(`exit-${code}`);
+        }
+      }
+    });
+
+    const starting = runtime.start();
+    await waitFor(() => typeof releaseTick === 'function');
+    await runtime.shutdown('SIGTERM');
+
+    assert.deepEqual(events, ['first-tick-started', 'exit-1']);
+    assert.equal(timers.intervals.length, 0);
+
+    releaseTick();
+    await starting;
   });
 
   it('carga scheduler.js real sin Express ni servidor HTTP', () => {
