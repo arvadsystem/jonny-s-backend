@@ -1210,6 +1210,13 @@ const createVentaWithRpcTransaction = async ({ client, venta, perf, requestStart
     };
   }
 
+  await aplicarSnapshotEnFactura(
+    client,
+    idFactura,
+    facturacionVenta.snapshot,
+    facturacionVenta.idConfig
+  );
+
   const responsePayload = {
     ...response,
     fidelizacion: null
@@ -1282,6 +1289,16 @@ const createVentaWithRpcV2Transaction = async ({ client, venta, perf, requestSta
       publicMessage: 'La venta fue procesada por RPC V2, pero no devolvio factura valida.'
     };
   }
+
+  const facturacionVenta = await obtenerConfigFacturacionParaVenta(client, venta.id_sucursal, {
+    perf
+  });
+  await aplicarSnapshotEnFactura(
+    client,
+    idFactura,
+    facturacionVenta.snapshot,
+    facturacionVenta.idConfig
+  );
 
   const responsePayload = {
     ...response,
