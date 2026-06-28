@@ -37,4 +37,34 @@ describe('caja assignment route rules', () => {
     assert.match(endpointSource, /VALUES \(\$1,\s*\$2,\s*\$3,\s*\(now\(\) AT TIME ZONE 'America\/Tegucigalpa'\),\s*true,\s*\$4,\s*NOW\(\),\s*NOW\(\)\)/, 'insert debe usar hora local en fecha_inicio');
     assert.doesNotMatch(endpointSource, /'RESPONSABLE'/, 'auto-auxiliar no debe convertir al usuario en responsable');
   });
+
+  it('usa hora local operativa en fecha_inicio y fecha_fin de participantes', () => {
+    const localTimeExpression = "(now() AT TIME ZONE 'America/Tegucigalpa')";
+    const participantInsertBlocks = [...source.matchAll(
+      /INSERT INTO public\.cajas_sesiones_participantes[\s\S]*?VALUES\s*\([^;]+/g
+    )].map((match) => match[0]);
+    const participantUpdateBlocks = [...source.matchAll(
+      /UPDATE public\.cajas_sesiones_participantes[\s\S]*?WHERE\s+(?:id_sesion_caja|id_participacion_caja)[^;`]+/g
+    )].map((match) => match[0]);
+
+    assert.ok(participantInsertBlocks.length >= 5, 'deben existir inserciones operativas de participantes');
+    for (const block of participantInsertBlocks) {
+      if (!/fecha_inicio/.test(block)) continue;
+      assert.match(block, /fecha_inicio[\s\S]*VALUES\s*\(\$1,\s*\$2,\s*\$3,\s*\(now\(\) AT TIME ZONE 'America\/Tegucigalpa'\)/);
+      assert.doesNotMatch(block, /fecha_inicio[\s\S]*VALUES\s*\(\$1,\s*\$2,\s*\$3,\s*NOW\(\)/);
+    }
+
+    const operationalParticipantUpdates = participantUpdateBlocks.filter((block) => /fecha_(?:inicio|fin)\s*=/.test(block));
+    assert.ok(operationalParticipantUpdates.length >= 3, 'deben existir actualizaciones operativas de participantes');
+    for (const block of operationalParticipantUpdates) {
+      if (/fecha_inicio\s*=/.test(block)) {
+        assert.match(block, /fecha_inicio\s*=\s*\(now\(\) AT TIME ZONE 'America\/Tegucigalpa'\)/);
+      }
+      if (/fecha_fin\s*=\s*NULL/i.test(block)) continue;
+      if (/fecha_fin\s*=/.test(block)) {
+        assert.match(block, /fecha_fin\s*=\s*\(now\(\) AT TIME ZONE 'America\/Tegucigalpa'\)/);
+      }
+      assert.ok(block.includes(localTimeExpression), 'cada actualizacion temporal debe usar la expresion local exacta');
+    }
+  });
 });
