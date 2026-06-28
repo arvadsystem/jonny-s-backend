@@ -10,9 +10,9 @@ const VALID_TICKET_WIDTH = new Set([58, 80]);
 const VALID_PREFIX_RE = /^[A-Za-z0-9_-]+$/;
 const SAFE_EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const TICKET_FLAG_DEFAULTS = Object.freeze({
-  mostrar_datos_fiscales: true,
-  mostrar_cai_ticket: true,
-  mostrar_numero_fiscal_ticket: true,
+  mostrar_datos_fiscales: false,
+  mostrar_cai_ticket: false,
+  mostrar_numero_fiscal_ticket: false,
   mostrar_codigo_interno_ticket: true,
   aplicar_impuestos: false,
   mostrar_impuestos_ticket: false,
@@ -126,6 +126,13 @@ const buildPreviewFromConfig = (config) => {
       numero_ejemplo: sampleNumber,
       modo_fiscal: config?.modo_fiscal ?? 'INTERNO',
       ancho_ticket_mm: Number(config?.ancho_ticket_mm ?? 80)
+    },
+    fiscal: {
+      habilitado: false,
+      modo_fiscal: 'NO_INTEGRADO',
+      cai: null,
+      numero_factura_fiscal: null,
+      id_rango_cai: null
     },
     items: [
       {
@@ -564,7 +571,7 @@ export const crearConfiguracionInicialSiNoExiste = async (idSucursal, db = pool)
         VALUES (
           $1, 'VTA', 'REV', 5, true, 'INTERNO', true, 80, true,
           $2, null, $3, $4, $5, null, null, null, 'Gracias por su compra', true, true, true, false,
-          true, true, true, true,
+          false, false, false, true,
           false, false, false, false, false, false, false, false,
           true, true, true,
           true, true, true, true, true, true, true, true

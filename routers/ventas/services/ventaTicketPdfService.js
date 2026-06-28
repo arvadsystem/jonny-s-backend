@@ -46,6 +46,20 @@ const cleanText = (value) => {
   return text || null;
 };
 
+const normalizeFiscalText = (value) => {
+  const normalized = cleanText(value);
+  if (!normalized || normalized === '0') return null;
+  return normalized;
+};
+
+const hasRealFiscalData = (fiscal = {}, venta = {}) => (
+  Boolean(
+    normalizeFiscalText(fiscal?.cai || venta?.cai)
+    || normalizeFiscalText(fiscal?.numero_factura_fiscal || venta?.numero_factura_fiscal)
+    || Number(fiscal?.id_rango_cai || venta?.id_rango_cai || 0) > 0
+  )
+);
+
 const formatDateParts = (value) => {
   const date = value ? new Date(value) : new Date();
   if (Number.isNaN(date.getTime())) return { date: '--', time: '--' };
@@ -123,7 +137,10 @@ const estimateHeightMm = (venta = {}) => {
   const extrasCount = countExtras(items);
   const salsasCount = countSalsas(items);
   const splitCount = countSplitLines(venta.cuenta_dividida);
-  const fiscalBlocks = venta?.facturacion?.ticket?.mostrar_datos_fiscales === false ? 0 : 4;
+  const fiscalBlocks = hasRealFiscalData(venta?.facturacion?.fiscal, venta)
+    && venta?.facturacion?.ticket?.mostrar_datos_fiscales !== false
+    ? 4
+    : 0;
   const logoBlock = venta?.facturacion?.ticket?.mostrar_logo_ticket && venta?.facturacion?.emisor?.logo_data_url
     ? (ticketWidth === 58 ? 32 : 46)
     : 0;
@@ -200,12 +217,19 @@ const buildFiscalBlock = (venta, widthMm) => {
   const facturacion = venta.facturacion || {};
   const ticket = facturacion.ticket || {};
   const fiscal = facturacion.fiscal || {};
-  if (ticket.mostrar_datos_fiscales === false) return [];
+  const cai = normalizeFiscalText(fiscal.cai || venta.cai);
+  const numeroFiscal = normalizeFiscalText(fiscal.numero_factura_fiscal || venta.numero_factura_fiscal);
+  const fiscalEnabled = Boolean(fiscal?.habilitado) && hasRealFiscalData(fiscal, venta);
+  if (ticket.mostrar_datos_fiscales === false || !fiscalEnabled) {
+    return ticket.mostrar_codigo_interno_ticket
+      ? [divider(widthMm), metaRow('Codigo', venta.codigo_venta || venta.numero_venta || `VTA-${String(venta.id_factura || '').padStart(5, '0')}`, widthMm)]
+      : [];
+  }
 
   const rows = [];
-  if (ticket.mostrar_cai_ticket) rows.push(metaRow('CAI', fiscal.cai || venta.cai || '0', widthMm));
-  if (ticket.mostrar_numero_fiscal_ticket) {
-    rows.push(metaRow('No fiscal', fiscal.numero_factura_fiscal || venta.numero_factura_fiscal || '0', widthMm));
+  if (ticket.mostrar_cai_ticket && cai) rows.push(metaRow('CAI', cai, widthMm));
+  if (ticket.mostrar_numero_fiscal_ticket && numeroFiscal) {
+    rows.push(metaRow('No fiscal', numeroFiscal, widthMm));
   }
   if (ticket.mostrar_codigo_interno_ticket) {
     rows.push(metaRow('Codigo', venta.codigo_venta || venta.numero_venta || `VTA-${String(venta.id_factura || '').padStart(5, '0')}`, widthMm));

@@ -5,6 +5,7 @@ import { SUPABASE_ADMIN_BUCKET } from '../utils/uploads.js';
 const TEGUCIGALPA_TZ = 'America/Tegucigalpa';
 const DEFAULT_BUSINESS_NAME = "JONNY'S";
 const DEFAULT_FOOTER = 'Gracias por su compra';
+const INTERNAL_FISCAL_MODE = 'NO_INTEGRADO';
 const MAX_LOGO_DATA_URL_BYTES = 1024 * 1024;
 const LOGO_ASSET_CACHE_TTL_MS = 5 * 60 * 1000;
 const LOGO_MIME_BY_EXTENSION = Object.freeze({
@@ -15,9 +16,9 @@ const LOGO_MIME_BY_EXTENSION = Object.freeze({
 });
 const logoAssetCache = new Map();
 const TICKET_FLAG_DEFAULTS = Object.freeze({
-  mostrar_datos_fiscales: true,
-  mostrar_cai_ticket: true,
-  mostrar_numero_fiscal_ticket: true,
+  mostrar_datos_fiscales: false,
+  mostrar_cai_ticket: false,
+  mostrar_numero_fiscal_ticket: false,
   mostrar_codigo_interno_ticket: true,
   aplicar_impuestos: false,
   mostrar_impuestos_ticket: false,
@@ -56,6 +57,57 @@ const toBoolean = (value, fallback = false) => {
 const toNullableText = (value) => {
   const normalized = String(value ?? '').trim();
   return normalized ? normalized : null;
+};
+
+const toNullableFiscalText = (value) => {
+  const normalized = toNullableText(value);
+  if (!normalized || normalized === '0') return null;
+  return normalized;
+};
+
+const buildDisabledFiscalState = () => ({
+  habilitado: false,
+  modo_fiscal: INTERNAL_FISCAL_MODE,
+  cai: null,
+  numero_factura_fiscal: null,
+  id_rango_cai: null
+});
+
+const normalizeFiscalMode = (value) => {
+  const normalized = String(value ?? '').trim().toUpperCase();
+  return normalized || INTERNAL_FISCAL_MODE;
+};
+
+const normalizeFiscalState = (source = {}) => {
+  const cai = toNullableFiscalText(source?.cai);
+  const numeroFacturaFiscal = toNullableFiscalText(source?.numero_factura_fiscal);
+  const idRangoCai = toPositiveInt(source?.id_rango_cai);
+  const hasRealFiscalData = Boolean(cai || numeroFacturaFiscal || idRangoCai);
+  const habilitado = toBoolean(source?.habilitado, hasRealFiscalData);
+
+  if (!habilitado) {
+    return buildDisabledFiscalState();
+  }
+
+  return {
+    habilitado: true,
+    modo_fiscal: normalizeFiscalMode(source?.modo_fiscal),
+    cai,
+    numero_factura_fiscal: numeroFacturaFiscal,
+    id_rango_cai: idRangoCai
+  };
+};
+
+const applyFiscalTicketVisibility = (ticket = {}, fiscal = {}) => {
+  if (fiscal?.habilitado) return ticket;
+
+  return {
+    ...ticket,
+    mostrar_datos_fiscales: false,
+    mostrar_cai_ticket: false,
+    mostrar_numero_fiscal_ticket: false,
+    mostrar_codigo_interno_ticket: toBoolean(ticket?.mostrar_codigo_interno_ticket, true)
+  };
 };
 
 const parseStoredStoragePath = (rawValue) => {
@@ -242,7 +294,7 @@ const ensureConfigRow = async (client, idSucursal, sucursal) => {
         true,
         true,
         false,
-        true, true, true, true,
+        false, false, false, true,
         false, false, false, false, false, false, false, false,
         true, true, true,
         true, true, true, true, true, true, true, true
@@ -540,6 +592,19 @@ const snapshotFromConfig = ({ config, sucursal, idSucursal }) => {
   const telefonoEmisor = toNullableText(config?.telefono_emisor) || telefonoSucursal;
   const correoEmisor = toNullableText(config?.correo_emisor) || correoSucursal;
 
+  const fiscal = buildDisabledFiscalState();
+  const ticket = applyFiscalTicketVisibility({
+    ancho_ticket_mm: toTicketWidth(config?.ancho_ticket_mm),
+    mostrar_logo_ticket: toBoolean(config?.mostrar_logo_ticket, true),
+    mostrar_rtn: toBoolean(config?.mostrar_rtn, true),
+    mostrar_direccion: toBoolean(config?.mostrar_direccion, true),
+    mostrar_telefono: toBoolean(config?.mostrar_telefono, true),
+    mostrar_correo: toBoolean(config?.mostrar_correo, false),
+    ...resolveTicketFlags(config),
+    texto_encabezado_ticket: toNullableText(config?.texto_encabezado_ticket),
+    texto_pie_ticket: toNullableText(config?.texto_pie_ticket) || DEFAULT_FOOTER
+  }, fiscal);
+
   return {
     version: 1,
     origen: 'SUCURSALES_FACTURACION',
@@ -553,29 +618,14 @@ const snapshotFromConfig = ({ config, sucursal, idSucursal }) => {
       correo_emisor: correoEmisor,
       logo_url: toNullableText(config?.logo_url)
     },
-    ticket: {
-      ancho_ticket_mm: toTicketWidth(config?.ancho_ticket_mm),
-      mostrar_logo_ticket: toBoolean(config?.mostrar_logo_ticket, true),
-      mostrar_rtn: toBoolean(config?.mostrar_rtn, true),
-      mostrar_direccion: toBoolean(config?.mostrar_direccion, true),
-      mostrar_telefono: toBoolean(config?.mostrar_telefono, true),
-      mostrar_correo: toBoolean(config?.mostrar_correo, false),
-      ...resolveTicketFlags(config),
-      texto_encabezado_ticket: toNullableText(config?.texto_encabezado_ticket),
-      texto_pie_ticket: toNullableText(config?.texto_pie_ticket) || DEFAULT_FOOTER
-    },
+    ticket,
     correlativo: {
       prefijo_venta: toNullableText(config?.prefijo_venta) || 'VTA',
       prefijo_reversion: toNullableText(config?.prefijo_reversion) || 'REV',
       longitud_correlativo: Number.parseInt(String(config?.longitud_correlativo ?? '5'), 10) || 5,
       reinicio_diario: toBoolean(config?.reinicio_diario, true)
     },
-    fiscal: {
-      modo_fiscal: 'NO_INTEGRADO',
-      cai: '0',
-      numero_factura_fiscal: '0',
-      id_rango_cai: null
-    },
+    fiscal,
     creado_en: currentDateTimeHonduras()
   };
 };
@@ -635,19 +685,27 @@ export const aplicarSnapshotEnFactura = async (client, idFactura, snapshot, idCo
     throw new Error('FACTURACION_SNAPSHOT_FACTURA_INVALIDA');
   }
   const db = client && typeof client.query === 'function' ? client : pool;
+  const normalizedSnapshot = normalizeSnapshotShape(snapshot);
+  const fiscal = normalizedSnapshot.fiscal || buildDisabledFiscalState();
 
   const result = await db.query(
     `
       UPDATE public.facturas
       SET
         id_config_facturacion = $1,
-        id_rango_cai = NULL,
-        numero_factura_fiscal = '0',
-        facturacion_snapshot = $2::jsonb
-      WHERE id_factura = $3
+        id_rango_cai = $2,
+        numero_factura_fiscal = $3,
+        facturacion_snapshot = $4::jsonb
+      WHERE id_factura = $5
       RETURNING id_factura
     `,
-    [idConfig || null, JSON.stringify(snapshot || {}), idFacturaNum]
+    [
+      idConfig || null,
+      fiscal.habilitado ? toPositiveInt(fiscal.id_rango_cai) : null,
+      fiscal.habilitado ? toNullableFiscalText(fiscal.numero_factura_fiscal) : null,
+      JSON.stringify(normalizedSnapshot),
+      idFacturaNum
+    ]
   );
 
   return result.rowCount > 0;
@@ -656,8 +714,19 @@ export const aplicarSnapshotEnFactura = async (client, idFactura, snapshot, idCo
 const normalizeSnapshotShape = (snapshot) => {
   const source = snapshot && typeof snapshot === 'object' ? snapshot : {};
   const emisor = source.emisor && typeof source.emisor === 'object' ? source.emisor : {};
-  const ticket = source.ticket && typeof source.ticket === 'object' ? source.ticket : {};
-  const fiscal = source.fiscal && typeof source.fiscal === 'object' ? source.fiscal : {};
+  const rawTicket = source.ticket && typeof source.ticket === 'object' ? source.ticket : {};
+  const fiscal = normalizeFiscalState(source.fiscal && typeof source.fiscal === 'object' ? source.fiscal : {});
+  const ticket = applyFiscalTicketVisibility({
+    ancho_ticket_mm: toTicketWidth(rawTicket.ancho_ticket_mm),
+    mostrar_logo_ticket: toBoolean(rawTicket.mostrar_logo_ticket, true),
+    mostrar_rtn: toBoolean(rawTicket.mostrar_rtn, true),
+    mostrar_direccion: toBoolean(rawTicket.mostrar_direccion, true),
+    mostrar_telefono: toBoolean(rawTicket.mostrar_telefono, true),
+    mostrar_correo: toBoolean(rawTicket.mostrar_correo, false),
+    ...resolveTicketFlags(rawTicket),
+    texto_encabezado_ticket: toNullableText(rawTicket.texto_encabezado_ticket),
+    texto_pie_ticket: toNullableText(rawTicket.texto_pie_ticket) || DEFAULT_FOOTER
+  }, fiscal);
 
   return {
     version: Number(source.version || 1),
@@ -673,23 +742,8 @@ const normalizeSnapshotShape = (snapshot) => {
       logo_url: toNullableText(emisor.logo_url),
       logo_data_url: toNullableText(emisor.logo_data_url)
     },
-    ticket: {
-      ancho_ticket_mm: toTicketWidth(ticket.ancho_ticket_mm),
-      mostrar_logo_ticket: toBoolean(ticket.mostrar_logo_ticket, true),
-      mostrar_rtn: toBoolean(ticket.mostrar_rtn, true),
-      mostrar_direccion: toBoolean(ticket.mostrar_direccion, true),
-      mostrar_telefono: toBoolean(ticket.mostrar_telefono, true),
-      mostrar_correo: toBoolean(ticket.mostrar_correo, false),
-      ...resolveTicketFlags(ticket),
-      texto_encabezado_ticket: toNullableText(ticket.texto_encabezado_ticket),
-      texto_pie_ticket: toNullableText(ticket.texto_pie_ticket) || DEFAULT_FOOTER
-    },
-    fiscal: {
-      modo_fiscal: 'NO_INTEGRADO',
-      cai: '0',
-      numero_factura_fiscal: '0',
-      id_rango_cai: null
-    }
+    ticket,
+    fiscal
   };
 };
 

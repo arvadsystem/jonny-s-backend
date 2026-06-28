@@ -8,7 +8,14 @@ import {
   VENTAS_LIMIT_72H_CUTOFF_SQL
 } from '../constants.js';
 
+const INTERNAL_FISCAL_MODE = 'NO_INTEGRADO';
 const tableExistsCache = new Map();
+
+const normalizeFiscalText = (value) => {
+  const normalized = String(value ?? '').trim();
+  if (!normalized || normalized === '0') return null;
+  return normalized;
+};
 
 const hasTable = async (client, tableName) => {
   const key = `table:${String(tableName || '').trim().toLowerCase()}`;
@@ -32,10 +39,17 @@ const hasTable = async (client, tableName) => {
 export const mergeVentaWithFacturacion = (venta = {}, facturacion = {}) => {
   const emisor = facturacion?.emisor || {};
   const ticket = facturacion?.ticket || {};
+  const fiscalSource = facturacion?.fiscal || {};
+  const cai = normalizeFiscalText(fiscalSource?.cai ?? venta?.cai);
+  const numeroFacturaFiscal = normalizeFiscalText(
+    fiscalSource?.numero_factura_fiscal ?? venta?.numero_factura_fiscal
+  );
+  const hasFiscalData = Boolean(cai || numeroFacturaFiscal || Number(fiscalSource?.id_rango_cai ?? venta?.id_rango_cai ?? 0) > 0);
+  const fiscalEnabled = Boolean(fiscalSource?.habilitado) && hasFiscalData;
   const ticketFlags = {
-    mostrar_datos_fiscales: ticket?.mostrar_datos_fiscales !== false,
-    mostrar_cai_ticket: ticket?.mostrar_cai_ticket !== false,
-    mostrar_numero_fiscal_ticket: ticket?.mostrar_numero_fiscal_ticket !== false,
+    mostrar_datos_fiscales: fiscalEnabled && ticket?.mostrar_datos_fiscales !== false,
+    mostrar_cai_ticket: fiscalEnabled && ticket?.mostrar_cai_ticket !== false,
+    mostrar_numero_fiscal_ticket: fiscalEnabled && ticket?.mostrar_numero_fiscal_ticket !== false,
     mostrar_codigo_interno_ticket: ticket?.mostrar_codigo_interno_ticket !== false,
     aplicar_impuestos: Boolean(ticket?.aplicar_impuestos),
     mostrar_impuestos_ticket: Boolean(ticket?.mostrar_impuestos_ticket),
@@ -81,9 +95,13 @@ export const mergeVentaWithFacturacion = (venta = {}, facturacion = {}) => {
         texto_pie_ticket: ticket?.texto_pie_ticket || 'Gracias por su compra'
       },
       fiscal: {
-        modo_fiscal: 'NO_INTEGRADO',
-        cai: '0',
-        numero_factura_fiscal: '0'
+        habilitado: fiscalEnabled,
+        modo_fiscal: fiscalEnabled
+          ? String(fiscalSource?.modo_fiscal || venta?.modo_fiscal || 'CAI_PREPARADO').trim().toUpperCase()
+          : INTERNAL_FISCAL_MODE,
+        cai,
+        numero_factura_fiscal: numeroFacturaFiscal,
+        id_rango_cai: fiscalEnabled ? Number(fiscalSource?.id_rango_cai ?? venta?.id_rango_cai ?? 0) || null : null
       }
     },
     nombre_emisor: emisor?.nombre_emisor || "JONNY'S",
@@ -102,10 +120,12 @@ export const mergeVentaWithFacturacion = (venta = {}, facturacion = {}) => {
     ...ticketFlags,
     texto_encabezado_ticket: ticket?.texto_encabezado_ticket || null,
     texto_pie_ticket: ticket?.texto_pie_ticket || 'Gracias por su compra',
-    modo_fiscal: 'NO_INTEGRADO',
-    cai: '0',
-    numero_factura_fiscal: '0',
-    id_rango_cai: null
+    modo_fiscal: fiscalEnabled
+      ? String(fiscalSource?.modo_fiscal || venta?.modo_fiscal || 'CAI_PREPARADO').trim().toUpperCase()
+      : INTERNAL_FISCAL_MODE,
+    cai,
+    numero_factura_fiscal: numeroFacturaFiscal,
+    id_rango_cai: fiscalEnabled ? Number(fiscalSource?.id_rango_cai ?? venta?.id_rango_cai ?? 0) || null : null
   };
 };
 
