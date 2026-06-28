@@ -4,6 +4,7 @@ import jwt from 'jsonwebtoken';
 import crypto from 'crypto';
 import { authRequired } from '../middleware/auth.js';
 import { requireActiveSession } from '../middleware/requireActiveSession.js';
+import { requireSessionTouchMiddleware } from '../middleware/touchSession.js';
 import {
   internalLoginIpLimiter,
   internalLoginAccountIpLimiter
@@ -454,7 +455,7 @@ router.post('/logout', authRequired, async (req, res) => {
   return res.json({ message: 'Logout exitoso' });
 });
 
-router.get('/me', authRequired, requireActiveSession, async (req, res) => {
+router.get('/me', authRequired, requireActiveSession, requireSessionTouchMiddleware, async (req, res) => {
   const csrfToken = issueCsrf(req, res, { reuseIfPresent: true });
   const usuario = { ...(req.user || {}) };
   const idUsuario = Number.parseInt(String(usuario?.id_usuario ?? ''), 10);
