@@ -73,6 +73,7 @@ export const getActiveMenuByBranchController = async (req, res) => {
 // GET /public-menu/catalogo?id_sucursal=...&tipo_pedido=...
 export const getPublicCatalogController = async (req, res) => {
   try {
+    res.setHeader('Cache-Control', 'no-store');
     const { idSucursal, tipoPedido } = req.publicMenu;
     const data = await getPublicCatalogService({
       idSucursal,

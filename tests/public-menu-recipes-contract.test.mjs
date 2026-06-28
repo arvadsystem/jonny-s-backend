@@ -64,3 +64,19 @@ test('servicio publico conserva los campos minimos requeridos por el Landing', a
     assert.match(source, new RegExp(`\\b${field}\\b`));
   }
 });
+
+test('catalogo publico reutiliza y libera un unico cliente del pool por resolucion', async () => {
+  const source = await readSource('routers/public_menu/publicMenuService.js');
+  const catalogBuilder = source.slice(
+    source.indexOf('const buildPublicCatalog'),
+    source.indexOf('export const getPublicCatalogService')
+  );
+
+  assert.match(catalogBuilder, /const client = await pool\.connect\(\)/);
+  assert.match(catalogBuilder, /fetchActiveMenuByBranchQuery\(idSucursal, client\)/);
+  assert.match(catalogBuilder, /fetchCatalogRowsByMenuQuery\([\s\S]*?client\s*\)/);
+  assert.match(catalogBuilder, /buildCatalogSauceConfigByDetail\(rows, idSucursal, client\)/);
+  assert.match(catalogBuilder, /buildCatalogExtrasByRecipe\(rows, Number\(idSucursal\), client\)/);
+  assert.match(catalogBuilder, /fetchRecipeAvailabilityQuery\([\s\S]*?client\s*\)/);
+  assert.match(catalogBuilder, /finally\s*{\s*client\.release\(\);\s*}/);
+});
