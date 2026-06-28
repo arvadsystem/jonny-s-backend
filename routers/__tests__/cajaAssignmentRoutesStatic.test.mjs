@@ -33,6 +33,8 @@ describe('caja assignment route rules', () => {
     assert.doesNotMatch(endpointSource, /cajas_usuarios_autorizados/, 'auto-auxiliar no debe crear ni modificar autorizaciones');
     assert.match(endpointSource, /ON CONFLICT \(id_sesion_caja,\s*id_usuario\) WHERE activo IS TRUE[\s\S]*DO NOTHING/, 'debe ser idempotente por sesion+usuario');
     assert.match(endpointSource, /getCatalogId\(client,\s*'PARTICIPATION_ROLES',\s*'AUXILIAR'\)/, 'debe insertar siempre rol AUXILIAR');
+    assert.match(endpointSource, /fecha_inicio = \(now\(\) AT TIME ZONE 'America\/Tegucigalpa'\)/, 'reactivacion debe usar hora local en fecha_inicio');
+    assert.match(endpointSource, /VALUES \(\$1,\s*\$2,\s*\$3,\s*\(now\(\) AT TIME ZONE 'America\/Tegucigalpa'\),\s*true,\s*\$4,\s*NOW\(\),\s*NOW\(\)\)/, 'insert debe usar hora local en fecha_inicio');
     assert.doesNotMatch(endpointSource, /'RESPONSABLE'/, 'auto-auxiliar no debe convertir al usuario en responsable');
   });
 });

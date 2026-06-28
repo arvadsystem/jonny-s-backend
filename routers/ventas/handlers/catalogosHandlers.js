@@ -685,8 +685,8 @@ const fetchCajaBootstrapAvailableSessions = async ({ idUsuario, isSuperAdmin, id
   return (result.rows || []).map(mapCajaAvailableSession);
 };
 
-const fetchCajaBootstrapOperationalState = async ({ idUsuario, idSucursal = null, isSuperAdmin = false }) => {
-  const result = await pool.query(
+export const fetchCajaBootstrapOperationalState = async ({ idUsuario, idSucursal = null, db = pool }) => {
+  const result = await db.query(
     `
       WITH active_session AS (
         SELECT
@@ -808,7 +808,7 @@ const fetchCajaBootstrapOperationalState = async ({ idUsuario, idSucursal = null
         ON caja.id_caja = COALESCE(sesion.id_caja, asignacion.id_caja)
       LIMIT 1
     `,
-    [idUsuario, idSucursal, Boolean(isSuperAdmin)]
+    [idUsuario, idSucursal]
   );
 
   const row = result.rows?.[0] || null;
@@ -921,8 +921,7 @@ export const getCajaBootstrapHandler = async (req, res) => {
     const operationalStartedAt = performance.now();
     let operationalState = await fetchCajaBootstrapOperationalState({
       idUsuario: scope.idUsuario,
-      idSucursal,
-      isSuperAdmin: scope.isSuperAdmin
+      idSucursal
     });
     sqlDurationMs += performance.now() - operationalStartedAt;
     idSucursal = idSucursal || operationalState?.id_sucursal || null;
@@ -954,8 +953,7 @@ export const getCajaBootstrapHandler = async (req, res) => {
       const scopedOperationalStartedAt = performance.now();
       operationalState = await fetchCajaBootstrapOperationalState({
         idUsuario: scope.idUsuario,
-        idSucursal,
-        isSuperAdmin: scope.isSuperAdmin
+        idSucursal
       });
       sqlDurationMs += performance.now() - scopedOperationalStartedAt;
     }

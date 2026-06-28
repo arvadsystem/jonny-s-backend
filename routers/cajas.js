@@ -6231,7 +6231,7 @@ router.post('/ventas/cajas/sesiones/:id/auto-auxiliar', checkPermission(['VENTAS
           `
             UPDATE public.cajas_sesiones_participantes
             SET id_rol_participacion_caja = $1,
-                fecha_inicio = NOW(),
+                fecha_inicio = (now() AT TIME ZONE 'America/Tegucigalpa'),
                 fecha_fin = NULL,
                 activo = true,
                 observacion = $2,
@@ -6246,7 +6246,7 @@ router.post('/ventas/cajas/sesiones/:id/auto-auxiliar', checkPermission(['VENTAS
             INSERT INTO public.cajas_sesiones_participantes (
               id_sesion_caja, id_usuario, id_rol_participacion_caja, fecha_inicio, activo, observacion, fecha_creacion, fecha_actualizacion
             )
-            VALUES ($1, $2, $3, NOW(), true, $4, NOW(), NOW())
+            VALUES ($1, $2, $3, (now() AT TIME ZONE 'America/Tegucigalpa'), true, $4, NOW(), NOW())
             ON CONFLICT (id_sesion_caja, id_usuario) WHERE activo IS TRUE
             DO NOTHING
           `,

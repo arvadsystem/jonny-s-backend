@@ -28,7 +28,7 @@ assert.match(handlersSource, /sesion_caja:\s*operationalState\.sesion_caja/, 'bo
 assert.match(handlersSource, /caja_activa:\s*operationalState\.caja_activa/, 'bootstrap debe incluir la caja activa');
 assert.match(handlersSource, /if \(!operationalState\?\.sesion_caja\)/, 'sin sesion no debe cargar catalogos');
 const operationalStateSource = handlersSource.slice(
-  handlersSource.indexOf('const fetchCajaBootstrapOperationalState'),
+  handlersSource.indexOf('fetchCajaBootstrapOperationalState'),
   handlersSource.indexOf('export const getCajaBootstrapHandler')
 );
 assert.doesNotMatch(
