@@ -36,7 +36,7 @@ const parseUtcTimestampForDisplay = (value) => {
   return value;
 };
 
-const formatDateTime = (value = new Date()) => {
+export const formatCajaCierreDateTime = (value = new Date()) => {
   const date = value ? new Date(parseUtcTimestampForDisplay(value)) : new Date();
   if (Number.isNaN(date.getTime())) return 'No disponible';
   return date.toLocaleString('es-HN', {
@@ -117,7 +117,7 @@ const buildManualMovementsTableBody = (rows = []) => {
 
   rows.forEach((row) => {
     body.push([
-      row.fecha_hora ? cleanText(formatDateTime(row.fecha_hora), 'Sin fecha') : 'Sin fecha',
+      row.fecha_hora ? cleanText(formatCajaCierreDateTime(row.fecha_hora), 'Sin fecha') : 'Sin fecha',
       { text: formatMoney(row.monto), alignment: 'right' },
       cleanText(row.observacion, 'N/A'),
       cleanText(row.referencia, 'N/A'),
@@ -190,7 +190,7 @@ export const buildCajaCierrePdfDefinition = (payload = {}) => {
         table: {
           widths: ['35%', '65%'],
           body: labelValueRows([
-            ['Generado', formatDateTime(new Date())],
+            ['Generado', formatCajaCierreDateTime(payload.generatedAt || new Date())],
             ['Cierre', cierreCode(payload.idCierreCaja)],
             ['ID sesion', payload.idSesionCaja]
           ])
@@ -207,7 +207,7 @@ export const buildCajaCierrePdfDefinition = (payload = {}) => {
             ['Sucursal', payload.session?.nombre_sucursal || payload.session?.id_sucursal],
             ['Responsable', responsableLabel],
             ['Usuario de cierre', cierreLabel],
-            ['Fecha/hora de cierre', formatDateTime(payload.fechaCierre)]
+            ['Fecha/hora de cierre', formatCajaCierreDateTime(payload.fechaCierre)]
           ])
         },
         layout: 'lightHorizontalLines'

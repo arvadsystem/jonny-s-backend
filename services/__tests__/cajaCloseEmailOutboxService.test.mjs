@@ -13,7 +13,10 @@ import {
   processClaimedCajaCloseEmailNotification,
   resolveCajaCloseOutboxRecipient
 } from '../cajaCloseEmailOutboxService.js';
-import { buildCajaCierrePdfDefinition } from '../../utils/cajaCierreReportePdf.js';
+import {
+  buildCajaCierrePdfDefinition,
+  formatCajaCierreDateTime
+} from '../../utils/cajaCierreReportePdf.js';
 
 const routerSource = readFileSync(resolve('routers/cajas.js'), 'utf8');
 const serverSource = readFileSync(resolve('server.js'), 'utf8');
@@ -37,6 +40,68 @@ const withCajaCloseEmailTo = async (value, fn) => {
     }
   }
 };
+
+const buildSampleClosePayload = () => ({
+  generatedAt: '2026-06-28 12:00:00',
+  idCierreCaja: '2',
+  idSesionCaja: '1',
+  session: {
+    id_caja: 10,
+    id_sucursal: 1,
+    codigo_caja: 'CJ-1',
+    nombre_caja: 'Caja 1',
+    nombre_sucursal: 'Sucursal 1'
+  },
+  actors: {
+    responsable_nombre: 'Cajero Prueba',
+    responsable_usuario: 'cajero.prueba',
+    cierre_nombre: 'Cajero Prueba',
+    cierre_usuario: 'cajero.prueba'
+  },
+  fechaCierre: '2026-06-28 10:00:00',
+  montoApertura: 100,
+  ventasEfectivoNetas: 900,
+  ventasNoEfectivoNetas: 300,
+  ingresosManuales: 1200,
+  egresosManuales: 1200,
+  montoTeorico: 1300,
+  montoDeclaradoCierre: 1300,
+  diferencia: 0,
+  idResolucionFinal: 3,
+  resolutionCode: 'CAJA_CUADRA',
+  requiresAudit: false,
+  payrollSyncLabel: 'No requerido',
+  payrollSync: {
+    synced: true,
+    reason: 'NOT_REQUIRED'
+  },
+  arqueos: [{
+    metodo_pago_codigo: 'EFECTIVO',
+    monto_teorico: 1000,
+    monto_declarado: 1000,
+    diferencia: 0,
+    requiere_revision: false,
+    observacion: 'Cuadrado'
+  }],
+  movimientosManuales: {
+    ingresos: [{
+      fecha_hora: '2026-06-28 09:00:00',
+      monto: 500,
+      observacion: 'Ingreso manual caja',
+      referencia: 'REF-IN-1',
+      usuario_ejecutor: 'Cajero Prueba'
+    }],
+    egresos: [{
+      fecha_hora: '2026-06-28 09:05:00',
+      monto: 300,
+      observacion: 'Egreso manual caja',
+      referencia: 'N/A',
+      usuario_ejecutor: 'Cajero Prueba'
+    }]
+  }
+});
+
+const stripHtml = (html) => String(html || '').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
 
 describe('caja close email durable outbox', () => {
   it('crea cierre y outbox en la misma transaccion sin depender de cola en memoria', () => {
@@ -248,62 +313,227 @@ describe('caja close email durable outbox', () => {
     assert.equal(normalizeManualMovement({ referencia: '   ' }).referencia, 'N/A');
   });
 
-  it('HTML y PDF contienen actores, arqueos y tablas separadas de movimientos manuales', () => {
-    const payload = {
-      idCierreCaja: '2',
-      idSesionCaja: '1',
-      session: { nombre_caja: 'Caja 1', nombre_sucursal: 'Sucursal 1' },
-      actors: {
-        responsable_nombre: 'Cajero Prueba',
-        cierre_nombre: 'Cajero Prueba'
-      },
-      montoTeorico: 1200,
-      montoDeclaradoCierre: 1200,
-      diferencia: 0,
-      requiresAudit: false,
-      arqueos: [{
-        metodo_pago_codigo: 'EFECTIVO',
-        monto_teorico: 1200,
-        monto_declarado: 1200,
-        diferencia: 0,
-        requiere_revision: false,
-        observacion: 'Cuadrado'
-      }],
-      movimientosManuales: {
-        ingresos: [{
-          fecha_hora: '2026-06-28 09:00:00',
-          monto: 500,
-          observacion: 'Ingreso manual caja',
-          referencia: 'REF-IN-1',
-          usuario_ejecutor: 'Cajero Prueba'
-        }],
-        egresos: [{
-          fecha_hora: '2026-06-28 09:05:00',
-          monto: 300,
-          observacion: 'Egreso manual caja',
-          referencia: 'N/A',
-          usuario_ejecutor: 'Cajero Prueba'
-        }]
+  it('HTML y PDF contienen la misma informacion funcional con valores concretos', () => {
+    const payload = buildSampleClosePayload();
+    const htmlText = stripHtml(buildCajaCloseEmailHtml({ payload, pdfAttached: false }));
+    const pdfDefinitionText = JSON.stringify(buildCajaCierrePdfDefinition(payload));
+    const expectedGeneratedAt = formatCajaCierreDateTime('2026-06-28 12:00:00');
+    const expectedCloseAt = formatCajaCierreDateTime('2026-06-28 10:00:00');
+    const commonValues = [
+      'Cajero Prueba',
+      'Caja 1',
+      'Sucursal 1',
+      expectedGeneratedAt,
+      expectedCloseAt,
+      '1',
+      'CJ-1',
+      'L 100.00',
+      'L 900.00',
+      'L 300.00',
+      'L 1,200.00',
+      'L 1,300.00',
+      'CAJA_CUADRA',
+      'No requerido',
+      'No disponible',
+      'CIERRE REGISTRADO',
+      'EFECTIVO',
+      'Cuadrado',
+      'Ingreso manual caja',
+      'Egreso manual caja',
+      'REF-IN-1',
+      'N/A'
+    ];
+    const htmlLabels = [
+      'Fecha de generacion',
+      'ID sesion',
+      'Codigo de caja',
+      'Fecha/hora de cierre',
+      'Monto de apertura',
+      'Ventas en efectivo',
+      'Ventas no efectivas',
+      'Total de ingresos manuales',
+      'Total de egresos manuales',
+      'Resolucion',
+      'Estado de nomina',
+      'ID movimiento de planilla',
+      'Responsable',
+      'Usuario de cierre',
+      'Total teorico',
+      'Total declarado',
+      'Diferencia',
+      'Estado de revision',
+      'Arqueos por metodo',
+      'Ingresos manuales',
+      'Egresos manuales'
+    ];
+    const pdfLabels = [
+      'Generado',
+      'ID sesion',
+      'Fecha/hora de cierre',
+      'Monto apertura',
+      'Ventas efectivo',
+      'Ventas no efectivo',
+      'Ingresos manuales',
+      'Egresos manuales',
+      'Resolucion',
+      'Estado de nomina',
+      'ID movimiento de planilla',
+      'Responsable',
+      'Usuario de cierre',
+      'Total teorico',
+      'Total declarado',
+      'Diferencia',
+      'Arqueos por metodo'
+    ];
+
+    for (const label of htmlLabels) assert.match(htmlText, new RegExp(label));
+    for (const label of pdfLabels) assert.match(pdfDefinitionText, new RegExp(label));
+    for (const value of commonValues) {
+      assert.match(htmlText, new RegExp(value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+      assert.match(pdfDefinitionText, new RegExp(value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+    }
+
+    assert.doesNotMatch(htmlText, /Responsable\s+37\b/);
+    assert.doesNotMatch(htmlText, /Usuario de cierre\s+37\b/);
+    assert.doesNotMatch(pdfDefinitionText, /"37"/);
+    assert.doesNotMatch(pdfDefinitionText, /"Tipo"/);
+  });
+
+  it('interpreta timestamps sin zona como UTC para HTML y PDF', () => {
+    const expected = '28/06/2026, 04:00 a. m.';
+    assert.equal(formatCajaCierreDateTime('2026-06-28 10:00:00'), expected);
+
+    const payload = buildSampleClosePayload();
+    const htmlText = stripHtml(buildCajaCloseEmailHtml({ payload, pdfAttached: false }));
+    const pdfDefinitionText = JSON.stringify(buildCajaCierrePdfDefinition(payload));
+    assert.match(htmlText, /28\/06\/2026, 04:00 a\. m\./);
+    assert.match(pdfDefinitionText, /28\/06\/2026, 04:00 a\. m\./);
+  });
+
+  it('si falla buildPdf envia HTML completo y marca outbox ENVIADO', async () => {
+    const queries = [];
+    const fakeQueryRunner = {
+      async query(sql, params) {
+        queries.push({ sql, params });
+        if (/FROM public\.cajas_cierres cc/.test(sql)) {
+          return {
+            rows: [{
+              id_cierre_caja: 2,
+              id_sesion_caja: 1,
+              id_caja: 10,
+              id_sucursal: 1,
+              id_usuario_responsable: 37,
+              sesion_id_usuario_responsable: 37,
+              id_usuario_cierre: 37,
+              fecha_cierre: '2026-06-28 10:00:00',
+              codigo_caja: 'CJ-1',
+              nombre_caja: 'Caja 1',
+              nombre_sucursal: 'Sucursal 1',
+              monto_teorico_cierre: '1300',
+              monto_declarado_cierre: '1300',
+              diferencia: '0',
+              monto_apertura: '100',
+              monto_ventas_efectivo: '900',
+              monto_ventas_no_efectivo: '300',
+              monto_ingresos_manuales: '1200',
+              monto_egresos_manuales: '1200',
+              resolucion_codigo: 'CAJA_CUADRA'
+            }]
+          };
+        }
+        if (/FROM public\.usuarios u/.test(sql)) {
+          return {
+            rows: [{
+              id_usuario: 37,
+              nombre_usuario: 'cajero.prueba',
+              nombre_completo: 'Cajero Prueba'
+            }]
+          };
+        }
+        if (/FROM public\.cajas_movimientos cm/.test(sql)) {
+          return {
+            rows: [
+              {
+                fecha_movimiento: '2026-06-28 09:00:00',
+                monto: '500',
+                observacion: 'Ingreso manual caja',
+                referencia: 'REF-IN-1',
+                tipo_codigo: 'INGRESO_MANUAL',
+                tipo_nombre: 'Ingreso manual',
+                signo: 1,
+                usuario_ejecutor_nombre: 'Cajero Prueba',
+                usuario_ejecutor_usuario: 'cajero.prueba'
+              },
+              {
+                fecha_movimiento: '2026-06-28 09:05:00',
+                monto: '300',
+                observacion: 'Egreso manual caja',
+                referencia: null,
+                tipo_codigo: 'EGRESO_MANUAL',
+                tipo_nombre: 'Egreso manual',
+                signo: -1,
+                usuario_ejecutor_nombre: 'Cajero Prueba',
+                usuario_ejecutor_usuario: 'cajero.prueba'
+              }
+            ]
+          };
+        }
+        if (/FROM public\.cajas_cierres_arqueos_metodos/.test(sql)) {
+          return {
+            rows: [{
+              metodo_pago_codigo: 'EFECTIVO',
+              monto_teorico: '1000',
+              monto_declarado: '1000',
+              diferencia: '0',
+              requiere_revision: false,
+              observacion: 'Cuadrado'
+            }]
+          };
+        }
+        if (/UPDATE public\.cajas_cierres_notificaciones_email/.test(sql)) {
+          return { rows: [{ estado: 'ENVIADO', message_id: params[1] }] };
+        }
+        return { rows: [] };
       }
     };
+    const sent = [];
+    const result = await processClaimedCajaCloseEmailNotification(
+      { id_notificacion: 1, id_cierre_caja: 2, email_destino: 'fallback@example.com', intentos: 0 },
+      {
+        queryRunner: fakeQueryRunner,
+        async sendEmail(to, subject, html, meta) {
+          sent.push({ to, subject, html: stripHtml(html), meta });
+          return { messageId: 'smtp-message-id' };
+        },
+        async buildPdf() {
+          throw new Error('pdf unavailable');
+        },
+        buildPdfFilename() {
+          return 'cierre.pdf';
+        }
+      }
+    );
 
-    const html = buildCajaCloseEmailHtml({ payload, pdfAttached: false });
-    assert.match(html, /Responsable/);
-    assert.match(html, /Cajero Prueba/);
-    assert.match(html, /Arqueos por metodo/);
-    assert.match(html, /Ingresos manuales/);
-    assert.match(html, /Egresos manuales/);
-    assert.match(html, /Ingreso manual caja/);
-    assert.match(html, /Egreso manual caja/);
-
-    const pdfDefinitionText = JSON.stringify(buildCajaCierrePdfDefinition(payload));
-    assert.match(pdfDefinitionText, /Responsable/);
-    assert.match(pdfDefinitionText, /Cajero Prueba/);
-    assert.match(pdfDefinitionText, /Arqueos por metodo/);
-    assert.match(pdfDefinitionText, /Ingresos manuales/);
-    assert.match(pdfDefinitionText, /Egresos manuales/);
-    assert.doesNotMatch(pdfDefinitionText, /"Tipo"/);
-    assert.doesNotMatch(pdfDefinitionText, /"37"/);
+    assert.equal(result.estado, 'ENVIADO');
+    assert.equal(sent[0].meta.attachments.length, 0);
+    for (const value of [
+      'Cajero Prueba',
+      'Monto de apertura',
+      'L 100.00',
+      'Ventas en efectivo',
+      'L 900.00',
+      'Arqueos por metodo',
+      'EFECTIVO',
+      'Ingresos manuales',
+      'Ingreso manual caja',
+      'Egresos manuales',
+      'Egreso manual caja',
+      'N/A'
+    ]) {
+      assert.match(sent[0].html, new RegExp(value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+    }
+    assert.doesNotMatch(sent[0].html, /Responsable\s+37\b/);
+    assert.doesNotMatch(sent[0].html, /Usuario de cierre\s+37\b/);
   });
 
   it('envio exitoso guarda message_id y usa log_correos_enviados por enviarCorreo', async () => {

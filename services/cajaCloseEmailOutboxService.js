@@ -1,6 +1,10 @@
 import pool from '../config/db-connection.js';
 import { enviarCorreo } from '../utils/emailService.js';
-import { buildCajaCierrePdfBuffer, buildCajaCierrePdfFilename } from '../utils/cajaCierreReportePdf.js';
+import {
+  buildCajaCierrePdfBuffer,
+  buildCajaCierrePdfFilename,
+  formatCajaCierreDateTime
+} from '../utils/cajaCierreReportePdf.js';
 import { resolveCajaCloseEmailRecipient } from './cajaCloseNotificationService.js';
 
 export const CAJA_CLOSE_EMAIL_FALLBACK_TO = 'gersonmz@jonnyshn.com';
@@ -55,23 +59,25 @@ const escapeHtml = (value) =>
     "'": '&#39;'
   }[char]));
 
-const money = (value) => Number(value || 0).toFixed(2);
+const money = (value) =>
+  `L ${Number(value || 0).toLocaleString('en-US', {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2
+  })}`;
 
 const resolveActorName = ({ nombre, usuario } = {}) =>
   cleanOptionalText(nombre) || cleanOptionalText(usuario) || 'No disponible';
 
-const formatHtmlDateTime = (value) => {
-  if (!value) return 'N/A';
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return cleanText(value);
-  return date.toLocaleString('es-HN', {
-    timeZone: 'America/Tegucigalpa',
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit',
-    hour: '2-digit',
-    minute: '2-digit'
-  });
+const formatHtmlDateTime = (value) => cleanText(formatCajaCierreDateTime(value), 'N/A');
+
+const resolvePayrollSyncLabel = (payrollSync = {}) => {
+  const reason = String(payrollSync?.reason || '').trim().toUpperCase();
+  if (!reason || reason === 'NOT_REQUIRED') return 'No requerido';
+  if (reason === 'UPDATED') return 'Actualizado';
+  if (reason === 'CREATED') return 'Creado';
+  if (reason === 'SKIPPED') return 'Omitido';
+  if (reason === 'PAYROLL_DEDUCTION_NOT_CREATED') return 'No creado';
+  return cleanText(reason.replace(/_/g, ' ').toLowerCase(), 'No disponible');
 };
 
 export const normalizeManualMovement = (row = {}) => ({
@@ -233,34 +239,56 @@ export const buildCajaCloseEmailHtml = ({ payload = {}, pdfAttached = false } = 
   const actors = payload.actors || {};
   const manualColumns = [
     { label: 'Fecha/hora', render: (row) => formatHtmlDateTime(row.fecha_hora) },
-    { label: 'Monto', align: 'right', render: (row) => `L ${money(row.monto)}` },
+    { label: 'Monto', align: 'right', render: (row) => money(row.monto) },
     { label: 'Observacion', render: (row) => row.observacion || 'N/A' },
     { label: 'Referencia', render: (row) => row.referencia || 'N/A' },
     { label: 'Usuario ejecutor', render: (row) => row.usuario_ejecutor || 'No disponible' }
   ];
   const arqueoColumns = [
     { label: 'Metodo', render: (row) => row.metodo_pago_codigo || 'N/A' },
-    { label: 'Teorico', align: 'right', render: (row) => `L ${money(row.monto_teorico)}` },
-    { label: 'Declarado', align: 'right', render: (row) => `L ${money(row.monto_declarado)}` },
-    { label: 'Diferencia', align: 'right', render: (row) => `L ${money(row.diferencia)}` },
+    { label: 'Teorico', align: 'right', render: (row) => money(row.monto_teorico) },
+    { label: 'Declarado', align: 'right', render: (row) => money(row.monto_declarado) },
+    { label: 'Diferencia', align: 'right', render: (row) => money(row.diferencia) },
     { label: 'Revision', render: (row) => (row.requiere_revision ? 'Si' : 'No') },
     { label: 'Observacion', render: (row) => row.observacion || 'N/A' }
   ];
+  const generatedAt = payload.generatedAt || new Date();
+  const resolutionLabel = payload.resolutionCode || payload.idResolucionFinal || 'No disponible';
+  const payrollSync = payload.payrollSync || {};
+  const payrollLabel = payload.payrollSyncLabel || resolvePayrollSyncLabel(payrollSync);
+  const payrollMovementId = payrollSync.id_movimiento_planilla || payrollSync.idMovimientoPlanilla || 'No disponible';
+  const reviewStatus = payload.requiresAudit ? 'REQUIERE AUDITORIA' : 'CIERRE REGISTRADO';
+  const reviewDetail = payload.requiresAudit
+    ? 'Este cierre requiere auditoria preventiva por recuento, diferencia o inconsistencia detectada durante el proceso de cierre.'
+    : 'Este cierre fue registrado sin inconsistencias pendientes de auditoria.';
   return `<!doctype html>
 <html>
 <body style="font-family:Arial,sans-serif;color:#111827;">
   <h2 style="margin:0 0 12px;">Cierre de caja registrado</h2>
   <p>Se registro un cierre de caja en JONNY'S SmartOrder.</p>
   <table cellpadding="6" cellspacing="0" style="border-collapse:collapse;border:1px solid #eaecf0;">
+    <tr><td><strong>Fecha de generacion</strong></td><td>${escapeHtml(formatHtmlDateTime(generatedAt))}</td></tr>
     <tr><td><strong>Cierre</strong></td><td>${payload.idCierreCaja || 'N/A'}</td></tr>
+    <tr><td><strong>ID sesion</strong></td><td>${payload.idSesionCaja || 'N/A'}</td></tr>
+    <tr><td><strong>Codigo de caja</strong></td><td>${escapeHtml(session.codigo_caja || session.id_caja || 'N/A')}</td></tr>
     <tr><td><strong>Caja</strong></td><td>${session.nombre_caja || session.codigo_caja || 'N/A'}</td></tr>
     <tr><td><strong>Sucursal</strong></td><td>${session.nombre_sucursal || session.id_sucursal || 'N/A'}</td></tr>
     <tr><td><strong>Responsable</strong></td><td>${escapeHtml(resolveActorName({ nombre: actors.responsable_nombre, usuario: actors.responsable_usuario }))}</td></tr>
     <tr><td><strong>Usuario de cierre</strong></td><td>${escapeHtml(resolveActorName({ nombre: actors.cierre_nombre, usuario: actors.cierre_usuario }))}</td></tr>
-    <tr><td><strong>Total teorico</strong></td><td>L ${money(payload.montoTeorico)}</td></tr>
-    <tr><td><strong>Total declarado</strong></td><td>L ${money(payload.montoDeclaradoCierre)}</td></tr>
-    <tr><td><strong>Diferencia</strong></td><td>L ${money(payload.diferencia)}</td></tr>
-    <tr><td><strong>Revision</strong></td><td>${payload.requiresAudit ? 'Requiere revision' : 'Sin inconsistencias pendientes'}</td></tr>
+    <tr><td><strong>Fecha/hora de cierre</strong></td><td>${escapeHtml(formatHtmlDateTime(payload.fechaCierre))}</td></tr>
+    <tr><td><strong>Monto de apertura</strong></td><td>${money(payload.montoApertura)}</td></tr>
+    <tr><td><strong>Ventas en efectivo</strong></td><td>${money(payload.ventasEfectivoNetas)}</td></tr>
+    <tr><td><strong>Ventas no efectivas</strong></td><td>${money(payload.ventasNoEfectivoNetas)}</td></tr>
+    <tr><td><strong>Total de ingresos manuales</strong></td><td>${money(payload.ingresosManuales)}</td></tr>
+    <tr><td><strong>Total de egresos manuales</strong></td><td>${money(payload.egresosManuales)}</td></tr>
+    <tr><td><strong>Total teorico</strong></td><td>${money(payload.montoTeorico)}</td></tr>
+    <tr><td><strong>Total declarado</strong></td><td>${money(payload.montoDeclaradoCierre)}</td></tr>
+    <tr><td><strong>Diferencia</strong></td><td>${money(payload.diferencia)}</td></tr>
+    <tr><td><strong>Resolucion</strong></td><td>${escapeHtml(resolutionLabel)}</td></tr>
+    <tr><td><strong>Estado de nomina</strong></td><td>${escapeHtml(payrollLabel)}</td></tr>
+    <tr><td><strong>ID movimiento de planilla</strong></td><td>${escapeHtml(payrollMovementId)}</td></tr>
+    <tr><td><strong>Estado de revision</strong></td><td>${reviewStatus}</td></tr>
+    <tr><td><strong>Detalle de revision</strong></td><td>${escapeHtml(reviewDetail)}</td></tr>
   </table>
   ${buildHtmlTable({
     title: 'Arqueos por metodo',
@@ -422,6 +450,7 @@ export const loadCajaCloseEmailPayload = async (queryRunner, idCierreCaja) => {
   });
   const movimientosManuales = await fetchCajaCloseManualMovements(queryRunner, row.id_sesion_caja);
   const arqueos = await fetchCajaCloseArqueos(queryRunner, row.id_cierre_caja);
+  const payrollSync = { synced: true, reason: 'NOT_REQUIRED' };
   return {
     idCierreCaja: String(row.id_cierre_caja),
     idSesionCaja: String(row.id_sesion_caja),
@@ -449,7 +478,8 @@ export const loadCajaCloseEmailPayload = async (queryRunner, idCierreCaja) => {
     ventasNoEfectivoNetas: Number(row.monto_ventas_no_efectivo || 0),
     ingresosManuales: Number(row.monto_ingresos_manuales || 0),
     egresosManuales: Number(row.monto_egresos_manuales || 0),
-    payrollSync: { synced: true, reason: 'NOT_REQUIRED' },
+    payrollSync,
+    payrollSyncLabel: resolvePayrollSyncLabel(payrollSync),
     arqueos,
     movimientosManuales
   };
