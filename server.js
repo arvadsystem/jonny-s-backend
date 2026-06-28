@@ -2,12 +2,16 @@ import 'dotenv/config';
 import app from './app.js';
 import { checkDatabaseReady, closePool } from './config/db-connection.js';
 import { getRuntimeConfig } from './config/runtime-config.js';
-import { drainCajaCloseNotificationQueue } from './services/cajaCloseNotificationQueue.js';
+import {
+  startCajaCloseEmailOutboxWorker,
+  stopCajaCloseEmailOutboxWorker
+} from './jobs/cajaCloseEmailOutboxWorker.js';
 
 const config = getRuntimeConfig();
 const PORT = config.port;
 
 await checkDatabaseReady();
+await startCajaCloseEmailOutboxWorker();
 
 const server = app.listen(PORT, () => {
   console.log(`Servidor activo en el puerto ${PORT}`);
@@ -32,7 +36,7 @@ const shutdown = async (signal) => {
 
   console.warn(`[shutdown] Senal recibida: ${signal}. Cerrando servidor HTTP y pool PostgreSQL.`);
   const gracefulWork = closeHttpServer()
-    .then(() => drainCajaCloseNotificationQueue({ timeoutMs: 5000 }))
+    .then(() => stopCajaCloseEmailOutboxWorker({ timeoutMs: 5000 }))
     .then(() => closePool());
 
   const timeout = new Promise((_, reject) => {

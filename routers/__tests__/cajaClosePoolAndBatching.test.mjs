@@ -30,16 +30,17 @@ describe('caja close pool and batching guards', () => {
     assert.match(closeHandlerSource, /isBalancedClose/);
   });
 
-  it('libera el cliente antes de encolar correo, PDF o SMTP', () => {
+  it('persistencia de correo de cierre ocurre en outbox transaccional sin PDF ni SMTP en la ruta', () => {
     const transactionIndex = closeHandlerSource.indexOf('await withDbTransaction');
     const transactionEndIndex = closeHandlerSource.indexOf("}, { label: 'caja_close_session' })", transactionIndex);
-    const queueIndex = closeHandlerSource.indexOf('enqueueCajaCloseEmailNotification', transactionEndIndex);
 
     assert.ok(transactionIndex > 0);
     assert.ok(transactionEndIndex > transactionIndex);
-    assert.ok(queueIndex > transactionEndIndex);
+    assert.match(closeHandlerSource.slice(transactionIndex, transactionEndIndex), /createCajaCloseEmailNotification\(client,\s*\{/);
+    assert.doesNotMatch(closeHandlerSource, /enqueueCajaCloseEmailNotification/);
     assert.doesNotMatch(closeHandlerSource.slice(transactionIndex, transactionEndIndex), /sendCajaCierreEmail/);
     assert.doesNotMatch(closeHandlerSource.slice(transactionIndex, transactionEndIndex), /buildCajaCierrePdfBuffer/);
+    assert.doesNotMatch(closeHandlerSource.slice(transactionEndIndex), /sendCajaCierreEmail|buildCajaCierrePdfBuffer/);
   });
 
   it('usa withDbTransaction en cierre y validacion', () => {

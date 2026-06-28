@@ -1,6 +1,5 @@
 import express from 'express';
 import { enviarCorreo } from '../utils/emailService.js';
-import { buildCajaCierrePdfBuffer, buildCajaCierrePdfFilename } from '../utils/cajaCierreReportePdf.js';
 import pool from '../config/db-connection.js';
 import { getClientIp } from '../utils/security/clientInfo.js';
 import {
@@ -14,10 +13,14 @@ import {
   mapCajaFinancialLockError,
   parsePositiveBigIntId
 } from '../services/cajaFinancialLockService.js';
-import { enqueueCajaCloseNotification } from '../services/cajaCloseNotificationQueue.js';
-import { processCajaCloseNotification } from '../services/cajaCloseNotificationService.js';
 import { withDbTransaction } from '../services/dbTransactionService.js';
 import { loadCajaCloseFinancialSnapshot } from '../services/cajaCloseFinancialSnapshotService.js';
+import {
+  CAJA_CLOSE_EMAIL_FALLBACK_TO,
+  createCajaCloseEmailNotification,
+  fetchCajaCloseEmailNotificationByCloseId,
+  reactivateFailedCajaCloseEmailNotification
+} from '../services/cajaCloseEmailOutboxService.js';
 import {
   buildSegmentedArqueoComputation as buildSegmentedArqueoComputationFromSnapshot,
   fingerprintValuesEqual
@@ -37,7 +40,6 @@ const AUXILIARY_ALLOWED_ROLE_CODES = new Set([
 ]);
 const CAJA_ADMIN_EMAIL_TO = 'gersonmz@jonnyshn.com';
 const CAJA_APERTURA_EMAIL_TO = CAJA_ADMIN_EMAIL_TO;
-const MANUAL_MOVEMENT_EXCLUDED_CODES = new Set(['APERTURA', 'REVERSION', 'REVERSO']);
 const CAJA_CATALOG_LOCK_NAMESPACE = 8152029;
 
 const CATALOGS = Object.freeze({
@@ -2003,332 +2005,6 @@ const sendCajaAperturaEmail = async (idSesionCaja) => {
   );
 };
 
-const formatPayrollSyncLabel = (payrollSync) => {
-  if (!payrollSync) return 'No disponible';
-  const reason = String(payrollSync.reason || '').trim().toUpperCase();
-
-  if (reason === 'NOT_REQUIRED') return 'No requerida';
-  if (reason === 'UPDATED') return 'Deduccion sincronizada';
-  if (reason === 'RESPONSABLE_CAJA_NO_DETERMINADO') return 'No sincronizada: responsable no determinado';
-  if (reason === 'PLANILLA_DETAIL_NOT_FOUND') return 'No sincronizada: planilla no encontrada';
-  if (reason === 'PLANILLA_NOT_EDITABLE') return 'No sincronizada: planilla no editable';
-  if (reason === 'PAYROLL_DEDUCTION_NOT_CREATED') return 'No sincronizada: deduccion no creada';
-
-  return payrollSync.synced
-    ? `Sincronizada (${reason || 'OK'})`
-    : `No sincronizada (${reason || 'sin motivo'})`;
-};
-
-const fetchCajaCloseEmailActors = async (client, { idUsuarioResponsable, idUsuarioCierre }) => {
-  const ids = [
-    parsePositiveInt(idUsuarioResponsable),
-    parsePositiveInt(idUsuarioCierre)
-  ].filter(Boolean);
-  const uniqueIds = [...new Set(ids)];
-  if (uniqueIds.length === 0) return {};
-
-  const result = await client.query(
-    `
-      SELECT
-        u.id_usuario,
-        u.nombre_usuario,
-        ${USER_DISPLAY_SQL} AS nombre_completo
-      FROM public.usuarios u
-      LEFT JOIN public.empleados e ON e.id_empleado = u.id_empleado
-      LEFT JOIN public.personas per ON per.id_persona = e.id_persona
-      WHERE u.id_usuario = ANY($1::int[])
-    `,
-    [uniqueIds]
-  );
-  const usersById = new Map(
-    result.rows.map((row) => [Number(row.id_usuario), row])
-  );
-  const responsable = usersById.get(parsePositiveInt(idUsuarioResponsable));
-  const cierre = usersById.get(parsePositiveInt(idUsuarioCierre));
-
-  return {
-    responsable_nombre: responsable?.nombre_completo || null,
-    responsable_usuario: responsable?.nombre_usuario || null,
-    cierre_nombre: cierre?.nombre_completo || null,
-    cierre_usuario: cierre?.nombre_usuario || null
-  };
-};
-
-const resolveCajaEmailActorLabel = (actors, primaryNameKey, primaryUserKey, fallback) =>
-  actors?.[primaryNameKey] || actors?.[primaryUserKey] || fallback || 'No disponible';
-
-const normalizeManualMovement = (row) => ({
-  fecha_hora: row.fecha_movimiento || row.fecha_creacion || null,
-  tipo_codigo: normalizeCajaCode(row.tipo_codigo, 80) || 'N/A',
-  tipo: row.tipo_nombre || row.tipo_codigo || 'N/A',
-  monto: Number(row.monto || 0),
-  observacion: row.observacion || 'N/A',
-  referencia: row.referencia || 'N/A',
-  usuario_ejecutor: row.usuario_ejecutor_nombre || row.nombre_usuario || 'No disponible',
-  signo: Number(row.signo || 0)
-});
-
-const splitManualMovements = (rows = []) => {
-  const manualRows = (Array.isArray(rows) ? rows : [])
-    .map(normalizeManualMovement)
-    .filter((row) => !MANUAL_MOVEMENT_EXCLUDED_CODES.has(row.tipo_codigo));
-
-  return {
-    ingresos: manualRows.filter((row) => row.signo > 0),
-    egresos: manualRows.filter((row) => row.signo < 0)
-  };
-};
-
-const fetchCajaCloseManualMovements = async (client, idSesionCaja) => {
-  const result = await client.query(
-    `
-      SELECT
-        cm.fecha_movimiento,
-        cm.fecha_creacion,
-        cm.monto,
-        cm.observacion,
-        cm.referencia,
-        mt.codigo AS tipo_codigo,
-        mt.nombre AS tipo_nombre,
-        mt.signo,
-        u.nombre_usuario,
-        ${USER_DISPLAY_SQL} AS usuario_ejecutor_nombre
-      FROM public.cajas_movimientos cm
-      INNER JOIN public.cat_cajas_movimientos_tipos mt
-        ON mt.id_tipo_movimiento_caja = cm.id_tipo_movimiento_caja
-      LEFT JOIN public.usuarios u ON u.id_usuario = cm.id_usuario_ejecutor
-      LEFT JOIN public.empleados e ON e.id_empleado = u.id_empleado
-      LEFT JOIN public.personas per ON per.id_persona = e.id_persona
-      WHERE cm.id_sesion_caja = $1
-        AND UPPER(TRIM(mt.codigo)) <> ALL($2::text[])
-      ORDER BY cm.fecha_movimiento ASC, cm.id_movimiento_caja ASC
-    `,
-    [idSesionCaja, [...MANUAL_MOVEMENT_EXCLUDED_CODES]]
-  );
-
-  return splitManualMovements(result.rows);
-};
-
-const buildManualMovementEmailRows = (rows = []) => {
-  if (!Array.isArray(rows) || rows.length === 0) {
-    return '<tr><td colspan="6" style="color:#667085;">Sin movimientos manuales registrados.</td></tr>';
-  }
-
-  return rows.map((row) => `
-    <tr>
-      <td>${escapeHtml(formatDateTimeLabel(row.fecha_hora))}</td>
-      <td>${escapeHtml(row.tipo)}</td>
-      <td>${escapeHtml(formatMoneyLabel(row.monto))}</td>
-      <td>${escapeHtml(row.observacion)}</td>
-      <td>${escapeHtml(row.referencia)}</td>
-      <td>${escapeHtml(row.usuario_ejecutor)}</td>
-    </tr>
-  `).join('');
-};
-
-const buildManualMovementEmailSection = (title, rows) => `
-  <h3 style="margin:16px 0 8px;">${escapeHtml(title)}</h3>
-  <table cellpadding="6" cellspacing="0" style="border-collapse:collapse; width:100%; border:1px solid #eaecf0;">
-    <thead>
-      <tr style="background:#f9fafb;">
-        <th align="left">Fecha/hora</th>
-        <th align="left">Tipo</th>
-        <th align="left">Monto</th>
-        <th align="left">Razon u observacion</th>
-        <th align="left">Referencia</th>
-        <th align="left">Usuario ejecutor</th>
-      </tr>
-    </thead>
-    <tbody>${buildManualMovementEmailRows(rows)}</tbody>
-  </table>
-`;
-
-const buildCajaCierreEmailHtml = (payload) => {
-  const arqueosRows = Array.isArray(payload.arqueos) && payload.arqueos.length > 0
-    ? payload.arqueos.map((row) => `
-      <tr>
-        <td>${escapeHtml(row.metodo_pago_codigo || row.id_metodo_pago || 'N/A')}</td>
-        <td>${escapeHtml(formatMoneyLabel(row.monto_teorico))}</td>
-        <td>${escapeHtml(formatMoneyLabel(row.monto_declarado))}</td>
-        <td>${escapeHtml(formatMoneyLabel(row.diferencia))}</td>
-        <td>${escapeHtml(row.requiere_revision ? 'Si' : 'No')}</td>
-      </tr>
-    `).join('')
-    : `
-      <tr>
-        <td colspan="5" style="color:#667085;">Sin arqueos segmentados asociados.</td>
-      </tr>
-    `;
-  const responsableLabel = resolveCajaEmailActorLabel(
-    payload.actors,
-    'responsable_nombre',
-    'responsable_usuario',
-    payload.session?.id_usuario_responsable
-  );
-  const cierreLabel = resolveCajaEmailActorLabel(
-    payload.actors,
-    'cierre_nombre',
-    'cierre_usuario',
-    payload.idUsuarioCierre
-  );
-  const auditMessage = payload.requiresAudit
-    ? 'Este cierre de caja requiere auditoria por inconsistencias detectadas en el recuento o diferencia de cierre.'
-    : 'Este cierre de caja fue registrado sin inconsistencias pendientes de auditoria.';
-  const pdfMessage = payload.pdfAttached === false
-    ? 'No fue posible adjuntar el PDF automaticamente; el resumen del cierre se incluye en este correo.'
-    : 'Se adjunta el reporte PDF del cierre de caja para control interno.';
-  const movimientosManuales = payload.movimientosManuales || {};
-
-  return `
-<!DOCTYPE html>
-<html lang="es">
-<head><meta charset="UTF-8"></head>
-<body style="font-family:Arial,sans-serif; color:#1f2933; line-height:1.5;">
-  <h2 style="margin:0 0 12px;">Cierre de caja</h2>
-  <p>Se registro un cierre de caja en JONNY'S SmartOrder.</p>
-  <p>${escapeHtml(pdfMessage)}</p>
-  <p style="font-weight:700; color:${payload.requiresAudit ? '#b42318' : '#027a48'};">${escapeHtml(auditMessage)}</p>
-  <table cellpadding="6" cellspacing="0" style="border-collapse:collapse; margin-bottom:14px;">
-    <tr><td><strong>Cierre</strong></td><td>CIE-${escapeHtml(String(payload.idCierreCaja || '').padStart(5, '0'))}</td></tr>
-    <tr><td><strong>Sesion</strong></td><td>${escapeHtml(payload.idSesionCaja || 'No disponible')}</td></tr>
-    <tr><td><strong>Codigo de caja</strong></td><td>${escapeHtml(payload.session?.codigo_caja || payload.session?.id_caja || 'No disponible')}</td></tr>
-    <tr><td><strong>Nombre de caja</strong></td><td>${escapeHtml(payload.session?.nombre_caja || 'No disponible')}</td></tr>
-    <tr><td><strong>Sucursal</strong></td><td>${escapeHtml(payload.session?.nombre_sucursal || payload.session?.id_sucursal || 'No disponible')}</td></tr>
-    <tr><td><strong>Responsable</strong></td><td>${escapeHtml(responsableLabel)}</td></tr>
-    <tr><td><strong>Usuario de cierre</strong></td><td>${escapeHtml(cierreLabel)}</td></tr>
-    <tr><td><strong>Fecha/hora</strong></td><td>${escapeHtml(formatDateTimeLabel(payload.fechaCierre))}</td></tr>
-    <tr><td><strong>Total teorico</strong></td><td>${escapeHtml(formatMoneyLabel(payload.montoTeorico))}</td></tr>
-    <tr><td><strong>Total declarado</strong></td><td>${escapeHtml(formatMoneyLabel(payload.montoDeclaradoCierre))}</td></tr>
-    <tr><td><strong>Diferencia</strong></td><td>${escapeHtml(formatMoneyLabel(payload.diferencia))}</td></tr>
-    <tr><td><strong>Resolucion</strong></td><td>${escapeHtml(payload.resolutionCode || payload.idResolucionFinal || 'No disponible')}</td></tr>
-    <tr><td><strong>Nomina</strong></td><td>${escapeHtml(formatPayrollSyncLabel(payload.payrollSync))}</td></tr>
-  </table>
-  <h3 style="margin:0 0 8px;">Arqueos por metodo</h3>
-  <table cellpadding="6" cellspacing="0" style="border-collapse:collapse; width:100%; border:1px solid #eaecf0;">
-    <thead>
-      <tr style="background:#f9fafb;">
-        <th align="left">Metodo</th>
-        <th align="left">Teorico</th>
-        <th align="left">Declarado</th>
-        <th align="left">Diferencia</th>
-        <th align="left">Revision</th>
-      </tr>
-    </thead>
-    <tbody>${arqueosRows}</tbody>
-  </table>
-  ${buildManualMovementEmailSection('Ingresos manuales', movimientosManuales.ingresos)}
-  ${buildManualMovementEmailSection('Egresos manuales', movimientosManuales.egresos)}
-</body>
-</html>`;
-};
-
-const sendCajaCierreEmail = async (payload) => {
-  const subjectPrefix = payload.requiresAudit
-    ? 'Cierre de caja requiere auditoria'
-    : 'Cierre de caja registrado';
-  const cajaLabel = payload.session?.codigo_caja || payload.session?.nombre_caja || payload.idSesionCaja;
-  const sucursalLabel = payload.session?.nombre_sucursal || payload.session?.id_sucursal || 'Sucursal';
-  const payrollSyncLabel = formatPayrollSyncLabel(payload.payrollSync);
-  const attachments = [];
-  try {
-    const pdfPayload = { ...payload, payrollSyncLabel };
-    const pdfBuffer = await buildCajaCierrePdfBuffer(pdfPayload);
-    attachments.push({
-      filename: buildCajaCierrePdfFilename(payload.idCierreCaja),
-      content: pdfBuffer,
-      contentType: 'application/pdf'
-    });
-  } catch (pdfError) {
-    console.warn('[cajas] No se pudo generar PDF de cierre, se enviara correo sin adjunto:', pdfError?.message || pdfError);
-  }
-  const emailPayload = {
-    ...payload,
-    payrollSyncLabel,
-    pdfAttached: attachments.length > 0
-  };
-  await enviarCorreo(
-    CAJA_ADMIN_EMAIL_TO,
-    `${subjectPrefix} - ${cajaLabel} - ${sucursalLabel}`,
-    buildCajaCierreEmailHtml(emailPayload),
-    {
-      id_usuario: payload.session?.id_usuario_responsable,
-      tipo_correo: 'caja_cierre',
-      fromKey: 'ADMON',
-      attachments
-    }
-  );
-};
-
-const enqueueCajaCloseEmailNotification = ({
-  idCierreCaja,
-  idSesionCaja,
-  session,
-  idUsuarioCierre,
-  fechaCierre,
-  montoTeorico,
-  montoDeclaradoCierre,
-  diferencia,
-  idResolucionFinal,
-  resolutionCode,
-  payrollSync,
-  arqueos,
-  requiresAudit,
-  resumen
-}) => enqueueCajaCloseNotification({
-  idCierreCaja,
-  task: async () => {
-    const payrollSyncLabel = describePayrollSync(payrollSync);
-    const cajaLabel = session?.nombre_caja || session?.codigo_caja || `Caja ${session?.id_caja || ''}`.trim();
-    const sucursalLabel = session?.nombre_sucursal || `Sucursal ${session?.id_sucursal || ''}`.trim();
-    const subjectPrefix = requiresAudit
-      ? 'Cierre de caja pendiente de revision'
-      : 'Cierre de caja registrado';
-
-    await processCajaCloseNotification({
-      idCierreCaja,
-      payload: {
-        idCierreCaja,
-        idSesionCaja,
-        session,
-        idUsuarioCierre,
-        fechaCierre,
-        montoTeorico,
-        montoDeclaradoCierre,
-        diferencia,
-        idResolucionFinal,
-        resolutionCode,
-        payrollSync,
-        payrollSyncLabel,
-        arqueos,
-        requiresAudit,
-        montoApertura: Number(resumen?.montoApertura || 0),
-        ventasEfectivoNetas: Number(resumen?.ventasEfectivoNetas || 0),
-        ventasNoEfectivoNetas: Number(resumen?.ventasNoEfectivoNetas || 0),
-        ingresosManuales: Number(resumen?.ingresosManuales || 0),
-        egresosManuales: Number(resumen?.egresosManuales || 0)
-      },
-      dependencies: {
-        pool,
-        to: CAJA_ADMIN_EMAIL_TO,
-        subject: `${subjectPrefix} - ${cajaLabel} - ${sucursalLabel}`,
-        fetchActors: (client) => fetchCajaCloseEmailActors(client, {
-          idUsuarioResponsable: session.id_usuario_responsable,
-          idUsuarioCierre
-        }),
-        fetchMovements: (client) => fetchCajaCloseManualMovements(client, idSesionCaja),
-        buildPdf: buildCajaCierrePdfBuffer,
-        buildPdfFilename: buildCajaCierrePdfFilename,
-        sendEmail: enviarCorreo,
-        buildHtml: (payload) => buildCajaCierreEmailHtml({
-          ...payload,
-          actors: payload.actors || {},
-          movimientosManuales: payload.movimientosManuales || { ingresos: [], egresos: [] }
-        })
-      }
-    });
-  }
-});
-
 const fetchSessionBase = async (client, idSesionCaja, { forUpdate = false } = {}) => {
   const result = await client.query(
     `
@@ -2973,6 +2649,7 @@ const buildSessionDetailPayload = async (client, session) => {
     ultimoArqueoCierreResult,
     movimientosResult,
     cierreResult,
+    cierreNotificacionResult,
     resumenResult,
     arqueosMetodosResult,
     validacionesResult,
@@ -3161,6 +2838,17 @@ const buildSessionDetailPayload = async (client, session) => {
       ),
       client.query(
         `
+          SELECT n.*
+          FROM public.cajas_cierres_notificaciones_email n
+          INNER JOIN public.cajas_cierres cc ON cc.id_cierre_caja = n.id_cierre_caja
+          WHERE cc.id_sesion_caja = $1
+          ORDER BY cc.id_cierre_caja DESC
+          LIMIT 1
+        `,
+        [session.id_sesion_caja]
+      ),
+      client.query(
+        `
           SELECT *
           FROM public.vw_cajas_sesiones_resumen
           WHERE id_sesion_caja = $1
@@ -3306,6 +2994,26 @@ const buildSessionDetailPayload = async (client, session) => {
   });
   const financialSummary = await fetchSessionMethodFinancialSummary(client, session.id_sesion_caja);
   const cierre = cierreResult.rows[0] || null;
+  const cierreNotificacion = cierreNotificacionResult.rows[0] || null;
+  const cierreConCorreo = cierre
+    ? {
+        ...cierre,
+        correo_estado: cierreNotificacion?.estado || null,
+        notificacion_correo: cierreNotificacion
+          ? {
+              id_notificacion: cierreNotificacion.id_notificacion,
+              estado: cierreNotificacion.estado,
+              intentos: Number(cierreNotificacion.intentos || 0),
+              proximo_intento: cierreNotificacion.proximo_intento || null,
+              bloqueado_hasta: cierreNotificacion.bloqueado_hasta || null,
+              ultimo_error: cierreNotificacion.ultimo_error || null,
+              email_destino: cierreNotificacion.email_destino || null,
+              message_id: cierreNotificacion.message_id || null,
+              fecha_envio: cierreNotificacion.fecha_envio || null
+            }
+          : null
+      }
+    : null;
   const recuentoUsadoParaCierre = recuentos.find((row) => row.usado_para_cierre) || null;
   const montoTeoricoTotal = roundMoney(
     cierre?.monto_teorico_cierre
@@ -3356,7 +3064,7 @@ const buildSessionDetailPayload = async (client, session) => {
     recuentos,
     validaciones_cierre: recuentos,
     incidencias: [],
-    cierre
+    cierre: cierreConCorreo
   };
 };
 
@@ -5272,6 +4980,10 @@ const closeSessionHandler = async (req, res) => {
       ]
     );
     const idCierreCaja = parsePositiveBigIntId(closeResult.rows?.[0]?.id_cierre_caja);
+    const closeEmailNotification = await createCajaCloseEmailNotification(client, {
+      idCierreCaja,
+      emailDestino: CAJA_CLOSE_EMAIL_FALLBACK_TO
+    });
 
     if (idCierreCaja && idValidacionCierre) {
       await client.query(
@@ -5397,26 +5109,11 @@ const closeSessionHandler = async (req, res) => {
         requiresAudit,
         resumen: snapshot,
         idArqueoFinalSelected,
-        isCashierOnly
+        isCashierOnly,
+        closeEmailNotification
       };
     }, { label: 'caja_close_session' });
 
-    const notificationQueue = enqueueCajaCloseEmailNotification({
-      idCierreCaja: closeOutcome.idCierreCaja,
-      idSesionCaja: closeOutcome.idSesionCaja,
-      session: closeOutcome.session,
-      idUsuarioCierre: closeOutcome.idUsuarioCierre,
-      fechaCierre: closeOutcome.fechaCierre,
-      montoTeorico: closeOutcome.montoTeorico,
-      montoDeclaradoCierre: closeOutcome.montoDeclaradoCierre,
-      diferencia: closeOutcome.diferencia,
-      idResolucionFinal: closeOutcome.idResolucionFinal,
-      resolutionCode: closeOutcome.resolutionCode,
-      payrollSync: closeOutcome.payrollSync,
-      arqueos: closeOutcome.arqueosPersistir,
-      requiresAudit: closeOutcome.requiresAudit,
-      resumen: closeOutcome.resumen
-    });
     const responsePayload = {
       message: 'Cierre de caja registrado correctamente.',
       id_cierre_caja: closeOutcome.idCierreCaja,
@@ -5425,7 +5122,11 @@ const closeSessionHandler = async (req, res) => {
       estado_revision: closeOutcome.resolutionCode,
       arqueos_metodos: closeOutcome.arqueosPersistir,
       payroll_sync: closeOutcome.payrollSync,
-      notification_queue: notificationQueue
+      correo_cierre: {
+        estado: closeOutcome.closeEmailNotification?.estado || 'PENDIENTE',
+        id_notificacion: closeOutcome.closeEmailNotification?.id_notificacion || null,
+        intentos: Number(closeOutcome.closeEmailNotification?.intentos || 0)
+      }
     };
     return res.status(200).json(
       closeOutcome.isCashierOnly ? maskCajaCloseResponseForCajero(responsePayload) : responsePayload
@@ -5436,6 +5137,62 @@ const closeSessionHandler = async (req, res) => {
 };
 router.patch('/ventas/cajas/sesiones/:id/cerrar', checkPermission(['VENTAS_CAJAS_SESION_CERRAR']), closeSessionHandler);
 router.post('/ventas/cajas/sesiones/:id/cerrar', checkPermission(['VENTAS_CAJAS_SESION_CERRAR']), closeSessionHandler);
+
+router.post('/ventas/cajas/cierres/:id/reintentar-correo', checkPermission(['VENTAS_CAJAS_SESION_CERRAR']), async (req, res) => {
+  try {
+    const notification = await withDbTransaction(async (client) => {
+      const idCierreCaja = parsePositiveBigIntId(req.params.id);
+      if (!idCierreCaja) {
+        throw createCajaError(400, 'VENTAS_CAJAS_CLOSE_ID_INVALID', 'El id de cierre es invalido.');
+      }
+      if (!(await requestIsSuperAdminReal(client, req))) {
+        throw createCajaError(403, 'VENTAS_CAJAS_ROLE_FORBIDDEN', 'Accion exclusiva para SUPER_ADMIN.');
+      }
+      const closeResult = await client.query(
+        `
+          SELECT id_cierre_caja
+          FROM public.cajas_cierres
+          WHERE id_cierre_caja = $1
+          LIMIT 1
+        `,
+        [idCierreCaja]
+      );
+      if (closeResult.rowCount === 0) {
+        throw createCajaError(404, 'VENTAS_CAJAS_CLOSE_NOT_FOUND', 'El cierre indicado no existe.');
+      }
+
+      const currentNotification = await fetchCajaCloseEmailNotificationByCloseId(client, idCierreCaja);
+      if (!currentNotification) {
+        return createCajaCloseEmailNotification(client, {
+          idCierreCaja,
+          emailDestino: CAJA_CLOSE_EMAIL_FALLBACK_TO
+        });
+      }
+      if (currentNotification.estado !== 'FALLIDO') {
+        return currentNotification;
+      }
+      return reactivateFailedCajaCloseEmailNotification(client, idCierreCaja);
+    }, { label: 'caja_close_email_retry' });
+
+    return res.status(200).json({
+      message: 'Estado de notificacion de cierre consultado correctamente.',
+      notificacion: {
+        id_notificacion: notification?.id_notificacion || null,
+        id_cierre_caja: notification?.id_cierre_caja || null,
+        estado: notification?.estado || null,
+        intentos: Number(notification?.intentos || 0),
+        proximo_intento: notification?.proximo_intento || null,
+        bloqueado_hasta: notification?.bloqueado_hasta || null,
+        ultimo_error: notification?.ultimo_error || null,
+        email_destino: notification?.email_destino || null,
+        message_id: notification?.message_id || null,
+        fecha_envio: notification?.fecha_envio || null
+      }
+    });
+  } catch (err) {
+    return sendInternalError(res, err, 'VENTAS_CAJAS_CLOSE_EMAIL_RETRY_ERROR', 'No se pudo reintentar el correo de cierre.');
+  }
+});
 
 router.post('/ventas/cajas/sesiones/:id/cierre-validaciones', checkPermission(['VENTAS_CAJAS_SESION_CERRAR']), async (req, res) => {
   try {
