@@ -6,6 +6,9 @@ const defaultSendEmail = async (...args) => {
   return enviarCorreo(...args);
 };
 
+export const resolveCajaCloseEmailRecipient = (fallback) =>
+  String(process.env.CAJA_CLOSE_EMAIL_TO || fallback || '').trim();
+
 export const processCajaCloseNotification = async ({
   idCierreCaja,
   payload,
@@ -58,8 +61,13 @@ export const processCajaCloseNotification = async ({
     console.warn('[caja_close_notification] No se pudo generar PDF:', pdfError?.message || pdfError);
   }
 
+  const recipient = resolveCajaCloseEmailRecipient(to);
+  if (!recipient) {
+    throw new Error('CAJA_CLOSE_EMAIL_TO no está configurado y no existe destinatario fallback.');
+  }
+
   await sendEmail(
-    to,
+    recipient,
     subject,
     typeof buildHtml === 'function' ? buildHtml({ ...enrichedPayload, pdfAttached: attachments.length > 0 }) : '',
     {
