@@ -3,13 +3,17 @@ import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { describe, it } from 'node:test';
 import {
+  buildCajaCloseEmailHtml,
   buildCajaCloseEmailSubject,
   claimCajaCloseEmailNotifications,
   createCajaCloseEmailNotification,
+  loadCajaCloseEmailPayload,
   markCajaCloseEmailNotificationFailed,
+  normalizeManualMovement,
   processClaimedCajaCloseEmailNotification,
   resolveCajaCloseOutboxRecipient
 } from '../cajaCloseEmailOutboxService.js';
+import { buildCajaCierrePdfDefinition } from '../../utils/cajaCierreReportePdf.js';
 
 const routerSource = readFileSync(resolve('routers/cajas.js'), 'utf8');
 const serverSource = readFileSync(resolve('server.js'), 'utf8');
@@ -118,6 +122,188 @@ describe('caja close email durable outbox', () => {
     assert.equal(failed.estado, 'FALLIDO');
     assert.match(updates[0].sql, /proximo_intento = CASE/);
     assert.equal(updates[0].params[4], 'smtp down');
+  });
+
+  it('payload de correo resuelve actores, movimientos manuales y arqueos reales', async () => {
+    const queries = [];
+    const fakeQueryRunner = {
+      async query(sql, params) {
+        queries.push({ sql, params });
+        if (/FROM public\.cajas_cierres cc/.test(sql)) {
+          return {
+            rows: [{
+              id_cierre_caja: 2,
+              id_sesion_caja: 1,
+              id_caja: 10,
+              id_sucursal: 1,
+              id_usuario_responsable: 37,
+              sesion_id_usuario_responsable: 37,
+              id_usuario_cierre: 37,
+              fecha_cierre: '2026-06-28 10:00:00',
+              codigo_caja: 'CJ-1',
+              nombre_caja: 'Caja 1',
+              nombre_sucursal: 'Sucursal 1',
+              monto_teorico_cierre: '1200',
+              monto_declarado_cierre: '1200',
+              diferencia: '0',
+              monto_apertura: '0',
+              monto_ventas_efectivo: '0',
+              monto_ventas_no_efectivo: '0',
+              monto_ingresos_manuales: '1200',
+              monto_egresos_manuales: '1200',
+              resolucion_codigo: 'CAJA_CUADRA'
+            }]
+          };
+        }
+        if (/FROM public\.usuarios u/.test(sql)) {
+          return {
+            rows: [{
+              id_usuario: 37,
+              nombre_usuario: 'cajero.prueba',
+              nombre_completo: 'Cajero Prueba'
+            }]
+          };
+        }
+        if (/FROM public\.cajas_movimientos cm/.test(sql)) {
+          return {
+            rows: [
+              {
+                id_movimiento_caja: 1,
+                fecha_movimiento: '2026-06-28 09:00:00',
+                monto: '500',
+                observacion: 'Ingreso manual caja',
+                referencia: 'REF-IN-1',
+                tipo_codigo: 'INGRESO_MANUAL',
+                tipo_nombre: 'Ingreso manual',
+                signo: 1,
+                usuario_ejecutor_nombre: 'Cajero Prueba',
+                usuario_ejecutor_usuario: 'cajero.prueba'
+              },
+              {
+                id_movimiento_caja: 2,
+                fecha_movimiento: '2026-06-28 09:05:00',
+                monto: '300',
+                observacion: 'Egreso manual caja',
+                referencia: null,
+                tipo_codigo: 'EGRESO_MANUAL',
+                tipo_nombre: 'Egreso manual',
+                signo: -1,
+                usuario_ejecutor_nombre: 'Cajero Prueba',
+                usuario_ejecutor_usuario: 'cajero.prueba'
+              }
+            ]
+          };
+        }
+        if (/FROM public\.cajas_cierres_arqueos_metodos/.test(sql)) {
+          return {
+            rows: [{
+              metodo_pago_codigo: 'EFECTIVO',
+              monto_teorico: '1200',
+              monto_declarado: '1200',
+              diferencia: '0',
+              requiere_revision: false,
+              observacion: 'Cuadrado'
+            }]
+          };
+        }
+        return { rows: [] };
+      }
+    };
+
+    const payload = await loadCajaCloseEmailPayload(fakeQueryRunner, 2);
+    assert.equal(payload.actors.responsable_nombre, 'Cajero Prueba');
+    assert.equal(payload.actors.cierre_nombre, 'Cajero Prueba');
+    assert.equal(payload.movimientosManuales.ingresos.length, 1);
+    assert.equal(payload.movimientosManuales.egresos.length, 1);
+    assert.equal(payload.movimientosManuales.ingresos[0].observacion, 'Ingreso manual caja');
+    assert.equal(payload.movimientosManuales.ingresos[0].referencia, 'REF-IN-1');
+    assert.equal(payload.movimientosManuales.egresos[0].referencia, 'N/A');
+    assert.equal(payload.arqueos[0].metodo_pago_codigo, 'EFECTIVO');
+    assert.match(queries.find((call) => /FROM public\.cajas_movimientos cm/.test(call.sql)).sql, /NOT IN \('APERTURA', 'REVERSION', 'REVERSO'\)/);
+  });
+
+  it('normaliza movimientos manuales sin perder observacion, referencia ni ejecutor', () => {
+    assert.deepEqual(
+      normalizeManualMovement({
+        fecha_movimiento: '2026-06-28 08:00:00',
+        tipo_codigo: 'INGRESO',
+        tipo_nombre: 'Ingreso',
+        monto: '100',
+        observacion: '  Fondo extra  ',
+        referencia: '  REF-1 ',
+        usuario_ejecutor_nombre: 'Cajero Prueba',
+        signo: 1
+      }),
+      {
+        fecha_hora: '2026-06-28 08:00:00',
+        tipo_codigo: 'INGRESO',
+        tipo: 'Ingreso',
+        monto: 100,
+        observacion: 'Fondo extra',
+        referencia: 'REF-1',
+        usuario_ejecutor: 'Cajero Prueba',
+        signo: 1
+      }
+    );
+    assert.equal(normalizeManualMovement({ referencia: '   ' }).referencia, 'N/A');
+  });
+
+  it('HTML y PDF contienen actores, arqueos y tablas separadas de movimientos manuales', () => {
+    const payload = {
+      idCierreCaja: '2',
+      idSesionCaja: '1',
+      session: { nombre_caja: 'Caja 1', nombre_sucursal: 'Sucursal 1' },
+      actors: {
+        responsable_nombre: 'Cajero Prueba',
+        cierre_nombre: 'Cajero Prueba'
+      },
+      montoTeorico: 1200,
+      montoDeclaradoCierre: 1200,
+      diferencia: 0,
+      requiresAudit: false,
+      arqueos: [{
+        metodo_pago_codigo: 'EFECTIVO',
+        monto_teorico: 1200,
+        monto_declarado: 1200,
+        diferencia: 0,
+        requiere_revision: false,
+        observacion: 'Cuadrado'
+      }],
+      movimientosManuales: {
+        ingresos: [{
+          fecha_hora: '2026-06-28 09:00:00',
+          monto: 500,
+          observacion: 'Ingreso manual caja',
+          referencia: 'REF-IN-1',
+          usuario_ejecutor: 'Cajero Prueba'
+        }],
+        egresos: [{
+          fecha_hora: '2026-06-28 09:05:00',
+          monto: 300,
+          observacion: 'Egreso manual caja',
+          referencia: 'N/A',
+          usuario_ejecutor: 'Cajero Prueba'
+        }]
+      }
+    };
+
+    const html = buildCajaCloseEmailHtml({ payload, pdfAttached: false });
+    assert.match(html, /Responsable/);
+    assert.match(html, /Cajero Prueba/);
+    assert.match(html, /Arqueos por metodo/);
+    assert.match(html, /Ingresos manuales/);
+    assert.match(html, /Egresos manuales/);
+    assert.match(html, /Ingreso manual caja/);
+    assert.match(html, /Egreso manual caja/);
+
+    const pdfDefinitionText = JSON.stringify(buildCajaCierrePdfDefinition(payload));
+    assert.match(pdfDefinitionText, /Responsable/);
+    assert.match(pdfDefinitionText, /Cajero Prueba/);
+    assert.match(pdfDefinitionText, /Arqueos por metodo/);
+    assert.match(pdfDefinitionText, /Ingresos manuales/);
+    assert.match(pdfDefinitionText, /Egresos manuales/);
+    assert.doesNotMatch(pdfDefinitionText, /"Tipo"/);
+    assert.doesNotMatch(pdfDefinitionText, /"37"/);
   });
 
   it('envio exitoso guarda message_id y usa log_correos_enviados por enviarCorreo', async () => {

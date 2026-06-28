@@ -36,6 +36,166 @@ const resolveBackoffSeconds = (attempts) => {
   return Math.min(60 * (2 ** (boundedAttempts - 1)), 3600);
 };
 
+const cleanText = (value, fallback = 'N/A') => {
+  const text = String(value ?? '').replace(/\s+/g, ' ').trim();
+  return text || fallback;
+};
+
+const cleanOptionalText = (value) => {
+  const text = String(value ?? '').replace(/\s+/g, ' ').trim();
+  return text || null;
+};
+
+const escapeHtml = (value) =>
+  cleanText(value, '').replace(/[&<>"']/g, (char) => ({
+    '&': '&amp;',
+    '<': '&lt;',
+    '>': '&gt;',
+    '"': '&quot;',
+    "'": '&#39;'
+  }[char]));
+
+const money = (value) => Number(value || 0).toFixed(2);
+
+const resolveActorName = ({ nombre, usuario } = {}) =>
+  cleanOptionalText(nombre) || cleanOptionalText(usuario) || 'No disponible';
+
+const formatHtmlDateTime = (value) => {
+  if (!value) return 'N/A';
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return cleanText(value);
+  return date.toLocaleString('es-HN', {
+    timeZone: 'America/Tegucigalpa',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit'
+  });
+};
+
+export const normalizeManualMovement = (row = {}) => ({
+  fecha_hora: row.fecha_movimiento || row.fecha_creacion || null,
+  tipo_codigo: cleanText(row.tipo_codigo, 'N/A'),
+  tipo: cleanText(row.tipo_nombre || row.tipo_codigo, 'N/A'),
+  monto: Number(row.monto || 0),
+  observacion: cleanText(row.observacion, 'N/A'),
+  referencia: cleanText(row.referencia, 'N/A'),
+  usuario_ejecutor: resolveActorName({
+    nombre: row.usuario_ejecutor_nombre,
+    usuario: row.usuario_ejecutor_usuario
+  }),
+  signo: Number(row.signo || 0)
+});
+
+export const splitManualMovements = (rows = []) =>
+  (Array.isArray(rows) ? rows : []).reduce(
+    (acc, row) => {
+      const normalized = normalizeManualMovement(row);
+      if (normalized.signo > 0) acc.ingresos.push(normalized);
+      if (normalized.signo < 0) acc.egresos.push(normalized);
+      return acc;
+    },
+    { ingresos: [], egresos: [] }
+  );
+
+export const fetchCajaCloseEmailActors = async (queryRunner, {
+  idUsuarioResponsable,
+  idUsuarioCierre
+} = {}) => {
+  const ids = [
+    Number.parseInt(String(idUsuarioResponsable || ''), 10),
+    Number.parseInt(String(idUsuarioCierre || ''), 10)
+  ].filter((value) => Number.isInteger(value) && value > 0);
+  if (ids.length === 0) {
+    return {
+      responsable_nombre: null,
+      responsable_usuario: null,
+      cierre_nombre: null,
+      cierre_usuario: null
+    };
+  }
+
+  const result = await queryRunner.query(
+    `
+      SELECT
+        u.id_usuario,
+        u.nombre_usuario,
+        NULLIF(TRIM(CONCAT_WS(' ', per.nombre, per.apellido)), '') AS nombre_completo
+      FROM public.usuarios u
+      LEFT JOIN public.empleados e ON e.id_empleado = u.id_empleado
+      LEFT JOIN public.personas per ON per.id_persona = e.id_persona
+      WHERE u.id_usuario = ANY($1::bigint[])
+    `,
+    [[...new Set(ids)]]
+  );
+  const byId = new Map((result.rows || []).map((row) => [Number(row.id_usuario), row]));
+  const responsable = byId.get(Number(idUsuarioResponsable)) || {};
+  const cierre = byId.get(Number(idUsuarioCierre)) || {};
+  return {
+    responsable_nombre: cleanOptionalText(responsable.nombre_completo),
+    responsable_usuario: cleanOptionalText(responsable.nombre_usuario),
+    cierre_nombre: cleanOptionalText(cierre.nombre_completo),
+    cierre_usuario: cleanOptionalText(cierre.nombre_usuario)
+  };
+};
+
+export const fetchCajaCloseManualMovements = async (queryRunner, idSesionCaja) => {
+  const result = await queryRunner.query(
+    `
+      SELECT
+        cm.id_movimiento_caja,
+        cm.fecha_movimiento,
+        cm.fecha_creacion,
+        cm.monto,
+        cm.observacion,
+        cm.referencia,
+        mt.codigo AS tipo_codigo,
+        mt.nombre AS tipo_nombre,
+        mt.signo,
+        u.nombre_usuario AS usuario_ejecutor_usuario,
+        NULLIF(TRIM(CONCAT_WS(' ', per.nombre, per.apellido)), '') AS usuario_ejecutor_nombre
+      FROM public.cajas_movimientos cm
+      INNER JOIN public.cat_cajas_movimientos_tipos mt
+        ON mt.id_tipo_movimiento_caja = cm.id_tipo_movimiento_caja
+      LEFT JOIN public.usuarios u ON u.id_usuario = cm.id_usuario_ejecutor
+      LEFT JOIN public.empleados e ON e.id_empleado = u.id_empleado
+      LEFT JOIN public.personas per ON per.id_persona = e.id_persona
+      WHERE cm.id_sesion_caja = $1
+        AND UPPER(TRIM(mt.codigo)) NOT IN ('APERTURA', 'REVERSION', 'REVERSO')
+      ORDER BY cm.fecha_movimiento ASC, cm.id_movimiento_caja ASC
+    `,
+    [idSesionCaja]
+  );
+  return splitManualMovements(result.rows || []);
+};
+
+export const fetchCajaCloseArqueos = async (queryRunner, idCierreCaja) => {
+  const result = await queryRunner.query(
+    `
+      SELECT
+        metodo_pago_codigo,
+        monto_teorico,
+        monto_declarado,
+        diferencia,
+        requiere_revision,
+        observacion
+      FROM public.cajas_cierres_arqueos_metodos
+      WHERE id_cierre_caja = $1
+      ORDER BY id_arqueo_metodo ASC
+    `,
+    [idCierreCaja]
+  );
+  return (result.rows || []).map((row) => ({
+    metodo_pago_codigo: cleanText(row.metodo_pago_codigo, 'N/A'),
+    monto_teorico: Number(row.monto_teorico || 0),
+    monto_declarado: Number(row.monto_declarado || 0),
+    diferencia: Number(row.diferencia || 0),
+    requiere_revision: Boolean(row.requiere_revision),
+    observacion: cleanText(row.observacion, 'N/A')
+  }));
+};
+
 export const buildCajaCloseEmailSubject = ({ payload = {} } = {}) => {
   const cajaLabel = payload.session?.nombre_caja || payload.session?.codigo_caja || `Caja ${payload.session?.id_caja || ''}`.trim();
   const sucursalLabel = payload.session?.nombre_sucursal || `Sucursal ${payload.session?.id_sucursal || ''}`.trim();
@@ -45,9 +205,47 @@ export const buildCajaCloseEmailSubject = ({ payload = {} } = {}) => {
   return `${subjectPrefix} - ${cajaLabel || 'Caja'} - ${sucursalLabel || 'Sucursal'}`;
 };
 
+const buildHtmlRows = (rows = [], columns = [], emptyMessage = 'Sin registros.') => {
+  if (!Array.isArray(rows) || rows.length === 0) {
+    return `<tr><td colspan="${columns.length}" style="padding:8px;border:1px solid #eaecf0;color:#667085;">${escapeHtml(emptyMessage)}</td></tr>`;
+  }
+  return rows.map((row) => `
+    <tr>
+      ${columns.map((column) => `<td style="padding:8px;border:1px solid #eaecf0;vertical-align:top;${column.align === 'right' ? 'text-align:right;' : ''}">${escapeHtml(column.render(row))}</td>`).join('')}
+    </tr>
+  `).join('');
+};
+
+const buildHtmlTable = ({ title, columns, rows, emptyMessage }) => `
+  <h3 style="margin:18px 0 8px;">${escapeHtml(title)}</h3>
+  <table cellpadding="0" cellspacing="0" style="border-collapse:collapse;border:1px solid #eaecf0;width:100%;">
+    <thead>
+      <tr>
+        ${columns.map((column) => `<th style="padding:8px;border:1px solid #eaecf0;background:#f2f4f7;text-align:${column.align === 'right' ? 'right' : 'left'};">${escapeHtml(column.label)}</th>`).join('')}
+      </tr>
+    </thead>
+    <tbody>${buildHtmlRows(rows, columns, emptyMessage)}</tbody>
+  </table>
+`;
+
 export const buildCajaCloseEmailHtml = ({ payload = {}, pdfAttached = false } = {}) => {
-  const money = (value) => Number(value || 0).toFixed(2);
   const session = payload.session || {};
+  const actors = payload.actors || {};
+  const manualColumns = [
+    { label: 'Fecha/hora', render: (row) => formatHtmlDateTime(row.fecha_hora) },
+    { label: 'Monto', align: 'right', render: (row) => `L ${money(row.monto)}` },
+    { label: 'Observacion', render: (row) => row.observacion || 'N/A' },
+    { label: 'Referencia', render: (row) => row.referencia || 'N/A' },
+    { label: 'Usuario ejecutor', render: (row) => row.usuario_ejecutor || 'No disponible' }
+  ];
+  const arqueoColumns = [
+    { label: 'Metodo', render: (row) => row.metodo_pago_codigo || 'N/A' },
+    { label: 'Teorico', align: 'right', render: (row) => `L ${money(row.monto_teorico)}` },
+    { label: 'Declarado', align: 'right', render: (row) => `L ${money(row.monto_declarado)}` },
+    { label: 'Diferencia', align: 'right', render: (row) => `L ${money(row.diferencia)}` },
+    { label: 'Revision', render: (row) => (row.requiere_revision ? 'Si' : 'No') },
+    { label: 'Observacion', render: (row) => row.observacion || 'N/A' }
+  ];
   return `<!doctype html>
 <html>
 <body style="font-family:Arial,sans-serif;color:#111827;">
@@ -57,11 +255,31 @@ export const buildCajaCloseEmailHtml = ({ payload = {}, pdfAttached = false } = 
     <tr><td><strong>Cierre</strong></td><td>${payload.idCierreCaja || 'N/A'}</td></tr>
     <tr><td><strong>Caja</strong></td><td>${session.nombre_caja || session.codigo_caja || 'N/A'}</td></tr>
     <tr><td><strong>Sucursal</strong></td><td>${session.nombre_sucursal || session.id_sucursal || 'N/A'}</td></tr>
+    <tr><td><strong>Responsable</strong></td><td>${escapeHtml(resolveActorName({ nombre: actors.responsable_nombre, usuario: actors.responsable_usuario }))}</td></tr>
+    <tr><td><strong>Usuario de cierre</strong></td><td>${escapeHtml(resolveActorName({ nombre: actors.cierre_nombre, usuario: actors.cierre_usuario }))}</td></tr>
     <tr><td><strong>Total teorico</strong></td><td>L ${money(payload.montoTeorico)}</td></tr>
     <tr><td><strong>Total declarado</strong></td><td>L ${money(payload.montoDeclaradoCierre)}</td></tr>
     <tr><td><strong>Diferencia</strong></td><td>L ${money(payload.diferencia)}</td></tr>
     <tr><td><strong>Revision</strong></td><td>${payload.requiresAudit ? 'Requiere revision' : 'Sin inconsistencias pendientes'}</td></tr>
   </table>
+  ${buildHtmlTable({
+    title: 'Arqueos por metodo',
+    columns: arqueoColumns,
+    rows: payload.arqueos,
+    emptyMessage: 'Sin arqueos segmentados asociados.'
+  })}
+  ${buildHtmlTable({
+    title: 'Ingresos manuales',
+    columns: manualColumns,
+    rows: payload.movimientosManuales?.ingresos,
+    emptyMessage: 'Sin ingresos manuales registrados.'
+  })}
+  ${buildHtmlTable({
+    title: 'Egresos manuales',
+    columns: manualColumns,
+    rows: payload.movimientosManuales?.egresos,
+    emptyMessage: 'Sin egresos manuales registrados.'
+  })}
   <p>${pdfAttached ? 'Se adjunta el reporte PDF del cierre.' : 'No fue posible adjuntar el PDF automaticamente.'}</p>
 </body>
 </html>`;
@@ -197,6 +415,13 @@ export const loadCajaCloseEmailPayload = async (queryRunner, idCierreCaja) => {
   );
   const row = result.rows?.[0] || null;
   if (!row) return null;
+  const idUsuarioResponsable = row.id_usuario_responsable || row.sesion_id_usuario_responsable;
+  const actors = await fetchCajaCloseEmailActors(queryRunner, {
+    idUsuarioResponsable,
+    idUsuarioCierre: row.id_usuario_cierre
+  });
+  const movimientosManuales = await fetchCajaCloseManualMovements(queryRunner, row.id_sesion_caja);
+  const arqueos = await fetchCajaCloseArqueos(queryRunner, row.id_cierre_caja);
   return {
     idCierreCaja: String(row.id_cierre_caja),
     idSesionCaja: String(row.id_sesion_caja),
@@ -204,11 +429,12 @@ export const loadCajaCloseEmailPayload = async (queryRunner, idCierreCaja) => {
       id_sesion_caja: row.id_sesion_caja,
       id_caja: row.id_caja,
       id_sucursal: row.id_sucursal,
-      id_usuario_responsable: row.id_usuario_responsable || row.sesion_id_usuario_responsable,
+      id_usuario_responsable: idUsuarioResponsable,
       codigo_caja: row.codigo_caja,
       nombre_caja: row.nombre_caja,
       nombre_sucursal: row.nombre_sucursal
     },
+    actors,
     idUsuarioCierre: row.id_usuario_cierre,
     fechaCierre: row.fecha_cierre,
     montoTeorico: Number(row.monto_teorico_cierre || 0),
@@ -224,7 +450,8 @@ export const loadCajaCloseEmailPayload = async (queryRunner, idCierreCaja) => {
     ingresosManuales: Number(row.monto_ingresos_manuales || 0),
     egresosManuales: Number(row.monto_egresos_manuales || 0),
     payrollSync: { synced: true, reason: 'NOT_REQUIRED' },
-    arqueos: []
+    arqueos,
+    movimientosManuales
   };
 };
 
