@@ -27,6 +27,15 @@ assert.match(handlersSource, /fetchCajaBootstrapOperationalState/, 'bootstrap de
 assert.match(handlersSource, /sesion_caja:\s*operationalState\.sesion_caja/, 'bootstrap debe incluir la sesion activa');
 assert.match(handlersSource, /caja_activa:\s*operationalState\.caja_activa/, 'bootstrap debe incluir la caja activa');
 assert.match(handlersSource, /if \(!operationalState\?\.sesion_caja\)/, 'sin sesion no debe cargar catalogos');
+const operationalStateSource = handlersSource.slice(
+  handlersSource.indexOf('const fetchCajaBootstrapOperationalState'),
+  handlersSource.indexOf('export const getCajaBootstrapHandler')
+);
+assert.doesNotMatch(
+  operationalStateSource,
+  /OR \$3::boolean = true/,
+  'SUPER_ADMIN no debe aparecer como sesion operativa sin participacion real'
+);
 assert.match(handlersSource, /requiere_seleccion_sucursal:\s*true/, 'superadmin sin sesion debe poder seleccionar sucursal');
 assert.match(handlersSource, /fetchCajaBootstrapAvailableSessions/, 'bootstrap debe descubrir todas las sesiones operables');
 assert.match(handlersSource, /cajas_sesiones_participantes/, 'descubrimiento debe incluir participantes activos');

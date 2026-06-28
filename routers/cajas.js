@@ -2332,7 +2332,8 @@ const enqueueCajaCloseEmailNotification = ({
 const fetchSessionBase = async (client, idSesionCaja, { forUpdate = false } = {}) => {
   const result = await client.query(
     `
-      SELECT cs.*, c.codigo_caja, c.nombre_caja, COALESCE(c.estado, true) AS caja_estado, s.nombre_sucursal,
+      SELECT cs.*, c.codigo_caja, c.nombre_caja, COALESCE(c.estado, true) AS caja_estado,
+             COALESCE(c.permite_auxiliares, true) AS permite_auxiliares, s.nombre_sucursal,
              estado.codigo AS estado_codigo, estado.nombre AS estado_nombre,
              ua.nombre_usuario AS apertura_usuario,
              COALESCE(NULLIF(TRIM(CONCAT_WS(' ', per_apertura.nombre, per_apertura.apellido)), ''), ua.nombre_usuario) AS apertura_nombre,
@@ -6174,6 +6175,9 @@ router.post('/ventas/cajas/sesiones/:id/auto-auxiliar', checkPermission(['VENTAS
     if (!(await requestIsSuperAdminReal(client, req))) {
       throw createCajaError(403, 'VENTAS_CAJAS_ROLE_FORBIDDEN', 'Accion exclusiva para SUPER_ADMIN.');
     }
+    if (!(await requestHasAnyPermission(req, 'VENTAS_CREAR', client))) {
+      throw createCajaError(403, 'VENTAS_CAJAS_PERMISSION_FORBIDDEN', 'No tiene permiso para crear ventas.');
+    }
 
     const scopeContext = await getScopeContext(req, client, idSucursal, true);
     assertSucursalAllowed(scopeContext, idSucursal);
@@ -6181,6 +6185,9 @@ router.post('/ventas/cajas/sesiones/:id/auto-auxiliar', checkPermission(['VENTAS
     const session = await ensureOpenSession(client, idSesionCaja, { forUpdate: true });
     if (!parseBooleanish(session.caja_estado)) {
       throw createCajaError(409, 'VENTAS_CAJAS_CAJA_INACTIVA', 'La caja de la sesion seleccionada no esta activa.');
+    }
+    if (!parseBooleanish(session.permite_auxiliares)) {
+      throw createCajaError(409, 'VENTAS_CAJAS_AUXILIAR_FORBIDDEN', 'La caja seleccionada no permite auxiliares.');
     }
     if (Number(session.id_sucursal) !== Number(idSucursal)) {
       throw createCajaError(409, 'VENTAS_CAJAS_SCOPE_MISMATCH', 'La caja seleccionada no pertenece a la sucursal de la venta.');
@@ -6206,7 +6213,6 @@ router.post('/ventas/cajas/sesiones/:id/auto-auxiliar', checkPermission(['VENTAS
     );
 
     if (existingResult.rowCount === 0) {
-      await assertUsersNotInAnotherOpenSession(client, [idUsuario], { excludeSessionId: idSesionCaja });
       const inactiveResult = await client.query(
         `
           SELECT id_participacion_caja
@@ -6241,6 +6247,8 @@ router.post('/ventas/cajas/sesiones/:id/auto-auxiliar', checkPermission(['VENTAS
               id_sesion_caja, id_usuario, id_rol_participacion_caja, fecha_inicio, activo, observacion, fecha_creacion, fecha_actualizacion
             )
             VALUES ($1, $2, $3, NOW(), true, $4, NOW(), NOW())
+            ON CONFLICT (id_sesion_caja, id_usuario) WHERE activo IS TRUE
+            DO NOTHING
           `,
           [idSesionCaja, idUsuario, roleAuxiliarId, 'Autoasignacion operativa desde modulo de ventas para procesar venta.']
         );

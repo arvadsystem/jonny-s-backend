@@ -740,7 +740,6 @@ const fetchCajaBootstrapOperationalState = async ({ idUsuario, idSucursal = null
         WHERE (
             cs.id_usuario_responsable = $1
             OR participante.id_participacion_caja IS NOT NULL
-            OR $3::boolean = true
             OR EXISTS (
               SELECT 1
               FROM public.cajas_usuarios_autorizados autorizacion_operativa
