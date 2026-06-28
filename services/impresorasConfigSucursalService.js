@@ -6,10 +6,17 @@ const VALID_WIDTHS = new Set([58, 80]);
 const VALID_PRINT_MODES = ['BROWSER', 'QZ_HTML', 'QZ_RAW'];
 const VALID_PRINT_MODES_SET = new Set(VALID_PRINT_MODES);
 const DEFAULT_PRINT_MODE = 'BROWSER';
+const DEFAULT_DETECTED_PRINT_MODE = 'QZ_HTML';
 const DEFAULT_PRINT_PORT = 9100;
 const DEFAULT_LOGICAL_NAMES = Object.freeze({
   FACTURA: 'FACTURA',
   COCINA: 'COCINA'
+});
+const DETECTION_RESULT_STATUS = Object.freeze({
+  CONFIGURADO: 'CONFIGURADO',
+  YA_CONFIGURADO: 'YA_CONFIGURADO',
+  REQUIERE_CONFIGURACION_ADMIN: 'REQUIERE_CONFIGURACION_ADMIN',
+  NO_DETECTADO: 'NO_DETECTADO'
 });
 
 class ServiceError extends Error {
@@ -36,6 +43,13 @@ const trimUpperOrNull = (value) => {
   const normalized = trimOrNull(value);
   return normalized ? normalized.toUpperCase() : null;
 };
+
+const normalizePrinterToken = (value) =>
+  String(value || '')
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, ' ')
+    .replace(/[^a-z0-9]+/g, '');
 
 const normalizeBoolean = (value) => {
   if (typeof value === 'boolean') return value;
@@ -101,6 +115,206 @@ const mergePrinterRows = (idSucursal, rows = []) => {
   );
 
   return VALID_TIPOS.map((tipo) => byType.get(tipo) || buildDefaultPrinter(idSucursal, tipo));
+};
+
+const normalizeDetectedPrinters = (rawList = []) => {
+  if (!Array.isArray(rawList)) {
+    throw new ServiceError('impresoras_detectadas debe ser un arreglo.', 400);
+  }
+
+  const uniqueByToken = new Map();
+  for (const rawItem of rawList) {
+    const normalized = trimOrNull(rawItem);
+    if (!normalized) continue;
+    if (normalized.length > 160) {
+      throw new ServiceError('El nombre de una impresora detectada excede 160 caracteres.', 400);
+    }
+    const token = normalizePrinterToken(normalized);
+    if (!token || uniqueByToken.has(token)) continue;
+    uniqueByToken.set(token, normalized);
+  }
+
+  return [...uniqueByToken.values()];
+};
+
+const isActivePrinterRow = (row) =>
+  Boolean(row && row.activa !== false);
+
+const findLatestPrinterRow = (rows = [], predicate) =>
+  rows.find((row) => predicate(row)) || null;
+
+const printerMatchesDetectedSet = (row, detectedTokens) => {
+  if (!row || !isActivePrinterRow(row)) return false;
+  const token = normalizePrinterToken(row.nombre_impresora_sistema);
+  return Boolean(token && detectedTokens.has(token));
+};
+
+const getPrinterRowsForCajaDetection = async (idSucursal, idCaja, db = pool) => {
+  const result = await db.query(
+    `
+      SELECT
+        id_impresora,
+        id_sucursal,
+        id_caja,
+        tipo_impresora,
+        nombre_logico,
+        nombre_impresora_sistema,
+        ip_impresora,
+        puerto_impresora,
+        ancho_mm,
+        modo_impresion,
+        activa,
+        updated_at
+      FROM public.configuracion_impresoras
+      WHERE id_sucursal = $1
+        AND tipo_impresora = ANY($2::text[])
+        AND (
+          id_caja IS NULL
+          OR id_caja = $3
+        )
+      ORDER BY
+        tipo_impresora ASC,
+        CASE WHEN id_caja = $3 THEN 0 ELSE 1 END ASC,
+        activa DESC,
+        updated_at DESC NULLS LAST,
+        id_impresora DESC
+    `,
+    [idSucursal, VALID_TIPOS, idCaja]
+  );
+
+  return result.rows.map(sanitizePrinterRow);
+};
+
+const resolveDetectionTypeRows = (rows = [], idCaja, tipo) => {
+  const typedRows = rows.filter((row) => row.tipo_impresora === tipo);
+  return {
+    specific: findLatestPrinterRow(typedRows, (row) => Number(row.id_caja || 0) === Number(idCaja)),
+    global: findLatestPrinterRow(typedRows, (row) => row.id_caja == null)
+  };
+};
+
+const resolveUpsertPrinterPayload = ({
+  tipo,
+  currentSpecific,
+  sourceRow,
+  printerName
+}) => ({
+  nombre_logico: currentSpecific?.nombre_logico || sourceRow?.nombre_logico || DEFAULT_LOGICAL_NAMES[tipo],
+  nombre_impresora_sistema: printerName,
+  ip_impresora: sourceRow?.ip_impresora || currentSpecific?.ip_impresora || null,
+  puerto_impresora: Number(sourceRow?.puerto_impresora || currentSpecific?.puerto_impresora || DEFAULT_PRINT_PORT) || DEFAULT_PRINT_PORT,
+  ancho_mm: VALID_WIDTHS.has(Number(sourceRow?.ancho_mm))
+    ? Number(sourceRow.ancho_mm)
+    : VALID_WIDTHS.has(Number(currentSpecific?.ancho_mm))
+      ? Number(currentSpecific.ancho_mm)
+      : 80,
+  modo_impresion: VALID_PRINT_MODES_SET.has(String(currentSpecific?.modo_impresion || '').trim().toUpperCase())
+    ? String(currentSpecific.modo_impresion).trim().toUpperCase()
+    : VALID_PRINT_MODES_SET.has(String(sourceRow?.modo_impresion || '').trim().toUpperCase())
+      ? String(sourceRow.modo_impresion).trim().toUpperCase()
+      : DEFAULT_DETECTED_PRINT_MODE,
+  activa: true
+});
+
+const upsertCajaPrinterConfig = async ({
+  client,
+  idSucursal,
+  idCaja,
+  tipo,
+  currentSpecific,
+  sourceRow,
+  printerName
+}) => {
+  const payload = resolveUpsertPrinterPayload({
+    tipo,
+    currentSpecific,
+    sourceRow,
+    printerName
+  });
+
+  if (currentSpecific?.id_impresora) {
+    const result = await client.query(
+      `
+        UPDATE public.configuracion_impresoras
+        SET
+          nombre_logico = $1,
+          nombre_impresora_sistema = $2,
+          ip_impresora = $3,
+          puerto_impresora = $4,
+          ancho_mm = $5,
+          modo_impresion = $6,
+          activa = true,
+          updated_at = now()
+        WHERE id_impresora = $7
+        RETURNING
+          id_impresora,
+          id_sucursal,
+          id_caja,
+          tipo_impresora,
+          nombre_logico,
+          nombre_impresora_sistema,
+          ip_impresora,
+          puerto_impresora,
+          ancho_mm,
+          modo_impresion,
+          activa,
+          updated_at
+      `,
+      [
+        payload.nombre_logico,
+        payload.nombre_impresora_sistema,
+        payload.ip_impresora,
+        payload.puerto_impresora,
+        payload.ancho_mm,
+        payload.modo_impresion,
+        currentSpecific.id_impresora
+      ]
+    );
+    return sanitizePrinterRow(result.rows[0]);
+  }
+
+  const result = await client.query(
+    `
+      INSERT INTO public.configuracion_impresoras (
+        id_sucursal,
+        id_caja,
+        tipo_impresora,
+        nombre_logico,
+        nombre_impresora_sistema,
+        ip_impresora,
+        puerto_impresora,
+        ancho_mm,
+        modo_impresion,
+        activa
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, true)
+      RETURNING
+        id_impresora,
+        id_sucursal,
+        id_caja,
+        tipo_impresora,
+        nombre_logico,
+        nombre_impresora_sistema,
+        ip_impresora,
+        puerto_impresora,
+        ancho_mm,
+        modo_impresion,
+        activa,
+        updated_at
+    `,
+    [
+      idSucursal,
+      idCaja,
+      tipo,
+      payload.nombre_logico,
+      payload.nombre_impresora_sistema,
+      payload.ip_impresora,
+      payload.puerto_impresora,
+      payload.ancho_mm,
+      payload.modo_impresion
+    ]
+  );
+  return sanitizePrinterRow(result.rows[0]);
 };
 
 const getPrinterRowsBySucursal = async (idSucursal, db = pool) => {
@@ -393,9 +607,187 @@ export const actualizarConfiguracionImpresorasPorSucursal = async (idSucursal, p
   }
 };
 
+export const registrarDeteccionImpresorasPorCaja = async ({
+  idSucursal,
+  idCaja,
+  impresorasDetectadas = [],
+  db = pool
+}) => {
+  const idSucursalNum = asPositiveInt(idSucursal);
+  const idCajaNum = asPositiveInt(idCaja);
+  if (!idSucursalNum) {
+    throw new ServiceError('El id_sucursal es invalido.', 400);
+  }
+  if (!idCajaNum) {
+    throw new ServiceError('El id_caja es invalido.', 400);
+  }
+
+  const detectedPrinters = normalizeDetectedPrinters(impresorasDetectadas);
+  const detectedTokens = new Set(detectedPrinters.map(normalizePrinterToken).filter(Boolean));
+
+  await ensureSucursalExists(idSucursalNum, db);
+
+  if (detectedPrinters.length === 0) {
+    return {
+      status: DETECTION_RESULT_STATUS.NO_DETECTADO,
+      detected_printers: [],
+      runtime: await obtenerConfiguracionImpresorasRuntime({
+        idSucursal: idSucursalNum,
+        idCaja: idCajaNum,
+        db
+      }),
+      summary: {
+        configured_count: 0,
+        already_configured_count: 0,
+        requires_admin_count: 0
+      },
+      assignments: []
+    };
+  }
+
+  const client = db && typeof db.connect === 'function' ? await db.connect() : null;
+  const queryClient = client || db;
+  let txOpen = false;
+
+  try {
+    if (client) {
+      await client.query('BEGIN');
+      txOpen = true;
+    }
+
+    const rows = await getPrinterRowsForCajaDetection(idSucursalNum, idCajaNum, queryClient);
+    const assignments = [];
+    let configuredCount = 0;
+    let alreadyConfiguredCount = 0;
+    let requiresAdminCount = 0;
+
+    for (const tipo of VALID_TIPOS) {
+      const { specific, global } = resolveDetectionTypeRows(rows, idCajaNum, tipo);
+      const relevant = tipo === 'FACTURA'
+        || Boolean(
+          trimOrNull(global?.nombre_impresora_sistema)
+          || trimOrNull(specific?.nombre_impresora_sistema)
+        );
+
+      if (!relevant) {
+        assignments.push({
+          tipo_impresora: tipo,
+          status: 'NO_REQUERIDA',
+          assigned_printer_name: specific?.nombre_impresora_sistema || global?.nombre_impresora_sistema || null,
+          source: specific?.id_caja ? 'CAJA' : global ? 'GLOBAL' : null
+        });
+        continue;
+      }
+
+      if (printerMatchesDetectedSet(specific, detectedTokens)) {
+        alreadyConfiguredCount += 1;
+        assignments.push({
+          tipo_impresora: tipo,
+          status: DETECTION_RESULT_STATUS.YA_CONFIGURADO,
+          assigned_printer_name: specific.nombre_impresora_sistema,
+          source: 'CAJA',
+          id_impresora: specific.id_impresora
+        });
+        continue;
+      }
+
+      if (printerMatchesDetectedSet(global, detectedTokens)) {
+        const updated = await upsertCajaPrinterConfig({
+          client: queryClient,
+          idSucursal: idSucursalNum,
+          idCaja: idCajaNum,
+          tipo,
+          currentSpecific: specific,
+          sourceRow: global,
+          printerName: global.nombre_impresora_sistema
+        });
+        configuredCount += 1;
+        assignments.push({
+          tipo_impresora: tipo,
+          status: DETECTION_RESULT_STATUS.CONFIGURADO,
+          assigned_printer_name: updated.nombre_impresora_sistema,
+          source: 'GLOBAL_MATCH',
+          id_impresora: updated.id_impresora
+        });
+        continue;
+      }
+
+      if (tipo === 'FACTURA' && detectedPrinters.length === 1) {
+        const updated = await upsertCajaPrinterConfig({
+          client: queryClient,
+          idSucursal: idSucursalNum,
+          idCaja: idCajaNum,
+          tipo,
+          currentSpecific: specific,
+          sourceRow: global,
+          printerName: detectedPrinters[0]
+        });
+        configuredCount += 1;
+        assignments.push({
+          tipo_impresora: tipo,
+          status: DETECTION_RESULT_STATUS.CONFIGURADO,
+          assigned_printer_name: updated.nombre_impresora_sistema,
+          source: 'SINGLE_PRINTER',
+          id_impresora: updated.id_impresora
+        });
+        continue;
+      }
+
+      requiresAdminCount += 1;
+      assignments.push({
+        tipo_impresora: tipo,
+        status: DETECTION_RESULT_STATUS.REQUIERE_CONFIGURACION_ADMIN,
+        assigned_printer_name: specific?.nombre_impresora_sistema || global?.nombre_impresora_sistema || null,
+        source: null
+      });
+    }
+
+    const runtime = await obtenerConfiguracionImpresorasRuntime({
+      idSucursal: idSucursalNum,
+      idCaja: idCajaNum,
+      db: queryClient
+    });
+
+    if (txOpen) {
+      await queryClient.query('COMMIT');
+      txOpen = false;
+    }
+
+    const overallStatus = configuredCount > 0
+      ? (requiresAdminCount > 0
+        ? DETECTION_RESULT_STATUS.REQUIERE_CONFIGURACION_ADMIN
+        : DETECTION_RESULT_STATUS.CONFIGURADO)
+      : alreadyConfiguredCount > 0 && requiresAdminCount === 0
+        ? DETECTION_RESULT_STATUS.YA_CONFIGURADO
+        : requiresAdminCount > 0
+          ? DETECTION_RESULT_STATUS.REQUIERE_CONFIGURACION_ADMIN
+          : DETECTION_RESULT_STATUS.NO_DETECTADO;
+
+    return {
+      status: overallStatus,
+      detected_printers: detectedPrinters,
+      runtime,
+      summary: {
+        configured_count: configuredCount,
+        already_configured_count: alreadyConfiguredCount,
+        requires_admin_count: requiresAdminCount
+      },
+      assignments
+    };
+  } catch (error) {
+    if (txOpen) {
+      try { await queryClient.query('ROLLBACK'); } catch {}
+    }
+    throw error;
+  } finally {
+    if (client) client.release();
+  }
+};
+
 export const ImpresorasConfigSucursalService = Object.freeze({
   ServiceError,
   obtenerConfiguracionImpresorasPorSucursal,
   obtenerConfiguracionImpresorasRuntime,
-  actualizarConfiguracionImpresorasPorSucursal
+  actualizarConfiguracionImpresorasPorSucursal,
+  registrarDeteccionImpresorasPorCaja
 });

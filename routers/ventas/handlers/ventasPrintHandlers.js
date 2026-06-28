@@ -1,6 +1,8 @@
 import pool from '../../../config/db-connection.js';
 import {
-  obtenerConfiguracionImpresorasRuntime
+  ImpresorasConfigSucursalService,
+  obtenerConfiguracionImpresorasRuntime,
+  registrarDeteccionImpresorasPorCaja
 } from '../../../services/impresorasConfigSucursalService.js';
 import { buildVentaDetailPayload } from './ventasReadHandlers.js';
 import {
@@ -15,6 +17,7 @@ import {
   signQzMessage
 } from '../services/qzTraySigningService.js';
 import { parsePositiveInt } from '../utils/parseUtils.js';
+import { resolveRequestUserSucursalScope } from '../../../utils/sucursalScope.js';
 
 const sendVentasInternalError = (
   res,
@@ -60,6 +63,131 @@ const hasColumn = async (client, tableName, columnName) => {
   const exists = result.rowCount > 0;
   schemaLookupCache.set(key, exists);
   return exists;
+};
+
+const DETECTION_ORIGIN_MAX_LENGTH = 60;
+
+const normalizeRoleSet = (roles = []) =>
+  new Set(
+    (Array.isArray(roles) ? roles : [])
+      .map((role) => String(role || '').trim().replace(/[\s-]+/g, '_').toUpperCase())
+      .filter(Boolean)
+  );
+
+const normalizeDetectionOrigin = (value) => {
+  const normalized = String(value || '').trim().toUpperCase();
+  if (!normalized) return 'MANUAL';
+  return normalized.slice(0, DETECTION_ORIGIN_MAX_LENGTH);
+};
+
+const normalizeDetectedPrintersPayload = (value) => {
+  if (!Array.isArray(value)) {
+    return { ok: false, message: 'impresoras_detectadas debe ser un arreglo.' };
+  }
+
+  const unique = new Map();
+  for (const rawItem of value) {
+    const normalized = String(rawItem || '').trim();
+    if (!normalized) continue;
+    if (normalized.length > 160) {
+      return { ok: false, message: 'El nombre de una impresora detectada excede 160 caracteres.' };
+    }
+    const token = normalized.toLowerCase();
+    if (!unique.has(token)) unique.set(token, normalized);
+  }
+
+  return { ok: true, value: [...unique.values()] };
+};
+
+const validateDeviceDetectionSessionScope = async ({
+  client,
+  req,
+  idSucursal,
+  idCaja,
+  idSesionCaja
+}) => {
+  const scope = await resolveRequestUserSucursalScope(req, client);
+  const roleSet = normalizeRoleSet(req.user?.roles);
+  const isSuperAdmin = Boolean(scope.isSuperAdmin || roleSet.has('SUPER_ADMIN'));
+  const actorUserId = Number(req.user?.id_usuario || 0) || null;
+
+  if (!actorUserId) {
+    throw new ImpresorasConfigSucursalService.ServiceError('Sesion invalida.', 401);
+  }
+
+  if (!isSuperAdmin && !scope.allowedSucursalIds.includes(idSucursal)) {
+    throw new ImpresorasConfigSucursalService.ServiceError(
+      'No tienes permiso para operar esta sucursal.',
+      403
+    );
+  }
+
+  const sessionResult = await client.query(
+    `
+      SELECT
+        cs.id_sesion_caja,
+        cs.id_caja,
+        cs.id_sucursal,
+        cs.id_usuario_responsable,
+        cs.fecha_cierre,
+        c.estado AS caja_activa,
+        UPPER(TRIM(st.codigo)) AS estado_codigo,
+        EXISTS (
+          SELECT 1
+          FROM public.cajas_sesiones_participantes csp
+          WHERE csp.id_sesion_caja = cs.id_sesion_caja
+            AND csp.id_usuario = $4
+            AND COALESCE(csp.activo, true) = true
+        ) AS actor_participa
+      FROM public.cajas_sesiones cs
+      INNER JOIN public.cajas c
+        ON c.id_caja = cs.id_caja
+      INNER JOIN public.cat_cajas_sesiones_estados st
+        ON st.id_estado_sesion_caja = cs.id_estado_sesion_caja
+      WHERE cs.id_sesion_caja = $1
+        AND cs.id_caja = $2
+        AND cs.id_sucursal = $3
+      LIMIT 1
+    `,
+    [idSesionCaja, idCaja, idSucursal, actorUserId]
+  );
+
+  if (sessionResult.rowCount === 0) {
+    throw new ImpresorasConfigSucursalService.ServiceError(
+      'La sesion de caja no coincide con la caja y sucursal enviadas.',
+      409
+    );
+  }
+
+  const session = sessionResult.rows[0];
+  const isOpen = session.estado_codigo === 'ABIERTA' && !session.fecha_cierre;
+  if (!isOpen) {
+    throw new ImpresorasConfigSucursalService.ServiceError(
+      'La sesion de caja no esta abierta.',
+      409
+    );
+  }
+  if (session.caja_activa === false) {
+    throw new ImpresorasConfigSucursalService.ServiceError(
+      'La caja indicada no esta activa.',
+      409
+    );
+  }
+
+  const actorCanOperate = isSuperAdmin
+    || Number(session.id_usuario_responsable || 0) === actorUserId
+    || Boolean(session.actor_participa);
+  if (!actorCanOperate) {
+    throw new ImpresorasConfigSucursalService.ServiceError(
+      'No participas en la sesion de caja indicada.',
+      403
+    );
+  }
+
+  return {
+    actorUserId,
+    isSuperAdmin
+  };
 };
 
 const toKitchenExtras = (extras = []) =>
@@ -415,6 +543,67 @@ export const getVentasPrinterConfigHandler = async (req, res) => {
   } catch (error) {
     console.error('Error al obtener configuracion runtime de impresoras:', error);
     return sendVentasInternalError(res, 'No se pudo obtener la configuracion de impresion.');
+  }
+};
+
+export const createVentasPrinterDeviceDetectionHandler = async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const idSucursal = parsePositiveInt(req.body?.id_sucursal);
+    const idCaja = parsePositiveInt(req.body?.id_caja);
+    const idSesionCaja = parsePositiveInt(req.body?.id_sesion_caja);
+    const normalizedPrinters = normalizeDetectedPrintersPayload(req.body?.impresoras_detectadas);
+
+    if (!idSucursal || !idCaja || !idSesionCaja) {
+      return res.status(400).json({
+        error: true,
+        message: 'id_sucursal, id_caja e id_sesion_caja son obligatorios.'
+      });
+    }
+    if (!normalizedPrinters.ok) {
+      return res.status(400).json({ error: true, message: normalizedPrinters.message });
+    }
+
+    await validateDeviceDetectionSessionScope({
+      client,
+      req,
+      idSucursal,
+      idCaja,
+      idSesionCaja
+    });
+
+    const result = await registrarDeteccionImpresorasPorCaja({
+      idSucursal,
+      idCaja,
+      impresorasDetectadas: normalizedPrinters.value,
+      db: client
+    });
+
+    const statusCode = result.status === 'NO_DETECTADO' ? 200 : 200;
+    return res.status(statusCode).json({
+      ok: true,
+      status: result.status,
+      origen: normalizeDetectionOrigin(req.body?.origen),
+      id_sucursal: idSucursal,
+      id_caja: idCaja,
+      id_sesion_caja: idSesionCaja,
+      impresoras_detectadas: result.detected_printers,
+      summary: result.summary,
+      assignments: result.assignments,
+      runtime: result.runtime
+    });
+  } catch (error) {
+    if (error instanceof ImpresorasConfigSucursalService.ServiceError) {
+      return res.status(error.status || 500).json({
+        error: true,
+        message: error.message,
+        details: error.details || null
+      });
+    }
+    console.error('Error al registrar deteccion operativa de impresoras:', error);
+    return sendVentasInternalError(res, 'No se pudo validar la deteccion de impresoras.');
+  } finally {
+    client.release();
   }
 };
 
