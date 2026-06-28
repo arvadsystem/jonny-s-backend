@@ -2416,7 +2416,7 @@ const insertAssignedAuxiliariesIntoSession = async ({
           id_sesion_caja, id_usuario, id_rol_participacion_caja,
           fecha_inicio, activo, observacion, fecha_creacion, fecha_actualizacion
         )
-        VALUES ($1, $2, $3, NOW(), true, $4, NOW(), NOW())
+        VALUES ($1, $2, $3, (now() AT TIME ZONE 'America/Tegucigalpa'), true, $4, NOW(), NOW())
         ON CONFLICT (id_sesion_caja, id_usuario) WHERE activo IS TRUE
         DO NOTHING
       `,
@@ -2508,7 +2508,7 @@ const insertSessionParticipant = async ({
         id_sesion_caja, id_usuario, id_rol_participacion_caja,
         fecha_inicio, activo, observacion, fecha_creacion, fecha_actualizacion
       )
-      VALUES ($1, $2, $3, NOW(), true, $4, NOW(), NOW())
+      VALUES ($1, $2, $3, (now() AT TIME ZONE 'America/Tegucigalpa'), true, $4, NOW(), NOW())
       ON CONFLICT (id_sesion_caja, id_usuario) WHERE activo IS TRUE
       DO NOTHING
     `,
@@ -4723,7 +4723,7 @@ const createOpenSessionTransaction = async ({
       INSERT INTO public.cajas_sesiones_participantes (
         id_sesion_caja, id_usuario, id_rol_participacion_caja, fecha_inicio, activo, observacion, fecha_creacion, fecha_actualizacion
       )
-      VALUES ($1, $2, $3, NOW(), true, $4, NOW(), NOW())
+      VALUES ($1, $2, $3, (now() AT TIME ZONE 'America/Tegucigalpa'), true, $4, NOW(), NOW())
       ON CONFLICT (id_sesion_caja, id_usuario) WHERE activo IS TRUE
       DO NOTHING
     `,
@@ -5358,7 +5358,7 @@ const closeSessionHandler = async (req, res) => {
     await client.query(
       `
         UPDATE public.cajas_sesiones_participantes
-        SET activo = false, fecha_fin = NOW(), fecha_actualizacion = NOW()
+        SET activo = false, fecha_fin = (now() AT TIME ZONE 'America/Tegucigalpa'), fecha_actualizacion = NOW()
         WHERE id_sesion_caja = $1 AND COALESCE(activo, true) = true
       `,
       [idSesionCaja]
@@ -6147,7 +6147,7 @@ router.post('/ventas/cajas/sesiones/:id/participantes', checkPermission(['VENTAS
         INSERT INTO public.cajas_sesiones_participantes (
           id_sesion_caja, id_usuario, id_rol_participacion_caja, fecha_inicio, activo, observacion, fecha_creacion, fecha_actualizacion
         )
-        VALUES ($1, $2, $3, NOW(), true, $4, NOW(), NOW())
+        VALUES ($1, $2, $3, (now() AT TIME ZONE 'America/Tegucigalpa'), true, $4, NOW(), NOW())
         RETURNING id_participacion_caja
       `,
       [idSesionCaja, idUsuarioParticipante, idRolParticipacion, observacion]
@@ -6305,7 +6305,7 @@ const inactivateParticipantHandler = async ({ req, res, byUserId = false }) => {
     }
 
     await client.query(
-      `UPDATE public.cajas_sesiones_participantes SET activo = false, fecha_fin = NOW(), fecha_actualizacion = NOW() WHERE id_participacion_caja = $1`,
+      `UPDATE public.cajas_sesiones_participantes SET activo = false, fecha_fin = (now() AT TIME ZONE 'America/Tegucigalpa'), fecha_actualizacion = NOW() WHERE id_participacion_caja = $1`,
       [participant.id_participacion_caja]
     );
     await client.query('COMMIT');
