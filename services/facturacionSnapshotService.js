@@ -123,6 +123,19 @@ const getLogoMimeType = (filePath, fallback = 'image/png') => {
   return LOGO_MIME_BY_EXTENSION[extension] || fallback;
 };
 
+const fetchSignedLogoBuffer = async (signedUrl, filePath) => {
+  const response = await fetch(signedUrl);
+  if (!response.ok) {
+    throw new Error(`signed logo fetch failed (${response.status})`);
+  }
+
+  const buffer = Buffer.from(await response.arrayBuffer());
+  return {
+    buffer,
+    mimeType: response.headers.get('content-type') || getLogoMimeType(filePath)
+  };
+};
+
 const resolveLogoDisplayAsset = async (rawValue) => {
   const normalized = toNullableText(rawValue);
   if (!normalized) return { url: null, dataUrl: null };
@@ -152,6 +165,23 @@ const resolveLogoDisplayAsset = async (rawValue) => {
 
   if (downloadError || !logoFile || typeof logoFile.arrayBuffer !== 'function') {
     console.warn('[facturacion-snapshot] logo download warning:', downloadError?.message || 'missing logo file');
+
+    if (signedUrl) {
+      try {
+        const signedLogo = await fetchSignedLogoBuffer(signedUrl, storagePath.filePath);
+        if (signedLogo.buffer.length && signedLogo.buffer.length <= MAX_LOGO_DATA_URL_BYTES) {
+          const asset = {
+            url: signedUrl,
+            dataUrl: `data:${signedLogo.mimeType};base64,${signedLogo.buffer.toString('base64')}`
+          };
+          logoAssetCache.set(cacheKey, { asset, expiresAt: Date.now() + LOGO_ASSET_CACHE_TTL_MS });
+          return asset;
+        }
+      } catch (signedFetchError) {
+        console.warn('[facturacion-snapshot] logo signed fetch warning:', signedFetchError?.message || 'signed fetch failed');
+      }
+    }
+
     const asset = { url: signedUrl, dataUrl: null };
     logoAssetCache.set(cacheKey, { asset, expiresAt: Date.now() + LOGO_ASSET_CACHE_TTL_MS });
     return asset;
