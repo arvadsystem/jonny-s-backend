@@ -15,6 +15,20 @@ const addToMapTotal = (map, id, amount) => {
   map.set(id, current + Number(amount || 0));
 };
 
+const addMovementRow = (rows, row) => {
+  const quantity = Number(row?.cantidad || 0);
+  const idDetallePedido = toPositiveInt(row?.id_detalle_pedido);
+  if (!Number.isFinite(quantity) || quantity <= 0 || !idDetallePedido) return;
+  rows.push({
+    tipo_recurso: row.tipo_recurso,
+    id_producto: toPositiveInt(row.id_producto) || null,
+    id_insumo: toPositiveInt(row.id_insumo) || null,
+    id_detalle_pedido: idDetallePedido,
+    cantidad: quantity,
+    origen_consumo: String(row.origen_consumo || '').trim().toUpperCase() || null
+  });
+};
+
 const mapById = (rows, fieldName) => {
   const map = new Map();
   for (const row of rows || []) {
@@ -33,6 +47,7 @@ const addContext = (map, id, item) => {
     id_receta: toPositiveInt(item?.id_receta) || null,
     id_extra: toPositiveInt(item?.id_extra) || null,
     id_insumo: toPositiveInt(item?.id_insumo) || null,
+    cantidad: Number(item?.cantidad || 0) > 0 ? Number(item.cantidad) : null,
     cant: Number(item?.cant || 0) > 0 ? Number(item.cant) : null,
     id_unidad_medida: toPositiveInt(item?.id_unidad_medida) || null,
     codigo: typeof item?.codigo === 'string' ? item.codigo.trim() || null : null,
@@ -132,11 +147,19 @@ export const resolvePedidoConsumo = async ({ client, items }) => {
   const productoContextById = new Map();
   const recetaContextById = new Map();
   const extraContextById = new Map();
+  const movimientoRows = [];
 
   for (const item of items) {
     if (item.tipo_item === ITEM_TYPES.PRODUCTO) {
       addToMapTotal(productoQtyMap, item.id_item, item.cantidad);
       addContext(productoContextById, item.id_item, item);
+      addMovementRow(movimientoRows, {
+        tipo_recurso: 'producto',
+        id_producto: item.id_item,
+        id_detalle_pedido: item.id_detalle_pedido,
+        cantidad: item.cantidad,
+        origen_consumo: 'PRODUCTO'
+      });
     }
     if (item.tipo_item === ITEM_TYPES.RECETA) {
       addToMapTotal(recetaQtyMap, item.id_item, item.cantidad);
@@ -163,6 +186,13 @@ export const resolvePedidoConsumo = async ({ client, items }) => {
       }
       insumoWarehouseById.set(idInsumo, idAlmacen);
       addToMapTotal(insumoQtyMap, idInsumo, item.cantidad);
+      addMovementRow(movimientoRows, {
+        tipo_recurso: 'insumo',
+        id_insumo: idInsumo,
+        id_detalle_pedido: item.id_detalle_pedido,
+        cantidad: item.cantidad,
+        origen_consumo: 'SALSA'
+      });
       const trace = insumoTraceById.get(idInsumo) || {
         salsaIds: new Set(),
         detallePedidoIds: new Set(),
@@ -230,6 +260,13 @@ export const resolvePedidoConsumo = async ({ client, items }) => {
 
     if (hasSnapshotInventory) {
       addToMapTotal(insumoQtyMap, snapshotInsumoId, Number(extraQtyMap.get(idExtra) || 0) * snapshotFactor);
+      addMovementRow(movimientoRows, {
+        tipo_recurso: 'insumo',
+        id_insumo: snapshotInsumoId,
+        id_detalle_pedido: context.id_detalle_pedido,
+        cantidad: Number(extraQtyMap.get(idExtra) || 0) * snapshotFactor,
+        origen_consumo: 'EXTRA'
+      });
       continue;
     }
 
@@ -292,6 +329,13 @@ export const resolvePedidoConsumo = async ({ client, items }) => {
       continue;
     }
     addToMapTotal(insumoQtyMap, insumoId, Number(extraQtyMap.get(idExtra) || 0) * insumoFactor);
+    addMovementRow(movimientoRows, {
+      tipo_recurso: 'insumo',
+      id_insumo: insumoId,
+      id_detalle_pedido: context.id_detalle_pedido,
+      cantidad: Number(extraQtyMap.get(idExtra) || 0) * insumoFactor,
+      origen_consumo: 'EXTRA'
+    });
   }
 
   const allRecipeIds = [...recetaQtyMap.keys()].sort((a, b) => a - b);
@@ -327,6 +371,15 @@ export const resolvePedidoConsumo = async ({ client, items }) => {
     const recipeQty = Number(recetaQtyMap.get(idReceta) || 0);
     for (const component of components) {
       addToMapTotal(insumoQtyMap, component.id_insumo, recipeQty * Number(component.insumo_factor));
+      for (const context of recetaContextById.get(idReceta) || []) {
+        addMovementRow(movimientoRows, {
+          tipo_recurso: 'insumo',
+          id_insumo: component.id_insumo,
+          id_detalle_pedido: context.id_detalle_pedido,
+          cantidad: Number(context.cantidad || 0) * Number(component.insumo_factor),
+          origen_consumo: 'RECETA'
+        });
+      }
     }
   }
 
@@ -347,7 +400,8 @@ export const resolvePedidoConsumo = async ({ client, items }) => {
       productoQtyMap,
       recetaQtyMap,
       extraQtyMap,
-      insumoQtyMap
+      insumoQtyMap,
+      movimientoRows
     },
     contexto: {
       recetasById,

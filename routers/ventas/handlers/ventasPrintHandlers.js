@@ -195,8 +195,9 @@ const toKitchenExtras = (extras = []) =>
     id_extra: Number(extra?.id_extra || 0) || null,
     nombre: String(extra?.nombre || extra?.nombre_extra || 'Extra').trim(),
     cantidad: Number(extra?.cantidad_por_orden ?? extra?.origen_snapshot?.cantidad_por_orden ?? extra?.cantidad ?? 0) || 0,
+    cantidad_por_orden: Number(extra?.cantidad_por_orden ?? extra?.origen_snapshot?.cantidad_por_orden ?? extra?.cantidad ?? 0) || 0,
     cantidad_total: Number(extra?.cantidad_total ?? extra?.origen_snapshot?.cantidad_total ?? extra?.cantidad ?? 0) || 0
-  }));
+  })).filter((entry) => entry.id_extra || entry.nombre);
 
 const toKitchenComplementos = (item = {}) => {
   const config = item?.configuracion_menu && typeof item.configuracion_menu === 'object'
@@ -221,14 +222,23 @@ const toKitchenComplementos = (item = {}) => {
           ? snapshot.complementos.seleccion
           : [];
   return componentes
-    .map((entry) => ({
-      id_complemento: Number(entry?.id_complemento || entry?.id_salsa || entry?.id || 0) || null,
-      nombre: String(entry?.nombre || entry?.nombre_salsa || entry?.label || 'Salsa').trim()
-    }))
+    .map((entry) => {
+      const rawName = String(entry?.nombre || entry?.nombre_salsa || entry?.label || '').trim();
+      const idComplemento = Number(entry?.id_complemento || entry?.id_salsa || entry?.id || 0) || null;
+      return {
+        id_complemento: idComplemento,
+        id_salsa: Number(entry?.id_salsa || entry?.id_complemento || entry?.id || 0) || null,
+        nombre: rawName || (idComplemento ? 'Salsa' : ''),
+        porciones_por_orden: Number(entry?.porciones_por_orden || entry?.cantidad_por_orden || entry?.inventario?.porciones_por_orden || entry?.inventario?.porciones || 1) || 1,
+        porciones_total: Number(entry?.porciones_total || entry?.cantidad_total || entry?.inventario?.porciones_total || entry?.inventario?.porciones || 0) || 0,
+        cantidad_base_por_porcion: Number(entry?.cantidad_base_por_porcion || entry?.inventario?.cantidad_base_por_porcion || 0) || null,
+        cantidad_base_total: Number(entry?.cantidad_base_total || entry?.inventario?.cantidad_base_total || 0) || null
+      };
+    })
     .filter((entry) => entry.id_complemento || entry.nombre);
 };
 
-const buildVentaKitchenPrintPayload = (venta = {}, printerConfig = null) => {
+export const buildVentaKitchenPrintPayload = (venta = {}, printerConfig = null) => {
   const cocinaConfig = (Array.isArray(printerConfig?.impresoras) ? printerConfig.impresoras : [])
     .find((item) => String(item?.tipo_impresora || '').trim().toUpperCase() === 'COCINA');
 

@@ -2091,6 +2091,14 @@ const resolveLineComplementos = ({ item, receta, context, nombreItem }) => {
     rules: context.rulesByRecipe.get(Number(item.id_receta || 0)) || [],
     fallbackSauces: context.fallbackSauces
   });
+  if (metadata.ok === false) {
+    return {
+      ok: false,
+      status: 409,
+      code: metadata.code || 'VENTAS_REGLA_SALSA_CONFIGURACION_INVALIDA',
+      message: metadata.message || `La receta ${nombreItem || 'seleccionada'} tiene reglas de salsas incompletas.`
+    };
+  }
 
   const selectedIds = Array.isArray(item.complementos) ? item.complementos : [];
   const allowedMap = new Map(
@@ -2127,11 +2135,12 @@ const resolveLineComplementos = ({ item, receta, context, nombreItem }) => {
   const min = Math.max(0, Number(metadata.minimo_complementos || 0));
   const max = Math.max(min, Number(metadata.maximo_complementos || 0));
   const complementosIncompletos = min > 0 && selected.length < min;
+  const allowIncomplete = false;
   const boundsResult = validateComplementSelectionBounds({
     selectedCount: selected.length,
     minimo: min,
     maximo: max,
-    allowIncomplete: item.complementos_incompletos_autorizados === true,
+    allowIncomplete,
     nombreItem
   });
   if (!boundsResult.ok) {
@@ -2150,7 +2159,8 @@ const resolveLineComplementos = ({ item, receta, context, nombreItem }) => {
     ok: true,
     metadata: {
       ...metadata,
-      complementos_incompletos_autorizados: Boolean(item.complementos_incompletos_autorizados),
+      complementos_incompletos_autorizados: Boolean(item.complementos_incompletos_solicitados),
+      complementos_incompletos_autorizados_backend: allowIncomplete,
       complementos_recomendados: min,
       complementos_seleccionados: selected.length,
       complementos_incompletos: complementosIncompletos
@@ -7582,6 +7592,7 @@ async function listarPedidosPendientesPago(req, res) {
               'id_cuenta_division_item', vdi.id_cuenta_division_item,
               'id_detalle_pedido', vdi.id_detalle_pedido,
               'nombre_item', vdi.nombre_item_snapshot,
+              'cantidad', vdi.cantidad,
               'total_linea', vdi.total_linea
             )
             ORDER BY vdi.id_cuenta_division_item

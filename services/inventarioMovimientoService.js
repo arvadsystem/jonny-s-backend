@@ -11,6 +11,18 @@ import { toPositiveInt } from './pedidoPayloadValidator.js';
 
 export const MOVEMENT_REF = 'PEDIDO';
 export const SHORTAGE_MOVEMENT_REF = 'FALTANTE_COCINA';
+const VALID_CONSUMPTION_ORIGINS = new Set(['PRODUCTO', 'RECETA', 'EXTRA', 'SALSA']);
+
+export const normalizeOrigenConsumo = (value) => {
+  const normalized = String(value || '').trim().toUpperCase();
+  if (!VALID_CONSUMPTION_ORIGINS.has(normalized)) {
+    const error = new Error(`origen_consumo invalido: ${normalized || 'N/D'}`);
+    error.httpStatus = 409;
+    error.code = 'ORIGEN_CONSUMO_INVALIDO';
+    throw error;
+  }
+  return normalized;
+};
 
 export const fetchExistingPedidoMovement = async (client, idPedido) => {
   const rs = await client.query(
@@ -26,6 +38,109 @@ export const fetchExistingPedidoMovement = async (client, idPedido) => {
   return rs.rows[0]?.id_movimiento ? Number(rs.rows[0].id_movimiento) : null;
 };
 
+export const fetchPedidoInventoryMovementsForUpdate = async (client, idPedido) => {
+  const rs = await client.query(
+    `
+      SELECT
+        id_movimiento,
+        cantidad,
+        id_almacen,
+        id_producto,
+        id_insumo,
+        id_detalle_pedido,
+        ref_origen,
+        origen_consumo
+      FROM public.movimientos_inventario
+      WHERE ref_origen = ANY($1::text[])
+        AND id_ref = $2
+        AND tipo = 'SALIDA'
+      ORDER BY id_movimiento
+      FOR UPDATE
+    `,
+    [[MOVEMENT_REF, SHORTAGE_MOVEMENT_REF], idPedido]
+  );
+  return rs.rows || [];
+};
+
+const resourceKeyForMovement = (row) => {
+  const idProducto = toPositiveInt(row?.id_producto);
+  const idInsumo = toPositiveInt(row?.id_insumo);
+  if (idProducto && idInsumo) return null;
+  if (idProducto) return `producto:${idProducto}`;
+  if (idInsumo) return `insumo:${idInsumo}`;
+  return null;
+};
+
+const movementIdentityKey = (row) => [
+  toPositiveInt(row?.id_detalle_pedido) || 0,
+  String(row?.ref_origen || MOVEMENT_REF).trim().toUpperCase(),
+  normalizeOrigenConsumo(row?.origen_consumo),
+  Number(row?.id_almacen || 0),
+  resourceKeyForMovement(row)
+].join('|');
+
+export const analyzePedidoMovementState = ({ expectedRows = [], existingRows = [] } = {}) => {
+  const expected = new Map();
+  for (const row of Array.isArray(expectedRows) ? expectedRows : []) {
+    const key = movementIdentityKey(row);
+    expected.set(key, { ...row, cantidad: Number(row.cantidad || 0) });
+  }
+
+  const existing = new Map();
+  const duplicates = new Set();
+  const invalidRows = [];
+  for (const row of Array.isArray(existingRows) ? existingRows : []) {
+    if (!toPositiveInt(row?.id_detalle_pedido) || !String(row?.origen_consumo || '').trim()) {
+      invalidRows.push(row);
+      continue;
+    }
+    const key = movementIdentityKey(row);
+    if (existing.has(key)) duplicates.add(key);
+    existing.set(key, { ...row, cantidad: Number(row.cantidad || 0) });
+  }
+
+  if (existing.size === 0 && invalidRows.length === 0) {
+    return { state: 'NONE', expectedCount: expected.size, existingCount: 0 };
+  }
+
+  const missing = [];
+  const mismatched = [];
+  for (const [key, row] of expected.entries()) {
+    const found = existing.get(key);
+    if (!found) {
+      missing.push(row);
+      continue;
+    }
+    if (Number(found.cantidad || 0).toFixed(6) !== Number(row.cantidad || 0).toFixed(6)) {
+      mismatched.push({ expected: row, existing: found });
+    }
+  }
+
+  const unexpected = [...existing.entries()]
+    .filter(([key]) => !expected.has(key))
+    .map(([, row]) => row);
+
+  if (!missing.length && !mismatched.length && !unexpected.length && duplicates.size === 0 && invalidRows.length === 0) {
+    return {
+      state: 'COMPLETE',
+      id_movimiento: Number(existing.values().next().value?.id_movimiento || 0) || null,
+      expectedCount: expected.size,
+      existingCount: existing.size
+    };
+  }
+
+  return {
+    state: 'PARTIAL',
+    expectedCount: expected.size,
+    existingCount: existing.size,
+    missing,
+    mismatched,
+    unexpected,
+    duplicates: [...duplicates],
+    invalidRows
+  };
+};
+
 const insertMovimiento = async (client, movement) => {
   await client.query(
     `
@@ -35,22 +150,109 @@ const insertMovimiento = async (client, movement) => {
         id_almacen,
         id_producto,
         id_insumo,
+        id_detalle_pedido,
+        origen_consumo,
         ref_origen,
         id_ref,
         descripcion
       )
-      VALUES ('SALIDA', $1, $2, $3, $4, $5, $6, $7)
+      VALUES ('SALIDA', $1, $2, $3, $4, $5, $6, $7, $8, $9)
     `,
     [
       Number(movement.cantidad),
       Number(movement.id_almacen),
       movement.id_producto ? Number(movement.id_producto) : null,
       movement.id_insumo ? Number(movement.id_insumo) : null,
+      movement.id_detalle_pedido ? Number(movement.id_detalle_pedido) : null,
+      movement.origen_consumo ? normalizeOrigenConsumo(movement.origen_consumo) : null,
       movement.ref_origen || MOVEMENT_REF,
       Number(movement.id_ref),
       String(movement.descripcion || '').trim() || null
     ]
   );
+};
+
+export const buildLineMovementRows = ({
+  movementRows = [],
+  productosById,
+  insumosById,
+  actorUserId,
+  idPedido,
+  refOrigen,
+  shortagesByResource
+}) => {
+  const merged = new Map();
+  for (const row of Array.isArray(movementRows) ? movementRows : []) {
+    const tipoRecurso = String(row?.tipo_recurso || '').trim().toLowerCase();
+    const idDetallePedido = toPositiveInt(row?.id_detalle_pedido);
+    const quantity = Number(row?.cantidad || 0);
+    if (!idDetallePedido || !Number.isFinite(quantity) || quantity <= 0) continue;
+
+    if (tipoRecurso === 'producto') {
+      const rowProducto = productosById.get(Number(row.id_producto || 0));
+      if (!rowProducto) continue;
+      const idProductoMovimiento = toPositiveInt(rowProducto?.id_producto_maestro) || toPositiveInt(rowProducto?.id_producto) || toPositiveInt(row.id_producto);
+      const key = [
+        refOrigen || MOVEMENT_REF,
+        idDetallePedido,
+        'producto',
+        idProductoMovimiento,
+        Number(rowProducto.id_almacen),
+        normalizeOrigenConsumo(row.origen_consumo || 'PRODUCTO')
+      ].join(':');
+      const existing = merged.get(key) || {
+        cantidad: 0,
+        id_almacen: Number(rowProducto.id_almacen),
+        id_producto: idProductoMovimiento,
+        id_insumo: null,
+        id_detalle_pedido: idDetallePedido,
+        ref_origen: refOrigen,
+        origen_consumo: normalizeOrigenConsumo(row.origen_consumo || 'PRODUCTO')
+      };
+      existing.cantidad += quantity;
+      merged.set(key, existing);
+    }
+
+    if (tipoRecurso === 'insumo') {
+      const rowInsumo = insumosById.get(Number(row.id_insumo || 0));
+      if (!rowInsumo) continue;
+      const idInsumoMovimiento = toPositiveInt(rowInsumo?.id_insumo_maestro) || toPositiveInt(rowInsumo?.id_insumo) || toPositiveInt(row.id_insumo);
+      const key = [
+        refOrigen || MOVEMENT_REF,
+        idDetallePedido,
+        'insumo',
+        idInsumoMovimiento,
+        Number(rowInsumo.id_almacen),
+        normalizeOrigenConsumo(row.origen_consumo || 'RECETA')
+      ].join(':');
+      const existing = merged.get(key) || {
+        cantidad: 0,
+        id_almacen: Number(rowInsumo.id_almacen),
+        id_producto: null,
+        id_insumo: idInsumoMovimiento,
+        id_detalle_pedido: idDetallePedido,
+        ref_origen: refOrigen,
+        origen_consumo: normalizeOrigenConsumo(row.origen_consumo || 'RECETA')
+      };
+      existing.cantidad += quantity;
+      merged.set(key, existing);
+    }
+  }
+
+  return [...merged.values()]
+    .sort((left, right) => (
+      Number(left.id_detalle_pedido) - Number(right.id_detalle_pedido)
+      || String(left.origen_consumo).localeCompare(String(right.origen_consumo))
+      || Number(left.id_producto || left.id_insumo || 0) - Number(right.id_producto || right.id_insumo || 0)
+    ))
+    .map((row) => {
+      const resourceKey = row.id_producto ? `producto:${row.id_producto}` : `insumo:${row.id_insumo}`;
+      const shortage = shortagesByResource.get(resourceKey) || null;
+      return {
+        ...row,
+        descripcion: `Descuento por pedido #${idPedido} linea #${row.id_detalle_pedido} (${row.id_producto ? `producto ${row.id_producto}` : `insumo ${row.id_insumo}`}; origen ${row.origen_consumo})${shortage ? ` - faltante auditado req:${shortage.requerido} disp:${shortage.disponible} deficit:${shortage.faltante}` : ''}${toPositiveInt(actorUserId) ? ` - usuario ${actorUserId}` : ''}`
+      };
+    });
 };
 
 export const registrarMovimientosPedido = async ({
@@ -62,9 +264,26 @@ export const registrarMovimientosPedido = async ({
   productosById,
   insumosById,
   insumoTraceById = new Map(),
+  movementRows = [],
   refOrigen = MOVEMENT_REF,
   shortagesByResource = new Map()
 }) => {
+  const lineMovementRows = buildLineMovementRows({
+    movementRows,
+    productosById,
+    insumosById,
+    actorUserId,
+    idPedido,
+    refOrigen,
+    shortagesByResource
+  });
+  if (lineMovementRows.length > 0) {
+    for (const row of lineMovementRows) {
+      await insertMovimiento(client, row);
+    }
+    return;
+  }
+
   const productoIds = [...productoQtyMap.keys()].sort((a, b) => a - b);
   const insumoIds = [...insumoQtyMap.keys()].sort((a, b) => a - b);
 

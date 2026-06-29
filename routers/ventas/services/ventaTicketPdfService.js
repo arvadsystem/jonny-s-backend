@@ -106,7 +106,9 @@ const normalizeSalsas = (item = {}) => {
     return directComplementos
       .map((entry, index) => ({
         key: `${entry?.id_complemento || entry?.id_salsa || index}-${index}`,
-        nombre: cleanText(entry?.nombre) || 'Salsa'
+        nombre: cleanText(entry?.nombre) || 'Salsa',
+        porciones_por_orden: toMoneyNumber(entry?.porciones_por_orden || entry?.cantidad_por_orden || entry?.inventario?.porciones_por_orden || entry?.inventario?.porciones || 1),
+        porciones_total: toMoneyNumber(entry?.porciones_total || entry?.cantidad_total || entry?.inventario?.porciones_total || 0)
       }))
       .filter((entry) => entry.nombre);
   }
@@ -116,7 +118,9 @@ const normalizeSalsas = (item = {}) => {
   return snapshotComponentes
     .map((entry, index) => ({
       key: `${entry?.id_complemento || entry?.id_salsa || index}-${index}`,
-      nombre: cleanText(entry?.nombre) || 'Salsa'
+      nombre: cleanText(entry?.nombre) || 'Salsa',
+      porciones_por_orden: toMoneyNumber(entry?.porciones_por_orden || entry?.cantidad_por_orden || entry?.inventario?.porciones_por_orden || entry?.inventario?.porciones || 1),
+      porciones_total: toMoneyNumber(entry?.porciones_total || entry?.cantidad_total || entry?.inventario?.porciones_total || 0)
     }))
     .filter((entry) => entry.nombre);
 };
@@ -268,7 +272,7 @@ const buildItemRows = (items = [], widthMm) => {
     rows.push([
       text(item.cantidad || 1),
       text(item.nombre_item || item.nombre_producto || 'Item'),
-      text(formatMoney(item.total_linea || item.sub_total), { alignment: 'right' })
+      text(formatMoney(item.total_linea ?? item.sub_total), { alignment: 'right' })
     ]);
 
     if (Array.isArray(item.extras)) {
@@ -279,27 +283,22 @@ const buildItemRows = (items = [], widthMm) => {
         const totalQty = toMoneyNumber(extra.cantidad_total || extra.cantidad || perOrderQty);
         rows.push([
           text(''),
-          text(`+ ${extra.nombre || extra.nombre_extra || 'Extra'} x${perOrderQty} por orden`, { fontSize: widthMm === 58 ? 5.5 : 6 }),
-          text(formatMoney(extra.subtotal || (toMoneyNumber(extra.precio_unitario) * toMoneyNumber(extra.cantidad || 1))), {
+        text(`Extra: ${extra.nombre || extra.nombre_extra || 'Extra'} ${perOrderQty} por orden - ${totalQty} total`, { fontSize: widthMm === 58 ? 5.5 : 6 }),
+          text(formatMoney(extra.subtotal ?? (toMoneyNumber(extra.precio_unitario) * toMoneyNumber(extra.cantidad || 1))), {
             alignment: 'right',
             fontSize: widthMm === 58 ? 5.5 : 6
           })
         ]);
-        if (totalQty !== perOrderQty) {
-          rows.push([
-            text(''),
-            text(`  Total extra: ${totalQty}`, { fontSize: widthMm === 58 ? 5 : 5.5 }),
-            text('', { alignment: 'right' })
-          ]);
-        }
       }
     }
 
     if (salsas.length > 0) {
       const salsaLabel = salsas.length === 1 ? 'Salsa' : 'Salsas';
+      const porOrden = salsas.reduce((sum, salsa) => sum + toMoneyNumber(salsa.porciones_por_orden || 0), 0) || salsas.length;
+      const total = salsas.reduce((sum, salsa) => sum + toMoneyNumber(salsa.porciones_total || 0), 0);
       rows.push([
         text(''),
-        text(`${salsaLabel}: ${salsas.map((salsa) => salsa.nombre).join(', ')}`, {
+        text(`${salsaLabel}: ${salsas.map((salsa) => salsa.nombre).join(', ')}${total > 0 ? ` ${porOrden} por orden - ${total} total` : ''}`, {
           fontSize: widthMm === 58 ? 5.5 : 6
         }),
         text('', { alignment: 'right' })
@@ -386,7 +385,7 @@ const buildDeliveryBlock = (venta, widthMm) => {
   ];
 };
 
-export const buildVentaTicketPdfBuffer = async (venta) => {
+export const buildVentaTicketPdfDefinition = (venta) => {
   const widthMm = resolveTicketWidth(venta);
   const heightMm = estimateHeightMm(venta);
   const ticket = venta?.facturacion?.ticket || {};
@@ -402,7 +401,7 @@ export const buildVentaTicketPdfBuffer = async (venta) => {
     text(ticket.texto_pie_ticket || DEFAULT_FOOTER, { alignment: 'center', margin: [0, 2, 0, 0] })
   ];
 
-  const docDefinition = {
+  return {
     pageSize: {
       width: mmToPt(widthMm),
       height: mmToPt(heightMm)
@@ -415,6 +414,10 @@ export const buildVentaTicketPdfBuffer = async (venta) => {
     styles: {},
     content
   };
+};
+
+export const buildVentaTicketPdfBuffer = async (venta) => {
+  const docDefinition = buildVentaTicketPdfDefinition(venta);
 
   return pdfmake.createPdf(docDefinition).getBuffer();
 };

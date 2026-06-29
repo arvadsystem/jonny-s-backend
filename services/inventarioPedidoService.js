@@ -5,7 +5,9 @@ import { validarStockConBloqueo } from './inventarioStockValidator.js';
 import {
   MOVEMENT_REF,
   SHORTAGE_MOVEMENT_REF,
-  fetchExistingPedidoMovement,
+  analyzePedidoMovementState,
+  buildLineMovementRows,
+  fetchPedidoInventoryMovementsForUpdate,
   registrarMovimientosPedido
 } from './inventarioMovimientoService.js';
 
@@ -92,15 +94,6 @@ export const validarYDescontarPedido = async (payload, options = {}) => {
 
     await ensureBranchExists(client, idSucursal);
 
-    const alreadyProcessedMovementId = await fetchExistingPedidoMovement(client, idPedido);
-    if (alreadyProcessedMovementId) {
-      const error = new Error(`El pedido ${idPedido} ya fue descontado en inventario.`);
-      error.httpStatus = 409;
-      error.code = 'PEDIDO_YA_DESCONTADO';
-      error.details = { id_movimiento: alreadyProcessedMovementId };
-      throw error;
-    }
-
     // 1) Resolver consumo real desde items del pedido.
     const consumoResult = await resolvePedidoConsumo({
       client,
@@ -182,6 +175,46 @@ export const validarYDescontarPedido = async (payload, options = {}) => {
     const shortagesByResource = new Map(
       stockShortages.map((item) => [`${item.tipo_recurso}:${item.id_recurso}`, item])
     );
+    const expectedLineMovementRows = buildLineMovementRows({
+      movementRows: consumoResult.consumo.movimientoRows,
+      productosById: stockResult.lockedRows.productosById,
+      insumosById: stockResult.lockedRows.insumosById,
+      actorUserId,
+      idPedido,
+      refOrigen: stockShortages.length > 0 ? movementRefForShortage : MOVEMENT_REF,
+      shortagesByResource
+    });
+    const existingMovementRows = await fetchPedidoInventoryMovementsForUpdate(client, idPedido);
+    const movementState = analyzePedidoMovementState({
+      expectedRows: expectedLineMovementRows,
+      existingRows: existingMovementRows
+    });
+    if (movementState.state === 'COMPLETE') {
+      const error = new Error(`El pedido ${idPedido} ya fue descontado en inventario.`);
+      error.httpStatus = 409;
+      error.code = 'PEDIDO_YA_DESCONTADO';
+      error.details = {
+        id_movimiento: movementState.id_movimiento,
+        movimientos_esperados: movementState.expectedCount,
+        movimientos_existentes: movementState.existingCount
+      };
+      throw error;
+    }
+    if (movementState.state === 'PARTIAL') {
+      const error = new Error(`El pedido ${idPedido} tiene movimientos de inventario parciales o inconsistentes.`);
+      error.httpStatus = 409;
+      error.code = 'PEDIDO_INVENTARIO_PARCIAL_INCONSISTENTE';
+      error.details = {
+        movimientos_esperados: movementState.expectedCount,
+        movimientos_existentes: movementState.existingCount,
+        faltantes: movementState.missing?.length || 0,
+        diferentes: movementState.mismatched?.length || 0,
+        inesperados: movementState.unexpected?.length || 0,
+        duplicados: movementState.duplicates?.length || 0,
+        invalidos: movementState.invalidRows?.length || 0
+      };
+      throw error;
+    }
 
     // 4) Registrar movimientos de salida ligados al pedido.
     await registrarMovimientosPedido({
@@ -193,6 +226,7 @@ export const validarYDescontarPedido = async (payload, options = {}) => {
       productosById: stockResult.lockedRows.productosById,
       insumosById: stockResult.lockedRows.insumosById,
       insumoTraceById: consumoResult.insumoTraceById,
+      movementRows: consumoResult.consumo.movimientoRows,
       refOrigen: stockShortages.length > 0 ? movementRefForShortage : MOVEMENT_REF,
       shortagesByResource
     });

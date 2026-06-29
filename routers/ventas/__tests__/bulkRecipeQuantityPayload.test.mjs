@@ -5,8 +5,14 @@ import { validarYDescontarPedido } from '../../../services/inventarioPedidoServi
 import { normalizePedidoPayload } from '../../../services/pedidoPayloadValidator.js';
 import { resolvePedidoConsumo } from '../../../services/pedidoConsumoResolver.js';
 import { buildSalsaConsumptionItemsFromPedidoDetails } from '../../../services/salsasPedidoSnapshotService.js';
-import { buildSalsaInventorySnapshotsForReturn } from '../../../services/ventasReversionService.js';
+import { buildSalsaInventorySnapshotsForReturn, roundInventoryQuantity } from '../../../services/ventasReversionService.js';
 import { buildPedidoMovementReturnRows } from '../../../services/ventasReversionService.js';
+import {
+  analyzePedidoMovementState,
+  normalizeOrigenConsumo
+} from '../../../services/inventarioMovimientoService.js';
+import { buildVentaKitchenPrintPayload } from '../handlers/ventasPrintHandlers.js';
+import { buildVentaTicketPdfDefinition } from '../services/ventaTicketPdfService.js';
 import {
   buildSalsaConsumptionSnapshot,
   restoreSalsasInventoryFromSnapshots
@@ -200,6 +206,35 @@ describe('ventas bulk recipe quantity payload', () => {
     assert.equal(authorized.ok, true);
   });
 
+  it('devuelve error cuando hay reglas formales de salsa sin rango aplicable', () => {
+    const metadata = resolveRecetaComplementMetadata({
+      receta: { nombre_receta: '18 ALITAS', descripcion: 'Orden de 18 alitas' },
+      quantity: 99,
+      rules: [
+        { min_unidades: 1, max_unidades: 6, salsas_requeridas: 1 },
+        { min_unidades: 7, max_unidades: 12, salsas_requeridas: 2 }
+      ],
+      allowedSauces: []
+    });
+
+    assert.equal(metadata.ok, false);
+    assert.equal(metadata.code, 'VENTAS_REGLA_SALSA_NO_CONFIGURADA');
+    assert.match(metadata.message, /18 ALITAS/);
+  });
+
+  it('detecta reglas de salsa traslapadas', () => {
+    const metadata = resolveRecetaComplementMetadata({
+      receta: { nombre_receta: '12 ALITAS', descripcion: 'Orden de 12 alitas' },
+      rules: [
+        { min_unidades: 1, max_unidades: 8, salsas_requeridas: 1 },
+        { min_unidades: 7, max_unidades: 12, salsas_requeridas: 2 }
+      ]
+    });
+
+    assert.equal(metadata.ok, false);
+    assert.equal(metadata.code, 'VENTAS_REGLA_SALSA_AMBIGUA');
+  });
+
   it('resuelve extras, ingredientes y salsas multiplicados por cantidad de linea', async () => {
     const result = await resolvePedidoConsumo({
       client: makeResolverClient(),
@@ -216,6 +251,28 @@ describe('ventas bulk recipe quantity payload', () => {
     assert.equal(result.consumo.insumoQtyMap.get(200), 297);
     assert.equal(result.consumo.insumoQtyMap.get(300), 49.5);
     assert.equal(result.consumo.insumoQtyMap.get(400), 49.5);
+    assert.equal(result.consumo.movimientoRows.some((row) => row.id_detalle_pedido), false);
+  });
+
+  it('construye consumos por linea para receta, extra y salsa', async () => {
+    const result = await resolvePedidoConsumo({
+      client: makeResolverClient(),
+      items: [
+        { tipo_item: 'RECETA', id_item: 12, id_receta: 12, id_detalle_pedido: 700, cantidad: 99 },
+        { tipo_item: 'EXTRA', id_item: 8, id_extra: 8, id_detalle_pedido: 700, cantidad: 99 },
+        { tipo_item: 'SALSA', id_item: 5, id_salsa: 5, id_detalle_pedido: 700, id_insumo: 400, id_almacen: 3, cantidad: 49.5 }
+      ]
+    });
+
+    assert.deepEqual(result.faltantes, []);
+    assert.deepEqual(
+      result.consumo.movimientoRows.map((row) => [row.id_detalle_pedido, row.origen_consumo, row.id_insumo, row.cantidad]),
+      [
+        [700, 'SALSA', 400, 49.5],
+        [700, 'EXTRA', 300, 49.5],
+        [700, 'RECETA', 200, 297]
+      ]
+    );
   });
 
   it('extrae consumo total desde configuracion_menu sin reconstruir por una sola orden', () => {
@@ -303,17 +360,114 @@ describe('ventas bulk recipe quantity payload', () => {
   it('construye devoluciones proporcionales desde movimientos originales del pedido', () => {
     const rows = buildPedidoMovementReturnRows({
       movements: [
-        { cantidad: 198, id_almacen: 1, id_producto: 10, id_insumo: null },
-        { cantidad: 49.5, id_almacen: 2, id_producto: null, id_insumo: 400 }
+        { cantidad: 198, id_almacen: 1, id_producto: 10, id_insumo: null, id_detalle_pedido: 700, origen_consumo: 'PRODUCTO' },
+        { cantidad: 49.5, id_almacen: 2, id_producto: null, id_insumo: 400, id_detalle_pedido: 701, origen_consumo: 'RECETA' }
       ],
       lineas: [
-        { cantidad_vendida: 99, cantidad_revertida: 33 }
+        { id_detalle_pedido: 701, cantidad_vendida: 99, cantidad_revertida: 33 }
       ]
     });
 
-    assert.equal(rows.length, 2);
-    assert.equal(rows[0].cantidad, 66);
-    assert.equal(rows[1].cantidad, 16.5);
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].cantidad, 16.5);
+    assert.equal(rows[0].id_detalle_pedido, 701);
+    assert.equal(rows[0].id_movimiento_origen, null);
+  });
+
+  it('calcula devoluciones disponibles por movimiento origen', () => {
+    const rows = buildPedidoMovementReturnRows({
+      movements: [
+        { id_movimiento: 901, cantidad: 99, id_almacen: 2, id_producto: null, id_insumo: 400, id_detalle_pedido: 701, origen_consumo: 'RECETA' }
+      ],
+      lineas: [
+        { id_detalle_pedido: 701, cantidad_vendida: 99, cantidad_revertida: 30 }
+      ],
+      returnedByOrigin: new Map([[901, 20]])
+    });
+
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].id_movimiento_origen, 901);
+    assert.equal(rows[0].cantidad, 30);
+    assert.equal(rows[0].cantidad_disponible, 79);
+  });
+
+  it('detecta pedido ya descontado completo y pedido parcial inconsistente', () => {
+    const expectedRows = [
+      { id_detalle_pedido: 700, ref_origen: 'PEDIDO', origen_consumo: 'RECETA', id_almacen: 1, id_producto: null, id_insumo: 200, cantidad: 297 },
+      { id_detalle_pedido: 701, ref_origen: 'PEDIDO', origen_consumo: 'PRODUCTO', id_almacen: 1, id_producto: 10, id_insumo: null, cantidad: 1 }
+    ];
+    const complete = analyzePedidoMovementState({
+      expectedRows,
+      existingRows: expectedRows.map((row, index) => ({ ...row, id_movimiento: index + 1 }))
+    });
+    const partial = analyzePedidoMovementState({
+      expectedRows,
+      existingRows: [{ ...expectedRows[0], id_movimiento: 1 }]
+    });
+
+    assert.equal(complete.state, 'COMPLETE');
+    assert.equal(partial.state, 'PARTIAL');
+    assert.equal(partial.missing.length, 1);
+  });
+
+  it('normaliza origen_consumo y rechaza valores no permitidos', () => {
+    assert.equal(normalizeOrigenConsumo(' receta '), 'RECETA');
+    assert.throws(() => normalizeOrigenConsumo('RECETA_COMPONENTE'), /origen_consumo invalido/);
+  });
+
+  it('preserva precision fisica de inventario', () => {
+    assert.equal(roundInventoryQuantity(0.005 * 0.5), 0.0025);
+    assert.equal(roundInventoryQuantity(1.333333), 1.333333);
+  });
+
+  it('construye payload de cocina con cantidades de extras y salsas', () => {
+    const payload = buildVentaKitchenPrintPayload({
+      items: [{
+        cantidad: 99,
+        nombre_item: '12 ALITAS',
+        extras: [{ id_extra: 8, nombre: 'Queso', cantidad_por_orden: 1, cantidad_total: 99 }],
+        configuracion_menu: {
+          complementos: [
+            { id_complemento: 5, id_salsa: 5, nombre: 'Barbecue', porciones_por_orden: 1, porciones_total: 99 },
+            { id_complemento: 6, id_salsa: 6, nombre: 'Cajun', porciones_por_orden: 1, porciones_total: 99 }
+          ]
+        }
+      }]
+    });
+
+    assert.equal(payload.items[0].extras[0].cantidad_por_orden, 1);
+    assert.equal(payload.items[0].extras[0].cantidad_total, 99);
+    assert.equal(payload.items[0].complementos[0].id_salsa, 5);
+    assert.equal(payload.items[0].complementos[0].porciones_total, 99);
+  });
+
+  it('construye definicion PDF con observacion, total cero y cantidades', () => {
+    const doc = buildVentaTicketPdfDefinition({
+      codigo_venta: 'VTA-TEST',
+      nombre_sucursal: 'QA',
+      id_sesion_caja: 1,
+      nombre_usuario: 'cajero',
+      items: [{
+        cantidad: 99,
+        nombre_item: '12 ALITAS',
+        sub_total: 9900,
+        total_linea: 0,
+        observacion: 'Sin cebolla',
+        extras: [{ nombre: 'Queso', cantidad_por_orden: 1, cantidad_total: 99, subtotal: 0 }],
+        complementos: [
+          { id_salsa: 5, nombre: 'Barbecue', porciones_por_orden: 1, porciones_total: 99 },
+          { id_salsa: 6, nombre: 'Cajun', porciones_por_orden: 1, porciones_total: 99 }
+        ]
+      }],
+      total: 0,
+      sub_total: 9900,
+      facturacion: { ticket: {} }
+    });
+    const serialized = JSON.stringify(doc.content);
+    assert.match(serialized, /L 0.00/);
+    assert.match(serialized, /Sin cebolla/);
+    assert.match(serialized, /Extra: Queso 1 por orden - 99 total/);
+    assert.match(serialized, /Salsas: Barbecue, Cajun 2 por orden - 198 total/);
   });
 
   it('bloquea venta transaccional por receta sin componentes sin crear registros parciales', async () => {

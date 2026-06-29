@@ -126,20 +126,91 @@ const findMatchingSalsaRule = (rules, unidades) => {
   }) || null;
 };
 
+const validateSalsaRules = (rules = []) => {
+  const orderedRules = [...(Array.isArray(rules) ? rules : [])]
+    .map((rule) => ({
+      min: Number(rule?.min_unidades || 0),
+      max: rule?.max_unidades === null || rule?.max_unidades === undefined ? null : Number(rule.max_unidades),
+      required: Number(rule?.salsas_requeridas || 0)
+    }))
+    .sort((left, right) => left.min - right.min || Number(left.max || 0) - Number(right.max || 0));
+
+  for (let index = 0; index < orderedRules.length; index += 1) {
+    const current = orderedRules[index];
+    if (!Number.isFinite(current.min) || current.min <= 0) {
+      return {
+        ok: false,
+        code: 'VENTAS_REGLA_SALSA_CONFIGURACION_INVALIDA',
+        message: 'Existe una regla de salsas con minimo invalido.'
+      };
+    }
+    if (current.max !== null && (!Number.isFinite(current.max) || current.max < current.min)) {
+      return {
+        ok: false,
+        code: 'VENTAS_REGLA_SALSA_CONFIGURACION_INVALIDA',
+        message: 'Existe una regla de salsas con rango invalido.'
+      };
+    }
+    if (!Number.isFinite(current.required) || current.required < 0) {
+      return {
+        ok: false,
+        code: 'VENTAS_REGLA_SALSA_CONFIGURACION_INVALIDA',
+        message: 'Existe una regla de salsas con cantidad requerida invalida.'
+      };
+    }
+    const next = orderedRules[index + 1];
+    if (!next) continue;
+    const currentMax = current.max === null ? Number.POSITIVE_INFINITY : current.max;
+    if (current.min === next.min && currentMax === (next.max === null ? Number.POSITIVE_INFINITY : next.max)) {
+      return {
+        ok: false,
+        code: 'VENTAS_REGLA_SALSA_AMBIGUA',
+        message: 'Existen reglas de salsas duplicadas para la receta.'
+      };
+    }
+    if (currentMax >= next.min) {
+      return {
+        ok: false,
+        code: 'VENTAS_REGLA_SALSA_AMBIGUA',
+        message: 'Existen reglas de salsas traslapadas para la receta.'
+      };
+    }
+  }
+
+  return { ok: true };
+};
+
 const buildRecipeSauceRequirement = ({ recipeName = '', recipeDescription = '', rules = [] }) => {
   const unitsBase = Math.max(1, inferSauceUnitsBaseFromText(recipeName, recipeDescription));
+  const rulesValidation = validateSalsaRules(rules);
+  if (!rulesValidation.ok) {
+    return {
+      ok: false,
+      code: rulesValidation.code,
+      message: rulesValidation.message,
+      required: 0
+    };
+  }
   const rule = findMatchingSalsaRule(rules, unitsBase);
   if (rule) {
-    return Number(rule?.salsas_requeridas || 0);
+    return { ok: true, required: Number(rule?.salsas_requeridas || 0) };
   }
   if (Array.isArray(rules) && rules.length > 0) {
-    return 0;
+    return {
+      ok: false,
+      code: 'VENTAS_REGLA_SALSA_NO_CONFIGURADA',
+      message: `La receta ${recipeName || 'seleccionada'} no tiene una regla de salsas configurada para ${unitsBase} unidades.`,
+      required: 0
+    };
   }
   // AM: fallback acotado solo para familias alitas/tenders cuando no hay reglas formales.
-  return calculateFallbackWingSauceRequirement({
-    nombre: recipeName,
-    descripcion: recipeDescription
-  });
+  return {
+    ok: true,
+    required: calculateFallbackWingSauceRequirement({
+      nombre: recipeName,
+      descripcion: recipeDescription
+    })
+  };
 };
 
 export const validateComplementSelectionBounds = ({
@@ -175,17 +246,31 @@ export const validateComplementSelectionBounds = ({
 };
 
 export const resolveRecetaComplementMetadata = ({ receta = {}, quantity = 1, allowedSauces = [], rules = [], fallbackSauces = [] }) => {
-  const required = Math.max(0, buildRecipeSauceRequirement({
+  const requirement = buildRecipeSauceRequirement({
     recipeName: receta?.nombre_receta,
     recipeDescription: receta?.descripcion,
     rules,
     quantity
-  }));
+  });
+  if (!requirement.ok) {
+    return {
+      ok: false,
+      code: requirement.code,
+      message: requirement.message,
+      requiere_complementos: false,
+      tipo_complemento: VENTA_COMPLEMENTO_TIPO_SALSAS,
+      minimo_complementos: 0,
+      maximo_complementos: 0,
+      complementos_disponibles: []
+    };
+  }
+  const required = Math.max(0, Number(requirement.required || 0));
   let available = sortSauceOptions(allowedSauces);
   if (required > 0 && available.length === 0) {
     available = sortSauceOptions(fallbackSauces);
   }
   return {
+    ok: true,
     requiere_complementos: required > 0,
     tipo_complemento: VENTA_COMPLEMENTO_TIPO_SALSAS,
     minimo_complementos: required,
@@ -342,12 +427,13 @@ export const buildVentaComplementContext = async ({ client, normalizedItems, idS
         const receta = recetaMap.get(recipeId) || {};
         const allowed = saucesByRecipe.get(recipeId) || [];
         const rules = rulesByRecipe.get(recipeId) || [];
-        const required = Math.max(0, buildRecipeSauceRequirement({
+        const requirement = buildRecipeSauceRequirement({
           recipeName: receta?.nombre_receta,
           recipeDescription: receta?.descripcion,
           rules,
           quantity: item.cantidad
-        }));
+        });
+        const required = requirement.ok ? Math.max(0, Number(requirement.required || 0)) : 0;
         if (required > 0 && allowed.length === 0) {
           needsFallbackSauces = true;
           break;
