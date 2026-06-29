@@ -6,10 +6,15 @@ import { normalizePedidoPayload } from '../../../services/pedidoPayloadValidator
 import { resolvePedidoConsumo } from '../../../services/pedidoConsumoResolver.js';
 import { buildSalsaConsumptionItemsFromPedidoDetails } from '../../../services/salsasPedidoSnapshotService.js';
 import { buildSalsaInventorySnapshotsForReturn } from '../../../services/ventasReversionService.js';
+import { buildPedidoMovementReturnRows } from '../../../services/ventasReversionService.js';
 import {
   buildSalsaConsumptionSnapshot,
   restoreSalsasInventoryFromSnapshots
 } from '../services/salsasInventoryService.js';
+import {
+  resolveRecetaComplementMetadata,
+  validateComplementSelectionBounds
+} from '../services/complementosCatalogService.js';
 import {
   buildComplementLineConfig,
   normalizeVentaItems
@@ -156,6 +161,45 @@ describe('ventas bulk recipe quantity payload', () => {
     assert.equal(snapshot.cantidad_base_total, 49.5);
   });
 
+  it('calcula reglas de salsas por orden aunque la linea tenga cantidad masiva', () => {
+    const metadata = resolveRecetaComplementMetadata({
+      receta: { nombre_receta: '12 ALITAS', descripcion: 'Orden de 12 alitas' },
+      quantity: 99,
+      rules: [
+        { min_unidades: 1, max_unidades: 6, salsas_requeridas: 1 },
+        { min_unidades: 7, max_unidades: 12, salsas_requeridas: 2 }
+      ],
+      allowedSauces: [
+        { id_complemento: 5, id_salsa: 5, nombre: 'Barbecue', disponible: true },
+        { id_complemento: 6, id_salsa: 6, nombre: 'Buffalo', disponible: true }
+      ]
+    });
+
+    assert.equal(metadata.minimo_complementos, 2);
+    assert.equal(metadata.maximo_complementos, 2);
+  });
+
+  it('bloquea complementos incompletos salvo autorizacion explicita', () => {
+    const blocked = validateComplementSelectionBounds({
+      selectedCount: 1,
+      minimo: 2,
+      maximo: 2,
+      allowIncomplete: false,
+      nombreItem: '12 ALITAS'
+    });
+    const authorized = validateComplementSelectionBounds({
+      selectedCount: 1,
+      minimo: 2,
+      maximo: 2,
+      allowIncomplete: true,
+      nombreItem: '12 ALITAS'
+    });
+
+    assert.equal(blocked.ok, false);
+    assert.equal(blocked.code, 'VENTAS_COMPLEMENTOS_INCOMPLETOS');
+    assert.equal(authorized.ok, true);
+  });
+
   it('resuelve extras, ingredientes y salsas multiplicados por cantidad de linea', async () => {
     const result = await resolvePedidoConsumo({
       client: makeResolverClient(),
@@ -256,6 +300,22 @@ describe('ventas bulk recipe quantity payload', () => {
     assert.equal(insert.params[0], 198);
   });
 
+  it('construye devoluciones proporcionales desde movimientos originales del pedido', () => {
+    const rows = buildPedidoMovementReturnRows({
+      movements: [
+        { cantidad: 198, id_almacen: 1, id_producto: 10, id_insumo: null },
+        { cantidad: 49.5, id_almacen: 2, id_producto: null, id_insumo: 400 }
+      ],
+      lineas: [
+        { cantidad_vendida: 99, cantidad_revertida: 33 }
+      ]
+    });
+
+    assert.equal(rows.length, 2);
+    assert.equal(rows[0].cantidad, 66);
+    assert.equal(rows[1].cantidad, 16.5);
+  });
+
   it('bloquea venta transaccional por receta sin componentes sin crear registros parciales', async () => {
     const client = makeTransactionClient({ recipeComponents: [] });
     const result = await validarYDescontarPedido({
@@ -275,5 +335,12 @@ describe('ventas bulk recipe quantity payload', () => {
     assert.match(ventasSource, /dp\.cantidad/);
     assert.match(ventasSource, /const cantidadPersistida = Number\(row\.cantidad \?\? 0\);/);
     assert.match(ventasSource, /: inferKitchenItemQuantity\(subTotal, precioBase\);/);
+  });
+
+  it('incluye observacion de item en el PDF de ticket', async () => {
+    const source = await readFile(new URL('../services/ventaTicketPdfService.js', import.meta.url), 'utf8');
+
+    assert.match(source, /Nota: \$\{observacion\}/);
+    assert.match(source, /String\(item\.observacion \|\| ''\)\.trim\(\)/);
   });
 });

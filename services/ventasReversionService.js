@@ -444,6 +444,7 @@ const resolveReversionLines = ({ tipoReversion, requestedLines, facturaLines, re
       tipo_item: line.tipo_item,
       id_producto: parsePositiveInt(line.id_producto),
       id_receta: parsePositiveInt(line.id_receta),
+      cantidad_vendida: soldQty,
       cantidad_revertida: requestedQty,
       precio_unitario_original: roundMoney(line.precio_unitario),
       subtotal_revertido: subtotal,
@@ -763,6 +764,96 @@ const registerInventoryReturn = async ({ client, idReversion, codigoReversion, c
       ]
     );
   }
+};
+
+export const buildPedidoMovementReturnRows = ({ movements = [], lineas = [] } = {}) => {
+  const soldQty = (Array.isArray(lineas) ? lineas : []).reduce(
+    (sum, line) => sum + Number(line?.cantidad_vendida || line?.origen_snapshot?.cantidad || 0),
+    0
+  );
+  const reversedQty = (Array.isArray(lineas) ? lineas : []).reduce(
+    (sum, line) => sum + Number(line?.cantidad_revertida || 0),
+    0
+  );
+  const ratio = soldQty > 0 && reversedQty > 0 ? Math.min(1, reversedQty / soldQty) : 0;
+  if (ratio <= 0) return [];
+
+  return (Array.isArray(movements) ? movements : [])
+    .map((movement) => {
+      const cantidad = roundMoney(Number(movement?.cantidad || 0) * ratio);
+      if (cantidad <= 0) return null;
+      return {
+        cantidad,
+        id_almacen: parsePositiveInt(movement?.id_almacen),
+        id_producto: parsePositiveInt(movement?.id_producto),
+        id_insumo: parsePositiveInt(movement?.id_insumo),
+        ratio
+      };
+    })
+    .filter((row) => row && row.id_almacen && (row.id_producto || row.id_insumo));
+};
+
+const restorePedidoInventoryMovementsForReversion = async ({
+  client,
+  idPedido,
+  idReversion,
+  codigoReversion,
+  codigoVenta,
+  lineas
+}) => {
+  const pedidoId = parsePositiveInt(idPedido);
+  if (!pedidoId) return false;
+
+  const movementResult = await client.query(
+    `
+      SELECT
+        mi.id_movimiento,
+        mi.cantidad,
+        mi.id_almacen,
+        mi.id_producto,
+        mi.id_insumo
+      FROM public.movimientos_inventario mi
+      WHERE mi.tipo = 'SALIDA'
+        AND mi.ref_origen IN ('PEDIDO', 'FALTANTE_COCINA')
+        AND mi.id_ref = $1
+      ORDER BY mi.id_movimiento
+      FOR UPDATE
+    `,
+    [pedidoId]
+  );
+  const returnRows = buildPedidoMovementReturnRows({
+    movements: movementResult.rows,
+    lineas
+  });
+  if (!returnRows.length) return false;
+
+  for (const row of returnRows) {
+    await client.query(
+      `
+        INSERT INTO public.movimientos_inventario (
+          tipo,
+          cantidad,
+          id_almacen,
+          id_producto,
+          id_insumo,
+          ref_origen,
+          id_ref,
+          descripcion
+        )
+        VALUES ('ENTRADA', $1, $2, $3, $4, 'REVERSION_VENTA_INVENTARIO', $5, $6)
+      `,
+      [
+        row.cantidad,
+        row.id_almacen,
+        row.id_producto || null,
+        row.id_insumo || null,
+        idReversion,
+        `Entrada proporcional por reversión ${codigoReversion} de venta ${codigoVenta}`
+      ]
+    );
+  }
+
+  return true;
 };
 
 export const buildSalsaInventorySnapshotsForReturn = (lineas = []) => {
@@ -1151,26 +1242,37 @@ export const createVentaReversion = async ({ idFactura, body, req, idUsuario, id
       totalFactura
     });
 
-    await registerInventoryReturn({
-      client,
-      idReversion,
-      codigoReversion: correlativo.codigo,
-      codigoVenta: factura.codigo_venta || `VTA-${String(facturaId).padStart(5, '0')}`,
-      lineas: reversionLines
-    });
-    const salsaSnapshots = await filterConsumedSalsaSnapshots({
+    const codigoVenta = factura.codigo_venta || `VTA-${String(facturaId).padStart(5, '0')}`;
+    const restoredFromOriginalMovements = await restorePedidoInventoryMovementsForReversion({
       client,
       idPedido: factura.id_pedido,
-      idFactura: facturaId,
-      snapshots: buildSalsaInventorySnapshotsForReturn(reversionLines)
-    });
-    await restoreSalsasInventoryFromSnapshots({
-      client,
-      snapshots: salsaSnapshots,
       idReversion,
       codigoReversion: correlativo.codigo,
-      codigoVenta: factura.codigo_venta || `VTA-${String(facturaId).padStart(5, '0')}`
+      codigoVenta,
+      lineas: reversionLines
     });
+    if (!restoredFromOriginalMovements) {
+      await registerInventoryReturn({
+        client,
+        idReversion,
+        codigoReversion: correlativo.codigo,
+        codigoVenta,
+        lineas: reversionLines
+      });
+      const salsaSnapshots = await filterConsumedSalsaSnapshots({
+        client,
+        idPedido: factura.id_pedido,
+        idFactura: facturaId,
+        snapshots: buildSalsaInventorySnapshotsForReturn(reversionLines)
+      });
+      await restoreSalsasInventoryFromSnapshots({
+        client,
+        snapshots: salsaSnapshots,
+        idReversion,
+        codigoReversion: correlativo.codigo,
+        codigoVenta
+      });
+    }
 
     const result = {
       id_reversion: idReversion,

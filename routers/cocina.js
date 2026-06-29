@@ -257,7 +257,7 @@ const buildTicketNumber = (idPedido, idFactura, codigoVenta) => {
   return `VTA-${String(baseId).padStart(5, '0')}`;
 };
 
-const buildPedidoConsumoPayload = async (client, idPedido, idSucursal) => {
+export const buildPedidoConsumoPayload = async (client, idPedido, idSucursal) => {
   const hasDetallePedidoConfiguracionMenu = await hasColumn(client, 'detalle_pedido', 'configuracion_menu');
   const detailsResult = await client.query(
     `
@@ -481,17 +481,26 @@ const extractConfigMenuModifications = (configuracionMenu, itemTipo, salsaNameMa
   if (!complementos.length && !extras.length && !salsasPorUnidad.length && !notaCliente) return [];
 
   const complementosText = complementos
-    .map((entry) => String(entry?.nombre || '').trim())
-    .filter(Boolean)
-    .map((nombre) => {
-      return `Salsa: ${nombre}`;
+    .map((entry) => {
+      const nombre = String(entry?.nombre || '').trim();
+      if (!nombre) return null;
+      const porOrden = Number(entry?.porciones_por_orden || entry?.cantidad_por_orden || entry?.inventario?.porciones_por_orden || entry?.inventario?.porciones || 1);
+      const total = Number(entry?.porciones_total || entry?.cantidad_total || entry?.inventario?.porciones_total || 0);
+      if (total > 0 && total !== porOrden) {
+        return `Salsa: ${nombre} x${porOrden} por orden, total ${total}`;
+      }
+      return porOrden > 1 ? `Salsa: ${nombre} x${porOrden} por orden` : `Salsa: ${nombre}`;
     });
   const extrasText = extras
     .map((entry) => {
       const nombre = String(entry?.nombre || entry?.nombre_extra || '').trim();
-      const cantidad = Number(entry?.cantidad || 0);
-      if (!nombre || cantidad <= 0) return null;
-      return `Extra: ${nombre} x${cantidad}`;
+      const porOrden = Number(entry?.cantidad_por_orden || entry?.cantidad || 0);
+      const total = Number(entry?.cantidad_total || entry?.cantidad || 0);
+      if (!nombre || porOrden <= 0) return null;
+      if (total > 0 && total !== porOrden) {
+        return `Extra: ${nombre} x${porOrden} por orden, total ${total}`;
+      }
+      return `Extra: ${nombre} x${porOrden} por orden`;
     })
     .filter(Boolean);
 

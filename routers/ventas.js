@@ -48,7 +48,8 @@ import {
   buildVentaComplementContext,
   buildVentasStaticCacheKey,
   fetchCachedVentasStaticRows,
-  resolveRecetaComplementMetadata
+  resolveRecetaComplementMetadata,
+  validateComplementSelectionBounds
 } from './ventas/services/complementosCatalogService.js';
 import {
   getCajaBootstrapHandler,
@@ -117,6 +118,8 @@ import {
   VENTAS_MAX_PAGE_SIZE
 } from './ventas/constants.js';
 import { roundMoney } from './ventas/utils/moneyUtils.js';
+import { validarYDescontarPedido } from '../services/inventarioPedidoService.js';
+import { buildPedidoConsumoPayload } from './cocina.js';
 import {
   coercePositiveIntArray,
   isPlainObject,
@@ -2021,6 +2024,48 @@ const buildInvalidComplementResult = ({ item, nombreItem, allowed = [], reason }
   };
 };
 
+const validarYDescontarInventarioCajaPedido = async ({
+  client,
+  idPedido,
+  idSucursal,
+  idUsuario
+}) => {
+  const consumoPayloadResult = await buildPedidoConsumoPayload(client, idPedido, idSucursal);
+  if (!consumoPayloadResult.ok) {
+    throw {
+      httpStatus: consumoPayloadResult.status || 409,
+      code: consumoPayloadResult.body?.code || 'VENTAS_INVENTARIO_PEDIDO_INVALIDO',
+      publicMessage: consumoPayloadResult.body?.message || 'No se pudo validar el inventario del pedido.',
+      details: consumoPayloadResult.body?.details || null
+    };
+  }
+
+  try {
+    const inventoryResult = await validarYDescontarPedido(consumoPayloadResult.payload, {
+      id_usuario: idUsuario,
+      dbClient: client
+    });
+    if (!inventoryResult?.ok) {
+      throw {
+        httpStatus: 409,
+        code: inventoryResult?.code || 'VENTAS_INVENTARIO_INSUFICIENTE',
+        publicMessage: inventoryResult?.message || 'No se pudo descontar inventario para el pedido.',
+        details: inventoryResult?.faltantes || null
+      };
+    }
+    return inventoryResult;
+  } catch (error) {
+    if (String(error?.code || '').trim().toUpperCase() === 'PEDIDO_YA_DESCONTADO') {
+      return {
+        ok: true,
+        code: 'PEDIDO_YA_DESCONTADO',
+        message: 'El pedido ya tenia descuento de inventario registrado.'
+      };
+    }
+    throw error;
+  }
+};
+
 const resolveLineComplementos = ({ item, receta, context, nombreItem }) => {
   if (item.kind === 'PRODUCTO' || item.kind === 'ITEM') {
     if (Array.isArray(item.complementos) && item.complementos.length > 0) {
@@ -2082,8 +2127,15 @@ const resolveLineComplementos = ({ item, receta, context, nombreItem }) => {
   const min = Math.max(0, Number(metadata.minimo_complementos || 0));
   const max = Math.max(min, Number(metadata.maximo_complementos || 0));
   const complementosIncompletos = min > 0 && selected.length < min;
-  if (max > 0 && selected.length > max) {
-    return { ok: false, message: `No puedes seleccionar mas de ${max} complemento(s) para este item.` };
+  const boundsResult = validateComplementSelectionBounds({
+    selectedCount: selected.length,
+    minimo: min,
+    maximo: max,
+    allowIncomplete: item.complementos_incompletos_autorizados === true,
+    nombreItem
+  });
+  if (!boundsResult.ok) {
+    return boundsResult;
   }
   if (!metadata.requiere_complementos && allowedMap.size === 0 && selected.length > 0) {
     return buildInvalidComplementResult({
@@ -6556,6 +6608,8 @@ router.get('/ventas/pedidos-menu', checkPermission(['VENTAS_VER']), async (req, 
                 'nombre_producto', COALESCE(prod.nombre_producto, rec.nombre_receta, 'Item de pedido'),
                 'cantidad',
                   CASE
+                    WHEN COALESCE(dp.cantidad, 0) > 0
+                      THEN dp.cantidad::int
                     WHEN COALESCE(prod.precio, rec.precio, 0) > 0
                       THEN GREATEST(1, ROUND(COALESCE(dp.sub_total_pedido, dp.total_pedido, 0) / COALESCE(prod.precio, rec.precio, 1))::int)
                     ELSE 1
@@ -7656,6 +7710,8 @@ async function listarPedidosPendientesPago(req, res) {
             dp.id_detalle_pedido,
             COALESCE(prod.nombre_producto, rec.nombre_receta, 'Item de pedido') AS nombre_item,
             CASE
+              WHEN COALESCE(dp.cantidad, 0) > 0
+                THEN dp.cantidad::int
               WHEN COALESCE(prod.precio, rec.precio, 0) > 0
                 THEN GREATEST(1, ROUND(COALESCE(dp.sub_total_pedido, dp.total_pedido, 0) / COALESCE(prod.precio, rec.precio, 1))::int)
               ELSE 1
@@ -7927,6 +7983,12 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
           [rpcResponseBody.id_pedido]
         );
       }
+      await validarYDescontarInventarioCajaPedido({
+        client,
+        idPedido: rpcResponseBody.id_pedido,
+        idSucursal: pedidoPendiente.id_sucursal,
+        idUsuario: userId
+      });
       const commitStart = ventasPerf.now();
       await client.query('COMMIT');
       ventasPerf.add('commit_ms', commitStart);
@@ -8247,6 +8309,13 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
         ]
       );
     }
+
+    await validarYDescontarInventarioCajaPedido({
+      client,
+      idPedido,
+      idSucursal: pedidoPendiente.id_sucursal,
+      idUsuario: userId
+    });
 
     const commitStart = ventasPerf.now();
     await client.query('COMMIT');
@@ -9334,6 +9403,12 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
       });
       const idPedidoRpc = parseOptionalPositiveInt(rpcCreateResult.response?.id_pedido);
       await persistVentaPedidoSnapshots({ client, idPedido: idPedidoRpc, venta });
+      await validarYDescontarInventarioCajaPedido({
+        client,
+        idPedido: idPedidoRpc,
+        idSucursal: venta.id_sucursal,
+        idUsuario: userId
+      });
       if (ventaHasExtras) {
         const fidelizacionPedidoId = parseOptionalPositiveInt(rpcCreateResult.fidelizacionJob?.idPedido);
         if (!fidelizacionPedidoId) {
@@ -9381,6 +9456,12 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
         client,
         idPedido: rpcCreateResult.response?.id_pedido,
         venta
+      });
+      await validarYDescontarInventarioCajaPedido({
+        client,
+        idPedido: rpcCreateResult.response?.id_pedido,
+        idSucursal: venta.id_sucursal,
+        idUsuario: userId
       });
 
       const commitStart = ventasPerf.now();
@@ -9627,6 +9708,12 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
     }
     ventasPerf.add('detalle_pedido_insert_ms', detallePedidoInsertStart);
     ventasPerf.add('detalle_pedido_ms', detallePedidoStart);
+    await validarYDescontarInventarioCajaPedido({
+      client,
+      idPedido,
+      idSucursal: venta.id_sucursal,
+      idUsuario: userId
+    });
     const facturaInsertStart = ventasPerf.now();
     const facturaResult = await client.query(
       `

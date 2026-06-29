@@ -418,6 +418,8 @@ const buildPedidoKitchenPrintPayload = async (client, idPedido) => {
             'nombre_producto', COALESCE(prod.nombre_producto, rec.nombre_receta, 'Item de pedido'),
             'cantidad',
               CASE
+                WHEN COALESCE(dp.cantidad, 0) > 0
+                  THEN dp.cantidad::int
                 WHEN COALESCE(prod.precio, rec.precio, 0) > 0
                   THEN GREATEST(1, ROUND(COALESCE(dp.sub_total_pedido, dp.total_pedido, 0) / COALESCE(prod.precio, rec.precio, 1))::int)
                 ELSE 1

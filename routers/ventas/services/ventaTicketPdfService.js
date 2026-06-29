@@ -305,6 +305,15 @@ const buildItemRows = (items = [], widthMm) => {
         text('', { alignment: 'right' })
       ]);
     }
+
+    const observacion = String(item.observacion || '').trim();
+    if (observacion) {
+      rows.push([
+        text(''),
+        text(`Nota: ${observacion}`, { fontSize: widthMm === 58 ? 5.5 : 6 }),
+        text('', { alignment: 'right' })
+      ]);
+    }
   }
 
   return rows;
