@@ -24,8 +24,14 @@ const VALID_MOTIVOS = new Set([
 ]);
 
 const parsePositiveInt = (value) => {
-  const parsed = Number.parseInt(String(value ?? ''), 10);
-  return Number.isInteger(parsed) && parsed > 0 ? parsed : null;
+  if (typeof value === 'number') {
+    return Number.isSafeInteger(value) && value > 0 ? value : null;
+  }
+  if (typeof value !== 'string') return null;
+  const normalized = value.trim();
+  if (!/^0*[1-9]\d*$/.test(normalized)) return null;
+  const parsed = Number(normalized);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : null;
 };
 
 const isIntegerNumber = (value) => Number.isInteger(Number(value));
@@ -453,6 +459,9 @@ const resolveReversionLines = ({ tipoReversion, requestedLines, facturaLines, re
       id_detalle_pedido: parsePositiveInt(line.id_detalle_pedido),
       cantidad_vendida: soldQty,
       cantidad_revertida: requestedQty,
+      cantidad_revertida_previa: reversedQty,
+      cantidad_pendiente_antes: availableQty,
+      completa_linea: requestedQty === availableQty,
       precio_unitario_original: roundMoney(line.precio_unitario),
       subtotal_revertido: subtotal,
       descuento_revertido: descuento,
@@ -774,31 +783,40 @@ const registerInventoryReturn = async ({ client, idReversion, codigoReversion, c
 };
 
 export const buildPedidoMovementReturnRows = ({ movements = [], lineas = [], returnedByOrigin = new Map() } = {}) => {
-  const lineRatioByDetalle = new Map();
+  const lineReturnByDetalle = new Map();
   for (const line of Array.isArray(lineas) ? lineas : []) {
     const idDetallePedido = parsePositiveInt(line?.id_detalle_pedido);
     const soldQty = Number(line?.cantidad_vendida || line?.origen_snapshot?.cantidad || 0);
     const reversedQty = Number(line?.cantidad_revertida || 0);
     const ratio = soldQty > 0 && reversedQty > 0 ? Math.min(1, reversedQty / soldQty) : 0;
     if (idDetallePedido && ratio > 0) {
-      lineRatioByDetalle.set(idDetallePedido, ratio);
+      lineReturnByDetalle.set(idDetallePedido, {
+        ratio,
+        completesLine: Boolean(line?.completa_linea)
+          || (Number(line?.cantidad_pendiente_antes || 0) > 0 && reversedQty === Number(line.cantidad_pendiente_antes))
+      });
     }
   }
-  if (lineRatioByDetalle.size === 0) return [];
+  if (lineReturnByDetalle.size === 0) return [];
 
   return (Array.isArray(movements) ? movements : [])
     .map((movement) => {
       const idDetallePedido = parsePositiveInt(movement?.id_detalle_pedido);
-      const ratio = idDetallePedido ? Number(lineRatioByDetalle.get(idDetallePedido) || 0) : 0;
-      const cantidad = roundInventoryQuantity(Number(movement?.cantidad || 0) * ratio);
+      const lineReturn = idDetallePedido ? lineReturnByDetalle.get(idDetallePedido) : null;
+      const ratio = Number(lineReturn?.ratio || 0);
+      const idMovimientoOrigen = parsePositiveInt(movement?.id_movimiento);
+      const cantidadDisponible = roundInventoryQuantity(Math.max(
+        0,
+        Number(movement?.cantidad || 0) - Number(returnedByOrigin.get(idMovimientoOrigen) || 0)
+      ));
+      const cantidad = lineReturn?.completesLine
+        ? cantidadDisponible
+        : roundInventoryQuantity(Number(movement?.cantidad || 0) * ratio);
       if (cantidad <= 0) return null;
       return {
-        id_movimiento_origen: parsePositiveInt(movement?.id_movimiento),
+        id_movimiento_origen: idMovimientoOrigen,
         cantidad,
-        cantidad_disponible: roundInventoryQuantity(Math.max(
-          0,
-          Number(movement?.cantidad || 0) - Number(returnedByOrigin.get(parsePositiveInt(movement?.id_movimiento)) || 0)
-        )),
+        cantidad_disponible: cantidadDisponible,
         id_almacen: parsePositiveInt(movement?.id_almacen),
         id_producto: parsePositiveInt(movement?.id_producto),
         id_insumo: parsePositiveInt(movement?.id_insumo),
@@ -809,6 +827,37 @@ export const buildPedidoMovementReturnRows = ({ movements = [], lineas = [], ret
     })
     .map((row) => row ? { ...row, cantidad: Math.min(row.cantidad, row.cantidad_disponible) } : null)
     .filter((row) => row && row.cantidad > 0 && row.id_almacen && (row.id_producto || row.id_insumo));
+};
+
+export const classifyPedidoMovementReturnState = ({ movements = [], lineas = [], returnedByOrigin = new Map(), tipoReversion = '' } = {}) => {
+  const rows = Array.isArray(movements) ? movements : [];
+  if (rows.length === 0) return 'NO_ORIGINAL_MOVEMENTS';
+
+  const traced = rows.filter((row) => parsePositiveInt(row.id_detalle_pedido));
+  const legacy = rows.filter((row) => !parsePositiveInt(row.id_detalle_pedido));
+  if (legacy.length > 0 && String(tipoReversion || '').toUpperCase() === 'PARCIAL') return 'LEGACY_PARTIAL_BLOCKED';
+  if (legacy.length > 0 && traced.length === 0 && String(tipoReversion || '').toUpperCase() === 'TOTAL') return 'LEGACY_TOTAL_ALLOWED';
+
+  const requestedDetalleIds = new Set(
+    (Array.isArray(lineas) ? lineas : []).map((line) => parsePositiveInt(line?.id_detalle_pedido)).filter(Boolean)
+  );
+  const tracedDetalleIds = new Set(traced.map((row) => parsePositiveInt(row.id_detalle_pedido)).filter(Boolean));
+  for (const detalleId of requestedDetalleIds) {
+    if (!tracedDetalleIds.has(detalleId)) return 'TRACE_INCONSISTENT';
+  }
+  for (const row of traced) {
+    const hasOneResource = Boolean(parsePositiveInt(row.id_producto)) !== Boolean(parsePositiveInt(row.id_insumo));
+    if (!parsePositiveInt(row.id_movimiento) || !parsePositiveInt(row.id_almacen) || !hasOneResource || !String(row.origen_consumo || '').trim()) {
+      return 'TRACE_INCONSISTENT';
+    }
+  }
+  if (traced.length > 0 && legacy.length > 0) return 'TRACE_INCONSISTENT';
+
+  const allReturned = rows.every((row) => {
+    const idMovimiento = parsePositiveInt(row.id_movimiento);
+    return roundInventoryQuantity(Number(returnedByOrigin.get(idMovimiento) || 0)) >= roundInventoryQuantity(Number(row.cantidad || 0));
+  });
+  return allReturned ? 'ALREADY_FULLY_RETURNED' : 'TRACE_OK';
 };
 
 const restorePedidoInventoryMovementsForReversion = async ({
@@ -850,13 +899,6 @@ const restorePedidoInventoryMovementsForReversion = async ({
     ]
   );
   const legacyMovements = movementResult.rows.filter((row) => !parsePositiveInt(row.id_detalle_pedido));
-  if (legacyMovements.length > 0 && String(tipoReversion || '').toUpperCase() !== 'TOTAL') {
-    throw createReversionError(
-      409,
-      'VENTAS_REVERSION_LEGACY_SIN_TRAZABILIDAD',
-      'La reversión parcial no puede restaurar inventario de movimientos legacy sin trazabilidad por línea.'
-    );
-  }
   const originIds = movementResult.rows
     .map((row) => parsePositiveInt(row.id_movimiento))
     .filter(Boolean);
@@ -881,12 +923,32 @@ const restorePedidoInventoryMovementsForReversion = async ({
       Number(row.cantidad_devuelta || 0)
     ])
   );
+  const returnState = classifyPedidoMovementReturnState({
+    movements: movementResult.rows,
+    lineas,
+    returnedByOrigin,
+    tipoReversion
+  });
+  if (returnState === 'NO_ORIGINAL_MOVEMENTS') return false;
+  if (returnState === 'ALREADY_FULLY_RETURNED') {
+    throw createReversionError(409, 'ALREADY_FULLY_RETURNED', 'El inventario de la venta ya fue devuelto completamente.');
+  }
+  if (returnState === 'TRACE_INCONSISTENT') {
+    throw createReversionError(409, 'TRACE_INCONSISTENT', 'Los movimientos originales de inventario tienen trazabilidad inconsistente.');
+  }
+  if (returnState === 'LEGACY_PARTIAL_BLOCKED') {
+    throw createReversionError(
+      409,
+      'LEGACY_PARTIAL_BLOCKED',
+      'La reversión parcial no puede restaurar inventario de movimientos legacy sin trazabilidad por línea.'
+    );
+  }
   const tracedReturnRows = buildPedidoMovementReturnRows({
     movements: movementResult.rows.filter((row) => parsePositiveInt(row.id_detalle_pedido)),
     lineas,
     returnedByOrigin
   });
-  const legacyReturnRows = String(tipoReversion || '').toUpperCase() === 'TOTAL'
+  const legacyReturnRows = returnState === 'LEGACY_TOTAL_ALLOWED'
     ? legacyMovements
       .map((movement) => {
         const idMovimientoOrigen = parsePositiveInt(movement.id_movimiento);

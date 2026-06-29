@@ -18,12 +18,12 @@ const addToMapTotal = (map, id, amount) => {
 const addMovementRow = (rows, row) => {
   const quantity = Number(row?.cantidad || 0);
   const idDetallePedido = toPositiveInt(row?.id_detalle_pedido);
-  if (!Number.isFinite(quantity) || quantity <= 0 || !idDetallePedido) return;
+  if (!Number.isFinite(quantity) || quantity <= 0) return;
   rows.push({
     tipo_recurso: row.tipo_recurso,
     id_producto: toPositiveInt(row.id_producto) || null,
     id_insumo: toPositiveInt(row.id_insumo) || null,
-    id_detalle_pedido: idDetallePedido,
+    id_detalle_pedido: idDetallePedido || null,
     cantidad: quantity,
     origen_consumo: String(row.origen_consumo || '').trim().toUpperCase() || null
   });
@@ -210,8 +210,8 @@ export const resolvePedidoConsumo = async ({ client, items }) => {
   const extraIds = [...extraQtyMap.keys()].sort((a, b) => a - b);
   const extraIdsWithSnapshot = new Set();
   for (const idExtra of extraIds) {
-    const context = firstContext(extraContextById, idExtra);
-    if (toPositiveInt(context.id_insumo) && Number(context.cant || 0) > 0) {
+    const contexts = extraContextById.get(idExtra) || [];
+    if (contexts.length > 0 && contexts.every((context) => toPositiveInt(context.id_insumo) && Number(context.cant || 0) > 0)) {
       extraIdsWithSnapshot.add(idExtra);
     }
   }
@@ -252,90 +252,108 @@ export const resolvePedidoConsumo = async ({ client, items }) => {
   }
 
   for (const idExtra of extraIds) {
-    const context = firstContext(extraContextById, idExtra);
-    const snapshotInsumoId = toPositiveInt(context.id_insumo);
-    const snapshotFactor = Number(context.cant || 0);
-    const snapshotUnidadId = toPositiveInt(context.id_unidad_medida);
-    const hasSnapshotInventory = snapshotInsumoId && snapshotFactor > 0;
+    const contexts = extraContextById.get(idExtra) || [];
+    const firstExtraContext = firstContext(extraContextById, idExtra);
+    const hasSnapshotInventory = contexts.length > 0
+      && contexts.every((context) => toPositiveInt(context.id_insumo) && Number(context.cant || 0) > 0);
 
     if (hasSnapshotInventory) {
-      addToMapTotal(insumoQtyMap, snapshotInsumoId, Number(extraQtyMap.get(idExtra) || 0) * snapshotFactor);
-      addMovementRow(movimientoRows, {
-        tipo_recurso: 'insumo',
-        id_insumo: snapshotInsumoId,
-        id_detalle_pedido: context.id_detalle_pedido,
-        cantidad: Number(extraQtyMap.get(idExtra) || 0) * snapshotFactor,
-        origen_consumo: 'EXTRA'
-      });
+      for (const context of contexts) {
+        const snapshotInsumoId = toPositiveInt(context.id_insumo);
+        const snapshotFactor = Number(context.cant || 0);
+        const lineQty = Number(context.cantidad || 0);
+        addToMapTotal(insumoQtyMap, snapshotInsumoId, lineQty * snapshotFactor);
+        addMovementRow(movimientoRows, {
+          tipo_recurso: 'insumo',
+          id_insumo: snapshotInsumoId,
+          id_detalle_pedido: context.id_detalle_pedido,
+          cantidad: lineQty * snapshotFactor,
+          origen_consumo: 'EXTRA'
+        });
+      }
       continue;
     }
 
     const row = extrasById.get(idExtra);
-    if (!row) {
-      faltantes.push({
-        tipo_recurso: 'extra',
-        id_recurso: idExtra,
-        id_extra: idExtra,
-        ...context,
-        motivo: 'EXTRA_SIN_CONFIGURACION_INVENTARIO',
-        mensaje: `El extra ${context.nombre || context.codigo || idExtra} no tiene configuracion de inventario disponible.`
-      });
-      continue;
-    }
-    if (!Boolean(row.estado)) {
-      faltantes.push({
-        tipo_recurso: 'extra',
-        id_recurso: idExtra,
-        id_extra: idExtra,
-        ...context,
-        nombre: row.nombre,
-        codigo: row.codigo || null,
-        motivo: 'EXTRA_INACTIVO',
-        mensaje: `El extra ${row.nombre || row.codigo || idExtra} esta inactivo.`
-      });
-      continue;
-    }
-    const insumoId = toPositiveInt(row?.id_insumo);
-    const insumoFactor = Number(row?.insumo_factor || 0);
-    const unidadId = snapshotUnidadId || toPositiveInt(row?.id_unidad_medida);
-    const nombre = context.nombre || row?.nombre || null;
-    const codigo = context.codigo || row?.codigo || null;
-    if (!insumoId || insumoFactor <= 0) {
-      faltantes.push({
-        tipo_recurso: 'extra',
-        id_recurso: idExtra,
-        id_extra: idExtra,
-        ...context,
-        nombre,
-        codigo,
-        motivo: 'EXTRA_SIN_CONFIGURACION_INVENTARIO',
-        mensaje: `El extra ${nombre || codigo || idExtra} no tiene id_insumo o cantidad de consumo configurada.`
-      });
-      continue;
-    }
-    if (!unidadId) {
-      faltantes.push({
-        tipo_recurso: 'extra',
-        id_recurso: idExtra,
-        id_extra: idExtra,
-        ...context,
-        nombre,
-        codigo,
+    for (const context of contexts) {
+      const snapshotUnidadId = toPositiveInt(context.id_unidad_medida);
+      if (!row) {
+        faltantes.push({
+          tipo_recurso: 'extra',
+          id_recurso: idExtra,
+          id_extra: idExtra,
+          ...context,
+          motivo: 'EXTRA_SIN_CONFIGURACION_INVENTARIO',
+          mensaje: `El extra ${context.nombre || context.codigo || idExtra} no tiene configuracion de inventario disponible.`
+        });
+        continue;
+      }
+      if (!Boolean(row.estado)) {
+        faltantes.push({
+          tipo_recurso: 'extra',
+          id_recurso: idExtra,
+          id_extra: idExtra,
+          ...context,
+          nombre: row.nombre,
+          codigo: row.codigo || null,
+          motivo: 'EXTRA_INACTIVO',
+          mensaje: `El extra ${row.nombre || row.codigo || idExtra} esta inactivo.`
+        });
+        continue;
+      }
+      const insumoId = toPositiveInt(row?.id_insumo);
+      const insumoFactor = Number(row?.insumo_factor || 0);
+      const unidadId = snapshotUnidadId || toPositiveInt(row?.id_unidad_medida);
+      const nombre = context.nombre || row?.nombre || null;
+      const codigo = context.codigo || row?.codigo || null;
+      if (!insumoId || insumoFactor <= 0) {
+        faltantes.push({
+          tipo_recurso: 'extra',
+          id_recurso: idExtra,
+          id_extra: idExtra,
+          ...context,
+          nombre,
+          codigo,
+          motivo: 'EXTRA_SIN_CONFIGURACION_INVENTARIO',
+          mensaje: `El extra ${nombre || codigo || idExtra} no tiene id_insumo o cantidad de consumo configurada.`
+        });
+        continue;
+      }
+      if (!unidadId) {
+        faltantes.push({
+          tipo_recurso: 'extra',
+          id_recurso: idExtra,
+          id_extra: idExtra,
+          ...context,
+          nombre,
+          codigo,
+          id_insumo: insumoId,
+          cant: insumoFactor,
+          motivo: 'EXTRA_SIN_UNIDAD_MEDIDA',
+          mensaje: `El extra ${nombre || codigo || idExtra} no tiene unidad de medida configurada.`
+        });
+        continue;
+      }
+      const lineQty = Number(context.cantidad || 0);
+      addToMapTotal(insumoQtyMap, insumoId, lineQty * insumoFactor);
+      addMovementRow(movimientoRows, {
+        tipo_recurso: 'insumo',
         id_insumo: insumoId,
-        cant: insumoFactor,
-        motivo: 'EXTRA_SIN_UNIDAD_MEDIDA',
-        mensaje: `El extra ${nombre || codigo || idExtra} no tiene unidad de medida configurada.`
+        id_detalle_pedido: context.id_detalle_pedido,
+        cantidad: lineQty * insumoFactor,
+        origen_consumo: 'EXTRA'
       });
-      continue;
     }
-    addToMapTotal(insumoQtyMap, insumoId, Number(extraQtyMap.get(idExtra) || 0) * insumoFactor);
-    addMovementRow(movimientoRows, {
-      tipo_recurso: 'insumo',
-      id_insumo: insumoId,
-      id_detalle_pedido: context.id_detalle_pedido,
-      cantidad: Number(extraQtyMap.get(idExtra) || 0) * insumoFactor,
-      origen_consumo: 'EXTRA'
-    });
+    if (contexts.length === 0) {
+      faltantes.push({
+        tipo_recurso: 'extra',
+        id_recurso: idExtra,
+        id_extra: idExtra,
+        ...firstExtraContext,
+        motivo: 'EXTRA_SIN_CONTEXTO_LINEA',
+        mensaje: `El extra ${idExtra} no tiene contexto de linea para inventario.`
+      });
+    }
   }
 
   const allRecipeIds = [...recetaQtyMap.keys()].sort((a, b) => a - b);

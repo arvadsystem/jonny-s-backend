@@ -3799,7 +3799,17 @@ const buildPedidoPendientePayload = async ({ client, body, userId, sucursalScope
   const validationItemsStart = perf?.now?.() || 0;
   const normalizedItemsResult = normalizeVentaItems(buildPedidoPendienteItemsBody(body));
   perf?.add?.('validation_items_ms', validationItemsStart);
-  if (!normalizedItemsResult.ok) return { ok: false, status: 400, body: { error: true, message: normalizedItemsResult.message } };
+  if (!normalizedItemsResult.ok) {
+    return {
+      ok: false,
+      status: 400,
+      body: {
+        error: true,
+        code: normalizedItemsResult.code || undefined,
+        message: normalizedItemsResult.message
+      }
+    };
+  }
   const hydrateLinesStart = perf?.now?.() || 0;
   const hydratedResult = await hydrateVentaLines(client, normalizedItemsResult.data, perf, {
     idSucursal,
@@ -4299,7 +4309,11 @@ const buildVentaPayload = async ({ client, body, userId, sucursalScope, canApply
     return {
       ok: false,
       status: 400,
-      body: { error: true, message: normalizedItemsResult.message }
+      body: {
+        error: true,
+        code: normalizedItemsResult.code || undefined,
+        message: normalizedItemsResult.message
+      }
     };
   }
 

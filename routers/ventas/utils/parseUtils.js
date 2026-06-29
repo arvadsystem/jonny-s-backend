@@ -93,7 +93,8 @@ export const parseComplementosPayload = (value) => {
   if (!Array.isArray(value)) {
     return { ok: false, message: 'complementos debe ser una lista valida.' };
   }
-  const dedupe = new Set();
+  const seen = new Set();
+  const normalized = [];
   for (const entry of value) {
     if (!isPlainObject(entry)) {
       return { ok: false, message: 'Cada complemento debe ser un objeto valido.' };
@@ -102,9 +103,17 @@ export const parseComplementosPayload = (value) => {
     if (!idComplemento) {
       return { ok: false, message: 'Cada complemento debe incluir id_complemento entero mayor a 0.' };
     }
-    dedupe.add(Number(idComplemento));
+    if (seen.has(idComplemento)) {
+      return {
+        ok: false,
+        code: 'VENTAS_COMPLEMENTO_DUPLICADO',
+        message: 'No se permite duplicar el mismo complemento en una linea.'
+      };
+    }
+    seen.add(idComplemento);
+    normalized.push(idComplemento);
   }
-  return { ok: true, data: [...dedupe].sort((a, b) => a - b) };
+  return { ok: true, data: normalized.sort((a, b) => a - b) };
 };
 
 export const parseVentaExtrasPayload = (value, { kind }) => {
@@ -186,14 +195,25 @@ export const parseEntityIdentifier = (value, fieldName) => {
     return { ok: true, value: null };
   }
 
-  const parsed = Number.parseInt(String(value), 10);
-  if (!Number.isInteger(parsed) || parsed <= 0) {
+  if (typeof value === 'number') {
+    if (!Number.isSafeInteger(value) || value <= 0) {
+      return {
+        ok: false,
+        message: `${fieldName} debe ser un entero mayor a 0 o null.`
+      };
+    }
+    return { ok: true, value };
+  }
+
+  const normalized = String(value).trim();
+  if (!/^0*[1-9]\d*$/.test(normalized)) {
     return {
       ok: false,
       message: `${fieldName} debe ser un entero mayor a 0 o null.`
     };
   }
 
+  const parsed = Number(normalized);
   return { ok: true, value: parsed };
 };
 

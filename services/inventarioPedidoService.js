@@ -171,7 +171,6 @@ export const validarYDescontarPedido = async (payload, options = {}) => {
       consumoResult.consumo.insumoQtyMap,
       excludedInsumoIds
     );
-    const generatedMovementCount = movimientoProductoQtyMap.size + movimientoInsumoQtyMap.size;
     const shortagesByResource = new Map(
       stockShortages.map((item) => [`${item.tipo_recurso}:${item.id_recurso}`, item])
     );
@@ -182,7 +181,9 @@ export const validarYDescontarPedido = async (payload, options = {}) => {
       actorUserId,
       idPedido,
       refOrigen: stockShortages.length > 0 ? movementRefForShortage : MOVEMENT_REF,
-      shortagesByResource
+      shortagesByResource,
+      excludedProductIds,
+      excludedInsumoIds
     });
     const existingMovementRows = await fetchPedidoInventoryMovementsForUpdate(client, idPedido);
     const movementState = analyzePedidoMovementState({
@@ -217,7 +218,7 @@ export const validarYDescontarPedido = async (payload, options = {}) => {
     }
 
     // 4) Registrar movimientos de salida ligados al pedido.
-    await registrarMovimientosPedido({
+    const generatedMovementCount = await registrarMovimientosPedido({
       client,
       idPedido,
       actorUserId,
@@ -228,7 +229,9 @@ export const validarYDescontarPedido = async (payload, options = {}) => {
       insumoTraceById: consumoResult.insumoTraceById,
       movementRows: consumoResult.consumo.movimientoRows,
       refOrigen: stockShortages.length > 0 ? movementRefForShortage : MOVEMENT_REF,
-      shortagesByResource
+      shortagesByResource,
+      excludedProductIds,
+      excludedInsumoIds
     });
 
     if (manageTransaction) await client.query('COMMIT');

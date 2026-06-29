@@ -71,6 +71,14 @@ const resourceKeyForMovement = (row) => {
   return null;
 };
 
+const createInventoryTraceError = (code, message, details = null) => {
+  const error = new Error(message);
+  error.httpStatus = 409;
+  error.code = code;
+  if (details) error.details = details;
+  return error;
+};
+
 const movementIdentityKey = (row) => [
   toPositiveInt(row?.id_detalle_pedido) || 0,
   String(row?.ref_origen || MOVEMENT_REF).trim().toUpperCase(),
@@ -142,6 +150,13 @@ export const analyzePedidoMovementState = ({ expectedRows = [], existingRows = [
 };
 
 const insertMovimiento = async (client, movement) => {
+  const idRef = toPositiveInt(movement?.id_ref);
+  if (!idRef) {
+    throw createInventoryTraceError(
+      'PEDIDO_TRAZABILIDAD_ID_REF_INVALIDO',
+      'No se pudo registrar inventario trazado sin id_ref de pedido valido.'
+    );
+  }
   await client.query(
     `
       INSERT INTO public.movimientos_inventario (
@@ -166,7 +181,7 @@ const insertMovimiento = async (client, movement) => {
       movement.id_detalle_pedido ? Number(movement.id_detalle_pedido) : null,
       movement.origen_consumo ? normalizeOrigenConsumo(movement.origen_consumo) : null,
       movement.ref_origen || MOVEMENT_REF,
-      Number(movement.id_ref),
+      idRef,
       String(movement.descripcion || '').trim() || null
     ]
   );
@@ -179,14 +194,30 @@ export const buildLineMovementRows = ({
   actorUserId,
   idPedido,
   refOrigen,
-  shortagesByResource
+  shortagesByResource,
+  excludedProductIds = new Set(),
+  excludedInsumoIds = new Set()
 }) => {
+  const pedidoId = toPositiveInt(idPedido);
+  if (!pedidoId) {
+    throw createInventoryTraceError(
+      'PEDIDO_TRAZABILIDAD_ID_REF_INVALIDO',
+      'No se pudo construir inventario trazado sin id_pedido valido.'
+    );
+  }
   const merged = new Map();
+  const incompleteRows = [];
   for (const row of Array.isArray(movementRows) ? movementRows : []) {
     const tipoRecurso = String(row?.tipo_recurso || '').trim().toLowerCase();
     const idDetallePedido = toPositiveInt(row?.id_detalle_pedido);
     const quantity = Number(row?.cantidad || 0);
-    if (!idDetallePedido || !Number.isFinite(quantity) || quantity <= 0) continue;
+    if (!Number.isFinite(quantity) || quantity <= 0) continue;
+    if (tipoRecurso === 'producto' && excludedProductIds.has(Number(row.id_producto || 0))) continue;
+    if (tipoRecurso === 'insumo' && excludedInsumoIds.has(Number(row.id_insumo || 0))) continue;
+    if (!idDetallePedido) {
+      incompleteRows.push(row);
+      continue;
+    }
 
     if (tipoRecurso === 'producto') {
       const rowProducto = productosById.get(Number(row.id_producto || 0));
@@ -206,6 +237,7 @@ export const buildLineMovementRows = ({
         id_producto: idProductoMovimiento,
         id_insumo: null,
         id_detalle_pedido: idDetallePedido,
+        id_ref: pedidoId,
         ref_origen: refOrigen,
         origen_consumo: normalizeOrigenConsumo(row.origen_consumo || 'PRODUCTO')
       };
@@ -231,12 +263,20 @@ export const buildLineMovementRows = ({
         id_producto: null,
         id_insumo: idInsumoMovimiento,
         id_detalle_pedido: idDetallePedido,
+        id_ref: pedidoId,
         ref_origen: refOrigen,
         origen_consumo: normalizeOrigenConsumo(row.origen_consumo || 'RECETA')
       };
       existing.cantidad += quantity;
       merged.set(key, existing);
     }
+  }
+  if (incompleteRows.length > 0) {
+    throw createInventoryTraceError(
+      'PEDIDO_TRAZABILIDAD_LINEA_INCOMPLETA',
+      'No se puede descontar inventario parcialmente: hay consumos fisicos sin id_detalle_pedido.',
+      { filas_sin_trazabilidad: incompleteRows.length }
+    );
   }
 
   return [...merged.values()]
@@ -250,7 +290,8 @@ export const buildLineMovementRows = ({
       const shortage = shortagesByResource.get(resourceKey) || null;
       return {
         ...row,
-        descripcion: `Descuento por pedido #${idPedido} linea #${row.id_detalle_pedido} (${row.id_producto ? `producto ${row.id_producto}` : `insumo ${row.id_insumo}`}; origen ${row.origen_consumo})${shortage ? ` - faltante auditado req:${shortage.requerido} disp:${shortage.disponible} deficit:${shortage.faltante}` : ''}${toPositiveInt(actorUserId) ? ` - usuario ${actorUserId}` : ''}`
+        id_ref: pedidoId,
+        descripcion: `Descuento por pedido #${pedidoId} linea #${row.id_detalle_pedido} (${row.id_producto ? `producto ${row.id_producto}` : `insumo ${row.id_insumo}`}; origen ${row.origen_consumo})${shortage ? ` - faltante auditado req:${shortage.requerido} disp:${shortage.disponible} deficit:${shortage.faltante}` : ''}${toPositiveInt(actorUserId) ? ` - usuario ${actorUserId}` : ''}`
       };
     });
 };
@@ -266,7 +307,9 @@ export const registrarMovimientosPedido = async ({
   insumoTraceById = new Map(),
   movementRows = [],
   refOrigen = MOVEMENT_REF,
-  shortagesByResource = new Map()
+  shortagesByResource = new Map(),
+  excludedProductIds = new Set(),
+  excludedInsumoIds = new Set()
 }) => {
   const lineMovementRows = buildLineMovementRows({
     movementRows,
@@ -275,13 +318,15 @@ export const registrarMovimientosPedido = async ({
     actorUserId,
     idPedido,
     refOrigen,
-    shortagesByResource
+    shortagesByResource,
+    excludedProductIds,
+    excludedInsumoIds
   });
-  if (lineMovementRows.length > 0) {
+  if (Array.isArray(movementRows) && movementRows.length > 0) {
     for (const row of lineMovementRows) {
       await insertMovimiento(client, row);
     }
-    return;
+    return lineMovementRows.length;
   }
 
   const productoIds = [...productoQtyMap.keys()].sort((a, b) => a - b);
@@ -320,5 +365,6 @@ export const registrarMovimientosPedido = async ({
       descripcion: `Descuento por pedido #${idPedido} (insumo ${idInsumo})${salsaTrace}${shortage ? ` - faltante auditado req:${shortage.requerido} disp:${shortage.disponible} deficit:${shortage.faltante}` : ''}${toPositiveInt(actorUserId) ? ` - usuario ${actorUserId}` : ''}`
     });
   }
+  return productoIds.length + insumoIds.length;
 };
 

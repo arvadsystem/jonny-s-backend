@@ -134,7 +134,7 @@ export const normalizeVentaItems = (items) => {
 
     const complementosResult = parseComplementosPayload(item.complementos);
     if (!complementosResult.ok) {
-      return { ok: false, message: complementosResult.message };
+      return { ok: false, code: complementosResult.code, message: complementosResult.message };
     }
     const extrasResult = parseVentaExtrasPayload(item.extras, { kind });
     if (!extrasResult.ok) {
