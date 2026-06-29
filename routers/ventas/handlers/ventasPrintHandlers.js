@@ -194,7 +194,8 @@ const toKitchenExtras = (extras = []) =>
   (Array.isArray(extras) ? extras : []).map((extra) => ({
     id_extra: Number(extra?.id_extra || 0) || null,
     nombre: String(extra?.nombre || extra?.nombre_extra || 'Extra').trim(),
-    cantidad: Number(extra?.cantidad ?? 0) || 0
+    cantidad: Number(extra?.cantidad_por_orden ?? extra?.origen_snapshot?.cantidad_por_orden ?? extra?.cantidad ?? 0) || 0,
+    cantidad_total: Number(extra?.cantidad_total ?? extra?.origen_snapshot?.cantidad_total ?? extra?.cantidad ?? 0) || 0
   }));
 
 const toKitchenComplementos = (item = {}) => {

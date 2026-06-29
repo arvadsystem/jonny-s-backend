@@ -273,14 +273,25 @@ const buildItemRows = (items = [], widthMm) => {
 
     if (Array.isArray(item.extras)) {
       for (const extra of item.extras) {
+        const perOrderQty = toMoneyNumber(extra.cantidad_por_orden || 0) > 0
+          ? toMoneyNumber(extra.cantidad_por_orden)
+          : toMoneyNumber(extra.cantidad || 1);
+        const totalQty = toMoneyNumber(extra.cantidad_total || extra.cantidad || perOrderQty);
         rows.push([
           text(''),
-          text(`+ ${extra.nombre || extra.nombre_extra || 'Extra'} x${extra.cantidad || 1}`, { fontSize: widthMm === 58 ? 5.5 : 6 }),
+          text(`+ ${extra.nombre || extra.nombre_extra || 'Extra'} x${perOrderQty} por orden`, { fontSize: widthMm === 58 ? 5.5 : 6 }),
           text(formatMoney(extra.subtotal || (toMoneyNumber(extra.precio_unitario) * toMoneyNumber(extra.cantidad || 1))), {
             alignment: 'right',
             fontSize: widthMm === 58 ? 5.5 : 6
           })
         ]);
+        if (totalQty !== perOrderQty) {
+          rows.push([
+            text(''),
+            text(`  Total extra: ${totalQty}`, { fontSize: widthMm === 58 ? 5 : 5.5 }),
+            text('', { alignment: 'right' })
+          ]);
+        }
       }
     }
 

@@ -340,7 +340,10 @@ const wrapInventoryMutationError = (error) => {
   return error;
 };
 
-const buildConsumptionSnapshot = (resolved, count, lineQuantity = 1) => ({
+const buildConsumptionSnapshot = (resolved, count, lineQuantity = 1) => {
+  const cantidadLinea = toPositiveInventoryInt(lineQuantity) || 1;
+  const porcionesPorOrden = Math.max(1, Number(count || 0));
+  return {
   id_complemento: resolved.id_complemento || resolved.id_salsa,
   id_salsa: resolved.id_salsa,
   nombre: String(resolved.nombre || 'Salsa').trim(),
@@ -351,13 +354,16 @@ const buildConsumptionSnapshot = (resolved, count, lineQuantity = 1) => ({
   cantidad_porcion: Number(resolved.cantidad_consumo_configurada || 0),
   id_unidad_consumo: resolved.id_unidad_consumo,
   cantidad_base_por_porcion: Number(resolved.cantidad_consumo_base || 0),
-  cantidad_base_total: Number(resolved.cantidad_consumo_base || 0) * count,
+  cantidad_base_total: Number(resolved.cantidad_consumo_base || 0) * porcionesPorOrden * cantidadLinea,
   id_unidad_base: resolved.id_unidad_base,
   id_almacen: resolved.id_almacen,
-  porciones: count,
-  cantidad_linea: toPositiveInventoryInt(lineQuantity) || 1,
+  porciones: porcionesPorOrden,
+  porciones_por_orden: porcionesPorOrden,
+  porciones_total: porcionesPorOrden * cantidadLinea,
+  cantidad_linea: cantidadLinea,
   usa_catalogo_maestro: Boolean(resolved.usa_catalogo_maestro)
-});
+  };
+};
 
 export const attachSalsaInventorySnapshotsToLines = async ({ client, lines = [], idSucursal }) => {
   const selected = normalizeSelectedSalsas(lines);
@@ -399,8 +405,6 @@ export const attachSalsaInventorySnapshotsToLines = async ({ client, lines = [],
           `La salsa ${source.nombre || idSalsa} no esta disponible en esta sucursal: ${String(resolved?.motivo_no_disponible || 'requiere revisar su configuracion de inventario.').toLowerCase()}`
         );
       }
-      // complementos_detalle ya representa el total autorizado para la linea completa.
-      // No se multiplica otra vez por cantidad para evitar sobreconsumo en RECETA.
       const snapshot = buildConsumptionSnapshot(resolved, count, line?.cantidad);
       if (!snapshot.id_insumo || !snapshot.id_almacen || snapshot.cantidad_base_total <= 0) {
         throw createInventoryError('VENTAS_SALSA_INVENTARIO_NO_DISPONIBLE', `La salsa ${source.nombre || idSalsa} requiere revisar su configuracion de inventario.`);
@@ -427,7 +431,8 @@ export const attachSalsaInventorySnapshotsToLines = async ({ client, lines = [],
             inventario: {
               ...snapshot,
               cantidad_base_total: snapshot.cantidad_base_por_porcion,
-              porciones: 1
+              porciones: snapshot.porciones_por_orden,
+              porciones_total: snapshot.porciones_total
             }
           }
         : salsa;

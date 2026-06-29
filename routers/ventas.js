@@ -2284,7 +2284,9 @@ const resolveLineExtras = ({ item, allowedExtrasMap }) => {
     if (!extra || extra.estado !== true) {
       return { ok: false, message: 'Uno o mas extras seleccionados no son validos para este item.' };
     }
-    const cantidad = Number(entry.cantidad || 0);
+    const cantidadPorOrden = Number(entry.cantidad || 0);
+    const cantidadLinea = Number(item.cantidad || 1);
+    const cantidad = cantidadPorOrden * cantidadLinea;
     if (extra.disponible !== true) {
       return {
         ok: false,
@@ -2318,6 +2320,8 @@ const resolveLineExtras = ({ item, allowedExtrasMap }) => {
       codigo: extra.codigo,
       nombre: extra.nombre,
       cantidad,
+      cantidad_por_orden: cantidadPorOrden,
+      cantidad_total: cantidad,
       precio_unitario: extra.precio_unitario,
       subtotal: lineSubtotal,
       id_insumo: controlsInventory ? extra.id_insumo : null,
@@ -2466,6 +2470,8 @@ const insertDetallePedidoExtras = async ({ client, idDetallePedido, extras = [] 
         codigo,
         nombre,
         cantidad,
+        cantidad_por_orden: Number(extra.cantidad_por_orden ?? (extra.cantidad || 0)),
+        cantidad_total: Number(extra.cantidad_total ?? (extra.cantidad || 0)),
         precio_unitario: precioUnitario,
         subtotal,
         id_insumo: idInsumo || null,
@@ -2588,7 +2594,8 @@ const fetchDetallePedidoExtras = async (client, detallePedidoIds = []) => {
         nombre_extra_snapshot AS nombre,
         cantidad,
         precio_unitario,
-        subtotal
+        subtotal,
+        origen_snapshot
       FROM public.detalle_pedido_extras
       WHERE id_detalle_pedido = ANY($1::int[])
         AND COALESCE(estado, true) = true
@@ -2605,6 +2612,8 @@ const fetchDetallePedidoExtras = async (client, detallePedidoIds = []) => {
       id_extra: Number(row.id_extra),
       nombre: row.nombre,
       cantidad: Number(row.cantidad),
+      cantidad_por_orden: Number(row.origen_snapshot?.cantidad_por_orden ?? row.cantidad),
+      cantidad_total: Number(row.origen_snapshot?.cantidad_total ?? row.cantidad),
       precio_unitario: roundMoney(row.precio_unitario),
       subtotal: roundMoney(row.subtotal)
     });

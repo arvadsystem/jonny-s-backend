@@ -231,6 +231,8 @@ export const buildPedidoPendienteRpcPayload = (pedidoPendiente = {}) => ({
         codigo: extra.codigo || null,
         nombre: extra.nombre || null,
         cantidad: Number(extra.cantidad || 0),
+        cantidad_por_orden: Number(extra.cantidad_por_orden ?? (extra.cantidad || 0)),
+        cantidad_total: Number(extra.cantidad_total ?? (extra.cantidad || 0)),
         precio_unitario: roundMoney(extra.precio_unitario),
         subtotal: roundMoney(extra.subtotal),
         id_insumo: extra.id_insumo || null,

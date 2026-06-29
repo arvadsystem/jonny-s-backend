@@ -13,6 +13,8 @@ import {
   parseVentaExtrasPayload
 } from '../utils/parseUtils.js';
 
+export const VENTA_ITEM_MAX_CANTIDAD = 999;
+
 export const buildComplementSnapshot = (line) => {
   const selected = Array.isArray(line?.complementos_detalle) ? line.complementos_detalle : [];
   if (selected.length === 0) return null;
@@ -51,6 +53,8 @@ export const buildComplementLineConfig = (line) => {
       codigo: String(entry?.codigo || '').trim() || null,
       nombre: String(entry?.nombre || 'Extra').trim(),
       cantidad: Number(entry?.cantidad || 0),
+      cantidad_por_orden: Number(entry?.cantidad_por_orden ?? (entry?.cantidad || 0)),
+      cantidad_total: Number(entry?.cantidad_total ?? (entry?.cantidad || 0)),
       precio_unitario: roundMoney(entry?.precio_unitario),
       subtotal: roundMoney(entry?.subtotal),
       id_insumo: entry?.id_insumo ? Number(entry.id_insumo) : null,
@@ -92,6 +96,12 @@ export const normalizeVentaItems = (items) => {
       return {
         ok: false,
         message: `La linea ${index + 1} debe incluir cantidad entera mayor a 0.`
+      };
+    }
+    if (cantidad > VENTA_ITEM_MAX_CANTIDAD) {
+      return {
+        ok: false,
+        message: `La linea ${index + 1} no puede superar ${VENTA_ITEM_MAX_CANTIDAD} unidades.`
       };
     }
 
