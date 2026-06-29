@@ -765,7 +765,7 @@ const registerInventoryReturn = async ({ client, idReversion, codigoReversion, c
   }
 };
 
-const buildSalsaInventorySnapshotsForReturn = (lineas = []) => {
+export const buildSalsaInventorySnapshotsForReturn = (lineas = []) => {
   const snapshots = [];
   for (const line of Array.isArray(lineas) ? lineas : []) {
     const source = line?.origen_snapshot;

@@ -3928,7 +3928,10 @@ const prepareDetalleFacturaDesdePedido = (row, idPedido) => {
   const subTotal = roundMoney(row.sub_total_pedido);
   const totalDetalle = roundMoney(row.total_pedido ?? row.sub_total_pedido);
   const precioBase = roundMoney(row.precio_unitario || (subTotal > 0 ? subTotal : totalDetalle));
-  const cantidad = inferKitchenItemQuantity(subTotal, precioBase);
+  const cantidadPersistida = Number(row.cantidad ?? 0);
+  const cantidad = Number.isFinite(cantidadPersistida) && cantidadPersistida > 0
+    ? cantidadPersistida
+    : inferKitchenItemQuantity(subTotal, precioBase);
   const precioUnitario = precioBase > 0 ? precioBase : roundMoney(subTotal / Math.max(cantidad, 1));
   const idDetallePedido = parseOptionalPositiveInt(row.id_detalle_pedido);
   const snapshot = buildPedidoFacturaSnapshot(row, cantidad, tipoItem, precioUnitario, subTotal, totalDetalle);
@@ -8528,6 +8531,7 @@ router.post('/ventas/pedidos/:id/registrar-pago', checkPermission(['VENTAS_CREAR
             dp.id_producto,
             dp.id_descuento,
             dp.id_receta,
+            dp.cantidad,
             dp.observacion,
             ${hasDetallePedidoConfiguracionMenu ? 'dp.configuracion_menu,' : 'NULL::jsonb AS configuracion_menu,'}
             COALESCE(prod.nombre_producto, rec.nombre_receta, 'Item de pedido') AS nombre_item,
@@ -8555,6 +8559,7 @@ router.post('/ventas/pedidos/:id/registrar-pago', checkPermission(['VENTAS_CREAR
             dp.id_producto,
             dp.id_descuento,
             dp.id_receta,
+            dp.cantidad,
             dp.observacion,
             ${hasDetallePedidoConfiguracionMenu ? 'dp.configuracion_menu,' : 'NULL::jsonb AS configuracion_menu,'}
             COALESCE(prod.nombre_producto, rec.nombre_receta, 'Item de pedido') AS nombre_item,
@@ -8651,7 +8656,10 @@ router.post('/ventas/pedidos/:id/registrar-pago', checkPermission(['VENTAS_CREAR
             : Math.max(roundMoney(totalLinea - subTotal), 0);
           const descuentoLinea = Math.max(roundMoney(subTotal + extrasSubtotal - totalLinea), 0);
           const precioBase = roundMoney(row.precio_unitario || (subTotal > 0 ? subTotal : totalLinea));
-          const cantidad = inferKitchenItemQuantity(subTotal, precioBase);
+          const cantidadPersistida = Number(row.cantidad ?? 0);
+          const cantidad = Number.isFinite(cantidadPersistida) && cantidadPersistida > 0
+            ? cantidadPersistida
+            : inferKitchenItemQuantity(subTotal, precioBase);
           return {
             id_detalle_pedido: parseOptionalPositiveInt(row.id_detalle_pedido),
             kind: normalizeTipoItem(idReceta ? 'RECETA' : idProducto ? 'PRODUCTO' : 'ITEM'),
