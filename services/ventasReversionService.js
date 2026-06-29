@@ -853,6 +853,13 @@ export const classifyPedidoMovementReturnState = ({ movements = [], lineas = [],
   }
   if (traced.length > 0 && legacy.length > 0) return 'TRACE_INCONSISTENT';
 
+  for (const row of rows) {
+    const idMovimiento = parsePositiveInt(row.id_movimiento);
+    const returnedQty = roundInventoryQuantity(Number(returnedByOrigin.get(idMovimiento) || 0));
+    const originalQty = roundInventoryQuantity(Number(row.cantidad || 0));
+    if (returnedQty > originalQty) return 'TRACE_INCONSISTENT';
+  }
+
   const allReturned = rows.every((row) => {
     const idMovimiento = parsePositiveInt(row.id_movimiento);
     return roundInventoryQuantity(Number(returnedByOrigin.get(idMovimiento) || 0)) >= roundInventoryQuantity(Number(row.cantidad || 0));
@@ -886,17 +893,10 @@ const restorePedidoInventoryMovementsForReversion = async ({
       WHERE mi.tipo = 'SALIDA'
         AND mi.ref_origen IN ('PEDIDO', 'FALTANTE_COCINA')
         AND mi.id_ref = $1
-        AND (
-          mi.id_detalle_pedido = ANY($2::int[])
-          OR mi.id_detalle_pedido IS NULL
-        )
       ORDER BY mi.id_movimiento
       FOR UPDATE
     `,
-    [
-      pedidoId,
-      [...new Set((Array.isArray(lineas) ? lineas : []).map((line) => parsePositiveInt(line?.id_detalle_pedido)).filter(Boolean))]
-    ]
+    [pedidoId]
   );
   const legacyMovements = movementResult.rows.filter((row) => !parsePositiveInt(row.id_detalle_pedido));
   const originIds = movementResult.rows
@@ -974,35 +974,42 @@ const restorePedidoInventoryMovementsForReversion = async ({
   if (!returnRows.length) return false;
 
   for (const row of returnRows) {
-    await client.query(
-      `
-        INSERT INTO public.movimientos_inventario (
-          tipo,
-          cantidad,
-          id_almacen,
-          id_producto,
-          id_insumo,
-          id_detalle_pedido,
-          origen_consumo,
-          id_movimiento_origen,
-          ref_origen,
-          id_ref,
-          descripcion
-        )
-        VALUES ('ENTRADA', $1, $2, $3, $4, $5, $6, $7, 'REVERSION_VENTA_INVENTARIO', $8, $9)
-      `,
-      [
-        row.cantidad,
-        row.id_almacen,
-        row.id_producto || null,
-        row.id_insumo || null,
-        row.id_detalle_pedido || null,
-        row.origen_consumo || null,
-        row.id_movimiento_origen || null,
-        idReversion,
-        `Entrada por línea #${row.id_detalle_pedido} en reversión ${codigoReversion} de venta ${codigoVenta}`
-      ]
-    );
+    try {
+      await client.query(
+        `
+          INSERT INTO public.movimientos_inventario (
+            tipo,
+            cantidad,
+            id_almacen,
+            id_producto,
+            id_insumo,
+            id_detalle_pedido,
+            origen_consumo,
+            id_movimiento_origen,
+            ref_origen,
+            id_ref,
+            descripcion
+          )
+          VALUES ('ENTRADA', $1, $2, $3, $4, $5, $6, $7, 'REVERSION_VENTA_INVENTARIO', $8, $9)
+        `,
+        [
+          row.cantidad,
+          row.id_almacen,
+          row.id_producto || null,
+          row.id_insumo || null,
+          row.id_detalle_pedido || null,
+          row.origen_consumo || null,
+          row.id_movimiento_origen || null,
+          idReversion,
+          `Entrada por línea #${row.id_detalle_pedido} en reversión ${codigoReversion} de venta ${codigoVenta}`
+        ]
+      );
+    } catch (error) {
+      if (error?.code === '23505') {
+        throw createReversionError(409, 'ALREADY_FULLY_RETURNED', 'El inventario de la venta ya fue devuelto o esta en proceso de devolucion.');
+      }
+      throw error;
+    }
   }
 
   return true;
@@ -1336,7 +1343,7 @@ export const createVentaReversion = async ({ idFactura, body, req, idUsuario, id
             total_revertido,
             devuelve_inventario
           )
-          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
         `,
         [
           idReversion,

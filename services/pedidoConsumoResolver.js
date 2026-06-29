@@ -57,6 +57,12 @@ const addContext = (map, id, item) => {
 
 const firstContext = (map, id) => (Array.isArray(map.get(id)) ? map.get(id)[0] : {}) || {};
 
+const hasExtraInventorySnapshot = (context) => (
+  context?.id_insumo !== null ||
+  context?.id_unidad_medida !== null ||
+  context?.cant !== null
+);
+
 const schemaColumnCache = new Map();
 const hasColumn = async (client, tableName, columnName) => {
   const key = `${String(tableName || '').trim().toLowerCase()}.${String(columnName || '').trim().toLowerCase()}`;
@@ -127,7 +133,6 @@ const fetchRecipeInsumoComponents = async (client, recipeIds) => {
         ${insumoFactorExpr} AS insumo_factor
       FROM public.detalle_recetas dr
       WHERE dr.id_receta = ANY($1::int[])
-        AND dr.id_insumo IS NOT NULL
         AND COALESCE(dr.estado, true) = true
     `,
     [recipeIds]
@@ -208,26 +213,20 @@ export const resolvePedidoConsumo = async ({ client, items }) => {
   const productoIds = [...productoQtyMap.keys()].sort((a, b) => a - b);
   const recetaIds = [...recetaQtyMap.keys()].sort((a, b) => a - b);
   const extraIds = [...extraQtyMap.keys()].sort((a, b) => a - b);
-  const extraIdsWithSnapshot = new Set();
-  for (const idExtra of extraIds) {
-    const contexts = extraContextById.get(idExtra) || [];
-    if (contexts.length > 0 && contexts.every((context) => toPositiveInt(context.id_insumo) && Number(context.cant || 0) > 0)) {
-      extraIdsWithSnapshot.add(idExtra);
-    }
-  }
-  const extraFallbackIds = extraIds.filter((idExtra) => !extraIdsWithSnapshot.has(idExtra));
 
   const [recetasRows, extrasRows] = await Promise.all([
     fetchRecetasByIds(client, recetaIds),
-    fetchExtrasByIds(client, extraFallbackIds)
+    fetchExtrasByIds(client, extraIds)
   ]);
 
   const recetasById = mapById(recetasRows, 'id_receta');
   const extrasById = mapById(extrasRows, 'id_extra');
+  const excludedRecipeIds = new Set();
 
   for (const idReceta of recetaIds) {
     const row = recetasById.get(idReceta);
     if (!row) {
+      excludedRecipeIds.add(idReceta);
       faltantes.push({
         tipo_recurso: 'receta',
         id_recurso: idReceta,
@@ -239,6 +238,7 @@ export const resolvePedidoConsumo = async ({ client, items }) => {
       continue;
     }
     if (!Boolean(row.estado)) {
+      excludedRecipeIds.add(idReceta);
       faltantes.push({
         tipo_recurso: 'receta',
         id_recurso: idReceta,
@@ -254,13 +254,24 @@ export const resolvePedidoConsumo = async ({ client, items }) => {
   for (const idExtra of extraIds) {
     const contexts = extraContextById.get(idExtra) || [];
     const firstExtraContext = firstContext(extraContextById, idExtra);
-    const hasSnapshotInventory = contexts.length > 0
-      && contexts.every((context) => toPositiveInt(context.id_insumo) && Number(context.cant || 0) > 0);
-
-    if (hasSnapshotInventory) {
-      for (const context of contexts) {
-        const snapshotInsumoId = toPositiveInt(context.id_insumo);
-        const snapshotFactor = Number(context.cant || 0);
+    const row = extrasById.get(idExtra);
+    for (const context of contexts) {
+      const hasSnapshotInventory = hasExtraInventorySnapshot(context);
+      const snapshotInsumoId = toPositiveInt(context.id_insumo);
+      const snapshotFactor = Number(context.cant || 0);
+      const snapshotUnidadId = toPositiveInt(context.id_unidad_medida);
+      if (hasSnapshotInventory) {
+        if (!snapshotInsumoId || snapshotFactor <= 0) {
+          faltantes.push({
+            tipo_recurso: 'extra',
+            id_recurso: idExtra,
+            id_extra: idExtra,
+            ...context,
+            motivo: 'EXTRA_SNAPSHOT_INVENTARIO_INVALIDO',
+            mensaje: `El snapshot de inventario del extra ${context.nombre || context.codigo || idExtra} esta incompleto.`
+          });
+          continue;
+        }
         const lineQty = Number(context.cantidad || 0);
         addToMapTotal(insumoQtyMap, snapshotInsumoId, lineQty * snapshotFactor);
         addMovementRow(movimientoRows, {
@@ -270,13 +281,8 @@ export const resolvePedidoConsumo = async ({ client, items }) => {
           cantidad: lineQty * snapshotFactor,
           origen_consumo: 'EXTRA'
         });
+        continue;
       }
-      continue;
-    }
-
-    const row = extrasById.get(idExtra);
-    for (const context of contexts) {
-      const snapshotUnidadId = toPositiveInt(context.id_unidad_medida);
       if (!row) {
         faltantes.push({
           tipo_recurso: 'extra',
@@ -356,15 +362,20 @@ export const resolvePedidoConsumo = async ({ client, items }) => {
     }
   }
 
-  const allRecipeIds = [...recetaQtyMap.keys()].sort((a, b) => a - b);
+  const allRecipeIds = [...recetaQtyMap.keys()].filter((idReceta) => !excludedRecipeIds.has(idReceta)).sort((a, b) => a - b);
   const recipeComponentsRows = await fetchRecipeInsumoComponents(client, allRecipeIds);
   const recipeComponentsById = new Map();
+  const invalidRecipeComponentIds = new Set();
 
   for (const row of recipeComponentsRows) {
     const recipeId = Number(row?.id_receta || 0);
     const insumoId = Number(row?.id_insumo || 0);
     const factor = Number(row?.insumo_factor || 0);
-    if (!recipeId || !insumoId || factor <= 0) continue;
+    if (!recipeId) continue;
+    if (!insumoId || factor <= 0) {
+      invalidRecipeComponentIds.add(recipeId);
+      continue;
+    }
     if (!recipeComponentsById.has(recipeId)) recipeComponentsById.set(recipeId, []);
     recipeComponentsById.get(recipeId).push({
       id_insumo: insumoId,
@@ -373,6 +384,18 @@ export const resolvePedidoConsumo = async ({ client, items }) => {
   }
 
   for (const idReceta of allRecipeIds) {
+    if (invalidRecipeComponentIds.has(idReceta)) {
+      faltantes.push({
+        tipo_recurso: 'receta',
+        id_recurso: idReceta,
+        id_receta: idReceta,
+        ...firstContext(recetaContextById, idReceta),
+        nombre: recetasById.get(idReceta)?.nombre_receta || null,
+        motivo: 'RECETA_CON_COMPONENTES_INVALIDOS',
+        mensaje: `La receta ${recetasById.get(idReceta)?.nombre_receta || idReceta} tiene componentes de inventario invalidos.`
+      });
+      continue;
+    }
     const components = recipeComponentsById.get(idReceta) || [];
     if (components.length === 0) {
       faltantes.push({

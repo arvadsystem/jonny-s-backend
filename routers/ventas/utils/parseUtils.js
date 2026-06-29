@@ -18,7 +18,7 @@ export const parsePositiveInt = (value) => {
   const normalized = value.trim();
   if (!/^0*[1-9]\d*$/.test(normalized)) return null;
   const parsed = Number(normalized);
-  return Number.isInteger(parsed) && parsed > 0 ? parsed : null;
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : null;
 };
 
 export const parseOptionalPositiveInt = (value) => {
@@ -176,8 +176,8 @@ export const parseOptionalDateInput = (value) => {
 
 export const coercePositiveIntArray = (value) =>
   [...new Set((Array.isArray(value) ? value : [])
-    .map((item) => Number.parseInt(String(item ?? ''), 10))
-    .filter((item) => Number.isInteger(item) && item > 0))];
+    .map((item) => parsePositiveInt(item))
+    .filter(Boolean))];
 
 export const parseBooleanish = (value) =>
   value === true ||
@@ -205,6 +205,13 @@ export const parseEntityIdentifier = (value, fieldName) => {
     return { ok: true, value };
   }
 
+  if (typeof value !== 'string') {
+    return {
+      ok: false,
+      message: `${fieldName} debe ser un entero mayor a 0 o null.`
+    };
+  }
+
   const normalized = String(value).trim();
   if (!/^0*[1-9]\d*$/.test(normalized)) {
     return {
@@ -214,6 +221,12 @@ export const parseEntityIdentifier = (value, fieldName) => {
   }
 
   const parsed = Number(normalized);
+  if (!Number.isSafeInteger(parsed) || parsed <= 0) {
+    return {
+      ok: false,
+      message: `${fieldName} debe ser un entero mayor a 0 o null.`
+    };
+  }
   return { ok: true, value: parsed };
 };
 

@@ -65,6 +65,27 @@ const normalizePositiveIdSet = (value) => new Set(
     .filter((id) => Number.isInteger(id) && id > 0)
 );
 
+const createPedidoMovementConflictError = ({ idPedido, movementState, cause }) => {
+  const isComplete = movementState?.state === 'COMPLETE';
+  const error = new Error(isComplete
+    ? `El pedido ${idPedido} ya fue descontado en inventario.`
+    : `El pedido ${idPedido} tiene movimientos de inventario parciales o inconsistentes.`);
+  error.httpStatus = 409;
+  error.code = isComplete ? 'PEDIDO_YA_DESCONTADO' : 'PEDIDO_INVENTARIO_PARCIAL_INCONSISTENTE';
+  error.details = {
+    id_movimiento: movementState?.id_movimiento || null,
+    movimientos_esperados: movementState?.expectedCount || 0,
+    movimientos_existentes: movementState?.existingCount || 0,
+    faltantes: movementState?.missing?.length || 0,
+    diferentes: movementState?.mismatched?.length || 0,
+    inesperados: movementState?.unexpected?.length || 0,
+    duplicados: movementState?.duplicates?.length || 0,
+    invalidos: movementState?.invalidRows?.length || 0,
+    constraint: cause?.constraint || null
+  };
+  return error;
+};
+
 export const validarYDescontarPedido = async (payload, options = {}) => {
   const normalized = normalizePedidoPayload(payload);
   if (!normalized.ok) {
@@ -191,48 +212,41 @@ export const validarYDescontarPedido = async (payload, options = {}) => {
       existingRows: existingMovementRows
     });
     if (movementState.state === 'COMPLETE') {
-      const error = new Error(`El pedido ${idPedido} ya fue descontado en inventario.`);
-      error.httpStatus = 409;
-      error.code = 'PEDIDO_YA_DESCONTADO';
-      error.details = {
-        id_movimiento: movementState.id_movimiento,
-        movimientos_esperados: movementState.expectedCount,
-        movimientos_existentes: movementState.existingCount
-      };
-      throw error;
+      throw createPedidoMovementConflictError({ idPedido, movementState });
     }
     if (movementState.state === 'PARTIAL') {
-      const error = new Error(`El pedido ${idPedido} tiene movimientos de inventario parciales o inconsistentes.`);
-      error.httpStatus = 409;
-      error.code = 'PEDIDO_INVENTARIO_PARCIAL_INCONSISTENTE';
-      error.details = {
-        movimientos_esperados: movementState.expectedCount,
-        movimientos_existentes: movementState.existingCount,
-        faltantes: movementState.missing?.length || 0,
-        diferentes: movementState.mismatched?.length || 0,
-        inesperados: movementState.unexpected?.length || 0,
-        duplicados: movementState.duplicates?.length || 0,
-        invalidos: movementState.invalidRows?.length || 0
-      };
-      throw error;
+      throw createPedidoMovementConflictError({ idPedido, movementState });
     }
 
     // 4) Registrar movimientos de salida ligados al pedido.
-    const generatedMovementCount = await registrarMovimientosPedido({
-      client,
-      idPedido,
-      actorUserId,
-      productoQtyMap: movimientoProductoQtyMap,
-      insumoQtyMap: movimientoInsumoQtyMap,
-      productosById: stockResult.lockedRows.productosById,
-      insumosById: stockResult.lockedRows.insumosById,
-      insumoTraceById: consumoResult.insumoTraceById,
-      movementRows: consumoResult.consumo.movimientoRows,
-      refOrigen: stockShortages.length > 0 ? movementRefForShortage : MOVEMENT_REF,
-      shortagesByResource,
-      excludedProductIds,
-      excludedInsumoIds
-    });
+    let generatedMovementCount = 0;
+    try {
+      generatedMovementCount = await registrarMovimientosPedido({
+        client,
+        idPedido,
+        actorUserId,
+        productoQtyMap: movimientoProductoQtyMap,
+        insumoQtyMap: movimientoInsumoQtyMap,
+        productosById: stockResult.lockedRows.productosById,
+        insumosById: stockResult.lockedRows.insumosById,
+        insumoTraceById: consumoResult.insumoTraceById,
+        movementRows: consumoResult.consumo.movimientoRows,
+        refOrigen: stockShortages.length > 0 ? movementRefForShortage : MOVEMENT_REF,
+        shortagesByResource,
+        excludedProductIds,
+        excludedInsumoIds
+      });
+    } catch (error) {
+      if (error?.code === '23505') {
+        const concurrentRows = await fetchPedidoInventoryMovementsForUpdate(client, idPedido);
+        const concurrentState = analyzePedidoMovementState({
+          expectedRows: expectedLineMovementRows,
+          existingRows: concurrentRows
+        });
+        throw createPedidoMovementConflictError({ idPedido, movementState: concurrentState, cause: error });
+      }
+      throw error;
+    }
 
     if (manageTransaction) await client.query('COMMIT');
 

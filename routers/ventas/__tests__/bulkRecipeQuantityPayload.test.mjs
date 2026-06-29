@@ -18,6 +18,7 @@ import {
 } from '../../../services/inventarioMovimientoService.js';
 import {
   parseComplementosPayload,
+  coercePositiveIntArray,
   parseEntityIdentifier
 } from '../utils/parseUtils.js';
 import { buildVentaKitchenPrintPayload } from '../handlers/ventasPrintHandlers.js';
@@ -35,7 +36,19 @@ import {
   normalizeVentaItems
 } from '../services/ventasPayloadService.js';
 
-const makeResolverClient = ({ recipeComponents = [{ id_receta: 12, id_insumo: 200, insumo_factor: '3' }] } = {}) => ({
+const makeResolverClient = ({
+  recipeComponents = [{ id_receta: 12, id_insumo: 200, insumo_factor: '3' }],
+  recetasRows = [{ id_receta: 12, nombre_receta: '12 alitas', estado: true }],
+  extrasRows = [{
+    id_extra: 8,
+    codigo: 'QUESO',
+    nombre: 'Queso',
+    estado: true,
+    id_insumo: 300,
+    insumo_factor: '0.5',
+    id_unidad_medida: 1
+  }]
+} = {}) => ({
   async query(sql, params = []) {
     const text = String(sql);
     if (text.includes('information_schema.columns')) {
@@ -43,20 +56,10 @@ const makeResolverClient = ({ recipeComponents = [{ id_receta: 12, id_insumo: 20
       return { rowCount: ['id_extra', 'cant'].includes(column) ? 1 : 0, rows: ['id_extra', 'cant'].includes(column) ? [{ column_name: column }] : [] };
     }
     if (text.includes('FROM public.recetas')) {
-      return { rows: [{ id_receta: 12, nombre_receta: '12 alitas', estado: true }] };
+      return { rows: recetasRows };
     }
     if (text.includes('FROM public.menu_extras')) {
-      return {
-        rows: [{
-          id_extra: 8,
-          codigo: 'QUESO',
-          nombre: 'Queso',
-          estado: true,
-          id_insumo: 300,
-          insumo_factor: '0.5',
-          id_unidad_medida: 1
-        }]
-      };
+      return { rows: extrasRows };
     }
     if (text.includes('FROM public.detalle_recetas')) {
       return { rows: recipeComponents };
@@ -304,6 +307,71 @@ describe('ventas bulk recipe quantity payload', () => {
     );
   });
 
+  it('resuelve extras mixtos con snapshot por linea y catalogo por linea', async () => {
+    const result = await resolvePedidoConsumo({
+      client: makeResolverClient({
+        extrasRows: [{
+          id_extra: 8,
+          codigo: 'QUESO',
+          nombre: 'Queso',
+          estado: true,
+          id_insumo: 300,
+          insumo_factor: '0.75',
+          id_unidad_medida: 1
+        }]
+      }),
+      items: [
+        { tipo_item: 'EXTRA', id_item: 8, id_extra: 8, id_detalle_pedido: 700, id_insumo: 300, cant: 0.5, cantidad: 1 },
+        { tipo_item: 'EXTRA', id_item: 8, id_extra: 8, id_detalle_pedido: 701, cantidad: 2 }
+      ]
+    });
+
+    assert.deepEqual(result.faltantes, []);
+    assert.equal(result.consumo.insumoQtyMap.get(300), 2);
+    assert.deepEqual(
+      result.consumo.movimientoRows.map((row) => [row.id_detalle_pedido, row.origen_consumo, row.id_insumo, row.cantidad]),
+      [
+        [700, 'EXTRA', 300, 0.5],
+        [701, 'EXTRA', 300, 1.5]
+      ]
+    );
+  });
+
+  it('bloquea snapshot parcial de extra sin generar movimiento de fallback', async () => {
+    const result = await resolvePedidoConsumo({
+      client: makeResolverClient(),
+      items: [
+        { tipo_item: 'EXTRA', id_item: 8, id_extra: 8, id_detalle_pedido: 700, id_insumo: 300, cantidad: 2 }
+      ]
+    });
+
+    assert.equal(result.faltantes[0].motivo, 'EXTRA_SNAPSHOT_INVENTARIO_INVALIDO');
+    assert.equal(result.consumo.insumoQtyMap.has(300), false);
+    assert.equal(result.consumo.movimientoRows.length, 0);
+  });
+
+  it('no expande recetas inactivas ni componentes invalidos aun con faltantes permitidos', async () => {
+    const inactive = await resolvePedidoConsumo({
+      client: makeResolverClient({
+        recetasRows: [{ id_receta: 12, nombre_receta: '12 alitas', estado: false }]
+      }),
+      items: [{ tipo_item: 'RECETA', id_item: 12, id_receta: 12, id_detalle_pedido: 700, cantidad: 2 }]
+    });
+    const invalidComponents = await resolvePedidoConsumo({
+      client: makeResolverClient({
+        recipeComponents: [{ id_receta: 12, id_insumo: null, insumo_factor: '3' }]
+      }),
+      items: [{ tipo_item: 'RECETA', id_item: 12, id_receta: 12, id_detalle_pedido: 700, cantidad: 2 }]
+    });
+
+    assert.equal(inactive.faltantes[0].motivo, 'RECETA_INACTIVA');
+    assert.equal(inactive.consumo.insumoQtyMap.size, 0);
+    assert.equal(inactive.consumo.movimientoRows.length, 0);
+    assert.equal(invalidComponents.faltantes[0].motivo, 'RECETA_CON_COMPONENTES_INVALIDOS');
+    assert.equal(invalidComponents.consumo.insumoQtyMap.size, 0);
+    assert.equal(invalidComponents.consumo.movimientoRows.length, 0);
+  });
+
   it('exige trazabilidad completa por linea para consumos fisicos descontables', () => {
     assert.throws(() => buildLineMovementRows({
       movementRows: [{ tipo_recurso: 'insumo', id_insumo: 200, cantidad: 1, origen_consumo: 'RECETA' }],
@@ -525,7 +593,16 @@ describe('ventas bulk recipe quantity payload', () => {
       returnedByOrigin: new Map([[1, 1]])
     }), 'ALREADY_FULLY_RETURNED');
     assert.equal(classifyPedidoMovementReturnState({
+      movements: traced,
+      lineas: [{ id_detalle_pedido: 700 }],
+      returnedByOrigin: new Map([[1, 1.000001]])
+    }), 'TRACE_INCONSISTENT');
+    assert.equal(classifyPedidoMovementReturnState({
       movements: [{ ...traced[0], id_movimiento: null }],
+      lineas: [{ id_detalle_pedido: 700 }]
+    }), 'TRACE_INCONSISTENT');
+    assert.equal(classifyPedidoMovementReturnState({
+      movements: [{ ...traced[0], id_detalle_pedido: 999 }],
       lineas: [{ id_detalle_pedido: 700 }]
     }), 'TRACE_INCONSISTENT');
     assert.equal(classifyPedidoMovementReturnState({
@@ -568,10 +645,11 @@ describe('ventas bulk recipe quantity payload', () => {
     for (const value of [12, '12', '0012']) {
       assert.equal(parseEntityIdentifier(value, 'id_receta').ok, true);
     }
-    for (const value of ['12abc', '7-extra', '10.5', 10.5, -1]) {
-      assert.equal(parseEntityIdentifier(value, 'id_receta').ok, false, `debe rechazar ${value}`);
+    for (const value of ['12abc', '7-extra', '10.5', 10.5, -1, Infinity, NaN, Number.MAX_SAFE_INTEGER + 1, [12], true, { id: 12 }, new Number(12)]) {
+      assert.equal(parseEntityIdentifier(value, 'id_receta').ok, false, `debe rechazar ${String(value)}`);
     }
     assert.deepEqual(parseEntityIdentifier(null, 'id_receta'), { ok: true, value: null });
+    assert.deepEqual(coercePositiveIntArray(['12', '12abc', 7, [8], true]), [12, 7]);
 
     const duplicate = parseComplementosPayload([{ id_complemento: 5 }, { id_complemento: 5 }]);
     assert.equal(duplicate.ok, false);
