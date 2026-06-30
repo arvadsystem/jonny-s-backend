@@ -78,9 +78,14 @@ assert.doesNotMatch(ventasSource, /consumeSalsasInventoryFromSnapshots\s*\(/, 'V
 const salsaServiceSource = readFileSync(new URL('../routers/ventas/services/salsasInventoryService.js', import.meta.url), 'utf8');
 assert.match(salsaServiceSource, /cantidad_base_total: snapshot\.cantidad_base_por_porcion/, 'cada seleccion persistida debe guardar una sola porcion');
 const cocinaSource = readFileSync(new URL('../routers/cocina.js', import.meta.url), 'utf8');
-assert.match(cocinaSource, /buildSalsaConsumptionItemsFromPedidoDetails/, 'Cocina debe incorporar snapshots al payload canonico');
+const payloadServiceSource = readFileSync(new URL('../services/pedidoInventoryPayloadService.js', import.meta.url), 'utf8');
+assert.match(cocinaSource, /buildPedidoConsumoPayload/, 'Cocina debe construir el payload canonico desde el pedido persistido');
+assert.match(payloadServiceSource, /buildSalsaConsumptionItemsFromPedidoDetails/, 'El payload canonico debe incorporar snapshots de salsa');
 assert.match(cocinaSource, /estadoDestino === 'EN_PREPARACION'/, 'el evento canonico debe seguir siendo EN_PREPARACION');
-assert.match(cocinaSource, /strictInsumoIds: strictSalsaInsumoIds/, 'los faltantes de salsa deben abortar aunque Cocina permita advertencias de receta');
+assert.match(cocinaSource, /shortageMode:\s*'FALTANTE_COCINA'/, 'Cocina debe registrar faltantes con ref_origen FALTANTE_COCINA');
+assert.match(cocinaSource, /strictInsumoIds: strictSalsaInsumoIds/, 'strictInsumoIds se conserva para errores de configuracion de salsa');
+const inventarioPedidoSource = readFileSync(new URL('../services/inventarioPedidoService.js', import.meta.url), 'utf8');
+assert.doesNotMatch(inventarioPedidoSource, /strictStockShortages/, 'strictInsumoIds no debe bloquear solo por stock insuficiente');
 const movementSource = readFileSync(new URL('../services/inventarioMovimientoService.js', import.meta.url), 'utf8');
 assert.match(movementSource, /fetchExistingPedidoMovement/, 'el consumo debe reutilizar idempotencia por pedido');
 

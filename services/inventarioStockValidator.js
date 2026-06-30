@@ -41,6 +41,7 @@ const buildShortage = ({
   const minimo = Number(stock_minimo || 0);
   const req = Number(requerido || 0);
   const disponible = Math.max(actual - minimo, 0);
+  const saldoProyectado = actual - req;
 
   return {
     tipo_recurso,
@@ -51,7 +52,9 @@ const buildShortage = ({
     motivo,
     requerido: req,
     disponible,
+    stock_disponible: disponible,
     faltante: Math.max(req - disponible, 0),
+    saldo_proyectado: saldoProyectado,
     cantidad_actual: actual,
     stock_minimo: minimo,
     mensaje: `Stock insuficiente para ${tipo_recurso} ${nombre || id_recurso}. Requerido: ${req}, disponible: ${disponible}.`

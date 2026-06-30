@@ -199,7 +199,6 @@ export const validarYDescontarPedido = async (payload, options = {}) => {
       (item) => String(item?.motivo || '').trim().toUpperCase() === 'STOCK_INSUFICIENTE'
     );
     const strictConfigFaults = configFaults.filter((item) => strictInsumoIds.has(Number(item?.id_insumo || item?.id_recurso)));
-    const strictStockShortages = stockShortages.filter((item) => strictInsumoIds.has(Number(item?.id_insumo || item?.id_recurso)));
     const operationalWarnings = Array.isArray(stockResult.advertencias)
       ? stockResult.advertencias
       : [];
@@ -260,8 +259,7 @@ export const validarYDescontarPedido = async (payload, options = {}) => {
       };
     }
 
-    if (strictStockShortages.length > 0 || (stockShortages.length > 0 && !allowNegativeStock)) {
-      const blockingStockShortages = strictStockShortages.length > 0 ? strictStockShortages : stockShortages;
+    if (stockShortages.length > 0 && !allowNegativeStock) {
       if (manageTransaction) await client.query('ROLLBACK');
       return {
         ok: false,
@@ -269,7 +267,7 @@ export const validarYDescontarPedido = async (payload, options = {}) => {
         message: 'No se pudo descontar inventario porque faltan recursos o hay configuraciones incompletas.',
         id_pedido: idPedido,
         id_sucursal: idSucursal,
-        faltantes: blockingStockShortages
+        faltantes: stockShortages
       };
     }
 

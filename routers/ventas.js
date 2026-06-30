@@ -2043,6 +2043,7 @@ const validarYDescontarInventarioCajaPedido = async ({
   try {
     const inventoryResult = await validarYDescontarPedido(consumoPayloadResult.payload, {
       id_usuario: idUsuario,
+      allowNegativeStock: true,
       dbClient: client
     });
     if (!inventoryResult?.ok) {
@@ -2063,6 +2064,34 @@ const validarYDescontarInventarioCajaPedido = async ({
       };
     }
     throw error;
+  }
+};
+
+const buildStockWarningResponse = (inventoryResult) => {
+  const faltantes = Array.isArray(inventoryResult?.warning?.faltantes)
+    ? inventoryResult.warning.faltantes
+    : [];
+  if (faltantes.length === 0) return null;
+  return {
+    code: inventoryResult?.warning?.code || 'STOCK_INSUFICIENTE_PERMITIDO',
+    message: 'La venta se completo y algunos recursos quedaron por debajo de cero.',
+    faltantes
+  };
+};
+
+const registrarAlertasInventarioVentaAfterCommit = async ({ idPedido, idUsuario, inventoryResult }) => {
+  const warnings = Array.isArray(inventoryResult?.warning?.faltantes)
+    ? inventoryResult.warning.faltantes
+    : [];
+  if (!parseOptionalPositiveInt(idPedido) || warnings.length === 0) return;
+  try {
+    await registrarAlertasInventarioPedido({
+      id_pedido: idPedido,
+      id_usuario: idUsuario,
+      warnings
+    });
+  } catch (error) {
+    console.error('No se pudieron registrar alertas de inventario de venta:', error?.message || error);
   }
 };
 
@@ -2367,14 +2396,8 @@ const resolveLineExtras = ({ item, allowedExtrasMap }) => {
         message: `El extra ${extra.nombre} no esta disponible en esta sucursal: requiere revisar su configuracion de inventario.`
       };
     }
-    if (controlsInventory && Number(extra.stock_disponible ?? 0) < requiredInsumo) {
-      return {
-        ok: false,
-        status: 409,
-        code: 'VENTAS_EXTRA_INVENTARIO_NO_DISPONIBLE',
-        message: `No hay existencias suficientes para el extra ${extra.nombre}.`
-      };
-    }
+    const stockDisponible = controlsInventory ? Number(extra.stock_disponible ?? 0) : null;
+    const saldoProyectado = controlsInventory ? stockDisponible - requiredInsumo : null;
     const lineSubtotal = roundMoney(extra.precio_unitario * cantidad);
     subtotal = roundMoney(subtotal + lineSubtotal);
     selected.push({
@@ -2391,6 +2414,9 @@ const resolveLineExtras = ({ item, allowedExtrasMap }) => {
       cant: controlsInventory ? Number(extra.cantidad_insumo || 0) : null,
       id_unidad_medida: extra.id_unidad_medida,
       stock_disponible: extra.stock_disponible,
+      cantidad_requerida: controlsInventory ? requiredInsumo : null,
+      saldo_proyectado: saldoProyectado,
+      stock_insuficiente: controlsInventory ? saldoProyectado < 0 : false,
       id_almacen: extra.id_almacen
     });
   }
@@ -2423,21 +2449,25 @@ const validateAggregatedExtrasInventory = (lines = []) => {
     }
   }
 
-  for (const usage of usageByStockKey.values()) {
-    if (usage.stockDisponible < usage.requerido) {
-      return {
-        ok: false,
-        status: 409,
-        body: {
-          error: true,
-          code: 'VENTAS_EXTRA_INVENTARIO_NO_DISPONIBLE',
-          message: `No hay existencias suficientes para el extra ${usage.nombre}.`
-        }
-      };
-    }
-  }
+  const warnings = [...usageByStockKey.values()]
+    .map((usage) => ({
+      tipo_recurso: 'insumo',
+      id_recurso: usage.idInsumo,
+      id_insumo: usage.idInsumo,
+      id_almacen: usage.idAlmacen,
+      nombre: usage.nombre,
+      motivo: 'STOCK_INSUFICIENTE',
+      requerido: roundMoney(usage.requerido),
+      cantidad_requerida: roundMoney(usage.requerido),
+      disponible: Number(usage.stockDisponible || 0),
+      stock_disponible: Number(usage.stockDisponible || 0),
+      faltante: Math.max(roundMoney(usage.requerido) - Number(usage.stockDisponible || 0), 0),
+      saldo_proyectado: Number(usage.stockDisponible || 0) - roundMoney(usage.requerido),
+      mensaje: `Stock insuficiente para el extra ${usage.nombre}. Requerido: ${roundMoney(usage.requerido)}, disponible: ${Number(usage.stockDisponible || 0)}.`
+    }))
+    .filter((warning) => warning.saldo_proyectado < 0);
 
-  return { ok: true };
+  return { ok: true, warnings };
 };
 
 const hasVentaExtras = (venta) =>
@@ -3251,17 +3281,8 @@ const hydrateVentaLines = async (client, normalizedItems, perf = null, options =
           }
         };
       }
-      if (controlsInventory && Number(extra.stock_disponible ?? 0) < requiredInsumo) {
-        return {
-          ok: false,
-          status: 409,
-          body: {
-            error: true,
-            code: 'VENTAS_EXTRA_INVENTARIO_NO_DISPONIBLE',
-            message: `No hay existencias suficientes para el extra ${extra.nombre}.`
-          }
-        };
-      }
+      const stockDisponible = controlsInventory ? Number(extra.stock_disponible ?? 0) : null;
+      const saldoProyectado = controlsInventory ? stockDisponible - requiredInsumo : null;
 
       const subTotal = roundMoney(precioUnitario * item.cantidad);
       const standaloneExtraDetail = {
@@ -3276,6 +3297,9 @@ const hydrateVentaLines = async (client, normalizedItems, perf = null, options =
         cant: controlsInventory ? Number(extra.cantidad_insumo || 0) : null,
         id_unidad_medida: extra.id_unidad_medida,
         stock_disponible: extra.stock_disponible,
+        cantidad_requerida: controlsInventory ? requiredInsumo : null,
+        saldo_proyectado: saldoProyectado,
+        stock_insuficiente: controlsInventory ? saldoProyectado < 0 : false,
         id_almacen: extra.id_almacen
       };
 
@@ -3382,7 +3406,7 @@ const hydrateVentaLines = async (client, normalizedItems, perf = null, options =
   if (!extrasInventoryResult.ok) return extrasInventoryResult;
 
   perf?.add?.('totals_items_ms', totalsItemsStart);
-  return { ok: true, data: { lines, subTotals } };
+  return { ok: true, data: { lines, subTotals, warnings: extrasInventoryResult.warnings || [] } };
 };
 
 const normalizePedidoCatalogCode = (value) =>
@@ -4497,7 +4521,10 @@ const buildVentaPayload = async ({ client, body, userId, sucursalScope, canApply
   perf?.add?.('auth_payload_context_ms', authContextStart);
   const totalsStart = perf?.now?.() || 0;
 
-  const hydratedResult = await hydrateVentaLines(client, normalizedItemsResult.data, perf, { idSucursal });
+  const hydratedResult = await hydrateVentaLines(client, normalizedItemsResult.data, perf, {
+    idSucursal,
+    validateProductStock: false
+  });
   if (!hydratedResult.ok) return hydratedResult;
 
   const { lines } = hydratedResult.data;
@@ -8008,12 +8035,14 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
           [rpcResponseBody.id_pedido]
         );
       }
-      await validarYDescontarInventarioCajaPedido({
+      const inventoryResult = await validarYDescontarInventarioCajaPedido({
         client,
         idPedido: rpcResponseBody.id_pedido,
         idSucursal: pedidoPendiente.id_sucursal,
         idUsuario: userId
       });
+      const stockWarning = buildStockWarningResponse(inventoryResult);
+      if (stockWarning) rpcResponseBody.warning = stockWarning;
       const commitStart = ventasPerf.now();
       await client.query('COMMIT');
       ventasPerf.add('commit_ms', commitStart);
@@ -8029,6 +8058,11 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
         idSucursal: pedidoPendiente.id_sucursal
       }).catch((err) => {
         console.error('No se pudo guardar resultado idempotente RPC de pedido pendiente:', err);
+      });
+      await registrarAlertasInventarioVentaAfterCommit({
+        idPedido: rpcResponseBody.id_pedido,
+        idUsuario: userId,
+        inventoryResult
       });
       ventasPerf.add('pedido_pendiente_idempotency_success_ms', idempotencySuccessStart);
       addPedidoPendienteTotalRoute();
@@ -8335,12 +8369,13 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
       );
     }
 
-    await validarYDescontarInventarioCajaPedido({
+    const inventoryResult = await validarYDescontarInventarioCajaPedido({
       client,
       idPedido,
       idSucursal: pedidoPendiente.id_sucursal,
       idUsuario: userId
     });
+    const stockWarning = buildStockWarningResponse(inventoryResult);
 
     const commitStart = ventasPerf.now();
     await client.query('COMMIT');
@@ -8357,7 +8392,8 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
       modalidad: pedidoPendiente.modalidad,
       total: pedidoPendiente.total,
       monto_pendiente: pedidoPendiente.total,
-      cuenta_dividida: cuentaDivididaResponse
+      cuenta_dividida: cuentaDivididaResponse,
+      warning: stockWarning
     };
     const idempotencySuccessStart = ventasPerf.now();
     await saveVentasIdempotencySuccess({
@@ -8369,6 +8405,11 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
       idSucursal: pedidoPendiente.id_sucursal
     }).catch((err) => {
       console.error('No se pudo guardar resultado idempotente de pedido pendiente:', err);
+    });
+    await registrarAlertasInventarioVentaAfterCommit({
+      idPedido,
+      idUsuario: userId,
+      inventoryResult
     });
     ventasPerf.add('pedido_pendiente_idempotency_success_ms', idempotencySuccessStart);
     addPedidoPendienteTotalRoute();
@@ -9428,12 +9469,15 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
       });
       const idPedidoRpc = parseOptionalPositiveInt(rpcCreateResult.response?.id_pedido);
       await persistVentaPedidoSnapshots({ client, idPedido: idPedidoRpc, venta });
-      await validarYDescontarInventarioCajaPedido({
+      const inventoryResult = await validarYDescontarInventarioCajaPedido({
         client,
         idPedido: idPedidoRpc,
         idSucursal: venta.id_sucursal,
         idUsuario: userId
       });
+      const rpcResponseBody = attachVentaSnapshotsToResponse(rpcCreateResult.response, venta);
+      const stockWarning = buildStockWarningResponse(inventoryResult);
+      if (stockWarning) rpcResponseBody.warning = stockWarning;
       if (ventaHasExtras) {
         const fidelizacionPedidoId = parseOptionalPositiveInt(rpcCreateResult.fidelizacionJob?.idPedido);
         if (!fidelizacionPedidoId) {
@@ -9453,7 +9497,7 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
         client,
         reservation: idempotencyReservation,
         httpStatus: 201,
-        responseBody: attachVentaSnapshotsToResponse(rpcCreateResult.response, venta),
+        responseBody: rpcResponseBody,
         idPedido: idPedidoRpc,
         idFactura: rpcCreateResult.response?.id_factura,
         idUsuario: userId,
@@ -9464,7 +9508,12 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
 
       ventasPerf.add('node_after_rpc_ms', rpcCreateResult.afterRpcStart);
       ventasPerf.log({ ...ventasPerfContext, status: 201 });
-      res.status(201).json(attachVentaSnapshotsToResponse(rpcCreateResult.response, venta));
+      await registrarAlertasInventarioVentaAfterCommit({
+        idPedido: idPedidoRpc,
+        idUsuario: userId,
+        inventoryResult
+      });
+      res.status(201).json(rpcResponseBody);
 
       void registerVentaFidelizacionAfterCommit(rpcCreateResult.fidelizacionJob);
       return;
@@ -9482,12 +9531,15 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
         idPedido: rpcCreateResult.response?.id_pedido,
         venta
       });
-      await validarYDescontarInventarioCajaPedido({
+      const inventoryResult = await validarYDescontarInventarioCajaPedido({
         client,
         idPedido: rpcCreateResult.response?.id_pedido,
         idSucursal: venta.id_sucursal,
         idUsuario: userId
       });
+      const rpcResponseBody = attachVentaSnapshotsToResponse(rpcCreateResult.response, venta);
+      const stockWarning = buildStockWarningResponse(inventoryResult);
+      if (stockWarning) rpcResponseBody.warning = stockWarning;
 
       const commitStart = ventasPerf.now();
       await client.query('COMMIT');
@@ -9497,7 +9549,7 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
         client,
         reservation: idempotencyReservation,
         httpStatus: 201,
-        responseBody: attachVentaSnapshotsToResponse(rpcCreateResult.response, venta),
+        responseBody: rpcResponseBody,
         idPedido: rpcCreateResult.response?.id_pedido,
         idFactura: rpcCreateResult.response?.id_factura,
         idUsuario: userId,
@@ -9508,7 +9560,12 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
 
       ventasPerf.add('node_after_rpc_ms', rpcCreateResult.afterRpcStart);
       ventasPerf.log({ ...ventasPerfContext, status: 201 });
-      res.status(201).json(attachVentaSnapshotsToResponse(rpcCreateResult.response, venta));
+      await registrarAlertasInventarioVentaAfterCommit({
+        idPedido: rpcCreateResult.response?.id_pedido,
+        idUsuario: userId,
+        inventoryResult
+      });
+      res.status(201).json(rpcResponseBody);
 
       void registerVentaFidelizacionAfterCommit(rpcCreateResult.fidelizacionJob);
       return;
@@ -9733,7 +9790,7 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
     }
     ventasPerf.add('detalle_pedido_insert_ms', detallePedidoInsertStart);
     ventasPerf.add('detalle_pedido_ms', detallePedidoStart);
-    await validarYDescontarInventarioCajaPedido({
+    const inventoryResult = await validarYDescontarInventarioCajaPedido({
       client,
       idPedido,
       idSucursal: venta.id_sucursal,
@@ -10037,6 +10094,8 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
       fidelizacion: acumulacionFidelizacion,
       cuentaDividida: cuentaDivididaResponse
     }), venta);
+    const stockWarning = buildStockWarningResponse(inventoryResult);
+    if (stockWarning) createVentaResponse.warning = stockWarning;
     ventasPerf.add('ticket_response_build_ms', ticketResponseStart);
 
     const commitStart = ventasPerf.now();
@@ -10054,6 +10113,11 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
       idSucursal: venta.id_sucursal
     }).catch((saveError) => {
       console.error('No se pudo guardar resultado idempotente de venta:', saveError);
+    });
+    await registrarAlertasInventarioVentaAfterCommit({
+      idPedido,
+      idUsuario: venta.id_usuario || userId,
+      inventoryResult
     });
 
     ventasPerf.log(ventasPerfContext);

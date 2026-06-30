@@ -1003,6 +1003,7 @@ router.put('/cocina/pedidos/:id/estado', checkPermission(COCINA_VIEW_PERMISSIONS
             id_usuario: req?.user?.id_usuario,
             allowNegativeStock: true,
             allowIncompleteConfiguration: true,
+            shortageMode: 'FALTANTE_COCINA',
             strictInsumoIds: strictSalsaInsumoIds,
             dbClient: client
           });

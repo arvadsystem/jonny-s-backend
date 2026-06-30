@@ -311,10 +311,12 @@ export const resolveSalsasInventory = async ({
       inventario_configurado: true,
       disponible: result.estado !== false
     };
-    if (result.stock_disponible < result.cantidad_consumo_base) {
-      return markUnavailable(result, 'SALSA_STOCK_INSUFICIENTE', { preserveInventoryConfiguration: true });
-    }
-    return result;
+    const saldoProyectado = Number(result.stock_disponible || 0) - Number(result.cantidad_consumo_base || 0);
+    return {
+      ...result,
+      stock_insuficiente: saldoProyectado < 0,
+      saldo_proyectado: saldoProyectado
+    };
   });
 };
 
@@ -361,6 +363,13 @@ export const buildSalsaConsumptionSnapshot = (resolved, count, lineQuantity = 1)
     porciones_por_orden: porcionesPorOrden,
     porciones_total: porcionesPorOrden * cantidadLinea,
     cantidad_linea: cantidadLinea,
+    stock_disponible: resolved.stock_disponible === null || resolved.stock_disponible === undefined
+      ? null
+      : Number(resolved.stock_disponible),
+    stock_insuficiente: Boolean(resolved.stock_insuficiente),
+    saldo_proyectado: resolved.saldo_proyectado === null || resolved.saldo_proyectado === undefined
+      ? null
+      : Number(resolved.saldo_proyectado),
     usa_catalogo_maestro: Boolean(resolved.usa_catalogo_maestro)
   };
 };
@@ -415,9 +424,13 @@ export const attachSalsaInventorySnapshotsToLines = async ({ client, lines = [],
         idAlmacen: snapshot.id_almacen,
         nombre: snapshot.nombre,
         stockDisponible: Number(resolved.stock_disponible ?? 0),
-        requerido: 0
+        requerido: 0,
+        consumos: []
       };
       current.requerido += snapshot.cantidad_base_total;
+      current.saldoProyectado = Number(current.stockDisponible || 0) - Number(current.requerido || 0);
+      current.stockInsuficiente = current.saldoProyectado < 0;
+      current.consumos.push(snapshot);
       usageByStockKey.set(stockKey, current);
       snapshots.push(snapshot);
     }
@@ -429,17 +442,12 @@ export const attachSalsaInventorySnapshotsToLines = async ({ client, lines = [],
         ? {
             ...salsa,
             inventario: {
-              ...snapshot
+              ...snapshot,
+              cantidad_base_total: snapshot.cantidad_base_por_porcion
             }
           }
         : salsa;
     });
-  }
-
-  for (const usage of usageByStockKey.values()) {
-    if (usage.stockDisponible < usage.requerido) {
-      throw createInventoryError('VENTAS_SALSA_STOCK_INSUFICIENTE', `No hay existencias suficientes para la salsa ${usage.nombre}.`);
-    }
   }
 
   return [...usageByStockKey.values()];
@@ -488,22 +496,23 @@ export const attachSalsaInventorySnapshotsToPublicLines = async ({ client, lines
       const snapshot = buildSalsaConsumptionSnapshot(inventory, portions, line?.cantidad);
       const stockKey = `${snapshot.id_insumo}:${snapshot.id_almacen}`;
       const usage = usageByStockKey.get(stockKey) || {
+        idInsumo: snapshot.id_insumo,
+        idAlmacen: snapshot.id_almacen,
         nombre: snapshot.nombre,
         stockDisponible: Number(inventory.stock_disponible || 0),
-        requerido: 0
+        requerido: 0,
+        consumos: []
       };
       usage.requerido += snapshot.cantidad_base_total;
+      usage.saldoProyectado = Number(usage.stockDisponible || 0) - Number(usage.requerido || 0);
+      usage.stockInsuficiente = usage.saldoProyectado < 0;
+      usage.consumos.push(snapshot);
       usageByStockKey.set(stockKey, usage);
       return {
         ...selection,
         inventario: snapshot
       };
     });
-  }
-  for (const usage of usageByStockKey.values()) {
-    if (usage.stockDisponible < usage.requerido) {
-      throw createInventoryError('VENTAS_SALSA_STOCK_INSUFICIENTE', `No hay existencias suficientes para la salsa ${usage.nombre}.`);
-    }
   }
   return lines;
 };
@@ -544,9 +553,12 @@ export const consumeSalsasInventoryFromSnapshots = async ({
       [row.idInsumo, row.idAlmacen]
     );
     const stock = Number(stockResult.rows?.[0]?.cantidad || 0);
-    if (!stockResult.rowCount || stock < row.cantidad) {
-      throw createInventoryError('VENTAS_SALSA_STOCK_INSUFICIENTE', `No hay existencias suficientes para salsa en inventario.`);
+    if (!stockResult.rowCount) {
+      throw createInventoryError('VENTAS_SALSA_INVENTARIO_NO_DISPONIBLE', 'No se encontro el stock de salsa para descontar inventario.');
     }
+    row.stockDisponible = stock;
+    row.saldoProyectado = stock - Number(row.cantidad || 0);
+    row.stockInsuficiente = row.saldoProyectado < 0;
     try {
       await client.query(
         `
