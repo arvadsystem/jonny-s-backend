@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import {
+  fetchExistingPedidoMovement,
+  fetchPedidoInventoryMovementsForUpdate,
   registrarMovimientosPedido,
   validateTracedPedidoMovement
 } from '../inventarioMovimientoService.js';
@@ -22,8 +24,16 @@ const baseOptions = (overrides = {}) => ({
   actorUserId: 11,
   productoQtyMap: new Map(),
   insumoQtyMap: new Map(),
-  productosById: new Map([[10, { id_producto: 10, id_almacen: 3 }]]),
-  insumosById: new Map([[22, { id_insumo: 22, id_almacen: 4 }]]),
+  productosById: new Map([
+    [8, { id_producto: 8, id_almacen: 5 }],
+    [10, { id_producto: 10, id_almacen: 3 }],
+    [11, { id_producto: 11, id_almacen: 3 }]
+  ]),
+  insumosById: new Map([
+    [22, { id_insumo: 22, id_almacen: 4 }],
+    [99, { id_insumo: 99, id_almacen: 6 }],
+    [100, { id_insumo: 100, id_almacen: 6 }]
+  ]),
   movementRows: [],
   ...overrides
 });
@@ -37,8 +47,25 @@ const productMovementRow = (overrides = {}) => ({
   ...overrides
 });
 
+const insumoMovementRow = (overrides = {}) => ({
+  tipo_recurso: 'insumo',
+  id_detalle_pedido: 9001,
+  id_insumo: 22,
+  cantidad: 2,
+  origen_consumo: 'RECETA',
+  ...overrides
+});
+
 const expectCode = async (fn, code) => {
   await assert.rejects(fn, (error) => {
+    assert.equal(error.code, code);
+    assert.equal(error.httpStatus, 409);
+    return true;
+  });
+};
+
+const expectSyncCode = (fn, code) => {
+  assert.throws(fn, (error) => {
     assert.equal(error.code, code);
     assert.equal(error.httpStatus, 409);
     return true;
@@ -116,20 +143,111 @@ describe('pedido traced movement registration', () => {
     }
   });
 
+  it('acepta origenes explicitos validos para producto e insumo', async () => {
+    const productOptions = baseOptions({
+      productoQtyMap: new Map([[10, 2]]),
+      movementRows: [productMovementRow({ origen_consumo: 'PRODUCTO' })]
+    });
+    await registrarMovimientosPedido(productOptions);
+    assert.equal(productOptions.client.queries[0].params[5], 'PRODUCTO');
+
+    for (const origenConsumo of ['RECETA', 'EXTRA', 'SALSA']) {
+      const options = baseOptions({
+        insumoQtyMap: new Map([[22, 2]]),
+        movementRows: [insumoMovementRow({ origen_consumo: origenConsumo })]
+      });
+      await registrarMovimientosPedido(options);
+      assert.equal(options.client.queries[0].params[5], origenConsumo);
+    }
+  });
+
+  it('bloquea origen_consumo nulo, vacio u OTRO en filas crudas', async () => {
+    for (const origen_consumo of [null, '', 'OTRO']) {
+      const options = baseOptions({
+        productoQtyMap: new Map([[10, 2]]),
+        movementRows: [productMovementRow({ origen_consumo })]
+      });
+      await expectCode(
+        () => registrarMovimientosPedido(options),
+        'ORIGEN_CONSUMO_INVALIDO'
+      );
+      assert.equal(options.client.queries.length, 0);
+    }
+  });
+
+  it('bloquea tipo_recurso invalido o vacio', async () => {
+    for (const tipo_recurso of ['otro', '']) {
+      const options = baseOptions({
+        productoQtyMap: new Map([[10, 2]]),
+        movementRows: [productMovementRow({ tipo_recurso })]
+      });
+      await expectCode(
+        () => registrarMovimientosPedido(options),
+        'PEDIDO_TRAZABILIDAD_TIPO_RECURSO_INVALIDO'
+      );
+      assert.equal(options.client.queries.length, 0);
+    }
+  });
+
+  it('bloquea producto o insumo sin id fisico o con id cruzado sobrante', async () => {
+    for (const row of [
+      productMovementRow({ id_producto: null }),
+      productMovementRow({ id_insumo: 22 }),
+      insumoMovementRow({ id_insumo: null }),
+      insumoMovementRow({ id_producto: 10 })
+    ]) {
+      const options = baseOptions({
+        productoQtyMap: new Map([[10, 2]]),
+        insumoQtyMap: new Map([[22, 2]]),
+        movementRows: [row]
+      });
+      await expectCode(
+        () => registrarMovimientosPedido(options),
+        'PEDIDO_TRAZABILIDAD_RECURSO_INVALIDO'
+      );
+      assert.equal(options.client.queries.length, 0);
+    }
+  });
+
+  it('bloquea producto no resuelto', async () => {
+    const options = baseOptions({
+      productoQtyMap: new Map([[123, 1]]),
+      movementRows: [productMovementRow({ id_producto: 123, cantidad: 1 })]
+    });
+    await expectCode(
+      () => registrarMovimientosPedido(options),
+      'PEDIDO_TRAZABILIDAD_PRODUCTO_NO_RESUELTO'
+    );
+    assert.equal(options.client.queries.length, 0);
+  });
+
+  it('bloquea insumo no resuelto', async () => {
+    const options = baseOptions({
+      insumoQtyMap: new Map([[123, 1]]),
+      movementRows: [insumoMovementRow({ id_insumo: 123, cantidad: 1 })]
+    });
+    await expectCode(
+      () => registrarMovimientosPedido(options),
+      'PEDIDO_TRAZABILIDAD_INSUMO_NO_RESUELTO'
+    );
+    assert.equal(options.client.queries.length, 0);
+  });
+
   it('bloquea detalle nulo', async () => {
     const options = baseOptions({
       productoQtyMap: new Map([[10, 1]]),
-      movementRows: [productMovementRow({ id_detalle_pedido: null })]
+      movementRows: [productMovementRow({ cantidad: 1, id_detalle_pedido: null })]
     });
     await expectCode(
       () => registrarMovimientosPedido(options),
       'PEDIDO_TRAZABILIDAD_LINEA_INCOMPLETA'
     );
+    assert.equal(options.client.queries.length, 0);
   });
 
   it('bloquea almacen nulo o cero', () => {
     for (const id_almacen of [null, 0]) {
-      assert.throws(
+      expectSyncCode(
         () => validateTracedPedidoMovement({
           id_ref: 700,
           id_pedido_trazabilidad: 700,
@@ -141,14 +259,14 @@ describe('pedido traced movement registration', () => {
           origen_consumo: 'PRODUCTO',
           ref_origen: 'PEDIDO'
         }),
-        { code: 'PEDIDO_TRAZABILIDAD_ALMACEN_INVALIDO' }
+        'PEDIDO_TRAZABILIDAD_ALMACEN_INVALIDO'
       );
     }
   });
 
   it('bloquea cantidad cero o negativa', () => {
     for (const cantidad of [0, -1]) {
-      assert.throws(
+      expectSyncCode(
         () => validateTracedPedidoMovement({
           id_ref: 700,
           id_pedido_trazabilidad: 700,
@@ -160,17 +278,17 @@ describe('pedido traced movement registration', () => {
           origen_consumo: 'PRODUCTO',
           ref_origen: 'PEDIDO'
         }),
-        { code: 'PEDIDO_TRAZABILIDAD_CANTIDAD_INVALIDA' }
+        'PEDIDO_TRAZABILIDAD_CANTIDAD_INVALIDA'
       );
     }
   });
 
-  it('bloquea recurso nulo o doble', () => {
+  it('bloquea recurso nulo o doble en movimiento normalizado', () => {
     for (const resource of [
       { id_producto: null, id_insumo: null },
       { id_producto: 10, id_insumo: 22 }
     ]) {
-      assert.throws(
+      expectSyncCode(
         () => validateTracedPedidoMovement({
           id_ref: 700,
           id_pedido_trazabilidad: 700,
@@ -181,12 +299,12 @@ describe('pedido traced movement registration', () => {
           ref_origen: 'PEDIDO',
           ...resource
         }),
-        { code: 'PEDIDO_TRAZABILIDAD_RECURSO_INVALIDO' }
+        'PEDIDO_TRAZABILIDAD_RECURSO_INVALIDO'
       );
     }
   });
 
-  it('bloquea origen_consumo invalido y ref_origen desconocido', () => {
+  it('bloquea origen_consumo invalido y ref_origen desconocido en movimiento normalizado', () => {
     const base = {
       id_ref: 700,
       id_pedido_trazabilidad: 700,
@@ -198,13 +316,181 @@ describe('pedido traced movement registration', () => {
       origen_consumo: 'PRODUCTO',
       ref_origen: 'PEDIDO'
     };
-    assert.throws(
+    expectSyncCode(
       () => validateTracedPedidoMovement({ ...base, origen_consumo: 'OTRO' }),
-      { code: 'ORIGEN_CONSUMO_INVALIDO' }
+      'ORIGEN_CONSUMO_INVALIDO'
     );
-    assert.throws(
+    expectSyncCode(
       () => validateTracedPedidoMovement({ ...base, ref_origen: 'OTRO' }),
-      { code: 'PEDIDO_TRAZABILIDAD_REF_ORIGEN_INVALIDO' }
+      'PEDIDO_TRAZABILIDAD_REF_ORIGEN_INVALIDO'
     );
+  });
+
+  it('acepta total canonico valido para producto 8', async () => {
+    const options = baseOptions({
+      productoQtyMap: new Map([[8, 8]]),
+      movementRows: [productMovementRow({ id_producto: 8, cantidad: 8 })]
+    });
+    const count = await registrarMovimientosPedido(options);
+    assert.equal(count, 1);
+    assert.equal(options.client.queries[0].params[2], 8);
+    assert.equal(options.client.queries[0].params[0], 8);
+  });
+
+  it('bloquea total canonico invalido para producto 8', async () => {
+    const options = baseOptions({
+      productoQtyMap: new Map([[8, 8]]),
+      movementRows: [productMovementRow({ id_producto: 8, cantidad: 7.999999 })]
+    });
+    await expectCode(
+      () => registrarMovimientosPedido(options),
+      'PEDIDO_TRAZABILIDAD_TOTALES_INCONSISTENTES'
+    );
+    assert.equal(options.client.queries.length, 0);
+  });
+
+  it('acepta total canonico valido para insumo 99', async () => {
+    const options = baseOptions({
+      insumoQtyMap: new Map([[99, 99]]),
+      movementRows: [insumoMovementRow({ id_insumo: 99, cantidad: 99 })]
+    });
+    const count = await registrarMovimientosPedido(options);
+    assert.equal(count, 1);
+    assert.equal(options.client.queries[0].params[3], 99);
+    assert.equal(options.client.queries[0].params[0], 99);
+  });
+
+  it('bloquea total canonico invalido para insumo 99', async () => {
+    const options = baseOptions({
+      insumoQtyMap: new Map([[99, 99]]),
+      movementRows: [insumoMovementRow({ id_insumo: 99, cantidad: 98.999999 })]
+    });
+    await expectCode(
+      () => registrarMovimientosPedido(options),
+      'PEDIDO_TRAZABILIDAD_TOTALES_INCONSISTENTES'
+    );
+    assert.equal(options.client.queries.length, 0);
+  });
+
+  it('acepta dos lineas de producto que suman el total canonico', async () => {
+    const options = baseOptions({
+      productoQtyMap: new Map([[8, 8]]),
+      movementRows: [
+        productMovementRow({ id_detalle_pedido: 9001, id_producto: 8, cantidad: 3 }),
+        productMovementRow({ id_detalle_pedido: 9002, id_producto: 8, cantidad: 5 })
+      ]
+    });
+    const count = await registrarMovimientosPedido(options);
+    assert.equal(count, 2);
+    assert.equal(options.client.queries.length, 2);
+  });
+
+  it('acepta dos lineas de insumo que suman el total canonico', async () => {
+    const options = baseOptions({
+      insumoQtyMap: new Map([[99, 99]]),
+      movementRows: [
+        insumoMovementRow({ id_detalle_pedido: 9001, id_insumo: 99, cantidad: 50 }),
+        insumoMovementRow({ id_detalle_pedido: 9002, id_insumo: 99, cantidad: 49 })
+      ]
+    });
+    const count = await registrarMovimientosPedido(options);
+    assert.equal(count, 2);
+    assert.equal(options.client.queries.length, 2);
+  });
+
+  it('bloquea total canonico con recurso faltante', async () => {
+    const options = baseOptions({
+      productoQtyMap: new Map([[8, 8]]),
+      insumoQtyMap: new Map([[99, 99]]),
+      movementRows: [productMovementRow({ id_producto: 8, cantidad: 8 })]
+    });
+    await assert.rejects(
+      () => registrarMovimientosPedido(options),
+      (error) => {
+        assert.equal(error.code, 'PEDIDO_TRAZABILIDAD_TOTALES_INCONSISTENTES');
+        assert.deepEqual(error.details.missing, [{ key: 'insumo:99', expected: 99 }]);
+        return true;
+      }
+    );
+    assert.equal(options.client.queries.length, 0);
+  });
+
+  it('bloquea total canonico con recurso inesperado', async () => {
+    const options = baseOptions({
+      productoQtyMap: new Map([[8, 8]]),
+      movementRows: [
+        productMovementRow({ id_producto: 8, cantidad: 8 }),
+        insumoMovementRow({ id_insumo: 99, cantidad: 99 })
+      ]
+    });
+    await assert.rejects(
+      () => registrarMovimientosPedido(options),
+      (error) => {
+        assert.equal(error.code, 'PEDIDO_TRAZABILIDAD_TOTALES_INCONSISTENTES');
+        assert.deepEqual(error.details.unexpected, [{ key: 'insumo:99', traced: 99 }]);
+        return true;
+      }
+    );
+    assert.equal(options.client.queries.length, 0);
+  });
+
+  it('bloquea diferencia canonica a 6 decimales', async () => {
+    const options = baseOptions({
+      productoQtyMap: new Map([[8, 1.0000004]]),
+      movementRows: [productMovementRow({ id_producto: 8, cantidad: 1.0000014 })]
+    });
+    await assert.rejects(
+      () => registrarMovimientosPedido(options),
+      (error) => {
+        assert.equal(error.code, 'PEDIDO_TRAZABILIDAD_TOTALES_INCONSISTENTES');
+        assert.deepEqual(error.details.mismatched, [{ key: 'producto:8', expected: 1, traced: 1.000001 }]);
+        return true;
+      }
+    );
+    assert.equal(options.client.queries.length, 0);
+  });
+
+  it('no inserta nada si la segunda fila cruda es invalida', async () => {
+    const options = baseOptions({
+      productoQtyMap: new Map([[10, 2]]),
+      insumoQtyMap: new Map([[22, 2]]),
+      movementRows: [
+        productMovementRow(),
+        insumoMovementRow({ origen_consumo: null })
+      ]
+    });
+    await expectCode(
+      () => registrarMovimientosPedido(options),
+      'ORIGEN_CONSUMO_INVALIDO'
+    );
+    assert.equal(options.client.queries.length, 0);
+  });
+
+  it('inserta exactamente dos movimientos si dos filas crudas son validas', async () => {
+    const options = baseOptions({
+      productoQtyMap: new Map([[10, 2]]),
+      insumoQtyMap: new Map([[22, 2]]),
+      movementRows: [
+        productMovementRow(),
+        insumoMovementRow()
+      ]
+    });
+    const count = await registrarMovimientosPedido(options);
+    assert.equal(count, 2);
+    assert.equal(options.client.queries.length, 2);
+  });
+
+  it('mantiene lectura indexable por ref_origen = ANY sin UPPER ni BTRIM', async () => {
+    const existingClient = createClient();
+    await fetchExistingPedidoMovement(existingClient, 88);
+    assert.match(existingClient.queries[0].sql, /ref_origen\s+=\s+ANY\(\$1::text\[\]\)/);
+    assert.doesNotMatch(existingClient.queries[0].sql, /UPPER\(/);
+    assert.doesNotMatch(existingClient.queries[0].sql, /BTRIM\(/);
+
+    const lockClient = createClient();
+    await fetchPedidoInventoryMovementsForUpdate(lockClient, 88);
+    assert.match(lockClient.queries[0].sql, /ref_origen\s+=\s+ANY\(\$1::text\[\]\)/);
+    assert.doesNotMatch(lockClient.queries[0].sql, /UPPER\(/);
+    assert.doesNotMatch(lockClient.queries[0].sql, /BTRIM\(/);
   });
 });
