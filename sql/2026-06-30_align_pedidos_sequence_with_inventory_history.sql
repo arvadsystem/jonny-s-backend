@@ -21,6 +21,12 @@ DECLARE
   v_max_pedido bigint;
   v_max_inventory_ref bigint;
   v_sequence_last bigint;
+  v_sequence_is_called boolean;
+  v_sequence_increment bigint;
+  v_sequence_cycle boolean;
+  v_sequence_max bigint;
+  v_sequence_next_candidate bigint;
+  v_history_floor bigint;
   v_safe_value bigint;
   v_seq_schema text;
   v_seq_name text;
@@ -61,17 +67,51 @@ BEGIN
   JOIN pg_namespace n ON n.oid = c.relnamespace
   WHERE c.oid = v_sequence_regclass;
 
-  SELECT last_value
-    INTO v_sequence_last
-  FROM pg_sequences
-  WHERE schemaname = v_seq_schema
-    AND sequencename = v_seq_name;
+  SELECT seq.seqincrement::bigint, seq.seqcycle::boolean, seq.seqmax::bigint
+    INTO v_sequence_increment, v_sequence_cycle, v_sequence_max
+  FROM pg_sequence seq
+  WHERE seq.seqrelid = v_sequence_regclass;
 
-  IF v_sequence_last IS NULL THEN
-    RAISE EXCEPTION 'Preflight fallido: no se pudo leer last_value de la secuencia %.', v_sequence_name;
+  EXECUTE format(
+    'SELECT last_value::bigint, is_called::boolean FROM %I.%I',
+    v_seq_schema,
+    v_seq_name
+  )
+  INTO v_sequence_last, v_sequence_is_called;
+
+  IF v_sequence_last IS NULL OR v_sequence_is_called IS NULL THEN
+    RAISE EXCEPTION 'Preflight fallido: no se pudo leer last_value/is_called de la secuencia %.', v_sequence_name;
   END IF;
 
-  v_safe_value := GREATEST(v_max_pedido, v_max_inventory_ref, v_sequence_last);
+  IF v_sequence_increment IS NULL OR v_sequence_increment <= 0 THEN
+    RAISE EXCEPTION 'Preflight fallido: la secuencia % tiene incremento inseguro (%).', v_sequence_name, v_sequence_increment;
+  END IF;
+
+  IF v_sequence_cycle IS TRUE THEN
+    RAISE EXCEPTION 'Preflight fallido: la secuencia % tiene CYCLE activo.', v_sequence_name;
+  END IF;
+
+  v_history_floor := GREATEST(v_max_pedido, v_max_inventory_ref);
+  v_sequence_next_candidate := CASE
+    WHEN v_sequence_is_called THEN v_sequence_last + v_sequence_increment
+    ELSE v_sequence_last
+  END;
+
+  IF v_sequence_next_candidate > v_sequence_max THEN
+    RAISE EXCEPTION 'Preflight fallido: la secuencia % esta agotada; next_candidate=%, max_value=%.',
+      v_sequence_name,
+      v_sequence_next_candidate,
+      v_sequence_max;
+  END IF;
+
+  v_safe_value := GREATEST(v_history_floor, v_sequence_last);
+
+  IF (v_safe_value + v_sequence_increment) > v_sequence_max THEN
+    RAISE EXCEPTION 'Preflight fallido: alinear % a % agotaria la secuencia; max_value=%.',
+      v_sequence_name,
+      v_safe_value,
+      v_sequence_max;
+  END IF;
 
   PERFORM setval(v_sequence_name, v_safe_value, true);
 
@@ -79,17 +119,19 @@ BEGIN
     RAISE EXCEPTION 'Validacion fallida: safe_value (%) redujo un piso calculado.', v_safe_value;
   END IF;
 
-  -- With is_called=true, nextval() will return last_value + increment_by.
-  -- We do not call nextval() here because validation must not consume a pedido ID.
-  IF (v_safe_value + 1) <= GREATEST(v_max_pedido, v_max_inventory_ref) THEN
+  -- With is_called=true, the next generated value will be last_value + increment_by.
+  -- Validation must not consume a pedido ID.
+  IF (v_safe_value + v_sequence_increment) <= v_history_floor THEN
     RAISE EXCEPTION 'Validacion fallida: el proximo id_pedido no supera el historial de pedidos/inventario.';
   END IF;
 
-  RAISE NOTICE 'Secuencia % alineada: max_pedidos=%, max_inventory_order_ref=%, sequence_last=%, safe_value=%.',
+  RAISE NOTICE 'Secuencia % alineada: max_pedidos=%, max_inventory_order_ref=%, sequence_last=%, is_called=%, increment_by=%, safe_value=%.',
     v_sequence_name,
     v_max_pedido,
     v_max_inventory_ref,
     v_sequence_last,
+    v_sequence_is_called,
+    v_sequence_increment,
     v_safe_value;
 END;
 $$;

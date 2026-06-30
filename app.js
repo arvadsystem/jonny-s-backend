@@ -149,58 +149,101 @@ const assertInventoryTracePreflightReady = async () => {
 
 const assertPedidosSequencePreflightReady = async () => {
   const result = await healthCheckQueryRunner.query(`
-    WITH sequence_info AS (
-      SELECT
-        pg_get_serial_sequence('public.pedidos', 'id_pedido') AS sequence_name,
-        to_regclass('public.pedidos') AS pedidos_table,
-        to_regclass('public.movimientos_inventario') AS inventory_table
-    ),
-    sequence_parts AS (
-      SELECT
-        sequence_name,
-        pedidos_table,
-        inventory_table,
-        split_part(sequence_name, '.', 1) AS sequence_schema,
-        split_part(sequence_name, '.', 2) AS sequence_relation
-      FROM sequence_info
-    )
     SELECT
-      sequence_name,
-      pedidos_table IS NOT NULL AS pedidos_exists,
-      inventory_table IS NOT NULL AS inventory_exists,
-      (
-        SELECT s.last_value
-        FROM pg_sequences s
-        WHERE s.schemaname = sequence_parts.sequence_schema
-          AND s.sequencename = sequence_parts.sequence_relation
-      )::bigint AS sequence_last_value,
-      COALESCE((SELECT MAX(id_pedido)::bigint FROM public.pedidos), 0) AS max_pedido_id,
+      pg_get_serial_sequence('public.pedidos', 'id_pedido') AS sequence_name,
+      to_regclass('public.pedidos') IS NOT NULL AS pedidos_exists,
+      to_regclass('public.movimientos_inventario') IS NOT NULL AS inventory_exists
+  `);
+  const row = result.rows?.[0] || {};
+  if (!row.pedidos_exists) {
+    const error = new Error('PEDIDOS_TABLE_MISSING');
+    error.code = 'PEDIDOS_TABLE_MISSING';
+    throw error;
+  }
+  if (!row.inventory_exists) {
+    const error = new Error('MOVIMIENTOS_INVENTARIO_TABLE_MISSING');
+    error.code = 'MOVIMIENTOS_INVENTARIO_TABLE_MISSING';
+    throw error;
+  }
+  if (!row.sequence_name) {
+    const error = new Error('PEDIDOS_SEQUENCE_MISSING');
+    error.code = 'PEDIDOS_SEQUENCE_MISSING';
+    throw error;
+  }
+
+  const sequenceMetaResult = await healthCheckQueryRunner.query(`
+    SELECT
+      n.nspname AS sequence_schema,
+      c.relname AS sequence_relation,
+      seq.seqincrement::bigint AS sequence_increment_by,
+      seq.seqcycle::boolean AS sequence_cycle,
+      seq.seqmin::bigint AS sequence_min_value,
+      seq.seqmax::bigint AS sequence_max_value
+    FROM pg_class c
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    JOIN pg_sequence seq ON seq.seqrelid = c.oid
+    WHERE c.oid = $1::regclass
+    LIMIT 1
+  `, [row.sequence_name]);
+  const sequenceMeta = sequenceMetaResult.rows?.[0] || {};
+  if (!sequenceMeta.sequence_schema || !sequenceMeta.sequence_relation) {
+    const error = new Error('PEDIDOS_SEQUENCE_MISSING');
+    error.code = 'PEDIDOS_SEQUENCE_MISSING';
+    throw error;
+  }
+
+  const sequenceIdentifier = `"${String(sequenceMeta.sequence_schema).replaceAll('"', '""')}"."${String(sequenceMeta.sequence_relation).replaceAll('"', '""')}"`;
+  const sequenceStateResult = await healthCheckQueryRunner.query(`
+    SELECT last_value::bigint AS sequence_last_value, is_called::boolean AS sequence_is_called
+    FROM ${sequenceIdentifier}
+  `);
+  const historyResult = await healthCheckQueryRunner.query(`
+    SELECT
+      COALESCE(MAX(id_pedido), 0)::bigint AS max_pedido_id,
       COALESCE((
         SELECT MAX(id_ref)::bigint
         FROM public.movimientos_inventario
         WHERE ref_origen IN ('PEDIDO', 'FALTANTE_COCINA')
-      ), 0) AS max_inventory_order_ref
-    FROM sequence_parts
+          AND id_ref IS NOT NULL
+      ), 0)::bigint AS max_inventory_order_ref
+    FROM public.pedidos
   `);
-  const row = result.rows?.[0] || {};
-  const sequenceLastValue = Number(row.sequence_last_value || 0);
-  const maxPedidoId = Number(row.max_pedido_id || 0);
-  const maxInventoryOrderRef = Number(row.max_inventory_order_ref || 0);
+
+  const sequenceState = sequenceStateResult.rows?.[0] || {};
+  const history = historyResult.rows?.[0] || {};
+  const sequenceLastValue = Number(sequenceState.sequence_last_value);
+  const sequenceIncrementBy = Number(sequenceMeta.sequence_increment_by);
+  const sequenceMaxValue = Number(sequenceMeta.sequence_max_value);
+  const sequenceIsCalled = sequenceState.sequence_is_called === true;
+  const sequenceCycle = sequenceMeta.sequence_cycle === true;
+  const maxPedidoId = Number(history.max_pedido_id || 0);
+  const maxInventoryOrderRef = Number(history.max_inventory_order_ref || 0);
+  const historyFloor = Math.max(maxPedidoId, maxInventoryOrderRef);
+  const sequenceNextCandidate = sequenceIsCalled ? sequenceLastValue + sequenceIncrementBy : sequenceLastValue;
+  const safeDetails = {
+    sequence_last_value: Number.isFinite(sequenceLastValue) ? sequenceLastValue : null,
+    sequence_is_called: typeof sequenceState.sequence_is_called === 'boolean' ? sequenceIsCalled : null,
+    sequence_increment_by: Number.isFinite(sequenceIncrementBy) ? sequenceIncrementBy : null,
+    sequence_cycle: sequenceCycle,
+    sequence_next_candidate: Number.isFinite(sequenceNextCandidate) ? sequenceNextCandidate : null,
+    max_pedido_id: Number.isFinite(maxPedidoId) ? maxPedidoId : null,
+    max_inventory_order_ref: Number.isFinite(maxInventoryOrderRef) ? maxInventoryOrderRef : null,
+    history_floor: Number.isFinite(historyFloor) ? historyFloor : null
+  };
+
   let code = null;
-  if (!row.pedidos_exists) code = 'PEDIDOS_TABLE_MISSING';
-  else if (!row.inventory_exists) code = 'MOVIMIENTOS_INVENTARIO_TABLE_MISSING';
-  else if (!row.sequence_name || !Number.isFinite(sequenceLastValue) || sequenceLastValue <= 0) code = 'PEDIDOS_SEQUENCE_MISSING';
-  else if (sequenceLastValue < maxPedidoId || sequenceLastValue < maxInventoryOrderRef) {
+  if (!Number.isFinite(sequenceLastValue)) code = 'PEDIDOS_SEQUENCE_MISSING';
+  else if (!Number.isFinite(sequenceIncrementBy) || sequenceIncrementBy <= 0) code = 'PEDIDOS_SEQUENCE_INVALID_INCREMENT';
+  else if (sequenceCycle) code = 'PEDIDOS_SEQUENCE_CYCLE_UNSAFE';
+  else if (!Number.isFinite(sequenceNextCandidate) || sequenceNextCandidate <= historyFloor) {
     code = 'PEDIDOS_SEQUENCE_BELOW_INVENTORY_HISTORY';
+  } else if (!Number.isFinite(sequenceMaxValue) || sequenceNextCandidate > sequenceMaxValue) {
+    code = 'PEDIDOS_SEQUENCE_EXHAUSTED';
   }
   if (code) {
     const error = new Error(code);
     error.code = code;
-    error.safeDetails = {
-      sequence_last_value: Number.isFinite(sequenceLastValue) ? sequenceLastValue : null,
-      max_pedido_id: Number.isFinite(maxPedidoId) ? maxPedidoId : null,
-      max_inventory_order_ref: Number.isFinite(maxInventoryOrderRef) ? maxInventoryOrderRef : null
-    };
+    error.safeDetails = safeDetails;
     throw error;
   }
 };

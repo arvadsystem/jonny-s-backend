@@ -51,6 +51,7 @@ export const fetchPedidoInventoryMovementsForUpdate = async (client, idPedido) =
       SELECT
         id_movimiento,
         fecha_mov,
+        (EXTRACT(EPOCH FROM (fecha_mov AT TIME ZONE 'UTC')) * 1000)::bigint AS fecha_mov_epoch_ms,
         cantidad,
         id_almacen,
         id_producto,
@@ -72,10 +73,10 @@ export const fetchPedidoInventoryMovementsForUpdate = async (client, idPedido) =
   return rs.rows || [];
 };
 
-const toTimeMs = (value) => {
-  if (!value) return null;
-  const ms = new Date(value).getTime();
-  return Number.isFinite(ms) ? ms : null;
+const toEpochMs = (value) => {
+  if (value === null || value === undefined || value === '') return null;
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? numeric : null;
 };
 
 const hasValidResourceShape = (row) => {
@@ -93,7 +94,7 @@ const hasTraceRequiredFields = (row) => (
 
 export const partitionPedidoInventoryMovements = ({ rows = [], context = {} } = {}) => {
   const idPedido = toPositiveInt(context?.idPedido);
-  const pedidoMs = toTimeMs(context?.fechaHoraPedido);
+  const pedidoMs = toEpochMs(context?.fechaHoraPedidoEpochMs);
   const toleranceMs = LEGACY_ID_COLLISION_TOLERANCE_MINUTES * 60 * 1000;
   const legacyCutoffMs = pedidoMs === null ? null : pedidoMs - toleranceMs;
   const detallePedidoIds = new Set(
@@ -113,7 +114,7 @@ export const partitionPedidoInventoryMovements = ({ rows = [], context = {} } = 
     const idRef = toPositiveInt(row?.id_ref);
     const idDetallePedido = toPositiveInt(row?.id_detalle_pedido);
     const idPedidoTrazabilidad = toPositiveInt(row?.id_pedido_trazabilidad);
-    const rowMs = toTimeMs(row?.fecha_mov);
+    const rowMs = toEpochMs(row?.fecha_mov_epoch_ms);
     const isLegacyShape = idRef === idPedido && !idDetallePedido && !idPedidoTrazabilidad;
     const isCurrentTraced = (
       idRef === idPedido
@@ -130,7 +131,7 @@ export const partitionPedidoInventoryMovements = ({ rows = [], context = {} } = 
     }
 
     if (isLegacyShape) {
-      if (rowMs === null || legacyCutoffMs === null) {
+      if (rowMs === null || legacyCutoffMs === null || !hasTraceRequiredFields(row)) {
         result.invalidCurrentTraceRows.push(row);
         continue;
       }

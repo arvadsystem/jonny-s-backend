@@ -65,7 +65,8 @@ const lockPedidoForInventory = async (client, idPedido, idSucursal) => {
         id_pedido,
         id_sucursal,
         id_estado_pedido,
-        fecha_hora_pedido
+        fecha_hora_pedido,
+        (EXTRACT(EPOCH FROM (fecha_hora_pedido AT TIME ZONE 'America/Tegucigalpa')) * 1000)::bigint AS fecha_hora_pedido_epoch_ms
       FROM public.pedidos
       WHERE id_pedido = $1
       FOR UPDATE
@@ -108,13 +109,16 @@ const summarizeIgnoredLegacyCollisions = (rows = []) => {
   const safeRows = Array.isArray(rows) ? rows : [];
   if (!safeRows.length) return null;
   const timestamps = safeRows
-    .map((row) => row?.fecha_mov)
-    .filter(Boolean)
-    .sort((left, right) => new Date(left).getTime() - new Date(right).getTime());
+    .map((row) => ({
+      value: row?.fecha_mov || null,
+      epoch: Number(row?.fecha_mov_epoch_ms)
+    }))
+    .filter((item) => item.value && Number.isFinite(item.epoch))
+    .sort((left, right) => left.epoch - right.epoch);
   return {
     ignored_count: safeRows.length,
-    min_fecha_mov: timestamps[0] || null,
-    max_fecha_mov: timestamps[timestamps.length - 1] || null,
+    min_fecha_mov: timestamps[0]?.value || null,
+    max_fecha_mov: timestamps[timestamps.length - 1]?.value || null,
     movement_ids: safeRows
       .map((row) => toPositiveInt(row?.id_movimiento))
       .filter(Boolean)
@@ -288,7 +292,7 @@ export const validarYDescontarPedido = async (payload, options = {}) => {
       rows: existingMovementRows,
       context: {
         idPedido,
-        fechaHoraPedido: pedidoContextRow.fecha_hora_pedido,
+        fechaHoraPedidoEpochMs: pedidoContextRow.fecha_hora_pedido_epoch_ms,
         detallePedidoIds
       }
     });
@@ -368,7 +372,7 @@ export const validarYDescontarPedido = async (payload, options = {}) => {
           rows: concurrentRows,
           context: {
             idPedido,
-            fechaHoraPedido: pedidoContextRow.fecha_hora_pedido,
+            fechaHoraPedidoEpochMs: pedidoContextRow.fecha_hora_pedido_epoch_ms,
             detallePedidoIds
           }
         });

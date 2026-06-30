@@ -33,20 +33,37 @@ const createServer = () => new Promise((resolve) => {
 });
 
 const createReadyQueryRunner = ({ traceGenerated = 'NEVER', sequenceLast = 100, maxPedido = 90, maxInventory = 95 } = {}) => ({
-  async query(sql) {
+  async query(sql, params = []) {
+    const text = String(sql);
     if (sql === 'SELECT 1') return { rows: [{ '?column?': 1 }] };
-    if (String(sql).includes('id_pedido_trazabilidad')) return { rows: [{ is_generated: traceGenerated }] };
-    if (String(sql).includes("pg_get_serial_sequence('public.pedidos'")) {
+    if (text.includes('id_pedido_trazabilidad')) return { rows: [{ is_generated: traceGenerated }] };
+    if (text.includes("pg_get_serial_sequence('public.pedidos'")) {
       return {
         rows: [{
           sequence_name: 'public.pedidos_id_pedido_seq',
           pedidos_exists: true,
-          inventory_exists: true,
-          sequence_last_value: sequenceLast,
-          max_pedido_id: maxPedido,
-          max_inventory_order_ref: maxInventory
+          inventory_exists: true
         }]
       };
+    }
+    if (text.includes('JOIN pg_sequence')) {
+      assert.deepEqual(params, ['public.pedidos_id_pedido_seq']);
+      return {
+        rows: [{
+          sequence_schema: 'public',
+          sequence_relation: 'pedidos_id_pedido_seq',
+          sequence_increment_by: 1,
+          sequence_cycle: false,
+          sequence_min_value: 1,
+          sequence_max_value: 2147483647
+        }]
+      };
+    }
+    if (text.includes('FROM "public"."pedidos_id_pedido_seq"')) {
+      return { rows: [{ sequence_last_value: sequenceLast, sequence_is_called: true }] };
+    }
+    if (text.includes('MAX(id_pedido)')) {
+      return { rows: [{ max_pedido_id: maxPedido, max_inventory_order_ref: maxInventory }] };
     }
     throw new Error(`Unexpected health query: ${sql}`);
   }
