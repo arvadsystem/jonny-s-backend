@@ -62,7 +62,7 @@ describe('fn_mov_inv_apply_stock precision PostgreSQL QA', { concurrency: false 
         RETURNING id_movimiento, saldo_antes, saldo_despues
       `, [target.id_almacen, target.id_insumo]);
 
-      const entrada = await client.query(`
+      const entrada1 = await client.query(`
         INSERT INTO public.movimientos_inventario (
           tipo,
           cantidad,
@@ -77,6 +77,36 @@ describe('fn_mov_inv_apply_stock precision PostgreSQL QA', { concurrency: false 
         RETURNING id_movimiento, saldo_antes, saldo_despues
       `, [target.id_almacen, target.id_insumo, salida.rows[0].id_movimiento]);
 
+      const entrada2 = await client.query(`
+        INSERT INTO public.movimientos_inventario (
+          tipo,
+          cantidad,
+          id_almacen,
+          id_insumo,
+          id_movimiento_origen,
+          ref_origen,
+          id_ref,
+          descripcion
+        )
+        VALUES ('ENTRADA', 0.000833, $1, $2, $3, 'QA_PRECISION_TEST', 900000003, 'QA precision trigger entrada rollback 2')
+        RETURNING id_movimiento, saldo_antes, saldo_despues
+      `, [target.id_almacen, target.id_insumo, salida.rows[0].id_movimiento]);
+
+      const entrada3 = await client.query(`
+        INSERT INTO public.movimientos_inventario (
+          tipo,
+          cantidad,
+          id_almacen,
+          id_insumo,
+          id_movimiento_origen,
+          ref_origen,
+          id_ref,
+          descripcion
+        )
+        VALUES ('ENTRADA', 0.000834, $1, $2, $3, 'QA_PRECISION_TEST', 900000004, 'QA precision trigger entrada rollback 3')
+        RETURNING id_movimiento, saldo_antes, saldo_despues
+      `, [target.id_almacen, target.id_insumo, salida.rows[0].id_movimiento]);
+
       const stockResult = await client.query(
         `SELECT cantidad FROM public.insumos_almacenes WHERE id_insumo = $1 AND id_almacen = $2`,
         [target.id_insumo, target.id_almacen]
@@ -84,9 +114,34 @@ describe('fn_mov_inv_apply_stock precision PostgreSQL QA', { concurrency: false 
 
       assert.equal(String(salida.rows[0].saldo_antes), '1.000000');
       assert.equal(String(salida.rows[0].saldo_despues), '0.997500');
-      assert.equal(String(entrada.rows[0].saldo_antes), '0.997500');
-      assert.equal(String(entrada.rows[0].saldo_despues), '0.998333');
-      assert.equal(String(stockResult.rows[0].cantidad), '0.998333');
+      assert.equal(String(entrada1.rows[0].saldo_antes), '0.997500');
+      assert.equal(String(entrada1.rows[0].saldo_despues), '0.998333');
+      assert.equal(String(entrada2.rows[0].saldo_antes), '0.998333');
+      assert.equal(String(entrada2.rows[0].saldo_despues), '0.999166');
+      assert.equal(String(entrada3.rows[0].saldo_antes), '0.999166');
+      assert.equal(String(entrada3.rows[0].saldo_despues), '1.000000');
+      assert.equal(String(stockResult.rows[0].cantidad), '1.000000');
+
+      for (const cantidad of ['0.000001', '0.123456', '1.333333', '999999.999999']) {
+        await client.query(
+          `UPDATE public.insumos_almacenes SET cantidad = 1000000.000000 WHERE id_insumo = $1 AND id_almacen = $2`,
+          [target.id_insumo, target.id_almacen]
+        );
+        const probe = await client.query(`
+          INSERT INTO public.movimientos_inventario (
+            tipo,
+            cantidad,
+            id_almacen,
+            id_insumo,
+            ref_origen,
+            id_ref,
+            descripcion
+          )
+          VALUES ('SALIDA', $1::numeric, $2, $3, 'QA_PRECISION_TEST', 900000005, 'QA precision scale probe rollback')
+          RETURNING cantidad
+        `, [cantidad, target.id_almacen, target.id_insumo]);
+        assert.equal(String(probe.rows[0].cantidad), cantidad);
+      }
     } finally {
       try { await client.query('ROLLBACK'); } catch {}
       client.release();

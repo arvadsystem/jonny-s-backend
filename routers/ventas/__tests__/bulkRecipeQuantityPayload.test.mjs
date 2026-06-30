@@ -2,7 +2,11 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { describe, it } from 'node:test';
 import { validarYDescontarPedido } from '../../../services/inventarioPedidoService.js';
-import { normalizePedidoPayload } from '../../../services/pedidoPayloadValidator.js';
+import {
+  normalizeItemType,
+  normalizePedidoPayload,
+  parseStrictPositiveQuantity
+} from '../../../services/pedidoPayloadValidator.js';
 import { resolvePedidoConsumo } from '../../../services/pedidoConsumoResolver.js';
 import { buildSalsaConsumptionItemsFromPedidoDetails } from '../../../services/salsasPedidoSnapshotService.js';
 import { buildSalsaInventorySnapshotsForReturn, roundInventoryQuantity } from '../../../services/ventasReversionService.js';
@@ -75,6 +79,9 @@ const makeTransactionClient = ({ recipeComponents = [] } = {}) => {
     async query(sql, params = []) {
       queries.push({ sql: String(sql), params });
       const text = String(sql);
+      if (text.includes('FROM public.pedidos')) {
+        return { rowCount: 1, rows: [{ id_pedido: 10, id_sucursal: 1, id_estado_pedido: 1 }] };
+      }
       if (text.includes('FROM public.sucursales')) {
         return { rowCount: 1, rows: [{ id_sucursal: 1, nombre_sucursal: 'Sucursal 1', estado: true }] };
       }
@@ -130,6 +137,30 @@ describe('ventas bulk recipe quantity payload', () => {
     assert.equal(ok.ok, true);
     assert.equal(ok.value.items[0].cantidad, 99);
     assert.equal(invalid.ok, false);
+  });
+
+  it('rechaza cantidades de inventario no escalares o comerciales invalidas', () => {
+    for (const cantidad of [true, false, [], [1], ['2'], {}, new Number(2), NaN, Infinity, -Infinity, '2abc', '1.5x', '', ' ', 0, -1, 1.5, '1.5', 1000]) {
+      assert.equal(
+        parseStrictPositiveQuantity(cantidad, { integer: true, max: 999 }),
+        null,
+        `debe rechazar ${JSON.stringify(cantidad)}`
+      );
+    }
+  });
+
+  it('valida cantidades fisicas con maximo seis decimales', () => {
+    for (const cantidad of ['0.000001', '0.123456', '1.333333', '999999.999999']) {
+      assert.equal(parseStrictPositiveQuantity(cantidad, { maxDecimals: 6 }), Number(cantidad));
+    }
+    assert.equal(parseStrictPositiveQuantity('0.1234567', { maxDecimals: 6 }), null);
+  });
+
+  it('normalizeItemType solo acepta strings', () => {
+    assert.equal(normalizeItemType('RECETA'), 'RECETA');
+    for (const tipo of [['RECETA'], { toString: () => 'RECETA' }, true, 1]) {
+      assert.equal(normalizeItemType(tipo), null);
+    }
   });
 
   it('incluye cantidad por orden y total en configuracion_menu', () => {
@@ -583,7 +614,9 @@ describe('ventas bulk recipe quantity payload', () => {
       id_producto: null,
       id_insumo: 2,
       id_detalle_pedido: 700,
-      origen_consumo: 'RECETA'
+      origen_consumo: 'RECETA',
+      ref_origen: 'PEDIDO',
+      tipo: 'SALIDA'
     }];
 
     assert.equal(classifyPedidoMovementReturnState({ movements: [], lineas: [] }), 'NO_ORIGINAL_MOVEMENTS');

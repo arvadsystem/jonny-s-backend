@@ -44,6 +44,127 @@ const ensureBranchExists = async (client, idSucursal) => {
   }
 };
 
+const createPedidoInventoryError = (code, message, status = 409, details = null) => {
+  const error = new Error(message);
+  error.httpStatus = status;
+  error.code = code;
+  if (details) error.details = details;
+  return error;
+};
+
+const lockPedidoForInventory = async (client, idPedido, idSucursal) => {
+  const rs = await client.query(
+    `
+      SELECT
+        id_pedido,
+        id_sucursal,
+        id_estado_pedido
+      FROM public.pedidos
+      WHERE id_pedido = $1
+      FOR UPDATE
+    `,
+    [idPedido]
+  );
+  const pedido = rs.rows[0] || null;
+  if (!pedido) {
+    throw createPedidoInventoryError(
+      'PEDIDO_NO_ENCONTRADO',
+      `El pedido ${idPedido} no existe.`,
+      404
+    );
+  }
+  if (Number(pedido.id_sucursal) !== Number(idSucursal)) {
+    throw createPedidoInventoryError(
+      'PEDIDO_SUCURSAL_NO_COINCIDE',
+      `El pedido ${idPedido} no pertenece a la sucursal ${idSucursal}.`
+    );
+  }
+  return pedido;
+};
+
+const validatePedidoDetalleResources = async ({ client, idPedido, items }) => {
+  const detailIds = [...new Set(
+    (Array.isArray(items) ? items : [])
+      .map((item) => toPositiveInt(item?.id_detalle_pedido))
+      .filter(Boolean)
+  )];
+  if (!detailIds.length) return;
+
+  const detailsResult = await client.query(
+    `
+      SELECT id_detalle_pedido, id_pedido, id_producto, id_receta
+      FROM public.detalle_pedido
+      WHERE id_detalle_pedido = ANY($1::int[])
+        AND COALESCE(estado, true) = true
+      FOR UPDATE
+    `,
+    [detailIds]
+  );
+  const detailById = new Map(detailsResult.rows.map((row) => [Number(row.id_detalle_pedido), row]));
+
+  const extrasResult = await client.query(
+    `
+      SELECT id_detalle_pedido, id_extra, id_insumo, id_almacen, origen_snapshot
+      FROM public.detalle_pedido_extras
+      WHERE id_detalle_pedido = ANY($1::int[])
+        AND COALESCE(estado, true) = true
+    `,
+    [detailIds]
+  );
+  const extrasByDetail = new Map();
+  for (const row of extrasResult.rows || []) {
+    const idDetalle = Number(row.id_detalle_pedido);
+    if (!extrasByDetail.has(idDetalle)) extrasByDetail.set(idDetalle, []);
+    extrasByDetail.get(idDetalle).push(row);
+  }
+
+  for (const item of items) {
+    const idDetalle = toPositiveInt(item?.id_detalle_pedido);
+    if (!idDetalle) continue;
+
+    const detail = detailById.get(idDetalle);
+    if (!detail || Number(detail.id_pedido) !== Number(idPedido)) {
+      throw createPedidoInventoryError(
+        'PEDIDO_DETALLE_NO_PERTENECE',
+        `La linea ${idDetalle} no pertenece al pedido ${idPedido}.`
+      );
+    }
+
+    if (item.tipo_item === 'PRODUCTO') {
+      if (Number(detail.id_producto || 0) !== Number(item.id_producto || item.id_item) || detail.id_receta !== null) {
+        throw createPedidoInventoryError('PEDIDO_DETALLE_RECURSO_NO_COINCIDE', `La linea ${idDetalle} no corresponde al producto enviado.`);
+      }
+    }
+    if (item.tipo_item === 'RECETA') {
+      if (Number(detail.id_receta || 0) !== Number(item.id_receta || item.id_item) || detail.id_producto !== null) {
+        throw createPedidoInventoryError('PEDIDO_DETALLE_RECURSO_NO_COINCIDE', `La linea ${idDetalle} no corresponde a la receta enviada.`);
+      }
+    }
+    if (item.tipo_item === 'EXTRA') {
+      const belongs = (extrasByDetail.get(idDetalle) || [])
+        .some((row) => Number(row.id_extra || 0) === Number(item.id_extra || item.id_item));
+      if (!belongs) {
+        throw createPedidoInventoryError('PEDIDO_EXTRA_NO_PERTENECE_LINEA', `El extra enviado no pertenece a la linea ${idDetalle}.`);
+      }
+    }
+    if (item.tipo_item === 'SALSA') {
+      const belongs = (extrasByDetail.get(idDetalle) || [])
+        .some((row) => {
+          const snapshot = row.origen_snapshot && typeof row.origen_snapshot === 'object' ? row.origen_snapshot : {};
+          const idSalsa = toPositiveInt(snapshot.id_salsa ?? snapshot.id_complemento ?? row.id_extra);
+          const idInsumo = toPositiveInt(snapshot.id_insumo ?? row.id_insumo);
+          const idAlmacen = toPositiveInt(snapshot.id_almacen ?? row.id_almacen);
+          return idSalsa === Number(item.id_salsa || item.id_item)
+            && idInsumo === Number(item.id_insumo)
+            && idAlmacen === Number(item.id_almacen);
+        });
+      if (!belongs) {
+        throw createPedidoInventoryError('PEDIDO_SALSA_NO_PERTENECE_LINEA', `La salsa enviada no pertenece a la linea ${idDetalle}.`);
+      }
+    }
+  }
+};
+
 const normalizeExcludedIdSet = (value) => {
   if (value instanceof Set) return value;
   if (Array.isArray(value)) return new Set(value.map((id) => Number(id)).filter((id) => id > 0));
@@ -113,7 +234,9 @@ export const validarYDescontarPedido = async (payload, options = {}) => {
   try {
     if (manageTransaction) await client.query('BEGIN');
 
+    await lockPedidoForInventory(client, idPedido, idSucursal);
     await ensureBranchExists(client, idSucursal);
+    await validatePedidoDetalleResources({ client, idPedido, items });
 
     // 1) Resolver consumo real desde items del pedido.
     const consumoResult = await resolvePedidoConsumo({
@@ -220,6 +343,7 @@ export const validarYDescontarPedido = async (payload, options = {}) => {
 
     // 4) Registrar movimientos de salida ligados al pedido.
     let generatedMovementCount = 0;
+    await client.query('SAVEPOINT inventario_movimientos_insert');
     try {
       generatedMovementCount = await registrarMovimientosPedido({
         client,
@@ -236,8 +360,10 @@ export const validarYDescontarPedido = async (payload, options = {}) => {
         excludedProductIds,
         excludedInsumoIds
       });
+      await client.query('RELEASE SAVEPOINT inventario_movimientos_insert');
     } catch (error) {
       if (error?.code === '23505') {
+        await client.query('ROLLBACK TO SAVEPOINT inventario_movimientos_insert');
         const concurrentRows = await fetchPedidoInventoryMovementsForUpdate(client, idPedido);
         const concurrentState = analyzePedidoMovementState({
           expectedRows: expectedLineMovementRows,

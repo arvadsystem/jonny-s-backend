@@ -104,6 +104,11 @@ const getAllowedOrigins = () => {
 const allowedOrigins = getAllowedOrigins();
 const isAllowedOrigin = (origin) => allowedOrigins.includes(normalizeOrigin(origin));
 const READINESS_TIMEOUT_MS = 2000;
+const buildInfo = Object.freeze({
+  git_commit_sha: String(process.env.GIT_COMMIT_SHA || process.env.BUILD_SHA || '').trim() || null,
+  app_version: String(process.env.APP_VERSION || process.env.npm_package_version || '').trim() || null,
+  build_sha: String(process.env.BUILD_SHA || '').trim() || null
+});
 let healthCheckQueryRunner = pool;
 
 export const setHealthCheckQueryRunnerForTests = (queryRunner = pool) => {
@@ -209,6 +214,7 @@ app.get('/health/ready', async (req, res) => {
         idle: poolState.idleCount,
         waiting: poolState.waitingCount
       },
+      build: buildInfo,
       timestamp: new Date().toISOString()
     });
   } catch {

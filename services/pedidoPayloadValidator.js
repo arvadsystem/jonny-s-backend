@@ -26,14 +26,37 @@ export const toPositiveInt = (value) => {
   return parsed;
 };
 
-const toPositiveNumber = (value) => {
+const decimalPlaces = (value) => {
+  const text = String(value).trim().toLowerCase();
+  if (text.includes('e')) return null;
+  const [, decimals = ''] = text.split('.');
+  return decimals.length;
+};
+
+export const parseStrictPositiveQuantity = (value, {
+  integer = false,
+  max = null,
+  maxDecimals = null
+} = {}) => {
+  if (typeof value !== 'number' && typeof value !== 'string') return null;
+  if (typeof value === 'string' && value.trim() === '') return null;
+  if (typeof value === 'string' && !/^\d+(?:\.\d+)?$/.test(value.trim())) return null;
+  if (typeof value === 'number' && !Number.isFinite(value)) return null;
+
   const parsed = Number(value);
   if (!Number.isFinite(parsed) || parsed <= 0) return null;
+  if (integer && !Number.isSafeInteger(parsed)) return null;
+  if (max !== null && parsed > max) return null;
+  if (maxDecimals !== null) {
+    const places = decimalPlaces(value);
+    if (places === null || places > maxDecimals) return null;
+  }
   return parsed;
 };
 
-const normalizeItemType = (value) => {
-  const raw = String(value || '').trim().toUpperCase();
+export const normalizeItemType = (value) => {
+  if (typeof value !== 'string') return null;
+  const raw = value.trim().toUpperCase();
   if (raw === ITEM_TYPES.PRODUCTO) return ITEM_TYPES.PRODUCTO;
   if (raw === ITEM_TYPES.RECETA) return ITEM_TYPES.RECETA;
   if (raw === ITEM_TYPES.EXTRA) return ITEM_TYPES.EXTRA;
@@ -55,7 +78,9 @@ export const normalizePedidoPayload = (payload = {}) => {
   for (let index = 0; index < rawItems.length; index += 1) {
     const row = rawItems[index] && typeof rawItems[index] === 'object' ? rawItems[index] : {};
     const tipoItem = normalizeItemType(row.tipo_item);
-    const cantidad = toPositiveNumber(row.cantidad);
+    const cantidad = tipoItem === ITEM_TYPES.SALSA
+      ? parseStrictPositiveQuantity(row.cantidad, { maxDecimals: 6 })
+      : parseStrictPositiveQuantity(row.cantidad, { integer: true, max: 999 });
 
     if (!tipoItem) {
       errors.push(`items[${index}].tipo_item invalido. Use PRODUCTO, RECETA, EXTRA o SALSA.`);
@@ -98,7 +123,7 @@ export const normalizePedidoPayload = (payload = {}) => {
         id_salsa: tipoItem === ITEM_TYPES.SALSA ? idItem : toPositiveInt(row.id_salsa) || null,
         id_insumo: toPositiveInt(row.id_insumo) || null,
         id_almacen: toPositiveInt(row.id_almacen) || null,
-        cant: toPositiveNumber(row.cant ?? row.cantidad_insumo) || null,
+        cant: parseStrictPositiveQuantity(row.cant ?? row.cantidad_insumo, { maxDecimals: 6 }) || null,
         id_unidad_medida: toPositiveInt(row.id_unidad_medida) || null,
         codigo: typeof row.codigo === 'string' ? row.codigo.trim() || null : null,
         nombre: typeof row.nombre === 'string' ? row.nombre.trim() || null : null
