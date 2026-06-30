@@ -29,16 +29,7 @@ ALTER TABLE public.movimientos_inventario
   ADD COLUMN IF NOT EXISTS id_movimiento_origen integer NULL;
 
 ALTER TABLE public.movimientos_inventario
-  ADD COLUMN IF NOT EXISTS id_pedido_trazabilidad integer
-  GENERATED ALWAYS AS (
-    CASE
-      WHEN id_detalle_pedido IS NOT NULL
-       AND ref_origen IN ('PEDIDO', 'FALTANTE_COCINA')
-       AND tipo = 'SALIDA'
-        THEN id_ref
-      ELSE NULL
-    END
-  ) STORED;
+  ADD COLUMN IF NOT EXISTS id_pedido_trazabilidad integer NULL;
 
 UPDATE public.movimientos_inventario
 SET origen_consumo = UPPER(TRIM(origen_consumo))
@@ -129,7 +120,7 @@ COMMENT ON COLUMN public.movimientos_inventario.id_movimiento_origen IS
   'Movimiento SALIDA original que origina una ENTRADA de reversion. NULL para salidas y movimientos legacy.';
 
 COMMENT ON COLUMN public.movimientos_inventario.id_pedido_trazabilidad IS
-  'Pedido usado por FK compuesta de salidas trazadas. Es NULL para legacy y para entradas de reversion.';
+  'Pedido usado por FK compuesta de movimientos trazados. El backend lo escribe explicitamente y el trigger lo conserva como defensa.';
 
 DROP INDEX IF EXISTS public.ux_mov_inv_pedido_salida_insumo;
 DROP INDEX IF EXISTS public.ux_mov_inv_pedido_salida_producto;
@@ -144,7 +135,7 @@ DROP INDEX IF EXISTS public.idx_mov_inv_pedido_linea;
 DROP INDEX IF EXISTS public.idx_mov_inv_reversion_origen;
 
 CREATE UNIQUE INDEX ux_mov_inv_linea_salida_insumo
-  ON public.movimientos_inventario (id_ref, id_detalle_pedido, ref_origen, tipo, origen_consumo, id_insumo)
+  ON public.movimientos_inventario (id_ref, id_detalle_pedido, tipo, origen_consumo, id_insumo)
   WHERE ref_origen IN ('PEDIDO', 'FALTANTE_COCINA')
     AND tipo = 'SALIDA'
     AND id_ref IS NOT NULL
@@ -153,7 +144,7 @@ CREATE UNIQUE INDEX ux_mov_inv_linea_salida_insumo
     AND id_insumo IS NOT NULL;
 
 CREATE UNIQUE INDEX ux_mov_inv_linea_salida_producto
-  ON public.movimientos_inventario (id_ref, id_detalle_pedido, ref_origen, tipo, origen_consumo, id_producto)
+  ON public.movimientos_inventario (id_ref, id_detalle_pedido, tipo, origen_consumo, id_producto)
   WHERE ref_origen IN ('PEDIDO', 'FALTANTE_COCINA')
     AND tipo = 'SALIDA'
     AND id_ref IS NOT NULL

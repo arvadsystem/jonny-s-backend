@@ -336,6 +336,95 @@ describe('ventas bulk recipe quantity payload', () => {
     );
   });
 
+  it('usa inventario_receta persistido sin consultar detalle_recetas vivo', async () => {
+    const queries = [];
+    const client = {
+      async query(sql, params = []) {
+        queries.push({ sql: String(sql), params });
+        const text = String(sql);
+        if (text.includes('information_schema.columns')) {
+          const column = params[1];
+          return { rowCount: ['id_extra', 'cant'].includes(column) ? 1 : 0, rows: [] };
+        }
+        if (text.includes('FROM public.recetas')) return { rows: [] };
+        if (text.includes('FROM public.menu_extras')) return { rows: [] };
+        if (text.includes('FROM public.detalle_recetas')) {
+          throw new Error('No debe consultar detalle_recetas cuando existe inventario_receta.');
+        }
+        return { rowCount: 0, rows: [] };
+      }
+    };
+
+    const result = await resolvePedidoConsumo({
+      client,
+      items: [{
+        tipo_item: 'RECETA',
+        id_item: 12,
+        id_receta: 12,
+        id_detalle_pedido: 700,
+        cantidad: 8,
+        configuracion_menu: {
+          inventario_receta: {
+            version: 1,
+            id_receta: 12,
+            cantidad_linea: 8,
+            componentes: [
+              {
+                id_insumo: 200,
+                id_almacen: 3,
+                factor_por_unidad: 1,
+                cantidad_linea: 8,
+                cantidad_total: 8,
+                id_unidad_medida: 7,
+                id_unidad_base: 7
+              },
+              {
+                id_insumo: 201,
+                id_almacen: 3,
+                factor_por_unidad: 0.25,
+                cantidad_linea: 8,
+                cantidad_total: 2,
+                id_unidad_medida: 7,
+                id_unidad_base: 7
+              }
+            ]
+          }
+        }
+      }]
+    });
+
+    assert.deepEqual(result.faltantes, []);
+    assert.equal(result.consumo.insumoQtyMap.get(200), 8);
+    assert.equal(result.consumo.insumoQtyMap.get(201), 2);
+    assert.equal(result.insumoWarehouseById.get(200), 3);
+    assert.equal(result.consumo.movimientoRows.length, 2);
+    assert.equal(queries.some((entry) => entry.sql.includes('FROM public.detalle_recetas')), false);
+  });
+
+  it('bloquea inventario_receta invalido sin fallback a receta viva', async () => {
+    const result = await resolvePedidoConsumo({
+      client: makeResolverClient(),
+      items: [{
+        tipo_item: 'RECETA',
+        id_item: 12,
+        id_receta: 12,
+        id_detalle_pedido: 700,
+        cantidad: 8,
+        configuracion_menu: {
+          inventario_receta: {
+            version: 1,
+            id_receta: 12,
+            cantidad_linea: 8,
+            componentes: [{ id_insumo: 200, id_almacen: 3, factor_por_unidad: 1 }]
+          }
+        }
+      }]
+    });
+
+    assert.equal(result.faltantes[0].motivo, 'RECETA_SNAPSHOT_COMPONENTE_INVALIDO');
+    assert.equal(result.consumo.insumoQtyMap.size, 0);
+  });
+
   it('conserva extras repetidos por linea sin asignar todo al primer contexto', async () => {
     const result = await resolvePedidoConsumo({
       client: makeResolverClient(),
@@ -476,7 +565,8 @@ describe('ventas bulk recipe quantity payload', () => {
     const insert = queries.find((entry) => entry.sql.includes('INSERT INTO public.movimientos_inventario'));
     assert.equal(count, 1);
     assert.ok(insert);
-    assert.deepEqual(insert.params.slice(0, 8), [1.25, 3, null, 200, 700, 'RECETA', 'PEDIDO', 55]);
+    assert.match(insert.sql, /id_pedido_trazabilidad/);
+    assert.deepEqual(insert.params.slice(0, 9), [1.25, 3, null, 200, 700, 'RECETA', 'PEDIDO', 55, 55]);
   });
 
   it('extrae consumo total desde configuracion_menu sin reconstruir por una sola orden', () => {

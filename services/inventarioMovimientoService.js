@@ -189,9 +189,10 @@ const insertMovimiento = async (client, movement) => {
         origen_consumo,
         ref_origen,
         id_ref,
+        id_pedido_trazabilidad,
         descripcion
       )
-      VALUES ('SALIDA', $1, $2, $3, $4, $5, $6, $7, $8, $9)
+      VALUES ('SALIDA', $1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
     `,
     [
       Number(movement.cantidad),
@@ -202,6 +203,7 @@ const insertMovimiento = async (client, movement) => {
       movement.origen_consumo ? normalizeOrigenConsumo(movement.origen_consumo) : null,
       movement.ref_origen || MOVEMENT_REF,
       idRef,
+      toPositiveInt(movement?.id_pedido_trazabilidad) || idRef,
       String(movement.descripcion || '').trim() || null
     ]
   );

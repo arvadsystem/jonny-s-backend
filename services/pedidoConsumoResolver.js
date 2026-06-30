@@ -63,6 +63,57 @@ const hasExtraInventorySnapshot = (context) => (
   context?.cant !== null
 );
 
+const roundInventory = (value) => {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return 0;
+  return Number(parsed.toFixed(6));
+};
+
+const getRecipeInventorySnapshot = (item) => {
+  const config = item?.configuracion_menu && typeof item.configuracion_menu === 'object'
+    ? item.configuracion_menu
+    : null;
+  const snapshot = config?.inventario_receta;
+  return snapshot && typeof snapshot === 'object' ? snapshot : null;
+};
+
+const validateRecipeInventorySnapshot = (snapshot, item) => {
+  const idReceta = toPositiveInt(item?.id_receta ?? item?.id_item);
+  const cantidadLinea = Number(item?.cantidad || 0);
+  if (!idReceta || !snapshot || Number(snapshot.version) !== 1) return { ok: false, reason: 'RECETA_SNAPSHOT_INVALIDO' };
+  if (toPositiveInt(snapshot.id_receta) !== idReceta) return { ok: false, reason: 'RECETA_SNAPSHOT_ID_RECETA_INVALIDO' };
+  if (roundInventory(snapshot.cantidad_linea) !== roundInventory(cantidadLinea)) {
+    return { ok: false, reason: 'RECETA_SNAPSHOT_CANTIDAD_LINEA_INVALIDA' };
+  }
+  const components = Array.isArray(snapshot.componentes) ? snapshot.componentes : [];
+  if (components.length === 0) return { ok: false, reason: 'RECETA_SNAPSHOT_SIN_COMPONENTES' };
+
+  const normalizedComponents = [];
+  for (const component of components) {
+    const idInsumo = toPositiveInt(component?.id_insumo);
+    const idAlmacen = toPositiveInt(component?.id_almacen);
+    const factor = roundInventory(component?.factor_por_unidad);
+    const cantidadTotal = roundInventory(component?.cantidad_total);
+    const unidadMedida = toPositiveInt(component?.id_unidad_medida);
+    const unidadBase = toPositiveInt(component?.id_unidad_base);
+    if (!idInsumo || !idAlmacen || factor <= 0 || cantidadTotal <= 0 || !unidadMedida || !unidadBase) {
+      return { ok: false, reason: 'RECETA_SNAPSHOT_COMPONENTE_INVALIDO' };
+    }
+    if (cantidadTotal !== roundInventory(factor * cantidadLinea)) {
+      return { ok: false, reason: 'RECETA_SNAPSHOT_TOTAL_INVALIDO' };
+    }
+    normalizedComponents.push({
+      id_insumo: idInsumo,
+      id_almacen: idAlmacen,
+      factor_por_unidad: factor,
+      cantidad_total: cantidadTotal,
+      id_unidad_medida: unidadMedida,
+      id_unidad_base: unidadBase
+    });
+  }
+  return { ok: true, components: normalizedComponents };
+};
+
 const schemaColumnCache = new Map();
 const hasColumn = async (client, tableName, columnName) => {
   const key = `${String(tableName || '').trim().toLowerCase()}.${String(columnName || '').trim().toLowerCase()}`;
@@ -167,6 +218,33 @@ export const resolvePedidoConsumo = async ({ client, items }) => {
       });
     }
     if (item.tipo_item === ITEM_TYPES.RECETA) {
+      const snapshot = getRecipeInventorySnapshot(item);
+      if (snapshot) {
+        const validation = validateRecipeInventorySnapshot(snapshot, item);
+        if (!validation.ok) {
+          faltantes.push({
+            tipo_recurso: 'receta',
+            id_recurso: toPositiveInt(item.id_item),
+            id_receta: toPositiveInt(item.id_receta ?? item.id_item),
+            ...item,
+            motivo: validation.reason,
+            mensaje: `El snapshot fisico de inventario de la receta ${item.id_receta || item.id_item} esta incompleto o no coincide con la linea.`
+          });
+          continue;
+        }
+        for (const component of validation.components) {
+          addToMapTotal(insumoQtyMap, component.id_insumo, component.cantidad_total);
+          insumoWarehouseById.set(component.id_insumo, component.id_almacen);
+          addMovementRow(movimientoRows, {
+            tipo_recurso: 'insumo',
+            id_insumo: component.id_insumo,
+            id_detalle_pedido: item.id_detalle_pedido,
+            cantidad: component.cantidad_total,
+            origen_consumo: 'RECETA'
+          });
+        }
+        continue;
+      }
       addToMapTotal(recetaQtyMap, item.id_item, item.cantidad);
       addContext(recetaContextById, item.id_item, item);
     }

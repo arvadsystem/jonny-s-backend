@@ -239,9 +239,10 @@ const main = async () => {
             origen_consumo,
             ref_origen,
             id_ref,
+            id_pedido_trazabilidad,
             descripcion
           )
-          VALUES ('SALIDA', 2, $1, $2, $3, 'SALSA', $4, $5, $6)
+          VALUES ('SALIDA', 2, $1, $2, $3, 'SALSA', $4, $5, $5, $6)
         `,
         [idAlmacen, idInsumo, idDetallePedido, refOrigen, idPedidoFixture, `QA stock negativo salsa ${refOrigen}`]
       );

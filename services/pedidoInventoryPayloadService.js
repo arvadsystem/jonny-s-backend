@@ -90,6 +90,9 @@ export const buildPedidoConsumoPayload = async (client, idPedido, idSucursal) =>
       const idReceta = parsePositiveInt(row.id_receta);
       const quantity = parsePositiveInt(row.cantidad);
       const idDetallePedido = parsePositiveInt(row.id_detalle_pedido);
+      const configuracionMenu = row.configuracion_menu && typeof row.configuracion_menu === 'object'
+        ? row.configuracion_menu
+        : null;
 
       if (idProducto) {
         return {
@@ -97,7 +100,8 @@ export const buildPedidoConsumoPayload = async (client, idPedido, idSucursal) =>
           id_item: idProducto,
           id_producto: idProducto,
           id_detalle_pedido: idDetallePedido,
-          cantidad: quantity
+          cantidad: quantity,
+          configuracion_menu: configuracionMenu
         };
       }
       if (idReceta) {
@@ -106,7 +110,8 @@ export const buildPedidoConsumoPayload = async (client, idPedido, idSucursal) =>
           id_item: idReceta,
           id_receta: idReceta,
           id_detalle_pedido: idDetallePedido,
-          cantidad: quantity
+          cantidad: quantity,
+          configuracion_menu: configuracionMenu
         };
       }
       return null;

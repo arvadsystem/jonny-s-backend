@@ -120,6 +120,7 @@ import {
 import { roundMoney } from './ventas/utils/moneyUtils.js';
 import { validarYDescontarPedido } from '../services/inventarioPedidoService.js';
 import { buildPedidoConsumoPayload } from '../services/pedidoInventoryPayloadService.js';
+import { attachRecipeInventorySnapshotsToLines } from '../services/recetaInventorySnapshotService.js';
 import {
   coercePositiveIntArray,
   isPlainObject,
@@ -9668,9 +9669,16 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
     }
 
     const detallePedidoInsertStart = ventasPerf.now();
-    const detallePedidoRows = venta.pedido_lines.map((line) => ({
+    const pedidoLinesWithInventorySnapshots = hasDetallePedidoConfiguracionMenu
+      ? await attachRecipeInventorySnapshotsToLines({
+        client,
+        lines: venta.pedido_lines,
+        idSucursal: venta.id_sucursal
+      })
+      : venta.pedido_lines;
+    const detallePedidoRows = pedidoLinesWithInventorySnapshots.map((line) => ({
       line,
-      configuracionMenu: buildComplementLineConfig(line),
+      configuracionMenu: line.configuracion_menu || buildComplementLineConfig(line),
       complementSnapshot: buildComplementSnapshot(line)
     }));
     const pedidoLineRefs = [];

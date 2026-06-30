@@ -23,6 +23,10 @@ const VALID_MOTIVOS = new Set([
   'COBRO_INCORRECTO'
 ]);
 
+export const REVERSION_EXPECTED_UNIQUE_CONSTRAINTS = new Set([
+  'ux_mov_inv_reversion_origen'
+]);
+
 const parsePositiveInt = (value) => {
   if (typeof value === 'number') {
     return Number.isSafeInteger(value) && value > 0 ? value : null;
@@ -74,6 +78,16 @@ const mapInventoryTraceTriggerError = (error) => {
   }
   if (text.includes('TRACE_INVALID') || text.includes('REVERSION_TRACE_INVALID')) {
     return createReversionError(409, 'TRACE_INCONSISTENT', 'Los movimientos originales de inventario tienen trazabilidad inconsistente.');
+  }
+  return null;
+};
+
+export const mapExpectedReversionUniqueError = (error) => {
+  if (
+    error?.code === '23505'
+    && REVERSION_EXPECTED_UNIQUE_CONSTRAINTS.has(error?.constraint)
+  ) {
+    return createReversionError(409, 'ALREADY_FULLY_RETURNED', 'El inventario de la venta ya fue devuelto o esta en proceso de devolucion.');
   }
   return null;
 };
@@ -1079,9 +1093,8 @@ const restorePedidoInventoryMovementsForReversion = async ({
     } catch (error) {
       const mappedTraceError = mapInventoryTraceTriggerError(error);
       if (mappedTraceError) throw mappedTraceError;
-      if (error?.code === '23505') {
-        throw createReversionError(409, 'ALREADY_FULLY_RETURNED', 'El inventario de la venta ya fue devuelto o esta en proceso de devolucion.');
-      }
+      const mappedUniqueError = mapExpectedReversionUniqueError(error);
+      if (mappedUniqueError) throw mappedUniqueError;
       throw error;
     }
   }

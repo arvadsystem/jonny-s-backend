@@ -64,9 +64,10 @@ const insertPedidoSalida = (client, target, idRefOffset = 0) => client.query(
       origen_consumo,
       ref_origen,
       id_ref,
+      id_pedido_trazabilidad,
       descripcion
     )
-    VALUES ('SALIDA', 0.000001, $1, $2, $3, 'RECETA', 'PEDIDO', $4, $5)
+    VALUES ('SALIDA', 0.000001, $1, $2, $3, 'RECETA', 'PEDIDO', $4, $4, $5)
     RETURNING id_movimiento, id_ref, id_pedido_trazabilidad
   `,
   [
@@ -79,23 +80,26 @@ const insertPedidoSalida = (client, target, idRefOffset = 0) => client.query(
 );
 
 describe('descuento de pedido con trazabilidad PostgreSQL QA', { concurrency: false }, () => {
-  it('bloquea doble salida identica por constraint trazada sin dejar residuos', async () => {
-    const client = await pool.connect();
+  it('bloquea doble salida identica con clientA/clientB reales sin dejar residuos', async () => {
+    const clientA = await pool.connect();
+    const clientB = await pool.connect();
     try {
-      await client.query('BEGIN');
-      const target = await findTraceTarget(client);
+      const target = await findTraceTarget(clientA);
+      await clientA.query('BEGIN');
+      await clientB.query('BEGIN');
+      await clientB.query("SET LOCAL lock_timeout = '250ms'");
 
-      await insertPedidoSalida(client, target);
+      await insertPedidoSalida(clientA, target);
+      const secondInsert = insertPedidoSalida(clientB, target);
       await assert.rejects(
-        () => insertPedidoSalida(client, target),
-        (error) => error.code === '23505' && [
-          'ux_mov_inv_linea_salida_insumo',
-          'ux_mov_inv_linea_salida_producto'
-        ].includes(error.constraint)
+        () => secondInsert,
+        (error) => ['55P03', '57014'].includes(error.code)
       );
     } finally {
-      try { await client.query('ROLLBACK'); } catch {}
-      client.release();
+      try { await clientA.query('ROLLBACK'); } catch {}
+      try { await clientB.query('ROLLBACK'); } catch {}
+      clientA.release();
+      clientB.release();
     }
   });
 
