@@ -21,14 +21,17 @@ const mapById = (rows, fieldName) => {
   return map;
 };
 
-const hasEnoughStock = (cantidadActual, stockMinimo, required) => {
+const classifyStockAfterConsumption = (cantidadActual, stockMinimo, required) => {
   const actual = Number(cantidadActual || 0);
   const minimo = Number(stockMinimo || 0);
-  const disponible = actual - minimo;
-  return disponible >= Number(required || 0);
+  const req = Number(required || 0);
+  const saldoProyectado = actual - req;
+  if (saldoProyectado < 0) return 'STOCK_INSUFICIENTE';
+  if (saldoProyectado <= minimo) return 'STOCK_BAJO';
+  return null;
 };
 
-const buildShortage = ({
+const buildStockWarning = ({
   tipo_recurso,
   id_recurso,
   nombre,
@@ -40,8 +43,8 @@ const buildShortage = ({
   const actual = Number(cantidad_actual || 0);
   const minimo = Number(stock_minimo || 0);
   const req = Number(requerido || 0);
-  const disponible = Math.max(actual - minimo, 0);
   const saldoProyectado = actual - req;
+  const isNegative = saldoProyectado < 0;
 
   return {
     tipo_recurso,
@@ -51,13 +54,15 @@ const buildShortage = ({
     nombre,
     motivo,
     requerido: req,
-    disponible,
-    stock_disponible: disponible,
-    faltante: Math.max(req - disponible, 0),
+    disponible: actual,
+    stock_disponible: actual,
+    faltante: isNegative ? Math.abs(saldoProyectado) : 0,
     saldo_proyectado: saldoProyectado,
     cantidad_actual: actual,
     stock_minimo: minimo,
-    mensaje: `Stock insuficiente para ${tipo_recurso} ${nombre || id_recurso}. Requerido: ${req}, disponible: ${disponible}.`
+    mensaje: isNegative
+      ? `Stock insuficiente para ${tipo_recurso} ${nombre || id_recurso}. Requerido: ${req}, saldo proyectado: ${saldoProyectado}.`
+      : `Stock bajo para ${tipo_recurso} ${nombre || id_recurso}. Saldo proyectado: ${saldoProyectado}, stock minimo: ${minimo}.`
   };
 };
 
@@ -829,16 +834,29 @@ export const validarStockConBloqueo = async ({
     if (!row) continue;
     if (excludedProductIds.has(idProducto)) continue;
     const requerido = Number(productoQtyMap.get(idProducto) || 0);
-    if (!hasEnoughStock(row.cantidad, row.stock_minimo, requerido)) {
+    const stockMotivo = classifyStockAfterConsumption(row.cantidad, row.stock_minimo, requerido);
+    if (stockMotivo === 'STOCK_INSUFICIENTE') {
       faltantes.push(
-        buildShortage({
+        buildStockWarning({
           tipo_recurso: 'producto',
           id_recurso: idProducto,
           nombre: row.nombre_producto,
           cantidad_actual: row.cantidad,
           stock_minimo: row.stock_minimo,
           requerido,
-          motivo: 'STOCK_INSUFICIENTE'
+          motivo: stockMotivo
+        })
+      );
+    } else if (stockMotivo === 'STOCK_BAJO') {
+      advertencias.push(
+        buildStockWarning({
+          tipo_recurso: 'producto',
+          id_recurso: idProducto,
+          nombre: row.nombre_producto,
+          cantidad_actual: row.cantidad,
+          stock_minimo: row.stock_minimo,
+          requerido,
+          motivo: stockMotivo
         })
       );
     }
@@ -849,16 +867,29 @@ export const validarStockConBloqueo = async ({
     if (!row) continue;
     if (excludedInsumoIds.has(idInsumo)) continue;
     const requerido = Number(insumoQtyMap.get(idInsumo) || 0);
-    if (!hasEnoughStock(row.cantidad, row.stock_minimo, requerido)) {
+    const stockMotivo = classifyStockAfterConsumption(row.cantidad, row.stock_minimo, requerido);
+    if (stockMotivo === 'STOCK_INSUFICIENTE') {
       faltantes.push(
-        buildShortage({
+        buildStockWarning({
           tipo_recurso: 'insumo',
           id_recurso: idInsumo,
           nombre: row.nombre_insumo,
           cantidad_actual: row.cantidad,
           stock_minimo: row.stock_minimo,
           requerido,
-          motivo: 'STOCK_INSUFICIENTE'
+          motivo: stockMotivo
+        })
+      );
+    } else if (stockMotivo === 'STOCK_BAJO') {
+      advertencias.push(
+        buildStockWarning({
+          tipo_recurso: 'insumo',
+          id_recurso: idInsumo,
+          nombre: row.nombre_insumo,
+          cantidad_actual: row.cantidad,
+          stock_minimo: row.stock_minimo,
+          requerido,
+          motivo: stockMotivo
         })
       );
     }

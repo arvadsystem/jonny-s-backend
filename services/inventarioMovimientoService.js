@@ -13,6 +13,12 @@ export const MOVEMENT_REF = 'PEDIDO';
 export const SHORTAGE_MOVEMENT_REF = 'FALTANTE_COCINA';
 const VALID_CONSUMPTION_ORIGINS = new Set(['PRODUCTO', 'RECETA', 'EXTRA', 'SALSA']);
 
+export const normalizePedidoTraceRefOrigen = (refOrigen) => {
+  const normalized = String(refOrigen || MOVEMENT_REF).trim().toUpperCase();
+  if (normalized === SHORTAGE_MOVEMENT_REF) return MOVEMENT_REF;
+  return normalized || MOVEMENT_REF;
+};
+
 export const normalizeOrigenConsumo = (value) => {
   const normalized = String(value || '').trim().toUpperCase();
   if (!VALID_CONSUMPTION_ORIGINS.has(normalized)) {
@@ -83,7 +89,7 @@ const createInventoryTraceError = (code, message, details = null) => {
 
 const movementIdentityKey = (row) => [
   toPositiveInt(row?.id_detalle_pedido) || 0,
-  String(row?.ref_origen || MOVEMENT_REF).trim().toUpperCase(),
+  normalizePedidoTraceRefOrigen(row?.ref_origen),
   normalizeOrigenConsumo(row?.origen_consumo),
   Number(row?.id_almacen || 0),
   resourceKeyForMovement(row)

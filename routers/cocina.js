@@ -1002,8 +1002,7 @@ router.put('/cocina/pedidos/:id/estado', checkPermission(COCINA_VIEW_PERMISSIONS
           inventoryResult = await validarYDescontarPedido(consumoPayloadResult.payload, {
             id_usuario: req?.user?.id_usuario,
             allowNegativeStock: true,
-            allowIncompleteConfiguration: true,
-            shortageMode: 'FALTANTE_COCINA',
+            allowIncompleteConfiguration: false,
             strictInsumoIds: strictSalsaInsumoIds,
             dbClient: client
           });

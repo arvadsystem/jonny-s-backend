@@ -187,10 +187,7 @@ const resolveLegacyExtrasInventory = async ({ queryRunner, extras, idSucursal })
     }
     const configuredId = resolved.id_insumo_configurado;
     if (!configuredId) {
-      return {
-        ...resolved,
-        disponible: extra?.estado !== false
-      };
+      return markUnavailable(resolved, 'EXTRA_INSUMO_NO_CONFIGURADO');
     }
 
     const row = inventoryById.get(configuredId);

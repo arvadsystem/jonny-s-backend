@@ -85,6 +85,7 @@ const getAlertasTableCapabilities = async (queryRunner = pool) => {
 const resolveAlertType = (motivo) => {
   const code = String(motivo || '').trim().toUpperCase();
   if (code === 'STOCK_INSUFICIENTE') return 'STOCK_INSUFICIENTE_PERMITIDO';
+  if (code === 'STOCK_BAJO') return 'STOCK_BAJO';
   if (code === 'ALMACEN_DE_OTRA_SUCURSAL') return 'ALMACEN_NO_DESCONTADO';
   if (code.includes('SIN_COMPONENTES')) return 'CONFIGURACION_INCOMPLETA';
   if (code.startsWith('EXTRA_')) return 'CONFIGURACION_EXTRA_INCOMPLETA';

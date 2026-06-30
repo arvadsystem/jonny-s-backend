@@ -1,7 +1,13 @@
 import assert from 'node:assert/strict';
-import { readFile } from 'node:fs/promises';
 import { describe, it } from 'node:test';
 import { validarStockConBloqueo } from '../services/inventarioStockValidator.js';
+import {
+  analyzePedidoMovementState,
+  buildLineMovementRows
+} from '../services/inventarioMovimientoService.js';
+import { buildSalsaConsumptionItemsFromPedidoDetails } from '../services/salsasPedidoSnapshotService.js';
+import { attachSalsaInventorySnapshotsToLines } from '../routers/ventas/services/salsasInventoryService.js';
+import { buildComplementLineConfig } from '../routers/ventas/services/ventasPayloadService.js';
 
 process.env.CATALOGO_MAESTRO_READS_ENABLED = 'false';
 
@@ -76,6 +82,55 @@ const validate = (client, { productos = [], insumos = [], expectedInsumoWarehous
 const stockShortages = (result) =>
   result.faltantes.filter((item) => item.motivo === 'STOCK_INSUFICIENTE');
 
+const stockLowWarnings = (result) =>
+  result.advertencias.filter((item) => item.motivo === 'STOCK_BAJO');
+
+const makeSalsaClient = () => ({
+  async query(sql) {
+    const text = String(sql);
+    if (text.includes('information_schema.columns')) {
+      return {
+        rows: [
+          { column_name: 'id_insumo' },
+          { column_name: 'cantidad_porcion' },
+          { column_name: 'id_unidad_consumo' }
+        ]
+      };
+    }
+    if (text.includes('FROM public.salsas')) {
+      return {
+        rows: [{
+          id_salsa: 40,
+          id_complemento: 40,
+          nombre: 'Cajun',
+          estado: true,
+          id_insumo: 400,
+          cantidad_porcion: 2,
+          id_unidad_consumo: 1
+        }]
+      };
+    }
+    if (text.includes('SELECT id_insumo, id_unidad_medida')) {
+      return { rows: [{ id_insumo: 400, id_unidad_medida: 1, estado: true }] };
+    }
+    if (text.includes('FROM public.insumos_almacenes')) {
+      return {
+        rows: [{
+          id_insumo: 400,
+          id_almacen: 20,
+          id_sucursal: 6,
+          cantidad: 1,
+          stock_minimo: 0
+        }]
+      };
+    }
+    if (text.includes('FROM public.unidades_medida')) {
+      return { rows: [{ id_unidad_medida: 1 }] };
+    }
+    return { rows: [] };
+  }
+});
+
 describe('politica de stock negativo en ventas e inventario', () => {
   it('PRODUCTO: stock 10, venta 1 queda suficiente y saldo proyectado 9', async () => {
     const result = await validate(makeStockClient({
@@ -84,6 +139,20 @@ describe('politica de stock negativo en ventas e inventario', () => {
 
     assert.equal(result.faltantes.length, 0);
     assert.equal(result.excludedResources.productoIds.size, 0);
+  });
+
+  it('PRODUCTO: stock 10, minimo 5, venta 7 queda STOCK_BAJO sin faltante negativo', async () => {
+    const result = await validate(makeStockClient({
+      products: { 1: { id_producto: 1, cantidad: 10, stock_minimo: 5 } }
+    }), { productos: [[1, 7]] });
+    const [warning] = stockLowWarnings(result);
+
+    assert.equal(result.faltantes.length, 0);
+    assert.equal(warning.id_producto, 1);
+    assert.equal(warning.requerido, 7);
+    assert.equal(warning.faltante, 0);
+    assert.equal(warning.saldo_proyectado, 3);
+    assert.equal(warning.stock_minimo, 5);
   });
 
   it('PRODUCTO: stock 3, venta 8 se reporta como warning de saldo proyectado -5', async () => {
@@ -223,28 +292,100 @@ describe('politica de stock negativo en ventas e inventario', () => {
     assert.equal(result.excludedResources.insumoIds.size, 0);
   });
 
-  it('STRICT: stock insuficiente no usa strictStockShortages y configuracion invalida sigue separada', async () => {
-    const service = await readFile(new URL('../services/inventarioPedidoService.js', import.meta.url), 'utf8');
-    assert.equal(service.includes('strictStockShortages'), false);
-    assert.match(service, /strictConfigFaults/);
-    assert.match(service, /stockShortages\.length > 0 && !allowNegativeStock/);
+  it('IDEMPOTENCIA: PEDIDO y FALTANTE_COCINA son equivalentes para la identidad fisica', () => {
+    const expectedRows = [{
+      id_detalle_pedido: 900,
+      id_ref: 700,
+      id_pedido_trazabilidad: 700,
+      ref_origen: 'PEDIDO',
+      origen_consumo: 'SALSA',
+      id_almacen: 20,
+      id_insumo: 400,
+      cantidad: 16
+    }];
+    const existingRows = [{
+      id_movimiento: 1,
+      id_detalle_pedido: 900,
+      id_ref: 700,
+      id_pedido_trazabilidad: 700,
+      ref_origen: 'FALTANTE_COCINA',
+      origen_consumo: 'SALSA',
+      id_almacen: 20,
+      id_insumo: 400,
+      cantidad: 16
+    }];
+
+    assert.equal(analyzePedidoMovementState({ expectedRows, existingRows }).state, 'COMPLETE');
   });
 
-  it('COCINA: EN_PREPARACION usa FALTANTE_COCINA cuando hay faltantes permitidos', async () => {
-    const cocina = await readFile(new URL('../routers/cocina.js', import.meta.url), 'utf8');
-    assert.match(cocina, /allowNegativeStock:\s*true/);
-    assert.match(cocina, /allowIncompleteConfiguration:\s*true/);
-    assert.match(cocina, /shortageMode:\s*'FALTANTE_COCINA'/);
+  it('MOVIMIENTOS: buildLineMovementRows mantiene ref_origen PEDIDO aunque haya shortage', () => {
+    const rows = buildLineMovementRows({
+      movementRows: [{
+        tipo_recurso: 'insumo',
+        id_detalle_pedido: 900,
+        id_insumo: 400,
+        cantidad: 16,
+        origen_consumo: 'SALSA'
+      }],
+      productosById: new Map(),
+      insumosById: new Map([[400, { id_insumo: 400, id_almacen: 20 }]]),
+      actorUserId: 1,
+      idPedido: 700,
+      refOrigen: 'PEDIDO',
+      shortagesByResource: new Map([['insumo:400', { requerido: 16, disponible: 1, faltante: 15 }]])
+    });
+
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].ref_origen, 'PEDIDO');
+    assert.equal(rows[0].cantidad, 16);
   });
 
-  it('VENTAS/SALSAS: no quedan throws por stock insuficiente de extras o salsa en hidratacion/snapshots', async () => {
-    const ventas = await readFile(new URL('../routers/ventas.js', import.meta.url), 'utf8');
-    const salsas = await readFile(new URL('../routers/ventas/services/salsasInventoryService.js', import.meta.url), 'utf8');
+  it('SALSA ROUND-TRIP: snapshot persiste consumo total para cantidades 1, 8, 99 y 999', async () => {
+    for (const cantidad of [1, 8, 99, 999]) {
+      const line = {
+        kind: 'RECETA',
+        cantidad,
+        complementos_detalle: [{ id_salsa: 40, id_complemento: 40, nombre: 'Cajun' }]
+      };
+      await attachSalsaInventorySnapshotsToLines({
+        client: makeSalsaClient(),
+        lines: [line],
+        idSucursal: 6
+      });
 
-    assert.match(ventas, /validateProductStock:\s*false/);
-    assert.equal(/No hay existencias suficientes para el extra/.test(ventas), false);
-    assert.equal(/VENTAS_SALSA_STOCK_INSUFICIENTE/.test(salsas.slice(salsas.indexOf('export const attachSalsaInventorySnapshotsToLines'))), false);
-    assert.match(salsas, /stockInsuficiente/);
-    assert.match(salsas, /saldoProyectado/);
+      const configuracion_menu = buildComplementLineConfig(line);
+      const consumo = buildSalsaConsumptionItemsFromPedidoDetails([{
+        id_detalle_pedido: 1000 + cantidad,
+        configuracion_menu
+      }]);
+
+      assert.equal(consumo.errors.length, 0);
+      assert.equal(consumo.items.length, 1);
+      assert.equal(consumo.items[0].cantidad, cantidad * 2);
+    }
+  });
+
+  it('SALSA SNAPSHOT LEGACY: reconstruye total si falta cantidad_base_total y no descarta salsas_por_unidad no vacio', () => {
+    const consumo = buildSalsaConsumptionItemsFromPedidoDetails([{
+      id_detalle_pedido: 901,
+      configuracion_menu: {
+        complementos: [],
+        salsas_por_unidad: [{
+          id_salsa: 40,
+          nombre: 'Cajun',
+          inventario: {
+            id_insumo: 400,
+            id_almacen: 20,
+            id_unidad_base: 1,
+            cantidad_base_por_porcion: 2,
+            porciones_por_orden: 1,
+            cantidad_linea: 8
+          }
+        }]
+      }
+    }]);
+
+    assert.equal(consumo.errors.length, 0);
+    assert.equal(consumo.items[0].cantidad, 16);
   });
 });

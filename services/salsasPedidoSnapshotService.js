@@ -9,13 +9,30 @@ const toPositiveNumber = (value) => {
 };
 
 const getSelections = (config) => {
-  if (Array.isArray(config?.complementos)) return config.complementos;
-  if (Array.isArray(config?.componentes?.seleccion)) return config.componentes.seleccion;
-  if (Array.isArray(config?.salsas_por_unidad)) return config.salsas_por_unidad;
+  const candidates = [
+    config?.complementos,
+    config?.componentes?.seleccion,
+    config?.salsas_por_unidad
+  ];
+  for (const candidate of candidates) {
+    if (Array.isArray(candidate) && candidate.length > 0) return candidate;
+  }
   return [];
 };
 
 const stockKey = (idInsumo, idAlmacen) => `${idInsumo}:${idAlmacen}`;
+
+const resolveSnapshotTotal = (snapshot) => {
+  const explicitTotal = toPositiveNumber(snapshot?.cantidad_base_total);
+  if (explicitTotal) return explicitTotal;
+  const basePorPorcion = toPositiveNumber(snapshot?.cantidad_base_por_porcion);
+  if (!basePorPorcion) return null;
+  const porcionesTotal = toPositiveNumber(snapshot?.porciones_total);
+  if (porcionesTotal) return basePorPorcion * porcionesTotal;
+  const porcionesPorOrden = toPositiveNumber(snapshot?.porciones_por_orden ?? snapshot?.porciones) || 1;
+  const cantidadLinea = toPositiveNumber(snapshot?.cantidad_linea) || 1;
+  return basePorPorcion * porcionesPorOrden * cantidadLinea;
+};
 
 export const loadLegacySalsaConsumptionByStockKey = async (client, idPedido) => {
   const pedidoId = toPositiveInt(idPedido);
@@ -75,7 +92,7 @@ export const buildSalsaConsumptionItemsFromPedidoDetails = (
       const idInsumo = toPositiveInt(snapshot.id_insumo_maestro || snapshot.id_insumo);
       const idAlmacen = toPositiveInt(snapshot.id_almacen);
       const idUnidadBase = toPositiveInt(snapshot.id_unidad_base);
-      const cantidadBaseTotal = toPositiveNumber(snapshot.cantidad_base_total);
+      const cantidadBaseTotal = resolveSnapshotTotal(snapshot);
       if (!idInsumo || !idAlmacen || !idUnidadBase || !cantidadBaseTotal) {
         errors.push({
           id_detalle_pedido: idDetallePedido,
@@ -86,7 +103,7 @@ export const buildSalsaConsumptionItemsFromPedidoDetails = (
         continue;
       }
 
-      const aggregateKey = `${idDetallePedido}:${idSalsa}`;
+      const aggregateKey = `${idDetallePedido}:${idSalsa}:${idInsumo}:${idAlmacen}:${cantidadBaseTotal}`;
       if (Number(snapshot.porciones || 0) > 1) {
         if (aggregateSnapshotsSeen.has(aggregateKey)) continue;
         aggregateSnapshotsSeen.add(aggregateKey);

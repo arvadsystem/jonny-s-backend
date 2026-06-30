@@ -442,8 +442,7 @@ export const attachSalsaInventorySnapshotsToLines = async ({ client, lines = [],
         ? {
             ...salsa,
             inventario: {
-              ...snapshot,
-              cantidad_base_total: snapshot.cantidad_base_por_porcion
+              ...snapshot
             }
           }
         : salsa;

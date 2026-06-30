@@ -2072,9 +2072,12 @@ const buildStockWarningResponse = (inventoryResult) => {
     ? inventoryResult.warning.faltantes
     : [];
   if (faltantes.length === 0) return null;
+  const hasNegative = faltantes.some((item) => String(item?.motivo || '').trim().toUpperCase() === 'STOCK_INSUFICIENTE');
   return {
-    code: inventoryResult?.warning?.code || 'STOCK_INSUFICIENTE_PERMITIDO',
-    message: 'La venta se completo y algunos recursos quedaron por debajo de cero.',
+    code: hasNegative ? 'STOCK_INSUFICIENTE_PERMITIDO' : 'STOCK_BAJO',
+    message: hasNegative
+      ? 'La venta se completo y algunos recursos quedaron con saldo negativo.'
+      : 'La venta se completo y algunos recursos quedaron por debajo del stock minimo.',
     faltantes
   };
 };

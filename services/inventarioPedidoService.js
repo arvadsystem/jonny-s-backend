@@ -5,7 +5,6 @@ import { resolvePedidoConsumo } from './pedidoConsumoResolver.js';
 import { validarStockConBloqueo } from './inventarioStockValidator.js';
 import {
   MOVEMENT_REF,
-  SHORTAGE_MOVEMENT_REF,
   analyzePedidoMovementState,
   buildLineMovementRows,
   fetchPedidoInventoryMovementsForUpdate,
@@ -130,6 +129,20 @@ const createPedidoMovementConflictError = ({ idPedido, movementState, cause }) =
   return error;
 };
 
+const buildInventoryWarningResponse = (warningDetails, generatedMovementCount) => {
+  if (!Array.isArray(warningDetails) || warningDetails.length === 0) return null;
+  const hasNegative = warningDetails.some((item) => String(item?.motivo || '').trim().toUpperCase() === 'STOCK_INSUFICIENTE');
+  const code = hasNegative ? 'STOCK_INSUFICIENTE_PERMITIDO' : 'STOCK_BAJO';
+  return {
+    code,
+    message: hasNegative
+      ? 'Pedido paso a preparacion y algunos recursos quedaron con saldo negativo.'
+      : 'Pedido paso a preparacion y algunos recursos quedaron por debajo del stock minimo.',
+    movimientos_generados: generatedMovementCount,
+    faltantes: warningDetails
+  };
+};
+
 export const validarYDescontarPedido = async (payload, options = {}) => {
   const idSucursal = toPositiveInt(payload?.id_sucursal);
   const idPedido = toPositiveInt(payload?.id_pedido);
@@ -144,10 +157,6 @@ export const validarYDescontarPedido = async (payload, options = {}) => {
   const allowNegativeStock = options?.allowNegativeStock === true;
   const allowCrossBranchWarehouse = options?.allowCrossBranchWarehouse === true;
   const allowIncompleteConfiguration = options?.allowIncompleteConfiguration === true;
-  const shortageMode = String(options?.shortageMode || '').trim().toUpperCase();
-  const movementRefForShortage = shortageMode === SHORTAGE_MOVEMENT_REF
-    ? SHORTAGE_MOVEMENT_REF
-    : MOVEMENT_REF;
   const externalClient = options?.dbClient || null;
   const strictInsumoIds = normalizePositiveIdSet(options?.strictInsumoIds);
 
@@ -192,10 +201,14 @@ export const validarYDescontarPedido = async (payload, options = {}) => {
       ...(Array.isArray(stockResult.faltantes) ? stockResult.faltantes : [])
     ];
 
+    const stockWarningCodes = new Set(['STOCK_INSUFICIENTE', 'STOCK_BAJO']);
     const configFaults = faltantes.filter(
-      (item) => String(item?.motivo || '').trim().toUpperCase() !== 'STOCK_INSUFICIENTE'
+      (item) => !stockWarningCodes.has(String(item?.motivo || '').trim().toUpperCase())
     );
-    const stockShortages = faltantes.filter(
+    const stockWarnings = faltantes.filter(
+      (item) => stockWarningCodes.has(String(item?.motivo || '').trim().toUpperCase())
+    );
+    const stockShortages = stockWarnings.filter(
       (item) => String(item?.motivo || '').trim().toUpperCase() === 'STOCK_INSUFICIENTE'
     );
     const strictConfigFaults = configFaults.filter((item) => strictInsumoIds.has(Number(item?.id_insumo || item?.id_recurso)));
@@ -204,7 +217,7 @@ export const validarYDescontarPedido = async (payload, options = {}) => {
       : [];
     const configWarnings = allowIncompleteConfiguration ? configFaults : [];
     const warningDetails = [
-      ...stockShortages,
+      ...stockWarnings,
       ...operationalWarnings,
       ...configWarnings
     ];
@@ -228,7 +241,7 @@ export const validarYDescontarPedido = async (payload, options = {}) => {
       insumosById: stockResult.lockedRows.insumosById,
       actorUserId,
       idPedido,
-      refOrigen: stockShortages.length > 0 ? movementRefForShortage : MOVEMENT_REF,
+      refOrigen: MOVEMENT_REF,
       shortagesByResource,
       excludedProductIds,
       excludedInsumoIds
@@ -285,7 +298,7 @@ export const validarYDescontarPedido = async (payload, options = {}) => {
         insumosById: stockResult.lockedRows.insumosById,
         insumoTraceById: consumoResult.insumoTraceById,
         movementRows: consumoResult.consumo.movimientoRows,
-        refOrigen: stockShortages.length > 0 ? movementRefForShortage : MOVEMENT_REF,
+        refOrigen: MOVEMENT_REF,
         shortagesByResource,
         excludedProductIds,
         excludedInsumoIds
@@ -316,15 +329,7 @@ export const validarYDescontarPedido = async (payload, options = {}) => {
         : 'Inventario descontado correctamente.',
       id_pedido: idPedido,
       id_sucursal: idSucursal,
-      warning: warningDetails.length > 0
-        ? {
-            code: 'STOCK_INSUFICIENTE_PERMITIDO',
-            message: generatedMovementCount > 0
-              ? 'Pedido paso a preparacion y el inventario se desconto con advertencias operativas.'
-              : 'Pedido paso a preparacion con advertencias operativas de inventario.',
-            faltantes: warningDetails
-          }
-        : null,
+      warning: buildInventoryWarningResponse(warningDetails, generatedMovementCount),
       resumen: {
         productos_afectados: movimientoProductoQtyMap.size,
         insumos_afectados: movimientoInsumoQtyMap.size,
