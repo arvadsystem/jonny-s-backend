@@ -131,7 +131,7 @@ export const partitionPedidoInventoryMovements = ({ rows = [], context = {} } = 
     }
 
     if (isLegacyShape) {
-      if (rowMs === null || legacyCutoffMs === null || !hasTraceRequiredFields(row)) {
+      if (rowMs === null || legacyCutoffMs === null) {
         result.invalidCurrentTraceRows.push(row);
         continue;
       }

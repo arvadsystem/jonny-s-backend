@@ -200,7 +200,7 @@ const main = async () => {
           id_usuario,
           origen_pedido
         )
-        VALUES ($1, CURRENT_TIMESTAMP, 1, 0, 1, $2, $3, $4, 'QA_SALSA_INVENTORY')
+        VALUES ($1, CURRENT_TIMESTAMP AT TIME ZONE 'America/Tegucigalpa', 1, 0, 1, $2, $3, $4, 'QA_SALSA_INVENTORY')
         RETURNING id_pedido
       `,
       [`QA salsa inventory ${refId}`, fixture.id_estado_pedido, fixture.id_sucursal, fixture.id_usuario]

@@ -101,6 +101,43 @@ describe('pedido legacy id collision partition', () => {
     assert.equal(partition.ignoredLegacyCollisionRows.length, 0);
   });
 
+  it('ignora legacy antiguo aunque no tenga origen_consumo', () => {
+    const partition = classifySingle({ ...oldLegacy, origen_consumo: null });
+    assert.equal(partition.ignoredLegacyCollisionRows.length, 1);
+    assert.equal(partition.invalidCurrentTraceRows.length, 0);
+  });
+
+  it('ignora legacy antiguo aunque no tenga id_almacen', () => {
+    const partition = classifySingle({ ...oldLegacy, id_almacen: null });
+    assert.equal(partition.ignoredLegacyCollisionRows.length, 1);
+    assert.equal(partition.invalidCurrentTraceRows.length, 0);
+  });
+
+  it('ignora legacy antiguo aunque no tenga producto ni insumo', () => {
+    const partition = classifySingle({ ...oldLegacy, id_producto: null, id_insumo: null });
+    assert.equal(partition.ignoredLegacyCollisionRows.length, 1);
+    assert.equal(partition.invalidCurrentTraceRows.length, 0);
+  });
+
+  it('ignora legacy antiguo aunque tenga producto e insumo simultaneamente', () => {
+    const partition = classifySingle({ ...oldLegacy, id_producto: 100, id_insumo: 200 });
+    assert.equal(partition.ignoredLegacyCollisionRows.length, 1);
+    assert.equal(partition.invalidCurrentTraceRows.length, 0);
+  });
+
+  it('ignora legacy antiguo con datos incompletos', () => {
+    const partition = classifySingle({
+      ...oldLegacy,
+      id_almacen: null,
+      id_producto: null,
+      id_insumo: null,
+      origen_consumo: null,
+      cantidad: null
+    });
+    assert.equal(partition.ignoredLegacyCollisionRows.length, 1);
+    assert.equal(partition.invalidCurrentTraceRows.length, 0);
+  });
+
   it('ignora legacy seis horas anterior real si supera margen', () => {
     const partition = classifySingle({ ...oldLegacy, fecha_mov_epoch_ms: pedidoMs - minutes(360) });
     assert.equal(partition.ignoredLegacyCollisionRows.length, 1);
@@ -135,6 +172,16 @@ describe('pedido legacy id collision partition', () => {
 
   it('bloquea legacy posterior al pedido', () => {
     const partition = classifySingle({ ...oldLegacy, fecha_mov_epoch_ms: pedidoMs + 1 });
+    assert.equal(partition.currentLegacyRows.length, 1);
+    assert.equal(partition.ignoredLegacyCollisionRows.length, 0);
+  });
+
+  it('bloquea legacy contemporaneo aunque no tenga origen_consumo', () => {
+    const partition = classifySingle({
+      ...oldLegacy,
+      origen_consumo: null,
+      fecha_mov_epoch_ms: pedidoMs
+    });
     assert.equal(partition.currentLegacyRows.length, 1);
     assert.equal(partition.ignoredLegacyCollisionRows.length, 0);
   });
@@ -180,6 +227,15 @@ describe('pedido legacy id collision partition', () => {
     assert.equal(partition.invalidCurrentTraceRows.length, 1);
   });
 
+  it('movimiento actual trazado sin origen_consumo queda invalido', () => {
+    const partition = partitionPedidoInventoryMovements({
+      rows: [{ ...currentComplete, origen_consumo: null }],
+      context
+    });
+    assert.equal(partition.invalidCurrentTraceRows.length, 1);
+    assert.equal(partition.currentTracedRows.length, 0);
+  });
+
   it('movimiento trazado con detalle de otro pedido bloquea como INVALID_CURRENT_TRACE', () => {
     const partition = partitionPedidoInventoryMovements({
       rows: [{ ...currentComplete, id_detalle_pedido: 901 }],
@@ -196,5 +252,28 @@ describe('pedido legacy id collision partition', () => {
     });
     assert.equal(partition.invalidCurrentTraceRows.length, 1);
     assert.equal(partition.ignoredLegacyCollisionRows.length, 0);
+  });
+
+  it('fixture QA-like legacy con origen_consumo null se ignora', () => {
+    const qaContext = {
+      idPedido: 81,
+      fechaHoraPedidoEpochMs: Date.UTC(2026, 5, 30, 10, 0, 0, 0),
+      detallePedidoIds: [910]
+    };
+    const partition = classifySingle({
+      id_movimiento: 81,
+      id_ref: 81,
+      id_detalle_pedido: null,
+      id_pedido_trazabilidad: null,
+      id_almacen: 1,
+      id_producto: null,
+      id_insumo: 22,
+      origen_consumo: null,
+      ref_origen: 'PEDIDO',
+      tipo: 'SALIDA',
+      fecha_mov_epoch_ms: qaContext.fechaHoraPedidoEpochMs - minutes(60)
+    }, qaContext);
+    assert.equal(partition.ignoredLegacyCollisionRows.length, 1);
+    assert.equal(partition.invalidCurrentTraceRows.length, 0);
   });
 });
