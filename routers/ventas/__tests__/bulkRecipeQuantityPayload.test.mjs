@@ -85,6 +85,24 @@ const makeTransactionClient = ({ recipeComponents = [] } = {}) => {
       if (text.includes('FROM public.sucursales')) {
         return { rowCount: 1, rows: [{ id_sucursal: 1, nombre_sucursal: 'Sucursal 1', estado: true }] };
       }
+      if (text.includes('information_schema.tables')) {
+        return { rowCount: 1, rows: [{ table_name: 'detalle_pedido_extras' }] };
+      }
+      if (text.includes('FROM public.detalle_pedido dp') && text.includes('WHERE dp.id_pedido = $1')) {
+        return {
+          rowCount: 1,
+          rows: [{
+            id_detalle_pedido: 700,
+            id_producto: null,
+            id_receta: 12,
+            cantidad: 99,
+            configuracion_menu: null
+          }]
+        };
+      }
+      if (text.includes('FROM public.detalle_pedido_extras')) {
+        return { rowCount: 0, rows: [] };
+      }
       if (text.includes('FROM public.movimientos_inventario') && text.includes('LIMIT 1')) {
         return { rowCount: 0, rows: [] };
       }
@@ -652,8 +670,8 @@ describe('ventas bulk recipe quantity payload', () => {
 
   it('detecta pedido ya descontado completo y pedido parcial inconsistente', () => {
     const expectedRows = [
-      { id_detalle_pedido: 700, ref_origen: 'PEDIDO', origen_consumo: 'RECETA', id_almacen: 1, id_producto: null, id_insumo: 200, cantidad: 297 },
-      { id_detalle_pedido: 701, ref_origen: 'PEDIDO', origen_consumo: 'PRODUCTO', id_almacen: 1, id_producto: 10, id_insumo: null, cantidad: 1 }
+      { id_ref: 10, id_pedido_trazabilidad: 10, id_detalle_pedido: 700, ref_origen: 'PEDIDO', origen_consumo: 'RECETA', id_almacen: 1, id_producto: null, id_insumo: 200, cantidad: 297 },
+      { id_ref: 10, id_pedido_trazabilidad: 10, id_detalle_pedido: 701, ref_origen: 'PEDIDO', origen_consumo: 'PRODUCTO', id_almacen: 1, id_producto: 10, id_insumo: null, cantidad: 1 }
     ];
     const complete = analyzePedidoMovementState({
       expectedRows,

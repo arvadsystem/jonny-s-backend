@@ -1,5 +1,6 @@
 import pool from '../config/db-connection.js';
-import { normalizePedidoPayload, toPositiveInt } from './pedidoPayloadValidator.js';
+import { toPositiveInt } from './pedidoPayloadValidator.js';
+import { buildPedidoConsumoPayload } from './pedidoInventoryPayloadService.js';
 import { resolvePedidoConsumo } from './pedidoConsumoResolver.js';
 import { validarStockConBloqueo } from './inventarioStockValidator.js';
 import {
@@ -10,6 +11,11 @@ import {
   fetchPedidoInventoryMovementsForUpdate,
   registrarMovimientosPedido
 } from './inventarioMovimientoService.js';
+
+const PEDIDO_TRACE_UNIQUE_CONSTRAINTS = new Set([
+  'ux_mov_inv_linea_salida_insumo',
+  'ux_mov_inv_linea_salida_producto'
+]);
 
 // Orquestador de descuento por pedido (modulo INSUMOS).
 // -----------------------------------------------------
@@ -82,89 +88,6 @@ const lockPedidoForInventory = async (client, idPedido, idSucursal) => {
   return pedido;
 };
 
-const validatePedidoDetalleResources = async ({ client, idPedido, items }) => {
-  const detailIds = [...new Set(
-    (Array.isArray(items) ? items : [])
-      .map((item) => toPositiveInt(item?.id_detalle_pedido))
-      .filter(Boolean)
-  )];
-  if (!detailIds.length) return;
-
-  const detailsResult = await client.query(
-    `
-      SELECT id_detalle_pedido, id_pedido, id_producto, id_receta
-      FROM public.detalle_pedido
-      WHERE id_detalle_pedido = ANY($1::int[])
-        AND COALESCE(estado, true) = true
-      FOR UPDATE
-    `,
-    [detailIds]
-  );
-  const detailById = new Map(detailsResult.rows.map((row) => [Number(row.id_detalle_pedido), row]));
-
-  const extrasResult = await client.query(
-    `
-      SELECT id_detalle_pedido, id_extra, id_insumo, id_almacen, origen_snapshot
-      FROM public.detalle_pedido_extras
-      WHERE id_detalle_pedido = ANY($1::int[])
-        AND COALESCE(estado, true) = true
-    `,
-    [detailIds]
-  );
-  const extrasByDetail = new Map();
-  for (const row of extrasResult.rows || []) {
-    const idDetalle = Number(row.id_detalle_pedido);
-    if (!extrasByDetail.has(idDetalle)) extrasByDetail.set(idDetalle, []);
-    extrasByDetail.get(idDetalle).push(row);
-  }
-
-  for (const item of items) {
-    const idDetalle = toPositiveInt(item?.id_detalle_pedido);
-    if (!idDetalle) continue;
-
-    const detail = detailById.get(idDetalle);
-    if (!detail || Number(detail.id_pedido) !== Number(idPedido)) {
-      throw createPedidoInventoryError(
-        'PEDIDO_DETALLE_NO_PERTENECE',
-        `La linea ${idDetalle} no pertenece al pedido ${idPedido}.`
-      );
-    }
-
-    if (item.tipo_item === 'PRODUCTO') {
-      if (Number(detail.id_producto || 0) !== Number(item.id_producto || item.id_item) || detail.id_receta !== null) {
-        throw createPedidoInventoryError('PEDIDO_DETALLE_RECURSO_NO_COINCIDE', `La linea ${idDetalle} no corresponde al producto enviado.`);
-      }
-    }
-    if (item.tipo_item === 'RECETA') {
-      if (Number(detail.id_receta || 0) !== Number(item.id_receta || item.id_item) || detail.id_producto !== null) {
-        throw createPedidoInventoryError('PEDIDO_DETALLE_RECURSO_NO_COINCIDE', `La linea ${idDetalle} no corresponde a la receta enviada.`);
-      }
-    }
-    if (item.tipo_item === 'EXTRA') {
-      const belongs = (extrasByDetail.get(idDetalle) || [])
-        .some((row) => Number(row.id_extra || 0) === Number(item.id_extra || item.id_item));
-      if (!belongs) {
-        throw createPedidoInventoryError('PEDIDO_EXTRA_NO_PERTENECE_LINEA', `El extra enviado no pertenece a la linea ${idDetalle}.`);
-      }
-    }
-    if (item.tipo_item === 'SALSA') {
-      const belongs = (extrasByDetail.get(idDetalle) || [])
-        .some((row) => {
-          const snapshot = row.origen_snapshot && typeof row.origen_snapshot === 'object' ? row.origen_snapshot : {};
-          const idSalsa = toPositiveInt(snapshot.id_salsa ?? snapshot.id_complemento ?? row.id_extra);
-          const idInsumo = toPositiveInt(snapshot.id_insumo ?? row.id_insumo);
-          const idAlmacen = toPositiveInt(snapshot.id_almacen ?? row.id_almacen);
-          return idSalsa === Number(item.id_salsa || item.id_item)
-            && idInsumo === Number(item.id_insumo)
-            && idAlmacen === Number(item.id_almacen);
-        });
-      if (!belongs) {
-        throw createPedidoInventoryError('PEDIDO_SALSA_NO_PERTENECE_LINEA', `La salsa enviada no pertenece a la linea ${idDetalle}.`);
-      }
-    }
-  }
-};
-
 const normalizeExcludedIdSet = (value) => {
   if (value instanceof Set) return value;
   if (Array.isArray(value)) return new Set(value.map((id) => Number(id)).filter((id) => id > 0));
@@ -208,16 +131,15 @@ const createPedidoMovementConflictError = ({ idPedido, movementState, cause }) =
 };
 
 export const validarYDescontarPedido = async (payload, options = {}) => {
-  const normalized = normalizePedidoPayload(payload);
-  if (!normalized.ok) {
-    const error = new Error(normalized.errors[0] || 'Payload invalido.');
-    error.httpStatus = 400;
-    error.code = 'VALIDATION_ERROR';
-    error.details = normalized.errors;
-    throw error;
+  const idSucursal = toPositiveInt(payload?.id_sucursal);
+  const idPedido = toPositiveInt(payload?.id_pedido);
+  if (!idSucursal || !idPedido) {
+    throw createPedidoInventoryError(
+      'VALIDATION_ERROR',
+      'id_sucursal e id_pedido son obligatorios y deben ser enteros > 0.',
+      400
+    );
   }
-
-  const { id_sucursal: idSucursal, id_pedido: idPedido, items } = normalized.value;
   const actorUserId = toPositiveInt(options?.id_usuario) || null;
   const allowNegativeStock = options?.allowNegativeStock === true;
   const allowCrossBranchWarehouse = options?.allowCrossBranchWarehouse === true;
@@ -236,12 +158,22 @@ export const validarYDescontarPedido = async (payload, options = {}) => {
 
     await lockPedidoForInventory(client, idPedido, idSucursal);
     await ensureBranchExists(client, idSucursal);
-    await validatePedidoDetalleResources({ client, idPedido, items });
+    const canonicalResult = await buildPedidoConsumoPayload(client, idPedido, idSucursal);
+    if (!canonicalResult.ok) {
+      const body = canonicalResult.body || {};
+      throw createPedidoInventoryError(
+        body.code || 'PEDIDO_CONSUMO_INVALIDO',
+        body.message || 'No se pudo construir el consumo canonico del pedido.',
+        Number(canonicalResult.status || 409),
+        body.details || null
+      );
+    }
+    const canonicalItems = canonicalResult.payload.items;
 
-    // 1) Resolver consumo real desde items del pedido.
+    // 1) Resolver consumo real desde el pedido persistido, no desde el payload externo.
     const consumoResult = await resolvePedidoConsumo({
       client,
-      items
+      items: canonicalItems
     });
 
     // 2) Validar stock con locks de concurrencia.
@@ -254,7 +186,7 @@ export const validarYDescontarPedido = async (payload, options = {}) => {
       allowCrossBranchWarehouse
     });
 
-    // 3) Si existe cualquier faltante, rollback total (sin descuentos parciales).
+    // 3) Construir filas esperadas y revisar idempotencia antes de responder faltantes.
     const faltantes = [
       ...(Array.isArray(consumoResult.faltantes) ? consumoResult.faltantes : []),
       ...(Array.isArray(stockResult.faltantes) ? stockResult.faltantes : [])
@@ -277,33 +209,6 @@ export const validarYDescontarPedido = async (payload, options = {}) => {
       ...operationalWarnings,
       ...configWarnings
     ];
-
-    if (strictConfigFaults.length > 0 || (configFaults.length > 0 && !allowIncompleteConfiguration)) {
-      const blockingConfigFaults = strictConfigFaults.length > 0 ? strictConfigFaults : configFaults;
-      const firstConfigFaultMessage = String(blockingConfigFaults[0]?.mensaje || '').trim();
-      if (manageTransaction) await client.query('ROLLBACK');
-      return {
-        ok: false,
-        code: 'CONFIGURACION_INVENTARIO_INVALIDA',
-        message: firstConfigFaultMessage || 'No se pudo descontar inventario por configuracion incompleta de productos/recetas/extras/insumos/almacen.',
-        id_pedido: idPedido,
-        id_sucursal: idSucursal,
-        faltantes: blockingConfigFaults
-      };
-    }
-
-    if (strictStockShortages.length > 0 || (stockShortages.length > 0 && !allowNegativeStock)) {
-      const blockingStockShortages = strictStockShortages.length > 0 ? strictStockShortages : stockShortages;
-      if (manageTransaction) await client.query('ROLLBACK');
-      return {
-        ok: false,
-        code: 'STOCK_O_CONFIG_INSUFICIENTE',
-        message: 'No se pudo descontar inventario porque faltan recursos o hay configuraciones incompletas.',
-        id_pedido: idPedido,
-        id_sucursal: idSucursal,
-        faltantes: blockingStockShortages
-      };
-    }
 
     const excludedProductIds = normalizeExcludedIdSet(stockResult.excludedResources?.productoIds);
     const excludedInsumoIds = normalizeExcludedIdSet(stockResult.excludedResources?.insumoIds);
@@ -341,6 +246,33 @@ export const validarYDescontarPedido = async (payload, options = {}) => {
       throw createPedidoMovementConflictError({ idPedido, movementState });
     }
 
+    if (strictConfigFaults.length > 0 || (configFaults.length > 0 && !allowIncompleteConfiguration)) {
+      const blockingConfigFaults = strictConfigFaults.length > 0 ? strictConfigFaults : configFaults;
+      const firstConfigFaultMessage = String(blockingConfigFaults[0]?.mensaje || '').trim();
+      if (manageTransaction) await client.query('ROLLBACK');
+      return {
+        ok: false,
+        code: 'CONFIGURACION_INVENTARIO_INVALIDA',
+        message: firstConfigFaultMessage || 'No se pudo descontar inventario por configuracion incompleta de productos/recetas/extras/insumos/almacen.',
+        id_pedido: idPedido,
+        id_sucursal: idSucursal,
+        faltantes: blockingConfigFaults
+      };
+    }
+
+    if (strictStockShortages.length > 0 || (stockShortages.length > 0 && !allowNegativeStock)) {
+      const blockingStockShortages = strictStockShortages.length > 0 ? strictStockShortages : stockShortages;
+      if (manageTransaction) await client.query('ROLLBACK');
+      return {
+        ok: false,
+        code: 'STOCK_O_CONFIG_INSUFICIENTE',
+        message: 'No se pudo descontar inventario porque faltan recursos o hay configuraciones incompletas.',
+        id_pedido: idPedido,
+        id_sucursal: idSucursal,
+        faltantes: blockingStockShortages
+      };
+    }
+
     // 4) Registrar movimientos de salida ligados al pedido.
     let generatedMovementCount = 0;
     await client.query('SAVEPOINT inventario_movimientos_insert');
@@ -362,7 +294,7 @@ export const validarYDescontarPedido = async (payload, options = {}) => {
       });
       await client.query('RELEASE SAVEPOINT inventario_movimientos_insert');
     } catch (error) {
-      if (error?.code === '23505') {
+      if (error?.code === '23505' && PEDIDO_TRACE_UNIQUE_CONSTRAINTS.has(error?.constraint)) {
         await client.query('ROLLBACK TO SAVEPOINT inventario_movimientos_insert');
         const concurrentRows = await fetchPedidoInventoryMovementsForUpdate(client, idPedido);
         const concurrentState = analyzePedidoMovementState({

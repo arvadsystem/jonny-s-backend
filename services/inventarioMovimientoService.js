@@ -48,6 +48,8 @@ export const fetchPedidoInventoryMovementsForUpdate = async (client, idPedido) =
         id_producto,
         id_insumo,
         id_detalle_pedido,
+        id_ref,
+        id_pedido_trazabilidad,
         ref_origen,
         origen_consumo
       FROM public.movimientos_inventario
@@ -98,7 +100,19 @@ export const analyzePedidoMovementState = ({ expectedRows = [], existingRows = [
   const duplicates = new Set();
   const invalidRows = [];
   for (const row of Array.isArray(existingRows) ? existingRows : []) {
-    if (!toPositiveInt(row?.id_detalle_pedido) || !String(row?.origen_consumo || '').trim()) {
+    const idRef = toPositiveInt(row?.id_ref);
+    const idPedidoTrazabilidad = toPositiveInt(row?.id_pedido_trazabilidad);
+    const idProducto = toPositiveInt(row?.id_producto);
+    const idInsumo = toPositiveInt(row?.id_insumo);
+    if (
+      !toPositiveInt(row?.id_detalle_pedido) ||
+      !String(row?.origen_consumo || '').trim() ||
+      !idRef ||
+      !idPedidoTrazabilidad ||
+      idPedidoTrazabilidad !== idRef ||
+      (idProducto && idInsumo) ||
+      (!idProducto && !idInsumo)
+    ) {
       invalidRows.push(row);
       continue;
     }
@@ -238,6 +252,7 @@ export const buildLineMovementRows = ({
         id_insumo: null,
         id_detalle_pedido: idDetallePedido,
         id_ref: pedidoId,
+        id_pedido_trazabilidad: pedidoId,
         ref_origen: refOrigen,
         origen_consumo: normalizeOrigenConsumo(row.origen_consumo || 'PRODUCTO')
       };
@@ -264,6 +279,7 @@ export const buildLineMovementRows = ({
         id_insumo: idInsumoMovimiento,
         id_detalle_pedido: idDetallePedido,
         id_ref: pedidoId,
+        id_pedido_trazabilidad: pedidoId,
         ref_origen: refOrigen,
         origen_consumo: normalizeOrigenConsumo(row.origen_consumo || 'RECETA')
       };
@@ -342,6 +358,7 @@ export const registrarMovimientosPedido = async ({
       id_producto: idProductoMovimiento,
       id_insumo: null,
       id_ref: idPedido,
+      id_pedido_trazabilidad: idPedido,
       ref_origen: refOrigen,
       descripcion: `Descuento por pedido #${idPedido} (producto ${idProducto})${shortage ? ` - faltante auditado req:${shortage.requerido} disp:${shortage.disponible} deficit:${shortage.faltante}` : ''}${toPositiveInt(actorUserId) ? ` - usuario ${actorUserId}` : ''}`
     });
@@ -361,6 +378,7 @@ export const registrarMovimientosPedido = async ({
       id_producto: null,
       id_insumo: idInsumoMovimiento,
       id_ref: idPedido,
+      id_pedido_trazabilidad: idPedido,
       ref_origen: refOrigen,
       descripcion: `Descuento por pedido #${idPedido} (insumo ${idInsumo})${salsaTrace}${shortage ? ` - faltante auditado req:${shortage.requerido} disp:${shortage.disponible} deficit:${shortage.faltante}` : ''}${toPositiveInt(actorUserId) ? ` - usuario ${actorUserId}` : ''}`
     });

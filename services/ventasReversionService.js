@@ -60,6 +60,24 @@ const createReversionError = (status, code, message) => {
   return error;
 };
 
+const mapInventoryTraceTriggerError = (error) => {
+  if (!['23514', '23503'].includes(String(error?.code || ''))) return null;
+  const text = `${error?.message || ''} ${error?.detail || ''} ${error?.constraint || ''}`.toUpperCase();
+  if (text.includes('REVERSION_OVER_RETURN')) {
+    return createReversionError(409, 'VENTAS_REVERSION_SOBREDEVOLUCION', 'La reversión excede la cantidad disponible para devolver.');
+  }
+  if (text.includes('REVERSION_ALREADY_FULLY_RETURNED')) {
+    return createReversionError(409, 'ALREADY_FULLY_RETURNED', 'El inventario de la venta ya fue devuelto completamente.');
+  }
+  if (text.includes('LEGACY_PARTIAL_BLOCKED')) {
+    return createReversionError(409, 'LEGACY_PARTIAL_BLOCKED', 'La reversión parcial no puede restaurar inventario de movimientos legacy sin trazabilidad por línea.');
+  }
+  if (text.includes('TRACE_INVALID') || text.includes('REVERSION_TRACE_INVALID')) {
+    return createReversionError(409, 'TRACE_INCONSISTENT', 'Los movimientos originales de inventario tienen trazabilidad inconsistente.');
+  }
+  return null;
+};
+
 const resolveSucursalScope = async (client, idUsuario) => {
   const result = await client.query(
     `
@@ -358,8 +376,11 @@ const resolveFacturaLinesForUpdate = async (client, idFactura) => {
               NULLIF(TRIM(df.tipo_item), ''),
               CASE WHEN COALESCE(dfo.id_producto, df.id_producto) IS NOT NULL THEN 'PRODUCTO' ELSE 'ITEM' END
             )
-          ) = 'PRODUCTO'
-            AND COALESCE(dfo.id_producto, df.id_producto) IS NOT NULL THEN true
+          ) IN ('PRODUCTO', 'RECETA')
+            AND (
+              COALESCE(dfo.id_producto, df.id_producto) IS NOT NULL
+              OR COALESCE(dfo.id_receta, df.id_receta::int) IS NOT NULL
+            ) THEN true
           ELSE false
         END AS devuelve_inventario
       FROM public.detalle_facturas df
@@ -833,11 +854,10 @@ const isValidLegacyMovement = (row, returnedByOrigin = new Map()) => {
   const idMovimiento = parsePositiveInt(row?.id_movimiento);
   const cantidad = roundInventoryQuantity(Number(row?.cantidad || 0));
   const hasOneResource = Boolean(parsePositiveInt(row?.id_producto)) !== Boolean(parsePositiveInt(row?.id_insumo));
-  const returnedQty = roundInventoryQuantity(Number(returnedByOrigin.get(idMovimiento) || 0));
   if (!idMovimiento || cantidad <= 0 || !parsePositiveInt(row?.id_almacen) || !hasOneResource) return false;
   if (!['PEDIDO', 'FALTANTE_COCINA'].includes(String(row?.ref_origen || '').trim().toUpperCase())) return false;
   if (String(row?.tipo || '').trim().toUpperCase() !== 'SALIDA') return false;
-  return returnedQty <= cantidad;
+  return true;
 };
 
 export const classifyPedidoMovementReturnState = ({ movements = [], lineas = [], returnedByOrigin = new Map(), tipoReversion = '' } = {}) => {
@@ -850,6 +870,15 @@ export const classifyPedidoMovementReturnState = ({ movements = [], lineas = [],
   if (legacy.length > 0) {
     const hasInvalidLegacy = legacy.some((row) => !isValidLegacyMovement(row, returnedByOrigin));
     if (hasInvalidLegacy) return 'LEGACY_TRACE_INCONSISTENT';
+    const returnedStates = legacy.map((row) => {
+      const idMovimiento = parsePositiveInt(row.id_movimiento);
+      const returnedQty = roundInventoryQuantity(Number(returnedByOrigin.get(idMovimiento) || 0));
+      const originalQty = roundInventoryQuantity(Number(row.cantidad || 0));
+      return { returnedQty, originalQty };
+    });
+    if (returnedStates.some((row) => row.returnedQty > row.originalQty)) return 'LEGACY_OVER_RETURNED';
+    if (returnedStates.every((row) => row.returnedQty >= row.originalQty)) return 'LEGACY_ALREADY_FULLY_RETURNED';
+    if (returnedStates.some((row) => row.returnedQty > 0)) return 'LEGACY_PARTIALLY_RETURNED_INCONSISTENT';
     if (String(tipoReversion || '').toUpperCase() === 'PARCIAL') return 'LEGACY_PARTIAL_BLOCKED';
     return 'LEGACY_TOTAL_ALLOWED';
   }
@@ -956,11 +985,18 @@ const restorePedidoInventoryMovementsForReversion = async ({
   if (returnState === 'NO_ORIGINAL_MOVEMENTS') {
     return { handled: false, state: returnState, insertedCount: 0 };
   }
-  if (returnState === 'ALREADY_FULLY_RETURNED') {
+  if (returnState === 'ALREADY_FULLY_RETURNED' || returnState === 'LEGACY_ALREADY_FULLY_RETURNED') {
     throw createReversionError(409, 'ALREADY_FULLY_RETURNED', 'El inventario de la venta ya fue devuelto completamente.');
   }
-  if (returnState === 'TRACE_INCONSISTENT' || returnState === 'LEGACY_TRACE_INCONSISTENT') {
+  if (
+    returnState === 'TRACE_INCONSISTENT' ||
+    returnState === 'LEGACY_TRACE_INCONSISTENT' ||
+    returnState === 'LEGACY_PARTIALLY_RETURNED_INCONSISTENT'
+  ) {
     throw createReversionError(409, 'TRACE_INCONSISTENT', 'Los movimientos originales de inventario tienen trazabilidad inconsistente.');
+  }
+  if (returnState === 'LEGACY_OVER_RETURNED') {
+    throw createReversionError(409, 'VENTAS_REVERSION_SOBREDEVOLUCION', 'La reversión excede la cantidad disponible para devolver.');
   }
   if (returnState === 'LEGACY_PARTIAL_BLOCKED') {
     throw createReversionError(
@@ -1041,6 +1077,8 @@ const restorePedidoInventoryMovementsForReversion = async ({
       );
       insertedCount += 1;
     } catch (error) {
+      const mappedTraceError = mapInventoryTraceTriggerError(error);
+      if (mappedTraceError) throw mappedTraceError;
       if (error?.code === '23505') {
         throw createReversionError(409, 'ALREADY_FULLY_RETURNED', 'El inventario de la venta ya fue devuelto o esta en proceso de devolucion.');
       }
@@ -1509,6 +1547,8 @@ export const createVentaReversion = async ({ idFactura, body, req, idUsuario, id
     return { result, responseBody };
   } catch (error) {
     try { await client.query('ROLLBACK'); } catch {}
+    const mappedTraceError = mapInventoryTraceTriggerError(error);
+    if (mappedTraceError) throw mappedTraceError;
     const mappedError = mapCajaFinancialLockError(error);
     if (error?.code === '23514' && error?.constraint === 'ck_facturas_reversiones_motivo') {
       throw createReversionError(

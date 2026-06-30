@@ -119,7 +119,7 @@ import {
 } from './ventas/constants.js';
 import { roundMoney } from './ventas/utils/moneyUtils.js';
 import { validarYDescontarPedido } from '../services/inventarioPedidoService.js';
-import { buildPedidoConsumoPayload } from './cocina.js';
+import { buildPedidoConsumoPayload } from '../services/pedidoInventoryPayloadService.js';
 import {
   coercePositiveIntArray,
   isPlainObject,
