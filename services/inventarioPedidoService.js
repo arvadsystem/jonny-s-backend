@@ -8,6 +8,7 @@ import {
   analyzePedidoMovementState,
   buildLineMovementRows,
   fetchPedidoInventoryMovementsForUpdate,
+  partitionPedidoInventoryMovements,
   registrarMovimientosPedido
 } from './inventarioMovimientoService.js';
 
@@ -63,7 +64,8 @@ const lockPedidoForInventory = async (client, idPedido, idSucursal) => {
       SELECT
         id_pedido,
         id_sucursal,
-        id_estado_pedido
+        id_estado_pedido,
+        fecha_hora_pedido
       FROM public.pedidos
       WHERE id_pedido = $1
       FOR UPDATE
@@ -85,6 +87,39 @@ const lockPedidoForInventory = async (client, idPedido, idSucursal) => {
     );
   }
   return pedido;
+};
+
+const fetchPedidoDetalleIds = async (client, idPedido) => {
+  const result = await client.query(
+    `
+      SELECT id_detalle_pedido
+      FROM public.detalle_pedido
+      WHERE id_pedido = $1
+        AND COALESCE(estado, true) = true
+    `,
+    [idPedido]
+  );
+  return (result.rows || [])
+    .map((row) => toPositiveInt(row.id_detalle_pedido))
+    .filter(Boolean);
+};
+
+const summarizeIgnoredLegacyCollisions = (rows = []) => {
+  const safeRows = Array.isArray(rows) ? rows : [];
+  if (!safeRows.length) return null;
+  const timestamps = safeRows
+    .map((row) => row?.fecha_mov)
+    .filter(Boolean)
+    .sort((left, right) => new Date(left).getTime() - new Date(right).getTime());
+  return {
+    ignored_count: safeRows.length,
+    min_fecha_mov: timestamps[0] || null,
+    max_fecha_mov: timestamps[timestamps.length - 1] || null,
+    movement_ids: safeRows
+      .map((row) => toPositiveInt(row?.id_movimiento))
+      .filter(Boolean)
+      .slice(0, 20)
+  };
 };
 
 const normalizeExcludedIdSet = (value) => {
@@ -124,6 +159,7 @@ const createPedidoMovementConflictError = ({ idPedido, movementState, cause }) =
     inesperados: movementState?.unexpected?.length || 0,
     duplicados: movementState?.duplicates?.length || 0,
     invalidos: movementState?.invalidRows?.length || 0,
+    ignored_legacy_id_collisions: movementState?.ignored_legacy_id_collisions || 0,
     constraint: cause?.constraint || null
   };
   return error;
@@ -165,7 +201,8 @@ export const validarYDescontarPedido = async (payload, options = {}) => {
   try {
     if (manageTransaction) await client.query('BEGIN');
 
-    await lockPedidoForInventory(client, idPedido, idSucursal);
+    const pedidoContextRow = await lockPedidoForInventory(client, idPedido, idSucursal);
+    const detallePedidoIds = await fetchPedidoDetalleIds(client, idPedido);
     await ensureBranchExists(client, idSucursal);
     const canonicalResult = await buildPedidoConsumoPayload(client, idPedido, idSucursal);
     if (!canonicalResult.ok) {
@@ -247,10 +284,29 @@ export const validarYDescontarPedido = async (payload, options = {}) => {
       excludedInsumoIds
     });
     const existingMovementRows = await fetchPedidoInventoryMovementsForUpdate(client, idPedido);
+    const partitionedMovementRows = partitionPedidoInventoryMovements({
+      rows: existingMovementRows,
+      context: {
+        idPedido,
+        fechaHoraPedido: pedidoContextRow.fecha_hora_pedido,
+        detallePedidoIds
+      }
+    });
+    if (partitionedMovementRows.ignoredLegacyCollisionRows.length > 0) {
+      console.warn('[inventario_pedido] legacy id collision ignored', {
+        id_pedido: idPedido,
+        fecha_hora_pedido: pedidoContextRow.fecha_hora_pedido || null,
+        ...summarizeIgnoredLegacyCollisions(partitionedMovementRows.ignoredLegacyCollisionRows)
+      });
+    }
     const movementState = analyzePedidoMovementState({
       expectedRows: expectedLineMovementRows,
-      existingRows: existingMovementRows
+      existingRows: [
+        ...partitionedMovementRows.currentRows,
+        ...partitionedMovementRows.invalidCurrentTraceRows
+      ]
     });
+    movementState.ignored_legacy_id_collisions = partitionedMovementRows.ignoredLegacyCollisionRows.length;
     if (movementState.state === 'COMPLETE') {
       throw createPedidoMovementConflictError({ idPedido, movementState });
     }
@@ -308,10 +364,22 @@ export const validarYDescontarPedido = async (payload, options = {}) => {
       if (error?.code === '23505' && PEDIDO_TRACE_UNIQUE_CONSTRAINTS.has(error?.constraint)) {
         await client.query('ROLLBACK TO SAVEPOINT inventario_movimientos_insert');
         const concurrentRows = await fetchPedidoInventoryMovementsForUpdate(client, idPedido);
+        const concurrentPartitionedRows = partitionPedidoInventoryMovements({
+          rows: concurrentRows,
+          context: {
+            idPedido,
+            fechaHoraPedido: pedidoContextRow.fecha_hora_pedido,
+            detallePedidoIds
+          }
+        });
         const concurrentState = analyzePedidoMovementState({
           expectedRows: expectedLineMovementRows,
-          existingRows: concurrentRows
+          existingRows: [
+            ...concurrentPartitionedRows.currentRows,
+            ...concurrentPartitionedRows.invalidCurrentTraceRows
+          ]
         });
+        concurrentState.ignored_legacy_id_collisions = concurrentPartitionedRows.ignoredLegacyCollisionRows.length;
         throw createPedidoMovementConflictError({ idPedido, movementState: concurrentState, cause: error });
       }
       throw error;

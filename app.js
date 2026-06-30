@@ -147,6 +147,64 @@ const assertInventoryTracePreflightReady = async () => {
   }
 };
 
+const assertPedidosSequencePreflightReady = async () => {
+  const result = await healthCheckQueryRunner.query(`
+    WITH sequence_info AS (
+      SELECT
+        pg_get_serial_sequence('public.pedidos', 'id_pedido') AS sequence_name,
+        to_regclass('public.pedidos') AS pedidos_table,
+        to_regclass('public.movimientos_inventario') AS inventory_table
+    ),
+    sequence_parts AS (
+      SELECT
+        sequence_name,
+        pedidos_table,
+        inventory_table,
+        split_part(sequence_name, '.', 1) AS sequence_schema,
+        split_part(sequence_name, '.', 2) AS sequence_relation
+      FROM sequence_info
+    )
+    SELECT
+      sequence_name,
+      pedidos_table IS NOT NULL AS pedidos_exists,
+      inventory_table IS NOT NULL AS inventory_exists,
+      (
+        SELECT s.last_value
+        FROM pg_sequences s
+        WHERE s.schemaname = sequence_parts.sequence_schema
+          AND s.sequencename = sequence_parts.sequence_relation
+      )::bigint AS sequence_last_value,
+      COALESCE((SELECT MAX(id_pedido)::bigint FROM public.pedidos), 0) AS max_pedido_id,
+      COALESCE((
+        SELECT MAX(id_ref)::bigint
+        FROM public.movimientos_inventario
+        WHERE ref_origen IN ('PEDIDO', 'FALTANTE_COCINA')
+      ), 0) AS max_inventory_order_ref
+    FROM sequence_parts
+  `);
+  const row = result.rows?.[0] || {};
+  const sequenceLastValue = Number(row.sequence_last_value || 0);
+  const maxPedidoId = Number(row.max_pedido_id || 0);
+  const maxInventoryOrderRef = Number(row.max_inventory_order_ref || 0);
+  let code = null;
+  if (!row.pedidos_exists) code = 'PEDIDOS_TABLE_MISSING';
+  else if (!row.inventory_exists) code = 'MOVIMIENTOS_INVENTARIO_TABLE_MISSING';
+  else if (!row.sequence_name || !Number.isFinite(sequenceLastValue) || sequenceLastValue <= 0) code = 'PEDIDOS_SEQUENCE_MISSING';
+  else if (sequenceLastValue < maxPedidoId || sequenceLastValue < maxInventoryOrderRef) {
+    code = 'PEDIDOS_SEQUENCE_BELOW_INVENTORY_HISTORY';
+  }
+  if (code) {
+    const error = new Error(code);
+    error.code = code;
+    error.safeDetails = {
+      sequence_last_value: Number.isFinite(sequenceLastValue) ? sequenceLastValue : null,
+      max_pedido_id: Number.isFinite(maxPedidoId) ? maxPedidoId : null,
+      max_inventory_order_ref: Number.isFinite(maxInventoryOrderRef) ? maxInventoryOrderRef : null
+    };
+    throw error;
+  }
+};
+
 // ✅ (Opcional) proxy - no afecta el login
 if (String(process.env.TRUST_PROXY || '').toLowerCase() === 'true') {
   app.set('trust proxy', 1);
@@ -223,6 +281,7 @@ app.get('/health/ready', async (req, res) => {
   try {
     await withTimeout(healthCheckQueryRunner.query('SELECT 1'), READINESS_TIMEOUT_MS);
     await withTimeout(assertInventoryTracePreflightReady(), READINESS_TIMEOUT_MS);
+    await withTimeout(assertPedidosSequencePreflightReady(), READINESS_TIMEOUT_MS);
     const poolState = getPoolState();
     return res.status(200).json({
       status: 'ready',
@@ -236,11 +295,13 @@ app.get('/health/ready', async (req, res) => {
       build: buildInfo,
       timestamp: new Date().toISOString()
     });
-  } catch {
+  } catch (error) {
     return res.status(503).json({
       status: 'not_ready',
       database: 'error',
       role: 'web',
+      code: error?.code || 'READINESS_CHECK_FAILED',
+      details: error?.safeDetails || undefined,
       timestamp: new Date().toISOString()
     });
   }

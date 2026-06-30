@@ -32,6 +32,26 @@ const createServer = () => new Promise((resolve) => {
   const server = app.listen(0, '127.0.0.1', () => resolve(server));
 });
 
+const createReadyQueryRunner = ({ traceGenerated = 'NEVER', sequenceLast = 100, maxPedido = 90, maxInventory = 95 } = {}) => ({
+  async query(sql) {
+    if (sql === 'SELECT 1') return { rows: [{ '?column?': 1 }] };
+    if (String(sql).includes('id_pedido_trazabilidad')) return { rows: [{ is_generated: traceGenerated }] };
+    if (String(sql).includes("pg_get_serial_sequence('public.pedidos'")) {
+      return {
+        rows: [{
+          sequence_name: 'public.pedidos_id_pedido_seq',
+          pedidos_exists: true,
+          inventory_exists: true,
+          sequence_last_value: sequenceLast,
+          max_pedido_id: maxPedido,
+          max_inventory_order_ref: maxInventory
+        }]
+      };
+    }
+    throw new Error(`Unexpected health query: ${sql}`);
+  }
+});
+
 after(() => {
   setHealthCheckQueryRunnerForTests();
 });
@@ -58,13 +78,7 @@ describe('web health checks', () => {
   });
 
   it('GET /health/ready responde 200 cuando SELECT 1 funciona', async () => {
-    setHealthCheckQueryRunnerForTests({
-      async query(sql) {
-        if (sql === 'SELECT 1') return { rows: [{ '?column?': 1 }] };
-        assert.match(sql, /information_schema\.columns/);
-        return { rows: [{ is_generated: 'NEVER' }] };
-      }
-    });
+    setHealthCheckQueryRunnerForTests(createReadyQueryRunner());
     const server = await createServer();
     try {
       const response = await request(server, '/health/ready');
@@ -78,13 +92,7 @@ describe('web health checks', () => {
   });
 
   it('GET /health/ready responde 503 cuando id_pedido_trazabilidad sigue generado', async () => {
-    setHealthCheckQueryRunnerForTests({
-      async query(sql) {
-        if (sql === 'SELECT 1') return { rows: [{ '?column?': 1 }] };
-        assert.match(sql, /information_schema\.columns/);
-        return { rows: [{ is_generated: 'ALWAYS' }] };
-      }
-    });
+    setHealthCheckQueryRunnerForTests(createReadyQueryRunner({ traceGenerated: 'ALWAYS' }));
     const server = await createServer();
     try {
       const response = await request(server, '/health/ready');
@@ -102,8 +110,8 @@ describe('web health checks', () => {
     setHealthCheckQueryRunnerForTests({
       async query(sql) {
         if (sql === 'SELECT 1') return { rows: [{ '?column?': 1 }] };
-        assert.match(sql, /information_schema\.columns/);
-        return { rows: [] };
+        if (String(sql).includes('id_pedido_trazabilidad')) return { rows: [] };
+        return createReadyQueryRunner().query(sql);
       }
     });
     const server = await createServer();

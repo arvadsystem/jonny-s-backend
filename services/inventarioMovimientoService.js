@@ -12,6 +12,7 @@ import { toPositiveInt } from './pedidoPayloadValidator.js';
 export const MOVEMENT_REF = 'PEDIDO';
 export const SHORTAGE_MOVEMENT_REF = 'FALTANTE_COCINA';
 const VALID_CONSUMPTION_ORIGINS = new Set(['PRODUCTO', 'RECETA', 'EXTRA', 'SALSA']);
+export const LEGACY_ID_COLLISION_TOLERANCE_MINUTES = 5;
 
 export const normalizePedidoTraceRefOrigen = (refOrigen) => {
   const normalized = String(refOrigen || MOVEMENT_REF).trim().toUpperCase();
@@ -49,6 +50,7 @@ export const fetchPedidoInventoryMovementsForUpdate = async (client, idPedido) =
     `
       SELECT
         id_movimiento,
+        fecha_mov,
         cantidad,
         id_almacen,
         id_producto,
@@ -68,6 +70,83 @@ export const fetchPedidoInventoryMovementsForUpdate = async (client, idPedido) =
     [[MOVEMENT_REF, SHORTAGE_MOVEMENT_REF], idPedido]
   );
   return rs.rows || [];
+};
+
+const toTimeMs = (value) => {
+  if (!value) return null;
+  const ms = new Date(value).getTime();
+  return Number.isFinite(ms) ? ms : null;
+};
+
+const hasValidResourceShape = (row) => {
+  const idProducto = toPositiveInt(row?.id_producto);
+  const idInsumo = toPositiveInt(row?.id_insumo);
+  return Boolean(idProducto) !== Boolean(idInsumo);
+};
+
+const hasTraceRequiredFields = (row) => (
+  toPositiveInt(row?.id_movimiento)
+  && toPositiveInt(row?.id_almacen)
+  && hasValidResourceShape(row)
+  && String(row?.origen_consumo || '').trim()
+);
+
+export const partitionPedidoInventoryMovements = ({ rows = [], context = {} } = {}) => {
+  const idPedido = toPositiveInt(context?.idPedido);
+  const pedidoMs = toTimeMs(context?.fechaHoraPedido);
+  const toleranceMs = LEGACY_ID_COLLISION_TOLERANCE_MINUTES * 60 * 1000;
+  const legacyCutoffMs = pedidoMs === null ? null : pedidoMs - toleranceMs;
+  const detallePedidoIds = new Set(
+    [...(context?.detallePedidoIds instanceof Set ? context.detallePedidoIds : Array.isArray(context?.detallePedidoIds) ? context.detallePedidoIds : [])]
+      .map((id) => toPositiveInt(id))
+      .filter(Boolean)
+  );
+  const result = {
+    currentRows: [],
+    currentTracedRows: [],
+    currentLegacyRows: [],
+    ignoredLegacyCollisionRows: [],
+    invalidCurrentTraceRows: []
+  };
+
+  for (const row of Array.isArray(rows) ? rows : []) {
+    const idRef = toPositiveInt(row?.id_ref);
+    const idDetallePedido = toPositiveInt(row?.id_detalle_pedido);
+    const idPedidoTrazabilidad = toPositiveInt(row?.id_pedido_trazabilidad);
+    const rowMs = toTimeMs(row?.fecha_mov);
+    const isLegacyShape = idRef === idPedido && !idDetallePedido && !idPedidoTrazabilidad;
+    const isCurrentTraced = (
+      idRef === idPedido
+      && idPedidoTrazabilidad === idPedido
+      && idDetallePedido
+      && detallePedidoIds.has(idDetallePedido)
+      && hasTraceRequiredFields(row)
+    );
+
+    if (isCurrentTraced) {
+      result.currentTracedRows.push(row);
+      result.currentRows.push(row);
+      continue;
+    }
+
+    if (isLegacyShape) {
+      if (rowMs === null || legacyCutoffMs === null) {
+        result.invalidCurrentTraceRows.push(row);
+        continue;
+      }
+      if (rowMs < legacyCutoffMs) {
+        result.ignoredLegacyCollisionRows.push(row);
+        continue;
+      }
+      result.currentLegacyRows.push(row);
+      result.currentRows.push(row);
+      continue;
+    }
+
+    result.invalidCurrentTraceRows.push(row);
+  }
+
+  return result;
 };
 
 const resourceKeyForMovement = (row) => {

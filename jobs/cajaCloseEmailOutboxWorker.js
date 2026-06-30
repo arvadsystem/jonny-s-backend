@@ -49,6 +49,9 @@ const getIntervalMs = () =>
 const getBatchSize = () =>
   parsePositiveIntEnv(process.env.CAJA_CLOSE_EMAIL_OUTBOX_BATCH_SIZE, DEFAULT_BATCH_SIZE, 1, 20);
 
+const shouldLogIdleTicks = () =>
+  String(process.env.CAJA_CLOSE_EMAIL_OUTBOX_LOG_IDLE || '').trim().toLowerCase() === 'true';
+
 const publicState = () => ({
   started: workerState.started,
   running: workerState.running,
@@ -109,11 +112,15 @@ export const cajaCloseEmailOutboxTick = async () => {
       workerState.successfulTicks += 1;
       workerState.lastTickSucceededAt = isoNow();
       workerState.lastError = null;
-      dependencies.log('[caja_close_email_outbox_worker] tick completed', {
-        duration_ms: Date.now() - startedMs,
-        claimed: result?.claimed || 0,
-        processed: result?.processed || 0
-      });
+      const claimed = Number(result?.claimed || 0);
+      const processed = Number(result?.processed || 0);
+      if (claimed > 0 || processed > 0 || shouldLogIdleTicks()) {
+        dependencies.log('[caja_close_email_outbox_worker] tick completed', {
+          duration_ms: Date.now() - startedMs,
+          claimed,
+          processed
+        });
+      }
       return { skipped: false, success: true, result };
     })
     .catch((error) => {
