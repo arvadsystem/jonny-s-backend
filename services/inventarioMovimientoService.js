@@ -12,12 +12,24 @@ import { toPositiveInt } from './pedidoPayloadValidator.js';
 export const MOVEMENT_REF = 'PEDIDO';
 export const SHORTAGE_MOVEMENT_REF = 'FALTANTE_COCINA';
 const VALID_CONSUMPTION_ORIGINS = new Set(['PRODUCTO', 'RECETA', 'EXTRA', 'SALSA']);
+const VALID_MOVEMENT_REFS = new Set([MOVEMENT_REF, SHORTAGE_MOVEMENT_REF]);
 export const LEGACY_ID_COLLISION_TOLERANCE_MINUTES = 5;
 
 export const normalizePedidoTraceRefOrigen = (refOrigen) => {
   const normalized = String(refOrigen || MOVEMENT_REF).trim().toUpperCase();
   if (normalized === SHORTAGE_MOVEMENT_REF) return MOVEMENT_REF;
   return normalized || MOVEMENT_REF;
+};
+
+export const normalizePedidoMovementRefOrigenStrict = (refOrigen) => {
+  const normalized = String(refOrigen ?? '').trim().toUpperCase();
+  if (!VALID_MOVEMENT_REFS.has(normalized)) {
+    throw createInventoryTraceError(
+      'PEDIDO_TRAZABILIDAD_REF_ORIGEN_INVALIDO',
+      'ref_origen invalido para movimiento trazado de pedido.'
+    );
+  }
+  return normalized;
 };
 
 export const normalizeOrigenConsumo = (value) => {
@@ -36,7 +48,7 @@ export const fetchExistingPedidoMovement = async (client, idPedido) => {
     `
       SELECT id_movimiento
       FROM public.movimientos_inventario
-      WHERE ref_origen = ANY($1::text[])
+      WHERE UPPER(BTRIM(ref_origen::text)) = ANY($1::text[])
         AND id_ref = $2
       LIMIT 1
     `,
@@ -62,7 +74,7 @@ export const fetchPedidoInventoryMovementsForUpdate = async (client, idPedido) =
         ref_origen,
         origen_consumo
       FROM public.movimientos_inventario
-      WHERE ref_origen = ANY($1::text[])
+      WHERE UPPER(BTRIM(ref_origen::text)) = ANY($1::text[])
         AND id_ref = $2
         AND tipo = 'SALIDA'
       ORDER BY id_movimiento
@@ -249,7 +261,7 @@ export const analyzePedidoMovementState = ({ expectedRows = [], existingRows = [
   };
 };
 
-const insertMovimiento = async (client, movement) => {
+export const validateTracedPedidoMovement = (movement) => {
   const idRef = toPositiveInt(movement?.id_ref);
   if (!idRef) {
     throw createInventoryTraceError(
@@ -257,6 +269,60 @@ const insertMovimiento = async (client, movement) => {
       'No se pudo registrar inventario trazado sin id_ref de pedido valido.'
     );
   }
+  const idPedidoTrazabilidad = toPositiveInt(movement?.id_pedido_trazabilidad);
+  if (idPedidoTrazabilidad !== idRef) {
+    throw createInventoryTraceError(
+      'PEDIDO_TRAZABILIDAD_ID_REF_INVALIDO',
+      'No se pudo registrar inventario trazado sin id_pedido_trazabilidad consistente.'
+    );
+  }
+  const idDetallePedido = toPositiveInt(movement?.id_detalle_pedido);
+  if (!idDetallePedido) {
+    throw createInventoryTraceError(
+      'PEDIDO_TRAZABILIDAD_DETALLE_INVALIDO',
+      'No se pudo registrar inventario trazado sin id_detalle_pedido valido.'
+    );
+  }
+  const idAlmacen = toPositiveInt(movement?.id_almacen);
+  if (!idAlmacen) {
+    throw createInventoryTraceError(
+      'PEDIDO_TRAZABILIDAD_ALMACEN_INVALIDO',
+      'No se pudo registrar inventario trazado sin id_almacen valido.'
+    );
+  }
+  const cantidad = Number(movement?.cantidad);
+  if (!Number.isFinite(cantidad) || cantidad <= 0) {
+    throw createInventoryTraceError(
+      'PEDIDO_TRAZABILIDAD_CANTIDAD_INVALIDA',
+      'No se pudo registrar inventario trazado con cantidad invalida.'
+    );
+  }
+  const idProducto = toPositiveInt(movement?.id_producto);
+  const idInsumo = toPositiveInt(movement?.id_insumo);
+  if (Boolean(idProducto) === Boolean(idInsumo)) {
+    throw createInventoryTraceError(
+      'PEDIDO_TRAZABILIDAD_RECURSO_INVALIDO',
+      'No se pudo registrar inventario trazado sin un recurso unico valido.'
+    );
+  }
+  const origenConsumo = normalizeOrigenConsumo(movement?.origen_consumo);
+  const refOrigen = normalizePedidoMovementRefOrigenStrict(movement?.ref_origen);
+  return {
+    cantidad,
+    idAlmacen,
+    idProducto,
+    idInsumo,
+    idDetallePedido,
+    origenConsumo,
+    refOrigen,
+    idRef,
+    idPedidoTrazabilidad,
+    descripcion: String(movement.descripcion || '').trim() || null
+  };
+};
+
+const insertMovimiento = async (client, movement) => {
+  const normalized = validateTracedPedidoMovement(movement);
   await client.query(
     `
       INSERT INTO public.movimientos_inventario (
@@ -275,16 +341,16 @@ const insertMovimiento = async (client, movement) => {
       VALUES ('SALIDA', $1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
     `,
     [
-      Number(movement.cantidad),
-      Number(movement.id_almacen),
-      movement.id_producto ? Number(movement.id_producto) : null,
-      movement.id_insumo ? Number(movement.id_insumo) : null,
-      movement.id_detalle_pedido ? Number(movement.id_detalle_pedido) : null,
-      movement.origen_consumo ? normalizeOrigenConsumo(movement.origen_consumo) : null,
-      movement.ref_origen || MOVEMENT_REF,
-      idRef,
-      toPositiveInt(movement?.id_pedido_trazabilidad) || idRef,
-      String(movement.descripcion || '').trim() || null
+      normalized.cantidad,
+      normalized.idAlmacen,
+      normalized.idProducto || null,
+      normalized.idInsumo || null,
+      normalized.idDetallePedido,
+      normalized.origenConsumo,
+      normalized.refOrigen,
+      normalized.idRef,
+      normalized.idPedidoTrazabilidad,
+      normalized.descripcion
     ]
   );
 };
@@ -295,7 +361,7 @@ export const buildLineMovementRows = ({
   insumosById,
   actorUserId,
   idPedido,
-  refOrigen,
+  refOrigen = MOVEMENT_REF,
   shortagesByResource,
   excludedProductIds = new Set(),
   excludedInsumoIds = new Set()
@@ -307,13 +373,19 @@ export const buildLineMovementRows = ({
       'No se pudo construir inventario trazado sin id_pedido valido.'
     );
   }
+  const normalizedRefOrigen = normalizePedidoMovementRefOrigenStrict(refOrigen);
   const merged = new Map();
   const incompleteRows = [];
   for (const row of Array.isArray(movementRows) ? movementRows : []) {
     const tipoRecurso = String(row?.tipo_recurso || '').trim().toLowerCase();
     const idDetallePedido = toPositiveInt(row?.id_detalle_pedido);
     const quantity = Number(row?.cantidad || 0);
-    if (!Number.isFinite(quantity) || quantity <= 0) continue;
+    if (!Number.isFinite(quantity) || quantity <= 0) {
+      throw createInventoryTraceError(
+        'PEDIDO_TRAZABILIDAD_CANTIDAD_INVALIDA',
+        'No se pudo construir inventario trazado con cantidad invalida.'
+      );
+    }
     if (tipoRecurso === 'producto' && excludedProductIds.has(Number(row.id_producto || 0))) continue;
     if (tipoRecurso === 'insumo' && excludedInsumoIds.has(Number(row.id_insumo || 0))) continue;
     if (!idDetallePedido) {
@@ -326,7 +398,7 @@ export const buildLineMovementRows = ({
       if (!rowProducto) continue;
       const idProductoMovimiento = toPositiveInt(rowProducto?.id_producto_maestro) || toPositiveInt(rowProducto?.id_producto) || toPositiveInt(row.id_producto);
       const key = [
-        refOrigen || MOVEMENT_REF,
+        normalizedRefOrigen,
         idDetallePedido,
         'producto',
         idProductoMovimiento,
@@ -341,7 +413,7 @@ export const buildLineMovementRows = ({
         id_detalle_pedido: idDetallePedido,
         id_ref: pedidoId,
         id_pedido_trazabilidad: pedidoId,
-        ref_origen: refOrigen,
+        ref_origen: normalizedRefOrigen,
         origen_consumo: normalizeOrigenConsumo(row.origen_consumo || 'PRODUCTO')
       };
       existing.cantidad += quantity;
@@ -353,7 +425,7 @@ export const buildLineMovementRows = ({
       if (!rowInsumo) continue;
       const idInsumoMovimiento = toPositiveInt(rowInsumo?.id_insumo_maestro) || toPositiveInt(rowInsumo?.id_insumo) || toPositiveInt(row.id_insumo);
       const key = [
-        refOrigen || MOVEMENT_REF,
+        normalizedRefOrigen,
         idDetallePedido,
         'insumo',
         idInsumoMovimiento,
@@ -368,7 +440,7 @@ export const buildLineMovementRows = ({
         id_detalle_pedido: idDetallePedido,
         id_ref: pedidoId,
         id_pedido_trazabilidad: pedidoId,
-        ref_origen: refOrigen,
+        ref_origen: normalizedRefOrigen,
         origen_consumo: normalizeOrigenConsumo(row.origen_consumo || 'RECETA')
       };
       existing.cantidad += quantity;
@@ -415,6 +487,16 @@ export const registrarMovimientosPedido = async ({
   excludedProductIds = new Set(),
   excludedInsumoIds = new Set()
 }) => {
+  const hasPositiveQuantity = (qtyMap) => [...(qtyMap instanceof Map ? qtyMap.values() : [])]
+    .some((quantity) => Number.isFinite(Number(quantity)) && Number(quantity) > 0);
+  const hasPhysicalConsumption = hasPositiveQuantity(productoQtyMap) || hasPositiveQuantity(insumoQtyMap);
+  if (!Array.isArray(movementRows) || movementRows.length === 0) {
+    if (!hasPhysicalConsumption) return 0;
+    throw createInventoryTraceError(
+      'PEDIDO_TRAZABILIDAD_LINEA_INCOMPLETA',
+      'No se pueden registrar movimientos de pedido sin trazabilidad por linea.'
+    );
+  }
   const lineMovementRows = buildLineMovementRows({
     movementRows,
     productosById,
@@ -426,51 +508,9 @@ export const registrarMovimientosPedido = async ({
     excludedProductIds,
     excludedInsumoIds
   });
-  if (Array.isArray(movementRows) && movementRows.length > 0) {
-    for (const row of lineMovementRows) {
-      await insertMovimiento(client, row);
-    }
-    return lineMovementRows.length;
+  for (const row of lineMovementRows) {
+    await insertMovimiento(client, row);
   }
-
-  const productoIds = [...productoQtyMap.keys()].sort((a, b) => a - b);
-  const insumoIds = [...insumoQtyMap.keys()].sort((a, b) => a - b);
-
-  for (const idProducto of productoIds) {
-    const row = productosById.get(idProducto);
-    const shortage = shortagesByResource.get(`producto:${idProducto}`) || null;
-    const idProductoMovimiento = toPositiveInt(row?.id_producto_maestro) || toPositiveInt(row?.id_producto) || idProducto;
-    await insertMovimiento(client, {
-      cantidad: Number(productoQtyMap.get(idProducto) || 0),
-      id_almacen: Number(row.id_almacen),
-      id_producto: idProductoMovimiento,
-      id_insumo: null,
-      id_ref: idPedido,
-      id_pedido_trazabilidad: idPedido,
-      ref_origen: refOrigen,
-      descripcion: `Descuento por pedido #${idPedido} (producto ${idProducto})${shortage ? ` - faltante auditado req:${shortage.requerido} disp:${shortage.disponible} deficit:${shortage.faltante}` : ''}${toPositiveInt(actorUserId) ? ` - usuario ${actorUserId}` : ''}`
-    });
-  }
-
-  for (const idInsumo of insumoIds) {
-    const row = insumosById.get(idInsumo);
-    const shortage = shortagesByResource.get(`insumo:${idInsumo}`) || null;
-    const trace = insumoTraceById.get(idInsumo) || null;
-    const salsaTrace = trace
-      ? ` - salsas ${[...trace.salsaIds].sort((a, b) => a - b).map((id) => `#${id}`).join(', ')}; detalles ${[...trace.detallePedidoIds].sort((a, b) => a - b).map((id) => `#${id}`).join(', ')}`
-      : '';
-    const idInsumoMovimiento = toPositiveInt(row?.id_insumo_maestro) || toPositiveInt(row?.id_insumo) || idInsumo;
-    await insertMovimiento(client, {
-      cantidad: Number(insumoQtyMap.get(idInsumo) || 0),
-      id_almacen: Number(row.id_almacen),
-      id_producto: null,
-      id_insumo: idInsumoMovimiento,
-      id_ref: idPedido,
-      id_pedido_trazabilidad: idPedido,
-      ref_origen: refOrigen,
-      descripcion: `Descuento por pedido #${idPedido} (insumo ${idInsumo})${salsaTrace}${shortage ? ` - faltante auditado req:${shortage.requerido} disp:${shortage.disponible} deficit:${shortage.faltante}` : ''}${toPositiveInt(actorUserId) ? ` - usuario ${actorUserId}` : ''}`
-    });
-  }
-  return productoIds.length + insumoIds.length;
+  return lineMovementRows.length;
 };
 

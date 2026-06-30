@@ -12,7 +12,10 @@ BEGIN;
 SET LOCAL lock_timeout = '10s';
 SET LOCAL statement_timeout = '120s';
 
-LOCK TABLE public.pedidos IN ACCESS EXCLUSIVE MODE;
+LOCK TABLE
+  public.pedidos,
+  public.movimientos_inventario
+IN ACCESS EXCLUSIVE MODE;
 
 DO $$
 DECLARE
@@ -104,7 +107,20 @@ BEGIN
       v_sequence_max;
   END IF;
 
-  v_safe_value := GREATEST(v_history_floor, v_sequence_last);
+  IF v_sequence_next_candidate > v_history_floor THEN
+    RAISE NOTICE 'Secuencia % ya esta segura: max_pedidos=%, max_inventory_order_ref=%, sequence_last=%, is_called=%, increment_by=%, next_candidate=%, history_floor=%.',
+      v_sequence_name,
+      v_max_pedido,
+      v_max_inventory_ref,
+      v_sequence_last,
+      v_sequence_is_called,
+      v_sequence_increment,
+      v_sequence_next_candidate,
+      v_history_floor;
+    RETURN;
+  END IF;
+
+  v_safe_value := v_history_floor;
 
   IF (v_safe_value + v_sequence_increment) > v_sequence_max THEN
     RAISE EXCEPTION 'Preflight fallido: alinear % a % agotaria la secuencia; max_value=%.',
@@ -115,8 +131,8 @@ BEGIN
 
   PERFORM setval(v_sequence_name, v_safe_value, true);
 
-  IF v_safe_value < v_max_pedido OR v_safe_value < v_max_inventory_ref OR v_safe_value < v_sequence_last THEN
-    RAISE EXCEPTION 'Validacion fallida: safe_value (%) redujo un piso calculado.', v_safe_value;
+  IF v_safe_value < v_max_pedido OR v_safe_value < v_max_inventory_ref THEN
+    RAISE EXCEPTION 'Validacion fallida: safe_value (%) redujo el historial calculado.', v_safe_value;
   END IF;
 
   -- With is_called=true, the next generated value will be last_value + increment_by.
