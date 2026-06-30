@@ -89,6 +89,7 @@ const validateRecipeInventorySnapshot = (snapshot, item) => {
   if (components.length === 0) return { ok: false, reason: 'RECETA_SNAPSHOT_SIN_COMPONENTES' };
 
   const normalizedComponents = [];
+  const warehouseByInsumo = new Map();
   for (const component of components) {
     const idInsumo = toPositiveInt(component?.id_insumo);
     const idAlmacen = toPositiveInt(component?.id_almacen);
@@ -98,6 +99,17 @@ const validateRecipeInventorySnapshot = (snapshot, item) => {
     const unidadBase = toPositiveInt(component?.id_unidad_base);
     if (!idInsumo || !idAlmacen || factor <= 0 || cantidadTotal <= 0 || !unidadMedida || !unidadBase) {
       return { ok: false, reason: 'RECETA_SNAPSHOT_COMPONENTE_INVALIDO' };
+    }
+    const previousWarehouse = warehouseByInsumo.get(idInsumo);
+    if (previousWarehouse && previousWarehouse !== idAlmacen) {
+      return { ok: false, reason: 'RECETA_SNAPSHOT_ALMACEN_AMBIGUO' };
+    }
+    if (previousWarehouse && previousWarehouse === idAlmacen) {
+      return { ok: false, reason: 'RECETA_SNAPSHOT_COMPONENTE_DUPLICADO' };
+    }
+    warehouseByInsumo.set(idInsumo, idAlmacen);
+    if (unidadMedida !== unidadBase) {
+      return { ok: false, reason: 'RECETA_SNAPSHOT_UNIDAD_INVALIDA' };
     }
     if (cantidadTotal !== roundInventory(factor * cantidadLinea)) {
       return { ok: false, reason: 'RECETA_SNAPSHOT_TOTAL_INVALIDO' };

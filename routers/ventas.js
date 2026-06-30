@@ -78,8 +78,8 @@ import {
   signQzRequestHandler
 } from './ventas/handlers/ventasPrintHandlers.js';
 import {
-  buildComplementLineConfig,
   buildComplementSnapshot,
+  mergePedidoLineInventoryConfig,
   normalizeCartKey,
   normalizeVentaItems
 } from './ventas/services/ventasPayloadService.js';
@@ -938,7 +938,10 @@ const buildCreatedVentaDetailItems = ({ detalleFacturaRows, detalleFacturaRowsIn
         descuento_global: roundMoney(line.descuento_global),
         subtotal_extras: roundMoney(line.subtotal_extras),
         extras: Array.isArray(line.extras_detalle) ? line.extras_detalle : [],
-        configuracion_menu: entry.pedidoRef?.configuracion_menu || buildComplementLineConfig(line),
+        configuracion_menu: mergePedidoLineInventoryConfig({
+          ...line,
+          configuracion_menu: entry.pedidoRef?.configuracion_menu || line.configuracion_menu
+        }),
         isv_15_linea: null,
         isv_18_linea: null,
         exento_linea: null,
@@ -8004,6 +8007,11 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
       lines: pedidoPendiente.pedido_lines,
       idSucursal: pedidoPendiente.id_sucursal
     });
+    pedidoPendiente.pedido_lines = await attachRecipeInventorySnapshotsToLines({
+      client,
+      lines: pedidoPendiente.pedido_lines,
+      idSucursal: pedidoPendiente.id_sucursal
+    });
     const cuentaDivisionPlan = buildCuentaDivisionPlan({
       cuentaDividida: req.body?.cuenta_dividida,
       lines: pedidoPendiente.pedido_lines,
@@ -8156,7 +8164,7 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
     const pedidoLineRefs = [];
     const detallePedidoRows = pedidoPendiente.pedido_lines.map((line) => ({
       line,
-      configuracionMenu: buildComplementLineConfig(line)
+      configuracionMenu: mergePedidoLineInventoryConfig(line)
     }));
 
     if (detallePedidoRows.length > 0) {
@@ -9406,6 +9414,16 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
       lines: venta.all_lines,
       idSucursal: venta.id_sucursal
     });
+    venta.all_lines = await attachRecipeInventorySnapshotsToLines({
+      client,
+      lines: venta.all_lines,
+      idSucursal: venta.id_sucursal
+    });
+    venta.pedido_lines = await attachRecipeInventorySnapshotsToLines({
+      client,
+      lines: venta.pedido_lines,
+      idSucursal: venta.id_sucursal
+    });
     const amountValidation = validateVentaMontoCobro({ venta });
     if (!amountValidation.ok) {
       await client.query('ROLLBACK');
@@ -9669,16 +9687,9 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
     }
 
     const detallePedidoInsertStart = ventasPerf.now();
-    const pedidoLinesWithInventorySnapshots = hasDetallePedidoConfiguracionMenu
-      ? await attachRecipeInventorySnapshotsToLines({
-        client,
-        lines: venta.pedido_lines,
-        idSucursal: venta.id_sucursal
-      })
-      : venta.pedido_lines;
-    const detallePedidoRows = pedidoLinesWithInventorySnapshots.map((line) => ({
+    const detallePedidoRows = venta.pedido_lines.map((line) => ({
       line,
-      configuracionMenu: line.configuracion_menu || buildComplementLineConfig(line),
+      configuracionMenu: mergePedidoLineInventoryConfig(line),
       complementSnapshot: buildComplementSnapshot(line)
     }));
     const pedidoLineRefs = [];

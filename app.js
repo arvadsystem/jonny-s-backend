@@ -129,6 +129,24 @@ const withTimeout = (promise, timeoutMs) => {
   });
 };
 
+const assertInventoryTracePreflightReady = async () => {
+  const result = await healthCheckQueryRunner.query(`
+    SELECT c.is_generated
+    FROM information_schema.columns c
+    WHERE c.table_schema = 'public'
+      AND c.table_name = 'movimientos_inventario'
+      AND c.column_name = 'id_pedido_trazabilidad'
+    LIMIT 1
+  `);
+  const generationState = String(result.rows?.[0]?.is_generated || '').trim().toUpperCase();
+  if (generationState !== 'NEVER') {
+    const error = new Error('INVENTORY_TRACE_SCHEMA_NOT_READY');
+    error.code = generationState ? 'INVENTORY_TRACE_SCHEMA_NOT_READY' : 'INVENTORY_TRACE_SCHEMA_MISSING';
+    error.generationState = generationState || 'MISSING';
+    throw error;
+  }
+};
+
 // ✅ (Opcional) proxy - no afecta el login
 if (String(process.env.TRUST_PROXY || '').toLowerCase() === 'true') {
   app.set('trust proxy', 1);
@@ -204,6 +222,7 @@ app.get('/health/live', (req, res) => {
 app.get('/health/ready', async (req, res) => {
   try {
     await withTimeout(healthCheckQueryRunner.query('SELECT 1'), READINESS_TIMEOUT_MS);
+    await withTimeout(assertInventoryTracePreflightReady(), READINESS_TIMEOUT_MS);
     const poolState = getPoolState();
     return res.status(200).json({
       status: 'ready',

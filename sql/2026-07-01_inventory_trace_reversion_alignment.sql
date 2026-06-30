@@ -9,8 +9,10 @@
 
 BEGIN;
 
-SET LOCAL lock_timeout = '5s';
-SET LOCAL statement_timeout = '60s';
+SET LOCAL lock_timeout = '10s';
+SET LOCAL statement_timeout = '180s';
+
+LOCK TABLE public.movimientos_inventario IN ACCESS EXCLUSIVE MODE;
 
 DO $$
 DECLARE
@@ -89,6 +91,37 @@ BEGIN
     RAISE EXCEPTION 'Preflight fallido: public.fn_mov_inv_trace_reversion_guard() no existe.';
   END IF;
 
+  IF NOT EXISTS (
+    SELECT 1
+    FROM pg_trigger t
+    JOIN pg_class c ON c.oid = t.tgrelid
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE n.nspname = 'public'
+      AND c.relname = 'movimientos_inventario'
+      AND t.tgname = 'tr_00_mov_inv_trace_reversion_guard'
+      AND NOT t.tgisinternal
+      AND t.tgenabled <> 'D'
+      AND pg_get_triggerdef(t.oid) ILIKE '%BEFORE INSERT OR UPDATE%'
+      AND pg_get_triggerdef(t.oid) ILIKE '%fn_mov_inv_trace_reversion_guard%'
+  ) THEN
+    RAISE EXCEPTION 'Preflight fallido: tr_00_mov_inv_trace_reversion_guard no existe, no esta habilitado o no es BEFORE INSERT OR UPDATE.';
+  END IF;
+
+  IF EXISTS (
+    SELECT 1
+    FROM pg_trigger guard_trigger
+    JOIN pg_class guard_class ON guard_class.oid = guard_trigger.tgrelid
+    JOIN pg_namespace guard_ns ON guard_ns.oid = guard_class.relnamespace
+    JOIN pg_trigger stock_trigger ON stock_trigger.tgrelid = guard_trigger.tgrelid
+    WHERE guard_ns.nspname = 'public'
+      AND guard_class.relname = 'movimientos_inventario'
+      AND guard_trigger.tgname = 'tr_00_mov_inv_trace_reversion_guard'
+      AND pg_get_triggerdef(stock_trigger.oid) ILIKE '%fn_mov_inv_apply_stock%'
+      AND guard_trigger.tgname > stock_trigger.tgname
+  ) THEN
+    RAISE EXCEPTION 'Preflight fallido: el guard de trazabilidad debe ejecutarse antes del trigger de stock.';
+  END IF;
+
   SELECT COALESCE(c.generation_expression, 'NEVER')
     INTO v_generation
   FROM information_schema.columns c
@@ -156,27 +189,33 @@ END $$;
 
 DO $$
 BEGIN
-  IF NOT EXISTS (
-    SELECT 1
-    FROM pg_constraint
-    WHERE conrelid = 'public.movimientos_inventario'::regclass
-      AND conname = 'ck_mov_inv_pedido_trace_scope'
-  ) THEN
-    ALTER TABLE public.movimientos_inventario
-      ADD CONSTRAINT ck_mov_inv_pedido_trace_scope
-      CHECK (
-        ref_origen NOT IN ('PEDIDO', 'FALTANTE_COCINA')
-        OR (
-          tipo = 'SALIDA'
-          AND id_ref IS NOT NULL
-          AND id_pedido_trazabilidad IS NOT NULL
-          AND id_pedido_trazabilidad = id_ref
-          AND id_detalle_pedido IS NOT NULL
-          AND origen_consumo IS NOT NULL
-        )
+  ALTER TABLE public.movimientos_inventario
+    DROP CONSTRAINT IF EXISTS ck_mov_inv_pedido_trace_scope;
+
+  ALTER TABLE public.movimientos_inventario
+    ADD CONSTRAINT ck_mov_inv_pedido_trace_scope
+    CHECK (
+      ref_origen NOT IN ('PEDIDO', 'FALTANTE_COCINA', 'REVERSION_VENTA_INVENTARIO')
+      OR (
+        tipo = 'SALIDA'
+        AND ref_origen IN ('PEDIDO', 'FALTANTE_COCINA')
+        AND id_ref IS NOT NULL
+        AND id_pedido_trazabilidad IS NOT NULL
+        AND id_pedido_trazabilidad = id_ref
+        AND id_detalle_pedido IS NOT NULL
+        AND origen_consumo IS NOT NULL
       )
-      NOT VALID;
-  END IF;
+      OR (
+        tipo = 'ENTRADA'
+        AND ref_origen = 'REVERSION_VENTA_INVENTARIO'
+        AND id_ref IS NOT NULL
+        AND id_movimiento_origen IS NOT NULL
+        AND id_pedido_trazabilidad IS NOT NULL
+        AND id_detalle_pedido IS NOT NULL
+        AND origen_consumo IS NOT NULL
+      )
+    )
+    NOT VALID;
 END $$;
 
 ALTER TABLE public.movimientos_inventario

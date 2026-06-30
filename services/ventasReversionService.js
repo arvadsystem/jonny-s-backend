@@ -820,6 +820,7 @@ const registerInventoryReturn = async ({ client, idReversion, codigoReversion, c
 export const buildPedidoMovementReturnRows = ({ movements = [], lineas = [], returnedByOrigin = new Map() } = {}) => {
   const lineReturnByDetalle = new Map();
   for (const line of Array.isArray(lineas) ? lineas : []) {
+    if (line?.devuelve_inventario !== true || Number(line?.cantidad_revertida || 0) <= 0) continue;
     const idDetallePedido = parsePositiveInt(line?.id_detalle_pedido);
     const soldQty = Number(line?.cantidad_vendida || line?.origen_snapshot?.cantidad || 0);
     const reversedQty = Number(line?.cantidad_revertida || 0);
@@ -856,6 +857,7 @@ export const buildPedidoMovementReturnRows = ({ movements = [], lineas = [], ret
         id_producto: parsePositiveInt(movement?.id_producto),
         id_insumo: parsePositiveInt(movement?.id_insumo),
         id_detalle_pedido: idDetallePedido,
+        id_pedido_trazabilidad: parsePositiveInt(movement?.id_pedido_trazabilidad),
         origen_consumo: String(movement?.origen_consumo || '').trim().toUpperCase() || null,
         ratio
       };
@@ -897,12 +899,15 @@ export const classifyPedidoMovementReturnState = ({ movements = [], lineas = [],
     return 'LEGACY_TOTAL_ALLOWED';
   }
 
+  const requestedInventoryLines = (Array.isArray(lineas) ? lineas : [])
+    .filter((line) => line?.devuelve_inventario === true && Number(line?.cantidad_revertida || 0) > 0);
   const requestedDetalleIds = new Set(
-    (Array.isArray(lineas) ? lineas : []).map((line) => parsePositiveInt(line?.id_detalle_pedido)).filter(Boolean)
+    requestedInventoryLines.map((line) => parsePositiveInt(line?.id_detalle_pedido)).filter(Boolean)
   );
-  const hasMissingRequestedDetalle = (Array.isArray(lineas) ? lineas : [])
-    .some((line) => Boolean(line?.devuelve_inventario) && !parsePositiveInt(line?.id_detalle_pedido));
+  const hasMissingRequestedDetalle = requestedInventoryLines
+    .some((line) => !parsePositiveInt(line?.id_detalle_pedido));
   if (traced.length > 0 && hasMissingRequestedDetalle) return 'TRACE_INCONSISTENT';
+  if (traced.length > 0 && requestedDetalleIds.size === 0) return 'TRACE_NO_INVENTORY_REQUESTED';
 
   const tracedDetalleIds = new Set(traced.map((row) => parsePositiveInt(row.id_detalle_pedido)).filter(Boolean));
   for (const detalleId of requestedDetalleIds) {
@@ -910,7 +915,13 @@ export const classifyPedidoMovementReturnState = ({ movements = [], lineas = [],
   }
   for (const row of traced) {
     const hasOneResource = Boolean(parsePositiveInt(row.id_producto)) !== Boolean(parsePositiveInt(row.id_insumo));
-    if (!parsePositiveInt(row.id_movimiento) || !parsePositiveInt(row.id_almacen) || !hasOneResource || !String(row.origen_consumo || '').trim()) {
+    if (
+      !parsePositiveInt(row.id_movimiento)
+      || !parsePositiveInt(row.id_almacen)
+      || !hasOneResource
+      || !String(row.origen_consumo || '').trim()
+      || !parsePositiveInt(row.id_pedido_trazabilidad)
+    ) {
       return 'TRACE_INCONSISTENT';
     }
   }
@@ -953,6 +964,7 @@ const restorePedidoInventoryMovementsForReversion = async ({
         mi.id_producto,
         mi.id_insumo,
         mi.id_detalle_pedido,
+        mi.id_pedido_trazabilidad,
         mi.origen_consumo,
         mi.ref_origen,
         mi.tipo
@@ -999,6 +1011,9 @@ const restorePedidoInventoryMovementsForReversion = async ({
   if (returnState === 'NO_ORIGINAL_MOVEMENTS') {
     return { handled: false, state: returnState, insertedCount: 0 };
   }
+  if (returnState === 'TRACE_NO_INVENTORY_REQUESTED') {
+    return { handled: true, state: returnState, insertedCount: 0 };
+  }
   if (returnState === 'ALREADY_FULLY_RETURNED' || returnState === 'LEGACY_ALREADY_FULLY_RETURNED') {
     throw createReversionError(409, 'ALREADY_FULLY_RETURNED', 'El inventario de la venta ya fue devuelto completamente.');
   }
@@ -1040,6 +1055,7 @@ const restorePedidoInventoryMovementsForReversion = async ({
           id_producto: parsePositiveInt(movement.id_producto),
           id_insumo: parsePositiveInt(movement.id_insumo),
           id_detalle_pedido: null,
+          id_pedido_trazabilidad: null,
           origen_consumo: String(movement.origen_consumo || '').trim().toUpperCase() || null,
           ratio: 1
         };
@@ -1059,6 +1075,9 @@ const restorePedidoInventoryMovementsForReversion = async ({
 
   let insertedCount = 0;
   for (const row of returnRows) {
+    if (row.id_detalle_pedido && parsePositiveInt(row.id_pedido_trazabilidad) !== pedidoId) {
+      throw createReversionError(409, 'TRACE_INCONSISTENT', 'Los movimientos originales de inventario tienen trazabilidad inconsistente.');
+    }
     try {
       await client.query(
         `
@@ -1071,11 +1090,12 @@ const restorePedidoInventoryMovementsForReversion = async ({
             id_detalle_pedido,
             origen_consumo,
             id_movimiento_origen,
+            id_pedido_trazabilidad,
             ref_origen,
             id_ref,
             descripcion
           )
-          VALUES ('ENTRADA', $1, $2, $3, $4, $5, $6, $7, 'REVERSION_VENTA_INVENTARIO', $8, $9)
+          VALUES ('ENTRADA', $1, $2, $3, $4, $5, $6, $7, $8, 'REVERSION_VENTA_INVENTARIO', $9, $10)
         `,
         [
           row.cantidad,
@@ -1085,6 +1105,7 @@ const restorePedidoInventoryMovementsForReversion = async ({
           row.id_detalle_pedido || null,
           row.origen_consumo || null,
           row.id_movimiento_origen || null,
+          row.id_pedido_trazabilidad || null,
           idReversion,
           `Entrada por línea #${row.id_detalle_pedido} en reversión ${codigoReversion} de venta ${codigoVenta}`
         ]

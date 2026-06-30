@@ -37,8 +37,11 @@ import {
 } from '../services/complementosCatalogService.js';
 import {
   buildComplementLineConfig,
+  mergePedidoLineInventoryConfig,
   normalizeVentaItems
 } from '../services/ventasPayloadService.js';
+import { buildVentaRpcPayload } from '../services/ventasRpcPayloadService.js';
+import { buildRecipeInventorySnapshot } from '../../../services/recetaInventorySnapshotService.js';
 
 const makeResolverClient = ({
   recipeComponents = [{ id_receta: 12, id_insumo: 200, insumo_factor: '3' }],
@@ -655,10 +658,10 @@ describe('ventas bulk recipe quantity payload', () => {
     const rows = buildPedidoMovementReturnRows({
       movements: [
         { cantidad: 198, id_almacen: 1, id_producto: 10, id_insumo: null, id_detalle_pedido: 700, origen_consumo: 'PRODUCTO' },
-        { cantidad: 49.5, id_almacen: 2, id_producto: null, id_insumo: 400, id_detalle_pedido: 701, origen_consumo: 'RECETA' }
+        { cantidad: 49.5, id_almacen: 2, id_producto: null, id_insumo: 400, id_detalle_pedido: 701, id_pedido_trazabilidad: 10, origen_consumo: 'RECETA' }
       ],
       lineas: [
-        { id_detalle_pedido: 701, cantidad_vendida: 99, cantidad_revertida: 33 }
+        { id_detalle_pedido: 701, cantidad_vendida: 99, cantidad_revertida: 33, devuelve_inventario: true }
       ]
     });
 
@@ -671,10 +674,10 @@ describe('ventas bulk recipe quantity payload', () => {
   it('calcula devoluciones disponibles por movimiento origen', () => {
     const rows = buildPedidoMovementReturnRows({
       movements: [
-        { id_movimiento: 901, cantidad: 99, id_almacen: 2, id_producto: null, id_insumo: 400, id_detalle_pedido: 701, origen_consumo: 'RECETA' }
+        { id_movimiento: 901, cantidad: 99, id_almacen: 2, id_producto: null, id_insumo: 400, id_detalle_pedido: 701, id_pedido_trazabilidad: 10, origen_consumo: 'RECETA' }
       ],
       lineas: [
-        { id_detalle_pedido: 701, cantidad_vendida: 99, cantidad_revertida: 30 }
+        { id_detalle_pedido: 701, cantidad_vendida: 99, cantidad_revertida: 30, devuelve_inventario: true }
       ],
       returnedByOrigin: new Map([[901, 20]])
     });
@@ -687,16 +690,16 @@ describe('ventas bulk recipe quantity payload', () => {
 
   it('devuelve exactamente el remanente fisico al completar la linea', () => {
     const movements = [
-      { id_movimiento: 901, cantidad: 0.0025, id_almacen: 2, id_producto: null, id_insumo: 400, id_detalle_pedido: 701, origen_consumo: 'RECETA' }
+      { id_movimiento: 901, cantidad: 0.0025, id_almacen: 2, id_producto: null, id_insumo: 400, id_detalle_pedido: 701, id_pedido_trazabilidad: 10, origen_consumo: 'RECETA' }
     ];
     const first = buildPedidoMovementReturnRows({
       movements,
-      lineas: [{ id_detalle_pedido: 701, cantidad_vendida: 99, cantidad_revertida: 33 }],
+      lineas: [{ id_detalle_pedido: 701, cantidad_vendida: 99, cantidad_revertida: 33, devuelve_inventario: true }],
       returnedByOrigin: new Map()
     });
     const second = buildPedidoMovementReturnRows({
       movements,
-      lineas: [{ id_detalle_pedido: 701, cantidad_vendida: 99, cantidad_revertida: 33 }],
+      lineas: [{ id_detalle_pedido: 701, cantidad_vendida: 99, cantidad_revertida: 33, devuelve_inventario: true }],
       returnedByOrigin: new Map([[901, first[0].cantidad]])
     });
     const third = buildPedidoMovementReturnRows({
@@ -706,7 +709,8 @@ describe('ventas bulk recipe quantity payload', () => {
         cantidad_vendida: 99,
         cantidad_revertida: 33,
         cantidad_pendiente_antes: 33,
-        completa_linea: true
+        completa_linea: true,
+        devuelve_inventario: true
       }],
       returnedByOrigin: new Map([[901, first[0].cantidad + second[0].cantidad]])
     });
@@ -722,6 +726,7 @@ describe('ventas bulk recipe quantity payload', () => {
       id_producto: null,
       id_insumo: 2,
       id_detalle_pedido: 700,
+      id_pedido_trazabilidad: 10,
       origen_consumo: 'RECETA',
       ref_origen: 'PEDIDO',
       tipo: 'SALIDA'
@@ -730,32 +735,156 @@ describe('ventas bulk recipe quantity payload', () => {
     assert.equal(classifyPedidoMovementReturnState({ movements: [], lineas: [] }), 'NO_ORIGINAL_MOVEMENTS');
     assert.equal(classifyPedidoMovementReturnState({
       movements: traced,
-      lineas: [{ id_detalle_pedido: 700 }],
+      lineas: [{ id_detalle_pedido: 700, cantidad_revertida: 1, devuelve_inventario: true }],
       returnedByOrigin: new Map([[1, 1]])
     }), 'ALREADY_FULLY_RETURNED');
     assert.equal(classifyPedidoMovementReturnState({
       movements: traced,
-      lineas: [{ id_detalle_pedido: 700 }],
+      lineas: [{ id_detalle_pedido: 700, cantidad_revertida: 1, devuelve_inventario: true }],
       returnedByOrigin: new Map([[1, 1.000001]])
     }), 'TRACE_INCONSISTENT');
     assert.equal(classifyPedidoMovementReturnState({
       movements: [{ ...traced[0], id_movimiento: null }],
-      lineas: [{ id_detalle_pedido: 700 }]
+      lineas: [{ id_detalle_pedido: 700, cantidad_revertida: 1, devuelve_inventario: true }]
     }), 'TRACE_INCONSISTENT');
     assert.equal(classifyPedidoMovementReturnState({
       movements: [{ ...traced[0], id_detalle_pedido: 999 }],
-      lineas: [{ id_detalle_pedido: 700 }]
+      lineas: [{ id_detalle_pedido: 700, cantidad_revertida: 1, devuelve_inventario: true }]
     }), 'TRACE_INCONSISTENT');
     assert.equal(classifyPedidoMovementReturnState({
       movements: [{ ...traced[0], id_detalle_pedido: null }],
-      lineas: [{ id_detalle_pedido: 700 }],
+      lineas: [{ id_detalle_pedido: 700, cantidad_revertida: 1, devuelve_inventario: true }],
       tipoReversion: 'PARCIAL'
     }), 'LEGACY_PARTIAL_BLOCKED');
     assert.equal(classifyPedidoMovementReturnState({
       movements: [{ ...traced[0], id_detalle_pedido: null }],
-      lineas: [{ id_detalle_pedido: 700 }],
+      lineas: [{ id_detalle_pedido: 700, cantidad_revertida: 1, devuelve_inventario: true }],
       tipoReversion: 'TOTAL'
     }), 'LEGACY_TOTAL_ALLOWED');
+  });
+
+  it('ignora lineas sin devolucion de inventario al clasificar reversión trazada', () => {
+    const traced = [{
+      id_movimiento: 1,
+      cantidad: 1,
+      id_almacen: 1,
+      id_producto: null,
+      id_insumo: 2,
+      id_detalle_pedido: 700,
+      id_pedido_trazabilidad: 10,
+      origen_consumo: 'RECETA',
+      ref_origen: 'PEDIDO',
+      tipo: 'SALIDA'
+    }];
+
+    assert.equal(classifyPedidoMovementReturnState({
+      movements: traced,
+      lineas: [{ id_detalle_pedido: 999, cantidad_revertida: 1, devuelve_inventario: false }]
+    }), 'TRACE_NO_INVENTORY_REQUESTED');
+  });
+
+  it('preserva configuracion_menu existente y agrega inventario_receta en payload RPC', () => {
+    const inventorySnapshot = {
+      version: 1,
+      id_receta: 12,
+      cantidad_linea: 2,
+      componentes: [{
+        id_insumo: 200,
+        id_almacen: 3,
+        factor_por_unidad: 1.5,
+        cantidad_linea: 2,
+        cantidad_total: 3,
+        id_unidad_medida: 1,
+        id_unidad_base: 1
+      }]
+    };
+    const line = {
+      kind: 'RECETA',
+      id_receta: 12,
+      cantidad: 2,
+      precio_unitario: 100,
+      sub_total: 200,
+      total_linea: 200,
+      configuracion_menu: {
+        tipo_complemento: 'SALSAS',
+        salsa: 'bbq',
+        inventario_receta: inventorySnapshot
+      },
+      complementos_detalle: [{
+        id_complemento: 4,
+        id_salsa: 4,
+        nombre: 'Buffalo'
+      }],
+      complementos_metadata: { requiere_complementos: true, minimo_complementos: 1, maximo_complementos: 2 }
+    };
+
+    const merged = mergePedidoLineInventoryConfig(line);
+    assert.equal(merged.salsa, 'bbq');
+    assert.equal(merged.inventario_receta, inventorySnapshot);
+    assert.equal(merged.complementos.length, 1);
+
+    const payload = buildVentaRpcPayload({
+      venta: {
+        all_lines: [line],
+        id_sucursal: 1,
+        id_cliente: 1,
+        id_usuario: 1,
+        id_caja: 1,
+        id_sesion_caja: 1,
+        total: 200
+      },
+      correlativoVenta: { codigo: 'VTA-1', fecha_operacion: '2026-06-30' },
+      facturacionVenta: {},
+      facturacionNormalizada: {}
+    });
+    assert.equal(payload.items[0].configuracion_menu.inventario_receta, inventorySnapshot);
+    assert.equal(payload.items[0].configuracion_menu.salsa, 'bbq');
+  });
+
+  it('bloquea snapshot de receta con unidad distinta a unidad base o almacen ambiguo', () => {
+    assert.throws(() => buildRecipeInventorySnapshot({
+      line: { id_receta: 12, cantidad: 2 },
+      components: [{
+        id_insumo: 200,
+        factor_por_unidad: 1,
+        id_unidad_medida: 2,
+        id_unidad_base: 1,
+        almacenes: [3]
+      }]
+    }), /unidad/);
+
+    assert.throws(() => buildRecipeInventorySnapshot({
+      line: { id_receta: 12, cantidad: 2 },
+      components: [{
+        id_insumo: 200,
+        factor_por_unidad: 1,
+        id_unidad_medida: 1,
+        id_unidad_base: 1,
+        almacenes: [3, 4]
+      }]
+    }), /mas de un almacen/);
+  });
+
+  it('detecta snapshot manipulado con mismo insumo en almacenes distintos', async () => {
+    const result = await resolvePedidoConsumo({ client: makeResolverClient(), items: [{
+      tipo_item: 'RECETA',
+      id_item: 12,
+      id_receta: 12,
+      cantidad: 2,
+      configuracion_menu: {
+        inventario_receta: {
+          version: 1,
+          id_receta: 12,
+          cantidad_linea: 2,
+          componentes: [
+            { id_insumo: 200, id_almacen: 3, factor_por_unidad: 1, cantidad_total: 2, id_unidad_medida: 1, id_unidad_base: 1 },
+            { id_insumo: 200, id_almacen: 4, factor_por_unidad: 1, cantidad_total: 2, id_unidad_medida: 1, id_unidad_base: 1 }
+          ]
+        }
+      }
+    }] });
+
+    assert.equal(result.faltantes[0].motivo, 'RECETA_SNAPSHOT_ALMACEN_AMBIGUO');
   });
 
   it('detecta pedido ya descontado completo y pedido parcial inconsistente', () => {

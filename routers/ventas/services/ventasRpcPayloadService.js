@@ -1,8 +1,8 @@
 import { roundMoney } from '../utils/moneyUtils.js';
 import { normalizeTipoItem } from '../utils/parseUtils.js';
 import {
-  buildComplementLineConfig,
-  buildComplementSnapshot
+  buildComplementSnapshot,
+  mergePedidoLineInventoryConfig
 } from './ventasPayloadService.js';
 
 export const VENTA_MONTO_COBRO_INVALIDO_CODE = 'VENTA_MONTO_COBRO_INVALIDO';
@@ -33,7 +33,7 @@ export const validateVentaMontoCobro = ({ venta, payload = null } = {}) => {
 const buildVentaRpcItems = (venta) =>
   (Array.isArray(venta?.all_lines) ? venta.all_lines : []).map((line, index) => {
     const tipoItem = normalizeTipoItem(line.kind);
-    const configuracionMenu = buildComplementLineConfig(line);
+    const configuracionMenu = mergePedidoLineInventoryConfig(line);
     const complementSnapshot = buildComplementSnapshot(line);
     const origenSnapshot = {
       tipo_item: tipoItem,
@@ -224,7 +224,7 @@ export const buildPedidoPendienteRpcPayload = (pedidoPendiente = {}) => ({
     observacion: line.observacion || null,
     descuento: roundMoney(line.descuento),
     id_descuento_catalogo: line.id_descuento_catalogo || null,
-    configuracion_menu: buildComplementLineConfig(line),
+    configuracion_menu: mergePedidoLineInventoryConfig(line),
     extras_detalle: Array.isArray(line.extras_detalle)
       ? line.extras_detalle.map((extra) => ({
         id_extra: extra.id_extra || null,

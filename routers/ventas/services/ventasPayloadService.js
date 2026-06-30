@@ -66,6 +66,19 @@ export const buildComplementLineConfig = (line) => {
   };
 };
 
+export const mergePedidoLineInventoryConfig = (line) => {
+  const complementConfig = buildComplementLineConfig(line);
+  const existingConfig = line?.configuracion_menu && typeof line.configuracion_menu === 'object'
+    ? line.configuracion_menu
+    : null;
+  if (!complementConfig && !existingConfig) return null;
+  return {
+    ...(complementConfig || {}),
+    ...(existingConfig || {}),
+    inventario_receta: existingConfig?.inventario_receta ?? null
+  };
+};
+
 export const normalizeCartKey = (value) => {
   const text = String(value ?? '').trim();
   return text || null;
