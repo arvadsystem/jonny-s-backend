@@ -194,6 +194,14 @@ const hasColumn = async (client, tableName, columnName) => {
   return exists;
 };
 
+const hasDbFunction = async (client, functionSignature) => {
+  const result = await client.query(
+    'SELECT to_regprocedure($1::text) IS NOT NULL AS exists',
+    [functionSignature]
+  );
+  return result.rows?.[0]?.exists === true;
+};
+
 const hasTable = async (client, tableName) => {
   const key = `table:${String(tableName || '').trim().toLowerCase()}`;
   if (schemaColumnCache.has(key)) return schemaColumnCache.get(key);
@@ -1253,8 +1261,26 @@ const createVentaWithRpcTransaction = async ({ client, venta, perf, requestStart
     }
   };
 };
-const createVentaWithRpcV2Transaction = async ({ client, venta, perf, requestStartedAt = 0 }) => {
+const VENTA_RPC_FUNCTIONS = Object.freeze({
+  v2: 'public.registrar_venta_pos_v2',
+  v3: 'public.registrar_venta_pos_v3'
+});
+
+const PEDIDO_PENDIENTE_RPC_FUNCTIONS = Object.freeze({
+  v1: 'public.registrar_pedido_pendiente_pos_v1',
+  v2: 'public.registrar_pedido_pendiente_pos_v2'
+});
+
+const createVentaWithRpcV2Transaction = async ({
+  client,
+  venta,
+  perf,
+  requestStartedAt = 0,
+  rpcVersion = 'v2'
+}) => {
   const rpcTotalStart = perf?.now?.() || 0;
+  const normalizedRpcVersion = rpcVersion === 'v3' ? 'v3' : 'v2';
+  const functionName = VENTA_RPC_FUNCTIONS[normalizedRpcVersion];
 
   const rpcPayloadBuildStart = perf?.now?.() || 0;
   const rpcPayload = buildVentaRpcV2Payload({ venta });
@@ -1272,7 +1298,7 @@ const createVentaWithRpcV2Transaction = async ({ client, venta, perf, requestSta
     id_caja: venta.id_caja,
     id_sesion_caja: venta.id_sesion_caja
   };
-  perf?.add?.('rpc_v2_payload_build_ms', rpcPayloadBuildStart);
+  perf?.add?.(`rpc_${normalizedRpcVersion}_payload_build_ms`, rpcPayloadBuildStart);
   perf?.add?.('pre_rpc_total_ms', rpcTotalStart);
   if (requestStartedAt) {
     perf?.add?.('node_before_rpc_ms', requestStartedAt);
@@ -1280,10 +1306,10 @@ const createVentaWithRpcV2Transaction = async ({ client, venta, perf, requestSta
 
   const rpcCallStart = perf?.now?.() || 0;
   const rpcResult = await client.query(
-    'SELECT public.registrar_venta_pos_v2($1::jsonb, $2::jsonb) AS response',
+    `SELECT ${functionName}($1::jsonb, $2::jsonb) AS response`,
     [JSON.stringify(rpcPayload), JSON.stringify(rpcActor)]
   );
-  perf?.add?.('rpc_v2_call_ms', rpcCallStart);
+  perf?.add?.(`rpc_${normalizedRpcVersion}_call_ms`, rpcCallStart);
   const afterRpcStart = perf?.now?.() || 0;
 
   const postRpcResponseStart = perf?.now?.() || 0;
@@ -1291,8 +1317,8 @@ const createVentaWithRpcV2Transaction = async ({ client, venta, perf, requestSta
   if (!isPlainObject(response) || response.ticket_ready !== true) {
     throw {
       httpStatus: 500,
-      code: 'VENTAS_RPC_V2_RESPONSE_INVALID',
-      publicMessage: 'La venta fue procesada por RPC V2, pero la respuesta del ticket no es valida.'
+      code: normalizedRpcVersion === 'v3' ? 'VENTAS_RPC_V3_RESPONSE_INVALID' : 'VENTAS_RPC_V2_RESPONSE_INVALID',
+      publicMessage: `La venta fue procesada por RPC ${normalizedRpcVersion.toUpperCase()}, pero la respuesta del ticket no es valida.`
     };
   }
 
@@ -1300,8 +1326,8 @@ const createVentaWithRpcV2Transaction = async ({ client, venta, perf, requestSta
   if (!idFactura) {
     throw {
       httpStatus: 500,
-      code: 'VENTAS_RPC_V2_FACTURA_INVALIDA',
-      publicMessage: 'La venta fue procesada por RPC V2, pero no devolvio factura valida.'
+      code: normalizedRpcVersion === 'v3' ? 'VENTAS_RPC_V3_FACTURA_INVALIDA' : 'VENTAS_RPC_V2_FACTURA_INVALIDA',
+      publicMessage: `La venta fue procesada por RPC ${normalizedRpcVersion.toUpperCase()}, pero no devolvio factura valida.`
     };
   }
 
@@ -1321,7 +1347,7 @@ const createVentaWithRpcV2Transaction = async ({ client, venta, perf, requestSta
   };
   perf?.add?.('post_rpc_response_ms', postRpcResponseStart);
   perf?.add?.('post_rpc_total_ms', afterRpcStart);
-  perf?.add?.('rpc_v2_total_ms', rpcTotalStart);
+  perf?.add?.(`rpc_${normalizedRpcVersion}_total_ms`, rpcTotalStart);
 
   return {
     response: responsePayload,
@@ -1337,8 +1363,15 @@ const createVentaWithRpcV2Transaction = async ({ client, venta, perf, requestSta
   };
 };
 
-const createPedidoPendienteWithRpcV1Transaction = async ({ client, pedidoPendiente, perf }) => {
+const createPedidoPendienteWithRpcV1Transaction = async ({
+  client,
+  pedidoPendiente,
+  perf,
+  rpcVersion = 'v1'
+}) => {
   const rpcTotalStart = perf?.now?.() || 0;
+  const normalizedRpcVersion = rpcVersion === 'v2' ? 'v2' : 'v1';
+  const functionName = PEDIDO_PENDIENTE_RPC_FUNCTIONS[normalizedRpcVersion];
   const rpcPayloadBuildStart = perf?.now?.() || 0;
   const rpcPayload = buildPedidoPendienteRpcPayload(pedidoPendiente);
   const rpcActor = {
@@ -1351,11 +1384,11 @@ const createPedidoPendienteWithRpcV1Transaction = async ({ client, pedidoPendien
 
   const rpcCallStart = perf?.now?.() || 0;
   const rpcResult = await client.query(
-    'SELECT public.registrar_pedido_pendiente_pos_v1($1::jsonb, $2::jsonb) AS response',
+    `SELECT ${functionName}($1::jsonb, $2::jsonb) AS response`,
     [JSON.stringify(rpcPayload), JSON.stringify(rpcActor)]
   );
-  perf?.add?.('pedido_pendiente_rpc_call_ms', rpcCallStart);
-  perf?.add?.('pedido_pendiente_rpc_total_ms', rpcTotalStart);
+  perf?.add?.(`pedido_pendiente_rpc_${normalizedRpcVersion}_call_ms`, rpcCallStart);
+  perf?.add?.(`pedido_pendiente_rpc_${normalizedRpcVersion}_total_ms`, rpcTotalStart);
 
   const response = rpcResult.rows?.[0]?.response;
   if (!isPlainObject(response) || !parseOptionalPositiveInt(response.id_pedido)) {
@@ -2171,7 +2204,7 @@ const resolveLineComplementos = ({ item, receta, context, nombreItem }) => {
   const min = Math.max(0, Number(metadata.minimo_complementos || 0));
   const max = Math.max(min, Number(metadata.maximo_complementos || 0));
   const complementosIncompletos = min > 0 && selected.length < min;
-  const allowIncomplete = false;
+  const allowIncomplete = item.complementos_incompletos_solicitados === true;
   const boundsResult = validateComplementSelectionBounds({
     selectedCount: selected.length,
     minimo: min,
@@ -8026,20 +8059,30 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
     });
     ventasPerfContext.cuenta_dividida = Boolean(cuentaDivisionPlan);
     const pedidoPendienteHasSalsasInventario = getSelectedSalsaIdsFromLines(pedidoPendiente.pedido_lines).length > 0;
+    const pedidoPendienteHasLines = Array.isArray(pedidoPendiente.pedido_lines)
+      && pedidoPendiente.pedido_lines.length > 0;
+    const pedidoPendienteRpcV2Available =
+      pedidoPendienteRpcEnabled
+      && pedidoPendienteHasSalsasInventario
+      && !cuentaDivisionPlan
+      && pedidoPendienteHasLines
+        ? await hasDbFunction(client, 'public.registrar_pedido_pendiente_pos_v2(jsonb,jsonb)')
+        : false;
+    const pedidoPendienteRpcVersion = pedidoPendienteHasSalsasInventario ? 'v2' : 'v1';
 
     const shouldUsePedidoPendienteRpcV1 =
       pedidoPendienteRpcEnabled
-      && !pedidoPendienteHasSalsasInventario
       && !cuentaDivisionPlan
-      && Array.isArray(pedidoPendiente.pedido_lines)
-      && pedidoPendiente.pedido_lines.length > 0;
+      && pedidoPendienteHasLines
+      && (!pedidoPendienteHasSalsasInventario || pedidoPendienteRpcV2Available);
 
     if (shouldUsePedidoPendienteRpcV1) {
-      pedidoPendientePersistenceMode = 'rpc_v1';
+      pedidoPendientePersistenceMode = `rpc_${pedidoPendienteRpcVersion}`;
       const rpcResponseBody = await createPedidoPendienteWithRpcV1Transaction({
         client,
         pedidoPendiente,
-        perf: ventasPerf
+        perf: ventasPerf,
+        rpcVersion: pedidoPendienteRpcVersion
       });
       if (pedidoPendiente.modalidad === 'DELIVERY' && pedidoPendiente.delivery?.costo_envio === null) {
         await client.query(
@@ -8085,12 +8128,12 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
     pedidoPendientePersistenceMode = 'legacy';
     if (cuentaDivisionPlan) {
       pedidoPendienteRpcSkipReason = 'cuenta_dividida';
-    } else if (pedidoPendienteHasSalsasInventario) {
-      pedidoPendienteRpcSkipReason = 'salsas_inventario';
     } else if (!pedidoPendienteRpcEnabled) {
       pedidoPendienteRpcSkipReason = 'flag_disabled';
-    } else if (!Array.isArray(pedidoPendiente.pedido_lines) || pedidoPendiente.pedido_lines.length === 0) {
+    } else if (!pedidoPendienteHasLines) {
       pedidoPendienteRpcSkipReason = 'no_lines';
+    } else if (pedidoPendienteHasSalsasInventario) {
+      pedidoPendienteRpcSkipReason = 'rpc_v2_missing';
     }
 
     const descuentosStart = ventasPerf.now();
@@ -9419,11 +9462,7 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
       lines: venta.all_lines,
       idSucursal: venta.id_sucursal
     });
-    venta.pedido_lines = await attachRecipeInventorySnapshotsToLines({
-      client,
-      lines: venta.pedido_lines,
-      idSucursal: venta.id_sucursal
-    });
+    venta.pedido_lines = venta.all_lines;
     const amountValidation = validateVentaMontoCobro({ venta });
     if (!amountValidation.ok) {
       await client.query('ROLLBACK');
@@ -9472,9 +9511,16 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
     venta.id_sucursal = Number(validatedCajaSession.id_sucursal);
     const ventaHasExtras = hasVentaExtras(venta);
     const ventaHasSalsasInventario = getSelectedSalsaIdsFromLines(venta.all_lines).length > 0;
-    if (ventaHasSalsasInventario) {
+    const ventaRpcV3Available = ventaHasSalsasInventario && ventasRpcV2Enabled
+      ? await hasDbFunction(client, 'public.registrar_venta_pos_v3(jsonb,jsonb)')
+      : false;
+    const shouldUseVentaRpcV2Family = ventasRpcV2Enabled && (!ventaHasSalsasInventario || ventaRpcV3Available);
+    const ventaRpcVersion = ventaHasSalsasInventario ? 'v3' : 'v2';
+    if (ventaHasSalsasInventario && ventaRpcV3Available) {
+      ventasPerfContext.rpc_version = 'v3_salsas';
+    } else if (ventaHasSalsasInventario) {
       ventasPerfContext.rpc_enabled = false;
-      ventasPerfContext.rpc_version = 'legacy_salsas_inventario';
+      ventasPerfContext.rpc_version = ventasRpcV2Enabled ? 'legacy_rpc_v3_missing' : 'legacy_flag_disabled';
     } else if (ventaHasExtras && ventasRpcV2Enabled) {
       ventasPerfContext.rpc_version = 'v2_extras';
     } else if (ventaHasExtras) {
@@ -9482,12 +9528,13 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
       ventasPerfContext.rpc_version = 'legacy_extras';
     }
 
-    if (ventasRpcV2Enabled && !ventaHasSalsasInventario) {
+    if (shouldUseVentaRpcV2Family) {
       const rpcCreateResult = await createVentaWithRpcV2Transaction({
         client,
         venta,
         perf: ventasPerf,
-        requestStartedAt: authContextStart
+        requestStartedAt: authContextStart,
+        rpcVersion: ventaRpcVersion
       });
       const idPedidoRpc = parseOptionalPositiveInt(rpcCreateResult.response?.id_pedido);
       await persistVentaPedidoSnapshots({ client, idPedido: idPedidoRpc, venta });
@@ -9505,8 +9552,8 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
         if (!fidelizacionPedidoId) {
           throw {
             httpStatus: 500,
-            code: 'VENTAS_RPC_V2_PEDIDO_INVALIDO',
-            publicMessage: 'La venta fue procesada por RPC V2, pero no devolvio pedido valido para descontar extras.'
+            code: ventaRpcVersion === 'v3' ? 'VENTAS_RPC_V3_PEDIDO_INVALIDO' : 'VENTAS_RPC_V2_PEDIDO_INVALIDO',
+            publicMessage: `La venta fue procesada por RPC ${ventaRpcVersion.toUpperCase()}, pero no devolvio pedido valido para descontar extras.`
           };
         }
       }
@@ -9525,7 +9572,7 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
         idUsuario: userId,
         idSucursal: venta.id_sucursal
       }).catch((saveError) => {
-        console.error('No se pudo guardar resultado idempotente RPC V2 de venta:', saveError);
+        console.error(`No se pudo guardar resultado idempotente RPC ${ventaRpcVersion.toUpperCase()} de venta:`, saveError);
       });
 
       ventasPerf.add('node_after_rpc_ms', rpcCreateResult.afterRpcStart);

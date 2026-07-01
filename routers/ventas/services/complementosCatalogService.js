@@ -109,6 +109,11 @@ const calculateFallbackWingSauceRequirement = ({ nombre = '', descripcion = '' }
   return Math.max(0, Math.ceil(baseUnits / 6));
 };
 
+const normalizeLineQuantity = (value) => {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 1;
+};
+
 const findMatchingSalsaRule = (rules, unidades) => {
   const units = Number(unidades);
   if (!Number.isFinite(units) || units <= 0) return null;
@@ -193,7 +198,7 @@ const buildRecipeSauceRequirement = ({ recipeName = '', recipeDescription = '', 
   }
   const rule = findMatchingSalsaRule(rules, unitsBase);
   if (rule) {
-    return { ok: true, required: Number(rule?.salsas_requeridas || 0) };
+    return { ok: true, requiredPerOrder: Number(rule?.salsas_requeridas || 0) };
   }
   if (Array.isArray(rules) && rules.length > 0) {
     return {
@@ -206,7 +211,7 @@ const buildRecipeSauceRequirement = ({ recipeName = '', recipeDescription = '', 
   // AM: fallback acotado solo para familias alitas/tenders cuando no hay reglas formales.
   return {
     ok: true,
-    required: calculateFallbackWingSauceRequirement({
+    requiredPerOrder: calculateFallbackWingSauceRequirement({
       nombre: recipeName,
       descripcion: recipeDescription
     })
@@ -249,8 +254,7 @@ export const resolveRecetaComplementMetadata = ({ receta = {}, quantity = 1, all
   const requirement = buildRecipeSauceRequirement({
     recipeName: receta?.nombre_receta,
     recipeDescription: receta?.descripcion,
-    rules,
-    quantity
+    rules
   });
   if (!requirement.ok) {
     return {
@@ -264,7 +268,8 @@ export const resolveRecetaComplementMetadata = ({ receta = {}, quantity = 1, all
       complementos_disponibles: []
     };
   }
-  const required = Math.max(0, Number(requirement.required || 0));
+  const requiredPerOrder = Math.max(0, Number(requirement.requiredPerOrder ?? requirement.required ?? 0));
+  const required = Math.max(0, Math.round(requiredPerOrder * normalizeLineQuantity(quantity)));
   let available = sortSauceOptions(allowedSauces);
   if (required > 0 && available.length === 0) {
     available = sortSauceOptions(fallbackSauces);
@@ -430,10 +435,10 @@ export const buildVentaComplementContext = async ({ client, normalizedItems, idS
         const requirement = buildRecipeSauceRequirement({
           recipeName: receta?.nombre_receta,
           recipeDescription: receta?.descripcion,
-          rules,
-          quantity: item.cantidad
+          rules
         });
-        const required = requirement.ok ? Math.max(0, Number(requirement.required || 0)) : 0;
+        const requiredPerOrder = requirement.ok ? Math.max(0, Number(requirement.requiredPerOrder ?? requirement.required ?? 0)) : 0;
+        const required = Math.max(0, Math.round(requiredPerOrder * normalizeLineQuantity(item.cantidad)));
         if (required > 0 && allowed.length === 0) {
           needsFallbackSauces = true;
           break;

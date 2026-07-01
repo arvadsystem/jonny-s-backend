@@ -29,6 +29,7 @@ import { buildVentaKitchenPrintPayload } from '../handlers/ventasPrintHandlers.j
 import { buildVentaTicketPdfDefinition } from '../services/ventaTicketPdfService.js';
 import {
   buildSalsaConsumptionSnapshot,
+  attachSalsaInventorySnapshotsToLines,
   restoreSalsasInventoryFromSnapshots
 } from '../services/salsasInventoryService.js';
 import {
@@ -40,7 +41,11 @@ import {
   mergePedidoLineInventoryConfig,
   normalizeVentaItems
 } from '../services/ventasPayloadService.js';
-import { buildVentaRpcPayload } from '../services/ventasRpcPayloadService.js';
+import {
+  buildPedidoPendienteRpcPayload,
+  buildVentaRpcPayload,
+  buildVentaRpcV2Payload
+} from '../services/ventasRpcPayloadService.js';
 import { buildRecipeInventorySnapshot } from '../../../services/recetaInventorySnapshotService.js';
 
 const makeResolverClient = ({
@@ -121,6 +126,56 @@ const makeTransactionClient = ({ recipeComponents = [] } = {}) => {
       }
       if (text.includes('FROM public.detalle_recetas')) {
         return { rows: recipeComponents };
+      }
+      return { rowCount: 0, rows: [] };
+    }
+  };
+};
+
+const makeSalsaInventoryClient = () => {
+  const queries = [];
+  const salsaRows = [{
+    id_salsa: 5,
+    id_complemento: 5,
+    nombre: 'Barbecue',
+    estado: true,
+    id_insumo: 400,
+    cantidad_porcion: '1',
+    id_unidad_consumo: 1
+  }];
+  return {
+    queries,
+    async query(sql, params = []) {
+      queries.push({ sql: String(sql), params });
+      const text = String(sql);
+      if (text.includes('information_schema.columns')) {
+        return {
+          rowCount: 3,
+          rows: [
+            { column_name: 'id_insumo' },
+            { column_name: 'cantidad_porcion' },
+            { column_name: 'id_unidad_consumo' }
+          ]
+        };
+      }
+      if (text.includes('FROM public.salsas s')) {
+        const ids = new Set(params[0] || []);
+        return { rows: salsaRows.filter((row) => ids.has(row.id_salsa)) };
+      }
+      if (text.includes('FROM public.insumos_mapeo_maestro')) {
+        return { rows: [] };
+      }
+      if (text.includes('FROM public.insumos_almacenes')) {
+        return { rows: [{ id_insumo: 400, id_almacen: 3, id_sucursal: 1, cantidad: '100', stock_minimo: '0' }] };
+      }
+      if (text.includes('FROM public.insumos')) {
+        return { rows: [{ id_insumo: 400, id_unidad_medida: 1, estado: true }] };
+      }
+      if (text.includes('FROM public.insumo_presentaciones')) {
+        return { rows: [] };
+      }
+      if (text.includes('FROM public.unidades_medida')) {
+        return { rows: [{ id_unidad_medida: 1 }] };
       }
       return { rowCount: 0, rows: [] };
     }
@@ -231,7 +286,30 @@ describe('ventas bulk recipe quantity payload', () => {
     assert.equal(snapshot.cantidad_base_total, 49.5);
   });
 
-  it('calcula reglas de salsas por orden aunque la linea tenga cantidad masiva', () => {
+  it('hidrata inventario de salsas una sola vez y solo con IDs seleccionados', async () => {
+    const client = makeSalsaInventoryClient();
+    const lines = [{
+      cantidad: 2,
+      complementos_detalle: [
+        { id_complemento: 5, id_salsa: 5, nombre: 'Barbecue' }
+      ]
+    }];
+
+    const usage = await attachSalsaInventorySnapshotsToLines({
+      client,
+      lines,
+      idSucursal: 1
+    });
+
+    const salsaQueries = client.queries.filter((entry) => entry.sql.includes('FROM public.salsas s'));
+    assert.equal(salsaQueries.length, 1);
+    assert.deepEqual(salsaQueries[0].params[0], [5]);
+    assert.equal(usage.length, 1);
+    assert.equal(lines[0].complementos_detalle[0].inventario.id_salsa, 5);
+    assert.equal(lines[0].complementos_detalle[0].inventario.cantidad_base_total, 2);
+  });
+
+  it('calcula reglas de salsas por cantidad de linea', () => {
     const metadata = resolveRecetaComplementMetadata({
       receta: { nombre_receta: '12 ALITAS', descripcion: 'Orden de 12 alitas' },
       quantity: 99,
@@ -245,8 +323,8 @@ describe('ventas bulk recipe quantity payload', () => {
       ]
     });
 
-    assert.equal(metadata.minimo_complementos, 2);
-    assert.equal(metadata.maximo_complementos, 2);
+    assert.equal(metadata.minimo_complementos, 198);
+    assert.equal(metadata.maximo_complementos, 198);
   });
 
   it('bloquea complementos incompletos salvo autorizacion explicita', () => {
@@ -268,6 +346,61 @@ describe('ventas bulk recipe quantity payload', () => {
     assert.equal(blocked.ok, false);
     assert.equal(blocked.code, 'VENTAS_COMPLEMENTOS_INCOMPLETOS');
     assert.equal(authorized.ok, true);
+  });
+
+  it('escala reglas de salsa por cantidad de linea sin doble multiplicar', () => {
+    const rules = [
+      { min_unidades: 1, max_unidades: 6, salsas_requeridas: 1 },
+      { min_unidades: 7, max_unidades: 12, salsas_requeridas: 2 },
+      { min_unidades: 13, max_unidades: 24, salsas_requeridas: 4 }
+    ];
+    const expectedByQuantity = new Map([
+      [1, 4],
+      [2, 8],
+      [3, 12],
+      [99, 396],
+      [120, 480]
+    ]);
+
+    for (const [quantity, expected] of expectedByQuantity.entries()) {
+      const metadata = resolveRecetaComplementMetadata({
+        receta: { nombre_receta: '24 ALITAS', descripcion: 'Orden de 24 alitas' },
+        quantity,
+        rules,
+        allowedSauces: [
+          { id_complemento: 5, id_salsa: 5, nombre: 'Barbecue', disponible: true },
+          { id_complemento: 6, id_salsa: 6, nombre: 'Buffalo', disponible: true },
+          { id_complemento: 7, id_salsa: 7, nombre: 'Cajun', disponible: true },
+          { id_complemento: 8, id_salsa: 8, nombre: 'Ranch', disponible: true }
+        ]
+      });
+
+      assert.equal(metadata.ok, true);
+      assert.equal(metadata.minimo_complementos, expected);
+      assert.equal(metadata.maximo_complementos, expected);
+    }
+  });
+
+  it('persiste autorizacion backend para complementos incompletos solo cuando fue normalizada', () => {
+    const config = buildComplementLineConfig({
+      complementos_metadata: {
+        requiere_complementos: true,
+        minimo_complementos: 4,
+        maximo_complementos: 4,
+        complementos_incompletos_autorizados_backend: true,
+        complementos_recomendados: 4,
+        complementos_seleccionados: 3
+      },
+      complementos_detalle: [
+        { id_complemento: 5, id_salsa: 5, nombre: 'Barbecue' },
+        { id_complemento: 6, id_salsa: 6, nombre: 'Buffalo' },
+        { id_complemento: 7, id_salsa: 7, nombre: 'Cajun' }
+      ]
+    });
+
+    assert.equal(config.complementos_incompletos_autorizados, true);
+    assert.equal(config.complementos_recomendados, 4);
+    assert.equal(config.complementos_seleccionados, 3);
   });
 
   it('devuelve error cuando hay reglas formales de salsa sin rango aplicable', () => {
@@ -839,6 +972,60 @@ describe('ventas bulk recipe quantity payload', () => {
     });
     assert.equal(payload.items[0].configuracion_menu.inventario_receta, inventorySnapshot);
     assert.equal(payload.items[0].configuracion_menu.salsa, 'bbq');
+  });
+
+  it('transporta cart_key en payloads RPC de venta y pedido pendiente', () => {
+    const line = {
+      kind: 'RECETA',
+      cart_key: 'line-abc',
+      id_producto: null,
+      id_receta: 12,
+      cantidad: 2,
+      precio_unitario: 100,
+      sub_total: 200,
+      total_linea: 200,
+      descuento: 0,
+      subtotal_extras: 0,
+      extras_detalle: [],
+      complementos_detalle: []
+    };
+    const ventaPayload = buildVentaRpcV2Payload({
+      venta: {
+        descripcion_pedido: null,
+        descripcion_envio: null,
+        pedido_subtotal: 200,
+        pedido_isv: 0,
+        pedido_total: 200,
+        id_estado_pedido: 1,
+        id_sucursal: 1,
+        id_cliente: null,
+        id_usuario: 1,
+        id_caja: 1,
+        id_sesion_caja: 1,
+        efectivo_entregado: 200,
+        cambio: 0,
+        id_metodo_pago: 1,
+        total: 200,
+        metodo_pago: 'EFECTIVO',
+        metodo_pago_codigo: 'EFECTIVO',
+        subtotal: 200,
+        descuento: 0,
+        isv: 0,
+        contacto: null,
+        contexto: null,
+        all_lines: [line]
+      }
+    });
+    const pendientePayload = buildPedidoPendienteRpcPayload({
+      subtotal: 200,
+      isv: 0,
+      total: 200,
+      pedido_lines: [line]
+    });
+
+    assert.equal(ventaPayload.items[0].cart_key, 'line-abc');
+    assert.equal(ventaPayload.items[0].origen_snapshot.cart_key, 'line-abc');
+    assert.equal(pendientePayload.pedido_lines[0].cart_key, 'line-abc');
   });
 
   it('bloquea snapshot de receta con unidad distinta a unidad base o almacen ambiguo', () => {

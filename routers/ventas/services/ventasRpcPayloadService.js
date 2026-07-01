@@ -37,6 +37,7 @@ const buildVentaRpcItems = (venta) =>
     const complementSnapshot = buildComplementSnapshot(line);
     const origenSnapshot = {
       tipo_item: tipoItem,
+      cart_key: line.cart_key || null,
       nombre_item: line.nombre_item || null,
       id_producto: line.id_producto || null,
       id_receta: line.id_receta || null,
@@ -58,6 +59,7 @@ const buildVentaRpcItems = (venta) =>
 
     return {
       item_index: index,
+      cart_key: line.cart_key || null,
       tipo_item: tipoItem,
       id_producto: line.id_producto || null,
       id_receta: line.id_receta || null,
@@ -215,6 +217,7 @@ export const buildPedidoPendienteRpcPayload = (pedidoPendiente = {}) => ({
   observacion_pago: pedidoPendiente.observacion_pago || null,
   pedido_lines: (Array.isArray(pedidoPendiente.pedido_lines) ? pedidoPendiente.pedido_lines : []).map((line, index) => ({
     item_index: index,
+    cart_key: line.cart_key || null,
     sub_total: roundMoney(line.sub_total),
     total_linea: roundMoney(line.total_linea),
     cantidad: Number(line.cantidad || 0),
