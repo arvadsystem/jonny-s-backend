@@ -558,7 +558,7 @@ describe('ventas bulk recipe quantity payload', () => {
       idPedido: 55,
       actorUserId: 9,
       productoQtyMap: new Map(),
-      insumoQtyMap: new Map(),
+      insumoQtyMap: new Map([[200, 1.25]]),
       productosById: new Map(),
       insumosById: new Map([[200, { id_insumo: 200, id_almacen: 3 }]]),
       movementRows: [{ tipo_recurso: 'insumo', id_insumo: 200, id_detalle_pedido: 700, cantidad: 1.25, origen_consumo: 'RECETA' }],

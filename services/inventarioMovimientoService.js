@@ -12,6 +12,7 @@ import { toPositiveInt } from './pedidoPayloadValidator.js';
 export const MOVEMENT_REF = 'PEDIDO';
 export const SHORTAGE_MOVEMENT_REF = 'FALTANTE_COCINA';
 const VALID_CONSUMPTION_ORIGINS = new Set(['PRODUCTO', 'RECETA', 'EXTRA', 'SALSA']);
+const VALID_INSUMO_CONSUMPTION_ORIGINS = new Set(['RECETA', 'EXTRA', 'SALSA']);
 const VALID_MOVEMENT_REFS = new Set([MOVEMENT_REF, SHORTAGE_MOVEMENT_REF]);
 export const LEGACY_ID_COLLISION_TOLERANCE_MINUTES = 5;
 
@@ -190,10 +191,22 @@ const normalizeTraceQuantity = (value, code = 'PEDIDO_TRAZABILIDAD_CANTIDAD_INVA
   return quantity;
 };
 
-const normalizeComparableQuantity = (value) => Number(Number(value || 0).toFixed(6));
+const normalizeMapQuantity = (value) => {
+  const quantity = Number(value);
+  if (!Number.isFinite(quantity) || quantity <= 0) {
+    throw createInventoryTraceError(
+      'PEDIDO_TRAZABILIDAD_CANTIDAD_INVALIDA',
+      'El mapa de consumo contiene una cantidad invalida.'
+    );
+  }
+  return quantity;
+};
+
+const normalizeComparableQuantity = (value) => Number(Number(value).toFixed(6));
 
 const addQuantity = (target, key, quantity) => {
-  target.set(key, normalizeComparableQuantity((target.get(key) || 0) + Number(quantity || 0)));
+  const current = Number(target.get(key) || 0);
+  target.set(key, current + Number(quantity));
 };
 
 const totalsToArray = (totals) => [...totals.entries()]
@@ -212,6 +225,21 @@ const resolveInsumoMovementId = (rowInsumo, inputInsumoId) => (
   || toPositiveInt(inputInsumoId)
 );
 
+const validateResourceOriginCompatibility = (tipoRecurso, origenConsumo) => {
+  if (tipoRecurso === 'producto' && origenConsumo !== 'PRODUCTO') {
+    throw createInventoryTraceError(
+      'PEDIDO_TRAZABILIDAD_ORIGEN_INCOMPATIBLE',
+      'Un producto solo puede usar origen_consumo PRODUCTO.'
+    );
+  }
+  if (tipoRecurso === 'insumo' && !VALID_INSUMO_CONSUMPTION_ORIGINS.has(origenConsumo)) {
+    throw createInventoryTraceError(
+      'PEDIDO_TRAZABILIDAD_ORIGEN_INCOMPATIBLE',
+      'Un insumo solo puede usar origen_consumo RECETA, EXTRA o SALSA.'
+    );
+  }
+};
+
 const buildExpectedCanonicalTotals = ({
   productoQtyMap,
   insumoQtyMap,
@@ -223,8 +251,14 @@ const buildExpectedCanonicalTotals = ({
   const expected = new Map();
   for (const [inputProductId, rawQuantity] of productoQtyMap instanceof Map ? productoQtyMap.entries() : []) {
     const idProducto = toPositiveInt(inputProductId);
-    if (!idProducto || excludedProductIds.has(idProducto)) continue;
-    const quantity = normalizeTraceQuantity(rawQuantity);
+    if (!idProducto) {
+      throw createInventoryTraceError(
+        'PEDIDO_TRAZABILIDAD_RECURSO_INVALIDO',
+        'productoQtyMap contiene un id_producto invalido.'
+      );
+    }
+    const quantity = normalizeMapQuantity(rawQuantity);
+    if (excludedProductIds.has(idProducto)) continue;
     const rowProducto = productosById.get(idProducto);
     if (!rowProducto) {
       throw createInventoryTraceError(
@@ -236,8 +270,14 @@ const buildExpectedCanonicalTotals = ({
   }
   for (const [inputInsumoId, rawQuantity] of insumoQtyMap instanceof Map ? insumoQtyMap.entries() : []) {
     const idInsumo = toPositiveInt(inputInsumoId);
-    if (!idInsumo || excludedInsumoIds.has(idInsumo)) continue;
-    const quantity = normalizeTraceQuantity(rawQuantity);
+    if (!idInsumo) {
+      throw createInventoryTraceError(
+        'PEDIDO_TRAZABILIDAD_RECURSO_INVALIDO',
+        'insumoQtyMap contiene un id_insumo invalido.'
+      );
+    }
+    const quantity = normalizeMapQuantity(rawQuantity);
+    if (excludedInsumoIds.has(idInsumo)) continue;
     const rowInsumo = insumosById.get(idInsumo);
     if (!rowInsumo) {
       throw createInventoryTraceError(
@@ -427,6 +467,8 @@ export const validateTracedPedidoMovement = (movement) => {
     );
   }
   const origenConsumo = normalizeOrigenConsumo(movement?.origen_consumo);
+  const tipoRecurso = idProducto ? 'producto' : 'insumo';
+  validateResourceOriginCompatibility(tipoRecurso, origenConsumo);
   const refOrigen = normalizePedidoMovementRefOrigenStrict(movement?.ref_origen);
   return {
     cantidad,
@@ -516,6 +558,7 @@ export const buildLineMovementRows = ({
       );
     }
     const origenConsumo = normalizeOrigenConsumo(row?.origen_consumo);
+    validateResourceOriginCompatibility(tipoRecurso, origenConsumo);
     const idDetallePedido = toPositiveInt(row?.id_detalle_pedido);
     const quantity = normalizeTraceQuantity(row?.cantidad);
     if (tipoRecurso === 'producto' && excludedProductIds.has(rawProductId)) continue;
@@ -629,11 +672,16 @@ export const registrarMovimientosPedido = async ({
   excludedProductIds = new Set(),
   excludedInsumoIds = new Set()
 }) => {
-  const hasPositiveQuantity = (qtyMap) => [...(qtyMap instanceof Map ? qtyMap.values() : [])]
-    .some((quantity) => Number.isFinite(Number(quantity)) && Number(quantity) > 0);
-  const hasPhysicalConsumption = hasPositiveQuantity(productoQtyMap) || hasPositiveQuantity(insumoQtyMap);
+  const expectedTotals = buildExpectedCanonicalTotals({
+    productoQtyMap,
+    insumoQtyMap,
+    productosById,
+    insumosById,
+    excludedProductIds,
+    excludedInsumoIds
+  });
   if (!Array.isArray(movementRows) || movementRows.length === 0) {
-    if (!hasPhysicalConsumption) return 0;
+    if (expectedTotals.size === 0) return 0;
     throw createInventoryTraceError(
       'PEDIDO_TRAZABILIDAD_LINEA_INCOMPLETA',
       'No se pueden registrar movimientos de pedido sin trazabilidad por linea.'
@@ -650,26 +698,13 @@ export const registrarMovimientosPedido = async ({
     excludedProductIds,
     excludedInsumoIds
   });
-  if (hasPhysicalConsumption && lineMovementRows.length === 0) {
-    throw createInventoryTraceError(
-      'PEDIDO_TRAZABILIDAD_LINEA_INCOMPLETA',
-      'El consumo fisico no produjo movimientos trazados.'
-    );
-  }
   const validatedRows = lineMovementRows.map(validateTracedPedidoMovement);
-  if (hasPhysicalConsumption) {
-    validateExpectedVsTracedTotals({
-      expectedTotals: buildExpectedCanonicalTotals({
-        productoQtyMap,
-        insumoQtyMap,
-        productosById,
-        insumosById,
-        excludedProductIds,
-        excludedInsumoIds
-      }),
-      tracedTotals: buildTracedCanonicalTotals(validatedRows)
-    });
-  }
+  const tracedTotals = buildTracedCanonicalTotals(validatedRows);
+  if (expectedTotals.size === 0 && tracedTotals.size === 0) return 0;
+  validateExpectedVsTracedTotals({
+    expectedTotals,
+    tracedTotals
+  });
   for (const row of validatedRows) {
     await insertValidatedMovimiento(client, row);
   }
