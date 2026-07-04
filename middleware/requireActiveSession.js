@@ -5,22 +5,13 @@
  */
 
 import pool from '../config/db-connection.js';
+import {
+  CLIENT_SESSION_INACTIVITY_MINUTES,
+  INACTIVITY_EXCLUDED_ROLE_CODES,
+  SESSION_INACTIVITY_MINUTES
+} from '../utils/security/sessionService.js';
 
 const HN_NOW_SQL = "timezone('America/Tegucigalpa', now())";
-const INACTIVITY_EXCLUDED_ROLE_CODES = Object.freeze([
-  'COCINA',
-  'MESERO',
-  'AUXILIAR_COCINA',
-  'P_COCINA'
-]);
-
-const parseInactivityMinutes = () => {
-  const raw = Number.parseInt(String(process.env.SESSION_INACTIVITY_MINUTES ?? ''), 10);
-  if (!Number.isInteger(raw) || raw <= 0) return 20;
-  return raw;
-};
-
-const SESSION_INACTIVITY_MINUTES = parseInactivityMinutes();
 
 const clearAuthCookies = (res) => {
   const isProd = process.env.NODE_ENV === 'production';
@@ -31,7 +22,7 @@ const clearAuthCookies = (res) => {
   res.clearCookie('csrf_token', { path: '/', sameSite, secure });
 };
 
-export async function requireActiveSession(req, res, next) {
+export const createRequireActiveSession = ({ sessionPool = pool } = {}) => async (req, res, next) => {
   try {
     const user = req.user || req.usuario;
 
@@ -53,20 +44,47 @@ export async function requireActiveSession(req, res, next) {
             WHERE ru.id_usuario = $2
               AND UPPER(REGEXP_REPLACE(TRIM(r.nombre), '[\\s-]+', '_', 'g')) = ANY($4::text[])
           )
+          AND NOT EXISTS (
+            SELECT 1
+            FROM usuarios u_excluded
+            WHERE u_excluded.id_usuario = $2
+              AND UPPER(REGEXP_REPLACE(TRIM(COALESCE(u_excluded.tipo_usuario, '')), '[\\s-]+', '_', 'g')) = ANY($4::text[])
+          )
           AND
-          ultima_actividad <= (${HN_NOW_SQL} - make_interval(mins => $3))
+          ultima_actividad <= (
+            ${HN_NOW_SQL} - make_interval(
+              mins => (CASE
+                WHEN EXISTS (
+                  SELECT 1
+                  FROM usuarios u_cliente
+                  WHERE u_cliente.id_usuario = $2
+                    AND UPPER(TRIM(COALESCE(u_cliente.tipo_usuario, ''))) = 'CLIENTE'
+                )
+                OR EXISTS (
+                  SELECT 1
+                  FROM roles_usuarios ru_cliente
+                  INNER JOIN roles r_cliente ON r_cliente.id_rol = ru_cliente.id_rol
+                  WHERE ru_cliente.id_usuario = $2
+                    AND UPPER(REGEXP_REPLACE(TRIM(r_cliente.nombre), '[\\s-]+', '_', 'g')) = 'CLIENTE'
+                )
+                THEN $5
+                ELSE $3
+              END)::integer
+            )
+          )
         ) AS expirada_por_inactividad
-      FROM sesiones_activas
-      WHERE id_sesion = $1
-        AND id_usuario = $2
+      FROM sesiones_activas sa
+      WHERE sa.id_sesion = $1
+        AND sa.id_usuario = $2
       LIMIT 1
     `;
 
-    const result = await pool.query(sql, [
+    const result = await sessionPool.query(sql, [
       user.sid,
       user.id_usuario,
       SESSION_INACTIVITY_MINUTES,
-      INACTIVITY_EXCLUDED_ROLE_CODES
+      INACTIVITY_EXCLUDED_ROLE_CODES,
+      CLIENT_SESSION_INACTIVITY_MINUTES
     ]);
 
     if (result.rows.length === 0) {
@@ -91,7 +109,7 @@ export async function requireActiveSession(req, res, next) {
     }
 
     if (expiredByInactivity) {
-      await pool.query(
+      await sessionPool.query(
         `
           UPDATE sesiones_activas
           SET activa = FALSE,
@@ -116,4 +134,6 @@ export async function requireActiveSession(req, res, next) {
     console.error('requireActiveSession error:', err);
     return res.status(500).json({ error: true, message: 'Error interno del servidor' });
   }
-}
+};
+
+export const requireActiveSession = createRequireActiveSession();

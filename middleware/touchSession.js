@@ -49,3 +49,22 @@ export async function touchSessionMiddleware(req, res, next) {
     return next();
   }
 }
+
+export async function requireSessionTouchMiddleware(req, res, next) {
+  try {
+    const user = req.user || req.usuario;
+    if (!user?.sid) {
+      return res.status(401).json({ error: true, message: 'No autorizado (sin sesion)' });
+    }
+
+    const touched = await touchSession(user.sid);
+    if (touched !== 1) {
+      return res.status(401).json({ error: true, message: 'Sesion cerrada o invalida' });
+    }
+
+    return next();
+  } catch (err) {
+    console.error('requireSessionTouchMiddleware error:', err);
+    return res.status(500).json({ error: true, message: 'Error interno del servidor' });
+  }
+}

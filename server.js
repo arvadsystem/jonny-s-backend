@@ -6,12 +6,17 @@ import {
   startCajaCloseEmailOutboxWorker,
   stopCajaCloseEmailOutboxWorker
 } from './jobs/cajaCloseEmailOutboxWorker.js';
+import {
+  startOperationalSessionCutoffWorker,
+  stopOperationalSessionCutoffWorker
+} from './jobs/operationalSessionCutoffWorker.js';
 
 const config = getRuntimeConfig();
 const PORT = config.port;
 
 await checkDatabaseReady();
 await startCajaCloseEmailOutboxWorker();
+await startOperationalSessionCutoffWorker();
 
 const server = app.listen(PORT, () => {
   console.log(`Servidor activo en el puerto ${PORT}`);
@@ -36,7 +41,10 @@ const shutdown = async (signal) => {
 
   console.warn(`[shutdown] Senal recibida: ${signal}. Cerrando servidor HTTP y pool PostgreSQL.`);
   const gracefulWork = closeHttpServer()
-    .then(() => stopCajaCloseEmailOutboxWorker({ timeoutMs: 5000 }))
+    .then(() => Promise.all([
+      stopCajaCloseEmailOutboxWorker({ timeoutMs: 5000 }),
+      stopOperationalSessionCutoffWorker({ timeoutMs: 5000 })
+    ]))
     .then(() => closePool());
 
   const timeout = new Promise((_, reject) => {

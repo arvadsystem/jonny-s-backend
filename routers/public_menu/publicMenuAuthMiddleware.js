@@ -1,4 +1,6 @@
 import jwt from 'jsonwebtoken';
+import { requireActiveSession } from '../../middleware/requireActiveSession.js';
+import { touchSessionMiddleware } from '../../middleware/touchSession.js';
 import { sendPublicMenuClientError, sendPublicMenuError } from './publicMenuResponse.js';
 
 const FALLBACK_JWT_SECRET = 'CAMBIA_ESTE_SECRET_EN_ENV';
@@ -121,6 +123,7 @@ const publicMenuCsrfProtect = (req, res, next) => {
 // Reglas finales del modulo: solo clientes autenticados pueden crear pedidos.
 export const requireAuthenticatedPublicCustomer = [
   publicMenuAuthRequired,
+  requireActiveSession,
   publicMenuCsrfProtect,
   (req, res, next) => {
     const tipoUsuario = String(req.user?.tipo_usuario || '').trim().toUpperCase();
@@ -151,5 +154,6 @@ export const requireAuthenticatedPublicCustomer = [
     };
 
     return next();
-  }
+  },
+  touchSessionMiddleware
 ];

@@ -30,6 +30,7 @@ import {
   attachSalsaInventorySnapshotsToPublicLines,
   resolveSalsasInventory
 } from '../ventas/services/salsasInventoryService.js';
+import { fetchCoalescedPublicCatalog } from './publicMenuCatalogRequestCoalescer.js';
 
 // Tabla de mensajes legibles para no exponer codigos internos al frontend.
 const AVAILABILITY_REASON_LABEL = Object.freeze({
@@ -1449,62 +1450,80 @@ export const getMenuVigenteByBranchService = async (idSucursal) => {
 };
 
 // Servicio: construir catalogo publico real usando menu_vigente + detalle_menu.
-export const getPublicCatalogService = async ({ idSucursal, tipoPedido = null }) => {
-  const activeMenu = await fetchActiveMenuByBranchQuery(idSucursal);
+const buildPublicCatalog = async ({ idSucursal, tipoPedido = null }) => {
+  const client = await pool.connect();
 
-  if (!activeMenu) {
-    return {
-      menu: null,
-      tipo_pedido: tipoPedido,
-      stats: {
-        total: 0,
-        disponibles: 0,
-        agotados: 0
-      },
-      items: []
-    };
-  }
+  try {
+    const activeMenu = await fetchActiveMenuByBranchQuery(idSucursal, client);
 
-  const rows = await fetchCatalogRowsByMenuQuery(Number(activeMenu.id_menu), Number(idSucursal));
-  const [sauceConfigByDetail, extrasByRecipe] = await Promise.all([
-    buildCatalogSauceConfigByDetail(rows, idSucursal),
-    buildCatalogExtrasByRecipe(rows, Number(idSucursal))
-  ]);
+    if (!activeMenu) {
+      return {
+        menu: null,
+        tipo_pedido: tipoPedido,
+        stats: {
+          total: 0,
+          disponibles: 0,
+          agotados: 0
+        },
+        items: []
+      };
+    }
 
-  const recipeIds = rows
-    .filter((row) => row.tipo_item === PUBLIC_ITEM_TYPES.RECETA && row.id_receta)
-    .map((row) => Number(row.id_receta));
+    const rows = await fetchCatalogRowsByMenuQuery(
+      Number(activeMenu.id_menu),
+      Number(idSucursal),
+      client
+    );
+    const [sauceConfigByDetail, extrasByRecipe] = await Promise.all([
+      buildCatalogSauceConfigByDetail(rows, idSucursal, client),
+      buildCatalogExtrasByRecipe(rows, Number(idSucursal), client)
+    ]);
 
-  const recipeAvailabilityRows = await fetchRecipeAvailabilityQuery(
-    [...new Set(recipeIds)], Number(idSucursal)
-  );
+    const recipeIds = rows
+      .filter((row) => row.tipo_item === PUBLIC_ITEM_TYPES.RECETA && row.id_receta)
+      .map((row) => Number(row.id_receta));
 
-  const recipeAvailabilityMap = toAvailabilityMap(recipeAvailabilityRows, 'id_receta');
-
-  const items = rows
-    .filter(isRowVisibleInPublicMenu)
-    .map((row) =>
-    mapCatalogItem({
-      row,
-      recipeAvailabilityMap,
-      sauceConfigByDetail,
-      extrasByRecipe
-    })
+    const recipeAvailabilityRows = await fetchRecipeAvailabilityQuery(
+      [...new Set(recipeIds)],
+      Number(idSucursal),
+      client
     );
 
-  const disponibles = items.filter((item) => item.disponibilidad.available).length;
+    const recipeAvailabilityMap = toAvailabilityMap(recipeAvailabilityRows, 'id_receta');
 
-  return {
-    menu: mapMenuSummary(activeMenu),
-    tipo_pedido: tipoPedido,
-    stats: {
-      total: items.length,
-      disponibles,
-      agotados: items.length - disponibles
-    },
-    items
-  };
+    const items = rows
+      .filter(isRowVisibleInPublicMenu)
+      .map((row) =>
+      mapCatalogItem({
+        row,
+        recipeAvailabilityMap,
+        sauceConfigByDetail,
+        extrasByRecipe
+      })
+      );
+
+    const disponibles = items.filter((item) => item.disponibilidad.available).length;
+
+    return {
+      menu: mapMenuSummary(activeMenu),
+      tipo_pedido: tipoPedido,
+      stats: {
+        total: items.length,
+        disponibles,
+        agotados: items.length - disponibles
+      },
+      items
+    };
+  } finally {
+    client.release();
+  }
 };
+
+export const getPublicCatalogService = ({ idSucursal, tipoPedido = null }) =>
+  fetchCoalescedPublicCatalog(
+    { idSucursal, tipoPedido },
+    () => buildPublicCatalog({ idSucursal, tipoPedido })
+  );
 
 // Servicio: detalle de un item puntual del menu vigente por sucursal.
 export const getPublicCatalogItemDetailService = async ({ idSucursal, idDetalleMenu }) => {
