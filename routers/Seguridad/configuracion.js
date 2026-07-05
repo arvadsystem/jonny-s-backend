@@ -12,6 +12,11 @@ import { securityReadLimiter, securityWriteLimiter } from './securityRateLimit.j
 
 const router = express.Router();
 
+const allowPasswordPolicyReadDuringRequiredChange = (req, res, next) => {
+  if (Boolean(req.user?.must_change_password)) return next();
+  return checkPermission(['SEGURIDAD_VER', 'SEGURIDAD_CONFIG_EDITAR'])(req, res, next);
+};
+
 /**
  * GET /seguridad/configuracion/password
  * Retorna políticas actuales (password_*).
@@ -19,7 +24,7 @@ const router = express.Router();
 router.get(
   '/configuracion/password',
   securityReadLimiter,
-  checkPermission(['SEGURIDAD_VER', 'SEGURIDAD_CONFIG_EDITAR']),
+  allowPasswordPolicyReadDuringRequiredChange,
   async (req, res) => {
   try {
     const sql = `
