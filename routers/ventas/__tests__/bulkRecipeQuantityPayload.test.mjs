@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { describe, it } from 'node:test';
 import { validarYDescontarPedido } from '../../../services/inventarioPedidoService.js';
+import { buildLineMovementRows } from '../../../services/inventarioMovimientoService.js';
 import { normalizePedidoPayload } from '../../../services/pedidoPayloadValidator.js';
 import { resolvePedidoConsumo } from '../../../services/pedidoConsumoResolver.js';
 import { buildSalsaConsumptionItemsFromPedidoDetails } from '../../../services/salsasPedidoSnapshotService.js';
@@ -204,9 +205,9 @@ describe('ventas bulk recipe quantity payload', () => {
     const result = await resolvePedidoConsumo({
       client: makeResolverClient(),
       items: [
-        { tipo_item: 'RECETA', id_item: 12, id_receta: 12, cantidad: 99 },
-        { tipo_item: 'EXTRA', id_item: 8, id_extra: 8, cantidad: 99 },
-        { tipo_item: 'SALSA', id_item: 5, id_salsa: 5, id_insumo: 400, id_almacen: 3, cantidad: 49.5 }
+        { tipo_item: 'RECETA', id_item: 12, id_receta: 12, id_detalle_pedido: 701, cantidad: 99 },
+        { tipo_item: 'EXTRA', id_item: 8, id_extra: 8, id_detalle_pedido: 702, cantidad: 99 },
+        { tipo_item: 'SALSA', id_item: 5, id_salsa: 5, id_insumo: 400, id_almacen: 3, id_detalle_pedido: 703, cantidad: 49.5 }
       ]
     });
 
@@ -216,6 +217,53 @@ describe('ventas bulk recipe quantity payload', () => {
     assert.equal(result.consumo.insumoQtyMap.get(200), 297);
     assert.equal(result.consumo.insumoQtyMap.get(300), 49.5);
     assert.equal(result.consumo.insumoQtyMap.get(400), 49.5);
+    assert.deepEqual(
+      result.consumo.movimientoRows.map((row) => ({
+        detalle: row.id_detalle_pedido,
+        origen: row.origen_consumo,
+        insumo: row.id_insumo,
+        cantidad: row.cantidad
+      })),
+      [
+        { detalle: 703, origen: 'SALSA', insumo: 400, cantidad: 49.5 },
+        { detalle: 702, origen: 'EXTRA', insumo: 300, cantidad: 49.5 },
+        { detalle: 701, origen: 'RECETA', insumo: 200, cantidad: 297 }
+      ]
+    );
+  });
+
+  it('construye movimientos trazados por linea sin agregar recursos compartidos', () => {
+    const rows = buildLineMovementRows({
+      idPedido: 9001,
+      actorUserId: 4,
+      movementRows: [
+        { tipo_recurso: 'producto', id_producto: 10, id_detalle_pedido: 801, cantidad: 1, origen_consumo: 'PRODUCTO' },
+        { tipo_recurso: 'producto', id_producto: 10, id_detalle_pedido: 802, cantidad: 2, origen_consumo: 'PRODUCTO' },
+        { tipo_recurso: 'insumo', id_insumo: 20, id_detalle_pedido: 803, cantidad: 3, origen_consumo: 'RECETA' },
+        { tipo_recurso: 'insumo', id_insumo: 20, id_detalle_pedido: 804, cantidad: 4, origen_consumo: 'EXTRA' }
+      ],
+      productosById: new Map([[10, { id_producto: 10, id_almacen: 5 }]]),
+      insumosById: new Map([[20, { id_insumo: 20, id_almacen: 6 }]])
+    });
+
+    assert.deepEqual(
+      rows.map((row) => ({
+        id_ref: row.id_ref,
+        id_pedido_trazabilidad: row.id_pedido_trazabilidad,
+        id_detalle_pedido: row.id_detalle_pedido,
+        origen_consumo: row.origen_consumo,
+        id_almacen: row.id_almacen,
+        id_producto: row.id_producto,
+        id_insumo: row.id_insumo,
+        cantidad: row.cantidad
+      })),
+      [
+        { id_ref: 9001, id_pedido_trazabilidad: 9001, id_detalle_pedido: 801, origen_consumo: 'PRODUCTO', id_almacen: 5, id_producto: 10, id_insumo: null, cantidad: 1 },
+        { id_ref: 9001, id_pedido_trazabilidad: 9001, id_detalle_pedido: 802, origen_consumo: 'PRODUCTO', id_almacen: 5, id_producto: 10, id_insumo: null, cantidad: 2 },
+        { id_ref: 9001, id_pedido_trazabilidad: 9001, id_detalle_pedido: 803, origen_consumo: 'RECETA', id_almacen: 6, id_producto: null, id_insumo: 20, cantidad: 3 },
+        { id_ref: 9001, id_pedido_trazabilidad: 9001, id_detalle_pedido: 804, origen_consumo: 'EXTRA', id_almacen: 6, id_producto: null, id_insumo: 20, cantidad: 4 }
+      ]
+    );
   });
 
   it('extrae consumo total desde configuracion_menu sin reconstruir por una sola orden', () => {
