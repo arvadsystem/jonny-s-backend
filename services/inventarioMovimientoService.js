@@ -73,7 +73,27 @@ export const fetchExistingPedidoMovement = async (client, idPedido) => {
   return rs.rows[0]?.id_movimiento ? Number(rs.rows[0].id_movimiento) : null;
 };
 
-const insertMovimiento = async (client, movement) => {
+const insertMovimientosBatch = async (client, movements) => {
+  const rows = Array.isArray(movements) ? movements : [];
+  if (!rows.length) return 0;
+  const values = [];
+  const placeholders = rows.map((movement, rowIndex) => {
+    const offset = rowIndex * 10;
+    values.push(
+      Number(movement.cantidad),
+      Number(movement.id_almacen),
+      movement.id_producto ? Number(movement.id_producto) : null,
+      movement.id_insumo ? Number(movement.id_insumo) : null,
+      Number(movement.id_detalle_pedido),
+      movement.origen_consumo,
+      movement.ref_origen || MOVEMENT_REF,
+      Number(movement.id_ref),
+      Number(movement.id_pedido_trazabilidad),
+      String(movement.descripcion || '').trim() || null
+    );
+    return `('SALIDA', $${offset + 1}, $${offset + 2}, $${offset + 3}, $${offset + 4}, $${offset + 5}, $${offset + 6}, $${offset + 7}, $${offset + 8}, $${offset + 9}, $${offset + 10})`;
+  }).join(', ');
+
   await client.query(
     `
       INSERT INTO public.movimientos_inventario (
@@ -89,21 +109,11 @@ const insertMovimiento = async (client, movement) => {
         id_pedido_trazabilidad,
         descripcion
       )
-      VALUES ('SALIDA', $1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+      VALUES ${placeholders}
     `,
-    [
-      Number(movement.cantidad),
-      Number(movement.id_almacen),
-      movement.id_producto ? Number(movement.id_producto) : null,
-      movement.id_insumo ? Number(movement.id_insumo) : null,
-      Number(movement.id_detalle_pedido),
-      movement.origen_consumo,
-      movement.ref_origen || MOVEMENT_REF,
-      Number(movement.id_ref),
-      Number(movement.id_pedido_trazabilidad),
-      String(movement.descripcion || '').trim() || null
-    ]
+    values
   );
+  return rows.length;
 };
 
 const resolveProductMovementId = (rowProducto, inputProductId) => (
@@ -249,8 +259,10 @@ export const registrarMovimientosPedido = async ({
   refOrigen = MOVEMENT_REF,
   shortagesByResource = new Map(),
   excludedProductIds = new Set(),
-  excludedInsumoIds = new Set()
+  excludedInsumoIds = new Set(),
+  perf = null
 }) => {
+  const buildStartedAt = perf?.now?.() || 0;
   const tracedRows = buildLineMovementRows({
     movementRows,
     productosById,
@@ -262,6 +274,7 @@ export const registrarMovimientosPedido = async ({
     excludedProductIds,
     excludedInsumoIds
   });
+  perf?.add?.('inventario_movimientos_build_ms', buildStartedAt);
 
   const expectedMovementCount = [...productoQtyMap.keys()]
     .filter((id) => !excludedProductIds.has(Number(id))).length
@@ -274,10 +287,11 @@ export const registrarMovimientosPedido = async ({
     );
   }
 
-  for (const movement of tracedRows) {
-    await insertMovimiento(client, movement);
-  }
+  const insertStartedAt = perf?.now?.() || 0;
+  const insertedCount = await insertMovimientosBatch(client, tracedRows);
+  perf?.add?.('inventario_movimientos_insert_ms', insertStartedAt);
+  perf?.inc?.('inventario_movimientos_count', insertedCount);
 
-  return tracedRows.length;
+  return insertedCount;
 };
 

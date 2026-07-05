@@ -2,7 +2,10 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { describe, it } from 'node:test';
 import { validarYDescontarPedido } from '../../../services/inventarioPedidoService.js';
-import { buildLineMovementRows } from '../../../services/inventarioMovimientoService.js';
+import {
+  buildLineMovementRows,
+  registrarMovimientosPedido
+} from '../../../services/inventarioMovimientoService.js';
 import { normalizePedidoPayload } from '../../../services/pedidoPayloadValidator.js';
 import { resolvePedidoConsumo } from '../../../services/pedidoConsumoResolver.js';
 import { buildSalsaConsumptionItemsFromPedidoDetails } from '../../../services/salsasPedidoSnapshotService.js';
@@ -264,6 +267,72 @@ describe('ventas bulk recipe quantity payload', () => {
         { id_ref: 9001, id_pedido_trazabilidad: 9001, id_detalle_pedido: 804, origen_consumo: 'EXTRA', id_almacen: 6, id_producto: null, id_insumo: 20, cantidad: 4 }
       ]
     );
+  });
+
+  it('inserta movimientos de inventario en una sola sentencia batch', async () => {
+    const inserts = [];
+    const client = {
+      async query(sql, params = []) {
+        if (String(sql).includes('INSERT INTO public.movimientos_inventario')) {
+          inserts.push({ sql: String(sql), params });
+        }
+        return { rows: [], rowCount: 2 };
+      }
+    };
+
+    const count = await registrarMovimientosPedido({
+      client,
+      idPedido: 9100,
+      actorUserId: 4,
+      productoQtyMap: new Map(),
+      insumoQtyMap: new Map([[20, 7]]),
+      productosById: new Map(),
+      insumosById: new Map([[20, { id_insumo: 20, id_almacen: 6 }]]),
+      movementRows: [
+        { tipo_recurso: 'insumo', id_insumo: 20, id_detalle_pedido: 811, cantidad: 3, origen_consumo: 'RECETA' },
+        { tipo_recurso: 'insumo', id_insumo: 20, id_detalle_pedido: 812, cantidad: 4, origen_consumo: 'RECETA' }
+      ]
+    });
+
+    assert.equal(count, 2);
+    assert.equal(inserts.length, 1);
+    assert.match(inserts[0].sql, /VALUES\s+\('SALIDA', \$1, \$2, \$3, \$4, \$5, \$6, \$7, \$8, \$9, \$10\), \('SALIDA', \$11,/);
+    assert.equal(inserts[0].params[4], 811);
+    assert.equal(inserts[0].params[5], 'RECETA');
+    assert.equal(inserts[0].params[7], 9100);
+    assert.equal(inserts[0].params[8], 9100);
+    assert.equal(inserts[0].params[14], 812);
+  });
+
+  it('propaga error de lote para que la venta haga rollback transaccional', async () => {
+    let insertAttempts = 0;
+    const client = {
+      async query(sql) {
+        if (String(sql).includes('INSERT INTO public.movimientos_inventario')) {
+          insertAttempts += 1;
+          const error = new Error('batch failed');
+          error.code = '23514';
+          throw error;
+        }
+        return { rows: [], rowCount: 0 };
+      }
+    };
+
+    await assert.rejects(
+      () => registrarMovimientosPedido({
+        client,
+        idPedido: 9101,
+        productoQtyMap: new Map(),
+        insumoQtyMap: new Map([[20, 3]]),
+        productosById: new Map(),
+        insumosById: new Map([[20, { id_insumo: 20, id_almacen: 6 }]]),
+        movementRows: [
+          { tipo_recurso: 'insumo', id_insumo: 20, id_detalle_pedido: 811, cantidad: 3, origen_consumo: 'RECETA' }
+        ]
+      }),
+      /batch failed/
+    );
+    assert.equal(insertAttempts, 1);
   });
 
   it('extrae consumo total desde configuracion_menu sin reconstruir por una sola orden', () => {

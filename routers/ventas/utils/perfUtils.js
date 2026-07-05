@@ -60,6 +60,30 @@ export const measureVentasPerf = async (perf, name, task) => {
   }
 };
 
+const SQL_INSTRUMENTED = Symbol('ventas.sql.instrumented');
+
+export const instrumentVentasSqlClient = (client, perf) => {
+  if (!client || typeof client.query !== 'function' || !perf?.enabled || client[SQL_INSTRUMENTED]) {
+    return client;
+  }
+
+  const originalQuery = client.query.bind(client);
+  Object.defineProperty(client, SQL_INSTRUMENTED, {
+    value: true,
+    enumerable: false
+  });
+  client.query = async (...args) => {
+    const startedAt = perf.now();
+    try {
+      return await originalQuery(...args);
+    } finally {
+      perf.inc('sql_query_count');
+      perf.add('sql_total_ms', startedAt);
+    }
+  };
+  return client;
+};
+
 export const createVentasPerfTracker = () => {
   const enabled = isVentasPerfEnabled();
   if (enabled) logVentasPerfStartupIfEnabled();
@@ -78,6 +102,11 @@ export const createVentasPerfTracker = () => {
       const elapsed = Math.max(0, Math.round(performance.now() - startedAtMs));
       measures[name] = (measures[name] || 0) + elapsed;
     },
+    addValue(name, valueMs) {
+      if (!enabled) return;
+      const elapsed = Math.max(0, Math.round(Number(valueMs || 0)));
+      measures[name] = (measures[name] || 0) + elapsed;
+    },
     inc(name, by = 1) {
       if (!enabled) return;
       counters[name] = (counters[name] || 0) + Number(by || 1);
@@ -92,9 +121,18 @@ export const createVentasPerfTracker = () => {
         return acc;
       }, {});
 
+      const totalMs = enabled ? Math.max(0, Math.round(performance.now() - startedAt)) : 0;
+      const attributedStageNames = VENTAS_PERF_STAGE_NAMES.filter((name) => (
+        name !== 'tiempo_no_atribuido_ms'
+        && name !== 'transaction_ms'
+        && !name.startsWith('sql_')
+      ));
+      const attributedMs = attributedStageNames.reduce((acc, name) => acc + Number(measures[name] || 0), 0);
+      stages.tiempo_no_atribuido_ms = Math.max(0, totalMs - attributedMs);
+
       return {
         ...extra,
-        total_ms: enabled ? Math.max(0, Math.round(performance.now() - startedAt)) : 0,
+        total_ms: totalMs,
         ...stages,
         ...counterSummary
       };

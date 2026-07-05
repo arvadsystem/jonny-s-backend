@@ -127,9 +127,19 @@ export const VENTAS_PERF_STAGE_NAMES = [
   'detalle_factura_descuentos_ms',
   'detalle_factura_lookup_ms',
   'detalle_factura_insert_ms',
+  'detalle_factura_extras_ms',
   'detalle_factura_origen_ms',
   'cobro_ms',
+  'pool_wait_ms',
+  'transaction_ms',
   'inventario_ms',
+  'inventario_payload_ms',
+  'inventario_resolver_ms',
+  'inventario_stock_lock_ms',
+  'inventario_movimientos_build_ms',
+  'inventario_movimientos_insert_ms',
+  'sql_total_ms',
+  'tiempo_no_atribuido_ms',
   'fidelizacion_ms',
   'ticket_response_build_ms',
   'pre_rpc_total_ms',
@@ -148,7 +158,9 @@ export const VENTAS_PERF_STAGE_NAMES = [
 ];
 export const VENTAS_PERF_COUNTER_NAMES = [
   'cache_hits',
-  'cache_misses'
+  'cache_misses',
+  'sql_query_count',
+  'inventario_movimientos_count'
 ];
 export const PEDIDO_PENDIENTE_ESTADO_PAGO = 'PENDIENTE_PAGO';
 export const PEDIDO_PAGADO_CONFIRMADO_ESTADO_PAGO = 'PAGADO_CONFIRMADO';

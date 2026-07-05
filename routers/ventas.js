@@ -141,6 +141,7 @@ import {
 } from './ventas/utils/parseUtils.js';
 import {
   createVentasPerfTracker,
+  instrumentVentasSqlClient,
   isPedidoPendienteRpcV1Enabled,
   isVentasPerfEnabled,
   isVentasRpcTransactionEnabled,
@@ -1097,7 +1098,11 @@ const registerVentaFidelizacionAfterCommit = async ({
   let transactionStarted = false;
 
   try {
+    const poolWaitStart = ventasPerf.now();
     client = await pool.connect();
+    ventasPerf.add('pool_wait_ms', poolWaitStart);
+    instrumentVentasSqlClient(client, ventasPerf);
+    const transactionStart = ventasPerf.now();
     await client.query('BEGIN');
     transactionStarted = true;
     await client.query(
@@ -1117,6 +1122,7 @@ const registerVentaFidelizacionAfterCommit = async ({
 
     await client.query('COMMIT');
     transactionStarted = false;
+    ventasPerf.add('transaction_ms', transactionStart);
 
     logVentasFidelizacionAsyncPerf({
       id_factura: facturaId,
@@ -2028,9 +2034,13 @@ const validarYDescontarInventarioCajaPedido = async ({
   client,
   idPedido,
   idSucursal,
-  idUsuario
+  idUsuario,
+  perf = null
 }) => {
+  const inventoryStartedAt = perf?.now?.() || 0;
+  const payloadStartedAt = perf?.now?.() || 0;
   const consumoPayloadResult = await buildPedidoConsumoPayload(client, idPedido, idSucursal);
+  perf?.add?.('inventario_payload_ms', payloadStartedAt);
   if (!consumoPayloadResult.ok) {
     throw {
       httpStatus: consumoPayloadResult.status || 409,
@@ -2043,7 +2053,8 @@ const validarYDescontarInventarioCajaPedido = async ({
   try {
     const inventoryResult = await validarYDescontarPedido(consumoPayloadResult.payload, {
       id_usuario: idUsuario,
-      dbClient: client
+      dbClient: client,
+      perf
     });
     if (!inventoryResult?.ok) {
       throw {
@@ -2063,6 +2074,8 @@ const validarYDescontarInventarioCajaPedido = async ({
       };
     }
     throw error;
+  } finally {
+    perf?.add?.('inventario_ms', inventoryStartedAt);
   }
 };
 
@@ -2565,6 +2578,106 @@ const insertDetallePedidoExtras = async ({ client, idDetallePedido, extras = [] 
   );
 };
 
+const insertDetallePedidoExtrasBatch = async ({ client, lineRefs = [] }) => {
+  const flatRows = [];
+  for (const ref of Array.isArray(lineRefs) ? lineRefs : []) {
+    const detalleId = parseOptionalPositiveInt(ref?.id_detalle_pedido);
+    if (!detalleId) continue;
+    for (const extra of Array.isArray(ref?.extras_detalle) ? ref.extras_detalle : []) {
+      if (!parseOptionalPositiveInt(extra?.id_extra) || Number(extra?.cantidad || 0) <= 0) continue;
+      flatRows.push({ detalleId, extra });
+    }
+  }
+  if (!flatRows.length) return 0;
+  if (!(await hasTable(client, 'detalle_pedido_extras'))) return 0;
+
+  const rowsNeedingCatalog = flatRows
+    .map(({ extra }) => extra)
+    .filter((extra) => {
+      const idInsumo = parseOptionalPositiveInt(extra.id_insumo);
+      const hasConsumption = Number(extra.cant ?? extra.cantidad_insumo ?? 0) > 0;
+      const hasUnit = Boolean(parseOptionalPositiveInt(extra.id_unidad_medida));
+      return !idInsumo || !hasConsumption || !hasUnit || !String(extra.codigo || '').trim() || !String(extra.nombre || '').trim();
+    });
+  const catalogByExtraId = await fetchMenuExtrasSnapshotByIds(
+    client,
+    rowsNeedingCatalog.map((extra) => extra.id_extra)
+  );
+
+  const values = buildBatchPlaceholders(flatRows.length, 11);
+  const params = [];
+  for (const { detalleId, extra } of flatRows) {
+    const idExtra = Number(extra.id_extra);
+    const catalog = catalogByExtraId.get(idExtra) || null;
+    const codigo = String(extra.codigo || catalog?.codigo || '').trim() || null;
+    const nombre = String(extra.nombre || catalog?.nombre || 'Extra').trim().slice(0, 120);
+    const cantidad = Number(extra.cantidad);
+    const precioUnitario = roundMoney(extra.precio_unitario ?? catalog?.precio_unitario);
+    const subtotal = roundMoney(extra.subtotal ?? precioUnitario * cantidad);
+    const idInsumo = parseOptionalPositiveInt(extra.id_insumo) || parseOptionalPositiveInt(catalog?.id_insumo);
+    const cant = idInsumo ? Number(extra.cant ?? extra.cantidad_insumo ?? catalog?.cant ?? 0) || null : null;
+    const idUnidadMedida = idInsumo ? parseOptionalPositiveInt(extra.id_unidad_medida) || parseOptionalPositiveInt(catalog?.id_unidad_medida) : null;
+    params.push(
+      detalleId,
+      idExtra,
+      codigo,
+      nombre,
+      cantidad,
+      precioUnitario,
+      subtotal,
+      idInsumo || null,
+      cant,
+      idUnidadMedida,
+      JSON.stringify({
+        id_extra: idExtra,
+        codigo,
+        nombre,
+        cantidad,
+        cantidad_por_orden: Number(extra.cantidad_por_orden ?? (extra.cantidad || 0)),
+        cantidad_total: Number(extra.cantidad_total ?? (extra.cantidad || 0)),
+        precio_unitario: precioUnitario,
+        subtotal,
+        id_insumo: idInsumo || null,
+        cant,
+        id_unidad_medida: idUnidadMedida
+      })
+    );
+  }
+
+  await client.query(
+    `
+      INSERT INTO public.detalle_pedido_extras (
+        id_detalle_pedido,
+        id_extra,
+        codigo_extra_snapshot,
+        nombre_extra_snapshot,
+        cantidad,
+        precio_unitario,
+        subtotal,
+        id_insumo,
+        cant,
+        id_unidad_medida,
+        origen_snapshot
+      )
+      VALUES ${values}
+      ON CONFLICT (id_detalle_pedido, id_extra)
+      DO UPDATE SET
+        codigo_extra_snapshot = EXCLUDED.codigo_extra_snapshot,
+        nombre_extra_snapshot = EXCLUDED.nombre_extra_snapshot,
+        cantidad = EXCLUDED.cantidad,
+        precio_unitario = EXCLUDED.precio_unitario,
+        subtotal = EXCLUDED.subtotal,
+        id_insumo = EXCLUDED.id_insumo,
+        cant = EXCLUDED.cant,
+        id_unidad_medida = EXCLUDED.id_unidad_medida,
+        origen_snapshot = EXCLUDED.origen_snapshot,
+        estado = true
+    `,
+    params
+  );
+  return flatRows.length;
+};
+
 const insertDetalleFacturaExtras = async ({ client, idDetalleFactura, idDetallePedido = null, extras = [] }) => {
   const detalleId = parseOptionalPositiveInt(idDetalleFactura);
   const rows = (Array.isArray(extras) ? extras : []).filter((extra) => parseOptionalPositiveInt(extra?.id_extra) && Number(extra?.cantidad || 0) > 0);
@@ -2629,6 +2742,85 @@ const insertDetalleFacturaExtras = async ({ client, idDetalleFactura, idDetalleP
     `,
     params
   );
+};
+
+const insertDetalleFacturaExtrasBatch = async ({ client, detailRows = [], insertedRows = [] }) => {
+  const flatRows = [];
+  const detallePedidoIds = new Set();
+  const extraIds = new Set();
+  for (let index = 0; index < (Array.isArray(detailRows) ? detailRows.length : 0); index += 1) {
+    const detalleFacturaId = parseOptionalPositiveInt(insertedRows?.[index]?.id_detalle_factura);
+    if (!detalleFacturaId) continue;
+    const detallePedidoId = parseOptionalPositiveInt(insertedRows?.[index]?.id_detalle_pedido || detailRows[index]?.pedidoRef?.id_detalle_pedido);
+    for (const extra of Array.isArray(detailRows[index]?.line?.extras_detalle) ? detailRows[index].line.extras_detalle : []) {
+      const idExtra = parseOptionalPositiveInt(extra?.id_extra);
+      if (!idExtra || Number(extra?.cantidad || 0) <= 0) continue;
+      flatRows.push({ detalleFacturaId, detallePedidoId, extra });
+      if (detallePedidoId) detallePedidoIds.add(detallePedidoId);
+      extraIds.add(idExtra);
+    }
+  }
+  if (!flatRows.length) return 0;
+  if (!(await hasTable(client, 'detalle_factura_extras'))) return 0;
+
+  const pedidoExtraIdsByKey = new Map();
+  if (detallePedidoIds.size > 0 && extraIds.size > 0 && (await hasTable(client, 'detalle_pedido_extras'))) {
+    const pedidoExtras = await client.query(
+      `
+        SELECT id_detalle_pedido, id_extra, id_detalle_pedido_extra
+        FROM public.detalle_pedido_extras
+        WHERE id_detalle_pedido = ANY($1::int[])
+          AND id_extra = ANY($2::int[])
+          AND COALESCE(estado, true) = true
+      `,
+      [[...detallePedidoIds], [...extraIds]]
+    );
+    for (const row of pedidoExtras.rows) {
+      pedidoExtraIdsByKey.set(
+        `${Number(row.id_detalle_pedido)}:${Number(row.id_extra)}`,
+        parseOptionalPositiveInt(row.id_detalle_pedido_extra)
+      );
+    }
+  }
+
+  const values = buildBatchPlaceholders(flatRows.length, 7);
+  const params = [];
+  for (const { detalleFacturaId, detallePedidoId, extra } of flatRows) {
+    const idExtra = Number(extra.id_extra);
+    params.push(
+      detalleFacturaId,
+      parseOptionalPositiveInt(extra.id_detalle_pedido_extra) || pedidoExtraIdsByKey.get(`${detallePedidoId}:${idExtra}`) || null,
+      idExtra,
+      String(extra.nombre || 'Extra').trim().slice(0, 120),
+      Number(extra.cantidad),
+      roundMoney(extra.precio_unitario),
+      roundMoney(extra.subtotal)
+    );
+  }
+  await client.query(
+    `
+      INSERT INTO public.detalle_factura_extras (
+        id_detalle_factura,
+        id_detalle_pedido_extra,
+        id_extra,
+        nombre_extra_snapshot,
+        cantidad,
+        precio_unitario,
+        subtotal
+      )
+      VALUES ${values}
+      ON CONFLICT (id_detalle_factura, id_extra)
+      DO UPDATE SET
+        id_detalle_pedido_extra = COALESCE(EXCLUDED.id_detalle_pedido_extra, detalle_factura_extras.id_detalle_pedido_extra),
+        nombre_extra_snapshot = EXCLUDED.nombre_extra_snapshot,
+        cantidad = EXCLUDED.cantidad,
+        precio_unitario = EXCLUDED.precio_unitario,
+        subtotal = EXCLUDED.subtotal,
+        estado = true
+    `,
+    params
+  );
+  return flatRows.length;
 };
 
 const fetchDetallePedidoExtras = async (client, detallePedidoIds = []) => {
@@ -7987,12 +8179,14 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
         client,
         idPedido: rpcResponseBody.id_pedido,
         idSucursal: pedidoPendiente.id_sucursal,
-        idUsuario: userId
+        idUsuario: userId,
+        perf: ventasPerf
       });
       const commitStart = ventasPerf.now();
       await client.query('COMMIT');
       ventasPerf.add('commit_ms', commitStart);
       ventasPerf.add('pedido_pendiente_commit_ms', commitStart);
+      ventasPerf.add('transaction_ms', transactionStart);
 
       const idempotencySuccessStart = ventasPerf.now();
       await saveVentasIdempotencySuccess({
@@ -8180,13 +8374,13 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
         pedidoLineRefs.push({ id_detalle_pedido: idDetallePedido });
       });
 
-      for (let index = 0; index < detallePedidoRows.length; index += 1) {
-        await insertDetallePedidoExtras({
-          client,
-          idDetallePedido: pedidoLineRefs[index]?.id_detalle_pedido,
-          extras: detallePedidoRows[index].line.extras_detalle
-        });
-      }
+      await insertDetallePedidoExtrasBatch({
+        client,
+        lineRefs: pedidoLineRefs.map((ref, index) => ({
+          ...ref,
+          extras_detalle: detallePedidoRows[index]?.line?.extras_detalle || []
+        }))
+      });
     }
     ventasPerf.add('detalle_pedido_ms', detalleStart);
 
@@ -8314,13 +8508,15 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
       client,
       idPedido,
       idSucursal: pedidoPendiente.id_sucursal,
-      idUsuario: userId
+      idUsuario: userId,
+      perf: ventasPerf
     });
 
     const commitStart = ventasPerf.now();
     await client.query('COMMIT');
     ventasPerf.add('commit_ms', commitStart);
     ventasPerf.add('pedido_pendiente_commit_ms', commitStart);
+    ventasPerf.add('transaction_ms', transactionStart);
 
     const responseBody = {
       message: 'Pedido pendiente creado correctamente.',
@@ -8427,9 +8623,13 @@ router.post('/ventas/pedidos/:id/registrar-pago', checkPermission(['VENTAS_CREAR
     return res.status(400).json({ error: true, message: 'cobrar_division_orden debe ser un entero mayor a 0.' });
   }
 
+  const poolWaitStart = ventasPerf.now();
   const client = await pool.connect();
+  ventasPerf.add('pool_wait_ms', poolWaitStart);
+  instrumentVentasSqlClient(client, ventasPerf);
 
   try {
+    const transactionStart = ventasPerf.now();
     await client.query('BEGIN');
 
     const contextoStart = ventasPerf.now();
@@ -9387,11 +9587,17 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
     if (ventaHasSalsasInventario) {
       ventasPerfContext.rpc_enabled = false;
       ventasPerfContext.rpc_version = 'legacy_salsas_inventario';
+      ventasPerfContext.rpc_disabled_reason = 'SALSAS_INVENTARIO_NO_SOPORTADAS_RPC_V2';
     } else if (ventaHasExtras && ventasRpcV2Enabled) {
       ventasPerfContext.rpc_version = 'v2_extras';
     } else if (ventaHasExtras) {
       ventasPerfContext.rpc_enabled = false;
       ventasPerfContext.rpc_version = 'legacy_extras';
+      ventasPerfContext.rpc_disabled_reason = ventasRpcV2Enabled
+        ? 'EXTRAS_NO_SOPORTADOS_RPC_V1'
+        : 'FEATURE_FLAG_DISABLED';
+    } else if (!ventasRpcV2Enabled && !ventasRpcV1Enabled) {
+      ventasPerfContext.rpc_disabled_reason = 'FEATURE_FLAG_DISABLED';
     }
 
     if (ventasRpcV2Enabled && !ventaHasSalsasInventario) {
@@ -9407,7 +9613,8 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
         client,
         idPedido: idPedidoRpc,
         idSucursal: venta.id_sucursal,
-        idUsuario: userId
+        idUsuario: userId,
+        perf: ventasPerf
       });
       if (ventaHasExtras) {
         const fidelizacionPedidoId = parseOptionalPositiveInt(rpcCreateResult.fidelizacionJob?.idPedido);
@@ -9423,6 +9630,7 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
       const commitStart = ventasPerf.now();
       await client.query('COMMIT');
       ventasPerf.add('commit_ms', commitStart);
+      ventasPerf.add('transaction_ms', transactionStart);
 
       await saveVentasIdempotencySuccess({
         client,
@@ -9461,12 +9669,14 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
         client,
         idPedido: rpcCreateResult.response?.id_pedido,
         idSucursal: venta.id_sucursal,
-        idUsuario: userId
+        idUsuario: userId,
+        perf: ventasPerf
       });
 
       const commitStart = ventasPerf.now();
       await client.query('COMMIT');
       ventasPerf.add('commit_ms', commitStart);
+      ventasPerf.add('transaction_ms', transactionStart);
 
       await saveVentasIdempotencySuccess({
         client,
@@ -9698,13 +9908,7 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
           }
         });
       });
-      for (const ref of pedidoLineRefs) {
-        await insertDetallePedidoExtras({
-          client,
-          idDetallePedido: ref.id_detalle_pedido,
-          extras: ref.extras_detalle
-        });
-      }
+      await insertDetallePedidoExtrasBatch({ client, lineRefs: pedidoLineRefs });
     }
     ventasPerf.add('detalle_pedido_insert_ms', detallePedidoInsertStart);
     ventasPerf.add('detalle_pedido_ms', detallePedidoStart);
@@ -9712,7 +9916,8 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
       client,
       idPedido,
       idSucursal: venta.id_sucursal,
-      idUsuario: userId
+      idUsuario: userId,
+      perf: ventasPerf
     });
     const facturaInsertStart = ventasPerf.now();
     const facturaResult = await client.query(
@@ -9895,6 +10100,14 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
       );
       ventasPerf.add('detalle_factura_insert_ms', detalleFacturaInsertStart);
 
+      const detalleFacturaExtrasStart = ventasPerf.now();
+      await insertDetalleFacturaExtrasBatch({
+        client,
+        detailRows: detalleFacturaRows,
+        insertedRows: detalleFacturaResult.rows
+      });
+      ventasPerf.add('detalle_factura_extras_ms', detalleFacturaExtrasStart);
+
       const detalleFacturaOrigenStart = ventasPerf.now();
       const detalleFacturaOrigenRows = detalleFacturaResult.rows.filter((row) =>
         Number(row.id_detalle_factura || 0) > 0
@@ -10017,6 +10230,7 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
     const commitStart = ventasPerf.now();
     await client.query('COMMIT');
     ventasPerf.add('commit_ms', commitStart);
+    ventasPerf.add('transaction_ms', transactionStart);
 
     await saveVentasIdempotencySuccess({
       client,
