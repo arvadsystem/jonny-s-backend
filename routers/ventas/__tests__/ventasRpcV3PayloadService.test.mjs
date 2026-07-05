@@ -110,6 +110,93 @@ describe('ventas RPC V3/V2 payload builders', () => {
     assert.equal(payload.items[0].consumos.find((entry) => entry.origen_consumo === 'EXTRA').cantidad, 0.5);
   });
 
+  it('conserva snapshot y un unico consumo EXTRA para extra independiente', () => {
+    const payload = buildVentaRpcV3Payload({
+      venta: baseVenta([{
+        kind: 'ITEM',
+        cart_key: 'extra-bacon',
+        id_extra: 1,
+        id_producto: null,
+        id_receta: null,
+        cantidad: 2,
+        precio_unitario: 30,
+        sub_total: 60,
+        total_linea: 60,
+        subtotal_extras: 0,
+        es_linea_extra_independiente: true,
+        extras_detalle: [{
+          id_extra: 1,
+          cantidad: 2,
+          cantidad_total: 2,
+          id_insumo: 257,
+          id_almacen: 1,
+          cantidad_insumo: 1,
+          cant: 1,
+          id_unidad_medida: 1
+        }],
+        complementos_detalle: []
+      }]),
+      idempotencyKey: 'idem-extra-1',
+      requestHash: 'f'.repeat(64)
+    });
+
+    const item = payload.items[0];
+    assert.equal(item.tipo_item, 'ITEM');
+    assert.equal(item.id_extra, 1);
+    assert.equal(item.id_producto, null);
+    assert.equal(item.id_receta, null);
+    assert.equal(item.configuracion_menu.extras.length, 1);
+    assert.equal(item.configuracion_menu.extras[0].id_extra, 1);
+    assert.equal(item.configuracion_menu.extras[0].cantidad_total, 2);
+    assert.equal(item.consumos.length, 1);
+    assert.equal(item.consumos[0].origen_consumo, 'EXTRA');
+    assert.equal(item.consumos[0].id_extra, 1);
+    assert.equal(item.consumos[0].cantidad, 2);
+    assert.equal(item.consumos.filter((entry) => entry.origen_consumo === 'EXTRA').length, 1);
+    assert.equal(item.consumos.some((entry) => entry.origen_consumo === 'SALSA'), false);
+    assert.equal(item.consumos.some((entry) => entry.origen_consumo === 'PRODUCTO'), false);
+    assert.equal(item.consumos.some((entry) => entry.origen_consumo === 'RECETA'), false);
+  });
+
+  it('calcula cantidad total para extra independiente con cantidad mayor a uno', () => {
+    const payload = buildVentaRpcV3Payload({
+      venta: baseVenta([{
+        kind: 'ITEM',
+        cart_key: 'extra-ranch',
+        id_extra: 1,
+        id_producto: null,
+        id_receta: null,
+        cantidad: 3,
+        precio_unitario: 30,
+        sub_total: 90,
+        total_linea: 90,
+        subtotal_extras: 0,
+        es_linea_extra_independiente: true,
+        extras_detalle: [{
+          id_extra: 1,
+          cantidad: 3,
+          cantidad_total: 3,
+          id_insumo: 257,
+          id_almacen: 1,
+          cantidad_insumo: 1.5,
+          cant: 1.5,
+          id_unidad_medida: 1
+        }],
+        complementos_detalle: []
+      }]),
+      idempotencyKey: 'idem-extra-2',
+      requestHash: 'g'.repeat(64)
+    });
+
+    const item = payload.items[0];
+    assert.equal(item.configuracion_menu.extras.length, 1);
+    assert.equal(item.configuracion_menu.extras[0].cantidad_total, 3);
+    assert.equal(item.consumos.length, 1);
+    assert.equal(item.consumos[0].origen_consumo, 'EXTRA');
+    assert.equal(item.consumos[0].id_extra, 1);
+    assert.equal(item.consumos[0].cantidad, 4.5);
+  });
+
   it('no consolida line_ref diferentes para el mismo insumo', () => {
     const venta = baseVenta([
       recetaLine({ cart_key: 'a' }),
