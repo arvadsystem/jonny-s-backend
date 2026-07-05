@@ -38,7 +38,7 @@ export const fetchRecetaMap = async (client, ids) => {
           SELECT jsonb_agg(jsonb_build_object(
             'id_insumo', dr.id_insumo,
             'cantidad', dr.cant
-          ) ORDER BY dr.id_detalle_receta)
+          ) ORDER BY dr.id_detalle)
           FROM public.detalle_recetas dr
           WHERE dr.id_receta = r.id_receta
             AND COALESCE(dr.estado, true) IS TRUE
@@ -98,7 +98,7 @@ export const fetchVentaCatalogMaps = async (client, { productoIds = [], recetaId
                   AND COALESCE(ia.estado, true) IS TRUE
                   AND (${sucursalParam} IS NULL OR a.id_sucursal = ${sucursalParam})
               )
-            ) ORDER BY dr.id_detalle_receta)
+            ) ORDER BY dr.id_detalle)
             FROM public.detalle_recetas dr
             WHERE dr.id_receta = r.id_receta
               AND COALESCE(dr.estado, true) IS TRUE
