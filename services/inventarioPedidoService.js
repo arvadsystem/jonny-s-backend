@@ -178,13 +178,12 @@ export const validarYDescontarPedido = async (payload, options = {}) => {
       consumoResult.consumo.insumoQtyMap,
       excludedInsumoIds
     );
-    const generatedMovementCount = movimientoProductoQtyMap.size + movimientoInsumoQtyMap.size;
     const shortagesByResource = new Map(
       stockShortages.map((item) => [`${item.tipo_recurso}:${item.id_recurso}`, item])
     );
 
     // 4) Registrar movimientos de salida ligados al pedido.
-    await registrarMovimientosPedido({
+    const generatedMovementCount = await registrarMovimientosPedido({
       client,
       idPedido,
       actorUserId,
@@ -193,8 +192,11 @@ export const validarYDescontarPedido = async (payload, options = {}) => {
       productosById: stockResult.lockedRows.productosById,
       insumosById: stockResult.lockedRows.insumosById,
       insumoTraceById: consumoResult.insumoTraceById,
+      movementRows: consumoResult.consumo.movimientoRows,
       refOrigen: stockShortages.length > 0 ? movementRefForShortage : MOVEMENT_REF,
-      shortagesByResource
+      shortagesByResource,
+      excludedProductIds,
+      excludedInsumoIds
     });
 
     if (manageTransaction) await client.query('COMMIT');
