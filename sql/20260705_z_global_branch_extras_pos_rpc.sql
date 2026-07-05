@@ -425,11 +425,19 @@ BEGIN
         FROM public.menu_extra_almacenes mea
         INNER JOIN public.almacenes a ON a.id_almacen = mea.id_almacen
           AND a.id_sucursal = p_id_sucursal AND COALESCE(a.estado, true) IS TRUE
-        WHERE mea.id_extra = v_id_extra AND COALESCE(mea.estado, true) IS TRUE;
-        IF v_assignment_count = 0 THEN
+        WHERE mea.id_extra = v_id_extra
+          AND mea.id_almacen = v_id_almacen
+          AND COALESCE(mea.estado, true) IS TRUE;
+        IF v_assignment_count <> 1 THEN
           RAISE EXCEPTION USING
             ERRCODE = 'P0001', MESSAGE = 'POS_RPC_EXTRA_NO_DISPONIBLE_SUCURSAL',
-            DETAIL = format('line_ref=%s; id_extra=%s', v_line_ref, v_id_extra);
+            DETAIL = format(
+              'line_ref=%s; id_extra=%s; id_almacen=%s; id_sucursal=%s',
+              v_line_ref,
+              v_id_extra,
+              v_id_almacen,
+              p_id_sucursal
+            );
         END IF;
 
         v_configured_resolved := public.fn_pos_resolver_insumo_inventario_v1(v_configured_id, v_id_almacen, p_id_sucursal);

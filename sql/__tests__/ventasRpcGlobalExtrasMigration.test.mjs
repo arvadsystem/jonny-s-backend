@@ -26,6 +26,9 @@ describe('ventas global extras POS RPC migration', () => {
 
   it('preserves branch assignment, legacy movement replay, and negative stock semantics', () => {
     assert.match(migration, /FROM\s+public\.menu_extra_almacenes\s+mea/i);
+    assert.match(migration, /mea\.id_almacen\s*=\s*v_id_almacen/i);
+    assert.match(migration, /v_assignment_count\s*<>\s*1/i);
+    assert.match(migration, /id_extra=%s;\s+id_almacen=%s;\s+id_sucursal=%s/i);
     assert.match(migration, /id_pedido_trazabilidad\s*=\s*p_id_pedido/i);
     assert.match(migration, /id_ref\s*=\s*dp\.id_detalle_pedido/i);
     assert.match(migration, /permite que el saldo quede negativo/i);
