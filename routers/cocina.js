@@ -448,7 +448,8 @@ const extractPedidoNotes = (descripcionPedido) =>
   String(descripcionPedido || '')
     .split('|')
     .map((segment) => segment.trim())
-    .filter(Boolean);
+    .filter(Boolean)
+    .filter((note) => !isTechnicalOrderNote(note));
 
 const splitObservationSegments = (value) => {
   const source = String(value || '').trim();
@@ -467,6 +468,26 @@ const isTechnicalKitchenObservation = (value) => {
     source.includes('PUBCFG:v1') ||
     /^(extras|salsas|complementos|config|cfg)=/i.test(source) ||
     /(?:^|[|,\s])(extras|salsas|complementos)=\d+(?:\*\d+)?(?:[;,|]\d+(?:\*\d+)?)*($|[|,\s])/i.test(source)
+  );
+};
+
+const isTechnicalOrderNote = (note) => {
+  const source = String(note || '').trim().toLowerCase();
+  if (!source) return false;
+
+  return (
+    source.includes('[public-menu]') ||
+    source.includes('[menu-publico]') ||
+    source.startsWith('idem:') ||
+    source.startsWith('idempotency:') ||
+    source.startsWith('idempotencia:') ||
+    source.startsWith('tel:') ||
+    source.startsWith('telefono:') ||
+    source.includes('schema_version') ||
+    source.includes('menu_publico_linea_v1') ||
+    source.includes('pubcfg:v1') ||
+    /(?:^|[\s|,;])salsas=/.test(source) ||
+    /(?:^|[\s|,;])extras=/.test(source)
   );
 };
 
@@ -905,8 +926,8 @@ router.get('/cocina/pedidos', checkPermission(COCINA_VIEW_PERMISSIONS), async (r
 
           grouped.set(row.id_pedido, {
             id_pedido: Number(row.id_pedido),
-            numero_ticket: String(row.codigo_venta || '').trim(),
-            codigo_venta: String(row.codigo_venta || '').trim(),
+            numero_ticket: buildTicketNumber(row.id_pedido, row.id_factura, row.codigo_venta),
+            codigo_venta: String(row.codigo_venta || '').trim() || null,
             id_sucursal: Number(row.id_sucursal ?? 0) || null,
             nombre_sucursal: row.nombre_sucursal || 'Sucursal no definida',
             id_estado_pedido: Number(row.id_estado_pedido ?? 0) || null,
@@ -1007,7 +1028,10 @@ router.get('/cocina/pedidos', checkPermission(COCINA_VIEW_PERMISSIONS), async (r
               ...new Set(
                 modificacionesFinales
                   .filter(Boolean)
+                  .map((entry) => String(entry).trim())
+                  .filter(Boolean)
                   .filter((entry) => !isTechnicalKitchenObservation(entry))
+                  .filter((entry) => !isTechnicalOrderNote(entry))
               )
             ];
 
