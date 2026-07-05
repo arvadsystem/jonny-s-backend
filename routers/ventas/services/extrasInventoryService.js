@@ -77,8 +77,7 @@ export const EXTRA_INVENTORY_UNAVAILABLE_MESSAGES = Object.freeze({
   EXTRA_CANTIDAD_CONSUMO_INVALIDA: 'Este extra no tiene una cantidad de consumo valida.',
   EXTRA_UNIDAD_NO_CONFIGURADA: 'Este extra no tiene una unidad de consumo valida.',
   EXTRA_UNIDAD_SIN_CONVERSION: 'Este extra no tiene una conversion de unidad configurada.',
-  EXTRA_UNIDAD_CONVERSION_AMBIGUA: 'Este extra tiene mas de una conversion de unidad aplicable.',
-  EXTRA_STOCK_INSUFICIENTE: 'No hay existencias suficientes para este extra.'
+  EXTRA_UNIDAD_CONVERSION_AMBIGUA: 'Este extra tiene mas de una conversion de unidad aplicable.'
 });
 
 const buildBaseResult = (extra, { useMasterCatalog, idSucursal }) => ({
@@ -215,9 +214,6 @@ const resolveLegacyExtrasInventory = async ({ queryRunner, extras, idSucursal })
       inventario_configurado: true,
       disponible: extra?.estado !== false
     };
-    if (resolved.stock_disponible < resolved.cantidad_consumo_base) {
-      return markUnavailable(resolved, 'EXTRA_STOCK_INSUFICIENTE', { preserveInventoryConfiguration: true });
-    }
     return resolved;
   });
 };
@@ -416,9 +412,6 @@ const resolveMasterExtrasInventory = async ({ queryRunner, extras, idSucursal, m
       inventario_configurado: true,
       disponible: extraIsActive(result)
     };
-    if (result.stock_disponible < result.cantidad_consumo_base) {
-      return markUnavailable(result, 'EXTRA_STOCK_INSUFICIENTE', { preserveInventoryConfiguration: true });
-    }
     return result;
   });
 };

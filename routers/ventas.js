@@ -294,8 +294,7 @@ const resolvePedidoDeliverySnapshotForInsert = async (client, delivery = {}) => 
 };
 
 const PEDIDO_PENDIENTE_ALLOWED_EXTRAS_SCHEMA_TABLES = Object.freeze([
-  'menu_extras',
-  'menu_extra_receta'
+  'menu_extras'
 ]);
 const PEDIDO_PENDIENTE_ALLOWED_EXTRAS_SCHEMA_MIN_TTL_MS = 5 * 60 * 1000;
 const pedidoPendienteAllowedExtrasSchemaCache = new Map();
@@ -307,8 +306,7 @@ const getPedidoPendienteAllowedExtrasSchemaCacheTtlMs = () => {
 };
 
 const clonePedidoPendienteAllowedExtrasSchemaValue = (value) => ({
-  hasMenuExtras: Boolean(value?.hasMenuExtras),
-  hasMenuExtraReceta: Boolean(value?.hasMenuExtraReceta)
+  hasMenuExtras: Boolean(value?.hasMenuExtras)
 });
 
 const resolvePedidoPendienteAllowedExtrasSchema = async (client, perf = null) => {
@@ -333,8 +331,7 @@ const resolvePedidoPendienteAllowedExtrasSchema = async (client, perf = null) =>
     );
     const existingTables = new Set(result.rows.map((row) => String(row.table_name || '').trim()));
     const value = {
-      hasMenuExtras: existingTables.has('menu_extras'),
-      hasMenuExtraReceta: existingTables.has('menu_extra_receta')
+      hasMenuExtras: existingTables.has('menu_extras')
     };
     pedidoPendienteAllowedExtrasSchemaCache.set(cacheKey, {
       value,
@@ -2271,7 +2268,7 @@ const buildExtraLineKey = (kind, idItem, idExtra) =>
 const itemHasRequestedExtras = (item) =>
   Array.isArray(item?.extras) && item.extras.some((extra) => parseOptionalPositiveInt(extra?.id_extra));
 
-const buildAllowedExtrasMap = async (client, { normalizedItems = [], idSucursal = null, perf = null, allowedExtrasSchema = null } = {}) => {
+const buildGlobalExtrasMap = async (client, { normalizedItems = [], idSucursal = null, perf = null, allowedExtrasSchema = null } = {}) => {
   const needsExtras = normalizedItems.some((item) => itemHasRequestedExtras(item));
   if (!needsExtras) return new Map();
   const requestedExtraIds = [...new Set(
@@ -2286,7 +2283,7 @@ const buildAllowedExtrasMap = async (client, { normalizedItems = [], idSucursal 
   const normalizedSucursalId = parseOptionalPositiveInt(idSucursal);
   if (!normalizedSucursalId) return new Map();
 
-  const allowedExtrasQueryStart = perf?.now?.() || 0;
+  const globalExtrasQueryStart = perf?.now?.() || 0;
   let rows = [];
   try {
     rows = await fetchVentaGlobalExtrasCatalog({
@@ -2295,7 +2292,7 @@ const buildAllowedExtrasMap = async (client, { normalizedItems = [], idSucursal 
       extraIds: requestedExtraIds
     });
   } finally {
-    perf?.add?.('pedido_pendiente_allowed_extras_query_ms', allowedExtrasQueryStart);
+    perf?.add?.('pedido_pendiente_global_extras_query_ms', globalExtrasQueryStart);
   }
 
   const uniqueExtrasById = new Map();
@@ -2425,7 +2422,7 @@ const buildStandaloneExtraCatalogMap = async (client, { normalizedItems = [], id
   );
 };
 
-const resolveLineExtras = ({ item, allowedExtrasMap }) => {
+const resolveLineExtras = ({ item, globalExtrasMap }) => {
   const requested = Array.isArray(item.extras) ? item.extras : [];
   if (item.kind === 'PRODUCTO' || item.kind === 'ITEM') {
     if (requested.length > 0) return { ok: false, message: 'Los productos no permiten extras.' };
@@ -2438,7 +2435,7 @@ const resolveLineExtras = ({ item, allowedExtrasMap }) => {
   let subtotal = 0;
 
   for (const entry of requested) {
-    const extra = allowedExtrasMap.get(buildExtraLineKey(item.kind, idItem, entry.id_extra));
+    const extra = globalExtrasMap.get(buildExtraLineKey(item.kind, idItem, entry.id_extra));
     if (!extra || extra.estado !== true) {
       return { ok: false, message: 'Uno o mas extras seleccionados no son validos para este item.' };
     }
@@ -2461,14 +2458,6 @@ const resolveLineExtras = ({ item, allowedExtrasMap }) => {
         status: 409,
         code: 'VENTAS_EXTRA_INVENTARIO_NO_DISPONIBLE',
         message: `El extra ${extra.nombre} no esta disponible en esta sucursal: requiere revisar su configuracion de inventario.`
-      };
-    }
-    if (controlsInventory && Number(extra.stock_disponible ?? 0) < requiredInsumo) {
-      return {
-        ok: false,
-        status: 409,
-        code: 'VENTAS_EXTRA_INVENTARIO_NO_DISPONIBLE',
-        message: `No hay existencias suficientes para el extra ${extra.nombre}.`
       };
     }
     const lineSubtotal = roundMoney(extra.precio_unitario * cantidad);
@@ -2495,44 +2484,7 @@ const resolveLineExtras = ({ item, allowedExtrasMap }) => {
 };
 
 const validateAggregatedExtrasInventory = (lines = []) => {
-  const usageByStockKey = new Map();
-
-  for (const line of Array.isArray(lines) ? lines : []) {
-    for (const extra of Array.isArray(line?.extras_detalle) ? line.extras_detalle : []) {
-      const idInsumo = parseOptionalPositiveInt(extra?.id_insumo);
-      const idAlmacen = parseOptionalPositiveInt(extra?.id_almacen);
-      const consumoBase = Number(extra?.cantidad_insumo ?? extra?.cant ?? 0);
-      const cantidad = Number(extra?.cantidad || 0);
-      if (!idInsumo || !idAlmacen || consumoBase <= 0 || cantidad <= 0) continue;
-
-      const stockKey = `${idInsumo}:${idAlmacen}`;
-      const current = usageByStockKey.get(stockKey) || {
-        idInsumo,
-        idAlmacen,
-        nombre: extra.nombre || 'extra',
-        stockDisponible: Number(extra.stock_disponible ?? 0),
-        requerido: 0
-      };
-      current.requerido = roundMoney(current.requerido + (consumoBase * cantidad));
-      current.stockDisponible = Math.min(current.stockDisponible, Number(extra.stock_disponible ?? 0));
-      usageByStockKey.set(stockKey, current);
-    }
-  }
-
-  for (const usage of usageByStockKey.values()) {
-    if (usage.stockDisponible < usage.requerido) {
-      return {
-        ok: false,
-        status: 409,
-        body: {
-          error: true,
-          code: 'VENTAS_EXTRA_INVENTARIO_NO_DISPONIBLE',
-          message: `No hay existencias suficientes para el extra ${usage.nombre}.`
-        }
-      };
-    }
-  }
-
+  void lines;
   return { ok: true };
 };
 
@@ -3325,7 +3277,7 @@ const hydrateVentaLines = async (client, normalizedItems, perf = null, options =
     ? await resolvePedidoPendienteAllowedExtrasSchema(client, perf)
     : null;
 
-  const [complementContext, allowedExtrasMap, standaloneExtraCatalogMap] = await Promise.all([
+  const [complementContext, globalExtrasMap, standaloneExtraCatalogMap] = await Promise.all([
     buildVentaComplementContext({
       client,
       normalizedItems,
@@ -3336,7 +3288,7 @@ const hydrateVentaLines = async (client, normalizedItems, perf = null, options =
     (async () => {
       const extrasStart = perf?.now?.() || 0;
       try {
-        return await buildAllowedExtrasMap(client, {
+        return await buildGlobalExtrasMap(client, {
           normalizedItems,
           idSucursal: options?.idSucursal,
           perf,
@@ -3445,7 +3397,7 @@ const hydrateVentaLines = async (client, normalizedItems, perf = null, options =
           }
         };
       }
-      const extrasResult = resolveLineExtras({ item, allowedExtrasMap });
+      const extrasResult = resolveLineExtras({ item, globalExtrasMap });
       if (!extrasResult.ok) {
         return {
           ok: false,
@@ -3524,18 +3476,6 @@ const hydrateVentaLines = async (client, normalizedItems, perf = null, options =
           }
         };
       }
-      if (controlsInventory && Number(extra.stock_disponible ?? 0) < requiredInsumo) {
-        return {
-          ok: false,
-          status: 409,
-          body: {
-            error: true,
-            code: 'VENTAS_EXTRA_INVENTARIO_NO_DISPONIBLE',
-            message: `No hay existencias suficientes para el extra ${extra.nombre}.`
-          }
-        };
-      }
-
       const subTotal = roundMoney(precioUnitario * item.cantidad);
       const standaloneExtraDetail = {
         id_extra: extra.id_extra,
@@ -3621,7 +3561,7 @@ const hydrateVentaLines = async (client, normalizedItems, perf = null, options =
         }
       };
     }
-    const extrasResult = resolveLineExtras({ item, allowedExtrasMap });
+    const extrasResult = resolveLineExtras({ item, globalExtrasMap });
     if (!extrasResult.ok) {
       return {
         ok: false,
