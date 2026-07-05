@@ -1,6 +1,13 @@
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { describe, it } from 'node:test';
+import {
+  IDEMPOTENCY_MODE,
+  resolvePedidoPendienteIdempotencyMode,
+  resolveVentaIdempotencyMode,
+  resolvePedidoPendienteRpcSkipReason,
+  shouldUsePedidoPendienteRpcV2
+} from '../services/ventasRpcRoutingService.js';
 
 const readVentasSource = () => readFile(new URL('../../ventas.js', import.meta.url), 'utf8');
 
@@ -15,15 +22,39 @@ describe('ventas RPC route selection', () => {
     assert.match(source.slice(v3Branch, salsaFallback), /persistence_mode = 'rpc_v3'/);
   });
 
-  it('pedido pendiente V2 acepta salsas y excluye solo cuenta dividida', async () => {
-    const source = await readVentasSource();
-    const handlerStart = source.indexOf("router.post('/ventas/pedidos-pendientes'");
-    const v2Condition = source.indexOf('const shouldUsePedidoPendienteRpcV2 =', handlerStart);
-    const v1Condition = source.indexOf('const shouldUsePedidoPendienteRpcV1 =', handlerStart);
-    const v2Block = source.slice(v2Condition, v1Condition);
-    assert.match(v2Block, /pedidoPendienteRpcV2Enabled/);
-    assert.match(v2Block, /!cuentaDivisionPlan/);
-    assert.doesNotMatch(v2Block, /pedidoPendienteHasSalsasInventario/);
-    assert.match(source, /CUENTA_DIVIDIDA_NO_SOPORTADA_RPC_V2/);
+  it('pedido pendiente V2 acepta salsas y excluye solo cuenta dividida', () => {
+    assert.equal(shouldUsePedidoPendienteRpcV2({
+      pedidoPendienteRpcV2Enabled: true,
+      cuentaDivisionPlan: null,
+      pedidoLines: [{ item_index: 0, salsa_snapshot: { id_salsa: 2 } }]
+    }), true);
+    assert.equal(shouldUsePedidoPendienteRpcV2({
+      pedidoPendienteRpcV2Enabled: true,
+      cuentaDivisionPlan: { pagos: [] },
+      pedidoLines: [{ item_index: 0 }]
+    }), false);
+    assert.equal(resolvePedidoPendienteRpcSkipReason({
+      cuentaDivisionPlan: { pagos: [] },
+      pedidoPendienteRpcV2Enabled: true,
+      pedidoPendienteHasSalsasInventario: false,
+      pedidoPendienteRpcEnabled: true
+    }), 'CUENTA_DIVIDIDA_NO_SOPORTADA_RPC_V2');
+  });
+
+  it('flags nuevas apagadas conservan idempotencia externa y rutas previas', () => {
+    assert.equal(resolveVentaIdempotencyMode({
+      ventasRpcV3Enabled: false,
+      idempotencyKey: 'idem-1'
+    }), IDEMPOTENCY_MODE.EXTERNAL);
+    assert.equal(resolvePedidoPendienteIdempotencyMode({
+      pedidoPendienteRpcV2Enabled: false,
+      cuentaDivididaSolicitada: false,
+      idempotencyKey: 'idem-1'
+    }), IDEMPOTENCY_MODE.EXTERNAL);
+    assert.equal(shouldUsePedidoPendienteRpcV2({
+      pedidoPendienteRpcV2Enabled: false,
+      cuentaDivisionPlan: null,
+      pedidoLines: [{ item_index: 0 }]
+    }), false);
   });
 });

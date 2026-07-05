@@ -99,6 +99,17 @@ import {
   executeVentasRpc
 } from './ventas/services/ventasRpcExecutionService.js';
 import {
+  hasCuentaDivididaPayload,
+  reserveIdempotencyForMode,
+  resolvePedidoPendienteIdempotencyMode,
+  resolvePedidoPendienteRpcSkipReason,
+  resolveVentaIdempotencyMode,
+  saveExternalIdempotencyFailureIfNeeded,
+  saveExternalIdempotencySuccessIfNeeded,
+  shouldRunRpcPostCommitSideEffects,
+  shouldUsePedidoPendienteRpcV2
+} from './ventas/services/ventasRpcRoutingService.js';
+import {
   DESCUENTO_ALCANCE_KEYS,
   DESCUENTO_TIPO_KEYS,
   ESTADO_PEDIDO_CODES,
@@ -2946,8 +2957,6 @@ const fetchDetallePedidoExtras = async (client, detallePedidoIds = []) => {
   }
   return grouped;
 };
-
-const hasCuentaDivididaPayload = (body) => Array.isArray(body?.cuenta_dividida);
 
 const buildCuentaDivisionPlan = ({ cuentaDividida, lines, expectedTotal, allowPartial = false }) => {
   if (!Array.isArray(cuentaDividida)) return null;
@@ -8087,6 +8096,7 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
   const pedidoPendienteRpcV2Enabled = isPedidoPendienteRpcV2Enabled();
   const pedidoPendienteRpcV1Enabled = isPedidoPendienteRpcV1Enabled();
   const pedidoPendienteRpcEnabled = pedidoPendienteRpcV2Enabled || pedidoPendienteRpcV1Enabled;
+  const cuentaDivididaSolicitada = hasCuentaDivididaPayload(req.body);
   let pedidoPendientePersistenceMode = 'not_reached';
   let pedidoPendienteRpcSkipReason = null;
   let pedidoPendienteTotalRouteMeasured = false;
@@ -8109,7 +8119,7 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
     items_count: Array.isArray(req.body?.items) ? req.body.items.length : 0,
     rpc_enabled: pedidoPendienteRpcEnabled,
     rpc_version: pedidoPendienteRpcV2Enabled ? 'v2' : pedidoPendienteRpcV1Enabled ? 'v1' : 'legacy',
-    cuenta_dividida: hasCuentaDivididaPayload(req.body)
+    cuenta_dividida: cuentaDivididaSolicitada
   };
   const buildPedidoPendientePerfLogContext = (extra = {}) => {
     const context = {
@@ -8127,6 +8137,11 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
   const idempotencyRequestHash = idempotencyKey
     ? buildIdempotencyRequestHash(req.body)
     : null;
+  const idempotencyMode = resolvePedidoPendienteIdempotencyMode({
+    pedidoPendienteRpcV2Enabled,
+    cuentaDivididaSolicitada,
+    idempotencyKey
+  });
   let idempotencyReservation = null;
   let client = null;
   let transactionStarted = false;
@@ -8165,15 +8180,18 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
 
     const idempotencyStart = ventasPerf.now();
     try {
-      idempotencyReservation = pedidoPendienteRpcV2Enabled
-        ? { enabled: Boolean(idempotencyKey), rpcManaged: true }
-        : await reserveVentasIdempotencyKey({
+      idempotencyReservation = await reserveIdempotencyForMode({
+        mode: idempotencyMode,
+        idempotencyKey,
+        reserveExternal: reserveVentasIdempotencyKey,
+        reserveArgs: {
           idempotencyKey,
           operation: 'POST /ventas/pedidos-pendientes',
           requestHash: idempotencyRequestHash,
           idUsuario: userId,
           idSucursal: req.body?.id_sucursal
-        });
+        }
+      });
     } finally {
       ventasPerf.add('pedido_pendiente_idempotency_ms', idempotencyStart);
     }
@@ -8218,10 +8236,14 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
     if (!prepared.ok) {
       await client.query('ROLLBACK');
       transactionStarted = false;
-      await saveVentasIdempotencyFailure({
+      await saveExternalIdempotencyFailureIfNeeded({
         reservation: idempotencyReservation,
-        httpStatus: prepared.status,
-        errorCode: prepared.body?.code || null
+        saveFailure: saveVentasIdempotencyFailure,
+        args: {
+          reservation: idempotencyReservation,
+          httpStatus: prepared.status,
+          errorCode: prepared.body?.code || null
+        }
       });
       addPedidoPendienteTotalRoute();
       ventasPerf.log(buildPedidoPendientePerfLogContext({
@@ -8253,11 +8275,11 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
     ventasPerfContext.cuenta_dividida = Boolean(cuentaDivisionPlan);
     const pedidoPendienteHasSalsasInventario = getSelectedSalsaIdsFromLines(pedidoPendiente.pedido_lines).length > 0;
 
-    const shouldUsePedidoPendienteRpcV2 =
-      pedidoPendienteRpcV2Enabled
-      && !cuentaDivisionPlan
-      && Array.isArray(pedidoPendiente.pedido_lines)
-      && pedidoPendiente.pedido_lines.length > 0;
+    const usePedidoPendienteRpcV2 = shouldUsePedidoPendienteRpcV2({
+      pedidoPendienteRpcV2Enabled,
+      cuentaDivisionPlan,
+      pedidoLines: pedidoPendiente.pedido_lines
+    });
 
     const shouldUsePedidoPendienteRpcV1 =
       pedidoPendienteRpcV1Enabled
@@ -8266,7 +8288,7 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
       && Array.isArray(pedidoPendiente.pedido_lines)
       && pedidoPendiente.pedido_lines.length > 0;
 
-    if (shouldUsePedidoPendienteRpcV2) {
+    if (usePedidoPendienteRpcV2) {
       pedidoPendientePersistenceMode = 'pending_rpc_v2';
       ventasPerfContext.rpc_inventory_mode = 'inside_rpc';
       const rpcResponseBody = await createPedidoPendienteWithRpcV2Transaction({
@@ -8318,13 +8340,17 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
       ventasPerf.add('transaction_ms', transactionStart);
 
       const idempotencySuccessStart = ventasPerf.now();
-      await saveVentasIdempotencySuccess({
+      await saveExternalIdempotencySuccessIfNeeded({
         reservation: idempotencyReservation,
-        httpStatus: 201,
-        responseBody: rpcResponseBody,
-        idPedido: rpcResponseBody.id_pedido,
-        idUsuario: userId,
-        idSucursal: pedidoPendiente.id_sucursal
+        saveSuccess: saveVentasIdempotencySuccess,
+        args: {
+          reservation: idempotencyReservation,
+          httpStatus: 201,
+          responseBody: rpcResponseBody,
+          idPedido: rpcResponseBody.id_pedido,
+          idUsuario: userId,
+          idSucursal: pedidoPendiente.id_sucursal
+        }
       }).catch((err) => {
         console.error('No se pudo guardar resultado idempotente RPC de pedido pendiente:', err);
       });
@@ -8335,17 +8361,13 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
     }
 
     pedidoPendientePersistenceMode = 'legacy';
-    if (cuentaDivisionPlan) {
-      pedidoPendienteRpcSkipReason = pedidoPendienteRpcV2Enabled
-        ? 'CUENTA_DIVIDIDA_NO_SOPORTADA_RPC_V2'
-        : 'cuenta_dividida';
-    } else if (pedidoPendienteHasSalsasInventario) {
-      pedidoPendienteRpcSkipReason = pedidoPendienteRpcV2Enabled ? null : 'salsas_inventario';
-    } else if (!pedidoPendienteRpcEnabled) {
-      pedidoPendienteRpcSkipReason = 'flag_disabled';
-    } else if (!Array.isArray(pedidoPendiente.pedido_lines) || pedidoPendiente.pedido_lines.length === 0) {
-      pedidoPendienteRpcSkipReason = 'no_lines';
-    }
+    pedidoPendienteRpcSkipReason = resolvePedidoPendienteRpcSkipReason({
+      cuentaDivisionPlan,
+      pedidoPendienteRpcV2Enabled,
+      pedidoPendienteHasSalsasInventario,
+      pedidoPendienteRpcEnabled,
+      pedidoLines: pedidoPendiente.pedido_lines
+    });
 
     const descuentosStart = ventasPerf.now();
     for (const line of pedidoPendiente.pedido_lines) {
@@ -8663,13 +8685,17 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
       cuenta_dividida: cuentaDivididaResponse
     };
     const idempotencySuccessStart = ventasPerf.now();
-    await saveVentasIdempotencySuccess({
+    await saveExternalIdempotencySuccessIfNeeded({
       reservation: idempotencyReservation,
-      httpStatus: 201,
-      responseBody,
-      idPedido,
-      idUsuario: userId,
-      idSucursal: pedidoPendiente.id_sucursal
+      saveSuccess: saveVentasIdempotencySuccess,
+      args: {
+        reservation: idempotencyReservation,
+        httpStatus: 201,
+        responseBody,
+        idPedido,
+        idUsuario: userId,
+        idSucursal: pedidoPendiente.id_sucursal
+      }
     }).catch((err) => {
       console.error('No se pudo guardar resultado idempotente de pedido pendiente:', err);
     });
@@ -8684,15 +8710,17 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
       });
       transactionStarted = false;
     }
-    if (!idempotencyReservation?.rpcManaged) {
-      await saveVentasIdempotencyFailure({
+    await saveExternalIdempotencyFailureIfNeeded({
+      reservation: idempotencyReservation,
+      saveFailure: saveVentasIdempotencyFailure,
+      args: {
         reservation: idempotencyReservation,
         httpStatus: Number.isInteger(err?.httpStatus) ? err.httpStatus : 500,
         errorCode: err?.code || null
-      }).catch((idempotencyErr) => {
-        console.error('No se pudo marcar fallo idempotente de pedido pendiente:', idempotencyErr);
-      });
-    }
+      }
+    }).catch((idempotencyErr) => {
+      console.error('No se pudo marcar fallo idempotente de pedido pendiente:', idempotencyErr);
+    });
     addPedidoPendienteTotalRoute();
     ventasPerf.log(buildPedidoPendientePerfLogContext({
       status: Number.isInteger(err?.httpStatus) ? err.httpStatus : 500,
@@ -9570,6 +9598,10 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
   const idempotencyRequestHash = idempotencyKey
     ? buildIdempotencyRequestHash(req.body)
     : null;
+  const idempotencyMode = resolveVentaIdempotencyMode({
+    ventasRpcV3Enabled,
+    idempotencyKey
+  });
   let idempotencyReservation = null;
   const authContextStart = ventasPerf.now();
   const discountIntent = hasDiscountIntentInPayload(req.body);
@@ -9612,16 +9644,19 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
     ventasPerfContext.id_usuario = userId || null;
     ventasPerf.add('auth_context_ms', authContextStart);
 
-    idempotencyReservation = ventasRpcV3Enabled
-      ? { enabled: Boolean(idempotencyKey), rpcManaged: true }
-      : await reserveVentasIdempotencyKey({
+    idempotencyReservation = await reserveIdempotencyForMode({
+      mode: idempotencyMode,
+      idempotencyKey,
+      reserveExternal: reserveVentasIdempotencyKey,
+      reserveArgs: {
         client,
         idempotencyKey,
         operation: 'POST /ventas',
         requestHash: idempotencyRequestHash,
         idUsuario: userId,
         idSucursal: req.body?.id_sucursal
-      });
+      }
+    });
     if (idempotencyReservation.replay) {
       await client.query('ROLLBACK');
       transactionStarted = false;
@@ -9663,11 +9698,15 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
     if (!prepared.ok) {
       await client.query('ROLLBACK');
       transactionStarted = false;
-      await saveVentasIdempotencyFailure({
-        client,
+      await saveExternalIdempotencyFailureIfNeeded({
         reservation: idempotencyReservation,
-        httpStatus: prepared.status,
-        errorCode: prepared.body?.code || null
+        saveFailure: saveVentasIdempotencyFailure,
+        args: {
+          client,
+          reservation: idempotencyReservation,
+          httpStatus: prepared.status,
+          errorCode: prepared.body?.code || null
+        }
       }).catch((saveError) => {
         console.error('No se pudo guardar fallo idempotente de venta:', saveError);
       });
@@ -9689,11 +9728,15 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
     if (!amountValidation.ok) {
       await client.query('ROLLBACK');
       transactionStarted = false;
-      await saveVentasIdempotencyFailure({
-        client,
+      await saveExternalIdempotencyFailureIfNeeded({
         reservation: idempotencyReservation,
-        httpStatus: amountValidation.status,
-        errorCode: amountValidation.code
+        saveFailure: saveVentasIdempotencyFailure,
+        args: {
+          client,
+          reservation: idempotencyReservation,
+          httpStatus: amountValidation.status,
+          errorCode: amountValidation.code
+        }
       }).catch((saveError) => {
         console.error('No se pudo guardar validacion fallida idempotente de venta:', saveError);
       });
@@ -9781,7 +9824,7 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
       });
       res.status(201).json(rpcV3ResponseBody);
 
-      if (!rpcV3ResponseBody.idempotent_replay) {
+      if (shouldRunRpcPostCommitSideEffects(rpcV3ResponseBody)) {
         void registerVentaFidelizacionAfterCommit(rpcCreateResult.fidelizacionJob);
       }
       return;
@@ -10445,12 +10488,16 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
       transactionStarted = false;
     }
     const mappedErr = mapCajaFinancialLockError(err);
-    if (!transactionCommitted && !idempotencyReservation?.rpcManaged) {
-      await saveVentasIdempotencyFailure({
-        client,
+    if (!transactionCommitted) {
+      await saveExternalIdempotencyFailureIfNeeded({
         reservation: idempotencyReservation,
-        httpStatus: Number.isInteger(mappedErr?.httpStatus) ? mappedErr.httpStatus : 500,
-        errorCode: mappedErr?.code || 'VENTAS_CREATE_ERROR'
+        saveFailure: saveVentasIdempotencyFailure,
+        args: {
+          client,
+          reservation: idempotencyReservation,
+          httpStatus: Number.isInteger(mappedErr?.httpStatus) ? mappedErr.httpStatus : 500,
+          errorCode: mappedErr?.code || 'VENTAS_CREATE_ERROR'
+        }
       }).catch((saveError) => {
         console.error('No se pudo marcar fallo idempotente de venta:', saveError);
       });
