@@ -8043,6 +8043,8 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
     : null;
   let idempotencyReservation = null;
   let client = null;
+  let transactionStarted = false;
+  let transactionStart = 0;
 
   try {
     const discountIntent = hasDiscountIntentInPayload(req.body);
@@ -8060,8 +8062,13 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
       });
     }
 
+    const poolWaitStart = ventasPerf.now();
     client = await pool.connect();
+    ventasPerf.add('pool_wait_ms', poolWaitStart);
+    instrumentVentasSqlClient(client, ventasPerf);
+    transactionStart = ventasPerf.now();
     await client.query('BEGIN');
+    transactionStarted = true;
 
     const contextoStart = ventasPerf.now();
     const scope = await resolveRequestUserSucursalScope(req, client);
@@ -8084,6 +8091,7 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
     }
     if (idempotencyReservation.replay) {
       await client.query('ROLLBACK');
+      transactionStarted = false;
       addPedidoPendienteTotalRoute();
       ventasPerf.log(buildPedidoPendientePerfLogContext({ status: idempotencyReservation.httpStatus || 200 }));
       return res.status(idempotencyReservation.httpStatus || 200).json({
@@ -8093,6 +8101,7 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
     }
     if (idempotencyReservation.conflict) {
       await client.query('ROLLBACK');
+      transactionStarted = false;
       addPedidoPendienteTotalRoute();
       ventasPerf.log(buildPedidoPendientePerfLogContext({
         status: 409,
@@ -8120,6 +8129,7 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
 
     if (!prepared.ok) {
       await client.query('ROLLBACK');
+      transactionStarted = false;
       await saveVentasIdempotencyFailure({
         reservation: idempotencyReservation,
         httpStatus: prepared.status,
@@ -8184,6 +8194,7 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
       });
       const commitStart = ventasPerf.now();
       await client.query('COMMIT');
+      transactionStarted = false;
       ventasPerf.add('commit_ms', commitStart);
       ventasPerf.add('pedido_pendiente_commit_ms', commitStart);
       ventasPerf.add('transaction_ms', transactionStart);
@@ -8514,6 +8525,7 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
 
     const commitStart = ventasPerf.now();
     await client.query('COMMIT');
+    transactionStarted = false;
     ventasPerf.add('commit_ms', commitStart);
     ventasPerf.add('pedido_pendiente_commit_ms', commitStart);
     ventasPerf.add('transaction_ms', transactionStart);
@@ -8546,10 +8558,11 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
     ventasPerf.log(buildPedidoPendientePerfLogContext({ status: 201 }));
     return res.status(201).json(responseBody);
   } catch (err) {
-    if (client) {
+    if (client && transactionStarted) {
       await client.query('ROLLBACK').catch((rollbackErr) => {
         console.error('Error al revertir creacion de pedido pendiente:', rollbackErr);
       });
+      transactionStarted = false;
     }
     await saveVentasIdempotencyFailure({
       reservation: idempotencyReservation,
@@ -9456,10 +9469,17 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
     });
   }
 
+  const poolWaitStart = ventasPerf.now();
   const client = await pool.connect();
+  ventasPerf.add('pool_wait_ms', poolWaitStart);
+  instrumentVentasSqlClient(client, ventasPerf);
+  let transactionStarted = false;
+  let transactionCommitted = false;
+  const transactionStart = ventasPerf.now();
 
   try {
     await client.query('BEGIN');
+    transactionStarted = true;
 
     const authScopeStart = ventasPerf.now();
     const scope = await resolveRequestUserSucursalScope(req, client);
@@ -9478,6 +9498,7 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
     });
     if (idempotencyReservation.replay) {
       await client.query('ROLLBACK');
+      transactionStarted = false;
       ventasPerf.log({
         ...ventasPerfContext,
         status: idempotencyReservation.httpStatus || 200
@@ -9489,6 +9510,7 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
     }
     if (idempotencyReservation.conflict) {
       await client.query('ROLLBACK');
+      transactionStarted = false;
       ventasPerf.log({
         ...ventasPerfContext,
         status: 409,
@@ -9514,6 +9536,7 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
 
     if (!prepared.ok) {
       await client.query('ROLLBACK');
+      transactionStarted = false;
       await saveVentasIdempotencyFailure({
         client,
         reservation: idempotencyReservation,
@@ -9539,6 +9562,7 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
     const amountValidation = validateVentaMontoCobro({ venta });
     if (!amountValidation.ok) {
       await client.query('ROLLBACK');
+      transactionStarted = false;
       await saveVentasIdempotencyFailure({
         client,
         reservation: idempotencyReservation,
@@ -9627,27 +9651,28 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
         }
       }
 
-      const commitStart = ventasPerf.now();
-      await client.query('COMMIT');
-      ventasPerf.add('commit_ms', commitStart);
-      ventasPerf.add('transaction_ms', transactionStart);
-
+      const rpcV2ResponseBody = attachVentaSnapshotsToResponse(rpcCreateResult.response, venta);
       await saveVentasIdempotencySuccess({
         client,
         reservation: idempotencyReservation,
         httpStatus: 201,
-        responseBody: attachVentaSnapshotsToResponse(rpcCreateResult.response, venta),
+        responseBody: rpcV2ResponseBody,
         idPedido: idPedidoRpc,
         idFactura: rpcCreateResult.response?.id_factura,
         idUsuario: userId,
         idSucursal: venta.id_sucursal
-      }).catch((saveError) => {
-        console.error('No se pudo guardar resultado idempotente RPC V2 de venta:', saveError);
       });
+
+      const commitStart = ventasPerf.now();
+      await client.query('COMMIT');
+      transactionStarted = false;
+      transactionCommitted = true;
+      ventasPerf.add('commit_ms', commitStart);
+      ventasPerf.add('transaction_ms', transactionStart);
 
       ventasPerf.add('node_after_rpc_ms', rpcCreateResult.afterRpcStart);
       ventasPerf.log({ ...ventasPerfContext, status: 201 });
-      res.status(201).json(attachVentaSnapshotsToResponse(rpcCreateResult.response, venta));
+      res.status(201).json(rpcV2ResponseBody);
 
       void registerVentaFidelizacionAfterCommit(rpcCreateResult.fidelizacionJob);
       return;
@@ -9673,27 +9698,28 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
         perf: ventasPerf
       });
 
-      const commitStart = ventasPerf.now();
-      await client.query('COMMIT');
-      ventasPerf.add('commit_ms', commitStart);
-      ventasPerf.add('transaction_ms', transactionStart);
-
+      const rpcV1ResponseBody = attachVentaSnapshotsToResponse(rpcCreateResult.response, venta);
       await saveVentasIdempotencySuccess({
         client,
         reservation: idempotencyReservation,
         httpStatus: 201,
-        responseBody: attachVentaSnapshotsToResponse(rpcCreateResult.response, venta),
+        responseBody: rpcV1ResponseBody,
         idPedido: rpcCreateResult.response?.id_pedido,
         idFactura: rpcCreateResult.response?.id_factura,
         idUsuario: userId,
         idSucursal: venta.id_sucursal
-      }).catch((saveError) => {
-        console.error('No se pudo guardar resultado idempotente RPC V1 de venta:', saveError);
       });
+
+      const commitStart = ventasPerf.now();
+      await client.query('COMMIT');
+      transactionStarted = false;
+      transactionCommitted = true;
+      ventasPerf.add('commit_ms', commitStart);
+      ventasPerf.add('transaction_ms', transactionStart);
 
       ventasPerf.add('node_after_rpc_ms', rpcCreateResult.afterRpcStart);
       ventasPerf.log({ ...ventasPerfContext, status: 201 });
-      res.status(201).json(attachVentaSnapshotsToResponse(rpcCreateResult.response, venta));
+      res.status(201).json(rpcV1ResponseBody);
 
       void registerVentaFidelizacionAfterCommit(rpcCreateResult.fidelizacionJob);
       return;
@@ -10227,11 +10253,6 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
     }), venta);
     ventasPerf.add('ticket_response_build_ms', ticketResponseStart);
 
-    const commitStart = ventasPerf.now();
-    await client.query('COMMIT');
-    ventasPerf.add('commit_ms', commitStart);
-    ventasPerf.add('transaction_ms', transactionStart);
-
     await saveVentasIdempotencySuccess({
       client,
       reservation: idempotencyReservation,
@@ -10241,24 +10262,36 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
       idFactura,
       idUsuario: venta.id_usuario || userId,
       idSucursal: venta.id_sucursal
-    }).catch((saveError) => {
-      console.error('No se pudo guardar resultado idempotente de venta:', saveError);
     });
+
+    const commitStart = ventasPerf.now();
+    await client.query('COMMIT');
+    transactionStarted = false;
+    transactionCommitted = true;
+    ventasPerf.add('commit_ms', commitStart);
+    ventasPerf.add('transaction_ms', transactionStart);
 
     ventasPerf.log(ventasPerfContext);
 
     res.status(201).json(createVentaResponse);
   } catch (err) {
-    await client.query('ROLLBACK');
+    if (transactionStarted) {
+      await client.query('ROLLBACK').catch((rollbackErr) => {
+        console.error('Error al revertir creacion de venta:', rollbackErr);
+      });
+      transactionStarted = false;
+    }
     const mappedErr = mapCajaFinancialLockError(err);
-    await saveVentasIdempotencyFailure({
-      client,
-      reservation: idempotencyReservation,
-      httpStatus: Number.isInteger(mappedErr?.httpStatus) ? mappedErr.httpStatus : 500,
-      errorCode: mappedErr?.code || 'VENTAS_CREATE_ERROR'
-    }).catch((saveError) => {
-      console.error('No se pudo marcar fallo idempotente de venta:', saveError);
-    });
+    if (!transactionCommitted) {
+      await saveVentasIdempotencyFailure({
+        client,
+        reservation: idempotencyReservation,
+        httpStatus: Number.isInteger(mappedErr?.httpStatus) ? mappedErr.httpStatus : 500,
+        errorCode: mappedErr?.code || 'VENTAS_CREATE_ERROR'
+      }).catch((saveError) => {
+        console.error('No se pudo marcar fallo idempotente de venta:', saveError);
+      });
+    }
     ventasPerf.log({
       ...ventasPerfContext,
       status: Number.isInteger(mappedErr?.httpStatus) ? mappedErr.httpStatus : 500,
