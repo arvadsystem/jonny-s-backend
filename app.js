@@ -104,6 +104,11 @@ const getAllowedOrigins = () => {
 const allowedOrigins = getAllowedOrigins();
 const isAllowedOrigin = (origin) => allowedOrigins.includes(normalizeOrigin(origin));
 const READINESS_TIMEOUT_MS = 2000;
+const buildInfo = Object.freeze({
+  git_commit_sha: String(process.env.GIT_COMMIT_SHA || process.env.BUILD_SHA || '').trim() || null,
+  app_version: String(process.env.APP_VERSION || process.env.npm_package_version || '').trim() || null,
+  build_sha: String(process.env.BUILD_SHA || '').trim() || null
+});
 let healthCheckQueryRunner = pool;
 
 export const setHealthCheckQueryRunnerForTests = (queryRunner = pool) => {
@@ -122,6 +127,125 @@ const withTimeout = (promise, timeoutMs) => {
   return Promise.race([promise, timeoutPromise]).finally(() => {
     if (timeout) clearTimeout(timeout);
   });
+};
+
+const assertInventoryTracePreflightReady = async () => {
+  const result = await healthCheckQueryRunner.query(`
+    SELECT c.is_generated
+    FROM information_schema.columns c
+    WHERE c.table_schema = 'public'
+      AND c.table_name = 'movimientos_inventario'
+      AND c.column_name = 'id_pedido_trazabilidad'
+    LIMIT 1
+  `);
+  const generationState = String(result.rows?.[0]?.is_generated || '').trim().toUpperCase();
+  if (generationState !== 'NEVER') {
+    const error = new Error('INVENTORY_TRACE_SCHEMA_NOT_READY');
+    error.code = generationState ? 'INVENTORY_TRACE_SCHEMA_NOT_READY' : 'INVENTORY_TRACE_SCHEMA_MISSING';
+    error.generationState = generationState || 'MISSING';
+    throw error;
+  }
+};
+
+const assertPedidosSequencePreflightReady = async () => {
+  const result = await healthCheckQueryRunner.query(`
+    SELECT
+      pg_get_serial_sequence('public.pedidos', 'id_pedido') AS sequence_name,
+      to_regclass('public.pedidos') IS NOT NULL AS pedidos_exists,
+      to_regclass('public.movimientos_inventario') IS NOT NULL AS inventory_exists
+  `);
+  const row = result.rows?.[0] || {};
+  if (!row.pedidos_exists) {
+    const error = new Error('PEDIDOS_TABLE_MISSING');
+    error.code = 'PEDIDOS_TABLE_MISSING';
+    throw error;
+  }
+  if (!row.inventory_exists) {
+    const error = new Error('MOVIMIENTOS_INVENTARIO_TABLE_MISSING');
+    error.code = 'MOVIMIENTOS_INVENTARIO_TABLE_MISSING';
+    throw error;
+  }
+  if (!row.sequence_name) {
+    const error = new Error('PEDIDOS_SEQUENCE_MISSING');
+    error.code = 'PEDIDOS_SEQUENCE_MISSING';
+    throw error;
+  }
+
+  const sequenceMetaResult = await healthCheckQueryRunner.query(`
+    SELECT
+      n.nspname AS sequence_schema,
+      c.relname AS sequence_relation,
+      seq.seqincrement::bigint AS sequence_increment_by,
+      seq.seqcycle::boolean AS sequence_cycle,
+      seq.seqmin::bigint AS sequence_min_value,
+      seq.seqmax::bigint AS sequence_max_value
+    FROM pg_class c
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    JOIN pg_sequence seq ON seq.seqrelid = c.oid
+    WHERE c.oid = $1::regclass
+    LIMIT 1
+  `, [row.sequence_name]);
+  const sequenceMeta = sequenceMetaResult.rows?.[0] || {};
+  if (!sequenceMeta.sequence_schema || !sequenceMeta.sequence_relation) {
+    const error = new Error('PEDIDOS_SEQUENCE_MISSING');
+    error.code = 'PEDIDOS_SEQUENCE_MISSING';
+    throw error;
+  }
+
+  const sequenceIdentifier = `"${String(sequenceMeta.sequence_schema).replaceAll('"', '""')}"."${String(sequenceMeta.sequence_relation).replaceAll('"', '""')}"`;
+  const sequenceStateResult = await healthCheckQueryRunner.query(`
+    SELECT last_value::bigint AS sequence_last_value, is_called::boolean AS sequence_is_called
+    FROM ${sequenceIdentifier}
+  `);
+  const historyResult = await healthCheckQueryRunner.query(`
+    SELECT
+      COALESCE(MAX(id_pedido), 0)::bigint AS max_pedido_id,
+      COALESCE((
+        SELECT MAX(id_ref)::bigint
+        FROM public.movimientos_inventario
+        WHERE ref_origen IN ('PEDIDO', 'FALTANTE_COCINA')
+          AND id_ref IS NOT NULL
+      ), 0)::bigint AS max_inventory_order_ref
+    FROM public.pedidos
+  `);
+
+  const sequenceState = sequenceStateResult.rows?.[0] || {};
+  const history = historyResult.rows?.[0] || {};
+  const sequenceLastValue = Number(sequenceState.sequence_last_value);
+  const sequenceIncrementBy = Number(sequenceMeta.sequence_increment_by);
+  const sequenceMaxValue = Number(sequenceMeta.sequence_max_value);
+  const sequenceIsCalled = sequenceState.sequence_is_called === true;
+  const sequenceCycle = sequenceMeta.sequence_cycle === true;
+  const maxPedidoId = Number(history.max_pedido_id || 0);
+  const maxInventoryOrderRef = Number(history.max_inventory_order_ref || 0);
+  const historyFloor = Math.max(maxPedidoId, maxInventoryOrderRef);
+  const sequenceNextCandidate = sequenceIsCalled ? sequenceLastValue + sequenceIncrementBy : sequenceLastValue;
+  const safeDetails = {
+    sequence_last_value: Number.isFinite(sequenceLastValue) ? sequenceLastValue : null,
+    sequence_is_called: typeof sequenceState.sequence_is_called === 'boolean' ? sequenceIsCalled : null,
+    sequence_increment_by: Number.isFinite(sequenceIncrementBy) ? sequenceIncrementBy : null,
+    sequence_cycle: sequenceCycle,
+    sequence_next_candidate: Number.isFinite(sequenceNextCandidate) ? sequenceNextCandidate : null,
+    max_pedido_id: Number.isFinite(maxPedidoId) ? maxPedidoId : null,
+    max_inventory_order_ref: Number.isFinite(maxInventoryOrderRef) ? maxInventoryOrderRef : null,
+    history_floor: Number.isFinite(historyFloor) ? historyFloor : null
+  };
+
+  let code = null;
+  if (!Number.isFinite(sequenceLastValue)) code = 'PEDIDOS_SEQUENCE_MISSING';
+  else if (!Number.isFinite(sequenceIncrementBy) || sequenceIncrementBy <= 0) code = 'PEDIDOS_SEQUENCE_INVALID_INCREMENT';
+  else if (sequenceCycle) code = 'PEDIDOS_SEQUENCE_CYCLE_UNSAFE';
+  else if (!Number.isFinite(sequenceNextCandidate) || sequenceNextCandidate <= historyFloor) {
+    code = 'PEDIDOS_SEQUENCE_BELOW_INVENTORY_HISTORY';
+  } else if (!Number.isFinite(sequenceMaxValue) || sequenceNextCandidate > sequenceMaxValue) {
+    code = 'PEDIDOS_SEQUENCE_EXHAUSTED';
+  }
+  if (code) {
+    const error = new Error(code);
+    error.code = code;
+    error.safeDetails = safeDetails;
+    throw error;
+  }
 };
 
 // ✅ (Opcional) proxy - no afecta el login
@@ -199,6 +323,8 @@ app.get('/health/live', (req, res) => {
 app.get('/health/ready', async (req, res) => {
   try {
     await withTimeout(healthCheckQueryRunner.query('SELECT 1'), READINESS_TIMEOUT_MS);
+    await withTimeout(assertInventoryTracePreflightReady(), READINESS_TIMEOUT_MS);
+    await withTimeout(assertPedidosSequencePreflightReady(), READINESS_TIMEOUT_MS);
     const poolState = getPoolState();
     return res.status(200).json({
       status: 'ready',
@@ -209,13 +335,16 @@ app.get('/health/ready', async (req, res) => {
         idle: poolState.idleCount,
         waiting: poolState.waitingCount
       },
+      build: buildInfo,
       timestamp: new Date().toISOString()
     });
-  } catch {
+  } catch (error) {
     return res.status(503).json({
       status: 'not_ready',
       database: 'error',
       role: 'web',
+      code: error?.code || 'READINESS_CHECK_FAILED',
+      details: error?.safeDetails || undefined,
       timestamp: new Date().toISOString()
     });
   }

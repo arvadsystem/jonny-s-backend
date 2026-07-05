@@ -39,7 +39,7 @@ export const buildComplementLineConfig = (line) => {
     requiere_complementos: Boolean(metadata?.requiere_complementos),
     minimo_complementos: Number(metadata?.minimo_complementos || 0),
     maximo_complementos: Number(metadata?.maximo_complementos || 0),
-    complementos_incompletos_autorizados: Boolean(metadata?.complementos_incompletos_autorizados),
+    complementos_incompletos_autorizados: Boolean(metadata?.complementos_incompletos_autorizados_backend),
     complementos_recomendados: Number(metadata?.complementos_recomendados ?? metadata?.minimo_complementos ?? 0),
     complementos_seleccionados: Number(metadata?.complementos_seleccionados ?? selected.length),
     complementos: selected.map((entry) => ({
@@ -63,6 +63,19 @@ export const buildComplementLineConfig = (line) => {
         : null,
       id_unidad_medida: parseOptionalPositiveInt(entry?.id_unidad_medida)
     })).filter((entry) => entry.id_extra > 0 && entry.cantidad > 0)
+  };
+};
+
+export const mergePedidoLineInventoryConfig = (line) => {
+  const complementConfig = buildComplementLineConfig(line);
+  const existingConfig = line?.configuracion_menu && typeof line.configuracion_menu === 'object'
+    ? line.configuracion_menu
+    : null;
+  if (!complementConfig && !existingConfig) return null;
+  return {
+    ...(complementConfig || {}),
+    ...(existingConfig || {}),
+    inventario_receta: existingConfig?.inventario_receta ?? null
   };
 };
 
@@ -134,20 +147,20 @@ export const normalizeVentaItems = (items) => {
 
     const complementosResult = parseComplementosPayload(item.complementos);
     if (!complementosResult.ok) {
-      return { ok: false, message: complementosResult.message };
+      return { ok: false, code: complementosResult.code, message: complementosResult.message };
     }
     const extrasResult = parseVentaExtrasPayload(item.extras, { kind });
     if (!extrasResult.ok) {
       return { ok: false, message: extrasResult.message };
     }
     const complementosIncompletosInput = item.complementos_incompletos_autorizados ?? item.permitir_complementos_incompletos;
-    let complementosIncompletosAutorizados = false;
+    let complementosIncompletosSolicitados = false;
     if (complementosIncompletosInput !== undefined && complementosIncompletosInput !== null) {
       const parsedComplementosIncompletos = parseBooleanInput(complementosIncompletosInput);
       if (!parsedComplementosIncompletos.ok) {
         return { ok: false, message: 'complementos_incompletos_autorizados debe ser booleano.' };
       }
-      complementosIncompletosAutorizados = parsedComplementosIncompletos.value;
+      complementosIncompletosSolicitados = parsedComplementosIncompletos.value;
     }
 
     normalized.push({
@@ -160,7 +173,8 @@ export const normalizeVentaItems = (items) => {
       observacion: normalizeObservation(item.observacion),
       id_descuento_catalogo_linea: idDescuentoCatalogoLinea,
       complementos: complementosResult.data,
-      complementos_incompletos_autorizados: complementosIncompletosAutorizados,
+      complementos_incompletos_autorizados: false,
+      complementos_incompletos_solicitados: complementosIncompletosSolicitados,
       extras: extrasResult.data
     });
   }

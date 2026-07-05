@@ -174,8 +174,104 @@ const main = async () => {
     );
     assertEqual(afterRollback.rows?.[0]?.cantidad, 100, 'stock despues de rollback por insuficiencia');
 
+    const fixtureContext = await client.query(
+      `
+        SELECT
+          (SELECT id_estado_pedido FROM public.estados_pedido ORDER BY id_estado_pedido LIMIT 1) AS id_estado_pedido,
+          (SELECT id_sucursal FROM public.almacenes WHERE id_almacen = $1 LIMIT 1) AS id_sucursal,
+          (SELECT id_usuario FROM public.usuarios ORDER BY id_usuario LIMIT 1) AS id_usuario
+      `,
+      [idAlmacen]
+    );
+    const fixture = fixtureContext.rows?.[0] || {};
+    if (!fixture.id_estado_pedido || !fixture.id_sucursal || !fixture.id_usuario) {
+      throw new Error('No se pudo resolver fixture minimo de pedido para probar PEDIDO/FALTANTE_COCINA.');
+    }
+    const pedidoFixture = await client.query(
+      `
+        INSERT INTO public.pedidos (
+          descripcion_pedido,
+          fecha_hora_pedido,
+          sub_total,
+          isv,
+          total,
+          id_estado_pedido,
+          id_sucursal,
+          id_usuario,
+          origen_pedido
+        )
+        VALUES ($1, CURRENT_TIMESTAMP AT TIME ZONE 'America/Tegucigalpa', 1, 0, 1, $2, $3, $4, 'QA_SALSA_INVENTORY')
+        RETURNING id_pedido
+      `,
+      [`QA salsa inventory ${refId}`, fixture.id_estado_pedido, fixture.id_sucursal, fixture.id_usuario]
+    );
+    const idPedidoFixture = Number(pedidoFixture.rows?.[0]?.id_pedido || 0);
+    const detalleFixture = await client.query(
+      `
+        INSERT INTO public.detalle_pedido (
+          sub_total_pedido,
+          total_pedido,
+          id_pedido,
+          estado,
+          observacion
+        )
+        VALUES (1, 1, $1, true, $2)
+        RETURNING id_detalle_pedido
+      `,
+      [idPedidoFixture, `QA salsa inventory ${refId}`]
+    );
+    const idDetallePedido = Number(detalleFixture.rows?.[0]?.id_detalle_pedido || 0);
+
+    for (const refOrigen of ['PEDIDO', 'FALTANTE_COCINA']) {
+      await client.query(`SAVEPOINT salsa_negative_${refOrigen.toLowerCase()}`);
+      await client.query(
+        'UPDATE public.insumos_almacenes SET cantidad = 1 WHERE id_insumo = $1 AND id_almacen = $2',
+        [idInsumo, idAlmacen]
+      );
+      await client.query(
+        `
+          INSERT INTO public.movimientos_inventario (
+            tipo,
+            cantidad,
+            id_almacen,
+            id_insumo,
+            id_detalle_pedido,
+            origen_consumo,
+            ref_origen,
+            id_ref,
+            id_pedido_trazabilidad,
+            descripcion
+          )
+          VALUES ('SALIDA', 2, $1, $2, $3, 'SALSA', $4, $5, $5, $6)
+        `,
+        [idAlmacen, idInsumo, idDetallePedido, refOrigen, idPedidoFixture, `QA stock negativo salsa ${refOrigen}`]
+      );
+      const negativeStock = await client.query(
+        'SELECT cantidad FROM public.insumos_almacenes WHERE id_insumo = $1 AND id_almacen = $2',
+        [idInsumo, idAlmacen]
+      );
+      assertEqual(negativeStock.rows?.[0]?.cantidad, -1, `stock negativo permitido para ${refOrigen}`);
+      const negativeMovement = await client.query(
+        `
+          SELECT saldo_antes, saldo_despues
+          FROM public.movimientos_inventario
+          WHERE ref_origen = $1
+            AND id_ref = $2
+            AND tipo = 'SALIDA'
+            AND id_insumo = $3
+            AND id_almacen = $4
+          ORDER BY id_movimiento DESC
+          LIMIT 1
+        `,
+        [refOrigen, idPedidoFixture, idInsumo, idAlmacen]
+      );
+      assertEqual(negativeMovement.rows?.[0]?.saldo_antes, 1, `${refOrigen} saldo_antes`);
+      assertEqual(negativeMovement.rows?.[0]?.saldo_despues, -1, `${refOrigen} saldo_despues`);
+      await client.query(`ROLLBACK TO SAVEPOINT salsa_negative_${refOrigen.toLowerCase()}`);
+    }
+
     await client.query('ROLLBACK');
-    console.log('[qa:salsas-inventory] OK: trigger aplica 100->98->100 y la insuficiencia revierte la transaccion.');
+    console.log('[qa:salsas-inventory] OK: trigger aplica 100->98->100, bloquea origen arbitrario y permite negativos para PEDIDO/FALTANTE_COCINA.');
   } catch (error) {
     await client.query('ROLLBACK').catch(() => {});
     throw error;

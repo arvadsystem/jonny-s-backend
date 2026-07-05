@@ -187,10 +187,7 @@ const resolveLegacyExtrasInventory = async ({ queryRunner, extras, idSucursal })
     }
     const configuredId = resolved.id_insumo_configurado;
     if (!configuredId) {
-      return {
-        ...resolved,
-        disponible: extra?.estado !== false
-      };
+      return markUnavailable(resolved, 'EXTRA_INSUMO_NO_CONFIGURADO');
     }
 
     const row = inventoryById.get(configuredId);
@@ -215,10 +212,12 @@ const resolveLegacyExtrasInventory = async ({ queryRunner, extras, idSucursal })
       inventario_configurado: true,
       disponible: extra?.estado !== false
     };
-    if (resolved.stock_disponible < resolved.cantidad_consumo_base) {
-      return markUnavailable(resolved, 'EXTRA_STOCK_INSUFICIENTE', { preserveInventoryConfiguration: true });
-    }
-    return resolved;
+    const saldoProyectado = Number(resolved.stock_disponible || 0) - Number(resolved.cantidad_consumo_base || 0);
+    return {
+      ...resolved,
+      stock_insuficiente: saldoProyectado < 0,
+      saldo_proyectado: saldoProyectado
+    };
   });
 };
 
@@ -416,10 +415,12 @@ const resolveMasterExtrasInventory = async ({ queryRunner, extras, idSucursal, m
       inventario_configurado: true,
       disponible: extraIsActive(result)
     };
-    if (result.stock_disponible < result.cantidad_consumo_base) {
-      return markUnavailable(result, 'EXTRA_STOCK_INSUFICIENTE', { preserveInventoryConfiguration: true });
-    }
-    return result;
+    const saldoProyectado = Number(result.stock_disponible || 0) - Number(result.cantidad_consumo_base || 0);
+    return {
+      ...result,
+      stock_insuficiente: saldoProyectado < 0,
+      saldo_proyectado: saldoProyectado
+    };
   });
 };
 

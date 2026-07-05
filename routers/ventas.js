@@ -78,8 +78,8 @@ import {
   signQzRequestHandler
 } from './ventas/handlers/ventasPrintHandlers.js';
 import {
-  buildComplementLineConfig,
   buildComplementSnapshot,
+  mergePedidoLineInventoryConfig,
   normalizeCartKey,
   normalizeVentaItems
 } from './ventas/services/ventasPayloadService.js';
@@ -119,7 +119,8 @@ import {
 } from './ventas/constants.js';
 import { roundMoney } from './ventas/utils/moneyUtils.js';
 import { validarYDescontarPedido } from '../services/inventarioPedidoService.js';
-import { buildPedidoConsumoPayload } from './cocina.js';
+import { buildPedidoConsumoPayload } from '../services/pedidoInventoryPayloadService.js';
+import { attachRecipeInventorySnapshotsToLines } from '../services/recetaInventorySnapshotService.js';
 import {
   coercePositiveIntArray,
   isPlainObject,
@@ -191,6 +192,14 @@ const hasColumn = async (client, tableName, columnName) => {
   const exists = result.rowCount > 0;
   schemaColumnCache.set(key, exists);
   return exists;
+};
+
+const hasDbFunction = async (client, functionSignature) => {
+  const result = await client.query(
+    'SELECT to_regprocedure($1::text) IS NOT NULL AS exists',
+    [functionSignature]
+  );
+  return result.rows?.[0]?.exists === true;
 };
 
 const hasTable = async (client, tableName) => {
@@ -937,7 +946,10 @@ const buildCreatedVentaDetailItems = ({ detalleFacturaRows, detalleFacturaRowsIn
         descuento_global: roundMoney(line.descuento_global),
         subtotal_extras: roundMoney(line.subtotal_extras),
         extras: Array.isArray(line.extras_detalle) ? line.extras_detalle : [],
-        configuracion_menu: entry.pedidoRef?.configuracion_menu || buildComplementLineConfig(line),
+        configuracion_menu: mergePedidoLineInventoryConfig({
+          ...line,
+          configuracion_menu: entry.pedidoRef?.configuracion_menu || line.configuracion_menu
+        }),
         isv_15_linea: null,
         isv_18_linea: null,
         exento_linea: null,
@@ -1249,8 +1261,26 @@ const createVentaWithRpcTransaction = async ({ client, venta, perf, requestStart
     }
   };
 };
-const createVentaWithRpcV2Transaction = async ({ client, venta, perf, requestStartedAt = 0 }) => {
+const VENTA_RPC_FUNCTIONS = Object.freeze({
+  v2: 'public.registrar_venta_pos_v2',
+  v3: 'public.registrar_venta_pos_v3'
+});
+
+const PEDIDO_PENDIENTE_RPC_FUNCTIONS = Object.freeze({
+  v1: 'public.registrar_pedido_pendiente_pos_v1',
+  v2: 'public.registrar_pedido_pendiente_pos_v2'
+});
+
+const createVentaWithRpcV2Transaction = async ({
+  client,
+  venta,
+  perf,
+  requestStartedAt = 0,
+  rpcVersion = 'v2'
+}) => {
   const rpcTotalStart = perf?.now?.() || 0;
+  const normalizedRpcVersion = rpcVersion === 'v3' ? 'v3' : 'v2';
+  const functionName = VENTA_RPC_FUNCTIONS[normalizedRpcVersion];
 
   const rpcPayloadBuildStart = perf?.now?.() || 0;
   const rpcPayload = buildVentaRpcV2Payload({ venta });
@@ -1268,7 +1298,7 @@ const createVentaWithRpcV2Transaction = async ({ client, venta, perf, requestSta
     id_caja: venta.id_caja,
     id_sesion_caja: venta.id_sesion_caja
   };
-  perf?.add?.('rpc_v2_payload_build_ms', rpcPayloadBuildStart);
+  perf?.add?.(`rpc_${normalizedRpcVersion}_payload_build_ms`, rpcPayloadBuildStart);
   perf?.add?.('pre_rpc_total_ms', rpcTotalStart);
   if (requestStartedAt) {
     perf?.add?.('node_before_rpc_ms', requestStartedAt);
@@ -1276,10 +1306,10 @@ const createVentaWithRpcV2Transaction = async ({ client, venta, perf, requestSta
 
   const rpcCallStart = perf?.now?.() || 0;
   const rpcResult = await client.query(
-    'SELECT public.registrar_venta_pos_v2($1::jsonb, $2::jsonb) AS response',
+    `SELECT ${functionName}($1::jsonb, $2::jsonb) AS response`,
     [JSON.stringify(rpcPayload), JSON.stringify(rpcActor)]
   );
-  perf?.add?.('rpc_v2_call_ms', rpcCallStart);
+  perf?.add?.(`rpc_${normalizedRpcVersion}_call_ms`, rpcCallStart);
   const afterRpcStart = perf?.now?.() || 0;
 
   const postRpcResponseStart = perf?.now?.() || 0;
@@ -1287,8 +1317,8 @@ const createVentaWithRpcV2Transaction = async ({ client, venta, perf, requestSta
   if (!isPlainObject(response) || response.ticket_ready !== true) {
     throw {
       httpStatus: 500,
-      code: 'VENTAS_RPC_V2_RESPONSE_INVALID',
-      publicMessage: 'La venta fue procesada por RPC V2, pero la respuesta del ticket no es valida.'
+      code: normalizedRpcVersion === 'v3' ? 'VENTAS_RPC_V3_RESPONSE_INVALID' : 'VENTAS_RPC_V2_RESPONSE_INVALID',
+      publicMessage: `La venta fue procesada por RPC ${normalizedRpcVersion.toUpperCase()}, pero la respuesta del ticket no es valida.`
     };
   }
 
@@ -1296,8 +1326,8 @@ const createVentaWithRpcV2Transaction = async ({ client, venta, perf, requestSta
   if (!idFactura) {
     throw {
       httpStatus: 500,
-      code: 'VENTAS_RPC_V2_FACTURA_INVALIDA',
-      publicMessage: 'La venta fue procesada por RPC V2, pero no devolvio factura valida.'
+      code: normalizedRpcVersion === 'v3' ? 'VENTAS_RPC_V3_FACTURA_INVALIDA' : 'VENTAS_RPC_V2_FACTURA_INVALIDA',
+      publicMessage: `La venta fue procesada por RPC ${normalizedRpcVersion.toUpperCase()}, pero no devolvio factura valida.`
     };
   }
 
@@ -1317,7 +1347,7 @@ const createVentaWithRpcV2Transaction = async ({ client, venta, perf, requestSta
   };
   perf?.add?.('post_rpc_response_ms', postRpcResponseStart);
   perf?.add?.('post_rpc_total_ms', afterRpcStart);
-  perf?.add?.('rpc_v2_total_ms', rpcTotalStart);
+  perf?.add?.(`rpc_${normalizedRpcVersion}_total_ms`, rpcTotalStart);
 
   return {
     response: responsePayload,
@@ -1333,8 +1363,15 @@ const createVentaWithRpcV2Transaction = async ({ client, venta, perf, requestSta
   };
 };
 
-const createPedidoPendienteWithRpcV1Transaction = async ({ client, pedidoPendiente, perf }) => {
+const createPedidoPendienteWithRpcV1Transaction = async ({
+  client,
+  pedidoPendiente,
+  perf,
+  rpcVersion = 'v1'
+}) => {
   const rpcTotalStart = perf?.now?.() || 0;
+  const normalizedRpcVersion = rpcVersion === 'v2' ? 'v2' : 'v1';
+  const functionName = PEDIDO_PENDIENTE_RPC_FUNCTIONS[normalizedRpcVersion];
   const rpcPayloadBuildStart = perf?.now?.() || 0;
   const rpcPayload = buildPedidoPendienteRpcPayload(pedidoPendiente);
   const rpcActor = {
@@ -1347,11 +1384,11 @@ const createPedidoPendienteWithRpcV1Transaction = async ({ client, pedidoPendien
 
   const rpcCallStart = perf?.now?.() || 0;
   const rpcResult = await client.query(
-    'SELECT public.registrar_pedido_pendiente_pos_v1($1::jsonb, $2::jsonb) AS response',
+    `SELECT ${functionName}($1::jsonb, $2::jsonb) AS response`,
     [JSON.stringify(rpcPayload), JSON.stringify(rpcActor)]
   );
-  perf?.add?.('pedido_pendiente_rpc_call_ms', rpcCallStart);
-  perf?.add?.('pedido_pendiente_rpc_total_ms', rpcTotalStart);
+  perf?.add?.(`pedido_pendiente_rpc_${normalizedRpcVersion}_call_ms`, rpcCallStart);
+  perf?.add?.(`pedido_pendiente_rpc_${normalizedRpcVersion}_total_ms`, rpcTotalStart);
 
   const response = rpcResult.rows?.[0]?.response;
   if (!isPlainObject(response) || !parseOptionalPositiveInt(response.id_pedido)) {
@@ -2043,6 +2080,7 @@ const validarYDescontarInventarioCajaPedido = async ({
   try {
     const inventoryResult = await validarYDescontarPedido(consumoPayloadResult.payload, {
       id_usuario: idUsuario,
+      allowNegativeStock: true,
       dbClient: client
     });
     if (!inventoryResult?.ok) {
@@ -2063,6 +2101,37 @@ const validarYDescontarInventarioCajaPedido = async ({
       };
     }
     throw error;
+  }
+};
+
+const buildStockWarningResponse = (inventoryResult) => {
+  const faltantes = Array.isArray(inventoryResult?.warning?.faltantes)
+    ? inventoryResult.warning.faltantes
+    : [];
+  if (faltantes.length === 0) return null;
+  const hasNegative = faltantes.some((item) => String(item?.motivo || '').trim().toUpperCase() === 'STOCK_INSUFICIENTE');
+  return {
+    code: hasNegative ? 'STOCK_INSUFICIENTE_PERMITIDO' : 'STOCK_BAJO',
+    message: hasNegative
+      ? 'La venta se completo y algunos recursos quedaron con saldo negativo.'
+      : 'La venta se completo y algunos recursos quedaron por debajo del stock minimo.',
+    faltantes
+  };
+};
+
+const registrarAlertasInventarioVentaAfterCommit = async ({ idPedido, idUsuario, inventoryResult }) => {
+  const warnings = Array.isArray(inventoryResult?.warning?.faltantes)
+    ? inventoryResult.warning.faltantes
+    : [];
+  if (!parseOptionalPositiveInt(idPedido) || warnings.length === 0) return;
+  try {
+    await registrarAlertasInventarioPedido({
+      id_pedido: idPedido,
+      id_usuario: idUsuario,
+      warnings
+    });
+  } catch (error) {
+    console.error('No se pudieron registrar alertas de inventario de venta:', error?.message || error);
   }
 };
 
@@ -2091,6 +2160,14 @@ const resolveLineComplementos = ({ item, receta, context, nombreItem }) => {
     rules: context.rulesByRecipe.get(Number(item.id_receta || 0)) || [],
     fallbackSauces: context.fallbackSauces
   });
+  if (metadata.ok === false) {
+    return {
+      ok: false,
+      status: 409,
+      code: metadata.code || 'VENTAS_REGLA_SALSA_CONFIGURACION_INVALIDA',
+      message: metadata.message || `La receta ${nombreItem || 'seleccionada'} tiene reglas de salsas incompletas.`
+    };
+  }
 
   const selectedIds = Array.isArray(item.complementos) ? item.complementos : [];
   const allowedMap = new Map(
@@ -2127,11 +2204,12 @@ const resolveLineComplementos = ({ item, receta, context, nombreItem }) => {
   const min = Math.max(0, Number(metadata.minimo_complementos || 0));
   const max = Math.max(min, Number(metadata.maximo_complementos || 0));
   const complementosIncompletos = min > 0 && selected.length < min;
+  const allowIncomplete = item.complementos_incompletos_solicitados === true;
   const boundsResult = validateComplementSelectionBounds({
     selectedCount: selected.length,
     minimo: min,
     maximo: max,
-    allowIncomplete: item.complementos_incompletos_autorizados === true,
+    allowIncomplete,
     nombreItem
   });
   if (!boundsResult.ok) {
@@ -2150,7 +2228,8 @@ const resolveLineComplementos = ({ item, receta, context, nombreItem }) => {
     ok: true,
     metadata: {
       ...metadata,
-      complementos_incompletos_autorizados: Boolean(item.complementos_incompletos_autorizados),
+      complementos_incompletos_autorizados: Boolean(item.complementos_incompletos_solicitados),
+      complementos_incompletos_autorizados_backend: allowIncomplete,
       complementos_recomendados: min,
       complementos_seleccionados: selected.length,
       complementos_incompletos: complementosIncompletos
@@ -2357,14 +2436,8 @@ const resolveLineExtras = ({ item, allowedExtrasMap }) => {
         message: `El extra ${extra.nombre} no esta disponible en esta sucursal: requiere revisar su configuracion de inventario.`
       };
     }
-    if (controlsInventory && Number(extra.stock_disponible ?? 0) < requiredInsumo) {
-      return {
-        ok: false,
-        status: 409,
-        code: 'VENTAS_EXTRA_INVENTARIO_NO_DISPONIBLE',
-        message: `No hay existencias suficientes para el extra ${extra.nombre}.`
-      };
-    }
+    const stockDisponible = controlsInventory ? Number(extra.stock_disponible ?? 0) : null;
+    const saldoProyectado = controlsInventory ? stockDisponible - requiredInsumo : null;
     const lineSubtotal = roundMoney(extra.precio_unitario * cantidad);
     subtotal = roundMoney(subtotal + lineSubtotal);
     selected.push({
@@ -2381,6 +2454,9 @@ const resolveLineExtras = ({ item, allowedExtrasMap }) => {
       cant: controlsInventory ? Number(extra.cantidad_insumo || 0) : null,
       id_unidad_medida: extra.id_unidad_medida,
       stock_disponible: extra.stock_disponible,
+      cantidad_requerida: controlsInventory ? requiredInsumo : null,
+      saldo_proyectado: saldoProyectado,
+      stock_insuficiente: controlsInventory ? saldoProyectado < 0 : false,
       id_almacen: extra.id_almacen
     });
   }
@@ -2413,21 +2489,25 @@ const validateAggregatedExtrasInventory = (lines = []) => {
     }
   }
 
-  for (const usage of usageByStockKey.values()) {
-    if (usage.stockDisponible < usage.requerido) {
-      return {
-        ok: false,
-        status: 409,
-        body: {
-          error: true,
-          code: 'VENTAS_EXTRA_INVENTARIO_NO_DISPONIBLE',
-          message: `No hay existencias suficientes para el extra ${usage.nombre}.`
-        }
-      };
-    }
-  }
+  const warnings = [...usageByStockKey.values()]
+    .map((usage) => ({
+      tipo_recurso: 'insumo',
+      id_recurso: usage.idInsumo,
+      id_insumo: usage.idInsumo,
+      id_almacen: usage.idAlmacen,
+      nombre: usage.nombre,
+      motivo: 'STOCK_INSUFICIENTE',
+      requerido: roundMoney(usage.requerido),
+      cantidad_requerida: roundMoney(usage.requerido),
+      disponible: Number(usage.stockDisponible || 0),
+      stock_disponible: Number(usage.stockDisponible || 0),
+      faltante: Math.max(roundMoney(usage.requerido) - Number(usage.stockDisponible || 0), 0),
+      saldo_proyectado: Number(usage.stockDisponible || 0) - roundMoney(usage.requerido),
+      mensaje: `Stock insuficiente para el extra ${usage.nombre}. Requerido: ${roundMoney(usage.requerido)}, disponible: ${Number(usage.stockDisponible || 0)}.`
+    }))
+    .filter((warning) => warning.saldo_proyectado < 0);
 
-  return { ok: true };
+  return { ok: true, warnings };
 };
 
 const hasVentaExtras = (venta) =>
@@ -3241,17 +3321,8 @@ const hydrateVentaLines = async (client, normalizedItems, perf = null, options =
           }
         };
       }
-      if (controlsInventory && Number(extra.stock_disponible ?? 0) < requiredInsumo) {
-        return {
-          ok: false,
-          status: 409,
-          body: {
-            error: true,
-            code: 'VENTAS_EXTRA_INVENTARIO_NO_DISPONIBLE',
-            message: `No hay existencias suficientes para el extra ${extra.nombre}.`
-          }
-        };
-      }
+      const stockDisponible = controlsInventory ? Number(extra.stock_disponible ?? 0) : null;
+      const saldoProyectado = controlsInventory ? stockDisponible - requiredInsumo : null;
 
       const subTotal = roundMoney(precioUnitario * item.cantidad);
       const standaloneExtraDetail = {
@@ -3266,6 +3337,9 @@ const hydrateVentaLines = async (client, normalizedItems, perf = null, options =
         cant: controlsInventory ? Number(extra.cantidad_insumo || 0) : null,
         id_unidad_medida: extra.id_unidad_medida,
         stock_disponible: extra.stock_disponible,
+        cantidad_requerida: controlsInventory ? requiredInsumo : null,
+        saldo_proyectado: saldoProyectado,
+        stock_insuficiente: controlsInventory ? saldoProyectado < 0 : false,
         id_almacen: extra.id_almacen
       };
 
@@ -3372,7 +3446,7 @@ const hydrateVentaLines = async (client, normalizedItems, perf = null, options =
   if (!extrasInventoryResult.ok) return extrasInventoryResult;
 
   perf?.add?.('totals_items_ms', totalsItemsStart);
-  return { ok: true, data: { lines, subTotals } };
+  return { ok: true, data: { lines, subTotals, warnings: extrasInventoryResult.warnings || [] } };
 };
 
 const normalizePedidoCatalogCode = (value) =>
@@ -3789,7 +3863,17 @@ const buildPedidoPendientePayload = async ({ client, body, userId, sucursalScope
   const validationItemsStart = perf?.now?.() || 0;
   const normalizedItemsResult = normalizeVentaItems(buildPedidoPendienteItemsBody(body));
   perf?.add?.('validation_items_ms', validationItemsStart);
-  if (!normalizedItemsResult.ok) return { ok: false, status: 400, body: { error: true, message: normalizedItemsResult.message } };
+  if (!normalizedItemsResult.ok) {
+    return {
+      ok: false,
+      status: 400,
+      body: {
+        error: true,
+        code: normalizedItemsResult.code || undefined,
+        message: normalizedItemsResult.message
+      }
+    };
+  }
   const hydrateLinesStart = perf?.now?.() || 0;
   const hydratedResult = await hydrateVentaLines(client, normalizedItemsResult.data, perf, {
     idSucursal,
@@ -4289,7 +4373,11 @@ const buildVentaPayload = async ({ client, body, userId, sucursalScope, canApply
     return {
       ok: false,
       status: 400,
-      body: { error: true, message: normalizedItemsResult.message }
+      body: {
+        error: true,
+        code: normalizedItemsResult.code || undefined,
+        message: normalizedItemsResult.message
+      }
     };
   }
 
@@ -4473,7 +4561,10 @@ const buildVentaPayload = async ({ client, body, userId, sucursalScope, canApply
   perf?.add?.('auth_payload_context_ms', authContextStart);
   const totalsStart = perf?.now?.() || 0;
 
-  const hydratedResult = await hydrateVentaLines(client, normalizedItemsResult.data, perf, { idSucursal });
+  const hydratedResult = await hydrateVentaLines(client, normalizedItemsResult.data, perf, {
+    idSucursal,
+    validateProductStock: false
+  });
   if (!hydratedResult.ok) return hydratedResult;
 
   const { lines } = hydratedResult.data;
@@ -7582,6 +7673,7 @@ async function listarPedidosPendientesPago(req, res) {
               'id_cuenta_division_item', vdi.id_cuenta_division_item,
               'id_detalle_pedido', vdi.id_detalle_pedido,
               'nombre_item', vdi.nombre_item_snapshot,
+              'cantidad', vdi.cantidad,
               'total_linea', vdi.total_linea
             )
             ORDER BY vdi.id_cuenta_division_item
@@ -7948,6 +8040,11 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
       lines: pedidoPendiente.pedido_lines,
       idSucursal: pedidoPendiente.id_sucursal
     });
+    pedidoPendiente.pedido_lines = await attachRecipeInventorySnapshotsToLines({
+      client,
+      lines: pedidoPendiente.pedido_lines,
+      idSucursal: pedidoPendiente.id_sucursal
+    });
     const cuentaDivisionPlan = buildCuentaDivisionPlan({
       cuentaDividida: req.body?.cuenta_dividida,
       lines: pedidoPendiente.pedido_lines,
@@ -7962,20 +8059,30 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
     });
     ventasPerfContext.cuenta_dividida = Boolean(cuentaDivisionPlan);
     const pedidoPendienteHasSalsasInventario = getSelectedSalsaIdsFromLines(pedidoPendiente.pedido_lines).length > 0;
+    const pedidoPendienteHasLines = Array.isArray(pedidoPendiente.pedido_lines)
+      && pedidoPendiente.pedido_lines.length > 0;
+    const pedidoPendienteRpcV2Available =
+      pedidoPendienteRpcEnabled
+      && pedidoPendienteHasSalsasInventario
+      && !cuentaDivisionPlan
+      && pedidoPendienteHasLines
+        ? await hasDbFunction(client, 'public.registrar_pedido_pendiente_pos_v2(jsonb,jsonb)')
+        : false;
+    const pedidoPendienteRpcVersion = pedidoPendienteHasSalsasInventario ? 'v2' : 'v1';
 
     const shouldUsePedidoPendienteRpcV1 =
       pedidoPendienteRpcEnabled
-      && !pedidoPendienteHasSalsasInventario
       && !cuentaDivisionPlan
-      && Array.isArray(pedidoPendiente.pedido_lines)
-      && pedidoPendiente.pedido_lines.length > 0;
+      && pedidoPendienteHasLines
+      && (!pedidoPendienteHasSalsasInventario || pedidoPendienteRpcV2Available);
 
     if (shouldUsePedidoPendienteRpcV1) {
-      pedidoPendientePersistenceMode = 'rpc_v1';
+      pedidoPendientePersistenceMode = `rpc_${pedidoPendienteRpcVersion}`;
       const rpcResponseBody = await createPedidoPendienteWithRpcV1Transaction({
         client,
         pedidoPendiente,
-        perf: ventasPerf
+        perf: ventasPerf,
+        rpcVersion: pedidoPendienteRpcVersion
       });
       if (pedidoPendiente.modalidad === 'DELIVERY' && pedidoPendiente.delivery?.costo_envio === null) {
         await client.query(
@@ -7983,12 +8090,14 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
           [rpcResponseBody.id_pedido]
         );
       }
-      await validarYDescontarInventarioCajaPedido({
+      const inventoryResult = await validarYDescontarInventarioCajaPedido({
         client,
         idPedido: rpcResponseBody.id_pedido,
         idSucursal: pedidoPendiente.id_sucursal,
         idUsuario: userId
       });
+      const stockWarning = buildStockWarningResponse(inventoryResult);
+      if (stockWarning) rpcResponseBody.warning = stockWarning;
       const commitStart = ventasPerf.now();
       await client.query('COMMIT');
       ventasPerf.add('commit_ms', commitStart);
@@ -8005,6 +8114,11 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
       }).catch((err) => {
         console.error('No se pudo guardar resultado idempotente RPC de pedido pendiente:', err);
       });
+      await registrarAlertasInventarioVentaAfterCommit({
+        idPedido: rpcResponseBody.id_pedido,
+        idUsuario: userId,
+        inventoryResult
+      });
       ventasPerf.add('pedido_pendiente_idempotency_success_ms', idempotencySuccessStart);
       addPedidoPendienteTotalRoute();
       ventasPerf.log(buildPedidoPendientePerfLogContext({ status: 201 }));
@@ -8014,12 +8128,12 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
     pedidoPendientePersistenceMode = 'legacy';
     if (cuentaDivisionPlan) {
       pedidoPendienteRpcSkipReason = 'cuenta_dividida';
-    } else if (pedidoPendienteHasSalsasInventario) {
-      pedidoPendienteRpcSkipReason = 'salsas_inventario';
     } else if (!pedidoPendienteRpcEnabled) {
       pedidoPendienteRpcSkipReason = 'flag_disabled';
-    } else if (!Array.isArray(pedidoPendiente.pedido_lines) || pedidoPendiente.pedido_lines.length === 0) {
+    } else if (!pedidoPendienteHasLines) {
       pedidoPendienteRpcSkipReason = 'no_lines';
+    } else if (pedidoPendienteHasSalsasInventario) {
+      pedidoPendienteRpcSkipReason = 'rpc_v2_missing';
     }
 
     const descuentosStart = ventasPerf.now();
@@ -8093,7 +8207,7 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
     const pedidoLineRefs = [];
     const detallePedidoRows = pedidoPendiente.pedido_lines.map((line) => ({
       line,
-      configuracionMenu: buildComplementLineConfig(line)
+      configuracionMenu: mergePedidoLineInventoryConfig(line)
     }));
 
     if (detallePedidoRows.length > 0) {
@@ -8310,12 +8424,13 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
       );
     }
 
-    await validarYDescontarInventarioCajaPedido({
+    const inventoryResult = await validarYDescontarInventarioCajaPedido({
       client,
       idPedido,
       idSucursal: pedidoPendiente.id_sucursal,
       idUsuario: userId
     });
+    const stockWarning = buildStockWarningResponse(inventoryResult);
 
     const commitStart = ventasPerf.now();
     await client.query('COMMIT');
@@ -8332,7 +8447,8 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
       modalidad: pedidoPendiente.modalidad,
       total: pedidoPendiente.total,
       monto_pendiente: pedidoPendiente.total,
-      cuenta_dividida: cuentaDivididaResponse
+      cuenta_dividida: cuentaDivididaResponse,
+      warning: stockWarning
     };
     const idempotencySuccessStart = ventasPerf.now();
     await saveVentasIdempotencySuccess({
@@ -8344,6 +8460,11 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
       idSucursal: pedidoPendiente.id_sucursal
     }).catch((err) => {
       console.error('No se pudo guardar resultado idempotente de pedido pendiente:', err);
+    });
+    await registrarAlertasInventarioVentaAfterCommit({
+      idPedido,
+      idUsuario: userId,
+      inventoryResult
     });
     ventasPerf.add('pedido_pendiente_idempotency_success_ms', idempotencySuccessStart);
     addPedidoPendienteTotalRoute();
@@ -9336,6 +9457,12 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
       lines: venta.all_lines,
       idSucursal: venta.id_sucursal
     });
+    venta.all_lines = await attachRecipeInventorySnapshotsToLines({
+      client,
+      lines: venta.all_lines,
+      idSucursal: venta.id_sucursal
+    });
+    venta.pedido_lines = venta.all_lines;
     const amountValidation = validateVentaMontoCobro({ venta });
     if (!amountValidation.ok) {
       await client.query('ROLLBACK');
@@ -9384,9 +9511,16 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
     venta.id_sucursal = Number(validatedCajaSession.id_sucursal);
     const ventaHasExtras = hasVentaExtras(venta);
     const ventaHasSalsasInventario = getSelectedSalsaIdsFromLines(venta.all_lines).length > 0;
-    if (ventaHasSalsasInventario) {
+    const ventaRpcV3Available = ventaHasSalsasInventario && ventasRpcV2Enabled
+      ? await hasDbFunction(client, 'public.registrar_venta_pos_v3(jsonb,jsonb)')
+      : false;
+    const shouldUseVentaRpcV2Family = ventasRpcV2Enabled && (!ventaHasSalsasInventario || ventaRpcV3Available);
+    const ventaRpcVersion = ventaHasSalsasInventario ? 'v3' : 'v2';
+    if (ventaHasSalsasInventario && ventaRpcV3Available) {
+      ventasPerfContext.rpc_version = 'v3_salsas';
+    } else if (ventaHasSalsasInventario) {
       ventasPerfContext.rpc_enabled = false;
-      ventasPerfContext.rpc_version = 'legacy_salsas_inventario';
+      ventasPerfContext.rpc_version = ventasRpcV2Enabled ? 'legacy_rpc_v3_missing' : 'legacy_flag_disabled';
     } else if (ventaHasExtras && ventasRpcV2Enabled) {
       ventasPerfContext.rpc_version = 'v2_extras';
     } else if (ventaHasExtras) {
@@ -9394,28 +9528,32 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
       ventasPerfContext.rpc_version = 'legacy_extras';
     }
 
-    if (ventasRpcV2Enabled && !ventaHasSalsasInventario) {
+    if (shouldUseVentaRpcV2Family) {
       const rpcCreateResult = await createVentaWithRpcV2Transaction({
         client,
         venta,
         perf: ventasPerf,
-        requestStartedAt: authContextStart
+        requestStartedAt: authContextStart,
+        rpcVersion: ventaRpcVersion
       });
       const idPedidoRpc = parseOptionalPositiveInt(rpcCreateResult.response?.id_pedido);
       await persistVentaPedidoSnapshots({ client, idPedido: idPedidoRpc, venta });
-      await validarYDescontarInventarioCajaPedido({
+      const inventoryResult = await validarYDescontarInventarioCajaPedido({
         client,
         idPedido: idPedidoRpc,
         idSucursal: venta.id_sucursal,
         idUsuario: userId
       });
+      const rpcResponseBody = attachVentaSnapshotsToResponse(rpcCreateResult.response, venta);
+      const stockWarning = buildStockWarningResponse(inventoryResult);
+      if (stockWarning) rpcResponseBody.warning = stockWarning;
       if (ventaHasExtras) {
         const fidelizacionPedidoId = parseOptionalPositiveInt(rpcCreateResult.fidelizacionJob?.idPedido);
         if (!fidelizacionPedidoId) {
           throw {
             httpStatus: 500,
-            code: 'VENTAS_RPC_V2_PEDIDO_INVALIDO',
-            publicMessage: 'La venta fue procesada por RPC V2, pero no devolvio pedido valido para descontar extras.'
+            code: ventaRpcVersion === 'v3' ? 'VENTAS_RPC_V3_PEDIDO_INVALIDO' : 'VENTAS_RPC_V2_PEDIDO_INVALIDO',
+            publicMessage: `La venta fue procesada por RPC ${ventaRpcVersion.toUpperCase()}, pero no devolvio pedido valido para descontar extras.`
           };
         }
       }
@@ -9428,18 +9566,23 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
         client,
         reservation: idempotencyReservation,
         httpStatus: 201,
-        responseBody: attachVentaSnapshotsToResponse(rpcCreateResult.response, venta),
+        responseBody: rpcResponseBody,
         idPedido: idPedidoRpc,
         idFactura: rpcCreateResult.response?.id_factura,
         idUsuario: userId,
         idSucursal: venta.id_sucursal
       }).catch((saveError) => {
-        console.error('No se pudo guardar resultado idempotente RPC V2 de venta:', saveError);
+        console.error(`No se pudo guardar resultado idempotente RPC ${ventaRpcVersion.toUpperCase()} de venta:`, saveError);
       });
 
       ventasPerf.add('node_after_rpc_ms', rpcCreateResult.afterRpcStart);
       ventasPerf.log({ ...ventasPerfContext, status: 201 });
-      res.status(201).json(attachVentaSnapshotsToResponse(rpcCreateResult.response, venta));
+      await registrarAlertasInventarioVentaAfterCommit({
+        idPedido: idPedidoRpc,
+        idUsuario: userId,
+        inventoryResult
+      });
+      res.status(201).json(rpcResponseBody);
 
       void registerVentaFidelizacionAfterCommit(rpcCreateResult.fidelizacionJob);
       return;
@@ -9457,12 +9600,15 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
         idPedido: rpcCreateResult.response?.id_pedido,
         venta
       });
-      await validarYDescontarInventarioCajaPedido({
+      const inventoryResult = await validarYDescontarInventarioCajaPedido({
         client,
         idPedido: rpcCreateResult.response?.id_pedido,
         idSucursal: venta.id_sucursal,
         idUsuario: userId
       });
+      const rpcResponseBody = attachVentaSnapshotsToResponse(rpcCreateResult.response, venta);
+      const stockWarning = buildStockWarningResponse(inventoryResult);
+      if (stockWarning) rpcResponseBody.warning = stockWarning;
 
       const commitStart = ventasPerf.now();
       await client.query('COMMIT');
@@ -9472,7 +9618,7 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
         client,
         reservation: idempotencyReservation,
         httpStatus: 201,
-        responseBody: attachVentaSnapshotsToResponse(rpcCreateResult.response, venta),
+        responseBody: rpcResponseBody,
         idPedido: rpcCreateResult.response?.id_pedido,
         idFactura: rpcCreateResult.response?.id_factura,
         idUsuario: userId,
@@ -9483,7 +9629,12 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
 
       ventasPerf.add('node_after_rpc_ms', rpcCreateResult.afterRpcStart);
       ventasPerf.log({ ...ventasPerfContext, status: 201 });
-      res.status(201).json(attachVentaSnapshotsToResponse(rpcCreateResult.response, venta));
+      await registrarAlertasInventarioVentaAfterCommit({
+        idPedido: rpcCreateResult.response?.id_pedido,
+        idUsuario: userId,
+        inventoryResult
+      });
+      res.status(201).json(rpcResponseBody);
 
       void registerVentaFidelizacionAfterCommit(rpcCreateResult.fidelizacionJob);
       return;
@@ -9585,7 +9736,7 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
     const detallePedidoInsertStart = ventasPerf.now();
     const detallePedidoRows = venta.pedido_lines.map((line) => ({
       line,
-      configuracionMenu: buildComplementLineConfig(line),
+      configuracionMenu: mergePedidoLineInventoryConfig(line),
       complementSnapshot: buildComplementSnapshot(line)
     }));
     const pedidoLineRefs = [];
@@ -9708,7 +9859,7 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
     }
     ventasPerf.add('detalle_pedido_insert_ms', detallePedidoInsertStart);
     ventasPerf.add('detalle_pedido_ms', detallePedidoStart);
-    await validarYDescontarInventarioCajaPedido({
+    const inventoryResult = await validarYDescontarInventarioCajaPedido({
       client,
       idPedido,
       idSucursal: venta.id_sucursal,
@@ -10012,6 +10163,8 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
       fidelizacion: acumulacionFidelizacion,
       cuentaDividida: cuentaDivididaResponse
     }), venta);
+    const stockWarning = buildStockWarningResponse(inventoryResult);
+    if (stockWarning) createVentaResponse.warning = stockWarning;
     ventasPerf.add('ticket_response_build_ms', ticketResponseStart);
 
     const commitStart = ventasPerf.now();
@@ -10029,6 +10182,11 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
       idSucursal: venta.id_sucursal
     }).catch((saveError) => {
       console.error('No se pudo guardar resultado idempotente de venta:', saveError);
+    });
+    await registrarAlertasInventarioVentaAfterCommit({
+      idPedido,
+      idUsuario: venta.id_usuario || userId,
+      inventoryResult
     });
 
     ventasPerf.log(ventasPerfContext);

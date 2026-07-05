@@ -23,14 +23,30 @@ const VALID_MOTIVOS = new Set([
   'COBRO_INCORRECTO'
 ]);
 
+export const REVERSION_EXPECTED_UNIQUE_CONSTRAINTS = new Set([
+  'ux_mov_inv_reversion_origen'
+]);
+
 const parsePositiveInt = (value) => {
-  const parsed = Number.parseInt(String(value ?? ''), 10);
-  return Number.isInteger(parsed) && parsed > 0 ? parsed : null;
+  if (typeof value === 'number') {
+    return Number.isSafeInteger(value) && value > 0 ? value : null;
+  }
+  if (typeof value !== 'string') return null;
+  const normalized = value.trim();
+  if (!/^0*[1-9]\d*$/.test(normalized)) return null;
+  const parsed = Number(normalized);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : null;
 };
 
 const isIntegerNumber = (value) => Number.isInteger(Number(value));
 
 const roundMoney = (value) => Number(Number(value || 0).toFixed(2));
+
+export const roundInventoryQuantity = (value) => {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return 0;
+  return Number(parsed.toFixed(6));
+};
 
 const normalizeText = (value, max = 200) => {
   if (value === undefined || value === null) return null;
@@ -46,6 +62,34 @@ const createReversionError = (status, code, message) => {
   error.code = code;
   error.publicMessage = message;
   return error;
+};
+
+const mapInventoryTraceTriggerError = (error) => {
+  if (!['23514', '23503'].includes(String(error?.code || ''))) return null;
+  const text = `${error?.message || ''} ${error?.detail || ''} ${error?.constraint || ''}`.toUpperCase();
+  if (text.includes('REVERSION_OVER_RETURN')) {
+    return createReversionError(409, 'VENTAS_REVERSION_SOBREDEVOLUCION', 'La reversión excede la cantidad disponible para devolver.');
+  }
+  if (text.includes('REVERSION_ALREADY_FULLY_RETURNED')) {
+    return createReversionError(409, 'ALREADY_FULLY_RETURNED', 'El inventario de la venta ya fue devuelto completamente.');
+  }
+  if (text.includes('LEGACY_PARTIAL_BLOCKED')) {
+    return createReversionError(409, 'LEGACY_PARTIAL_BLOCKED', 'La reversión parcial no puede restaurar inventario de movimientos legacy sin trazabilidad por línea.');
+  }
+  if (text.includes('TRACE_INVALID') || text.includes('REVERSION_TRACE_INVALID')) {
+    return createReversionError(409, 'TRACE_INCONSISTENT', 'Los movimientos originales de inventario tienen trazabilidad inconsistente.');
+  }
+  return null;
+};
+
+export const mapExpectedReversionUniqueError = (error) => {
+  if (
+    error?.code === '23505'
+    && REVERSION_EXPECTED_UNIQUE_CONSTRAINTS.has(error?.constraint)
+  ) {
+    return createReversionError(409, 'ALREADY_FULLY_RETURNED', 'El inventario de la venta ya fue devuelto o esta en proceso de devolucion.');
+  }
+  return null;
 };
 
 const resolveSucursalScope = async (client, idUsuario) => {
@@ -346,8 +390,11 @@ const resolveFacturaLinesForUpdate = async (client, idFactura) => {
               NULLIF(TRIM(df.tipo_item), ''),
               CASE WHEN COALESCE(dfo.id_producto, df.id_producto) IS NOT NULL THEN 'PRODUCTO' ELSE 'ITEM' END
             )
-          ) = 'PRODUCTO'
-            AND COALESCE(dfo.id_producto, df.id_producto) IS NOT NULL THEN true
+          ) IN ('PRODUCTO', 'RECETA')
+            AND (
+              COALESCE(dfo.id_producto, df.id_producto) IS NOT NULL
+              OR COALESCE(dfo.id_receta, df.id_receta::int) IS NOT NULL
+            ) THEN true
           ELSE false
         END AS devuelve_inventario
       FROM public.detalle_facturas df
@@ -444,8 +491,12 @@ const resolveReversionLines = ({ tipoReversion, requestedLines, facturaLines, re
       tipo_item: line.tipo_item,
       id_producto: parsePositiveInt(line.id_producto),
       id_receta: parsePositiveInt(line.id_receta),
+      id_detalle_pedido: parsePositiveInt(line.id_detalle_pedido),
       cantidad_vendida: soldQty,
       cantidad_revertida: requestedQty,
+      cantidad_revertida_previa: reversedQty,
+      cantidad_pendiente_antes: availableQty,
+      completa_linea: requestedQty === availableQty,
       precio_unitario_original: roundMoney(line.precio_unitario),
       subtotal_revertido: subtotal,
       descuento_revertido: descuento,
@@ -766,31 +817,130 @@ const registerInventoryReturn = async ({ client, idReversion, codigoReversion, c
   }
 };
 
-export const buildPedidoMovementReturnRows = ({ movements = [], lineas = [] } = {}) => {
-  const soldQty = (Array.isArray(lineas) ? lineas : []).reduce(
-    (sum, line) => sum + Number(line?.cantidad_vendida || line?.origen_snapshot?.cantidad || 0),
-    0
-  );
-  const reversedQty = (Array.isArray(lineas) ? lineas : []).reduce(
-    (sum, line) => sum + Number(line?.cantidad_revertida || 0),
-    0
-  );
-  const ratio = soldQty > 0 && reversedQty > 0 ? Math.min(1, reversedQty / soldQty) : 0;
-  if (ratio <= 0) return [];
+export const buildPedidoMovementReturnRows = ({ movements = [], lineas = [], returnedByOrigin = new Map() } = {}) => {
+  const lineReturnByDetalle = new Map();
+  for (const line of Array.isArray(lineas) ? lineas : []) {
+    if (line?.devuelve_inventario !== true || Number(line?.cantidad_revertida || 0) <= 0) continue;
+    const idDetallePedido = parsePositiveInt(line?.id_detalle_pedido);
+    const soldQty = Number(line?.cantidad_vendida || line?.origen_snapshot?.cantidad || 0);
+    const reversedQty = Number(line?.cantidad_revertida || 0);
+    const ratio = soldQty > 0 && reversedQty > 0 ? Math.min(1, reversedQty / soldQty) : 0;
+    if (idDetallePedido && ratio > 0) {
+      lineReturnByDetalle.set(idDetallePedido, {
+        ratio,
+        completesLine: Boolean(line?.completa_linea)
+          || (Number(line?.cantidad_pendiente_antes || 0) > 0 && reversedQty === Number(line.cantidad_pendiente_antes))
+      });
+    }
+  }
+  if (lineReturnByDetalle.size === 0) return [];
 
   return (Array.isArray(movements) ? movements : [])
     .map((movement) => {
-      const cantidad = roundMoney(Number(movement?.cantidad || 0) * ratio);
+      const idDetallePedido = parsePositiveInt(movement?.id_detalle_pedido);
+      const lineReturn = idDetallePedido ? lineReturnByDetalle.get(idDetallePedido) : null;
+      const ratio = Number(lineReturn?.ratio || 0);
+      const idMovimientoOrigen = parsePositiveInt(movement?.id_movimiento);
+      const cantidadDisponible = roundInventoryQuantity(Math.max(
+        0,
+        Number(movement?.cantidad || 0) - Number(returnedByOrigin.get(idMovimientoOrigen) || 0)
+      ));
+      const cantidad = lineReturn?.completesLine
+        ? cantidadDisponible
+        : roundInventoryQuantity(Number(movement?.cantidad || 0) * ratio);
       if (cantidad <= 0) return null;
       return {
+        id_movimiento_origen: idMovimientoOrigen,
         cantidad,
+        cantidad_disponible: cantidadDisponible,
         id_almacen: parsePositiveInt(movement?.id_almacen),
         id_producto: parsePositiveInt(movement?.id_producto),
         id_insumo: parsePositiveInt(movement?.id_insumo),
+        id_detalle_pedido: idDetallePedido,
+        id_pedido_trazabilidad: parsePositiveInt(movement?.id_pedido_trazabilidad),
+        origen_consumo: String(movement?.origen_consumo || '').trim().toUpperCase() || null,
         ratio
       };
     })
-    .filter((row) => row && row.id_almacen && (row.id_producto || row.id_insumo));
+    .map((row) => row ? { ...row, cantidad: Math.min(row.cantidad, row.cantidad_disponible) } : null)
+    .filter((row) => row && row.cantidad > 0 && row.id_almacen && (row.id_producto || row.id_insumo));
+};
+
+const isValidLegacyMovement = (row, returnedByOrigin = new Map()) => {
+  const idMovimiento = parsePositiveInt(row?.id_movimiento);
+  const cantidad = roundInventoryQuantity(Number(row?.cantidad || 0));
+  const hasOneResource = Boolean(parsePositiveInt(row?.id_producto)) !== Boolean(parsePositiveInt(row?.id_insumo));
+  if (!idMovimiento || cantidad <= 0 || !parsePositiveInt(row?.id_almacen) || !hasOneResource) return false;
+  if (!['PEDIDO', 'FALTANTE_COCINA'].includes(String(row?.ref_origen || '').trim().toUpperCase())) return false;
+  if (String(row?.tipo || '').trim().toUpperCase() !== 'SALIDA') return false;
+  return true;
+};
+
+export const classifyPedidoMovementReturnState = ({ movements = [], lineas = [], returnedByOrigin = new Map(), tipoReversion = '' } = {}) => {
+  const rows = Array.isArray(movements) ? movements : [];
+  if (rows.length === 0) return 'NO_ORIGINAL_MOVEMENTS';
+
+  const traced = rows.filter((row) => parsePositiveInt(row.id_detalle_pedido));
+  const legacy = rows.filter((row) => !parsePositiveInt(row.id_detalle_pedido));
+  if (traced.length > 0 && legacy.length > 0) return 'TRACE_INCONSISTENT';
+  if (legacy.length > 0) {
+    const hasInvalidLegacy = legacy.some((row) => !isValidLegacyMovement(row, returnedByOrigin));
+    if (hasInvalidLegacy) return 'LEGACY_TRACE_INCONSISTENT';
+    const returnedStates = legacy.map((row) => {
+      const idMovimiento = parsePositiveInt(row.id_movimiento);
+      const returnedQty = roundInventoryQuantity(Number(returnedByOrigin.get(idMovimiento) || 0));
+      const originalQty = roundInventoryQuantity(Number(row.cantidad || 0));
+      return { returnedQty, originalQty };
+    });
+    if (returnedStates.some((row) => row.returnedQty > row.originalQty)) return 'LEGACY_OVER_RETURNED';
+    if (returnedStates.every((row) => row.returnedQty >= row.originalQty)) return 'LEGACY_ALREADY_FULLY_RETURNED';
+    if (returnedStates.some((row) => row.returnedQty > 0)) return 'LEGACY_PARTIALLY_RETURNED_INCONSISTENT';
+    if (String(tipoReversion || '').toUpperCase() === 'PARCIAL') return 'LEGACY_PARTIAL_BLOCKED';
+    return 'LEGACY_TOTAL_ALLOWED';
+  }
+
+  const requestedInventoryLines = (Array.isArray(lineas) ? lineas : [])
+    .filter((line) => line?.devuelve_inventario === true && Number(line?.cantidad_revertida || 0) > 0);
+  const requestedDetalleIds = new Set(
+    requestedInventoryLines.map((line) => parsePositiveInt(line?.id_detalle_pedido)).filter(Boolean)
+  );
+  const hasMissingRequestedDetalle = requestedInventoryLines
+    .some((line) => !parsePositiveInt(line?.id_detalle_pedido));
+  if (traced.length > 0 && hasMissingRequestedDetalle) return 'TRACE_INCONSISTENT';
+  if (traced.length > 0 && requestedDetalleIds.size === 0) return 'TRACE_NO_INVENTORY_REQUESTED';
+
+  const tracedDetalleIds = new Set(traced.map((row) => parsePositiveInt(row.id_detalle_pedido)).filter(Boolean));
+  for (const detalleId of requestedDetalleIds) {
+    if (!tracedDetalleIds.has(detalleId)) return 'TRACE_INCONSISTENT';
+  }
+  for (const row of traced) {
+    const hasOneResource = Boolean(parsePositiveInt(row.id_producto)) !== Boolean(parsePositiveInt(row.id_insumo));
+    if (
+      !parsePositiveInt(row.id_movimiento)
+      || !parsePositiveInt(row.id_almacen)
+      || !hasOneResource
+      || !String(row.origen_consumo || '').trim()
+      || !parsePositiveInt(row.id_pedido_trazabilidad)
+    ) {
+      return 'TRACE_INCONSISTENT';
+    }
+  }
+
+  for (const row of rows) {
+    const idMovimiento = parsePositiveInt(row.id_movimiento);
+    const returnedQty = roundInventoryQuantity(Number(returnedByOrigin.get(idMovimiento) || 0));
+    const originalQty = roundInventoryQuantity(Number(row.cantidad || 0));
+    if (returnedQty > originalQty) return 'TRACE_INCONSISTENT';
+  }
+
+  const requestedRows = traced.filter((row) => requestedDetalleIds.has(parsePositiveInt(row.id_detalle_pedido)));
+  if (requestedRows.length === 0) return 'TRACE_INCONSISTENT';
+
+  const allReturned = requestedRows.every((row) => {
+    const idMovimiento = parsePositiveInt(row.id_movimiento);
+    return roundInventoryQuantity(Number(returnedByOrigin.get(idMovimiento) || 0)) >= roundInventoryQuantity(Number(row.cantidad || 0));
+  });
+  return allReturned ? 'ALREADY_FULLY_RETURNED' : 'TRACE_OK';
 };
 
 const restorePedidoInventoryMovementsForReversion = async ({
@@ -799,10 +949,11 @@ const restorePedidoInventoryMovementsForReversion = async ({
   idReversion,
   codigoReversion,
   codigoVenta,
-  lineas
+  lineas,
+  tipoReversion
 }) => {
   const pedidoId = parsePositiveInt(idPedido);
-  if (!pedidoId) return false;
+  if (!pedidoId) return { handled: false, state: 'NO_ORIGINAL_MOVEMENTS', insertedCount: 0 };
 
   const movementResult = await client.query(
     `
@@ -811,7 +962,12 @@ const restorePedidoInventoryMovementsForReversion = async ({
         mi.cantidad,
         mi.id_almacen,
         mi.id_producto,
-        mi.id_insumo
+        mi.id_insumo,
+        mi.id_detalle_pedido,
+        mi.id_pedido_trazabilidad,
+        mi.origen_consumo,
+        mi.ref_origen,
+        mi.tipo
       FROM public.movimientos_inventario mi
       WHERE mi.tipo = 'SALIDA'
         AND mi.ref_origen IN ('PEDIDO', 'FALTANTE_COCINA')
@@ -821,39 +977,150 @@ const restorePedidoInventoryMovementsForReversion = async ({
     `,
     [pedidoId]
   );
-  const returnRows = buildPedidoMovementReturnRows({
-    movements: movementResult.rows,
-    lineas
-  });
-  if (!returnRows.length) return false;
-
-  for (const row of returnRows) {
-    await client.query(
+  const legacyMovements = movementResult.rows.filter((row) => !parsePositiveInt(row.id_detalle_pedido));
+  const originIds = movementResult.rows
+    .map((row) => parsePositiveInt(row.id_movimiento))
+    .filter(Boolean);
+  const returnedResult = originIds.length > 0
+    ? await client.query(
       `
-        INSERT INTO public.movimientos_inventario (
-          tipo,
-          cantidad,
-          id_almacen,
-          id_producto,
-          id_insumo,
-          ref_origen,
-          id_ref,
-          descripcion
-        )
-        VALUES ('ENTRADA', $1, $2, $3, $4, 'REVERSION_VENTA_INVENTARIO', $5, $6)
+        SELECT
+          id_movimiento_origen,
+          COALESCE(SUM(cantidad), 0)::numeric AS cantidad_devuelta
+        FROM public.movimientos_inventario
+        WHERE tipo = 'ENTRADA'
+          AND ref_origen = 'REVERSION_VENTA_INVENTARIO'
+          AND id_movimiento_origen = ANY($1::int[])
+        GROUP BY id_movimiento_origen
       `,
-      [
-        row.cantidad,
-        row.id_almacen,
-        row.id_producto || null,
-        row.id_insumo || null,
-        idReversion,
-        `Entrada proporcional por reversión ${codigoReversion} de venta ${codigoVenta}`
-      ]
+      [originIds]
+    )
+    : { rows: [] };
+  const returnedByOrigin = new Map(
+    (returnedResult.rows || []).map((row) => [
+      parsePositiveInt(row.id_movimiento_origen),
+      Number(row.cantidad_devuelta || 0)
+    ])
+  );
+  const returnState = classifyPedidoMovementReturnState({
+    movements: movementResult.rows,
+    lineas,
+    returnedByOrigin,
+    tipoReversion
+  });
+  if (returnState === 'NO_ORIGINAL_MOVEMENTS') {
+    return { handled: false, state: returnState, insertedCount: 0 };
+  }
+  if (returnState === 'TRACE_NO_INVENTORY_REQUESTED') {
+    return { handled: true, state: returnState, insertedCount: 0 };
+  }
+  if (returnState === 'ALREADY_FULLY_RETURNED' || returnState === 'LEGACY_ALREADY_FULLY_RETURNED') {
+    throw createReversionError(409, 'ALREADY_FULLY_RETURNED', 'El inventario de la venta ya fue devuelto completamente.');
+  }
+  if (
+    returnState === 'TRACE_INCONSISTENT' ||
+    returnState === 'LEGACY_TRACE_INCONSISTENT' ||
+    returnState === 'LEGACY_PARTIALLY_RETURNED_INCONSISTENT'
+  ) {
+    throw createReversionError(409, 'TRACE_INCONSISTENT', 'Los movimientos originales de inventario tienen trazabilidad inconsistente.');
+  }
+  if (returnState === 'LEGACY_OVER_RETURNED') {
+    throw createReversionError(409, 'VENTAS_REVERSION_SOBREDEVOLUCION', 'La reversión excede la cantidad disponible para devolver.');
+  }
+  if (returnState === 'LEGACY_PARTIAL_BLOCKED') {
+    throw createReversionError(
+      409,
+      'LEGACY_PARTIAL_BLOCKED',
+      'La reversión parcial no puede restaurar inventario de movimientos legacy sin trazabilidad por línea.'
     );
   }
+  const tracedReturnRows = buildPedidoMovementReturnRows({
+    movements: movementResult.rows.filter((row) => parsePositiveInt(row.id_detalle_pedido)),
+    lineas,
+    returnedByOrigin
+  });
+  const legacyReturnRows = returnState === 'LEGACY_TOTAL_ALLOWED'
+    ? legacyMovements
+      .map((movement) => {
+        const idMovimientoOrigen = parsePositiveInt(movement.id_movimiento);
+        const cantidadDisponible = roundInventoryQuantity(Math.max(
+          0,
+          Number(movement.cantidad || 0) - Number(returnedByOrigin.get(idMovimientoOrigen) || 0)
+        ));
+        if (cantidadDisponible <= 0) return null;
+        return {
+          id_movimiento_origen: idMovimientoOrigen,
+          cantidad: cantidadDisponible,
+          id_almacen: parsePositiveInt(movement.id_almacen),
+          id_producto: parsePositiveInt(movement.id_producto),
+          id_insumo: parsePositiveInt(movement.id_insumo),
+          id_detalle_pedido: null,
+          id_pedido_trazabilidad: null,
+          origen_consumo: String(movement.origen_consumo || '').trim().toUpperCase() || null,
+          ratio: 1
+        };
+      })
+      .filter((row) => row && row.id_almacen && (row.id_producto || row.id_insumo))
+    : [];
+  const returnRows = [...tracedReturnRows, ...legacyReturnRows];
+  if (!returnRows.length) {
+    const emptyState = movementResult.rows.some((row) => parsePositiveInt(row.id_detalle_pedido))
+      ? 'TRACE_INCONSISTENT'
+      : returnState;
+    if (emptyState === 'TRACE_INCONSISTENT') {
+      throw createReversionError(409, 'TRACE_INCONSISTENT', 'Los movimientos originales de inventario tienen trazabilidad inconsistente.');
+    }
+    return { handled: true, state: emptyState, insertedCount: 0 };
+  }
 
-  return true;
+  let insertedCount = 0;
+  for (const row of returnRows) {
+    if (row.id_detalle_pedido && parsePositiveInt(row.id_pedido_trazabilidad) !== pedidoId) {
+      throw createReversionError(409, 'TRACE_INCONSISTENT', 'Los movimientos originales de inventario tienen trazabilidad inconsistente.');
+    }
+    try {
+      await client.query(
+        `
+          INSERT INTO public.movimientos_inventario (
+            tipo,
+            cantidad,
+            id_almacen,
+            id_producto,
+            id_insumo,
+            id_detalle_pedido,
+            origen_consumo,
+            id_movimiento_origen,
+            id_pedido_trazabilidad,
+            ref_origen,
+            id_ref,
+            descripcion
+          )
+          VALUES ('ENTRADA', $1, $2, $3, $4, $5, $6, $7, $8, 'REVERSION_VENTA_INVENTARIO', $9, $10)
+        `,
+        [
+          row.cantidad,
+          row.id_almacen,
+          row.id_producto || null,
+          row.id_insumo || null,
+          row.id_detalle_pedido || null,
+          row.origen_consumo || null,
+          row.id_movimiento_origen || null,
+          row.id_pedido_trazabilidad || null,
+          idReversion,
+          `Entrada por línea #${row.id_detalle_pedido} en reversión ${codigoReversion} de venta ${codigoVenta}`
+        ]
+      );
+      insertedCount += 1;
+    } catch (error) {
+      const mappedTraceError = mapInventoryTraceTriggerError(error);
+      if (mappedTraceError) throw mappedTraceError;
+      const mappedUniqueError = mapExpectedReversionUniqueError(error);
+      if (mappedUniqueError) throw mappedUniqueError;
+      throw error;
+    }
+  }
+
+  return { handled: true, state: returnState, insertedCount };
 };
 
 export const buildSalsaInventorySnapshotsForReturn = (lineas = []) => {
@@ -1184,7 +1451,7 @@ export const createVentaReversion = async ({ idFactura, body, req, idUsuario, id
             total_revertido,
             devuelve_inventario
           )
-          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
         `,
         [
           idReversion,
@@ -1249,9 +1516,10 @@ export const createVentaReversion = async ({ idFactura, body, req, idUsuario, id
       idReversion,
       codigoReversion: correlativo.codigo,
       codigoVenta,
-      lineas: reversionLines
+      lineas: reversionLines,
+      tipoReversion
     });
-    if (!restoredFromOriginalMovements) {
+    if (restoredFromOriginalMovements.state === 'NO_ORIGINAL_MOVEMENTS') {
       await registerInventoryReturn({
         client,
         idReversion,
@@ -1313,6 +1581,8 @@ export const createVentaReversion = async ({ idFactura, body, req, idUsuario, id
     return { result, responseBody };
   } catch (error) {
     try { await client.query('ROLLBACK'); } catch {}
+    const mappedTraceError = mapInventoryTraceTriggerError(error);
+    if (mappedTraceError) throw mappedTraceError;
     const mappedError = mapCajaFinancialLockError(error);
     if (error?.code === '23514' && error?.constraint === 'ck_facturas_reversiones_motivo') {
       throw createReversionError(

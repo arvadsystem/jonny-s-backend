@@ -15,6 +15,20 @@ const addToMapTotal = (map, id, amount) => {
   map.set(id, current + Number(amount || 0));
 };
 
+const addMovementRow = (rows, row) => {
+  const quantity = Number(row?.cantidad || 0);
+  const idDetallePedido = toPositiveInt(row?.id_detalle_pedido);
+  if (!Number.isFinite(quantity) || quantity <= 0) return;
+  rows.push({
+    tipo_recurso: row.tipo_recurso,
+    id_producto: toPositiveInt(row.id_producto) || null,
+    id_insumo: toPositiveInt(row.id_insumo) || null,
+    id_detalle_pedido: idDetallePedido || null,
+    cantidad: quantity,
+    origen_consumo: String(row.origen_consumo || '').trim().toUpperCase() || null
+  });
+};
+
 const mapById = (rows, fieldName) => {
   const map = new Map();
   for (const row of rows || []) {
@@ -33,6 +47,7 @@ const addContext = (map, id, item) => {
     id_receta: toPositiveInt(item?.id_receta) || null,
     id_extra: toPositiveInt(item?.id_extra) || null,
     id_insumo: toPositiveInt(item?.id_insumo) || null,
+    cantidad: Number(item?.cantidad || 0) > 0 ? Number(item.cantidad) : null,
     cant: Number(item?.cant || 0) > 0 ? Number(item.cant) : null,
     id_unidad_medida: toPositiveInt(item?.id_unidad_medida) || null,
     codigo: typeof item?.codigo === 'string' ? item.codigo.trim() || null : null,
@@ -41,6 +56,75 @@ const addContext = (map, id, item) => {
 };
 
 const firstContext = (map, id) => (Array.isArray(map.get(id)) ? map.get(id)[0] : {}) || {};
+
+const hasExtraInventorySnapshot = (context) => (
+  context?.id_insumo !== null ||
+  context?.id_unidad_medida !== null ||
+  context?.cant !== null
+);
+
+const roundInventory = (value) => {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return 0;
+  return Number(parsed.toFixed(6));
+};
+
+const getRecipeInventorySnapshot = (item) => {
+  const config = item?.configuracion_menu && typeof item.configuracion_menu === 'object'
+    ? item.configuracion_menu
+    : null;
+  const snapshot = config?.inventario_receta;
+  return snapshot && typeof snapshot === 'object' ? snapshot : null;
+};
+
+const validateRecipeInventorySnapshot = (snapshot, item) => {
+  const idReceta = toPositiveInt(item?.id_receta ?? item?.id_item);
+  const cantidadLinea = Number(item?.cantidad || 0);
+  if (!idReceta || !snapshot || Number(snapshot.version) !== 1) return { ok: false, reason: 'RECETA_SNAPSHOT_INVALIDO' };
+  if (toPositiveInt(snapshot.id_receta) !== idReceta) return { ok: false, reason: 'RECETA_SNAPSHOT_ID_RECETA_INVALIDO' };
+  if (roundInventory(snapshot.cantidad_linea) !== roundInventory(cantidadLinea)) {
+    return { ok: false, reason: 'RECETA_SNAPSHOT_CANTIDAD_LINEA_INVALIDA' };
+  }
+  const components = Array.isArray(snapshot.componentes) ? snapshot.componentes : [];
+  if (components.length === 0) return { ok: false, reason: 'RECETA_SNAPSHOT_SIN_COMPONENTES' };
+
+  const normalizedComponents = [];
+  const warehouseByInsumo = new Map();
+  for (const component of components) {
+    const idInsumo = toPositiveInt(component?.id_insumo);
+    const idAlmacen = toPositiveInt(component?.id_almacen);
+    const factor = roundInventory(component?.factor_por_unidad);
+    const cantidadTotal = roundInventory(component?.cantidad_total);
+    const unidadMedida = toPositiveInt(component?.id_unidad_medida);
+    const unidadBase = toPositiveInt(component?.id_unidad_base);
+    if (!idInsumo || !idAlmacen || factor <= 0 || cantidadTotal <= 0 || !unidadMedida || !unidadBase) {
+      return { ok: false, reason: 'RECETA_SNAPSHOT_COMPONENTE_INVALIDO' };
+    }
+    const previousWarehouse = warehouseByInsumo.get(idInsumo);
+    if (previousWarehouse && previousWarehouse !== idAlmacen) {
+      return { ok: false, reason: 'RECETA_SNAPSHOT_ALMACEN_AMBIGUO' };
+    }
+    if (previousWarehouse && previousWarehouse === idAlmacen) {
+      return { ok: false, reason: 'RECETA_SNAPSHOT_COMPONENTE_DUPLICADO' };
+    }
+    warehouseByInsumo.set(idInsumo, idAlmacen);
+    if (unidadMedida !== unidadBase) {
+      return { ok: false, reason: 'RECETA_SNAPSHOT_UNIDAD_INVALIDA' };
+    }
+    if (cantidadTotal !== roundInventory(factor * cantidadLinea)) {
+      return { ok: false, reason: 'RECETA_SNAPSHOT_TOTAL_INVALIDO' };
+    }
+    normalizedComponents.push({
+      id_insumo: idInsumo,
+      id_almacen: idAlmacen,
+      factor_por_unidad: factor,
+      cantidad_total: cantidadTotal,
+      id_unidad_medida: unidadMedida,
+      id_unidad_base: unidadBase
+    });
+  }
+  return { ok: true, components: normalizedComponents };
+};
 
 const schemaColumnCache = new Map();
 const hasColumn = async (client, tableName, columnName) => {
@@ -112,7 +196,6 @@ const fetchRecipeInsumoComponents = async (client, recipeIds) => {
         ${insumoFactorExpr} AS insumo_factor
       FROM public.detalle_recetas dr
       WHERE dr.id_receta = ANY($1::int[])
-        AND dr.id_insumo IS NOT NULL
         AND COALESCE(dr.estado, true) = true
     `,
     [recipeIds]
@@ -132,13 +215,48 @@ export const resolvePedidoConsumo = async ({ client, items }) => {
   const productoContextById = new Map();
   const recetaContextById = new Map();
   const extraContextById = new Map();
+  const movimientoRows = [];
 
   for (const item of items) {
     if (item.tipo_item === ITEM_TYPES.PRODUCTO) {
       addToMapTotal(productoQtyMap, item.id_item, item.cantidad);
       addContext(productoContextById, item.id_item, item);
+      addMovementRow(movimientoRows, {
+        tipo_recurso: 'producto',
+        id_producto: item.id_item,
+        id_detalle_pedido: item.id_detalle_pedido,
+        cantidad: item.cantidad,
+        origen_consumo: 'PRODUCTO'
+      });
     }
     if (item.tipo_item === ITEM_TYPES.RECETA) {
+      const snapshot = getRecipeInventorySnapshot(item);
+      if (snapshot) {
+        const validation = validateRecipeInventorySnapshot(snapshot, item);
+        if (!validation.ok) {
+          faltantes.push({
+            tipo_recurso: 'receta',
+            id_recurso: toPositiveInt(item.id_item),
+            id_receta: toPositiveInt(item.id_receta ?? item.id_item),
+            ...item,
+            motivo: validation.reason,
+            mensaje: `El snapshot fisico de inventario de la receta ${item.id_receta || item.id_item} esta incompleto o no coincide con la linea.`
+          });
+          continue;
+        }
+        for (const component of validation.components) {
+          addToMapTotal(insumoQtyMap, component.id_insumo, component.cantidad_total);
+          insumoWarehouseById.set(component.id_insumo, component.id_almacen);
+          addMovementRow(movimientoRows, {
+            tipo_recurso: 'insumo',
+            id_insumo: component.id_insumo,
+            id_detalle_pedido: item.id_detalle_pedido,
+            cantidad: component.cantidad_total,
+            origen_consumo: 'RECETA'
+          });
+        }
+        continue;
+      }
       addToMapTotal(recetaQtyMap, item.id_item, item.cantidad);
       addContext(recetaContextById, item.id_item, item);
     }
@@ -163,6 +281,13 @@ export const resolvePedidoConsumo = async ({ client, items }) => {
       }
       insumoWarehouseById.set(idInsumo, idAlmacen);
       addToMapTotal(insumoQtyMap, idInsumo, item.cantidad);
+      addMovementRow(movimientoRows, {
+        tipo_recurso: 'insumo',
+        id_insumo: idInsumo,
+        id_detalle_pedido: item.id_detalle_pedido,
+        cantidad: item.cantidad,
+        origen_consumo: 'SALSA'
+      });
       const trace = insumoTraceById.get(idInsumo) || {
         salsaIds: new Set(),
         detallePedidoIds: new Set(),
@@ -178,26 +303,20 @@ export const resolvePedidoConsumo = async ({ client, items }) => {
   const productoIds = [...productoQtyMap.keys()].sort((a, b) => a - b);
   const recetaIds = [...recetaQtyMap.keys()].sort((a, b) => a - b);
   const extraIds = [...extraQtyMap.keys()].sort((a, b) => a - b);
-  const extraIdsWithSnapshot = new Set();
-  for (const idExtra of extraIds) {
-    const context = firstContext(extraContextById, idExtra);
-    if (toPositiveInt(context.id_insumo) && Number(context.cant || 0) > 0) {
-      extraIdsWithSnapshot.add(idExtra);
-    }
-  }
-  const extraFallbackIds = extraIds.filter((idExtra) => !extraIdsWithSnapshot.has(idExtra));
 
   const [recetasRows, extrasRows] = await Promise.all([
     fetchRecetasByIds(client, recetaIds),
-    fetchExtrasByIds(client, extraFallbackIds)
+    fetchExtrasByIds(client, extraIds)
   ]);
 
   const recetasById = mapById(recetasRows, 'id_receta');
   const extrasById = mapById(extrasRows, 'id_extra');
+  const excludedRecipeIds = new Set();
 
   for (const idReceta of recetaIds) {
     const row = recetasById.get(idReceta);
     if (!row) {
+      excludedRecipeIds.add(idReceta);
       faltantes.push({
         tipo_recurso: 'receta',
         id_recurso: idReceta,
@@ -209,6 +328,7 @@ export const resolvePedidoConsumo = async ({ client, items }) => {
       continue;
     }
     if (!Boolean(row.estado)) {
+      excludedRecipeIds.add(idReceta);
       faltantes.push({
         tipo_recurso: 'receta',
         id_recurso: idReceta,
@@ -222,87 +342,130 @@ export const resolvePedidoConsumo = async ({ client, items }) => {
   }
 
   for (const idExtra of extraIds) {
-    const context = firstContext(extraContextById, idExtra);
-    const snapshotInsumoId = toPositiveInt(context.id_insumo);
-    const snapshotFactor = Number(context.cant || 0);
-    const snapshotUnidadId = toPositiveInt(context.id_unidad_medida);
-    const hasSnapshotInventory = snapshotInsumoId && snapshotFactor > 0;
-
-    if (hasSnapshotInventory) {
-      addToMapTotal(insumoQtyMap, snapshotInsumoId, Number(extraQtyMap.get(idExtra) || 0) * snapshotFactor);
-      continue;
-    }
-
+    const contexts = extraContextById.get(idExtra) || [];
+    const firstExtraContext = firstContext(extraContextById, idExtra);
     const row = extrasById.get(idExtra);
-    if (!row) {
-      faltantes.push({
-        tipo_recurso: 'extra',
-        id_recurso: idExtra,
-        id_extra: idExtra,
-        ...context,
-        motivo: 'EXTRA_SIN_CONFIGURACION_INVENTARIO',
-        mensaje: `El extra ${context.nombre || context.codigo || idExtra} no tiene configuracion de inventario disponible.`
-      });
-      continue;
-    }
-    if (!Boolean(row.estado)) {
-      faltantes.push({
-        tipo_recurso: 'extra',
-        id_recurso: idExtra,
-        id_extra: idExtra,
-        ...context,
-        nombre: row.nombre,
-        codigo: row.codigo || null,
-        motivo: 'EXTRA_INACTIVO',
-        mensaje: `El extra ${row.nombre || row.codigo || idExtra} esta inactivo.`
-      });
-      continue;
-    }
-    const insumoId = toPositiveInt(row?.id_insumo);
-    const insumoFactor = Number(row?.insumo_factor || 0);
-    const unidadId = snapshotUnidadId || toPositiveInt(row?.id_unidad_medida);
-    const nombre = context.nombre || row?.nombre || null;
-    const codigo = context.codigo || row?.codigo || null;
-    if (!insumoId || insumoFactor <= 0) {
-      faltantes.push({
-        tipo_recurso: 'extra',
-        id_recurso: idExtra,
-        id_extra: idExtra,
-        ...context,
-        nombre,
-        codigo,
-        motivo: 'EXTRA_SIN_CONFIGURACION_INVENTARIO',
-        mensaje: `El extra ${nombre || codigo || idExtra} no tiene id_insumo o cantidad de consumo configurada.`
-      });
-      continue;
-    }
-    if (!unidadId) {
-      faltantes.push({
-        tipo_recurso: 'extra',
-        id_recurso: idExtra,
-        id_extra: idExtra,
-        ...context,
-        nombre,
-        codigo,
+    for (const context of contexts) {
+      const hasSnapshotInventory = hasExtraInventorySnapshot(context);
+      const snapshotInsumoId = toPositiveInt(context.id_insumo);
+      const snapshotFactor = Number(context.cant || 0);
+      const snapshotUnidadId = toPositiveInt(context.id_unidad_medida);
+      if (hasSnapshotInventory) {
+        if (!snapshotInsumoId || snapshotFactor <= 0) {
+          faltantes.push({
+            tipo_recurso: 'extra',
+            id_recurso: idExtra,
+            id_extra: idExtra,
+            ...context,
+            motivo: 'EXTRA_SNAPSHOT_INVENTARIO_INVALIDO',
+            mensaje: `El snapshot de inventario del extra ${context.nombre || context.codigo || idExtra} esta incompleto.`
+          });
+          continue;
+        }
+        const lineQty = Number(context.cantidad || 0);
+        addToMapTotal(insumoQtyMap, snapshotInsumoId, lineQty * snapshotFactor);
+        addMovementRow(movimientoRows, {
+          tipo_recurso: 'insumo',
+          id_insumo: snapshotInsumoId,
+          id_detalle_pedido: context.id_detalle_pedido,
+          cantidad: lineQty * snapshotFactor,
+          origen_consumo: 'EXTRA'
+        });
+        continue;
+      }
+      if (!row) {
+        faltantes.push({
+          tipo_recurso: 'extra',
+          id_recurso: idExtra,
+          id_extra: idExtra,
+          ...context,
+          motivo: 'EXTRA_SIN_CONFIGURACION_INVENTARIO',
+          mensaje: `El extra ${context.nombre || context.codigo || idExtra} no tiene configuracion de inventario disponible.`
+        });
+        continue;
+      }
+      if (!Boolean(row.estado)) {
+        faltantes.push({
+          tipo_recurso: 'extra',
+          id_recurso: idExtra,
+          id_extra: idExtra,
+          ...context,
+          nombre: row.nombre,
+          codigo: row.codigo || null,
+          motivo: 'EXTRA_INACTIVO',
+          mensaje: `El extra ${row.nombre || row.codigo || idExtra} esta inactivo.`
+        });
+        continue;
+      }
+      const insumoId = toPositiveInt(row?.id_insumo);
+      const insumoFactor = Number(row?.insumo_factor || 0);
+      const unidadId = snapshotUnidadId || toPositiveInt(row?.id_unidad_medida);
+      const nombre = context.nombre || row?.nombre || null;
+      const codigo = context.codigo || row?.codigo || null;
+      if (!insumoId || insumoFactor <= 0) {
+        faltantes.push({
+          tipo_recurso: 'extra',
+          id_recurso: idExtra,
+          id_extra: idExtra,
+          ...context,
+          nombre,
+          codigo,
+          motivo: 'EXTRA_SIN_CONFIGURACION_INVENTARIO',
+          mensaje: `El extra ${nombre || codigo || idExtra} no tiene id_insumo o cantidad de consumo configurada.`
+        });
+        continue;
+      }
+      if (!unidadId) {
+        faltantes.push({
+          tipo_recurso: 'extra',
+          id_recurso: idExtra,
+          id_extra: idExtra,
+          ...context,
+          nombre,
+          codigo,
+          id_insumo: insumoId,
+          cant: insumoFactor,
+          motivo: 'EXTRA_SIN_UNIDAD_MEDIDA',
+          mensaje: `El extra ${nombre || codigo || idExtra} no tiene unidad de medida configurada.`
+        });
+        continue;
+      }
+      const lineQty = Number(context.cantidad || 0);
+      addToMapTotal(insumoQtyMap, insumoId, lineQty * insumoFactor);
+      addMovementRow(movimientoRows, {
+        tipo_recurso: 'insumo',
         id_insumo: insumoId,
-        cant: insumoFactor,
-        motivo: 'EXTRA_SIN_UNIDAD_MEDIDA',
-        mensaje: `El extra ${nombre || codigo || idExtra} no tiene unidad de medida configurada.`
+        id_detalle_pedido: context.id_detalle_pedido,
+        cantidad: lineQty * insumoFactor,
+        origen_consumo: 'EXTRA'
       });
-      continue;
     }
-    addToMapTotal(insumoQtyMap, insumoId, Number(extraQtyMap.get(idExtra) || 0) * insumoFactor);
+    if (contexts.length === 0) {
+      faltantes.push({
+        tipo_recurso: 'extra',
+        id_recurso: idExtra,
+        id_extra: idExtra,
+        ...firstExtraContext,
+        motivo: 'EXTRA_SIN_CONTEXTO_LINEA',
+        mensaje: `El extra ${idExtra} no tiene contexto de linea para inventario.`
+      });
+    }
   }
 
-  const allRecipeIds = [...recetaQtyMap.keys()].sort((a, b) => a - b);
+  const allRecipeIds = [...recetaQtyMap.keys()].filter((idReceta) => !excludedRecipeIds.has(idReceta)).sort((a, b) => a - b);
   const recipeComponentsRows = await fetchRecipeInsumoComponents(client, allRecipeIds);
   const recipeComponentsById = new Map();
+  const invalidRecipeComponentIds = new Set();
 
   for (const row of recipeComponentsRows) {
     const recipeId = Number(row?.id_receta || 0);
     const insumoId = Number(row?.id_insumo || 0);
     const factor = Number(row?.insumo_factor || 0);
-    if (!recipeId || !insumoId || factor <= 0) continue;
+    if (!recipeId) continue;
+    if (!insumoId || factor <= 0) {
+      invalidRecipeComponentIds.add(recipeId);
+      continue;
+    }
     if (!recipeComponentsById.has(recipeId)) recipeComponentsById.set(recipeId, []);
     recipeComponentsById.get(recipeId).push({
       id_insumo: insumoId,
@@ -311,6 +474,18 @@ export const resolvePedidoConsumo = async ({ client, items }) => {
   }
 
   for (const idReceta of allRecipeIds) {
+    if (invalidRecipeComponentIds.has(idReceta)) {
+      faltantes.push({
+        tipo_recurso: 'receta',
+        id_recurso: idReceta,
+        id_receta: idReceta,
+        ...firstContext(recetaContextById, idReceta),
+        nombre: recetasById.get(idReceta)?.nombre_receta || null,
+        motivo: 'RECETA_CON_COMPONENTES_INVALIDOS',
+        mensaje: `La receta ${recetasById.get(idReceta)?.nombre_receta || idReceta} tiene componentes de inventario invalidos.`
+      });
+      continue;
+    }
     const components = recipeComponentsById.get(idReceta) || [];
     if (components.length === 0) {
       faltantes.push({
@@ -327,6 +502,15 @@ export const resolvePedidoConsumo = async ({ client, items }) => {
     const recipeQty = Number(recetaQtyMap.get(idReceta) || 0);
     for (const component of components) {
       addToMapTotal(insumoQtyMap, component.id_insumo, recipeQty * Number(component.insumo_factor));
+      for (const context of recetaContextById.get(idReceta) || []) {
+        addMovementRow(movimientoRows, {
+          tipo_recurso: 'insumo',
+          id_insumo: component.id_insumo,
+          id_detalle_pedido: context.id_detalle_pedido,
+          cantidad: Number(context.cantidad || 0) * Number(component.insumo_factor),
+          origen_consumo: 'RECETA'
+        });
+      }
     }
   }
 
@@ -347,7 +531,8 @@ export const resolvePedidoConsumo = async ({ client, items }) => {
       productoQtyMap,
       recetaQtyMap,
       extraQtyMap,
-      insumoQtyMap
+      insumoQtyMap,
+      movimientoRows
     },
     contexto: {
       recetasById,

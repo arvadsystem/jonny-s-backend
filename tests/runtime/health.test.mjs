@@ -32,6 +32,43 @@ const createServer = () => new Promise((resolve) => {
   const server = app.listen(0, '127.0.0.1', () => resolve(server));
 });
 
+const createReadyQueryRunner = ({ traceGenerated = 'NEVER', sequenceLast = 100, maxPedido = 90, maxInventory = 95 } = {}) => ({
+  async query(sql, params = []) {
+    const text = String(sql);
+    if (sql === 'SELECT 1') return { rows: [{ '?column?': 1 }] };
+    if (text.includes('id_pedido_trazabilidad')) return { rows: [{ is_generated: traceGenerated }] };
+    if (text.includes("pg_get_serial_sequence('public.pedidos'")) {
+      return {
+        rows: [{
+          sequence_name: 'public.pedidos_id_pedido_seq',
+          pedidos_exists: true,
+          inventory_exists: true
+        }]
+      };
+    }
+    if (text.includes('JOIN pg_sequence')) {
+      assert.deepEqual(params, ['public.pedidos_id_pedido_seq']);
+      return {
+        rows: [{
+          sequence_schema: 'public',
+          sequence_relation: 'pedidos_id_pedido_seq',
+          sequence_increment_by: 1,
+          sequence_cycle: false,
+          sequence_min_value: 1,
+          sequence_max_value: 2147483647
+        }]
+      };
+    }
+    if (text.includes('FROM "public"."pedidos_id_pedido_seq"')) {
+      return { rows: [{ sequence_last_value: sequenceLast, sequence_is_called: true }] };
+    }
+    if (text.includes('MAX(id_pedido)')) {
+      return { rows: [{ max_pedido_id: maxPedido, max_inventory_order_ref: maxInventory }] };
+    }
+    throw new Error(`Unexpected health query: ${sql}`);
+  }
+});
+
 after(() => {
   setHealthCheckQueryRunnerForTests();
 });
@@ -58,12 +95,7 @@ describe('web health checks', () => {
   });
 
   it('GET /health/ready responde 200 cuando SELECT 1 funciona', async () => {
-    setHealthCheckQueryRunnerForTests({
-      async query(sql) {
-        assert.equal(sql, 'SELECT 1');
-        return { rows: [{ '?column?': 1 }] };
-      }
-    });
+    setHealthCheckQueryRunnerForTests(createReadyQueryRunner());
     const server = await createServer();
     try {
       const response = await request(server, '/health/ready');
@@ -71,6 +103,42 @@ describe('web health checks', () => {
       assert.equal(response.body.status, 'ready');
       assert.equal(response.body.database, 'ok');
       assert.equal(response.body.role, 'web');
+    } finally {
+      server.close();
+    }
+  });
+
+  it('GET /health/ready responde 503 cuando id_pedido_trazabilidad sigue generado', async () => {
+    setHealthCheckQueryRunnerForTests(createReadyQueryRunner({ traceGenerated: 'ALWAYS' }));
+    const server = await createServer();
+    try {
+      const response = await request(server, '/health/ready');
+      const serialized = JSON.stringify(response.body);
+      assert.equal(response.statusCode, 503);
+      assert.equal(response.body.status, 'not_ready');
+      assert.equal(response.body.database, 'error');
+      assert.doesNotMatch(serialized, /password|host|user|connectionString|stack/i);
+    } finally {
+      server.close();
+    }
+  });
+
+  it('GET /health/ready responde 503 cuando falta id_pedido_trazabilidad', async () => {
+    setHealthCheckQueryRunnerForTests({
+      async query(sql) {
+        if (sql === 'SELECT 1') return { rows: [{ '?column?': 1 }] };
+        if (String(sql).includes('id_pedido_trazabilidad')) return { rows: [] };
+        return createReadyQueryRunner().query(sql);
+      }
+    });
+    const server = await createServer();
+    try {
+      const response = await request(server, '/health/ready');
+      const serialized = JSON.stringify(response.body);
+      assert.equal(response.statusCode, 503);
+      assert.equal(response.body.status, 'not_ready');
+      assert.equal(response.body.database, 'error');
+      assert.doesNotMatch(serialized, /password|host|user|connectionString|stack/i);
     } finally {
       server.close();
     }

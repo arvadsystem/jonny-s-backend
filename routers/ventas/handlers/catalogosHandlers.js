@@ -534,13 +534,18 @@ const fetchRecetasCatalogoData = async ({
       rules: complementContext.rulesByRecipe.get(Number(row?.id_receta || 0)) || [],
       fallbackSauces: complementContext.fallbackSauces
     });
+    const metadataOk = metadata.ok !== false;
     return {
       ...row,
       imagen_principal_url: buildAbsolutePublicUrl(req, row.imagen_principal_url),
-      requiere_complementos: Boolean(metadata.requiere_complementos),
+      requiere_complementos: metadataOk && Boolean(metadata.requiere_complementos),
       tipo_complemento: metadata.tipo_complemento || VENTA_COMPLEMENTO_TIPO_SALSAS,
       minimo_complementos: Number(metadata.minimo_complementos || 0),
       maximo_complementos: Number(metadata.maximo_complementos || 0),
+      complementos_config_error: metadataOk ? null : {
+        code: metadata.code || 'VENTAS_REGLA_SALSA_CONFIGURACION_INVALIDA',
+        message: metadata.message || 'La receta tiene reglas de salsas incompletas.'
+      },
       complementos_disponibles: (Array.isArray(metadata.complementos_disponibles)
         ? metadata.complementos_disponibles
         : []).map((entry) => ({

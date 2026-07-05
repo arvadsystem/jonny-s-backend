@@ -1,13 +1,21 @@
 import pool from '../config/db-connection.js';
-import { normalizePedidoPayload, toPositiveInt } from './pedidoPayloadValidator.js';
+import { toPositiveInt } from './pedidoPayloadValidator.js';
+import { buildPedidoConsumoPayload } from './pedidoInventoryPayloadService.js';
 import { resolvePedidoConsumo } from './pedidoConsumoResolver.js';
 import { validarStockConBloqueo } from './inventarioStockValidator.js';
 import {
   MOVEMENT_REF,
-  SHORTAGE_MOVEMENT_REF,
-  fetchExistingPedidoMovement,
+  analyzePedidoMovementState,
+  buildLineMovementRows,
+  fetchPedidoInventoryMovementsForUpdate,
+  partitionPedidoInventoryMovements,
   registrarMovimientosPedido
 } from './inventarioMovimientoService.js';
+
+const PEDIDO_TRACE_UNIQUE_CONSTRAINTS = new Set([
+  'ux_mov_inv_linea_salida_insumo',
+  'ux_mov_inv_linea_salida_producto'
+]);
 
 // Orquestador de descuento por pedido (modulo INSUMOS).
 // -----------------------------------------------------
@@ -42,6 +50,82 @@ const ensureBranchExists = async (client, idSucursal) => {
   }
 };
 
+const createPedidoInventoryError = (code, message, status = 409, details = null) => {
+  const error = new Error(message);
+  error.httpStatus = status;
+  error.code = code;
+  if (details) error.details = details;
+  return error;
+};
+
+const lockPedidoForInventory = async (client, idPedido, idSucursal) => {
+  const rs = await client.query(
+    `
+      SELECT
+        id_pedido,
+        id_sucursal,
+        id_estado_pedido,
+        fecha_hora_pedido,
+        (EXTRACT(EPOCH FROM (fecha_hora_pedido AT TIME ZONE 'America/Tegucigalpa')) * 1000)::bigint AS fecha_hora_pedido_epoch_ms
+      FROM public.pedidos
+      WHERE id_pedido = $1
+      FOR UPDATE
+    `,
+    [idPedido]
+  );
+  const pedido = rs.rows[0] || null;
+  if (!pedido) {
+    throw createPedidoInventoryError(
+      'PEDIDO_NO_ENCONTRADO',
+      `El pedido ${idPedido} no existe.`,
+      404
+    );
+  }
+  if (Number(pedido.id_sucursal) !== Number(idSucursal)) {
+    throw createPedidoInventoryError(
+      'PEDIDO_SUCURSAL_NO_COINCIDE',
+      `El pedido ${idPedido} no pertenece a la sucursal ${idSucursal}.`
+    );
+  }
+  return pedido;
+};
+
+const fetchPedidoDetalleIds = async (client, idPedido) => {
+  const result = await client.query(
+    `
+      SELECT id_detalle_pedido
+      FROM public.detalle_pedido
+      WHERE id_pedido = $1
+        AND COALESCE(estado, true) = true
+    `,
+    [idPedido]
+  );
+  return (result.rows || [])
+    .map((row) => toPositiveInt(row.id_detalle_pedido))
+    .filter(Boolean);
+};
+
+const summarizeIgnoredLegacyCollisions = (rows = []) => {
+  const safeRows = Array.isArray(rows) ? rows : [];
+  if (!safeRows.length) return null;
+  const timestamps = safeRows
+    .map((row) => ({
+      value: row?.fecha_mov || null,
+      epoch: Number(row?.fecha_mov_epoch_ms)
+    }))
+    .filter((item) => item.value && Number.isFinite(item.epoch))
+    .sort((left, right) => left.epoch - right.epoch);
+  return {
+    ignored_count: safeRows.length,
+    min_fecha_mov: timestamps[0]?.value || null,
+    max_fecha_mov: timestamps[timestamps.length - 1]?.value || null,
+    movement_ids: safeRows
+      .map((row) => toPositiveInt(row?.id_movimiento))
+      .filter(Boolean)
+      .slice(0, 20)
+  };
+};
+
 const normalizeExcludedIdSet = (value) => {
   if (value instanceof Set) return value;
   if (Array.isArray(value)) return new Set(value.map((id) => Number(id)).filter((id) => id > 0));
@@ -63,25 +147,56 @@ const normalizePositiveIdSet = (value) => new Set(
     .filter((id) => Number.isInteger(id) && id > 0)
 );
 
-export const validarYDescontarPedido = async (payload, options = {}) => {
-  const normalized = normalizePedidoPayload(payload);
-  if (!normalized.ok) {
-    const error = new Error(normalized.errors[0] || 'Payload invalido.');
-    error.httpStatus = 400;
-    error.code = 'VALIDATION_ERROR';
-    error.details = normalized.errors;
-    throw error;
-  }
+const createPedidoMovementConflictError = ({ idPedido, movementState, cause }) => {
+  const isComplete = movementState?.state === 'COMPLETE';
+  const error = new Error(isComplete
+    ? `El pedido ${idPedido} ya fue descontado en inventario.`
+    : `El pedido ${idPedido} tiene movimientos de inventario parciales o inconsistentes.`);
+  error.httpStatus = 409;
+  error.code = isComplete ? 'PEDIDO_YA_DESCONTADO' : 'PEDIDO_INVENTARIO_PARCIAL_INCONSISTENTE';
+  error.details = {
+    id_movimiento: movementState?.id_movimiento || null,
+    movimientos_esperados: movementState?.expectedCount || 0,
+    movimientos_existentes: movementState?.existingCount || 0,
+    faltantes: movementState?.missing?.length || 0,
+    diferentes: movementState?.mismatched?.length || 0,
+    inesperados: movementState?.unexpected?.length || 0,
+    duplicados: movementState?.duplicates?.length || 0,
+    invalidos: movementState?.invalidRows?.length || 0,
+    ignored_legacy_id_collisions: movementState?.ignored_legacy_id_collisions || 0,
+    constraint: cause?.constraint || null
+  };
+  return error;
+};
 
-  const { id_sucursal: idSucursal, id_pedido: idPedido, items } = normalized.value;
+const buildInventoryWarningResponse = (warningDetails, generatedMovementCount) => {
+  if (!Array.isArray(warningDetails) || warningDetails.length === 0) return null;
+  const hasNegative = warningDetails.some((item) => String(item?.motivo || '').trim().toUpperCase() === 'STOCK_INSUFICIENTE');
+  const code = hasNegative ? 'STOCK_INSUFICIENTE_PERMITIDO' : 'STOCK_BAJO';
+  return {
+    code,
+    message: hasNegative
+      ? 'Pedido paso a preparacion y algunos recursos quedaron con saldo negativo.'
+      : 'Pedido paso a preparacion y algunos recursos quedaron por debajo del stock minimo.',
+    movimientos_generados: generatedMovementCount,
+    faltantes: warningDetails
+  };
+};
+
+export const validarYDescontarPedido = async (payload, options = {}) => {
+  const idSucursal = toPositiveInt(payload?.id_sucursal);
+  const idPedido = toPositiveInt(payload?.id_pedido);
+  if (!idSucursal || !idPedido) {
+    throw createPedidoInventoryError(
+      'VALIDATION_ERROR',
+      'id_sucursal e id_pedido son obligatorios y deben ser enteros > 0.',
+      400
+    );
+  }
   const actorUserId = toPositiveInt(options?.id_usuario) || null;
   const allowNegativeStock = options?.allowNegativeStock === true;
   const allowCrossBranchWarehouse = options?.allowCrossBranchWarehouse === true;
   const allowIncompleteConfiguration = options?.allowIncompleteConfiguration === true;
-  const shortageMode = String(options?.shortageMode || '').trim().toUpperCase();
-  const movementRefForShortage = shortageMode === SHORTAGE_MOVEMENT_REF
-    ? SHORTAGE_MOVEMENT_REF
-    : MOVEMENT_REF;
   const externalClient = options?.dbClient || null;
   const strictInsumoIds = normalizePositiveIdSet(options?.strictInsumoIds);
 
@@ -90,21 +205,25 @@ export const validarYDescontarPedido = async (payload, options = {}) => {
   try {
     if (manageTransaction) await client.query('BEGIN');
 
+    const pedidoContextRow = await lockPedidoForInventory(client, idPedido, idSucursal);
+    const detallePedidoIds = await fetchPedidoDetalleIds(client, idPedido);
     await ensureBranchExists(client, idSucursal);
-
-    const alreadyProcessedMovementId = await fetchExistingPedidoMovement(client, idPedido);
-    if (alreadyProcessedMovementId) {
-      const error = new Error(`El pedido ${idPedido} ya fue descontado en inventario.`);
-      error.httpStatus = 409;
-      error.code = 'PEDIDO_YA_DESCONTADO';
-      error.details = { id_movimiento: alreadyProcessedMovementId };
-      throw error;
+    const canonicalResult = await buildPedidoConsumoPayload(client, idPedido, idSucursal);
+    if (!canonicalResult.ok) {
+      const body = canonicalResult.body || {};
+      throw createPedidoInventoryError(
+        body.code || 'PEDIDO_CONSUMO_INVALIDO',
+        body.message || 'No se pudo construir el consumo canonico del pedido.',
+        Number(canonicalResult.status || 409),
+        body.details || null
+      );
     }
+    const canonicalItems = canonicalResult.payload.items;
 
-    // 1) Resolver consumo real desde items del pedido.
+    // 1) Resolver consumo real desde el pedido persistido, no desde el payload externo.
     const consumoResult = await resolvePedidoConsumo({
       client,
-      items
+      items: canonicalItems
     });
 
     // 2) Validar stock con locks de concurrencia.
@@ -117,29 +236,87 @@ export const validarYDescontarPedido = async (payload, options = {}) => {
       allowCrossBranchWarehouse
     });
 
-    // 3) Si existe cualquier faltante, rollback total (sin descuentos parciales).
+    // 3) Construir filas esperadas y revisar idempotencia antes de responder faltantes.
     const faltantes = [
       ...(Array.isArray(consumoResult.faltantes) ? consumoResult.faltantes : []),
       ...(Array.isArray(stockResult.faltantes) ? stockResult.faltantes : [])
     ];
 
+    const stockWarningCodes = new Set(['STOCK_INSUFICIENTE', 'STOCK_BAJO']);
     const configFaults = faltantes.filter(
-      (item) => String(item?.motivo || '').trim().toUpperCase() !== 'STOCK_INSUFICIENTE'
+      (item) => !stockWarningCodes.has(String(item?.motivo || '').trim().toUpperCase())
     );
-    const stockShortages = faltantes.filter(
+    const stockWarnings = faltantes.filter(
+      (item) => stockWarningCodes.has(String(item?.motivo || '').trim().toUpperCase())
+    );
+    const stockShortages = stockWarnings.filter(
       (item) => String(item?.motivo || '').trim().toUpperCase() === 'STOCK_INSUFICIENTE'
     );
     const strictConfigFaults = configFaults.filter((item) => strictInsumoIds.has(Number(item?.id_insumo || item?.id_recurso)));
-    const strictStockShortages = stockShortages.filter((item) => strictInsumoIds.has(Number(item?.id_insumo || item?.id_recurso)));
     const operationalWarnings = Array.isArray(stockResult.advertencias)
       ? stockResult.advertencias
       : [];
     const configWarnings = allowIncompleteConfiguration ? configFaults : [];
     const warningDetails = [
-      ...stockShortages,
+      ...stockWarnings,
       ...operationalWarnings,
       ...configWarnings
     ];
+
+    const excludedProductIds = normalizeExcludedIdSet(stockResult.excludedResources?.productoIds);
+    const excludedInsumoIds = normalizeExcludedIdSet(stockResult.excludedResources?.insumoIds);
+    const movimientoProductoQtyMap = filterQtyMap(
+      consumoResult.consumo.productoQtyMap,
+      excludedProductIds
+    );
+    const movimientoInsumoQtyMap = filterQtyMap(
+      consumoResult.consumo.insumoQtyMap,
+      excludedInsumoIds
+    );
+    const shortagesByResource = new Map(
+      stockShortages.map((item) => [`${item.tipo_recurso}:${item.id_recurso}`, item])
+    );
+    const expectedLineMovementRows = buildLineMovementRows({
+      movementRows: consumoResult.consumo.movimientoRows,
+      productosById: stockResult.lockedRows.productosById,
+      insumosById: stockResult.lockedRows.insumosById,
+      actorUserId,
+      idPedido,
+      refOrigen: MOVEMENT_REF,
+      shortagesByResource,
+      excludedProductIds,
+      excludedInsumoIds
+    });
+    const existingMovementRows = await fetchPedidoInventoryMovementsForUpdate(client, idPedido);
+    const partitionedMovementRows = partitionPedidoInventoryMovements({
+      rows: existingMovementRows,
+      context: {
+        idPedido,
+        fechaHoraPedidoEpochMs: pedidoContextRow.fecha_hora_pedido_epoch_ms,
+        detallePedidoIds
+      }
+    });
+    if (partitionedMovementRows.ignoredLegacyCollisionRows.length > 0) {
+      console.warn('[inventario_pedido] legacy id collision ignored', {
+        id_pedido: idPedido,
+        fecha_hora_pedido: pedidoContextRow.fecha_hora_pedido || null,
+        ...summarizeIgnoredLegacyCollisions(partitionedMovementRows.ignoredLegacyCollisionRows)
+      });
+    }
+    const movementState = analyzePedidoMovementState({
+      expectedRows: expectedLineMovementRows,
+      existingRows: [
+        ...partitionedMovementRows.currentRows,
+        ...partitionedMovementRows.invalidCurrentTraceRows
+      ]
+    });
+    movementState.ignored_legacy_id_collisions = partitionedMovementRows.ignoredLegacyCollisionRows.length;
+    if (movementState.state === 'COMPLETE') {
+      throw createPedidoMovementConflictError({ idPedido, movementState });
+    }
+    if (movementState.state === 'PARTIAL') {
+      throw createPedidoMovementConflictError({ idPedido, movementState });
+    }
 
     if (strictConfigFaults.length > 0 || (configFaults.length > 0 && !allowIncompleteConfiguration)) {
       const blockingConfigFaults = strictConfigFaults.length > 0 ? strictConfigFaults : configFaults;
@@ -155,8 +332,7 @@ export const validarYDescontarPedido = async (payload, options = {}) => {
       };
     }
 
-    if (strictStockShortages.length > 0 || (stockShortages.length > 0 && !allowNegativeStock)) {
-      const blockingStockShortages = strictStockShortages.length > 0 ? strictStockShortages : stockShortages;
+    if (stockShortages.length > 0 && !allowNegativeStock) {
       if (manageTransaction) await client.query('ROLLBACK');
       return {
         ok: false,
@@ -164,38 +340,54 @@ export const validarYDescontarPedido = async (payload, options = {}) => {
         message: 'No se pudo descontar inventario porque faltan recursos o hay configuraciones incompletas.',
         id_pedido: idPedido,
         id_sucursal: idSucursal,
-        faltantes: blockingStockShortages
+        faltantes: stockShortages
       };
     }
 
-    const excludedProductIds = normalizeExcludedIdSet(stockResult.excludedResources?.productoIds);
-    const excludedInsumoIds = normalizeExcludedIdSet(stockResult.excludedResources?.insumoIds);
-    const movimientoProductoQtyMap = filterQtyMap(
-      consumoResult.consumo.productoQtyMap,
-      excludedProductIds
-    );
-    const movimientoInsumoQtyMap = filterQtyMap(
-      consumoResult.consumo.insumoQtyMap,
-      excludedInsumoIds
-    );
-    const generatedMovementCount = movimientoProductoQtyMap.size + movimientoInsumoQtyMap.size;
-    const shortagesByResource = new Map(
-      stockShortages.map((item) => [`${item.tipo_recurso}:${item.id_recurso}`, item])
-    );
-
     // 4) Registrar movimientos de salida ligados al pedido.
-    await registrarMovimientosPedido({
-      client,
-      idPedido,
-      actorUserId,
-      productoQtyMap: movimientoProductoQtyMap,
-      insumoQtyMap: movimientoInsumoQtyMap,
-      productosById: stockResult.lockedRows.productosById,
-      insumosById: stockResult.lockedRows.insumosById,
-      insumoTraceById: consumoResult.insumoTraceById,
-      refOrigen: stockShortages.length > 0 ? movementRefForShortage : MOVEMENT_REF,
-      shortagesByResource
-    });
+    let generatedMovementCount = 0;
+    await client.query('SAVEPOINT inventario_movimientos_insert');
+    try {
+      generatedMovementCount = await registrarMovimientosPedido({
+        client,
+        idPedido,
+        actorUserId,
+        productoQtyMap: movimientoProductoQtyMap,
+        insumoQtyMap: movimientoInsumoQtyMap,
+        productosById: stockResult.lockedRows.productosById,
+        insumosById: stockResult.lockedRows.insumosById,
+        insumoTraceById: consumoResult.insumoTraceById,
+        movementRows: consumoResult.consumo.movimientoRows,
+        refOrigen: MOVEMENT_REF,
+        shortagesByResource,
+        excludedProductIds,
+        excludedInsumoIds
+      });
+      await client.query('RELEASE SAVEPOINT inventario_movimientos_insert');
+    } catch (error) {
+      if (error?.code === '23505' && PEDIDO_TRACE_UNIQUE_CONSTRAINTS.has(error?.constraint)) {
+        await client.query('ROLLBACK TO SAVEPOINT inventario_movimientos_insert');
+        const concurrentRows = await fetchPedidoInventoryMovementsForUpdate(client, idPedido);
+        const concurrentPartitionedRows = partitionPedidoInventoryMovements({
+          rows: concurrentRows,
+          context: {
+            idPedido,
+            fechaHoraPedidoEpochMs: pedidoContextRow.fecha_hora_pedido_epoch_ms,
+            detallePedidoIds
+          }
+        });
+        const concurrentState = analyzePedidoMovementState({
+          expectedRows: expectedLineMovementRows,
+          existingRows: [
+            ...concurrentPartitionedRows.currentRows,
+            ...concurrentPartitionedRows.invalidCurrentTraceRows
+          ]
+        });
+        concurrentState.ignored_legacy_id_collisions = concurrentPartitionedRows.ignoredLegacyCollisionRows.length;
+        throw createPedidoMovementConflictError({ idPedido, movementState: concurrentState, cause: error });
+      }
+      throw error;
+    }
 
     if (manageTransaction) await client.query('COMMIT');
 
@@ -209,15 +401,7 @@ export const validarYDescontarPedido = async (payload, options = {}) => {
         : 'Inventario descontado correctamente.',
       id_pedido: idPedido,
       id_sucursal: idSucursal,
-      warning: warningDetails.length > 0
-        ? {
-            code: 'STOCK_INSUFICIENTE_PERMITIDO',
-            message: generatedMovementCount > 0
-              ? 'Pedido paso a preparacion y el inventario se desconto con advertencias operativas.'
-              : 'Pedido paso a preparacion con advertencias operativas de inventario.',
-            faltantes: warningDetails
-          }
-        : null,
+      warning: buildInventoryWarningResponse(warningDetails, generatedMovementCount),
       resumen: {
         productos_afectados: movimientoProductoQtyMap.size,
         insumos_afectados: movimientoInsumoQtyMap.size,
