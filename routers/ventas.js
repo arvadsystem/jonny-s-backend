@@ -85,12 +85,19 @@ import {
 } from './ventas/services/ventasPayloadService.js';
 import {
   buildPedidoPendienteRpcPayload,
+  buildPedidoPendienteRpcV2Payload,
   buildVentaRpcPayload,
   buildVentaRpcV2Payload,
+  buildVentaRpcV3Payload,
   validateVentaMontoCobro,
   VENTA_MONTO_COBRO_INVALIDO_CODE,
   VENTA_MONTO_COBRO_INVALIDO_MESSAGE
 } from './ventas/services/ventasRpcPayloadService.js';
+import {
+  buildRpcFidelizacionJob,
+  buildVentasRpcActor,
+  executeVentasRpc
+} from './ventas/services/ventasRpcExecutionService.js';
 import {
   DESCUENTO_ALCANCE_KEYS,
   DESCUENTO_TIPO_KEYS,
@@ -143,9 +150,11 @@ import {
   createVentasPerfTracker,
   instrumentVentasSqlClient,
   isPedidoPendienteRpcV1Enabled,
+  isPedidoPendienteRpcV2Enabled,
   isVentasPerfEnabled,
   isVentasRpcTransactionEnabled,
   isVentasRpcV2Enabled,
+  isVentasRpcV3Enabled,
   logVentasPerfRoute,
   logVentasPerfStartupIfEnabled
 } from './ventas/utils/perfUtils.js';
@@ -1339,6 +1348,53 @@ const createVentaWithRpcV2Transaction = async ({ client, venta, perf, requestSta
   };
 };
 
+const createVentaWithRpcV3Transaction = async ({
+  client,
+  venta,
+  perf,
+  idempotencyKey,
+  requestHash,
+  requestStartedAt = 0
+}) => {
+  const rpcTotalStart = perf?.now?.() || 0;
+  const payloadStart = perf?.now?.() || 0;
+  const rpcPayload = buildVentaRpcV3Payload({ venta, idempotencyKey, requestHash });
+  const amountValidation = validateVentaMontoCobro({ venta, payload: rpcPayload });
+  if (!amountValidation.ok) {
+    throw {
+      httpStatus: amountValidation.status,
+      code: amountValidation.code,
+      publicMessage: amountValidation.message
+    };
+  }
+  const rpcActor = buildVentasRpcActor(venta);
+  perf?.add?.('rpc_v3_payload_build_ms', payloadStart);
+  perf?.add?.('pre_rpc_total_ms', rpcTotalStart);
+  if (requestStartedAt) perf?.add?.('node_before_rpc_ms', requestStartedAt);
+
+  const afterRpcStart = perf?.now?.() || 0;
+  const response = await executeVentasRpc({
+    client,
+    sql: 'SELECT public.registrar_venta_pos_v3($1::jsonb, $2::jsonb) AS response',
+    payload: rpcPayload,
+    actor: rpcActor,
+    perf,
+    callMetric: 'rpc_v3_call_ms',
+    expectedVersion: 'v3',
+    invalidCode: 'VENTAS_RPC_V3_RESPONSE_INVALID'
+  });
+  perf?.add?.('rpc_v3_total_ms', rpcTotalStart);
+  perf?.add?.('post_rpc_total_ms', afterRpcStart);
+  return {
+    response: {
+      ...response,
+      fidelizacion: null
+    },
+    afterRpcStart,
+    fidelizacionJob: buildRpcFidelizacionJob({ response, venta })
+  };
+};
+
 const createPedidoPendienteWithRpcV1Transaction = async ({ client, pedidoPendiente, perf }) => {
   const rpcTotalStart = perf?.now?.() || 0;
   const rpcPayloadBuildStart = perf?.now?.() || 0;
@@ -1368,6 +1424,32 @@ const createPedidoPendienteWithRpcV1Transaction = async ({ client, pedidoPendien
     };
   }
 
+  return response;
+};
+
+const createPedidoPendienteWithRpcV2Transaction = async ({
+  client,
+  pedidoPendiente,
+  perf,
+  idempotencyKey,
+  requestHash
+}) => {
+  const rpcTotalStart = perf?.now?.() || 0;
+  const payloadStart = perf?.now?.() || 0;
+  const rpcPayload = buildPedidoPendienteRpcV2Payload({ pedidoPendiente, idempotencyKey, requestHash });
+  const rpcActor = buildVentasRpcActor(pedidoPendiente);
+  perf?.add?.('pedido_pendiente_rpc_v2_payload_build_ms', payloadStart);
+  const response = await executeVentasRpc({
+    client,
+    sql: 'SELECT public.registrar_pedido_pendiente_pos_v2($1::jsonb, $2::jsonb) AS response',
+    payload: rpcPayload,
+    actor: rpcActor,
+    perf,
+    callMetric: 'pedido_pendiente_rpc_v2_call_ms',
+    expectedVersion: 'v2',
+    invalidCode: 'PEDIDO_PENDIENTE_RPC_V2_RESPONSE_INVALID'
+  });
+  perf?.add?.('pedido_pendiente_rpc_v2_total_ms', rpcTotalStart);
   return response;
 };
 
@@ -3546,6 +3628,7 @@ const hydrateVentaLines = async (client, normalizedItems, perf = null, options =
       id_receta: item.id_receta,
       id_descuento_catalogo_linea: item.id_descuento_catalogo_linea ?? null,
       id_almacen: null,
+      componentes_receta: Array.isArray(receta.componentes) ? receta.componentes : [],
       nombre_item: receta.nombre_receta || `Receta #${item.id_receta}`,
       cantidad: item.cantidad,
       precio_unitario: precioUnitario,
@@ -8001,7 +8084,9 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
   const ventasPerf = createVentasPerfTracker();
   const pedidoPendienteRouteStart = ventasPerf.now();
   const pedidoPendienteRoute = 'POST /ventas/pedidos-pendientes';
-  const pedidoPendienteRpcEnabled = isPedidoPendienteRpcV1Enabled();
+  const pedidoPendienteRpcV2Enabled = isPedidoPendienteRpcV2Enabled();
+  const pedidoPendienteRpcV1Enabled = isPedidoPendienteRpcV1Enabled();
+  const pedidoPendienteRpcEnabled = pedidoPendienteRpcV2Enabled || pedidoPendienteRpcV1Enabled;
   let pedidoPendientePersistenceMode = 'not_reached';
   let pedidoPendienteRpcSkipReason = null;
   let pedidoPendienteTotalRouteMeasured = false;
@@ -8023,6 +8108,7 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
     id_sesion_caja: parseOptionalPositiveInt(req.body?.id_sesion_caja) || null,
     items_count: Array.isArray(req.body?.items) ? req.body.items.length : 0,
     rpc_enabled: pedidoPendienteRpcEnabled,
+    rpc_version: pedidoPendienteRpcV2Enabled ? 'v2' : pedidoPendienteRpcV1Enabled ? 'v1' : 'legacy',
     cuenta_dividida: hasCuentaDivididaPayload(req.body)
   };
   const buildPedidoPendientePerfLogContext = (extra = {}) => {
@@ -8079,13 +8165,15 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
 
     const idempotencyStart = ventasPerf.now();
     try {
-      idempotencyReservation = await reserveVentasIdempotencyKey({
-        idempotencyKey,
-        operation: 'POST /ventas/pedidos-pendientes',
-        requestHash: idempotencyRequestHash,
-        idUsuario: userId,
-        idSucursal: req.body?.id_sucursal
-      });
+      idempotencyReservation = pedidoPendienteRpcV2Enabled
+        ? { enabled: Boolean(idempotencyKey), rpcManaged: true }
+        : await reserveVentasIdempotencyKey({
+          idempotencyKey,
+          operation: 'POST /ventas/pedidos-pendientes',
+          requestHash: idempotencyRequestHash,
+          idUsuario: userId,
+          idSucursal: req.body?.id_sucursal
+        });
     } finally {
       ventasPerf.add('pedido_pendiente_idempotency_ms', idempotencyStart);
     }
@@ -8165,12 +8253,42 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
     ventasPerfContext.cuenta_dividida = Boolean(cuentaDivisionPlan);
     const pedidoPendienteHasSalsasInventario = getSelectedSalsaIdsFromLines(pedidoPendiente.pedido_lines).length > 0;
 
+    const shouldUsePedidoPendienteRpcV2 =
+      pedidoPendienteRpcV2Enabled
+      && !cuentaDivisionPlan
+      && Array.isArray(pedidoPendiente.pedido_lines)
+      && pedidoPendiente.pedido_lines.length > 0;
+
     const shouldUsePedidoPendienteRpcV1 =
-      pedidoPendienteRpcEnabled
+      pedidoPendienteRpcV1Enabled
       && !pedidoPendienteHasSalsasInventario
       && !cuentaDivisionPlan
       && Array.isArray(pedidoPendiente.pedido_lines)
       && pedidoPendiente.pedido_lines.length > 0;
+
+    if (shouldUsePedidoPendienteRpcV2) {
+      pedidoPendientePersistenceMode = 'pending_rpc_v2';
+      ventasPerfContext.rpc_inventory_mode = 'inside_rpc';
+      const rpcResponseBody = await createPedidoPendienteWithRpcV2Transaction({
+        client,
+        pedidoPendiente,
+        perf: ventasPerf,
+        idempotencyKey,
+        requestHash: idempotencyRequestHash
+      });
+      const commitStart = ventasPerf.now();
+      await client.query('COMMIT');
+      transactionStarted = false;
+      ventasPerf.add('commit_ms', commitStart);
+      ventasPerf.add('pedido_pendiente_commit_ms', commitStart);
+      ventasPerf.add('transaction_ms', transactionStart);
+      addPedidoPendienteTotalRoute();
+      ventasPerf.log(buildPedidoPendientePerfLogContext({
+        status: 201,
+        pedido_pendiente_rpc_v2_idempotent_replay: Boolean(rpcResponseBody.idempotent_replay)
+      }));
+      return res.status(201).json(rpcResponseBody);
+    }
 
     if (shouldUsePedidoPendienteRpcV1) {
       pedidoPendientePersistenceMode = 'rpc_v1';
@@ -8218,9 +8336,11 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
 
     pedidoPendientePersistenceMode = 'legacy';
     if (cuentaDivisionPlan) {
-      pedidoPendienteRpcSkipReason = 'cuenta_dividida';
+      pedidoPendienteRpcSkipReason = pedidoPendienteRpcV2Enabled
+        ? 'CUENTA_DIVIDIDA_NO_SOPORTADA_RPC_V2'
+        : 'cuenta_dividida';
     } else if (pedidoPendienteHasSalsasInventario) {
-      pedidoPendienteRpcSkipReason = 'salsas_inventario';
+      pedidoPendienteRpcSkipReason = pedidoPendienteRpcV2Enabled ? null : 'salsas_inventario';
     } else if (!pedidoPendienteRpcEnabled) {
       pedidoPendienteRpcSkipReason = 'flag_disabled';
     } else if (!Array.isArray(pedidoPendiente.pedido_lines) || pedidoPendiente.pedido_lines.length === 0) {
@@ -8564,13 +8684,15 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
       });
       transactionStarted = false;
     }
-    await saveVentasIdempotencyFailure({
-      reservation: idempotencyReservation,
-      httpStatus: Number.isInteger(err?.httpStatus) ? err.httpStatus : 500,
-      errorCode: err?.code || null
-    }).catch((idempotencyErr) => {
-      console.error('No se pudo marcar fallo idempotente de pedido pendiente:', idempotencyErr);
-    });
+    if (!idempotencyReservation?.rpcManaged) {
+      await saveVentasIdempotencyFailure({
+        reservation: idempotencyReservation,
+        httpStatus: Number.isInteger(err?.httpStatus) ? err.httpStatus : 500,
+        errorCode: err?.code || null
+      }).catch((idempotencyErr) => {
+        console.error('No se pudo marcar fallo idempotente de pedido pendiente:', idempotencyErr);
+      });
+    }
     addPedidoPendienteTotalRoute();
     ventasPerf.log(buildPedidoPendientePerfLogContext({
       status: Number.isInteger(err?.httpStatus) ? err.httpStatus : 500,
@@ -9430,6 +9552,7 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
     has_pedido_pendiente: false
   });
   const cuentaDivididaSolicitada = hasCuentaDivididaPayload(req.body);
+  const ventasRpcV3Enabled = !cuentaDivididaSolicitada && isVentasRpcV3Enabled();
   const ventasRpcV2Enabled = !cuentaDivididaSolicitada && isVentasRpcV2Enabled();
   const ventasRpcV1Enabled = !cuentaDivididaSolicitada && isVentasRpcTransactionEnabled();
   const ventasPerfContext = {
@@ -9438,9 +9561,10 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
     id_caja: null,
     id_sesion_caja: null,
     items_count: Array.isArray(req.body?.items) ? req.body.items.length : 0,
-    rpc_enabled: ventasRpcV2Enabled || ventasRpcV1Enabled,
+    rpc_enabled: ventasRpcV3Enabled || ventasRpcV2Enabled || ventasRpcV1Enabled,
+    rpc_v3_enabled: ventasRpcV3Enabled,
     rpc_v2_enabled: ventasRpcV2Enabled,
-    rpc_version: ventasRpcV2Enabled ? 'v2' : ventasRpcV1Enabled ? 'v1' : 'legacy'
+    rpc_version: ventasRpcV3Enabled ? 'v3' : ventasRpcV2Enabled ? 'v2' : ventasRpcV1Enabled ? 'v1' : 'legacy'
   };
   const idempotencyKey = getIdempotencyKey(req);
   const idempotencyRequestHash = idempotencyKey
@@ -9488,14 +9612,16 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
     ventasPerfContext.id_usuario = userId || null;
     ventasPerf.add('auth_context_ms', authContextStart);
 
-    idempotencyReservation = await reserveVentasIdempotencyKey({
-      client,
-      idempotencyKey,
-      operation: 'POST /ventas',
-      requestHash: idempotencyRequestHash,
-      idUsuario: userId,
-      idSucursal: req.body?.id_sucursal
-    });
+    idempotencyReservation = ventasRpcV3Enabled
+      ? { enabled: Boolean(idempotencyKey), rpcManaged: true }
+      : await reserveVentasIdempotencyKey({
+        client,
+        idempotencyKey,
+        operation: 'POST /ventas',
+        requestHash: idempotencyRequestHash,
+        idUsuario: userId,
+        idSucursal: req.body?.id_sucursal
+      });
     if (idempotencyReservation.replay) {
       await client.query('ROLLBACK');
       transactionStarted = false;
@@ -9608,7 +9734,12 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
     venta.id_sucursal = Number(validatedCajaSession.id_sucursal);
     const ventaHasExtras = hasVentaExtras(venta);
     const ventaHasSalsasInventario = getSelectedSalsaIdsFromLines(venta.all_lines).length > 0;
-    if (ventaHasSalsasInventario) {
+    if (ventasRpcV3Enabled) {
+      ventasPerfContext.rpc_enabled = true;
+      ventasPerfContext.rpc_version = 'v3';
+      ventasPerfContext.persistence_mode = 'rpc_v3';
+      ventasPerfContext.rpc_inventory_mode = 'inside_rpc';
+    } else if (ventaHasSalsasInventario) {
       ventasPerfContext.rpc_enabled = false;
       ventasPerfContext.rpc_version = 'legacy_salsas_inventario';
       ventasPerfContext.rpc_disabled_reason = 'SALSAS_INVENTARIO_NO_SOPORTADAS_RPC_V2';
@@ -9622,6 +9753,38 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
         : 'FEATURE_FLAG_DISABLED';
     } else if (!ventasRpcV2Enabled && !ventasRpcV1Enabled) {
       ventasPerfContext.rpc_disabled_reason = 'FEATURE_FLAG_DISABLED';
+    }
+
+    if (ventasRpcV3Enabled) {
+      const rpcCreateResult = await createVentaWithRpcV3Transaction({
+        client,
+        venta,
+        perf: ventasPerf,
+        idempotencyKey,
+        requestHash: idempotencyRequestHash,
+        requestStartedAt: authContextStart
+      });
+      const rpcV3ResponseBody = attachVentaSnapshotsToResponse(rpcCreateResult.response, venta);
+      const commitStart = ventasPerf.now();
+      await client.query('COMMIT');
+      transactionStarted = false;
+      transactionCommitted = true;
+      ventasPerf.add('commit_ms', commitStart);
+      ventasPerf.add('transaction_ms', transactionStart);
+
+      ventasPerf.add('node_after_rpc_ms', rpcCreateResult.afterRpcStart);
+      ventasPerf.log({
+        ...ventasPerfContext,
+        status: 201,
+        rpc_v3_idempotent_replay: Boolean(rpcV3ResponseBody.idempotent_replay),
+        inventario_ms: 0
+      });
+      res.status(201).json(rpcV3ResponseBody);
+
+      if (!rpcV3ResponseBody.idempotent_replay) {
+        void registerVentaFidelizacionAfterCommit(rpcCreateResult.fidelizacionJob);
+      }
+      return;
     }
 
     if (ventasRpcV2Enabled && !ventaHasSalsasInventario) {
@@ -10282,7 +10445,7 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
       transactionStarted = false;
     }
     const mappedErr = mapCajaFinancialLockError(err);
-    if (!transactionCommitted) {
+    if (!transactionCommitted && !idempotencyReservation?.rpcManaged) {
       await saveVentasIdempotencyFailure({
         client,
         reservation: idempotencyReservation,

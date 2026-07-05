@@ -80,16 +80,29 @@ describe('POST /ventas transaction regression guard', () => {
     );
   });
 
-  it('guarda SUCCESS idempotente antes de cada COMMIT exitoso de POST /ventas', async () => {
+  it('guarda SUCCESS idempotente antes de cada COMMIT exitoso legacy/V1/V2 de POST /ventas', async () => {
     const handler = await getPostVentasHandlerSource();
     const commitMatches = [...handler.matchAll(/await client\.query\('COMMIT'\);/g)];
-    assert.equal(commitMatches.length, 3);
-    for (const match of commitMatches) {
+    assert.equal(commitMatches.length, 4);
+    for (const match of commitMatches.slice(1)) {
       const beforeCommit = handler.slice(Math.max(0, match.index - 900), match.index);
       const afterCommit = handler.slice(match.index, match.index + 450);
       assert.match(beforeCommit, /await saveVentasIdempotencySuccess\(/);
       assert.doesNotMatch(afterCommit, /await saveVentasIdempotencySuccess\(/);
     }
+  });
+
+  it('POST /ventas V3 no persiste idempotencia externa ni inventario Node despues de la RPC', async () => {
+    const handler = await getPostVentasHandlerSource();
+    const v3Start = handler.indexOf('if (ventasRpcV3Enabled) {');
+    assert.notEqual(v3Start, -1, 'No se encontro el bloque V3.');
+    const v2Start = handler.indexOf('if (ventasRpcV2Enabled && !ventaHasSalsasInventario)', v3Start);
+    assert.notEqual(v2Start, -1, 'No se encontro el bloque V2 posterior.');
+    const v3Block = handler.slice(v3Start, v2Start);
+    assert.match(v3Block, /createVentaWithRpcV3Transaction/);
+    assert.doesNotMatch(v3Block, /saveVentasIdempotencySuccess/);
+    assert.doesNotMatch(v3Block, /validarYDescontarInventarioCajaPedido/);
+    assert.doesNotMatch(v3Block, /persistVentaPedidoSnapshots/);
   });
 
   it('no ejecuta ROLLBACK ni marca FAILED despues de un COMMIT confirmado', async () => {

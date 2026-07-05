@@ -18,8 +18,10 @@ export const logVentasPerfStartupIfEnabled = () => {
     NODE_ENV: process.env.NODE_ENV || null,
     VENTAS_PERF_LOGS: process.env.VENTAS_PERF_LOGS || null,
     VENTAS_USE_RPC_V2: process.env.VENTAS_USE_RPC_V2 || null,
+    VENTAS_USE_RPC_V3: process.env.VENTAS_USE_RPC_V3 || null,
     VENTAS_USE_RPC_TRANSACTION: process.env.VENTAS_USE_RPC_TRANSACTION || null,
     PEDIDO_PENDIENTE_USE_RPC_V1: process.env.PEDIDO_PENDIENTE_USE_RPC_V1 || null,
+    PEDIDO_PENDIENTE_USE_RPC_V2: process.env.PEDIDO_PENDIENTE_USE_RPC_V2 || null,
     VENTAS_CATALOG_CACHE_TTL_MS: process.env.VENTAS_CATALOG_CACHE_TTL_MS || null,
     EMAIL_SCHEDULER_ENABLED: process.env.EMAIL_SCHEDULER_ENABLED || null
   });
@@ -45,10 +47,18 @@ export function isVentasRpcV2Enabled() {
     .toLowerCase() === 'true';
 }
 
+export function isVentasRpcV3Enabled() {
+  return parseTruthyEnv(process.env.VENTAS_USE_RPC_V3);
+}
+
 export function isPedidoPendienteRpcV1Enabled() {
   return String(process.env.PEDIDO_PENDIENTE_USE_RPC_V1 || '')
     .trim()
     .toLowerCase() === 'true';
+}
+
+export function isPedidoPendienteRpcV2Enabled() {
+  return parseTruthyEnv(process.env.PEDIDO_PENDIENTE_USE_RPC_V2);
 }
 
 export const measureVentasPerf = async (perf, name, task) => {
