@@ -40,6 +40,8 @@ export const buildComplementLineConfig = (line) => {
     minimo_complementos: Number(metadata?.minimo_complementos || 0),
     maximo_complementos: Number(metadata?.maximo_complementos || 0),
     complementos_incompletos_autorizados: Boolean(metadata?.complementos_incompletos_autorizados),
+    complementos_incompletos_autorizado_por: metadata?.complementos_incompletos_autorizado_por || null,
+    complementos_incompletos_permiso: metadata?.complementos_incompletos_permiso || null,
     complementos_recomendados: Number(metadata?.complementos_recomendados ?? metadata?.minimo_complementos ?? 0),
     complementos_seleccionados: Number(metadata?.complementos_seleccionados ?? selected.length),
     complementos: selected.map((entry) => ({
@@ -141,13 +143,13 @@ export const normalizeVentaItems = (items) => {
       return { ok: false, message: extrasResult.message };
     }
     const complementosIncompletosInput = item.complementos_incompletos_autorizados ?? item.permitir_complementos_incompletos;
-    let complementosIncompletosAutorizados = false;
+    let complementosIncompletosSolicitados = false;
     if (complementosIncompletosInput !== undefined && complementosIncompletosInput !== null) {
       const parsedComplementosIncompletos = parseBooleanInput(complementosIncompletosInput);
       if (!parsedComplementosIncompletos.ok) {
         return { ok: false, message: 'complementos_incompletos_autorizados debe ser booleano.' };
       }
-      complementosIncompletosAutorizados = parsedComplementosIncompletos.value;
+      complementosIncompletosSolicitados = parsedComplementosIncompletos.value;
     }
 
     normalized.push({
@@ -160,7 +162,8 @@ export const normalizeVentaItems = (items) => {
       observacion: normalizeObservation(item.observacion),
       id_descuento_catalogo_linea: idDescuentoCatalogoLinea,
       complementos: complementosResult.data,
-      complementos_incompletos_autorizados: complementosIncompletosAutorizados,
+      // Este valor es una solicitud del cliente; la autorizacion final se resuelve en el servidor.
+      complementos_incompletos_solicitados: complementosIncompletosSolicitados,
       extras: extrasResult.data
     });
   }

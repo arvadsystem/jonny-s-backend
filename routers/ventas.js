@@ -48,9 +48,9 @@ import {
   buildVentaComplementContext,
   buildVentasStaticCacheKey,
   fetchCachedVentasStaticRows,
-  resolveRecetaComplementMetadata,
-  validateComplementSelectionBounds
+  resolveRecetaComplementMetadata
 } from './ventas/services/complementosCatalogService.js';
+import { resolveComplementosIncompleteAuthorization } from './ventas/services/complementosAuthorizationService.js';
 import {
   getCajaBootstrapHandler,
   listCategoriasCatalogoHandler,
@@ -126,6 +126,7 @@ import {
   VENTA_DIRECTA_LABEL,
   VENTAS_DEFAULT_PAGE,
   VENTAS_DEFAULT_PAGE_SIZE,
+  VENTAS_COMPLEMENTOS_INCOMPLETOS_AUTORIZAR_PERMISSION,
   VENTAS_DESCUENTO_APLICAR_PERMISSION,
   VENTAS_DESCUENTOS_PERMISSIONS,
   VENTAS_DESCUENTOS_WRITE_PERMISSIONS,
@@ -2169,7 +2170,7 @@ const validarYDescontarInventarioCajaPedido = async ({
   }
 };
 
-const resolveLineComplementos = ({ item, receta, context, nombreItem }) => {
+const resolveLineComplementos = ({ item, receta, context, nombreItem, complementosIncompleteAuthorization = {} }) => {
   if (item.kind === 'PRODUCTO' || item.kind === 'ITEM') {
     if (Array.isArray(item.complementos) && item.complementos.length > 0) {
       return buildInvalidComplementResult({ item, nombreItem, reason: 'PRODUCTO_NO_PERMITE_COMPLEMENTOS' });
@@ -2230,12 +2231,14 @@ const resolveLineComplementos = ({ item, receta, context, nombreItem }) => {
   const min = Math.max(0, Number(metadata.minimo_complementos || 0));
   const max = Math.max(min, Number(metadata.maximo_complementos || 0));
   const complementosIncompletos = min > 0 && selected.length < min;
-  const boundsResult = validateComplementSelectionBounds({
+  const boundsResult = resolveComplementosIncompleteAuthorization({
     selectedCount: selected.length,
     minimo: min,
     maximo: max,
-    allowIncomplete: item.complementos_incompletos_autorizados === true,
-    nombreItem
+    nombreItem,
+    requestedOverride: item.complementos_incompletos_solicitados === true,
+    serverAuthorized: complementosIncompleteAuthorization.serverAuthorized === true,
+    authorizedByUserId: complementosIncompleteAuthorization.authorizedByUserId
   });
   if (!boundsResult.ok) {
     return boundsResult;
@@ -2253,7 +2256,8 @@ const resolveLineComplementos = ({ item, receta, context, nombreItem }) => {
     ok: true,
     metadata: {
       ...metadata,
-      complementos_incompletos_autorizados: Boolean(item.complementos_incompletos_autorizados),
+      complementos_incompletos_autorizados: boundsResult.authorized === true,
+      ...(boundsResult.authorization || {}),
       complementos_recomendados: min,
       complementos_seleccionados: selected.length,
       complementos_incompletos: complementosIncompletos
@@ -3383,8 +3387,9 @@ const hydrateVentaLines = async (client, normalizedItems, perf = null, options =
       const complementosResult = resolveLineComplementos({
         item,
         receta: null,
-        context: complementContext,
-        nombreItem: producto.nombre_producto || 'Producto'
+      context: complementContext,
+      nombreItem: producto.nombre_producto || 'Producto',
+      complementosIncompleteAuthorization: options.complementosIncompleteAuthorization
       });
       if (!complementosResult.ok) {
         return {
@@ -3548,7 +3553,8 @@ const hydrateVentaLines = async (client, normalizedItems, perf = null, options =
       item,
       receta,
       context: complementContext,
-      nombreItem: receta.nombre_receta || 'Receta'
+      nombreItem: receta.nombre_receta || 'Receta',
+      complementosIncompleteAuthorization: options.complementosIncompleteAuthorization
     });
     if (!complementosResult.ok) {
       return {
@@ -3923,7 +3929,7 @@ const buildPedidoPendienteDiscountErrorBody = (validation) => ({
 
 const mapPedidoPendienteSessionStatus = (reason) => reason === 'SESSION_SCOPE_MISMATCH' ? 403 : 409;
 
-const buildPedidoPendientePayload = async ({ client, body, userId, sucursalScope, canApplyDiscount, perf = null }) => {
+const buildPedidoPendientePayload = async ({ client, body, userId, sucursalScope, canApplyDiscount, canAuthorizeIncompleteComplementos, perf = null }) => {
   if (!isPlainObject(body)) return { ok: false, status: 400, body: { error: true, message: 'Payload invalido para crear pedido pendiente.' } };
   if (!userId) return { ok: false, status: 401, body: { error: true, message: 'No se pudo resolver el usuario autenticado.' } };
 
@@ -4017,7 +4023,11 @@ const buildPedidoPendientePayload = async ({ client, body, userId, sucursalScope
   const hydrateLinesStart = perf?.now?.() || 0;
   const hydratedResult = await hydrateVentaLines(client, normalizedItemsResult.data, perf, {
     idSucursal,
-    validateProductStock: false
+    validateProductStock: false,
+    complementosIncompleteAuthorization: {
+      serverAuthorized: canAuthorizeIncompleteComplementos === true,
+      authorizedByUserId: userId
+    }
   });
   perf?.add?.('pedido_pendiente_hydrate_lines_ms', hydrateLinesStart);
   if (!hydratedResult.ok) return hydratedResult;
@@ -4485,7 +4495,7 @@ const updatePedidoLegacyPagoConfirmado = async ({ client, idPedido, userId }) =>
   await client.query('UPDATE pedidos SET ' + assignments.join(', ') + ' WHERE id_pedido = $1', params);
 };
 
-const buildVentaPayload = async ({ client, body, userId, sucursalScope, canApplyDiscount, perf = null }) => {
+const buildVentaPayload = async ({ client, body, userId, sucursalScope, canApplyDiscount, canAuthorizeIncompleteComplementos, perf = null }) => {
   const payloadBuildStart = perf?.now?.() || 0;
   if (!isPlainObject(body)) {
     return {
@@ -4697,7 +4707,13 @@ const buildVentaPayload = async ({ client, body, userId, sucursalScope, canApply
   perf?.add?.('auth_payload_context_ms', authContextStart);
   const totalsStart = perf?.now?.() || 0;
 
-  const hydratedResult = await hydrateVentaLines(client, normalizedItemsResult.data, perf, { idSucursal });
+  const hydratedResult = await hydrateVentaLines(client, normalizedItemsResult.data, perf, {
+    idSucursal,
+    complementosIncompleteAuthorization: {
+      serverAuthorized: canAuthorizeIncompleteComplementos === true,
+      authorizedByUserId: userId
+    }
+  });
   if (!hydratedResult.ok) return hydratedResult;
 
   const { lines } = hydratedResult.data;
@@ -8090,6 +8106,7 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
   try {
     const discountIntent = hasDiscountIntentInPayload(req.body);
     const canApplyDiscount = await requestHasAnyPermission(req, [VENTAS_DESCUENTO_APLICAR_PERMISSION]);
+    const canAuthorizeIncompleteComplementos = await requestHasAnyPermission(req, [VENTAS_COMPLEMENTOS_INCOMPLETOS_AUTORIZAR_PERMISSION]);
     if (discountIntent && !canApplyDiscount) {
       addPedidoPendienteTotalRoute();
       ventasPerf.log(buildPedidoPendientePerfLogContext({
@@ -8169,6 +8186,7 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
       userId,
       sucursalScope: scope,
       canApplyDiscount,
+      canAuthorizeIncompleteComplementos,
       perf: ventasPerf
     });
     ventasPerf.add('pedido_pendiente_build_ms', buildStart);
@@ -9546,6 +9564,7 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
   const authContextStart = ventasPerf.now();
   const discountIntent = hasDiscountIntentInPayload(req.body);
   let canApplyDiscount = false;
+  let canAuthorizeIncompleteComplementos = false;
   if (discountIntent) {
     const authPermissionStart = ventasPerf.now();
     canApplyDiscount = await requestHasAnyPermission(req, [VENTAS_DESCUENTO_APLICAR_PERMISSION]);
@@ -9564,6 +9583,7 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
       message: 'No tienes permiso para aplicar descuentos en ventas.'
     });
   }
+  canAuthorizeIncompleteComplementos = await requestHasAnyPermission(req, [VENTAS_COMPLEMENTOS_INCOMPLETOS_AUTORIZAR_PERMISSION]);
 
   const poolWaitStart = ventasPerf.now();
   const client = await pool.connect();
@@ -9632,6 +9652,7 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
       userId,
       sucursalScope: scope,
       canApplyDiscount,
+      canAuthorizeIncompleteComplementos,
       perf: ventasPerf
     });
 
