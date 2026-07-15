@@ -84,15 +84,20 @@ export const validarYDescontarPedido = async (payload, options = {}) => {
     : MOVEMENT_REF;
   const externalClient = options?.dbClient || null;
   const strictInsumoIds = normalizePositiveIdSet(options?.strictInsumoIds);
+  const perf = options?.perf || null;
 
   const client = externalClient || (await pool.connect());
   const manageTransaction = !externalClient;
   try {
     if (manageTransaction) await client.query('BEGIN');
 
+    const branchStartedAt = perf?.now?.() || 0;
     await ensureBranchExists(client, idSucursal);
+    perf?.add?.('inventario_payload_ms', branchStartedAt);
 
+    const alreadyProcessedStartedAt = perf?.now?.() || 0;
     const alreadyProcessedMovementId = await fetchExistingPedidoMovement(client, idPedido);
+    perf?.add?.('inventario_payload_ms', alreadyProcessedStartedAt);
     if (alreadyProcessedMovementId) {
       const error = new Error(`El pedido ${idPedido} ya fue descontado en inventario.`);
       error.httpStatus = 409;
@@ -102,12 +107,15 @@ export const validarYDescontarPedido = async (payload, options = {}) => {
     }
 
     // 1) Resolver consumo real desde items del pedido.
+    const resolverStartedAt = perf?.now?.() || 0;
     const consumoResult = await resolvePedidoConsumo({
       client,
       items
     });
+    perf?.add?.('inventario_resolver_ms', resolverStartedAt);
 
     // 2) Validar stock con locks de concurrencia.
+    const stockLockStartedAt = perf?.now?.() || 0;
     const stockResult = await validarStockConBloqueo({
       client,
       idSucursal,
@@ -116,6 +124,7 @@ export const validarYDescontarPedido = async (payload, options = {}) => {
       expectedInsumoWarehouseById: consumoResult.insumoWarehouseById,
       allowCrossBranchWarehouse
     });
+    perf?.add?.('inventario_stock_lock_ms', stockLockStartedAt);
 
     // 3) Si existe cualquier faltante, rollback total (sin descuentos parciales).
     const faltantes = [
@@ -178,13 +187,12 @@ export const validarYDescontarPedido = async (payload, options = {}) => {
       consumoResult.consumo.insumoQtyMap,
       excludedInsumoIds
     );
-    const generatedMovementCount = movimientoProductoQtyMap.size + movimientoInsumoQtyMap.size;
     const shortagesByResource = new Map(
       stockShortages.map((item) => [`${item.tipo_recurso}:${item.id_recurso}`, item])
     );
 
     // 4) Registrar movimientos de salida ligados al pedido.
-    await registrarMovimientosPedido({
+    const generatedMovementCount = await registrarMovimientosPedido({
       client,
       idPedido,
       actorUserId,
@@ -193,8 +201,12 @@ export const validarYDescontarPedido = async (payload, options = {}) => {
       productosById: stockResult.lockedRows.productosById,
       insumosById: stockResult.lockedRows.insumosById,
       insumoTraceById: consumoResult.insumoTraceById,
+      movementRows: consumoResult.consumo.movimientoRows,
       refOrigen: stockShortages.length > 0 ? movementRefForShortage : MOVEMENT_REF,
-      shortagesByResource
+      shortagesByResource,
+      excludedProductIds,
+      excludedInsumoIds,
+      perf
     });
 
     if (manageTransaction) await client.query('COMMIT');

@@ -1,0 +1,34 @@
+name: Backend CI
+
+on:
+  pull_request:
+    branches:
+      - dev
+      - main
+  push:
+    branches:
+      - dev
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - run: npm ci
+      - run: npm run check:syntax
+      - run: npm test
+      - run: docker build -t jonnys-backend-ci .
+      - name: Validate invalid runtime fails
+        run: |
+          if docker run --rm -e PROCESS_ROLE=invalid jonnys-backend-ci; then
+            echo "Expected PROCESS_ROLE=invalid container to fail"
+            exit 1
+          fi

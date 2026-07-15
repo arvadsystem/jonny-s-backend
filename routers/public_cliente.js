@@ -23,7 +23,7 @@ import {
 } from '../middleware/rateLimiter.js';
 import { getClientIp, parseUserAgent } from '../utils/security/clientInfo.js';
 import { insertLoginLog } from '../utils/security/loginLogger.js';
-import { createSession, closeAllUserSessions } from '../utils/security/sessionService.js';
+import { createExclusiveClientSession, closeAllUserSessions } from '../utils/security/sessionService.js';
 import { enviarCorreo, enviarVerificacion, enviarRecuperacion } from '../utils/emailService.js';
 
 const router = express.Router();
@@ -1059,7 +1059,7 @@ router.post('/api/public/login', publicLoginIpLimiter, publicLoginAccountIpLimit
       [auth_user_id]
     );
 
-    const id_sesion = await createSession({
+    const id_sesion = await createExclusiveClientSession({
       id_usuario, ip_origen, user_agent, dispositivo, navegador, sistema_operativo, ubicacion: null
     });
 
@@ -1654,7 +1654,7 @@ router.post('/api/public/google-callback', async (req, res) => {
     // Emitir sesión y JWT
     const usuario = await getClienteUsuarioById(id_usuario);
 
-    const id_sesion = await createSession({
+    const id_sesion = await createExclusiveClientSession({
       id_usuario, ip_origen, user_agent, dispositivo, navegador, sistema_operativo, ubicacion: null
     });
 

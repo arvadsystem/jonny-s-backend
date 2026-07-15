@@ -257,7 +257,7 @@ const buildTicketNumber = (idPedido, idFactura, codigoVenta) => {
   return `VTA-${String(baseId).padStart(5, '0')}`;
 };
 
-const buildPedidoConsumoPayload = async (client, idPedido, idSucursal) => {
+export const buildPedidoConsumoPayload = async (client, idPedido, idSucursal) => {
   const hasDetallePedidoConfiguracionMenu = await hasColumn(client, 'detalle_pedido', 'configuracion_menu');
   const detailsResult = await client.query(
     `
@@ -448,7 +448,8 @@ const extractPedidoNotes = (descripcionPedido) =>
   String(descripcionPedido || '')
     .split('|')
     .map((segment) => segment.trim())
-    .filter(Boolean);
+    .filter(Boolean)
+    .filter((note) => !isTechnicalOrderNote(note));
 
 const splitObservationSegments = (value) => {
   const source = String(value || '').trim();
@@ -470,6 +471,26 @@ const isTechnicalKitchenObservation = (value) => {
   );
 };
 
+const isTechnicalOrderNote = (note) => {
+  const source = String(note || '').trim().toLowerCase();
+  if (!source) return false;
+
+  return (
+    source.includes('[public-menu]') ||
+    source.includes('[menu-publico]') ||
+    source.startsWith('idem:') ||
+    source.startsWith('idempotency:') ||
+    source.startsWith('idempotencia:') ||
+    source.startsWith('tel:') ||
+    source.startsWith('telefono:') ||
+    source.includes('schema_version') ||
+    source.includes('menu_publico_linea_v1') ||
+    source.includes('pubcfg:v1') ||
+    /(?:^|[\s|,;])salsas=/.test(source) ||
+    /(?:^|[\s|,;])extras=/.test(source)
+  );
+};
+
 const extractConfigMenuModifications = (configuracionMenu, itemTipo, salsaNameMap = new Map()) => {
   const source = configuracionMenu && typeof configuracionMenu === 'object'
     ? configuracionMenu
@@ -481,17 +502,26 @@ const extractConfigMenuModifications = (configuracionMenu, itemTipo, salsaNameMa
   if (!complementos.length && !extras.length && !salsasPorUnidad.length && !notaCliente) return [];
 
   const complementosText = complementos
-    .map((entry) => String(entry?.nombre || '').trim())
-    .filter(Boolean)
-    .map((nombre) => {
-      return `Salsa: ${nombre}`;
+    .map((entry) => {
+      const nombre = String(entry?.nombre || '').trim();
+      if (!nombre) return null;
+      const porOrden = Number(entry?.porciones_por_orden || entry?.cantidad_por_orden || entry?.inventario?.porciones_por_orden || entry?.inventario?.porciones || 1);
+      const total = Number(entry?.porciones_total || entry?.cantidad_total || entry?.inventario?.porciones_total || 0);
+      if (total > 0 && total !== porOrden) {
+        return `Salsa: ${nombre} x${porOrden} por orden, total ${total}`;
+      }
+      return porOrden > 1 ? `Salsa: ${nombre} x${porOrden} por orden` : `Salsa: ${nombre}`;
     });
   const extrasText = extras
     .map((entry) => {
       const nombre = String(entry?.nombre || entry?.nombre_extra || '').trim();
-      const cantidad = Number(entry?.cantidad || 0);
-      if (!nombre || cantidad <= 0) return null;
-      return `Extra: ${nombre} x${cantidad}`;
+      const porOrden = Number(entry?.cantidad_por_orden || entry?.cantidad || 0);
+      const total = Number(entry?.cantidad_total || entry?.cantidad || 0);
+      if (!nombre || porOrden <= 0) return null;
+      if (total > 0 && total !== porOrden) {
+        return `Extra: ${nombre} x${porOrden} por orden, total ${total}`;
+      }
+      return `Extra: ${nombre} x${porOrden} por orden`;
     })
     .filter(Boolean);
 
@@ -896,8 +926,8 @@ router.get('/cocina/pedidos', checkPermission(COCINA_VIEW_PERMISSIONS), async (r
 
           grouped.set(row.id_pedido, {
             id_pedido: Number(row.id_pedido),
-            numero_ticket: String(row.codigo_venta || '').trim(),
-            codigo_venta: String(row.codigo_venta || '').trim(),
+            numero_ticket: buildTicketNumber(row.id_pedido, row.id_factura, row.codigo_venta),
+            codigo_venta: String(row.codigo_venta || '').trim() || null,
             id_sucursal: Number(row.id_sucursal ?? 0) || null,
             nombre_sucursal: row.nombre_sucursal || 'Sucursal no definida',
             id_estado_pedido: Number(row.id_estado_pedido ?? 0) || null,
@@ -998,7 +1028,10 @@ router.get('/cocina/pedidos', checkPermission(COCINA_VIEW_PERMISSIONS), async (r
               ...new Set(
                 modificacionesFinales
                   .filter(Boolean)
+                  .map((entry) => String(entry).trim())
+                  .filter(Boolean)
                   .filter((entry) => !isTechnicalKitchenObservation(entry))
+                  .filter((entry) => !isTechnicalOrderNote(entry))
               )
             ];
 

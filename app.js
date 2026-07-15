@@ -3,7 +3,7 @@ import express from 'express';
 import cors from 'cors';
 import cookieParser from 'cookie-parser';
 import helmet from 'helmet';
-import pool, { closePool } from './config/db-connection.js';
+import pool, { getPoolState } from './config/db-connection.js';
 
 import loginRoutes from './routers/login.js';
 import publicClienteRoutes from './routers/public_cliente.js';
@@ -71,7 +71,6 @@ import { touchSessionMiddleware } from './middleware/touchSession.js';
 import { requireActiveSession } from './middleware/requireActiveSession.js';
 import { requirePasswordChange } from './middleware/requirePasswordChange.js';
 import { MAX_IMAGE_JSON_LIMIT, UPLOADS_DIR } from './utils/uploads.js';
-import { startEmailCampaignScheduler } from './jobs/emailCampaignScheduler.js';
 
 // Parametros
 import catalogosRoutes from './routers/Parametros/catalogos.js';
@@ -104,6 +103,26 @@ const getAllowedOrigins = () => {
 
 const allowedOrigins = getAllowedOrigins();
 const isAllowedOrigin = (origin) => allowedOrigins.includes(normalizeOrigin(origin));
+const READINESS_TIMEOUT_MS = 2000;
+let healthCheckQueryRunner = pool;
+
+export const setHealthCheckQueryRunnerForTests = (queryRunner = pool) => {
+  healthCheckQueryRunner = queryRunner;
+};
+
+const withTimeout = (promise, timeoutMs) => {
+  let timeout = null;
+  const timeoutPromise = new Promise((_, reject) => {
+    timeout = setTimeout(() => {
+      const error = new Error('READINESS_TIMEOUT');
+      error.code = 'READINESS_TIMEOUT';
+      reject(error);
+    }, timeoutMs);
+  });
+  return Promise.race([promise, timeoutPromise]).finally(() => {
+    if (timeout) clearTimeout(timeout);
+  });
+};
 
 // ✅ (Opcional) proxy - no afecta el login
 if (String(process.env.TRUST_PROXY || '').toLowerCase() === 'true') {
@@ -169,6 +188,40 @@ app.use((err, req, res, next) => {
 app.use('/uploads', express.static(UPLOADS_DIR));
 
 // ✅ 2) Rutas públicas ANTES de auth
+app.get('/health/live', (req, res) => {
+  res.status(200).json({
+    status: 'alive',
+    role: 'web',
+    timestamp: new Date().toISOString()
+  });
+});
+
+app.get('/health/ready', async (req, res) => {
+  try {
+    await withTimeout(healthCheckQueryRunner.query('SELECT 1'), READINESS_TIMEOUT_MS);
+    const poolState = getPoolState();
+    return res.status(200).json({
+      status: 'ready',
+      database: 'ok',
+      role: 'web',
+      pool: {
+        total: poolState.totalCount,
+        idle: poolState.idleCount,
+        waiting: poolState.waitingCount
+      },
+      timestamp: new Date().toISOString()
+    });
+  } catch {
+    return res.status(503).json({
+      status: 'not_ready',
+      database: 'error',
+      role: 'web',
+      timestamp: new Date().toISOString()
+    });
+  }
+});
+
+// Legacy: mantener por compatibilidad; EasyPanel debe usar /health/ready.
 app.get('/status', async (req, res) => {
   try {
     const result = await pool.query('SELECT NOW()');
@@ -272,54 +325,6 @@ app.use(empresasRoutes);
 
 app.use(menuPosRouter); // Monta las rutas del POS Menú
 app.use(movimientosInventarioRoutes);
-
-const PORT = process.env.PORT || 3001;
-startEmailCampaignScheduler();
-const server = app.listen(PORT, () => {
-  console.log(`Servidor activo en el puerto ${PORT}`);
-});
-
-let shutdownPromise = null;
-
-const shutdown = async (signal) => {
-  if (shutdownPromise) return shutdownPromise;
-
-  console.warn(`[shutdown] Senal recibida: ${signal}. Cerrando servidor HTTP y pool PostgreSQL.`);
-
-  shutdownPromise = new Promise((resolve) => {
-    server.close((serverErr) => {
-      if (serverErr) {
-        console.error('[shutdown] Error cerrando servidor HTTP:', {
-          code: serverErr?.code || null,
-          message: serverErr?.message || 'Error de cierre'
-        });
-      }
-      resolve();
-    });
-  })
-    .then(() => closePool())
-    .then(() => {
-      console.log('[shutdown] Servidor y pool PostgreSQL cerrados.');
-      process.exit(0);
-    })
-    .catch((err) => {
-      console.error('[shutdown] Error durante cierre limpio:', {
-        code: err?.code || null,
-        message: err?.message || 'Error de cierre'
-      });
-      process.exit(1);
-    });
-
-  return shutdownPromise;
-};
-
-process.once('SIGTERM', () => {
-  void shutdown('SIGTERM');
-});
-
-process.once('SIGINT', () => {
-  void shutdown('SIGINT');
-});
 
 export default app;
 

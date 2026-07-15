@@ -36,7 +36,7 @@ const parseUtcTimestampForDisplay = (value) => {
   return value;
 };
 
-const formatDateTime = (value = new Date()) => {
+export const formatCajaCierreDateTime = (value = new Date()) => {
   const date = value ? new Date(parseUtcTimestampForDisplay(value)) : new Date();
   if (Number.isNaN(date.getTime())) return 'No disponible';
   return date.toLocaleString('es-HN', {
@@ -57,8 +57,8 @@ const cleanText = (value, fallback = 'No disponible') => {
 const cierreCode = (idCierreCaja) =>
   `CIE-${String(idCierreCaja || '').padStart(5, '0')}`;
 
-const resolveActorLabel = (actors, primaryNameKey, primaryUserKey, fallback) =>
-  cleanText(actors?.[primaryNameKey] || actors?.[primaryUserKey] || fallback);
+const resolveActorLabel = (actors, primaryNameKey, primaryUserKey) =>
+  cleanText(actors?.[primaryNameKey] || actors?.[primaryUserKey], 'No disponible');
 
 const labelValueRows = (rows) =>
   rows.map(([label, value]) => [
@@ -101,25 +101,23 @@ const buildArqueosTableBody = (arqueos = []) => {
 const buildManualMovementsTableBody = (rows = []) => {
   const body = [[
     { text: 'Fecha/hora', style: 'tableHeader' },
-    { text: 'Tipo', style: 'tableHeader' },
     { text: 'Monto', style: 'tableHeader', alignment: 'right' },
-    { text: 'Razon u observacion', style: 'tableHeader' },
+    { text: 'Observacion', style: 'tableHeader' },
     { text: 'Referencia', style: 'tableHeader' },
     { text: 'Usuario ejecutor', style: 'tableHeader' }
   ]];
 
   if (!Array.isArray(rows) || rows.length === 0) {
     body.push([
-      { text: 'Sin movimientos manuales registrados.', colSpan: 6, color: '#667085' },
-      {}, {}, {}, {}, {}
+      { text: 'Sin movimientos manuales registrados.', colSpan: 5, color: '#667085' },
+      {}, {}, {}, {}
     ]);
     return body;
   }
 
   rows.forEach((row) => {
     body.push([
-      row.fecha_hora ? cleanText(formatDateTime(row.fecha_hora), 'Sin fecha') : 'Sin fecha',
-      cleanText(row.tipo, 'N/A'),
+      row.fecha_hora ? cleanText(formatCajaCierreDateTime(row.fecha_hora), 'Sin fecha') : 'Sin fecha',
       { text: formatMoney(row.monto), alignment: 'right' },
       cleanText(row.observacion, 'N/A'),
       cleanText(row.referencia, 'N/A'),
@@ -135,7 +133,7 @@ const buildManualMovementSection = (title, rows = []) => [
   {
     table: {
       headerRows: 1,
-      widths: ['16%', '13%', '12%', '24%', '15%', '20%'],
+      widths: ['17%', '13%', '30%', '22%', '18%'],
       body: buildManualMovementsTableBody(rows)
     },
     layout: 'lightHorizontalLines'
@@ -145,25 +143,23 @@ const buildManualMovementSection = (title, rows = []) => [
 export const buildCajaCierrePdfFilename = (idCierreCaja) =>
   `cierre-caja-${cierreCode(idCierreCaja)}.pdf`;
 
-export const buildCajaCierrePdfBuffer = async (payload = {}) => {
+export const buildCajaCierrePdfDefinition = (payload = {}) => {
   const responsableLabel = resolveActorLabel(
     payload.actors,
     'responsable_nombre',
-    'responsable_usuario',
-    payload.session?.id_usuario_responsable
+    'responsable_usuario'
   );
   const cierreLabel = resolveActorLabel(
     payload.actors,
     'cierre_nombre',
-    'cierre_usuario',
-    payload.idUsuarioCierre
+    'cierre_usuario'
   );
   const statusLabel = payload.requiresAudit ? 'REQUIERE AUDITORIA' : 'CIERRE REGISTRADO';
   const statusMessage = payload.requiresAudit
     ? 'Este cierre requiere auditoria preventiva por recuento, diferencia o inconsistencia detectada durante el proceso de cierre.'
     : 'Este cierre fue registrado sin inconsistencias pendientes de auditoria.';
 
-  const docDefinition = {
+  return {
     pageSize: 'LETTER',
     pageMargins: [36, 42, 36, 48],
     defaultStyle: {
@@ -194,7 +190,7 @@ export const buildCajaCierrePdfBuffer = async (payload = {}) => {
         table: {
           widths: ['35%', '65%'],
           body: labelValueRows([
-            ['Generado', formatDateTime(new Date())],
+            ['Generado', formatCajaCierreDateTime(payload.generatedAt || new Date())],
             ['Cierre', cierreCode(payload.idCierreCaja)],
             ['ID sesion', payload.idSesionCaja]
           ])
@@ -211,7 +207,7 @@ export const buildCajaCierrePdfBuffer = async (payload = {}) => {
             ['Sucursal', payload.session?.nombre_sucursal || payload.session?.id_sucursal],
             ['Responsable', responsableLabel],
             ['Usuario de cierre', cierreLabel],
-            ['Fecha/hora de cierre', formatDateTime(payload.fechaCierre)]
+            ['Fecha/hora de cierre', formatCajaCierreDateTime(payload.fechaCierre)]
           ])
         },
         layout: 'lightHorizontalLines'
@@ -267,6 +263,9 @@ export const buildCajaCierrePdfBuffer = async (payload = {}) => {
       }
     ]
   };
+};
 
+export const buildCajaCierrePdfBuffer = async (payload = {}) => {
+  const docDefinition = buildCajaCierrePdfDefinition(payload);
   return pdfmake.createPdf(docDefinition).getBuffer();
 };

@@ -1,11 +1,11 @@
 {
   "name": "jonnys-back",
   "version": "1.0.0",
-  "main": "app.js",
+  "main": "bootstrap.js",
   "type": "module",
   "scripts": {
-    "start": "node app.js",
-    "dev": "node --watch app.js",
+    "start": "node bootstrap.js",
+    "dev": "node --watch bootstrap.js",
     "qa:menu-publico": "node scripts/qa-menu-publico.js",
     "qa:admin-salsas-inventory-state": "node scripts/qa-admin-salsas-inventory-state.js",
     "qa:admin-salsas-router-contract": "node scripts/qa-admin-salsas-router-contract.js",
@@ -19,7 +19,12 @@
     "qa:ventas-clientes-caja": "node scripts/qa-ventas-clientes-caja.js",
     "rbac:personas:dry-run": "node scripts/sync-personas-rbac.js",
     "rbac:personas:sync": "node scripts/sync-personas-rbac.js --apply",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "node scripts/run-tests.mjs",
+    "test:cajas": "node scripts/run-cajas-tests.mjs",
+    "check:syntax": "node scripts/check-js-syntax.mjs",
+    "docker:build": "docker build -t jonnys-backend-local .",
+    "smoke:web": "node scripts/smoke-web-runtime.mjs",
+    "smoke:scheduler": "node scripts/smoke-scheduler-runtime.mjs"
   },
   "author": "",
   "license": "ISC",

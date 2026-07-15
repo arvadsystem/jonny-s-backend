@@ -22,6 +22,7 @@ export const DESCUENTO_ALCANCE_KEYS = {
   RECETA: 'RECETA'
 };
 export const VENTAS_DESCUENTO_APLICAR_PERMISSION = 'VENTAS_DESCUENTO_APLICAR';
+export const VENTAS_COMPLEMENTOS_INCOMPLETOS_AUTORIZAR_PERMISSION = 'VENTAS_COMPLEMENTOS_INCOMPLETOS_AUTORIZAR';
 export const ESTADO_PEDIDO_CODES = {
   PENDIENTE: new Set([
     'pendiente',
@@ -127,9 +128,19 @@ export const VENTAS_PERF_STAGE_NAMES = [
   'detalle_factura_descuentos_ms',
   'detalle_factura_lookup_ms',
   'detalle_factura_insert_ms',
+  'detalle_factura_extras_ms',
   'detalle_factura_origen_ms',
   'cobro_ms',
+  'pool_wait_ms',
+  'transaction_ms',
   'inventario_ms',
+  'inventario_payload_ms',
+  'inventario_resolver_ms',
+  'inventario_stock_lock_ms',
+  'inventario_movimientos_build_ms',
+  'inventario_movimientos_insert_ms',
+  'sql_total_ms',
+  'tiempo_no_atribuido_ms',
   'fidelizacion_ms',
   'ticket_response_build_ms',
   'pre_rpc_total_ms',
@@ -138,6 +149,12 @@ export const VENTAS_PERF_STAGE_NAMES = [
   'rpc_v2_payload_build_ms',
   'rpc_v2_call_ms',
   'rpc_v2_total_ms',
+  'rpc_v3_payload_build_ms',
+  'rpc_v3_call_ms',
+  'rpc_v3_total_ms',
+  'pedido_pendiente_rpc_v2_payload_build_ms',
+  'pedido_pendiente_rpc_v2_call_ms',
+  'pedido_pendiente_rpc_v2_total_ms',
   'post_rpc_total_ms',
   'post_rpc_fidelizacion_ms',
   'post_rpc_response_ms',
@@ -148,7 +165,9 @@ export const VENTAS_PERF_STAGE_NAMES = [
 ];
 export const VENTAS_PERF_COUNTER_NAMES = [
   'cache_hits',
-  'cache_misses'
+  'cache_misses',
+  'sql_query_count',
+  'inventario_movimientos_count'
 ];
 export const PEDIDO_PENDIENTE_ESTADO_PAGO = 'PENDIENTE_PAGO';
 export const PEDIDO_PAGADO_CONFIRMADO_ESTADO_PAGO = 'PAGADO_CONFIRMADO';

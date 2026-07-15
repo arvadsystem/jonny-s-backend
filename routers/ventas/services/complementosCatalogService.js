@@ -103,11 +103,10 @@ const inferSauceUnitsBaseFromText = (...sources) => {
   return Math.max(1, Math.floor(units));
 };
 
-const calculateFallbackWingSauceRequirement = ({ nombre = '', descripcion = '', quantity = 1 }) => {
+const calculateFallbackWingSauceRequirement = ({ nombre = '', descripcion = '' }) => {
   const baseUnits = inferSauceUnitsBaseFromText(nombre, descripcion);
   if (baseUnits <= 1) return 0;
-  const totalUnits = Math.max(1, Number(quantity || 1)) * baseUnits;
-  return Math.max(0, Math.ceil(totalUnits / 6));
+  return Math.max(0, Math.ceil(baseUnits / 6));
 };
 
 const findMatchingSalsaRule = (rules, unidades) => {
@@ -127,10 +126,9 @@ const findMatchingSalsaRule = (rules, unidades) => {
   }) || null;
 };
 
-const buildRecipeSauceRequirement = ({ recipeName = '', recipeDescription = '', rules = [], quantity = 1 }) => {
+const buildRecipeSauceRequirement = ({ recipeName = '', recipeDescription = '', rules = [] }) => {
   const unitsBase = Math.max(1, inferSauceUnitsBaseFromText(recipeName, recipeDescription));
-  const units = Math.max(1, Number(quantity || 1)) * unitsBase;
-  const rule = findMatchingSalsaRule(rules, units);
+  const rule = findMatchingSalsaRule(rules, unitsBase);
   if (rule) {
     return Number(rule?.salsas_requeridas || 0);
   }
@@ -140,9 +138,40 @@ const buildRecipeSauceRequirement = ({ recipeName = '', recipeDescription = '', 
   // AM: fallback acotado solo para familias alitas/tenders cuando no hay reglas formales.
   return calculateFallbackWingSauceRequirement({
     nombre: recipeName,
-    descripcion: recipeDescription,
-    quantity
+    descripcion: recipeDescription
   });
+};
+
+export const validateComplementSelectionBounds = ({
+  selectedCount = 0,
+  minimo = 0,
+  maximo = 0,
+  allowIncomplete = false,
+  nombreItem = 'este item'
+} = {}) => {
+  const count = Math.max(0, Number(selectedCount || 0));
+  const min = Math.max(0, Number(minimo || 0));
+  const max = Math.max(min, Number(maximo || 0));
+
+  if (max > 0 && count > max) {
+    return {
+      ok: false,
+      status: 400,
+      code: 'VENTAS_COMPLEMENTOS_EXCEDIDOS',
+      message: `No puedes seleccionar mas de ${max} complemento(s) para ${nombreItem || 'este item'}.`
+    };
+  }
+
+  if (min > 0 && count < min && allowIncomplete !== true) {
+    return {
+      ok: false,
+      status: 400,
+      code: 'VENTAS_COMPLEMENTOS_INCOMPLETOS',
+      message: `Debes seleccionar al menos ${min} complemento(s) para ${nombreItem || 'este item'}.`
+    };
+  }
+
+  return { ok: true };
 };
 
 export const resolveRecetaComplementMetadata = ({ receta = {}, quantity = 1, allowedSauces = [], rules = [], fallbackSauces = [] }) => {

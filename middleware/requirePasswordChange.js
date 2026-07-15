@@ -5,7 +5,9 @@
  */
 
 const ALLOWED_WHEN_PASSWORD_CHANGE_REQUIRED = new Set([
+  'GET /perfil',
   'PUT /perfil/password',
+  'GET /seguridad/configuracion/password',
   'POST /usuarios/v2/change-password',
 ]);
 

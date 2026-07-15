@@ -1,5 +1,6 @@
 import pg from 'pg';
 import dotenv from 'dotenv';
+import { getRuntimeConfig } from './runtime-config.js';
 
 dotenv.config();
 
@@ -23,12 +24,9 @@ const parseBoolean = (value, fallback = false) => {
   return ['1', 'true', 'yes', 'on'].includes(String(value).trim().toLowerCase());
 };
 
-const DB_POOL_MAX_LIMIT = 24;
-
-const poolMax = parsePositiveInt(process.env.DB_POOL_MAX, 8);
-if (poolMax > DB_POOL_MAX_LIMIT) {
-  throw new Error(`DB_POOL_MAX no puede ser mayor que ${DB_POOL_MAX_LIMIT}.`);
-}
+const runtimeConfig = getRuntimeConfig();
+const PROCESS_ROLE = runtimeConfig.processRole;
+const poolMax = runtimeConfig.dbPoolMax;
 
 const idleTimeoutMillis = parsePositiveInt(process.env.DB_IDLE_TIMEOUT_MS, 30000);
 const connectionTimeoutMillis = parsePositiveInt(process.env.DB_CONNECTION_TIMEOUT_MS, 3000);
@@ -59,13 +57,25 @@ const pool = new Pool({
   },
 });
 
-const getPoolState = () => ({
+export const getPoolState = () => ({
   totalCount: pool.totalCount,
   idleCount: pool.idleCount,
   waitingCount: pool.waitingCount
 });
 
+export const logPoolWaitIfAny = (context = 'unspecified') => {
+  const state = getPoolState();
+  if (state.waitingCount > 0) {
+    console.warn('[pool] waiting clients detected', {
+      context,
+      ...state
+    });
+  }
+  return state;
+};
+
 console.info('[pool] Configuracion efectiva', {
+  PROCESS_ROLE,
   DB_POOL_MAX: poolMax,
   idleTimeoutMillis,
   connectionTimeoutMillis,
@@ -73,11 +83,6 @@ console.info('[pool] Configuracion efectiva', {
   ...getPoolState()
 });
 
-if (poolMax > 12) {
-  console.warn('[pool] DB_POOL_MAX alto: este valor se multiplica por cada replica del backend.', {
-    DB_POOL_MAX: poolMax
-  });
-}
 
 pool.on('error', (err) => {
   const payload = {
@@ -94,19 +99,23 @@ pool.on('error', (err) => {
   console.error('[pool] Unexpected idle client error', payload);
 });
 
-export const dbReady = pool.connect()
-  .then((client) => {
+export const checkDatabaseReady = async () => {
+  let client = null;
+  try {
+    client = await pool.connect();
+    await client.query('SELECT 1');
     console.log('[db] PostgreSQL connection ready');
-    client.release();
     return true;
-  })
-  .catch((err) => {
+  } catch (err) {
     console.error('[db] PostgreSQL connection failed:', {
       code: err?.code || null,
       message: err?.message || 'Connection error'
     });
-    return false;
-  });
+    throw err;
+  } finally {
+    if (client) client.release();
+  }
+};
 
 let poolEndPromise = null;
 

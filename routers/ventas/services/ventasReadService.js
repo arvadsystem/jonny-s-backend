@@ -33,7 +33,17 @@ export const fetchRecetaMap = async (client, ids) => {
         r.nombre_receta,
         r.descripcion,
         r.estado,
-        r.precio
+        r.precio,
+        COALESCE((
+          SELECT jsonb_agg(jsonb_build_object(
+            'id_insumo', dr.id_insumo,
+            'cantidad', dr.cant
+          ) ORDER BY dr.id_detalle)
+          FROM public.detalle_recetas dr
+          WHERE dr.id_receta = r.id_receta
+            AND COALESCE(dr.estado, true) IS TRUE
+            AND dr.cant > 0
+        ), '[]'::jsonb) AS componentes
       FROM recetas r
       WHERE r.id_receta = ANY($1::int[])
     `,
@@ -65,6 +75,7 @@ export const fetchVentaCatalogMaps = async (client, { productoIds = [], recetaId
 
   if (uniqueRecetaIds.length > 0) {
     const recetasParam = addArrayParam(uniqueRecetaIds);
+    const sucursalParam = idSucursal ? `$${params.push(Number(idSucursal))}::int` : 'NULL::int';
     ctes.push(`
       recetas_rows AS (
         SELECT
@@ -72,7 +83,27 @@ export const fetchVentaCatalogMaps = async (client, { productoIds = [], recetaId
           r.nombre_receta,
           r.descripcion,
           r.estado,
-          r.precio
+          r.precio,
+          COALESCE((
+            SELECT jsonb_agg(jsonb_build_object(
+              'id_insumo', dr.id_insumo,
+              'cantidad', dr.cant,
+              'id_almacen', (
+                SELECT MIN(ia.id_almacen)::int
+                FROM public.insumos_almacenes ia
+                INNER JOIN public.almacenes a
+                  ON a.id_almacen = ia.id_almacen
+                 AND COALESCE(a.estado, true) IS TRUE
+                WHERE ia.id_insumo = dr.id_insumo
+                  AND COALESCE(ia.estado, true) IS TRUE
+                  AND (${sucursalParam} IS NULL OR a.id_sucursal = ${sucursalParam})
+              )
+            ) ORDER BY dr.id_detalle)
+            FROM public.detalle_recetas dr
+            WHERE dr.id_receta = r.id_receta
+              AND COALESCE(dr.estado, true) IS TRUE
+              AND dr.cant > 0
+          ), '[]'::jsonb) AS componentes
         FROM recetas r
         WHERE r.id_receta = ANY(${recetasParam})
       )

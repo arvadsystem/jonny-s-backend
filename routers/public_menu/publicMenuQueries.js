@@ -1221,8 +1221,7 @@ export const insertPublicPedidoDetalleQuery = async (client, payload) => {
     '$6',
     '$7',
     '$8',
-    '$9',
-    '$10'
+    '$9'
   ];
 
   // Item 11: persistimos configuracion estructurada del menu cuando el esquema lo soporta.

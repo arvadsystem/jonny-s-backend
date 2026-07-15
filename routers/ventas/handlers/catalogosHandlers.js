@@ -685,8 +685,8 @@ const fetchCajaBootstrapAvailableSessions = async ({ idUsuario, isSuperAdmin, id
   return (result.rows || []).map(mapCajaAvailableSession);
 };
 
-const fetchCajaBootstrapOperationalState = async ({ idUsuario, idSucursal = null, isSuperAdmin = false }) => {
-  const result = await pool.query(
+export const fetchCajaBootstrapOperationalState = async ({ idUsuario, idSucursal = null, db = pool }) => {
+  const result = await db.query(
     `
       WITH active_session AS (
         SELECT
@@ -740,7 +740,6 @@ const fetchCajaBootstrapOperationalState = async ({ idUsuario, idSucursal = null
         WHERE (
             cs.id_usuario_responsable = $1
             OR participante.id_participacion_caja IS NOT NULL
-            OR $3::boolean = true
             OR EXISTS (
               SELECT 1
               FROM public.cajas_usuarios_autorizados autorizacion_operativa
@@ -809,7 +808,7 @@ const fetchCajaBootstrapOperationalState = async ({ idUsuario, idSucursal = null
         ON caja.id_caja = COALESCE(sesion.id_caja, asignacion.id_caja)
       LIMIT 1
     `,
-    [idUsuario, idSucursal, Boolean(isSuperAdmin)]
+    [idUsuario, idSucursal]
   );
 
   const row = result.rows?.[0] || null;
@@ -868,6 +867,8 @@ export const getCajaBootstrapHandler = async (req, res) => {
   let idTipoDepartamento = null;
   let cacheStatus = 'MISS';
   let sqlDurationMs = 0;
+  let operationalSqlMs = 0;
+  let catalogSqlMs = 0;
   let mappingDurationMs = 0;
   let recipeCount = 0;
   try {
@@ -892,6 +893,7 @@ export const getCajaBootstrapHandler = async (req, res) => {
       fetchCajaBootstrapSucursalesDisponibles({ scope })
     ]);
     sqlDurationMs += performance.now() - sessionsStartedAt;
+    operationalSqlMs += performance.now() - sessionsStartedAt;
     if (!idSucursal && scope.isSuperAdmin) {
       if (sesionesDisponibles.length === 1) {
         idSucursal = Number(sesionesDisponibles[0].id_sucursal);
@@ -914,6 +916,8 @@ export const getCajaBootstrapHandler = async (req, res) => {
             cache: 'MISS',
             duration_ms: Number((performance.now() - startedAt).toFixed(2)),
             sql_duration_ms: Number(sqlDurationMs.toFixed(2)),
+            operational_sql_ms: Number(operationalSqlMs.toFixed(2)),
+            catalog_sql_ms: Number(catalogSqlMs.toFixed(2)),
             mapping_duration_ms: 0
           }
         });
@@ -922,10 +926,10 @@ export const getCajaBootstrapHandler = async (req, res) => {
     const operationalStartedAt = performance.now();
     let operationalState = await fetchCajaBootstrapOperationalState({
       idUsuario: scope.idUsuario,
-      idSucursal,
-      isSuperAdmin: scope.isSuperAdmin
+      idSucursal
     });
     sqlDurationMs += performance.now() - operationalStartedAt;
+    operationalSqlMs += performance.now() - operationalStartedAt;
     idSucursal = idSucursal || operationalState?.id_sucursal || null;
     if (!idSucursal) {
       return res.status(200).json({
@@ -945,6 +949,8 @@ export const getCajaBootstrapHandler = async (req, res) => {
           cache: 'MISS',
           duration_ms: Number((performance.now() - startedAt).toFixed(2)),
           sql_duration_ms: Number(sqlDurationMs.toFixed(2)),
+          operational_sql_ms: Number(operationalSqlMs.toFixed(2)),
+          catalog_sql_ms: Number(catalogSqlMs.toFixed(2)),
           mapping_duration_ms: 0
         }
       });
@@ -955,10 +961,10 @@ export const getCajaBootstrapHandler = async (req, res) => {
       const scopedOperationalStartedAt = performance.now();
       operationalState = await fetchCajaBootstrapOperationalState({
         idUsuario: scope.idUsuario,
-        idSucursal,
-        isSuperAdmin: scope.isSuperAdmin
+        idSucursal
       });
       sqlDurationMs += performance.now() - scopedOperationalStartedAt;
+      operationalSqlMs += performance.now() - scopedOperationalStartedAt;
     }
 
     if (!operationalState?.sesion_caja) {
@@ -980,6 +986,8 @@ export const getCajaBootstrapHandler = async (req, res) => {
           cache: 'MISS',
           duration_ms: Number(durationMs.toFixed(2)),
           sql_duration_ms: Number(sqlDurationMs.toFixed(2)),
+          operational_sql_ms: Number(operationalSqlMs.toFixed(2)),
+          catalog_sql_ms: Number(catalogSqlMs.toFixed(2)),
           mapping_duration_ms: 0
         }
       });
@@ -1030,6 +1038,7 @@ export const getCajaBootstrapHandler = async (req, res) => {
     cacheStatus = cached.cache;
     idTipoDepartamento = Number(cached.value.data?.departamento_activo?.id_tipo_departamento || idTipoDepartamento || 0) || null;
     sqlDurationMs += cacheStatus === 'HIT' ? 0 : Number(cached.value.metrics?.sql_duration_ms || 0);
+    catalogSqlMs += cacheStatus === 'HIT' ? 0 : Number(cached.value.metrics?.sql_duration_ms || 0);
     mappingDurationMs = cacheStatus === 'HIT' ? 0 : Number(cached.value.metrics?.mapping_duration_ms || 0);
     recipeCount = Array.isArray(cached.value.data?.recetas) ? cached.value.data.recetas.length : 0;
     const durationMs = performance.now() - startedAt;
@@ -1049,6 +1058,8 @@ export const getCajaBootstrapHandler = async (req, res) => {
         cache: cacheStatus,
         duration_ms: Number(durationMs.toFixed(2)),
         sql_duration_ms: Number(sqlDurationMs.toFixed(2)),
+        operational_sql_ms: Number(operationalSqlMs.toFixed(2)),
+        catalog_sql_ms: Number(catalogSqlMs.toFixed(2)),
         mapping_duration_ms: Number(mappingDurationMs.toFixed(2))
       }
     });
@@ -1074,6 +1085,8 @@ export const getCajaBootstrapHandler = async (req, res) => {
         id_tipo_departamento: idTipoDepartamento,
         cache: cacheStatus,
         sql_duration_ms: Number(sqlDurationMs.toFixed(2)),
+        operational_sql_ms: Number(operationalSqlMs.toFixed(2)),
+        catalog_sql_ms: Number(catalogSqlMs.toFixed(2)),
         mapping_duration_ms: Number(mappingDurationMs.toFixed(2)),
         total_duration_ms: Number((performance.now() - startedAt).toFixed(2)),
         cantidad_recetas: recipeCount,

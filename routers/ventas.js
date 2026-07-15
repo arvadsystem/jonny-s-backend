@@ -18,6 +18,13 @@ import {
   listFacturaReversiones
 } from '../services/ventasReversionService.js';
 import {
+  lockCajaFinancialSession,
+  mapCajaFinancialLockError
+} from '../services/cajaFinancialLockService.js';
+import {
+  validateCajaSessionOpenForFinancialWrite
+} from '../services/cajaSessionWriteGuardService.js';
+import {
   listarAlertasInventarioPedido
 } from '../services/inventarioAlertasService.js';
 import {
@@ -43,6 +50,7 @@ import {
   fetchCachedVentasStaticRows,
   resolveRecetaComplementMetadata
 } from './ventas/services/complementosCatalogService.js';
+import { resolveComplementosIncompleteAuthorization } from './ventas/services/complementosAuthorizationService.js';
 import {
   getCajaBootstrapHandler,
   listCategoriasCatalogoHandler,
@@ -61,6 +69,7 @@ import {
   getVentaTicketByIdHandler
 } from './ventas/handlers/ventasReadHandlers.js';
 import {
+  createVentasPrinterDeviceDetectionHandler,
   createVentaPrintEventHandler,
   getPedidoKitchenComandaByIdHandler,
   getQzCertificateHandler,
@@ -76,12 +85,30 @@ import {
 } from './ventas/services/ventasPayloadService.js';
 import {
   buildPedidoPendienteRpcPayload,
+  buildPedidoPendienteRpcV2Payload,
   buildVentaRpcPayload,
   buildVentaRpcV2Payload,
+  buildVentaRpcV3Payload,
   validateVentaMontoCobro,
   VENTA_MONTO_COBRO_INVALIDO_CODE,
   VENTA_MONTO_COBRO_INVALIDO_MESSAGE
 } from './ventas/services/ventasRpcPayloadService.js';
+import {
+  buildRpcFidelizacionJob,
+  buildVentasRpcActor,
+  executeVentasRpc
+} from './ventas/services/ventasRpcExecutionService.js';
+import {
+  hasCuentaDivididaPayload,
+  reserveIdempotencyForMode,
+  resolvePedidoPendienteIdempotencyMode,
+  resolvePedidoPendienteRpcSkipReason,
+  resolveVentaIdempotencyMode,
+  saveExternalIdempotencyFailureIfNeeded,
+  saveExternalIdempotencySuccessIfNeeded,
+  shouldRunRpcPostCommitSideEffects,
+  shouldUsePedidoPendienteRpcV2
+} from './ventas/services/ventasRpcRoutingService.js';
 import {
   DESCUENTO_ALCANCE_KEYS,
   DESCUENTO_TIPO_KEYS,
@@ -99,6 +126,7 @@ import {
   VENTA_DIRECTA_LABEL,
   VENTAS_DEFAULT_PAGE,
   VENTAS_DEFAULT_PAGE_SIZE,
+  VENTAS_COMPLEMENTOS_INCOMPLETOS_AUTORIZAR_PERMISSION,
   VENTAS_DESCUENTO_APLICAR_PERMISSION,
   VENTAS_DESCUENTOS_PERMISSIONS,
   VENTAS_DESCUENTOS_WRITE_PERMISSIONS,
@@ -109,6 +137,8 @@ import {
   VENTAS_MAX_PAGE_SIZE
 } from './ventas/constants.js';
 import { roundMoney } from './ventas/utils/moneyUtils.js';
+import { validarYDescontarPedido } from '../services/inventarioPedidoService.js';
+import { buildPedidoConsumoPayload } from './cocina.js';
 import {
   coercePositiveIntArray,
   isPlainObject,
@@ -130,10 +160,13 @@ import {
 } from './ventas/utils/parseUtils.js';
 import {
   createVentasPerfTracker,
+  instrumentVentasSqlClient,
   isPedidoPendienteRpcV1Enabled,
+  isPedidoPendienteRpcV2Enabled,
   isVentasPerfEnabled,
   isVentasRpcTransactionEnabled,
   isVentasRpcV2Enabled,
+  isVentasRpcV3Enabled,
   logVentasPerfRoute,
   logVentasPerfStartupIfEnabled
 } from './ventas/utils/perfUtils.js';
@@ -262,8 +295,7 @@ const resolvePedidoDeliverySnapshotForInsert = async (client, delivery = {}) => 
 };
 
 const PEDIDO_PENDIENTE_ALLOWED_EXTRAS_SCHEMA_TABLES = Object.freeze([
-  'menu_extras',
-  'menu_extra_receta'
+  'menu_extras'
 ]);
 const PEDIDO_PENDIENTE_ALLOWED_EXTRAS_SCHEMA_MIN_TTL_MS = 5 * 60 * 1000;
 const pedidoPendienteAllowedExtrasSchemaCache = new Map();
@@ -275,8 +307,7 @@ const getPedidoPendienteAllowedExtrasSchemaCacheTtlMs = () => {
 };
 
 const clonePedidoPendienteAllowedExtrasSchemaValue = (value) => ({
-  hasMenuExtras: Boolean(value?.hasMenuExtras),
-  hasMenuExtraReceta: Boolean(value?.hasMenuExtraReceta)
+  hasMenuExtras: Boolean(value?.hasMenuExtras)
 });
 
 const resolvePedidoPendienteAllowedExtrasSchema = async (client, perf = null) => {
@@ -301,8 +332,7 @@ const resolvePedidoPendienteAllowedExtrasSchema = async (client, perf = null) =>
     );
     const existingTables = new Set(result.rows.map((row) => String(row.table_name || '').trim()));
     const value = {
-      hasMenuExtras: existingTables.has('menu_extras'),
-      hasMenuExtraReceta: existingTables.has('menu_extra_receta')
+      hasMenuExtras: existingTables.has('menu_extras')
     };
     pedidoPendienteAllowedExtrasSchemaCache.set(cacheKey, {
       value,
@@ -1086,7 +1116,11 @@ const registerVentaFidelizacionAfterCommit = async ({
   let transactionStarted = false;
 
   try {
+    const poolWaitStart = ventasPerf.now();
     client = await pool.connect();
+    ventasPerf.add('pool_wait_ms', poolWaitStart);
+    instrumentVentasSqlClient(client, ventasPerf);
+    const transactionStart = ventasPerf.now();
     await client.query('BEGIN');
     transactionStarted = true;
     await client.query(
@@ -1106,6 +1140,7 @@ const registerVentaFidelizacionAfterCommit = async ({
 
     await client.query('COMMIT');
     transactionStarted = false;
+    ventasPerf.add('transaction_ms', transactionStart);
 
     logVentasFidelizacionAsyncPerf({
       id_factura: facturaId,
@@ -1210,6 +1245,13 @@ const createVentaWithRpcTransaction = async ({ client, venta, perf, requestStart
     };
   }
 
+  await aplicarSnapshotEnFactura(
+    client,
+    idFactura,
+    facturacionVenta.snapshot,
+    facturacionVenta.idConfig
+  );
+
   const responsePayload = {
     ...response,
     fidelizacion: null
@@ -1283,6 +1325,16 @@ const createVentaWithRpcV2Transaction = async ({ client, venta, perf, requestSta
     };
   }
 
+  const facturacionVenta = await obtenerConfigFacturacionParaVenta(client, venta.id_sucursal, {
+    perf
+  });
+  await aplicarSnapshotEnFactura(
+    client,
+    idFactura,
+    facturacionVenta.snapshot,
+    facturacionVenta.idConfig
+  );
+
   const responsePayload = {
     ...response,
     fidelizacion: null
@@ -1302,6 +1354,53 @@ const createVentaWithRpcV2Transaction = async ({ client, venta, perf, requestSta
       idUsuarioEjecutor: venta.id_usuario,
       montoFactura: venta.total
     }
+  };
+};
+
+const createVentaWithRpcV3Transaction = async ({
+  client,
+  venta,
+  perf,
+  idempotencyKey,
+  requestHash,
+  requestStartedAt = 0
+}) => {
+  const rpcTotalStart = perf?.now?.() || 0;
+  const payloadStart = perf?.now?.() || 0;
+  const rpcPayload = buildVentaRpcV3Payload({ venta, idempotencyKey, requestHash });
+  const amountValidation = validateVentaMontoCobro({ venta, payload: rpcPayload });
+  if (!amountValidation.ok) {
+    throw {
+      httpStatus: amountValidation.status,
+      code: amountValidation.code,
+      publicMessage: amountValidation.message
+    };
+  }
+  const rpcActor = buildVentasRpcActor(venta);
+  perf?.add?.('rpc_v3_payload_build_ms', payloadStart);
+  perf?.add?.('pre_rpc_total_ms', rpcTotalStart);
+  if (requestStartedAt) perf?.add?.('node_before_rpc_ms', requestStartedAt);
+
+  const afterRpcStart = perf?.now?.() || 0;
+  const response = await executeVentasRpc({
+    client,
+    sql: 'SELECT public.registrar_venta_pos_v3($1::jsonb, $2::jsonb) AS response',
+    payload: rpcPayload,
+    actor: rpcActor,
+    perf,
+    callMetric: 'rpc_v3_call_ms',
+    expectedVersion: 'v3',
+    invalidCode: 'VENTAS_RPC_V3_RESPONSE_INVALID'
+  });
+  perf?.add?.('rpc_v3_total_ms', rpcTotalStart);
+  perf?.add?.('post_rpc_total_ms', afterRpcStart);
+  return {
+    response: {
+      ...response,
+      fidelizacion: null
+    },
+    afterRpcStart,
+    fidelizacionJob: buildRpcFidelizacionJob({ response, venta })
   };
 };
 
@@ -1334,6 +1433,32 @@ const createPedidoPendienteWithRpcV1Transaction = async ({ client, pedidoPendien
     };
   }
 
+  return response;
+};
+
+const createPedidoPendienteWithRpcV2Transaction = async ({
+  client,
+  pedidoPendiente,
+  perf,
+  idempotencyKey,
+  requestHash
+}) => {
+  const rpcTotalStart = perf?.now?.() || 0;
+  const payloadStart = perf?.now?.() || 0;
+  const rpcPayload = buildPedidoPendienteRpcV2Payload({ pedidoPendiente, idempotencyKey, requestHash });
+  const rpcActor = buildVentasRpcActor(pedidoPendiente);
+  perf?.add?.('pedido_pendiente_rpc_v2_payload_build_ms', payloadStart);
+  const response = await executeVentasRpc({
+    client,
+    sql: 'SELECT public.registrar_pedido_pendiente_pos_v2($1::jsonb, $2::jsonb) AS response',
+    payload: rpcPayload,
+    actor: rpcActor,
+    perf,
+    callMetric: 'pedido_pendiente_rpc_v2_call_ms',
+    expectedVersion: 'v2',
+    invalidCode: 'PEDIDO_PENDIENTE_RPC_V2_RESPONSE_INVALID'
+  });
+  perf?.add?.('pedido_pendiente_rpc_v2_total_ms', rpcTotalStart);
   return response;
 };
 
@@ -1996,7 +2121,56 @@ const buildInvalidComplementResult = ({ item, nombreItem, allowed = [], reason }
   };
 };
 
-const resolveLineComplementos = ({ item, receta, context, nombreItem }) => {
+const validarYDescontarInventarioCajaPedido = async ({
+  client,
+  idPedido,
+  idSucursal,
+  idUsuario,
+  perf = null
+}) => {
+  const inventoryStartedAt = perf?.now?.() || 0;
+  const payloadStartedAt = perf?.now?.() || 0;
+  const consumoPayloadResult = await buildPedidoConsumoPayload(client, idPedido, idSucursal);
+  perf?.add?.('inventario_payload_ms', payloadStartedAt);
+  if (!consumoPayloadResult.ok) {
+    throw {
+      httpStatus: consumoPayloadResult.status || 409,
+      code: consumoPayloadResult.body?.code || 'VENTAS_INVENTARIO_PEDIDO_INVALIDO',
+      publicMessage: consumoPayloadResult.body?.message || 'No se pudo validar el inventario del pedido.',
+      details: consumoPayloadResult.body?.details || null
+    };
+  }
+
+  try {
+    const inventoryResult = await validarYDescontarPedido(consumoPayloadResult.payload, {
+      id_usuario: idUsuario,
+      dbClient: client,
+      perf
+    });
+    if (!inventoryResult?.ok) {
+      throw {
+        httpStatus: 409,
+        code: inventoryResult?.code || 'VENTAS_INVENTARIO_INSUFICIENTE',
+        publicMessage: inventoryResult?.message || 'No se pudo descontar inventario para el pedido.',
+        details: inventoryResult?.faltantes || null
+      };
+    }
+    return inventoryResult;
+  } catch (error) {
+    if (String(error?.code || '').trim().toUpperCase() === 'PEDIDO_YA_DESCONTADO') {
+      return {
+        ok: true,
+        code: 'PEDIDO_YA_DESCONTADO',
+        message: 'El pedido ya tenia descuento de inventario registrado.'
+      };
+    }
+    throw error;
+  } finally {
+    perf?.add?.('inventario_ms', inventoryStartedAt);
+  }
+};
+
+const resolveLineComplementos = ({ item, receta, context, nombreItem, complementosIncompleteAuthorization = {} }) => {
   if (item.kind === 'PRODUCTO' || item.kind === 'ITEM') {
     if (Array.isArray(item.complementos) && item.complementos.length > 0) {
       return buildInvalidComplementResult({ item, nombreItem, reason: 'PRODUCTO_NO_PERMITE_COMPLEMENTOS' });
@@ -2057,8 +2231,17 @@ const resolveLineComplementos = ({ item, receta, context, nombreItem }) => {
   const min = Math.max(0, Number(metadata.minimo_complementos || 0));
   const max = Math.max(min, Number(metadata.maximo_complementos || 0));
   const complementosIncompletos = min > 0 && selected.length < min;
-  if (max > 0 && selected.length > max) {
-    return { ok: false, message: `No puedes seleccionar mas de ${max} complemento(s) para este item.` };
+  const boundsResult = resolveComplementosIncompleteAuthorization({
+    selectedCount: selected.length,
+    minimo: min,
+    maximo: max,
+    nombreItem,
+    requestedOverride: item.complementos_incompletos_solicitados === true,
+    serverAuthorized: complementosIncompleteAuthorization.serverAuthorized === true,
+    authorizedByUserId: complementosIncompleteAuthorization.authorizedByUserId
+  });
+  if (!boundsResult.ok) {
+    return boundsResult;
   }
   if (!metadata.requiere_complementos && allowedMap.size === 0 && selected.length > 0) {
     return buildInvalidComplementResult({
@@ -2073,7 +2256,8 @@ const resolveLineComplementos = ({ item, receta, context, nombreItem }) => {
     ok: true,
     metadata: {
       ...metadata,
-      complementos_incompletos_autorizados: Boolean(item.complementos_incompletos_autorizados),
+      complementos_incompletos_autorizados: boundsResult.authorized === true,
+      ...(boundsResult.authorization || {}),
       complementos_recomendados: min,
       complementos_seleccionados: selected.length,
       complementos_incompletos: complementosIncompletos
@@ -2088,7 +2272,7 @@ const buildExtraLineKey = (kind, idItem, idExtra) =>
 const itemHasRequestedExtras = (item) =>
   Array.isArray(item?.extras) && item.extras.some((extra) => parseOptionalPositiveInt(extra?.id_extra));
 
-const buildAllowedExtrasMap = async (client, { normalizedItems = [], idSucursal = null, perf = null, allowedExtrasSchema = null } = {}) => {
+const buildGlobalExtrasMap = async (client, { normalizedItems = [], idSucursal = null, perf = null, allowedExtrasSchema = null } = {}) => {
   const needsExtras = normalizedItems.some((item) => itemHasRequestedExtras(item));
   if (!needsExtras) return new Map();
   const requestedExtraIds = [...new Set(
@@ -2103,7 +2287,7 @@ const buildAllowedExtrasMap = async (client, { normalizedItems = [], idSucursal 
   const normalizedSucursalId = parseOptionalPositiveInt(idSucursal);
   if (!normalizedSucursalId) return new Map();
 
-  const allowedExtrasQueryStart = perf?.now?.() || 0;
+  const globalExtrasQueryStart = perf?.now?.() || 0;
   let rows = [];
   try {
     rows = await fetchVentaGlobalExtrasCatalog({
@@ -2112,7 +2296,7 @@ const buildAllowedExtrasMap = async (client, { normalizedItems = [], idSucursal 
       extraIds: requestedExtraIds
     });
   } finally {
-    perf?.add?.('pedido_pendiente_allowed_extras_query_ms', allowedExtrasQueryStart);
+    perf?.add?.('pedido_pendiente_global_extras_query_ms', globalExtrasQueryStart);
   }
 
   const uniqueExtrasById = new Map();
@@ -2242,7 +2426,7 @@ const buildStandaloneExtraCatalogMap = async (client, { normalizedItems = [], id
   );
 };
 
-const resolveLineExtras = ({ item, allowedExtrasMap }) => {
+const resolveLineExtras = ({ item, globalExtrasMap }) => {
   const requested = Array.isArray(item.extras) ? item.extras : [];
   if (item.kind === 'PRODUCTO' || item.kind === 'ITEM') {
     if (requested.length > 0) return { ok: false, message: 'Los productos no permiten extras.' };
@@ -2255,11 +2439,13 @@ const resolveLineExtras = ({ item, allowedExtrasMap }) => {
   let subtotal = 0;
 
   for (const entry of requested) {
-    const extra = allowedExtrasMap.get(buildExtraLineKey(item.kind, idItem, entry.id_extra));
+    const extra = globalExtrasMap.get(buildExtraLineKey(item.kind, idItem, entry.id_extra));
     if (!extra || extra.estado !== true) {
       return { ok: false, message: 'Uno o mas extras seleccionados no son validos para este item.' };
     }
-    const cantidad = Number(entry.cantidad || 0);
+    const cantidadPorOrden = Number(entry.cantidad || 0);
+    const cantidadLinea = Number(item.cantidad || 1);
+    const cantidad = cantidadPorOrden * cantidadLinea;
     if (extra.disponible !== true) {
       return {
         ok: false,
@@ -2278,14 +2464,6 @@ const resolveLineExtras = ({ item, allowedExtrasMap }) => {
         message: `El extra ${extra.nombre} no esta disponible en esta sucursal: requiere revisar su configuracion de inventario.`
       };
     }
-    if (controlsInventory && Number(extra.stock_disponible ?? 0) < requiredInsumo) {
-      return {
-        ok: false,
-        status: 409,
-        code: 'VENTAS_EXTRA_INVENTARIO_NO_DISPONIBLE',
-        message: `No hay existencias suficientes para el extra ${extra.nombre}.`
-      };
-    }
     const lineSubtotal = roundMoney(extra.precio_unitario * cantidad);
     subtotal = roundMoney(subtotal + lineSubtotal);
     selected.push({
@@ -2293,6 +2471,8 @@ const resolveLineExtras = ({ item, allowedExtrasMap }) => {
       codigo: extra.codigo,
       nombre: extra.nombre,
       cantidad,
+      cantidad_por_orden: cantidadPorOrden,
+      cantidad_total: cantidad,
       precio_unitario: extra.precio_unitario,
       subtotal: lineSubtotal,
       id_insumo: controlsInventory ? extra.id_insumo : null,
@@ -2308,44 +2488,7 @@ const resolveLineExtras = ({ item, allowedExtrasMap }) => {
 };
 
 const validateAggregatedExtrasInventory = (lines = []) => {
-  const usageByStockKey = new Map();
-
-  for (const line of Array.isArray(lines) ? lines : []) {
-    for (const extra of Array.isArray(line?.extras_detalle) ? line.extras_detalle : []) {
-      const idInsumo = parseOptionalPositiveInt(extra?.id_insumo);
-      const idAlmacen = parseOptionalPositiveInt(extra?.id_almacen);
-      const consumoBase = Number(extra?.cantidad_insumo ?? extra?.cant ?? 0);
-      const cantidad = Number(extra?.cantidad || 0);
-      if (!idInsumo || !idAlmacen || consumoBase <= 0 || cantidad <= 0) continue;
-
-      const stockKey = `${idInsumo}:${idAlmacen}`;
-      const current = usageByStockKey.get(stockKey) || {
-        idInsumo,
-        idAlmacen,
-        nombre: extra.nombre || 'extra',
-        stockDisponible: Number(extra.stock_disponible ?? 0),
-        requerido: 0
-      };
-      current.requerido = roundMoney(current.requerido + (consumoBase * cantidad));
-      current.stockDisponible = Math.min(current.stockDisponible, Number(extra.stock_disponible ?? 0));
-      usageByStockKey.set(stockKey, current);
-    }
-  }
-
-  for (const usage of usageByStockKey.values()) {
-    if (usage.stockDisponible < usage.requerido) {
-      return {
-        ok: false,
-        status: 409,
-        body: {
-          error: true,
-          code: 'VENTAS_EXTRA_INVENTARIO_NO_DISPONIBLE',
-          message: `No hay existencias suficientes para el extra ${usage.nombre}.`
-        }
-      };
-    }
-  }
-
+  void lines;
   return { ok: true };
 };
 
@@ -2441,6 +2584,8 @@ const insertDetallePedidoExtras = async ({ client, idDetallePedido, extras = [] 
         codigo,
         nombre,
         cantidad,
+        cantidad_por_orden: Number(extra.cantidad_por_orden ?? (extra.cantidad || 0)),
+        cantidad_total: Number(extra.cantidad_total ?? (extra.cantidad || 0)),
         precio_unitario: precioUnitario,
         subtotal,
         id_insumo: idInsumo || null,
@@ -2480,6 +2625,106 @@ const insertDetallePedidoExtras = async ({ client, idDetallePedido, extras = [] 
     `,
     params
   );
+};
+
+const insertDetallePedidoExtrasBatch = async ({ client, lineRefs = [] }) => {
+  const flatRows = [];
+  for (const ref of Array.isArray(lineRefs) ? lineRefs : []) {
+    const detalleId = parseOptionalPositiveInt(ref?.id_detalle_pedido);
+    if (!detalleId) continue;
+    for (const extra of Array.isArray(ref?.extras_detalle) ? ref.extras_detalle : []) {
+      if (!parseOptionalPositiveInt(extra?.id_extra) || Number(extra?.cantidad || 0) <= 0) continue;
+      flatRows.push({ detalleId, extra });
+    }
+  }
+  if (!flatRows.length) return 0;
+  if (!(await hasTable(client, 'detalle_pedido_extras'))) return 0;
+
+  const rowsNeedingCatalog = flatRows
+    .map(({ extra }) => extra)
+    .filter((extra) => {
+      const idInsumo = parseOptionalPositiveInt(extra.id_insumo);
+      const hasConsumption = Number(extra.cant ?? extra.cantidad_insumo ?? 0) > 0;
+      const hasUnit = Boolean(parseOptionalPositiveInt(extra.id_unidad_medida));
+      return !idInsumo || !hasConsumption || !hasUnit || !String(extra.codigo || '').trim() || !String(extra.nombre || '').trim();
+    });
+  const catalogByExtraId = await fetchMenuExtrasSnapshotByIds(
+    client,
+    rowsNeedingCatalog.map((extra) => extra.id_extra)
+  );
+
+  const values = buildBatchPlaceholders(flatRows.length, 11);
+  const params = [];
+  for (const { detalleId, extra } of flatRows) {
+    const idExtra = Number(extra.id_extra);
+    const catalog = catalogByExtraId.get(idExtra) || null;
+    const codigo = String(extra.codigo || catalog?.codigo || '').trim() || null;
+    const nombre = String(extra.nombre || catalog?.nombre || 'Extra').trim().slice(0, 120);
+    const cantidad = Number(extra.cantidad);
+    const precioUnitario = roundMoney(extra.precio_unitario ?? catalog?.precio_unitario);
+    const subtotal = roundMoney(extra.subtotal ?? precioUnitario * cantidad);
+    const idInsumo = parseOptionalPositiveInt(extra.id_insumo) || parseOptionalPositiveInt(catalog?.id_insumo);
+    const cant = idInsumo ? Number(extra.cant ?? extra.cantidad_insumo ?? catalog?.cant ?? 0) || null : null;
+    const idUnidadMedida = idInsumo ? parseOptionalPositiveInt(extra.id_unidad_medida) || parseOptionalPositiveInt(catalog?.id_unidad_medida) : null;
+    params.push(
+      detalleId,
+      idExtra,
+      codigo,
+      nombre,
+      cantidad,
+      precioUnitario,
+      subtotal,
+      idInsumo || null,
+      cant,
+      idUnidadMedida,
+      JSON.stringify({
+        id_extra: idExtra,
+        codigo,
+        nombre,
+        cantidad,
+        cantidad_por_orden: Number(extra.cantidad_por_orden ?? (extra.cantidad || 0)),
+        cantidad_total: Number(extra.cantidad_total ?? (extra.cantidad || 0)),
+        precio_unitario: precioUnitario,
+        subtotal,
+        id_insumo: idInsumo || null,
+        cant,
+        id_unidad_medida: idUnidadMedida
+      })
+    );
+  }
+
+  await client.query(
+    `
+      INSERT INTO public.detalle_pedido_extras (
+        id_detalle_pedido,
+        id_extra,
+        codigo_extra_snapshot,
+        nombre_extra_snapshot,
+        cantidad,
+        precio_unitario,
+        subtotal,
+        id_insumo,
+        cant,
+        id_unidad_medida,
+        origen_snapshot
+      )
+      VALUES ${values}
+      ON CONFLICT (id_detalle_pedido, id_extra)
+      DO UPDATE SET
+        codigo_extra_snapshot = EXCLUDED.codigo_extra_snapshot,
+        nombre_extra_snapshot = EXCLUDED.nombre_extra_snapshot,
+        cantidad = EXCLUDED.cantidad,
+        precio_unitario = EXCLUDED.precio_unitario,
+        subtotal = EXCLUDED.subtotal,
+        id_insumo = EXCLUDED.id_insumo,
+        cant = EXCLUDED.cant,
+        id_unidad_medida = EXCLUDED.id_unidad_medida,
+        origen_snapshot = EXCLUDED.origen_snapshot,
+        estado = true
+    `,
+    params
+  );
+  return flatRows.length;
 };
 
 const insertDetalleFacturaExtras = async ({ client, idDetalleFactura, idDetallePedido = null, extras = [] }) => {
@@ -2548,6 +2793,85 @@ const insertDetalleFacturaExtras = async ({ client, idDetalleFactura, idDetalleP
   );
 };
 
+const insertDetalleFacturaExtrasBatch = async ({ client, detailRows = [], insertedRows = [] }) => {
+  const flatRows = [];
+  const detallePedidoIds = new Set();
+  const extraIds = new Set();
+  for (let index = 0; index < (Array.isArray(detailRows) ? detailRows.length : 0); index += 1) {
+    const detalleFacturaId = parseOptionalPositiveInt(insertedRows?.[index]?.id_detalle_factura);
+    if (!detalleFacturaId) continue;
+    const detallePedidoId = parseOptionalPositiveInt(insertedRows?.[index]?.id_detalle_pedido || detailRows[index]?.pedidoRef?.id_detalle_pedido);
+    for (const extra of Array.isArray(detailRows[index]?.line?.extras_detalle) ? detailRows[index].line.extras_detalle : []) {
+      const idExtra = parseOptionalPositiveInt(extra?.id_extra);
+      if (!idExtra || Number(extra?.cantidad || 0) <= 0) continue;
+      flatRows.push({ detalleFacturaId, detallePedidoId, extra });
+      if (detallePedidoId) detallePedidoIds.add(detallePedidoId);
+      extraIds.add(idExtra);
+    }
+  }
+  if (!flatRows.length) return 0;
+  if (!(await hasTable(client, 'detalle_factura_extras'))) return 0;
+
+  const pedidoExtraIdsByKey = new Map();
+  if (detallePedidoIds.size > 0 && extraIds.size > 0 && (await hasTable(client, 'detalle_pedido_extras'))) {
+    const pedidoExtras = await client.query(
+      `
+        SELECT id_detalle_pedido, id_extra, id_detalle_pedido_extra
+        FROM public.detalle_pedido_extras
+        WHERE id_detalle_pedido = ANY($1::int[])
+          AND id_extra = ANY($2::int[])
+          AND COALESCE(estado, true) = true
+      `,
+      [[...detallePedidoIds], [...extraIds]]
+    );
+    for (const row of pedidoExtras.rows) {
+      pedidoExtraIdsByKey.set(
+        `${Number(row.id_detalle_pedido)}:${Number(row.id_extra)}`,
+        parseOptionalPositiveInt(row.id_detalle_pedido_extra)
+      );
+    }
+  }
+
+  const values = buildBatchPlaceholders(flatRows.length, 7);
+  const params = [];
+  for (const { detalleFacturaId, detallePedidoId, extra } of flatRows) {
+    const idExtra = Number(extra.id_extra);
+    params.push(
+      detalleFacturaId,
+      parseOptionalPositiveInt(extra.id_detalle_pedido_extra) || pedidoExtraIdsByKey.get(`${detallePedidoId}:${idExtra}`) || null,
+      idExtra,
+      String(extra.nombre || 'Extra').trim().slice(0, 120),
+      Number(extra.cantidad),
+      roundMoney(extra.precio_unitario),
+      roundMoney(extra.subtotal)
+    );
+  }
+  await client.query(
+    `
+      INSERT INTO public.detalle_factura_extras (
+        id_detalle_factura,
+        id_detalle_pedido_extra,
+        id_extra,
+        nombre_extra_snapshot,
+        cantidad,
+        precio_unitario,
+        subtotal
+      )
+      VALUES ${values}
+      ON CONFLICT (id_detalle_factura, id_extra)
+      DO UPDATE SET
+        id_detalle_pedido_extra = COALESCE(EXCLUDED.id_detalle_pedido_extra, detalle_factura_extras.id_detalle_pedido_extra),
+        nombre_extra_snapshot = EXCLUDED.nombre_extra_snapshot,
+        cantidad = EXCLUDED.cantidad,
+        precio_unitario = EXCLUDED.precio_unitario,
+        subtotal = EXCLUDED.subtotal,
+        estado = true
+    `,
+    params
+  );
+  return flatRows.length;
+};
+
 const fetchDetallePedidoExtras = async (client, detallePedidoIds = []) => {
   const ids = [...new Set((Array.isArray(detallePedidoIds) ? detallePedidoIds : [])
     .map((id) => parseOptionalPositiveInt(id))
@@ -2563,7 +2887,8 @@ const fetchDetallePedidoExtras = async (client, detallePedidoIds = []) => {
         nombre_extra_snapshot AS nombre,
         cantidad,
         precio_unitario,
-        subtotal
+        subtotal,
+        origen_snapshot
       FROM public.detalle_pedido_extras
       WHERE id_detalle_pedido = ANY($1::int[])
         AND COALESCE(estado, true) = true
@@ -2580,14 +2905,14 @@ const fetchDetallePedidoExtras = async (client, detallePedidoIds = []) => {
       id_extra: Number(row.id_extra),
       nombre: row.nombre,
       cantidad: Number(row.cantidad),
+      cantidad_por_orden: Number(row.origen_snapshot?.cantidad_por_orden ?? row.cantidad),
+      cantidad_total: Number(row.origen_snapshot?.cantidad_total ?? row.cantidad),
       precio_unitario: roundMoney(row.precio_unitario),
       subtotal: roundMoney(row.subtotal)
     });
   }
   return grouped;
 };
-
-const hasCuentaDivididaPayload = (body) => Array.isArray(body?.cuenta_dividida);
 
 const buildCuentaDivisionPlan = ({ cuentaDividida, lines, expectedTotal, allowPartial = false }) => {
   if (!Array.isArray(cuentaDividida)) return null;
@@ -2956,7 +3281,7 @@ const hydrateVentaLines = async (client, normalizedItems, perf = null, options =
     ? await resolvePedidoPendienteAllowedExtrasSchema(client, perf)
     : null;
 
-  const [complementContext, allowedExtrasMap, standaloneExtraCatalogMap] = await Promise.all([
+  const [complementContext, globalExtrasMap, standaloneExtraCatalogMap] = await Promise.all([
     buildVentaComplementContext({
       client,
       normalizedItems,
@@ -2967,7 +3292,7 @@ const hydrateVentaLines = async (client, normalizedItems, perf = null, options =
     (async () => {
       const extrasStart = perf?.now?.() || 0;
       try {
-        return await buildAllowedExtrasMap(client, {
+        return await buildGlobalExtrasMap(client, {
           normalizedItems,
           idSucursal: options?.idSucursal,
           perf,
@@ -3062,8 +3387,9 @@ const hydrateVentaLines = async (client, normalizedItems, perf = null, options =
       const complementosResult = resolveLineComplementos({
         item,
         receta: null,
-        context: complementContext,
-        nombreItem: producto.nombre_producto || 'Producto'
+      context: complementContext,
+      nombreItem: producto.nombre_producto || 'Producto',
+      complementosIncompleteAuthorization: options.complementosIncompleteAuthorization
       });
       if (!complementosResult.ok) {
         return {
@@ -3076,7 +3402,7 @@ const hydrateVentaLines = async (client, normalizedItems, perf = null, options =
           }
         };
       }
-      const extrasResult = resolveLineExtras({ item, allowedExtrasMap });
+      const extrasResult = resolveLineExtras({ item, globalExtrasMap });
       if (!extrasResult.ok) {
         return {
           ok: false,
@@ -3155,18 +3481,6 @@ const hydrateVentaLines = async (client, normalizedItems, perf = null, options =
           }
         };
       }
-      if (controlsInventory && Number(extra.stock_disponible ?? 0) < requiredInsumo) {
-        return {
-          ok: false,
-          status: 409,
-          body: {
-            error: true,
-            code: 'VENTAS_EXTRA_INVENTARIO_NO_DISPONIBLE',
-            message: `No hay existencias suficientes para el extra ${extra.nombre}.`
-          }
-        };
-      }
-
       const subTotal = roundMoney(precioUnitario * item.cantidad);
       const standaloneExtraDetail = {
         id_extra: extra.id_extra,
@@ -3239,7 +3553,8 @@ const hydrateVentaLines = async (client, normalizedItems, perf = null, options =
       item,
       receta,
       context: complementContext,
-      nombreItem: receta.nombre_receta || 'Receta'
+      nombreItem: receta.nombre_receta || 'Receta',
+      complementosIncompleteAuthorization: options.complementosIncompleteAuthorization
     });
     if (!complementosResult.ok) {
       return {
@@ -3252,7 +3567,7 @@ const hydrateVentaLines = async (client, normalizedItems, perf = null, options =
         }
       };
     }
-    const extrasResult = resolveLineExtras({ item, allowedExtrasMap });
+    const extrasResult = resolveLineExtras({ item, globalExtrasMap });
     if (!extrasResult.ok) {
       return {
         ok: false,
@@ -3268,6 +3583,7 @@ const hydrateVentaLines = async (client, normalizedItems, perf = null, options =
       id_receta: item.id_receta,
       id_descuento_catalogo_linea: item.id_descuento_catalogo_linea ?? null,
       id_almacen: null,
+      componentes_receta: Array.isArray(receta.componentes) ? receta.componentes : [],
       nombre_item: receta.nombre_receta || `Receta #${item.id_receta}`,
       cantidad: item.cantidad,
       precio_unitario: precioUnitario,
@@ -3613,7 +3929,7 @@ const buildPedidoPendienteDiscountErrorBody = (validation) => ({
 
 const mapPedidoPendienteSessionStatus = (reason) => reason === 'SESSION_SCOPE_MISMATCH' ? 403 : 409;
 
-const buildPedidoPendientePayload = async ({ client, body, userId, sucursalScope, canApplyDiscount, perf = null }) => {
+const buildPedidoPendientePayload = async ({ client, body, userId, sucursalScope, canApplyDiscount, canAuthorizeIncompleteComplementos, perf = null }) => {
   if (!isPlainObject(body)) return { ok: false, status: 400, body: { error: true, message: 'Payload invalido para crear pedido pendiente.' } };
   if (!userId) return { ok: false, status: 401, body: { error: true, message: 'No se pudo resolver el usuario autenticado.' } };
 
@@ -3707,7 +4023,11 @@ const buildPedidoPendientePayload = async ({ client, body, userId, sucursalScope
   const hydrateLinesStart = perf?.now?.() || 0;
   const hydratedResult = await hydrateVentaLines(client, normalizedItemsResult.data, perf, {
     idSucursal,
-    validateProductStock: false
+    validateProductStock: false,
+    complementosIncompleteAuthorization: {
+      serverAuthorized: canAuthorizeIncompleteComplementos === true,
+      authorizedByUserId: userId
+    }
   });
   perf?.add?.('pedido_pendiente_hydrate_lines_ms', hydrateLinesStart);
   if (!hydratedResult.ok) return hydratedResult;
@@ -3894,7 +4214,10 @@ const prepareDetalleFacturaDesdePedido = (row, idPedido) => {
   const subTotal = roundMoney(row.sub_total_pedido);
   const totalDetalle = roundMoney(row.total_pedido ?? row.sub_total_pedido);
   const precioBase = roundMoney(row.precio_unitario || (subTotal > 0 ? subTotal : totalDetalle));
-  const cantidad = inferKitchenItemQuantity(subTotal, precioBase);
+  const cantidadPersistida = Number(row.cantidad ?? 0);
+  const cantidad = Number.isFinite(cantidadPersistida) && cantidadPersistida > 0
+    ? cantidadPersistida
+    : inferKitchenItemQuantity(subTotal, precioBase);
   const precioUnitario = precioBase > 0 ? precioBase : roundMoney(subTotal / Math.max(cantidad, 1));
   const idDetallePedido = parseOptionalPositiveInt(row.id_detalle_pedido);
   const snapshot = buildPedidoFacturaSnapshot(row, cantidad, tipoItem, precioUnitario, subTotal, totalDetalle);
@@ -4172,7 +4495,7 @@ const updatePedidoLegacyPagoConfirmado = async ({ client, idPedido, userId }) =>
   await client.query('UPDATE pedidos SET ' + assignments.join(', ') + ' WHERE id_pedido = $1', params);
 };
 
-const buildVentaPayload = async ({ client, body, userId, sucursalScope, canApplyDiscount, perf = null }) => {
+const buildVentaPayload = async ({ client, body, userId, sucursalScope, canApplyDiscount, canAuthorizeIncompleteComplementos, perf = null }) => {
   const payloadBuildStart = perf?.now?.() || 0;
   if (!isPlainObject(body)) {
     return {
@@ -4384,7 +4707,13 @@ const buildVentaPayload = async ({ client, body, userId, sucursalScope, canApply
   perf?.add?.('auth_payload_context_ms', authContextStart);
   const totalsStart = perf?.now?.() || 0;
 
-  const hydratedResult = await hydrateVentaLines(client, normalizedItemsResult.data, perf, { idSucursal });
+  const hydratedResult = await hydrateVentaLines(client, normalizedItemsResult.data, perf, {
+    idSucursal,
+    complementosIncompleteAuthorization: {
+      serverAuthorized: canAuthorizeIncompleteComplementos === true,
+      authorizedByUserId: userId
+    }
+  });
   if (!hydratedResult.ok) return hydratedResult;
 
   const { lines } = hydratedResult.data;
@@ -6519,6 +6848,8 @@ router.get('/ventas/pedidos-menu', checkPermission(['VENTAS_VER']), async (req, 
                 'nombre_producto', COALESCE(prod.nombre_producto, rec.nombre_receta, 'Item de pedido'),
                 'cantidad',
                   CASE
+                    WHEN COALESCE(dp.cantidad, 0) > 0
+                      THEN dp.cantidad::int
                     WHEN COALESCE(prod.precio, rec.precio, 0) > 0
                       THEN GREATEST(1, ROUND(COALESCE(dp.sub_total_pedido, dp.total_pedido, 0) / COALESCE(prod.precio, rec.precio, 1))::int)
                     ELSE 1
@@ -7290,6 +7621,7 @@ router.get('/ventas/:id/ticket', checkPermission(['VENTAS_IMPRIMIR', 'VENTAS_CRE
 router.get('/ventas/:id/comanda', checkPermission(['VENTAS_IMPRIMIR', 'VENTAS_CREAR']), getVentaKitchenComandaByIdHandler);
 router.get('/ventas/pedidos/:id/comanda', checkPermission(['VENTAS_IMPRIMIR', 'VENTAS_CREAR']), getPedidoKitchenComandaByIdHandler);
 router.get('/ventas/impresoras-config', checkPermission(['VENTAS_IMPRIMIR', 'VENTAS_CREAR']), getVentasPrinterConfigHandler);
+router.post('/ventas/impresoras/dispositivo-deteccion', checkPermission(['VENTAS_IMPRIMIR', 'VENTAS_CREAR']), createVentasPrinterDeviceDetectionHandler);
 router.get('/ventas/qz/certificate', checkPermission(['VENTAS_IMPRIMIR', 'VENTAS_CREAR']), getQzCertificateHandler);
 router.post('/ventas/qz/sign', checkPermission(['VENTAS_IMPRIMIR', 'VENTAS_CREAR']), signQzRequestHandler);
 router.post('/ventas/:id/impresiones', checkPermission(['VENTAS_IMPRIMIR', 'VENTAS_CREAR']), createVentaPrintEventHandler);
@@ -7618,6 +7950,8 @@ async function listarPedidosPendientesPago(req, res) {
             dp.id_detalle_pedido,
             COALESCE(prod.nombre_producto, rec.nombre_receta, 'Item de pedido') AS nombre_item,
             CASE
+              WHEN COALESCE(dp.cantidad, 0) > 0
+                THEN dp.cantidad::int
               WHEN COALESCE(prod.precio, rec.precio, 0) > 0
                 THEN GREATEST(1, ROUND(COALESCE(dp.sub_total_pedido, dp.total_pedido, 0) / COALESCE(prod.precio, rec.precio, 1))::int)
               ELSE 1
@@ -7715,7 +8049,10 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
   const ventasPerf = createVentasPerfTracker();
   const pedidoPendienteRouteStart = ventasPerf.now();
   const pedidoPendienteRoute = 'POST /ventas/pedidos-pendientes';
-  const pedidoPendienteRpcEnabled = isPedidoPendienteRpcV1Enabled();
+  const pedidoPendienteRpcV2Enabled = isPedidoPendienteRpcV2Enabled();
+  const pedidoPendienteRpcV1Enabled = isPedidoPendienteRpcV1Enabled();
+  const pedidoPendienteRpcEnabled = pedidoPendienteRpcV2Enabled || pedidoPendienteRpcV1Enabled;
+  const cuentaDivididaSolicitada = hasCuentaDivididaPayload(req.body);
   let pedidoPendientePersistenceMode = 'not_reached';
   let pedidoPendienteRpcSkipReason = null;
   let pedidoPendienteTotalRouteMeasured = false;
@@ -7737,7 +8074,8 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
     id_sesion_caja: parseOptionalPositiveInt(req.body?.id_sesion_caja) || null,
     items_count: Array.isArray(req.body?.items) ? req.body.items.length : 0,
     rpc_enabled: pedidoPendienteRpcEnabled,
-    cuenta_dividida: hasCuentaDivididaPayload(req.body)
+    rpc_version: pedidoPendienteRpcV2Enabled ? 'v2' : pedidoPendienteRpcV1Enabled ? 'v1' : 'legacy',
+    cuenta_dividida: cuentaDivididaSolicitada
   };
   const buildPedidoPendientePerfLogContext = (extra = {}) => {
     const context = {
@@ -7755,12 +8093,20 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
   const idempotencyRequestHash = idempotencyKey
     ? buildIdempotencyRequestHash(req.body)
     : null;
+  const idempotencyMode = resolvePedidoPendienteIdempotencyMode({
+    pedidoPendienteRpcV2Enabled,
+    cuentaDivididaSolicitada,
+    idempotencyKey
+  });
   let idempotencyReservation = null;
   let client = null;
+  let transactionStarted = false;
+  let transactionStart = 0;
 
   try {
     const discountIntent = hasDiscountIntentInPayload(req.body);
     const canApplyDiscount = await requestHasAnyPermission(req, [VENTAS_DESCUENTO_APLICAR_PERMISSION]);
+    const canAuthorizeIncompleteComplementos = await requestHasAnyPermission(req, [VENTAS_COMPLEMENTOS_INCOMPLETOS_AUTORIZAR_PERMISSION]);
     if (discountIntent && !canApplyDiscount) {
       addPedidoPendienteTotalRoute();
       ventasPerf.log(buildPedidoPendientePerfLogContext({
@@ -7774,8 +8120,13 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
       });
     }
 
+    const poolWaitStart = ventasPerf.now();
     client = await pool.connect();
+    ventasPerf.add('pool_wait_ms', poolWaitStart);
+    instrumentVentasSqlClient(client, ventasPerf);
+    transactionStart = ventasPerf.now();
     await client.query('BEGIN');
+    transactionStarted = true;
 
     const contextoStart = ventasPerf.now();
     const scope = await resolveRequestUserSucursalScope(req, client);
@@ -7786,18 +8137,24 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
 
     const idempotencyStart = ventasPerf.now();
     try {
-      idempotencyReservation = await reserveVentasIdempotencyKey({
+      idempotencyReservation = await reserveIdempotencyForMode({
+        mode: idempotencyMode,
         idempotencyKey,
-        operation: 'POST /ventas/pedidos-pendientes',
-        requestHash: idempotencyRequestHash,
-        idUsuario: userId,
-        idSucursal: req.body?.id_sucursal
+        reserveExternal: reserveVentasIdempotencyKey,
+        reserveArgs: {
+          idempotencyKey,
+          operation: 'POST /ventas/pedidos-pendientes',
+          requestHash: idempotencyRequestHash,
+          idUsuario: userId,
+          idSucursal: req.body?.id_sucursal
+        }
       });
     } finally {
       ventasPerf.add('pedido_pendiente_idempotency_ms', idempotencyStart);
     }
     if (idempotencyReservation.replay) {
       await client.query('ROLLBACK');
+      transactionStarted = false;
       addPedidoPendienteTotalRoute();
       ventasPerf.log(buildPedidoPendientePerfLogContext({ status: idempotencyReservation.httpStatus || 200 }));
       return res.status(idempotencyReservation.httpStatus || 200).json({
@@ -7807,6 +8164,7 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
     }
     if (idempotencyReservation.conflict) {
       await client.query('ROLLBACK');
+      transactionStarted = false;
       addPedidoPendienteTotalRoute();
       ventasPerf.log(buildPedidoPendientePerfLogContext({
         status: 409,
@@ -7828,16 +8186,22 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
       userId,
       sucursalScope: scope,
       canApplyDiscount,
+      canAuthorizeIncompleteComplementos,
       perf: ventasPerf
     });
     ventasPerf.add('pedido_pendiente_build_ms', buildStart);
 
     if (!prepared.ok) {
       await client.query('ROLLBACK');
-      await saveVentasIdempotencyFailure({
+      transactionStarted = false;
+      await saveExternalIdempotencyFailureIfNeeded({
         reservation: idempotencyReservation,
-        httpStatus: prepared.status,
-        errorCode: prepared.body?.code || null
+        saveFailure: saveVentasIdempotencyFailure,
+        args: {
+          reservation: idempotencyReservation,
+          httpStatus: prepared.status,
+          errorCode: prepared.body?.code || null
+        }
       });
       addPedidoPendienteTotalRoute();
       ventasPerf.log(buildPedidoPendientePerfLogContext({
@@ -7869,12 +8233,42 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
     ventasPerfContext.cuenta_dividida = Boolean(cuentaDivisionPlan);
     const pedidoPendienteHasSalsasInventario = getSelectedSalsaIdsFromLines(pedidoPendiente.pedido_lines).length > 0;
 
+    const usePedidoPendienteRpcV2 = shouldUsePedidoPendienteRpcV2({
+      pedidoPendienteRpcV2Enabled,
+      cuentaDivisionPlan,
+      pedidoLines: pedidoPendiente.pedido_lines
+    });
+
     const shouldUsePedidoPendienteRpcV1 =
-      pedidoPendienteRpcEnabled
+      pedidoPendienteRpcV1Enabled
       && !pedidoPendienteHasSalsasInventario
       && !cuentaDivisionPlan
       && Array.isArray(pedidoPendiente.pedido_lines)
       && pedidoPendiente.pedido_lines.length > 0;
+
+    if (usePedidoPendienteRpcV2) {
+      pedidoPendientePersistenceMode = 'pending_rpc_v2';
+      ventasPerfContext.rpc_inventory_mode = 'inside_rpc';
+      const rpcResponseBody = await createPedidoPendienteWithRpcV2Transaction({
+        client,
+        pedidoPendiente,
+        perf: ventasPerf,
+        idempotencyKey,
+        requestHash: idempotencyRequestHash
+      });
+      const commitStart = ventasPerf.now();
+      await client.query('COMMIT');
+      transactionStarted = false;
+      ventasPerf.add('commit_ms', commitStart);
+      ventasPerf.add('pedido_pendiente_commit_ms', commitStart);
+      ventasPerf.add('transaction_ms', transactionStart);
+      addPedidoPendienteTotalRoute();
+      ventasPerf.log(buildPedidoPendientePerfLogContext({
+        status: 201,
+        pedido_pendiente_rpc_v2_idempotent_replay: Boolean(rpcResponseBody.idempotent_replay)
+      }));
+      return res.status(201).json(rpcResponseBody);
+    }
 
     if (shouldUsePedidoPendienteRpcV1) {
       pedidoPendientePersistenceMode = 'rpc_v1';
@@ -7889,19 +8283,32 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
           [rpcResponseBody.id_pedido]
         );
       }
+      await validarYDescontarInventarioCajaPedido({
+        client,
+        idPedido: rpcResponseBody.id_pedido,
+        idSucursal: pedidoPendiente.id_sucursal,
+        idUsuario: userId,
+        perf: ventasPerf
+      });
       const commitStart = ventasPerf.now();
       await client.query('COMMIT');
+      transactionStarted = false;
       ventasPerf.add('commit_ms', commitStart);
       ventasPerf.add('pedido_pendiente_commit_ms', commitStart);
+      ventasPerf.add('transaction_ms', transactionStart);
 
       const idempotencySuccessStart = ventasPerf.now();
-      await saveVentasIdempotencySuccess({
+      await saveExternalIdempotencySuccessIfNeeded({
         reservation: idempotencyReservation,
-        httpStatus: 201,
-        responseBody: rpcResponseBody,
-        idPedido: rpcResponseBody.id_pedido,
-        idUsuario: userId,
-        idSucursal: pedidoPendiente.id_sucursal
+        saveSuccess: saveVentasIdempotencySuccess,
+        args: {
+          reservation: idempotencyReservation,
+          httpStatus: 201,
+          responseBody: rpcResponseBody,
+          idPedido: rpcResponseBody.id_pedido,
+          idUsuario: userId,
+          idSucursal: pedidoPendiente.id_sucursal
+        }
       }).catch((err) => {
         console.error('No se pudo guardar resultado idempotente RPC de pedido pendiente:', err);
       });
@@ -7912,15 +8319,13 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
     }
 
     pedidoPendientePersistenceMode = 'legacy';
-    if (cuentaDivisionPlan) {
-      pedidoPendienteRpcSkipReason = 'cuenta_dividida';
-    } else if (pedidoPendienteHasSalsasInventario) {
-      pedidoPendienteRpcSkipReason = 'salsas_inventario';
-    } else if (!pedidoPendienteRpcEnabled) {
-      pedidoPendienteRpcSkipReason = 'flag_disabled';
-    } else if (!Array.isArray(pedidoPendiente.pedido_lines) || pedidoPendiente.pedido_lines.length === 0) {
-      pedidoPendienteRpcSkipReason = 'no_lines';
-    }
+    pedidoPendienteRpcSkipReason = resolvePedidoPendienteRpcSkipReason({
+      cuentaDivisionPlan,
+      pedidoPendienteRpcV2Enabled,
+      pedidoPendienteHasSalsasInventario,
+      pedidoPendienteRpcEnabled,
+      pedidoLines: pedidoPendiente.pedido_lines
+    });
 
     const descuentosStart = ventasPerf.now();
     for (const line of pedidoPendiente.pedido_lines) {
@@ -8080,13 +8485,13 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
         pedidoLineRefs.push({ id_detalle_pedido: idDetallePedido });
       });
 
-      for (let index = 0; index < detallePedidoRows.length; index += 1) {
-        await insertDetallePedidoExtras({
-          client,
-          idDetallePedido: pedidoLineRefs[index]?.id_detalle_pedido,
-          extras: detallePedidoRows[index].line.extras_detalle
-        });
-      }
+      await insertDetallePedidoExtrasBatch({
+        client,
+        lineRefs: pedidoLineRefs.map((ref, index) => ({
+          ...ref,
+          extras_detalle: detallePedidoRows[index]?.line?.extras_detalle || []
+        }))
+      });
     }
     ventasPerf.add('detalle_pedido_ms', detalleStart);
 
@@ -8210,10 +8615,20 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
       );
     }
 
+    await validarYDescontarInventarioCajaPedido({
+      client,
+      idPedido,
+      idSucursal: pedidoPendiente.id_sucursal,
+      idUsuario: userId,
+      perf: ventasPerf
+    });
+
     const commitStart = ventasPerf.now();
     await client.query('COMMIT');
+    transactionStarted = false;
     ventasPerf.add('commit_ms', commitStart);
     ventasPerf.add('pedido_pendiente_commit_ms', commitStart);
+    ventasPerf.add('transaction_ms', transactionStart);
 
     const responseBody = {
       message: 'Pedido pendiente creado correctamente.',
@@ -8228,13 +8643,17 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
       cuenta_dividida: cuentaDivididaResponse
     };
     const idempotencySuccessStart = ventasPerf.now();
-    await saveVentasIdempotencySuccess({
+    await saveExternalIdempotencySuccessIfNeeded({
       reservation: idempotencyReservation,
-      httpStatus: 201,
-      responseBody,
-      idPedido,
-      idUsuario: userId,
-      idSucursal: pedidoPendiente.id_sucursal
+      saveSuccess: saveVentasIdempotencySuccess,
+      args: {
+        reservation: idempotencyReservation,
+        httpStatus: 201,
+        responseBody,
+        idPedido,
+        idUsuario: userId,
+        idSucursal: pedidoPendiente.id_sucursal
+      }
     }).catch((err) => {
       console.error('No se pudo guardar resultado idempotente de pedido pendiente:', err);
     });
@@ -8243,15 +8662,20 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
     ventasPerf.log(buildPedidoPendientePerfLogContext({ status: 201 }));
     return res.status(201).json(responseBody);
   } catch (err) {
-    if (client) {
+    if (client && transactionStarted) {
       await client.query('ROLLBACK').catch((rollbackErr) => {
         console.error('Error al revertir creacion de pedido pendiente:', rollbackErr);
       });
+      transactionStarted = false;
     }
-    await saveVentasIdempotencyFailure({
+    await saveExternalIdempotencyFailureIfNeeded({
       reservation: idempotencyReservation,
-      httpStatus: Number.isInteger(err?.httpStatus) ? err.httpStatus : 500,
-      errorCode: err?.code || null
+      saveFailure: saveVentasIdempotencyFailure,
+      args: {
+        reservation: idempotencyReservation,
+        httpStatus: Number.isInteger(err?.httpStatus) ? err.httpStatus : 500,
+        errorCode: err?.code || null
+      }
     }).catch((idempotencyErr) => {
       console.error('No se pudo marcar fallo idempotente de pedido pendiente:', idempotencyErr);
     });
@@ -8320,9 +8744,13 @@ router.post('/ventas/pedidos/:id/registrar-pago', checkPermission(['VENTAS_CREAR
     return res.status(400).json({ error: true, message: 'cobrar_division_orden debe ser un entero mayor a 0.' });
   }
 
+  const poolWaitStart = ventasPerf.now();
   const client = await pool.connect();
+  ventasPerf.add('pool_wait_ms', poolWaitStart);
+  instrumentVentasSqlClient(client, ventasPerf);
 
   try {
+    const transactionStart = ventasPerf.now();
     await client.query('BEGIN');
 
     const contextoStart = ventasPerf.now();
@@ -8493,6 +8921,7 @@ router.post('/ventas/pedidos/:id/registrar-pago', checkPermission(['VENTAS_CREAR
             dp.id_producto,
             dp.id_descuento,
             dp.id_receta,
+            dp.cantidad,
             dp.observacion,
             ${hasDetallePedidoConfiguracionMenu ? 'dp.configuracion_menu,' : 'NULL::jsonb AS configuracion_menu,'}
             COALESCE(prod.nombre_producto, rec.nombre_receta, 'Item de pedido') AS nombre_item,
@@ -8520,6 +8949,7 @@ router.post('/ventas/pedidos/:id/registrar-pago', checkPermission(['VENTAS_CREAR
             dp.id_producto,
             dp.id_descuento,
             dp.id_receta,
+            dp.cantidad,
             dp.observacion,
             ${hasDetallePedidoConfiguracionMenu ? 'dp.configuracion_menu,' : 'NULL::jsonb AS configuracion_menu,'}
             COALESCE(prod.nombre_producto, rec.nombre_receta, 'Item de pedido') AS nombre_item,
@@ -8616,7 +9046,10 @@ router.post('/ventas/pedidos/:id/registrar-pago', checkPermission(['VENTAS_CREAR
             : Math.max(roundMoney(totalLinea - subTotal), 0);
           const descuentoLinea = Math.max(roundMoney(subTotal + extrasSubtotal - totalLinea), 0);
           const precioBase = roundMoney(row.precio_unitario || (subTotal > 0 ? subTotal : totalLinea));
-          const cantidad = inferKitchenItemQuantity(subTotal, precioBase);
+          const cantidadPersistida = Number(row.cantidad ?? 0);
+          const cantidad = Number.isFinite(cantidadPersistida) && cantidadPersistida > 0
+            ? cantidadPersistida
+            : inferKitchenItemQuantity(subTotal, precioBase);
           return {
             id_detalle_pedido: parseOptionalPositiveInt(row.id_detalle_pedido),
             kind: normalizeTipoItem(idReceta ? 'RECETA' : idProducto ? 'PRODUCTO' : 'ITEM'),
@@ -8734,6 +9167,14 @@ router.post('/ventas/pedidos/:id/registrar-pago', checkPermission(['VENTAS_CREAR
       });
     }
     ventasPerf.add('registrar_pago_scope_session_ms', scopeSessionStart);
+    await lockCajaFinancialSession(client, sessionActiva.data.id_sesion_caja);
+    sessionActiva.data = await validateCajaSessionOpenForFinancialWrite({
+      client,
+      idSesionCaja: sessionActiva.data.id_sesion_caja,
+      idCaja: sessionActiva.data.id_caja,
+      idSucursal: idSucursalPedido,
+      idUsuario: userId
+    });
 
     const metodoPago = await resolveMetodoPagoRegistroPedido(client, {
       idMetodoPago: req.body?.id_metodo_pago,
@@ -9065,17 +9506,18 @@ router.post('/ventas/pedidos/:id/registrar-pago', checkPermission(['VENTAS_CREAR
     });
   } catch (err) {
     await client.query('ROLLBACK');
+    const mappedErr = mapCajaFinancialLockError(err);
     ventasPerf.log({
       ...ventasPerfContext,
-      status: Number.isInteger(err?.httpStatus) ? err.httpStatus : 500,
-      error_code: err?.code || null
+      status: Number.isInteger(mappedErr?.httpStatus) ? mappedErr.httpStatus : 500,
+      error_code: mappedErr?.code || null
     });
-    console.error('Error al registrar pago de pedido pendiente:', err);
-    if (Number.isInteger(err?.httpStatus) && err.httpStatus >= 400 && err.httpStatus < 500) {
-      return res.status(err.httpStatus).json({
+    console.error('Error al registrar pago de pedido pendiente:', mappedErr);
+    if (Number.isInteger(mappedErr?.httpStatus) && mappedErr.httpStatus >= 400 && mappedErr.httpStatus < 500) {
+      return res.status(mappedErr.httpStatus).json({
         error: true,
-        code: err.code || 'PEDIDO_REGISTRAR_PAGO_ERROR',
-        message: err.publicMessage || 'No se pudo registrar el pago del pedido.'
+        code: mappedErr.code || 'PEDIDO_REGISTRAR_PAGO_ERROR',
+        message: mappedErr.publicMessage || 'No se pudo registrar el pago del pedido.'
       });
     }
     return res.status(500).json({ error: true, message: 'No se pudo registrar el pago del pedido.' });
@@ -9096,6 +9538,7 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
     has_pedido_pendiente: false
   });
   const cuentaDivididaSolicitada = hasCuentaDivididaPayload(req.body);
+  const ventasRpcV3Enabled = !cuentaDivididaSolicitada && isVentasRpcV3Enabled();
   const ventasRpcV2Enabled = !cuentaDivididaSolicitada && isVentasRpcV2Enabled();
   const ventasRpcV1Enabled = !cuentaDivididaSolicitada && isVentasRpcTransactionEnabled();
   const ventasPerfContext = {
@@ -9104,18 +9547,24 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
     id_caja: null,
     id_sesion_caja: null,
     items_count: Array.isArray(req.body?.items) ? req.body.items.length : 0,
-    rpc_enabled: ventasRpcV2Enabled || ventasRpcV1Enabled,
+    rpc_enabled: ventasRpcV3Enabled || ventasRpcV2Enabled || ventasRpcV1Enabled,
+    rpc_v3_enabled: ventasRpcV3Enabled,
     rpc_v2_enabled: ventasRpcV2Enabled,
-    rpc_version: ventasRpcV2Enabled ? 'v2' : ventasRpcV1Enabled ? 'v1' : 'legacy'
+    rpc_version: ventasRpcV3Enabled ? 'v3' : ventasRpcV2Enabled ? 'v2' : ventasRpcV1Enabled ? 'v1' : 'legacy'
   };
   const idempotencyKey = getIdempotencyKey(req);
   const idempotencyRequestHash = idempotencyKey
     ? buildIdempotencyRequestHash(req.body)
     : null;
+  const idempotencyMode = resolveVentaIdempotencyMode({
+    ventasRpcV3Enabled,
+    idempotencyKey
+  });
   let idempotencyReservation = null;
   const authContextStart = ventasPerf.now();
   const discountIntent = hasDiscountIntentInPayload(req.body);
   let canApplyDiscount = false;
+  let canAuthorizeIncompleteComplementos = false;
   if (discountIntent) {
     const authPermissionStart = ventasPerf.now();
     canApplyDiscount = await requestHasAnyPermission(req, [VENTAS_DESCUENTO_APLICAR_PERMISSION]);
@@ -9134,11 +9583,19 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
       message: 'No tienes permiso para aplicar descuentos en ventas.'
     });
   }
+  canAuthorizeIncompleteComplementos = await requestHasAnyPermission(req, [VENTAS_COMPLEMENTOS_INCOMPLETOS_AUTORIZAR_PERMISSION]);
 
+  const poolWaitStart = ventasPerf.now();
   const client = await pool.connect();
+  ventasPerf.add('pool_wait_ms', poolWaitStart);
+  instrumentVentasSqlClient(client, ventasPerf);
+  let transactionStarted = false;
+  let transactionCommitted = false;
+  const transactionStart = ventasPerf.now();
 
   try {
     await client.query('BEGIN');
+    transactionStarted = true;
 
     const authScopeStart = ventasPerf.now();
     const scope = await resolveRequestUserSucursalScope(req, client);
@@ -9147,16 +9604,22 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
     ventasPerfContext.id_usuario = userId || null;
     ventasPerf.add('auth_context_ms', authContextStart);
 
-    idempotencyReservation = await reserveVentasIdempotencyKey({
-      client,
+    idempotencyReservation = await reserveIdempotencyForMode({
+      mode: idempotencyMode,
       idempotencyKey,
-      operation: 'POST /ventas',
-      requestHash: idempotencyRequestHash,
-      idUsuario: userId,
-      idSucursal: req.body?.id_sucursal
+      reserveExternal: reserveVentasIdempotencyKey,
+      reserveArgs: {
+        client,
+        idempotencyKey,
+        operation: 'POST /ventas',
+        requestHash: idempotencyRequestHash,
+        idUsuario: userId,
+        idSucursal: req.body?.id_sucursal
+      }
     });
     if (idempotencyReservation.replay) {
       await client.query('ROLLBACK');
+      transactionStarted = false;
       ventasPerf.log({
         ...ventasPerfContext,
         status: idempotencyReservation.httpStatus || 200
@@ -9168,6 +9631,7 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
     }
     if (idempotencyReservation.conflict) {
       await client.query('ROLLBACK');
+      transactionStarted = false;
       ventasPerf.log({
         ...ventasPerfContext,
         status: 409,
@@ -9188,16 +9652,22 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
       userId,
       sucursalScope: scope,
       canApplyDiscount,
+      canAuthorizeIncompleteComplementos,
       perf: ventasPerf
     });
 
     if (!prepared.ok) {
       await client.query('ROLLBACK');
-      await saveVentasIdempotencyFailure({
-        client,
+      transactionStarted = false;
+      await saveExternalIdempotencyFailureIfNeeded({
         reservation: idempotencyReservation,
-        httpStatus: prepared.status,
-        errorCode: prepared.body?.code || null
+        saveFailure: saveVentasIdempotencyFailure,
+        args: {
+          client,
+          reservation: idempotencyReservation,
+          httpStatus: prepared.status,
+          errorCode: prepared.body?.code || null
+        }
       }).catch((saveError) => {
         console.error('No se pudo guardar fallo idempotente de venta:', saveError);
       });
@@ -9218,11 +9688,16 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
     const amountValidation = validateVentaMontoCobro({ venta });
     if (!amountValidation.ok) {
       await client.query('ROLLBACK');
-      await saveVentasIdempotencyFailure({
-        client,
+      transactionStarted = false;
+      await saveExternalIdempotencyFailureIfNeeded({
         reservation: idempotencyReservation,
-        httpStatus: amountValidation.status,
-        errorCode: amountValidation.code
+        saveFailure: saveVentasIdempotencyFailure,
+        args: {
+          client,
+          reservation: idempotencyReservation,
+          httpStatus: amountValidation.status,
+          errorCode: amountValidation.code
+        }
       }).catch((saveError) => {
         console.error('No se pudo guardar validacion fallida idempotente de venta:', saveError);
       });
@@ -9250,16 +9725,70 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
       id_sesion_caja: parseOptionalPositiveInt(venta.id_sesion_caja),
       items_count: allLines.length
     });
+    await lockCajaFinancialSession(client, venta.id_sesion_caja);
+    const validatedCajaSession = await validateCajaSessionOpenForFinancialWrite({
+      client,
+      idSesionCaja: venta.id_sesion_caja,
+      idCaja: venta.id_caja,
+      idSucursal: venta.id_sucursal,
+      idUsuario: parseOptionalPositiveInt(venta.id_usuario) || userId
+    });
+    venta.id_caja = Number(validatedCajaSession.id_caja);
+    venta.id_sesion_caja = Number(validatedCajaSession.id_sesion_caja);
+    venta.id_sucursal = Number(validatedCajaSession.id_sucursal);
     const ventaHasExtras = hasVentaExtras(venta);
     const ventaHasSalsasInventario = getSelectedSalsaIdsFromLines(venta.all_lines).length > 0;
-    if (ventaHasSalsasInventario) {
+    if (ventasRpcV3Enabled) {
+      ventasPerfContext.rpc_enabled = true;
+      ventasPerfContext.rpc_version = 'v3';
+      ventasPerfContext.persistence_mode = 'rpc_v3';
+      ventasPerfContext.rpc_inventory_mode = 'inside_rpc';
+    } else if (ventaHasSalsasInventario) {
       ventasPerfContext.rpc_enabled = false;
       ventasPerfContext.rpc_version = 'legacy_salsas_inventario';
+      ventasPerfContext.rpc_disabled_reason = 'SALSAS_INVENTARIO_NO_SOPORTADAS_RPC_V2';
     } else if (ventaHasExtras && ventasRpcV2Enabled) {
       ventasPerfContext.rpc_version = 'v2_extras';
     } else if (ventaHasExtras) {
       ventasPerfContext.rpc_enabled = false;
       ventasPerfContext.rpc_version = 'legacy_extras';
+      ventasPerfContext.rpc_disabled_reason = ventasRpcV2Enabled
+        ? 'EXTRAS_NO_SOPORTADOS_RPC_V1'
+        : 'FEATURE_FLAG_DISABLED';
+    } else if (!ventasRpcV2Enabled && !ventasRpcV1Enabled) {
+      ventasPerfContext.rpc_disabled_reason = 'FEATURE_FLAG_DISABLED';
+    }
+
+    if (ventasRpcV3Enabled) {
+      const rpcCreateResult = await createVentaWithRpcV3Transaction({
+        client,
+        venta,
+        perf: ventasPerf,
+        idempotencyKey,
+        requestHash: idempotencyRequestHash,
+        requestStartedAt: authContextStart
+      });
+      const rpcV3ResponseBody = attachVentaSnapshotsToResponse(rpcCreateResult.response, venta);
+      const commitStart = ventasPerf.now();
+      await client.query('COMMIT');
+      transactionStarted = false;
+      transactionCommitted = true;
+      ventasPerf.add('commit_ms', commitStart);
+      ventasPerf.add('transaction_ms', transactionStart);
+
+      ventasPerf.add('node_after_rpc_ms', rpcCreateResult.afterRpcStart);
+      ventasPerf.log({
+        ...ventasPerfContext,
+        status: 201,
+        rpc_v3_idempotent_replay: Boolean(rpcV3ResponseBody.idempotent_replay),
+        inventario_ms: 0
+      });
+      res.status(201).json(rpcV3ResponseBody);
+
+      if (shouldRunRpcPostCommitSideEffects(rpcV3ResponseBody)) {
+        void registerVentaFidelizacionAfterCommit(rpcCreateResult.fidelizacionJob);
+      }
+      return;
     }
 
     if (ventasRpcV2Enabled && !ventaHasSalsasInventario) {
@@ -9271,6 +9800,13 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
       });
       const idPedidoRpc = parseOptionalPositiveInt(rpcCreateResult.response?.id_pedido);
       await persistVentaPedidoSnapshots({ client, idPedido: idPedidoRpc, venta });
+      await validarYDescontarInventarioCajaPedido({
+        client,
+        idPedido: idPedidoRpc,
+        idSucursal: venta.id_sucursal,
+        idUsuario: userId,
+        perf: ventasPerf
+      });
       if (ventaHasExtras) {
         const fidelizacionPedidoId = parseOptionalPositiveInt(rpcCreateResult.fidelizacionJob?.idPedido);
         if (!fidelizacionPedidoId) {
@@ -9282,26 +9818,28 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
         }
       }
 
-      const commitStart = ventasPerf.now();
-      await client.query('COMMIT');
-      ventasPerf.add('commit_ms', commitStart);
-
+      const rpcV2ResponseBody = attachVentaSnapshotsToResponse(rpcCreateResult.response, venta);
       await saveVentasIdempotencySuccess({
         client,
         reservation: idempotencyReservation,
         httpStatus: 201,
-        responseBody: attachVentaSnapshotsToResponse(rpcCreateResult.response, venta),
+        responseBody: rpcV2ResponseBody,
         idPedido: idPedidoRpc,
         idFactura: rpcCreateResult.response?.id_factura,
         idUsuario: userId,
         idSucursal: venta.id_sucursal
-      }).catch((saveError) => {
-        console.error('No se pudo guardar resultado idempotente RPC V2 de venta:', saveError);
       });
+
+      const commitStart = ventasPerf.now();
+      await client.query('COMMIT');
+      transactionStarted = false;
+      transactionCommitted = true;
+      ventasPerf.add('commit_ms', commitStart);
+      ventasPerf.add('transaction_ms', transactionStart);
 
       ventasPerf.add('node_after_rpc_ms', rpcCreateResult.afterRpcStart);
       ventasPerf.log({ ...ventasPerfContext, status: 201 });
-      res.status(201).json(attachVentaSnapshotsToResponse(rpcCreateResult.response, venta));
+      res.status(201).json(rpcV2ResponseBody);
 
       void registerVentaFidelizacionAfterCommit(rpcCreateResult.fidelizacionJob);
       return;
@@ -9319,27 +9857,36 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
         idPedido: rpcCreateResult.response?.id_pedido,
         venta
       });
+      await validarYDescontarInventarioCajaPedido({
+        client,
+        idPedido: rpcCreateResult.response?.id_pedido,
+        idSucursal: venta.id_sucursal,
+        idUsuario: userId,
+        perf: ventasPerf
+      });
 
-      const commitStart = ventasPerf.now();
-      await client.query('COMMIT');
-      ventasPerf.add('commit_ms', commitStart);
-
+      const rpcV1ResponseBody = attachVentaSnapshotsToResponse(rpcCreateResult.response, venta);
       await saveVentasIdempotencySuccess({
         client,
         reservation: idempotencyReservation,
         httpStatus: 201,
-        responseBody: attachVentaSnapshotsToResponse(rpcCreateResult.response, venta),
+        responseBody: rpcV1ResponseBody,
         idPedido: rpcCreateResult.response?.id_pedido,
         idFactura: rpcCreateResult.response?.id_factura,
         idUsuario: userId,
         idSucursal: venta.id_sucursal
-      }).catch((saveError) => {
-        console.error('No se pudo guardar resultado idempotente RPC V1 de venta:', saveError);
       });
+
+      const commitStart = ventasPerf.now();
+      await client.query('COMMIT');
+      transactionStarted = false;
+      transactionCommitted = true;
+      ventasPerf.add('commit_ms', commitStart);
+      ventasPerf.add('transaction_ms', transactionStart);
 
       ventasPerf.add('node_after_rpc_ms', rpcCreateResult.afterRpcStart);
       ventasPerf.log({ ...ventasPerfContext, status: 201 });
-      res.status(201).json(attachVentaSnapshotsToResponse(rpcCreateResult.response, venta));
+      res.status(201).json(rpcV1ResponseBody);
 
       void registerVentaFidelizacionAfterCommit(rpcCreateResult.fidelizacionJob);
       return;
@@ -9554,16 +10101,17 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
           }
         });
       });
-      for (const ref of pedidoLineRefs) {
-        await insertDetallePedidoExtras({
-          client,
-          idDetallePedido: ref.id_detalle_pedido,
-          extras: ref.extras_detalle
-        });
-      }
+      await insertDetallePedidoExtrasBatch({ client, lineRefs: pedidoLineRefs });
     }
     ventasPerf.add('detalle_pedido_insert_ms', detallePedidoInsertStart);
     ventasPerf.add('detalle_pedido_ms', detallePedidoStart);
+    await validarYDescontarInventarioCajaPedido({
+      client,
+      idPedido,
+      idSucursal: venta.id_sucursal,
+      idUsuario: userId,
+      perf: ventasPerf
+    });
     const facturaInsertStart = ventasPerf.now();
     const facturaResult = await client.query(
       `
@@ -9745,6 +10293,14 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
       );
       ventasPerf.add('detalle_factura_insert_ms', detalleFacturaInsertStart);
 
+      const detalleFacturaExtrasStart = ventasPerf.now();
+      await insertDetalleFacturaExtrasBatch({
+        client,
+        detailRows: detalleFacturaRows,
+        insertedRows: detalleFacturaResult.rows
+      });
+      ventasPerf.add('detalle_factura_extras_ms', detalleFacturaExtrasStart);
+
       const detalleFacturaOrigenStart = ventasPerf.now();
       const detalleFacturaOrigenRows = detalleFacturaResult.rows.filter((row) =>
         Number(row.id_detalle_factura || 0) > 0
@@ -9864,10 +10420,6 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
     }), venta);
     ventasPerf.add('ticket_response_build_ms', ticketResponseStart);
 
-    const commitStart = ventasPerf.now();
-    await client.query('COMMIT');
-    ventasPerf.add('commit_ms', commitStart);
-
     await saveVentasIdempotencySuccess({
       client,
       reservation: idempotencyReservation,
@@ -9877,34 +10429,51 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
       idFactura,
       idUsuario: venta.id_usuario || userId,
       idSucursal: venta.id_sucursal
-    }).catch((saveError) => {
-      console.error('No se pudo guardar resultado idempotente de venta:', saveError);
     });
+
+    const commitStart = ventasPerf.now();
+    await client.query('COMMIT');
+    transactionStarted = false;
+    transactionCommitted = true;
+    ventasPerf.add('commit_ms', commitStart);
+    ventasPerf.add('transaction_ms', transactionStart);
 
     ventasPerf.log(ventasPerfContext);
 
     res.status(201).json(createVentaResponse);
   } catch (err) {
-    await client.query('ROLLBACK');
-    await saveVentasIdempotencyFailure({
-      client,
-      reservation: idempotencyReservation,
-      httpStatus: Number.isInteger(err?.httpStatus) ? err.httpStatus : 500,
-      errorCode: err?.code || 'VENTAS_CREATE_ERROR'
-    }).catch((saveError) => {
-      console.error('No se pudo marcar fallo idempotente de venta:', saveError);
-    });
+    if (transactionStarted) {
+      await client.query('ROLLBACK').catch((rollbackErr) => {
+        console.error('Error al revertir creacion de venta:', rollbackErr);
+      });
+      transactionStarted = false;
+    }
+    const mappedErr = mapCajaFinancialLockError(err);
+    if (!transactionCommitted) {
+      await saveExternalIdempotencyFailureIfNeeded({
+        reservation: idempotencyReservation,
+        saveFailure: saveVentasIdempotencyFailure,
+        args: {
+          client,
+          reservation: idempotencyReservation,
+          httpStatus: Number.isInteger(mappedErr?.httpStatus) ? mappedErr.httpStatus : 500,
+          errorCode: mappedErr?.code || 'VENTAS_CREATE_ERROR'
+        }
+      }).catch((saveError) => {
+        console.error('No se pudo marcar fallo idempotente de venta:', saveError);
+      });
+    }
     ventasPerf.log({
       ...ventasPerfContext,
-      status: Number.isInteger(err?.httpStatus) ? err.httpStatus : 500,
-      error_code: err?.code || 'VENTAS_CREATE_ERROR'
+      status: Number.isInteger(mappedErr?.httpStatus) ? mappedErr.httpStatus : 500,
+      error_code: mappedErr?.code || 'VENTAS_CREATE_ERROR'
     });
-    console.error('Error al crear venta:', err);
-    if (Number.isInteger(err?.httpStatus) && err.httpStatus >= 400 && err.httpStatus < 500) {
-      return res.status(err.httpStatus).json({
+    console.error('Error al crear venta:', mappedErr);
+    if (Number.isInteger(mappedErr?.httpStatus) && mappedErr.httpStatus >= 400 && mappedErr.httpStatus < 500) {
+      return res.status(mappedErr.httpStatus).json({
         error: true,
-        code: err.code || 'VENTAS_CREATE_ERROR',
-        message: err.publicMessage || 'No se pudo completar la venta.'
+        code: mappedErr.code || 'VENTAS_CREATE_ERROR',
+        message: mappedErr.publicMessage || 'No se pudo completar la venta.'
       });
     }
     res.status(500).json({ error: true, message: 'No se pudo completar la venta.' });

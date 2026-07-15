@@ -13,6 +13,8 @@ import {
   parseVentaExtrasPayload
 } from '../utils/parseUtils.js';
 
+export const VENTA_ITEM_MAX_CANTIDAD = 999;
+
 export const buildComplementSnapshot = (line) => {
   const selected = Array.isArray(line?.complementos_detalle) ? line.complementos_detalle : [];
   if (selected.length === 0) return null;
@@ -38,6 +40,8 @@ export const buildComplementLineConfig = (line) => {
     minimo_complementos: Number(metadata?.minimo_complementos || 0),
     maximo_complementos: Number(metadata?.maximo_complementos || 0),
     complementos_incompletos_autorizados: Boolean(metadata?.complementos_incompletos_autorizados),
+    complementos_incompletos_autorizado_por: metadata?.complementos_incompletos_autorizado_por || null,
+    complementos_incompletos_permiso: metadata?.complementos_incompletos_permiso || null,
     complementos_recomendados: Number(metadata?.complementos_recomendados ?? metadata?.minimo_complementos ?? 0),
     complementos_seleccionados: Number(metadata?.complementos_seleccionados ?? selected.length),
     complementos: selected.map((entry) => ({
@@ -51,6 +55,8 @@ export const buildComplementLineConfig = (line) => {
       codigo: String(entry?.codigo || '').trim() || null,
       nombre: String(entry?.nombre || 'Extra').trim(),
       cantidad: Number(entry?.cantidad || 0),
+      cantidad_por_orden: Number(entry?.cantidad_por_orden ?? (entry?.cantidad || 0)),
+      cantidad_total: Number(entry?.cantidad_total ?? (entry?.cantidad || 0)),
       precio_unitario: roundMoney(entry?.precio_unitario),
       subtotal: roundMoney(entry?.subtotal),
       id_insumo: entry?.id_insumo ? Number(entry.id_insumo) : null,
@@ -94,6 +100,12 @@ export const normalizeVentaItems = (items) => {
         message: `La linea ${index + 1} debe incluir cantidad entera mayor a 0.`
       };
     }
+    if (cantidad > VENTA_ITEM_MAX_CANTIDAD) {
+      return {
+        ok: false,
+        message: `La linea ${index + 1} no puede superar ${VENTA_ITEM_MAX_CANTIDAD} unidades.`
+      };
+    }
 
     const presentIds = [
       ['PRODUCTO', productoResult.value],
@@ -131,13 +143,13 @@ export const normalizeVentaItems = (items) => {
       return { ok: false, message: extrasResult.message };
     }
     const complementosIncompletosInput = item.complementos_incompletos_autorizados ?? item.permitir_complementos_incompletos;
-    let complementosIncompletosAutorizados = false;
+    let complementosIncompletosSolicitados = false;
     if (complementosIncompletosInput !== undefined && complementosIncompletosInput !== null) {
       const parsedComplementosIncompletos = parseBooleanInput(complementosIncompletosInput);
       if (!parsedComplementosIncompletos.ok) {
         return { ok: false, message: 'complementos_incompletos_autorizados debe ser booleano.' };
       }
-      complementosIncompletosAutorizados = parsedComplementosIncompletos.value;
+      complementosIncompletosSolicitados = parsedComplementosIncompletos.value;
     }
 
     normalized.push({
@@ -150,7 +162,8 @@ export const normalizeVentaItems = (items) => {
       observacion: normalizeObservation(item.observacion),
       id_descuento_catalogo_linea: idDescuentoCatalogoLinea,
       complementos: complementosResult.data,
-      complementos_incompletos_autorizados: complementosIncompletosAutorizados,
+      // Este valor es una solicitud del cliente; la autorizacion final se resuelve en el servidor.
+      complementos_incompletos_solicitados: complementosIncompletosSolicitados,
       extras: extrasResult.data
     });
   }
