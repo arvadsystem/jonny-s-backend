@@ -1,0 +1,21 @@
+{
+  "name": "jonnys-branch-print-agent",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "start": "node src/index.js",
+    "check": "node --check src/index.js",
+    "test": "node --test test/*.test.js",
+    "credential:generate": "node scripts/generate-credential.js",
+    "service:install": "node scripts/windows-service.js install",
+    "service:uninstall": "node scripts/windows-service.js uninstall"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.7",
+    "node-windows": "^1.0.0-beta.8",
+    "qz-tray": "2.2.6",
+    "ws": "^8.18.0"
+  }
+}

@@ -8,6 +8,7 @@ import pool, { getPoolState } from './config/db-connection.js';
 import loginRoutes from './routers/login.js';
 import publicClienteRoutes from './routers/public_cliente.js';
 import publicMenuRouter from './routers/public_menu/index.js';
+import printAgentRoutes from './routers/printAgent.js';
 
 // ... tus otros routes
 import usuarioRoutes from './routers/usuarios.js';
@@ -65,6 +66,7 @@ import adminInsumoPresentacionesRouter from './routers/admin_insumo_presentacion
 import cajasRoutes from './routers/cajas.js';
 import fidelizacionRoutes from './routers/fidelizacion.js';
 import reportesRoutes from './routers/reportes.js';
+import printingRoutes from './routers/printing.js';
 
 import { authRequired, csrfProtect } from './middleware/auth.js';
 import { touchSessionMiddleware } from './middleware/touchSession.js';
@@ -244,6 +246,9 @@ app.use('/api/public-menu', publicMenuRouter);
 // ✅ Rutas públicas de clientes (registro, login, menú, forgot-password)
 app.use(publicClienteRoutes);
 
+// El agente inicia conexiones HTTPS salientes y usa una credencial propia, no una sesion web.
+app.use('/api/print-agent', printAgentRoutes);
+
 // ✅ 3) A partir de aquí: todo protegido
 app.use(authRequired);               // 1) valida JWT
 app.use(requireActiveSession);       // 2) valida sesión activa en BD
@@ -308,6 +313,7 @@ app.use(tipoDepartamentoRoutes);
 app.use(sucursalesRoutes);
 app.use(cajasRoutes);
 app.use(ventasRoutes);
+app.use(printingRoutes);
 app.use(cocinaRoutes);
 app.use(fidelizacionRoutes);
 app.use(reportesRoutes);
