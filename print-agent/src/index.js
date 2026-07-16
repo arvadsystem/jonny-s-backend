@@ -5,6 +5,7 @@ import { loadConfig } from './config.js';
 import { createApiClient } from './apiClient.js';
 import { createQzClient } from './qzClient.js';
 import { createRunner } from './runner.js';
+import { createPrintStateStore } from './stateStore.js';
 
 const config = loadConfig();
 const lockPath = path.resolve('.print-agent.lock');
@@ -13,7 +14,9 @@ try { lockHandle = fs.openSync(lockPath, 'wx'); } catch { throw new Error('PRINT
 const log = (level, event, data = {}) => console.log(JSON.stringify({ ts: new Date().toISOString(), level, event, ...data }));
 const api = createApiClient({ config });
 const qz = createQzClient({ config, api });
-const runner = createRunner({ config, api, qz, log });
+const stateStore = createPrintStateStore({ filePath: config.stateFile });
+await stateStore.init();
+const runner = createRunner({ config, api, qz, stateStore, log });
 const shutdown = async (signal) => {
   log('info', 'shutdown', { signal });
   runner.stop();

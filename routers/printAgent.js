@@ -3,11 +3,11 @@ import rateLimit from 'express-rate-limit';
 import pool from '../config/db-connection.js';
 import { authenticatePrintAgent } from '../services/printAgentAuthService.js';
 import { claimPrintJobs, transitionPrintJob } from '../services/printQueueService.js';
+import { authorizeAndSignAgentQzRequest } from '../services/qzAgentSigningService.js';
 import {
   getQzCertificateText,
   getQzPublicErrorMessage,
   isQzConfigurationError,
-  signQzMessage
 } from './ventas/services/qzTraySigningService.js';
 
 const router = express.Router();
@@ -50,7 +50,6 @@ router.post('/jobs/claim', async (req, res) => {
   try {
     const jobs = await claimPrintJobs({
       agentId: req.printAgent.id_agente,
-      limit: req.body?.limit,
       leaseSeconds: req.body?.lease_seconds
     });
     return res.json({ ok: true, jobs });
@@ -82,6 +81,7 @@ const transitionHandler = (action) => async (req, res) => {
 };
 
 router.post('/jobs/:id/printing', transitionHandler('printing'));
+router.post('/jobs/:id/confirmation-pending', transitionHandler('confirmationPending'));
 router.post('/jobs/:id/complete', transitionHandler('complete'));
 router.post('/jobs/:id/fail', transitionHandler('fail'));
 router.post('/jobs/:id/lease', transitionHandler('renew'));
@@ -99,17 +99,30 @@ router.get('/qz/certificate', async (_req, res) => {
 });
 
 router.post('/qz/sign', async (req, res) => {
-  const request = typeof req.body?.request === 'string' ? req.body.request : '';
-  if (!request || Buffer.byteLength(request, 'utf8') > 64 * 1024) {
+  const jobId = Number.parseInt(String(req.body?.job_id || ''), 10);
+  const request = req.body?.request;
+  const digest = String(req.body?.digest || '').trim();
+  let requestSize = 0;
+  try { requestSize = Buffer.byteLength(JSON.stringify(request), 'utf8'); } catch { requestSize = 0; }
+  if (!Number.isInteger(jobId) || jobId <= 0 || !request || !digest || requestSize <= 0 || requestSize > 256 * 1024) {
     return res.status(400).json({ ok: false, code: 'QZ_SIGN_REQUEST_INVALID', message: 'Solicitud de firma invalida.' });
   }
   try {
-    return res.json({ ok: true, signature: await signQzMessage(request) });
+    const result = await authorizeAndSignAgentQzRequest({
+      agent: req.printAgent,
+      jobId,
+      request,
+      digest
+    });
+    return res.json({ ok: true, ...result });
   } catch (error) {
-    return res.status(isQzConfigurationError(error) ? 503 : 500).json({
+    const status = isQzConfigurationError(error) ? 503 : (error?.status || 500);
+    return res.status(status).json({
       ok: false,
       code: error?.code || 'QZ_SIGNING_ERROR',
-      message: isQzConfigurationError(error) ? getQzPublicErrorMessage() : 'No se pudo firmar la solicitud.'
+      message: isQzConfigurationError(error)
+        ? getQzPublicErrorMessage()
+        : (error?.status ? error.message : 'No se pudo firmar la solicitud.')
     });
   }
 });

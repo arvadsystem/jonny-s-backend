@@ -29,8 +29,8 @@ CREATE TABLE IF NOT EXISTS public.trabajos_impresion (
   id_sucursal INTEGER NOT NULL REFERENCES public.sucursales(id_sucursal),
   tipo_documento VARCHAR(30) NOT NULL
     CHECK (tipo_documento IN ('factura', 'comanda', 'caja')),
-  estado VARCHAR(20) NOT NULL DEFAULT 'pendiente'
-    CHECK (estado IN ('pendiente', 'asignado', 'imprimiendo', 'impreso', 'fallido', 'cancelado')),
+  estado VARCHAR(30) NOT NULL DEFAULT 'pendiente'
+    CHECK (estado IN ('pendiente', 'asignado', 'imprimiendo', 'confirmacion_pendiente', 'impreso', 'fallido', 'cancelado')),
   payload JSONB NOT NULL CHECK (jsonb_typeof(payload) = 'object'),
   idempotency_key VARCHAR(160) NOT NULL,
   intentos INTEGER NOT NULL DEFAULT 0 CHECK (intentos >= 0),
@@ -66,14 +66,31 @@ CREATE TABLE IF NOT EXISTS public.trabajos_impresion_eventos (
   id_agente UUID NULL REFERENCES public.agentes_impresion(id_agente),
   id_usuario INTEGER NULL REFERENCES public.usuarios(id_usuario),
   evento VARCHAR(40) NOT NULL,
-  estado_anterior VARCHAR(20) NULL,
-  estado_nuevo VARCHAR(20) NULL,
+  estado_anterior VARCHAR(30) NULL,
+  estado_nuevo VARCHAR(30) NULL,
   detalle JSONB NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(detalle) = 'object'),
   fecha_creacion TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
 CREATE INDEX IF NOT EXISTS idx_trabajos_impresion_eventos_trabajo
   ON public.trabajos_impresion_eventos (id_trabajo, fecha_creacion DESC);
+
+CREATE TABLE IF NOT EXISTS public.firmas_qz_agente_solicitudes (
+  id_firma BIGSERIAL PRIMARY KEY,
+  id_trabajo BIGINT NOT NULL REFERENCES public.trabajos_impresion(id_trabajo) ON DELETE CASCADE,
+  id_sucursal INTEGER NOT NULL REFERENCES public.sucursales(id_sucursal),
+  id_agente UUID NOT NULL REFERENCES public.agentes_impresion(id_agente),
+  llamada VARCHAR(40) NOT NULL CHECK (llamada IN ('printers.find', 'print')),
+  request_hash CHAR(128) NOT NULL UNIQUE,
+  request_timestamp BIGINT NOT NULL,
+  expira_at TIMESTAMPTZ NOT NULL,
+  fecha_creacion TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_firmas_qz_agente_trabajo
+  ON public.firmas_qz_agente_solicitudes (id_trabajo, fecha_creacion DESC);
+CREATE INDEX IF NOT EXISTS idx_firmas_qz_agente_expira
+  ON public.firmas_qz_agente_solicitudes (expira_at);
 
 CREATE OR REPLACE FUNCTION public.reclamar_trabajos_impresion(
   p_id_agente UUID,
@@ -97,6 +114,18 @@ BEGIN
     RAISE EXCEPTION USING ERRCODE = 'P0001', MESSAGE = 'AGENTE_IMPRESION_NO_AUTORIZADO';
   END IF;
 
+  -- El bloqueo del agente serializa claims concurrentes del mismo proceso/credencial.
+  -- Si ya conserva un lease activo, no se toma un segundo trabajo.
+  IF EXISTS (
+    SELECT 1
+    FROM public.trabajos_impresion t
+    WHERE t.id_agente_tomado = p_id_agente
+      AND t.estado IN ('asignado', 'imprimiendo')
+      AND t.lease_expires_at > now()
+  ) THEN
+    RETURN;
+  END IF;
+
   RETURN QUERY
   WITH candidatos AS (
     SELECT t.id_trabajo
@@ -110,7 +139,8 @@ BEGIN
       )
     ORDER BY t.fecha_creacion, t.id_trabajo
     FOR UPDATE SKIP LOCKED
-    LIMIT LEAST(GREATEST(COALESCE(p_limite, 1), 1), 10)
+    -- Primera version: nunca tomar un segundo lease mientras el agente procesa otro trabajo.
+    LIMIT 1
   )
   UPDATE public.trabajos_impresion t
   SET estado = 'asignado',
@@ -131,5 +161,5 @@ COMMIT;
 -- Verificacion QA:
 -- SELECT table_name FROM information_schema.tables
 -- WHERE table_schema='public' AND table_name IN
--- ('agentes_impresion','trabajos_impresion','trabajos_impresion_eventos');
+-- ('agentes_impresion','trabajos_impresion','trabajos_impresion_eventos','firmas_qz_agente_solicitudes');
 -- SELECT proname FROM pg_proc WHERE proname='reclamar_trabajos_impresion';

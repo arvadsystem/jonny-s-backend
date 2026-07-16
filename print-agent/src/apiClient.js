@@ -17,12 +17,16 @@ export const createApiClient = ({ config, fetchImpl = fetch }) => {
   };
   return {
     heartbeat: (version) => request('/heartbeat', { method: 'POST', body: { version } }),
-    claim: () => request('/jobs/claim', { method: 'POST', body: { limit: 3, lease_seconds: config.leaseSeconds } }),
+    claim: () => request('/jobs/claim', { method: 'POST', body: { limit: 1, lease_seconds: config.leaseSeconds } }),
     printing: (id) => request(`/jobs/${id}/printing`, { method: 'POST', body: { lease_seconds: config.leaseSeconds } }),
+    confirmationPending: (id) => request(`/jobs/${id}/confirmation-pending`, { method: 'POST', body: {} }),
     complete: (id) => request(`/jobs/${id}/complete`, { method: 'POST', body: {} }),
     fail: (id, error) => request(`/jobs/${id}/fail`, { method: 'POST', body: { error: String(error || '').slice(0, 1000) } }),
     renew: (id) => request(`/jobs/${id}/lease`, { method: 'POST', body: { lease_seconds: config.leaseSeconds } }),
     certificate: async () => (await request('/qz/certificate')).certificate,
-    sign: async (value) => (await request('/qz/sign', { method: 'POST', body: { request: value } })).signature
+    sign: async (jobId, qzRequest, digest) => request('/qz/sign', {
+      method: 'POST',
+      body: { job_id: jobId, request: qzRequest, digest }
+    })
   };
 };

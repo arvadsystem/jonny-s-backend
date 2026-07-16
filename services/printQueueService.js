@@ -48,55 +48,81 @@ export const enqueuePrintJob = async ({
   return result.rows[0];
 };
 
-export const claimPrintJobs = async ({ agentId, limit = 1, leaseSeconds = 90, db = pool }) => {
+export const claimPrintJobs = async ({ agentId, leaseSeconds = 90, db = pool }) => {
   const result = await db.query(
     'SELECT * FROM public.reclamar_trabajos_impresion($1::uuid, $2::integer, $3::integer)',
-    [agentId, Math.min(Math.max(Number(limit) || 1, 1), 10), Math.min(Math.max(Number(leaseSeconds) || 90, 30), 600)]
+    [agentId, 1, Math.min(Math.max(Number(leaseSeconds) || 90, 30), 600)]
   );
   return result.rows;
 };
 
 export const transitionPrintJob = async ({ agent, jobId, action, errorMessage = null, leaseSeconds = 90, db = pool }) => {
   const transitions = {
-    printing: { from: ['asignado'], to: 'imprimiendo', final: false },
-    complete: { from: ['asignado', 'imprimiendo'], to: 'impreso', final: true },
-    fail: { from: ['asignado', 'imprimiendo'], to: 'fallido', final: true },
-    renew: { from: ['asignado', 'imprimiendo'], to: null, final: false }
+    printing: { from: ['asignado'], to: 'imprimiendo', event: 'printing' },
+    confirmationPending: { from: ['imprimiendo'], to: 'confirmacion_pendiente', event: 'confirmacion_pendiente' },
+    complete: { from: ['confirmacion_pendiente'], to: 'impreso', event: 'complete' },
+    fail: { from: ['imprimiendo', 'confirmacion_pendiente'], to: 'fallido', event: 'fail' },
+    renew: { from: ['asignado', 'imprimiendo'], to: null, event: 'renew' }
   };
   const rule = transitions[action];
   if (!rule) throw Object.assign(new Error('Accion invalida.'), { status: 400 });
   const sanitizedError = String(errorMessage || '').replace(/[\r\n\t]+/g, ' ').trim().slice(0, 1000) || null;
-  const result = await db.query(
-    `UPDATE public.trabajos_impresion
-     SET estado = CASE
-           WHEN $9 = 'fail' AND intentos < max_intentos THEN 'pendiente'
-           ELSE COALESCE($5, estado)
-         END,
-         disponible_at = CASE
-           WHEN $9 = 'fail' AND intentos < max_intentos
-             THEN now() + make_interval(secs => LEAST(60, power(2, LEAST(intentos, 5))::integer))
-           ELSE disponible_at
-         END,
-         lease_expires_at = CASE WHEN $6 OR $9 = 'fail' THEN NULL ELSE now() + make_interval(secs => $7) END,
-         finalizado_at = CASE
-           WHEN $9 = 'complete' OR ($9 = 'fail' AND intentos >= max_intentos) THEN now()
-           ELSE finalizado_at
-         END,
-         error_sanitizado = CASE WHEN $5 = 'fallido' THEN $8 ELSE NULL END,
-         fecha_actualizacion = now()
-     WHERE id_trabajo = $1 AND id_sucursal = $2 AND id_agente_tomado = $3
-       AND estado = ANY($4::varchar[]) AND lease_expires_at > now()
-     RETURNING id_trabajo, estado, finalizado_at, lease_expires_at`,
-    [jobId, agent.id_sucursal, agent.id_agente, rule.from, rule.to, rule.final,
-      Math.min(Math.max(Number(leaseSeconds) || 90, 30), 600), sanitizedError, action]
-  );
-  if (!result.rows[0]) throw Object.assign(new Error('Trabajo no encontrado, lease vencido o estado incompatible.'), { status: 409, code: 'PRINT_JOB_STATE_CONFLICT' });
-  await db.query(
-    `INSERT INTO public.trabajos_impresion_eventos
-       (id_trabajo,id_sucursal,id_agente,evento,estado_nuevo,detalle)
-     VALUES ($1,$2,$3,$4,$5,$6::jsonb)`,
-    [jobId, agent.id_sucursal, agent.id_agente, action, result.rows[0].estado,
-      JSON.stringify(sanitizedError ? { error: sanitizedError } : {})]
-  );
-  return result.rows[0];
+  const client = typeof db.connect === 'function' ? await db.connect() : db;
+  const shouldRelease = client !== db && typeof client.release === 'function';
+
+  try {
+    await client.query('BEGIN');
+    const currentResult = await client.query(
+      `SELECT id_trabajo, estado, intentos, max_intentos,
+              (lease_expires_at IS NOT NULL AND lease_expires_at > now()) AS lease_activo
+       FROM public.trabajos_impresion
+       WHERE id_trabajo=$1 AND id_sucursal=$2 AND id_agente_tomado=$3
+       FOR UPDATE`,
+      [jobId, agent.id_sucursal, agent.id_agente]
+    );
+    const current = currentResult.rows[0];
+    const canFinishWithoutLease = current?.estado === 'confirmacion_pendiente'
+      && ['complete', 'fail'].includes(action);
+    if (!current || !rule.from.includes(current.estado) || (!canFinishWithoutLease && !current.lease_activo)) {
+      throw Object.assign(new Error('Trabajo no encontrado, lease vencido o estado incompatible.'), {
+        status: 409,
+        code: 'PRINT_JOB_STATE_CONFLICT'
+      });
+    }
+
+    const retryableFailure = action === 'fail' && Number(current.intentos) < Number(current.max_intentos);
+    const nextState = retryableFailure ? 'pendiente' : (rule.to || current.estado);
+    const clearLease = ['confirmationPending', 'complete', 'fail'].includes(action);
+    const finalState = action === 'complete' || (action === 'fail' && !retryableFailure);
+    const boundedLeaseSeconds = Math.min(Math.max(Number(leaseSeconds) || 90, 30), 600);
+    const updateResult = await client.query(
+      `UPDATE public.trabajos_impresion
+       SET estado=$4,
+           disponible_at=CASE WHEN $5 THEN now() + make_interval(secs => LEAST(60, power(2, LEAST(intentos,5))::integer)) ELSE disponible_at END,
+           lease_expires_at=CASE WHEN $6 THEN NULL ELSE now() + make_interval(secs => $7) END,
+           finalizado_at=CASE WHEN $8 THEN now() ELSE finalizado_at END,
+           error_sanitizado=CASE WHEN $9::text IS NOT NULL THEN $9 ELSE NULL END,
+           fecha_actualizacion=now()
+       WHERE id_trabajo=$1 AND id_sucursal=$2 AND id_agente_tomado=$3
+       RETURNING id_trabajo, estado, finalizado_at, lease_expires_at`,
+      [jobId, agent.id_sucursal, agent.id_agente, nextState, retryableFailure, clearLease,
+        boundedLeaseSeconds, finalState, action === 'fail' ? sanitizedError : null]
+    );
+    const updated = updateResult.rows[0];
+
+    await client.query(
+      `INSERT INTO public.trabajos_impresion_eventos
+         (id_trabajo,id_sucursal,id_agente,evento,estado_anterior,estado_nuevo,detalle)
+       VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb)`,
+      [jobId, agent.id_sucursal, agent.id_agente, rule.event, current.estado, updated.estado,
+        JSON.stringify(sanitizedError ? { error: sanitizedError } : {})]
+    );
+    await client.query('COMMIT');
+    return updated;
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => undefined);
+    throw error;
+  } finally {
+    if (shouldRelease) client.release();
+  }
 };

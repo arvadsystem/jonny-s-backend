@@ -1,3 +1,7 @@
+import crypto from 'node:crypto';
+import fs from 'node:fs';
+import path from 'node:path';
+
 const required = (env, key) => {
   const value = String(env[key] || '').trim();
   if (!value) throw new Error(`CONFIG_REQUIRED:${key}`);
@@ -19,6 +23,14 @@ export const loadConfig = (env = process.env) => {
   for (const [logical, physical] of Object.entries(printerMap)) {
     if (!['factura', 'cocina', 'caja'].includes(logical) || !String(physical || '').trim()) throw new Error('CONFIG_INVALID:PRINTER_MAP_JSON');
   }
+  const caPathValue = String(env.QZ_CA_CERT_PATH || env.NODE_EXTRA_CA_CERTS || '').trim();
+  const qzCaCertPath = caPathValue ? path.resolve(caPathValue) : null;
+  if (qzCaCertPath) {
+    if (!fs.existsSync(qzCaCertPath) || !fs.statSync(qzCaCertPath).isFile()) throw new Error('CONFIG_INVALID:QZ_CA_CERT_PATH');
+    const caText = fs.readFileSync(qzCaCertPath, 'utf8');
+    if (/PRIVATE KEY/.test(caText)) throw new Error('CONFIG_INVALID:QZ_CA_CERT_MUST_NOT_CONTAIN_PRIVATE_KEY');
+    try { new crypto.X509Certificate(caText); } catch { throw new Error('CONFIG_INVALID:QZ_CA_CERT_PATH'); }
+  }
   return {
     apiBaseUrl,
     agentId: required(env, 'PRINT_AGENT_ID'),
@@ -30,6 +42,8 @@ export const loadConfig = (env = process.env) => {
     heartbeatIntervalMs: integer(env, 'HEARTBEAT_INTERVAL_MS', 30000, 5000, 300000),
     leaseSeconds: integer(env, 'LEASE_SECONDS', 90, 30, 600),
     printerMap,
-    logDir: String(env.LOG_DIR || './logs').trim()
+    logDir: String(env.LOG_DIR || './logs').trim(),
+    stateFile: path.resolve(String(env.PRINT_STATE_FILE || './data/print-state.json').trim()),
+    qzCaCertPath
   };
 };
