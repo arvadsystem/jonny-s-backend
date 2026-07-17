@@ -101,9 +101,14 @@ router.post('/jobs/:id/complete', transitionHandler('complete'));
 router.post('/jobs/:id/fail', transitionHandler('fail'));
 router.post('/jobs/:id/lease', transitionHandler('renew'));
 
-router.get('/qz/certificate', async (_req, res) => {
+router.get('/qz/certificate', async (req, res) => {
   try {
-    return res.json({ ok: true, certificate: await getQzCertificateText() });
+    return res.json({
+      ok: true,
+      certificate: await getQzCertificateText({
+        idSucursal: req.printAgent.id_sucursal
+      })
+    });
   } catch (error) {
     return res.status(isQzConfigurationError(error) ? 503 : 500).json({
       ok: false,

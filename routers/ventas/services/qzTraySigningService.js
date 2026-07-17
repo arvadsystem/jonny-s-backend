@@ -23,7 +23,15 @@ const createQzError = (code, cause = null) => {
   error.code = code;
   error.expose = false;
   if (CONFIG_ERROR_CODES.has(code)) error.httpStatus = 503;
+  if (code === 'QZ_SUCURSAL_REQUIRED') error.httpStatus = 400;
   if (cause) error.cause = cause;
+  return error;
+};
+
+const tagCredentialSource = (error, credentialSource) => {
+  if (error && typeof error === 'object') {
+    error.credentialSource = credentialSource;
+  }
   return error;
 };
 
@@ -41,6 +49,52 @@ const normalizePemText = (value = '') => {
     ? text.replace(/\\n/g, '\n')
     : text;
   return withRealLineBreaks.replace(/\r\n/g, '\n').replace(/\r/g, '\n').trim();
+};
+
+const normalizeSucursalId = (value) => {
+  const parsed = typeof value === 'number'
+    ? value
+    : Number(String(value ?? '').trim());
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : null;
+};
+
+const resolveQzCredentialSource = (idSucursal) => {
+  const normalizedSucursalId = normalizeSucursalId(idSucursal);
+  if (!normalizedSucursalId) throw createQzError('QZ_SUCURSAL_REQUIRED');
+
+  const suffix = `SUCURSAL_${normalizedSucursalId}`;
+  const scopedCertificateKey = `QZ_TRAY_CERTIFICATE_TEXT_${suffix}`;
+  const scopedPrivateKeyKey = `QZ_TRAY_PRIVATE_KEY_PEM_${suffix}`;
+  const scopedCertificate = String(process.env[scopedCertificateKey] || '').trim();
+  const scopedPrivateKey = String(process.env[scopedPrivateKeyKey] || '').trim();
+  const hasAnyScopedValue = Boolean(scopedCertificate || scopedPrivateKey);
+
+  if (hasAnyScopedValue) {
+    if (!scopedCertificate) {
+      throw tagCredentialSource(
+        createQzError('QZ_CERTIFICATE_NOT_CONFIGURED'),
+        'sucursal'
+      );
+    }
+    if (!scopedPrivateKey) {
+      throw tagCredentialSource(
+        createQzError('QZ_PRIVATE_KEY_NOT_CONFIGURED'),
+        'sucursal'
+      );
+    }
+
+    return {
+      source: 'sucursal',
+      certificateText: normalizePemText(scopedCertificate),
+      privateKeyText: normalizePemText(scopedPrivateKey)
+    };
+  }
+
+  return {
+    source: 'default',
+    certificateText: null,
+    privateKeyText: null
+  };
 };
 
 const isPermissionDenied = (error) => ['EACCES', 'EPERM'].includes(error?.code);
@@ -67,13 +121,13 @@ const readTextFromEnvOrFile = async ({
   }
 };
 
-export const getQzCertificateText = async () => {
-  const { certificateText } = await getQzSigningConfiguration();
+export const getQzCertificateText = async ({ idSucursal } = {}) => {
+  const { certificateText } = await getQzSigningConfiguration({ idSucursal });
   return certificateText;
 };
 
-export const getQzPrivateKeyText = async () => {
-  const { privateKeyText } = await getQzSigningConfiguration();
+export const getQzPrivateKeyText = async ({ idSucursal } = {}) => {
+  const { privateKeyText } = await getQzSigningConfiguration({ idSucursal });
   return privateKeyText;
 };
 
@@ -125,28 +179,55 @@ const assertCertificateMatchesPrivateKey = ({ certificate, privateKey, algorithm
   }
 };
 
-export const getQzSigningConfiguration = async () => {
-  let certificateText = '';
-  let privateKeyText = '';
-  try {
-    [certificateText, privateKeyText] = await Promise.all([
-      readQzCertificateText(),
-      readQzPrivateKeyText()
-    ]);
-  } catch (error) {
-    if (error?.httpStatus === 503) throw error;
-    throw createQzError('QZ_SIGNING_NOT_CONFIGURED', error);
+export const getQzSigningConfiguration = async ({ idSucursal } = {}) => {
+  const resolvedCredentials = resolveQzCredentialSource(idSucursal);
+  let certificateText = resolvedCredentials.certificateText;
+  let privateKeyText = resolvedCredentials.privateKeyText;
+
+  if (resolvedCredentials.source === 'default') {
+    try {
+      [certificateText, privateKeyText] = await Promise.all([
+        readQzCertificateText(),
+        readQzPrivateKeyText()
+      ]);
+    } catch (error) {
+      if (error?.httpStatus === 503) {
+        throw tagCredentialSource(error, resolvedCredentials.source);
+      }
+      throw tagCredentialSource(
+        createQzError('QZ_SIGNING_NOT_CONFIGURED', error),
+        resolvedCredentials.source
+      );
+    }
   }
 
-  if (!certificateText) throw createQzError('QZ_CERTIFICATE_NOT_CONFIGURED');
-  if (!privateKeyText) throw createQzError('QZ_PRIVATE_KEY_NOT_CONFIGURED');
+  if (!certificateText) {
+    throw tagCredentialSource(
+      createQzError('QZ_CERTIFICATE_NOT_CONFIGURED'),
+      resolvedCredentials.source
+    );
+  }
+  if (!privateKeyText) {
+    throw tagCredentialSource(
+      createQzError('QZ_PRIVATE_KEY_NOT_CONFIGURED'),
+      resolvedCredentials.source
+    );
+  }
 
-  const certificate = parseCertificate(certificateText);
-  const privateKey = parsePrivateKey(privateKeyText);
-  const algorithm = getQzSignatureAlgorithm();
-  assertCertificateMatchesPrivateKey({ certificate, privateKey, algorithm });
+  let certificate;
+  let privateKey;
+  let algorithm;
+  try {
+    certificate = parseCertificate(certificateText);
+    privateKey = parsePrivateKey(privateKeyText);
+    algorithm = getQzSignatureAlgorithm();
+    assertCertificateMatchesPrivateKey({ certificate, privateKey, algorithm });
+  } catch (error) {
+    throw tagCredentialSource(error, resolvedCredentials.source);
+  }
 
   return {
+    credentialSource: resolvedCredentials.source,
     certificateText,
     privateKeyText,
     certificate,
@@ -155,9 +236,9 @@ export const getQzSigningConfiguration = async () => {
   };
 };
 
-export const hasQzSigningConfigured = async () => {
+export const hasQzSigningConfigured = async ({ idSucursal } = {}) => {
   try {
-    await getQzSigningConfiguration();
+    await getQzSigningConfiguration({ idSucursal });
     return true;
   } catch (error) {
     if (error?.httpStatus === 503) return false;
@@ -173,12 +254,16 @@ export const getQzPublicErrorMessage = () => (
   'La firma segura de QZ Tray no esta configurada correctamente.'
 );
 
-export const signQzMessage = async (requestToSign) => {
+export const signQzMessage = async (requestToSign, { idSucursal } = {}) => {
   if (typeof requestToSign !== 'string' || requestToSign.length === 0) {
     throw createQzError('QZ_SIGN_REQUEST_INVALID');
   }
 
-  const { privateKey, algorithm } = await getQzSigningConfiguration();
+  const {
+    privateKey,
+    algorithm,
+    credentialSource
+  } = await getQzSigningConfiguration({ idSucursal });
 
   try {
     return crypto.sign(
@@ -187,6 +272,9 @@ export const signQzMessage = async (requestToSign) => {
       privateKey
     ).toString('base64');
   } catch (error) {
-    throw createQzError('QZ_SIGNING_NOT_CONFIGURED', error);
+    throw tagCredentialSource(
+      createQzError('QZ_SIGNING_NOT_CONFIGURED', error),
+      credentialSource
+    );
   }
 };

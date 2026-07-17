@@ -610,21 +610,78 @@ export const createVentasPrinterDeviceDetectionHandler = async (req, res) => {
   }
 };
 
-export const getQzCertificateHandler = async (_req, res) => {
+const validateQzSucursalAccess = async (req, idSucursal) => {
+  const scope = await resolveRequestUserSucursalScope(req, pool);
+  const allowedSucursalIds = Array.isArray(scope.allowedSucursalIds)
+    ? scope.allowedSucursalIds.map(Number)
+    : [];
+
+  if (!scope.isSuperAdmin && !allowedSucursalIds.includes(idSucursal)) {
+    return {
+      status: 403,
+      body: {
+        error: true,
+        code: 'QZ_SUCURSAL_FORBIDDEN',
+        message: 'No tienes permiso para operar esta sucursal.'
+      }
+    };
+  }
+
+  const sucursalResult = await pool.query(
+    `
+      SELECT 1
+      FROM public.sucursales
+      WHERE id_sucursal = $1
+      LIMIT 1
+    `,
+    [idSucursal]
+  );
+  if (sucursalResult.rowCount === 0) {
+    return {
+      status: 404,
+      body: {
+        error: true,
+        code: 'QZ_SUCURSAL_NOT_FOUND',
+        message: 'La sucursal solicitada no existe.'
+      }
+    };
+  }
+
+  return null;
+};
+
+const buildQzCredentialLogContext = (idSucursal, error) => ({
+  id_sucursal: idSucursal,
+  credential_source: error?.credentialSource === 'sucursal' ? 'sucursal' : 'default'
+});
+
+export const getQzCertificateHandler = async (req, res) => {
+  const idSucursal = parsePositiveInt(req.query?.id_sucursal);
+  if (!idSucursal) {
+    return res.status(400).json({
+      error: true,
+      code: 'QZ_SUCURSAL_REQUIRED',
+      message: 'id_sucursal debe ser un entero mayor a 0.'
+    });
+  }
+
   try {
-    const certificate = await getQzCertificateText();
+    const accessError = await validateQzSucursalAccess(req, idSucursal);
+    if (accessError) return res.status(accessError.status).json(accessError.body);
+
+    const certificate = await getQzCertificateText({ idSucursal });
 
     return res.status(200).json({
       ok: true,
-      configured: await hasQzSigningConfigured(),
+      configured: await hasQzSigningConfigured({ idSucursal }),
       certificate
     });
   } catch (error) {
     if (isQzConfigurationError(error)) {
-      console.warn('[ventas.qz.certificate] configuracion no disponible', {
-        code: error?.code || 'QZ_SIGNING_NOT_CONFIGURED',
-        configured: false
-      });
+      console.warn(
+        '[ventas.qz.certificate] configuracion no disponible',
+        buildQzCredentialLogContext(idSucursal, error)
+      );
       return res.status(503).json({
         error: true,
         code: error?.code || 'QZ_SIGNING_NOT_CONFIGURED',
@@ -632,15 +689,21 @@ export const getQzCertificateHandler = async (_req, res) => {
       });
     }
 
-    console.error('[ventas.qz.certificate] error inesperado', {
-      code: error?.code || null,
-      message: error?.message || 'Error sin mensaje'
-    });
+    console.error('[ventas.qz.certificate] error inesperado');
     return sendVentasInternalError(res, 'No se pudo obtener el certificado de impresion.');
   }
 };
 
 export const signQzRequestHandler = async (req, res) => {
+  const idSucursal = parsePositiveInt(req.body?.id_sucursal);
+  if (!idSucursal) {
+    return res.status(400).json({
+      error: true,
+      code: 'QZ_SUCURSAL_REQUIRED',
+      message: 'id_sucursal debe ser un entero mayor a 0.'
+    });
+  }
+
   try {
     const request = typeof req.body?.request === 'string' ? req.body.request : '';
     if (request.length === 0) {
@@ -651,14 +714,17 @@ export const signQzRequestHandler = async (req, res) => {
       });
     }
 
-    const signature = await signQzMessage(request);
+    const accessError = await validateQzSucursalAccess(req, idSucursal);
+    if (accessError) return res.status(accessError.status).json(accessError.body);
+
+    const signature = await signQzMessage(request, { idSucursal });
     return res.status(200).json({ ok: true, signature });
   } catch (error) {
     if (isQzConfigurationError(error)) {
-      console.warn('[ventas.qz.sign] configuracion no disponible', {
-        code: error?.code || 'QZ_SIGNING_NOT_CONFIGURED',
-        configured: false
-      });
+      console.warn(
+        '[ventas.qz.sign] configuracion no disponible',
+        buildQzCredentialLogContext(idSucursal, error)
+      );
       return res.status(503).json({
         error: true,
         code: error?.code || 'QZ_SIGNING_NOT_CONFIGURED',
@@ -673,10 +739,7 @@ export const signQzRequestHandler = async (req, res) => {
       });
     }
 
-    console.error('[ventas.qz.sign] error inesperado', {
-      code: error?.code || null,
-      message: error?.message || 'Error sin mensaje'
-    });
+    console.error('[ventas.qz.sign] error inesperado');
     return sendVentasInternalError(res, 'No se pudo firmar la solicitud de impresion.');
   }
 };
