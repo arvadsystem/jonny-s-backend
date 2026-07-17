@@ -10,11 +10,11 @@ import {
   registerVentaPrintEvent
 } from '../services/ventasPrintAuditService.js';
 import {
-  getQzCertificateText,
-  hasQzSigningConfigured,
+  getQzSigningConfiguration,
   getQzPublicErrorMessage,
+  isQzSucursalContextRequired,
   isQzConfigurationError,
-  signQzMessage
+  signQzMessageWithContext
 } from '../services/qzTraySigningService.js';
 import { parsePositiveInt } from '../utils/parseUtils.js';
 import { resolveRequestUserSucursalScope } from '../../../utils/sucursalScope.js';
@@ -611,22 +611,6 @@ export const createVentasPrinterDeviceDetectionHandler = async (req, res) => {
 };
 
 const validateQzSucursalAccess = async (req, idSucursal) => {
-  const scope = await resolveRequestUserSucursalScope(req, pool);
-  const allowedSucursalIds = Array.isArray(scope.allowedSucursalIds)
-    ? scope.allowedSucursalIds.map(Number)
-    : [];
-
-  if (!scope.isSuperAdmin && !allowedSucursalIds.includes(idSucursal)) {
-    return {
-      status: 403,
-      body: {
-        error: true,
-        code: 'QZ_SUCURSAL_FORBIDDEN',
-        message: 'No tienes permiso para operar esta sucursal.'
-      }
-    };
-  }
-
   const sucursalResult = await pool.query(
     `
       SELECT 1
@@ -647,40 +631,78 @@ const validateQzSucursalAccess = async (req, idSucursal) => {
     };
   }
 
+  const scope = await resolveRequestUserSucursalScope(req, pool);
+  const allowedSucursalIds = Array.isArray(scope.allowedSucursalIds)
+    ? scope.allowedSucursalIds.map(Number)
+    : [];
+
+  if (!scope.isSuperAdmin && !allowedSucursalIds.includes(idSucursal)) {
+    return {
+      status: 403,
+      body: {
+        error: true,
+        code: 'QZ_SUCURSAL_FORBIDDEN',
+        message: 'No tienes permiso para operar esta sucursal.'
+      }
+    };
+  }
+
   return null;
 };
 
-const buildQzCredentialLogContext = (idSucursal, error) => ({
-  id_sucursal: idSucursal,
-  credential_source: error?.credentialSource === 'sucursal' ? 'sucursal' : 'default'
+const hasQzSucursalInput = (value) => (
+  value !== undefined && value !== null && String(value).trim() !== ''
+);
+
+const buildQzCredentialLogContext = (idSucursal, credentialSource) => ({
+  id_sucursal: idSucursal || null,
+  credential_source: credentialSource === 'sucursal' ? 'sucursal' : 'default',
+  legacy_client: !idSucursal
 });
 
 export const getQzCertificateHandler = async (req, res) => {
-  const idSucursal = parsePositiveInt(req.query?.id_sucursal);
-  if (!idSucursal) {
+  const rawIdSucursal = req.query?.id_sucursal;
+  const idSucursal = parsePositiveInt(rawIdSucursal);
+  if (hasQzSucursalInput(rawIdSucursal) && !idSucursal) {
     return res.status(400).json({
       error: true,
       code: 'QZ_SUCURSAL_REQUIRED',
       message: 'id_sucursal debe ser un entero mayor a 0.'
     });
   }
+  if (!idSucursal && isQzSucursalContextRequired()) {
+    return res.status(400).json({
+      error: true,
+      code: 'QZ_SUCURSAL_REQUIRED',
+      message: 'id_sucursal es obligatorio.'
+    });
+  }
 
   try {
-    const accessError = await validateQzSucursalAccess(req, idSucursal);
-    if (accessError) return res.status(accessError.status).json(accessError.body);
+    if (idSucursal) {
+      const accessError = await validateQzSucursalAccess(req, idSucursal);
+      if (accessError) return res.status(accessError.status).json(accessError.body);
+    }
 
-    const certificate = await getQzCertificateText({ idSucursal });
+    const config = await getQzSigningConfiguration({
+      idSucursal,
+      allowGlobalWithoutSucursal: !idSucursal
+    });
+    console.info(
+      '[ventas.qz.certificate] configuracion resuelta',
+      buildQzCredentialLogContext(idSucursal, config.credentialSource)
+    );
 
     return res.status(200).json({
       ok: true,
-      configured: await hasQzSigningConfigured({ idSucursal }),
-      certificate
+      configured: true,
+      certificate: config.certificateText
     });
   } catch (error) {
     if (isQzConfigurationError(error)) {
       console.warn(
         '[ventas.qz.certificate] configuracion no disponible',
-        buildQzCredentialLogContext(idSucursal, error)
+        buildQzCredentialLogContext(idSucursal, error?.credentialSource)
       );
       return res.status(503).json({
         error: true,
@@ -695,12 +717,20 @@ export const getQzCertificateHandler = async (req, res) => {
 };
 
 export const signQzRequestHandler = async (req, res) => {
-  const idSucursal = parsePositiveInt(req.body?.id_sucursal);
-  if (!idSucursal) {
+  const rawIdSucursal = req.body?.id_sucursal;
+  const idSucursal = parsePositiveInt(rawIdSucursal);
+  if (hasQzSucursalInput(rawIdSucursal) && !idSucursal) {
     return res.status(400).json({
       error: true,
       code: 'QZ_SUCURSAL_REQUIRED',
       message: 'id_sucursal debe ser un entero mayor a 0.'
+    });
+  }
+  if (!idSucursal && isQzSucursalContextRequired()) {
+    return res.status(400).json({
+      error: true,
+      code: 'QZ_SUCURSAL_REQUIRED',
+      message: 'id_sucursal es obligatorio.'
     });
   }
 
@@ -714,16 +744,25 @@ export const signQzRequestHandler = async (req, res) => {
       });
     }
 
-    const accessError = await validateQzSucursalAccess(req, idSucursal);
-    if (accessError) return res.status(accessError.status).json(accessError.body);
+    if (idSucursal) {
+      const accessError = await validateQzSucursalAccess(req, idSucursal);
+      if (accessError) return res.status(accessError.status).json(accessError.body);
+    }
 
-    const signature = await signQzMessage(request, { idSucursal });
+    const { signature, credentialSource } = await signQzMessageWithContext(request, {
+      idSucursal,
+      allowGlobalWithoutSucursal: !idSucursal
+    });
+    console.info(
+      '[ventas.qz.sign] solicitud firmada',
+      buildQzCredentialLogContext(idSucursal, credentialSource)
+    );
     return res.status(200).json({ ok: true, signature });
   } catch (error) {
     if (isQzConfigurationError(error)) {
       console.warn(
         '[ventas.qz.sign] configuracion no disponible',
-        buildQzCredentialLogContext(idSucursal, error)
+        buildQzCredentialLogContext(idSucursal, error?.credentialSource)
       );
       return res.status(503).json({
         error: true,

@@ -134,7 +134,8 @@ export const authorizeAndSignAgentQzRequest = async ({
     }
 
     const signature = await signer(normalizedDigest, {
-      idSucursal: job.id_sucursal
+      idSucursal: job.id_sucursal,
+      allowGlobalWithoutSucursal: false
     });
     await client.query(
       `INSERT INTO public.firmas_qz_agente_solicitudes

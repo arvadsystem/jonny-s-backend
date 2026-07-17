@@ -106,7 +106,8 @@ router.get('/qz/certificate', async (req, res) => {
     return res.json({
       ok: true,
       certificate: await getQzCertificateText({
-        idSucursal: req.printAgent.id_sucursal
+        idSucursal: req.printAgent.id_sucursal,
+        allowGlobalWithoutSucursal: false
       })
     });
   } catch (error) {
