@@ -13,9 +13,13 @@ COPY config ./config
 COPY middleware ./middleware
 COPY routers ./routers
 COPY services ./services
+COPY print-agent/src/documentRenderer.js ./print-agent/src/documentRenderer.js
 COPY utils ./utils
 COPY jobs ./jobs
 COPY scripts ./scripts
+
+RUN test -f /usr/src/app/print-agent/src/documentRenderer.js
+RUN node --check /usr/src/app/print-agent/src/documentRenderer.js
 
 RUN mkdir -p uploads && chown -R node:node /usr/src/app
 
