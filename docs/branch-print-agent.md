@@ -6,7 +6,7 @@
 
 El navegador nunca necesita QZ en `VITE_PRINT_MODE=agent`. La venta se confirma antes de encolar y no se revierte si la impresion falla. La funcion PostgreSQL `reclamar_trabajos_impresion` usa `FOR UPDATE SKIP LOCKED`, toma como maximo un trabajo, asigna un lease y deriva la sucursal desde el agente autenticado. Un lease vencido permite recuperar un trabajo que no llego a la barrera de despacho. Los fallos se reprograman con backoff acotado hasta `max_intentos`; despues quedan `fallido`. La unicidad `(id_sucursal, idempotency_key, tipo_documento)` evita duplicados.
 
-Antes de invocar `qz.print`, el agente mueve el trabajo a `confirmacion_pendiente`, estado que no vuelve a entrar al claim automatico. El journal local registra `dispatch_started` y, tras una respuesta QZ exitosa, `printed_unconfirmed`. Si falla la confirmacion HTTP, los reinicios solo reintentan `complete`: nunca vuelven a llamar `qz.print`. Un resultado `dispatch_started`, tanto tras un cierre abrupto como tras un rechazo ambiguo de la promesa QZ, queda para revision manual porque no es posible saber con certeza si QZ alcanzo a imprimir. Los errores comprobables durante preparacion, antes de invocar `qz.print`, si pueden reintentarse. Esta estrategia prioriza evitar duplicados fisicos; no ofrece ni afirma semantica exactly-once.
+Antes de cruzar la barrera, el agente valida QZ/impresora y persiste `prepared`. Despues mueve el backend a `confirmacion_pendiente`, persiste `dispatch_started` inmediatamente antes de `qz.print` y, tras una respuesta QZ exitosa, cambia el journal a `printed_unconfirmed`. Un reinicio desde `prepared` consulta el estado remoto y puede continuar una sola vez; `dispatch_started` nunca reimprime automaticamente; `printed_unconfirmed` solo reintenta `complete`. Los ambiguos quedan en cuarentena sin bloquear trabajos posteriores y el log se emite una sola vez por proceso. Esta estrategia prioriza evitar duplicados fisicos; no ofrece ni afirma semantica exactly-once.
 
 Se eligio un endpoint web autenticado e idempotente despues de confirmar la venta porque el alta actual ocurre en una RPC PostgreSQL versionada. Acoplar la cola a esa RPC habria ampliado la transaccion financiera y el alcance de la migracion. El endpoint conserva la regla esencial: la venta ya confirmada nunca espera ni depende de la impresora.
 
@@ -14,7 +14,7 @@ El certificado publico y la clave privada de firma QZ siguen centralizados en el
 
 ## Migracion y backend QA
 
-Aplicar manualmente en QA `sql/2026-07-16_cola_impresion_agentes_sucursal.sql`. No fue ejecutada por Codex. Verificar las tres tablas y la funcion con las consultas al final del archivo.
+Aplicar manualmente en QA `sql/2026-07-16_cola_impresion_agentes_sucursal.sql`. No fue ejecutada por Codex. La migracion habilita RLS sin politicas de Data API y revoca tablas, secuencias y funcion a `anon`, `authenticated` y `service_role`. El backend usa `pg.Pool` con conexion PostgreSQL directa (`DB_USER`); el propietario conserva sus privilegios y no se agrega ningun `GRANT` a roles web. Ejecutar las consultas de RLS, ACL, funcion, indices, constraints y hash al final del archivo.
 
 Variables de backend existentes:
 
@@ -37,6 +37,7 @@ Endpoints del agente, todos bajo `/api/print-agent`, HTTPS, rate limit y credenc
 
 - `POST /heartbeat`
 - `POST /jobs/claim`
+- `GET /jobs/:id/status` (solo lectura minima dentro de la sucursal del agente)
 - `POST /jobs/:id/printing`
 - `POST /jobs/:id/confirmation-pending`
 - `POST /jobs/:id/lease`
@@ -48,9 +49,18 @@ Endpoints del agente, todos bajo `/api/print-agent`, HTTPS, rate limit y credenc
 La firma QZ del agente no es un firmador generico. Solo admite:
 
 - `printers.find`, con consulta nula y un trabajo del agente en `imprimiendo` o `confirmacion_pendiente`;
-- `print`, una copia HTML/pixel de 58 u 80 mm cuyo `jobName` coincide con el trabajo en `confirmacion_pendiente`.
+- `print`, una copia HTML/pixel de 58 u 80 mm cuyo `jobName`, ancho y HTML determinista coinciden exactamente con el payload del trabajo en `confirmacion_pendiente`.
 
-Cada solicitud incluye timestamp de 30 segundos, queda vinculada a agente, sucursal y trabajo, y su hash SHA512 es de un solo uso en `firmas_qz_agente_solicitudes`. Llamadas de red, archivos, RAW arbitrario y solicitudes reutilizadas o vencidas se rechazan.
+QZ Tray 2.2.6 entrega a `setSignaturePromise` el digest SHA-256 hexadecimal del JSON canonico `{call,params,timestamp}`. El backend recalcula ese SHA-256 y lo compara timing-safe; despues firma el digest recibido mediante RSA-SHA512, que sigue siendo el algoritmo configurado en QZ. La autorizacion guarda impresora y firma. Un reintento identico dentro de la ventana devuelve la misma firma; un `print` distinto para el mismo agente/trabajo se rechaza. `printers.find` admite como maximo cinco autorizaciones por minuto y su unicidad incluye agente, trabajo y llamada, evitando colisiones globales.
+
+Retencion: eliminar diariamente autorizaciones vencidas con una tarea operativa controlada, por ejemplo `DELETE FROM public.firmas_qz_agente_solicitudes WHERE expira_at < now() - interval '7 days';`. Esta limpieza no fue instalada ni ejecutada durante la correccion.
+
+Rutas administrativas protegidas por autenticacion, sesion activa, CSRF, auditoria global, `VENTAS_IMPRIMIR`, rol `ADMIN`/`ADMINISTRADOR`/`SUPER_ADMIN` y alcance de sucursal:
+
+- `GET /ventas/print-jobs/ambiguous?id_sucursal=...`
+- `GET /ventas/print-jobs/:id/events`
+- `POST /ventas/print-jobs/:id/resolve-printed`, con `motivo` obligatorio.
+- `POST /ventas/print-jobs/:id/resolve-not-printed`, con `motivo` obligatorio; es la unica ruta que puede reencolar despues de la barrera.
 
 ## Frontend
 
@@ -75,7 +85,7 @@ En `agent`, ventas y reimpresiones encolan por HTTPS; no hay deteccion ni conexi
 
 Consulte `print-agent/.env.example`. Son obligatorias `API_BASE_URL`, `PRINT_AGENT_ID`, `PRINT_AGENT_TOKEN`, `BRANCH_ID` y `PRINTER_MAP_JSON`. `QZ_HOST` solo acepta localhost/loopback y `QZ_SECURE_PORT` por defecto es 8181. `BRANCH_ID` debe coincidir con la identidad provisionada; el backend vuelve a imponer ese alcance. `PRINT_STATE_FILE` guarda el journal local y debe estar en disco persistente de la PC.
 
-Para la CA TLS local de QZ configure `QZ_CA_CERT_PATH` con un PEM publico instalado solo en la PC servidor. Alternativamente puede establecer `NODE_EXTRA_CA_CERTS` como variable de sistema antes de iniciar Node. El agente valida que exista un certificado X.509 y rechaza archivos que contengan claves privadas. Nunca use `rejectUnauthorized=false`, no use `ws://8182` y no suba esa CA al repositorio.
+Para la CA/certificado TLS local de QZ configure `QZ_CA_CERT_PATH` con un PEM publico instalado solo en la PC servidor. Alternativamente puede establecer `NODE_EXTRA_CA_CERTS` como variable de sistema antes de iniciar Node. El agente valida que exista, que sea X.509, que no contenga claves privadas y que sea valido para `localhost` mediante SAN o la alternativa aceptada por la verificacion de hostname de Node. La conexion TLS vuelve a verificar cadena y hostname con `rejectUnauthorized=true`. Nunca use `rejectUnauthorized=false`, no use `ws://8182` y no suba el certificado al repositorio.
 
 Ejemplo de mapeo (reemplace nombres localmente):
 
@@ -85,7 +95,7 @@ PRINTER_MAP_JSON={"factura":"Nombre Windows","cocina":"Nombre Cocina","caja":"No
 
 ## Instalacion: El Carmen
 
-1. En la PC designada, instalar Node.js 20+, QZ Tray 2.2.6 y drivers.
+1. En la PC designada, instalar Node.js 20+, QZ Tray 2.2.6 y drivers; generar/configurar el certificado TLS local para el nombre `localhost`.
 2. Mantener puertos 8181/8182 cerrados a la red; QZ solo se usa por localhost.
 3. Copiar `print-agent`, ejecutar `npm.cmd install --omit=dev` y crear `.env` fuera de Git.
 4. Provisionar agente con el ID real de El Carmen. No configurar `192.168.2.90`; no se usa.
@@ -107,9 +117,9 @@ Los scripts verifican administrador, Node, `.env` y disponibilidad de QZ. `node-
 
 ## Diagnostico
 
-Consultar `trabajos_impresion` por `id_sucursal`, `estado`, `intentos`, `lease_expires_at` y `error_sanitizado`; luego revisar `trabajos_impresion_eventos`, heartbeat, el journal y logs JSON del agente. Un trabajo `asignado/imprimiendo` con lease vencido se recupera en el siguiente claim. `confirmacion_pendiente` nunca se reclama automaticamente: primero concilie el journal o confirme fisicamente el resultado. Un `fallido` requiere una reimpresion controlada desde la UI con una nueva clave de idempotencia.
+Consultar `trabajos_impresion` por `id_sucursal`, `estado`, `intentos`, `lease_expires_at` y `error_sanitizado`; luego revisar `trabajos_impresion_eventos`, heartbeat, el journal y logs JSON del agente. Un trabajo `asignado/imprimiendo` con lease vencido se recupera en el siguiente claim. `confirmacion_pendiente` nunca acepta `fail` ni vuelve automaticamente a `pendiente`: un administrador debe confirmar fisicamente `impreso` o `no impreso`, indicando motivo. El agente consulta el estado y limpia su journal cuando la resolucion ya es final o el trabajo fue reencolado manualmente.
 
-Pasos manuales por PC: instalar QZ/Node/drivers, confiar la configuracion TLS local de QZ según su instalador oficial, crear `.env`, mapear impresoras, instalar el servicio y custodiar el token. No modificar `hosts`, no instalar certificados en telefonos/tablets y no abrir acceso entrante desde Internet.
+Pasos manuales por PC: instalar QZ/Node/drivers, generar y confiar la configuracion TLS local de QZ para SAN `localhost` segun su instalador oficial, crear `.env`, mapear impresoras, instalar el servicio y custodiar el token. Repetir el mismo requisito de SAN `localhost` en El Carmen y posteriormente en 21 de Agosto. No modificar `hosts`, no instalar certificados en telefonos/tablets y no abrir acceso entrante desde Internet.
 
 ## Rollback y limites
 

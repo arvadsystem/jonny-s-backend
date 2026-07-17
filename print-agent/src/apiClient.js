@@ -18,6 +18,7 @@ export const createApiClient = ({ config, fetchImpl = fetch }) => {
   return {
     heartbeat: (version) => request('/heartbeat', { method: 'POST', body: { version } }),
     claim: () => request('/jobs/claim', { method: 'POST', body: { limit: 1, lease_seconds: config.leaseSeconds } }),
+    status: (id) => request(`/jobs/${id}/status`),
     printing: (id) => request(`/jobs/${id}/printing`, { method: 'POST', body: { lease_seconds: config.leaseSeconds } }),
     confirmationPending: (id) => request(`/jobs/${id}/confirmation-pending`, { method: 'POST', body: {} }),
     complete: (id) => request(`/jobs/${id}/complete`, { method: 'POST', body: {} }),

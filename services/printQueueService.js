@@ -56,12 +56,24 @@ export const claimPrintJobs = async ({ agentId, leaseSeconds = 90, db = pool }) 
   return result.rows;
 };
 
+export const getPrintJobStatusForAgent = async ({ agent, jobId, db = pool }) => {
+  const result = await db.query(
+    `SELECT id_trabajo,estado,finalizado_at,fecha_actualizacion,
+            (id_agente_tomado=$3) AS assigned_to_agent,
+            (lease_expires_at IS NOT NULL AND lease_expires_at > now()) AS lease_active
+     FROM public.trabajos_impresion
+     WHERE id_trabajo=$1 AND id_sucursal=$2`,
+    [jobId, agent.id_sucursal, agent.id_agente]
+  );
+  return result.rows[0] || null;
+};
+
 export const transitionPrintJob = async ({ agent, jobId, action, errorMessage = null, leaseSeconds = 90, db = pool }) => {
   const transitions = {
     printing: { from: ['asignado'], to: 'imprimiendo', event: 'printing' },
     confirmationPending: { from: ['imprimiendo'], to: 'confirmacion_pendiente', event: 'confirmacion_pendiente' },
     complete: { from: ['confirmacion_pendiente'], to: 'impreso', event: 'complete' },
-    fail: { from: ['imprimiendo', 'confirmacion_pendiente'], to: 'fallido', event: 'fail' },
+    fail: { from: ['imprimiendo'], to: 'fallido', event: 'fail' },
     renew: { from: ['asignado', 'imprimiendo'], to: null, event: 'renew' }
   };
   const rule = transitions[action];
@@ -81,8 +93,7 @@ export const transitionPrintJob = async ({ agent, jobId, action, errorMessage = 
       [jobId, agent.id_sucursal, agent.id_agente]
     );
     const current = currentResult.rows[0];
-    const canFinishWithoutLease = current?.estado === 'confirmacion_pendiente'
-      && ['complete', 'fail'].includes(action);
+    const canFinishWithoutLease = current?.estado === 'confirmacion_pendiente' && action === 'complete';
     if (!current || !rule.from.includes(current.estado) || (!canFinishWithoutLease && !current.lease_activo)) {
       throw Object.assign(new Error('Trabajo no encontrado, lease vencido o estado incompatible.'), {
         status: 409,

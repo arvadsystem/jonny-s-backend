@@ -1,9 +1,11 @@
 import crypto from 'node:crypto';
 import pool from '../config/db-connection.js';
+import { renderPrintJobHtml } from '../print-agent/src/documentRenderer.js';
 import { signQzMessage } from '../routers/ventas/services/qzTraySigningService.js';
 
 const ALLOWED_CALLS = new Set(['printers.find', 'print']);
 const REQUEST_MAX_AGE_MS = 30_000;
+const MAX_FIND_AUTHORIZATIONS_PER_MINUTE = 5;
 
 const qzRequestError = (code, message, status = 400) => Object.assign(new Error(message), { code, status });
 const isPlainObject = (value) => Boolean(value && typeof value === 'object' && !Array.isArray(value));
@@ -14,22 +16,35 @@ const validateFindParams = (params) => {
   return keys.length === 1 && keys[0] === 'query' && params.query === null;
 };
 
-const validatePrintParams = (params, jobId) => {
-  if (!isPlainObject(params) || !isPlainObject(params.printer) || !isPlainObject(params.options)) return false;
+const validatePrintParams = (params, job) => {
+  if (!isPlainObject(params) || !isPlainObject(params.printer) || !isPlainObject(params.options)) return null;
   const printerKeys = Object.keys(params.printer);
-  if (printerKeys.length !== 1 || printerKeys[0] !== 'name') return false;
+  if (printerKeys.length !== 1 || printerKeys[0] !== 'name') return null;
   const printerName = String(params.printer.name || '').trim();
-  if (!printerName || printerName.length > 160) return false;
-  if (Number(params.options.copies) !== 1 || String(params.options.jobName || '') !== `Jonny-${jobId}`) return false;
-  if (!Array.isArray(params.data) || params.data.length !== 1) return false;
+  if (!printerName || printerName.length > 160) return null;
+  if (Number(params.options.copies) !== 1 || String(params.options.jobName || '') !== `Jonny-${job.id_trabajo}`) return null;
+  if (!Array.isArray(params.data) || params.data.length !== 1) return null;
   const item = params.data[0];
-  if (!isPlainObject(item) || item.type !== 'pixel' || item.format !== 'html' || item.flavor !== 'plain') return false;
-  if (typeof item.data !== 'string' || Buffer.byteLength(item.data, 'utf8') > 256 * 1024) return false;
-  return Number(item.options?.pageWidth) === 58 || Number(item.options?.pageWidth) === 80;
+  if (!isPlainObject(item) || item.type !== 'pixel' || item.format !== 'html' || item.flavor !== 'plain') return null;
+  if (typeof item.data !== 'string' || Buffer.byteLength(item.data, 'utf8') > 256 * 1024) return null;
+  const expectedWidth = Number(job.payload?.ancho_mm) === 58 ? 58 : 80;
+  if (Number(item.options?.pageWidth) !== expectedWidth) return null;
+  let expectedHtml;
+  try { expectedHtml = renderPrintJobHtml(job.payload); } catch { return null; }
+  if (item.data !== expectedHtml) return null;
+  return { printerName };
 };
 
+export const canonicalizeAgentQzRequest = (request) => JSON.stringify({
+  call: request.call,
+  params: request.params,
+  timestamp: request.timestamp
+});
+
 export const validateAgentQzRequest = ({ request, job, now = Date.now() }) => {
-  if (!isPlainObject(request) || Object.keys(request).some((key) => !['call', 'params', 'timestamp'].includes(key))) {
+  if (!isPlainObject(request)
+    || Object.keys(request).length !== 3
+    || Object.keys(request).some((key) => !['call', 'params', 'timestamp'].includes(key))) {
     throw qzRequestError('QZ_SIGN_REQUEST_INVALID', 'Estructura QZ invalida.');
   }
   const call = String(request.call || '');
@@ -38,14 +53,20 @@ export const validateAgentQzRequest = ({ request, job, now = Date.now() }) => {
     throw qzRequestError('QZ_SIGN_REQUEST_EXPIRED', 'Solicitud QZ vencida.');
   }
   const state = String(job?.estado || '');
+  let printerName = null;
   if (call === 'printers.find') {
-    if (!['imprimiendo', 'confirmacion_pendiente'].includes(state) || !validateFindParams(request.params)) {
+    const activeState = state === 'confirmacion_pendiente' || (state === 'imprimiendo' && job.lease_active === true);
+    if (!activeState || !validateFindParams(request.params)) {
       throw qzRequestError('QZ_SIGN_REQUEST_NOT_RELATED', 'Solicitud QZ no relacionada con el trabajo.', 403);
     }
-  } else if (state !== 'confirmacion_pendiente' || !validatePrintParams(request.params, job.id_trabajo)) {
-    throw qzRequestError('QZ_SIGN_REQUEST_NOT_RELATED', 'Solicitud QZ no relacionada con el trabajo.', 403);
+  } else {
+    const validatedPrint = state === 'confirmacion_pendiente' ? validatePrintParams(request.params, job) : null;
+    if (!validatedPrint) {
+      throw qzRequestError('QZ_SIGN_REQUEST_NOT_RELATED', 'Documento QZ no coincide con el trabajo reclamado.', 403);
+    }
+    printerName = validatedPrint.printerName;
   }
-  return { call, canonical: JSON.stringify(request) };
+  return { call, printerName, canonical: canonicalizeAgentQzRequest(request) };
 };
 
 export const authorizeAndSignAgentQzRequest = async ({
@@ -56,37 +77,77 @@ export const authorizeAndSignAgentQzRequest = async ({
   try {
     await client.query('BEGIN');
     const jobResult = await client.query(
-      `SELECT id_trabajo,id_sucursal,id_agente_tomado,estado,payload
+      `SELECT id_trabajo,id_sucursal,id_agente_tomado,estado,payload,
+              (lease_expires_at IS NOT NULL AND lease_expires_at > now()) AS lease_active
        FROM public.trabajos_impresion
        WHERE id_trabajo=$1 AND id_sucursal=$2 AND id_agente_tomado=$3
-       FOR SHARE`,
+       FOR UPDATE`,
       [jobId, agent.id_sucursal, agent.id_agente]
     );
     const job = jobResult.rows[0];
     if (!job) throw qzRequestError('QZ_SIGN_JOB_NOT_ACTIVE', 'Trabajo de impresion no autorizado.', 403);
-    const { call, canonical } = validateAgentQzRequest({ request, job, now });
-    const requestHash = crypto.createHash('sha512').update(canonical, 'utf8').digest('hex');
-    if (!/^[a-f0-9]{128}$/i.test(String(digest || ''))) {
+    const { call, printerName, canonical } = validateAgentQzRequest({ request, job, now });
+    const requestHash = crypto.createHash('sha256').update(canonical, 'utf8').digest('hex');
+    const normalizedDigest = String(digest || '').toLowerCase();
+    if (!/^[a-f0-9]{64}$/.test(normalizedDigest)) {
       throw qzRequestError('QZ_SIGN_DIGEST_INVALID', 'Hash QZ invalido.');
     }
     const digestMatches = crypto.timingSafeEqual(
       Buffer.from(requestHash, 'hex'),
-      Buffer.from(String(digest), 'hex')
+      Buffer.from(normalizedDigest, 'hex')
     );
     if (!digestMatches) throw qzRequestError('QZ_SIGN_DIGEST_MISMATCH', 'Hash QZ no coincide con la operacion.', 403);
+
+    const existingResult = await client.query(
+      `SELECT signature
+       FROM public.firmas_qz_agente_solicitudes
+       WHERE id_agente=$1 AND id_trabajo=$2 AND llamada=$3 AND request_hash=$4
+       LIMIT 1`,
+      [agent.id_agente, jobId, call, requestHash]
+    );
+    if (existingResult.rows[0]?.signature) {
+      await client.query('COMMIT');
+      return { signature: existingResult.rows[0].signature, timestamp: request.timestamp, call, idempotent: true };
+    }
+
+    if (call === 'print') {
+      const priorPrint = await client.query(
+        `SELECT 1 FROM public.firmas_qz_agente_solicitudes
+         WHERE id_agente=$1 AND id_trabajo=$2 AND llamada='print'
+         LIMIT 1`,
+        [agent.id_agente, jobId]
+      );
+      if (priorPrint.rows[0]) {
+        throw qzRequestError('QZ_SIGN_PRINT_ALREADY_AUTHORIZED', 'El trabajo ya tiene otra autorizacion de impresion.', 409);
+      }
+    } else {
+      const findCount = await client.query(
+        `SELECT COUNT(*)::integer AS total
+         FROM public.firmas_qz_agente_solicitudes
+         WHERE id_agente=$1 AND id_trabajo=$2 AND llamada='printers.find'
+           AND fecha_creacion > now() - interval '1 minute'`,
+        [agent.id_agente, jobId]
+      );
+      if (Number(findCount.rows[0]?.total || 0) >= MAX_FIND_AUTHORIZATIONS_PER_MINUTE) {
+        throw qzRequestError('QZ_SIGN_FIND_RATE_LIMITED', 'Limite de busquedas de impresora alcanzado.', 429);
+      }
+    }
+
+    const signature = await signer(normalizedDigest);
     await client.query(
       `INSERT INTO public.firmas_qz_agente_solicitudes
-         (id_trabajo,id_sucursal,id_agente,llamada,request_hash,request_timestamp,expira_at)
-       VALUES ($1,$2,$3,$4,$5,$6,to_timestamp($6 / 1000.0) + interval '30 seconds')`,
-      [jobId, agent.id_sucursal, agent.id_agente, call, requestHash, request.timestamp]
+         (id_trabajo,id_sucursal,id_agente,llamada,request_hash,request_timestamp,
+          printer_name,signature,expira_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,to_timestamp($6 / 1000.0) + interval '30 seconds')`,
+      [jobId, agent.id_sucursal, agent.id_agente, call, requestHash, request.timestamp,
+        printerName, signature]
     );
-    const signature = await signer(String(digest));
     await client.query('COMMIT');
-    return { signature, timestamp: request.timestamp, call };
+    return { signature, timestamp: request.timestamp, call, idempotent: false };
   } catch (error) {
     await client.query('ROLLBACK').catch(() => undefined);
     if (error?.code === '23505') {
-      throw qzRequestError('QZ_SIGN_REQUEST_REPLAYED', 'Solicitud QZ ya utilizada.', 409);
+      throw qzRequestError('QZ_SIGN_CONFLICT', 'La autorizacion QZ entra en conflicto con otra solicitud.', 409);
     }
     throw error;
   } finally {

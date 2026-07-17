@@ -2,7 +2,7 @@ import express from 'express';
 import rateLimit from 'express-rate-limit';
 import pool from '../config/db-connection.js';
 import { authenticatePrintAgent } from '../services/printAgentAuthService.js';
-import { claimPrintJobs, transitionPrintJob } from '../services/printQueueService.js';
+import { claimPrintJobs, getPrintJobStatusForAgent, transitionPrintJob } from '../services/printQueueService.js';
 import { authorizeAndSignAgentQzRequest } from '../services/qzAgentSigningService.js';
 import {
   getQzCertificateText,
@@ -56,6 +56,21 @@ router.post('/jobs/claim', async (req, res) => {
   } catch (error) {
     console.error('[print-agent.claim] fallo', { agent_id: req.printAgent.id_agente, code: error?.code || null });
     return res.status(500).json({ ok: false, code: 'PRINT_CLAIM_FAILED', message: 'No se pudieron reclamar trabajos.' });
+  }
+});
+
+router.get('/jobs/:id/status', async (req, res) => {
+  const jobId = Number.parseInt(String(req.params.id || ''), 10);
+  if (!Number.isInteger(jobId) || jobId <= 0) {
+    return res.status(400).json({ ok: false, code: 'PRINT_JOB_ID_INVALID', message: 'ID de trabajo invalido.' });
+  }
+  try {
+    const job = await getPrintJobStatusForAgent({ agent: req.printAgent, jobId });
+    if (!job) return res.status(404).json({ ok: false, code: 'PRINT_JOB_NOT_FOUND', message: 'Trabajo no encontrado.' });
+    return res.json({ ok: true, job });
+  } catch (error) {
+    console.error('[print-agent.status] fallo', { agent_id: req.printAgent.id_agente, code: error?.code || null });
+    return res.status(500).json({ ok: false, code: 'PRINT_JOB_STATUS_FAILED', message: 'No se pudo consultar el trabajo.' });
   }
 });
 

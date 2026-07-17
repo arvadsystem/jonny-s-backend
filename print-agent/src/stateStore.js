@@ -20,6 +20,7 @@ export const createPrintStateStore = ({ filePath }) => {
       job_id: jobId,
       branch_id: Number(job?.id_sucursal || job?.branch_id || 0),
       status,
+      ...(status === 'prepared' ? { job: JSON.parse(JSON.stringify(job)) } : {}),
       updated_at: new Date().toISOString()
     };
     state.jobs = [...state.jobs.filter((item) => item.job_id !== jobId), entry];
@@ -39,6 +40,7 @@ export const createPrintStateStore = ({ filePath }) => {
         await persist();
       }
     },
+    markPrepared: (job) => upsert(job, 'prepared'),
     markDispatchStarted: (job) => upsert(job, 'dispatch_started'),
     markPrintedUnconfirmed: (job) => upsert(job, 'printed_unconfirmed'),
     list: () => state.jobs.map((item) => ({ ...item })),

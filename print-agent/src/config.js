@@ -12,11 +12,22 @@ const integer = (env, key, fallback, min, max) => {
   if (!Number.isInteger(value) || value < min || value > max) throw new Error(`CONFIG_INVALID:${key}`);
   return value;
 };
+
+export const validateQzCaCertificate = ({ certificateText, host, X509CertificateImpl = crypto.X509Certificate }) => {
+  if (/PRIVATE KEY/.test(String(certificateText || ''))) {
+    throw new Error('CONFIG_INVALID:QZ_CA_CERT_MUST_NOT_CONTAIN_PRIVATE_KEY');
+  }
+  let certificate;
+  try { certificate = new X509CertificateImpl(certificateText); } catch { throw new Error('CONFIG_INVALID:QZ_CA_CERT_PATH'); }
+  if (!certificate.checkHost(host)) throw new Error('CONFIG_INVALID:QZ_CA_CERT_HOSTNAME');
+  return certificate;
+};
+
 export const loadConfig = (env = process.env) => {
   const apiBaseUrl = required(env, 'API_BASE_URL').replace(/\/+$/, '');
   if (!/^https:\/\//i.test(apiBaseUrl) && !/^https:\/\/localhost(?::\d+)?$/i.test(apiBaseUrl)) throw new Error('CONFIG_INVALID:API_BASE_URL_HTTPS_REQUIRED');
   const qzHost = String(env.QZ_HOST || 'localhost').trim().toLowerCase();
-  if (!['localhost', '127.0.0.1', '::1'].includes(qzHost)) throw new Error('CONFIG_INVALID:QZ_HOST_MUST_BE_LOCALHOST');
+  if (qzHost !== 'localhost') throw new Error('CONFIG_INVALID:QZ_HOST_MUST_BE_LOCALHOST');
   let printerMap;
   try { printerMap = JSON.parse(required(env, 'PRINTER_MAP_JSON')); } catch { throw new Error('CONFIG_INVALID:PRINTER_MAP_JSON'); }
   if (!printerMap || typeof printerMap !== 'object' || Array.isArray(printerMap)) throw new Error('CONFIG_INVALID:PRINTER_MAP_JSON');
@@ -28,8 +39,7 @@ export const loadConfig = (env = process.env) => {
   if (qzCaCertPath) {
     if (!fs.existsSync(qzCaCertPath) || !fs.statSync(qzCaCertPath).isFile()) throw new Error('CONFIG_INVALID:QZ_CA_CERT_PATH');
     const caText = fs.readFileSync(qzCaCertPath, 'utf8');
-    if (/PRIVATE KEY/.test(caText)) throw new Error('CONFIG_INVALID:QZ_CA_CERT_MUST_NOT_CONTAIN_PRIVATE_KEY');
-    try { new crypto.X509Certificate(caText); } catch { throw new Error('CONFIG_INVALID:QZ_CA_CERT_PATH'); }
+    validateQzCaCertificate({ certificateText: caText, host: qzHost });
   }
   return {
     apiBaseUrl,

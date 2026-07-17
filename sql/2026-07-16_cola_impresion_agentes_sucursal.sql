@@ -81,16 +81,38 @@ CREATE TABLE IF NOT EXISTS public.firmas_qz_agente_solicitudes (
   id_sucursal INTEGER NOT NULL REFERENCES public.sucursales(id_sucursal),
   id_agente UUID NOT NULL REFERENCES public.agentes_impresion(id_agente),
   llamada VARCHAR(40) NOT NULL CHECK (llamada IN ('printers.find', 'print')),
-  request_hash CHAR(128) NOT NULL UNIQUE,
+  request_hash CHAR(64) NOT NULL,
   request_timestamp BIGINT NOT NULL,
+  printer_name VARCHAR(160) NULL,
+  signature TEXT NOT NULL,
   expira_at TIMESTAMPTZ NOT NULL,
-  fecha_creacion TIMESTAMPTZ NOT NULL DEFAULT now()
+  fecha_creacion TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (id_agente, id_trabajo, llamada, request_hash)
 );
 
 CREATE INDEX IF NOT EXISTS idx_firmas_qz_agente_trabajo
   ON public.firmas_qz_agente_solicitudes (id_trabajo, fecha_creacion DESC);
 CREATE INDEX IF NOT EXISTS idx_firmas_qz_agente_expira
   ON public.firmas_qz_agente_solicitudes (expira_at);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_firmas_qz_agente_print_trabajo
+  ON public.firmas_qz_agente_solicitudes (id_agente, id_trabajo, llamada)
+  WHERE llamada = 'print';
+
+ALTER TABLE public.agentes_impresion ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.trabajos_impresion ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.trabajos_impresion_eventos ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.firmas_qz_agente_solicitudes ENABLE ROW LEVEL SECURITY;
+
+-- El backend usa conexion PostgreSQL directa mediante DB_USER. El propietario conserva
+-- privilegios nativos; no se conceden permisos a roles de Supabase Data API.
+REVOKE ALL ON TABLE public.agentes_impresion FROM anon, authenticated, service_role;
+REVOKE ALL ON TABLE public.trabajos_impresion FROM anon, authenticated, service_role;
+REVOKE ALL ON TABLE public.trabajos_impresion_eventos FROM anon, authenticated, service_role;
+REVOKE ALL ON TABLE public.firmas_qz_agente_solicitudes FROM anon, authenticated, service_role;
+
+REVOKE ALL ON SEQUENCE public.trabajos_impresion_id_trabajo_seq FROM anon, authenticated, service_role;
+REVOKE ALL ON SEQUENCE public.trabajos_impresion_eventos_id_evento_seq FROM anon, authenticated, service_role;
+REVOKE ALL ON SEQUENCE public.firmas_qz_agente_solicitudes_id_firma_seq FROM anon, authenticated, service_role;
 
 CREATE OR REPLACE FUNCTION public.reclamar_trabajos_impresion(
   p_id_agente UUID,
@@ -156,10 +178,44 @@ BEGIN
 END;
 $$;
 
+REVOKE EXECUTE ON FUNCTION public.reclamar_trabajos_impresion(UUID, INTEGER, INTEGER)
+  FROM PUBLIC, anon, authenticated, service_role;
+
 COMMIT;
 
 -- Verificacion QA:
--- SELECT table_name FROM information_schema.tables
--- WHERE table_schema='public' AND table_name IN
+-- 1) Tablas y RLS (las cuatro deben mostrar rowsecurity=true):
+-- SELECT c.relname, c.relrowsecurity
+-- FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+-- WHERE n.nspname='public' AND c.relname IN
 -- ('agentes_impresion','trabajos_impresion','trabajos_impresion_eventos','firmas_qz_agente_solicitudes');
--- SELECT proname FROM pg_proc WHERE proname='reclamar_trabajos_impresion';
+--
+-- 2) ACL: anon/authenticated no deben tener privilegios; tampoco service_role porque
+-- el backend usa conexion PostgreSQL directa:
+-- SELECT table_name, grantee, privilege_type
+-- FROM information_schema.role_table_grants
+-- WHERE table_schema='public'
+--   AND table_name IN ('agentes_impresion','trabajos_impresion','trabajos_impresion_eventos','firmas_qz_agente_solicitudes')
+--   AND grantee IN ('anon','authenticated','service_role');
+-- SELECT tablename,policyname,roles FROM pg_policies
+-- WHERE schemaname='public' AND tablename IN
+-- ('agentes_impresion','trabajos_impresion','trabajos_impresion_eventos','firmas_qz_agente_solicitudes');
+--
+-- 3) Secuencias sin USAGE para Data API (todos deben ser false):
+-- SELECT has_sequence_privilege('anon','public.trabajos_impresion_id_trabajo_seq','USAGE') AS anon_jobs,
+--        has_sequence_privilege('authenticated','public.trabajos_impresion_eventos_id_evento_seq','USAGE') AS authenticated_events,
+--        has_sequence_privilege('service_role','public.firmas_qz_agente_solicitudes_id_firma_seq','USAGE') AS service_signatures;
+--
+-- 4) Funcion sin EXECUTE publico/Data API (todos deben ser false):
+-- SELECT has_function_privilege('PUBLIC','public.reclamar_trabajos_impresion(uuid,integer,integer)','EXECUTE') AS public_execute,
+--        has_function_privilege('anon','public.reclamar_trabajos_impresion(uuid,integer,integer)','EXECUTE') AS anon_execute,
+--        has_function_privilege('authenticated','public.reclamar_trabajos_impresion(uuid,integer,integer)','EXECUTE') AS authenticated_execute;
+--
+-- 5) Hash QZ, constraints e indices:
+-- SELECT data_type, character_maximum_length
+-- FROM information_schema.columns
+-- WHERE table_schema='public' AND table_name='firmas_qz_agente_solicitudes' AND column_name='request_hash';
+-- SELECT conname, pg_get_constraintdef(oid) FROM pg_constraint
+-- WHERE conrelid IN ('public.trabajos_impresion'::regclass,'public.firmas_qz_agente_solicitudes'::regclass);
+-- SELECT tablename,indexname,indexdef FROM pg_indexes
+-- WHERE schemaname='public' AND tablename IN ('trabajos_impresion','firmas_qz_agente_solicitudes');
