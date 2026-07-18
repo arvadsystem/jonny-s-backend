@@ -133,6 +133,10 @@ export const authorizeAndSignAgentQzRequest = async ({
       }
     }
 
+    const expiresAt = new Date(request.timestamp + REQUEST_MAX_AGE_MS);
+    if (Number.isNaN(expiresAt.getTime())) {
+      throw qzRequestError('QZ_SIGN_REQUEST_INVALID', 'Timestamp QZ invalido.');
+    }
     const signature = await signer(normalizedDigest, {
       idSucursal: job.id_sucursal,
       allowGlobalWithoutSucursal: false
@@ -141,9 +145,9 @@ export const authorizeAndSignAgentQzRequest = async ({
       `INSERT INTO public.firmas_qz_agente_solicitudes
          (id_trabajo,id_sucursal,id_agente,llamada,request_hash,request_timestamp,
           printer_name,signature,expira_at)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,to_timestamp($6 / 1000.0) + interval '30 seconds')`,
+       VALUES ($1,$2,$3,$4,$5,$6::bigint,$7,$8,$9::timestamptz)`,
       [jobId, agent.id_sucursal, agent.id_agente, call, requestHash, request.timestamp,
-        printerName, signature]
+        printerName, signature, expiresAt]
     );
     await client.query('COMMIT');
     return { signature, timestamp: request.timestamp, call, idempotent: false };

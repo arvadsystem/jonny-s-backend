@@ -8,6 +8,7 @@ import {
   authorizeAndSignAgentQzRequest,
   canonicalizeAgentQzRequest
 } from '../services/qzAgentSigningService.js';
+import { buildAgentQzSigningErrorResponse } from '../routers/printAgent.js';
 
 const agent = { id_agente: '11111111-1111-1111-1111-111111111111', id_sucursal: 9 };
 const payload = {
@@ -118,7 +119,14 @@ test('QZ acepta digest SHA-256 real y rechaza digest hexadecimal de 128 caracter
   assert.equal(result.signature, 'sig:64');
   assert.equal(result.idempotent, false);
   const insert = accepted.calls.find((call) => call.sql.includes('INSERT INTO public.firmas_qz_agente_solicitudes'));
+  assert.match(insert.sql, /\$6::bigint/);
+  assert.match(insert.sql, /\$9::timestamptz/);
+  assert.doesNotMatch(insert.sql, /to_timestamp\s*\(\s*\$6/);
+  assert.equal(insert.params.length, 9);
+  assert.equal(insert.params[5], request.timestamp);
   assert.equal(insert.params[6], 'QA Printer');
+  assert.ok(insert.params[8] instanceof Date);
+  assert.equal(insert.params[8].getTime(), request.timestamp + 30_000);
 
   await assert.rejects(
     () => authorizeAndSignAgentQzRequest({
@@ -126,6 +134,56 @@ test('QZ acepta digest SHA-256 real y rechaza digest hexadecimal de 128 caracter
     }),
     (error) => error.code === 'QZ_SIGN_DIGEST_INVALID'
   );
+});
+
+test('router QZ oculta SQLSTATE y conserva errores funcionales y de configuracion', () => {
+  const logs = [];
+  const databaseError = Object.assign(new Error('detalle SQL sensible'), {
+    code: '42P08',
+    signature: 'firma-no-registrar',
+    requestHash: 'hash-no-registrar',
+    certificate: 'certificado-no-registrar'
+  });
+  const databaseResponse = buildAgentQzSigningErrorResponse({
+    error: databaseError,
+    agentId: agent.id_agente,
+    jobId: 25,
+    log: (...args) => logs.push(args)
+  });
+  assert.equal(databaseResponse.status, 500);
+  assert.equal(databaseResponse.body.code, 'QZ_SIGNING_ERROR');
+  assert.doesNotMatch(JSON.stringify(databaseResponse), /42P08/);
+  assert.deepEqual(logs[0][1], {
+    agent_id: agent.id_agente,
+    job_id: 25,
+    sqlstate: '42P08'
+  });
+  assert.doesNotMatch(
+    JSON.stringify(logs),
+    /detalle SQL sensible|firma-no-registrar|hash-no-registrar|certificado-no-registrar/
+  );
+
+  const functionalResponse = buildAgentQzSigningErrorResponse({
+    error: Object.assign(new Error('Solicitud QZ vencida.'), {
+      code: 'QZ_SIGN_REQUEST_EXPIRED',
+      status: 400
+    }),
+    log: (...args) => logs.push(args)
+  });
+  assert.equal(functionalResponse.status, 400);
+  assert.equal(functionalResponse.body.code, 'QZ_SIGN_REQUEST_EXPIRED');
+  assert.equal(functionalResponse.body.message, 'Solicitud QZ vencida.');
+
+  const configurationResponse = buildAgentQzSigningErrorResponse({
+    error: Object.assign(new Error('internal configuration detail'), {
+      code: 'QZ_CERTIFICATE_INVALID',
+      httpStatus: 503
+    }),
+    log: (...args) => logs.push(args)
+  });
+  assert.equal(configurationResponse.status, 503);
+  assert.equal(configurationResponse.body.code, 'QZ_CERTIFICATE_INVALID');
+  assert.equal(logs.length, 1);
 });
 
 test('dependencia qz-tray 2.2.6 aplica SHA-256 al objeto canonico antes de firmar', () => {

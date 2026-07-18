@@ -12,6 +12,49 @@ import {
 
 const router = express.Router();
 const limiter = rateLimit({ windowMs: 60_000, max: 180, standardHeaders: true, legacyHeaders: false });
+const isPublicQzErrorCode = (code) => /^QZ_[A-Z0-9_]+$/.test(String(code || ''));
+
+export const buildAgentQzSigningErrorResponse = ({
+  error,
+  agentId = null,
+  jobId = null,
+  log = console.error
+}) => {
+  if (isQzConfigurationError(error)) {
+    return {
+      status: 503,
+      body: {
+        ok: false,
+        code: isPublicQzErrorCode(error?.code) ? error.code : 'QZ_SIGNING_NOT_CONFIGURED',
+        message: getQzPublicErrorMessage()
+      }
+    };
+  }
+  if (error?.status) {
+    return {
+      status: error.status,
+      body: {
+        ok: false,
+        code: isPublicQzErrorCode(error?.code) ? error.code : 'QZ_SIGNING_ERROR',
+        message: error.message
+      }
+    };
+  }
+  const internalCode = String(error?.code || '').toUpperCase();
+  log('[print-agent.qz.sign] fallo interno', {
+    agent_id: agentId,
+    job_id: jobId,
+    sqlstate: /^[0-9A-Z]{5}$/.test(internalCode) ? internalCode : null
+  });
+  return {
+    status: 500,
+    body: {
+      ok: false,
+      code: 'QZ_SIGNING_ERROR',
+      message: 'No se pudo firmar la solicitud.'
+    }
+  };
+};
 
 const requireHttps = (req, res, next) => {
   const forwardedProto = String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim().toLowerCase();
@@ -137,14 +180,12 @@ router.post('/qz/sign', async (req, res) => {
     });
     return res.json({ ok: true, ...result });
   } catch (error) {
-    const status = isQzConfigurationError(error) ? 503 : (error?.status || 500);
-    return res.status(status).json({
-      ok: false,
-      code: error?.code || 'QZ_SIGNING_ERROR',
-      message: isQzConfigurationError(error)
-        ? getQzPublicErrorMessage()
-        : (error?.status ? error.message : 'No se pudo firmar la solicitud.')
+    const response = buildAgentQzSigningErrorResponse({
+      error,
+      agentId: req.printAgent.id_agente,
+      jobId
     });
+    return res.status(response.status).json(response.body);
   }
 });
 
