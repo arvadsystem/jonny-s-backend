@@ -20,7 +20,13 @@ const payload = {
 };
 const digestFor = (request) => crypto.createHash('sha256').update(canonicalizeAgentQzRequest(request), 'utf8').digest('hex');
 const sha256 = (value) => crypto.createHash('sha256').update(value).digest('hex');
-const qzOptions = (jobId) => ({ copies: 1, margins: 0, units: 'mm', jobName: `Jonny-${jobId}` });
+const qzOptions = (jobId) => ({
+  copies: 1,
+  jobName: `Jonny-${jobId}`,
+  margins: 0,
+  scaleContent: false,
+  units: 'mm'
+});
 const clone = (value) => JSON.parse(JSON.stringify(value));
 
 const facturaPdfBytes = Buffer.from('%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\n%%EOF\n', 'utf8');
@@ -43,7 +49,7 @@ const facturaDataV2 = {
   format: 'pdf',
   flavor: 'base64',
   data: facturaPdfBytes.toString('base64'),
-  options: { pageWidth: 80 }
+  options: { altFontRendering: true, ignoreTransparency: true }
 };
 
 const comandaHtml = '<!doctype html><html><body><h1>COMANDA COCINA</h1><p>2 Alitas</p></body></html>';
@@ -353,6 +359,11 @@ test('payload canonico v2 exige contrato y referencias exactas', () => {
 });
 
 test('firmador QZ acepta exactamente factura PDF oficial y comanda HTML canonica', async () => {
+  assert.deepEqual(facturaDataV2.options, {
+    altFontRendering: true,
+    ignoreTransparency: true
+  });
+  assert.deepEqual(comandaDataV2.options, { pageWidth: 58 });
   const fixtures = [
     { id: 8, currentPayload: facturaPayloadV2, dataItem: facturaDataV2 },
     { id: 9, currentPayload: comandaPayloadV2, dataItem: comandaDataV2 }
@@ -362,6 +373,7 @@ test('firmador QZ acepta exactamente factura PDF oficial y comanda HTML canonica
     const now = Date.now();
     const job = canonicalJob(fixture);
     const request = canonicalPrintRequest({ timestamp: now, jobId: fixture.id, dataItem: fixture.dataItem });
+    assert.equal(request.params.options.scaleContent, false);
     const scopedDb = createSigningDb({ job });
     const result = await authorizeAndSignAgentQzRequest({
       agent,
@@ -413,11 +425,18 @@ test('firmador QZ v2 rechaza formato, flavor, ancho, copias, jobName y opciones 
     (request) => { request.params.data[0].flavor = 'plain'; },
     (request) => { request.params.data[0].options.pageWidth = 58; },
     (request) => { request.params.data[0].options.pageWidth = '80'; },
+    (request) => { request.params.data[0].options.extra = true; },
+    (request) => { request.params.data[0].options.altFontRendering = false; },
+    (request) => { request.params.data[0].options.ignoreTransparency = false; },
+    (request) => { delete request.params.data[0].options.altFontRendering; },
+    (request) => { delete request.params.data[0].options.ignoreTransparency; },
     (request) => { request.params.options.copies = 2; },
     (request) => { request.params.options.copies = '1'; },
     (request) => { request.params.options.jobName = 'Jonny-otro'; },
     (request) => { request.params.options.margins = 1; },
     (request) => { request.params.options.margins = '0'; },
+    (request) => { request.params.options.scaleContent = true; },
+    (request) => { delete request.params.options.scaleContent; },
     (request) => { request.params.options.units = 'in'; },
     (request) => { request.params.options.duplex = true; },
     (request) => { request.params.options.command = 'arbitrario'; }
@@ -426,6 +445,28 @@ test('firmador QZ v2 rechaza formato, flavor, ancho, copias, jobName y opciones 
   for (const mutate of invalidMutations) {
     const request = canonicalPrintRequest({ timestamp: now, dataItem: clone(facturaDataV2) });
     mutate(request);
+    assert.throws(
+      () => validateAgentQzRequest({ request, job, now }),
+      (error) => error.code === 'QZ_SIGN_REQUEST_NOT_RELATED'
+    );
+  }
+});
+
+test('firmador QZ v2 exige solo pageWidth para comanda', () => {
+  const now = Date.now();
+  const job = canonicalJob({ id: 9, currentPayload: comandaPayloadV2 });
+  const accepted = canonicalPrintRequest({ timestamp: now, jobId: 9, dataItem: clone(comandaDataV2) });
+  assert.deepEqual(accepted.params.data[0].options, { pageWidth: 58 });
+  assert.equal(validateAgentQzRequest({ request: accepted, job, now }).call, 'print');
+
+  for (const invalidOptions of [
+    { altFontRendering: true, ignoreTransparency: true },
+    { pageWidth: 58, altFontRendering: true },
+    { pageWidth: 58, ignoreTransparency: true },
+    { pageWidth: 58, extra: true }
+  ]) {
+    const request = canonicalPrintRequest({ timestamp: now, jobId: 9, dataItem: clone(comandaDataV2) });
+    request.params.data[0].options = invalidOptions;
     assert.throws(
       () => validateAgentQzRequest({ request, job, now }),
       (error) => error.code === 'QZ_SIGN_REQUEST_NOT_RELATED'

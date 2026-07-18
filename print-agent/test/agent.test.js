@@ -6,6 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { loadConfig, normalizeQzHost, validateQzCaCertificate } from '../src/config.js';
 import { createApiClient } from '../src/apiClient.js';
+import { validateCanonicalPrintJobData } from '../src/documentRenderer.js';
 import { assertQzHostResolvesLocally, createQzClient, createSecureWebSocketType } from '../src/qzClient.js';
 import { createRunner } from '../src/runner.js';
 import { createPrintStateStore } from '../src/stateStore.js';
@@ -191,7 +192,7 @@ test('documento canonico usa el endpoint autenticado y exclusivo del trabajo', a
     format: 'pdf',
     flavor: 'base64',
     data: Buffer.from('%PDF-1.4\nagent endpoint\n%%EOF').toString('base64'),
-    options: { pageWidth: 80 }
+    options: { altFontRendering: true, ignoreTransparency: true }
   };
   let capturedUrl;
   let capturedOptions;
@@ -351,6 +352,20 @@ test('cliente QZ usa documentos canonicos v2 y conserva discovery, WSS, SHA512 y
     const canonicalPdf = Buffer.from('%PDF-1.4\ncanonical venta ticket\n%%EOF');
     const canonicalPdfBase64 = canonicalPdf.toString('base64');
     const canonicalHtml = '<!doctype html><html><body><h1>COMANDA COCINA</h1><p>VTA-00007</p></body></html>';
+    const canonicalPdfDataItem = {
+      type: 'pixel',
+      format: 'pdf',
+      flavor: 'base64',
+      data: canonicalPdfBase64,
+      options: { altFontRendering: true, ignoreTransparency: true }
+    };
+    const canonicalHtmlDataItem = {
+      type: 'pixel',
+      format: 'html',
+      flavor: 'plain',
+      data: canonicalHtml,
+      options: { pageWidth: 58 }
+    };
     function MockWebSocket(_address, options) { socketOptions = options; }
     Object.assign(MockWebSocket, { CONNECTING: 0, OPEN: 1, CLOSING: 2, CLOSED: 3 });
     const qz = {
@@ -390,22 +405,10 @@ test('cliente QZ usa documentos canonicos v2 y conserva discovery, WSS, SHA512 y
       document: async (jobId) => {
         documentCalls.push(jobId);
         if (jobId === 71) {
-          return {
-            type: 'pixel',
-            format: 'pdf',
-            flavor: 'base64',
-            data: canonicalPdfBase64,
-            options: { pageWidth: 80 }
-          };
+          return canonicalPdfDataItem;
         }
         if (jobId === 72) {
-          return {
-            type: 'pixel',
-            format: 'html',
-            flavor: 'plain',
-            data: canonicalHtml,
-            options: { pageWidth: 58 }
-          };
+          return canonicalHtmlDataItem;
         }
         throw new Error('unexpected document request');
       },
@@ -464,6 +467,34 @@ test('cliente QZ usa documentos canonicos v2 y conserva discovery, WSS, SHA512 y
       }
     };
 
+    for (const invalidPdfOptions of [
+      { pageWidth: 80 },
+      { altFontRendering: false, ignoreTransparency: true },
+      { altFontRendering: true, ignoreTransparency: false },
+      { altFontRendering: true, ignoreTransparency: true, extra: true }
+    ]) {
+      assert.throws(
+        () => validateCanonicalPrintJobData(currentJob.payload, {
+          ...canonicalPdfDataItem,
+          options: invalidPdfOptions
+        }),
+        /PAYLOAD_V2_CANONICAL_INVALID/
+      );
+    }
+    for (const invalidHtmlOptions of [
+      { altFontRendering: true, ignoreTransparency: true },
+      { pageWidth: 80 },
+      { pageWidth: 58, extra: true }
+    ]) {
+      assert.throws(
+        () => validateCanonicalPrintJobData(comandaJob.payload, {
+          ...canonicalHtmlDataItem,
+          options: invalidHtmlOptions
+        }),
+        /PAYLOAD_V2_CANONICAL_INVALID/
+      );
+    }
+
     const prepared = await client.prepare(currentJob);
     new SecureWebSocket('wss://qz-elcarmen.jonnyshn.com:8181');
     await client.dispatch(prepared);
@@ -489,21 +520,24 @@ test('cliente QZ usa documentos canonicos v2 y conserva discovery, WSS, SHA512 y
     assert.equal(Object.prototype.hasOwnProperty.call(comandaJob.payload, 'documento'), false);
     assert.equal(prepared.qzConfig.getPrinter(), 'ZKP8008');
     assert.equal(preparedComanda.qzConfig.getPrinter(), 'Kitchen Printer');
+    assert.deepEqual(prepared.qzConfig.getOptions(), {
+      copies: 1,
+      jobName: 'Jonny-71',
+      margins: 0,
+      scaleContent: false,
+      units: 'mm'
+    });
+    assert.deepEqual(preparedComanda.qzConfig.getOptions(), {
+      copies: 1,
+      jobName: 'Jonny-72',
+      margins: 0,
+      scaleContent: false,
+      units: 'mm'
+    });
     assert.deepEqual(documentCalls, [71, 72]);
-    assert.deepEqual(prepared.data, [{
-      type: 'pixel',
-      format: 'pdf',
-      flavor: 'base64',
-      data: canonicalPdfBase64,
-      options: { pageWidth: 80 }
-    }]);
-    assert.deepEqual(preparedComanda.data, [{
-      type: 'pixel',
-      format: 'html',
-      flavor: 'plain',
-      data: canonicalHtml,
-      options: { pageWidth: 58 }
-    }]);
+    assert.deepEqual(prepared.data, [canonicalPdfDataItem]);
+    assert.deepEqual(preparedComanda.data, [canonicalHtmlDataItem]);
+    assert.equal(Object.hasOwn(prepared.data[0].options, 'pageWidth'), false);
     const preparedPdfContent = Buffer.from(prepared.data[0].data, 'base64');
     assert.equal(preparedPdfContent.length, currentJob.payload.documento_canonico.content_bytes);
     assert.equal(
@@ -538,6 +572,8 @@ test('cliente QZ usa documentos canonicos v2 y conserva discovery, WSS, SHA512 y
     assert.equal(printCalls.length, 2);
     assert.deepEqual(signCalls[1].request.params.data, prepared.data);
     assert.deepEqual(signCalls[3].request.params.data, preparedComanda.data);
+    assert.deepEqual(signCalls[1].request.params.options, prepared.qzConfig.getOptions());
+    assert.deepEqual(signCalls[3].request.params.options, preparedComanda.qzConfig.getOptions());
     assert.deepEqual(printCalls[0][2], []);
     assert.deepEqual(printCalls[0][3], [signCalls[1].request.timestamp]);
     assert.equal(printCalls[0][3][0], signCalls[1].request.timestamp);

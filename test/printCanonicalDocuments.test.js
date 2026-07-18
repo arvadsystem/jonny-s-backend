@@ -129,6 +129,7 @@ const cloneForRequester = (venta, role, esReimpresion = false) => ({
     es_reimpresion: esReimpresion
   }
 });
+const REQUESTER_ROLES = Object.freeze(['root', 'super_admin', 'admin', 'cajero']);
 
 const sha256 = (value) => crypto.createHash('sha256').update(value).digest('hex');
 
@@ -212,21 +213,27 @@ test('VTA-00006 conserva todos los campos del formato oficial en la definicion P
   }
 });
 
-test('VTA-00006 produce el mismo PDF y SHA-256 para solicitantes root y cajero', async () => {
-  const rootBuffer = await buildVentaTicketPdfBuffer(cloneForRequester(facturaFixture, 'ROOT'));
-  await new Promise((resolve) => setTimeout(resolve, 5));
-  const cajeroBuffer = await buildVentaTicketPdfBuffer(cloneForRequester(facturaFixture, 'CAJERO'));
+test('VTA-00006 produce el mismo PDF y SHA-256 para root, super_admin, admin y cajero', async () => {
+  const buffers = [];
+  for (const role of REQUESTER_ROLES) {
+    buffers.push(await buildVentaTicketPdfBuffer(cloneForRequester(facturaFixture, role)));
+  }
 
-  assert.equal(rootBuffer.subarray(0, 5).toString('ascii'), '%PDF-');
-  assert.deepEqual(cajeroBuffer, rootBuffer);
-  assert.equal(sha256(cajeroBuffer), sha256(rootBuffer));
+  const reference = buffers[0];
+  assert.equal(reference.subarray(0, 5).toString('ascii'), '%PDF-');
+  for (const buffer of buffers.slice(1)) {
+    assert.deepEqual(buffer, reference);
+    assert.equal(sha256(buffer), sha256(reference));
+  }
 });
 
-test('VTA-00007 genera la misma comanda completa para root y cajero sin totales monetarios', () => {
-  const rootHtml = buildComandaCocinaHtml(cloneForRequester(comandaFixture, 'ROOT'), { widthMm: 80 });
-  const cajeroHtml = buildComandaCocinaHtml(cloneForRequester(comandaFixture, 'CAJERO'), { widthMm: 80 });
+test('VTA-00007 genera la misma comanda para root, super_admin, admin y cajero sin totales', () => {
+  const documents = REQUESTER_ROLES.map((role) => (
+    buildComandaCocinaHtml(cloneForRequester(comandaFixture, role), { widthMm: 80 })
+  ));
+  const rootHtml = documents[0];
 
-  assert.equal(cajeroHtml, rootHtml);
+  for (const html of documents.slice(1)) assert.equal(html, rootHtml);
   assert.match(rootHtml, /<!doctype html>/i);
   assert.match(rootHtml, /size:\s*80mm auto/);
   assert.match(rootHtml, /width:\s*61\.5mm/);
@@ -292,12 +299,24 @@ test('schema 2 usa PDF/base64 para factura y HTML/plain para comanda', async () 
     { type: pdfDocument.type, format: pdfDocument.format, flavor: pdfDocument.flavor },
     { type: 'pixel', format: 'pdf', flavor: 'base64' }
   );
-  assert.equal(Buffer.from(pdfDocument.data, 'base64').subarray(0, 5).toString('ascii'), '%PDF-');
+  assert.deepEqual(pdfDocument.options, {
+    altFontRendering: true,
+    ignoreTransparency: true
+  });
+  assert.equal(Object.hasOwn(pdfDocument.options, 'pageWidth'), false);
+  const pdfBytes = Buffer.from(pdfDocument.data, 'base64');
+  assert.equal(pdfBytes.subarray(0, 5).toString('ascii'), '%PDF-');
+  assert.equal(pdfBytes.length, initialFactura.documento_canonico.content_bytes);
+  assert.equal(sha256(pdfBytes), initialFactura.documento_canonico.content_sha256);
   assert.deepEqual(
     { type: htmlDocument.type, format: htmlDocument.format, flavor: htmlDocument.flavor },
     { type: 'pixel', format: 'html', flavor: 'plain' }
   );
+  assert.deepEqual(htmlDocument.options, { pageWidth: 80 });
   assert.match(htmlDocument.data, /^<!doctype html>/i);
+  const htmlBytes = Buffer.from(htmlDocument.data, 'utf8');
+  assert.equal(htmlBytes.length, initialComanda.documento_canonico.content_bytes);
+  assert.equal(sha256(htmlBytes), initialComanda.documento_canonico.content_sha256);
 });
 
 test('documento del agente exige trabajo asignado, sucursal y estado con lease activo', async () => {

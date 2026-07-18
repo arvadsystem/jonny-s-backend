@@ -17,13 +17,21 @@ const PAYLOAD_V2_KEYS = Object.freeze([
 const SOURCE_KEYS = Object.freeze(['id_factura', 'id_pedido']);
 const DOCUMENT_KEYS = Object.freeze(['kind', 'format', 'flavor', 'content_sha256', 'content_bytes']);
 const DATA_ITEM_KEYS = Object.freeze(['type', 'format', 'flavor', 'data', 'options']);
-const DATA_OPTIONS_KEYS = Object.freeze(['pageWidth']);
 
 const isPlainObject = (value) => Boolean(value && typeof value === 'object' && !Array.isArray(value));
 const hasExactKeys = (value, expectedKeys) => (
   isPlainObject(value)
   && Object.keys(value).length === expectedKeys.length
   && expectedKeys.every((key) => Object.prototype.hasOwnProperty.call(value, key))
+);
+const buildCanonicalDataOptions = ({ contract, widthMm }) => (
+  contract.format === 'pdf'
+    ? { altFontRendering: true, ignoreTransparency: true }
+    : { pageWidth: widthMm }
+);
+const hasExactOptionValues = (options, expected) => (
+  hasExactKeys(options, Object.keys(expected))
+  && Object.entries(expected).every(([key, value]) => options[key] === value)
 );
 const isPositiveSafeInteger = (value) => Number.isSafeInteger(value) && value > 0;
 const invalidCanonicalDocument = () => {
@@ -88,12 +96,12 @@ const decodeCanonicalContent = ({ contract, data }) => {
 
 export const validateCanonicalPrintJobData = (payload, dataItem) => {
   const contract = validatePayloadV2(payload);
+  const expectedOptions = buildCanonicalDataOptions({ contract, widthMm: payload.ancho_mm });
   if (!hasExactKeys(dataItem, DATA_ITEM_KEYS)
     || dataItem.type !== 'pixel'
     || dataItem.format !== contract.format
     || dataItem.flavor !== contract.flavor
-    || !hasExactKeys(dataItem.options, DATA_OPTIONS_KEYS)
-    || dataItem.options.pageWidth !== payload.ancho_mm) {
+    || !hasExactOptionValues(dataItem.options, expectedOptions)) {
     invalidCanonicalDocument();
   }
 
@@ -109,7 +117,7 @@ export const validateCanonicalPrintJobData = (payload, dataItem) => {
     format: contract.format,
     flavor: contract.flavor,
     data: dataItem.data,
-    options: Object.freeze({ pageWidth: payload.ancho_mm })
+    options: Object.freeze({ ...expectedOptions })
   });
 };
 

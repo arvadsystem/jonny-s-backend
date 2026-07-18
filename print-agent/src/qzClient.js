@@ -134,9 +134,10 @@ export const createQzClient = ({
       const data = [dataItem];
       const qzConfig = qz.configs.create(printer, {
         copies: 1,
+        jobName: `Jonny-${job.id_trabajo}`,
         margins: 0,
-        units: 'mm',
-        jobName: `Jonny-${job.id_trabajo}`
+        scaleContent: false,
+        units: 'mm'
       });
       return { job, qzConfig, data };
     },

@@ -26,7 +26,7 @@ const SAFE_QZ_OPTION_VALUES = Object.freeze({
   printerTray: null,
   rasterize: false,
   rotation: 0,
-  scaleContent: true,
+  scaleContent: false,
   size: null,
   forceRaw: false,
   encoding: null,
@@ -56,6 +56,7 @@ const validatePrintTarget = (params, job) => {
     || params.options.copies !== 1
     || String(params.options.jobName || '') !== `Jonny-${job.id_trabajo}`
     || params.options.margins !== 0
+    || params.options.scaleContent !== false
     || params.options.units !== 'mm') return null;
   for (const [key, expected] of Object.entries(SAFE_QZ_OPTION_VALUES)) {
     if (Object.hasOwn(params.options, key) && params.options[key] !== expected) return null;

@@ -27,6 +27,15 @@ const hasExactKeys = (value, expectedKeys) => (
   && Object.keys(value).length === expectedKeys.length
   && expectedKeys.every((key) => Object.hasOwn(value, key))
 );
+const buildCanonicalDataOptions = ({ contract, widthMm }) => (
+  contract.format === 'pdf'
+    ? { altFontRendering: true, ignoreTransparency: true }
+    : { pageWidth: widthMm }
+);
+const hasExactOptionValues = (options, expected) => (
+  hasExactKeys(options, Object.keys(expected))
+  && Object.entries(expected).every(([key, value]) => options[key] === value)
+);
 const parsePositiveId = (value) => {
   const parsed = Number.parseInt(String(value ?? ''), 10);
   return Number.isInteger(parsed) && parsed > 0 ? parsed : null;
@@ -127,13 +136,13 @@ const decodeCanonicalBase64 = (value) => {
 
 export const validateCanonicalPrintDataItem = (payload, item) => {
   const validation = validateCanonicalPrintPayload(payload);
+  const expectedOptions = validation.ok ? buildCanonicalDataOptions(validation) : null;
   if (!validation.ok
     || !hasExactKeys(item, DATA_ITEM_KEYS)
     || item.type !== 'pixel'
     || item.format !== validation.contract.format
     || item.flavor !== validation.contract.flavor
-    || !hasExactKeys(item.options, ['pageWidth'])
-    || item.options.pageWidth !== validation.widthMm) {
+    || !hasExactOptionValues(item.options, expectedOptions)) {
     return null;
   }
 
@@ -189,7 +198,7 @@ const renderCanonicalDocument = async ({ tipoDocumento, venta, widthMm }) => {
       format: contract.format,
       flavor: contract.flavor,
       data,
-      options: { pageWidth: widthMm }
+      options: buildCanonicalDataOptions({ contract, widthMm })
     }
   };
 };
