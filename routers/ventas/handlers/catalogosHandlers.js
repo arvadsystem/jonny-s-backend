@@ -296,18 +296,29 @@ export const listProductosCatalogoHandler = async (req, res) => {
         p.nombre_producto,
         p.descripcion_producto,
         p.precio,
-        p.cantidad,
-        p.estado,
+        COALESCE(pa.cantidad, 0)::numeric AS cantidad,
+        COALESCE(p.estado, true) AS estado,
         p.id_categoria_producto,
         p.id_tipo_departamento,
         p.id_archivo_imagen_principal,
+        pa.id_almacen,
         al.id_sucursal,
-        a.url_publica AS imagen_principal_url
+        COALESCE(pa.stock_minimo, 0)::numeric AS stock_minimo,
+        ar.url_publica AS imagen_principal_url
       FROM public.productos p
-      LEFT JOIN public.almacenes al ON al.id_almacen = p.id_almacen
-      LEFT JOIN public.archivos a ON a.id_archivo = p.id_archivo_imagen_principal AND (a.estado = true OR a.estado IS NULL)
+      INNER JOIN public.productos_almacenes pa
+        ON pa.id_producto = p.id_producto
+       AND COALESCE(pa.estado, true) = true
+      INNER JOIN public.almacenes al
+        ON al.id_almacen = pa.id_almacen
+       AND COALESCE(al.estado, true) = true
+      INNER JOIN public.sucursales suc
+        ON suc.id_sucursal = al.id_sucursal
+       AND COALESCE(suc.estado, true) = true
+      LEFT JOIN public.archivos ar
+        ON ar.id_archivo = p.id_archivo_imagen_principal
+       AND (ar.estado = true OR ar.estado IS NULL)
       WHERE COALESCE(p.estado, true) = true
-        AND COALESCE(al.estado, true) = true
       ${whereClause}
       ORDER BY p.nombre_producto ASC, p.id_producto ASC
     `;
