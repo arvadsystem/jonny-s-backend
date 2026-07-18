@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import { renderPrintJobHtml } from '../print-agent/src/documentRenderer.js';
-import { claimPrintJobs, transitionPrintJob } from '../services/printQueueService.js';
+import { claimPrintJobs, transitionPrintJob, validatePrintPayload } from '../services/printQueueService.js';
 import {
   authorizeAndSignAgentQzRequest,
   canonicalizeAgentQzRequest,
@@ -19,6 +19,78 @@ const payload = {
   documento: { titulo: 'QA', items: [{ cantidad: 1, descripcion: 'Combo', total: 99 }], total: 99 }
 };
 const digestFor = (request) => crypto.createHash('sha256').update(canonicalizeAgentQzRequest(request), 'utf8').digest('hex');
+const sha256 = (value) => crypto.createHash('sha256').update(value).digest('hex');
+const qzOptions = (jobId) => ({ copies: 1, margins: 0, units: 'mm', jobName: `Jonny-${jobId}` });
+const clone = (value) => JSON.parse(JSON.stringify(value));
+
+const facturaPdfBytes = Buffer.from('%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\n%%EOF\n', 'utf8');
+const facturaPayloadV2 = {
+  schema_version: 2,
+  tipo_documento: 'factura',
+  impresora_logica: 'factura',
+  ancho_mm: 80,
+  source: { id_factura: 6, id_pedido: 7 },
+  documento_canonico: {
+    kind: 'venta_ticket_pdf',
+    format: 'pdf',
+    flavor: 'base64',
+    content_sha256: sha256(facturaPdfBytes),
+    content_bytes: facturaPdfBytes.length
+  }
+};
+const facturaDataV2 = {
+  type: 'pixel',
+  format: 'pdf',
+  flavor: 'base64',
+  data: facturaPdfBytes.toString('base64'),
+  options: { pageWidth: 80 }
+};
+
+const comandaHtml = '<!doctype html><html><body><h1>COMANDA COCINA</h1><p>2 Alitas</p></body></html>';
+const comandaHtmlBytes = Buffer.from(comandaHtml, 'utf8');
+const comandaPayloadV2 = {
+  schema_version: 2,
+  tipo_documento: 'comanda',
+  impresora_logica: 'cocina',
+  ancho_mm: 58,
+  source: { id_factura: 7, id_pedido: 8 },
+  documento_canonico: {
+    kind: 'comanda_cocina_html',
+    format: 'html',
+    flavor: 'plain',
+    content_sha256: sha256(comandaHtmlBytes),
+    content_bytes: comandaHtmlBytes.length
+  }
+};
+const comandaDataV2 = {
+  type: 'pixel',
+  format: 'html',
+  flavor: 'plain',
+  data: comandaHtml,
+  options: { pageWidth: 58 }
+};
+
+const canonicalJob = ({ id = 8, currentPayload = facturaPayloadV2 } = {}) => ({
+  id_trabajo: id,
+  id_sucursal: agent.id_sucursal,
+  id_agente_tomado: agent.id_agente,
+  tipo_documento: currentPayload.tipo_documento,
+  estado: 'confirmacion_pendiente',
+  payload: currentPayload,
+  id_factura: currentPayload.source.id_factura,
+  id_pedido: currentPayload.source.id_pedido,
+  lease_active: false
+});
+
+const canonicalPrintRequest = ({ timestamp, jobId = 8, dataItem = facturaDataV2 } = {}) => ({
+  call: 'print',
+  params: {
+    printer: { name: 'QA Printer' },
+    options: qzOptions(jobId),
+    data: [dataItem]
+  },
+  timestamp
+});
 
 const createTransactionalDb = (queryHandler) => {
   const calls = [];
@@ -36,16 +108,31 @@ const allowedPrintRequest = (timestamp, jobId = 8, html = renderPrintJobHtml(pay
   call: 'print',
   params: {
     printer: { name: 'QA Printer' },
-    options: { copies: 1, jobName: `Jonny-${jobId}` },
+    options: qzOptions(jobId),
     data: [{ type: 'pixel', format: 'html', flavor: 'plain', data: html, options: { pageWidth: 80 } }]
   },
   timestamp
 });
 
-const createSigningDb = ({ jobState = 'confirmacion_pendiente', existing = null, priorPrint = false, findCount = 0 } = {}) => (
+const createSigningDb = ({
+  jobState = 'confirmacion_pendiente',
+  existing = null,
+  priorPrint = false,
+  findCount = 0,
+  job = null
+} = {}) => (
   createTransactionalDb(async (sql) => {
     if (sql.includes('FROM public.trabajos_impresion')) {
-      return { rows: [{ id_trabajo: 8, id_sucursal: 9, id_agente_tomado: agent.id_agente, estado: jobState, payload }] };
+      return {
+        rows: [{
+          id_trabajo: 8,
+          id_sucursal: 9,
+          id_agente_tomado: agent.id_agente,
+          estado: jobState,
+          payload,
+          ...job
+        }]
+      };
     }
     if (sql.includes('SELECT signature')) return { rows: existing ? [{ signature: existing }] : [] };
     if (sql.includes("llamada='print'")) return { rows: priorPrint ? [{ exists: 1 }] : [] };
@@ -240,6 +327,165 @@ test('firma QZ exige el HTML determinista almacenado en el trabajo', async () =>
     () => authorizeAndSignAgentQzRequest({ agent, jobId: 8, request, digest: digestFor(request), db: createSigningDb().db, now, signer: async () => 'sig' }),
     (error) => error.code === 'QZ_SIGN_REQUEST_NOT_RELATED'
   );
+});
+
+test('payload canonico v2 exige contrato y referencias exactas', () => {
+  assert.equal(validatePrintPayload(facturaPayloadV2).ok, true);
+  assert.equal(validatePrintPayload(comandaPayloadV2).ok, true);
+
+  const invalidPayloads = [
+    { ...clone(facturaPayloadV2), extra: true },
+    { ...clone(facturaPayloadV2), schema_version: '2' },
+    { ...clone(facturaPayloadV2), ancho_mm: '80' },
+    { ...clone(facturaPayloadV2), impresora_logica: 'cocina' },
+    { ...clone(facturaPayloadV2), source: { ...facturaPayloadV2.source, extra: true } },
+    { ...clone(facturaPayloadV2), source: { id_factura: '6', id_pedido: 7 } },
+    {
+      ...clone(facturaPayloadV2),
+      documento_canonico: { ...facturaPayloadV2.documento_canonico, extra: true }
+    },
+    {
+      ...clone(facturaPayloadV2),
+      documento_canonico: { ...facturaPayloadV2.documento_canonico, content_bytes: (2 * 1024 * 1024) + 1 }
+    }
+  ];
+  for (const invalidPayload of invalidPayloads) assert.equal(validatePrintPayload(invalidPayload).ok, false);
+});
+
+test('firmador QZ acepta exactamente factura PDF oficial y comanda HTML canonica', async () => {
+  const fixtures = [
+    { id: 8, currentPayload: facturaPayloadV2, dataItem: facturaDataV2 },
+    { id: 9, currentPayload: comandaPayloadV2, dataItem: comandaDataV2 }
+  ];
+
+  for (const fixture of fixtures) {
+    const now = Date.now();
+    const job = canonicalJob(fixture);
+    const request = canonicalPrintRequest({ timestamp: now, jobId: fixture.id, dataItem: fixture.dataItem });
+    const scopedDb = createSigningDb({ job });
+    const result = await authorizeAndSignAgentQzRequest({
+      agent,
+      jobId: fixture.id,
+      request,
+      digest: digestFor(request),
+      db: scopedDb.db,
+      now,
+      signer: async () => `sig-${fixture.currentPayload.tipo_documento}`
+    });
+    assert.equal(result.signature, `sig-${fixture.currentPayload.tipo_documento}`);
+    assert.equal(result.idempotent, false);
+    const jobSelect = scopedDb.calls.find((call) => call.sql.includes('FROM public.trabajos_impresion'));
+    assert.deepEqual(jobSelect.params, [fixture.id, agent.id_sucursal, agent.id_agente]);
+    assert.equal(scopedDb.calls.filter((call) => call.sql.includes('INSERT INTO public.firmas_qz_agente_solicitudes')).length, 1);
+  }
+});
+
+test('firmador QZ rechaza contenido canonico v2 alterado', () => {
+  const now = Date.now();
+  const facturaJob = canonicalJob();
+  const alteredPdf = {
+    ...facturaDataV2,
+    data: Buffer.from('%PDF-1.4\ncontenido alterado\n%%EOF\n', 'utf8').toString('base64')
+  };
+  const alteredInvoiceRequest = canonicalPrintRequest({ timestamp: now, dataItem: alteredPdf });
+  assert.throws(
+    () => validateAgentQzRequest({ request: alteredInvoiceRequest, job: facturaJob, now }),
+    (error) => error.code === 'QZ_SIGN_REQUEST_NOT_RELATED'
+  );
+
+  const comandaJob = canonicalJob({ id: 9, currentPayload: comandaPayloadV2 });
+  const alteredHtmlRequest = canonicalPrintRequest({
+    timestamp: now,
+    jobId: 9,
+    dataItem: { ...comandaDataV2, data: `${comandaHtml}<p>ALTERADO</p>` }
+  });
+  assert.throws(
+    () => validateAgentQzRequest({ request: alteredHtmlRequest, job: comandaJob, now }),
+    (error) => error.code === 'QZ_SIGN_REQUEST_NOT_RELATED'
+  );
+});
+
+test('firmador QZ v2 rechaza formato, flavor, ancho, copias, jobName y opciones inseguras', () => {
+  const now = Date.now();
+  const job = canonicalJob();
+  const invalidMutations = [
+    (request) => { request.params.data[0].format = 'html'; },
+    (request) => { request.params.data[0].flavor = 'plain'; },
+    (request) => { request.params.data[0].options.pageWidth = 58; },
+    (request) => { request.params.data[0].options.pageWidth = '80'; },
+    (request) => { request.params.options.copies = 2; },
+    (request) => { request.params.options.copies = '1'; },
+    (request) => { request.params.options.jobName = 'Jonny-otro'; },
+    (request) => { request.params.options.margins = 1; },
+    (request) => { request.params.options.margins = '0'; },
+    (request) => { request.params.options.units = 'in'; },
+    (request) => { request.params.options.duplex = true; },
+    (request) => { request.params.options.command = 'arbitrario'; }
+  ];
+
+  for (const mutate of invalidMutations) {
+    const request = canonicalPrintRequest({ timestamp: now, dataItem: clone(facturaDataV2) });
+    mutate(request);
+    assert.throws(
+      () => validateAgentQzRequest({ request, job, now }),
+      (error) => error.code === 'QZ_SIGN_REQUEST_NOT_RELATED'
+    );
+  }
+});
+
+test('v2 conserva idempotencia, maximo una firma print y aislamiento por sucursal', async () => {
+  const now = Date.now();
+  const job = canonicalJob();
+  const request = canonicalPrintRequest({ timestamp: now });
+  let signerCalls = 0;
+  const idempotentDb = createSigningDb({ job, existing: 'stored-v2-signature' });
+  const idempotent = await authorizeAndSignAgentQzRequest({
+    agent,
+    jobId: job.id_trabajo,
+    request,
+    digest: digestFor(request),
+    db: idempotentDb.db,
+    now,
+    signer: async () => { signerCalls += 1; return 'new-signature'; }
+  });
+  assert.equal(idempotent.signature, 'stored-v2-signature');
+  assert.equal(idempotent.idempotent, true);
+  assert.equal(signerCalls, 0);
+
+  await assert.rejects(
+    () => authorizeAndSignAgentQzRequest({
+      agent,
+      jobId: job.id_trabajo,
+      request,
+      digest: digestFor(request),
+      db: createSigningDb({ job, priorPrint: true }).db,
+      now,
+      signer: async () => 'must-not-sign'
+    }),
+    (error) => error.code === 'QZ_SIGN_PRINT_ALREADY_AUTHORIZED'
+  );
+
+  const wrongBranchAgent = { ...agent, id_sucursal: 10 };
+  const branchDb = createTransactionalDb(async (sql, params) => {
+    if (sql.includes('FROM public.trabajos_impresion')) {
+      return { rows: params[1] === agent.id_sucursal ? [job] : [] };
+    }
+    return { rows: [] };
+  });
+  await assert.rejects(
+    () => authorizeAndSignAgentQzRequest({
+      agent: wrongBranchAgent,
+      jobId: job.id_trabajo,
+      request,
+      digest: digestFor(request),
+      db: branchDb.db,
+      now,
+      signer: async () => 'must-not-sign'
+    }),
+    (error) => error.code === 'QZ_SIGN_JOB_NOT_ACTIVE'
+  );
+  const scopedSelect = branchDb.calls.find((call) => call.sql.includes('FROM public.trabajos_impresion'));
+  assert.deepEqual(scopedSelect.params, [job.id_trabajo, wrongBranchAgent.id_sucursal, wrongBranchAgent.id_agente]);
 });
 
 test('reintento identico devuelve firma almacenada sin volver a firmar', async () => {

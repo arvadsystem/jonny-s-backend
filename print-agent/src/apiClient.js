@@ -24,6 +24,7 @@ export const createApiClient = ({ config, fetchImpl = fetch }) => {
     complete: (id) => request(`/jobs/${id}/complete`, { method: 'POST', body: {} }),
     fail: (id, error) => request(`/jobs/${id}/fail`, { method: 'POST', body: { error: String(error || '').slice(0, 1000) } }),
     renew: (id) => request(`/jobs/${id}/lease`, { method: 'POST', body: { lease_seconds: config.leaseSeconds } }),
+    document: async (id) => (await request(`/jobs/${id}/document`)).document,
     certificate: async () => (await request('/qz/certificate')).certificate,
     sign: async (jobId, qzRequest, digest) => request('/qz/sign', {
       method: 'POST',

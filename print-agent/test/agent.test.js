@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import crypto from 'node:crypto';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -184,6 +185,35 @@ test('claim del agente solicita exactamente un trabajo', async () => {
   assert.equal(requestBody.limit, 1);
 });
 
+test('documento canonico usa el endpoint autenticado y exclusivo del trabajo', async () => {
+  const expectedDocument = {
+    type: 'pixel',
+    format: 'pdf',
+    flavor: 'base64',
+    data: Buffer.from('%PDF-1.4\nagent endpoint\n%%EOF').toString('base64'),
+    options: { pageWidth: 80 }
+  };
+  let capturedUrl;
+  let capturedOptions;
+  const api = createApiClient({
+    config,
+    fetchImpl: async (url, options) => {
+      capturedUrl = url;
+      capturedOptions = options;
+      return { ok: true, json: async () => ({ document: expectedDocument }) };
+    }
+  });
+
+  const document = await api.document(71);
+
+  assert.equal(capturedUrl, `${config.apiBaseUrl}/api/print-agent/jobs/71/document`);
+  assert.equal(capturedOptions.method, 'GET');
+  assert.equal(capturedOptions.headers.Authorization, `Bearer ${config.token}`);
+  assert.equal(capturedOptions.headers['X-Print-Agent-Id'], config.agentId);
+  assert.equal(capturedOptions.body, undefined);
+  assert.deepEqual(document, expectedDocument);
+});
+
 test('localhost queda permitido cuando el certificado coincide y DNS devuelve loopback', async () => {
   class LocalhostCertificate {
     checkHost(host) { return host === 'localhost' ? 'localhost' : undefined; }
@@ -302,7 +332,7 @@ test('WebSocket QZ exige WSS, mantiene rejectUnauthorized=true y carga CA explic
   assert.equal(capturedOptions.ca.toString(), 'test-ca');
 });
 
-test('cliente QZ omite query al listar, localiza ZKP8008 y conserva WSS, SHA512 y print', async () => {
+test('cliente QZ usa documentos canonicos v2 y conserva discovery, WSS, SHA512 y timestamps de print', async () => {
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'jonnys-qz-client-'));
   const caPath = path.join(tempDir, 'root-ca.crt');
   await fs.writeFile(caPath, 'explicit-test-ca', 'utf8');
@@ -313,10 +343,14 @@ test('cliente QZ omite query al listar, localiza ZKP8008 y conserva WSS, SHA512 
     let signatureAlgorithm;
     let signaturePromise;
     let socketOptions;
-    let availablePrinters = ['ZKP8008'];
+    let availablePrinters = ['ZKP8008', 'Kitchen Printer'];
     const findCalls = [];
     const signCalls = [];
     const printCalls = [];
+    const documentCalls = [];
+    const canonicalPdf = Buffer.from('%PDF-1.4\ncanonical venta ticket\n%%EOF');
+    const canonicalPdfBase64 = canonicalPdf.toString('base64');
+    const canonicalHtml = '<!doctype html><html><body><h1>COMANDA COCINA</h1><p>VTA-00007</p></body></html>';
     function MockWebSocket(_address, options) { socketOptions = options; }
     Object.assign(MockWebSocket, { CONNECTING: 0, OPEN: 1, CLOSING: 2, CLOSED: 3 });
     const qz = {
@@ -353,6 +387,28 @@ test('cliente QZ omite query al listar, localiza ZKP8008 y conserva WSS, SHA512 
       }
     };
     const api = {
+      document: async (jobId) => {
+        documentCalls.push(jobId);
+        if (jobId === 71) {
+          return {
+            type: 'pixel',
+            format: 'pdf',
+            flavor: 'base64',
+            data: canonicalPdfBase64,
+            options: { pageWidth: 80 }
+          };
+        }
+        if (jobId === 72) {
+          return {
+            type: 'pixel',
+            format: 'html',
+            flavor: 'plain',
+            data: canonicalHtml,
+            options: { pageWidth: 58 }
+          };
+        }
+        throw new Error('unexpected document request');
+      },
       sign: async (jobId, request, digest) => {
         signCalls.push({ jobId, request, digest });
         return { signature: `signed:${digest}` };
@@ -361,7 +417,7 @@ test('cliente QZ omite query al listar, localiza ZKP8008 y conserva WSS, SHA512 
     const client = createQzClient({
       config: {
         qzHost: 'qz-elcarmen.jonnyshn.com', qzSecurePort: 8181, qzCaCertPath: caPath,
-        printerMap: { factura: 'ZKP8008' }
+        printerMap: { factura: 'ZKP8008', cocina: 'Kitchen Printer' }
       },
       api,
       qz,
@@ -374,15 +430,48 @@ test('cliente QZ omite query al listar, localiza ZKP8008 y conserva WSS, SHA512 
     const currentJob = {
       id_trabajo: 71,
       tipo_documento: 'factura',
-      payload: { schema_version: 1, documento: { items: [], total: 0 } }
+      payload: {
+        schema_version: 2,
+        tipo_documento: 'factura',
+        impresora_logica: 'factura',
+        ancho_mm: 80,
+        source: { id_factura: 7, id_pedido: null },
+        documento_canonico: {
+          kind: 'venta_ticket_pdf',
+          format: 'pdf',
+          flavor: 'base64',
+          content_sha256: crypto.createHash('sha256').update(canonicalPdf).digest('hex'),
+          content_bytes: canonicalPdf.length
+        }
+      }
+    };
+    const comandaJob = {
+      id_trabajo: 72,
+      tipo_documento: 'comanda',
+      payload: {
+        schema_version: 2,
+        tipo_documento: 'comanda',
+        impresora_logica: 'cocina',
+        ancho_mm: 58,
+        source: { id_factura: 7, id_pedido: 19 },
+        documento_canonico: {
+          kind: 'comanda_cocina_html',
+          format: 'html',
+          flavor: 'plain',
+          content_sha256: crypto.createHash('sha256').update(canonicalHtml, 'utf8').digest('hex'),
+          content_bytes: Buffer.byteLength(canonicalHtml, 'utf8')
+        }
+      }
     };
 
     const prepared = await client.prepare(currentJob);
     new SecureWebSocket('wss://qz-elcarmen.jonnyshn.com:8181');
     await client.dispatch(prepared);
+    const preparedComanda = await client.prepare(comandaJob);
+    await client.dispatch(preparedComanda);
     availablePrinters = ['Otra impresora'];
     await assert.rejects(
-      client.prepare({ ...currentJob, id_trabajo: 72 }),
+      client.prepare({ ...currentJob, id_trabajo: 73 }),
       /IMPRESORA_NO_ENCONTRADA:factura/
     );
 
@@ -396,22 +485,65 @@ test('cliente QZ omite query al listar, localiza ZKP8008 y conserva WSS, SHA512 
     assert.equal(socketOptions.rejectUnauthorized, true);
     assert.equal(socketOptions.ca.toString(), 'explicit-test-ca');
     assert.equal(signatureAlgorithm, 'SHA512');
+    assert.equal(Object.prototype.hasOwnProperty.call(currentJob.payload, 'documento'), false);
+    assert.equal(Object.prototype.hasOwnProperty.call(comandaJob.payload, 'documento'), false);
     assert.equal(prepared.qzConfig.getPrinter(), 'ZKP8008');
-    assert.equal(findCalls.length, 2);
+    assert.equal(preparedComanda.qzConfig.getPrinter(), 'Kitchen Printer');
+    assert.deepEqual(documentCalls, [71, 72]);
+    assert.deepEqual(prepared.data, [{
+      type: 'pixel',
+      format: 'pdf',
+      flavor: 'base64',
+      data: canonicalPdfBase64,
+      options: { pageWidth: 80 }
+    }]);
+    assert.deepEqual(preparedComanda.data, [{
+      type: 'pixel',
+      format: 'html',
+      flavor: 'plain',
+      data: canonicalHtml,
+      options: { pageWidth: 58 }
+    }]);
+    const preparedPdfContent = Buffer.from(prepared.data[0].data, 'base64');
+    assert.equal(preparedPdfContent.length, currentJob.payload.documento_canonico.content_bytes);
+    assert.equal(
+      crypto.createHash('sha256').update(preparedPdfContent).digest('hex'),
+      currentJob.payload.documento_canonico.content_sha256
+    );
+    assert.equal(Buffer.byteLength(preparedComanda.data[0].data, 'utf8'), comandaJob.payload.documento_canonico.content_bytes);
+    assert.equal(
+      crypto.createHash('sha256').update(preparedComanda.data[0].data, 'utf8').digest('hex'),
+      comandaJob.payload.documento_canonico.content_sha256
+    );
+    assert.equal(findCalls.length, 3);
     assert.equal(findCalls[0][0], undefined);
     assert.equal(findCalls[0][1], undefined);
     assert.equal(findCalls[0][2], signCalls[0].request.timestamp);
     assert.equal(findCalls[1][0], undefined);
     assert.equal(findCalls[1][1], undefined);
     assert.equal(findCalls[1][2], signCalls[2].request.timestamp);
+    assert.equal(findCalls[2][0], undefined);
+    assert.equal(findCalls[2][1], undefined);
+    assert.equal(findCalls[2][2], signCalls[4].request.timestamp);
     assert.deepEqual(signCalls[0].request.params, {});
     assert.deepEqual(signCalls[2].request.params, {});
+    assert.deepEqual(signCalls[4].request.params, {});
     assert.deepEqual(signCalls.map(({ jobId, request, digest }) => ({ jobId, call: request.call, digest })), [
       { jobId: 71, call: 'printers.find', digest: 'find-digest' },
       { jobId: 71, call: 'print', digest: 'print-digest' },
-      { jobId: 72, call: 'printers.find', digest: 'find-digest' }
+      { jobId: 72, call: 'printers.find', digest: 'find-digest' },
+      { jobId: 72, call: 'print', digest: 'print-digest' },
+      { jobId: 73, call: 'printers.find', digest: 'find-digest' }
     ]);
-    assert.equal(printCalls.length, 1);
+    assert.equal(printCalls.length, 2);
+    assert.deepEqual(signCalls[1].request.params.data, prepared.data);
+    assert.deepEqual(signCalls[3].request.params.data, preparedComanda.data);
+    assert.deepEqual(printCalls[0][2], []);
+    assert.deepEqual(printCalls[0][3], [signCalls[1].request.timestamp]);
+    assert.equal(printCalls[0][3][0], signCalls[1].request.timestamp);
+    assert.deepEqual(printCalls[1][2], []);
+    assert.deepEqual(printCalls[1][3], [signCalls[3].request.timestamp]);
+    assert.equal(printCalls[1][3][0], signCalls[3].request.timestamp);
   } finally {
     await fs.rm(tempDir, { recursive: true, force: true });
   }

@@ -1,5 +1,117 @@
+import crypto from 'node:crypto';
+
 const escapeHtml = (value) => String(value ?? '').replace(/[&<>"']/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[char]));
 const money = (value) => `L ${Number(value || 0).toFixed(2)}`;
+
+const PDF_MAX_BYTES = 2 * 1024 * 1024;
+const HTML_MAX_BYTES = 256 * 1024;
+const BASE64_PATTERN = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
+const PAYLOAD_V2_KEYS = Object.freeze([
+  'schema_version',
+  'tipo_documento',
+  'impresora_logica',
+  'ancho_mm',
+  'source',
+  'documento_canonico'
+]);
+const SOURCE_KEYS = Object.freeze(['id_factura', 'id_pedido']);
+const DOCUMENT_KEYS = Object.freeze(['kind', 'format', 'flavor', 'content_sha256', 'content_bytes']);
+const DATA_ITEM_KEYS = Object.freeze(['type', 'format', 'flavor', 'data', 'options']);
+const DATA_OPTIONS_KEYS = Object.freeze(['pageWidth']);
+
+const isPlainObject = (value) => Boolean(value && typeof value === 'object' && !Array.isArray(value));
+const hasExactKeys = (value, expectedKeys) => (
+  isPlainObject(value)
+  && Object.keys(value).length === expectedKeys.length
+  && expectedKeys.every((key) => Object.prototype.hasOwnProperty.call(value, key))
+);
+const isPositiveSafeInteger = (value) => Number.isSafeInteger(value) && value > 0;
+const invalidCanonicalDocument = () => {
+  throw new Error('PAYLOAD_V2_CANONICAL_INVALID');
+};
+
+const validatePayloadV2 = (payload) => {
+  if (!hasExactKeys(payload, PAYLOAD_V2_KEYS) || payload.schema_version !== 2) invalidCanonicalDocument();
+  if (![58, 80].includes(payload.ancho_mm)) invalidCanonicalDocument();
+  if (!hasExactKeys(payload.source, SOURCE_KEYS)
+    || !isPositiveSafeInteger(payload.source.id_factura)
+    || !(payload.source.id_pedido === null || isPositiveSafeInteger(payload.source.id_pedido))) {
+    invalidCanonicalDocument();
+  }
+  if (!hasExactKeys(payload.documento_canonico, DOCUMENT_KEYS)) invalidCanonicalDocument();
+
+  const contracts = {
+    factura: {
+      impresoraLogica: 'factura',
+      kind: 'venta_ticket_pdf',
+      format: 'pdf',
+      flavor: 'base64',
+      maxBytes: PDF_MAX_BYTES
+    },
+    comanda: {
+      impresoraLogica: 'cocina',
+      kind: 'comanda_cocina_html',
+      format: 'html',
+      flavor: 'plain',
+      maxBytes: HTML_MAX_BYTES
+    }
+  };
+  const contract = contracts[payload.tipo_documento];
+  if (!contract
+    || payload.impresora_logica !== contract.impresoraLogica
+    || payload.documento_canonico.kind !== contract.kind
+    || payload.documento_canonico.format !== contract.format
+    || payload.documento_canonico.flavor !== contract.flavor
+    || !/^[a-f0-9]{64}$/.test(payload.documento_canonico.content_sha256)
+    || !isPositiveSafeInteger(payload.documento_canonico.content_bytes)
+    || payload.documento_canonico.content_bytes > contract.maxBytes) {
+    invalidCanonicalDocument();
+  }
+  return contract;
+};
+
+const decodeCanonicalContent = ({ contract, data }) => {
+  if (typeof data !== 'string' || data.length === 0) invalidCanonicalDocument();
+  if (contract.format === 'html') {
+    if (Buffer.byteLength(data, 'utf8') > contract.maxBytes) invalidCanonicalDocument();
+    return Buffer.from(data, 'utf8');
+  }
+  if (data.length > Math.ceil(contract.maxBytes / 3) * 4 || !BASE64_PATTERN.test(data)) {
+    invalidCanonicalDocument();
+  }
+  const decoded = Buffer.from(data, 'base64');
+  if (decoded.toString('base64') !== data || decoded.subarray(0, 5).toString('ascii') !== '%PDF-') {
+    invalidCanonicalDocument();
+  }
+  return decoded;
+};
+
+export const validateCanonicalPrintJobData = (payload, dataItem) => {
+  const contract = validatePayloadV2(payload);
+  if (!hasExactKeys(dataItem, DATA_ITEM_KEYS)
+    || dataItem.type !== 'pixel'
+    || dataItem.format !== contract.format
+    || dataItem.flavor !== contract.flavor
+    || !hasExactKeys(dataItem.options, DATA_OPTIONS_KEYS)
+    || dataItem.options.pageWidth !== payload.ancho_mm) {
+    invalidCanonicalDocument();
+  }
+
+  const content = decodeCanonicalContent({ contract, data: dataItem.data });
+  if (content.length !== payload.documento_canonico.content_bytes || content.length > contract.maxBytes) {
+    invalidCanonicalDocument();
+  }
+  const contentHash = crypto.createHash('sha256').update(content).digest('hex');
+  if (contentHash !== payload.documento_canonico.content_sha256) invalidCanonicalDocument();
+
+  return Object.freeze({
+    type: 'pixel',
+    format: contract.format,
+    flavor: contract.flavor,
+    data: dataItem.data,
+    options: Object.freeze({ pageWidth: payload.ancho_mm })
+  });
+};
 
 export const renderPrintJobHtml = (payload) => {
   if (Number(payload?.schema_version) !== 1 || !payload?.documento) throw new Error('PAYLOAD_NO_SOPORTADO');

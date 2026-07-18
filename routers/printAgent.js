@@ -5,6 +5,10 @@ import { authenticatePrintAgent } from '../services/printAgentAuthService.js';
 import { claimPrintJobs, getPrintJobStatusForAgent, transitionPrintJob } from '../services/printQueueService.js';
 import { authorizeAndSignAgentQzRequest } from '../services/qzAgentSigningService.js';
 import {
+  getCanonicalPrintDocumentForAgent,
+  MAX_AGENT_QZ_SIGN_REQUEST_BYTES
+} from '../services/printJobDocumentService.js';
+import {
   getQzCertificateText,
   getQzPublicErrorMessage,
   isQzConfigurationError,
@@ -144,6 +148,32 @@ router.post('/jobs/:id/complete', transitionHandler('complete'));
 router.post('/jobs/:id/fail', transitionHandler('fail'));
 router.post('/jobs/:id/lease', transitionHandler('renew'));
 
+router.get('/jobs/:id/document', async (req, res) => {
+  const jobId = Number.parseInt(String(req.params.id || ''), 10);
+  if (!Number.isInteger(jobId) || jobId <= 0) {
+    return res.status(400).json({ ok: false, code: 'PRINT_JOB_ID_INVALID', message: 'ID de trabajo invalido.' });
+  }
+  try {
+    const result = await getCanonicalPrintDocumentForAgent({
+      agent: req.printAgent,
+      jobId
+    });
+    res.setHeader('Cache-Control', 'no-store');
+    return res.json({ ok: true, document: result.document });
+  } catch (error) {
+    console.error('[print-agent.document] fallo', {
+      agent_id: req.printAgent.id_agente,
+      job_id: jobId,
+      code: error?.code || null
+    });
+    return res.status(error?.status || 500).json({
+      ok: false,
+      code: error?.status ? error.code : 'PRINT_DOCUMENT_FAILED',
+      message: error?.status ? error.message : 'No se pudo obtener el documento de impresion.'
+    });
+  }
+});
+
 router.get('/qz/certificate', async (req, res) => {
   try {
     return res.json({
@@ -168,7 +198,7 @@ router.post('/qz/sign', async (req, res) => {
   const digest = String(req.body?.digest || '').trim();
   let requestSize = 0;
   try { requestSize = Buffer.byteLength(JSON.stringify(request), 'utf8'); } catch { requestSize = 0; }
-  if (!Number.isInteger(jobId) || jobId <= 0 || !request || !digest || requestSize <= 0 || requestSize > 256 * 1024) {
+  if (!Number.isInteger(jobId) || jobId <= 0 || !request || !digest || requestSize <= 0 || requestSize > MAX_AGENT_QZ_SIGN_REQUEST_BYTES) {
     return res.status(400).json({ ok: false, code: 'QZ_SIGN_REQUEST_INVALID', message: 'Solicitud de firma invalida.' });
   }
   try {

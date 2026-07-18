@@ -2,6 +2,7 @@ import crypto from 'node:crypto';
 import pool from '../config/db-connection.js';
 import { renderPrintJobHtml } from '../print-agent/src/documentRenderer.js';
 import { signQzMessage } from '../routers/ventas/services/qzTraySigningService.js';
+import { validateCanonicalPrintDataItem, validateCanonicalPrintPayload } from './printJobDocumentService.js';
 
 const ALLOWED_CALLS = new Set(['printers.find', 'print']);
 const REQUEST_MAX_AGE_MS = 30_000;
@@ -12,15 +13,72 @@ const isPlainObject = (value) => Boolean(value && typeof value === 'object' && !
 
 const validateFindParams = (params) => isPlainObject(params) && Object.keys(params).length === 0;
 
-const validatePrintParams = (params, job) => {
-  if (!isPlainObject(params) || !isPlainObject(params.printer) || !isPlainObject(params.options)) return null;
+const SAFE_QZ_OPTION_VALUES = Object.freeze({
+  bounds: null,
+  colorType: 'color',
+  density: 0,
+  duplex: false,
+  fallbackDensity: null,
+  interpolation: 'bicubic',
+  legacy: false,
+  orientation: null,
+  paperThickness: null,
+  printerTray: null,
+  rasterize: false,
+  rotation: 0,
+  scaleContent: true,
+  size: null,
+  forceRaw: false,
+  encoding: null,
+  spool: null
+});
+const QZ_PRINT_OPTION_KEYS = new Set([
+  ...Object.keys(SAFE_QZ_OPTION_VALUES),
+  'copies',
+  'jobName',
+  'margins',
+  'units'
+]);
+
+const validatePrintTarget = (params, job) => {
+  if (!isPlainObject(params)
+    || Object.keys(params).length !== 3
+    || !['printer', 'options', 'data'].every((key) => Object.hasOwn(params, key))
+    || !isPlainObject(params.printer)
+    || !isPlainObject(params.options)) return null;
   const printerKeys = Object.keys(params.printer);
   if (printerKeys.length !== 1 || printerKeys[0] !== 'name') return null;
   const printerName = String(params.printer.name || '').trim();
   if (!printerName || printerName.length > 160) return null;
-  if (Number(params.options.copies) !== 1 || String(params.options.jobName || '') !== `Jonny-${job.id_trabajo}`) return null;
+
+  const optionKeys = Object.keys(params.options);
+  if (optionKeys.some((key) => !QZ_PRINT_OPTION_KEYS.has(key))
+    || params.options.copies !== 1
+    || String(params.options.jobName || '') !== `Jonny-${job.id_trabajo}`
+    || params.options.margins !== 0
+    || params.options.units !== 'mm') return null;
+  for (const [key, expected] of Object.entries(SAFE_QZ_OPTION_VALUES)) {
+    if (Object.hasOwn(params.options, key) && params.options[key] !== expected) return null;
+  }
   if (!Array.isArray(params.data) || params.data.length !== 1) return null;
-  const item = params.data[0];
+  return { printerName, item: params.data[0] };
+};
+
+const validatePrintParams = (params, job) => {
+  const target = validatePrintTarget(params, job);
+  if (!target) return null;
+  const { printerName, item } = target;
+
+  if (Number(job.payload?.schema_version) === 2) {
+    const payloadValidation = validateCanonicalPrintPayload(job.payload);
+    if (!payloadValidation.ok
+      || job.tipo_documento !== job.payload.tipo_documento
+      || Number(job.id_factura) !== payloadValidation.idFactura
+      || (job.id_pedido === null ? null : Number(job.id_pedido)) !== payloadValidation.idPedido
+      || !validateCanonicalPrintDataItem(job.payload, item)) return null;
+    return { printerName };
+  }
+
   if (!isPlainObject(item) || item.type !== 'pixel' || item.format !== 'html' || item.flavor !== 'plain') return null;
   if (typeof item.data !== 'string' || Buffer.byteLength(item.data, 'utf8') > 256 * 1024) return null;
   const expectedWidth = Number(job.payload?.ancho_mm) === 58 ? 58 : 80;
@@ -73,7 +131,7 @@ export const authorizeAndSignAgentQzRequest = async ({
   try {
     await client.query('BEGIN');
     const jobResult = await client.query(
-      `SELECT id_trabajo,id_sucursal,id_agente_tomado,estado,payload,
+      `SELECT id_trabajo,id_sucursal,id_agente_tomado,tipo_documento,estado,payload,id_factura,id_pedido,
               (lease_expires_at IS NOT NULL AND lease_expires_at > now()) AS lease_active
        FROM public.trabajos_impresion
        WHERE id_trabajo=$1 AND id_sucursal=$2 AND id_agente_tomado=$3

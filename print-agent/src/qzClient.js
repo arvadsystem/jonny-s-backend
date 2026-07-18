@@ -5,7 +5,7 @@ import { networkInterfaces as getNetworkInterfaces } from 'node:os';
 import qzImport from 'qz-tray';
 import WebSocket from 'ws';
 import { normalizeQzHost } from './config.js';
-import { renderPrintJobHtml } from './documentRenderer.js';
+import { renderPrintJobHtml, validateCanonicalPrintJobData } from './documentRenderer.js';
 
 const normalizeIpAddress = (address) => {
   const value = String(address || '').trim().toLowerCase().split('%', 1)[0];
@@ -122,13 +122,16 @@ export const createQzClient = ({
       const printer = String(config.printerMap[logical] || '').trim();
       if (!printer) throw new Error(`IMPRESORA_LOGICA_NO_CONFIGURADA:${logical}`);
       if (!available.some((name) => String(name).toLowerCase() === printer.toLowerCase())) throw new Error(`IMPRESORA_NO_ENCONTRADA:${logical}`);
-      const data = [{
-        type: 'pixel',
-        format: 'html',
-        flavor: 'plain',
-        data: renderPrintJobHtml(job.payload),
-        options: { pageWidth: Number(job.payload?.ancho_mm) === 58 ? 58 : 80 }
-      }];
+      const dataItem = Number(job.payload?.schema_version) === 2
+        ? validateCanonicalPrintJobData(job.payload, await api.document(job.id_trabajo))
+        : {
+          type: 'pixel',
+          format: 'html',
+          flavor: 'plain',
+          data: renderPrintJobHtml(job.payload),
+          options: { pageWidth: Number(job.payload?.ancho_mm) === 58 ? 58 : 80 }
+        };
+      const data = [dataItem];
       const qzConfig = qz.configs.create(printer, {
         copies: 1,
         margins: 0,
@@ -149,7 +152,7 @@ export const createQzClient = ({
       };
       signingContext = { jobId: job.id_trabajo, request: printRequest };
       try {
-        await qz.print(qzConfig, data, undefined, printRequest.timestamp);
+        await qz.print(qzConfig, data, [], [printRequest.timestamp]);
       } finally {
         signingContext = null;
       }
