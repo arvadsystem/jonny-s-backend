@@ -10,11 +10,7 @@ const MAX_FIND_AUTHORIZATIONS_PER_MINUTE = 5;
 const qzRequestError = (code, message, status = 400) => Object.assign(new Error(message), { code, status });
 const isPlainObject = (value) => Boolean(value && typeof value === 'object' && !Array.isArray(value));
 
-const validateFindParams = (params) => {
-  if (!isPlainObject(params)) return false;
-  const keys = Object.keys(params);
-  return keys.length === 1 && keys[0] === 'query' && params.query === null;
-};
+const validateFindParams = (params) => isPlainObject(params) && Object.keys(params).length === 0;
 
 const validatePrintParams = (params, job) => {
   if (!isPlainObject(params) || !isPlainObject(params.printer) || !isPlainObject(params.options)) return null;

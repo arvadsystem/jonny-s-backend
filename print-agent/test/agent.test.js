@@ -3,9 +3,9 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { loadConfig, validateQzCaCertificate } from '../src/config.js';
+import { loadConfig, normalizeQzHost, validateQzCaCertificate } from '../src/config.js';
 import { createApiClient } from '../src/apiClient.js';
-import { createSecureWebSocketType } from '../src/qzClient.js';
+import { assertQzHostResolvesLocally, createQzClient, createSecureWebSocketType } from '../src/qzClient.js';
 import { createRunner } from '../src/runner.js';
 import { createPrintStateStore } from '../src/stateStore.js';
 
@@ -14,6 +14,18 @@ const config = loadConfig({
   BRANCH_ID: '2', QZ_HOST: 'localhost', QZ_SECURE_PORT: '8181', POLL_INTERVAL_MS: '500',
   HEARTBEAT_INTERVAL_MS: '5000', LEASE_SECONDS: '30', PRINTER_MAP_JSON: '{"factura":"QA Printer"}'
 });
+
+const qzConfigEnv = (host) => ({
+  API_BASE_URL: 'https://qa.example.com', PRINT_AGENT_ID: 'agent-id', PRINT_AGENT_TOKEN: 'x'.repeat(48),
+  BRANCH_ID: '2', QZ_HOST: host, QZ_SECURE_PORT: '8181', PRINTER_MAP_JSON: '{"factura":"QA Printer"}',
+  QZ_CA_CERT_PATH: 'C:/ProgramData/qz/ssl/root-ca.crt'
+});
+
+const certificateFileSystem = {
+  existsSync: () => true,
+  statSync: () => ({ isFile: () => true }),
+  readFileSync: () => 'certificate'
+};
 
 const createStoreFixture = async (prefix) => {
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), prefix));
@@ -172,34 +184,235 @@ test('claim del agente solicita exactamente un trabajo', async () => {
   assert.equal(requestBody.limit, 1);
 });
 
-test('certificado QZ exige hostname localhost y rechaza clave privada', () => {
+test('localhost queda permitido cuando el certificado coincide y DNS devuelve loopback', async () => {
   class LocalhostCertificate {
     checkHost(host) { return host === 'localhost' ? 'localhost' : undefined; }
   }
+  const localhostConfig = loadConfig(qzConfigEnv('LOCALHOST'), {
+    fileSystem: certificateFileSystem,
+    X509CertificateImpl: LocalhostCertificate
+  });
+  assert.equal(localhostConfig.qzHost, 'localhost');
+  await assertQzHostResolvesLocally({
+    host: localhostConfig.qzHost,
+    lookupImpl: async () => [{ address: '::1', family: 6 }],
+    networkInterfacesImpl: () => ({})
+  });
+});
+
+test('hostname QZ personalizado permite certificado coincidente y cualquier resultado DNS local', async () => {
+  class CustomHostCertificate {
+    checkHost(host) { return host === 'qz-elcarmen.jonnyshn.com' ? host : undefined; }
+  }
+  const customConfig = loadConfig(qzConfigEnv('QZ-ELCARMEN.JONNYSHN.COM'), {
+    fileSystem: certificateFileSystem,
+    X509CertificateImpl: CustomHostCertificate
+  });
+  assert.equal(customConfig.qzHost, 'qz-elcarmen.jonnyshn.com');
+
+  let lookupHost;
+  let lookupOptions;
+  const resolved = await assertQzHostResolvesLocally({
+    host: customConfig.qzHost,
+    lookupImpl: async (host, options) => {
+      lookupHost = host;
+      lookupOptions = options;
+      return [
+        { address: '203.0.113.20', family: 4 },
+        { address: '2001:0db8:0:0:0:0:0:1', family: 6 }
+      ];
+    },
+    networkInterfacesImpl: () => ({
+      'Wi-Fi': [{ address: '2001:db8::1', family: 'IPv6', internal: false }]
+    })
+  });
+  assert.equal(lookupHost, 'qz-elcarmen.jonnyshn.com');
+  assert.deepEqual(lookupOptions, { all: true, verbatim: true });
+  assert.deepEqual(resolved, ['203.0.113.20', '2001:db8::1']);
+});
+
+test('hostname QZ se rechaza cuando el certificado no coincide', () => {
   class OtherHostCertificate {
     checkHost() { return undefined; }
   }
-  assert.ok(validateQzCaCertificate({ certificateText: 'certificate', host: 'localhost', X509CertificateImpl: LocalhostCertificate }));
   assert.throws(
-    () => validateQzCaCertificate({ certificateText: 'certificate', host: 'localhost', X509CertificateImpl: OtherHostCertificate }),
+    () => loadConfig(qzConfigEnv('qz-elcarmen.jonnyshn.com'), {
+      fileSystem: certificateFileSystem,
+      X509CertificateImpl: OtherHostCertificate
+    }),
     /QZ_CA_CERT_HOSTNAME/
   );
+});
+
+test('hostname QZ se rechaza cuando todas las IP resueltas son externas', async () => {
+  await assert.rejects(
+    assertQzHostResolvesLocally({
+      host: 'qz-elcarmen.jonnyshn.com',
+      lookupImpl: async () => [
+        { address: '203.0.113.20', family: 4 },
+        { address: '2001:db8:ffff::20', family: 6 }
+      ],
+      networkInterfacesImpl: () => ({
+        'Wi-Fi': [{ address: '192.168.2.90', family: 'IPv4', internal: false }],
+        Ethernet: [{ address: '2001:db8::1%12', family: 'IPv6', internal: false }]
+      })
+    }),
+    /QZ_HOST_NOT_LOCAL/
+  );
+});
+
+test('hostname QZ se rechaza cuando DNS falla', async () => {
+  await assert.rejects(
+    assertQzHostResolvesLocally({
+      host: 'qz-elcarmen.jonnyshn.com',
+      lookupImpl: async () => { throw new Error('ENOTFOUND'); },
+      networkInterfacesImpl: () => ({})
+    }),
+    /QZ_HOST_DNS_LOOKUP_FAILED/
+  );
+});
+
+test('configuracion QZ rechaza IP literales, hostnames invalidos y host personalizado sin CA', () => {
+  assert.throws(() => normalizeQzHost('198.51.100.20'), /CONFIG_INVALID:QZ_HOST/);
+  assert.throws(() => normalizeQzHost('host externo.example.com'), /CONFIG_INVALID:QZ_HOST/);
+  assert.throws(
+    () => loadConfig({ ...qzConfigEnv('externo.example.com'), QZ_CA_CERT_PATH: '' }),
+    /CONFIG_REQUIRED:QZ_CA_CERT_PATH/
+  );
+});
+
+test('certificado QZ rechaza claves privadas', () => {
+  class LocalhostCertificate {
+    checkHost(host) { return host === 'localhost' ? host : undefined; }
+  }
   assert.throws(
     () => validateQzCaCertificate({ certificateText: 'PRIVATE KEY', host: 'localhost', X509CertificateImpl: LocalhostCertificate }),
     /QZ_CA_CERT_MUST_NOT_CONTAIN_PRIVATE_KEY/
   );
-  assert.throws(
-    () => loadConfig({ API_BASE_URL: 'https://qa.example.com', PRINT_AGENT_ID: 'id', PRINT_AGENT_TOKEN: 'token', BRANCH_ID: '2', QZ_HOST: '127.0.0.1', PRINTER_MAP_JSON: '{"factura":"QA"}' }),
-    /QZ_HOST_MUST_BE_LOCALHOST/
-  );
 });
 
-test('WebSocket QZ mantiene rejectUnauthorized=true y CA explicita', () => {
+test('WebSocket QZ exige WSS, mantiene rejectUnauthorized=true y carga CA explicita', () => {
   let capturedOptions;
   function MockWebSocket(_address, options) { capturedOptions = options; }
   Object.assign(MockWebSocket, { CONNECTING: 0, OPEN: 1, CLOSING: 2, CLOSED: 3 });
   const SecureWebSocket = createSecureWebSocketType({ WebSocketImpl: MockWebSocket, ca: Buffer.from('test-ca') });
-  new SecureWebSocket('wss://localhost:8181');
+  assert.throws(() => new SecureWebSocket('ws://localhost:8182'), /QZ_WSS_REQUIRED/);
+  new SecureWebSocket('wss://qz-elcarmen.jonnyshn.com:8181');
   assert.equal(capturedOptions.rejectUnauthorized, true);
   assert.equal(capturedOptions.ca.toString(), 'test-ca');
+});
+
+test('cliente QZ omite query al listar, localiza ZKP8008 y conserva WSS, SHA512 y print', async () => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'jonnys-qz-client-'));
+  const caPath = path.join(tempDir, 'root-ca.crt');
+  await fs.writeFile(caPath, 'explicit-test-ca', 'utf8');
+  try {
+    let active = false;
+    let connectOptions;
+    let SecureWebSocket;
+    let signatureAlgorithm;
+    let signaturePromise;
+    let socketOptions;
+    let availablePrinters = ['ZKP8008'];
+    const findCalls = [];
+    const signCalls = [];
+    const printCalls = [];
+    function MockWebSocket(_address, options) { socketOptions = options; }
+    Object.assign(MockWebSocket, { CONNECTING: 0, OPEN: 1, CLOSING: 2, CLOSED: 3 });
+    const qz = {
+      api: {
+        setPromiseType: () => {},
+        setWebSocketType: (value) => { SecureWebSocket = value; }
+      },
+      security: {
+        setCertificatePromise: () => {},
+        setSignatureAlgorithm: (value) => { signatureAlgorithm = value; },
+        setSignaturePromise: (value) => { signaturePromise = value; }
+      },
+      websocket: {
+        isActive: () => active,
+        connect: async (options) => { connectOptions = options; active = true; },
+        disconnect: async () => { active = false; }
+      },
+      printers: {
+        find: async (...args) => {
+          findCalls.push(args);
+          await signaturePromise('find-digest');
+          return availablePrinters;
+        }
+      },
+      configs: {
+        create: (printer, options) => ({
+          getPrinter: () => printer,
+          getOptions: () => options
+        })
+      },
+      print: async (...args) => {
+        printCalls.push(args);
+        await signaturePromise('print-digest');
+      }
+    };
+    const api = {
+      sign: async (jobId, request, digest) => {
+        signCalls.push({ jobId, request, digest });
+        return { signature: `signed:${digest}` };
+      }
+    };
+    const client = createQzClient({
+      config: {
+        qzHost: 'qz-elcarmen.jonnyshn.com', qzSecurePort: 8181, qzCaCertPath: caPath,
+        printerMap: { factura: 'ZKP8008' }
+      },
+      api,
+      qz,
+      WebSocketImpl: MockWebSocket,
+      lookupImpl: async () => [{ address: '192.168.2.90', family: 4 }],
+      networkInterfacesImpl: () => ({
+        'Wi-Fi': [{ address: '192.168.2.90', family: 'IPv4', internal: false }]
+      })
+    });
+    const currentJob = {
+      id_trabajo: 71,
+      tipo_documento: 'factura',
+      payload: { schema_version: 1, documento: { items: [], total: 0 } }
+    };
+
+    const prepared = await client.prepare(currentJob);
+    new SecureWebSocket('wss://qz-elcarmen.jonnyshn.com:8181');
+    await client.dispatch(prepared);
+    availablePrinters = ['Otra impresora'];
+    await assert.rejects(
+      client.prepare({ ...currentJob, id_trabajo: 72 }),
+      /IMPRESORA_NO_ENCONTRADA:factura/
+    );
+
+    assert.deepEqual(connectOptions, {
+      host: 'qz-elcarmen.jonnyshn.com',
+      usingSecure: true,
+      port: { secure: [8181] },
+      retries: 1,
+      delay: 1
+    });
+    assert.equal(socketOptions.rejectUnauthorized, true);
+    assert.equal(socketOptions.ca.toString(), 'explicit-test-ca');
+    assert.equal(signatureAlgorithm, 'SHA512');
+    assert.equal(prepared.qzConfig.getPrinter(), 'ZKP8008');
+    assert.equal(findCalls.length, 2);
+    assert.equal(findCalls[0][0], undefined);
+    assert.equal(findCalls[0][1], undefined);
+    assert.equal(findCalls[0][2], signCalls[0].request.timestamp);
+    assert.equal(findCalls[1][0], undefined);
+    assert.equal(findCalls[1][1], undefined);
+    assert.equal(findCalls[1][2], signCalls[2].request.timestamp);
+    assert.deepEqual(signCalls[0].request.params, {});
+    assert.deepEqual(signCalls[2].request.params, {});
+    assert.deepEqual(signCalls.map(({ jobId, request, digest }) => ({ jobId, call: request.call, digest })), [
+      { jobId: 71, call: 'printers.find', digest: 'find-digest' },
+      { jobId: 71, call: 'print', digest: 'print-digest' },
+      { jobId: 72, call: 'printers.find', digest: 'find-digest' }
+    ]);
+    assert.equal(printCalls.length, 1);
+  } finally {
+    await fs.rm(tempDir, { recursive: true, force: true });
+  }
 });

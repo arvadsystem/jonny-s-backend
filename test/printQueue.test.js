@@ -6,7 +6,8 @@ import { renderPrintJobHtml } from '../print-agent/src/documentRenderer.js';
 import { claimPrintJobs, transitionPrintJob } from '../services/printQueueService.js';
 import {
   authorizeAndSignAgentQzRequest,
-  canonicalizeAgentQzRequest
+  canonicalizeAgentQzRequest,
+  validateAgentQzRequest
 } from '../services/qzAgentSigningService.js';
 import { buildAgentQzSigningErrorResponse } from '../routers/printAgent.js';
 
@@ -193,6 +194,43 @@ test('dependencia qz-tray 2.2.6 aplica SHA-256 al objeto canonico antes de firma
   assert.match(source, /var signObj = \{[\s\S]*call: obj\.call,[\s\S]*params: obj\.params,[\s\S]*timestamp: obj\.timestamp/);
   assert.match(source, /var hashing = _qz\.tools\.hash\(_qz\.tools\.stringify\(signObj\)\)/);
   assert.match(source, /Change the SHA-256 hashing function used by QZ API/);
+
+  const timestamp = 1_723_456_789_012;
+  const qzCanonical = JSON.stringify({
+    call: 'printers.find',
+    params: { query: undefined },
+    timestamp
+  });
+  const backendRequest = { call: 'printers.find', params: {}, timestamp };
+  assert.equal(qzCanonical, `{"call":"printers.find","params":{},"timestamp":${timestamp}}`);
+  assert.equal(canonicalizeAgentQzRequest(backendRequest), qzCanonical);
+  assert.equal(
+    digestFor(backendRequest),
+    crypto.createHash('sha256').update(qzCanonical, 'utf8').digest('hex')
+  );
+});
+
+test('backend QZ acepta params vacio y rechaza query null o claves adicionales en printers.find', () => {
+  const now = Date.now();
+  const activeJob = { estado: 'imprimiendo', lease_active: true, payload };
+  const accepted = validateAgentQzRequest({
+    request: { call: 'printers.find', params: {}, timestamp: now },
+    job: activeJob,
+    now
+  });
+  assert.equal(accepted.call, 'printers.find');
+  assert.deepEqual(JSON.parse(accepted.canonical).params, {});
+
+  for (const params of [{ query: null }, { extra: true }, { query: undefined }]) {
+    assert.throws(
+      () => validateAgentQzRequest({
+        request: { call: 'printers.find', params, timestamp: now },
+        job: activeJob,
+        now
+      }),
+      (error) => error.code === 'QZ_SIGN_REQUEST_NOT_RELATED'
+    );
+  }
 });
 
 test('firma QZ exige el HTML determinista almacenado en el trabajo', async () => {
@@ -228,7 +266,7 @@ test('print diferente para trabajo ya autorizado es rechazado', async () => {
 
 test('printers.find no colisiona globalmente entre agentes en el mismo milisegundo', async () => {
   const now = Date.now();
-  const request = { call: 'printers.find', params: { query: null }, timestamp: now };
+  const request = { call: 'printers.find', params: {}, timestamp: now };
   const run = async (currentAgent, jobId) => {
     const db = createTransactionalDb(async (sql) => {
       if (sql.includes('FROM public.trabajos_impresion')) return { rows: [{ id_trabajo: jobId, id_sucursal: currentAgent.id_sucursal, id_agente_tomado: currentAgent.id_agente, estado: 'imprimiendo', payload, lease_active: true }] };
@@ -247,7 +285,7 @@ test('printers.find no colisiona globalmente entre agentes en el mismo milisegun
 test('firma QZ rechaza solicitud vencida y llamada no permitida', async () => {
   const now = Date.now();
   for (const [request, code] of [
-    [{ call: 'printers.find', params: { query: null }, timestamp: now - 60_000 }, 'QZ_SIGN_REQUEST_EXPIRED'],
+    [{ call: 'printers.find', params: {}, timestamp: now - 60_000 }, 'QZ_SIGN_REQUEST_EXPIRED'],
     [{ call: 'networking.device', params: {}, timestamp: now }, 'QZ_SIGN_CALL_NOT_ALLOWED']
   ]) {
     await assert.rejects(
