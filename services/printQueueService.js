@@ -1,4 +1,5 @@
 import pool from '../config/db-connection.js';
+import { validateCanonicalPrintPayload } from './printJobDocumentService.js';
 
 export const PRINT_DOCUMENT_TYPES = new Set(['factura', 'comanda', 'caja']);
 const MAX_PAYLOAD_BYTES = 256 * 1024;
@@ -12,13 +13,18 @@ export const validatePrintPayload = (payload) => {
   if (Buffer.byteLength(serialized, 'utf8') > MAX_PAYLOAD_BYTES) {
     return { ok: false, message: 'El payload de impresion excede 256 KB.' };
   }
-  if (Number(payload.schema_version) !== 1 || !PRINT_DOCUMENT_TYPES.has(String(payload.tipo_documento || '').toLowerCase())) {
+  const schemaVersion = Number(payload.schema_version);
+  if (!PRINT_DOCUMENT_TYPES.has(String(payload.tipo_documento || '').toLowerCase())) {
     return { ok: false, message: 'Payload de impresion no soportado.' };
   }
-  if (!payload.documento || typeof payload.documento !== 'object' || Array.isArray(payload.documento)) {
-    return { ok: false, message: 'El documento de impresion es obligatorio.' };
+  if (schemaVersion === 1) {
+    if (!payload.documento || typeof payload.documento !== 'object' || Array.isArray(payload.documento)) {
+      return { ok: false, message: 'El documento de impresion es obligatorio.' };
+    }
+    return { ok: true, value: payload };
   }
-  return { ok: true, value: payload };
+  if (schemaVersion === 2) return validateCanonicalPrintPayload(payload);
+  return { ok: false, message: 'Payload de impresion no soportado.' };
 };
 
 export const enqueuePrintJob = async ({

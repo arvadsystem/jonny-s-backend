@@ -5,6 +5,7 @@ import pdfmake from 'pdfmake';
 const FONT_DIR = fileURLToPath(new URL('../../../node_modules/pdfmake/fonts/Roboto/', import.meta.url));
 const FONT_DIR_PREFIX = path.resolve(FONT_DIR) + path.sep;
 const DEFAULT_FOOTER = 'Gracias por su compra';
+const STABLE_PDF_FALLBACK_DATE = '1970-01-01T00:00:00.000Z';
 
 pdfmake.setUrlAccessPolicy(() => false);
 pdfmake.setLocalAccessPolicy((filePath) => path.resolve(filePath).startsWith(FONT_DIR_PREFIX));
@@ -61,8 +62,8 @@ const hasRealFiscalData = (fiscal = {}, venta = {}) => (
 );
 
 const formatDateParts = (value) => {
-  const date = value ? new Date(value) : new Date();
-  if (Number.isNaN(date.getTime())) return { date: '--', time: '--' };
+  const date = value ? new Date(value) : null;
+  if (!date || Number.isNaN(date.getTime())) return { date: '--', time: '--' };
 
   return {
     date: date.toLocaleDateString('es-HN', {
@@ -77,6 +78,12 @@ const formatDateParts = (value) => {
       minute: '2-digit'
     })
   };
+};
+
+const resolveStablePdfDate = (venta = {}) => {
+  const source = venta.fecha_hora_facturacion || venta.fecha_hora_pedido;
+  const date = source ? new Date(source) : new Date(STABLE_PDF_FALLBACK_DATE);
+  return Number.isNaN(date.getTime()) ? new Date(STABLE_PDF_FALLBACK_DATE) : date;
 };
 
 const resolveTicketWidth = (venta = {}) =>
@@ -386,10 +393,11 @@ const buildDeliveryBlock = (venta, widthMm) => {
   ];
 };
 
-export const buildVentaTicketPdfBuffer = async (venta) => {
+export const buildVentaTicketPdfDefinition = (venta) => {
   const widthMm = resolveTicketWidth(venta);
   const heightMm = estimateHeightMm(venta);
   const ticket = venta?.facturacion?.ticket || {};
+  const stablePdfDate = resolveStablePdfDate(venta);
   const content = [
     ...buildHeader(venta, widthMm),
     ...buildFiscalBlock(venta, widthMm),
@@ -402,12 +410,16 @@ export const buildVentaTicketPdfBuffer = async (venta) => {
     text(ticket.texto_pie_ticket || DEFAULT_FOOTER, { alignment: 'center', margin: [0, 2, 0, 0] })
   ];
 
-  const docDefinition = {
+  return {
     pageSize: {
       width: mmToPt(widthMm),
       height: mmToPt(heightMm)
     },
     pageMargins: resolvePageMargins(widthMm),
+    info: {
+      creationDate: stablePdfDate,
+      modDate: stablePdfDate
+    },
     defaultStyle: {
       font: 'Roboto',
       fontSize: widthMm === 58 ? 6.2 : 7
@@ -415,9 +427,10 @@ export const buildVentaTicketPdfBuffer = async (venta) => {
     styles: {},
     content
   };
-
-  return pdfmake.createPdf(docDefinition).getBuffer();
 };
+
+export const buildVentaTicketPdfBuffer = async (venta) =>
+  pdfmake.createPdf(buildVentaTicketPdfDefinition(venta)).getBuffer();
 
 export const buildVentaTicketPdfFilename = (venta = {}) => {
   const raw = cleanText(venta.codigo_venta || venta.numero_venta || `VTA-${String(venta.id_factura || '').padStart(5, '0')}`);

@@ -188,22 +188,28 @@ export const buscarVentaHandler = async (req, res) => {
   }
 };
 
-export const buildVentaDetailPayload = async (req, {
+export const buildVentaDetailPayloadForScope = async ({
   idFactura,
-  includePrintAssets = false
+  includePrintAssets = false,
+  allowedSucursalIds = [],
+  limitedToLast72Hours = false,
+  idUsuarioDetalle = null,
+  queryRunner = pool
 }) => {
-  const scope = await resolveVentasHistoryScope(req);
-  if (!scope.allowedSucursalIds.length) {
+  const normalizedSucursalIds = (Array.isArray(allowedSucursalIds) ? allowedSucursalIds : [])
+    .map(parseOptionalPositiveInt)
+    .filter(Boolean);
+  if (!normalizedSucursalIds.length) {
     return {
       status: 403,
       body: { error: true, message: 'El empleado no tiene sucursales asignadas.' }
     };
   }
 
-  const headerResult = await fetchVentaDetailHeader(pool, {
+  const headerResult = await fetchVentaDetailHeader(queryRunner, {
     idFactura,
-    limitedToLast72Hours: scope.limitedToLast72Hours,
-    allowedSucursalIds: scope.allowedSucursalIds
+    limitedToLast72Hours,
+    allowedSucursalIds: normalizedSucursalIds
   });
   if (headerResult.rowCount === 0) {
     return {
@@ -214,35 +220,35 @@ export const buildVentaDetailPayload = async (req, {
 
   const venta = headerResult.rows[0];
   const facturacionNormalizada = await normalizarDatosTicketDesdeSnapshot({
-    client: pool,
+    client: queryRunner,
     factura: venta,
     includePrintAssets
   });
   Object.assign(venta, mergeVentaWithFacturacion(venta, facturacionNormalizada));
 
-  const idUsuarioDetalle = parsePositiveInt(req.user?.id_usuario);
-  const reversiones = idUsuarioDetalle
+  const normalizedUsuarioDetalle = parsePositiveInt(idUsuarioDetalle);
+  const reversiones = normalizedUsuarioDetalle
     ? await listFacturaReversiones({
       idFactura: venta.id_factura,
-      idUsuario: idUsuarioDetalle
+      idUsuario: normalizedUsuarioDetalle
     })
     : [];
 
   if (venta.id_pedido) {
-    const pedidoItemsResult = await fetchKitchenSaleDetailRows(pool, venta.id_factura);
+    const pedidoItemsResult = await fetchKitchenSaleDetailRows(queryRunner, venta.id_factura);
     const detalleFacturaExtrasById = await fetchDetalleFacturaExtras(
-      pool,
+      queryRunner,
       pedidoItemsResult.rows.map((row) => row.id_detalle)
     );
     const pedidoItems = buildKitchenSaleDetailItems(pedidoItemsResult.rows).map((item) => ({
       ...item,
       extras: detalleFacturaExtrasById.get(Number(item.id_detalle)) || []
     }));
-    const cuentaDividida = await fetchCuentaDividida(pool, {
+    const cuentaDividida = await fetchCuentaDividida(queryRunner, {
       idFactura: venta.id_factura,
       idPedido: venta.id_pedido
     });
-    const pedidoDeliveryDetail = await fetchPedidoDeliveryDetail(pool, venta.id_pedido);
+    const pedidoDeliveryDetail = await fetchPedidoDeliveryDetail(queryRunner, venta.id_pedido);
     const delivery = pedidoDeliveryDetail.delivery;
 
     return {
@@ -271,16 +277,16 @@ export const buildVentaDetailPayload = async (req, {
     };
   }
 
-  const directItemsResult = await fetchDirectSaleDetailRows(pool, venta.id_factura);
+  const directItemsResult = await fetchDirectSaleDetailRows(queryRunner, venta.id_factura);
   const detalleFacturaExtrasById = await fetchDetalleFacturaExtras(
-    pool,
+    queryRunner,
     directItemsResult.rows.map((row) => row.id_detalle)
   );
   const directItems = buildDirectSaleDetailItems(directItemsResult.rows).map((item) => ({
     ...item,
     extras: detalleFacturaExtrasById.get(Number(item.id_detalle)) || []
   }));
-  const cuentaDividida = await fetchCuentaDividida(pool, {
+  const cuentaDividida = await fetchCuentaDividida(queryRunner, {
     idFactura: venta.id_factura,
     idPedido: venta.id_pedido
   });
@@ -296,6 +302,21 @@ export const buildVentaDetailPayload = async (req, {
       reversiones
     }
   };
+};
+
+export const buildVentaDetailPayload = async (req, {
+  idFactura,
+  includePrintAssets = false
+}) => {
+  const scope = await resolveVentasHistoryScope(req);
+  return buildVentaDetailPayloadForScope({
+    idFactura,
+    includePrintAssets,
+    allowedSucursalIds: scope.allowedSucursalIds,
+    limitedToLast72Hours: scope.limitedToLast72Hours,
+    idUsuarioDetalle: req.user?.id_usuario,
+    queryRunner: pool
+  });
 };
 
 export const getVentaByIdHandler = async (req, res) => {

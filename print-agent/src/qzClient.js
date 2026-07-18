@@ -1,10 +1,58 @@
+import { lookup as dnsLookup } from 'node:dns/promises';
 import fs from 'node:fs';
+import net from 'node:net';
+import { networkInterfaces as getNetworkInterfaces } from 'node:os';
 import qzImport from 'qz-tray';
 import WebSocket from 'ws';
-import { renderPrintJobHtml } from './documentRenderer.js';
+import { normalizeQzHost } from './config.js';
+import { renderPrintJobHtml, validateCanonicalPrintJobData } from './documentRenderer.js';
+
+const normalizeIpAddress = (address) => {
+  const value = String(address || '').trim().toLowerCase().split('%', 1)[0];
+  const family = net.isIP(value);
+  if (family === 4) return value.split('.').map(Number).join('.');
+  if (family !== 6) return null;
+  try { return new URL(`http://[${value}]/`).hostname.slice(1, -1); } catch { return null; }
+};
+
+const isLoopbackAddress = (address) => (
+  address === '::1' || (net.isIP(address) === 4 && address.startsWith('127.'))
+);
+
+export const assertQzHostResolvesLocally = async ({
+  host,
+  lookupImpl = dnsLookup,
+  networkInterfacesImpl = getNetworkInterfaces
+}) => {
+  const normalizedHost = normalizeQzHost(host);
+  let records;
+  try {
+    records = await lookupImpl(normalizedHost, { all: true, verbatim: true });
+  } catch {
+    throw new Error('QZ_HOST_DNS_LOOKUP_FAILED');
+  }
+  const resolvedAddresses = (Array.isArray(records) ? records : [records])
+    .map((record) => normalizeIpAddress(record?.address ?? record))
+    .filter(Boolean);
+  if (resolvedAddresses.length === 0) throw new Error('QZ_HOST_DNS_LOOKUP_FAILED');
+  if (resolvedAddresses.some(isLoopbackAddress)) return resolvedAddresses;
+
+  let interfaces;
+  try { interfaces = networkInterfacesImpl(); } catch { throw new Error('QZ_HOST_LOCAL_INTERFACES_UNAVAILABLE'); }
+  const localAddresses = new Set(
+    Object.values(interfaces || {}).flatMap((entries) => Array.isArray(entries) ? entries : [])
+      .map((entry) => normalizeIpAddress(entry?.address))
+      .filter(Boolean)
+  );
+  if (!resolvedAddresses.some((address) => localAddresses.has(address))) {
+    throw new Error('QZ_HOST_NOT_LOCAL');
+  }
+  return resolvedAddresses;
+};
 
 export const createSecureWebSocketType = ({ WebSocketImpl = WebSocket, ca = null } = {}) => {
   function SecureWebSocket(address) {
+    if (!/^wss:\/\//i.test(String(address))) throw new Error('QZ_WSS_REQUIRED');
     return new WebSocketImpl(address, {
       rejectUnauthorized: true,
       ...(ca ? { ca } : {})
@@ -14,7 +62,14 @@ export const createSecureWebSocketType = ({ WebSocketImpl = WebSocket, ca = null
   return SecureWebSocket;
 };
 
-export const createQzClient = ({ config, api, qz = qzImport?.default || qzImport, WebSocketImpl = WebSocket }) => {
+export const createQzClient = ({
+  config,
+  api,
+  qz = qzImport?.default || qzImport,
+  WebSocketImpl = WebSocket,
+  lookupImpl = dnsLookup,
+  networkInterfacesImpl = getNetworkInterfaces
+}) => {
   let securityConfigured = false;
   let signingContext = null;
   const ca = config.qzCaCertPath ? fs.readFileSync(config.qzCaCertPath) : null;
@@ -33,6 +88,11 @@ export const createQzClient = ({ config, api, qz = qzImport?.default || qzImport
       securityConfigured = true;
     }
     if (!qz.websocket.isActive()) {
+      await assertQzHostResolvesLocally({
+        host: config.qzHost,
+        lookupImpl,
+        networkInterfacesImpl
+      });
       await qz.websocket.connect({
         host: config.qzHost,
         usingSecure: true,
@@ -48,13 +108,13 @@ export const createQzClient = ({ config, api, qz = qzImport?.default || qzImport
       await connect();
       const findRequest = {
         call: 'printers.find',
-        params: { query: null },
+        params: {},
         timestamp: Date.now()
       };
       signingContext = { jobId: job.id_trabajo, request: findRequest };
       let available;
       try {
-        available = await qz.printers.find(null, undefined, findRequest.timestamp);
+        available = await qz.printers.find(undefined, undefined, findRequest.timestamp);
       } finally {
         signingContext = null;
       }
@@ -62,18 +122,22 @@ export const createQzClient = ({ config, api, qz = qzImport?.default || qzImport
       const printer = String(config.printerMap[logical] || '').trim();
       if (!printer) throw new Error(`IMPRESORA_LOGICA_NO_CONFIGURADA:${logical}`);
       if (!available.some((name) => String(name).toLowerCase() === printer.toLowerCase())) throw new Error(`IMPRESORA_NO_ENCONTRADA:${logical}`);
-      const data = [{
-        type: 'pixel',
-        format: 'html',
-        flavor: 'plain',
-        data: renderPrintJobHtml(job.payload),
-        options: { pageWidth: Number(job.payload?.ancho_mm) === 58 ? 58 : 80 }
-      }];
+      const dataItem = Number(job.payload?.schema_version) === 2
+        ? validateCanonicalPrintJobData(job.payload, await api.document(job.id_trabajo))
+        : {
+          type: 'pixel',
+          format: 'html',
+          flavor: 'plain',
+          data: renderPrintJobHtml(job.payload),
+          options: { pageWidth: Number(job.payload?.ancho_mm) === 58 ? 58 : 80 }
+        };
+      const data = [dataItem];
       const qzConfig = qz.configs.create(printer, {
         copies: 1,
+        jobName: `Jonny-${job.id_trabajo}`,
         margins: 0,
-        units: 'mm',
-        jobName: `Jonny-${job.id_trabajo}`
+        scaleContent: false,
+        units: 'mm'
       });
       return { job, qzConfig, data };
     },
@@ -89,7 +153,7 @@ export const createQzClient = ({ config, api, qz = qzImport?.default || qzImport
       };
       signingContext = { jobId: job.id_trabajo, request: printRequest };
       try {
-        await qz.print(qzConfig, data, undefined, printRequest.timestamp);
+        await qz.print(qzConfig, data, [], [printRequest.timestamp]);
       } finally {
         signingContext = null;
       }
