@@ -41,9 +41,18 @@ const invalidCanonicalDocument = () => {
 const validatePayloadV2 = (payload) => {
   if (!hasExactKeys(payload, PAYLOAD_V2_KEYS) || payload.schema_version !== 2) invalidCanonicalDocument();
   if (![58, 80].includes(payload.ancho_mm)) invalidCanonicalDocument();
+  const facturaSourceValid = payload.source?.id_factura === null
+    || isPositiveSafeInteger(payload.source?.id_factura);
+  const pedidoSourceValid = payload.source?.id_pedido === null
+    || isPositiveSafeInteger(payload.source?.id_pedido);
+  const requiredSourcePresent = payload.tipo_documento === 'factura'
+    ? isPositiveSafeInteger(payload.source?.id_factura)
+    : payload.tipo_documento === 'comanda'
+      && (isPositiveSafeInteger(payload.source?.id_factura) || isPositiveSafeInteger(payload.source?.id_pedido));
   if (!hasExactKeys(payload.source, SOURCE_KEYS)
-    || !isPositiveSafeInteger(payload.source.id_factura)
-    || !(payload.source.id_pedido === null || isPositiveSafeInteger(payload.source.id_pedido))) {
+    || !facturaSourceValid
+    || !pedidoSourceValid
+    || !requiredSourcePresent) {
     invalidCanonicalDocument();
   }
   if (!hasExactKeys(payload.documento_canonico, DOCUMENT_KEYS)) invalidCanonicalDocument();

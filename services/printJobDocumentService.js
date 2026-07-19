@@ -1,6 +1,7 @@
 import crypto from 'node:crypto';
 import pool from '../config/db-connection.js';
 import { buildVentaDetailPayloadForScope } from '../routers/ventas/handlers/ventasReadHandlers.js';
+import { buildPedidoKitchenPrintPayload } from '../routers/ventas/services/pedidoKitchenPrintPayloadService.js';
 import { buildVentaTicketPdfBuffer } from '../routers/ventas/services/ventaTicketPdfService.js';
 import { buildComandaCocinaHtml } from './comandaCocinaHtmlService.js';
 
@@ -37,8 +38,9 @@ const hasExactOptionValues = (options, expected) => (
   && Object.entries(expected).every(([key, value]) => options[key] === value)
 );
 const parsePositiveId = (value) => {
-  const parsed = Number.parseInt(String(value ?? ''), 10);
-  return Number.isInteger(parsed) && parsed > 0 ? parsed : null;
+  if (value === null || value === undefined || value === '') return null;
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : null;
 };
 const resolveWidth = (value) => Number(value) === 58 ? 58 : 80;
 const sha256 = (value) => crypto.createHash('sha256').update(value).digest('hex');
@@ -92,17 +94,25 @@ export const validateCanonicalPrintPayload = (payload) => {
     return { ok: false, message: 'Contrato canonico de impresion invalido.' };
   }
 
-  const idFactura = Number.isSafeInteger(payload.source.id_factura) && payload.source.id_factura > 0
-    ? payload.source.id_factura
+  const rawIdFactura = payload.source.id_factura;
+  const rawIdPedido = payload.source.id_pedido;
+  const idFactura = Number.isSafeInteger(rawIdFactura) && rawIdFactura > 0
+    ? rawIdFactura
     : null;
-  const idPedido = payload.source.id_pedido === null
+  const idPedido = rawIdPedido === null
     ? null
-    : (Number.isSafeInteger(payload.source.id_pedido) && payload.source.id_pedido > 0
-      ? payload.source.id_pedido
+    : (Number.isSafeInteger(rawIdPedido) && rawIdPedido > 0
+      ? rawIdPedido
       : null);
+  const facturaFieldValid = rawIdFactura === null || idFactura !== null;
+  const pedidoFieldValid = rawIdPedido === null || idPedido !== null;
+  const sourceValid = tipoDocumento === 'factura'
+    ? idFactura !== null
+    : idFactura !== null || idPedido !== null;
   const document = payload.documento_canonico;
-  if (!idFactura
-    || (payload.source.id_pedido !== null && !idPedido)
+  if (!facturaFieldValid
+    || !pedidoFieldValid
+    || !sourceValid
     || document.kind !== contract.kind
     || document.format !== contract.format
     || document.flavor !== contract.flavor
@@ -207,14 +217,23 @@ export const createCanonicalPrintJobPayload = async ({ tipoDocumento, venta, wid
   const normalizedType = String(tipoDocumento || '').trim().toLowerCase();
   const normalizedWidth = resolveWidth(widthMm);
   const idFactura = parsePositiveId(venta?.id_factura);
-  if (!idFactura) throw printDocumentError('PRINT_DOCUMENT_FACTURA_INVALID', 'La factura del documento es invalida.', 400);
+  const idPedido = parsePositiveId(venta?.id_pedido);
+  const contract = getDocumentContract(normalizedType);
+  if (!contract) {
+    throw printDocumentError('PRINT_DOCUMENT_TYPE_INVALID', 'Tipo de documento canonico invalido.', 400);
+  }
+  if (normalizedType === 'factura' && !idFactura) {
+    throw printDocumentError('PRINT_DOCUMENT_FACTURA_INVALID', 'La factura del documento es invalida.', 400);
+  }
+  if (normalizedType === 'comanda' && !idFactura && !idPedido) {
+    throw printDocumentError('PRINT_DOCUMENT_SOURCE_INVALID', 'El origen de la comanda es invalido.', 400);
+  }
 
   const rendered = await renderCanonicalDocument({
     tipoDocumento: normalizedType,
     venta,
     widthMm: normalizedWidth
   });
-  const contract = getDocumentContract(normalizedType);
   return {
     schema_version: CANONICAL_PRINT_SCHEMA_VERSION,
     tipo_documento: normalizedType,
@@ -222,7 +241,7 @@ export const createCanonicalPrintJobPayload = async ({ tipoDocumento, venta, wid
     ancho_mm: normalizedWidth,
     source: {
       id_factura: idFactura,
-      id_pedido: parsePositiveId(venta?.id_pedido)
+      id_pedido: idPedido
     },
     documento_canonico: rendered.descriptor
   };
@@ -254,7 +273,8 @@ export const getCanonicalPrintDocumentForAgent = async ({
   agent,
   jobId,
   db = pool,
-  loadVenta = null
+  loadVenta = null,
+  loadPedido = null
 }) => {
   const result = await db.query(
     `SELECT id_trabajo,id_sucursal,id_agente_tomado,tipo_documento,estado,payload,id_factura,id_pedido,
@@ -282,19 +302,31 @@ export const getCanonicalPrintDocumentForAgent = async ({
     throw printDocumentError('PRINT_DOCUMENT_JOB_MISMATCH', 'El documento no coincide con el trabajo reclamado.', 409);
   }
 
-  const detailResult = loadVenta
-    ? await loadVenta({ idFactura: validation.idFactura, idSucursal: Number(agent.id_sucursal), includePrintAssets: job.tipo_documento === 'factura' })
-    : await buildVentaDetailPayloadForScope({
-      idFactura: validation.idFactura,
-      includePrintAssets: job.tipo_documento === 'factura',
-      allowedSucursalIds: [Number(agent.id_sucursal)],
-      limitedToLast72Hours: false,
-      idUsuarioDetalle: null,
-      queryRunner: db
-    });
+  let detailResult;
+  if (validation.idFactura) {
+    detailResult = loadVenta
+      ? await loadVenta({ idFactura: validation.idFactura, idSucursal: Number(agent.id_sucursal), includePrintAssets: job.tipo_documento === 'factura' })
+      : await buildVentaDetailPayloadForScope({
+        idFactura: validation.idFactura,
+        includePrintAssets: job.tipo_documento === 'factura',
+        allowedSucursalIds: [Number(agent.id_sucursal)],
+        limitedToLast72Hours: false,
+        idUsuarioDetalle: null,
+        queryRunner: db
+      });
+  } else if (job.tipo_documento === 'comanda' && validation.idPedido) {
+    detailResult = loadPedido
+      ? await loadPedido({
+        idPedido: validation.idPedido,
+        idSucursal: Number(agent.id_sucursal),
+        queryRunner: db
+      })
+      : await buildPedidoKitchenPrintPayload(db, validation.idPedido);
+  }
   const venta = detailResult?.status === 200 ? detailResult.body : detailResult;
   if (!venta
     || parsePositiveId(venta.id_factura) !== validation.idFactura
+    || parsePositiveId(venta.id_pedido) !== validation.idPedido
     || Number(venta.id_sucursal) !== Number(agent.id_sucursal)) {
     throw printDocumentError('PRINT_DOCUMENT_SOURCE_NOT_FOUND', 'No se encontro la fuente autorizada del documento.', 404);
   }

@@ -98,6 +98,7 @@ import {
   buildVentasRpcActor,
   executeVentasRpc
 } from './ventas/services/ventasRpcExecutionService.js';
+import { persistVentaPedidoSnapshotRows } from './ventas/services/ventaPedidoSnapshotPersistenceService.js';
 import {
   hasCuentaDivididaPayload,
   reserveIdempotencyForMode,
@@ -4977,7 +4978,12 @@ const buildVentaPayload = async ({ client, body, userId, sucursalScope, canApply
   };
 };
 
-const persistVentaPedidoSnapshots = async ({ client, idPedido, venta }) => {
+const persistVentaPedidoSnapshots = async ({
+  client,
+  idPedido,
+  venta,
+  skipExisting = false
+}) => {
   const pedidoId = parseOptionalPositiveInt(idPedido);
   if (!pedidoId) {
     throw {
@@ -4987,53 +4993,14 @@ const persistVentaPedidoSnapshots = async ({ client, idPedido, venta }) => {
     };
   }
 
-  await client.query(
-    `
-      INSERT INTO public.pedidos_contexto (
-        id_pedido,
-        id_canal_pedido,
-        id_modalidad_entrega,
-        id_usuario_toma,
-        id_sesion_caja_origen,
-        observacion_contexto
-      )
-      VALUES ($1, $2, $3, $4, $5, $6)
-    `,
-    [
-      pedidoId,
-      venta.contexto.id_canal_pedido,
-      venta.contexto.id_modalidad_entrega,
-      venta.id_usuario,
-      venta.id_sesion_caja,
-      venta.contexto.observacion_contexto
-    ]
-  );
-
   const contactoSnapshot = await resolvePedidoContactoSnapshotForInsert(client, venta.contacto);
-
-  await client.query(
-    `
-      INSERT INTO public.pedidos_contacto (
-        id_pedido,
-        nombre_contacto,
-        telefono_contacto,
-        telefono_normalizado,
-        dni,
-        rtn,
-        correo
-      )
-      VALUES ($1, $2, $3, $4, $5, $6, $7)
-    `,
-    [
-      pedidoId,
-      contactoSnapshot.nombre_contacto,
-      contactoSnapshot.telefono_contacto,
-      contactoSnapshot.telefono_normalizado,
-      contactoSnapshot.dni,
-      contactoSnapshot.rtn,
-      contactoSnapshot.correo
-    ]
-  );
+  await persistVentaPedidoSnapshotRows({
+    client,
+    pedidoId,
+    venta,
+    contactoSnapshot,
+    skipExisting
+  });
 };
 
 const attachVentaSnapshotsToResponse = (response, venta) => {
@@ -9767,6 +9734,20 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
         idempotencyKey,
         requestHash: idempotencyRequestHash,
         requestStartedAt: authContextStart
+      });
+      const idPedidoRpc = parseOptionalPositiveInt(rpcCreateResult.response?.id_pedido);
+      if (!idPedidoRpc) {
+        throw {
+          httpStatus: 500,
+          code: 'VENTAS_RPC_V3_PEDIDO_INVALIDO',
+          publicMessage: 'La venta fue procesada por RPC V3, pero no devolvio un pedido valido.'
+        };
+      }
+      await persistVentaPedidoSnapshots({
+        client,
+        idPedido: idPedidoRpc,
+        venta,
+        skipExisting: true
       });
       const rpcV3ResponseBody = attachVentaSnapshotsToResponse(rpcCreateResult.response, venta);
       const commitStart = ventasPerf.now();

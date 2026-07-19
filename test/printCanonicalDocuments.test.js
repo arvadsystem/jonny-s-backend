@@ -7,10 +7,13 @@ import {
   mmToPt
 } from '../routers/ventas/services/ventaTicketPdfService.js';
 import { buildComandaCocinaHtml } from '../services/comandaCocinaHtmlService.js';
+import { buildVentaKitchenPrintPayload } from '../routers/ventas/handlers/ventasPrintHandlers.js';
+import { buildPedidoKitchenPrintPayload } from '../routers/ventas/services/pedidoKitchenPrintPayloadService.js';
 import {
   createCanonicalPrintJobPayload,
   getCanonicalPrintDocumentForAgent,
-  renderCanonicalPrintJobDocument
+  renderCanonicalPrintJobDocument,
+  validateCanonicalPrintPayload
 } from '../services/printJobDocumentService.js';
 
 const ONE_PIXEL_PNG = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=';
@@ -121,6 +124,22 @@ const comandaFixture = {
     }
   ]
 };
+
+const pendingComandaFixture = {
+  ...structuredClone(comandaFixture),
+  id_factura: null
+};
+
+const COMANDA_RENDER_BASELINES = Object.freeze({
+  58: Object.freeze({
+    bytes: 7161,
+    sha256: '3981b0a1d20b184ca403a52fa94b8b92baa835f6b38f6b48e495eafccce201c1'
+  }),
+  80: Object.freeze({
+    bytes: 7164,
+    sha256: 'f5393514518e2c62b84b19b2eba53b9866a261c2ba0fe042e2b75d551493cdc8'
+  })
+});
 
 const cloneForRequester = (venta, role, esReimpresion = false) => ({
   ...structuredClone(venta),
@@ -256,6 +275,134 @@ test('VTA-00007 genera la misma comanda para root, super_admin, admin y cajero s
   assert.doesNotMatch(rootHtml, /L\s*0\.00/i);
 });
 
+test('comanda prioriza modalidad persistida sin traducirla para todos los canales', () => {
+  const cases = [
+    ['POS', 'CONSUMO_LOCAL'],
+    ['POS', 'RECOGER'],
+    ['POS', 'DELIVERY'],
+    ['WEB', 'CONSUMO_LOCAL'],
+    ['TELEFONO', 'RECOGER'],
+    ['WHATSAPP', 'DELIVERY']
+  ];
+  let referenceStyle = null;
+
+  for (const [canal, modalidad] of cases) {
+    const normalized = buildVentaKitchenPrintPayload({
+      ...structuredClone(comandaFixture),
+      modalidad: 'RECOGER',
+      contexto: {
+        ...comandaFixture.contexto,
+        canal,
+        modalidad
+      }
+    });
+    assert.equal(normalized.modalidad, modalidad);
+    const html = buildComandaCocinaHtml(normalized, { widthMm: 80 });
+    const style = html.match(/<style>([\s\S]*?)<\/style>/)?.[1];
+    assert.ok(style);
+    referenceStyle ??= style;
+    assert.equal(style, referenceStyle);
+    assert.match(style, /size:\s*80mm auto/);
+    assert.match(style, /width:\s*61\.5mm/);
+    assert.match(style, /margin-left:\s*7mm/);
+    assert.match(style, /margin-right:\s*10mm/);
+    assert.match(html, new RegExp(`<span>Modalidad</span>\\s*<span>${modalidad}</span>`));
+    if (modalidad === 'CONSUMO_LOCAL') assert.doesNotMatch(html, /<span>RECOGER<\/span>/);
+  }
+});
+
+test('cargador de pedido pendiente prioriza modalidad_contexto sobre tipo_entrega', async () => {
+  let modalidadContexto = 'CONSUMO_LOCAL';
+  let idFacturaPago = null;
+  let idFacturaExistente = null;
+  const queryRunner = {
+    query: async (sql) => {
+      if (sql.includes('information_schema.')) return { rowCount: 1, rows: [{ exists: 1 }] };
+      return {
+        rowCount: 1,
+        rows: [{
+          id_pedido: 107,
+          id_sucursal: 9,
+          tipo_entrega: 'RECOGER',
+          modalidad_contexto: modalidadContexto,
+          id_factura_pago: idFacturaPago,
+          id_factura_existente: idFacturaExistente,
+          canal_contexto: 'POS',
+          items: [{
+            id_detalle: 1,
+            tipo_item: 'RECETA',
+            cantidad: 1,
+            nombre_item: 'Alitas QA',
+            extras: [],
+            configuracion_menu: null
+          }]
+        }]
+      };
+    }
+  };
+
+  for (const modalidad of ['CONSUMO_LOCAL', 'RECOGER', 'DELIVERY']) {
+    modalidadContexto = modalidad;
+    const pedido = await buildPedidoKitchenPrintPayload(queryRunner, 107);
+    assert.equal(pedido.id_factura, null);
+    assert.equal(pedido.id_pedido, 107);
+    assert.equal(pedido.contexto.modalidad, modalidad);
+    assert.equal(pedido.modalidad, modalidad);
+    const html = buildComandaCocinaHtml(pedido, { widthMm: 80 });
+    assert.match(html, new RegExp(`<span>Modalidad</span>\\s*<span>${modalidad}</span>`));
+    if (modalidad === 'CONSUMO_LOCAL') assert.doesNotMatch(html, /<span>RECOGER<\/span>/);
+  }
+
+  idFacturaExistente = 77;
+  const paidPedido = await buildPedidoKitchenPrintPayload(queryRunner, 107);
+  assert.equal(paidPedido.id_factura, null);
+  assert.equal(paidPedido.pago.id_factura, 77);
+
+  idFacturaPago = 78;
+  const paidControlPedido = await buildPedidoKitchenPrintPayload(queryRunner, 107);
+  assert.equal(paidControlPedido.pago.id_factura, 78);
+});
+
+test('comanda pendiente por id_pedido conserva exactamente documento, hashes y metricas 58/80', async () => {
+  for (const widthMm of [58, 80]) {
+    const paidPayload = await createCanonicalPrintJobPayload({
+      tipoDocumento: 'comanda',
+      venta: comandaFixture,
+      widthMm
+    });
+    const pendingPayload = await createCanonicalPrintJobPayload({
+      tipoDocumento: 'comanda',
+      venta: pendingComandaFixture,
+      widthMm
+    });
+    assert.deepEqual(pendingPayload.source, { id_factura: null, id_pedido: comandaFixture.id_pedido });
+    assert.deepEqual(pendingPayload.documento_canonico, paidPayload.documento_canonico);
+    assert.equal(validateCanonicalPrintPayload(pendingPayload).ok, true);
+
+    const paidDocument = await renderCanonicalPrintJobDocument({ payload: paidPayload, venta: comandaFixture });
+    const pendingDocument = await renderCanonicalPrintJobDocument({ payload: pendingPayload, venta: pendingComandaFixture });
+    assert.deepEqual(pendingDocument, paidDocument);
+    assert.deepEqual(pendingDocument.options, { pageWidth: widthMm });
+    assert.equal(Buffer.byteLength(pendingDocument.data, 'utf8'), COMANDA_RENDER_BASELINES[widthMm].bytes);
+    assert.equal(sha256(Buffer.from(pendingDocument.data, 'utf8')), COMANDA_RENDER_BASELINES[widthMm].sha256);
+  }
+});
+
+test('contrato canonico exige factura para PDF y al menos un origen para comanda', async () => {
+  await assert.rejects(
+    () => createCanonicalPrintJobPayload({ tipoDocumento: 'factura', venta: pendingComandaFixture, widthMm: 80 }),
+    (error) => error.code === 'PRINT_DOCUMENT_FACTURA_INVALID'
+  );
+  await assert.rejects(
+    () => createCanonicalPrintJobPayload({
+      tipoDocumento: 'comanda',
+      venta: { ...pendingComandaFixture, id_pedido: null },
+      widthMm: 80
+    }),
+    (error) => error.code === 'PRINT_DOCUMENT_SOURCE_INVALID'
+  );
+});
+
 test('schema 2 usa PDF/base64 para factura y HTML/plain para comanda', async () => {
   const initialFactura = await createCanonicalPrintJobPayload({
     tipoDocumento: 'factura',
@@ -357,6 +504,45 @@ test('documento del agente exige trabajo asignado, sucursal y estado con lease a
   });
   assert.equal(recovery.job.estado, 'confirmacion_pendiente');
   assert.equal(recovery.document.data, result.document.data);
+});
+
+test('agente recupera comanda pendiente solo por id_pedido y sucursal autorizada', async () => {
+  const payload = await createCanonicalPrintJobPayload({
+    tipoDocumento: 'comanda',
+    venta: pendingComandaFixture,
+    widthMm: 80
+  });
+  let pedidoArgs;
+  let ventaLoads = 0;
+  const result = await getCanonicalPrintDocumentForAgent({
+    agent,
+    jobId: 91,
+    db: createDocumentDb(buildJob({ payload, state: 'confirmacion_pendiente', leaseActive: false })).db,
+    loadVenta: async () => {
+      ventaLoads += 1;
+      return facturaFixture;
+    },
+    loadPedido: async (args) => {
+      pedidoArgs = args;
+      return pendingComandaFixture;
+    }
+  });
+
+  assert.equal(ventaLoads, 0);
+  assert.equal(pedidoArgs.idPedido, pendingComandaFixture.id_pedido);
+  assert.equal(pedidoArgs.idSucursal, agent.id_sucursal);
+  assert.equal(result.document.format, 'html');
+  assert.match(result.document.data, /VTA-00007/);
+
+  await assert.rejects(
+    () => getCanonicalPrintDocumentForAgent({
+      agent,
+      jobId: 91,
+      db: createDocumentDb(buildJob({ payload })).db,
+      loadPedido: async () => ({ ...pendingComandaFixture, id_sucursal: 10 })
+    }),
+    (error) => error.code === 'PRINT_DOCUMENT_SOURCE_NOT_FOUND'
+  );
 });
 
 test('documento del agente rechaza asignacion inexistente o lease invalido antes de cargar la venta', async () => {

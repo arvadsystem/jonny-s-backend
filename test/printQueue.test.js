@@ -10,6 +10,10 @@ import {
   validateAgentQzRequest
 } from '../services/qzAgentSigningService.js';
 import { buildAgentQzSigningErrorResponse } from '../routers/printAgent.js';
+import {
+  buildPedidoPrintEnqueueErrorResponse,
+  enqueuePedidoComandaPrintJob
+} from '../routers/printing.js';
 
 const agent = { id_agente: '11111111-1111-1111-1111-111111111111', id_sucursal: 9 };
 const payload = {
@@ -67,6 +71,10 @@ const comandaPayloadV2 = {
     content_sha256: sha256(comandaHtmlBytes),
     content_bytes: comandaHtmlBytes.length
   }
+};
+const pendingComandaPayloadV2 = {
+  ...clone(comandaPayloadV2),
+  source: { id_factura: null, id_pedido: 8 }
 };
 const comandaDataV2 = {
   type: 'pixel',
@@ -155,6 +163,160 @@ test('claim backend fuerza limite uno y no toma otro lease mientras el agente im
   assert.equal(params[1], 1);
   const migration = fs.readFileSync(new URL('../sql/2026-07-16_cola_impresion_agentes_sucursal.sql', import.meta.url), 'utf8');
   assert.match(migration, /FOR UPDATE;[\s\S]*IF EXISTS \([\s\S]*id_agente_tomado = p_id_agente[\s\S]*estado IN \('asignado', 'imprimiendo'\)[\s\S]*RETURN;/);
+});
+
+test('endpoint de pedido encola comanda inicial idempotente y reimpresion separada sin factura', async () => {
+  const pedido = {
+    id_factura: null,
+    id_pedido: 501,
+    id_sucursal: agent.id_sucursal,
+    id_caja: 3,
+    modalidad: 'CONSUMO_LOCAL',
+    contexto: { modalidad: 'CONSUMO_LOCAL', canal: 'POS' },
+    items: []
+  };
+  const enqueueCalls = [];
+  const jobsByKey = new Map();
+  const enqueue = async (args) => {
+    enqueueCalls.push(args);
+    const key = `${args.idSucursal}:${args.tipoDocumento}:${args.idempotencyKey}`;
+    if (!jobsByKey.has(key)) jobsByKey.set(key, { id_trabajo: jobsByKey.size + 100, ...args });
+    return jobsByKey.get(key);
+  };
+  const baseArgs = {
+    req: { user: { id_usuario: 44 } },
+    idPedido: 501,
+    tipoDocumento: 'comanda',
+    queryRunner: {},
+    loadPedido: async () => pedido,
+    resolveScope: async () => ({ isSuperAdmin: false, allowedSucursalIds: [agent.id_sucursal] }),
+    loadPrinterConfig: async () => ({ impresoras: [{ tipo_impresora: 'COCINA', ancho_mm: 58 }] }),
+    createPayload: async ({ tipoDocumento, venta, widthMm }) => ({
+      ...clone(comandaPayloadV2),
+      tipo_documento: tipoDocumento,
+      ancho_mm: widthMm,
+      source: { id_factura: venta.id_factura, id_pedido: venta.id_pedido }
+    }),
+    enqueue
+  };
+
+  const first = await enqueuePedidoComandaPrintJob(baseArgs);
+  const replay = await enqueuePedidoComandaPrintJob({
+    ...baseArgs,
+    idempotencyKey: 'comanda:pedido:501:inicial'
+  });
+  const reprint = await enqueuePedidoComandaPrintJob({
+    ...baseArgs,
+    esReimpresion: true,
+    idempotencyKey: 'comanda:pedido-reprint:501:qa-1'
+  });
+
+  assert.equal(first.id_trabajo, replay.id_trabajo);
+  assert.notEqual(reprint.id_trabajo, first.id_trabajo);
+  assert.deepEqual(enqueueCalls[0], {
+    idSucursal: agent.id_sucursal,
+    tipoDocumento: 'comanda',
+    idempotencyKey: 'comanda:pedido:501:inicial',
+    idFactura: null,
+    idPedido: 501,
+    idUsuario: 44,
+    esReimpresion: false,
+    payload: enqueueCalls[0].payload
+  });
+  assert.deepEqual(enqueueCalls[0].payload.source, { id_factura: null, id_pedido: 501 });
+  assert.equal(enqueueCalls[2].esReimpresion, true);
+  assert.equal(enqueueCalls[2].idempotencyKey, 'comanda:pedido-reprint:501:qa-1');
+
+  const routerSource = fs.readFileSync(new URL('../routers/printing.js', import.meta.url), 'utf8');
+  assert.match(routerSource, /router\.post\('\/ventas\/pedidos\/:idPedido\/print-jobs', checkPermission\(\['VENTAS_IMPRIMIR', 'VENTAS_CREAR'\]\)/);
+  assert.match(routerSource, /router\.post\('\/ventas\/pedidos\/:idPedido\/print-jobs'[\s\S]*return res\.status\(202\)/);
+  assert.match(routerSource, /router\.post\('\/ventas\/:id\/print-jobs'[\s\S]*buildVentaDetailPayload/);
+  const queueSource = fs.readFileSync(new URL('../services/printQueueService.js', import.meta.url), 'utf8');
+  assert.match(queueSource, /ON CONFLICT \(id_sucursal,\s*idempotency_key,\s*tipo_documento\)/);
+});
+
+test('endpoint de pedido falla cerrado para clave, sucursal, factura o tipo incorrectos', async () => {
+  const pedido = { id_factura: null, id_pedido: 501, id_sucursal: agent.id_sucursal, items: [] };
+  const baseArgs = {
+    req: { user: { id_usuario: 44 } },
+    idPedido: 501,
+    tipoDocumento: 'comanda',
+    queryRunner: {},
+    loadPedido: async () => pedido,
+    resolveScope: async () => ({ isSuperAdmin: false, allowedSucursalIds: [agent.id_sucursal] }),
+    loadPrinterConfig: async () => null,
+    createPayload: async () => comandaPayloadV2,
+    enqueue: async () => ({ id_trabajo: 1 })
+  };
+
+  await assert.rejects(
+    () => enqueuePedidoComandaPrintJob({
+      ...baseArgs,
+      esReimpresion: true,
+      idempotencyKey: 'comanda:pedido-reprint:999:qa-1'
+    }),
+    (error) => error.code === 'PRINT_IDEMPOTENCY_INVALID'
+  );
+  for (const invalidId of ['501-externo', '1e2', ' 501 ', '+501']) {
+    await assert.rejects(
+      () => enqueuePedidoComandaPrintJob({ ...baseArgs, idPedido: invalidId }),
+      (error) => error.code === 'PRINT_PEDIDO_INVALID'
+    );
+  }
+  await assert.rejects(
+    () => enqueuePedidoComandaPrintJob({ ...baseArgs, loadPedido: async () => null }),
+    (error) => error.code === 'PRINT_PEDIDO_NOT_FOUND' && error.status === 404
+  );
+  await assert.rejects(
+    () => enqueuePedidoComandaPrintJob({ ...baseArgs, idempotencyKey: 'arbitraria-externa' }),
+    (error) => error.code === 'PRINT_IDEMPOTENCY_INVALID'
+  );
+  await assert.rejects(
+    () => enqueuePedidoComandaPrintJob({ ...baseArgs, esReimpresion: true }),
+    (error) => error.code === 'PRINT_IDEMPOTENCY_REQUIRED'
+  );
+  await assert.rejects(
+    () => enqueuePedidoComandaPrintJob({
+      ...baseArgs,
+      resolveScope: async () => ({ isSuperAdmin: false, allowedSucursalIds: [10] })
+    }),
+    (error) => error.code === 'PRINT_SUCURSAL_FORBIDDEN'
+  );
+  await assert.rejects(
+    () => enqueuePedidoComandaPrintJob({
+      ...baseArgs,
+      loadPedido: async () => ({ ...pedido, id_factura: 77 })
+    }),
+    (error) => error.code === 'PRINT_PEDIDO_SOURCE_INVALID'
+  );
+  await assert.rejects(
+    () => enqueuePedidoComandaPrintJob({
+      ...baseArgs,
+      loadPedido: async () => ({ ...pedido, pago: { id_factura: 77 } })
+    }),
+    (error) => error.code === 'PRINT_PEDIDO_SOURCE_INVALID'
+  );
+  await assert.rejects(
+    () => enqueuePedidoComandaPrintJob({ ...baseArgs, tipoDocumento: 'factura' }),
+    (error) => error.code === 'PRINT_DOCUMENT_TYPE_INVALID'
+  );
+
+  const databaseError = buildPedidoPrintEnqueueErrorResponse(Object.assign(new Error('SQL sensible'), {
+    code: '42P08'
+  }));
+  assert.deepEqual(databaseError, {
+    status: 500,
+    body: {
+      ok: false,
+      code: 'PRINT_ENQUEUE_FAILED',
+      message: 'No se pudo enviar el trabajo de impresion.'
+    }
+  });
+  const controlledError = buildPedidoPrintEnqueueErrorResponse(Object.assign(new Error('Pedido no encontrado.'), {
+    status: 404,
+    code: 'PRINT_PEDIDO_NOT_FOUND'
+  }));
+  assert.equal(controlledError.body.code, 'PRINT_PEDIDO_NOT_FOUND');
 });
 
 test('transicion y evento son atomicos y rollback revierte si falla el evento', async () => {
@@ -338,6 +500,7 @@ test('firma QZ exige el HTML determinista almacenado en el trabajo', async () =>
 test('payload canonico v2 exige contrato y referencias exactas', () => {
   assert.equal(validatePrintPayload(facturaPayloadV2).ok, true);
   assert.equal(validatePrintPayload(comandaPayloadV2).ok, true);
+  assert.equal(validatePrintPayload(pendingComandaPayloadV2).ok, true);
 
   const invalidPayloads = [
     { ...clone(facturaPayloadV2), extra: true },
@@ -346,6 +509,8 @@ test('payload canonico v2 exige contrato y referencias exactas', () => {
     { ...clone(facturaPayloadV2), impresora_logica: 'cocina' },
     { ...clone(facturaPayloadV2), source: { ...facturaPayloadV2.source, extra: true } },
     { ...clone(facturaPayloadV2), source: { id_factura: '6', id_pedido: 7 } },
+    { ...clone(facturaPayloadV2), source: { id_factura: null, id_pedido: 7 } },
+    { ...clone(pendingComandaPayloadV2), source: { id_factura: null, id_pedido: null } },
     {
       ...clone(facturaPayloadV2),
       documento_canonico: { ...facturaPayloadV2.documento_canonico, extra: true }
@@ -366,7 +531,8 @@ test('firmador QZ acepta exactamente factura PDF oficial y comanda HTML canonica
   assert.deepEqual(comandaDataV2.options, { pageWidth: 58 });
   const fixtures = [
     { id: 8, currentPayload: facturaPayloadV2, dataItem: facturaDataV2 },
-    { id: 9, currentPayload: comandaPayloadV2, dataItem: comandaDataV2 }
+    { id: 9, currentPayload: comandaPayloadV2, dataItem: comandaDataV2 },
+    { id: 10, currentPayload: pendingComandaPayloadV2, dataItem: comandaDataV2 }
   ];
 
   for (const fixture of fixtures) {
