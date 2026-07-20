@@ -176,7 +176,14 @@ export const buildVentaKitchenPrintPayload = (venta = {}, printerConfig = null) 
     };
   });
 
-  const totalProductos = items.reduce((sum, item) => sum + Math.max(0, Number(item.cantidad || 0)), 0);
+  const totalProductos = items.reduce(
+    (sum, item) => (
+      item.tipo_item === 'EXTRA' || item.es_linea_extra_independiente
+        ? sum
+        : sum + Math.max(0, Number(item.cantidad || 0))
+    ),
+    0
+  );
 
   return {
     id_factura: Number(venta?.id_factura || 0) || null,

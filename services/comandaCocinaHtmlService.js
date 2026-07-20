@@ -1,5 +1,7 @@
 import { formatHondurasDateTime } from '../utils/hondurasDateTime.js';
 
+const HONDURAS_TIME_ZONE = 'America/Tegucigalpa';
+
 const resolveTicketWidthMm = (value) => Number(value) === 58 ? 58 : 80;
 
 const resolveFacturaLikeMetrics = (ticketWidthMm) => {
@@ -38,7 +40,25 @@ const toSafeNumber = (value, fallback = 0) => {
   return Number.isFinite(numeric) ? numeric : fallback;
 };
 
-const formatDateTime = (value) => formatHondurasDateTime(value, toSafeText(value, 'N/D'));
+// Formato legacy (schema_version 2): reproduce byte a byte las comandas creadas
+// antes de 3eea227 (dateStyle/timeStyle short, hora 12h). Existe solo para
+// regenerar de forma identica trabajos v2 ya encolados.
+const formatDateTimeLegacy = (value) => {
+  if (!value) return 'N/D';
+  const date = new Date(value);
+  if (!Number.isFinite(date.getTime())) return toSafeText(value, 'N/D');
+  return new Intl.DateTimeFormat('es-HN', {
+    dateStyle: 'short',
+    timeStyle: 'short',
+    timeZone: HONDURAS_TIME_ZONE
+  }).format(date);
+};
+
+const formatDateTime = (value, { legacy = false } = {}) => (
+  legacy
+    ? formatDateTimeLegacy(value)
+    : formatHondurasDateTime(value, toSafeText(value, 'N/D'))
+);
 
 const normalizeDetailList = (items, mapItem) => (
   Array.isArray(items) ? items : []
@@ -161,7 +181,7 @@ export const buildComandaCocinaHtml = (comanda, options = {}) => {
   const nestedPaddingMm = isNarrowTicket ? 7 : 8;
   const metaLabelWidthMm = isNarrowTicket ? 16 : 18;
   const items = validation.items;
-  const fecha = formatDateTime(comanda?.fecha_hora_pedido || comanda?.fecha_hora_facturacion);
+  const fecha = formatDateTime(comanda?.fecha_hora_pedido || comanda?.fecha_hora_facturacion, { legacy: Boolean(options?.legacy) });
   const numeroPedido = toSafeText(comanda?.numero_pedido || comanda?.numero_venta || comanda?.codigo_venta);
   const sucursal = toSafeText(comanda?.nombre_sucursal, 'No registrada');
   const cajero = toSafeText(comanda?.nombre_usuario, 'No registrado');

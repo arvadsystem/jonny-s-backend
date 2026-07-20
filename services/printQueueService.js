@@ -23,7 +23,7 @@ export const validatePrintPayload = (payload) => {
     }
     return { ok: true, value: payload };
   }
-  if (schemaVersion === 2) return validateCanonicalPrintPayload(payload);
+  if (schemaVersion === 2 || schemaVersion === 3) return validateCanonicalPrintPayload(payload);
   return { ok: false, message: 'Payload de impresion no soportado.' };
 };
 

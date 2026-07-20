@@ -189,22 +189,49 @@ export const buscarVentaHandler = async (req, res) => {
   }
 };
 
-const attachDetailExtras = (item, extras) => {
-  const standaloneExtra = resolveStandaloneExtraLine({
-    idProducto: item.id_producto,
-    idReceta: item.id_receta,
-    extras
-  });
+const roundMoneyOr = (value, fallback) => {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? roundMoney(parsed) : fallback;
+};
+
+const attachDetailExtras = (item, extras, { normalizeStandaloneExtras = true } = {}) => {
+  const standaloneExtra = normalizeStandaloneExtras
+    ? resolveStandaloneExtraLine({
+      idProducto: item.id_producto,
+      idReceta: item.id_receta,
+      extras
+    })
+    : null;
+
+  if (!standaloneExtra) {
+    return { ...item, extras };
+  }
+
+  // Usa el snapshot financiero persistido del extra; nunca reinterpreta el
+  // sub_total del pedido como precio unitario (cantidad x precio = subtotal).
+  const cantidad = Number.isFinite(standaloneExtra.cantidad) && standaloneExtra.cantidad > 0
+    ? standaloneExtra.cantidad
+    : Number(item.cantidad ?? 0) || 0;
+  const subtotal = roundMoneyOr(standaloneExtra.subtotal, roundMoney(item.sub_total));
+  const precioUnitario = roundMoneyOr(
+    standaloneExtra.precio_unitario,
+    cantidad > 0 ? roundMoney(Number(subtotal) / cantidad) : roundMoney(item.precio_unitario)
+  );
 
   return {
     ...item,
-    tipo_item: standaloneExtra ? 'EXTRA' : item.tipo_item,
-    nombre_item: standaloneExtra ? standaloneExtra.nombre_extra_snapshot : item.nombre_item,
-    nombre_producto: standaloneExtra ? standaloneExtra.nombre_extra_snapshot : item.nombre_producto,
-    es_linea_extra_independiente: Boolean(standaloneExtra),
-    id_extra: standaloneExtra?.id_extra || null,
-    nombre_extra_snapshot: standaloneExtra?.nombre_extra_snapshot || null,
-    codigo_extra_snapshot: standaloneExtra?.codigo_extra_snapshot || null,
+    tipo_item: 'EXTRA',
+    nombre_item: standaloneExtra.nombre_extra_snapshot,
+    nombre_producto: standaloneExtra.nombre_extra_snapshot,
+    es_linea_extra_independiente: true,
+    id_extra: standaloneExtra.id_extra || null,
+    nombre_extra_snapshot: standaloneExtra.nombre_extra_snapshot,
+    codigo_extra_snapshot: standaloneExtra.codigo_extra_snapshot || null,
+    cantidad,
+    precio_unitario: precioUnitario,
+    sub_total: subtotal,
+    subtotal_linea: subtotal,
+    total_linea: subtotal,
     extras
   };
 };
@@ -215,6 +242,7 @@ export const buildVentaDetailPayloadForScope = async ({
   allowedSucursalIds = [],
   limitedToLast72Hours = false,
   idUsuarioDetalle = null,
+  normalizeStandaloneExtras = true,
   queryRunner = pool
 }) => {
   const normalizedSucursalIds = (Array.isArray(allowedSucursalIds) ? allowedSucursalIds : [])
@@ -262,7 +290,7 @@ export const buildVentaDetailPayloadForScope = async ({
       pedidoItemsResult.rows.map((row) => row.id_detalle)
     );
     const pedidoItems = buildKitchenSaleDetailItems(pedidoItemsResult.rows).map((item) =>
-      attachDetailExtras(item, detalleFacturaExtrasById.get(Number(item.id_detalle)) || []));
+      attachDetailExtras(item, detalleFacturaExtrasById.get(Number(item.id_detalle)) || [], { normalizeStandaloneExtras }));
     const cuentaDividida = await fetchCuentaDividida(queryRunner, {
       idFactura: venta.id_factura,
       idPedido: venta.id_pedido
@@ -302,7 +330,7 @@ export const buildVentaDetailPayloadForScope = async ({
     directItemsResult.rows.map((row) => row.id_detalle)
   );
   const directItems = buildDirectSaleDetailItems(directItemsResult.rows).map((item) =>
-    attachDetailExtras(item, detalleFacturaExtrasById.get(Number(item.id_detalle)) || []));
+    attachDetailExtras(item, detalleFacturaExtrasById.get(Number(item.id_detalle)) || [], { normalizeStandaloneExtras }));
   const cuentaDividida = await fetchCuentaDividida(queryRunner, {
     idFactura: venta.id_factura,
     idPedido: venta.id_pedido

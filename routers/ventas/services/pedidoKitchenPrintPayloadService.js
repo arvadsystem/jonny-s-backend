@@ -79,7 +79,7 @@ export const toKitchenComplementos = (item = {}) => {
     .filter((entry) => entry.id_complemento || entry.nombre);
 };
 
-export const buildPedidoKitchenPrintPayload = async (queryRunner, idPedido) => {
+export const buildPedidoKitchenPrintPayload = async (queryRunner, idPedido, { normalizeStandaloneExtras = true } = {}) => {
   const hasDetallePedidoConfiguracionMenu = await hasColumn(queryRunner, 'detalle_pedido', 'configuracion_menu');
   const hasDetallePedidoExtras = await hasTable(queryRunner, 'detalle_pedido_extras');
   const hasPedidosContacto = await hasTable(queryRunner, 'pedidos_contacto');
@@ -271,17 +271,23 @@ export const buildPedidoKitchenPrintPayload = async (queryRunner, idPedido) => {
 
   const row = result.rows[0];
   const items = (Array.isArray(row.items) ? row.items : []).map((item, index) => {
-    const standaloneExtra = resolveStandaloneExtraLine({
-      idProducto: item?.id_producto,
-      idReceta: item?.id_receta,
-      extras: item?.extras
-    });
+    const standaloneExtra = normalizeStandaloneExtras
+      ? resolveStandaloneExtraLine({
+        idProducto: item?.id_producto,
+        idReceta: item?.id_receta,
+        extras: item?.extras
+      })
+      : null;
+    const standaloneCantidad = standaloneExtra
+      && Number.isFinite(standaloneExtra.cantidad) && standaloneExtra.cantidad > 0
+      ? standaloneExtra.cantidad
+      : null;
 
     return {
       linea: index + 1,
       id_detalle: Number(item?.id_detalle || 0) || null,
       tipo_item: standaloneExtra ? 'EXTRA' : String(item?.tipo_item || 'ITEM').trim().toUpperCase(),
-      cantidad: Number(item?.cantidad ?? 0) || 0,
+      cantidad: standaloneCantidad ?? (Number(item?.cantidad ?? 0) || 0),
       nombre_item: standaloneExtra
         ? standaloneExtra.nombre_extra_snapshot
         : String(item?.nombre_item || item?.nombre_producto || 'Item de cocina').trim(),
@@ -295,7 +301,16 @@ export const buildPedidoKitchenPrintPayload = async (queryRunner, idPedido) => {
       configuracion_menu: item?.configuracion_menu || null
     };
   });
-  const totalProductos = items.reduce((sum, item) => sum + Math.max(0, Number(item.cantidad || 0)), 0);
+  // El contador de productos excluye lineas de extra independiente para no
+  // inflar el total (p. ej. 1 producto + 4 extras debe reportar 1, no 5).
+  const totalProductos = items.reduce(
+    (sum, item) => (
+      item.tipo_item === 'EXTRA' || item.es_linea_extra_independiente
+        ? sum
+        : sum + Math.max(0, Number(item.cantidad || 0))
+    ),
+    0
+  );
 
   return {
     id_factura: null,

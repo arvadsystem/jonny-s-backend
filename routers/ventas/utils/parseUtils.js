@@ -206,11 +206,20 @@ export const normalizeObservation = (value) => {
   return normalized.slice(0, 200);
 };
 
+const toStandaloneNumber = (value) => {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+};
+
 /**
  * Detecta una linea de "extra independiente": sin producto ni receta, con
  * exactamente un extra valido asociado (snapshot en detalle_pedido_extras o
  * detalle_factura_extras). No clasifica lineas con cero o multiples extras;
  * esas se dejan con su fallback actual para evitar inventar datos.
+ *
+ * Devuelve tambien los valores financieros persistidos del extra (cantidad,
+ * precio_unitario, subtotal) para que la linea use el snapshot historico y no
+ * el sub_total del pedido interpretado como precio unitario.
  */
 export const resolveStandaloneExtraLine = ({ idProducto, idReceta, extras }) => {
   if (idProducto || idReceta) return null;
@@ -224,7 +233,10 @@ export const resolveStandaloneExtraLine = ({ idProducto, idReceta, extras }) => 
   return {
     id_extra: parseOptionalPositiveInt(extra.id_extra),
     nombre_extra_snapshot: nombre,
-    codigo_extra_snapshot: String(extra.codigo || extra.codigo_extra_snapshot || '').trim() || null
+    codigo_extra_snapshot: String(extra.codigo || extra.codigo_extra_snapshot || '').trim() || null,
+    cantidad: toStandaloneNumber(extra.cantidad),
+    precio_unitario: toStandaloneNumber(extra.precio_unitario),
+    subtotal: toStandaloneNumber(extra.subtotal)
   };
 };
 

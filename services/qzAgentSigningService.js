@@ -75,7 +75,7 @@ const validatePrintParams = (params, job) => {
   if (!target) return null;
   const { printerName, item } = target;
 
-  if (Number(job.payload?.schema_version) === 2) {
+  if (Number(job.payload?.schema_version) === 2 || Number(job.payload?.schema_version) === 3) {
     const payloadValidation = validateCanonicalPrintPayload(job.payload);
     if (!payloadValidation.ok
       || job.tipo_documento !== job.payload.tipo_documento

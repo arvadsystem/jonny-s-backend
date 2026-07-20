@@ -15,6 +15,7 @@ import {
   renderCanonicalPrintJobDocument,
   validateCanonicalPrintPayload
 } from '../services/printJobDocumentService.js';
+import { validateCanonicalPrintJobData } from '../print-agent/src/documentRenderer.js';
 import { formatHondurasDateTime } from '../utils/hondurasDateTime.js';
 
 const ONE_PIXEL_PNG = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=';
@@ -398,7 +399,7 @@ test('contrato canonico exige factura para PDF y al menos un origen para comanda
   );
 });
 
-test('schema 2 usa PDF/base64 para factura y HTML/plain para comanda', async () => {
+test('schema 3 usa PDF/base64 para factura y HTML/plain para comanda', async () => {
   const initialFactura = await createCanonicalPrintJobPayload({
     tipoDocumento: 'factura',
     venta: cloneForRequester(facturaFixture, 'ROOT', false),
@@ -420,11 +421,11 @@ test('schema 2 usa PDF/base64 para factura y HTML/plain para comanda', async () 
     widthMm: 80
   });
 
-  assert.equal(initialFactura.schema_version, 2);
+  assert.equal(initialFactura.schema_version, 3);
   assert.equal(initialFactura.documento_canonico.format, 'pdf');
   assert.equal(initialFactura.documento_canonico.flavor, 'base64');
   assert.deepEqual(reprintFactura.documento_canonico, initialFactura.documento_canonico);
-  assert.equal(initialComanda.schema_version, 2);
+  assert.equal(initialComanda.schema_version, 3);
   assert.equal(initialComanda.documento_canonico.format, 'html');
   assert.equal(initialComanda.documento_canonico.flavor, 'plain');
   assert.deepEqual(reprintComanda.documento_canonico, initialComanda.documento_canonico);
@@ -485,7 +486,8 @@ test('documento del agente exige trabajo asignado, sucursal y estado con lease a
   assert.deepEqual(loadArgs, {
     idFactura: facturaFixture.id_factura,
     idSucursal: agent.id_sucursal,
-    includePrintAssets: true
+    includePrintAssets: true,
+    normalizeStandaloneExtras: true
   });
   assert.equal(result.job.estado, 'imprimiendo');
   assert.equal(result.document.format, 'pdf');
@@ -600,4 +602,111 @@ test('documento del agente falla cerrado si el contenido regenerado fue alterado
     }),
     (error) => error.code === 'PRINT_DOCUMENT_CHANGED'
   );
+});
+
+// --- Compatibilidad v2 (legacy) / v3 (corregido) ---------------------------
+
+// Descriptores byte-exactos del commit 911a9b3 (previo a 3eea227). Un trabajo v2
+// encolado con estos hashes debe seguir regenerandose identico tras el cambio.
+const LEGACY_V2_BASELINES = Object.freeze({
+  factura: Object.freeze({
+    bytes: 22791,
+    sha256: '302cd89d1bc6afc40703b9f105c585c696d8fa8dcd1f2a14684680efff20349f'
+  }),
+  comanda58: Object.freeze({
+    bytes: 7161,
+    sha256: '3981b0a1d20b184ca403a52fa94b8b92baa835f6b38f6b48e495eafccce201c1'
+  }),
+  comanda80: Object.freeze({
+    bytes: 7164,
+    sha256: 'f5393514518e2c62b84b19b2eba53b9866a261c2ba0fe042e2b75d551493cdc8'
+  })
+});
+
+const buildLegacyV2Payload = ({ tipoDocumento, descriptor, widthMm, source }) => ({
+  schema_version: 2,
+  tipo_documento: tipoDocumento,
+  impresora_logica: tipoDocumento === 'factura' ? 'factura' : 'cocina',
+  ancho_mm: widthMm,
+  source,
+  documento_canonico: {
+    kind: tipoDocumento === 'factura' ? 'venta_ticket_pdf' : 'comanda_cocina_html',
+    format: tipoDocumento === 'factura' ? 'pdf' : 'html',
+    flavor: tipoDocumento === 'factura' ? 'base64' : 'plain',
+    content_sha256: descriptor.sha256,
+    content_bytes: descriptor.bytes
+  }
+});
+
+test('el renderizador legacy reproduce byte a byte los documentos v2 previos a 3eea227', async () => {
+  const facturaPdf = await buildVentaTicketPdfBuffer(facturaFixture, { legacy: true });
+  assert.equal(facturaPdf.length, LEGACY_V2_BASELINES.factura.bytes);
+  assert.equal(sha256(facturaPdf), LEGACY_V2_BASELINES.factura.sha256);
+
+  for (const widthMm of [58, 80]) {
+    const html = Buffer.from(buildComandaCocinaHtml(comandaFixture, { widthMm, legacy: true }), 'utf8');
+    const baseline = LEGACY_V2_BASELINES[`comanda${widthMm}`];
+    assert.equal(html.length, baseline.bytes);
+    assert.equal(sha256(html), baseline.sha256);
+  }
+});
+
+test('un trabajo v2 encolado antes del cambio NO dispara PRINT_DOCUMENT_CHANGED', async () => {
+  const payload = buildLegacyV2Payload({
+    tipoDocumento: 'factura',
+    descriptor: LEGACY_V2_BASELINES.factura,
+    widthMm: 80,
+    source: { id_factura: facturaFixture.id_factura, id_pedido: null }
+  });
+  assert.equal(validateCanonicalPrintPayload(payload).ok, true);
+
+  // Misma venta historica -> el backend regenera exactamente los bytes v2.
+  const dataItem = await renderCanonicalPrintJobDocument({ payload, venta: facturaFixture });
+  const bytes = Buffer.from(dataItem.data, 'base64');
+  assert.equal(bytes.length, LEGACY_V2_BASELINES.factura.bytes);
+  assert.equal(sha256(bytes), LEGACY_V2_BASELINES.factura.sha256);
+
+  // El agente valida el documento v2 contra el descriptor almacenado sin re-render.
+  const validated = validateCanonicalPrintJobData(payload, dataItem);
+  assert.equal(validated.format, 'pdf');
+});
+
+test('comanda v2 legacy regenera identico y es aceptada por el agente', async () => {
+  for (const widthMm of [58, 80]) {
+    const baseline = LEGACY_V2_BASELINES[`comanda${widthMm}`];
+    const payload = buildLegacyV2Payload({
+      tipoDocumento: 'comanda',
+      descriptor: baseline,
+      widthMm,
+      source: { id_factura: comandaFixture.id_factura, id_pedido: comandaFixture.id_pedido }
+    });
+    const dataItem = await renderCanonicalPrintJobDocument({ payload, venta: comandaFixture });
+    const bytes = Buffer.from(dataItem.data, 'utf8');
+    assert.equal(bytes.length, baseline.bytes);
+    assert.equal(sha256(bytes), baseline.sha256);
+    assert.deepEqual(validateCanonicalPrintJobData(payload, dataItem).options, { pageWidth: widthMm });
+  }
+});
+
+test('el agente acepta descriptores v2 y v3 con el mismo contrato', async () => {
+  const v3Payload = await createCanonicalPrintJobPayload({
+    tipoDocumento: 'factura',
+    venta: facturaFixture,
+    widthMm: 80
+  });
+  assert.equal(v3Payload.schema_version, 3);
+  const v3DataItem = await renderCanonicalPrintJobDocument({ payload: v3Payload, venta: facturaFixture });
+  assert.equal(validateCanonicalPrintJobData(v3Payload, v3DataItem).format, 'pdf');
+
+  const v2Payload = buildLegacyV2Payload({
+    tipoDocumento: 'factura',
+    descriptor: LEGACY_V2_BASELINES.factura,
+    widthMm: 80,
+    source: { id_factura: facturaFixture.id_factura, id_pedido: null }
+  });
+  const v2DataItem = await renderCanonicalPrintJobDocument({ payload: v2Payload, venta: facturaFixture });
+  assert.equal(validateCanonicalPrintJobData(v2Payload, v2DataItem).format, 'pdf');
+
+  // v2 y v3 producen documentos distintos (hora/formato corregido en v3).
+  assert.notEqual(v3Payload.documento_canonico.content_sha256, v2Payload.documento_canonico.content_sha256);
 });

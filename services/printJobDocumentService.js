@@ -5,7 +5,16 @@ import { buildPedidoKitchenPrintPayload } from '../routers/ventas/services/pedid
 import { buildVentaTicketPdfBuffer } from '../routers/ventas/services/ventaTicketPdfService.js';
 import { buildComandaCocinaHtml } from './comandaCocinaHtmlService.js';
 
-export const CANONICAL_PRINT_SCHEMA_VERSION = 2;
+// v2 = renderizador legacy congelado (bytes previos a 3eea227), preservado para
+// trabajos ya encolados. v3 = renderizador corregido (hora Honduras 24h, extras
+// independientes con nombre/precio correctos). Los trabajos nuevos usan v3.
+export const LEGACY_CANONICAL_PRINT_SCHEMA_VERSION = 2;
+export const CANONICAL_PRINT_SCHEMA_VERSION = 3;
+export const SUPPORTED_CANONICAL_SCHEMA_VERSIONS = Object.freeze([
+  LEGACY_CANONICAL_PRINT_SCHEMA_VERSION,
+  CANONICAL_PRINT_SCHEMA_VERSION
+]);
+const isLegacySchemaVersion = (schemaVersion) => Number(schemaVersion) === LEGACY_CANONICAL_PRINT_SCHEMA_VERSION;
 export const MAX_CANONICAL_PDF_BYTES = 2 * 1024 * 1024;
 export const MAX_CANONICAL_HTML_BYTES = 256 * 1024;
 export const MAX_AGENT_QZ_SIGN_REQUEST_BYTES = 3 * 1024 * 1024;
@@ -78,7 +87,8 @@ export const resolveCanonicalPrintWidth = ({ tipoDocumento, venta = {}, printerC
 };
 
 export const validateCanonicalPrintPayload = (payload) => {
-  if (!hasExactKeys(payload, PAYLOAD_KEYS) || payload.schema_version !== CANONICAL_PRINT_SCHEMA_VERSION) {
+  if (!hasExactKeys(payload, PAYLOAD_KEYS)
+    || !SUPPORTED_CANONICAL_SCHEMA_VERSIONS.includes(payload.schema_version)) {
     return { ok: false, message: 'Payload canonico de impresion no soportado.' };
   }
 
@@ -129,7 +139,8 @@ export const validateCanonicalPrintPayload = (payload) => {
     contract,
     idFactura,
     idPedido,
-    widthMm
+    widthMm,
+    schemaVersion: payload.schema_version
   };
 };
 
@@ -174,20 +185,26 @@ export const validateCanonicalPrintDataItem = (payload, item) => {
   return { contentBytes, validation };
 };
 
-const renderCanonicalDocument = async ({ tipoDocumento, venta, widthMm }) => {
+const renderCanonicalDocument = async ({
+  tipoDocumento,
+  venta,
+  widthMm,
+  schemaVersion = CANONICAL_PRINT_SCHEMA_VERSION
+}) => {
   const contract = getDocumentContract(tipoDocumento);
   if (!contract) throw printDocumentError('PRINT_DOCUMENT_TYPE_INVALID', 'Tipo de documento canonico invalido.', 400);
 
+  const legacy = isLegacySchemaVersion(schemaVersion);
   let contentBytes;
   let data;
   if (tipoDocumento === 'factura') {
-    contentBytes = await buildVentaTicketPdfBuffer(venta);
+    contentBytes = await buildVentaTicketPdfBuffer(venta, { legacy });
     if (!Buffer.isBuffer(contentBytes) || contentBytes.subarray(0, 5).toString('ascii') !== '%PDF-') {
       throw printDocumentError('PRINT_DOCUMENT_PDF_INVALID', 'El PDF canonico no es valido.');
     }
     data = contentBytes.toString('base64');
   } else {
-    data = buildComandaCocinaHtml(venta, { widthMm });
+    data = buildComandaCocinaHtml(venta, { widthMm, legacy });
     contentBytes = Buffer.from(data, 'utf8');
   }
 
@@ -232,7 +249,8 @@ export const createCanonicalPrintJobPayload = async ({ tipoDocumento, venta, wid
   const rendered = await renderCanonicalDocument({
     tipoDocumento: normalizedType,
     venta,
-    widthMm: normalizedWidth
+    widthMm: normalizedWidth,
+    schemaVersion: CANONICAL_PRINT_SCHEMA_VERSION
   });
   return {
     schema_version: CANONICAL_PRINT_SCHEMA_VERSION,
@@ -260,7 +278,8 @@ export const renderCanonicalPrintJobDocument = async ({ payload, venta }) => {
   const rendered = await renderCanonicalDocument({
     tipoDocumento: payload.tipo_documento,
     venta,
-    widthMm: validation.widthMm
+    widthMm: validation.widthMm,
+    schemaVersion: validation.schemaVersion
   });
   if (rendered.descriptor.content_sha256 !== payload.documento_canonico.content_sha256
     || rendered.descriptor.content_bytes !== payload.documento_canonico.content_bytes) {
@@ -302,16 +321,22 @@ export const getCanonicalPrintDocumentForAgent = async ({
     throw printDocumentError('PRINT_DOCUMENT_JOB_MISMATCH', 'El documento no coincide con el trabajo reclamado.', 409);
   }
 
+  // Trabajos v2 (legacy) deben regenerar exactamente los bytes almacenados: se
+  // cargan sin normalizar extras independientes (datos previos a 3eea227). Los
+  // trabajos v3 usan la normalizacion corregida.
+  const normalizeStandaloneExtras = !isLegacySchemaVersion(validation.schemaVersion);
+
   let detailResult;
   if (validation.idFactura) {
     detailResult = loadVenta
-      ? await loadVenta({ idFactura: validation.idFactura, idSucursal: Number(agent.id_sucursal), includePrintAssets: job.tipo_documento === 'factura' })
+      ? await loadVenta({ idFactura: validation.idFactura, idSucursal: Number(agent.id_sucursal), includePrintAssets: job.tipo_documento === 'factura', normalizeStandaloneExtras })
       : await buildVentaDetailPayloadForScope({
         idFactura: validation.idFactura,
         includePrintAssets: job.tipo_documento === 'factura',
         allowedSucursalIds: [Number(agent.id_sucursal)],
         limitedToLast72Hours: false,
         idUsuarioDetalle: null,
+        normalizeStandaloneExtras,
         queryRunner: db
       });
   } else if (job.tipo_documento === 'comanda' && validation.idPedido) {
@@ -319,9 +344,10 @@ export const getCanonicalPrintDocumentForAgent = async ({
       ? await loadPedido({
         idPedido: validation.idPedido,
         idSucursal: Number(agent.id_sucursal),
+        normalizeStandaloneExtras,
         queryRunner: db
       })
-      : await buildPedidoKitchenPrintPayload(db, validation.idPedido);
+      : await buildPedidoKitchenPrintPayload(db, validation.idPedido, { normalizeStandaloneExtras });
   }
   const venta = detailResult?.status === 200 ? detailResult.body : detailResult;
   if (!venta
