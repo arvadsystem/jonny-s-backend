@@ -33,7 +33,7 @@ export const validatePrintPayload = (payload) => {
 export const enqueuePrintJob = async ({
   idSucursal, tipoDocumento, payload, idempotencyKey, idFactura = null,
   idPedido = null, idUsuario = null, esReimpresion = false,
-  canonicalDocument = null, db = pool
+  canonicalDocument = null, db = pool, onInsertedTransaction = null
 }) => {
   const normalizedType = String(tipoDocumento || '').trim().toLowerCase();
   const validation = validatePrintPayload(payload);
@@ -98,6 +98,9 @@ export const enqueuePrintJob = async ({
           descriptor.content_bytes
         ]
       );
+    }
+    if (job.inserted === true && typeof onInsertedTransaction === 'function') {
+      await onInsertedTransaction({ client, job });
     }
     await client.query('COMMIT');
     const { inserted, ...publicJob } = job;

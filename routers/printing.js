@@ -15,6 +15,7 @@ import {
   listAmbiguousPrintJobs,
   resolvePrintJobAdministratively
 } from '../services/printQueueAdminService.js';
+import { markPedidoVisibleInKitchen } from './ventas/services/pedidoKitchenVisibilityService.js';
 
 const router = express.Router();
 const ADMIN_ROLE_CODES = Object.freeze(['ADMIN', 'ADMINISTRADOR', 'SUPER_ADMIN']);
@@ -139,6 +140,12 @@ export const enqueuePedidoComandaPrintJob = async ({
     payload
   };
   if (createdDocument?.document) enqueueParams.canonicalDocument = createdDocument.document;
+  if (!isReprint) {
+    enqueueParams.onInsertedTransaction = ({ client }) => markPedidoVisibleInKitchen({
+      client,
+      idPedido: normalizedIdPedido
+    });
+  }
   return enqueue(enqueueParams);
 };
 
@@ -212,7 +219,7 @@ router.post('/ventas/:id/print-jobs', checkPermission(['VENTAS_IMPRIMIR', 'VENTA
       widthMm
     });
 
-    const job = await enqueuePrintJob({
+    const enqueueParams = {
       idSucursal: Number(venta.id_sucursal),
       tipoDocumento,
       idempotencyKey,
@@ -222,7 +229,14 @@ router.post('/ventas/:id/print-jobs', checkPermission(['VENTAS_IMPRIMIR', 'VENTA
       esReimpresion: isReprint,
       payload: createdDocument.payload,
       canonicalDocument: createdDocument.document
-    });
+    };
+    if (tipoDocumento === 'comanda' && !isReprint) {
+      enqueueParams.onInsertedTransaction = ({ client }) => markPedidoVisibleInKitchen({
+        client,
+        idPedido: Number(venta.id_pedido)
+      });
+    }
+    const job = await enqueuePrintJob(enqueueParams);
     return res.status(202).json({ ok: true, message: 'Trabajo enviado a impresion.', job });
   } catch (error) {
     console.error('[printing.enqueue] fallo', { code: error?.code || null });

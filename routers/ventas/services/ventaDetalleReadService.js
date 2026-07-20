@@ -436,6 +436,23 @@ export const normalizeSplitAccountStandaloneExtra = (item) => {
   };
 };
 
+export const normalizePedidoPendingDetailItem = (item) => {
+  const extras = parseJsonArrayValue(item?.extras);
+  const subtotalBase = roundMoney(item?.sub_total ?? item?.subtotal_linea);
+  const subtotalExtras = roundMoney(extras.reduce(
+    (sum, extra) => sum + Number(extra?.subtotal || 0),
+    0
+  ));
+  return normalizeSplitAccountStandaloneExtra({
+    ...item,
+    sub_total: subtotalBase,
+    subtotal_linea: subtotalBase,
+    subtotal_base: subtotalBase,
+    subtotal_extras: subtotalExtras,
+    extras
+  });
+};
+
 export const buildSplitAccountNormalizedBreakdown = ({ division, items = [] }) => {
   const normalizedItems = Array.isArray(items) ? items : [];
   const subtotalBase = roundMoney(normalizedItems.reduce(

@@ -8,6 +8,7 @@ import { buildVentaDetailPayloadForScope } from '../routers/ventas/handlers/vent
 import {
   buildSplitAccountNormalizedBreakdown,
   fetchCuentaDividida,
+  normalizePedidoPendingDetailItem,
   normalizeSplitAccountStandaloneExtra
 } from '../routers/ventas/services/ventaDetalleReadService.js';
 
@@ -71,6 +72,38 @@ test('cuenta dividida normaliza un unico extra independiente sin duplicarlo', ()
   assert.equal(item.subtotal_base, 0);
   assert.equal(item.subtotal_extras, 40);
   assert.equal(item.total_linea, 40);
+  assert.deepEqual(item.extras, []);
+});
+
+test('detalle real de pedido pendiente normaliza extra independiente con nombre y valores del snapshot', () => {
+  const item = normalizePedidoPendingDetailItem({
+    tipo_item: 'ITEM',
+    id_producto: null,
+    id_receta: null,
+    nombre_item: 'Item de pedido',
+    cantidad: 1,
+    precio_unitario: 0,
+    sub_total: 20,
+    total_linea: 20,
+    extras: [{
+      id_extra: 4,
+      nombre: 'Extra Ranch',
+      cantidad: 2,
+      precio_unitario: 10,
+      subtotal: 20
+    }]
+  });
+
+  assert.equal(item.tipo_item, 'EXTRA');
+  assert.equal(item.nombre_item, 'Extra Ranch');
+  assert.equal(item.nombre_producto, 'Extra Ranch');
+  assert.equal(item.es_linea_extra_independiente, true);
+  assert.equal(item.cantidad, 2);
+  assert.equal(item.precio_unitario, 10);
+  assert.equal(item.subtotal_base, 0);
+  assert.equal(item.subtotal_extras, 20);
+  assert.equal(item.subtotal_linea, 20);
+  assert.equal(item.total_linea, 20);
   assert.deepEqual(item.extras, []);
 });
 

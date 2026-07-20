@@ -206,6 +206,95 @@ test('fallo al persistir documento revierte y no deja trabajo incompleto', async
   assert.equal(fixture.calls.some((call) => call.sql === 'COMMIT'), false);
 });
 
+test('enqueue ejecuta la transicion de cocina dentro de la misma transaccion', async () => {
+  const order = [];
+  const fixture = createTransactionalDb(async (sql) => {
+    if (sql === 'BEGIN' || sql === 'COMMIT' || sql === 'ROLLBACK') {
+      order.push(sql);
+      return { rows: [] };
+    }
+    if (/INSERT INTO public\.trabajos_impresion\s/.test(sql)) {
+      order.push('JOB');
+      return { rows: [{ id_trabajo: 83, id_sucursal: 9, tipo_documento: 'comanda', estado: 'pendiente', inserted: true }] };
+    }
+    if (/INSERT INTO public\.trabajos_impresion_documentos/.test(sql)) {
+      order.push('DOCUMENT');
+      return { rows: [] };
+    }
+    throw new Error(`SQL inesperado: ${sql}`);
+  });
+
+  await enqueuePrintJob({
+    idSucursal: 9,
+    tipoDocumento: 'comanda',
+    payload: comandaPayloadV2,
+    canonicalDocument: comandaDataV2,
+    idempotencyKey: 'comanda:7:qa-kitchen',
+    idFactura: 7,
+    idPedido: 8,
+    db: fixture.db,
+    onInsertedTransaction: async ({ client, job }) => {
+      assert.equal(job.id_trabajo, 83);
+      assert.ok(client);
+      order.push('KITCHEN');
+    }
+  });
+
+  assert.deepEqual(order, ['BEGIN', 'JOB', 'DOCUMENT', 'KITCHEN', 'COMMIT']);
+});
+
+test('fallo de transicion de cocina revierte trabajo y documento', async () => {
+  const fixture = createTransactionalDb(async (sql) => {
+    if (sql === 'BEGIN' || sql === 'ROLLBACK') return { rows: [] };
+    if (/INSERT INTO public\.trabajos_impresion\s/.test(sql)) {
+      return { rows: [{ id_trabajo: 84, id_sucursal: 9, tipo_documento: 'comanda', estado: 'pendiente', inserted: true }] };
+    }
+    if (/INSERT INTO public\.trabajos_impresion_documentos/.test(sql)) return { rows: [] };
+    throw new Error(`SQL inesperado: ${sql}`);
+  });
+
+  await assert.rejects(() => enqueuePrintJob({
+    idSucursal: 9,
+    tipoDocumento: 'comanda',
+    payload: comandaPayloadV2,
+    canonicalDocument: comandaDataV2,
+    idempotencyKey: 'comanda:7:qa-kitchen-fail',
+    idFactura: 7,
+    idPedido: 8,
+    db: fixture.db,
+    onInsertedTransaction: async () => { throw new Error('kitchen transition failed'); }
+  }), /kitchen transition failed/);
+
+  assert.equal(fixture.calls.some((call) => call.sql === 'ROLLBACK'), true);
+  assert.equal(fixture.calls.some((call) => call.sql === 'COMMIT'), false);
+});
+
+test('reintento idempotente no vuelve a ejecutar la transicion de cocina', async () => {
+  let transitionCalls = 0;
+  const fixture = createTransactionalDb(async (sql) => {
+    if (sql === 'BEGIN' || sql === 'COMMIT') return { rows: [] };
+    if (/INSERT INTO public\.trabajos_impresion\s/.test(sql)) return { rows: [] };
+    if (/SELECT id_trabajo,id_sucursal,tipo_documento,estado,fecha_creacion,false AS inserted/.test(sql)) {
+      return { rows: [{ id_trabajo: 83, id_sucursal: 9, tipo_documento: 'comanda', estado: 'pendiente', inserted: false }] };
+    }
+    throw new Error(`SQL inesperado: ${sql}`);
+  });
+
+  await enqueuePrintJob({
+    idSucursal: 9,
+    tipoDocumento: 'comanda',
+    payload: comandaPayloadV2,
+    canonicalDocument: comandaDataV2,
+    idempotencyKey: 'comanda:7:qa-kitchen',
+    idFactura: 7,
+    idPedido: 8,
+    db: fixture.db,
+    onInsertedTransaction: async () => { transitionCalls += 1; }
+  });
+
+  assert.equal(transitionCalls, 0);
+});
+
 const allowedPrintRequest = (timestamp, jobId = 8, html = renderPrintJobHtml(payload)) => ({
   call: 'print',
   params: {
@@ -309,11 +398,14 @@ test('endpoint de pedido encola comanda inicial idempotente y reimpresion separa
     idPedido: 501,
     idUsuario: 44,
     esReimpresion: false,
-    payload: enqueueCalls[0].payload
+    payload: enqueueCalls[0].payload,
+    onInsertedTransaction: enqueueCalls[0].onInsertedTransaction
   });
+  assert.equal(typeof enqueueCalls[0].onInsertedTransaction, 'function');
   assert.deepEqual(enqueueCalls[0].payload.source, { id_factura: null, id_pedido: 501 });
   assert.equal(enqueueCalls[2].esReimpresion, true);
   assert.equal(enqueueCalls[2].idempotencyKey, 'comanda:pedido-reprint:501:qa-1');
+  assert.equal(enqueueCalls[2].onInsertedTransaction, undefined);
 
   const routerSource = fs.readFileSync(new URL('../routers/printing.js', import.meta.url), 'utf8');
   assert.match(routerSource, /router\.post\('\/ventas\/pedidos\/:idPedido\/print-jobs', checkPermission\(\['VENTAS_IMPRIMIR', 'VENTAS_CREAR'\]\)/);

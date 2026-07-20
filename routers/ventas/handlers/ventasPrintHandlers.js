@@ -9,6 +9,7 @@ import {
   normalizePrintEventPayload,
   registerVentaPrintEvent
 } from '../services/ventasPrintAuditService.js';
+import { markPedidoVisibleInKitchen } from '../services/pedidoKitchenVisibilityService.js';
 import {
   getQzSigningConfiguration,
   getQzPublicErrorMessage,
@@ -527,6 +528,7 @@ export const getPedidoKitchenComandaByIdHandler = async (req, res) => {
 };
 
 export const createVentaPrintEventHandler = async (req, res) => {
+  let client = null;
   try {
     const idFactura = parsePositiveInt(req.params.id);
     if (!idFactura) {
@@ -546,8 +548,10 @@ export const createVentaPrintEventHandler = async (req, res) => {
       return res.status(detailResult.status).json(detailResult.body);
     }
 
+    client = await pool.connect();
+    await client.query('BEGIN');
     const auditResult = await registerVentaPrintEvent({
-      client: pool,
+      client,
       idFactura,
       idPedido: detailResult.body?.id_pedido || null,
       idUsuario: req.user?.id_usuario || null,
@@ -555,12 +559,26 @@ export const createVentaPrintEventHandler = async (req, res) => {
       payload: normalized.value
     });
 
+    const isInitialKitchenDispatch = normalized.value.tipo_documento === 'COMANDA'
+      && normalized.value.estado === 'ENVIADA'
+      && String(normalized.value.metadata?.promptAction || '').trim().toLowerCase() === 'initial';
+    if (isInitialKitchenDispatch) {
+      await markPedidoVisibleInKitchen({
+        client,
+        idPedido: detailResult.body?.id_pedido
+      });
+    }
+    await client.query('COMMIT');
+
     return res.status(200).json({
       ok: true,
       ...auditResult
     });
   } catch (error) {
+    if (client) await client.query('ROLLBACK').catch(() => undefined);
     console.error('Error al registrar auditoria de impresion:', error);
     return sendVentasInternalError(res, 'No se pudo registrar el evento de impresion.');
+  } finally {
+    if (client) client.release();
   }
 };
