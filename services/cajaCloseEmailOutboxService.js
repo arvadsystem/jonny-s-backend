@@ -3,6 +3,7 @@ import { enviarCorreo } from '../utils/emailService.js';
 import {
   buildCajaCierrePdfBuffer,
   buildCajaCierrePdfFilename,
+  calculateTotalNetSales,
   formatCajaCierreDateTime
 } from '../utils/cajaCierreReportePdf.js';
 import { resolveCajaCloseEmailRecipient } from './cajaCloseNotificationService.js';
@@ -261,6 +262,8 @@ export const buildCajaCloseEmailHtml = ({ payload = {}, pdfAttached = false } = 
   const reviewDetail = payload.requiresAudit
     ? 'Este cierre requiere auditoria preventiva por recuento, diferencia o inconsistencia detectada durante el proceso de cierre.'
     : 'Este cierre fue registrado sin inconsistencias pendientes de auditoria.';
+  const ventasTotalesNetas = calculateTotalNetSales(payload);
+  const moneyCellStyle = 'text-align:right;white-space:nowrap;';
   return `<!doctype html>
 <html>
 <body style="font-family:Arial,sans-serif;color:#111827;">
@@ -276,14 +279,16 @@ export const buildCajaCloseEmailHtml = ({ payload = {}, pdfAttached = false } = 
     <tr><td><strong>Responsable</strong></td><td>${escapeHtml(resolveActorName({ nombre: actors.responsable_nombre, usuario: actors.responsable_usuario }))}</td></tr>
     <tr><td><strong>Usuario de cierre</strong></td><td>${escapeHtml(resolveActorName({ nombre: actors.cierre_nombre, usuario: actors.cierre_usuario }))}</td></tr>
     <tr><td><strong>Fecha/hora de cierre</strong></td><td>${escapeHtml(formatHtmlDateTime(payload.fechaCierre))}</td></tr>
-    <tr><td><strong>Monto de apertura</strong></td><td>${money(payload.montoApertura)}</td></tr>
-    <tr><td><strong>Ventas en efectivo</strong></td><td>${money(payload.ventasEfectivoNetas)}</td></tr>
-    <tr><td><strong>Ventas no efectivas</strong></td><td>${money(payload.ventasNoEfectivoNetas)}</td></tr>
-    <tr><td><strong>Total de ingresos manuales</strong></td><td>${money(payload.ingresosManuales)}</td></tr>
-    <tr><td><strong>Total de egresos manuales</strong></td><td>${money(payload.egresosManuales)}</td></tr>
-    <tr><td><strong>Total teorico</strong></td><td>${money(payload.montoTeorico)}</td></tr>
-    <tr><td><strong>Total declarado</strong></td><td>${money(payload.montoDeclaradoCierre)}</td></tr>
-    <tr><td><strong>Diferencia</strong></td><td>${money(payload.diferencia)}</td></tr>
+    <tr><td><strong>Monto de apertura</strong></td><td style="${moneyCellStyle}">${money(payload.montoApertura)}</td></tr>
+    <tr><td colspan="2" style="background:#f2f4f7;"><strong>Ventas</strong></td></tr>
+    <tr><td style="padding-left:18px;">Ventas en efectivo</td><td style="${moneyCellStyle}">${money(payload.ventasEfectivoNetas)}</td></tr>
+    <tr><td style="padding-left:18px;">Ventas no efectivo</td><td style="${moneyCellStyle}">${money(payload.ventasNoEfectivoNetas)}</td></tr>
+    <tr><td style="border-top:1px solid #98a2b3;"><strong>Total ventas</strong></td><td style="border-top:1px solid #98a2b3;${moneyCellStyle}"><strong>${money(ventasTotalesNetas)}</strong></td></tr>
+    <tr><td><strong>Total de ingresos manuales</strong></td><td style="${moneyCellStyle}">${money(payload.ingresosManuales)}</td></tr>
+    <tr><td><strong>Total de egresos manuales</strong></td><td style="${moneyCellStyle}">${money(payload.egresosManuales)}</td></tr>
+    <tr><td><strong>Total teorico</strong></td><td style="${moneyCellStyle}">${money(payload.montoTeorico)}</td></tr>
+    <tr><td><strong>Total declarado</strong></td><td style="${moneyCellStyle}">${money(payload.montoDeclaradoCierre)}</td></tr>
+    <tr><td><strong>Diferencia</strong></td><td style="${moneyCellStyle}">${money(payload.diferencia)}</td></tr>
     <tr><td><strong>Resolucion</strong></td><td>${escapeHtml(resolutionLabel)}</td></tr>
     <tr><td><strong>Estado de nomina</strong></td><td>${escapeHtml(payrollLabel)}</td></tr>
     <tr><td><strong>ID movimiento de planilla</strong></td><td>${escapeHtml(payrollMovementId)}</td></tr>
