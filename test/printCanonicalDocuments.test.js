@@ -13,6 +13,8 @@ import {
   createCanonicalPrintJob,
   createCanonicalPrintJobPayload,
   getCanonicalPrintDocumentForAgent,
+  HISTORICAL_V2_DOCUMENT_CANDIDATES,
+  MAX_CANONICAL_PDF_BYTES,
   renderCanonicalPrintJobDocument,
   validateCanonicalPrintPayload
 } from '../services/printJobDocumentService.js';
@@ -720,22 +722,91 @@ test('agente prueba v2 corregido antes del fallback v2 legacy para trabajos sin 
     widthMm: 80,
     source: { id_factura: facturaFixture.id_factura, id_pedido: null }
   });
-  const normalizationAttempts = [];
+  const sourceAttempts = [];
 
   const result = await getCanonicalPrintDocumentForAgent({
     agent,
     jobId: 91,
     db: createDocumentDb(buildJob({ payload })).db,
-    loadVenta: async ({ normalizeStandaloneExtras }) => {
-      normalizationAttempts.push(normalizeStandaloneExtras);
+    loadVenta: async ({ normalizeStandaloneExtras, useHistoricalFacturacionSnapshot }) => {
+      sourceAttempts.push({ normalizeStandaloneExtras, useHistoricalFacturacionSnapshot });
       return { status: 200, body: facturaFixture };
     }
   });
 
-  assert.deepEqual(normalizationAttempts, [true, false]);
+  assert.deepEqual(sourceAttempts, [
+    { normalizeStandaloneExtras: true, useHistoricalFacturacionSnapshot: true },
+    { normalizeStandaloneExtras: true, useHistoricalFacturacionSnapshot: false },
+    { normalizeStandaloneExtras: false, useHistoricalFacturacionSnapshot: true }
+  ]);
   const bytes = Buffer.from(result.document.data, 'base64');
   assert.equal(bytes.length, LEGACY_V2_BASELINES.factura.bytes);
   assert.equal(sha256(bytes), LEGACY_V2_BASELINES.factura.sha256);
+});
+
+test('fallback v2 usa orden explicito y detiene candidatos despues de la primera coincidencia', async () => {
+  assert.deepEqual(HISTORICAL_V2_DOCUMENT_CANDIDATES.map((candidate) => candidate.name), [
+    'current-historical-snapshot',
+    'current-previous-loader',
+    'legacy-historical-snapshot',
+    'legacy-previous-loader'
+  ]);
+
+  const currentPayload = await createCanonicalPrintJobPayload({
+    tipoDocumento: 'factura', venta: facturaFixture, widthMm: 80
+  });
+  const alteredVenta = structuredClone(facturaFixture);
+  alteredVenta.items[0].nombre_item = 'Fuente historica diferente';
+  const currentAttempts = [];
+  await getCanonicalPrintDocumentForAgent({
+    agent,
+    jobId: 91,
+    db: createDocumentDb(buildJob({ payload: currentPayload })).db,
+    loadVenta: async (args) => {
+      currentAttempts.push({
+        normalizeStandaloneExtras: args.normalizeStandaloneExtras,
+        useHistoricalFacturacionSnapshot: args.useHistoricalFacturacionSnapshot
+      });
+      return {
+        status: 200,
+        body: args.useHistoricalFacturacionSnapshot ? alteredVenta : facturaFixture
+      };
+    }
+  });
+  assert.deepEqual(currentAttempts, [
+    { normalizeStandaloneExtras: true, useHistoricalFacturacionSnapshot: true },
+    { normalizeStandaloneExtras: true, useHistoricalFacturacionSnapshot: false }
+  ]);
+
+  const legacyPayload = buildLegacyV2Payload({
+    tipoDocumento: 'factura',
+    descriptor: LEGACY_V2_BASELINES.factura,
+    widthMm: 80,
+    source: { id_factura: facturaFixture.id_factura, id_pedido: null }
+  });
+  const legacyAttempts = [];
+  const legacyResult = await getCanonicalPrintDocumentForAgent({
+    agent,
+    jobId: 91,
+    db: createDocumentDb(buildJob({ payload: legacyPayload })).db,
+    loadVenta: async (args) => {
+      legacyAttempts.push({
+        normalizeStandaloneExtras: args.normalizeStandaloneExtras,
+        useHistoricalFacturacionSnapshot: args.useHistoricalFacturacionSnapshot
+      });
+      const finalCandidate = args.normalizeStandaloneExtras === false
+        && args.useHistoricalFacturacionSnapshot === false;
+      return { status: 200, body: finalCandidate ? facturaFixture : alteredVenta };
+    }
+  });
+  assert.deepEqual(legacyAttempts, HISTORICAL_V2_DOCUMENT_CANDIDATES.map((candidate) => ({
+    normalizeStandaloneExtras: candidate.normalizeStandaloneExtras,
+    useHistoricalFacturacionSnapshot: candidate.useHistoricalFacturacionSnapshot
+  })));
+  assert.equal(
+    sha256(Buffer.from(legacyResult.document.data, 'base64')),
+    LEGACY_V2_BASELINES.factura.sha256
+  );
 });
 
 test('comanda v2 legacy regenera identico y es aceptada por el agente', async () => {
@@ -793,6 +864,7 @@ test('documento persistido conserva bytes aunque cambien logo y configuracion vi
   const content = Buffer.from(created.document.data, 'base64');
   const persisted = {
     persisted_document_id: 7001,
+    persisted_job_id: 91,
     persisted_schema_version: 2,
     persisted_tipo_documento: 'factura',
     persisted_formato: 'pdf',
@@ -822,4 +894,85 @@ test('documento persistido conserva bytes aunque cambien logo y configuracion vi
   assert.equal(renderSourceLoads, 0);
   assert.equal(result.document.data, created.document.data);
   assert.equal(sha256(Buffer.from(result.document.data, 'base64')), created.payload.documento_canonico.content_sha256);
+});
+
+test('documento persistido falla cerrado ante contenido, descriptor, tipo, schema o trabajo alterado', async () => {
+  const created = await createCanonicalPrintJob({
+    tipoDocumento: 'factura', venta: facturaFixture, widthMm: 80
+  });
+  const content = Buffer.from(created.document.data, 'base64');
+  const persisted = {
+    persisted_document_id: 7001,
+    persisted_job_id: 91,
+    persisted_schema_version: 2,
+    persisted_tipo_documento: 'factura',
+    persisted_formato: 'pdf',
+    persisted_flavor: 'base64',
+    persisted_content: content,
+    persisted_content_sha256: created.payload.documento_canonico.content_sha256,
+    persisted_content_bytes: created.payload.documento_canonico.content_bytes
+  };
+  const alteredContent = Buffer.from(content);
+  alteredContent[alteredContent.length - 1] ^= 1;
+  const mutations = [
+    { name: 'contenido', value: { persisted_content: alteredContent } },
+    { name: 'hash', value: { persisted_content_sha256: '0'.repeat(64) } },
+    { name: 'bytes', value: { persisted_content_bytes: content.length + 1 } },
+    { name: 'tipo', value: { persisted_tipo_documento: 'comanda' } },
+    { name: 'formato', value: { persisted_formato: 'html' } },
+    { name: 'flavor', value: { persisted_flavor: 'plain' } },
+    { name: 'schema', value: { persisted_schema_version: 1 } },
+    { name: 'otro trabajo', value: { persisted_job_id: 92 } }
+  ];
+
+  for (const mutation of mutations) {
+    let sourceLoads = 0;
+    await assert.rejects(
+      () => getCanonicalPrintDocumentForAgent({
+        agent,
+        jobId: 91,
+        db: createDocumentDb(buildJob({
+          payload: created.payload,
+          persisted: { ...persisted, ...mutation.value }
+        })).db,
+        loadVenta: async () => {
+          sourceLoads += 1;
+          return facturaFixture;
+        }
+      }),
+      (error) => error.code === 'PRINT_DOCUMENT_STORED_INVALID',
+      mutation.name
+    );
+    assert.equal(sourceLoads, 0, mutation.name);
+  }
+
+  const oversizedPayload = structuredClone(created.payload);
+  oversizedPayload.documento_canonico.content_bytes = MAX_CANONICAL_PDF_BYTES + 1;
+  await assert.rejects(
+    () => getCanonicalPrintDocumentForAgent({
+      agent,
+      jobId: 91,
+      db: createDocumentDb(buildJob({ payload: oversizedPayload, persisted })).db
+    }),
+    (error) => error.code === 'PRINT_DOCUMENT_JOB_MISMATCH'
+  );
+});
+
+test('documento rechaza sucursal o agente inconsistentes aunque el adaptador devuelva una fila', async () => {
+  const payload = await createCanonicalPrintJobPayload({
+    tipoDocumento: 'factura', venta: facturaFixture, widthMm: 80
+  });
+  for (const mismatch of [
+    { id_sucursal: agent.id_sucursal + 1 },
+    { id_agente_tomado: '22222222-2222-2222-2222-222222222222' }
+  ]) {
+    await assert.rejects(
+      () => getCanonicalPrintDocumentForAgent({
+        agent,
+        jobId: 91,
+        db: createDocumentDb({ ...buildJob({ payload }), ...mismatch }).db
+      }),
+      (error) => error.code === 'PRINT_DOCUMENT_JOB_NOT_ACTIVE'
+    );
+  }
 });

@@ -849,15 +849,36 @@ test('migracion protege Data API, funcion y hash SHA-256 sin ejecutarse', () => 
   assert.match(migration, /REVOKE ALL ON SEQUENCE public\.trabajos_impresion_id_trabajo_seq/);
 });
 
-test('migracion de documentos canonicos impone uno por trabajo, RLS y rollback', () => {
+test('migracion de documentos canonicos replica el endurecimiento QA sin privilegios service_role', () => {
   const migration = fs.readFileSync(new URL('../sql/20260719_create_print_job_documents.sql', import.meta.url), 'utf8');
   const rollback = fs.readFileSync(new URL('../sql/20260719_create_print_job_documents_ROLLBACK.sql', import.meta.url), 'utf8');
-  assert.match(migration, /CREATE TABLE IF NOT EXISTS public\.trabajos_impresion_documentos/);
+  const verification = fs.readFileSync(new URL('../sql/20260719_verify_print_job_documents.sql', import.meta.url), 'utf8');
+  assert.match(migration, /current_user <> 'postgres'/);
+  assert.match(migration, /trabajos_impresion\.id_trabajo debe ser la PK/);
+  assert.match(migration, /extensions\.digest\(bytea,text\)/);
+  assert.match(migration, /CREATE TABLE public\.trabajos_impresion_documentos/);
+  assert.doesNotMatch(migration, /CREATE TABLE IF NOT EXISTS/);
+  assert.match(migration, /GENERATED ALWAYS AS IDENTITY/);
+  assert.match(migration, /OWNER TO postgres/);
   assert.match(migration, /UNIQUE \(id_trabajo\)/);
+  assert.match(migration, /REFERENCES public\.trabajos_impresion\(id_trabajo\)[\s\S]*ON DELETE CASCADE/);
   assert.match(migration, /schema_version = 2/);
   assert.match(migration, /octet_length\(contenido\) = content_bytes/);
+  assert.match(migration, /content_bytes <= 2097152/);
+  assert.match(migration, /content_bytes <= 262144/);
+  assert.match(migration, /encode\(extensions\.digest\(contenido, 'sha256'\), 'hex'\)/);
   assert.match(migration, /ENABLE ROW LEVEL SECURITY/);
-  assert.match(migration, /REVOKE ALL ON TABLE public\.trabajos_impresion_documentos FROM anon, authenticated/);
+  assert.match(migration, /REVOKE ALL ON TABLE public\.trabajos_impresion_documentos[\s\S]*FROM PUBLIC, anon, authenticated, service_role/);
+  assert.match(migration, /REVOKE ALL ON SEQUENCE public\.trabajos_impresion_documentos_id_documento_seq[\s\S]*FROM PUBLIC, anon, authenticated, service_role/);
+  assert.doesNotMatch(migration, /GRANT[\s\S]*TO service_role/);
   assert.doesNotMatch(migration, /CREATE POLICY/);
+  assert.match(migration, /POSTFLIGHT_FAILED/);
+  assert.match(migration, /faltan restricciones/);
   assert.match(rollback, /DROP TABLE IF EXISTS public\.trabajos_impresion_documentos/);
+  assert.match(rollback, /ROLLBACK_REQUIRES_POSTGRES/);
+  assert.match(verification, /is_identity/);
+  assert.match(verification, /service_role_select/);
+  assert.match(verification, /service_role_sequence_usage/);
+  assert.match(verification, /hashes_invalidos/);
+  assert.match(verification, /trabajos_v2_sin_documento/);
 });

@@ -217,6 +217,9 @@ const attachDetailExtras = (item, extras, { normalizeStandaloneExtras = true } =
     standaloneExtra.precio_unitario,
     cantidad > 0 ? roundMoney(Number(subtotal) / cantidad) : roundMoney(item.precio_unitario)
   );
+  const totalLinea = Number.isFinite(Number(item.total_linea))
+    ? roundMoney(item.total_linea)
+    : subtotal;
 
   return {
     ...item,
@@ -231,7 +234,7 @@ const attachDetailExtras = (item, extras, { normalizeStandaloneExtras = true } =
     precio_unitario: precioUnitario,
     sub_total: subtotal,
     subtotal_linea: subtotal,
-    total_linea: subtotal,
+    total_linea: totalLinea,
     extras
   };
 };
@@ -244,6 +247,7 @@ export const buildVentaDetailPayloadForScope = async ({
   idUsuarioDetalle = null,
   normalizeStandaloneExtras = true,
   useHistoricalFacturacionSnapshot = false,
+  loadReversiones = listFacturaReversiones,
   queryRunner = pool
 }) => {
   const normalizedSucursalIds = (Array.isArray(allowedSucursalIds) ? allowedSucursalIds : [])
@@ -279,7 +283,7 @@ export const buildVentaDetailPayloadForScope = async ({
 
   const normalizedUsuarioDetalle = parsePositiveInt(idUsuarioDetalle);
   const reversiones = normalizedUsuarioDetalle
-    ? await listFacturaReversiones({
+    ? await loadReversiones({
       idFactura: venta.id_factura,
       idUsuario: normalizedUsuarioDetalle
     })

@@ -11,6 +11,32 @@ export const SUPPORTED_CANONICAL_SCHEMA_VERSIONS = Object.freeze([CANONICAL_PRIN
 export const MAX_CANONICAL_PDF_BYTES = 2 * 1024 * 1024;
 export const MAX_CANONICAL_HTML_BYTES = 256 * 1024;
 export const MAX_AGENT_QZ_SIGN_REQUEST_BYTES = 3 * 1024 * 1024;
+export const HISTORICAL_V2_DOCUMENT_CANDIDATES = Object.freeze([
+  Object.freeze({
+    name: 'current-historical-snapshot',
+    renderVariant: 'current',
+    normalizeStandaloneExtras: true,
+    useHistoricalFacturacionSnapshot: true
+  }),
+  Object.freeze({
+    name: 'current-previous-loader',
+    renderVariant: 'current',
+    normalizeStandaloneExtras: true,
+    useHistoricalFacturacionSnapshot: false
+  }),
+  Object.freeze({
+    name: 'legacy-historical-snapshot',
+    renderVariant: 'legacy',
+    normalizeStandaloneExtras: false,
+    useHistoricalFacturacionSnapshot: true
+  }),
+  Object.freeze({
+    name: 'legacy-previous-loader',
+    renderVariant: 'legacy',
+    normalizeStandaloneExtras: false,
+    useHistoricalFacturacionSnapshot: false
+  })
+]);
 
 const PAYLOAD_KEYS = Object.freeze([
   'schema_version',
@@ -300,7 +326,8 @@ const buildPersistedCanonicalDataItem = ({ job, validation }) => {
     ? job.persisted_content
     : Buffer.from(job.persisted_content || []);
   const descriptor = job.payload.documento_canonico;
-  if (Number(job.persisted_schema_version) !== validation.schemaVersion
+  if (Number(job.persisted_job_id) !== Number(job.id_trabajo)
+    || Number(job.persisted_schema_version) !== validation.schemaVersion
     || job.persisted_tipo_documento !== job.tipo_documento
     || job.persisted_formato !== validation.contract.format
     || job.persisted_flavor !== validation.contract.flavor
@@ -337,6 +364,7 @@ export const getCanonicalPrintDocumentForAgent = async ({
             ti.payload,ti.id_factura,ti.id_pedido,
             (lease_expires_at IS NOT NULL AND lease_expires_at > now()) AS lease_active
             ,tid.id_documento AS persisted_document_id
+            ,tid.id_trabajo AS persisted_job_id
             ,tid.schema_version AS persisted_schema_version
             ,tid.tipo_documento AS persisted_tipo_documento
             ,tid.formato AS persisted_formato
@@ -351,7 +379,11 @@ export const getCanonicalPrintDocumentForAgent = async ({
     [jobId, agent.id_sucursal, agent.id_agente]
   );
   const job = result.rows[0];
-  if (!job) throw printDocumentError('PRINT_DOCUMENT_JOB_NOT_ACTIVE', 'Trabajo de impresion no autorizado.', 404);
+  if (!job
+    || Number(job.id_sucursal) !== Number(agent.id_sucursal)
+    || String(job.id_agente_tomado || '') !== String(agent.id_agente || '')) {
+    throw printDocumentError('PRINT_DOCUMENT_JOB_NOT_ACTIVE', 'Trabajo de impresion no autorizado.', 404);
+  }
 
   const state = String(job.estado || '');
   const allowedState = state === 'confirmacion_pendiente'
@@ -371,68 +403,81 @@ export const getCanonicalPrintDocumentForAgent = async ({
   const persistedDocument = buildPersistedCanonicalDataItem({ job, validation });
   if (persistedDocument) return { job, document: persistedDocument };
 
-  const loadSource = async (normalizeStandaloneExtras) => {
-    let detailResult;
-    if (validation.idFactura) {
-      detailResult = loadVenta
-        ? await loadVenta({
-          idFactura: validation.idFactura,
-          idSucursal: Number(agent.id_sucursal),
-          includePrintAssets: job.tipo_documento === 'factura',
-          normalizeStandaloneExtras,
-          useHistoricalFacturacionSnapshot: true
-        })
-        : await buildVentaDetailPayloadForScope({
-          idFactura: validation.idFactura,
-          includePrintAssets: job.tipo_documento === 'factura',
-          allowedSucursalIds: [Number(agent.id_sucursal)],
-          limitedToLast72Hours: false,
-          idUsuarioDetalle: null,
-          normalizeStandaloneExtras,
-          useHistoricalFacturacionSnapshot: true,
-          queryRunner: db
-        });
-    } else if (job.tipo_documento === 'comanda' && validation.idPedido) {
-      detailResult = loadPedido
-        ? await loadPedido({
-          idPedido: validation.idPedido,
-          idSucursal: Number(agent.id_sucursal),
-          normalizeStandaloneExtras,
-          queryRunner: db
-        })
-        : await buildPedidoKitchenPrintPayload(db, validation.idPedido, { normalizeStandaloneExtras });
-    }
-    const venta = detailResult?.status === 200 ? detailResult.body : detailResult;
-    if (!venta
-      || parsePositiveId(venta.id_factura) !== validation.idFactura
-      || parsePositiveId(venta.id_pedido) !== validation.idPedido
-      || Number(venta.id_sucursal) !== Number(agent.id_sucursal)) {
-      throw printDocumentError('PRINT_DOCUMENT_SOURCE_NOT_FOUND', 'No se encontro la fuente autorizada del documento.', 404);
-    }
-    return venta;
+  const sourceCache = new Map();
+  const loadSource = async ({ normalizeStandaloneExtras, useHistoricalFacturacionSnapshot }) => {
+    const cacheKey = validation.idFactura
+      ? `factura:${normalizeStandaloneExtras}:${useHistoricalFacturacionSnapshot}`
+      : `pedido:${normalizeStandaloneExtras}`;
+    if (sourceCache.has(cacheKey)) return { cacheKey, venta: await sourceCache.get(cacheKey) };
+
+    const sourcePromise = (async () => {
+      let detailResult;
+      if (validation.idFactura) {
+        detailResult = loadVenta
+          ? await loadVenta({
+            idFactura: validation.idFactura,
+            idSucursal: Number(agent.id_sucursal),
+            includePrintAssets: job.tipo_documento === 'factura',
+            normalizeStandaloneExtras,
+            useHistoricalFacturacionSnapshot
+          })
+          : await buildVentaDetailPayloadForScope({
+            idFactura: validation.idFactura,
+            includePrintAssets: job.tipo_documento === 'factura',
+            allowedSucursalIds: [Number(agent.id_sucursal)],
+            limitedToLast72Hours: false,
+            idUsuarioDetalle: null,
+            normalizeStandaloneExtras,
+            useHistoricalFacturacionSnapshot,
+            queryRunner: db
+          });
+      } else if (job.tipo_documento === 'comanda' && validation.idPedido) {
+        detailResult = loadPedido
+          ? await loadPedido({
+            idPedido: validation.idPedido,
+            idSucursal: Number(agent.id_sucursal),
+            normalizeStandaloneExtras,
+            queryRunner: db
+          })
+          : await buildPedidoKitchenPrintPayload(db, validation.idPedido, { normalizeStandaloneExtras });
+      }
+      const venta = detailResult?.status === 200 ? detailResult.body : detailResult;
+      if (!venta
+        || parsePositiveId(venta.id_factura) !== validation.idFactura
+        || parsePositiveId(venta.id_pedido) !== validation.idPedido
+        || Number(venta.id_sucursal) !== Number(agent.id_sucursal)) {
+        throw printDocumentError('PRINT_DOCUMENT_SOURCE_NOT_FOUND', 'No se encontro la fuente autorizada del documento.', 404);
+      }
+      return venta;
+    })();
+    sourceCache.set(cacheKey, sourcePromise);
+    return { cacheKey, venta: await sourcePromise };
   };
 
-  const currentVenta = await loadSource(true);
-  try {
-    return {
-      job,
-      document: await renderCanonicalPrintJobDocument({
-        payload: job.payload,
-        venta: currentVenta,
-        renderVariants: ['current']
-      })
-    };
-  } catch (error) {
-    if (error?.code !== 'PRINT_DOCUMENT_CHANGED') throw error;
+  const attemptedRenders = new Set();
+  let mismatchError = null;
+  for (const candidate of HISTORICAL_V2_DOCUMENT_CANDIDATES) {
+    const { cacheKey, venta } = await loadSource(candidate);
+    const renderKey = `${candidate.renderVariant}:${cacheKey}`;
+    if (attemptedRenders.has(renderKey)) continue;
+    attemptedRenders.add(renderKey);
+    try {
+      return {
+        job,
+        document: await renderCanonicalPrintJobDocument({
+          payload: job.payload,
+          venta,
+          renderVariants: [candidate.renderVariant]
+        })
+      };
+    } catch (error) {
+      if (error?.code !== 'PRINT_DOCUMENT_CHANGED') throw error;
+      mismatchError = error;
+    }
   }
-
-  const legacyVenta = await loadSource(false);
-  return {
-    job,
-    document: await renderCanonicalPrintJobDocument({
-      payload: job.payload,
-      venta: legacyVenta,
-      renderVariants: ['legacy']
-    })
-  };
+  throw mismatchError || printDocumentError(
+    'PRINT_DOCUMENT_CHANGED',
+    'El documento canonico cambio desde que se creo el trabajo.',
+    409
+  );
 };

@@ -5,7 +5,11 @@ import { buildPedidoKitchenPrintPayload } from '../routers/ventas/services/pedid
 import { buildComandaCocinaHtml } from '../services/comandaCocinaHtmlService.js';
 import { buildVentaTicketPdfDefinition } from '../routers/ventas/services/ventaTicketPdfService.js';
 import { buildVentaDetailPayloadForScope } from '../routers/ventas/handlers/ventasReadHandlers.js';
-import { normalizeSplitAccountStandaloneExtra } from '../routers/ventas/services/ventaDetalleReadService.js';
+import {
+  buildSplitAccountNormalizedBreakdown,
+  fetchCuentaDividida,
+  normalizeSplitAccountStandaloneExtra
+} from '../routers/ventas/services/ventaDetalleReadService.js';
 
 test('linea sin producto/receta con exactamente un extra se clasifica como EXTRA con snapshot financiero', () => {
   const result = resolveStandaloneExtraLine({
@@ -91,7 +95,8 @@ for (const scenario of [
   { name: 'sin descuento e impuestos deshabilitados', descuento_total: 0, isv_total: 0, total_linea: 40 },
   { name: 'descuento de linea', descuento_total: 5, isv_total: 0, total_linea: 35 },
   { name: 'descuento global persistido', descuento_total: 4, isv_total: 0, total_linea: 36 },
-  { name: 'impuestos habilitados', descuento_total: 0, isv_total: 6, total_linea: 46 }
+  { name: 'impuestos habilitados', descuento_total: 0, isv_total: 6, total_linea: 46 },
+  { name: 'descuento mas ISV', descuento_total: 5, isv_total: 5.25, total_linea: 40.25 }
 ]) {
   test(`cuenta dividida conserva snapshot fiscal para extra independiente: ${scenario.name}`, () => {
     const item = normalizeSplitAccountStandaloneExtra({
@@ -114,32 +119,123 @@ for (const scenario of [
   });
 }
 
+test('desglose normalizado clasifica productos, recetas y extras sin reemplazar el total historico', () => {
+  const standalone = normalizeSplitAccountStandaloneExtra({
+    tipo_item: 'ITEM', id_producto: null, id_receta: null,
+    subtotal_base: 40, subtotal_extras: 40, total_linea: 40,
+    extras: [{ nombre: 'Extra Ranch', cantidad: 4, precio_unitario: 10, subtotal: 40 }]
+  });
+  const scenarios = [
+    {
+      name: 'producto',
+      items: [{ tipo_item: 'PRODUCTO', subtotal_base: 100, subtotal_extras: 0 }],
+      expected: { base: 100, extras: 0 }
+    },
+    {
+      name: 'receta',
+      items: [{ tipo_item: 'RECETA', subtotal_base: 80, subtotal_extras: 0 }],
+      expected: { base: 80, extras: 0 }
+    },
+    {
+      name: 'producto con extra asociado',
+      items: [{ tipo_item: 'PRODUCTO', subtotal_base: 100, subtotal_extras: 20 }],
+      expected: { base: 100, extras: 20 }
+    },
+    { name: 'extra independiente', items: [standalone], expected: { base: 0, extras: 40 } },
+    {
+      name: 'mezcla',
+      items: [{ tipo_item: 'PRODUCTO', subtotal_base: 100, subtotal_extras: 20 }, standalone],
+      expected: { base: 100, extras: 60 }
+    }
+  ];
+
+  for (const scenario of scenarios) {
+    const division = { descuento_total: 40, isv_total: 5, total: 125 };
+    const result = buildSplitAccountNormalizedBreakdown({ division, items: scenario.items });
+    assert.equal(result.subtotal_base, scenario.expected.base, scenario.name);
+    assert.equal(result.subtotal_extras, scenario.expected.extras, scenario.name);
+    assert.equal(result.descuento_total, 40, scenario.name);
+    assert.equal(result.isv_total, 5, scenario.name);
+    assert.equal(result.total, 125, scenario.name);
+  }
+});
+
+const buildSplitAccountQueryRunner = ({ divisions, items, cobros = [] }) => ({
+  query: async (sql) => {
+    if (/FROM public\.ventas_cuenta_divisiones vcd/i.test(sql)) {
+      return { rowCount: divisions.length, rows: divisions };
+    }
+    if (/FROM public\.ventas_cuenta_division_items/i.test(sql)) {
+      return { rowCount: items.length, rows: items };
+    }
+    if (/FROM public\.facturas_cobros fc/i.test(sql)) {
+      return { rowCount: cobros.length, rows: cobros };
+    }
+    throw new Error(`SQL inesperado: ${sql}`);
+  }
+});
+
 for (const scenario of [
-  { name: 'reversion parcial pagada', estado_pago: 'PAGADA', monto_reversado: 20, saldo_historico: 20 },
-  { name: 'reversion total pagada', estado_pago: 'PAGADA', monto_reversado: 40, saldo_historico: 0 },
-  { name: 'pago pendiente', estado_pago: 'PENDIENTE', monto_reversado: 0, saldo_historico: 40 }
+  { name: 'cuenta pendiente', estado: 'PENDIENTE', pagado: 0, pendiente: 40, cobros: [] },
+  { name: 'pago parcial', estado: 'PENDIENTE', pagado: 20, pendiente: 20, cobros: [{ monto: 20 }] },
+  { name: 'pago completo', estado: 'PAGADA', pagado: 40, pendiente: 0, cobros: [{ monto: 40 }] }
 ]) {
-  test(`normalizar extra no altera metadatos historicos de ${scenario.name}`, () => {
-    const item = normalizeSplitAccountStandaloneExtra({
+  test(`fetchCuentaDividida conserva importes historicos para ${scenario.name}`, async () => {
+    const division = {
+      id_cuenta_division: 51,
+      id_factura: 12,
+      id_pedido: 501,
+      etiqueta: 'Persona 1',
+      orden: 1,
+      subtotal_base: 40,
+      subtotal_extras: 40,
+      descuento_total: 40,
+      isv_total: 0,
+      total: 40,
+      monto_pagado: scenario.pagado,
+      monto_pendiente: scenario.pendiente,
+      estado: scenario.estado
+    };
+    const item = {
+      id_cuenta_division: 51,
+      id_cuenta_division_item: 61,
       tipo_item: 'ITEM',
       id_producto: null,
       id_receta: null,
-      nombre_item: 'Item de pedido',
-      cantidad: 1,
+      nombre_item_snapshot: 'Item de pedido',
+      cantidad: 4,
+      precio_unitario: 10,
+      subtotal_base: 0,
       subtotal_extras: 40,
       descuento_total: 0,
       isv_total: 0,
       total_linea: 40,
-      estado_pago: scenario.estado_pago,
-      monto_reversado: scenario.monto_reversado,
-      saldo_historico: scenario.saldo_historico,
-      extras: [{ nombre: 'Extra papas', cantidad: 1, precio_unitario: 40, subtotal: 40 }]
-    });
+      extras_snapshot: [{ nombre: 'Extra Ranch', cantidad: 4, precio_unitario: 10, subtotal: 40 }],
+      complementos_snapshot: [],
+      origen_snapshot: {}
+    };
+    const cobros = scenario.cobros.map((cobro, index) => ({
+      id_factura_cobro: index + 1,
+      id_cuenta_division: 51,
+      id_metodo_pago: 1,
+      metodo_pago: 'Efectivo',
+      monto: cobro.monto
+    }));
+    const result = await fetchCuentaDividida(buildSplitAccountQueryRunner({
+      divisions: [division], items: [item], cobros
+    }), { idFactura: 12, idPedido: 501 });
 
-    assert.equal(item.estado_pago, scenario.estado_pago);
-    assert.equal(item.monto_reversado, scenario.monto_reversado);
-    assert.equal(item.saldo_historico, scenario.saldo_historico);
-    assert.equal(item.total_linea, 40);
+    assert.equal(result.total, 40);
+    assert.equal(result.monto_pagado, scenario.pagado);
+    assert.equal(result.monto_pendiente, scenario.pendiente);
+    assert.equal(result.divisiones[0].subtotal_base, 40);
+    assert.equal(result.divisiones[0].subtotal_extras, 40);
+    assert.equal(result.divisiones[0].descuento_total, 40);
+    assert.equal(result.divisiones[0].desglose_normalizado.subtotal_base, 0);
+    assert.equal(result.divisiones[0].desglose_normalizado.subtotal_extras, 40);
+    assert.equal(result.divisiones[0].desglose_normalizado.total, 40);
+    assert.equal(result.divisiones[0].items[0].nombre_item, 'Extra Ranch');
+    assert.deepEqual(result.divisiones[0].items[0].extras, []);
   });
 }
 
@@ -246,7 +342,7 @@ test('el ticket de factura no duplica el extra como fila y como detalle anidado'
 
 // --- Prueba integral post-facturacion: buildVentaDetailPayloadForScope --------
 
-const buildFacturaDetailQueryRunner = () => {
+const buildFacturaDetailQueryRunner = ({ itemOverrides = {}, divisions = [], divisionItems = [], cobros = [] } = {}) => {
   const kitchenRow = {
     id_detalle: 71,
     id_detalle_pedido: 501,
@@ -262,7 +358,8 @@ const buildFacturaDetailQueryRunner = () => {
     total_linea: 40,
     descuento: 0, descuento_linea: 0, descuento_global: 0,
     observacion: null,
-    origen_snapshot: {}
+    origen_snapshot: {},
+    ...itemOverrides
   };
   const facturaExtraRow = {
     id_detalle_factura: 71,
@@ -290,7 +387,15 @@ const buildFacturaDetailQueryRunner = () => {
       if (/FROM\s+public\.detalle_factura_extras/i.test(sql)) {
         return { rowCount: 1, rows: [facturaExtraRow] };
       }
-      if (/ventas_cuenta_divisiones/i.test(sql)) return { rowCount: 0, rows: [] };
+      if (/FROM public\.ventas_cuenta_divisiones vcd/i.test(sql)) {
+        return { rowCount: divisions.length, rows: divisions };
+      }
+      if (/FROM public\.ventas_cuenta_division_items/i.test(sql)) {
+        return { rowCount: divisionItems.length, rows: divisionItems };
+      }
+      if (/FROM public\.facturas_cobros fc/i.test(sql)) {
+        return { rowCount: cobros.length, rows: cobros };
+      }
       if (/pedidos_delivery|pedidos_contacto|pedidos_contexto/i.test(sql)) return { rowCount: 0, rows: [] };
       return { rowCount: 0, rows: [] };
     }
@@ -318,6 +423,74 @@ test('buildVentaDetailPayloadForScope normaliza el extra independiente con preci
   assert.ok(!names.includes('Item de pedido'), 'no debe aparecer "Item de pedido"');
   assert.ok(!names.includes('Item de cocina'), 'no debe aparecer "Item de cocina"');
   assert.equal(names.filter((n) => n === 'Extra Ranch').length, 1);
+});
+
+for (const scenario of [
+  { name: 'sin descuento', descuento: 0, isv: 0, total: 40 },
+  { name: 'con descuento', descuento: 5, isv: 0, total: 35 },
+  { name: 'con ISV', descuento: 0, isv: 6, total: 46 },
+  { name: 'con descuento e ISV', descuento: 5, isv: 5.25, total: 40.25 }
+]) {
+  test(`detalle de venta conserva total_linea historico del extra ${scenario.name}`, async () => {
+    const result = await buildVentaDetailPayloadForScope({
+      idFactura: 12,
+      allowedSucursalIds: [9],
+      queryRunner: buildFacturaDetailQueryRunner({
+        itemOverrides: {
+          total_linea: scenario.total,
+          descuento: scenario.descuento,
+          descuento_linea: scenario.descuento,
+          isv_15_linea: scenario.isv
+        }
+      })
+    });
+    const item = result.body.items[0];
+    assert.equal(item.sub_total, 40);
+    assert.equal(item.subtotal_linea, 40);
+    assert.equal(item.descuento_linea, scenario.descuento);
+    assert.equal(item.isv_15_linea, scenario.isv);
+    assert.equal(item.total_linea, scenario.total);
+  });
+}
+
+test('detalle integra reversion parcial y total sin alterar la cuenta dividida historica', async () => {
+  const divisions = [{
+    id_cuenta_division: 51, id_factura: 12, id_pedido: 501,
+    etiqueta: 'Persona 1', orden: 1,
+    subtotal_base: 40, subtotal_extras: 40, descuento_total: 40, isv_total: 0,
+    total: 40, monto_pagado: 40, monto_pendiente: 0, estado: 'PAGADA'
+  }];
+  const divisionItems = [{
+    id_cuenta_division: 51, id_cuenta_division_item: 61,
+    tipo_item: 'ITEM', id_producto: null, id_receta: null,
+    nombre_item_snapshot: 'Item de pedido', cantidad: 4, precio_unitario: 10,
+    subtotal_base: 0, subtotal_extras: 40, descuento_total: 0, isv_total: 0,
+    total_linea: 40,
+    extras_snapshot: [{ nombre: 'Extra Ranch', cantidad: 4, precio_unitario: 10, subtotal: 40 }],
+    complementos_snapshot: [], origen_snapshot: {}
+  }];
+  const reversiones = [
+    { id_reversion: 1, tipo_reversion: 'PARCIAL', monto_reversado: 20, lineas: [{ total_revertido: 20 }] },
+    { id_reversion: 2, tipo_reversion: 'TOTAL', monto_reversado: 40, lineas: [{ total_revertido: 40 }] }
+  ];
+  let reversionLoads = 0;
+  const result = await buildVentaDetailPayloadForScope({
+    idFactura: 12,
+    allowedSucursalIds: [9],
+    idUsuarioDetalle: 1,
+    queryRunner: buildFacturaDetailQueryRunner({ divisions, divisionItems }),
+    loadReversiones: async () => {
+      reversionLoads += 1;
+      return reversiones;
+    }
+  });
+
+  assert.equal(reversionLoads, 1);
+  assert.deepEqual(result.body.reversiones, reversiones);
+  assert.equal(result.body.cuenta_dividida.divisiones[0].total, 40);
+  assert.equal(result.body.cuenta_dividida.divisiones[0].monto_pagado, 40);
+  assert.equal(result.body.cuenta_dividida.divisiones[0].desglose_normalizado.total, 40);
+  assert.equal(result.body.cuenta_dividida.divisiones[0].items[0].nombre_item, 'Extra Ranch');
 });
 
 test('buildVentaDetailPayloadForScope legacy (v2) preserva el detalle sin normalizar', async () => {

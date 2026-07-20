@@ -436,6 +436,23 @@ export const normalizeSplitAccountStandaloneExtra = (item) => {
   };
 };
 
+export const buildSplitAccountNormalizedBreakdown = ({ division, items = [] }) => {
+  const normalizedItems = Array.isArray(items) ? items : [];
+  return {
+    subtotal_base: roundMoney(normalizedItems.reduce(
+      (sum, item) => sum + Number(item?.subtotal_base || 0),
+      0
+    )),
+    subtotal_extras: roundMoney(normalizedItems.reduce(
+      (sum, item) => sum + Number(item?.subtotal_extras || 0),
+      0
+    )),
+    descuento_total: roundMoney(division?.descuento_total),
+    isv_total: roundMoney(division?.isv_total),
+    total: roundMoney(division?.total)
+  };
+};
+
 export const fetchCuentaDividida = async (client, { idFactura = null, idPedido = null } = {}) => {
   const facturaId = parseOptionalPositiveInt(idFactura);
   const pedidoId = parseOptionalPositiveInt(idPedido);
@@ -549,6 +566,7 @@ export const fetchCuentaDividida = async (client, { idFactura = null, idPedido =
 
   const divisiones = divisionsResult.rows.map((row) => {
     const id = Number(row.id_cuenta_division);
+    const items = itemsByDivision.get(id) || [];
     return {
       id_cuenta_division: id,
       id_factura: parseOptionalPositiveInt(row.id_factura),
@@ -563,7 +581,8 @@ export const fetchCuentaDividida = async (client, { idFactura = null, idPedido =
       monto_pagado: roundMoney(row.monto_pagado),
       monto_pendiente: roundMoney(row.monto_pendiente),
       estado: String(row.estado || 'PENDIENTE').trim().toUpperCase(),
-      items: itemsByDivision.get(id) || [],
+      items,
+      desglose_normalizado: buildSplitAccountNormalizedBreakdown({ division: row, items }),
       cobros: cobrosByDivision.get(id) || []
     };
   });
