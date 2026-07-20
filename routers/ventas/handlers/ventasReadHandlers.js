@@ -15,7 +15,8 @@ import {
   normalizeRoleName,
   parseOptionalDateInput,
   parseOptionalPositiveInt,
-  parsePositiveInt
+  parsePositiveInt,
+  resolveStandaloneExtraLine
 } from '../utils/parseUtils.js';
 import {
   buildDirectSaleDetailItems,
@@ -188,6 +189,26 @@ export const buscarVentaHandler = async (req, res) => {
   }
 };
 
+const attachDetailExtras = (item, extras) => {
+  const standaloneExtra = resolveStandaloneExtraLine({
+    idProducto: item.id_producto,
+    idReceta: item.id_receta,
+    extras
+  });
+
+  return {
+    ...item,
+    tipo_item: standaloneExtra ? 'EXTRA' : item.tipo_item,
+    nombre_item: standaloneExtra ? standaloneExtra.nombre_extra_snapshot : item.nombre_item,
+    nombre_producto: standaloneExtra ? standaloneExtra.nombre_extra_snapshot : item.nombre_producto,
+    es_linea_extra_independiente: Boolean(standaloneExtra),
+    id_extra: standaloneExtra?.id_extra || null,
+    nombre_extra_snapshot: standaloneExtra?.nombre_extra_snapshot || null,
+    codigo_extra_snapshot: standaloneExtra?.codigo_extra_snapshot || null,
+    extras
+  };
+};
+
 export const buildVentaDetailPayloadForScope = async ({
   idFactura,
   includePrintAssets = false,
@@ -240,10 +261,8 @@ export const buildVentaDetailPayloadForScope = async ({
       queryRunner,
       pedidoItemsResult.rows.map((row) => row.id_detalle)
     );
-    const pedidoItems = buildKitchenSaleDetailItems(pedidoItemsResult.rows).map((item) => ({
-      ...item,
-      extras: detalleFacturaExtrasById.get(Number(item.id_detalle)) || []
-    }));
+    const pedidoItems = buildKitchenSaleDetailItems(pedidoItemsResult.rows).map((item) =>
+      attachDetailExtras(item, detalleFacturaExtrasById.get(Number(item.id_detalle)) || []));
     const cuentaDividida = await fetchCuentaDividida(queryRunner, {
       idFactura: venta.id_factura,
       idPedido: venta.id_pedido
@@ -282,10 +301,8 @@ export const buildVentaDetailPayloadForScope = async ({
     queryRunner,
     directItemsResult.rows.map((row) => row.id_detalle)
   );
-  const directItems = buildDirectSaleDetailItems(directItemsResult.rows).map((item) => ({
-    ...item,
-    extras: detalleFacturaExtrasById.get(Number(item.id_detalle)) || []
-  }));
+  const directItems = buildDirectSaleDetailItems(directItemsResult.rows).map((item) =>
+    attachDetailExtras(item, detalleFacturaExtrasById.get(Number(item.id_detalle)) || []));
   const cuentaDividida = await fetchCuentaDividida(queryRunner, {
     idFactura: venta.id_factura,
     idPedido: venta.id_pedido

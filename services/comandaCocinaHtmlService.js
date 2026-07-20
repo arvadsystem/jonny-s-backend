@@ -1,4 +1,4 @@
-const HONDURAS_TIME_ZONE = 'America/Tegucigalpa';
+import { formatHondurasDateTime } from '../utils/hondurasDateTime.js';
 
 const resolveTicketWidthMm = (value) => Number(value) === 58 ? 58 : 80;
 
@@ -38,16 +38,7 @@ const toSafeNumber = (value, fallback = 0) => {
   return Number.isFinite(numeric) ? numeric : fallback;
 };
 
-const formatDateTime = (value) => {
-  if (!value) return 'N/D';
-  const date = new Date(value);
-  if (!Number.isFinite(date.getTime())) return toSafeText(value, 'N/D');
-  return new Intl.DateTimeFormat('es-HN', {
-    dateStyle: 'short',
-    timeStyle: 'short',
-    timeZone: HONDURAS_TIME_ZONE
-  }).format(date);
-};
+const formatDateTime = (value) => formatHondurasDateTime(value, toSafeText(value, 'N/D'));
 
 const normalizeDetailList = (items, mapItem) => (
   Array.isArray(items) ? items : []

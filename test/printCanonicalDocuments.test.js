@@ -15,6 +15,7 @@ import {
   renderCanonicalPrintJobDocument,
   validateCanonicalPrintPayload
 } from '../services/printJobDocumentService.js';
+import { formatHondurasDateTime } from '../utils/hondurasDateTime.js';
 
 const ONE_PIXEL_PNG = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=';
 const agent = {
@@ -132,12 +133,12 @@ const pendingComandaFixture = {
 
 const COMANDA_RENDER_BASELINES = Object.freeze({
   58: Object.freeze({
-    bytes: 7161,
-    sha256: '3981b0a1d20b184ca403a52fa94b8b92baa835f6b38f6b48e495eafccce201c1'
+    bytes: 7157,
+    sha256: 'baeb2287eb5b90794e73112db5fd81de56d2ac2dc8bc563020c7749b8bd295c3'
   }),
   80: Object.freeze({
-    bytes: 7164,
-    sha256: 'f5393514518e2c62b84b19b2eba53b9866a261c2ba0fe042e2b75d551493cdc8'
+    bytes: 7160,
+    sha256: '958c2fc558ea96770aebda8276e631b75a5c3fd32be6f975a97d266ece80caa5'
   })
 });
 
@@ -165,12 +166,6 @@ const collectPdfDefinition = (value, result = { texts: [], images: [] }) => {
   }
   return result;
 };
-
-const formatHondurasDateTime = (value) => new Intl.DateTimeFormat('es-HN', {
-  dateStyle: 'short',
-  timeStyle: 'short',
-  timeZone: 'America/Tegucigalpa'
-}).format(new Date(value));
 
 const buildJob = ({ payload, state = 'imprimiendo', leaseActive = true }) => ({
   id_trabajo: 91,

@@ -1,11 +1,15 @@
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import pdfmake from 'pdfmake';
+import {
+  formatHondurasDate,
+  formatHondurasTime,
+  resolveStableDocumentDate
+} from '../../../utils/hondurasDateTime.js';
 
 const FONT_DIR = fileURLToPath(new URL('../../../node_modules/pdfmake/fonts/Roboto/', import.meta.url));
 const FONT_DIR_PREFIX = path.resolve(FONT_DIR) + path.sep;
 const DEFAULT_FOOTER = 'Gracias por su compra';
-const STABLE_PDF_FALLBACK_DATE = '1970-01-01T00:00:00.000Z';
 
 pdfmake.setUrlAccessPolicy(() => false);
 pdfmake.setLocalAccessPolicy((filePath) => path.resolve(filePath).startsWith(FONT_DIR_PREFIX));
@@ -61,30 +65,13 @@ const hasRealFiscalData = (fiscal = {}, venta = {}) => (
   )
 );
 
-const formatDateParts = (value) => {
-  const date = value ? new Date(value) : null;
-  if (!date || Number.isNaN(date.getTime())) return { date: '--', time: '--' };
+const formatDateParts = (value) => ({
+  date: formatHondurasDate(value),
+  time: formatHondurasTime(value)
+});
 
-  return {
-    date: date.toLocaleDateString('es-HN', {
-      timeZone: 'America/Tegucigalpa',
-      day: '2-digit',
-      month: '2-digit',
-      year: 'numeric'
-    }),
-    time: date.toLocaleTimeString('es-HN', {
-      timeZone: 'America/Tegucigalpa',
-      hour: '2-digit',
-      minute: '2-digit'
-    })
-  };
-};
-
-const resolveStablePdfDate = (venta = {}) => {
-  const source = venta.fecha_hora_facturacion || venta.fecha_hora_pedido;
-  const date = source ? new Date(source) : new Date(STABLE_PDF_FALLBACK_DATE);
-  return Number.isNaN(date.getTime()) ? new Date(STABLE_PDF_FALLBACK_DATE) : date;
-};
+const resolveStablePdfDate = (venta = {}) =>
+  resolveStableDocumentDate(venta.fecha_hora_facturacion || venta.fecha_hora_pedido);
 
 const resolveTicketWidth = (venta = {}) =>
   Number(venta?.facturacion?.ticket?.ancho_ticket_mm || venta?.ancho_ticket_mm) === 58 ? 58 : 80;
@@ -271,14 +258,17 @@ const buildItemRows = (items = [], widthMm) => {
   ]];
 
   for (const item of items) {
-    const salsas = normalizeSalsas(item);
+    const isStandaloneExtra = Boolean(
+      item.es_linea_extra_independiente || item?.origen_snapshot?.es_linea_extra_independiente
+    );
+    const salsas = isStandaloneExtra ? [] : normalizeSalsas(item);
     rows.push([
       text(item.cantidad || 1),
       text(item.nombre_item || item.nombre_producto || 'Item'),
       text(formatMoney(item.total_linea || item.sub_total), { alignment: 'right' })
     ]);
 
-    if (Array.isArray(item.extras)) {
+    if (!isStandaloneExtra && Array.isArray(item.extras)) {
       for (const extra of item.extras) {
         const perOrderQty = toMoneyNumber(extra.cantidad_por_orden || 0) > 0
           ? toMoneyNumber(extra.cantidad_por_orden)

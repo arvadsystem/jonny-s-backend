@@ -1,3 +1,5 @@
+import { resolveStandaloneExtraLine } from '../utils/parseUtils.js';
+
 const schemaLookupCache = new Map();
 
 const hasTable = async (queryRunner, tableName) => {
@@ -242,6 +244,8 @@ export const buildPedidoKitchenPrintPayload = async (queryRunner, idPedido) => {
               'id_extra', dpe.id_extra,
               'nombre', dpe.nombre_extra_snapshot,
               'nombre_extra', dpe.nombre_extra_snapshot,
+              'codigo', dpe.codigo_extra_snapshot,
+              'codigo_extra_snapshot', dpe.codigo_extra_snapshot,
               'cantidad', dpe.cantidad,
               'precio_unitario', dpe.precio_unitario,
               'subtotal', dpe.subtotal,
@@ -266,17 +270,31 @@ export const buildPedidoKitchenPrintPayload = async (queryRunner, idPedido) => {
   if (result.rowCount === 0) return null;
 
   const row = result.rows[0];
-  const items = (Array.isArray(row.items) ? row.items : []).map((item, index) => ({
-    linea: index + 1,
-    id_detalle: Number(item?.id_detalle || 0) || null,
-    tipo_item: String(item?.tipo_item || 'ITEM').trim().toUpperCase(),
-    cantidad: Number(item?.cantidad ?? 0) || 0,
-    nombre_item: String(item?.nombre_item || item?.nombre_producto || 'Item de cocina').trim(),
-    observacion: String(item?.observacion || '').trim() || null,
-    extras: toKitchenExtras(item?.extras),
-    complementos: toKitchenComplementos(item),
-    configuracion_menu: item?.configuracion_menu || null
-  }));
+  const items = (Array.isArray(row.items) ? row.items : []).map((item, index) => {
+    const standaloneExtra = resolveStandaloneExtraLine({
+      idProducto: item?.id_producto,
+      idReceta: item?.id_receta,
+      extras: item?.extras
+    });
+
+    return {
+      linea: index + 1,
+      id_detalle: Number(item?.id_detalle || 0) || null,
+      tipo_item: standaloneExtra ? 'EXTRA' : String(item?.tipo_item || 'ITEM').trim().toUpperCase(),
+      cantidad: Number(item?.cantidad ?? 0) || 0,
+      nombre_item: standaloneExtra
+        ? standaloneExtra.nombre_extra_snapshot
+        : String(item?.nombre_item || item?.nombre_producto || 'Item de cocina').trim(),
+      observacion: String(item?.observacion || '').trim() || null,
+      es_linea_extra_independiente: Boolean(standaloneExtra),
+      id_extra: standaloneExtra?.id_extra || null,
+      nombre_extra_snapshot: standaloneExtra?.nombre_extra_snapshot || null,
+      codigo_extra_snapshot: standaloneExtra?.codigo_extra_snapshot || null,
+      extras: toKitchenExtras(item?.extras),
+      complementos: toKitchenComplementos(item),
+      configuracion_menu: item?.configuracion_menu || null
+    };
+  });
   const totalProductos = items.reduce((sum, item) => sum + Math.max(0, Number(item.cantidad || 0)), 0);
 
   return {

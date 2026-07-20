@@ -206,6 +206,28 @@ export const normalizeObservation = (value) => {
   return normalized.slice(0, 200);
 };
 
+/**
+ * Detecta una linea de "extra independiente": sin producto ni receta, con
+ * exactamente un extra valido asociado (snapshot en detalle_pedido_extras o
+ * detalle_factura_extras). No clasifica lineas con cero o multiples extras;
+ * esas se dejan con su fallback actual para evitar inventar datos.
+ */
+export const resolveStandaloneExtraLine = ({ idProducto, idReceta, extras }) => {
+  if (idProducto || idReceta) return null;
+  const list = Array.isArray(extras) ? extras : [];
+  if (list.length !== 1) return null;
+
+  const extra = list[0] || {};
+  const nombre = String(extra.nombre || extra.nombre_extra || extra.nombre_extra_snapshot || '').trim();
+  if (!nombre) return null;
+
+  return {
+    id_extra: parseOptionalPositiveInt(extra.id_extra),
+    nombre_extra_snapshot: nombre,
+    codigo_extra_snapshot: String(extra.codigo || extra.codigo_extra_snapshot || '').trim() || null
+  };
+};
+
 export const parseJsonArrayValue = (value) => {
   if (Array.isArray(value)) return value;
   if (typeof value !== 'string' || !value.trim()) return [];

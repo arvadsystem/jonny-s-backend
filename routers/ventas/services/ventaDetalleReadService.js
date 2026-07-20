@@ -360,6 +360,7 @@ export const fetchDetalleFacturaExtras = async (client, detalleFacturaIds = []) 
         id_detalle_factura,
         id_extra,
         nombre_extra_snapshot AS nombre,
+        codigo_extra_snapshot,
         cantidad,
         precio_unitario,
         subtotal
@@ -377,6 +378,7 @@ export const fetchDetalleFacturaExtras = async (client, detalleFacturaIds = []) 
     grouped.get(id).push({
       id_extra: Number(row.id_extra),
       nombre: row.nombre,
+      codigo_extra_snapshot: row.codigo_extra_snapshot || null,
       cantidad: Number(row.cantidad),
       precio_unitario: roundMoney(row.precio_unitario),
       subtotal: roundMoney(row.subtotal)
