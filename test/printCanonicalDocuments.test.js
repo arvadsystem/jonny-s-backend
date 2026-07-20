@@ -744,7 +744,7 @@ test('agente prueba v2 corregido antes del fallback v2 legacy para trabajos sin 
   assert.equal(sha256(bytes), LEGACY_V2_BASELINES.factura.sha256);
 });
 
-test('fallback v2 usa orden explicito y detiene candidatos despues de la primera coincidencia', async () => {
+test('fallback v2 historico es best-effort, respeta orden y detiene candidatos tras coincidir', async () => {
   assert.deepEqual(HISTORICAL_V2_DOCUMENT_CANDIDATES.map((candidate) => candidate.name), [
     'current-historical-snapshot',
     'current-previous-loader',
@@ -758,10 +758,11 @@ test('fallback v2 usa orden explicito y detiene candidatos despues de la primera
   const alteredVenta = structuredClone(facturaFixture);
   alteredVenta.items[0].nombre_item = 'Fuente historica diferente';
   const currentAttempts = [];
+  const currentDb = createDocumentDb(buildJob({ payload: currentPayload }));
   await getCanonicalPrintDocumentForAgent({
     agent,
     jobId: 91,
-    db: createDocumentDb(buildJob({ payload: currentPayload })).db,
+    db: currentDb.db,
     loadVenta: async (args) => {
       currentAttempts.push({
         normalizeStandaloneExtras: args.normalizeStandaloneExtras,
@@ -777,6 +778,7 @@ test('fallback v2 usa orden explicito y detiene candidatos despues de la primera
     { normalizeStandaloneExtras: true, useHistoricalFacturacionSnapshot: true },
     { normalizeStandaloneExtras: true, useHistoricalFacturacionSnapshot: false }
   ]);
+  assert.ok(currentDb.calls.every(({ sql }) => /^\s*SELECT\b/i.test(sql)));
 
   const legacyPayload = buildLegacyV2Payload({
     tipoDocumento: 'factura',
@@ -785,10 +787,11 @@ test('fallback v2 usa orden explicito y detiene candidatos despues de la primera
     source: { id_factura: facturaFixture.id_factura, id_pedido: null }
   });
   const legacyAttempts = [];
+  const legacyDb = createDocumentDb(buildJob({ payload: legacyPayload }));
   const legacyResult = await getCanonicalPrintDocumentForAgent({
     agent,
     jobId: 91,
-    db: createDocumentDb(buildJob({ payload: legacyPayload })).db,
+    db: legacyDb.db,
     loadVenta: async (args) => {
       legacyAttempts.push({
         normalizeStandaloneExtras: args.normalizeStandaloneExtras,
@@ -803,6 +806,7 @@ test('fallback v2 usa orden explicito y detiene candidatos despues de la primera
     normalizeStandaloneExtras: candidate.normalizeStandaloneExtras,
     useHistoricalFacturacionSnapshot: candidate.useHistoricalFacturacionSnapshot
   })));
+  assert.ok(legacyDb.calls.every(({ sql }) => /^\s*SELECT\b/i.test(sql)));
   assert.equal(
     sha256(Buffer.from(legacyResult.document.data, 'base64')),
     LEGACY_V2_BASELINES.factura.sha256

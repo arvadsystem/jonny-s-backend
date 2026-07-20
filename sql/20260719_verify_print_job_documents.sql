@@ -1,5 +1,11 @@
 -- Verificacion READ-ONLY posterior a la migracion.
 
+SELECT EXISTS (
+  SELECT 1
+  FROM supabase_migrations.schema_migrations
+  WHERE version = '20260719'
+) AS migracion_20260719_registrada;
+
 SELECT
   current_user,
   session_user,

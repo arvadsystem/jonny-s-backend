@@ -856,8 +856,14 @@ test('migracion de documentos canonicos replica el endurecimiento QA sin privile
   assert.match(migration, /current_user <> 'postgres'/);
   assert.match(migration, /trabajos_impresion\.id_trabajo debe ser la PK/);
   assert.match(migration, /extensions\.digest\(bytea,text\)/);
-  assert.match(migration, /CREATE TABLE public\.trabajos_impresion_documentos/);
-  assert.doesNotMatch(migration, /CREATE TABLE IF NOT EXISTS/);
+  assert.match(migration, /CREATE TABLE IF NOT EXISTS public\.trabajos_impresion_documentos/);
+  assert.match(migration, /tabla existente compatible; migracion en modo no-op/);
+  assert.match(migration, /PREFLIGHT_FAILED_EXISTING_TABLE_MISMATCH/);
+  assert.ok(
+    migration.indexOf('PREFLIGHT_FAILED_EXISTING_TABLE_MISMATCH')
+      < migration.indexOf('CREATE TABLE IF NOT EXISTS'),
+    'la tabla existente debe validarse antes del CREATE no-op'
+  );
   assert.match(migration, /GENERATED ALWAYS AS IDENTITY/);
   assert.match(migration, /OWNER TO postgres/);
   assert.match(migration, /UNIQUE \(id_trabajo\)/);
@@ -874,11 +880,24 @@ test('migracion de documentos canonicos replica el endurecimiento QA sin privile
   assert.doesNotMatch(migration, /CREATE POLICY/);
   assert.match(migration, /POSTFLIGHT_FAILED/);
   assert.match(migration, /faltan restricciones/);
-  assert.match(rollback, /DROP TABLE IF EXISTS public\.trabajos_impresion_documentos/);
+  assert.doesNotMatch(migration, /INSERT INTO\s+supabase_migrations\.schema_migrations/i);
+  assert.doesNotMatch(migration, /(?:INSERT INTO|UPDATE|DELETE FROM)\s+public\.trabajos_impresion\b/i);
   assert.match(rollback, /ROLLBACK_REQUIRES_POSTGRES/);
+  assert.ok(
+    rollback.indexOf('IF v_table IS NULL') < rollback.indexOf('LOCK TABLE'),
+    'la ausencia debe resolverse antes de intentar bloquear la tabla'
+  );
+  assert.match(rollback, /owner o tipo de relacion inesperado/);
+  assert.match(rollback, /LOCK TABLE public\.trabajos_impresion_documentos IN ACCESS EXCLUSIVE MODE/);
+  assert.match(rollback, /SELECT EXISTS \(SELECT 1 FROM public\.trabajos_impresion_documentos LIMIT 1\)/);
+  assert.match(rollback, /ROLLBACK_BLOCKED_NONEMPTY/);
+  assert.match(rollback, /IF v_has_rows THEN[\s\S]*RAISE EXCEPTION[\s\S]*END IF;[\s\S]*DROP TABLE/);
+  assert.doesNotMatch(rollback, /CASCADE/i);
+  assert.doesNotMatch(rollback, /DROP TABLE IF EXISTS/);
   assert.match(verification, /is_identity/);
   assert.match(verification, /service_role_select/);
   assert.match(verification, /service_role_sequence_usage/);
   assert.match(verification, /hashes_invalidos/);
   assert.match(verification, /trabajos_v2_sin_documento/);
+  assert.match(verification, /supabase_migrations\.schema_migrations/);
 });

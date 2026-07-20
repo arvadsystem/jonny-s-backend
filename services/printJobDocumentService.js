@@ -11,6 +11,9 @@ export const SUPPORTED_CANONICAL_SCHEMA_VERSIONS = Object.freeze([CANONICAL_PRIN
 export const MAX_CANONICAL_PDF_BYTES = 2 * 1024 * 1024;
 export const MAX_CANONICAL_HTML_BYTES = 256 * 1024;
 export const MAX_AGENT_QZ_SIGN_REQUEST_BYTES = 3 * 1024 * 1024;
+// Los trabajos nuevos retornan primero sus bytes persistidos. Esta lista solo
+// intenta recuperar, de forma best-effort, trabajos v2 historicos sin contenido;
+// ningun candidato modifica el descriptor ni persiste el resultado regenerado.
 export const HISTORICAL_V2_DOCUMENT_CANDIDATES = Object.freeze([
   Object.freeze({
     name: 'current-historical-snapshot',

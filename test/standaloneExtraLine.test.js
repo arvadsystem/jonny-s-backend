@@ -119,6 +119,123 @@ for (const scenario of [
   });
 }
 
+const buildSplitAccountQueryRunner = ({ divisions, items, cobros = [] }) => ({
+  query: async (sql) => {
+    if (/FROM public\.ventas_cuenta_divisiones vcd/i.test(sql)) {
+      return { rowCount: divisions.length, rows: divisions };
+    }
+    if (/FROM public\.ventas_cuenta_division_items/i.test(sql)) {
+      return { rowCount: items.length, rows: items };
+    }
+    if (/FROM public\.facturas_cobros fc/i.test(sql)) {
+      return { rowCount: cobros.length, rows: cobros };
+    }
+    throw new Error(`SQL inesperado: ${sql}`);
+  }
+});
+
+for (const payment of [
+  { name: 'pago parcial', paid: 121.5, pending: 121.5, state: 'PENDIENTE' },
+  { name: 'pago completo', paid: 243, pending: 0, state: 'PAGADA' }
+]) {
+  test(`cuenta mixta concilia descuento, ISV y ${payment.name} (PASS UNITARIO)`, async () => {
+    const division = {
+      id_cuenta_division: 71,
+      id_factura: 12,
+      id_pedido: 501,
+      etiqueta: 'Mixta',
+      orden: 1,
+      subtotal_base: 220,
+      subtotal_extras: 60,
+      descuento_total: 15,
+      isv_total: 18,
+      total: 243,
+      monto_pagado: payment.paid,
+      monto_pendiente: payment.pending,
+      estado: payment.state
+    };
+    const common = {
+      id_cuenta_division: 71,
+      cantidad: 1,
+      descuento_total: 0,
+      isv_total: 0,
+      complementos_snapshot: [],
+      origen_snapshot: {}
+    };
+    const items = [
+      {
+        ...common,
+        id_cuenta_division_item: 81,
+        tipo_item: 'PRODUCTO',
+        id_producto: 1,
+        id_receta: null,
+        nombre_item_snapshot: 'Producto',
+        precio_unitario: 120,
+        subtotal_base: 100,
+        subtotal_extras: 20,
+        total_linea: 120,
+        extras_snapshot: [{ nombre: 'Extra asociado', cantidad: 1, precio_unitario: 20, subtotal: 20 }]
+      },
+      {
+        ...common,
+        id_cuenta_division_item: 82,
+        tipo_item: 'RECETA',
+        id_producto: null,
+        id_receta: 2,
+        nombre_item_snapshot: 'Receta',
+        precio_unitario: 80,
+        subtotal_base: 80,
+        subtotal_extras: 0,
+        total_linea: 80,
+        extras_snapshot: []
+      },
+      {
+        ...common,
+        id_cuenta_division_item: 83,
+        tipo_item: 'ITEM',
+        id_producto: null,
+        id_receta: null,
+        nombre_item_snapshot: 'Item de pedido',
+        cantidad: 4,
+        precio_unitario: 10,
+        subtotal_base: 40,
+        subtotal_extras: 40,
+        total_linea: 40,
+        extras_snapshot: [{ nombre: 'Extra independiente', cantidad: 4, precio_unitario: 10, subtotal: 40 }]
+      }
+    ];
+    const cobros = payment.paid > 0
+      ? [{
+        id_factura_cobro: 91,
+        id_cuenta_division: 71,
+        id_metodo_pago: 1,
+        metodo_pago: 'Efectivo',
+        monto: payment.paid
+      }]
+      : [];
+
+    const result = await fetchCuentaDividida(buildSplitAccountQueryRunner({
+      divisions: [division], items, cobros
+    }), { idFactura: 12, idPedido: 501 });
+    const normalized = result.divisiones[0].desglose_normalizado;
+
+    assert.equal(result.divisiones[0].subtotal_base, 220);
+    assert.equal(result.divisiones[0].subtotal_extras, 60);
+    assert.equal(result.divisiones[0].descuento_total, 15);
+    assert.equal(result.divisiones[0].isv_total, 18);
+    assert.equal(result.divisiones[0].total, 243);
+    assert.equal(result.divisiones[0].monto_pagado, payment.paid);
+    assert.equal(result.divisiones[0].monto_pendiente, payment.pending);
+    assert.equal(normalized.subtotal_base, 180);
+    assert.equal(normalized.subtotal_extras, 60);
+    assert.equal(normalized.total_calculado_sin_ajuste, 243);
+    assert.equal(normalized.ajuste_conciliacion, 0);
+    assert.equal(normalized.requiere_conciliacion, false);
+    assert.equal(normalized.total, 243);
+    assert.equal(result.divisiones[0].items[2].nombre_item, 'Extra independiente');
+  });
+}
+
 test('desglose normalizado clasifica productos, recetas y extras sin reemplazar el total historico', () => {
   const standalone = normalizeSplitAccountStandaloneExtra({
     tipo_item: 'ITEM', id_producto: null, id_receta: null,
@@ -157,23 +274,62 @@ test('desglose normalizado clasifica productos, recetas y extras sin reemplazar 
     assert.equal(result.descuento_total, 40, scenario.name);
     assert.equal(result.isv_total, 5, scenario.name);
     assert.equal(result.total, 125, scenario.name);
+    assert.equal(
+      Math.round((result.total_calculado_sin_ajuste + result.ajuste_conciliacion) * 100) / 100,
+      result.total,
+      scenario.name
+    );
   }
 });
 
-const buildSplitAccountQueryRunner = ({ divisions, items, cobros = [] }) => ({
-  query: async (sql) => {
-    if (/FROM public\.ventas_cuenta_divisiones vcd/i.test(sql)) {
-      return { rowCount: divisions.length, rows: divisions };
-    }
-    if (/FROM public\.ventas_cuenta_division_items/i.test(sql)) {
-      return { rowCount: items.length, rows: items };
-    }
-    if (/FROM public\.facturas_cobros fc/i.test(sql)) {
-      return { rowCount: cobros.length, rows: cobros };
-    }
-    throw new Error(`SQL inesperado: ${sql}`);
+for (const scenario of [
+  {
+    name: 'caso normal sin ajuste',
+    division: { descuento_total: 10, isv_total: 0, total: 110 },
+    items: [{ subtotal_base: 100, subtotal_extras: 20 }],
+    expectedCalculated: 110,
+    expectedAdjustment: 0,
+    expectedReconciliation: false
+  },
+  {
+    name: 'caso QA con ajuste positivo',
+    division: { descuento_total: 40, isv_total: 0, total: 40 },
+    items: [{ subtotal_base: 0, subtotal_extras: 40 }],
+    expectedCalculated: 0,
+    expectedAdjustment: 40,
+    expectedReconciliation: true
+  },
+  {
+    name: 'ajuste negativo',
+    division: { descuento_total: 0, isv_total: 0, total: 110 },
+    items: [{ subtotal_base: 100, subtotal_extras: 20 }],
+    expectedCalculated: 120,
+    expectedAdjustment: -10,
+    expectedReconciliation: true
+  },
+  {
+    name: 'redondeo de centavos sin deriva',
+    division: { descuento_total: 10, isv_total: 0, total: 110 },
+    items: [{ subtotal_base: 100.005, subtotal_extras: 19.994 }],
+    expectedCalculated: 109.99,
+    expectedAdjustment: 0.01,
+    expectedReconciliation: true
   }
-});
+]) {
+  test(`desglose conciliado: ${scenario.name} (PASS UNITARIO)`, () => {
+    const result = buildSplitAccountNormalizedBreakdown({
+      division: scenario.division,
+      items: scenario.items
+    });
+    assert.equal(result.total_calculado_sin_ajuste, scenario.expectedCalculated);
+    assert.equal(result.ajuste_conciliacion, scenario.expectedAdjustment);
+    assert.equal(result.requiere_conciliacion, scenario.expectedReconciliation);
+    assert.equal(
+      Math.round((result.total_calculado_sin_ajuste + result.ajuste_conciliacion) * 100) / 100,
+      result.total
+    );
+  });
+}
 
 for (const scenario of [
   { name: 'cuenta pendiente', estado: 'PENDIENTE', pagado: 0, pendiente: 40, cobros: [] },
@@ -233,6 +389,9 @@ for (const scenario of [
     assert.equal(result.divisiones[0].descuento_total, 40);
     assert.equal(result.divisiones[0].desglose_normalizado.subtotal_base, 0);
     assert.equal(result.divisiones[0].desglose_normalizado.subtotal_extras, 40);
+    assert.equal(result.divisiones[0].desglose_normalizado.total_calculado_sin_ajuste, 0);
+    assert.equal(result.divisiones[0].desglose_normalizado.ajuste_conciliacion, 40);
+    assert.equal(result.divisiones[0].desglose_normalizado.requiere_conciliacion, true);
     assert.equal(result.divisiones[0].desglose_normalizado.total, 40);
     assert.equal(result.divisiones[0].items[0].nombre_item, 'Extra Ranch');
     assert.deepEqual(result.divisiones[0].items[0].extras, []);
@@ -431,7 +590,7 @@ for (const scenario of [
   { name: 'con ISV', descuento: 0, isv: 6, total: 46 },
   { name: 'con descuento e ISV', descuento: 5, isv: 5.25, total: 40.25 }
 ]) {
-  test(`detalle de venta conserva total_linea historico del extra ${scenario.name}`, async () => {
+  test(`detalle conserva snapshot fiscal ${scenario.name} (PASS UNITARIO)`, async () => {
     const result = await buildVentaDetailPayloadForScope({
       idFactura: 12,
       allowedSucursalIds: [9],
@@ -453,7 +612,7 @@ for (const scenario of [
   });
 }
 
-test('detalle integra reversion parcial y total sin alterar la cuenta dividida historica', async () => {
+test('composicion simulada de reversion parcial/total conserva cuenta historica (PASS UNITARIO)', async () => {
   const divisions = [{
     id_cuenta_division: 51, id_factura: 12, id_pedido: 501,
     etiqueta: 'Persona 1', orden: 1,

@@ -438,18 +438,31 @@ export const normalizeSplitAccountStandaloneExtra = (item) => {
 
 export const buildSplitAccountNormalizedBreakdown = ({ division, items = [] }) => {
   const normalizedItems = Array.isArray(items) ? items : [];
+  const subtotalBase = roundMoney(normalizedItems.reduce(
+    (sum, item) => sum + Number(item?.subtotal_base || 0),
+    0
+  ));
+  const subtotalExtras = roundMoney(normalizedItems.reduce(
+    (sum, item) => sum + Number(item?.subtotal_extras || 0),
+    0
+  ));
+  const descuentoTotal = roundMoney(division?.descuento_total);
+  const isvTotal = roundMoney(division?.isv_total);
+  const total = roundMoney(division?.total);
+  const totalCalculadoSinAjuste = roundMoney(
+    subtotalBase + subtotalExtras - descuentoTotal + isvTotal
+  );
+  const ajusteConciliacion = roundMoney(total - totalCalculadoSinAjuste);
+
   return {
-    subtotal_base: roundMoney(normalizedItems.reduce(
-      (sum, item) => sum + Number(item?.subtotal_base || 0),
-      0
-    )),
-    subtotal_extras: roundMoney(normalizedItems.reduce(
-      (sum, item) => sum + Number(item?.subtotal_extras || 0),
-      0
-    )),
-    descuento_total: roundMoney(division?.descuento_total),
-    isv_total: roundMoney(division?.isv_total),
-    total: roundMoney(division?.total)
+    subtotal_base: subtotalBase,
+    subtotal_extras: subtotalExtras,
+    descuento_total: descuentoTotal,
+    isv_total: isvTotal,
+    total_calculado_sin_ajuste: totalCalculadoSinAjuste,
+    ajuste_conciliacion: ajusteConciliacion,
+    requiere_conciliacion: Math.abs(ajusteConciliacion) >= 0.01,
+    total
   };
 };
 
