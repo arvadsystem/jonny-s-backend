@@ -10,6 +10,11 @@ const MAX_FIND_AUTHORIZATIONS_PER_MINUTE = 5;
 
 const qzRequestError = (code, message, status = 400) => Object.assign(new Error(message), { code, status });
 const isPlainObject = (value) => Boolean(value && typeof value === 'object' && !Array.isArray(value));
+const parsePositiveId = (value) => {
+  if (value === null || value === undefined || value === '') return null;
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : null;
+};
 
 const validateFindParams = (params) => isPlainObject(params) && Object.keys(params).length === 0;
 
@@ -74,8 +79,8 @@ const validatePrintParams = (params, job) => {
     const payloadValidation = validateCanonicalPrintPayload(job.payload);
     if (!payloadValidation.ok
       || job.tipo_documento !== job.payload.tipo_documento
-      || Number(job.id_factura) !== payloadValidation.idFactura
-      || (job.id_pedido === null ? null : Number(job.id_pedido)) !== payloadValidation.idPedido
+      || parsePositiveId(job.id_factura) !== payloadValidation.idFactura
+      || parsePositiveId(job.id_pedido) !== payloadValidation.idPedido
       || !validateCanonicalPrintDataItem(job.payload, item)) return null;
     return { printerName };
   }

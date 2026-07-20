@@ -1,5 +1,8 @@
 import pool from '../config/db-connection.js';
-import { validateCanonicalPrintPayload } from './printJobDocumentService.js';
+import {
+  validateCanonicalPrintDataItem,
+  validateCanonicalPrintPayload
+} from './printJobDocumentService.js';
 
 export const PRINT_DOCUMENT_TYPES = new Set(['factura', 'comanda', 'caja']);
 const MAX_PAYLOAD_BYTES = 256 * 1024;
@@ -29,7 +32,8 @@ export const validatePrintPayload = (payload) => {
 
 export const enqueuePrintJob = async ({
   idSucursal, tipoDocumento, payload, idempotencyKey, idFactura = null,
-  idPedido = null, idUsuario = null, esReimpresion = false, db = pool
+  idPedido = null, idUsuario = null, esReimpresion = false,
+  canonicalDocument = null, db = pool, onInsertedTransaction = null
 }) => {
   const normalizedType = String(tipoDocumento || '').trim().toLowerCase();
   const validation = validatePrintPayload(payload);
@@ -41,17 +45,72 @@ export const enqueuePrintJob = async ({
   if (key.length < 8 || key.length > 160) {
     throw Object.assign(new Error('Idempotency-Key es obligatorio.'), { code: 'PRINT_IDEMPOTENCY_INVALID', status: 400 });
   }
-  const result = await db.query(
-    `INSERT INTO public.trabajos_impresion
-       (id_sucursal, tipo_documento, payload, idempotency_key, id_factura, id_pedido,
-        id_usuario_solicitante, es_reimpresion)
-     VALUES ($1,$2,$3::jsonb,$4,$5,$6,$7,$8)
-     ON CONFLICT (id_sucursal, idempotency_key, tipo_documento)
-     DO UPDATE SET fecha_actualizacion = public.trabajos_impresion.fecha_actualizacion
-     RETURNING id_trabajo, id_sucursal, tipo_documento, estado, fecha_creacion`,
-    [idSucursal, normalizedType, JSON.stringify(payload), key, idFactura, idPedido, idUsuario, esReimpresion]
-  );
-  return result.rows[0];
+  const canonicalValidation = Number(payload.schema_version) === 2
+    ? validateCanonicalPrintDataItem(payload, canonicalDocument)
+    : null;
+  if (Number(payload.schema_version) === 2 && !canonicalValidation) {
+    throw Object.assign(new Error('El contenido canonico es obligatorio.'), {
+      code: 'PRINT_DOCUMENT_CONTENT_INVALID',
+      status: 400
+    });
+  }
+
+  const client = typeof db.connect === 'function' ? await db.connect() : db;
+  const shouldRelease = client !== db && typeof client.release === 'function';
+  try {
+    await client.query('BEGIN');
+    const insertResult = await client.query(
+      `INSERT INTO public.trabajos_impresion
+         (id_sucursal, tipo_documento, payload, idempotency_key, id_factura, id_pedido,
+          id_usuario_solicitante, es_reimpresion)
+       VALUES ($1,$2,$3::jsonb,$4,$5,$6,$7,$8)
+       ON CONFLICT (id_sucursal, idempotency_key, tipo_documento) DO NOTHING
+       RETURNING id_trabajo,id_sucursal,tipo_documento,estado,fecha_creacion,true AS inserted`,
+      [idSucursal, normalizedType, JSON.stringify(payload), key, idFactura, idPedido, idUsuario, esReimpresion]
+    );
+    let job = insertResult.rows[0];
+    if (!job) {
+      const existingResult = await client.query(
+        `SELECT id_trabajo,id_sucursal,tipo_documento,estado,fecha_creacion,false AS inserted
+         FROM public.trabajos_impresion
+         WHERE id_sucursal=$1 AND idempotency_key=$2 AND tipo_documento=$3
+         LIMIT 1`,
+        [idSucursal, key, normalizedType]
+      );
+      job = existingResult.rows[0];
+    }
+    if (!job) throw Object.assign(new Error('No se pudo crear el trabajo.'), { code: 'PRINT_ENQUEUE_FAILED' });
+
+    if (job.inserted === true && canonicalValidation) {
+      const descriptor = payload.documento_canonico;
+      await client.query(
+        `INSERT INTO public.trabajos_impresion_documentos
+           (id_trabajo,schema_version,tipo_documento,formato,flavor,contenido,content_sha256,content_bytes)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+        [
+          job.id_trabajo,
+          payload.schema_version,
+          normalizedType,
+          payload.documento_canonico.format,
+          payload.documento_canonico.flavor,
+          canonicalValidation.contentBytes,
+          descriptor.content_sha256,
+          descriptor.content_bytes
+        ]
+      );
+    }
+    if (job.inserted === true && typeof onInsertedTransaction === 'function') {
+      await onInsertedTransaction({ client, job });
+    }
+    await client.query('COMMIT');
+    const { inserted, ...publicJob } = job;
+    return publicJob;
+  } catch (error) {
+    try { await client.query('ROLLBACK'); } catch { /* conserva error original */ }
+    throw error;
+  } finally {
+    if (shouldRelease) client.release();
+  }
 };
 
 export const claimPrintJobs = async ({ agentId, leaseSeconds = 90, db = pool }) => {

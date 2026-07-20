@@ -15,7 +15,8 @@ import {
   normalizeRoleName,
   parseOptionalDateInput,
   parseOptionalPositiveInt,
-  parsePositiveInt
+  parsePositiveInt,
+  resolveStandaloneExtraLine
 } from '../utils/parseUtils.js';
 import {
   buildDirectSaleDetailItems,
@@ -188,12 +189,65 @@ export const buscarVentaHandler = async (req, res) => {
   }
 };
 
+const roundMoneyOr = (value, fallback) => {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? roundMoney(parsed) : fallback;
+};
+
+const attachDetailExtras = (item, extras, { normalizeStandaloneExtras = true } = {}) => {
+  const standaloneExtra = normalizeStandaloneExtras
+    ? resolveStandaloneExtraLine({
+      idProducto: item.id_producto,
+      idReceta: item.id_receta,
+      extras
+    })
+    : null;
+
+  if (!standaloneExtra) {
+    return { ...item, extras };
+  }
+
+  // Usa el snapshot financiero persistido del extra; nunca reinterpreta el
+  // sub_total del pedido como precio unitario (cantidad x precio = subtotal).
+  const cantidad = Number.isFinite(standaloneExtra.cantidad) && standaloneExtra.cantidad > 0
+    ? standaloneExtra.cantidad
+    : Number(item.cantidad ?? 0) || 0;
+  const subtotal = roundMoneyOr(standaloneExtra.subtotal, roundMoney(item.sub_total));
+  const precioUnitario = roundMoneyOr(
+    standaloneExtra.precio_unitario,
+    cantidad > 0 ? roundMoney(Number(subtotal) / cantidad) : roundMoney(item.precio_unitario)
+  );
+  const totalLinea = Number.isFinite(Number(item.total_linea))
+    ? roundMoney(item.total_linea)
+    : subtotal;
+
+  return {
+    ...item,
+    tipo_item: 'EXTRA',
+    nombre_item: standaloneExtra.nombre_extra_snapshot,
+    nombre_producto: standaloneExtra.nombre_extra_snapshot,
+    es_linea_extra_independiente: true,
+    id_extra: standaloneExtra.id_extra || null,
+    nombre_extra_snapshot: standaloneExtra.nombre_extra_snapshot,
+    codigo_extra_snapshot: standaloneExtra.codigo_extra_snapshot || null,
+    cantidad,
+    precio_unitario: precioUnitario,
+    sub_total: subtotal,
+    subtotal_linea: subtotal,
+    total_linea: totalLinea,
+    extras
+  };
+};
+
 export const buildVentaDetailPayloadForScope = async ({
   idFactura,
   includePrintAssets = false,
   allowedSucursalIds = [],
   limitedToLast72Hours = false,
   idUsuarioDetalle = null,
+  normalizeStandaloneExtras = true,
+  useHistoricalFacturacionSnapshot = false,
+  loadReversiones = listFacturaReversiones,
   queryRunner = pool
 }) => {
   const normalizedSucursalIds = (Array.isArray(allowedSucursalIds) ? allowedSucursalIds : [])
@@ -222,13 +276,14 @@ export const buildVentaDetailPayloadForScope = async ({
   const facturacionNormalizada = await normalizarDatosTicketDesdeSnapshot({
     client: queryRunner,
     factura: venta,
-    includePrintAssets
+    includePrintAssets,
+    useHistoricalSnapshot: useHistoricalFacturacionSnapshot
   });
   Object.assign(venta, mergeVentaWithFacturacion(venta, facturacionNormalizada));
 
   const normalizedUsuarioDetalle = parsePositiveInt(idUsuarioDetalle);
   const reversiones = normalizedUsuarioDetalle
-    ? await listFacturaReversiones({
+    ? await loadReversiones({
       idFactura: venta.id_factura,
       idUsuario: normalizedUsuarioDetalle
     })
@@ -240,10 +295,8 @@ export const buildVentaDetailPayloadForScope = async ({
       queryRunner,
       pedidoItemsResult.rows.map((row) => row.id_detalle)
     );
-    const pedidoItems = buildKitchenSaleDetailItems(pedidoItemsResult.rows).map((item) => ({
-      ...item,
-      extras: detalleFacturaExtrasById.get(Number(item.id_detalle)) || []
-    }));
+    const pedidoItems = buildKitchenSaleDetailItems(pedidoItemsResult.rows).map((item) =>
+      attachDetailExtras(item, detalleFacturaExtrasById.get(Number(item.id_detalle)) || [], { normalizeStandaloneExtras }));
     const cuentaDividida = await fetchCuentaDividida(queryRunner, {
       idFactura: venta.id_factura,
       idPedido: venta.id_pedido
@@ -282,10 +335,8 @@ export const buildVentaDetailPayloadForScope = async ({
     queryRunner,
     directItemsResult.rows.map((row) => row.id_detalle)
   );
-  const directItems = buildDirectSaleDetailItems(directItemsResult.rows).map((item) => ({
-    ...item,
-    extras: detalleFacturaExtrasById.get(Number(item.id_detalle)) || []
-  }));
+  const directItems = buildDirectSaleDetailItems(directItemsResult.rows).map((item) =>
+    attachDetailExtras(item, detalleFacturaExtrasById.get(Number(item.id_detalle)) || [], { normalizeStandaloneExtras }));
   const cuentaDividida = await fetchCuentaDividida(queryRunner, {
     idFactura: venta.id_factura,
     idPedido: venta.id_pedido
@@ -306,7 +357,8 @@ export const buildVentaDetailPayloadForScope = async ({
 
 export const buildVentaDetailPayload = async (req, {
   idFactura,
-  includePrintAssets = false
+  includePrintAssets = false,
+  useHistoricalFacturacionSnapshot = false
 }) => {
   const scope = await resolveVentasHistoryScope(req);
   return buildVentaDetailPayloadForScope({
@@ -315,6 +367,7 @@ export const buildVentaDetailPayload = async (req, {
     allowedSucursalIds: scope.allowedSucursalIds,
     limitedToLast72Hours: scope.limitedToLast72Hours,
     idUsuarioDetalle: req.user?.id_usuario,
+    useHistoricalFacturacionSnapshot,
     queryRunner: pool
   });
 };

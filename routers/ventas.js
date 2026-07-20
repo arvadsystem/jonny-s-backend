@@ -42,6 +42,7 @@ import {
   fetchCuentaDividida,
   inferKitchenItemQuantity,
   mergeVentaWithFacturacion,
+  normalizePedidoPendingDetailItem,
   resolveVentaNumero
 } from './ventas/services/ventaDetalleReadService.js';
 import {
@@ -98,6 +99,9 @@ import {
   buildVentasRpcActor,
   executeVentasRpc
 } from './ventas/services/ventasRpcExecutionService.js';
+import { persistVentaPedidoSnapshotRows } from './ventas/services/ventaPedidoSnapshotPersistenceService.js';
+import { persistImmediateSalePaymentState } from './ventas/services/ventaImmediatePaymentStateService.js';
+import { initializePedidoPendingKitchen } from './ventas/services/pedidoKitchenVisibilityService.js';
 import {
   hasCuentaDivididaPayload,
   reserveIdempotencyForMode,
@@ -1691,7 +1695,7 @@ const resolveVentaContextForCreate = async (client, req, payload = {}) => {
   const idEstadoPedidoRequested = parseOptionalPositiveInt(payload.idEstadoPedidoRequested);
   const idCliente = parseOptionalPositiveInt(payload.idCliente);
   const metodoPagoInput = String(payload.metodoPagoInput || '').trim();
-  const estadoEnCocinaAliases = [...(ESTADO_PEDIDO_CODES.EN_COCINA || new Set())];
+  const estadoPendienteAliases = [...(ESTADO_PEDIDO_CODES.PENDIENTE || new Set())];
 
   const result = await client.query(
     `
@@ -1701,7 +1705,7 @@ const resolveVentaContextForCreate = async (client, req, payload = {}) => {
           $2::int AS id_estado_pedido_requested,
           $3::int AS id_cliente,
           $4::text AS metodo_pago_input,
-          $5::text[] AS estado_en_cocina_aliases
+          $5::text[] AS estado_pendiente_aliases
       ),
       sucursal AS (
         SELECT s.id_sucursal
@@ -1717,11 +1721,11 @@ const resolveVentaContextForCreate = async (client, req, payload = {}) => {
         WHERE i.id_estado_pedido_requested IS NOT NULL
         LIMIT 1
       ),
-      estado_cocina AS (
+      estado_pendiente AS (
         SELECT ep.id_estado_pedido
         FROM estados_pedido ep
         CROSS JOIN input i
-        WHERE LOWER(REGEXP_REPLACE(TRIM(COALESCE(ep.descripcion, '')), '\\s+', '_', 'g')) = ANY(i.estado_en_cocina_aliases)
+        WHERE LOWER(REGEXP_REPLACE(TRIM(COALESCE(ep.descripcion, '')), '\\s+', '_', 'g')) = ANY(i.estado_pendiente_aliases)
         ORDER BY ep.id_estado_pedido
         LIMIT 1
       ),
@@ -1750,7 +1754,7 @@ const resolveVentaContextForCreate = async (client, req, payload = {}) => {
       SELECT
         (SELECT id_sucursal FROM sucursal) AS id_sucursal,
         (SELECT id_estado_pedido FROM estado_solicitado) AS id_estado_pedido_solicitado,
-        (SELECT id_estado_pedido FROM estado_cocina) AS id_estado_pedido_cocina,
+        (SELECT id_estado_pedido FROM estado_pendiente) AS id_estado_pedido_pendiente,
         (SELECT id_cliente FROM cliente) AS id_cliente,
         (SELECT row_to_json(m) FROM metodo m) AS metodo_pago
     `,
@@ -1759,7 +1763,7 @@ const resolveVentaContextForCreate = async (client, req, payload = {}) => {
       idEstadoPedidoRequested,
       idCliente,
       metodoPagoInput,
-      estadoEnCocinaAliases
+      estadoPendienteAliases
     ]
   );
 
@@ -1767,7 +1771,7 @@ const resolveVentaContextForCreate = async (client, req, payload = {}) => {
   return {
     idSucursal: parseOptionalPositiveInt(row.id_sucursal),
     requestedEstadoPedido: parseOptionalPositiveInt(row.id_estado_pedido_solicitado),
-    estadoPedidoEnCocina: parseOptionalPositiveInt(row.id_estado_pedido_cocina),
+    estadoPedidoPendiente: parseOptionalPositiveInt(row.id_estado_pedido_pendiente),
     cliente: idCliente && row.id_cliente ? { id_cliente: parseOptionalPositiveInt(row.id_cliente) } : null,
     metodoPago: row.metodo_pago || null
   };
@@ -3715,7 +3719,7 @@ const buildPedidoPendienteStaticCatalogSpecs = ({ canal, modalidad, motivoPagoPe
     key: 'idEstadoPedido',
     tableName: 'estados_pedido',
     idColumn: 'id_estado_pedido',
-    code: 'EN_COCINA'
+    code: 'PENDIENTE'
   })
 ].filter(Boolean);
 
@@ -4118,7 +4122,7 @@ const buildPedidoPendientePayload = async ({ client, body, userId, sucursalScope
   const subtotal = roundMoney(finalizedLines.reduce((sum, line) => sum + line.total_linea, 0));
   const isv = 0;
   const total = roundMoney(subtotal + (costoEnvio || 0));
-  if (!idEstadoPedido) return { ok: false, status: 409, body: { error: true, message: 'No existe el estado EN_COCINA en estados_pedido.' } };
+  if (!idEstadoPedido) return { ok: false, status: 409, body: { error: true, message: 'No existe el estado PENDIENTE en estados_pedido.' } };
 
   const sessionActiva = await resolveCajaSession({ client, idSucursal, idUsuario: userId, idSesionCaja: idSesionCajaRequested, isSuperAdmin });
   if (!sessionActiva.ok) {
@@ -4489,6 +4493,12 @@ const updatePedidoLegacyPagoConfirmado = async ({ client, idPedido, userId }) =>
   if (await hasColumn(client, 'pedidos', 'id_usuario_pago_confirmado')) {
     params.push(userId);
     assignments.push('id_usuario_pago_confirmado = $' + params.length);
+  }
+  if (await hasColumn(client, 'pedidos', 'validacion_pago_vence_at')) {
+    assignments.push('validacion_pago_vence_at = NULL');
+  }
+  if (await hasColumn(client, 'pedidos', 'cancelado_por_timeout_at')) {
+    assignments.push('cancelado_por_timeout_at = NULL');
   }
 
   if (!assignments.length) return;
@@ -4903,7 +4913,17 @@ const buildVentaPayload = async ({ client, body, userId, sucursalScope, canApply
 
   let idEstadoPedido = null;
   if (requiresPedido) {
-    idEstadoPedido = requestedEstadoPedido || ventaContext.estadoPedidoEnCocina;
+    if (requestedEstadoPedido && requestedEstadoPedido !== ventaContext.estadoPedidoPendiente) {
+      return {
+        ok: false,
+        status: 400,
+        body: {
+          error: true,
+          message: 'La venta debe iniciar en estado PENDIENTE hasta aceptar la comanda.'
+        }
+      };
+    }
+    idEstadoPedido = ventaContext.estadoPedidoPendiente;
 
     if (!idEstadoPedido) {
       return {
@@ -4912,7 +4932,7 @@ const buildVentaPayload = async ({ client, body, userId, sucursalScope, canApply
         body: {
           error: true,
           message:
-            'No existe el estado EN_COCINA en estados_pedido. Aplica el seed del KDS antes de facturar items de cocina.'
+            'No existe el estado PENDIENTE en estados_pedido.'
         }
       };
     }
@@ -4977,7 +4997,12 @@ const buildVentaPayload = async ({ client, body, userId, sucursalScope, canApply
   };
 };
 
-const persistVentaPedidoSnapshots = async ({ client, idPedido, venta }) => {
+const persistVentaPedidoSnapshots = async ({
+  client,
+  idPedido,
+  venta,
+  skipExisting = false
+}) => {
   const pedidoId = parseOptionalPositiveInt(idPedido);
   if (!pedidoId) {
     throw {
@@ -4987,53 +5012,14 @@ const persistVentaPedidoSnapshots = async ({ client, idPedido, venta }) => {
     };
   }
 
-  await client.query(
-    `
-      INSERT INTO public.pedidos_contexto (
-        id_pedido,
-        id_canal_pedido,
-        id_modalidad_entrega,
-        id_usuario_toma,
-        id_sesion_caja_origen,
-        observacion_contexto
-      )
-      VALUES ($1, $2, $3, $4, $5, $6)
-    `,
-    [
-      pedidoId,
-      venta.contexto.id_canal_pedido,
-      venta.contexto.id_modalidad_entrega,
-      venta.id_usuario,
-      venta.id_sesion_caja,
-      venta.contexto.observacion_contexto
-    ]
-  );
-
   const contactoSnapshot = await resolvePedidoContactoSnapshotForInsert(client, venta.contacto);
-
-  await client.query(
-    `
-      INSERT INTO public.pedidos_contacto (
-        id_pedido,
-        nombre_contacto,
-        telefono_contacto,
-        telefono_normalizado,
-        dni,
-        rtn,
-        correo
-      )
-      VALUES ($1, $2, $3, $4, $5, $6, $7)
-    `,
-    [
-      pedidoId,
-      contactoSnapshot.nombre_contacto,
-      contactoSnapshot.telefono_contacto,
-      contactoSnapshot.telefono_normalizado,
-      contactoSnapshot.dni,
-      contactoSnapshot.rtn,
-      contactoSnapshot.correo
-    ]
-  );
+  await persistVentaPedidoSnapshotRows({
+    client,
+    pedidoId,
+    venta,
+    contactoSnapshot,
+    skipExisting
+  });
 };
 
 const attachVentaSnapshotsToResponse = (response, venta) => {
@@ -7948,6 +7934,13 @@ async function listarPedidosPendientesPago(req, res) {
           SELECT
             dp.id_pedido,
             dp.id_detalle_pedido,
+            dp.id_producto,
+            dp.id_receta,
+            CASE
+              WHEN dp.id_producto IS NOT NULL THEN 'PRODUCTO'
+              WHEN dp.id_receta IS NOT NULL THEN 'RECETA'
+              ELSE 'ITEM'
+            END AS tipo_item,
             COALESCE(prod.nombre_producto, rec.nombre_receta, 'Item de pedido') AS nombre_item,
             CASE
               WHEN COALESCE(dp.cantidad, 0) > 0
@@ -8004,8 +7997,11 @@ async function listarPedidosPendientesPago(req, res) {
       for (const row of detalleResult.rows) {
         const idPedidoRow = Number(row.id_pedido);
         if (!detallesByPedido.has(idPedidoRow)) detallesByPedido.set(idPedidoRow, []);
-        detallesByPedido.get(idPedidoRow).push({
+        detallesByPedido.get(idPedidoRow).push(normalizePedidoPendingDetailItem({
           id_detalle_pedido: Number(row.id_detalle_pedido),
+          id_producto: parseOptionalPositiveInt(row.id_producto),
+          id_receta: parseOptionalPositiveInt(row.id_receta),
+          tipo_item: row.tipo_item,
           nombre_item: row.nombre_item,
           cantidad: Number(row.cantidad || 1),
           precio_unitario: roundMoney(row.precio_unitario),
@@ -8018,7 +8014,7 @@ async function listarPedidosPendientesPago(req, res) {
           observacion: row.observacion || null,
           configuracion_menu: row.configuracion_menu || null,
           extras: Array.isArray(row.extras) ? row.extras : []
-        });
+        }));
       }
       for (const item of items) {
         item.items = detallesByPedido.get(Number(item.id_pedido)) || [];
@@ -8256,6 +8252,9 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
         idempotencyKey,
         requestHash: idempotencyRequestHash
       });
+      if (!rpcResponseBody?.idempotent_replay) {
+        await initializePedidoPendingKitchen({ client, idPedido: rpcResponseBody?.id_pedido });
+      }
       const commitStart = ventasPerf.now();
       await client.query('COMMIT');
       transactionStarted = false;
@@ -8365,7 +8364,7 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
           tipo_entrega,
           visible_en_cocina_at
         )
-        VALUES ($1, $2, (NOW() AT TIME ZONE 'America/Tegucigalpa'), $3, $4, $5, $6, $7, $8, $9, 'CAJA', $10, $11, $12, (NOW() AT TIME ZONE 'America/Tegucigalpa'))
+        VALUES ($1, $2, (NOW() AT TIME ZONE 'America/Tegucigalpa'), $3, $4, $5, $6, $7, $8, $9, 'CAJA', $10, $11, $12, NULL)
         RETURNING id_pedido
       `,
       [
@@ -8634,7 +8633,7 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
       message: 'Pedido pendiente creado correctamente.',
       id_pedido: idPedido,
       estado_pago: PEDIDO_PENDIENTE_ESTADO_PAGO,
-      estado_pedido: 'EN_COCINA',
+      estado_pedido: 'PENDIENTE',
       origen_pedido: 'CAJA',
       canal: pedidoPendiente.canal,
       modalidad: pedidoPendiente.modalidad,
@@ -9768,6 +9767,28 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
         requestHash: idempotencyRequestHash,
         requestStartedAt: authContextStart
       });
+      const idPedidoRpc = parseOptionalPositiveInt(rpcCreateResult.response?.id_pedido);
+      if (!idPedidoRpc) {
+        throw {
+          httpStatus: 500,
+          code: 'VENTAS_RPC_V3_PEDIDO_INVALIDO',
+          publicMessage: 'La venta fue procesada por RPC V3, pero no devolvio un pedido valido.'
+        };
+      }
+      if (!rpcCreateResult.response?.idempotent_replay) {
+        await persistImmediateSalePaymentState({
+          client,
+          idPedido: idPedidoRpc,
+          idFactura: rpcCreateResult.response?.id_factura,
+          venta
+        });
+      }
+      await persistVentaPedidoSnapshots({
+        client,
+        idPedido: idPedidoRpc,
+        venta,
+        skipExisting: true
+      });
       const rpcV3ResponseBody = attachVentaSnapshotsToResponse(rpcCreateResult.response, venta);
       const commitStart = ventasPerf.now();
       await client.query('COMMIT');
@@ -9799,6 +9820,12 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
         requestStartedAt: authContextStart
       });
       const idPedidoRpc = parseOptionalPositiveInt(rpcCreateResult.response?.id_pedido);
+      await persistImmediateSalePaymentState({
+        client,
+        idPedido: idPedidoRpc,
+        idFactura: rpcCreateResult.response?.id_factura,
+        venta
+      });
       await persistVentaPedidoSnapshots({ client, idPedido: idPedidoRpc, venta });
       await validarYDescontarInventarioCajaPedido({
         client,
@@ -9852,6 +9879,12 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
         perf: ventasPerf,
         requestStartedAt: authContextStart
       });
+      await persistImmediateSalePaymentState({
+        client,
+        idPedido: rpcCreateResult.response?.id_pedido,
+        idFactura: rpcCreateResult.response?.id_factura,
+        venta
+      });
       await persistVentaPedidoSnapshots({
         client,
         idPedido: rpcCreateResult.response?.id_pedido,
@@ -9864,6 +9897,7 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
         idUsuario: userId,
         perf: ventasPerf
       });
+      await initializePedidoPendingKitchen({ client, idPedido: rpcResponseBody?.id_pedido });
 
       const rpcV1ResponseBody = attachVentaSnapshotsToResponse(rpcCreateResult.response, venta);
       await saveVentasIdempotencySuccess({
@@ -10205,6 +10239,12 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
       );
     }
     ventasPerf.add('cobro_ms', cobroStart);
+    await persistImmediateSalePaymentState({
+      client,
+      idPedido,
+      idFactura,
+      venta
+    });
 
     const detalleFacturaStart = ventasPerf.now();
     const detalleFacturaRows = venta.all_lines.map((line, index) => {

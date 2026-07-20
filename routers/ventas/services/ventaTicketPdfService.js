@@ -1,11 +1,16 @@
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import pdfmake from 'pdfmake';
+import {
+  formatHondurasDate,
+  formatHondurasTime,
+  resolveStableDocumentDate
+} from '../../../utils/hondurasDateTime.js';
 
 const FONT_DIR = fileURLToPath(new URL('../../../node_modules/pdfmake/fonts/Roboto/', import.meta.url));
 const FONT_DIR_PREFIX = path.resolve(FONT_DIR) + path.sep;
 const DEFAULT_FOOTER = 'Gracias por su compra';
-const STABLE_PDF_FALLBACK_DATE = '1970-01-01T00:00:00.000Z';
+const LEGACY_STABLE_PDF_FALLBACK_DATE = '1970-01-01T00:00:00.000Z';
 
 pdfmake.setUrlAccessPolicy(() => false);
 pdfmake.setLocalAccessPolicy((filePath) => path.resolve(filePath).startsWith(FONT_DIR_PREFIX));
@@ -61,10 +66,12 @@ const hasRealFiscalData = (fiscal = {}, venta = {}) => (
   )
 );
 
-const formatDateParts = (value) => {
+// Formato legacy (schema_version 2): reproduce byte a byte los tickets creados
+// antes de 3eea227 (hora 12h vía toLocale, Date directo). No corrige la doble
+// conversion de zona; existe solo para regenerar trabajos v2 ya encolados.
+const formatDatePartsLegacy = (value) => {
   const date = value ? new Date(value) : null;
   if (!date || Number.isNaN(date.getTime())) return { date: '--', time: '--' };
-
   return {
     date: date.toLocaleDateString('es-HN', {
       timeZone: 'America/Tegucigalpa',
@@ -80,10 +87,19 @@ const formatDateParts = (value) => {
   };
 };
 
-const resolveStablePdfDate = (venta = {}) => {
+const formatDateParts = (value, { legacy = false } = {}) => (
+  legacy
+    ? formatDatePartsLegacy(value)
+    : { date: formatHondurasDate(value), time: formatHondurasTime(value) }
+);
+
+const resolveStablePdfDate = (venta = {}, { legacy = false } = {}) => {
   const source = venta.fecha_hora_facturacion || venta.fecha_hora_pedido;
-  const date = source ? new Date(source) : new Date(STABLE_PDF_FALLBACK_DATE);
-  return Number.isNaN(date.getTime()) ? new Date(STABLE_PDF_FALLBACK_DATE) : date;
+  if (legacy) {
+    const date = source ? new Date(source) : new Date(LEGACY_STABLE_PDF_FALLBACK_DATE);
+    return Number.isNaN(date.getTime()) ? new Date(LEGACY_STABLE_PDF_FALLBACK_DATE) : date;
+  }
+  return resolveStableDocumentDate(source);
 };
 
 const resolveTicketWidth = (venta = {}) =>
@@ -245,8 +261,8 @@ const buildFiscalBlock = (venta, widthMm) => {
   return rows.length ? [divider(widthMm), ...rows] : [];
 };
 
-const buildMetaBlock = (venta, widthMm) => {
-  const parts = formatDateParts(venta.fecha_hora_facturacion || venta.fecha_hora_pedido);
+const buildMetaBlock = (venta, widthMm, { legacy = false } = {}) => {
+  const parts = formatDateParts(venta.fecha_hora_facturacion || venta.fecha_hora_pedido, { legacy });
   const rows = [
     metaRow('Fecha', parts.date, widthMm),
     metaRow('Hora', parts.time, widthMm),
@@ -271,14 +287,17 @@ const buildItemRows = (items = [], widthMm) => {
   ]];
 
   for (const item of items) {
-    const salsas = normalizeSalsas(item);
+    const isStandaloneExtra = Boolean(
+      item.es_linea_extra_independiente || item?.origen_snapshot?.es_linea_extra_independiente
+    );
+    const salsas = isStandaloneExtra ? [] : normalizeSalsas(item);
     rows.push([
       text(item.cantidad || 1),
       text(item.nombre_item || item.nombre_producto || 'Item'),
       text(formatMoney(item.total_linea || item.sub_total), { alignment: 'right' })
     ]);
 
-    if (Array.isArray(item.extras)) {
+    if (!isStandaloneExtra && Array.isArray(item.extras)) {
       for (const extra of item.extras) {
         const perOrderQty = toMoneyNumber(extra.cantidad_por_orden || 0) > 0
           ? toMoneyNumber(extra.cantidad_por_orden)
@@ -393,15 +412,15 @@ const buildDeliveryBlock = (venta, widthMm) => {
   ];
 };
 
-export const buildVentaTicketPdfDefinition = (venta) => {
+export const buildVentaTicketPdfDefinition = (venta, { legacy = false } = {}) => {
   const widthMm = resolveTicketWidth(venta);
   const heightMm = estimateHeightMm(venta);
   const ticket = venta?.facturacion?.ticket || {};
-  const stablePdfDate = resolveStablePdfDate(venta);
+  const stablePdfDate = resolveStablePdfDate(venta, { legacy });
   const content = [
     ...buildHeader(venta, widthMm),
     ...buildFiscalBlock(venta, widthMm),
-    ...buildMetaBlock(venta, widthMm),
+    ...buildMetaBlock(venta, widthMm, { legacy }),
     ...buildItemsBlock(venta, widthMm),
     ...buildSplitBlock(venta.cuenta_dividida, widthMm),
     ...buildDeliveryBlock(venta, widthMm),
@@ -429,8 +448,8 @@ export const buildVentaTicketPdfDefinition = (venta) => {
   };
 };
 
-export const buildVentaTicketPdfBuffer = async (venta) =>
-  pdfmake.createPdf(buildVentaTicketPdfDefinition(venta)).getBuffer();
+export const buildVentaTicketPdfBuffer = async (venta, { legacy = false } = {}) =>
+  pdfmake.createPdf(buildVentaTicketPdfDefinition(venta, { legacy })).getBuffer();
 
 export const buildVentaTicketPdfFilename = (venta = {}) => {
   const raw = cleanText(venta.codigo_venta || venta.numero_venta || `VTA-${String(venta.id_factura || '').padStart(5, '0')}`);

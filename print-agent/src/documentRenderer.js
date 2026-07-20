@@ -6,7 +6,8 @@ const money = (value) => `L ${Number(value || 0).toFixed(2)}`;
 const PDF_MAX_BYTES = 2 * 1024 * 1024;
 const HTML_MAX_BYTES = 256 * 1024;
 const BASE64_PATTERN = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
-const PAYLOAD_V2_KEYS = Object.freeze([
+const CANONICAL_SCHEMA_VERSION = 2;
+const PAYLOAD_CANONICAL_KEYS = Object.freeze([
   'schema_version',
   'tipo_documento',
   'impresora_logica',
@@ -38,12 +39,22 @@ const invalidCanonicalDocument = () => {
   throw new Error('PAYLOAD_V2_CANONICAL_INVALID');
 };
 
-const validatePayloadV2 = (payload) => {
-  if (!hasExactKeys(payload, PAYLOAD_V2_KEYS) || payload.schema_version !== 2) invalidCanonicalDocument();
+const validateCanonicalPayload = (payload) => {
+  if (!hasExactKeys(payload, PAYLOAD_CANONICAL_KEYS)
+    || payload.schema_version !== CANONICAL_SCHEMA_VERSION) invalidCanonicalDocument();
   if (![58, 80].includes(payload.ancho_mm)) invalidCanonicalDocument();
+  const facturaSourceValid = payload.source?.id_factura === null
+    || isPositiveSafeInteger(payload.source?.id_factura);
+  const pedidoSourceValid = payload.source?.id_pedido === null
+    || isPositiveSafeInteger(payload.source?.id_pedido);
+  const requiredSourcePresent = payload.tipo_documento === 'factura'
+    ? isPositiveSafeInteger(payload.source?.id_factura)
+    : payload.tipo_documento === 'comanda'
+      && (isPositiveSafeInteger(payload.source?.id_factura) || isPositiveSafeInteger(payload.source?.id_pedido));
   if (!hasExactKeys(payload.source, SOURCE_KEYS)
-    || !isPositiveSafeInteger(payload.source.id_factura)
-    || !(payload.source.id_pedido === null || isPositiveSafeInteger(payload.source.id_pedido))) {
+    || !facturaSourceValid
+    || !pedidoSourceValid
+    || !requiredSourcePresent) {
     invalidCanonicalDocument();
   }
   if (!hasExactKeys(payload.documento_canonico, DOCUMENT_KEYS)) invalidCanonicalDocument();
@@ -95,7 +106,7 @@ const decodeCanonicalContent = ({ contract, data }) => {
 };
 
 export const validateCanonicalPrintJobData = (payload, dataItem) => {
-  const contract = validatePayloadV2(payload);
+  const contract = validateCanonicalPayload(payload);
   const expectedOptions = buildCanonicalDataOptions({ contract, widthMm: payload.ancho_mm });
   if (!hasExactKeys(dataItem, DATA_ITEM_KEYS)
     || dataItem.type !== 'pixel'

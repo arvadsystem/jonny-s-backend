@@ -1,7 +1,9 @@
 import { roundMoney } from '../utils/moneyUtils.js';
 import {
   normalizeObservation,
-  parseOptionalPositiveInt
+  parseJsonArrayValue,
+  parseOptionalPositiveInt,
+  resolveStandaloneExtraLine
 } from '../utils/parseUtils.js';
 import {
   VENTA_DIRECTA_LABEL,
@@ -360,6 +362,7 @@ export const fetchDetalleFacturaExtras = async (client, detalleFacturaIds = []) 
         id_detalle_factura,
         id_extra,
         nombre_extra_snapshot AS nombre,
+        codigo_extra_snapshot,
         cantidad,
         precio_unitario,
         subtotal
@@ -377,12 +380,107 @@ export const fetchDetalleFacturaExtras = async (client, detalleFacturaIds = []) 
     grouped.get(id).push({
       id_extra: Number(row.id_extra),
       nombre: row.nombre,
+      codigo_extra_snapshot: row.codigo_extra_snapshot || null,
       cantidad: Number(row.cantidad),
       precio_unitario: roundMoney(row.precio_unitario),
       subtotal: roundMoney(row.subtotal)
     });
   }
   return grouped;
+};
+
+export const normalizeSplitAccountStandaloneExtra = (item) => {
+  const extras = parseJsonArrayValue(item?.extras);
+  const standaloneExtra = resolveStandaloneExtraLine({
+    idProducto: item?.id_producto,
+    idReceta: item?.id_receta,
+    extras
+  });
+  if (!standaloneExtra) return { ...item, extras };
+
+  const cantidad = Number(standaloneExtra.cantidad) > 0
+    ? Number(standaloneExtra.cantidad)
+    : Number(item?.cantidad || 0);
+  const subtotal = Number.isFinite(Number(standaloneExtra.subtotal))
+    ? roundMoney(standaloneExtra.subtotal)
+    : roundMoney(item?.subtotal_extras ?? item?.total_linea);
+  const precioUnitario = Number.isFinite(Number(standaloneExtra.precio_unitario))
+    ? roundMoney(standaloneExtra.precio_unitario)
+    : (cantidad > 0 ? roundMoney(subtotal / cantidad) : 0);
+  const totalLinea = Number.isFinite(Number(item?.total_linea))
+    ? roundMoney(item.total_linea)
+    : subtotal;
+
+  return {
+    ...item,
+    tipo_item: 'EXTRA',
+    id_extra: standaloneExtra.id_extra || null,
+    nombre_item: standaloneExtra.nombre_extra_snapshot,
+    nombre_producto: standaloneExtra.nombre_extra_snapshot,
+    es_linea_extra_independiente: true,
+    cantidad,
+    precio_unitario: precioUnitario,
+    sub_total: subtotal,
+    subtotal_linea: subtotal,
+    subtotal_base: 0,
+    subtotal_extras: subtotal,
+    total_linea: totalLinea,
+    extras: [],
+    origen_snapshot: {
+      ...(item?.origen_snapshot || {}),
+      es_linea_extra_independiente: true,
+      id_extra: standaloneExtra.id_extra || null,
+      nombre_extra_snapshot: standaloneExtra.nombre_extra_snapshot,
+      extras_snapshot: extras
+    }
+  };
+};
+
+export const normalizePedidoPendingDetailItem = (item) => {
+  const extras = parseJsonArrayValue(item?.extras);
+  const subtotalBase = roundMoney(item?.sub_total ?? item?.subtotal_linea);
+  const subtotalExtras = roundMoney(extras.reduce(
+    (sum, extra) => sum + Number(extra?.subtotal || 0),
+    0
+  ));
+  return normalizeSplitAccountStandaloneExtra({
+    ...item,
+    sub_total: subtotalBase,
+    subtotal_linea: subtotalBase,
+    subtotal_base: subtotalBase,
+    subtotal_extras: subtotalExtras,
+    extras
+  });
+};
+
+export const buildSplitAccountNormalizedBreakdown = ({ division, items = [] }) => {
+  const normalizedItems = Array.isArray(items) ? items : [];
+  const subtotalBase = roundMoney(normalizedItems.reduce(
+    (sum, item) => sum + Number(item?.subtotal_base || 0),
+    0
+  ));
+  const subtotalExtras = roundMoney(normalizedItems.reduce(
+    (sum, item) => sum + Number(item?.subtotal_extras || 0),
+    0
+  ));
+  const descuentoTotal = roundMoney(division?.descuento_total);
+  const isvTotal = roundMoney(division?.isv_total);
+  const total = roundMoney(division?.total);
+  const totalCalculadoSinAjuste = roundMoney(
+    subtotalBase + subtotalExtras - descuentoTotal + isvTotal
+  );
+  const ajusteConciliacion = roundMoney(total - totalCalculadoSinAjuste);
+
+  return {
+    subtotal_base: subtotalBase,
+    subtotal_extras: subtotalExtras,
+    descuento_total: descuentoTotal,
+    isv_total: isvTotal,
+    total_calculado_sin_ajuste: totalCalculadoSinAjuste,
+    ajuste_conciliacion: ajusteConciliacion,
+    requiere_conciliacion: Math.abs(ajusteConciliacion) >= 0.01,
+    total
+  };
 };
 
 export const fetchCuentaDividida = async (client, { idFactura = null, idPedido = null } = {}) => {
@@ -460,7 +558,7 @@ export const fetchCuentaDividida = async (client, { idFactura = null, idPedido =
   for (const row of itemsResult.rows) {
     const id = Number(row.id_cuenta_division);
     if (!itemsByDivision.has(id)) itemsByDivision.set(id, []);
-    itemsByDivision.get(id).push({
+    itemsByDivision.get(id).push(normalizeSplitAccountStandaloneExtra({
       id_cuenta_division_item: Number(row.id_cuenta_division_item),
       id_detalle_factura: parseOptionalPositiveInt(row.id_detalle_factura),
       id_detalle_pedido: parseOptionalPositiveInt(row.id_detalle_pedido),
@@ -475,10 +573,10 @@ export const fetchCuentaDividida = async (client, { idFactura = null, idPedido =
       descuento_total: roundMoney(row.descuento_total),
       isv_total: roundMoney(row.isv_total),
       total_linea: roundMoney(row.total_linea),
-      extras: Array.isArray(row.extras_snapshot) ? row.extras_snapshot : [],
+      extras: parseJsonArrayValue(row.extras_snapshot),
       complementos: Array.isArray(row.complementos_snapshot) ? row.complementos_snapshot : [],
       origen_snapshot: row.origen_snapshot || {}
-    });
+    }));
   }
 
   const cobrosByDivision = new Map();
@@ -498,6 +596,7 @@ export const fetchCuentaDividida = async (client, { idFactura = null, idPedido =
 
   const divisiones = divisionsResult.rows.map((row) => {
     const id = Number(row.id_cuenta_division);
+    const items = itemsByDivision.get(id) || [];
     return {
       id_cuenta_division: id,
       id_factura: parseOptionalPositiveInt(row.id_factura),
@@ -512,7 +611,8 @@ export const fetchCuentaDividida = async (client, { idFactura = null, idPedido =
       monto_pagado: roundMoney(row.monto_pagado),
       monto_pendiente: roundMoney(row.monto_pendiente),
       estado: String(row.estado || 'PENDIENTE').trim().toUpperCase(),
-      items: itemsByDivision.get(id) || [],
+      items,
+      desglose_normalizado: buildSplitAccountNormalizedBreakdown({ division: row, items }),
       cobros: cobrosByDivision.get(id) || []
     };
   });

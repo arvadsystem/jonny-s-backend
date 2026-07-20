@@ -3,13 +3,22 @@ import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import { renderPrintJobHtml } from '../print-agent/src/documentRenderer.js';
-import { claimPrintJobs, transitionPrintJob, validatePrintPayload } from '../services/printQueueService.js';
+import {
+  claimPrintJobs,
+  enqueuePrintJob,
+  transitionPrintJob,
+  validatePrintPayload
+} from '../services/printQueueService.js';
 import {
   authorizeAndSignAgentQzRequest,
   canonicalizeAgentQzRequest,
   validateAgentQzRequest
 } from '../services/qzAgentSigningService.js';
 import { buildAgentQzSigningErrorResponse } from '../routers/printAgent.js';
+import {
+  buildPedidoPrintEnqueueErrorResponse,
+  enqueuePedidoComandaPrintJob
+} from '../routers/printing.js';
 
 const agent = { id_agente: '11111111-1111-1111-1111-111111111111', id_sucursal: 9 };
 const payload = {
@@ -68,6 +77,10 @@ const comandaPayloadV2 = {
     content_bytes: comandaHtmlBytes.length
   }
 };
+const pendingComandaPayloadV2 = {
+  ...clone(comandaPayloadV2),
+  source: { id_factura: null, id_pedido: 8 }
+};
 const comandaDataV2 = {
   type: 'pixel',
   format: 'html',
@@ -109,6 +122,178 @@ const createTransactionalDb = (queryHandler) => {
   };
   return { db: { connect: async () => client }, calls };
 };
+
+test('enqueue v2 persiste trabajo y contenido canonico en una sola transaccion', async () => {
+  const fixture = createTransactionalDb(async (sql) => {
+    if (sql === 'BEGIN' || sql === 'COMMIT' || sql === 'ROLLBACK') return { rows: [] };
+    if (/INSERT INTO public\.trabajos_impresion\s/.test(sql)) {
+      return {
+        rows: [{
+          id_trabajo: 81,
+          id_sucursal: 9,
+          tipo_documento: 'factura',
+          estado: 'pendiente',
+          fecha_creacion: new Date('2026-07-19T00:00:00Z'),
+          inserted: true
+        }]
+      };
+    }
+    if (/INSERT INTO public\.trabajos_impresion_documentos/.test(sql)) return { rows: [] };
+    throw new Error(`SQL inesperado: ${sql}`);
+  });
+
+  const job = await enqueuePrintJob({
+    idSucursal: 9,
+    tipoDocumento: 'factura',
+    payload: facturaPayloadV2,
+    canonicalDocument: facturaDataV2,
+    idempotencyKey: 'factura:6:qa-atomic',
+    idFactura: 6,
+    db: fixture.db
+  });
+
+  assert.equal(job.id_trabajo, 81);
+  const documentInsert = fixture.calls.find((call) => /trabajos_impresion_documentos/.test(call.sql));
+  assert.ok(documentInsert);
+  assert.equal(Buffer.compare(documentInsert.params[5], facturaPdfBytes), 0);
+  assert.deepEqual(fixture.calls.filter((call) => ['BEGIN', 'COMMIT'].includes(call.sql)).map((call) => call.sql), ['BEGIN', 'COMMIT']);
+  assert.equal(fixture.calls.some((call) => call.sql === 'ROLLBACK'), false);
+});
+
+test('enqueue idempotente no sobrescribe ni duplica contenido persistido', async () => {
+  const fixture = createTransactionalDb(async (sql) => {
+    if (sql === 'BEGIN' || sql === 'COMMIT') return { rows: [] };
+    if (/INSERT INTO public\.trabajos_impresion\s/.test(sql)) return { rows: [] };
+    if (/SELECT id_trabajo,id_sucursal,tipo_documento,estado,fecha_creacion,false AS inserted/.test(sql)) {
+      return { rows: [{ id_trabajo: 81, id_sucursal: 9, tipo_documento: 'factura', estado: 'pendiente', inserted: false }] };
+    }
+    throw new Error(`SQL inesperado: ${sql}`);
+  });
+
+  await enqueuePrintJob({
+    idSucursal: 9,
+    tipoDocumento: 'factura',
+    payload: facturaPayloadV2,
+    canonicalDocument: facturaDataV2,
+    idempotencyKey: 'factura:6:qa-atomic',
+    idFactura: 6,
+    db: fixture.db
+  });
+
+  assert.equal(fixture.calls.some((call) => /INSERT INTO public\.trabajos_impresion_documentos/.test(call.sql)), false);
+});
+
+test('fallo al persistir documento revierte y no deja trabajo incompleto', async () => {
+  const fixture = createTransactionalDb(async (sql) => {
+    if (sql === 'BEGIN' || sql === 'ROLLBACK') return { rows: [] };
+    if (/INSERT INTO public\.trabajos_impresion\s/.test(sql)) {
+      return { rows: [{ id_trabajo: 82, id_sucursal: 9, tipo_documento: 'factura', estado: 'pendiente', inserted: true }] };
+    }
+    if (/INSERT INTO public\.trabajos_impresion_documentos/.test(sql)) throw new Error('persistencia fallida');
+    throw new Error(`SQL inesperado: ${sql}`);
+  });
+
+  await assert.rejects(() => enqueuePrintJob({
+    idSucursal: 9,
+    tipoDocumento: 'factura',
+    payload: facturaPayloadV2,
+    canonicalDocument: facturaDataV2,
+    idempotencyKey: 'factura:6:qa-rollback',
+    idFactura: 6,
+    db: fixture.db
+  }), /persistencia fallida/);
+  assert.equal(fixture.calls.some((call) => call.sql === 'ROLLBACK'), true);
+  assert.equal(fixture.calls.some((call) => call.sql === 'COMMIT'), false);
+});
+
+test('enqueue ejecuta la transicion de cocina dentro de la misma transaccion', async () => {
+  const order = [];
+  const fixture = createTransactionalDb(async (sql) => {
+    if (sql === 'BEGIN' || sql === 'COMMIT' || sql === 'ROLLBACK') {
+      order.push(sql);
+      return { rows: [] };
+    }
+    if (/INSERT INTO public\.trabajos_impresion\s/.test(sql)) {
+      order.push('JOB');
+      return { rows: [{ id_trabajo: 83, id_sucursal: 9, tipo_documento: 'comanda', estado: 'pendiente', inserted: true }] };
+    }
+    if (/INSERT INTO public\.trabajos_impresion_documentos/.test(sql)) {
+      order.push('DOCUMENT');
+      return { rows: [] };
+    }
+    throw new Error(`SQL inesperado: ${sql}`);
+  });
+
+  await enqueuePrintJob({
+    idSucursal: 9,
+    tipoDocumento: 'comanda',
+    payload: comandaPayloadV2,
+    canonicalDocument: comandaDataV2,
+    idempotencyKey: 'comanda:7:qa-kitchen',
+    idFactura: 7,
+    idPedido: 8,
+    db: fixture.db,
+    onInsertedTransaction: async ({ client, job }) => {
+      assert.equal(job.id_trabajo, 83);
+      assert.ok(client);
+      order.push('KITCHEN');
+    }
+  });
+
+  assert.deepEqual(order, ['BEGIN', 'JOB', 'DOCUMENT', 'KITCHEN', 'COMMIT']);
+});
+
+test('fallo de transicion de cocina revierte trabajo y documento', async () => {
+  const fixture = createTransactionalDb(async (sql) => {
+    if (sql === 'BEGIN' || sql === 'ROLLBACK') return { rows: [] };
+    if (/INSERT INTO public\.trabajos_impresion\s/.test(sql)) {
+      return { rows: [{ id_trabajo: 84, id_sucursal: 9, tipo_documento: 'comanda', estado: 'pendiente', inserted: true }] };
+    }
+    if (/INSERT INTO public\.trabajos_impresion_documentos/.test(sql)) return { rows: [] };
+    throw new Error(`SQL inesperado: ${sql}`);
+  });
+
+  await assert.rejects(() => enqueuePrintJob({
+    idSucursal: 9,
+    tipoDocumento: 'comanda',
+    payload: comandaPayloadV2,
+    canonicalDocument: comandaDataV2,
+    idempotencyKey: 'comanda:7:qa-kitchen-fail',
+    idFactura: 7,
+    idPedido: 8,
+    db: fixture.db,
+    onInsertedTransaction: async () => { throw new Error('kitchen transition failed'); }
+  }), /kitchen transition failed/);
+
+  assert.equal(fixture.calls.some((call) => call.sql === 'ROLLBACK'), true);
+  assert.equal(fixture.calls.some((call) => call.sql === 'COMMIT'), false);
+});
+
+test('reintento idempotente no vuelve a ejecutar la transicion de cocina', async () => {
+  let transitionCalls = 0;
+  const fixture = createTransactionalDb(async (sql) => {
+    if (sql === 'BEGIN' || sql === 'COMMIT') return { rows: [] };
+    if (/INSERT INTO public\.trabajos_impresion\s/.test(sql)) return { rows: [] };
+    if (/SELECT id_trabajo,id_sucursal,tipo_documento,estado,fecha_creacion,false AS inserted/.test(sql)) {
+      return { rows: [{ id_trabajo: 83, id_sucursal: 9, tipo_documento: 'comanda', estado: 'pendiente', inserted: false }] };
+    }
+    throw new Error(`SQL inesperado: ${sql}`);
+  });
+
+  await enqueuePrintJob({
+    idSucursal: 9,
+    tipoDocumento: 'comanda',
+    payload: comandaPayloadV2,
+    canonicalDocument: comandaDataV2,
+    idempotencyKey: 'comanda:7:qa-kitchen',
+    idFactura: 7,
+    idPedido: 8,
+    db: fixture.db,
+    onInsertedTransaction: async () => { transitionCalls += 1; }
+  });
+
+  assert.equal(transitionCalls, 0);
+});
 
 const allowedPrintRequest = (timestamp, jobId = 8, html = renderPrintJobHtml(payload)) => ({
   call: 'print',
@@ -155,6 +340,163 @@ test('claim backend fuerza limite uno y no toma otro lease mientras el agente im
   assert.equal(params[1], 1);
   const migration = fs.readFileSync(new URL('../sql/2026-07-16_cola_impresion_agentes_sucursal.sql', import.meta.url), 'utf8');
   assert.match(migration, /FOR UPDATE;[\s\S]*IF EXISTS \([\s\S]*id_agente_tomado = p_id_agente[\s\S]*estado IN \('asignado', 'imprimiendo'\)[\s\S]*RETURN;/);
+});
+
+test('endpoint de pedido encola comanda inicial idempotente y reimpresion separada sin factura', async () => {
+  const pedido = {
+    id_factura: null,
+    id_pedido: 501,
+    id_sucursal: agent.id_sucursal,
+    id_caja: 3,
+    modalidad: 'CONSUMO_LOCAL',
+    contexto: { modalidad: 'CONSUMO_LOCAL', canal: 'POS' },
+    items: []
+  };
+  const enqueueCalls = [];
+  const jobsByKey = new Map();
+  const enqueue = async (args) => {
+    enqueueCalls.push(args);
+    const key = `${args.idSucursal}:${args.tipoDocumento}:${args.idempotencyKey}`;
+    if (!jobsByKey.has(key)) jobsByKey.set(key, { id_trabajo: jobsByKey.size + 100, ...args });
+    return jobsByKey.get(key);
+  };
+  const baseArgs = {
+    req: { user: { id_usuario: 44 } },
+    idPedido: 501,
+    tipoDocumento: 'comanda',
+    queryRunner: {},
+    loadPedido: async () => pedido,
+    resolveScope: async () => ({ isSuperAdmin: false, allowedSucursalIds: [agent.id_sucursal] }),
+    loadPrinterConfig: async () => ({ impresoras: [{ tipo_impresora: 'COCINA', ancho_mm: 58 }] }),
+    createPayload: async ({ tipoDocumento, venta, widthMm }) => ({
+      ...clone(comandaPayloadV2),
+      tipo_documento: tipoDocumento,
+      ancho_mm: widthMm,
+      source: { id_factura: venta.id_factura, id_pedido: venta.id_pedido }
+    }),
+    enqueue
+  };
+
+  const first = await enqueuePedidoComandaPrintJob(baseArgs);
+  const replay = await enqueuePedidoComandaPrintJob({
+    ...baseArgs,
+    idempotencyKey: 'comanda:pedido:501:inicial'
+  });
+  const reprint = await enqueuePedidoComandaPrintJob({
+    ...baseArgs,
+    esReimpresion: true,
+    idempotencyKey: 'comanda:pedido-reprint:501:qa-1'
+  });
+
+  assert.equal(first.id_trabajo, replay.id_trabajo);
+  assert.notEqual(reprint.id_trabajo, first.id_trabajo);
+  assert.deepEqual(enqueueCalls[0], {
+    idSucursal: agent.id_sucursal,
+    tipoDocumento: 'comanda',
+    idempotencyKey: 'comanda:pedido:501:inicial',
+    idFactura: null,
+    idPedido: 501,
+    idUsuario: 44,
+    esReimpresion: false,
+    payload: enqueueCalls[0].payload,
+    onInsertedTransaction: enqueueCalls[0].onInsertedTransaction
+  });
+  assert.equal(typeof enqueueCalls[0].onInsertedTransaction, 'function');
+  assert.deepEqual(enqueueCalls[0].payload.source, { id_factura: null, id_pedido: 501 });
+  assert.equal(enqueueCalls[2].esReimpresion, true);
+  assert.equal(enqueueCalls[2].idempotencyKey, 'comanda:pedido-reprint:501:qa-1');
+  assert.equal(enqueueCalls[2].onInsertedTransaction, undefined);
+
+  const routerSource = fs.readFileSync(new URL('../routers/printing.js', import.meta.url), 'utf8');
+  assert.match(routerSource, /router\.post\('\/ventas\/pedidos\/:idPedido\/print-jobs', checkPermission\(\['VENTAS_IMPRIMIR', 'VENTAS_CREAR'\]\)/);
+  assert.match(routerSource, /router\.post\('\/ventas\/pedidos\/:idPedido\/print-jobs'[\s\S]*return res\.status\(202\)/);
+  assert.match(routerSource, /router\.post\('\/ventas\/:id\/print-jobs'[\s\S]*buildVentaDetailPayload/);
+  const queueSource = fs.readFileSync(new URL('../services/printQueueService.js', import.meta.url), 'utf8');
+  assert.match(queueSource, /ON CONFLICT \(id_sucursal,\s*idempotency_key,\s*tipo_documento\)/);
+});
+
+test('endpoint de pedido falla cerrado para clave, sucursal, factura o tipo incorrectos', async () => {
+  const pedido = { id_factura: null, id_pedido: 501, id_sucursal: agent.id_sucursal, items: [] };
+  const baseArgs = {
+    req: { user: { id_usuario: 44 } },
+    idPedido: 501,
+    tipoDocumento: 'comanda',
+    queryRunner: {},
+    loadPedido: async () => pedido,
+    resolveScope: async () => ({ isSuperAdmin: false, allowedSucursalIds: [agent.id_sucursal] }),
+    loadPrinterConfig: async () => null,
+    createPayload: async () => comandaPayloadV2,
+    enqueue: async () => ({ id_trabajo: 1 })
+  };
+
+  await assert.rejects(
+    () => enqueuePedidoComandaPrintJob({
+      ...baseArgs,
+      esReimpresion: true,
+      idempotencyKey: 'comanda:pedido-reprint:999:qa-1'
+    }),
+    (error) => error.code === 'PRINT_IDEMPOTENCY_INVALID'
+  );
+  for (const invalidId of ['501-externo', '1e2', ' 501 ', '+501']) {
+    await assert.rejects(
+      () => enqueuePedidoComandaPrintJob({ ...baseArgs, idPedido: invalidId }),
+      (error) => error.code === 'PRINT_PEDIDO_INVALID'
+    );
+  }
+  await assert.rejects(
+    () => enqueuePedidoComandaPrintJob({ ...baseArgs, loadPedido: async () => null }),
+    (error) => error.code === 'PRINT_PEDIDO_NOT_FOUND' && error.status === 404
+  );
+  await assert.rejects(
+    () => enqueuePedidoComandaPrintJob({ ...baseArgs, idempotencyKey: 'arbitraria-externa' }),
+    (error) => error.code === 'PRINT_IDEMPOTENCY_INVALID'
+  );
+  await assert.rejects(
+    () => enqueuePedidoComandaPrintJob({ ...baseArgs, esReimpresion: true }),
+    (error) => error.code === 'PRINT_IDEMPOTENCY_REQUIRED'
+  );
+  await assert.rejects(
+    () => enqueuePedidoComandaPrintJob({
+      ...baseArgs,
+      resolveScope: async () => ({ isSuperAdmin: false, allowedSucursalIds: [10] })
+    }),
+    (error) => error.code === 'PRINT_SUCURSAL_FORBIDDEN'
+  );
+  await assert.rejects(
+    () => enqueuePedidoComandaPrintJob({
+      ...baseArgs,
+      loadPedido: async () => ({ ...pedido, id_factura: 77 })
+    }),
+    (error) => error.code === 'PRINT_PEDIDO_SOURCE_INVALID'
+  );
+  await assert.rejects(
+    () => enqueuePedidoComandaPrintJob({
+      ...baseArgs,
+      loadPedido: async () => ({ ...pedido, pago: { id_factura: 77 } })
+    }),
+    (error) => error.code === 'PRINT_PEDIDO_SOURCE_INVALID'
+  );
+  await assert.rejects(
+    () => enqueuePedidoComandaPrintJob({ ...baseArgs, tipoDocumento: 'factura' }),
+    (error) => error.code === 'PRINT_DOCUMENT_TYPE_INVALID'
+  );
+
+  const databaseError = buildPedidoPrintEnqueueErrorResponse(Object.assign(new Error('SQL sensible'), {
+    code: '42P08'
+  }));
+  assert.deepEqual(databaseError, {
+    status: 500,
+    body: {
+      ok: false,
+      code: 'PRINT_ENQUEUE_FAILED',
+      message: 'No se pudo enviar el trabajo de impresion.'
+    }
+  });
+  const controlledError = buildPedidoPrintEnqueueErrorResponse(Object.assign(new Error('Pedido no encontrado.'), {
+    status: 404,
+    code: 'PRINT_PEDIDO_NOT_FOUND'
+  }));
+  assert.equal(controlledError.body.code, 'PRINT_PEDIDO_NOT_FOUND');
 });
 
 test('transicion y evento son atomicos y rollback revierte si falla el evento', async () => {
@@ -338,14 +680,18 @@ test('firma QZ exige el HTML determinista almacenado en el trabajo', async () =>
 test('payload canonico v2 exige contrato y referencias exactas', () => {
   assert.equal(validatePrintPayload(facturaPayloadV2).ok, true);
   assert.equal(validatePrintPayload(comandaPayloadV2).ok, true);
+  assert.equal(validatePrintPayload(pendingComandaPayloadV2).ok, true);
 
   const invalidPayloads = [
     { ...clone(facturaPayloadV2), extra: true },
     { ...clone(facturaPayloadV2), schema_version: '2' },
+    { ...clone(facturaPayloadV2), schema_version: 3 },
     { ...clone(facturaPayloadV2), ancho_mm: '80' },
     { ...clone(facturaPayloadV2), impresora_logica: 'cocina' },
     { ...clone(facturaPayloadV2), source: { ...facturaPayloadV2.source, extra: true } },
     { ...clone(facturaPayloadV2), source: { id_factura: '6', id_pedido: 7 } },
+    { ...clone(facturaPayloadV2), source: { id_factura: null, id_pedido: 7 } },
+    { ...clone(pendingComandaPayloadV2), source: { id_factura: null, id_pedido: null } },
     {
       ...clone(facturaPayloadV2),
       documento_canonico: { ...facturaPayloadV2.documento_canonico, extra: true }
@@ -366,7 +712,8 @@ test('firmador QZ acepta exactamente factura PDF oficial y comanda HTML canonica
   assert.deepEqual(comandaDataV2.options, { pageWidth: 58 });
   const fixtures = [
     { id: 8, currentPayload: facturaPayloadV2, dataItem: facturaDataV2 },
-    { id: 9, currentPayload: comandaPayloadV2, dataItem: comandaDataV2 }
+    { id: 9, currentPayload: comandaPayloadV2, dataItem: comandaDataV2 },
+    { id: 10, currentPayload: pendingComandaPayloadV2, dataItem: comandaDataV2 }
   ];
 
   for (const fixture of fixtures) {
@@ -592,4 +939,57 @@ test('migracion protege Data API, funcion y hash SHA-256 sin ejecutarse', () => 
   }
   assert.match(migration, /REVOKE EXECUTE ON FUNCTION public\.reclamar_trabajos_impresion[\s\S]*FROM PUBLIC, anon, authenticated, service_role/);
   assert.match(migration, /REVOKE ALL ON SEQUENCE public\.trabajos_impresion_id_trabajo_seq/);
+});
+
+test('migracion de documentos canonicos replica el endurecimiento QA sin privilegios service_role', () => {
+  const migration = fs.readFileSync(new URL('../sql/20260719_create_print_job_documents.sql', import.meta.url), 'utf8');
+  const rollback = fs.readFileSync(new URL('../sql/20260719_create_print_job_documents_ROLLBACK.sql', import.meta.url), 'utf8');
+  const verification = fs.readFileSync(new URL('../sql/20260719_verify_print_job_documents.sql', import.meta.url), 'utf8');
+  assert.match(migration, /current_user <> 'postgres'/);
+  assert.match(migration, /trabajos_impresion\.id_trabajo debe ser la PK/);
+  assert.match(migration, /extensions\.digest\(bytea,text\)/);
+  assert.match(migration, /CREATE TABLE IF NOT EXISTS public\.trabajos_impresion_documentos/);
+  assert.match(migration, /tabla existente compatible; migracion en modo no-op/);
+  assert.match(migration, /PREFLIGHT_FAILED_EXISTING_TABLE_MISMATCH/);
+  assert.ok(
+    migration.indexOf('PREFLIGHT_FAILED_EXISTING_TABLE_MISMATCH')
+      < migration.indexOf('CREATE TABLE IF NOT EXISTS'),
+    'la tabla existente debe validarse antes del CREATE no-op'
+  );
+  assert.match(migration, /GENERATED ALWAYS AS IDENTITY/);
+  assert.match(migration, /OWNER TO postgres/);
+  assert.match(migration, /UNIQUE \(id_trabajo\)/);
+  assert.match(migration, /REFERENCES public\.trabajos_impresion\(id_trabajo\)[\s\S]*ON DELETE CASCADE/);
+  assert.match(migration, /schema_version = 2/);
+  assert.match(migration, /octet_length\(contenido\) = content_bytes/);
+  assert.match(migration, /content_bytes <= 2097152/);
+  assert.match(migration, /content_bytes <= 262144/);
+  assert.match(migration, /encode\(extensions\.digest\(contenido, 'sha256'\), 'hex'\)/);
+  assert.match(migration, /ENABLE ROW LEVEL SECURITY/);
+  assert.match(migration, /REVOKE ALL ON TABLE public\.trabajos_impresion_documentos[\s\S]*FROM PUBLIC, anon, authenticated, service_role/);
+  assert.match(migration, /REVOKE ALL ON SEQUENCE public\.trabajos_impresion_documentos_id_documento_seq[\s\S]*FROM PUBLIC, anon, authenticated, service_role/);
+  assert.doesNotMatch(migration, /GRANT[\s\S]*TO service_role/);
+  assert.doesNotMatch(migration, /CREATE POLICY/);
+  assert.match(migration, /POSTFLIGHT_FAILED/);
+  assert.match(migration, /faltan restricciones/);
+  assert.doesNotMatch(migration, /INSERT INTO\s+supabase_migrations\.schema_migrations/i);
+  assert.doesNotMatch(migration, /(?:INSERT INTO|UPDATE|DELETE FROM)\s+public\.trabajos_impresion\b/i);
+  assert.match(rollback, /ROLLBACK_REQUIRES_POSTGRES/);
+  assert.ok(
+    rollback.indexOf('IF v_table IS NULL') < rollback.indexOf('LOCK TABLE'),
+    'la ausencia debe resolverse antes de intentar bloquear la tabla'
+  );
+  assert.match(rollback, /owner o tipo de relacion inesperado/);
+  assert.match(rollback, /LOCK TABLE public\.trabajos_impresion_documentos IN ACCESS EXCLUSIVE MODE/);
+  assert.match(rollback, /SELECT EXISTS \(SELECT 1 FROM public\.trabajos_impresion_documentos LIMIT 1\)/);
+  assert.match(rollback, /ROLLBACK_BLOCKED_NONEMPTY/);
+  assert.match(rollback, /IF v_has_rows THEN[\s\S]*RAISE EXCEPTION[\s\S]*END IF;[\s\S]*DROP TABLE/);
+  assert.doesNotMatch(rollback, /CASCADE/i);
+  assert.doesNotMatch(rollback, /DROP TABLE IF EXISTS/);
+  assert.match(verification, /is_identity/);
+  assert.match(verification, /service_role_select/);
+  assert.match(verification, /service_role_sequence_usage/);
+  assert.match(verification, /hashes_invalidos/);
+  assert.match(verification, /trabajos_v2_sin_documento/);
+  assert.match(verification, /supabase_migrations\.schema_migrations/);
 });

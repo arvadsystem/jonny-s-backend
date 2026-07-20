@@ -5,6 +5,7 @@ import {
   createVentasPerfTracker,
   instrumentVentasSqlClient
 } from '../utils/perfUtils.js';
+import { persistVentaPedidoSnapshotRows } from '../services/ventaPedidoSnapshotPersistenceService.js';
 
 process.env.VENTAS_PERF_LOGS = 'true';
 
@@ -92,7 +93,7 @@ describe('POST /ventas transaction regression guard', () => {
     }
   });
 
-  it('POST /ventas V3 no persiste idempotencia externa ni inventario Node despues de la RPC', async () => {
+  it('POST /ventas V3 persiste snapshots antes del COMMIT sin idempotencia externa ni inventario Node', async () => {
     const handler = await getPostVentasHandlerSource();
     const v3Start = handler.indexOf('if (ventasRpcV3Enabled) {');
     assert.notEqual(v3Start, -1, 'No se encontro el bloque V3.');
@@ -100,9 +101,86 @@ describe('POST /ventas transaction regression guard', () => {
     assert.notEqual(v2Start, -1, 'No se encontro el bloque V2 posterior.');
     const v3Block = handler.slice(v3Start, v2Start);
     assert.match(v3Block, /createVentaWithRpcV3Transaction/);
+    assert.match(v3Block, /const idPedidoRpc = parseOptionalPositiveInt\(rpcCreateResult\.response\?\.id_pedido\)/);
+    assert.match(v3Block, /VENTAS_RPC_V3_PEDIDO_INVALIDO/);
+    assert.match(v3Block, /await persistVentaPedidoSnapshots\(/);
+    assert.match(v3Block, /skipExisting:\s*true/);
+    assert.ok(
+      v3Block.indexOf('await persistVentaPedidoSnapshots(') < v3Block.indexOf("await client.query('COMMIT');"),
+      'Los snapshots V3 deben guardarse antes del COMMIT.'
+    );
     assert.doesNotMatch(v3Block, /saveVentasIdempotencySuccess/);
     assert.doesNotMatch(v3Block, /validarYDescontarInventarioCajaPedido/);
-    assert.doesNotMatch(v3Block, /persistVentaPedidoSnapshots/);
+  });
+
+  it('persistencia de snapshots evita duplicados por replay para el mismo pedido', async () => {
+    const persistence = await readFile(
+      new URL('../services/ventaPedidoSnapshotPersistenceService.js', import.meta.url),
+      'utf8'
+    );
+    assert.equal((persistence.match(/WHERE NOT EXISTS \(/g) || []).length, 2);
+    assert.match(persistence, /FROM public\.pedidos_contexto\s+WHERE id_pedido = \$1/);
+    assert.match(persistence, /FROM public\.pedidos_contacto\s+WHERE id_pedido = \$1/);
+  });
+
+  it('persiste una sola vez modalidad y contacto exactos en replay V3', async () => {
+    const stored = { contexto: new Map(), contacto: new Map() };
+    const client = {
+      query: async (sql, params = []) => {
+        if (sql.includes('information_schema.columns')) {
+          return { rowCount: 1, rows: [{ is_nullable: 'YES' }] };
+        }
+        if (sql.includes('INSERT INTO public.pedidos_contexto')) {
+          const inserted = !stored.contexto.has(params[0]);
+          if (inserted) stored.contexto.set(params[0], [...params]);
+          return { rowCount: inserted ? 1 : 0, rows: [] };
+        }
+        if (sql.includes('INSERT INTO public.pedidos_contacto')) {
+          const inserted = !stored.contacto.has(params[0]);
+          if (inserted) stored.contacto.set(params[0], [...params]);
+          return { rowCount: inserted ? 1 : 0, rows: [] };
+        }
+        throw new Error(`Consulta inesperada: ${sql}`);
+      }
+    };
+    const venta = {
+      id_usuario: 10,
+      id_sesion_caja: 77,
+      contexto: {
+        id_canal_pedido: 4,
+        id_modalidad_entrega: 11,
+        observacion_contexto: 'Mesa QA'
+      },
+      contacto: {
+        nombre_contacto: 'Cliente QA',
+        telefono_contacto: '9999-0000',
+        telefono_normalizado: '99990000',
+        dni: null,
+        rtn: null,
+        correo: null
+      }
+    };
+
+    const contactoSnapshot = venta.contacto;
+    await persistVentaPedidoSnapshotRows({
+      client,
+      pedidoId: 501,
+      venta,
+      contactoSnapshot,
+      skipExisting: true
+    });
+    await persistVentaPedidoSnapshotRows({
+      client,
+      pedidoId: 501,
+      venta,
+      contactoSnapshot,
+      skipExisting: true
+    });
+
+    assert.equal(stored.contexto.size, 1);
+    assert.equal(stored.contacto.size, 1);
+    assert.deepEqual(stored.contexto.get(501), [501, 4, 11, 10, 77, 'Mesa QA']);
+    assert.deepEqual(stored.contacto.get(501), [501, 'Cliente QA', '9999-0000', '99990000', null, null, null]);
   });
 
   it('no ejecuta ROLLBACK ni marca FAILED despues de un COMMIT confirmado', async () => {

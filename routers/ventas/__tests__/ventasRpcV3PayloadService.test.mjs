@@ -52,6 +52,36 @@ const recetaLine = (overrides = {}) => ({
 });
 
 describe('ventas RPC V3/V2 payload builders', () => {
+  it('RPC V3 conserva codigo e id exactos de modalidad para persistir el contexto seleccionado', () => {
+    for (const [modalidad, idModalidad] of [
+      ['CONSUMO_LOCAL', 11],
+      ['RECOGER', 12],
+      ['DELIVERY', 13]
+    ]) {
+      const payload = buildVentaRpcV3Payload({
+        venta: {
+          ...baseVenta([recetaLine()]),
+          contexto: {
+            canal: 'POS',
+            modalidad,
+            id_canal_pedido: 4,
+            id_modalidad_entrega: idModalidad,
+            observacion_contexto: null
+          }
+        },
+        idempotencyKey: `idem-modalidad-${idModalidad}`,
+        requestHash: String(idModalidad).padStart(64, '0')
+      });
+      assert.deepEqual(payload.contexto, {
+        canal: 'POS',
+        modalidad,
+        id_canal_pedido: 4,
+        id_modalidad_entrega: idModalidad,
+        observacion_contexto: null
+      });
+    }
+  });
+
   it('construye consumos de producto con line_ref estable', () => {
     const payload = buildVentaRpcV3Payload({
       venta: baseVenta([{

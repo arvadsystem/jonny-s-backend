@@ -407,7 +407,7 @@ test('cliente QZ usa documentos canonicos v2 y conserva discovery, WSS, SHA512 y
         if (jobId === 71) {
           return canonicalPdfDataItem;
         }
-        if (jobId === 72) {
+        if (jobId === 72 || jobId === 74) {
           return canonicalHtmlDataItem;
         }
         throw new Error('unexpected document request');
@@ -466,6 +466,14 @@ test('cliente QZ usa documentos canonicos v2 y conserva discovery, WSS, SHA512 y
         }
       }
     };
+    const pendingComandaJob = {
+      ...comandaJob,
+      id_trabajo: 74,
+      payload: {
+        ...comandaJob.payload,
+        source: { id_factura: null, id_pedido: 19 }
+      }
+    };
 
     for (const invalidPdfOptions of [
       { pageWidth: 80 },
@@ -494,12 +502,28 @@ test('cliente QZ usa documentos canonicos v2 y conserva discovery, WSS, SHA512 y
         /PAYLOAD_V2_CANONICAL_INVALID/
       );
     }
+    assert.throws(
+      () => validateCanonicalPrintJobData(
+        { ...pendingComandaJob.payload, source: { id_factura: null, id_pedido: null } },
+        canonicalHtmlDataItem
+      ),
+      /PAYLOAD_V2_CANONICAL_INVALID/
+    );
+    assert.throws(
+      () => validateCanonicalPrintJobData(
+        { ...currentJob.payload, schema_version: 3 },
+        canonicalPdfDataItem
+      ),
+      /PAYLOAD_V2_CANONICAL_INVALID/
+    );
 
     const prepared = await client.prepare(currentJob);
     new SecureWebSocket('wss://qz-elcarmen.jonnyshn.com:8181');
     await client.dispatch(prepared);
     const preparedComanda = await client.prepare(comandaJob);
     await client.dispatch(preparedComanda);
+    const preparedPendingComanda = await client.prepare(pendingComandaJob);
+    await client.dispatch(preparedPendingComanda);
     availablePrinters = ['Otra impresora'];
     await assert.rejects(
       client.prepare({ ...currentJob, id_trabajo: 73 }),
@@ -518,8 +542,11 @@ test('cliente QZ usa documentos canonicos v2 y conserva discovery, WSS, SHA512 y
     assert.equal(signatureAlgorithm, 'SHA512');
     assert.equal(Object.prototype.hasOwnProperty.call(currentJob.payload, 'documento'), false);
     assert.equal(Object.prototype.hasOwnProperty.call(comandaJob.payload, 'documento'), false);
+    assert.deepEqual(comandaJob.payload.source, { id_factura: 7, id_pedido: 19 });
+    assert.deepEqual(pendingComandaJob.payload.source, { id_factura: null, id_pedido: 19 });
     assert.equal(prepared.qzConfig.getPrinter(), 'ZKP8008');
     assert.equal(preparedComanda.qzConfig.getPrinter(), 'Kitchen Printer');
+    assert.equal(preparedPendingComanda.qzConfig.getPrinter(), 'Kitchen Printer');
     assert.deepEqual(prepared.qzConfig.getOptions(), {
       copies: 1,
       jobName: 'Jonny-71',
@@ -534,9 +561,17 @@ test('cliente QZ usa documentos canonicos v2 y conserva discovery, WSS, SHA512 y
       scaleContent: false,
       units: 'mm'
     });
-    assert.deepEqual(documentCalls, [71, 72]);
+    assert.deepEqual(preparedPendingComanda.qzConfig.getOptions(), {
+      copies: 1,
+      jobName: 'Jonny-74',
+      margins: 0,
+      scaleContent: false,
+      units: 'mm'
+    });
+    assert.deepEqual(documentCalls, [71, 72, 74]);
     assert.deepEqual(prepared.data, [canonicalPdfDataItem]);
     assert.deepEqual(preparedComanda.data, [canonicalHtmlDataItem]);
+    assert.deepEqual(preparedPendingComanda.data, [canonicalHtmlDataItem]);
     assert.equal(Object.hasOwn(prepared.data[0].options, 'pageWidth'), false);
     const preparedPdfContent = Buffer.from(prepared.data[0].data, 'base64');
     assert.equal(preparedPdfContent.length, currentJob.payload.documento_canonico.content_bytes);
@@ -549,7 +584,11 @@ test('cliente QZ usa documentos canonicos v2 y conserva discovery, WSS, SHA512 y
       crypto.createHash('sha256').update(preparedComanda.data[0].data, 'utf8').digest('hex'),
       comandaJob.payload.documento_canonico.content_sha256
     );
-    assert.equal(findCalls.length, 3);
+    assert.equal(
+      crypto.createHash('sha256').update(preparedPendingComanda.data[0].data, 'utf8').digest('hex'),
+      pendingComandaJob.payload.documento_canonico.content_sha256
+    );
+    assert.equal(findCalls.length, 4);
     assert.equal(findCalls[0][0], undefined);
     assert.equal(findCalls[0][1], undefined);
     assert.equal(findCalls[0][2], signCalls[0].request.timestamp);
@@ -559,27 +598,38 @@ test('cliente QZ usa documentos canonicos v2 y conserva discovery, WSS, SHA512 y
     assert.equal(findCalls[2][0], undefined);
     assert.equal(findCalls[2][1], undefined);
     assert.equal(findCalls[2][2], signCalls[4].request.timestamp);
+    assert.equal(findCalls[3][0], undefined);
+    assert.equal(findCalls[3][1], undefined);
+    assert.equal(findCalls[3][2], signCalls[6].request.timestamp);
     assert.deepEqual(signCalls[0].request.params, {});
     assert.deepEqual(signCalls[2].request.params, {});
     assert.deepEqual(signCalls[4].request.params, {});
+    assert.deepEqual(signCalls[6].request.params, {});
     assert.deepEqual(signCalls.map(({ jobId, request, digest }) => ({ jobId, call: request.call, digest })), [
       { jobId: 71, call: 'printers.find', digest: 'find-digest' },
       { jobId: 71, call: 'print', digest: 'print-digest' },
       { jobId: 72, call: 'printers.find', digest: 'find-digest' },
       { jobId: 72, call: 'print', digest: 'print-digest' },
+      { jobId: 74, call: 'printers.find', digest: 'find-digest' },
+      { jobId: 74, call: 'print', digest: 'print-digest' },
       { jobId: 73, call: 'printers.find', digest: 'find-digest' }
     ]);
-    assert.equal(printCalls.length, 2);
+    assert.equal(printCalls.length, 3);
     assert.deepEqual(signCalls[1].request.params.data, prepared.data);
     assert.deepEqual(signCalls[3].request.params.data, preparedComanda.data);
+    assert.deepEqual(signCalls[5].request.params.data, preparedPendingComanda.data);
     assert.deepEqual(signCalls[1].request.params.options, prepared.qzConfig.getOptions());
     assert.deepEqual(signCalls[3].request.params.options, preparedComanda.qzConfig.getOptions());
+    assert.deepEqual(signCalls[5].request.params.options, preparedPendingComanda.qzConfig.getOptions());
     assert.deepEqual(printCalls[0][2], []);
     assert.deepEqual(printCalls[0][3], [signCalls[1].request.timestamp]);
     assert.equal(printCalls[0][3][0], signCalls[1].request.timestamp);
     assert.deepEqual(printCalls[1][2], []);
     assert.deepEqual(printCalls[1][3], [signCalls[3].request.timestamp]);
     assert.equal(printCalls[1][3][0], signCalls[3].request.timestamp);
+    assert.deepEqual(printCalls[2][2], []);
+    assert.deepEqual(printCalls[2][3], [signCalls[5].request.timestamp]);
+    assert.equal(printCalls[2][3][0], signCalls[5].request.timestamp);
   } finally {
     await fs.rm(tempDir, { recursive: true, force: true });
   }
