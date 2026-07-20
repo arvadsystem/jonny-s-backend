@@ -5,6 +5,12 @@ const toPositiveInteger = (value) => {
   return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : null;
 };
 
+export const isInitialKitchenDispatchEvent = (event = {}) => (
+  String(event.tipo_documento || '').trim().toUpperCase() === 'COMANDA'
+  && String(event.estado || '').trim().toUpperCase() === 'ENVIADA'
+  && String(event.metadata?.promptAction || '').trim().toLowerCase() === 'initial'
+);
+
 export const initializePedidoPendingKitchen = async ({ client, idPedido }) => {
   const pedidoId = toPositiveInteger(idPedido);
   const estadoPendienteId = await resolveEstadoPedidoIdByCode(client, 'PENDIENTE');

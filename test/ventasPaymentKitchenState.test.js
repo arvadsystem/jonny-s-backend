@@ -1,8 +1,13 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { persistImmediateSalePaymentState } from '../routers/ventas/services/ventaImmediatePaymentStateService.js';
+import fs from 'node:fs';
+import {
+  persistImmediateSalePaymentState,
+  reconcileVentaResponseWithPersistedPedidoState
+} from '../routers/ventas/services/ventaImmediatePaymentStateService.js';
 import {
   initializePedidoPendingKitchen,
+  isInitialKitchenDispatchEvent,
   markPedidoVisibleInKitchen
 } from '../routers/ventas/services/pedidoKitchenVisibilityService.js';
 
@@ -139,4 +144,130 @@ test('fallo al localizar pedido impide confirmar la transicion a cocina', async 
     () => markPedidoVisibleInKitchen({ client, idPedido: 999 }),
     (error) => error.code === 'PRINT_PEDIDO_NOT_FOUND' && error.status === 404
   );
+});
+
+test('respuesta idempotente se reconcilia con el estado realmente persistido', async () => {
+  const visibleAt = null;
+  const client = {
+    query: async (sql, params) => {
+      assert.match(sql, /FROM public\.pedidos p/);
+      assert.deepEqual(params, [218]);
+      return {
+        rowCount: 1,
+        rows: [{
+          id_pedido: 218,
+          estado_pago: 'PAGADO_CONFIRMADO',
+          canal: 'LOCAL',
+          modalidad: 'CONSUMO_LOCAL',
+          id_estado_pedido: 1,
+          visible_en_cocina_at: visibleAt,
+          estado_pedido: 'Pendiente'
+        }]
+      };
+    }
+  };
+
+  const response = await reconcileVentaResponseWithPersistedPedidoState({
+    client,
+    response: {
+      id_pedido: 218,
+      estado_pago: 'PENDIENTE_PAGO',
+      estado_pedido: 'EN_COCINA',
+      canal: 'DELIVERY',
+      modalidad: 'DELIVERY',
+      visible_en_cocina_at: '2026-07-20T12:00:00.000Z',
+      idempotent_replay: true,
+      contexto: { canal: 'DELIVERY', modalidad: 'DELIVERY' },
+      pedido: { id_pedido: 218, estado_pedido: 'EN_COCINA' }
+    }
+  });
+
+  assert.equal(response.idempotent_replay, true);
+  assert.equal(response.estado_pago, 'PAGADO_CONFIRMADO');
+  assert.equal(response.estado_pedido, 'PENDIENTE');
+  assert.equal(response.id_estado_pedido, 1);
+  assert.equal(response.visible_en_cocina_at, null);
+  assert.deepEqual(response.contexto, { canal: 'LOCAL', modalidad: 'CONSUMO_LOCAL' });
+  assert.deepEqual(response.pedido, {
+    id_pedido: 218,
+    id_estado_pedido: 1,
+    estado_pedido: 'PENDIENTE',
+    visible_en_cocina_at: null
+  });
+});
+
+test('pedido con pago pendiente responde PENDIENTE_PAGO y permanece fuera de cocina', async () => {
+  const client = {
+    query: async () => ({
+      rowCount: 1,
+      rows: [{
+        id_pedido: 219,
+        estado_pago: 'PENDIENTE_PAGO',
+        canal: 'POS',
+        modalidad: 'PARA_LLEVAR',
+        id_estado_pedido: 1,
+        visible_en_cocina_at: null,
+        estado_pedido: 'PENDIENTE'
+      }]
+    })
+  };
+
+  const response = await reconcileVentaResponseWithPersistedPedidoState({
+    client,
+    response: {
+      id_pedido: 219,
+      estado_pago: 'PENDIENTE_PAGO',
+      estado_pedido: 'EN_COCINA'
+    }
+  });
+
+  assert.equal(response.estado_pago, 'PENDIENTE_PAGO');
+  assert.equal(response.estado_pedido, 'PENDIENTE');
+  assert.equal(response.visible_en_cocina_at, null);
+  assert.equal(response.canal, 'POS');
+  assert.equal(response.modalidad, 'PARA_LLEVAR');
+});
+
+test('RPC V1 usa el id de rpcCreateResult y no referencia una variable fuera de alcance', () => {
+  const source = fs.readFileSync(new URL('../routers/ventas.js', import.meta.url), 'utf8');
+  const start = source.indexOf('if (ventasRpcV1Enabled && !ventaHasExtras && !ventaHasSalsasInventario)');
+  const end = source.indexOf('const correlativoStart = ventasPerf.now();', start);
+  assert.ok(start >= 0 && end > start);
+  const rpcV1Block = source.slice(start, end);
+
+  assert.match(
+    rpcV1Block,
+    /initializePedidoPendingKitchen\(\{ client, idPedido: rpcCreateResult\.response\?\.id_pedido \}\)/
+  );
+  assert.doesNotMatch(rpcV1Block, /rpcResponseBody/);
+});
+
+test('RPC V1, V2, V3 y legacy reconcilian la respuesta antes de guardarla o devolverla', () => {
+  const source = fs.readFileSync(new URL('../routers/ventas.js', import.meta.url), 'utf8');
+  const immediateStart = source.indexOf("router.post('/ventas', checkPermission(['VENTAS_CREAR'])");
+  const immediateSource = source.slice(immediateStart);
+
+  assert.ok(immediateStart >= 0);
+  assert.match(immediateSource, /if \(ventasRpcV3Enabled\)[\s\S]*?rpcV3ResponseBody = await reconcileVentaResponseWithPersistedPedidoState/);
+  assert.match(immediateSource, /if \(ventasRpcV2Enabled[\s\S]*?rpcV2ResponseBody = await reconcileVentaResponseWithPersistedPedidoState/);
+  assert.match(immediateSource, /if \(ventasRpcV1Enabled[\s\S]*?rpcV1ResponseBody = await reconcileVentaResponseWithPersistedPedidoState/);
+  assert.match(immediateSource, /const createVentaResponse = await reconcileVentaResponseWithPersistedPedidoState/);
+});
+
+test('solo aceptar una comanda inicial habilita la transicion a cocina', () => {
+  assert.equal(isInitialKitchenDispatchEvent({
+    tipo_documento: 'COMANDA',
+    estado: 'ENVIADA',
+    metadata: { promptAction: 'initial' }
+  }), true);
+  assert.equal(isInitialKitchenDispatchEvent({
+    tipo_documento: 'COMANDA',
+    estado: 'CANCELADA',
+    metadata: { promptAction: 'initial' }
+  }), false);
+  assert.equal(isInitialKitchenDispatchEvent({
+    tipo_documento: 'COMANDA',
+    estado: 'ENVIADA',
+    metadata: { promptAction: 'reprint' }
+  }), false);
 });
