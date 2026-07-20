@@ -15,6 +15,86 @@ const requireAffectedPedido = (result) => {
   });
 };
 
+const normalizeEstadoPedidoCode = (value) => String(value || '')
+  .trim()
+  .toUpperCase()
+  .replace(/\s+/g, '_');
+
+const isPlainObject = (value) => Boolean(value)
+  && typeof value === 'object'
+  && !Array.isArray(value);
+
+export const readPersistedVentaPedidoState = async ({ client, idPedido }) => {
+  const pedidoId = asPositiveInteger(idPedido);
+  if (!pedidoId || typeof client?.query !== 'function') {
+    throw Object.assign(new Error('No se pudo consultar el estado persistido del pedido.'), {
+      code: 'VENTAS_PEDIDO_ESTADO_CONSULTA_INVALIDA'
+    });
+  }
+
+  const result = await client.query(
+    `SELECT p.id_pedido,
+            p.estado_pago,
+            p.canal,
+            p.tipo_entrega AS modalidad,
+            p.id_estado_pedido,
+            p.visible_en_cocina_at,
+            ep.descripcion AS estado_pedido
+     FROM public.pedidos p
+     LEFT JOIN public.estados_pedido ep
+       ON ep.id_estado_pedido = p.id_estado_pedido
+     WHERE p.id_pedido = $1
+     LIMIT 1`,
+    [pedidoId]
+  );
+  const row = result.rows?.[0];
+  if (!row) {
+    throw Object.assign(new Error('No se encontro el pedido persistido para reconciliar la respuesta.'), {
+      code: 'VENTAS_PEDIDO_ESTADO_NO_ENCONTRADO'
+    });
+  }
+
+  return {
+    id_pedido: pedidoId,
+    estado_pago: row.estado_pago ?? null,
+    canal: row.canal ?? null,
+    modalidad: row.modalidad ?? null,
+    id_estado_pedido: asPositiveInteger(row.id_estado_pedido),
+    estado_pedido: normalizeEstadoPedidoCode(row.estado_pedido),
+    visible_en_cocina_at: row.visible_en_cocina_at ?? null
+  };
+};
+
+export const reconcileVentaResponseWithPersistedPedidoState = async ({ client, response }) => {
+  const persisted = await readPersistedVentaPedidoState({
+    client,
+    idPedido: response?.id_pedido
+  });
+  const reconciled = {
+    ...(isPlainObject(response) ? response : {}),
+    ...persisted
+  };
+
+  if (isPlainObject(response?.contexto)) {
+    reconciled.contexto = {
+      ...response.contexto,
+      canal: persisted.canal,
+      modalidad: persisted.modalidad
+    };
+  }
+  if (isPlainObject(response?.pedido)) {
+    reconciled.pedido = {
+      ...response.pedido,
+      id_pedido: persisted.id_pedido,
+      id_estado_pedido: persisted.id_estado_pedido,
+      estado_pedido: persisted.estado_pedido,
+      visible_en_cocina_at: persisted.visible_en_cocina_at
+    };
+  }
+
+  return reconciled;
+};
+
 export const persistImmediateSalePaymentState = async ({
   client,
   idPedido,

@@ -100,7 +100,10 @@ import {
   executeVentasRpc
 } from './ventas/services/ventasRpcExecutionService.js';
 import { persistVentaPedidoSnapshotRows } from './ventas/services/ventaPedidoSnapshotPersistenceService.js';
-import { persistImmediateSalePaymentState } from './ventas/services/ventaImmediatePaymentStateService.js';
+import {
+  persistImmediateSalePaymentState,
+  reconcileVentaResponseWithPersistedPedidoState
+} from './ventas/services/ventaImmediatePaymentStateService.js';
 import { initializePedidoPendingKitchen } from './ventas/services/pedidoKitchenVisibilityService.js';
 import {
   hasCuentaDivididaPayload,
@@ -8151,10 +8154,14 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
     if (idempotencyReservation.replay) {
       await client.query('ROLLBACK');
       transactionStarted = false;
+      const replayResponse = await reconcileVentaResponseWithPersistedPedidoState({
+        client,
+        response: idempotencyReservation.responseBody
+      });
       addPedidoPendienteTotalRoute();
       ventasPerf.log(buildPedidoPendientePerfLogContext({ status: idempotencyReservation.httpStatus || 200 }));
       return res.status(idempotencyReservation.httpStatus || 200).json({
-        ...(isPlainObject(idempotencyReservation.responseBody) ? idempotencyReservation.responseBody : {}),
+        ...replayResponse,
         idempotent_replay: true
       });
     }
@@ -8255,6 +8262,10 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
       if (!rpcResponseBody?.idempotent_replay) {
         await initializePedidoPendingKitchen({ client, idPedido: rpcResponseBody?.id_pedido });
       }
+      const reconciledRpcResponseBody = await reconcileVentaResponseWithPersistedPedidoState({
+        client,
+        response: rpcResponseBody
+      });
       const commitStart = ventasPerf.now();
       await client.query('COMMIT');
       transactionStarted = false;
@@ -8266,7 +8277,7 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
         status: 201,
         pedido_pendiente_rpc_v2_idempotent_replay: Boolean(rpcResponseBody.idempotent_replay)
       }));
-      return res.status(201).json(rpcResponseBody);
+      return res.status(201).json(reconciledRpcResponseBody);
     }
 
     if (shouldUsePedidoPendienteRpcV1) {
@@ -8289,6 +8300,11 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
         idUsuario: userId,
         perf: ventasPerf
       });
+      await initializePedidoPendingKitchen({ client, idPedido: rpcResponseBody.id_pedido });
+      const reconciledRpcResponseBody = await reconcileVentaResponseWithPersistedPedidoState({
+        client,
+        response: rpcResponseBody
+      });
       const commitStart = ventasPerf.now();
       await client.query('COMMIT');
       transactionStarted = false;
@@ -8303,8 +8319,8 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
         args: {
           reservation: idempotencyReservation,
           httpStatus: 201,
-          responseBody: rpcResponseBody,
-          idPedido: rpcResponseBody.id_pedido,
+          responseBody: reconciledRpcResponseBody,
+          idPedido: reconciledRpcResponseBody.id_pedido,
           idUsuario: userId,
           idSucursal: pedidoPendiente.id_sucursal
         }
@@ -8314,7 +8330,7 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
       ventasPerf.add('pedido_pendiente_idempotency_success_ms', idempotencySuccessStart);
       addPedidoPendienteTotalRoute();
       ventasPerf.log(buildPedidoPendientePerfLogContext({ status: 201 }));
-      return res.status(201).json(rpcResponseBody);
+      return res.status(201).json(reconciledRpcResponseBody);
     }
 
     pedidoPendientePersistenceMode = 'legacy';
@@ -8622,6 +8638,21 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
       perf: ventasPerf
     });
 
+    const responseBody = await reconcileVentaResponseWithPersistedPedidoState({
+      client,
+      response: {
+        message: 'Pedido pendiente creado correctamente.',
+        id_pedido: idPedido,
+        estado_pago: PEDIDO_PENDIENTE_ESTADO_PAGO,
+        estado_pedido: 'PENDIENTE',
+        origen_pedido: 'CAJA',
+        canal: pedidoPendiente.canal,
+        modalidad: pedidoPendiente.modalidad,
+        total: pedidoPendiente.total,
+        monto_pendiente: pedidoPendiente.total,
+        cuenta_dividida: cuentaDivididaResponse
+      }
+    });
     const commitStart = ventasPerf.now();
     await client.query('COMMIT');
     transactionStarted = false;
@@ -8629,18 +8660,6 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
     ventasPerf.add('pedido_pendiente_commit_ms', commitStart);
     ventasPerf.add('transaction_ms', transactionStart);
 
-    const responseBody = {
-      message: 'Pedido pendiente creado correctamente.',
-      id_pedido: idPedido,
-      estado_pago: PEDIDO_PENDIENTE_ESTADO_PAGO,
-      estado_pedido: 'PENDIENTE',
-      origen_pedido: 'CAJA',
-      canal: pedidoPendiente.canal,
-      modalidad: pedidoPendiente.modalidad,
-      total: pedidoPendiente.total,
-      monto_pendiente: pedidoPendiente.total,
-      cuenta_dividida: cuentaDivididaResponse
-    };
     const idempotencySuccessStart = ventasPerf.now();
     await saveExternalIdempotencySuccessIfNeeded({
       reservation: idempotencyReservation,
@@ -9619,12 +9638,16 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
     if (idempotencyReservation.replay) {
       await client.query('ROLLBACK');
       transactionStarted = false;
+      const replayResponse = await reconcileVentaResponseWithPersistedPedidoState({
+        client,
+        response: idempotencyReservation.responseBody
+      });
       ventasPerf.log({
         ...ventasPerfContext,
         status: idempotencyReservation.httpStatus || 200
       });
       return res.status(idempotencyReservation.httpStatus || 200).json({
-        ...(isPlainObject(idempotencyReservation.responseBody) ? idempotencyReservation.responseBody : {}),
+        ...replayResponse,
         idempotent_replay: true
       });
     }
@@ -9789,7 +9812,10 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
         venta,
         skipExisting: true
       });
-      const rpcV3ResponseBody = attachVentaSnapshotsToResponse(rpcCreateResult.response, venta);
+      const rpcV3ResponseBody = await reconcileVentaResponseWithPersistedPedidoState({
+        client,
+        response: attachVentaSnapshotsToResponse(rpcCreateResult.response, venta)
+      });
       const commitStart = ventasPerf.now();
       await client.query('COMMIT');
       transactionStarted = false;
@@ -9845,7 +9871,10 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
         }
       }
 
-      const rpcV2ResponseBody = attachVentaSnapshotsToResponse(rpcCreateResult.response, venta);
+      const rpcV2ResponseBody = await reconcileVentaResponseWithPersistedPedidoState({
+        client,
+        response: attachVentaSnapshotsToResponse(rpcCreateResult.response, venta)
+      });
       await saveVentasIdempotencySuccess({
         client,
         reservation: idempotencyReservation,
@@ -9897,9 +9926,12 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
         idUsuario: userId,
         perf: ventasPerf
       });
-      await initializePedidoPendingKitchen({ client, idPedido: rpcResponseBody?.id_pedido });
+      await initializePedidoPendingKitchen({ client, idPedido: rpcCreateResult.response?.id_pedido });
 
-      const rpcV1ResponseBody = attachVentaSnapshotsToResponse(rpcCreateResult.response, venta);
+      const rpcV1ResponseBody = await reconcileVentaResponseWithPersistedPedidoState({
+        client,
+        response: attachVentaSnapshotsToResponse(rpcCreateResult.response, venta)
+      });
       await saveVentasIdempotencySuccess({
         client,
         reservation: idempotencyReservation,
@@ -10445,19 +10477,22 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
       detalleFacturaRows,
       detalleFacturaRowsInserted: detalleFacturaResult.rows
     });
-    const createVentaResponse = attachVentaSnapshotsToResponse(buildCreateVentaDetailResponse({
-      idFactura,
-      idPedido,
-      venta,
-      correlativoVenta,
-      fechaHoraPedido,
-      fechaHoraFacturacion,
-      facturacion: facturacionNormalizada,
-      context: createDetailContext,
-      items: createDetailItems,
-      fidelizacion: acumulacionFidelizacion,
-      cuentaDividida: cuentaDivididaResponse
-    }), venta);
+    const createVentaResponse = await reconcileVentaResponseWithPersistedPedidoState({
+      client,
+      response: attachVentaSnapshotsToResponse(buildCreateVentaDetailResponse({
+        idFactura,
+        idPedido,
+        venta,
+        correlativoVenta,
+        fechaHoraPedido,
+        fechaHoraFacturacion,
+        facturacion: facturacionNormalizada,
+        context: createDetailContext,
+        items: createDetailItems,
+        fidelizacion: acumulacionFidelizacion,
+        cuentaDividida: cuentaDivididaResponse
+      }), venta)
+    });
     ventasPerf.add('ticket_response_build_ms', ticketResponseStart);
 
     await saveVentasIdempotencySuccess({

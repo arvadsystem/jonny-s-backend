@@ -9,7 +9,10 @@ import {
   normalizePrintEventPayload,
   registerVentaPrintEvent
 } from '../services/ventasPrintAuditService.js';
-import { markPedidoVisibleInKitchen } from '../services/pedidoKitchenVisibilityService.js';
+import {
+  isInitialKitchenDispatchEvent,
+  markPedidoVisibleInKitchen
+} from '../services/pedidoKitchenVisibilityService.js';
 import {
   getQzSigningConfiguration,
   getQzPublicErrorMessage,
@@ -559,10 +562,7 @@ export const createVentaPrintEventHandler = async (req, res) => {
       payload: normalized.value
     });
 
-    const isInitialKitchenDispatch = normalized.value.tipo_documento === 'COMANDA'
-      && normalized.value.estado === 'ENVIADA'
-      && String(normalized.value.metadata?.promptAction || '').trim().toLowerCase() === 'initial';
-    if (isInitialKitchenDispatch) {
+    if (isInitialKitchenDispatchEvent(normalized.value)) {
       await markPedidoVisibleInKitchen({
         client,
         idPedido: detailResult.body?.id_pedido
