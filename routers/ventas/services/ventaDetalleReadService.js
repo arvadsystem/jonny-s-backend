@@ -1,7 +1,9 @@
 import { roundMoney } from '../utils/moneyUtils.js';
 import {
   normalizeObservation,
-  parseOptionalPositiveInt
+  parseJsonArrayValue,
+  parseOptionalPositiveInt,
+  resolveStandaloneExtraLine
 } from '../utils/parseUtils.js';
 import {
   VENTA_DIRECTA_LABEL,
@@ -387,6 +389,53 @@ export const fetchDetalleFacturaExtras = async (client, detalleFacturaIds = []) 
   return grouped;
 };
 
+export const normalizeSplitAccountStandaloneExtra = (item) => {
+  const extras = parseJsonArrayValue(item?.extras);
+  const standaloneExtra = resolveStandaloneExtraLine({
+    idProducto: item?.id_producto,
+    idReceta: item?.id_receta,
+    extras
+  });
+  if (!standaloneExtra) return { ...item, extras };
+
+  const cantidad = Number(standaloneExtra.cantidad) > 0
+    ? Number(standaloneExtra.cantidad)
+    : Number(item?.cantidad || 0);
+  const subtotal = Number.isFinite(Number(standaloneExtra.subtotal))
+    ? roundMoney(standaloneExtra.subtotal)
+    : roundMoney(item?.subtotal_extras ?? item?.total_linea);
+  const precioUnitario = Number.isFinite(Number(standaloneExtra.precio_unitario))
+    ? roundMoney(standaloneExtra.precio_unitario)
+    : (cantidad > 0 ? roundMoney(subtotal / cantidad) : 0);
+  const totalLinea = Number.isFinite(Number(item?.total_linea))
+    ? roundMoney(item.total_linea)
+    : subtotal;
+
+  return {
+    ...item,
+    tipo_item: 'EXTRA',
+    id_extra: standaloneExtra.id_extra || null,
+    nombre_item: standaloneExtra.nombre_extra_snapshot,
+    nombre_producto: standaloneExtra.nombre_extra_snapshot,
+    es_linea_extra_independiente: true,
+    cantidad,
+    precio_unitario: precioUnitario,
+    sub_total: subtotal,
+    subtotal_linea: subtotal,
+    subtotal_base: 0,
+    subtotal_extras: subtotal,
+    total_linea: totalLinea,
+    extras: [],
+    origen_snapshot: {
+      ...(item?.origen_snapshot || {}),
+      es_linea_extra_independiente: true,
+      id_extra: standaloneExtra.id_extra || null,
+      nombre_extra_snapshot: standaloneExtra.nombre_extra_snapshot,
+      extras_snapshot: extras
+    }
+  };
+};
+
 export const fetchCuentaDividida = async (client, { idFactura = null, idPedido = null } = {}) => {
   const facturaId = parseOptionalPositiveInt(idFactura);
   const pedidoId = parseOptionalPositiveInt(idPedido);
@@ -462,7 +511,7 @@ export const fetchCuentaDividida = async (client, { idFactura = null, idPedido =
   for (const row of itemsResult.rows) {
     const id = Number(row.id_cuenta_division);
     if (!itemsByDivision.has(id)) itemsByDivision.set(id, []);
-    itemsByDivision.get(id).push({
+    itemsByDivision.get(id).push(normalizeSplitAccountStandaloneExtra({
       id_cuenta_division_item: Number(row.id_cuenta_division_item),
       id_detalle_factura: parseOptionalPositiveInt(row.id_detalle_factura),
       id_detalle_pedido: parseOptionalPositiveInt(row.id_detalle_pedido),
@@ -477,10 +526,10 @@ export const fetchCuentaDividida = async (client, { idFactura = null, idPedido =
       descuento_total: roundMoney(row.descuento_total),
       isv_total: roundMoney(row.isv_total),
       total_linea: roundMoney(row.total_linea),
-      extras: Array.isArray(row.extras_snapshot) ? row.extras_snapshot : [],
+      extras: parseJsonArrayValue(row.extras_snapshot),
       complementos: Array.isArray(row.complementos_snapshot) ? row.complementos_snapshot : [],
       origen_snapshot: row.origen_snapshot || {}
-    });
+    }));
   }
 
   const cobrosByDivision = new Map();

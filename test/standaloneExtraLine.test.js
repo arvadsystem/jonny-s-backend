@@ -5,6 +5,7 @@ import { buildPedidoKitchenPrintPayload } from '../routers/ventas/services/pedid
 import { buildComandaCocinaHtml } from '../services/comandaCocinaHtmlService.js';
 import { buildVentaTicketPdfDefinition } from '../routers/ventas/services/ventaTicketPdfService.js';
 import { buildVentaDetailPayloadForScope } from '../routers/ventas/handlers/ventasReadHandlers.js';
+import { normalizeSplitAccountStandaloneExtra } from '../routers/ventas/services/ventaDetalleReadService.js';
 
 test('linea sin producto/receta con exactamente un extra se clasifica como EXTRA con snapshot financiero', () => {
   const result = resolveStandaloneExtraLine({
@@ -36,6 +37,111 @@ test('no clasifica como extra si tiene producto/receta o si hay 0 o varios extra
 test('extra sin nombre no se clasifica como valido', () => {
   assert.equal(resolveStandaloneExtraLine({ idProducto: null, idReceta: null, extras: [{ id_extra: 3, cantidad: 2 }] }), null);
 });
+
+test('cuenta dividida normaliza un unico extra independiente sin duplicarlo', () => {
+  const item = normalizeSplitAccountStandaloneExtra({
+    tipo_item: 'ITEM',
+    id_producto: null,
+    id_receta: null,
+    nombre_item: 'Item de pedido',
+    cantidad: 1,
+    precio_unitario: 40,
+    subtotal_base: 0,
+    subtotal_extras: 40,
+    total_linea: 40,
+    extras: [{
+      id_extra: 14,
+      nombre: 'Extra papas sazonadas',
+      cantidad: 1,
+      precio_unitario: 40,
+      subtotal: 40
+    }]
+  });
+
+  assert.equal(item.tipo_item, 'EXTRA');
+  assert.equal(item.nombre_item, 'Extra papas sazonadas');
+  assert.equal(item.es_linea_extra_independiente, true);
+  assert.equal(item.id_extra, 14);
+  assert.equal(item.cantidad, 1);
+  assert.equal(item.precio_unitario, 40);
+  assert.equal(item.subtotal_base, 0);
+  assert.equal(item.subtotal_extras, 40);
+  assert.equal(item.total_linea, 40);
+  assert.deepEqual(item.extras, []);
+});
+
+test('cuenta dividida conserva fallback seguro con cero o varios extras', () => {
+  for (const extras of [[], [{ nombre: 'A' }, { nombre: 'B' }]]) {
+    const item = normalizeSplitAccountStandaloneExtra({
+      tipo_item: 'ITEM',
+      id_producto: null,
+      id_receta: null,
+      nombre_item: 'Item de pedido',
+      cantidad: 1,
+      total_linea: 40,
+      extras
+    });
+    assert.equal(item.tipo_item, 'ITEM');
+    assert.equal(item.nombre_item, 'Item de pedido');
+    assert.deepEqual(item.extras, extras);
+  }
+});
+
+for (const scenario of [
+  { name: 'sin descuento e impuestos deshabilitados', descuento_total: 0, isv_total: 0, total_linea: 40 },
+  { name: 'descuento de linea', descuento_total: 5, isv_total: 0, total_linea: 35 },
+  { name: 'descuento global persistido', descuento_total: 4, isv_total: 0, total_linea: 36 },
+  { name: 'impuestos habilitados', descuento_total: 0, isv_total: 6, total_linea: 46 }
+]) {
+  test(`cuenta dividida conserva snapshot fiscal para extra independiente: ${scenario.name}`, () => {
+    const item = normalizeSplitAccountStandaloneExtra({
+      tipo_item: 'ITEM',
+      id_producto: null,
+      id_receta: null,
+      nombre_item: 'Item de pedido',
+      cantidad: 1,
+      subtotal_base: 0,
+      subtotal_extras: 40,
+      descuento_total: scenario.descuento_total,
+      isv_total: scenario.isv_total,
+      total_linea: scenario.total_linea,
+      extras: [{ nombre: 'Extra papas', cantidad: 1, precio_unitario: 40, subtotal: 40 }]
+    });
+
+    assert.equal(item.subtotal_extras - item.descuento_total + item.isv_total, item.total_linea);
+    assert.equal(item.descuento_total, scenario.descuento_total);
+    assert.equal(item.isv_total, scenario.isv_total);
+  });
+}
+
+for (const scenario of [
+  { name: 'reversion parcial pagada', estado_pago: 'PAGADA', monto_reversado: 20, saldo_historico: 20 },
+  { name: 'reversion total pagada', estado_pago: 'PAGADA', monto_reversado: 40, saldo_historico: 0 },
+  { name: 'pago pendiente', estado_pago: 'PENDIENTE', monto_reversado: 0, saldo_historico: 40 }
+]) {
+  test(`normalizar extra no altera metadatos historicos de ${scenario.name}`, () => {
+    const item = normalizeSplitAccountStandaloneExtra({
+      tipo_item: 'ITEM',
+      id_producto: null,
+      id_receta: null,
+      nombre_item: 'Item de pedido',
+      cantidad: 1,
+      subtotal_extras: 40,
+      descuento_total: 0,
+      isv_total: 0,
+      total_linea: 40,
+      estado_pago: scenario.estado_pago,
+      monto_reversado: scenario.monto_reversado,
+      saldo_historico: scenario.saldo_historico,
+      extras: [{ nombre: 'Extra papas', cantidad: 1, precio_unitario: 40, subtotal: 40 }]
+    });
+
+    assert.equal(item.estado_pago, scenario.estado_pago);
+    assert.equal(item.monto_reversado, scenario.monto_reversado);
+    assert.equal(item.saldo_historico, scenario.saldo_historico);
+    assert.equal(item.total_linea, 40);
+  });
+}
 
 for (const scenario of [
   { nombre: 'Extra bacon', cantidad: 4, precio_unitario: 30, subtotal: 120 },

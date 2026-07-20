@@ -6,9 +6,7 @@ const money = (value) => `L ${Number(value || 0).toFixed(2)}`;
 const PDF_MAX_BYTES = 2 * 1024 * 1024;
 const HTML_MAX_BYTES = 256 * 1024;
 const BASE64_PATTERN = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
-// El agente valida el documento canonico contra el hash almacenado; el contrato
-// es identico para v2 (legacy) y v3 (corregido), por lo que ambos se aceptan.
-const CANONICAL_SCHEMA_VERSIONS = Object.freeze([2, 3]);
+const CANONICAL_SCHEMA_VERSION = 2;
 const PAYLOAD_CANONICAL_KEYS = Object.freeze([
   'schema_version',
   'tipo_documento',
@@ -43,7 +41,7 @@ const invalidCanonicalDocument = () => {
 
 const validateCanonicalPayload = (payload) => {
   if (!hasExactKeys(payload, PAYLOAD_CANONICAL_KEYS)
-    || !CANONICAL_SCHEMA_VERSIONS.includes(payload.schema_version)) invalidCanonicalDocument();
+    || payload.schema_version !== CANONICAL_SCHEMA_VERSION) invalidCanonicalDocument();
   if (![58, 80].includes(payload.ancho_mm)) invalidCanonicalDocument();
   const facturaSourceValid = payload.source?.id_factura === null
     || isPositiveSafeInteger(payload.source?.id_factura);

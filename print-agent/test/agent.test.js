@@ -509,6 +509,13 @@ test('cliente QZ usa documentos canonicos v2 y conserva discovery, WSS, SHA512 y
       ),
       /PAYLOAD_V2_CANONICAL_INVALID/
     );
+    assert.throws(
+      () => validateCanonicalPrintJobData(
+        { ...currentJob.payload, schema_version: 3 },
+        canonicalPdfDataItem
+      ),
+      /PAYLOAD_V2_CANONICAL_INVALID/
+    );
 
     const prepared = await client.prepare(currentJob);
     new SecureWebSocket('wss://qz-elcarmen.jonnyshn.com:8181');

@@ -3,7 +3,12 @@ import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import { renderPrintJobHtml } from '../print-agent/src/documentRenderer.js';
-import { claimPrintJobs, transitionPrintJob, validatePrintPayload } from '../services/printQueueService.js';
+import {
+  claimPrintJobs,
+  enqueuePrintJob,
+  transitionPrintJob,
+  validatePrintPayload
+} from '../services/printQueueService.js';
 import {
   authorizeAndSignAgentQzRequest,
   canonicalizeAgentQzRequest,
@@ -117,6 +122,89 @@ const createTransactionalDb = (queryHandler) => {
   };
   return { db: { connect: async () => client }, calls };
 };
+
+test('enqueue v2 persiste trabajo y contenido canonico en una sola transaccion', async () => {
+  const fixture = createTransactionalDb(async (sql) => {
+    if (sql === 'BEGIN' || sql === 'COMMIT' || sql === 'ROLLBACK') return { rows: [] };
+    if (/INSERT INTO public\.trabajos_impresion\s/.test(sql)) {
+      return {
+        rows: [{
+          id_trabajo: 81,
+          id_sucursal: 9,
+          tipo_documento: 'factura',
+          estado: 'pendiente',
+          fecha_creacion: new Date('2026-07-19T00:00:00Z'),
+          inserted: true
+        }]
+      };
+    }
+    if (/INSERT INTO public\.trabajos_impresion_documentos/.test(sql)) return { rows: [] };
+    throw new Error(`SQL inesperado: ${sql}`);
+  });
+
+  const job = await enqueuePrintJob({
+    idSucursal: 9,
+    tipoDocumento: 'factura',
+    payload: facturaPayloadV2,
+    canonicalDocument: facturaDataV2,
+    idempotencyKey: 'factura:6:qa-atomic',
+    idFactura: 6,
+    db: fixture.db
+  });
+
+  assert.equal(job.id_trabajo, 81);
+  const documentInsert = fixture.calls.find((call) => /trabajos_impresion_documentos/.test(call.sql));
+  assert.ok(documentInsert);
+  assert.equal(Buffer.compare(documentInsert.params[5], facturaPdfBytes), 0);
+  assert.deepEqual(fixture.calls.filter((call) => ['BEGIN', 'COMMIT'].includes(call.sql)).map((call) => call.sql), ['BEGIN', 'COMMIT']);
+  assert.equal(fixture.calls.some((call) => call.sql === 'ROLLBACK'), false);
+});
+
+test('enqueue idempotente no sobrescribe ni duplica contenido persistido', async () => {
+  const fixture = createTransactionalDb(async (sql) => {
+    if (sql === 'BEGIN' || sql === 'COMMIT') return { rows: [] };
+    if (/INSERT INTO public\.trabajos_impresion\s/.test(sql)) return { rows: [] };
+    if (/SELECT id_trabajo,id_sucursal,tipo_documento,estado,fecha_creacion,false AS inserted/.test(sql)) {
+      return { rows: [{ id_trabajo: 81, id_sucursal: 9, tipo_documento: 'factura', estado: 'pendiente', inserted: false }] };
+    }
+    throw new Error(`SQL inesperado: ${sql}`);
+  });
+
+  await enqueuePrintJob({
+    idSucursal: 9,
+    tipoDocumento: 'factura',
+    payload: facturaPayloadV2,
+    canonicalDocument: facturaDataV2,
+    idempotencyKey: 'factura:6:qa-atomic',
+    idFactura: 6,
+    db: fixture.db
+  });
+
+  assert.equal(fixture.calls.some((call) => /INSERT INTO public\.trabajos_impresion_documentos/.test(call.sql)), false);
+});
+
+test('fallo al persistir documento revierte y no deja trabajo incompleto', async () => {
+  const fixture = createTransactionalDb(async (sql) => {
+    if (sql === 'BEGIN' || sql === 'ROLLBACK') return { rows: [] };
+    if (/INSERT INTO public\.trabajos_impresion\s/.test(sql)) {
+      return { rows: [{ id_trabajo: 82, id_sucursal: 9, tipo_documento: 'factura', estado: 'pendiente', inserted: true }] };
+    }
+    if (/INSERT INTO public\.trabajos_impresion_documentos/.test(sql)) throw new Error('persistencia fallida');
+    throw new Error(`SQL inesperado: ${sql}`);
+  });
+
+  await assert.rejects(() => enqueuePrintJob({
+    idSucursal: 9,
+    tipoDocumento: 'factura',
+    payload: facturaPayloadV2,
+    canonicalDocument: facturaDataV2,
+    idempotencyKey: 'factura:6:qa-rollback',
+    idFactura: 6,
+    db: fixture.db
+  }), /persistencia fallida/);
+  assert.equal(fixture.calls.some((call) => call.sql === 'ROLLBACK'), true);
+  assert.equal(fixture.calls.some((call) => call.sql === 'COMMIT'), false);
+});
 
 const allowedPrintRequest = (timestamp, jobId = 8, html = renderPrintJobHtml(payload)) => ({
   call: 'print',
@@ -505,6 +593,7 @@ test('payload canonico v2 exige contrato y referencias exactas', () => {
   const invalidPayloads = [
     { ...clone(facturaPayloadV2), extra: true },
     { ...clone(facturaPayloadV2), schema_version: '2' },
+    { ...clone(facturaPayloadV2), schema_version: 3 },
     { ...clone(facturaPayloadV2), ancho_mm: '80' },
     { ...clone(facturaPayloadV2), impresora_logica: 'cocina' },
     { ...clone(facturaPayloadV2), source: { ...facturaPayloadV2.source, extra: true } },
@@ -758,4 +847,17 @@ test('migracion protege Data API, funcion y hash SHA-256 sin ejecutarse', () => 
   }
   assert.match(migration, /REVOKE EXECUTE ON FUNCTION public\.reclamar_trabajos_impresion[\s\S]*FROM PUBLIC, anon, authenticated, service_role/);
   assert.match(migration, /REVOKE ALL ON SEQUENCE public\.trabajos_impresion_id_trabajo_seq/);
+});
+
+test('migracion de documentos canonicos impone uno por trabajo, RLS y rollback', () => {
+  const migration = fs.readFileSync(new URL('../sql/20260719_create_print_job_documents.sql', import.meta.url), 'utf8');
+  const rollback = fs.readFileSync(new URL('../sql/20260719_create_print_job_documents_ROLLBACK.sql', import.meta.url), 'utf8');
+  assert.match(migration, /CREATE TABLE IF NOT EXISTS public\.trabajos_impresion_documentos/);
+  assert.match(migration, /UNIQUE \(id_trabajo\)/);
+  assert.match(migration, /schema_version = 2/);
+  assert.match(migration, /octet_length\(contenido\) = content_bytes/);
+  assert.match(migration, /ENABLE ROW LEVEL SECURITY/);
+  assert.match(migration, /REVOKE ALL ON TABLE public\.trabajos_impresion_documentos FROM anon, authenticated/);
+  assert.doesNotMatch(migration, /CREATE POLICY/);
+  assert.match(rollback, /DROP TABLE IF EXISTS public\.trabajos_impresion_documentos/);
 });

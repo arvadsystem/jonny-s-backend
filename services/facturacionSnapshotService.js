@@ -780,7 +780,8 @@ const normalizeSnapshotShape = (snapshot) => {
 export const normalizarDatosTicketDesdeSnapshot = async ({
   client,
   factura,
-  includePrintAssets = false
+  includePrintAssets = false,
+  useHistoricalSnapshot = false
 }) => {
   const db = client && typeof client.query === 'function' ? client : pool;
   const source = factura && typeof factura === 'object' ? factura : {};
@@ -794,7 +795,8 @@ export const normalizarDatosTicketDesdeSnapshot = async ({
     }
   }
 
-  if (!snapshot || typeof snapshot !== 'object') {
+  const hasPersistedSnapshot = Boolean(snapshot && typeof snapshot === 'object');
+  if (!hasPersistedSnapshot) {
     try {
       const fallback = await obtenerConfigFacturacionParaVenta(db, source.id_sucursal);
       snapshot = fallback.snapshot;
@@ -811,7 +813,7 @@ export const normalizarDatosTicketDesdeSnapshot = async ({
   const idSucursal = toPositiveInt(source.id_sucursal || normalized.id_sucursal);
   let currentConfigSnapshot = null;
 
-  if (idSucursal) {
+  if (idSucursal && !useHistoricalSnapshot) {
     try {
       const currentConfig = await obtenerConfigFacturacionParaVenta(db, idSucursal);
       currentConfigSnapshot = currentConfig?.snapshot || null;

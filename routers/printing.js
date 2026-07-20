@@ -7,7 +7,7 @@ import { buildPedidoKitchenPrintPayload } from './ventas/services/pedidoKitchenP
 import { enqueuePrintJob } from '../services/printQueueService.js';
 import { obtenerConfiguracionImpresorasRuntime } from '../services/impresorasConfigSucursalService.js';
 import {
-  createCanonicalPrintJobPayload,
+  createCanonicalPrintJob,
   resolveCanonicalPrintWidth
 } from '../services/printJobDocumentService.js';
 import {
@@ -59,7 +59,7 @@ export const enqueuePedidoComandaPrintJob = async ({
   loadPedido = buildPedidoKitchenPrintPayload,
   resolveScope = resolveRequestUserSucursalScope,
   loadPrinterConfig = obtenerConfiguracionImpresorasRuntime,
-  createPayload = createCanonicalPrintJobPayload,
+  createPayload = createCanonicalPrintJob,
   enqueue = enqueuePrintJob
 }) => {
   const normalizedIdPedido = parseStrictPositiveId(idPedido);
@@ -121,13 +121,14 @@ export const enqueuePedidoComandaPrintJob = async ({
     venta: pedido,
     printerConfig
   });
-  const payload = await createPayload({
+  const createdDocument = await createPayload({
     tipoDocumento: 'comanda',
     venta: pedido,
     widthMm
   });
+  const payload = createdDocument?.payload || createdDocument;
 
-  return enqueue({
+  const enqueueParams = {
     idSucursal,
     tipoDocumento: 'comanda',
     idempotencyKey: resolvedIdempotencyKey,
@@ -136,7 +137,9 @@ export const enqueuePedidoComandaPrintJob = async ({
     idUsuario: Number(req?.user?.id_usuario || 0) || null,
     esReimpresion: isReprint,
     payload
-  });
+  };
+  if (createdDocument?.document) enqueueParams.canonicalDocument = createdDocument.document;
+  return enqueue(enqueueParams);
 };
 
 const requireAdministrativePrintRole = async (req) => {
@@ -186,7 +189,8 @@ router.post('/ventas/:id/print-jobs', checkPermission(['VENTAS_IMPRIMIR', 'VENTA
 
     const detail = await buildVentaDetailPayload(req, {
       idFactura,
-      includePrintAssets: tipoDocumento === 'factura'
+      includePrintAssets: tipoDocumento === 'factura',
+      useHistoricalFacturacionSnapshot: true
     });
     if (detail.status !== 200) return res.status(detail.status).json(detail.body);
     const venta = detail.body;
@@ -202,7 +206,7 @@ router.post('/ventas/:id/print-jobs', checkPermission(['VENTAS_IMPRIMIR', 'VENTA
       }).catch(() => null)
       : null;
     const widthMm = resolveCanonicalPrintWidth({ tipoDocumento, venta, printerConfig });
-    const payload = await createCanonicalPrintJobPayload({
+    const createdDocument = await createCanonicalPrintJob({
       tipoDocumento,
       venta,
       widthMm
@@ -216,7 +220,8 @@ router.post('/ventas/:id/print-jobs', checkPermission(['VENTAS_IMPRIMIR', 'VENTA
       idPedido: Number(venta.id_pedido || 0) || null,
       idUsuario: Number(req.user?.id_usuario || 0) || null,
       esReimpresion: isReprint,
-      payload
+      payload: createdDocument.payload,
+      canonicalDocument: createdDocument.document
     });
     return res.status(202).json({ ok: true, message: 'Trabajo enviado a impresion.', job });
   } catch (error) {

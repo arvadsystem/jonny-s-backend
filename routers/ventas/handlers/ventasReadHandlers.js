@@ -243,6 +243,7 @@ export const buildVentaDetailPayloadForScope = async ({
   limitedToLast72Hours = false,
   idUsuarioDetalle = null,
   normalizeStandaloneExtras = true,
+  useHistoricalFacturacionSnapshot = false,
   queryRunner = pool
 }) => {
   const normalizedSucursalIds = (Array.isArray(allowedSucursalIds) ? allowedSucursalIds : [])
@@ -271,7 +272,8 @@ export const buildVentaDetailPayloadForScope = async ({
   const facturacionNormalizada = await normalizarDatosTicketDesdeSnapshot({
     client: queryRunner,
     factura: venta,
-    includePrintAssets
+    includePrintAssets,
+    useHistoricalSnapshot: useHistoricalFacturacionSnapshot
   });
   Object.assign(venta, mergeVentaWithFacturacion(venta, facturacionNormalizada));
 
@@ -351,7 +353,8 @@ export const buildVentaDetailPayloadForScope = async ({
 
 export const buildVentaDetailPayload = async (req, {
   idFactura,
-  includePrintAssets = false
+  includePrintAssets = false,
+  useHistoricalFacturacionSnapshot = false
 }) => {
   const scope = await resolveVentasHistoryScope(req);
   return buildVentaDetailPayloadForScope({
@@ -360,6 +363,7 @@ export const buildVentaDetailPayload = async (req, {
     allowedSucursalIds: scope.allowedSucursalIds,
     limitedToLast72Hours: scope.limitedToLast72Hours,
     idUsuarioDetalle: req.user?.id_usuario,
+    useHistoricalFacturacionSnapshot,
     queryRunner: pool
   });
 };

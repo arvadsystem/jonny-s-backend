@@ -123,7 +123,7 @@ export const createQzClient = ({
       if (!printer) throw new Error(`IMPRESORA_LOGICA_NO_CONFIGURADA:${logical}`);
       if (!available.some((name) => String(name).toLowerCase() === printer.toLowerCase())) throw new Error(`IMPRESORA_NO_ENCONTRADA:${logical}`);
       const schemaVersion = Number(job.payload?.schema_version);
-      const dataItem = schemaVersion === 2 || schemaVersion === 3
+      const dataItem = schemaVersion === 2
         ? validateCanonicalPrintJobData(job.payload, await api.document(job.id_trabajo))
         : {
           type: 'pixel',

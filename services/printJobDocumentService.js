@@ -5,16 +5,9 @@ import { buildPedidoKitchenPrintPayload } from '../routers/ventas/services/pedid
 import { buildVentaTicketPdfBuffer } from '../routers/ventas/services/ventaTicketPdfService.js';
 import { buildComandaCocinaHtml } from './comandaCocinaHtmlService.js';
 
-// v2 = renderizador legacy congelado (bytes previos a 3eea227), preservado para
-// trabajos ya encolados. v3 = renderizador corregido (hora Honduras 24h, extras
-// independientes con nombre/precio correctos). Los trabajos nuevos usan v3.
 export const LEGACY_CANONICAL_PRINT_SCHEMA_VERSION = 2;
-export const CANONICAL_PRINT_SCHEMA_VERSION = 3;
-export const SUPPORTED_CANONICAL_SCHEMA_VERSIONS = Object.freeze([
-  LEGACY_CANONICAL_PRINT_SCHEMA_VERSION,
-  CANONICAL_PRINT_SCHEMA_VERSION
-]);
-const isLegacySchemaVersion = (schemaVersion) => Number(schemaVersion) === LEGACY_CANONICAL_PRINT_SCHEMA_VERSION;
+export const CANONICAL_PRINT_SCHEMA_VERSION = 2;
+export const SUPPORTED_CANONICAL_SCHEMA_VERSIONS = Object.freeze([CANONICAL_PRINT_SCHEMA_VERSION]);
 export const MAX_CANONICAL_PDF_BYTES = 2 * 1024 * 1024;
 export const MAX_CANONICAL_HTML_BYTES = 256 * 1024;
 export const MAX_AGENT_QZ_SIGN_REQUEST_BYTES = 3 * 1024 * 1024;
@@ -189,12 +182,12 @@ const renderCanonicalDocument = async ({
   tipoDocumento,
   venta,
   widthMm,
-  schemaVersion = CANONICAL_PRINT_SCHEMA_VERSION
+  renderVariant = 'current'
 }) => {
   const contract = getDocumentContract(tipoDocumento);
   if (!contract) throw printDocumentError('PRINT_DOCUMENT_TYPE_INVALID', 'Tipo de documento canonico invalido.', 400);
 
-  const legacy = isLegacySchemaVersion(schemaVersion);
+  const legacy = renderVariant === 'legacy';
   let contentBytes;
   let data;
   if (tipoDocumento === 'factura') {
@@ -230,7 +223,7 @@ const renderCanonicalDocument = async ({
   };
 };
 
-export const createCanonicalPrintJobPayload = async ({ tipoDocumento, venta, widthMm }) => {
+export const createCanonicalPrintJob = async ({ tipoDocumento, venta, widthMm }) => {
   const normalizedType = String(tipoDocumento || '').trim().toLowerCase();
   const normalizedWidth = resolveWidth(widthMm);
   const idFactura = parsePositiveId(venta?.id_factura);
@@ -250,9 +243,9 @@ export const createCanonicalPrintJobPayload = async ({ tipoDocumento, venta, wid
     tipoDocumento: normalizedType,
     venta,
     widthMm: normalizedWidth,
-    schemaVersion: CANONICAL_PRINT_SCHEMA_VERSION
+    renderVariant: 'current'
   });
-  return {
+  const payload = {
     schema_version: CANONICAL_PRINT_SCHEMA_VERSION,
     tipo_documento: normalizedType,
     impresora_logica: contract.logicalPrinter,
@@ -263,9 +256,18 @@ export const createCanonicalPrintJobPayload = async ({ tipoDocumento, venta, wid
     },
     documento_canonico: rendered.descriptor
   };
+  return { payload, document: rendered.dataItem };
 };
 
-export const renderCanonicalPrintJobDocument = async ({ payload, venta }) => {
+export const createCanonicalPrintJobPayload = async (params) => (
+  await createCanonicalPrintJob(params)
+).payload;
+
+export const renderCanonicalPrintJobDocument = async ({
+  payload,
+  venta,
+  renderVariants = ['current', 'legacy']
+}) => {
   const validation = validateCanonicalPrintPayload(payload);
   if (!validation.ok) {
     throw printDocumentError('PRINT_DOCUMENT_PAYLOAD_INVALID', validation.message, 400);
@@ -275,17 +277,52 @@ export const renderCanonicalPrintJobDocument = async ({ payload, venta }) => {
     throw printDocumentError('PRINT_DOCUMENT_SOURCE_MISMATCH', 'La fuente del documento no coincide con el trabajo.', 409);
   }
 
-  const rendered = await renderCanonicalDocument({
-    tipoDocumento: payload.tipo_documento,
-    venta,
-    widthMm: validation.widthMm,
-    schemaVersion: validation.schemaVersion
-  });
-  if (rendered.descriptor.content_sha256 !== payload.documento_canonico.content_sha256
-    || rendered.descriptor.content_bytes !== payload.documento_canonico.content_bytes) {
-    throw printDocumentError('PRINT_DOCUMENT_CHANGED', 'El documento canonico cambio desde que se creo el trabajo.', 409);
+  const variants = Array.isArray(renderVariants) ? renderVariants : [];
+  for (const renderVariant of variants) {
+    if (!['current', 'legacy'].includes(renderVariant)) continue;
+    const rendered = await renderCanonicalDocument({
+      tipoDocumento: payload.tipo_documento,
+      venta,
+      widthMm: validation.widthMm,
+      renderVariant
+    });
+    if (rendered.descriptor.content_sha256 === payload.documento_canonico.content_sha256
+      && rendered.descriptor.content_bytes === payload.documento_canonico.content_bytes) {
+      return rendered.dataItem;
+    }
   }
-  return rendered.dataItem;
+  throw printDocumentError('PRINT_DOCUMENT_CHANGED', 'El documento canonico cambio desde que se creo el trabajo.', 409);
+};
+
+const buildPersistedCanonicalDataItem = ({ job, validation }) => {
+  if (job.persisted_document_id === null || job.persisted_document_id === undefined) return null;
+  const contentBytes = Buffer.isBuffer(job.persisted_content)
+    ? job.persisted_content
+    : Buffer.from(job.persisted_content || []);
+  const descriptor = job.payload.documento_canonico;
+  if (Number(job.persisted_schema_version) !== validation.schemaVersion
+    || job.persisted_tipo_documento !== job.tipo_documento
+    || job.persisted_formato !== validation.contract.format
+    || job.persisted_flavor !== validation.contract.flavor
+    || job.persisted_content_sha256 !== descriptor.content_sha256
+    || Number(job.persisted_content_bytes) !== descriptor.content_bytes
+    || contentBytes.length !== descriptor.content_bytes
+    || sha256(contentBytes) !== descriptor.content_sha256) {
+    throw printDocumentError('PRINT_DOCUMENT_STORED_INVALID', 'El documento canonico persistido no es valido.', 409);
+  }
+  const dataItem = {
+    type: 'pixel',
+    format: validation.contract.format,
+    flavor: validation.contract.flavor,
+    data: validation.contract.format === 'pdf'
+      ? contentBytes.toString('base64')
+      : contentBytes.toString('utf8'),
+    options: buildCanonicalDataOptions({ contract: validation.contract, widthMm: validation.widthMm })
+  };
+  if (!validateCanonicalPrintDataItem(job.payload, dataItem)) {
+    throw printDocumentError('PRINT_DOCUMENT_STORED_INVALID', 'El documento canonico persistido no es valido.', 409);
+  }
+  return dataItem;
 };
 
 export const getCanonicalPrintDocumentForAgent = async ({
@@ -296,10 +333,20 @@ export const getCanonicalPrintDocumentForAgent = async ({
   loadPedido = null
 }) => {
   const result = await db.query(
-    `SELECT id_trabajo,id_sucursal,id_agente_tomado,tipo_documento,estado,payload,id_factura,id_pedido,
+    `SELECT ti.id_trabajo,ti.id_sucursal,ti.id_agente_tomado,ti.tipo_documento,ti.estado,
+            ti.payload,ti.id_factura,ti.id_pedido,
             (lease_expires_at IS NOT NULL AND lease_expires_at > now()) AS lease_active
-     FROM public.trabajos_impresion
-     WHERE id_trabajo=$1 AND id_sucursal=$2 AND id_agente_tomado=$3
+            ,tid.id_documento AS persisted_document_id
+            ,tid.schema_version AS persisted_schema_version
+            ,tid.tipo_documento AS persisted_tipo_documento
+            ,tid.formato AS persisted_formato
+            ,tid.flavor AS persisted_flavor
+            ,tid.contenido AS persisted_content
+            ,tid.content_sha256 AS persisted_content_sha256
+            ,tid.content_bytes AS persisted_content_bytes
+     FROM public.trabajos_impresion ti
+     LEFT JOIN public.trabajos_impresion_documentos tid ON tid.id_trabajo=ti.id_trabajo
+     WHERE ti.id_trabajo=$1 AND ti.id_sucursal=$2 AND ti.id_agente_tomado=$3
      LIMIT 1`,
     [jobId, agent.id_sucursal, agent.id_agente]
   );
@@ -321,44 +368,71 @@ export const getCanonicalPrintDocumentForAgent = async ({
     throw printDocumentError('PRINT_DOCUMENT_JOB_MISMATCH', 'El documento no coincide con el trabajo reclamado.', 409);
   }
 
-  // Trabajos v2 (legacy) deben regenerar exactamente los bytes almacenados: se
-  // cargan sin normalizar extras independientes (datos previos a 3eea227). Los
-  // trabajos v3 usan la normalizacion corregida.
-  const normalizeStandaloneExtras = !isLegacySchemaVersion(validation.schemaVersion);
+  const persistedDocument = buildPersistedCanonicalDataItem({ job, validation });
+  if (persistedDocument) return { job, document: persistedDocument };
 
-  let detailResult;
-  if (validation.idFactura) {
-    detailResult = loadVenta
-      ? await loadVenta({ idFactura: validation.idFactura, idSucursal: Number(agent.id_sucursal), includePrintAssets: job.tipo_documento === 'factura', normalizeStandaloneExtras })
-      : await buildVentaDetailPayloadForScope({
-        idFactura: validation.idFactura,
-        includePrintAssets: job.tipo_documento === 'factura',
-        allowedSucursalIds: [Number(agent.id_sucursal)],
-        limitedToLast72Hours: false,
-        idUsuarioDetalle: null,
-        normalizeStandaloneExtras,
-        queryRunner: db
-      });
-  } else if (job.tipo_documento === 'comanda' && validation.idPedido) {
-    detailResult = loadPedido
-      ? await loadPedido({
-        idPedido: validation.idPedido,
-        idSucursal: Number(agent.id_sucursal),
-        normalizeStandaloneExtras,
-        queryRunner: db
+  const loadSource = async (normalizeStandaloneExtras) => {
+    let detailResult;
+    if (validation.idFactura) {
+      detailResult = loadVenta
+        ? await loadVenta({
+          idFactura: validation.idFactura,
+          idSucursal: Number(agent.id_sucursal),
+          includePrintAssets: job.tipo_documento === 'factura',
+          normalizeStandaloneExtras,
+          useHistoricalFacturacionSnapshot: true
+        })
+        : await buildVentaDetailPayloadForScope({
+          idFactura: validation.idFactura,
+          includePrintAssets: job.tipo_documento === 'factura',
+          allowedSucursalIds: [Number(agent.id_sucursal)],
+          limitedToLast72Hours: false,
+          idUsuarioDetalle: null,
+          normalizeStandaloneExtras,
+          useHistoricalFacturacionSnapshot: true,
+          queryRunner: db
+        });
+    } else if (job.tipo_documento === 'comanda' && validation.idPedido) {
+      detailResult = loadPedido
+        ? await loadPedido({
+          idPedido: validation.idPedido,
+          idSucursal: Number(agent.id_sucursal),
+          normalizeStandaloneExtras,
+          queryRunner: db
+        })
+        : await buildPedidoKitchenPrintPayload(db, validation.idPedido, { normalizeStandaloneExtras });
+    }
+    const venta = detailResult?.status === 200 ? detailResult.body : detailResult;
+    if (!venta
+      || parsePositiveId(venta.id_factura) !== validation.idFactura
+      || parsePositiveId(venta.id_pedido) !== validation.idPedido
+      || Number(venta.id_sucursal) !== Number(agent.id_sucursal)) {
+      throw printDocumentError('PRINT_DOCUMENT_SOURCE_NOT_FOUND', 'No se encontro la fuente autorizada del documento.', 404);
+    }
+    return venta;
+  };
+
+  const currentVenta = await loadSource(true);
+  try {
+    return {
+      job,
+      document: await renderCanonicalPrintJobDocument({
+        payload: job.payload,
+        venta: currentVenta,
+        renderVariants: ['current']
       })
-      : await buildPedidoKitchenPrintPayload(db, validation.idPedido, { normalizeStandaloneExtras });
-  }
-  const venta = detailResult?.status === 200 ? detailResult.body : detailResult;
-  if (!venta
-    || parsePositiveId(venta.id_factura) !== validation.idFactura
-    || parsePositiveId(venta.id_pedido) !== validation.idPedido
-    || Number(venta.id_sucursal) !== Number(agent.id_sucursal)) {
-    throw printDocumentError('PRINT_DOCUMENT_SOURCE_NOT_FOUND', 'No se encontro la fuente autorizada del documento.', 404);
+    };
+  } catch (error) {
+    if (error?.code !== 'PRINT_DOCUMENT_CHANGED') throw error;
   }
 
+  const legacyVenta = await loadSource(false);
   return {
     job,
-    document: await renderCanonicalPrintJobDocument({ payload: job.payload, venta })
+    document: await renderCanonicalPrintJobDocument({
+      payload: job.payload,
+      venta: legacyVenta,
+      renderVariants: ['legacy']
+    })
   };
 };
