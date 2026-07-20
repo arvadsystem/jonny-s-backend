@@ -34,6 +34,29 @@ FROM pg_constraint c
 WHERE c.conrelid = 'public.trabajos_impresion_documentos'::regclass
 ORDER BY c.conname;
 
+
+-- Verifica la dependencia real de la restriccion SHA-256. No depende de como
+-- PostgreSQL textualiza el nombre calificado de extensions.digest en search_path.
+SELECT
+  c.conname,
+  pg_get_expr(c.conbin, c.conrelid, true) AS expresion,
+  EXISTS (
+    SELECT 1
+    FROM pg_depend d
+    WHERE d.classid = 'pg_constraint'::regclass
+      AND d.objid = c.oid
+      AND d.refclassid = 'pg_proc'::regclass
+      AND d.refobjid = to_regprocedure('extensions.digest(bytea,text)')
+      AND d.deptype = 'n'
+  ) AS depende_de_extensions_digest,
+  position('content_sha256' IN pg_get_expr(c.conbin, c.conrelid, true)) > 0 AS compara_content_sha256,
+  position('digest(contenido' IN replace(pg_get_expr(c.conbin, c.conrelid, true), ' ', '')) > 0 AS aplica_digest_a_contenido,
+  position('''sha256''' IN pg_get_expr(c.conbin, c.conrelid, true)) > 0 AS usa_sha256,
+  position('''hex''' IN pg_get_expr(c.conbin, c.conrelid, true)) > 0 AS codifica_hex
+FROM pg_constraint c
+WHERE c.conrelid = 'public.trabajos_impresion_documentos'::regclass
+  AND c.conname = 'trabajos_impresion_documentos_hash_contenido_chk';
+
 SELECT indexname, indexdef
 FROM pg_indexes
 WHERE schemaname = 'public'

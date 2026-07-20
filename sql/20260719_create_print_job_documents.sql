@@ -1,5 +1,10 @@
 BEGIN;
 
+-- Migracion auditada para:
+--   QA  cluideiojeikzcmmizhe: tabla existente compatible => no-op seguro.
+--   PROD ooofeoziqaoqcufifqci: tabla ausente => creacion completa.
+-- No hace backfill ni modifica trabajos_impresion existentes.
+
 SET LOCAL lock_timeout = '5s';
 SET LOCAL statement_timeout = '60s';
 
@@ -262,11 +267,25 @@ BEGIN
       AND pg_get_constraintdef(c.oid, true) LIKE '%2097152%'
       AND pg_get_constraintdef(c.oid, true) LIKE '%262144%'
   ) OR NOT EXISTS (
-    SELECT 1 FROM pg_constraint c
+    SELECT 1
+    FROM pg_constraint c
     WHERE c.conrelid = v_target
       AND c.conname = 'trabajos_impresion_documentos_hash_contenido_chk'
-      AND pg_get_constraintdef(c.oid, true) LIKE '%extensions.digest%'
-      AND pg_get_constraintdef(c.oid, true) LIKE '%sha256%'
+      AND c.contype = 'c'
+      AND EXISTS (
+        SELECT 1
+        FROM pg_depend d
+        WHERE d.classid = 'pg_constraint'::regclass
+          AND d.objid = c.oid
+          AND d.refclassid = 'pg_proc'::regclass
+          AND d.refobjid = to_regprocedure('extensions.digest(bytea,text)')
+          AND d.deptype = 'n'
+      )
+      AND position('content_sha256' IN pg_get_expr(c.conbin, c.conrelid, true)) > 0
+      AND position('digest(contenido' IN replace(pg_get_expr(c.conbin, c.conrelid, true), ' ', '')) > 0
+      AND position('''sha256''' IN pg_get_expr(c.conbin, c.conrelid, true)) > 0
+      AND position('encode(' IN pg_get_expr(c.conbin, c.conrelid, true)) > 0
+      AND position('''hex''' IN pg_get_expr(c.conbin, c.conrelid, true)) > 0
   ) THEN
     RAISE EXCEPTION 'PREFLIGHT_FAILED_EXISTING_TABLE_MISMATCH: checks incompatibles';
   END IF;
@@ -297,7 +316,10 @@ BEGIN
     SELECT 1
     FROM pg_class c
     CROSS JOIN LATERAL aclexplode(
-      COALESCE(c.relacl, acldefault(CASE WHEN c.relkind = 'S' THEN 'S'::char ELSE 'r'::char END, c.relowner))
+      COALESCE(c.relacl, pg_catalog.acldefault(
+        (CASE WHEN c.relkind = 'S' THEN 's' ELSE 'r' END)::pg_catalog."char",
+        c.relowner
+      ))
     ) acl
     WHERE c.oid IN (v_target, v_sequence)
       AND acl.grantee = 0
@@ -434,7 +456,10 @@ BEGIN
     SELECT 1
     FROM pg_class c
     CROSS JOIN LATERAL aclexplode(
-      COALESCE(c.relacl, acldefault(CASE WHEN c.relkind = 'S' THEN 'S'::char ELSE 'r'::char END, c.relowner))
+      COALESCE(c.relacl, pg_catalog.acldefault(
+        (CASE WHEN c.relkind = 'S' THEN 's' ELSE 'r' END)::pg_catalog."char",
+        c.relowner
+      ))
     ) acl
     WHERE c.oid IN (
       'public.trabajos_impresion_documentos'::regclass,
@@ -474,9 +499,23 @@ BEGIN
     FROM pg_constraint c
     WHERE c.conrelid = 'public.trabajos_impresion_documentos'::regclass
       AND c.conname = 'trabajos_impresion_documentos_hash_contenido_chk'
-      AND pg_get_constraintdef(c.oid, true) LIKE '%extensions.digest%'
+      AND c.contype = 'c'
+      AND EXISTS (
+        SELECT 1
+        FROM pg_depend d
+        WHERE d.classid = 'pg_constraint'::regclass
+          AND d.objid = c.oid
+          AND d.refclassid = 'pg_proc'::regclass
+          AND d.refobjid = to_regprocedure('extensions.digest(bytea,text)')
+          AND d.deptype = 'n'
+      )
+      AND position('content_sha256' IN pg_get_expr(c.conbin, c.conrelid, true)) > 0
+      AND position('digest(contenido' IN replace(pg_get_expr(c.conbin, c.conrelid, true), ' ', '')) > 0
+      AND position('''sha256''' IN pg_get_expr(c.conbin, c.conrelid, true)) > 0
+      AND position('encode(' IN pg_get_expr(c.conbin, c.conrelid, true)) > 0
+      AND position('''hex''' IN pg_get_expr(c.conbin, c.conrelid, true)) > 0
   ) THEN
-    RAISE EXCEPTION 'POSTFLIGHT_FAILED: falta validacion SHA-256 real';
+    RAISE EXCEPTION 'POSTFLIGHT_FAILED: falta validacion SHA-256 real o dependencia a extensions.digest(bytea,text)';
   END IF;
 END
 $postflight$;

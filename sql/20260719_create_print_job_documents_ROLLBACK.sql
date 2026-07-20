@@ -1,5 +1,8 @@
 BEGIN;
 
+-- Rollback protegido: solo elimina la tabla si existe y esta vacia.
+-- Debe ejecutarse unicamente despues de revertir el backend.
+
 SET LOCAL lock_timeout = '5s';
 SET LOCAL statement_timeout = '60s';
 
