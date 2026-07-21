@@ -73,8 +73,8 @@ const schemaColumnCache = new Map();
 const NO_SUCURSAL_ASSIGNMENT_MESSAGE =
   'No tienes una sucursal asignada para visualizar Cocina. Contacta al administrador.';
 const KDS_EXPECTED_RULES = Object.freeze([
-  { code: 'RANGO_0_10', min: 0, max: 10, minutes: 25 },
-  { code: 'RANGO_11_15', min: 11, max: 15, minutes: 30 },
+  { code: 'RANGO_0_9', min: 0, max: 9, minutes: 25 },
+  { code: 'RANGO_10_15', min: 10, max: 15, minutes: 30 },
   { code: 'RANGO_16_25', min: 16, max: 25, minutes: 45 },
   { code: 'RANGO_26_PLUS', min: 26, max: Number.POSITIVE_INFINITY, minutes: 50 }
 ]);
@@ -101,7 +101,7 @@ const parsePositiveInt = (value) => {
   return Number.isInteger(parsed) && parsed > 0 ? parsed : null;
 };
 
-const resolveKdsRuleByActiveCount = (activeCount) => {
+export const resolveKdsRuleByActiveCount = (activeCount) => {
   const safeCount = Math.max(0, Number(activeCount) || 0);
   return (
     KDS_EXPECTED_RULES.find((rule) => safeCount >= rule.min && safeCount <= rule.max) ||
@@ -119,7 +119,7 @@ const resolveOperationalDateValue = (value) => {
   return tegucigalpaDate.toISOString().slice(0, 10);
 };
 
-const assignPersistedKdsTiming = async ({
+export const assignPersistedKdsTiming = async ({
   client,
   pedidoId,
   idSucursal,
@@ -162,16 +162,29 @@ const assignPersistedKdsTiming = async ({
     resolveOperationalDateValue(operationalDate) ||
     new Date().toLocaleDateString('en-CA', { timeZone: 'America/Tegucigalpa' });
 
-  // AM: Evita sobreconteo si existe mas de una factura por pedido.
+  // AM: Cuenta la carga visible del KDS aunque el pedido aun no tenga factura o codigo de venta.
   const activeCountResult = await client.query(
     `
       SELECT COUNT(DISTINCT p.id_pedido)::int AS total
       FROM public.pedidos p
-      INNER JOIN public.facturas f ON f.id_pedido = p.id_pedido
+      LEFT JOIN LATERAL (
+        SELECT f.fecha_operacion
+        FROM public.facturas f
+        WHERE f.id_pedido = p.id_pedido
+          AND f.id_sucursal = p.id_sucursal
+        ORDER BY
+          f.fecha_operacion DESC NULLS LAST,
+          f.fecha_hora_facturacion DESC NULLS LAST,
+          f.id_factura DESC
+        LIMIT 1
+      ) f ON TRUE
       WHERE p.id_sucursal = $1
         AND p.id_estado_pedido = ANY($2::int[])
-        AND f.fecha_operacion::date = $3::date
-        AND COALESCE(NULLIF(TRIM(f.codigo_venta), ''), NULL) IS NOT NULL
+        AND COALESCE(
+          f.fecha_operacion::date,
+          p.visible_en_cocina_at::date,
+          p.fecha_hora_pedido::date
+        ) = $3::date
     `,
     [safeSucursalId, activeEstadoIds, operationalDateValue]
   );
@@ -782,6 +795,7 @@ router.get('/cocina/pedidos', checkPermission(COCINA_VIEW_PERMISSIONS), async (r
       const hasKdsStartedAt = await hasColumn(client, 'pedidos', 'kds_started_at');
       const hasKdsExpectedMinutes = await hasColumn(client, 'pedidos', 'kds_expected_minutes');
       const hasKdsExpectedRule = await hasColumn(client, 'pedidos', 'kds_expected_rule');
+      const hasEnPreparacionAt = await hasColumn(client, 'pedidos', 'en_preparacion_at');
       const hasKdsTimingColumns = hasKdsStartedAt && hasKdsExpectedMinutes && hasKdsExpectedRule;
       const hasPedidosInventarioAlertas = await hasTable(client, 'pedidos_inventario_alertas');
       const activeKdsEstadoIds = ['EN_COCINA', 'EN_PREPARACION']
@@ -798,6 +812,7 @@ router.get('/cocina/pedidos', checkPermission(COCINA_VIEW_PERMISSIONS), async (r
             p.descripcion_envio,
             p.fecha_hora_pedido,
             p.visible_en_cocina_at,
+            ${hasEnPreparacionAt ? 'p.en_preparacion_at,' : 'NULL::timestamptz AS en_preparacion_at,'}
             ${hasKdsStartedAt ? 'p.kds_started_at,' : 'NULL::timestamptz AS kds_started_at,'}
             ${hasKdsExpectedMinutes ? 'p.kds_expected_minutes,' : 'NULL::int AS kds_expected_minutes,'}
             ${hasKdsExpectedRule ? 'p.kds_expected_rule,' : 'NULL::text AS kds_expected_rule,'}
@@ -862,7 +877,22 @@ router.get('/cocina/pedidos', checkPermission(COCINA_VIEW_PERMISSIONS), async (r
           LEFT JOIN recetas rec ON rec.id_receta = dp.id_receta
           ${whereClause}
           ORDER BY
-            COALESCE(p.visible_en_cocina_at, f.fecha_hora_facturacion, p.fecha_hora_pedido) ASC,
+            ${hasEnPreparacionAt
+              ? `CASE
+                   WHEN REPLACE(REPLACE(UPPER(TRIM(COALESCE(ep.descripcion, ''))), ' ', '_'), '-', '_') = 'EN_PREPARACION'
+                     THEN COALESCE(
+                       p.en_preparacion_at,
+                       p.visible_en_cocina_at AT TIME ZONE 'America/Tegucigalpa',
+                       f.fecha_hora_facturacion AT TIME ZONE 'America/Tegucigalpa',
+                       p.fecha_hora_pedido AT TIME ZONE 'America/Tegucigalpa'
+                     )
+                   ELSE COALESCE(
+                     p.visible_en_cocina_at AT TIME ZONE 'America/Tegucigalpa',
+                     f.fecha_hora_facturacion AT TIME ZONE 'America/Tegucigalpa',
+                     p.fecha_hora_pedido AT TIME ZONE 'America/Tegucigalpa'
+                   )
+                 END ASC NULLS LAST,`
+              : `COALESCE(p.visible_en_cocina_at, f.fecha_hora_facturacion, p.fecha_hora_pedido) ASC NULLS LAST,`}
             p.id_pedido ASC,
             dp.id_detalle_pedido ASC
         `,
@@ -940,6 +970,7 @@ router.get('/cocina/pedidos', checkPermission(COCINA_VIEW_PERMISSIONS), async (r
             fecha_operacion: row.fecha_operacion || null,
             fecha_hora_pedido: row.fecha_hora_pedido,
             visible_en_cocina_at: row.visible_en_cocina_at || row.fecha_hora_facturacion || row.fecha_hora_pedido,
+            en_preparacion_at: row.en_preparacion_at || null,
             kds_started_at: row.kds_started_at || null,
             kds_expected_minutes: parsePositiveInt(row.kds_expected_minutes),
             kds_expected_rule: row.kds_expected_rule || null,
@@ -1236,12 +1267,17 @@ router.put('/cocina/pedidos/:id/estado', checkPermission(COCINA_VIEW_PERMISSIONS
       }
 
       // ���� 9. Actualizar estado ������������������������������������������������������������������������������
-      await client.query(
+      const hasEnPreparacionAt = await hasColumn(client, 'pedidos', 'en_preparacion_at');
+      const updatedPedidoResult = await client.query(
         `
           UPDATE pedidos
           SET id_estado_pedido = $1,
               visible_en_cocina_at = COALESCE(visible_en_cocina_at, fecha_hora_pedido, NOW())
+              ${hasEnPreparacionAt && estadoDestino === 'EN_PREPARACION'
+                ? ', en_preparacion_at = COALESCE(en_preparacion_at, NOW())'
+                : ''}
           WHERE id_pedido = $2
+          RETURNING ${hasEnPreparacionAt ? 'en_preparacion_at' : 'NULL::timestamptz AS en_preparacion_at'}
         `,
         [idEstadoDestino, idPedido]
       );
@@ -1281,6 +1317,7 @@ router.put('/cocina/pedidos/:id/estado', checkPermission(COCINA_VIEW_PERMISSIONS
         id_pedido: idPedido,
         estado_anterior: estadoActual,
         estado_actual: estadoDestino,
+        en_preparacion_at: updatedPedidoResult.rows[0]?.en_preparacion_at || null,
         warning: Boolean(inventoryResult?.warning || inventoryAlreadyDiscounted),
         warning_code: inventoryAlreadyDiscounted
           ? 'INVENTARIO_YA_DESCONTADO'

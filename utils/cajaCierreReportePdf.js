@@ -21,6 +21,15 @@ const toNumber = (value) => {
   return Number.isFinite(parsed) ? parsed : 0;
 };
 
+const roundMoney = (value) => Number(toNumber(value).toFixed(2));
+
+export const calculateTotalNetSales = ({
+  ventasEfectivoNetas,
+  ventasNoEfectivoNetas
+} = {}) => roundMoney(
+  toNumber(ventasEfectivoNetas) + toNumber(ventasNoEfectivoNetas)
+);
+
 const formatMoney = (value) =>
   `L ${toNumber(value).toLocaleString('en-US', {
     minimumFractionDigits: 2,
@@ -65,6 +74,61 @@ const labelValueRows = (rows) =>
     { text: label, style: 'labelCell' },
     { text: cleanText(value), style: 'valueCell' }
   ]);
+
+const buildMonetarySummaryRows = (payload = {}) => {
+  const totalNetSales = calculateTotalNetSales(payload);
+  const moneyValueCell = (value, extra = {}) => ({
+    text: formatMoney(value),
+    style: 'moneyValueCell',
+    ...extra
+  });
+
+  return [
+    [
+      { text: 'Monto apertura', style: 'labelCell' },
+      moneyValueCell(payload.montoApertura)
+    ],
+    [
+      { text: 'Ventas', style: 'salesGroupHeader', colSpan: 2 },
+      {}
+    ],
+    [
+      { text: 'Efectivo', style: 'salesDetailLabel' },
+      moneyValueCell(payload.ventasEfectivoNetas)
+    ],
+    [
+      { text: 'No efectivo', style: 'salesDetailLabel' },
+      moneyValueCell(payload.ventasNoEfectivoNetas)
+    ],
+    [
+      { text: 'Total ventas', style: 'salesTotalLabel', border: [false, true, false, false] },
+      moneyValueCell(totalNetSales, {
+        style: 'salesTotalValue',
+        border: [false, true, false, false]
+      })
+    ],
+    [
+      { text: 'Ingresos manuales', style: 'labelCell' },
+      moneyValueCell(payload.ingresosManuales)
+    ],
+    [
+      { text: 'Egresos manuales', style: 'labelCell' },
+      moneyValueCell(payload.egresosManuales)
+    ],
+    [
+      { text: 'Total teorico', style: 'labelCell' },
+      moneyValueCell(payload.montoTeorico)
+    ],
+    [
+      { text: 'Total declarado', style: 'labelCell' },
+      moneyValueCell(payload.montoDeclaradoCierre)
+    ],
+    [
+      { text: 'Diferencia', style: 'labelCell' },
+      moneyValueCell(payload.diferencia)
+    ]
+  ];
+};
 
 const buildArqueosTableBody = (arqueos = []) => {
   const body = [[
@@ -133,6 +197,7 @@ const buildManualMovementSection = (title, rows = []) => [
   {
     table: {
       headerRows: 1,
+      dontBreakRows: true,
       widths: ['17%', '13%', '30%', '22%', '18%'],
       body: buildManualMovementsTableBody(rows)
     },
@@ -181,6 +246,11 @@ export const buildCajaCierrePdfDefinition = (payload = {}) => {
       status: { bold: true, color: payload.requiresAudit ? '#b42318' : '#027a48', margin: [0, 0, 0, 4] },
       labelCell: { bold: true, fillColor: '#f9fafb' },
       valueCell: {},
+      moneyValueCell: { alignment: 'right', noWrap: true },
+      salesGroupHeader: { bold: true, fillColor: '#f2f4f7' },
+      salesDetailLabel: { margin: [12, 0, 0, 0] },
+      salesTotalLabel: { bold: true },
+      salesTotalValue: { bold: true, alignment: 'right', noWrap: true },
       tableHeader: { bold: true, fillColor: '#f2f4f7' }
     },
     content: [
@@ -219,16 +289,7 @@ export const buildCajaCierrePdfDefinition = (payload = {}) => {
       {
         table: {
           widths: ['40%', '60%'],
-          body: labelValueRows([
-            ['Monto apertura', formatMoney(payload.montoApertura)],
-            ['Ventas efectivo', formatMoney(payload.ventasEfectivoNetas)],
-            ['Ventas no efectivo', formatMoney(payload.ventasNoEfectivoNetas)],
-            ['Ingresos manuales', formatMoney(payload.ingresosManuales)],
-            ['Egresos manuales', formatMoney(payload.egresosManuales)],
-            ['Total teorico', formatMoney(payload.montoTeorico)],
-            ['Total declarado', formatMoney(payload.montoDeclaradoCierre)],
-            ['Diferencia', formatMoney(payload.diferencia)]
-          ])
+          body: buildMonetarySummaryRows(payload)
         },
         layout: 'lightHorizontalLines'
       },
@@ -248,6 +309,7 @@ export const buildCajaCierrePdfDefinition = (payload = {}) => {
       {
         table: {
           headerRows: 1,
+          dontBreakRows: true,
           widths: ['15%', '15%', '15%', '15%', '12%', '28%'],
           body: buildArqueosTableBody(payload.arqueos)
         },

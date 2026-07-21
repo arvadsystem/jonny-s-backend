@@ -7,6 +7,21 @@ const normalizeMethodCode = (value) => String(value || '').trim().toUpperCase();
 
 const toBigIntText = (value) => parsePositiveBigIntId(value) || '0';
 
+const createUnaccountablePaymentMethodError = (methods = []) => {
+  const error = new Error('La sesion contiene cobros con un metodo de pago no contabilizable.');
+  error.code = 'VENTAS_CAJAS_METODO_PAGO_NO_CONTABILIZABLE';
+  error.httpStatus = 409;
+  error.publicMessage = 'La sesion contiene cobros con un metodo de pago inactivo o sin clasificacion contable.';
+  error.details = {
+    metodos: methods.map((method) => ({
+      id_metodo_pago: Number(method?.id_metodo_pago || 0) || null,
+      codigo: normalizeMethodCode(method?.codigo) || null,
+      motivo: String(method?.motivo || 'NO_CONTABILIZABLE')
+    }))
+  };
+  return error;
+};
+
 const normalizeMethod = (row = {}) => ({
   id_metodo_pago: Number(row.id_metodo_pago || 0) || null,
   codigo: normalizeMethodCode(row.codigo),
@@ -47,6 +62,9 @@ const normalizeSnapshot = (row = {}, idSesionCaja) => {
     tarjeta_teorico: roundMoney(row.tarjeta_teorico),
     transferencia_teorico: roundMoney(row.transferencia_teorico),
     total_teorico: roundMoney(row.total_teorico),
+    otros_no_efectivo_id_metodo_pago: Number.isFinite(Number(row.otros_no_efectivo_id_metodo_pago))
+      ? Number(row.otros_no_efectivo_id_metodo_pago)
+      : null,
     fingerprint: {
       cantidad_cobros: Number(fingerprint.cantidad_cobros || 0),
       max_id_factura_cobro: toBigIntText(fingerprint.max_id_factura_cobro),
@@ -58,6 +76,8 @@ const normalizeSnapshot = (row = {}, idSesionCaja) => {
       max_id_movimiento_caja: toBigIntText(fingerprint.max_id_movimiento_caja),
       total_ingresos_manuales: roundMoney(fingerprint.total_ingresos_manuales),
       total_egresos_manuales: roundMoney(fingerprint.total_egresos_manuales),
+      ventas_efectivo_netas: roundMoney(fingerprint.ventas_efectivo_netas),
+      ventas_no_efectivo_netas: roundMoney(fingerprint.ventas_no_efectivo_netas),
       efectivo_teorico: roundMoney(fingerprint.efectivo_teorico),
       tarjeta_teorico: roundMoney(fingerprint.tarjeta_teorico),
       transferencia_teorico: roundMoney(fingerprint.transferencia_teorico),
@@ -76,6 +96,7 @@ const normalizeSnapshot = (row = {}, idSesionCaja) => {
   snapshot.tarjetaTeorico = snapshot.tarjeta_teorico;
   snapshot.transferenciaTeorico = snapshot.transferencia_teorico;
   snapshot.totalTeorico = snapshot.total_teorico;
+  snapshot.otrosNoEfectivoIdMetodoPago = snapshot.otros_no_efectivo_id_metodo_pago;
   snapshot.salesByCode = new Map(snapshot.metodos.map((method) => [method.codigo, method.ventas_brutas]));
   snapshot.reversionsByCode = new Map(snapshot.metodos.map((method) => [method.codigo, method.reversiones]));
   snapshot.salesNetByCode = new Map(snapshot.metodos.map((method) => [method.codigo, method.ventas_netas]));
@@ -106,13 +127,19 @@ export const loadCajaCloseFinancialSnapshot = async ({ queryRunner, idSesionCaja
         WHERE cs.id_sesion_caja = $1::bigint
         LIMIT 1
       ),
-      payment_methods AS (
+      payment_method_catalog AS (
         SELECT
           mp.id_metodo_pago,
-          UPPER(TRIM(mp.codigo)) AS codigo
+          UPPER(TRIM(mp.codigo)) AS codigo,
+          COALESCE(mp.estado, true) AS activo,
+          mp.afecta_efectivo
         FROM public.cat_metodos_pago mp
-        WHERE COALESCE(mp.estado, true) = true
-          AND UPPER(TRIM(mp.codigo)) = ANY(ARRAY['EFECTIVO','TARJETA','TRANSFERENCIA']::text[])
+      ),
+      payment_methods AS (
+        SELECT id_metodo_pago, codigo, afecta_efectivo
+        FROM payment_method_catalog
+        WHERE activo = true
+          AND afecta_efectivo IS NOT NULL
       ),
       payments AS (
         SELECT
@@ -122,6 +149,36 @@ export const loadCajaCloseFinancialSnapshot = async ({ queryRunner, idSesionCaja
           COALESCE(fc.monto, 0)::numeric(14,2) AS monto
         FROM public.facturas_cobros fc
         WHERE fc.id_sesion_caja = $1::bigint
+      ),
+      invalid_payment_methods AS (
+        SELECT DISTINCT
+          p.id_metodo_pago,
+          pmc.codigo,
+          CASE
+            WHEN pmc.id_metodo_pago IS NULL THEN 'NO_EXISTE'
+            WHEN pmc.activo IS NOT TRUE THEN 'INACTIVO'
+            ELSE 'SIN_CLASIFICACION_EFECTIVO'
+          END AS motivo
+        FROM payments p
+        LEFT JOIN payment_method_catalog pmc
+          ON pmc.id_metodo_pago = p.id_metodo_pago
+        WHERE pmc.id_metodo_pago IS NULL
+           OR pmc.activo IS NOT TRUE
+           OR pmc.afecta_efectivo IS NULL
+      ),
+      invalid_payment_summary AS (
+        SELECT COALESCE(
+          jsonb_agg(
+            jsonb_build_object(
+              'id_metodo_pago', ipm.id_metodo_pago,
+              'codigo', ipm.codigo,
+              'motivo', ipm.motivo
+            )
+            ORDER BY ipm.id_metodo_pago
+          ),
+          '[]'::jsonb
+        ) AS metodos_pago_invalidos
+        FROM invalid_payment_methods ipm
       ),
       payments_by_method AS (
         SELECT
@@ -240,31 +297,101 @@ export const loadCajaCloseFinancialSnapshot = async ({ queryRunner, idSesionCaja
           (SELECT COALESCE(MAX(id_reversion), 0)::text FROM reversion_source) AS max_id_reversion,
           (SELECT COALESCE(SUM(monto_reversado), 0)::numeric(14,2) FROM reversion_source) AS total_reversado
       ),
+      method_totals AS (
+        SELECT
+          pm.id_metodo_pago,
+          pm.codigo,
+          pm.afecta_efectivo,
+          COALESCE(pbm.ventas_brutas, 0)::numeric(14,2) AS ventas_brutas,
+          COALESCE(rbm.reversiones, 0)::numeric(14,2) AS reversiones,
+          (
+            COALESCE(pbm.ventas_brutas, 0) - COALESCE(rbm.reversiones, 0)
+          )::numeric(14,2) AS ventas_netas
+        FROM payment_methods pm
+        LEFT JOIN payments_by_method pbm
+          ON pbm.id_metodo_pago = pm.id_metodo_pago
+        LEFT JOIN reversions_by_method rbm
+          ON rbm.id_metodo_pago = pm.id_metodo_pago
+      ),
+      aggregate_totals AS (
+        SELECT
+          COALESCE(SUM(CASE WHEN mt.afecta_efectivo IS TRUE THEN mt.ventas_netas ELSE 0 END), 0)::numeric(14,2) AS ventas_efectivo_netas,
+          COALESCE(SUM(CASE WHEN mt.afecta_efectivo IS FALSE THEN mt.ventas_netas ELSE 0 END), 0)::numeric(14,2) AS ventas_no_efectivo_netas,
+          COALESCE(SUM(CASE WHEN mt.codigo = 'TARJETA' THEN mt.ventas_netas ELSE 0 END), 0)::numeric(14,2) AS ventas_tarjeta_netas,
+          COALESCE(SUM(CASE WHEN mt.codigo = 'TRANSFERENCIA' THEN mt.ventas_netas ELSE 0 END), 0)::numeric(14,2) AS ventas_transferencia_netas
+        FROM method_totals mt
+      ),
+      -- cajas_cierres_arqueos_metodos.id_metodo_pago es NOT NULL con FK real a
+      -- cat_metodos_pago (fk_ccam_metodo); la fila agrupada OTROS_NO_EFECTIVO
+      -- necesita un ancla valida. Se toma el catalogo completo (activo o no)
+      -- para que exista un id aunque el metodo este inactivo.
+      other_non_cash_method AS (
+        SELECT MIN(pmc.id_metodo_pago) AS id_metodo_pago
+        FROM payment_method_catalog pmc
+        WHERE pmc.codigo <> ALL(ARRAY['EFECTIVO','TARJETA','TRANSFERENCIA']::text[])
+      ),
+      segmented_methods AS (
+        SELECT
+          mt.id_metodo_pago,
+          mt.codigo,
+          mt.ventas_brutas,
+          mt.reversiones,
+          mt.ventas_netas,
+          CASE
+            WHEN mt.codigo = 'EFECTIVO' THEN
+              sb.monto_apertura
+              + at.ventas_efectivo_netas
+              + COALESCE(mm.ingresos_manuales, 0)
+              - COALESCE(mm.egresos_manuales, 0)
+            ELSE mt.ventas_netas
+          END::numeric(14,2) AS monto_teorico
+        FROM method_totals mt
+        CROSS JOIN session_base sb
+        CROSS JOIN manual_movements mm
+        CROSS JOIN aggregate_totals at
+        WHERE mt.codigo = ANY(ARRAY['EFECTIVO','TARJETA','TRANSFERENCIA']::text[])
+      ),
       final_snapshot AS (
         SELECT
           sb.id_sesion_caja::text AS id_sesion_caja,
           sb.monto_apertura,
           COALESCE(mm.ingresos_manuales, 0)::numeric(14,2) AS ingresos_manuales,
           COALESCE(mm.egresos_manuales, 0)::numeric(14,2) AS egresos_manuales,
-          COALESCE(SUM(CASE WHEN pm.codigo = 'EFECTIVO' THEN pbm.ventas_brutas - rbm.reversiones ELSE 0 END), 0)::numeric(14,2) AS ventas_efectivo_netas,
-          COALESCE(SUM(CASE WHEN pm.codigo = 'TARJETA' THEN pbm.ventas_brutas - rbm.reversiones ELSE 0 END), 0)::numeric(14,2) AS ventas_tarjeta_netas,
-          COALESCE(SUM(CASE WHEN pm.codigo = 'TRANSFERENCIA' THEN pbm.ventas_brutas - rbm.reversiones ELSE 0 END), 0)::numeric(14,2) AS ventas_transferencia_netas,
-          COALESCE(SUM(CASE WHEN pm.codigo <> 'EFECTIVO' THEN pbm.ventas_brutas - rbm.reversiones ELSE 0 END), 0)::numeric(14,2) AS ventas_no_efectivo_netas,
-          jsonb_agg(
-            jsonb_build_object(
-              'id_metodo_pago', pm.id_metodo_pago,
-              'codigo', pm.codigo,
-              'ventas_brutas', COALESCE(pbm.ventas_brutas, 0),
-              'reversiones', COALESCE(rbm.reversiones, 0),
-              'ventas_netas', COALESCE(pbm.ventas_brutas, 0) - COALESCE(rbm.reversiones, 0),
-              'monto_teorico',
-                CASE
-                  WHEN pm.codigo = 'EFECTIVO' THEN sb.monto_apertura + COALESCE(pbm.ventas_brutas, 0) - COALESCE(rbm.reversiones, 0) + COALESCE(mm.ingresos_manuales, 0) - COALESCE(mm.egresos_manuales, 0)
-                  ELSE COALESCE(pbm.ventas_brutas, 0) - COALESCE(rbm.reversiones, 0)
-                END
+          at.ventas_efectivo_netas,
+          at.ventas_tarjeta_netas,
+          at.ventas_transferencia_netas,
+          at.ventas_no_efectivo_netas,
+          (
+            sb.monto_apertura
+            + at.ventas_efectivo_netas
+            + COALESCE(mm.ingresos_manuales, 0)
+            - COALESCE(mm.egresos_manuales, 0)
+          )::numeric(14,2) AS efectivo_teorico,
+          at.ventas_tarjeta_netas::numeric(14,2) AS tarjeta_teorico,
+          at.ventas_transferencia_netas::numeric(14,2) AS transferencia_teorico,
+          (
+            sb.monto_apertura
+            + at.ventas_efectivo_netas
+            + COALESCE(mm.ingresos_manuales, 0)
+            - COALESCE(mm.egresos_manuales, 0)
+            + at.ventas_no_efectivo_netas
+          )::numeric(14,2) AS total_teorico,
+          COALESCE((
+            SELECT jsonb_agg(
+              jsonb_build_object(
+                'id_metodo_pago', sm.id_metodo_pago,
+                'codigo', sm.codigo,
+                'ventas_brutas', sm.ventas_brutas,
+                'reversiones', sm.reversiones,
+                'ventas_netas', sm.ventas_netas,
+                'monto_teorico', sm.monto_teorico
+              )
+              ORDER BY sm.id_metodo_pago ASC
             )
-            ORDER BY pm.id_metodo_pago ASC
-          ) AS metodos,
+            FROM segmented_methods sm
+          ), '[]'::jsonb) AS metodos,
+          onm.id_metodo_pago AS otros_no_efectivo_id_metodo_pago,
+          ips.metodos_pago_invalidos,
           jsonb_build_object(
             'cantidad_cobros', COALESCE(ff.cantidad_cobros, 0),
             'max_id_factura_cobro', COALESCE(ff.max_id_factura_cobro, '0'),
@@ -275,50 +402,36 @@ export const loadCajaCloseFinancialSnapshot = async ({ queryRunner, idSesionCaja
             'cantidad_movimientos', COALESCE(mm.cantidad_movimientos, 0),
             'max_id_movimiento_caja', COALESCE(mm.max_id_movimiento_caja, '0'),
             'total_ingresos_manuales', COALESCE(mm.ingresos_manuales, 0),
-            'total_egresos_manuales', COALESCE(mm.egresos_manuales, 0)
-          ) AS base_fingerprint
+            'total_egresos_manuales', COALESCE(mm.egresos_manuales, 0),
+            'ventas_efectivo_netas', at.ventas_efectivo_netas,
+            'ventas_no_efectivo_netas', at.ventas_no_efectivo_netas,
+            'efectivo_teorico',
+              sb.monto_apertura + at.ventas_efectivo_netas + COALESCE(mm.ingresos_manuales, 0) - COALESCE(mm.egresos_manuales, 0),
+            'tarjeta_teorico', at.ventas_tarjeta_netas,
+            'transferencia_teorico', at.ventas_transferencia_netas,
+            'total_teorico',
+              sb.monto_apertura + at.ventas_efectivo_netas + COALESCE(mm.ingresos_manuales, 0) - COALESCE(mm.egresos_manuales, 0) + at.ventas_no_efectivo_netas
+          ) AS fingerprint
         FROM session_base sb
-        CROSS JOIN payment_methods pm
-        LEFT JOIN payments_by_method pbm ON pbm.id_metodo_pago = pm.id_metodo_pago
-        LEFT JOIN reversions_by_method rbm ON rbm.id_metodo_pago = pm.id_metodo_pago
         CROSS JOIN manual_movements mm
         CROSS JOIN financial_fingerprint ff
-        GROUP BY
-          sb.id_sesion_caja,
-          sb.monto_apertura,
-          mm.ingresos_manuales,
-          mm.egresos_manuales,
-          mm.cantidad_movimientos,
-          mm.max_id_movimiento_caja,
-          ff.cantidad_cobros,
-          ff.max_id_factura_cobro,
-          ff.total_cobros,
-          ff.cantidad_reversiones,
-          ff.max_id_reversion,
-          ff.total_reversado
+        CROSS JOIN aggregate_totals at
+        CROSS JOIN invalid_payment_summary ips
+        CROSS JOIN other_non_cash_method onm
       )
-      SELECT
-        fs.*,
-        (
-          fs.monto_apertura + fs.ventas_efectivo_netas + fs.ingresos_manuales - fs.egresos_manuales
-        )::numeric(14,2) AS efectivo_teorico,
-        fs.ventas_tarjeta_netas::numeric(14,2) AS tarjeta_teorico,
-        fs.ventas_transferencia_netas::numeric(14,2) AS transferencia_teorico,
-        (
-          fs.monto_apertura + fs.ventas_efectivo_netas + fs.ingresos_manuales - fs.egresos_manuales
-          + fs.ventas_tarjeta_netas
-          + fs.ventas_transferencia_netas
-        )::numeric(14,2) AS total_teorico,
-        fs.base_fingerprint || jsonb_build_object(
-          'efectivo_teorico', fs.monto_apertura + fs.ventas_efectivo_netas + fs.ingresos_manuales - fs.egresos_manuales,
-          'tarjeta_teorico', fs.ventas_tarjeta_netas,
-          'transferencia_teorico', fs.ventas_transferencia_netas,
-          'total_teorico', fs.monto_apertura + fs.ventas_efectivo_netas + fs.ingresos_manuales - fs.egresos_manuales + fs.ventas_tarjeta_netas + fs.ventas_transferencia_netas
-        ) AS fingerprint
+      SELECT fs.*
       FROM final_snapshot fs
     `,
     [sessionId]
   );
 
-  return normalizeSnapshot(result.rows?.[0] || {}, sessionId);
+  const row = result.rows?.[0] || {};
+  const invalidMethods = Array.isArray(row.metodos_pago_invalidos)
+    ? row.metodos_pago_invalidos
+    : [];
+  if (invalidMethods.length > 0) {
+    throw createUnaccountablePaymentMethodError(invalidMethods);
+  }
+
+  return normalizeSnapshot(row, sessionId);
 };

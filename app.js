@@ -71,6 +71,7 @@ import printingRoutes from './routers/printing.js';
 import { authRequired, csrfProtect } from './middleware/auth.js';
 import { touchSessionMiddleware } from './middleware/touchSession.js';
 import { requireActiveSession } from './middleware/requireActiveSession.js';
+import { refreshKitchenDisplaySession } from './middleware/refreshKitchenDisplaySession.js';
 import { requirePasswordChange } from './middleware/requirePasswordChange.js';
 import { MAX_IMAGE_JSON_LIMIT, UPLOADS_DIR } from './utils/uploads.js';
 
@@ -252,6 +253,7 @@ app.use('/api/print-agent', printAgentRoutes);
 // ✅ 3) A partir de aquí: todo protegido
 app.use(authRequired);               // 1) valida JWT
 app.use(requireActiveSession);       // 2) valida sesión activa en BD
+app.use(refreshKitchenDisplaySession);
 app.use(requirePasswordChange);      // fuerza cambio de contrasena cuando aplica
 app.use(touchSessionMiddleware);     // 3) actualiza ultima_actividad
 app.use(csrfProtect);                // 4) CSRF para no-GET

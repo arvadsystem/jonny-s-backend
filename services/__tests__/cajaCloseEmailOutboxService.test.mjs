@@ -14,7 +14,9 @@ import {
   resolveCajaCloseOutboxRecipient
 } from '../cajaCloseEmailOutboxService.js';
 import {
+  buildCajaCierrePdfBuffer,
   buildCajaCierrePdfDefinition,
+  calculateTotalNetSales,
   formatCajaCierreDateTime
 } from '../../utils/cajaCierreReportePdf.js';
 
@@ -104,6 +106,94 @@ const buildSampleClosePayload = () => ({
 const stripHtml = (html) => String(html || '').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
 
 describe('caja close email durable outbox', () => {
+  it('calcula ventas netas totales una sola vez y redondea a dos decimales', () => {
+    assert.equal(calculateTotalNetSales({
+      ventasEfectivoNetas: 0,
+      ventasNoEfectivoNetas: 0
+    }), 0);
+    assert.equal(calculateTotalNetSales({
+      ventasEfectivoNetas: 30482,
+      ventasNoEfectivoNetas: 3437,
+      ventasTarjetaNetas: 99999,
+      ventasTransferenciaNetas: 99999
+    }), 33919);
+    assert.equal(calculateTotalNetSales({
+      ventasEfectivoNetas: 10.115,
+      ventasNoEfectivoNetas: 0.116
+    }), 10.23);
+    assert.equal(calculateTotalNetSales({
+      ventasEfectivoNetas: null,
+      ventasNoEfectivoNetas: undefined
+    }), 0);
+    assert.equal(calculateTotalNetSales({
+      ventasEfectivoNetas: 100,
+      ventasNoEfectivoNetas: 900
+    }), 1000);
+  });
+
+  it('agrupa ventas en PDF y HTML con el mismo total y una sola columna monetaria', () => {
+    const payload = {
+      ...buildSampleClosePayload(),
+      ventasEfectivoNetas: 30482,
+      ventasNoEfectivoNetas: 3437
+    };
+    const definition = buildCajaCierrePdfDefinition(payload);
+    const summaryTable = definition.content.find((item) =>
+      item?.table?.body?.some((row) => row?.[0]?.text === 'Total ventas')
+    );
+    const totalRow = summaryTable.table.body.find((row) => row[0]?.text === 'Total ventas');
+    const pdfText = JSON.stringify(definition);
+    const html = buildCajaCloseEmailHtml({ payload, pdfAttached: true });
+
+    assert.ok(summaryTable);
+    assert.deepEqual(summaryTable.table.widths, ['40%', '60%']);
+    assert.equal(totalRow[1].text, 'L 33,919.00');
+    assert.equal(totalRow[0].bold, undefined);
+    assert.equal(totalRow[0].style, 'salesTotalLabel');
+    assert.deepEqual(totalRow[0].border, [false, true, false, false]);
+    assert.equal(definition.styles.salesTotalLabel.bold, true);
+    assert.equal(definition.styles.salesTotalValue.alignment, 'right');
+    assert.equal((pdfText.match(/Total ventas/g) || []).length, 1);
+    assert.equal((html.match(/Total ventas/g) || []).length, 1);
+    assert.match(pdfText, /"text":"Ventas"/);
+    assert.match(pdfText, /"text":"Efectivo"/);
+    assert.match(pdfText, /"text":"No efectivo"/);
+    assert.match(html, /Ventas en efectivo/);
+    assert.match(html, /Ventas no efectivo/);
+    assert.match(html, /L 33,919\.00/);
+    assert.doesNotMatch(html, /L 233,917\.00/);
+  });
+
+  it('genera PDF LETTER con arqueos y movimientos extensos sin alterar paginacion', async () => {
+    const payload = buildSampleClosePayload();
+    payload.arqueos = Array.from({ length: 40 }, (_, index) => ({
+      ...payload.arqueos[0],
+      metodo_pago_codigo: `METODO-${index + 1}`
+    }));
+    payload.movimientosManuales = {
+      ingresos: Array.from({ length: 55 }, (_, index) => ({
+        ...payload.movimientosManuales.ingresos[0],
+        observacion: `Ingreso ${index + 1}`
+      })),
+      egresos: Array.from({ length: 55 }, (_, index) => ({
+        ...payload.movimientosManuales.egresos[0],
+        observacion: `Egreso ${index + 1}`
+      }))
+    };
+
+    const definition = buildCajaCierrePdfDefinition(payload);
+    const buffer = await buildCajaCierrePdfBuffer(payload);
+
+    assert.equal(definition.pageSize, 'LETTER');
+    assert.deepEqual(definition.pageMargins, [36, 42, 36, 48]);
+    assert.equal(typeof definition.footer, 'function');
+    for (const table of definition.content.filter((item) => item?.table?.headerRows === 1)) {
+      assert.equal(table.table.dontBreakRows, true);
+    }
+    assert.ok(Buffer.isBuffer(buffer));
+    assert.equal(buffer.subarray(0, 4).toString(), '%PDF');
+  });
+
   it('crea cierre y outbox en la misma transaccion sin depender de cola en memoria', () => {
     const closeHandlerStart = routerSource.indexOf('const closeSessionHandler = async');
     const closeHandlerEnd = routerSource.indexOf("router.patch('/ventas/cajas/sesiones/:id/cerrar'", closeHandlerStart);
@@ -350,7 +440,8 @@ describe('caja close email durable outbox', () => {
       'Fecha/hora de cierre',
       'Monto de apertura',
       'Ventas en efectivo',
-      'Ventas no efectivas',
+      'Ventas no efectivo',
+      'Total ventas',
       'Total de ingresos manuales',
       'Total de egresos manuales',
       'Resolucion',
@@ -371,8 +462,10 @@ describe('caja close email durable outbox', () => {
       'ID sesion',
       'Fecha/hora de cierre',
       'Monto apertura',
-      'Ventas efectivo',
-      'Ventas no efectivo',
+      'Ventas',
+      'Efectivo',
+      'No efectivo',
+      'Total ventas',
       'Ingresos manuales',
       'Egresos manuales',
       'Resolucion',

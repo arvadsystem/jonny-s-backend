@@ -1,9 +1,9 @@
 import express from 'express';
 import pool from '../config/db-connection.js';
-import jwt from 'jsonwebtoken';
 import crypto from 'crypto';
 import { authRequired } from '../middleware/auth.js';
 import { requireActiveSession } from '../middleware/requireActiveSession.js';
+import { refreshKitchenDisplaySession } from '../middleware/refreshKitchenDisplaySession.js';
 import { requireSessionTouchMiddleware } from '../middleware/touchSession.js';
 import {
   internalLoginIpLimiter,
@@ -18,6 +18,8 @@ import {
   buildAuthRoleCompatFields,
   getUserAuthzSnapshot
 } from '../utils/security/authTokenPayload.js';
+import { buildAccessTokenCookieOptions } from '../utils/security/authCookieOptions.js';
+import { issueAccessToken } from '../utils/security/accessTokenPolicy.js';
 
 // helpers de HU78
 import { getClientIp, parseUserAgent } from '../utils/security/clientInfo.js';
@@ -130,17 +132,6 @@ const normalizeSameSite = (value, fallback) => {
     return normalized;
   }
   return fallback;
-};
-
-const authCookieOptions = () => {
-  const isProd = process.env.NODE_ENV === 'production';
-  return {
-    httpOnly: true,
-    secure: String(process.env.AUTH_COOKIE_SECURE || '').toLowerCase() === 'true' || isProd,
-    sameSite: normalizeSameSite(process.env.AUTH_COOKIE_SAMESITE, isProd ? 'none' : 'lax'),
-    domain: String(process.env.AUTH_COOKIE_DOMAIN || '').trim() || undefined,
-    path: '/'
-  };
 };
 
 const csrfCookieOptions = () => {
@@ -378,12 +369,11 @@ router.post('/login', internalLoginIpLimiter, internalLoginAccountIpLimiter, asy
       permisos: authz.permisos
     };
 
-    const token = jwt.sign(payload, JWT_SECRET, { expiresIn: '8h' });
+    const accessToken = issueAccessToken(payload, { roles: authz.roles });
 
-    res.cookie('access_token', token, {
-      ...authCookieOptions(),
-      maxAge: 1000 * 60 * 60 * 8
-    });
+    res.cookie('access_token', accessToken.token, buildAccessTokenCookieOptions({
+      maxAgeMs: accessToken.cookieMaxAgeMs
+    }));
 
     const csrfToken = issueCsrf(req, res);
 
@@ -449,13 +439,13 @@ router.post('/logout', authRequired, async (req, res) => {
     console.error('Error cerrando sesión en BD (logout):', err);
   }
 
-  res.clearCookie('access_token', authCookieOptions());
+  res.clearCookie('access_token', buildAccessTokenCookieOptions());
   res.clearCookie('csrf_token', csrfCookieOptions());
 
   return res.json({ message: 'Logout exitoso' });
 });
 
-router.get('/me', authRequired, requireActiveSession, requireSessionTouchMiddleware, async (req, res) => {
+router.get('/me', authRequired, requireActiveSession, refreshKitchenDisplaySession, requireSessionTouchMiddleware, async (req, res) => {
   const csrfToken = issueCsrf(req, res, { reuseIfPresent: true });
   const usuario = { ...(req.user || {}) };
   const idUsuario = Number.parseInt(String(usuario?.id_usuario ?? ''), 10);

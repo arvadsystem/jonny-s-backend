@@ -1,4 +1,5 @@
 import jwt from 'jsonwebtoken';
+import { buildAccessTokenCookieOptions } from '../utils/security/authCookieOptions.js';
 
 const FALLBACK_JWT_SECRET = 'CAMBIA_ESTE_SECRET_EN_ENV';
 const JWT_SECRET = process.env.JWT_SECRET || (process.env.NODE_ENV === 'production' ? '' : FALLBACK_JWT_SECRET);
@@ -11,16 +12,6 @@ const normalizeSameSite = (value, fallback) => {
     return normalized;
   }
   return fallback;
-};
-
-const accessTokenCookieOptions = () => {
-  const isProd = process.env.NODE_ENV === 'production';
-  return {
-    path: '/',
-    secure: String(process.env.AUTH_COOKIE_SECURE || '').toLowerCase() === 'true' || isProd,
-    sameSite: normalizeSameSite(process.env.AUTH_COOKIE_SAMESITE, isProd ? 'none' : 'lax'),
-    domain: String(process.env.AUTH_COOKIE_DOMAIN || '').trim() || undefined
-  };
 };
 
 const csrfTokenCookieOptions = () => {
@@ -86,7 +77,7 @@ export const authRequired = (req, res, next) => {
     return next();
   } catch (err) {
     // Si el token expiró o es inválido, limpiamos cookies
-    res.clearCookie('access_token', accessTokenCookieOptions());
+    res.clearCookie('access_token', buildAccessTokenCookieOptions());
     res.clearCookie('csrf_token', csrfTokenCookieOptions());
 
     return res.status(401).json({ error: true, message: 'Sesión expirada o inválida' });

@@ -1,4 +1,5 @@
 const METHOD_CODES = Object.freeze(['EFECTIVO', 'TARJETA', 'TRANSFERENCIA']);
+export const OTHER_NON_CASH_METHOD_CODE = 'OTROS_NO_EFECTIVO';
 
 const roundMoney = (value) => Number(Number(value || 0).toFixed(2));
 const normalizeMethodCode = (value) => String(value || '').trim().toUpperCase();
@@ -46,6 +47,8 @@ export const MONEY_FINGERPRINT_KEYS = new Set([
   'total_reversado',
   'total_ingresos_manuales',
   'total_egresos_manuales',
+  'ventas_efectivo_netas',
+  'ventas_no_efectivo_netas',
   'efectivo_teorico',
   'tarjeta_teorico',
   'transferencia_teorico',
@@ -119,8 +122,8 @@ export const buildSegmentedArqueoComputation = ({
     ? Number(threshold)
     : 0;
 
-  let totalTeorico = 0;
-  let totalDeclarado = 0;
+  let totalTeoricoSegmentado = 0;
+  let totalDeclaradoSegmentado = 0;
   const rows = [];
   for (const method of methodCatalog) {
     const code = normalizeMethodCode(method.codigo);
@@ -159,8 +162,8 @@ export const buildSegmentedArqueoComputation = ({
       );
     }
 
-    totalTeorico = roundMoney(totalTeorico + montoTeoricoMetodo);
-    totalDeclarado = roundMoney(totalDeclarado + montoDeclaradoMetodo);
+    totalTeoricoSegmentado = roundMoney(totalTeoricoSegmentado + montoTeoricoMetodo);
+    totalDeclaradoSegmentado = roundMoney(totalDeclaradoSegmentado + montoDeclaradoMetodo);
     rows.push({
       id_metodo_pago: Number(method.id_metodo_pago),
       metodo_pago_codigo: code,
@@ -176,6 +179,50 @@ export const buildSegmentedArqueoComputation = ({
       completado_automaticamente: autoComplete
     });
   }
+
+  const totalTeorico = snapshot?.totalTeorico === null || snapshot?.totalTeorico === undefined
+    ? totalTeoricoSegmentado
+    : roundMoney(snapshot.totalTeorico);
+
+  // Fila automatica y no editable: agrupa TODO metodo activo con afecta_efectivo
+  // = false que no sea TARJETA/TRANSFERENCIA (OTRO y cualquier metodo futuro),
+  // para que el detalle visible nunca deje dinero fuera de una fila (evita que
+  // el residual se sume "en silencio" al total declarado, como ocurria antes).
+  // monto_teorico conserva el valor real (puede ser negativo, p. ej. una
+  // reversion de sesion cruzada); monto_declarado se ancla en 0 como piso
+  // porque la columna persistida no admite valores negativos (ck_ccam/ck_ccvm
+  // monto_declarado >= 0, fuera del alcance de este cambio). Por eso
+  // completado_automaticamente/requiere_revision son fijos: nunca depende de
+  // un ingreso manual ni bloquea el cierre.
+  const otrosMontoTeorico = roundMoney(totalTeorico - totalTeoricoSegmentado);
+  const otrosMontoDeclarado = Math.max(0, otrosMontoTeorico);
+  const otrosDiferencia = roundMoney(otrosMontoDeclarado - otrosMontoTeorico);
+  // cajas_cierres_arqueos_metodos.id_metodo_pago es NOT NULL con FK real a
+  // cat_metodos_pago (fk_ccam_metodo): no admite NULL ni un sentinel
+  // inexistente. El snapshot resuelve un id real (cualquier metodo activo o
+  // no que no sea EFECTIVO/TARJETA/TRANSFERENCIA) como ancla de la fila
+  // agrupada; metodo_pago_codigo sigue siendo la fuente de verdad semantica.
+  const otrosIdMetodoPago = Number.isFinite(Number(snapshot?.otrosNoEfectivoIdMetodoPago))
+    ? Number(snapshot.otrosNoEfectivoIdMetodoPago)
+    : null;
+  rows.push({
+    id_metodo_pago: otrosIdMetodoPago,
+    metodo_pago_codigo: OTHER_NON_CASH_METHOD_CODE,
+    monto_teorico: otrosMontoTeorico,
+    monto_declarado: otrosMontoDeclarado,
+    diferencia: otrosDiferencia,
+    cantidad_referencias: null,
+    observacion: null,
+    requiere_revision: false,
+    observacion_requerida: false,
+    observacion_presente: false,
+    resultado: resolveArqueoResultado(otrosDiferencia),
+    completado_automaticamente: true
+  });
+
+  // Construidos a partir de las filas (incluida OTROS_NO_EFECTIVO) para que la
+  // suma del detalle visible coincida siempre, exactamente, con estos totales.
+  const totalDeclarado = roundMoney(totalDeclaradoSegmentado + otrosMontoDeclarado);
 
   return {
     rows,

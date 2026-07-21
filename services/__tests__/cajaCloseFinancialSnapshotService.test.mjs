@@ -3,6 +3,147 @@ import { describe, it } from 'node:test';
 import { loadCajaCloseFinancialSnapshot } from '../cajaCloseFinancialSnapshotService.js';
 
 describe('loadCajaCloseFinancialSnapshot', () => {
+  it('conserva efectivo teorico negativo exacto cuando egresos superan apertura', async () => {
+    const queryRunner = {
+      async query(sql) {
+        assert.match(sql, /sb\.monto_apertura\s*\+ at\.ventas_efectivo_netas\s*\+ COALESCE\(mm\.ingresos_manuales, 0\)\s*- COALESCE\(mm\.egresos_manuales, 0\)/);
+        return {
+          rows: [{
+            id_sesion_caja: '9',
+            monto_apertura: '3000.00',
+            ventas_efectivo_netas: '0.00',
+            ventas_tarjeta_netas: '0.00',
+            ventas_transferencia_netas: '0.00',
+            ventas_no_efectivo_netas: '0.00',
+            ingresos_manuales: '0.00',
+            egresos_manuales: '16763.00',
+            efectivo_teorico: '-13763.00',
+            tarjeta_teorico: '0.00',
+            transferencia_teorico: '0.00',
+            total_teorico: '-13763.00',
+            metodos_pago_invalidos: [],
+            metodos: [{
+              id_metodo_pago: 1,
+              codigo: 'EFECTIVO',
+              ventas_brutas: '0.00',
+              reversiones: '0.00',
+              ventas_netas: '0.00',
+              monto_teorico: '-13763.00'
+            }],
+            fingerprint: {
+              total_egresos_manuales: '16763.00',
+              efectivo_teorico: '-13763.00',
+              total_teorico: '-13763.00'
+            }
+          }]
+        };
+      }
+    };
+
+    const snapshot = await loadCajaCloseFinancialSnapshot({
+      queryRunner,
+      idSesionCaja: '9'
+    });
+
+    assert.equal(snapshot.montoApertura, 3000);
+    assert.equal(snapshot.ventasEfectivoNetas, 0);
+    assert.equal(snapshot.ingresosManuales, 0);
+    assert.equal(snapshot.egresosManuales, 16763);
+    assert.equal(snapshot.efectivoTeorico, -13763);
+    assert.equal(snapshot.totalTeorico, -13763);
+    assert.equal(snapshot.metodos.find((row) => row.codigo === 'EFECTIVO').monto_teorico, -13763);
+  });
+
+  it('incluye OTRO y futuros metodos activos no efectivos sin ampliar el arqueo segmentado', async () => {
+    const calls = [];
+    const queryRunner = {
+      async query(sql) {
+        calls.push(sql);
+        return {
+          rows: [{
+            id_sesion_caja: '20',
+            monto_apertura: '0',
+            ventas_efectivo_netas: '100',
+            ventas_tarjeta_netas: '200',
+            ventas_transferencia_netas: '300',
+            ventas_no_efectivo_netas: '900',
+            ingresos_manuales: '0',
+            egresos_manuales: '0',
+            efectivo_teorico: '100',
+            tarjeta_teorico: '200',
+            transferencia_teorico: '300',
+            total_teorico: '1000',
+            metodos_pago_invalidos: [],
+            metodos: [
+              { id_metodo_pago: 1, codigo: 'EFECTIVO', ventas_brutas: '100', reversiones: '0', ventas_netas: '100', monto_teorico: '100' },
+              { id_metodo_pago: 2, codigo: 'TARJETA', ventas_brutas: '200', reversiones: '0', ventas_netas: '200', monto_teorico: '200' },
+              { id_metodo_pago: 3, codigo: 'TRANSFERENCIA', ventas_brutas: '300', reversiones: '0', ventas_netas: '300', monto_teorico: '300' }
+            ],
+            fingerprint: {
+              cantidad_cobros: 4,
+              total_cobros: '1000',
+              ventas_efectivo_netas: '100',
+              ventas_no_efectivo_netas: '900',
+              efectivo_teorico: '100',
+              total_teorico: '1000'
+            }
+          }]
+        };
+      }
+    };
+
+    const snapshot = await loadCajaCloseFinancialSnapshot({
+      queryRunner,
+      idSesionCaja: '20'
+    });
+
+    assert.equal(snapshot.ventasEfectivoNetas, 100);
+    assert.equal(snapshot.ventasNoEfectivoNetas, 900);
+    assert.equal(snapshot.totalTeorico, 1000);
+    assert.equal(snapshot.fingerprint.ventas_no_efectivo_netas, 900);
+    assert.deepEqual(snapshot.metodos.map((method) => method.codigo), [
+      'EFECTIVO',
+      'TARJETA',
+      'TRANSFERENCIA'
+    ]);
+    assert.match(calls[0], /pm\.afecta_efectivo/);
+    assert.match(calls[0], /WHEN mt\.afecta_efectivo IS TRUE/);
+    assert.match(calls[0], /WHEN mt\.afecta_efectivo IS FALSE/);
+    assert.match(calls[0], /\+ at\.ventas_no_efectivo_netas/);
+    assert.doesNotMatch(calls[0], /codigo\) = ANY\(ARRAY\['EFECTIVO','TARJETA','TRANSFERENCIA'\]::text\[\]\)\s*\),\s*payments AS/);
+  });
+
+  it('rechaza cobros con metodo inexistente, inactivo o sin clasificacion contable', async () => {
+    const queryRunner = {
+      async query() {
+        return {
+          rows: [{
+            id_sesion_caja: '21',
+            metodos_pago_invalidos: [{
+              id_metodo_pago: 99,
+              codigo: 'LEGACY',
+              motivo: 'INACTIVO'
+            }]
+          }]
+        };
+      }
+    };
+
+    await assert.rejects(
+      loadCajaCloseFinancialSnapshot({ queryRunner, idSesionCaja: '21' }),
+      (error) => {
+        assert.equal(error.code, 'VENTAS_CAJAS_METODO_PAGO_NO_CONTABILIZABLE');
+        assert.equal(error.httpStatus, 409);
+        assert.deepEqual(error.details.metodos, [{
+          id_metodo_pago: 99,
+          codigo: 'LEGACY',
+          motivo: 'INACTIVO'
+        }]);
+        return true;
+      }
+    );
+  });
+
   it('ejecuta exactamente una consulta y normaliza metodos/fingerprint', async () => {
     const calls = [];
     const queryRunner = {
@@ -22,6 +163,7 @@ describe('loadCajaCloseFinancialSnapshot', () => {
             tarjeta_teorico: '0',
             transferencia_teorico: '0',
             total_teorico: '0',
+            metodos_pago_invalidos: [],
             metodos: [
               { id_metodo_pago: 1, codigo: 'EFECTIVO', ventas_brutas: '0', reversiones: '0', ventas_netas: '0', monto_teorico: '0' },
               { id_metodo_pago: 2, codigo: 'TARJETA', ventas_brutas: '0', reversiones: '0', ventas_netas: '0', monto_teorico: '0' },

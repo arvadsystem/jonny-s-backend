@@ -29,6 +29,96 @@ describe('caja close computation', () => {
     assert.equal(tarjeta.observacion_requerida, false);
   });
 
+  it('agrupa metodos no segmentados (OTRO, futuros) en una fila unica OTROS_NO_EFECTIVO visible', () => {
+    const result = buildSegmentedArqueoComputation({
+      snapshot: {
+        totalTeorico: 1000,
+        metodos: [
+          { id_metodo_pago: 1, codigo: 'EFECTIVO', ventas_brutas: 100, monto_teorico: 100 },
+          { id_metodo_pago: 2, codigo: 'TARJETA', ventas_brutas: 200, monto_teorico: 200 },
+          { id_metodo_pago: 3, codigo: 'TRANSFERENCIA', ventas_brutas: 300, monto_teorico: 300 }
+        ]
+      },
+      payloadRows: [
+        { metodo_pago_codigo: 'EFECTIVO', monto_declarado: 100 },
+        { metodo_pago_codigo: 'TARJETA', monto_declarado: 200, cantidad_referencias: 1 },
+        { metodo_pago_codigo: 'TRANSFERENCIA', monto_declarado: 300, cantidad_referencias: 1 }
+      ],
+      threshold: 0,
+      requireObservacionOnDifference: false
+    });
+
+    assert.deepEqual(result.rows.map((row) => row.metodo_pago_codigo), [
+      'EFECTIVO',
+      'TARJETA',
+      'TRANSFERENCIA',
+      'OTROS_NO_EFECTIVO'
+    ]);
+    const otros = result.rows.at(-1);
+    assert.equal(otros.id_metodo_pago, null);
+    assert.equal(otros.monto_teorico, 400);
+    assert.equal(otros.monto_declarado, 400);
+    assert.equal(otros.diferencia, 0);
+    assert.equal(otros.completado_automaticamente, true);
+    assert.equal(otros.requiere_revision, false);
+    assert.equal(result.monto_teorico_total, 1000);
+    assert.equal(result.monto_declarado_total, 1000);
+    assert.equal(result.diferencia_total, 0);
+    assert.equal(
+      result.rows.reduce((sum, row) => sum + row.monto_declarado, 0),
+      result.monto_declarado_total
+    );
+    assert.equal(
+      result.rows.reduce((sum, row) => sum + row.monto_teorico, 0),
+      result.monto_teorico_total
+    );
+  });
+
+  it('ancla monto_declarado de OTROS_NO_EFECTIVO en 0 cuando el residual neto es negativo, sin exigir revision', () => {
+    const result = buildSegmentedArqueoComputation({
+      snapshot: {
+        totalTeorico: 2700,
+        metodos: [
+          { id_metodo_pago: 1, codigo: 'EFECTIVO', ventas_brutas: 0, monto_teorico: 3000 },
+          { id_metodo_pago: 2, codigo: 'TARJETA', ventas_brutas: 0, monto_teorico: 0 },
+          { id_metodo_pago: 3, codigo: 'TRANSFERENCIA', ventas_brutas: 0, monto_teorico: 0 }
+        ]
+      },
+      payloadRows: [{ metodo_pago_codigo: 'EFECTIVO', monto_declarado: 3000 }],
+      threshold: 0,
+      requireObservacionOnDifference: true
+    });
+
+    const otros = result.rows.find((row) => row.metodo_pago_codigo === 'OTROS_NO_EFECTIVO');
+    assert.equal(otros.monto_teorico, -300);
+    assert.equal(otros.monto_declarado, 0);
+    assert.ok(otros.monto_declarado >= 0);
+    assert.equal(otros.requiere_revision, false);
+    assert.equal(otros.observacion_requerida, false);
+  });
+
+  it('conserva total positivo cuando el efectivo teorico es negativo', () => {
+    const result = buildSegmentedArqueoComputation({
+      snapshot: {
+        totalTeorico: 500,
+        metodos: [
+          { id_metodo_pago: 1, codigo: 'EFECTIVO', ventas_brutas: 0, monto_teorico: -2000 },
+          { id_metodo_pago: 2, codigo: 'TARJETA', ventas_brutas: 2500, monto_teorico: 2500 },
+          { id_metodo_pago: 3, codigo: 'TRANSFERENCIA', ventas_brutas: 0, monto_teorico: 0 }
+        ]
+      },
+      payloadRows: [
+        { metodo_pago_codigo: 'EFECTIVO', monto_declarado: 0 },
+        { metodo_pago_codigo: 'TARJETA', monto_declarado: 2500, cantidad_referencias: 1 }
+      ],
+      threshold: 0,
+      requireObservacionOnDifference: false
+    });
+
+    assert.equal(result.monto_teorico_total, 500);
+    assert.equal(result.diferencia_total, 2000);
+  });
+
   it('compara ids bigint como cadenas canonicas', () => {
     assert.equal(fingerprintValuesEqual('max_id_factura_cobro', '9007199254740992', '9007199254740993'), false);
     assert.equal(fingerprintValuesEqual('max_id_reversion', '9223372036854775807', '9223372036854775807'), true);
@@ -39,6 +129,8 @@ describe('caja close computation', () => {
     assert.equal(fingerprintValuesEqual('cantidad_cobros', '2', 2), true);
     assert.equal(fingerprintValuesEqual('cantidad_movimientos', '2', 3), false);
     assert.equal(fingerprintValuesEqual('total_cobros', '10.004', '10.00'), true);
+    assert.equal(fingerprintValuesEqual('ventas_no_efectivo_netas', '900.004', '900.00'), true);
+    assert.equal(fingerprintValuesEqual('ventas_no_efectivo_netas', '900.01', '900.02'), false);
     assert.equal(fingerprintValuesEqual('total_teorico', '10.01', '10.02'), false);
   });
 });
