@@ -175,7 +175,6 @@ export const buildComandaCocinaHtml = (comanda, options = {}) => {
   const orderFontPx = isNarrowTicket ? 13 : 14;
   const dateFontPx = isNarrowTicket ? 10.5 : 11.5;
   const metaFontPx = isNarrowTicket ? 10.5 : 11;
-  const customerNameFontPx = metaFontPx;
   const qtyFontPx = isNarrowTicket ? 15 : 17;
   const nameFontPx = isNarrowTicket ? 13.5 : 15.5;
   const tagFontPx = isNarrowTicket ? 10 : 10.8;
@@ -312,30 +311,8 @@ export const buildComandaCocinaHtml = (comanda, options = {}) => {
         overflow-wrap: anywhere;
         word-break: break-word;
       }
-${legacy ? '' : `      .comanda-cocina-print__customer {
-        display: grid;
-        gap: 2px;
-        width: 100%;
-        min-width: 0;
-        max-width: 100%;
-        margin: 4px 0 5px;
-        font-size: ${metaFontPx}px;
-      }
-      .comanda-cocina-print__customer-label {
-        display: block;
-        font-weight: 700;
-      }
-      .comanda-cocina-print__customer-name {
-        display: block;
-        width: 100%;
-        min-width: 0;
-        max-width: 100%;
-        font-size: ${customerNameFontPx}px;
-        line-height: 1.2;
+${legacy ? '' : `      .comanda-cocina-print__customer-name {
         font-weight: 800;
-        white-space: normal;
-        overflow-wrap: anywhere;
-        word-break: break-word;
       }
 ` }      .comanda-cocina-print__items {
         display: grid;
@@ -437,9 +414,9 @@ ${legacy ? '' : `      .comanda-cocina-print__customer {
 ${legacy ? `          <div class="comanda-cocina-print__meta-row">
             <span>Cliente</span>
             <span>${escapeHtml(cliente)}</span>
-          </div>` : `          <div class="comanda-cocina-print__customer">
-            <span class="comanda-cocina-print__customer-label">Cliente</span>
-            <strong class="comanda-cocina-print__customer-name">${escapeHtml(cliente)}</strong>
+          </div>` : `          <div class="comanda-cocina-print__meta-row">
+            <span>Cliente</span>
+            <span class="comanda-cocina-print__customer-name">${escapeHtml(cliente)}</span>
           </div>`}
           ${telefonoCliente ? `
           <div class="comanda-cocina-print__meta-row">

@@ -157,7 +157,8 @@ const countSplitLines = (cuentaDividida) => {
 const estimateCustomerNameLines = (value, widthMm) => {
   const customerName = cleanText(value) || 'Consumidor final';
   const fontSize = widthMm === 58 ? 6.2 : 7;
-  const usableWidthPt = getContentWidthPt(widthMm);
+  const labelWidthPt = widthMm === 58 ? 38 : 42;
+  const usableWidthPt = Math.max(getContentWidthPt(widthMm) - labelWidthPt - 2, fontSize);
   const averageCharacterWidthPt = fontSize * 0.58;
   const estimatedCharactersPerLine = Math.max(1, Math.floor(usableWidthPt / averageCharacterWidthPt));
   const words = customerName.split(' ');
@@ -236,17 +237,19 @@ const metaRow = (label, value, widthMm = 80) => ({
   margin: [0, 1, 0, 1]
 });
 
-const customerNameBlock = (value, widthMm) => ({
-  stack: [
-    text('Cliente', { bold: true }),
+const customerNameRow = (value, widthMm) => ({
+  columns: [
+    text('Cliente', { width: widthMm === 58 ? 38 : 42, bold: true }),
     text(value || 'Consumidor final', {
+      width: '*',
+      alignment: 'right',
       bold: true,
       fontSize: widthMm === 58 ? 6.2 : 7,
-      lineHeight: 1.2,
-      margin: [0, 1, 0, 4]
+      lineHeight: 1.2
     })
   ],
-  margin: [0, 1, 0, 1]
+  columnGap: 2,
+  margin: [0, 1, 0, 3]
 });
 
 const buildHeader = (venta, widthMm) => {
@@ -320,7 +323,7 @@ const buildMetaBlock = (venta, widthMm, { legacy = false } = {}) => {
     metaRow('Cajero', venta.nombre_usuario || '--', widthMm),
     legacy
       ? metaRow('Cliente', venta.cliente_nombre || 'Consumidor final', widthMm)
-      : customerNameBlock(venta.cliente_nombre, widthMm)
+      : customerNameRow(venta.cliente_nombre, widthMm)
   ];
 
   if (venta.cliente_rtn) rows.push(metaRow('RTN cliente', venta.cliente_rtn, widthMm));

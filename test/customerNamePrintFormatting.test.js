@@ -87,8 +87,8 @@ for (const [widthMm, expectedFontSize] of [[58, 6.2], [80, 7]]) {
       assert.equal(customerNode.bold, true);
       assert.equal(customerNode.fontSize, expectedFontSize);
       assert.equal(customerNode.lineHeight, 1.2);
-      assert.deepEqual(customerNode.margin, [0, 1, 0, 4]);
-      assert.equal(customerNode.width, undefined);
+      assert.equal(customerNode.width, '*');
+      assert.equal(customerNode.alignment, 'right');
       assert.ok(nextSectionIndex > customerIndex);
       assert.equal(definition.pageSize.width, mmToPt(widthMm));
 
@@ -113,15 +113,10 @@ for (const [widthMm, expectedFontSize] of [[58, 10.5], [80, 11]]) {
       const customerIndex = html.indexOf(customerName);
       const phoneIndex = html.indexOf('Telefono');
 
-      assert.match(html, /class="comanda-cocina-print__customer"/);
-      assert.match(html, /class="comanda-cocina-print__customer-label">Cliente<\/span>/);
+      assert.match(html, /class="comanda-cocina-print__meta-row">\s*<span>Cliente<\/span>\s*<span class="comanda-cocina-print__customer-name">/);
       assert.match(html, new RegExp(`font-size:\\s*${expectedFontSize}px`));
       assert.match(customerCss, /font-weight:\s*800/);
-      assert.match(customerCss, /line-height:\s*1\.2/);
-      assert.match(customerCss, /white-space:\s*normal/);
-      assert.match(customerCss, /overflow-wrap:\s*anywhere/);
-      assert.match(customerCss, /word-break:\s*break-word/);
-      assert.doesNotMatch(customerCss, /position:\s*absolute|(?:^|\s)height:\s*\d|overflow:\s*hidden/);
+      assert.doesNotMatch(customerCss, /font-size|position|height|overflow/);
       assert.ok(phoneIndex > customerIndex);
       assert.ok(Buffer.byteLength(html, 'utf8') < MAX_CANONICAL_HTML_BYTES);
     });
@@ -133,7 +128,7 @@ test('los renderers actuales conservan sus fallbacks cuando no hay nombre', () =
   assert.ok(pdfNodes.some((node) => node.text === 'Consumidor final' && node.fontSize === 6.2));
 
   const html = buildComandaCocinaHtml(buildComanda(null), { widthMm: 58 });
-  assert.match(html, /class="comanda-cocina-print__customer-name">N\/D<\/strong>/);
+  assert.match(html, /class="comanda-cocina-print__customer-name">N\/D<\/span>/);
 });
 
 test('legacy conserva la fila estrecha y no incorpora las clases nuevas', () => {
