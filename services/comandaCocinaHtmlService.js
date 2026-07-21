@@ -175,7 +175,7 @@ export const buildComandaCocinaHtml = (comanda, options = {}) => {
   const orderFontPx = isNarrowTicket ? 13 : 14;
   const dateFontPx = isNarrowTicket ? 10.5 : 11.5;
   const metaFontPx = isNarrowTicket ? 10.5 : 11;
-  const customerNameFontPx = isNarrowTicket ? 21 : 22;
+  const customerNameFontPx = isNarrowTicket ? 15.75 : 16.5;
   const qtyFontPx = isNarrowTicket ? 15 : 17;
   const nameFontPx = isNarrowTicket ? 13.5 : 15.5;
   const tagFontPx = isNarrowTicket ? 10 : 10.8;
