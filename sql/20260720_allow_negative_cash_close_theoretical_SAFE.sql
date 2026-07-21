@@ -3,6 +3,9 @@
 
 BEGIN;
 
+SET LOCAL lock_timeout = '5s';
+SET LOCAL statement_timeout = '120s';
+
 DO $migration$
 DECLARE
   constraint_columns smallint[];

@@ -24,6 +24,8 @@ describe('monto teorico negativo en cierre de caja', () => {
     assert.match(safeSource, /conkey/);
     assert.match(safeSource, /pg_get_expr\(c\.conbin, c\.conrelid\)/);
     assert.match(safeSource, /monto_teorico_cierre>=0/);
+    assert.match(safeSource, /SET LOCAL lock_timeout = '5s';/);
+    assert.match(safeSource, /SET LOCAL statement_timeout = '120s';/);
     assert.match(safeSource, /ARRAY\[target_column\]::smallint\[\]/);
     assert.match(safeSource, /DROP CONSTRAINT IF EXISTS ck_cajas_sesiones_monto_teorico/);
     assert.match(safeSource, /DROP CONSTRAINT IF EXISTS ck_cajas_cierres_monto_teorico/);
@@ -31,7 +33,23 @@ describe('monto teorico negativo en cierre de caja', () => {
     assert.doesNotMatch(safeSource, /monto_apertura\s*>?=|monto_declarado_cierre\s*>?=|monto_ventas|monto_ingresos_manuales|monto_egresos_manuales/i);
   });
 
-  it('VERIFY demuestra el caso exacto y consulta el movimiento 17 sin mutarlo', () => {
+  it('VERIFY detecta CHECK equivalentes por columna y conserva controles no negativos', () => {
+    assert.match(verifySource, /c\.conkey @> ARRAY\[a\.attnum\]::smallint\[\]/);
+    assert.match(verifySource, /checks_equivalentes_no_negativos/);
+    assert.match(verifySource, /permite_valores_negativos/);
+    for (const column of [
+      'monto_apertura',
+      'monto_declarado_cierre',
+      'monto_ventas_efectivo',
+      'monto_ventas_no_efectivo',
+      'monto_ingresos_manuales',
+      'monto_egresos_manuales',
+      'monto_declarado'
+    ]) {
+      assert.match(verifySource, new RegExp(column));
+    }
+    assert.match(verifySource, /c\.convalidated/);
+    assert.match(verifySource, /control_no_negativo_presente_y_validado/);
     assert.match(verifySource, /3000\.00::numeric\(14,2\)/);
     assert.match(verifySource, /16763\.00::numeric\(14,2\)/);
     assert.match(verifySource, /efectivo_teorico_esperado/);
@@ -40,8 +58,15 @@ describe('monto teorico negativo en cierre de caja', () => {
   });
 
   it('ROLLBACK restaura ambos CHECK y falla cerrado si existen negativos', () => {
+    assert.match(rollbackSource, /SET LOCAL lock_timeout = '5s';/);
+    assert.match(rollbackSource, /SET LOCAL statement_timeout = '120s';/);
     assert.match(rollbackSource, /WHERE monto_teorico_cierre < 0/g);
     assert.match(rollbackSource, /Rollback bloqueado/);
+    assert.match(rollbackSource, /constraint_columns IS DISTINCT FROM ARRAY\[target_column\]::smallint\[\]/g);
+    assert.match(rollbackSource, /constraint_validated IS NOT TRUE/g);
+    assert.match(rollbackSource, /monto_teorico_cierreisnullormonto_teorico_cierre>=0/);
+    assert.match(rollbackSource, /monto_teorico_cierre>=0/);
+    assert.match(rollbackSource, /existe con una definicion incorrecta o no validada/g);
     assert.match(rollbackSource, /ADD CONSTRAINT ck_cajas_sesiones_monto_teorico/);
     assert.match(rollbackSource, /ADD CONSTRAINT ck_cajas_cierres_monto_teorico/);
     assert.match(rollbackSource, /VALIDATE CONSTRAINT ck_cajas_sesiones_monto_teorico/);

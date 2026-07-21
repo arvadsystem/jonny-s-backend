@@ -2992,7 +2992,10 @@ const buildSessionDetailPayload = async (client, session) => {
       metodos: metodosPorValidacion.get(idValidacion) || []
     };
   });
-  const financialSummary = await fetchSessionMethodFinancialSummary(client, session.id_sesion_caja);
+  const financialSummary = await loadCajaCloseFinancialSnapshot({
+    queryRunner: client,
+    idSesionCaja: session.id_sesion_caja
+  });
   const cierre = cierreResult.rows[0] || null;
   const cierreNotificacion = cierreNotificacionResult.rows[0] || null;
   const cierreConCorreo = cierre
@@ -5646,7 +5649,10 @@ router.patch('/ventas/cajas/cierres/:id', checkPermission(['VENTAS_CAJAS_SESION_
       throw createCajaError(400, 'VENTAS_CAJAS_CLOSE_AMOUNT_INVALID', 'Debe indicar un monto declarado valido.');
     }
 
-    const summary = await fetchSessionMethodFinancialSummary(client, cierre.id_sesion_caja);
+    const summary = await loadCajaCloseFinancialSnapshot({
+      queryRunner: client,
+      idSesionCaja: cierre.id_sesion_caja
+    });
     const montoTeorico = Number(summary.totalTeorico || 0);
     const diferencia = Number((montoDeclaradoFinal - montoTeorico).toFixed(2));
     const idResolucionCajaCuadra = await getCatalogId(client, 'RESOLUTIONS', 'CAJA_CUADRA');
@@ -6103,7 +6109,7 @@ router.post('/ventas/cajas/sesiones/:id/arqueos', checkPermission(['VENTAS_CAJAS
       );
     }
 
-    const resumen = await fetchSessionMethodFinancialSummary(client, idSesionCaja);
+    const resumen = await loadCajaCloseFinancialSnapshot({ queryRunner: client, idSesionCaja });
     const montoTeorico = Number(resumen.efectivoTeorico || 0);
     const diferencia = Number((montoContado - montoTeorico).toFixed(2));
     const insertArqueo = await client.query(

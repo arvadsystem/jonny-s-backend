@@ -108,6 +108,10 @@ const stripHtml = (html) => String(html || '').replace(/<[^>]+>/g, ' ').replace(
 describe('caja close email durable outbox', () => {
   it('calcula ventas netas totales una sola vez y redondea a dos decimales', () => {
     assert.equal(calculateTotalNetSales({
+      ventasEfectivoNetas: 0,
+      ventasNoEfectivoNetas: 0
+    }), 0);
+    assert.equal(calculateTotalNetSales({
       ventasEfectivoNetas: 30482,
       ventasNoEfectivoNetas: 3437,
       ventasTarjetaNetas: 99999,
@@ -121,6 +125,10 @@ describe('caja close email durable outbox', () => {
       ventasEfectivoNetas: null,
       ventasNoEfectivoNetas: undefined
     }), 0);
+    assert.equal(calculateTotalNetSales({
+      ventasEfectivoNetas: 100,
+      ventasNoEfectivoNetas: 900
+    }), 1000);
   });
 
   it('agrupa ventas en PDF y HTML con el mismo total y una sola columna monetaria', () => {

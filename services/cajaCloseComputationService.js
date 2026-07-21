@@ -46,6 +46,8 @@ export const MONEY_FINGERPRINT_KEYS = new Set([
   'total_reversado',
   'total_ingresos_manuales',
   'total_egresos_manuales',
+  'ventas_efectivo_netas',
+  'ventas_no_efectivo_netas',
   'efectivo_teorico',
   'tarjeta_teorico',
   'transferencia_teorico',
@@ -119,8 +121,8 @@ export const buildSegmentedArqueoComputation = ({
     ? Number(threshold)
     : 0;
 
-  let totalTeorico = 0;
-  let totalDeclarado = 0;
+  let totalTeoricoSegmentado = 0;
+  let totalDeclaradoSegmentado = 0;
   const rows = [];
   for (const method of methodCatalog) {
     const code = normalizeMethodCode(method.codigo);
@@ -159,8 +161,8 @@ export const buildSegmentedArqueoComputation = ({
       );
     }
 
-    totalTeorico = roundMoney(totalTeorico + montoTeoricoMetodo);
-    totalDeclarado = roundMoney(totalDeclarado + montoDeclaradoMetodo);
+    totalTeoricoSegmentado = roundMoney(totalTeoricoSegmentado + montoTeoricoMetodo);
+    totalDeclaradoSegmentado = roundMoney(totalDeclaradoSegmentado + montoDeclaradoMetodo);
     rows.push({
       id_metodo_pago: Number(method.id_metodo_pago),
       metodo_pago_codigo: code,
@@ -176,6 +178,12 @@ export const buildSegmentedArqueoComputation = ({
       completado_automaticamente: autoComplete
     });
   }
+
+  const totalTeorico = snapshot?.totalTeorico === null || snapshot?.totalTeorico === undefined
+    ? totalTeoricoSegmentado
+    : roundMoney(snapshot.totalTeorico);
+  const totalNoSegmentado = roundMoney(totalTeorico - totalTeoricoSegmentado);
+  const totalDeclarado = roundMoney(totalDeclaradoSegmentado + totalNoSegmentado);
 
   return {
     rows,
