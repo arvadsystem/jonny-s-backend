@@ -66,6 +66,24 @@ const cleanText = (value, fallback = 'No disponible') => {
 const cierreCode = (idCierreCaja) =>
   `CIE-${String(idCierreCaja || '').padStart(5, '0')}`;
 
+// Presentacion unicamente: el codigo tecnico persistido (metodo_pago_codigo)
+// sigue siendo EFECTIVO/TARJETA/TRANSFERENCIA/OTRO. Nunca mostrar el codigo
+// tecnico anterior OTROS_NO_EFECTIVO ni ningun codigo crudo con guion bajo;
+// un codigo desconocido cae al texto crudo como ultimo recurso.
+const METHOD_DISPLAY_LABELS = {
+  EFECTIVO: 'Efectivo',
+  TARJETA: 'Tarjeta',
+  TRANSFERENCIA: 'Transferencia',
+  OTRO: 'Otros no efectivo'
+};
+
+const resolveMethodDisplayLabel = (row) => {
+  const code = String(row?.metodo_pago_codigo || '').trim().toUpperCase();
+  return METHOD_DISPLAY_LABELS[code] || cleanText(row?.metodo_pago_codigo || row?.id_metodo_pago, 'N/A');
+};
+
+const AUTOMATIC_RECONCILIATION_NOTE = 'Conciliación automática del sistema';
+
 const resolveActorLabel = (actors, primaryNameKey, primaryUserKey) =>
   cleanText(actors?.[primaryNameKey] || actors?.[primaryUserKey], 'No disponible');
 
@@ -149,13 +167,15 @@ const buildArqueosTableBody = (arqueos = []) => {
   }
 
   arqueos.forEach((row) => {
+    const codigo = String(row.metodo_pago_codigo || '').trim().toUpperCase();
+    const isAutomatic = codigo === 'OTRO' || Boolean(row.completado_automaticamente) || row.editable === false;
     body.push([
-      cleanText(row.metodo_pago_codigo || row.id_metodo_pago || 'N/A', 'N/A'),
+      resolveMethodDisplayLabel(row),
       { text: formatMoney(row.monto_teorico), alignment: 'right' },
       { text: formatMoney(row.monto_declarado), alignment: 'right' },
       { text: formatMoney(row.diferencia), alignment: 'right' },
       row.requiere_revision ? 'Si' : 'No',
-      cleanText(row.observacion, 'N/A')
+      cleanText(row.observacion, isAutomatic ? AUTOMATIC_RECONCILIATION_NOTE : 'N/A')
     ]);
   });
 

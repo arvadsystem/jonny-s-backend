@@ -1,5 +1,13 @@
 const METHOD_CODES = Object.freeze(['EFECTIVO', 'TARJETA', 'TRANSFERENCIA']);
-export const OTHER_NON_CASH_METHOD_CODE = 'OTROS_NO_EFECTIVO';
+// Codigo tecnico persistido para la fila agrupada automatica. Debe coincidir
+// exactamente con cat_metodos_pago.codigo = 'OTRO' (fk_ccam_metodo /
+// fk_ccvm_metodo apuntan al mismo id que este codigo). "Otros no efectivo" es
+// unicamente una etiqueta de presentacion (display_name / frontend), nunca el
+// valor persistido de metodo_pago_codigo.
+export const OTHER_NON_CASH_METHOD_CODE = 'OTRO';
+export const OTHER_NON_CASH_DISPLAY_NAME = 'Otros no efectivo';
+const OTHER_NON_CASH_AUTO_OBSERVATION =
+  'Conciliación automática: el saldo neto de otros métodos no efectivo es negativo por reversiones o ajustes.';
 
 const roundMoney = (value) => Number(Number(value || 0).toFixed(2));
 const normalizeMethodCode = (value) => String(value || '').trim().toUpperCase();
@@ -74,23 +82,46 @@ export const fingerprintValuesEqual = (key, left, right) => {
   return String(left ?? '') === String(right ?? '');
 };
 
+const describeCatalogState = (entry) => {
+  if (!entry?.id_metodo_pago) return 'NO_EXISTE';
+  return entry.activo ? 'ACTIVO' : 'INACTIVO';
+};
+
+// 5.1: EFECTIVO/TARJETA/TRANSFERENCIA deben tener exactamente una
+// configuracion valida (id positivo, activo, afecta_efectivo correcto) antes
+// de escribir nada. snapshot.catalogValidation viene de una resolucion por
+// codigo exacto (ver cajaCloseFinancialSnapshotService); ya no se fabrican
+// filas con id_metodo_pago=null que pasen esta validacion por "tener codigo".
+const assertCoreCatalogValid = (catalogValidation) => {
+  for (const codigo of METHOD_CODES) {
+    const entry = catalogValidation?.[codigo];
+    if (!entry || !entry.valido) {
+      throw createCajaError(
+        409,
+        'VENTAS_CAJAS_METODO_CATALOGO_INCOMPLETO',
+        `El catalogo de metodos de pago no tiene una configuracion valida para ${codigo}.`,
+        {
+          codigo,
+          estado_encontrado: describeCatalogState(entry),
+          afecta_efectivo_encontrado: entry?.afecta_efectivo ?? null,
+          motivo: entry?.motivo || 'NO_EXISTE'
+        }
+      );
+    }
+  }
+};
+
 export const buildSegmentedArqueoComputation = ({
   snapshot,
   payloadRows,
   threshold,
   requireObservacionOnDifference = true
 }) => {
+  const catalogValidation = snapshot?.catalogValidation || {};
+  assertCoreCatalogValid(catalogValidation);
+
   const methodCatalog = Array.isArray(snapshot?.metodos) ? snapshot.metodos : [];
   const methodCodes = new Set(methodCatalog.map((row) => normalizeMethodCode(row.codigo)));
-  for (const requiredCode of METHOD_CODES) {
-    if (!methodCodes.has(requiredCode)) {
-      throw createCajaError(
-        409,
-        'VENTAS_CAJAS_METODO_CATALOGO_INCOMPLETO',
-        `No se encontro el metodo de pago requerido: ${requiredCode}.`
-      );
-    }
-  }
 
   const declaredByCode = new Map();
   for (const row of Array.isArray(payloadRows) ? payloadRows : []) {
@@ -180,49 +211,80 @@ export const buildSegmentedArqueoComputation = ({
     });
   }
 
-  const totalTeorico = snapshot?.totalTeorico === null || snapshot?.totalTeorico === undefined
-    ? totalTeoricoSegmentado
-    : roundMoney(snapshot.totalTeorico);
+  // 5.2/5.4: fila automatica y no editable "OTRO". Agrupa todo metodo activo
+  // con afecta_efectivo=false que no sea TARJETA/TRANSFERENCIA (OTRO y
+  // billeteras/enlaces de pago futuros). Solo se genera cuando existe
+  // actividad bruta o reversiones en ese grupo (5.2 "cuando generar la
+  // fila"); si el grupo esta completamente inactivo se omite, preservando el
+  // comportamiento de 3 filas para sesiones sin esa actividad.
+  const otrosNoEfectivo = snapshot?.otrosNoEfectivo || {
+    ventas_brutas: 0,
+    reversiones: 0,
+    ventas_netas: 0,
+    metodos_agrupados: []
+  };
+  const otrosVentasBrutas = roundMoney(otrosNoEfectivo.ventas_brutas);
+  const otrosReversionesAgrupadas = roundMoney(otrosNoEfectivo.reversiones);
+  const hasGroupedOtherActivity = otrosVentasBrutas !== 0 || otrosReversionesAgrupadas !== 0;
 
-  // Fila automatica y no editable: agrupa TODO metodo activo con afecta_efectivo
-  // = false que no sea TARJETA/TRANSFERENCIA (OTRO y cualquier metodo futuro),
-  // para que el detalle visible nunca deje dinero fuera de una fila (evita que
-  // el residual se sume "en silencio" al total declarado, como ocurria antes).
-  // monto_teorico conserva el valor real (puede ser negativo, p. ej. una
-  // reversion de sesion cruzada); monto_declarado se ancla en 0 como piso
-  // porque la columna persistida no admite valores negativos (ck_ccam/ck_ccvm
-  // monto_declarado >= 0, fuera del alcance de este cambio). Por eso
-  // completado_automaticamente/requiere_revision son fijos: nunca depende de
-  // un ingreso manual ni bloquea el cierre.
-  const otrosMontoTeorico = roundMoney(totalTeorico - totalTeoricoSegmentado);
-  const otrosMontoDeclarado = Math.max(0, otrosMontoTeorico);
-  const otrosDiferencia = roundMoney(otrosMontoDeclarado - otrosMontoTeorico);
-  // cajas_cierres_arqueos_metodos.id_metodo_pago es NOT NULL con FK real a
-  // cat_metodos_pago (fk_ccam_metodo): no admite NULL ni un sentinel
-  // inexistente. El snapshot resuelve un id real (cualquier metodo activo o
-  // no que no sea EFECTIVO/TARJETA/TRANSFERENCIA) como ancla de la fila
-  // agrupada; metodo_pago_codigo sigue siendo la fuente de verdad semantica.
-  const otrosIdMetodoPago = Number.isFinite(Number(snapshot?.otrosNoEfectivoIdMetodoPago))
-    ? Number(snapshot.otrosNoEfectivoIdMetodoPago)
-    : null;
-  rows.push({
-    id_metodo_pago: otrosIdMetodoPago,
-    metodo_pago_codigo: OTHER_NON_CASH_METHOD_CODE,
-    monto_teorico: otrosMontoTeorico,
-    monto_declarado: otrosMontoDeclarado,
-    diferencia: otrosDiferencia,
-    cantidad_referencias: null,
-    observacion: null,
-    requiere_revision: false,
-    observacion_requerida: false,
-    observacion_presente: false,
-    resultado: resolveArqueoResultado(otrosDiferencia),
-    completado_automaticamente: true
-  });
+  if (hasGroupedOtherActivity) {
+    const otroValidation = catalogValidation.OTRO;
+    if (!otroValidation || !otroValidation.valido) {
+      throw createCajaError(
+        409,
+        'VENTAS_CAJAS_OTROS_NO_EFECTIVO_CONFIG_INVALID',
+        'Existen ventas o reversiones en metodos no efectivo agrupados, pero el metodo OTRO no tiene una configuracion valida en el catalogo.',
+        {
+          codigo: 'OTRO',
+          estado_encontrado: describeCatalogState(otroValidation),
+          afecta_efectivo_encontrado: otroValidation?.afecta_efectivo ?? null,
+          motivo: otroValidation?.motivo || 'NO_EXISTE'
+        }
+      );
+    }
 
-  // Construidos a partir de las filas (incluida OTROS_NO_EFECTIVO) para que la
-  // suma del detalle visible coincida siempre, exactamente, con estos totales.
-  const totalDeclarado = roundMoney(totalDeclaradoSegmentado + otrosMontoDeclarado);
+    // monto_teorico conserva el valor real (puede ser negativo, p. ej.
+    // reversiones superiores a las ventas del grupo). monto_declarado se
+    // ancla en 0 como piso porque la columna persistida no admite valores
+    // negativos (ck_ccam/ck_ccvm monto_declarado >= 0). Cuando eso ocurre la
+    // diferencia queda visible y requiere_revision=true (5.4): nunca se
+    // marca una fila con diferencia distinta de cero como revisada.
+    const otrosMontoTeorico = roundMoney(otrosNoEfectivo.ventas_netas);
+    const otrosMontoDeclarado = otrosMontoTeorico >= 0 ? otrosMontoTeorico : 0;
+    const otrosDiferencia = roundMoney(otrosMontoDeclarado - otrosMontoTeorico);
+    const otrosRequiereRevision = otrosDiferencia !== 0;
+
+    totalTeoricoSegmentado = roundMoney(totalTeoricoSegmentado + otrosMontoTeorico);
+    totalDeclaradoSegmentado = roundMoney(totalDeclaradoSegmentado + otrosMontoDeclarado);
+    rows.push({
+      id_metodo_pago: otroValidation.id_metodo_pago,
+      metodo_pago_codigo: OTHER_NON_CASH_METHOD_CODE,
+      display_name: OTHER_NON_CASH_DISPLAY_NAME,
+      monto_teorico: otrosMontoTeorico,
+      monto_declarado: otrosMontoDeclarado,
+      diferencia: otrosDiferencia,
+      cantidad_referencias: null,
+      observacion: otrosRequiereRevision ? OTHER_NON_CASH_AUTO_OBSERVATION : null,
+      requiere_revision: otrosRequiereRevision,
+      observacion_requerida: false,
+      observacion_presente: otrosRequiereRevision,
+      resultado: resolveArqueoResultado(otrosDiferencia),
+      completado_automaticamente: true,
+      editable: false,
+      ventas_brutas_agrupadas: otrosVentasBrutas,
+      reversiones_agrupadas: otrosReversionesAgrupadas,
+      metodos_agrupados: Array.isArray(otrosNoEfectivo.metodos_agrupados)
+        ? otrosNoEfectivo.metodos_agrupados
+        : []
+    });
+  }
+
+  // 5.5: los totales se calculan EXCLUSIVAMENTE a partir de las filas finales
+  // (incluida OTRO cuando aplica), nunca desde un total independiente. Esto
+  // garantiza por construccion que sum(rows.monto_teorico) === total y
+  // sum(rows.monto_declarado) === total, sin sumar ningun grupo dos veces.
+  const totalTeorico = totalTeoricoSegmentado;
+  const totalDeclarado = totalDeclaradoSegmentado;
 
   return {
     rows,

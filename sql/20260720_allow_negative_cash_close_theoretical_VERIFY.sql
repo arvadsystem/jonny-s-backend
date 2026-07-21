@@ -1,5 +1,9 @@
 -- Verificacion exclusivamente de lectura, antes y despues del SAFE.
+-- Segura de ejecutar en produccion (solo SELECT, ningun DDL/DML).
 
+-- 1) Listado completo de CHECK sobre las tablas involucradas: sirve para
+-- confirmar por inspeccion que no aparecio un CHECK equivalente con nombre
+-- distinto a los tres que SAFE elimina.
 SELECT
   c.conrelid::regclass AS tabla,
   c.conname AS restriccion,
@@ -16,6 +20,24 @@ WHERE c.conrelid IN (
   AND c.contype = 'c'
 ORDER BY c.conrelid::regclass::text, c.conname;
 
+-- 2) Ausencia explicita de los tres CHECK que SAFE debe haber eliminado.
+-- ausente=true es el estado esperado despues de SAFE.
+SELECT
+  objetivo.tabla,
+  objetivo.restriccion,
+  NOT EXISTS (
+    SELECT 1 FROM pg_constraint c
+    WHERE c.conrelid = objetivo.tabla AND c.conname = objetivo.restriccion AND c.contype = 'c'
+  ) AS ausente
+FROM (VALUES
+  ('public.cajas_sesiones'::regclass, 'ck_cajas_sesiones_monto_teorico'),
+  ('public.cajas_cierres'::regclass, 'ck_cajas_cierres_monto_teorico'),
+  ('public.cajas_arqueos'::regclass, 'ck_cajas_arqueos_teorico')
+) AS objetivo(tabla, restriccion);
+
+-- 3) checks_equivalentes_no_negativos / permite_valores_negativos: confirma,
+-- por COLUMNA (no por nombre de restriccion), que cada columna que debe
+-- seguir siendo no-negativa todavia tiene un CHECK equivalente valido.
 WITH columnas_que_permiten_negativos(tabla, columna) AS (
   VALUES
     ('public.cajas_sesiones'::regclass, 'monto_teorico_cierre'::text),
@@ -83,6 +105,8 @@ SELECT
 FROM resultado
 ORDER BY tabla::text, columna;
 
+-- 4) control_no_negativo_presente_y_validado: el resto de columnas de dinero
+-- y referencias que NUNCA deben perder su CHECK no-negativo por este cambio.
 WITH controles_requeridos(tabla, columna) AS (
   VALUES
     ('public.cajas_sesiones'::regclass, 'monto_apertura'::text),
@@ -124,18 +148,52 @@ SELECT
 FROM controles_requeridos objetivo
 ORDER BY objetivo.tabla::text, objetivo.columna;
 
+-- 5) ck_cajas_arqueos_contado debe seguir intacto: exacto, validado, y
+-- protegiendo unicamente monto_contado.
 SELECT
-  3000.00::numeric(14,2) AS monto_apertura,
-  0.00::numeric(14,2) AS ventas_efectivo,
-  0.00::numeric(14,2) AS ingresos_manuales,
-  16763.00::numeric(14,2) AS egresos_manuales,
-  (
-    3000.00::numeric(14,2)
-    + 0.00::numeric(14,2)
-    + 0.00::numeric(14,2)
-    - 16763.00::numeric(14,2)
-  )::numeric(14,2) AS efectivo_teorico_esperado;
+  c.oid IS NOT NULL AS existe,
+  c.convalidated AS validada,
+  c.conkey = (
+    SELECT array_agg(a.attnum)
+    FROM pg_attribute a
+    WHERE a.attrelid = 'public.cajas_arqueos'::regclass
+      AND a.attname = 'monto_contado'
+      AND NOT a.attisdropped
+  ) AS protege_exclusivamente_monto_contado,
+  lower(regexp_replace(COALESCE(pg_get_expr(c.conbin, c.conrelid), ''), '\s+|[()]|::numeric', '', 'g')) = 'monto_contado>=0' AS expresion_no_negativa_exacta
+FROM pg_constraint c
+WHERE c.conrelid = 'public.cajas_arqueos'::regclass
+  AND c.conname = 'ck_cajas_arqueos_contado'
+  AND c.contype = 'c';
 
-SELECT cm.*
-FROM public.cajas_movimientos cm
-WHERE cm.id_movimiento_caja = 17;
+-- 6) Catalogo completo requerido (EFECTIVO/TARJETA/TRANSFERENCIA/OTRO) y
+-- validez de OTRO como bucket de "otros no efectivo".
+WITH requerido(codigo, afecta_efectivo_esperado) AS (
+  VALUES ('EFECTIVO', true), ('TARJETA', false), ('TRANSFERENCIA', false), ('OTRO', false)
+)
+SELECT
+  r.codigo,
+  mp.id_metodo_pago,
+  COALESCE(mp.estado, true) AS activo,
+  mp.afecta_efectivo,
+  (mp.id_metodo_pago IS NOT NULL
+    AND COALESCE(mp.estado, true) = true
+    AND mp.afecta_efectivo IS NOT DISTINCT FROM r.afecta_efectivo_esperado) AS valido
+FROM requerido r
+LEFT JOIN public.cat_metodos_pago mp ON UPPER(TRIM(mp.codigo)) = r.codigo
+ORDER BY r.codigo;
+
+-- 7) Evidencia de regresion cero: conteos y sumas que NO deben cambiar por
+-- esta migracion (ninguna fila de ventas/cobros/facturas se toca). Ejecutar
+-- antes y despues de SAFE y comparar manualmente los dos resultados.
+SELECT
+  (SELECT COUNT(*) FROM public.facturas) AS cantidad_facturas,
+  (SELECT COALESCE(SUM(total_detalle), 0) FROM public.detalle_facturas) AS suma_facturas,
+  (SELECT COUNT(*) FROM public.facturas_cobros) AS cantidad_cobros,
+  (SELECT COALESCE(SUM(monto), 0) FROM public.facturas_cobros) AS suma_cobros,
+  (SELECT COUNT(*) FROM public.pedidos) AS cantidad_pedidos,
+  (SELECT COUNT(*) FROM public.cajas_movimientos) AS cantidad_movimientos,
+  (SELECT COUNT(*) FROM public.cajas_cierres) AS cantidad_cierres,
+  (SELECT COUNT(*) FROM public.cajas_sesiones cs
+     INNER JOIN public.cat_cajas_sesiones_estados e ON e.id_estado_sesion_caja = cs.id_estado_sesion_caja
+     WHERE UPPER(TRIM(e.codigo)) = 'ABIERTA') AS sesiones_abiertas;

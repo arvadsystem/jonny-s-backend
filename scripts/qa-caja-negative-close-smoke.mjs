@@ -23,11 +23,28 @@ const SAFE_PATH = new URL('../sql/20260720_allow_negative_cash_close_theoretical
 const VERIFY_PATH = new URL('../sql/20260720_allow_negative_cash_close_theoretical_VERIFY.sql', import.meta.url);
 const ROLLBACK_PATH = new URL('../sql/20260720_allow_negative_cash_close_theoretical_ROLLBACK.sql', import.meta.url);
 
-// Usuario QA real (root/SUPER_ADMIN) usado unicamente para firmar una sesion
-// de prueba desechable. No se lee ni modifica su clave; solo se crea y borra
-// una fila de sesiones_activas propia de este smoke.
-const QA_ROOT_USER_ID = 30;
+// Usuario QA real con rol SUPER_ADMIN, resuelto dinamicamente (nunca un ID
+// hardcodeado): usado unicamente para firmar una sesion de prueba
+// desechable. No se lee ni modifica su clave; solo se crea y borra una fila
+// de sesiones_activas propia de este smoke.
+const resolveQaHttpTestUser = async (client) => {
+  const result = await client.query(`
+    SELECT u.id_usuario
+    FROM public.usuarios u
+    INNER JOIN public.roles_usuarios ru ON ru.id_usuario = u.id_usuario
+    INNER JOIN public.roles r ON r.id_rol = ru.id_rol
+    WHERE COALESCE(u.estado, true) = true
+      AND UPPER(REGEXP_REPLACE(TRIM(r.nombre), '[\\s-]+', '_', 'g')) = 'SUPER_ADMIN'
+    ORDER BY u.id_usuario
+    LIMIT 1
+  `);
+  const idUsuario = Number(result.rows[0]?.id_usuario) || null;
+  assert.ok(idUsuario, 'No se encontro un usuario SUPER_ADMIN activo en QA para firmar la sesion de prueba HTTP.');
+  return idUsuario;
+};
+
 const LEAVE_SAFE_APPLIED = process.argv.includes('--leave-safe-applied');
+const INJECT_FAILURE_AFTER_SAFE = process.argv.includes('--inject-failure-after-safe');
 
 const assertQaTarget = () => {
   if (process.env.QA_CAJAS_NEGATIVE_CLOSE_SMOKE !== 'true') {
@@ -80,20 +97,37 @@ const runVerify = async (queryRunner, verifySql) => {
   const requiredChecks = results.find((result) =>
     result.fields?.some((field) => field.name === 'control_no_negativo_presente_y_validado')
   );
-  const financialCase = results.find((result) =>
-    result.fields?.some((field) => field.name === 'efectivo_teorico_esperado')
+  const absenceChecks = results.find((result) =>
+    result.fields?.some((field) => field.name === 'ausente')
+  );
+  const arqueosContadoCheck = results.find((result) =>
+    result.fields?.some((field) => field.name === 'protege_exclusivamente_monto_contado')
+  );
+  const catalogChecks = results.find((result) =>
+    result.fields?.some((field) => field.name === 'valido') && result.fields?.some((field) => field.name === 'codigo')
+  );
+  const regressionCounts = results.find((result) =>
+    result.fields?.some((field) => field.name === 'cantidad_facturas')
   );
 
   assert.ok(negativeChecks);
   assert.ok(requiredChecks);
-  assert.ok(financialCase);
+  assert.ok(absenceChecks);
+  assert.ok(arqueosContadoCheck);
+  assert.ok(catalogChecks);
+  assert.ok(regressionCounts);
   assert.ok(requiredChecks.rows.every((row) => row.control_no_negativo_presente_y_validado === true));
-  assert.equal(Number(financialCase.rows[0].efectivo_teorico_esperado), -13763);
+  assert.equal(arqueosContadoCheck.rows[0].existe, true);
+  assert.equal(arqueosContadoCheck.rows[0].protege_exclusivamente_monto_contado, true);
+  assert.equal(arqueosContadoCheck.rows[0].expresion_no_negativa_exacta, true);
+  assert.ok(catalogChecks.rows.every((row) => row.valido === true), 'catalogo EFECTIVO/TARJETA/TRANSFERENCIA/OTRO debe ser valido');
 
   return {
     negativeChecks: negativeChecks.rows,
     protectedChecks: requiredChecks.rows.length,
-    financialResult: Number(financialCase.rows[0].efectivo_teorico_esperado)
+    absenceChecks: absenceChecks.rows,
+    catalog: catalogChecks.rows,
+    regressionCounts: regressionCounts.rows[0]
   };
 };
 
@@ -108,17 +142,28 @@ const expectMigrationFailure = async ({ client, sql, code, messagePattern }) => 
   );
 };
 
+// SAFE endurecido usa LOCK TABLE ... NOWAIT (falla inmediato, sin esperar el
+// lock_timeout de 1s) en vez del lock_timeout '5s' anterior. La prueba de
+// contencion (11.7) exige fallo en menos de 1.5s; se deja margen generoso
+// para jitter de red/CI mientras se mantiene muy por debajo del limite.
 const testLockTimeout = async (safeSql) => {
   const locker = await pool.connect();
   const runner = await pool.connect();
   try {
+    const stateBefore = await namedConstraintState(pool);
     await locker.query('BEGIN');
     await locker.query('LOCK TABLE public.cajas_sesiones IN ACCESS EXCLUSIVE MODE');
     const startedAt = Date.now();
     await expectMigrationFailure({ client: runner, sql: safeSql, code: '55P03' });
     const elapsedMs = Date.now() - startedAt;
-    assert.ok(elapsedMs >= 4500 && elapsedMs < 15000, `lock_timeout inesperado: ${elapsedMs}ms`);
+    assert.ok(elapsedMs < 1500, `NOWAIT debe fallar en menos de 1.5s, tardo: ${elapsedMs}ms`);
     await runner.query('ROLLBACK');
+
+    // Cero cambios de esquema mientras el lock estaba contendido, sin
+    // asumir un estado inicial fijo (el entorno puede ya estar en SAFE).
+    const stateAfter = await namedConstraintState(pool);
+    assert.deepEqual(stateAfter, stateBefore, 'ninguna restriccion debe cambiar cuando NOWAIT falla');
+
     return elapsedMs;
   } finally {
     await locker.query('ROLLBACK').catch(() => {});
@@ -336,10 +381,12 @@ const runTransactionalFinancialSmoke = async () => {
       requireObservacionOnDifference: false
     });
     // Caso obligatorio: OTRO (400) debe aparecer como fila unica agrupada
-    // OTROS_NO_EFECTIVO, no perderse dentro del total declarado.
+    // OTRO (codigo tecnico persistido; "Otros no efectivo" es solo la
+    // etiqueta de presentacion), no perderse dentro del total declarado.
     assert.equal(salesComputation.rows.length, 4);
-    const otrosRow = salesComputation.rows.find((row) => row.metodo_pago_codigo === 'OTROS_NO_EFECTIVO');
-    assert.ok(otrosRow, 'debe existir la fila OTROS_NO_EFECTIVO');
+    const otrosRow = salesComputation.rows.find((row) => row.metodo_pago_codigo === 'OTRO');
+    assert.ok(otrosRow, 'debe existir la fila OTRO');
+    assert.equal(otrosRow.display_name, 'Otros no efectivo');
     assert.equal(otrosRow.monto_teorico, 400);
     assert.equal(otrosRow.monto_declarado, 400);
     assert.equal(otrosRow.diferencia, 0);
@@ -379,11 +426,15 @@ const runTransactionalFinancialSmoke = async () => {
       threshold: 0,
       requireObservacionOnDifference: true
     });
-    const negativeOtrosRow = negativeOtrosComputation.rows.find((row) => row.metodo_pago_codigo === 'OTROS_NO_EFECTIVO');
+    const negativeOtrosRow = negativeOtrosComputation.rows.find((row) => row.metodo_pago_codigo === 'OTRO');
     assert.equal(negativeOtrosRow.monto_teorico, -100);
     assert.equal(negativeOtrosRow.monto_declarado, 0);
     assert.ok(negativeOtrosRow.monto_declarado >= 0);
-    assert.equal(negativeOtrosRow.requiere_revision, false);
+    // 5.4: residual negativo SI exige revision (a diferencia del diseno
+    // anterior); el cierre no se bloquea, pero queda PENDIENTE_REVISION.
+    assert.equal(negativeOtrosRow.requiere_revision, true);
+    assert.equal(negativeOtrosRow.diferencia, 100);
+    assert.match(negativeOtrosRow.observacion, /Conciliaci.n autom.tica/);
     assert.equal(negativeOtrosRow.completado_automaticamente, true);
 
     await client.query('SAVEPOINT metodo_inactivo');
@@ -656,7 +707,11 @@ const runTransactionalFinancialSmoke = async () => {
     const html = buildCajaCloseEmailHtml({ payload: emailPayload, pdfAttached: true });
     const pdf = await buildCajaCierrePdfBuffer(emailPayload);
     assert.match(html, /Total ventas/);
-    assert.match(html, /OTROS_NO_EFECTIVO/);
+    // 7: el documento muestra la etiqueta humana, nunca el codigo tecnico
+    // (ni el actual OTRO ni el anterior OTROS_NO_EFECTIVO).
+    assert.match(html, /Otros no efectivo/);
+    assert.doesNotMatch(html, /OTROS_NO_EFECTIVO/);
+    assert.doesNotMatch(html, />OTRO</);
     assert.ok(Buffer.isBuffer(pdf) && pdf.subarray(0, 4).toString() === '%PDF');
 
     await client.query('ROLLBACK');
@@ -785,6 +840,7 @@ const cleanupHttpCloseArtifacts = async ({ idSesionCaja, idCierreCaja }) => {
 
 const runHttpCloseSmoke = async () => {
   const references = await loadSmokeReferences(pool);
+  const qaTestUserId = await resolveQaHttpTestUser(pool);
   // Rango seguro para integer (algunas tablas de auditoria referencian el id
   // de sesion en una columna integer, no bigint), muy por encima de cualquier
   // secuencia real de QA.
@@ -796,7 +852,7 @@ const runHttpCloseSmoke = async () => {
     references,
     estado: references.estado_abierta,
     montoApertura: 3000,
-    idUsuarioResponsable: QA_ROOT_USER_ID
+    idUsuarioResponsable: qaTestUserId
   });
   await pool.query(`
     INSERT INTO public.cajas_movimientos (
@@ -805,7 +861,7 @@ const runHttpCloseSmoke = async () => {
       referencia, observacion, fecha_movimiento, fecha_creacion
     ) OVERRIDING SYSTEM VALUE
     VALUES ($1, $2, $3, $4, $5, $6, 16763, 'QA_SMOKE_HTTP_EGRESO', 'QA_SMOKE_CAJA_NEGATIVE_CLOSE', NOW(), NOW())
-  `, [baseId + 1, idSesionCaja, references.id_caja, references.id_sucursal, references.tipo_egreso, QA_ROOT_USER_ID]);
+  `, [baseId + 1, idSesionCaja, references.id_caja, references.id_sucursal, references.tipo_egreso, qaTestUserId]);
   for (const [index, [methodCode, amount]] of [
     ['EFECTIVO', 100],
     ['TARJETA', 200],
@@ -815,7 +871,7 @@ const runHttpCloseSmoke = async () => {
     await insertPayment(pool, {
       idFacturaCobro: baseId + 10 + index,
       idSesionCaja,
-      references: { ...references, id_usuario: QA_ROOT_USER_ID },
+      references: { ...references, id_usuario: qaTestUserId },
       methodCode,
       amount
     });
@@ -826,7 +882,7 @@ const runHttpCloseSmoke = async () => {
   const expectedTotalTeorico = -12763;
   const expectedTotalDeclarado = 900; // efectivo declarado 0 + tarjeta 200 + transferencia 300 + otros 400
 
-  const auth = await mintQaAuthContext({ idUsuario: QA_ROOT_USER_ID, idSucursal: references.id_sucursal });
+  const auth = await mintQaAuthContext({ idUsuario: qaTestUserId, idSucursal: references.id_sucursal });
   const server = await startServer();
   const { port } = server.address();
   const baseUrl = `http://127.0.0.1:${port}`;
@@ -847,8 +903,10 @@ const runHttpCloseSmoke = async () => {
     });
     assert.equal(preview.status, 200, `cierre-preview HTTP ${preview.status}: ${JSON.stringify(preview.body)}`);
     assert.equal(preview.body.arqueos_metodos.length, 4);
-    const previewOtros = preview.body.arqueos_metodos.find((row) => row.metodo_pago_codigo === 'OTROS_NO_EFECTIVO');
-    assert.ok(previewOtros, 'preview debe incluir OTROS_NO_EFECTIVO');
+    const previewOtros = preview.body.arqueos_metodos.find((row) => row.metodo_pago_codigo === 'OTRO');
+    assert.ok(previewOtros, 'preview debe incluir la fila OTRO');
+    assert.equal(previewOtros.display_name, 'Otros no efectivo');
+    assert.equal(previewOtros.editable, false);
     assert.equal(previewOtros.monto_teorico, 400);
     assert.equal(previewOtros.monto_declarado, 400);
     assert.equal(preview.body.resumen.total_teorico, expectedTotalTeorico);
@@ -862,8 +920,9 @@ const runHttpCloseSmoke = async () => {
     idValidacionCierre = validaciones.body.id_validacion_cierre;
     assert.ok(idValidacionCierre);
     assert.equal(validaciones.body.metodos.length, 4);
-    const validacionOtros = validaciones.body.metodos.find((row) => row.metodo_pago_codigo === 'OTROS_NO_EFECTIVO');
-    assert.ok(validacionOtros, 'cierre-validaciones debe incluir OTROS_NO_EFECTIVO');
+    const validacionOtros = validaciones.body.metodos.find((row) => row.metodo_pago_codigo === 'OTRO');
+    assert.ok(validacionOtros, 'cierre-validaciones debe incluir la fila OTRO');
+    assert.equal(validacionOtros.completado_automaticamente, true);
     assert.equal(validacionOtros.monto_declarado, 400);
     assert.equal(validacionOtros.diferencia, 0);
     assert.equal(validaciones.body.resumen.total_declarado, expectedTotalDeclarado);
@@ -887,7 +946,7 @@ const runHttpCloseSmoke = async () => {
     assert.ok(idCierreCaja);
     assert.equal(cerrar.body.estado_revision, 'PENDIENTE_REVISION');
     assert.equal(cerrar.body.arqueos_metodos.length, 4);
-    const cierreOtros = cerrar.body.arqueos_metodos.find((row) => row.metodo_pago_codigo === 'OTROS_NO_EFECTIVO');
+    const cierreOtros = cerrar.body.arqueos_metodos.find((row) => row.metodo_pago_codigo === 'OTRO');
     assert.ok(cierreOtros);
     assert.equal(cierreOtros.monto_declarado, 400);
     assert.equal(cerrar.body.correo_cierre.estado, 'PENDIENTE');
@@ -907,7 +966,7 @@ const runHttpCloseSmoke = async () => {
         cc.id_cierre_caja,
         cv.id_cierre_caja AS validacion_vinculada,
         COUNT(cam.id_arqueo_metodo)::int AS arqueos,
-        COUNT(cam.id_arqueo_metodo) FILTER (WHERE cam.metodo_pago_codigo = 'OTROS_NO_EFECTIVO')::int AS arqueos_otros,
+        COUNT(cam.id_arqueo_metodo) FILTER (WHERE cam.metodo_pago_codigo = 'OTRO')::int AS arqueos_otros,
         SUM(cam.monto_declarado)::numeric AS suma_declarado,
         SUM(cam.monto_teorico)::numeric AS suma_teorico,
         COUNT(DISTINCT outbox.id_notificacion)::int AS outbox
@@ -934,7 +993,8 @@ const runHttpCloseSmoke = async () => {
     const emailPayload = await loadCajaCloseEmailPayload(pool, idCierreCaja);
     const html = buildCajaCloseEmailHtml({ payload: emailPayload, pdfAttached: true });
     const pdf = await buildCajaCierrePdfBuffer(emailPayload);
-    assert.match(html, /OTROS_NO_EFECTIVO/);
+    assert.match(html, /Otros no efectivo/);
+    assert.doesNotMatch(html, /OTROS_NO_EFECTIVO/);
     assert.doesNotMatch(html, /Extra Ranch/); // sanity: no leftover fixture data bleeding in
     assert.ok(Buffer.isBuffer(pdf) && pdf.subarray(0, 4).toString() === '%PDF');
     const detalleSumaDeclarado = emailPayload.arqueos.reduce((sum, row) => sum + Number(row.monto_declarado || 0), 0);
@@ -962,6 +1022,32 @@ const runHttpCloseSmoke = async () => {
   }
 };
 
+const DELIBERATE_FAILURE_MARKER = 'QA_SMOKE_DELIBERATE_FAILURE_AFTER_SAFE';
+
+// Restaura el estado inicial EXACTO (no solo el conteo): misma definicion y
+// mismo estado de validacion por restriccion. Se llama siempre desde el
+// finally de main(), exista o no un error, para que ningun fallo de
+// asercion a mitad de camino deje SAFE aplicado sin restaurar.
+const restoreExactInitialState = async ({ initialMode, initialDetailByConstraint, safeSql, rollbackSql, leaveSafeApplied }) => {
+  const targetMode = leaveSafeApplied ? 'safe' : initialMode;
+  const currentRows = await namedConstraintState(pool);
+  const currentMode = resolveInitialMode(currentRows);
+  if (currentMode !== targetMode) {
+    await pool.query(targetMode === 'legacy' ? rollbackSql : safeSql);
+  }
+  const restoredRows = await namedConstraintState(pool);
+  assert.equal(restoredRows.length, targetMode === 'legacy' ? NEGATIVE_CLOSE_CONSTRAINTS.length : 0);
+  if (targetMode === 'legacy') {
+    for (const row of restoredRows) {
+      const original = initialDetailByConstraint[row.conname];
+      assert.ok(original, `se restauro una restriccion no presente originalmente: ${row.conname}`);
+      assert.equal(row.expresion, original.expresion, `definicion de ${row.conname} no coincide con el estado original`);
+      assert.equal(row.convalidated, true, `${row.conname} debe quedar validada`);
+    }
+  }
+  return { targetMode, restoredRows };
+};
+
 const main = async () => {
   assertQaTarget();
   const [safeSql, verifySql, rollbackSql] = await Promise.all([
@@ -972,6 +1058,13 @@ const main = async () => {
 
   const initialRows = await namedConstraintState(pool);
   const initialMode = resolveInitialMode(initialRows);
+  // Estado EXACTO (no solo presencia) de cada restriccion objetivo, capturado
+  // antes de tocar nada, para poder restaurar y verificar exactitud incluso
+  // si algo falla a mitad de la ejecucion.
+  const initialDetailByConstraint = Object.fromEntries(initialRows.map((row) => [row.conname, row]));
+
+  let results = null;
+  let mainError = null;
 
   try {
     const before = await runVerify(pool, verifySql);
@@ -990,6 +1083,13 @@ const main = async () => {
     await pool.query(safeSql);
     await pool.query(safeSql);
     assert.deepEqual(await namedConstraintState(pool), []);
+
+    // 11.7 #15: excepcion deliberada justo despues de aplicar SAFE, para
+    // confirmar (mas abajo, en el finally) que el esquema queda restaurado
+    // exactamente aunque el smoke "falle" en este punto.
+    if (INJECT_FAILURE_AFTER_SAFE) {
+      throw new Error(`${DELIBERATE_FAILURE_MARKER}: excepcion sintetica para probar restauracion garantizada.`);
+    }
 
     const after = await runVerify(pool, verifySql);
     assert.ok(after.negativeChecks.every((row) => Number(row.checks_equivalentes_no_negativos) === 0));
@@ -1030,30 +1130,58 @@ const main = async () => {
     const finalVerify = await runVerify(pool, verifySql);
     assert.ok(finalVerify.negativeChecks.every((row) => Number(row.checks_equivalentes_no_negativos) === 0));
 
-    const targetMode = LEAVE_SAFE_APPLIED ? 'safe' : initialMode;
-    if (targetMode === 'legacy') {
-      await pool.query(rollbackSql);
-    } else {
-      await pool.query(safeSql);
-    }
-    const restoredRows = await namedConstraintState(pool);
-    assert.equal(restoredRows.length, targetMode === 'legacy' ? NEGATIVE_CLOSE_CONSTRAINTS.length : 0);
-
-    console.log(JSON.stringify({
+    results = {
       projectRef: QA_PROJECT_REF,
       initialMode,
-      restoredMode: targetMode,
       leaveSafeApplied: LEAVE_SAFE_APPLIED,
       lockTimeoutMs,
       verifyBefore: before,
       verifyAfter: after,
       smoke,
-      httpSmoke,
-      finalNamedConstraints: restoredRows
-    }, null, 2));
-  } finally {
-    await closePool();
+      httpSmoke
+    };
+  } catch (error) {
+    mainError = error;
   }
+
+  // A partir de aqui SIEMPRE se ejecuta, con o sin error arriba. No se
+  // reintenta automaticamente si la propia restauracion falla: eso es un
+  // fallo critico distinto del error original y debe reportarse aparte.
+  let restoration = null;
+  let restorationError = null;
+  try {
+    restoration = await restoreExactInitialState({
+      initialMode,
+      initialDetailByConstraint,
+      safeSql,
+      rollbackSql,
+      leaveSafeApplied: LEAVE_SAFE_APPLIED
+    });
+  } catch (error) {
+    restorationError = error;
+    console.error('[qa-caja-negative-close-smoke] CRITICO: fallo restaurando el estado original de las restricciones. Revisar manualmente en QA:', error);
+  }
+
+  await closePool();
+
+  if (restorationError) {
+    const combined = new Error('Fallo el smoke y/o la restauracion del estado original de las restricciones.');
+    combined.cause = { mainError, restorationError };
+    throw combined;
+  }
+
+  const isDeliberateFailure = mainError && String(mainError.message || '').includes(DELIBERATE_FAILURE_MARKER);
+  if (mainError && !isDeliberateFailure) {
+    throw mainError;
+  }
+
+  console.log(JSON.stringify({
+    ...(results || { projectRef: QA_PROJECT_REF, initialMode }),
+    restoredMode: restoration.targetMode,
+    finalNamedConstraints: restoration.restoredRows,
+    deliberateFailureInjected: INJECT_FAILURE_AFTER_SAFE,
+    deliberateFailureRestorationVerified: isDeliberateFailure ? true : undefined
+  }, null, 2));
 };
 
 await main();
