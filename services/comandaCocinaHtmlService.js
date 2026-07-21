@@ -164,6 +164,7 @@ export const buildComandaCocinaHtml = (comanda, options = {}) => {
   }
 
   const ticketWidthMm = resolveTicketWidthMm(options?.widthMm);
+  const legacy = Boolean(options?.legacy);
   const printMetrics = resolveFacturaLikeMetrics(ticketWidthMm);
   const contentWidthMm = printMetrics.contentWidthMm;
   const marginLeftMm = printMetrics.marginLeftMm;
@@ -174,6 +175,7 @@ export const buildComandaCocinaHtml = (comanda, options = {}) => {
   const orderFontPx = isNarrowTicket ? 13 : 14;
   const dateFontPx = isNarrowTicket ? 10.5 : 11.5;
   const metaFontPx = isNarrowTicket ? 10.5 : 11;
+  const customerNameFontPx = isNarrowTicket ? 21 : 22;
   const qtyFontPx = isNarrowTicket ? 15 : 17;
   const nameFontPx = isNarrowTicket ? 13.5 : 15.5;
   const tagFontPx = isNarrowTicket ? 10 : 10.8;
@@ -181,7 +183,7 @@ export const buildComandaCocinaHtml = (comanda, options = {}) => {
   const nestedPaddingMm = isNarrowTicket ? 7 : 8;
   const metaLabelWidthMm = isNarrowTicket ? 16 : 18;
   const items = validation.items;
-  const fecha = formatDateTime(comanda?.fecha_hora_pedido || comanda?.fecha_hora_facturacion, { legacy: Boolean(options?.legacy) });
+  const fecha = formatDateTime(comanda?.fecha_hora_pedido || comanda?.fecha_hora_facturacion, { legacy });
   const numeroPedido = toSafeText(comanda?.numero_pedido || comanda?.numero_venta || comanda?.codigo_venta);
   const sucursal = toSafeText(comanda?.nombre_sucursal, 'No registrada');
   const cajero = toSafeText(comanda?.nombre_usuario, 'No registrado');
@@ -310,7 +312,32 @@ export const buildComandaCocinaHtml = (comanda, options = {}) => {
         overflow-wrap: anywhere;
         word-break: break-word;
       }
-      .comanda-cocina-print__items {
+${legacy ? '' : `      .comanda-cocina-print__customer {
+        display: grid;
+        gap: 2px;
+        width: 100%;
+        min-width: 0;
+        max-width: 100%;
+        margin: 4px 0 5px;
+        font-size: ${metaFontPx}px;
+      }
+      .comanda-cocina-print__customer-label {
+        display: block;
+        font-weight: 700;
+      }
+      .comanda-cocina-print__customer-name {
+        display: block;
+        width: 100%;
+        min-width: 0;
+        max-width: 100%;
+        font-size: ${customerNameFontPx}px;
+        line-height: 1.2;
+        font-weight: 800;
+        white-space: normal;
+        overflow-wrap: anywhere;
+        word-break: break-word;
+      }
+` }      .comanda-cocina-print__items {
         display: grid;
         gap: 5px;
       }
@@ -407,10 +434,13 @@ export const buildComandaCocinaHtml = (comanda, options = {}) => {
             <span>Mesa</span>
             <span>${escapeHtml(mesa)}</span>
           </div>
-          <div class="comanda-cocina-print__meta-row">
+${legacy ? `          <div class="comanda-cocina-print__meta-row">
             <span>Cliente</span>
             <span>${escapeHtml(cliente)}</span>
-          </div>
+          </div>` : `          <div class="comanda-cocina-print__customer">
+            <span class="comanda-cocina-print__customer-label">Cliente</span>
+            <strong class="comanda-cocina-print__customer-name">${escapeHtml(cliente)}</strong>
+          </div>`}
           ${telefonoCliente ? `
           <div class="comanda-cocina-print__meta-row">
             <span>Telefono</span>

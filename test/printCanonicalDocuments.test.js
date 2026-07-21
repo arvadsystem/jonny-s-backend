@@ -173,12 +173,12 @@ test('regeneracion canonica conserva configuracion historica sin consultar confi
 
 const COMANDA_RENDER_BASELINES = Object.freeze({
   58: Object.freeze({
-    bytes: 7157,
-    sha256: 'baeb2287eb5b90794e73112db5fd81de56d2ac2dc8bc563020c7749b8bd295c3'
+    bytes: 7881,
+    sha256: '0858765f14812224fd80c763082b1cb21509b8dfe0d6b46fee0234360ccfbb9c'
   }),
   80: Object.freeze({
-    bytes: 7160,
-    sha256: '958c2fc558ea96770aebda8276e631b75a5c3fd32be6f975a97d266ece80caa5'
+    bytes: 7882,
+    sha256: '46bbae568fb812727ef91adb6d1fb3d7fa0e0b486afb73da5d15dbf4a94edfbb'
   })
 });
 
