@@ -156,7 +156,7 @@ const countSplitLines = (cuentaDividida) => {
 
 const estimateCustomerNameLines = (value, widthMm) => {
   const customerName = cleanText(value) || 'Consumidor final';
-  const fontSize = widthMm === 58 ? 6.2 : 7;
+  const fontSize = widthMm === 58 ? 6.8 : 7.7;
   const labelWidthPt = widthMm === 58 ? 38 : 42;
   const usableWidthPt = Math.max(getContentWidthPt(widthMm) - labelWidthPt - 2, fontSize);
   const averageCharacterWidthPt = fontSize * 0.58;
@@ -202,7 +202,7 @@ const estimateHeightMm = (venta = {}, { legacy = false } = {}) => {
   const deliveryBlock = venta?.delivery ? 16 : 0;
   const customerNameBlock = legacy
     ? 0
-    : estimateCustomerNameLines(venta.cliente_nombre, ticketWidth) * (ticketWidth === 58 ? 2.8 : 3.1) + 3;
+    : estimateCustomerNameLines(venta.cliente_nombre, ticketWidth) * (ticketWidth === 58 ? 3 : 3.4) + 3;
   const estimated = 110
     + logoBlock
     + items.length * 10
@@ -244,7 +244,7 @@ const customerNameRow = (value, widthMm) => ({
       width: '*',
       alignment: 'right',
       bold: true,
-      fontSize: widthMm === 58 ? 6.2 : 7,
+      fontSize: widthMm === 58 ? 6.8 : 7.7,
       lineHeight: 1.2
     })
   ],

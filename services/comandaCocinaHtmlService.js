@@ -312,6 +312,7 @@ export const buildComandaCocinaHtml = (comanda, options = {}) => {
         word-break: break-word;
       }
 ${legacy ? '' : `      .comanda-cocina-print__customer-name {
+        font-size: ${isNarrowTicket ? 11.5 : 12.1}px;
         font-weight: 800;
       }
 ` }      .comanda-cocina-print__items {

@@ -73,7 +73,7 @@ const extractCustomerCss = (html) => html.match(
   /\.comanda-cocina-print__customer-name\s*\{([\s\S]*?)\n\s*\}/
 )?.[1] || '';
 
-for (const [widthMm, expectedFontSize] of [[58, 6.2], [80, 7]]) {
+for (const [widthMm, expectedFontSize] of [[58, 6.8], [80, 7.7]]) {
   for (const customerName of [SHORT_CUSTOMER_NAME, LONG_CUSTOMER_NAME, LONG_UNBROKEN_CUSTOMER_NAME]) {
     test(`factura ${widthMm} mm imprime cliente actual a ${expectedFontSize} pt: ${customerName.length} caracteres`, async () => {
       const factura = buildFactura(widthMm, customerName);
@@ -105,7 +105,7 @@ for (const [widthMm, expectedFontSize] of [[58, 6.2], [80, 7]]) {
   });
 }
 
-for (const [widthMm, expectedFontSize] of [[58, 10.5], [80, 11]]) {
+for (const [widthMm, expectedFontSize] of [[58, 11.5], [80, 12.1]]) {
   for (const customerName of [SHORT_CUSTOMER_NAME, LONG_CUSTOMER_NAME, LONG_UNBROKEN_CUSTOMER_NAME]) {
     test(`comanda ${widthMm} mm imprime cliente actual a ${expectedFontSize} px: ${customerName.length} caracteres`, () => {
       const html = buildComandaCocinaHtml(buildComanda(customerName), { widthMm });
@@ -115,8 +115,9 @@ for (const [widthMm, expectedFontSize] of [[58, 10.5], [80, 11]]) {
 
       assert.match(html, /class="comanda-cocina-print__meta-row">\s*<span>Cliente<\/span>\s*<span class="comanda-cocina-print__customer-name">/);
       assert.match(html, new RegExp(`font-size:\\s*${expectedFontSize}px`));
+      assert.match(customerCss, new RegExp(`font-size:\\s*${expectedFontSize}px`));
       assert.match(customerCss, /font-weight:\s*800/);
-      assert.doesNotMatch(customerCss, /font-size|position|height|overflow/);
+      assert.doesNotMatch(customerCss, /position|height|overflow/);
       assert.ok(phoneIndex > customerIndex);
       assert.ok(Buffer.byteLength(html, 'utf8') < MAX_CANONICAL_HTML_BYTES);
     });
@@ -125,7 +126,7 @@ for (const [widthMm, expectedFontSize] of [[58, 10.5], [80, 11]]) {
 
 test('los renderers actuales conservan sus fallbacks cuando no hay nombre', () => {
   const pdfNodes = collectPdfTextNodes(buildVentaTicketPdfDefinition(buildFactura(58, null)).content);
-  assert.ok(pdfNodes.some((node) => node.text === 'Consumidor final' && node.fontSize === 6.2));
+  assert.ok(pdfNodes.some((node) => node.text === 'Consumidor final' && node.fontSize === 6.8));
 
   const html = buildComandaCocinaHtml(buildComanda(null), { widthMm: 58 });
   assert.match(html, /class="comanda-cocina-print__customer-name">N\/D<\/span>/);
