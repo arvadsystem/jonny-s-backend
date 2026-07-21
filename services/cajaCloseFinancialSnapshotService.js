@@ -62,6 +62,9 @@ const normalizeSnapshot = (row = {}, idSesionCaja) => {
     tarjeta_teorico: roundMoney(row.tarjeta_teorico),
     transferencia_teorico: roundMoney(row.transferencia_teorico),
     total_teorico: roundMoney(row.total_teorico),
+    otros_no_efectivo_id_metodo_pago: Number.isFinite(Number(row.otros_no_efectivo_id_metodo_pago))
+      ? Number(row.otros_no_efectivo_id_metodo_pago)
+      : null,
     fingerprint: {
       cantidad_cobros: Number(fingerprint.cantidad_cobros || 0),
       max_id_factura_cobro: toBigIntText(fingerprint.max_id_factura_cobro),
@@ -93,6 +96,7 @@ const normalizeSnapshot = (row = {}, idSesionCaja) => {
   snapshot.tarjetaTeorico = snapshot.tarjeta_teorico;
   snapshot.transferenciaTeorico = snapshot.transferencia_teorico;
   snapshot.totalTeorico = snapshot.total_teorico;
+  snapshot.otrosNoEfectivoIdMetodoPago = snapshot.otros_no_efectivo_id_metodo_pago;
   snapshot.salesByCode = new Map(snapshot.metodos.map((method) => [method.codigo, method.ventas_brutas]));
   snapshot.reversionsByCode = new Map(snapshot.metodos.map((method) => [method.codigo, method.reversiones]));
   snapshot.salesNetByCode = new Map(snapshot.metodos.map((method) => [method.codigo, method.ventas_netas]));
@@ -317,6 +321,15 @@ export const loadCajaCloseFinancialSnapshot = async ({ queryRunner, idSesionCaja
           COALESCE(SUM(CASE WHEN mt.codigo = 'TRANSFERENCIA' THEN mt.ventas_netas ELSE 0 END), 0)::numeric(14,2) AS ventas_transferencia_netas
         FROM method_totals mt
       ),
+      -- cajas_cierres_arqueos_metodos.id_metodo_pago es NOT NULL con FK real a
+      -- cat_metodos_pago (fk_ccam_metodo); la fila agrupada OTROS_NO_EFECTIVO
+      -- necesita un ancla valida. Se toma el catalogo completo (activo o no)
+      -- para que exista un id aunque el metodo este inactivo.
+      other_non_cash_method AS (
+        SELECT MIN(pmc.id_metodo_pago) AS id_metodo_pago
+        FROM payment_method_catalog pmc
+        WHERE pmc.codigo <> ALL(ARRAY['EFECTIVO','TARJETA','TRANSFERENCIA']::text[])
+      ),
       segmented_methods AS (
         SELECT
           mt.id_metodo_pago,
@@ -377,6 +390,7 @@ export const loadCajaCloseFinancialSnapshot = async ({ queryRunner, idSesionCaja
             )
             FROM segmented_methods sm
           ), '[]'::jsonb) AS metodos,
+          onm.id_metodo_pago AS otros_no_efectivo_id_metodo_pago,
           ips.metodos_pago_invalidos,
           jsonb_build_object(
             'cantidad_cobros', COALESCE(ff.cantidad_cobros, 0),
@@ -403,6 +417,7 @@ export const loadCajaCloseFinancialSnapshot = async ({ queryRunner, idSesionCaja
         CROSS JOIN financial_fingerprint ff
         CROSS JOIN aggregate_totals at
         CROSS JOIN invalid_payment_summary ips
+        CROSS JOIN other_non_cash_method onm
       )
       SELECT fs.*
       FROM final_snapshot fs

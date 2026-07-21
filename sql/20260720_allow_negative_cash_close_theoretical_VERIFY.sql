@@ -9,6 +9,7 @@ FROM pg_constraint c
 WHERE c.conrelid IN (
     'public.cajas_sesiones'::regclass,
     'public.cajas_cierres'::regclass,
+    'public.cajas_arqueos'::regclass,
     'public.cajas_cierres_arqueos_metodos'::regclass,
     'public.cajas_cierres_validaciones_metodos'::regclass
   )
@@ -19,6 +20,7 @@ WITH columnas_que_permiten_negativos(tabla, columna) AS (
   VALUES
     ('public.cajas_sesiones'::regclass, 'monto_teorico_cierre'::text),
     ('public.cajas_cierres'::regclass, 'monto_teorico_cierre'::text),
+    ('public.cajas_arqueos'::regclass, 'monto_teorico'::text),
     ('public.cajas_cierres_arqueos_metodos'::regclass, 'monto_teorico'::text),
     ('public.cajas_cierres_validaciones_metodos'::regclass, 'monto_teorico'::text)
 ),
@@ -91,6 +93,7 @@ WITH controles_requeridos(tabla, columna) AS (
     ('public.cajas_cierres'::regclass, 'monto_ventas_no_efectivo'::text),
     ('public.cajas_cierres'::regclass, 'monto_ingresos_manuales'::text),
     ('public.cajas_cierres'::regclass, 'monto_egresos_manuales'::text),
+    ('public.cajas_arqueos'::regclass, 'monto_contado'::text),
     ('public.cajas_cierres_arqueos_metodos'::regclass, 'monto_declarado'::text),
     ('public.cajas_cierres_validaciones_metodos'::regclass, 'monto_declarado'::text)
 )

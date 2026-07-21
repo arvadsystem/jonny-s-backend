@@ -18,7 +18,7 @@ const rollbackSource = readFileSync(
 const routerSource = readFileSync(resolve('routers/cajas.js'), 'utf8');
 
 describe('monto teorico negativo en cierre de caja', () => {
-  it('SAFE elimina solo los dos CHECK del monto teorico y no modifica filas', () => {
+  it('SAFE elimina solo los tres CHECK del monto teorico (sesiones, cierres, arqueos) y no modifica filas', () => {
     assert.match(safeSource, /BEGIN;/);
     assert.match(safeSource, /COMMIT;/);
     assert.match(safeSource, /conkey/);
@@ -29,11 +29,15 @@ describe('monto teorico negativo en cierre de caja', () => {
     assert.match(safeSource, /ARRAY\[target_column\]::smallint\[\]/);
     assert.match(safeSource, /DROP CONSTRAINT IF EXISTS ck_cajas_sesiones_monto_teorico/);
     assert.match(safeSource, /DROP CONSTRAINT IF EXISTS ck_cajas_cierres_monto_teorico/);
+    assert.match(safeSource, /DROP CONSTRAINT IF EXISTS ck_cajas_arqueos_teorico/);
+    assert.match(safeSource, /public\.cajas_arqueos/);
+    assert.match(safeSource, /ck_cajas_arqueos_contado/);
+    assert.match(safeSource, /'monto_teorico>=0'/);
     assert.doesNotMatch(safeSource, /\b(?:INSERT|UPDATE|DELETE|TRUNCATE)\b/i);
-    assert.doesNotMatch(safeSource, /monto_apertura\s*>?=|monto_declarado_cierre\s*>?=|monto_ventas|monto_ingresos_manuales|monto_egresos_manuales/i);
+    assert.doesNotMatch(safeSource, /monto_apertura\s*>?=|monto_declarado_cierre\s*>?=|monto_ventas|monto_ingresos_manuales|monto_egresos_manuales|monto_contado\s*>?=/i);
   });
 
-  it('VERIFY detecta CHECK equivalentes por columna y conserva controles no negativos', () => {
+  it('VERIFY detecta CHECK equivalentes por columna (incluye cajas_arqueos) y conserva controles no negativos', () => {
     assert.match(verifySource, /c\.conkey @> ARRAY\[a\.attnum\]::smallint\[\]/);
     assert.match(verifySource, /checks_equivalentes_no_negativos/);
     assert.match(verifySource, /permite_valores_negativos/);
@@ -44,10 +48,12 @@ describe('monto teorico negativo en cierre de caja', () => {
       'monto_ventas_no_efectivo',
       'monto_ingresos_manuales',
       'monto_egresos_manuales',
-      'monto_declarado'
+      'monto_declarado',
+      'monto_contado'
     ]) {
       assert.match(verifySource, new RegExp(column));
     }
+    assert.match(verifySource, /public\.cajas_arqueos/);
     assert.match(verifySource, /c\.convalidated/);
     assert.match(verifySource, /control_no_negativo_presente_y_validado/);
     assert.match(verifySource, /3000\.00::numeric\(14,2\)/);
@@ -57,20 +63,24 @@ describe('monto teorico negativo en cierre de caja', () => {
     assert.doesNotMatch(verifySource, /\b(?:INSERT|UPDATE|DELETE|TRUNCATE|ALTER|DROP)\b/i);
   });
 
-  it('ROLLBACK restaura ambos CHECK y falla cerrado si existen negativos', () => {
+  it('ROLLBACK restaura los tres CHECK (sesiones, cierres, arqueos) y falla cerrado si existen negativos', () => {
     assert.match(rollbackSource, /SET LOCAL lock_timeout = '5s';/);
     assert.match(rollbackSource, /SET LOCAL statement_timeout = '120s';/);
     assert.match(rollbackSource, /WHERE monto_teorico_cierre < 0/g);
+    assert.match(rollbackSource, /WHERE monto_teorico < 0/);
     assert.match(rollbackSource, /Rollback bloqueado/);
     assert.match(rollbackSource, /constraint_columns IS DISTINCT FROM ARRAY\[target_column\]::smallint\[\]/g);
     assert.match(rollbackSource, /constraint_validated IS NOT TRUE/g);
     assert.match(rollbackSource, /monto_teorico_cierreisnullormonto_teorico_cierre>=0/);
     assert.match(rollbackSource, /monto_teorico_cierre>=0/);
+    assert.match(rollbackSource, /'monto_teorico>=0'/);
     assert.match(rollbackSource, /existe con una definicion incorrecta o no validada/g);
     assert.match(rollbackSource, /ADD CONSTRAINT ck_cajas_sesiones_monto_teorico/);
     assert.match(rollbackSource, /ADD CONSTRAINT ck_cajas_cierres_monto_teorico/);
+    assert.match(rollbackSource, /ADD CONSTRAINT ck_cajas_arqueos_teorico/);
     assert.match(rollbackSource, /VALIDATE CONSTRAINT ck_cajas_sesiones_monto_teorico/);
     assert.match(rollbackSource, /VALIDATE CONSTRAINT ck_cajas_cierres_monto_teorico/);
+    assert.match(rollbackSource, /VALIDATE CONSTRAINT ck_cajas_arqueos_teorico/);
   });
 
   it('el cierre conserva valor exacto, diferencia, revision y notificacion', () => {

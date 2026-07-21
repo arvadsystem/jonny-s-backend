@@ -29,7 +29,7 @@ describe('caja close computation', () => {
     assert.equal(tarjeta.observacion_requerida, false);
   });
 
-  it('incluye metodos no segmentados en los totales sin agregarlos al arqueo visual', () => {
+  it('agrupa metodos no segmentados (OTRO, futuros) en una fila unica OTROS_NO_EFECTIVO visible', () => {
     const result = buildSegmentedArqueoComputation({
       snapshot: {
         totalTeorico: 1000,
@@ -51,11 +51,50 @@ describe('caja close computation', () => {
     assert.deepEqual(result.rows.map((row) => row.metodo_pago_codigo), [
       'EFECTIVO',
       'TARJETA',
-      'TRANSFERENCIA'
+      'TRANSFERENCIA',
+      'OTROS_NO_EFECTIVO'
     ]);
+    const otros = result.rows.at(-1);
+    assert.equal(otros.id_metodo_pago, null);
+    assert.equal(otros.monto_teorico, 400);
+    assert.equal(otros.monto_declarado, 400);
+    assert.equal(otros.diferencia, 0);
+    assert.equal(otros.completado_automaticamente, true);
+    assert.equal(otros.requiere_revision, false);
     assert.equal(result.monto_teorico_total, 1000);
     assert.equal(result.monto_declarado_total, 1000);
     assert.equal(result.diferencia_total, 0);
+    assert.equal(
+      result.rows.reduce((sum, row) => sum + row.monto_declarado, 0),
+      result.monto_declarado_total
+    );
+    assert.equal(
+      result.rows.reduce((sum, row) => sum + row.monto_teorico, 0),
+      result.monto_teorico_total
+    );
+  });
+
+  it('ancla monto_declarado de OTROS_NO_EFECTIVO en 0 cuando el residual neto es negativo, sin exigir revision', () => {
+    const result = buildSegmentedArqueoComputation({
+      snapshot: {
+        totalTeorico: 2700,
+        metodos: [
+          { id_metodo_pago: 1, codigo: 'EFECTIVO', ventas_brutas: 0, monto_teorico: 3000 },
+          { id_metodo_pago: 2, codigo: 'TARJETA', ventas_brutas: 0, monto_teorico: 0 },
+          { id_metodo_pago: 3, codigo: 'TRANSFERENCIA', ventas_brutas: 0, monto_teorico: 0 }
+        ]
+      },
+      payloadRows: [{ metodo_pago_codigo: 'EFECTIVO', monto_declarado: 3000 }],
+      threshold: 0,
+      requireObservacionOnDifference: true
+    });
+
+    const otros = result.rows.find((row) => row.metodo_pago_codigo === 'OTROS_NO_EFECTIVO');
+    assert.equal(otros.monto_teorico, -300);
+    assert.equal(otros.monto_declarado, 0);
+    assert.ok(otros.monto_declarado >= 0);
+    assert.equal(otros.requiere_revision, false);
+    assert.equal(otros.observacion_requerida, false);
   });
 
   it('conserva total positivo cuando el efectivo teorico es negativo', () => {

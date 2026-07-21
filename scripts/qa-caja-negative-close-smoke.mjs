@@ -1,7 +1,9 @@
 import assert from 'node:assert/strict';
+import crypto from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import process from 'node:process';
 import pool, { closePool } from '../config/db-connection.js';
+import app from '../app.js';
 import {
   buildCajaCloseEmailHtml,
   loadCajaCloseEmailPayload
@@ -9,11 +11,23 @@ import {
 import { buildSegmentedArqueoComputation } from '../services/cajaCloseComputationService.js';
 import { loadCajaCloseFinancialSnapshot } from '../services/cajaCloseFinancialSnapshotService.js';
 import { buildCajaCierrePdfBuffer } from '../utils/cajaCierreReportePdf.js';
+import { createSession } from '../utils/security/sessionService.js';
+import {
+  buildAuthTokenPayload,
+  getUserAuthzSnapshot
+} from '../utils/security/authTokenPayload.js';
+import { issueAccessToken } from '../utils/security/accessTokenPolicy.js';
 
 const QA_PROJECT_REF = 'cluideiojeikzcmmizhe';
 const SAFE_PATH = new URL('../sql/20260720_allow_negative_cash_close_theoretical_SAFE.sql', import.meta.url);
 const VERIFY_PATH = new URL('../sql/20260720_allow_negative_cash_close_theoretical_VERIFY.sql', import.meta.url);
 const ROLLBACK_PATH = new URL('../sql/20260720_allow_negative_cash_close_theoretical_ROLLBACK.sql', import.meta.url);
+
+// Usuario QA real (root/SUPER_ADMIN) usado unicamente para firmar una sesion
+// de prueba desechable. No se lee ni modifica su clave; solo se crea y borra
+// una fila de sesiones_activas propia de este smoke.
+const QA_ROOT_USER_ID = 30;
+const LEAVE_SAFE_APPLIED = process.argv.includes('--leave-safe-applied');
 
 const assertQaTarget = () => {
   if (process.env.QA_CAJAS_NEGATIVE_CLOSE_SMOKE !== 'true') {
@@ -26,6 +40,12 @@ const assertQaTarget = () => {
   }
 };
 
+const NEGATIVE_CLOSE_CONSTRAINTS = Object.freeze([
+  ['public.cajas_sesiones', 'ck_cajas_sesiones_monto_teorico'],
+  ['public.cajas_cierres', 'ck_cajas_cierres_monto_teorico'],
+  ['public.cajas_arqueos', 'ck_cajas_arqueos_teorico']
+]);
+
 const namedConstraintState = async (queryRunner) => {
   const result = await queryRunner.query(`
     SELECT c.conrelid::regclass::text AS tabla, c.conname, c.convalidated,
@@ -33,12 +53,23 @@ const namedConstraintState = async (queryRunner) => {
     FROM pg_constraint c
     WHERE (c.conrelid, c.conname) IN (
       ('public.cajas_sesiones'::regclass, 'ck_cajas_sesiones_monto_teorico'),
-      ('public.cajas_cierres'::regclass, 'ck_cajas_cierres_monto_teorico')
+      ('public.cajas_cierres'::regclass, 'ck_cajas_cierres_monto_teorico'),
+      ('public.cajas_arqueos'::regclass, 'ck_cajas_arqueos_teorico')
     )
     ORDER BY tabla
   `);
   return result.rows;
 };
+
+// "legacy" (las 3 restricciones presentes, nada migrado) es el unico estado
+// que se restaura al finalizar. Cualquier otro estado (0, 1 o 2 presentes)
+// se trata como "safe": ya sea porque el smoke ya se ejecuto antes, o porque
+// un fix previo (sesiones/cierres) dejo la migracion a medias mientras
+// cajas_arqueos seguia bloqueando negativos (el propio bug de este cambio).
+// En ambos casos el resultado correcto es completar y dejar SAFE, nunca
+// revertir constraints que ya se habian retirado deliberadamente.
+const resolveInitialMode = (rows) =>
+  rows.length === NEGATIVE_CLOSE_CONSTRAINTS.length ? 'legacy' : 'safe';
 
 const runVerify = async (queryRunner, verifySql) => {
   const rawResults = await queryRunner.query(verifySql);
@@ -97,15 +128,16 @@ const testLockTimeout = async (safeSql) => {
   }
 };
 
-const testSafeWrongDefinition = async (safeSql) => {
+const testWrongDefinition = async ({
+  table,
+  constraintName,
+  wrongCheckSql,
+  safeSql
+}) => {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    await client.query(`
-      ALTER TABLE public.cajas_sesiones
-        ADD CONSTRAINT ck_cajas_sesiones_monto_teorico
-        CHECK (monto_teorico_cierre >= -999)
-    `);
+    await client.query(`ALTER TABLE ${table} ADD CONSTRAINT ${constraintName} ${wrongCheckSql}`);
     await expectMigrationFailure({
       client,
       sql: safeSql,
@@ -117,16 +149,17 @@ const testSafeWrongDefinition = async (safeSql) => {
   }
 };
 
-const testRollbackWrongDefinition = async (rollbackSql) => {
+const testRollbackWrongDefinition = async ({
+  table,
+  constraintName,
+  wrongCheckSql,
+  rollbackSql
+}) => {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    await client.query('ALTER TABLE public.cajas_sesiones DROP CONSTRAINT ck_cajas_sesiones_monto_teorico');
-    await client.query(`
-      ALTER TABLE public.cajas_sesiones
-        ADD CONSTRAINT ck_cajas_sesiones_monto_teorico
-        CHECK (monto_teorico_cierre >= -999)
-    `);
+    await client.query(`ALTER TABLE ${table} DROP CONSTRAINT ${constraintName}`);
+    await client.query(`ALTER TABLE ${table} ADD CONSTRAINT ${constraintName} ${wrongCheckSql}`);
     await expectMigrationFailure({
       client,
       sql: rollbackSql,
@@ -190,7 +223,8 @@ const insertSession = async (client, {
   references,
   estado,
   montoApertura,
-  closed = false
+  closed = false,
+  idUsuarioResponsable = references.id_usuario
 }) => {
   await client.query(`
     INSERT INTO public.cajas_sesiones (
@@ -210,7 +244,7 @@ const insertSession = async (client, {
     idSesionCaja,
     references.id_caja,
     references.id_sucursal,
-    references.id_usuario,
+    idUsuarioResponsable,
     estado,
     closed,
     montoApertura
@@ -246,7 +280,7 @@ const insertPayment = async (client, {
   ]);
 };
 
-const runTransactionalFinancialSmoke = async (rollbackSql) => {
+const runTransactionalFinancialSmoke = async () => {
   const client = await pool.connect();
   const baseId = 8_000_000_000_000 + (Date.now() % 100_000_000);
   const salesSessionId = baseId;
@@ -254,6 +288,7 @@ const runTransactionalFinancialSmoke = async (rollbackSql) => {
   const closeId = baseId + 2;
   const validationId = baseId + 3;
   const outboxId = baseId + 4;
+  const arqueoId = baseId + 5;
   let rolledBack = false;
   try {
     await client.query('BEGIN');
@@ -300,10 +335,56 @@ const runTransactionalFinancialSmoke = async (rollbackSql) => {
       threshold: 0,
       requireObservacionOnDifference: false
     });
+    // Caso obligatorio: OTRO (400) debe aparecer como fila unica agrupada
+    // OTROS_NO_EFECTIVO, no perderse dentro del total declarado.
+    assert.equal(salesComputation.rows.length, 4);
+    const otrosRow = salesComputation.rows.find((row) => row.metodo_pago_codigo === 'OTROS_NO_EFECTIVO');
+    assert.ok(otrosRow, 'debe existir la fila OTROS_NO_EFECTIVO');
+    assert.equal(otrosRow.monto_teorico, 400);
+    assert.equal(otrosRow.monto_declarado, 400);
+    assert.equal(otrosRow.diferencia, 0);
+    assert.equal(otrosRow.completado_automaticamente, true);
+    assert.equal(otrosRow.requiere_revision, false);
+    // Ancla FK real (fk_ccam_metodo es NOT NULL): un metodo real del catalogo,
+    // no un sentinel ni null.
+    assert.ok(Number.isInteger(otrosRow.id_metodo_pago) && otrosRow.id_metodo_pago > 0);
     assert.equal(salesComputation.monto_teorico_total, 1000);
     assert.equal(salesComputation.monto_declarado_total, 1000);
     assert.equal(salesComputation.diferencia_total, 0);
-    assert.equal(salesComputation.rows.length, 3);
+    const sumDeclarado = salesComputation.rows.reduce((sum, row) => sum + row.monto_declarado, 0);
+    const sumTeorico = salesComputation.rows.reduce((sum, row) => sum + row.monto_teorico, 0);
+    assert.equal(sumDeclarado, salesComputation.monto_declarado_total);
+    assert.equal(sumTeorico, salesComputation.monto_teorico_total);
+    assert.equal(
+      salesComputation.rows.filter((row) => row.metodo_pago_codigo === 'TARJETA').length,
+      1,
+      'TARJETA no debe duplicarse'
+    );
+    assert.equal(
+      salesComputation.rows.filter((row) => row.metodo_pago_codigo === 'TRANSFERENCIA').length,
+      1,
+      'TRANSFERENCIA no debe duplicarse'
+    );
+
+    // Caso limite: metodo no efectivo neto negativo (p. ej. reversion de otra
+    // sesion). monto_declarado nunca debe quedar negativo (CHECK >=0 fuera de
+    // alcance) y el cierre no debe bloquearse ni lanzar.
+    const negativeOtrosComputation = buildSegmentedArqueoComputation({
+      snapshot: { ...salesSnapshot, totalTeorico: salesSnapshot.totalTeorico - 500 },
+      payloadRows: [
+        { metodo_pago_codigo: 'EFECTIVO', monto_declarado: 100 },
+        { metodo_pago_codigo: 'TARJETA', monto_declarado: 200, cantidad_referencias: 1 },
+        { metodo_pago_codigo: 'TRANSFERENCIA', monto_declarado: 300, cantidad_referencias: 1 }
+      ],
+      threshold: 0,
+      requireObservacionOnDifference: true
+    });
+    const negativeOtrosRow = negativeOtrosComputation.rows.find((row) => row.metodo_pago_codigo === 'OTROS_NO_EFECTIVO');
+    assert.equal(negativeOtrosRow.monto_teorico, -100);
+    assert.equal(negativeOtrosRow.monto_declarado, 0);
+    assert.ok(negativeOtrosRow.monto_declarado >= 0);
+    assert.equal(negativeOtrosRow.requiere_revision, false);
+    assert.equal(negativeOtrosRow.completado_automaticamente, true);
 
     await client.query('SAVEPOINT metodo_inactivo');
     await client.query("UPDATE public.cat_metodos_pago SET estado = false WHERE UPPER(TRIM(codigo)) = 'OTRO'");
@@ -356,6 +437,37 @@ const runTransactionalFinancialSmoke = async (rollbackSql) => {
     assert.equal(negativeSnapshot.efectivoTeorico, -13763);
     assert.equal(negativeSnapshot.totalTeorico, -13763);
 
+    // Problema 1 a nivel de tabla cajas_arqueos: el endpoint de arqueo puntual
+    // inserta resumen.efectivoTeorico directamente en monto_teorico. Prueba
+    // que, con SAFE aplicado, ya no bloquea valores negativos.
+    const arqueoMontoContado = 0;
+    const arqueoDiferencia = Number((arqueoMontoContado - negativeSnapshot.efectivoTeorico).toFixed(2));
+    await client.query(`
+      INSERT INTO public.cajas_arqueos (
+        id_arqueo_caja, id_sesion_caja, id_caja, id_sucursal, id_tipo_arqueo_caja,
+        id_usuario_ejecutor, monto_teorico, monto_contado, diferencia, observacion,
+        fecha_arqueo, fecha_creacion
+      ) OVERRIDING SYSTEM VALUE
+      VALUES ($1, $2, $3, $4,
+        (SELECT id_tipo_arqueo_caja FROM public.cat_cajas_arqueos_tipos WHERE UPPER(TRIM(codigo)) = 'CIERRE' LIMIT 1),
+        $5, $6, $7, $8, 'QA_SMOKE_CAJA_NEGATIVE_CLOSE', NOW(), NOW())
+    `, [
+      arqueoId,
+      negativeSessionId,
+      references.id_caja,
+      references.id_sucursal,
+      references.id_usuario,
+      negativeSnapshot.efectivoTeorico,
+      arqueoMontoContado,
+      arqueoDiferencia
+    ]);
+    const persistedArqueo = await client.query(
+      'SELECT monto_teorico, diferencia FROM public.cajas_arqueos WHERE id_arqueo_caja = $1',
+      [arqueoId]
+    );
+    assert.equal(Number(persistedArqueo.rows[0].monto_teorico), -13763);
+    assert.equal(Number(persistedArqueo.rows[0].diferencia), 13763);
+
     const computation = buildSegmentedArqueoComputation({
       snapshot: negativeSnapshot,
       payloadRows: [{
@@ -369,6 +481,7 @@ const runTransactionalFinancialSmoke = async (rollbackSql) => {
     assert.equal(computation.monto_teorico_total, -13763);
     assert.equal(computation.monto_declarado_total, 0);
     assert.equal(computation.diferencia_total, 13763);
+    assert.equal(computation.rows.length, 4);
 
     await client.query(`
       INSERT INTO public.cajas_cierres_validaciones (
@@ -464,7 +577,7 @@ const runTransactionalFinancialSmoke = async (rollbackSql) => {
         negativeSessionId,
         references.id_caja,
         references.id_sucursal,
-        row.id_metodo_pago,
+        Number(row.id_metodo_pago) || 0,
         row.metodo_pago_codigo,
         row.monto_teorico,
         row.monto_declarado,
@@ -536,20 +649,16 @@ const runTransactionalFinancialSmoke = async (rollbackSql) => {
     assert.equal(String(state.resolucion).trim().toUpperCase(), 'PENDIENTE_REVISION');
     assert.equal(String(state.id_cierre_caja), String(closeId));
     assert.equal(String(state.validacion_vinculada), String(closeId));
-    assert.equal(state.arqueos, 3);
+    assert.equal(state.arqueos, 4);
     assert.equal(state.notificaciones, 1);
 
     const emailPayload = await loadCajaCloseEmailPayload(client, closeId);
     const html = buildCajaCloseEmailHtml({ payload: emailPayload, pdfAttached: true });
     const pdf = await buildCajaCierrePdfBuffer(emailPayload);
     assert.match(html, /Total ventas/);
+    assert.match(html, /OTROS_NO_EFECTIVO/);
     assert.ok(Buffer.isBuffer(pdf) && pdf.subarray(0, 4).toString() === '%PDF');
 
-    await expectMigrationFailure({
-      client,
-      sql: rollbackSql,
-      messagePattern: /existen montos teoricos negativos/
-    });
     await client.query('ROLLBACK');
     rolledBack = true;
 
@@ -558,12 +667,14 @@ const runTransactionalFinancialSmoke = async (rollbackSql) => {
         EXISTS (SELECT 1 FROM public.cajas_sesiones WHERE id_sesion_caja IN ($1, $2)) AS sesiones,
         EXISTS (SELECT 1 FROM public.cajas_cierres WHERE id_cierre_caja = $3) AS cierres,
         EXISTS (SELECT 1 FROM public.cajas_cierres_validaciones WHERE id_validacion_cierre = $4) AS validaciones,
-        EXISTS (SELECT 1 FROM public.cajas_cierres_notificaciones_email WHERE id_notificacion = $5) AS outbox
-    `, [salesSessionId, negativeSessionId, closeId, validationId, outboxId]);
+        EXISTS (SELECT 1 FROM public.cajas_arqueos WHERE id_arqueo_caja = $5) AS arqueos,
+        EXISTS (SELECT 1 FROM public.cajas_cierres_notificaciones_email WHERE id_notificacion = $6) AS outbox
+    `, [salesSessionId, negativeSessionId, closeId, validationId, arqueoId, outboxId]);
     assert.deepEqual(cleanup.rows[0], {
       sesiones: false,
       cierres: false,
       validaciones: false,
+      arqueos: false,
       outbox: false
     });
 
@@ -571,7 +682,8 @@ const runTransactionalFinancialSmoke = async (rollbackSql) => {
       sales: {
         efectivo: salesSnapshot.ventasEfectivoNetas,
         noEfectivo: salesSnapshot.ventasNoEfectivoNetas,
-        total: salesSnapshot.totalTeorico
+        total: salesSnapshot.totalTeorico,
+        otrosNoEfectivo: otrosRow.monto_teorico
       },
       negativeClose: {
         efectivoTeorico: -13763,
@@ -581,7 +693,9 @@ const runTransactionalFinancialSmoke = async (rollbackSql) => {
         arqueos: state.arqueos,
         outbox: state.notificaciones,
         pdfBytes: pdf.length,
-        htmlTotalVentas: true
+        htmlTotalVentas: true,
+        htmlOtrosNoEfectivo: true,
+        arqueoCajaMontoTeorico: Number(persistedArqueo.rows[0].monto_teorico)
       },
       cleanup: cleanup.rows[0]
     };
@@ -591,47 +705,355 @@ const runTransactionalFinancialSmoke = async (rollbackSql) => {
   }
 };
 
-assertQaTarget();
-const [safeSql, verifySql, rollbackSql] = await Promise.all([
-  readFile(SAFE_PATH, 'utf8'),
-  readFile(VERIFY_PATH, 'utf8'),
-  readFile(ROLLBACK_PATH, 'utf8')
-]);
+// --- Problema 3: integracion HTTP real (cierre-preview / cierre-validaciones / cerrar) ---
 
-try {
-  const before = await runVerify(pool, verifySql);
-  assert.equal(before.negativeChecks.filter((row) =>
-    ['cajas_sesiones', 'cajas_cierres'].includes(String(row.tabla))
-      && Number(row.checks_equivalentes_no_negativos) > 0
-  ).length, 2);
+const startServer = () => new Promise((resolve, reject) => {
+  const server = app.listen(0, '127.0.0.1');
+  server.once('listening', () => resolve(server));
+  server.once('error', reject);
+});
 
-  const lockTimeoutMs = await testLockTimeout(safeSql);
-  await pool.query(safeSql);
-  await pool.query(safeSql);
-  assert.deepEqual(await namedConstraintState(pool), []);
+const stopServer = (server) => new Promise((resolve) => server.close(() => resolve()));
 
-  const after = await runVerify(pool, verifySql);
-  assert.ok(after.negativeChecks.every((row) => Number(row.checks_equivalentes_no_negativos) === 0));
+const mintQaAuthContext = async ({ idUsuario, idSucursal }) => {
+  const idSesion = await createSession({
+    id_usuario: idUsuario,
+    ip_origen: '127.0.0.1',
+    user_agent: 'qa-caja-negative-close-smoke'
+  });
+  const authz = await getUserAuthzSnapshot(pool, idUsuario);
+  const userRow = await pool.query('SELECT nombre_usuario FROM public.usuarios WHERE id_usuario = $1', [idUsuario]);
+  const payload = buildAuthTokenPayload({
+    id_usuario: idUsuario,
+    nombre_usuario: userRow.rows[0]?.nombre_usuario || null,
+    id_sucursal: idSucursal,
+    must_change_password: false,
+    sid: idSesion
+  }, authz);
+  const { token } = issueAccessToken(payload, { roles: authz.roles });
+  const csrfToken = crypto.randomBytes(32).toString('hex');
+  return {
+    idSesion,
+    cookieHeader: `access_token=${token}; csrf_token=${csrfToken}`,
+    csrfToken
+  };
+};
 
-  await testSafeWrongDefinition(safeSql);
-  await pool.query(rollbackSql);
-  await pool.query(rollbackSql);
-  assert.equal((await namedConstraintState(pool)).length, 2);
-  await testRollbackWrongDefinition(rollbackSql);
+const closeQaAuthContext = async (idSesion) => {
+  await pool.query('DELETE FROM sesiones_activas WHERE id_sesion = $1', [idSesion]);
+};
 
-  await pool.query(safeSql);
-  const smoke = await runTransactionalFinancialSmoke(rollbackSql);
-  const finalVerify = await runVerify(pool, verifySql);
-  assert.ok(finalVerify.negativeChecks.every((row) => Number(row.checks_equivalentes_no_negativos) === 0));
+const callJson = async (baseUrl, method, path, { auth, body } = {}) => {
+  const headers = { 'Content-Type': 'application/json' };
+  if (auth) {
+    headers.Cookie = auth.cookieHeader;
+    headers['X-CSRF-Token'] = auth.csrfToken;
+  }
+  const res = await fetch(`${baseUrl}${path}`, {
+    method,
+    headers,
+    body: body !== undefined ? JSON.stringify(body) : undefined
+  });
+  const text = await res.text();
+  let parsed = null;
+  try { parsed = text ? JSON.parse(text) : null; } catch { parsed = text; }
+  return { status: res.status, body: parsed };
+};
 
-  console.log(JSON.stringify({
-    projectRef: QA_PROJECT_REF,
-    lockTimeoutMs,
-    verifyBefore: before,
-    verifyAfter: after,
-    smoke,
-    finalNamedConstraints: await namedConstraintState(pool)
-  }, null, 2));
-} finally {
-  await closePool();
-}
+// Se limpia por id_sesion_caja (no solo por el id de validacion "principal")
+// porque el flujo de prueba puede generar mas de un intento de validacion
+// (p. ej. el caso "reintento del cierre"); todos deben quedar sin rastro.
+const cleanupHttpCloseArtifacts = async ({ idSesionCaja, idCierreCaja }) => {
+  if (idCierreCaja) {
+    await pool.query('DELETE FROM public.cajas_cierres_arqueos_metodos WHERE id_cierre_caja = $1', [idCierreCaja]);
+    await pool.query('DELETE FROM public.cajas_cierres_notificaciones_email WHERE id_cierre_caja = $1', [idCierreCaja]);
+  }
+  await pool.query(`
+    DELETE FROM public.cajas_cierres_validaciones_metodos
+    WHERE id_validacion_cierre IN (
+      SELECT id_validacion_cierre FROM public.cajas_cierres_validaciones WHERE id_sesion_caja = $1
+    )
+  `, [idSesionCaja]);
+  await pool.query('DELETE FROM public.cajas_cierres_validaciones WHERE id_sesion_caja = $1', [idSesionCaja]);
+  if (idCierreCaja) {
+    await pool.query('DELETE FROM public.cajas_cierres WHERE id_cierre_caja = $1', [idCierreCaja]);
+  }
+  await pool.query('DELETE FROM public.facturas_cobros WHERE id_sesion_caja = $1', [idSesionCaja]);
+  await pool.query('DELETE FROM public.cajas_movimientos WHERE id_sesion_caja = $1', [idSesionCaja]);
+  await pool.query('DELETE FROM public.cajas_sesiones WHERE id_sesion_caja = $1', [idSesionCaja]);
+};
+
+const runHttpCloseSmoke = async () => {
+  const references = await loadSmokeReferences(pool);
+  // Rango seguro para integer (algunas tablas de auditoria referencian el id
+  // de sesion en una columna integer, no bigint), muy por encima de cualquier
+  // secuencia real de QA.
+  const idSesionCaja = 900_000_000 + (Date.now() % 90_000_000);
+  const baseId = idSesionCaja;
+
+  await insertSession(pool, {
+    idSesionCaja,
+    references,
+    estado: references.estado_abierta,
+    montoApertura: 3000,
+    idUsuarioResponsable: QA_ROOT_USER_ID
+  });
+  await pool.query(`
+    INSERT INTO public.cajas_movimientos (
+      id_movimiento_caja, id_sesion_caja, id_caja, id_sucursal,
+      id_tipo_movimiento_caja, id_usuario_ejecutor, monto,
+      referencia, observacion, fecha_movimiento, fecha_creacion
+    ) OVERRIDING SYSTEM VALUE
+    VALUES ($1, $2, $3, $4, $5, $6, 16763, 'QA_SMOKE_HTTP_EGRESO', 'QA_SMOKE_CAJA_NEGATIVE_CLOSE', NOW(), NOW())
+  `, [baseId + 1, idSesionCaja, references.id_caja, references.id_sucursal, references.tipo_egreso, QA_ROOT_USER_ID]);
+  for (const [index, [methodCode, amount]] of [
+    ['EFECTIVO', 100],
+    ['TARJETA', 200],
+    ['TRANSFERENCIA', 300],
+    ['OTRO', 400]
+  ].entries()) {
+    await insertPayment(pool, {
+      idFacturaCobro: baseId + 10 + index,
+      idSesionCaja,
+      references: { ...references, id_usuario: QA_ROOT_USER_ID },
+      methodCode,
+      amount
+    });
+  }
+
+  // apertura 3000 + efectivo 100 - egreso 16763 = -13663; no-efectivo 900 (200+300+400)
+  const expectedEfectivoTeorico = -13663;
+  const expectedTotalTeorico = -12763;
+  const expectedTotalDeclarado = 900; // efectivo declarado 0 + tarjeta 200 + transferencia 300 + otros 400
+
+  const auth = await mintQaAuthContext({ idUsuario: QA_ROOT_USER_ID, idSucursal: references.id_sucursal });
+  const server = await startServer();
+  const { port } = server.address();
+  const baseUrl = `http://127.0.0.1:${port}`;
+
+  let idCierreCaja = null;
+  let idValidacionCierre = null;
+  try {
+    const arqueosPayload = [
+      { metodo_pago_codigo: 'EFECTIVO', monto_declarado: 0, observacion: 'QA smoke HTTP: caja vacia tras egreso' },
+      { metodo_pago_codigo: 'TARJETA', monto_declarado: 200, cantidad_referencias: 1 },
+      { metodo_pago_codigo: 'TRANSFERENCIA', monto_declarado: 300, cantidad_referencias: 1 }
+    ];
+    const observacionCierre = 'QA_SMOKE_HTTP cierre negativo con OTRO';
+
+    const preview = await callJson(baseUrl, 'POST', `/ventas/cajas/sesiones/${idSesionCaja}/cierre-preview`, {
+      auth,
+      body: { observacion_cierre: observacionCierre, arqueos: arqueosPayload }
+    });
+    assert.equal(preview.status, 200, `cierre-preview HTTP ${preview.status}: ${JSON.stringify(preview.body)}`);
+    assert.equal(preview.body.arqueos_metodos.length, 4);
+    const previewOtros = preview.body.arqueos_metodos.find((row) => row.metodo_pago_codigo === 'OTROS_NO_EFECTIVO');
+    assert.ok(previewOtros, 'preview debe incluir OTROS_NO_EFECTIVO');
+    assert.equal(previewOtros.monto_teorico, 400);
+    assert.equal(previewOtros.monto_declarado, 400);
+    assert.equal(preview.body.resumen.total_teorico, expectedTotalTeorico);
+    assert.equal(preview.body.resumen.total_declarado, expectedTotalDeclarado);
+
+    const validaciones = await callJson(baseUrl, 'POST', `/ventas/cajas/sesiones/${idSesionCaja}/cierre-validaciones`, {
+      auth,
+      body: { observacion_cierre: observacionCierre, arqueos: arqueosPayload }
+    });
+    assert.equal(validaciones.status, 201, `cierre-validaciones HTTP ${validaciones.status}: ${JSON.stringify(validaciones.body)}`);
+    idValidacionCierre = validaciones.body.id_validacion_cierre;
+    assert.ok(idValidacionCierre);
+    assert.equal(validaciones.body.metodos.length, 4);
+    const validacionOtros = validaciones.body.metodos.find((row) => row.metodo_pago_codigo === 'OTROS_NO_EFECTIVO');
+    assert.ok(validacionOtros, 'cierre-validaciones debe incluir OTROS_NO_EFECTIVO');
+    assert.equal(validacionOtros.monto_declarado, 400);
+    assert.equal(validacionOtros.diferencia, 0);
+    assert.equal(validaciones.body.resumen.total_declarado, expectedTotalDeclarado);
+    assert.equal(validaciones.body.resumen.hay_diferencia, true);
+
+    // Reintento del cierre: reenviar cierre-validaciones antes de cerrar debe
+    // seguir aceptando la revision (no hay estado que lo bloquee todavia).
+    const revalidacion = await callJson(baseUrl, 'POST', `/ventas/cajas/sesiones/${idSesionCaja}/cierre-validaciones`, {
+      auth,
+      body: { observacion_cierre: observacionCierre, arqueos: arqueosPayload }
+    });
+    assert.equal(revalidacion.status, 201);
+    assert.notEqual(revalidacion.body.id_validacion_cierre, idValidacionCierre);
+
+    const cerrar = await callJson(baseUrl, 'PATCH', `/ventas/cajas/sesiones/${idSesionCaja}/cerrar`, {
+      auth,
+      body: { observacion_cierre: observacionCierre, id_validacion_cierre: idValidacionCierre }
+    });
+    assert.equal(cerrar.status, 200, `cerrar HTTP ${cerrar.status}: ${JSON.stringify(cerrar.body)}`);
+    idCierreCaja = cerrar.body.id_cierre_caja;
+    assert.ok(idCierreCaja);
+    assert.equal(cerrar.body.estado_revision, 'PENDIENTE_REVISION');
+    assert.equal(cerrar.body.arqueos_metodos.length, 4);
+    const cierreOtros = cerrar.body.arqueos_metodos.find((row) => row.metodo_pago_codigo === 'OTROS_NO_EFECTIVO');
+    assert.ok(cierreOtros);
+    assert.equal(cierreOtros.monto_declarado, 400);
+    assert.equal(cerrar.body.correo_cierre.estado, 'PENDIENTE');
+
+    // La validacion ya vinculada no debe poder reutilizarse en un segundo cierre.
+    const idValidacionSobrante = revalidacion.body.id_validacion_cierre;
+    const cerrarReintento = await callJson(baseUrl, 'PATCH', `/ventas/cajas/sesiones/${idSesionCaja}/cerrar`, {
+      auth,
+      body: { observacion_cierre: observacionCierre, id_validacion_cierre: idValidacionSobrante }
+    });
+    assert.equal(cerrarReintento.status, 409);
+
+    const persisted = await pool.query(`
+      SELECT
+        cs.id_estado_sesion_caja, estado.codigo AS estado_codigo,
+        cs.monto_teorico_cierre,
+        cc.id_cierre_caja,
+        cv.id_cierre_caja AS validacion_vinculada,
+        COUNT(cam.id_arqueo_metodo)::int AS arqueos,
+        COUNT(cam.id_arqueo_metodo) FILTER (WHERE cam.metodo_pago_codigo = 'OTROS_NO_EFECTIVO')::int AS arqueos_otros,
+        SUM(cam.monto_declarado)::numeric AS suma_declarado,
+        SUM(cam.monto_teorico)::numeric AS suma_teorico,
+        COUNT(DISTINCT outbox.id_notificacion)::int AS outbox
+      FROM public.cajas_sesiones cs
+      INNER JOIN public.cat_cajas_sesiones_estados estado ON estado.id_estado_sesion_caja = cs.id_estado_sesion_caja
+      INNER JOIN public.cajas_cierres cc ON cc.id_sesion_caja = cs.id_sesion_caja
+      LEFT JOIN public.cajas_cierres_validaciones cv ON cv.id_validacion_cierre = $2
+      LEFT JOIN public.cajas_cierres_arqueos_metodos cam ON cam.id_cierre_caja = cc.id_cierre_caja
+      LEFT JOIN public.cajas_cierres_notificaciones_email outbox ON outbox.id_cierre_caja = cc.id_cierre_caja
+      WHERE cs.id_sesion_caja = $1
+      GROUP BY cs.id_estado_sesion_caja, estado.codigo, cs.monto_teorico_cierre, cc.id_cierre_caja, cv.id_cierre_caja
+    `, [idSesionCaja, idValidacionCierre]);
+    const state = persisted.rows[0];
+    assert.equal(String(state.estado_codigo).trim().toUpperCase(), 'CERRADA');
+    assert.equal(Number(state.monto_teorico_cierre), expectedTotalTeorico);
+    assert.equal(String(state.id_cierre_caja), String(idCierreCaja));
+    assert.equal(String(state.validacion_vinculada), String(idCierreCaja));
+    assert.equal(state.arqueos, 4);
+    assert.equal(state.arqueos_otros, 1);
+    assert.equal(Number(state.suma_declarado), expectedTotalDeclarado);
+    assert.equal(Number(state.suma_teorico), expectedTotalTeorico);
+    assert.equal(state.outbox, 1);
+
+    const emailPayload = await loadCajaCloseEmailPayload(pool, idCierreCaja);
+    const html = buildCajaCloseEmailHtml({ payload: emailPayload, pdfAttached: true });
+    const pdf = await buildCajaCierrePdfBuffer(emailPayload);
+    assert.match(html, /OTROS_NO_EFECTIVO/);
+    assert.doesNotMatch(html, /Extra Ranch/); // sanity: no leftover fixture data bleeding in
+    assert.ok(Buffer.isBuffer(pdf) && pdf.subarray(0, 4).toString() === '%PDF');
+    const detalleSumaDeclarado = emailPayload.arqueos.reduce((sum, row) => sum + Number(row.monto_declarado || 0), 0);
+    assert.equal(detalleSumaDeclarado, expectedTotalDeclarado);
+
+    return {
+      httpStatus: { preview: preview.status, validaciones: validaciones.status, cerrar: cerrar.status },
+      idSesionCaja: String(idSesionCaja),
+      idCierreCaja: String(idCierreCaja),
+      efectivoTeoricoEsperado: expectedEfectivoTeorico,
+      totalTeorico: Number(state.monto_teorico_cierre),
+      totalDeclarado: Number(state.suma_declarado),
+      arqueos: state.arqueos,
+      arqueosOtrosNoEfectivo: state.arqueos_otros,
+      reintentoCierreRechazado: cerrarReintento.status === 409,
+      pdfBytes: pdf.length
+    };
+  } finally {
+    await stopServer(server);
+    await closeQaAuthContext(auth.idSesion).catch(() => {});
+    await cleanupHttpCloseArtifacts({ idSesionCaja, idCierreCaja, idValidacionCierre }).catch((cleanupError) => {
+      console.error('[qa-caja-negative-close-smoke] fallo limpiando artefactos HTTP:', cleanupError);
+      throw cleanupError;
+    });
+  }
+};
+
+const main = async () => {
+  assertQaTarget();
+  const [safeSql, verifySql, rollbackSql] = await Promise.all([
+    readFile(SAFE_PATH, 'utf8'),
+    readFile(VERIFY_PATH, 'utf8'),
+    readFile(ROLLBACK_PATH, 'utf8')
+  ]);
+
+  const initialRows = await namedConstraintState(pool);
+  const initialMode = resolveInitialMode(initialRows);
+
+  try {
+    const before = await runVerify(pool, verifySql);
+    // Se compara contra el conteo real observado (initialRows), no contra un
+    // modo binario asumido: un ambiente parcialmente migrado (p. ej. solo
+    // cajas_arqueos aun bloqueando) es un estado inicial legitimo.
+    assert.equal(
+      before.negativeChecks.filter((row) =>
+        ['cajas_sesiones', 'cajas_cierres', 'cajas_arqueos'].includes(String(row.tabla))
+          && Number(row.checks_equivalentes_no_negativos) > 0
+      ).length,
+      initialRows.length
+    );
+
+    const lockTimeoutMs = await testLockTimeout(safeSql);
+    await pool.query(safeSql);
+    await pool.query(safeSql);
+    assert.deepEqual(await namedConstraintState(pool), []);
+
+    const after = await runVerify(pool, verifySql);
+    assert.ok(after.negativeChecks.every((row) => Number(row.checks_equivalentes_no_negativos) === 0));
+
+    await testWrongDefinition({
+      table: 'public.cajas_sesiones',
+      constraintName: 'ck_cajas_sesiones_monto_teorico',
+      wrongCheckSql: 'CHECK (monto_teorico_cierre >= -999)',
+      safeSql
+    });
+    await testWrongDefinition({
+      table: 'public.cajas_arqueos',
+      constraintName: 'ck_cajas_arqueos_teorico',
+      wrongCheckSql: 'CHECK (monto_teorico >= -999)',
+      safeSql
+    });
+
+    await pool.query(rollbackSql);
+    await pool.query(rollbackSql);
+    assert.equal((await namedConstraintState(pool)).length, NEGATIVE_CLOSE_CONSTRAINTS.length);
+
+    await testRollbackWrongDefinition({
+      table: 'public.cajas_sesiones',
+      constraintName: 'ck_cajas_sesiones_monto_teorico',
+      wrongCheckSql: 'CHECK (monto_teorico_cierre >= -999)',
+      rollbackSql
+    });
+    await testRollbackWrongDefinition({
+      table: 'public.cajas_arqueos',
+      constraintName: 'ck_cajas_arqueos_teorico',
+      wrongCheckSql: 'CHECK (monto_teorico >= -999)',
+      rollbackSql
+    });
+
+    await pool.query(safeSql);
+    const smoke = await runTransactionalFinancialSmoke();
+    const httpSmoke = await runHttpCloseSmoke();
+    const finalVerify = await runVerify(pool, verifySql);
+    assert.ok(finalVerify.negativeChecks.every((row) => Number(row.checks_equivalentes_no_negativos) === 0));
+
+    const targetMode = LEAVE_SAFE_APPLIED ? 'safe' : initialMode;
+    if (targetMode === 'legacy') {
+      await pool.query(rollbackSql);
+    } else {
+      await pool.query(safeSql);
+    }
+    const restoredRows = await namedConstraintState(pool);
+    assert.equal(restoredRows.length, targetMode === 'legacy' ? NEGATIVE_CLOSE_CONSTRAINTS.length : 0);
+
+    console.log(JSON.stringify({
+      projectRef: QA_PROJECT_REF,
+      initialMode,
+      restoredMode: targetMode,
+      leaveSafeApplied: LEAVE_SAFE_APPLIED,
+      lockTimeoutMs,
+      verifyBefore: before,
+      verifyAfter: after,
+      smoke,
+      httpSmoke,
+      finalNamedConstraints: restoredRows
+    }, null, 2));
+  } finally {
+    await closePool();
+  }
+};
+
+await main();
