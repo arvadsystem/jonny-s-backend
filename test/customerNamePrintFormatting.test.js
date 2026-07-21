@@ -14,7 +14,7 @@ import {
 const SHORT_CUSTOMER_NAME = 'Ana Lopez';
 const LONG_CUSTOMER_NAME = 'Maria Fernanda Hernandez Rodriguez de Martinez con apellido adicional';
 const LONG_UNBROKEN_CUSTOMER_NAME = `Cliente ${'ExtraordinariamenteLargo'.repeat(4)}`;
-const STRESS_CUSTOMER_NAME = `Cliente ${'ExtraordinariamenteLargo'.repeat(10)}`;
+const STRESS_CUSTOMER_NAME = `Cliente ${'ExtraordinariamenteLargo'.repeat(30)}`;
 
 const buildFactura = (widthMm, customerName) => ({
   id_factura: 501,
@@ -73,7 +73,7 @@ const extractCustomerCss = (html) => html.match(
   /\.comanda-cocina-print__customer-name\s*\{([\s\S]*?)\n\s*\}/
 )?.[1] || '';
 
-for (const [widthMm, expectedFontSize] of [[58, 9.3], [80, 10.5]]) {
+for (const [widthMm, expectedFontSize] of [[58, 6.2], [80, 7]]) {
   for (const customerName of [SHORT_CUSTOMER_NAME, LONG_CUSTOMER_NAME, LONG_UNBROKEN_CUSTOMER_NAME]) {
     test(`factura ${widthMm} mm imprime cliente actual a ${expectedFontSize} pt: ${customerName.length} caracteres`, async () => {
       const factura = buildFactura(widthMm, customerName);
@@ -105,7 +105,7 @@ for (const [widthMm, expectedFontSize] of [[58, 9.3], [80, 10.5]]) {
   });
 }
 
-for (const [widthMm, expectedFontSize] of [[58, 15.75], [80, 16.5]]) {
+for (const [widthMm, expectedFontSize] of [[58, 10.5], [80, 11]]) {
   for (const customerName of [SHORT_CUSTOMER_NAME, LONG_CUSTOMER_NAME, LONG_UNBROKEN_CUSTOMER_NAME]) {
     test(`comanda ${widthMm} mm imprime cliente actual a ${expectedFontSize} px: ${customerName.length} caracteres`, () => {
       const html = buildComandaCocinaHtml(buildComanda(customerName), { widthMm });
@@ -130,7 +130,7 @@ for (const [widthMm, expectedFontSize] of [[58, 15.75], [80, 16.5]]) {
 
 test('los renderers actuales conservan sus fallbacks cuando no hay nombre', () => {
   const pdfNodes = collectPdfTextNodes(buildVentaTicketPdfDefinition(buildFactura(58, null)).content);
-  assert.ok(pdfNodes.some((node) => node.text === 'Consumidor final' && node.fontSize === 9.3));
+  assert.ok(pdfNodes.some((node) => node.text === 'Consumidor final' && node.fontSize === 6.2));
 
   const html = buildComandaCocinaHtml(buildComanda(null), { widthMm: 58 });
   assert.match(html, /class="comanda-cocina-print__customer-name">N\/D<\/strong>/);
