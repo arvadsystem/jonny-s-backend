@@ -3,6 +3,7 @@ import { TEGUCIGALPA_TZ } from '../constants.js';
 const DATE_PATTERN = /^(\d{4})-(\d{2})-(\d{2})$/;
 const TIME_PATTERN = /^(\d{2}):(\d{2})$/;
 const HONDURAS_UTC_OFFSET_HOURS = 6;
+const MINUTE_MS = 60 * 1000;
 const HOURS_72_MS = 72 * 60 * 60 * 1000;
 
 const tegucigalpaDateFormatter = new Intl.DateTimeFormat('en-CA', {
@@ -84,6 +85,9 @@ const getTegucigalpaToday = (now) => {
 const wallTimeToEpochMs = (date, hour, minute) =>
   Date.UTC(date.year, date.month - 1, date.day, hour + HONDURAS_UTC_OFFSET_HOURS, minute);
 
+const getVentas72hCutoffEpochMs = (now) =>
+  Math.floor(now.getTime() / MINUTE_MS) * MINUTE_MS - HOURS_72_MS;
+
 export const resolveVentasTemporalFilter = (
   query = {},
   { limitedToLast72Hours = false, now = new Date() } = {}
@@ -144,7 +148,7 @@ export const resolveVentasTemporalFilter = (
     : { date: addCalendarDays(hastaDate, 1), hour: 0, minute: 0 };
   const startEpochMs = wallTimeToEpochMs(desdeDate, startHour, startMinute);
 
-  if (limitedToLast72Hours && startEpochMs < (now.getTime() - HOURS_72_MS)) {
+  if (limitedToLast72Hours && startEpochMs < getVentas72hCutoffEpochMs(now)) {
     return fail(
       'VENTAS_RANGO_72H_EXCEDIDO',
       'El historial de caja solo permite consultar ventas comprendidas en las ultimas 72 horas.',

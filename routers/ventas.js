@@ -5601,11 +5601,6 @@ router.get('/ventas', checkPermission(['VENTAS_VER']), async (req, res) => {
       pushFilter('COALESCE(p.id_sucursal, f.id_sucursal) = ANY($IDX::int[])', scope.allowedSucursalIds);
     }
 
-    if (scope.limitedToLast72Hours) {
-      filters.push(`f.fecha_hora_facturacion IS NOT NULL`);
-      filters.push(`f.fecha_hora_facturacion >= ${VENTAS_LIMIT_72H_CUTOFF_SQL}`);
-    }
-
     if (search) {
       const qLike = `%${search}%`;
       pushFilter(

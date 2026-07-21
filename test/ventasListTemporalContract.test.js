@@ -14,6 +14,8 @@ test('GET /ventas centraliza limites temporales inclusivo/exclusivo', () => {
   assert.match(listRoute, /f\.fecha_hora_facturacion >= \$IDX::timestamp/);
   assert.match(listRoute, /f\.fecha_hora_facturacion < \$IDX::timestamp/);
   assert.doesNotMatch(listRoute, /fecha_hora_facturacion\)\)::date/);
+  assert.doesNotMatch(listRoute, /VENTAS_LIMIT_72H_CUTOFF_SQL/);
+  assert.doesNotMatch(listRoute, /NOW\(\)[\s\S]*INTERVAL '72 hours'/i);
 });
 
 test('count, summary y data reutilizan exactamente el mismo whereClause', () => {
