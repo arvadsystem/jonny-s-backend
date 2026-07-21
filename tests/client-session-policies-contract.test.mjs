@@ -21,7 +21,7 @@ test('password y Google crean sesiones exclusivas solo para Cliente', async () =
   assert.ok((clientSource.match(/maxAge:\s*1000 \* 60 \* 60 \* 8/g) || []).length >= 2);
 });
 
-test('/me valida sesion y actualiza ultima_actividad sin cambiar su respuesta', async () => {
+test('/me valida sesion, renueva P_COCINA y actualiza ultima_actividad sin cambiar su respuesta', async () => {
   const [source, touchSource, sessionSource] = await Promise.all([
     readSource('routers/login.js'),
     readSource('middleware/touchSession.js'),
@@ -30,13 +30,29 @@ test('/me valida sesion y actualiza ultima_actividad sin cambiar su respuesta', 
 
   assert.match(
     source,
-    /router\.get\('\/me', authRequired, requireActiveSession, requireSessionTouchMiddleware, async \(req, res\) =>/
+    /router\.get\('\/me', authRequired, requireActiveSession, refreshKitchenDisplaySession, requireSessionTouchMiddleware, async \(req, res\) =>/
   );
   assert.match(source, /issueCsrf\(req, res, \{ reuseIfPresent: true \}\)/);
   assert.match(touchSource, /const touched = await touchSession\(user\.sid\)/);
   assert.match(touchSource, /if \(touched !== 1\)/);
   assert.match(sessionSource, /return result\.rowCount \|\| 0/);
   assert.match(sessionSource, /make_interval\([\s\S]*mins => \(CASE[\s\S]*END\)::integer/);
+});
+
+test('la renovacion P_COCINA ocurre despues de auth y sesion activa', async () => {
+  const source = await readSource('app.js');
+  const authIndex = source.indexOf('app.use(authRequired)');
+  const activeIndex = source.indexOf('app.use(requireActiveSession)');
+  const refreshIndex = source.indexOf('app.use(refreshKitchenDisplaySession)');
+  const passwordIndex = source.indexOf('app.use(requirePasswordChange)');
+  const touchIndex = source.indexOf('app.use(touchSessionMiddleware)');
+  const csrfIndex = source.indexOf('app.use(csrfProtect)');
+
+  assert.ok(authIndex >= 0 && authIndex < activeIndex);
+  assert.ok(activeIndex < refreshIndex);
+  assert.ok(refreshIndex < passwordIndex);
+  assert.ok(passwordIndex < touchIndex);
+  assert.ok(touchIndex < csrfIndex);
 });
 
 test('pedidos publicos validan JWT, sesion activa, CSRF, Cliente y touch antes del negocio', async () => {

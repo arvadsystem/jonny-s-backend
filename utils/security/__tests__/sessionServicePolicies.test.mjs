@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import {
   DAILY_CUTOFF_PROTECTED_ROLE_CODES,
+  INACTIVITY_EXCLUDED_ROLE_CODES,
   OPERATIONAL_DAILY_CUTOFF_ROLE_CODES,
   closeOperationalSessionsAtDailyCutoff,
   createExclusiveClientSession
@@ -174,7 +175,17 @@ describe('createExclusiveClientSession', () => {
 });
 
 describe('closeOperationalSessionsAtDailyCutoff', () => {
-  it('limita el cierre a los cuatro roles, al cutoff y conserva historico', async () => {
+  it('mantiene P_COCINA fuera del daily cutoff pero dentro de la exclusion por inactividad', async () => {
+    assert.deepEqual(OPERATIONAL_DAILY_CUTOFF_ROLE_CODES, [
+      'COCINA',
+      'MESERO',
+      'AUXILIAR_COCINA'
+    ]);
+    assert.equal(OPERATIONAL_DAILY_CUTOFF_ROLE_CODES.includes('P_COCINA'), false);
+    assert.equal(INACTIVITY_EXCLUDED_ROLE_CODES.includes('P_COCINA'), true);
+  });
+
+  it('limita el cierre a los tres roles operativos, al cutoff y conserva historico', async () => {
     const pool = createTransactionalPool({ dailyClosedSessions: 4 });
 
     const result = await closeOperationalSessionsAtDailyCutoff(
