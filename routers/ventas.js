@@ -165,6 +165,7 @@ import {
   parsePositiveInt,
   parseRequiredPositiveInt
 } from './ventas/utils/parseUtils.js';
+import { resolveVentasTemporalFilter } from './ventas/services/ventasTemporalFilterService.js';
 import {
   createVentasPerfTracker,
   instrumentVentasSqlClient,
@@ -5565,13 +5566,14 @@ router.get('/ventas', checkPermission(['VENTAS_VER']), async (req, res) => {
     const cliente = typeof req.query.cliente === 'string' ? req.query.cliente.trim() : '';
     const estado = typeof req.query.estado === 'string' ? req.query.estado.trim() : '';
 
-    const fechaDesde = parseOptionalDateInput(req.query.fechaDesde);
-    const fechaHasta = parseOptionalDateInput(req.query.fechaHasta);
-    if (fechaDesde === '__INVALID_DATE__' || fechaHasta === '__INVALID_DATE__') {
-      return res.status(400).json({
+    const temporalFilter = resolveVentasTemporalFilter(req.query, {
+      limitedToLast72Hours: scope.limitedToLast72Hours
+    });
+    if (!temporalFilter.ok) {
+      return res.status(temporalFilter.status).json({
         error: true,
-        code: 'VENTAS_FECHA_INVALIDA',
-        message: 'fechaDesde y fechaHasta deben tener formato YYYY-MM-DD.'
+        code: temporalFilter.code,
+        message: temporalFilter.message
       });
     }
 
@@ -5679,12 +5681,8 @@ router.get('/ventas', checkPermission(['VENTAS_VER']), async (req, res) => {
       pushFilter('COALESCE(p.id_cliente, f.id_cliente) = $IDX', idCliente);
     }
 
-    if (fechaDesde) {
-      pushFilter('(f.fecha_hora_facturacion)::date >= $IDX::date', fechaDesde);
-    }
-    if (fechaHasta) {
-      pushFilter('(f.fecha_hora_facturacion)::date <= $IDX::date', fechaHasta);
-    }
+    pushFilter('f.fecha_hora_facturacion >= $IDX::timestamp', temporalFilter.bounds.startInclusive);
+    pushFilter('f.fecha_hora_facturacion < $IDX::timestamp', temporalFilter.bounds.endExclusive);
 
     const whereClause = filters.length ? `WHERE ${filters.join(' AND ')}` : '';
 
@@ -5921,6 +5919,7 @@ router.get('/ventas', checkPermission(['VENTAS_VER']), async (req, res) => {
         }
         : null,
       filters: {
+        ...temporalFilter.filters,
         scope: {
           canSelectSucursal: scope.isSuperAdmin,
           selectedSucursalId: idSucursalEffective,
