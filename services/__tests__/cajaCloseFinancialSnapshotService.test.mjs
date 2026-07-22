@@ -194,6 +194,8 @@ describe('loadCajaCloseFinancialSnapshot', () => {
 
     assert.equal(calls.length, 1);
     assert.match(calls[0].sql, /WITH session_base AS/);
+    assert.match(calls[0].sql, /attributed_reversion_payment_state AS/);
+    assert.match(calls[0].sql, /reversion_payment_mismatch_summary AS/);
     assert.match(calls[0].sql, /reversion_allocations AS/);
     assert.match(calls[0].sql, /COALESCE\(MAX\(id_factura_cobro\), 0\)::text FROM payments/);
     assert.equal(snapshot.metodos.length, 3);
@@ -201,15 +203,284 @@ describe('loadCajaCloseFinancialSnapshot', () => {
     assert.equal(snapshot.fingerprint.max_id_movimiento_caja, '9223372036854775807');
   });
 
-  it('usa EXISTS para reversiones heredadas y no castea movimientos a int', async () => {
+  it('resuelve reversiones por sesion, limita el reparto a esa sesion y no castea movimientos a int', async () => {
     const queryRunner = {
       async query(sql) {
         assert.match(sql, /EXISTS \(\s*SELECT 1\s*FROM public\.facturas_cobros fc_scope/);
+        assert.match(sql, /fc\.id_sesion_caja\s*=\s*rs\.id_sesion_caja_atribuida/);
+        assert.match(sql, /CARDINALITY\(rs\.sesiones_cobro\)\s*>=\s*2/);
         assert.doesNotMatch(sql, /MAX\(cm\.id_movimiento_caja\)::int/);
         return { rows: [] };
       }
     };
 
     await loadCajaCloseFinancialSnapshot({ queryRunner, idSesionCaja: '1' });
+  });
+
+  it('rechaza con 409 una reversion heredada con cobros en dos sesiones', async () => {
+    const queryRunner = {
+      async query() {
+        return {
+          rows: [{
+            id_sesion_caja: '1',
+            reversiones_sesion_ambiguas: [{
+              id_reversion: '91',
+              id_factura_original: '81',
+              sesiones: ['1', '2']
+            }],
+            metodos_pago_invalidos: []
+          }]
+        };
+      }
+    };
+
+    await assert.rejects(
+      loadCajaCloseFinancialSnapshot({ queryRunner, idSesionCaja: '1' }),
+      (error) => {
+        assert.equal(error.httpStatus, 409);
+        assert.equal(error.code, 'VENTAS_CAJAS_REVERSION_SESSION_AMBIGUOUS');
+        assert.deepEqual(error.details, {
+          id_reversion: '91',
+          id_factura_original: '81',
+          sesiones: ['1', '2']
+        });
+        return true;
+      }
+    );
+  });
+
+  it('rechaza una reversion atribuida sin cobros en esa sesion con detalles controlados', async () => {
+    const queryRunner = {
+      async query() {
+        return {
+          rows: [{
+            id_sesion_caja: '1',
+            reversiones_sesion_ambiguas: [],
+            reversiones_sesion_pago_inconsistentes: [{
+              id_reversion: '92',
+              id_factura_original: '82',
+              id_sesion_caja_atribuida: '1',
+              sesiones_con_cobros: ['2'],
+              cantidad_cobros_sesion_atribuida: 0,
+              total_cobrado_sesion_atribuida: '0',
+              motivo: 'SIN_COBROS_EN_SESION_ATRIBUIDA'
+            }],
+            metodos_pago_invalidos: []
+          }]
+        };
+      }
+    };
+
+    await assert.rejects(
+      loadCajaCloseFinancialSnapshot({ queryRunner, idSesionCaja: '1' }),
+      (error) => {
+        assert.equal(error.httpStatus, 409);
+        assert.equal(error.code, 'VENTAS_CAJAS_REVERSION_SESSION_PAYMENT_MISMATCH');
+        assert.equal(error.details.id_reversion, '92');
+        assert.equal(error.details.id_sesion_caja_atribuida, '1');
+        assert.deepEqual(error.details.sesiones_con_cobros, ['2']);
+        assert.equal(error.details.cantidad_cobros_sesion_atribuida, 0);
+        return true;
+      }
+    );
+  });
+
+  it('no devuelve un snapshot si fingerprint.total_reversado difiere de la suma por metodo', async () => {
+    const queryRunner = {
+      async query() {
+        return {
+          rows: [{
+            id_sesion_caja: '1',
+            metodos_pago_invalidos: [],
+            metodos: [
+              { id_metodo_pago: 1, codigo: 'EFECTIVO', reversiones: '10' },
+              { id_metodo_pago: 2, codigo: 'TARJETA', reversiones: '0' },
+              { id_metodo_pago: 3, codigo: 'TRANSFERENCIA', reversiones: '0' }
+            ],
+            fingerprint: { total_reversado: '11' }
+          }]
+        };
+      }
+    };
+    await assert.rejects(
+      loadCajaCloseFinancialSnapshot({ queryRunner, idSesionCaja: '1' }),
+      (error) => error.httpStatus === 409
+        && error.code === 'VENTAS_CAJAS_REVERSION_ACCOUNTING_MISMATCH'
+        && error.details.total_reversiones_por_metodo === 10
+        && error.details.total_reversado === 11
+    );
+  });
+
+  it('resuelve catalogValidation por codigo exacto (nunca por MIN(id) arbitrario)', async () => {
+    const queryRunner = {
+      async query() {
+        return {
+          rows: [{
+            id_sesion_caja: '30',
+            monto_apertura: '0',
+            ventas_efectivo_netas: '0',
+            ventas_tarjeta_netas: '0',
+            ventas_transferencia_netas: '0',
+            ventas_no_efectivo_netas: '400',
+            ingresos_manuales: '0',
+            egresos_manuales: '0',
+            efectivo_teorico: '0',
+            tarjeta_teorico: '0',
+            transferencia_teorico: '0',
+            total_teorico: '400',
+            metodos_pago_invalidos: [],
+            metodos: [
+              { id_metodo_pago: 1, codigo: 'EFECTIVO', ventas_brutas: '0', reversiones: '0', ventas_netas: '0', monto_teorico: '0' },
+              { id_metodo_pago: 2, codigo: 'TARJETA', ventas_brutas: '0', reversiones: '0', ventas_netas: '0', monto_teorico: '0' },
+              { id_metodo_pago: 3, codigo: 'TRANSFERENCIA', ventas_brutas: '0', reversiones: '0', ventas_netas: '0', monto_teorico: '0' }
+            ],
+            catalogo_requerido: {
+              EFECTIVO: { id_metodo_pago: 1, activo: true, afecta_efectivo: true },
+              TARJETA: { id_metodo_pago: 2, activo: true, afecta_efectivo: false },
+              TRANSFERENCIA: { id_metodo_pago: 3, activo: true, afecta_efectivo: false },
+              OTRO: { id_metodo_pago: 4, activo: true, afecta_efectivo: false }
+            },
+            otros_no_efectivo_ventas_brutas: '400',
+            otros_no_efectivo_reversiones: '0',
+            otros_no_efectivo_ventas_netas: '400',
+            otros_no_efectivo_metodos_agrupados: [{ codigo: 'OTRO', ventas_brutas: '400', reversiones: '0', ventas_netas: '400' }],
+            fingerprint: {}
+          }]
+        };
+      }
+    };
+
+    const snapshot = await loadCajaCloseFinancialSnapshot({ queryRunner, idSesionCaja: '30' });
+
+    assert.equal(snapshot.catalogValidation.EFECTIVO.valido, true);
+    assert.equal(snapshot.catalogValidation.TARJETA.valido, true);
+    assert.equal(snapshot.catalogValidation.TRANSFERENCIA.valido, true);
+    assert.equal(snapshot.catalogValidation.OTRO.valido, true);
+    assert.equal(snapshot.catalogValidation.OTRO.id_metodo_pago, 4);
+    assert.equal(snapshot.catalogValidation.OTRO.coincidencias, 1);
+    assert.equal(snapshot.fingerprint.catalogo_otro, '1:4:1:0');
+    assert.equal(snapshot.otrosNoEfectivo.ventas_brutas, 400);
+    assert.equal(snapshot.otrosNoEfectivo.ventas_netas, 400);
+    assert.deepEqual(snapshot.otrosNoEfectivo.metodos_agrupados, [
+      { codigo: 'OTRO', ventas_brutas: 400, reversiones: 0, ventas_netas: 400 }
+    ]);
+  });
+
+  it('detecta codigos de catalogo duplicados sin ocultarlos en jsonb_object_agg', async () => {
+    const queryRunner = {
+      async query(sql) {
+        assert.match(sql, /COUNT\(pmc\.id_metodo_pago\)::int AS coincidencias/);
+        assert.match(sql, /GROUP BY rc\.codigo/);
+        return {
+          rows: [{
+            id_sesion_caja: '34',
+            metodos_pago_invalidos: [],
+            metodos: [],
+            catalogo_requerido: {
+              TARJETA: {
+                coincidencias: 2,
+                id_metodo_pago: null,
+                activo: null,
+                afecta_efectivo: null
+              }
+            },
+            fingerprint: {}
+          }]
+        };
+      }
+    };
+
+    const snapshot = await loadCajaCloseFinancialSnapshot({ queryRunner, idSesionCaja: '34' });
+    assert.equal(snapshot.catalogValidation.TARJETA.valido, false);
+    assert.equal(snapshot.catalogValidation.TARJETA.motivo, 'CODIGO_DUPLICADO');
+    assert.equal(snapshot.catalogValidation.TARJETA.coincidencias, 2);
+    assert.equal(snapshot.fingerprint.catalogo_tarjeta, '2:0:0:NULL');
+  });
+
+  it('marca catalogValidation invalido por codigo faltante, inactivo o afecta_efectivo incorrecto', async () => {
+    const buildRow = (catalogoRequerido) => ({
+      rows: [{
+        id_sesion_caja: '31',
+        metodos_pago_invalidos: [],
+        catalogo_requerido: catalogoRequerido,
+        metodos: [],
+        fingerprint: {}
+      }]
+    });
+
+    const queryRunnerMissing = { async query() { return buildRow({}); } };
+    const missing = await loadCajaCloseFinancialSnapshot({ queryRunner: queryRunnerMissing, idSesionCaja: '31' });
+    assert.equal(missing.catalogValidation.EFECTIVO.valido, false);
+    assert.equal(missing.catalogValidation.EFECTIVO.motivo, 'NO_EXISTE');
+    assert.equal(missing.catalogValidation.OTRO.valido, false);
+    assert.equal(missing.catalogValidation.OTRO.motivo, 'NO_EXISTE');
+
+    const queryRunnerInactive = {
+      async query() {
+        return buildRow({ EFECTIVO: { id_metodo_pago: 1, activo: false, afecta_efectivo: true } });
+      }
+    };
+    const inactive = await loadCajaCloseFinancialSnapshot({ queryRunner: queryRunnerInactive, idSesionCaja: '31' });
+    assert.equal(inactive.catalogValidation.EFECTIVO.valido, false);
+    assert.equal(inactive.catalogValidation.EFECTIVO.motivo, 'INACTIVO');
+
+    const queryRunnerMisclassified = {
+      async query() {
+        return buildRow({ TARJETA: { id_metodo_pago: 2, activo: true, afecta_efectivo: true } });
+      }
+    };
+    const misclassified = await loadCajaCloseFinancialSnapshot({ queryRunner: queryRunnerMisclassified, idSesionCaja: '31' });
+    assert.equal(misclassified.catalogValidation.TARJETA.valido, false);
+    assert.equal(misclassified.catalogValidation.TARJETA.motivo, 'AFECTA_EFECTIVO_INCORRECTO');
+  });
+
+  it('degrada de forma segura cuando faltan los campos nuevos (fixture con forma anterior)', async () => {
+    const queryRunner = {
+      async query() {
+        return {
+          rows: [{
+            id_sesion_caja: '32',
+            metodos_pago_invalidos: [],
+            metodos: [
+              { id_metodo_pago: 1, codigo: 'EFECTIVO', ventas_brutas: '0', reversiones: '0', ventas_netas: '0', monto_teorico: '0' }
+            ],
+            fingerprint: {}
+          }]
+        };
+      }
+    };
+
+    const snapshot = await loadCajaCloseFinancialSnapshot({ queryRunner, idSesionCaja: '32' });
+    assert.equal(snapshot.catalogValidation.EFECTIVO.valido, false);
+    assert.equal(snapshot.otrosNoEfectivo.ventas_brutas, 0);
+    assert.equal(snapshot.otrosNoEfectivo.reversiones, 0);
+    assert.equal(snapshot.otrosNoEfectivo.ventas_netas, 0);
+    assert.deepEqual(snapshot.otrosNoEfectivo.metodos_agrupados, []);
+  });
+
+  it('conserva ventas_netas negativo en el bucket agrupado (reversiones superiores a ventas)', async () => {
+    const queryRunner = {
+      async query() {
+        return {
+          rows: [{
+            id_sesion_caja: '33',
+            metodos_pago_invalidos: [],
+            metodos: [],
+            catalogo_requerido: {
+              OTRO: { id_metodo_pago: 4, activo: true, afecta_efectivo: false }
+            },
+            otros_no_efectivo_ventas_brutas: '0',
+            otros_no_efectivo_reversiones: '300',
+            otros_no_efectivo_ventas_netas: '-300',
+            otros_no_efectivo_metodos_agrupados: [{ codigo: 'OTRO', ventas_brutas: '0', reversiones: '300', ventas_netas: '-300' }],
+            fingerprint: { total_reversado: '300' }
+          }]
+        };
+      }
+    };
+
+    const snapshot = await loadCajaCloseFinancialSnapshot({ queryRunner, idSesionCaja: '33' });
+    assert.equal(snapshot.otrosNoEfectivo.ventas_netas, -300);
+    assert.equal(snapshot.otrosNoEfectivo.metodos_agrupados[0].ventas_netas, -300);
   });
 });

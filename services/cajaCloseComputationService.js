@@ -1,5 +1,13 @@
 const METHOD_CODES = Object.freeze(['EFECTIVO', 'TARJETA', 'TRANSFERENCIA']);
-export const OTHER_NON_CASH_METHOD_CODE = 'OTROS_NO_EFECTIVO';
+// Codigo tecnico persistido para la fila agrupada automatica. Debe coincidir
+// exactamente con cat_metodos_pago.codigo = 'OTRO' (fk_ccam_metodo /
+// fk_ccvm_metodo apuntan al mismo id que este codigo). "Otros no efectivo" es
+// unicamente una etiqueta de presentacion (display_name / frontend), nunca el
+// valor persistido de metodo_pago_codigo.
+export const OTHER_NON_CASH_METHOD_CODE = 'OTRO';
+export const OTHER_NON_CASH_DISPLAY_NAME = 'Otros no efectivo';
+const OTHER_NON_CASH_AUTO_OBSERVATION =
+  'Conciliación automática: el saldo neto de otros métodos no efectivo es negativo por reversiones o ajustes.';
 
 const roundMoney = (value) => Number(Number(value || 0).toFixed(2));
 const normalizeMethodCode = (value) => String(value || '').trim().toUpperCase();
@@ -74,28 +82,58 @@ export const fingerprintValuesEqual = (key, left, right) => {
   return String(left ?? '') === String(right ?? '');
 };
 
+const describeCatalogState = (entry) => {
+  if (!entry?.id_metodo_pago) return 'NO_EXISTE';
+  return entry.activo ? 'ACTIVO' : 'INACTIVO';
+};
+
+// 5.1: EFECTIVO/TARJETA/TRANSFERENCIA deben tener exactamente una
+// configuracion valida (id positivo, activo, afecta_efectivo correcto) antes
+// de escribir nada. snapshot.catalogValidation viene de una resolucion por
+// codigo exacto (ver cajaCloseFinancialSnapshotService); ya no se fabrican
+// filas con id_metodo_pago=null que pasen esta validacion por "tener codigo".
+export const assertCoreCatalogValid = (catalogValidation, {
+  errorCode = 'VENTAS_CAJAS_METODO_CATALOGO_INCOMPLETO',
+  publicMessage = null
+} = {}) => {
+  for (const codigo of METHOD_CODES) {
+    const entry = catalogValidation?.[codigo];
+    const coincidencias = Number(entry?.coincidencias || 0);
+    if (!entry || coincidencias !== 1 || !entry.valido) {
+      throw createCajaError(
+        409,
+        errorCode,
+        publicMessage || `El catalogo de metodos de pago no tiene una configuracion valida para ${codigo}.`,
+        {
+          codigo,
+          coincidencias,
+          estado_encontrado: describeCatalogState(entry),
+          afecta_efectivo_encontrado: entry?.afecta_efectivo ?? null,
+          motivo: entry?.motivo || 'NO_EXISTE'
+        }
+      );
+    }
+  }
+};
+
 export const buildSegmentedArqueoComputation = ({
   snapshot,
   payloadRows,
   threshold,
   requireObservacionOnDifference = true
 }) => {
+  const catalogValidation = snapshot?.catalogValidation || {};
+  assertCoreCatalogValid(catalogValidation);
+
   const methodCatalog = Array.isArray(snapshot?.metodos) ? snapshot.metodos : [];
-  const methodCodes = new Set(methodCatalog.map((row) => normalizeMethodCode(row.codigo)));
-  for (const requiredCode of METHOD_CODES) {
-    if (!methodCodes.has(requiredCode)) {
-      throw createCajaError(
-        409,
-        'VENTAS_CAJAS_METODO_CATALOGO_INCOMPLETO',
-        `No se encontro el metodo de pago requerido: ${requiredCode}.`
-      );
-    }
-  }
 
   const declaredByCode = new Map();
-  for (const row of Array.isArray(payloadRows) ? payloadRows : []) {
+  const normalizedPayloadRows = Array.isArray(payloadRows) ? payloadRows : [];
+  for (const row of normalizedPayloadRows) {
     const code = normalizeMethodCode(row?.metodo_pago_codigo);
-    if (!code || !methodCodes.has(code)) {
+    // El cliente solo declara los tres metodos manuales. OTRO y cualquier
+    // codigo futuro son responsabilidad exclusiva del backend.
+    if (!code || !METHOD_CODES.includes(code)) {
       throw createCajaError(400, 'VENTAS_CAJAS_ARQUEO_METODO_INVALID', 'El metodo_pago_codigo del arqueo es invalido.');
     }
     if (declaredByCode.has(code)) {
@@ -118,6 +156,18 @@ export const buildSegmentedArqueoComputation = ({
     });
   }
 
+  // No se autocompletan metodos con teorico cero: omitir TARJETA o
+  // TRANSFERENCIA cambia el significado de la declaracion manual. Despues de
+  // normalizar y detectar duplicados/invalidos, el conjunto debe ser exacto.
+  for (const code of METHOD_CODES) {
+    if (!declaredByCode.has(code)) {
+      throw createCajaError(400, 'VENTAS_CAJAS_ARQUEO_METODO_REQUIRED', `Debe declarar arqueo para ${code}.`);
+    }
+  }
+  if (normalizedPayloadRows.length !== METHOD_CODES.length || declaredByCode.size !== METHOD_CODES.length) {
+    throw createCajaError(400, 'VENTAS_CAJAS_ARQUEO_METODO_INVALID', 'Debe declarar exactamente EFECTIVO, TARJETA y TRANSFERENCIA.');
+  }
+
   const normalizedThreshold = Number.isFinite(Number(threshold)) && Number(threshold) >= 0
     ? Number(threshold)
     : 0;
@@ -130,16 +180,15 @@ export const buildSegmentedArqueoComputation = ({
     const salesGross = roundMoney(method.ventas_brutas);
     const montoTeoricoMetodo = roundMoney(method.monto_teorico);
     const declaredEntry = declaredByCode.get(code);
-    const autoComplete = !declaredEntry && montoTeoricoMetodo === 0;
-    if (!declaredEntry && !autoComplete) {
+    if (!declaredEntry) {
       throw createCajaError(400, 'VENTAS_CAJAS_ARQUEO_METODO_REQUIRED', `Debe declarar arqueo para ${code}.`);
     }
 
-    const montoDeclaradoMetodo = autoComplete ? 0 : Number(declaredEntry.monto_declarado);
+    const montoDeclaradoMetodo = Number(declaredEntry.monto_declarado);
     const diferenciaMetodo = roundMoney(montoDeclaradoMetodo - montoTeoricoMetodo);
     const requiereRevision = Math.abs(diferenciaMetodo) > normalizedThreshold;
-    const observacionMetodo = autoComplete ? null : declaredEntry.observacion;
-    const cantidadReferenciasMetodo = autoComplete ? null : declaredEntry.cantidad_referencias;
+    const observacionMetodo = declaredEntry.observacion;
+    const cantidadReferenciasMetodo = declaredEntry.cantidad_referencias;
 
     if ((code === 'TARJETA' || code === 'TRANSFERENCIA') && salesGross > 0 && cantidadReferenciasMetodo === null) {
       throw createCajaError(
@@ -176,53 +225,84 @@ export const buildSegmentedArqueoComputation = ({
       observacion_requerida: requireObservacionOnDifference && requiereRevision,
       observacion_presente: Boolean(observacionMetodo),
       resultado: resolveArqueoResultado(diferenciaMetodo),
-      completado_automaticamente: autoComplete
+      completado_automaticamente: false
     });
   }
 
-  const totalTeorico = snapshot?.totalTeorico === null || snapshot?.totalTeorico === undefined
-    ? totalTeoricoSegmentado
-    : roundMoney(snapshot.totalTeorico);
+  // 5.2/5.4: fila automatica y no editable "OTRO". Agrupa todo metodo activo
+  // con afecta_efectivo=false que no sea TARJETA/TRANSFERENCIA (OTRO y
+  // billeteras/enlaces de pago futuros). Solo se genera cuando existe
+  // actividad bruta o reversiones en ese grupo (5.2 "cuando generar la
+  // fila"); si el grupo esta completamente inactivo se omite, preservando el
+  // comportamiento de 3 filas para sesiones sin esa actividad.
+  const otrosNoEfectivo = snapshot?.otrosNoEfectivo || {
+    ventas_brutas: 0,
+    reversiones: 0,
+    ventas_netas: 0,
+    metodos_agrupados: []
+  };
+  const otrosVentasBrutas = roundMoney(otrosNoEfectivo.ventas_brutas);
+  const otrosReversionesAgrupadas = roundMoney(otrosNoEfectivo.reversiones);
+  const hasGroupedOtherActivity = otrosVentasBrutas !== 0 || otrosReversionesAgrupadas !== 0;
 
-  // Fila automatica y no editable: agrupa TODO metodo activo con afecta_efectivo
-  // = false que no sea TARJETA/TRANSFERENCIA (OTRO y cualquier metodo futuro),
-  // para que el detalle visible nunca deje dinero fuera de una fila (evita que
-  // el residual se sume "en silencio" al total declarado, como ocurria antes).
-  // monto_teorico conserva el valor real (puede ser negativo, p. ej. una
-  // reversion de sesion cruzada); monto_declarado se ancla en 0 como piso
-  // porque la columna persistida no admite valores negativos (ck_ccam/ck_ccvm
-  // monto_declarado >= 0, fuera del alcance de este cambio). Por eso
-  // completado_automaticamente/requiere_revision son fijos: nunca depende de
-  // un ingreso manual ni bloquea el cierre.
-  const otrosMontoTeorico = roundMoney(totalTeorico - totalTeoricoSegmentado);
-  const otrosMontoDeclarado = Math.max(0, otrosMontoTeorico);
-  const otrosDiferencia = roundMoney(otrosMontoDeclarado - otrosMontoTeorico);
-  // cajas_cierres_arqueos_metodos.id_metodo_pago es NOT NULL con FK real a
-  // cat_metodos_pago (fk_ccam_metodo): no admite NULL ni un sentinel
-  // inexistente. El snapshot resuelve un id real (cualquier metodo activo o
-  // no que no sea EFECTIVO/TARJETA/TRANSFERENCIA) como ancla de la fila
-  // agrupada; metodo_pago_codigo sigue siendo la fuente de verdad semantica.
-  const otrosIdMetodoPago = Number.isFinite(Number(snapshot?.otrosNoEfectivoIdMetodoPago))
-    ? Number(snapshot.otrosNoEfectivoIdMetodoPago)
-    : null;
-  rows.push({
-    id_metodo_pago: otrosIdMetodoPago,
-    metodo_pago_codigo: OTHER_NON_CASH_METHOD_CODE,
-    monto_teorico: otrosMontoTeorico,
-    monto_declarado: otrosMontoDeclarado,
-    diferencia: otrosDiferencia,
-    cantidad_referencias: null,
-    observacion: null,
-    requiere_revision: false,
-    observacion_requerida: false,
-    observacion_presente: false,
-    resultado: resolveArqueoResultado(otrosDiferencia),
-    completado_automaticamente: true
-  });
+  if (hasGroupedOtherActivity) {
+    const otroValidation = catalogValidation.OTRO;
+    if (!otroValidation || !otroValidation.valido) {
+      throw createCajaError(
+        409,
+        'VENTAS_CAJAS_OTROS_NO_EFECTIVO_CONFIG_INVALID',
+        'Existen ventas o reversiones en metodos no efectivo agrupados, pero el metodo OTRO no tiene una configuracion valida en el catalogo.',
+        {
+          codigo: 'OTRO',
+          estado_encontrado: describeCatalogState(otroValidation),
+          afecta_efectivo_encontrado: otroValidation?.afecta_efectivo ?? null,
+          motivo: otroValidation?.motivo || 'NO_EXISTE'
+        }
+      );
+    }
 
-  // Construidos a partir de las filas (incluida OTROS_NO_EFECTIVO) para que la
-  // suma del detalle visible coincida siempre, exactamente, con estos totales.
-  const totalDeclarado = roundMoney(totalDeclaradoSegmentado + otrosMontoDeclarado);
+    // monto_teorico conserva el valor real (puede ser negativo, p. ej.
+    // reversiones superiores a las ventas del grupo). monto_declarado se
+    // ancla en 0 como piso porque la columna persistida no admite valores
+    // negativos (ck_ccam/ck_ccvm monto_declarado >= 0). Cuando eso ocurre la
+    // diferencia queda visible y requiere_revision=true (5.4): nunca se
+    // marca una fila con diferencia distinta de cero como revisada.
+    const otrosMontoTeorico = roundMoney(otrosNoEfectivo.ventas_netas);
+    const otrosMontoDeclarado = otrosMontoTeorico >= 0 ? otrosMontoTeorico : 0;
+    const otrosDiferencia = roundMoney(otrosMontoDeclarado - otrosMontoTeorico);
+    const otrosRequiereRevision = otrosDiferencia !== 0;
+
+    totalTeoricoSegmentado = roundMoney(totalTeoricoSegmentado + otrosMontoTeorico);
+    totalDeclaradoSegmentado = roundMoney(totalDeclaradoSegmentado + otrosMontoDeclarado);
+    rows.push({
+      id_metodo_pago: otroValidation.id_metodo_pago,
+      metodo_pago_codigo: OTHER_NON_CASH_METHOD_CODE,
+      display_name: OTHER_NON_CASH_DISPLAY_NAME,
+      monto_teorico: otrosMontoTeorico,
+      monto_declarado: otrosMontoDeclarado,
+      diferencia: otrosDiferencia,
+      cantidad_referencias: null,
+      observacion: otrosRequiereRevision ? OTHER_NON_CASH_AUTO_OBSERVATION : null,
+      requiere_revision: otrosRequiereRevision,
+      observacion_requerida: false,
+      observacion_presente: otrosRequiereRevision,
+      resultado: resolveArqueoResultado(otrosDiferencia),
+      completado_automaticamente: true,
+      editable: false,
+      ventas_brutas_agrupadas: otrosVentasBrutas,
+      reversiones_agrupadas: otrosReversionesAgrupadas,
+      metodos_agrupados: Array.isArray(otrosNoEfectivo.metodos_agrupados)
+        ? otrosNoEfectivo.metodos_agrupados
+        : []
+    });
+  }
+
+  // 5.5: los totales se calculan EXCLUSIVAMENTE a partir de las filas finales
+  // (incluida OTRO cuando aplica), nunca desde un total independiente. Esto
+  // garantiza por construccion que sum(rows.monto_teorico) === total y
+  // sum(rows.monto_declarado) === total, sin sumar ningun grupo dos veces.
+  const totalTeorico = totalTeoricoSegmentado;
+  const totalDeclarado = totalDeclaradoSegmentado;
 
   return {
     rows,
@@ -232,4 +312,277 @@ export const buildSegmentedArqueoComputation = ({
     snapshot,
     financialSummary: snapshot
   };
+};
+
+export const assertCloseValidationArithmeticIntegrity = ({
+  validation,
+  validationMethods,
+  threshold = 0
+}) => {
+  const rows = Array.isArray(validationMethods) ? validationMethods : [];
+  const normalizedThreshold = Number.isFinite(Number(threshold)) && Number(threshold) >= 0
+    ? roundMoney(threshold)
+    : 0;
+  const inconsistencies = [];
+  let totalTeorico = 0;
+  let totalDeclarado = 0;
+  let hasMethodDifference = false;
+
+  const readMoney = (value, field, methodCode) => {
+    const parsed = Number(value);
+    if (!Number.isFinite(parsed)) {
+      inconsistencies.push({ metodo_pago_codigo: methodCode, campo: field, motivo: 'MONTO_INVALIDO' });
+      return 0;
+    }
+    return roundMoney(parsed);
+  };
+
+  for (const row of rows) {
+    const methodCode = normalizeMethodCode(row?.metodo_pago_codigo) || 'VACIO';
+    const montoTeorico = readMoney(row?.monto_teorico, 'monto_teorico', methodCode);
+    const montoDeclarado = readMoney(row?.monto_declarado, 'monto_declarado', methodCode);
+    const storedDifference = readMoney(row?.diferencia, 'diferencia', methodCode);
+    const expectedDifference = roundMoney(montoDeclarado - montoTeorico);
+    const expectedRequiresReview = methodCode === OTHER_NON_CASH_METHOD_CODE && montoTeorico < 0
+      ? true
+      : Math.abs(expectedDifference) > normalizedThreshold;
+
+    if (storedDifference !== expectedDifference) {
+      inconsistencies.push({
+        metodo_pago_codigo: methodCode,
+        campo: 'diferencia',
+        almacenado: storedDifference,
+        esperado: expectedDifference
+      });
+    }
+    if (Boolean(row?.requiere_revision) !== expectedRequiresReview) {
+      inconsistencies.push({
+        metodo_pago_codigo: methodCode,
+        campo: 'requiere_revision',
+        almacenado: Boolean(row?.requiere_revision),
+        esperado: expectedRequiresReview
+      });
+    }
+
+    if (methodCode === OTHER_NON_CASH_METHOD_CODE) {
+      const expectedOtroDeclared = montoTeorico >= 0 ? montoTeorico : 0;
+      const expectedOtroDifference = roundMoney(expectedOtroDeclared - montoTeorico);
+      if (
+        montoDeclarado !== expectedOtroDeclared
+        || storedDifference !== expectedOtroDifference
+        || (montoTeorico < 0 && row?.requiere_revision !== true)
+      ) {
+        inconsistencies.push({
+          metodo_pago_codigo: methodCode,
+          campo: 'conciliacion_automatica',
+          monto_declarado_almacenado: montoDeclarado,
+          monto_declarado_esperado: expectedOtroDeclared,
+          diferencia_esperada: expectedOtroDifference
+        });
+      }
+    }
+
+    totalTeorico = roundMoney(totalTeorico + montoTeorico);
+    totalDeclarado = roundMoney(totalDeclarado + montoDeclarado);
+    hasMethodDifference ||= expectedDifference !== 0;
+  }
+
+  const expectedTotalDifference = roundMoney(totalDeclarado - totalTeorico);
+  const expectedHasDifference = expectedTotalDifference !== 0 || hasMethodDifference;
+  const storedHeader = {
+    total_teorico: readMoney(validation?.total_teorico, 'total_teorico', 'TOTAL'),
+    total_declarado: readMoney(validation?.total_declarado, 'total_declarado', 'TOTAL'),
+    diferencia_total: readMoney(validation?.diferencia_total, 'diferencia_total', 'TOTAL'),
+    hay_diferencia: Boolean(validation?.hay_diferencia)
+  };
+  const expectedHeader = {
+    total_teorico: totalTeorico,
+    total_declarado: totalDeclarado,
+    diferencia_total: expectedTotalDifference,
+    hay_diferencia: expectedHasDifference
+  };
+  for (const field of Object.keys(expectedHeader)) {
+    if (storedHeader[field] !== expectedHeader[field]) {
+      inconsistencies.push({
+        metodo_pago_codigo: 'TOTAL',
+        campo: field,
+        almacenado: storedHeader[field],
+        esperado: expectedHeader[field]
+      });
+    }
+  }
+
+  if (inconsistencies.length > 0) {
+    throw createCajaError(
+      409,
+      'VENTAS_CAJAS_CLOSE_VALIDATION_STALE',
+      'La aritmetica de la validacion almacenada ya no es consistente. Debe realizar una nueva revision antes de cerrar.',
+      { inconsistencias: inconsistencies }
+    );
+  }
+
+  return expectedHeader;
+};
+
+const createValidationRecomputationMismatchError = (inconsistencies = []) => createCajaError(
+  409,
+  'VENTAS_CAJAS_CLOSE_VALIDATION_STALE',
+  'La validación almacenada ya no coincide con la declaración original o con el estado actual de la sesión. Debe realizar una nueva revisión.',
+  {
+    motivo: 'VALIDATION_RECOMPUTATION_MISMATCH',
+    inconsistencias: inconsistencies
+  }
+);
+
+const parseStoredJsonObject = (value) => {
+  if (value && typeof value === 'object' && !Array.isArray(value)) return value;
+  if (typeof value !== 'string') return null;
+  try {
+    const parsed = JSON.parse(value);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+};
+
+const nullableInteger = (value) => {
+  if (value === null || value === undefined || value === '') return null;
+  const parsed = Number(value);
+  return Number.isInteger(parsed) ? parsed : null;
+};
+
+export const recomputeAndAssertCloseValidation = ({
+  validation,
+  validationMethods,
+  snapshot,
+  threshold = 0
+}) => {
+  const payloadOriginal = parseStoredJsonObject(validation?.payload_declarado_json);
+  if (!payloadOriginal || !Array.isArray(payloadOriginal.arqueos)) {
+    throw createValidationRecomputationMismatchError([{
+      metodo_pago_codigo: 'PAYLOAD',
+      campo: 'payload_declarado_json',
+      motivo: 'PAYLOAD_ORIGINAL_INVALIDO'
+    }]);
+  }
+
+  let computation;
+  try {
+    computation = buildSegmentedArqueoComputation({
+      snapshot,
+      payloadRows: payloadOriginal.arqueos,
+      threshold,
+      requireObservacionOnDifference: true
+    });
+  } catch (error) {
+    throw createValidationRecomputationMismatchError([{
+      metodo_pago_codigo: 'PAYLOAD',
+      campo: 'payload_declarado_json',
+      motivo: 'DECLARACION_ORIGINAL_NO_RECONSTRUIBLE',
+      codigo_validacion: error?.code || null
+    }]);
+  }
+
+  const inconsistencies = [];
+  const addMismatch = (methodCode, field, stored, expected, source = 'DETALLE') => {
+    inconsistencies.push({
+      metodo_pago_codigo: methodCode,
+      campo: field,
+      almacenado: stored,
+      esperado: expected,
+      fuente: source
+    });
+  };
+  const compareMoney = (methodCode, field, stored, expected, source) => {
+    const storedNumber = Number(stored);
+    if (!Number.isFinite(storedNumber) || roundMoney(storedNumber) !== roundMoney(expected)) {
+      addMismatch(methodCode, field, Number.isFinite(storedNumber) ? roundMoney(storedNumber) : null, roundMoney(expected), source);
+    }
+  };
+  const compareRows = ({ rows, source, includeDomainFlags = false }) => {
+    if (!Array.isArray(rows)) {
+      addMismatch('TOTAL', 'metodos', null, computation.rows.length, source);
+      return;
+    }
+    const storedByCode = new Map();
+    for (const row of rows) {
+      const code = normalizeMethodCode(row?.metodo_pago_codigo) || 'VACIO';
+      const matches = storedByCode.get(code) || [];
+      matches.push(row);
+      storedByCode.set(code, matches);
+    }
+    const expectedCodes = new Set(computation.rows.map((row) => row.metodo_pago_codigo));
+    for (const [code, matches] of storedByCode.entries()) {
+      if (!expectedCodes.has(code)) addMismatch(code, 'presencia', matches.length, 0, source);
+    }
+    for (const expected of computation.rows) {
+      const code = expected.metodo_pago_codigo;
+      const matches = storedByCode.get(code) || [];
+      if (matches.length !== 1) {
+        addMismatch(code, 'unicidad', matches.length, 1, source);
+        continue;
+      }
+      const stored = matches[0];
+      if (Number(stored.id_metodo_pago) !== Number(expected.id_metodo_pago)) {
+        addMismatch(code, 'id_metodo_pago', Number(stored.id_metodo_pago) || null, Number(expected.id_metodo_pago), source);
+      }
+      for (const field of ['monto_teorico', 'monto_declarado', 'diferencia']) {
+        compareMoney(code, field, stored[field], expected[field], source);
+      }
+      const storedReferences = nullableInteger(stored.cantidad_referencias);
+      const expectedReferences = nullableInteger(expected.cantidad_referencias);
+      if (storedReferences !== expectedReferences) {
+        addMismatch(code, 'cantidad_referencias', storedReferences, expectedReferences, source);
+      }
+      const storedObservation = normalizeText(stored.observacion, 500);
+      const expectedObservation = normalizeText(expected.observacion, 500);
+      if (storedObservation !== expectedObservation) {
+        addMismatch(code, 'observacion', storedObservation, expectedObservation, source);
+      }
+      if (stored.requiere_revision !== expected.requiere_revision) {
+        addMismatch(code, 'requiere_revision', stored.requiere_revision, expected.requiere_revision, source);
+      }
+      if (includeDomainFlags) {
+        if (stored.completado_automaticamente !== expected.completado_automaticamente) {
+          addMismatch(code, 'completado_automaticamente', stored.completado_automaticamente, expected.completado_automaticamente, source);
+        }
+        if (code === OTHER_NON_CASH_METHOD_CODE && stored.editable !== false) {
+          addMismatch(code, 'editable', stored.editable ?? null, false, source);
+        }
+      }
+    }
+  };
+
+  compareRows({ rows: validationMethods, source: 'DETALLE_PERSISTIDO' });
+
+  const resultadoJson = parseStoredJsonObject(validation?.resultado_json);
+  if (!resultadoJson) {
+    addMismatch('TOTAL', 'resultado_json', null, 'OBJETO_JSON', 'RESULTADO_JSON');
+  } else {
+    compareRows({ rows: resultadoJson.metodos, source: 'RESULTADO_JSON', includeDomainFlags: true });
+  }
+
+  const expectedHeader = {
+    total_teorico: computation.monto_teorico_total,
+    total_declarado: computation.monto_declarado_total,
+    diferencia_total: computation.diferencia_total,
+    hay_diferencia: computation.rows.some((row) => roundMoney(row.diferencia) !== 0)
+  };
+  for (const field of ['total_teorico', 'total_declarado', 'diferencia_total']) {
+    compareMoney('TOTAL', field, validation?.[field], expectedHeader[field], 'ENCABEZADO');
+    if (resultadoJson?.resumen) {
+      compareMoney('TOTAL', field, resultadoJson.resumen[field], expectedHeader[field], 'RESULTADO_JSON');
+    }
+  }
+  if (validation?.hay_diferencia !== expectedHeader.hay_diferencia) {
+    addMismatch('TOTAL', 'hay_diferencia', validation?.hay_diferencia, expectedHeader.hay_diferencia, 'ENCABEZADO');
+  }
+  if (resultadoJson?.resumen?.hay_diferencia !== expectedHeader.hay_diferencia) {
+    addMismatch('TOTAL', 'hay_diferencia', resultadoJson?.resumen?.hay_diferencia, expectedHeader.hay_diferencia, 'RESULTADO_JSON');
+  }
+
+  if (inconsistencies.length > 0) {
+    throw createValidationRecomputationMismatchError(inconsistencies);
+  }
+  return computation;
 };

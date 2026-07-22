@@ -22,12 +22,16 @@ import {
   reactivateFailedCajaCloseEmailNotification
 } from '../services/cajaCloseEmailOutboxService.js';
 import {
+  assertCoreCatalogValid,
   buildSegmentedArqueoComputation as buildSegmentedArqueoComputationFromSnapshot,
-  fingerprintValuesEqual
+  fingerprintValuesEqual,
+  OTHER_NON_CASH_METHOD_CODE,
+  recomputeAndAssertCloseValidation
 } from '../services/cajaCloseComputationService.js';
 import {
   canBypassCajaSucursalForAuxiliary
 } from '../services/cajaAssignmentRulesService.js';
+import { validateCajaCloseEditObservation } from '../services/cajaCloseEditValidationService.js';
 
 const router = express.Router();
 const CAJAS_SCOPE_PERMISSION = 'VENTAS_CAJAS_MULTISUCURSAL_VER';
@@ -747,31 +751,111 @@ const assertOperationalFingerprintMatches = ({ validation, currentFingerprint })
   }
 };
 
+// 5.6: recalcula, a partir del snapshot actual, si la fila automatica OTRO
+// deberia existir y con que id/monto_teorico. Se compara contra lo que quedo
+// almacenado en la revision (cajas_cierres_validaciones_metodos) para poder
+// detectar catalogo reconfigurado, OTRO activado/desactivado, o cambio en el
+// residual agrupado entre la revision y el cierre.
+const buildExpectedOtroValidationRow = (currentSummary) => {
+  const otrosNoEfectivo = currentSummary?.otrosNoEfectivo || { ventas_brutas: 0, reversiones: 0, ventas_netas: 0 };
+  const ventasBrutas = roundMoney(otrosNoEfectivo.ventas_brutas);
+  const reversiones = roundMoney(otrosNoEfectivo.reversiones);
+  if (ventasBrutas === 0 && reversiones === 0) return null;
+
+  const otroValidation = currentSummary?.catalogValidation?.OTRO;
+  return {
+    id_metodo_pago: otroValidation?.valido ? otroValidation.id_metodo_pago : null,
+    metodo_pago_codigo: 'OTRO',
+    monto_teorico: roundMoney(otrosNoEfectivo.ventas_netas)
+  };
+};
+
 const assertCloseValidationMatchesCurrentSummary = ({
   validation,
   validationMethods,
   currentSummary,
-  currentFingerprint
+  currentFingerprint,
+  threshold
 }) => {
+  const recomputedValidation = recomputeAndAssertCloseValidation({
+    validation,
+    validationMethods,
+    snapshot: currentSummary,
+    threshold
+  });
+  assertCoreCatalogValid(currentSummary?.catalogValidation, {
+    errorCode: 'VENTAS_CAJAS_CLOSE_VALIDATION_STALE',
+    publicMessage: 'El catalogo de metodos de pago cambio despues de validar el cierre. Debe realizar una nueva revision.'
+  });
+
   const currentByCode = buildCurrentCloseTheoreticalByCode(currentSummary);
-  const validationByCode = new Map(
-    (Array.isArray(validationMethods) ? validationMethods : [])
-      .map((row) => [normalizeMethodCode(row?.metodo_pago_codigo), row])
-      .filter(([code]) => SEGMENTED_ARQUEO_METHOD_CODES.includes(code))
-  );
+  const storedRows = Array.isArray(validationMethods) ? validationMethods : [];
+  const storedByCode = new Map();
   const staleDetails = [];
 
+  for (const row of storedRows) {
+    const code = normalizeMethodCode(row?.metodo_pago_codigo);
+    if (!SEGMENTED_ARQUEO_METHOD_CODES.includes(code) && code !== OTHER_NON_CASH_METHOD_CODE) {
+      staleDetails.push({ metodo_pago_codigo: code || 'VACIO', validacion: 'INESPERADO', actual: null });
+      continue;
+    }
+    const rowsForCode = storedByCode.get(code) || [];
+    rowsForCode.push(row);
+    storedByCode.set(code, rowsForCode);
+  }
+
   for (const methodCode of SEGMENTED_ARQUEO_METHOD_CODES) {
-    const methodValidation = validationByCode.get(methodCode);
+    const methodRows = storedByCode.get(methodCode) || [];
+    const methodValidation = methodRows.length === 1 ? methodRows[0] : null;
+    const catalogEntry = currentSummary?.catalogValidation?.[methodCode];
     const validationAmount = roundMoney(methodValidation?.monto_teorico ?? 0);
     const currentAmount = roundMoney(currentByCode.get(methodCode) || 0);
-    if (!methodValidation || validationAmount !== currentAmount) {
+    const validationMethodId = Number(methodValidation?.id_metodo_pago || 0) || null;
+    const currentMethodId = Number(catalogEntry?.id_metodo_pago || 0) || null;
+    if (
+      methodRows.length !== 1
+      || validationMethodId !== currentMethodId
+      || validationAmount !== currentAmount
+    ) {
       staleDetails.push({
         metodo_pago_codigo: methodCode,
-        validacion: validationAmount,
-        actual: currentAmount
+        validacion: methodRows.length > 1 ? 'DUPLICADO' : methodRows.length === 0 ? 'AUSENTE' : validationAmount,
+        actual: currentAmount,
+        id_validacion: validationMethodId,
+        id_actual: currentMethodId
       });
     }
+  }
+
+  const storedOtroRows = storedByCode.get(OTHER_NON_CASH_METHOD_CODE) || [];
+  const expectedOtroRow = buildExpectedOtroValidationRow(currentSummary);
+  const otroCatalogEntry = currentSummary?.catalogValidation?.OTRO;
+  const storedOtroRow = storedOtroRows.length === 1 ? storedOtroRows[0] : null;
+  const storedOtroTeorico = storedOtroRow ? roundMoney(storedOtroRow.monto_teorico ?? 0) : null;
+  const storedOtroId = storedOtroRow ? (Number(storedOtroRow.id_metodo_pago) || null) : null;
+  const expectedOtroTeorico = expectedOtroRow ? roundMoney(expectedOtroRow.monto_teorico) : null;
+  const expectedOtroId = expectedOtroRow ? Number(expectedOtroRow.id_metodo_pago || 0) || null : null;
+  const otroCatalogInvalid = Boolean(expectedOtroRow) && (
+    !otroCatalogEntry?.valido
+    || Number(otroCatalogEntry.coincidencias || 0) !== 1
+  );
+  if (
+    storedOtroRows.length > 1
+    || Boolean(storedOtroRow) !== Boolean(expectedOtroRow)
+    || otroCatalogInvalid
+    || (storedOtroRow && expectedOtroRow && (
+      storedOtroId !== expectedOtroId
+      || storedOtroTeorico !== expectedOtroTeorico
+    ))
+  ) {
+    staleDetails.push({
+      metodo_pago_codigo: OTHER_NON_CASH_METHOD_CODE,
+      validacion: storedOtroRows.length > 1 ? 'DUPLICADO' : storedOtroTeorico,
+      actual: expectedOtroTeorico,
+      id_validacion: storedOtroId,
+      id_actual: expectedOtroId,
+      catalogo_valido: !otroCatalogInvalid
+    });
   }
 
   const validationTotal = roundMoney(validation?.total_teorico || 0);
@@ -794,6 +878,7 @@ const assertCloseValidationMatchesCurrentSummary = ({
   }
 
   assertOperationalFingerprintMatches({ validation, currentFingerprint });
+  return recomputedValidation;
 };
 
 const getScopeContext = async (req, client, requestedSucursalId = null, allowGlobal = false) => {
@@ -2622,13 +2707,24 @@ const buildCloseValidationResponse = ({ validation, computation, isCashierOnly }
     },
     metodos: computation.rows.map((row) => ({
       metodo_pago_codigo: row.metodo_pago_codigo,
+      display_name: row.display_name || null,
       monto_declarado: row.monto_declarado,
       diferencia: row.diferencia,
       resultado: row.resultado,
       requiere_revision: row.requiere_revision,
       observacion_requerida: row.observacion_requerida,
       observacion_presente: row.observacion_presente,
+      observacion: row.completado_automaticamente ? (row.observacion || null) : undefined,
       cantidad_referencias: row.cantidad_referencias,
+      completado_automaticamente: Boolean(row.completado_automaticamente),
+      editable: row.editable,
+      ...(row.metodo_pago_codigo === OTHER_NON_CASH_METHOD_CODE
+        ? {
+            ventas_brutas_agrupadas: row.ventas_brutas_agrupadas,
+            reversiones_agrupadas: row.reversiones_agrupadas,
+            metodos_agrupados: row.metodos_agrupados
+          }
+        : {}),
       ...(isCashierOnly ? {} : { monto_teorico: row.monto_teorico })
     }))
   };
@@ -4907,7 +5003,8 @@ const closeSessionHandler = async (req, res) => {
     const validationResult = await client.query(
       `
         SELECT id_validacion_cierre, id_cierre_caja
-             , total_teorico, total_declarado, diferencia_total, resultado_json
+             , total_teorico, total_declarado, diferencia_total, hay_diferencia,
+               payload_declarado_json, resultado_json
         FROM public.cajas_cierres_validaciones
         WHERE id_validacion_cierre = $1
           AND id_sesion_caja = $2
@@ -4937,28 +5034,32 @@ const closeSessionHandler = async (req, res) => {
     if (validationMethodsResult.rowCount === 0) {
       throw createCajaError(409, 'VENTAS_CAJAS_VALIDACION_CIERRE_INCOMPLETA', 'La validacion de cierre no tiene detalle por metodo.');
     }
-    assertCloseValidationMatchesCurrentSummary({
+    const recomputedValidation = assertCloseValidationMatchesCurrentSummary({
       validation,
       validationMethods: validationMethodsResult.rows,
       currentSummary: snapshot,
-      currentFingerprint
+      currentFingerprint,
+      threshold: CLOSE_DIFFERENCE_THRESHOLD
     });
-    montoTeorico = Number(validationToLink.total_teorico || 0);
-    montoDeclaradoCierre = Number(validationToLink.total_declarado || 0);
-    diferencia = Number(validationToLink.diferencia_total || 0);
-    arqueosPersistir = validationMethodsResult.rows.map((row) => ({
-      id_metodo_pago: Number(row.id_metodo_pago),
-      metodo_pago_codigo: normalizeMethodCode(row.metodo_pago_codigo),
-      monto_teorico: Number(row.monto_teorico || 0),
-      monto_declarado: Number(row.monto_declarado || 0),
-      diferencia: Number(row.diferencia || 0),
-      cantidad_referencias: row.cantidad_referencias === null || row.cantidad_referencias === undefined
-        ? null
-        : Number(row.cantidad_referencias),
-      observacion: row.observacion || null,
-      requiere_revision: Boolean(row.requiere_revision),
-      completado_automaticamente: false
-    }));
+    montoTeorico = recomputedValidation.monto_teorico_total;
+    montoDeclaradoCierre = recomputedValidation.monto_declarado_total;
+    diferencia = recomputedValidation.diferencia_total;
+    arqueosPersistir = recomputedValidation.rows.map((row) => {
+      const methodCode = normalizeMethodCode(row.metodo_pago_codigo);
+      return {
+        id_metodo_pago: Number(row.id_metodo_pago),
+        metodo_pago_codigo: methodCode,
+        monto_teorico: roundMoney(row.monto_teorico),
+        monto_declarado: roundMoney(row.monto_declarado),
+        diferencia: roundMoney(row.diferencia),
+        cantidad_referencias: row.cantidad_referencias === null || row.cantidad_referencias === undefined
+          ? null
+          : Number(row.cantidad_referencias),
+        observacion: row.observacion || null,
+        requiere_revision: Boolean(row.requiere_revision),
+        completado_automaticamente: Boolean(row.completado_automaticamente)
+      };
+    });
     const hasMethodDifference = arqueosPersistir.some((row) => Math.abs(roundMoney(row.diferencia)) > 0);
     const isBalancedClose = !hasMethodDifference && Math.abs(roundMoney(diferencia)) === 0;
     idResolucionFinal = isBalancedClose ? balancedResolutionId : pendingResolutionId;
@@ -5582,17 +5683,33 @@ router.patch('/ventas/cajas/cierres/:id/resolucion', checkPermission(['VENTAS_CA
 });
 
 router.patch('/ventas/cajas/cierres/:id', checkPermission(['VENTAS_CAJAS_SESION_CERRAR']), async (req, res) => {
+  const observationValidation = validateCajaCloseEditObservation(req.body);
+  if (!observationValidation.valid) {
+    return res.status(400).json({
+      error: true,
+      code: 'VENTAS_CAJAS_CLOSE_EDIT_OBSERVATION_REQUIRED',
+      message: 'Debe indicar una observacion de cierre no vacia.'
+    });
+  }
+
+  const observacion = observationValidation.observation;
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
     await ensureAdminOrSuperAdmin(req);
 
     const idCierreCaja = parsePositiveBigIntId(req.params.id);
-    const montoDeclarado = parseNullableNonNegativeAmount(req.body.monto_declarado_cierre);
-    const observacion = normalizeText(req.body.observacion_cierre, 500);
     const motivoEdicion = normalizeText(req.body.motivo_edicion, 500);
-    const idResolucion = parseNullablePositiveInt(req.body.id_resolucion_cierre_caja);
-    const idArqueoFinal = parseNullablePositiveInt(req.body.id_arqueo_final);
+    const hasOwnField = (field) => Object.prototype.hasOwnProperty.call(req.body || {}, field);
+    const financialFields = [
+      'monto_declarado_cierre',
+      'id_arqueo_final',
+      'id_resolucion_cierre_caja'
+    ];
+    const requestedFinancialFields = financialFields.filter(hasOwnField);
+    const idArqueoFinal = hasOwnField('id_arqueo_final')
+      ? parseNullablePositiveInt(req.body.id_arqueo_final)
+      : null;
 
     if (!idCierreCaja) {
       throw createCajaError(400, 'VENTAS_CAJAS_CLOSE_ID_INVALID', 'El id de cierre es invalido.');
@@ -5620,6 +5737,54 @@ router.patch('/ventas/cajas/cierres/:id', checkPermission(['VENTAS_CAJAS_SESION_
     const scopeContext = await getScopeContext(req, client, cierre.id_sucursal, true);
     assertSucursalAllowed(scopeContext, cierre.id_sucursal);
 
+    if (idArqueoFinal) {
+      const arqueoResult = await client.query(
+        `
+          SELECT id_sesion_caja
+          FROM public.cajas_arqueos
+          WHERE id_arqueo_caja = $1
+          LIMIT 1
+        `,
+        [idArqueoFinal]
+      );
+      if (
+        arqueoResult.rowCount > 0
+        && String(arqueoResult.rows[0].id_sesion_caja) !== String(cierre.id_sesion_caja)
+      ) {
+        throw createCajaError(
+          409,
+          'VENTAS_CAJAS_ARQUEO_SESSION_MISMATCH',
+          'El arqueo indicado no pertenece a la sesion del cierre.'
+        );
+      }
+    }
+
+    const segmentedDetailResult = await client.query(
+      `
+        SELECT EXISTS (
+          SELECT 1
+          FROM public.cajas_cierres_arqueos_metodos
+          WHERE id_cierre_caja = $1
+        ) AS tiene_detalle_segmentado
+      `,
+      [idCierreCaja]
+    );
+    const hasSegmentedDetail = segmentedDetailResult.rows[0]?.tiene_detalle_segmentado === true;
+    if (hasSegmentedDetail && requestedFinancialFields.length > 0) {
+      throw createCajaError(
+        409,
+        'VENTAS_CAJAS_CLOSE_SEGMENTED_EDIT_REQUIRES_REVALIDATION',
+        'El cierre segmentado no puede modificarse financieramente sin realizar una nueva validación.'
+      );
+    }
+    if (requestedFinancialFields.length > 0) {
+      throw createCajaError(
+        409,
+        'VENTAS_CAJAS_CLOSE_FINANCIAL_EDIT_NOT_ALLOWED',
+        'Los campos financieros del cierre deben modificarse mediante su flujo especifico.'
+      );
+    }
+
     const fechaCreacion = new Date(cierre.fecha_creacion || cierre.fecha_cierre || 0);
     const elapsedMinutes = Math.floor((Date.now() - fechaCreacion.getTime()) / 60000);
     if (!Number.isFinite(elapsedMinutes) || elapsedMinutes > 30) {
@@ -5630,83 +5795,23 @@ router.patch('/ventas/cajas/cierres/:id', checkPermission(['VENTAS_CAJAS_SESION_
       );
     }
 
-    let montoDeclaradoFinal = montoDeclarado;
-    let idArqueoFinalSelected = idArqueoFinal ?? parseNullablePositiveInt(cierre.id_arqueo_final);
-    if (montoDeclaradoFinal === null && idArqueoFinalSelected) {
-      const arqueoResult = await client.query(
-        `
-          SELECT monto_contado
-          FROM public.cajas_arqueos
-          WHERE id_arqueo_caja = $1
-            AND id_sesion_caja = $2
-          LIMIT 1
-        `,
-        [idArqueoFinalSelected, cierre.id_sesion_caja]
-      );
-      montoDeclaradoFinal = parseNullableNonNegativeAmount(arqueoResult.rows?.[0]?.monto_contado);
-    }
-    if (montoDeclaradoFinal === null) {
-      throw createCajaError(400, 'VENTAS_CAJAS_CLOSE_AMOUNT_INVALID', 'Debe indicar un monto declarado valido.');
-    }
-
-    const summary = await loadCajaCloseFinancialSnapshot({
-      queryRunner: client,
-      idSesionCaja: cierre.id_sesion_caja
-    });
-    const montoTeorico = Number(summary.totalTeorico || 0);
-    const diferencia = Number((montoDeclaradoFinal - montoTeorico).toFixed(2));
-    const idResolucionCajaCuadra = await getCatalogId(client, 'RESOLUTIONS', 'CAJA_CUADRA');
-    let idResolucionFinal = idResolucion ?? parseNullablePositiveInt(cierre.id_resolucion_cierre_caja);
-
-    if (Math.abs(diferencia) === 0) {
-      idResolucionFinal = idResolucionCajaCuadra;
-    } else if (!idResolucionFinal) {
-      throw createCajaError(400, 'VENTAS_CAJAS_RESOLUTION_REQUIRED', 'Debe seleccionar una resolucion para diferencias.');
-    }
-
-    const resolutionCode = await getCatalogCodeById(client, 'RESOLUTIONS', idResolucionFinal);
-    if (Math.abs(diferencia) > 0 && resolutionCode === 'CAJA_CUADRA') {
-      throw createCajaError(
-        400,
-        'VENTAS_CAJAS_RESOLUTION_INVALID',
-        'Caja cuadra no aplica cuando existe diferencia.'
-      );
-    }
-
     await client.query(
       `
         UPDATE public.cajas_cierres
-        SET id_resolucion_cierre_caja = $1,
-            id_arqueo_final = $2,
-            monto_teorico_cierre = $3,
-            monto_declarado_cierre = $4,
-            diferencia = $5,
-            observacion = $6
-        WHERE id_cierre_caja = $7
+        SET observacion = $1
+        WHERE id_cierre_caja = $2
       `,
-      [
-        idResolucionFinal,
-        idArqueoFinalSelected,
-        montoTeorico,
-        montoDeclaradoFinal,
-        diferencia,
-        observacion,
-        idCierreCaja
-      ]
+      [observacion, idCierreCaja]
     );
 
     await client.query(
       `
         UPDATE public.cajas_sesiones
-        SET monto_teorico_cierre = $1,
-            monto_declarado_cierre = $2,
-            diferencia_cierre = $3,
-            id_resolucion_cierre_caja = $4,
-            observacion_cierre = $5,
+        SET observacion_cierre = $1,
             fecha_actualizacion = NOW()
-        WHERE id_sesion_caja = $6
+        WHERE id_sesion_caja = $2
       `,
-      [montoTeorico, montoDeclaradoFinal, diferencia, idResolucionFinal, observacion, cierre.id_sesion_caja]
+      [observacion, cierre.id_sesion_caja]
     );
 
     await client.query(
@@ -5729,32 +5834,17 @@ router.patch('/ventas/cajas/cierres/:id', checkPermission(['VENTAS_CAJAS_SESION_
         JSON.stringify(cierre),
         JSON.stringify({
           ...cierre,
-          id_resolucion_cierre_caja: idResolucionFinal,
-          id_arqueo_final: idArqueoFinalSelected,
-          monto_teorico_cierre: montoTeorico,
-          monto_declarado_cierre: montoDeclaradoFinal,
-          diferencia,
           observacion
         })
       ]
     );
 
-    const payrollSync = await syncPayrollDeductionForClose({
-      client,
-      idCierreCaja,
-      idUsuarioResponsable: cierre.id_usuario_responsable,
-      idSucursal: cierre.id_sucursal,
-      fechaCierre: cierre.fecha_cierre || new Date().toISOString(),
-      diferencia,
-      resolucionCodigo: resolutionCode
-    });
-
     await client.query('COMMIT');
     return res.status(200).json({
       message: 'Cierre editado correctamente.',
       id_cierre_caja: idCierreCaja,
-      diferencia,
-      payroll_sync: payrollSync
+      diferencia: roundMoney(cierre.diferencia),
+      payroll_sync: { synced: true, reason: 'NOT_REQUIRED' }
     });
   } catch (err) {
     await client.query('ROLLBACK');
@@ -6097,7 +6187,8 @@ router.post('/ventas/cajas/sesiones/:id/arqueos', checkPermission(['VENTAS_CAJAS
     if (montoContado === null) throw createCajaError(400, 'VENTAS_CAJAS_ARQUEO_AMOUNT_INVALID', 'monto_contado debe ser un numero mayor o igual a 0.');
 
     const scopeContext = await getScopeContext(req, client, null, true);
-    const session = await ensureOpenSession(client, idSesionCaja);
+    await lockCajaFinancialSession(client, idSesionCaja);
+    const session = await ensureOpenSession(client, idSesionCaja, { forUpdate: true });
     assertSucursalAllowed(scopeContext, session.id_sucursal);
     await ensureSessionParticipant(client, idSesionCaja, scopeContext.idUsuario, { allowAdminBypass: true, req, scopeContext });
     const tipoArqueoCode = await getCatalogCodeById(client, 'ARQUEO_TYPES', idTipoArqueoCaja);
@@ -6174,7 +6265,8 @@ router.post('/ventas/cajas/sesiones/:id/movimientos', checkPermission(['VENTAS_C
     if (monto === null || monto <= 0) throw createCajaError(400, 'VENTAS_CAJAS_MOVEMENT_AMOUNT_INVALID', 'monto debe ser un numero mayor a 0.');
 
     const scopeContext = await getScopeContext(req, client, null, true);
-    const session = await ensureOpenSession(client, idSesionCaja);
+    await lockCajaFinancialSession(client, idSesionCaja);
+    const session = await ensureOpenSession(client, idSesionCaja, { forUpdate: true });
     assertSucursalAllowed(scopeContext, session.id_sucursal);
     await ensureSessionParticipant(client, idSesionCaja, scopeContext.idUsuario, { allowAdminBypass: true, req, scopeContext });
     if (await isCashierOnlyRequest(req, client)) {

@@ -164,6 +164,7 @@ export const buildComandaCocinaHtml = (comanda, options = {}) => {
   }
 
   const ticketWidthMm = resolveTicketWidthMm(options?.widthMm);
+  const legacy = Boolean(options?.legacy);
   const printMetrics = resolveFacturaLikeMetrics(ticketWidthMm);
   const contentWidthMm = printMetrics.contentWidthMm;
   const marginLeftMm = printMetrics.marginLeftMm;
@@ -181,7 +182,7 @@ export const buildComandaCocinaHtml = (comanda, options = {}) => {
   const nestedPaddingMm = isNarrowTicket ? 7 : 8;
   const metaLabelWidthMm = isNarrowTicket ? 16 : 18;
   const items = validation.items;
-  const fecha = formatDateTime(comanda?.fecha_hora_pedido || comanda?.fecha_hora_facturacion, { legacy: Boolean(options?.legacy) });
+  const fecha = formatDateTime(comanda?.fecha_hora_pedido || comanda?.fecha_hora_facturacion, { legacy });
   const numeroPedido = toSafeText(comanda?.numero_pedido || comanda?.numero_venta || comanda?.codigo_venta);
   const sucursal = toSafeText(comanda?.nombre_sucursal, 'No registrada');
   const cajero = toSafeText(comanda?.nombre_usuario, 'No registrado');
@@ -310,7 +311,11 @@ export const buildComandaCocinaHtml = (comanda, options = {}) => {
         overflow-wrap: anywhere;
         word-break: break-word;
       }
-      .comanda-cocina-print__items {
+${legacy ? '' : `      .comanda-cocina-print__customer-name {
+        font-size: ${isNarrowTicket ? 11.5 : 12.1}px;
+        font-weight: 800;
+      }
+` }      .comanda-cocina-print__items {
         display: grid;
         gap: 5px;
       }
@@ -407,10 +412,13 @@ export const buildComandaCocinaHtml = (comanda, options = {}) => {
             <span>Mesa</span>
             <span>${escapeHtml(mesa)}</span>
           </div>
-          <div class="comanda-cocina-print__meta-row">
+${legacy ? `          <div class="comanda-cocina-print__meta-row">
             <span>Cliente</span>
             <span>${escapeHtml(cliente)}</span>
-          </div>
+          </div>` : `          <div class="comanda-cocina-print__meta-row">
+            <span>Cliente</span>
+            <span class="comanda-cocina-print__customer-name">${escapeHtml(cliente)}</span>
+          </div>`}
           ${telefonoCliente ? `
           <div class="comanda-cocina-print__meta-row">
             <span>Telefono</span>

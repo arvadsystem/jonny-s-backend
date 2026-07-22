@@ -154,7 +154,39 @@ const countSplitLines = (cuentaDividida) => {
   ), 0);
 };
 
-const estimateHeightMm = (venta = {}) => {
+const estimateCustomerNameLines = (value, widthMm) => {
+  const customerName = cleanText(value) || 'Consumidor final';
+  const fontSize = widthMm === 58 ? 6.8 : 7.7;
+  const labelWidthPt = widthMm === 58 ? 38 : 42;
+  const usableWidthPt = Math.max(getContentWidthPt(widthMm) - labelWidthPt - 2, fontSize);
+  const averageCharacterWidthPt = fontSize * 0.58;
+  const estimatedCharactersPerLine = Math.max(1, Math.floor(usableWidthPt / averageCharacterWidthPt));
+  const words = customerName.split(' ');
+  let lines = 1;
+  let currentLineLength = 0;
+
+  for (const word of words) {
+    const wordLines = Math.max(1, Math.ceil(word.length / estimatedCharactersPerLine));
+    if (wordLines > 1) {
+      if (currentLineLength > 0) lines += 1;
+      lines += wordLines - 1;
+      currentLineLength = word.length % estimatedCharactersPerLine || estimatedCharactersPerLine;
+      continue;
+    }
+
+    const nextLength = currentLineLength === 0 ? word.length : currentLineLength + 1 + word.length;
+    if (nextLength > estimatedCharactersPerLine) {
+      lines += 1;
+      currentLineLength = word.length;
+    } else {
+      currentLineLength = nextLength;
+    }
+  }
+
+  return lines;
+};
+
+const estimateHeightMm = (venta = {}, { legacy = false } = {}) => {
   const ticketWidth = resolveTicketWidth(venta);
   const items = Array.isArray(venta.items) ? venta.items : [];
   const extrasCount = countExtras(items);
@@ -168,6 +200,9 @@ const estimateHeightMm = (venta = {}) => {
     ? (ticketWidth === 58 ? 32 : 46)
     : 0;
   const deliveryBlock = venta?.delivery ? 16 : 0;
+  const customerNameBlock = legacy
+    ? 0
+    : estimateCustomerNameLines(venta.cliente_nombre, ticketWidth) * (ticketWidth === 58 ? 3 : 3.4) + 3;
   const estimated = 110
     + logoBlock
     + items.length * 10
@@ -175,7 +210,8 @@ const estimateHeightMm = (venta = {}) => {
     + salsasCount * 4
     + splitCount * 7
     + fiscalBlocks * 4
-    + deliveryBlock;
+    + deliveryBlock
+    + customerNameBlock;
 
   return Math.max(160, estimated);
 };
@@ -199,6 +235,21 @@ const metaRow = (label, value, widthMm = 80) => ({
   ],
   columnGap: 2,
   margin: [0, 1, 0, 1]
+});
+
+const customerNameRow = (value, widthMm) => ({
+  columns: [
+    text('Cliente', { width: widthMm === 58 ? 38 : 42, bold: true }),
+    text(value || 'Consumidor final', {
+      width: '*',
+      alignment: 'right',
+      bold: true,
+      fontSize: widthMm === 58 ? 6.8 : 7.7,
+      lineHeight: 1.2
+    })
+  ],
+  columnGap: 2,
+  margin: [0, 1, 0, 3]
 });
 
 const buildHeader = (venta, widthMm) => {
@@ -270,7 +321,9 @@ const buildMetaBlock = (venta, widthMm, { legacy = false } = {}) => {
     metaRow('Caja', venta.nombre_caja || venta.codigo_caja || '--', widthMm),
     metaRow('Sesion', venta.id_sesion_caja ? `#${venta.id_sesion_caja}` : '--', widthMm),
     metaRow('Cajero', venta.nombre_usuario || '--', widthMm),
-    metaRow('Cliente', venta.cliente_nombre || 'Consumidor final', widthMm)
+    legacy
+      ? metaRow('Cliente', venta.cliente_nombre || 'Consumidor final', widthMm)
+      : customerNameRow(venta.cliente_nombre, widthMm)
   ];
 
   if (venta.cliente_rtn) rows.push(metaRow('RTN cliente', venta.cliente_rtn, widthMm));
@@ -414,7 +467,7 @@ const buildDeliveryBlock = (venta, widthMm) => {
 
 export const buildVentaTicketPdfDefinition = (venta, { legacy = false } = {}) => {
   const widthMm = resolveTicketWidth(venta);
-  const heightMm = estimateHeightMm(venta);
+  const heightMm = estimateHeightMm(venta, { legacy });
   const ticket = venta?.facturacion?.ticket || {};
   const stablePdfDate = resolveStablePdfDate(venta, { legacy });
   const content = [

@@ -1,11 +1,32 @@
 -- Rollback seguro: falla cerrado si ya existen cierres teoricos negativos.
+-- No ejecutar en produccion sin una revision especifica.
+--
+-- Dividido en dos fases para minimizar el tiempo bajo ACCESS EXCLUSIVE:
+--   Fase 1 (transaccion corta): toma el lock NOWAIT, valida definiciones,
+--     verifica ausencia de negativos, y agrega las restricciones faltantes
+--     como NOT VALID (metadata-only, sin recorrer la tabla).
+--   Fase 2 (fuera de la transaccion de la fase 1): valida cada restriccion
+--     con VALIDATE CONSTRAINT bajo SHARE UPDATE EXCLUSIVE, que no bloquea
+--     lecturas ni escrituras concurrentes. Si todo se hiciera en una sola
+--     transaccion, el ACCESS EXCLUSIVE tomado por el ADD CONSTRAINT se
+--     mantendria durante todo el escaneo de VALIDATE CONSTRAINT (los locks
+--     de una transaccion no se liberan hasta el COMMIT), anulando el
+--     beneficio de usar NOT VALID.
 
+-- ===================== FASE 1 =====================
 BEGIN;
 
-SET LOCAL lock_timeout = '5s';
-SET LOCAL statement_timeout = '120s';
+SET LOCAL lock_timeout = '1s';
+SET LOCAL statement_timeout = '20s';
+SET LOCAL idle_in_transaction_session_timeout = '20s';
 
-DO $rollback$
+LOCK TABLE
+  public.cajas_sesiones,
+  public.cajas_cierres,
+  public.cajas_arqueos
+IN ACCESS EXCLUSIVE MODE NOWAIT;
+
+DO $rollback_guard$
 BEGIN
   IF EXISTS (
     SELECT 1
@@ -23,9 +44,9 @@ BEGIN
     RAISE EXCEPTION 'Rollback bloqueado: existen montos teoricos negativos que deben conservarse';
   END IF;
 END
-$rollback$;
+$rollback_guard$;
 
-DO $rollback$
+DO $rollback_validate$
 DECLARE
   constraint_columns smallint[];
   constraint_expression text;
@@ -34,11 +55,56 @@ DECLARE
   constraint_validated boolean;
   normalized_expression text;
   target_column smallint;
+  monto_contado_attnum smallint;
 BEGIN
   IF to_regclass('public.cajas_sesiones') IS NULL
-     OR to_regclass('public.cajas_cierres') IS NULL THEN
+     OR to_regclass('public.cajas_cierres') IS NULL
+     OR to_regclass('public.cajas_arqueos') IS NULL THEN
     RAISE EXCEPTION 'Faltan tablas requeridas de cajas';
   END IF;
+
+  -- Esta columna es un control fisico protegido y nunca forma parte del
+  -- rollback. Se valida primero y de forma completa para fallar antes de
+  -- agregar o validar cualquier restriccion teorica.
+  SELECT a.attnum
+  INTO monto_contado_attnum
+  FROM pg_attribute a
+  WHERE a.attrelid = 'public.cajas_arqueos'::regclass
+    AND a.attname = 'monto_contado'
+    AND NOT a.attisdropped;
+
+  IF monto_contado_attnum IS NULL THEN
+    RAISE EXCEPTION 'Falta public.cajas_arqueos.monto_contado';
+  END IF;
+
+  SELECT c.contype, c.conkey, c.convalidated, pg_get_expr(c.conbin, c.conrelid)
+  INTO constraint_type, constraint_columns, constraint_validated, constraint_expression
+  FROM pg_constraint c
+  WHERE c.conrelid = 'public.cajas_arqueos'::regclass
+    AND c.conname = 'ck_cajas_arqueos_contado';
+
+  constraint_found := FOUND;
+  normalized_expression := lower(regexp_replace(
+    COALESCE(constraint_expression, ''),
+    '\s+|[()]|::numeric',
+    '',
+    'g'
+  ));
+
+  IF NOT constraint_found
+     OR constraint_type IS DISTINCT FROM 'c'::"char"
+     OR constraint_validated IS NOT TRUE
+     OR constraint_columns IS DISTINCT FROM ARRAY[monto_contado_attnum]::smallint[]
+     OR normalized_expression <> 'monto_contado>=0'
+  THEN
+    RAISE EXCEPTION 'ck_cajas_arqueos_contado no coincide exactamente con CHECK (monto_contado >= 0), no esta validado, o protege otras columnas; abortando por seguridad';
+  END IF;
+
+  constraint_columns := NULL;
+  constraint_expression := NULL;
+  constraint_type := NULL;
+  constraint_validated := NULL;
+  normalized_expression := NULL;
 
   SELECT a.attnum
   INTO target_column
@@ -65,13 +131,15 @@ BEGIN
     'g'
   ));
 
+  -- Solo se valida la definicion cuando la restriccion YA existe (pudo no
+  -- haber sido eliminada nunca, o ya haber sido restaurada antes). Si no
+  -- existe, la fase de ADD mas abajo la crea desde cero.
   IF constraint_found AND (
     constraint_type IS DISTINCT FROM 'c'::"char"
     OR constraint_columns IS DISTINCT FROM ARRAY[target_column]::smallint[]
     OR normalized_expression <> 'monto_teorico_cierreisnullormonto_teorico_cierre>=0'
-    OR constraint_validated IS NOT TRUE
   ) THEN
-    RAISE EXCEPTION 'ck_cajas_sesiones_monto_teorico existe con una definicion incorrecta o no validada';
+    RAISE EXCEPTION 'ck_cajas_sesiones_monto_teorico existe con una definicion incorrecta';
   END IF;
 
   target_column := NULL;
@@ -110,9 +178,8 @@ BEGIN
     constraint_type IS DISTINCT FROM 'c'::"char"
     OR constraint_columns IS DISTINCT FROM ARRAY[target_column]::smallint[]
     OR normalized_expression <> 'monto_teorico_cierre>=0'
-    OR constraint_validated IS NOT TRUE
   ) THEN
-    RAISE EXCEPTION 'ck_cajas_cierres_monto_teorico existe con una definicion incorrecta o no validada';
+    RAISE EXCEPTION 'ck_cajas_cierres_monto_teorico existe con una definicion incorrecta';
   END IF;
 
   target_column := NULL;
@@ -155,18 +222,21 @@ BEGIN
     constraint_type IS DISTINCT FROM 'c'::"char"
     OR constraint_columns IS DISTINCT FROM ARRAY[target_column]::smallint[]
     OR normalized_expression <> 'monto_teorico>=0'
-    OR constraint_validated IS NOT TRUE
   ) THEN
-    RAISE EXCEPTION 'ck_cajas_arqueos_teorico existe con una definicion incorrecta o no validada';
+    RAISE EXCEPTION 'ck_cajas_arqueos_teorico existe con una definicion incorrecta';
   END IF;
-END
-$rollback$;
 
-DO $rollback$
+END
+$rollback_validate$;
+
+-- Restaura EXCLUSIVAMENTE las restricciones que faltan (estado LEGACY). Si
+-- alguna ya existe (rollback repetido, o nunca se elimino), no se toca.
+-- NOT VALID: metadata-only, no recorre la tabla todavia (eso ocurre en la
+-- fase 2, fuera de este ACCESS EXCLUSIVE).
+DO $rollback_add$
 BEGIN
   IF NOT EXISTS (
-    SELECT 1
-    FROM pg_constraint c
+    SELECT 1 FROM pg_constraint c
     WHERE c.conrelid = 'public.cajas_sesiones'::regclass
       AND c.conname = 'ck_cajas_sesiones_monto_teorico'
   ) THEN
@@ -179,8 +249,7 @@ BEGIN
   END IF;
 
   IF NOT EXISTS (
-    SELECT 1
-    FROM pg_constraint c
+    SELECT 1 FROM pg_constraint c
     WHERE c.conrelid = 'public.cajas_cierres'::regclass
       AND c.conname = 'ck_cajas_cierres_monto_teorico'
   ) THEN
@@ -190,8 +259,7 @@ BEGIN
   END IF;
 
   IF NOT EXISTS (
-    SELECT 1
-    FROM pg_constraint c
+    SELECT 1 FROM pg_constraint c
     WHERE c.conrelid = 'public.cajas_arqueos'::regclass
       AND c.conname = 'ck_cajas_arqueos_teorico'
   ) THEN
@@ -200,15 +268,88 @@ BEGIN
       CHECK (monto_teorico >= 0) NOT VALID;
   END IF;
 END
-$rollback$;
-
-ALTER TABLE public.cajas_sesiones
-  VALIDATE CONSTRAINT ck_cajas_sesiones_monto_teorico;
-
-ALTER TABLE public.cajas_cierres
-  VALIDATE CONSTRAINT ck_cajas_cierres_monto_teorico;
-
-ALTER TABLE public.cajas_arqueos
-  VALIDATE CONSTRAINT ck_cajas_arqueos_teorico;
+$rollback_add$;
 
 COMMIT;
+
+-- ===================== FASE 2 =====================
+-- Cada VALIDATE tiene su propia transaccion y sus propios timeouts. Un lock o
+-- timeout identifica la restriccion exacta y aborta la ejecucion del archivo;
+-- nunca se modifican filas ni se continua silenciosamente.
+-- PHASE_2_VALIDATE_CAJAS_SESIONES_BEGIN
+BEGIN;
+SET LOCAL lock_timeout = '1s';
+SET LOCAL statement_timeout = '20s';
+SET LOCAL idle_in_transaction_session_timeout = '20s';
+DO $validate_sesiones$
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM pg_constraint
+    WHERE conrelid = 'public.cajas_sesiones'::regclass
+      AND conname = 'ck_cajas_sesiones_monto_teorico'
+      AND NOT convalidated
+  ) THEN
+    BEGIN
+      ALTER TABLE public.cajas_sesiones VALIDATE CONSTRAINT ck_cajas_sesiones_monto_teorico;
+    EXCEPTION WHEN OTHERS THEN
+      RAISE EXCEPTION USING
+        ERRCODE = SQLSTATE,
+        MESSAGE = FORMAT('Fallo VALIDATE CONSTRAINT public.cajas_sesiones.ck_cajas_sesiones_monto_teorico: %s', SQLERRM);
+    END;
+  END IF;
+END
+$validate_sesiones$;
+COMMIT;
+-- PHASE_2_VALIDATE_CAJAS_SESIONES_END
+
+-- PHASE_2_VALIDATE_CAJAS_CIERRES_BEGIN
+BEGIN;
+SET LOCAL lock_timeout = '1s';
+SET LOCAL statement_timeout = '20s';
+SET LOCAL idle_in_transaction_session_timeout = '20s';
+DO $validate_cierres$
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM pg_constraint
+    WHERE conrelid = 'public.cajas_cierres'::regclass
+      AND conname = 'ck_cajas_cierres_monto_teorico'
+      AND NOT convalidated
+  ) THEN
+    BEGIN
+      ALTER TABLE public.cajas_cierres VALIDATE CONSTRAINT ck_cajas_cierres_monto_teorico;
+    EXCEPTION WHEN OTHERS THEN
+      RAISE EXCEPTION USING
+        ERRCODE = SQLSTATE,
+        MESSAGE = FORMAT('Fallo VALIDATE CONSTRAINT public.cajas_cierres.ck_cajas_cierres_monto_teorico: %s', SQLERRM);
+    END;
+  END IF;
+END
+$validate_cierres$;
+COMMIT;
+-- PHASE_2_VALIDATE_CAJAS_CIERRES_END
+
+-- PHASE_2_VALIDATE_CAJAS_ARQUEOS_BEGIN
+BEGIN;
+SET LOCAL lock_timeout = '1s';
+SET LOCAL statement_timeout = '20s';
+SET LOCAL idle_in_transaction_session_timeout = '20s';
+DO $validate_arqueos$
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM pg_constraint
+    WHERE conrelid = 'public.cajas_arqueos'::regclass
+      AND conname = 'ck_cajas_arqueos_teorico'
+      AND NOT convalidated
+  ) THEN
+    BEGIN
+      ALTER TABLE public.cajas_arqueos VALIDATE CONSTRAINT ck_cajas_arqueos_teorico;
+    EXCEPTION WHEN OTHERS THEN
+      RAISE EXCEPTION USING
+        ERRCODE = SQLSTATE,
+        MESSAGE = FORMAT('Fallo VALIDATE CONSTRAINT public.cajas_arqueos.ck_cajas_arqueos_teorico: %s', SQLERRM);
+    END;
+  END IF;
+END
+$validate_arqueos$;
+COMMIT;
+-- PHASE_2_VALIDATE_CAJAS_ARQUEOS_END
