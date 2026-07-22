@@ -619,7 +619,12 @@ export const createSolicitudesCompraService = (overrides = {}) => {
                CASE WHEN d.tipo_item = 'PRODUCTO' THEN cp.nombre_categoria ELSE ci.nombre_categoria END AS categoria,
                d.cantidad_solicitada, d.nombre_presentacion_snapshot AS presentacion_snapshot,
                d.cantidad_base_solicitada, ub.nombre AS unidad_base,
-               d.cantidad_aprobada, NULL::integer AS proveedor, d.cantidad_recibida,
+               d.cantidad_aprobada, d.cantidad_base_aprobada,
+               CASE WHEN prov.id_proveedor IS NULL THEN NULL ELSE JSON_BUILD_OBJECT(
+                 'id_proveedor', prov.id_proveedor,
+                 'nombre_proveedor', prov.nombre_proveedor
+               ) END AS proveedor,
+               d.cantidad_recibida,
                COALESCE(pa.cantidad, ia.cantidad, 0)::numeric AS stock_actual,
                COALESCE(pa.stock_minimo, ia.stock_minimo, 0)::numeric AS stock_minimo,
                ${stockStatusSql('COALESCE(pa.cantidad, ia.cantidad, 0)', 'COALESCE(pa.stock_minimo, ia.stock_minimo, 0)')} AS estado_stock
@@ -632,6 +637,7 @@ export const createSolicitudesCompraService = (overrides = {}) => {
         LEFT JOIN public.categorias_insumos ci ON ci.id_categoria_insumo = i.id_categoria_insumo
         LEFT JOIN public.insumos_almacenes ia ON ia.id_insumo = d.id_insumo AND ia.id_almacen = sc.id_almacen
         LEFT JOIN public.unidades_medida ub ON ub.id_unidad_medida = d.id_unidad_base
+        LEFT JOIN public.proveedores prov ON prov.id_proveedor = d.id_proveedor
         WHERE d.id_solicitud_compra = $1
         ORDER BY d.id_solicitud_detalle
       `,
@@ -659,6 +665,7 @@ export const createSolicitudesCompraService = (overrides = {}) => {
         cantidad_solicitada: Number(row.cantidad_solicitada),
         cantidad_base_solicitada: Number(row.cantidad_base_solicitada),
         cantidad_aprobada: row.cantidad_aprobada === null ? null : Number(row.cantidad_aprobada),
+        cantidad_base_aprobada: row.cantidad_base_aprobada === null ? null : Number(row.cantidad_base_aprobada),
         cantidad_recibida: row.cantidad_recibida === null ? null : Number(row.cantidad_recibida),
         stock_actual: Number(row.stock_actual ?? 0),
         stock_minimo: Number(row.stock_minimo ?? 0)

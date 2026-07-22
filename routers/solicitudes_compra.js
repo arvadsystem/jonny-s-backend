@@ -4,6 +4,7 @@ import {
   SolicitudesCompraError,
   solicitudesCompraService
 } from '../services/solicitudesCompraService.js';
+import { solicitudesCompraRevisionService } from '../services/solicitudesCompraRevisionService.js';
 
 const router = express.Router();
 
@@ -14,6 +15,9 @@ const VIEW_PERMISSIONS = [
   'INVENTARIO_ORDENES_COMPRA_VER_TODAS'
 ];
 const CATALOG_PERMISSIONS = Array.from(new Set([...CREATE_PERMISSIONS, ...VIEW_PERMISSIONS]));
+const APPROVE_PERMISSIONS = ['INVENTARIO_OC_APROBAR', 'INVENTARIO_ORDENES_COMPRA_GESTIONAR'];
+const REJECT_PERMISSIONS = ['INVENTARIO_OC_RECHAZAR', 'INVENTARIO_ORDENES_COMPRA_GESTIONAR'];
+const REVIEW_PERMISSIONS = Array.from(new Set([...APPROVE_PERMISSIONS, ...REJECT_PERMISSIONS]));
 
 const requirePermissions = (permissions) => async (req, res, next) => {
   const idUsuario = Number.parseInt(String(req?.user?.id_usuario ?? ''), 10);
@@ -59,8 +63,11 @@ const handler = (operation) => async (req, res) => {
 };
 
 router.get('/catalogo', requirePermissions(CATALOG_PERMISSIONS), handler(solicitudesCompraService.listCatalog));
+router.get('/proveedores', requirePermissions(REVIEW_PERMISSIONS), handler(solicitudesCompraRevisionService.listProviders));
 router.post('/', requirePermissions(CREATE_PERMISSIONS), handler(solicitudesCompraService.create));
 router.get('/', requirePermissions(VIEW_PERMISSIONS), handler(solicitudesCompraService.list));
+router.put('/:id_solicitud_compra/aprobar', requirePermissions(APPROVE_PERMISSIONS), handler(solicitudesCompraRevisionService.approve));
+router.put('/:id_solicitud_compra/rechazar', requirePermissions(REJECT_PERMISSIONS), handler(solicitudesCompraRevisionService.reject));
 router.get('/:id_solicitud_compra', requirePermissions(VIEW_PERMISSIONS), handler(solicitudesCompraService.getById));
 
 export default router;

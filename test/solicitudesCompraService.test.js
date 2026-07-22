@@ -355,7 +355,7 @@ test('administrador puede filtrar listado por sucursal sin datos financieros', a
   assert.equal(captured.params[0], 8);
 });
 
-test('router nuevo queda montado con los cuatro endpoints y antes del parametro dinamico', async () => {
+test('router nuevo conserva montados los endpoints base y su orden seguro', async () => {
   const [appSource, routerSource] = await Promise.all([
     readFile(new URL('../app.js', import.meta.url), 'utf8'),
     readFile(new URL('../routers/solicitudes_compra.js', import.meta.url), 'utf8')
