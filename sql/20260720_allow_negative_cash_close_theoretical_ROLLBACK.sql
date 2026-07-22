@@ -55,11 +55,56 @@ DECLARE
   constraint_validated boolean;
   normalized_expression text;
   target_column smallint;
+  monto_contado_attnum smallint;
 BEGIN
   IF to_regclass('public.cajas_sesiones') IS NULL
-     OR to_regclass('public.cajas_cierres') IS NULL THEN
+     OR to_regclass('public.cajas_cierres') IS NULL
+     OR to_regclass('public.cajas_arqueos') IS NULL THEN
     RAISE EXCEPTION 'Faltan tablas requeridas de cajas';
   END IF;
+
+  -- Esta columna es un control fisico protegido y nunca forma parte del
+  -- rollback. Se valida primero y de forma completa para fallar antes de
+  -- agregar o validar cualquier restriccion teorica.
+  SELECT a.attnum
+  INTO monto_contado_attnum
+  FROM pg_attribute a
+  WHERE a.attrelid = 'public.cajas_arqueos'::regclass
+    AND a.attname = 'monto_contado'
+    AND NOT a.attisdropped;
+
+  IF monto_contado_attnum IS NULL THEN
+    RAISE EXCEPTION 'Falta public.cajas_arqueos.monto_contado';
+  END IF;
+
+  SELECT c.contype, c.conkey, c.convalidated, pg_get_expr(c.conbin, c.conrelid)
+  INTO constraint_type, constraint_columns, constraint_validated, constraint_expression
+  FROM pg_constraint c
+  WHERE c.conrelid = 'public.cajas_arqueos'::regclass
+    AND c.conname = 'ck_cajas_arqueos_contado';
+
+  constraint_found := FOUND;
+  normalized_expression := lower(regexp_replace(
+    COALESCE(constraint_expression, ''),
+    '\s+|[()]|::numeric',
+    '',
+    'g'
+  ));
+
+  IF NOT constraint_found
+     OR constraint_type IS DISTINCT FROM 'c'::"char"
+     OR constraint_validated IS NOT TRUE
+     OR constraint_columns IS DISTINCT FROM ARRAY[monto_contado_attnum]::smallint[]
+     OR normalized_expression <> 'monto_contado>=0'
+  THEN
+    RAISE EXCEPTION 'ck_cajas_arqueos_contado no coincide exactamente con CHECK (monto_contado >= 0), no esta validado, o protege otras columnas; abortando por seguridad';
+  END IF;
+
+  constraint_columns := NULL;
+  constraint_expression := NULL;
+  constraint_type := NULL;
+  constraint_validated := NULL;
+  normalized_expression := NULL;
 
   SELECT a.attnum
   INTO target_column
@@ -181,17 +226,6 @@ BEGIN
     RAISE EXCEPTION 'ck_cajas_arqueos_teorico existe con una definicion incorrecta';
   END IF;
 
-  -- Columna protegida monto_contado: nunca se toca. Solo se confirma que
-  -- sigue intacta antes de continuar (no se restaura ni se elimina).
-  IF NOT EXISTS (
-    SELECT 1 FROM pg_constraint c
-    WHERE c.conrelid = 'public.cajas_arqueos'::regclass
-      AND c.conname = 'ck_cajas_arqueos_contado'
-      AND c.contype = 'c'
-      AND c.convalidated
-  ) THEN
-    RAISE EXCEPTION 'ck_cajas_arqueos_contado no existe o no esta validado; abortando por seguridad';
-  END IF;
 END
 $rollback_validate$;
 

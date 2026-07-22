@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import {
+  assertCoreCatalogValid,
   buildSegmentedArqueoComputation,
   fingerprintValuesEqual,
   OTHER_NON_CASH_METHOD_CODE
@@ -9,10 +10,10 @@ import {
 // Catalogo valido de referencia (EFECTIVO=1, TARJETA=2, TRANSFERENCIA=3,
 // OTRO=4), reflejando el estado real observado en QA/produccion.
 const VALID_CATALOG_VALIDATION = Object.freeze({
-  EFECTIVO: { codigo: 'EFECTIVO', id_metodo_pago: 1, activo: true, afecta_efectivo: true, valido: true, motivo: null },
-  TARJETA: { codigo: 'TARJETA', id_metodo_pago: 2, activo: true, afecta_efectivo: false, valido: true, motivo: null },
-  TRANSFERENCIA: { codigo: 'TRANSFERENCIA', id_metodo_pago: 3, activo: true, afecta_efectivo: false, valido: true, motivo: null },
-  OTRO: { codigo: 'OTRO', id_metodo_pago: 4, activo: true, afecta_efectivo: false, valido: true, motivo: null }
+  EFECTIVO: { codigo: 'EFECTIVO', coincidencias: 1, id_metodo_pago: 1, activo: true, afecta_efectivo: true, valido: true, motivo: null },
+  TARJETA: { codigo: 'TARJETA', coincidencias: 1, id_metodo_pago: 2, activo: true, afecta_efectivo: false, valido: true, motivo: null },
+  TRANSFERENCIA: { codigo: 'TRANSFERENCIA', coincidencias: 1, id_metodo_pago: 3, activo: true, afecta_efectivo: false, valido: true, motivo: null },
+  OTRO: { codigo: 'OTRO', coincidencias: 1, id_metodo_pago: 4, activo: true, afecta_efectivo: false, valido: true, motivo: null }
 });
 
 const NO_OTHER_ACTIVITY = Object.freeze({ ventas_brutas: 0, reversiones: 0, ventas_netas: 0, metodos_agrupados: [] });
@@ -225,6 +226,31 @@ describe('caja close computation', () => {
       (error) => {
         assert.equal(error.code, 'VENTAS_CAJAS_METODO_CATALOGO_INCOMPLETO');
         assert.equal(error.details.motivo, 'AFECTA_EFECTIVO_INCORRECTO');
+        return true;
+      }
+    );
+  });
+
+  it('rechaza catalogo duplicado y permite reutilizar el codigo stale en el cierre', () => {
+    const duplicated = {
+      ...VALID_CATALOG_VALIDATION,
+      TARJETA: {
+        ...VALID_CATALOG_VALIDATION.TARJETA,
+        coincidencias: 2,
+        valido: false,
+        motivo: 'CODIGO_DUPLICADO'
+      }
+    };
+    assert.throws(
+      () => assertCoreCatalogValid(duplicated, {
+        errorCode: 'VENTAS_CAJAS_CLOSE_VALIDATION_STALE',
+        publicMessage: 'Catalogo obsoleto.'
+      }),
+      (error) => {
+        assert.equal(error.httpStatus, 409);
+        assert.equal(error.code, 'VENTAS_CAJAS_CLOSE_VALIDATION_STALE');
+        assert.equal(error.details.codigo, 'TARJETA');
+        assert.equal(error.details.coincidencias, 2);
         return true;
       }
     );

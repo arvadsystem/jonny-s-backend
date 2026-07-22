@@ -105,18 +105,25 @@ const normalizeSnapshot = (row = {}, idSesionCaja) => {
     const idMetodoPago = Number.isFinite(Number(entry.id_metodo_pago)) && Number(entry.id_metodo_pago) > 0
       ? Number(entry.id_metodo_pago)
       : null;
+    const parsedMatches = Number(entry.coincidencias);
+    const coincidencias = Number.isInteger(parsedMatches) && parsedMatches >= 0
+      ? parsedMatches
+      : idMetodoPago ? 1 : 0;
     const activo = entry.activo === true;
     const afectaEfectivo = entry.afecta_efectivo === true
       ? true
       : entry.afecta_efectivo === false ? false : null;
 
     let motivo = null;
-    if (!idMetodoPago) motivo = 'NO_EXISTE';
+    if (coincidencias === 0) motivo = 'NO_EXISTE';
+    else if (coincidencias !== 1) motivo = 'CODIGO_DUPLICADO';
+    else if (!idMetodoPago) motivo = 'NO_EXISTE';
     else if (!activo) motivo = 'INACTIVO';
     else if (afectaEfectivo !== expectedAfectaEfectivo) motivo = 'AFECTA_EFECTIVO_INCORRECTO';
 
     return {
       codigo,
+      coincidencias,
       id_metodo_pago: idMetodoPago,
       activo,
       afecta_efectivo: afectaEfectivo,
@@ -136,6 +143,14 @@ const normalizeSnapshot = (row = {}, idSesionCaja) => {
     TRANSFERENCIA: buildCatalogValidation('TRANSFERENCIA', false),
     OTRO: buildCatalogValidation('OTRO', false)
   };
+  for (const [codigo, entry] of Object.entries(snapshot.catalogValidation)) {
+    snapshot.fingerprint[`catalogo_${codigo.toLowerCase()}`] = [
+      entry.coincidencias,
+      entry.id_metodo_pago || 0,
+      entry.activo === true ? '1' : '0',
+      entry.afecta_efectivo === true ? '1' : entry.afecta_efectivo === false ? '0' : 'NULL'
+    ].join(':');
+  }
 
   const metodosAgrupados = Array.isArray(row.otros_no_efectivo_metodos_agrupados)
     ? row.otros_no_efectivo_metodos_agrupados.map((item) => ({
@@ -387,16 +402,19 @@ export const loadCajaCloseFinancialSnapshot = async ({ queryRunner, idSesionCaja
       required_catalog_state AS (
         SELECT
           rc.codigo AS codigo_requerido,
-          pmc.id_metodo_pago,
-          pmc.activo,
-          pmc.afecta_efectivo
+          COUNT(pmc.id_metodo_pago)::int AS coincidencias,
+          CASE WHEN COUNT(pmc.id_metodo_pago) = 1 THEN MIN(pmc.id_metodo_pago) END AS id_metodo_pago,
+          CASE WHEN COUNT(pmc.id_metodo_pago) = 1 THEN BOOL_OR(pmc.activo) END AS activo,
+          CASE WHEN COUNT(pmc.id_metodo_pago) = 1 THEN BOOL_OR(pmc.afecta_efectivo) END AS afecta_efectivo
         FROM required_codes rc
         LEFT JOIN payment_method_catalog pmc ON pmc.codigo = rc.codigo
+        GROUP BY rc.codigo
       ),
       required_catalog_json AS (
         SELECT jsonb_object_agg(
           codigo_requerido,
-          jsonb_build_object(
+           jsonb_build_object(
+            'coincidencias', coincidencias,
             'id_metodo_pago', id_metodo_pago,
             'activo', activo,
             'afecta_efectivo', afecta_efectivo

@@ -92,16 +92,21 @@ const describeCatalogState = (entry) => {
 // de escribir nada. snapshot.catalogValidation viene de una resolucion por
 // codigo exacto (ver cajaCloseFinancialSnapshotService); ya no se fabrican
 // filas con id_metodo_pago=null que pasen esta validacion por "tener codigo".
-const assertCoreCatalogValid = (catalogValidation) => {
+export const assertCoreCatalogValid = (catalogValidation, {
+  errorCode = 'VENTAS_CAJAS_METODO_CATALOGO_INCOMPLETO',
+  publicMessage = null
+} = {}) => {
   for (const codigo of METHOD_CODES) {
     const entry = catalogValidation?.[codigo];
-    if (!entry || !entry.valido) {
+    const coincidencias = Number(entry?.coincidencias || 0);
+    if (!entry || coincidencias !== 1 || !entry.valido) {
       throw createCajaError(
         409,
-        'VENTAS_CAJAS_METODO_CATALOGO_INCOMPLETO',
-        `El catalogo de metodos de pago no tiene una configuracion valida para ${codigo}.`,
+        errorCode,
+        publicMessage || `El catalogo de metodos de pago no tiene una configuracion valida para ${codigo}.`,
         {
           codigo,
+          coincidencias,
           estado_encontrado: describeCatalogState(entry),
           afecta_efectivo_encontrado: entry?.afecta_efectivo ?? null,
           motivo: entry?.motivo || 'NO_EXISTE'

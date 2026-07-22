@@ -39,6 +39,8 @@ DECLARE
   constraint_validated boolean;
   normalized_expression text;
   target_column smallint;
+  monto_teorico_attnum smallint;
+  monto_contado_attnum smallint;
 BEGIN
   IF to_regclass('public.cajas_sesiones') IS NULL
      OR to_regclass('public.cajas_cierres') IS NULL THEN
@@ -132,13 +134,13 @@ BEGIN
   END IF;
 
   SELECT a.attnum
-  INTO target_column
+  INTO monto_teorico_attnum
   FROM pg_attribute a
   WHERE a.attrelid = 'public.cajas_arqueos'::regclass
     AND a.attname = 'monto_teorico'
     AND NOT a.attisdropped;
 
-  IF target_column IS NULL THEN
+  IF monto_teorico_attnum IS NULL THEN
     RAISE EXCEPTION 'Falta public.cajas_arqueos.monto_teorico';
   END IF;
 
@@ -146,13 +148,13 @@ BEGIN
   -- debe ser alterada por esta migracion. No basta con el nombre de la
   -- restriccion: se valida tipo, validacion, columnas exactas y expresion.
   SELECT a.attnum
-  INTO target_column
+  INTO monto_contado_attnum
   FROM pg_attribute a
   WHERE a.attrelid = 'public.cajas_arqueos'::regclass
     AND a.attname = 'monto_contado'
     AND NOT a.attisdropped;
 
-  IF target_column IS NULL THEN
+  IF monto_contado_attnum IS NULL THEN
     RAISE EXCEPTION 'Falta public.cajas_arqueos.monto_contado';
   END IF;
 
@@ -173,13 +175,12 @@ BEGIN
   IF NOT constraint_found
      OR constraint_type IS DISTINCT FROM 'c'::"char"
      OR constraint_validated IS NOT TRUE
-     OR constraint_columns IS DISTINCT FROM ARRAY[target_column]::smallint[]
+     OR constraint_columns IS DISTINCT FROM ARRAY[monto_contado_attnum]::smallint[]
      OR normalized_expression <> 'monto_contado>=0'
   THEN
     RAISE EXCEPTION 'ck_cajas_arqueos_contado (columna protegida monto_contado) no existe, no esta validado, protege columnas distintas de monto_contado, o no coincide con monto_contado >= 0; abortando por seguridad';
   END IF;
 
-  target_column := NULL;
   constraint_columns := NULL;
   constraint_expression := NULL;
   constraint_type := NULL;
@@ -202,7 +203,7 @@ BEGIN
   ));
 
   IF constraint_found AND (
-    constraint_columns IS DISTINCT FROM ARRAY[target_column]::smallint[]
+    constraint_columns IS DISTINCT FROM ARRAY[monto_teorico_attnum]::smallint[]
     OR normalized_expression <> 'monto_teorico>=0'
   ) THEN
     RAISE EXCEPTION 'ck_cajas_arqueos_teorico no coincide con el CHECK no-negativo esperado';

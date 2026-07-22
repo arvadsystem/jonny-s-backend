@@ -57,6 +57,10 @@ describe('monto teorico negativo en cierre de caja', () => {
     assert.match(safeSource, /pg_get_expr\(c\.conbin, c\.conrelid\)/);
     assert.match(safeSource, /monto_teorico_cierre>=0/);
     assert.match(safeSource, /ARRAY\[target_column\]::smallint\[\]/);
+    assert.match(safeSource, /monto_teorico_attnum smallint/);
+    assert.match(safeSource, /monto_contado_attnum smallint/);
+    assert.match(safeSource, /ARRAY\[monto_teorico_attnum\]::smallint\[\]/);
+    assert.match(safeSource, /ARRAY\[monto_contado_attnum\]::smallint\[\]/);
     assert.match(safeSource, /DROP CONSTRAINT IF EXISTS ck_cajas_sesiones_monto_teorico/);
     assert.match(safeSource, /DROP CONSTRAINT IF EXISTS ck_cajas_cierres_monto_teorico/);
     assert.match(safeSource, /DROP CONSTRAINT IF EXISTS ck_cajas_arqueos_teorico/);
@@ -136,7 +140,11 @@ describe('monto teorico negativo en cierre de caja', () => {
     assert.match(rollbackSource, /monto_teorico_cierre>=0/);
     assert.match(rollbackSource, /'monto_teorico>=0'/);
     assert.match(rollbackSource, /existe con una definicion incorrecta/g);
-    assert.match(rollbackSource, /ck_cajas_arqueos_contado no existe o no esta validado/);
+    assert.match(rollbackSource, /monto_contado_attnum smallint/);
+    assert.match(rollbackSource, /constraint_type IS DISTINCT FROM 'c'::"char"/);
+    assert.match(rollbackSource, /constraint_columns IS DISTINCT FROM ARRAY\[monto_contado_attnum\]::smallint\[\]/);
+    assert.match(rollbackSource, /normalized_expression <> 'monto_contado>=0'/);
+    assert.match(rollbackSource, /ck_cajas_arqueos_contado no coincide exactamente/);
 
     assert.match(rollbackSource, /ADD CONSTRAINT ck_cajas_sesiones_monto_teorico/);
     assert.match(rollbackSource, /ADD CONSTRAINT ck_cajas_cierres_monto_teorico/);
@@ -197,10 +205,14 @@ describe('monto teorico negativo en cierre de caja', () => {
     const assertSource = routerSource.slice(start, end);
 
     assert.match(assertSource, /buildExpectedOtroValidationRow/);
+    assert.match(assertSource, /const storedByCode = new Map/);
+    assert.match(assertSource, /const rowsForCode = storedByCode\.get\(code\) \|\| \[\]/);
+    assert.match(assertSource, /methodRows\.length !== 1/);
     assert.match(assertSource, /DUPLICADO/);
     assert.match(assertSource, /INESPERADO/);
-    assert.match(assertSource, /presenceChanged/);
-    assert.match(assertSource, /idChanged/);
-    assert.match(assertSource, /amountChanged/);
+    assert.match(assertSource, /validationMethodId !== currentMethodId/);
+    assert.match(assertSource, /Boolean\(storedOtroRow\) !== Boolean\(expectedOtroRow\)/);
+    assert.match(assertSource, /storedOtroId !== expectedOtroId/);
+    assert.match(assertSource, /storedOtroTeorico !== expectedOtroTeorico/);
   });
 });

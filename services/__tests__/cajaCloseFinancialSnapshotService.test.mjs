@@ -259,11 +259,44 @@ describe('loadCajaCloseFinancialSnapshot', () => {
     assert.equal(snapshot.catalogValidation.TRANSFERENCIA.valido, true);
     assert.equal(snapshot.catalogValidation.OTRO.valido, true);
     assert.equal(snapshot.catalogValidation.OTRO.id_metodo_pago, 4);
+    assert.equal(snapshot.catalogValidation.OTRO.coincidencias, 1);
+    assert.equal(snapshot.fingerprint.catalogo_otro, '1:4:1:0');
     assert.equal(snapshot.otrosNoEfectivo.ventas_brutas, 400);
     assert.equal(snapshot.otrosNoEfectivo.ventas_netas, 400);
     assert.deepEqual(snapshot.otrosNoEfectivo.metodos_agrupados, [
       { codigo: 'OTRO', ventas_brutas: 400, reversiones: 0, ventas_netas: 400 }
     ]);
+  });
+
+  it('detecta codigos de catalogo duplicados sin ocultarlos en jsonb_object_agg', async () => {
+    const queryRunner = {
+      async query(sql) {
+        assert.match(sql, /COUNT\(pmc\.id_metodo_pago\)::int AS coincidencias/);
+        assert.match(sql, /GROUP BY rc\.codigo/);
+        return {
+          rows: [{
+            id_sesion_caja: '34',
+            metodos_pago_invalidos: [],
+            metodos: [],
+            catalogo_requerido: {
+              TARJETA: {
+                coincidencias: 2,
+                id_metodo_pago: null,
+                activo: null,
+                afecta_efectivo: null
+              }
+            },
+            fingerprint: {}
+          }]
+        };
+      }
+    };
+
+    const snapshot = await loadCajaCloseFinancialSnapshot({ queryRunner, idSesionCaja: '34' });
+    assert.equal(snapshot.catalogValidation.TARJETA.valido, false);
+    assert.equal(snapshot.catalogValidation.TARJETA.motivo, 'CODIGO_DUPLICADO');
+    assert.equal(snapshot.catalogValidation.TARJETA.coincidencias, 2);
+    assert.equal(snapshot.fingerprint.catalogo_tarjeta, '2:0:0:NULL');
   });
 
   it('marca catalogValidation invalido por codigo faltante, inactivo o afecta_efectivo incorrecto', async () => {

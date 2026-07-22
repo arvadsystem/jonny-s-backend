@@ -22,6 +22,7 @@ import {
   reactivateFailedCajaCloseEmailNotification
 } from '../services/cajaCloseEmailOutboxService.js';
 import {
+  assertCoreCatalogValid,
   buildSegmentedArqueoComputation as buildSegmentedArqueoComputationFromSnapshot,
   fingerprintValuesEqual,
   OTHER_NON_CASH_METHOD_CODE
@@ -773,57 +774,79 @@ const assertCloseValidationMatchesCurrentSummary = ({
   currentSummary,
   currentFingerprint
 }) => {
+  assertCoreCatalogValid(currentSummary?.catalogValidation, {
+    errorCode: 'VENTAS_CAJAS_CLOSE_VALIDATION_STALE',
+    publicMessage: 'El catalogo de metodos de pago cambio despues de validar el cierre. Debe realizar una nueva revision.'
+  });
+
   const currentByCode = buildCurrentCloseTheoreticalByCode(currentSummary);
   const storedRows = Array.isArray(validationMethods) ? validationMethods : [];
-  const validationByCode = new Map(
-    storedRows
-      .map((row) => [normalizeMethodCode(row?.metodo_pago_codigo), row])
-      .filter(([code]) => SEGMENTED_ARQUEO_METHOD_CODES.includes(code))
-  );
+  const storedByCode = new Map();
   const staleDetails = [];
 
+  for (const row of storedRows) {
+    const code = normalizeMethodCode(row?.metodo_pago_codigo);
+    if (!SEGMENTED_ARQUEO_METHOD_CODES.includes(code) && code !== OTHER_NON_CASH_METHOD_CODE) {
+      staleDetails.push({ metodo_pago_codigo: code || 'VACIO', validacion: 'INESPERADO', actual: null });
+      continue;
+    }
+    const rowsForCode = storedByCode.get(code) || [];
+    rowsForCode.push(row);
+    storedByCode.set(code, rowsForCode);
+  }
+
   for (const methodCode of SEGMENTED_ARQUEO_METHOD_CODES) {
-    const methodValidation = validationByCode.get(methodCode);
+    const methodRows = storedByCode.get(methodCode) || [];
+    const methodValidation = methodRows.length === 1 ? methodRows[0] : null;
+    const catalogEntry = currentSummary?.catalogValidation?.[methodCode];
     const validationAmount = roundMoney(methodValidation?.monto_teorico ?? 0);
     const currentAmount = roundMoney(currentByCode.get(methodCode) || 0);
-    if (!methodValidation || validationAmount !== currentAmount) {
+    const validationMethodId = Number(methodValidation?.id_metodo_pago || 0) || null;
+    const currentMethodId = Number(catalogEntry?.id_metodo_pago || 0) || null;
+    if (
+      methodRows.length !== 1
+      || validationMethodId !== currentMethodId
+      || validationAmount !== currentAmount
+    ) {
       staleDetails.push({
         metodo_pago_codigo: methodCode,
-        validacion: validationAmount,
-        actual: currentAmount
+        validacion: methodRows.length > 1 ? 'DUPLICADO' : methodRows.length === 0 ? 'AUSENTE' : validationAmount,
+        actual: currentAmount,
+        id_validacion: validationMethodId,
+        id_actual: currentMethodId
       });
     }
   }
 
-  const storedOtroRows = storedRows.filter((row) => normalizeMethodCode(row?.metodo_pago_codigo) === 'OTRO');
-  if (storedOtroRows.length > 1) {
-    staleDetails.push({ metodo_pago_codigo: 'OTRO', validacion: 'DUPLICADO', actual: null });
-  } else {
-    const storedOtroRow = storedOtroRows[0] || null;
-    const expectedOtroRow = buildExpectedOtroValidationRow(currentSummary);
-    const presenceChanged = Boolean(storedOtroRow) !== Boolean(expectedOtroRow);
-    const storedOtroTeorico = storedOtroRow ? roundMoney(storedOtroRow.monto_teorico ?? 0) : null;
-    const storedOtroId = storedOtroRow ? (Number(storedOtroRow.id_metodo_pago) || null) : null;
-    const expectedOtroTeorico = expectedOtroRow ? roundMoney(expectedOtroRow.monto_teorico) : null;
-    const expectedOtroId = expectedOtroRow ? expectedOtroRow.id_metodo_pago : null;
-    const idChanged = Boolean(storedOtroRow) && Boolean(expectedOtroRow) && storedOtroId !== expectedOtroId;
-    const amountChanged = Boolean(storedOtroRow) && Boolean(expectedOtroRow) && storedOtroTeorico !== expectedOtroTeorico;
-
-    if (presenceChanged || idChanged || amountChanged) {
-      staleDetails.push({
-        metodo_pago_codigo: 'OTRO',
-        validacion: storedOtroTeorico,
-        actual: expectedOtroTeorico
-      });
-    }
-  }
-
-  const unexpectedRows = storedRows.filter((row) => {
-    const code = normalizeMethodCode(row?.metodo_pago_codigo);
-    return !SEGMENTED_ARQUEO_METHOD_CODES.includes(code) && code !== 'OTRO';
-  });
-  if (unexpectedRows.length > 0) {
-    staleDetails.push({ metodo_pago_codigo: 'INESPERADO', validacion: null, actual: null });
+  const storedOtroRows = storedByCode.get(OTHER_NON_CASH_METHOD_CODE) || [];
+  const expectedOtroRow = buildExpectedOtroValidationRow(currentSummary);
+  const otroCatalogEntry = currentSummary?.catalogValidation?.OTRO;
+  const storedOtroRow = storedOtroRows.length === 1 ? storedOtroRows[0] : null;
+  const storedOtroTeorico = storedOtroRow ? roundMoney(storedOtroRow.monto_teorico ?? 0) : null;
+  const storedOtroId = storedOtroRow ? (Number(storedOtroRow.id_metodo_pago) || null) : null;
+  const expectedOtroTeorico = expectedOtroRow ? roundMoney(expectedOtroRow.monto_teorico) : null;
+  const expectedOtroId = expectedOtroRow ? Number(expectedOtroRow.id_metodo_pago || 0) || null : null;
+  const otroCatalogInvalid = Boolean(expectedOtroRow) && (
+    !otroCatalogEntry?.valido
+    || Number(otroCatalogEntry.coincidencias || 0) !== 1
+  );
+  if (
+    storedOtroRows.length > 1
+    || Boolean(storedOtroRow) !== Boolean(expectedOtroRow)
+    || otroCatalogInvalid
+    || (storedOtroRow && expectedOtroRow && (
+      storedOtroId !== expectedOtroId
+      || storedOtroTeorico !== expectedOtroTeorico
+    ))
+  ) {
+    staleDetails.push({
+      metodo_pago_codigo: OTHER_NON_CASH_METHOD_CODE,
+      validacion: storedOtroRows.length > 1 ? 'DUPLICADO' : storedOtroTeorico,
+      actual: expectedOtroTeorico,
+      id_validacion: storedOtroId,
+      id_actual: expectedOtroId,
+      catalogo_valido: !otroCatalogInvalid
+    });
   }
 
   const validationTotal = roundMoney(validation?.total_teorico || 0);
@@ -5009,19 +5032,22 @@ const closeSessionHandler = async (req, res) => {
     montoTeorico = Number(validationToLink.total_teorico || 0);
     montoDeclaradoCierre = Number(validationToLink.total_declarado || 0);
     diferencia = Number(validationToLink.diferencia_total || 0);
-    arqueosPersistir = validationMethodsResult.rows.map((row) => ({
-      id_metodo_pago: Number(row.id_metodo_pago),
-      metodo_pago_codigo: normalizeMethodCode(row.metodo_pago_codigo),
-      monto_teorico: Number(row.monto_teorico || 0),
-      monto_declarado: Number(row.monto_declarado || 0),
-      diferencia: Number(row.diferencia || 0),
-      cantidad_referencias: row.cantidad_referencias === null || row.cantidad_referencias === undefined
-        ? null
-        : Number(row.cantidad_referencias),
-      observacion: row.observacion || null,
-      requiere_revision: Boolean(row.requiere_revision),
-      completado_automaticamente: false
-    }));
+    arqueosPersistir = validationMethodsResult.rows.map((row) => {
+      const methodCode = normalizeMethodCode(row.metodo_pago_codigo);
+      return {
+        id_metodo_pago: Number(row.id_metodo_pago),
+        metodo_pago_codigo: methodCode,
+        monto_teorico: Number(row.monto_teorico || 0),
+        monto_declarado: Number(row.monto_declarado || 0),
+        diferencia: Number(row.diferencia || 0),
+        cantidad_referencias: row.cantidad_referencias === null || row.cantidad_referencias === undefined
+          ? null
+          : Number(row.cantidad_referencias),
+        observacion: row.observacion || null,
+        requiere_revision: Boolean(row.requiere_revision),
+        completado_automaticamente: methodCode === OTHER_NON_CASH_METHOD_CODE
+      };
+    });
     const hasMethodDifference = arqueosPersistir.some((row) => Math.abs(roundMoney(row.diferencia)) > 0);
     const isBalancedClose = !hasMethodDifference && Math.abs(roundMoney(diferencia)) === 0;
     idResolucionFinal = isBalancedClose ? balancedResolutionId : pendingResolutionId;

@@ -17,11 +17,10 @@ import {
   getUserAuthzSnapshot
 } from '../utils/security/authTokenPayload.js';
 import { issueAccessToken } from '../utils/security/accessTokenPolicy.js';
+import { runIsolatedPostgresMigrationSuite } from './qa-caja-negative-close-postgres-isolated.mjs';
 
 const QA_PROJECT_REF = 'cluideiojeikzcmmizhe';
-const SAFE_PATH = new URL('../sql/20260720_allow_negative_cash_close_theoretical_SAFE.sql', import.meta.url);
 const VERIFY_PATH = new URL('../sql/20260720_allow_negative_cash_close_theoretical_VERIFY.sql', import.meta.url);
-const ROLLBACK_PATH = new URL('../sql/20260720_allow_negative_cash_close_theoretical_ROLLBACK.sql', import.meta.url);
 
 // Usuario QA real con rol SUPER_ADMIN, resuelto dinamicamente (nunca un ID
 // hardcodeado): usado unicamente para firmar una sesion de prueba
@@ -57,12 +56,6 @@ const assertQaTarget = () => {
   }
 };
 
-const NEGATIVE_CLOSE_CONSTRAINTS = Object.freeze([
-  ['public.cajas_sesiones', 'ck_cajas_sesiones_monto_teorico'],
-  ['public.cajas_cierres', 'ck_cajas_cierres_monto_teorico'],
-  ['public.cajas_arqueos', 'ck_cajas_arqueos_teorico']
-]);
-
 const namedConstraintState = async (queryRunner) => {
   const result = await queryRunner.query(`
     SELECT c.conrelid::regclass::text AS tabla, c.conname, c.convalidated,
@@ -77,16 +70,6 @@ const namedConstraintState = async (queryRunner) => {
   `);
   return result.rows;
 };
-
-// "legacy" (las 3 restricciones presentes, nada migrado) es el unico estado
-// que se restaura al finalizar. Cualquier otro estado (0, 1 o 2 presentes)
-// se trata como "safe": ya sea porque el smoke ya se ejecuto antes, o porque
-// un fix previo (sesiones/cierres) dejo la migracion a medias mientras
-// cajas_arqueos seguia bloqueando negativos (el propio bug de este cambio).
-// En ambos casos el resultado correcto es completar y dejar SAFE, nunca
-// revertir constraints que ya se habian retirado deliberadamente.
-const resolveInitialMode = (rows) =>
-  rows.length === NEGATIVE_CLOSE_CONSTRAINTS.length ? 'legacy' : 'safe';
 
 const runVerify = async (queryRunner, verifySql) => {
   const rawResults = await queryRunner.query(verifySql);
@@ -131,90 +114,6 @@ const runVerify = async (queryRunner, verifySql) => {
   };
 };
 
-const expectMigrationFailure = async ({ client, sql, code, messagePattern }) => {
-  await assert.rejects(
-    client.query(sql),
-    (error) => {
-      if (code) assert.equal(error.code, code);
-      if (messagePattern) assert.match(error.message, messagePattern);
-      return true;
-    }
-  );
-};
-
-// SAFE endurecido usa LOCK TABLE ... NOWAIT (falla inmediato, sin esperar el
-// lock_timeout de 1s) en vez del lock_timeout '5s' anterior. La prueba de
-// contencion (11.7) exige fallo en menos de 1.5s; se deja margen generoso
-// para jitter de red/CI mientras se mantiene muy por debajo del limite.
-const testLockTimeout = async (safeSql) => {
-  const locker = await pool.connect();
-  const runner = await pool.connect();
-  try {
-    const stateBefore = await namedConstraintState(pool);
-    await locker.query('BEGIN');
-    await locker.query('LOCK TABLE public.cajas_sesiones IN ACCESS EXCLUSIVE MODE');
-    const startedAt = Date.now();
-    await expectMigrationFailure({ client: runner, sql: safeSql, code: '55P03' });
-    const elapsedMs = Date.now() - startedAt;
-    assert.ok(elapsedMs < 1500, `NOWAIT debe fallar en menos de 1.5s, tardo: ${elapsedMs}ms`);
-    await runner.query('ROLLBACK');
-
-    // Cero cambios de esquema mientras el lock estaba contendido, sin
-    // asumir un estado inicial fijo (el entorno puede ya estar en SAFE).
-    const stateAfter = await namedConstraintState(pool);
-    assert.deepEqual(stateAfter, stateBefore, 'ninguna restriccion debe cambiar cuando NOWAIT falla');
-
-    return elapsedMs;
-  } finally {
-    await locker.query('ROLLBACK').catch(() => {});
-    await runner.query('ROLLBACK').catch(() => {});
-    locker.release();
-    runner.release();
-  }
-};
-
-const testWrongDefinition = async ({
-  table,
-  constraintName,
-  wrongCheckSql,
-  safeSql
-}) => {
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-    await client.query(`ALTER TABLE ${table} ADD CONSTRAINT ${constraintName} ${wrongCheckSql}`);
-    await expectMigrationFailure({
-      client,
-      sql: safeSql,
-      messagePattern: /no coincide con el CHECK no-negativo esperado/
-    });
-  } finally {
-    await client.query('ROLLBACK').catch(() => {});
-    client.release();
-  }
-};
-
-const testRollbackWrongDefinition = async ({
-  table,
-  constraintName,
-  wrongCheckSql,
-  rollbackSql
-}) => {
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-    await client.query(`ALTER TABLE ${table} DROP CONSTRAINT ${constraintName}`);
-    await client.query(`ALTER TABLE ${table} ADD CONSTRAINT ${constraintName} ${wrongCheckSql}`);
-    await expectMigrationFailure({
-      client,
-      sql: rollbackSql,
-      messagePattern: /definicion incorrecta o no validada/
-    });
-  } finally {
-    await client.query('ROLLBACK').catch(() => {});
-    client.release();
-  }
-};
 
 const loadSmokeReferences = async (client) => {
   const result = await client.query(`
@@ -226,8 +125,7 @@ const loadSmokeReferences = async (client) => {
       (SELECT id_estado_sesion_caja FROM public.cat_cajas_sesiones_estados WHERE UPPER(TRIM(codigo)) = 'CERRADA' LIMIT 1) AS estado_cerrada,
       (SELECT id_tipo_movimiento_caja FROM public.cat_cajas_movimientos_tipos WHERE UPPER(TRIM(codigo)) = 'APERTURA' LIMIT 1) AS tipo_apertura,
       (SELECT id_tipo_movimiento_caja FROM public.cat_cajas_movimientos_tipos WHERE UPPER(TRIM(codigo)) IN ('EGRESO_MANUAL','EGRESO','RETIRO','SALIDA_CAJA') ORDER BY CASE WHEN UPPER(TRIM(codigo)) = 'EGRESO_MANUAL' THEN 0 ELSE 1 END LIMIT 1) AS tipo_egreso,
-      (SELECT id_resolucion_cierre_caja FROM public.cat_cajas_resoluciones_cierre WHERE UPPER(TRIM(codigo)) = 'PENDIENTE_REVISION' LIMIT 1) AS resolucion_pendiente,
-      (SELECT id_factura FROM public.facturas f WHERE NOT EXISTS (SELECT 1 FROM public.facturas_reversiones fr WHERE fr.id_factura_original = f.id_factura) ORDER BY id_factura DESC LIMIT 1) AS id_factura
+      (SELECT id_resolucion_cierre_caja FROM public.cat_cajas_resoluciones_cierre WHERE UPPER(TRIM(codigo)) = 'PENDIENTE_REVISION' LIMIT 1) AS resolucion_pendiente
     FROM public.cajas caja
     CROSS JOIN LATERAL (
       SELECT u.id_usuario
@@ -257,10 +155,51 @@ const loadSmokeReferences = async (client) => {
     'estado_cerrada',
     'tipo_apertura',
     'tipo_egreso',
-    'resolucion_pendiente',
-    'id_factura'
+    'resolucion_pendiente'
   ]) assert.ok(row[key], `Referencia QA faltante: ${key}`);
   return row;
+};
+
+const insertSyntheticInvoice = async (client, {
+  idSesionCaja,
+  references,
+  idUsuario = references.id_usuario,
+  fixtureReference,
+  total = 1000
+}) => {
+  const invoice = await client.query(`
+    INSERT INTO public.facturas (
+      id_caja, id_pedido, id_sucursal, id_usuario, id_cliente,
+      codigo_venta, fecha_operacion, efectivo_entregado, cambio,
+      fecha_hora_facturacion, isv_15, isv_18, id_sesion_caja
+    ) VALUES (
+      $1, NULL, $2, $3, NULL,
+      $4, (NOW() AT TIME ZONE 'America/Tegucigalpa')::date, $5, 0,
+      (NOW() AT TIME ZONE 'America/Tegucigalpa'), 0, 0, $6
+    )
+    RETURNING id_factura
+  `, [
+    references.id_caja,
+    references.id_sucursal,
+    idUsuario,
+    fixtureReference,
+    total,
+    idSesionCaja
+  ]);
+  const idFactura = Number(invoice.rows[0]?.id_factura) || null;
+  assert.ok(idFactura, 'No se pudo crear la factura sintetica del smoke.');
+
+  const detail = await client.query(`
+    INSERT INTO public.detalle_facturas (
+      id_factura, id_producto, id_descuento, cantidad,
+      precio_unitario, sub_total, total_detalle, id_pedido, tipo_item
+    ) VALUES ($1, NULL, NULL, 1, $2, $2, $2, NULL, NULL)
+    RETURNING id_detalle_factura
+  `, [idFactura, total]);
+  const idDetalleFactura = Number(detail.rows[0]?.id_detalle_factura) || null;
+  assert.ok(idDetalleFactura, 'No se pudo crear el detalle sintetico del smoke.');
+
+  return { idFactura, idDetalleFactura };
 };
 
 const insertSession = async (client, {
@@ -269,7 +208,8 @@ const insertSession = async (client, {
   estado,
   montoApertura,
   closed = false,
-  idUsuarioResponsable = references.id_usuario
+  idUsuarioResponsable = references.id_usuario,
+  fixtureReference = 'QA_SMOKE_CAJA_NEGATIVE_CLOSE'
 }) => {
   await client.query(`
     INSERT INTO public.cajas_sesiones (
@@ -283,7 +223,7 @@ const insertSession = async (client, {
       CASE WHEN $6::boolean THEN $4::integer ELSE NULL::integer END,
       NOW() - interval '1 minute',
       CASE WHEN $6::boolean THEN NOW() ELSE NULL END,
-      $7::numeric, 'QA_SMOKE_CAJA_NEGATIVE_CLOSE', NOW(), NOW()
+      $7::numeric, $8, NOW(), NOW()
     )
   `, [
     idSesionCaja,
@@ -292,16 +232,19 @@ const insertSession = async (client, {
     idUsuarioResponsable,
     estado,
     closed,
-    montoApertura
+    montoApertura,
+    fixtureReference
   ]);
 };
 
 const insertPayment = async (client, {
   idFacturaCobro,
+  idFactura,
   idSesionCaja,
   references,
   methodCode,
-  amount
+  amount,
+  fixtureReference
 }) => {
   await client.query(`
     INSERT INTO public.facturas_cobros (
@@ -310,17 +253,18 @@ const insertPayment = async (client, {
       fecha_cobro, fecha_creacion
     ) OVERRIDING SYSTEM VALUE
     SELECT $1, $2, $3, $4, $5, $6, mp.id_metodo_pago, $7,
-           'QA_SMOKE', 'QA_SMOKE_CAJA_NEGATIVE_CLOSE', NOW(), NOW()
+           $8, $8, NOW(), NOW()
     FROM public.cat_metodos_pago mp
-    WHERE UPPER(TRIM(mp.codigo)) = $8
+    WHERE UPPER(TRIM(mp.codigo)) = $9
   `, [
     idFacturaCobro,
-    references.id_factura,
+    idFactura,
     idSesionCaja,
     references.id_caja,
     references.id_sucursal,
     references.id_usuario,
     amount,
+    fixtureReference,
     methodCode
   ]);
 };
@@ -347,6 +291,12 @@ const runTransactionalFinancialSmoke = async () => {
       montoApertura: 0,
       closed: false
     });
+    const salesFixtureReference = `QAC${baseId}`;
+    const salesInvoice = await insertSyntheticInvoice(client, {
+      idSesionCaja: salesSessionId,
+      references,
+      fixtureReference: salesFixtureReference
+    });
     for (const [index, [methodCode, amount]] of [
       ['EFECTIVO', 100],
       ['TARJETA', 200],
@@ -355,10 +305,12 @@ const runTransactionalFinancialSmoke = async () => {
     ].entries()) {
       await insertPayment(client, {
         idFacturaCobro: baseId + 100 + index,
+        idFactura: salesInvoice.idFactura,
         idSesionCaja: salesSessionId,
         references,
         methodCode,
-        amount
+        amount,
+        fixtureReference: salesFixtureReference
       });
     }
 
@@ -417,7 +369,15 @@ const runTransactionalFinancialSmoke = async () => {
     // sesion). monto_declarado nunca debe quedar negativo (CHECK >=0 fuera de
     // alcance) y el cierre no debe bloquearse ni lanzar.
     const negativeOtrosComputation = buildSegmentedArqueoComputation({
-      snapshot: { ...salesSnapshot, totalTeorico: salesSnapshot.totalTeorico - 500 },
+      snapshot: {
+        ...salesSnapshot,
+        otrosNoEfectivo: {
+          ...salesSnapshot.otrosNoEfectivo,
+          ventas_brutas: 400,
+          reversiones: 500,
+          ventas_netas: -100
+        }
+      },
       payloadRows: [
         { metodo_pago_codigo: 'EFECTIVO', monto_declarado: 100 },
         { metodo_pago_codigo: 'TARJETA', monto_declarado: 200, cantidad_referencias: 1 },
@@ -532,7 +492,7 @@ const runTransactionalFinancialSmoke = async () => {
     assert.equal(computation.monto_teorico_total, -13763);
     assert.equal(computation.monto_declarado_total, 0);
     assert.equal(computation.diferencia_total, 13763);
-    assert.equal(computation.rows.length, 4);
+    assert.equal(computation.rows.length, 3);
 
     await client.query(`
       INSERT INTO public.cajas_cierres_validaciones (
@@ -700,16 +660,15 @@ const runTransactionalFinancialSmoke = async () => {
     assert.equal(String(state.resolucion).trim().toUpperCase(), 'PENDIENTE_REVISION');
     assert.equal(String(state.id_cierre_caja), String(closeId));
     assert.equal(String(state.validacion_vinculada), String(closeId));
-    assert.equal(state.arqueos, 4);
+    assert.equal(state.arqueos, 3);
     assert.equal(state.notificaciones, 1);
 
     const emailPayload = await loadCajaCloseEmailPayload(client, closeId);
     const html = buildCajaCloseEmailHtml({ payload: emailPayload, pdfAttached: true });
     const pdf = await buildCajaCierrePdfBuffer(emailPayload);
     assert.match(html, /Total ventas/);
-    // 7: el documento muestra la etiqueta humana, nunca el codigo tecnico
-    // (ni el actual OTRO ni el anterior OTROS_NO_EFECTIVO).
-    assert.match(html, /Otros no efectivo/);
+    // Esta sesion no tiene actividad OTRO; el documento nunca debe filtrar
+    // codigos tecnicos de metodos.
     assert.doesNotMatch(html, /OTROS_NO_EFECTIVO/);
     assert.doesNotMatch(html, />OTRO</);
     assert.ok(Buffer.isBuffer(pdf) && pdf.subarray(0, 4).toString() === '%PDF');
@@ -749,7 +708,7 @@ const runTransactionalFinancialSmoke = async () => {
         outbox: state.notificaciones,
         pdfBytes: pdf.length,
         htmlTotalVentas: true,
-        htmlOtrosNoEfectivo: true,
+        htmlSinCodigosTecnicos: true,
         arqueoCajaMontoTeorico: Number(persistedArqueo.rows[0].monto_teorico)
       },
       cleanup: cleanup.rows[0]
@@ -815,87 +774,228 @@ const callJson = async (baseUrl, method, path, { auth, body } = {}) => {
   return { status: res.status, body: parsed };
 };
 
-// Se limpia por id_sesion_caja (no solo por el id de validacion "principal")
-// porque el flujo de prueba puede generar mas de un intento de validacion
-// (p. ej. el caso "reintento del cierre"); todos deben quedar sin rastro.
-const cleanupHttpCloseArtifacts = async ({ idSesionCaja, idCierreCaja }) => {
-  if (idCierreCaja) {
-    await pool.query('DELETE FROM public.cajas_cierres_arqueos_metodos WHERE id_cierre_caja = $1', [idCierreCaja]);
-    await pool.query('DELETE FROM public.cajas_cierres_notificaciones_email WHERE id_cierre_caja = $1', [idCierreCaja]);
+const captureRegressionMetrics = async (queryRunner) => {
+  const result = await queryRunner.query(`
+    SELECT
+      (SELECT COUNT(*)::bigint FROM public.facturas)::text AS cantidad_facturas,
+      (SELECT COALESCE(SUM(total_detalle), 0)::numeric FROM public.detalle_facturas)::text AS suma_facturas,
+      (SELECT COUNT(*)::bigint FROM public.facturas_cobros)::text AS cantidad_cobros,
+      (SELECT COALESCE(SUM(monto), 0)::numeric FROM public.facturas_cobros)::text AS suma_cobros,
+      (SELECT COUNT(*)::bigint FROM public.pedidos)::text AS cantidad_pedidos,
+      (SELECT COUNT(*)::bigint FROM public.cajas_movimientos)::text AS cantidad_movimientos,
+      (SELECT COUNT(*)::bigint FROM public.cajas_cierres)::text AS cantidad_cierres,
+      (SELECT COUNT(*)::bigint
+       FROM public.cajas_sesiones cs
+       INNER JOIN public.cat_cajas_sesiones_estados estado
+         ON estado.id_estado_sesion_caja = cs.id_estado_sesion_caja
+       WHERE UPPER(TRIM(estado.codigo)) = 'ABIERTA')::text AS sesiones_abiertas
+  `);
+  return result.rows[0];
+};
+
+// Limpieza idempotente y por alcance completo. Descubre todos los cierres y
+// todas las validaciones de la sesion; no depende de que el flujo haya llegado
+// a devolver sus identificadores antes de fallar.
+const cleanupHttpCloseArtifacts = async ({ idSesionCaja, idFactura, fixtureReference }) => {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const closeRows = await client.query(
+      'SELECT id_cierre_caja FROM public.cajas_cierres WHERE id_sesion_caja = $1',
+      [idSesionCaja]
+    );
+    const closeIds = closeRows.rows.map((row) => String(row.id_cierre_caja));
+    if (closeIds.length > 0) {
+      await client.query('DELETE FROM public.cajas_cierres_notificaciones_email WHERE id_cierre_caja = ANY($1::bigint[])', [closeIds]);
+      await client.query('DELETE FROM public.cajas_cierres_arqueos_metodos WHERE id_cierre_caja = ANY($1::bigint[])', [closeIds]);
+    }
+    await client.query('UPDATE public.cajas_cierres_validaciones SET id_cierre_caja = NULL WHERE id_sesion_caja = $1', [idSesionCaja]);
+    await client.query(`
+      DELETE FROM public.cajas_cierres_validaciones_metodos
+      WHERE id_validacion_cierre IN (
+        SELECT id_validacion_cierre FROM public.cajas_cierres_validaciones WHERE id_sesion_caja = $1
+      )
+    `, [idSesionCaja]);
+    await client.query('DELETE FROM public.cajas_cierres_validaciones WHERE id_sesion_caja = $1', [idSesionCaja]);
+    await client.query('DELETE FROM public.cajas_cierres WHERE id_sesion_caja = $1', [idSesionCaja]);
+    await client.query('DELETE FROM public.cajas_arqueos WHERE id_sesion_caja = $1', [idSesionCaja]);
+    await client.query(`
+      DELETE FROM public.facturas_reversiones_detalle
+      WHERE id_reversion IN (
+        SELECT id_reversion FROM public.facturas_reversiones
+        WHERE id_sesion_caja_original = $1
+           OR id_sesion_caja_actual = $1
+           OR codigo_reversion LIKE $2 || '%'
+      )
+    `, [idSesionCaja, fixtureReference]);
+    await client.query(`
+      DELETE FROM public.facturas_reversiones
+      WHERE id_sesion_caja_original = $1
+         OR id_sesion_caja_actual = $1
+         OR codigo_reversion LIKE $2 || '%'
+    `, [idSesionCaja, fixtureReference]);
+    await client.query("DELETE FROM public.facturas_cobros WHERE id_sesion_caja = $1 OR referencia LIKE $2 || '%' OR observacion LIKE $2 || '%'", [idSesionCaja, fixtureReference]);
+    await client.query("DELETE FROM public.cajas_movimientos WHERE id_sesion_caja = $1 OR referencia LIKE $2 || '%' OR observacion LIKE $2 || '%'", [idSesionCaja, fixtureReference]);
+    await client.query('DELETE FROM public.cajas_sesiones_participantes WHERE id_sesion_caja = $1', [idSesionCaja]);
+    await client.query(`
+      DELETE FROM public.detalle_facturas
+      WHERE id_factura IN (
+        SELECT id_factura FROM public.facturas
+        WHERE id_factura = $1 OR codigo_venta LIKE $2 || '%'
+      )
+    `, [idFactura, fixtureReference]);
+    await client.query("DELETE FROM public.facturas WHERE id_factura = $1 OR codigo_venta LIKE $2 || '%'", [idFactura, fixtureReference]);
+    await client.query('DELETE FROM public.cajas_sesiones WHERE id_sesion_caja = $1', [idSesionCaja]);
+    await client.query('COMMIT');
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw error;
+  } finally {
+    client.release();
   }
-  await pool.query(`
-    DELETE FROM public.cajas_cierres_validaciones_metodos
-    WHERE id_validacion_cierre IN (
-      SELECT id_validacion_cierre FROM public.cajas_cierres_validaciones WHERE id_sesion_caja = $1
-    )
-  `, [idSesionCaja]);
-  await pool.query('DELETE FROM public.cajas_cierres_validaciones WHERE id_sesion_caja = $1', [idSesionCaja]);
-  if (idCierreCaja) {
-    await pool.query('DELETE FROM public.cajas_cierres WHERE id_cierre_caja = $1', [idCierreCaja]);
-  }
-  await pool.query('DELETE FROM public.facturas_cobros WHERE id_sesion_caja = $1', [idSesionCaja]);
-  await pool.query('DELETE FROM public.cajas_movimientos WHERE id_sesion_caja = $1', [idSesionCaja]);
-  await pool.query('DELETE FROM public.cajas_sesiones WHERE id_sesion_caja = $1', [idSesionCaja]);
+};
+
+const assertZeroHttpCloseArtifacts = async ({ idSesionCaja, fixtureReference, authSessionId }) => {
+  const result = await pool.query(`
+    SELECT
+      (SELECT COUNT(*)::int FROM public.cajas_sesiones WHERE id_sesion_caja = $1) AS sesiones,
+      (SELECT COUNT(*)::int FROM public.cajas_sesiones_participantes WHERE id_sesion_caja = $1) AS participantes,
+      (SELECT COUNT(*)::int FROM public.cajas_movimientos WHERE id_sesion_caja = $1 OR referencia LIKE $2 || '%' OR observacion LIKE $2 || '%') AS movimientos,
+      (SELECT COUNT(*)::int FROM public.facturas_cobros WHERE id_sesion_caja = $1 OR referencia LIKE $2 || '%' OR observacion LIKE $2 || '%') AS cobros,
+      (SELECT COUNT(*)::int FROM public.facturas WHERE id_sesion_caja = $1 OR codigo_venta LIKE $2 || '%') AS facturas,
+      (SELECT COUNT(*)::int FROM public.detalle_facturas df
+       INNER JOIN public.facturas f ON f.id_factura = df.id_factura
+       WHERE f.id_sesion_caja = $1 OR f.codigo_venta LIKE $2 || '%') AS detalles,
+      (SELECT COUNT(*)::int FROM public.facturas_reversiones
+       WHERE id_sesion_caja_original = $1 OR id_sesion_caja_actual = $1 OR codigo_reversion LIKE $2 || '%') AS reversiones,
+      (SELECT COUNT(*)::int FROM public.cajas_cierres_validaciones WHERE id_sesion_caja = $1) AS validaciones,
+      (SELECT COUNT(*)::int FROM public.cajas_cierres WHERE id_sesion_caja = $1) AS cierres,
+      (SELECT COUNT(*)::int FROM public.cajas_arqueos WHERE id_sesion_caja = $1) AS arqueos,
+      (SELECT COUNT(*)::int FROM public.sesiones_activas WHERE id_sesion = $3) AS autenticaciones
+  `, [idSesionCaja, fixtureReference, authSessionId]);
+  const residues = result.rows[0];
+  assert.ok(Object.values(residues).every((value) => Number(value) === 0), `Quedaron residuos del smoke HTTP: ${JSON.stringify(residues)}`);
+  return residues;
 };
 
 const runHttpCloseSmoke = async () => {
-  const references = await loadSmokeReferences(pool);
-  const qaTestUserId = await resolveQaHttpTestUser(pool);
   // Rango seguro para integer (algunas tablas de auditoria referencian el id
   // de sesion en una columna integer, no bigint), muy por encima de cualquier
   // secuencia real de QA.
   const idSesionCaja = 900_000_000 + (Date.now() % 90_000_000);
   const baseId = idSesionCaja;
-
-  await insertSession(pool, {
-    idSesionCaja,
-    references,
-    estado: references.estado_abierta,
-    montoApertura: 3000,
-    idUsuarioResponsable: qaTestUserId
-  });
-  await pool.query(`
-    INSERT INTO public.cajas_movimientos (
-      id_movimiento_caja, id_sesion_caja, id_caja, id_sucursal,
-      id_tipo_movimiento_caja, id_usuario_ejecutor, monto,
-      referencia, observacion, fecha_movimiento, fecha_creacion
-    ) OVERRIDING SYSTEM VALUE
-    VALUES ($1, $2, $3, $4, $5, $6, 16763, 'QA_SMOKE_HTTP_EGRESO', 'QA_SMOKE_CAJA_NEGATIVE_CLOSE', NOW(), NOW())
-  `, [baseId + 1, idSesionCaja, references.id_caja, references.id_sucursal, references.tipo_egreso, qaTestUserId]);
-  for (const [index, [methodCode, amount]] of [
-    ['EFECTIVO', 100],
-    ['TARJETA', 200],
-    ['TRANSFERENCIA', 300],
-    ['OTRO', 400]
-  ].entries()) {
-    await insertPayment(pool, {
-      idFacturaCobro: baseId + 10 + index,
-      idSesionCaja,
-      references: { ...references, id_usuario: qaTestUserId },
-      methodCode,
-      amount
-    });
-  }
-
-  // apertura 3000 + efectivo 100 - egreso 16763 = -13663; no-efectivo 900 (200+300+400)
-  const expectedEfectivoTeorico = -13663;
-  const expectedTotalTeorico = -12763;
-  const expectedTotalDeclarado = 900; // efectivo declarado 0 + tarjeta 200 + transferencia 300 + otros 400
-
-  const auth = await mintQaAuthContext({ idUsuario: qaTestUserId, idSucursal: references.id_sucursal });
-  const server = await startServer();
-  const { port } = server.address();
-  const baseUrl = `http://127.0.0.1:${port}`;
-
+  const fixtureReference = `QAH${baseId}`;
+  let references = null;
+  let qaTestUserId = null;
+  let auth = null;
+  let server = null;
+  let baseUrl = null;
+  let idFactura = null;
+  let idDetalleFactura = null;
   let idCierreCaja = null;
   let idValidacionCierre = null;
+  let metricsBefore = null;
+  let result = null;
   try {
+    references = await loadSmokeReferences(pool);
+    qaTestUserId = await resolveQaHttpTestUser(pool);
+    metricsBefore = await captureRegressionMetrics(pool);
+    await insertSession(pool, {
+      idSesionCaja,
+      references,
+      estado: references.estado_abierta,
+      montoApertura: 3000,
+      idUsuarioResponsable: qaTestUserId,
+      fixtureReference
+    });
+    const syntheticInvoice = await insertSyntheticInvoice(pool, {
+      idSesionCaja,
+      references,
+      idUsuario: qaTestUserId,
+      fixtureReference
+    });
+    ({ idFactura, idDetalleFactura } = syntheticInvoice);
+    const invoiceProof = await pool.query(`
+      SELECT f.id_factura, f.id_pedido, f.codigo_venta,
+             COUNT(df.id_detalle_factura)::int AS detalles,
+             COALESCE(SUM(df.total_detalle), 0)::numeric AS total_detalle
+      FROM public.facturas f
+      LEFT JOIN public.detalle_facturas df ON df.id_factura = f.id_factura
+      WHERE f.id_factura = $1 AND f.codigo_venta = $2 AND f.id_sesion_caja = $3
+      GROUP BY f.id_factura, f.id_pedido, f.codigo_venta
+    `, [idFactura, fixtureReference, idSesionCaja]);
+    assert.equal(invoiceProof.rowCount, 1);
+    assert.equal(invoiceProof.rows[0].id_pedido, null);
+    assert.equal(invoiceProof.rows[0].detalles, 1);
+    assert.equal(Number(invoiceProof.rows[0].total_detalle), 1000);
+
+    await pool.query(`
+      INSERT INTO public.cajas_movimientos (
+        id_movimiento_caja, id_sesion_caja, id_caja, id_sucursal,
+        id_tipo_movimiento_caja, id_usuario_ejecutor, monto,
+        referencia, observacion, fecha_movimiento, fecha_creacion
+      ) OVERRIDING SYSTEM VALUE
+      VALUES ($1, $2, $3, $4, $5, $6, 16763, $7, $7, NOW(), NOW())
+    `, [baseId + 1, idSesionCaja, references.id_caja, references.id_sucursal, references.tipo_egreso, qaTestUserId, fixtureReference]);
+    for (const [index, [methodCode, amount]] of [
+      ['EFECTIVO', 100],
+      ['TARJETA', 200],
+      ['TRANSFERENCIA', 300],
+      ['OTRO', 400]
+    ].entries()) {
+      await insertPayment(pool, {
+        idFacturaCobro: baseId + 10 + index,
+        idFactura,
+        idSesionCaja,
+        references: { ...references, id_usuario: qaTestUserId },
+        methodCode,
+        amount,
+        fixtureReference
+      });
+    }
+
+    // apertura 3000 + efectivo 100 - egreso 16763 = -13663;
+    // no-efectivo 900 (200+300+400).
+    const expectedEfectivoTeorico = -13663;
+    const expectedTotalTeorico = -12763;
+    const expectedTotalDeclarado = 900;
+    auth = await mintQaAuthContext({ idUsuario: qaTestUserId, idSucursal: references.id_sucursal });
+    server = await startServer();
+    const { port } = server.address();
+    baseUrl = `http://127.0.0.1:${port}`;
+
     const arqueosPayload = [
       { metodo_pago_codigo: 'EFECTIVO', monto_declarado: 0, observacion: 'QA smoke HTTP: caja vacia tras egreso' },
       { metodo_pago_codigo: 'TARJETA', monto_declarado: 200, cantidad_referencias: 1 },
       { metodo_pago_codigo: 'TRANSFERENCIA', monto_declarado: 300, cantidad_referencias: 1 }
     ];
     const observacionCierre = 'QA_SMOKE_HTTP cierre negativo con OTRO';
+    const createCloseValidation = async (rows = arqueosPayload) => {
+      const response = await callJson(baseUrl, 'POST', `/ventas/cajas/sesiones/${idSesionCaja}/cierre-validaciones`, {
+        auth,
+        body: { observacion_cierre: observacionCierre, arqueos: rows }
+      });
+      assert.equal(response.status, 201, `cierre-validaciones HTTP ${response.status}: ${JSON.stringify(response.body)}`);
+      assert.ok(response.body?.id_validacion_cierre);
+      return response;
+    };
+    const expectControlledCloseRejection = async (validationId, label, expectedCode = null) => {
+      const response = await callJson(baseUrl, 'PATCH', `/ventas/cajas/sesiones/${idSesionCaja}/cerrar`, {
+        auth,
+        body: { observacion_cierre: observacionCierre, id_validacion_cierre: validationId }
+      });
+      assert.ok(response.status >= 400 && response.status < 500, `${label} produjo HTTP ${response.status}: ${JSON.stringify(response.body)}`);
+      if (expectedCode) assert.equal(response.body?.code, expectedCode, label);
+      const partialWrites = await pool.query(`
+        SELECT
+          (SELECT COUNT(*)::int FROM public.cajas_cierres WHERE id_sesion_caja = $1) AS cierres,
+          (SELECT COUNT(*)::int FROM public.cajas_cierres_notificaciones_email outbox
+           INNER JOIN public.cajas_cierres cierre ON cierre.id_cierre_caja = outbox.id_cierre_caja
+           WHERE cierre.id_sesion_caja = $1) AS outbox
+      `, [idSesionCaja]);
+      assert.deepEqual(partialWrites.rows[0], { cierres: 0, outbox: 0 }, `${label} dejo escritura parcial`);
+      return response;
+    };
 
     const preview = await callJson(baseUrl, 'POST', `/ventas/cajas/sesiones/${idSesionCaja}/cierre-preview`, {
       auth,
@@ -928,14 +1028,321 @@ const runHttpCloseSmoke = async () => {
     assert.equal(validaciones.body.resumen.total_declarado, expectedTotalDeclarado);
     assert.equal(validaciones.body.resumen.hay_diferencia, true);
 
-    // Reintento del cierre: reenviar cierre-validaciones antes de cerrar debe
-    // seguir aceptando la revision (no hay estado que lo bloquee todavia).
-    const revalidacion = await callJson(baseUrl, 'POST', `/ventas/cajas/sesiones/${idSesionCaja}/cierre-validaciones`, {
+    // Catalogo desactivado despues de validar. TARJETA y TRANSFERENCIA se
+    // prueban expresamente con teorico cero para que la invalidacion no pueda
+    // depender de una diferencia monetaria.
+    const zeroPaymentRows = await pool.query(`
+      SELECT fc.id_factura_cobro, fc.monto, UPPER(TRIM(mp.codigo)) AS codigo
+      FROM public.facturas_cobros fc
+      INNER JOIN public.cat_metodos_pago mp ON mp.id_metodo_pago = fc.id_metodo_pago
+      WHERE fc.id_sesion_caja = $1
+        AND UPPER(TRIM(mp.codigo)) IN ('TARJETA', 'TRANSFERENCIA')
+      ORDER BY fc.id_factura_cobro
+    `, [idSesionCaja]);
+    assert.equal(zeroPaymentRows.rowCount, 2);
+    const inactiveCatalogRejections = [];
+    try {
+      await pool.query(`
+        DELETE FROM public.facturas_cobros
+        WHERE id_factura_cobro = ANY($1::bigint[])
+      `, [zeroPaymentRows.rows.map((row) => String(row.id_factura_cobro))]);
+      const zeroPayload = [
+        { metodo_pago_codigo: 'EFECTIVO', monto_declarado: 0, observacion: 'QA smoke HTTP: caja vacia tras egreso' },
+        { metodo_pago_codigo: 'TARJETA', monto_declarado: 0 },
+        { metodo_pago_codigo: 'TRANSFERENCIA', monto_declarado: 0 }
+      ];
+      for (const methodCode of ['EFECTIVO', 'TARJETA', 'TRANSFERENCIA', 'OTRO']) {
+        const validation = await createCloseValidation(zeroPayload);
+        const catalogRow = await pool.query(`
+          SELECT id_metodo_pago, estado
+          FROM public.cat_metodos_pago
+          WHERE UPPER(TRIM(codigo)) = $1
+          ORDER BY id_metodo_pago
+        `, [methodCode]);
+        assert.equal(catalogRow.rowCount, 1, `${methodCode} debe ser unico`);
+        await pool.query('UPDATE public.cat_metodos_pago SET estado = false WHERE id_metodo_pago = $1', [catalogRow.rows[0].id_metodo_pago]);
+        try {
+          const rejected = await expectControlledCloseRejection(validation.body.id_validacion_cierre, `${methodCode} inactivo`);
+          inactiveCatalogRejections.push({ metodo: methodCode, teoricoCero: ['TARJETA', 'TRANSFERENCIA'].includes(methodCode), code: rejected.body?.code || null });
+        } finally {
+          await pool.query('UPDATE public.cat_metodos_pago SET estado = $1 WHERE id_metodo_pago = $2', [catalogRow.rows[0].estado, catalogRow.rows[0].id_metodo_pago]);
+        }
+      }
+    } finally {
+      for (const row of zeroPaymentRows.rows) {
+        await insertPayment(pool, {
+          idFacturaCobro: row.id_factura_cobro,
+          idFactura,
+          idSesionCaja,
+          references: { ...references, id_usuario: qaTestUserId },
+          methodCode: row.codigo,
+          amount: row.monto,
+          fixtureReference
+        });
+      }
+    }
+
+    const duplicateRejections = [];
+    const methodCodes = ['EFECTIVO', 'TARJETA', 'TRANSFERENCIA', 'OTRO'];
+    for (const [index, methodCode] of methodCodes.entries()) {
+      const validationForDuplicate = index === 0
+        ? validaciones
+        : await callJson(baseUrl, 'POST', `/ventas/cajas/sesiones/${idSesionCaja}/cierre-validaciones`, {
+            auth,
+            body: { observacion_cierre: observacionCierre, arqueos: arqueosPayload }
+          });
+      assert.equal(validationForDuplicate.status, index === 0 ? 201 : 201);
+      const validationId = validationForDuplicate.body.id_validacion_cierre;
+      const rows = await pool.query(`
+        SELECT id_validacion_metodo, id_metodo_pago, metodo_pago_codigo
+        FROM public.cajas_cierres_validaciones_metodos
+        WHERE id_validacion_cierre = $1
+        ORDER BY id_validacion_metodo
+      `, [validationId]);
+      const target = rows.rows.find((row) => String(row.metodo_pago_codigo).trim().toUpperCase() === methodCode);
+      const donor = rows.rows.find((row) => String(row.metodo_pago_codigo).trim().toUpperCase() !== methodCode);
+      assert.ok(target && donor);
+      await pool.query(`
+        UPDATE public.cajas_cierres_validaciones_metodos
+        SET id_metodo_pago = $1, metodo_pago_codigo = $2
+        WHERE id_validacion_metodo = $3
+      `, [target.id_metodo_pago, methodCode, donor.id_validacion_metodo]);
+      try {
+        const rejected = await callJson(baseUrl, 'PATCH', `/ventas/cajas/sesiones/${idSesionCaja}/cerrar`, {
+          auth,
+          body: { observacion_cierre: observacionCierre, id_validacion_cierre: validationId }
+        });
+        assert.equal(rejected.status, 409, `duplicado ${methodCode}: ${JSON.stringify(rejected.body)}`);
+        assert.equal(rejected.body?.code, 'VENTAS_CAJAS_CLOSE_VALIDATION_STALE');
+        duplicateRejections.push(methodCode);
+      } finally {
+        await pool.query(`
+          UPDATE public.cajas_cierres_validaciones_metodos
+          SET id_metodo_pago = $1, metodo_pago_codigo = $2
+          WHERE id_validacion_metodo = $3
+        `, [donor.id_metodo_pago, donor.metodo_pago_codigo, donor.id_validacion_metodo]);
+      }
+    }
+
+    const malformedValidationRejections = {};
+    {
+      const validation = await createCloseValidation();
+      await pool.query(`
+        UPDATE public.cajas_cierres_validaciones_metodos
+        SET metodo_pago_codigo = 'INESPERADO_QA'
+        WHERE id_validacion_metodo = (
+          SELECT id_validacion_metodo
+          FROM public.cajas_cierres_validaciones_metodos
+          WHERE id_validacion_cierre = $1
+          ORDER BY id_validacion_metodo DESC
+          LIMIT 1
+        )
+      `, [validation.body.id_validacion_cierre]);
+      const rejected = await expectControlledCloseRejection(
+        validation.body.id_validacion_cierre,
+        'codigo inesperado',
+        'VENTAS_CAJAS_CLOSE_VALIDATION_STALE'
+      );
+      malformedValidationRejections.codigoInesperado = rejected.status;
+    }
+    {
+      const validation = await createCloseValidation();
+      const rows = await pool.query(`
+        SELECT id_validacion_metodo, id_metodo_pago, UPPER(TRIM(metodo_pago_codigo)) AS codigo
+        FROM public.cajas_cierres_validaciones_metodos
+        WHERE id_validacion_cierre = $1
+      `, [validation.body.id_validacion_cierre]);
+      const tarjeta = rows.rows.find((row) => row.codigo === 'TARJETA');
+      const otro = rows.rows.find((row) => row.codigo === 'OTRO');
+      assert.ok(tarjeta && otro);
+      await pool.query(
+        'UPDATE public.cajas_cierres_validaciones_metodos SET id_metodo_pago = $1 WHERE id_validacion_metodo = $2',
+        [otro.id_metodo_pago, tarjeta.id_validacion_metodo]
+      );
+      const rejected = await expectControlledCloseRejection(
+        validation.body.id_validacion_cierre,
+        'id y codigo desalineados',
+        'VENTAS_CAJAS_CLOSE_VALIDATION_STALE'
+      );
+      malformedValidationRejections.idCodigoDesalineados = rejected.status;
+    }
+    {
+      const validation = await createCloseValidation();
+      await pool.query(`
+        DELETE FROM public.cajas_cierres_validaciones_metodos
+        WHERE id_validacion_cierre = $1
+          AND UPPER(TRIM(metodo_pago_codigo)) IN ('TRANSFERENCIA', 'OTRO')
+      `, [validation.body.id_validacion_cierre]);
+      const rejected = await expectControlledCloseRejection(
+        validation.body.id_validacion_cierre,
+        'validacion con solo dos metodos',
+        'VENTAS_CAJAS_CLOSE_VALIDATION_STALE'
+      );
+      malformedValidationRejections.soloDosMetodos = rejected.status;
+    }
+    {
+      const validation = await createCloseValidation();
+      await pool.query(
+        'DELETE FROM public.cajas_cierres_validaciones_metodos WHERE id_validacion_cierre = $1',
+        [validation.body.id_validacion_cierre]
+      );
+      const rejected = await expectControlledCloseRejection(validation.body.id_validacion_cierre, 'validacion sin detalle');
+      assert.equal(rejected.body?.code, 'VENTAS_CAJAS_VALIDACION_CIERRE_INCOMPLETA');
+      malformedValidationRejections.sinDetalle = rejected.status;
+    }
+
+    const operationalChangeRejections = {};
+    {
+      const validation = await createCloseValidation();
+      await insertPayment(pool, {
+        idFacturaCobro: baseId + 100,
+        idFactura,
+        idSesionCaja,
+        references: { ...references, id_usuario: qaTestUserId },
+        methodCode: 'EFECTIVO',
+        amount: 1,
+        fixtureReference
+      });
+      try {
+        const rejected = await expectControlledCloseRejection(validation.body.id_validacion_cierre, 'nuevo cobro', 'VENTAS_CAJAS_CLOSE_VALIDATION_STALE');
+        operationalChangeRejections.nuevoCobro = rejected.status;
+      } finally {
+        await pool.query('DELETE FROM public.facturas_cobros WHERE id_factura_cobro = $1', [baseId + 100]);
+      }
+    }
+    {
+      const validation = await createCloseValidation();
+      await pool.query(`
+        INSERT INTO public.cajas_movimientos (
+          id_movimiento_caja, id_sesion_caja, id_caja, id_sucursal,
+          id_tipo_movimiento_caja, id_usuario_ejecutor, monto,
+          referencia, observacion, fecha_movimiento, fecha_creacion
+        ) OVERRIDING SYSTEM VALUE
+        VALUES ($1, $2, $3, $4, $5, $6, 1, $7, $7, NOW(), NOW())
+      `, [baseId + 101, idSesionCaja, references.id_caja, references.id_sucursal, references.tipo_egreso, qaTestUserId, fixtureReference]);
+      try {
+        const rejected = await expectControlledCloseRejection(validation.body.id_validacion_cierre, 'nuevo movimiento', 'VENTAS_CAJAS_CLOSE_VALIDATION_STALE');
+        operationalChangeRejections.nuevoMovimiento = rejected.status;
+      } finally {
+        await pool.query('DELETE FROM public.cajas_movimientos WHERE id_movimiento_caja = $1', [baseId + 101]);
+      }
+    }
+    {
+      const validation = await createCloseValidation();
+      const saleReference = `${fixtureReference}S`;
+      const saleInvoice = await insertSyntheticInvoice(pool, {
+        idSesionCaja,
+        references,
+        idUsuario: qaTestUserId,
+        fixtureReference: saleReference,
+        total: 1
+      });
+      await insertPayment(pool, {
+        idFacturaCobro: baseId + 102,
+        idFactura: saleInvoice.idFactura,
+        idSesionCaja,
+        references: { ...references, id_usuario: qaTestUserId },
+        methodCode: 'EFECTIVO',
+        amount: 1,
+        fixtureReference: saleReference
+      });
+      try {
+        const rejected = await expectControlledCloseRejection(validation.body.id_validacion_cierre, 'nueva venta', 'VENTAS_CAJAS_CLOSE_VALIDATION_STALE');
+        operationalChangeRejections.nuevaVenta = rejected.status;
+      } finally {
+        await pool.query('DELETE FROM public.facturas_cobros WHERE id_factura_cobro = $1', [baseId + 102]);
+        await pool.query('DELETE FROM public.detalle_facturas WHERE id_factura = $1', [saleInvoice.idFactura]);
+        await pool.query('DELETE FROM public.facturas WHERE id_factura = $1', [saleInvoice.idFactura]);
+      }
+    }
+    {
+      const validation = await createCloseValidation();
+      const reversal = await pool.query(`
+        INSERT INTO public.facturas_reversiones (
+          codigo_reversion, id_factura_original, id_sucursal,
+          id_caja_original, id_sesion_caja_original, id_caja_actual,
+          id_sesion_caja_actual, tipo_reversion, motivo, observacion,
+          monto_reversado, estado, creada_por, creada_en,
+          fecha_operacion, ip_origen, dispositivo, user_agent, correo_notificado
+        ) VALUES (
+          $1, $2, $3, $4, $5, $4, $5, 'PARCIAL', 'OTRO', $1,
+          1, 'APLICADA', $6, NOW(),
+          (NOW() AT TIME ZONE 'America/Tegucigalpa')::date,
+          '127.0.0.1', 'QA_SMOKE', 'qa-caja-negative-close-smoke', false
+        )
+        RETURNING id_reversion
+      `, [`R${baseId}`, idFactura, references.id_sucursal, references.id_caja, idSesionCaja, qaTestUserId]);
+      const idReversion = reversal.rows[0].id_reversion;
+      try {
+        const rejected = await expectControlledCloseRejection(validation.body.id_validacion_cierre, 'nueva reversion', 'VENTAS_CAJAS_CLOSE_VALIDATION_STALE');
+        operationalChangeRejections.nuevaReversion = rejected.status;
+      } finally {
+        await pool.query('DELETE FROM public.facturas_reversiones WHERE id_reversion = $1', [idReversion]);
+      }
+    }
+
+    const catalogIdValidation = await createCloseValidation();
+    const catalogIdRows = await pool.query(`
+      SELECT id_metodo_pago, codigo
+      FROM public.cat_metodos_pago
+      WHERE UPPER(TRIM(codigo)) IN ('TARJETA', 'OTRO')
+      ORDER BY id_metodo_pago
+    `);
+    assert.equal(catalogIdRows.rowCount, 2);
+    const tarjetaCatalog = catalogIdRows.rows.find((row) => String(row.codigo).trim().toUpperCase() === 'TARJETA');
+    const otroCatalog = catalogIdRows.rows.find((row) => String(row.codigo).trim().toUpperCase() === 'OTRO');
+    const swapCode = `QA_SWAP_${baseId}`;
+    let catalogIdChangeRejected = false;
+    try {
+      await pool.query('UPDATE public.cat_metodos_pago SET codigo = $1 WHERE id_metodo_pago = $2', [swapCode, tarjetaCatalog.id_metodo_pago]);
+      await pool.query("UPDATE public.cat_metodos_pago SET codigo = 'TARJETA' WHERE id_metodo_pago = $1", [otroCatalog.id_metodo_pago]);
+      await pool.query("UPDATE public.cat_metodos_pago SET codigo = 'OTRO' WHERE id_metodo_pago = $1", [tarjetaCatalog.id_metodo_pago]);
+      const rejected = await expectControlledCloseRejection(
+        catalogIdValidation.body.id_validacion_cierre,
+        'cambio de id asociado al codigo',
+        'VENTAS_CAJAS_CLOSE_VALIDATION_STALE'
+      );
+      catalogIdChangeRejected = rejected.status === 409;
+    } finally {
+      await pool.query('UPDATE public.cat_metodos_pago SET codigo = $1 WHERE id_metodo_pago = $2', [`${swapCode}_T`, tarjetaCatalog.id_metodo_pago]);
+      await pool.query('UPDATE public.cat_metodos_pago SET codigo = $1 WHERE id_metodo_pago = $2', [`${swapCode}_O`, otroCatalog.id_metodo_pago]);
+      await pool.query("UPDATE public.cat_metodos_pago SET codigo = 'TARJETA' WHERE id_metodo_pago = $1", [tarjetaCatalog.id_metodo_pago]);
+      await pool.query("UPDATE public.cat_metodos_pago SET codigo = 'OTRO' WHERE id_metodo_pago = $1", [otroCatalog.id_metodo_pago]);
+    }
+
+    const catalogValidation = await callJson(baseUrl, 'POST', `/ventas/cajas/sesiones/${idSesionCaja}/cierre-validaciones`, {
       auth,
       body: { observacion_cierre: observacionCierre, arqueos: arqueosPayload }
     });
-    assert.equal(revalidacion.status, 201);
-    assert.notEqual(revalidacion.body.id_validacion_cierre, idValidacionCierre);
+    assert.equal(catalogValidation.status, 201);
+    const catalogOriginalResult = await pool.query(`
+      SELECT id_metodo_pago, estado, afecta_efectivo
+      FROM public.cat_metodos_pago
+      WHERE UPPER(TRIM(codigo)) = 'OTRO'
+      ORDER BY id_metodo_pago
+    `);
+    assert.equal(catalogOriginalResult.rowCount, 1, 'OTRO debe ser unico antes de probar cambio de catalogo.');
+    const catalogOriginal = catalogOriginalResult.rows[0];
+    await pool.query(
+      'UPDATE public.cat_metodos_pago SET afecta_efectivo = NOT $1::boolean WHERE id_metodo_pago = $2',
+      [catalogOriginal.afecta_efectivo, catalogOriginal.id_metodo_pago]
+    );
+    let catalogChangeRejected = false;
+    try {
+      const rejected = await callJson(baseUrl, 'PATCH', `/ventas/cajas/sesiones/${idSesionCaja}/cerrar`, {
+        auth,
+        body: { observacion_cierre: observacionCierre, id_validacion_cierre: catalogValidation.body.id_validacion_cierre }
+      });
+      assert.equal(rejected.status, 409, `cambio catalogo: ${JSON.stringify(rejected.body)}`);
+      assert.equal(rejected.body?.code, 'VENTAS_CAJAS_CLOSE_VALIDATION_STALE');
+      catalogChangeRejected = true;
+    } finally {
+      await pool.query(`
+        UPDATE public.cat_metodos_pago
+        SET estado = $1, afecta_efectivo = $2
+        WHERE id_metodo_pago = $3
+      `, [catalogOriginal.estado, catalogOriginal.afecta_efectivo, catalogOriginal.id_metodo_pago]);
+    }
 
     const cerrar = await callJson(baseUrl, 'PATCH', `/ventas/cajas/sesiones/${idSesionCaja}/cerrar`, {
       auth,
@@ -951,8 +1358,8 @@ const runHttpCloseSmoke = async () => {
     assert.equal(cierreOtros.monto_declarado, 400);
     assert.equal(cerrar.body.correo_cierre.estado, 'PENDIENTE');
 
-    // La validacion ya vinculada no debe poder reutilizarse en un segundo cierre.
-    const idValidacionSobrante = revalidacion.body.id_validacion_cierre;
+    // Una validacion sobrante no debe producir un segundo cierre.
+    const idValidacionSobrante = catalogValidation.body.id_validacion_cierre;
     const cerrarReintento = await callJson(baseUrl, 'PATCH', `/ventas/cajas/sesiones/${idSesionCaja}/cerrar`, {
       auth,
       body: { observacion_cierre: observacionCierre, id_validacion_cierre: idValidacionSobrante }
@@ -962,13 +1369,16 @@ const runHttpCloseSmoke = async () => {
     const persisted = await pool.query(`
       SELECT
         cs.id_estado_sesion_caja, estado.codigo AS estado_codigo,
-        cs.monto_teorico_cierre,
+        cs.monto_teorico_cierre, cs.monto_declarado_cierre, cs.diferencia_cierre,
         cc.id_cierre_caja,
         cv.id_cierre_caja AS validacion_vinculada,
         COUNT(cam.id_arqueo_metodo)::int AS arqueos,
         COUNT(cam.id_arqueo_metodo) FILTER (WHERE cam.metodo_pago_codigo = 'OTRO')::int AS arqueos_otros,
+        COUNT(cam.id_arqueo_metodo) FILTER (WHERE cam.metodo_pago_codigo = 'OTRO' AND cam.completado_automaticamente IS TRUE)::int AS otros_automaticos,
+        COUNT(cam.id_arqueo_metodo) FILTER (WHERE cam.metodo_pago_codigo IN ('EFECTIVO','TARJETA','TRANSFERENCIA') AND cam.completado_automaticamente IS FALSE)::int AS core_no_automaticos,
         SUM(cam.monto_declarado)::numeric AS suma_declarado,
         SUM(cam.monto_teorico)::numeric AS suma_teorico,
+        SUM(cam.diferencia)::numeric AS suma_diferencia,
         COUNT(DISTINCT outbox.id_notificacion)::int AS outbox
       FROM public.cajas_sesiones cs
       INNER JOIN public.cat_cajas_sesiones_estados estado ON estado.id_estado_sesion_caja = cs.id_estado_sesion_caja
@@ -977,7 +1387,9 @@ const runHttpCloseSmoke = async () => {
       LEFT JOIN public.cajas_cierres_arqueos_metodos cam ON cam.id_cierre_caja = cc.id_cierre_caja
       LEFT JOIN public.cajas_cierres_notificaciones_email outbox ON outbox.id_cierre_caja = cc.id_cierre_caja
       WHERE cs.id_sesion_caja = $1
-      GROUP BY cs.id_estado_sesion_caja, estado.codigo, cs.monto_teorico_cierre, cc.id_cierre_caja, cv.id_cierre_caja
+      GROUP BY cs.id_estado_sesion_caja, estado.codigo, cs.monto_teorico_cierre,
+               cs.monto_declarado_cierre, cs.diferencia_cierre,
+               cc.id_cierre_caja, cv.id_cierre_caja
     `, [idSesionCaja, idValidacionCierre]);
     const state = persisted.rows[0];
     assert.equal(String(state.estado_codigo).trim().toUpperCase(), 'CERRADA');
@@ -986,9 +1398,37 @@ const runHttpCloseSmoke = async () => {
     assert.equal(String(state.validacion_vinculada), String(idCierreCaja));
     assert.equal(state.arqueos, 4);
     assert.equal(state.arqueos_otros, 1);
+    assert.equal(state.otros_automaticos, 1);
+    assert.equal(state.core_no_automaticos, 3);
     assert.equal(Number(state.suma_declarado), expectedTotalDeclarado);
     assert.equal(Number(state.suma_teorico), expectedTotalTeorico);
+    assert.equal(Number(state.suma_diferencia), Number(state.diferencia_cierre));
+    assert.equal(Number(state.suma_declarado), Number(state.monto_declarado_cierre));
     assert.equal(state.outbox, 1);
+
+    const persistedMethods = await pool.query(`
+      SELECT metodo_pago_codigo, id_metodo_pago, completado_automaticamente,
+             requiere_revision, monto_teorico, monto_declarado, diferencia,
+             observacion
+      FROM public.cajas_cierres_arqueos_metodos
+      WHERE id_cierre_caja = $1
+      ORDER BY id_arqueo_metodo
+    `, [idCierreCaja]);
+    assert.deepEqual(
+      persistedMethods.rows.map((row) => [row.metodo_pago_codigo, row.completado_automaticamente]),
+      [
+        ['EFECTIVO', false],
+        ['TARJETA', false],
+        ['TRANSFERENCIA', false],
+        ['OTRO', true]
+      ]
+    );
+    const persistedOtro = persistedMethods.rows.find((row) => row.metodo_pago_codigo === 'OTRO');
+    const canonicalOtro = await pool.query("SELECT id_metodo_pago FROM public.cat_metodos_pago WHERE UPPER(TRIM(codigo)) = 'OTRO'");
+    assert.equal(canonicalOtro.rowCount, 1);
+    assert.equal(Number(persistedOtro.id_metodo_pago), Number(canonicalOtro.rows[0].id_metodo_pago));
+    assert.equal(persistedOtro.requiere_revision, false);
+    assert.equal(Number(persistedOtro.diferencia), 0);
 
     const emailPayload = await loadCajaCloseEmailPayload(pool, idCierreCaja);
     const html = buildCajaCloseEmailHtml({ payload: emailPayload, pdfAttached: true });
@@ -1000,188 +1440,75 @@ const runHttpCloseSmoke = async () => {
     const detalleSumaDeclarado = emailPayload.arqueos.reduce((sum, row) => sum + Number(row.monto_declarado || 0), 0);
     assert.equal(detalleSumaDeclarado, expectedTotalDeclarado);
 
-    return {
+    result = {
       httpStatus: { preview: preview.status, validaciones: validaciones.status, cerrar: cerrar.status },
       idSesionCaja: String(idSesionCaja),
       idCierreCaja: String(idCierreCaja),
+      syntheticInvoice: { idFactura: String(idFactura), idDetalleFactura: String(idDetalleFactura), fixtureReference },
       efectivoTeoricoEsperado: expectedEfectivoTeorico,
       totalTeorico: Number(state.monto_teorico_cierre),
       totalDeclarado: Number(state.suma_declarado),
+      diferencia: Number(state.suma_diferencia),
       arqueos: state.arqueos,
       arqueosOtrosNoEfectivo: state.arqueos_otros,
+      otroAutomaticoPersistido: state.otros_automaticos === 1 && state.core_no_automaticos === 3,
+      persistedMethods: persistedMethods.rows,
+      inactiveCatalogRejections,
+      duplicateRejections,
+      malformedValidationRejections,
+      operationalChangeRejections,
+      catalogIdChangeRejected,
+      catalogChangeRejected,
       reintentoCierreRechazado: cerrarReintento.status === 409,
       pdfBytes: pdf.length
     };
   } finally {
-    await stopServer(server);
-    await closeQaAuthContext(auth.idSesion).catch(() => {});
-    await cleanupHttpCloseArtifacts({ idSesionCaja, idCierreCaja, idValidacionCierre }).catch((cleanupError) => {
-      console.error('[qa-caja-negative-close-smoke] fallo limpiando artefactos HTTP:', cleanupError);
-      throw cleanupError;
-    });
+    if (server) await stopServer(server);
+    if (auth?.idSesion) await closeQaAuthContext(auth.idSesion).catch(() => {});
+    await cleanupHttpCloseArtifacts({ idSesionCaja, idFactura, fixtureReference });
   }
-};
-
-const DELIBERATE_FAILURE_MARKER = 'QA_SMOKE_DELIBERATE_FAILURE_AFTER_SAFE';
-
-// Restaura el estado inicial EXACTO (no solo el conteo): misma definicion y
-// mismo estado de validacion por restriccion. Se llama siempre desde el
-// finally de main(), exista o no un error, para que ningun fallo de
-// asercion a mitad de camino deje SAFE aplicado sin restaurar.
-const restoreExactInitialState = async ({ initialMode, initialDetailByConstraint, safeSql, rollbackSql, leaveSafeApplied }) => {
-  const targetMode = leaveSafeApplied ? 'safe' : initialMode;
-  const currentRows = await namedConstraintState(pool);
-  const currentMode = resolveInitialMode(currentRows);
-  if (currentMode !== targetMode) {
-    await pool.query(targetMode === 'legacy' ? rollbackSql : safeSql);
-  }
-  const restoredRows = await namedConstraintState(pool);
-  assert.equal(restoredRows.length, targetMode === 'legacy' ? NEGATIVE_CLOSE_CONSTRAINTS.length : 0);
-  if (targetMode === 'legacy') {
-    for (const row of restoredRows) {
-      const original = initialDetailByConstraint[row.conname];
-      assert.ok(original, `se restauro una restriccion no presente originalmente: ${row.conname}`);
-      assert.equal(row.expresion, original.expresion, `definicion de ${row.conname} no coincide con el estado original`);
-      assert.equal(row.convalidated, true, `${row.conname} debe quedar validada`);
-    }
-  }
-  return { targetMode, restoredRows };
+  const residues = await assertZeroHttpCloseArtifacts({ idSesionCaja, fixtureReference, authSessionId: auth?.idSesion || null });
+  const metricsAfter = await captureRegressionMetrics(pool);
+  assert.deepEqual(metricsAfter, metricsBefore, 'Los conteos/sumas globales deben volver exactamente al baseline tras limpiar el fixture HTTP.');
+  return { ...result, cleanup: residues, metricsBefore, metricsAfter };
 };
 
 const main = async () => {
   assertQaTarget();
-  const [safeSql, verifySql, rollbackSql] = await Promise.all([
-    readFile(SAFE_PATH, 'utf8'),
-    readFile(VERIFY_PATH, 'utf8'),
-    readFile(ROLLBACK_PATH, 'utf8')
-  ]);
-
-  const initialRows = await namedConstraintState(pool);
-  const initialMode = resolveInitialMode(initialRows);
-  // Estado EXACTO (no solo presencia) de cada restriccion objetivo, capturado
-  // antes de tocar nada, para poder restaurar y verificar exactitud incluso
-  // si algo falla a mitad de la ejecucion.
-  const initialDetailByConstraint = Object.fromEntries(initialRows.map((row) => [row.conname, row]));
-
-  let results = null;
-  let mainError = null;
-
+  const verifySql = await readFile(VERIFY_PATH, 'utf8');
   try {
-    const before = await runVerify(pool, verifySql);
-    // Se compara contra el conteo real observado (initialRows), no contra un
-    // modo binario asumido: un ambiente parcialmente migrado (p. ej. solo
-    // cajas_arqueos aun bloqueando) es un estado inicial legitimo.
-    assert.equal(
-      before.negativeChecks.filter((row) =>
-        ['cajas_sesiones', 'cajas_cierres', 'cajas_arqueos'].includes(String(row.tabla))
-          && Number(row.checks_equivalentes_no_negativos) > 0
-      ).length,
-      initialRows.length
+    // Toda mutacion DDL vive en PostgreSQL aislado. QA solo recibe el fixture
+    // DML sintetico de los endpoints y debe encontrarse previamente en SAFE.
+    const isolatedPostgres = await runIsolatedPostgresMigrationSuite({
+      injectFailureAfterSafe: INJECT_FAILURE_AFTER_SAFE,
+      leaveSafeApplied: LEAVE_SAFE_APPLIED
+    });
+    const qaNamedConstraints = await namedConstraintState(pool);
+    assert.deepEqual(
+      qaNamedConstraints,
+      [],
+      'QA debe estar previamente en SAFE; este arnes no altera restricciones del proyecto compartido.'
     );
-
-    const lockTimeoutMs = await testLockTimeout(safeSql);
-    await pool.query(safeSql);
-    await pool.query(safeSql);
-    assert.deepEqual(await namedConstraintState(pool), []);
-
-    // 11.7 #15: excepcion deliberada justo despues de aplicar SAFE, para
-    // confirmar (mas abajo, en el finally) que el esquema queda restaurado
-    // exactamente aunque el smoke "falle" en este punto.
-    if (INJECT_FAILURE_AFTER_SAFE) {
-      throw new Error(`${DELIBERATE_FAILURE_MARKER}: excepcion sintetica para probar restauracion garantizada.`);
-    }
-
-    const after = await runVerify(pool, verifySql);
-    assert.ok(after.negativeChecks.every((row) => Number(row.checks_equivalentes_no_negativos) === 0));
-
-    await testWrongDefinition({
-      table: 'public.cajas_sesiones',
-      constraintName: 'ck_cajas_sesiones_monto_teorico',
-      wrongCheckSql: 'CHECK (monto_teorico_cierre >= -999)',
-      safeSql
-    });
-    await testWrongDefinition({
-      table: 'public.cajas_arqueos',
-      constraintName: 'ck_cajas_arqueos_teorico',
-      wrongCheckSql: 'CHECK (monto_teorico >= -999)',
-      safeSql
-    });
-
-    await pool.query(rollbackSql);
-    await pool.query(rollbackSql);
-    assert.equal((await namedConstraintState(pool)).length, NEGATIVE_CLOSE_CONSTRAINTS.length);
-
-    await testRollbackWrongDefinition({
-      table: 'public.cajas_sesiones',
-      constraintName: 'ck_cajas_sesiones_monto_teorico',
-      wrongCheckSql: 'CHECK (monto_teorico_cierre >= -999)',
-      rollbackSql
-    });
-    await testRollbackWrongDefinition({
-      table: 'public.cajas_arqueos',
-      constraintName: 'ck_cajas_arqueos_teorico',
-      wrongCheckSql: 'CHECK (monto_teorico >= -999)',
-      rollbackSql
-    });
-
-    await pool.query(safeSql);
+    const before = await runVerify(pool, verifySql);
+    assert.ok(before.negativeChecks.every((row) => Number(row.checks_equivalentes_no_negativos) === 0));
     const smoke = await runTransactionalFinancialSmoke();
     const httpSmoke = await runHttpCloseSmoke();
-    const finalVerify = await runVerify(pool, verifySql);
-    assert.ok(finalVerify.negativeChecks.every((row) => Number(row.checks_equivalentes_no_negativos) === 0));
+    const after = await runVerify(pool, verifySql);
+    assert.ok(after.negativeChecks.every((row) => Number(row.checks_equivalentes_no_negativos) === 0));
+    assert.deepEqual(after.regressionCounts, before.regressionCounts);
 
-    results = {
+    console.log(JSON.stringify({
       projectRef: QA_PROJECT_REF,
-      initialMode,
-      leaveSafeApplied: LEAVE_SAFE_APPLIED,
-      lockTimeoutMs,
+      qaSchemaMutation: false,
+      isolatedPostgres,
       verifyBefore: before,
       verifyAfter: after,
       smoke,
       httpSmoke
-    };
-  } catch (error) {
-    mainError = error;
+    }, null, 2));
+  } finally {
+    await closePool();
   }
-
-  // A partir de aqui SIEMPRE se ejecuta, con o sin error arriba. No se
-  // reintenta automaticamente si la propia restauracion falla: eso es un
-  // fallo critico distinto del error original y debe reportarse aparte.
-  let restoration = null;
-  let restorationError = null;
-  try {
-    restoration = await restoreExactInitialState({
-      initialMode,
-      initialDetailByConstraint,
-      safeSql,
-      rollbackSql,
-      leaveSafeApplied: LEAVE_SAFE_APPLIED
-    });
-  } catch (error) {
-    restorationError = error;
-    console.error('[qa-caja-negative-close-smoke] CRITICO: fallo restaurando el estado original de las restricciones. Revisar manualmente en QA:', error);
-  }
-
-  await closePool();
-
-  if (restorationError) {
-    const combined = new Error('Fallo el smoke y/o la restauracion del estado original de las restricciones.');
-    combined.cause = { mainError, restorationError };
-    throw combined;
-  }
-
-  const isDeliberateFailure = mainError && String(mainError.message || '').includes(DELIBERATE_FAILURE_MARKER);
-  if (mainError && !isDeliberateFailure) {
-    throw mainError;
-  }
-
-  console.log(JSON.stringify({
-    ...(results || { projectRef: QA_PROJECT_REF, initialMode }),
-    restoredMode: restoration.targetMode,
-    finalNamedConstraints: restoration.restoredRows,
-    deliberateFailureInjected: INJECT_FAILURE_AFTER_SAFE,
-    deliberateFailureRestorationVerified: isDeliberateFailure ? true : undefined
-  }, null, 2));
 };
 
 await main();
