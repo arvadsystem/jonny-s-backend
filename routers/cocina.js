@@ -13,6 +13,7 @@ import {
   buildSalsaConsumptionItemsFromPedidoDetails,
   loadLegacySalsaConsumptionByStockKey
 } from '../services/salsasPedidoSnapshotService.js';
+import { readPedidoOperationalRouting } from './ventas/services/pedidoOperationalRoutingService.js';
 
 const router = express.Router();
 
@@ -753,6 +754,28 @@ router.get('/cocina/pedidos', checkPermission(COCINA_VIEW_PERMISSIONS), async (r
       }
 
       filters.push(`p.id_estado_pedido = ANY(${pushParam(activeEstadoIds)}::int[])`);
+      filters.push(`
+        EXISTS (
+          SELECT 1
+          FROM public.detalle_pedido dp_route
+          WHERE dp_route.id_pedido = p.id_pedido
+            AND COALESCE(dp_route.estado, true) = true
+            AND dp_route.id_producto IS NULL
+            AND dp_route.id_receta IS NOT NULL
+        )
+      `);
+      filters.push(`
+        NOT EXISTS (
+          SELECT 1
+          FROM public.detalle_pedido dp_invalid
+          WHERE dp_invalid.id_pedido = p.id_pedido
+            AND COALESCE(dp_invalid.estado, true) = true
+            AND (
+              (dp_invalid.id_producto IS NULL AND dp_invalid.id_receta IS NULL)
+              OR (dp_invalid.id_producto IS NOT NULL AND dp_invalid.id_receta IS NOT NULL)
+            )
+        )
+      `);
 
       if (requestedSucursalId) {
         filters.push(`p.id_sucursal = ${pushParam(requestedSucursalId)}`);
@@ -871,8 +894,10 @@ router.get('/cocina/pedidos', checkPermission(COCINA_VIEW_PERMISSIONS), async (r
           LEFT JOIN detalle_pedido dp
             ON dp.id_pedido = p.id_pedido
            AND COALESCE(dp.estado, true) = true
-           AND dp.id_producto IS NULL
-           AND dp.id_receta IS NOT NULL
+           AND (
+             (dp.id_producto IS NOT NULL AND dp.id_receta IS NULL)
+             OR (dp.id_producto IS NULL AND dp.id_receta IS NOT NULL)
+           )
           LEFT JOIN productos prod ON prod.id_producto = dp.id_producto
           LEFT JOIN recetas rec ON rec.id_receta = dp.id_receta
           ${whereClause}
@@ -999,6 +1024,9 @@ router.get('/cocina/pedidos', checkPermission(COCINA_VIEW_PERMISSIONS), async (r
                   : 'ITEM',
             id_producto: Number(row.id_producto ?? 0) || null,
             id_receta: Number(row.id_receta ?? 0) || null,
+            instruccion_operativa: row.id_producto !== null
+              ? 'ENTREGAR_JUNTO_CON_EL_PEDIDO'
+              : 'PREPARAR',
             nombre_item: row.nombre_item || 'Item de cocina',
             cantidad,
             observacion: row.observacion || null,
@@ -1163,6 +1191,26 @@ router.put('/cocina/pedidos/:id/estado', checkPermission(COCINA_VIEW_PERMISSIONS
       // ���� 6. Verificar estado actual y transición válida ��������������������������
       const estadoActual = estadoCodeByIdMap.get(Number(pedido.id_estado_pedido ?? 0)) || null;
 
+      const routing = await readPedidoOperationalRouting({ client, idPedido });
+      if (routing.requiere_revision) {
+        await client.query('ROLLBACK');
+        return res.status(409).json({
+          error: true,
+          code: 'VENTAS_PEDIDO_RUTEO_REQUIERE_REVISION',
+          message: 'El pedido tiene lineas invalidas y requiere revision antes de avanzar.',
+          ...routing
+        });
+      }
+      if (!routing.requiere_cocina) {
+        await client.query('ROLLBACK');
+        return res.status(409).json({
+          error: true,
+          code: 'VENTAS_PEDIDO_NO_REQUIERE_COCINA',
+          message: 'Este pedido no contiene preparaciones para cocina.',
+          ...routing
+        });
+      }
+
       if (!estadoActual || !TRANSITIONS[estadoActual]) {
         await client.query('ROLLBACK');
         return res.status(409).json({
@@ -1181,7 +1229,8 @@ router.put('/cocina/pedidos/:id/estado', checkPermission(COCINA_VIEW_PERMISSIONS
           estado_actual: estadoDestino,
           warning: false,
           warning_code: null,
-          warning_detail: null
+          warning_detail: null,
+          ...routing
         });
       }
 
@@ -1317,6 +1366,7 @@ router.put('/cocina/pedidos/:id/estado', checkPermission(COCINA_VIEW_PERMISSIONS
         id_pedido: idPedido,
         estado_anterior: estadoActual,
         estado_actual: estadoDestino,
+        ...routing,
         en_preparacion_at: updatedPedidoResult.rows[0]?.en_preparacion_at || null,
         warning: Boolean(inventoryResult?.warning || inventoryAlreadyDiscounted),
         warning_code: inventoryAlreadyDiscounted

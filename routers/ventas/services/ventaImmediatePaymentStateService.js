@@ -2,6 +2,10 @@ import {
   PEDIDO_PAGADO_CONFIRMADO_ESTADO_PAGO
 } from '../constants.js';
 import { resolveEstadoPedidoIdByCode } from './catalogLookupService.js';
+import {
+  applyPedidoInitialOperationalRouting,
+  readPedidoOperationalRouting
+} from './pedidoOperationalRoutingService.js';
 
 const asPositiveInteger = (value) => {
   const parsed = Number(value);
@@ -70,9 +74,14 @@ export const reconcileVentaResponseWithPersistedPedidoState = async ({ client, r
     client,
     idPedido: response?.id_pedido
   });
+  const routing = await readPedidoOperationalRouting({
+    client,
+    idPedido: persisted.id_pedido
+  });
   const reconciled = {
     ...(isPlainObject(response) ? response : {}),
-    ...persisted
+    ...persisted,
+    ...routing
   };
 
   if (isPlainObject(response?.contexto)) {
@@ -88,7 +97,8 @@ export const reconcileVentaResponseWithPersistedPedidoState = async ({ client, r
       id_pedido: persisted.id_pedido,
       id_estado_pedido: persisted.id_estado_pedido,
       estado_pedido: persisted.estado_pedido,
-      visible_en_cocina_at: persisted.visible_en_cocina_at
+      visible_en_cocina_at: persisted.visible_en_cocina_at,
+      ...routing
     };
   }
 
@@ -207,4 +217,6 @@ export const persistImmediateSalePaymentState = async ({
       [pedidoId, estadoPagoId, total, userId, sessionId, facturaId]
     );
   }
+
+  await applyPedidoInitialOperationalRouting({ client, idPedido: pedidoId });
 };

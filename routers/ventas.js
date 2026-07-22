@@ -104,7 +104,11 @@ import {
   persistImmediateSalePaymentState,
   reconcileVentaResponseWithPersistedPedidoState
 } from './ventas/services/ventaImmediatePaymentStateService.js';
-import { initializePedidoPendingKitchen } from './ventas/services/pedidoKitchenVisibilityService.js';
+import {
+  applyPedidoInitialOperationalRouting,
+  classifyPedidoOperationalRouting,
+  readPedidoOperationalRouting
+} from './ventas/services/pedidoOperationalRoutingService.js';
 import {
   hasCuentaDivididaPayload,
   reserveIdempotencyForMode,
@@ -6697,6 +6701,8 @@ router.get('/ventas/pedidos-menu', checkPermission(['VENTAS_VER']), async (req, 
           p.id_sucursal,
           p.id_estado_pedido,
           p.origen_pedido,
+          p.canal,
+          p.tipo_entrega AS modalidad_operativa,
           f.id_factura,
           ep.descripcion AS nombre_estado_pedido,
           ${estadoPagoSelect},
@@ -6901,8 +6907,14 @@ router.get('/ventas/pedidos-menu', checkPermission(['VENTAS_VER']), async (req, 
       const venceAt = row.validacion_pago_vence_at ? new Date(row.validacion_pago_vence_at) : null;
       const remainingMs = venceAt ? (venceAt.getTime() - nowMs) : null;
       const minutosRestantes = remainingMs === null ? null : Math.max(0, Math.ceil(remainingMs / 60000));
+      const routing = classifyPedidoOperationalRouting(row.items, {
+        estado_pago: row.estado_pago_control || row.estado_pago,
+        canal: row.canal,
+        modalidad: row.modalidad_operativa || row.modalidad
+      });
       return {
         ...row,
+        ...routing,
         pago_validado: String(row.estado_pago || '').toUpperCase() === PEDIDO_ESTADO_PAGO.PAGADO_CONFIRMADO,
         pago_expirado: String(row.estado_pago_legacy || row.estado_pago || '').toUpperCase() === PEDIDO_ESTADO_PAGO.CANCELADO_TIMEOUT,
         minutos_restantes_pago: minutosRestantes
@@ -6978,6 +6990,7 @@ router.post('/ventas/pedidos-menu/:id/confirmar-pago', checkPermission(['VENTAS_
     }
 
     const pedido = pedidoResult.rows[0];
+    const routing = await readPedidoOperationalRouting({ client, idPedido });
     const pedidoSucursalId = Number(pedido.id_sucursal || 0);
     if (
       allowedSucursalIds.length > 0 &&
@@ -6987,7 +7000,12 @@ router.post('/ventas/pedidos-menu/:id/confirmar-pago', checkPermission(['VENTAS_
       return res.status(403).json({ error: true, message: 'No puedes confirmar pagos de otra sucursal.' });
     }
 
-    if (Number(pedido.id_estado_pedido || 0) !== Number(estadoPendiente)) {
+    const estadoListoProducto = !routing.requiere_cocina && !routing.requiere_revision
+      ? await resolveEstadoPedidoIdByCode(client, 'LISTO_PARA_ENTREGA')
+      : null;
+    const estadoPagoConfirmable = Number(pedido.id_estado_pedido || 0) === Number(estadoPendiente)
+      || Number(pedido.id_estado_pedido || 0) === Number(estadoListoProducto);
+    if (!estadoPagoConfirmable) {
       await client.query('ROLLBACK');
       return res.status(409).json({
         error: true,
@@ -7047,13 +7065,16 @@ router.post('/ventas/pedidos-menu/:id/confirmar-pago', checkPermission(['VENTAS_
       updateParams
     );
 
+    const updatedRouting = await applyPedidoInitialOperationalRouting({ client, idPedido });
+
     await client.query('COMMIT');
 
     return res.status(200).json({
       ok: true,
       id_pedido: idPedido,
       estado_pago: PEDIDO_ESTADO_PAGO.PAGADO_CONFIRMADO,
-      message: 'Pago confirmado correctamente.'
+      message: 'Pago confirmado correctamente.',
+      ...updatedRouting
     });
   } catch (error) {
     try { await client.query('ROLLBACK'); } catch {}
@@ -7129,6 +7150,38 @@ router.put('/ventas/pedidos-menu/:id/estado', checkPermission(['VENTAS_VER']), a
       targetCode = estadoCodeById.get(Number(requestedLegacyStateId)) || null;
     }
 
+    const routing = await readPedidoOperationalRouting({ client, idPedido });
+    if (routing.requiere_revision) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({
+        error: true,
+        code: 'VENTAS_PEDIDO_RUTEO_REQUIERE_REVISION',
+        message: 'El pedido tiene lineas invalidas y requiere revision antes de avanzar.',
+        ...routing
+      });
+    }
+    if (targetCode === 'EN_COCINA' && !routing.requiere_cocina) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({
+        error: true,
+        code: 'VENTAS_PEDIDO_NO_REQUIERE_COCINA',
+        message: 'Este pedido no contiene preparaciones para cocina.',
+        ...routing
+      });
+    }
+    if (currentCode && currentCode === targetCode) {
+      await client.query('COMMIT');
+      return res.status(200).json({
+        ok: true,
+        id_pedido: idPedido,
+        estado_anterior: currentCode,
+        estado_actual: currentCode,
+        idempotent_replay: true,
+        message: 'El pedido ya se encuentra en el estado solicitado.',
+        ...routing
+      });
+    }
+
     const normalizedTargetCode = resolvePedidoTransitionTargetCode(currentCode, targetCode);
     if (!normalizedTargetCode) {
       await client.query('ROLLBACK');
@@ -7170,6 +7223,9 @@ router.put('/ventas/pedidos-menu/:id/estado', checkPermission(['VENTAS_VER']), a
       `
         UPDATE pedidos
         SET id_estado_pedido = $2
+            ${normalizedTargetCode === 'EN_COCINA'
+              ? ", visible_en_cocina_at = COALESCE(visible_en_cocina_at, (NOW() AT TIME ZONE 'America/Tegucigalpa'))"
+              : ''}
         WHERE id_pedido = $1
       `,
       [idPedido, targetStateId]
@@ -7187,7 +7243,8 @@ router.put('/ventas/pedidos-menu/:id/estado', checkPermission(['VENTAS_VER']), a
       id_pedido: idPedido,
       estado_anterior: currentCode,
       estado_actual: normalizedTargetCode,
-      message: successMessage
+      message: successMessage,
+      ...routing
     });
   } catch (error) {
     try { await client.query('ROLLBACK'); } catch {}
@@ -8254,7 +8311,7 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
         requestHash: idempotencyRequestHash
       });
       if (!rpcResponseBody?.idempotent_replay) {
-        await initializePedidoPendingKitchen({ client, idPedido: rpcResponseBody?.id_pedido });
+        await applyPedidoInitialOperationalRouting({ client, idPedido: rpcResponseBody?.id_pedido });
       }
       const reconciledRpcResponseBody = await reconcileVentaResponseWithPersistedPedidoState({
         client,
@@ -8294,7 +8351,7 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
         idUsuario: userId,
         perf: ventasPerf
       });
-      await initializePedidoPendingKitchen({ client, idPedido: rpcResponseBody.id_pedido });
+      await applyPedidoInitialOperationalRouting({ client, idPedido: rpcResponseBody.id_pedido });
       const reconciledRpcResponseBody = await reconcileVentaResponseWithPersistedPedidoState({
         client,
         response: rpcResponseBody
@@ -8631,6 +8688,8 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
       idUsuario: userId,
       perf: ventasPerf
     });
+
+    await applyPedidoInitialOperationalRouting({ client, idPedido });
 
     const responseBody = await reconcileVentaResponseWithPersistedPedidoState({
       client,
@@ -9920,8 +9979,6 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
         idUsuario: userId,
         perf: ventasPerf
       });
-      await initializePedidoPendingKitchen({ client, idPedido: rpcCreateResult.response?.id_pedido });
-
       const rpcV1ResponseBody = await reconcileVentaResponseWithPersistedPedidoState({
         client,
         response: attachVentaSnapshotsToResponse(rpcCreateResult.response, venta)

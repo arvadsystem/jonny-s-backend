@@ -10,10 +10,6 @@ import {
   registerVentaPrintEvent
 } from '../services/ventasPrintAuditService.js';
 import {
-  isInitialKitchenDispatchEvent,
-  markPedidoVisibleInKitchen
-} from '../services/pedidoKitchenVisibilityService.js';
-import {
   getQzSigningConfiguration,
   getQzPublicErrorMessage,
   isQzSucursalContextRequired,
@@ -562,12 +558,6 @@ export const createVentaPrintEventHandler = async (req, res) => {
       payload: normalized.value
     });
 
-    if (isInitialKitchenDispatchEvent(normalized.value)) {
-      await markPedidoVisibleInKitchen({
-        client,
-        idPedido: detailResult.body?.id_pedido
-      });
-    }
     await client.query('COMMIT');
 
     return res.status(200).json({
