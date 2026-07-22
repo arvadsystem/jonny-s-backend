@@ -22,6 +22,8 @@ import { assertQaSharedPaymentCatalogWriteForbidden } from '../services/cajaClos
 const QA_PROJECT_REF = 'cluideiojeikzcmmizhe';
 const VERIFY_PATH = new URL('../sql/20260720_allow_negative_cash_close_theoretical_VERIFY.sql', import.meta.url);
 const QA_CATALOG_GUARD_INSTALLED = Symbol.for('jonnys.qaCajaCatalogGuardInstalled');
+const QA_SMOKE_LOCK_NAMESPACE = 8152033;
+const QA_SMOKE_LOCK_RESOURCE = 20260720;
 
 const installQaSharedPaymentCatalogWriteGuard = () => {
   const protectClient = (client) => {
@@ -94,6 +96,39 @@ const namedConstraintState = async (queryRunner) => {
   return result.rows;
 };
 
+export const acquireQaSmokeAdvisoryLock = async () => {
+  const client = await pool.connect();
+  try {
+    const result = await client.query(
+      'SELECT pg_try_advisory_lock($1::integer, $2::integer) AS acquired',
+      [QA_SMOKE_LOCK_NAMESPACE, QA_SMOKE_LOCK_RESOURCE]
+    );
+    if (result.rows[0]?.acquired !== true) {
+      const error = new Error('QA_CAJA_CLOSE_SMOKE_ALREADY_RUNNING');
+      error.code = 'QA_CAJA_CLOSE_SMOKE_ALREADY_RUNNING';
+      throw error;
+    }
+  } catch (error) {
+    client.release();
+    throw error;
+  }
+
+  let released = false;
+  return async () => {
+    if (released) return;
+    released = true;
+    try {
+      const result = await client.query(
+        'SELECT pg_advisory_unlock($1::integer, $2::integer) AS released',
+        [QA_SMOKE_LOCK_NAMESPACE, QA_SMOKE_LOCK_RESOURCE]
+      );
+      assert.equal(result.rows[0]?.released, true, 'El advisory lock global del smoke debe liberarse en finally.');
+    } finally {
+      client.release();
+    }
+  };
+};
+
 const runVerify = async (queryRunner, verifySql) => {
   const rawResults = await queryRunner.query(verifySql);
   const results = Array.isArray(rawResults) ? rawResults : [rawResults];
@@ -148,6 +183,7 @@ const loadSmokeReferences = async (client) => {
       (SELECT id_estado_sesion_caja FROM public.cat_cajas_sesiones_estados WHERE UPPER(TRIM(codigo)) = 'CERRADA' LIMIT 1) AS estado_cerrada,
       (SELECT id_tipo_movimiento_caja FROM public.cat_cajas_movimientos_tipos WHERE UPPER(TRIM(codigo)) = 'APERTURA' LIMIT 1) AS tipo_apertura,
       (SELECT id_tipo_movimiento_caja FROM public.cat_cajas_movimientos_tipos WHERE UPPER(TRIM(codigo)) IN ('EGRESO_MANUAL','EGRESO','RETIRO','SALIDA_CAJA') ORDER BY CASE WHEN UPPER(TRIM(codigo)) = 'EGRESO_MANUAL' THEN 0 ELSE 1 END LIMIT 1) AS tipo_egreso,
+      (SELECT id_tipo_arqueo_caja FROM public.cat_cajas_arqueos_tipos WHERE UPPER(TRIM(codigo)) IN ('EXTRAORDINARIO','CIERRE') ORDER BY CASE WHEN UPPER(TRIM(codigo)) = 'EXTRAORDINARIO' THEN 0 ELSE 1 END LIMIT 1) AS tipo_arqueo,
       (SELECT id_resolucion_cierre_caja FROM public.cat_cajas_resoluciones_cierre WHERE UPPER(TRIM(codigo)) = 'PENDIENTE_REVISION' LIMIT 1) AS resolucion_pendiente
     FROM public.cajas caja
     CROSS JOIN LATERAL (
@@ -178,6 +214,7 @@ const loadSmokeReferences = async (client) => {
     'estado_cerrada',
     'tipo_apertura',
     'tipo_egreso',
+    'tipo_arqueo',
     'resolucion_pendiente'
   ]) assert.ok(row[key], `Referencia QA faltante: ${key}`);
   return row;
@@ -357,6 +394,7 @@ const captureRegressionMetrics = async (queryRunner) => {
       (SELECT COALESCE(SUM(monto), 0)::numeric FROM public.facturas_cobros)::text AS suma_cobros,
       (SELECT COUNT(*)::bigint FROM public.pedidos)::text AS cantidad_pedidos,
       (SELECT COUNT(*)::bigint FROM public.cajas_movimientos)::text AS cantidad_movimientos,
+      (SELECT COUNT(*)::bigint FROM public.cajas_arqueos)::text AS cantidad_arqueos,
       (SELECT COUNT(*)::bigint FROM public.cajas_cierres)::text AS cantidad_cierres,
       (SELECT COUNT(*)::bigint
        FROM public.cajas_sesiones cs
@@ -378,6 +416,32 @@ const captureRegressionMetrics = async (queryRunner) => {
   return result.rows[0];
 };
 
+const allocateUniqueSmokeBaseId = async (queryRunner) => {
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    const baseId = crypto.randomInt(900_000_000, 990_000_000);
+    const collision = await queryRunner.query(
+      `
+        SELECT
+          EXISTS (
+            SELECT 1 FROM public.cajas_sesiones
+            WHERE id_sesion_caja BETWEEN $1::bigint AND ($1::bigint + 600)
+          )
+          OR EXISTS (
+            SELECT 1 FROM public.cajas_movimientos
+            WHERE id_movimiento_caja BETWEEN $1::bigint AND ($1::bigint + 200)
+          )
+          OR EXISTS (
+            SELECT 1 FROM public.facturas_cobros
+            WHERE id_factura_cobro BETWEEN $1::bigint AND ($1::bigint + 200)
+          ) AS exists
+      `,
+      [baseId]
+    );
+    if (collision.rows[0]?.exists !== true) return baseId;
+  }
+  throw new Error('QA_CAJA_CLOSE_SMOKE_ID_ALLOCATION_EXHAUSTED');
+};
+
 // Limpieza idempotente y por alcance completo. Descubre todos los cierres y
 // todas las validaciones de la sesion; no depende de que el flujo haya llegado
 // a devolver sus identificadores antes de fallar.
@@ -391,6 +455,7 @@ const cleanupHttpCloseArtifacts = async ({ idSesionCaja, idFactura, fixtureRefer
     );
     const closeIds = closeRows.rows.map((row) => String(row.id_cierre_caja));
     if (closeIds.length > 0) {
+      await client.query('DELETE FROM public.cajas_cierres_auditoria WHERE id_cierre_caja = ANY($1::bigint[])', [closeIds]);
       await client.query('DELETE FROM public.cajas_cierres_notificaciones_email WHERE id_cierre_caja = ANY($1::bigint[])', [closeIds]);
       await client.query('DELETE FROM public.cajas_cierres_arqueos_metodos WHERE id_cierre_caja = ANY($1::bigint[])', [closeIds]);
     }
@@ -440,6 +505,44 @@ const cleanupHttpCloseArtifacts = async ({ idSesionCaja, idFactura, fixtureRefer
   }
 };
 
+const cleanupAuxiliarySessionArtifacts = async (idSesionCaja) => {
+  if (!idSesionCaja) return;
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query(`
+      DELETE FROM public.cajas_arqueos_detalle
+      WHERE id_arqueo_caja IN (
+        SELECT id_arqueo_caja FROM public.cajas_arqueos WHERE id_sesion_caja = $1
+      )
+    `, [idSesionCaja]);
+    await client.query('DELETE FROM public.cajas_arqueos WHERE id_sesion_caja = $1', [idSesionCaja]);
+    await client.query('DELETE FROM public.cajas_movimientos WHERE id_sesion_caja = $1', [idSesionCaja]);
+    await client.query('DELETE FROM public.cajas_sesiones_participantes WHERE id_sesion_caja = $1', [idSesionCaja]);
+    await client.query('DELETE FROM public.cajas_sesiones WHERE id_sesion_caja = $1', [idSesionCaja]);
+    await client.query('COMMIT');
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw error;
+  } finally {
+    client.release();
+  }
+};
+
+const assertZeroAuxiliarySessionArtifacts = async (idSesionCaja) => {
+  const result = await pool.query(`
+    SELECT
+      (SELECT COUNT(*)::int FROM public.cajas_sesiones WHERE id_sesion_caja = $1) AS sesiones,
+      (SELECT COUNT(*)::int FROM public.cajas_movimientos WHERE id_sesion_caja = $1) AS movimientos,
+      (SELECT COUNT(*)::int FROM public.cajas_arqueos WHERE id_sesion_caja = $1) AS arqueos
+  `, [idSesionCaja]);
+  assert.ok(
+    Object.values(result.rows[0]).every((value) => Number(value) === 0),
+    `Quedaron residuos de la sesion auxiliar: ${JSON.stringify(result.rows[0])}`
+  );
+  return result.rows[0];
+};
+
 const assertZeroHttpCloseArtifacts = async ({ idSesionCaja, fixtureReference, authSessionId }) => {
   const result = await pool.query(`
     SELECT
@@ -455,6 +558,9 @@ const assertZeroHttpCloseArtifacts = async ({ idSesionCaja, fixtureReference, au
        WHERE id_sesion_caja_original = $1 OR id_sesion_caja_actual = $1 OR codigo_reversion LIKE $2 || '%') AS reversiones,
       (SELECT COUNT(*)::int FROM public.cajas_cierres_validaciones WHERE id_sesion_caja = $1) AS validaciones,
       (SELECT COUNT(*)::int FROM public.cajas_cierres WHERE id_sesion_caja = $1) AS cierres,
+      (SELECT COUNT(*)::int FROM public.cajas_cierres_auditoria cca
+       INNER JOIN public.cajas_cierres cc ON cc.id_cierre_caja = cca.id_cierre_caja
+       WHERE cc.id_sesion_caja = $1) AS auditorias,
       (SELECT COUNT(*)::int FROM public.cajas_arqueos WHERE id_sesion_caja = $1) AS arqueos,
       (SELECT COUNT(*)::int FROM public.sesiones_activas WHERE id_sesion = $3) AS autenticaciones
   `, [idSesionCaja, fixtureReference, authSessionId]);
@@ -467,8 +573,9 @@ const runHttpCloseSmoke = async () => {
   // Rango seguro para integer (algunas tablas de auditoria referencian el id
   // de sesion en una columna integer, no bigint), muy por encima de cualquier
   // secuencia real de QA.
-  const idSesionCaja = 900_000_000 + (Date.now() % 90_000_000);
+  const idSesionCaja = await allocateUniqueSmokeBaseId(pool);
   const baseId = idSesionCaja;
+  const auxiliarySessionId = baseId + 500;
   const fixtureReference = `QAH${baseId}`;
   let references = null;
   let qaTestUserId = null;
@@ -479,6 +586,7 @@ const runHttpCloseSmoke = async () => {
   let idDetalleFactura = null;
   let idCierreCaja = null;
   let idValidacionCierre = null;
+  let auxiliarySessionInserted = false;
   let metricsBefore = null;
   let result = null;
   try {
@@ -1149,6 +1257,119 @@ const runHttpCloseSmoke = async () => {
     assert.equal(persistedOtro.requiere_revision, false);
     assert.equal(Number(persistedOtro.diferencia), 0);
 
+    const loadFinancialEditState = async () => {
+      const financialState = await pool.query(`
+        SELECT
+          cc.id_resolucion_cierre_caja,
+          cc.id_arqueo_final,
+          cc.monto_teorico_cierre::text,
+          cc.monto_declarado_cierre::text,
+          cc.diferencia::text,
+          cs.monto_teorico_cierre::text AS sesion_monto_teorico,
+          cs.monto_declarado_cierre::text AS sesion_monto_declarado,
+          cs.diferencia_cierre::text AS sesion_diferencia,
+          (SELECT COALESCE(JSONB_AGG(TO_JSONB(cam) ORDER BY cam.id_arqueo_metodo), '[]'::jsonb)
+           FROM public.cajas_cierres_arqueos_metodos cam
+           WHERE cam.id_cierre_caja = cc.id_cierre_caja) AS detalle_segmentado,
+          (SELECT COUNT(*)::int FROM public.cajas_cierres_validaciones cv
+           WHERE cv.id_sesion_caja = cc.id_sesion_caja) AS validaciones,
+          (SELECT COUNT(*)::int FROM public.cajas_cierres_validaciones_metodos cvm
+           INNER JOIN public.cajas_cierres_validaciones cv
+             ON cv.id_validacion_cierre = cvm.id_validacion_cierre
+           WHERE cv.id_sesion_caja = cc.id_sesion_caja) AS validaciones_metodos,
+          (SELECT COUNT(*)::int FROM public.cajas_cierres_notificaciones_email outbox
+           WHERE outbox.id_cierre_caja = cc.id_cierre_caja) AS outbox
+        FROM public.cajas_cierres cc
+        INNER JOIN public.cajas_sesiones cs ON cs.id_sesion_caja = cc.id_sesion_caja
+        WHERE cc.id_cierre_caja = $1
+      `, [idCierreCaja]);
+      assert.equal(financialState.rowCount, 1);
+      return financialState.rows[0];
+    };
+
+    const financialBeforeEditAttempts = await loadFinancialEditState();
+    const segmentedAmountEdit = await callJson(baseUrl, 'PATCH', `/ventas/cajas/cierres/${idCierreCaja}`, {
+      auth,
+      body: {
+        monto_declarado_cierre: Number(financialBeforeEditAttempts.monto_declarado_cierre) + 1,
+        observacion_cierre: 'No debe persistirse',
+        motivo_edicion: 'QA rechazo de edicion segmentada'
+      }
+    });
+    assert.equal(segmentedAmountEdit.status, 409);
+    assert.equal(segmentedAmountEdit.body?.code, 'VENTAS_CAJAS_CLOSE_SEGMENTED_EDIT_REQUIRES_REVALIDATION');
+    assert.deepEqual(await loadFinancialEditState(), financialBeforeEditAttempts);
+
+    const sameSessionArqueo = await pool.query(`
+      INSERT INTO public.cajas_arqueos (
+        id_sesion_caja, id_caja, id_sucursal, id_tipo_arqueo_caja, id_usuario_ejecutor,
+        monto_teorico, monto_contado, diferencia, observacion, fecha_arqueo, fecha_creacion
+      ) VALUES ($1, $2, $3, $4, $5, 0, 0, 0, $6, NOW(), NOW())
+      RETURNING id_arqueo_caja
+    `, [idSesionCaja, references.id_caja, references.id_sucursal, references.tipo_arqueo, qaTestUserId, `${fixtureReference}_ARQUEO_MISMA_SESION`]);
+    const segmentedArqueoEdit = await callJson(baseUrl, 'PATCH', `/ventas/cajas/cierres/${idCierreCaja}`, {
+      auth,
+      body: {
+        id_arqueo_final: sameSessionArqueo.rows[0].id_arqueo_caja,
+        motivo_edicion: 'QA rechazo de arqueo en cierre segmentado'
+      }
+    });
+    assert.equal(segmentedArqueoEdit.status, 409);
+    assert.equal(segmentedArqueoEdit.body?.code, 'VENTAS_CAJAS_CLOSE_SEGMENTED_EDIT_REQUIRES_REVALIDATION');
+
+    await insertSession(pool, {
+      idSesionCaja: auxiliarySessionId,
+      references,
+      estado: references.estado_cerrada,
+      montoApertura: 0,
+      closed: true,
+      idUsuarioResponsable: qaTestUserId,
+      fixtureReference: `${fixtureReference}_AUX`
+    });
+    auxiliarySessionInserted = true;
+    const otherSessionArqueo = await pool.query(`
+      INSERT INTO public.cajas_arqueos (
+        id_sesion_caja, id_caja, id_sucursal, id_tipo_arqueo_caja, id_usuario_ejecutor,
+        monto_teorico, monto_contado, diferencia, observacion, fecha_arqueo, fecha_creacion
+      ) VALUES ($1, $2, $3, $4, $5, 0, 0, 0, $6, NOW(), NOW())
+      RETURNING id_arqueo_caja
+    `, [auxiliarySessionId, references.id_caja, references.id_sucursal, references.tipo_arqueo, qaTestUserId, `${fixtureReference}_ARQUEO_OTRA_SESION`]);
+    const crossSessionArqueoEdit = await callJson(baseUrl, 'PATCH', `/ventas/cajas/cierres/${idCierreCaja}`, {
+      auth,
+      body: {
+        id_arqueo_final: otherSessionArqueo.rows[0].id_arqueo_caja,
+        motivo_edicion: 'QA rechazo de arqueo cruzado'
+      }
+    });
+    assert.equal(crossSessionArqueoEdit.status, 409);
+    assert.equal(crossSessionArqueoEdit.body?.code, 'VENTAS_CAJAS_ARQUEO_SESSION_MISMATCH');
+
+    const observationEdit = await callJson(baseUrl, 'PATCH', `/ventas/cajas/cierres/${idCierreCaja}`, {
+      auth,
+      body: {
+        observacion_cierre: 'QA observacion administrativa sin cambios financieros',
+        motivo_edicion: 'QA edicion permitida solo de observacion'
+      }
+    });
+    assert.equal(observationEdit.status, 200, JSON.stringify(observationEdit.body));
+    assert.deepEqual(await loadFinancialEditState(), financialBeforeEditAttempts);
+    const observationAudit = await pool.query(`
+      SELECT cc.observacion,
+             cs.observacion_cierre,
+             COUNT(cca.id_cierre_auditoria)::int AS auditorias
+      FROM public.cajas_cierres cc
+      INNER JOIN public.cajas_sesiones cs ON cs.id_sesion_caja = cc.id_sesion_caja
+      LEFT JOIN public.cajas_cierres_auditoria cca
+        ON cca.id_cierre_caja = cc.id_cierre_caja
+       AND cca.accion = 'EDIT'
+       AND cca.motivo = 'QA edicion permitida solo de observacion'
+      WHERE cc.id_cierre_caja = $1
+      GROUP BY cc.observacion, cs.observacion_cierre
+    `, [idCierreCaja]);
+    assert.equal(observationAudit.rows[0]?.observacion, 'QA observacion administrativa sin cambios financieros');
+    assert.equal(observationAudit.rows[0]?.observacion_cierre, 'QA observacion administrativa sin cambios financieros');
+    assert.equal(observationAudit.rows[0]?.auditorias, 1);
+
     const emailPayload = await loadCajaCloseEmailPayload(pool, idCierreCaja);
     const html = buildCajaCloseEmailHtml({ payload: emailPayload, pdfAttached: true });
     const pdf = await buildCajaCierrePdfBuffer(emailPayload);
@@ -1179,6 +1400,13 @@ const runHttpCloseSmoke = async () => {
       coherentTamperRejections,
       invalidOriginalPayloadRejections,
       operationalChangeRejections,
+      postCloseEditProtection: {
+        montoSegmentado: segmentedAmountEdit.status,
+        arqueoSegmentado: segmentedArqueoEdit.status,
+        arqueoOtraSesion: crossSessionArqueoEdit.status,
+        observacion: observationEdit.status,
+        auditoriaObservacion: observationAudit.rows[0]?.auditorias
+      },
       sharedQaCatalogMutations: false,
       reintentoCierreRechazado: cerrarReintento.status === 409,
       pdfBytes: pdf.length
@@ -1186,19 +1414,29 @@ const runHttpCloseSmoke = async () => {
   } finally {
     if (server) await stopServer(server);
     if (auth?.idSesion) await closeQaAuthContext(auth.idSesion).catch(() => {});
+    if (auxiliarySessionInserted) await cleanupAuxiliarySessionArtifacts(auxiliarySessionId);
     await cleanupHttpCloseArtifacts({ idSesionCaja, idFactura, fixtureReference });
   }
   const residues = await assertZeroHttpCloseArtifacts({ idSesionCaja, fixtureReference, authSessionId: auth?.idSesion || null });
+  const auxiliaryResidues = await assertZeroAuxiliarySessionArtifacts(auxiliarySessionId);
   const metricsAfter = await captureRegressionMetrics(pool);
   assert.deepEqual(metricsAfter, metricsBefore, 'Los conteos/sumas globales deben volver exactamente al baseline tras limpiar el fixture HTTP.');
-  return { ...result, cleanup: residues, metricsBefore, metricsAfter };
+  return { ...result, cleanup: { ...residues, auxiliary: auxiliaryResidues }, metricsBefore, metricsAfter };
 };
 
-const main = async () => {
+const main = async ({ lockProbeMs = 0 } = {}) => {
   installQaSharedPaymentCatalogWriteGuard();
   assertQaTarget();
-  const verifySql = await readFile(VERIFY_PATH, 'utf8');
+  let releaseSmokeLock = null;
   try {
+    releaseSmokeLock = await acquireQaSmokeAdvisoryLock();
+    if (lockProbeMs > 0) {
+      console.log(JSON.stringify({ lockProbe: 'LOCK_ACQUIRED', lockProbeMs }));
+      await new Promise((resolve) => setTimeout(resolve, lockProbeMs));
+      console.log(JSON.stringify({ lockProbe: 'CONTINUED', lockProbeMs }));
+      return;
+    }
+    const verifySql = await readFile(VERIFY_PATH, 'utf8');
     // PostgreSQL aislado se ejecuta por separado. Este proceso solo opera el
     // fixture sintetico de QA y exige que el esquema compartido ya este SAFE.
     const qaNamedConstraints = await namedConstraintState(pool);
@@ -1223,6 +1461,7 @@ const main = async () => {
       httpSmoke
     }, null, 2));
   } finally {
+    if (releaseSmokeLock) await releaseSmokeLock();
     await closePool();
   }
 };
@@ -1230,4 +1469,11 @@ const main = async () => {
 const isDirectExecution = process.argv[1]
   && new URL(`file:///${process.argv[1].replace(/\\/g, '/')}`).href === import.meta.url;
 
-if (isDirectExecution) await main();
+if (isDirectExecution) {
+  const lockProbeArg = process.argv.find((arg) => arg.startsWith('--lock-probe-ms='));
+  const lockProbeMs = lockProbeArg ? Number(lockProbeArg.split('=')[1]) : 0;
+  if (!Number.isInteger(lockProbeMs) || lockProbeMs < 0 || lockProbeMs > 30000) {
+    throw new Error('QA_CAJA_CLOSE_SMOKE_LOCK_PROBE_INVALID');
+  }
+  await main({ lockProbeMs });
+}

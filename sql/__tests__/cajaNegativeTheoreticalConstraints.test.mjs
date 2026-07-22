@@ -193,6 +193,12 @@ describe('monto teorico negativo en cierre de caja', () => {
     assert.match(preflightSource, /pg_locks/);
     assert.match(preflightSource, /sesiones_negativas/);
     assert.match(preflightSource, /pg_total_relation_size/);
+    assert.match(preflightSource, /UPPER\(TRIM\(fr\.estado\)\) = 'APLICADA'/);
+    assert.match(preflightSource, /fr\.id_sesion_caja_original IS NULL/);
+    assert.match(preflightSource, /fc_atribuible\.id_sesion_caja IS NOT NULL/);
+    assert.match(preflightSource, /REVERSION_SIN_SESION_ATRIBUIBLE/);
+    assert.match(preflightSource, /bloqueante_despliegue/);
+    assert.match(preflightSource, /estado_preflight/);
   });
 
   it('el cierre conserva valor exacto, diferencia, revision y notificacion', () => {

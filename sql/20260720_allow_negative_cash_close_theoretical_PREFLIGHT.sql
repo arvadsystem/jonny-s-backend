@@ -211,3 +211,33 @@ SELECT
   pg_total_relation_size(('public.'||relname)::regclass) AS bytes
 FROM (VALUES ('cajas_sesiones'), ('cajas_cierres'), ('cajas_arqueos')) v(relname)
 ORDER BY bytes DESC;
+
+-- 12) Reversiones aplicadas completamente huerfanas. Este resultado es
+-- bloqueante para el despliegue: sin una sesion original ni un cobro con
+-- id_sesion_caja no existe una atribucion financiera verificable.
+SELECT
+  fr.id_reversion,
+  fr.id_factura_original,
+  fr.monto_reversado,
+  COALESCE(
+    ARRAY_AGG(DISTINCT fc.id_sesion_caja)
+      FILTER (WHERE fc.id_sesion_caja IS NOT NULL),
+    ARRAY[]::bigint[]
+  ) AS sesiones_encontradas,
+  COUNT(fc.id_factura_cobro)::bigint AS cantidad_cobros,
+  'REVERSION_SIN_SESION_ATRIBUIBLE'::text AS motivo,
+  true AS bloqueante_despliegue,
+  'BLOQUEANTE'::text AS estado_preflight
+FROM public.facturas_reversiones fr
+LEFT JOIN public.facturas_cobros fc
+  ON fc.id_factura = fr.id_factura_original
+WHERE UPPER(TRIM(fr.estado)) = 'APLICADA'
+  AND fr.id_sesion_caja_original IS NULL
+  AND NOT EXISTS (
+    SELECT 1
+    FROM public.facturas_cobros fc_atribuible
+    WHERE fc_atribuible.id_factura = fr.id_factura_original
+      AND fc_atribuible.id_sesion_caja IS NOT NULL
+  )
+GROUP BY fr.id_reversion, fr.id_factura_original, fr.monto_reversado
+ORDER BY fr.id_reversion;

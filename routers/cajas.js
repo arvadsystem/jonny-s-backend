@@ -5688,11 +5688,18 @@ router.patch('/ventas/cajas/cierres/:id', checkPermission(['VENTAS_CAJAS_SESION_
     await ensureAdminOrSuperAdmin(req);
 
     const idCierreCaja = parsePositiveBigIntId(req.params.id);
-    const montoDeclarado = parseNullableNonNegativeAmount(req.body.monto_declarado_cierre);
     const observacion = normalizeText(req.body.observacion_cierre, 500);
     const motivoEdicion = normalizeText(req.body.motivo_edicion, 500);
-    const idResolucion = parseNullablePositiveInt(req.body.id_resolucion_cierre_caja);
-    const idArqueoFinal = parseNullablePositiveInt(req.body.id_arqueo_final);
+    const hasOwnField = (field) => Object.prototype.hasOwnProperty.call(req.body || {}, field);
+    const financialFields = [
+      'monto_declarado_cierre',
+      'id_arqueo_final',
+      'id_resolucion_cierre_caja'
+    ];
+    const requestedFinancialFields = financialFields.filter(hasOwnField);
+    const idArqueoFinal = hasOwnField('id_arqueo_final')
+      ? parseNullablePositiveInt(req.body.id_arqueo_final)
+      : null;
 
     if (!idCierreCaja) {
       throw createCajaError(400, 'VENTAS_CAJAS_CLOSE_ID_INVALID', 'El id de cierre es invalido.');
@@ -5720,6 +5727,54 @@ router.patch('/ventas/cajas/cierres/:id', checkPermission(['VENTAS_CAJAS_SESION_
     const scopeContext = await getScopeContext(req, client, cierre.id_sucursal, true);
     assertSucursalAllowed(scopeContext, cierre.id_sucursal);
 
+    if (idArqueoFinal) {
+      const arqueoResult = await client.query(
+        `
+          SELECT id_sesion_caja
+          FROM public.cajas_arqueos
+          WHERE id_arqueo_caja = $1
+          LIMIT 1
+        `,
+        [idArqueoFinal]
+      );
+      if (
+        arqueoResult.rowCount > 0
+        && String(arqueoResult.rows[0].id_sesion_caja) !== String(cierre.id_sesion_caja)
+      ) {
+        throw createCajaError(
+          409,
+          'VENTAS_CAJAS_ARQUEO_SESSION_MISMATCH',
+          'El arqueo indicado no pertenece a la sesion del cierre.'
+        );
+      }
+    }
+
+    const segmentedDetailResult = await client.query(
+      `
+        SELECT EXISTS (
+          SELECT 1
+          FROM public.cajas_cierres_arqueos_metodos
+          WHERE id_cierre_caja = $1
+        ) AS tiene_detalle_segmentado
+      `,
+      [idCierreCaja]
+    );
+    const hasSegmentedDetail = segmentedDetailResult.rows[0]?.tiene_detalle_segmentado === true;
+    if (hasSegmentedDetail && requestedFinancialFields.length > 0) {
+      throw createCajaError(
+        409,
+        'VENTAS_CAJAS_CLOSE_SEGMENTED_EDIT_REQUIRES_REVALIDATION',
+        'El cierre segmentado no puede modificarse financieramente sin realizar una nueva validación.'
+      );
+    }
+    if (requestedFinancialFields.length > 0) {
+      throw createCajaError(
+        409,
+        'VENTAS_CAJAS_CLOSE_FINANCIAL_EDIT_NOT_ALLOWED',
+        'Los campos financieros del cierre deben modificarse mediante su flujo especifico.'
+      );
+    }
+
     const fechaCreacion = new Date(cierre.fecha_creacion || cierre.fecha_cierre || 0);
     const elapsedMinutes = Math.floor((Date.now() - fechaCreacion.getTime()) / 60000);
     if (!Number.isFinite(elapsedMinutes) || elapsedMinutes > 30) {
@@ -5730,83 +5785,23 @@ router.patch('/ventas/cajas/cierres/:id', checkPermission(['VENTAS_CAJAS_SESION_
       );
     }
 
-    let montoDeclaradoFinal = montoDeclarado;
-    let idArqueoFinalSelected = idArqueoFinal ?? parseNullablePositiveInt(cierre.id_arqueo_final);
-    if (montoDeclaradoFinal === null && idArqueoFinalSelected) {
-      const arqueoResult = await client.query(
-        `
-          SELECT monto_contado
-          FROM public.cajas_arqueos
-          WHERE id_arqueo_caja = $1
-            AND id_sesion_caja = $2
-          LIMIT 1
-        `,
-        [idArqueoFinalSelected, cierre.id_sesion_caja]
-      );
-      montoDeclaradoFinal = parseNullableNonNegativeAmount(arqueoResult.rows?.[0]?.monto_contado);
-    }
-    if (montoDeclaradoFinal === null) {
-      throw createCajaError(400, 'VENTAS_CAJAS_CLOSE_AMOUNT_INVALID', 'Debe indicar un monto declarado valido.');
-    }
-
-    const summary = await loadCajaCloseFinancialSnapshot({
-      queryRunner: client,
-      idSesionCaja: cierre.id_sesion_caja
-    });
-    const montoTeorico = Number(summary.totalTeorico || 0);
-    const diferencia = Number((montoDeclaradoFinal - montoTeorico).toFixed(2));
-    const idResolucionCajaCuadra = await getCatalogId(client, 'RESOLUTIONS', 'CAJA_CUADRA');
-    let idResolucionFinal = idResolucion ?? parseNullablePositiveInt(cierre.id_resolucion_cierre_caja);
-
-    if (Math.abs(diferencia) === 0) {
-      idResolucionFinal = idResolucionCajaCuadra;
-    } else if (!idResolucionFinal) {
-      throw createCajaError(400, 'VENTAS_CAJAS_RESOLUTION_REQUIRED', 'Debe seleccionar una resolucion para diferencias.');
-    }
-
-    const resolutionCode = await getCatalogCodeById(client, 'RESOLUTIONS', idResolucionFinal);
-    if (Math.abs(diferencia) > 0 && resolutionCode === 'CAJA_CUADRA') {
-      throw createCajaError(
-        400,
-        'VENTAS_CAJAS_RESOLUTION_INVALID',
-        'Caja cuadra no aplica cuando existe diferencia.'
-      );
-    }
-
     await client.query(
       `
         UPDATE public.cajas_cierres
-        SET id_resolucion_cierre_caja = $1,
-            id_arqueo_final = $2,
-            monto_teorico_cierre = $3,
-            monto_declarado_cierre = $4,
-            diferencia = $5,
-            observacion = $6
-        WHERE id_cierre_caja = $7
+        SET observacion = $1
+        WHERE id_cierre_caja = $2
       `,
-      [
-        idResolucionFinal,
-        idArqueoFinalSelected,
-        montoTeorico,
-        montoDeclaradoFinal,
-        diferencia,
-        observacion,
-        idCierreCaja
-      ]
+      [observacion, idCierreCaja]
     );
 
     await client.query(
       `
         UPDATE public.cajas_sesiones
-        SET monto_teorico_cierre = $1,
-            monto_declarado_cierre = $2,
-            diferencia_cierre = $3,
-            id_resolucion_cierre_caja = $4,
-            observacion_cierre = $5,
+        SET observacion_cierre = $1,
             fecha_actualizacion = NOW()
-        WHERE id_sesion_caja = $6
+        WHERE id_sesion_caja = $2
       `,
-      [montoTeorico, montoDeclaradoFinal, diferencia, idResolucionFinal, observacion, cierre.id_sesion_caja]
+      [observacion, cierre.id_sesion_caja]
     );
 
     await client.query(
@@ -5829,32 +5824,17 @@ router.patch('/ventas/cajas/cierres/:id', checkPermission(['VENTAS_CAJAS_SESION_
         JSON.stringify(cierre),
         JSON.stringify({
           ...cierre,
-          id_resolucion_cierre_caja: idResolucionFinal,
-          id_arqueo_final: idArqueoFinalSelected,
-          monto_teorico_cierre: montoTeorico,
-          monto_declarado_cierre: montoDeclaradoFinal,
-          diferencia,
           observacion
         })
       ]
     );
 
-    const payrollSync = await syncPayrollDeductionForClose({
-      client,
-      idCierreCaja,
-      idUsuarioResponsable: cierre.id_usuario_responsable,
-      idSucursal: cierre.id_sucursal,
-      fechaCierre: cierre.fecha_cierre || new Date().toISOString(),
-      diferencia,
-      resolucionCodigo: resolutionCode
-    });
-
     await client.query('COMMIT');
     return res.status(200).json({
       message: 'Cierre editado correctamente.',
       id_cierre_caja: idCierreCaja,
-      diferencia,
-      payroll_sync: payrollSync
+      diferencia: roundMoney(cierre.diferencia),
+      payroll_sync: { synced: true, reason: 'NOT_REQUIRED' }
     });
   } catch (err) {
     await client.query('ROLLBACK');
@@ -6197,7 +6177,8 @@ router.post('/ventas/cajas/sesiones/:id/arqueos', checkPermission(['VENTAS_CAJAS
     if (montoContado === null) throw createCajaError(400, 'VENTAS_CAJAS_ARQUEO_AMOUNT_INVALID', 'monto_contado debe ser un numero mayor o igual a 0.');
 
     const scopeContext = await getScopeContext(req, client, null, true);
-    const session = await ensureOpenSession(client, idSesionCaja);
+    await lockCajaFinancialSession(client, idSesionCaja);
+    const session = await ensureOpenSession(client, idSesionCaja, { forUpdate: true });
     assertSucursalAllowed(scopeContext, session.id_sucursal);
     await ensureSessionParticipant(client, idSesionCaja, scopeContext.idUsuario, { allowAdminBypass: true, req, scopeContext });
     const tipoArqueoCode = await getCatalogCodeById(client, 'ARQUEO_TYPES', idTipoArqueoCaja);
@@ -6274,7 +6255,8 @@ router.post('/ventas/cajas/sesiones/:id/movimientos', checkPermission(['VENTAS_C
     if (monto === null || monto <= 0) throw createCajaError(400, 'VENTAS_CAJAS_MOVEMENT_AMOUNT_INVALID', 'monto debe ser un numero mayor a 0.');
 
     const scopeContext = await getScopeContext(req, client, null, true);
-    const session = await ensureOpenSession(client, idSesionCaja);
+    await lockCajaFinancialSession(client, idSesionCaja);
+    const session = await ensureOpenSession(client, idSesionCaja, { forUpdate: true });
     assertSucursalAllowed(scopeContext, session.id_sucursal);
     await ensureSessionParticipant(client, idSesionCaja, scopeContext.idUsuario, { allowAdminBypass: true, req, scopeContext });
     if (await isCashierOnlyRequest(req, client)) {

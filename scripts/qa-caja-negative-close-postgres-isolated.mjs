@@ -8,9 +8,14 @@ import {
 } from '../services/cajaCloseIsolatedDatabaseGuard.js';
 import { assertCoreCatalogValid } from '../services/cajaCloseComputationService.js';
 import { loadCajaCloseFinancialSnapshot } from '../services/cajaCloseFinancialSnapshotService.js';
+import {
+  lockCajaFinancialSession,
+  mapCajaFinancialLockError
+} from '../services/cajaFinancialLockService.js';
 
 const SAFE_PATH = new URL('../sql/20260720_allow_negative_cash_close_theoretical_SAFE.sql', import.meta.url);
 const ROLLBACK_PATH = new URL('../sql/20260720_allow_negative_cash_close_theoretical_ROLLBACK.sql', import.meta.url);
+const PREFLIGHT_PATH = new URL('../sql/20260720_allow_negative_cash_close_theoretical_PREFLIGHT.sql', import.meta.url);
 
 const TARGETS = Object.freeze([
   {
@@ -57,6 +62,7 @@ const initializeSchema = async (queryRunner) => {
       monto_teorico_cierre numeric(14,2),
       marca text,
       monto_apertura numeric(14,2) NOT NULL DEFAULT 0,
+      estado_codigo text NOT NULL DEFAULT 'ABIERTA',
       CONSTRAINT ck_cajas_sesiones_monto_teorico
         CHECK (monto_teorico_cierre IS NULL OR monto_teorico_cierre >= 0)
     );
@@ -122,6 +128,27 @@ const initializeSchema = async (queryRunner) => {
       id_tipo_movimiento_caja integer,
       monto numeric(14,2)
     );
+
+    CREATE OR REPLACE FUNCTION public.fn_ventas_lock_caja_financial_session(
+      p_id_sesion_caja bigint,
+      p_timeout_ms integer DEFAULT 5000
+    )
+    RETURNS void
+    LANGUAGE plpgsql
+    AS $$
+    DECLARE
+      v_deadline timestamptz := clock_timestamp() + make_interval(secs => p_timeout_ms::double precision / 1000.0);
+      v_lock_key bigint := ~p_id_sesion_caja;
+    BEGIN
+      LOOP
+        EXIT WHEN pg_try_advisory_xact_lock(v_lock_key);
+        IF clock_timestamp() >= v_deadline THEN
+          RAISE EXCEPTION 'VENTAS_CAJA_FINANCIAL_LOCK_TIMEOUT' USING ERRCODE = '55P03';
+        END IF;
+        PERFORM pg_sleep(0.025);
+      END LOOP;
+    END;
+    $$;
 
     INSERT INTO public.cat_metodos_pago (id_metodo_pago, codigo, estado, afecta_efectivo) VALUES
       (1, 'EFECTIVO', true, true),
@@ -203,6 +230,7 @@ const regressionMetrics = async (queryRunner) => {
       (SELECT COALESCE(SUM(monto), 0)::text FROM public.facturas_cobros) AS suma_cobros,
       (SELECT COUNT(*)::int FROM public.pedidos) AS cantidad_pedidos,
       (SELECT COUNT(*)::int FROM public.cajas_movimientos) AS cantidad_movimientos,
+      (SELECT COUNT(*)::int FROM public.cajas_arqueos) AS cantidad_arqueos,
       (SELECT COUNT(*)::int FROM public.cajas_cierres) AS cantidad_cierres,
       (SELECT COUNT(*)::int FROM public.cajas_sesiones) AS cantidad_sesiones
   `);
@@ -692,6 +720,187 @@ const testRealReversionAttribution = async (client) => {
   }
 };
 
+const createSessionNotOpenError = () => {
+  const error = new Error('La sesion de caja no se encuentra abierta.');
+  error.httpStatus = 409;
+  error.code = 'VENTAS_CAJAS_SESSION_NOT_OPEN';
+  error.publicMessage = 'La sesion de caja no se encuentra abierta.';
+  return error;
+};
+
+const ensureIsolatedSessionOpen = async (client, idSesionCaja) => {
+  const result = await client.query(
+    'SELECT estado_codigo FROM public.cajas_sesiones WHERE id_sesion_caja = $1 FOR UPDATE',
+    [idSesionCaja]
+  );
+  if (result.rows[0]?.estado_codigo !== 'ABIERTA') throw createSessionNotOpenError();
+};
+
+const testConcurrentFinancialWrite = async ({ pool, kind, idSesionCaja, writeId }) => {
+  const closeClient = await pool.connect();
+  const writeClient = await pool.connect();
+  const targetTable = kind === 'movimiento' ? 'public.cajas_movimientos' : 'public.cajas_arqueos';
+  try {
+    await closeClient.query(
+      'INSERT INTO public.cajas_sesiones (id_sesion_caja, monto_teorico_cierre, marca, monto_apertura, estado_codigo) VALUES ($1, 0, $2, 0, \'ABIERTA\')',
+      [idSesionCaja, `CONCURRENCIA_${kind.toUpperCase()}`]
+    );
+
+    await closeClient.query('BEGIN');
+    await lockCajaFinancialSession(closeClient, idSesionCaja, 2000);
+    await writeClient.query('BEGIN');
+    let timeoutError;
+    try {
+      await lockCajaFinancialSession(writeClient, idSesionCaja, 100);
+    } catch (error) {
+      timeoutError = mapCajaFinancialLockError(error);
+    }
+    assert.equal(timeoutError?.httpStatus, 409);
+    assert.equal(timeoutError?.code, 'VENTAS_CAJAS_CONCURRENT_OPERATION_RETRY');
+    await writeClient.query('ROLLBACK');
+    await closeClient.query('ROLLBACK');
+
+    await closeClient.query('BEGIN');
+    await lockCajaFinancialSession(closeClient, idSesionCaja, 2000);
+    const waitingWrite = (async () => {
+      await writeClient.query('BEGIN');
+      try {
+        await lockCajaFinancialSession(writeClient, idSesionCaja, 2000);
+        await ensureIsolatedSessionOpen(writeClient, idSesionCaja);
+        if (kind === 'movimiento') {
+          await writeClient.query(
+            'INSERT INTO public.cajas_movimientos (id_movimiento_caja, id_sesion_caja, id_tipo_movimiento_caja, monto) VALUES ($1, $2, 1, 1)',
+            [writeId, idSesionCaja]
+          );
+        } else {
+          await writeClient.query(
+            'INSERT INTO public.cajas_arqueos (id_arqueo_caja, id_sesion_caja, monto_teorico, monto_contado) VALUES ($1, $2, 0, 0)',
+            [writeId, idSesionCaja]
+          );
+        }
+        await writeClient.query('COMMIT');
+        return { status: 201, code: null };
+      } catch (error) {
+        await writeClient.query('ROLLBACK');
+        const mapped = mapCajaFinancialLockError(error);
+        return { status: mapped.httpStatus || 500, code: mapped.code || null };
+      }
+    })();
+
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    await closeClient.query(
+      "UPDATE public.cajas_sesiones SET estado_codigo = 'CERRADA' WHERE id_sesion_caja = $1",
+      [idSesionCaja]
+    );
+    await closeClient.query('COMMIT');
+    const response = await waitingWrite;
+    assert.equal(response.status, 409);
+    assert.equal(response.code, 'VENTAS_CAJAS_SESSION_NOT_OPEN');
+    const inserted = await closeClient.query(
+      `SELECT COUNT(*)::int AS count FROM ${targetTable} WHERE id_sesion_caja = $1 AND ${kind === 'movimiento' ? 'id_movimiento_caja' : 'id_arqueo_caja'} = $2`,
+      [idSesionCaja, writeId]
+    );
+    assert.equal(inserted.rows[0].count, 0);
+
+    return {
+      kind,
+      timeoutResponse: { status: timeoutError.httpStatus, code: timeoutError.code },
+      postCloseResponse: response,
+      insertedAfterClose: 0
+    };
+  } finally {
+    await writeClient.query('ROLLBACK').catch(() => {});
+    await closeClient.query('ROLLBACK').catch(() => {});
+    await closeClient.query('DELETE FROM public.cajas_movimientos WHERE id_sesion_caja = $1', [idSesionCaja]).catch(() => {});
+    await closeClient.query('DELETE FROM public.cajas_arqueos WHERE id_sesion_caja = $1', [idSesionCaja]).catch(() => {});
+    await closeClient.query('DELETE FROM public.cajas_sesiones WHERE id_sesion_caja = $1', [idSesionCaja]).catch(() => {});
+    writeClient.release();
+    closeClient.release();
+  }
+};
+
+const testOrphanReversionPreflight = async (client, preflightSql) => {
+  const orphanSectionIndex = preflightSql.indexOf('-- 12) Reversiones aplicadas completamente huerfanas.');
+  assert.ok(orphanSectionIndex >= 0, 'No se encontro la consulta exacta de reversiones huerfanas en PREFLIGHT.');
+  const orphanQuery = preflightSql.slice(orphanSectionIndex);
+  assert.doesNotMatch(orphanQuery, /\b(?:INSERT|UPDATE|DELETE|TRUNCATE|ALTER|DROP|LOCK)\b/i);
+
+  await client.query('BEGIN');
+  try {
+    await client.query('INSERT INTO public.facturas (id_factura) VALUES (9201), (9202)');
+    await client.query(`
+      INSERT INTO public.facturas_cobros (id_factura_cobro, monto, id_factura, id_sesion_caja, id_metodo_pago)
+      VALUES (9211, 10, 9201, NULL, 1), (9212, 10, 9202, 1, 1)
+    `);
+    await client.query(`
+      INSERT INTO public.facturas_reversiones (
+        id_reversion, id_factura_original, id_sesion_caja_original, monto_reversado, estado
+      ) VALUES
+        (9221, 9201, NULL, 10, 'APLICADA'),
+        (9222, 9202, NULL, 10, 'APLICADA')
+    `);
+    const before = await client.query(`
+      SELECT
+        (SELECT COUNT(*)::int FROM public.facturas_reversiones) AS reversiones,
+        (SELECT COUNT(*)::int FROM public.facturas_cobros) AS cobros
+    `);
+    const result = await client.query(orphanQuery);
+    const after = await client.query(`
+      SELECT
+        (SELECT COUNT(*)::int FROM public.facturas_reversiones) AS reversiones,
+        (SELECT COUNT(*)::int FROM public.facturas_cobros) AS cobros
+    `);
+    assert.deepEqual(after.rows, before.rows);
+    assert.equal(result.rowCount, 1);
+    assert.equal(String(result.rows[0].id_reversion), '9221');
+    assert.equal(result.rows[0].motivo, 'REVERSION_SIN_SESION_ATRIBUIBLE');
+    assert.equal(result.rows[0].bloqueante_despliegue, true);
+    assert.equal(result.rows[0].estado_preflight, 'BLOQUEANTE');
+    assert.deepEqual(result.rows[0].sesiones_encontradas, []);
+    assert.equal(Number(result.rows[0].cantidad_cobros), 1);
+    return { detected: result.rows, noDml: true };
+  } finally {
+    await client.query('ROLLBACK');
+  }
+};
+
+export const runPostCloseConsistencyTargetedSuite = async ({
+  connectionString = process.env.CAJA_CLOSE_ISOLATED_DATABASE_URL
+} = {}) => {
+  const expectedTarget = assertIsolatedDatabaseUrlAllowed({ connectionString });
+  const pool = createPool(connectionString);
+  const client = await pool.connect();
+  try {
+    const destructiveTarget = await assertIsolatedDatabaseServerAndMarker({
+      queryRunner: client,
+      expectedTarget
+    });
+    await initializeSchema(client);
+    const metricsBefore = await regressionMetrics(client);
+    const [movement, arqueo] = await Promise.all([
+      testConcurrentFinancialWrite({ pool, kind: 'movimiento', idSesionCaja: 9101, writeId: 9111 }),
+      testConcurrentFinancialWrite({ pool, kind: 'arqueo', idSesionCaja: 9102, writeId: 9112 })
+    ]);
+    const preflightSql = await readFile(PREFLIGHT_PATH, 'utf8');
+    const preflight = await testOrphanReversionPreflight(client, preflightSql);
+    const metricsAfter = await regressionMetrics(client);
+    assert.deepEqual(metricsAfter, metricsBefore);
+    return {
+      postgresVersion: (await client.query("SELECT current_setting('server_version') AS version")).rows[0].version,
+      destructiveTarget,
+      movement,
+      arqueo,
+      preflight,
+      metricsBefore,
+      metricsAfter,
+      zeroResidues: true
+    };
+  } finally {
+    client.release();
+    await pool.end();
+  }
+};
+
 export const runIsolatedPostgresMigrationSuite = async ({
   connectionString = process.env.CAJA_CLOSE_ISOLATED_DATABASE_URL,
   injectFailureAfterSafe = false,
@@ -793,9 +1002,11 @@ const isDirectExecution = process.argv[1]
   && new URL(`file:///${process.argv[1].replace(/\\/g, '/')}`).href === import.meta.url;
 
 if (isDirectExecution) {
-  const result = await runIsolatedPostgresMigrationSuite({
-    injectFailureAfterSafe: process.argv.includes('--inject-failure-after-safe'),
-    leaveSafeApplied: process.argv.includes('--leave-safe-applied')
-  });
+  const result = process.argv.includes('--post-close-consistency-only')
+    ? await runPostCloseConsistencyTargetedSuite()
+    : await runIsolatedPostgresMigrationSuite({
+        injectFailureAfterSafe: process.argv.includes('--inject-failure-after-safe'),
+        leaveSafeApplied: process.argv.includes('--leave-safe-applied')
+      });
   console.log(JSON.stringify(result, null, 2));
 }
