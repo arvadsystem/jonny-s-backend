@@ -626,7 +626,7 @@ export const createSolicitudesCompraService = (overrides = {}) => {
     }
     const detailsResult = await dependencies.db.query(
       `
-        SELECT d.tipo_item,
+        SELECT d.id_solicitud_detalle, d.tipo_item,
                COALESCE(d.id_producto, d.id_insumo) AS id_item,
                CASE WHEN d.tipo_item = 'PRODUCTO' THEN p.nombre_producto ELSE i.nombre_insumo END AS nombre,
                CASE WHEN d.tipo_item = 'PRODUCTO' THEN cp.nombre_categoria ELSE ci.nombre_categoria END AS categoria,
@@ -678,6 +678,7 @@ export const createSolicitudesCompraService = (overrides = {}) => {
       },
       detalles: (detailsResult.rows || []).map((row) => ({
         ...row,
+        id_solicitud_detalle: Number(row.id_solicitud_detalle),
         id_item: Number(row.id_item),
         cantidad_solicitada: Number(row.cantidad_solicitada),
         cantidad_base_solicitada: Number(row.cantidad_base_solicitada),

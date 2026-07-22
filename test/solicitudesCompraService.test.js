@@ -313,6 +313,74 @@ test('detalle operativo responde 403 para otra sucursal', async () => {
   assert.equal(calls, 1);
 });
 
+test('detalle expone IDs reales distintos y conserva encabezado, proveedor y cantidades', async () => {
+  const header = {
+    id_solicitud_compra: '44', id_sucursal: '3', nombre_sucursal: 'Sucursal 3',
+    id_almacen: '11', nombre_almacen: 'Bodega principal', id_usuario_solicitante: '7',
+    solicitante_nombre: 'Operador', estado: 'APROBADA', observacion_solicitud: 'Reposicion',
+    comentario_revision: 'Aprobada', observacion_recepcion: null,
+    fecha_creacion: '2026-07-21T12:00:00Z', fecha_revision: '2026-07-21T13:00:00Z',
+    fecha_recepcion: null, inventario_aplicado: false, fecha_inventario_aplicado: null,
+    tiene_evidencia: false, id_usuario_recepcion: null, receptor_nombre: null,
+    id_usuario_revisor: '1', revisor_nombre: 'Administrador'
+  };
+  const provider = { id_proveedor: 5, nombre_proveedor: 'Proveedor Central' };
+  const details = [
+    {
+      id_solicitud_detalle: '15', tipo_item: 'INSUMO', id_item: '230', nombre: 'Harina',
+      categoria: 'Secos', cantidad_solicitada: '2', presentacion_snapshot: 'Saco 25 kg',
+      cantidad_base_solicitada: '50', unidad_base: 'Kilogramo', cantidad_aprobada: '2',
+      cantidad_base_aprobada: '50', proveedor: provider, cantidad_recibida: null,
+      cantidad_base_recibida: null, stock_actual: '20', stock_minimo: '5', estado_stock: 'DISPONIBLE'
+    },
+    {
+      id_solicitud_detalle: '16', tipo_item: 'INSUMO', id_item: '230', nombre: 'Harina',
+      categoria: 'Secos', cantidad_solicitada: '3', presentacion_snapshot: 'Bolsa 1 kg',
+      cantidad_base_solicitada: '3', unidad_base: 'Kilogramo', cantidad_aprobada: '2.5',
+      cantidad_base_aprobada: '2.5', proveedor: null, cantidad_recibida: '2',
+      cantidad_base_recibida: '2', stock_actual: '20', stock_minimo: '5', estado_stock: 'DISPONIBLE'
+    }
+  ];
+  let detailSql = '';
+  const db = makeReadDb(async (sql) => {
+    if (sql.includes('FROM public.solicitudes_compra sc')) return { rows: [header], rowCount: 1 };
+    if (sql.includes('FROM public.solicitudes_compra_detalle d')) {
+      detailSql = sql;
+      return { rows: details, rowCount: 2 };
+    }
+    throw new Error('Consulta inesperada');
+  });
+  const service = createSolicitudesCompraService(baseOverrides(db, { readAccess: adminAccess }));
+  const result = await service.getById({ params: { id_solicitud_compra: 44 } });
+
+  assert.match(detailSql, /SELECT\s+d\.id_solicitud_detalle,\s*d\.tipo_item/);
+  assert.match(detailSql, /ORDER BY d\.id_solicitud_detalle/);
+  assert.deepEqual(result.solicitud, {
+    id_solicitud_compra: 44,
+    sucursal: { id_sucursal: 3, nombre: 'Sucursal 3' },
+    almacen: { id_almacen: 11, nombre: 'Bodega principal' },
+    solicitante: { id_usuario: 7, nombre: 'Operador' },
+    estado: 'APROBADA', observacion_solicitud: 'Reposicion', comentario_revision: 'Aprobada',
+    observacion_recepcion: null, fecha_creacion: '2026-07-21T12:00:00Z',
+    fecha_revision: '2026-07-21T13:00:00Z', fecha_recepcion: null,
+    inventario_aplicado: false, fecha_inventario_aplicado: null, tiene_evidencia: false,
+    receptor: null, revisor: { id_usuario: 1, nombre: 'Administrador' }
+  });
+  assert.deepEqual(result.detalles.map((line) => line.id_solicitud_detalle), [15, 16]);
+  assert.ok(result.detalles.every((line) => Number.isInteger(line.id_solicitud_detalle) && line.id_solicitud_detalle > 0));
+  assert.equal(result.detalles[0].id_item, result.detalles[1].id_item);
+  assert.notEqual(result.detalles[0].id_solicitud_detalle, result.detalles[0].id_item);
+  assert.notEqual(result.detalles[0].presentacion_snapshot, result.detalles[1].presentacion_snapshot);
+  assert.deepEqual(result.detalles[0].proveedor, provider);
+  assert.deepEqual(
+    result.detalles.map(({ cantidad_solicitada, cantidad_aprobada, cantidad_recibida }) => ({ cantidad_solicitada, cantidad_aprobada, cantidad_recibida })),
+    [
+      { cantidad_solicitada: 2, cantidad_aprobada: 2, cantidad_recibida: null },
+      { cantidad_solicitada: 3, cantidad_aprobada: 2.5, cantidad_recibida: 2 }
+    ]
+  );
+});
+
 test('servicio no crea movimientos de inventario', async () => {
   const source = await readFile(new URL('../services/solicitudesCompraService.js', import.meta.url), 'utf8');
   assert.doesNotMatch(source, /INSERT\s+INTO\s+public\.movimientos_inventario/i);
