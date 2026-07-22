@@ -23,6 +23,7 @@ import detalleOrdenComprasRoutes from './routers/detalle_orden_compras.js';
 import comprasRoutes from './routers/compras.js';
 import detalleComprasRoutes from './routers/detalle_compras.js';
 import ordenesCompraWorkflowRoutes from './routers/ordenes_compra_workflow.js';
+import solicitudesCompraRoutes from './routers/solicitudes_compra.js';
 import sucursalesRoutes from './routers/sucursales.js';
 import ventasRoutes from './routers/ventas.js';
 import cocinaRoutes from './routers/cocina.js';
@@ -311,6 +312,8 @@ app.use(comprasRoutes);
 app.use(detalleComprasRoutes);
 // AM: flujo transaccional y seguro para solicitudes/ordenes/compras de abastecimiento.
 app.use(ordenesCompraWorkflowRoutes);
+// AM: backend independiente para la primera microfase de Solicitudes de Compra.
+app.use('/solicitudes_compra', solicitudesCompraRoutes);
 app.use(tipoDepartamentoRoutes);
 app.use(sucursalesRoutes);
 app.use(cajasRoutes);
