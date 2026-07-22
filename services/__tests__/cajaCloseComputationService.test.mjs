@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import {
+  assertCloseValidationArithmeticIntegrity,
   assertCoreCatalogValid,
   buildSegmentedArqueoComputation,
   fingerprintValuesEqual,
@@ -33,7 +34,9 @@ describe('caja close computation', () => {
     const result = buildSegmentedArqueoComputation({
       snapshot,
       payloadRows: [
-        { metodo_pago_codigo: 'TARJETA', monto_declarado: 9, cantidad_referencias: 1 }
+        { metodo_pago_codigo: 'EFECTIVO', monto_declarado: 0 },
+        { metodo_pago_codigo: 'TARJETA', monto_declarado: 9, cantidad_referencias: 1 },
+        { metodo_pago_codigo: 'TRANSFERENCIA', monto_declarado: 0 }
       ],
       threshold: 0,
       requireObservacionOnDifference: false
@@ -42,6 +45,109 @@ describe('caja close computation', () => {
     const tarjeta = result.rows.find((row) => row.metodo_pago_codigo === 'TARJETA');
     assert.equal(tarjeta.requiere_revision, true);
     assert.equal(tarjeta.observacion_requerida, false);
+  });
+
+  it('exige exactamente EFECTIVO, TARJETA y TRANSFERENCIA como filas manuales', () => {
+    const requiredCases = [
+      [{ metodo_pago_codigo: 'EFECTIVO', monto_declarado: 0 }],
+      [
+        { metodo_pago_codigo: 'EFECTIVO', monto_declarado: 0 },
+        { metodo_pago_codigo: 'TARJETA', monto_declarado: 10, cantidad_referencias: 1 }
+      ],
+      [
+        { metodo_pago_codigo: 'EFECTIVO', monto_declarado: 0 },
+        { metodo_pago_codigo: 'TRANSFERENCIA', monto_declarado: 0 }
+      ]
+    ];
+    for (const payloadRows of requiredCases) {
+      assert.throws(
+        () => buildSegmentedArqueoComputation({ snapshot, payloadRows, threshold: 0 }),
+        (error) => error.httpStatus === 400 && error.code === 'VENTAS_CAJAS_ARQUEO_METODO_REQUIRED'
+      );
+    }
+
+    assert.throws(
+      () => buildSegmentedArqueoComputation({
+        snapshot,
+        payloadRows: [
+          { metodo_pago_codigo: 'EFECTIVO', monto_declarado: 0 },
+          { metodo_pago_codigo: 'TARJETA', monto_declarado: 10, cantidad_referencias: 1 },
+          { metodo_pago_codigo: 'TRANSFERENCIA', monto_declarado: 0 },
+          { metodo_pago_codigo: 'OTRO', monto_declarado: 0 }
+        ],
+        threshold: 0
+      }),
+      (error) => error.httpStatus === 400 && error.code === 'VENTAS_CAJAS_ARQUEO_METODO_INVALID'
+    );
+
+    for (const duplicateCode of ['EFECTIVO', 'TARJETA', 'TRANSFERENCIA']) {
+      const payloadRows = [
+        { metodo_pago_codigo: 'EFECTIVO', monto_declarado: 0 },
+        { metodo_pago_codigo: 'TARJETA', monto_declarado: 10, cantidad_referencias: 1 },
+        { metodo_pago_codigo: 'TRANSFERENCIA', monto_declarado: 0 },
+        { metodo_pago_codigo: duplicateCode, monto_declarado: 0 }
+      ];
+      assert.throws(
+        () => buildSegmentedArqueoComputation({ snapshot, payloadRows, threshold: 0 }),
+        (error) => error.httpStatus === 400 && error.code === 'VENTAS_CAJAS_ARQUEO_METODO_DUPLICATE'
+      );
+    }
+  });
+
+  it('recalcula toda la aritmetica almacenada y rechaza cualquier manipulacion antes del cierre', () => {
+    const validMethods = [
+      { metodo_pago_codigo: 'EFECTIVO', monto_teorico: 100, monto_declarado: 90, diferencia: -10, requiere_revision: true },
+      { metodo_pago_codigo: 'TARJETA', monto_teorico: 200, monto_declarado: 200, diferencia: 0, requiere_revision: false },
+      { metodo_pago_codigo: 'TRANSFERENCIA', monto_teorico: 300, monto_declarado: 300, diferencia: 0, requiere_revision: false },
+      { metodo_pago_codigo: 'OTRO', monto_teorico: 400, monto_declarado: 400, diferencia: 0, requiere_revision: false }
+    ];
+    const validHeader = {
+      total_teorico: 1000,
+      total_declarado: 990,
+      diferencia_total: -10,
+      hay_diferencia: true
+    };
+    assert.deepEqual(
+      assertCloseValidationArithmeticIntegrity({ validation: validHeader, validationMethods: validMethods, threshold: 0 }),
+      validHeader
+    );
+
+    const clone = (value) => JSON.parse(JSON.stringify(value));
+    const manipulations = [
+      ({ header, rows }) => { rows[0].monto_declarado = 91; },
+      ({ header, rows }) => { rows[0].diferencia = -9; },
+      ({ header }) => { header.total_declarado = 991; },
+      ({ header }) => { header.diferencia_total = -9; },
+      ({ rows }) => { rows[0].requiere_revision = false; },
+      ({ header }) => { header.total_teorico = 999; },
+      ({ rows }) => { rows[3].monto_declarado = 399; rows[3].diferencia = -1; rows[3].requiere_revision = true; }
+    ];
+    for (const mutate of manipulations) {
+      const fixture = { header: clone(validHeader), rows: clone(validMethods) };
+      mutate(fixture);
+      assert.throws(
+        () => assertCloseValidationArithmeticIntegrity({
+          validation: fixture.header,
+          validationMethods: fixture.rows,
+          threshold: 0
+        }),
+        (error) => error.httpStatus === 409 && error.code === 'VENTAS_CAJAS_CLOSE_VALIDATION_STALE'
+      );
+    }
+  });
+
+  it('valida la regla automatica de OTRO cuando el teorico es negativo', () => {
+    const methods = [
+      { metodo_pago_codigo: 'EFECTIVO', monto_teorico: 0, monto_declarado: 0, diferencia: 0, requiere_revision: false },
+      { metodo_pago_codigo: 'TARJETA', monto_teorico: 0, monto_declarado: 0, diferencia: 0, requiere_revision: false },
+      { metodo_pago_codigo: 'TRANSFERENCIA', monto_teorico: 0, monto_declarado: 0, diferencia: 0, requiere_revision: false },
+      { metodo_pago_codigo: 'OTRO', monto_teorico: -25, monto_declarado: 0, diferencia: 25, requiere_revision: true }
+    ];
+    const header = { total_teorico: -25, total_declarado: 0, diferencia_total: 25, hay_diferencia: true };
+    assert.deepEqual(
+      assertCloseValidationArithmeticIntegrity({ validation: header, validationMethods: methods, threshold: 100 }),
+      header
+    );
   });
 
   it('sin actividad agrupada no genera fila OTRO (retrocompatible con 3 filas)', () => {
@@ -142,7 +248,11 @@ describe('caja close computation', () => {
           { id_metodo_pago: 3, codigo: 'TRANSFERENCIA', ventas_brutas: 0, monto_teorico: 0 }
         ]
       },
-      payloadRows: [{ metodo_pago_codigo: 'EFECTIVO', monto_declarado: 3000 }],
+      payloadRows: [
+        { metodo_pago_codigo: 'EFECTIVO', monto_declarado: 3000 },
+        { metodo_pago_codigo: 'TARJETA', monto_declarado: 0 },
+        { metodo_pago_codigo: 'TRANSFERENCIA', monto_declarado: 0 }
+      ],
       threshold: 0,
       requireObservacionOnDifference: true
     });
@@ -177,7 +287,8 @@ describe('caja close computation', () => {
       },
       payloadRows: [
         { metodo_pago_codigo: 'EFECTIVO', monto_declarado: 0 },
-        { metodo_pago_codigo: 'TARJETA', monto_declarado: 2500, cantidad_referencias: 1 }
+        { metodo_pago_codigo: 'TARJETA', monto_declarado: 2500, cantidad_referencias: 1 },
+        { metodo_pago_codigo: 'TRANSFERENCIA', monto_declarado: 0 }
       ],
       threshold: 0,
       requireObservacionOnDifference: false

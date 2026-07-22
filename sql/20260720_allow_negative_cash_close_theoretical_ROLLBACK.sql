@@ -273,11 +273,14 @@ $rollback_add$;
 COMMIT;
 
 -- ===================== FASE 2 =====================
--- Statements independientes (fuera de cualquier BEGIN explicito): cada uno
--- corre en su propia transaccion implicita, bajo SHARE UPDATE EXCLUSIVE
--- (VALIDATE CONSTRAINT), sin bloquear ventas ni cierres concurrentes. Cada
--- bloque es un no-op seguro si la restriccion no existe o ya esta validada
--- (por ejemplo, si la fase 1 no pudo tomar el lock y aborto).
+-- Cada VALIDATE tiene su propia transaccion y sus propios timeouts. Un lock o
+-- timeout identifica la restriccion exacta y aborta la ejecucion del archivo;
+-- nunca se modifican filas ni se continua silenciosamente.
+-- PHASE_2_VALIDATE_CAJAS_SESIONES_BEGIN
+BEGIN;
+SET LOCAL lock_timeout = '1s';
+SET LOCAL statement_timeout = '20s';
+SET LOCAL idle_in_transaction_session_timeout = '20s';
 DO $validate_sesiones$
 BEGIN
   IF EXISTS (
@@ -286,11 +289,24 @@ BEGIN
       AND conname = 'ck_cajas_sesiones_monto_teorico'
       AND NOT convalidated
   ) THEN
-    ALTER TABLE public.cajas_sesiones VALIDATE CONSTRAINT ck_cajas_sesiones_monto_teorico;
+    BEGIN
+      ALTER TABLE public.cajas_sesiones VALIDATE CONSTRAINT ck_cajas_sesiones_monto_teorico;
+    EXCEPTION WHEN OTHERS THEN
+      RAISE EXCEPTION USING
+        ERRCODE = SQLSTATE,
+        MESSAGE = FORMAT('Fallo VALIDATE CONSTRAINT public.cajas_sesiones.ck_cajas_sesiones_monto_teorico: %s', SQLERRM);
+    END;
   END IF;
 END
 $validate_sesiones$;
+COMMIT;
+-- PHASE_2_VALIDATE_CAJAS_SESIONES_END
 
+-- PHASE_2_VALIDATE_CAJAS_CIERRES_BEGIN
+BEGIN;
+SET LOCAL lock_timeout = '1s';
+SET LOCAL statement_timeout = '20s';
+SET LOCAL idle_in_transaction_session_timeout = '20s';
 DO $validate_cierres$
 BEGIN
   IF EXISTS (
@@ -299,11 +315,24 @@ BEGIN
       AND conname = 'ck_cajas_cierres_monto_teorico'
       AND NOT convalidated
   ) THEN
-    ALTER TABLE public.cajas_cierres VALIDATE CONSTRAINT ck_cajas_cierres_monto_teorico;
+    BEGIN
+      ALTER TABLE public.cajas_cierres VALIDATE CONSTRAINT ck_cajas_cierres_monto_teorico;
+    EXCEPTION WHEN OTHERS THEN
+      RAISE EXCEPTION USING
+        ERRCODE = SQLSTATE,
+        MESSAGE = FORMAT('Fallo VALIDATE CONSTRAINT public.cajas_cierres.ck_cajas_cierres_monto_teorico: %s', SQLERRM);
+    END;
   END IF;
 END
 $validate_cierres$;
+COMMIT;
+-- PHASE_2_VALIDATE_CAJAS_CIERRES_END
 
+-- PHASE_2_VALIDATE_CAJAS_ARQUEOS_BEGIN
+BEGIN;
+SET LOCAL lock_timeout = '1s';
+SET LOCAL statement_timeout = '20s';
+SET LOCAL idle_in_transaction_session_timeout = '20s';
 DO $validate_arqueos$
 BEGIN
   IF EXISTS (
@@ -312,7 +341,15 @@ BEGIN
       AND conname = 'ck_cajas_arqueos_teorico'
       AND NOT convalidated
   ) THEN
-    ALTER TABLE public.cajas_arqueos VALIDATE CONSTRAINT ck_cajas_arqueos_teorico;
+    BEGIN
+      ALTER TABLE public.cajas_arqueos VALIDATE CONSTRAINT ck_cajas_arqueos_teorico;
+    EXCEPTION WHEN OTHERS THEN
+      RAISE EXCEPTION USING
+        ERRCODE = SQLSTATE,
+        MESSAGE = FORMAT('Fallo VALIDATE CONSTRAINT public.cajas_arqueos.ck_cajas_arqueos_teorico: %s', SQLERRM);
+    END;
   END IF;
 END
 $validate_arqueos$;
+COMMIT;
+-- PHASE_2_VALIDATE_CAJAS_ARQUEOS_END

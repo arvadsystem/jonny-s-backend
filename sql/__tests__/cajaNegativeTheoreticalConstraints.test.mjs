@@ -153,6 +153,15 @@ describe('monto teorico negativo en cierre de caja', () => {
     assert.match(rollbackSource, /VALIDATE CONSTRAINT ck_cajas_sesiones_monto_teorico/);
     assert.match(rollbackSource, /VALIDATE CONSTRAINT ck_cajas_cierres_monto_teorico/);
     assert.match(rollbackSource, /VALIDATE CONSTRAINT ck_cajas_arqueos_teorico/);
+    assert.equal((rollbackSource.match(/SET LOCAL lock_timeout = '1s';/g) || []).length, 4);
+    assert.equal((rollbackSource.match(/SET LOCAL statement_timeout = '20s';/g) || []).length, 4);
+    assert.equal((rollbackSource.match(/SET LOCAL idle_in_transaction_session_timeout = '20s';/g) || []).length, 4);
+    assert.match(rollbackSource, /PHASE_2_VALIDATE_CAJAS_SESIONES_BEGIN/);
+    assert.match(rollbackSource, /PHASE_2_VALIDATE_CAJAS_CIERRES_BEGIN/);
+    assert.match(rollbackSource, /PHASE_2_VALIDATE_CAJAS_ARQUEOS_BEGIN/);
+    assert.match(rollbackSource, /Fallo VALIDATE CONSTRAINT public\.cajas_sesiones\.ck_cajas_sesiones_monto_teorico/);
+    assert.match(rollbackSource, /Fallo VALIDATE CONSTRAINT public\.cajas_cierres\.ck_cajas_cierres_monto_teorico/);
+    assert.match(rollbackSource, /Fallo VALIDATE CONSTRAINT public\.cajas_arqueos\.ck_cajas_arqueos_teorico/);
 
     // Fase 1 (ADD ... NOT VALID) debe estar en un COMMIT anterior al de las
     // fases de VALIDATE CONSTRAINT: evita mantener ACCESS EXCLUSIVE durante
@@ -191,8 +200,11 @@ describe('monto teorico negativo en cierre de caja', () => {
     const end = routerSource.indexOf("router.patch('/ventas/cajas/sesiones/:id/cerrar'", start);
     const closeSource = routerSource.slice(start, end);
 
-    assert.match(closeSource, /montoTeorico = Number\(validationToLink\.total_teorico \|\| 0\)/);
-    assert.match(closeSource, /diferencia = Number\(validationToLink\.diferencia_total \|\| 0\)/);
+    assert.match(closeSource, /const validatedArithmetic = assertCloseValidationMatchesCurrentSummary/);
+    assert.match(closeSource, /montoTeorico = validatedArithmetic\.total_teorico/);
+    assert.match(closeSource, /montoDeclaradoCierre = validatedArithmetic\.total_declarado/);
+    assert.match(closeSource, /diferencia = validatedArithmetic\.diferencia_total/);
+    assert.match(closeSource, /total_teorico, total_declarado, diferencia_total, hay_diferencia/);
     assert.match(closeSource, /PENDIENTE_REVISION/);
     assert.match(closeSource, /createCajaCloseEmailNotification\(client/);
     assert.match(closeSource, /requiresAudit/);
@@ -205,6 +217,7 @@ describe('monto teorico negativo en cierre de caja', () => {
     const assertSource = routerSource.slice(start, end);
 
     assert.match(assertSource, /buildExpectedOtroValidationRow/);
+    assert.match(assertSource, /assertCloseValidationArithmeticIntegrity/);
     assert.match(assertSource, /const storedByCode = new Map/);
     assert.match(assertSource, /const rowsForCode = storedByCode\.get\(code\) \|\| \[\]/);
     assert.match(assertSource, /methodRows\.length !== 1/);

@@ -22,6 +22,7 @@ import {
   reactivateFailedCajaCloseEmailNotification
 } from '../services/cajaCloseEmailOutboxService.js';
 import {
+  assertCloseValidationArithmeticIntegrity,
   assertCoreCatalogValid,
   buildSegmentedArqueoComputation as buildSegmentedArqueoComputationFromSnapshot,
   fingerprintValuesEqual,
@@ -772,8 +773,14 @@ const assertCloseValidationMatchesCurrentSummary = ({
   validation,
   validationMethods,
   currentSummary,
-  currentFingerprint
+  currentFingerprint,
+  threshold
 }) => {
+  const validatedArithmetic = assertCloseValidationArithmeticIntegrity({
+    validation,
+    validationMethods,
+    threshold
+  });
   assertCoreCatalogValid(currentSummary?.catalogValidation, {
     errorCode: 'VENTAS_CAJAS_CLOSE_VALIDATION_STALE',
     publicMessage: 'El catalogo de metodos de pago cambio despues de validar el cierre. Debe realizar una nueva revision.'
@@ -869,6 +876,7 @@ const assertCloseValidationMatchesCurrentSummary = ({
   }
 
   assertOperationalFingerprintMatches({ validation, currentFingerprint });
+  return validatedArithmetic;
 };
 
 const getScopeContext = async (req, client, requestedSucursalId = null, allowGlobal = false) => {
@@ -4993,7 +5001,7 @@ const closeSessionHandler = async (req, res) => {
     const validationResult = await client.query(
       `
         SELECT id_validacion_cierre, id_cierre_caja
-             , total_teorico, total_declarado, diferencia_total, resultado_json
+             , total_teorico, total_declarado, diferencia_total, hay_diferencia, resultado_json
         FROM public.cajas_cierres_validaciones
         WHERE id_validacion_cierre = $1
           AND id_sesion_caja = $2
@@ -5023,15 +5031,16 @@ const closeSessionHandler = async (req, res) => {
     if (validationMethodsResult.rowCount === 0) {
       throw createCajaError(409, 'VENTAS_CAJAS_VALIDACION_CIERRE_INCOMPLETA', 'La validacion de cierre no tiene detalle por metodo.');
     }
-    assertCloseValidationMatchesCurrentSummary({
+    const validatedArithmetic = assertCloseValidationMatchesCurrentSummary({
       validation,
       validationMethods: validationMethodsResult.rows,
       currentSummary: snapshot,
-      currentFingerprint
+      currentFingerprint,
+      threshold: CLOSE_DIFFERENCE_THRESHOLD
     });
-    montoTeorico = Number(validationToLink.total_teorico || 0);
-    montoDeclaradoCierre = Number(validationToLink.total_declarado || 0);
-    diferencia = Number(validationToLink.diferencia_total || 0);
+    montoTeorico = validatedArithmetic.total_teorico;
+    montoDeclaradoCierre = validatedArithmetic.total_declarado;
+    diferencia = validatedArithmetic.diferencia_total;
     arqueosPersistir = validationMethodsResult.rows.map((row) => {
       const methodCode = normalizeMethodCode(row.metodo_pago_codigo);
       return {

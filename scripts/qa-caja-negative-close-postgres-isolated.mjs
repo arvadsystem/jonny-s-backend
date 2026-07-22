@@ -2,6 +2,12 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import process from 'node:process';
 import pg from 'pg';
+import {
+  assertIsolatedDatabaseServerAndMarker,
+  assertIsolatedDatabaseUrlAllowed
+} from '../services/cajaCloseIsolatedDatabaseGuard.js';
+import { assertCoreCatalogValid } from '../services/cajaCloseComputationService.js';
+import { loadCajaCloseFinancialSnapshot } from '../services/cajaCloseFinancialSnapshotService.js';
 
 const SAFE_PATH = new URL('../sql/20260720_allow_negative_cash_close_theoretical_SAFE.sql', import.meta.url);
 const ROLLBACK_PATH = new URL('../sql/20260720_allow_negative_cash_close_theoretical_ROLLBACK.sql', import.meta.url);
@@ -40,10 +46,17 @@ const initializeSchema = async (queryRunner) => {
     DROP SCHEMA IF EXISTS public CASCADE;
     CREATE SCHEMA public;
 
+    CREATE TABLE public.__jonnys_disposable_test_database (
+      purpose text PRIMARY KEY
+    );
+    INSERT INTO public.__jonnys_disposable_test_database (purpose)
+    VALUES ('CAJA_CLOSE_ISOLATED_TEST');
+
     CREATE TABLE public.cajas_sesiones (
       id_sesion_caja bigint PRIMARY KEY,
       monto_teorico_cierre numeric(14,2),
       marca text,
+      monto_apertura numeric(14,2) NOT NULL DEFAULT 0,
       CONSTRAINT ck_cajas_sesiones_monto_teorico
         CHECK (monto_teorico_cierre IS NULL OR monto_teorico_cierre >= 0)
     );
@@ -72,6 +85,17 @@ const initializeSchema = async (queryRunner) => {
       CONSTRAINT ck_cajas_arqueos_contado CHECK (monto_contado >= 0)
     );
 
+    CREATE TABLE public.cat_metodos_pago (
+      id_metodo_pago integer PRIMARY KEY,
+      codigo text NOT NULL,
+      estado boolean NOT NULL DEFAULT true,
+      afecta_efectivo boolean
+    );
+    CREATE TABLE public.cat_cajas_movimientos_tipos (
+      id_tipo_movimiento_caja integer PRIMARY KEY,
+      codigo text NOT NULL,
+      signo integer NOT NULL
+    );
     CREATE TABLE public.facturas (id_factura bigint PRIMARY KEY);
     CREATE TABLE public.detalle_facturas (
       id_detalle_factura bigint PRIMARY KEY,
@@ -79,12 +103,34 @@ const initializeSchema = async (queryRunner) => {
     );
     CREATE TABLE public.facturas_cobros (
       id_factura_cobro bigint PRIMARY KEY,
-      monto numeric(14,2) NOT NULL
+      monto numeric(14,2) NOT NULL,
+      id_factura bigint,
+      id_sesion_caja bigint,
+      id_metodo_pago integer
+    );
+    CREATE TABLE public.facturas_reversiones (
+      id_reversion bigint PRIMARY KEY,
+      id_factura_original bigint NOT NULL,
+      id_sesion_caja_original bigint,
+      monto_reversado numeric(14,2) NOT NULL,
+      estado text NOT NULL
     );
     CREATE TABLE public.pedidos (id_pedido bigint PRIMARY KEY);
-    CREATE TABLE public.cajas_movimientos (id_movimiento_caja bigint PRIMARY KEY);
+    CREATE TABLE public.cajas_movimientos (
+      id_movimiento_caja bigint PRIMARY KEY,
+      id_sesion_caja bigint,
+      id_tipo_movimiento_caja integer,
+      monto numeric(14,2)
+    );
 
-    INSERT INTO public.cajas_sesiones VALUES (1, 10, 'BASE');
+    INSERT INTO public.cat_metodos_pago (id_metodo_pago, codigo, estado, afecta_efectivo) VALUES
+      (1, 'EFECTIVO', true, true),
+      (2, 'TARJETA', true, false),
+      (3, 'TRANSFERENCIA', true, false),
+      (4, 'OTRO', true, false);
+    INSERT INTO public.cat_cajas_movimientos_tipos VALUES (1, 'APERTURA', 1);
+    INSERT INTO public.cajas_sesiones (id_sesion_caja, monto_teorico_cierre, marca, monto_apertura)
+    VALUES (1, 10, 'BASE', 10);
     INSERT INTO public.cajas_cierres VALUES (1, 10, 'BASE');
     INSERT INTO public.cajas_arqueos (
       id_arqueo_caja, id_sesion_caja, id_caja, id_sucursal, id_usuario,
@@ -92,7 +138,7 @@ const initializeSchema = async (queryRunner) => {
     ) VALUES (1, 1, 1, 1, 1, NOW(), 10, 10);
     INSERT INTO public.facturas VALUES (1);
     INSERT INTO public.detalle_facturas VALUES (1, 123.45);
-    INSERT INTO public.facturas_cobros VALUES (1, 123.45);
+    INSERT INTO public.facturas_cobros (id_factura_cobro, monto) VALUES (1, 123.45);
     INSERT INTO public.pedidos VALUES (1);
     INSERT INTO public.cajas_movimientos VALUES (1);
   `);
@@ -343,15 +389,252 @@ const testInjectedFailureRestoration = async (client, safeSql) => {
   return { initialState: '101', deliberateFailureObserved, restoredExactly: true };
 };
 
+const extractMarkedSql = (sql, markerName) => {
+  const startMarker = `-- ${markerName}_BEGIN`;
+  const endMarker = `-- ${markerName}_END`;
+  const start = sql.indexOf(startMarker);
+  const end = sql.indexOf(endMarker);
+  assert.ok(start >= 0 && end > start, `No se encontro el bloque SQL ${markerName}`);
+  return sql.slice(start + startMarker.length, end).trim();
+};
+
+const testRollbackValidateLock = async (pool, rollbackSql) => {
+  const locker = await pool.connect();
+  const runner = await pool.connect();
+  let lockReleased = false;
+  try {
+    await setCombination(runner, '000');
+    await runner.query(`
+      ALTER TABLE public.cajas_sesiones
+      ADD CONSTRAINT ck_cajas_sesiones_monto_teorico
+      CHECK (monto_teorico_cierre IS NULL OR monto_teorico_cierre >= 0) NOT VALID
+    `);
+    await locker.query('BEGIN');
+    await locker.query('LOCK TABLE public.cajas_sesiones IN ACCESS EXCLUSIVE MODE');
+    const validateSql = extractMarkedSql(rollbackSql, 'PHASE_2_VALIDATE_CAJAS_SESIONES');
+    const started = process.hrtime.bigint();
+    const error = await expectFailure(runner, validateSql, (candidate) => candidate.code === '55P03');
+    const elapsedMs = Number(process.hrtime.bigint() - started) / 1_000_000;
+    assert.match(error.message, /ck_cajas_sesiones_monto_teorico/);
+    assert.ok(elapsedMs >= 900 && elapsedMs < 1500, `VALIDATE lock_timeout tardo ${elapsedMs.toFixed(3)}ms`);
+    await locker.query('ROLLBACK');
+    lockReleased = true;
+    const state = await constraintSnapshot(runner);
+    assert.equal(state[0].presente, true);
+    assert.equal(state[0].convalidated, false);
+    await setLegacyState(runner);
+    return { sqlstate: error.code, elapsedMs: Number(elapsedMs.toFixed(3)), constraint: TARGETS[0].name };
+  } finally {
+    if (!lockReleased) await locker.query('ROLLBACK').catch(() => {});
+    locker.release();
+    runner.release();
+  }
+};
+
+const testIsolatedCatalogMutations = async (client) => {
+  await client.query('BEGIN');
+  try {
+    await client.query(`
+      INSERT INTO public.cajas_sesiones (id_sesion_caja, monto_teorico_cierre, marca, monto_apertura)
+      VALUES (8001, NULL, 'CATALOG_TEST', 0)
+    `);
+    const baseline = await loadCajaCloseFinancialSnapshot({ queryRunner: client, idSesionCaja: '8001' });
+    assertCoreCatalogValid(baseline.catalogValidation);
+
+    const inactive = [];
+    for (const code of ['EFECTIVO', 'TARJETA', 'TRANSFERENCIA', 'OTRO']) {
+      await client.query('SAVEPOINT catalog_case');
+      await client.query('UPDATE public.cat_metodos_pago SET estado=false WHERE codigo=$1', [code]);
+      const changed = await loadCajaCloseFinancialSnapshot({ queryRunner: client, idSesionCaja: '8001' });
+      assert.equal(changed.catalogValidation[code].valido, false);
+      assert.equal(changed.catalogValidation[code].motivo, 'INACTIVO');
+      inactive.push(code);
+      await client.query('ROLLBACK TO SAVEPOINT catalog_case');
+      await client.query('RELEASE SAVEPOINT catalog_case');
+    }
+
+    await client.query('SAVEPOINT classification_case');
+    await client.query("UPDATE public.cat_metodos_pago SET afecta_efectivo=true WHERE codigo='TARJETA'");
+    const misclassified = await loadCajaCloseFinancialSnapshot({ queryRunner: client, idSesionCaja: '8001' });
+    assert.equal(misclassified.catalogValidation.TARJETA.motivo, 'AFECTA_EFECTIVO_INCORRECTO');
+    await client.query('ROLLBACK TO SAVEPOINT classification_case');
+    await client.query('RELEASE SAVEPOINT classification_case');
+
+    await client.query('SAVEPOINT id_swap_case');
+    await client.query("UPDATE public.cat_metodos_pago SET codigo='TEMP_T' WHERE codigo='TARJETA'");
+    await client.query("UPDATE public.cat_metodos_pago SET codigo='TARJETA' WHERE codigo='OTRO'");
+    await client.query("UPDATE public.cat_metodos_pago SET codigo='OTRO' WHERE codigo='TEMP_T'");
+    const swapped = await loadCajaCloseFinancialSnapshot({ queryRunner: client, idSesionCaja: '8001' });
+    assert.notEqual(swapped.catalogValidation.TARJETA.id_metodo_pago, baseline.catalogValidation.TARJETA.id_metodo_pago);
+    assert.notEqual(swapped.fingerprint.catalogo_tarjeta, baseline.fingerprint.catalogo_tarjeta);
+    await client.query('ROLLBACK TO SAVEPOINT id_swap_case');
+    await client.query('RELEASE SAVEPOINT id_swap_case');
+
+    const duplicates = [];
+    for (const [index, code] of ['EFECTIVO', 'TARJETA', 'TRANSFERENCIA', 'OTRO'].entries()) {
+      await client.query('SAVEPOINT duplicate_case');
+      const expectedCash = code === 'EFECTIVO';
+      await client.query(
+        'INSERT INTO public.cat_metodos_pago (id_metodo_pago,codigo,estado,afecta_efectivo) VALUES ($1,$2,true,$3)',
+        [100 + index, code, expectedCash]
+      );
+      const duplicated = await loadCajaCloseFinancialSnapshot({ queryRunner: client, idSesionCaja: '8001' });
+      assert.equal(duplicated.catalogValidation[code].coincidencias, 2);
+      assert.equal(duplicated.catalogValidation[code].motivo, 'CODIGO_DUPLICADO');
+      duplicates.push(code);
+      await client.query('ROLLBACK TO SAVEPOINT duplicate_case');
+      await client.query('RELEASE SAVEPOINT duplicate_case');
+    }
+    return { inactive, classificationChanged: true, idSwapDetected: true, duplicates };
+  } finally {
+    await client.query('ROLLBACK');
+  }
+};
+
+const testRealReversionAttribution = async (client) => {
+  await client.query('BEGIN');
+  const scenarioResults = [];
+  let scenarioIndex = 0;
+  const runScenario = async (name, callback) => {
+    scenarioIndex += 1;
+    const savepoint = `reversion_case_${scenarioIndex}`;
+    await client.query(`SAVEPOINT ${savepoint}`);
+    try {
+      await callback();
+      scenarioResults.push(name);
+    } finally {
+      await client.query(`ROLLBACK TO SAVEPOINT ${savepoint}`);
+      await client.query(`RELEASE SAVEPOINT ${savepoint}`);
+    }
+  };
+  const insertPayment = (id, invoiceId, sessionId, methodId, amount) => client.query(`
+    INSERT INTO public.facturas_cobros
+      (id_factura_cobro, monto, id_factura, id_sesion_caja, id_metodo_pago)
+    VALUES ($1,$2,$3,$4,$5)
+  `, [id, amount, invoiceId, sessionId, methodId]);
+  const insertReversion = (id, invoiceId, originalSessionId, amount) => client.query(`
+    INSERT INTO public.facturas_reversiones
+      (id_reversion,id_factura_original,id_sesion_caja_original,monto_reversado,estado)
+    VALUES ($1,$2,$3,$4,'APLICADA')
+  `, [id, invoiceId, originalSessionId, amount]);
+  try {
+    await client.query(`
+      INSERT INTO public.cajas_sesiones (id_sesion_caja,monto_teorico_cierre,marca,monto_apertura)
+      VALUES (8101,NULL,'REV_A',0),(8102,NULL,'REV_B',0)
+    `);
+
+    await runScenario('una_sesion_reversion_parcial', async () => {
+      await client.query('INSERT INTO public.facturas VALUES (81001)');
+      await insertPayment(81101, 81001, 8101, 1, 100);
+      await insertReversion(81201, 81001, 8101, 40);
+      const snapshot = await loadCajaCloseFinancialSnapshot({ queryRunner: client, idSesionCaja: '8101' });
+      assert.equal(snapshot.reversionsByCode.get('EFECTIVO'), 40);
+      assert.equal(snapshot.salesNetByCode.get('EFECTIVO'), 60);
+    });
+
+    await runScenario('una_sesion_reversion_total', async () => {
+      await client.query('INSERT INTO public.facturas VALUES (81002)');
+      await insertPayment(81102, 81002, 8101, 2, 100);
+      await insertReversion(81202, 81002, 8101, 100);
+      const snapshot = await loadCajaCloseFinancialSnapshot({ queryRunner: client, idSesionCaja: '8101' });
+      assert.equal(snapshot.reversionsByCode.get('TARJETA'), 100);
+      assert.equal(snapshot.salesNetByCode.get('TARJETA'), 0);
+    });
+
+    await runScenario('dos_sesiones_original_definida', async () => {
+      await client.query('INSERT INTO public.facturas VALUES (81003)');
+      await insertPayment(81103, 81003, 8101, 1, 60);
+      await insertPayment(81104, 81003, 8102, 2, 40);
+      await insertReversion(81203, 81003, 8101, 50);
+      const original = await loadCajaCloseFinancialSnapshot({ queryRunner: client, idSesionCaja: '8101' });
+      const other = await loadCajaCloseFinancialSnapshot({ queryRunner: client, idSesionCaja: '8102' });
+      assert.equal(original.reversionsByCode.get('EFECTIVO'), 50);
+      assert.equal(other.fingerprint.cantidad_reversiones, 0);
+    });
+
+    await runScenario('dos_sesiones_original_null_ambigua', async () => {
+      await client.query('INSERT INTO public.facturas VALUES (81004)');
+      await insertPayment(81105, 81004, 8101, 1, 60);
+      await insertPayment(81106, 81004, 8102, 2, 40);
+      await insertReversion(81204, 81004, null, 50);
+      await assert.rejects(
+        loadCajaCloseFinancialSnapshot({ queryRunner: client, idSesionCaja: '8101' }),
+        (error) => error.code === 'VENTAS_CAJAS_REVERSION_SESSION_AMBIGUOUS'
+          && error.httpStatus === 409
+          && error.details.sesiones.join(',') === '8101,8102'
+      );
+    });
+
+    await runScenario('dos_metodos_misma_sesion', async () => {
+      await client.query('INSERT INTO public.facturas VALUES (81005)');
+      await insertPayment(81107, 81005, 8101, 1, 60);
+      await insertPayment(81108, 81005, 8101, 2, 40);
+      await insertReversion(81205, 81005, 8101, 50);
+      const snapshot = await loadCajaCloseFinancialSnapshot({ queryRunner: client, idSesionCaja: '8101' });
+      assert.equal(snapshot.reversionsByCode.get('EFECTIVO'), 30);
+      assert.equal(snapshot.reversionsByCode.get('TARJETA'), 20);
+      assert.equal([...snapshot.reversionsByCode.values()].reduce((sum, value) => sum + value, 0), 50);
+    });
+
+    await runScenario('redondeo_proporcional', async () => {
+      await client.query('INSERT INTO public.facturas VALUES (81006)');
+      await insertPayment(81109, 81006, 8101, 2, 33.33);
+      await insertPayment(81110, 81006, 8101, 3, 66.66);
+      await insertReversion(81206, 81006, 8101, 50);
+      const snapshot = await loadCajaCloseFinancialSnapshot({ queryRunner: client, idSesionCaja: '8101' });
+      assert.equal(snapshot.reversionsByCode.get('TARJETA'), 16.67);
+      assert.equal(snapshot.reversionsByCode.get('TRANSFERENCIA'), 33.33);
+    });
+
+    await runScenario('reversion_superior_al_neto', async () => {
+      await client.query('INSERT INTO public.facturas VALUES (81007)');
+      await insertPayment(81111, 81007, 8101, 1, 100);
+      await insertReversion(81207, 81007, 8101, 150);
+      const snapshot = await loadCajaCloseFinancialSnapshot({ queryRunner: client, idSesionCaja: '8101' });
+      assert.equal(snapshot.salesNetByCode.get('EFECTIVO'), -50);
+      assert.equal(snapshot.fingerprint.total_reversado, 150);
+    });
+
+    await runScenario('ninguna_reversion_contabilizada_dos_veces', async () => {
+      await client.query('INSERT INTO public.facturas VALUES (81008)');
+      await insertPayment(81112, 81008, 8101, 1, 75);
+      await insertPayment(81113, 81008, 8102, 2, 25);
+      await insertReversion(81208, 81008, 8101, 60);
+      const firstSession = await loadCajaCloseFinancialSnapshot({ queryRunner: client, idSesionCaja: '8101' });
+      const secondSession = await loadCajaCloseFinancialSnapshot({ queryRunner: client, idSesionCaja: '8102' });
+      assert.equal(firstSession.fingerprint.total_reversado, 60);
+      assert.equal(secondSession.fingerprint.total_reversado, 0);
+      assert.equal(
+        firstSession.fingerprint.total_reversado + secondSession.fingerprint.total_reversado,
+        60
+      );
+    });
+
+    return { scenarios: scenarioResults, noDoubleCounting: true };
+  } finally {
+    await client.query('ROLLBACK');
+  }
+};
+
 export const runIsolatedPostgresMigrationSuite = async ({
   connectionString = process.env.CAJA_CLOSE_ISOLATED_DATABASE_URL,
   injectFailureAfterSafe = false,
   leaveSafeApplied = false
 } = {}) => {
-  if (!connectionString) throw new Error('CAJA_CLOSE_ISOLATED_DATABASE_URL es obligatorio.');
+  // Esta politica se evalua antes de abrir una conexion. Aunque alguien
+  // suministre accidentalmente una URL real, el harness no alcanza ningun
+  // DDL si el host, project ref, nombre o opt-in destructivo no son validos.
+  const expectedTarget = assertIsolatedDatabaseUrlAllowed({ connectionString });
   const pool = createPool(connectionString);
   const client = await pool.connect();
   try {
+    // Segunda barrera contra URLs redirigidas, aliases o bases incorrectas:
+    // PostgreSQL debe confirmar identidad, direccion y marcador desechable
+    // antes de que initializeSchema pueda ejecutar DROP SCHEMA.
+    const destructiveTarget = await assertIsolatedDatabaseServerAndMarker({
+      queryRunner: client,
+      expectedTarget
+    });
     const [safeSql, rollbackSql] = await Promise.all([
       readFile(SAFE_PATH, 'utf8'),
       readFile(ROLLBACK_PATH, 'utf8')
@@ -387,7 +670,10 @@ export const runIsolatedPostgresMigrationSuite = async ({
     const wrongDefinitions = await testWrongTargetDefinitions(client, safeSql);
     const combinations = await testEightCombinations(client, safeSql);
     const rollback = await testRollback(client, rollbackSql);
+    const rollbackValidateLock = await testRollbackValidateLock(pool, rollbackSql);
     const injectedFailure = await testInjectedFailureRestoration(client, safeSql);
+    const catalogMutations = await testIsolatedCatalogMutations(client);
+    const reversionAttribution = await testRealReversionAttribution(client);
 
     if (injectFailureAfterSafe) {
       assert.equal(injectedFailure.deliberateFailureObserved, true);
@@ -404,6 +690,7 @@ export const runIsolatedPostgresMigrationSuite = async ({
 
     return {
       postgresVersion: (await client.query("SELECT current_setting('server_version') AS version")).rows[0].version,
+      destructiveTarget,
       attnums: Object.fromEntries(attnums.rows.map((row) => [row.attname, Number(row.attnum)])),
       safeLegacy: true,
       safeRepeated: true,
@@ -412,7 +699,10 @@ export const runIsolatedPostgresMigrationSuite = async ({
       wrongDefinitions,
       combinations,
       rollback,
+      rollbackValidateLock,
       injectedFailure,
+      catalogMutations,
+      reversionAttribution,
       zeroBusinessDml: true,
       metricsBefore,
       metricsAfter: await regressionMetrics(client)

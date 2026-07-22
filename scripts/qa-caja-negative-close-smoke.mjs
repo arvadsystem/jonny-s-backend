@@ -17,10 +17,36 @@ import {
   getUserAuthzSnapshot
 } from '../utils/security/authTokenPayload.js';
 import { issueAccessToken } from '../utils/security/accessTokenPolicy.js';
-import { runIsolatedPostgresMigrationSuite } from './qa-caja-negative-close-postgres-isolated.mjs';
+import { assertQaSharedPaymentCatalogWriteForbidden } from '../services/cajaCloseIsolatedDatabaseGuard.js';
 
 const QA_PROJECT_REF = 'cluideiojeikzcmmizhe';
 const VERIFY_PATH = new URL('../sql/20260720_allow_negative_cash_close_theoretical_VERIFY.sql', import.meta.url);
+const QA_CATALOG_GUARD_INSTALLED = Symbol.for('jonnys.qaCajaCatalogGuardInstalled');
+
+const installQaSharedPaymentCatalogWriteGuard = () => {
+  const protectClient = (client) => {
+    if (!client || client[QA_CATALOG_GUARD_INSTALLED]) return client;
+    const originalQuery = client.query.bind(client);
+    client.query = (query, ...args) => {
+      assertQaSharedPaymentCatalogWriteForbidden(query);
+      return originalQuery(query, ...args);
+    };
+    Object.defineProperty(client, QA_CATALOG_GUARD_INSTALLED, { value: true });
+    return client;
+  };
+
+  if (!pool[QA_CATALOG_GUARD_INSTALLED]) {
+    pool.on('connect', protectClient);
+    const originalPoolQuery = pool.query.bind(pool);
+    pool.query = (query, ...args) => {
+      assertQaSharedPaymentCatalogWriteForbidden(query);
+      return originalPoolQuery(query, ...args);
+    };
+    const originalPoolConnect = pool.connect.bind(pool);
+    pool.connect = async (...args) => protectClient(await originalPoolConnect(...args));
+    Object.defineProperty(pool, QA_CATALOG_GUARD_INSTALLED, { value: true });
+  }
+};
 
 // Usuario QA real con rol SUPER_ADMIN, resuelto dinamicamente (nunca un ID
 // hardcodeado): usado unicamente para firmar una sesion de prueba
@@ -41,9 +67,6 @@ const resolveQaHttpTestUser = async (client) => {
   assert.ok(idUsuario, 'No se encontro un usuario SUPER_ADMIN activo en QA para firmar la sesion de prueba HTTP.');
   return idUsuario;
 };
-
-const LEAVE_SAFE_APPLIED = process.argv.includes('--leave-safe-applied');
-const INJECT_FAILURE_AFTER_SAFE = process.argv.includes('--inject-failure-after-safe');
 
 const assertQaTarget = () => {
   if (process.env.QA_CAJAS_NEGATIVE_CLOSE_SMOKE !== 'true') {
@@ -269,455 +292,6 @@ const insertPayment = async (client, {
   ]);
 };
 
-const runTransactionalFinancialSmoke = async () => {
-  const client = await pool.connect();
-  const baseId = 8_000_000_000_000 + (Date.now() % 100_000_000);
-  const salesSessionId = baseId;
-  const negativeSessionId = baseId + 1;
-  const closeId = baseId + 2;
-  const validationId = baseId + 3;
-  const outboxId = baseId + 4;
-  const arqueoId = baseId + 5;
-  let rolledBack = false;
-  try {
-    await client.query('BEGIN');
-    await client.query("SET LOCAL statement_timeout = '120s'");
-    const references = await loadSmokeReferences(client);
-
-    await insertSession(client, {
-      idSesionCaja: salesSessionId,
-      references,
-      estado: references.estado_abierta,
-      montoApertura: 0,
-      closed: false
-    });
-    const salesFixtureReference = `QAC${baseId}`;
-    const salesInvoice = await insertSyntheticInvoice(client, {
-      idSesionCaja: salesSessionId,
-      references,
-      fixtureReference: salesFixtureReference
-    });
-    for (const [index, [methodCode, amount]] of [
-      ['EFECTIVO', 100],
-      ['TARJETA', 200],
-      ['TRANSFERENCIA', 300],
-      ['OTRO', 400]
-    ].entries()) {
-      await insertPayment(client, {
-        idFacturaCobro: baseId + 100 + index,
-        idFactura: salesInvoice.idFactura,
-        idSesionCaja: salesSessionId,
-        references,
-        methodCode,
-        amount,
-        fixtureReference: salesFixtureReference
-      });
-    }
-
-    const salesSnapshot = await loadCajaCloseFinancialSnapshot({
-      queryRunner: client,
-      idSesionCaja: salesSessionId
-    });
-    assert.equal(salesSnapshot.ventasEfectivoNetas, 100);
-    assert.equal(salesSnapshot.ventasNoEfectivoNetas, 900);
-    assert.equal(salesSnapshot.totalTeorico, 1000);
-    assert.equal(salesSnapshot.fingerprint.ventas_no_efectivo_netas, 900);
-    const salesComputation = buildSegmentedArqueoComputation({
-      snapshot: salesSnapshot,
-      payloadRows: [
-        { metodo_pago_codigo: 'EFECTIVO', monto_declarado: 100 },
-        { metodo_pago_codigo: 'TARJETA', monto_declarado: 200, cantidad_referencias: 1 },
-        { metodo_pago_codigo: 'TRANSFERENCIA', monto_declarado: 300, cantidad_referencias: 1 }
-      ],
-      threshold: 0,
-      requireObservacionOnDifference: false
-    });
-    // Caso obligatorio: OTRO (400) debe aparecer como fila unica agrupada
-    // OTRO (codigo tecnico persistido; "Otros no efectivo" es solo la
-    // etiqueta de presentacion), no perderse dentro del total declarado.
-    assert.equal(salesComputation.rows.length, 4);
-    const otrosRow = salesComputation.rows.find((row) => row.metodo_pago_codigo === 'OTRO');
-    assert.ok(otrosRow, 'debe existir la fila OTRO');
-    assert.equal(otrosRow.display_name, 'Otros no efectivo');
-    assert.equal(otrosRow.monto_teorico, 400);
-    assert.equal(otrosRow.monto_declarado, 400);
-    assert.equal(otrosRow.diferencia, 0);
-    assert.equal(otrosRow.completado_automaticamente, true);
-    assert.equal(otrosRow.requiere_revision, false);
-    // Ancla FK real (fk_ccam_metodo es NOT NULL): un metodo real del catalogo,
-    // no un sentinel ni null.
-    assert.ok(Number.isInteger(otrosRow.id_metodo_pago) && otrosRow.id_metodo_pago > 0);
-    assert.equal(salesComputation.monto_teorico_total, 1000);
-    assert.equal(salesComputation.monto_declarado_total, 1000);
-    assert.equal(salesComputation.diferencia_total, 0);
-    const sumDeclarado = salesComputation.rows.reduce((sum, row) => sum + row.monto_declarado, 0);
-    const sumTeorico = salesComputation.rows.reduce((sum, row) => sum + row.monto_teorico, 0);
-    assert.equal(sumDeclarado, salesComputation.monto_declarado_total);
-    assert.equal(sumTeorico, salesComputation.monto_teorico_total);
-    assert.equal(
-      salesComputation.rows.filter((row) => row.metodo_pago_codigo === 'TARJETA').length,
-      1,
-      'TARJETA no debe duplicarse'
-    );
-    assert.equal(
-      salesComputation.rows.filter((row) => row.metodo_pago_codigo === 'TRANSFERENCIA').length,
-      1,
-      'TRANSFERENCIA no debe duplicarse'
-    );
-
-    // Caso limite: metodo no efectivo neto negativo (p. ej. reversion de otra
-    // sesion). monto_declarado nunca debe quedar negativo (CHECK >=0 fuera de
-    // alcance) y el cierre no debe bloquearse ni lanzar.
-    const negativeOtrosComputation = buildSegmentedArqueoComputation({
-      snapshot: {
-        ...salesSnapshot,
-        otrosNoEfectivo: {
-          ...salesSnapshot.otrosNoEfectivo,
-          ventas_brutas: 400,
-          reversiones: 500,
-          ventas_netas: -100
-        }
-      },
-      payloadRows: [
-        { metodo_pago_codigo: 'EFECTIVO', monto_declarado: 100 },
-        { metodo_pago_codigo: 'TARJETA', monto_declarado: 200, cantidad_referencias: 1 },
-        { metodo_pago_codigo: 'TRANSFERENCIA', monto_declarado: 300, cantidad_referencias: 1 }
-      ],
-      threshold: 0,
-      requireObservacionOnDifference: true
-    });
-    const negativeOtrosRow = negativeOtrosComputation.rows.find((row) => row.metodo_pago_codigo === 'OTRO');
-    assert.equal(negativeOtrosRow.monto_teorico, -100);
-    assert.equal(negativeOtrosRow.monto_declarado, 0);
-    assert.ok(negativeOtrosRow.monto_declarado >= 0);
-    // 5.4: residual negativo SI exige revision (a diferencia del diseno
-    // anterior); el cierre no se bloquea, pero queda PENDIENTE_REVISION.
-    assert.equal(negativeOtrosRow.requiere_revision, true);
-    assert.equal(negativeOtrosRow.diferencia, 100);
-    assert.match(negativeOtrosRow.observacion, /Conciliaci.n autom.tica/);
-    assert.equal(negativeOtrosRow.completado_automaticamente, true);
-
-    await client.query('SAVEPOINT metodo_inactivo');
-    await client.query("UPDATE public.cat_metodos_pago SET estado = false WHERE UPPER(TRIM(codigo)) = 'OTRO'");
-    await assert.rejects(
-      loadCajaCloseFinancialSnapshot({ queryRunner: client, idSesionCaja: salesSessionId }),
-      (error) => error.code === 'VENTAS_CAJAS_METODO_PAGO_NO_CONTABILIZABLE'
-    );
-    await client.query('ROLLBACK TO SAVEPOINT metodo_inactivo');
-
-    await client.query(`
-      UPDATE public.cajas_sesiones
-      SET id_estado_sesion_caja = $1,
-          id_usuario_cierre = $2,
-          fecha_cierre = NOW()
-      WHERE id_sesion_caja = $3
-    `, [references.estado_cerrada, references.id_usuario, salesSessionId]);
-
-    await insertSession(client, {
-      idSesionCaja: negativeSessionId,
-      references,
-      estado: references.estado_abierta,
-      montoApertura: 3000
-    });
-    await client.query(`
-      INSERT INTO public.cajas_movimientos (
-        id_movimiento_caja, id_sesion_caja, id_caja, id_sucursal,
-        id_tipo_movimiento_caja, id_usuario_ejecutor, monto,
-        referencia, observacion, fecha_movimiento, fecha_creacion
-      ) OVERRIDING SYSTEM VALUE
-      VALUES
-        ($1, $2, $3, $4, $5, $6, 3000, 'QA_SMOKE_APERTURA', 'QA_SMOKE_CAJA_NEGATIVE_CLOSE', NOW(), NOW()),
-        ($7, $2, $3, $4, $8, $6, 16763, 'QA_SMOKE_EGRESO', 'QA_SMOKE_CAJA_NEGATIVE_CLOSE', NOW(), NOW())
-    `, [
-      baseId + 200,
-      negativeSessionId,
-      references.id_caja,
-      references.id_sucursal,
-      references.tipo_apertura,
-      references.id_usuario,
-      baseId + 201,
-      references.tipo_egreso
-    ]);
-
-    const negativeSnapshot = await loadCajaCloseFinancialSnapshot({
-      queryRunner: client,
-      idSesionCaja: negativeSessionId
-    });
-    assert.equal(negativeSnapshot.montoApertura, 3000);
-    assert.equal(negativeSnapshot.egresosManuales, 16763);
-    assert.equal(negativeSnapshot.efectivoTeorico, -13763);
-    assert.equal(negativeSnapshot.totalTeorico, -13763);
-
-    // Problema 1 a nivel de tabla cajas_arqueos: el endpoint de arqueo puntual
-    // inserta resumen.efectivoTeorico directamente en monto_teorico. Prueba
-    // que, con SAFE aplicado, ya no bloquea valores negativos.
-    const arqueoMontoContado = 0;
-    const arqueoDiferencia = Number((arqueoMontoContado - negativeSnapshot.efectivoTeorico).toFixed(2));
-    await client.query(`
-      INSERT INTO public.cajas_arqueos (
-        id_arqueo_caja, id_sesion_caja, id_caja, id_sucursal, id_tipo_arqueo_caja,
-        id_usuario_ejecutor, monto_teorico, monto_contado, diferencia, observacion,
-        fecha_arqueo, fecha_creacion
-      ) OVERRIDING SYSTEM VALUE
-      VALUES ($1, $2, $3, $4,
-        (SELECT id_tipo_arqueo_caja FROM public.cat_cajas_arqueos_tipos WHERE UPPER(TRIM(codigo)) = 'CIERRE' LIMIT 1),
-        $5, $6, $7, $8, 'QA_SMOKE_CAJA_NEGATIVE_CLOSE', NOW(), NOW())
-    `, [
-      arqueoId,
-      negativeSessionId,
-      references.id_caja,
-      references.id_sucursal,
-      references.id_usuario,
-      negativeSnapshot.efectivoTeorico,
-      arqueoMontoContado,
-      arqueoDiferencia
-    ]);
-    const persistedArqueo = await client.query(
-      'SELECT monto_teorico, diferencia FROM public.cajas_arqueos WHERE id_arqueo_caja = $1',
-      [arqueoId]
-    );
-    assert.equal(Number(persistedArqueo.rows[0].monto_teorico), -13763);
-    assert.equal(Number(persistedArqueo.rows[0].diferencia), 13763);
-
-    const computation = buildSegmentedArqueoComputation({
-      snapshot: negativeSnapshot,
-      payloadRows: [{
-        metodo_pago_codigo: 'EFECTIVO',
-        monto_declarado: 0,
-        observacion: 'QA smoke monto teorico negativo'
-      }],
-      threshold: 0,
-      requireObservacionOnDifference: false
-    });
-    assert.equal(computation.monto_teorico_total, -13763);
-    assert.equal(computation.monto_declarado_total, 0);
-    assert.equal(computation.diferencia_total, 13763);
-    assert.equal(computation.rows.length, 3);
-
-    await client.query(`
-      INSERT INTO public.cajas_cierres_validaciones (
-        id_validacion_cierre, id_sesion_caja, id_caja, id_sucursal,
-        id_usuario_valida, numero_intento, origen, total_teorico,
-        total_declarado, diferencia_total, hay_diferencia,
-        payload_declarado_json, resultado_json, observacion_general,
-        fecha_validacion, fecha_creacion
-      ) VALUES (
-        $1, $2, $3, $4, $5, 1, 'QA_SMOKE', $6, $7, $8, true,
-        $9::jsonb, $10::jsonb, 'QA_SMOKE_CAJA_NEGATIVE_CLOSE', NOW(), NOW()
-      )
-    `, [
-      validationId,
-      negativeSessionId,
-      references.id_caja,
-      references.id_sucursal,
-      references.id_usuario,
-      computation.monto_teorico_total,
-      computation.monto_declarado_total,
-      computation.diferencia_total,
-      JSON.stringify({ arqueos: computation.rows }),
-      JSON.stringify({ huella_operacional: negativeSnapshot.fingerprint })
-    ]);
-
-    for (const [index, row] of computation.rows.entries()) {
-      await client.query(`
-        INSERT INTO public.cajas_cierres_validaciones_metodos (
-          id_validacion_metodo, id_validacion_cierre, id_metodo_pago,
-          metodo_pago_codigo, monto_teorico, monto_declarado, diferencia,
-          cantidad_referencias, resultado, requiere_revision, observacion,
-          fecha_creacion
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW())
-      `, [
-        baseId + 300 + index,
-        validationId,
-        row.id_metodo_pago,
-        row.metodo_pago_codigo,
-        row.monto_teorico,
-        row.monto_declarado,
-        row.diferencia,
-        row.cantidad_referencias,
-        row.resultado,
-        row.requiere_revision,
-        row.observacion
-      ]);
-    }
-
-    await client.query(`
-      INSERT INTO public.cajas_cierres (
-        id_cierre_caja, id_sesion_caja, id_caja, id_sucursal,
-        id_usuario_responsable, id_usuario_cierre,
-        id_resolucion_cierre_caja, fecha_cierre, monto_apertura,
-        monto_ventas_efectivo, monto_ventas_no_efectivo,
-        monto_ingresos_manuales, monto_egresos_manuales,
-        monto_teorico_cierre, monto_declarado_cierre, diferencia,
-        observacion, fecha_creacion
-      ) OVERRIDING SYSTEM VALUE
-      VALUES (
-        $1, $2, $3, $4, $5, $5, $6, NOW(), 3000,
-        0, 0, 0, 16763, -13763, 0, 13763,
-        'QA_SMOKE_CAJA_NEGATIVE_CLOSE', NOW()
-      )
-    `, [
-      closeId,
-      negativeSessionId,
-      references.id_caja,
-      references.id_sucursal,
-      references.id_usuario,
-      references.resolucion_pendiente
-    ]);
-    await client.query(`
-      UPDATE public.cajas_cierres_validaciones
-      SET id_cierre_caja = $1
-      WHERE id_validacion_cierre = $2
-    `, [closeId, validationId]);
-
-    for (const [index, row] of computation.rows.entries()) {
-      await client.query(`
-        INSERT INTO public.cajas_cierres_arqueos_metodos (
-          id_arqueo_metodo, id_cierre_caja, id_sesion_caja, id_caja,
-          id_sucursal, id_metodo_pago, metodo_pago_codigo, monto_teorico,
-          monto_declarado, diferencia, cantidad_referencias, observacion,
-          requiere_revision, completado_automaticamente, fecha_registro,
-          id_usuario_registro
-        ) VALUES (
-          $1, $2, $3, $4, $5, $6, $7, $8,
-          $9, $10, $11, $12, $13, $14, NOW(), $15
-        )
-      `, [
-        baseId + 400 + index,
-        closeId,
-        negativeSessionId,
-        references.id_caja,
-        references.id_sucursal,
-        Number(row.id_metodo_pago) || 0,
-        row.metodo_pago_codigo,
-        row.monto_teorico,
-        row.monto_declarado,
-        row.diferencia,
-        row.cantidad_referencias,
-        row.observacion,
-        row.requiere_revision,
-        row.completado_automaticamente,
-        references.id_usuario
-      ]);
-    }
-
-    await client.query(`
-      UPDATE public.cajas_sesiones
-      SET id_estado_sesion_caja = $1,
-          id_usuario_cierre = $2,
-          fecha_cierre = NOW(),
-          monto_teorico_cierre = -13763,
-          monto_declarado_cierre = 0,
-          diferencia_cierre = 13763,
-          id_resolucion_cierre_caja = $3,
-          observacion_cierre = 'QA_SMOKE_CAJA_NEGATIVE_CLOSE'
-      WHERE id_sesion_caja = $4
-    `, [
-      references.estado_cerrada,
-      references.id_usuario,
-      references.resolucion_pendiente,
-      negativeSessionId
-    ]);
-    await client.query(`
-      INSERT INTO public.cajas_cierres_notificaciones_email (
-        id_notificacion, id_cierre_caja, estado, intentos,
-        email_destino, fecha_creacion, fecha_actualizacion
-      ) VALUES ($1, $2, 'PENDIENTE', 0, 'qa-smoke@example.invalid', NOW(), NOW())
-    `, [outboxId, closeId]);
-
-    const persisted = await client.query(`
-      SELECT
-        cs.monto_teorico_cierre,
-        cs.diferencia_cierre,
-        estado.codigo AS estado_sesion,
-        resolucion.codigo AS resolucion,
-        cc.id_cierre_caja,
-        cv.id_cierre_caja AS validacion_vinculada,
-        COUNT(DISTINCT cam.id_arqueo_metodo)::int AS arqueos,
-        COUNT(DISTINCT outbox.id_notificacion)::int AS notificaciones
-      FROM public.cajas_sesiones cs
-      INNER JOIN public.cat_cajas_sesiones_estados estado
-        ON estado.id_estado_sesion_caja = cs.id_estado_sesion_caja
-      INNER JOIN public.cat_cajas_resoluciones_cierre resolucion
-        ON resolucion.id_resolucion_cierre_caja = cs.id_resolucion_cierre_caja
-      INNER JOIN public.cajas_cierres cc
-        ON cc.id_sesion_caja = cs.id_sesion_caja
-      INNER JOIN public.cajas_cierres_validaciones cv
-        ON cv.id_validacion_cierre = $2
-      LEFT JOIN public.cajas_cierres_arqueos_metodos cam
-        ON cam.id_cierre_caja = cc.id_cierre_caja
-      LEFT JOIN public.cajas_cierres_notificaciones_email outbox
-        ON outbox.id_cierre_caja = cc.id_cierre_caja
-      WHERE cs.id_sesion_caja = $1
-      GROUP BY cs.monto_teorico_cierre, cs.diferencia_cierre,
-               estado.codigo, resolucion.codigo, cc.id_cierre_caja,
-               cv.id_cierre_caja
-    `, [negativeSessionId, validationId]);
-    const state = persisted.rows[0];
-    assert.equal(Number(state.monto_teorico_cierre), -13763);
-    assert.equal(Number(state.diferencia_cierre), 13763);
-    assert.equal(String(state.estado_sesion).trim().toUpperCase(), 'CERRADA');
-    assert.equal(String(state.resolucion).trim().toUpperCase(), 'PENDIENTE_REVISION');
-    assert.equal(String(state.id_cierre_caja), String(closeId));
-    assert.equal(String(state.validacion_vinculada), String(closeId));
-    assert.equal(state.arqueos, 3);
-    assert.equal(state.notificaciones, 1);
-
-    const emailPayload = await loadCajaCloseEmailPayload(client, closeId);
-    const html = buildCajaCloseEmailHtml({ payload: emailPayload, pdfAttached: true });
-    const pdf = await buildCajaCierrePdfBuffer(emailPayload);
-    assert.match(html, /Total ventas/);
-    // Esta sesion no tiene actividad OTRO; el documento nunca debe filtrar
-    // codigos tecnicos de metodos.
-    assert.doesNotMatch(html, /OTROS_NO_EFECTIVO/);
-    assert.doesNotMatch(html, />OTRO</);
-    assert.ok(Buffer.isBuffer(pdf) && pdf.subarray(0, 4).toString() === '%PDF');
-
-    await client.query('ROLLBACK');
-    rolledBack = true;
-
-    const cleanup = await pool.query(`
-      SELECT
-        EXISTS (SELECT 1 FROM public.cajas_sesiones WHERE id_sesion_caja IN ($1, $2)) AS sesiones,
-        EXISTS (SELECT 1 FROM public.cajas_cierres WHERE id_cierre_caja = $3) AS cierres,
-        EXISTS (SELECT 1 FROM public.cajas_cierres_validaciones WHERE id_validacion_cierre = $4) AS validaciones,
-        EXISTS (SELECT 1 FROM public.cajas_arqueos WHERE id_arqueo_caja = $5) AS arqueos,
-        EXISTS (SELECT 1 FROM public.cajas_cierres_notificaciones_email WHERE id_notificacion = $6) AS outbox
-    `, [salesSessionId, negativeSessionId, closeId, validationId, arqueoId, outboxId]);
-    assert.deepEqual(cleanup.rows[0], {
-      sesiones: false,
-      cierres: false,
-      validaciones: false,
-      arqueos: false,
-      outbox: false
-    });
-
-    return {
-      sales: {
-        efectivo: salesSnapshot.ventasEfectivoNetas,
-        noEfectivo: salesSnapshot.ventasNoEfectivoNetas,
-        total: salesSnapshot.totalTeorico,
-        otrosNoEfectivo: otrosRow.monto_teorico
-      },
-      negativeClose: {
-        efectivoTeorico: -13763,
-        diferencia: 13763,
-        estado: 'CERRADA',
-        resolucion: 'PENDIENTE_REVISION',
-        arqueos: state.arqueos,
-        outbox: state.notificaciones,
-        pdfBytes: pdf.length,
-        htmlTotalVentas: true,
-        htmlSinCodigosTecnicos: true,
-        arqueoCajaMontoTeorico: Number(persistedArqueo.rows[0].monto_teorico)
-      },
-      cleanup: cleanup.rows[0]
-    };
-  } finally {
-    if (!rolledBack) await client.query('ROLLBACK').catch(() => {});
-    client.release();
-  }
-};
 
 // --- Problema 3: integracion HTTP real (cierre-preview / cierre-validaciones / cerrar) ---
 
@@ -788,7 +362,18 @@ const captureRegressionMetrics = async (queryRunner) => {
        FROM public.cajas_sesiones cs
        INNER JOIN public.cat_cajas_sesiones_estados estado
          ON estado.id_estado_sesion_caja = cs.id_estado_sesion_caja
-       WHERE UPPER(TRIM(estado.codigo)) = 'ABIERTA')::text AS sesiones_abiertas
+       WHERE UPPER(TRIM(estado.codigo)) = 'ABIERTA')::text AS sesiones_abiertas,
+      (SELECT COALESCE(
+         JSONB_AGG(
+           JSONB_BUILD_OBJECT(
+             'id_metodo_pago', id_metodo_pago,
+             'codigo', codigo,
+             'estado', estado,
+             'afecta_efectivo', afecta_efectivo
+           ) ORDER BY id_metodo_pago
+         ),
+         '[]'::jsonb
+       )::text FROM public.cat_metodos_pago) AS catalogo_metodos_pago
   `);
   return result.rows[0];
 };
@@ -997,6 +582,60 @@ const runHttpCloseSmoke = async () => {
       return response;
     };
 
+    const manualPayloadRejections = [];
+    const expectManualPayloadRejection = async ({ rows, expectedCode, label }) => {
+      for (const endpoint of ['cierre-preview', 'cierre-validaciones']) {
+        const beforeCount = await pool.query(
+          'SELECT COUNT(*)::int AS count FROM public.cajas_cierres_validaciones WHERE id_sesion_caja=$1',
+          [idSesionCaja]
+        );
+        const response = await callJson(baseUrl, 'POST', `/ventas/cajas/sesiones/${idSesionCaja}/${endpoint}`, {
+          auth,
+          body: { observacion_cierre: observacionCierre, arqueos: rows }
+        });
+        assert.equal(response.status, 400, `${label}/${endpoint}: ${JSON.stringify(response.body)}`);
+        assert.equal(response.body?.code, expectedCode, `${label}/${endpoint}`);
+        const afterCount = await pool.query(
+          'SELECT COUNT(*)::int AS count FROM public.cajas_cierres_validaciones WHERE id_sesion_caja=$1',
+          [idSesionCaja]
+        );
+        assert.equal(afterCount.rows[0].count, beforeCount.rows[0].count, `${label}/${endpoint} escribio validacion parcial`);
+        manualPayloadRejections.push({ label, endpoint, code: response.body.code });
+      }
+    };
+
+    const efectivoRow = arqueosPayload[0];
+    const tarjetaRow = arqueosPayload[1];
+    const transferenciaRow = arqueosPayload[2];
+    await expectManualPayloadRejection({
+      rows: [efectivoRow],
+      expectedCode: 'VENTAS_CAJAS_ARQUEO_METODO_REQUIRED',
+      label: 'solo EFECTIVO'
+    });
+    await expectManualPayloadRejection({
+      rows: [efectivoRow, tarjetaRow],
+      expectedCode: 'VENTAS_CAJAS_ARQUEO_METODO_REQUIRED',
+      label: 'EFECTIVO + TARJETA'
+    });
+    await expectManualPayloadRejection({
+      rows: [efectivoRow, transferenciaRow],
+      expectedCode: 'VENTAS_CAJAS_ARQUEO_METODO_REQUIRED',
+      label: 'EFECTIVO + TRANSFERENCIA'
+    });
+    await expectManualPayloadRejection({
+      rows: [...arqueosPayload, { metodo_pago_codigo: 'OTRO', monto_declarado: 400 }],
+      expectedCode: 'VENTAS_CAJAS_ARQUEO_METODO_INVALID',
+      label: 'OTRO enviado por cliente'
+    });
+    for (const duplicateCode of ['EFECTIVO', 'TARJETA', 'TRANSFERENCIA']) {
+      const duplicateRow = arqueosPayload.find((row) => row.metodo_pago_codigo === duplicateCode);
+      await expectManualPayloadRejection({
+        rows: [...arqueosPayload, { ...duplicateRow }],
+        expectedCode: 'VENTAS_CAJAS_ARQUEO_METODO_DUPLICATE',
+        label: `duplicado ${duplicateCode}`
+      });
+    }
+
     const preview = await callJson(baseUrl, 'POST', `/ventas/cajas/sesiones/${idSesionCaja}/cierre-preview`, {
       auth,
       body: { observacion_cierre: observacionCierre, arqueos: arqueosPayload }
@@ -1027,61 +666,6 @@ const runHttpCloseSmoke = async () => {
     assert.equal(validacionOtros.diferencia, 0);
     assert.equal(validaciones.body.resumen.total_declarado, expectedTotalDeclarado);
     assert.equal(validaciones.body.resumen.hay_diferencia, true);
-
-    // Catalogo desactivado despues de validar. TARJETA y TRANSFERENCIA se
-    // prueban expresamente con teorico cero para que la invalidacion no pueda
-    // depender de una diferencia monetaria.
-    const zeroPaymentRows = await pool.query(`
-      SELECT fc.id_factura_cobro, fc.monto, UPPER(TRIM(mp.codigo)) AS codigo
-      FROM public.facturas_cobros fc
-      INNER JOIN public.cat_metodos_pago mp ON mp.id_metodo_pago = fc.id_metodo_pago
-      WHERE fc.id_sesion_caja = $1
-        AND UPPER(TRIM(mp.codigo)) IN ('TARJETA', 'TRANSFERENCIA')
-      ORDER BY fc.id_factura_cobro
-    `, [idSesionCaja]);
-    assert.equal(zeroPaymentRows.rowCount, 2);
-    const inactiveCatalogRejections = [];
-    try {
-      await pool.query(`
-        DELETE FROM public.facturas_cobros
-        WHERE id_factura_cobro = ANY($1::bigint[])
-      `, [zeroPaymentRows.rows.map((row) => String(row.id_factura_cobro))]);
-      const zeroPayload = [
-        { metodo_pago_codigo: 'EFECTIVO', monto_declarado: 0, observacion: 'QA smoke HTTP: caja vacia tras egreso' },
-        { metodo_pago_codigo: 'TARJETA', monto_declarado: 0 },
-        { metodo_pago_codigo: 'TRANSFERENCIA', monto_declarado: 0 }
-      ];
-      for (const methodCode of ['EFECTIVO', 'TARJETA', 'TRANSFERENCIA', 'OTRO']) {
-        const validation = await createCloseValidation(zeroPayload);
-        const catalogRow = await pool.query(`
-          SELECT id_metodo_pago, estado
-          FROM public.cat_metodos_pago
-          WHERE UPPER(TRIM(codigo)) = $1
-          ORDER BY id_metodo_pago
-        `, [methodCode]);
-        assert.equal(catalogRow.rowCount, 1, `${methodCode} debe ser unico`);
-        await pool.query('UPDATE public.cat_metodos_pago SET estado = false WHERE id_metodo_pago = $1', [catalogRow.rows[0].id_metodo_pago]);
-        try {
-          const rejected = await expectControlledCloseRejection(validation.body.id_validacion_cierre, `${methodCode} inactivo`);
-          inactiveCatalogRejections.push({ metodo: methodCode, teoricoCero: ['TARJETA', 'TRANSFERENCIA'].includes(methodCode), code: rejected.body?.code || null });
-        } finally {
-          await pool.query('UPDATE public.cat_metodos_pago SET estado = $1 WHERE id_metodo_pago = $2', [catalogRow.rows[0].estado, catalogRow.rows[0].id_metodo_pago]);
-        }
-      }
-    } finally {
-      for (const row of zeroPaymentRows.rows) {
-        await insertPayment(pool, {
-          idFacturaCobro: row.id_factura_cobro,
-          idFactura,
-          idSesionCaja,
-          references: { ...references, id_usuario: qaTestUserId },
-          methodCode: row.codigo,
-          amount: row.monto,
-          fixtureReference
-        });
-      }
-    }
-
     const duplicateRejections = [];
     const methodCodes = ['EFECTIVO', 'TARJETA', 'TRANSFERENCIA', 'OTRO'];
     for (const [index, methodCode] of methodCodes.entries()) {
@@ -1191,6 +775,56 @@ const runHttpCloseSmoke = async () => {
       malformedValidationRejections.sinDetalle = rejected.status;
     }
 
+    const arithmeticTamperRejections = {};
+    const runArithmeticTamper = async (label, mutate) => {
+      const validation = await createCloseValidation();
+      await mutate(validation.body.id_validacion_cierre);
+      const rejected = await expectControlledCloseRejection(
+        validation.body.id_validacion_cierre,
+        label,
+        'VENTAS_CAJAS_CLOSE_VALIDATION_STALE'
+      );
+      assert.equal(rejected.status, 409);
+      arithmeticTamperRejections[label] = rejected.status;
+    };
+    await runArithmeticTamper('monto_declarado_alterado', (validationId) => pool.query(`
+      UPDATE public.cajas_cierres_validaciones_metodos
+      SET monto_declarado = monto_declarado + 1
+      WHERE id_validacion_cierre = $1 AND metodo_pago_codigo = 'EFECTIVO'
+    `, [validationId]));
+    await runArithmeticTamper('diferencia_alterada', (validationId) => pool.query(`
+      UPDATE public.cajas_cierres_validaciones_metodos
+      SET diferencia = diferencia + 1
+      WHERE id_validacion_cierre = $1 AND metodo_pago_codigo = 'TARJETA'
+    `, [validationId]));
+    await runArithmeticTamper('total_declarado_alterado', (validationId) => pool.query(`
+      UPDATE public.cajas_cierres_validaciones
+      SET total_declarado = total_declarado + 1
+      WHERE id_validacion_cierre = $1
+    `, [validationId]));
+    await runArithmeticTamper('diferencia_total_alterada', (validationId) => pool.query(`
+      UPDATE public.cajas_cierres_validaciones
+      SET diferencia_total = diferencia_total + 1
+      WHERE id_validacion_cierre = $1
+    `, [validationId]));
+    await runArithmeticTamper('requiere_revision_false_con_diferencia', (validationId) => pool.query(`
+      UPDATE public.cajas_cierres_validaciones_metodos
+      SET requiere_revision = false
+      WHERE id_validacion_cierre = $1 AND metodo_pago_codigo = 'EFECTIVO'
+    `, [validationId]));
+    await runArithmeticTamper('suma_filas_distinta_encabezado', (validationId) => pool.query(`
+      UPDATE public.cajas_cierres_validaciones_metodos
+      SET monto_teorico = monto_teorico + 1
+      WHERE id_validacion_cierre = $1 AND metodo_pago_codigo = 'TRANSFERENCIA'
+    `, [validationId]));
+    await runArithmeticTamper('otro_declarado_no_automatico', (validationId) => pool.query(`
+      UPDATE public.cajas_cierres_validaciones_metodos
+      SET monto_declarado = monto_declarado + 1,
+          diferencia = diferencia + 1,
+          requiere_revision = true
+      WHERE id_validacion_cierre = $1 AND metodo_pago_codigo = 'OTRO'
+    `, [validationId]));
+
     const operationalChangeRejections = {};
     {
       const validation = await createCloseValidation();
@@ -1280,70 +914,8 @@ const runHttpCloseSmoke = async () => {
         await pool.query('DELETE FROM public.facturas_reversiones WHERE id_reversion = $1', [idReversion]);
       }
     }
-
-    const catalogIdValidation = await createCloseValidation();
-    const catalogIdRows = await pool.query(`
-      SELECT id_metodo_pago, codigo
-      FROM public.cat_metodos_pago
-      WHERE UPPER(TRIM(codigo)) IN ('TARJETA', 'OTRO')
-      ORDER BY id_metodo_pago
-    `);
-    assert.equal(catalogIdRows.rowCount, 2);
-    const tarjetaCatalog = catalogIdRows.rows.find((row) => String(row.codigo).trim().toUpperCase() === 'TARJETA');
-    const otroCatalog = catalogIdRows.rows.find((row) => String(row.codigo).trim().toUpperCase() === 'OTRO');
-    const swapCode = `QA_SWAP_${baseId}`;
-    let catalogIdChangeRejected = false;
-    try {
-      await pool.query('UPDATE public.cat_metodos_pago SET codigo = $1 WHERE id_metodo_pago = $2', [swapCode, tarjetaCatalog.id_metodo_pago]);
-      await pool.query("UPDATE public.cat_metodos_pago SET codigo = 'TARJETA' WHERE id_metodo_pago = $1", [otroCatalog.id_metodo_pago]);
-      await pool.query("UPDATE public.cat_metodos_pago SET codigo = 'OTRO' WHERE id_metodo_pago = $1", [tarjetaCatalog.id_metodo_pago]);
-      const rejected = await expectControlledCloseRejection(
-        catalogIdValidation.body.id_validacion_cierre,
-        'cambio de id asociado al codigo',
-        'VENTAS_CAJAS_CLOSE_VALIDATION_STALE'
-      );
-      catalogIdChangeRejected = rejected.status === 409;
-    } finally {
-      await pool.query('UPDATE public.cat_metodos_pago SET codigo = $1 WHERE id_metodo_pago = $2', [`${swapCode}_T`, tarjetaCatalog.id_metodo_pago]);
-      await pool.query('UPDATE public.cat_metodos_pago SET codigo = $1 WHERE id_metodo_pago = $2', [`${swapCode}_O`, otroCatalog.id_metodo_pago]);
-      await pool.query("UPDATE public.cat_metodos_pago SET codigo = 'TARJETA' WHERE id_metodo_pago = $1", [tarjetaCatalog.id_metodo_pago]);
-      await pool.query("UPDATE public.cat_metodos_pago SET codigo = 'OTRO' WHERE id_metodo_pago = $1", [otroCatalog.id_metodo_pago]);
-    }
-
-    const catalogValidation = await callJson(baseUrl, 'POST', `/ventas/cajas/sesiones/${idSesionCaja}/cierre-validaciones`, {
-      auth,
-      body: { observacion_cierre: observacionCierre, arqueos: arqueosPayload }
-    });
-    assert.equal(catalogValidation.status, 201);
-    const catalogOriginalResult = await pool.query(`
-      SELECT id_metodo_pago, estado, afecta_efectivo
-      FROM public.cat_metodos_pago
-      WHERE UPPER(TRIM(codigo)) = 'OTRO'
-      ORDER BY id_metodo_pago
-    `);
-    assert.equal(catalogOriginalResult.rowCount, 1, 'OTRO debe ser unico antes de probar cambio de catalogo.');
-    const catalogOriginal = catalogOriginalResult.rows[0];
-    await pool.query(
-      'UPDATE public.cat_metodos_pago SET afecta_efectivo = NOT $1::boolean WHERE id_metodo_pago = $2',
-      [catalogOriginal.afecta_efectivo, catalogOriginal.id_metodo_pago]
-    );
-    let catalogChangeRejected = false;
-    try {
-      const rejected = await callJson(baseUrl, 'PATCH', `/ventas/cajas/sesiones/${idSesionCaja}/cerrar`, {
-        auth,
-        body: { observacion_cierre: observacionCierre, id_validacion_cierre: catalogValidation.body.id_validacion_cierre }
-      });
-      assert.equal(rejected.status, 409, `cambio catalogo: ${JSON.stringify(rejected.body)}`);
-      assert.equal(rejected.body?.code, 'VENTAS_CAJAS_CLOSE_VALIDATION_STALE');
-      catalogChangeRejected = true;
-    } finally {
-      await pool.query(`
-        UPDATE public.cat_metodos_pago
-        SET estado = $1, afecta_efectivo = $2
-        WHERE id_metodo_pago = $3
-      `, [catalogOriginal.estado, catalogOriginal.afecta_efectivo, catalogOriginal.id_metodo_pago]);
-    }
-
+    const validacionSobrante = await createCloseValidation();
+    const idValidacionSobrante = validacionSobrante.body.id_validacion_cierre;
     const cerrar = await callJson(baseUrl, 'PATCH', `/ventas/cajas/sesiones/${idSesionCaja}/cerrar`, {
       auth,
       body: { observacion_cierre: observacionCierre, id_validacion_cierre: idValidacionCierre }
@@ -1359,7 +931,6 @@ const runHttpCloseSmoke = async () => {
     assert.equal(cerrar.body.correo_cierre.estado, 'PENDIENTE');
 
     // Una validacion sobrante no debe producir un segundo cierre.
-    const idValidacionSobrante = catalogValidation.body.id_validacion_cierre;
     const cerrarReintento = await callJson(baseUrl, 'PATCH', `/ventas/cajas/sesiones/${idSesionCaja}/cerrar`, {
       auth,
       body: { observacion_cierre: observacionCierre, id_validacion_cierre: idValidacionSobrante }
@@ -1453,12 +1024,12 @@ const runHttpCloseSmoke = async () => {
       arqueosOtrosNoEfectivo: state.arqueos_otros,
       otroAutomaticoPersistido: state.otros_automaticos === 1 && state.core_no_automaticos === 3,
       persistedMethods: persistedMethods.rows,
-      inactiveCatalogRejections,
+      manualPayloadRejections,
       duplicateRejections,
       malformedValidationRejections,
+      arithmeticTamperRejections,
       operationalChangeRejections,
-      catalogIdChangeRejected,
-      catalogChangeRejected,
+      sharedQaCatalogMutations: false,
       reintentoCierreRechazado: cerrarReintento.status === 409,
       pdfBytes: pdf.length
     };
@@ -1474,15 +1045,12 @@ const runHttpCloseSmoke = async () => {
 };
 
 const main = async () => {
+  installQaSharedPaymentCatalogWriteGuard();
   assertQaTarget();
   const verifySql = await readFile(VERIFY_PATH, 'utf8');
   try {
-    // Toda mutacion DDL vive en PostgreSQL aislado. QA solo recibe el fixture
-    // DML sintetico de los endpoints y debe encontrarse previamente en SAFE.
-    const isolatedPostgres = await runIsolatedPostgresMigrationSuite({
-      injectFailureAfterSafe: INJECT_FAILURE_AFTER_SAFE,
-      leaveSafeApplied: LEAVE_SAFE_APPLIED
-    });
+    // PostgreSQL aislado se ejecuta por separado. Este proceso solo opera el
+    // fixture sintetico de QA y exige que el esquema compartido ya este SAFE.
     const qaNamedConstraints = await namedConstraintState(pool);
     assert.deepEqual(
       qaNamedConstraints,
@@ -1491,7 +1059,6 @@ const main = async () => {
     );
     const before = await runVerify(pool, verifySql);
     assert.ok(before.negativeChecks.every((row) => Number(row.checks_equivalentes_no_negativos) === 0));
-    const smoke = await runTransactionalFinancialSmoke();
     const httpSmoke = await runHttpCloseSmoke();
     const after = await runVerify(pool, verifySql);
     assert.ok(after.negativeChecks.every((row) => Number(row.checks_equivalentes_no_negativos) === 0));
@@ -1500,10 +1067,9 @@ const main = async () => {
     console.log(JSON.stringify({
       projectRef: QA_PROJECT_REF,
       qaSchemaMutation: false,
-      isolatedPostgres,
+      sharedQaCatalogMutations: false,
       verifyBefore: before,
       verifyAfter: after,
-      smoke,
       httpSmoke
     }, null, 2));
   } finally {
@@ -1511,4 +1077,7 @@ const main = async () => {
   }
 };
 
-await main();
+const isDirectExecution = process.argv[1]
+  && new URL(`file:///${process.argv[1].replace(/\\/g, '/')}`).href === import.meta.url;
+
+if (isDirectExecution) await main();

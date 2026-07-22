@@ -201,16 +201,50 @@ describe('loadCajaCloseFinancialSnapshot', () => {
     assert.equal(snapshot.fingerprint.max_id_movimiento_caja, '9223372036854775807');
   });
 
-  it('usa EXISTS para reversiones heredadas y no castea movimientos a int', async () => {
+  it('resuelve reversiones por sesion, limita el reparto a esa sesion y no castea movimientos a int', async () => {
     const queryRunner = {
       async query(sql) {
         assert.match(sql, /EXISTS \(\s*SELECT 1\s*FROM public\.facturas_cobros fc_scope/);
+        assert.match(sql, /fc\.id_sesion_caja\s*=\s*rs\.id_sesion_caja_atribuida/);
+        assert.match(sql, /CARDINALITY\(rs\.sesiones_cobro\)\s*>=\s*2/);
         assert.doesNotMatch(sql, /MAX\(cm\.id_movimiento_caja\)::int/);
         return { rows: [] };
       }
     };
 
     await loadCajaCloseFinancialSnapshot({ queryRunner, idSesionCaja: '1' });
+  });
+
+  it('rechaza con 409 una reversion heredada con cobros en dos sesiones', async () => {
+    const queryRunner = {
+      async query() {
+        return {
+          rows: [{
+            id_sesion_caja: '1',
+            reversiones_sesion_ambiguas: [{
+              id_reversion: '91',
+              id_factura_original: '81',
+              sesiones: ['1', '2']
+            }],
+            metodos_pago_invalidos: []
+          }]
+        };
+      }
+    };
+
+    await assert.rejects(
+      loadCajaCloseFinancialSnapshot({ queryRunner, idSesionCaja: '1' }),
+      (error) => {
+        assert.equal(error.httpStatus, 409);
+        assert.equal(error.code, 'VENTAS_CAJAS_REVERSION_SESSION_AMBIGUOUS');
+        assert.deepEqual(error.details, {
+          id_reversion: '91',
+          id_factura_original: '81',
+          sesiones: ['1', '2']
+        });
+        return true;
+      }
+    );
   });
 
   it('resuelve catalogValidation por codigo exacto (nunca por MIN(id) arbitrario)', async () => {

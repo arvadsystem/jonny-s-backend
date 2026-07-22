@@ -22,6 +22,20 @@ const createUnaccountablePaymentMethodError = (methods = []) => {
   return error;
 };
 
+const createAmbiguousReversionSessionError = (reversions = []) => {
+  const first = reversions[0] || {};
+  const error = new Error('La reversion no puede atribuirse de forma determinista a una sesion de caja.');
+  error.code = 'VENTAS_CAJAS_REVERSION_SESSION_AMBIGUOUS';
+  error.httpStatus = 409;
+  error.publicMessage = 'Una reversion de la factura tiene cobros en varias sesiones y no define la sesion original.';
+  error.details = {
+    id_reversion: first.id_reversion ?? null,
+    id_factura_original: first.id_factura_original ?? null,
+    sesiones: Array.isArray(first.sesiones) ? first.sesiones.map(String) : []
+  };
+  return error;
+};
+
 const normalizeMethod = (row = {}) => ({
   id_metodo_pago: Number(row.id_metodo_pago || 0) || null,
   codigo: normalizeMethodCode(row.codigo),
@@ -259,12 +273,20 @@ export const loadCajaCloseFinancialSnapshot = async ({ queryRunner, idSesionCaja
           ON p.id_metodo_pago = pm.id_metodo_pago
         GROUP BY pm.id_metodo_pago
       ),
-      reversion_source AS (
+      reversion_candidates AS (
         SELECT
           fr.id_reversion,
           fr.id_factura_original,
-          COALESCE(fr.monto_reversado, 0)::numeric(14,2) AS monto_reversado
+          fr.id_sesion_caja_original,
+          COALESCE(fr.monto_reversado, 0)::numeric(14,2) AS monto_reversado,
+          COALESCE(
+            ARRAY_AGG(DISTINCT fc_session.id_sesion_caja ORDER BY fc_session.id_sesion_caja)
+              FILTER (WHERE fc_session.id_sesion_caja IS NOT NULL),
+            ARRAY[]::bigint[]
+          ) AS sesiones_cobro
         FROM public.facturas_reversiones fr
+        LEFT JOIN public.facturas_cobros fc_session
+          ON fc_session.id_factura = fr.id_factura_original
         WHERE UPPER(TRIM(COALESCE(fr.estado, ''))) = 'APLICADA'
           AND (
             fr.id_sesion_caja_original = $1::bigint
@@ -277,6 +299,48 @@ export const loadCajaCloseFinancialSnapshot = async ({ queryRunner, idSesionCaja
                   AND fc_scope.id_sesion_caja = $1::bigint
               )
             )
+          )
+        GROUP BY fr.id_reversion, fr.id_factura_original,
+                 fr.id_sesion_caja_original, fr.monto_reversado
+      ),
+      reversion_scope AS (
+        SELECT
+          rc.*,
+          CASE
+            WHEN rc.id_sesion_caja_original IS NOT NULL THEN rc.id_sesion_caja_original
+            WHEN CARDINALITY(rc.sesiones_cobro) = 1 THEN rc.sesiones_cobro[1]
+            ELSE NULL
+          END AS id_sesion_caja_atribuida
+        FROM reversion_candidates rc
+      ),
+      ambiguous_reversion_summary AS (
+        SELECT COALESCE(
+          JSONB_AGG(
+            JSONB_BUILD_OBJECT(
+              'id_reversion', rs.id_reversion,
+              'id_factura_original', rs.id_factura_original,
+              'sesiones', rs.sesiones_cobro
+            )
+            ORDER BY rs.id_reversion
+          ) FILTER (
+            WHERE rs.id_sesion_caja_original IS NULL
+              AND CARDINALITY(rs.sesiones_cobro) >= 2
+          ),
+          '[]'::jsonb
+        ) AS reversiones_sesion_ambiguas
+        FROM reversion_scope rs
+      ),
+      reversion_source AS (
+        SELECT
+          rs.id_reversion,
+          rs.id_factura_original,
+          rs.monto_reversado,
+          rs.id_sesion_caja_atribuida
+        FROM reversion_scope rs
+        WHERE rs.id_sesion_caja_atribuida = $1::bigint
+          AND NOT (
+            rs.id_sesion_caja_original IS NULL
+            AND CARDINALITY(rs.sesiones_cobro) >= 2
           )
       ),
       reversion_lines AS (
@@ -292,6 +356,7 @@ export const loadCajaCloseFinancialSnapshot = async ({ queryRunner, idSesionCaja
         FROM reversion_source rs
         INNER JOIN public.facturas_cobros fc
           ON fc.id_factura = rs.id_factura_original
+         AND fc.id_sesion_caja = rs.id_sesion_caja_atribuida
       ),
       reversion_allocations AS (
         SELECT
@@ -515,6 +580,7 @@ export const loadCajaCloseFinancialSnapshot = async ({ queryRunner, idSesionCaja
           gos.reversiones AS otros_no_efectivo_reversiones,
           gos.ventas_netas AS otros_no_efectivo_ventas_netas,
           gos.metodos_agrupados AS otros_no_efectivo_metodos_agrupados,
+          ars.reversiones_sesion_ambiguas,
           ips.metodos_pago_invalidos,
           jsonb_build_object(
             'cantidad_cobros', COALESCE(ff.cantidad_cobros, 0),
@@ -541,6 +607,7 @@ export const loadCajaCloseFinancialSnapshot = async ({ queryRunner, idSesionCaja
         CROSS JOIN financial_fingerprint ff
         CROSS JOIN aggregate_totals at
         CROSS JOIN invalid_payment_summary ips
+        CROSS JOIN ambiguous_reversion_summary ars
         CROSS JOIN required_catalog_json rcj
         CROSS JOIN grouped_other_summary gos
       )
@@ -551,6 +618,12 @@ export const loadCajaCloseFinancialSnapshot = async ({ queryRunner, idSesionCaja
   );
 
   const row = result.rows?.[0] || {};
+  const ambiguousReversions = Array.isArray(row.reversiones_sesion_ambiguas)
+    ? row.reversiones_sesion_ambiguas
+    : [];
+  if (ambiguousReversions.length > 0) {
+    throw createAmbiguousReversionSessionError(ambiguousReversions);
+  }
   const invalidMethods = Array.isArray(row.metodos_pago_invalidos)
     ? row.metodos_pago_invalidos
     : [];
