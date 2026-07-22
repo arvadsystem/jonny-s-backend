@@ -19,59 +19,96 @@ FROM (VALUES
   ('public.cat_metodos_pago')
 ) AS t(tabla);
 
--- 2) Estado individual de cada uno de los tres CHECK que SAFE eliminaria.
--- Nunca se decide por conteo: cada restriccion se clasifica por separado.
-WITH objetivo(tabla, restriccion) AS (
+-- 2) Estado individual de cada restriccion objetivo. Se busca primero solo
+-- por tabla+nombre (sin filtrar contype): una colision no-CHECK o un CHECK
+-- con otra columna/expresion bloquea el despliegue.
+WITH objetivo(tabla, restriccion, columna, expresiones_esperadas) AS (
   VALUES
-    ('public.cajas_sesiones'::regclass, 'ck_cajas_sesiones_monto_teorico'),
-    ('public.cajas_cierres'::regclass, 'ck_cajas_cierres_monto_teorico'),
-    ('public.cajas_arqueos'::regclass, 'ck_cajas_arqueos_teorico')
+    ('public.cajas_sesiones'::regclass, 'ck_cajas_sesiones_monto_teorico', 'monto_teorico_cierre'::text, ARRAY['monto_teorico_cierre>=0', 'monto_teorico_cierreisnullormonto_teorico_cierre>=0']::text[]),
+    ('public.cajas_cierres'::regclass, 'ck_cajas_cierres_monto_teorico', 'monto_teorico_cierre'::text, ARRAY['monto_teorico_cierre>=0', 'monto_teorico_cierreisnullormonto_teorico_cierre>=0']::text[]),
+    ('public.cajas_arqueos'::regclass, 'ck_cajas_arqueos_teorico', 'monto_teorico'::text, ARRAY['monto_teorico>=0']::text[])
 ),
 estado AS (
   SELECT
     o.tabla,
     o.restriccion,
     c.oid IS NOT NULL AS presente,
+    c.contype AS tipo_restriccion,
+    c.contype = 'c' AS es_check,
     c.convalidated,
-    pg_get_constraintdef(c.oid, true) AS definicion
+    c.conkey AS columnas_protegidas_attnum,
+    a.attnum AS attnum_columna_esperada,
+    pg_get_expr(c.conbin, c.conrelid) AS expresion,
+    pg_get_constraintdef(c.oid, true) AS definicion,
+    (
+      c.contype = 'c'
+      AND c.conkey = ARRAY[a.attnum]::smallint[]
+      AND lower(regexp_replace(COALESCE(pg_get_expr(c.conbin, c.conrelid), ''), '\s+|[()]|::numeric', '', 'g')) = ANY(o.expresiones_esperadas)
+    ) AS coincide_definicion_esperada
   FROM objetivo o
   LEFT JOIN pg_constraint c
-    ON c.conrelid = o.tabla AND c.conname = o.restriccion AND c.contype = 'c'
+    ON c.conrelid = o.tabla AND c.conname = o.restriccion
+  LEFT JOIN pg_attribute a
+    ON a.attrelid = o.tabla AND a.attname = o.columna AND NOT a.attisdropped
 )
 SELECT
   tabla,
   restriccion,
   presente,
+  tipo_restriccion,
+  es_check,
   convalidated,
+  columnas_protegidas_attnum,
+  attnum_columna_esperada,
+  expresion,
   definicion,
-  CASE WHEN presente THEN 'LEGACY' ELSE 'SAFE' END AS estado_restriccion
+  COALESCE(coincide_definicion_esperada, false) AS coincide_definicion_esperada,
+  (presente AND NOT COALESCE(coincide_definicion_esperada, false)) AS bloqueante_despliegue,
+  CASE
+    WHEN NOT presente THEN 'SAFE'
+    WHEN coincide_definicion_esperada THEN 'LEGACY'
+    ELSE 'BLOQUEANTE'
+  END AS estado_restriccion
 FROM estado
 ORDER BY tabla::text;
 
 -- 3) Estado global de la migracion: LEGACY (las 3 presentes), SAFE (las 3
 -- ausentes) o PARCIAL (mezcla). Deriva del detalle anterior, nunca de un
 -- COUNT(*) suelto.
-WITH objetivo(tabla, restriccion) AS (
+WITH objetivo(tabla, restriccion, columna, expresiones_esperadas) AS (
   VALUES
-    ('public.cajas_sesiones'::regclass, 'ck_cajas_sesiones_monto_teorico'),
-    ('public.cajas_cierres'::regclass, 'ck_cajas_cierres_monto_teorico'),
-    ('public.cajas_arqueos'::regclass, 'ck_cajas_arqueos_teorico')
+    ('public.cajas_sesiones'::regclass, 'ck_cajas_sesiones_monto_teorico', 'monto_teorico_cierre'::text, ARRAY['monto_teorico_cierre>=0', 'monto_teorico_cierreisnullormonto_teorico_cierre>=0']::text[]),
+    ('public.cajas_cierres'::regclass, 'ck_cajas_cierres_monto_teorico', 'monto_teorico_cierre'::text, ARRAY['monto_teorico_cierre>=0', 'monto_teorico_cierreisnullormonto_teorico_cierre>=0']::text[]),
+    ('public.cajas_arqueos'::regclass, 'ck_cajas_arqueos_teorico', 'monto_teorico'::text, ARRAY['monto_teorico>=0']::text[])
 ),
-presentes AS (
-  SELECT o.tabla, o.restriccion, (c.oid IS NOT NULL) AS presente
+estados AS (
+  SELECT
+    o.tabla,
+    o.restriccion,
+    (c.oid IS NOT NULL) AS presente,
+    (
+      c.contype = 'c'
+      AND c.conkey = ARRAY[a.attnum]::smallint[]
+      AND lower(regexp_replace(COALESCE(pg_get_expr(c.conbin, c.conrelid), ''), '\s+|[()]|::numeric', '', 'g')) = ANY(o.expresiones_esperadas)
+    ) AS coincide_definicion_esperada
   FROM objetivo o
   LEFT JOIN pg_constraint c
-    ON c.conrelid = o.tabla AND c.conname = o.restriccion AND c.contype = 'c'
+    ON c.conrelid = o.tabla AND c.conname = o.restriccion
+  LEFT JOIN pg_attribute a
+    ON a.attrelid = o.tabla AND a.attname = o.columna AND NOT a.attisdropped
 )
 SELECT
   COUNT(*) FILTER (WHERE presente) AS presentes_count,
   COUNT(*) FILTER (WHERE NOT presente) AS ausentes_count,
+  COUNT(*) FILTER (WHERE presente AND NOT COALESCE(coincide_definicion_esperada, false)) AS bloqueantes_count,
+  BOOL_OR(presente AND NOT COALESCE(coincide_definicion_esperada, false)) AS bloqueante_despliegue,
   CASE
+    WHEN BOOL_OR(presente AND NOT COALESCE(coincide_definicion_esperada, false)) THEN 'BLOQUEANTE'
     WHEN COUNT(*) FILTER (WHERE presente) = 3 THEN 'LEGACY'
     WHEN COUNT(*) FILTER (WHERE NOT presente) = 3 THEN 'SAFE'
     ELSE 'PARCIAL'
   END AS estado_migracion
-FROM presentes;
+FROM estados;
 
 -- 4) Validacion estricta de ck_cajas_arqueos_contado: no basta el nombre.
 -- Debe proteger EXCLUSIVAMENTE monto_contado con monto_contado >= 0, estar

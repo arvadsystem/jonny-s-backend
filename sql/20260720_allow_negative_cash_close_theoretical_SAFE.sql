@@ -58,12 +58,11 @@ BEGIN
     RAISE EXCEPTION 'Falta public.cajas_sesiones.monto_teorico_cierre';
   END IF;
 
-  SELECT c.conkey, pg_get_expr(c.conbin, c.conrelid)
-  INTO constraint_columns, constraint_expression
+  SELECT c.contype, c.convalidated, c.conkey, pg_get_expr(c.conbin, c.conrelid)
+  INTO constraint_type, constraint_validated, constraint_columns, constraint_expression
   FROM pg_constraint c
   WHERE c.conrelid = 'public.cajas_sesiones'::regclass
-    AND c.conname = 'ck_cajas_sesiones_monto_teorico'
-    AND c.contype = 'c';
+    AND c.conname = 'ck_cajas_sesiones_monto_teorico';
 
   constraint_found := FOUND;
   normalized_expression := lower(regexp_replace(
@@ -72,6 +71,10 @@ BEGIN
     '',
     'g'
   ));
+
+  IF constraint_found AND constraint_type IS DISTINCT FROM 'c'::"char" THEN
+    RAISE EXCEPTION 'ck_cajas_sesiones_monto_teorico existe con tipo %, no es CHECK; abortando antes de DROP CONSTRAINT', constraint_type;
+  END IF;
 
   IF constraint_found AND (
     constraint_columns IS DISTINCT FROM ARRAY[target_column]::smallint[]
@@ -86,6 +89,8 @@ BEGIN
   target_column := NULL;
   constraint_columns := NULL;
   constraint_expression := NULL;
+  constraint_type := NULL;
+  constraint_validated := NULL;
   normalized_expression := NULL;
 
   SELECT a.attnum
@@ -99,12 +104,11 @@ BEGIN
     RAISE EXCEPTION 'Falta public.cajas_cierres.monto_teorico_cierre';
   END IF;
 
-  SELECT c.conkey, pg_get_expr(c.conbin, c.conrelid)
-  INTO constraint_columns, constraint_expression
+  SELECT c.contype, c.convalidated, c.conkey, pg_get_expr(c.conbin, c.conrelid)
+  INTO constraint_type, constraint_validated, constraint_columns, constraint_expression
   FROM pg_constraint c
   WHERE c.conrelid = 'public.cajas_cierres'::regclass
-    AND c.conname = 'ck_cajas_cierres_monto_teorico'
-    AND c.contype = 'c';
+    AND c.conname = 'ck_cajas_cierres_monto_teorico';
 
   constraint_found := FOUND;
   normalized_expression := lower(regexp_replace(
@@ -113,6 +117,10 @@ BEGIN
     '',
     'g'
   ));
+
+  IF constraint_found AND constraint_type IS DISTINCT FROM 'c'::"char" THEN
+    RAISE EXCEPTION 'ck_cajas_cierres_monto_teorico existe con tipo %, no es CHECK; abortando antes de DROP CONSTRAINT', constraint_type;
+  END IF;
 
   IF constraint_found AND (
     constraint_columns IS DISTINCT FROM ARRAY[target_column]::smallint[]
@@ -127,6 +135,8 @@ BEGIN
   target_column := NULL;
   constraint_columns := NULL;
   constraint_expression := NULL;
+  constraint_type := NULL;
+  constraint_validated := NULL;
   normalized_expression := NULL;
 
   IF to_regclass('public.cajas_arqueos') IS NULL THEN
@@ -187,12 +197,11 @@ BEGIN
   constraint_validated := NULL;
   normalized_expression := NULL;
 
-  SELECT c.conkey, pg_get_expr(c.conbin, c.conrelid)
-  INTO constraint_columns, constraint_expression
+  SELECT c.contype, c.convalidated, c.conkey, pg_get_expr(c.conbin, c.conrelid)
+  INTO constraint_type, constraint_validated, constraint_columns, constraint_expression
   FROM pg_constraint c
   WHERE c.conrelid = 'public.cajas_arqueos'::regclass
-    AND c.conname = 'ck_cajas_arqueos_teorico'
-    AND c.contype = 'c';
+    AND c.conname = 'ck_cajas_arqueos_teorico';
 
   constraint_found := FOUND;
   normalized_expression := lower(regexp_replace(
@@ -201,6 +210,10 @@ BEGIN
     '',
     'g'
   ));
+
+  IF constraint_found AND constraint_type IS DISTINCT FROM 'c'::"char" THEN
+    RAISE EXCEPTION 'ck_cajas_arqueos_teorico existe con tipo %, no es CHECK; abortando antes de DROP CONSTRAINT', constraint_type;
+  END IF;
 
   IF constraint_found AND (
     constraint_columns IS DISTINCT FROM ARRAY[monto_teorico_attnum]::smallint[]

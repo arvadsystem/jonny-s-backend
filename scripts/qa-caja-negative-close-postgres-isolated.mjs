@@ -350,6 +350,50 @@ const testWrongTargetDefinitions = async (client, safeSql) => {
   return results;
 };
 
+const testNonCheckNameCollision = async (client, safeSql) => {
+  const target = TARGETS[0];
+  await setCombination(client, '000');
+  try {
+    await client.query(`
+      ALTER TABLE ${target.table}
+      ADD CONSTRAINT ${target.name} UNIQUE (monto_teorico_cierre)
+    `);
+    const readConstraint = () => client.query(`
+      SELECT
+        c.oid::text AS oid,
+        c.contype,
+        c.convalidated,
+        c.conkey,
+        pg_get_expr(c.conbin, c.conrelid) AS expresion,
+        pg_get_constraintdef(c.oid, true) AS definicion
+      FROM pg_constraint c
+      WHERE c.conrelid = $1::regclass
+        AND c.conname = $2
+    `, [target.table, target.name]);
+    const before = await readConstraint();
+    assert.equal(before.rowCount, 1);
+    assert.equal(before.rows[0].contype, 'u');
+
+    const error = await expectFailure(
+      client,
+      safeSql,
+      (candidate) => /existe con tipo u, no es CHECK/.test(candidate.message)
+    );
+    const after = await readConstraint();
+    assert.deepEqual(after.rows, before.rows);
+
+    return {
+      constraint: target.name,
+      type: before.rows[0].contype,
+      safeRejected: true,
+      constraintIntact: true,
+      sqlstate: error.code || null
+    };
+  } finally {
+    await setLegacyState(client);
+  }
+};
+
 const testRollback = async (client, rollbackSql) => {
   await setCombination(client, '000');
   await runMultiStatement(client, rollbackSql);
@@ -901,6 +945,31 @@ export const runPostCloseConsistencyTargetedSuite = async ({
   }
 };
 
+export const runNonCheckConstraintCollisionTargetedSuite = async ({
+  connectionString = process.env.CAJA_CLOSE_ISOLATED_DATABASE_URL
+} = {}) => {
+  const expectedTarget = assertIsolatedDatabaseUrlAllowed({ connectionString });
+  const pool = createPool(connectionString);
+  const client = await pool.connect();
+  try {
+    const destructiveTarget = await assertIsolatedDatabaseServerAndMarker({
+      queryRunner: client,
+      expectedTarget
+    });
+    await initializeSchema(client);
+    const safeSql = await readFile(SAFE_PATH, 'utf8');
+    const nonCheckNameCollision = await testNonCheckNameCollision(client, safeSql);
+    return {
+      postgresVersion: (await client.query("SELECT current_setting('server_version') AS version")).rows[0].version,
+      destructiveTarget,
+      nonCheckNameCollision
+    };
+  } finally {
+    client.release();
+    await pool.end();
+  }
+};
+
 export const runIsolatedPostgresMigrationSuite = async ({
   connectionString = process.env.CAJA_CLOSE_ISOLATED_DATABASE_URL,
   injectFailureAfterSafe = false,
@@ -953,6 +1022,7 @@ export const runIsolatedPostgresMigrationSuite = async ({
     await restoreConstraintSnapshot(client, legacyBefore);
     const lock = await testNowaitLock(pool, safeSql);
     const wrongDefinitions = await testWrongTargetDefinitions(client, safeSql);
+    const nonCheckNameCollision = await testNonCheckNameCollision(client, safeSql);
     const combinations = await testEightCombinations(client, safeSql);
     const rollback = await testRollback(client, rollbackSql);
     const rollbackValidateLock = await testRollbackValidateLock(pool, rollbackSql);
@@ -982,6 +1052,7 @@ export const runIsolatedPostgresMigrationSuite = async ({
       safeOnSafe: true,
       lock,
       wrongDefinitions,
+      nonCheckNameCollision,
       combinations,
       rollback,
       rollbackValidateLock,
@@ -1002,9 +1073,11 @@ const isDirectExecution = process.argv[1]
   && new URL(`file:///${process.argv[1].replace(/\\/g, '/')}`).href === import.meta.url;
 
 if (isDirectExecution) {
-  const result = process.argv.includes('--post-close-consistency-only')
-    ? await runPostCloseConsistencyTargetedSuite()
-    : await runIsolatedPostgresMigrationSuite({
+  const result = process.argv.includes('--non-check-collision-only')
+    ? await runNonCheckConstraintCollisionTargetedSuite()
+    : process.argv.includes('--post-close-consistency-only')
+      ? await runPostCloseConsistencyTargetedSuite()
+      : await runIsolatedPostgresMigrationSuite({
         injectFailureAfterSafe: process.argv.includes('--inject-failure-after-safe'),
         leaveSafeApplied: process.argv.includes('--leave-safe-applied')
       });

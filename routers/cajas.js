@@ -31,6 +31,7 @@ import {
 import {
   canBypassCajaSucursalForAuxiliary
 } from '../services/cajaAssignmentRulesService.js';
+import { validateCajaCloseEditObservation } from '../services/cajaCloseEditValidationService.js';
 
 const router = express.Router();
 const CAJAS_SCOPE_PERMISSION = 'VENTAS_CAJAS_MULTISUCURSAL_VER';
@@ -5682,13 +5683,22 @@ router.patch('/ventas/cajas/cierres/:id/resolucion', checkPermission(['VENTAS_CA
 });
 
 router.patch('/ventas/cajas/cierres/:id', checkPermission(['VENTAS_CAJAS_SESION_CERRAR']), async (req, res) => {
+  const observationValidation = validateCajaCloseEditObservation(req.body);
+  if (!observationValidation.valid) {
+    return res.status(400).json({
+      error: true,
+      code: 'VENTAS_CAJAS_CLOSE_EDIT_OBSERVATION_REQUIRED',
+      message: 'Debe indicar una observacion de cierre no vacia.'
+    });
+  }
+
+  const observacion = observationValidation.observation;
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
     await ensureAdminOrSuperAdmin(req);
 
     const idCierreCaja = parsePositiveBigIntId(req.params.id);
-    const observacion = normalizeText(req.body.observacion_cierre, 500);
     const motivoEdicion = normalizeText(req.body.motivo_edicion, 500);
     const hasOwnField = (field) => Object.prototype.hasOwnProperty.call(req.body || {}, field);
     const financialFields = [

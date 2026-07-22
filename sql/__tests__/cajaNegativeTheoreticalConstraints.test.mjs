@@ -82,6 +82,20 @@ describe('monto teorico negativo en cierre de caja', () => {
     assert.equal((safeCode.match(/\bALTER TABLE\b/g) || []).length, 3);
   });
 
+  it('SAFE y PREFLIGHT detectan por nombre las colisiones no-CHECK y las marcan bloqueantes', () => {
+    assert.match(safeSource, /c\.contype, c\.convalidated, c\.conkey/);
+    assert.equal((safeSource.match(/constraint_type IS DISTINCT FROM 'c'::"char"/g) || []).length, 4);
+    assert.equal((safeSource.match(/no es CHECK; abortando antes de DROP CONSTRAINT/g) || []).length, 3);
+    assert.doesNotMatch(safeSource, /c\.conname = 'ck_cajas_(?:sesiones_monto_teorico|cierres_monto_teorico|arqueos_teorico)'\s+AND c\.contype = 'c'/);
+
+    assert.match(preflightSource, /tipo_restriccion/);
+    assert.match(preflightSource, /es_check/);
+    assert.match(preflightSource, /coincide_definicion_esperada/);
+    assert.match(preflightSource, /bloqueante_despliegue/);
+    assert.match(preflightSource, /c\.conkey = ARRAY\[a\.attnum\]::smallint\[\]/);
+    assert.doesNotMatch(preflightSource, /c\.conname = o\.restriccion AND c\.contype = 'c'/);
+  });
+
   it('VERIFY es solo lectura, detecta CHECK equivalentes por columna, catalogo OTRO y conteos de regresion', () => {
     assert.doesNotMatch(verifyCode, /\b(?:INSERT|UPDATE|DELETE|TRUNCATE|ALTER|DROP)\b/i);
     assert.match(verifySource, /c\.conkey @> ARRAY\[a\.attnum\]::smallint\[\]/);
