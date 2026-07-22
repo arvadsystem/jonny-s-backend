@@ -5,6 +5,7 @@ import {
   solicitudesCompraService
 } from '../services/solicitudesCompraService.js';
 import { solicitudesCompraRevisionService } from '../services/solicitudesCompraRevisionService.js';
+import { solicitudesCompraRecepcionService } from '../services/solicitudesCompraRecepcionService.js';
 
 const router = express.Router();
 
@@ -18,6 +19,13 @@ const CATALOG_PERMISSIONS = Array.from(new Set([...CREATE_PERMISSIONS, ...VIEW_P
 const APPROVE_PERMISSIONS = ['INVENTARIO_OC_APROBAR', 'INVENTARIO_ORDENES_COMPRA_GESTIONAR'];
 const REJECT_PERMISSIONS = ['INVENTARIO_OC_RECHAZAR', 'INVENTARIO_ORDENES_COMPRA_GESTIONAR'];
 const REVIEW_PERMISSIONS = Array.from(new Set([...APPROVE_PERMISSIONS, ...REJECT_PERMISSIONS]));
+const RECEIVE_PERMISSIONS = ['INVENTARIO_OC_RECEPCIONAR', 'INVENTARIO_ORDENES_COMPRA_RECEPCIONAR'];
+const EVIDENCE_PERMISSIONS = Array.from(new Set([
+  'INVENTARIO_OC_VER_EVIDENCIAS',
+  'INVENTARIO_OC_VER_DETALLE',
+  ...VIEW_PERMISSIONS,
+  ...RECEIVE_PERMISSIONS
+]));
 
 const requirePermissions = (permissions) => async (req, res, next) => {
   const idUsuario = Number.parseInt(String(req?.user?.id_usuario ?? ''), 10);
@@ -68,6 +76,8 @@ router.post('/', requirePermissions(CREATE_PERMISSIONS), handler(solicitudesComp
 router.get('/', requirePermissions(VIEW_PERMISSIONS), handler(solicitudesCompraService.list));
 router.put('/:id_solicitud_compra/aprobar', requirePermissions(APPROVE_PERMISSIONS), handler(solicitudesCompraRevisionService.approve));
 router.put('/:id_solicitud_compra/rechazar', requirePermissions(REJECT_PERMISSIONS), handler(solicitudesCompraRevisionService.reject));
+router.post('/:id_solicitud_compra/recibir', requirePermissions(RECEIVE_PERMISSIONS), handler(solicitudesCompraRecepcionService.receive));
+router.get('/:id_solicitud_compra/evidencias', requirePermissions(EVIDENCE_PERMISSIONS), handler(solicitudesCompraRecepcionService.listEvidence));
 router.get('/:id_solicitud_compra', requirePermissions(VIEW_PERMISSIONS), handler(solicitudesCompraService.getById));
 
 export default router;

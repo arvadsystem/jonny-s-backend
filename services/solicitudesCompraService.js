@@ -559,7 +559,11 @@ export const createSolicitudesCompraService = (overrides = {}) => {
                COALESCE(dc.total_productos, 0) AS total_productos,
                COALESCE(dc.total_insumos, 0) AS total_insumos,
                sc.observacion_solicitud, sc.comentario_revision,
-               false AS tiene_evidencia, COUNT(*) OVER()::integer AS total_count
+               EXISTS (
+                 SELECT 1 FROM public.solicitudes_compra_evidencias sce
+                 WHERE sce.id_solicitud_compra = sc.id_solicitud_compra
+               ) AS tiene_evidencia,
+               COUNT(*) OVER()::integer AS total_count
         FROM public.solicitudes_compra sc
         INNER JOIN public.sucursales s ON s.id_sucursal = sc.id_sucursal
         INNER JOIN public.almacenes a ON a.id_almacen = sc.id_almacen
@@ -591,7 +595,13 @@ export const createSolicitudesCompraService = (overrides = {}) => {
                u.nombre_usuario AS solicitante_usuario,
                COALESCE(NULLIF(TRIM(CONCAT_WS(' ', p.nombre, p.apellido)), ''), u.nombre_usuario) AS solicitante_nombre,
                ur.nombre_usuario AS revisor_usuario,
-               COALESCE(NULLIF(TRIM(CONCAT_WS(' ', pr.nombre, pr.apellido)), ''), ur.nombre_usuario) AS revisor_nombre
+               COALESCE(NULLIF(TRIM(CONCAT_WS(' ', pr.nombre, pr.apellido)), ''), ur.nombre_usuario) AS revisor_nombre,
+               urec.nombre_usuario AS receptor_usuario,
+               COALESCE(NULLIF(TRIM(CONCAT_WS(' ', prec.nombre, prec.apellido)), ''), urec.nombre_usuario) AS receptor_nombre,
+               EXISTS (
+                 SELECT 1 FROM public.solicitudes_compra_evidencias sce
+                 WHERE sce.id_solicitud_compra = sc.id_solicitud_compra
+               ) AS tiene_evidencia
         FROM public.solicitudes_compra sc
         INNER JOIN public.sucursales s ON s.id_sucursal = sc.id_sucursal
         INNER JOIN public.almacenes a ON a.id_almacen = sc.id_almacen
@@ -601,6 +611,9 @@ export const createSolicitudesCompraService = (overrides = {}) => {
         LEFT JOIN public.usuarios ur ON ur.id_usuario = sc.id_usuario_revisor
         LEFT JOIN public.empleados er ON er.id_empleado = ur.id_empleado
         LEFT JOIN public.personas pr ON pr.id_persona = er.id_persona
+        LEFT JOIN public.usuarios urec ON urec.id_usuario = sc.id_usuario_recepcion
+        LEFT JOIN public.empleados erec ON erec.id_empleado = urec.id_empleado
+        LEFT JOIN public.personas prec ON prec.id_persona = erec.id_persona
         WHERE sc.id_solicitud_compra = $1
         LIMIT 1
       `,
@@ -624,7 +637,7 @@ export const createSolicitudesCompraService = (overrides = {}) => {
                  'id_proveedor', prov.id_proveedor,
                  'nombre_proveedor', prov.nombre_proveedor
                ) END AS proveedor,
-               d.cantidad_recibida,
+               d.cantidad_recibida, d.cantidad_base_recibida,
                COALESCE(pa.cantidad, ia.cantidad, 0)::numeric AS stock_actual,
                COALESCE(pa.stock_minimo, ia.stock_minimo, 0)::numeric AS stock_minimo,
                ${stockStatusSql('COALESCE(pa.cantidad, ia.cantidad, 0)', 'COALESCE(pa.stock_minimo, ia.stock_minimo, 0)')} AS estado_stock
@@ -657,6 +670,10 @@ export const createSolicitudesCompraService = (overrides = {}) => {
         fecha_creacion: header.fecha_creacion,
         fecha_revision: header.fecha_revision,
         fecha_recepcion: header.fecha_recepcion,
+        inventario_aplicado: Boolean(header.inventario_aplicado),
+        fecha_inventario_aplicado: header.fecha_inventario_aplicado,
+        tiene_evidencia: Boolean(header.tiene_evidencia),
+        receptor: header.id_usuario_recepcion ? { id_usuario: Number(header.id_usuario_recepcion), nombre: header.receptor_nombre } : null,
         revisor: header.id_usuario_revisor ? { id_usuario: Number(header.id_usuario_revisor), nombre: header.revisor_nombre } : null
       },
       detalles: (detailsResult.rows || []).map((row) => ({
@@ -667,6 +684,7 @@ export const createSolicitudesCompraService = (overrides = {}) => {
         cantidad_aprobada: row.cantidad_aprobada === null ? null : Number(row.cantidad_aprobada),
         cantidad_base_aprobada: row.cantidad_base_aprobada === null ? null : Number(row.cantidad_base_aprobada),
         cantidad_recibida: row.cantidad_recibida === null ? null : Number(row.cantidad_recibida),
+        cantidad_base_recibida: row.cantidad_base_recibida === null ? null : Number(row.cantidad_base_recibida),
         stock_actual: Number(row.stock_actual ?? 0),
         stock_minimo: Number(row.stock_minimo ?? 0)
       }))
