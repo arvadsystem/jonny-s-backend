@@ -22,6 +22,58 @@ const createUnaccountablePaymentMethodError = (methods = []) => {
   return error;
 };
 
+const createAmbiguousReversionSessionError = (reversions = []) => {
+  const first = reversions[0] || {};
+  const error = new Error('La reversion no puede atribuirse de forma determinista a una sesion de caja.');
+  error.code = 'VENTAS_CAJAS_REVERSION_SESSION_AMBIGUOUS';
+  error.httpStatus = 409;
+  error.publicMessage = 'Una reversion de la factura tiene cobros en varias sesiones y no define la sesion original.';
+  error.details = {
+    id_reversion: first.id_reversion ?? null,
+    id_factura_original: first.id_factura_original ?? null,
+    sesiones: Array.isArray(first.sesiones) ? first.sesiones.map(String) : []
+  };
+  return error;
+};
+
+const createReversionSessionPaymentMismatchError = (reversions = []) => {
+  const normalized = reversions.map((item) => ({
+    id_reversion: item?.id_reversion == null ? null : String(item.id_reversion),
+    id_factura_original: item?.id_factura_original == null ? null : String(item.id_factura_original),
+    id_sesion_caja_atribuida: item?.id_sesion_caja_atribuida == null
+      ? null
+      : String(item.id_sesion_caja_atribuida),
+    sesiones_con_cobros: Array.isArray(item?.sesiones_con_cobros)
+      ? item.sesiones_con_cobros.map(String)
+      : [],
+    cantidad_cobros_sesion_atribuida: Number(item?.cantidad_cobros_sesion_atribuida || 0),
+    total_cobrado_sesion_atribuida: roundMoney(item?.total_cobrado_sesion_atribuida),
+    motivo: String(item?.motivo || 'SIN_COBROS_EN_SESION_ATRIBUIDA')
+  }));
+  const first = normalized[0] || {};
+  const error = new Error('La reversion atribuida no tiene cobros contabilizables en la sesion indicada.');
+  error.code = 'VENTAS_CAJAS_REVERSION_SESSION_PAYMENT_MISMATCH';
+  error.httpStatus = 409;
+  error.publicMessage = 'Una reversion fue asociada a una sesion que no contiene los cobros originales de la factura.';
+  error.details = {
+    ...first,
+    inconsistencias: normalized
+  };
+  return error;
+};
+
+const createReversionAccountingMismatchError = ({ totalReversado, totalPorMetodo }) => {
+  const error = new Error('El total de reversiones no coincide con su distribucion por metodo.');
+  error.code = 'VENTAS_CAJAS_REVERSION_ACCOUNTING_MISMATCH';
+  error.httpStatus = 409;
+  error.publicMessage = 'La distribucion contable de las reversiones de la sesion no es consistente.';
+  error.details = {
+    total_reversado: roundMoney(totalReversado),
+    total_reversiones_por_metodo: roundMoney(totalPorMetodo)
+  };
+  return error;
+};
+
 const normalizeMethod = (row = {}) => ({
   id_metodo_pago: Number(row.id_metodo_pago || 0) || null,
   codigo: normalizeMethodCode(row.codigo),
@@ -62,9 +114,6 @@ const normalizeSnapshot = (row = {}, idSesionCaja) => {
     tarjeta_teorico: roundMoney(row.tarjeta_teorico),
     transferencia_teorico: roundMoney(row.transferencia_teorico),
     total_teorico: roundMoney(row.total_teorico),
-    otros_no_efectivo_id_metodo_pago: Number.isFinite(Number(row.otros_no_efectivo_id_metodo_pago))
-      ? Number(row.otros_no_efectivo_id_metodo_pago)
-      : null,
     fingerprint: {
       cantidad_cobros: Number(fingerprint.cantidad_cobros || 0),
       max_id_factura_cobro: toBigIntText(fingerprint.max_id_factura_cobro),
@@ -96,10 +145,95 @@ const normalizeSnapshot = (row = {}, idSesionCaja) => {
   snapshot.tarjetaTeorico = snapshot.tarjeta_teorico;
   snapshot.transferenciaTeorico = snapshot.transferencia_teorico;
   snapshot.totalTeorico = snapshot.total_teorico;
-  snapshot.otrosNoEfectivoIdMetodoPago = snapshot.otros_no_efectivo_id_metodo_pago;
   snapshot.salesByCode = new Map(snapshot.metodos.map((method) => [method.codigo, method.ventas_brutas]));
   snapshot.reversionsByCode = new Map(snapshot.metodos.map((method) => [method.codigo, method.reversiones]));
   snapshot.salesNetByCode = new Map(snapshot.metodos.map((method) => [method.codigo, method.ventas_netas]));
+
+  const catalogoRequerido = row.catalogo_requerido && typeof row.catalogo_requerido === 'object'
+    ? row.catalogo_requerido
+    : {};
+  const buildCatalogValidation = (codigo, expectedAfectaEfectivo) => {
+    const entry = catalogoRequerido[codigo] || {};
+    const idMetodoPago = Number.isFinite(Number(entry.id_metodo_pago)) && Number(entry.id_metodo_pago) > 0
+      ? Number(entry.id_metodo_pago)
+      : null;
+    const parsedMatches = Number(entry.coincidencias);
+    const coincidencias = Number.isInteger(parsedMatches) && parsedMatches >= 0
+      ? parsedMatches
+      : idMetodoPago ? 1 : 0;
+    const activo = entry.activo === true;
+    const afectaEfectivo = entry.afecta_efectivo === true
+      ? true
+      : entry.afecta_efectivo === false ? false : null;
+
+    let motivo = null;
+    if (coincidencias === 0) motivo = 'NO_EXISTE';
+    else if (coincidencias !== 1) motivo = 'CODIGO_DUPLICADO';
+    else if (!idMetodoPago) motivo = 'NO_EXISTE';
+    else if (!activo) motivo = 'INACTIVO';
+    else if (afectaEfectivo !== expectedAfectaEfectivo) motivo = 'AFECTA_EFECTIVO_INCORRECTO';
+
+    return {
+      codigo,
+      coincidencias,
+      id_metodo_pago: idMetodoPago,
+      activo,
+      afecta_efectivo: afectaEfectivo,
+      valido: motivo === null,
+      motivo
+    };
+  };
+
+  // Fuente de verdad para saber si EFECTIVO/TARJETA/TRANSFERENCIA/OTRO tienen
+  // exactamente una configuracion valida en el catalogo. Reemplaza la
+  // fabricacion silenciosa de filas con id_metodo_pago=null: el consumidor
+  // (buildSegmentedArqueoComputation) debe consultar esto antes de confiar en
+  // snapshot.metodos o en el bucket agrupado.
+  snapshot.catalogValidation = {
+    EFECTIVO: buildCatalogValidation('EFECTIVO', true),
+    TARJETA: buildCatalogValidation('TARJETA', false),
+    TRANSFERENCIA: buildCatalogValidation('TRANSFERENCIA', false),
+    OTRO: buildCatalogValidation('OTRO', false)
+  };
+  for (const [codigo, entry] of Object.entries(snapshot.catalogValidation)) {
+    snapshot.fingerprint[`catalogo_${codigo.toLowerCase()}`] = [
+      entry.coincidencias,
+      entry.id_metodo_pago || 0,
+      entry.activo === true ? '1' : '0',
+      entry.afecta_efectivo === true ? '1' : entry.afecta_efectivo === false ? '0' : 'NULL'
+    ].join(':');
+  }
+
+  const metodosAgrupados = Array.isArray(row.otros_no_efectivo_metodos_agrupados)
+    ? row.otros_no_efectivo_metodos_agrupados.map((item) => ({
+        codigo: normalizeMethodCode(item?.codigo),
+        ventas_brutas: roundMoney(item?.ventas_brutas),
+        reversiones: roundMoney(item?.reversiones),
+        ventas_netas: roundMoney(item?.ventas_netas)
+      }))
+    : [];
+
+  // Detalle de auditoria del bucket "otros no efectivo" (TARJETA/TRANSFERENCIA
+  // excluidas). ventas_netas puede ser negativo (reversiones superiores a las
+  // ventas del grupo); eso se resuelve en la capa de computo (5.4), no aqui.
+  snapshot.otrosNoEfectivo = {
+    ventas_brutas: roundMoney(row.otros_no_efectivo_ventas_brutas),
+    reversiones: roundMoney(row.otros_no_efectivo_reversiones),
+    ventas_netas: roundMoney(row.otros_no_efectivo_ventas_netas),
+    metodos_agrupados: metodosAgrupados
+  };
+
+  const totalReversionesPorMetodo = roundMoney(
+    snapshot.metodos.reduce((sum, method) => roundMoney(sum + method.reversiones), 0)
+      + snapshot.otrosNoEfectivo.reversiones
+  );
+  if (totalReversionesPorMetodo !== roundMoney(snapshot.fingerprint.total_reversado)) {
+    throw createReversionAccountingMismatchError({
+      totalReversado: snapshot.fingerprint.total_reversado,
+      totalPorMetodo: totalReversionesPorMetodo
+    });
+  }
+  snapshot.totalReversionesPorMetodo = totalReversionesPorMetodo;
 
   return snapshot;
 };
@@ -189,12 +323,20 @@ export const loadCajaCloseFinancialSnapshot = async ({ queryRunner, idSesionCaja
           ON p.id_metodo_pago = pm.id_metodo_pago
         GROUP BY pm.id_metodo_pago
       ),
-      reversion_source AS (
+      reversion_candidates AS (
         SELECT
           fr.id_reversion,
           fr.id_factura_original,
-          COALESCE(fr.monto_reversado, 0)::numeric(14,2) AS monto_reversado
+          fr.id_sesion_caja_original,
+          COALESCE(fr.monto_reversado, 0)::numeric(14,2) AS monto_reversado,
+          COALESCE(
+            ARRAY_AGG(DISTINCT fc_session.id_sesion_caja ORDER BY fc_session.id_sesion_caja)
+              FILTER (WHERE fc_session.id_sesion_caja IS NOT NULL),
+            ARRAY[]::bigint[]
+          ) AS sesiones_cobro
         FROM public.facturas_reversiones fr
+        LEFT JOIN public.facturas_cobros fc_session
+          ON fc_session.id_factura = fr.id_factura_original
         WHERE UPPER(TRIM(COALESCE(fr.estado, ''))) = 'APLICADA'
           AND (
             fr.id_sesion_caja_original = $1::bigint
@@ -208,6 +350,88 @@ export const loadCajaCloseFinancialSnapshot = async ({ queryRunner, idSesionCaja
               )
             )
           )
+        GROUP BY fr.id_reversion, fr.id_factura_original,
+                 fr.id_sesion_caja_original, fr.monto_reversado
+      ),
+      reversion_scope AS (
+        SELECT
+          rc.*,
+          CASE
+            WHEN rc.id_sesion_caja_original IS NOT NULL THEN rc.id_sesion_caja_original
+            WHEN CARDINALITY(rc.sesiones_cobro) = 1 THEN rc.sesiones_cobro[1]
+            ELSE NULL
+          END AS id_sesion_caja_atribuida
+        FROM reversion_candidates rc
+      ),
+      attributed_reversion_payment_state AS (
+        SELECT
+          rs.id_reversion,
+          rs.id_factura_original,
+          rs.monto_reversado,
+          rs.id_sesion_caja_atribuida,
+          rs.sesiones_cobro AS sesiones_con_cobros,
+          COUNT(fc_attributed.id_factura_cobro)::int AS cantidad_cobros_sesion_atribuida,
+          COALESCE(SUM(fc_attributed.monto), 0)::numeric(14,2) AS total_cobrado_sesion_atribuida
+        FROM reversion_scope rs
+        LEFT JOIN public.facturas_cobros fc_attributed
+          ON fc_attributed.id_factura = rs.id_factura_original
+         AND fc_attributed.id_sesion_caja = rs.id_sesion_caja_atribuida
+        GROUP BY rs.id_reversion, rs.id_factura_original, rs.monto_reversado,
+                 rs.id_sesion_caja_atribuida, rs.sesiones_cobro
+      ),
+      ambiguous_reversion_summary AS (
+        SELECT COALESCE(
+          JSONB_AGG(
+            JSONB_BUILD_OBJECT(
+              'id_reversion', rs.id_reversion,
+              'id_factura_original', rs.id_factura_original,
+              'sesiones', rs.sesiones_cobro
+            )
+            ORDER BY rs.id_reversion
+          ) FILTER (
+            WHERE rs.id_sesion_caja_original IS NULL
+              AND CARDINALITY(rs.sesiones_cobro) >= 2
+          ),
+          '[]'::jsonb
+        ) AS reversiones_sesion_ambiguas
+        FROM reversion_scope rs
+      ),
+      reversion_payment_mismatch_summary AS (
+        SELECT COALESCE(
+          JSONB_AGG(
+            JSONB_BUILD_OBJECT(
+              'id_reversion', arps.id_reversion,
+              'id_factura_original', arps.id_factura_original,
+              'id_sesion_caja_atribuida', arps.id_sesion_caja_atribuida,
+              'sesiones_con_cobros', arps.sesiones_con_cobros,
+              'cantidad_cobros_sesion_atribuida', arps.cantidad_cobros_sesion_atribuida,
+              'total_cobrado_sesion_atribuida', arps.total_cobrado_sesion_atribuida,
+              'motivo', CASE
+                WHEN arps.cantidad_cobros_sesion_atribuida = 0 THEN 'SIN_COBROS_EN_SESION_ATRIBUIDA'
+                ELSE 'TOTAL_COBRADO_SESION_INVALIDO'
+              END
+            )
+            ORDER BY arps.id_reversion
+          ) FILTER (
+            WHERE arps.id_sesion_caja_atribuida IS NOT NULL
+              AND arps.monto_reversado <> 0
+              AND (
+                arps.cantidad_cobros_sesion_atribuida = 0
+                OR arps.total_cobrado_sesion_atribuida <= 0
+              )
+          ),
+          '[]'::jsonb
+        ) AS reversiones_sesion_pago_inconsistentes
+        FROM attributed_reversion_payment_state arps
+      ),
+      reversion_source AS (
+        SELECT
+          arps.id_reversion,
+          arps.id_factura_original,
+          arps.monto_reversado,
+          arps.id_sesion_caja_atribuida
+        FROM attributed_reversion_payment_state arps
+        WHERE arps.id_sesion_caja_atribuida = $1::bigint
       ),
       reversion_lines AS (
         SELECT
@@ -222,6 +446,7 @@ export const loadCajaCloseFinancialSnapshot = async ({ queryRunner, idSesionCaja
         FROM reversion_source rs
         INNER JOIN public.facturas_cobros fc
           ON fc.id_factura = rs.id_factura_original
+         AND fc.id_sesion_caja = rs.id_sesion_caja_atribuida
       ),
       reversion_allocations AS (
         SELECT
@@ -321,14 +546,64 @@ export const loadCajaCloseFinancialSnapshot = async ({ queryRunner, idSesionCaja
           COALESCE(SUM(CASE WHEN mt.codigo = 'TRANSFERENCIA' THEN mt.ventas_netas ELSE 0 END), 0)::numeric(14,2) AS ventas_transferencia_netas
         FROM method_totals mt
       ),
-      -- cajas_cierres_arqueos_metodos.id_metodo_pago es NOT NULL con FK real a
-      -- cat_metodos_pago (fk_ccam_metodo); la fila agrupada OTROS_NO_EFECTIVO
-      -- necesita un ancla valida. Se toma el catalogo completo (activo o no)
-      -- para que exista un id aunque el metodo este inactivo.
-      other_non_cash_method AS (
-        SELECT MIN(pmc.id_metodo_pago) AS id_metodo_pago
-        FROM payment_method_catalog pmc
-        WHERE pmc.codigo <> ALL(ARRAY['EFECTIVO','TARJETA','TRANSFERENCIA']::text[])
+      required_codes AS (
+        SELECT * FROM (VALUES ('EFECTIVO'), ('TARJETA'), ('TRANSFERENCIA'), ('OTRO')) AS v(codigo)
+      ),
+      -- Estado crudo del catalogo (exista o no, activo o no) para los 4 codigos
+      -- que el cierre siempre necesita evaluar. Resuelve el id de OTRO por
+      -- codigo exacto (no por MIN(id) arbitrario): el id_metodo_pago persistido
+      -- y el metodo_pago_codigo persistido siempre corresponden a la misma fila
+      -- del catalogo.
+      required_catalog_state AS (
+        SELECT
+          rc.codigo AS codigo_requerido,
+          COUNT(pmc.id_metodo_pago)::int AS coincidencias,
+          CASE WHEN COUNT(pmc.id_metodo_pago) = 1 THEN MIN(pmc.id_metodo_pago) END AS id_metodo_pago,
+          CASE WHEN COUNT(pmc.id_metodo_pago) = 1 THEN BOOL_OR(pmc.activo) END AS activo,
+          CASE WHEN COUNT(pmc.id_metodo_pago) = 1 THEN BOOL_OR(pmc.afecta_efectivo) END AS afecta_efectivo
+        FROM required_codes rc
+        LEFT JOIN payment_method_catalog pmc ON pmc.codigo = rc.codigo
+        GROUP BY rc.codigo
+      ),
+      required_catalog_json AS (
+        SELECT jsonb_object_agg(
+          codigo_requerido,
+           jsonb_build_object(
+            'coincidencias', coincidencias,
+            'id_metodo_pago', id_metodo_pago,
+            'activo', activo,
+            'afecta_efectivo', afecta_efectivo
+          )
+        ) AS catalogo_requerido
+        FROM required_catalog_state
+      ),
+      -- Bucket "otros no efectivo": todo metodo activo con afecta_efectivo =
+      -- false que no sea TARJETA/TRANSFERENCIA (OTRO y billeteras/enlaces de
+      -- pago futuros). Calculado de forma explicita (no por resta del total)
+      -- para poder exponer el detalle agrupado como informacion de auditoria.
+      grouped_other_methods AS (
+        SELECT mt.id_metodo_pago, mt.codigo, mt.ventas_brutas, mt.reversiones, mt.ventas_netas
+        FROM method_totals mt
+        WHERE mt.afecta_efectivo = false
+          AND mt.codigo <> ALL(ARRAY['TARJETA','TRANSFERENCIA']::text[])
+      ),
+      grouped_other_summary AS (
+        SELECT
+          COALESCE(SUM(ventas_brutas), 0)::numeric(14,2) AS ventas_brutas,
+          COALESCE(SUM(reversiones), 0)::numeric(14,2) AS reversiones,
+          COALESCE(SUM(ventas_netas), 0)::numeric(14,2) AS ventas_netas,
+          COALESCE(
+            jsonb_agg(
+              jsonb_build_object(
+                'codigo', codigo,
+                'ventas_brutas', ventas_brutas,
+                'reversiones', reversiones,
+                'ventas_netas', ventas_netas
+              ) ORDER BY codigo
+            ) FILTER (WHERE ventas_brutas <> 0 OR reversiones <> 0),
+            '[]'::jsonb
+          ) AS metodos_agrupados
+        FROM grouped_other_methods
       ),
       segmented_methods AS (
         SELECT
@@ -390,7 +665,13 @@ export const loadCajaCloseFinancialSnapshot = async ({ queryRunner, idSesionCaja
             )
             FROM segmented_methods sm
           ), '[]'::jsonb) AS metodos,
-          onm.id_metodo_pago AS otros_no_efectivo_id_metodo_pago,
+          rcj.catalogo_requerido,
+          gos.ventas_brutas AS otros_no_efectivo_ventas_brutas,
+          gos.reversiones AS otros_no_efectivo_reversiones,
+          gos.ventas_netas AS otros_no_efectivo_ventas_netas,
+          gos.metodos_agrupados AS otros_no_efectivo_metodos_agrupados,
+          ars.reversiones_sesion_ambiguas,
+          rpms.reversiones_sesion_pago_inconsistentes,
           ips.metodos_pago_invalidos,
           jsonb_build_object(
             'cantidad_cobros', COALESCE(ff.cantidad_cobros, 0),
@@ -417,7 +698,10 @@ export const loadCajaCloseFinancialSnapshot = async ({ queryRunner, idSesionCaja
         CROSS JOIN financial_fingerprint ff
         CROSS JOIN aggregate_totals at
         CROSS JOIN invalid_payment_summary ips
-        CROSS JOIN other_non_cash_method onm
+        CROSS JOIN ambiguous_reversion_summary ars
+        CROSS JOIN reversion_payment_mismatch_summary rpms
+        CROSS JOIN required_catalog_json rcj
+        CROSS JOIN grouped_other_summary gos
       )
       SELECT fs.*
       FROM final_snapshot fs
@@ -426,6 +710,18 @@ export const loadCajaCloseFinancialSnapshot = async ({ queryRunner, idSesionCaja
   );
 
   const row = result.rows?.[0] || {};
+  const ambiguousReversions = Array.isArray(row.reversiones_sesion_ambiguas)
+    ? row.reversiones_sesion_ambiguas
+    : [];
+  if (ambiguousReversions.length > 0) {
+    throw createAmbiguousReversionSessionError(ambiguousReversions);
+  }
+  const paymentMismatchReversions = Array.isArray(row.reversiones_sesion_pago_inconsistentes)
+    ? row.reversiones_sesion_pago_inconsistentes
+    : [];
+  if (paymentMismatchReversions.length > 0) {
+    throw createReversionSessionPaymentMismatchError(paymentMismatchReversions);
+  }
   const invalidMethods = Array.isArray(row.metodos_pago_invalidos)
     ? row.metodos_pago_invalidos
     : [];

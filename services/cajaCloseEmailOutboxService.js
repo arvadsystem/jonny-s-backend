@@ -71,6 +71,23 @@ const resolveActorName = ({ nombre, usuario } = {}) =>
 
 const formatHtmlDateTime = (value) => cleanText(formatCajaCierreDateTime(value), 'N/A');
 
+// Presentacion unicamente: metodo_pago_codigo persistido sigue siendo
+// EFECTIVO/TARJETA/TRANSFERENCIA/OTRO. Nunca mostrar el codigo tecnico
+// anterior OTROS_NO_EFECTIVO ni un codigo crudo con guion bajo.
+const METHOD_DISPLAY_LABELS = {
+  EFECTIVO: 'Efectivo',
+  TARJETA: 'Tarjeta',
+  TRANSFERENCIA: 'Transferencia',
+  OTRO: 'Otros no efectivo'
+};
+
+const resolveMethodDisplayLabel = (codigo) => {
+  const normalized = String(codigo || '').trim().toUpperCase();
+  return METHOD_DISPLAY_LABELS[normalized] || cleanText(codigo, 'N/A');
+};
+
+const AUTOMATIC_RECONCILIATION_NOTE = 'Conciliación automática del sistema';
+
 const resolvePayrollSyncLabel = (payrollSync = {}) => {
   const reason = String(payrollSync?.reason || '').trim().toUpperCase();
   if (!reason || reason === 'NOT_REQUIRED') return 'No requerido';
@@ -193,14 +210,19 @@ export const fetchCajaCloseArqueos = async (queryRunner, idCierreCaja) => {
     `,
     [idCierreCaja]
   );
-  return (result.rows || []).map((row) => ({
-    metodo_pago_codigo: cleanText(row.metodo_pago_codigo, 'N/A'),
-    monto_teorico: Number(row.monto_teorico || 0),
-    monto_declarado: Number(row.monto_declarado || 0),
-    diferencia: Number(row.diferencia || 0),
-    requiere_revision: Boolean(row.requiere_revision),
-    observacion: cleanText(row.observacion, 'N/A')
-  }));
+  return (result.rows || []).map((row) => {
+    const codigo = cleanText(row.metodo_pago_codigo, 'N/A');
+    const isOtro = codigo.trim().toUpperCase() === 'OTRO';
+    return {
+      metodo_pago_codigo: codigo,
+      monto_teorico: Number(row.monto_teorico || 0),
+      monto_declarado: Number(row.monto_declarado || 0),
+      diferencia: Number(row.diferencia || 0),
+      requiere_revision: Boolean(row.requiere_revision),
+      // La fila OTRO nunca fue declarada manualmente: "N/A" seria enganoso.
+      observacion: cleanText(row.observacion, isOtro ? AUTOMATIC_RECONCILIATION_NOTE : 'N/A')
+    };
+  });
 };
 
 export const buildCajaCloseEmailSubject = ({ payload = {} } = {}) => {
@@ -246,7 +268,7 @@ export const buildCajaCloseEmailHtml = ({ payload = {}, pdfAttached = false } = 
     { label: 'Usuario ejecutor', render: (row) => row.usuario_ejecutor || 'No disponible' }
   ];
   const arqueoColumns = [
-    { label: 'Metodo', render: (row) => row.metodo_pago_codigo || 'N/A' },
+    { label: 'Metodo', render: (row) => resolveMethodDisplayLabel(row.metodo_pago_codigo) },
     { label: 'Teorico', align: 'right', render: (row) => money(row.monto_teorico) },
     { label: 'Declarado', align: 'right', render: (row) => money(row.monto_declarado) },
     { label: 'Diferencia', align: 'right', render: (row) => money(row.diferencia) },

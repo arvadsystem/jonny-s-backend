@@ -426,7 +426,9 @@ describe('caja close email durable outbox', () => {
       'No requerido',
       'No disponible',
       'CIERRE REGISTRADO',
-      'EFECTIVO',
+      // Etiqueta de presentacion, no el codigo tecnico crudo (5.2/7): tanto
+      // el HTML como el PDF deben mostrar "Efectivo", nunca "EFECTIVO".
+      'Efectivo',
       'Cuadrado',
       'Ingreso manual caja',
       'Egreso manual caja',
@@ -616,7 +618,7 @@ describe('caja close email durable outbox', () => {
       'Ventas en efectivo',
       'L 900.00',
       'Arqueos por metodo',
-      'EFECTIVO',
+      'Efectivo',
       'Ingresos manuales',
       'Ingreso manual caja',
       'Egresos manuales',
