@@ -574,11 +574,25 @@ const runHttpCloseSmoke = async () => {
       const partialWrites = await pool.query(`
         SELECT
           (SELECT COUNT(*)::int FROM public.cajas_cierres WHERE id_sesion_caja = $1) AS cierres,
+          (SELECT COUNT(*)::int FROM public.cajas_cierres_arqueos_metodos WHERE id_sesion_caja = $1) AS arqueos,
           (SELECT COUNT(*)::int FROM public.cajas_cierres_notificaciones_email outbox
            INNER JOIN public.cajas_cierres cierre ON cierre.id_cierre_caja = outbox.id_cierre_caja
-           WHERE cierre.id_sesion_caja = $1) AS outbox
-      `, [idSesionCaja]);
-      assert.deepEqual(partialWrites.rows[0], { cierres: 0, outbox: 0 }, `${label} dejo escritura parcial`);
+           WHERE cierre.id_sesion_caja = $1) AS outbox,
+          (SELECT UPPER(TRIM(estado.codigo))
+           FROM public.cajas_sesiones sesion
+           INNER JOIN public.cat_cajas_sesiones_estados estado
+             ON estado.id_estado_sesion_caja = sesion.id_estado_sesion_caja
+           WHERE sesion.id_sesion_caja = $1) AS estado_sesion,
+          (SELECT id_cierre_caja FROM public.cajas_cierres_validaciones
+           WHERE id_validacion_cierre = $2) AS validacion_vinculada
+      `, [idSesionCaja, validationId]);
+      assert.deepEqual(partialWrites.rows[0], {
+        cierres: 0,
+        arqueos: 0,
+        outbox: 0,
+        estado_sesion: 'ABIERTA',
+        validacion_vinculada: null
+      }, `${label} dejo escritura parcial`);
       return response;
     };
 
@@ -825,6 +839,140 @@ const runHttpCloseSmoke = async () => {
       WHERE id_validacion_cierre = $1 AND metodo_pago_codigo = 'OTRO'
     `, [validationId]));
 
+    const coherentTamperRejections = {};
+    const runCoherentTamper = async (label, mutate) => {
+      const validation = await createCloseValidation();
+      const validationId = validation.body.id_validacion_cierre;
+      await mutate(validationId);
+      const rejected = await expectControlledCloseRejection(
+        validationId,
+        label,
+        'VENTAS_CAJAS_CLOSE_VALIDATION_STALE'
+      );
+      assert.equal(rejected.status, 409);
+      assert.equal(rejected.body?.details?.motivo, 'VALIDATION_RECOMPUTATION_MISMATCH');
+      coherentTamperRejections[label] = rejected.status;
+    };
+    await runCoherentTamper('efectivo_coherente', async (validationId) => {
+      await pool.query(`
+        UPDATE public.cajas_cierres_validaciones_metodos
+        SET monto_declarado = monto_declarado + 100,
+            diferencia = diferencia + 100,
+            requiere_revision = true
+        WHERE id_validacion_cierre = $1 AND metodo_pago_codigo = 'EFECTIVO'
+      `, [validationId]);
+      await pool.query(`
+        UPDATE public.cajas_cierres_validaciones
+        SET total_declarado = total_declarado + 100,
+            diferencia_total = diferencia_total + 100,
+            hay_diferencia = true
+        WHERE id_validacion_cierre = $1
+      `, [validationId]);
+    });
+    await runCoherentTamper('tarjeta_coherente', async (validationId) => {
+      await pool.query(`
+        UPDATE public.cajas_cierres_validaciones_metodos
+        SET monto_declarado = monto_declarado + 10,
+            diferencia = diferencia + 10,
+            cantidad_referencias = COALESCE(cantidad_referencias, 0) + 1,
+            requiere_revision = true
+        WHERE id_validacion_cierre = $1 AND metodo_pago_codigo = 'TARJETA'
+      `, [validationId]);
+      await pool.query(`
+        UPDATE public.cajas_cierres_validaciones
+        SET total_declarado = total_declarado + 10,
+            diferencia_total = diferencia_total + 10,
+            hay_diferencia = true
+        WHERE id_validacion_cierre = $1
+      `, [validationId]);
+    });
+    await runCoherentTamper('transferencia_coherente', async (validationId) => {
+      await pool.query(`
+        UPDATE public.cajas_cierres_validaciones_metodos
+        SET monto_declarado = monto_declarado + 10,
+            diferencia = diferencia + 10,
+            observacion = 'QA alteracion coordinada transferencia',
+            requiere_revision = true
+        WHERE id_validacion_cierre = $1 AND metodo_pago_codigo = 'TRANSFERENCIA'
+      `, [validationId]);
+      await pool.query(`
+        UPDATE public.cajas_cierres_validaciones
+        SET total_declarado = total_declarado + 10,
+            diferencia_total = diferencia_total + 10,
+            hay_diferencia = true
+        WHERE id_validacion_cierre = $1
+      `, [validationId]);
+    });
+    await runCoherentTamper('todos_los_manuales_coherentes', async (validationId) => {
+      await pool.query(`
+        UPDATE public.cajas_cierres_validaciones_metodos
+        SET monto_declarado = monto_declarado + 10,
+            diferencia = diferencia + 10,
+            observacion = COALESCE(observacion, 'QA alteracion coordinada completa'),
+            requiere_revision = true
+        WHERE id_validacion_cierre = $1
+          AND metodo_pago_codigo IN ('EFECTIVO','TARJETA','TRANSFERENCIA')
+      `, [validationId]);
+      await pool.query(`
+        UPDATE public.cajas_cierres_validaciones
+        SET total_declarado = total_declarado + 30,
+            diferencia_total = diferencia_total + 30,
+            hay_diferencia = true
+        WHERE id_validacion_cierre = $1
+      `, [validationId]);
+    });
+    await runCoherentTamper('otro_coherente', async (validationId) => {
+      await pool.query(`
+        UPDATE public.cajas_cierres_validaciones_metodos
+        SET monto_declarado = monto_declarado + 10,
+            diferencia = diferencia + 10,
+            requiere_revision = true
+        WHERE id_validacion_cierre = $1 AND metodo_pago_codigo = 'OTRO'
+      `, [validationId]);
+      await pool.query(`
+        UPDATE public.cajas_cierres_validaciones
+        SET total_declarado = total_declarado + 10,
+            diferencia_total = diferencia_total + 10,
+            hay_diferencia = true
+        WHERE id_validacion_cierre = $1
+      `, [validationId]);
+    });
+    await runCoherentTamper('payload_original_alterado', (validationId) => pool.query(`
+      UPDATE public.cajas_cierres_validaciones
+      SET payload_declarado_json = jsonb_set(
+        payload_declarado_json,
+        '{arqueos,0,monto_declarado}',
+        '100'::jsonb,
+        false
+      )
+      WHERE id_validacion_cierre = $1
+    `, [validationId]));
+
+    const invalidOriginalPayloadRejections = {};
+    const invalidOriginalPayloads = {
+      json_nulo: null,
+      estructura_incorrecta: {},
+      solo_dos_metodos: { arqueos: arqueosPayload.slice(0, 2) },
+      metodo_duplicado: { arqueos: [...arqueosPayload, { ...arqueosPayload[0] }] },
+      otro_manual: { arqueos: [...arqueosPayload.slice(0, 2), { metodo_pago_codigo: 'OTRO', monto_declarado: 400 }] },
+      codigo_inesperado: { arqueos: [...arqueosPayload.slice(0, 2), { metodo_pago_codigo: 'CRIPTO', monto_declarado: 0 }] }
+    };
+    for (const [label, payload] of Object.entries(invalidOriginalPayloads)) {
+      const validation = await createCloseValidation();
+      const validationId = validation.body.id_validacion_cierre;
+      await pool.query(
+        'UPDATE public.cajas_cierres_validaciones SET payload_declarado_json = $2::jsonb WHERE id_validacion_cierre = $1',
+        [validationId, JSON.stringify(payload)]
+      );
+      const rejected = await expectControlledCloseRejection(
+        validationId,
+        `payload original ${label}`,
+        'VENTAS_CAJAS_CLOSE_VALIDATION_STALE'
+      );
+      assert.equal(rejected.status, 409);
+      invalidOriginalPayloadRejections[label] = rejected.status;
+    }
+
     const operationalChangeRejections = {};
     {
       const validation = await createCloseValidation();
@@ -905,7 +1053,7 @@ const runHttpCloseSmoke = async () => {
           '127.0.0.1', 'QA_SMOKE', 'qa-caja-negative-close-smoke', false
         )
         RETURNING id_reversion
-      `, [`R${baseId}`, idFactura, references.id_sucursal, references.id_caja, idSesionCaja, qaTestUserId]);
+      `, [`${fixtureReference}R`, idFactura, references.id_sucursal, references.id_caja, idSesionCaja, qaTestUserId]);
       const idReversion = reversal.rows[0].id_reversion;
       try {
         const rejected = await expectControlledCloseRejection(validation.body.id_validacion_cierre, 'nueva reversion', 'VENTAS_CAJAS_CLOSE_VALIDATION_STALE');
@@ -1028,6 +1176,8 @@ const runHttpCloseSmoke = async () => {
       duplicateRejections,
       malformedValidationRejections,
       arithmeticTamperRejections,
+      coherentTamperRejections,
+      invalidOriginalPayloadRejections,
       operationalChangeRejections,
       sharedQaCatalogMutations: false,
       reintentoCierreRechazado: cerrarReintento.status === 409,

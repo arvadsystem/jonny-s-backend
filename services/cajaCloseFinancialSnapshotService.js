@@ -36,6 +36,44 @@ const createAmbiguousReversionSessionError = (reversions = []) => {
   return error;
 };
 
+const createReversionSessionPaymentMismatchError = (reversions = []) => {
+  const normalized = reversions.map((item) => ({
+    id_reversion: item?.id_reversion == null ? null : String(item.id_reversion),
+    id_factura_original: item?.id_factura_original == null ? null : String(item.id_factura_original),
+    id_sesion_caja_atribuida: item?.id_sesion_caja_atribuida == null
+      ? null
+      : String(item.id_sesion_caja_atribuida),
+    sesiones_con_cobros: Array.isArray(item?.sesiones_con_cobros)
+      ? item.sesiones_con_cobros.map(String)
+      : [],
+    cantidad_cobros_sesion_atribuida: Number(item?.cantidad_cobros_sesion_atribuida || 0),
+    total_cobrado_sesion_atribuida: roundMoney(item?.total_cobrado_sesion_atribuida),
+    motivo: String(item?.motivo || 'SIN_COBROS_EN_SESION_ATRIBUIDA')
+  }));
+  const first = normalized[0] || {};
+  const error = new Error('La reversion atribuida no tiene cobros contabilizables en la sesion indicada.');
+  error.code = 'VENTAS_CAJAS_REVERSION_SESSION_PAYMENT_MISMATCH';
+  error.httpStatus = 409;
+  error.publicMessage = 'Una reversion fue asociada a una sesion que no contiene los cobros originales de la factura.';
+  error.details = {
+    ...first,
+    inconsistencias: normalized
+  };
+  return error;
+};
+
+const createReversionAccountingMismatchError = ({ totalReversado, totalPorMetodo }) => {
+  const error = new Error('El total de reversiones no coincide con su distribucion por metodo.');
+  error.code = 'VENTAS_CAJAS_REVERSION_ACCOUNTING_MISMATCH';
+  error.httpStatus = 409;
+  error.publicMessage = 'La distribucion contable de las reversiones de la sesion no es consistente.';
+  error.details = {
+    total_reversado: roundMoney(totalReversado),
+    total_reversiones_por_metodo: roundMoney(totalPorMetodo)
+  };
+  return error;
+};
+
 const normalizeMethod = (row = {}) => ({
   id_metodo_pago: Number(row.id_metodo_pago || 0) || null,
   codigo: normalizeMethodCode(row.codigo),
@@ -185,6 +223,18 @@ const normalizeSnapshot = (row = {}, idSesionCaja) => {
     metodos_agrupados: metodosAgrupados
   };
 
+  const totalReversionesPorMetodo = roundMoney(
+    snapshot.metodos.reduce((sum, method) => roundMoney(sum + method.reversiones), 0)
+      + snapshot.otrosNoEfectivo.reversiones
+  );
+  if (totalReversionesPorMetodo !== roundMoney(snapshot.fingerprint.total_reversado)) {
+    throw createReversionAccountingMismatchError({
+      totalReversado: snapshot.fingerprint.total_reversado,
+      totalPorMetodo: totalReversionesPorMetodo
+    });
+  }
+  snapshot.totalReversionesPorMetodo = totalReversionesPorMetodo;
+
   return snapshot;
 };
 
@@ -313,6 +363,22 @@ export const loadCajaCloseFinancialSnapshot = async ({ queryRunner, idSesionCaja
           END AS id_sesion_caja_atribuida
         FROM reversion_candidates rc
       ),
+      attributed_reversion_payment_state AS (
+        SELECT
+          rs.id_reversion,
+          rs.id_factura_original,
+          rs.monto_reversado,
+          rs.id_sesion_caja_atribuida,
+          rs.sesiones_cobro AS sesiones_con_cobros,
+          COUNT(fc_attributed.id_factura_cobro)::int AS cantidad_cobros_sesion_atribuida,
+          COALESCE(SUM(fc_attributed.monto), 0)::numeric(14,2) AS total_cobrado_sesion_atribuida
+        FROM reversion_scope rs
+        LEFT JOIN public.facturas_cobros fc_attributed
+          ON fc_attributed.id_factura = rs.id_factura_original
+         AND fc_attributed.id_sesion_caja = rs.id_sesion_caja_atribuida
+        GROUP BY rs.id_reversion, rs.id_factura_original, rs.monto_reversado,
+                 rs.id_sesion_caja_atribuida, rs.sesiones_cobro
+      ),
       ambiguous_reversion_summary AS (
         SELECT COALESCE(
           JSONB_AGG(
@@ -330,18 +396,42 @@ export const loadCajaCloseFinancialSnapshot = async ({ queryRunner, idSesionCaja
         ) AS reversiones_sesion_ambiguas
         FROM reversion_scope rs
       ),
+      reversion_payment_mismatch_summary AS (
+        SELECT COALESCE(
+          JSONB_AGG(
+            JSONB_BUILD_OBJECT(
+              'id_reversion', arps.id_reversion,
+              'id_factura_original', arps.id_factura_original,
+              'id_sesion_caja_atribuida', arps.id_sesion_caja_atribuida,
+              'sesiones_con_cobros', arps.sesiones_con_cobros,
+              'cantidad_cobros_sesion_atribuida', arps.cantidad_cobros_sesion_atribuida,
+              'total_cobrado_sesion_atribuida', arps.total_cobrado_sesion_atribuida,
+              'motivo', CASE
+                WHEN arps.cantidad_cobros_sesion_atribuida = 0 THEN 'SIN_COBROS_EN_SESION_ATRIBUIDA'
+                ELSE 'TOTAL_COBRADO_SESION_INVALIDO'
+              END
+            )
+            ORDER BY arps.id_reversion
+          ) FILTER (
+            WHERE arps.id_sesion_caja_atribuida IS NOT NULL
+              AND arps.monto_reversado <> 0
+              AND (
+                arps.cantidad_cobros_sesion_atribuida = 0
+                OR arps.total_cobrado_sesion_atribuida <= 0
+              )
+          ),
+          '[]'::jsonb
+        ) AS reversiones_sesion_pago_inconsistentes
+        FROM attributed_reversion_payment_state arps
+      ),
       reversion_source AS (
         SELECT
-          rs.id_reversion,
-          rs.id_factura_original,
-          rs.monto_reversado,
-          rs.id_sesion_caja_atribuida
-        FROM reversion_scope rs
-        WHERE rs.id_sesion_caja_atribuida = $1::bigint
-          AND NOT (
-            rs.id_sesion_caja_original IS NULL
-            AND CARDINALITY(rs.sesiones_cobro) >= 2
-          )
+          arps.id_reversion,
+          arps.id_factura_original,
+          arps.monto_reversado,
+          arps.id_sesion_caja_atribuida
+        FROM attributed_reversion_payment_state arps
+        WHERE arps.id_sesion_caja_atribuida = $1::bigint
       ),
       reversion_lines AS (
         SELECT
@@ -581,6 +671,7 @@ export const loadCajaCloseFinancialSnapshot = async ({ queryRunner, idSesionCaja
           gos.ventas_netas AS otros_no_efectivo_ventas_netas,
           gos.metodos_agrupados AS otros_no_efectivo_metodos_agrupados,
           ars.reversiones_sesion_ambiguas,
+          rpms.reversiones_sesion_pago_inconsistentes,
           ips.metodos_pago_invalidos,
           jsonb_build_object(
             'cantidad_cobros', COALESCE(ff.cantidad_cobros, 0),
@@ -608,6 +699,7 @@ export const loadCajaCloseFinancialSnapshot = async ({ queryRunner, idSesionCaja
         CROSS JOIN aggregate_totals at
         CROSS JOIN invalid_payment_summary ips
         CROSS JOIN ambiguous_reversion_summary ars
+        CROSS JOIN reversion_payment_mismatch_summary rpms
         CROSS JOIN required_catalog_json rcj
         CROSS JOIN grouped_other_summary gos
       )
@@ -623,6 +715,12 @@ export const loadCajaCloseFinancialSnapshot = async ({ queryRunner, idSesionCaja
     : [];
   if (ambiguousReversions.length > 0) {
     throw createAmbiguousReversionSessionError(ambiguousReversions);
+  }
+  const paymentMismatchReversions = Array.isArray(row.reversiones_sesion_pago_inconsistentes)
+    ? row.reversiones_sesion_pago_inconsistentes
+    : [];
+  if (paymentMismatchReversions.length > 0) {
+    throw createReversionSessionPaymentMismatchError(paymentMismatchReversions);
   }
   const invalidMethods = Array.isArray(row.metodos_pago_invalidos)
     ? row.metodos_pago_invalidos

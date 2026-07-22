@@ -5,7 +5,8 @@ import {
   assertCoreCatalogValid,
   buildSegmentedArqueoComputation,
   fingerprintValuesEqual,
-  OTHER_NON_CASH_METHOD_CODE
+  OTHER_NON_CASH_METHOD_CODE,
+  recomputeAndAssertCloseValidation
 } from '../cajaCloseComputationService.js';
 
 // Catalogo valido de referencia (EFECTIVO=1, TARJETA=2, TRANSFERENCIA=3,
@@ -27,6 +28,51 @@ const snapshot = {
     { id_metodo_pago: 2, codigo: 'TARJETA', ventas_brutas: 10, reversiones: 0, ventas_netas: 10, monto_teorico: 10 },
     { id_metodo_pago: 3, codigo: 'TRANSFERENCIA', ventas_brutas: 0, reversiones: 0, ventas_netas: 0, monto_teorico: 0 }
   ]
+};
+
+const clone = (value) => JSON.parse(JSON.stringify(value));
+const buildStoredValidationFixture = ({ sourceSnapshot = snapshot, payloadRows = null } = {}) => {
+  const arqueos = payloadRows || [
+    { metodo_pago_codigo: 'EFECTIVO', monto_declarado: 0 },
+    { metodo_pago_codigo: 'TARJETA', monto_declarado: 10, cantidad_referencias: 1 },
+    { metodo_pago_codigo: 'TRANSFERENCIA', monto_declarado: 0 }
+  ];
+  const computation = buildSegmentedArqueoComputation({
+    snapshot: sourceSnapshot,
+    payloadRows: arqueos,
+    threshold: 0,
+    requireObservacionOnDifference: true
+  });
+  const hayDiferencia = computation.rows.some((row) => row.diferencia !== 0);
+  return {
+    computation,
+    validation: {
+      total_teorico: computation.monto_teorico_total,
+      total_declarado: computation.monto_declarado_total,
+      diferencia_total: computation.diferencia_total,
+      hay_diferencia: hayDiferencia,
+      payload_declarado_json: { arqueos: clone(arqueos), observacion_cierre: null },
+      resultado_json: {
+        resumen: {
+          total_teorico: computation.monto_teorico_total,
+          total_declarado: computation.monto_declarado_total,
+          diferencia_total: computation.diferencia_total,
+          hay_diferencia: hayDiferencia
+        },
+        metodos: clone(computation.rows)
+      }
+    },
+    validationMethods: computation.rows.map((row) => ({
+      id_metodo_pago: row.id_metodo_pago,
+      metodo_pago_codigo: row.metodo_pago_codigo,
+      monto_teorico: row.monto_teorico,
+      monto_declarado: row.monto_declarado,
+      diferencia: row.diferencia,
+      cantidad_referencias: row.cantidad_referencias,
+      observacion: row.observacion,
+      requiere_revision: row.requiere_revision
+    }))
+  };
 };
 
 describe('caja close computation', () => {
@@ -92,6 +138,124 @@ describe('caja close computation', () => {
         (error) => error.httpStatus === 400 && error.code === 'VENTAS_CAJAS_ARQUEO_METODO_DUPLICATE'
       );
     }
+  });
+
+  it('reconstruye desde payload_declarado_json y rechaza manipulaciones coordinadas internamente consistentes', () => {
+    const assertStale = (fixture) => assert.throws(
+      () => recomputeAndAssertCloseValidation({
+        ...fixture,
+        snapshot,
+        threshold: 0
+      }),
+      (error) => error.httpStatus === 409
+        && error.code === 'VENTAS_CAJAS_CLOSE_VALIDATION_STALE'
+        && error.details?.motivo === 'VALIDATION_RECOMPUTATION_MISMATCH'
+    );
+    const mutations = [
+      (fixture) => {
+        const efectivo = fixture.validationMethods.find((row) => row.metodo_pago_codigo === 'EFECTIVO');
+        efectivo.monto_declarado = 100;
+        efectivo.diferencia = 100;
+        efectivo.requiere_revision = true;
+        fixture.validation.total_declarado = 110;
+        fixture.validation.diferencia_total = 100;
+        fixture.validation.hay_diferencia = true;
+      },
+      (fixture) => {
+        const tarjeta = fixture.validationMethods.find((row) => row.metodo_pago_codigo === 'TARJETA');
+        tarjeta.monto_declarado = 20;
+        tarjeta.diferencia = 10;
+        tarjeta.requiere_revision = true;
+        tarjeta.cantidad_referencias = 2;
+        fixture.validation.total_declarado = 20;
+        fixture.validation.diferencia_total = 10;
+        fixture.validation.hay_diferencia = true;
+      },
+      (fixture) => {
+        const transferencia = fixture.validationMethods.find((row) => row.metodo_pago_codigo === 'TRANSFERENCIA');
+        transferencia.monto_declarado = 5;
+        transferencia.diferencia = 5;
+        transferencia.requiere_revision = true;
+        transferencia.observacion = 'Alterada coordinadamente';
+        fixture.validation.total_declarado = 15;
+        fixture.validation.diferencia_total = 5;
+        fixture.validation.hay_diferencia = true;
+      },
+      (fixture) => {
+        let declaredTotal = 0;
+        for (const row of fixture.validationMethods) {
+          row.monto_declarado += 10;
+          row.diferencia = row.monto_declarado - row.monto_teorico;
+          row.requiere_revision = row.diferencia !== 0;
+          row.observacion = row.requiere_revision ? 'Alteracion completa' : null;
+          declaredTotal += row.monto_declarado;
+        }
+        fixture.validation.total_declarado = declaredTotal;
+        fixture.validation.diferencia_total = declaredTotal - fixture.validation.total_teorico;
+        fixture.validation.hay_diferencia = true;
+      }
+    ];
+    for (const mutate of mutations) {
+      const fixture = buildStoredValidationFixture();
+      mutate(fixture);
+      assertStale(fixture);
+    }
+  });
+
+  it('rechaza payload original alterado o invalido y acepta una validacion intacta', () => {
+    const intact = buildStoredValidationFixture();
+    assert.deepEqual(
+      recomputeAndAssertCloseValidation({ ...intact, snapshot, threshold: 0 }).rows,
+      intact.computation.rows
+    );
+
+    const altered = buildStoredValidationFixture();
+    altered.validation.payload_declarado_json.arqueos[0].monto_declarado = 1;
+    assert.throws(
+      () => recomputeAndAssertCloseValidation({ ...altered, snapshot, threshold: 0 }),
+      (error) => error.code === 'VENTAS_CAJAS_CLOSE_VALIDATION_STALE'
+    );
+
+    const invalidPayloads = [
+      null,
+      {},
+      { arqueos: intact.validation.payload_declarado_json.arqueos.slice(0, 2) },
+      { arqueos: [...intact.validation.payload_declarado_json.arqueos, clone(intact.validation.payload_declarado_json.arqueos[0])] },
+      { arqueos: [...intact.validation.payload_declarado_json.arqueos.slice(0, 2), { metodo_pago_codigo: 'OTRO', monto_declarado: 0 }] },
+      { arqueos: [...intact.validation.payload_declarado_json.arqueos.slice(0, 2), { metodo_pago_codigo: 'CRIPTO', monto_declarado: 0 }] }
+    ];
+    for (const payload of invalidPayloads) {
+      const fixture = buildStoredValidationFixture();
+      fixture.validation.payload_declarado_json = payload;
+      assert.throws(
+        () => recomputeAndAssertCloseValidation({ ...fixture, snapshot, threshold: 0 }),
+        (error) => error.httpStatus === 409 && error.code === 'VENTAS_CAJAS_CLOSE_VALIDATION_STALE'
+      );
+    }
+  });
+
+  it('rechaza OTRO alterado coherentemente aunque encabezado y detalle sigan cuadrando', () => {
+    const otherSnapshot = {
+      ...snapshot,
+      otrosNoEfectivo: {
+        ventas_brutas: 40,
+        reversiones: 0,
+        ventas_netas: 40,
+        metodos_agrupados: [{ codigo: 'OTRO', ventas_brutas: 40, reversiones: 0, ventas_netas: 40 }]
+      }
+    };
+    const fixture = buildStoredValidationFixture({ sourceSnapshot: otherSnapshot });
+    const otro = fixture.validationMethods.find((row) => row.metodo_pago_codigo === 'OTRO');
+    otro.monto_declarado = 50;
+    otro.diferencia = 10;
+    otro.requiere_revision = true;
+    fixture.validation.total_declarado += 10;
+    fixture.validation.diferencia_total += 10;
+    fixture.validation.hay_diferencia = true;
+    assert.throws(
+      () => recomputeAndAssertCloseValidation({ ...fixture, snapshot: otherSnapshot, threshold: 0 }),
+      (error) => error.httpStatus === 409 && error.code === 'VENTAS_CAJAS_CLOSE_VALIDATION_STALE'
+    );
   });
 
   it('recalcula toda la aritmetica almacenada y rechaza cualquier manipulacion antes del cierre', () => {

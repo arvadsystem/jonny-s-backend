@@ -194,6 +194,8 @@ describe('loadCajaCloseFinancialSnapshot', () => {
 
     assert.equal(calls.length, 1);
     assert.match(calls[0].sql, /WITH session_base AS/);
+    assert.match(calls[0].sql, /attributed_reversion_payment_state AS/);
+    assert.match(calls[0].sql, /reversion_payment_mismatch_summary AS/);
     assert.match(calls[0].sql, /reversion_allocations AS/);
     assert.match(calls[0].sql, /COALESCE\(MAX\(id_factura_cobro\), 0\)::text FROM payments/);
     assert.equal(snapshot.metodos.length, 3);
@@ -244,6 +246,68 @@ describe('loadCajaCloseFinancialSnapshot', () => {
         });
         return true;
       }
+    );
+  });
+
+  it('rechaza una reversion atribuida sin cobros en esa sesion con detalles controlados', async () => {
+    const queryRunner = {
+      async query() {
+        return {
+          rows: [{
+            id_sesion_caja: '1',
+            reversiones_sesion_ambiguas: [],
+            reversiones_sesion_pago_inconsistentes: [{
+              id_reversion: '92',
+              id_factura_original: '82',
+              id_sesion_caja_atribuida: '1',
+              sesiones_con_cobros: ['2'],
+              cantidad_cobros_sesion_atribuida: 0,
+              total_cobrado_sesion_atribuida: '0',
+              motivo: 'SIN_COBROS_EN_SESION_ATRIBUIDA'
+            }],
+            metodos_pago_invalidos: []
+          }]
+        };
+      }
+    };
+
+    await assert.rejects(
+      loadCajaCloseFinancialSnapshot({ queryRunner, idSesionCaja: '1' }),
+      (error) => {
+        assert.equal(error.httpStatus, 409);
+        assert.equal(error.code, 'VENTAS_CAJAS_REVERSION_SESSION_PAYMENT_MISMATCH');
+        assert.equal(error.details.id_reversion, '92');
+        assert.equal(error.details.id_sesion_caja_atribuida, '1');
+        assert.deepEqual(error.details.sesiones_con_cobros, ['2']);
+        assert.equal(error.details.cantidad_cobros_sesion_atribuida, 0);
+        return true;
+      }
+    );
+  });
+
+  it('no devuelve un snapshot si fingerprint.total_reversado difiere de la suma por metodo', async () => {
+    const queryRunner = {
+      async query() {
+        return {
+          rows: [{
+            id_sesion_caja: '1',
+            metodos_pago_invalidos: [],
+            metodos: [
+              { id_metodo_pago: 1, codigo: 'EFECTIVO', reversiones: '10' },
+              { id_metodo_pago: 2, codigo: 'TARJETA', reversiones: '0' },
+              { id_metodo_pago: 3, codigo: 'TRANSFERENCIA', reversiones: '0' }
+            ],
+            fingerprint: { total_reversado: '11' }
+          }]
+        };
+      }
+    };
+    await assert.rejects(
+      loadCajaCloseFinancialSnapshot({ queryRunner, idSesionCaja: '1' }),
+      (error) => error.httpStatus === 409
+        && error.code === 'VENTAS_CAJAS_REVERSION_ACCOUNTING_MISMATCH'
+        && error.details.total_reversiones_por_metodo === 10
+        && error.details.total_reversado === 11
     );
   });
 
@@ -409,7 +473,7 @@ describe('loadCajaCloseFinancialSnapshot', () => {
             otros_no_efectivo_reversiones: '300',
             otros_no_efectivo_ventas_netas: '-300',
             otros_no_efectivo_metodos_agrupados: [{ codigo: 'OTRO', ventas_brutas: '0', reversiones: '300', ventas_netas: '-300' }],
-            fingerprint: {}
+            fingerprint: { total_reversado: '300' }
           }]
         };
       }

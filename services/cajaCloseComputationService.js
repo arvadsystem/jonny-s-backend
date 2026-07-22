@@ -423,3 +423,166 @@ export const assertCloseValidationArithmeticIntegrity = ({
 
   return expectedHeader;
 };
+
+const createValidationRecomputationMismatchError = (inconsistencies = []) => createCajaError(
+  409,
+  'VENTAS_CAJAS_CLOSE_VALIDATION_STALE',
+  'La validación almacenada ya no coincide con la declaración original o con el estado actual de la sesión. Debe realizar una nueva revisión.',
+  {
+    motivo: 'VALIDATION_RECOMPUTATION_MISMATCH',
+    inconsistencias: inconsistencies
+  }
+);
+
+const parseStoredJsonObject = (value) => {
+  if (value && typeof value === 'object' && !Array.isArray(value)) return value;
+  if (typeof value !== 'string') return null;
+  try {
+    const parsed = JSON.parse(value);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+};
+
+const nullableInteger = (value) => {
+  if (value === null || value === undefined || value === '') return null;
+  const parsed = Number(value);
+  return Number.isInteger(parsed) ? parsed : null;
+};
+
+export const recomputeAndAssertCloseValidation = ({
+  validation,
+  validationMethods,
+  snapshot,
+  threshold = 0
+}) => {
+  const payloadOriginal = parseStoredJsonObject(validation?.payload_declarado_json);
+  if (!payloadOriginal || !Array.isArray(payloadOriginal.arqueos)) {
+    throw createValidationRecomputationMismatchError([{
+      metodo_pago_codigo: 'PAYLOAD',
+      campo: 'payload_declarado_json',
+      motivo: 'PAYLOAD_ORIGINAL_INVALIDO'
+    }]);
+  }
+
+  let computation;
+  try {
+    computation = buildSegmentedArqueoComputation({
+      snapshot,
+      payloadRows: payloadOriginal.arqueos,
+      threshold,
+      requireObservacionOnDifference: true
+    });
+  } catch (error) {
+    throw createValidationRecomputationMismatchError([{
+      metodo_pago_codigo: 'PAYLOAD',
+      campo: 'payload_declarado_json',
+      motivo: 'DECLARACION_ORIGINAL_NO_RECONSTRUIBLE',
+      codigo_validacion: error?.code || null
+    }]);
+  }
+
+  const inconsistencies = [];
+  const addMismatch = (methodCode, field, stored, expected, source = 'DETALLE') => {
+    inconsistencies.push({
+      metodo_pago_codigo: methodCode,
+      campo: field,
+      almacenado: stored,
+      esperado: expected,
+      fuente: source
+    });
+  };
+  const compareMoney = (methodCode, field, stored, expected, source) => {
+    const storedNumber = Number(stored);
+    if (!Number.isFinite(storedNumber) || roundMoney(storedNumber) !== roundMoney(expected)) {
+      addMismatch(methodCode, field, Number.isFinite(storedNumber) ? roundMoney(storedNumber) : null, roundMoney(expected), source);
+    }
+  };
+  const compareRows = ({ rows, source, includeDomainFlags = false }) => {
+    if (!Array.isArray(rows)) {
+      addMismatch('TOTAL', 'metodos', null, computation.rows.length, source);
+      return;
+    }
+    const storedByCode = new Map();
+    for (const row of rows) {
+      const code = normalizeMethodCode(row?.metodo_pago_codigo) || 'VACIO';
+      const matches = storedByCode.get(code) || [];
+      matches.push(row);
+      storedByCode.set(code, matches);
+    }
+    const expectedCodes = new Set(computation.rows.map((row) => row.metodo_pago_codigo));
+    for (const [code, matches] of storedByCode.entries()) {
+      if (!expectedCodes.has(code)) addMismatch(code, 'presencia', matches.length, 0, source);
+    }
+    for (const expected of computation.rows) {
+      const code = expected.metodo_pago_codigo;
+      const matches = storedByCode.get(code) || [];
+      if (matches.length !== 1) {
+        addMismatch(code, 'unicidad', matches.length, 1, source);
+        continue;
+      }
+      const stored = matches[0];
+      if (Number(stored.id_metodo_pago) !== Number(expected.id_metodo_pago)) {
+        addMismatch(code, 'id_metodo_pago', Number(stored.id_metodo_pago) || null, Number(expected.id_metodo_pago), source);
+      }
+      for (const field of ['monto_teorico', 'monto_declarado', 'diferencia']) {
+        compareMoney(code, field, stored[field], expected[field], source);
+      }
+      const storedReferences = nullableInteger(stored.cantidad_referencias);
+      const expectedReferences = nullableInteger(expected.cantidad_referencias);
+      if (storedReferences !== expectedReferences) {
+        addMismatch(code, 'cantidad_referencias', storedReferences, expectedReferences, source);
+      }
+      const storedObservation = normalizeText(stored.observacion, 500);
+      const expectedObservation = normalizeText(expected.observacion, 500);
+      if (storedObservation !== expectedObservation) {
+        addMismatch(code, 'observacion', storedObservation, expectedObservation, source);
+      }
+      if (stored.requiere_revision !== expected.requiere_revision) {
+        addMismatch(code, 'requiere_revision', stored.requiere_revision, expected.requiere_revision, source);
+      }
+      if (includeDomainFlags) {
+        if (stored.completado_automaticamente !== expected.completado_automaticamente) {
+          addMismatch(code, 'completado_automaticamente', stored.completado_automaticamente, expected.completado_automaticamente, source);
+        }
+        if (code === OTHER_NON_CASH_METHOD_CODE && stored.editable !== false) {
+          addMismatch(code, 'editable', stored.editable ?? null, false, source);
+        }
+      }
+    }
+  };
+
+  compareRows({ rows: validationMethods, source: 'DETALLE_PERSISTIDO' });
+
+  const resultadoJson = parseStoredJsonObject(validation?.resultado_json);
+  if (!resultadoJson) {
+    addMismatch('TOTAL', 'resultado_json', null, 'OBJETO_JSON', 'RESULTADO_JSON');
+  } else {
+    compareRows({ rows: resultadoJson.metodos, source: 'RESULTADO_JSON', includeDomainFlags: true });
+  }
+
+  const expectedHeader = {
+    total_teorico: computation.monto_teorico_total,
+    total_declarado: computation.monto_declarado_total,
+    diferencia_total: computation.diferencia_total,
+    hay_diferencia: computation.rows.some((row) => roundMoney(row.diferencia) !== 0)
+  };
+  for (const field of ['total_teorico', 'total_declarado', 'diferencia_total']) {
+    compareMoney('TOTAL', field, validation?.[field], expectedHeader[field], 'ENCABEZADO');
+    if (resultadoJson?.resumen) {
+      compareMoney('TOTAL', field, resultadoJson.resumen[field], expectedHeader[field], 'RESULTADO_JSON');
+    }
+  }
+  if (validation?.hay_diferencia !== expectedHeader.hay_diferencia) {
+    addMismatch('TOTAL', 'hay_diferencia', validation?.hay_diferencia, expectedHeader.hay_diferencia, 'ENCABEZADO');
+  }
+  if (resultadoJson?.resumen?.hay_diferencia !== expectedHeader.hay_diferencia) {
+    addMismatch('TOTAL', 'hay_diferencia', resultadoJson?.resumen?.hay_diferencia, expectedHeader.hay_diferencia, 'RESULTADO_JSON');
+  }
+
+  if (inconsistencies.length > 0) {
+    throw createValidationRecomputationMismatchError(inconsistencies);
+  }
+  return computation;
+};

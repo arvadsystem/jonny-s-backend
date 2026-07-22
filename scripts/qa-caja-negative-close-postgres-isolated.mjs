@@ -517,6 +517,14 @@ const testRealReversionAttribution = async (client) => {
       (id_reversion,id_factura_original,id_sesion_caja_original,monto_reversado,estado)
     VALUES ($1,$2,$3,$4,'APLICADA')
   `, [id, invoiceId, originalSessionId, amount]);
+  const assertFingerprintMatchesMethods = (snapshot) => {
+    const sumByMethod = Number((
+      [...snapshot.reversionsByCode.values()].reduce((sum, value) => sum + value, 0)
+      + snapshot.otrosNoEfectivo.reversiones
+    ).toFixed(2));
+    assert.equal(sumByMethod, snapshot.fingerprint.total_reversado);
+    assert.equal(snapshot.totalReversionesPorMetodo, snapshot.fingerprint.total_reversado);
+  };
   try {
     await client.query(`
       INSERT INTO public.cajas_sesiones (id_sesion_caja,monto_teorico_cierre,marca,monto_apertura)
@@ -530,6 +538,7 @@ const testRealReversionAttribution = async (client) => {
       const snapshot = await loadCajaCloseFinancialSnapshot({ queryRunner: client, idSesionCaja: '8101' });
       assert.equal(snapshot.reversionsByCode.get('EFECTIVO'), 40);
       assert.equal(snapshot.salesNetByCode.get('EFECTIVO'), 60);
+      assertFingerprintMatchesMethods(snapshot);
     });
 
     await runScenario('una_sesion_reversion_total', async () => {
@@ -539,6 +548,7 @@ const testRealReversionAttribution = async (client) => {
       const snapshot = await loadCajaCloseFinancialSnapshot({ queryRunner: client, idSesionCaja: '8101' });
       assert.equal(snapshot.reversionsByCode.get('TARJETA'), 100);
       assert.equal(snapshot.salesNetByCode.get('TARJETA'), 0);
+      assertFingerprintMatchesMethods(snapshot);
     });
 
     await runScenario('dos_sesiones_original_definida', async () => {
@@ -550,6 +560,8 @@ const testRealReversionAttribution = async (client) => {
       const other = await loadCajaCloseFinancialSnapshot({ queryRunner: client, idSesionCaja: '8102' });
       assert.equal(original.reversionsByCode.get('EFECTIVO'), 50);
       assert.equal(other.fingerprint.cantidad_reversiones, 0);
+      assertFingerprintMatchesMethods(original);
+      assertFingerprintMatchesMethods(other);
     });
 
     await runScenario('dos_sesiones_original_null_ambigua', async () => {
@@ -574,6 +586,7 @@ const testRealReversionAttribution = async (client) => {
       assert.equal(snapshot.reversionsByCode.get('EFECTIVO'), 30);
       assert.equal(snapshot.reversionsByCode.get('TARJETA'), 20);
       assert.equal([...snapshot.reversionsByCode.values()].reduce((sum, value) => sum + value, 0), 50);
+      assertFingerprintMatchesMethods(snapshot);
     });
 
     await runScenario('redondeo_proporcional', async () => {
@@ -584,6 +597,66 @@ const testRealReversionAttribution = async (client) => {
       const snapshot = await loadCajaCloseFinancialSnapshot({ queryRunner: client, idSesionCaja: '8101' });
       assert.equal(snapshot.reversionsByCode.get('TARJETA'), 16.67);
       assert.equal(snapshot.reversionsByCode.get('TRANSFERENCIA'), 33.33);
+      assertFingerprintMatchesMethods(snapshot);
+    });
+
+    await runScenario('original_definida_sin_cobros_en_sesion', async () => {
+      await client.query('INSERT INTO public.facturas VALUES (81009)');
+      await insertPayment(81114, 81009, 8102, 2, 100);
+      await insertReversion(81209, 81009, 8101, 100);
+      await assert.rejects(
+        loadCajaCloseFinancialSnapshot({ queryRunner: client, idSesionCaja: '8101' }),
+        (error) => error.code === 'VENTAS_CAJAS_REVERSION_SESSION_PAYMENT_MISMATCH'
+          && error.httpStatus === 409
+          && error.details.id_reversion === '81209'
+          && error.details.id_sesion_caja_atribuida === '8101'
+          && error.details.sesiones_con_cobros.join(',') === '8102'
+      );
+    });
+
+    await runScenario('original_definida_cobros_sin_sesion', async () => {
+      await client.query('INSERT INTO public.facturas VALUES (81010)');
+      await insertPayment(81115, 81010, null, 2, 100);
+      await insertReversion(81210, 81010, 8101, 100);
+      await assert.rejects(
+        loadCajaCloseFinancialSnapshot({ queryRunner: client, idSesionCaja: '8101' }),
+        (error) => error.code === 'VENTAS_CAJAS_REVERSION_SESSION_PAYMENT_MISMATCH'
+          && error.details.cantidad_cobros_sesion_atribuida === 0
+          && error.details.sesiones_con_cobros.length === 0
+      );
+    });
+
+    await runScenario('reversion_positiva_cobros_total_cero', async () => {
+      await client.query('INSERT INTO public.facturas VALUES (81011)');
+      await insertPayment(81116, 81011, 8101, 2, 0);
+      await insertReversion(81211, 81011, 8101, 100);
+      await assert.rejects(
+        loadCajaCloseFinancialSnapshot({ queryRunner: client, idSesionCaja: '8101' }),
+        (error) => error.code === 'VENTAS_CAJAS_REVERSION_SESSION_PAYMENT_MISMATCH'
+          && error.details.motivo === 'TOTAL_COBRADO_SESION_INVALIDO'
+          && error.details.cantidad_cobros_sesion_atribuida === 1
+      );
+    });
+
+    await runScenario('varias_reversiones_una_invalida', async () => {
+      await client.query('INSERT INTO public.facturas VALUES (81012),(81013)');
+      await insertPayment(81117, 81012, 8101, 1, 100);
+      await insertPayment(81118, 81013, 8102, 2, 100);
+      await insertReversion(81212, 81012, 8101, 25);
+      await insertReversion(81213, 81013, 8101, 25);
+      await assert.rejects(
+        loadCajaCloseFinancialSnapshot({ queryRunner: client, idSesionCaja: '8101' }),
+        (error) => error.code === 'VENTAS_CAJAS_REVERSION_SESSION_PAYMENT_MISMATCH'
+          && error.details.inconsistencias.some((item) => String(item.id_reversion) === '81213')
+      );
+    });
+
+    await runScenario('reversion_monto_cero_sin_impacto', async () => {
+      await client.query('INSERT INTO public.facturas VALUES (81014)');
+      await insertReversion(81214, 81014, 8101, 0);
+      const snapshot = await loadCajaCloseFinancialSnapshot({ queryRunner: client, idSesionCaja: '8101' });
+      assert.equal(snapshot.fingerprint.total_reversado, 0);
+      assertFingerprintMatchesMethods(snapshot);
     });
 
     await runScenario('reversion_superior_al_neto', async () => {
@@ -593,6 +666,7 @@ const testRealReversionAttribution = async (client) => {
       const snapshot = await loadCajaCloseFinancialSnapshot({ queryRunner: client, idSesionCaja: '8101' });
       assert.equal(snapshot.salesNetByCode.get('EFECTIVO'), -50);
       assert.equal(snapshot.fingerprint.total_reversado, 150);
+      assertFingerprintMatchesMethods(snapshot);
     });
 
     await runScenario('ninguna_reversion_contabilizada_dos_veces', async () => {
@@ -608,9 +682,11 @@ const testRealReversionAttribution = async (client) => {
         firstSession.fingerprint.total_reversado + secondSession.fingerprint.total_reversado,
         60
       );
+      assertFingerprintMatchesMethods(firstSession);
+      assertFingerprintMatchesMethods(secondSession);
     });
 
-    return { scenarios: scenarioResults, noDoubleCounting: true };
+    return { scenarios: scenarioResults, noDoubleCounting: true, fingerprintMatchesMethods: true };
   } finally {
     await client.query('ROLLBACK');
   }

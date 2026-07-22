@@ -200,11 +200,12 @@ describe('monto teorico negativo en cierre de caja', () => {
     const end = routerSource.indexOf("router.patch('/ventas/cajas/sesiones/:id/cerrar'", start);
     const closeSource = routerSource.slice(start, end);
 
-    assert.match(closeSource, /const validatedArithmetic = assertCloseValidationMatchesCurrentSummary/);
-    assert.match(closeSource, /montoTeorico = validatedArithmetic\.total_teorico/);
-    assert.match(closeSource, /montoDeclaradoCierre = validatedArithmetic\.total_declarado/);
-    assert.match(closeSource, /diferencia = validatedArithmetic\.diferencia_total/);
-    assert.match(closeSource, /total_teorico, total_declarado, diferencia_total, hay_diferencia/);
+    assert.match(closeSource, /const recomputedValidation = assertCloseValidationMatchesCurrentSummary/);
+    assert.match(closeSource, /montoTeorico = recomputedValidation\.monto_teorico_total/);
+    assert.match(closeSource, /montoDeclaradoCierre = recomputedValidation\.monto_declarado_total/);
+    assert.match(closeSource, /diferencia = recomputedValidation\.diferencia_total/);
+    assert.match(closeSource, /payload_declarado_json, resultado_json/);
+    assert.match(closeSource, /arqueosPersistir = recomputedValidation\.rows\.map/);
     assert.match(closeSource, /PENDIENTE_REVISION/);
     assert.match(closeSource, /createCajaCloseEmailNotification\(client/);
     assert.match(closeSource, /requiresAudit/);
@@ -217,7 +218,7 @@ describe('monto teorico negativo en cierre de caja', () => {
     const assertSource = routerSource.slice(start, end);
 
     assert.match(assertSource, /buildExpectedOtroValidationRow/);
-    assert.match(assertSource, /assertCloseValidationArithmeticIntegrity/);
+    assert.match(assertSource, /recomputeAndAssertCloseValidation/);
     assert.match(assertSource, /const storedByCode = new Map/);
     assert.match(assertSource, /const rowsForCode = storedByCode\.get\(code\) \|\| \[\]/);
     assert.match(assertSource, /methodRows\.length !== 1/);

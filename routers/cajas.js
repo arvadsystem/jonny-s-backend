@@ -22,11 +22,11 @@ import {
   reactivateFailedCajaCloseEmailNotification
 } from '../services/cajaCloseEmailOutboxService.js';
 import {
-  assertCloseValidationArithmeticIntegrity,
   assertCoreCatalogValid,
   buildSegmentedArqueoComputation as buildSegmentedArqueoComputationFromSnapshot,
   fingerprintValuesEqual,
-  OTHER_NON_CASH_METHOD_CODE
+  OTHER_NON_CASH_METHOD_CODE,
+  recomputeAndAssertCloseValidation
 } from '../services/cajaCloseComputationService.js';
 import {
   canBypassCajaSucursalForAuxiliary
@@ -776,9 +776,10 @@ const assertCloseValidationMatchesCurrentSummary = ({
   currentFingerprint,
   threshold
 }) => {
-  const validatedArithmetic = assertCloseValidationArithmeticIntegrity({
+  const recomputedValidation = recomputeAndAssertCloseValidation({
     validation,
     validationMethods,
+    snapshot: currentSummary,
     threshold
   });
   assertCoreCatalogValid(currentSummary?.catalogValidation, {
@@ -876,7 +877,7 @@ const assertCloseValidationMatchesCurrentSummary = ({
   }
 
   assertOperationalFingerprintMatches({ validation, currentFingerprint });
-  return validatedArithmetic;
+  return recomputedValidation;
 };
 
 const getScopeContext = async (req, client, requestedSucursalId = null, allowGlobal = false) => {
@@ -5001,7 +5002,8 @@ const closeSessionHandler = async (req, res) => {
     const validationResult = await client.query(
       `
         SELECT id_validacion_cierre, id_cierre_caja
-             , total_teorico, total_declarado, diferencia_total, hay_diferencia, resultado_json
+             , total_teorico, total_declarado, diferencia_total, hay_diferencia,
+               payload_declarado_json, resultado_json
         FROM public.cajas_cierres_validaciones
         WHERE id_validacion_cierre = $1
           AND id_sesion_caja = $2
@@ -5031,30 +5033,30 @@ const closeSessionHandler = async (req, res) => {
     if (validationMethodsResult.rowCount === 0) {
       throw createCajaError(409, 'VENTAS_CAJAS_VALIDACION_CIERRE_INCOMPLETA', 'La validacion de cierre no tiene detalle por metodo.');
     }
-    const validatedArithmetic = assertCloseValidationMatchesCurrentSummary({
+    const recomputedValidation = assertCloseValidationMatchesCurrentSummary({
       validation,
       validationMethods: validationMethodsResult.rows,
       currentSummary: snapshot,
       currentFingerprint,
       threshold: CLOSE_DIFFERENCE_THRESHOLD
     });
-    montoTeorico = validatedArithmetic.total_teorico;
-    montoDeclaradoCierre = validatedArithmetic.total_declarado;
-    diferencia = validatedArithmetic.diferencia_total;
-    arqueosPersistir = validationMethodsResult.rows.map((row) => {
+    montoTeorico = recomputedValidation.monto_teorico_total;
+    montoDeclaradoCierre = recomputedValidation.monto_declarado_total;
+    diferencia = recomputedValidation.diferencia_total;
+    arqueosPersistir = recomputedValidation.rows.map((row) => {
       const methodCode = normalizeMethodCode(row.metodo_pago_codigo);
       return {
         id_metodo_pago: Number(row.id_metodo_pago),
         metodo_pago_codigo: methodCode,
-        monto_teorico: Number(row.monto_teorico || 0),
-        monto_declarado: Number(row.monto_declarado || 0),
-        diferencia: Number(row.diferencia || 0),
+        monto_teorico: roundMoney(row.monto_teorico),
+        monto_declarado: roundMoney(row.monto_declarado),
+        diferencia: roundMoney(row.diferencia),
         cantidad_referencias: row.cantidad_referencias === null || row.cantidad_referencias === undefined
           ? null
           : Number(row.cantidad_referencias),
         observacion: row.observacion || null,
         requiere_revision: Boolean(row.requiere_revision),
-        completado_automaticamente: methodCode === OTHER_NON_CASH_METHOD_CODE
+        completado_automaticamente: Boolean(row.completado_automaticamente)
       };
     });
     const hasMethodDifference = arqueosPersistir.some((row) => Math.abs(roundMoney(row.diferencia)) > 0);
