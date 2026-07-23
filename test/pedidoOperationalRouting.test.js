@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import {
   applyPedidoInitialOperationalRouting,
+  applyPedidoOperationalRoutingAfterCommit,
   classifyPedidoOperationalRouting
 } from '../routers/ventas/services/pedidoOperationalRoutingService.js';
 import { resolvePedidoConsumo } from '../services/pedidoConsumoResolver.js';
@@ -28,7 +29,8 @@ test('1 producto terminado pagado en local se completa sin cocina', () => {
   const result = classifyPedidoOperationalRouting([product()], {
     estado_pago: 'PAGADO_CONFIRMADO',
     canal: 'LOCAL',
-    modalidad: 'CONSUMO_LOCAL'
+    modalidad: 'CONSUMO_LOCAL',
+    origen_pedido: 'CAJA'
   });
   assert.equal(result.requiere_cocina, false);
   assert.equal(result.estado_operativo_inicial, 'COMPLETADO');
@@ -39,7 +41,8 @@ test('2 helado tratado como producto terminado no se envia a cocina', () => {
   const result = classifyPedidoOperationalRouting([product(77)], {
     estado_pago: 'PAGADO_CONFIRMADO',
     canal: 'LOCAL',
-    modalidad: 'CONSUMO_LOCAL'
+    modalidad: 'CONSUMO_LOCAL',
+    origen_pedido: 'CAJA'
   });
   assert.deepEqual(result.productos.map((line) => line.id_producto), [77]);
   assert.deepEqual(result.recetas, []);
@@ -50,17 +53,42 @@ test('3 producto con pago pendiente queda listo para entrega sin alterar pago', 
   const result = classifyPedidoOperationalRouting([product()], {
     estado_pago: 'PENDIENTE_PAGO',
     canal: 'POS',
-    modalidad: 'PARA_LLEVAR'
+    modalidad: 'PARA_LLEVAR',
+    origen_pedido: 'CAJA'
   });
   assert.equal(result.estado_operativo_inicial, 'LISTO_PARA_ENTREGA');
   assert.equal(result.accion_operativa, 'LISTO_PARA_ENTREGA');
 });
 
-test('4 receta conserva flujo pendiente hacia cocina', () => {
-  const result = classifyPedidoOperationalRouting([recipe()]);
+test('4 receta interna entra directamente a cocina', () => {
+  const result = classifyPedidoOperationalRouting([recipe()], { origen_pedido: 'CAJA' });
   assert.equal(result.requiere_cocina, true);
-  assert.equal(result.estado_operativo_inicial, 'PENDIENTE');
+  assert.equal(result.estado_operativo_inicial, 'EN_COCINA');
   assert.equal(result.accion_operativa, 'ENVIAR_COCINA');
+});
+
+test('menu publico y origen desconocido permanecen en validacion', () => {
+  const publicResult = classifyPedidoOperationalRouting([recipe()], {
+    origen_pedido: 'MENU',
+    estado_pago: 'PAGADO_CONFIRMADO'
+  });
+  const unknownResult = classifyPedidoOperationalRouting([recipe()], {
+    origen_pedido: 'OTRO'
+  });
+  assert.equal(publicResult.estado_operativo_inicial, 'PENDIENTE');
+  assert.equal(publicResult.pendiente_validacion_publica, true);
+  assert.equal(publicResult.requiere_revision, false);
+  assert.equal(unknownResult.estado_operativo_inicial, 'PENDIENTE');
+  assert.equal(unknownResult.origen_desconocido, true);
+});
+
+test('menu publico validado enruta por contenido', () => {
+  const result = classifyPedidoOperationalRouting([recipe()], {
+    origen_pedido: 'MENU',
+    pago_confirmado_at: '2026-07-23T12:00:00-06:00'
+  });
+  assert.equal(result.pendiente_validacion_publica, false);
+  assert.equal(result.estado_operativo_inicial, 'EN_COCINA');
 });
 
 test('5 pedido mixto requiere cocina y separa receta de producto', () => {
@@ -113,11 +141,16 @@ test('9 doble clic se atiende como replay idempotente en la ruta explicita', () 
 
 test('10 solicitudes concurrentes serializan por pedido antes de transicionar', () => {
   const source = fs.readFileSync(new URL('../routers/ventas.js', import.meta.url), 'utf8');
+  const routingSource = fs.readFileSync(
+    new URL('../routers/ventas/services/pedidoOperationalRoutingService.js', import.meta.url),
+    'utf8'
+  );
   const routeStart = source.indexOf("router.put('/ventas/pedidos-menu/:id/estado'");
   const routeEnd = source.indexOf("router.get('/ventas/pedidos-pendientes'", routeStart);
   const route = source.slice(routeStart, routeEnd);
   assert.match(route, /WHERE id_pedido = \$1[\s\S]*?FOR UPDATE/);
-  assert.match(route, /visible_en_cocina_at = COALESCE/);
+  assert.match(route, /transitionPedidoToKitchenState/);
+  assert.match(routingSource, /visible_en_cocina_at = COALESCE/);
 });
 
 test('11 fallo de impresion no controla la transicion operacional', () => {
@@ -173,8 +206,17 @@ test('aplicacion inicial persiste el estado derivado sin tocar el estado financi
   const client = {
     query: async (sql, params = []) => {
       calls.push({ sql, params });
-      if (/SELECT estado_pago, canal, tipo_entrega AS modalidad/.test(sql)) {
-        return { rowCount: 1, rows: [{ estado_pago: 'PENDIENTE_PAGO', canal: 'POS', modalidad: 'PARA_LLEVAR' }] };
+      if (/SELECT estado_pago,[\s\S]*tipo_entrega AS modalidad/.test(sql)) {
+        return {
+          rowCount: 1,
+          rows: [{
+            estado_pago: 'PENDIENTE_PAGO',
+            canal: 'POS',
+            modalidad: 'PARA_LLEVAR',
+            origen_pedido: 'CAJA',
+            pago_confirmado_at: null
+          }]
+        };
       }
       if (/FROM public\.detalle_pedido/.test(sql)) {
         return { rowCount: 1, rows: [product(10, 100)] };
@@ -204,10 +246,16 @@ test('aplicacion inicial no cambia estado cuando la cantidad operativa es invali
   const client = {
     query: async (sql) => {
       calls.push(sql);
-      if (/SELECT estado_pago, canal, tipo_entrega AS modalidad/.test(sql)) {
+      if (/SELECT estado_pago,[\s\S]*tipo_entrega AS modalidad/.test(sql)) {
         return {
           rowCount: 1,
-          rows: [{ estado_pago: 'PENDIENTE_PAGO', canal: 'POS', modalidad: 'PARA_LLEVAR' }]
+          rows: [{
+            estado_pago: 'PENDIENTE_PAGO',
+            canal: 'POS',
+            modalidad: 'PARA_LLEVAR',
+            origen_pedido: 'CAJA',
+            pago_confirmado_at: null
+          }]
         };
       }
       if (/FROM public\.detalle_pedido/.test(sql)) {
@@ -227,4 +275,58 @@ test('aplicacion inicial no cambia estado cuando la cantidad operativa es invali
       && error.lineas_invalidas[0].motivo === 'CANTIDAD_INVALIDA'
   );
   assert.equal(calls.some((sql) => /UPDATE public\.pedidos/.test(sql)), false);
+});
+
+test('ruteo interno post-commit bloquea y envia receta a EN_COCINA de forma idempotente', async () => {
+  const calls = [];
+  const client = {
+    query: async (sql, params = []) => {
+      calls.push({ sql, params });
+      if (sql === 'BEGIN' || sql === 'COMMIT' || sql === 'ROLLBACK') {
+        return { rowCount: null, rows: [] };
+      }
+      if (/SELECT id_pedido[\s\S]*FOR UPDATE/.test(sql)) {
+        return { rowCount: 1, rows: [{ id_pedido: 5 }] };
+      }
+      if (/SELECT estado_pago,[\s\S]*tipo_entrega AS modalidad/.test(sql)) {
+        return {
+          rowCount: 1,
+          rows: [{
+            estado_pago: 'PENDIENTE_PAGO',
+            canal: 'LOCAL',
+            modalidad: 'CONSUMO_LOCAL',
+            origen_pedido: 'CAJA',
+            pago_confirmado_at: null
+          }]
+        };
+      }
+      if (/FROM public\.detalle_pedido/.test(sql)) {
+        return { rowCount: 1, rows: [recipe(20, 100)] };
+      }
+      if (/SELECT id_estado_pedido, descripcion FROM estados_pedido/.test(sql)) {
+        return { rowCount: 1, rows: [{ id_estado_pedido: 2, descripcion: 'EN_COCINA' }] };
+      }
+      if (/UPDATE public\.pedidos/.test(sql)) {
+        return {
+          rowCount: 1,
+          rows: [{
+            id_pedido: 5,
+            id_estado_pedido: 2,
+            visible_en_cocina_at: '2026-07-23T12:00:00-06:00'
+          }]
+        };
+      }
+      throw new Error(`SQL inesperado: ${sql}`);
+    }
+  };
+
+  const result = await applyPedidoOperationalRoutingAfterCommit({ client, idPedido: 5 });
+  assert.equal(result.estado_pedido, 'EN_COCINA');
+  assert.deepEqual(calls.filter((call) => call.sql === 'BEGIN' || call.sql === 'COMMIT').map((call) => call.sql), [
+    'BEGIN',
+    'COMMIT'
+  ]);
+  const update = calls.find((call) => /UPDATE public\.pedidos/.test(call.sql));
+  assert.match(update.sql, /visible_en_cocina_at = COALESCE/);
+  assert.deepEqual(update.params, [5, 2]);
 });

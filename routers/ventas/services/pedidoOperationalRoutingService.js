@@ -5,7 +5,14 @@ export const PEDIDO_OPERATIONAL_ACTION = Object.freeze({
   SEND_TO_KITCHEN: 'ENVIAR_COCINA',
   READY_FOR_DELIVERY: 'LISTO_PARA_ENTREGA',
   COMPLETE: 'COMPLETAR',
-  REVIEW: 'REQUIERE_REVISION'
+  REVIEW: 'REQUIERE_REVISION',
+  AWAIT_VALIDATION: 'PENDIENTE_VALIDACION'
+});
+
+export const PEDIDO_ORIGIN = Object.freeze({
+  PUBLIC_MENU: 'PUBLIC_MENU',
+  INTERNAL_POS: 'INTERNAL_POS',
+  UNKNOWN: 'UNKNOWN'
 });
 
 const toPositiveInteger = (value) => {
@@ -24,6 +31,13 @@ const normalizeCode = (value) => String(value || '')
   .trim()
   .toUpperCase()
   .replace(/[\s-]+/g, '_');
+
+export const resolvePedidoOrigin = ({ origen_pedido: persistedSource } = {}) => {
+  const normalizedSource = normalizeCode(persistedSource);
+  if (normalizedSource === 'MENU') return PEDIDO_ORIGIN.PUBLIC_MENU;
+  if (normalizedSource === 'CAJA') return PEDIDO_ORIGIN.INTERNAL_POS;
+  return PEDIDO_ORIGIN.UNKNOWN;
+};
 
 export const DELIVERY_PREFERENCE_TRUE_VALUES = Object.freeze(['true', '1', 'si']);
 export const DELIVERY_PREFERENCE_FALSE_VALUES = Object.freeze(['false', '0', 'no']);
@@ -297,6 +311,20 @@ export const classifyPedidoOperationalRouting = (lines, context = {}) => {
   const estadoPago = normalizeCode(context.estado_pago);
   const canal = normalizeCode(context.canal);
   const modalidad = normalizeCode(context.modalidad ?? context.tipo_entrega);
+  const origenPedido = resolvePedidoOrigin(context);
+  const publicValidationCompleted = origenPedido === PEDIDO_ORIGIN.PUBLIC_MENU
+    && (
+      context.public_validation_completed === true
+      || (
+        context.pago_confirmado_at !== null
+        && context.pago_confirmado_at !== undefined
+        && String(context.pago_confirmado_at).trim() !== ''
+      )
+    );
+  const pendienteValidacionPublica = origenPedido === PEDIDO_ORIGIN.PUBLIC_MENU
+    && !publicValidationCompleted;
+  const origenDesconocido = origenPedido === PEDIDO_ORIGIN.UNKNOWN;
+  const requiereValidacionOrigen = pendienteValidacionPublica || origenDesconocido;
   const isPaidLocalConsumption = estadoPago === 'PAGADO_CONFIRMADO'
     && ['LOCAL', 'POS', 'CAJA'].includes(canal)
     && ['CONSUMO_LOCAL', 'LOCAL', 'EN_LOCAL'].includes(modalidad);
@@ -306,9 +334,12 @@ export const classifyPedidoOperationalRouting = (lines, context = {}) => {
   if (requiereRevision) {
     accionOperativa = PEDIDO_OPERATIONAL_ACTION.REVIEW;
     estadoInicial = 'PENDIENTE';
+  } else if (requiereValidacionOrigen) {
+    accionOperativa = PEDIDO_OPERATIONAL_ACTION.AWAIT_VALIDATION;
+    estadoInicial = 'PENDIENTE';
   } else if (requiereCocina) {
     accionOperativa = PEDIDO_OPERATIONAL_ACTION.SEND_TO_KITCHEN;
-    estadoInicial = 'PENDIENTE';
+    estadoInicial = 'EN_COCINA';
   } else if (isPaidLocalConsumption) {
     accionOperativa = PEDIDO_OPERATIONAL_ACTION.COMPLETE;
     estadoInicial = 'COMPLETADO';
@@ -329,6 +360,10 @@ export const classifyPedidoOperationalRouting = (lines, context = {}) => {
     extras_independientes: extrasIndependientes,
     requiere_revision: requiereRevision,
     lineas_invalidas: lineasInvalidas,
+    origen_pedido_clasificado: origenPedido,
+    pendiente_validacion_publica: pendienteValidacionPublica,
+    origen_desconocido: origenDesconocido,
+    requiere_validacion_origen: requiereValidacionOrigen,
     accion_operativa: accionOperativa,
     estado_operativo_inicial: estadoInicial
   };
@@ -344,7 +379,11 @@ export const readPedidoOperationalRouting = async ({ client, idPedido }) => {
 
   const [pedidoResult, detailResult] = await Promise.all([
     client.query(
-      `SELECT estado_pago, canal, tipo_entrega AS modalidad
+      `SELECT estado_pago,
+              canal,
+              tipo_entrega AS modalidad,
+              origen_pedido,
+              pago_confirmado_at
        FROM public.pedidos
        WHERE id_pedido = $1
        LIMIT 1`,
@@ -404,6 +443,42 @@ export const readPedidoOperationalRouting = async ({ client, idPedido }) => {
   };
 };
 
+export const transitionPedidoToKitchenState = async ({
+  client,
+  idPedido,
+  estadoEnCocinaId = null
+}) => {
+  const pedidoId = toPositiveInteger(idPedido);
+  const targetStateId = toPositiveInteger(estadoEnCocinaId)
+    || toPositiveInteger(await resolveEstadoPedidoIdByCode(client, 'EN_COCINA'));
+
+  if (!pedidoId || !targetStateId) {
+    throw Object.assign(new Error('No existe el estado EN_COCINA para el pedido.'), {
+      code: 'VENTAS_PEDIDO_ESTADO_COCINA_NO_ENCONTRADO'
+    });
+  }
+
+  const result = await client.query(
+    `UPDATE public.pedidos
+     SET id_estado_pedido = $2,
+         visible_en_cocina_at = COALESCE(
+           visible_en_cocina_at,
+           (NOW() AT TIME ZONE 'America/Tegucigalpa')
+         )
+     WHERE id_pedido = $1
+     RETURNING id_pedido, id_estado_pedido, visible_en_cocina_at`,
+    [pedidoId, targetStateId]
+  );
+
+  if (result.rowCount !== 1) {
+    throw Object.assign(new Error('Pedido no encontrado para enviar a cocina.'), {
+      code: 'VENTAS_PEDIDO_NO_ENCONTRADO'
+    });
+  }
+
+  return result.rows[0];
+};
+
 export const applyPedidoInitialOperationalRouting = async ({ client, idPedido }) => {
   const pedidoId = toPositiveInteger(idPedido);
   const routing = await readPedidoOperationalRouting({ client, idPedido: pedidoId });
@@ -420,6 +495,16 @@ export const applyPedidoInitialOperationalRouting = async ({ client, idPedido })
       }
     );
   }
+
+  if (routing.estado_operativo_inicial === 'EN_COCINA') {
+    const transitioned = await transitionPedidoToKitchenState({ client, idPedido: pedidoId });
+    return {
+      ...routing,
+      ...transitioned,
+      estado_pedido: 'EN_COCINA'
+    };
+  }
+
   const targetStateId = await resolveEstadoPedidoIdByCode(client, routing.estado_operativo_inicial);
 
   if (!toPositiveInteger(targetStateId)) {
@@ -448,4 +533,36 @@ export const applyPedidoInitialOperationalRouting = async ({ client, idPedido })
     estado_pedido: routing.estado_operativo_inicial,
     visible_en_cocina_at: null
   };
+};
+
+export const applyPedidoOperationalRoutingAfterCommit = async ({ client, idPedido }) => {
+  const pedidoId = toPositiveInteger(idPedido);
+  if (!pedidoId || typeof client?.query !== 'function') {
+    throw Object.assign(new Error('No se pudo aplicar el ruteo post-commit del pedido.'), {
+      code: 'VENTAS_PEDIDO_RUTEO_CONTEXTO_INVALIDO'
+    });
+  }
+
+  await client.query('BEGIN');
+  try {
+    const lockResult = await client.query(
+      `SELECT id_pedido
+       FROM public.pedidos
+       WHERE id_pedido = $1
+       FOR UPDATE`,
+      [pedidoId]
+    );
+    if (lockResult.rowCount !== 1) {
+      throw Object.assign(new Error('Pedido no encontrado para aplicar su ruteo post-commit.'), {
+        code: 'VENTAS_PEDIDO_NO_ENCONTRADO'
+      });
+    }
+
+    const routing = await applyPedidoInitialOperationalRouting({ client, idPedido: pedidoId });
+    await client.query('COMMIT');
+    return routing;
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw error;
+  }
 };

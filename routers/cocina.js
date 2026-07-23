@@ -225,12 +225,22 @@ const parseTegucigalpaLocalTimestampToEpoch = (value) => {
   return resolvedEpoch + parts.milliseconds;
 };
 
-const resolveKdsWaitingMetrics = ({
+export const resolveKdsWaitingMetrics = ({
   startedAt,
   expectedMinutes,
   startedAtIsLocal = false,
   nowMs = Date.now()
 }) => {
+  const hasStartedAt = startedAt !== null
+    && startedAt !== undefined
+    && (typeof startedAt !== 'string' || startedAt.trim() !== '');
+  if (!hasStartedAt) {
+    return {
+      minutos_en_espera: null,
+      esta_proximo_a_expirar: false
+    };
+  }
+
   const startedAtMs = startedAtIsLocal
     ? parseTegucigalpaLocalTimestampToEpoch(startedAt)
     : startedAt instanceof Date

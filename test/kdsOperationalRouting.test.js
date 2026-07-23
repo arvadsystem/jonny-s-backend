@@ -15,6 +15,7 @@ import {
   DELIVERY_PREFERENCE_FALSE_VALUES,
   DELIVERY_PREFERENCE_TRUE_VALUES
 } from '../routers/ventas/services/pedidoOperationalRoutingService.js';
+import { resolveKdsWaitingMetrics } from '../routers/cocina.js';
 
 const recipeRow = ({
   idPedido = 1,
@@ -73,6 +74,18 @@ const standaloneExtraRow = ({
 
 const routedInstructions = (rows) => routeKdsOperationalRows(rows)
   .map((row) => `${row.id_detalle_pedido}:${row.kds_instruccion_operativa}`);
+
+test('metricas KDS rechazan referencias de inicio ausentes o invalidas', () => {
+  for (const startedAt of [null, undefined, '', '   ', new Date('invalid'), 'fecha-invalida']) {
+    assert.deepEqual(
+      resolveKdsWaitingMetrics({ startedAt, expectedMinutes: 25 }),
+      {
+        minutos_en_espera: null,
+        esta_proximo_a_expirar: false
+      }
+    );
+  }
+});
 
 test('predicados SQL KDS expresan el mismo contrato operacional estricto', () => {
   const preparation = buildKitchenPreparationPredicate('dp');

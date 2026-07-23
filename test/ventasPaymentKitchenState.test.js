@@ -26,8 +26,17 @@ const buildClient = ({ lines, estadoPago = 'PAGADO_CONFIRMADO', canal = 'LOCAL',
       }
       if (/SELECT id_pedido_pago_control/.test(sql)) return { rowCount: 0, rows: [] };
       if (/INSERT INTO public\.pedidos_pago_control/.test(sql)) return { rowCount: 1, rows: [] };
-      if (/SELECT estado_pago, canal, tipo_entrega AS modalidad/.test(sql)) {
-        return { rowCount: 1, rows: [{ estado_pago: estadoPago, canal, modalidad }] };
+      if (/SELECT estado_pago,[\s\S]*tipo_entrega AS modalidad/.test(sql)) {
+        return {
+          rowCount: 1,
+          rows: [{
+            estado_pago: estadoPago,
+            canal,
+            modalidad,
+            origen_pedido: 'CAJA',
+            pago_confirmado_at: '2026-07-23T12:00:00-06:00'
+          }]
+        };
       }
       if (/FROM public\.detalle_pedido/.test(sql)) return { rowCount: lines.length, rows: lines };
       if (/SELECT p\.id_pedido,[\s\S]*FROM public\.pedidos p/.test(sql)) {
@@ -53,7 +62,7 @@ const buildClient = ({ lines, estadoPago = 'PAGADO_CONFIRMADO', canal = 'LOCAL',
   return { client, calls };
 };
 
-test('venta inmediata producto-only persiste pago y finaliza el pedido', async () => {
+test('venta inmediata persiste el pago sin ejecutar ruteo antes del commit', async () => {
   const fixture = buildClient({
     lines: [{
       id_detalle_pedido: 1,
@@ -77,10 +86,8 @@ test('venta inmediata producto-only persiste pago y finaliza el pedido', async (
   });
 
   const orderUpdates = fixture.calls.filter((call) => /UPDATE public\.pedidos/.test(call.sql));
-  assert.equal(orderUpdates.length, 2);
+  assert.equal(orderUpdates.length, 1);
   assert.match(orderUpdates[0].sql, /estado_pago = \$2/);
-  assert.doesNotMatch(orderUpdates[1].sql, /estado_pago/);
-  assert.deepEqual(orderUpdates[1].params, [218, 4]);
 });
 
 test('respuesta reconciliada expone ruteo persistido de receta', async () => {
