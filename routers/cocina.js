@@ -119,6 +119,24 @@ export const resolveKdsRuleByActiveCount = (activeCount) => {
 };
 
 const ISO_DATE_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
+const LOCAL_TIMESTAMP_PATTERN =
+  /^(\d{4}-\d{2}-\d{2})[ T](\d{2}):(\d{2}):(\d{2})(?:\.(\d+))?$/;
+const TEGUCIGALPA_DATE_FORMATTER = new Intl.DateTimeFormat('en-US', {
+  timeZone: 'America/Tegucigalpa',
+  year: 'numeric',
+  month: '2-digit',
+  day: '2-digit'
+});
+const TEGUCIGALPA_DATE_TIME_FORMATTER = new Intl.DateTimeFormat('en-US', {
+  timeZone: 'America/Tegucigalpa',
+  year: 'numeric',
+  month: '2-digit',
+  day: '2-digit',
+  hour: '2-digit',
+  minute: '2-digit',
+  second: '2-digit',
+  hourCycle: 'h23'
+});
 
 const isValidIsoDate = (value) => {
   if (!ISO_DATE_PATTERN.test(value)) return false;
@@ -129,28 +147,105 @@ const isValidIsoDate = (value) => {
     && date.getUTCDate() === day;
 };
 
+const readDateTimeParts = (formatter, date) => Object.fromEntries(
+  formatter
+    .formatToParts(date)
+    .filter((part) => part.type !== 'literal')
+    .map((part) => [part.type, part.value])
+);
+
+const parseLocalTimestampParts = (value) => {
+  const match = String(value ?? '').trim().match(LOCAL_TIMESTAMP_PATTERN);
+  if (!match || !isValidIsoDate(match[1])) return null;
+  const hour = Number(match[2]);
+  const minute = Number(match[3]);
+  const second = Number(match[4]);
+  if (hour > 23 || minute > 59 || second > 59) return null;
+  const [year, month, day] = match[1].split('-').map(Number);
+  const milliseconds = Number(String(match[5] || '').slice(0, 3).padEnd(3, '0')) || 0;
+  return { date: match[1], year, month, day, hour, minute, second, milliseconds };
+};
+
+const formatDateInTegucigalpa = (date) => {
+  const dateParts = readDateTimeParts(TEGUCIGALPA_DATE_FORMATTER, date);
+  if (!dateParts.year || !dateParts.month || !dateParts.day) return null;
+  return `${dateParts.year}-${dateParts.month}-${dateParts.day}`;
+};
+
 const resolveOperationalDateValue = (value) => {
-  if (value === null || value === undefined || value === '') return null;
+  if (value === null || value === undefined) return null;
   const text = String(value).trim();
+  if (!text) return null;
   if (ISO_DATE_PATTERN.test(text)) {
     return isValidIsoDate(text) ? text : null;
   }
 
+  if (LOCAL_TIMESTAMP_PATTERN.test(text)) {
+    const localTimestamp = parseLocalTimestampParts(text);
+    return localTimestamp?.date || null;
+  }
+
   const date = value instanceof Date ? value : new Date(text);
   if (Number.isNaN(date.getTime())) return null;
-  const parts = new Intl.DateTimeFormat('en-US', {
-    timeZone: 'America/Tegucigalpa',
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit'
-  }).formatToParts(date);
-  const dateParts = Object.fromEntries(
-    parts
-      .filter((part) => part.type !== 'literal')
-      .map((part) => [part.type, part.value])
+  return formatDateInTegucigalpa(date);
+};
+
+const resolveTegucigalpaOffsetMs = (epochMs) => {
+  const instant = new Date(epochMs);
+  const parts = readDateTimeParts(TEGUCIGALPA_DATE_TIME_FORMATTER, instant);
+  if (!parts.year || !parts.month || !parts.day || parts.hour === undefined) return null;
+  return Date.UTC(
+    Number(parts.year),
+    Number(parts.month) - 1,
+    Number(parts.day),
+    Number(parts.hour),
+    Number(parts.minute),
+    Number(parts.second)
+  ) - epochMs;
+};
+
+const parseTegucigalpaLocalTimestampToEpoch = (value) => {
+  const parts = parseLocalTimestampParts(value);
+  if (!parts) return null;
+  const wallClockEpoch = Date.UTC(
+    parts.year,
+    parts.month - 1,
+    parts.day,
+    parts.hour,
+    parts.minute,
+    parts.second
   );
-  if (!dateParts.year || !dateParts.month || !dateParts.day) return null;
-  return `${dateParts.year}-${dateParts.month}-${dateParts.day}`;
+  const initialOffset = resolveTegucigalpaOffsetMs(wallClockEpoch);
+  if (!Number.isFinite(initialOffset)) return null;
+  let resolvedEpoch = wallClockEpoch - initialOffset;
+  const resolvedOffset = resolveTegucigalpaOffsetMs(resolvedEpoch);
+  if (Number.isFinite(resolvedOffset) && resolvedOffset !== initialOffset) {
+    resolvedEpoch = wallClockEpoch - resolvedOffset;
+  }
+  return resolvedEpoch + parts.milliseconds;
+};
+
+const resolveKdsWaitingMetrics = ({
+  startedAt,
+  expectedMinutes,
+  startedAtIsLocal = false,
+  nowMs = Date.now()
+}) => {
+  const startedAtMs = startedAtIsLocal
+    ? parseTegucigalpaLocalTimestampToEpoch(startedAt)
+    : startedAt instanceof Date
+      ? startedAt.getTime()
+      : new Date(startedAt).getTime();
+  const minutosEnEspera = Number.isFinite(startedAtMs)
+    ? Math.max(0, Math.floor((nowMs - startedAtMs) / 60000))
+    : null;
+  const resolvedExpectedMinutes =
+    parsePositiveInt(expectedMinutes) || parsePositiveInt(EXPIRY_WARN_MINUTES) || 20;
+  return {
+    minutos_en_espera: minutosEnEspera,
+    esta_proximo_a_expirar:
+      minutosEnEspera !== null && minutosEnEspera >= resolvedExpectedMinutes
+  };
 };
 
 export const assignPersistedKdsTiming = async ({
@@ -1009,26 +1104,10 @@ router.get('/cocina/pedidos', checkPermission(COCINA_VIEW_PERMISSIONS), async (r
       }
 
       const grouped = new Map();
-      const now = Date.now();
 
       for (const row of operationalRows) {
         if (!grouped.has(row.id_pedido)) {
           const estadoCode = resolveEstadoCode(row.estado_descripcion);
-          // AM: Base del atraso prioriza kds_started_at para evitar falsos retrasos al inicializar pedidos.
-          const kdsBaseRef =
-            row.kds_started_at || row.visible_en_cocina_at || row.fecha_hora_facturacion || row.fecha_hora_pedido;
-          const kdsBaseMs = kdsBaseRef ? new Date(kdsBaseRef).getTime() : null;
-          const minutosEnEspera = Number.isFinite(kdsBaseMs)
-            ? Math.max(0, Math.floor((now - kdsBaseMs) / 60000))
-            : null;
-          // AM: Usa minutos esperados del pedido; fallback seguro solo cuando no exista kds_expected_minutes.
-          const expectedMinutes =
-            parsePositiveInt(row.kds_expected_minutes) || parsePositiveInt(EXPIRY_WARN_MINUTES) || 20;
-          const estaProximoAExpirar =
-            minutosEnEspera !== null &&
-            Number.isInteger(expectedMinutes) &&
-            expectedMinutes > 0 &&
-            minutosEnEspera >= expectedMinutes;
 
           grouped.set(row.id_pedido, {
             id_pedido: Number(row.id_pedido),
@@ -1051,8 +1130,8 @@ router.get('/cocina/pedidos', checkPermission(COCINA_VIEW_PERMISSIONS), async (r
             kds_expected_minutes: parsePositiveInt(row.kds_expected_minutes),
             kds_expected_rule: row.kds_expected_rule || null,
             fecha_hora_facturacion: row.fecha_hora_facturacion || row.fecha_hora_pedido,
-            minutos_en_espera: minutosEnEspera,
-            esta_proximo_a_expirar: estaProximoAExpirar,
+            minutos_en_espera: null,
+            esta_proximo_a_expirar: false,
             total: roundMoney(row.total),
             inventario_alertas_total: Number(row.inventario_alertas_total ?? 0) || 0,
             inventario_alertas_pendientes: Number(row.inventario_alertas_pendientes ?? 0) || 0,
@@ -1115,6 +1194,20 @@ router.get('/cocina/pedidos', checkPermission(COCINA_VIEW_PERMISSIONS), async (r
             parsePositiveInt(persistedTiming.kds_expected_minutes) || pedido.kds_expected_minutes;
           pedido.kds_expected_rule = persistedTiming.kds_expected_rule || pedido.kds_expected_rule;
         }
+      }
+
+      const metricsNowMs = Date.now();
+      for (const pedido of grouped.values()) {
+        const hasPersistedStartedAt = Boolean(pedido.kds_started_at);
+        const startedAt = hasPersistedStartedAt
+          ? pedido.kds_started_at
+          : pedido.visible_en_cocina_at || pedido.fecha_hora_facturacion || pedido.fecha_hora_pedido;
+        Object.assign(pedido, resolveKdsWaitingMetrics({
+          startedAt,
+          expectedMinutes: pedido.kds_expected_minutes,
+          startedAtIsLocal: !hasPersistedStartedAt,
+          nowMs: metricsNowMs
+        }));
       }
 
       const data = Array.from(grouped.values()).filter((pedido) => pedido.items.length > 0).map((pedido) => {

@@ -6835,16 +6835,15 @@ router.get('/ventas/pedidos-menu', checkPermission(['VENTAS_VER']), async (req, 
                   END,
                 'id_producto', dp.id_producto,
                 'id_receta', dp.id_receta,
-                'nombre_item', COALESCE(prod.nombre_producto, rec.nombre_receta, 'Item de pedido'),
-                'nombre_producto', COALESCE(prod.nombre_producto, rec.nombre_receta, 'Item de pedido'),
-                'cantidad',
-                  CASE
-                    WHEN COALESCE(dp.cantidad, 0) > 0
-                      THEN dp.cantidad::int
-                    WHEN COALESCE(prod.precio, rec.precio, 0) > 0
-                      THEN GREATEST(1, ROUND(COALESCE(dp.sub_total_pedido, dp.total_pedido, 0) / COALESCE(prod.precio, rec.precio, 1))::int)
-                    ELSE 1
-                  END,
+                'nombre_item', COALESCE(
+                  NULLIF(TRIM(prod.nombre_producto), ''),
+                  NULLIF(TRIM(rec.nombre_receta), '')
+                ),
+                'nombre_producto', COALESCE(
+                  NULLIF(TRIM(prod.nombre_producto), ''),
+                  NULLIF(TRIM(rec.nombre_receta), '')
+                ),
+                'cantidad', dp.cantidad,
                 'precio_unitario',
                   COALESCE(
                     prod.precio,
