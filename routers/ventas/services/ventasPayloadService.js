@@ -33,8 +33,10 @@ export const buildComplementLineConfig = (line) => {
   const selected = Array.isArray(line?.complementos_detalle) ? line.complementos_detalle : [];
   const extras = Array.isArray(line?.extras_detalle) ? line.extras_detalle : [];
   const metadata = line?.complementos_metadata;
-  if (!selected.length && !metadata?.requiere_complementos && !extras.length) return null;
+  const hasDeliveryPreference = line?.kind === 'PRODUCTO' && typeof line?.entregar_con_pedido === 'boolean';
+  if (!selected.length && !metadata?.requiere_complementos && !extras.length && !hasDeliveryPreference) return null;
   return {
+    ...(hasDeliveryPreference ? { entregar_con_pedido: line.entregar_con_pedido } : {}),
     tipo_complemento: VENTA_COMPLEMENTO_TIPO_SALSAS,
     requiere_complementos: Boolean(metadata?.requiere_complementos),
     minimo_complementos: Number(metadata?.minimo_complementos || 0),
@@ -122,6 +124,14 @@ export const normalizeVentaItems = (items) => {
     }
 
     const [kind, entityId] = presentIds[0];
+    let entregarConPedido = null;
+    if (kind === 'PRODUCTO' && item.entregar_con_pedido !== undefined && item.entregar_con_pedido !== null) {
+      const entregarConPedidoResult = parseBooleanInput(item.entregar_con_pedido);
+      if (!entregarConPedidoResult.ok) {
+        return { ok: false, message: 'entregar_con_pedido debe ser booleano.' };
+      }
+      entregarConPedido = entregarConPedidoResult.value;
+    }
     const idDescuentoCatalogoLinea = parseOptionalPositiveInt(item.id_descuento_catalogo);
     if (
       item.id_descuento_catalogo !== undefined &&
@@ -159,6 +169,7 @@ export const normalizeVentaItems = (items) => {
       id_producto: kind === 'PRODUCTO' ? entityId : null,
       id_receta: kind === 'RECETA' ? entityId : null,
       id_extra: kind === 'ITEM' ? entityId : null,
+      entregar_con_pedido: kind === 'PRODUCTO' ? entregarConPedido : null,
       observacion: normalizeObservation(item.observacion),
       id_descuento_catalogo_linea: idDescuentoCatalogoLinea,
       complementos: complementosResult.data,

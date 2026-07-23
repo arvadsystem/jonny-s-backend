@@ -764,6 +764,7 @@ export const fetchKitchenSaleDetailRows = async (client, idFactura) =>
             NULL::numeric AS exento_linea,
             NULL::numeric AS exonerado_linea,
             dp.observacion,
+            dp.configuracion_menu,
             COALESCE(dfo.origen_snapshot, df.origen_snapshot) AS origen_snapshot
           FROM detalle_facturas df
           LEFT JOIN detalle_facturas_origen dfo

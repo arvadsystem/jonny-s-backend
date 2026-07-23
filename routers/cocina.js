@@ -13,6 +13,12 @@ import {
   buildSalsaConsumptionItemsFromPedidoDetails,
   loadLegacySalsaConsumptionByStockKey
 } from '../services/salsasPedidoSnapshotService.js';
+import { readPedidoOperationalRouting } from './ventas/services/pedidoOperationalRoutingService.js';
+import {
+  buildInvalidKitchenLinePredicate,
+  buildKitchenPreparationPredicate,
+  buildKitchenProductPredicate
+} from './ventas/services/kitchenPrintRoutingService.js';
 
 const router = express.Router();
 
@@ -61,6 +67,7 @@ const EXTRA_TRANSITIONS = {
 };
 
 const COCINA_VIEW_PERMISSIONS = ['COCINA_VER'];
+
 const COCINA_TRANSITION_PERMISSION_BY_STATE = Object.freeze({
   EN_COCINA: 'COCINA_PEDIDO_INICIAR',
   EN_PREPARACION: 'COCINA_PEDIDO_MARCAR_LISTO',
@@ -753,6 +760,24 @@ router.get('/cocina/pedidos', checkPermission(COCINA_VIEW_PERMISSIONS), async (r
       }
 
       filters.push(`p.id_estado_pedido = ANY(${pushParam(activeEstadoIds)}::int[])`);
+      filters.push(`
+        EXISTS (
+          SELECT 1
+          FROM public.detalle_pedido dp_route
+          WHERE dp_route.id_pedido = p.id_pedido
+            AND COALESCE(dp_route.estado, true) = true
+            AND ${buildKitchenPreparationPredicate('dp_route')}
+        )
+      `);
+      filters.push(`
+        NOT EXISTS (
+          SELECT 1
+          FROM public.detalle_pedido dp_invalid
+          WHERE dp_invalid.id_pedido = p.id_pedido
+            AND COALESCE(dp_invalid.estado, true) = true
+            AND ${buildInvalidKitchenLinePredicate('dp_invalid')}
+        )
+      `);
 
       if (requestedSucursalId) {
         filters.push(`p.id_sucursal = ${pushParam(requestedSucursalId)}`);
@@ -784,7 +809,7 @@ router.get('/cocina/pedidos', checkPermission(COCINA_VIEW_PERMISSIONS), async (r
             p.id_pedido::text ILIKE ${qParam}
             OR COALESCE(s.nombre_sucursal, '') ILIKE ${qParam}
             OR COALESCE(NULLIF(trim(concat_ws(' ', per.nombre, per.apellido)), ''), emp.nombre_empresa, 'Consumidor final') ILIKE ${qParam}
-            OR COALESCE(prod.nombre_producto, rec.nombre_receta, '') ILIKE ${qParam}
+            OR COALESCE(prod.nombre_producto, rec.nombre_receta, standalone_extra.nombre_extra_snapshot, '') ILIKE ${qParam}
             OR COALESCE(dp.observacion, p.descripcion_pedido, '') ILIKE ${qParam}
           )
         `);
@@ -836,10 +861,14 @@ router.get('/cocina/pedidos', checkPermission(COCINA_VIEW_PERMISSIONS), async (r
             dp.id_detalle_pedido,
             dp.id_producto,
             dp.id_receta,
-            dp.cantidad,
+            standalone_extra.id_extra AS id_extra_independiente,
+            CASE
+              WHEN standalone_extra.id_extra IS NOT NULL THEN standalone_extra.cantidad
+              ELSE dp.cantidad
+            END AS cantidad,
             dp.observacion,
             ${hasDetallePedidoConfiguracionMenu ? 'dp.configuracion_menu,' : 'NULL::jsonb AS configuracion_menu,'}
-            COALESCE(prod.nombre_producto, rec.nombre_receta, 'Item de cocina') AS nombre_item,
+            COALESCE(prod.nombre_producto, rec.nombre_receta, standalone_extra.nombre_extra_snapshot, 'Item de cocina') AS nombre_item,
             COALESCE(dp.total_pedido, COALESCE(dp.sub_total_pedido, 0)) AS total_linea
           FROM pedidos p
           LEFT JOIN estados_pedido ep ON ep.id_estado_pedido = p.id_estado_pedido
@@ -871,10 +900,31 @@ router.get('/cocina/pedidos', checkPermission(COCINA_VIEW_PERMISSIONS), async (r
           LEFT JOIN detalle_pedido dp
             ON dp.id_pedido = p.id_pedido
            AND COALESCE(dp.estado, true) = true
-           AND dp.id_producto IS NULL
-           AND dp.id_receta IS NOT NULL
+           AND (
+             ${buildKitchenProductPredicate('dp', {
+               hasConfiguration: hasDetallePedidoConfiguracionMenu
+             })}
+             OR ${buildKitchenPreparationPredicate('dp')}
+           )
           LEFT JOIN productos prod ON prod.id_producto = dp.id_producto
           LEFT JOIN recetas rec ON rec.id_receta = dp.id_receta
+          LEFT JOIN LATERAL (
+            SELECT
+              dpe.id_extra,
+              dpe.nombre_extra_snapshot,
+              dpe.codigo_extra_snapshot,
+              dpe.cantidad,
+              dpe.precio_unitario,
+              dpe.subtotal
+            FROM public.detalle_pedido_extras dpe
+            WHERE dpe.id_detalle_pedido = dp.id_detalle_pedido
+              AND COALESCE(dpe.estado, true) = true
+              AND dpe.id_extra IS NOT NULL
+              AND NULLIF(TRIM(dpe.nombre_extra_snapshot), '') IS NOT NULL
+              AND COALESCE(dpe.cantidad, 0) > 0
+            ORDER BY dpe.id_detalle_pedido_extra
+            LIMIT 1
+          ) standalone_extra ON true
           ${whereClause}
           ORDER BY
             ${hasEnPreparacionAt
@@ -992,13 +1042,20 @@ router.get('/cocina/pedidos', checkPermission(COCINA_VIEW_PERMISSIONS), async (r
           pedido.items.push({
             id_detalle: Number(row.id_detalle_pedido),
             tipo_item:
-              row.id_producto !== null
+              row.id_extra_independiente !== null
+                ? 'EXTRA'
+                : row.id_producto !== null
                 ? 'PRODUCTO'
                 : row.id_receta !== null
                     ? 'RECETA'
                   : 'ITEM',
             id_producto: Number(row.id_producto ?? 0) || null,
             id_receta: Number(row.id_receta ?? 0) || null,
+            id_extra: Number(row.id_extra_independiente ?? 0) || null,
+            es_linea_extra_independiente: row.id_extra_independiente !== null,
+            instruccion_operativa: row.id_producto !== null
+              ? 'ENTREGAR_JUNTO_CON_EL_PEDIDO'
+              : 'PREPARAR',
             nombre_item: row.nombre_item || 'Item de cocina',
             cantidad,
             observacion: row.observacion || null,
@@ -1163,6 +1220,26 @@ router.put('/cocina/pedidos/:id/estado', checkPermission(COCINA_VIEW_PERMISSIONS
       // ���� 6. Verificar estado actual y transición válida ��������������������������
       const estadoActual = estadoCodeByIdMap.get(Number(pedido.id_estado_pedido ?? 0)) || null;
 
+      const routing = await readPedidoOperationalRouting({ client, idPedido });
+      if (routing.requiere_revision) {
+        await client.query('ROLLBACK');
+        return res.status(409).json({
+          error: true,
+          code: 'VENTAS_PEDIDO_RUTEO_REQUIERE_REVISION',
+          message: 'El pedido tiene lineas invalidas y requiere revision antes de avanzar.',
+          ...routing
+        });
+      }
+      if (!routing.requiere_cocina) {
+        await client.query('ROLLBACK');
+        return res.status(409).json({
+          error: true,
+          code: 'VENTAS_PEDIDO_NO_REQUIERE_COCINA',
+          message: 'Este pedido no contiene preparaciones para cocina.',
+          ...routing
+        });
+      }
+
       if (!estadoActual || !TRANSITIONS[estadoActual]) {
         await client.query('ROLLBACK');
         return res.status(409).json({
@@ -1181,7 +1258,8 @@ router.put('/cocina/pedidos/:id/estado', checkPermission(COCINA_VIEW_PERMISSIONS
           estado_actual: estadoDestino,
           warning: false,
           warning_code: null,
-          warning_detail: null
+          warning_detail: null,
+          ...routing
         });
       }
 
@@ -1317,6 +1395,7 @@ router.put('/cocina/pedidos/:id/estado', checkPermission(COCINA_VIEW_PERMISSIONS
         id_pedido: idPedido,
         estado_anterior: estadoActual,
         estado_actual: estadoDestino,
+        ...routing,
         en_preparacion_at: updatedPedidoResult.rows[0]?.en_preparacion_at || null,
         warning: Boolean(inventoryResult?.warning || inventoryAlreadyDiscounted),
         warning_code: inventoryAlreadyDiscounted

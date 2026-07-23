@@ -1,4 +1,7 @@
 import { resolveStandaloneExtraLine } from '../utils/parseUtils.js';
+import {
+  classifyKitchenPrintItems
+} from './kitchenPrintRoutingService.js';
 
 const schemaLookupCache = new Map();
 
@@ -79,7 +82,11 @@ export const toKitchenComplementos = (item = {}) => {
     .filter((entry) => entry.id_complemento || entry.nombre);
 };
 
-export const buildPedidoKitchenPrintPayload = async (queryRunner, idPedido, { normalizeStandaloneExtras = true } = {}) => {
+export const buildPedidoKitchenPrintPayload = async (
+  queryRunner,
+  idPedido,
+  { normalizeStandaloneExtras = true, applyOperationalRouting = true } = {}
+) => {
   const hasDetallePedidoConfiguracionMenu = await hasColumn(queryRunner, 'detalle_pedido', 'configuracion_menu');
   const hasDetallePedidoExtras = await hasTable(queryRunner, 'detalle_pedido_extras');
   const hasPedidosContacto = await hasTable(queryRunner, 'pedidos_contacto');
@@ -270,7 +277,7 @@ export const buildPedidoKitchenPrintPayload = async (queryRunner, idPedido, { no
   if (result.rowCount === 0) return null;
 
   const row = result.rows[0];
-  const items = (Array.isArray(row.items) ? row.items : []).map((item, index) => {
+  const normalizedItems = (Array.isArray(row.items) ? row.items : []).map((item, index) => {
     const standaloneExtra = normalizeStandaloneExtras
       ? resolveStandaloneExtraLine({
         idProducto: item?.id_producto,
@@ -287,6 +294,8 @@ export const buildPedidoKitchenPrintPayload = async (queryRunner, idPedido, { no
       linea: index + 1,
       id_detalle: Number(item?.id_detalle || 0) || null,
       tipo_item: standaloneExtra ? 'EXTRA' : String(item?.tipo_item || 'ITEM').trim().toUpperCase(),
+      id_producto: Number(item?.id_producto || 0) || null,
+      id_receta: Number(item?.id_receta || 0) || null,
       cantidad: standaloneCantidad ?? (Number(item?.cantidad ?? 0) || 0),
       nombre_item: standaloneExtra
         ? standaloneExtra.nombre_extra_snapshot
@@ -296,11 +305,17 @@ export const buildPedidoKitchenPrintPayload = async (queryRunner, idPedido, { no
       id_extra: standaloneExtra?.id_extra || null,
       nombre_extra_snapshot: standaloneExtra?.nombre_extra_snapshot || null,
       codigo_extra_snapshot: standaloneExtra?.codigo_extra_snapshot || null,
-      extras: toKitchenExtras(item?.extras),
+      precio_unitario: standaloneExtra?.precio_unitario ?? null,
+      subtotal: standaloneExtra?.subtotal ?? null,
+      extras: standaloneExtra ? [] : toKitchenExtras(item?.extras),
       complementos: toKitchenComplementos(item),
       configuracion_menu: item?.configuracion_menu || null
     };
   });
+  const routing = classifyKitchenPrintItems(normalizedItems);
+  const items = normalizeStandaloneExtras && applyOperationalRouting && !routing.requiere_revision
+    ? routing.items_operativos
+    : normalizedItems;
   // El contador de productos excluye lineas de extra independiente para no
   // inflar el total (p. ej. 1 producto + 4 extras debe reportar 1, no 5).
   const totalProductos = items.reduce(
@@ -360,6 +375,9 @@ export const buildPedidoKitchenPrintPayload = async (queryRunner, idPedido, { no
       monto_pendiente: Number(row.monto_pendiente ?? row.total ?? 0) || 0
     },
     total_productos: totalProductos,
+    requiere_cocina: routing.requiere_cocina,
+    requiere_revision: routing.requiere_revision,
+    lineas_invalidas: routing.lineas_invalidas,
     items
   };
 };

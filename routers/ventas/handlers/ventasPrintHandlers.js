@@ -10,10 +10,6 @@ import {
   registerVentaPrintEvent
 } from '../services/ventasPrintAuditService.js';
 import {
-  isInitialKitchenDispatchEvent,
-  markPedidoVisibleInKitchen
-} from '../services/pedidoKitchenVisibilityService.js';
-import {
   getQzSigningConfiguration,
   getQzPublicErrorMessage,
   isQzSucursalContextRequired,
@@ -27,11 +23,39 @@ import {
   toKitchenComplementos,
   toKitchenExtras
 } from '../services/pedidoKitchenPrintPayloadService.js';
+import {
+  assertKitchenPrintPayload,
+  classifyKitchenPrintItems
+} from '../services/kitchenPrintRoutingService.js';
 
 const sendVentasInternalError = (
   res,
   message = 'No se pudo procesar la solicitud de impresion.'
 ) => res.status(500).json({ error: true, message });
+
+export const buildKitchenPrintValidationErrorResponse = (error) => {
+  if (error?.status !== 409 || ![
+    'PRINT_PEDIDO_NO_REQUIERE_COCINA',
+    'PRINT_PEDIDO_REQUIERE_REVISION'
+  ].includes(error?.code)) return null;
+  return {
+    status: 409,
+    body: {
+      error: true,
+      code: error.code,
+      message: error.message,
+      requiere_revision: error.code === 'PRINT_PEDIDO_REQUIERE_REVISION',
+      lineas_invalidas: Array.isArray(error?.lineas_invalidas) ? error.lineas_invalidas : []
+    }
+  };
+};
+
+const sendKitchenPrintValidationError = (res, error) => {
+  const response = buildKitchenPrintValidationErrorResponse(error);
+  if (!response) return false;
+  res.status(response.status).json(response.body);
+  return true;
+};
 
 const DETECTION_ORIGIN_MAX_LENGTH = 60;
 
@@ -162,7 +186,7 @@ export const buildVentaKitchenPrintPayload = (venta = {}, printerConfig = null) 
   const cocinaConfig = (Array.isArray(printerConfig?.impresoras) ? printerConfig.impresoras : [])
     .find((item) => String(item?.tipo_impresora || '').trim().toUpperCase() === 'COCINA');
 
-  const items = (Array.isArray(venta?.items) ? venta.items : []).map((item, index) => {
+  const normalizedItems = (Array.isArray(venta?.items) ? venta.items : []).map((item, index) => {
     const isStandaloneExtra = Boolean(
       item?.es_linea_extra_independiente || item?.origen_snapshot?.es_linea_extra_independiente
     );
@@ -171,14 +195,31 @@ export const buildVentaKitchenPrintPayload = (venta = {}, printerConfig = null) 
       linea: index + 1,
       id_detalle: Number(item?.id_detalle || 0) || null,
       tipo_item: String(item?.tipo_item || 'ITEM').trim().toUpperCase(),
+      id_producto: Number(item?.id_producto || 0) || null,
+      id_receta: Number(item?.id_receta || 0) || null,
+      id_extra: Number(item?.id_extra || item?.origen_snapshot?.id_extra || 0) || null,
       cantidad: Number(item?.cantidad ?? 0) || 0,
-      nombre_item: String(item?.nombre_item || item?.nombre_producto || 'Item de cocina').trim(),
+      nombre_item: String(item?.nombre_item || item?.nombre_producto || '').trim(),
       observacion: String(item?.observacion || '').trim() || null,
       es_linea_extra_independiente: isStandaloneExtra,
       extras: isStandaloneExtra ? [] : toKitchenExtras(item?.extras),
-      complementos: toKitchenComplementos(item)
+      complementos: toKitchenComplementos(item),
+      configuracion_menu: item?.configuracion_menu || null
     };
   });
+  const derivedRouting = classifyKitchenPrintItems(normalizedItems);
+  const routing = normalizedItems.length === 0
+    && venta?.requiere_revision === false
+    && venta?.requiere_cocina === false
+    ? {
+        ...derivedRouting,
+        requiere_cocina: false,
+        requiere_revision: false,
+        lineas_invalidas: [],
+        items_operativos: []
+      }
+    : derivedRouting;
+  const items = routing.requiere_revision ? normalizedItems : routing.items_operativos;
 
   const totalProductos = items.reduce(
     (sum, item) => (
@@ -208,6 +249,9 @@ export const buildVentaKitchenPrintPayload = (venta = {}, printerConfig = null) 
     contacto: venta?.contacto || null,
     delivery: venta?.delivery || null,
     total_productos: totalProductos,
+    requiere_cocina: routing.requiere_cocina,
+    requiere_revision: routing.requiere_revision,
+    lineas_invalidas: routing.lineas_invalidas,
     items,
     print_config: {
       printMode: cocinaConfig?.modo_impresion || 'BROWSER',
@@ -496,8 +540,11 @@ export const getVentaKitchenComandaByIdHandler = async (req, res) => {
       idCaja: result.body?.id_caja
     }).catch(() => null);
 
-    return res.status(200).json(buildVentaKitchenPrintPayload(result.body, printerConfig));
+    const payload = buildVentaKitchenPrintPayload(result.body, printerConfig);
+    payload.items = assertKitchenPrintPayload(payload);
+    return res.status(200).json(payload);
   } catch (error) {
+    if (sendKitchenPrintValidationError(res, error)) return;
     console.error('Error al obtener comanda de cocina:', error);
     return sendVentasInternalError(res, 'No se pudo generar la comanda de cocina.');
   }
@@ -521,8 +568,11 @@ export const getPedidoKitchenComandaByIdHandler = async (req, res) => {
       idCaja: pedidoComanda.id_caja
     }).catch(() => null);
 
-    return res.status(200).json(buildVentaKitchenPrintPayload(pedidoComanda, printerConfig));
+    const payload = buildVentaKitchenPrintPayload(pedidoComanda, printerConfig);
+    payload.items = assertKitchenPrintPayload(payload);
+    return res.status(200).json(payload);
   } catch (error) {
+    if (sendKitchenPrintValidationError(res, error)) return;
     console.error('Error al obtener comanda de cocina por pedido:', error);
     return sendVentasInternalError(res, 'No se pudo generar la comanda de cocina del pedido.');
   } finally {
@@ -562,12 +612,6 @@ export const createVentaPrintEventHandler = async (req, res) => {
       payload: normalized.value
     });
 
-    if (isInitialKitchenDispatchEvent(normalized.value)) {
-      await markPedidoVisibleInKitchen({
-        client,
-        idPedido: detailResult.body?.id_pedido
-      });
-    }
     await client.query('COMMIT');
 
     return res.status(200).json({

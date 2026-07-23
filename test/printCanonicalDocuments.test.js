@@ -122,6 +122,8 @@ const comandaFixture = {
   items: [
     {
       id_detalle: 71,
+      tipo_item: 'RECETA',
+      id_receta: 7,
       cantidad: 2,
       nombre_item: 'Alitas 12 piezas',
       extras: [{ id_extra: 3, nombre: 'Papas extra', cantidad: 1 }],
@@ -173,12 +175,12 @@ test('regeneracion canonica conserva configuracion historica sin consultar confi
 
 const COMANDA_RENDER_BASELINES = Object.freeze({
   58: Object.freeze({
-    bytes: 7307,
-    sha256: 'b45a035f4f26a41f5c2831f875c4633a31d5ff5159cfa836d0ba19299b74cd98'
+    bytes: 7853,
+    sha256: '5038c4fa5dbd877c31f66d91802c312f0893e3a352bb48f86c8a1b87f996d104'
   }),
   80: Object.freeze({
-    bytes: 7310,
-    sha256: '64e289ba1298610f130cf69cee8741c5605dd47f034034924a7f7266bd04d710'
+    bytes: 7856,
+    sha256: '80a2ac38f4a8dbae31648c9144c190333787e72c5dd798e89d42a78fdd2245f4'
   })
 });
 
@@ -748,6 +750,8 @@ test('fallback v2 historico es best-effort, respeta orden y detiene candidatos t
   assert.deepEqual(HISTORICAL_V2_DOCUMENT_CANDIDATES.map((candidate) => candidate.name), [
     'current-historical-snapshot',
     'current-previous-loader',
+    'pre-routing-historical-snapshot',
+    'pre-routing-previous-loader',
     'legacy-historical-snapshot',
     'legacy-previous-loader'
   ]);
@@ -802,10 +806,12 @@ test('fallback v2 historico es best-effort, respeta orden y detiene candidatos t
       return { status: 200, body: finalCandidate ? facturaFixture : alteredVenta };
     }
   });
-  assert.deepEqual(legacyAttempts, HISTORICAL_V2_DOCUMENT_CANDIDATES.map((candidate) => ({
-    normalizeStandaloneExtras: candidate.normalizeStandaloneExtras,
-    useHistoricalFacturacionSnapshot: candidate.useHistoricalFacturacionSnapshot
-  })));
+  assert.deepEqual(legacyAttempts, [
+    { normalizeStandaloneExtras: true, useHistoricalFacturacionSnapshot: true },
+    { normalizeStandaloneExtras: true, useHistoricalFacturacionSnapshot: false },
+    { normalizeStandaloneExtras: false, useHistoricalFacturacionSnapshot: true },
+    { normalizeStandaloneExtras: false, useHistoricalFacturacionSnapshot: false }
+  ]);
   assert.ok(legacyDb.calls.every(({ sql }) => /^\s*SELECT\b/i.test(sql)));
   assert.equal(
     sha256(Buffer.from(legacyResult.document.data, 'base64')),

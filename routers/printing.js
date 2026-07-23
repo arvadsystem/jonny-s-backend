@@ -4,6 +4,7 @@ import { checkPermission, requestHasAnyRole } from '../middleware/checkPermissio
 import { resolveRequestUserSucursalScope } from '../utils/sucursalScope.js';
 import { buildVentaDetailPayload } from './ventas/handlers/ventasReadHandlers.js';
 import { buildPedidoKitchenPrintPayload } from './ventas/services/pedidoKitchenPrintPayloadService.js';
+import { assertKitchenPrintPayload } from './ventas/services/kitchenPrintRoutingService.js';
 import { enqueuePrintJob } from '../services/printQueueService.js';
 import { obtenerConfiguracionImpresorasRuntime } from '../services/impresorasConfigSucursalService.js';
 import {
@@ -15,7 +16,6 @@ import {
   listAmbiguousPrintJobs,
   resolvePrintJobAdministratively
 } from '../services/printQueueAdminService.js';
-import { markPedidoVisibleInKitchen } from './ventas/services/pedidoKitchenVisibilityService.js';
 
 const router = express.Router();
 const ADMIN_ROLE_CODES = Object.freeze(['ADMIN', 'ADMINISTRADOR', 'SUPER_ADMIN']);
@@ -84,6 +84,7 @@ export const enqueuePedidoComandaPrintJob = async ({
       code: 'PRINT_PEDIDO_SOURCE_INVALID'
     });
   }
+  assertKitchenPrintPayload(pedido);
 
   const idSucursal = await resolveAllowedSucursal(
     req,
@@ -140,13 +141,32 @@ export const enqueuePedidoComandaPrintJob = async ({
     payload
   };
   if (createdDocument?.document) enqueueParams.canonicalDocument = createdDocument.document;
-  if (!isReprint) {
-    enqueueParams.onInsertedTransaction = ({ client }) => markPedidoVisibleInKitchen({
-      client,
-      idPedido: normalizedIdPedido
-    });
-  }
   return enqueue(enqueueParams);
+};
+
+export const enqueueVentaCanonicalPrintJob = async ({
+  venta,
+  tipoDocumento,
+  widthMm,
+  idempotencyKey,
+  idUsuario = null,
+  esReimpresion = false,
+  createPayload = createCanonicalPrintJob,
+  enqueue = enqueuePrintJob
+}) => {
+  const createdDocument = await createPayload({ tipoDocumento, venta, widthMm });
+  const job = await enqueue({
+    idSucursal: Number(venta.id_sucursal),
+    tipoDocumento,
+    idempotencyKey,
+    idFactura: Number(venta.id_factura),
+    idPedido: Number(venta.id_pedido || 0) || null,
+    idUsuario: Number(idUsuario || 0) || null,
+    esReimpresion,
+    payload: createdDocument.payload,
+    canonicalDocument: createdDocument.document
+  });
+  return { job, createdDocument };
 };
 
 const requireAdministrativePrintRole = async (req) => {
@@ -213,30 +233,14 @@ router.post('/ventas/:id/print-jobs', checkPermission(['VENTAS_IMPRIMIR', 'VENTA
       }).catch(() => null)
       : null;
     const widthMm = resolveCanonicalPrintWidth({ tipoDocumento, venta, printerConfig });
-    const createdDocument = await createCanonicalPrintJob({
-      tipoDocumento,
+    const { job } = await enqueueVentaCanonicalPrintJob({
       venta,
-      widthMm
-    });
-
-    const enqueueParams = {
-      idSucursal: Number(venta.id_sucursal),
       tipoDocumento,
+      widthMm,
       idempotencyKey,
-      idFactura,
-      idPedido: Number(venta.id_pedido || 0) || null,
-      idUsuario: Number(req.user?.id_usuario || 0) || null,
-      esReimpresion: isReprint,
-      payload: createdDocument.payload,
-      canonicalDocument: createdDocument.document
-    };
-    if (tipoDocumento === 'comanda' && !isReprint) {
-      enqueueParams.onInsertedTransaction = ({ client }) => markPedidoVisibleInKitchen({
-        client,
-        idPedido: Number(venta.id_pedido)
-      });
-    }
-    const job = await enqueuePrintJob(enqueueParams);
+      idUsuario: req.user?.id_usuario,
+      esReimpresion: isReprint
+    });
     return res.status(202).json({ ok: true, message: 'Trabajo enviado a impresion.', job });
   } catch (error) {
     console.error('[printing.enqueue] fallo', { code: error?.code || null });

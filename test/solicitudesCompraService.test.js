@@ -76,6 +76,75 @@ const baseOverrides = (db, extra = {}) => ({
   ...extra
 });
 
+const captureCatalogQuery = async (query) => {
+  let captured;
+  const db = makeReadDb(async (sql, params) => {
+    if (sql.includes('FROM public.almacenes a') && !sql.includes('WITH catalogo')) {
+      return { rows: [warehouseRow()], rowCount: 1 };
+    }
+    captured = { sql, params };
+    return { rows: [], rowCount: 0 };
+  });
+  const service = createSolicitudesCompraService(baseOverrides(db));
+  const result = await service.listCatalog({ query: { id_almacen: 11, ...query } });
+  return { captured, result };
+};
+
+test('catalogo aplica prioridad global de stock antes de paginar y conserva desempates estables', async () => {
+  const { captured } = await captureCatalogQuery({
+    buscar: 'aceite',
+    solo_stock_bajo: 'true',
+    page: '2',
+    limit: '12'
+  });
+  const compactSql = captured.sql.replace(/\s+/g, ' ').trim();
+  const expectedOrder = [
+    "WHEN 'SIN_STOCK' THEN 0",
+    "WHEN 'STOCK_BAJO' THEN 1",
+    "WHEN 'DISPONIBLE' THEN 2",
+    'ELSE 3',
+    'LOWER(catalogo.nombre)',
+    'catalogo.tipo_item',
+    'catalogo.id_item',
+    'LIMIT $4',
+    'OFFSET $5'
+  ];
+  let previousIndex = -1;
+  for (const fragment of expectedOrder) {
+    const currentIndex = compactSql.indexOf(fragment);
+    assert.ok(currentIndex > previousIndex, `${fragment} debe conservar el orden SQL esperado`);
+    previousIndex = currentIndex;
+  }
+  assert.match(compactSql, /catalogo\.estado_stock IN \('SIN_STOCK', 'STOCK_BAJO'\)/);
+  assert.match(compactSql, /catalogo\.nombre ILIKE '%' \|\| \$2 \|\| '%'/);
+  assert.match(compactSql, /COALESCE\(catalogo\.descripcion, ''\) ILIKE '%' \|\| \$2 \|\| '%'/);
+  assert.deepEqual(captured.params, [11, 'aceite', true, 12, 12]);
+});
+
+test('catalogo completo no excluye disponibles cuando solo_stock_bajo es false o se omite', async () => {
+  for (const query of [{ solo_stock_bajo: 'false' }, {}]) {
+    const { captured, result } = await captureCatalogQuery(query);
+    assert.equal(captured.params[2], false);
+    assert.match(captured.sql, /\(\$3::boolean = false OR catalogo\.estado_stock IN \('SIN_STOCK', 'STOCK_BAJO'\)\)/);
+    assert.deepEqual(result, {
+      ok: true,
+      id_almacen: 11,
+      items: [],
+      pagination: { page: 1, limit: 20, total: 0, total_pages: 0 }
+    });
+  }
+});
+
+test('catalogo conserva filtros separados para producto e insumo', async () => {
+  const product = await captureCatalogQuery({ tipo: 'producto' });
+  assert.match(product.captured.sql, /FROM public\.productos p/);
+  assert.doesNotMatch(product.captured.sql, /FROM public\.insumos i/);
+
+  const supply = await captureCatalogQuery({ tipo: 'insumo' });
+  assert.match(supply.captured.sql, /FROM public\.insumos i/);
+  assert.doesNotMatch(supply.captured.sql, /FROM public\.productos p/);
+});
+
 test('catalogo devuelve productos del almacen con stock local', async () => {
   const db = makeReadDb(async (sql) => {
     if (sql.includes('FROM public.almacenes a') && !sql.includes('WITH catalogo')) return { rows: [warehouseRow()], rowCount: 1 };
