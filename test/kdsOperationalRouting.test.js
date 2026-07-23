@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import {
   buildInvalidKitchenLinePredicate,
@@ -15,7 +16,10 @@ import {
   DELIVERY_PREFERENCE_FALSE_VALUES,
   DELIVERY_PREFERENCE_TRUE_VALUES
 } from '../routers/ventas/services/pedidoOperationalRoutingService.js';
-import { resolveKdsWaitingMetrics } from '../routers/cocina.js';
+import {
+  resolveKdsWaitingMetrics,
+  resolveTegucigalpaLocalWaitingMinutes
+} from '../routers/cocina.js';
 
 const recipeRow = ({
   idPedido = 1,
@@ -90,6 +94,105 @@ test('metricas KDS rechazan referencias de inicio ausentes o invalidas', () => {
       }
     );
   }
+});
+
+test('espera local de Tegucigalpa calcula 30 minutos reales', () => {
+  const nowMs = Date.parse('2026-07-23T09:30:00.000Z');
+  assert.equal(
+    resolveTegucigalpaLocalWaitingMinutes('2026-07-23 03:00:00', nowMs),
+    30
+  );
+});
+
+test('espera local cerca de medianoche conserva los minutos del mismo dia', () => {
+  const nowMs = Date.parse('2026-07-24T05:59:00.000Z');
+  assert.equal(
+    resolveTegucigalpaLocalWaitingMinutes('2026-07-23 23:50:00', nowMs),
+    9
+  );
+});
+
+test('espera local cruza correctamente de un dia al siguiente', () => {
+  const nowMs = Date.parse('2026-07-24T06:10:00.000Z');
+  assert.equal(
+    resolveTegucigalpaLocalWaitingMinutes('2026-07-23 23:50:00', nowMs),
+    20
+  );
+});
+
+test('espera local rechaza valores ausentes, vacios o invalidos', () => {
+  for (const value of [null, undefined, '', '   ', 'fecha-invalida']) {
+    assert.equal(resolveTegucigalpaLocalWaitingMinutes(value), null);
+  }
+});
+
+test('espera local limita fechas futuras a cero minutos', () => {
+  const nowMs = Date.parse('2026-07-23T09:30:00.000Z');
+  assert.equal(
+    resolveTegucigalpaLocalWaitingMinutes('2026-07-23 04:00:00', nowMs),
+    0
+  );
+});
+
+test('espera local es independiente del TZ del proceso Node', () => {
+  const cocinaModuleUrl = new URL('../routers/cocina.js', import.meta.url).href;
+  const script = `
+    import { resolveTegucigalpaLocalWaitingMinutes } from ${JSON.stringify(cocinaModuleUrl)};
+    const result = resolveTegucigalpaLocalWaitingMinutes(
+      '2026-07-23 03:00:00',
+      Date.parse('2026-07-23T09:30:00.000Z')
+    );
+    if (result !== 30) throw new Error(\`Resultado inesperado: \${result}\`);
+  `;
+
+  for (const timezone of ['UTC', 'America/Tegucigalpa', 'America/New_York']) {
+    const result = spawnSync(process.execPath, ['--input-type=module', '--eval', script], {
+      env: { ...process.env, TZ: timezone },
+      encoding: 'utf8'
+    });
+    assert.equal(result.status, 0, `${timezone}: ${result.stderr}`);
+  }
+});
+
+test('alerta de expiracion usa el limite real y evita la falsa espera de seis horas', () => {
+  const nowMs = Date.parse('2026-07-23T09:30:00.000Z');
+  const esperaReal = resolveTegucigalpaLocalWaitingMinutes(
+    '2026-07-23 03:00:00',
+    nowMs
+  );
+  const esperaSobreLimite = resolveTegucigalpaLocalWaitingMinutes(
+    '2026-07-23 02:44:00',
+    nowMs
+  );
+
+  assert.equal(esperaReal, 30);
+  assert.notEqual(esperaReal, 390);
+  assert.equal(esperaReal >= 45, false);
+  assert.equal(esperaSobreLimite, 46);
+  assert.equal(esperaSobreLimite >= 45, true);
+
+  const source = fs.readFileSync(new URL('../routers/cocina.js', import.meta.url), 'utf8');
+  assert.match(
+    source,
+    /const minutosEnEspera = resolveTegucigalpaLocalWaitingMinutes\(\s*pedido\.fecha_hora_pedido\s*\);/
+  );
+  assert.match(
+    source,
+    /if \(minutosEnEspera !== null && minutosEnEspera >= EXPIRY_WARN_MINUTES\) \{\s*tryEnviarAlertaExpiracion\(/
+  );
+  assert.doesNotMatch(source, /new Date\(fechaRef\)/);
+});
+
+test('fallback SQL de visibilidad usa la hora local de Tegucigalpa', () => {
+  const source = fs.readFileSync(new URL('../routers/cocina.js', import.meta.url), 'utf8');
+  assert.match(
+    source,
+    /visible_en_cocina_at = COALESCE\(\s*visible_en_cocina_at,\s*fecha_hora_pedido,\s*NOW\(\) AT TIME ZONE 'America\/Tegucigalpa'\s*\)/
+  );
+  assert.doesNotMatch(
+    source,
+    /visible_en_cocina_at = COALESCE\(visible_en_cocina_at, fecha_hora_pedido, NOW\(\)\)/
+  );
 });
 
 test('predicados SQL KDS expresan el mismo contrato operacional estricto', () => {
