@@ -133,7 +133,8 @@ export const assignPersistedKdsTiming = async ({
   pedidoId,
   idSucursal,
   activeEstadoIds,
-  operationalDate
+  operationalDate,
+  hasConfiguration = true
 }) => {
   const safePedidoId = parsePositiveInt(pedidoId);
   const safeSucursalId = parsePositiveInt(idSucursal);
@@ -170,6 +171,9 @@ export const assignPersistedKdsTiming = async ({
   const operationalDateValue =
     resolveOperationalDateValue(operationalDate) ||
     new Date().toLocaleDateString('en-CA', { timeZone: 'America/Tegucigalpa' });
+  const eligibilityPredicate = buildKitchenOrderEligibilityPredicate('p', {
+    hasConfiguration
+  });
 
   // AM: Cuenta la carga visible del KDS aunque el pedido aun no tenga factura o codigo de venta.
   const activeCountResult = await client.query(
@@ -194,6 +198,7 @@ export const assignPersistedKdsTiming = async ({
           p.visible_en_cocina_at::date,
           p.fecha_hora_pedido::date
         ) = $3::date
+        AND ${eligibilityPredicate}
     `,
     [safeSucursalId, activeEstadoIds, operationalDateValue]
   );
@@ -1070,7 +1075,8 @@ router.get('/cocina/pedidos', checkPermission(COCINA_VIEW_PERMISSIONS), async (r
             pedidoId: pedido.id_pedido,
             idSucursal: pedido.id_sucursal,
             activeEstadoIds: activeKdsEstadoIds,
-            operationalDate: pedido.fecha_operacion || pedido.fecha_hora_pedido || null
+            operationalDate: pedido.fecha_operacion || pedido.fecha_hora_pedido || null,
+            hasConfiguration: hasDetallePedidoConfiguracionMenu
           });
           if (!persistedTiming) continue;
           pedido.kds_started_at = persistedTiming.kds_started_at || pedido.kds_started_at;

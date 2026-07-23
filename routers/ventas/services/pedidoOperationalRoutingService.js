@@ -29,14 +29,19 @@ export const DELIVERY_PREFERENCE_TRUE_VALUES = Object.freeze(['true', '1', 'si']
 export const DELIVERY_PREFERENCE_FALSE_VALUES = Object.freeze(['false', '0', 'no']);
 
 const parseObject = (value) => {
-  if (value && typeof value === 'object' && !Array.isArray(value)) {
-    return { valid: true, value };
-  }
   if (value === null || value === undefined) {
     return { valid: true, value: null };
   }
-  if (typeof value !== 'string' || !value.trim()) {
-    return { valid: false, value: null };
+  if (typeof value === 'object' && !Array.isArray(value)) {
+    return { valid: true, value };
+  }
+  return { valid: false, value: null };
+};
+
+const parseHistoricalObject = (value) => {
+  const parsedObject = parseObject(value);
+  if (parsedObject.valid || typeof value !== 'string' || !value.trim()) {
+    return parsedObject;
   }
   try {
     const parsed = JSON.parse(value);
@@ -79,12 +84,8 @@ const readDeliveryPreference = (line) => {
     return { presente: true, valida: false, valor: null };
   }
   if (typeof value === 'string') {
-    const normalized = value
-      .trim()
-      .toLowerCase()
-      .normalize('NFD')
-      .replace(/[\u0300-\u036f]/g, '');
-    if (DELIVERY_PREFERENCE_TRUE_VALUES.includes(normalized)) {
+    const normalized = value.trim().toLowerCase();
+    if (normalized === 'sí' || DELIVERY_PREFERENCE_TRUE_VALUES.includes(normalized)) {
       return { presente: true, valida: true, valor: true };
     }
     if (DELIVERY_PREFERENCE_FALSE_VALUES.includes(normalized)) {
@@ -126,7 +127,7 @@ const buildLineReference = (line, index) => {
 };
 
 const isDeliveryChargeLine = (line, reference) => {
-  const snapshot = parseObject(line?.origen_snapshot);
+  const snapshot = parseHistoricalObject(line?.origen_snapshot);
   return snapshot.valid
     && normalizeCode(snapshot.value?.origen) === 'DELIVERY'
     && reference.tipo_item === 'ITEM'
