@@ -227,14 +227,16 @@ export const resolveStandaloneExtraLine = ({ idProducto, idReceta, extras }) => 
   if (list.length !== 1) return null;
 
   const extra = list[0] || {};
+  const idExtra = parseOptionalPositiveInt(extra.id_extra);
   const nombre = String(extra.nombre || extra.nombre_extra || extra.nombre_extra_snapshot || '').trim();
-  if (!nombre) return null;
+  const cantidad = toStandaloneNumber(extra.cantidad);
+  if (!idExtra || !nombre || !Number.isFinite(cantidad) || cantidad <= 0) return null;
 
   return {
-    id_extra: parseOptionalPositiveInt(extra.id_extra),
+    id_extra: idExtra,
     nombre_extra_snapshot: nombre,
     codigo_extra_snapshot: String(extra.codigo || extra.codigo_extra_snapshot || '').trim() || null,
-    cantidad: toStandaloneNumber(extra.cantidad),
+    cantidad,
     precio_unitario: toStandaloneNumber(extra.precio_unitario),
     subtotal: toStandaloneNumber(extra.subtotal)
   };

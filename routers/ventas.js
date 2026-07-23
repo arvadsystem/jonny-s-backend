@@ -3426,6 +3426,7 @@ const hydrateVentaLines = async (client, normalizedItems, perf = null, options =
         kind: 'PRODUCTO',
         cart_key: item.cart_key,
         requiere_cocina: false,
+        entregar_con_pedido: item.entregar_con_pedido,
         id_producto: item.id_producto,
         id_receta: null,
         id_descuento_catalogo_linea: item.id_descuento_catalogo_linea ?? null,
@@ -7085,7 +7086,7 @@ router.post('/ventas/pedidos-menu/:id/confirmar-pago', checkPermission(['VENTAS_
   }
 });
 
-router.put('/ventas/pedidos-menu/:id/estado', checkPermission(['VENTAS_VER']), async (req, res) => {
+router.put('/ventas/pedidos-menu/:id/estado', checkPermission(['VENTAS_CREAR']), async (req, res) => {
   const idPedido = parsePositiveInt(req.params.id);
   if (!idPedido) {
     return res.status(400).json({ error: true, message: 'ID de pedido invalido.' });

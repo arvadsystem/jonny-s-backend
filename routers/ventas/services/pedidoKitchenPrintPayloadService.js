@@ -79,6 +79,16 @@ export const toKitchenComplementos = (item = {}) => {
     .filter((entry) => entry.id_complemento || entry.nombre);
 };
 
+const shouldDeliverProductWithOrder = (configuracionMenu) => {
+  const value = configuracionMenu && typeof configuracionMenu === 'object'
+    ? configuracionMenu.entregar_con_pedido
+    : null;
+  if (typeof value === 'boolean') return value;
+  const normalized = String(value ?? '').trim().toLowerCase();
+  if (['false', '0', 'no'].includes(normalized)) return false;
+  return true;
+};
+
 export const buildPedidoKitchenPrintPayload = async (queryRunner, idPedido, { normalizeStandaloneExtras = true } = {}) => {
   const hasDetallePedidoConfiguracionMenu = await hasColumn(queryRunner, 'detalle_pedido', 'configuracion_menu');
   const hasDetallePedidoExtras = await hasTable(queryRunner, 'detalle_pedido_extras');
@@ -270,7 +280,7 @@ export const buildPedidoKitchenPrintPayload = async (queryRunner, idPedido, { no
   if (result.rowCount === 0) return null;
 
   const row = result.rows[0];
-  const items = (Array.isArray(row.items) ? row.items : []).map((item, index) => {
+  const normalizedItems = (Array.isArray(row.items) ? row.items : []).map((item, index) => {
     const standaloneExtra = normalizeStandaloneExtras
       ? resolveStandaloneExtraLine({
         idProducto: item?.id_producto,
@@ -287,6 +297,8 @@ export const buildPedidoKitchenPrintPayload = async (queryRunner, idPedido, { no
       linea: index + 1,
       id_detalle: Number(item?.id_detalle || 0) || null,
       tipo_item: standaloneExtra ? 'EXTRA' : String(item?.tipo_item || 'ITEM').trim().toUpperCase(),
+      id_producto: Number(item?.id_producto || 0) || null,
+      id_receta: Number(item?.id_receta || 0) || null,
       cantidad: standaloneCantidad ?? (Number(item?.cantidad ?? 0) || 0),
       nombre_item: standaloneExtra
         ? standaloneExtra.nombre_extra_snapshot
@@ -296,11 +308,31 @@ export const buildPedidoKitchenPrintPayload = async (queryRunner, idPedido, { no
       id_extra: standaloneExtra?.id_extra || null,
       nombre_extra_snapshot: standaloneExtra?.nombre_extra_snapshot || null,
       codigo_extra_snapshot: standaloneExtra?.codigo_extra_snapshot || null,
-      extras: toKitchenExtras(item?.extras),
+      precio_unitario: standaloneExtra?.precio_unitario ?? null,
+      subtotal: standaloneExtra?.subtotal ?? null,
+      extras: standaloneExtra ? [] : toKitchenExtras(item?.extras),
       complementos: toKitchenComplementos(item),
       configuracion_menu: item?.configuracion_menu || null
     };
   });
+  const hasPreparableItems = normalizedItems.some((item) =>
+    item.tipo_item === 'RECETA' || item.es_linea_extra_independiente
+  );
+  const items = normalizeStandaloneExtras
+    ? normalizedItems
+      .filter((item) => {
+        if (item.tipo_item === 'PRODUCTO') {
+          return hasPreparableItems && shouldDeliverProductWithOrder(item.configuracion_menu);
+        }
+        return item.tipo_item === 'RECETA' || item.es_linea_extra_independiente;
+      })
+      .map((item) => ({
+        ...item,
+        instruccion_operativa: item.tipo_item === 'PRODUCTO'
+          ? 'ENTREGAR_JUNTO_CON_EL_PEDIDO'
+          : 'PREPARAR'
+      }))
+    : normalizedItems;
   // El contador de productos excluye lineas de extra independiente para no
   // inflar el total (p. ej. 1 producto + 4 extras debe reportar 1, no 5).
   const totalProductos = items.reduce(
