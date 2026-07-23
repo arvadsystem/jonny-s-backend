@@ -431,7 +431,16 @@ export const createSolicitudesCompraService = (overrides = {}) => {
         FROM catalogo
         WHERE ($2::text IS NULL OR catalogo.nombre ILIKE '%' || $2 || '%' OR COALESCE(catalogo.descripcion, '') ILIKE '%' || $2 || '%')
           AND ($3::boolean = false OR catalogo.estado_stock IN ('SIN_STOCK', 'STOCK_BAJO'))
-        ORDER BY LOWER(catalogo.nombre), catalogo.tipo_item, catalogo.id_item
+        ORDER BY
+          CASE catalogo.estado_stock
+            WHEN 'SIN_STOCK' THEN 0
+            WHEN 'STOCK_BAJO' THEN 1
+            WHEN 'DISPONIBLE' THEN 2
+            ELSE 3
+          END,
+          LOWER(catalogo.nombre),
+          catalogo.tipo_item,
+          catalogo.id_item
         LIMIT $4 OFFSET $5
       `,
       [warehouse.id_almacen, search, lowStock, pagination.limit, pagination.offset]
