@@ -989,7 +989,10 @@ router.get('/cocina/pedidos', checkPermission(COCINA_VIEW_PERMISSIONS), async (r
             dp.id_receta,
             standalone_extra.id_extra AS id_extra_independiente,
             CASE
-              WHEN standalone_extra.id_extra IS NOT NULL THEN standalone_extra.cantidad
+              WHEN dp.id_producto IS NULL
+               AND dp.id_receta IS NULL
+               AND standalone_extra.id_extra IS NOT NULL
+                THEN standalone_extra.cantidad
               ELSE dp.cantidad
             END AS cantidad,
             dp.observacion,
@@ -1049,7 +1052,9 @@ router.get('/cocina/pedidos', checkPermission(COCINA_VIEW_PERMISSIONS), async (r
               dpe.precio_unitario,
               dpe.subtotal
             FROM public.detalle_pedido_extras dpe
-            WHERE dpe.id_detalle_pedido = dp.id_detalle_pedido
+            WHERE dp.id_producto IS NULL
+              AND dp.id_receta IS NULL
+              AND dpe.id_detalle_pedido = dp.id_detalle_pedido
               AND COALESCE(dpe.estado, true) = true
               AND ${buildValidStandaloneKitchenExtraRowPredicate('dpe')}
             ORDER BY dpe.id_detalle_pedido_extra
@@ -1154,20 +1159,27 @@ router.get('/cocina/pedidos', checkPermission(COCINA_VIEW_PERMISSIONS), async (r
 
         if (row.id_detalle_pedido) {
           const cantidad = Number(row.cantidad);
+          const hasProduct = row.id_producto !== null && row.id_producto !== undefined;
+          const hasRecipe = row.id_receta !== null && row.id_receta !== undefined;
+          const isStandaloneExtra = !hasProduct
+            && !hasRecipe
+            && row.id_extra_independiente !== null
+            && row.id_extra_independiente !== undefined;
           pedido.items.push({
             id_detalle: Number(row.id_detalle_pedido),
-            tipo_item:
-              row.id_extra_independiente !== null
-                ? 'EXTRA'
-                : row.id_producto !== null
-                ? 'PRODUCTO'
-                : row.id_receta !== null
-                    ? 'RECETA'
+            tipo_item: hasProduct
+              ? 'PRODUCTO'
+              : hasRecipe
+                ? 'RECETA'
+                : isStandaloneExtra
+                  ? 'EXTRA'
                   : 'ITEM',
             id_producto: Number(row.id_producto ?? 0) || null,
             id_receta: Number(row.id_receta ?? 0) || null,
-            id_extra: Number(row.id_extra_independiente ?? 0) || null,
-            es_linea_extra_independiente: row.id_extra_independiente !== null,
+            id_extra: isStandaloneExtra
+              ? Number(row.id_extra_independiente ?? 0) || null
+              : null,
+            es_linea_extra_independiente: isStandaloneExtra,
             instruccion_operativa: row.kds_instruccion_operativa,
             nombre_item: row.nombre_item,
             cantidad,

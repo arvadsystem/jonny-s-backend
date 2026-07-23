@@ -208,16 +208,22 @@ export const buildKitchenOrderEligibilityPredicate = (
 )`;
 
 const toKdsClassifierItem = (row) => {
-  const isStandaloneExtra = row?.id_extra_independiente !== null
+  const hasProduct = row?.id_producto !== null
+    && row?.id_producto !== undefined;
+  const hasRecipe = row?.id_receta !== null
+    && row?.id_receta !== undefined;
+  const isStandaloneExtra = !hasProduct
+    && !hasRecipe
+    && row?.id_extra_independiente !== null
     && row?.id_extra_independiente !== undefined;
   return {
     id_detalle: row?.id_detalle_pedido,
-    tipo_item: isStandaloneExtra
-      ? 'EXTRA'
-      : row?.id_producto !== null && row?.id_producto !== undefined
-        ? 'PRODUCTO'
-        : row?.id_receta !== null && row?.id_receta !== undefined
-          ? 'RECETA'
+    tipo_item: hasProduct
+      ? 'PRODUCTO'
+      : hasRecipe
+        ? 'RECETA'
+        : isStandaloneExtra
+          ? 'EXTRA'
           : 'ITEM',
     id_producto: row?.id_producto,
     id_receta: row?.id_receta,

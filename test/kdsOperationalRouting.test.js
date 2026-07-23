@@ -22,22 +22,27 @@ const recipeRow = ({
   idDetalle = 1,
   idReceta = 20,
   idProducto = null,
+  idExtra = null,
   cantidad = 1,
-  nombre = 'Receta valida'
+  nombre = 'Receta valida',
+  configuracionMenu = null,
+  estadoPago
 } = {}) => ({
   id_pedido: idPedido,
   id_detalle_pedido: idDetalle,
   id_producto: idProducto,
   id_receta: idReceta,
-  id_extra_independiente: null,
+  id_extra_independiente: idExtra,
   cantidad,
   nombre_item: nombre,
-  configuracion_menu: null
+  configuracion_menu: configuracionMenu,
+  estado_pago: estadoPago
 });
 
 const productRow = ({
   idPedido = 1,
   idDetalle = 2,
+  idExtra = null,
   cantidad = 1,
   nombre = 'Producto valido',
   preference,
@@ -47,7 +52,7 @@ const productRow = ({
   id_detalle_pedido: idDetalle,
   id_producto: 10,
   id_receta: null,
-  id_extra_independiente: null,
+  id_extra_independiente: idExtra,
   cantidad,
   nombre_item: nombre,
   configuracion_menu: includePreference
@@ -278,12 +283,134 @@ test('consulta KDS usa helpers centrales, sin fallback de cantidad o nombre', ()
   const source = fs.readFileSync(new URL('../routers/cocina.js', import.meta.url), 'utf8');
   assert.match(source, /buildKitchenOrderEligibilityPredicate\('p'/);
   assert.match(source, /buildValidStandaloneKitchenExtraRowPredicate\('dpe'\)/);
+  assert.match(
+    source,
+    /FROM public\.detalle_pedido_extras dpe\s+WHERE dp\.id_producto IS NULL\s+AND dp\.id_receta IS NULL\s+AND dpe\.id_detalle_pedido = dp\.id_detalle_pedido/
+  );
+  assert.match(
+    source,
+    /CASE\s+WHEN dp\.id_producto IS NULL\s+AND dp\.id_receta IS NULL\s+AND standalone_extra\.id_extra IS NOT NULL\s+THEN standalone_extra\.cantidad\s+ELSE dp\.cantidad\s+END AS cantidad/
+  );
+  assert.match(
+    source,
+    /const isStandaloneExtra = !hasProduct\s+&& !hasRecipe\s+&& row\.id_extra_independiente !== null\s+&& row\.id_extra_independiente !== undefined;/
+  );
   assert.match(source, /routeKdsOperationalRows\(result\.rows\)/);
   assert.match(source, /for \(const row of operationalRows\)/);
   assert.match(source, /const cantidad = Number\(row\.cantidad\)/);
   assert.doesNotMatch(source, /parsePositiveInt\(row\.cantidad\) \|\| 0/);
   assert.doesNotMatch(source, /nombre_item: row\.nombre_item \|\| 'Item de cocina'/);
   assert.doesNotMatch(source, /nombre_extra_snapshot, 'Item de cocina'\) AS nombre_item/);
+});
+
+test('receta con tres extras asociados conserva una sola fila PREPARAR', () => {
+  const routed = routeKdsOperationalRows([
+    recipeRow({
+      idExtra: 31,
+      configuracionMenu: {
+        extras: [{ id_extra: 31 }, { id_extra: 32 }, { id_extra: 33 }]
+      }
+    })
+  ]);
+
+  assert.equal(routed.length, 1);
+  assert.equal(routed[0].id_receta, 20);
+  assert.equal(routed[0].kds_instruccion_operativa, 'PREPARAR');
+});
+
+test('equivalente PED-00236 conserva cuatro recetas y tres extras independientes', () => {
+  const rows = [
+    ...Array.from({ length: 4 }, (_, index) => recipeRow({
+      idPedido: 236,
+      idDetalle: index + 1,
+      idReceta: 20 + index,
+      idExtra: 40 + index
+    })),
+    ...Array.from({ length: 3 }, (_, index) => standaloneExtraRow({
+      idPedido: 236,
+      idDetalle: index + 5,
+      idExtra: 50 + index
+    }))
+  ];
+  const routed = routeKdsOperationalRows(rows);
+
+  assert.equal(routed.length, 7);
+  assert.equal(routed.filter((row) => row.id_receta !== null).length, 4);
+  assert.equal(
+    routed.filter((row) => row.id_producto === null && row.id_receta === null).length,
+    3
+  );
+  assert.equal(routed.every((row) => row.kds_instruccion_operativa === 'PREPARAR'), true);
+});
+
+test('equivalente PED-00237 conserva tres recetas con pago pendiente', () => {
+  const routed = routeKdsOperationalRows(
+    Array.from({ length: 3 }, (_, index) => recipeRow({
+      idPedido: 237,
+      idDetalle: index + 1,
+      idReceta: 30 + index,
+      idExtra: 60 + index,
+      estadoPago: 'PENDIENTE'
+    }))
+  );
+
+  assert.equal(routed.length, 3);
+  assert.equal(routed.every((row) => row.kds_instruccion_operativa === 'PREPARAR'), true);
+});
+
+test('equivalente PED-00238 conserva cantidad de receta y tres extras independientes', () => {
+  const routed = routeKdsOperationalRows([
+    recipeRow({
+      idPedido: 238,
+      idDetalle: 1,
+      idReceta: 40,
+      idExtra: 70,
+      cantidad: 2
+    }),
+    ...Array.from({ length: 3 }, (_, index) => standaloneExtraRow({
+      idPedido: 238,
+      idDetalle: index + 2,
+      idExtra: 71 + index
+    }))
+  ]);
+
+  assert.equal(routed.length, 4);
+  assert.equal(routed.filter((row) => row.id_receta !== null).length, 1);
+  assert.equal(
+    routed.filter((row) => row.id_producto === null && row.id_receta === null).length,
+    3
+  );
+  assert.equal(routed.find((row) => row.id_receta === 40)?.cantidad, 2);
+});
+
+test('producto con extra asociado conserva clasificacion de producto', () => {
+  const routed = routeKdsOperationalRows([
+    recipeRow(),
+    productRow({ idExtra: 80, preference: true })
+  ]);
+
+  assert.equal(routed.length, 2);
+  assert.equal(routed[1].id_producto, 10);
+  assert.equal(routed[1].kds_instruccion_operativa, 'ENTREGAR_JUNTO_CON_EL_PEDIDO');
+});
+
+test('receta con id_extra_independiente forzado prioriza la receta', () => {
+  const routed = routeKdsOperationalRows([
+    recipeRow({ idExtra: 90 })
+  ]);
+
+  assert.equal(routed.length, 1);
+  assert.equal(routed[0].id_receta, 20);
+  assert.equal(routed[0].kds_instruccion_operativa, 'PREPARAR');
+});
+
+test('extra independiente invalido sigue bloqueando el pedido completo', () => {
+  const routed = routeKdsOperationalRows([
+    recipeRow(),
+    standaloneExtraRow({ idDetalle: 2, idExtra: -1 })
+  ]);
+
+  assert.deepEqual(routed, []);
 });
 
 test('casos KDS validos, conjuntos, inmediatos, invalidos y solo-producto', () => {
