@@ -34,6 +34,10 @@ import {
   buildVentaTicketPdfBuffer,
   buildVentaTicketPdfFilename
 } from '../services/ventaTicketPdfService.js';
+import {
+  hasKitchenPreparations,
+  routeKitchenPrintItems
+} from '../services/kitchenPrintRoutingService.js';
 
 const sendVentasInternalError = (
   res,
@@ -297,6 +301,7 @@ export const buildVentaDetailPayloadForScope = async ({
     );
     const pedidoItems = buildKitchenSaleDetailItems(pedidoItemsResult.rows).map((item) =>
       attachDetailExtras(item, detalleFacturaExtrasById.get(Number(item.id_detalle)) || [], { normalizeStandaloneExtras }));
+    const operationalKitchenItems = routeKitchenPrintItems(pedidoItems);
     const cuentaDividida = await fetchCuentaDividida(queryRunner, {
       idFactura: venta.id_factura,
       idPedido: venta.id_pedido
@@ -311,6 +316,7 @@ export const buildVentaDetailPayloadForScope = async ({
         cliente_nombre: pedidoDeliveryDetail.contacto?.nombre_contacto || venta.cliente_nombre || 'Consumidor final',
         numero_venta: resolveVentaNumero(venta),
         metodo_pago: venta.metodo_pago || null,
+        requiere_cocina: hasKitchenPreparations(operationalKitchenItems),
         items: pedidoItems,
         cuenta_dividida: cuentaDividida,
         contacto: pedidoDeliveryDetail.contacto,
@@ -337,6 +343,7 @@ export const buildVentaDetailPayloadForScope = async ({
   );
   const directItems = buildDirectSaleDetailItems(directItemsResult.rows).map((item) =>
     attachDetailExtras(item, detalleFacturaExtrasById.get(Number(item.id_detalle)) || [], { normalizeStandaloneExtras }));
+  const operationalKitchenItems = routeKitchenPrintItems(directItems);
   const cuentaDividida = await fetchCuentaDividida(queryRunner, {
     idFactura: venta.id_factura,
     idPedido: venta.id_pedido
@@ -348,6 +355,7 @@ export const buildVentaDetailPayloadForScope = async ({
       ...venta,
       numero_venta: resolveVentaNumero(venta),
       metodo_pago: venta.metodo_pago || null,
+      requiere_cocina: hasKitchenPreparations(operationalKitchenItems),
       items: directItems,
       cuenta_dividida: cuentaDividida,
       reversiones

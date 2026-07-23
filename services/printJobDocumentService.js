@@ -2,6 +2,9 @@ import crypto from 'node:crypto';
 import pool from '../config/db-connection.js';
 import { buildVentaDetailPayloadForScope } from '../routers/ventas/handlers/ventasReadHandlers.js';
 import { buildPedidoKitchenPrintPayload } from '../routers/ventas/services/pedidoKitchenPrintPayloadService.js';
+import {
+  assertKitchenPrintPayload
+} from '../routers/ventas/services/kitchenPrintRoutingService.js';
 import { buildVentaTicketPdfBuffer } from '../routers/ventas/services/ventaTicketPdfService.js';
 import { buildComandaCocinaHtml } from './comandaCocinaHtmlService.js';
 
@@ -25,6 +28,20 @@ export const HISTORICAL_V2_DOCUMENT_CANDIDATES = Object.freeze([
     name: 'current-previous-loader',
     renderVariant: 'current',
     normalizeStandaloneExtras: true,
+    useHistoricalFacturacionSnapshot: false
+  }),
+  Object.freeze({
+    name: 'pre-routing-historical-snapshot',
+    renderVariant: 'pre-routing',
+    normalizeStandaloneExtras: true,
+    applyOperationalRouting: false,
+    useHistoricalFacturacionSnapshot: true
+  }),
+  Object.freeze({
+    name: 'pre-routing-previous-loader',
+    renderVariant: 'pre-routing',
+    normalizeStandaloneExtras: true,
+    applyOperationalRouting: false,
     useHistoricalFacturacionSnapshot: false
   }),
   Object.freeze({
@@ -217,16 +234,28 @@ const renderCanonicalDocument = async ({
   if (!contract) throw printDocumentError('PRINT_DOCUMENT_TYPE_INVALID', 'Tipo de documento canonico invalido.', 400);
 
   const legacy = renderVariant === 'legacy';
+  const applyOperationalRouting = renderVariant === 'current';
+  const renderSource = tipoDocumento === 'comanda' && applyOperationalRouting
+    ? {
+        ...venta,
+        requiere_cocina: true,
+        items: assertKitchenPrintPayload(venta)
+      }
+    : venta;
   let contentBytes;
   let data;
   if (tipoDocumento === 'factura') {
-    contentBytes = await buildVentaTicketPdfBuffer(venta, { legacy });
+    contentBytes = await buildVentaTicketPdfBuffer(renderSource, { legacy });
     if (!Buffer.isBuffer(contentBytes) || contentBytes.subarray(0, 5).toString('ascii') !== '%PDF-') {
       throw printDocumentError('PRINT_DOCUMENT_PDF_INVALID', 'El PDF canonico no es valido.');
     }
     data = contentBytes.toString('base64');
   } else {
-    data = buildComandaCocinaHtml(venta, { widthMm, legacy });
+    data = buildComandaCocinaHtml(renderSource, {
+      widthMm,
+      legacy,
+      operationalSections: applyOperationalRouting
+    });
     contentBytes = Buffer.from(data, 'utf8');
   }
 
@@ -308,7 +337,7 @@ export const renderCanonicalPrintJobDocument = async ({
 
   const variants = Array.isArray(renderVariants) ? renderVariants : [];
   for (const renderVariant of variants) {
-    if (!['current', 'legacy'].includes(renderVariant)) continue;
+    if (!['current', 'pre-routing', 'legacy'].includes(renderVariant)) continue;
     const rendered = await renderCanonicalDocument({
       tipoDocumento: payload.tipo_documento,
       venta,
@@ -407,10 +436,14 @@ export const getCanonicalPrintDocumentForAgent = async ({
   if (persistedDocument) return { job, document: persistedDocument };
 
   const sourceCache = new Map();
-  const loadSource = async ({ normalizeStandaloneExtras, useHistoricalFacturacionSnapshot }) => {
+  const loadSource = async ({
+    normalizeStandaloneExtras,
+    applyOperationalRouting = true,
+    useHistoricalFacturacionSnapshot
+  }) => {
     const cacheKey = validation.idFactura
       ? `factura:${normalizeStandaloneExtras}:${useHistoricalFacturacionSnapshot}`
-      : `pedido:${normalizeStandaloneExtras}`;
+      : `pedido:${normalizeStandaloneExtras}:${applyOperationalRouting}`;
     if (sourceCache.has(cacheKey)) return { cacheKey, venta: await sourceCache.get(cacheKey) };
 
     const sourcePromise = (async () => {
@@ -440,9 +473,13 @@ export const getCanonicalPrintDocumentForAgent = async ({
             idPedido: validation.idPedido,
             idSucursal: Number(agent.id_sucursal),
             normalizeStandaloneExtras,
+            applyOperationalRouting,
             queryRunner: db
           })
-          : await buildPedidoKitchenPrintPayload(db, validation.idPedido, { normalizeStandaloneExtras });
+          : await buildPedidoKitchenPrintPayload(db, validation.idPedido, {
+            normalizeStandaloneExtras,
+            applyOperationalRouting
+          });
       }
       const venta = detailResult?.status === 200 ? detailResult.body : detailResult;
       if (!venta

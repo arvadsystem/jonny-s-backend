@@ -23,6 +23,10 @@ import {
   toKitchenComplementos,
   toKitchenExtras
 } from '../services/pedidoKitchenPrintPayloadService.js';
+import {
+  hasKitchenPreparations,
+  routeKitchenPrintItems
+} from '../services/kitchenPrintRoutingService.js';
 
 const sendVentasInternalError = (
   res,
@@ -158,7 +162,7 @@ export const buildVentaKitchenPrintPayload = (venta = {}, printerConfig = null) 
   const cocinaConfig = (Array.isArray(printerConfig?.impresoras) ? printerConfig.impresoras : [])
     .find((item) => String(item?.tipo_impresora || '').trim().toUpperCase() === 'COCINA');
 
-  const items = (Array.isArray(venta?.items) ? venta.items : []).map((item, index) => {
+  const normalizedItems = (Array.isArray(venta?.items) ? venta.items : []).map((item, index) => {
     const isStandaloneExtra = Boolean(
       item?.es_linea_extra_independiente || item?.origen_snapshot?.es_linea_extra_independiente
     );
@@ -167,14 +171,19 @@ export const buildVentaKitchenPrintPayload = (venta = {}, printerConfig = null) 
       linea: index + 1,
       id_detalle: Number(item?.id_detalle || 0) || null,
       tipo_item: String(item?.tipo_item || 'ITEM').trim().toUpperCase(),
+      id_producto: Number(item?.id_producto || 0) || null,
+      id_receta: Number(item?.id_receta || 0) || null,
+      id_extra: Number(item?.id_extra || item?.origen_snapshot?.id_extra || 0) || null,
       cantidad: Number(item?.cantidad ?? 0) || 0,
       nombre_item: String(item?.nombre_item || item?.nombre_producto || 'Item de cocina').trim(),
       observacion: String(item?.observacion || '').trim() || null,
       es_linea_extra_independiente: isStandaloneExtra,
       extras: isStandaloneExtra ? [] : toKitchenExtras(item?.extras),
-      complementos: toKitchenComplementos(item)
+      complementos: toKitchenComplementos(item),
+      configuracion_menu: item?.configuracion_menu || null
     };
   });
+  const items = routeKitchenPrintItems(normalizedItems);
 
   const totalProductos = items.reduce(
     (sum, item) => (
@@ -204,6 +213,7 @@ export const buildVentaKitchenPrintPayload = (venta = {}, printerConfig = null) 
     contacto: venta?.contacto || null,
     delivery: venta?.delivery || null,
     total_productos: totalProductos,
+    requiere_cocina: hasKitchenPreparations(items),
     items,
     print_config: {
       printMode: cocinaConfig?.modo_impresion || 'BROWSER',

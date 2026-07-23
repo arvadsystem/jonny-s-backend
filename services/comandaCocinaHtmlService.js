@@ -129,6 +129,15 @@ const normalizeComandaItems = (comanda) => normalizeDetailList(comanda?.items, (
     }));
   const complementos = resolveItemComplementos(item);
   const observacion = String(item?.observacion || item?.nota_cocina || item?.nota || '').trim();
+  const tipoItem = String(item?.tipo_item || '').trim().toUpperCase();
+  const explicitInstruction = String(item?.instruccion_operativa || '').trim().toUpperCase();
+  const instruccionOperativa = explicitInstruction === 'ENTREGAR_JUNTO_CON_EL_PEDIDO'
+    ? explicitInstruction
+    : explicitInstruction === 'PREPARAR'
+      ? explicitInstruction
+      : (tipoItem === 'PRODUCTO' && !isStandaloneExtra
+          ? 'ENTREGAR_JUNTO_CON_EL_PEDIDO'
+          : 'PREPARAR');
 
   return {
     key: `${item?.id_detalle || index}-${index}`,
@@ -136,7 +145,8 @@ const normalizeComandaItems = (comanda) => normalizeDetailList(comanda?.items, (
     nombreItem,
     extras,
     complementos,
-    observacion
+    observacion,
+    instruccionOperativa
   };
 });
 
@@ -165,6 +175,7 @@ export const buildComandaCocinaHtml = (comanda, options = {}) => {
 
   const ticketWidthMm = resolveTicketWidthMm(options?.widthMm);
   const legacy = Boolean(options?.legacy);
+  const operationalSections = !legacy && options?.operationalSections !== false;
   const printMetrics = resolveFacturaLikeMetrics(ticketWidthMm);
   const contentWidthMm = printMetrics.contentWidthMm;
   const marginLeftMm = printMetrics.marginLeftMm;
@@ -182,6 +193,8 @@ export const buildComandaCocinaHtml = (comanda, options = {}) => {
   const nestedPaddingMm = isNarrowTicket ? 7 : 8;
   const metaLabelWidthMm = isNarrowTicket ? 16 : 18;
   const items = validation.items;
+  const prepararItems = items.filter((item) => item.instruccionOperativa === 'PREPARAR');
+  const entregaConjuntaItems = items.filter((item) => item.instruccionOperativa === 'ENTREGAR_JUNTO_CON_EL_PEDIDO');
   const fecha = formatDateTime(comanda?.fecha_hora_pedido || comanda?.fecha_hora_facturacion, { legacy });
   const numeroPedido = toSafeText(comanda?.numero_pedido || comanda?.numero_venta || comanda?.codigo_venta);
   const sucursal = toSafeText(comanda?.nombre_sucursal, 'No registrada');
@@ -319,7 +332,18 @@ ${legacy ? '' : `      .comanda-cocina-print__customer-name {
         display: grid;
         gap: 5px;
       }
-      .comanda-cocina-print__item {
+${operationalSections ? `      .comanda-cocina-print__section + .comanda-cocina-print__section {
+        margin-top: 7px;
+      }
+      .comanda-cocina-print__section-title {
+        margin: 0 0 4px;
+        padding-bottom: 2px;
+        border-bottom: 1px solid #111;
+        font-size: ${isNarrowTicket ? 11 : 12}px;
+        font-weight: 900;
+        letter-spacing: 0.04em;
+      }
+` : ''}      .comanda-cocina-print__item {
         border-bottom: 1px dashed #ccc;
         padding-bottom: 4px;
       }
@@ -429,7 +453,44 @@ ${legacy ? `          <div class="comanda-cocina-print__meta-row">
         <div class="comanda-cocina-print__divider"></div>
 
         <div class="comanda-cocina-print__items">
-          ${items.map((item) => `
+          ${operationalSections ? `
+          ${prepararItems.length > 0 ? `
+          <section class="comanda-cocina-print__section">
+            <h2 class="comanda-cocina-print__section-title">PREPARAR</h2>
+            ${prepararItems.map((item) => `
+            <section class="comanda-cocina-print__item">
+              <div class="comanda-cocina-print__item-head">
+                <span class="comanda-cocina-print__qty">${escapeHtml(item.cantidad)}x</span>
+                <span class="comanda-cocina-print__name">${escapeHtml(item.nombreItem)}</span>
+              </div>
+              ${renderTags('Extra', item.extras, (extra) => `${escapeHtml(extra.nombre)} x${escapeHtml(extra.cantidad)}`)}
+              ${renderTagSummary(item.complementos.length === 1 ? 'Salsa' : 'Salsas', item.complementos, (complemento) => complemento.nombre)}
+              ${item.observacion ? `
+                <div class="comanda-cocina-print__notes">
+                  <div class="comanda-cocina-print__note">
+                    <span class="comanda-cocina-print__note-title">Nota:</span>
+                    <span>${escapeHtml(item.observacion)}</span>
+                  </div>
+                </div>
+              ` : ''}
+            </section>
+            `).join('')}
+          </section>
+          ` : ''}
+          ${entregaConjuntaItems.length > 0 ? `
+          <section class="comanda-cocina-print__section">
+            <h2 class="comanda-cocina-print__section-title">ENTREGAR JUNTO CON EL PEDIDO</h2>
+            ${entregaConjuntaItems.map((item) => `
+            <section class="comanda-cocina-print__item">
+              <div class="comanda-cocina-print__item-head">
+                <span class="comanda-cocina-print__qty">${escapeHtml(item.cantidad)}x</span>
+                <span class="comanda-cocina-print__name">${escapeHtml(item.nombreItem)}</span>
+              </div>
+            </section>
+            `).join('')}
+          </section>
+          ` : ''}
+          ` : items.map((item) => `
             <section class="comanda-cocina-print__item">
               <div class="comanda-cocina-print__item-head">
                 <span class="comanda-cocina-print__qty">${escapeHtml(item.cantidad)}x</span>

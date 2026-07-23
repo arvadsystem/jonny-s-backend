@@ -14,6 +14,11 @@ import {
   loadLegacySalsaConsumptionByStockKey
 } from '../services/salsasPedidoSnapshotService.js';
 import { readPedidoOperationalRouting } from './ventas/services/pedidoOperationalRoutingService.js';
+import {
+  buildInvalidKitchenLinePredicate,
+  buildKitchenPreparationPredicate,
+  buildKitchenProductPredicate
+} from './ventas/services/kitchenPrintRoutingService.js';
 
 const router = express.Router();
 
@@ -63,35 +68,6 @@ const EXTRA_TRANSITIONS = {
 
 const COCINA_VIEW_PERMISSIONS = ['COCINA_VER'];
 
-const buildValidStandaloneExtraPredicate = (detailAlias) => `(
-  SELECT COUNT(*) = 1
-     AND COUNT(*) FILTER (
-       WHERE dpe_route.id_extra IS NOT NULL
-         AND NULLIF(TRIM(dpe_route.nombre_extra_snapshot), '') IS NOT NULL
-         AND COALESCE(dpe_route.cantidad, 0) > 0
-     ) = 1
-  FROM public.detalle_pedido_extras dpe_route
-  WHERE dpe_route.id_detalle_pedido = ${detailAlias}.id_detalle_pedido
-    AND COALESCE(dpe_route.estado, true) = true
-)`;
-
-const buildPreparedLinePredicate = (detailAlias) => `(
-  (${detailAlias}.id_producto IS NULL AND ${detailAlias}.id_receta IS NOT NULL)
-  OR (
-    ${detailAlias}.id_producto IS NULL
-    AND ${detailAlias}.id_receta IS NULL
-    AND ${buildValidStandaloneExtraPredicate(detailAlias)}
-  )
-)`;
-
-const buildInvalidOperationalLinePredicate = (detailAlias) => `(
-  (${detailAlias}.id_producto IS NOT NULL AND ${detailAlias}.id_receta IS NOT NULL)
-  OR (
-    ${detailAlias}.id_producto IS NULL
-    AND ${detailAlias}.id_receta IS NULL
-    AND NOT ${buildValidStandaloneExtraPredicate(detailAlias)}
-  )
-)`;
 const COCINA_TRANSITION_PERMISSION_BY_STATE = Object.freeze({
   EN_COCINA: 'COCINA_PEDIDO_INICIAR',
   EN_PREPARACION: 'COCINA_PEDIDO_MARCAR_LISTO',
@@ -790,7 +766,7 @@ router.get('/cocina/pedidos', checkPermission(COCINA_VIEW_PERMISSIONS), async (r
           FROM public.detalle_pedido dp_route
           WHERE dp_route.id_pedido = p.id_pedido
             AND COALESCE(dp_route.estado, true) = true
-            AND ${buildPreparedLinePredicate('dp_route')}
+            AND ${buildKitchenPreparationPredicate('dp_route')}
         )
       `);
       filters.push(`
@@ -799,7 +775,7 @@ router.get('/cocina/pedidos', checkPermission(COCINA_VIEW_PERMISSIONS), async (r
           FROM public.detalle_pedido dp_invalid
           WHERE dp_invalid.id_pedido = p.id_pedido
             AND COALESCE(dp_invalid.estado, true) = true
-            AND ${buildInvalidOperationalLinePredicate('dp_invalid')}
+            AND ${buildInvalidKitchenLinePredicate('dp_invalid')}
         )
       `);
 
@@ -925,15 +901,10 @@ router.get('/cocina/pedidos', checkPermission(COCINA_VIEW_PERMISSIONS), async (r
             ON dp.id_pedido = p.id_pedido
            AND COALESCE(dp.estado, true) = true
            AND (
-             (
-               dp.id_producto IS NOT NULL
-               AND dp.id_receta IS NULL
-               ${hasDetallePedidoConfiguracionMenu
-                 ? `AND LOWER(COALESCE(NULLIF(TRIM(dp.configuracion_menu->>'entregar_con_pedido'), ''), 'true'))
-                      NOT IN ('false', '0', 'no')`
-                 : ''}
-             )
-             OR ${buildPreparedLinePredicate('dp')}
+             ${buildKitchenProductPredicate('dp', {
+               hasConfiguration: hasDetallePedidoConfiguracionMenu
+             })}
+             OR ${buildKitchenPreparationPredicate('dp')}
            )
           LEFT JOIN productos prod ON prod.id_producto = dp.id_producto
           LEFT JOIN recetas rec ON rec.id_receta = dp.id_receta

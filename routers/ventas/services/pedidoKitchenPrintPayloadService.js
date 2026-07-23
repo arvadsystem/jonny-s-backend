@@ -1,4 +1,8 @@
 import { resolveStandaloneExtraLine } from '../utils/parseUtils.js';
+import {
+  hasKitchenPreparations,
+  routeKitchenPrintItems
+} from './kitchenPrintRoutingService.js';
 
 const schemaLookupCache = new Map();
 
@@ -79,17 +83,11 @@ export const toKitchenComplementos = (item = {}) => {
     .filter((entry) => entry.id_complemento || entry.nombre);
 };
 
-const shouldDeliverProductWithOrder = (configuracionMenu) => {
-  const value = configuracionMenu && typeof configuracionMenu === 'object'
-    ? configuracionMenu.entregar_con_pedido
-    : null;
-  if (typeof value === 'boolean') return value;
-  const normalized = String(value ?? '').trim().toLowerCase();
-  if (['false', '0', 'no'].includes(normalized)) return false;
-  return true;
-};
-
-export const buildPedidoKitchenPrintPayload = async (queryRunner, idPedido, { normalizeStandaloneExtras = true } = {}) => {
+export const buildPedidoKitchenPrintPayload = async (
+  queryRunner,
+  idPedido,
+  { normalizeStandaloneExtras = true, applyOperationalRouting = true } = {}
+) => {
   const hasDetallePedidoConfiguracionMenu = await hasColumn(queryRunner, 'detalle_pedido', 'configuracion_menu');
   const hasDetallePedidoExtras = await hasTable(queryRunner, 'detalle_pedido_extras');
   const hasPedidosContacto = await hasTable(queryRunner, 'pedidos_contacto');
@@ -315,23 +313,8 @@ export const buildPedidoKitchenPrintPayload = async (queryRunner, idPedido, { no
       configuracion_menu: item?.configuracion_menu || null
     };
   });
-  const hasPreparableItems = normalizedItems.some((item) =>
-    item.tipo_item === 'RECETA' || item.es_linea_extra_independiente
-  );
-  const items = normalizeStandaloneExtras
-    ? normalizedItems
-      .filter((item) => {
-        if (item.tipo_item === 'PRODUCTO') {
-          return hasPreparableItems && shouldDeliverProductWithOrder(item.configuracion_menu);
-        }
-        return item.tipo_item === 'RECETA' || item.es_linea_extra_independiente;
-      })
-      .map((item) => ({
-        ...item,
-        instruccion_operativa: item.tipo_item === 'PRODUCTO'
-          ? 'ENTREGAR_JUNTO_CON_EL_PEDIDO'
-          : 'PREPARAR'
-      }))
+  const items = normalizeStandaloneExtras && applyOperationalRouting
+    ? routeKitchenPrintItems(normalizedItems)
     : normalizedItems;
   // El contador de productos excluye lineas de extra independiente para no
   // inflar el total (p. ej. 1 producto + 4 extras debe reportar 1, no 5).
@@ -392,6 +375,7 @@ export const buildPedidoKitchenPrintPayload = async (queryRunner, idPedido, { no
       monto_pendiente: Number(row.monto_pendiente ?? row.total ?? 0) || 0
     },
     total_productos: totalProductos,
+    requiere_cocina: hasKitchenPreparations(items),
     items
   };
 };

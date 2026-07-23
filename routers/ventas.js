@@ -109,6 +109,7 @@ import {
   classifyPedidoOperationalRouting,
   readPedidoOperationalRouting
 } from './ventas/services/pedidoOperationalRoutingService.js';
+import { canRequestPedidoStateTransition } from './ventas/services/pedidoStatePermissionService.js';
 import {
   hasCuentaDivididaPayload,
   reserveIdempotencyForMode,
@@ -7086,7 +7087,13 @@ router.post('/ventas/pedidos-menu/:id/confirmar-pago', checkPermission(['VENTAS_
   }
 });
 
-router.put('/ventas/pedidos-menu/:id/estado', checkPermission(['VENTAS_CREAR']), async (req, res) => {
+router.put('/ventas/pedidos-menu/:id/estado', checkPermission([
+  'VENTAS_VER',
+  'VENTAS_CREAR',
+  'MENU_PEDIDO_CONFIRMAR',
+  'COCINA_PEDIDO_INICIAR',
+  'COCINA_PEDIDO_ENTREGAR'
+]), async (req, res) => {
   const idPedido = parsePositiveInt(req.params.id);
   if (!idPedido) {
     return res.status(400).json({ error: true, message: 'ID de pedido invalido.' });
@@ -7170,7 +7177,37 @@ router.put('/ventas/pedidos-menu/:id/estado', checkPermission(['VENTAS_CREAR']),
         ...routing
       });
     }
-    if (currentCode && currentCode === targetCode) {
+    const normalizedTargetCode = currentCode === targetCode
+      ? currentCode
+      : resolvePedidoTransitionTargetCode(currentCode, targetCode);
+    if (normalizedTargetCode === 'LISTO_PARA_ENTREGA' && currentCode !== normalizedTargetCode) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({
+        error: true,
+        message: 'El pedido solo puede marcarse como listo desde Cocina.'
+      });
+    }
+    if (!normalizedTargetCode) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({
+        error: true,
+        message: 'La transici�n solicitada no es v�lida para el estado actual del pedido.'
+      });
+    }
+    const canChangeState = await canRequestPedidoStateTransition({
+      req,
+      targetState: normalizedTargetCode,
+      queryRunner: client
+    });
+    if (!canChangeState) {
+      await client.query('ROLLBACK');
+      return res.status(403).json({
+        error: true,
+        code: 'VENTAS_PEDIDO_ESTADO_PERMISO_INSUFICIENTE',
+        message: 'No tienes permisos operativos para cambiar el estado del pedido.'
+      });
+    }
+    if (currentCode === normalizedTargetCode) {
       await client.query('COMMIT');
       return res.status(200).json({
         ok: true,
@@ -7182,23 +7219,6 @@ router.put('/ventas/pedidos-menu/:id/estado', checkPermission(['VENTAS_CREAR']),
         ...routing
       });
     }
-
-    const normalizedTargetCode = resolvePedidoTransitionTargetCode(currentCode, targetCode);
-    if (!normalizedTargetCode) {
-      await client.query('ROLLBACK');
-      return res.status(409).json({
-        error: true,
-        message: 'La transici�n solicitada no es v�lida para el estado actual del pedido.'
-      });
-    }
-    if (normalizedTargetCode === 'LISTO_PARA_ENTREGA') {
-      await client.query('ROLLBACK');
-      return res.status(409).json({
-        error: true,
-        message: 'El pedido solo puede marcarse como listo desde Cocina.'
-      });
-    }
-
     if (
       (currentCode === 'EN_COCINA' || currentCode === 'EN_PREPARACION')
       && (normalizedTargetCode === 'COMPLETADO' || normalizedTargetCode === 'NO_ENTREGADO')

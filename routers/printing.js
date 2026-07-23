@@ -4,6 +4,7 @@ import { checkPermission, requestHasAnyRole } from '../middleware/checkPermissio
 import { resolveRequestUserSucursalScope } from '../utils/sucursalScope.js';
 import { buildVentaDetailPayload } from './ventas/handlers/ventasReadHandlers.js';
 import { buildPedidoKitchenPrintPayload } from './ventas/services/pedidoKitchenPrintPayloadService.js';
+import { assertKitchenPrintPayload } from './ventas/services/kitchenPrintRoutingService.js';
 import { enqueuePrintJob } from '../services/printQueueService.js';
 import { obtenerConfiguracionImpresorasRuntime } from '../services/impresorasConfigSucursalService.js';
 import {
@@ -83,6 +84,7 @@ export const enqueuePedidoComandaPrintJob = async ({
       code: 'PRINT_PEDIDO_SOURCE_INVALID'
     });
   }
+  assertKitchenPrintPayload(pedido);
 
   const idSucursal = await resolveAllowedSucursal(
     req,

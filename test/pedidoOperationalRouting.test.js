@@ -101,7 +101,7 @@ test('9 doble clic se atiende como replay idempotente en la ruta explicita', () 
   const routeStart = source.indexOf("router.put('/ventas/pedidos-menu/:id/estado'");
   const routeEnd = source.indexOf("router.get('/ventas/pedidos-pendientes'", routeStart);
   const route = source.slice(routeStart, routeEnd);
-  assert.match(route, /currentCode && currentCode === targetCode/);
+  assert.match(route, /currentCode === normalizedTargetCode/);
   assert.match(route, /idempotent_replay: true/);
 });
 
@@ -148,8 +148,15 @@ test('13 producto terminado no genera consumo de ingredientes', async () => {
 
 test('14 consulta KDS oculta pedidos solo-producto e incluye recordatorios en mixtos', () => {
   const source = fs.readFileSync(new URL('../routers/cocina.js', import.meta.url), 'utf8');
-  assert.match(source, /EXISTS \([\s\S]*?dp_route\.id_producto IS NULL[\s\S]*?dp_route\.id_receta IS NOT NULL/);
-  assert.match(source, /dp\.id_producto IS NOT NULL AND dp\.id_receta IS NULL/);
+  const routingSource = fs.readFileSync(
+    new URL('../routers/ventas/services/kitchenPrintRoutingService.js', import.meta.url),
+    'utf8'
+  );
+  assert.match(source, /EXISTS \([\s\S]*?buildKitchenPreparationPredicate\('dp_route'\)/);
+  assert.match(source, /buildKitchenProductPredicate\('dp'/);
+  assert.match(routingSource, /buildKitchenPreparationPredicate[\s\S]*?id_receta IS NOT NULL[\s\S]*?buildValidStandaloneKitchenExtraPredicate/);
+  assert.match(routingSource, /buildKitchenProductPredicate[\s\S]*?entregar_con_pedido[\s\S]*?NOT IN \('false', '0', 'no'\)/);
+  assert.match(source, /row\.id_producto !== null[\s\S]*?ENTREGAR_JUNTO_CON_EL_PEDIDO/);
   assert.match(source, /ENTREGAR_JUNTO_CON_EL_PEDIDO/);
 });
 
