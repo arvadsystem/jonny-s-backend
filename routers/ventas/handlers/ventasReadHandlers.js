@@ -35,8 +35,7 @@ import {
   buildVentaTicketPdfFilename
 } from '../services/ventaTicketPdfService.js';
 import {
-  hasKitchenPreparations,
-  routeKitchenPrintItems
+  classifyKitchenPrintItems
 } from '../services/kitchenPrintRoutingService.js';
 
 const sendVentasInternalError = (
@@ -301,7 +300,7 @@ export const buildVentaDetailPayloadForScope = async ({
     );
     const pedidoItems = buildKitchenSaleDetailItems(pedidoItemsResult.rows).map((item) =>
       attachDetailExtras(item, detalleFacturaExtrasById.get(Number(item.id_detalle)) || [], { normalizeStandaloneExtras }));
-    const operationalKitchenItems = routeKitchenPrintItems(pedidoItems);
+    const kitchenRouting = classifyKitchenPrintItems(pedidoItems);
     const cuentaDividida = await fetchCuentaDividida(queryRunner, {
       idFactura: venta.id_factura,
       idPedido: venta.id_pedido
@@ -316,7 +315,9 @@ export const buildVentaDetailPayloadForScope = async ({
         cliente_nombre: pedidoDeliveryDetail.contacto?.nombre_contacto || venta.cliente_nombre || 'Consumidor final',
         numero_venta: resolveVentaNumero(venta),
         metodo_pago: venta.metodo_pago || null,
-        requiere_cocina: hasKitchenPreparations(operationalKitchenItems),
+        requiere_cocina: kitchenRouting.requiere_cocina,
+        requiere_revision: kitchenRouting.requiere_revision,
+        lineas_invalidas: kitchenRouting.lineas_invalidas,
         items: pedidoItems,
         cuenta_dividida: cuentaDividida,
         contacto: pedidoDeliveryDetail.contacto,
@@ -343,7 +344,7 @@ export const buildVentaDetailPayloadForScope = async ({
   );
   const directItems = buildDirectSaleDetailItems(directItemsResult.rows).map((item) =>
     attachDetailExtras(item, detalleFacturaExtrasById.get(Number(item.id_detalle)) || [], { normalizeStandaloneExtras }));
-  const operationalKitchenItems = routeKitchenPrintItems(directItems);
+  const kitchenRouting = classifyKitchenPrintItems(directItems);
   const cuentaDividida = await fetchCuentaDividida(queryRunner, {
     idFactura: venta.id_factura,
     idPedido: venta.id_pedido
@@ -355,7 +356,9 @@ export const buildVentaDetailPayloadForScope = async ({
       ...venta,
       numero_venta: resolveVentaNumero(venta),
       metodo_pago: venta.metodo_pago || null,
-      requiere_cocina: hasKitchenPreparations(operationalKitchenItems),
+      requiere_cocina: kitchenRouting.requiere_cocina,
+      requiere_revision: kitchenRouting.requiere_revision,
+      lineas_invalidas: kitchenRouting.lineas_invalidas,
       items: directItems,
       cuenta_dividida: cuentaDividida,
       reversiones

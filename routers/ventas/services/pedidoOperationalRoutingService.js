@@ -13,6 +13,13 @@ const toPositiveInteger = (value) => {
   return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : null;
 };
 
+const normalizeLineType = (value) => String(value || '')
+  .trim()
+  .toUpperCase()
+  .replace(/[\s-]+/g, '_');
+
+const STANDALONE_EXTRA_TYPES = new Set(['EXTRA', 'EXTRA_INDEPENDIENTE']);
+
 const normalizeCode = (value) => String(value || '')
   .trim()
   .toUpperCase()
@@ -38,15 +45,58 @@ const readDeliveryPreference = (line) => {
   return null;
 };
 
-const buildLineReference = (line, index) => ({
-  id_detalle_pedido: toPositiveInteger(line?.id_detalle_pedido ?? line?.id_detalle) || null,
-  indice: index,
-  id_producto: toPositiveInteger(line?.id_producto),
-  id_receta: toPositiveInteger(line?.id_receta),
-  nombre_item: String(line?.nombre_item || line?.nombre_producto || '').trim() || null,
-  cantidad: Number(line?.cantidad) > 0 ? Number(line.cantidad) : null,
-  entregar_con_pedido: readDeliveryPreference(line)
-});
+const buildLineReference = (line, index) => {
+  const tipoItem = normalizeLineType(line?.tipo_item || line?.kind);
+  const idExtra = toPositiveInteger(line?.id_extra ?? line?.origen_snapshot?.id_extra);
+  return {
+    id_detalle_pedido: toPositiveInteger(line?.id_detalle_pedido ?? line?.id_detalle) || null,
+    indice: index,
+    tipo_item: tipoItem || null,
+    id_producto: toPositiveInteger(line?.id_producto),
+    id_receta: toPositiveInteger(line?.id_receta),
+    id_extra: idExtra,
+    es_linea_extra_independiente: Boolean(
+      line?.es_linea_extra_independiente
+      || line?.origen_snapshot?.es_linea_extra_independiente
+      || STANDALONE_EXTRA_TYPES.has(tipoItem)
+      || idExtra
+    ),
+    nombre_item: String(
+      line?.nombre_item
+      || line?.nombre_producto
+      || line?.nombre_extra_snapshot
+      || line?.origen_snapshot?.nombre_extra_snapshot
+      || ''
+    ).trim() || null,
+    cantidad: Number(line?.cantidad) > 0 ? Number(line.cantidad) : null,
+    entregar_con_pedido: readDeliveryPreference(line)
+  };
+};
+
+const resolveDeclaredStandaloneExtra = (line, reference) => {
+  if (!reference.es_linea_extra_independiente) return null;
+  if (!reference.id_extra || !reference.nombre_item || !reference.cantidad) return null;
+  return {
+    id_extra: reference.id_extra,
+    nombre_extra_snapshot: reference.nombre_item,
+    codigo_extra_snapshot: String(
+      line?.codigo_extra_snapshot || line?.origen_snapshot?.codigo_extra_snapshot || ''
+    ).trim() || null,
+    cantidad: reference.cantidad,
+    precio_unitario: line?.precio_unitario ?? null,
+    subtotal: line?.subtotal ?? null
+  };
+};
+
+const resolveClassificationConflict = (reference) => {
+  const { tipo_item: tipoItem, id_producto: idProducto, id_receta: idReceta } = reference;
+  if (reference.es_linea_extra_independiente && (idProducto || idReceta)) {
+    return 'CLASIFICACION_EXTRA_CON_PRODUCTO_O_RECETA';
+  }
+  if (tipoItem === 'PRODUCTO' && (!idProducto || idReceta)) return 'CLASIFICACION_PRODUCTO_CONTRADICTORIA';
+  if (tipoItem === 'RECETA' && (!idReceta || idProducto)) return 'CLASIFICACION_RECETA_CONTRADICTORIA';
+  return null;
+};
 
 export const classifyPedidoOperationalRouting = (lines, context = {}) => {
   const sourceLines = Array.isArray(lines) ? lines : [];
@@ -59,20 +109,24 @@ export const classifyPedidoOperationalRouting = (lines, context = {}) => {
     const reference = buildLineReference(line, index);
     const hasProducto = Boolean(reference.id_producto);
     const hasReceta = Boolean(reference.id_receta);
+    const classificationConflict = resolveClassificationConflict(reference);
 
     if (hasProducto && hasReceta) {
       lineasInvalidas.push({ ...reference, motivo: 'PRODUCTO_Y_RECETA_SIMULTANEOS' });
+    } else if (classificationConflict) {
+      lineasInvalidas.push({ ...reference, motivo: classificationConflict });
     } else if (hasProducto) {
       productos.push(reference);
     } else if (hasReceta) {
       recetas.push({ ...reference, tipo_item: 'RECETA' });
     } else {
       const extras = Array.isArray(line?.extras) ? line.extras : [];
-      const standaloneExtra = resolveStandaloneExtraLine({
-        idProducto: reference.id_producto,
-        idReceta: reference.id_receta,
-        extras
-      });
+      const standaloneExtra = resolveDeclaredStandaloneExtra(line, reference)
+        || resolveStandaloneExtraLine({
+          idProducto: reference.id_producto,
+          idReceta: reference.id_receta,
+          extras
+        });
       if (standaloneExtra) {
         extrasIndependientes.push({
           ...reference,
@@ -89,7 +143,9 @@ export const classifyPedidoOperationalRouting = (lines, context = {}) => {
       } else {
         lineasInvalidas.push({
           ...reference,
-          motivo: extras.length > 1
+          motivo: reference.es_linea_extra_independiente
+            ? 'EXTRA_INDEPENDIENTE_INVALIDO'
+            : extras.length > 1
             ? 'EXTRAS_INDEPENDIENTES_AMBIGUOS'
             : extras.length === 1
               ? 'EXTRA_INDEPENDIENTE_INVALIDO'

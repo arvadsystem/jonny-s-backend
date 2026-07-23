@@ -1,7 +1,6 @@
 import { resolveStandaloneExtraLine } from '../utils/parseUtils.js';
 import {
-  hasKitchenPreparations,
-  routeKitchenPrintItems
+  classifyKitchenPrintItems
 } from './kitchenPrintRoutingService.js';
 
 const schemaLookupCache = new Map();
@@ -313,8 +312,9 @@ export const buildPedidoKitchenPrintPayload = async (
       configuracion_menu: item?.configuracion_menu || null
     };
   });
-  const items = normalizeStandaloneExtras && applyOperationalRouting
-    ? routeKitchenPrintItems(normalizedItems)
+  const routing = classifyKitchenPrintItems(normalizedItems);
+  const items = normalizeStandaloneExtras && applyOperationalRouting && !routing.requiere_revision
+    ? routing.items_operativos
     : normalizedItems;
   // El contador de productos excluye lineas de extra independiente para no
   // inflar el total (p. ej. 1 producto + 4 extras debe reportar 1, no 5).
@@ -375,7 +375,9 @@ export const buildPedidoKitchenPrintPayload = async (
       monto_pendiente: Number(row.monto_pendiente ?? row.total ?? 0) || 0
     },
     total_productos: totalProductos,
-    requiere_cocina: hasKitchenPreparations(items),
+    requiere_cocina: routing.requiere_cocina,
+    requiere_revision: routing.requiere_revision,
+    lineas_invalidas: routing.lineas_invalidas,
     items
   };
 };

@@ -93,6 +93,10 @@ const parsePositiveId = (value) => {
 const resolveWidth = (value) => Number(value) === 58 ? 58 : 80;
 const sha256 = (value) => crypto.createHash('sha256').update(value).digest('hex');
 const printDocumentError = (code, message, status = 409) => Object.assign(new Error(message), { code, status });
+const isCurrentKitchenRoutingRejection = (error) => [
+  'PRINT_PEDIDO_NO_REQUIERE_COCINA',
+  'PRINT_PEDIDO_REQUIERE_REVISION'
+].includes(error?.code);
 
 const getDocumentContract = (tipoDocumento) => {
   if (tipoDocumento === 'factura') {
@@ -335,15 +339,22 @@ export const renderCanonicalPrintJobDocument = async ({
     throw printDocumentError('PRINT_DOCUMENT_SOURCE_MISMATCH', 'La fuente del documento no coincide con el trabajo.', 409);
   }
 
-  const variants = Array.isArray(renderVariants) ? renderVariants : [];
-  for (const renderVariant of variants) {
-    if (!['current', 'pre-routing', 'legacy'].includes(renderVariant)) continue;
-    const rendered = await renderCanonicalDocument({
-      tipoDocumento: payload.tipo_documento,
-      venta,
-      widthMm: validation.widthMm,
-      renderVariant
-    });
+  const variants = (Array.isArray(renderVariants) ? renderVariants : [])
+    .filter((renderVariant) => ['current', 'pre-routing', 'legacy'].includes(renderVariant));
+  for (let index = 0; index < variants.length; index += 1) {
+    const renderVariant = variants[index];
+    let rendered;
+    try {
+      rendered = await renderCanonicalDocument({
+        tipoDocumento: payload.tipo_documento,
+        venta,
+        widthMm: validation.widthMm,
+        renderVariant
+      });
+    } catch (error) {
+      if (isCurrentKitchenRoutingRejection(error) && index < variants.length - 1) continue;
+      throw error;
+    }
     if (rendered.descriptor.content_sha256 === payload.documento_canonico.content_sha256
       && rendered.descriptor.content_bytes === payload.documento_canonico.content_bytes) {
       return rendered.dataItem;
@@ -511,8 +522,14 @@ export const getCanonicalPrintDocumentForAgent = async ({
         })
       };
     } catch (error) {
-      if (error?.code !== 'PRINT_DOCUMENT_CHANGED') throw error;
-      mismatchError = error;
+      if (error?.code !== 'PRINT_DOCUMENT_CHANGED' && !isCurrentKitchenRoutingRejection(error)) throw error;
+      mismatchError = error?.code === 'PRINT_DOCUMENT_CHANGED'
+        ? error
+        : printDocumentError(
+          'PRINT_DOCUMENT_CHANGED',
+          'El documento canonico cambio desde que se creo el trabajo.',
+          409
+        );
     }
   }
   throw mismatchError || printDocumentError(

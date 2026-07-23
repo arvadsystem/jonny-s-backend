@@ -1,4 +1,4 @@
-const normalizeItemType = (item) => String(item?.tipo_item || '').trim().toUpperCase();
+import { classifyPedidoOperationalRouting } from './pedidoOperationalRoutingService.js';
 
 export const buildValidStandaloneKitchenExtraPredicate = (detailAlias) => `(
   SELECT COUNT(*) = 1
@@ -39,89 +39,104 @@ export const buildKitchenProductPredicate = (detailAlias, { hasConfiguration = t
     : ''}
 )`;
 
-const readMenuConfig = (value) => {
-  if (value && typeof value === 'object' && !Array.isArray(value)) return value;
-  if (typeof value !== 'string' || !value.trim()) return {};
-  try {
-    const parsed = JSON.parse(value);
-    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
-  } catch {
-    return {};
+const kitchenRoutingError = (message, code, lineasInvalidas = []) => Object.assign(
+  new Error(message),
+  {
+    status: 409,
+    code,
+    requiere_revision: code === 'PRINT_PEDIDO_REQUIERE_REVISION',
+    lineas_invalidas: lineasInvalidas
   }
-};
-
-export const shouldDeliverProductWithOrder = (item) => {
-  const value = readMenuConfig(item?.configuracion_menu).entregar_con_pedido;
-  if (typeof value === 'boolean') return value;
-  const normalized = String(value ?? '').trim().toLowerCase();
-  if (['false', '0', 'no'].includes(normalized)) return false;
-  return true;
-};
-
-export const isStandaloneKitchenExtra = (item) => {
-  const type = normalizeItemType(item);
-  const declaredStandalone = Boolean(
-    item?.es_linea_extra_independiente
-    || item?.origen_snapshot?.es_linea_extra_independiente
-    || type === 'EXTRA'
-    || type === 'EXTRA_INDEPENDIENTE'
-  );
-  if (!declaredStandalone) return false;
-  const idExtra = Number(item?.id_extra || item?.origen_snapshot?.id_extra || 0);
-  const name = String(item?.nombre_item || item?.nombre_producto || item?.nombre_extra_snapshot || '').trim();
-  const quantity = Number(item?.cantidad || 0);
-  return Number.isSafeInteger(idExtra) && idExtra > 0 && name.length > 0 && Number.isFinite(quantity) && quantity > 0;
-};
-
-export const isKitchenRecipe = (item) => {
-  const type = normalizeItemType(item);
-  const hasProduct = Number(item?.id_producto || 0) > 0;
-  const hasRecipe = Number(item?.id_receta || 0) > 0;
-  if (hasProduct && hasRecipe) return false;
-  return !hasProduct && (hasRecipe || type === 'RECETA');
-};
-
-export const isKitchenProduct = (item) => {
-  const type = normalizeItemType(item);
-  const hasProduct = Number(item?.id_producto || 0) > 0;
-  const hasRecipe = Number(item?.id_receta || 0) > 0;
-  if (hasProduct && hasRecipe) return false;
-  return !hasRecipe && !isStandaloneKitchenExtra(item) && (hasProduct || type === 'PRODUCTO');
-};
-
-export const isKitchenPreparation = (item) => (
-  isKitchenRecipe(item) || isStandaloneKitchenExtra(item)
 );
 
-export const routeKitchenPrintItems = (items) => {
+export const classifyKitchenPrintItems = (items) => {
   const source = Array.isArray(items) ? items : [];
-  const hasPreparations = source.some(isKitchenPreparation);
-  if (!hasPreparations) return [];
+  const routing = classifyPedidoOperationalRouting(source);
+  const prepararByIndex = new Map(
+    routing.items_preparables.map((item) => [item.indice, item])
+  );
+  const entregarByIndex = new Set(
+    routing.items_entrega_conjunta.map((item) => item.indice)
+  );
+  const operationalItems = routing.requiere_revision
+    ? []
+    : source.flatMap((item, index) => {
+      const preparar = prepararByIndex.get(index);
+      if (preparar) {
+        const isStandaloneExtra = preparar.tipo_item === 'EXTRA_INDEPENDIENTE';
+        return [{
+          ...item,
+          ...(isStandaloneExtra ? {
+            tipo_item: 'EXTRA',
+            id_extra: preparar.id_extra,
+            nombre_item: preparar.nombre_item,
+            nombre_extra_snapshot: preparar.nombre_extra_snapshot,
+            cantidad: preparar.cantidad,
+            es_linea_extra_independiente: true,
+            extras: []
+          } : {}),
+          instruccion_operativa: 'PREPARAR'
+        }];
+      }
+      if (entregarByIndex.has(index)) {
+        return [{ ...item, instruccion_operativa: 'ENTREGAR_JUNTO_CON_EL_PEDIDO' }];
+      }
+      return [];
+    });
 
-  return source
-    .filter((item) => (
-      isKitchenPreparation(item)
-      || (isKitchenProduct(item) && shouldDeliverProductWithOrder(item))
-    ))
-    .map((item) => ({
-      ...item,
-      instruccion_operativa: isKitchenProduct(item)
-        ? 'ENTREGAR_JUNTO_CON_EL_PEDIDO'
-        : 'PREPARAR'
-    }));
+  return {
+    ...routing,
+    items_operativos: operationalItems
+  };
+};
+
+export const findInvalidKitchenItems = (items) => (
+  classifyKitchenPrintItems(items).lineas_invalidas
+);
+
+export const assertValidKitchenItems = (items) => {
+  const classification = classifyKitchenPrintItems(items);
+  if (classification.requiere_revision) {
+    throw kitchenRoutingError(
+      'El pedido contiene lineas invalidas y requiere revision antes de imprimir.',
+      'PRINT_PEDIDO_REQUIERE_REVISION',
+      classification.lineas_invalidas
+    );
+  }
+  return classification;
+};
+
+export const routeKitchenPrintItems = (items) => {
+  return assertValidKitchenItems(items).items_operativos;
 };
 
 export const hasKitchenPreparations = (items) => (
-  (Array.isArray(items) ? items : []).some(isKitchenPreparation)
+  classifyKitchenPrintItems(items).requiere_cocina
 );
 
 export const assertKitchenPrintPayload = (payload) => {
-  const items = routeKitchenPrintItems(payload?.items);
-  if (!hasKitchenPreparations(items)) {
-    throw Object.assign(new Error('Este pedido no contiene preparaciones para cocina.'), {
-      status: 409,
-      code: 'PRINT_PEDIDO_NO_REQUIERE_COCINA'
-    });
+  const declaredInvalidItems = Array.isArray(payload?.lineas_invalidas)
+    ? payload.lineas_invalidas
+    : [];
+  if (payload?.requiere_revision === true || declaredInvalidItems.length > 0) {
+    throw kitchenRoutingError(
+      'El pedido contiene lineas invalidas y requiere revision antes de imprimir.',
+      'PRINT_PEDIDO_REQUIERE_REVISION',
+      declaredInvalidItems
+    );
   }
-  return items;
+  if (payload?.requiere_cocina === false) {
+    throw kitchenRoutingError(
+      'Este pedido no contiene preparaciones para cocina.',
+      'PRINT_PEDIDO_NO_REQUIERE_COCINA'
+    );
+  }
+  const classification = assertValidKitchenItems(payload?.items);
+  if (!classification.requiere_cocina) {
+    throw kitchenRoutingError(
+      'Este pedido no contiene preparaciones para cocina.',
+      'PRINT_PEDIDO_NO_REQUIERE_COCINA'
+    );
+  }
+  return classification.items_operativos;
 };

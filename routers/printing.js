@@ -144,6 +144,31 @@ export const enqueuePedidoComandaPrintJob = async ({
   return enqueue(enqueueParams);
 };
 
+export const enqueueVentaCanonicalPrintJob = async ({
+  venta,
+  tipoDocumento,
+  widthMm,
+  idempotencyKey,
+  idUsuario = null,
+  esReimpresion = false,
+  createPayload = createCanonicalPrintJob,
+  enqueue = enqueuePrintJob
+}) => {
+  const createdDocument = await createPayload({ tipoDocumento, venta, widthMm });
+  const job = await enqueue({
+    idSucursal: Number(venta.id_sucursal),
+    tipoDocumento,
+    idempotencyKey,
+    idFactura: Number(venta.id_factura),
+    idPedido: Number(venta.id_pedido || 0) || null,
+    idUsuario: Number(idUsuario || 0) || null,
+    esReimpresion,
+    payload: createdDocument.payload,
+    canonicalDocument: createdDocument.document
+  });
+  return { job, createdDocument };
+};
+
 const requireAdministrativePrintRole = async (req) => {
   if (!(await requestHasAnyRole(req, ADMIN_ROLE_CODES))) {
     throw Object.assign(new Error('Resolucion exclusiva para administradores.'), { status: 403, code: 'PRINT_ADMIN_ROLE_REQUIRED' });
@@ -208,24 +233,14 @@ router.post('/ventas/:id/print-jobs', checkPermission(['VENTAS_IMPRIMIR', 'VENTA
       }).catch(() => null)
       : null;
     const widthMm = resolveCanonicalPrintWidth({ tipoDocumento, venta, printerConfig });
-    const createdDocument = await createCanonicalPrintJob({
-      tipoDocumento,
+    const { job } = await enqueueVentaCanonicalPrintJob({
       venta,
-      widthMm
-    });
-
-    const enqueueParams = {
-      idSucursal: Number(venta.id_sucursal),
       tipoDocumento,
+      widthMm,
       idempotencyKey,
-      idFactura,
-      idPedido: Number(venta.id_pedido || 0) || null,
-      idUsuario: Number(req.user?.id_usuario || 0) || null,
-      esReimpresion: isReprint,
-      payload: createdDocument.payload,
-      canonicalDocument: createdDocument.document
-    };
-    const job = await enqueuePrintJob(enqueueParams);
+      idUsuario: req.user?.id_usuario,
+      esReimpresion: isReprint
+    });
     return res.status(202).json({ ok: true, message: 'Trabajo enviado a impresion.', job });
   } catch (error) {
     console.error('[printing.enqueue] fallo', { code: error?.code || null });
