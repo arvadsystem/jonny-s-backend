@@ -226,6 +226,7 @@ const toKdsClassifierItem = (row) => {
     cantidad: row?.cantidad,
     nombre_item: row?.nombre_item,
     configuracion_menu: row?.configuracion_menu ?? null,
+    configuracion_menu_json_type: row?.configuracion_menu_json_type ?? null,
     extras: []
   };
 };

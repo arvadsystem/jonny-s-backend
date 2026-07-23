@@ -118,14 +118,39 @@ export const resolveKdsRuleByActiveCount = (activeCount) => {
   );
 };
 
+const ISO_DATE_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
+
+const isValidIsoDate = (value) => {
+  if (!ISO_DATE_PATTERN.test(value)) return false;
+  const [year, month, day] = value.split('-').map(Number);
+  const date = new Date(Date.UTC(year, month - 1, day));
+  return date.getUTCFullYear() === year
+    && date.getUTCMonth() === month - 1
+    && date.getUTCDate() === day;
+};
+
 const resolveOperationalDateValue = (value) => {
-  if (!value) return null;
-  const date = new Date(value);
+  if (value === null || value === undefined || value === '') return null;
+  const text = String(value).trim();
+  if (ISO_DATE_PATTERN.test(text)) {
+    return isValidIsoDate(text) ? text : null;
+  }
+
+  const date = value instanceof Date ? value : new Date(text);
   if (Number.isNaN(date.getTime())) return null;
-  const tegucigalpaDate = new Date(
-    date.toLocaleString('en-US', { timeZone: 'America/Tegucigalpa' })
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/Tegucigalpa',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit'
+  }).formatToParts(date);
+  const dateParts = Object.fromEntries(
+    parts
+      .filter((part) => part.type !== 'literal')
+      .map((part) => [part.type, part.value])
   );
-  return tegucigalpaDate.toISOString().slice(0, 10);
+  if (!dateParts.year || !dateParts.month || !dateParts.day) return null;
+  return `${dateParts.year}-${dateParts.month}-${dateParts.day}`;
 };
 
 export const assignPersistedKdsTiming = async ({
@@ -864,6 +889,12 @@ router.get('/cocina/pedidos', checkPermission(COCINA_VIEW_PERMISSIONS), async (r
             END AS cantidad,
             dp.observacion,
             ${hasDetallePedidoConfiguracionMenu ? 'dp.configuracion_menu,' : 'NULL::jsonb AS configuracion_menu,'}
+            ${hasDetallePedidoConfiguracionMenu
+              ? `CASE
+                   WHEN dp.configuracion_menu IS NULL THEN 'sql_null'
+                   ELSE COALESCE(jsonb_typeof(dp.configuracion_menu), 'unknown')
+                 END AS configuracion_menu_json_type,`
+              : "'sql_null'::text AS configuracion_menu_json_type,"}
             COALESCE(prod.nombre_producto, rec.nombre_receta, standalone_extra.nombre_extra_snapshot) AS nombre_item,
             COALESCE(dp.total_pedido, COALESCE(dp.sub_total_pedido, 0)) AS total_linea
           FROM pedidos p

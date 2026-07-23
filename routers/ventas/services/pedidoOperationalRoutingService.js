@@ -64,12 +64,28 @@ const parseOperationalQuantity = (value) => {
   return null;
 };
 
+const normalizeConfigurationJsonType = (value) => {
+  const normalized = String(value || '').trim().toLowerCase();
+  return normalized || null;
+};
+
 const readDeliveryPreference = (line) => {
+  const jsonType = normalizeConfigurationJsonType(line?.configuracion_menu_json_type);
+  if (jsonType === 'sql_null') {
+    return { presente: false, valida: true, valor: null };
+  }
+  if (jsonType && jsonType !== 'object') {
+    return { presente: true, valida: false, valor: null };
+  }
+
   const parsedConfig = parseObject(line?.configuracion_menu);
   if (!parsedConfig.valid) {
     return { presente: true, valida: false, valor: null };
   }
   const config = parsedConfig.value;
+  if (jsonType === 'object' && !config) {
+    return { presente: true, valida: false, valor: null };
+  }
   if (!config || !Object.hasOwn(config, 'entregar_con_pedido')) {
     return { presente: false, valida: true, valor: null };
   }
@@ -341,6 +357,10 @@ export const readPedidoOperationalRouting = async ({ client, idPedido }) => {
          dp.id_receta,
          dp.cantidad,
          dp.configuracion_menu,
+         CASE
+           WHEN dp.configuracion_menu IS NULL THEN 'sql_null'
+           ELSE COALESCE(jsonb_typeof(dp.configuracion_menu), 'unknown')
+         END AS configuracion_menu_json_type,
          COALESCE(prod.nombre_producto, rec.nombre_receta) AS nombre_item,
          COALESCE(extras_info.extras, '[]'::jsonb) AS extras
        FROM public.detalle_pedido dp

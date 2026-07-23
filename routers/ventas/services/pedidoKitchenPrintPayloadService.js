@@ -250,7 +250,13 @@ export const buildPedidoKitchenPrintPayload = async (
                 : 'dp.cantidad'},
             'observacion', dp.observacion,
             'extras', ${hasDetallePedidoExtras ? `COALESCE(extras_info.extras, '[]'::jsonb)` : `'[]'::jsonb`},
-            'configuracion_menu', ${hasDetallePedidoConfiguracionMenu ? 'dp.configuracion_menu' : 'NULL::jsonb'}
+            'configuracion_menu', ${hasDetallePedidoConfiguracionMenu ? 'dp.configuracion_menu' : 'NULL::jsonb'},
+            'configuracion_menu_json_type', ${hasDetallePedidoConfiguracionMenu
+              ? `CASE
+                   WHEN dp.configuracion_menu IS NULL THEN 'sql_null'
+                   ELSE COALESCE(jsonb_typeof(dp.configuracion_menu), 'unknown')
+                 END`
+              : "'sql_null'"}
           )
           ORDER BY dp.id_detalle_pedido
         ) AS items
@@ -327,7 +333,8 @@ export const buildPedidoKitchenPrintPayload = async (
       subtotal: standaloneExtra?.subtotal ?? null,
       extras: standaloneExtra ? [] : toKitchenExtras(item?.extras),
       complementos: toKitchenComplementos(item),
-      configuracion_menu: item?.configuracion_menu ?? null
+      configuracion_menu: item?.configuracion_menu ?? null,
+      configuracion_menu_json_type: item?.configuracion_menu_json_type ?? null
     };
   });
   const routing = classifyKitchenPrintItems(normalizedItems);

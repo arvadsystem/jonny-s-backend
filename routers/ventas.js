@@ -6867,7 +6867,13 @@ router.get('/ventas/pedidos-menu', checkPermission(['VENTAS_VER']), async (req, 
                 'extras', ${hasDetallePedidoExtras
                   ? `COALESCE(extras_info.extras, '[]'::jsonb)`
                   : `'[]'::jsonb`},
-                'configuracion_menu', ${hasDetallePedidoConfiguracionMenu ? 'dp.configuracion_menu' : 'NULL::jsonb'}
+                'configuracion_menu', ${hasDetallePedidoConfiguracionMenu ? 'dp.configuracion_menu' : 'NULL::jsonb'},
+                'configuracion_menu_json_type', ${hasDetallePedidoConfiguracionMenu
+                  ? `CASE
+                       WHEN dp.configuracion_menu IS NULL THEN 'sql_null'
+                       ELSE COALESCE(jsonb_typeof(dp.configuracion_menu), 'unknown')
+                     END`
+                  : "'sql_null'"}
               )
               ORDER BY dp.id_detalle_pedido
             ) AS items

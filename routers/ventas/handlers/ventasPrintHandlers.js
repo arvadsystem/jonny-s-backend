@@ -205,6 +205,7 @@ export const buildVentaKitchenPrintPayload = (venta = {}, printerConfig = null) 
       extras: isStandaloneExtra ? [] : toKitchenExtras(item?.extras),
       complementos: toKitchenComplementos(item),
       configuracion_menu: item?.configuracion_menu ?? null,
+      configuracion_menu_json_type: item?.configuracion_menu_json_type ?? null,
       origen_snapshot: item?.origen_snapshot ?? null
     };
   });

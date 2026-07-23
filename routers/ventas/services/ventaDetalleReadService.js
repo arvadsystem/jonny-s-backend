@@ -780,6 +780,10 @@ export const fetchKitchenSaleDetailRows = async (client, idFactura) =>
             NULL::numeric AS exonerado_linea,
             dp.observacion,
             dp.configuracion_menu,
+            CASE
+              WHEN dp.configuracion_menu IS NULL THEN 'sql_null'
+              ELSE COALESCE(jsonb_typeof(dp.configuracion_menu), 'unknown')
+            END AS configuracion_menu_json_type,
             COALESCE(dfo.origen_snapshot, df.origen_snapshot) AS origen_snapshot
           FROM detalle_facturas df
           LEFT JOIN detalle_facturas_origen dfo
