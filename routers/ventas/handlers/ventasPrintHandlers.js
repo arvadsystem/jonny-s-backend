@@ -204,7 +204,8 @@ export const buildVentaKitchenPrintPayload = (venta = {}, printerConfig = null) 
       es_linea_extra_independiente: isStandaloneExtra,
       extras: isStandaloneExtra ? [] : toKitchenExtras(item?.extras),
       complementos: toKitchenComplementos(item),
-      configuracion_menu: item?.configuracion_menu || null
+      configuracion_menu: item?.configuracion_menu ?? null,
+      origen_snapshot: item?.origen_snapshot ?? null
     };
   });
   const derivedRouting = classifyKitchenPrintItems(normalizedItems);
@@ -221,7 +222,7 @@ export const buildVentaKitchenPrintPayload = (venta = {}, printerConfig = null) 
     : derivedRouting;
   const items = routing.requiere_revision ? normalizedItems : routing.items_operativos;
 
-  const totalProductos = items.reduce(
+  const totalProductos = (routing.requiere_revision ? [] : routing.items_operativos).reduce(
     (sum, item) => (
       item.tipo_item === 'EXTRA' || item.es_linea_extra_independiente
         ? sum
@@ -252,6 +253,7 @@ export const buildVentaKitchenPrintPayload = (venta = {}, printerConfig = null) 
     requiere_cocina: routing.requiere_cocina,
     requiere_revision: routing.requiere_revision,
     lineas_invalidas: routing.lineas_invalidas,
+    items_no_cocina: routing.items_no_cocina,
     items,
     print_config: {
       printMode: cocinaConfig?.modo_impresion || 'BROWSER',

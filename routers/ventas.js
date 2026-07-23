@@ -7081,6 +7081,15 @@ router.post('/ventas/pedidos-menu/:id/confirmar-pago', checkPermission(['VENTAS_
   } catch (error) {
     try { await client.query('ROLLBACK'); } catch {}
     console.error('Error confirmando pago de pedido:', error);
+    if (error?.code === 'VENTAS_PEDIDO_REQUIERE_REVISION') {
+      return res.status(409).json({
+        error: true,
+        code: error.code,
+        message: error.publicMessage,
+        requiere_revision: true,
+        lineas_invalidas: error.lineas_invalidas
+      });
+    }
     return sendVentasInternalError(res, 'No se pudo confirmar el pago del pedido.');
   } finally {
     client.release();

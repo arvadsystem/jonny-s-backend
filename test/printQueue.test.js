@@ -350,7 +350,13 @@ test('endpoint de pedido encola comanda inicial idempotente y reimpresion separa
     id_caja: 3,
     modalidad: 'CONSUMO_LOCAL',
     contexto: { modalidad: 'CONSUMO_LOCAL', canal: 'POS' },
-    items: []
+    items: [{
+      id_detalle: 1,
+      tipo_item: 'RECETA',
+      id_receta: 10,
+      cantidad: 1,
+      nombre_item: 'Hamburguesa'
+    }]
   };
   const enqueueCalls = [];
   const jobsByKey = new Map();
@@ -398,10 +404,9 @@ test('endpoint de pedido encola comanda inicial idempotente y reimpresion separa
     idPedido: 501,
     idUsuario: 44,
     esReimpresion: false,
-    payload: enqueueCalls[0].payload,
-    onInsertedTransaction: enqueueCalls[0].onInsertedTransaction
+    payload: enqueueCalls[0].payload
   });
-  assert.equal(typeof enqueueCalls[0].onInsertedTransaction, 'function');
+  assert.equal(enqueueCalls[0].onInsertedTransaction, undefined);
   assert.deepEqual(enqueueCalls[0].payload.source, { id_factura: null, id_pedido: 501 });
   assert.equal(enqueueCalls[2].esReimpresion, true);
   assert.equal(enqueueCalls[2].idempotencyKey, 'comanda:pedido-reprint:501:qa-1');
@@ -416,7 +421,18 @@ test('endpoint de pedido encola comanda inicial idempotente y reimpresion separa
 });
 
 test('endpoint de pedido falla cerrado para clave, sucursal, factura o tipo incorrectos', async () => {
-  const pedido = { id_factura: null, id_pedido: 501, id_sucursal: agent.id_sucursal, items: [] };
+  const pedido = {
+    id_factura: null,
+    id_pedido: 501,
+    id_sucursal: agent.id_sucursal,
+    items: [{
+      id_detalle: 1,
+      tipo_item: 'RECETA',
+      id_receta: 10,
+      cantidad: 1,
+      nombre_item: 'Hamburguesa'
+    }]
+  };
   const baseArgs = {
     req: { user: { id_usuario: 44 } },
     idPedido: 501,

@@ -55,7 +55,14 @@ const buildClient = ({ lines, estadoPago = 'PAGADO_CONFIRMADO', canal = 'LOCAL',
 
 test('venta inmediata producto-only persiste pago y finaliza el pedido', async () => {
   const fixture = buildClient({
-    lines: [{ id_detalle_pedido: 1, id_producto: 10, id_receta: null }]
+    lines: [{
+      id_detalle_pedido: 1,
+      tipo_item: 'PRODUCTO',
+      id_producto: 10,
+      id_receta: null,
+      cantidad: 1,
+      nombre_item: 'Refresco'
+    }]
   });
   await persistImmediateSalePaymentState({
     client: fixture.client,
@@ -78,7 +85,14 @@ test('venta inmediata producto-only persiste pago y finaliza el pedido', async (
 
 test('respuesta reconciliada expone ruteo persistido de receta', async () => {
   const fixture = buildClient({
-    lines: [{ id_detalle_pedido: 2, id_producto: null, id_receta: 20 }]
+    lines: [{
+      id_detalle_pedido: 2,
+      tipo_item: 'RECETA',
+      id_producto: null,
+      id_receta: 20,
+      cantidad: 1,
+      nombre_item: 'Hamburguesa'
+    }]
   });
   const response = await reconcileVentaResponseWithPersistedPedidoState({
     client: fixture.client,

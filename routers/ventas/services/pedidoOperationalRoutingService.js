@@ -25,29 +25,76 @@ const normalizeCode = (value) => String(value || '')
   .toUpperCase()
   .replace(/[\s-]+/g, '_');
 
-const asObject = (value) => {
-  if (value && typeof value === 'object' && !Array.isArray(value)) return value;
-  if (typeof value !== 'string' || !value.trim()) return {};
+const parseObject = (value) => {
+  if (value && typeof value === 'object' && !Array.isArray(value)) {
+    return { valid: true, value };
+  }
+  if (value === null || value === undefined) {
+    return { valid: true, value: null };
+  }
+  if (typeof value !== 'string' || !value.trim()) {
+    return { valid: false, value: null };
+  }
   try {
     const parsed = JSON.parse(value);
-    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? { valid: true, value: parsed }
+      : { valid: false, value: null };
   } catch {
-    return {};
+    return { valid: false, value: null };
   }
 };
 
-const readDeliveryPreference = (line) => {
-  const value = asObject(line?.configuracion_menu).entregar_con_pedido;
-  if (typeof value === 'boolean') return value;
-  const normalized = String(value ?? '').trim().toLowerCase();
-  if (['true', '1', 'si', 'sí'].includes(normalized)) return true;
-  if (['false', '0', 'no'].includes(normalized)) return false;
+const parseOperationalQuantity = (value) => {
+  if (typeof value === 'number') {
+    return Number.isSafeInteger(value) && value > 0 ? value : null;
+  }
+  if (typeof value === 'string' && /^[1-9]\d*$/.test(value.trim())) {
+    const parsed = Number(value.trim());
+    return Number.isSafeInteger(parsed) ? parsed : null;
+  }
   return null;
+};
+
+const readDeliveryPreference = (line) => {
+  const parsedConfig = parseObject(line?.configuracion_menu);
+  if (!parsedConfig.valid) {
+    return { presente: true, valida: false, valor: null };
+  }
+  const config = parsedConfig.value;
+  if (!config || !Object.hasOwn(config, 'entregar_con_pedido')) {
+    return { presente: false, valida: true, valor: null };
+  }
+
+  const value = config.entregar_con_pedido;
+  if (typeof value === 'boolean') {
+    return { presente: true, valida: true, valor: value };
+  }
+  if (typeof value === 'number') {
+    if (value === 1) return { presente: true, valida: true, valor: true };
+    if (value === 0) return { presente: true, valida: true, valor: false };
+    return { presente: true, valida: false, valor: null };
+  }
+  if (typeof value === 'string') {
+    const normalized = value
+      .trim()
+      .toLowerCase()
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '');
+    if (['true', '1', 'si'].includes(normalized)) {
+      return { presente: true, valida: true, valor: true };
+    }
+    if (['false', '0', 'no'].includes(normalized)) {
+      return { presente: true, valida: true, valor: false };
+    }
+  }
+  return { presente: true, valida: false, valor: null };
 };
 
 const buildLineReference = (line, index) => {
   const tipoItem = normalizeLineType(line?.tipo_item || line?.kind);
   const idExtra = toPositiveInteger(line?.id_extra ?? line?.origen_snapshot?.id_extra);
+  const deliveryPreference = readDeliveryPreference(line);
   return {
     id_detalle_pedido: toPositiveInteger(line?.id_detalle_pedido ?? line?.id_detalle) || null,
     indice: index,
@@ -68,9 +115,22 @@ const buildLineReference = (line, index) => {
       || line?.origen_snapshot?.nombre_extra_snapshot
       || ''
     ).trim() || null,
-    cantidad: Number(line?.cantidad) > 0 ? Number(line.cantidad) : null,
-    entregar_con_pedido: readDeliveryPreference(line)
+    cantidad: parseOperationalQuantity(line?.cantidad),
+    entregar_con_pedido: deliveryPreference.valor,
+    preferencia_entrega_presente: deliveryPreference.presente,
+    preferencia_entrega_valida: deliveryPreference.valida
   };
+};
+
+const isDeliveryChargeLine = (line, reference) => {
+  const snapshot = parseObject(line?.origen_snapshot);
+  return snapshot.valid
+    && normalizeCode(snapshot.value?.origen) === 'DELIVERY'
+    && reference.tipo_item === 'ITEM'
+    && !reference.id_producto
+    && !reference.id_receta
+    && !reference.id_extra
+    && !reference.es_linea_extra_independiente;
 };
 
 const resolveDeclaredStandaloneExtra = (line, reference) => {
@@ -98,11 +158,18 @@ const resolveClassificationConflict = (reference) => {
   return null;
 };
 
+const invalidLine = (reference, motivo) => ({
+  ...reference,
+  tipo_clasificacion: 'LINEA_INVALIDA',
+  motivo
+});
+
 export const classifyPedidoOperationalRouting = (lines, context = {}) => {
   const sourceLines = Array.isArray(lines) ? lines : [];
   const productos = [];
   const recetas = [];
   const extrasIndependientes = [];
+  const itemsNoCocina = [];
   const lineasInvalidas = [];
 
   sourceLines.forEach((line, index) => {
@@ -111,14 +178,37 @@ export const classifyPedidoOperationalRouting = (lines, context = {}) => {
     const hasReceta = Boolean(reference.id_receta);
     const classificationConflict = resolveClassificationConflict(reference);
 
-    if (hasProducto && hasReceta) {
-      lineasInvalidas.push({ ...reference, motivo: 'PRODUCTO_Y_RECETA_SIMULTANEOS' });
+    if (isDeliveryChargeLine(line, reference)) {
+      itemsNoCocina.push({
+        ...reference,
+        tipo_clasificacion: 'CARGO_NO_COCINA'
+      });
+    } else if (hasProducto && hasReceta) {
+      lineasInvalidas.push(invalidLine(reference, 'PRODUCTO_Y_RECETA_SIMULTANEOS'));
     } else if (classificationConflict) {
-      lineasInvalidas.push({ ...reference, motivo: classificationConflict });
+      lineasInvalidas.push(invalidLine(reference, classificationConflict));
     } else if (hasProducto) {
-      productos.push(reference);
+      if (!reference.cantidad) {
+        lineasInvalidas.push(invalidLine(reference, 'CANTIDAD_INVALIDA'));
+      } else if (!reference.nombre_item) {
+        lineasInvalidas.push(invalidLine(reference, 'NOMBRE_INVALIDO'));
+      } else if (!reference.preferencia_entrega_valida) {
+        lineasInvalidas.push(invalidLine(reference, 'PREFERENCIA_ENTREGA_INVALIDA'));
+      } else {
+        productos.push({ ...reference, tipo_clasificacion: 'PRODUCTO' });
+      }
     } else if (hasReceta) {
-      recetas.push({ ...reference, tipo_item: 'RECETA' });
+      if (!reference.cantidad) {
+        lineasInvalidas.push(invalidLine(reference, 'CANTIDAD_INVALIDA'));
+      } else if (!reference.nombre_item) {
+        lineasInvalidas.push(invalidLine(reference, 'NOMBRE_INVALIDO'));
+      } else {
+        recetas.push({
+          ...reference,
+          tipo_item: 'RECETA',
+          tipo_clasificacion: 'RECETA'
+        });
+      }
     } else {
       const extras = Array.isArray(line?.extras) ? line.extras : [];
       const standaloneExtra = resolveDeclaredStandaloneExtra(line, reference)
@@ -128,29 +218,35 @@ export const classifyPedidoOperationalRouting = (lines, context = {}) => {
           extras
         });
       if (standaloneExtra) {
-        extrasIndependientes.push({
-          ...reference,
-          tipo_item: 'EXTRA_INDEPENDIENTE',
-          id_extra: standaloneExtra.id_extra,
-          nombre_item: standaloneExtra.nombre_extra_snapshot,
-          nombre_extra_snapshot: standaloneExtra.nombre_extra_snapshot,
-          codigo_extra_snapshot: standaloneExtra.codigo_extra_snapshot,
-          cantidad: standaloneExtra.cantidad,
-          precio_unitario: standaloneExtra.precio_unitario,
-          subtotal: standaloneExtra.subtotal,
-          entregar_con_pedido: null
-        });
+        const standaloneQuantity = parseOperationalQuantity(standaloneExtra.cantidad);
+        if (!standaloneQuantity) {
+          lineasInvalidas.push(invalidLine(reference, 'CANTIDAD_INVALIDA'));
+        } else {
+          extrasIndependientes.push({
+            ...reference,
+            tipo_item: 'EXTRA_INDEPENDIENTE',
+            tipo_clasificacion: 'EXTRA_INDEPENDIENTE',
+            id_extra: standaloneExtra.id_extra,
+            nombre_item: standaloneExtra.nombre_extra_snapshot,
+            nombre_extra_snapshot: standaloneExtra.nombre_extra_snapshot,
+            codigo_extra_snapshot: standaloneExtra.codigo_extra_snapshot,
+            cantidad: standaloneQuantity,
+            precio_unitario: standaloneExtra.precio_unitario,
+            subtotal: standaloneExtra.subtotal,
+            entregar_con_pedido: null
+          });
+        }
       } else {
-        lineasInvalidas.push({
-          ...reference,
-          motivo: reference.es_linea_extra_independiente
-            ? 'EXTRA_INDEPENDIENTE_INVALIDO'
-            : extras.length > 1
+        const motivo = reference.es_linea_extra_independiente
+          ? (!reference.cantidad ? 'CANTIDAD_INVALIDA' : 'EXTRA_INDEPENDIENTE_INVALIDO')
+          : extras.length > 1
             ? 'EXTRAS_INDEPENDIENTES_AMBIGUOS'
-            : extras.length === 1
-              ? 'EXTRA_INDEPENDIENTE_INVALIDO'
-              : 'LINEA_SIN_CLASIFICACION'
-        });
+            : extras.length === 1 && parseOperationalQuantity(extras[0]?.cantidad) === null
+              ? 'CANTIDAD_INVALIDA'
+              : extras.length === 1
+                ? 'EXTRA_INDEPENDIENTE_INVALIDO'
+                : 'LINEA_SIN_CLASIFICACION';
+        lineasInvalidas.push(invalidLine(reference, motivo));
       }
     }
   });
@@ -161,6 +257,7 @@ export const classifyPedidoOperationalRouting = (lines, context = {}) => {
       indice: null,
       id_producto: null,
       id_receta: null,
+      tipo_clasificacion: 'LINEA_INVALIDA',
       motivo: 'PEDIDO_SIN_DETALLE'
     });
   }
@@ -205,6 +302,7 @@ export const classifyPedidoOperationalRouting = (lines, context = {}) => {
     items_preparables: itemsPreparables,
     items_entrega_conjunta: itemsEntregaConjunta,
     items_entrega_inmediata: itemsEntregaInmediata,
+    items_no_cocina: itemsNoCocina,
     items_sin_clasificar: lineasInvalidas,
     productos: productosClasificados,
     recetas,
@@ -239,7 +337,7 @@ export const readPedidoOperationalRouting = async ({ client, idPedido }) => {
          dp.id_receta,
          dp.cantidad,
          dp.configuracion_menu,
-         COALESCE(prod.nombre_producto, rec.nombre_receta, 'Item de pedido') AS nombre_item,
+         COALESCE(prod.nombre_producto, rec.nombre_receta) AS nombre_item,
          COALESCE(extras_info.extras, '[]'::jsonb) AS extras
        FROM public.detalle_pedido dp
        LEFT JOIN public.productos prod ON prod.id_producto = dp.id_producto
@@ -285,6 +383,19 @@ export const readPedidoOperationalRouting = async ({ client, idPedido }) => {
 export const applyPedidoInitialOperationalRouting = async ({ client, idPedido }) => {
   const pedidoId = toPositiveInteger(idPedido);
   const routing = await readPedidoOperationalRouting({ client, idPedido: pedidoId });
+  if (routing.requiere_revision) {
+    throw Object.assign(
+      new Error('El pedido contiene lineas invalidas y no puede cambiar de estado operativo.'),
+      {
+        status: 409,
+        httpStatus: 409,
+        code: 'VENTAS_PEDIDO_REQUIERE_REVISION',
+        publicMessage: 'El pedido contiene lineas invalidas y requiere revision.',
+        requiere_revision: true,
+        lineas_invalidas: routing.lineas_invalidas
+      }
+    );
+  }
   const targetStateId = await resolveEstadoPedidoIdByCode(client, routing.estado_operativo_inicial);
 
   if (!toPositiveInteger(targetStateId)) {

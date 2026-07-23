@@ -249,6 +249,7 @@ export const buildVentaDetailPayloadForScope = async ({
   limitedToLast72Hours = false,
   idUsuarioDetalle = null,
   normalizeStandaloneExtras = true,
+  allowHistoricalQuantityInference = false,
   useHistoricalFacturacionSnapshot = false,
   loadReversiones = listFacturaReversiones,
   queryRunner = pool
@@ -298,7 +299,9 @@ export const buildVentaDetailPayloadForScope = async ({
       queryRunner,
       pedidoItemsResult.rows.map((row) => row.id_detalle)
     );
-    const pedidoItems = buildKitchenSaleDetailItems(pedidoItemsResult.rows).map((item) =>
+    const pedidoItems = buildKitchenSaleDetailItems(pedidoItemsResult.rows, {
+      allowHistoricalQuantityInference
+    }).map((item) =>
       attachDetailExtras(item, detalleFacturaExtrasById.get(Number(item.id_detalle)) || [], { normalizeStandaloneExtras }));
     const kitchenRouting = classifyKitchenPrintItems(pedidoItems);
     const cuentaDividida = await fetchCuentaDividida(queryRunner, {
@@ -318,6 +321,7 @@ export const buildVentaDetailPayloadForScope = async ({
         requiere_cocina: kitchenRouting.requiere_cocina,
         requiere_revision: kitchenRouting.requiere_revision,
         lineas_invalidas: kitchenRouting.lineas_invalidas,
+        items_no_cocina: kitchenRouting.items_no_cocina,
         items: pedidoItems,
         cuenta_dividida: cuentaDividida,
         contacto: pedidoDeliveryDetail.contacto,
@@ -342,7 +346,9 @@ export const buildVentaDetailPayloadForScope = async ({
     queryRunner,
     directItemsResult.rows.map((row) => row.id_detalle)
   );
-  const directItems = buildDirectSaleDetailItems(directItemsResult.rows).map((item) =>
+  const directItems = buildDirectSaleDetailItems(directItemsResult.rows, {
+    allowHistoricalQuantityInference
+  }).map((item) =>
     attachDetailExtras(item, detalleFacturaExtrasById.get(Number(item.id_detalle)) || [], { normalizeStandaloneExtras }));
   const kitchenRouting = classifyKitchenPrintItems(directItems);
   const cuentaDividida = await fetchCuentaDividida(queryRunner, {
@@ -359,6 +365,7 @@ export const buildVentaDetailPayloadForScope = async ({
       requiere_cocina: kitchenRouting.requiere_cocina,
       requiere_revision: kitchenRouting.requiere_revision,
       lineas_invalidas: kitchenRouting.lineas_invalidas,
+      items_no_cocina: kitchenRouting.items_no_cocina,
       items: directItems,
       cuenta_dividida: cuentaDividida,
       reversiones

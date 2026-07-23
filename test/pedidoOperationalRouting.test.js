@@ -9,13 +9,19 @@ import { resolvePedidoConsumo } from '../services/pedidoConsumoResolver.js';
 
 const product = (id = 10, detailId = id) => ({
   id_detalle_pedido: detailId,
+  tipo_item: 'PRODUCTO',
   id_producto: id,
-  id_receta: null
+  id_receta: null,
+  nombre_item: `Producto ${id}`,
+  cantidad: 1
 });
 const recipe = (id = 20, detailId = id) => ({
   id_detalle_pedido: detailId,
+  tipo_item: 'RECETA',
   id_producto: null,
-  id_receta: id
+  id_receta: id,
+  nombre_item: `Receta ${id}`,
+  cantidad: 1
 });
 
 test('1 producto terminado pagado en local se completa sin cocina', () => {
@@ -189,4 +195,34 @@ test('aplicacion inicial persiste el estado derivado sin tocar el estado financi
   const update = calls.find((call) => /UPDATE public\.pedidos/.test(call.sql));
   assert.doesNotMatch(update.sql, /estado_pago/);
   assert.deepEqual(update.params, [5, 3]);
+});
+
+test('aplicacion inicial no cambia estado cuando la cantidad operativa es invalida', async () => {
+  const calls = [];
+  const client = {
+    query: async (sql) => {
+      calls.push(sql);
+      if (/SELECT estado_pago, canal, tipo_entrega AS modalidad/.test(sql)) {
+        return {
+          rowCount: 1,
+          rows: [{ estado_pago: 'PENDIENTE_PAGO', canal: 'POS', modalidad: 'PARA_LLEVAR' }]
+        };
+      }
+      if (/FROM public\.detalle_pedido/.test(sql)) {
+        return {
+          rowCount: 1,
+          rows: [{ ...recipe(20, 100), cantidad: 0 }]
+        };
+      }
+      throw new Error(`No se esperaba ejecutar SQL adicional: ${sql}`);
+    }
+  };
+
+  await assert.rejects(
+    () => applyPedidoInitialOperationalRouting({ client, idPedido: 5 }),
+    (error) => error.status === 409
+      && error.code === 'VENTAS_PEDIDO_REQUIERE_REVISION'
+      && error.lineas_invalidas[0].motivo === 'CANTIDAD_INVALIDA'
+  );
+  assert.equal(calls.some((sql) => /UPDATE public\.pedidos/.test(sql)), false);
 });
