@@ -106,8 +106,10 @@ import {
 } from './ventas/services/ventaImmediatePaymentStateService.js';
 import {
   applyPedidoInitialOperationalRouting,
+  applyPedidoReplayOperationalRouting,
   classifyPedidoOperationalRouting,
-  readPedidoOperationalRouting
+  readPedidoOperationalRouting,
+  transitionPedidoToKitchenState
 } from './ventas/services/pedidoOperationalRoutingService.js';
 import { canRequestPedidoStateTransition } from './ventas/services/pedidoStatePermissionService.js';
 import {
@@ -496,7 +498,7 @@ const saveVentasIdempotencySuccess = async ({
   idUsuario = null,
   idSucursal = null
 }) => {
-  if (!reservation?.reserved) return;
+  if ((!reservation?.reserved && !reservation?.rpcManaged) || !reservation?.idempotencyKey) return;
   await client.query(
     `
       UPDATE public.ventas_idempotency_keys
@@ -6835,16 +6837,15 @@ router.get('/ventas/pedidos-menu', checkPermission(['VENTAS_VER']), async (req, 
                   END,
                 'id_producto', dp.id_producto,
                 'id_receta', dp.id_receta,
-                'nombre_item', COALESCE(prod.nombre_producto, rec.nombre_receta, 'Item de pedido'),
-                'nombre_producto', COALESCE(prod.nombre_producto, rec.nombre_receta, 'Item de pedido'),
-                'cantidad',
-                  CASE
-                    WHEN COALESCE(dp.cantidad, 0) > 0
-                      THEN dp.cantidad::int
-                    WHEN COALESCE(prod.precio, rec.precio, 0) > 0
-                      THEN GREATEST(1, ROUND(COALESCE(dp.sub_total_pedido, dp.total_pedido, 0) / COALESCE(prod.precio, rec.precio, 1))::int)
-                    ELSE 1
-                  END,
+                'nombre_item', COALESCE(
+                  NULLIF(TRIM(prod.nombre_producto), ''),
+                  NULLIF(TRIM(rec.nombre_receta), '')
+                ),
+                'nombre_producto', COALESCE(
+                  NULLIF(TRIM(prod.nombre_producto), ''),
+                  NULLIF(TRIM(rec.nombre_receta), '')
+                ),
+                'cantidad', dp.cantidad,
                 'precio_unitario',
                   COALESCE(
                     prod.precio,
@@ -6867,7 +6868,13 @@ router.get('/ventas/pedidos-menu', checkPermission(['VENTAS_VER']), async (req, 
                 'extras', ${hasDetallePedidoExtras
                   ? `COALESCE(extras_info.extras, '[]'::jsonb)`
                   : `'[]'::jsonb`},
-                'configuracion_menu', ${hasDetallePedidoConfiguracionMenu ? 'dp.configuracion_menu' : 'NULL::jsonb'}
+                'configuracion_menu', ${hasDetallePedidoConfiguracionMenu ? 'dp.configuracion_menu' : 'NULL::jsonb'},
+                'configuracion_menu_json_type', ${hasDetallePedidoConfiguracionMenu
+                  ? `CASE
+                       WHEN dp.configuracion_menu IS NULL THEN 'sql_null'
+                       ELSE COALESCE(jsonb_typeof(dp.configuracion_menu), 'unknown')
+                     END`
+                  : "'sql_null'"}
               )
               ORDER BY dp.id_detalle_pedido
             ) AS items
@@ -6912,7 +6919,9 @@ router.get('/ventas/pedidos-menu', checkPermission(['VENTAS_VER']), async (req, 
       const routing = classifyPedidoOperationalRouting(row.items, {
         estado_pago: row.estado_pago_control || row.estado_pago,
         canal: row.canal,
-        modalidad: row.modalidad_operativa || row.modalidad
+        modalidad: row.modalidad_operativa || row.modalidad,
+        origen_pedido: row.origen_pedido,
+        pago_confirmado_at: row.pago_confirmado_at
       });
       return {
         ...row,
@@ -7081,6 +7090,15 @@ router.post('/ventas/pedidos-menu/:id/confirmar-pago', checkPermission(['VENTAS_
   } catch (error) {
     try { await client.query('ROLLBACK'); } catch {}
     console.error('Error confirmando pago de pedido:', error);
+    if (error?.code === 'VENTAS_PEDIDO_REQUIERE_REVISION') {
+      return res.status(409).json({
+        error: true,
+        code: error.code,
+        message: error.publicMessage,
+        requiere_revision: true,
+        lineas_invalidas: error.lineas_invalidas
+      });
+    }
     return sendVentasInternalError(res, 'No se pudo confirmar el pago del pedido.');
   } finally {
     client.release();
@@ -7240,17 +7258,22 @@ router.put('/ventas/pedidos-menu/:id/estado', checkPermission([
       });
     }
 
-    await client.query(
-      `
-        UPDATE pedidos
-        SET id_estado_pedido = $2
-            ${normalizedTargetCode === 'EN_COCINA'
-              ? ", visible_en_cocina_at = COALESCE(visible_en_cocina_at, (NOW() AT TIME ZONE 'America/Tegucigalpa'))"
-              : ''}
-        WHERE id_pedido = $1
-      `,
-      [idPedido, targetStateId]
-    );
+    if (normalizedTargetCode === 'EN_COCINA') {
+      await transitionPedidoToKitchenState({
+        client,
+        idPedido,
+        estadoEnCocinaId: targetStateId
+      });
+    } else {
+      await client.query(
+        `
+          UPDATE pedidos
+          SET id_estado_pedido = $2
+          WHERE id_pedido = $1
+        `,
+        [idPedido, targetStateId]
+      );
+    }
 
     await client.query('COMMIT');
     const successMessage = normalizedTargetCode === 'NO_ENTREGADO'
@@ -8226,6 +8249,10 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
     if (idempotencyReservation.replay) {
       await client.query('ROLLBACK');
       transactionStarted = false;
+      await applyPedidoReplayOperationalRouting({
+        client,
+        idPedido: idempotencyReservation.responseBody?.id_pedido
+      });
       const replayResponse = await reconcileVentaResponseWithPersistedPedidoState({
         client,
         response: idempotencyReservation.responseBody
@@ -8331,12 +8358,22 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
         idempotencyKey,
         requestHash: idempotencyRequestHash
       });
-      if (!rpcResponseBody?.idempotent_replay) {
-        await applyPedidoInitialOperationalRouting({ client, idPedido: rpcResponseBody?.id_pedido });
-      }
+      await applyPedidoInitialOperationalRouting({
+        client,
+        idPedido: rpcResponseBody?.id_pedido
+      });
       const reconciledRpcResponseBody = await reconcileVentaResponseWithPersistedPedidoState({
         client,
         response: rpcResponseBody
+      });
+      await saveVentasIdempotencySuccess({
+        client,
+        reservation: idempotencyReservation,
+        httpStatus: 201,
+        responseBody: reconciledRpcResponseBody,
+        idPedido: reconciledRpcResponseBody.id_pedido,
+        idUsuario: userId,
+        idSucursal: pedidoPendiente.id_sucursal
       });
       const commitStart = ventasPerf.now();
       await client.query('COMMIT');
@@ -8372,23 +8409,20 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
         idUsuario: userId,
         perf: ventasPerf
       });
-      await applyPedidoInitialOperationalRouting({ client, idPedido: rpcResponseBody.id_pedido });
+      await applyPedidoInitialOperationalRouting({
+        client,
+        idPedido: rpcResponseBody.id_pedido
+      });
       const reconciledRpcResponseBody = await reconcileVentaResponseWithPersistedPedidoState({
         client,
         response: rpcResponseBody
       });
-      const commitStart = ventasPerf.now();
-      await client.query('COMMIT');
-      transactionStarted = false;
-      ventasPerf.add('commit_ms', commitStart);
-      ventasPerf.add('pedido_pendiente_commit_ms', commitStart);
-      ventasPerf.add('transaction_ms', transactionStart);
-
       const idempotencySuccessStart = ventasPerf.now();
       await saveExternalIdempotencySuccessIfNeeded({
         reservation: idempotencyReservation,
         saveSuccess: saveVentasIdempotencySuccess,
         args: {
+          client,
           reservation: idempotencyReservation,
           httpStatus: 201,
           responseBody: reconciledRpcResponseBody,
@@ -8396,10 +8430,14 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
           idUsuario: userId,
           idSucursal: pedidoPendiente.id_sucursal
         }
-      }).catch((err) => {
-        console.error('No se pudo guardar resultado idempotente RPC de pedido pendiente:', err);
       });
       ventasPerf.add('pedido_pendiente_idempotency_success_ms', idempotencySuccessStart);
+      const commitStart = ventasPerf.now();
+      await client.query('COMMIT');
+      transactionStarted = false;
+      ventasPerf.add('commit_ms', commitStart);
+      ventasPerf.add('pedido_pendiente_commit_ms', commitStart);
+      ventasPerf.add('transaction_ms', transactionStart);
       addPedidoPendienteTotalRoute();
       ventasPerf.log(buildPedidoPendientePerfLogContext({ status: 201 }));
       return res.status(201).json(reconciledRpcResponseBody);
@@ -8710,35 +8748,29 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
       perf: ventasPerf
     });
 
+    const baseResponseBody = {
+      message: 'Pedido pendiente creado correctamente.',
+      id_pedido: idPedido,
+      estado_pago: PEDIDO_PENDIENTE_ESTADO_PAGO,
+      estado_pedido: 'PENDIENTE',
+      origen_pedido: 'CAJA',
+      canal: pedidoPendiente.canal,
+      modalidad: pedidoPendiente.modalidad,
+      total: pedidoPendiente.total,
+      monto_pendiente: pedidoPendiente.total,
+      cuenta_dividida: cuentaDivididaResponse
+    };
     await applyPedidoInitialOperationalRouting({ client, idPedido });
-
     const responseBody = await reconcileVentaResponseWithPersistedPedidoState({
       client,
-      response: {
-        message: 'Pedido pendiente creado correctamente.',
-        id_pedido: idPedido,
-        estado_pago: PEDIDO_PENDIENTE_ESTADO_PAGO,
-        estado_pedido: 'PENDIENTE',
-        origen_pedido: 'CAJA',
-        canal: pedidoPendiente.canal,
-        modalidad: pedidoPendiente.modalidad,
-        total: pedidoPendiente.total,
-        monto_pendiente: pedidoPendiente.total,
-        cuenta_dividida: cuentaDivididaResponse
-      }
+      response: baseResponseBody
     });
-    const commitStart = ventasPerf.now();
-    await client.query('COMMIT');
-    transactionStarted = false;
-    ventasPerf.add('commit_ms', commitStart);
-    ventasPerf.add('pedido_pendiente_commit_ms', commitStart);
-    ventasPerf.add('transaction_ms', transactionStart);
-
     const idempotencySuccessStart = ventasPerf.now();
     await saveExternalIdempotencySuccessIfNeeded({
       reservation: idempotencyReservation,
       saveSuccess: saveVentasIdempotencySuccess,
       args: {
+        client,
         reservation: idempotencyReservation,
         httpStatus: 201,
         responseBody,
@@ -8746,10 +8778,14 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
         idUsuario: userId,
         idSucursal: pedidoPendiente.id_sucursal
       }
-    }).catch((err) => {
-      console.error('No se pudo guardar resultado idempotente de pedido pendiente:', err);
     });
     ventasPerf.add('pedido_pendiente_idempotency_success_ms', idempotencySuccessStart);
+    const commitStart = ventasPerf.now();
+    await client.query('COMMIT');
+    transactionStarted = false;
+    ventasPerf.add('commit_ms', commitStart);
+    ventasPerf.add('pedido_pendiente_commit_ms', commitStart);
+    ventasPerf.add('transaction_ms', transactionStart);
     addPedidoPendienteTotalRoute();
     ventasPerf.log(buildPedidoPendientePerfLogContext({ status: 201 }));
     return res.status(201).json(responseBody);
@@ -9712,6 +9748,10 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
     if (idempotencyReservation.replay) {
       await client.query('ROLLBACK');
       transactionStarted = false;
+      await applyPedidoReplayOperationalRouting({
+        client,
+        idPedido: idempotencyReservation.responseBody?.id_pedido
+      });
       const replayResponse = await reconcileVentaResponseWithPersistedPedidoState({
         client,
         response: idempotencyReservation.responseBody
@@ -9886,9 +9926,20 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
         venta,
         skipExisting: true
       });
+      await applyPedidoInitialOperationalRouting({ client, idPedido: idPedidoRpc });
       const rpcV3ResponseBody = await reconcileVentaResponseWithPersistedPedidoState({
         client,
         response: attachVentaSnapshotsToResponse(rpcCreateResult.response, venta)
+      });
+      await saveVentasIdempotencySuccess({
+        client,
+        reservation: idempotencyReservation,
+        httpStatus: 201,
+        responseBody: rpcV3ResponseBody,
+        idPedido: idPedidoRpc,
+        idFactura: rpcCreateResult.response?.id_factura,
+        idUsuario: userId,
+        idSucursal: venta.id_sucursal
       });
       const commitStart = ventasPerf.now();
       await client.query('COMMIT');
@@ -9945,6 +9996,7 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
         }
       }
 
+      await applyPedidoInitialOperationalRouting({ client, idPedido: idPedidoRpc });
       const rpcV2ResponseBody = await reconcileVentaResponseWithPersistedPedidoState({
         client,
         response: attachVentaSnapshotsToResponse(rpcCreateResult.response, venta)
@@ -9999,6 +10051,10 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
         idSucursal: venta.id_sucursal,
         idUsuario: userId,
         perf: ventasPerf
+      });
+      await applyPedidoInitialOperationalRouting({
+        client,
+        idPedido: rpcCreateResult.response?.id_pedido
       });
       const rpcV1ResponseBody = await reconcileVentaResponseWithPersistedPedidoState({
         client,
@@ -10549,6 +10605,7 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
       detalleFacturaRows,
       detalleFacturaRowsInserted: detalleFacturaResult.rows
     });
+    await applyPedidoInitialOperationalRouting({ client, idPedido });
     const createVentaResponse = await reconcileVentaResponseWithPersistedPedidoState({
       client,
       response: attachVentaSnapshotsToResponse(buildCreateVentaDetailResponse({

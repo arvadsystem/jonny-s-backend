@@ -533,6 +533,7 @@ test('documento del agente exige trabajo asignado, sucursal y estado con lease a
     idSucursal: agent.id_sucursal,
     includePrintAssets: true,
     normalizeStandaloneExtras: true,
+    allowHistoricalQuantityInference: false,
     useHistoricalFacturacionSnapshot: true
   });
   assert.equal(result.job.estado, 'imprimiendo');
@@ -730,16 +731,26 @@ test('agente prueba v2 corregido antes del fallback v2 legacy para trabajos sin 
     agent,
     jobId: 91,
     db: createDocumentDb(buildJob({ payload })).db,
-    loadVenta: async ({ normalizeStandaloneExtras, useHistoricalFacturacionSnapshot }) => {
-      sourceAttempts.push({ normalizeStandaloneExtras, useHistoricalFacturacionSnapshot });
+    loadVenta: async ({
+      normalizeStandaloneExtras,
+      allowHistoricalQuantityInference,
+      useHistoricalFacturacionSnapshot
+    }) => {
+      sourceAttempts.push({
+        normalizeStandaloneExtras,
+        allowHistoricalQuantityInference,
+        useHistoricalFacturacionSnapshot
+      });
       return { status: 200, body: facturaFixture };
     }
   });
 
   assert.deepEqual(sourceAttempts, [
-    { normalizeStandaloneExtras: true, useHistoricalFacturacionSnapshot: true },
-    { normalizeStandaloneExtras: true, useHistoricalFacturacionSnapshot: false },
-    { normalizeStandaloneExtras: false, useHistoricalFacturacionSnapshot: true }
+    { normalizeStandaloneExtras: true, allowHistoricalQuantityInference: false, useHistoricalFacturacionSnapshot: true },
+    { normalizeStandaloneExtras: true, allowHistoricalQuantityInference: false, useHistoricalFacturacionSnapshot: false },
+    { normalizeStandaloneExtras: true, allowHistoricalQuantityInference: true, useHistoricalFacturacionSnapshot: true },
+    { normalizeStandaloneExtras: true, allowHistoricalQuantityInference: true, useHistoricalFacturacionSnapshot: false },
+    { normalizeStandaloneExtras: false, allowHistoricalQuantityInference: true, useHistoricalFacturacionSnapshot: true }
   ]);
   const bytes = Buffer.from(result.document.data, 'base64');
   assert.equal(bytes.length, LEGACY_V2_BASELINES.factura.bytes);
@@ -770,6 +781,7 @@ test('fallback v2 historico es best-effort, respeta orden y detiene candidatos t
     loadVenta: async (args) => {
       currentAttempts.push({
         normalizeStandaloneExtras: args.normalizeStandaloneExtras,
+        allowHistoricalQuantityInference: args.allowHistoricalQuantityInference,
         useHistoricalFacturacionSnapshot: args.useHistoricalFacturacionSnapshot
       });
       return {
@@ -779,8 +791,8 @@ test('fallback v2 historico es best-effort, respeta orden y detiene candidatos t
     }
   });
   assert.deepEqual(currentAttempts, [
-    { normalizeStandaloneExtras: true, useHistoricalFacturacionSnapshot: true },
-    { normalizeStandaloneExtras: true, useHistoricalFacturacionSnapshot: false }
+    { normalizeStandaloneExtras: true, allowHistoricalQuantityInference: false, useHistoricalFacturacionSnapshot: true },
+    { normalizeStandaloneExtras: true, allowHistoricalQuantityInference: false, useHistoricalFacturacionSnapshot: false }
   ]);
   assert.ok(currentDb.calls.every(({ sql }) => /^\s*SELECT\b/i.test(sql)));
 
@@ -799,6 +811,7 @@ test('fallback v2 historico es best-effort, respeta orden y detiene candidatos t
     loadVenta: async (args) => {
       legacyAttempts.push({
         normalizeStandaloneExtras: args.normalizeStandaloneExtras,
+        allowHistoricalQuantityInference: args.allowHistoricalQuantityInference,
         useHistoricalFacturacionSnapshot: args.useHistoricalFacturacionSnapshot
       });
       const finalCandidate = args.normalizeStandaloneExtras === false
@@ -807,10 +820,12 @@ test('fallback v2 historico es best-effort, respeta orden y detiene candidatos t
     }
   });
   assert.deepEqual(legacyAttempts, [
-    { normalizeStandaloneExtras: true, useHistoricalFacturacionSnapshot: true },
-    { normalizeStandaloneExtras: true, useHistoricalFacturacionSnapshot: false },
-    { normalizeStandaloneExtras: false, useHistoricalFacturacionSnapshot: true },
-    { normalizeStandaloneExtras: false, useHistoricalFacturacionSnapshot: false }
+    { normalizeStandaloneExtras: true, allowHistoricalQuantityInference: false, useHistoricalFacturacionSnapshot: true },
+    { normalizeStandaloneExtras: true, allowHistoricalQuantityInference: false, useHistoricalFacturacionSnapshot: false },
+    { normalizeStandaloneExtras: true, allowHistoricalQuantityInference: true, useHistoricalFacturacionSnapshot: true },
+    { normalizeStandaloneExtras: true, allowHistoricalQuantityInference: true, useHistoricalFacturacionSnapshot: false },
+    { normalizeStandaloneExtras: false, allowHistoricalQuantityInference: true, useHistoricalFacturacionSnapshot: true },
+    { normalizeStandaloneExtras: false, allowHistoricalQuantityInference: true, useHistoricalFacturacionSnapshot: false }
   ]);
   assert.ok(legacyDb.calls.every(({ sql }) => /^\s*SELECT\b/i.test(sql)));
   assert.equal(
@@ -904,6 +919,52 @@ test('documento persistido conserva bytes aunque cambien logo y configuracion vi
   assert.equal(renderSourceLoads, 0);
   assert.equal(result.document.data, created.document.data);
   assert.equal(sha256(Buffer.from(result.document.data, 'base64')), created.payload.documento_canonico.content_sha256);
+});
+
+test('comanda persistida devuelve bytes exactos sin revalidar una linea no cocinable actual', async () => {
+  const source = structuredClone(comandaFixture);
+  source.items.push({
+    id_detalle: 72,
+    tipo_item: 'ITEM',
+    id_producto: null,
+    id_receta: null,
+    cantidad: 1,
+    nombre_item: 'Cargo logistico',
+    origen_snapshot: { origen: 'DELIVERY' }
+  });
+  const created = await createCanonicalPrintJob({
+    tipoDocumento: 'comanda',
+    venta: buildVentaKitchenPrintPayload(source),
+    widthMm: 80
+  });
+  const content = Buffer.from(created.document.data, 'utf8');
+  const persisted = {
+    persisted_document_id: 7002,
+    persisted_job_id: 91,
+    persisted_schema_version: 2,
+    persisted_tipo_documento: 'comanda',
+    persisted_formato: 'html',
+    persisted_flavor: 'plain',
+    persisted_content: content,
+    persisted_content_sha256: created.payload.documento_canonico.content_sha256,
+    persisted_content_bytes: created.payload.documento_canonico.content_bytes
+  };
+  let sourceLoads = 0;
+  const result = await getCanonicalPrintDocumentForAgent({
+    agent,
+    jobId: 91,
+    db: createDocumentDb(buildJob({ payload: created.payload, persisted })).db,
+    loadVenta: async () => {
+      sourceLoads += 1;
+      throw new Error('Un documento persistido valido no debe recargar la fuente.');
+    }
+  });
+
+  assert.equal(sourceLoads, 0);
+  assert.equal(result.document.data, created.document.data);
+  assert.equal(Buffer.byteLength(result.document.data, 'utf8'), created.payload.documento_canonico.content_bytes);
+  assert.equal(sha256(Buffer.from(result.document.data, 'utf8')), created.payload.documento_canonico.content_sha256);
+  assert.doesNotMatch(result.document.data, /Cargo logistico/);
 });
 
 test('documento persistido falla cerrado ante contenido, descriptor, tipo, schema o trabajo alterado', async () => {

@@ -1,7 +1,7 @@
-import { resolveEstadoPedidoIdByCode } from './catalogLookupService.js';
 import {
-  applyPedidoInitialOperationalRouting,
-  readPedidoOperationalRouting
+  applyPedidoReplayOperationalRouting,
+  readPedidoOperationalRouting,
+  transitionPedidoToKitchenState
 } from './pedidoOperationalRoutingService.js';
 
 const toPositiveInteger = (value) => {
@@ -10,7 +10,7 @@ const toPositiveInteger = (value) => {
 };
 
 export const initializePedidoPendingKitchen = async ({ client, idPedido }) => {
-  return applyPedidoInitialOperationalRouting({ client, idPedido });
+  return applyPedidoReplayOperationalRouting({ client, idPedido });
 };
 
 export const markPedidoVisibleInKitchen = async ({ client, idPedido }) => {
@@ -38,32 +38,9 @@ export const markPedidoVisibleInKitchen = async ({ client, idPedido }) => {
     });
   }
 
-  const estadoEnCocinaId = await resolveEstadoPedidoIdByCode(client, 'EN_COCINA');
-  if (!toPositiveInteger(estadoEnCocinaId)) {
-    throw Object.assign(new Error('No existe el estado EN_COCINA.'), {
-      status: 409,
-      code: 'VENTAS_PEDIDO_ESTADO_COCINA_NO_ENCONTRADO'
-    });
-  }
-
-  const result = await client.query(
-    `UPDATE public.pedidos
-     SET id_estado_pedido = $2,
-         visible_en_cocina_at = COALESCE(
-           visible_en_cocina_at,
-           (NOW() AT TIME ZONE 'America/Tegucigalpa')
-         )
-     WHERE id_pedido = $1
-     RETURNING id_pedido, id_estado_pedido, visible_en_cocina_at`,
-    [pedidoId, Number(estadoEnCocinaId)]
-  );
-
-  if (result.rowCount !== 1) {
-    throw Object.assign(new Error('Pedido no encontrado para enviar a cocina.'), {
-      status: 404,
-      code: 'VENTAS_PEDIDO_NO_ENCONTRADO'
-    });
-  }
-
-  return { ...result.rows[0], ...routing };
+  const transitioned = await transitionPedidoToKitchenState({
+    client,
+    idPedido: pedidoId
+  });
+  return { ...transitioned, ...routing };
 };

@@ -85,7 +85,11 @@ export const toKitchenComplementos = (item = {}) => {
 export const buildPedidoKitchenPrintPayload = async (
   queryRunner,
   idPedido,
-  { normalizeStandaloneExtras = true, applyOperationalRouting = true } = {}
+  {
+    normalizeStandaloneExtras = true,
+    applyOperationalRouting = true,
+    allowHistoricalQuantityInference = false
+  } = {}
 ) => {
   const hasDetallePedidoConfiguracionMenu = await hasColumn(queryRunner, 'detalle_pedido', 'configuracion_menu');
   const hasDetallePedidoExtras = await hasTable(queryRunner, 'detalle_pedido_extras');
@@ -224,19 +228,35 @@ export const buildPedidoKitchenPrintPayload = async (
               END,
             'id_producto', dp.id_producto,
             'id_receta', dp.id_receta,
-            'nombre_item', COALESCE(prod.nombre_producto, rec.nombre_receta, 'Item de pedido'),
-            'nombre_producto', COALESCE(prod.nombre_producto, rec.nombre_receta, 'Item de pedido'),
+            'nombre_item', COALESCE(
+              prod.nombre_producto,
+              rec.nombre_receta
+              ${allowHistoricalQuantityInference ? ", 'Item de pedido'" : ''}
+            ),
+            'nombre_producto', COALESCE(
+              prod.nombre_producto,
+              rec.nombre_receta
+              ${allowHistoricalQuantityInference ? ", 'Item de pedido'" : ''}
+            ),
             'cantidad',
-              CASE
-                WHEN COALESCE(dp.cantidad, 0) > 0
-                  THEN dp.cantidad::int
-                WHEN COALESCE(prod.precio, rec.precio, 0) > 0
-                  THEN GREATEST(1, ROUND(COALESCE(dp.sub_total_pedido, dp.total_pedido, 0) / COALESCE(prod.precio, rec.precio, 1))::int)
-                ELSE 1
-              END,
+              ${allowHistoricalQuantityInference
+                ? `CASE
+                    WHEN COALESCE(dp.cantidad, 0) > 0
+                      THEN dp.cantidad::int
+                    WHEN COALESCE(prod.precio, rec.precio, 0) > 0
+                      THEN GREATEST(1, ROUND(COALESCE(dp.sub_total_pedido, dp.total_pedido, 0) / COALESCE(prod.precio, rec.precio, 1))::int)
+                    ELSE 1
+                  END`
+                : 'dp.cantidad'},
             'observacion', dp.observacion,
             'extras', ${hasDetallePedidoExtras ? `COALESCE(extras_info.extras, '[]'::jsonb)` : `'[]'::jsonb`},
-            'configuracion_menu', ${hasDetallePedidoConfiguracionMenu ? 'dp.configuracion_menu' : 'NULL::jsonb'}
+            'configuracion_menu', ${hasDetallePedidoConfiguracionMenu ? 'dp.configuracion_menu' : 'NULL::jsonb'},
+            'configuracion_menu_json_type', ${hasDetallePedidoConfiguracionMenu
+              ? `CASE
+                   WHEN dp.configuracion_menu IS NULL THEN 'sql_null'
+                   ELSE COALESCE(jsonb_typeof(dp.configuracion_menu), 'unknown')
+                 END`
+              : "'sql_null'"}
           )
           ORDER BY dp.id_detalle_pedido
         ) AS items
@@ -299,7 +319,11 @@ export const buildPedidoKitchenPrintPayload = async (
       cantidad: standaloneCantidad ?? (Number(item?.cantidad ?? 0) || 0),
       nombre_item: standaloneExtra
         ? standaloneExtra.nombre_extra_snapshot
-        : String(item?.nombre_item || item?.nombre_producto || 'Item de cocina').trim(),
+        : String(
+            item?.nombre_item
+            || item?.nombre_producto
+            || (allowHistoricalQuantityInference ? 'Item de cocina' : '')
+          ).trim(),
       observacion: String(item?.observacion || '').trim() || null,
       es_linea_extra_independiente: Boolean(standaloneExtra),
       id_extra: standaloneExtra?.id_extra || null,
@@ -309,7 +333,8 @@ export const buildPedidoKitchenPrintPayload = async (
       subtotal: standaloneExtra?.subtotal ?? null,
       extras: standaloneExtra ? [] : toKitchenExtras(item?.extras),
       complementos: toKitchenComplementos(item),
-      configuracion_menu: item?.configuracion_menu || null
+      configuracion_menu: item?.configuracion_menu ?? null,
+      configuracion_menu_json_type: item?.configuracion_menu_json_type ?? null
     };
   });
   const routing = classifyKitchenPrintItems(normalizedItems);
@@ -318,7 +343,7 @@ export const buildPedidoKitchenPrintPayload = async (
     : normalizedItems;
   // El contador de productos excluye lineas de extra independiente para no
   // inflar el total (p. ej. 1 producto + 4 extras debe reportar 1, no 5).
-  const totalProductos = items.reduce(
+  const totalProductos = (routing.requiere_revision ? [] : routing.items_operativos).reduce(
     (sum, item) => (
       item.tipo_item === 'EXTRA' || item.es_linea_extra_independiente
         ? sum
@@ -378,6 +403,7 @@ export const buildPedidoKitchenPrintPayload = async (
     requiere_cocina: routing.requiere_cocina,
     requiere_revision: routing.requiere_revision,
     lineas_invalidas: routing.lineas_invalidas,
+    items_no_cocina: routing.items_no_cocina,
     items
   };
 };

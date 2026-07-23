@@ -15,9 +15,11 @@ import {
 } from '../services/salsasPedidoSnapshotService.js';
 import { readPedidoOperationalRouting } from './ventas/services/pedidoOperationalRoutingService.js';
 import {
-  buildInvalidKitchenLinePredicate,
+  buildKitchenOrderEligibilityPredicate,
   buildKitchenPreparationPredicate,
-  buildKitchenProductPredicate
+  buildKitchenProductPredicate,
+  buildValidStandaloneKitchenExtraRowPredicate,
+  routeKdsOperationalRows
 } from './ventas/services/kitchenPrintRoutingService.js';
 
 const router = express.Router();
@@ -116,14 +118,144 @@ export const resolveKdsRuleByActiveCount = (activeCount) => {
   );
 };
 
+const ISO_DATE_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
+const LOCAL_TIMESTAMP_PATTERN =
+  /^(\d{4}-\d{2}-\d{2})[ T](\d{2}):(\d{2}):(\d{2})(?:\.(\d+))?$/;
+const TEGUCIGALPA_DATE_FORMATTER = new Intl.DateTimeFormat('en-US', {
+  timeZone: 'America/Tegucigalpa',
+  year: 'numeric',
+  month: '2-digit',
+  day: '2-digit'
+});
+const TEGUCIGALPA_DATE_TIME_FORMATTER = new Intl.DateTimeFormat('en-US', {
+  timeZone: 'America/Tegucigalpa',
+  year: 'numeric',
+  month: '2-digit',
+  day: '2-digit',
+  hour: '2-digit',
+  minute: '2-digit',
+  second: '2-digit',
+  hourCycle: 'h23'
+});
+
+const isValidIsoDate = (value) => {
+  if (!ISO_DATE_PATTERN.test(value)) return false;
+  const [year, month, day] = value.split('-').map(Number);
+  const date = new Date(Date.UTC(year, month - 1, day));
+  return date.getUTCFullYear() === year
+    && date.getUTCMonth() === month - 1
+    && date.getUTCDate() === day;
+};
+
+const readDateTimeParts = (formatter, date) => Object.fromEntries(
+  formatter
+    .formatToParts(date)
+    .filter((part) => part.type !== 'literal')
+    .map((part) => [part.type, part.value])
+);
+
+const parseLocalTimestampParts = (value) => {
+  const match = String(value ?? '').trim().match(LOCAL_TIMESTAMP_PATTERN);
+  if (!match || !isValidIsoDate(match[1])) return null;
+  const hour = Number(match[2]);
+  const minute = Number(match[3]);
+  const second = Number(match[4]);
+  if (hour > 23 || minute > 59 || second > 59) return null;
+  const [year, month, day] = match[1].split('-').map(Number);
+  const milliseconds = Number(String(match[5] || '').slice(0, 3).padEnd(3, '0')) || 0;
+  return { date: match[1], year, month, day, hour, minute, second, milliseconds };
+};
+
+const formatDateInTegucigalpa = (date) => {
+  const dateParts = readDateTimeParts(TEGUCIGALPA_DATE_FORMATTER, date);
+  if (!dateParts.year || !dateParts.month || !dateParts.day) return null;
+  return `${dateParts.year}-${dateParts.month}-${dateParts.day}`;
+};
+
 const resolveOperationalDateValue = (value) => {
-  if (!value) return null;
-  const date = new Date(value);
+  if (value === null || value === undefined) return null;
+  const text = String(value).trim();
+  if (!text) return null;
+  if (ISO_DATE_PATTERN.test(text)) {
+    return isValidIsoDate(text) ? text : null;
+  }
+
+  if (LOCAL_TIMESTAMP_PATTERN.test(text)) {
+    const localTimestamp = parseLocalTimestampParts(text);
+    return localTimestamp?.date || null;
+  }
+
+  const date = value instanceof Date ? value : new Date(text);
   if (Number.isNaN(date.getTime())) return null;
-  const tegucigalpaDate = new Date(
-    date.toLocaleString('en-US', { timeZone: 'America/Tegucigalpa' })
+  return formatDateInTegucigalpa(date);
+};
+
+const resolveTegucigalpaOffsetMs = (epochMs) => {
+  const instant = new Date(epochMs);
+  const parts = readDateTimeParts(TEGUCIGALPA_DATE_TIME_FORMATTER, instant);
+  if (!parts.year || !parts.month || !parts.day || parts.hour === undefined) return null;
+  return Date.UTC(
+    Number(parts.year),
+    Number(parts.month) - 1,
+    Number(parts.day),
+    Number(parts.hour),
+    Number(parts.minute),
+    Number(parts.second)
+  ) - epochMs;
+};
+
+const parseTegucigalpaLocalTimestampToEpoch = (value) => {
+  const parts = parseLocalTimestampParts(value);
+  if (!parts) return null;
+  const wallClockEpoch = Date.UTC(
+    parts.year,
+    parts.month - 1,
+    parts.day,
+    parts.hour,
+    parts.minute,
+    parts.second
   );
-  return tegucigalpaDate.toISOString().slice(0, 10);
+  const initialOffset = resolveTegucigalpaOffsetMs(wallClockEpoch);
+  if (!Number.isFinite(initialOffset)) return null;
+  let resolvedEpoch = wallClockEpoch - initialOffset;
+  const resolvedOffset = resolveTegucigalpaOffsetMs(resolvedEpoch);
+  if (Number.isFinite(resolvedOffset) && resolvedOffset !== initialOffset) {
+    resolvedEpoch = wallClockEpoch - resolvedOffset;
+  }
+  return resolvedEpoch + parts.milliseconds;
+};
+
+export const resolveKdsWaitingMetrics = ({
+  startedAt,
+  expectedMinutes,
+  startedAtIsLocal = false,
+  nowMs = Date.now()
+}) => {
+  const hasStartedAt = startedAt !== null
+    && startedAt !== undefined
+    && (typeof startedAt !== 'string' || startedAt.trim() !== '');
+  if (!hasStartedAt) {
+    return {
+      minutos_en_espera: null,
+      esta_proximo_a_expirar: false
+    };
+  }
+
+  const startedAtMs = startedAtIsLocal
+    ? parseTegucigalpaLocalTimestampToEpoch(startedAt)
+    : startedAt instanceof Date
+      ? startedAt.getTime()
+      : new Date(startedAt).getTime();
+  const minutosEnEspera = Number.isFinite(startedAtMs)
+    ? Math.max(0, Math.floor((nowMs - startedAtMs) / 60000))
+    : null;
+  const resolvedExpectedMinutes =
+    parsePositiveInt(expectedMinutes) || parsePositiveInt(EXPIRY_WARN_MINUTES) || 20;
+  return {
+    minutos_en_espera: minutosEnEspera,
+    esta_proximo_a_expirar:
+      minutosEnEspera !== null && minutosEnEspera >= resolvedExpectedMinutes
+  };
 };
 
 export const assignPersistedKdsTiming = async ({
@@ -131,7 +263,8 @@ export const assignPersistedKdsTiming = async ({
   pedidoId,
   idSucursal,
   activeEstadoIds,
-  operationalDate
+  operationalDate,
+  hasConfiguration = true
 }) => {
   const safePedidoId = parsePositiveInt(pedidoId);
   const safeSucursalId = parsePositiveInt(idSucursal);
@@ -168,6 +301,9 @@ export const assignPersistedKdsTiming = async ({
   const operationalDateValue =
     resolveOperationalDateValue(operationalDate) ||
     new Date().toLocaleDateString('en-CA', { timeZone: 'America/Tegucigalpa' });
+  const eligibilityPredicate = buildKitchenOrderEligibilityPredicate('p', {
+    hasConfiguration
+  });
 
   // AM: Cuenta la carga visible del KDS aunque el pedido aun no tenga factura o codigo de venta.
   const activeCountResult = await client.query(
@@ -192,6 +328,7 @@ export const assignPersistedKdsTiming = async ({
           p.visible_en_cocina_at::date,
           p.fecha_hora_pedido::date
         ) = $3::date
+        AND ${eligibilityPredicate}
     `,
     [safeSucursalId, activeEstadoIds, operationalDateValue]
   );
@@ -741,6 +878,11 @@ router.get('/cocina/pedidos', checkPermission(COCINA_VIEW_PERMISSIONS), async (r
         return res.status(400).json({ error: true, message: 'estado inválido para el tablero KDS.' });
       }
 
+      const hasDetallePedidoConfiguracionMenu = await hasColumn(
+        client,
+        'detalle_pedido',
+        'configuracion_menu'
+      );
       const filters = [];
       const params = [];
 
@@ -760,24 +902,9 @@ router.get('/cocina/pedidos', checkPermission(COCINA_VIEW_PERMISSIONS), async (r
       }
 
       filters.push(`p.id_estado_pedido = ANY(${pushParam(activeEstadoIds)}::int[])`);
-      filters.push(`
-        EXISTS (
-          SELECT 1
-          FROM public.detalle_pedido dp_route
-          WHERE dp_route.id_pedido = p.id_pedido
-            AND COALESCE(dp_route.estado, true) = true
-            AND ${buildKitchenPreparationPredicate('dp_route')}
-        )
-      `);
-      filters.push(`
-        NOT EXISTS (
-          SELECT 1
-          FROM public.detalle_pedido dp_invalid
-          WHERE dp_invalid.id_pedido = p.id_pedido
-            AND COALESCE(dp_invalid.estado, true) = true
-            AND ${buildInvalidKitchenLinePredicate('dp_invalid')}
-        )
-      `);
+      filters.push(buildKitchenOrderEligibilityPredicate('p', {
+        hasConfiguration: hasDetallePedidoConfiguracionMenu
+      }));
 
       if (requestedSucursalId) {
         filters.push(`p.id_sucursal = ${pushParam(requestedSucursalId)}`);
@@ -816,7 +943,6 @@ router.get('/cocina/pedidos', checkPermission(COCINA_VIEW_PERMISSIONS), async (r
       }
 
       const whereClause = filters.length ? `WHERE ${filters.join(' AND ')}` : '';
-      const hasDetallePedidoConfiguracionMenu = await hasColumn(client, 'detalle_pedido', 'configuracion_menu');
       const hasKdsStartedAt = await hasColumn(client, 'pedidos', 'kds_started_at');
       const hasKdsExpectedMinutes = await hasColumn(client, 'pedidos', 'kds_expected_minutes');
       const hasKdsExpectedRule = await hasColumn(client, 'pedidos', 'kds_expected_rule');
@@ -863,12 +989,21 @@ router.get('/cocina/pedidos', checkPermission(COCINA_VIEW_PERMISSIONS), async (r
             dp.id_receta,
             standalone_extra.id_extra AS id_extra_independiente,
             CASE
-              WHEN standalone_extra.id_extra IS NOT NULL THEN standalone_extra.cantidad
+              WHEN dp.id_producto IS NULL
+               AND dp.id_receta IS NULL
+               AND standalone_extra.id_extra IS NOT NULL
+                THEN standalone_extra.cantidad
               ELSE dp.cantidad
             END AS cantidad,
             dp.observacion,
             ${hasDetallePedidoConfiguracionMenu ? 'dp.configuracion_menu,' : 'NULL::jsonb AS configuracion_menu,'}
-            COALESCE(prod.nombre_producto, rec.nombre_receta, standalone_extra.nombre_extra_snapshot, 'Item de cocina') AS nombre_item,
+            ${hasDetallePedidoConfiguracionMenu
+              ? `CASE
+                   WHEN dp.configuracion_menu IS NULL THEN 'sql_null'
+                   ELSE COALESCE(jsonb_typeof(dp.configuracion_menu), 'unknown')
+                 END AS configuracion_menu_json_type,`
+              : "'sql_null'::text AS configuracion_menu_json_type,"}
+            COALESCE(prod.nombre_producto, rec.nombre_receta, standalone_extra.nombre_extra_snapshot) AS nombre_item,
             COALESCE(dp.total_pedido, COALESCE(dp.sub_total_pedido, 0)) AS total_linea
           FROM pedidos p
           LEFT JOIN estados_pedido ep ON ep.id_estado_pedido = p.id_estado_pedido
@@ -917,11 +1052,11 @@ router.get('/cocina/pedidos', checkPermission(COCINA_VIEW_PERMISSIONS), async (r
               dpe.precio_unitario,
               dpe.subtotal
             FROM public.detalle_pedido_extras dpe
-            WHERE dpe.id_detalle_pedido = dp.id_detalle_pedido
+            WHERE dp.id_producto IS NULL
+              AND dp.id_receta IS NULL
+              AND dpe.id_detalle_pedido = dp.id_detalle_pedido
               AND COALESCE(dpe.estado, true) = true
-              AND dpe.id_extra IS NOT NULL
-              AND NULLIF(TRIM(dpe.nombre_extra_snapshot), '') IS NOT NULL
-              AND COALESCE(dpe.cantidad, 0) > 0
+              AND ${buildValidStandaloneKitchenExtraRowPredicate('dpe')}
             ORDER BY dpe.id_detalle_pedido_extra
             LIMIT 1
           ) standalone_extra ON true
@@ -949,9 +1084,10 @@ router.get('/cocina/pedidos', checkPermission(COCINA_VIEW_PERMISSIONS), async (r
         params
       );
 
+      const operationalRows = routeKdsOperationalRows(result.rows);
       const salsaIds = [
         ...new Set(
-          result.rows.flatMap((row) => {
+          operationalRows.flatMap((row) => {
             const config = row.configuracion_menu && typeof row.configuracion_menu === 'object'
               ? row.configuracion_menu
               : null;
@@ -983,26 +1119,10 @@ router.get('/cocina/pedidos', checkPermission(COCINA_VIEW_PERMISSIONS), async (r
       }
 
       const grouped = new Map();
-      const now = Date.now();
 
-      for (const row of result.rows) {
+      for (const row of operationalRows) {
         if (!grouped.has(row.id_pedido)) {
           const estadoCode = resolveEstadoCode(row.estado_descripcion);
-          // AM: Base del atraso prioriza kds_started_at para evitar falsos retrasos al inicializar pedidos.
-          const kdsBaseRef =
-            row.kds_started_at || row.visible_en_cocina_at || row.fecha_hora_facturacion || row.fecha_hora_pedido;
-          const kdsBaseMs = kdsBaseRef ? new Date(kdsBaseRef).getTime() : null;
-          const minutosEnEspera = Number.isFinite(kdsBaseMs)
-            ? Math.max(0, Math.floor((now - kdsBaseMs) / 60000))
-            : null;
-          // AM: Usa minutos esperados del pedido; fallback seguro solo cuando no exista kds_expected_minutes.
-          const expectedMinutes =
-            parsePositiveInt(row.kds_expected_minutes) || parsePositiveInt(EXPIRY_WARN_MINUTES) || 20;
-          const estaProximoAExpirar =
-            minutosEnEspera !== null &&
-            Number.isInteger(expectedMinutes) &&
-            expectedMinutes > 0 &&
-            minutosEnEspera >= expectedMinutes;
 
           grouped.set(row.id_pedido, {
             id_pedido: Number(row.id_pedido),
@@ -1025,8 +1145,8 @@ router.get('/cocina/pedidos', checkPermission(COCINA_VIEW_PERMISSIONS), async (r
             kds_expected_minutes: parsePositiveInt(row.kds_expected_minutes),
             kds_expected_rule: row.kds_expected_rule || null,
             fecha_hora_facturacion: row.fecha_hora_facturacion || row.fecha_hora_pedido,
-            minutos_en_espera: minutosEnEspera,
-            esta_proximo_a_expirar: estaProximoAExpirar,
+            minutos_en_espera: null,
+            esta_proximo_a_expirar: false,
             total: roundMoney(row.total),
             inventario_alertas_total: Number(row.inventario_alertas_total ?? 0) || 0,
             inventario_alertas_pendientes: Number(row.inventario_alertas_pendientes ?? 0) || 0,
@@ -1038,28 +1158,33 @@ router.get('/cocina/pedidos', checkPermission(COCINA_VIEW_PERMISSIONS), async (r
         const pedido = grouped.get(row.id_pedido);
 
         if (row.id_detalle_pedido) {
-          const cantidad = parsePositiveInt(row.cantidad) || 0;
+          const cantidad = Number(row.cantidad);
+          const hasProduct = row.id_producto !== null && row.id_producto !== undefined;
+          const hasRecipe = row.id_receta !== null && row.id_receta !== undefined;
+          const isStandaloneExtra = !hasProduct
+            && !hasRecipe
+            && row.id_extra_independiente !== null
+            && row.id_extra_independiente !== undefined;
           pedido.items.push({
             id_detalle: Number(row.id_detalle_pedido),
-            tipo_item:
-              row.id_extra_independiente !== null
-                ? 'EXTRA'
-                : row.id_producto !== null
-                ? 'PRODUCTO'
-                : row.id_receta !== null
-                    ? 'RECETA'
+            tipo_item: hasProduct
+              ? 'PRODUCTO'
+              : hasRecipe
+                ? 'RECETA'
+                : isStandaloneExtra
+                  ? 'EXTRA'
                   : 'ITEM',
             id_producto: Number(row.id_producto ?? 0) || null,
             id_receta: Number(row.id_receta ?? 0) || null,
-            id_extra: Number(row.id_extra_independiente ?? 0) || null,
-            es_linea_extra_independiente: row.id_extra_independiente !== null,
-            instruccion_operativa: row.id_producto !== null
-              ? 'ENTREGAR_JUNTO_CON_EL_PEDIDO'
-              : 'PREPARAR',
-            nombre_item: row.nombre_item || 'Item de cocina',
+            id_extra: isStandaloneExtra
+              ? Number(row.id_extra_independiente ?? 0) || null
+              : null,
+            es_linea_extra_independiente: isStandaloneExtra,
+            instruccion_operativa: row.kds_instruccion_operativa,
+            nombre_item: row.nombre_item,
             cantidad,
             observacion: row.observacion || null,
-            configuracion_menu: row.configuracion_menu || null,
+            configuracion_menu: row.configuracion_menu ?? null,
             modificaciones: []
           });
           pedido.total_items += cantidad;
@@ -1082,7 +1207,8 @@ router.get('/cocina/pedidos', checkPermission(COCINA_VIEW_PERMISSIONS), async (r
             pedidoId: pedido.id_pedido,
             idSucursal: pedido.id_sucursal,
             activeEstadoIds: activeKdsEstadoIds,
-            operationalDate: pedido.fecha_operacion || pedido.fecha_hora_pedido || null
+            operationalDate: pedido.fecha_operacion || pedido.fecha_hora_pedido || null,
+            hasConfiguration: hasDetallePedidoConfiguracionMenu
           });
           if (!persistedTiming) continue;
           pedido.kds_started_at = persistedTiming.kds_started_at || pedido.kds_started_at;
@@ -1090,6 +1216,20 @@ router.get('/cocina/pedidos', checkPermission(COCINA_VIEW_PERMISSIONS), async (r
             parsePositiveInt(persistedTiming.kds_expected_minutes) || pedido.kds_expected_minutes;
           pedido.kds_expected_rule = persistedTiming.kds_expected_rule || pedido.kds_expected_rule;
         }
+      }
+
+      const metricsNowMs = Date.now();
+      for (const pedido of grouped.values()) {
+        const hasPersistedStartedAt = Boolean(pedido.kds_started_at);
+        const startedAt = hasPersistedStartedAt
+          ? pedido.kds_started_at
+          : pedido.visible_en_cocina_at || pedido.fecha_hora_facturacion || pedido.fecha_hora_pedido;
+        Object.assign(pedido, resolveKdsWaitingMetrics({
+          startedAt,
+          expectedMinutes: pedido.kds_expected_minutes,
+          startedAtIsLocal: !hasPersistedStartedAt,
+          nowMs: metricsNowMs
+        }));
       }
 
       const data = Array.from(grouped.values()).filter((pedido) => pedido.items.length > 0).map((pedido) => {

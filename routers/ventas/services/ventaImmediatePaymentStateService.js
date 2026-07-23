@@ -3,7 +3,6 @@ import {
 } from '../constants.js';
 import { resolveEstadoPedidoIdByCode } from './catalogLookupService.js';
 import {
-  applyPedidoInitialOperationalRouting,
   readPedidoOperationalRouting
 } from './pedidoOperationalRoutingService.js';
 
@@ -217,6 +216,4 @@ export const persistImmediateSalePaymentState = async ({
       [pedidoId, estadoPagoId, total, userId, sessionId, facturaId]
     );
   }
-
-  await applyPedidoInitialOperationalRouting({ client, idPedido: pedidoId });
 };

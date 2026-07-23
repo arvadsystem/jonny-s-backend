@@ -17,6 +17,7 @@ describe('ventas RPC execution flow', () => {
   it('venta V3 falla con rollback conceptual sin fallback ni idempotencia externa', async () => {
     const calls = { rpc: 0, rollback: 0, legacy: 0, v2: 0, v1: 0, inventory: 0, failure: 0 };
     const reservation = buildRpcManagedIdempotencyReservation('idem-1');
+    assert.equal(reservation.idempotencyKey, 'idem-1');
     const client = {
       async query() {
         calls.rpc += 1;

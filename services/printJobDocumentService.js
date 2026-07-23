@@ -22,12 +22,14 @@ export const HISTORICAL_V2_DOCUMENT_CANDIDATES = Object.freeze([
     name: 'current-historical-snapshot',
     renderVariant: 'current',
     normalizeStandaloneExtras: true,
+    allowHistoricalQuantityInference: false,
     useHistoricalFacturacionSnapshot: true
   }),
   Object.freeze({
     name: 'current-previous-loader',
     renderVariant: 'current',
     normalizeStandaloneExtras: true,
+    allowHistoricalQuantityInference: false,
     useHistoricalFacturacionSnapshot: false
   }),
   Object.freeze({
@@ -35,6 +37,7 @@ export const HISTORICAL_V2_DOCUMENT_CANDIDATES = Object.freeze([
     renderVariant: 'pre-routing',
     normalizeStandaloneExtras: true,
     applyOperationalRouting: false,
+    allowHistoricalQuantityInference: true,
     useHistoricalFacturacionSnapshot: true
   }),
   Object.freeze({
@@ -42,18 +45,21 @@ export const HISTORICAL_V2_DOCUMENT_CANDIDATES = Object.freeze([
     renderVariant: 'pre-routing',
     normalizeStandaloneExtras: true,
     applyOperationalRouting: false,
+    allowHistoricalQuantityInference: true,
     useHistoricalFacturacionSnapshot: false
   }),
   Object.freeze({
     name: 'legacy-historical-snapshot',
     renderVariant: 'legacy',
     normalizeStandaloneExtras: false,
+    allowHistoricalQuantityInference: true,
     useHistoricalFacturacionSnapshot: true
   }),
   Object.freeze({
     name: 'legacy-previous-loader',
     renderVariant: 'legacy',
     normalizeStandaloneExtras: false,
+    allowHistoricalQuantityInference: true,
     useHistoricalFacturacionSnapshot: false
   })
 ]);
@@ -450,11 +456,12 @@ export const getCanonicalPrintDocumentForAgent = async ({
   const loadSource = async ({
     normalizeStandaloneExtras,
     applyOperationalRouting = true,
+    allowHistoricalQuantityInference = false,
     useHistoricalFacturacionSnapshot
   }) => {
     const cacheKey = validation.idFactura
-      ? `factura:${normalizeStandaloneExtras}:${useHistoricalFacturacionSnapshot}`
-      : `pedido:${normalizeStandaloneExtras}:${applyOperationalRouting}`;
+      ? `factura:${normalizeStandaloneExtras}:${allowHistoricalQuantityInference}:${useHistoricalFacturacionSnapshot}`
+      : `pedido:${normalizeStandaloneExtras}:${applyOperationalRouting}:${allowHistoricalQuantityInference}`;
     if (sourceCache.has(cacheKey)) return { cacheKey, venta: await sourceCache.get(cacheKey) };
 
     const sourcePromise = (async () => {
@@ -466,6 +473,7 @@ export const getCanonicalPrintDocumentForAgent = async ({
             idSucursal: Number(agent.id_sucursal),
             includePrintAssets: job.tipo_documento === 'factura',
             normalizeStandaloneExtras,
+            allowHistoricalQuantityInference,
             useHistoricalFacturacionSnapshot
           })
           : await buildVentaDetailPayloadForScope({
@@ -475,6 +483,7 @@ export const getCanonicalPrintDocumentForAgent = async ({
             limitedToLast72Hours: false,
             idUsuarioDetalle: null,
             normalizeStandaloneExtras,
+            allowHistoricalQuantityInference,
             useHistoricalFacturacionSnapshot,
             queryRunner: db
           });
@@ -485,11 +494,13 @@ export const getCanonicalPrintDocumentForAgent = async ({
             idSucursal: Number(agent.id_sucursal),
             normalizeStandaloneExtras,
             applyOperationalRouting,
+            allowHistoricalQuantityInference,
             queryRunner: db
           })
           : await buildPedidoKitchenPrintPayload(db, validation.idPedido, {
             normalizeStandaloneExtras,
-            applyOperationalRouting
+            applyOperationalRouting,
+            allowHistoricalQuantityInference
           });
       }
       const venta = detailResult?.status === 200 ? detailResult.body : detailResult;

@@ -26,8 +26,17 @@ const buildClient = ({ lines, estadoPago = 'PAGADO_CONFIRMADO', canal = 'LOCAL',
       }
       if (/SELECT id_pedido_pago_control/.test(sql)) return { rowCount: 0, rows: [] };
       if (/INSERT INTO public\.pedidos_pago_control/.test(sql)) return { rowCount: 1, rows: [] };
-      if (/SELECT estado_pago, canal, tipo_entrega AS modalidad/.test(sql)) {
-        return { rowCount: 1, rows: [{ estado_pago: estadoPago, canal, modalidad }] };
+      if (/SELECT estado_pago,[\s\S]*tipo_entrega AS modalidad/.test(sql)) {
+        return {
+          rowCount: 1,
+          rows: [{
+            estado_pago: estadoPago,
+            canal,
+            modalidad,
+            origen_pedido: 'CAJA',
+            pago_confirmado_at: '2026-07-23T12:00:00-06:00'
+          }]
+        };
       }
       if (/FROM public\.detalle_pedido/.test(sql)) return { rowCount: lines.length, rows: lines };
       if (/SELECT p\.id_pedido,[\s\S]*FROM public\.pedidos p/.test(sql)) {
@@ -53,9 +62,16 @@ const buildClient = ({ lines, estadoPago = 'PAGADO_CONFIRMADO', canal = 'LOCAL',
   return { client, calls };
 };
 
-test('venta inmediata producto-only persiste pago y finaliza el pedido', async () => {
+test('venta inmediata persiste el pago sin ejecutar ruteo antes del commit', async () => {
   const fixture = buildClient({
-    lines: [{ id_detalle_pedido: 1, id_producto: 10, id_receta: null }]
+    lines: [{
+      id_detalle_pedido: 1,
+      tipo_item: 'PRODUCTO',
+      id_producto: 10,
+      id_receta: null,
+      cantidad: 1,
+      nombre_item: 'Refresco'
+    }]
   });
   await persistImmediateSalePaymentState({
     client: fixture.client,
@@ -70,15 +86,20 @@ test('venta inmediata producto-only persiste pago y finaliza el pedido', async (
   });
 
   const orderUpdates = fixture.calls.filter((call) => /UPDATE public\.pedidos/.test(call.sql));
-  assert.equal(orderUpdates.length, 2);
+  assert.equal(orderUpdates.length, 1);
   assert.match(orderUpdates[0].sql, /estado_pago = \$2/);
-  assert.doesNotMatch(orderUpdates[1].sql, /estado_pago/);
-  assert.deepEqual(orderUpdates[1].params, [218, 4]);
 });
 
 test('respuesta reconciliada expone ruteo persistido de receta', async () => {
   const fixture = buildClient({
-    lines: [{ id_detalle_pedido: 2, id_producto: null, id_receta: 20 }]
+    lines: [{
+      id_detalle_pedido: 2,
+      tipo_item: 'RECETA',
+      id_producto: null,
+      id_receta: 20,
+      cantidad: 1,
+      nombre_item: 'Hamburguesa'
+    }]
   });
   const response = await reconcileVentaResponseWithPersistedPedidoState({
     client: fixture.client,
@@ -88,6 +109,25 @@ test('respuesta reconciliada expone ruteo persistido de receta', async () => {
   assert.equal(response.requiere_cocina, true);
   assert.equal(response.requiere_revision, false);
   assert.equal(response.accion_operativa, 'ENVIAR_COCINA');
+});
+
+test('ventas enruta y reconcilia antes de guardar idempotencia y COMMIT', () => {
+  const source = fs.readFileSync(new URL('../routers/ventas.js', import.meta.url), 'utf8');
+  const pendingStart = source.indexOf("router.post('/ventas/pedidos-pendientes'");
+  const ventaStart = source.indexOf("router.post('/ventas'", pendingStart + 1);
+  const pendingRoute = source.slice(pendingStart, ventaStart);
+  const ventaRoute = source.slice(ventaStart);
+
+  assert.match(
+    pendingRoute,
+    /applyPedidoInitialOperationalRouting[\s\S]*reconcileVentaResponseWithPersistedPedidoState[\s\S]*saveVentasIdempotencySuccess[\s\S]*client\.query\('COMMIT'\)/
+  );
+  assert.match(
+    ventaRoute,
+    /applyPedidoInitialOperationalRouting[\s\S]*reconcileVentaResponseWithPersistedPedidoState[\s\S]*saveVentasIdempotencySuccess[\s\S]*client\.query\('COMMIT'\)/
+  );
+  assert.doesNotMatch(source, /applyPedidoPostCommitRoutingSafely|applyPedidoOperationalRoutingAfterCommit/);
+  assert.match(source, /!reservation\?\.reserved && !reservation\?\.rpcManaged/);
 });
 
 test('auditoria y cola de impresion no modifican el estado del pedido', () => {

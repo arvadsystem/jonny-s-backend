@@ -147,12 +147,19 @@ export const inferKitchenItemQuantity = (rawSubtotal, rawUnitPrice) => {
   return Number.isInteger(inferred) && inferred > 0 ? inferred : 1;
 };
 
-export const buildDirectSaleDetailItems = (rows) =>
+export const buildDirectSaleDetailItems = (
+  rows,
+  { allowHistoricalQuantityInference = false } = {}
+) =>
   rows.map((row) => ({
     ...row,
     tipo_item: String(row.tipo_item || 'PRODUCTO').toUpperCase(),
-    nombre_item: row.nombre_item || row.nombre_producto || 'Producto',
-    nombre_producto: row.nombre_producto || row.nombre_item || 'Producto',
+    nombre_item: row.nombre_item
+      || row.nombre_producto
+      || (allowHistoricalQuantityInference ? 'Producto' : null),
+    nombre_producto: row.nombre_producto
+      || row.nombre_item
+      || (allowHistoricalQuantityInference ? 'Producto' : null),
     cantidad: Number(row.cantidad ?? 0) || 0,
     precio_unitario: roundMoney(row.precio_unitario),
     sub_total: roundMoney(row.sub_total),
@@ -163,15 +170,23 @@ export const buildDirectSaleDetailItems = (rows) =>
     observacion: null
   }));
 
-export const buildKitchenSaleDetailItems = (rows) =>
+export const buildKitchenSaleDetailItems = (
+  rows,
+  { allowHistoricalQuantityInference = false } = {}
+) =>
   rows.map((row) => ({
     ...row,
-    nombre_item: row.nombre_item || 'Item de cocina',
-    nombre_producto: row.nombre_item || 'Item de cocina',
-    cantidad:
-      Number(row.cantidad ?? 0) > 0
-        ? Number(row.cantidad)
-        : inferKitchenItemQuantity(row.sub_total, row.precio_unitario),
+    nombre_item: row.nombre_item
+      || (allowHistoricalQuantityInference ? 'Item de cocina' : null),
+    nombre_producto: row.nombre_item
+      || (allowHistoricalQuantityInference ? 'Item de cocina' : null),
+    cantidad: allowHistoricalQuantityInference
+      ? (
+          Number(row.cantidad ?? 0) > 0
+            ? Number(row.cantidad)
+            : inferKitchenItemQuantity(row.sub_total, row.precio_unitario)
+        )
+      : row.cantidad,
     precio_unitario: roundMoney(row.precio_unitario),
     sub_total: roundMoney(row.sub_total),
     total_linea: roundMoney(row.total_linea),
@@ -731,16 +746,16 @@ export const fetchKitchenSaleDetailRows = async (client, idFactura) =>
               df.origen_snapshot->>'nombre_item',
               prod.nombre_producto,
               rec.nombre_receta,
-              'Item de cocina'
+              NULL
             ) AS nombre_item,
             COALESCE(
               dfo.origen_snapshot->>'nombre_item',
               df.origen_snapshot->>'nombre_item',
               prod.nombre_producto,
               rec.nombre_receta,
-              'Item de cocina'
+              NULL
             ) AS nombre_producto,
-            COALESCE(df.cantidad, 1) AS cantidad,
+            df.cantidad AS cantidad,
             COALESCE(
               CASE
                 WHEN dp.id_producto IS NOT NULL THEN prod.precio
@@ -765,6 +780,10 @@ export const fetchKitchenSaleDetailRows = async (client, idFactura) =>
             NULL::numeric AS exonerado_linea,
             dp.observacion,
             dp.configuracion_menu,
+            CASE
+              WHEN dp.configuracion_menu IS NULL THEN 'sql_null'
+              ELSE COALESCE(jsonb_typeof(dp.configuracion_menu), 'unknown')
+            END AS configuracion_menu_json_type,
             COALESCE(dfo.origen_snapshot, df.origen_snapshot) AS origen_snapshot
           FROM detalle_facturas df
           LEFT JOIN detalle_facturas_origen dfo
@@ -788,9 +807,9 @@ export const fetchDirectSaleDetailRows = async (client, idFactura) =>
           COALESCE(NULLIF(TRIM(dfo.tipo_item), ''), NULLIF(TRIM(df.tipo_item), ''), 'PRODUCTO') AS tipo_item,
           COALESCE(dfo.id_producto, df.id_producto) AS id_producto,
           COALESCE(dfo.id_receta, df.id_receta::int) AS id_receta,
-          COALESCE(dfo.origen_snapshot->>'nombre_item', df.origen_snapshot->>'nombre_item', p.nombre_producto, 'Producto') AS nombre_item,
-          COALESCE(dfo.origen_snapshot->>'nombre_item', df.origen_snapshot->>'nombre_item', p.nombre_producto, 'Producto') AS nombre_producto,
-          COALESCE(df.cantidad, 1) AS cantidad,
+          COALESCE(dfo.origen_snapshot->>'nombre_item', df.origen_snapshot->>'nombre_item', p.nombre_producto) AS nombre_item,
+          COALESCE(dfo.origen_snapshot->>'nombre_item', df.origen_snapshot->>'nombre_item', p.nombre_producto) AS nombre_producto,
+          df.cantidad AS cantidad,
           COALESCE(df.precio_unitario, p.precio, 0) AS precio_unitario,
           COALESCE(df.sub_total, 0) AS sub_total,
           COALESCE(df.sub_total, 0) AS subtotal_linea,

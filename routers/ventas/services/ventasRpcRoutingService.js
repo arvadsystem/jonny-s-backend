@@ -27,7 +27,8 @@ export const resolveVentaIdempotencyMode = ({
 
 export const buildRpcManagedIdempotencyReservation = (idempotencyKey = null) => ({
   enabled: Boolean(idempotencyKey),
-  rpcManaged: true
+  rpcManaged: true,
+  idempotencyKey
 });
 
 export const shouldUseExternalIdempotency = (reservation) =>
