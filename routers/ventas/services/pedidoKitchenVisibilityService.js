@@ -1,5 +1,5 @@
 import {
-  applyPedidoInitialOperationalRouting,
+  applyPedidoReplayOperationalRouting,
   readPedidoOperationalRouting,
   transitionPedidoToKitchenState
 } from './pedidoOperationalRoutingService.js';
@@ -10,7 +10,7 @@ const toPositiveInteger = (value) => {
 };
 
 export const initializePedidoPendingKitchen = async ({ client, idPedido }) => {
-  return applyPedidoInitialOperationalRouting({ client, idPedido });
+  return applyPedidoReplayOperationalRouting({ client, idPedido });
 };
 
 export const markPedidoVisibleInKitchen = async ({ client, idPedido }) => {

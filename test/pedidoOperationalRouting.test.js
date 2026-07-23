@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import {
   applyPedidoInitialOperationalRouting,
-  applyPedidoOperationalRoutingAfterCommit,
+  applyPedidoReplayOperationalRouting,
   classifyPedidoOperationalRouting
 } from '../routers/ventas/services/pedidoOperationalRoutingService.js';
 import { resolvePedidoConsumo } from '../services/pedidoConsumoResolver.js';
@@ -89,6 +89,22 @@ test('menu publico validado enruta por contenido', () => {
   });
   assert.equal(result.pendiente_validacion_publica, false);
   assert.equal(result.estado_operativo_inicial, 'EN_COCINA');
+});
+
+test('matriz puntual de origen conserva pago independiente del ruteo', () => {
+  for (const estadoPago of ['PAGADO_CONFIRMADO', 'PENDIENTE_PAGO']) {
+    const internal = classifyPedidoOperationalRouting([recipe()], {
+      origen_pedido: 'CAJA',
+      estado_pago: estadoPago
+    });
+    assert.equal(internal.estado_operativo_inicial, 'EN_COCINA');
+  }
+  const publicProduct = classifyPedidoOperationalRouting([product()], {
+    origen_pedido: 'MENU',
+    estado_pago: 'PAGADO_CONFIRMADO'
+  });
+  assert.equal(publicProduct.estado_operativo_inicial, 'PENDIENTE');
+  assert.equal(publicProduct.pendiente_validacion_publica, true);
 });
 
 test('5 pedido mixto requiere cocina y separa receta de producto', () => {
@@ -201,132 +217,227 @@ test('14 consulta KDS oculta pedidos solo-producto e incluye recordatorios en mi
   assert.match(routingSource, /ENTREGAR_JUNTO_CON_EL_PEDIDO/);
 });
 
-test('aplicacion inicial persiste el estado derivado sin tocar el estado financiero', async () => {
+const operationalStateRows = [
+  { id_estado_pedido: 1, descripcion: 'PENDIENTE' },
+  { id_estado_pedido: 2, descripcion: 'EN_COCINA' },
+  { id_estado_pedido: 3, descripcion: 'EN_PREPARACION' },
+  { id_estado_pedido: 4, descripcion: 'LISTO_PARA_ENTREGA' },
+  { id_estado_pedido: 5, descripcion: 'COMPLETADO' },
+  { id_estado_pedido: 6, descripcion: 'NO_ENTREGADO' }
+];
+
+const buildOperationalRoutingClient = ({
+  currentState = 'PENDIENTE',
+  lines = [recipe(20, 100)],
+  origin = 'CAJA',
+  estadoPago = 'PENDIENTE_PAGO',
+  pagoConfirmadoAt = null,
+  failAt = null
+} = {}) => {
   const calls = [];
-  const client = {
-    query: async (sql, params = []) => {
-      calls.push({ sql, params });
-      if (/SELECT estado_pago,[\s\S]*tipo_entrega AS modalidad/.test(sql)) {
-        return {
-          rowCount: 1,
-          rows: [{
-            estado_pago: 'PENDIENTE_PAGO',
-            canal: 'POS',
-            modalidad: 'PARA_LLEVAR',
-            origen_pedido: 'CAJA',
-            pago_confirmado_at: null
-          }]
-        };
-      }
-      if (/FROM public\.detalle_pedido/.test(sql)) {
-        return { rowCount: 1, rows: [product(10, 100)] };
-      }
-      if (/SELECT id_estado_pedido, descripcion FROM estados_pedido/.test(sql)) {
-        return { rowCount: 2, rows: [
-          { id_estado_pedido: 1, descripcion: 'PENDIENTE' },
-          { id_estado_pedido: 3, descripcion: 'LISTO_PARA_ENTREGA' }
-        ] };
-      }
-      if (/UPDATE public\.pedidos/.test(sql)) {
-        return { rowCount: 1, rows: [{ id_pedido: 5, id_estado_pedido: 3, visible_en_cocina_at: null }] };
-      }
-      throw new Error(`SQL inesperado: ${sql}`);
-    }
-  };
-
-  const result = await applyPedidoInitialOperationalRouting({ client, idPedido: 5 });
-  assert.equal(result.estado_pedido, 'LISTO_PARA_ENTREGA');
-  const update = calls.find((call) => /UPDATE public\.pedidos/.test(call.sql));
-  assert.doesNotMatch(update.sql, /estado_pago/);
-  assert.deepEqual(update.params, [5, 3]);
-});
-
-test('aplicacion inicial no cambia estado cuando la cantidad operativa es invalida', async () => {
-  const calls = [];
-  const client = {
-    query: async (sql) => {
-      calls.push(sql);
-      if (/SELECT estado_pago,[\s\S]*tipo_entrega AS modalidad/.test(sql)) {
-        return {
-          rowCount: 1,
-          rows: [{
-            estado_pago: 'PENDIENTE_PAGO',
-            canal: 'POS',
-            modalidad: 'PARA_LLEVAR',
-            origen_pedido: 'CAJA',
-            pago_confirmado_at: null
-          }]
-        };
-      }
-      if (/FROM public\.detalle_pedido/.test(sql)) {
-        return {
-          rowCount: 1,
-          rows: [{ ...recipe(20, 100), cantidad: 0 }]
-        };
-      }
-      throw new Error(`No se esperaba ejecutar SQL adicional: ${sql}`);
-    }
-  };
-
-  await assert.rejects(
-    () => applyPedidoInitialOperationalRouting({ client, idPedido: 5 }),
-    (error) => error.status === 409
-      && error.code === 'VENTAS_PEDIDO_REQUIERE_REVISION'
-      && error.lineas_invalidas[0].motivo === 'CANTIDAD_INVALIDA'
-  );
-  assert.equal(calls.some((sql) => /UPDATE public\.pedidos/.test(sql)), false);
-});
-
-test('ruteo interno post-commit bloquea y envia receta a EN_COCINA de forma idempotente', async () => {
-  const calls = [];
+  let persistedState = currentState;
+  let visibleAt = currentState === 'PENDIENTE' ? null : '2026-07-23T12:00:00-06:00';
   const client = {
     query: async (sql, params = []) => {
       calls.push({ sql, params });
       if (sql === 'BEGIN' || sql === 'COMMIT' || sql === 'ROLLBACK') {
+        if (failAt === 'before_commit' && sql === 'COMMIT') throw new Error('COMMIT_FAILED');
         return { rowCount: null, rows: [] };
       }
-      if (/SELECT id_pedido[\s\S]*FOR UPDATE/.test(sql)) {
-        return { rowCount: 1, rows: [{ id_pedido: 5 }] };
-      }
-      if (/SELECT estado_pago,[\s\S]*tipo_entrega AS modalidad/.test(sql)) {
+      if (/FROM public\.pedidos p[\s\S]*FOR UPDATE/.test(sql)) {
+        const row = operationalStateRows.find((entry) => entry.descripcion === persistedState);
         return {
           rowCount: 1,
           rows: [{
-            estado_pago: 'PENDIENTE_PAGO',
+            id_estado_pedido: row?.id_estado_pedido || 99,
+            estado_pedido: persistedState,
+            visible_en_cocina_at: visibleAt
+          }]
+        };
+      }
+      if (/SELECT estado_pago,[\s\S]*FROM public\.pedidos/.test(sql)) {
+        return {
+          rowCount: 1,
+          rows: [{
+            estado_pago: estadoPago,
             canal: 'LOCAL',
             modalidad: 'CONSUMO_LOCAL',
-            origen_pedido: 'CAJA',
-            pago_confirmado_at: null
+            origen_pedido: origin,
+            pago_confirmado_at: pagoConfirmadoAt
           }]
         };
       }
       if (/FROM public\.detalle_pedido/.test(sql)) {
-        return { rowCount: 1, rows: [recipe(20, 100)] };
+        if (failAt === 'detail') throw new Error('DETAIL_READ_FAILED');
+        return { rowCount: lines.length, rows: lines };
       }
       if (/SELECT id_estado_pedido, descripcion FROM estados_pedido/.test(sql)) {
-        return { rowCount: 1, rows: [{ id_estado_pedido: 2, descripcion: 'EN_COCINA' }] };
+        if (failAt === 'catalog') throw new Error('CATALOG_READ_FAILED');
+        return { rowCount: operationalStateRows.length, rows: operationalStateRows };
       }
       if (/UPDATE public\.pedidos/.test(sql)) {
+        if (failAt === 'update') throw new Error('STATE_UPDATE_FAILED');
+        const target = operationalStateRows.find((entry) => entry.id_estado_pedido === Number(params[1]));
+        persistedState = target?.descripcion || persistedState;
+        if (persistedState === 'EN_COCINA' && !visibleAt) {
+          visibleAt = '2026-07-23T12:00:00-06:00';
+        }
         return {
           rowCount: 1,
           rows: [{
             id_pedido: 5,
-            id_estado_pedido: 2,
-            visible_en_cocina_at: '2026-07-23T12:00:00-06:00'
+            id_estado_pedido: target?.id_estado_pedido,
+            visible_en_cocina_at: visibleAt
           }]
         };
       }
       throw new Error(`SQL inesperado: ${sql}`);
     }
   };
+  return {
+    client,
+    calls,
+    getPersistedState: () => persistedState
+  };
+};
 
-  const result = await applyPedidoOperationalRoutingAfterCommit({ client, idPedido: 5 });
+test('ruteo inicial solo avanza desde PENDIENTE y no toca estado financiero', async () => {
+  const fixture = buildOperationalRoutingClient();
+  const result = await applyPedidoInitialOperationalRouting({ client: fixture.client, idPedido: 5 });
   assert.equal(result.estado_pedido, 'EN_COCINA');
-  assert.deepEqual(calls.filter((call) => call.sql === 'BEGIN' || call.sql === 'COMMIT').map((call) => call.sql), [
-    'BEGIN',
-    'COMMIT'
-  ]);
-  const update = calls.find((call) => /UPDATE public\.pedidos/.test(call.sql));
+  assert.equal(result.transicion_operativa_aplicada, true);
+  const update = fixture.calls.find((call) => /UPDATE public\.pedidos/.test(call.sql));
+  assert.doesNotMatch(update.sql, /estado_pago/);
   assert.match(update.sql, /visible_en_cocina_at = COALESCE/);
-  assert.deepEqual(update.params, [5, 2]);
+});
+
+test('linea invalida permanece en PENDIENTE como no-op de revision', async () => {
+  const fixture = buildOperationalRoutingClient({
+    lines: [{ ...recipe(20, 100), cantidad: 0 }]
+  });
+  const result = await applyPedidoInitialOperationalRouting({ client: fixture.client, idPedido: 5 });
+  assert.equal(result.estado_pedido, 'PENDIENTE');
+  assert.equal(result.requiere_revision, true);
+  assert.equal(result.ruteo_inicial_noop, true);
+  assert.equal(fixture.calls.some((call) => /UPDATE public\.pedidos/.test(call.sql)), false);
+});
+
+test('replays de EN_COCINA y estados avanzados nunca regresan el pedido', async () => {
+  for (const currentState of ['EN_COCINA', 'EN_PREPARACION', 'LISTO_PARA_ENTREGA', 'COMPLETADO', 'NO_ENTREGADO']) {
+    const fixture = buildOperationalRoutingClient({ currentState });
+    const result = await applyPedidoInitialOperationalRouting({ client: fixture.client, idPedido: 5 });
+    assert.equal(result.estado_pedido, currentState);
+    assert.equal(result.ruteo_inicial_noop, true);
+    assert.equal(fixture.calls.some((call) => /UPDATE public\.pedidos/.test(call.sql)), false);
+  }
+});
+
+test('estado actual desconocido falla cerrado sin UPDATE', async () => {
+  const fixture = buildOperationalRoutingClient({ currentState: 'ESTADO_NUEVO' });
+  await assert.rejects(
+    () => applyPedidoInitialOperationalRouting({ client: fixture.client, idPedido: 5 }),
+    (error) => error.code === 'VENTAS_PEDIDO_ESTADO_OPERATIVO_DESCONOCIDO'
+  );
+  assert.equal(fixture.calls.some((call) => /UPDATE public\.pedidos/.test(call.sql)), false);
+});
+
+test('fallos de catalogo, detalle y UPDATE se propagan sin exito silencioso', async () => {
+  for (const failAt of ['catalog', 'detail', 'update']) {
+    const fixture = buildOperationalRoutingClient({ failAt });
+    await assert.rejects(
+      () => applyPedidoInitialOperationalRouting({ client: fixture.client, idPedido: 5 }),
+      new RegExp(failAt === 'catalog' ? 'CATALOG' : failAt === 'detail' ? 'DETAIL' : 'STATE_UPDATE')
+    );
+  }
+});
+
+test('fallo antes de COMMIT ejecuta ROLLBACK y se propaga al caller', async () => {
+  const fixture = buildOperationalRoutingClient({ failAt: 'before_commit' });
+  await assert.rejects(
+    () => applyPedidoReplayOperationalRouting({ client: fixture.client, idPedido: 5 }),
+    /COMMIT_FAILED/
+  );
+  assert.equal(fixture.calls.some((call) => call.sql === 'ROLLBACK'), true);
+});
+
+test('dos replays concurrentes se serializan y producen un UPDATE y un no-op', async () => {
+  let persistedState = 'PENDIENTE';
+  let visibleAt = null;
+  let updateCount = 0;
+  let lockCount = 0;
+  let transactionTail = Promise.resolve();
+
+  const createConcurrentClient = () => {
+    let releaseTransaction = null;
+    return {
+      query: async (sql, params = []) => {
+        if (sql === 'BEGIN') {
+          const previousTransaction = transactionTail;
+          transactionTail = new Promise((resolve) => {
+            releaseTransaction = resolve;
+          });
+          await previousTransaction;
+          return { rowCount: null, rows: [] };
+        }
+        if (sql === 'COMMIT' || sql === 'ROLLBACK') {
+          releaseTransaction?.();
+          return { rowCount: null, rows: [] };
+        }
+        if (/FROM public\.pedidos p[\s\S]*FOR UPDATE/.test(sql)) {
+          lockCount += 1;
+          const row = operationalStateRows.find((entry) => entry.descripcion === persistedState);
+          return {
+            rowCount: 1,
+            rows: [{
+              id_estado_pedido: row.id_estado_pedido,
+              estado_pedido: persistedState,
+              visible_en_cocina_at: visibleAt
+            }]
+          };
+        }
+        if (/SELECT estado_pago,[\s\S]*FROM public\.pedidos/.test(sql)) {
+          return {
+            rowCount: 1,
+            rows: [{
+              estado_pago: 'PENDIENTE_PAGO',
+              canal: 'LOCAL',
+              modalidad: 'CONSUMO_LOCAL',
+              origen_pedido: 'CAJA',
+              pago_confirmado_at: null
+            }]
+          };
+        }
+        if (/FROM public\.detalle_pedido/.test(sql)) {
+          return { rowCount: 1, rows: [recipe(20, 100)] };
+        }
+        if (/SELECT id_estado_pedido, descripcion FROM estados_pedido/.test(sql)) {
+          return { rowCount: operationalStateRows.length, rows: operationalStateRows };
+        }
+        if (/UPDATE public\.pedidos/.test(sql)) {
+          updateCount += 1;
+          persistedState = 'EN_COCINA';
+          visibleAt ||= '2026-07-23T12:00:00-06:00';
+          return {
+            rowCount: 1,
+            rows: [{
+              id_pedido: 5,
+              id_estado_pedido: Number(params[1]),
+              visible_en_cocina_at: visibleAt
+            }]
+          };
+        }
+        throw new Error(`SQL inesperado: ${sql}`);
+      }
+    };
+  };
+
+  const results = await Promise.all([
+    applyPedidoReplayOperationalRouting({ client: createConcurrentClient(), idPedido: 5 }),
+    applyPedidoReplayOperationalRouting({ client: createConcurrentClient(), idPedido: 5 })
+  ]);
+  assert.equal(results.filter((result) => result.transicion_operativa_aplicada).length, 1);
+  assert.equal(results.filter((result) => result.ruteo_inicial_noop).length, 1);
+  assert.equal(persistedState, 'EN_COCINA');
+  assert.equal(updateCount, 1);
+  assert.equal(lockCount, 2);
 });

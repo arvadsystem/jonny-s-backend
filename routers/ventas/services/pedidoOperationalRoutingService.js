@@ -15,6 +15,24 @@ export const PEDIDO_ORIGIN = Object.freeze({
   UNKNOWN: 'UNKNOWN'
 });
 
+const PEDIDO_INITIAL_ROUTING_CURRENT_STATE = Object.freeze({
+  PENDING: 'PENDIENTE',
+  KITCHEN: 'EN_COCINA'
+});
+
+const PEDIDO_INITIAL_ROUTING_ADVANCED_STATES = new Set([
+  'EN_PREPARACION',
+  'LISTO_PARA_ENTREGA',
+  'COMPLETADO',
+  'NO_ENTREGADO'
+]);
+
+const PEDIDO_INITIAL_ROUTING_ALLOWED_TARGETS = new Set([
+  'EN_COCINA',
+  'LISTO_PARA_ENTREGA',
+  'COMPLETADO'
+]);
+
 const toPositiveInteger = (value) => {
   const parsed = Number(value);
   return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : null;
@@ -479,21 +497,82 @@ export const transitionPedidoToKitchenState = async ({
   return result.rows[0];
 };
 
+const buildInitialRoutingNoopResult = ({ routing, currentState }) => ({
+  ...routing,
+  id_estado_pedido: Number(currentState.id_estado_pedido),
+  estado_pedido: currentState.estado_pedido,
+  visible_en_cocina_at: currentState.visible_en_cocina_at ?? null,
+  transicion_operativa_aplicada: false,
+  ruteo_inicial_noop: true
+});
+
 export const applyPedidoInitialOperationalRouting = async ({ client, idPedido }) => {
   const pedidoId = toPositiveInteger(idPedido);
+  const currentStateResult = await client.query(
+    `SELECT
+       p.id_estado_pedido,
+       ep.descripcion AS estado_pedido,
+       p.visible_en_cocina_at
+     FROM public.pedidos p
+     LEFT JOIN public.estados_pedido ep
+       ON ep.id_estado_pedido = p.id_estado_pedido
+     WHERE p.id_pedido = $1
+     FOR UPDATE OF p`,
+    [pedidoId]
+  );
+  if (currentStateResult.rowCount !== 1) {
+    throw Object.assign(new Error('Pedido no encontrado para aplicar su ruteo operativo.'), {
+      code: 'VENTAS_PEDIDO_NO_ENCONTRADO'
+    });
+  }
+
+  const currentStateRow = currentStateResult.rows[0];
+  const currentStateCode = normalizeCode(currentStateRow.estado_pedido);
+  if (
+    !toPositiveInteger(currentStateRow.id_estado_pedido)
+    || !currentStateCode
+    || (
+      currentStateCode !== PEDIDO_INITIAL_ROUTING_CURRENT_STATE.PENDING
+      && currentStateCode !== PEDIDO_INITIAL_ROUTING_CURRENT_STATE.KITCHEN
+      && !PEDIDO_INITIAL_ROUTING_ADVANCED_STATES.has(currentStateCode)
+    )
+  ) {
+    throw Object.assign(new Error('El estado actual del pedido no permite aplicar el ruteo inicial.'), {
+      code: 'VENTAS_PEDIDO_ESTADO_OPERATIVO_DESCONOCIDO',
+      estado_actual: currentStateCode || null
+    });
+  }
+
   const routing = await readPedidoOperationalRouting({ client, idPedido: pedidoId });
-  if (routing.requiere_revision) {
-    throw Object.assign(
-      new Error('El pedido contiene lineas invalidas y no puede cambiar de estado operativo.'),
-      {
-        status: 409,
-        httpStatus: 409,
-        code: 'VENTAS_PEDIDO_REQUIERE_REVISION',
-        publicMessage: 'El pedido contiene lineas invalidas y requiere revision.',
-        requiere_revision: true,
-        lineas_invalidas: routing.lineas_invalidas
-      }
-    );
+  const currentState = {
+    id_estado_pedido: Number(currentStateRow.id_estado_pedido),
+    estado_pedido: currentStateCode,
+    visible_en_cocina_at: currentStateRow.visible_en_cocina_at ?? null
+  };
+
+  if (
+    currentStateCode === PEDIDO_INITIAL_ROUTING_CURRENT_STATE.KITCHEN
+    || PEDIDO_INITIAL_ROUTING_ADVANCED_STATES.has(currentStateCode)
+    || routing.requiere_revision
+    || routing.estado_operativo_inicial === PEDIDO_INITIAL_ROUTING_CURRENT_STATE.PENDING
+  ) {
+    return buildInitialRoutingNoopResult({ routing, currentState });
+  }
+
+  if (currentStateCode !== PEDIDO_INITIAL_ROUTING_CURRENT_STATE.PENDING) {
+    throw Object.assign(new Error('El pedido no esta en estado PENDIENTE para aplicar el ruteo inicial.'), {
+      code: 'VENTAS_PEDIDO_RUTEO_TRANSICION_NO_PERMITIDA',
+      estado_actual: currentStateCode,
+      estado_derivado: routing.estado_operativo_inicial
+    });
+  }
+
+  if (!PEDIDO_INITIAL_ROUTING_ALLOWED_TARGETS.has(routing.estado_operativo_inicial)) {
+    throw Object.assign(new Error('El estado derivado no es valido para el ruteo inicial.'), {
+      code: 'VENTAS_PEDIDO_ESTADO_OPERATIVO_NO_PERMITIDO',
+      estado_actual: currentStateCode,
+      estado_derivado: routing.estado_operativo_inicial
+    });
   }
 
   if (routing.estado_operativo_inicial === 'EN_COCINA') {
@@ -501,7 +580,9 @@ export const applyPedidoInitialOperationalRouting = async ({ client, idPedido })
     return {
       ...routing,
       ...transitioned,
-      estado_pedido: 'EN_COCINA'
+      estado_pedido: 'EN_COCINA',
+      transicion_operativa_aplicada: true,
+      ruteo_inicial_noop: false
     };
   }
 
@@ -531,33 +612,22 @@ export const applyPedidoInitialOperationalRouting = async ({ client, idPedido })
     ...routing,
     id_estado_pedido: Number(targetStateId),
     estado_pedido: routing.estado_operativo_inicial,
-    visible_en_cocina_at: null
+    visible_en_cocina_at: null,
+    transicion_operativa_aplicada: true,
+    ruteo_inicial_noop: false
   };
 };
 
-export const applyPedidoOperationalRoutingAfterCommit = async ({ client, idPedido }) => {
+export const applyPedidoReplayOperationalRouting = async ({ client, idPedido }) => {
   const pedidoId = toPositiveInteger(idPedido);
   if (!pedidoId || typeof client?.query !== 'function') {
-    throw Object.assign(new Error('No se pudo aplicar el ruteo post-commit del pedido.'), {
+    throw Object.assign(new Error('No se pudo aplicar el ruteo de replay del pedido.'), {
       code: 'VENTAS_PEDIDO_RUTEO_CONTEXTO_INVALIDO'
     });
   }
 
   await client.query('BEGIN');
   try {
-    const lockResult = await client.query(
-      `SELECT id_pedido
-       FROM public.pedidos
-       WHERE id_pedido = $1
-       FOR UPDATE`,
-      [pedidoId]
-    );
-    if (lockResult.rowCount !== 1) {
-      throw Object.assign(new Error('Pedido no encontrado para aplicar su ruteo post-commit.'), {
-        code: 'VENTAS_PEDIDO_NO_ENCONTRADO'
-      });
-    }
-
     const routing = await applyPedidoInitialOperationalRouting({ client, idPedido: pedidoId });
     await client.query('COMMIT');
     return routing;

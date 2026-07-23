@@ -111,6 +111,25 @@ test('respuesta reconciliada expone ruteo persistido de receta', async () => {
   assert.equal(response.accion_operativa, 'ENVIAR_COCINA');
 });
 
+test('ventas enruta y reconcilia antes de guardar idempotencia y COMMIT', () => {
+  const source = fs.readFileSync(new URL('../routers/ventas.js', import.meta.url), 'utf8');
+  const pendingStart = source.indexOf("router.post('/ventas/pedidos-pendientes'");
+  const ventaStart = source.indexOf("router.post('/ventas'", pendingStart + 1);
+  const pendingRoute = source.slice(pendingStart, ventaStart);
+  const ventaRoute = source.slice(ventaStart);
+
+  assert.match(
+    pendingRoute,
+    /applyPedidoInitialOperationalRouting[\s\S]*reconcileVentaResponseWithPersistedPedidoState[\s\S]*saveVentasIdempotencySuccess[\s\S]*client\.query\('COMMIT'\)/
+  );
+  assert.match(
+    ventaRoute,
+    /applyPedidoInitialOperationalRouting[\s\S]*reconcileVentaResponseWithPersistedPedidoState[\s\S]*saveVentasIdempotencySuccess[\s\S]*client\.query\('COMMIT'\)/
+  );
+  assert.doesNotMatch(source, /applyPedidoPostCommitRoutingSafely|applyPedidoOperationalRoutingAfterCommit/);
+  assert.match(source, /!reservation\?\.reserved && !reservation\?\.rpcManaged/);
+});
+
 test('auditoria y cola de impresion no modifican el estado del pedido', () => {
   const auditSource = fs.readFileSync(new URL('../routers/ventas/handlers/ventasPrintHandlers.js', import.meta.url), 'utf8');
   const queueSource = fs.readFileSync(new URL('../routers/printing.js', import.meta.url), 'utf8');
