@@ -25,6 +25,9 @@ const normalizeCode = (value) => String(value || '')
   .toUpperCase()
   .replace(/[\s-]+/g, '_');
 
+export const DELIVERY_PREFERENCE_TRUE_VALUES = Object.freeze(['true', '1', 'si']);
+export const DELIVERY_PREFERENCE_FALSE_VALUES = Object.freeze(['false', '0', 'no']);
+
 const parseObject = (value) => {
   if (value && typeof value === 'object' && !Array.isArray(value)) {
     return { valid: true, value };
@@ -81,10 +84,10 @@ const readDeliveryPreference = (line) => {
       .toLowerCase()
       .normalize('NFD')
       .replace(/[\u0300-\u036f]/g, '');
-    if (['true', '1', 'si'].includes(normalized)) {
+    if (DELIVERY_PREFERENCE_TRUE_VALUES.includes(normalized)) {
       return { presente: true, valida: true, valor: true };
     }
-    if (['false', '0', 'no'].includes(normalized)) {
+    if (DELIVERY_PREFERENCE_FALSE_VALUES.includes(normalized)) {
       return { presente: true, valida: true, valor: false };
     }
   }

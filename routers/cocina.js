@@ -15,9 +15,11 @@ import {
 } from '../services/salsasPedidoSnapshotService.js';
 import { readPedidoOperationalRouting } from './ventas/services/pedidoOperationalRoutingService.js';
 import {
-  buildInvalidKitchenLinePredicate,
+  buildKitchenOrderEligibilityPredicate,
   buildKitchenPreparationPredicate,
-  buildKitchenProductPredicate
+  buildKitchenProductPredicate,
+  buildValidStandaloneKitchenExtraRowPredicate,
+  routeKdsOperationalRows
 } from './ventas/services/kitchenPrintRoutingService.js';
 
 const router = express.Router();
@@ -741,6 +743,11 @@ router.get('/cocina/pedidos', checkPermission(COCINA_VIEW_PERMISSIONS), async (r
         return res.status(400).json({ error: true, message: 'estado inválido para el tablero KDS.' });
       }
 
+      const hasDetallePedidoConfiguracionMenu = await hasColumn(
+        client,
+        'detalle_pedido',
+        'configuracion_menu'
+      );
       const filters = [];
       const params = [];
 
@@ -760,24 +767,9 @@ router.get('/cocina/pedidos', checkPermission(COCINA_VIEW_PERMISSIONS), async (r
       }
 
       filters.push(`p.id_estado_pedido = ANY(${pushParam(activeEstadoIds)}::int[])`);
-      filters.push(`
-        EXISTS (
-          SELECT 1
-          FROM public.detalle_pedido dp_route
-          WHERE dp_route.id_pedido = p.id_pedido
-            AND COALESCE(dp_route.estado, true) = true
-            AND ${buildKitchenPreparationPredicate('dp_route')}
-        )
-      `);
-      filters.push(`
-        NOT EXISTS (
-          SELECT 1
-          FROM public.detalle_pedido dp_invalid
-          WHERE dp_invalid.id_pedido = p.id_pedido
-            AND COALESCE(dp_invalid.estado, true) = true
-            AND ${buildInvalidKitchenLinePredicate('dp_invalid')}
-        )
-      `);
+      filters.push(buildKitchenOrderEligibilityPredicate('p', {
+        hasConfiguration: hasDetallePedidoConfiguracionMenu
+      }));
 
       if (requestedSucursalId) {
         filters.push(`p.id_sucursal = ${pushParam(requestedSucursalId)}`);
@@ -816,7 +808,6 @@ router.get('/cocina/pedidos', checkPermission(COCINA_VIEW_PERMISSIONS), async (r
       }
 
       const whereClause = filters.length ? `WHERE ${filters.join(' AND ')}` : '';
-      const hasDetallePedidoConfiguracionMenu = await hasColumn(client, 'detalle_pedido', 'configuracion_menu');
       const hasKdsStartedAt = await hasColumn(client, 'pedidos', 'kds_started_at');
       const hasKdsExpectedMinutes = await hasColumn(client, 'pedidos', 'kds_expected_minutes');
       const hasKdsExpectedRule = await hasColumn(client, 'pedidos', 'kds_expected_rule');
@@ -868,7 +859,7 @@ router.get('/cocina/pedidos', checkPermission(COCINA_VIEW_PERMISSIONS), async (r
             END AS cantidad,
             dp.observacion,
             ${hasDetallePedidoConfiguracionMenu ? 'dp.configuracion_menu,' : 'NULL::jsonb AS configuracion_menu,'}
-            COALESCE(prod.nombre_producto, rec.nombre_receta, standalone_extra.nombre_extra_snapshot, 'Item de cocina') AS nombre_item,
+            COALESCE(prod.nombre_producto, rec.nombre_receta, standalone_extra.nombre_extra_snapshot) AS nombre_item,
             COALESCE(dp.total_pedido, COALESCE(dp.sub_total_pedido, 0)) AS total_linea
           FROM pedidos p
           LEFT JOIN estados_pedido ep ON ep.id_estado_pedido = p.id_estado_pedido
@@ -919,9 +910,7 @@ router.get('/cocina/pedidos', checkPermission(COCINA_VIEW_PERMISSIONS), async (r
             FROM public.detalle_pedido_extras dpe
             WHERE dpe.id_detalle_pedido = dp.id_detalle_pedido
               AND COALESCE(dpe.estado, true) = true
-              AND dpe.id_extra IS NOT NULL
-              AND NULLIF(TRIM(dpe.nombre_extra_snapshot), '') IS NOT NULL
-              AND COALESCE(dpe.cantidad, 0) > 0
+              AND ${buildValidStandaloneKitchenExtraRowPredicate('dpe')}
             ORDER BY dpe.id_detalle_pedido_extra
             LIMIT 1
           ) standalone_extra ON true
@@ -949,9 +938,10 @@ router.get('/cocina/pedidos', checkPermission(COCINA_VIEW_PERMISSIONS), async (r
         params
       );
 
+      const operationalRows = routeKdsOperationalRows(result.rows);
       const salsaIds = [
         ...new Set(
-          result.rows.flatMap((row) => {
+          operationalRows.flatMap((row) => {
             const config = row.configuracion_menu && typeof row.configuracion_menu === 'object'
               ? row.configuracion_menu
               : null;
@@ -985,7 +975,7 @@ router.get('/cocina/pedidos', checkPermission(COCINA_VIEW_PERMISSIONS), async (r
       const grouped = new Map();
       const now = Date.now();
 
-      for (const row of result.rows) {
+      for (const row of operationalRows) {
         if (!grouped.has(row.id_pedido)) {
           const estadoCode = resolveEstadoCode(row.estado_descripcion);
           // AM: Base del atraso prioriza kds_started_at para evitar falsos retrasos al inicializar pedidos.
@@ -1038,7 +1028,7 @@ router.get('/cocina/pedidos', checkPermission(COCINA_VIEW_PERMISSIONS), async (r
         const pedido = grouped.get(row.id_pedido);
 
         if (row.id_detalle_pedido) {
-          const cantidad = parsePositiveInt(row.cantidad) || 0;
+          const cantidad = Number(row.cantidad);
           pedido.items.push({
             id_detalle: Number(row.id_detalle_pedido),
             tipo_item:
@@ -1053,13 +1043,11 @@ router.get('/cocina/pedidos', checkPermission(COCINA_VIEW_PERMISSIONS), async (r
             id_receta: Number(row.id_receta ?? 0) || null,
             id_extra: Number(row.id_extra_independiente ?? 0) || null,
             es_linea_extra_independiente: row.id_extra_independiente !== null,
-            instruccion_operativa: row.id_producto !== null
-              ? 'ENTREGAR_JUNTO_CON_EL_PEDIDO'
-              : 'PREPARAR',
-            nombre_item: row.nombre_item || 'Item de cocina',
+            instruccion_operativa: row.kds_instruccion_operativa,
+            nombre_item: row.nombre_item,
             cantidad,
             observacion: row.observacion || null,
-            configuracion_menu: row.configuracion_menu || null,
+            configuracion_menu: row.configuracion_menu ?? null,
             modificaciones: []
           });
           pedido.total_items += cantidad;

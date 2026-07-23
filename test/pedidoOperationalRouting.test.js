@@ -158,12 +158,14 @@ test('14 consulta KDS oculta pedidos solo-producto e incluye recordatorios en mi
     new URL('../routers/ventas/services/kitchenPrintRoutingService.js', import.meta.url),
     'utf8'
   );
-  assert.match(source, /EXISTS \([\s\S]*?buildKitchenPreparationPredicate\('dp_route'\)/);
+  assert.match(source, /buildKitchenOrderEligibilityPredicate\('p'/);
   assert.match(source, /buildKitchenProductPredicate\('dp'/);
-  assert.match(routingSource, /buildKitchenPreparationPredicate[\s\S]*?id_receta IS NOT NULL[\s\S]*?buildValidStandaloneKitchenExtraPredicate/);
-  assert.match(routingSource, /buildKitchenProductPredicate[\s\S]*?entregar_con_pedido[\s\S]*?NOT IN \('false', '0', 'no'\)/);
-  assert.match(source, /row\.id_producto !== null[\s\S]*?ENTREGAR_JUNTO_CON_EL_PEDIDO/);
-  assert.match(source, /ENTREGAR_JUNTO_CON_EL_PEDIDO/);
+  assert.match(routingSource, /buildKitchenOrderEligibilityPredicate[\s\S]*?EXISTS \([\s\S]*?NOT EXISTS \(/);
+  assert.match(routingSource, /buildKitchenPreparationPredicate[\s\S]*?buildValidKitchenRecipePredicate[\s\S]*?buildValidStandaloneKitchenExtraPredicate/);
+  assert.match(routingSource, /buildKitchenProductPredicate[\s\S]*?buildProductDeliverWithOrderPredicate/);
+  assert.doesNotMatch(routingSource, /NOT IN \('false', '0', 'no'\)/);
+  assert.match(source, /row\.kds_instruccion_operativa/);
+  assert.match(routingSource, /ENTREGAR_JUNTO_CON_EL_PEDIDO/);
 });
 
 test('aplicacion inicial persiste el estado derivado sin tocar el estado financiero', async () => {

@@ -234,7 +234,13 @@ for (const payment of [
         subtotal_base: 40,
         subtotal_extras: 40,
         total_linea: 40,
-        extras_snapshot: [{ nombre: 'Extra independiente', cantidad: 4, precio_unitario: 10, subtotal: 40 }]
+        extras_snapshot: [{
+          id_extra: 31,
+          nombre: 'Extra independiente',
+          cantidad: 4,
+          precio_unitario: 10,
+          subtotal: 40
+        }]
       }
     ];
     const cobros = payment.paid > 0
@@ -273,7 +279,13 @@ test('desglose normalizado clasifica productos, recetas y extras sin reemplazar 
   const standalone = normalizeSplitAccountStandaloneExtra({
     tipo_item: 'ITEM', id_producto: null, id_receta: null,
     subtotal_base: 40, subtotal_extras: 40, total_linea: 40,
-    extras: [{ nombre: 'Extra Ranch', cantidad: 4, precio_unitario: 10, subtotal: 40 }]
+    extras: [{
+      id_extra: 32,
+      nombre: 'Extra Ranch',
+      cantidad: 4,
+      precio_unitario: 10,
+      subtotal: 40
+    }]
   });
   const scenarios = [
     {
@@ -399,7 +411,13 @@ for (const scenario of [
       descuento_total: 0,
       isv_total: 0,
       total_linea: 40,
-      extras_snapshot: [{ nombre: 'Extra Ranch', cantidad: 4, precio_unitario: 10, subtotal: 40 }],
+      extras_snapshot: [{
+        id_extra: 33,
+        nombre: 'Extra Ranch',
+        cantidad: 4,
+        precio_unitario: 10,
+        subtotal: 40
+      }],
       complementos_snapshot: [],
       origen_snapshot: {}
     };
@@ -658,7 +676,13 @@ test('composicion simulada de reversion parcial/total conserva cuenta historica 
     nombre_item_snapshot: 'Item de pedido', cantidad: 4, precio_unitario: 10,
     subtotal_base: 0, subtotal_extras: 40, descuento_total: 0, isv_total: 0,
     total_linea: 40,
-    extras_snapshot: [{ nombre: 'Extra Ranch', cantidad: 4, precio_unitario: 10, subtotal: 40 }],
+    extras_snapshot: [{
+      id_extra: 34,
+      nombre: 'Extra Ranch',
+      cantidad: 4,
+      precio_unitario: 10,
+      subtotal: 40
+    }],
     complementos_snapshot: [], origen_snapshot: {}
   }];
   const reversiones = [
