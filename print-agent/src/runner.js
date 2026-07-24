@@ -8,6 +8,7 @@ const isResolvedForJournal = (remote) => Boolean(
 export const createRunner = ({ config, api, qz, stateStore, log = () => {}, delayImpl = delay }) => {
   let stopped = false;
   let failures = 0;
+  let claimInProgress = false;
   const uncertainLogged = new Set();
 
   const removeJournal = async (jobId, event, data = {}) => {
@@ -170,19 +171,35 @@ export const createRunner = ({ config, api, qz, stateStore, log = () => {}, dela
     await dispatchPrepared(job, prepared);
   };
 
-  const pollOnce = async () => {
-    const reconciliation = await reconcileOnce();
-    if (reconciliation.didDispatch) return [];
-    const result = await api.claim();
-    const jobs = Array.isArray(result.jobs) ? result.jobs.slice(0, 1) : [];
-    for (const job of jobs) await processJob(job);
-    return jobs;
+  // Punto unico de reclamo/procesamiento: polling, WebSocket ("job_available") y
+  // reconexion WebSocket convergen aqui. claimInProgress evita que dos disparadores
+  // dentro del mismo agente reclamen/procesen en paralelo; la RPC SKIP LOCKED sigue
+  // siendo la autoridad que evita colisiones entre agentes distintos.
+  const claimAndProcess = async (trigger) => {
+    if (claimInProgress) {
+      log('info', 'claim_skipped_in_progress', { trigger });
+      return [];
+    }
+    claimInProgress = true;
+    try {
+      const reconciliation = await reconcileOnce();
+      if (reconciliation.didDispatch) return [];
+      const result = await api.claim();
+      const jobs = Array.isArray(result.jobs) ? result.jobs.slice(0, 1) : [];
+      for (const job of jobs) await processJob(job);
+      return jobs;
+    } finally {
+      claimInProgress = false;
+    }
   };
+
+  const pollOnce = () => claimAndProcess('polling');
 
   return {
     heartbeatOnce: () => api.heartbeat('1.0.0'),
     reconcileOnce,
     pollOnce,
+    claimAndProcess,
     run: async () => {
       let nextHeartbeat = 0;
       while (!stopped) {
@@ -191,7 +208,7 @@ export const createRunner = ({ config, api, qz, stateStore, log = () => {}, dela
             await api.heartbeat('1.0.0');
             nextHeartbeat = Date.now() + config.heartbeatIntervalMs;
           }
-          await pollOnce();
+          await claimAndProcess('polling');
           failures = 0;
           await delayImpl(config.pollIntervalMs);
         } catch (error) {
