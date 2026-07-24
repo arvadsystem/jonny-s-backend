@@ -4,6 +4,7 @@ import cors from 'cors';
 import cookieParser from 'cookie-parser';
 import helmet from 'helmet';
 import pool, { getPoolState } from './config/db-connection.js';
+import { isDatabaseReady } from './config/dbReadiness.js';
 
 import loginRoutes from './routers/login.js';
 import publicClienteRoutes from './routers/public_cliente.js';
@@ -237,6 +238,19 @@ app.get('/status', async (req, res) => {
       message: 'No se pudo verificar el estado del servicio.'
     });
   }
+});
+
+// Mientras la DB no confirme estar lista tras el arranque (ver config/dbReadiness.js), toda
+// ruta que dependa de ella responde 503 controlado en lugar de dejar que cada handler falle
+// por su cuenta (500, o colgado hasta el connectionTimeout del pool). Nunca bloquea
+// /health/live, /health/ready ni /status, que ya hacen su propio chequeo independiente.
+app.use((req, res, next) => {
+  if (isDatabaseReady()) return next();
+  return res.status(503).json({
+    ok: false,
+    status: 'not_ready',
+    message: 'El servicio esta iniciando: base de datos aun no disponible. Intenta de nuevo en unos segundos.'
+  });
 });
 
 // ✅ Login debe ser público

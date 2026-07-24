@@ -1,6 +1,10 @@
 import 'dotenv/config';
 import app from './app.js';
-import { checkDatabaseReady, closePool } from './config/db-connection.js';
+import { closePool } from './config/db-connection.js';
+import {
+  startDatabaseReadinessLoop,
+  stopDatabaseReadinessLoop
+} from './config/dbReadiness.js';
 import { getRuntimeConfig } from './config/runtime-config.js';
 import {
   startCajaCloseEmailOutboxWorker,
@@ -19,25 +23,29 @@ import {
 const config = getRuntimeConfig();
 const PORT = config.port;
 
-await checkDatabaseReady();
-
 const server = app.listen(PORT, () => {
   console.log(`Servidor activo en el puerto ${PORT}`);
-  // El puerto ya esta escuchando: ni el primer tick del outbox ni el del corte operativo
-  // (o un timeout/degradacion de PostgreSQL durante cualquiera de los dos) deben retrasar
-  // ni tumbar la apertura del servidor. Ver jobs/cajaCloseEmailOutboxWorker.js
-  // (CAJA_CLOSE_EMAIL_OUTBOX_ENABLED, backoff) y jobs/operationalSessionCutoffWorker.js.
-  startCajaCloseEmailOutboxWorker().catch((error) => {
-    console.error('[caja_close_email_outbox_worker] fallo al iniciar en segundo plano', {
-      code: error?.code || 'CAJA_CLOSE_EMAIL_OUTBOX_START_ERROR',
-      message: error?.message || 'Error iniciando el worker de outbox de cierre de caja.'
-    });
-  });
-  startOperationalSessionCutoffWorker().catch((error) => {
-    console.error('[operational_session_cutoff_worker] fallo al iniciar en segundo plano', {
-      code: error?.code || 'OPERATIONAL_SESSION_CUTOFF_START_ERROR',
-      message: error?.message || 'Error iniciando el worker de corte operativo.'
-    });
+  // El puerto abre de inmediato, sin esperar a PostgreSQL (liveness). La disponibilidad de
+  // la DB (readiness) se rastrea en segundo plano -- ver config/dbReadiness.js: backoff con
+  // jitter (2s..30s), nunca mas de un ciclo de reconexion activo. Los workers arrancan una
+  // sola vez, recien cuando la DB confirma estar lista, para no competir con su propio
+  // backoff interno en paralelo mientras la base sigue caida. Ver
+  // jobs/cajaCloseEmailOutboxWorker.js y jobs/operationalSessionCutoffWorker.js.
+  startDatabaseReadinessLoop({
+    onReady: () => {
+      startCajaCloseEmailOutboxWorker().catch((error) => {
+        console.error('[caja_close_email_outbox_worker] fallo al iniciar en segundo plano', {
+          code: error?.code || 'CAJA_CLOSE_EMAIL_OUTBOX_START_ERROR',
+          message: error?.message || 'Error iniciando el worker de outbox de cierre de caja.'
+        });
+      });
+      startOperationalSessionCutoffWorker().catch((error) => {
+        console.error('[operational_session_cutoff_worker] fallo al iniciar en segundo plano', {
+          code: error?.code || 'OPERATIONAL_SESSION_CUTOFF_START_ERROR',
+          message: error?.message || 'Error iniciando el worker de corte operativo.'
+        });
+      });
+    }
   });
 });
 
@@ -66,6 +74,7 @@ const shutdown = async (signal) => {
   if (shutdownPromise) return shutdownPromise;
 
   console.warn(`[shutdown] Senal recibida: ${signal}. Cerrando servidor HTTP y pool PostgreSQL.`);
+  stopDatabaseReadinessLoop();
   const gracefulWork = closeHttpServer()
     .then(() => Promise.all([
       stopCajaCloseEmailOutboxWorker({ timeoutMs: 5000 }),
