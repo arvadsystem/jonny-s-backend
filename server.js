@@ -10,6 +10,11 @@ import {
   startOperationalSessionCutoffWorker,
   stopOperationalSessionCutoffWorker
 } from './jobs/operationalSessionCutoffWorker.js';
+import {
+  attachPrintAgentWebSocketServer,
+  detachPrintAgentWebSocketServer,
+  isPrintAgentWebSocketEnabled
+} from './services/printAgentWebSocketService.js';
 
 const config = getRuntimeConfig();
 const PORT = config.port;
@@ -21,6 +26,13 @@ await startOperationalSessionCutoffWorker();
 const server = app.listen(PORT, () => {
   console.log(`Servidor activo en el puerto ${PORT}`);
 });
+
+// Aditivo: notifica "job_available" por WebSocket a agentes de impresion ya autenticados.
+// El polling del agente sigue siendo la via de reclamo; ver services/printAgentWebSocketService.js.
+if (isPrintAgentWebSocketEnabled()) {
+  attachPrintAgentWebSocketServer(server);
+  console.log('[print-agent.ws] servidor WebSocket habilitado en /api/print-agent/ws');
+}
 
 let shutdownPromise = null;
 
@@ -43,7 +55,8 @@ const shutdown = async (signal) => {
   const gracefulWork = closeHttpServer()
     .then(() => Promise.all([
       stopCajaCloseEmailOutboxWorker({ timeoutMs: 5000 }),
-      stopOperationalSessionCutoffWorker({ timeoutMs: 5000 })
+      stopOperationalSessionCutoffWorker({ timeoutMs: 5000 }),
+      detachPrintAgentWebSocketServer()
     ]))
     .then(() => closePool());
 
