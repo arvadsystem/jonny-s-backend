@@ -78,9 +78,16 @@ test('pedidos publicos validan JWT, sesion activa, CSRF, Cliente y touch antes d
   assert.match(routerSource, /'\/pedidos',[\s\S]*requireAuthenticatedPublicCustomer[\s\S]*createPublicOrderController/);
 });
 
-test('el worker se registra una vez en arranque y participa en shutdown', async () => {
+test('el worker se registra una vez en arranque (en segundo plano, sin bloquear el puerto) y participa en shutdown', async () => {
   const source = await readSource('server.js');
 
-  assert.equal((source.match(/await startOperationalSessionCutoffWorker\(\)/g) || []).length, 1);
+  // El puerto abre primero; el worker arranca dentro del callback de listen(), nunca
+  // bloqueando el arranque con un await previo. Ver jobs/operationalSessionCutoffWorker.js.
+  assert.equal((source.match(/startOperationalSessionCutoffWorker\(\)/g) || []).length, 1);
+  assert.doesNotMatch(source, /await\s+startOperationalSessionCutoffWorker\(\)/);
+  assert.match(source, /startOperationalSessionCutoffWorker\(\)\.catch\(/);
+  const listenIndex = source.indexOf('app.listen(PORT');
+  const startIndex = source.indexOf('startOperationalSessionCutoffWorker()');
+  assert.ok(listenIndex >= 0 && startIndex > listenIndex);
   assert.match(source, /stopOperationalSessionCutoffWorker\(\{ timeoutMs: 5000 \}\)/);
 });

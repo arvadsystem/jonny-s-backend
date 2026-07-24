@@ -22,11 +22,15 @@ const MAX_ATTEMPTS = 5;
 const DEFAULT_BATCH_SIZE = 5;
 const DEFAULT_LOCK_MS = 120000;
 const DEFAULT_CLAIM_TIMEOUT_MS = 5000;
-// Clave arbitraria y estable de pg_try_advisory_xact_lock: coordina un unico claim activo
-// entre replicas web concurrentes (varias replicas pueden tener el worker activo a la vez).
-// SKIP LOCKED ya evita duplicados aunque el lock fallara; esto solo evita el intento
-// redundante. Al ser un lock de transaccion, se libera solo con COMMIT/ROLLBACK -- nunca
-// puede quedar huerfano si el proceso cae a mitad del claim.
+// Clave arbitraria y estable de pg_try_advisory_xact_lock: serializa unicamente la
+// transaccion de claim (BEGIN..claim..COMMIT) entre replicas web concurrentes, para que
+// como mucho una replica este reclamando filas en un instante dado. NO representa una
+// unica instancia activa durante todo el procesamiento: el lock se libera en el COMMIT de
+// abajo, y el envio de cada correo (fuera de esta transaccion, via notificationPool) puede
+// seguir corriendo en paralelo en varias replicas a la vez, cada una sobre sus propias
+// filas ya reclamadas -- eso sigue siendo seguro porque SKIP LOCKED nunca deja que dos
+// replicas reclamen la misma fila. Al ser un lock de transaccion (no de sesion), se libera
+// solo con COMMIT/ROLLBACK y nunca puede quedar huerfano si el proceso cae a mitad del claim.
 const OUTBOX_ADVISORY_LOCK_KEY = 727270001;
 
 const parsePositiveInt = (value, fallback, min = 1, max = Number.MAX_SAFE_INTEGER) => {

@@ -804,7 +804,11 @@ describe('caja close email durable outbox', () => {
       assert.ok(calls.some((call) => /^\s*ROLLBACK\s*$/i.test(call.sql)), 'debe hacer ROLLBACK tras el timeout de claim');
     });
 
-    it('una sola instancia activa: si otra replica ya sostiene el advisory lock, esta se retira sin reclamar filas', async () => {
+    // El lock solo serializa esta transaccion de claim, no "una unica instancia activa"
+    // durante todo el procesamiento -- el envio de correos, fuera de esta transaccion,
+    // puede seguir corriendo en paralelo en varias replicas sobre sus propias filas ya
+    // reclamadas (ver el comentario junto a OUTBOX_ADVISORY_LOCK_KEY en el servicio).
+    it('el claim se serializa entre replicas: si otra ya sostiene el advisory lock, esta se retira sin reclamar filas', async () => {
       const { client, calls } = createFakeOutboxClient({ lockAcquired: false });
       const pool = { connect: async () => client };
 

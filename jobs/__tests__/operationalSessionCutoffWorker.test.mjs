@@ -1,4 +1,6 @@
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 import { afterEach, beforeEach, describe, it } from 'node:test';
 import {
   configureOperationalSessionCutoffWorkerForTests,
@@ -9,6 +11,8 @@ import {
   startOperationalSessionCutoffWorker,
   stopOperationalSessionCutoffWorker
 } from '../operationalSessionCutoffWorker.js';
+
+const serverSource = readFileSync(resolve('server.js'), 'utf8');
 
 const createTimerHarness = () => {
   const timers = [];
@@ -110,5 +114,33 @@ describe('worker de corte operativo', () => {
     assert.equal(result.started, true);
     assert.equal(getOperationalSessionCutoffWorkerState().last_error_code, 'DB_UNAVAILABLE');
     assert.equal(timers.timers.length, 1);
+  });
+});
+
+describe('arranque en server.js', () => {
+  it('el servidor abre el puerto antes de iniciar el worker de corte operativo, y un fallo al iniciarlo no lo bloquea ni lo tumba', () => {
+    const listenIndex = serverSource.indexOf('app.listen(PORT');
+    const startIndex = serverSource.indexOf('startOperationalSessionCutoffWorker()');
+    assert.ok(listenIndex >= 0, 'debe existir app.listen(PORT');
+    assert.ok(startIndex >= 0, 'debe existir una llamada a startOperationalSessionCutoffWorker()');
+    assert.ok(
+      startIndex > listenIndex,
+      'startOperationalSessionCutoffWorker() debe aparecer despues de app.listen(PORT (dentro de su callback), nunca antes'
+    );
+    assert.doesNotMatch(
+      serverSource,
+      /await\s+startOperationalSessionCutoffWorker\(\)/,
+      'el arranque no debe esperar (await) el primer tick del corte operativo antes de abrir el puerto'
+    );
+    assert.match(
+      serverSource,
+      /startOperationalSessionCutoffWorker\(\)\.catch\(/,
+      'un fallo al iniciar el worker de corte operativo en segundo plano debe capturarse, nunca tumbar el proceso'
+    );
+    assert.match(
+      serverSource,
+      /stopOperationalSessionCutoffWorker\(\{ timeoutMs: 5000 \}\)/,
+      'el shutdown limpio debe seguir deteniendo el worker de corte operativo'
+    );
   });
 });

@@ -20,17 +20,23 @@ const config = getRuntimeConfig();
 const PORT = config.port;
 
 await checkDatabaseReady();
-await startOperationalSessionCutoffWorker();
 
 const server = app.listen(PORT, () => {
   console.log(`Servidor activo en el puerto ${PORT}`);
-  // El puerto ya esta escuchando: el primer tick del outbox (o un timeout/degradacion de
-  // PostgreSQL durante ese tick) nunca debe retrasar ni tumbar la apertura del servidor.
-  // Ver jobs/cajaCloseEmailOutboxWorker.js (CAJA_CLOSE_EMAIL_OUTBOX_ENABLED, backoff).
+  // El puerto ya esta escuchando: ni el primer tick del outbox ni el del corte operativo
+  // (o un timeout/degradacion de PostgreSQL durante cualquiera de los dos) deben retrasar
+  // ni tumbar la apertura del servidor. Ver jobs/cajaCloseEmailOutboxWorker.js
+  // (CAJA_CLOSE_EMAIL_OUTBOX_ENABLED, backoff) y jobs/operationalSessionCutoffWorker.js.
   startCajaCloseEmailOutboxWorker().catch((error) => {
     console.error('[caja_close_email_outbox_worker] fallo al iniciar en segundo plano', {
       code: error?.code || 'CAJA_CLOSE_EMAIL_OUTBOX_START_ERROR',
       message: error?.message || 'Error iniciando el worker de outbox de cierre de caja.'
+    });
+  });
+  startOperationalSessionCutoffWorker().catch((error) => {
+    console.error('[operational_session_cutoff_worker] fallo al iniciar en segundo plano', {
+      code: error?.code || 'OPERATIONAL_SESSION_CUTOFF_START_ERROR',
+      message: error?.message || 'Error iniciando el worker de corte operativo.'
     });
   });
 });
