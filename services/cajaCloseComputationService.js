@@ -201,12 +201,15 @@ export const buildSegmentedArqueoComputation = ({
       throw createCajaError(
         400,
         'VENTAS_CAJAS_ARQUEO_OBSERVACION_REQUIRED',
-        `Debe indicar observacion para ${code} cuando existe diferencia.`,
+        `Existe diferencia en ${code}. Agrega una observación para continuar.`,
         {
+          method: code,
           metodo_pago_codigo: code,
           field: 'observacion',
           focus_target: `arqueos.${code}.observacion`,
-          step: code
+          step: code,
+          motivo: 'DIFERENCIA_SIN_OBSERVACION',
+          accion_requerida: 'AGREGAR_OBSERVACION'
         }
       );
     }
@@ -475,6 +478,9 @@ export const recomputeAndAssertCloseValidation = ({
       requireObservacionOnDifference: true
     });
   } catch (error) {
+    if (error?.code === 'VENTAS_CAJAS_ARQUEO_OBSERVACION_REQUIRED') {
+      throw error;
+    }
     throw createValidationRecomputationMismatchError([{
       metodo_pago_codigo: 'PAYLOAD',
       campo: 'payload_declarado_json',
