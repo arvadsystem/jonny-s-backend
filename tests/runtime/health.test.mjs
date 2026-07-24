@@ -5,7 +5,7 @@ import { after, afterEach, describe, it } from 'node:test';
 process.env.SUPABASE_URL = process.env.SUPABASE_URL || 'https://example.supabase.co';
 process.env.SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY || 'test-service-key';
 
-const { default: app, setHealthCheckQueryRunnerForTests } = await import('../../app.js');
+const { default: app } = await import('../../app.js');
 const {
   configureDatabaseReadinessForTests,
   resetDatabaseReadinessForTests
@@ -37,7 +37,6 @@ const createServer = () => new Promise((resolve) => {
 });
 
 after(() => {
-  setHealthCheckQueryRunnerForTests();
   resetDatabaseReadinessForTests();
 });
 
@@ -46,13 +45,11 @@ afterEach(() => {
 });
 
 describe('web health checks', () => {
-  it('GET /health/live responde sin consultar DB', async () => {
-    let queries = 0;
-    setHealthCheckQueryRunnerForTests({
-      async query() {
-        queries += 1;
-        return { rows: [] };
-      }
+  it('GET /health/live responde 200 sin importar el estado de readiness, y nunca consulta la DB', async () => {
+    let checkCalls = 0;
+    configureDatabaseReadinessForTests({
+      ready: false,
+      checkDatabaseReady: async () => { checkCalls += 1; return true; }
     });
     const server = await createServer();
     try {
@@ -60,19 +57,14 @@ describe('web health checks', () => {
       assert.equal(response.statusCode, 200);
       assert.equal(response.body.status, 'alive');
       assert.equal(response.body.role, 'web');
-      assert.equal(queries, 0);
+      assert.equal(checkCalls, 0, '/health/live nunca debe disparar un chequeo de DB');
     } finally {
       server.close();
     }
   });
 
-  it('GET /health/ready responde 200 cuando SELECT 1 funciona', async () => {
-    setHealthCheckQueryRunnerForTests({
-      async query(sql) {
-        assert.equal(sql, 'SELECT 1');
-        return { rows: [{ '?column?': 1 }] };
-      }
-    });
+  it('GET /health/ready responde 200 cuando el estado compartido de readiness es true', async () => {
+    configureDatabaseReadinessForTests({ ready: true });
     const server = await createServer();
     try {
       const response = await request(server, '/health/ready');
@@ -85,12 +77,8 @@ describe('web health checks', () => {
     }
   });
 
-  it('GET /health/ready responde 503 sin filtrar datos sensibles', async () => {
-    setHealthCheckQueryRunnerForTests({
-      async query() {
-        throw new Error('password host user connectionString stack');
-      }
-    });
+  it('GET /health/ready responde 503 cuando el estado compartido de readiness es false, sin exponer detalles internos', async () => {
+    configureDatabaseReadinessForTests({ ready: false });
     const server = await createServer();
     try {
       const response = await request(server, '/health/ready');
@@ -98,6 +86,9 @@ describe('web health checks', () => {
       assert.equal(response.statusCode, 503);
       assert.equal(response.body.status, 'not_ready');
       assert.equal(response.body.database, 'error');
+      // La ruta ya no ejecuta ni observa el error real del chequeo (vive por completo en el
+      // monitor de segundo plano, ver config/dbReadiness.js): no hay forma de que un mensaje
+      // de error termine en la respuesta HTTP.
       assert.doesNotMatch(serialized, /password|host|user|connectionString|stack/i);
     } finally {
       server.close();
@@ -105,23 +96,35 @@ describe('web health checks', () => {
   });
 
   it('tras recuperarse la DB, /health/ready pasa de 503 a 200 sin reiniciar el servidor', async () => {
-    let dbUp = false;
-    setHealthCheckQueryRunnerForTests({
-      async query() {
-        if (!dbUp) throw new Error('connection refused');
-        return { rows: [{ '?column?': 1 }] };
-      }
-    });
+    configureDatabaseReadinessForTests({ ready: false });
     const server = await createServer();
     try {
       const before = await request(server, '/health/ready');
       assert.equal(before.statusCode, 503);
       assert.equal(before.body.status, 'not_ready');
 
-      dbUp = true;
+      configureDatabaseReadinessForTests({ ready: true });
       const after = await request(server, '/health/ready');
       assert.equal(after.statusCode, 200);
       assert.equal(after.body.status, 'ready');
+    } finally {
+      server.close();
+    }
+  });
+
+  it('no existe un query/chequeo independiente por cada llamada a /health/ready', async () => {
+    let checkCalls = 0;
+    configureDatabaseReadinessForTests({
+      ready: true,
+      checkDatabaseReady: async () => { checkCalls += 1; return true; }
+    });
+    const server = await createServer();
+    try {
+      for (let i = 0; i < 5; i += 1) {
+        const response = await request(server, '/health/ready');
+        assert.equal(response.statusCode, 200);
+      }
+      assert.equal(checkCalls, 0, '/health/ready solo lee el estado ya calculado por el monitor, nunca dispara un chequeo propio');
     } finally {
       server.close();
     }
@@ -152,20 +155,28 @@ describe('web health checks', () => {
     }
   });
 
-  it('/health/live, /health/ready y /status nunca son bloqueados por el gate de readiness', async () => {
-    configureDatabaseReadinessForTests({ ready: false });
-    setHealthCheckQueryRunnerForTests({
-      async query() {
-        return { rows: [{ '?column?': 1 }] };
+  it('/health/ready y una ruta protegida siempre reflejan el mismo estado compartido de readiness', async () => {
+    const server = await createServer();
+    try {
+      for (const ready of [false, true, false]) {
+        configureDatabaseReadinessForTests({ ready });
+        const healthReady = await request(server, '/health/ready');
+        const protectedRoute = await request(server, '/usuarios');
+
+        assert.equal(healthReady.statusCode === 200, ready, `/health/ready debe reflejar ready=${ready}`);
+        assert.equal(protectedRoute.statusCode !== 503, ready, `la ruta protegida debe reflejar ready=${ready}`);
       }
-    });
+    } finally {
+      server.close();
+    }
+  });
+
+  it('/health/live nunca es bloqueado por el gate de rutas de negocio, incluso con readiness=false', async () => {
+    configureDatabaseReadinessForTests({ ready: false });
     const server = await createServer();
     try {
       const live = await request(server, '/health/live');
       assert.equal(live.statusCode, 200);
-
-      const ready = await request(server, '/health/ready');
-      assert.equal(ready.statusCode, 200, '/health/ready sigue haciendo su propio chequeo, independiente del gate');
     } finally {
       server.close();
     }

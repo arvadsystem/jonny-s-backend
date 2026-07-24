@@ -74,8 +74,10 @@ const shutdown = async (signal) => {
   if (shutdownPromise) return shutdownPromise;
 
   console.warn(`[shutdown] Senal recibida: ${signal}. Cerrando servidor HTTP y pool PostgreSQL.`);
-  stopDatabaseReadinessLoop();
-  const gracefulWork = closeHttpServer()
+  // El monitor de readiness se detiene primero y se espera (acotado) a que el chequeo en
+  // vuelo termine, para no cerrar el pool a mitad de un SELECT 1 en curso.
+  const gracefulWork = stopDatabaseReadinessLoop({ timeoutMs: 5000 })
+    .then(() => closeHttpServer())
     .then(() => Promise.all([
       stopCajaCloseEmailOutboxWorker({ timeoutMs: 5000 }),
       stopOperationalSessionCutoffWorker({ timeoutMs: 5000 }),

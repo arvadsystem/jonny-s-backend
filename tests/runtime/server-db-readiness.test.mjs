@@ -95,11 +95,16 @@ describe('server.js: el puerto abre sin esperar a PostgreSQL', () => {
     assert.match(serverSource, /startOperationalSessionCutoffWorker\(\)\.catch\(/);
   });
 
-  it('el shutdown cancela el retry de base de datos ademas de detener los workers y cerrar el pool', () => {
-    const stopDbIndex = serverSource.indexOf('stopDatabaseReadinessLoop()');
+  it('el shutdown detiene el monitor de DB, espera el chequeo en vuelo (acotado) y solo entonces cierra HTTP/workers/pool', () => {
+    const stopDbIndex = serverSource.indexOf('stopDatabaseReadinessLoop({ timeoutMs: 5000 })');
     const closeHttpIndex = serverSource.indexOf('closeHttpServer()');
-    assert.ok(stopDbIndex >= 0, 'debe existir una llamada a stopDatabaseReadinessLoop()');
-    assert.ok(stopDbIndex < closeHttpIndex, 'debe cancelar el retry de DB antes/al iniciar el cierre del servidor HTTP');
+    assert.ok(stopDbIndex >= 0, 'debe existir una llamada a stopDatabaseReadinessLoop({ timeoutMs: 5000 })');
+    assert.ok(stopDbIndex < closeHttpIndex, 'debe detener/esperar el monitor de DB antes de cerrar el servidor HTTP');
+    assert.match(
+      serverSource,
+      /stopDatabaseReadinessLoop\(\{ timeoutMs: 5000 \}\)\s*\n\s*\.then\(\(\)\s*=>\s*closeHttpServer\(\)\)/,
+      'closeHttpServer() debe encadenarse DESPUES de que stopDatabaseReadinessLoop() resuelva (o venza su timeout), no en paralelo'
+    );
     assert.match(serverSource, /stopCajaCloseEmailOutboxWorker\(\{ timeoutMs: 5000 \}\)/);
     assert.match(serverSource, /stopOperationalSessionCutoffWorker\(\{ timeoutMs: 5000 \}\)/);
     assert.match(serverSource, /closePool\(\)/);

@@ -108,26 +108,6 @@ const getAllowedOrigins = () => {
 
 const allowedOrigins = getAllowedOrigins();
 const isAllowedOrigin = (origin) => allowedOrigins.includes(normalizeOrigin(origin));
-const READINESS_TIMEOUT_MS = 2000;
-let healthCheckQueryRunner = pool;
-
-export const setHealthCheckQueryRunnerForTests = (queryRunner = pool) => {
-  healthCheckQueryRunner = queryRunner;
-};
-
-const withTimeout = (promise, timeoutMs) => {
-  let timeout = null;
-  const timeoutPromise = new Promise((_, reject) => {
-    timeout = setTimeout(() => {
-      const error = new Error('READINESS_TIMEOUT');
-      error.code = 'READINESS_TIMEOUT';
-      reject(error);
-    }, timeoutMs);
-  });
-  return Promise.race([promise, timeoutPromise]).finally(() => {
-    if (timeout) clearTimeout(timeout);
-  });
-};
 
 // ✅ (Opcional) proxy - no afecta el login
 if (String(process.env.TRUST_PROXY || '').toLowerCase() === 'true') {
@@ -201,22 +181,11 @@ app.get('/health/live', (req, res) => {
   });
 });
 
-app.get('/health/ready', async (req, res) => {
-  try {
-    await withTimeout(healthCheckQueryRunner.query('SELECT 1'), READINESS_TIMEOUT_MS);
-    const poolState = getPoolState();
-    return res.status(200).json({
-      status: 'ready',
-      database: 'ok',
-      role: 'web',
-      pool: {
-        total: poolState.totalCount,
-        idle: poolState.idleCount,
-        waiting: poolState.waitingCount
-      },
-      timestamp: new Date().toISOString()
-    });
-  } catch {
+// Lee el mismo estado compartido que usan el middleware de rutas y el arranque de workers
+// (ver config/dbReadiness.js) -- nunca dispara un SELECT 1 propio por cada llamada. El
+// chequeo real corre en segundo plano, en su propio ciclo continuo con backoff.
+app.get('/health/ready', (req, res) => {
+  if (!isDatabaseReady()) {
     return res.status(503).json({
       status: 'not_ready',
       database: 'error',
@@ -224,6 +193,18 @@ app.get('/health/ready', async (req, res) => {
       timestamp: new Date().toISOString()
     });
   }
+  const poolState = getPoolState();
+  return res.status(200).json({
+    status: 'ready',
+    database: 'ok',
+    role: 'web',
+    pool: {
+      total: poolState.totalCount,
+      idle: poolState.idleCount,
+      waiting: poolState.waitingCount
+    },
+    timestamp: new Date().toISOString()
+  });
 });
 
 // Legacy: mantener por compatibilidad; EasyPanel debe usar /health/ready.
@@ -240,10 +221,11 @@ app.get('/status', async (req, res) => {
   }
 });
 
-// Mientras la DB no confirme estar lista tras el arranque (ver config/dbReadiness.js), toda
-// ruta que dependa de ella responde 503 controlado en lugar de dejar que cada handler falle
-// por su cuenta (500, o colgado hasta el connectionTimeout del pool). Nunca bloquea
-// /health/live, /health/ready ni /status, que ya hacen su propio chequeo independiente.
+// Mismo estado compartido que /health/ready (ver config/dbReadiness.js): mientras la DB no
+// este lista, toda ruta que dependa de ella responde 503 controlado en lugar de dejar que
+// cada handler falle por su cuenta (500, o colgado hasta el connectionTimeout del pool).
+// Nunca bloquea /health/live ni /health/ready (montadas antes); /status es legacy y sigue
+// haciendo su propio SELECT NOW() independiente, sin cambios.
 app.use((req, res, next) => {
   if (isDatabaseReady()) return next();
   return res.status(503).json({
