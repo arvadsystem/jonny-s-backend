@@ -80,6 +80,8 @@ export const createQzClient = ({
   WebSocketImpl = WebSocket,
   lookupImpl = dnsLookup,
   networkInterfacesImpl = getNetworkInterfaces,
+  setTimeoutImpl = setTimeout,
+  clearTimeoutImpl = clearTimeout,
   log = () => {}
 }) => {
   let securityConfigured = false;
@@ -153,11 +155,11 @@ export const createQzClient = ({
     if (preconnectStopped || preconnectRetryTimer) return; // nunca mas de un reintento pendiente
     const wait = Math.min(PRECONNECT_RETRY_BASE_MS * (2 ** preconnectRetryAttempt), PRECONNECT_RETRY_MAX_MS);
     preconnectRetryAttempt += 1;
-    preconnectRetryTimer = setTimeout(() => {
+    preconnectRetryTimer = setTimeoutImpl(() => {
       preconnectRetryTimer = null;
       if (!preconnectStopped) void preconnect();
     }, wait);
-    preconnectRetryTimer.unref?.();
+    preconnectRetryTimer?.unref?.();
   };
 
   // Best-effort al iniciar el agente: nunca lanza. Si QZ Tray esta cerrado, el agente
@@ -179,7 +181,7 @@ export const createQzClient = ({
   const stopPreconnectRetry = () => {
     preconnectStopped = true;
     if (preconnectRetryTimer) {
-      clearTimeout(preconnectRetryTimer);
+      clearTimeoutImpl(preconnectRetryTimer);
       preconnectRetryTimer = null;
     }
   };

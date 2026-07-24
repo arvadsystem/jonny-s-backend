@@ -51,6 +51,36 @@ const openInstance = (instance, WebSocketImpl) => {
   instance.emit('open');
 };
 
+// setTimeoutImpl/clearTimeoutImpl rapidos: usan el setTimeout real (asincrono de verdad,
+// evita la reentrancia de un fake sincrono) pero con 0ms fijos, para que las pruebas que
+// exercitan scheduleReconnect() no esperen el backoff real (hasta 30s).
+const fastTimers = () => ({
+  setTimeoutImpl: (fn) => setTimeout(fn, 0),
+  clearTimeoutImpl: (handle) => clearTimeout(handle)
+});
+
+// Temporizador controlable manualmente: setTimeoutImpl no dispara nada por si solo, solo
+// registra el callback; fire(id) lo ejecuta y clearTimeoutImpl(id) lo cancela (como el
+// setTimeout/clearTimeout nativos), para probar de forma determinista que un timer
+// cancelado nunca dispara connect().
+const createControllableTimeout = () => {
+  let nextId = 1;
+  const callbacks = new Map();
+  const setTimeoutImpl = (fn) => {
+    const id = nextId;
+    nextId += 1;
+    callbacks.set(id, fn);
+    return id;
+  };
+  const clearTimeoutImpl = (id) => { callbacks.delete(id); };
+  const fire = (id) => {
+    const fn = callbacks.get(id);
+    callbacks.delete(id);
+    if (fn) fn();
+  };
+  return { setTimeoutImpl, clearTimeoutImpl, fire, lastId: () => nextId - 1 };
+};
+
 test('buildPrintAgentWsUrl convierte https a wss y agrega la ruta del agente', () => {
   assert.equal(buildPrintAgentWsUrl('https://qa.example.com'), 'wss://qa.example.com/api/print-agent/ws');
   assert.equal(buildPrintAgentWsUrl('HTTPS://Local.Example.Com'), 'wss://Local.Example.Com/api/print-agent/ws');
@@ -71,6 +101,18 @@ test('backoffDelayMs sigue 1,2,4,8,16,30s con tope y jitter pequeño', () => {
   assert.ok(withJitter >= 1000 && withJitter <= 1100, `jitter fuera de rango: ${withJitter}`);
 });
 
+test('backoffDelayMs con randomImpl=1 (jitter maximo) nunca supera el tope absoluto de 30000ms', () => {
+  // En el tope (base=30000), el jitter del 10% sin recortar daria 33000ms; randomImpl=1
+  // fuerza justamente ese peor caso para probar que el recorte final si se aplica.
+  const maxJitter = () => 1;
+  for (let attempt = 0; attempt <= 9; attempt += 1) {
+    const wait = backoffDelayMs(attempt, maxJitter);
+    assert.ok(wait <= 30000, `attempt=${attempt} produjo ${wait}ms, por encima del tope absoluto`);
+  }
+  assert.equal(backoffDelayMs(5, maxJitter), 30000);
+  assert.equal(backoffDelayMs(9, maxJitter), 30000);
+});
+
 test('al conectar (open) NO ejecuta claimAndProcess("reconnect") de inmediato', async () => {
   const WebSocketImpl = createFakeWebSocketImpl();
   const signals = [];
@@ -79,7 +121,6 @@ test('al conectar (open) NO ejecuta claimAndProcess("reconnect") de inmediato', 
     onSignal: async (trigger) => { signals.push(trigger); },
     log: () => {},
     WebSocketImpl,
-    delayImpl: async () => {},
     stableConnectionMs: 10000 // deliberadamente largo: nada debe emitirse todavia
   });
   client.start();
@@ -102,7 +143,6 @@ test('una conexion que permanece abierta stableConnectionMs si ejecuta claimAndP
     onSignal: async (trigger) => { signals.push(trigger); },
     log: () => {},
     WebSocketImpl,
-    delayImpl: async () => {},
     stableConnectionMs: 10
   });
   client.start();
@@ -120,8 +160,7 @@ test('job_available de la sucursal propia ejecuta claimAndProcess("websocket")',
     config: baseConfig,
     onSignal: async (trigger) => { signals.push(trigger); },
     log: () => {},
-    WebSocketImpl,
-    delayImpl: async () => {}
+    WebSocketImpl
   });
   client.start();
   const socket = WebSocketImpl.instances[0];
@@ -142,8 +181,7 @@ test('job_available de otra sucursal se ignora', async () => {
     config: baseConfig,
     onSignal: async (trigger) => { signals.push(trigger); },
     log: () => {},
-    WebSocketImpl,
-    delayImpl: async () => {}
+    WebSocketImpl
   });
   client.start();
   const socket = WebSocketImpl.instances[0];
@@ -165,8 +203,7 @@ test('mensajes invalidos o sin evento job_available se ignoran sin lanzar', asyn
     config: baseConfig,
     onSignal: async (trigger) => { signals.push(trigger); },
     log: () => {},
-    WebSocketImpl,
-    delayImpl: async () => {}
+    WebSocketImpl
   });
   client.start();
   const socket = WebSocketImpl.instances[0];
@@ -207,7 +244,6 @@ test('dos señales consecutivas: el wsClient llama onSignal ambas veces, pero el
     onSignal: guardedOnSignal,
     log: () => {},
     WebSocketImpl,
-    delayImpl: async () => {},
     stableConnectionMs: 10
   });
   client.start();
@@ -237,7 +273,7 @@ test('al cerrarse la conexion programa reconexion y, una vez estable, vuelve a e
     onSignal: async (trigger) => { signals.push(trigger); },
     log: () => {},
     WebSocketImpl,
-    delayImpl: async () => {},
+    ...fastTimers(),
     stableConnectionMs: 10
   });
   client.start();
@@ -262,8 +298,7 @@ test('stop() detiene la reconexion: un close tardio no crea un nuevo socket', as
     config: baseConfig,
     onSignal: async () => {},
     log: () => {},
-    WebSocketImpl,
-    delayImpl: async () => {}
+    WebSocketImpl
   });
   client.start();
   const first = WebSocketImpl.instances[0];
@@ -283,7 +318,7 @@ test('sin pong a tiempo, termina el socket y reconecta (heartbeat con timers rea
     onSignal: async () => {},
     log: () => {},
     WebSocketImpl,
-    delayImpl: async () => {},
+    ...fastTimers(),
     pingIntervalMs: 20,
     pongTimeoutMs: 15
   });
@@ -304,7 +339,6 @@ test('un pong a tiempo evita el terminate por timeout', async () => {
     onSignal: async () => {},
     log: () => {},
     WebSocketImpl,
-    delayImpl: async () => {},
     pingIntervalMs: 20,
     pongTimeoutMs: 200
   });
@@ -316,5 +350,63 @@ test('un pong a tiempo evita el terminate por timeout', async () => {
   first.emit('pong');
   await new Promise((resolve) => setTimeout(resolve, 250));
   assert.equal(first.terminated, false, 'un pong a tiempo no debe forzar terminate');
+  client.stop();
+});
+
+test('stop() ejecuta clearTimeout sobre la reconexion pendiente', async () => {
+  const WebSocketImpl = createFakeWebSocketImpl();
+  const { setTimeoutImpl, clearTimeoutImpl, lastId } = createControllableTimeout();
+  const cleared = [];
+  const client = createPrintAgentWebSocketClient({
+    config: baseConfig,
+    onSignal: async () => {},
+    log: () => {},
+    WebSocketImpl,
+    setTimeoutImpl,
+    clearTimeoutImpl: (id) => { cleared.push(id); clearTimeoutImpl(id); },
+    stableConnectionMs: 10000
+  });
+
+  client.start();
+  const first = WebSocketImpl.instances[0];
+  openInstance(first, WebSocketImpl);
+  first.readyState = WebSocketImpl.CLOSED;
+  first.emit('close'); // programa una reconexion pendiente via scheduleReconnect()
+  const pendingId = lastId();
+
+  client.stop();
+  assert.deepEqual(cleared, [pendingId], 'stop() debe cancelar exactamente el timer de reconexion pendiente');
+});
+
+test('start -> close -> reconexion pendiente -> stop -> start: al vencer el temporizador anterior no se crea una conexion adicional', () => {
+  const WebSocketImpl = createFakeWebSocketImpl();
+  const { setTimeoutImpl, clearTimeoutImpl, fire, lastId } = createControllableTimeout();
+  const client = createPrintAgentWebSocketClient({
+    config: baseConfig,
+    onSignal: async () => {},
+    log: () => {},
+    WebSocketImpl,
+    setTimeoutImpl,
+    clearTimeoutImpl,
+    stableConnectionMs: 10000
+  });
+
+  client.start();
+  const first = WebSocketImpl.instances[0];
+  openInstance(first, WebSocketImpl);
+  first.readyState = WebSocketImpl.CLOSED;
+  first.emit('close'); // programa la reconexion pendiente (timer controlado, nunca vence solo)
+  const staleTimerId = lastId();
+  assert.equal(WebSocketImpl.instances.length, 1, 'todavia no debe existir una segunda conexion: el timer sigue pendiente');
+
+  client.stop(); // debe cancelar el timer pendiente via clearTimeoutImpl
+  client.start(); // nuevo ciclo: abre su propia conexion inmediatamente
+  assert.equal(WebSocketImpl.instances.length, 2, 'start() posterior abre su propia conexion de inmediato');
+
+  fire(staleTimerId); // simula que el temporizador viejo vence de todas formas
+  assert.equal(
+    WebSocketImpl.instances.length, 2,
+    'el timer viejo, ya cancelado por stop(), no debe generar una conexion adicional'
+  );
   client.stop();
 });

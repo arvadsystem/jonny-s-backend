@@ -18,10 +18,11 @@ export const buildPrintAgentWsUrl = (apiBaseUrl) =>
 
 export const backoffDelayMs = (attempt, randomImpl = Math.random) => {
   const base = Math.min(BASE_BACKOFF_MS * (2 ** Math.min(attempt, MAX_BACKOFF_ATTEMPT)), MAX_BACKOFF_MS);
-  return base + Math.round(base * 0.1 * randomImpl());
+  const withJitter = base + Math.round(base * 0.1 * randomImpl());
+  // El jitter puede empujar la base (ya topada en MAX_BACKOFF_MS) por encima del tope
+  // absoluto; se recorta de nuevo aqui para que ningun caller vea un delay > 30000ms.
+  return Math.min(withJitter, MAX_BACKOFF_MS);
 };
-
-const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 // Cliente WebSocket aditivo: solo dispara claimAndProcess(trigger) en el runner. Nunca
 // imprime ni recibe el documento; ignora cualquier branch_id ajeno a su sucursal autenticada.
@@ -30,7 +31,8 @@ export const createPrintAgentWebSocketClient = ({
   onSignal,
   log = () => {},
   WebSocketImpl = WebSocket,
-  delayImpl = delay,
+  setTimeoutImpl = setTimeout,
+  clearTimeoutImpl = clearTimeout,
   randomImpl = Math.random,
   pingIntervalMs = PING_INTERVAL_MS,
   pongTimeoutMs = PONG_TIMEOUT_MS,
@@ -42,10 +44,11 @@ export const createPrintAgentWebSocketClient = ({
   let pingTimer = null;
   let pongTimer = null;
   let stableTimer = null;
-  // Referencia a la espera de reconexion en curso (delayImpl(wait) resuelto/pendiente).
-  // No es un handle nativo de setTimeout -- delayImpl es inyectable para pruebas -- pero
-  // cumple el mismo rol: mientras no sea null, scheduleReconnect() nunca programa una
-  // segunda reconexion en paralelo, y stop() la limpia para que no dispare connect().
+  // Handle del setTimeout de la reconexion pendiente (setTimeoutImpl/clearTimeoutImpl son
+  // inyectables para pruebas). Mientras no sea null, scheduleReconnect() nunca programa una
+  // segunda reconexion en paralelo, y stop() lo cancela con clearTimeoutImpl -- no solo lo
+  // desreferencia -- para que un timer que ya vencio no dispare connect() tras un stop()
+  // seguido de un start() nuevo.
   let reconnectTimer = null;
   // Por intento de conexion: evita que un pong tardio y el propio timer de estabilidad
   // reseteen el backoff/disparen la reconciliacion dos veces para la misma conexion.
@@ -102,10 +105,10 @@ export const createPrintAgentWebSocketClient = ({
     const wait = backoffDelayMs(attempt, randomImpl);
     attempt += 1;
     log('info', 'ws_reconnect_scheduled', { delay_ms: wait, attempt });
-    reconnectTimer = delayImpl(wait).then(() => {
+    reconnectTimer = setTimeoutImpl(() => {
       reconnectTimer = null;
       if (!stopped) connect();
-    });
+    }, wait);
   };
 
   const connect = () => {
@@ -175,9 +178,10 @@ export const createPrintAgentWebSocketClient = ({
       stopped = true;
       clearHeartbeatTimers();
       clearStableTimer();
-      // El guard `stopped` ya impide que el .then() de reconnectTimer llame connect();
-      // limpiar la referencia deja al cliente listo para programar una reconexion nueva
-      // y sin memoria si start() se vuelve a invocar mas adelante.
+      // clearTimeoutImpl cancela el timer nativo -- no basta con desreferenciarlo --
+      // porque si start() se vuelve a invocar despues, `stopped` vuelve a false y un
+      // timer viejo no cancelado dispararia connect() igual, creando una conexion extra.
+      if (reconnectTimer) clearTimeoutImpl(reconnectTimer);
       reconnectTimer = null;
       try { socket?.terminate(); } catch { /* ya cerrado */ }
       socket = null;

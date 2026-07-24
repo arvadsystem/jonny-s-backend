@@ -56,28 +56,40 @@ const waitUntil = async (predicate, timeoutMs = 500, intervalMs = 5) => {
   throw new Error('WAIT_UNTIL_TIMEOUT');
 };
 
-// delayImpl instantaneo (como en el resto de la suite) pero que registra cada espera
-// programada y cuantas quedan pendientes al mismo tiempo, para probar el guard de un
-// solo reconnectTimer sin esperar minutos de backoff real.
-const createRecordingDelay = () => {
+// setTimeoutImpl/clearTimeoutImpl que registran cada espera programada (el ms pedido) y
+// cuantas quedan pendientes al mismo tiempo, para probar el guard de un solo reconnectTimer
+// sin esperar minutos de backoff real. El callback se difiere via microtask -- nunca de
+// forma sincrona -- porque connect()/close() pueden reentrar scheduleReconnect() en la
+// misma pila; un fake sincrono pisaria la asignacion de reconnectTimer y romperia el guard.
+const createRecordingTimeout = () => {
   const delays = [];
   let pending = 0;
   let maxPending = 0;
-  const delayImpl = (ms) => {
+  let nextId = 1;
+  const cancelled = new Set();
+  const setTimeoutImpl = (fn, ms) => {
     delays.push(ms);
     pending += 1;
     maxPending = Math.max(maxPending, pending);
-    return Promise.resolve().then(() => { pending -= 1; });
+    const id = nextId;
+    nextId += 1;
+    Promise.resolve().then(() => {
+      pending -= 1;
+      if (cancelled.has(id)) return;
+      fn();
+    });
+    return id;
   };
-  return { delayImpl, delays, getMaxPending: () => maxPending };
+  const clearTimeoutImpl = (id) => { cancelled.add(id); };
+  return { setTimeoutImpl, clearTimeoutImpl, delays, getMaxPending: () => maxPending };
 };
 
 test('open seguido de close inmediato no reinicia el backoff', async () => {
   const WebSocketImpl = createFakeWebSocketImpl();
-  const { delayImpl, delays } = createRecordingDelay();
+  const { setTimeoutImpl, clearTimeoutImpl, delays } = createRecordingTimeout();
   const client = createPrintAgentWebSocketClient({
     config: baseConfig, onSignal: async () => {}, log: () => {}, WebSocketImpl,
-    delayImpl, randomImpl: () => 0, stableConnectionMs: 10000
+    setTimeoutImpl, clearTimeoutImpl, randomImpl: () => 0, stableConnectionMs: 10000
   });
 
   client.start();
@@ -99,10 +111,10 @@ test('open seguido de close inmediato no reinicia el backoff', async () => {
 
 test('varios ciclos open/close generan retrasos crecientes (backoff exponencial real)', async () => {
   const WebSocketImpl = createFakeWebSocketImpl();
-  const { delayImpl, delays } = createRecordingDelay();
+  const { setTimeoutImpl, clearTimeoutImpl, delays } = createRecordingTimeout();
   const client = createPrintAgentWebSocketClient({
     config: baseConfig, onSignal: async () => {}, log: () => {}, WebSocketImpl,
-    delayImpl, randomImpl: () => 0, stableConnectionMs: 10000
+    setTimeoutImpl, clearTimeoutImpl, randomImpl: () => 0, stableConnectionMs: 10000
   });
 
   client.start();
@@ -120,10 +132,10 @@ test('varios ciclos open/close generan retrasos crecientes (backoff exponencial 
 
 test('el retraso de reconexion nunca supera 30000ms', async () => {
   const WebSocketImpl = createFakeWebSocketImpl();
-  const { delayImpl, delays } = createRecordingDelay();
+  const { setTimeoutImpl, clearTimeoutImpl, delays } = createRecordingTimeout();
   const client = createPrintAgentWebSocketClient({
     config: baseConfig, onSignal: async () => {}, log: () => {}, WebSocketImpl,
-    delayImpl, randomImpl: () => 0, stableConnectionMs: 10000
+    setTimeoutImpl, clearTimeoutImpl, randomImpl: () => 0, stableConnectionMs: 10000
   });
 
   client.start();
@@ -144,10 +156,10 @@ test('el retraso de reconexion nunca supera 30000ms', async () => {
 
 test('nunca existe mas de un timer/espera de reconexion pendiente a la vez', async () => {
   const WebSocketImpl = createFakeWebSocketImpl();
-  const { delayImpl, getMaxPending } = createRecordingDelay();
+  const { setTimeoutImpl, clearTimeoutImpl, getMaxPending } = createRecordingTimeout();
   const client = createPrintAgentWebSocketClient({
     config: baseConfig, onSignal: async () => {}, log: () => {}, WebSocketImpl,
-    delayImpl, randomImpl: () => 0, stableConnectionMs: 10000
+    setTimeoutImpl, clearTimeoutImpl, randomImpl: () => 0, stableConnectionMs: 10000
   });
 
   client.start();
@@ -165,10 +177,10 @@ test('nunca existe mas de un timer/espera de reconexion pendiente a la vez', asy
 
 test('una conexion estable (permanece abierta stableConnectionMs) si reinicia attempt', async () => {
   const WebSocketImpl = createFakeWebSocketImpl();
-  const { delayImpl, delays } = createRecordingDelay();
+  const { setTimeoutImpl, clearTimeoutImpl, delays } = createRecordingTimeout();
   const client = createPrintAgentWebSocketClient({
     config: baseConfig, onSignal: async () => {}, log: () => {}, WebSocketImpl,
-    delayImpl, randomImpl: () => 0, stableConnectionMs: 10
+    setTimeoutImpl, clearTimeoutImpl, randomImpl: () => 0, stableConnectionMs: 10
   });
 
   client.start();
@@ -196,8 +208,8 @@ test('una conexion estable (permanece abierta stableConnectionMs) si reinicia at
 
 test('stop() cancela heartbeat, stableTimer y la reconexion pendiente (ninguno dispara despues)', async () => {
   const WebSocketImpl = createFakeWebSocketImpl();
-  // delayImpl real (no instantaneo) para probar que, aunque el timer subyacente this
-  // llegue a cumplirse, stop() impide que dispare una nueva conexion.
+  // setTimeoutImpl/clearTimeoutImpl reales (no instantaneos) para probar que, aunque el
+  // timer nativo subyacente llegue a cumplirse, stop() impide que dispare una nueva conexion.
   const client = createPrintAgentWebSocketClient({
     config: baseConfig, onSignal: async () => {}, log: () => {}, WebSocketImpl,
     pingIntervalMs: 20, pongTimeoutMs: 15, stableConnectionMs: 10000
@@ -238,7 +250,7 @@ test('emitSignal("reconnect") no se ejecuta para una conexion que abre y cierra 
     config: baseConfig,
     onSignal: async (trigger) => { signals.push(trigger); },
     log: () => {}, WebSocketImpl,
-    delayImpl: async () => {}, stableConnectionMs: 10000
+    ...createRecordingTimeout(), stableConnectionMs: 10000
   });
 
   client.start();
@@ -257,7 +269,7 @@ test('emitSignal("reconnect") no se ejecuta para una conexion que abre y cierra 
 test('una caida sostenida (equivalente a HTTP 502 repetido) no genera solicitudes cada segundo', async () => {
   // Simula la caida reportada en QA: el proxy deja abrir el WebSocket pero lo corta antes
   // de stableConnectionMs, una y otra vez, apenas se crea cada nuevo intento. Con backoff
-  // real (delayImpl por defecto), en ~2.9s debe haber como mucho 2 intentos de conexion
+  // real (setTimeout nativo por defecto), en ~2.9s debe haber como mucho 2 intentos de conexion
   // (t=0 y t=1s), nunca uno nuevo cada segundo sin crecer.
   const WebSocketImpl = createFakeWebSocketImpl();
   const client = createPrintAgentWebSocketClient({

@@ -76,6 +76,28 @@ const localhostNetworking = {
   networkInterfacesImpl: () => ({})
 };
 
+// Temporizador controlable manualmente: setTimeoutImpl solo registra el callback (nunca
+// lo dispara por si solo) y clearTimeoutImpl(id) lo cancela como el setTimeout/clearTimeout
+// nativos. Permite hacer avanzar el reintento de preconexion (base de 5000ms) sin esperar
+// tiempo real, y probar de forma determinista que un timer cancelado nunca reconecta.
+const createControllableTimeout = () => {
+  let nextId = 1;
+  const callbacks = new Map();
+  const setTimeoutImpl = (fn) => {
+    const id = nextId;
+    nextId += 1;
+    callbacks.set(id, fn);
+    return id;
+  };
+  const clearTimeoutImpl = (id) => { callbacks.delete(id); };
+  const fire = (id) => {
+    const fn = callbacks.get(id);
+    callbacks.delete(id);
+    if (fn) fn();
+  };
+  return { setTimeoutImpl, clearTimeoutImpl, fire, lastId: () => nextId - 1 };
+};
+
 const job = (id, logical = 'factura') => ({
   id_trabajo: id,
   tipo_documento: 'factura',
@@ -141,17 +163,24 @@ test('preconnect: no crea conexiones simultaneas (single-flight)', async () => {
 
 test('preconnect: shutdown (disconnect) cancela el timer de reintento en segundo plano', async () => {
   const fake = createFakeQz({ connectMode: 'fail' });
+  const { setTimeoutImpl, clearTimeoutImpl, fire, lastId } = createControllableTimeout();
   const client = createQzClient({
     config: baseConfig(), api: fakeApi(), qz: fake.qz, ...localhostNetworking,
+    setTimeoutImpl, clearTimeoutImpl,
     log: () => {}
   });
 
   await client.preconnect();
   assert.equal(fake.connectCalls.length, 1, 'el primer intento fallido programa un reintento en segundo plano');
+  const retryTimerId = lastId();
 
   await client.disconnect();
-  await new Promise((resolve) => setTimeout(resolve, 20));
-  assert.equal(fake.connectCalls.length, 1, 'disconnect() debe cancelar el timer: ningun reintento adicional despues del shutdown');
+  // Avanza realmente el temporizador de 5000ms del reintento (en vez de esperar 20ms
+  // reales, que jamas lo habrian alcanzado y dejarian pasar la prueba aunque disconnect()
+  // no lo hubiera cancelado). Si disconnect() cancelo el timer, fire() no hace nada.
+  fire(retryTimerId);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(fake.connectCalls.length, 1, 'disconnect() debe cancelar el timer: ningun reintento adicional aunque venza el temporizador original');
 });
 
 test('preconnect: un trabajo puede conectar despues de una preconexion fallida', async () => {

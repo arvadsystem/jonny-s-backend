@@ -140,7 +140,7 @@ test('WS activado: una señal genera un solo claim y una sola impresion', async 
   });
   const WebSocketImpl = createFakeWebSocketImpl();
   const wsClient = createPrintAgentWebSocketClient({
-    config, log: () => {}, WebSocketImpl, delayImpl: async () => {},
+    config, log: () => {}, WebSocketImpl,
     stableConnectionMs: 10,
     onSignal: (trigger) => runner.claimAndProcess(trigger)
   });
@@ -181,7 +181,7 @@ test('dos señales WS consecutivas antes de resolver la primera: nunca dos claim
   });
   const WebSocketImpl = createFakeWebSocketImpl();
   const wsClient = createPrintAgentWebSocketClient({
-    config, log: () => {}, WebSocketImpl, delayImpl: async () => {},
+    config, log: () => {}, WebSocketImpl,
     stableConnectionMs: 10,
     onSignal: (trigger) => runner.claimAndProcess(trigger)
   });
@@ -223,7 +223,7 @@ test('WS y polling simultaneos: solo un procesamiento activo, un unico claim gan
   });
   const WebSocketImpl = createFakeWebSocketImpl();
   const wsClient = createPrintAgentWebSocketClient({
-    config, log: () => {}, WebSocketImpl, delayImpl: async () => {},
+    config, log: () => {}, WebSocketImpl,
     stableConnectionMs: 10,
     onSignal: (trigger) => runner.claimAndProcess(trigger)
   });
@@ -279,7 +279,7 @@ test('varias señales WS sin trabajos disponibles: claims vacios, sin error y si
   });
   const WebSocketImpl = createFakeWebSocketImpl();
   const wsClient = createPrintAgentWebSocketClient({
-    config, log: () => {}, WebSocketImpl, delayImpl: async () => {},
+    config, log: () => {}, WebSocketImpl,
     stableConnectionMs: 10,
     onSignal: (trigger) => runner.claimAndProcess(trigger)
   });
@@ -321,7 +321,7 @@ test('cinco trabajos disponibles y cinco señales casi simultaneas: cinco impres
   });
   const WebSocketImpl = createFakeWebSocketImpl();
   const wsClient = createPrintAgentWebSocketClient({
-    config, log: () => {}, WebSocketImpl, delayImpl: async () => {},
+    config, log: () => {}, WebSocketImpl,
     stableConnectionMs: 10,
     onSignal: (trigger) => runner.claimAndProcess(trigger)
   });
