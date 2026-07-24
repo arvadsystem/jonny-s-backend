@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import {
   buildVentaTicketPdfBuffer,
   buildVentaTicketPdfDefinition,
@@ -15,6 +16,8 @@ const SHORT_CUSTOMER_NAME = 'Ana Lopez';
 const LONG_CUSTOMER_NAME = 'Maria Fernanda Hernandez Rodriguez de Martinez con apellido adicional';
 const LONG_UNBROKEN_CUSTOMER_NAME = `Cliente ${'ExtraordinariamenteLargo'.repeat(4)}`;
 const STRESS_CUSTOMER_NAME = `Cliente ${'ExtraordinariamenteLargo'.repeat(30)}`;
+
+const sha256 = (buffer) => createHash('sha256').update(buffer).digest('hex');
 
 const buildFactura = (widthMm, customerName) => ({
   id_factura: 501,
@@ -73,19 +76,36 @@ const extractCustomerCss = (html) => html.match(
   /\.comanda-cocina-print__customer-name\s*\{([\s\S]*?)\n\s*\}/
 )?.[1] || '';
 
-for (const [widthMm, expectedFontSize] of [[58, 6.8], [80, 7.7]]) {
+// Roboto-Bold.ttf no existe en node_modules/pdfmake/fonts/Roboto/: la fuente 'bold' del
+// documento sigue mapeada a Roboto-Medium.ttf, que en impresion termica fisica no siempre
+// se distingue del texto normal. Mientras eso sea asi, la fila Cliente se refuerza ademas
+// con un fontSize mayor al del resto del ticket (defaultStyle.fontSize) en ambos anchos.
+for (const [widthMm, expectedFontSize] of [[58, 7.5], [80, 8.5]]) {
   for (const customerName of [SHORT_CUSTOMER_NAME, LONG_CUSTOMER_NAME, LONG_UNBROKEN_CUSTOMER_NAME]) {
     test(`factura ${widthMm} mm imprime cliente actual a ${expectedFontSize} pt: ${customerName.length} caracteres`, async () => {
       const factura = buildFactura(widthMm, customerName);
       const definition = buildVentaTicketPdfDefinition(factura);
       const textNodes = collectPdfTextNodes(definition.content);
+      const labelNode = textNodes.find((node) => node.text === 'CLIENTE');
       const customerNode = textNodes.find((node) => node.text === customerName);
       const customerIndex = textNodes.indexOf(customerNode);
       const nextSectionIndex = textNodes.findIndex((node) => node.text === 'RTN cliente');
 
+      assert.ok(labelNode, 'la etiqueta CLIENTE debe existir como nodo de texto propio');
+      assert.equal(labelNode.bold, true);
+      assert.equal(labelNode.fontSize, expectedFontSize);
+      assert.ok(
+        labelNode.fontSize > definition.defaultStyle.fontSize,
+        'la etiqueta debe imprimirse mas grande que el texto normal del ticket'
+      );
+
       assert.ok(customerNode);
       assert.equal(customerNode.bold, true);
       assert.equal(customerNode.fontSize, expectedFontSize);
+      assert.ok(
+        customerNode.fontSize > definition.defaultStyle.fontSize,
+        'el valor debe imprimirse mas grande que el texto normal del ticket'
+      );
       assert.equal(customerNode.lineHeight, 1.2);
       assert.equal(customerNode.width, '*');
       assert.equal(customerNode.alignment, 'right');
@@ -102,6 +122,15 @@ for (const [widthMm, expectedFontSize] of [[58, 6.8], [80, 7.7]]) {
     const shortDefinition = buildVentaTicketPdfDefinition(buildFactura(widthMm, SHORT_CUSTOMER_NAME));
     const longDefinition = buildVentaTicketPdfDefinition(buildFactura(widthMm, STRESS_CUSTOMER_NAME));
     assert.ok(longDefinition.pageSize.height > shortDefinition.pageSize.height);
+  });
+
+  test(`factura ${widthMm} mm: el renderizado del PDF sigue siendo determinista (mismo hash en dos renderizados iguales)`, async () => {
+    const factura = buildFactura(widthMm, LONG_CUSTOMER_NAME);
+    const pdfOne = await buildVentaTicketPdfBuffer(buildFactura(widthMm, LONG_CUSTOMER_NAME));
+    const pdfTwo = await buildVentaTicketPdfBuffer(factura);
+
+    assert.equal(sha256(pdfOne), sha256(pdfTwo));
+    assert.ok(pdfOne.equals(pdfTwo));
   });
 }
 
@@ -126,7 +155,7 @@ for (const [widthMm, expectedFontSize] of [[58, 11.5], [80, 12.1]]) {
 
 test('los renderers actuales conservan sus fallbacks cuando no hay nombre', () => {
   const pdfNodes = collectPdfTextNodes(buildVentaTicketPdfDefinition(buildFactura(58, null)).content);
-  assert.ok(pdfNodes.some((node) => node.text === 'Consumidor final' && node.fontSize === 6.8));
+  assert.ok(pdfNodes.some((node) => node.text === 'Consumidor final' && node.fontSize === 7.5));
 
   const html = buildComandaCocinaHtml(buildComanda(null), { widthMm: 58 });
   assert.match(html, /class="comanda-cocina-print__customer-name">N\/D<\/span>/);
