@@ -21,6 +21,13 @@ export const CAJA_CLOSE_EMAIL_OUTBOX_STATES = Object.freeze({
 const MAX_ATTEMPTS = 5;
 const DEFAULT_BATCH_SIZE = 5;
 const DEFAULT_LOCK_MS = 120000;
+const DEFAULT_CLAIM_TIMEOUT_MS = 5000;
+// Clave arbitraria y estable de pg_try_advisory_xact_lock: coordina un unico claim activo
+// entre replicas web concurrentes (varias replicas pueden tener el worker activo a la vez).
+// SKIP LOCKED ya evita duplicados aunque el lock fallara; esto solo evita el intento
+// redundante. Al ser un lock de transaccion, se libera solo con COMMIT/ROLLBACK -- nunca
+// puede quedar huerfano si el proceso cae a mitad del claim.
+const OUTBOX_ADVISORY_LOCK_KEY = 727270001;
 
 const parsePositiveInt = (value, fallback, min = 1, max = Number.MAX_SAFE_INTEGER) => {
   const parsed = Number.parseInt(String(value ?? '').trim(), 10);
@@ -638,14 +645,27 @@ export const processCajaCloseEmailOutboxBatch = async ({
   notificationPool = pool,
   batchSize = DEFAULT_BATCH_SIZE,
   lockMs = DEFAULT_LOCK_MS,
+  claimTimeoutMs = DEFAULT_CLAIM_TIMEOUT_MS,
   sendEmail,
   buildPdf,
   buildPdfFilename
 } = {}) => {
+  const boundedClaimTimeoutMs = parsePositiveInt(claimTimeoutMs, DEFAULT_CLAIM_TIMEOUT_MS, 100, 30000);
   const client = await notificationPool.connect();
   let claimed = [];
   try {
     await client.query('BEGIN');
+    // statement_timeout acotado: si PostgreSQL esta degradado (lock contention, replica
+    // saturada), el claim aborta en boundedClaimTimeoutMs en lugar de colgar el tick
+    // indefinidamente; el worker interpreta el error como fallo de tick y aplica backoff.
+    await client.query(`SET LOCAL statement_timeout = ${boundedClaimTimeoutMs}`);
+
+    const lockResult = await client.query('SELECT pg_try_advisory_xact_lock($1) AS locked', [OUTBOX_ADVISORY_LOCK_KEY]);
+    if (lockResult.rows?.[0]?.locked !== true) {
+      await client.query('ROLLBACK');
+      return { claimed: 0, processed: 0, locked: false };
+    }
+
     claimed = await claimCajaCloseEmailNotifications({ queryRunner: client, batchSize, lockMs });
     await client.query('COMMIT');
   } catch (error) {
@@ -670,5 +690,5 @@ export const processCajaCloseEmailOutboxBatch = async ({
     processed += 1;
   }
 
-  return { claimed: claimed.length, processed };
+  return { claimed: claimed.length, processed, locked: true };
 };

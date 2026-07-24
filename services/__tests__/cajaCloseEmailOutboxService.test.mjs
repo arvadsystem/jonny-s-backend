@@ -10,6 +10,7 @@ import {
   loadCajaCloseEmailPayload,
   markCajaCloseEmailNotificationFailed,
   normalizeManualMovement,
+  processCajaCloseEmailOutboxBatch,
   processClaimedCajaCloseEmailNotification,
   resolveCajaCloseOutboxRecipient
 } from '../cajaCloseEmailOutboxService.js';
@@ -221,6 +222,27 @@ describe('caja close email durable outbox', () => {
   it('reinicio del proceso recupera notificaciones persistidas al arrancar el backend', () => {
     assert.match(serverSource, /startCajaCloseEmailOutboxWorker\(\)/);
     assert.match(serverSource, /stopCajaCloseEmailOutboxWorker\(\{ timeoutMs: 5000 \}\)/);
+  });
+
+  it('el servidor abre el puerto antes de iniciar el worker, y un fallo al iniciarlo no lo bloquea ni lo tumba', () => {
+    const listenIndex = serverSource.indexOf('app.listen(PORT');
+    const startIndex = serverSource.indexOf('startCajaCloseEmailOutboxWorker()');
+    assert.ok(listenIndex >= 0, 'debe existir app.listen(PORT');
+    assert.ok(startIndex >= 0, 'debe existir una llamada a startCajaCloseEmailOutboxWorker()');
+    assert.ok(
+      startIndex > listenIndex,
+      'startCajaCloseEmailOutboxWorker() debe aparecer despues de app.listen(PORT (dentro de su callback), nunca antes'
+    );
+    assert.doesNotMatch(
+      serverSource,
+      /await\s+startCajaCloseEmailOutboxWorker\(\)/,
+      'el arranque no debe esperar (await) el primer tick del worker antes de abrir el puerto'
+    );
+    assert.match(
+      serverSource,
+      /startCajaCloseEmailOutboxWorker\(\)\.catch\(/,
+      'un fallo al iniciar el worker en segundo plano debe capturarse, nunca tumbar el proceso'
+    );
   });
 
   it('resuelve destinatario QA y fallback de produccion', async () => {
@@ -716,5 +738,100 @@ describe('caja close email durable outbox', () => {
       }),
       'Cierre de caja registrado - Caja Central - Sucursal 1'
     );
+  });
+
+  describe('processCajaCloseEmailOutboxBatch: timeout de claim y coordinacion entre replicas', () => {
+    // Cliente/pool dedicados a la transaccion BEGIN/lock/claim/COMMIT que abre
+    // processCajaCloseEmailOutboxBatch. Enruta por regex sobre el texto de cada SQL, igual
+    // que los fakes de mas arriba en este archivo (sin mocking library, solo objetos planos).
+    const createFakeOutboxClient = ({ lockAcquired = true, claimRows = [], failClaimWith = null } = {}) => {
+      const calls = [];
+      const client = {
+        async query(sql, params) {
+          calls.push({ sql: String(sql), params });
+          const text = String(sql);
+          if (/^\s*BEGIN\s*$/i.test(text)) return {};
+          if (/^\s*COMMIT\s*$/i.test(text)) return {};
+          if (/^\s*ROLLBACK\s*$/i.test(text)) return {};
+          if (/SET LOCAL statement_timeout/i.test(text)) return {};
+          if (/pg_try_advisory_xact_lock/i.test(text)) return { rows: [{ locked: lockAcquired }] };
+          if (/FOR UPDATE SKIP LOCKED/i.test(text)) {
+            if (failClaimWith) throw failClaimWith;
+            return { rows: claimRows };
+          }
+          return { rows: [] };
+        },
+        release: () => {}
+      };
+      return { client, calls };
+    };
+
+    it('aplica un statement_timeout de 5000ms (default) antes de reclamar', async () => {
+      const { client, calls } = createFakeOutboxClient({ lockAcquired: true, claimRows: [] });
+      const pool = { connect: async () => client };
+
+      const result = await processCajaCloseEmailOutboxBatch({ notificationPool: pool });
+
+      assert.equal(result.claimed, 0);
+      const timeoutCall = calls.find((call) => /SET LOCAL statement_timeout/i.test(call.sql));
+      assert.ok(timeoutCall, 'debe fijar statement_timeout antes de reclamar');
+      assert.match(timeoutCall.sql, /SET LOCAL statement_timeout = 5000\b/);
+      const beginIndex = calls.findIndex((call) => /^\s*BEGIN\s*$/i.test(call.sql));
+      const timeoutIndex = calls.indexOf(timeoutCall);
+      const claimIndex = calls.findIndex((call) => /FOR UPDATE SKIP LOCKED/i.test(call.sql));
+      assert.ok(beginIndex < timeoutIndex && timeoutIndex < claimIndex, 'el timeout debe fijarse dentro de la transaccion, antes del claim');
+    });
+
+    it('respeta un claimTimeoutMs explicito, acotado entre 100 y 30000ms', async () => {
+      const { client, calls } = createFakeOutboxClient({ lockAcquired: true, claimRows: [] });
+      const pool = { connect: async () => client };
+
+      await processCajaCloseEmailOutboxBatch({ notificationPool: pool, claimTimeoutMs: 2000 });
+
+      const timeoutCall = calls.find((call) => /SET LOCAL statement_timeout/i.test(call.sql));
+      assert.match(timeoutCall.sql, /SET LOCAL statement_timeout = 2000\b/);
+    });
+
+    it('si el claim excede el timeout, el error se propaga (no se traga) tras hacer ROLLBACK', async () => {
+      const timeoutError = Object.assign(new Error('canceling statement due to statement timeout'), { code: '57014' });
+      const { client, calls } = createFakeOutboxClient({ lockAcquired: true, failClaimWith: timeoutError });
+      const pool = { connect: async () => client };
+
+      await assert.rejects(
+        processCajaCloseEmailOutboxBatch({ notificationPool: pool }),
+        (error) => error.code === '57014'
+      );
+      assert.ok(calls.some((call) => /^\s*ROLLBACK\s*$/i.test(call.sql)), 'debe hacer ROLLBACK tras el timeout de claim');
+    });
+
+    it('una sola instancia activa: si otra replica ya sostiene el advisory lock, esta se retira sin reclamar filas', async () => {
+      const { client, calls } = createFakeOutboxClient({ lockAcquired: false });
+      const pool = { connect: async () => client };
+
+      const result = await processCajaCloseEmailOutboxBatch({ notificationPool: pool });
+
+      assert.deepEqual(result, { claimed: 0, processed: 0, locked: false });
+      assert.ok(
+        !calls.some((call) => /FOR UPDATE SKIP LOCKED/i.test(call.sql)),
+        'no debe intentar reclamar filas si no obtuvo el advisory lock'
+      );
+      assert.ok(calls.some((call) => /^\s*ROLLBACK\s*$/i.test(call.sql)), 'debe cerrar la transaccion (ROLLBACK) al retirarse sin el lock');
+    });
+
+    it('con el lock disponible, las filas reclamadas siguen procesandose (correos pendientes no se pierden)', async () => {
+      const claimRows = [
+        { id_notificacion: 1, id_cierre_caja: 501, email_destino: null, intentos: 0 },
+        { id_notificacion: 2, id_cierre_caja: 502, email_destino: null, intentos: 0 }
+      ];
+      const { client, calls } = createFakeOutboxClient({ lockAcquired: true, claimRows });
+      const genericQuery = async (sql, params) => { calls.push({ sql: String(sql), params }); return { rows: [] }; };
+      const pool = { connect: async () => client, query: genericQuery };
+
+      const result = await processCajaCloseEmailOutboxBatch({ notificationPool: pool });
+
+      assert.equal(result.claimed, 2);
+      assert.equal(result.processed, 2, 'ambas filas reclamadas deben pasar por el procesamiento (exito o fallo, nunca se descartan)');
+      assert.equal(result.locked, true);
+    });
   });
 });
