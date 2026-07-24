@@ -14,6 +14,13 @@ const integer = (env, key, fallback, min, max) => {
   if (!Number.isInteger(value) || value < min || value > max) throw new Error(`CONFIG_INVALID:${key}`);
   return value;
 };
+// Si la variable falta o tiene un valor no reconocido, se conserva el comportamiento
+// actual mas seguro (solo polling): equivale a `fallback`.
+const boolean = (env, key, fallback) => {
+  const value = String(env[key] ?? '').trim().toLowerCase();
+  if (!value) return fallback;
+  return value === 'true';
+};
 
 export const normalizeQzHost = (value) => {
   const rawHost = String(value ?? '').trim().replace(/\.$/, '');
@@ -73,6 +80,7 @@ export const loadConfig = (
     pollIntervalMs: integer(env, 'POLL_INTERVAL_MS', 3000, 500, 60000),
     heartbeatIntervalMs: integer(env, 'HEARTBEAT_INTERVAL_MS', 30000, 5000, 300000),
     leaseSeconds: integer(env, 'LEASE_SECONDS', 90, 30, 600),
+    websocketEnabled: boolean(env, 'PRINT_AGENT_WEBSOCKET_ENABLED', false),
     printerMap,
     logDir: String(env.LOG_DIR || './logs').trim(),
     stateFile: path.resolve(String(env.PRINT_STATE_FILE || './data/print-state.json').trim()),

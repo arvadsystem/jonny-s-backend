@@ -3,6 +3,7 @@ import {
   validateCanonicalPrintDataItem,
   validateCanonicalPrintPayload
 } from './printJobDocumentService.js';
+import { notifyPrintJobAvailable } from './printAgentWebSocketService.js';
 
 export const PRINT_DOCUMENT_TYPES = new Set(['factura', 'comanda', 'caja']);
 const MAX_PAYLOAD_BYTES = 256 * 1024;
@@ -33,7 +34,8 @@ export const validatePrintPayload = (payload) => {
 export const enqueuePrintJob = async ({
   idSucursal, tipoDocumento, payload, idempotencyKey, idFactura = null,
   idPedido = null, idUsuario = null, esReimpresion = false,
-  canonicalDocument = null, db = pool, onInsertedTransaction = null
+  canonicalDocument = null, db = pool, onInsertedTransaction = null,
+  notify = notifyPrintJobAvailable
 }) => {
   const normalizedType = String(tipoDocumento || '').trim().toLowerCase();
   const validation = validatePrintPayload(payload);
@@ -104,6 +106,11 @@ export const enqueuePrintJob = async ({
     }
     await client.query('COMMIT');
     const { inserted, ...publicJob } = job;
+    if (inserted === true) {
+      // Señal aditiva: nunca lleva el documento ni ordena imprimir, solo indica que hay
+      // trabajo disponible. El claim real sigue siendo exclusivamente la RPC via polling/WS.
+      try { notify(idSucursal); } catch { /* la notificacion WS nunca debe romper el encolado */ }
+    }
     return publicJob;
   } catch (error) {
     try { await client.query('ROLLBACK'); } catch { /* conserva error original */ }
