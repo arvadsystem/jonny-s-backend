@@ -51,7 +51,7 @@ process.once('SIGTERM', () => exitAfterShutdown('SIGTERM'));
 
 try {
   const api = createApiClient({ config });
-  qz = createQzClient({ config, api });
+  qz = createQzClient({ config, api, log });
   const stateStore = createPrintStateStore({ filePath: config.stateFile });
   await stateStore.init();
   runner = createRunner({ config, api, qz, stateStore, log });
@@ -64,6 +64,10 @@ try {
     wsClient.start();
     log('info', 'ws_client_enabled', {});
   }
+  // Preconexion best-effort: nunca lanza (ver qzClient.js), asi que nunca convierte la
+  // ausencia de QZ Tray en un error fatal de arranque. Si falla, el agente sigue vivo y
+  // el primer trabajo real vuelve a intentar conectar dentro de qz.prepare().
+  await qz.preconnect();
   log('info', 'agent_started', { agent_id: config.agentId, branch_id: config.branchId });
   await runner.run();
 } finally {

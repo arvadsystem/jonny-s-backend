@@ -81,6 +81,9 @@ export const loadConfig = (
     heartbeatIntervalMs: integer(env, 'HEARTBEAT_INTERVAL_MS', 30000, 5000, 300000),
     leaseSeconds: integer(env, 'LEASE_SECONDS', 90, 30, 600),
     websocketEnabled: boolean(env, 'PRINT_AGENT_WEBSOCKET_ENABLED', false),
+    // Ausente o false: comportamiento actual, sin métricas ni ruido adicional en logs.
+    perfLogsEnabled: boolean(env, 'PRINT_AGENT_PERF_LOGS', false),
+    printerCacheTtlMs: integer(env, 'PRINTER_DISCOVERY_CACHE_TTL_MS', 60000, 0, 600000),
     printerMap,
     logDir: String(env.LOG_DIR || './logs').trim(),
     stateFile: path.resolve(String(env.PRINT_STATE_FILE || './data/print-state.json').trim()),

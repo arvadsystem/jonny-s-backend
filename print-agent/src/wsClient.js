@@ -6,6 +6,10 @@ const MAX_BACKOFF_MS = 30000;
 const MAX_BACKOFF_ATTEMPT = 5; // 1000 * 2^5 = 32000ms, recortado a MAX_BACKOFF_MS
 const PING_INTERVAL_MS = 25000;
 const PONG_TIMEOUT_MS = 10000;
+// Cuanto debe permanecer abierta una conexion antes de confiar en ella. Un proxy que
+// deja abrir el WebSocket pero lo cierra casi de inmediato (QA) no debe resetear el
+// backoff ni disparar la reconciliacion por reconexion; ver createPrintAgentWebSocketClient.
+const STABLE_CONNECTION_MS = 3000;
 
 const sanitize = (error) => String(error?.code || error?.message || 'WS_ERROR').replace(/[\r\n\t]+/g, ' ').slice(0, 500);
 
@@ -29,13 +33,23 @@ export const createPrintAgentWebSocketClient = ({
   delayImpl = delay,
   randomImpl = Math.random,
   pingIntervalMs = PING_INTERVAL_MS,
-  pongTimeoutMs = PONG_TIMEOUT_MS
+  pongTimeoutMs = PONG_TIMEOUT_MS,
+  stableConnectionMs = STABLE_CONNECTION_MS
 }) => {
   let stopped = true;
   let socket = null;
   let attempt = 0;
   let pingTimer = null;
   let pongTimer = null;
+  let stableTimer = null;
+  // Referencia a la espera de reconexion en curso (delayImpl(wait) resuelto/pendiente).
+  // No es un handle nativo de setTimeout -- delayImpl es inyectable para pruebas -- pero
+  // cumple el mismo rol: mientras no sea null, scheduleReconnect() nunca programa una
+  // segunda reconexion en paralelo, y stop() la limpia para que no dispare connect().
+  let reconnectTimer = null;
+  // Por intento de conexion: evita que un pong tardio y el propio timer de estabilidad
+  // reseteen el backoff/disparen la reconciliacion dos veces para la misma conexion.
+  let stabilized = false;
 
   const emitSignal = (trigger) => {
     Promise.resolve()
@@ -43,11 +57,28 @@ export const createPrintAgentWebSocketClient = ({
       .catch((error) => log('error', 'ws_signal_failed', { trigger, code: sanitize(error) }));
   };
 
+  const clearStableTimer = () => {
+    if (stableTimer) clearTimeout(stableTimer);
+    stableTimer = null;
+  };
+
   const clearHeartbeatTimers = () => {
     if (pingTimer) clearInterval(pingTimer);
     if (pongTimer) clearTimeout(pongTimer);
     pingTimer = null;
     pongTimer = null;
+  };
+
+  // Unica puerta hacia "esta conexion es confiable": una vez cruzada (por pong o por
+  // tiempo), recien ahi se resetea el backoff exponencial y se dispara la reconciliacion
+  // por reconexion. Una conexion que abre y cierra rapido nunca llega a este punto.
+  const markStable = () => {
+    if (stabilized) return;
+    stabilized = true;
+    clearStableTimer();
+    attempt = 0;
+    log('info', 'ws_stable', {});
+    emitSignal('reconnect');
   };
 
   const startHeartbeat = (activeSocket) => {
@@ -67,14 +98,19 @@ export const createPrintAgentWebSocketClient = ({
 
   const scheduleReconnect = () => {
     if (stopped) return;
+    if (reconnectTimer) return; // nunca mas de una reconexion programada al mismo tiempo
     const wait = backoffDelayMs(attempt, randomImpl);
     attempt += 1;
     log('info', 'ws_reconnect_scheduled', { delay_ms: wait, attempt });
-    void delayImpl(wait).then(() => { if (!stopped) connect(); });
+    reconnectTimer = delayImpl(wait).then(() => {
+      reconnectTimer = null;
+      if (!stopped) connect();
+    });
   };
 
   const connect = () => {
     if (stopped) return;
+    stabilized = false;
     let ws;
     try {
       ws = new WebSocketImpl(buildPrintAgentWsUrl(config.apiBaseUrl), {
@@ -92,15 +128,18 @@ export const createPrintAgentWebSocketClient = ({
 
     ws.on('open', () => {
       if (stopped) return;
-      attempt = 0;
       log('info', 'ws_connected', {});
       startHeartbeat(ws);
-      emitSignal('reconnect');
+      // No se resetea attempt ni se dispara la reconciliacion todavia: primero hay que
+      // ver que la conexion aguante stableConnectionMs, o llegue un pong valido.
+      clearStableTimer();
+      stableTimer = setTimeout(markStable, stableConnectionMs);
     });
 
     ws.on('pong', () => {
       if (pongTimer) clearTimeout(pongTimer);
       pongTimer = null;
+      markStable();
     });
 
     ws.on('message', (raw) => {
@@ -114,6 +153,7 @@ export const createPrintAgentWebSocketClient = ({
 
     ws.on('close', () => {
       clearHeartbeatTimers();
+      clearStableTimer();
       if (stopped) return;
       log('info', 'ws_disconnected', {});
       scheduleReconnect();
@@ -134,6 +174,11 @@ export const createPrintAgentWebSocketClient = ({
     stop: () => {
       stopped = true;
       clearHeartbeatTimers();
+      clearStableTimer();
+      // El guard `stopped` ya impide que el .then() de reconnectTimer llame connect();
+      // limpiar la referencia deja al cliente listo para programar una reconexion nueva
+      // y sin memoria si start() se vuelve a invocar mas adelante.
+      reconnectTimer = null;
       try { socket?.terminate(); } catch { /* ya cerrado */ }
       socket = null;
     }

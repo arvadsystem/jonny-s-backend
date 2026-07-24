@@ -1,3 +1,5 @@
+import { createStageTimer } from './metrics.js';
+
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const sanitize = (error) => String(error?.code || error?.message || 'PRINT_FAILED').replace(/[\r\n\t]+/g, ' ').slice(0, 500);
 const RESOLVED_STATES = new Set(['pendiente', 'impreso', 'fallido', 'cancelado']);
@@ -18,7 +20,11 @@ export const createRunner = ({ config, api, qz, stateStore, log = () => {}, dela
   // de descartarla, se marca claimPending para forzar una vuelta extra de drenaje antes de
   // liberar el guard, sin permitir nunca una segunda ejecucion concurrente.
   let claimPending = false;
+  // Cuenta cuantas señales fueron diferidas durante la vuelta de drenaje activa, para
+  // registrar un solo resumen al final en vez de un log por cada claim_deferred (Fase 6).
+  let deferredSignalCount = 0;
   const uncertainLogged = new Set();
+  const { timeStage } = createStageTimer({ log, enabled: config.perfLogsEnabled === true });
 
   const removeJournal = async (jobId, event, data = {}) => {
     await stateStore.remove(jobId);
@@ -61,8 +67,10 @@ export const createRunner = ({ config, api, qz, stateStore, log = () => {}, dela
   };
 
   const dispatchPrepared = async (job, prepared) => {
-    await stateStore.markDispatchStarted(job);
+    await timeStage(job.id_trabajo, 'journal_mark_dispatch_started', () => stateStore.markDispatchStarted(job));
     try {
+      // qz.dispatch ya mide su propia etapa qz_print internamente (qzClient.js); aqui solo
+      // se conserva intacta la barrera de resultado fisico incierto ante cualquier rechazo.
       await qz.dispatch(prepared);
     } catch (error) {
       // Desde la invocacion de qz.print, cualquier rechazo tiene resultado fisico ambiguo.
@@ -70,9 +78,9 @@ export const createRunner = ({ config, api, qz, stateStore, log = () => {}, dela
       return true;
     }
 
-    await stateStore.markPrintedUnconfirmed(job);
+    await timeStage(job.id_trabajo, 'journal_mark_printed_unconfirmed', () => stateStore.markPrintedUnconfirmed(job));
     try {
-      await api.complete(job.id_trabajo);
+      await timeStage(job.id_trabajo, 'api_complete', () => api.complete(job.id_trabajo));
       await removeJournal(job.id_trabajo, 'print_complete');
     } catch (error) {
       log('error', 'print_confirmation_pending', { job_id: job.id_trabajo, code: sanitize(error) });
@@ -153,14 +161,19 @@ export const createRunner = ({ config, api, qz, stateStore, log = () => {}, dela
     return { didDispatch };
   };
 
-  const processJob = async (job) => {
+  // total_processing envuelve exactamente el cuerpo original de processJob: nunca cambia
+  // que se ejecuta ni el orden, solo agrega la medicion de principio a fin (Fase 2). Con
+  // metricas apagadas, timeStage llama processJob sin ningun costo ni cambio de comportamiento.
+  const processJob = (job) => timeStage(job.id_trabajo, 'total_processing', async () => {
     if (Number(job.id_sucursal) !== config.branchId) throw new Error('BRANCH_SCOPE_MISMATCH');
-    await api.printing(job.id_trabajo);
+    await timeStage(job.id_trabajo, 'api_printing', () => api.printing(job.id_trabajo));
     const renewTimer = setInterval(() => void api.renew(job.id_trabajo).catch(() => undefined), Math.max(10_000, config.leaseSeconds * 500));
     let prepared;
     try {
+      // qz.prepare mide sus propias sub-etapas internamente (qz_connect, printers_find,
+      // printer_resolution, document_download, document_validation; ver qzClient.js).
       prepared = await qz.prepare(job);
-      await stateStore.markPrepared(job);
+      await timeStage(job.id_trabajo, 'journal_mark_prepared', () => stateStore.markPrepared(job));
     } catch (error) {
       await api.fail(job.id_trabajo, sanitize(error)).catch(() => undefined);
       log('error', 'print_prepare_failed', { job_id: job.id_trabajo, code: sanitize(error) });
@@ -169,7 +182,7 @@ export const createRunner = ({ config, api, qz, stateStore, log = () => {}, dela
     }
 
     try {
-      await api.confirmationPending(job.id_trabajo);
+      await timeStage(job.id_trabajo, 'confirmation_pending', () => api.confirmationPending(job.id_trabajo));
     } catch (error) {
       // La respuesta puede perderse despues de que el backend cruzo la barrera.
       log('error', 'print_barrier_pending', { job_id: job.id_trabajo, code: sanitize(error) });
@@ -178,7 +191,7 @@ export const createRunner = ({ config, api, qz, stateStore, log = () => {}, dela
     }
     clearInterval(renewTimer);
     await dispatchPrepared(job, prepared);
-  };
+  });
 
   // Punto unico de reclamo/procesamiento: polling, WebSocket ("job_available") y
   // reconexion WebSocket convergen aqui. claimInProgress evita que dos disparadores
@@ -190,14 +203,19 @@ export const createRunner = ({ config, api, qz, stateStore, log = () => {}, dela
   // cola vacia o se alcance MAX_DRAIN_ITERATIONS. Una señal que llega mientras esta
   // vuelta ya esta en curso jamas se pierde: queda marcada en claimPending y fuerza una
   // vuelta extra de verificacion antes de salir, en vez de descartarse.
+  //
+  // Fase 6: claim_deferred es esperado cuando polling y WebSocket coinciden y no indica
+  // ningun error; en vez de un log por cada señal diferida, se cuenta y se resume una
+  // sola vez al final de la vuelta de drenaje activa (claim_deferred_summary).
   const claimAndProcess = async (trigger) => {
     if (claimInProgress) {
       claimPending = true;
-      log('info', 'claim_deferred', { trigger });
+      deferredSignalCount += 1;
       return [];
     }
 
     claimInProgress = true;
+    deferredSignalCount = 0;
     const processedJobs = [];
     const seenJobIds = new Set();
     let iteration = 0;
@@ -233,6 +251,9 @@ export const createRunner = ({ config, api, qz, stateStore, log = () => {}, dela
       }
     } finally {
       claimInProgress = false;
+      if (deferredSignalCount > 0) {
+        log('info', 'claim_deferred_summary', { trigger, deferred_count: deferredSignalCount });
+      }
     }
     return processedJobs;
   };

@@ -420,7 +420,10 @@ test('cliente QZ usa documentos canonicos v2 y conserva discovery, WSS, SHA512 y
     const client = createQzClient({
       config: {
         qzHost: 'qz-elcarmen.jonnyshn.com', qzSecurePort: 8181, qzCaCertPath: caPath,
-        printerMap: { factura: 'ZKP8008', cocina: 'Kitchen Printer' }
+        printerMap: { factura: 'ZKP8008', cocina: 'Kitchen Printer' },
+        // TTL 0: esta prueba verifica discovery/firma/documento por cada prepare(); la
+        // cache de impresoras (Fase 4) se cubre por separado en qzClientPreconnectAndCache.test.js.
+        printerCacheTtlMs: 0
       },
       api,
       qz,
@@ -588,7 +591,11 @@ test('cliente QZ usa documentos canonicos v2 y conserva discovery, WSS, SHA512 y
       crypto.createHash('sha256').update(preparedPendingComanda.data[0].data, 'utf8').digest('hex'),
       pendingComandaJob.payload.documento_canonico.content_sha256
     );
-    assert.equal(findCalls.length, 4);
+    // La impresora configurada no aparece en la lista mutada (availablePrinters =
+    // ['Otra impresora']): antes de declarar IMPRESORA_NO_ENCONTRADA, la Fase 4 invalida
+    // la cache y reintenta una sola vez, por eso el trabajo 73 genera dos find en vez de
+    // uno (cinco find en total en vez de cuatro).
+    assert.equal(findCalls.length, 5);
     assert.equal(findCalls[0][0], undefined);
     assert.equal(findCalls[0][1], undefined);
     assert.equal(findCalls[0][2], signCalls[0].request.timestamp);
@@ -601,10 +608,14 @@ test('cliente QZ usa documentos canonicos v2 y conserva discovery, WSS, SHA512 y
     assert.equal(findCalls[3][0], undefined);
     assert.equal(findCalls[3][1], undefined);
     assert.equal(findCalls[3][2], signCalls[6].request.timestamp);
+    assert.equal(findCalls[4][0], undefined);
+    assert.equal(findCalls[4][1], undefined);
+    assert.equal(findCalls[4][2], signCalls[7].request.timestamp);
     assert.deepEqual(signCalls[0].request.params, {});
     assert.deepEqual(signCalls[2].request.params, {});
     assert.deepEqual(signCalls[4].request.params, {});
     assert.deepEqual(signCalls[6].request.params, {});
+    assert.deepEqual(signCalls[7].request.params, {});
     assert.deepEqual(signCalls.map(({ jobId, request, digest }) => ({ jobId, call: request.call, digest })), [
       { jobId: 71, call: 'printers.find', digest: 'find-digest' },
       { jobId: 71, call: 'print', digest: 'print-digest' },
@@ -612,6 +623,7 @@ test('cliente QZ usa documentos canonicos v2 y conserva discovery, WSS, SHA512 y
       { jobId: 72, call: 'print', digest: 'print-digest' },
       { jobId: 74, call: 'printers.find', digest: 'find-digest' },
       { jobId: 74, call: 'print', digest: 'print-digest' },
+      { jobId: 73, call: 'printers.find', digest: 'find-digest' },
       { jobId: 73, call: 'printers.find', digest: 'find-digest' }
     ]);
     assert.equal(printCalls.length, 3);

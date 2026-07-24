@@ -71,7 +71,7 @@ test('backoffDelayMs sigue 1,2,4,8,16,30s con tope y jitter pequeño', () => {
   assert.ok(withJitter >= 1000 && withJitter <= 1100, `jitter fuera de rango: ${withJitter}`);
 });
 
-test('al conectar (open) ejecuta claimAndProcess("reconnect")', async () => {
+test('al conectar (open) NO ejecuta claimAndProcess("reconnect") de inmediato', async () => {
   const WebSocketImpl = createFakeWebSocketImpl();
   const signals = [];
   const client = createPrintAgentWebSocketClient({
@@ -79,7 +79,8 @@ test('al conectar (open) ejecuta claimAndProcess("reconnect")', async () => {
     onSignal: async (trigger) => { signals.push(trigger); },
     log: () => {},
     WebSocketImpl,
-    delayImpl: async () => {}
+    delayImpl: async () => {},
+    stableConnectionMs: 10000 // deliberadamente largo: nada debe emitirse todavia
   });
   client.start();
   const socket = WebSocketImpl.instances[0];
@@ -89,6 +90,25 @@ test('al conectar (open) ejecuta claimAndProcess("reconnect")', async () => {
 
   openInstance(socket, WebSocketImpl);
   await tick();
+  assert.deepEqual(signals, [], 'open por si solo no debe disparar reconnect antes de probar estabilidad');
+  client.stop();
+});
+
+test('una conexion que permanece abierta stableConnectionMs si ejecuta claimAndProcess("reconnect")', async () => {
+  const WebSocketImpl = createFakeWebSocketImpl();
+  const signals = [];
+  const client = createPrintAgentWebSocketClient({
+    config: baseConfig,
+    onSignal: async (trigger) => { signals.push(trigger); },
+    log: () => {},
+    WebSocketImpl,
+    delayImpl: async () => {},
+    stableConnectionMs: 10
+  });
+  client.start();
+  const socket = WebSocketImpl.instances[0];
+  openInstance(socket, WebSocketImpl);
+  await waitUntil(() => signals.includes('reconnect'), 500);
   assert.deepEqual(signals, ['reconnect']);
   client.stop();
 });
@@ -187,7 +207,8 @@ test('dos señales consecutivas: el wsClient llama onSignal ambas veces, pero el
     onSignal: guardedOnSignal,
     log: () => {},
     WebSocketImpl,
-    delayImpl: async () => {}
+    delayImpl: async () => {},
+    stableConnectionMs: 10
   });
   client.start();
   const socket = WebSocketImpl.instances[0];
@@ -208,7 +229,7 @@ test('dos señales consecutivas: el wsClient llama onSignal ambas veces, pero el
   client.stop();
 });
 
-test('al cerrarse la conexion programa reconexion y vuelve a emitir reconnect', async () => {
+test('al cerrarse la conexion programa reconexion y, una vez estable, vuelve a emitir reconnect', async () => {
   const WebSocketImpl = createFakeWebSocketImpl();
   const signals = [];
   const client = createPrintAgentWebSocketClient({
@@ -216,12 +237,13 @@ test('al cerrarse la conexion programa reconexion y vuelve a emitir reconnect', 
     onSignal: async (trigger) => { signals.push(trigger); },
     log: () => {},
     WebSocketImpl,
-    delayImpl: async () => {}
+    delayImpl: async () => {},
+    stableConnectionMs: 10
   });
   client.start();
   const first = WebSocketImpl.instances[0];
   openInstance(first, WebSocketImpl);
-  await tick();
+  await waitUntil(() => signals.includes('reconnect'), 500);
   signals.length = 0;
 
   first.readyState = WebSocketImpl.CLOSED;
@@ -229,7 +251,7 @@ test('al cerrarse la conexion programa reconexion y vuelve a emitir reconnect', 
   await waitUntil(() => WebSocketImpl.instances.length === 2, 500);
   const second = WebSocketImpl.instances[1];
   openInstance(second, WebSocketImpl);
-  await tick();
+  await waitUntil(() => signals.includes('reconnect'), 500);
   assert.deepEqual(signals, ['reconnect']);
   client.stop();
 });
