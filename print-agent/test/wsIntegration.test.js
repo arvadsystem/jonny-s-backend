@@ -5,7 +5,7 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { loadConfig } from '../src/config.js';
-import { createRunner } from '../src/runner.js';
+import { createRunner, MAX_DRAIN_ITERATIONS } from '../src/runner.js';
 import { createPrintStateStore } from '../src/stateStore.js';
 import { createPrintAgentWebSocketClient } from '../src/wsClient.js';
 
@@ -101,6 +101,33 @@ const createSlowClaimApi = ({ jobsQueue, claimDelayMs = 15 }) => {
   };
 };
 
+// Fake API con "claim" resuelto manualmente desde la prueba, para forzar de forma
+// determinista (sin depender de setTimeout) el instante exacto en que una señal externa
+// llega mientras una vuelta de drenaje especifica sigue en vuelo.
+const createControllableClaimApi = () => {
+  const claimCalls = [];
+  const pendingResolvers = [];
+  return {
+    api: {
+      claim: () => new Promise((resolve) => {
+        claimCalls.push(Date.now());
+        pendingResolvers.push(resolve);
+      }),
+      printing: async () => {},
+      renew: async () => {},
+      confirmationPending: async () => {},
+      complete: async () => {},
+      fail: async () => {}
+    },
+    claimCalls,
+    resolveNextClaim: (jobs) => {
+      const resolve = pendingResolvers.shift();
+      if (!resolve) throw new Error('NO_PENDING_CLAIM_TO_RESOLVE');
+      resolve({ jobs });
+    }
+  };
+};
+
 test('WS activado: una señal genera un solo claim y una sola impresion', async () => {
   const fixture = await createStoreFixture('jonnys-ws-single-');
   const jobsQueue = [];
@@ -130,7 +157,10 @@ test('WS activado: una señal genera un solo claim y una sola impresion', async 
     await new Promise((resolve) => setTimeout(resolve, claimDelayMs + 25));
 
     assert.equal(dispatches, 1);
-    assert.equal(claimCalls.length, 2, 'reconnect + job_available: dos claims secuenciales, uno por cada señal');
+    // reconnect (1) + job_available: reclama job101 (2) y drena una vez mas para
+    // confirmar cola vacia antes de soltar el guard (3). La llamada extra es el
+    // comportamiento correcto del drenaje, no una señal duplicada ni un reclamo repetido.
+    assert.equal(claimCalls.length, 3, 'reconnect + drenaje de job_available (reclamo + confirmacion de cola vacia)');
   } finally {
     wsClient.stop();
     runner.stop();
@@ -138,7 +168,7 @@ test('WS activado: una señal genera un solo claim y una sola impresion', async 
   }
 });
 
-test('dos señales WS consecutivas antes de resolver la primera: un solo claim en vuelo, una sola impresion', async () => {
+test('dos señales WS consecutivas antes de resolver la primera: nunca dos claims en vuelo, una sola impresion', async () => {
   const fixture = await createStoreFixture('jonnys-ws-double-signal-');
   const jobsQueue = [];
   const claimDelayMs = 40;
@@ -168,7 +198,10 @@ test('dos señales WS consecutivas antes de resolver la primera: un solo claim e
     await new Promise((resolve) => setTimeout(resolve, claimDelayMs + 25));
 
     assert.equal(dispatches, 1, 'dos señales consecutivas no deben generar dos impresiones');
-    assert.equal(claimCalls.length, 1, 'la segunda señal debe ser absorbida por claimInProgress antes de llamar a claim()');
+    // La segunda señal jamas abre un segundo claim concurrente (la absorbe claimInProgress/
+    // claimPending), pero tampoco se pierde: el drenaje de la primera señal reclama job102
+    // (1) y hace una vuelta extra para confirmar cola vacia (2) en lugar de descartarla.
+    assert.equal(claimCalls.length, 2, 'drenaje de la señal en curso: reclamo del job + confirmacion de cola vacia, nunca un segundo claim concurrente');
     assert.equal(getMaxConcurrentClaims(), 1, 'nunca debe haber dos claims en vuelo al mismo tiempo dentro del mismo agente');
   } finally {
     wsClient.stop();
@@ -263,6 +296,127 @@ test('varias señales WS sin trabajos disponibles: claims vacios, sin error y si
     assert.equal(claimCalls.length, 6, 'reconnect + 5 señales = 6 claims vacios, todos sin error');
   } finally {
     wsClient.stop();
+    runner.stop();
+    await fs.rm(fixture.tempDir, { recursive: true, force: true });
+  }
+});
+
+test('cinco trabajos disponibles y cinco señales casi simultaneas: cinco impresiones, cero duplicados, un solo claim en vuelo, nada queda para el siguiente polling', async () => {
+  const fixture = await createStoreFixture('jonnys-ws-five-signals-');
+  const jobIds = [201, 202, 203, 204, 205];
+  const jobsQueue = jobIds.map((id) => job(id));
+  const claimDelayMs = 15;
+  const { api, getMaxConcurrentClaims, claimCalls } = createSlowClaimApi({ jobsQueue, claimDelayMs });
+  const dispatchedIds = [];
+  const runner = createRunner({
+    config, api, stateStore: fixture.store, log: () => {},
+    qz: {
+      prepare: async (value) => ({ job: value }),
+      dispatch: async ({ job: dispatchedJob }) => { dispatchedIds.push(dispatchedJob.id_trabajo); }
+    }
+  });
+  const WebSocketImpl = createFakeWebSocketImpl();
+  const wsClient = createPrintAgentWebSocketClient({
+    config, log: () => {}, WebSocketImpl, delayImpl: async () => {},
+    onSignal: (trigger) => runner.claimAndProcess(trigger)
+  });
+  try {
+    wsClient.start();
+    const socket = WebSocketImpl.instances[0];
+    openInstance(socket, WebSocketImpl); // reconnect: la cola de 5 trabajos aun no tiene nada visible
+    await waitUntil(() => claimCalls.length === 1, 500);
+    await new Promise((resolve) => setTimeout(resolve, claimDelayMs + 25));
+    claimCalls.length = 0;
+
+    // Cinco trabajos ya estan disponibles en el backend y llegan cinco señales
+    // job_available casi al mismo tiempo (sin esperar entre ellas), tal como pide la
+    // Etapa siguiente: el guard debe absorber las señales redundantes pero el drenaje de
+    // la que gana el guard debe procesar los cinco sin esperar al siguiente polling.
+    for (let i = 0; i < 5; i += 1) {
+      socket.emit('message', JSON.stringify({ event: 'job_available', branch_id: 2 }));
+    }
+
+    await waitUntil(() => dispatchedIds.length === 5, 2000);
+    await new Promise((resolve) => setTimeout(resolve, claimDelayMs + 30));
+
+    assert.equal(dispatchedIds.length, 5, 'deben imprimirse exactamente cinco trabajos');
+    assert.deepEqual([...dispatchedIds].sort((a, b) => a - b), jobIds, 'cada uno de los cinco trabajos se imprime, sin faltantes');
+    assert.equal(new Set(dispatchedIds).size, 5, 'cero duplicados: cinco ids distintos');
+    assert.equal(getMaxConcurrentClaims(), 1, 'jamas debe haber mas de un claim en vuelo al mismo tiempo');
+    assert.equal(jobsQueue.length, 0, 'la cola local queda vacia: ningun trabajo espera al siguiente polling');
+  } finally {
+    wsClient.stop();
+    runner.stop();
+    await fs.rm(fixture.tempDir, { recursive: true, force: true });
+  }
+});
+
+test('una señal que llega mientras se confirma la cola vacia no se pierde (claimPending)', async () => {
+  const fixture = await createStoreFixture('jonnys-ws-late-signal-');
+  const { api, claimCalls, resolveNextClaim } = createControllableClaimApi();
+  let dispatches = 0;
+  const runner = createRunner({
+    config, api, stateStore: fixture.store, log: () => {},
+    qz: { prepare: async (value) => ({ job: value }), dispatch: async () => { dispatches += 1; } }
+  });
+
+  try {
+    const draining = runner.claimAndProcess('websocket');
+    await waitUntil(() => claimCalls.length === 1, 500);
+    resolveNextClaim([job(301)]); // primera vuelta: hay un trabajo disponible
+    await waitUntil(() => dispatches === 1, 500);
+    await waitUntil(() => claimCalls.length === 2, 500); // el drenaje ya inicio la vuelta de confirmacion de cola vacia
+
+    // Mientras esa segunda llamada a claim() sigue sin resolver -- el drenaje esta a punto
+    // de concluir que no hay mas nada -- llega una señal nueva desde afuera.
+    void runner.claimAndProcess('websocket');
+    await new Promise((resolve) => setTimeout(resolve, 10)); // le da tiempo a marcar claimPending
+
+    resolveNextClaim([]); // el backend confirma que, en ese instante exacto, no habia nada mas
+    await waitUntil(() => claimCalls.length === 3, 500); // claimPending debe forzar una vuelta extra, no perderse
+    resolveNextClaim([job(302)]); // ahora si aparece el trabajo que anuncio la señal tardia
+    await waitUntil(() => dispatches === 2, 500);
+    await waitUntil(() => claimCalls.length === 4, 500);
+    resolveNextClaim([]); // cola vacia otra vez, esta vez sin señal pendiente: el drenaje se detiene
+
+    await draining;
+    assert.equal(dispatches, 2, 'el trabajo que llego durante la confirmacion de cola vacia no debe perderse');
+  } finally {
+    runner.stop();
+    await fs.rm(fixture.tempDir, { recursive: true, force: true });
+  }
+});
+
+test('el drenaje respeta MAX_DRAIN_ITERATIONS para evitar un loop sin fin', async () => {
+  const fixture = await createStoreFixture('jonnys-ws-drain-cap-');
+  let nextId = 900;
+  const api = {
+    // Cada llamada "encuentra" un trabajo nuevo distinto: sin el tope, este drenaje nunca
+    // terminaria por si solo dentro de una unica llamada a claimAndProcess.
+    claim: async () => ({ jobs: [job(nextId++)] }),
+    printing: async () => {},
+    renew: async () => {},
+    confirmationPending: async () => {},
+    complete: async () => {},
+    fail: async () => {}
+  };
+  let dispatches = 0;
+  const logs = [];
+  const runner = createRunner({
+    config, api, stateStore: fixture.store,
+    log: (level, event, data) => logs.push({ level, event, data }),
+    qz: { prepare: async (value) => ({ job: value }), dispatch: async () => { dispatches += 1; } }
+  });
+
+  try {
+    await runner.claimAndProcess('websocket');
+
+    assert.equal(dispatches, MAX_DRAIN_ITERATIONS, 'el drenaje se detiene exactamente en el limite configurado, no antes ni despues');
+    assert.ok(
+      logs.some((entry) => entry.event === 'claim_drain_limit_reached'),
+      'se debe registrar que se alcanzo el tope de drenaje, para que quede visible en logs'
+    );
+  } finally {
     runner.stop();
     await fs.rm(fixture.tempDir, { recursive: true, force: true });
   }

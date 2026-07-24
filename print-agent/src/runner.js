@@ -4,11 +4,20 @@ const RESOLVED_STATES = new Set(['pendiente', 'impreso', 'fallido', 'cancelado']
 const isResolvedForJournal = (remote) => Boolean(
   remote && (RESOLVED_STATES.has(String(remote.estado)) || remote.assigned_to_agent === false)
 );
+// Tope de vueltas de drenaje dentro de una sola llamada a claimAndProcess. Cada trabajo
+// disponible cuesta como minimo una vuelta; 25 cubre con margen una rafaga real de una
+// sucursal sin arriesgar un loop sin fin si algo se comporta de forma inesperada. Lo que
+// quede por encima del tope lo recoge el siguiente polling o la siguiente señal.
+export const MAX_DRAIN_ITERATIONS = 25;
 
 export const createRunner = ({ config, api, qz, stateStore, log = () => {}, delayImpl = delay }) => {
   let stopped = false;
   let failures = 0;
   let claimInProgress = false;
+  // Una señal que llega mientras claimInProgress ya esta activo no debe perderse: en vez
+  // de descartarla, se marca claimPending para forzar una vuelta extra de drenaje antes de
+  // liberar el guard, sin permitir nunca una segunda ejecucion concurrente.
+  let claimPending = false;
   const uncertainLogged = new Set();
 
   const removeJournal = async (jobId, event, data = {}) => {
@@ -175,22 +184,57 @@ export const createRunner = ({ config, api, qz, stateStore, log = () => {}, dela
   // reconexion WebSocket convergen aqui. claimInProgress evita que dos disparadores
   // dentro del mismo agente reclamen/procesen en paralelo; la RPC SKIP LOCKED sigue
   // siendo la autoridad que evita colisiones entre agentes distintos.
+  //
+  // Drenaje secuencial: si al reclamar aparece un trabajo, se reclama el siguiente de
+  // inmediato -- sin esperar el proximo poll/señal -- hasta que el backend devuelva la
+  // cola vacia o se alcance MAX_DRAIN_ITERATIONS. Una señal que llega mientras esta
+  // vuelta ya esta en curso jamas se pierde: queda marcada en claimPending y fuerza una
+  // vuelta extra de verificacion antes de salir, en vez de descartarse.
   const claimAndProcess = async (trigger) => {
     if (claimInProgress) {
-      log('info', 'claim_skipped_in_progress', { trigger });
+      claimPending = true;
+      log('info', 'claim_deferred', { trigger });
       return [];
     }
+
     claimInProgress = true;
+    const processedJobs = [];
+    const seenJobIds = new Set();
+    let iteration = 0;
     try {
-      const reconciliation = await reconcileOnce();
-      if (reconciliation.didDispatch) return [];
-      const result = await api.claim();
-      const jobs = Array.isArray(result.jobs) ? result.jobs.slice(0, 1) : [];
-      for (const job of jobs) await processJob(job);
-      return jobs;
+      for (; iteration < MAX_DRAIN_ITERATIONS; iteration += 1) {
+        claimPending = false;
+
+        const reconciliation = await reconcileOnce();
+        if (reconciliation.didDispatch) continue;
+
+        const result = await api.claim();
+        const jobs = Array.isArray(result.jobs) ? result.jobs.slice(0, 1) : [];
+        const freshJobs = jobs.filter((job) => !seenJobIds.has(Number(job.id_trabajo)));
+        if (freshJobs.length < jobs.length) {
+          // La RPC nunca deberia repetir un trabajo ya reclamado en esta misma vuelta de
+          // drenaje; si ocurre, se ignora en vez de reprocesar para no imprimir dos veces.
+          log('warn', 'claim_duplicate_job_ignored', { trigger, job_id: Number(jobs[0]?.id_trabajo) });
+        }
+
+        if (freshJobs.length === 0) {
+          if (claimPending) continue;
+          break;
+        }
+
+        for (const job of freshJobs) {
+          seenJobIds.add(Number(job.id_trabajo));
+          await processJob(job);
+          processedJobs.push(job);
+        }
+      }
+      if (iteration >= MAX_DRAIN_ITERATIONS) {
+        log('warn', 'claim_drain_limit_reached', { trigger, drained: processedJobs.length });
+      }
     } finally {
       claimInProgress = false;
     }
+    return processedJobs;
   };
 
   const pollOnce = () => claimAndProcess('polling');

@@ -3,11 +3,28 @@ import { authenticatePrintAgent } from './printAgentAuthService.js';
 
 export const PRINT_AGENT_WS_PATH = '/api/print-agent/ws';
 const DEFAULT_HEARTBEAT_INTERVAL_MS = 30000;
+// Cota defensiva para no dejar un upgrade colgado indefinidamente si la autenticacion
+// (consulta a PostgreSQL) tarda o se cuelga; ver hasValidCredentialShape mas abajo.
+const DEFAULT_AUTH_TIMEOUT_MS = 5000;
+// Autenticaciones en vuelo simultaneas: cada una dispara una consulta a la base de datos,
+// asi que se limita para no permitir que una rafaga de intentos de conexion agote el pool.
+const DEFAULT_MAX_PENDING_UPGRADES = 20;
+// Techo de sockets autenticados simultaneos; muy por encima de cualquier despliegue real
+// de agentes de sucursal, solo como limite defensivo ante un cliente descontrolado.
+const DEFAULT_MAX_CONNECTIONS = 200;
+// Misma forma que valida authenticatePrintAgent internamente (printAgentAuthService.js).
+// Repetirla aqui permite rechazar encabezados invalidos antes de siquiera invocar
+// authenticate(), sin depender de que la implementacion inyectada tenga ese atajo.
+const AGENT_ID_PATTERN = /^[0-9a-f-]{36}$/i;
+const MIN_TOKEN_LENGTH = 32;
 
 const parseBearerToken = (headers) => {
   const authorization = String(headers?.authorization || '');
   return authorization.startsWith('Bearer ') ? authorization.slice(7).trim() : '';
 };
+
+const hasValidCredentialShape = (agentId, token) =>
+  AGENT_ID_PATTERN.test(agentId) && token.length >= MIN_TOKEN_LENGTH;
 
 export const isPrintAgentWebSocketEnabled = (env = process.env) =>
   String(env.PRINT_AGENT_WEBSOCKET_ENABLED || '').trim().toLowerCase() === 'true';
@@ -18,16 +35,42 @@ export const isPrintAgentWebSocketEnabled = (env = process.env) =>
 export const createPrintAgentWebSocketServer = ({
   authenticate = authenticatePrintAgent,
   heartbeatIntervalMs = DEFAULT_HEARTBEAT_INTERVAL_MS,
+  authTimeoutMs = DEFAULT_AUTH_TIMEOUT_MS,
+  maxPendingUpgrades = DEFAULT_MAX_PENDING_UPGRADES,
+  maxConnections = DEFAULT_MAX_CONNECTIONS,
   log = console
 } = {}) => {
   const wss = new WebSocketServer({ noServer: true });
   const socketsByBranch = new Map();
+  let pendingUpgrades = 0;
+  let openConnections = 0;
+
+  const rejectUpgrade = (socket, statusLine) => {
+    try {
+      socket.write(`HTTP/1.1 ${statusLine}\r\nConnection: close\r\n\r\n`);
+    } catch { /* el socket ya pudo haberse cerrado */ }
+    socket.destroy();
+  };
+
+  // Mismo patron que app.js usa para /health/ready: Promise.race contra un timeout que
+  // nunca deja abierta la conexion mientras espera una autenticacion lenta o colgada.
+  const withAuthTimeout = (promise) => {
+    let timer;
+    const timeout = new Promise((_, reject) => {
+      timer = setTimeout(() => {
+        reject(Object.assign(new Error('PRINT_AGENT_WS_AUTH_TIMEOUT'), { code: 'PRINT_AGENT_WS_AUTH_TIMEOUT' }));
+      }, authTimeoutMs);
+    });
+    return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+  };
 
   const registerSocket = (ws, agent) => {
     const branchId = Number(agent.id_sucursal);
     if (!socketsByBranch.has(branchId)) socketsByBranch.set(branchId, new Set());
     socketsByBranch.get(branchId).add(ws);
+    openConnections += 1;
     ws.on('close', () => {
+      openConnections = Math.max(0, openConnections - 1);
       const sockets = socketsByBranch.get(branchId);
       if (!sockets) return;
       sockets.delete(ws);
@@ -72,11 +115,37 @@ export const createPrintAgentWebSocketServer = ({
 
     const agentId = String(request.headers['x-print-agent-id'] || '').trim();
     const token = parseBearerToken(request.headers);
-    Promise.resolve(authenticate({ agentId, token }))
+    // Rechazo inmediato: encabezados con forma invalida ni siquiera llegan a authenticate()
+    // (sin consulta a la base de datos), igual que un intento de conexion con credenciales
+    // vacias o corruptas.
+    if (!hasValidCredentialShape(agentId, token)) {
+      rejectUpgrade(socket, '400 Bad Request');
+      return;
+    }
+
+    if (openConnections >= maxConnections) {
+      log.warn?.('[print-agent.ws] limite de conexiones alcanzado', { open_connections: openConnections });
+      rejectUpgrade(socket, '503 Service Unavailable');
+      return;
+    }
+    if (pendingUpgrades >= maxPendingUpgrades) {
+      log.warn?.('[print-agent.ws] limite de autenticaciones pendientes alcanzado', { pending_upgrades: pendingUpgrades });
+      rejectUpgrade(socket, '503 Service Unavailable');
+      return;
+    }
+
+    pendingUpgrades += 1;
+    withAuthTimeout(Promise.resolve(authenticate({ agentId, token })))
       .then((agent) => {
+        pendingUpgrades -= 1;
+        if (socket.destroyed) return; // el cliente pudo haberse ido durante la autenticacion
         if (!agent) {
-          socket.write('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n');
-          socket.destroy();
+          rejectUpgrade(socket, '401 Unauthorized');
+          return;
+        }
+        if (openConnections >= maxConnections) {
+          log.warn?.('[print-agent.ws] limite de conexiones alcanzado tras autenticar', { open_connections: openConnections });
+          rejectUpgrade(socket, '503 Service Unavailable');
           return;
         }
         wss.handleUpgrade(request, socket, head, (ws) => {
@@ -84,11 +153,13 @@ export const createPrintAgentWebSocketServer = ({
         });
       })
       .catch((error) => {
-        log.error?.('[print-agent.ws] fallo de autenticacion', { code: error?.code || null });
-        try {
-          socket.write('HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n');
-        } catch { /* el socket ya pudo haberse cerrado */ }
-        socket.destroy();
+        pendingUpgrades -= 1;
+        const isTimeout = error?.code === 'PRINT_AGENT_WS_AUTH_TIMEOUT';
+        log.error?.(
+          isTimeout ? '[print-agent.ws] timeout de autenticacion' : '[print-agent.ws] fallo de autenticacion',
+          { code: error?.code || null }
+        );
+        if (!socket.destroyed) rejectUpgrade(socket, '503 Service Unavailable');
       });
   };
 

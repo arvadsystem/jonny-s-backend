@@ -12,10 +12,15 @@ import {
 const silentLog = { error: () => {}, info: () => {}, warn: () => {} };
 const agentOne = { id_agente: '11111111-1111-1111-1111-111111111111', id_sucursal: 1 };
 const agentTwo = { id_agente: '22222222-2222-2222-2222-222222222222', id_sucursal: 2 };
+// authenticatePrintAgent exige tokens de al menos 32 caracteres; se replica esa longitud
+// aqui para que el rechazo por forma invalida (hasValidCredentialShape) no interfiera con
+// las pruebas de credenciales validas.
+const TOKEN_ONE = 'a'.repeat(32);
+const TOKEN_TWO = 'b'.repeat(32);
 
 const authenticateFixture = async ({ agentId, token }) => {
-  if (agentId === agentOne.id_agente && token === 'token-1') return agentOne;
-  if (agentId === agentTwo.id_agente && token === 'token-2') return agentTwo;
+  if (agentId === agentOne.id_agente && token === TOKEN_ONE) return agentOne;
+  if (agentId === agentTwo.id_agente && token === TOKEN_TWO) return agentTwo;
   return null;
 };
 
@@ -70,8 +75,8 @@ const assertNoMessage = (ws, timeoutMs = 300) => new Promise((resolve, reject) =
 test('acepta conexion con credenciales validas y entrega job_available solo a la sucursal correspondiente', async () => {
   const server = await startServer();
   try {
-    const clientOne = await connect(server.port, { headers: { Authorization: 'Bearer token-1', 'X-Print-Agent-Id': agentOne.id_agente } });
-    const clientTwo = await connect(server.port, { headers: { Authorization: 'Bearer token-2', 'X-Print-Agent-Id': agentTwo.id_agente } });
+    const clientOne = await connect(server.port, { headers: { Authorization: `Bearer ${TOKEN_ONE}`, 'X-Print-Agent-Id': agentOne.id_agente } });
+    const clientTwo = await connect(server.port, { headers: { Authorization: `Bearer ${TOKEN_TWO}`, 'X-Print-Agent-Id': agentTwo.id_agente } });
     try {
       const sent = server.wsServer.notifyJobAvailable(1);
       assert.equal(sent, 1);
@@ -103,7 +108,7 @@ test('destruye upgrades fuera de la ruta del agente de impresion', async () => {
   const server = await startServer();
   try {
     await assert.rejects(
-      connect(server.port, { path: '/otra-ruta', headers: { Authorization: 'Bearer token-1', 'X-Print-Agent-Id': agentOne.id_agente } })
+      connect(server.port, { path: '/otra-ruta', headers: { Authorization: `Bearer ${TOKEN_ONE}`, 'X-Print-Agent-Id': agentOne.id_agente } })
     );
   } finally {
     await server.stop();
@@ -122,7 +127,7 @@ test('notifyJobAvailable no envia nada cuando no hay sockets para la sucursal', 
 
 test('close() termina todas las conexiones activas', async () => {
   const server = await startServer();
-  const client = await connect(server.port, { headers: { Authorization: 'Bearer token-1', 'X-Print-Agent-Id': agentOne.id_agente } });
+  const client = await connect(server.port, { headers: { Authorization: `Bearer ${TOKEN_ONE}`, 'X-Print-Agent-Id': agentOne.id_agente } });
   const closed = new Promise((resolve) => client.once('close', resolve));
   await server.stop();
   await closed;
@@ -138,4 +143,84 @@ test('isPrintAgentWebSocketEnabled exige exactamente "true" y por defecto es fal
   assert.equal(isPrintAgentWebSocketEnabled({ PRINT_AGENT_WEBSOCKET_ENABLED: 'yes' }), false);
   assert.equal(isPrintAgentWebSocketEnabled({ PRINT_AGENT_WEBSOCKET_ENABLED: 'true' }), true);
   assert.equal(isPrintAgentWebSocketEnabled({ PRINT_AGENT_WEBSOCKET_ENABLED: 'TRUE' }), true);
+});
+
+test('rechaza de inmediato encabezados con forma invalida sin invocar authenticate()', async () => {
+  let authenticateCalls = 0;
+  const authenticate = async () => { authenticateCalls += 1; throw new Error('NO_DEBIO_LLAMARSE'); };
+  const server = await startServer({ authenticate });
+  try {
+    const cases = [
+      { Authorization: `Bearer ${TOKEN_ONE}` }, // falta X-Print-Agent-Id
+      { 'X-Print-Agent-Id': agentOne.id_agente }, // falta Authorization
+      { Authorization: 'Bearer short', 'X-Print-Agent-Id': agentOne.id_agente }, // token < 32 chars
+      { Authorization: `Bearer ${TOKEN_ONE}`, 'X-Print-Agent-Id': 'no-es-un-uuid' } // agentId con forma invalida
+    ];
+    for (const headers of cases) {
+      await assert.rejects(connect(server.port, { headers }), /UNEXPECTED_RESPONSE|400/);
+    }
+    assert.equal(authenticateCalls, 0, 'ningun encabezado con forma invalida debe llegar a consultar la base de datos');
+  } finally {
+    await server.stop();
+  }
+});
+
+test('un timeout de autenticacion rechaza la conexion sin dejarla colgada', async () => {
+  const authenticate = () => new Promise(() => {}); // nunca se resuelve ni se rechaza
+  const server = await startServer({ authenticate, authTimeoutMs: 40 });
+  try {
+    const startedAt = Date.now();
+    await assert.rejects(
+      connect(server.port, { headers: { Authorization: `Bearer ${TOKEN_ONE}`, 'X-Print-Agent-Id': agentOne.id_agente } }),
+      /UNEXPECTED_RESPONSE|503/
+    );
+    const elapsedMs = Date.now() - startedAt;
+    assert.ok(elapsedMs < 2000, `el rechazo por timeout debe llegar cerca de authTimeoutMs, no colgarse (tardo ${elapsedMs}ms)`);
+  } finally {
+    await server.stop();
+  }
+});
+
+test('limite de conexiones abiertas rechaza conexiones nuevas una vez alcanzado', async () => {
+  const server = await startServer({ maxConnections: 1 });
+  try {
+    const clientOne = await connect(server.port, { headers: { Authorization: `Bearer ${TOKEN_ONE}`, 'X-Print-Agent-Id': agentOne.id_agente } });
+    try {
+      await assert.rejects(
+        connect(server.port, { headers: { Authorization: `Bearer ${TOKEN_TWO}`, 'X-Print-Agent-Id': agentTwo.id_agente } }),
+        /UNEXPECTED_RESPONSE|503/
+      );
+    } finally {
+      clientOne.terminate();
+    }
+  } finally {
+    await server.stop();
+  }
+});
+
+test('limite de autenticaciones pendientes rechaza intentos adicionales sin esperar a que el primero resuelva', async () => {
+  let releaseFirst;
+  const firstAuthPromise = new Promise((resolve) => { releaseFirst = () => resolve(agentOne); });
+  let authenticateCalls = 0;
+  const authenticate = async ({ agentId, token }) => {
+    authenticateCalls += 1;
+    if (authenticateCalls === 1) return firstAuthPromise;
+    return authenticateFixture({ agentId, token });
+  };
+  const server = await startServer({ authenticate, maxPendingUpgrades: 1 });
+  try {
+    const firstConnectPromise = connect(server.port, { headers: { Authorization: `Bearer ${TOKEN_ONE}`, 'X-Print-Agent-Id': agentOne.id_agente } });
+    await new Promise((resolve) => setTimeout(resolve, 30)); // deja que el primer intento quede "en vuelo"
+
+    await assert.rejects(
+      connect(server.port, { headers: { Authorization: `Bearer ${TOKEN_TWO}`, 'X-Print-Agent-Id': agentTwo.id_agente } }),
+      /UNEXPECTED_RESPONSE|503/
+    );
+
+    releaseFirst();
+    const firstClient = await firstConnectPromise;
+    firstClient.terminate();
+  } finally {
+    await server.stop();
+  }
 });
