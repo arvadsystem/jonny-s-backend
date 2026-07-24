@@ -7,6 +7,7 @@ import { createQzClient } from './qzClient.js';
 import { createRunner } from './runner.js';
 import { createPrintStateStore } from './stateStore.js';
 import { acquireProcessLock } from './processLock.js';
+import { createPrintAgentWebSocketClient } from './wsClient.js';
 
 const config = loadConfig();
 const agentDirectory = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -19,6 +20,7 @@ const processLock = acquireProcessLock({
 
 let qz;
 let runner;
+let wsClient;
 let shutdownPromise;
 let exitRequested = false;
 const shutdown = async (signal) => {
@@ -26,6 +28,7 @@ const shutdown = async (signal) => {
 
   shutdownPromise = (async () => {
     log('info', 'shutdown', { signal });
+    wsClient?.stop();
     runner?.stop();
     await qz?.disconnect().catch(() => undefined);
     processLock.release();
@@ -52,6 +55,15 @@ try {
   const stateStore = createPrintStateStore({ filePath: config.stateFile });
   await stateStore.init();
   runner = createRunner({ config, api, qz, stateStore, log });
+  if (config.websocketEnabled) {
+    wsClient = createPrintAgentWebSocketClient({
+      config,
+      log,
+      onSignal: (trigger) => runner.claimAndProcess(trigger)
+    });
+    wsClient.start();
+    log('info', 'ws_client_enabled', {});
+  }
   log('info', 'agent_started', { agent_id: config.agentId, branch_id: config.branchId });
   await runner.run();
 } finally {
