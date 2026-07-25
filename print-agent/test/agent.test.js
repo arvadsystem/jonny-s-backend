@@ -118,6 +118,41 @@ test('dispatch_started queda en cuarentena sin bloquear el siguiente trabajo', a
   }
 });
 
+test('un resultado ambiguo de qz.print (rechazo) nunca dispara un reintento automatico de dispatch', async () => {
+  const fixture = await createStoreFixture('jonnys-no-retry-after-print-');
+  try {
+    const target = job(50);
+    let dispatchCalls = 0;
+    const runner = createRunner({
+      config,
+      stateStore: fixture.store,
+      api: {
+        status: async () => ({ job: { estado: 'imprimiendo', assigned_to_agent: true, lease_active: true } }),
+        claim: async () => ({ jobs: dispatchCalls === 0 ? [target] : [] }),
+        printing: async () => {}, renew: async () => {}, confirmationPending: async () => {}, complete: async () => {}, fail: async () => {}
+      },
+      qz: {
+        prepare: async (value) => ({ job: value }),
+        // Resultado fisico ambiguo (qz.print rechazado): runner.js nunca debe reintentar
+        // dispatch automaticamente despues de esto, solo dejar el trabajo en cuarentena.
+        dispatch: async () => { dispatchCalls += 1; throw new Error('QZ_PRINT_AMBIGUOUS'); }
+      }
+    });
+
+    await runner.pollOnce();
+    assert.equal(dispatchCalls, 1, 'qz.dispatch (qz.print) se llama exactamente una vez tras el rechazo, sin reintento inmediato');
+    assert.equal(fixture.store.list()[0]?.status, 'dispatch_started', 'el trabajo queda en cuarentena, nunca se vuelve a despachar automaticamente');
+
+    // Nuevas vueltas de polling, con el mismo estado remoto ambiguo ("imprimiendo" con lease
+    // activo), tampoco deben volver a llamar qz.dispatch para este mismo trabajo.
+    await runner.pollOnce();
+    await runner.pollOnce();
+    assert.equal(dispatchCalls, 1, 'ninguna vuelta de polling posterior reintenta el dispatch automaticamente');
+  } finally {
+    await fs.rm(fixture.tempDir, { recursive: true, force: true });
+  }
+});
+
 test('respuesta QZ exitosa y fallo de complete persisten printed_unconfirmed; reinicio solo confirma', async () => {
   const fixture = await createStoreFixture('jonnys-printed-');
   try {
@@ -310,6 +345,21 @@ test('configuracion QZ rechaza IP literales, hostnames invalidos y host personal
     () => loadConfig({ ...qzConfigEnv('externo.example.com'), QZ_CA_CERT_PATH: '' }),
     /CONFIG_REQUIRED:QZ_CA_CERT_PATH/
   );
+});
+
+test('QZ_PRECONNECT_ENABLED es false por defecto y el polling sigue en 3000ms por defecto', () => {
+  const defaults = loadConfig({
+    API_BASE_URL: 'https://qa.example.com', PRINT_AGENT_ID: 'agent-id', PRINT_AGENT_TOKEN: 'x'.repeat(48),
+    BRANCH_ID: '2', PRINTER_MAP_JSON: '{"factura":"QA Printer"}'
+  });
+  assert.equal(defaults.qzPreconnectEnabled, false);
+  assert.equal(defaults.pollIntervalMs, 3000);
+
+  const enabled = loadConfig({
+    API_BASE_URL: 'https://qa.example.com', PRINT_AGENT_ID: 'agent-id', PRINT_AGENT_TOKEN: 'x'.repeat(48),
+    BRANCH_ID: '2', PRINTER_MAP_JSON: '{"factura":"QA Printer"}', QZ_PRECONNECT_ENABLED: 'true'
+  });
+  assert.equal(enabled.qzPreconnectEnabled, true);
 });
 
 test('certificado QZ rechaza claves privadas', () => {

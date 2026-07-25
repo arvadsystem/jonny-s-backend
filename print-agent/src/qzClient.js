@@ -82,6 +82,13 @@ export const createQzClient = ({
   networkInterfacesImpl = getNetworkInterfaces,
   setTimeoutImpl = setTimeout,
   clearTimeoutImpl = clearTimeout,
+  // La preconexion (ver preconnect mas abajo) ocurre antes de reclamar cualquier trabajo,
+  // asi que jamas existe un signingContext real (job_id, request) para firmar -- QZ Tray
+  // exige firmas ligadas a un trabajo, nunca genericas (ver QZ_GENERIC_SIGNING_DISABLED en
+  // setSignaturePromise). Sin firma, QZ Tray trata la sesion como anonima. Este hook es el
+  // unico punto de extension si algun dia se define un mecanismo de firma seguro y no
+  // generico para la preconexion; hasta entonces SIEMPRE debe devolver false.
+  hasSecurePreconnectContext = () => false,
   log = () => {}
 }) => {
   let securityConfigured = false;
@@ -165,7 +172,16 @@ export const createQzClient = ({
   // Best-effort al iniciar el agente: nunca lanza. Si QZ Tray esta cerrado, el agente
   // sigue vivo, programa un reintento en segundo plano con backoff y el primer trabajo
   // real puede conectar de todas formas via prepare() (comparten el mismo single-flight).
+  //
+  // Antes de intentar nada, exige un contexto de firma seguro (ver hasSecurePreconnectContext
+  // arriba). Hoy nunca existe uno al arrancar, asi que esto omite la conexion de forma
+  // controlada en vez de dejar que QZ Tray la reciba sin firma valida (sesion "anonymous",
+  // job_id 0, QZ_GENERIC_SIGNING_DISABLED).
   const preconnect = async () => {
+    if (!hasSecurePreconnectContext()) {
+      log('warn', 'qz_preconnect_skipped', { reason: 'NO_SECURE_SIGNING_CONTEXT' });
+      return false;
+    }
     try {
       await connect();
       log('info', 'qz_preconnect_complete', {});

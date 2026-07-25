@@ -64,10 +64,17 @@ try {
     wsClient.start();
     log('info', 'ws_client_enabled', {});
   }
-  // Preconexion best-effort: nunca lanza (ver qzClient.js), asi que nunca convierte la
-  // ausencia de QZ Tray en un error fatal de arranque. Si falla, el agente sigue vivo y
-  // el primer trabajo real vuelve a intentar conectar dentro de qz.prepare().
-  await qz.preconnect();
+  // Preconexion best-effort, deshabilitada por defecto (QZ_PRECONNECT_ENABLED): antes de
+  // reclamar un trabajo no existe signingContext, y QZ Tray exige firma ligada a un trabajo
+  // real -- intentar preconectar sin eso deja la sesion como "anonymous" (QZ_GENERIC_
+  // SIGNING_DISABLED, job_id 0). El primer trabajo real conecta igual dentro de
+  // qz.prepare(), con su firma valida. Si se habilita, qzClient.js igual omite la conexion
+  // mientras no exista un mecanismo de firma seguro para ella (ver qzClient.js/preconnect).
+  if (config.qzPreconnectEnabled) {
+    await qz.preconnect();
+  } else {
+    log('info', 'qz_preconnect_disabled', {});
+  }
   log('info', 'agent_started', { agent_id: config.agentId, branch_id: config.branchId });
   await runner.run();
 } finally {

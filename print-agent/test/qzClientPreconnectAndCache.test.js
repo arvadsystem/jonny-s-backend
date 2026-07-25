@@ -54,7 +54,8 @@ const createFakeQz = ({ connectMode = 'succeed' } = {}) => {
     isActive: () => active,
     setFindList: (list) => { findList = list; },
     resolvePendingConnect: () => { pendingConnect?.(); },
-    invokeCertificatePromise: () => new Promise((resolve, reject) => certificatePromise(resolve, reject))
+    invokeCertificatePromise: () => new Promise((resolve, reject) => certificatePromise(resolve, reject)),
+    invokeSignaturePromise: (digest = 'test-digest') => signaturePromise(digest)
   };
 };
 
@@ -110,12 +111,39 @@ const job = (id, logical = 'factura') => ({
 });
 
 // --- Preconexion --------------------------------------------------------------------
+//
+// Antes de reclamar un trabajo no existe signingContext (job_id, request), y QZ Tray exige
+// firma ligada a un trabajo real -- nunca generica (QZ_GENERIC_SIGNING_DISABLED, ver
+// setSignaturePromise en qzClient.js). Por eso, sin importar el valor de
+// QZ_PRECONNECT_ENABLED, preconnect() por defecto (hasSecurePreconnectContext no inyectado)
+// SIEMPRE omite la conexion en vez de dejar que QZ Tray la reciba sin firma valida (sesion
+// "anonymous", job_id 0). Los tests marcados "con contexto seguro inyectado" simulan el
+// unico escenario en el que algun dia se defina un mecanismo de firma seguro para la
+// preconexion, y prueban que el resto del mecanismo (single-flight, backoff, cancelacion en
+// disconnect) sigue intacto para ese caso futuro.
 
-test('preconnect: conecta cuando QZ esta disponible y registra qz_preconnect_complete', async () => {
+test('preconnect: sin contexto seguro (comportamiento por defecto) omite la conexion, sin sesion QZ "anonymous"', async () => {
   const fake = createFakeQz({ connectMode: 'succeed' });
   const logs = [];
   const client = createQzClient({
     config: baseConfig(), api: fakeApi(), qz: fake.qz, ...localhostNetworking,
+    log: (level, event, data) => logs.push({ level, event, data })
+  });
+
+  const result = await client.preconnect();
+
+  assert.equal(result, false);
+  assert.equal(fake.connectCalls.length, 0, 'nunca debe llamar a qz.websocket.connect sin un contexto de firma seguro');
+  assert.equal(fake.isActive(), false);
+  assert.ok(logs.some((entry) => entry.event === 'qz_preconnect_skipped' && entry.data.reason === 'NO_SECURE_SIGNING_CONTEXT'));
+});
+
+test('preconnect: con contexto seguro inyectado, conecta cuando QZ esta disponible y registra qz_preconnect_complete', async () => {
+  const fake = createFakeQz({ connectMode: 'succeed' });
+  const logs = [];
+  const client = createQzClient({
+    config: baseConfig(), api: fakeApi(), qz: fake.qz, ...localhostNetworking,
+    hasSecurePreconnectContext: () => true,
     log: (level, event, data) => logs.push({ level, event, data })
   });
 
@@ -127,11 +155,12 @@ test('preconnect: conecta cuando QZ esta disponible y registra qz_preconnect_com
   assert.ok(logs.some((entry) => entry.event === 'qz_preconnect_complete'));
 });
 
-test('preconnect: no bloquea el inicio si QZ esta cerrado (nunca lanza)', async () => {
+test('preconnect: con contexto seguro inyectado, no bloquea el inicio si QZ esta cerrado (nunca lanza)', async () => {
   const fake = createFakeQz({ connectMode: 'fail' });
   const logs = [];
   const client = createQzClient({
     config: baseConfig(), api: fakeApi(), qz: fake.qz, ...localhostNetworking,
+    hasSecurePreconnectContext: () => true,
     log: (level, event, data) => logs.push({ level, event, data })
   });
 
@@ -143,10 +172,11 @@ test('preconnect: no bloquea el inicio si QZ esta cerrado (nunca lanza)', async 
   client.stopPreconnectRetry();
 });
 
-test('preconnect: no crea conexiones simultaneas (single-flight)', async () => {
+test('preconnect: con contexto seguro inyectado, no crea conexiones simultaneas (single-flight)', async () => {
   const fake = createFakeQz({ connectMode: 'deferred' });
   const client = createQzClient({
-    config: baseConfig(), api: fakeApi(), qz: fake.qz, ...localhostNetworking
+    config: baseConfig(), api: fakeApi(), qz: fake.qz, ...localhostNetworking,
+    hasSecurePreconnectContext: () => true
   });
 
   const first = client.preconnect();
@@ -161,11 +191,12 @@ test('preconnect: no crea conexiones simultaneas (single-flight)', async () => {
   assert.equal(fake.connectCalls.length, 1);
 });
 
-test('preconnect: shutdown (disconnect) cancela el timer de reintento en segundo plano', async () => {
+test('preconnect: con contexto seguro inyectado, shutdown (disconnect) cancela el timer de reintento en segundo plano', async () => {
   const fake = createFakeQz({ connectMode: 'fail' });
   const { setTimeoutImpl, clearTimeoutImpl, fire, lastId } = createControllableTimeout();
   const client = createQzClient({
     config: baseConfig(), api: fakeApi(), qz: fake.qz, ...localhostNetworking,
+    hasSecurePreconnectContext: () => true,
     setTimeoutImpl, clearTimeoutImpl,
     log: () => {}
   });
@@ -183,10 +214,11 @@ test('preconnect: shutdown (disconnect) cancela el timer de reintento en segundo
   assert.equal(fake.connectCalls.length, 1, 'disconnect() debe cancelar el timer: ningun reintento adicional aunque venza el temporizador original');
 });
 
-test('preconnect: un trabajo puede conectar despues de una preconexion fallida', async () => {
+test('preconnect: con contexto seguro inyectado, un trabajo puede conectar despues de una preconexion fallida', async () => {
   const fake = createFakeQz({ connectMode: 'fail' });
   const client = createQzClient({
     config: baseConfig(), api: fakeApi(), qz: fake.qz, ...localhostNetworking,
+    hasSecurePreconnectContext: () => true,
     log: () => {}
   });
 
@@ -199,6 +231,55 @@ test('preconnect: un trabajo puede conectar despues de una preconexion fallida',
 
   assert.equal(prepared.qzConfig.getPrinter(), 'ZKP8008');
   client.stopPreconnectRetry();
+});
+
+test('preconnect: (comportamiento por defecto) un trabajo conecta por el flujo normal aunque la preconexion se haya omitido', async () => {
+  const fake = createFakeQz({ connectMode: 'succeed' });
+  const client = createQzClient({
+    config: baseConfig(), api: fakeApi(), qz: fake.qz, ...localhostNetworking,
+    log: () => {}
+  });
+
+  const preconnected = await client.preconnect();
+  assert.equal(preconnected, false);
+  assert.equal(fake.connectCalls.length, 0, 'la preconexion omitida no debe haber abierto ninguna conexion');
+
+  const prepared = await client.prepare(job(1));
+
+  assert.equal(prepared.qzConfig.getPrinter(), 'ZKP8008');
+  assert.equal(fake.connectCalls.length, 1, 'el primer trabajo real conecta por el flujo normal, sin depender de preconnect');
+  assert.equal(fake.isActive(), true);
+});
+
+test('preconnect: nunca dispara api.sign (nunca job_id 0), ni con contexto seguro inyectado', async () => {
+  const fake = createFakeQz({ connectMode: 'succeed' });
+  const signCalls = [];
+  const client = createQzClient({
+    config: baseConfig(),
+    api: { ...fakeApi(), sign: async (jobId, request, digest) => { signCalls.push(jobId); return { signature: `signed:${digest}` }; } },
+    qz: fake.qz, ...localhostNetworking,
+    hasSecurePreconnectContext: () => true, // incluso si algun dia hubiera contexto seguro, connect() en si no firma nada
+    log: () => {}
+  });
+
+  await client.preconnect();
+
+  assert.deepEqual(signCalls, [], 'preconnect (connect()) nunca debe disparar api.sign, con o sin contexto seguro');
+});
+
+test('preconnect: el guard de firma generica sigue intacto (sin signingContext, la firma se rechaza siempre)', async () => {
+  const fake = createFakeQz({ connectMode: 'succeed' });
+  const client = createQzClient({
+    config: baseConfig(), api: fakeApi(), qz: fake.qz, ...localhostNetworking,
+    hasSecurePreconnectContext: () => true,
+    log: () => {}
+  });
+
+  await client.preconnect(); // registra setCertificatePromise/setSignaturePromise en el fake
+
+  // Sin un trabajo en curso (signingContext null), cualquier intento de firma -- generica o
+  // no -- debe seguir siendo rechazado por QZ_GENERIC_SIGNING_DISABLED, nunca aceptado.
+  await assert.rejects(fake.invokeSignaturePromise('some-digest'), /QZ_GENERIC_SIGNING_DISABLED/);
 });
 
 // --- Cache de impresoras --------------------------------------------------------------
