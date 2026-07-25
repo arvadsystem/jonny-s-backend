@@ -80,7 +80,7 @@ const extractCustomerCss = (html) => html.match(
 // documento sigue mapeada a Roboto-Medium.ttf, que en impresion termica fisica no siempre
 // se distingue del texto normal. Mientras eso sea asi, la fila Cliente se refuerza ademas
 // con un fontSize mayor al del resto del ticket (defaultStyle.fontSize) en ambos anchos.
-for (const [widthMm, expectedFontSize] of [[58, 7.5], [80, 8.5]]) {
+for (const [widthMm, expectedFontSize] of [[58, 8], [80, 9]]) {
   for (const customerName of [SHORT_CUSTOMER_NAME, LONG_CUSTOMER_NAME, LONG_UNBROKEN_CUSTOMER_NAME]) {
     test(`factura ${widthMm} mm imprime cliente actual a ${expectedFontSize} pt: ${customerName.length} caracteres`, async () => {
       const factura = buildFactura(widthMm, customerName);
@@ -155,7 +155,7 @@ for (const [widthMm, expectedFontSize] of [[58, 11.5], [80, 12.1]]) {
 
 test('los renderers actuales conservan sus fallbacks cuando no hay nombre', () => {
   const pdfNodes = collectPdfTextNodes(buildVentaTicketPdfDefinition(buildFactura(58, null)).content);
-  assert.ok(pdfNodes.some((node) => node.text === 'Consumidor final' && node.fontSize === 7.5));
+  assert.ok(pdfNodes.some((node) => node.text === 'Consumidor final' && node.fontSize === 8));
 
   const html = buildComandaCocinaHtml(buildComanda(null), { widthMm: 58 });
   assert.match(html, /class="comanda-cocina-print__customer-name">N\/D<\/span>/);

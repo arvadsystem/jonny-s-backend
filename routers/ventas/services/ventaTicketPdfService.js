@@ -157,9 +157,11 @@ const countSplitLines = (cuentaDividida) => {
 // Roboto-Bold.ttf no existe en node_modules/pdfmake/fonts/Roboto/ (solo Regular, Medium,
 // Italic, MediumItalic); el mapa de fuentes 'bold' usa Medium, que no siempre se distingue
 // del texto normal en impresion termica fisica. Mientras eso sea asi, el campo Cliente se
-// refuerza con un fontSize mayor ademas de bold:true. Compartido con estimateCustomerNameLines
-// para que la estimacion de altura de pagina nunca quede desincronizada del tamano real.
-const CUSTOMER_NAME_FONT_SIZE = (widthMm) => (widthMm === 58 ? 7.5 : 8.5);
+// refuerza con un fontSize mayor ademas de bold:true -- un poco por encima del primer ajuste
+// (7.5/8.5pt) para que la diferencia sea clara tambien en papel termico real, sin llegar a
+// un tamano exagerado. Compartido con estimateCustomerNameLines para que la estimacion de
+// altura de pagina nunca quede desincronizada del tamano real.
+const CUSTOMER_NAME_FONT_SIZE = (widthMm) => (widthMm === 58 ? 8 : 9);
 
 const estimateCustomerNameLines = (value, widthMm) => {
   const customerName = cleanText(value) || 'Consumidor final';
