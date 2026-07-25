@@ -1129,13 +1129,14 @@ const registerVentaFidelizacionAfterCommit = async ({
 
   let client = null;
   let transactionStarted = false;
+  const fidelizacionAsyncPerf = createVentasPerfTracker();
 
   try {
-    const poolWaitStart = ventasPerf.now();
+    const poolWaitStart = fidelizacionAsyncPerf.now();
     client = await pool.connect();
-    ventasPerf.add('pool_wait_ms', poolWaitStart);
-    instrumentVentasSqlClient(client, ventasPerf);
-    const transactionStart = ventasPerf.now();
+    fidelizacionAsyncPerf.add('pool_wait_ms', poolWaitStart);
+    instrumentVentasSqlClient(client, fidelizacionAsyncPerf);
+    const transactionStart = fidelizacionAsyncPerf.now();
     await client.query('BEGIN');
     transactionStarted = true;
     await client.query(
@@ -1155,7 +1156,7 @@ const registerVentaFidelizacionAfterCommit = async ({
 
     await client.query('COMMIT');
     transactionStarted = false;
-    ventasPerf.add('transaction_ms', transactionStart);
+    fidelizacionAsyncPerf.add('transaction_ms', transactionStart);
 
     logVentasFidelizacionAsyncPerf({
       id_factura: facturaId,
@@ -9593,26 +9594,12 @@ router.post('/ventas/pedidos/:id/registrar-pago', checkPermission(['VENTAS_CREAR
       await updatePedidoLegacyPagoConfirmado({ client, idPedido, userId });
     }
 
-    const fidelizacionStart = ventasPerf.now();
-    const acumulacionFidelizacion = pedidoPagadoCompleto
-      ? await registerFacturaLoyaltyAccumulation({
-        client,
-        idFactura,
-        idPedido,
-        idCliente: parseOptionalPositiveInt(pedido.id_cliente),
-        idSucursal: idSucursalPedido,
-        idUsuarioEjecutor: userId,
-        montoFactura: totalPedido
-      })
-      : { created: false };
-    ventasPerf.add('fidelizacion_ms', fidelizacionStart);
-
     const commitStart = ventasPerf.now();
     await client.query('COMMIT');
     ventasPerf.add('commit_ms', commitStart);
     ventasPerf.log({ ...ventasPerfContext, status: 201 });
 
-    return res.status(201).json({
+    res.status(201).json({
       message: 'Pago registrado correctamente.',
       id_pedido: idPedido,
       id_factura: idFactura,
@@ -9625,13 +9612,20 @@ router.post('/ventas/pedidos/:id/registrar-pago', checkPermission(['VENTAS_CREAR
       cambio,
       id_sesion_caja: Number(sessionActiva.data.id_sesion_caja),
       metodo_pago: String(metodoPago.codigo || metodoPago.nombre || '').toUpperCase(),
-      fidelizacion: acumulacionFidelizacion.created
-        ? {
-            puntos_acumulados: acumulacionFidelizacion.points,
-            saldo_nuevo: acumulacionFidelizacion.saldoNuevo
-          }
-        : null
+      fidelizacion: null
     });
+
+    if (pedidoPagadoCompleto) {
+      void registerVentaFidelizacionAfterCommit({
+        idFactura,
+        idPedido,
+        idCliente: parseOptionalPositiveInt(pedido.id_cliente),
+        idSucursal: idSucursalPedido,
+        idUsuarioEjecutor: userId,
+        montoFactura: totalPedido
+      });
+    }
+    return undefined;
   } catch (err) {
     await client.query('ROLLBACK');
     const mappedErr = mapCajaFinancialLockError(err);
@@ -10575,18 +10569,6 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
       cuentaDivididaResponse = await fetchCuentaDividida(client, { idFactura, idPedido });
     }
 
-    const fidelizacionStart = ventasPerf.now();
-    const acumulacionFidelizacion = await registerFacturaLoyaltyAccumulation({
-      client,
-      idFactura,
-      idPedido,
-      idCliente: venta.id_cliente,
-      idSucursal: venta.id_sucursal,
-      idUsuarioEjecutor: venta.id_usuario,
-      montoFactura: venta.total
-    });
-    ventasPerf.add('fidelizacion_ms', fidelizacionStart);
-
     const ticketResponseStart = ventasPerf.now();
     const facturacionNormalizada = await normalizarDatosTicketDesdeSnapshot({
       client,
@@ -10618,7 +10600,7 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
         facturacion: facturacionNormalizada,
         context: createDetailContext,
         items: createDetailItems,
-        fidelizacion: acumulacionFidelizacion,
+        fidelizacion: null,
         cuentaDividida: cuentaDivididaResponse
       }), venta)
     });
@@ -10645,6 +10627,16 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
     ventasPerf.log(ventasPerfContext);
 
     res.status(201).json(createVentaResponse);
+
+    void registerVentaFidelizacionAfterCommit({
+      idFactura,
+      idPedido,
+      idCliente: venta.id_cliente,
+      idSucursal: venta.id_sucursal,
+      idUsuarioEjecutor: venta.id_usuario,
+      montoFactura: venta.total
+    });
+    return undefined;
   } catch (err) {
     if (transactionStarted) {
       await client.query('ROLLBACK').catch((rollbackErr) => {
@@ -10693,4 +10685,5 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
 });
 
 
+export { registerVentaFidelizacionAfterCommit };
 export default router;
