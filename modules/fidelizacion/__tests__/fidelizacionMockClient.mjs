@@ -11,6 +11,7 @@ export const createFidelizacionMockClient = ({
   activeConfig = { lempiras_por_punto: 10 },
   saldoInicial = 0,
   movimientos = [],
+  facturaContexts = {},
   failOn = null
 } = {}) => {
   const state = {
@@ -18,6 +19,7 @@ export const createFidelizacionMockClient = ({
     activeConfig,
     saldos: new Map(),
     movimientos: [...movimientos],
+    facturaContexts: { ...facturaContexts },
     nextMovimientoId: movimientos.length + 1,
     calls: []
   };
@@ -37,6 +39,12 @@ export const createFidelizacionMockClient = ({
       }
       if (trimmed.includes('pg_advisory_xact_lock')) {
         return { rows: [] };
+      }
+
+      if (text.includes('FROM public.facturas f')) {
+        const facturaId = Number(params[0]);
+        const context = state.facturaContexts[facturaId];
+        return { rows: context ? [{ id_factura: facturaId, ...context }] : [] };
       }
 
       if (text.includes('FROM public.fidelizacion_movimientos fm')) {

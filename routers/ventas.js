@@ -4,7 +4,7 @@ import { createHash } from 'node:crypto';
 import pool from '../config/db-connection.js';
 import { checkPermission, requestHasAnyPermission, requestHasAnyRole } from '../middleware/checkPermission.js';
 import { resolveRequestUserSucursalScope } from '../utils/sucursalScope.js';
-import { registerFacturaLoyaltyAccumulation } from '../services/fidelizacionService.js';
+import { notifyPaidInvoice } from '../modules/fidelizacion/index.js';
 import { generarCodigoDocumento } from '../services/facturacionCorrelativoService.js';
 import {
   aplicarSnapshotEnFactura,
@@ -144,7 +144,6 @@ import {
   VENTAS_DESCUENTO_APLICAR_PERMISSION,
   VENTAS_DESCUENTOS_PERMISSIONS,
   VENTAS_DESCUENTOS_WRITE_PERMISSIONS,
-  VENTAS_FIDELIZACION_ADVISORY_LOCK_CLASS,
   VENTAS_HISTORY_ADMIN_ROLES,
   VENTAS_HISTORY_CAJERO_ROLE,
   VENTAS_LIMIT_72H_CUTOFF_SQL,
@@ -1101,85 +1100,6 @@ const buildCreateVentaDetailResponse = ({
   };
 };
 
-const logVentasFidelizacionAsyncPerf = (payload) => {
-  if (!isVentasPerfEnabled()) return;
-  console.info('[ventas:perf:fidelizacion_async]', payload);
-};
-
-const registerVentaFidelizacionAfterCommit = async ({
-  idFactura,
-  idPedido = null,
-  idCliente = null,
-  idSucursal = null,
-  idUsuarioEjecutor = null,
-  montoFactura = 0
-}) => {
-  const facturaId = parseOptionalPositiveInt(idFactura);
-  const startedAt = performance.now();
-
-  if (!facturaId || !parseOptionalPositiveInt(idCliente) || !parseOptionalPositiveInt(idSucursal)) {
-    logVentasFidelizacionAsyncPerf({
-      id_factura: facturaId || null,
-      post_rpc_fidelizacion_ms: Math.max(0, Math.round(performance.now() - startedAt)),
-      created: false,
-      reason: 'MISSING_REQUIRED_DATA'
-    });
-    return;
-  }
-
-  let client = null;
-  let transactionStarted = false;
-  const fidelizacionAsyncPerf = createVentasPerfTracker();
-
-  try {
-    const poolWaitStart = fidelizacionAsyncPerf.now();
-    client = await pool.connect();
-    fidelizacionAsyncPerf.add('pool_wait_ms', poolWaitStart);
-    instrumentVentasSqlClient(client, fidelizacionAsyncPerf);
-    const transactionStart = fidelizacionAsyncPerf.now();
-    await client.query('BEGIN');
-    transactionStarted = true;
-    await client.query(
-      'SELECT pg_advisory_xact_lock($1::int, $2::int)',
-      [VENTAS_FIDELIZACION_ADVISORY_LOCK_CLASS, facturaId]
-    );
-
-    const result = await registerFacturaLoyaltyAccumulation({
-      client,
-      idFactura: facturaId,
-      idPedido,
-      idCliente,
-      idSucursal,
-      idUsuarioEjecutor,
-      montoFactura
-    });
-
-    await client.query('COMMIT');
-    transactionStarted = false;
-    fidelizacionAsyncPerf.add('transaction_ms', transactionStart);
-
-    logVentasFidelizacionAsyncPerf({
-      id_factura: facturaId,
-      post_rpc_fidelizacion_ms: Math.max(0, Math.round(performance.now() - startedAt)),
-      created: Boolean(result?.created),
-      reason: result?.reason || null
-    });
-  } catch (err) {
-    if (transactionStarted) {
-      try {
-        await client.query('ROLLBACK');
-      } catch (_) {
-        // La venta ya fue confirmada; este rollback solo protege el trabajo diferido.
-      }
-    }
-    console.error('[ventas:fidelizacion_async] error:', {
-      id_factura: facturaId,
-      code: err?.code || err?.name || 'FIDELIZACION_ASYNC_ERROR'
-    });
-  } finally {
-    if (client) client.release();
-  }
-};
 const createVentaWithRpcTransaction = async ({ client, venta, perf, requestStartedAt = 0 }) => {
   const rpcTotalStart = perf?.now?.() || 0;
 
@@ -1279,14 +1199,7 @@ const createVentaWithRpcTransaction = async ({ client, venta, perf, requestStart
   return {
     response: responsePayload,
     afterRpcStart,
-    fidelizacionJob: {
-      idFactura,
-      idPedido: parseOptionalPositiveInt(response.id_pedido),
-      idCliente: venta.id_cliente,
-      idSucursal: venta.id_sucursal,
-      idUsuarioEjecutor: venta.id_usuario,
-      montoFactura: venta.total
-    }
+    fidelizacionJob: { idFactura }
   };
 };
 const createVentaWithRpcV2Transaction = async ({ client, venta, perf, requestStartedAt = 0 }) => {
@@ -1362,14 +1275,7 @@ const createVentaWithRpcV2Transaction = async ({ client, venta, perf, requestSta
   return {
     response: responsePayload,
     afterRpcStart,
-    fidelizacionJob: {
-      idFactura,
-      idPedido: parseOptionalPositiveInt(response.id_pedido),
-      idCliente: venta.id_cliente,
-      idSucursal: venta.id_sucursal,
-      idUsuarioEjecutor: venta.id_usuario,
-      montoFactura: venta.total
-    }
+    fidelizacionJob: { idFactura }
   };
 };
 
@@ -1416,7 +1322,7 @@ const createVentaWithRpcV3Transaction = async ({
       fidelizacion: null
     },
     afterRpcStart,
-    fidelizacionJob: buildRpcFidelizacionJob({ response, venta })
+    fidelizacionJob: buildRpcFidelizacionJob({ response })
   };
 };
 
@@ -9616,14 +9522,7 @@ router.post('/ventas/pedidos/:id/registrar-pago', checkPermission(['VENTAS_CREAR
     });
 
     if (pedidoPagadoCompleto) {
-      void registerVentaFidelizacionAfterCommit({
-        idFactura,
-        idPedido,
-        idCliente: parseOptionalPositiveInt(pedido.id_cliente),
-        idSucursal: idSucursalPedido,
-        idUsuarioEjecutor: userId,
-        montoFactura: totalPedido
-      });
+      void notifyPaidInvoice({ idFactura }).catch(() => undefined);
     }
     return undefined;
   } catch (err) {
@@ -9952,7 +9851,7 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
       res.status(201).json(rpcV3ResponseBody);
 
       if (shouldRunRpcPostCommitSideEffects(rpcV3ResponseBody)) {
-        void registerVentaFidelizacionAfterCommit(rpcCreateResult.fidelizacionJob);
+        void notifyPaidInvoice({ idFactura: rpcCreateResult.fidelizacionJob.idFactura }).catch(() => undefined);
       }
       return;
     }
@@ -9979,15 +9878,12 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
         idUsuario: userId,
         perf: ventasPerf
       });
-      if (ventaHasExtras) {
-        const fidelizacionPedidoId = parseOptionalPositiveInt(rpcCreateResult.fidelizacionJob?.idPedido);
-        if (!fidelizacionPedidoId) {
-          throw {
-            httpStatus: 500,
-            code: 'VENTAS_RPC_V2_PEDIDO_INVALIDO',
-            publicMessage: 'La venta fue procesada por RPC V2, pero no devolvio pedido valido para descontar extras.'
-          };
-        }
+      if (ventaHasExtras && !idPedidoRpc) {
+        throw {
+          httpStatus: 500,
+          code: 'VENTAS_RPC_V2_PEDIDO_INVALIDO',
+          publicMessage: 'La venta fue procesada por RPC V2, pero no devolvio pedido valido para descontar extras.'
+        };
       }
 
       await applyPedidoInitialOperationalRouting({ client, idPedido: idPedidoRpc });
@@ -10017,7 +9913,7 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
       ventasPerf.log({ ...ventasPerfContext, status: 201 });
       res.status(201).json(rpcV2ResponseBody);
 
-      void registerVentaFidelizacionAfterCommit(rpcCreateResult.fidelizacionJob);
+      void notifyPaidInvoice({ idFactura: rpcCreateResult.fidelizacionJob.idFactura }).catch(() => undefined);
       return;
     }
 
@@ -10076,7 +9972,7 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
       ventasPerf.log({ ...ventasPerfContext, status: 201 });
       res.status(201).json(rpcV1ResponseBody);
 
-      void registerVentaFidelizacionAfterCommit(rpcCreateResult.fidelizacionJob);
+      void notifyPaidInvoice({ idFactura: rpcCreateResult.fidelizacionJob.idFactura }).catch(() => undefined);
       return;
     }
 
@@ -10628,14 +10524,7 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
 
     res.status(201).json(createVentaResponse);
 
-    void registerVentaFidelizacionAfterCommit({
-      idFactura,
-      idPedido,
-      idCliente: venta.id_cliente,
-      idSucursal: venta.id_sucursal,
-      idUsuarioEjecutor: venta.id_usuario,
-      montoFactura: venta.total
-    });
+    void notifyPaidInvoice({ idFactura }).catch(() => undefined);
     return undefined;
   } catch (err) {
     if (transactionStarted) {
@@ -10685,5 +10574,4 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
 });
 
 
-export { registerVentaFidelizacionAfterCommit };
 export default router;

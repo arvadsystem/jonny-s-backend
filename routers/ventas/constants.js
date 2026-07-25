@@ -178,4 +178,3 @@ export const REVERSION_ALERT_EMAIL = 'gersonmz@jonnyshn.com';
 export const REVERSION_FAILURE_EMAIL_COOLDOWN_MS = 60 * 1000;
 export const VENTA_COMPLEMENTO_TIPO_SALSAS = 'SALSAS';
 export const WINGS_SAUCE_KEYWORDS = Object.freeze(['alita', 'alitas', 'tender', 'tenders']);
-export const VENTAS_FIDELIZACION_ADVISORY_LOCK_CLASS = 724201;

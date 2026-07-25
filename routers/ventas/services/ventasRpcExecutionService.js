@@ -118,11 +118,9 @@ export const executeVentasRpc = async ({
   return response;
 };
 
-export const buildRpcFidelizacionJob = ({ response, venta }) => ({
-  idFactura: parseOptionalPositiveInt(response?.id_factura),
-  idPedido: parseOptionalPositiveInt(response?.id_pedido),
-  idCliente: venta.id_cliente,
-  idSucursal: venta.id_sucursal,
-  idUsuarioEjecutor: venta.id_usuario,
-  montoFactura: venta.total
+// Fidelizacion ya no recibe pedido/cliente/sucursal/usuario/monto desde
+// Ventas: solo el id_factura. Ella misma resuelve el resto desde datos
+// persistidos (ver modules/fidelizacion/infrastructure/fidelizacionRepository.js).
+export const buildRpcFidelizacionJob = ({ response }) => ({
+  idFactura: parseOptionalPositiveInt(response?.id_factura)
 });
