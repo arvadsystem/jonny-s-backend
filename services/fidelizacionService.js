@@ -1,5 +1,6 @@
 import pool from '../config/db-connection.js';
 import { getClientIp } from '../utils/security/clientInfo.js';
+import { computeAccumulationPoints } from '../modules/fidelizacion/domain/pointsCalculator.js';
 
 const CLIENT_ROLE_NAME = 'CLIENTE';
 const TEGUCIGALPA_TIMEZONE = 'America/Tegucigalpa';
@@ -150,7 +151,10 @@ const resolveFidelizacionCatalogs = async (client) => {
   };
 };
 
-export const getActiveFidelizacionConfig = async (client, idSucursal) => {
+// referenceDate es opcional (default NOW(), usado por canje presencial).
+// La acumulacion por factura pagada debe pasar la fecha de pago/facturacion
+// para resolver la configuracion vigente EN ESE MOMENTO, no la de hoy.
+export const getActiveFidelizacionConfig = async (client, idSucursal, referenceDate = null) => {
   const sucursalId = parsePositiveInt(idSucursal);
   if (!sucursalId) return null;
 
@@ -169,12 +173,12 @@ export const getActiveFidelizacionConfig = async (client, idSucursal) => {
       FROM public.fidelizacion_configuracion_sucursal fcs
       WHERE fcs.id_sucursal = $1
         AND COALESCE(fcs.estado, true) = true
-        AND fcs.vigente_desde <= NOW()
-        AND (fcs.vigente_hasta IS NULL OR fcs.vigente_hasta > NOW())
+        AND fcs.vigente_desde <= COALESCE($2::timestamptz, NOW())
+        AND (fcs.vigente_hasta IS NULL OR fcs.vigente_hasta > COALESCE($2::timestamptz, NOW()))
       ORDER BY fcs.vigente_desde DESC, fcs.id_configuracion DESC
       LIMIT 1
     `,
-    [sucursalId]
+    [sucursalId, referenceDate || null]
   );
 
   return result.rows[0] || null;
@@ -400,13 +404,6 @@ const addSaldoPoints = async ({
 const buildVentaNumero = (idFactura) => `VTA-${String(idFactura).padStart(5, '0')}`;
 const buildCanjeNumero = (idCanje) => `CAN-${String(idCanje).padStart(5, '0')}`;
 
-const computeAccumulationPoints = (montoFactura, lempirasPorPunto) => {
-  const total = Number(montoFactura || 0);
-  const ratio = Number(lempirasPorPunto || 0);
-  if (!Number.isFinite(total) || !Number.isFinite(ratio) || total <= 0 || ratio <= 0) return 0;
-  return Math.floor(total / ratio);
-};
-
 const computeRedemptionPoints = (precioProducto, lempirasPorPunto) => {
   const price = Number(precioProducto || 0);
   const ratio = Number(lempirasPorPunto || 0);
@@ -421,7 +418,8 @@ export const registerFacturaLoyaltyAccumulation = async ({
   idCliente = null,
   idSucursal = null,
   idUsuarioEjecutor = null,
-  montoFactura = 0
+  montoFactura = 0,
+  referenceDate = null
 }) => {
   const facturaId = parsePositiveInt(idFactura);
   const clienteId = parsePositiveInt(idCliente);
@@ -460,7 +458,7 @@ export const registerFacturaLoyaltyAccumulation = async ({
     return { created: false, reason: 'CLIENT_NOT_ELIGIBLE' };
   }
 
-  const activeConfig = await getActiveFidelizacionConfig(client, sucursalId);
+  const activeConfig = await getActiveFidelizacionConfig(client, sucursalId, referenceDate);
   if (!activeConfig) {
     return { created: false, reason: 'CONFIG_NOT_FOUND' };
   }

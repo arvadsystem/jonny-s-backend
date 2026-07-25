@@ -1,27 +1,52 @@
 // Test-only helper: an in-memory stand-in for the pg client used by
-// registerFacturaLoyaltyAccumulation, so tests never touch a real database.
+// registerFacturaLoyaltyAccumulation and el resto del modulo de fidelizacion,
+// para que las pruebas nunca toquen una base de datos real.
 const CATALOG_IDS = {
   tipos: { ACUMULACION: 1, CANJE: 2 },
   origenes: { FACTURA: 1, CANJE: 2 },
   estados: { REGISTRADO: 1 }
 };
 
+const toDateOrNull = (value) => (value ? new Date(value) : null);
+
+const resolveConfigForDate = (activeConfigs, referenceParam) => {
+  const refDate = referenceParam ? new Date(referenceParam) : new Date();
+  const matches = activeConfigs.filter((cfg) => {
+    const desde = toDateOrNull(cfg.vigente_desde) || new Date(0);
+    const hasta = toDateOrNull(cfg.vigente_hasta);
+    return desde <= refDate && (!hasta || hasta > refDate);
+  });
+  if (matches.length === 0) return null;
+  matches.sort((a, b) => new Date(b.vigente_desde || 0) - new Date(a.vigente_desde || 0));
+  return matches[0];
+};
+
 export const createFidelizacionMockClient = ({
   elegible = true,
   activeConfig = { lempiras_por_punto: 10 },
+  activeConfigs = null,
   saldoInicial = 0,
   movimientos = [],
   facturaContexts = {},
-  failOn = null
+  missingAccumulationIds = [],
+  failOn = null,
+  releaseError = null
 } = {}) => {
+  const resolvedConfigs = activeConfigs || (activeConfig
+    ? [{ vigente_desde: '1970-01-01T00:00:00Z', vigente_hasta: null, ...activeConfig }]
+    : []);
+
   const state = {
     elegible,
-    activeConfig,
+    activeConfigs: resolvedConfigs,
     saldos: new Map(),
     movimientos: [...movimientos],
     facturaContexts: { ...facturaContexts },
+    missingAccumulationIds: [...missingAccumulationIds],
     nextMovimientoId: movimientos.length + 1,
-    calls: []
+    calls: [],
+    released: false,
+    releaseCallCount: 0
   };
 
   const client = {
@@ -39,6 +64,12 @@ export const createFidelizacionMockClient = ({
       }
       if (trimmed.includes('pg_advisory_xact_lock')) {
         return { rows: [] };
+      }
+
+      if (text.includes('NOT EXISTS') && text.includes('FROM public.facturas f')) {
+        const limit = Number(params[0]) || 25;
+        const rows = state.missingAccumulationIds.slice(0, limit).map((id) => ({ id_factura: id }));
+        return { rows };
       }
 
       if (text.includes('FROM public.facturas f')) {
@@ -60,7 +91,8 @@ export const createFidelizacionMockClient = ({
       }
 
       if (text.includes('FROM public.fidelizacion_configuracion_sucursal')) {
-        return { rows: state.activeConfig ? [state.activeConfig] : [] };
+        const match = resolveConfigForDate(state.activeConfigs, params[1]);
+        return { rows: match ? [match] : [] };
       }
 
       if (text.includes('cat_fidelizacion_tipos_movimiento') && text.includes('SELECT')) {
@@ -127,7 +159,13 @@ export const createFidelizacionMockClient = ({
 
       throw new Error(`UNEXPECTED_MOCK_QUERY: ${text.slice(0, 80)}`);
     },
-    release() {}
+    release() {
+      state.releaseCallCount += 1;
+      if (releaseError) {
+        throw releaseError instanceof Error ? releaseError : new Error(String(releaseError));
+      }
+      state.released = true;
+    }
   };
 
   return { client, state };

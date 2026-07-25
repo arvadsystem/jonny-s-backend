@@ -3,11 +3,9 @@ import {
   connectClient,
   lockFacturaForAccumulation,
   getFacturaAccumulationContext,
-  hasExistingAccumulation,
-  getActiveConfigForSucursal,
+  isFacturaFullyPaid,
   persistAccumulation
 } from '../infrastructure/fidelizacionRepository.js';
-import { computeAccumulationPoints, isAccumulationWorthPersisting } from '../domain/pointsCalculator.js';
 
 const parsePositiveInt = (value) => {
   const parsed = Number.parseInt(String(value ?? ''), 10);
@@ -22,10 +20,27 @@ const logAccumulationOutcome = (payload) => {
   console.info('[fidelizacion:accumulate]', payload);
 };
 
-// Este es el sucesor de registerVentaFidelizacionAfterCommit (antes en
-// routers/ventas.js): abre su propia conexion y transaccion, nunca la de la
-// venta/pago que ya fue confirmada, y jamas propaga un error hacia quien la
-// invoco (ver application/notifyPaidInvoice.js).
+const releaseClientSafely = (client) => {
+  if (!client) return;
+  try {
+    client.release();
+  } catch (releaseErr) {
+    console.error('[fidelizacion:accumulate] error al liberar conexion:', {
+      code: releaseErr?.code || releaseErr?.name || 'FIDELIZACION_RELEASE_ERROR'
+    });
+  }
+};
+
+// Sucesor de registerVentaFidelizacionAfterCommit: abre su propia conexion
+// (pool dedicado, ver infrastructure/fidelizacionPool.js) y su propia
+// transaccion, nunca la de la venta/pago que ya fue confirmada, y jamas
+// propaga un error hacia quien la invoco (ver application/notifyPaidInvoice.js).
+//
+// Unica capa que decide y persiste los puntos: resuelve contexto y estado de
+// pago aqui, pero el calculo de puntos, la config vigente EN LA FECHA de pago
+// y la escritura viven en un solo lugar (infrastructure/fidelizacionRepository.js
+// -> services/fidelizacionService.js::registerFacturaLoyaltyAccumulation).
+// No se repite esa consulta ni ese calculo en esta capa.
 export const accumulateInvoicePoints = async ({ idFactura } = {}) => {
   const facturaId = parsePositiveInt(idFactura);
   const startedAt = performance.now();
@@ -45,22 +60,10 @@ export const accumulateInvoicePoints = async ({ idFactura } = {}) => {
     transactionStarted = true;
     await lockFacturaForAccumulation(client, facturaId);
 
-    const alreadyRegisteredMovementId = await hasExistingAccumulation(client, facturaId);
-    if (alreadyRegisteredMovementId) {
-      await client.query('COMMIT');
-      transactionStarted = false;
-      const outcome = { created: false, reason: 'ALREADY_REGISTERED', idMovimiento: alreadyRegisteredMovementId };
-      logAccumulationOutcome({
-        id_factura: facturaId,
-        ...outcome,
-        elapsed_ms: Math.max(0, Math.round(performance.now() - startedAt))
-      });
-      return outcome;
-    }
-
     const context = await getFacturaAccumulationContext(client, facturaId);
     const idCliente = parsePositiveInt(context?.id_cliente);
     const idSucursal = parsePositiveInt(context?.id_sucursal);
+
     if (!context || !idCliente || !idSucursal) {
       await client.query('COMMIT');
       transactionStarted = false;
@@ -73,15 +76,10 @@ export const accumulateInvoicePoints = async ({ idFactura } = {}) => {
       return outcome;
     }
 
-    const activeConfig = await getActiveConfigForSucursal(client, idSucursal);
-    const projectedPoints = computeAccumulationPoints(context.monto_factura, activeConfig?.lempiras_por_punto);
-    if (!isAccumulationWorthPersisting(projectedPoints)) {
+    if (!isFacturaFullyPaid(context)) {
       await client.query('COMMIT');
       transactionStarted = false;
-      const outcome = {
-        created: false,
-        reason: activeConfig ? 'POINTS_ROUND_DOWN_TO_ZERO' : 'CONFIG_NOT_FOUND'
-      };
+      const outcome = { created: false, reason: 'INVOICE_NOT_FULLY_PAID' };
       logAccumulationOutcome({
         id_factura: facturaId,
         ...outcome,
@@ -97,7 +95,8 @@ export const accumulateInvoicePoints = async ({ idFactura } = {}) => {
       idCliente,
       idSucursal,
       idUsuarioEjecutor: parsePositiveInt(context.id_usuario),
-      montoFactura: context.monto_factura
+      montoFactura: context.monto_factura,
+      referenceDate: context.fecha_referencia_config
     });
 
     await client.query('COMMIT');
@@ -125,6 +124,6 @@ export const accumulateInvoicePoints = async ({ idFactura } = {}) => {
     });
     return { created: false, reason: 'ERROR' };
   } finally {
-    if (client) client.release();
+    releaseClientSafely(client);
   }
 };

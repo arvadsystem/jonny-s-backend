@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import { readFile } from 'node:fs/promises';
+import { notifyPaidInvoice } from '../../../modules/fidelizacion/index.js';
+import { fidelizacionPool } from '../../../modules/fidelizacion/infrastructure/fidelizacionPool.js';
 
 const getVentasSource = async () => readFile(new URL('../../ventas.js', import.meta.url), 'utf8');
 
@@ -84,5 +86,54 @@ describe('Frontera Ventas -> Fidelizacion (modules/fidelizacion)', () => {
     assert.ok(commitIndex > -1 && jsonIndex > -1 && notifyIndex > -1);
     assert.ok(commitIndex < jsonIndex);
     assert.ok(jsonIndex < notifyIndex);
+  });
+
+  it('modules/fidelizacion/index.js expone publicamente solo notifyPaidInvoice', async () => {
+    const moduleIndex = await import('../../../modules/fidelizacion/index.js');
+    assert.deepEqual(Object.keys(moduleIndex), ['notifyPaidInvoice']);
+  });
+
+  it('respuesta 201 aunque notifyPaidInvoice falle: la respuesta ya se envio antes de que la notificacion resuelva o rechace', async () => {
+    const originalConnect = fidelizacionPool.connect;
+    fidelizacionPool.connect = async () => { throw new Error('FIDELIZACION_DB_DOWN'); };
+
+    const res = {
+      statusCode: null,
+      body: null,
+      sent: false,
+      status(code) {
+        this.statusCode = code;
+        return this;
+      },
+      json(body) {
+        this.body = body;
+        this.sent = true;
+        return this;
+      }
+    };
+
+    try {
+      // Reproduce exactamente el patron usado en routers/ventas.js: primero
+      // se responde, despues se notifica sin esperar ni afectar la respuesta.
+      res.status(201).json({ id_factura: 123, fidelizacion: null });
+      assert.equal(res.sent, true);
+      assert.equal(res.statusCode, 201);
+
+      let notifyOutcome = 'pending';
+      const notifyPromise = notifyPaidInvoice({ idFactura: 123 })
+        .then(() => { notifyOutcome = 'resolved'; })
+        .catch(() => { notifyOutcome = 'caught'; });
+
+      // La respuesta ya quedo enviada independientemente de lo que haga la notificacion.
+      assert.equal(res.sent, true);
+      assert.equal(res.statusCode, 201);
+      assert.deepEqual(res.body, { id_factura: 123, fidelizacion: null });
+
+      await notifyPromise;
+      assert.equal(notifyOutcome, 'resolved', 'notifyPaidInvoice nunca debe rechazar, incluso con la DB caida');
+      assert.equal(res.statusCode, 201, 'la respuesta ya enviada no debe alterarse por el resultado de la notificacion');
+    } finally {
+      fidelizacionPool.connect = originalConnect;
+    }
   });
 });

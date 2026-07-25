@@ -1,0 +1,199 @@
+import { reconcileMissingPoints } from '../modules/fidelizacion/workers/reconcileMissingPoints.js';
+
+const DEFAULT_INTERVAL_MS = 60000;
+const MIN_INTERVAL_MS = 15000;
+const MAX_INTERVAL_MS = 600000;
+const DEFAULT_BATCH_LIMIT = 25;
+
+const schedulerState = {
+  started: false,
+  acceptingTicks: false,
+  running: false,
+  timer: null,
+  intervalMs: null,
+  lastStartedAt: null,
+  lastTickStartedAt: null,
+  lastTickCompletedAt: null,
+  lastTickSucceededAt: null,
+  lastTickFailedAt: null,
+  lastError: null,
+  lastResult: null,
+  successfulTicks: 0,
+  failedTicks: 0,
+  runningPromise: null
+};
+
+const parseBoolEnv = (value, fallback = false) => {
+  if (value === undefined || value === null || value === '') return fallback;
+  return ['1', 'true', 'yes', 'on'].includes(String(value).trim().toLowerCase());
+};
+
+const parsePositiveIntEnv = (value, fallback, min = 1, max = Number.MAX_SAFE_INTEGER) => {
+  const parsed = Number.parseInt(String(value ?? '').trim(), 10);
+  if (!Number.isInteger(parsed) || parsed <= 0) return fallback;
+  return Math.min(Math.max(parsed, min), max);
+};
+
+const isFidelizacionReconcileSchedulerEnabled = () =>
+  parseBoolEnv(process.env.FIDELIZACION_RECONCILE_SCHEDULER_ENABLED, false);
+
+const defaultDependencies = {
+  reconcileMissingPoints,
+  isFidelizacionReconcileSchedulerEnabled,
+  setInterval: globalThis.setInterval.bind(globalThis),
+  clearInterval: globalThis.clearInterval.bind(globalThis),
+  now: () => new Date(),
+  log: console.log.bind(console),
+  error: console.error.bind(console)
+};
+
+const dependencies = { ...defaultDependencies };
+
+const isoNow = () => dependencies.now().toISOString();
+
+const getSchedulerInterval = () =>
+  parsePositiveIntEnv(process.env.FIDELIZACION_RECONCILE_INTERVAL_MS, DEFAULT_INTERVAL_MS, MIN_INTERVAL_MS, MAX_INTERVAL_MS);
+
+const getBatchLimit = () =>
+  parsePositiveIntEnv(process.env.FIDELIZACION_RECONCILE_BATCH_LIMIT, DEFAULT_BATCH_LIMIT, 1, 200);
+
+const publicState = () => ({
+  started: schedulerState.started,
+  running: schedulerState.running,
+  interval_ms: schedulerState.intervalMs,
+  last_started_at: schedulerState.lastStartedAt,
+  last_tick_started_at: schedulerState.lastTickStartedAt,
+  last_tick_completed_at: schedulerState.lastTickCompletedAt,
+  last_tick_succeeded_at: schedulerState.lastTickSucceededAt,
+  last_tick_failed_at: schedulerState.lastTickFailedAt,
+  last_result: schedulerState.lastResult,
+  successful_ticks: schedulerState.successfulTicks,
+  failed_ticks: schedulerState.failedTicks,
+  last_error_code: schedulerState.lastError?.code || null
+});
+
+export const getFidelizacionReconciliationSchedulerState = () => publicState();
+
+const resetSchedulerState = ({ preserveCounters = false } = {}) => {
+  schedulerState.started = false;
+  schedulerState.acceptingTicks = false;
+  schedulerState.running = false;
+  schedulerState.timer = null;
+  schedulerState.intervalMs = null;
+  schedulerState.lastStartedAt = null;
+  schedulerState.lastTickStartedAt = null;
+  schedulerState.lastTickCompletedAt = null;
+  schedulerState.lastTickSucceededAt = null;
+  schedulerState.lastTickFailedAt = null;
+  schedulerState.lastError = null;
+  schedulerState.runningPromise = null;
+  if (!preserveCounters) {
+    schedulerState.successfulTicks = 0;
+    schedulerState.failedTicks = 0;
+    schedulerState.lastResult = null;
+  }
+};
+
+export const configureFidelizacionReconciliationSchedulerForTests = (overrides = {}) => {
+  Object.assign(dependencies, overrides);
+};
+
+export const resetFidelizacionReconciliationSchedulerForTests = () => {
+  if (schedulerState.timer) dependencies.clearInterval(schedulerState.timer);
+  resetSchedulerState();
+  Object.assign(dependencies, defaultDependencies);
+};
+
+// Idempotente: si ya hay un tick corriendo, este no arranca otro en paralelo.
+export const fidelizacionReconciliationTick = async () => {
+  if (!schedulerState.acceptingTicks || schedulerState.running) {
+    return { skipped: true, reason: schedulerState.running ? 'ALREADY_RUNNING' : 'STOPPING' };
+  }
+
+  schedulerState.running = true;
+  schedulerState.lastTickStartedAt = isoNow();
+
+  schedulerState.runningPromise = Promise.resolve()
+    .then(() => dependencies.reconcileMissingPoints({ limit: getBatchLimit() }))
+    .then((result) => {
+      schedulerState.successfulTicks += 1;
+      schedulerState.lastTickSucceededAt = isoNow();
+      schedulerState.lastError = null;
+      schedulerState.lastResult = result;
+      dependencies.log('[fidelizacion_reconcile_scheduler] tick completed', {
+        candidates: result?.candidates ?? 0
+      });
+      return { skipped: false, success: true, result };
+    })
+    .catch((error) => {
+      schedulerState.failedTicks += 1;
+      schedulerState.lastTickFailedAt = isoNow();
+      schedulerState.lastError = { code: error?.code || 'TICK_ERROR' };
+      dependencies.error('[fidelizacion_reconcile_scheduler] tick failed', {
+        code: error?.code || 'TICK_ERROR'
+      });
+      return { skipped: false, success: false, error };
+    })
+    .finally(() => {
+      schedulerState.lastTickCompletedAt = isoNow();
+      schedulerState.running = false;
+      schedulerState.runningPromise = null;
+    });
+
+  return schedulerState.runningPromise;
+};
+
+export const startFidelizacionReconciliationScheduler = async () => {
+  const intervalMs = getSchedulerInterval();
+  if (schedulerState.started) {
+    return { started: true, reason: 'ALREADY_STARTED', interval_ms: schedulerState.intervalMs || intervalMs };
+  }
+
+  const processRole = String(process.env.PROCESS_ROLE || 'web').trim().toLowerCase();
+  if (processRole !== 'scheduler') {
+    return { started: false, reason: 'INVALID_PROCESS_ROLE' };
+  }
+  if (!dependencies.isFidelizacionReconcileSchedulerEnabled()) {
+    return { started: false, reason: 'DISABLED' };
+  }
+
+  schedulerState.acceptingTicks = true;
+  schedulerState.intervalMs = intervalMs;
+
+  await fidelizacionReconciliationTick();
+
+  if (!schedulerState.acceptingTicks) {
+    if (!schedulerState.running) resetSchedulerState({ preserveCounters: true });
+    return { started: false, reason: 'STOPPING', interval_ms: intervalMs };
+  }
+
+  schedulerState.timer = dependencies.setInterval(() => {
+    void fidelizacionReconciliationTick();
+  }, intervalMs);
+  schedulerState.started = true;
+  schedulerState.lastStartedAt = isoNow();
+
+  dependencies.log('[fidelizacion_reconcile_scheduler] activo', { interval_ms: intervalMs });
+
+  return { started: true, reason: 'STARTED', interval_ms: intervalMs };
+};
+
+export const stopFidelizacionReconciliationScheduler = async () => {
+  if (!schedulerState.started && !schedulerState.timer && !schedulerState.running) {
+    resetSchedulerState({ preserveCounters: true });
+    return { stopped: true, reason: 'ALREADY_STOPPED' };
+  }
+
+  schedulerState.acceptingTicks = false;
+  if (schedulerState.timer) {
+    dependencies.clearInterval(schedulerState.timer);
+    schedulerState.timer = null;
+  }
+
+  if (schedulerState.runningPromise) {
+    await schedulerState.runningPromise;
+  }
+
+  resetSchedulerState({ preserveCounters: true });
+  return { stopped: true, reason: 'STOPPED' };
+};
