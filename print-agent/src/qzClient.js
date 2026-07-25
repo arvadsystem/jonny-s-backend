@@ -119,12 +119,21 @@ export const createQzClient = ({
       qz.api.setPromiseType((resolver) => new Promise(resolver));
       qz.api.setWebSocketType(createSecureWebSocketType({ WebSocketImpl, ca }));
       if (!securityConfigured) {
-        // Medicion real (no solo documentada): el valor devuelto por api.certificate()
-        // nunca se pasa a timeStage/log, asi que el certificado en si jamas queda expuesto
-        // en las metricas -- timeStage solo registra job_id/stage/duration_ms/success.
-        qz.security.setCertificatePromise(async (resolve, reject) => {
-          timeStage(signingContext?.jobId ?? null, 'qz_certificate', () => api.certificate()).then(resolve, reject);
-        });
+        // qz-tray 2.2.6 detecta AsyncFunction por constructor.name y la invoca SIN
+        // argumentos (callCert() -> certHandler(), ver qz-tray.js): un handler
+        // `async (resolve, reject) => {...}` recibe resolve/reject undefined, nunca los
+        // llama, y el certificado real jamas llega a QZ Tray (envia certificate:null ->
+        // Anonymous/UNKNOWN REQUEST/Signature Invalid). El handler debe ser una AsyncFunction
+        // de CERO argumentos que retorne el certificado directamente. `rejectOnFailure:true`
+        // hace que un fallo real de api.certificate() rechace la conexion en vez de degradar
+        // en silencio a certificado nulo. Medicion real (no solo documentada): el valor
+        // devuelto por api.certificate() nunca se pasa a timeStage/log, asi que el
+        // certificado en si jamas queda expuesto en las metricas -- timeStage solo registra
+        // job_id/stage/duration_ms/success.
+        qz.security.setCertificatePromise(
+          async () => timeStage(signingContext?.jobId ?? null, 'qz_certificate', () => api.certificate()),
+          { rejectOnFailure: true }
+        );
         qz.security.setSignatureAlgorithm('SHA512');
         qz.security.setSignaturePromise(async (digest) => {
           if (!signingContext) throw new Error('QZ_GENERIC_SIGNING_DISABLED');

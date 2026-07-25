@@ -4,20 +4,38 @@ import { createQzClient } from '../src/qzClient.js';
 
 // Fake qz.tray minimo, controlable por prueba: cuenta connect/find/disconnect y permite
 // forzar exito, fallo o una espera controlada (deferred) para probar single-flight.
+//
+// El intercambio de certificado reproduce el comportamiento REAL de qz-tray 2.2.6
+// (qz-tray.js: security.callCert / websocket.setup.sendCert), no una version simplificada:
+// un handler AsyncFunction se detecta por constructor.name y se invoca SIN argumentos,
+// usando directamente el valor que retorna; un handler "clasico" (resolve, reject) se
+// invoca dentro de una promesa real, con resolve/reject genuinos. Si el handler falla,
+// options.rejectOnFailure decide si la conexion se rechaza (rejectOnFailure:true) o
+// degrada en silencio a certificate:null (comportamiento por defecto de QZ, y la causa raiz
+// del bug: un handler AsyncFunction que esperaba resolve/reject nunca los recibia).
 const createFakeQz = ({ connectMode = 'succeed' } = {}) => {
   let active = false;
   let signaturePromise = async () => {};
-  let certificatePromise = null;
+  let certHandler = null;
+  let certOptions = null;
+  let receivedCertificate; // permanece undefined si la conexion se rechazo antes de degradar
   const connectCalls = [];
   const findCalls = [];
   const disconnectCalls = [];
   let findList = ['ZKP8008'];
   let pendingConnect = null;
 
+  const callCert = () => {
+    if (certHandler && certHandler.constructor.name === 'AsyncFunction') {
+      return certHandler();
+    }
+    return new Promise((resolve, reject) => certHandler(resolve, reject));
+  };
+
   const qz = {
     api: { setPromiseType: () => {}, setWebSocketType: () => {} },
     security: {
-      setCertificatePromise: (fn) => { certificatePromise = fn; },
+      setCertificatePromise: (fn, options) => { certHandler = fn; certOptions = options || null; },
       setSignatureAlgorithm: () => {},
       setSignaturePromise: (fn) => { signaturePromise = fn; }
     },
@@ -26,6 +44,15 @@ const createFakeQz = ({ connectMode = 'succeed' } = {}) => {
       connect: async (options) => {
         connectCalls.push(options);
         if (connectMode === 'fail') throw new Error('QZ_CONNECTION_REFUSED');
+
+        try {
+          const cert = await callCert();
+          receivedCertificate = cert === undefined ? null : cert;
+        } catch (error) {
+          if (certOptions?.rejectOnFailure) throw error; // nunca degrada a certificate:null
+          receivedCertificate = null;
+        }
+
         if (connectMode === 'deferred') {
           await new Promise((resolve) => { pendingConnect = resolve; });
         }
@@ -54,7 +81,9 @@ const createFakeQz = ({ connectMode = 'succeed' } = {}) => {
     isActive: () => active,
     setFindList: (list) => { findList = list; },
     resolvePendingConnect: () => { pendingConnect?.(); },
-    invokeCertificatePromise: () => new Promise((resolve, reject) => certificatePromise(resolve, reject)),
+    getCertHandlerType: () => certHandler?.constructor?.name || null,
+    getCertOptions: () => certOptions,
+    getReceivedCertificate: () => receivedCertificate,
     invokeSignaturePromise: (digest = 'test-digest') => signaturePromise(digest)
   };
 };
@@ -372,8 +401,10 @@ test('qz_certificate se mide de verdad (print_stage_timing) y nunca expone el ce
     log: (level, event, data) => logs.push({ level, event, data })
   });
 
-  await client.prepare(job(1)); // dispara connect() -> registra setCertificatePromise
-  const certificate = await fake.invokeCertificatePromise();
+  // connect() ya reclama y resuelve el certificado real (via el callCert() del fake, que
+  // reproduce el comportamiento de qz-tray 2.2.6) como parte de qz.websocket.connect().
+  await client.prepare(job(1));
+  const certificate = fake.getReceivedCertificate();
 
   assert.equal(certificate, secretCertificateText, 'la promesa de certificado sigue devolviendo el certificado real a QZ Tray');
 
@@ -385,4 +416,59 @@ test('qz_certificate se mide de verdad (print_stage_timing) y nunca expone el ce
   const serializedLogs = JSON.stringify(logs);
   assert.doesNotMatch(serializedLogs, /MUY-SECRETO/, 'el certificado jamas debe aparecer en las metricas');
   assert.doesNotMatch(serializedLogs, /BEGIN CERTIFICATE/, 'el certificado jamas debe aparecer en las metricas');
+});
+
+// --- Certificado QZ: comportamiento real de qz-tray 2.2.6 (regresion del bug de firma) ---
+//
+// Causa raiz confirmada: qz-tray 2.2.6 detecta un handler AsyncFunction por
+// constructor.name y lo invoca SIN argumentos (callCert() -> certHandler()). Un handler
+// `async (resolve, reject) => {...}` recibe resolve/reject undefined, nunca los llama, y
+// QZ Tray termina enviando certificate:null -> Anonymous / UNKNOWN REQUEST / Signature
+// Invalid. El fix registra una AsyncFunction de CERO argumentos que retorna el certificado
+// directamente, con { rejectOnFailure: true }.
+
+test('certificado QZ: el handler es una AsyncFunction (deteccion real de qz-tray 2.2.6), se invoca sin resolve/reject y el certificado llega completo', async () => {
+  const fake = createFakeQz();
+  const realCertificate = 'CERT-PEM-COMPLETO-DE-PRUEBA';
+  const client = createQzClient({
+    config: baseConfig(),
+    api: { ...fakeApi(), certificate: async () => realCertificate },
+    qz: fake.qz, ...localhostNetworking,
+    log: () => {}
+  });
+
+  await client.prepare(job(1)); // dispara connect() -> registra e invoca setCertificatePromise
+
+  assert.equal(fake.getCertHandlerType(), 'AsyncFunction', 'qz-tray 2.2.6 debe detectar el handler como AsyncFunction (constructor.name)');
+  assert.deepEqual(fake.getCertOptions(), { rejectOnFailure: true });
+  assert.equal(fake.getReceivedCertificate(), realCertificate, 'el certificado real debe llegar completo aunque el handler se invoque sin resolve/reject');
+});
+
+test('certificado QZ: una falla real de api.certificate() rechaza la conexion, nunca degrada a certificate:null', async () => {
+  const fake = createFakeQz();
+  const client = createQzClient({
+    config: baseConfig(),
+    api: { ...fakeApi(), certificate: async () => { throw new Error('CERT_BACKEND_UNAVAILABLE'); } },
+    qz: fake.qz, ...localhostNetworking,
+    log: () => {}
+  });
+
+  await assert.rejects(client.prepare(job(1)), /CERT_BACKEND_UNAVAILABLE/);
+  assert.equal(fake.isActive(), false, 'la conexion nunca debe quedar activa/abierta con un certificado fallido');
+  assert.equal(fake.getReceivedCertificate(), undefined, 'rejectOnFailure:true debe rechazar la conexion en vez de degradar en silencio a certificate:null');
+});
+
+test('regresion: el patron anterior (handler async con resolve/reject) degrada a certificate:null bajo el comportamiento real de qz-tray 2.2.6 -- por eso se corrigio', async () => {
+  const fake = createFakeQz();
+  // Reproduce exactamente el handler que causaba el bug: una AsyncFunction que esperaba
+  // resolve/reject como parametros. qz-tray 2.2.6 la invoca sin argumentos (ver callCert()
+  // en el fake, fiel al comportamiento real), asi que resolve/reject nunca se llaman y el
+  // certificado real jamas llega.
+  fake.qz.security.setCertificatePromise(async (resolve, reject) => {
+    Promise.resolve('cert-pem-que-nunca-deberia-llegar').then(resolve, reject);
+  });
+
+  await fake.qz.websocket.connect({});
+
+  assert.equal(fake.getReceivedCertificate(), null, 'el patron anterior (resolve/reject) degrada a certificate:null bajo qz-tray 2.2.6 real');
 });
