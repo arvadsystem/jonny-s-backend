@@ -40,20 +40,39 @@ const baseContext = (overrides = {}) => ({
   ...overrides
 });
 
+// Simula lo que reservePaidInvoiceAccumulation habria dejado: una fila
+// PENDING con el snapshot YA congelado (ronda 4, bloqueante 2: el snapshot
+// es el contexto autoritativo -id_cliente/id_sucursal/fecha_referencia-, asi
+// que declararlo sin esos campos ya no representa una reserva real; antes de
+// la ronda 4 esos campos no importaban porque persistAccumulation nunca los
+// leia del snapshot). Toma id_cliente/id_sucursal/fecha del mismo contexto
+// que la prueba ya declaro en facturaContexts, para que ambos coincidan.
+const pendingConSnapshot = (context, overrides = {}) => ({
+  estado: 'PENDING',
+  id_pedido: context.id_pedido ?? null,
+  id_cliente: context.id_cliente,
+  id_sucursal: context.id_sucursal,
+  origen_pedido: null,
+  nombre_snapshot: 'Cliente Demo',
+  telefono_snapshot: '9999-9999',
+  perfil_completo_snapshot: true,
+  fecha_referencia: context.fecha_referencia_config ?? null,
+  ...overrides
+});
+
 describe('reconcileMissingPoints (worker de reconciliacion idempotente, sin inanicion)', () => {
   it('bloqueante 1 (regla 7): RECONCILE con PENDING ya existente (LIVE lo reservo antes) si procesa, espera el lote completo y reporta resultados reales', async () => {
     // PENDING simula que el camino LIVE ya reservo el estado (justo tras el
     // COMMIT de la venta) pero algo interrumpio antes de terminar de
     // evaluar (p.ej. reinicio del proceso) -- por eso RECONCILE si puede
     // continuarla, a diferencia de una factura sin fila alguna.
+    const ctx1001 = baseContext({ id_cliente: 5, monto_factura: 100 });
+    const ctx1002 = baseContext({ id_cliente: 6, monto_factura: 200 });
     const { client, state } = createFidelizacionMockClient({
-      facturaContexts: {
-        1001: baseContext({ id_cliente: 5, monto_factura: 100 }),
-        1002: baseContext({ id_cliente: 6, monto_factura: 200 })
-      },
+      facturaContexts: { 1001: ctx1001, 1002: ctx1002 },
       estadoFacturasIniciales: {
-        1001: { estado: 'PENDING' },
-        1002: { estado: 'PENDING' }
+        1001: pendingConSnapshot(ctx1001),
+        1002: pendingConSnapshot(ctx1002)
       }
     });
 
@@ -77,9 +96,12 @@ describe('reconcileMissingPoints (worker de reconciliacion idempotente, sin inan
   });
 
   it('bloqueante 1 (regla 8): RECONCILE con RETRYABLE_ERROR ya existente si reintenta', async () => {
+    const ctx1050 = baseContext({ id_cliente: 5, monto_factura: 100 });
     const { client, state } = createFidelizacionMockClient({
-      facturaContexts: { 1050: baseContext({ id_cliente: 5, monto_factura: 100 }) },
-      estadoFacturasIniciales: { 1050: { estado: 'RETRYABLE_ERROR', intentos: 1, ultimo_error: 'ECONNRESET previo' } }
+      facturaContexts: { 1050: ctx1050 },
+      estadoFacturasIniciales: {
+        1050: pendingConSnapshot(ctx1050, { estado: 'RETRYABLE_ERROR', intentos: 1, ultimo_error: 'ECONNRESET previo' })
+      }
     });
 
     const result = await withMockedFidelizacionPoolConnect(async () => client, () => reconcileMissingPoints({ limit: 25 }));
@@ -200,21 +222,20 @@ describe('reconcileMissingPoints (worker de reconciliacion idempotente, sin inan
   });
 
   it('factura sin configuracion historica valida (con PENDING previo): se procesa, queda SKIPPED_TERMINAL/CONFIG_NOT_FOUND, y no bloquea a las siguientes', async () => {
+    // Fecha fuera de cualquier ventana de configuracion: nunca sera procesable.
+    const ctx4001 = baseContext({ id_cliente: 5, fecha_referencia_config: '2020-01-01T00:00:00Z' });
+    const ctx4002 = baseContext({ id_cliente: 5, fecha_referencia_config: '2026-02-01T00:00:00Z' });
     const { client, state } = createFidelizacionMockClient({
       activeConfigs: [
         { lempiras_por_punto: 10, vigente_desde: '2026-01-01T00:00:00Z', vigente_hasta: null }
       ],
-      facturaContexts: {
-        // Fecha fuera de cualquier ventana de configuracion: nunca sera procesable.
-        4001: baseContext({ id_cliente: 5, fecha_referencia_config: '2020-01-01T00:00:00Z' }),
-        4002: baseContext({ id_cliente: 5, fecha_referencia_config: '2026-02-01T00:00:00Z' })
-      },
+      facturaContexts: { 4001: ctx4001, 4002: ctx4002 },
       // PENDING previo (LIVE ya las reservo): sin esto, RECONCILE no evaluaria
       // nada -ninguna fila de estado significa terminal inmediato, ver
       // bloqueante 1 reglas 4/5-.
       estadoFacturasIniciales: {
-        4001: { estado: 'PENDING' },
-        4002: { estado: 'PENDING' }
+        4001: pendingConSnapshot(ctx4001),
+        4002: pendingConSnapshot(ctx4002)
       }
     });
 
@@ -242,8 +263,8 @@ describe('reconcileMissingPoints (worker de reconciliacion idempotente, sin inan
         4102: baseContext({ id_cliente: 6, fecha_referencia_config: '2026-02-01T00:00:00Z' })
       },
       estadoFacturasIniciales: {
-        4101: { estado: 'PENDING' },
-        4102: { estado: 'PENDING' }
+        4101: pendingConSnapshot(baseContext({ id_cliente: 5, fecha_referencia_config: '2026-02-01T00:00:00Z' })),
+        4102: pendingConSnapshot(baseContext({ id_cliente: 6, fecha_referencia_config: '2026-02-01T00:00:00Z' }))
       }
     });
 
@@ -265,7 +286,9 @@ describe('reconcileMissingPoints (worker de reconciliacion idempotente, sin inan
       facturaContexts: {
         4201: baseContext({ id_cliente: 5, fecha_referencia_config: '2026-02-01T00:00:00Z' })
       },
-      estadoFacturasIniciales: { 4201: { estado: 'PENDING' } }
+      estadoFacturasIniciales: {
+        4201: pendingConSnapshot(baseContext({ id_cliente: 5, fecha_referencia_config: '2026-02-01T00:00:00Z' }))
+      }
     });
 
     const result = await withMockedFidelizacionPoolConnect(async () => client, () => reconcileMissingPoints({ limit: 25 }));
@@ -288,9 +311,9 @@ describe('reconcileMissingPoints (worker de reconciliacion idempotente, sin inan
       // evaluar (y por lo tanto nunca a INSERT INTO fidelizacion_movimientos,
       // que es donde este test simula el fallo tecnico).
       estadoFacturasIniciales: {
-        5001: { estado: 'PENDING' },
-        5002: { estado: 'PENDING' },
-        5003: { estado: 'PENDING' }
+        5001: pendingConSnapshot(baseContext({ id_cliente: 5 })),
+        5002: pendingConSnapshot(baseContext({ id_cliente: 6 })),
+        5003: pendingConSnapshot(baseContext({ id_cliente: 7 }))
       }
     });
 
@@ -324,9 +347,9 @@ describe('reconcileMissingPoints (worker de reconciliacion idempotente, sin inan
     const { client, state } = createFidelizacionMockClient({
       facturaContexts: contexts,
       estadoFacturasIniciales: {
-        6001: { estado: 'PENDING' },
-        6002: { estado: 'PENDING' },
-        6003: { estado: 'PENDING' }
+        6001: pendingConSnapshot(contexts[6001]),
+        6002: pendingConSnapshot(contexts[6002]),
+        6003: pendingConSnapshot(contexts[6003])
       }
     });
 
@@ -425,8 +448,8 @@ describe('reconcileMissingPoints (worker de reconciliacion idempotente, sin inan
         8002: baseContext({ id_cliente: 6 })
       },
       estadoFacturasIniciales: {
-        8001: { estado: 'PENDING' },
-        8002: { estado: 'PENDING' }
+        8001: pendingConSnapshot(baseContext({ id_cliente: 5 })),
+        8002: pendingConSnapshot(baseContext({ id_cliente: 6 }))
       }
     });
     const fakePool = createFakeLimitedPool({ max: 1, backendQuery: backendClient.query });
@@ -449,7 +472,7 @@ describe('reconcileMissingPoints (worker de reconciliacion idempotente, sin inan
   it('la conexion de listado se libera ANTES de procesar el lote (orden verificable)', async () => {
     const { client: backendClient, state } = createFidelizacionMockClient({
       facturaContexts: { 8101: baseContext({ id_cliente: 5 }) },
-      estadoFacturasIniciales: { 8101: { estado: 'PENDING' } }
+      estadoFacturasIniciales: { 8101: pendingConSnapshot(baseContext({ id_cliente: 5 })) }
     });
 
     const timeline = [];
@@ -537,12 +560,11 @@ describe('Elegibilidad historica en RECONCILE (snapshot durable vs evidencia vs 
     const { client, state } = createFidelizacionMockClient({
       facturaContexts: { 7101: baseContext({ id_cliente: 5 }) },
       estadoFacturasIniciales: {
-        7101: {
-          estado: 'PENDING',
+        7101: pendingConSnapshot(baseContext({ id_cliente: 5 }), {
           nombre_snapshot: 'Valido Al Pagar',
           telefono_snapshot: '9999-1111',
           perfil_completo_snapshot: true
-        }
+        })
       },
       // El perfil ACTUAL esta incompleto: si se usara, no acumularia.
       clienteProfiles: { 5: { estado: true, nombre: '', telefono: '' } }
@@ -559,7 +581,11 @@ describe('Elegibilidad historica en RECONCILE (snapshot durable vs evidencia vs 
     const { client, state } = createFidelizacionMockClient({
       facturaContexts: { 7102: baseContext({ id_cliente: 5 }) },
       estadoFacturasIniciales: {
-        7102: { estado: 'PENDING', nombre_snapshot: 'Sin Telefono', telefono_snapshot: null, perfil_completo_snapshot: false }
+        7102: pendingConSnapshot(baseContext({ id_cliente: 5 }), {
+          nombre_snapshot: 'Sin Telefono',
+          telefono_snapshot: null,
+          perfil_completo_snapshot: false
+        })
       }
     });
 
@@ -630,7 +656,9 @@ describe('Elegibilidad historica en RECONCILE (snapshot durable vs evidencia vs 
     const lockCoordinator = createFidelizacionLockCoordinator();
     const principal = createFidelizacionMockClient({
       facturaContexts: { 7106: baseContext({ id_cliente: 5 }) },
-      estadoFacturasIniciales: { 7106: { estado: 'PENDING', perfil_completo_snapshot: true, nombre_snapshot: 'X', telefono_snapshot: '9999-4444' } },
+      estadoFacturasIniciales: {
+        7106: pendingConSnapshot(baseContext({ id_cliente: 5 }), { nombre_snapshot: 'X', telefono_snapshot: '9999-4444' })
+      },
       lockCoordinator
     });
     const secundario = createFidelizacionMockClient({ sharedState: principal.state, lockCoordinator });

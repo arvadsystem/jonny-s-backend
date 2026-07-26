@@ -135,9 +135,14 @@ export const accumulateInvoicePoints = async ({ idFactura, trigger = ACCUMULATIO
     // decidido ni el 201 de la venta, que ya se respondio antes de que
     // cualquiera de esto se ejecute.
     if (client) {
+      // err.eligibilitySnapshot: persistAccumulation lo adjunta cuando ya
+      // habia resuelto el snapshot ANTES de que fallara el registro. El
+      // ROLLBACK de arriba deshizo cualquier escritura de este intento, asi
+      // que esta es la unica oportunidad de no perder esa evidencia historica.
       await recordAccumulationRetryableError(client, facturaId, {
         fechaReferencia: context?.fecha_referencia_config ?? null,
-        error: err
+        error: err,
+        snapshot: err?.eligibilitySnapshot ?? null
       });
     }
 

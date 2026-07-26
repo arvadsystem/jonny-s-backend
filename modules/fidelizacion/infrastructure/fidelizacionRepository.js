@@ -5,9 +5,11 @@ import { PEDIDO_ORIGIN, resolvePedidoOrigin } from '../../../utils/pedidoOrigen.
 import {
   ACCUMULATION_STATE,
   ACCUMULATION_TRIGGER,
+  ACCUMULATION_CONTEXT_MISMATCH,
   LEGACY_ELIGIBILITY_UNVERIFIABLE,
   RETRYABLE_ACCUMULATION_STATES
 } from '../domain/accumulationState.js';
+import { resolveEffectiveAccumulationContext } from '../domain/resolveEffectiveAccumulationContext.js';
 
 // Mismo valor que el antiguo VENTAS_FIDELIZACION_ADVISORY_LOCK_CLASS
 // (routers/ventas/constants.js) para preservar el mismo namespace de
@@ -74,6 +76,13 @@ export const lockFacturaForAccumulation = async (client, idFactura) => {
 // se resuelve y acumula por separado con su propio monto -nunca se agrega el
 // total del pedido completo-, y cada id_factura solo puede generar un
 // movimiento (ver el chequeo de idempotencia en registerFacturaLoyaltyAccumulation).
+//
+// Precedencia de cliente: COALESCE(f.id_cliente, p.id_cliente) -la factura
+// gana, el dueno del pedido es solo el fallback-. En una cuenta dividida la
+// factura puede facturarse a un cliente distinto de quien hizo el pedido;
+// fidelizacion es por factura, asi que el cliente de la FACTURA es siempre
+// el efectivo. (id_sucursal/id_usuario si usan pedido primero: son contexto
+// operativo, no el cliente facturado, y no forman parte de este bug.)
 export const getFacturaAccumulationContext = async (client, idFactura) => {
   const facturaId = parsePositiveInt(idFactura);
   if (!facturaId) return null;
@@ -85,7 +94,7 @@ export const getFacturaAccumulationContext = async (client, idFactura) => {
         f.id_pedido,
         COALESCE(p.id_sucursal, f.id_sucursal) AS id_sucursal,
         COALESCE(p.id_usuario, f.id_usuario) AS id_usuario,
-        COALESCE(p.id_cliente, f.id_cliente) AS id_cliente,
+        COALESCE(f.id_cliente, p.id_cliente) AS id_cliente,
         COALESCE(fc.total_cobrado, 0) AS monto_factura,
         COALESCE(upc.fecha_pago_confirmado, f.fecha_hora_facturacion) AS fecha_referencia_config,
         (upc.id_pedido_pago_control IS NOT NULL) AS tiene_pago_control,
@@ -165,7 +174,7 @@ const fetchAccumulationSnapshotSources = async (client, idFactura) => {
       SELECT
         f.id_factura,
         f.id_pedido,
-        COALESCE(p.id_cliente, f.id_cliente) AS id_cliente,
+        COALESCE(f.id_cliente, p.id_cliente) AS id_cliente,
         COALESCE(p.id_sucursal, f.id_sucursal) AS id_sucursal,
         COALESCE(upc.fecha_pago_confirmado, f.fecha_hora_facturacion) AS fecha_referencia,
         p.origen_pedido,
@@ -191,7 +200,7 @@ const fetchAccumulationSnapshotSources = async (client, idFactura) => {
         ORDER BY pci.id_pedido_contacto DESC
         LIMIT 1
       ) pc ON TRUE
-      LEFT JOIN public.clientes c ON c.id_cliente = COALESCE(p.id_cliente, f.id_cliente)
+      LEFT JOIN public.clientes c ON c.id_cliente = COALESCE(f.id_cliente, p.id_cliente)
       LEFT JOIN public.personas per ON per.id_persona = c.id_persona
       LEFT JOIN public.telefonos telp ON telp.id_telefono = per.id_telefono
       LEFT JOIN public.empresas emp ON emp.id_empresa = c.id_empresa
@@ -301,12 +310,21 @@ export const snapshotFromStateRow = (row) => {
 // de evaluar perfil/switch/tasa/puntos (camino LIVE unicamente -- ver
 // persistAccumulation). intentos arranca en 0: esta reserva no es todavia un
 // intento real de evaluacion; el primer intento real (mas abajo, via
-// upsertAccumulationState) lo sube a 1. ON CONFLICT DO NOTHING: si ya existe
-// cualquier fila (de un intento anterior, o de una carrera con otro
-// disparador bajo el mismo advisory lock), esta reserva no la toca.
+// upsertAccumulationState) lo sube a 1.
 // Acepta un snapshot opcional (buildAccumulationSnapshot). Cuando viene, la
 // fila PENDING queda con la evidencia historica ya congelada: es lo que
 // permite decidir despues sin volver a mirar el perfil actual del cliente.
+//
+// ON CONFLICT DO UPDATE con COALESCE(columna_existente, EXCLUDED.columna):
+// una fila PENDING/RETRYABLE_ERROR sin snapshot (creada antes de tener
+// evidencia, o legada) puede COMPLETARSE mas tarde si aparece evidencia
+// historica confiable -sin esto, esa fila queda huerfana para siempre
+// (Bloqueante: RECONCILE no podia reconstruir perfiles en estados sin
+// snapshot). COALESCE nunca pisa un valor ya grabado: si la columna ya tiene
+// dato, se conserva tal cual. El WHERE excluye estados terminales
+// (PROCESSED/SKIPPED_TERMINAL) -esta funcion jamas los toca- e intentos/
+// estado no se tocan en el UPDATE: completar el snapshot no es un intento de
+// evaluacion.
 export const ensurePendingAccumulationState = async (client, idFactura, fechaReferencia = null, snapshot = null) => {
   const facturaId = parsePositiveInt(idFactura);
   if (!facturaId) return null;
@@ -320,8 +338,20 @@ export const ensurePendingAccumulationState = async (client, idFactura, fechaRef
         nombre_snapshot, telefono_snapshot, perfil_completo_snapshot
       )
       VALUES ($1, 'PENDING', NULL, NULL, $2, NOW(), NOW(), 0, NULL, $3, $4, $5, $6, $7, $8, $9)
-      ON CONFLICT (id_factura) DO NOTHING
-      RETURNING id_factura, estado, motivo, elegibilidad_determinada, intentos
+      ON CONFLICT (id_factura) DO UPDATE SET
+        id_pedido = COALESCE(public.fidelizacion_acumulacion_facturas_estado.id_pedido, EXCLUDED.id_pedido),
+        id_cliente = COALESCE(public.fidelizacion_acumulacion_facturas_estado.id_cliente, EXCLUDED.id_cliente),
+        id_sucursal = COALESCE(public.fidelizacion_acumulacion_facturas_estado.id_sucursal, EXCLUDED.id_sucursal),
+        origen_pedido = COALESCE(public.fidelizacion_acumulacion_facturas_estado.origen_pedido, EXCLUDED.origen_pedido),
+        nombre_snapshot = COALESCE(public.fidelizacion_acumulacion_facturas_estado.nombre_snapshot, EXCLUDED.nombre_snapshot),
+        telefono_snapshot = COALESCE(public.fidelizacion_acumulacion_facturas_estado.telefono_snapshot, EXCLUDED.telefono_snapshot),
+        perfil_completo_snapshot = COALESCE(public.fidelizacion_acumulacion_facturas_estado.perfil_completo_snapshot, EXCLUDED.perfil_completo_snapshot),
+        fecha_referencia = COALESCE(public.fidelizacion_acumulacion_facturas_estado.fecha_referencia, EXCLUDED.fecha_referencia),
+        fecha_actualizacion = NOW()
+      WHERE public.fidelizacion_acumulacion_facturas_estado.estado IN ('PENDING', 'RETRYABLE_ERROR')
+      RETURNING id_factura, estado, motivo, elegibilidad_determinada, intentos,
+        id_pedido, id_cliente, id_sucursal, origen_pedido,
+        nombre_snapshot, telefono_snapshot, perfil_completo_snapshot
     `,
     [
       facturaId,
@@ -365,13 +395,20 @@ export const getAccumulationState = async (client, idFactura) => {
 // es cinturon-y-tirantes, porque el advisory lock por factura (tomado antes,
 // en accumulateInvoicePoints.js) ya serializa a los workers concurrentes
 // sobre la misma factura.
+//
+// snapshot es opcional: cuando se conoce (p.ej. un RETRYABLE_ERROR tecnico
+// que fallo DESPUES de resolver el snapshot), sus columnas se preservan con
+// el mismo COALESCE que ensurePendingAccumulationState -nunca pisa un valor
+// ya grabado. Sin esto, un reintento perderia la evidencia historica ya
+// resuelta y RECONCILE volveria a exigir evidencia desde cero.
 export const upsertAccumulationState = async (client, {
   idFactura,
   estado,
   motivo = null,
   elegibilidadDeterminada = null,
   fechaReferencia = null,
-  ultimoError = null
+  ultimoError = null,
+  snapshot = null
 }) => {
   const facturaId = parsePositiveInt(idFactura);
   if (!facturaId) return null;
@@ -380,21 +417,41 @@ export const upsertAccumulationState = async (client, {
     `
       INSERT INTO public.fidelizacion_acumulacion_facturas_estado (
         id_factura, estado, motivo, elegibilidad_determinada, fecha_referencia,
-        fecha_creacion, fecha_actualizacion, intentos, ultimo_error
+        fecha_creacion, fecha_actualizacion, intentos, ultimo_error,
+        id_pedido, id_cliente, id_sucursal, origen_pedido,
+        nombre_snapshot, telefono_snapshot, perfil_completo_snapshot
       )
-      VALUES ($1, $2, $3, $4, $5, NOW(), NOW(), 1, $6)
+      VALUES ($1, $2, $3, $4, $5, NOW(), NOW(), 1, $6, $7, $8, $9, $10, $11, $12, $13)
       ON CONFLICT (id_factura) DO UPDATE SET
         estado = EXCLUDED.estado,
         motivo = EXCLUDED.motivo,
         elegibilidad_determinada = EXCLUDED.elegibilidad_determinada,
-        fecha_referencia = COALESCE(EXCLUDED.fecha_referencia, public.fidelizacion_acumulacion_facturas_estado.fecha_referencia),
+        fecha_referencia = COALESCE(public.fidelizacion_acumulacion_facturas_estado.fecha_referencia, EXCLUDED.fecha_referencia),
         fecha_actualizacion = NOW(),
         intentos = public.fidelizacion_acumulacion_facturas_estado.intentos + 1,
-        ultimo_error = EXCLUDED.ultimo_error
+        ultimo_error = EXCLUDED.ultimo_error,
+        id_pedido = COALESCE(public.fidelizacion_acumulacion_facturas_estado.id_pedido, EXCLUDED.id_pedido),
+        id_cliente = COALESCE(public.fidelizacion_acumulacion_facturas_estado.id_cliente, EXCLUDED.id_cliente),
+        id_sucursal = COALESCE(public.fidelizacion_acumulacion_facturas_estado.id_sucursal, EXCLUDED.id_sucursal),
+        origen_pedido = COALESCE(public.fidelizacion_acumulacion_facturas_estado.origen_pedido, EXCLUDED.origen_pedido),
+        nombre_snapshot = COALESCE(public.fidelizacion_acumulacion_facturas_estado.nombre_snapshot, EXCLUDED.nombre_snapshot),
+        telefono_snapshot = COALESCE(public.fidelizacion_acumulacion_facturas_estado.telefono_snapshot, EXCLUDED.telefono_snapshot),
+        perfil_completo_snapshot = COALESCE(public.fidelizacion_acumulacion_facturas_estado.perfil_completo_snapshot, EXCLUDED.perfil_completo_snapshot)
       WHERE public.fidelizacion_acumulacion_facturas_estado.estado IN ('PENDING', 'RETRYABLE_ERROR')
-      RETURNING id_factura, estado, motivo, elegibilidad_determinada, intentos
+      RETURNING id_factura, estado, motivo, elegibilidad_determinada, intentos,
+        id_pedido, id_cliente, id_sucursal, origen_pedido,
+        nombre_snapshot, telefono_snapshot, perfil_completo_snapshot
     `,
-    [facturaId, estado, motivo, elegibilidadDeterminada, fechaReferencia, ultimoError]
+    [
+      facturaId, estado, motivo, elegibilidadDeterminada, fechaReferencia, ultimoError,
+      snapshot?.idPedido ?? null,
+      snapshot?.idCliente ?? null,
+      snapshot?.idSucursal ?? null,
+      snapshot?.origenPedido ?? null,
+      snapshot?.nombreSnapshot ?? null,
+      snapshot?.telefonoSnapshot ?? null,
+      snapshot ? Boolean(snapshot.perfilCompletoSnapshot) : null
+    ]
   );
 
   return result.rows[0] || null;
@@ -405,7 +462,14 @@ export const upsertAccumulationState = async (client, {
 // guardando el estado de fidelizacion no debe alterar el resultado ya
 // decidido ({created:false, reason:'ERROR'}), y muchisimo menos el 201 de la
 // venta, que ya se respondio antes de que cualquiera de esto se ejecute-.
-export const recordAccumulationRetryableError = async (client, idFactura, { fechaReferencia = null, error = null } = {}) => {
+//
+// snapshot opcional: si persistAccumulation ya habia resuelto la evidencia
+// historica ANTES de que fallara registerFacturaLoyaltyAccumulation, se
+// preserva aqui (el ROLLBACK deshizo cualquier escritura en transaccion, asi
+// que esta es la unica oportunidad de no perderla). Si no se conoce -la
+// falla ocurrio antes de resolver el snapshot-, la fila queda sin el y la
+// regla estricta de RECONCILE aplicara despues.
+export const recordAccumulationRetryableError = async (client, idFactura, { fechaReferencia = null, error = null, snapshot = null } = {}) => {
   try {
     await upsertAccumulationState(client, {
       idFactura,
@@ -413,7 +477,8 @@ export const recordAccumulationRetryableError = async (client, idFactura, { fech
       motivo: null,
       elegibilidadDeterminada: null,
       fechaReferencia,
-      ultimoError: String(error?.message || error || 'FIDELIZACION_ACCUMULATE_ERROR').slice(0, 500)
+      ultimoError: String(error?.message || error || 'FIDELIZACION_ACCUMULATE_ERROR').slice(0, 500),
+      snapshot
     });
   } catch (recordErr) {
     console.error('[fidelizacion:accumulate] error al registrar estado reintentable:', {
@@ -453,6 +518,12 @@ export const recordAccumulationRetryableError = async (client, idFactura, { fech
 // - sin fila + RECONCILE -> solo se acepta evidencia historica de
 //   pedidos_contacto (menu publico); si no la hay, terminal
 //   LEGACY_ELIGIBILITY_UNVERIFIABLE. Jamas el perfil actual.
+//
+// CONTEXTO: cuando hay snapshot, sus 4 campos (cliente/sucursal/pedido/
+// fecha) son AUTORITATIVOS -ver resolveEffectiveAccumulationContext-, nunca
+// se combinan con el contexto actual de la factura. Si contradicen al
+// contexto actual, es terminal (ACCUMULATION_CONTEXT_MISMATCH): no se
+// acredita a ninguno de los dos clientes.
 export const persistAccumulation = async ({
   client,
   idFactura,
@@ -479,10 +550,13 @@ export const persistAccumulation = async ({
   if (!eligibilitySnapshot) {
     const rebuilt = await buildAccumulationSnapshot(client, { idFactura });
 
-    if (trigger === ACCUMULATION_TRIGGER.RECONCILE && !existingState) {
-      // Sin reserva durable previa, reconciliacion solo puede confiar en la
-      // evidencia historica del pedido (pedidos_contacto del menu publico).
-      // El perfil maestro de HOY no prueba nada sobre el momento de la compra.
+    if (trigger === ACCUMULATION_TRIGGER.RECONCILE) {
+      // Sin snapshot -exista o no una fila previa- reconciliacion solo puede
+      // confiar en evidencia historica del pedido (pedidos_contacto del menu
+      // publico). El perfil maestro de HOY no prueba nada sobre el momento
+      // de la compra: una fila RETRYABLE_ERROR/PENDING legada sin snapshot
+      // JAMAS se completa con el perfil actual, exista o no la fila (antes
+      // el `&& !existingState` dejaba pasar exactamente ese caso).
       const evidenciaHistorica = rebuilt && rebuilt.fuenteSnapshot === 'PEDIDO_CONTACTO' && rebuilt.perfilCompletoSnapshot
         ? rebuilt
         : null;
@@ -503,23 +577,76 @@ export const persistAccumulation = async ({
       eligibilitySnapshot = rebuilt;
     }
 
-    // Reserva/actualiza la fila con el snapshot recien resuelto. La fila
-    // PENDING existente (sin snapshot, p.ej. legada) no se degrada: el
-    // ON CONFLICT DO NOTHING la respeta y el snapshot se usa solo en memoria.
+    // Reserva/completa la fila con el snapshot recien resuelto. Si ya existia
+    // sin snapshot (reintentable), ensurePendingAccumulationState ahora la
+    // COMPLETA (COALESCE) en vez de no-opear; nunca pisa un snapshot ya
+    // grabado ni toca un estado terminal.
     await ensurePendingAccumulationState(client, idFactura, referenceDate, eligibilitySnapshot);
   }
 
-  const result = await registerFacturaLoyaltyAccumulation({
-    client,
-    idFactura,
-    idPedido,
-    idCliente,
-    idSucursal,
-    idUsuarioEjecutor,
-    montoFactura,
-    referenceDate,
+  // El snapshot, cuando existe, es el contexto AUTORITATIVO completo -nunca
+  // se combina con el contexto actual de la factura-: evita que la
+  // elegibilidad historica de un cliente se acredite al saldo de otro. El
+  // contexto actual solo sigue usandose para el monto (montoFactura, siempre
+  // por-factura, jamas del snapshot) y para detectar inconsistencias.
+  const { effective, mismatch } = resolveEffectiveAccumulationContext({
+    currentContext: { idCliente, idSucursal, idPedido, referenceDate },
     eligibilitySnapshot
   });
+
+  if (mismatch) {
+    // Contradiccion real entre el snapshot durable y el contexto actual de
+    // la factura. No se reintenta indefinidamente una inconsistencia
+    // persistente: es terminal. Nunca se loguea nombre ni telefono (dato
+    // personal) -solo identificadores y fechas.
+    console.error('[fidelizacion:accumulate] contexto del snapshot inconsistente con el contexto actual de la factura:', {
+      id_factura: idFactura || null,
+      snapshot_id_cliente: eligibilitySnapshot?.idCliente ?? null,
+      current_id_cliente: idCliente ?? null,
+      snapshot_id_sucursal: eligibilitySnapshot?.idSucursal ?? null,
+      current_id_sucursal: idSucursal ?? null,
+      snapshot_id_pedido: eligibilitySnapshot?.idPedido ?? null,
+      current_id_pedido: idPedido ?? null,
+      snapshot_fecha_referencia: eligibilitySnapshot?.fechaReferencia ?? null,
+      current_fecha_referencia: referenceDate ?? null
+    });
+
+    await upsertAccumulationState(client, {
+      idFactura,
+      estado: ACCUMULATION_STATE.SKIPPED_TERMINAL,
+      motivo: ACCUMULATION_CONTEXT_MISMATCH,
+      elegibilidadDeterminada: false,
+      fechaReferencia: referenceDate,
+      snapshot: eligibilitySnapshot
+    });
+
+    return { created: false, reason: ACCUMULATION_CONTEXT_MISMATCH };
+  }
+
+  let result;
+  try {
+    result = await registerFacturaLoyaltyAccumulation({
+      client,
+      idFactura,
+      idPedido: effective.idPedido,
+      idCliente: effective.idCliente,
+      idSucursal: effective.idSucursal,
+      idUsuarioEjecutor,
+      montoFactura,
+      referenceDate: effective.referenceDate,
+      eligibilitySnapshot
+    });
+  } catch (err) {
+    // El snapshot ya resuelto se adjunta al error: la transaccion que llama
+    // a persistAccumulation hara ROLLBACK completo (incluida cualquier
+    // escritura previa de este mismo intento), asi que la unica forma de no
+    // perder la evidencia historica ya obtenida es que accumulateInvoicePoints
+    // la reenvie a recordAccumulationRetryableError DESPUES del rollback.
+    if (err && typeof err === 'object') {
+      err.eligibilitySnapshot = eligibilitySnapshot;
+    }
+    throw err;
+  }
 
   if (result.created || result.reason === 'ALREADY_REGISTERED') {
     await upsertAccumulationState(client, {
@@ -604,7 +731,7 @@ export const listPaidInvoicesMissingAccumulation = async (client, { cursor = 0, 
       LEFT JOIN public.fidelizacion_acumulacion_facturas_estado est
         ON est.id_factura = f.id_factura
       WHERE f.id_factura > $1
-        AND COALESCE(p.id_cliente, f.id_cliente) IS NOT NULL
+        AND COALESCE(f.id_cliente, p.id_cliente) IS NOT NULL
         AND (
           upc.id_pedido_pago_control IS NULL
           OR (

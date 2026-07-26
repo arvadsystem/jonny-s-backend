@@ -156,6 +156,26 @@ export const createFidelizacionMockClient = ({
     return override === undefined ? state.defaultClienteProfile : override;
   };
 
+  const parseIdLike = (value) => {
+    const parsed = Number.parseInt(String(value ?? ''), 10);
+    return Number.isInteger(parsed) && parsed > 0 ? parsed : null;
+  };
+
+  // Replica COALESCE(f.id_cliente, p.id_cliente) de la consulta real: el
+  // cliente de la FACTURA gana siempre que exista; el dueno del pedido
+  // (state.pedidos[idPedido].id_cliente) es solo el fallback. Las pruebas
+  // deben declarar facturaContexts[...].id_cliente (factura.id_cliente) y
+  // state.pedidos[...].id_cliente (pedido.id_cliente) POR SEPARADO -nunca un
+  // valor ya combinado- para que esta funcion ejercite de verdad la misma
+  // precedencia que la consulta SQL real, en vez de ocultarla.
+  const resolveClienteEfectivo = (context) => {
+    const facturaIdCliente = parseIdLike(context?.id_cliente);
+    if (facturaIdCliente) return facturaIdCliente;
+    const idPedido = context?.id_pedido ?? null;
+    const pedido = idPedido ? state.pedidos[Number(idPedido)] : null;
+    return pedido ? parseIdLike(pedido.id_cliente) : null;
+  };
+
   const hasMovimiento = (idFactura) => state.movimientos.some(
     (m) => m.id_factura === Number(idFactura) && m.tipo === 'ACUMULACION' && m.origen === 'FACTURA'
   );
@@ -185,7 +205,7 @@ export const createFidelizacionMockClient = ({
       .map(([idStr, context]) => ({ id: Number(idStr), context }))
       .filter(({ id, context }) => {
         if (id <= cursor) return false;
-        if (!context.id_cliente) return false;
+        if (!resolveClienteEfectivo(context)) return false;
         if (!isContextFullyPaid(context)) return false;
         if (hasMovimiento(id)) return false;
         if (!isRetryableOrNoState(id)) return false;
@@ -298,7 +318,9 @@ export const createFidelizacionMockClient = ({
         if (!context) return { rows: [] };
 
         const idPedido = context.id_pedido ?? null;
-        const idCliente = context.id_cliente ?? null;
+        // COALESCE(f.id_cliente, p.id_cliente): nunca el valor crudo de
+        // context.id_cliente sin resolver contra el pedido.
+        const idCliente = resolveClienteEfectivo(context);
         const pedido = idPedido ? state.pedidos[Number(idPedido)] : null;
         const contacto = idPedido ? state.pedidosContacto[Number(idPedido)] : null;
         const rel = idCliente ? state.clientesRelacional[Number(idCliente)] : null;
@@ -362,38 +384,70 @@ export const createFidelizacionMockClient = ({
       if (text.includes('INSERT INTO public.fidelizacion_acumulacion_facturas_estado')) {
         const id = Number(params[0]);
 
-        if (text.includes('DO NOTHING')) {
-          // ensurePendingAccumulationState (params: [idFactura,
-          // fechaReferencia, idPedido, idCliente, idSucursal, origenPedido,
-          // nombreSnapshot, telefonoSnapshot, perfilCompletoSnapshot]).
-          // Igual que Postgres real, ON CONFLICT DO NOTHING no devuelve fila
-          // cuando hubo conflicto.
+        // ensurePendingAccumulationState se distingue por el literal
+        // 'PENDING' NO parametrizado en su VALUES -unico a esta funcion,
+        // upsertAccumulationState siempre pasa estado como $2-. (params:
+        // [idFactura, fechaReferencia, idPedido, idCliente, idSucursal,
+        // origenPedido, nombreSnapshot, telefonoSnapshot, perfilCompletoSnapshot]).
+        if (text.includes("VALUES ($1, 'PENDING'")) {
           const existing = state.estadoFacturas.get(id);
-          if (existing) return { rows: [] };
+
+          if (!existing) {
+            const nextRow = {
+              id_factura: id,
+              estado: 'PENDING',
+              motivo: null,
+              elegibilidad_determinada: null,
+              fecha_referencia: params[1] ?? null,
+              intentos: 0,
+              ultimo_error: null,
+              id_pedido: params[2] ?? null,
+              id_cliente: params[3] ?? null,
+              id_sucursal: params[4] ?? null,
+              origen_pedido: params[5] ?? null,
+              nombre_snapshot: params[6] ?? null,
+              telefono_snapshot: params[7] ?? null,
+              perfil_completo_snapshot: params[8] ?? null
+            };
+            state.estadoFacturas.set(id, nextRow);
+            return { rows: [nextRow] };
+          }
+
+          // Mismo WHERE que el real: nunca toca un estado terminal.
+          if (existing.estado !== 'PENDING' && existing.estado !== 'RETRYABLE_ERROR') {
+            return { rows: [] };
+          }
+
+          // ON CONFLICT DO UPDATE ... COALESCE(existente, EXCLUDED): completa
+          // columnas vacias sin pisar un snapshot ya grabado, y sin tocar
+          // intentos/estado (completar el snapshot no es un intento).
           const nextRow = {
-            id_factura: id,
-            estado: 'PENDING',
-            motivo: null,
-            elegibilidad_determinada: null,
-            fecha_referencia: params[1] ?? null,
-            intentos: 0,
-            ultimo_error: null,
-            // Snapshot historico congelado en la reserva.
-            id_pedido: params[2] ?? null,
-            id_cliente: params[3] ?? null,
-            id_sucursal: params[4] ?? null,
-            origen_pedido: params[5] ?? null,
-            nombre_snapshot: params[6] ?? null,
-            telefono_snapshot: params[7] ?? null,
-            perfil_completo_snapshot: params[8] ?? null
+            ...existing,
+            id_pedido: existing.id_pedido ?? params[2] ?? null,
+            id_cliente: existing.id_cliente ?? params[3] ?? null,
+            id_sucursal: existing.id_sucursal ?? params[4] ?? null,
+            origen_pedido: existing.origen_pedido ?? params[5] ?? null,
+            nombre_snapshot: existing.nombre_snapshot ?? params[6] ?? null,
+            telefono_snapshot: existing.telefono_snapshot ?? params[7] ?? null,
+            perfil_completo_snapshot: existing.perfil_completo_snapshot ?? params[8] ?? null,
+            fecha_referencia: existing.fecha_referencia ?? params[1] ?? null
           };
           state.estadoFacturas.set(id, nextRow);
           return { rows: [nextRow] };
         }
 
         // upsertAccumulationState: DO UPDATE (params: [idFactura, estado,
-        // motivo, elegibilidadDeterminada, fechaReferencia, ultimoError]).
-        const [, estado, motivo, elegibilidadDeterminada, fechaReferencia, ultimoError] = params;
+        // motivo, elegibilidadDeterminada, fechaReferencia, ultimoError,
+        // idPedido, idCliente, idSucursal, origenPedido, nombreSnapshot,
+        // telefonoSnapshot, perfilCompletoSnapshot]). Las columnas de
+        // snapshot al final son opcionales (recordAccumulationRetryableError
+        // las pasa cuando ya se conocia el snapshot antes del rollback) y se
+        // preservan con la misma semantica COALESCE.
+        const [
+          , estado, motivo, elegibilidadDeterminada, fechaReferencia, ultimoError,
+          snapIdPedido, snapIdCliente, snapIdSucursal, snapOrigenPedido,
+          snapNombreSnapshot, snapTelefonoSnapshot, snapPerfilCompletoSnapshot
+        ] = params;
         const existing = state.estadoFacturas.get(id);
 
         // Mismo guard que el WHERE del ON CONFLICT DO UPDATE real: nunca
@@ -403,16 +457,13 @@ export const createFidelizacionMockClient = ({
         }
 
         const nextRow = {
-          // El UPDATE real solo toca estado/motivo/elegibilidad/fechas/
-          // intentos/ultimo_error: las columnas de snapshot conservan lo que
-          // grabo la reserva.
-          id_pedido: existing?.id_pedido ?? null,
-          id_cliente: existing?.id_cliente ?? null,
-          id_sucursal: existing?.id_sucursal ?? null,
-          origen_pedido: existing?.origen_pedido ?? null,
-          nombre_snapshot: existing?.nombre_snapshot ?? null,
-          telefono_snapshot: existing?.telefono_snapshot ?? null,
-          perfil_completo_snapshot: existing?.perfil_completo_snapshot ?? null,
+          id_pedido: existing?.id_pedido ?? snapIdPedido ?? null,
+          id_cliente: existing?.id_cliente ?? snapIdCliente ?? null,
+          id_sucursal: existing?.id_sucursal ?? snapIdSucursal ?? null,
+          origen_pedido: existing?.origen_pedido ?? snapOrigenPedido ?? null,
+          nombre_snapshot: existing?.nombre_snapshot ?? snapNombreSnapshot ?? null,
+          telefono_snapshot: existing?.telefono_snapshot ?? snapTelefonoSnapshot ?? null,
+          perfil_completo_snapshot: existing?.perfil_completo_snapshot ?? snapPerfilCompletoSnapshot ?? null,
           id_factura: id,
           estado,
           motivo: motivo ?? null,
@@ -442,7 +493,11 @@ export const createFidelizacionMockClient = ({
       if (text.includes('FROM public.facturas f')) {
         const facturaId = Number(params[0]);
         const context = state.facturaContexts[facturaId];
-        return { rows: context ? [{ id_factura: facturaId, ...context }] : [] };
+        if (!context) return { rows: [] };
+        // COALESCE(f.id_cliente, p.id_cliente): id_sucursal/id_usuario del
+        // context se dejan tal cual (esos usan COALESCE(pedido, factura), no
+        // forman parte de este bug); solo id_cliente se resuelve aqui.
+        return { rows: [{ id_factura: facturaId, ...context, id_cliente: resolveClienteEfectivo(context) }] };
       }
 
       // Perfil de cliente (fetchClienteProfileForFidelizacion): activo,

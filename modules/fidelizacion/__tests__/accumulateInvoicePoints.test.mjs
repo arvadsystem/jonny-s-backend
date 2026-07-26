@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import { fidelizacionPool } from '../infrastructure/fidelizacionPool.js';
 import { accumulateInvoicePoints } from '../application/accumulateInvoicePoints.js';
+import { buildAccumulationSnapshot } from '../infrastructure/fidelizacionRepository.js';
 import { createFidelizacionMockClient } from './fidelizacionMockClient.mjs';
 import { createFidelizacionLockCoordinator } from './fidelizacionLockCoordinator.mjs';
 
@@ -398,6 +399,113 @@ describe('accumulateInvoicePoints (capa unica: gate de pago + decide + persiste)
   });
 });
 
+describe('accumulateInvoicePoints: bloqueante 3 ronda 4 -- precedencia de cliente por factura: COALESCE(f.id_cliente, p.id_cliente)', () => {
+  // La factura gana sobre el dueno del pedido: en una cuenta dividida, una
+  // factura puede facturarse a un cliente distinto de quien hizo el pedido,
+  // y fidelizacion es por factura. facturaContexts[...].id_cliente y
+  // pedidos[...].id_cliente se declaran POR SEPARADO en cada prueba -nunca
+  // un valor ya combinado- para ejercitar de verdad la precedencia real.
+  const ctxDividida = (overrides = {}) => ({
+    id_sucursal: 1,
+    id_usuario: 9,
+    monto_factura: 100,
+    fecha_referencia_config: '2026-03-01T10:00:00Z',
+    tiene_pago_control: false,
+    pago_control_monto_pendiente: null,
+    pago_control_estado_codigo: null,
+    ...overrides
+  });
+
+  it('16: factura SIN id_cliente propio + pedido del cliente 5 -> cliente efectivo es 5 (fallback al dueno del pedido)', async () => {
+    const { client, state } = createFidelizacionMockClient({
+      facturaContexts: { 950: ctxDividida({ id_pedido: 700, id_cliente: null }) },
+      pedidos: { 700: { id_cliente: 5 } }
+    });
+
+    let result;
+    await withMockedFidelizacionPoolConnect(async () => client, async () => {
+      result = await accumulateInvoicePoints({ idFactura: 950 });
+    });
+
+    assert.equal(result.created, true);
+    assert.ok(state.saldos.has(5), 'el cliente efectivo (fallback al pedido) es quien recibe el saldo');
+    assert.equal(state.movimientos[0].id_factura, 950);
+  });
+
+  it('17: factura con id_cliente PROPIO (9) + pedido del cliente 5 -> cliente efectivo es 9 (la factura gana)', async () => {
+    const { client, state } = createFidelizacionMockClient({
+      facturaContexts: { 951: ctxDividida({ id_pedido: 701, id_cliente: 9 }) },
+      pedidos: { 701: { id_cliente: 5 } }
+    });
+
+    let result;
+    await withMockedFidelizacionPoolConnect(async () => client, async () => {
+      result = await accumulateInvoicePoints({ idFactura: 951 });
+    });
+
+    assert.equal(result.created, true);
+    assert.ok(state.saldos.has(9), 'la factura tiene su propio cliente: gana sobre el dueno del pedido');
+    assert.ok(!state.saldos.has(5), 'el dueno del pedido nunca recibe el saldo de una factura ajena');
+  });
+
+  it('18: el contacto del pedido (dueno cliente 5) nunca se usa como snapshot para la factura del cliente 9', async () => {
+    const { client } = createFidelizacionMockClient({
+      facturaContexts: { 952: ctxDividida({ id_pedido: 702, id_cliente: 9 }) },
+      pedidos: { 702: { id_cliente: 5, origen_pedido: 'MENU' } },
+      pedidosContacto: { 702: { nombre_contacto: 'Ana Menu', telefono_normalizado: '99998888' } },
+      // Perfil maestro del cliente 9 (acompanante) incompleto: si el
+      // contacto del pedido (del cliente 5) se filtrara por error, igual
+      // acumularia.
+      clienteProfiles: { 9: { estado: true, nombre: 'Acompanante', telefono: '' } }
+    });
+
+    const snapshot = await buildAccumulationSnapshot(client, { idFactura: 952 });
+    assert.equal(snapshot.idCliente, 9, 'el snapshot resuelve al cliente EFECTIVO de la factura, no al dueno del pedido');
+    assert.equal(snapshot.fuenteSnapshot, 'PERFIL_MAESTRO', 'el contacto es del dueno del pedido (5), no del cliente de la factura (9): no es utilizable');
+    assert.equal(snapshot.perfilCompletoSnapshot, false);
+  });
+
+  it('19: cuenta dividida con clientes DISTINTOS (una factura reasignada) -> cada una acumula a SU cliente, sin mezclar saldos ni snapshots', async () => {
+    const { client, state } = createFidelizacionMockClient({
+      facturaContexts: {
+        // Sin id_cliente propio: hereda el dueno del pedido (5).
+        960: ctxDividida({ id_pedido: 910, id_cliente: null, monto_factura: 120 }),
+        // Del MISMO pedido, pero re-facturada a otro cliente (9).
+        961: ctxDividida({ id_pedido: 910, id_cliente: 9, monto_factura: 180 })
+      },
+      pedidos: { 910: { id_cliente: 5 } }
+    });
+
+    let result960;
+    let result961;
+    await withMockedFidelizacionPoolConnect(async () => client, async () => {
+      result960 = await accumulateInvoicePoints({ idFactura: 960 });
+      result961 = await accumulateInvoicePoints({ idFactura: 961 });
+    });
+
+    assert.equal(result960.created, true);
+    assert.equal(result961.created, true);
+    assert.ok(state.saldos.has(5), 'la factura sin id_cliente propio acredito al dueno del pedido');
+    assert.ok(state.saldos.has(9), 'la factura con id_cliente propio acredito a SU cliente, no al dueno del pedido');
+    assert.equal(state.movimientos.length, 2, 'una factura = un movimiento, nunca combinados');
+    assert.ok(state.movimientos.some((m) => m.id_factura === 960));
+    assert.ok(state.movimientos.some((m) => m.id_factura === 961));
+  });
+
+  it('20: el mock modela factura.id_cliente y pedido.id_cliente como conceptos separados (no un id_cliente ya resuelto)', () => {
+    // Estructural: las pruebas 16-19 solo prueban algo si facturaContexts[...].id_cliente
+    // y pedidos[...].id_cliente conviven sin que el mock los combine antes de
+    // tiempo -si lo hiciera, ocultaria de nuevo el bug de precedencia SQL.
+    const { state } = createFidelizacionMockClient({
+      facturaContexts: { 999: ctxDividida({ id_pedido: 800, id_cliente: 9 }) },
+      pedidos: { 800: { id_cliente: 5 } }
+    });
+
+    assert.equal(state.facturaContexts[999].id_cliente, 9, 'factura.id_cliente se preserva tal cual lo declaro la prueba');
+    assert.equal(state.pedidos[800].id_cliente, 5, 'pedido.id_cliente se preserva tal cual, sin combinarse con el de la factura');
+  });
+});
+
 describe('accumulateInvoicePoints: bloqueante 3 (tabla de estado por factura, sin acumulacion retroactiva)', () => {
   const ctx = (overrides = {}) => ({
     id_pedido: null,
@@ -592,7 +700,7 @@ describe('accumulateInvoicePoints: bloqueante 1 (PENDING antes de evaluar en LIV
     });
 
     const snapshotIdx = state.calls.findIndex((c) => c.sql.includes('AS nombre_maestro'));
-    const insertPendingIdx = state.calls.findIndex((c) => c.sql.includes('INSERT INTO public.fidelizacion_acumulacion_facturas_estado') && c.sql.includes('DO NOTHING'));
+    const insertPendingIdx = state.calls.findIndex((c) => c.sql.includes('INSERT INTO public.fidelizacion_acumulacion_facturas_estado') && c.sql.includes("VALUES ($1, 'PENDING'"));
     const configIdx = state.calls.findIndex((c) => c.sql.includes('FROM public.fidelizacion_configuracion_sucursal'));
     const movimientoIdx = state.calls.findIndex((c) => c.sql.includes('INSERT INTO public.fidelizacion_movimientos'));
 
@@ -662,8 +770,15 @@ describe('accumulateInvoicePoints: bloqueante 1 (PENDING antes de evaluar en LIV
     assert.ok(!state.calls.some((c) => c.sql.includes('FROM public.fidelizacion_configuracion_sucursal')), 'RECONCILE sin fila previa nunca consulta la configuracion');
   });
 
-  it('regla 8 (con trigger RECONCILE explicito): un estado RETRYABLE_ERROR persistido si permite que RECONCILE reintente', async () => {
+  it('regla 8 (ronda 4, bloqueante 1): un RETRYABLE_ERROR YA EXISTENTE sin snapshot y sin evidencia historica nunca usa el perfil actual', async () => {
+    // Antes de la ronda 4, `trigger === RECONCILE && !existingState` dejaba
+    // pasar exactamente este caso (fila ya existente) al `else`, que
+    // reconstruia el snapshot con el perfil ACTUAL. Con la fila existente y
+    // sin evidencia historica confiable (pedidos_contacto), debe terminar
+    // LEGACY_ELIGIBILITY_UNVERIFIABLE igual que si nunca hubiera existido fila.
     const { client, state } = createFidelizacionMockClient({
+      // Perfil actual completo (nombre/telefono validos): la prueba de que
+      // NO se usa es que aun asi no acumula.
       facturaContexts: { 864: ctx() },
       estadoFacturasIniciales: { 864: { estado: 'RETRYABLE_ERROR', intentos: 2, ultimo_error: 'timeout previo' } }
     });
@@ -673,9 +788,13 @@ describe('accumulateInvoicePoints: bloqueante 1 (PENDING antes de evaluar en LIV
       result = await accumulateInvoicePoints({ idFactura: 864, trigger: 'RECONCILE' });
     });
 
-    assert.equal(result.created, true);
-    assert.equal(state.estadoFacturas.get(864).estado, 'PROCESSED');
-    assert.equal(state.estadoFacturas.get(864).intentos, 3);
+    assert.equal(result.created, false, 'sin snapshot y sin evidencia historica, RECONCILE nunca acumula aunque ya exista fila reintentable');
+    assert.equal(result.reason, 'LEGACY_ELIGIBILITY_UNVERIFIABLE');
+    assert.equal(state.estadoFacturas.get(864).estado, 'SKIPPED_TERMINAL');
+    assert.ok(
+      !state.calls.some((c) => c.sql.includes('FROM public.clientes c') && c.sql.includes('LEFT JOIN public.personas p')),
+      'nunca consulta el perfil actual del cliente'
+    );
   });
 
   it('regla 11: dos notificaciones para la misma factura no duplican el movimiento (idempotencia por estado, no solo por el chequeo interno de movimientos)', async () => {
@@ -697,7 +816,7 @@ describe('accumulateInvoicePoints: bloqueante 1 (PENDING antes de evaluar en LIV
   it('regla 12: una falla registrando PENDING (antes de evaluar nada) no impide que accumulateInvoicePoints responda sin lanzar', async () => {
     const { client } = createFidelizacionMockClient({
       facturaContexts: { 866: ctx() },
-      failOn: 'DO NOTHING'
+      failOn: "VALUES ($1, 'PENDING'"
     });
 
     let result;

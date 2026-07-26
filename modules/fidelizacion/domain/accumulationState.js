@@ -25,6 +25,13 @@ export const RETRYABLE_ACCUMULATION_STATES = Object.freeze([
 // venta).
 export const LEGACY_ELIGIBILITY_UNVERIFIABLE = 'LEGACY_ELIGIBILITY_UNVERIFIABLE';
 
+// Motivo terminal cuando el snapshot durable (autoritativo) y el contexto
+// actual de la factura discrepan en cliente/sucursal/pedido/fecha. Es
+// terminal -no PENDING/RETRYABLE_ERROR- porque una discrepancia real no se
+// resuelve reintentando: reintentar indefinidamente una inconsistencia
+// persistente solo repetiria el mismo resultado.
+export const ACCUMULATION_CONTEXT_MISMATCH = 'ACCUMULATION_CONTEXT_MISMATCH';
+
 export const ACCUMULATION_TRIGGER = Object.freeze({
   LIVE: 'LIVE',
   RECONCILE: 'RECONCILE'
