@@ -1,5 +1,8 @@
 import { fidelizacionPool } from './fidelizacionPool.js';
-import { registerFacturaLoyaltyAccumulation } from '../../../services/fidelizacionService.js';
+import {
+  registerFacturaLoyaltyAccumulation,
+  CLIENT_ROLE_NAME
+} from '../../../services/fidelizacionService.js';
 
 // Mismo valor que el antiguo VENTAS_FIDELIZACION_ADVISORY_LOCK_CLASS
 // (routers/ventas/constants.js) para preservar el mismo namespace de
@@ -30,6 +33,13 @@ export const lockFacturaForAccumulation = async (client, idFactura) => {
 // Incluye el estado de pago (para confirmar que la factura esta completamente
 // pagada antes de acumular) y la fecha de referencia para la configuracion
 // vigente (fecha de pago/facturacion, nunca NOW()).
+//
+// Regla de cuentas divididas: monto_factura es SIEMPRE
+// SUM(facturas_cobros.monto) filtrado por ESTA id_factura unicamente. Un
+// pedido con cuenta dividida puede tener varias facturas asociadas; cada una
+// se resuelve y acumula por separado con su propio monto -nunca se agrega el
+// total del pedido completo-, y cada id_factura solo puede generar un
+// movimiento (ver el chequeo de idempotencia en registerFacturaLoyaltyAccumulation).
 export const getFacturaAccumulationContext = async (client, idFactura) => {
   const facturaId = parsePositiveInt(idFactura);
   if (!facturaId) return null;
@@ -116,12 +126,24 @@ export const persistAccumulation = ({
 // pagadas pero que no tienen (todavia) un movimiento de acumulacion. La
 // idempotencia real sigue viviendo en persistAccumulation; esto solo detecta
 // candidatos para volver a intentar via notifyPaidInvoice.
-export const listPaidInvoicesMissingAccumulation = async (client, { limit = 25 } = {}) => {
+//
+// Paginacion por keyset (id_factura > cursor) para que un backlog grande no
+// haga que cada tick vea siempre las mismas primeras facturas. Ademas exige,
+// en la propia consulta, cliente realmente elegible y una configuracion de
+// fidelizacion vigente EN LA FECHA de pago/facturacion: sin estos dos
+// filtros, una factura permanentemente no procesable (cliente no elegible o
+// sucursal sin configuracion para esa fecha) reaparaceria en cada lote para
+// siempre e impediria avanzar hacia facturas mas nuevas (inanicion).
+export const listPaidInvoicesMissingAccumulation = async (client, { cursor = 0, limit = 25 } = {}) => {
   const boundedLimit = Math.min(Math.max(parsePositiveInt(limit) || 25, 1), 200);
+  const boundedCursor = Number.isFinite(Number(cursor)) && Number(cursor) >= 0 ? Number(cursor) : 0;
 
   const result = await client.query(
     `
-      SELECT f.id_factura
+      SELECT
+        f.id_factura,
+        COALESCE(upc.fecha_pago_confirmado, f.fecha_hora_facturacion) AS fecha_referencia_config,
+        COALESCE(p.id_sucursal, f.id_sucursal) AS id_sucursal
       FROM public.facturas f
       LEFT JOIN public.pedidos p ON p.id_pedido = f.id_pedido
       LEFT JOIN LATERAL (
@@ -133,13 +155,39 @@ export const listPaidInvoicesMissingAccumulation = async (client, { limit = 25 }
       ) upc ON TRUE
       LEFT JOIN public.cat_pedidos_estados_pago cep
         ON cep.id_estado_pago_pedido = upc.id_estado_pago_pedido
-      WHERE COALESCE(p.id_cliente, f.id_cliente) IS NOT NULL
+      WHERE f.id_factura > $1
+        AND COALESCE(p.id_cliente, f.id_cliente) IS NOT NULL
         AND (
           upc.id_pedido_pago_control IS NULL
           OR (
-            UPPER(TRIM(cep.codigo)) = $2
+            UPPER(TRIM(cep.codigo)) = $3
             AND COALESCE(upc.monto_pendiente, 0) = 0
           )
+        )
+        AND EXISTS (
+          SELECT 1
+          FROM public.usuarios_clientes uc
+          INNER JOIN public.usuarios u
+            ON u.id_usuario = uc.id_usuario
+           AND u.id_cliente = uc.id_cliente
+          INNER JOIN public.roles_usuarios ru
+            ON ru.id_usuario = u.id_usuario
+          INNER JOIN public.roles r
+            ON r.id_rol = ru.id_rol
+          WHERE uc.id_cliente = COALESCE(p.id_cliente, f.id_cliente)
+            AND COALESCE(uc.estado, true) = true
+            AND COALESCE(u.estado, false) = true
+            AND UPPER(TRIM(r.nombre)) = $4
+        )
+        AND EXISTS (
+          SELECT 1
+          FROM public.fidelizacion_configuracion_sucursal fcs
+          WHERE fcs.id_sucursal = COALESCE(p.id_sucursal, f.id_sucursal)
+            AND fcs.vigente_desde <= COALESCE(upc.fecha_pago_confirmado, f.fecha_hora_facturacion)
+            AND (
+              fcs.vigente_hasta IS NULL
+              OR fcs.vigente_hasta > COALESCE(upc.fecha_pago_confirmado, f.fecha_hora_facturacion)
+            )
         )
         AND NOT EXISTS (
           SELECT 1
@@ -153,10 +201,14 @@ export const listPaidInvoicesMissingAccumulation = async (client, { limit = 25 }
             AND UPPER(TRIM(om.codigo)) = 'FACTURA'
         )
       ORDER BY f.id_factura ASC
-      LIMIT $1
+      LIMIT $2
     `,
-    [boundedLimit, PAGADO_CONFIRMADO_CODIGO]
+    [boundedCursor, boundedLimit, PAGADO_CONFIRMADO_CODIGO, CLIENT_ROLE_NAME]
   );
 
-  return result.rows.map((row) => Number(row.id_factura));
+  const ids = result.rows.map((row) => Number(row.id_factura));
+  return {
+    ids,
+    nextCursor: ids.length > 0 ? ids[ids.length - 1] : boundedCursor
+  };
 };

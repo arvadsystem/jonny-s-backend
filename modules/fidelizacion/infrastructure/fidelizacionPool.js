@@ -32,3 +32,23 @@ fidelizacionPool.on('error', (err) => {
     message: err?.message || 'Unexpected idle client error'
   });
 });
+
+let fidelizacionPoolEndPromise = null;
+
+// Idempotente: llamadas concurrentes o repetidas comparten/reciben el mismo
+// resultado, nunca intentan cerrar dos veces en paralelo. Si el cierre falla,
+// se limpia el cache para permitir un reintento posterior (mismo patron que
+// closePool en config/db-connection.js) y el error se reporta sin lanzar
+// hacia quien orquesta el shutdown (Ventas nunca depende de este pool).
+export const closeFidelizacionPool = async () => {
+  if (!fidelizacionPoolEndPromise) {
+    fidelizacionPoolEndPromise = fidelizacionPool.end().catch((err) => {
+      fidelizacionPoolEndPromise = null;
+      console.error('[fidelizacion:pool] error al cerrar el pool dedicado', {
+        code: err?.code || err?.name || 'FIDELIZACION_POOL_CLOSE_ERROR'
+      });
+      throw err;
+    });
+  }
+  return fidelizacionPoolEndPromise;
+};

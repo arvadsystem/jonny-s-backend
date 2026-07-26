@@ -9,9 +9,12 @@ const CATALOG_IDS = {
 
 const toDateOrNull = (value) => (value ? new Date(value) : null);
 
+// Refleja el WHERE real de getActiveFidelizacionConfig: con referenceDate se
+// ignora "estado" (config historica), sin referenceDate se exige estado=true.
 const resolveConfigForDate = (activeConfigs, referenceParam) => {
   const refDate = referenceParam ? new Date(referenceParam) : new Date();
   const matches = activeConfigs.filter((cfg) => {
+    if (!referenceParam && cfg.estado === false) return false;
     const desde = toDateOrNull(cfg.vigente_desde) || new Date(0);
     const hasta = toDateOrNull(cfg.vigente_hasta);
     return desde <= refDate && (!hasta || hasta > refDate);
@@ -21,14 +24,23 @@ const resolveConfigForDate = (activeConfigs, referenceParam) => {
   return matches[0];
 };
 
+const isContextFullyPaid = (context) => {
+  if (!context) return false;
+  if (!context.tiene_pago_control) return true;
+  const estadoCodigo = String(context.pago_control_estado_codigo || '').trim().toUpperCase();
+  const montoPendiente = Number(context.pago_control_monto_pendiente ?? NaN);
+  return estadoCodigo === 'PAGADO_CONFIRMADO' && montoPendiente === 0;
+};
+
 export const createFidelizacionMockClient = ({
   elegible = true,
+  eligibleClienteIds = null,
   activeConfig = { lempiras_por_punto: 10 },
   activeConfigs = null,
   saldoInicial = 0,
   movimientos = [],
   facturaContexts = {},
-  missingAccumulationIds = [],
+  missingAccumulationIds = null,
   failOn = null,
   releaseError = null
 } = {}) => {
@@ -38,15 +50,52 @@ export const createFidelizacionMockClient = ({
 
   const state = {
     elegible,
+    eligibleClienteIds: eligibleClienteIds ? new Set([...eligibleClienteIds].map(Number)) : null,
     activeConfigs: resolvedConfigs,
     saldos: new Map(),
     movimientos: [...movimientos],
     facturaContexts: { ...facturaContexts },
-    missingAccumulationIds: [...missingAccumulationIds],
+    missingAccumulationIds: missingAccumulationIds ? [...missingAccumulationIds] : null,
     nextMovimientoId: movimientos.length + 1,
     calls: [],
     released: false,
     releaseCallCount: 0
+  };
+
+  const isClienteEligible = (idCliente) => (
+    state.eligibleClienteIds ? state.eligibleClienteIds.has(Number(idCliente)) : state.elegible
+  );
+
+  const hasMovimiento = (idFactura) => state.movimientos.some(
+    (m) => m.id_factura === Number(idFactura) && m.tipo === 'ACUMULACION' && m.origen === 'FACTURA'
+  );
+
+  // Recalcula la lista de candidatos "pagados sin movimiento" a partir de
+  // facturaContexts, replicando los mismos filtros que la consulta real
+  // (elegibilidad, config historica valida, pago completo, sin movimiento).
+  // Si el test declaro missingAccumulationIds explicitamente, se respeta tal
+  // cual (compatibilidad con pruebas mas simples que no necesitan el detalle).
+  const computeMissingAccumulationCandidates = (cursor, limit) => {
+    if (state.missingAccumulationIds !== null) {
+      return state.missingAccumulationIds.filter((id) => id > cursor).slice(0, limit);
+    }
+
+    const candidates = Object.entries(state.facturaContexts)
+      .map(([idStr, context]) => ({ id: Number(idStr), context }))
+      .filter(({ id, context }) => {
+        if (id <= cursor) return false;
+        if (!context.id_cliente) return false;
+        if (!isContextFullyPaid(context)) return false;
+        if (!isClienteEligible(context.id_cliente)) return false;
+        if (!resolveConfigForDate(state.activeConfigs, context.fecha_referencia_config)) return false;
+        if (hasMovimiento(id)) return false;
+        return true;
+      })
+      .sort((a, b) => a.id - b.id)
+      .slice(0, limit)
+      .map(({ id }) => id);
+
+    return candidates;
   };
 
   const client = {
@@ -67,9 +116,10 @@ export const createFidelizacionMockClient = ({
       }
 
       if (text.includes('NOT EXISTS') && text.includes('FROM public.facturas f')) {
-        const limit = Number(params[0]) || 25;
-        const rows = state.missingAccumulationIds.slice(0, limit).map((id) => ({ id_factura: id }));
-        return { rows };
+        const cursor = Number(params[0]) || 0;
+        const limit = Number(params[1]) || 25;
+        const ids = computeMissingAccumulationCandidates(cursor, limit);
+        return { rows: ids.map((id) => ({ id_factura: id })) };
       }
 
       if (text.includes('FROM public.facturas f')) {
@@ -87,7 +137,8 @@ export const createFidelizacionMockClient = ({
       }
 
       if (text.includes('FROM public.usuarios_clientes uc')) {
-        return { rows: [], rowCount: state.elegible ? 1 : 0 };
+        const idCliente = params[0];
+        return { rows: [], rowCount: isClienteEligible(idCliente) ? 1 : 0 };
       }
 
       if (text.includes('FROM public.fidelizacion_configuracion_sucursal')) {

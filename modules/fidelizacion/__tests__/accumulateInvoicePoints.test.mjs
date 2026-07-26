@@ -299,6 +299,54 @@ describe('accumulateInvoicePoints (capa unica: gate de pago + decide + persiste)
     assert.equal(state.movimientos.length, 1);
   });
 
+  it('cuenta dividida: dos facturas del MISMO pedido acumulan por separado segun su propio monto, no el total del pedido', async () => {
+    const { client, state } = createFidelizacionMockClient({
+      activeConfig: { lempiras_por_punto: 10 },
+      facturaContexts: {
+        // Mismo id_pedido (900), pero cada division genero su propia factura
+        // y su propio cobro; el total del pedido seria 300, pero cada
+        // factura solo debe usar SU sub-total (SUM(facturas_cobros.monto)
+        // filtrado por su propia id_factura), nunca los 300 combinados.
+        901: {
+          id_pedido: 900,
+          id_sucursal: 1,
+          id_usuario: 9,
+          id_cliente: 5,
+          monto_factura: 120,
+          fecha_referencia_config: '2026-03-01T10:00:00Z',
+          tiene_pago_control: true,
+          pago_control_monto_pendiente: 0,
+          pago_control_estado_codigo: 'PAGADO_CONFIRMADO'
+        },
+        902: {
+          id_pedido: 900,
+          id_sucursal: 1,
+          id_usuario: 9,
+          id_cliente: 6,
+          monto_factura: 180,
+          fecha_referencia_config: '2026-03-01T10:00:00Z',
+          tiene_pago_control: true,
+          pago_control_monto_pendiente: 0,
+          pago_control_estado_codigo: 'PAGADO_CONFIRMADO'
+        }
+      }
+    });
+
+    let result901;
+    let result902;
+    await withMockedFidelizacionPoolConnect(async () => client, async () => {
+      result901 = await accumulateInvoicePoints({ idFactura: 901 });
+      result902 = await accumulateInvoicePoints({ idFactura: 902 });
+    });
+
+    assert.equal(result901.created, true);
+    assert.equal(result901.points, 12, 'floor(120/10), no floor(300/10)');
+    assert.equal(result902.created, true);
+    assert.equal(result902.points, 18, 'floor(180/10), no floor(300/10)');
+    assert.equal(state.movimientos.length, 2, 'cada id_factura genera su propio movimiento');
+    assert.notEqual(state.movimientos[0].id_factura, state.movimientos[1].id_factura);
+  });
+
   it('id_factura invalido: no abre conexion alguna', async () => {
     let connectCalled = false;
     await withMockedFidelizacionPoolConnect(

@@ -2,7 +2,7 @@ import pool from '../config/db-connection.js';
 import { getClientIp } from '../utils/security/clientInfo.js';
 import { computeAccumulationPoints } from '../modules/fidelizacion/domain/pointsCalculator.js';
 
-const CLIENT_ROLE_NAME = 'CLIENTE';
+export const CLIENT_ROLE_NAME = 'CLIENTE';
 const TEGUCIGALPA_TIMEZONE = 'America/Tegucigalpa';
 
 const hasBitacorasCache = {
@@ -151,9 +151,14 @@ const resolveFidelizacionCatalogs = async (client) => {
   };
 };
 
-// referenceDate es opcional (default NOW(), usado por canje presencial).
-// La acumulacion por factura pagada debe pasar la fecha de pago/facturacion
-// para resolver la configuracion vigente EN ESE MOMENTO, no la de hoy.
+// referenceDate es opcional.
+// - referenceDate null (canje presencial, configuracion administrativa):
+//   busca la configuracion ACTUAL, exige estado=true y vigencia HOY.
+// - referenceDate presente (acumulacion por factura pagada): busca la
+//   configuracion cuya ventana de vigencia incluia esa fecha, SIN exigir
+//   estado=true, porque una configuracion historica puede haber sido
+//   desactivada despues sin que eso deba reescribir lo que aplico en su
+//   momento a una factura ya pagada.
 export const getActiveFidelizacionConfig = async (client, idSucursal, referenceDate = null) => {
   const sucursalId = parsePositiveInt(idSucursal);
   if (!sucursalId) return null;
@@ -172,7 +177,7 @@ export const getActiveFidelizacionConfig = async (client, idSucursal, referenceD
         fcs.fecha_actualizacion
       FROM public.fidelizacion_configuracion_sucursal fcs
       WHERE fcs.id_sucursal = $1
-        AND COALESCE(fcs.estado, true) = true
+        AND ($2::timestamptz IS NOT NULL OR COALESCE(fcs.estado, true) = true)
         AND fcs.vigente_desde <= COALESCE($2::timestamptz, NOW())
         AND (fcs.vigente_hasta IS NULL OR fcs.vigente_hasta > COALESCE($2::timestamptz, NOW()))
       ORDER BY fcs.vigente_desde DESC, fcs.id_configuracion DESC

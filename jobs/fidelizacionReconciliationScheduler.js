@@ -11,6 +11,11 @@ const schedulerState = {
   running: false,
   timer: null,
   intervalMs: null,
+  // Cursor keyset en memoria: avanza entre ticks para no reescanear siempre
+  // las mismas primeras facturas. Sobrevive a start/stop dentro del mismo
+  // proceso (solo un reinicio del proceso lo vuelve a 0), y solo se resetea
+  // explicitamente en pruebas.
+  cursor: 0,
   lastStartedAt: null,
   lastTickStartedAt: null,
   lastTickCompletedAt: null,
@@ -61,6 +66,7 @@ const publicState = () => ({
   started: schedulerState.started,
   running: schedulerState.running,
   interval_ms: schedulerState.intervalMs,
+  cursor: schedulerState.cursor,
   last_started_at: schedulerState.lastStartedAt,
   last_tick_started_at: schedulerState.lastTickStartedAt,
   last_tick_completed_at: schedulerState.lastTickCompletedAt,
@@ -101,6 +107,7 @@ export const configureFidelizacionReconciliationSchedulerForTests = (overrides =
 export const resetFidelizacionReconciliationSchedulerForTests = () => {
   if (schedulerState.timer) dependencies.clearInterval(schedulerState.timer);
   resetSchedulerState();
+  schedulerState.cursor = 0;
   Object.assign(dependencies, defaultDependencies);
 };
 
@@ -114,14 +121,24 @@ export const fidelizacionReconciliationTick = async () => {
   schedulerState.lastTickStartedAt = isoNow();
 
   schedulerState.runningPromise = Promise.resolve()
-    .then(() => dependencies.reconcileMissingPoints({ limit: getBatchLimit() }))
+    .then(() => dependencies.reconcileMissingPoints({ cursor: schedulerState.cursor, limit: getBatchLimit() }))
     .then((result) => {
       schedulerState.successfulTicks += 1;
       schedulerState.lastTickSucceededAt = isoNow();
       schedulerState.lastError = null;
       schedulerState.lastResult = result;
+      if (Number.isFinite(result?.next_cursor)) {
+        // Si no hubo candidatos, next_cursor vuelve igual al cursor enviado:
+        // el proximo tick reintenta desde el mismo punto (no hay progreso que perder).
+        schedulerState.cursor = result.next_cursor;
+      }
       dependencies.log('[fidelizacion_reconcile_scheduler] tick completed', {
-        candidates: result?.candidates ?? 0
+        scanned: result?.scanned ?? 0,
+        queued: result?.queued ?? 0,
+        processed: result?.processed ?? 0,
+        skipped: result?.skipped ?? 0,
+        failed: result?.failed ?? 0,
+        next_cursor: result?.next_cursor ?? schedulerState.cursor
       });
       return { skipped: false, success: true, result };
     })

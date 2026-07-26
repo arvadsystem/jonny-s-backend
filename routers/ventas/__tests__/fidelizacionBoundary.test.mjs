@@ -33,6 +33,12 @@ describe('Frontera Ventas -> Fidelizacion (modules/fidelizacion)', () => {
     assert.doesNotMatch(source, /registerVentaFidelizacionAfterCommit/);
   });
 
+  it('Ventas nunca importa ni usa el pool dedicado de fidelizacion', async () => {
+    const source = await getVentasSource();
+    assert.doesNotMatch(source, /fidelizacionPool/);
+    assert.doesNotMatch(source, /infrastructure\/fidelizacionPool/);
+  });
+
   it('Ventas solo notifica el id_factura: cada llamada a notifyPaidInvoice pasa un unico campo idFactura', async () => {
     const source = await getVentasSource();
     const calls = [...source.matchAll(/notifyPaidInvoice\(\{([^}]*)\}\)/g)];

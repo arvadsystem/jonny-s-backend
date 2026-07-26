@@ -3,6 +3,7 @@ import { describe, it } from 'node:test';
 import { fidelizacionPool } from '../infrastructure/fidelizacionPool.js';
 import { notifyPaidInvoice } from '../application/notifyPaidInvoice.js';
 import { waitForFidelizacionQueueIdle } from '../infrastructure/fidelizacionQueue.js';
+import { reconcileMissingPoints } from '../workers/reconcileMissingPoints.js';
 import { createFidelizacionMockClient } from './fidelizacionMockClient.mjs';
 
 const withMockedFidelizacionPoolConnect = async (connectImpl, run) => {
@@ -132,5 +133,26 @@ describe('notifyPaidInvoice (unica interfaz publica que Ventas puede llamar)', (
 
     assert.equal(maxConcurrent, 1);
     assert.equal(state.movimientos.length, 2);
+  });
+
+  it('no hay duplicacion entre la notificacion inmediata de Ventas y la reconciliacion del scheduler', async () => {
+    const { client, state } = createFidelizacionMockClient({
+      facturaContexts: { 907: baseContext({ monto_factura: 100 }) }
+    });
+
+    await withMockedFidelizacionPoolConnect(async () => client, async () => {
+      // Ventas notifica la factura apenas se confirma el pago (via la cola,
+      // sin esperar), y "casi al mismo tiempo" el worker de reconciliacion
+      // la encuentra como pagada-sin-movimiento y tambien intenta procesarla.
+      // Ambos caminos comparten la MISMA cola con deduplicacion por
+      // id_factura: solo debe ejecutarse una vez.
+      const notifyPromise = notifyPaidInvoice({ idFactura: 907 });
+      const reconcilePromise = reconcileMissingPoints({ limit: 25 });
+
+      await Promise.all([notifyPromise, reconcilePromise]);
+      await waitForFidelizacionQueueIdle();
+    });
+
+    assert.equal(state.movimientos.length, 1, 'no debe crear un movimiento por cada via, solo uno');
   });
 });
