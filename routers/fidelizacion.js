@@ -319,8 +319,13 @@ const buildClienteBaseSql = (empresaRelationExpr = 'c.id_empresa') => `
     -- normalizePhoneHN). No se exige usuario, rol CLIENTE, correo, apellido
     -- ni credenciales de acceso.
     WHERE COALESCE(c.estado, true) = true
+      -- Mismo criterio EXACTO que isClienteProfileComplete/fetchClienteProfileForFidelizacion
+      -- (services/fidelizacionService.js): solo p.nombre, nunca CONCAT con
+      -- apellido. Una persona sin nombre pero con apellido no debe pasar
+      -- este filtro (el apellido si se sigue mostrando en nombre_principal,
+      -- eso es solo visual).
       AND TRIM(COALESCE(
-        CASE WHEN c.id_persona IS NOT NULL THEN CONCAT(p.nombre, ' ', p.apellido) ELSE e.nombre_empresa END,
+        CASE WHEN c.id_persona IS NOT NULL THEN p.nombre ELSE e.nombre_empresa END,
         ''
       )) <> ''
       AND length(regexp_replace(

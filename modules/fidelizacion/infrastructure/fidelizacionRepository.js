@@ -21,6 +21,35 @@ const parsePositiveInt = (value) => {
   return Number.isInteger(parsed) && parsed > 0 ? parsed : null;
 };
 
+// Periodo de gracia para RECONCILE: evita la carrera entre el camino LIVE
+// (que crea PENDING justo tras el COMMIT de la venta) y la reconciliacion
+// (que corre en un tick aparte). Sin esto, reconciliacion podria encontrar
+// una factura recien pagada ANTES de que LIVE alcance a crear su fila
+// PENDING, y -sin fila- la marcaria terminal (LEGACY_ELIGIBILITY_UNVERIFIABLE)
+// de inmediato, perdiendo puntos de una compra legitima y reciente. Mismo
+// patron de validacion que jobs/fidelizacionReconciliationScheduler.js
+// (parsePositiveIntEnv), pero 0 es un valor valido explicito aqui (grace
+// deshabilitada), asi que se usa una variante propia. Se lee en cada
+// llamada (nunca cacheado), igual que el resto de la configuracion del
+// scheduler.
+const DEFAULT_RECONCILE_GRACE_MS = 300000;
+const MIN_RECONCILE_GRACE_MS = 0;
+const MAX_RECONCILE_GRACE_MS = 3600000;
+
+const parseNonNegativeIntEnv = (value, fallback, min, max) => {
+  const parsed = Number.parseInt(String(value ?? '').trim(), 10);
+  if (!Number.isInteger(parsed) || parsed < 0) return fallback;
+  return Math.min(Math.max(parsed, min), max);
+};
+
+export const getFidelizacionReconcileGraceMs = () =>
+  parseNonNegativeIntEnv(
+    process.env.FIDELIZACION_RECONCILE_GRACE_MS,
+    DEFAULT_RECONCILE_GRACE_MS,
+    MIN_RECONCILE_GRACE_MS,
+    MAX_RECONCILE_GRACE_MS
+  );
+
 // Pool dedicado (max 1), nunca el pool financiero compartido de Ventas/Caja.
 export const connectClient = () => fidelizacionPool.connect();
 
@@ -115,6 +144,34 @@ const BUSINESS_SKIP_REASONS = new Set([
   'ACCUMULATION_RULE_NOT_CONFIGURED',
   'POINTS_ROUND_DOWN_TO_ZERO'
 ]);
+
+// Bloqueante: evitar acumulacion retroactiva cuando no existe estado previo.
+// Reserva la fila PENDING para una factura que se sabe recien pagada, ANTES
+// de evaluar perfil/switch/tasa/puntos (camino LIVE unicamente -- ver
+// persistAccumulation). intentos arranca en 0: esta reserva no es todavia un
+// intento real de evaluacion; el primer intento real (mas abajo, via
+// upsertAccumulationState) lo sube a 1. ON CONFLICT DO NOTHING: si ya existe
+// cualquier fila (de un intento anterior, o de una carrera con otro
+// disparador bajo el mismo advisory lock), esta reserva no la toca.
+export const ensurePendingAccumulationState = async (client, idFactura, fechaReferencia = null) => {
+  const facturaId = parsePositiveInt(idFactura);
+  if (!facturaId) return null;
+
+  const result = await client.query(
+    `
+      INSERT INTO public.fidelizacion_acumulacion_facturas_estado (
+        id_factura, estado, motivo, elegibilidad_determinada, fecha_referencia,
+        fecha_creacion, fecha_actualizacion, intentos, ultimo_error
+      )
+      VALUES ($1, 'PENDING', NULL, NULL, $2, NOW(), NOW(), 0, NULL)
+      ON CONFLICT (id_factura) DO NOTHING
+      RETURNING id_factura, estado, motivo, elegibilidad_determinada, intentos
+    `,
+    [facturaId, fechaReferencia]
+  );
+
+  return result.rows[0] || null;
+};
 
 export const getAccumulationState = async (client, idFactura) => {
   const facturaId = parsePositiveInt(idFactura);
@@ -237,6 +294,26 @@ export const persistAccumulation = async ({
       : { created: false, reason: existingState.motivo };
   }
 
+  if (!existingState) {
+    if (trigger === ACCUMULATION_TRIGGER.RECONCILE) {
+      // Reconciliacion nunca es la primera en evaluar una factura: si no
+      // existe fila, no se consulta perfil actual, ni config, ni puntos --
+      // se registra terminal de inmediato como no verificable (no se puede
+      // garantizar que el perfil actual sea el de la compra).
+      await upsertAccumulationState(client, {
+        idFactura,
+        estado: ACCUMULATION_STATE.SKIPPED_TERMINAL,
+        motivo: LEGACY_ELIGIBILITY_UNVERIFIABLE,
+        elegibilidadDeterminada: false,
+        fechaReferencia: referenceDate
+      });
+      return { created: false, reason: LEGACY_ELIGIBILITY_UNVERIFIABLE };
+    }
+
+    // Camino LIVE: reserva PENDING antes de evaluar perfil/switch/tasa/puntos.
+    await ensurePendingAccumulationState(client, idFactura, referenceDate);
+  }
+
   const result = await registerFacturaLoyaltyAccumulation({
     client,
     idFactura,
@@ -301,6 +378,7 @@ export const persistAccumulation = async ({
 export const listPaidInvoicesMissingAccumulation = async (client, { cursor = 0, limit = 25 } = {}) => {
   const boundedLimit = Math.min(Math.max(parsePositiveInt(limit) || 25, 1), 200);
   const boundedCursor = Number.isFinite(Number(cursor)) && Number(cursor) >= 0 ? Number(cursor) : 0;
+  const graceMs = getFidelizacionReconcileGraceMs();
 
   const result = await client.query(
     `
@@ -333,6 +411,12 @@ export const listPaidInvoicesMissingAccumulation = async (client, { cursor = 0, 
         -- Nunca reintentar un estado terminal (PROCESSED/SKIPPED_TERMINAL):
         -- solo candidatos nuevos (sin fila) o en estado reintentable.
         AND (est.id_factura IS NULL OR est.estado IN ('PENDING', 'RETRYABLE_ERROR'))
+        -- Periodo de gracia: solo facturas cuya fecha de pago/facturacion ya
+        -- paso hace al menos $4 ms. Evita la carrera con el camino LIVE, que
+        -- todavia no tuvo tiempo de crear su fila PENDING para una factura
+        -- pagada hace unos instantes.
+        AND COALESCE(upc.fecha_pago_confirmado, f.fecha_hora_facturacion)
+          <= NOW() - make_interval(secs => $4::double precision / 1000)
         AND NOT EXISTS (
           SELECT 1
           FROM public.fidelizacion_movimientos fm
@@ -347,7 +431,7 @@ export const listPaidInvoicesMissingAccumulation = async (client, { cursor = 0, 
       ORDER BY f.id_factura ASC
       LIMIT $2
     `,
-    [boundedCursor, boundedLimit, PAGADO_CONFIRMADO_CODIGO]
+    [boundedCursor, boundedLimit, PAGADO_CONFIRMADO_CODIGO, graceMs]
   );
 
   const ids = result.rows.map((row) => Number(row.id_factura));

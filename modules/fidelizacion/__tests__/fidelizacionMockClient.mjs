@@ -48,8 +48,23 @@ export const createFidelizacionMockClient = ({
   defaultClienteProfile = DEFAULT_CLIENTE_PROFILE,
   missingAccumulationIds = null,
   estadoFacturasIniciales = {},
+  // Menu publico (backfillClienteTelefonoDesdePedidoContacto): simulacion
+  // relacional minima, independiente del clienteProfiles plano de arriba
+  // (que solo alimenta fetchClienteProfileForFidelizacion). pedidos:
+  // {id_pedido: {id_cliente}}. pedidosContacto: {id_pedido: {telefono_normalizado}}.
+  // clientesRelacional: {id_cliente: {id_persona|id_empresa, personaTelefono|empresaTelefono}}.
+  pedidos = {},
+  pedidosContacto = {},
+  clientesRelacional = {},
   failOn = null,
-  releaseError = null
+  releaseError = null,
+  // Bloqueante 3 (prueba de concurrencia real): dos clientes mock
+  // independientes pueden compartir el MISMO state (misma "base de datos")
+  // pasando sharedState = otroCliente.state, y el MISMO lockCoordinator
+  // (ver fidelizacionLockCoordinator.mjs) para que pg_advisory_xact_lock
+  // bloquee de verdad entre ambos, igual que Postgres real.
+  sharedState = null,
+  lockCoordinator = null
 } = {}) => {
   const rawConfigs = activeConfigs || (activeConfig ? [activeConfig] : []);
   const resolvedConfigs = rawConfigs.map((cfg) => ({
@@ -59,7 +74,7 @@ export const createFidelizacionMockClient = ({
     ...cfg
   }));
 
-  const state = {
+  const state = sharedState || {
     activeConfigs: resolvedConfigs,
     saldos: new Map(),
     movimientos: [...movimientos],
@@ -86,8 +101,30 @@ export const createFidelizacionMockClient = ({
     nextMovimientoId: movimientos.length + 1,
     calls: [],
     released: false,
-    releaseCallCount: 0
+    releaseCallCount: 0,
+    pedidos: Object.fromEntries(Object.entries(pedidos).map(([id, row]) => [Number(id), row])),
+    pedidosContacto: Object.fromEntries(Object.entries(pedidosContacto).map(([id, row]) => [Number(id), row])),
+    // clientesRelacional: valores por defecto (sin persona/empresa/telefono
+    // previo) mezclados con lo que declare el test.
+    clientesRelacional: Object.fromEntries(
+      Object.entries(clientesRelacional).map(([id, row]) => [Number(id), {
+        idPersona: null,
+        idEmpresa: null,
+        personaIdTelefono: null,
+        personaTelefono: null,
+        empresaIdTelefono: null,
+        empresaTelefono: null,
+        ...row
+      }])
+    ),
+    telefonos: new Map(),
+    nextTelefonoId: 1
   };
+
+  // Locks que ESTE cliente (esta "conexion") tiene tomados en la
+  // transaccion en curso; se liberan en el proximo COMMIT/ROLLBACK, igual
+  // que pg_advisory_xact_lock real (scoped a la transaccion, no a la query).
+  const heldLockReleases = [];
 
   const getClienteProfile = (idCliente) => {
     const override = state.clienteProfiles[Number(idCliente)];
@@ -105,17 +142,20 @@ export const createFidelizacionMockClient = ({
 
   // Recalcula la lista de candidatos "pagados sin movimiento" a partir de
   // facturaContexts, replicando los mismos filtros que la consulta real:
-  // pago completo, sin movimiento, y sin fila terminal en
-  // fidelizacion_acumulacion_facturas_estado. Ya NO filtra por perfil de
+  // pago completo, sin movimiento, sin fila terminal en
+  // fidelizacion_acumulacion_facturas_estado, y fuera del periodo de gracia
+  // (fecha_referencia_config <= ahora - graceMs). Ya NO filtra por perfil de
   // cliente ni por configuracion vigente (eso es exactamente lo que causaba
   // la acumulacion retroactiva: ver fidelizacionRepository.js). Si el test
   // declaro missingAccumulationIds explicitamente, se respeta tal cual
-  // (compatibilidad con pruebas mas simples).
-  const computeMissingAccumulationCandidates = (cursor, limit) => {
+  // (compatibilidad con pruebas mas simples; el periodo de gracia no aplica
+  // a esa via de compatibilidad).
+  const computeMissingAccumulationCandidates = (cursor, limit, graceMs = 0) => {
     if (state.missingAccumulationIds !== null) {
       return state.missingAccumulationIds.filter((id) => id > cursor).slice(0, limit);
     }
 
+    const graceCutoff = Date.now() - graceMs;
     const candidates = Object.entries(state.facturaContexts)
       .map(([idStr, context]) => ({ id: Number(idStr), context }))
       .filter(({ id, context }) => {
@@ -124,6 +164,8 @@ export const createFidelizacionMockClient = ({
         if (!isContextFullyPaid(context)) return false;
         if (hasMovimiento(id)) return false;
         if (!isRetryableOrNoState(id)) return false;
+        const refMs = context.fecha_referencia_config ? new Date(context.fecha_referencia_config).getTime() : NaN;
+        if (Number.isFinite(refMs) && refMs > graceCutoff) return false;
         return true;
       })
       .sort((a, b) => a.id - b.id)
@@ -143,10 +185,25 @@ export const createFidelizacionMockClient = ({
       }
 
       const trimmed = text.trim();
-      if (trimmed === 'BEGIN' || trimmed === 'COMMIT' || trimmed === 'ROLLBACK') {
+      if (trimmed === 'BEGIN') {
+        return { rows: [] };
+      }
+      if (trimmed === 'COMMIT' || trimmed === 'ROLLBACK') {
+        // pg_advisory_xact_lock esta scoped a la transaccion: se libera aqui,
+        // nunca antes. Si dos clientes comparten lockCoordinator, esto es lo
+        // que desbloquea genuinamente al que estaba esperando su turno.
+        while (heldLockReleases.length > 0) {
+          const release = heldLockReleases.pop();
+          release();
+        }
         return { rows: [] };
       }
       if (trimmed.includes('pg_advisory_xact_lock')) {
+        if (lockCoordinator) {
+          const key = params.join(':');
+          const release = await lockCoordinator.acquire(key);
+          heldLockReleases.push(release);
+        }
         return { rows: [] };
       }
 
@@ -156,11 +213,107 @@ export const createFidelizacionMockClient = ({
         return { rowCount: 0, rows: [] };
       }
 
+      // backfillClienteTelefonoDesdePedidoContacto (services/fidelizacionService.js):
+      // dueno del pedido (guard de cuentas divididas).
+      if (text.includes('SELECT id_cliente') && text.includes('FROM public.pedidos') && !text.includes('LEFT JOIN')) {
+        const idPedido = Number(params[0]);
+        const row = state.pedidos[idPedido];
+        return { rows: row ? [{ id_cliente: row.id_cliente }] : [] };
+      }
+
+      // backfillClienteTelefonoDesdePedidoContacto: candidato persona/empresa
+      // (FOR UPDATE OF c la distingue de la query de perfil de mas abajo).
+      if (text.includes('FROM public.clientes c') && text.includes('FOR UPDATE OF c')) {
+        const idCliente = Number(params[0]);
+        const rel = state.clientesRelacional[idCliente];
+        if (!rel) return { rows: [] };
+        return {
+          rows: [{
+            id_persona: rel.idPersona,
+            id_empresa: rel.idEmpresa,
+            persona_id_telefono: rel.personaIdTelefono,
+            persona_telefono: rel.personaTelefono,
+            empresa_id_telefono: rel.empresaIdTelefono,
+            empresa_telefono: rel.empresaTelefono
+          }]
+        };
+      }
+
+      // backfillClienteTelefonoDesdePedidoContacto: telefono mas reciente
+      // capturado en el pedido (menu publico o pedidos-pendientes del POS).
+      if (text.includes('FROM public.pedidos_contacto')) {
+        const idPedido = Number(params[0]);
+        const row = state.pedidosContacto[idPedido];
+        return { rows: row ? [{ telefono_normalizado: row.telefono_normalizado ?? null }] : [] };
+      }
+
+      if (text.includes('UPDATE public.telefonos SET telefono')) {
+        const [telefono, idTelefono] = params;
+        state.telefonos.set(Number(idTelefono), telefono);
+        for (const entry of Object.values(state.clientesRelacional)) {
+          if (entry.personaIdTelefono === Number(idTelefono)) entry.personaTelefono = telefono;
+          if (entry.empresaIdTelefono === Number(idTelefono)) entry.empresaTelefono = telefono;
+        }
+        return { rows: [] };
+      }
+
+      if (text.includes('INSERT INTO public.telefonos')) {
+        const [telefono] = params;
+        const idTelefono = state.nextTelefonoId++;
+        state.telefonos.set(idTelefono, telefono);
+        return { rows: [{ id_telefono: idTelefono }] };
+      }
+
+      if (text.includes('UPDATE public.personas SET id_telefono')) {
+        const [idTelefono, idPersona] = params;
+        const entry = Object.values(state.clientesRelacional).find((rel) => rel.idPersona === Number(idPersona));
+        if (entry) {
+          entry.personaIdTelefono = Number(idTelefono);
+          entry.personaTelefono = state.telefonos.get(Number(idTelefono)) ?? entry.personaTelefono;
+        }
+        return { rows: [] };
+      }
+
+      if (text.includes('UPDATE public.empresas SET id_telefono')) {
+        const [idTelefono, idEmpresa] = params;
+        const entry = Object.values(state.clientesRelacional).find((rel) => rel.idEmpresa === Number(idEmpresa));
+        if (entry) {
+          entry.empresaIdTelefono = Number(idTelefono);
+          entry.empresaTelefono = state.telefonos.get(Number(idTelefono)) ?? entry.empresaTelefono;
+        }
+        return { rows: [] };
+      }
+
       // Tabla de estado de procesamiento por factura (getAccumulationState /
-      // upsertAccumulationState / recordAccumulationRetryableError).
+      // ensurePendingAccumulationState / upsertAccumulationState /
+      // recordAccumulationRetryableError).
       if (text.includes('INSERT INTO public.fidelizacion_acumulacion_facturas_estado')) {
-        const [facturaId, estado, motivo, elegibilidadDeterminada, fechaReferencia, ultimoError] = params;
-        const id = Number(facturaId);
+        const id = Number(params[0]);
+
+        if (text.includes('DO NOTHING')) {
+          // ensurePendingAccumulationState: solo reserva PENDING si no
+          // existe fila (params: [idFactura, fechaReferencia]). Igual que
+          // Postgres real, ON CONFLICT DO NOTHING no devuelve fila cuando
+          // hubo conflicto.
+          const existing = state.estadoFacturas.get(id);
+          if (existing) return { rows: [] };
+          const fechaReferencia = params[1] ?? null;
+          const nextRow = {
+            id_factura: id,
+            estado: 'PENDING',
+            motivo: null,
+            elegibilidad_determinada: null,
+            fecha_referencia: fechaReferencia,
+            intentos: 0,
+            ultimo_error: null
+          };
+          state.estadoFacturas.set(id, nextRow);
+          return { rows: [nextRow] };
+        }
+
+        // upsertAccumulationState: DO UPDATE (params: [idFactura, estado,
+        // motivo, elegibilidadDeterminada, fechaReferencia, ultimoError]).
+        const [, estado, motivo, elegibilidadDeterminada, fechaReferencia, ultimoError] = params;
         const existing = state.estadoFacturas.get(id);
 
         // Mismo guard que el WHERE del ON CONFLICT DO UPDATE real: nunca
@@ -191,7 +344,8 @@ export const createFidelizacionMockClient = ({
       if (text.includes('NOT EXISTS') && text.includes('FROM public.facturas f')) {
         const cursor = Number(params[0]) || 0;
         const limit = Number(params[1]) || 25;
-        const ids = computeMissingAccumulationCandidates(cursor, limit);
+        const graceMs = Number(params[3]) || 0;
+        const ids = computeMissingAccumulationCandidates(cursor, limit, graceMs);
         return { rows: ids.map((id) => ({ id_factura: id })) };
       }
 
@@ -202,17 +356,24 @@ export const createFidelizacionMockClient = ({
       }
 
       // Perfil de cliente (fetchClienteProfileForFidelizacion): activo,
-      // nombre (persona/empresa) y telefono asociado.
+      // nombre (persona/empresa) y telefono asociado. Si el test declaro
+      // clientesRelacional para este cliente, el telefono se lee de ahi (asi
+      // el efecto de backfillClienteTelefonoDesdePedidoContacto -que solo
+      // escribe en clientesRelacional/telefonos- es visible aqui, igual que
+      // en Postgres real seria la MISMA fila). Sin clientesRelacional
+      // declarado, se usa el atajo plano clienteProfiles de siempre.
       if (text.includes('FROM public.clientes c') && text.includes('LEFT JOIN public.personas p')) {
         const idCliente = Number(params[0]);
         const profile = getClienteProfile(idCliente);
         if (!profile) return { rows: [] };
+        const rel = state.clientesRelacional[idCliente];
+        const telefonoRelacional = rel ? (rel.personaTelefono ?? rel.empresaTelefono ?? null) : undefined;
         return {
           rows: [{
             id_cliente: idCliente,
             estado: profile.estado ?? true,
             nombre: profile.nombre ?? null,
-            telefono: profile.telefono ?? null
+            telefono: telefonoRelacional !== undefined ? telefonoRelacional : (profile.telefono ?? null)
           }]
         };
       }

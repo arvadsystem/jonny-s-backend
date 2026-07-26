@@ -505,6 +505,111 @@ const computeRedemptionPoints = (precioProducto, lempirasPorPunto) => {
   return Math.ceil(price / ratio);
 };
 
+// Menu publico: el registro de clientes (routers/public_cliente.js) nunca
+// pide ni guarda telefono, y el telefono que el cliente SI escribe en el
+// formulario de contacto del pedido (pedidos_contacto.telefono_normalizado)
+// nunca se sincroniza de vuelta a personas/empresas. Sin esto, un cliente
+// del menu publico queda con CLIENT_PROFILE_INCOMPLETE para siempre, sin
+// importar cuantas veces escriba su telefono al pagar.
+//
+// Reimplementa -deliberadamente duplicado, mismo patron ya usado en este
+// archivo (ver buildClienteEmpresaRelationSql) para no depender de
+// routers/ventas.js- la logica exacta de PATCH /ventas/clientes/:id/telefono
+// (routers/ventas.js): nunca sobrescribe un telefono ya existente, y
+// resuelve el candidato via clientes.id_persona/id_empresa. Best-effort: si
+// falla, no debe impedir la evaluacion normal del perfil (cae a
+// CLIENT_PROFILE_INCOMPLETE si de verdad sigue sin telefono).
+const backfillClienteTelefonoDesdePedidoContacto = async (client, { idCliente, idPedido }) => {
+  const clienteId = parsePositiveInt(idCliente);
+  const pedidoId = parsePositiveInt(idPedido);
+  if (!clienteId || !pedidoId) return;
+
+  try {
+    // Cuentas divididas: pedidos_contacto es UNA fila por pedido (quien hizo
+    // el pedido), nunca una por division. Aplicar su telefono a un cliente
+    // que no es el dueno del pedido asignaria el telefono de una persona a
+    // la cuenta de otra -por eso solo se aplica cuando idCliente coincide
+    // con pedidos.id_cliente-.
+    const pedidoResult = await client.query(
+      'SELECT id_cliente FROM public.pedidos WHERE id_pedido = $1 LIMIT 1',
+      [pedidoId]
+    );
+    const pedidoIdCliente = parsePositiveInt(pedidoResult.rows?.[0]?.id_cliente);
+    if (!pedidoIdCliente || pedidoIdCliente !== clienteId) return;
+
+    const clienteResult = await client.query(
+      `
+        SELECT
+          c.id_persona, c.id_empresa,
+          p.id_telefono AS persona_id_telefono, tp.telefono AS persona_telefono,
+          e.id_telefono AS empresa_id_telefono, te.telefono AS empresa_telefono
+        FROM public.clientes c
+        LEFT JOIN public.personas p ON p.id_persona = c.id_persona
+        LEFT JOIN public.telefonos tp ON tp.id_telefono = p.id_telefono
+        LEFT JOIN public.empresas e ON e.id_empresa = c.id_empresa
+        LEFT JOIN public.telefonos te ON te.id_telefono = e.id_telefono
+        WHERE c.id_cliente = $1
+        FOR UPDATE OF c
+      `,
+      [clienteId]
+    );
+    const cliente = clienteResult.rows?.[0];
+    if (!cliente) return;
+
+    const target = parsePositiveInt(cliente.id_persona)
+      ? {
+          table: 'personas',
+          idField: 'id_persona',
+          id: Number(cliente.id_persona),
+          idTelefono: parsePositiveInt(cliente.persona_id_telefono),
+          telefonoActual: cliente.persona_telefono
+        }
+      : parsePositiveInt(cliente.id_empresa)
+      ? {
+          table: 'empresas',
+          idField: 'id_empresa',
+          id: Number(cliente.id_empresa),
+          idTelefono: parsePositiveInt(cliente.empresa_id_telefono),
+          telefonoActual: cliente.empresa_telefono
+        }
+      : null;
+    // Sin persona ni empresa (consumidor final): nada que completar.
+    if (!target) return;
+    // Ya tiene telefono: nunca se sobrescribe (misma regla que el PATCH de Ventas).
+    if (target.telefonoActual) return;
+
+    const contactoResult = await client.query(
+      `
+        SELECT telefono_normalizado
+        FROM public.pedidos_contacto
+        WHERE id_pedido = $1
+        ORDER BY id_pedido_contacto DESC
+        LIMIT 1
+      `,
+      [pedidoId]
+    );
+    const telefono = normalizePhoneHN(contactoResult.rows?.[0]?.telefono_normalizado);
+    // Sin telefono utilizable en el pedido: no hay nada que completar esta vez.
+    if (!telefono) return;
+
+    if (target.idTelefono) {
+      await client.query('UPDATE public.telefonos SET telefono = $1 WHERE id_telefono = $2', [telefono, target.idTelefono]);
+    } else {
+      const inserted = await client.query('INSERT INTO public.telefonos (telefono) VALUES ($1) RETURNING id_telefono', [telefono]);
+      const idTelefono = Number(inserted.rows?.[0]?.id_telefono || 0);
+      if (idTelefono) {
+        await client.query(`UPDATE public.${target.table} SET id_telefono = $1 WHERE ${target.idField} = $2`, [idTelefono, target.id]);
+      }
+    }
+  } catch (err) {
+    console.error('[fidelizacion] error al completar telefono del cliente desde pedidos_contacto (no bloquea la evaluacion):', {
+      id_cliente: idCliente || null,
+      id_pedido: idPedido || null,
+      code: err?.code || err?.name || 'FIDELIZACION_BACKFILL_TELEFONO_ERROR'
+    });
+  }
+};
+
 export const registerFacturaLoyaltyAccumulation = async ({
   client,
   idFactura,
@@ -546,6 +651,10 @@ export const registerFacturaLoyaltyAccumulation = async ({
       idMovimiento: Number(existingResult.rows[0].id_movimiento)
     };
   }
+
+  // Menu publico: completa el telefono del cliente desde el contacto del
+  // pedido si su perfil aun no tiene uno (ver comentario de la funcion).
+  await backfillClienteTelefonoDesdePedidoContacto(client, { idCliente: clienteId, idPedido });
 
   const clienteProfile = await fetchClienteProfileForFidelizacion(client, clienteId);
   if (!isClienteProfileComplete(clienteProfile)) {

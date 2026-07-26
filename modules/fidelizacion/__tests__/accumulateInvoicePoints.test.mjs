@@ -3,6 +3,7 @@ import { describe, it } from 'node:test';
 import { fidelizacionPool } from '../infrastructure/fidelizacionPool.js';
 import { accumulateInvoicePoints } from '../application/accumulateInvoicePoints.js';
 import { createFidelizacionMockClient } from './fidelizacionMockClient.mjs';
+import { createFidelizacionLockCoordinator } from './fidelizacionLockCoordinator.mjs';
 
 const withMockedFidelizacionPoolConnect = async (connectImpl, run) => {
   const originalConnect = fidelizacionPool.connect;
@@ -562,5 +563,221 @@ describe('accumulateInvoicePoints: bloqueante 3 (tabla de estado por factura, si
 
     assert.equal(result.created, false);
     assert.equal(result.reason, 'ERROR', 'una falla guardando el estado de fidelizacion no cambia el resultado ya decidido');
+  });
+});
+
+describe('accumulateInvoicePoints: bloqueante 1 (PENDING antes de evaluar en LIVE; RECONCILE nunca es el primero en evaluar)', () => {
+  const ctx = (overrides = {}) => ({
+    id_pedido: null,
+    id_sucursal: 1,
+    id_usuario: 9,
+    id_cliente: 5,
+    monto_factura: 100,
+    fecha_referencia_config: '2026-03-01T10:00:00Z',
+    tiene_pago_control: false,
+    pago_control_monto_pendiente: null,
+    pago_control_estado_codigo: null,
+    ...overrides
+  });
+
+  it('regla 1: LIVE crea PENDING antes de evaluar el perfil (orden verificable en las llamadas SQL)', async () => {
+    const { client, state } = createFidelizacionMockClient({
+      facturaContexts: { 860: ctx() }
+    });
+
+    await withMockedFidelizacionPoolConnect(async () => client, async () => {
+      await accumulateInvoicePoints({ idFactura: 860 });
+    });
+
+    const insertPendingIdx = state.calls.findIndex((c) => c.sql.includes('INSERT INTO public.fidelizacion_acumulacion_facturas_estado') && c.sql.includes('DO NOTHING'));
+    const perfilIdx = state.calls.findIndex((c) => c.sql.includes('FROM public.clientes c') && c.sql.includes('LEFT JOIN public.personas p'));
+    assert.notEqual(insertPendingIdx, -1, 'debe reservar PENDING');
+    assert.notEqual(perfilIdx, -1, 'debe consultar el perfil');
+    assert.ok(insertPendingIdx < perfilIdx, 'PENDING debe crearse ANTES de consultar el perfil');
+  });
+
+  it('regla 2: LIVE con perfil valido termina PROCESSED', async () => {
+    const { client, state } = createFidelizacionMockClient({ facturaContexts: { 861: ctx() } });
+    let result;
+    await withMockedFidelizacionPoolConnect(async () => client, async () => {
+      result = await accumulateInvoicePoints({ idFactura: 861 });
+    });
+    assert.equal(result.created, true);
+    assert.equal(state.estadoFacturas.get(861).estado, 'PROCESSED');
+  });
+
+  it('regla 3: LIVE con perfil incompleto termina SKIPPED_TERMINAL', async () => {
+    const { client, state } = createFidelizacionMockClient({
+      clienteProfiles: { 5: { estado: true, nombre: '', telefono: '' } },
+      facturaContexts: { 862: ctx() }
+    });
+    let result;
+    await withMockedFidelizacionPoolConnect(async () => client, async () => {
+      result = await accumulateInvoicePoints({ idFactura: 862 });
+    });
+    assert.equal(result.created, false);
+    assert.equal(state.estadoFacturas.get(862).estado, 'SKIPPED_TERMINAL');
+  });
+
+  it('regla 5: RECONCILE sin estado previo y perfil ACTUAL completo no acumula igual (nunca lo llega a evaluar)', async () => {
+    const { client, state } = createFidelizacionMockClient({
+      // Perfil por defecto: activo, con nombre y telefono validos.
+      facturaContexts: { 863: ctx() }
+    });
+
+    let result;
+    await withMockedFidelizacionPoolConnect(async () => client, async () => {
+      result = await accumulateInvoicePoints({ idFactura: 863, trigger: 'RECONCILE' });
+    });
+
+    assert.equal(result.created, false, 'aunque el perfil actual sea perfectamente valido, RECONCILE sin fila previa nunca acumula');
+    assert.equal(result.reason, 'LEGACY_ELIGIBILITY_UNVERIFIABLE');
+    assert.equal(state.movimientos.length, 0);
+    assert.equal(state.estadoFacturas.get(863).estado, 'SKIPPED_TERMINAL');
+    // No debe haber consultado ni el perfil ni la configuracion: se corta antes de cualquiera de las dos.
+    assert.ok(!state.calls.some((c) => c.sql.includes('FROM public.clientes c') && c.sql.includes('LEFT JOIN public.personas p')), 'RECONCILE sin fila previa nunca consulta el perfil');
+    assert.ok(!state.calls.some((c) => c.sql.includes('FROM public.fidelizacion_configuracion_sucursal')), 'RECONCILE sin fila previa nunca consulta la configuracion');
+  });
+
+  it('regla 8 (con trigger RECONCILE explicito): un estado RETRYABLE_ERROR persistido si permite que RECONCILE reintente', async () => {
+    const { client, state } = createFidelizacionMockClient({
+      facturaContexts: { 864: ctx() },
+      estadoFacturasIniciales: { 864: { estado: 'RETRYABLE_ERROR', intentos: 2, ultimo_error: 'timeout previo' } }
+    });
+
+    let result;
+    await withMockedFidelizacionPoolConnect(async () => client, async () => {
+      result = await accumulateInvoicePoints({ idFactura: 864, trigger: 'RECONCILE' });
+    });
+
+    assert.equal(result.created, true);
+    assert.equal(state.estadoFacturas.get(864).estado, 'PROCESSED');
+    assert.equal(state.estadoFacturas.get(864).intentos, 3);
+  });
+
+  it('regla 11: dos notificaciones para la misma factura no duplican el movimiento (idempotencia por estado, no solo por el chequeo interno de movimientos)', async () => {
+    const { client, state } = createFidelizacionMockClient({ facturaContexts: { 865: ctx() } });
+
+    let first;
+    let second;
+    await withMockedFidelizacionPoolConnect(async () => client, async () => {
+      first = await accumulateInvoicePoints({ idFactura: 865 });
+      second = await accumulateInvoicePoints({ idFactura: 865 });
+    });
+
+    assert.equal(first.created, true);
+    assert.equal(second.created, false);
+    assert.equal(second.reason, 'ALREADY_REGISTERED');
+    assert.equal(state.movimientos.length, 1);
+  });
+
+  it('regla 12: una falla registrando PENDING (antes de evaluar nada) no impide que accumulateInvoicePoints responda sin lanzar', async () => {
+    const { client } = createFidelizacionMockClient({
+      facturaContexts: { 866: ctx() },
+      failOn: 'DO NOTHING'
+    });
+
+    let result;
+    await withMockedFidelizacionPoolConnect(async () => client, async () => {
+      await assert.doesNotReject(
+        (async () => { result = await accumulateInvoicePoints({ idFactura: 866 }); })()
+      );
+    });
+
+    assert.equal(result.created, false);
+    assert.equal(result.reason, 'ERROR');
+  });
+});
+
+describe('accumulateInvoicePoints: bloqueante 3 (prueba de concurrencia REAL, no dos llamadas secuenciales)', () => {
+  const ctx = (overrides = {}) => ({
+    id_pedido: null,
+    id_sucursal: 1,
+    id_usuario: 9,
+    id_cliente: 5,
+    monto_factura: 100,
+    fecha_referencia_config: '2026-03-01T10:00:00Z',
+    tiene_pago_control: false,
+    pago_control_monto_pendiente: null,
+    pago_control_estado_codigo: null,
+    ...overrides
+  });
+
+  it('dos transacciones concurrentes (Promise.all) sobre la MISMA factura, con un coordinador que simula pg_advisory_xact_lock real: la segunda espera hasta que la primera libera el lock', async () => {
+    // Dos "conexiones" independientes (dos clientes mock distintos, cada
+    // uno representando su propia transaccion), compartiendo la MISMA
+    // "base de datos" (sharedState) y el MISMO coordinador de lock. Esto
+    // reproduce de verdad lo que pg_advisory_xact_lock hace en Postgres:
+    // la segunda transaccion que pide el mismo lock queda bloqueada
+    // (await) hasta que la primera hace COMMIT.
+    const lockCoordinator = createFidelizacionLockCoordinator();
+    const mockA = createFidelizacionMockClient({
+      facturaContexts: { 900: ctx() },
+      lockCoordinator
+    });
+    const mockB = createFidelizacionMockClient({
+      sharedState: mockA.state,
+      lockCoordinator
+    });
+
+    // Instrumentacion: registra CUANDO cada query realmente resuelve (no
+    // cuando se emite), para poder probar el orden real de adquisicion del
+    // lock y del COMMIT, sin depender de timings fragiles.
+    const events = [];
+    const instrument = (label, client) => {
+      const originalQuery = client.query.bind(client);
+      client.query = async (sql, params) => {
+        const text = String(sql).trim();
+        const result = await originalQuery(sql, params);
+        if (text.includes('pg_advisory_xact_lock')) events.push(`${label}:lock_acquired`);
+        if (text === 'COMMIT') events.push(`${label}:commit`);
+        return result;
+      };
+    };
+    instrument('A', mockA.client);
+    instrument('B', mockB.client);
+
+    let connectCount = 0;
+    const connectImpl = async () => {
+      connectCount += 1;
+      return connectCount === 1 ? mockA.client : mockB.client;
+    };
+
+    let results;
+    await withMockedFidelizacionPoolConnect(connectImpl, async () => {
+      results = await Promise.all([
+        accumulateInvoicePoints({ idFactura: 900 }),
+        accumulateInvoicePoints({ idFactura: 900 })
+      ]);
+    });
+
+    assert.equal(connectCount, 2, 'deben usarse dos conexiones/transacciones independientes, no la misma');
+
+    const createdCount = results.filter((r) => r.created).length;
+    const alreadyRegisteredCount = results.filter((r) => r.reason === 'ALREADY_REGISTERED').length;
+    assert.equal(createdCount, 1, 'solo una de las dos transacciones debe otorgar puntos');
+    assert.equal(alreadyRegisteredCount, 1, 'la otra debe responder ALREADY_REGISTERED');
+    assert.equal(mockA.state.movimientos.length, 1, 'solo un movimiento');
+    const saldoUpdateCalls = mockA.state.calls.filter((c) => c.sql.includes('UPDATE public.fidelizacion_saldos_cliente')).length;
+    assert.equal(saldoUpdateCalls, 1, 'solo una modificacion de saldo');
+    assert.equal(mockA.state.estadoFacturas.get(900).estado, 'PROCESSED', 'el estado final es PROCESSED');
+
+    // Prueba real de que hubo bloqueo (no solo un resultado correcto por
+    // casualidad de scheduling): quien haya adquirido el lock SEGUNDO solo
+    // pudo hacerlo DESPUES de que el primero hiciera COMMIT (y asi lo
+    // liberara). Si el coordinador no bloqueara de verdad, este orden no
+    // estaria garantizado.
+    const lockEvents = events.filter((e) => e.endsWith(':lock_acquired'));
+    assert.equal(lockEvents.length, 2, `ambas transacciones deben haber adquirido el lock: ${JSON.stringify(events)}`);
+    const firstLocker = lockEvents[0].split(':')[0];
+    const secondLocker = firstLocker === 'A' ? 'B' : 'A';
+    const firstCommitIdx = events.indexOf(`${firstLocker}:commit`);
+    const secondLockIdx = events.indexOf(`${secondLocker}:lock_acquired`);
+    assert.notEqual(firstCommitIdx, -1, `falta el COMMIT del primero: ${JSON.stringify(events)}`);
+    assert.notEqual(secondLockIdx, -1, `falta el lock del segundo: ${JSON.stringify(events)}`);
+    assert.ok(
+      secondLockIdx > firstCommitIdx,
+      `la segunda transaccion debio adquirir el lock DESPUES del COMMIT de la primera. Orden real: ${JSON.stringify(events)}`
+    );
   });
 });

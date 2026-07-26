@@ -35,9 +35,19 @@ describe('buildClienteBaseSql: ya no exige usuario/rol CLIENTE', () => {
 
   it('filtra por perfil: activo, nombre no vacio, telefono de 8 digitos (mismo criterio que normalizePhoneHN)', () => {
     assert.match(sql, /COALESCE\(c\.estado, true\) = true/);
-    assert.match(sql, /TRIM\(COALESCE\(\s*CASE WHEN c\.id_persona IS NOT NULL THEN CONCAT\(p\.nombre, ' ', p\.apellido\) ELSE e\.nombre_empresa END,\s*''\s*\)\) <> ''/);
+    assert.match(sql, /TRIM\(COALESCE\(\s*CASE WHEN c\.id_persona IS NOT NULL THEN p\.nombre ELSE e\.nombre_empresa END,\s*''\s*\)\) <> ''/);
     assert.match(sql, /length\(regexp_replace\(/);
     assert.match(sql, /'\\D', '', 'g'\s*\)\) = 8/);
+  });
+
+  it('bloqueante 2: el filtro de nombre usa exactamente p.nombre, nunca CONCAT con apellido (una persona sin nombre pero con apellido no debe pasar)', () => {
+    assert.doesNotMatch(sql, /CONCAT\(p\.nombre,\s*' ',\s*p\.apellido\)\s*ELSE/, 'el filtro de elegibilidad no debe concatenar apellido');
+    // El apellido si puede seguir usandose para nombre_principal (visual), en otra parte del SELECT.
+    assert.match(sql, /NULLIF\(TRIM\(CONCAT\(COALESCE\(p\.nombre, ''\), ' ', COALESCE\(p\.apellido, ''\)\)\), ''\)/, 'nombre_principal (visual) si puede seguir usando apellido');
+  });
+
+  it('la regla SQL coincide literalmente con isClienteProfileComplete: CASE WHEN id_persona THEN p.nombre ELSE e.nombre_empresa', () => {
+    assert.match(sql, /CASE WHEN c\.id_persona IS NOT NULL THEN p\.nombre ELSE e\.nombre_empresa END/);
   });
 
   it('usa el empresaRelationExpr recibido, no un c.id_empresa hardcodeado de una tercera implementacion', () => {
@@ -66,6 +76,14 @@ describe('elegibilidad del panel (isClienteProfileComplete): mismos casos que la
 
   it('cliente sin nombre -> no elegible (no aparece)', () => {
     assert.equal(isClienteProfileComplete({ estado: true, nombre: '', telefono: '9999-9999' }), false);
+  });
+
+  it('bloqueante 2: persona sin nombre pero CON apellido -> no elegible (fetchClienteProfileForFidelizacion nunca proyecta apellido como "nombre")', () => {
+    // El perfil que arma fetchClienteProfileForFidelizacion resuelve
+    // "nombre" con CASE WHEN id_persona THEN p.nombre (nunca CONCAT con
+    // apellido); un persona con nombre vacio pero apellido lleno llega aqui
+    // con profile.nombre = '' -- el apellido nunca "rescata" la elegibilidad.
+    assert.equal(isClienteProfileComplete({ estado: true, nombre: '', telefono: '9999-9999' }), false, 'apellido lleno pero nombre vacio: sigue sin ser elegible');
   });
 
   it('cliente inactivo -> no elegible (no aparece) aunque tenga nombre y telefono validos', () => {

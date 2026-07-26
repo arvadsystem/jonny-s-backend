@@ -7,9 +7,12 @@ import { createFakeLimitedPool, withTimeout } from './fakeLimitedPool.mjs';
 import { enqueueInvoiceAccumulation, waitForFidelizacionQueueIdle } from '../infrastructure/fidelizacionQueue.js';
 
 const originalQueueMaxSize = process.env.FIDELIZACION_QUEUE_MAX_SIZE;
+const originalGraceMs = process.env.FIDELIZACION_RECONCILE_GRACE_MS;
 afterEach(() => {
   if (originalQueueMaxSize === undefined) delete process.env.FIDELIZACION_QUEUE_MAX_SIZE;
   else process.env.FIDELIZACION_QUEUE_MAX_SIZE = originalQueueMaxSize;
+  if (originalGraceMs === undefined) delete process.env.FIDELIZACION_RECONCILE_GRACE_MS;
+  else process.env.FIDELIZACION_RECONCILE_GRACE_MS = originalGraceMs;
 });
 
 const withMockedFidelizacionPoolConnect = async (connectImpl, run) => {
@@ -36,11 +39,19 @@ const baseContext = (overrides = {}) => ({
 });
 
 describe('reconcileMissingPoints (worker de reconciliacion idempotente, sin inanicion)', () => {
-  it('encuentra facturas pagadas sin movimiento, espera el lote completo y reporta resultados reales', async () => {
+  it('bloqueante 1 (regla 7): RECONCILE con PENDING ya existente (LIVE lo reservo antes) si procesa, espera el lote completo y reporta resultados reales', async () => {
+    // PENDING simula que el camino LIVE ya reservo el estado (justo tras el
+    // COMMIT de la venta) pero algo interrumpio antes de terminar de
+    // evaluar (p.ej. reinicio del proceso) -- por eso RECONCILE si puede
+    // continuarla, a diferencia de una factura sin fila alguna.
     const { client, state } = createFidelizacionMockClient({
       facturaContexts: {
         1001: baseContext({ id_cliente: 5, monto_factura: 100 }),
         1002: baseContext({ id_cliente: 6, monto_factura: 200 })
+      },
+      estadoFacturasIniciales: {
+        1001: { estado: 'PENDING' },
+        1002: { estado: 'PENDING' }
       }
     });
 
@@ -59,6 +70,23 @@ describe('reconcileMissingPoints (worker de reconciliacion idempotente, sin inan
     assert.equal(result.partial, false);
     assert.equal(result.reached_end, false);
     assert.equal(state.movimientos.length, 2, 'no debe reportar exito solo por encolar: el lote ya debe estar procesado al responder');
+    assert.equal(state.estadoFacturas.get(1001).estado, 'PROCESSED');
+    assert.equal(state.estadoFacturas.get(1002).estado, 'PROCESSED');
+  });
+
+  it('bloqueante 1 (regla 8): RECONCILE con RETRYABLE_ERROR ya existente si reintenta', async () => {
+    const { client, state } = createFidelizacionMockClient({
+      facturaContexts: { 1050: baseContext({ id_cliente: 5, monto_factura: 100 }) },
+      estadoFacturasIniciales: { 1050: { estado: 'RETRYABLE_ERROR', intentos: 1, ultimo_error: 'ECONNRESET previo' } }
+    });
+
+    const result = await withMockedFidelizacionPoolConnect(async () => client, () => reconcileMissingPoints({ limit: 25 }));
+
+    assert.deepEqual(result.ids_factura, [1050]);
+    assert.equal(result.processed, 1);
+    assert.equal(state.movimientos.length, 1);
+    assert.equal(state.estadoFacturas.get(1050).estado, 'PROCESSED');
+    assert.equal(state.estadoFacturas.get(1050).intentos, 2, 'el reintento incrementa intentos sobre la fila existente');
   });
 
   it('sin candidatos: reached_end en true, para que el scheduler pueda reiniciar el cursor', async () => {
@@ -84,10 +112,11 @@ describe('reconcileMissingPoints (worker de reconciliacion idempotente, sin inan
     assert.equal(state.movimientos.length, 1);
   });
 
-  it('perfil incompleto: la factura SI se lista (ya no se filtra en silencio) pero queda SKIPPED_TERMINAL/LEGACY_ELIGIBILITY_UNVERIFIABLE, sin movimiento', async () => {
+  it('bloqueante 1 (reglas 4 y 5): RECONCILE sin fila de estado nunca acumula, tenga o no perfil completo el cliente actualmente', async () => {
     const { client, state } = createFidelizacionMockClient({
       clienteProfiles: {
-        5: { estado: true, nombre: '', telefono: '9999-9999' } // sin nombre: perfil incompleto
+        5: { estado: true, nombre: '', telefono: '9999-9999' } // perfil incompleto
+        // id_cliente 6 usa el perfil por defecto (completo/valido).
       },
       facturaContexts: {
         2001: baseContext({ id_cliente: 5, monto_factura: 100 }),
@@ -98,20 +127,20 @@ describe('reconcileMissingPoints (worker de reconciliacion idempotente, sin inan
 
     const result = await withMockedFidelizacionPoolConnect(async () => client, () => reconcileMissingPoints({ limit: 25 }));
 
-    // Bloqueante 3: ya no se filtra en la consulta de listado (eso era la
-    // causa raiz de la acumulacion retroactiva). Las 3 facturas se listan y
-    // se evaluan una sola vez; las de perfil incompleto quedan terminales.
+    // Sin fila de estado previa, RECONCILE nunca evalua perfil/config/puntos
+    // -ni siquiera para 2003, cuyo cliente (6) tiene un perfil actual
+    // perfectamente valido-: las 3 se listan pero NINGUNA acumula.
     assert.equal(result.scanned, 3);
     assert.deepEqual(result.ids_factura, [2001, 2002, 2003]);
-    assert.equal(result.processed, 1, 'solo la factura con perfil completo (2003) genera puntos');
-    assert.equal(result.skipped, 2);
-    assert.equal(state.movimientos.length, 1);
-    assert.equal(state.movimientos[0].id_factura, 2003);
+    assert.equal(result.processed, 0, 'ninguna acumula, ni siquiera la de perfil actual valido (2003)');
+    assert.equal(result.skipped, 3);
+    assert.equal(state.movimientos.length, 0);
 
-    for (const id of [2001, 2002]) {
+    for (const id of [2001, 2002, 2003]) {
       const row = state.estadoFacturas.get(id);
       assert.equal(row.estado, 'SKIPPED_TERMINAL');
-      assert.equal(row.motivo, 'LEGACY_ELIGIBILITY_UNVERIFIABLE', 'reconciliacion (no la venta inmediata) determino esto: se relabela, no queda como CLIENT_PROFILE_INCOMPLETE');
+      assert.equal(row.motivo, 'LEGACY_ELIGIBILITY_UNVERIFIABLE', 'reconciliacion sin fila previa nunca consulta el perfil actual');
+      assert.equal(row.elegibilidad_determinada, false);
     }
   });
 
@@ -168,7 +197,7 @@ describe('reconcileMissingPoints (worker de reconciliacion idempotente, sin inan
     assert.equal(secondBatch.next_cursor, 3003);
   });
 
-  it('factura sin configuracion historica valida: se lista, queda SKIPPED_TERMINAL/CONFIG_NOT_FOUND, y no bloquea a las siguientes', async () => {
+  it('factura sin configuracion historica valida (con PENDING previo): se procesa, queda SKIPPED_TERMINAL/CONFIG_NOT_FOUND, y no bloquea a las siguientes', async () => {
     const { client, state } = createFidelizacionMockClient({
       activeConfigs: [
         { lempiras_por_punto: 10, vigente_desde: '2026-01-01T00:00:00Z', vigente_hasta: null }
@@ -177,6 +206,13 @@ describe('reconcileMissingPoints (worker de reconciliacion idempotente, sin inan
         // Fecha fuera de cualquier ventana de configuracion: nunca sera procesable.
         4001: baseContext({ id_cliente: 5, fecha_referencia_config: '2020-01-01T00:00:00Z' }),
         4002: baseContext({ id_cliente: 5, fecha_referencia_config: '2026-02-01T00:00:00Z' })
+      },
+      // PENDING previo (LIVE ya las reservo): sin esto, RECONCILE no evaluaria
+      // nada -ninguna fila de estado significa terminal inmediato, ver
+      // bloqueante 1 reglas 4/5-.
+      estadoFacturasIniciales: {
+        4001: { estado: 'PENDING' },
+        4002: { estado: 'PENDING' }
       }
     });
 
@@ -194,7 +230,7 @@ describe('reconcileMissingPoints (worker de reconciliacion idempotente, sin inan
     assert.deepEqual(secondTick.ids_factura, []);
   });
 
-  it('sucursal con switch de acumulacion apagado en la fecha de referencia: se lista, queda SKIPPED_TERMINAL/ACCUMULATION_DISABLED', async () => {
+  it('sucursal con switch de acumulacion apagado en la fecha de referencia (con PENDING previo): se procesa, queda SKIPPED_TERMINAL/ACCUMULATION_DISABLED', async () => {
     const { client, state } = createFidelizacionMockClient({
       activeConfigs: [
         { lempiras_por_punto: 10, acumulacion_habilitada: false, vigente_desde: '2026-01-01T00:00:00Z', vigente_hasta: null }
@@ -202,6 +238,10 @@ describe('reconcileMissingPoints (worker de reconciliacion idempotente, sin inan
       facturaContexts: {
         4101: baseContext({ id_cliente: 5, fecha_referencia_config: '2026-02-01T00:00:00Z' }),
         4102: baseContext({ id_cliente: 6, fecha_referencia_config: '2026-02-01T00:00:00Z' })
+      },
+      estadoFacturasIniciales: {
+        4101: { estado: 'PENDING' },
+        4102: { estado: 'PENDING' }
       }
     });
 
@@ -215,14 +255,15 @@ describe('reconcileMissingPoints (worker de reconciliacion idempotente, sin inan
     assert.equal(state.estadoFacturas.get(4102).motivo, 'ACCUMULATION_DISABLED');
   });
 
-  it('configuracion sin tasa valida (lempiras_por_punto <= 0): se lista, queda SKIPPED_TERMINAL/ACCUMULATION_RULE_NOT_CONFIGURED', async () => {
+  it('configuracion sin tasa valida (lempiras_por_punto <= 0, con PENDING previo): se procesa, queda SKIPPED_TERMINAL/ACCUMULATION_RULE_NOT_CONFIGURED', async () => {
     const { client, state } = createFidelizacionMockClient({
       activeConfigs: [
         { lempiras_por_punto: 0, acumulacion_habilitada: true, vigente_desde: '2026-01-01T00:00:00Z', vigente_hasta: null }
       ],
       facturaContexts: {
         4201: baseContext({ id_cliente: 5, fecha_referencia_config: '2026-02-01T00:00:00Z' })
-      }
+      },
+      estadoFacturasIniciales: { 4201: { estado: 'PENDING' } }
     });
 
     const result = await withMockedFidelizacionPoolConnect(async () => client, () => reconcileMissingPoints({ limit: 25 }));
@@ -240,6 +281,14 @@ describe('reconcileMissingPoints (worker de reconciliacion idempotente, sin inan
         5001: baseContext({ id_cliente: 5 }),
         5002: baseContext({ id_cliente: 6 }),
         5003: baseContext({ id_cliente: 7 })
+      },
+      // PENDING previo en las 3: sin fila de estado, RECONCILE nunca llega a
+      // evaluar (y por lo tanto nunca a INSERT INTO fidelizacion_movimientos,
+      // que es donde este test simula el fallo tecnico).
+      estadoFacturasIniciales: {
+        5001: { estado: 'PENDING' },
+        5002: { estado: 'PENDING' },
+        5003: { estado: 'PENDING' }
       }
     });
 
@@ -270,7 +319,14 @@ describe('reconcileMissingPoints (worker de reconciliacion idempotente, sin inan
       6002: baseContext({ id_cliente: 6 }),
       6003: baseContext({ id_cliente: 7 })
     };
-    const { client, state } = createFidelizacionMockClient({ facturaContexts: contexts });
+    const { client, state } = createFidelizacionMockClient({
+      facturaContexts: contexts,
+      estadoFacturasIniciales: {
+        6001: { estado: 'PENDING' },
+        6002: { estado: 'PENDING' },
+        6003: { estado: 'PENDING' }
+      }
+    });
 
     // Solo la factura 6002 (la del medio) falla en este primer intento:
     // la segunda escritura de movimiento que se procese es la suya, dado el
@@ -365,6 +421,10 @@ describe('reconcileMissingPoints (worker de reconciliacion idempotente, sin inan
       facturaContexts: {
         8001: baseContext({ id_cliente: 5 }),
         8002: baseContext({ id_cliente: 6 })
+      },
+      estadoFacturasIniciales: {
+        8001: { estado: 'PENDING' },
+        8002: { estado: 'PENDING' }
       }
     });
     const fakePool = createFakeLimitedPool({ max: 1, backendQuery: backendClient.query });
@@ -386,7 +446,8 @@ describe('reconcileMissingPoints (worker de reconciliacion idempotente, sin inan
 
   it('la conexion de listado se libera ANTES de procesar el lote (orden verificable)', async () => {
     const { client: backendClient, state } = createFidelizacionMockClient({
-      facturaContexts: { 8101: baseContext({ id_cliente: 5 }) }
+      facturaContexts: { 8101: baseContext({ id_cliente: 5 }) },
+      estadoFacturasIniciales: { 8101: { estado: 'PENDING' } }
     });
 
     const timeline = [];
@@ -414,5 +475,57 @@ describe('reconcileMissingPoints (worker de reconciliacion idempotente, sin inan
       ['release', 'accumulate_begin', 'release'],
       'la conexion de listado debe liberarse antes de que la acumulacion pida/abra su propia conexion'
     );
+  });
+
+  it('bloqueante 1 (regla 9): RECONCILE no procesa facturas pagadas dentro del periodo de gracia', async () => {
+    process.env.FIDELIZACION_RECONCILE_GRACE_MS = '300000';
+    const recienPagada = new Date(Date.now() - 60000).toISOString(); // pagada hace 1 minuto: dentro de la gracia de 5 minutos.
+    const { client, state } = createFidelizacionMockClient({
+      facturaContexts: {
+        9001: baseContext({ id_cliente: 5, fecha_referencia_config: recienPagada })
+      }
+    });
+
+    const result = await withMockedFidelizacionPoolConnect(async () => client, () => reconcileMissingPoints({ limit: 25 }));
+
+    assert.deepEqual(result.ids_factura, [], 'una factura pagada hace 1 minuto no debe listarse con gracia de 5 minutos');
+    assert.equal(result.scanned, 0);
+    assert.equal(state.movimientos.length, 0);
+    assert.equal(state.estadoFacturas.has(9001), false, 'ni siquiera queda una fila de estado: nunca se evaluo');
+  });
+
+  it('bloqueante 1 (regla 10): despues del periodo de gracia, una factura sin fila de estado queda terminal (no vuelve a intentarse via perfil actual)', async () => {
+    process.env.FIDELIZACION_RECONCILE_GRACE_MS = '300000';
+    const pagadaHaceOchoMinutos = new Date(Date.now() - 8 * 60000).toISOString();
+    const { client, state } = createFidelizacionMockClient({
+      facturaContexts: {
+        9002: baseContext({ id_cliente: 5, fecha_referencia_config: pagadaHaceOchoMinutos })
+      }
+    });
+
+    const result = await withMockedFidelizacionPoolConnect(async () => client, () => reconcileMissingPoints({ limit: 25 }));
+
+    assert.deepEqual(result.ids_factura, [9002], 'ya paso el periodo de gracia: si se lista');
+    assert.equal(result.processed, 0);
+    assert.equal(state.movimientos.length, 0);
+    assert.equal(state.estadoFacturas.get(9002).estado, 'SKIPPED_TERMINAL');
+    assert.equal(state.estadoFacturas.get(9002).motivo, 'LEGACY_ELIGIBILITY_UNVERIFIABLE');
+
+    // Un tick posterior (con el perfil del cliente ya completo, si aplicara) no la reabre.
+    const secondTick = await withMockedFidelizacionPoolConnect(async () => client, () => reconcileMissingPoints({ limit: 25 }));
+    assert.deepEqual(secondTick.ids_factura, []);
+  });
+
+  it('bloqueante 1: el valor de FIDELIZACION_RECONCILE_GRACE_MS invalido cae al default seguro (300000 ms) en vez de desactivar la gracia', async () => {
+    process.env.FIDELIZACION_RECONCILE_GRACE_MS = 'no-es-un-numero';
+    const recienPagada = new Date(Date.now() - 60000).toISOString();
+    const { client, state } = createFidelizacionMockClient({
+      facturaContexts: { 9003: baseContext({ id_cliente: 5, fecha_referencia_config: recienPagada }) }
+    });
+
+    const result = await withMockedFidelizacionPoolConnect(async () => client, () => reconcileMissingPoints({ limit: 25 }));
+
+    assert.deepEqual(result.ids_factura, [], 'un valor invalido de env debe caer al default (300000ms), no a 0 (sin gracia)');
+    assert.equal(state.movimientos.length, 0);
   });
 });
