@@ -123,24 +123,51 @@ export const fidelizacionReconciliationTick = async () => {
   schedulerState.runningPromise = Promise.resolve()
     .then(() => dependencies.reconcileMissingPoints({ cursor: schedulerState.cursor, limit: getBatchLimit() }))
     .then((result) => {
-      schedulerState.successfulTicks += 1;
-      schedulerState.lastTickSucceededAt = isoNow();
-      schedulerState.lastError = null;
+      // success/partial son los que decide reconcileMissingPoints (failed=0
+      // y rejected=0 => success). result?.success !== false conserva
+      // compatibilidad con resultados sin ese campo (se asume exito).
+      const isSuccess = result?.success !== false;
+      const isPartial = Boolean(result?.partial);
+
+      if (isSuccess && !isPartial) {
+        schedulerState.successfulTicks += 1;
+        schedulerState.lastTickSucceededAt = isoNow();
+        schedulerState.lastError = null;
+      } else {
+        // Un lote parcial (algo fallo o fue rechazado) NUNCA cuenta como
+        // tick exitoso, aunque el propio tick no haya lanzado una excepcion:
+        // ocultar eso seria reportar exito con datos incompletos.
+        schedulerState.failedTicks += 1;
+        schedulerState.lastTickFailedAt = isoNow();
+        schedulerState.lastError = { code: 'FIDELIZACION_RECONCILE_PARTIAL_BATCH' };
+      }
       schedulerState.lastResult = result;
-      if (Number.isFinite(result?.next_cursor)) {
-        // Si no hubo candidatos, next_cursor vuelve igual al cursor enviado:
-        // el proximo tick reintenta desde el mismo punto (no hay progreso que perder).
+
+      if (result?.reached_end) {
+        // No quedar apuntando permanentemente al final del historico.
+        schedulerState.cursor = 0;
+      } else if (isPartial) {
+        if (Number.isFinite(result?.retry_cursor)) {
+          // No avanzar mas alla de la primera factura fallida/rechazada.
+          schedulerState.cursor = result.retry_cursor;
+        }
+      } else if (Number.isFinite(result?.next_cursor)) {
         schedulerState.cursor = result.next_cursor;
       }
+
       dependencies.log('[fidelizacion_reconcile_scheduler] tick completed', {
+        success: isSuccess && !isPartial,
+        partial: isPartial,
         scanned: result?.scanned ?? 0,
         queued: result?.queued ?? 0,
         processed: result?.processed ?? 0,
         skipped: result?.skipped ?? 0,
         failed: result?.failed ?? 0,
-        next_cursor: result?.next_cursor ?? schedulerState.cursor
+        rejected: result?.rejected ?? 0,
+        reached_end: Boolean(result?.reached_end),
+        cursor: schedulerState.cursor
       });
-      return { skipped: false, success: true, result };
+      return { skipped: false, success: isSuccess && !isPartial, result };
     })
     .catch((error) => {
       schedulerState.failedTicks += 1;

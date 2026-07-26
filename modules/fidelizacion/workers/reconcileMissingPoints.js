@@ -13,6 +13,16 @@ const releaseClientSafely = (client) => {
   }
 };
 
+// Clasifica un resultado de la cola como fallo real (algo se rompio o la cola
+// lo rechazo) frente a un skip legitimo de negocio (ya acumulada, cliente no
+// elegible, sin configuracion, pago incompleto, puntos en cero). Un fallo
+// real es lo unico que detiene el avance del cursor.
+const isRealFailure = (outcome) => (
+  outcome.status === 'failed'
+  || outcome.status === 'rejected'
+  || (outcome.status === 'processed' && outcome.result?.reason === 'ERROR')
+);
+
 // Reconciliacion idempotente: busca (via paginacion keyset) facturas ya
 // pagadas por completo que todavia no tienen movimiento de acumulacion -por
 // ejemplo si el proceso se reinicio entre el 201 de Ventas y el fin de
@@ -21,59 +31,86 @@ const releaseClientSafely = (client) => {
 // maxima de 1: nunca corren en paralelo notificaciones inmediatas y
 // reconciliacion para la misma factura).
 //
+// IMPORTANTE (pool max: 1): la conexion usada para LISTAR candidatos se
+// libera antes de encolar el lote. Cada acumulacion pide su propia conexion
+// al mismo pool dedicado (max: 1); si la conexion de listado siguiera
+// retenida mientras se espera el lote, la primera acumulacion se quedaria
+// esperando para siempre una conexion que nunca se libera (deadlock).
+//
 // Espera el resultado real de todo el lote antes de responder: no reporta
 // exito solo porque las facturas fueron encoladas. Un error al listar
 // candidatos (por ejemplo, la conexion cae) se propaga: el scheduler debe
 // verlo como tick fallido, no como reconciliacion exitosa sin candidatos.
 export const reconcileMissingPoints = async ({ cursor = 0, limit = 25 } = {}) => {
   let client = null;
+  let listing;
   try {
     client = await connectClient();
-    const { ids, nextCursor } = await listPaidInvoicesMissingAccumulation(client, { cursor, limit });
+    listing = await listPaidInvoicesMissingAccumulation(client, { cursor, limit });
+  } finally {
+    releaseClientSafely(client);
+  }
 
-    const outcomes = await enqueueInvoiceAccumulationBatch(
-      ids.map((idFactura) => ({ idFactura })),
-      accumulateInvoicePoints
-    );
+  const { ids, nextCursor } = listing;
 
-    let processed = 0;
-    let skipped = 0;
-    let failed = 0;
+  const outcomes = await enqueueInvoiceAccumulationBatch(
+    ids.map((idFactura) => ({ idFactura })),
+    accumulateInvoicePoints
+  );
 
-    outcomes.forEach((outcome, index) => {
-      // accumulateInvoicePoints nunca lanza: un fallo inesperado (DB caida a
-      // mitad de camino, etc.) llega aqui como resultado normal con
-      // reason: 'ERROR', no como promesa rechazada. Se clasifica como fallo
-      // real, distinto de un skip legitimo (ya acumulada, cliente no
-      // elegible, sin configuracion, pago incompleto, puntos en cero).
-      if (outcome.status === 'processed' && outcome.result?.reason !== 'ERROR') {
-        if (outcome.result?.created) {
-          processed += 1;
-        } else {
-          skipped += 1;
-        }
-        return;
+  let processed = 0;
+  let skipped = 0;
+  let failed = 0;
+  let rejected = 0;
+  let firstFailureIndex = -1;
+
+  outcomes.forEach((outcome, index) => {
+    if (isRealFailure(outcome)) {
+      if (outcome.status === 'rejected') {
+        rejected += 1;
+      } else {
+        failed += 1;
       }
-
-      failed += 1;
+      if (firstFailureIndex === -1) firstFailureIndex = index;
       console.error('[fidelizacion:reconcile] fallo individual en el lote:', {
         id_factura: ids[index],
         status: outcome.status,
         code: outcome.error?.code || outcome.error?.name || outcome.reason || outcome.result?.reason || 'FIDELIZACION_RECONCILE_ITEM_ERROR'
       });
-    });
+      return;
+    }
 
-    return {
-      implemented: true,
-      scanned: ids.length,
-      queued: ids.length,
-      processed,
-      skipped,
-      failed,
-      next_cursor: nextCursor,
-      ids_factura: ids
-    };
-  } finally {
-    releaseClientSafely(client);
-  }
+    if (outcome.result?.created) {
+      processed += 1;
+    } else {
+      skipped += 1;
+    }
+  });
+
+  const success = failed === 0 && rejected === 0;
+
+  // No avanzar mas alla de la primera factura fallida/rechazada: el
+  // siguiente tick debe poder volver a intentarla (y a todo lo que venia
+  // despues en este mismo lote). Lo que ya tenga movimiento para entonces
+  // queda excluido de forma natural por el NOT EXISTS del listado, asi que
+  // reintentar el resto del lote no duplica nada.
+  const retryCursor = success || firstFailureIndex === -1
+    ? null
+    : Math.max(0, ids[firstFailureIndex] - 1);
+
+  return {
+    implemented: true,
+    scanned: ids.length,
+    queued: ids.length,
+    processed,
+    skipped,
+    failed,
+    rejected,
+    next_cursor: nextCursor,
+    retry_cursor: retryCursor,
+    success,
+    partial: !success,
+    reached_end: ids.length === 0,
+    ids_factura: ids
+  };
 };

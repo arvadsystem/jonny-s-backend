@@ -1,8 +1,16 @@
 import assert from 'node:assert/strict';
-import { describe, it } from 'node:test';
+import { afterEach, describe, it } from 'node:test';
 import { fidelizacionPool } from '../infrastructure/fidelizacionPool.js';
 import { reconcileMissingPoints } from '../workers/reconcileMissingPoints.js';
 import { createFidelizacionMockClient } from './fidelizacionMockClient.mjs';
+import { createFakeLimitedPool, withTimeout } from './fakeLimitedPool.mjs';
+import { enqueueInvoiceAccumulation, waitForFidelizacionQueueIdle } from '../infrastructure/fidelizacionQueue.js';
+
+const originalQueueMaxSize = process.env.FIDELIZACION_QUEUE_MAX_SIZE;
+afterEach(() => {
+  if (originalQueueMaxSize === undefined) delete process.env.FIDELIZACION_QUEUE_MAX_SIZE;
+  else process.env.FIDELIZACION_QUEUE_MAX_SIZE = originalQueueMaxSize;
+});
 
 const withMockedFidelizacionPoolConnect = async (connectImpl, run) => {
   const originalConnect = fidelizacionPool.connect;
@@ -44,8 +52,24 @@ describe('reconcileMissingPoints (worker de reconciliacion idempotente, sin inan
     assert.equal(result.processed, 2);
     assert.equal(result.skipped, 0);
     assert.equal(result.failed, 0);
+    assert.equal(result.rejected, 0);
     assert.equal(result.next_cursor, 1002);
+    assert.equal(result.retry_cursor, null);
+    assert.equal(result.success, true);
+    assert.equal(result.partial, false);
+    assert.equal(result.reached_end, false);
     assert.equal(state.movimientos.length, 2, 'no debe reportar exito solo por encolar: el lote ya debe estar procesado al responder');
+  });
+
+  it('sin candidatos: reached_end en true, para que el scheduler pueda reiniciar el cursor', async () => {
+    const { client } = createFidelizacionMockClient({ facturaContexts: {} });
+
+    const result = await withMockedFidelizacionPoolConnect(async () => client, () => reconcileMissingPoints({ cursor: 999999, limit: 25 }));
+
+    assert.equal(result.scanned, 0);
+    assert.equal(result.success, true);
+    assert.equal(result.reached_end, true);
+    assert.equal(result.retry_cursor, null);
   });
 
   it('es idempotente: si ya tiene movimiento, no vuelve a listarla ni a duplicar', async () => {
@@ -149,6 +173,76 @@ describe('reconcileMissingPoints (worker de reconciliacion idempotente, sin inan
     assert.equal(result.processed, 2);
     assert.equal(result.failed, 1);
     assert.equal(state.movimientos.length, 2);
+    assert.equal(result.success, false);
+    assert.equal(result.partial, true);
+  });
+
+  it('factura fallida temporalmente: retry_cursor no avanza mas alla de la primera fallida, y el siguiente tick la reintenta', async () => {
+    const contexts = {
+      6001: baseContext({ id_cliente: 5 }),
+      6002: baseContext({ id_cliente: 6 }),
+      6003: baseContext({ id_cliente: 7 })
+    };
+    const { client, state } = createFidelizacionMockClient({ facturaContexts: contexts });
+
+    // Solo la factura 6002 (la del medio) falla en este primer intento:
+    // la segunda escritura de movimiento que se procese es la suya, dado el
+    // orden ascendente del lote (6001, 6002, 6003).
+    let insertAttempt = 0;
+    const originalInsertQuery = client.query.bind(client);
+    client.query = async (sql, params) => {
+      if (String(sql).includes('INSERT INTO public.fidelizacion_movimientos')) {
+        insertAttempt += 1;
+        if (insertAttempt === 2) throw new Error('SIMULATED_TEMP_FAILURE_6002');
+      }
+      return originalInsertQuery(sql, params);
+    };
+
+    const firstAttempt = await withMockedFidelizacionPoolConnect(async () => client, () => reconcileMissingPoints({ cursor: 0, limit: 25 }));
+
+    assert.equal(firstAttempt.success, false);
+    assert.equal(firstAttempt.partial, true);
+    assert.equal(firstAttempt.failed, 1);
+    assert.equal(firstAttempt.retry_cursor, 6001, 'no debe avanzar mas alla de la factura anterior a la fallida (6002 - 1)');
+    assert.equal(state.movimientos.some((m) => m.id_factura === 6002), false, 'la fallida no debe quedar con movimiento');
+    assert.equal(state.movimientos.some((m) => m.id_factura === 6001), true, 'la exitosa antes de la fallida si se procesa');
+
+    // Siguiente tick: retoma desde retry_cursor. Ya sin la falla simulada.
+    client.query = originalInsertQuery;
+    const secondAttempt = await withMockedFidelizacionPoolConnect(async () => client, () => reconcileMissingPoints({ cursor: firstAttempt.retry_cursor, limit: 25 }));
+
+    // 6003 ya acumulo con exito en el primer intento (no fue la que fallo);
+    // queda excluida por idempotencia. Solo 6002 vuelve a aparecer.
+    assert.deepEqual(secondAttempt.ids_factura, [6002], '6001 y 6003 ya tienen movimiento; solo 6002 se reintenta');
+    assert.equal(secondAttempt.success, true);
+    assert.equal(state.movimientos.some((m) => m.id_factura === 6002), true, 'el reintento si logra acumular la factura que antes fallo');
+    assert.equal(state.movimientos.length, 3);
+  });
+
+  it('factura rechazada por cola llena: no se abandona, tambien genera retry_cursor', async () => {
+    process.env.FIDELIZACION_QUEUE_MAX_SIZE = '1';
+    const { client, state } = createFidelizacionMockClient({
+      facturaContexts: { 7001: baseContext({ id_cliente: 5 }) }
+    });
+
+    const shortWait = () => new Promise((resolve) => setTimeout(resolve, 5));
+
+    // Ocupa la unica conexion "en proceso" (occupantA) y llena el unico
+    // lugar de espera de la cola (occupantB, max=1), para que la factura de
+    // la reconciliacion llegue como excedente y sea rechazada de inmediato.
+    const occupantA = enqueueInvoiceAccumulation({ idFactura: 9999 }, async () => { await shortWait(); return { created: false }; });
+    const occupantB = enqueueInvoiceAccumulation({ idFactura: 9998 }, async () => { await shortWait(); return { created: false }; });
+
+    const result = await withMockedFidelizacionPoolConnect(async () => client, () => reconcileMissingPoints({ limit: 25 }));
+
+    assert.equal(result.rejected, 1);
+    assert.equal(result.success, false);
+    assert.equal(result.partial, true);
+    assert.equal(result.retry_cursor, 7000, 'debe permitir reintentar la factura rechazada, no saltarsela');
+    assert.equal(state.movimientos.length, 0);
+
+    await Promise.all([occupantA, occupantB]);
+    await waitForFidelizacionQueueIdle();
   });
 
   it('un error real al listar candidatos se propaga (tick fallido, no exito silencioso)', async () => {
@@ -177,5 +271,61 @@ describe('reconcileMissingPoints (worker de reconciliacion idempotente, sin inan
     );
 
     assert.equal(state.releaseCallCount, 1);
+  });
+
+  it('pool max:1 REAL: reconciliar con candidatos no genera deadlock', async () => {
+    const { client: backendClient, state } = createFidelizacionMockClient({
+      facturaContexts: {
+        8001: baseContext({ id_cliente: 5 }),
+        8002: baseContext({ id_cliente: 6 })
+      }
+    });
+    const fakePool = createFakeLimitedPool({ max: 1, backendQuery: backendClient.query });
+
+    const result = await withMockedFidelizacionPoolConnect(
+      () => fakePool.connect(),
+      () => withTimeout(
+        reconcileMissingPoints({ limit: 25 }),
+        500,
+        'DEADLOCK_TIMEOUT: la conexion de listado sigue retenida mientras se procesa el lote'
+      )
+    );
+
+    assert.equal(result.processed, 2);
+    assert.equal(state.movimientos.length, 2);
+    assert.equal(fakePool.getInUse(), 0, 'no debe quedar ninguna conexion retenida al terminar');
+    assert.equal(fakePool.getWaitingCount(), 0);
+  });
+
+  it('la conexion de listado se libera ANTES de procesar el lote (orden verificable)', async () => {
+    const { client: backendClient, state } = createFidelizacionMockClient({
+      facturaContexts: { 8101: baseContext({ id_cliente: 5 }) }
+    });
+
+    const timeline = [];
+    const fakePool = createFakeLimitedPool({
+      max: 1,
+      backendQuery: (sql, params) => {
+        if (String(sql).trim() === 'BEGIN') timeline.push('accumulate_begin');
+        return backendClient.query(sql, params);
+      },
+      onRelease: () => timeline.push('release')
+    });
+
+    await withMockedFidelizacionPoolConnect(
+      () => fakePool.connect(),
+      () => withTimeout(reconcileMissingPoints({ limit: 25 }), 500, 'DEADLOCK_TIMEOUT')
+    );
+
+    assert.equal(state.movimientos.length, 1);
+    // 'release' (conexion de listado) -> 'accumulate_begin' (la acumulacion
+    // ya pudo abrir SU PROPIA conexion) -> 'release' (la acumulacion libera
+    // la suya al terminar). Si la conexion de listado no se liberara antes,
+    // 'accumulate_begin' nunca aparecería (deadlock).
+    assert.deepEqual(
+      timeline,
+      ['release', 'accumulate_begin', 'release'],
+      'la conexion de listado debe liberarse antes de que la acumulacion pida/abra su propia conexion'
+    );
   });
 });

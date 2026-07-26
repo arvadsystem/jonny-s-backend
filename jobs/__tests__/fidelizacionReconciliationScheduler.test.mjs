@@ -138,6 +138,89 @@ describe('fidelizacion reconciliation scheduler runtime', () => {
     assert.equal(state.last_error_code, 'RECONCILE_BOOM');
   });
 
+  it('lote completamente exitoso: avanza el cursor a next_cursor', async () => {
+    configureFidelizacionReconciliationSchedulerForTests({
+      reconcileMissingPoints: async () => ({
+        implemented: true, scanned: 2, queued: 2, processed: 2, skipped: 0,
+        failed: 0, rejected: 0, next_cursor: 42, retry_cursor: null,
+        success: true, partial: false, reached_end: false, ids_factura: [40, 42]
+      })
+    });
+
+    await startFidelizacionReconciliationScheduler();
+
+    assert.equal(getFidelizacionReconciliationSchedulerState().cursor, 42);
+    assert.equal(getFidelizacionReconciliationSchedulerState().successful_ticks, 1);
+    assert.equal(getFidelizacionReconciliationSchedulerState().failed_ticks, 0);
+  });
+
+  it('lote parcial (failed/rejected > 0): incrementa failed_ticks, NO successful_ticks, y usa retry_cursor', async () => {
+    configureFidelizacionReconciliationSchedulerForTests({
+      reconcileMissingPoints: async () => ({
+        implemented: true, scanned: 3, queued: 3, processed: 1, skipped: 0,
+        failed: 1, rejected: 0, next_cursor: 103, retry_cursor: 100,
+        success: false, partial: true, reached_end: false, ids_factura: [101, 102, 103]
+      })
+    });
+
+    await startFidelizacionReconciliationScheduler();
+    const state = getFidelizacionReconciliationSchedulerState();
+
+    assert.equal(state.successful_ticks, 0, 'un lote parcial no debe contar como tick exitoso');
+    assert.equal(state.failed_ticks, 1, 'un lote parcial debe contar como tick fallido');
+    assert.equal(state.cursor, 100, 'debe usar retry_cursor, no next_cursor, para no saltarse la fallida');
+    assert.equal(state.last_error_code, 'FIDELIZACION_RECONCILE_PARTIAL_BATCH');
+  });
+
+  it('reached_end: reinicia el cursor a 0 para el siguiente ciclo', async () => {
+    configureFidelizacionReconciliationSchedulerForTests({
+      reconcileMissingPoints: async () => ({
+        implemented: true, scanned: 0, queued: 0, processed: 0, skipped: 0,
+        failed: 0, rejected: 0, next_cursor: 500, retry_cursor: null,
+        success: true, partial: false, reached_end: true, ids_factura: []
+      })
+    });
+
+    await startFidelizacionReconciliationScheduler();
+
+    assert.equal(getFidelizacionReconciliationSchedulerState().cursor, 0);
+    assert.equal(getFidelizacionReconciliationSchedulerState().successful_ticks, 1);
+  });
+
+  it('el scheduler sigue funcionando despues de un tick parcial: el siguiente tick corre normalmente', async () => {
+    const timers = createTimerHarness();
+    let call = 0;
+    configureFidelizacionReconciliationSchedulerForTests({
+      setInterval: timers.setInterval,
+      clearInterval: timers.clearInterval,
+      reconcileMissingPoints: async () => {
+        call += 1;
+        if (call === 1) {
+          return {
+            implemented: true, scanned: 1, queued: 1, processed: 0, skipped: 0,
+            failed: 1, rejected: 0, next_cursor: 10, retry_cursor: 9,
+            success: false, partial: true, reached_end: false, ids_factura: [10]
+          };
+        }
+        return {
+          implemented: true, scanned: 1, queued: 1, processed: 1, skipped: 0,
+          failed: 0, rejected: 0, next_cursor: 10, retry_cursor: null,
+          success: true, partial: false, reached_end: false, ids_factura: [10]
+        };
+      }
+    });
+
+    await startFidelizacionReconciliationScheduler();
+    assert.equal(getFidelizacionReconciliationSchedulerState().failed_ticks, 1);
+    assert.equal(getFidelizacionReconciliationSchedulerState().started, true, 'el scheduler debe seguir activo tras un tick parcial');
+
+    await fidelizacionReconciliationTick();
+    const state = getFidelizacionReconciliationSchedulerState();
+    assert.equal(state.successful_ticks, 1);
+    assert.equal(state.failed_ticks, 1);
+    assert.equal(state.cursor, 10);
+  });
+
   it('detiene el scheduler, limpia el intervalo y espera el tick en curso', async () => {
     const timers = createTimerHarness();
     let tickStarted = false;
