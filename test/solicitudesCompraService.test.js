@@ -3,7 +3,9 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import {
   createSolicitudesCompraService,
-  parseQuantity
+  normalizeSolicitudSearch,
+  parseQuantity,
+  resolveOperativeWarehouseId
 } from '../services/solicitudesCompraService.js';
 
 const operativeAccess = async () => ({
@@ -73,6 +75,7 @@ const baseOverrides = (db, extra = {}) => ({
   resolveScope: operativeScope,
   resolveMaster: async (type, id) => resolvedMaster(type, id),
   getAssignment: async (type, id, warehouseId) => activeAssignment(type, id, warehouseId),
+  resolveOperativeWarehouse: async () => 11,
   ...extra
 });
 
@@ -490,6 +493,63 @@ test('administrador puede filtrar listado por sucursal sin datos financieros', a
   assert.match(captured.sql, /sc\.id_sucursal = \$1/);
   assert.doesNotMatch(captured.sql, /precio|costo|total_monetario/i);
   assert.equal(captured.params[0], 8);
+});
+
+test('buscar normaliza espacios y rechaza mas de 120 caracteres', () => {
+  assert.equal(normalizeSolicitudSearch('  Bandeja   grande  '), 'Bandeja grande');
+  assert.equal(normalizeSolicitudSearch('   '), null);
+  assert.throws(() => normalizeSolicitudSearch('x'.repeat(121)), (error) => error.status === 400);
+});
+
+test('listado aplica busqueda textual parametrizada con EXISTS antes de paginar', async () => {
+  let captured;
+  const db = makeReadDb(async (sql, params) => {
+    captured = { sql, params };
+    return { rows: [], rowCount: 0 };
+  });
+  const service = createSolicitudesCompraService(baseOverrides(db, { readAccess: adminAccess }));
+  await service.list({ query: { buscar: '  BANDEJA   grande ', estado: 'PENDIENTE', page: 2, limit: 10 } });
+  assert.match(captured.sql, /EXISTS\s*\([\s\S]*FROM public\.solicitudes_compra_detalle sd/);
+  assert.match(captured.sql, /sp\.nombre_producto/);
+  assert.match(captured.sql, /si\.nombre_insumo/);
+  assert.match(captured.sql, /sd\.nombre_presentacion_snapshot/);
+  assert.ok(captured.sql.indexOf('COUNT(*) OVER()') < captured.sql.indexOf('LIMIT'));
+  assert.deepEqual(captured.params, ['PENDIENTE', 'BANDEJA grande', 10, 10]);
+  assert.doesNotMatch(captured.sql, /BANDEJA grande/);
+});
+
+test('buscar numerico usa coincidencia exacta y no parcial', async () => {
+  let captured;
+  const db = makeReadDb(async (sql, params) => {
+    captured = { sql, params };
+    return { rows: [], rowCount: 0 };
+  });
+  const service = createSolicitudesCompraService(baseOverrides(db, { readAccess: adminAccess }));
+  await service.list({ query: { buscar: '42' } });
+  assert.match(captured.sql, /sc\.id_solicitud_compra::text = \$1/);
+  assert.doesNotMatch(captured.sql, /id_solicitud_compra::text ILIKE/);
+  assert.equal(captured.params[0], '42');
+});
+
+test('operativo filtra listado por sucursal y almacen resuelto', async () => {
+  let captured;
+  const db = makeReadDb(async (sql, params) => {
+    captured = { sql, params };
+    return { rows: [], rowCount: 0 };
+  });
+  const service = createSolicitudesCompraService(baseOverrides(db, { resolveOperativeWarehouse: async () => 11 }));
+  await service.list({ query: {} });
+  assert.match(captured.sql, /sc\.id_sucursal = \$1/);
+  assert.match(captured.sql, /sc\.id_almacen = \$2/);
+  assert.deepEqual(captured.params.slice(0, 2), [3, 11]);
+});
+
+test('resolver de almacen operativo controla cero y multiples almacenes', async () => {
+  await assert.rejects(resolveOperativeWarehouseId(makeReadDb(async () => ({ rows: [], rowCount: 0 })), 3),
+    (error) => error.status === 403 && error.code === 'FORBIDDEN');
+  await assert.rejects(resolveOperativeWarehouseId(makeReadDb(async () => ({ rows: [{ id_almacen: 1 }, { id_almacen: 2 }], rowCount: 2 })), 3),
+    (error) => error.status === 409 && error.code === 'SCOPE_AMBIGUOUS');
+  assert.equal(await resolveOperativeWarehouseId(makeReadDb(async () => ({ rows: [{ id_almacen: 7 }], rowCount: 1 })), 3), 7);
 });
 
 test('router nuevo conserva montados los endpoints base y su orden seguro', async () => {

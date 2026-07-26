@@ -82,6 +82,7 @@ const fixture = (options = {}) => {
     resolveScope: async () => ({ userSucursalId: options.userSucursalId ?? 3, allowedSucursalIds: options.allowedSucursalIds ?? [options.userSucursalId ?? 3] }),
     resolveMaster: async (type, id) => options.masterInvalid ? ({ ok: false }) : ({ ok: true, masterId: id, master: { estado_global: true, tipo: type } }),
     getAssignment: async () => ({ activo: !options.assignmentInactive }),
+    resolveOperativeWarehouse: async () => Number(options.operativeWarehouseId ?? 4),
     now: () => 1721563200000,
     uuid: () => '123e4567-e89b-12d3-a456-426614174000'
   });
@@ -110,9 +111,9 @@ test('rol no permitido responde 403', async () => {
   assert.equal((await codeOf(fixture({ role: 'MESERO' }).service.receive(req()))).status, 403);
 });
 
-test('administrador queda limitado a su alcance administrativo actual', async () => {
+test('administrador conserva alcance global aunque su resolver reporte otra sucursal', async () => {
   const f = fixture({ role: 'ADMIN', userSucursalId: 2, allowedSucursalIds: [2] });
-  assert.equal((await codeOf(f.service.receive(req()))).status, 403);
+  assert.equal((await f.service.receive(req())).ok, true);
 });
 
 test('solicitud inexistente responde 404', async () => {

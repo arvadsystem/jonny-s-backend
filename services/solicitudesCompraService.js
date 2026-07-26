@@ -10,6 +10,7 @@ const DEFAULT_LIMIT = 20;
 const MAX_LIMIT = 100;
 const MAX_LINES = 100;
 const MAX_OBSERVATION_LENGTH = 1000;
+const MAX_SEARCH_LENGTH = 120;
 const MAX_QUANTITY_SCALED = 9_999_999_999_999n;
 const VALID_STATES = new Set(['PENDIENTE', 'APROBADA', 'RECHAZADA', 'RECIBIDA', 'CANCELADA']);
 const ADMIN_ROLES = new Set(['SUPER_ADMIN', 'ADMIN', 'ADMINISTRADOR']);
@@ -101,6 +102,27 @@ const normalizeObservation = (value) => {
   return normalized || null;
 };
 
+export const normalizeSolicitudSearch = (value) => {
+  if (!hasValue(value)) return null;
+  const normalized = String(value).replace(/\s+/g, ' ').trim();
+  if (normalized.length > MAX_SEARCH_LENGTH) {
+    fail(400, 'VALIDATION_ERROR', `buscar no puede exceder ${MAX_SEARCH_LENGTH} caracteres.`);
+  }
+  return normalized || null;
+};
+
+export const resolveOperativeWarehouseId = async (queryRunner, userSucursalId) => {
+  const result = await queryRunner.query(
+    `SELECT a.id_almacen FROM public.almacenes a
+     WHERE a.id_sucursal = $1 AND COALESCE(a.estado, true) = true
+     ORDER BY a.id_almacen LIMIT 2`,
+    [userSucursalId]
+  );
+  if (result.rowCount === 0) fail(403, 'FORBIDDEN', 'La sucursal no tiene un almacén operativo disponible.');
+  if (result.rowCount > 1) fail(409, 'SCOPE_AMBIGUOUS', 'La sucursal requiere una asignación explícita de almacén.');
+  return Number(result.rows[0].id_almacen);
+};
+
 const validateRequestShape = (body) => {
   if (!Array.isArray(body.detalles) || body.detalles.length === 0) {
     fail(400, 'VALIDATION_ERROR', 'Debe incluir al menos una linea.');
@@ -149,12 +171,14 @@ const normalizeAccess = async (req, queryRunner, dependencies) => {
   if (!access.idUsuario) fail(401, 'UNAUTHORIZED', 'No autorizado.');
   if (!isAdmin && !isOperative) fail(403, 'FORBIDDEN', 'El rol del usuario no puede operar solicitudes de compra.');
   if (isOperative && !scope.userSucursalId) fail(403, 'FORBIDDEN', 'El usuario no tiene una sucursal operativa asignada.');
+  const operativeWarehouseId = isOperative ? await dependencies.resolveOperativeWarehouse(queryRunner, scope.userSucursalId) : null;
 
   return {
     idUsuario: access.idUsuario,
     isAdmin,
     isOperative,
     userSucursalId: scope.userSucursalId || null,
+    operativeWarehouseId,
     allowedSucursalIds: isOperative ? [scope.userSucursalId] : null
   };
 };
@@ -174,7 +198,7 @@ const getWarehouse = async (warehouseId, access, queryRunner) => {
   const warehouse = result.rows?.[0];
   if (!warehouse) fail(404, 'NOT_FOUND', 'Almacen no encontrado.');
   if (!warehouse.estado) fail(409, 'CONFLICT', 'El almacen esta inactivo.');
-  if (access.isOperative && Number(warehouse.id_sucursal) !== access.userSucursalId) {
+  if (access.isOperative && (Number(warehouse.id_sucursal) !== access.userSucursalId || Number(warehouse.id_almacen) !== access.operativeWarehouseId)) {
     fail(403, 'FORBIDDEN', 'No tiene acceso al almacen solicitado.');
   }
   return {
@@ -193,8 +217,8 @@ const resolveCatalogWarehouse = async (rawWarehouseId, access, queryRunner) => {
   const params = [];
   let scopeSql = '';
   if (access.isOperative) {
-    params.push(access.userSucursalId);
-    scopeSql = ` AND a.id_sucursal = $${params.length}`;
+    params.push(access.operativeWarehouseId);
+    scopeSql = ` AND a.id_almacen = $${params.length}`;
   }
   const result = await queryRunner.query(
     `
@@ -412,7 +436,8 @@ export const createSolicitudesCompraService = (overrides = {}) => {
     readAccess: overrides.readAccess || readRequestAccess,
     resolveScope: overrides.resolveScope || resolveRequestUserSucursalScope,
     resolveMaster: overrides.resolveMaster || resolveCatalogoMaestroEntity,
-    getAssignment: overrides.getAssignment || getWarehouseAssignmentDetails
+    getAssignment: overrides.getAssignment || getWarehouseAssignmentDetails,
+    resolveOperativeWarehouse: overrides.resolveOperativeWarehouse || resolveOperativeWarehouseId
   };
 
   const listCatalog = async (req) => {
@@ -537,16 +562,47 @@ export const createSolicitudesCompraService = (overrides = {}) => {
     if (hasValue(req.query?.fecha_desde) && !from) fail(400, 'VALIDATION_ERROR', 'fecha_desde debe usar formato YYYY-MM-DD.');
     if (hasValue(req.query?.fecha_hasta) && !to) fail(400, 'VALIDATION_ERROR', 'fecha_hasta debe usar formato YYYY-MM-DD.');
     if (from && to && from > to) fail(400, 'VALIDATION_ERROR', 'fecha_desde no puede ser posterior a fecha_hasta.');
+    const search = normalizeSolicitudSearch(req.query?.buscar);
 
     const params = [];
     const where = [];
     const add = (clause, value) => { params.push(value); where.push(clause.replace('?', `$${params.length}`)); };
-    if (access.isOperative) add('sc.id_sucursal = ?', access.userSucursalId);
+    if (access.isOperative) {
+      add('sc.id_sucursal = ?', access.userSucursalId);
+      add('sc.id_almacen = ?', access.operativeWarehouseId);
+    }
     else if (branchId) add('sc.id_sucursal = ?', branchId);
     if (state) add('sc.estado = ?', state);
     if (warehouseId) add('sc.id_almacen = ?', warehouseId);
     if (from) add('sc.fecha_creacion >= ?::date', from);
     if (to) add("sc.fecha_creacion < (?::date + INTERVAL '1 day')", to);
+    if (search) {
+      if (/^\d+$/.test(search)) {
+        add('sc.id_solicitud_compra::text = ?', search);
+      } else {
+        params.push(search);
+        const ref = `$${params.length}`;
+        where.push(`(
+          COALESCE(NULLIF(TRIM(CONCAT_WS(' ', p.nombre, p.apellido)), ''), '') ILIKE '%' || ${ref} || '%'
+          OR u.nombre_usuario ILIKE '%' || ${ref} || '%'
+          OR s.nombre_sucursal ILIKE '%' || ${ref} || '%'
+          OR a.nombre ILIKE '%' || ${ref} || '%'
+          OR sc.estado ILIKE '%' || ${ref} || '%'
+          OR COALESCE(sc.observacion_solicitud, '') ILIKE '%' || ${ref} || '%'
+          OR COALESCE(sc.comentario_revision, '') ILIKE '%' || ${ref} || '%'
+          OR COALESCE(sc.observacion_recepcion, '') ILIKE '%' || ${ref} || '%'
+          OR EXISTS (
+            SELECT 1 FROM public.solicitudes_compra_detalle sd
+            LEFT JOIN public.productos sp ON sp.id_producto = sd.id_producto
+            LEFT JOIN public.insumos si ON si.id_insumo = sd.id_insumo
+            WHERE sd.id_solicitud_compra = sc.id_solicitud_compra
+              AND (COALESCE(sp.nombre_producto, '') ILIKE '%' || ${ref} || '%'
+                OR COALESCE(si.nombre_insumo, '') ILIKE '%' || ${ref} || '%'
+                OR COALESCE(sd.nombre_presentacion_snapshot, '') ILIKE '%' || ${ref} || '%')
+          )
+        )`);
+      }
+    }
     params.push(pagination.limit, pagination.offset);
     const limitRef = `$${params.length - 1}`;
     const offsetRef = `$${params.length}`;
@@ -630,7 +686,7 @@ export const createSolicitudesCompraService = (overrides = {}) => {
     );
     const header = headerResult.rows?.[0];
     if (!header) fail(404, 'NOT_FOUND', 'Solicitud de compra no encontrada.');
-    if (access.isOperative && Number(header.id_sucursal) !== access.userSucursalId) {
+    if (access.isOperative && (Number(header.id_sucursal) !== access.userSucursalId || Number(header.id_almacen) !== access.operativeWarehouseId)) {
       fail(403, 'FORBIDDEN', 'No tiene acceso a esta solicitud de compra.');
     }
     const detailsResult = await dependencies.db.query(
