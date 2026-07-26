@@ -352,7 +352,7 @@ test('crea insumo con presentacion y conserva su snapshot', async () => {
       assert.equal(params[6], 'Bolsa');
       assert.equal(params[7], '1000');
       assert.equal(params[8], '2');
-      assert.match(sql, /\$9::numeric \* \$8::numeric/);
+      assert.match(sql, /ROUND\(\$9::numeric \* \$8::numeric, 6\)/);
       return { rows: [], rowCount: 1 };
     }
     throw new Error('Consulta inesperada');
@@ -365,6 +365,17 @@ test('conversion a unidad base usa cantidad por factor de base de datos', () => 
   const requested = parseQuantity('2.5');
   assert.equal(requested.decimal, '2.5');
   assert.equal(Number(requested.decimal) * 1000, 2500);
+});
+
+test('parseQuantity acepta seis decimales exactos y conserva el maximo operativo previo', () => {
+  assert.equal(parseQuantity('0.000001').decimal, '0.000001');
+  assert.equal(parseQuantity('1.123456').decimal, '1.123456');
+  assert.equal(parseQuantity('999999999.9999').decimal, '999999999.9999');
+  for (const invalid of ['1.1234567', '1e-6', '+1', '1,5', '0', '-1']) {
+    assert.equal(parseQuantity(invalid), null);
+  }
+  assert.equal(parseQuantity('2', { integerOnly: true }).decimal, '2');
+  assert.equal(parseQuantity('2.000001', { integerOnly: true }), null);
 });
 
 test('creacion rechaza insumo sin unidad relacionada con 409 antes del encabezado y revierte', async () => {
@@ -573,8 +584,8 @@ test('detalle expone IDs reales distintos y conserva encabezado, proveedor y can
   assert.deepEqual(
     result.detalles.map(({ cantidad_solicitada, cantidad_aprobada, cantidad_recibida }) => ({ cantidad_solicitada, cantidad_aprobada, cantidad_recibida })),
     [
-      { cantidad_solicitada: 2, cantidad_aprobada: 2, cantidad_recibida: null },
-      { cantidad_solicitada: 3, cantidad_aprobada: 2.5, cantidad_recibida: 2 }
+      { cantidad_solicitada: '2', cantidad_aprobada: '2', cantidad_recibida: null },
+      { cantidad_solicitada: '3', cantidad_aprobada: '2.5', cantidad_recibida: '2' }
     ]
   );
 });

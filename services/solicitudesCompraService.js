@@ -11,7 +11,8 @@ const MAX_LIMIT = 100;
 const MAX_LINES = 100;
 const MAX_OBSERVATION_LENGTH = 1000;
 const MAX_SEARCH_LENGTH = 120;
-const MAX_QUANTITY_SCALED = 9_999_999_999_999n;
+const QUANTITY_SCALE = 1_000_000n;
+const MAX_QUANTITY_SCALED = 999_999_999_999_900n;
 const VALID_STATES = new Set(['PENDIENTE', 'APROBADA', 'RECHAZADA', 'RECIBIDA', 'CANCELADA']);
 const ADMIN_ROLES = new Set(['SUPER_ADMIN', 'ADMIN', 'ADMINISTRADOR']);
 const OPERATIVE_ROLES = new Set(['CAJERO', 'COCINA', 'COCINERO', 'COCINERA', 'JEFA_COCINA', 'JEFE_COCINA']);
@@ -59,19 +60,19 @@ const parseDate = (value) => {
 };
 
 const scaledToDecimal = (scaled) => {
-  const integer = scaled / 10_000n;
-  const fraction = String(scaled % 10_000n).padStart(4, '0').replace(/0+$/, '');
+  const integer = scaled / QUANTITY_SCALE;
+  const fraction = String(scaled % QUANTITY_SCALE).padStart(6, '0').replace(/0+$/, '');
   return fraction ? `${integer}.${fraction}` : String(integer);
 };
 
 export const parseQuantity = (value, { integerOnly = false } = {}) => {
   const text = String(value ?? '').trim();
-  const pattern = integerOnly ? /^[1-9]\d*$/ : /^(?:0|[1-9]\d*)(?:\.\d{1,4})?$/;
+  const pattern = integerOnly ? /^[1-9]\d*$/ : /^(?:0|[1-9]\d*)(?:\.\d{1,6})?$/;
   if (!pattern.test(text)) return null;
   const [whole, fraction = ''] = text.split('.');
-  const scaled = BigInt(whole) * 10_000n + BigInt(fraction.padEnd(4, '0') || '0');
+  const scaled = BigInt(whole) * QUANTITY_SCALE + BigInt(fraction.padEnd(6, '0') || '0');
   if (scaled <= 0n || scaled > MAX_QUANTITY_SCALED) return null;
-  if (integerOnly && scaled % 10_000n !== 0n) return null;
+  if (integerOnly && scaled % QUANTITY_SCALE !== 0n) return null;
   return { scaled, decimal: scaledToDecimal(scaled) };
 };
 
@@ -419,7 +420,7 @@ const normalizeRequestLines = async (rawLines, warehouse, queryRunner, dependenc
     if (!quantity) {
       fail(400, 'VALIDATION_ERROR', type === 'producto'
         ? 'La cantidad de producto debe ser un entero positivo.'
-        : 'La cantidad de insumo debe ser positiva y tener hasta 4 decimales.');
+        : 'La cantidad de insumo debe ser positiva y tener hasta 6 decimales.');
     }
 
     const resolved = await dependencies.resolveMaster(type, rawItemId, queryRunner);
@@ -552,7 +553,7 @@ export const createSolicitudesCompraService = (overrides = {}) => {
               id_solicitud_compra, tipo_item, id_producto, id_insumo,
               id_presentacion_insumo, id_unidad_base, nombre_presentacion_snapshot,
               factor_conversion_snapshot, cantidad_solicitada, cantidad_base_solicitada
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8::numeric, $9::numeric, $9::numeric * $8::numeric)
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8::numeric, $9::numeric, ROUND($9::numeric * $8::numeric, 6))
           `,
           [
             header.id_solicitud_compra,
@@ -786,12 +787,12 @@ export const createSolicitudesCompraService = (overrides = {}) => {
         ...row,
         id_solicitud_detalle: Number(row.id_solicitud_detalle),
         id_item: Number(row.id_item),
-        cantidad_solicitada: Number(row.cantidad_solicitada),
-        cantidad_base_solicitada: Number(row.cantidad_base_solicitada),
-        cantidad_aprobada: row.cantidad_aprobada === null ? null : Number(row.cantidad_aprobada),
-        cantidad_base_aprobada: row.cantidad_base_aprobada === null ? null : Number(row.cantidad_base_aprobada),
-        cantidad_recibida: row.cantidad_recibida === null ? null : Number(row.cantidad_recibida),
-        cantidad_base_recibida: row.cantidad_base_recibida === null ? null : Number(row.cantidad_base_recibida),
+        cantidad_solicitada: String(row.cantidad_solicitada),
+        cantidad_base_solicitada: String(row.cantidad_base_solicitada),
+        cantidad_aprobada: row.cantidad_aprobada === null ? null : String(row.cantidad_aprobada),
+        cantidad_base_aprobada: row.cantidad_base_aprobada === null ? null : String(row.cantidad_base_aprobada),
+        cantidad_recibida: row.cantidad_recibida === null ? null : String(row.cantidad_recibida),
+        cantidad_base_recibida: row.cantidad_base_recibida === null ? null : String(row.cantidad_base_recibida),
         stock_actual: Number(row.stock_actual ?? 0),
         stock_minimo: Number(row.stock_minimo ?? 0)
       }))

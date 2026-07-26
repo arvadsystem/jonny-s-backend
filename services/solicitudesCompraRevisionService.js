@@ -92,7 +92,7 @@ const validateApprovalPayload = (body) => {
 
 const parseUnsignedDecimal = (value) => {
   const text = String(value ?? '').trim();
-  if (!/^\d+(?:\.\d+)?$/.test(text)) return null;
+  if (!/^\d+(?:\.\d{1,6})?$/.test(text)) return null;
   const [whole, fraction = ''] = text.split('.');
   const digits = BigInt(`${whole}${fraction}`);
   return digits > 0n ? { digits, scale: fraction.length } : null;
@@ -100,9 +100,9 @@ const parseUnsignedDecimal = (value) => {
 
 const powerOfTen = (exponent) => 10n ** BigInt(exponent);
 
-const formatScaled4 = (scaled) => {
-  const integer = scaled / 10_000n;
-  const fraction = String(scaled % 10_000n).padStart(4, '0').replace(/0+$/, '');
+const formatScaled6 = (scaled) => {
+  const integer = scaled / 1_000_000n;
+  const fraction = String(scaled % 1_000_000n).padStart(6, '0').replace(/0+$/, '');
   return fraction ? `${integer}.${fraction}` : String(integer);
 };
 
@@ -112,17 +112,17 @@ export const multiplyApprovedQuantityToBase = (quantity, factor) => {
   if (!left || !right) fail(409, 'CONFLICT', 'El factor de conversion snapshot no es valido.');
   const product = left.digits * right.digits;
   const sourceScale = left.scale + right.scale;
-  let scaled4;
-  if (sourceScale <= 4) {
-    scaled4 = product * powerOfTen(4 - sourceScale);
+  let scaled6;
+  if (sourceScale <= 6) {
+    scaled6 = product * powerOfTen(6 - sourceScale);
   } else {
-    const divisor = powerOfTen(sourceScale - 4);
-    scaled4 = product / divisor;
+    const divisor = powerOfTen(sourceScale - 6);
+    scaled6 = product / divisor;
     const remainder = product % divisor;
-    if (remainder * 2n >= divisor) scaled4 += 1n;
+    if (remainder * 2n >= divisor) scaled6 += 1n;
   }
-  if (scaled4 <= 0n) fail(409, 'CONFLICT', 'La cantidad base aprobada no es valida.');
-  return formatScaled4(scaled4);
+  if (scaled6 <= 0n) fail(409, 'CONFLICT', 'La cantidad base aprobada no es valida.');
+  return formatScaled6(scaled6);
 };
 
 const mapDatabaseError = (error) => {
@@ -241,7 +241,7 @@ export const createSolicitudesCompraRevisionService = (overrides = {}) => {
         if (!quantity) {
           fail(400, 'VALIDATION_ERROR', type === 'PRODUCTO'
             ? 'La cantidad aprobada de un producto debe ser un entero positivo.'
-            : 'La cantidad aprobada de un insumo debe ser positiva y tener hasta 4 decimales.');
+            : 'La cantidad aprobada de un insumo debe ser positiva y tener hasta 6 decimales.');
         }
         const factor = type === 'PRODUCTO' ? '1' : String(stored.factor_conversion_snapshot ?? '').trim();
         return {

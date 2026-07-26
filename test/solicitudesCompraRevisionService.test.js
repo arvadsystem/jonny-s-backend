@@ -219,23 +219,30 @@ test('cantidad decimal de producto es rechazada', async () => {
   );
 });
 
-test('cantidad de insumo con cuatro decimales es aceptada', async () => {
+test('cantidad de insumo con seis decimales es aceptada y siete se rechazan', async () => {
   const fixture = makeApprovalFixture({ stored: [supplyStored(11, '2.5')] });
   const result = await fixture.service.approve(approveRequest(approvalBody([
-    { id_solicitud_detalle: 11, cantidad_aprobada: '1.2345', id_proveedor: 5 }
+    { id_solicitud_detalle: 11, cantidad_aprobada: '1.123456', id_proveedor: 5 }
   ])));
   assert.equal(result.solicitud.estado, 'APROBADA');
+  await assert.rejects(
+    makeApprovalFixture({ stored: [supplyStored(11, '1')] }).service.approve(approveRequest(approvalBody([
+      { id_solicitud_detalle: 11, cantidad_aprobada: '1.1234567', id_proveedor: 5 }
+    ]))),
+    (error) => error.status === 400 && /hasta 6 decimales/.test(error.message)
+  );
 });
 
-test('cantidad_base_aprobada usa factor_conversion_snapshot con redondeo a cuatro decimales', async () => {
-  assert.equal(multiplyApprovedQuantityToBase('1.2345', '2.5'), '3.0863');
+test('cantidad_base_aprobada usa factor_conversion_snapshot con redondeo a seis decimales', async () => {
+  assert.equal(multiplyApprovedQuantityToBase('1.2345', '2.5'), '3.08625');
+  assert.equal(multiplyApprovedQuantityToBase('3', '0.166667'), '0.500001');
   const fixture = makeApprovalFixture({ stored: [supplyStored(11, '2.5')] });
   await fixture.service.approve(approveRequest(approvalBody([
     { id_solicitud_detalle: 11, cantidad_aprobada: '1.2345', id_proveedor: 5 }
   ])));
   const update = fixture.calls.find((call) => call.sql.startsWith('UPDATE public.solicitudes_compra_detalle'));
   assert.equal(update.params[2], '1.2345');
-  assert.equal(update.params[3], '3.0863');
+  assert.equal(update.params[3], '3.08625');
 });
 
 test('proveedor inexistente es rechazado', async () => {
@@ -405,7 +412,7 @@ test('detalle devuelve proveedor como objeto sin datos financieros', async () =>
   });
   const result = await service.getById({ params: { id_solicitud_compra: 8 } });
   assert.deepEqual(result.detalles[0].proveedor, { id_proveedor: 5, nombre_proveedor: 'Proveedor' });
-  assert.equal(result.detalles[0].cantidad_base_aprobada, 2);
+  assert.equal(result.detalles[0].cantidad_base_aprobada, '2');
   assert.equal('precio' in result.detalles[0].proveedor, false);
 });
 

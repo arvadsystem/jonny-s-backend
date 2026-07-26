@@ -149,7 +149,7 @@ const parseStoredPositive = (value) => parseQuantity(String(value ?? ''), { inte
 const parseReceivedQuantity = (value, type) => {
   if (type !== 'PRODUCTO') return parseQuantity(value);
   const text = String(value ?? '').trim();
-  const integerEquivalent = /^(?:[1-9]\d*)(?:\.0{1,4})?$/.exec(text);
+  const integerEquivalent = /^(?:[1-9]\d*)(?:\.0{1,6})?$/.exec(text);
   return integerEquivalent ? parseQuantity(text.split('.')[0], { integerOnly: true }) : null;
 };
 
@@ -173,7 +173,7 @@ const normalizeDetails = (submitted, stored) => {
     const received = parseReceivedQuantity(line.rawQuantity, type);
     if (!received) fail(400, 'VALIDATION_ERROR', type === 'PRODUCTO'
       ? 'La cantidad recibida de un producto debe ser un entero positivo.'
-      : 'La cantidad recibida de un insumo debe ser positiva y tener hasta 4 decimales.');
+      : 'La cantidad recibida de un insumo debe ser positiva y tener hasta 6 decimales.');
     if (received.scaled !== approved.scaled) hasDifference = true;
     const factor = type === 'PRODUCTO' ? '1' : String(row.factor_conversion_snapshot ?? '').trim();
     return {
