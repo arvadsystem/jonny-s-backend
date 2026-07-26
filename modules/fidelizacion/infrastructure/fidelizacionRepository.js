@@ -523,7 +523,22 @@ export const recordAccumulationRetryableError = async (client, idFactura, { fech
 // fecha) son AUTORITATIVOS -ver resolveEffectiveAccumulationContext-, nunca
 // se combinan con el contexto actual de la factura. Si contradicen al
 // contexto actual, es terminal (ACCUMULATION_CONTEXT_MISMATCH): no se
-// acredita a ninguno de los dos clientes.
+// acredita a ninguno de los dos clientes. El snapshot tambien rellena
+// cliente/sucursal cuando el contexto ACTUAL los trae NULL (ver
+// accumulateInvoicePoints.js, que ya no corta antes de llegar aqui por esa
+// razon).
+//
+// PRESERVACION DEL SNAPSHOT ANTE ERRORES: una vez que eligibilitySnapshot
+// pudo quedar resuelto, TODO lo que se ejecuta despues (completar PENDING,
+// resolver el contexto efectivo, registrar puntos, persistir el estado
+// final) vive dentro de un unico try/catch. Cualquier excepcion en ese tramo
+// adjunta el snapshot ya conocido al error (sin pisar uno que ya viniera
+// adjunto) antes de relanzarlo, para que accumulateInvoicePoints.js pueda
+// reenviarlo a recordAccumulationRetryableError DESPUES del ROLLBACK -que
+// deshace cualquier escritura de este intento, incluida la propia reserva
+// PENDING-. Antes, solo el fallo puntual de registerFacturaLoyaltyAccumulation
+// transportaba el snapshot; un fallo en ensurePendingAccumulationState o en
+// cualquiera de los upsert finales lo perdia.
 export const persistAccumulation = async ({
   client,
   idFactura,
@@ -535,97 +550,100 @@ export const persistAccumulation = async ({
   referenceDate,
   trigger = ACCUMULATION_TRIGGER.LIVE
 }) => {
-  const existingState = await getAccumulationState(client, idFactura);
+  let eligibilitySnapshot = null;
 
-  if (existingState && !RETRYABLE_ACCUMULATION_STATES.includes(existingState.estado)) {
-    // PROCESSED o SKIPPED_TERMINAL: ya fue determinado, nunca se vuelve a
-    // mirar el perfil/config/tasa.
-    return existingState.estado === ACCUMULATION_STATE.PROCESSED
-      ? { created: false, reason: 'ALREADY_REGISTERED' }
-      : { created: false, reason: existingState.motivo };
-  }
+  try {
+    const existingState = await getAccumulationState(client, idFactura);
 
-  let eligibilitySnapshot = existingState ? snapshotFromStateRow(existingState) : null;
-
-  if (!eligibilitySnapshot) {
-    const rebuilt = await buildAccumulationSnapshot(client, { idFactura });
-
-    if (trigger === ACCUMULATION_TRIGGER.RECONCILE) {
-      // Sin snapshot -exista o no una fila previa- reconciliacion solo puede
-      // confiar en evidencia historica del pedido (pedidos_contacto del menu
-      // publico). El perfil maestro de HOY no prueba nada sobre el momento
-      // de la compra: una fila RETRYABLE_ERROR/PENDING legada sin snapshot
-      // JAMAS se completa con el perfil actual, exista o no la fila (antes
-      // el `&& !existingState` dejaba pasar exactamente ese caso).
-      const evidenciaHistorica = rebuilt && rebuilt.fuenteSnapshot === 'PEDIDO_CONTACTO' && rebuilt.perfilCompletoSnapshot
-        ? rebuilt
-        : null;
-
-      if (!evidenciaHistorica) {
-        await upsertAccumulationState(client, {
-          idFactura,
-          estado: ACCUMULATION_STATE.SKIPPED_TERMINAL,
-          motivo: LEGACY_ELIGIBILITY_UNVERIFIABLE,
-          elegibilidadDeterminada: false,
-          fechaReferencia: referenceDate
-        });
-        return { created: false, reason: LEGACY_ELIGIBILITY_UNVERIFIABLE };
-      }
-
-      eligibilitySnapshot = evidenciaHistorica;
-    } else {
-      eligibilitySnapshot = rebuilt;
+    if (existingState && !RETRYABLE_ACCUMULATION_STATES.includes(existingState.estado)) {
+      // PROCESSED o SKIPPED_TERMINAL: ya fue determinado, nunca se vuelve a
+      // mirar el perfil/config/tasa.
+      return existingState.estado === ACCUMULATION_STATE.PROCESSED
+        ? { created: false, reason: 'ALREADY_REGISTERED' }
+        : { created: false, reason: existingState.motivo };
     }
 
-    // Reserva/completa la fila con el snapshot recien resuelto. Si ya existia
-    // sin snapshot (reintentable), ensurePendingAccumulationState ahora la
-    // COMPLETA (COALESCE) en vez de no-opear; nunca pisa un snapshot ya
-    // grabado ni toca un estado terminal.
-    await ensurePendingAccumulationState(client, idFactura, referenceDate, eligibilitySnapshot);
-  }
+    eligibilitySnapshot = existingState ? snapshotFromStateRow(existingState) : null;
 
-  // El snapshot, cuando existe, es el contexto AUTORITATIVO completo -nunca
-  // se combina con el contexto actual de la factura-: evita que la
-  // elegibilidad historica de un cliente se acredite al saldo de otro. El
-  // contexto actual solo sigue usandose para el monto (montoFactura, siempre
-  // por-factura, jamas del snapshot) y para detectar inconsistencias.
-  const { effective, mismatch } = resolveEffectiveAccumulationContext({
-    currentContext: { idCliente, idSucursal, idPedido, referenceDate },
-    eligibilitySnapshot
-  });
+    if (!eligibilitySnapshot) {
+      const rebuilt = await buildAccumulationSnapshot(client, { idFactura });
 
-  if (mismatch) {
-    // Contradiccion real entre el snapshot durable y el contexto actual de
-    // la factura. No se reintenta indefinidamente una inconsistencia
-    // persistente: es terminal. Nunca se loguea nombre ni telefono (dato
-    // personal) -solo identificadores y fechas.
-    console.error('[fidelizacion:accumulate] contexto del snapshot inconsistente con el contexto actual de la factura:', {
-      id_factura: idFactura || null,
-      snapshot_id_cliente: eligibilitySnapshot?.idCliente ?? null,
-      current_id_cliente: idCliente ?? null,
-      snapshot_id_sucursal: eligibilitySnapshot?.idSucursal ?? null,
-      current_id_sucursal: idSucursal ?? null,
-      snapshot_id_pedido: eligibilitySnapshot?.idPedido ?? null,
-      current_id_pedido: idPedido ?? null,
-      snapshot_fecha_referencia: eligibilitySnapshot?.fechaReferencia ?? null,
-      current_fecha_referencia: referenceDate ?? null
+      if (trigger === ACCUMULATION_TRIGGER.RECONCILE) {
+        // Sin snapshot -exista o no una fila previa- reconciliacion solo puede
+        // confiar en evidencia historica del pedido (pedidos_contacto del menu
+        // publico). El perfil maestro de HOY no prueba nada sobre el momento
+        // de la compra: una fila RETRYABLE_ERROR/PENDING legada sin snapshot
+        // JAMAS se completa con el perfil actual, exista o no la fila (antes
+        // el `&& !existingState` dejaba pasar exactamente ese caso).
+        const evidenciaHistorica = rebuilt && rebuilt.fuenteSnapshot === 'PEDIDO_CONTACTO' && rebuilt.perfilCompletoSnapshot
+          ? rebuilt
+          : null;
+
+        if (!evidenciaHistorica) {
+          await upsertAccumulationState(client, {
+            idFactura,
+            estado: ACCUMULATION_STATE.SKIPPED_TERMINAL,
+            motivo: LEGACY_ELIGIBILITY_UNVERIFIABLE,
+            elegibilidadDeterminada: false,
+            fechaReferencia: referenceDate
+          });
+          return { created: false, reason: LEGACY_ELIGIBILITY_UNVERIFIABLE };
+        }
+
+        eligibilitySnapshot = evidenciaHistorica;
+      } else {
+        eligibilitySnapshot = rebuilt;
+      }
+
+      // Reserva/completa la fila con el snapshot recien resuelto. Si ya existia
+      // sin snapshot (reintentable), ensurePendingAccumulationState ahora la
+      // COMPLETA (COALESCE) en vez de no-opear; nunca pisa un snapshot ya
+      // grabado ni toca un estado terminal.
+      await ensurePendingAccumulationState(client, idFactura, referenceDate, eligibilitySnapshot);
+    }
+
+    // El snapshot, cuando existe, es el contexto AUTORITATIVO completo -nunca
+    // se combina con el contexto actual de la factura-: evita que la
+    // elegibilidad historica de un cliente se acredite al saldo de otro, y
+    // permite que rellene cliente/sucursal/pedido/fecha ausentes en el
+    // contexto actual. El contexto actual solo sigue usandose para el monto
+    // (montoFactura, siempre por-factura, jamas del snapshot) y para
+    // detectar inconsistencias.
+    const { effective, mismatch } = resolveEffectiveAccumulationContext({
+      currentContext: { idCliente, idSucursal, idPedido, referenceDate },
+      eligibilitySnapshot
     });
 
-    await upsertAccumulationState(client, {
-      idFactura,
-      estado: ACCUMULATION_STATE.SKIPPED_TERMINAL,
-      motivo: ACCUMULATION_CONTEXT_MISMATCH,
-      elegibilidadDeterminada: false,
-      fechaReferencia: referenceDate,
-      snapshot: eligibilitySnapshot
-    });
+    if (mismatch) {
+      // Contradiccion real entre el snapshot durable y el contexto actual de
+      // la factura. No se reintenta indefinidamente una inconsistencia
+      // persistente: es terminal. Nunca se loguea nombre ni telefono (dato
+      // personal) -solo identificadores y fechas.
+      console.error('[fidelizacion:accumulate] contexto del snapshot inconsistente con el contexto actual de la factura:', {
+        id_factura: idFactura || null,
+        snapshot_id_cliente: eligibilitySnapshot?.idCliente ?? null,
+        current_id_cliente: idCliente ?? null,
+        snapshot_id_sucursal: eligibilitySnapshot?.idSucursal ?? null,
+        current_id_sucursal: idSucursal ?? null,
+        snapshot_id_pedido: eligibilitySnapshot?.idPedido ?? null,
+        current_id_pedido: idPedido ?? null,
+        snapshot_fecha_referencia: eligibilitySnapshot?.fechaReferencia ?? null,
+        current_fecha_referencia: referenceDate ?? null
+      });
 
-    return { created: false, reason: ACCUMULATION_CONTEXT_MISMATCH };
-  }
+      await upsertAccumulationState(client, {
+        idFactura,
+        estado: ACCUMULATION_STATE.SKIPPED_TERMINAL,
+        motivo: ACCUMULATION_CONTEXT_MISMATCH,
+        elegibilidadDeterminada: false,
+        fechaReferencia: referenceDate,
+        snapshot: eligibilitySnapshot
+      });
 
-  let result;
-  try {
-    result = await registerFacturaLoyaltyAccumulation({
+      return { created: false, reason: ACCUMULATION_CONTEXT_MISMATCH };
+    }
+
+    const result = await registerFacturaLoyaltyAccumulation({
       client,
       idFactura,
       idPedido: effective.idPedido,
@@ -636,57 +654,70 @@ export const persistAccumulation = async ({
       referenceDate: effective.referenceDate,
       eligibilitySnapshot
     });
-  } catch (err) {
-    // El snapshot ya resuelto se adjunta al error: la transaccion que llama
-    // a persistAccumulation hara ROLLBACK completo (incluida cualquier
-    // escritura previa de este mismo intento), asi que la unica forma de no
-    // perder la evidencia historica ya obtenida es que accumulateInvoicePoints
-    // la reenvie a recordAccumulationRetryableError DESPUES del rollback.
-    if (err && typeof err === 'object') {
-      err.eligibilitySnapshot = eligibilitySnapshot;
+
+    if (result.created || result.reason === 'ALREADY_REGISTERED') {
+      await upsertAccumulationState(client, {
+        idFactura,
+        estado: ACCUMULATION_STATE.PROCESSED,
+        motivo: result.created ? null : 'ALREADY_REGISTERED',
+        elegibilidadDeterminada: Boolean(result.created),
+        fechaReferencia: referenceDate
+      });
+      return result;
     }
-    throw err;
-  }
 
-  if (result.created || result.reason === 'ALREADY_REGISTERED') {
-    await upsertAccumulationState(client, {
-      idFactura,
-      estado: ACCUMULATION_STATE.PROCESSED,
-      motivo: result.created ? null : 'ALREADY_REGISTERED',
-      elegibilidadDeterminada: Boolean(result.created),
-      fechaReferencia: referenceDate
-    });
+    if (BUSINESS_SKIP_REASONS.has(result.reason)) {
+      // El rechazo por perfil incompleto solo se relabela como "no verificable"
+      // cuando de verdad NO hay evidencia historica que lo respalde: es decir,
+      // cuando reconciliacion trabaja sobre una fila legada sin snapshot. Si
+      // hay snapshot (la via normal desde la reserva pre-COMMIT), el motivo es
+      // verificable y se conserva tal cual.
+      const sinEvidenciaHistorica = !eligibilitySnapshot;
+      const persistedMotivo = trigger === ACCUMULATION_TRIGGER.RECONCILE
+        && result.reason === 'CLIENT_PROFILE_INCOMPLETE'
+        && sinEvidenciaHistorica
+        ? LEGACY_ELIGIBILITY_UNVERIFIABLE
+        : result.reason;
+
+      await upsertAccumulationState(client, {
+        idFactura,
+        estado: ACCUMULATION_STATE.SKIPPED_TERMINAL,
+        motivo: persistedMotivo,
+        elegibilidadDeterminada: false,
+        fechaReferencia: referenceDate
+      });
+
+      return { ...result, reason: persistedMotivo };
+    }
+
+    if (result.reason === 'MISSING_REQUIRED_DATA') {
+      // Ni el snapshot durable ni el contexto actual pudieron resolver
+      // cliente o sucursal: es un vacio ESTRUCTURAL de datos, no una falla
+      // tecnica transitoria (esas se manejan en el catch de abajo, via
+      // RETRYABLE_ERROR). Dejarlo en un estado reintentable haria que la
+      // fila PENDING reapareciera indefinidamente en cada tick de
+      // reconciliacion sin ninguna posibilidad real de resolverse sola.
+      await upsertAccumulationState(client, {
+        idFactura,
+        estado: ACCUMULATION_STATE.SKIPPED_TERMINAL,
+        motivo: 'MISSING_REQUIRED_DATA',
+        elegibilidadDeterminada: false,
+        fechaReferencia: referenceDate,
+        snapshot: eligibilitySnapshot
+      });
+      return result;
+    }
+
+    // Cualquier otro motivo no mapeado: no se toca la tabla de estado (misma
+    // precondicion que INVOICE_NOT_FULLY_PAID, resuelta antes de llegar
+    // aqui; puede cambiar, no es una regla de negocio terminal).
     return result;
+  } catch (error) {
+    if (error && typeof error === 'object' && eligibilitySnapshot) {
+      error.eligibilitySnapshot ??= eligibilitySnapshot;
+    }
+    throw error;
   }
-
-  if (BUSINESS_SKIP_REASONS.has(result.reason)) {
-    // El rechazo por perfil incompleto solo se relabela como "no verificable"
-    // cuando de verdad NO hay evidencia historica que lo respalde: es decir,
-    // cuando reconciliacion trabaja sobre una fila legada sin snapshot. Si
-    // hay snapshot (la via normal desde la reserva pre-COMMIT), el motivo es
-    // verificable y se conserva tal cual.
-    const sinEvidenciaHistorica = !eligibilitySnapshot;
-    const persistedMotivo = trigger === ACCUMULATION_TRIGGER.RECONCILE
-      && result.reason === 'CLIENT_PROFILE_INCOMPLETE'
-      && sinEvidenciaHistorica
-      ? LEGACY_ELIGIBILITY_UNVERIFIABLE
-      : result.reason;
-
-    await upsertAccumulationState(client, {
-      idFactura,
-      estado: ACCUMULATION_STATE.SKIPPED_TERMINAL,
-      motivo: persistedMotivo,
-      elegibilidadDeterminada: false,
-      fechaReferencia: referenceDate
-    });
-
-    return { ...result, reason: persistedMotivo };
-  }
-
-  // MISSING_REQUIRED_DATA u otro motivo no mapeado: no se toca la tabla de
-  // estado (misma precondicion que INVOICE_NOT_FULLY_PAID, resuelta antes de
-  // llegar aqui; puede cambiar, no es una regla de negocio terminal).
-  return result;
 };
 
 // Para el worker de reconciliacion: facturas que ya quedaron completamente

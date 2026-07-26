@@ -151,6 +151,37 @@ export const createFidelizacionMockClient = ({
   // que pg_advisory_xact_lock real (scoped a la transaccion, no a la query).
   const heldLockReleases = [];
 
+  // Snapshot transaccional (BEGIN -> COMMIT/ROLLBACK), por-CLIENTE, no en
+  // `state` compartido: dos conexiones que comparten `state` (sharedState,
+  // pruebas de concurrencia LIVE/RECONCILE) no deben pisarse el snapshot
+  // transaccional una a otra -cada una tiene su propia transaccion real-.
+  // Sin esto, un ROLLBACK solo limpiaba `aborted`, dejando saldos,
+  // movimientos e incrementos de intentos escritos DENTRO de la transaccion
+  // fallida como si se hubieran confirmado -lo opuesto a PostgreSQL real-.
+  let txSnapshot = null;
+
+  const captureTxSnapshot = () => ({
+    saldos: new Map(state.saldos),
+    movimientos: [...state.movimientos],
+    estadoFacturas: new Map(Array.from(state.estadoFacturas, ([id, row]) => [id, { ...row }])),
+    nextMovimientoId: state.nextMovimientoId,
+    escriturasPerfilMaestro: [...state.escriturasPerfilMaestro],
+    telefonosUnicos: new Set(state.telefonosUnicos),
+    telefonos: new Map(state.telefonos),
+    nextTelefonoId: state.nextTelefonoId
+  });
+
+  const restoreTxSnapshot = (snapshot) => {
+    state.saldos = snapshot.saldos;
+    state.movimientos = snapshot.movimientos;
+    state.estadoFacturas = snapshot.estadoFacturas;
+    state.nextMovimientoId = snapshot.nextMovimientoId;
+    state.escriturasPerfilMaestro = snapshot.escriturasPerfilMaestro;
+    state.telefonosUnicos = snapshot.telefonosUnicos;
+    state.telefonos = snapshot.telefonos;
+    state.nextTelefonoId = snapshot.nextTelefonoId;
+  };
+
   const getClienteProfile = (idCliente) => {
     const override = state.clienteProfiles[Number(idCliente)];
     return override === undefined ? state.defaultClienteProfile : override;
@@ -260,6 +291,9 @@ export const createFidelizacionMockClient = ({
       if (trimmed === 'BEGIN') {
         state.aborted = false;
         state.savepoints = [];
+        // Captura el estado mutable para poder restaurarlo en un ROLLBACK
+        // real (no de SAVEPOINT) mas abajo.
+        txSnapshot = captureTxSnapshot();
         return { rows: [] };
       }
       if (trimmed === 'COMMIT' || trimmed === 'ROLLBACK') {
@@ -267,6 +301,14 @@ export const createFidelizacionMockClient = ({
           // PostgreSQL rechaza el COMMIT de una transaccion abortada.
           throw buildAbortedTransactionError();
         }
+        if (trimmed === 'ROLLBACK' && txSnapshot) {
+          // Deshace TODA escritura transaccional -saldos, movimientos,
+          // estado durable (incluidos incrementos de intentos)- igual que
+          // PostgreSQL: un ROLLBACK no es solo "dejar de estar abortada", es
+          // reponer los datos al momento del BEGIN.
+          restoreTxSnapshot(txSnapshot);
+        }
+        txSnapshot = null;
         state.aborted = false;
         state.savepoints = [];
         // pg_advisory_xact_lock esta scoped a la transaccion: se libera aqui,

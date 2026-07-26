@@ -64,10 +64,15 @@ export const accumulateInvoicePoints = async ({ idFactura, trigger = ACCUMULATIO
     await lockFacturaForAccumulation(client, facturaId);
 
     context = await getFacturaAccumulationContext(client, facturaId);
-    const idCliente = parsePositiveInt(context?.id_cliente);
-    const idSucursal = parsePositiveInt(context?.id_sucursal);
 
-    if (!context || !idCliente || !idSucursal) {
+    // No se exige idCliente/idSucursal aqui: el snapshot durable (resuelto
+    // dentro de persistAccumulation) puede rellenar exactamente esos huecos
+    // -ver resolveEffectiveAccumulationContext-. Cortar antes de leer el
+    // estado durable le negaba esa posibilidad: una reserva PENDING con
+    // cliente/sucursal validos nunca llegaba a consultarse solo porque el
+    // contexto ACTUAL de la factura (que pudo cambiar, o nunca los tuvo)
+    // los trae NULL. Solo la existencia de la factura es indispensable aqui.
+    if (!context) {
       await client.query('COMMIT');
       transactionStarted = false;
       const outcome = { created: false, reason: 'MISSING_REQUIRED_DATA' };
@@ -95,8 +100,11 @@ export const accumulateInvoicePoints = async ({ idFactura, trigger = ACCUMULATIO
       client,
       idFactura: facturaId,
       idPedido: context.id_pedido,
-      idCliente,
-      idSucursal,
+      // Puede ser null: persistAccumulation resuelve el contexto EFECTIVO
+      // (snapshot durable si existe, contexto actual si no) antes de decidir
+      // si de verdad faltan datos.
+      idCliente: parsePositiveInt(context.id_cliente),
+      idSucursal: parsePositiveInt(context.id_sucursal),
       idUsuarioEjecutor: parsePositiveInt(context.id_usuario),
       montoFactura: context.monto_factura,
       referenceDate: context.fecha_referencia_config,
