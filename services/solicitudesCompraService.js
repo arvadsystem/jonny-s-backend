@@ -736,6 +736,7 @@ export const createSolicitudesCompraService = (overrides = {}) => {
                CASE WHEN d.tipo_item = 'PRODUCTO' THEN p.nombre_producto ELSE i.nombre_insumo END AS nombre,
                CASE WHEN d.tipo_item = 'PRODUCTO' THEN cp.nombre_categoria ELSE ci.nombre_categoria END AS categoria,
                d.cantidad_solicitada, d.nombre_presentacion_snapshot AS presentacion_snapshot,
+               d.factor_conversion_snapshot::text AS factor_conversion_snapshot,
                d.cantidad_base_solicitada, ub.nombre AS unidad_base,
                d.cantidad_aprobada, d.cantidad_base_aprobada,
                CASE WHEN prov.id_proveedor IS NULL THEN NULL ELSE JSON_BUILD_OBJECT(

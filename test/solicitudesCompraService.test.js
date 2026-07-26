@@ -522,6 +522,7 @@ test('detalle expone IDs reales distintos y conserva encabezado, proveedor y can
     {
       id_solicitud_detalle: '15', tipo_item: 'INSUMO', id_item: '230', nombre: 'Harina',
       categoria: 'Secos', cantidad_solicitada: '2', presentacion_snapshot: 'Saco 25 kg',
+      factor_conversion_snapshot: '25',
       cantidad_base_solicitada: '50', unidad_base: 'Kilogramo', cantidad_aprobada: '2',
       cantidad_base_aprobada: '50', proveedor: provider, cantidad_recibida: null,
       cantidad_base_recibida: null, stock_actual: '20', stock_minimo: '5', estado_stock: 'DISPONIBLE'
@@ -529,6 +530,7 @@ test('detalle expone IDs reales distintos y conserva encabezado, proveedor y can
     {
       id_solicitud_detalle: '16', tipo_item: 'INSUMO', id_item: '230', nombre: 'Harina',
       categoria: 'Secos', cantidad_solicitada: '3', presentacion_snapshot: 'Bolsa 1 kg',
+      factor_conversion_snapshot: '1',
       cantidad_base_solicitada: '3', unidad_base: 'Kilogramo', cantidad_aprobada: '2.5',
       cantidad_base_aprobada: '2.5', proveedor: null, cantidad_recibida: '2',
       cantidad_base_recibida: '2', stock_actual: '20', stock_minimo: '5', estado_stock: 'DISPONIBLE'
@@ -547,6 +549,8 @@ test('detalle expone IDs reales distintos y conserva encabezado, proveedor y can
   const result = await service.getById({ params: { id_solicitud_compra: 44 } });
 
   assert.match(detailSql, /SELECT\s+d\.id_solicitud_detalle,\s*d\.tipo_item/);
+  assert.match(detailSql, /d\.factor_conversion_snapshot::text AS factor_conversion_snapshot/);
+  assert.doesNotMatch(detailSql, /insumo_presentaciones/);
   assert.match(detailSql, /ORDER BY d\.id_solicitud_detalle/);
   assert.deepEqual(result.solicitud, {
     id_solicitud_compra: 44,
@@ -564,6 +568,7 @@ test('detalle expone IDs reales distintos y conserva encabezado, proveedor y can
   assert.equal(result.detalles[0].id_item, result.detalles[1].id_item);
   assert.notEqual(result.detalles[0].id_solicitud_detalle, result.detalles[0].id_item);
   assert.notEqual(result.detalles[0].presentacion_snapshot, result.detalles[1].presentacion_snapshot);
+  assert.deepEqual(result.detalles.map((line) => line.factor_conversion_snapshot), ['25', '1']);
   assert.deepEqual(result.detalles[0].proveedor, provider);
   assert.deepEqual(
     result.detalles.map(({ cantidad_solicitada, cantidad_aprobada, cantidad_recibida }) => ({ cantidad_solicitada, cantidad_aprobada, cantidad_recibida })),
