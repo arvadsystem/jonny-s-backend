@@ -111,6 +111,14 @@ export const normalizeSolicitudSearch = (value) => {
   return normalized || null;
 };
 
+export const normalizeCatalogSearch = (value) => {
+  const normalized = normalizeSolicitudSearch(value);
+  if (!normalized) return null;
+  const text = normalized.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase()
+    .replace(/[^a-z0-9]+/g, ' ').trim().replace(/\s+/g, ' ');
+  return { text, compact: text.replace(/[^a-z0-9]+/g, '') };
+};
+
 export const resolveOperativeWarehouseId = async (queryRunner, userSucursalId) => {
   const result = await queryRunner.query(
     `SELECT a.id_almacen FROM public.almacenes a
@@ -142,6 +150,16 @@ const stockStatusSql = (quantitySql, minimumSql) => `
     WHEN ${quantitySql} <= ${minimumSql} THEN 'STOCK_BAJO'
     ELSE 'DISPONIBLE'
   END
+`;
+
+const normalizeSearchSql = (expression) => `
+  TRANSLATE(LOWER(COALESCE(${expression}, '')),
+    'áàäâãåéèëêíìïîóòöôõúùüûñç',
+    'aaaaaaeeeeiiiiooooouuuunc')
+`;
+
+const compactSearchSql = (expression) => `
+  REGEXP_REPLACE(${normalizeSearchSql(expression)}, '[^a-z0-9]+', '', 'g')
 `;
 
 const serializeCatalogRow = (row) => ({
@@ -244,6 +262,8 @@ const resolveCatalogWarehouse = async (rawWarehouseId, access, queryRunner) => {
 };
 
 const buildCatalogUnion = (type) => {
+  const productSearch = `CONCAT_WS(' ', p.id_producto::text, p.nombre_producto, p.descripcion_producto,
+    cp.nombre_categoria, 'Producto', 'Unidad')`;
   const productSql = `
     SELECT 'PRODUCTO'::text AS tipo_item, p.id_producto AS id_item,
            p.nombre_producto AS nombre, p.descripcion_producto AS descripcion,
@@ -252,7 +272,9 @@ const buildCatalogUnion = (type) => {
            COALESCE(pa.cantidad, 0)::numeric AS cantidad,
            COALESCE(pa.stock_minimo, 0)::numeric AS stock_minimo,
            ${stockStatusSql('COALESCE(pa.cantidad, 0)', 'COALESCE(pa.stock_minimo, 0)')} AS estado_stock,
-           'Unidad'::text AS unidad_base, '[]'::jsonb AS presentaciones
+           'Unidad'::text AS unidad_base, '[]'::jsonb AS presentaciones,
+           ${normalizeSearchSql(productSearch)} AS search_text,
+           ${compactSearchSql(productSearch)} AS search_text_compact
     FROM public.productos p
     INNER JOIN public.productos_almacenes pa ON pa.id_producto = p.id_producto
     INNER JOIN public.almacenes a ON a.id_almacen = pa.id_almacen
@@ -260,6 +282,8 @@ const buildCatalogUnion = (type) => {
     LEFT JOIN public.categorias_productos cp ON cp.id_categoria_producto = p.id_categoria_producto
     WHERE pa.id_almacen = $1 AND p.estado = true AND pa.estado = true AND a.estado = true
   `;
+  const supplySearch = `CONCAT_WS(' ', i.id_insumo::text, i.nombre_insumo, i.descripcion,
+    ci.nombre_categoria, 'Insumo', ub.nombre, ub.simbolo, pres.search_text)`;
   const supplySql = `
     SELECT 'INSUMO'::text AS tipo_item, i.id_insumo AS id_item,
            i.nombre_insumo AS nombre, i.descripcion AS descripcion,
@@ -269,7 +293,9 @@ const buildCatalogUnion = (type) => {
            COALESCE(ia.stock_minimo, 0)::numeric AS stock_minimo,
            ${stockStatusSql('COALESCE(ia.cantidad, 0)', 'COALESCE(ia.stock_minimo, 0)')} AS estado_stock,
            COALESCE(NULLIF(TRIM(CONCAT(ub.nombre, CASE WHEN NULLIF(TRIM(ub.simbolo), '') IS NULL THEN '' ELSE CONCAT(' (', TRIM(ub.simbolo), ')') END)), ''), 'Sin unidad') AS unidad_base,
-           COALESCE(pres.presentaciones, '[]'::jsonb) AS presentaciones
+           COALESCE(pres.presentaciones, '[]'::jsonb) AS presentaciones,
+           ${normalizeSearchSql(supplySearch)} AS search_text,
+           ${compactSearchSql(supplySearch)} AS search_text_compact
     FROM public.insumos i
     INNER JOIN public.insumos_almacenes ia ON ia.id_insumo = i.id_insumo
     INNER JOIN public.almacenes a ON a.id_almacen = ia.id_almacen
@@ -286,7 +312,8 @@ const buildCatalogUnion = (type) => {
         'unidad_base', ubp.nombre,
         'factor_conversion', ip.cantidad_base / NULLIF(ip.cantidad_presentacion, 0),
         'es_predeterminada_compra', ip.es_predeterminada_compra
-      ) ORDER BY ip.es_predeterminada_compra DESC, ip.id_presentacion) AS presentaciones
+      ) ORDER BY ip.es_predeterminada_compra DESC, ip.id_presentacion) AS presentaciones,
+      STRING_AGG(CONCAT_WS(' ', ip.nombre_presentacion, up.nombre, up.simbolo, ubp.nombre, ubp.simbolo), ' ') AS search_text
       FROM public.insumo_presentaciones ip
       INNER JOIN public.unidades_medida up ON up.id_unidad_medida = ip.id_unidad_presentacion
       INNER JOIN public.unidades_medida ubp ON ubp.id_unidad_medida = ip.id_unidad_base
@@ -447,15 +474,15 @@ export const createSolicitudesCompraService = (overrides = {}) => {
     if (type && !['producto', 'insumo'].includes(type)) fail(400, 'VALIDATION_ERROR', 'tipo debe ser producto o insumo.');
     const lowStock = parseBoolean(req.query?.solo_stock_bajo);
     if (lowStock === null) fail(400, 'VALIDATION_ERROR', 'solo_stock_bajo debe ser booleano.');
-    const search = hasValue(req.query?.buscar) ? String(req.query.buscar).trim().slice(0, 120) : null;
+    const search = normalizeCatalogSearch(req.query?.buscar);
     const pagination = parsePagination(req.query);
     const result = await dependencies.db.query(
       `
         WITH catalogo AS (${buildCatalogUnion(type)})
         SELECT catalogo.*, COUNT(*) OVER()::integer AS total_count
         FROM catalogo
-        WHERE ($2::text IS NULL OR catalogo.nombre ILIKE '%' || $2 || '%' OR COALESCE(catalogo.descripcion, '') ILIKE '%' || $2 || '%')
-          AND ($3::boolean = false OR catalogo.estado_stock IN ('SIN_STOCK', 'STOCK_BAJO'))
+        WHERE ($2::text IS NULL OR catalogo.search_text LIKE '%' || $2 || '%' OR catalogo.search_text_compact LIKE '%' || $3 || '%')
+          AND ($4::boolean = false OR catalogo.estado_stock IN ('SIN_STOCK', 'STOCK_BAJO'))
         ORDER BY
           CASE catalogo.estado_stock
             WHEN 'SIN_STOCK' THEN 0
@@ -466,9 +493,9 @@ export const createSolicitudesCompraService = (overrides = {}) => {
           LOWER(catalogo.nombre),
           catalogo.tipo_item,
           catalogo.id_item
-        LIMIT $4 OFFSET $5
+        LIMIT $5 OFFSET $6
       `,
-      [warehouse.id_almacen, search, lowStock, pagination.limit, pagination.offset]
+      [warehouse.id_almacen, search?.text ?? null, search?.compact ?? null, lowStock, pagination.limit, pagination.offset]
     );
     const total = Number(result.rows?.[0]?.total_count ?? 0);
     return {

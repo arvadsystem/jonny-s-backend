@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import {
   createSolicitudesCompraService,
+  normalizeCatalogSearch,
   normalizeSolicitudSearch,
   parseQuantity,
   resolveOperativeWarehouseId
@@ -109,8 +110,8 @@ test('catalogo aplica prioridad global de stock antes de paginar y conserva dese
     'LOWER(catalogo.nombre)',
     'catalogo.tipo_item',
     'catalogo.id_item',
-    'LIMIT $4',
-    'OFFSET $5'
+    'LIMIT $5',
+    'OFFSET $6'
   ];
   let previousIndex = -1;
   for (const fragment of expectedOrder) {
@@ -119,16 +120,16 @@ test('catalogo aplica prioridad global de stock antes de paginar y conserva dese
     previousIndex = currentIndex;
   }
   assert.match(compactSql, /catalogo\.estado_stock IN \('SIN_STOCK', 'STOCK_BAJO'\)/);
-  assert.match(compactSql, /catalogo\.nombre ILIKE '%' \|\| \$2 \|\| '%'/);
-  assert.match(compactSql, /COALESCE\(catalogo\.descripcion, ''\) ILIKE '%' \|\| \$2 \|\| '%'/);
-  assert.deepEqual(captured.params, [11, 'aceite', true, 12, 12]);
+  assert.match(compactSql, /catalogo\.search_text LIKE '%' \|\| \$2 \|\| '%'/);
+  assert.match(compactSql, /catalogo\.search_text_compact LIKE '%' \|\| \$3 \|\| '%'/);
+  assert.deepEqual(captured.params, [11, 'aceite', 'aceite', true, 12, 12]);
 });
 
 test('catalogo completo no excluye disponibles cuando solo_stock_bajo es false o se omite', async () => {
   for (const query of [{ solo_stock_bajo: 'false' }, {}]) {
     const { captured, result } = await captureCatalogQuery(query);
-    assert.equal(captured.params[2], false);
-    assert.match(captured.sql, /\(\$3::boolean = false OR catalogo\.estado_stock IN \('SIN_STOCK', 'STOCK_BAJO'\)\)/);
+    assert.equal(captured.params[3], false);
+    assert.match(captured.sql, /\(\$4::boolean = false OR catalogo\.estado_stock IN \('SIN_STOCK', 'STOCK_BAJO'\)\)/);
     assert.deepEqual(result, {
       ok: true,
       id_almacen: 11,
@@ -136,6 +137,58 @@ test('catalogo completo no excluye disponibles cuando solo_stock_bajo es false o
       pagination: { page: 1, limit: 20, total: 0, total_pages: 0 }
     });
   }
+});
+
+test('catalogo normaliza tildes separadores espacios y variante compacta', () => {
+  assert.deepEqual(normalizeCatalogSearch('  LIMÓN   isotónico  '), {
+    text: 'limon isotonico',
+    compact: 'limonisotonico'
+  });
+  assert.deepEqual(normalizeCatalogSearch('Bandeja 7 X 7'), {
+    text: 'bandeja 7 x 7',
+    compact: 'bandeja7x7'
+  });
+  assert.deepEqual(normalizeCatalogSearch('coca-cola 5 X 11'), {
+    text: 'coca cola 5 x 11',
+    compact: 'cocacola5x11'
+  });
+  assert.equal(normalizeCatalogSearch('   '), null);
+  assert.throws(() => normalizeCatalogSearch('x'.repeat(121)), (error) => error.status === 400);
+});
+
+test('catalogo indexa campos de producto insumo unidades y presentaciones validas sin N mas 1', async () => {
+  const { captured } = await captureCatalogQuery({ buscar: '7x7' });
+  const sql = captured.sql.replace(/\s+/g, ' ');
+  for (const field of [
+    'p.id_producto::text', 'p.nombre_producto', 'p.descripcion_producto', 'cp.nombre_categoria',
+    "'Producto'", "'Unidad'", 'i.id_insumo::text', 'i.nombre_insumo', 'i.descripcion',
+    'ci.nombre_categoria', "'Insumo'", 'ub.nombre', 'ub.simbolo',
+    'ip.nombre_presentacion', 'up.nombre', 'up.simbolo', 'ubp.nombre', 'ubp.simbolo'
+  ]) assert.match(sql, new RegExp(field.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+  assert.match(sql, /STRING_AGG\(/);
+  assert.match(sql, /ip\.estado = true AND ip\.uso_compra = true/);
+  assert.match(sql, /ip\.cantidad_presentacion > 0 AND ip\.cantidad_base > 0/);
+  assert.equal((sql.match(/LEFT JOIN LATERAL/g) || []).length, 1);
+  assert.deepEqual(captured.params.slice(1, 3), ['7x7', '7x7']);
+});
+
+test('catalogo filtra antes de ordenar y paginar sin exponer campos auxiliares', async () => {
+  const { captured } = await captureCatalogQuery({ buscar: 'coca cola', page: 2, limit: 5 });
+  const resultOrder = captured.sql.lastIndexOf('ORDER BY');
+  assert.ok(captured.sql.indexOf('WHERE ($2::text') < resultOrder);
+  assert.ok(resultOrder < captured.sql.indexOf('LIMIT $5'));
+  assert.deepEqual(captured.params, [11, 'coca cola', 'cocacola', false, 5, 5]);
+  const serialized = await (async () => {
+    const db = makeReadDb(async (sql) => {
+      if (sql.includes('FROM public.almacenes a') && !sql.includes('WITH catalogo')) return { rows: [warehouseRow()], rowCount: 1 };
+      return { rows: [{ ...warehouseRow(), tipo_item: 'PRODUCTO', id_item: 1, nombre: 'Coca-Cola',
+        descripcion: null, categoria: 'Bebidas', cantidad: 1, stock_minimo: 0, estado_stock: 'DISPONIBLE',
+        unidad_base: 'Unidad', presentaciones: [], search_text: 'secreto', search_text_compact: 'secreto', total_count: 1 }], rowCount: 1 };
+    });
+    return createSolicitudesCompraService(baseOverrides(db)).listCatalog({ query: { id_almacen: 11 } });
+  })();
+  assert.equal(Object.hasOwn(serialized.items[0], 'search_text'), false);
+  assert.equal(Object.hasOwn(serialized.items[0], 'search_text_compact'), false);
 });
 
 test('catalogo conserva filtros separados para producto e insumo', async () => {
