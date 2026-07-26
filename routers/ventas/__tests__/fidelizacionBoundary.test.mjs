@@ -3,7 +3,7 @@ import { describe, it } from 'node:test';
 import { readFile, readdir } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { notifyPaidInvoice } from '../../../modules/fidelizacion/index.js';
+import { notifyPaidInvoice, reservePaidInvoiceAccumulation } from '../../../modules/fidelizacion/index.js';
 import { fidelizacionPool } from '../../../modules/fidelizacion/infrastructure/fidelizacionPool.js';
 
 const getVentasSource = async () => readFile(new URL('../../ventas.js', import.meta.url), 'utf8');
@@ -39,9 +39,9 @@ const getHandlerBlock = (source, routeMarker) => {
 };
 
 describe('Frontera Ventas -> Fidelizacion (modules/fidelizacion)', () => {
-  it('Ventas importa notifyPaidInvoice desde el modulo de fidelizacion, no el servicio directo', async () => {
+  it('Ventas importa la frontera del modulo de fidelizacion, no el servicio directo', async () => {
     const source = await getVentasSource();
-    assert.match(source, /import \{ notifyPaidInvoice \} from '\.\.\/modules\/fidelizacion\/index\.js';/);
+    assert.match(source, /import \{ notifyPaidInvoice, reservePaidInvoiceAccumulation \} from '\.\.\/modules\/fidelizacion\/index\.js';/);
     assert.doesNotMatch(source, /from '\.\.\/services\/fidelizacionService\.js'/);
   });
 
@@ -118,9 +118,9 @@ describe('Frontera Ventas -> Fidelizacion (modules/fidelizacion)', () => {
     assert.ok(jsonIndex < notifyIndex);
   });
 
-  it('modules/fidelizacion/index.js expone publicamente solo notifyPaidInvoice', async () => {
+  it('modules/fidelizacion/index.js expone publicamente solo la reserva y la notificacion', async () => {
     const moduleIndex = await import('../../../modules/fidelizacion/index.js');
-    assert.deepEqual(Object.keys(moduleIndex), ['notifyPaidInvoice']);
+    assert.deepEqual(Object.keys(moduleIndex).sort(), ['notifyPaidInvoice', 'reservePaidInvoiceAccumulation']);
   });
 
   it('respuesta 201 aunque notifyPaidInvoice falle: la respuesta ya se envio antes de que la notificacion resuelva o rechace', async () => {
@@ -165,6 +165,80 @@ describe('Frontera Ventas -> Fidelizacion (modules/fidelizacion)', () => {
     } finally {
       fidelizacionPool.connect = originalConnect;
     }
+  });
+
+  it('durabilidad: los 5 flujos completamente pagados reservan ANTES de su COMMIT y notifican DESPUES', async () => {
+    const source = await getVentasSource();
+
+    // Cada reserva debe quedar emparejada con un COMMIT posterior y, mas
+    // adelante, con su notificacion. Se recorre el archivo en orden.
+    const eventos = [...source.matchAll(/reservePaidInvoiceAccumulation\(\{|await client\.query\('COMMIT'\)|notifyPaidInvoice\(\{/g)]
+      .map((m) => (m[0].startsWith('reserve') ? 'RESERVA' : m[0].includes('COMMIT') ? 'COMMIT' : 'NOTIFY'));
+
+    const reservas = eventos.filter((e) => e === 'RESERVA').length;
+    assert.equal(reservas, 5, 'deben existir exactamente 5 reservas: registrar-pago + venta directa (RPC v1/v2/v3 y legado)');
+
+    // Para cada RESERVA debe haber un COMMIT despues y luego un NOTIFY.
+    for (let i = 0; i < eventos.length; i += 1) {
+      if (eventos[i] !== 'RESERVA') continue;
+      const resto = eventos.slice(i + 1);
+      const commitIdx = resto.indexOf('COMMIT');
+      const notifyIdx = resto.indexOf('NOTIFY');
+      assert.notEqual(commitIdx, -1, `la reserva #${i} debe ir seguida de un COMMIT`);
+      assert.notEqual(notifyIdx, -1, `la reserva #${i} debe ir seguida de una notificacion`);
+      assert.ok(commitIdx < notifyIdx, `la reserva #${i} debe confirmarse (COMMIT) antes de notificar`);
+    }
+  });
+
+  it('durabilidad: toda reserva usa el client de la transaccion financiera y solo el id_factura', async () => {
+    const source = await getVentasSource();
+    const calls = [...source.matchAll(/reservePaidInvoiceAccumulation\(\{([^}]*)\}\)/g)];
+    assert.equal(calls.length, 5);
+    for (const call of calls) {
+      const args = call[1].trim();
+      assert.match(
+        args,
+        /^client,\s*idFactura(:\s*[\w.?]+)?$/,
+        `la reserva debe recibir el client financiero y solo el id_factura: "${args}"`
+      );
+    }
+  });
+
+  it('durabilidad: la reserva se hace con await (dentro de la transaccion), la notificacion sigue siendo fire-and-forget', async () => {
+    const source = await getVentasSource();
+    // La reserva NO puede ser fire-and-forget: debe completarse antes del COMMIT.
+    const sinAwait = [...source.matchAll(/(^|[^\w.])(?<!await )reservePaidInvoiceAccumulation\(/gm)];
+    assert.equal(sinAwait.length, 0, 'toda reserva debe ejecutarse con await antes del COMMIT');
+    assert.doesNotMatch(source, /void reservePaidInvoiceAccumulation/, 'la reserva nunca debe ser fire-and-forget');
+  });
+
+  it('pago parcial en registrar-pago: no reserva ni notifica (ambos bajo el mismo guard)', async () => {
+    const source = await getVentasSource();
+    const handler = getHandlerBlock(source, "router.post('/ventas/pedidos/:id/registrar-pago'");
+
+    const reservaIdx = handler.indexOf('reservePaidInvoiceAccumulation(');
+    const guardIdx = handler.lastIndexOf('if (pedidoPagadoCompleto) {', reservaIdx);
+    assert.notEqual(guardIdx, -1, 'la reserva debe estar dentro de un bloque if (pedidoPagadoCompleto)');
+    // El unico codigo entre el guard y la reserva es la confirmacion legada del pedido.
+    const entreGuardYReserva = handler.slice(guardIdx, reservaIdx);
+    assert.doesNotMatch(entreGuardYReserva, /\n\s*\}/, 'la reserva no debe quedar fuera del bloque del guard');
+  });
+
+  it('respuesta 201 intacta aunque la reserva falle: reservePaidInvoiceAccumulation nunca lanza', async () => {
+    // Contrato ejecutable (no regex): con un client que falla en TODA
+    // consulta, la reserva resuelve sin lanzar, de modo que la transaccion
+    // financiera puede continuar hacia su COMMIT y su 201.
+    const clientQueRompe = {
+      query: async () => { throw new Error('FALLA_TOTAL_DE_LA_RESERVA'); }
+    };
+
+    let outcome;
+    await assert.doesNotReject(
+      (async () => { outcome = await reservePaidInvoiceAccumulation({ client: clientQueRompe, idFactura: 123 }); })(),
+      'la reserva nunca debe propagar un error hacia la transaccion de Ventas'
+    );
+    assert.equal(outcome.reserved, false);
+    assert.equal(outcome.reason, 'SAVEPOINT_ERROR');
   });
 
   it('multicanal: ningun archivo de routers/ fuera de ventas.js crea una factura (INSERT INTO public.facturas)', async () => {

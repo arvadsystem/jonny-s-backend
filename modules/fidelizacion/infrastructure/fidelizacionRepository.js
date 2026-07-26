@@ -1,5 +1,7 @@
 import { fidelizacionPool } from './fidelizacionPool.js';
 import { registerFacturaLoyaltyAccumulation } from '../../../services/fidelizacionService.js';
+import { normalizePhoneHN } from '../../../utils/security/personasHardening.js';
+import { PEDIDO_ORIGIN, resolvePedidoOrigin } from '../../../utils/pedidoOrigen.js';
 import {
   ACCUMULATION_STATE,
   ACCUMULATION_TRIGGER,
@@ -145,6 +147,155 @@ const BUSINESS_SKIP_REASONS = new Set([
   'POINTS_ROUND_DOWN_TO_ZERO'
 ]);
 
+// ---------------------------------------------------------------------------
+// Snapshot historico de elegibilidad
+// ---------------------------------------------------------------------------
+// Solo LECTURA. Nunca escribe en telefonos/personas/empresas: el perfil
+// maestro es intocable desde el camino de acumulacion (una escritura fallida
+// -p.ej. el UNIQUE de telefonos.telefono- abortaria toda la transaccion en
+// PostgreSQL, y ningun try/catch de JS la rescata).
+//
+// Devuelve las columnas crudas necesarias para decidir la elegibilidad; la
+// precedencia (contacto del pedido vs perfil maestro) se resuelve en
+// buildAccumulationSnapshot, en JS, reutilizando resolvePedidoOrigin
+// (utils/pedidoOrigen.js) y normalizePhoneHN.
+const fetchAccumulationSnapshotSources = async (client, idFactura) => {
+  const result = await client.query(
+    `
+      SELECT
+        f.id_factura,
+        f.id_pedido,
+        COALESCE(p.id_cliente, f.id_cliente) AS id_cliente,
+        COALESCE(p.id_sucursal, f.id_sucursal) AS id_sucursal,
+        COALESCE(upc.fecha_pago_confirmado, f.fecha_hora_facturacion) AS fecha_referencia,
+        p.origen_pedido,
+        p.id_cliente AS pedido_id_cliente,
+        pc.nombre_contacto,
+        pc.telefono_normalizado,
+        COALESCE(c.estado, true) AS cliente_estado,
+        CASE WHEN c.id_persona IS NOT NULL THEN per.nombre ELSE emp.nombre_empresa END AS nombre_maestro,
+        CASE WHEN c.id_persona IS NOT NULL THEN telp.telefono ELSE tele.telefono END AS telefono_maestro
+      FROM public.facturas f
+      LEFT JOIN public.pedidos p ON p.id_pedido = f.id_pedido
+      LEFT JOIN LATERAL (
+        SELECT ppc.fecha_pago_confirmado
+        FROM public.pedidos_pago_control ppc
+        WHERE ppc.id_pedido = f.id_pedido
+        ORDER BY ppc.id_pedido_pago_control DESC
+        LIMIT 1
+      ) upc ON TRUE
+      LEFT JOIN LATERAL (
+        SELECT pci.nombre_contacto, pci.telefono_normalizado
+        FROM public.pedidos_contacto pci
+        WHERE pci.id_pedido = f.id_pedido
+        ORDER BY pci.id_pedido_contacto DESC
+        LIMIT 1
+      ) pc ON TRUE
+      LEFT JOIN public.clientes c ON c.id_cliente = COALESCE(p.id_cliente, f.id_cliente)
+      LEFT JOIN public.personas per ON per.id_persona = c.id_persona
+      LEFT JOIN public.telefonos telp ON telp.id_telefono = per.id_telefono
+      LEFT JOIN public.empresas emp ON emp.id_empresa = c.id_empresa
+      LEFT JOIN public.telefonos tele ON tele.id_telefono = emp.id_telefono
+      WHERE f.id_factura = $1
+      LIMIT 1
+    `,
+    [idFactura]
+  );
+
+  return result.rows[0] || null;
+};
+
+const normalizeSnapshotText = (value) => String(value ?? '').trim();
+
+// Regla de precedencia acordada:
+// - origen PUBLIC_MENU + el pedido pertenece al MISMO cliente de la factura
+//   -> el contacto capturado en el pedido ES la evidencia historica.
+// - origen UNKNOWN (incluye NULL, filas legadas) -> solo cuenta como menu
+//   publico si hay evidencia COMPLETA del flujo publico: pedido con cliente
+//   valido, fila de contacto existente, nombre y telefono validos, y el
+//   dueno del pedido coincide con el cliente de la factura. Sin eso, no se
+//   asume nada.
+// - cualquier otro caso -> perfil maestro vigente EN ESE MOMENTO (en la
+//   reserva pre-COMMIT el perfil maestro es, por definicion, el historico).
+//
+// El contacto de un pedido NUNCA se aplica a un cliente distinto de su dueno:
+// eso es lo que impide que en una cuenta dividida el telefono de quien pidio
+// se le atribuya a un acompanante.
+const resolveSnapshotFromSources = (sources) => {
+  const idCliente = parsePositiveInt(sources?.id_cliente);
+  const pedidoIdCliente = parsePositiveInt(sources?.pedido_id_cliente);
+  const origen = resolvePedidoOrigin({ origen_pedido: sources?.origen_pedido });
+
+  const contactoNombre = normalizeSnapshotText(sources?.nombre_contacto);
+  const contactoTelefono = normalizePhoneHN(sources?.telefono_normalizado);
+  const contactoEsDelMismoCliente = Boolean(idCliente && pedidoIdCliente && idCliente === pedidoIdCliente);
+  const contactoUtilizable = Boolean(contactoEsDelMismoCliente && contactoNombre && contactoTelefono);
+
+  const esMenuPublico = origen === PEDIDO_ORIGIN.PUBLIC_MENU
+    || (origen === PEDIDO_ORIGIN.UNKNOWN && contactoUtilizable);
+
+  if (esMenuPublico && contactoEsDelMismoCliente && (contactoNombre || contactoTelefono)) {
+    return {
+      nombre: contactoNombre || null,
+      telefono: contactoTelefono || null,
+      fuente: 'PEDIDO_CONTACTO'
+    };
+  }
+
+  return {
+    nombre: normalizeSnapshotText(sources?.nombre_maestro) || null,
+    telefono: normalizePhoneHN(sources?.telefono_maestro),
+    fuente: 'PERFIL_MAESTRO'
+  };
+};
+
+// Snapshot completo listo para persistir. clienteActivo + nombre no vacio +
+// telefono valido (normalizePhoneHN). Solo `nombre`, nunca apellido: mismo
+// criterio exacto que isClienteProfileComplete.
+export const buildAccumulationSnapshot = async (client, { idFactura } = {}) => {
+  const facturaId = parsePositiveInt(idFactura);
+  if (!facturaId) return null;
+
+  const sources = await fetchAccumulationSnapshotSources(client, facturaId);
+  if (!sources) return null;
+
+  const perfil = resolveSnapshotFromSources(sources);
+  const clienteActivo = Boolean(sources.cliente_estado);
+  const perfilCompleto = Boolean(clienteActivo && perfil.nombre && perfil.telefono);
+
+  return {
+    idFactura: facturaId,
+    idPedido: parsePositiveInt(sources.id_pedido),
+    idCliente: parsePositiveInt(sources.id_cliente),
+    idSucursal: parsePositiveInt(sources.id_sucursal),
+    fechaReferencia: sources.fecha_referencia ?? null,
+    origenPedido: sources.origen_pedido ?? null,
+    nombreSnapshot: perfil.nombre,
+    telefonoSnapshot: perfil.telefono,
+    perfilCompletoSnapshot: perfilCompleto,
+    fuenteSnapshot: perfil.fuente
+  };
+};
+
+// Reconstruye el snapshot de una fila durable ya persistida. Si la fila no
+// trae snapshot (perfil_completo_snapshot NULL: fila legada creada antes de
+// esta migracion), devuelve null -> no hay evidencia confiable.
+export const snapshotFromStateRow = (row) => {
+  if (!row || row.perfil_completo_snapshot === null || row.perfil_completo_snapshot === undefined) return null;
+  return {
+    idFactura: parsePositiveInt(row.id_factura),
+    idPedido: parsePositiveInt(row.id_pedido),
+    idCliente: parsePositiveInt(row.id_cliente),
+    idSucursal: parsePositiveInt(row.id_sucursal),
+    fechaReferencia: row.fecha_referencia ?? null,
+    origenPedido: row.origen_pedido ?? null,
+    nombreSnapshot: row.nombre_snapshot ?? null,
+    telefonoSnapshot: row.telefono_snapshot ?? null,
+    perfilCompletoSnapshot: Boolean(row.perfil_completo_snapshot),
+    fuenteSnapshot: 'RESERVA_DURABLE'
+  };
+};
+
 // Bloqueante: evitar acumulacion retroactiva cuando no existe estado previo.
 // Reserva la fila PENDING para una factura que se sabe recien pagada, ANTES
 // de evaluar perfil/switch/tasa/puntos (camino LIVE unicamente -- ver
@@ -153,7 +304,10 @@ const BUSINESS_SKIP_REASONS = new Set([
 // upsertAccumulationState) lo sube a 1. ON CONFLICT DO NOTHING: si ya existe
 // cualquier fila (de un intento anterior, o de una carrera con otro
 // disparador bajo el mismo advisory lock), esta reserva no la toca.
-export const ensurePendingAccumulationState = async (client, idFactura, fechaReferencia = null) => {
+// Acepta un snapshot opcional (buildAccumulationSnapshot). Cuando viene, la
+// fila PENDING queda con la evidencia historica ya congelada: es lo que
+// permite decidir despues sin volver a mirar el perfil actual del cliente.
+export const ensurePendingAccumulationState = async (client, idFactura, fechaReferencia = null, snapshot = null) => {
   const facturaId = parsePositiveInt(idFactura);
   if (!facturaId) return null;
 
@@ -161,13 +315,25 @@ export const ensurePendingAccumulationState = async (client, idFactura, fechaRef
     `
       INSERT INTO public.fidelizacion_acumulacion_facturas_estado (
         id_factura, estado, motivo, elegibilidad_determinada, fecha_referencia,
-        fecha_creacion, fecha_actualizacion, intentos, ultimo_error
+        fecha_creacion, fecha_actualizacion, intentos, ultimo_error,
+        id_pedido, id_cliente, id_sucursal, origen_pedido,
+        nombre_snapshot, telefono_snapshot, perfil_completo_snapshot
       )
-      VALUES ($1, 'PENDING', NULL, NULL, $2, NOW(), NOW(), 0, NULL)
+      VALUES ($1, 'PENDING', NULL, NULL, $2, NOW(), NOW(), 0, NULL, $3, $4, $5, $6, $7, $8, $9)
       ON CONFLICT (id_factura) DO NOTHING
       RETURNING id_factura, estado, motivo, elegibilidad_determinada, intentos
     `,
-    [facturaId, fechaReferencia]
+    [
+      facturaId,
+      fechaReferencia ?? snapshot?.fechaReferencia ?? null,
+      snapshot?.idPedido ?? null,
+      snapshot?.idCliente ?? null,
+      snapshot?.idSucursal ?? null,
+      snapshot?.origenPedido ?? null,
+      snapshot?.nombreSnapshot ?? null,
+      snapshot?.telefonoSnapshot ?? null,
+      snapshot ? Boolean(snapshot.perfilCompletoSnapshot) : null
+    ]
   );
 
   return result.rows[0] || null;
@@ -179,7 +345,10 @@ export const getAccumulationState = async (client, idFactura) => {
 
   const result = await client.query(
     `
-      SELECT id_factura, estado, motivo, elegibilidad_determinada, fecha_referencia, intentos
+      SELECT
+        id_factura, estado, motivo, elegibilidad_determinada, fecha_referencia, intentos,
+        id_pedido, id_cliente, id_sucursal, origen_pedido,
+        nombre_snapshot, telefono_snapshot, perfil_completo_snapshot
       FROM public.fidelizacion_acumulacion_facturas_estado
       WHERE id_factura = $1
       LIMIT 1
@@ -267,12 +436,23 @@ export const recordAccumulationRetryableError = async (client, idFactura, { fech
 // antigua que ya fue evaluada y rechazada.
 //
 // trigger distingue el camino inmediato (LIVE, justo tras el COMMIT de la
-// venta -perfil actual = perfil al momento de la compra, confiable-) del de
-// reconciliacion (RECONCILE, asincrono -no puede garantizar que el perfil
-// actual sea el de la compra-). Solo afecta el MOTIVO persistido cuando el
-// rechazo es por perfil incompleto: el resto de motivos (config/tasa/redondeo)
-// ya son time-accurate porque getActiveFidelizacionConfig siempre usa la
-// referenceDate historica de la factura, nunca "ahora".
+// venta) del de reconciliacion (RECONCILE, asincrono). Solo afecta el MOTIVO
+// persistido cuando el rechazo es por perfil incompleto: el resto de motivos
+// (config/tasa/redondeo) ya son time-accurate porque
+// getActiveFidelizacionConfig siempre usa la referenceDate historica de la
+// factura, nunca "ahora".
+//
+// ELEGIBILIDAD: siempre se decide con un snapshot historico, nunca con el
+// perfil actual del cliente:
+// - fila durable PENDING/RETRYABLE_ERROR con snapshot -> ese snapshot (la vía
+//   principal: lo escribio reservePaidInvoiceAccumulation dentro de la
+//   transaccion financiera).
+// - sin fila + LIVE -> se construye ahora (recuperacion secundaria: la reserva
+//   pre-COMMIT fallo o la factura es anterior a esta funcionalidad). Sigue
+//   siendo contemporaneo al pago porque LIVE corre inmediatamente despues.
+// - sin fila + RECONCILE -> solo se acepta evidencia historica de
+//   pedidos_contacto (menu publico); si no la hay, terminal
+//   LEGACY_ELIGIBILITY_UNVERIFIABLE. Jamas el perfil actual.
 export const persistAccumulation = async ({
   client,
   idFactura,
@@ -294,24 +474,39 @@ export const persistAccumulation = async ({
       : { created: false, reason: existingState.motivo };
   }
 
-  if (!existingState) {
-    if (trigger === ACCUMULATION_TRIGGER.RECONCILE) {
-      // Reconciliacion nunca es la primera en evaluar una factura: si no
-      // existe fila, no se consulta perfil actual, ni config, ni puntos --
-      // se registra terminal de inmediato como no verificable (no se puede
-      // garantizar que el perfil actual sea el de la compra).
-      await upsertAccumulationState(client, {
-        idFactura,
-        estado: ACCUMULATION_STATE.SKIPPED_TERMINAL,
-        motivo: LEGACY_ELIGIBILITY_UNVERIFIABLE,
-        elegibilidadDeterminada: false,
-        fechaReferencia: referenceDate
-      });
-      return { created: false, reason: LEGACY_ELIGIBILITY_UNVERIFIABLE };
+  let eligibilitySnapshot = existingState ? snapshotFromStateRow(existingState) : null;
+
+  if (!eligibilitySnapshot) {
+    const rebuilt = await buildAccumulationSnapshot(client, { idFactura });
+
+    if (trigger === ACCUMULATION_TRIGGER.RECONCILE && !existingState) {
+      // Sin reserva durable previa, reconciliacion solo puede confiar en la
+      // evidencia historica del pedido (pedidos_contacto del menu publico).
+      // El perfil maestro de HOY no prueba nada sobre el momento de la compra.
+      const evidenciaHistorica = rebuilt && rebuilt.fuenteSnapshot === 'PEDIDO_CONTACTO' && rebuilt.perfilCompletoSnapshot
+        ? rebuilt
+        : null;
+
+      if (!evidenciaHistorica) {
+        await upsertAccumulationState(client, {
+          idFactura,
+          estado: ACCUMULATION_STATE.SKIPPED_TERMINAL,
+          motivo: LEGACY_ELIGIBILITY_UNVERIFIABLE,
+          elegibilidadDeterminada: false,
+          fechaReferencia: referenceDate
+        });
+        return { created: false, reason: LEGACY_ELIGIBILITY_UNVERIFIABLE };
+      }
+
+      eligibilitySnapshot = evidenciaHistorica;
+    } else {
+      eligibilitySnapshot = rebuilt;
     }
 
-    // Camino LIVE: reserva PENDING antes de evaluar perfil/switch/tasa/puntos.
-    await ensurePendingAccumulationState(client, idFactura, referenceDate);
+    // Reserva/actualiza la fila con el snapshot recien resuelto. La fila
+    // PENDING existente (sin snapshot, p.ej. legada) no se degrada: el
+    // ON CONFLICT DO NOTHING la respeta y el snapshot se usa solo en memoria.
+    await ensurePendingAccumulationState(client, idFactura, referenceDate, eligibilitySnapshot);
   }
 
   const result = await registerFacturaLoyaltyAccumulation({
@@ -322,7 +517,8 @@ export const persistAccumulation = async ({
     idSucursal,
     idUsuarioEjecutor,
     montoFactura,
-    referenceDate
+    referenceDate,
+    eligibilitySnapshot
   });
 
   if (result.created || result.reason === 'ALREADY_REGISTERED') {
@@ -337,7 +533,15 @@ export const persistAccumulation = async ({
   }
 
   if (BUSINESS_SKIP_REASONS.has(result.reason)) {
-    const persistedMotivo = trigger === ACCUMULATION_TRIGGER.RECONCILE && result.reason === 'CLIENT_PROFILE_INCOMPLETE'
+    // El rechazo por perfil incompleto solo se relabela como "no verificable"
+    // cuando de verdad NO hay evidencia historica que lo respalde: es decir,
+    // cuando reconciliacion trabaja sobre una fila legada sin snapshot. Si
+    // hay snapshot (la via normal desde la reserva pre-COMMIT), el motivo es
+    // verificable y se conserva tal cual.
+    const sinEvidenciaHistorica = !eligibilitySnapshot;
+    const persistedMotivo = trigger === ACCUMULATION_TRIGGER.RECONCILE
+      && result.reason === 'CLIENT_PROFILE_INCOMPLETE'
+      && sinEvidenciaHistorica
       ? LEGACY_ELIGIBILITY_UNVERIFIABLE
       : result.reason;
 

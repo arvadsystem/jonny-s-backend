@@ -4,7 +4,7 @@ import { createHash } from 'node:crypto';
 import pool from '../config/db-connection.js';
 import { checkPermission, requestHasAnyPermission, requestHasAnyRole } from '../middleware/checkPermission.js';
 import { resolveRequestUserSucursalScope } from '../utils/sucursalScope.js';
-import { notifyPaidInvoice } from '../modules/fidelizacion/index.js';
+import { notifyPaidInvoice, reservePaidInvoiceAccumulation } from '../modules/fidelizacion/index.js';
 import { generarCodigoDocumento } from '../services/facturacionCorrelativoService.js';
 import {
   aplicarSnapshotEnFactura,
@@ -9498,6 +9498,10 @@ router.post('/ventas/pedidos/:id/registrar-pago', checkPermission(['VENTAS_CREAR
 
     if (pedidoPagadoCompleto) {
       await updatePedidoLegacyPagoConfirmado({ client, idPedido, userId });
+      // Reserva durable de fidelizacion DENTRO de esta transaccion (aislada en
+      // su propio SAVEPOINT: nunca lanza ni aborta el pago). Solo cuando el
+      // pedido quedo completamente pagado; un pago parcial no reserva.
+      await reservePaidInvoiceAccumulation({ client, idFactura });
     }
 
     const commitStart = ventasPerf.now();
@@ -9834,6 +9838,12 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
         idUsuario: userId,
         idSucursal: venta.id_sucursal
       });
+      // Reserva durable de fidelizacion antes del COMMIT, con el mismo guard
+      // que la notificacion post-COMMIT (un replay idempotente no reserva).
+      // En V3 el idFactura puede venir null: la reserva lo detecta y no opera.
+      if (shouldRunRpcPostCommitSideEffects(rpcV3ResponseBody)) {
+        await reservePaidInvoiceAccumulation({ client, idFactura: rpcCreateResult.fidelizacionJob.idFactura });
+      }
       const commitStart = ventasPerf.now();
       await client.query('COMMIT');
       transactionStarted = false;
@@ -9902,6 +9912,10 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
         idSucursal: venta.id_sucursal
       });
 
+      // Reserva durable de fidelizacion antes del COMMIT (SAVEPOINT propio:
+      // nunca lanza ni aborta la venta).
+      await reservePaidInvoiceAccumulation({ client, idFactura: rpcCreateResult.fidelizacionJob.idFactura });
+
       const commitStart = ventasPerf.now();
       await client.query('COMMIT');
       transactionStarted = false;
@@ -9960,6 +9974,10 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
         idUsuario: userId,
         idSucursal: venta.id_sucursal
       });
+
+      // Reserva durable de fidelizacion antes del COMMIT (SAVEPOINT propio:
+      // nunca lanza ni aborta la venta).
+      await reservePaidInvoiceAccumulation({ client, idFactura: rpcCreateResult.fidelizacionJob.idFactura });
 
       const commitStart = ventasPerf.now();
       await client.query('COMMIT');
@@ -10512,6 +10530,10 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
       idUsuario: venta.id_usuario || userId,
       idSucursal: venta.id_sucursal
     });
+
+    // Reserva durable de fidelizacion antes del COMMIT (SAVEPOINT propio:
+    // nunca lanza ni aborta la venta).
+    await reservePaidInvoiceAccumulation({ client, idFactura });
 
     const commitStart = ventasPerf.now();
     await client.query('COMMIT');

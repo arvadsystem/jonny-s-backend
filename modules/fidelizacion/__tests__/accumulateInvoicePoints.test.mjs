@@ -256,7 +256,7 @@ describe('accumulateInvoicePoints (capa unica: gate de pago + decide + persiste)
     assert.ok(!sqlCalls.includes('COMMIT'));
   });
 
-  it('fallo especifico al evaluar el perfil del cliente: tampoco propaga (la venta ya respondio 201 antes)', async () => {
+  it('fallo especifico al resolver el snapshot de elegibilidad: tampoco propaga (la venta ya respondio 201 antes)', async () => {
     const { client, state } = createFidelizacionMockClient({
       facturaContexts: {
         815: {
@@ -271,7 +271,9 @@ describe('accumulateInvoicePoints (capa unica: gate de pago + decide + persiste)
           pago_control_estado_codigo: null
         }
       },
-      failOn: 'FROM public.clientes c'
+      // La elegibilidad ahora se resuelve con el snapshot historico
+      // (buildAccumulationSnapshot), identificable por su alias nombre_maestro.
+      failOn: 'AS nombre_maestro'
     });
 
     let result;
@@ -580,7 +582,7 @@ describe('accumulateInvoicePoints: bloqueante 1 (PENDING antes de evaluar en LIV
     ...overrides
   });
 
-  it('regla 1: LIVE crea PENDING antes de evaluar el perfil (orden verificable en las llamadas SQL)', async () => {
+  it('regla 1: LIVE crea PENDING (con snapshot) antes de evaluar configuracion/tasa/puntos', async () => {
     const { client, state } = createFidelizacionMockClient({
       facturaContexts: { 860: ctx() }
     });
@@ -589,11 +591,32 @@ describe('accumulateInvoicePoints: bloqueante 1 (PENDING antes de evaluar en LIV
       await accumulateInvoicePoints({ idFactura: 860 });
     });
 
+    const snapshotIdx = state.calls.findIndex((c) => c.sql.includes('AS nombre_maestro'));
     const insertPendingIdx = state.calls.findIndex((c) => c.sql.includes('INSERT INTO public.fidelizacion_acumulacion_facturas_estado') && c.sql.includes('DO NOTHING'));
-    const perfilIdx = state.calls.findIndex((c) => c.sql.includes('FROM public.clientes c') && c.sql.includes('LEFT JOIN public.personas p'));
+    const configIdx = state.calls.findIndex((c) => c.sql.includes('FROM public.fidelizacion_configuracion_sucursal'));
+    const movimientoIdx = state.calls.findIndex((c) => c.sql.includes('INSERT INTO public.fidelizacion_movimientos'));
+
+    assert.notEqual(snapshotIdx, -1, 'debe resolver el snapshot historico');
     assert.notEqual(insertPendingIdx, -1, 'debe reservar PENDING');
-    assert.notEqual(perfilIdx, -1, 'debe consultar el perfil');
-    assert.ok(insertPendingIdx < perfilIdx, 'PENDING debe crearse ANTES de consultar el perfil');
+    assert.notEqual(configIdx, -1, 'debe evaluar la configuracion');
+    assert.ok(snapshotIdx < insertPendingIdx, 'el snapshot se resuelve para poder congelarlo en la fila PENDING');
+    assert.ok(insertPendingIdx < configIdx, 'PENDING debe existir ANTES de evaluar configuracion/tasa');
+    assert.ok(insertPendingIdx < movimientoIdx, 'PENDING debe existir ANTES de crear el movimiento de puntos');
+  });
+
+  it('regla 1b: la elegibilidad sale del snapshot, no de una consulta al perfil actual', async () => {
+    const { client, state } = createFidelizacionMockClient({
+      facturaContexts: { 867: ctx() }
+    });
+
+    await withMockedFidelizacionPoolConnect(async () => client, async () => {
+      await accumulateInvoicePoints({ idFactura: 867 });
+    });
+
+    // fetchClienteProfileForFidelizacion (la consulta del perfil ACTUAL) ya
+    // no participa: su lugar lo ocupa el snapshot historico.
+    const perfilActualIdx = state.calls.findIndex((c) => c.sql.includes('FROM public.clientes c') && c.sql.includes('LEFT JOIN public.personas p') && !c.sql.includes('AS nombre_maestro'));
+    assert.equal(perfilActualIdx, -1, 'no debe consultarse el perfil actual del cliente');
   });
 
   it('regla 2: LIVE con perfil valido termina PROCESSED', async () => {

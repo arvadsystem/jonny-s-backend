@@ -2,8 +2,10 @@ import assert from 'node:assert/strict';
 import { afterEach, describe, it } from 'node:test';
 import { fidelizacionPool } from '../infrastructure/fidelizacionPool.js';
 import { reconcileMissingPoints } from '../workers/reconcileMissingPoints.js';
+import { accumulateInvoicePoints } from '../application/accumulateInvoicePoints.js';
 import { createFidelizacionMockClient } from './fidelizacionMockClient.mjs';
 import { createFakeLimitedPool, withTimeout } from './fakeLimitedPool.mjs';
+import { createFidelizacionLockCoordinator } from './fidelizacionLockCoordinator.mjs';
 import { enqueueInvoiceAccumulation, waitForFidelizacionQueueIdle } from '../infrastructure/fidelizacionQueue.js';
 
 const originalQueueMaxSize = process.env.FIDELIZACION_QUEUE_MAX_SIZE;
@@ -527,5 +529,128 @@ describe('reconcileMissingPoints (worker de reconciliacion idempotente, sin inan
 
     assert.deepEqual(result.ids_factura, [], 'un valor invalido de env debe caer al default (300000ms), no a 0 (sin gracia)');
     assert.equal(state.movimientos.length, 0);
+  });
+});
+
+describe('Elegibilidad historica en RECONCILE (snapshot durable vs evidencia vs nada)', () => {
+  it('26: RECONCILE con reserva PENDING valida procesa usando SU snapshot, no el perfil actual', async () => {
+    const { client, state } = createFidelizacionMockClient({
+      facturaContexts: { 7101: baseContext({ id_cliente: 5 }) },
+      estadoFacturasIniciales: {
+        7101: {
+          estado: 'PENDING',
+          nombre_snapshot: 'Valido Al Pagar',
+          telefono_snapshot: '9999-1111',
+          perfil_completo_snapshot: true
+        }
+      },
+      // El perfil ACTUAL esta incompleto: si se usara, no acumularia.
+      clienteProfiles: { 5: { estado: true, nombre: '', telefono: '' } }
+    });
+
+    const result = await withMockedFidelizacionPoolConnect(async () => client, () => reconcileMissingPoints({ limit: 25 }));
+
+    assert.equal(result.processed, 1, 'manda el snapshot historico, no el perfil de hoy');
+    assert.equal(state.movimientos.length, 1);
+    assert.equal(state.estadoFacturas.get(7101).estado, 'PROCESSED');
+  });
+
+  it('25: reserva con snapshot INCOMPLETO -> terminal, y completar el perfil despues no lo reabre', async () => {
+    const { client, state } = createFidelizacionMockClient({
+      facturaContexts: { 7102: baseContext({ id_cliente: 5 }) },
+      estadoFacturasIniciales: {
+        7102: { estado: 'PENDING', nombre_snapshot: 'Sin Telefono', telefono_snapshot: null, perfil_completo_snapshot: false }
+      }
+    });
+
+    const primero = await withMockedFidelizacionPoolConnect(async () => client, () => reconcileMissingPoints({ limit: 25 }));
+    assert.equal(primero.processed, 0);
+    assert.equal(state.estadoFacturas.get(7102).estado, 'SKIPPED_TERMINAL');
+    assert.equal(state.estadoFacturas.get(7102).motivo, 'CLIENT_PROFILE_INCOMPLETE');
+
+    // El cliente completa su perfil DESPUES.
+    state.clienteProfiles[5] = { estado: true, nombre: 'Ya Completo', telefono: '9999-2222' };
+
+    const segundo = await withMockedFidelizacionPoolConnect(async () => client, () => reconcileMissingPoints({ limit: 25 }));
+    assert.deepEqual(segundo.ids_factura, [], 'una factura terminal no vuelve a listarse');
+    assert.equal(state.movimientos.length, 0, 'nunca hay puntos retroactivos');
+  });
+
+  it('28: RECONCILE sin reserva pero con evidencia historica de pedidos_contacto (menu publico) SI puede procesar', async () => {
+    const { client, state } = createFidelizacionMockClient({
+      facturaContexts: { 7103: baseContext({ id_cliente: 5, id_pedido: 800 }) },
+      pedidos: { 800: { id_cliente: 5, origen_pedido: 'MENU' } },
+      pedidosContacto: { 800: { nombre_contacto: 'Ana Menu', telefono_normalizado: '99998888' } },
+      // Perfil maestro incompleto: la evidencia valida es la del pedido.
+      clienteProfiles: { 5: { estado: true, nombre: 'Ana Menu', telefono: '' } }
+    });
+
+    const result = await withMockedFidelizacionPoolConnect(async () => client, () => reconcileMissingPoints({ limit: 25 }));
+
+    assert.equal(result.processed, 1);
+    assert.equal(state.movimientos.length, 1);
+    assert.equal(state.estadoFacturas.get(7103).estado, 'PROCESSED');
+  });
+
+  it('27: RECONCILE sin reserva y SIN evidencia historica queda LEGACY_ELIGIBILITY_UNVERIFIABLE (jamas usa el perfil actual)', async () => {
+    const { client, state } = createFidelizacionMockClient({
+      // Venta directa (sin pedido), por lo tanto sin pedidos_contacto: no hay
+      // forma de probar como era el perfil al momento de la compra.
+      facturaContexts: { 7104: baseContext({ id_cliente: 5, id_pedido: null }) },
+      // Perfil actual perfectamente valido: aun asi NO debe acumular.
+      clienteProfiles: { 5: { estado: true, nombre: 'Perfecto Hoy', telefono: '9999-3333' } }
+    });
+
+    const result = await withMockedFidelizacionPoolConnect(async () => client, () => reconcileMissingPoints({ limit: 25 }));
+
+    assert.equal(result.processed, 0, 'un perfil valido HOY no prueba nada sobre el momento de la compra');
+    assert.equal(state.movimientos.length, 0);
+    assert.equal(state.estadoFacturas.get(7104).motivo, 'LEGACY_ELIGIBILITY_UNVERIFIABLE');
+  });
+
+  it('29: un estado terminal nunca vuelve a evaluar el perfil actual', async () => {
+    const { client, state } = createFidelizacionMockClient({
+      facturaContexts: { 7105: baseContext({ id_cliente: 5 }) },
+      estadoFacturasIniciales: {
+        7105: { estado: 'SKIPPED_TERMINAL', motivo: 'CLIENT_PROFILE_INCOMPLETE', perfil_completo_snapshot: false }
+      }
+    });
+
+    const result = await withMockedFidelizacionPoolConnect(async () => client, () => reconcileMissingPoints({ limit: 25 }));
+
+    assert.deepEqual(result.ids_factura, [], 'ni siquiera se lista');
+    const consultoPerfil = state.calls.some((c) => c.sql.includes('AS nombre_maestro'));
+    assert.equal(consultoPerfil, false, 'no debe resolver ningun snapshot para una factura ya terminal');
+  });
+
+  it('31: LIVE y RECONCILE concurrentes sobre la misma factura no duplican el movimiento (advisory lock real simulado)', async () => {
+    // Conexiones independientes que comparten la misma "base de datos" y el
+    // mismo coordinador de advisory lock: la segunda transaccion que pide el
+    // lock de esa factura espera de verdad a que la primera haga COMMIT.
+    const lockCoordinator = createFidelizacionLockCoordinator();
+    const principal = createFidelizacionMockClient({
+      facturaContexts: { 7106: baseContext({ id_cliente: 5 }) },
+      estadoFacturasIniciales: { 7106: { estado: 'PENDING', perfil_completo_snapshot: true, nombre_snapshot: 'X', telefono_snapshot: '9999-4444' } },
+      lockCoordinator
+    });
+    const secundario = createFidelizacionMockClient({ sharedState: principal.state, lockCoordinator });
+
+    let conexiones = 0;
+    const connectImpl = async () => {
+      conexiones += 1;
+      return conexiones === 1 ? principal.client : secundario.client;
+    };
+
+    await withMockedFidelizacionPoolConnect(connectImpl, async () => {
+      await Promise.all([
+        accumulateInvoicePoints({ idFactura: 7106 }),
+        reconcileMissingPoints({ limit: 25 })
+      ]);
+    });
+
+    assert.equal(principal.state.movimientos.length, 1, 'un solo movimiento entre ambos disparadores');
+    const saldoUpdates = principal.state.calls.filter((c) => c.sql.includes('UPDATE public.fidelizacion_saldos_cliente')).length;
+    assert.equal(saldoUpdates, 1, 'una sola actualizacion de saldo');
+    assert.equal(principal.state.estadoFacturas.get(7106).estado, 'PROCESSED');
   });
 });

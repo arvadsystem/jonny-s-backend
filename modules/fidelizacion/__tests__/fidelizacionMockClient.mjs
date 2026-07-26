@@ -30,6 +30,16 @@ const resolveConfigForDate = (activeConfigs, referenceParam) => {
   return matches[0];
 };
 
+// Error 25P02 de PostgreSQL: una vez que un statement falla dentro de una
+// transaccion, TODA consulta posterior falla asi hasta que se haga ROLLBACK
+// (total) o ROLLBACK TO SAVEPOINT. Es exactamente lo que hace inservible
+// "capturar el error en JS y seguir" dentro de la misma transaccion.
+const buildAbortedTransactionError = () => {
+  const err = new Error('current transaction is aborted, commands ignored until end of transaction block');
+  err.code = '25P02';
+  return err;
+};
+
 const isContextFullyPaid = (context) => {
   if (!context) return false;
   if (!context.tiene_pago_control) return true;
@@ -58,6 +68,11 @@ export const createFidelizacionMockClient = ({
   clientesRelacional = {},
   failOn = null,
   releaseError = null,
+  // Sentencias ajenas a fidelizacion que la prueba emite deliberadamente para
+  // simular la transaccion financiera (p.ej. 'INSERT INTO facturas'). Se
+  // aceptan como no-op. Vacio por defecto: el mock sigue siendo estricto y
+  // cualquier SQL inesperado de fidelizacion falla la prueba.
+  passthroughStatements = [],
   // Bloqueante 3 (prueba de concurrencia real): dos clientes mock
   // independientes pueden compartir el MISMO state (misma "base de datos")
   // pasando sharedState = otroCliente.state, y el MISMO lockCoordinator
@@ -118,7 +133,17 @@ export const createFidelizacionMockClient = ({
       }])
     ),
     telefonos: new Map(),
-    nextTelefonoId: 1
+    nextTelefonoId: 1,
+    // Toda escritura al perfil maestro intentada desde el camino de
+    // acumulacion queda registrada aqui: las pruebas afirman que esta vacio.
+    escriturasPerfilMaestro: [],
+    // Simula el UNIQUE real de telefonos.telefono.
+    telefonosUnicos: new Set(),
+    // Simula el estado de transaccion de PostgreSQL: tras un statement
+    // fallido la transaccion queda ABORTADA y todo lo siguiente falla con
+    // 25P02 hasta un ROLLBACK (total o a un SAVEPOINT).
+    aborted: false,
+    savepoints: []
   };
 
   // Locks que ESTE cliente (esta "conexion") tiene tomados en la
@@ -178,17 +203,52 @@ export const createFidelizacionMockClient = ({
   const client = {
     async query(sql, params = []) {
       const text = String(sql);
-      state.calls.push({ sql: text.trim(), params });
+      const trimmed = text.trim();
+      state.calls.push({ sql: trimmed, params });
 
-      if (failOn && text.includes(failOn)) {
-        throw new Error(`SIMULATED_FAILURE:${failOn}`);
+      // --- Semantica de transaccion de PostgreSQL -------------------------
+      // SAVEPOINT / ROLLBACK TO / RELEASE. El rollback a un savepoint es lo
+      // UNICO (junto al rollback total) que saca a la transaccion del estado
+      // abortado; por eso aislar una escritura riesgosa en un savepoint es
+      // obligatorio y no basta con capturar el error en JavaScript.
+      const savepointMatch = /^SAVEPOINT\s+(\S+)/i.exec(trimmed);
+      if (savepointMatch) {
+        if (state.aborted) throw buildAbortedTransactionError();
+        state.savepoints.push(savepointMatch[1]);
+        return { rows: [] };
+      }
+      const rollbackToMatch = /^ROLLBACK TO SAVEPOINT\s+(\S+)/i.exec(trimmed);
+      if (rollbackToMatch) {
+        const name = rollbackToMatch[1];
+        if (!state.savepoints.includes(name)) {
+          const err = new Error(`no such savepoint: ${name}`);
+          err.code = '3B001';
+          throw err;
+        }
+        // Recupera la transaccion: deja de estar abortada.
+        state.aborted = false;
+        return { rows: [] };
+      }
+      const releaseMatch = /^RELEASE SAVEPOINT\s+(\S+)/i.exec(trimmed);
+      if (releaseMatch) {
+        if (state.aborted) throw buildAbortedTransactionError();
+        const idx = state.savepoints.lastIndexOf(releaseMatch[1]);
+        if (idx >= 0) state.savepoints.splice(idx, 1);
+        return { rows: [] };
       }
 
-      const trimmed = text.trim();
       if (trimmed === 'BEGIN') {
+        state.aborted = false;
+        state.savepoints = [];
         return { rows: [] };
       }
       if (trimmed === 'COMMIT' || trimmed === 'ROLLBACK') {
+        if (trimmed === 'COMMIT' && state.aborted) {
+          // PostgreSQL rechaza el COMMIT de una transaccion abortada.
+          throw buildAbortedTransactionError();
+        }
+        state.aborted = false;
+        state.savepoints = [];
         // pg_advisory_xact_lock esta scoped a la transaccion: se libera aqui,
         // nunca antes. Si dos clientes comparten lockCoordinator, esto es lo
         // que desbloquea genuinamente al que estaba esperando su turno.
@@ -196,6 +256,21 @@ export const createFidelizacionMockClient = ({
           const release = heldLockReleases.pop();
           release();
         }
+        return { rows: [] };
+      }
+
+      // Cualquier otro statement dentro de una transaccion abortada falla.
+      if (state.aborted) {
+        throw buildAbortedTransactionError();
+      }
+
+      if (failOn && text.includes(failOn)) {
+        state.aborted = true;
+        throw new Error(`SIMULATED_FAILURE:${failOn}`);
+      }
+
+      // Sentencias de la transaccion financiera simulada por la prueba.
+      if (passthroughStatements.some((fragment) => text.includes(fragment))) {
         return { rows: [] };
       }
       if (trimmed.includes('pg_advisory_xact_lock')) {
@@ -213,73 +288,70 @@ export const createFidelizacionMockClient = ({
         return { rowCount: 0, rows: [] };
       }
 
-      // backfillClienteTelefonoDesdePedidoContacto (services/fidelizacionService.js):
-      // dueno del pedido (guard de cuentas divididas).
-      if (text.includes('SELECT id_cliente') && text.includes('FROM public.pedidos') && !text.includes('LEFT JOIN')) {
-        const idPedido = Number(params[0]);
-        const row = state.pedidos[idPedido];
-        return { rows: row ? [{ id_cliente: row.id_cliente }] : [] };
-      }
+      // Fuentes del snapshot historico (buildAccumulationSnapshot). Se
+      // reconoce por el alias nombre_maestro, exclusivo de esa consulta, y se
+      // evalua ANTES que los handlers genericos de facturas/clientes porque
+      // la consulta menciona varias de esas tablas a la vez.
+      if (text.includes('AS nombre_maestro')) {
+        const facturaId = Number(params[0]);
+        const context = state.facturaContexts[facturaId];
+        if (!context) return { rows: [] };
 
-      // backfillClienteTelefonoDesdePedidoContacto: candidato persona/empresa
-      // (FOR UPDATE OF c la distingue de la query de perfil de mas abajo).
-      if (text.includes('FROM public.clientes c') && text.includes('FOR UPDATE OF c')) {
-        const idCliente = Number(params[0]);
-        const rel = state.clientesRelacional[idCliente];
-        if (!rel) return { rows: [] };
+        const idPedido = context.id_pedido ?? null;
+        const idCliente = context.id_cliente ?? null;
+        const pedido = idPedido ? state.pedidos[Number(idPedido)] : null;
+        const contacto = idPedido ? state.pedidosContacto[Number(idPedido)] : null;
+        const rel = idCliente ? state.clientesRelacional[Number(idCliente)] : null;
+        const perfilPlano = idCliente ? getClienteProfile(idCliente) : null;
+
         return {
           rows: [{
-            id_persona: rel.idPersona,
-            id_empresa: rel.idEmpresa,
-            persona_id_telefono: rel.personaIdTelefono,
-            persona_telefono: rel.personaTelefono,
-            empresa_id_telefono: rel.empresaIdTelefono,
-            empresa_telefono: rel.empresaTelefono
+            id_factura: facturaId,
+            id_pedido: idPedido,
+            id_cliente: idCliente,
+            id_sucursal: context.id_sucursal ?? null,
+            fecha_referencia: context.fecha_referencia_config ?? null,
+            origen_pedido: pedido ? (pedido.origen_pedido ?? null) : null,
+            pedido_id_cliente: pedido ? (pedido.id_cliente ?? null) : null,
+            nombre_contacto: contacto ? (contacto.nombre_contacto ?? null) : null,
+            telefono_normalizado: contacto ? (contacto.telefono_normalizado ?? null) : null,
+            // El perfil maestro sale de clientesRelacional cuando el test lo
+            // declara (modelo relacional) y, si no, del atajo plano
+            // clienteProfiles que usan la mayoria de las pruebas.
+            cliente_estado: rel
+              ? (rel.estado ?? true)
+              : (perfilPlano ? (perfilPlano.estado ?? true) : true),
+            nombre_maestro: rel
+              ? (rel.nombre ?? null)
+              : (perfilPlano ? (perfilPlano.nombre ?? null) : null),
+            telefono_maestro: rel
+              ? (rel.personaTelefono ?? rel.empresaTelefono ?? null)
+              : (perfilPlano ? (perfilPlano.telefono ?? null) : null)
           }]
         };
       }
 
-      // backfillClienteTelefonoDesdePedidoContacto: telefono mas reciente
-      // capturado en el pedido (menu publico o pedidos-pendientes del POS).
-      if (text.includes('FROM public.pedidos_contacto')) {
-        const idPedido = Number(params[0]);
-        const row = state.pedidosContacto[idPedido];
-        return { rows: row ? [{ telefono_normalizado: row.telefono_normalizado ?? null }] : [] };
-      }
-
-      if (text.includes('UPDATE public.telefonos SET telefono')) {
-        const [telefono, idTelefono] = params;
-        state.telefonos.set(Number(idTelefono), telefono);
-        for (const entry of Object.values(state.clientesRelacional)) {
-          if (entry.personaIdTelefono === Number(idTelefono)) entry.personaTelefono = telefono;
-          if (entry.empresaIdTelefono === Number(idTelefono)) entry.empresaTelefono = telefono;
+      // Guardas: el camino de acumulacion NUNCA debe escribir en el perfil
+      // maestro. Estas escrituras se registran para que las pruebas puedan
+      // afirmar que no ocurrieron (y, si ocurrieran, ademas fallarian por
+      // el UNIQUE simulado de telefonos.telefono, igual que en PostgreSQL).
+      if (text.includes('INSERT INTO public.telefonos')
+        || text.includes('UPDATE public.telefonos')
+        || text.includes('UPDATE public.personas')
+        || text.includes('UPDATE public.empresas')) {
+        state.escriturasPerfilMaestro.push({ sql: trimmed, params });
+        const telefono = String(params?.[0] ?? '');
+        if (text.includes('INSERT INTO public.telefonos') && state.telefonosUnicos.has(telefono)) {
+          // telefonos.telefono es UNIQUE en el esquema real. Ademas de fallar,
+          // deja la transaccion abortada (25P02 en todo lo siguiente).
+          state.aborted = true;
+          const err = new Error('duplicate key value violates unique constraint "telefonos_telefono_key"');
+          err.code = '23505';
+          throw err;
         }
-        return { rows: [] };
-      }
-
-      if (text.includes('INSERT INTO public.telefonos')) {
-        const [telefono] = params;
-        const idTelefono = state.nextTelefonoId++;
-        state.telefonos.set(idTelefono, telefono);
-        return { rows: [{ id_telefono: idTelefono }] };
-      }
-
-      if (text.includes('UPDATE public.personas SET id_telefono')) {
-        const [idTelefono, idPersona] = params;
-        const entry = Object.values(state.clientesRelacional).find((rel) => rel.idPersona === Number(idPersona));
-        if (entry) {
-          entry.personaIdTelefono = Number(idTelefono);
-          entry.personaTelefono = state.telefonos.get(Number(idTelefono)) ?? entry.personaTelefono;
-        }
-        return { rows: [] };
-      }
-
-      if (text.includes('UPDATE public.empresas SET id_telefono')) {
-        const [idTelefono, idEmpresa] = params;
-        const entry = Object.values(state.clientesRelacional).find((rel) => rel.idEmpresa === Number(idEmpresa));
-        if (entry) {
-          entry.empresaIdTelefono = Number(idTelefono);
-          entry.empresaTelefono = state.telefonos.get(Number(idTelefono)) ?? entry.empresaTelefono;
+        if (text.includes('INSERT INTO public.telefonos')) {
+          state.telefonosUnicos.add(telefono);
+          return { rows: [{ id_telefono: state.nextTelefonoId++ }] };
         }
         return { rows: [] };
       }
@@ -291,21 +363,29 @@ export const createFidelizacionMockClient = ({
         const id = Number(params[0]);
 
         if (text.includes('DO NOTHING')) {
-          // ensurePendingAccumulationState: solo reserva PENDING si no
-          // existe fila (params: [idFactura, fechaReferencia]). Igual que
-          // Postgres real, ON CONFLICT DO NOTHING no devuelve fila cuando
-          // hubo conflicto.
+          // ensurePendingAccumulationState (params: [idFactura,
+          // fechaReferencia, idPedido, idCliente, idSucursal, origenPedido,
+          // nombreSnapshot, telefonoSnapshot, perfilCompletoSnapshot]).
+          // Igual que Postgres real, ON CONFLICT DO NOTHING no devuelve fila
+          // cuando hubo conflicto.
           const existing = state.estadoFacturas.get(id);
           if (existing) return { rows: [] };
-          const fechaReferencia = params[1] ?? null;
           const nextRow = {
             id_factura: id,
             estado: 'PENDING',
             motivo: null,
             elegibilidad_determinada: null,
-            fecha_referencia: fechaReferencia,
+            fecha_referencia: params[1] ?? null,
             intentos: 0,
-            ultimo_error: null
+            ultimo_error: null,
+            // Snapshot historico congelado en la reserva.
+            id_pedido: params[2] ?? null,
+            id_cliente: params[3] ?? null,
+            id_sucursal: params[4] ?? null,
+            origen_pedido: params[5] ?? null,
+            nombre_snapshot: params[6] ?? null,
+            telefono_snapshot: params[7] ?? null,
+            perfil_completo_snapshot: params[8] ?? null
           };
           state.estadoFacturas.set(id, nextRow);
           return { rows: [nextRow] };
@@ -323,6 +403,16 @@ export const createFidelizacionMockClient = ({
         }
 
         const nextRow = {
+          // El UPDATE real solo toca estado/motivo/elegibilidad/fechas/
+          // intentos/ultimo_error: las columnas de snapshot conservan lo que
+          // grabo la reserva.
+          id_pedido: existing?.id_pedido ?? null,
+          id_cliente: existing?.id_cliente ?? null,
+          id_sucursal: existing?.id_sucursal ?? null,
+          origen_pedido: existing?.origen_pedido ?? null,
+          nombre_snapshot: existing?.nombre_snapshot ?? null,
+          telefono_snapshot: existing?.telefono_snapshot ?? null,
+          perfil_completo_snapshot: existing?.perfil_completo_snapshot ?? null,
           id_factura: id,
           estado,
           motivo: motivo ?? null,
@@ -453,6 +543,7 @@ export const createFidelizacionMockClient = ({
         return { rows: [{ id_movimiento: idMovimiento }] };
       }
 
+      state.aborted = true;
       throw new Error(`UNEXPECTED_MOCK_QUERY: ${text.slice(0, 80)}`);
     },
     release() {
