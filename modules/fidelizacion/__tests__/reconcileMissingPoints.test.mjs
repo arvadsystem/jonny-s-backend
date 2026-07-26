@@ -84,11 +84,13 @@ describe('reconcileMissingPoints (worker de reconciliacion idempotente, sin inan
     assert.equal(state.movimientos.length, 1);
   });
 
-  it('filtra clientes no elegibles: primer lote sin candidatos procesables, segundo lote (cliente elegible) si avanza', async () => {
+  it('filtra clientes con perfil incompleto: primer lote sin candidatos procesables, segundo lote (perfil completo) si avanza', async () => {
     const { client, state } = createFidelizacionMockClient({
-      eligibleClienteIds: [6],
+      clienteProfiles: {
+        5: { estado: true, nombre: '', telefono: '9999-9999' } // sin nombre: perfil incompleto
+      },
       facturaContexts: {
-        // id_cliente 5 no esta en eligibleClienteIds: nunca debe aparecer como candidato.
+        // id_cliente 5 tiene perfil incompleto: nunca debe aparecer como candidato.
         2001: baseContext({ id_cliente: 5, monto_factura: 100 }),
         2002: baseContext({ id_cliente: 5, monto_factura: 100 }),
         2003: baseContext({ id_cliente: 6, monto_factura: 100 })
@@ -97,7 +99,7 @@ describe('reconcileMissingPoints (worker de reconciliacion idempotente, sin inan
 
     const result = await withMockedFidelizacionPoolConnect(async () => client, () => reconcileMissingPoints({ limit: 25 }));
 
-    assert.equal(result.scanned, 1, 'las facturas de cliente no elegible nunca deben listarse como candidatas');
+    assert.equal(result.scanned, 1, 'las facturas de cliente con perfil incompleto nunca deben listarse como candidatas');
     assert.deepEqual(result.ids_factura, [2003]);
     assert.equal(result.processed, 1);
     assert.equal(state.movimientos.length, 1);
@@ -145,6 +147,39 @@ describe('reconcileMissingPoints (worker de reconciliacion idempotente, sin inan
     assert.deepEqual(result.ids_factura, [4002], 'la factura sin configuracion historica no debe listarse, pero no debe impedir listar 4002');
     assert.equal(result.processed, 1);
     assert.equal(state.movimientos.length, 1);
+  });
+
+  it('excluye sucursales con switch de acumulacion apagado en la fecha de referencia', async () => {
+    const { client, state } = createFidelizacionMockClient({
+      activeConfigs: [
+        { lempiras_por_punto: 10, acumulacion_habilitada: false, vigente_desde: '2026-01-01T00:00:00Z', vigente_hasta: null }
+      ],
+      facturaContexts: {
+        4101: baseContext({ id_cliente: 5, fecha_referencia_config: '2026-02-01T00:00:00Z' }),
+        4102: baseContext({ id_cliente: 6, fecha_referencia_config: '2026-02-01T00:00:00Z' })
+      }
+    });
+
+    const result = await withMockedFidelizacionPoolConnect(async () => client, () => reconcileMissingPoints({ limit: 25 }));
+
+    assert.equal(result.scanned, 0, 'ninguna factura con el switch apagado debe listarse como candidata');
+    assert.equal(state.movimientos.length, 0);
+  });
+
+  it('excluye configuraciones sin tasa valida (lempiras_por_punto <= 0) aunque el switch este encendido', async () => {
+    const { client, state } = createFidelizacionMockClient({
+      activeConfigs: [
+        { lempiras_por_punto: 0, acumulacion_habilitada: true, vigente_desde: '2026-01-01T00:00:00Z', vigente_hasta: null }
+      ],
+      facturaContexts: {
+        4201: baseContext({ id_cliente: 5, fecha_referencia_config: '2026-02-01T00:00:00Z' })
+      }
+    });
+
+    const result = await withMockedFidelizacionPoolConnect(async () => client, () => reconcileMissingPoints({ limit: 25 }));
+
+    assert.equal(result.scanned, 0, 'una configuracion sin tasa valida no debe generar candidatos');
+    assert.equal(state.movimientos.length, 0);
   });
 
   it('un fallo individual en el lote no cancela el resto', async () => {

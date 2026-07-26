@@ -1,11 +1,17 @@
 // Test-only helper: an in-memory stand-in for the pg client used by
-// registerFacturaLoyaltyAccumulation and el resto del modulo de fidelizacion,
+// registerFacturaLoyaltyAccumulation y el resto del modulo de fidelizacion,
 // para que las pruebas nunca toquen una base de datos real.
 const CATALOG_IDS = {
   tipos: { ACUMULACION: 1, CANJE: 2 },
   origenes: { FACTURA: 1, CANJE: 2 },
   estados: { REGISTRADO: 1 }
 };
+
+// Perfil "seguro" por defecto: activo, con nombre y telefono validos. Asi,
+// las pruebas que no les importa el perfil del cliente (la mayoria de las
+// existentes antes de esta regla) no tienen que declararlo explicitamente.
+// Las que SI quieren un perfil incompleto lo indican via clienteProfiles.
+const DEFAULT_CLIENTE_PROFILE = { estado: true, nombre: 'Cliente Demo', telefono: '9999-9999' };
 
 const toDateOrNull = (value) => (value ? new Date(value) : null);
 
@@ -33,28 +39,34 @@ const isContextFullyPaid = (context) => {
 };
 
 export const createFidelizacionMockClient = ({
-  elegible = true,
-  eligibleClienteIds = null,
   activeConfig = { lempiras_por_punto: 10 },
   activeConfigs = null,
   saldoInicial = 0,
   movimientos = [],
   facturaContexts = {},
+  clienteProfiles = {},
+  defaultClienteProfile = DEFAULT_CLIENTE_PROFILE,
   missingAccumulationIds = null,
   failOn = null,
   releaseError = null
 } = {}) => {
-  const resolvedConfigs = activeConfigs || (activeConfig
-    ? [{ vigente_desde: '1970-01-01T00:00:00Z', vigente_hasta: null, ...activeConfig }]
-    : []);
+  const rawConfigs = activeConfigs || (activeConfig ? [activeConfig] : []);
+  const resolvedConfigs = rawConfigs.map((cfg) => ({
+    vigente_desde: '1970-01-01T00:00:00Z',
+    vigente_hasta: null,
+    acumulacion_habilitada: true,
+    ...cfg
+  }));
 
   const state = {
-    elegible,
-    eligibleClienteIds: eligibleClienteIds ? new Set([...eligibleClienteIds].map(Number)) : null,
     activeConfigs: resolvedConfigs,
     saldos: new Map(),
     movimientos: [...movimientos],
     facturaContexts: { ...facturaContexts },
+    clienteProfiles: Object.fromEntries(
+      Object.entries(clienteProfiles).map(([id, profile]) => [Number(id), profile])
+    ),
+    defaultClienteProfile,
     missingAccumulationIds: missingAccumulationIds ? [...missingAccumulationIds] : null,
     nextMovimientoId: movimientos.length + 1,
     calls: [],
@@ -62,9 +74,21 @@ export const createFidelizacionMockClient = ({
     releaseCallCount: 0
   };
 
-  const isClienteEligible = (idCliente) => (
-    state.eligibleClienteIds ? state.eligibleClienteIds.has(Number(idCliente)) : state.elegible
-  );
+  const getClienteProfile = (idCliente) => {
+    const override = state.clienteProfiles[Number(idCliente)];
+    return override === undefined ? state.defaultClienteProfile : override;
+  };
+
+  // Mismo criterio que isClienteProfileComplete en services/fidelizacionService.js:
+  // activo + nombre no vacio + telefono con exactamente 8 digitos (normalizePhoneHN).
+  const isClienteProfileValid = (idCliente) => {
+    const profile = getClienteProfile(idCliente);
+    if (!profile) return false;
+    const nombreValido = String(profile.nombre ?? '').trim().length > 0;
+    const digits = String(profile.telefono ?? '').replace(/\D/g, '');
+    const telefonoValido = digits.length === 8;
+    return Boolean(profile.estado ?? true) && nombreValido && telefonoValido;
+  };
 
   const hasMovimiento = (idFactura) => state.movimientos.some(
     (m) => m.id_factura === Number(idFactura) && m.tipo === 'ACUMULACION' && m.origen === 'FACTURA'
@@ -72,9 +96,9 @@ export const createFidelizacionMockClient = ({
 
   // Recalcula la lista de candidatos "pagados sin movimiento" a partir de
   // facturaContexts, replicando los mismos filtros que la consulta real
-  // (elegibilidad, config historica valida, pago completo, sin movimiento).
-  // Si el test declaro missingAccumulationIds explicitamente, se respeta tal
-  // cual (compatibilidad con pruebas mas simples que no necesitan el detalle).
+  // (perfil de cliente completo, switch+tasa historicos, pago completo, sin
+  // movimiento). Si el test declaro missingAccumulationIds explicitamente,
+  // se respeta tal cual (compatibilidad con pruebas mas simples).
   const computeMissingAccumulationCandidates = (cursor, limit) => {
     if (state.missingAccumulationIds !== null) {
       return state.missingAccumulationIds.filter((id) => id > cursor).slice(0, limit);
@@ -86,8 +110,11 @@ export const createFidelizacionMockClient = ({
         if (id <= cursor) return false;
         if (!context.id_cliente) return false;
         if (!isContextFullyPaid(context)) return false;
-        if (!isClienteEligible(context.id_cliente)) return false;
-        if (!resolveConfigForDate(state.activeConfigs, context.fecha_referencia_config)) return false;
+        if (!isClienteProfileValid(context.id_cliente)) return false;
+        const matchedConfig = resolveConfigForDate(state.activeConfigs, context.fecha_referencia_config);
+        if (!matchedConfig) return false;
+        if (!matchedConfig.acumulacion_habilitada) return false;
+        if (!(Number(matchedConfig.lempiras_por_punto) > 0)) return false;
         if (hasMovimiento(id)) return false;
         return true;
       })
@@ -115,6 +142,12 @@ export const createFidelizacionMockClient = ({
         return { rows: [] };
       }
 
+      // Deteccion de columna clientes.id_empresa_cliente (buildClienteEmpresaRelationSql):
+      // se simula un esquema SIN esa columna (empresaRelationExpr cae a c.id_empresa).
+      if (text.includes('information_schema.columns') && text.includes('clientes')) {
+        return { rowCount: 0, rows: [] };
+      }
+
       if (text.includes('NOT EXISTS') && text.includes('FROM public.facturas f')) {
         const cursor = Number(params[0]) || 0;
         const limit = Number(params[1]) || 25;
@@ -128,17 +161,28 @@ export const createFidelizacionMockClient = ({
         return { rows: context ? [{ id_factura: facturaId, ...context }] : [] };
       }
 
+      // Perfil de cliente (fetchClienteProfileForFidelizacion): activo,
+      // nombre (persona/empresa) y telefono asociado.
+      if (text.includes('FROM public.clientes c') && text.includes('LEFT JOIN public.personas p')) {
+        const idCliente = Number(params[0]);
+        const profile = getClienteProfile(idCliente);
+        if (!profile) return { rows: [] };
+        return {
+          rows: [{
+            id_cliente: idCliente,
+            estado: profile.estado ?? true,
+            nombre: profile.nombre ?? null,
+            telefono: profile.telefono ?? null
+          }]
+        };
+      }
+
       if (text.includes('FROM public.fidelizacion_movimientos fm')) {
         const facturaId = Number(params[0]);
         const match = state.movimientos.find(
           (m) => m.id_factura === facturaId && m.tipo === 'ACUMULACION' && m.origen === 'FACTURA'
         );
         return { rows: match ? [{ id_movimiento: match.id_movimiento }] : [], rowCount: match ? 1 : 0 };
-      }
-
-      if (text.includes('FROM public.usuarios_clientes uc')) {
-        const idCliente = params[0];
-        return { rows: [], rowCount: isClienteEligible(idCliente) ? 1 : 0 };
       }
 
       if (text.includes('FROM public.fidelizacion_configuracion_sucursal')) {

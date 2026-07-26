@@ -255,6 +255,38 @@ describe('accumulateInvoicePoints (capa unica: gate de pago + decide + persiste)
     assert.ok(!sqlCalls.includes('COMMIT'));
   });
 
+  it('fallo especifico al evaluar el perfil del cliente: tampoco propaga (la venta ya respondio 201 antes)', async () => {
+    const { client, state } = createFidelizacionMockClient({
+      facturaContexts: {
+        815: {
+          id_pedido: null,
+          id_sucursal: 1,
+          id_usuario: 9,
+          id_cliente: 5,
+          monto_factura: 100,
+          fecha_referencia_config: '2026-03-01T10:00:00Z',
+          tiene_pago_control: false,
+          pago_control_monto_pendiente: null,
+          pago_control_estado_codigo: null
+        }
+      },
+      failOn: 'FROM public.clientes c'
+    });
+
+    let result;
+    await withMockedFidelizacionPoolConnect(async () => client, async () => {
+      await assert.doesNotReject(
+        (async () => { result = await accumulateInvoicePoints({ idFactura: 815 }); })()
+      );
+    });
+
+    assert.equal(result.created, false);
+    assert.equal(result.reason, 'ERROR');
+    const sqlCalls = state.calls.map((c) => c.sql);
+    assert.ok(sqlCalls.includes('ROLLBACK'));
+    assert.ok(!sqlCalls.includes('COMMIT'));
+  });
+
   it('pool.connect fallando: nunca propaga el error', async () => {
     let result;
     await withMockedFidelizacionPoolConnect(

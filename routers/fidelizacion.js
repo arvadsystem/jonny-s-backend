@@ -933,6 +933,7 @@ const fidelizacionService = {
             ? {
                 id_configuracion: Number(config.id_configuracion),
                 lempiras_por_punto: Number(config.lempiras_por_punto),
+                acumulacion_habilitada: Boolean(config.acumulacion_habilitada),
                 vigente_desde: config.vigente_desde,
                 vigente_hasta: config.vigente_hasta,
                 id_usuario_creador: Number(config.id_usuario_creador)
@@ -963,6 +964,7 @@ const fidelizacionService = {
     const allowedFields = new Set([
       'id_sucursal',
       'lempiras_por_punto',
+      'acumulacion_habilitada',
       'productos',
       'productos_canjeables'
     ]);
@@ -978,13 +980,35 @@ const fidelizacionService = {
       };
     }
 
-    const lempirasPorPunto = parsePositiveNumber(req.body.lempiras_por_punto);
-    if (!lempirasPorPunto) {
+    // Booleano estricto: "true" (string) u otros tipos se rechazan. Si se
+    // omite, el valor seguro por defecto es false (no habilitar acumulacion
+    // implicitamente al guardar otros campos de la configuracion).
+    if (
+      req.body.acumulacion_habilitada !== undefined &&
+      typeof req.body.acumulacion_habilitada !== 'boolean'
+    ) {
       return {
         status: 400,
         body: buildErrorBody({
           code: 'VALIDATION_ERROR',
-          message: 'lempiras_por_punto debe ser un numero mayor a 0.'
+          message: 'acumulacion_habilitada debe ser un booleano.'
+        })
+      };
+    }
+    const acumulacionHabilitada = req.body.acumulacion_habilitada === undefined
+      ? false
+      : req.body.acumulacion_habilitada;
+
+    // La tasa solo es obligatoria (>0) cuando la acumulacion esta habilitada.
+    // Con el switch apagado es valido guardar la configuracion aunque exista
+    // una tasa ya configurada (se conserva tal cual para no afectar canje).
+    const lempirasPorPuntoInput = parsePositiveNumber(req.body.lempiras_por_punto);
+    if (acumulacionHabilitada && !lempirasPorPuntoInput) {
+      return {
+        status: 400,
+        body: buildErrorBody({
+          code: 'VALIDATION_ERROR',
+          message: 'lempiras_por_punto debe ser un numero mayor a 0 cuando la acumulacion de puntos esta habilitada.'
         })
       };
     }
@@ -1116,6 +1140,14 @@ const fidelizacionService = {
       await client.query('LOCK TABLE public.fidelizacion_configuracion_sucursal IN EXCLUSIVE MODE');
 
       const previousConfig = await getActiveFidelizacionConfig(client, scope.targetSucursalId);
+      // Si el switch queda apagado y no se envio una tasa valida, se
+      // conserva la tasa anterior (no se pisa con 0): sigue siendo la que
+      // usa el canje, y evita romper esa regla de negocio por apagar
+      // acumulacion.
+      const lempirasPorPunto = lempirasPorPuntoInput
+        || Number(previousConfig?.lempiras_por_punto)
+        || 0;
+
       await client.query(
         `
           UPDATE public.fidelizacion_configuracion_sucursal
@@ -1135,6 +1167,7 @@ const fidelizacionService = {
           INSERT INTO public.fidelizacion_configuracion_sucursal (
             id_sucursal,
             lempiras_por_punto,
+            acumulacion_habilitada,
             vigente_desde,
             vigente_hasta,
             estado,
@@ -1142,10 +1175,10 @@ const fidelizacionService = {
             fecha_creacion,
             fecha_actualizacion
           )
-          VALUES ($1, $2, NOW(), NULL, true, $3, NOW(), NOW())
+          VALUES ($1, $2, $3, NOW(), NULL, true, $4, NOW(), NOW())
           RETURNING id_configuracion
         `,
-        [scope.targetSucursalId, lempirasPorPunto, scope.idUsuario]
+        [scope.targetSucursalId, lempirasPorPunto, acumulacionHabilitada, scope.idUsuario]
       );
       const idConfiguracion = Number(configInsertResult.rows?.[0]?.id_configuracion || 0);
 
@@ -1229,12 +1262,14 @@ const fidelizacionService = {
         datosAntes: previousConfig
           ? {
               id_configuracion: Number(previousConfig.id_configuracion),
-              lempiras_por_punto: Number(previousConfig.lempiras_por_punto)
+              lempiras_por_punto: Number(previousConfig.lempiras_por_punto),
+              acumulacion_habilitada: Boolean(previousConfig.acumulacion_habilitada)
             }
           : null,
         datosDespues: {
           id_sucursal: scope.targetSucursalId,
           lempiras_por_punto: lempirasPorPunto,
+          acumulacion_habilitada: acumulacionHabilitada,
           productos_canjeables: [...productsMap.values()]
         }
       });
@@ -1249,6 +1284,7 @@ const fidelizacionService = {
           data: {
             id_sucursal: scope.targetSucursalId,
             lempiras_por_punto: lempirasPorPunto,
+            acumulacion_habilitada: acumulacionHabilitada,
             total_productos_canjeables: productsMap.size
           }
         }
@@ -1699,4 +1735,5 @@ router.get(
   })
 );
 
+export { fidelizacionService };
 export default router;

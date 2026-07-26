@@ -1,7 +1,7 @@
 import { fidelizacionPool } from './fidelizacionPool.js';
 import {
   registerFacturaLoyaltyAccumulation,
-  CLIENT_ROLE_NAME
+  buildClienteEmpresaRelationSql
 } from '../../../services/fidelizacionService.js';
 
 // Mismo valor que el antiguo VENTAS_FIDELIZACION_ADVISORY_LOCK_CLASS
@@ -137,6 +137,7 @@ export const persistAccumulation = ({
 export const listPaidInvoicesMissingAccumulation = async (client, { cursor = 0, limit = 25 } = {}) => {
   const boundedLimit = Math.min(Math.max(parsePositiveInt(limit) || 25, 1), 200);
   const boundedCursor = Number.isFinite(Number(cursor)) && Number(cursor) >= 0 ? Number(cursor) : 0;
+  const empresaRelationExpr = await buildClienteEmpresaRelationSql(client, 'c2');
 
   const result = await client.query(
     `
@@ -155,6 +156,11 @@ export const listPaidInvoicesMissingAccumulation = async (client, { cursor = 0, 
       ) upc ON TRUE
       LEFT JOIN public.cat_pedidos_estados_pago cep
         ON cep.id_estado_pago_pedido = upc.id_estado_pago_pedido
+      LEFT JOIN public.clientes c2 ON c2.id_cliente = COALESCE(p.id_cliente, f.id_cliente)
+      LEFT JOIN public.personas p2 ON p2.id_persona = c2.id_persona
+      LEFT JOIN public.telefonos telf_p2 ON telf_p2.id_telefono = p2.id_telefono
+      LEFT JOIN public.empresas e2 ON e2.id_empresa = ${empresaRelationExpr}
+      LEFT JOIN public.telefonos telf_e2 ON telf_e2.id_telefono = e2.id_telefono
       WHERE f.id_factura > $1
         AND COALESCE(p.id_cliente, f.id_cliente) IS NOT NULL
         AND (
@@ -164,21 +170,23 @@ export const listPaidInvoicesMissingAccumulation = async (client, { cursor = 0, 
             AND COALESCE(upc.monto_pendiente, 0) = 0
           )
         )
-        AND EXISTS (
-          SELECT 1
-          FROM public.usuarios_clientes uc
-          INNER JOIN public.usuarios u
-            ON u.id_usuario = uc.id_usuario
-           AND u.id_cliente = uc.id_cliente
-          INNER JOIN public.roles_usuarios ru
-            ON ru.id_usuario = u.id_usuario
-          INNER JOIN public.roles r
-            ON r.id_rol = ru.id_rol
-          WHERE uc.id_cliente = COALESCE(p.id_cliente, f.id_cliente)
-            AND COALESCE(uc.estado, true) = true
-            AND COALESCE(u.estado, false) = true
-            AND UPPER(TRIM(r.nombre)) = $4
-        )
+        -- Perfil de cliente completo: activo, nombre no vacio, telefono con
+        -- exactamente 8 digitos tras quitar todo lo que no sea numero (mismo
+        -- criterio que normalizePhoneHN). Sin esto, una factura de un
+        -- cliente con perfil incompleto reaparaceria en cada lote para
+        -- siempre (inanicion), igual que la elegibilidad/config anteriores.
+        AND COALESCE(c2.estado, true) = true
+        AND TRIM(COALESCE(
+          CASE WHEN c2.id_persona IS NOT NULL THEN p2.nombre ELSE e2.nombre_empresa END,
+          ''
+        )) <> ''
+        AND length(regexp_replace(
+          COALESCE(
+            CASE WHEN c2.id_persona IS NOT NULL THEN telf_p2.telefono ELSE telf_e2.telefono END,
+            ''
+          ),
+          '\\D', '', 'g'
+        )) = 8
         AND EXISTS (
           SELECT 1
           FROM public.fidelizacion_configuracion_sucursal fcs
@@ -188,6 +196,8 @@ export const listPaidInvoicesMissingAccumulation = async (client, { cursor = 0, 
               fcs.vigente_hasta IS NULL
               OR fcs.vigente_hasta > COALESCE(upc.fecha_pago_confirmado, f.fecha_hora_facturacion)
             )
+            AND fcs.acumulacion_habilitada = true
+            AND fcs.lempiras_por_punto > 0
         )
         AND NOT EXISTS (
           SELECT 1
@@ -203,7 +213,7 @@ export const listPaidInvoicesMissingAccumulation = async (client, { cursor = 0, 
       ORDER BY f.id_factura ASC
       LIMIT $2
     `,
-    [boundedCursor, boundedLimit, PAGADO_CONFIRMADO_CODIGO, CLIENT_ROLE_NAME]
+    [boundedCursor, boundedLimit, PAGADO_CONFIRMADO_CODIGO]
   );
 
   const ids = result.rows.map((row) => Number(row.id_factura));
