@@ -65,6 +65,37 @@ const parsePositiveNumber = (value) => {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
 };
 
+// lempiras_por_punto tambien se usa para calcular canjes, asi que debe seguir
+// siendo > 0 en TODA configuracion guardada, independiente del switch de
+// acumulacion. Reglas:
+// - Si el payload trae el campo (inputProvided=true) pero no es un numero
+//   valido > 0 (0, negativo, NaN, no numerico), es invalido: nunca se cae de
+//   forma silenciosa a la tasa anterior.
+// - Si el payload omite el campo, se conserva la tasa anterior (siempre que
+//   sea > 0); si no hay configuracion previa, tambien es invalido (no hay
+//   tasa valida que conservar para la primera configuracion de la sucursal).
+const resolveEffectiveLempirasPorPunto = ({ inputProvided, inputValue, previousConfig }) => {
+  if (inputProvided) {
+    return inputValue ? { ok: true, value: inputValue } : { ok: false };
+  }
+
+  const previousValue = Number(previousConfig?.lempiras_por_punto);
+  if (Number.isFinite(previousValue) && previousValue > 0) {
+    return { ok: true, value: previousValue };
+  }
+
+  return { ok: false };
+};
+
+// Compatibilidad con payloads antiguos: si el switch se omite y ya existe
+// configuracion previa, se conserva su valor (nunca se apaga en silencio);
+// solo se usa false cuando de verdad es la primera configuracion.
+const resolveEffectiveAcumulacionHabilitada = ({ inputProvided, inputValue, previousConfig }) => {
+  if (inputProvided) return Boolean(inputValue);
+  if (previousConfig) return Boolean(previousConfig.acumulacion_habilitada);
+  return false;
+};
+
 const roundMoney = (value) => Number(Number(value || 0).toFixed(2));
 
 export const createFidelizacionError = (status, code, publicMessage, internalMessage = null) => {
@@ -938,6 +969,8 @@ export {
   parsePositiveInt,
   parseNonNegativeInt,
   parsePositiveNumber,
+  resolveEffectiveLempirasPorPunto,
+  resolveEffectiveAcumulacionHabilitada,
   computeAccumulationPoints,
   computeRedemptionPoints
 };

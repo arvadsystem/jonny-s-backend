@@ -4,8 +4,10 @@ import {
   lockFacturaForAccumulation,
   getFacturaAccumulationContext,
   isFacturaFullyPaid,
-  persistAccumulation
+  persistAccumulation,
+  recordAccumulationRetryableError
 } from '../infrastructure/fidelizacionRepository.js';
+import { ACCUMULATION_TRIGGER } from '../domain/accumulationState.js';
 
 const parsePositiveInt = (value) => {
   const parsed = Number.parseInt(String(value ?? ''), 10);
@@ -41,7 +43,7 @@ const releaseClientSafely = (client) => {
 // y la escritura viven en un solo lugar (infrastructure/fidelizacionRepository.js
 // -> services/fidelizacionService.js::registerFacturaLoyaltyAccumulation).
 // No se repite esa consulta ni ese calculo en esta capa.
-export const accumulateInvoicePoints = async ({ idFactura } = {}) => {
+export const accumulateInvoicePoints = async ({ idFactura, trigger = ACCUMULATION_TRIGGER.LIVE } = {}) => {
   const facturaId = parsePositiveInt(idFactura);
   const startedAt = performance.now();
 
@@ -53,6 +55,7 @@ export const accumulateInvoicePoints = async ({ idFactura } = {}) => {
 
   let client = null;
   let transactionStarted = false;
+  let context = null;
 
   try {
     client = await connectClient();
@@ -60,7 +63,7 @@ export const accumulateInvoicePoints = async ({ idFactura } = {}) => {
     transactionStarted = true;
     await lockFacturaForAccumulation(client, facturaId);
 
-    const context = await getFacturaAccumulationContext(client, facturaId);
+    context = await getFacturaAccumulationContext(client, facturaId);
     const idCliente = parsePositiveInt(context?.id_cliente);
     const idSucursal = parsePositiveInt(context?.id_sucursal);
 
@@ -96,7 +99,8 @@ export const accumulateInvoicePoints = async ({ idFactura } = {}) => {
       idSucursal,
       idUsuarioEjecutor: parsePositiveInt(context.id_usuario),
       montoFactura: context.monto_factura,
-      referenceDate: context.fecha_referencia_config
+      referenceDate: context.fecha_referencia_config,
+      trigger
     });
 
     await client.query('COMMIT');
@@ -122,6 +126,21 @@ export const accumulateInvoicePoints = async ({ idFactura } = {}) => {
       id_factura: facturaId,
       code: err?.code || err?.name || 'FIDELIZACION_ACCUMULATE_ERROR'
     });
+
+    // Best-effort: deja la factura en RETRYABLE_ERROR (no un skip terminal
+    // de negocio) para que la reconciliacion pueda reintentarla. La
+    // transaccion de arriba ya hizo ROLLBACK; esto es una escritura nueva,
+    // separada, sobre la misma conexion. Si tambien falla (p.ej. la
+    // conexion en si esta caida), se ignora: nunca cambia el resultado ya
+    // decidido ni el 201 de la venta, que ya se respondio antes de que
+    // cualquiera de esto se ejecute.
+    if (client) {
+      await recordAccumulationRetryableError(client, facturaId, {
+        fechaReferencia: context?.fecha_referencia_config ?? null,
+        error: err
+      });
+    }
+
     return { created: false, reason: 'ERROR' };
   } finally {
     releaseClientSafely(client);

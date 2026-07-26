@@ -1,8 +1,11 @@
 import { fidelizacionPool } from './fidelizacionPool.js';
+import { registerFacturaLoyaltyAccumulation } from '../../../services/fidelizacionService.js';
 import {
-  registerFacturaLoyaltyAccumulation,
-  buildClienteEmpresaRelationSql
-} from '../../../services/fidelizacionService.js';
+  ACCUMULATION_STATE,
+  ACCUMULATION_TRIGGER,
+  LEGACY_ELIGIBILITY_UNVERIFIABLE,
+  RETRYABLE_ACCUMULATION_STATES
+} from '../domain/accumulationState.js';
 
 // Mismo valor que el antiguo VENTAS_FIDELIZACION_ADVISORY_LOCK_CLASS
 // (routers/ventas/constants.js) para preservar el mismo namespace de
@@ -98,11 +101,122 @@ export const isFacturaFullyPaid = (context) => {
   return estadoCodigo === PAGADO_CONFIRMADO_CODIGO && montoPendiente === 0;
 };
 
+// Motivos de negocio (no tecnicos) que puede devolver
+// registerFacturaLoyaltyAccumulation cuando NO otorga puntos. Cualquiera de
+// estos, la primera vez que se determina, queda grabado como SKIPPED_TERMINAL
+// -no existe snapshot historico del perfil del cliente al momento de la
+// compra (se reviso facturas/pedidos/tablas de fidelizacion: no hay tal
+// columna), asi que esta tabla es el sustituto que impide volver a mirar el
+// perfil ACTUAL de un cliente sobre una factura ya resuelta-.
+const BUSINESS_SKIP_REASONS = new Set([
+  'CLIENT_PROFILE_INCOMPLETE',
+  'CONFIG_NOT_FOUND',
+  'ACCUMULATION_DISABLED',
+  'ACCUMULATION_RULE_NOT_CONFIGURED',
+  'POINTS_ROUND_DOWN_TO_ZERO'
+]);
+
+export const getAccumulationState = async (client, idFactura) => {
+  const facturaId = parsePositiveInt(idFactura);
+  if (!facturaId) return null;
+
+  const result = await client.query(
+    `
+      SELECT id_factura, estado, motivo, elegibilidad_determinada, fecha_referencia, intentos
+      FROM public.fidelizacion_acumulacion_facturas_estado
+      WHERE id_factura = $1
+      LIMIT 1
+    `,
+    [facturaId]
+  );
+
+  return result.rows[0] || null;
+};
+
+// Un solo upsert para las 3 escrituras posibles (primera determinacion,
+// marca de legado sin evaluar perfil, reintento). El WHERE del DO UPDATE
+// nunca degrada un estado terminal ya grabado (PROCESSED/SKIPPED_TERMINAL):
+// es cinturon-y-tirantes, porque el advisory lock por factura (tomado antes,
+// en accumulateInvoicePoints.js) ya serializa a los workers concurrentes
+// sobre la misma factura.
+export const upsertAccumulationState = async (client, {
+  idFactura,
+  estado,
+  motivo = null,
+  elegibilidadDeterminada = null,
+  fechaReferencia = null,
+  ultimoError = null
+}) => {
+  const facturaId = parsePositiveInt(idFactura);
+  if (!facturaId) return null;
+
+  const result = await client.query(
+    `
+      INSERT INTO public.fidelizacion_acumulacion_facturas_estado (
+        id_factura, estado, motivo, elegibilidad_determinada, fecha_referencia,
+        fecha_creacion, fecha_actualizacion, intentos, ultimo_error
+      )
+      VALUES ($1, $2, $3, $4, $5, NOW(), NOW(), 1, $6)
+      ON CONFLICT (id_factura) DO UPDATE SET
+        estado = EXCLUDED.estado,
+        motivo = EXCLUDED.motivo,
+        elegibilidad_determinada = EXCLUDED.elegibilidad_determinada,
+        fecha_referencia = COALESCE(EXCLUDED.fecha_referencia, public.fidelizacion_acumulacion_facturas_estado.fecha_referencia),
+        fecha_actualizacion = NOW(),
+        intentos = public.fidelizacion_acumulacion_facturas_estado.intentos + 1,
+        ultimo_error = EXCLUDED.ultimo_error
+      WHERE public.fidelizacion_acumulacion_facturas_estado.estado IN ('PENDING', 'RETRYABLE_ERROR')
+      RETURNING id_factura, estado, motivo, elegibilidad_determinada, intentos
+    `,
+    [facturaId, estado, motivo, elegibilidadDeterminada, fechaReferencia, ultimoError]
+  );
+
+  return result.rows[0] || null;
+};
+
+// Best-effort: se llama desde el catch() de accumulateInvoicePoints, despues
+// de que su propia transaccion ya hizo ROLLBACK. Nunca lanza -una falla
+// guardando el estado de fidelizacion no debe alterar el resultado ya
+// decidido ({created:false, reason:'ERROR'}), y muchisimo menos el 201 de la
+// venta, que ya se respondio antes de que cualquiera de esto se ejecute-.
+export const recordAccumulationRetryableError = async (client, idFactura, { fechaReferencia = null, error = null } = {}) => {
+  try {
+    await upsertAccumulationState(client, {
+      idFactura,
+      estado: ACCUMULATION_STATE.RETRYABLE_ERROR,
+      motivo: null,
+      elegibilidadDeterminada: null,
+      fechaReferencia,
+      ultimoError: String(error?.message || error || 'FIDELIZACION_ACCUMULATE_ERROR').slice(0, 500)
+    });
+  } catch (recordErr) {
+    console.error('[fidelizacion:accumulate] error al registrar estado reintentable:', {
+      id_factura: idFactura || null,
+      code: recordErr?.code || recordErr?.name || 'FIDELIZACION_STATE_RECORD_ERROR'
+    });
+  }
+};
+
 // Unica capa que decide (elegibilidad, config vigente EN LA FECHA, calculo de
 // puntos) y persiste (saldo + movimiento). No se duplica ese calculo ni la
 // consulta de idempotencia en modules/fidelizacion; ambos viven una sola vez
 // dentro de este servicio ya probado.
-export const persistAccumulation = ({
+//
+// Gate de idempotencia por estado (ver domain/accumulationState.js): la
+// PRIMERA vez que CUALQUIER disparador determina la elegibilidad de una
+// factura, el resultado queda grabado y es definitivo para razones de
+// negocio (SKIPPED_TERMINAL); solo los errores tecnicos se reintentan. Esto
+// es lo que impide que completar el perfil del cliente reabra una factura
+// antigua que ya fue evaluada y rechazada.
+//
+// trigger distingue el camino inmediato (LIVE, justo tras el COMMIT de la
+// venta -perfil actual = perfil al momento de la compra, confiable-) del de
+// reconciliacion (RECONCILE, asincrono -no puede garantizar que el perfil
+// actual sea el de la compra-). Solo afecta el MOTIVO persistido cuando el
+// rechazo es por perfil incompleto: el resto de motivos (config/tasa/redondeo)
+// ya son time-accurate porque getActiveFidelizacionConfig siempre usa la
+// referenceDate historica de la factura, nunca "ahora".
+export const persistAccumulation = async ({
   client,
   idFactura,
   idPedido,
@@ -110,17 +224,62 @@ export const persistAccumulation = ({
   idSucursal,
   idUsuarioEjecutor,
   montoFactura,
-  referenceDate
-}) => registerFacturaLoyaltyAccumulation({
-  client,
-  idFactura,
-  idPedido,
-  idCliente,
-  idSucursal,
-  idUsuarioEjecutor,
-  montoFactura,
-  referenceDate
-});
+  referenceDate,
+  trigger = ACCUMULATION_TRIGGER.LIVE
+}) => {
+  const existingState = await getAccumulationState(client, idFactura);
+
+  if (existingState && !RETRYABLE_ACCUMULATION_STATES.includes(existingState.estado)) {
+    // PROCESSED o SKIPPED_TERMINAL: ya fue determinado, nunca se vuelve a
+    // mirar el perfil/config/tasa.
+    return existingState.estado === ACCUMULATION_STATE.PROCESSED
+      ? { created: false, reason: 'ALREADY_REGISTERED' }
+      : { created: false, reason: existingState.motivo };
+  }
+
+  const result = await registerFacturaLoyaltyAccumulation({
+    client,
+    idFactura,
+    idPedido,
+    idCliente,
+    idSucursal,
+    idUsuarioEjecutor,
+    montoFactura,
+    referenceDate
+  });
+
+  if (result.created || result.reason === 'ALREADY_REGISTERED') {
+    await upsertAccumulationState(client, {
+      idFactura,
+      estado: ACCUMULATION_STATE.PROCESSED,
+      motivo: result.created ? null : 'ALREADY_REGISTERED',
+      elegibilidadDeterminada: Boolean(result.created),
+      fechaReferencia: referenceDate
+    });
+    return result;
+  }
+
+  if (BUSINESS_SKIP_REASONS.has(result.reason)) {
+    const persistedMotivo = trigger === ACCUMULATION_TRIGGER.RECONCILE && result.reason === 'CLIENT_PROFILE_INCOMPLETE'
+      ? LEGACY_ELIGIBILITY_UNVERIFIABLE
+      : result.reason;
+
+    await upsertAccumulationState(client, {
+      idFactura,
+      estado: ACCUMULATION_STATE.SKIPPED_TERMINAL,
+      motivo: persistedMotivo,
+      elegibilidadDeterminada: false,
+      fechaReferencia: referenceDate
+    });
+
+    return { ...result, reason: persistedMotivo };
+  }
+
+  // MISSING_REQUIRED_DATA u otro motivo no mapeado: no se toca la tabla de
+  // estado (misma precondicion que INVOICE_NOT_FULLY_PAID, resuelta antes de
+  // llegar aqui; puede cambiar, no es una regla de negocio terminal).
+  return result;
+};
 
 // Para el worker de reconciliacion: facturas que ya quedaron completamente
 // pagadas pero que no tienen (todavia) un movimiento de acumulacion. La
@@ -128,16 +287,20 @@ export const persistAccumulation = ({
 // candidatos para volver a intentar via notifyPaidInvoice.
 //
 // Paginacion por keyset (id_factura > cursor) para que un backlog grande no
-// haga que cada tick vea siempre las mismas primeras facturas. Ademas exige,
-// en la propia consulta, cliente realmente elegible y una configuracion de
-// fidelizacion vigente EN LA FECHA de pago/facturacion: sin estos dos
-// filtros, una factura permanentemente no procesable (cliente no elegible o
-// sucursal sin configuracion para esa fecha) reaparaceria en cada lote para
-// siempre e impediria avanzar hacia facturas mas nuevas (inanicion).
+// haga que cada tick vea siempre las mismas primeras facturas.
+//
+// Ya NO filtra por perfil de cliente actual ni por configuracion vigente:
+// esos dos filtros (antes en esta misma consulta) eran la causa raiz de la
+// acumulacion retroactiva -evaluaban el perfil/config ACTUAL en vez del
+// vigente al momento de la compra-. La prevencion de inanicion (que una
+// factura permanentemente no procesable no reaparezca en cada lote para
+// siempre) ahora la hace la tabla de estado: persistAccumulation evalua cada
+// candidato UNA sola vez con la logica real (registerFacturaLoyaltyAccumulation,
+// que si usa la config vigente EN LA FECHA de la factura) y graba el
+// resultado como terminal; esta consulta excluye lo que ya quedo terminal.
 export const listPaidInvoicesMissingAccumulation = async (client, { cursor = 0, limit = 25 } = {}) => {
   const boundedLimit = Math.min(Math.max(parsePositiveInt(limit) || 25, 1), 200);
   const boundedCursor = Number.isFinite(Number(cursor)) && Number(cursor) >= 0 ? Number(cursor) : 0;
-  const empresaRelationExpr = await buildClienteEmpresaRelationSql(client, 'c2');
 
   const result = await client.query(
     `
@@ -156,11 +319,8 @@ export const listPaidInvoicesMissingAccumulation = async (client, { cursor = 0, 
       ) upc ON TRUE
       LEFT JOIN public.cat_pedidos_estados_pago cep
         ON cep.id_estado_pago_pedido = upc.id_estado_pago_pedido
-      LEFT JOIN public.clientes c2 ON c2.id_cliente = COALESCE(p.id_cliente, f.id_cliente)
-      LEFT JOIN public.personas p2 ON p2.id_persona = c2.id_persona
-      LEFT JOIN public.telefonos telf_p2 ON telf_p2.id_telefono = p2.id_telefono
-      LEFT JOIN public.empresas e2 ON e2.id_empresa = ${empresaRelationExpr}
-      LEFT JOIN public.telefonos telf_e2 ON telf_e2.id_telefono = e2.id_telefono
+      LEFT JOIN public.fidelizacion_acumulacion_facturas_estado est
+        ON est.id_factura = f.id_factura
       WHERE f.id_factura > $1
         AND COALESCE(p.id_cliente, f.id_cliente) IS NOT NULL
         AND (
@@ -170,35 +330,9 @@ export const listPaidInvoicesMissingAccumulation = async (client, { cursor = 0, 
             AND COALESCE(upc.monto_pendiente, 0) = 0
           )
         )
-        -- Perfil de cliente completo: activo, nombre no vacio, telefono con
-        -- exactamente 8 digitos tras quitar todo lo que no sea numero (mismo
-        -- criterio que normalizePhoneHN). Sin esto, una factura de un
-        -- cliente con perfil incompleto reaparaceria en cada lote para
-        -- siempre (inanicion), igual que la elegibilidad/config anteriores.
-        AND COALESCE(c2.estado, true) = true
-        AND TRIM(COALESCE(
-          CASE WHEN c2.id_persona IS NOT NULL THEN p2.nombre ELSE e2.nombre_empresa END,
-          ''
-        )) <> ''
-        AND length(regexp_replace(
-          COALESCE(
-            CASE WHEN c2.id_persona IS NOT NULL THEN telf_p2.telefono ELSE telf_e2.telefono END,
-            ''
-          ),
-          '\\D', '', 'g'
-        )) = 8
-        AND EXISTS (
-          SELECT 1
-          FROM public.fidelizacion_configuracion_sucursal fcs
-          WHERE fcs.id_sucursal = COALESCE(p.id_sucursal, f.id_sucursal)
-            AND fcs.vigente_desde <= COALESCE(upc.fecha_pago_confirmado, f.fecha_hora_facturacion)
-            AND (
-              fcs.vigente_hasta IS NULL
-              OR fcs.vigente_hasta > COALESCE(upc.fecha_pago_confirmado, f.fecha_hora_facturacion)
-            )
-            AND fcs.acumulacion_habilitada = true
-            AND fcs.lempiras_por_punto > 0
-        )
+        -- Nunca reintentar un estado terminal (PROCESSED/SKIPPED_TERMINAL):
+        -- solo candidatos nuevos (sin fila) o en estado reintentable.
+        AND (est.id_factura IS NULL OR est.estado IN ('PENDING', 'RETRYABLE_ERROR'))
         AND NOT EXISTS (
           SELECT 1
           FROM public.fidelizacion_movimientos fm

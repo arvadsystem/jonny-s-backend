@@ -1,6 +1,7 @@
 import { connectClient, listPaidInvoicesMissingAccumulation } from '../infrastructure/fidelizacionRepository.js';
 import { accumulateInvoicePoints } from '../application/accumulateInvoicePoints.js';
 import { enqueueInvoiceAccumulationBatch } from '../infrastructure/fidelizacionQueue.js';
+import { ACCUMULATION_TRIGGER } from '../domain/accumulationState.js';
 
 const releaseClientSafely = (client) => {
   if (!client) return;
@@ -53,8 +54,12 @@ export const reconcileMissingPoints = async ({ cursor = 0, limit = 25 } = {}) =>
 
   const { ids, nextCursor } = listing;
 
+  // trigger: RECONCILE -- distingue este camino asincrono del inmediato
+  // (notifyPaidInvoice, LIVE por defecto) para que persistAccumulation sepa
+  // que un rechazo por perfil incompleto aqui no puede vouch por el momento
+  // de la compra (ver domain/accumulationState.js).
   const outcomes = await enqueueInvoiceAccumulationBatch(
-    ids.map((idFactura) => ({ idFactura })),
+    ids.map((idFactura) => ({ idFactura, trigger: ACCUMULATION_TRIGGER.RECONCILE })),
     accumulateInvoicePoints
   );
 

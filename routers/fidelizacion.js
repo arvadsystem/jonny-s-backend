@@ -10,6 +10,7 @@ import {
   unknownFieldsFromPayload
 } from '../utils/security/personasHardening.js';
 import {
+  buildClienteEmpresaRelationSql,
   computeRedemptionPoints,
   createFidelizacionError,
   createPresentialFidelizacionCanje,
@@ -18,14 +19,15 @@ import {
   normalizeText,
   parseNonNegativeInt,
   parsePositiveInt,
-  parsePositiveNumber
+  parsePositiveNumber,
+  resolveEffectiveAcumulacionHabilitada,
+  resolveEffectiveLempirasPorPunto
 } from '../services/fidelizacionService.js';
 
 const router = express.Router();
 
 const MAX_PAGE_SIZE = 100;
 const MULTISUCURSAL_PERMISSION = 'fidelizacion_ver_multisucursal';
-const CLIENT_ROLE_NAME = 'CLIENTE';
 const TEGUCIGALPA_TIMEZONE = 'America/Tegucigalpa';
 
 const isPlainObject = (value) => value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -195,32 +197,17 @@ const assertAllPermissions = async (req, permissions) => {
   }
 };
 
-const buildClienteBaseSql = () => `
-  WITH eligible_clients AS (
-    SELECT DISTINCT
-      c.id_cliente,
-      u.id_usuario AS id_usuario_cliente,
-      u.nombre_usuario
-    FROM public.clientes c
-    INNER JOIN public.usuarios_clientes uc
-      ON uc.id_cliente = c.id_cliente
-     AND COALESCE(uc.estado, true) = true
-    INNER JOIN public.usuarios u
-      ON u.id_usuario = uc.id_usuario
-     AND u.id_cliente = uc.id_cliente
-     AND COALESCE(u.estado, false) = true
-    INNER JOIN public.roles_usuarios ru
-      ON ru.id_usuario = u.id_usuario
-    INNER JOIN public.roles r
-      ON r.id_rol = ru.id_rol
-    WHERE COALESCE(c.estado, true) = true
-      AND UPPER(TRIM(r.nombre)) = '${CLIENT_ROLE_NAME}'
-  ),
-  cliente_cards AS (
+// empresaRelationExpr: fragmento SQL resuelto por buildClienteEmpresaRelationSql
+// (services/fidelizacionService.js) -- misma deteccion dinamica de
+// clientes.id_empresa_cliente vs clientes.id_empresa que ya usa
+// fetchClienteProfileForFidelizacion y listPaidInvoicesMissingAccumulation.
+// No se duplica una tercera implementacion incompatible de esa relacion.
+const buildClienteBaseSql = (empresaRelationExpr = 'c.id_empresa') => `
+  WITH cliente_cards AS (
     SELECT
       c.id_cliente,
-      ec.id_usuario_cliente,
-      ec.nombre_usuario,
+      u.id_usuario AS id_usuario_cliente,
+      u.nombre_usuario,
       COALESCE(
         NULLIF(TRIM(CONCAT(COALESCE(p.nombre, ''), ' ', COALESCE(p.apellido, ''))), ''),
         NULLIF(TRIM(e.nombre_empresa), ''),
@@ -242,12 +229,10 @@ const buildClienteBaseSql = () => `
         ELSE false
       END AS visible_en_sucursal
     FROM public.clientes c
-    INNER JOIN eligible_clients ec
-      ON ec.id_cliente = c.id_cliente
     LEFT JOIN public.personas p
       ON p.id_persona = c.id_persona
     LEFT JOIN public.empresas e
-      ON e.id_empresa = c.id_empresa
+      ON e.id_empresa = ${empresaRelationExpr}
     LEFT JOIN public.telefonos tel_p
       ON tel_p.id_telefono = p.id_telefono
     LEFT JOIN public.telefonos tel_e
@@ -256,6 +241,16 @@ const buildClienteBaseSql = () => `
       ON cor_p.id_correo = p.id_correo
     LEFT JOIN public.correos cor_e
       ON cor_e.id_correo = e.id_correo
+    -- Datos de usuario opcionales (LEFT JOIN): un cliente puede acumular y
+    -- aparecer en el panel sin tener cuenta de usuario ni rol CLIENTE
+    -- (misma regla de perfil que la acumulacion, ver mas abajo).
+    LEFT JOIN public.usuarios_clientes uc
+      ON uc.id_cliente = c.id_cliente
+     AND COALESCE(uc.estado, true) = true
+    LEFT JOIN public.usuarios u
+      ON u.id_usuario = uc.id_usuario
+     AND u.id_cliente = uc.id_cliente
+     AND COALESCE(u.estado, false) = true
     LEFT JOIN public.fidelizacion_saldos_cliente fs
       ON fs.id_cliente = c.id_cliente
     LEFT JOIN LATERAL (
@@ -317,6 +312,24 @@ const buildClienteBaseSql = () => `
       ) x
       LIMIT 1
     ) activity_scope ON true
+    -- Misma regla de elegibilidad por perfil que usa la acumulacion
+    -- (isClienteProfileComplete / fetchClienteProfileForFidelizacion en
+    -- services/fidelizacionService.js): activo, con nombre (persona o
+    -- empresa) y telefono con exactamente 8 digitos (criterio canonico de
+    -- normalizePhoneHN). No se exige usuario, rol CLIENTE, correo, apellido
+    -- ni credenciales de acceso.
+    WHERE COALESCE(c.estado, true) = true
+      AND TRIM(COALESCE(
+        CASE WHEN c.id_persona IS NOT NULL THEN CONCAT(p.nombre, ' ', p.apellido) ELSE e.nombre_empresa END,
+        ''
+      )) <> ''
+      AND length(regexp_replace(
+        COALESCE(
+          CASE WHEN c.id_persona IS NOT NULL THEN tel_p.telefono ELSE tel_e.telefono END,
+          ''
+        ),
+        '\\D', '', 'g'
+      )) = 8
   )
 `;
 
@@ -335,9 +348,10 @@ const buildClienteWhereClause = ({ searchParamRef }) => `
 `;
 
 const fetchClienteDetalleRow = async (client, idCliente, targetSucursalId = null) => {
+  const empresaRelationExpr = await buildClienteEmpresaRelationSql(client, 'c');
   const result = await client.query(
     `
-      ${buildClienteBaseSql()}
+      ${buildClienteBaseSql(empresaRelationExpr)}
       SELECT *
       FROM cliente_cards
       WHERE id_cliente = $2
@@ -415,11 +429,13 @@ const fidelizacionService = {
       allowAllBranches: true
     });
 
+    const empresaRelationExpr = await buildClienteEmpresaRelationSql(pool, 'c');
+
     const [config, aggregateResult, canjesHoyResult, canjesMesResult] = await Promise.all([
       scope.targetSucursalId ? getActiveFidelizacionConfig(pool, scope.targetSucursalId) : null,
       pool.query(
         `
-          ${buildClienteBaseSql()}
+          ${buildClienteBaseSql(empresaRelationExpr)}
           SELECT
             COUNT(*) FILTER (WHERE COALESCE(puntos_disponibles, 0) > 0)::int AS clientes_con_puntos,
             COALESCE(SUM(COALESCE(puntos_disponibles, 0)), 0)::int AS puntos_disponibles_totales
@@ -510,9 +526,10 @@ const fidelizacionService = {
 
     const search = buildLikeSearch(req.query.search || req.query.q);
     const offset = (page - 1) * limit;
+    const empresaRelationExpr = await buildClienteEmpresaRelationSql(pool, 'c');
 
     const dataQuery = `
-      ${buildClienteBaseSql()}
+      ${buildClienteBaseSql(empresaRelationExpr)}
       SELECT
         cc.id_cliente,
         cc.id_usuario_cliente,
@@ -534,7 +551,7 @@ const fidelizacionService = {
     `;
 
     const countQuery = `
-      ${buildClienteBaseSql()}
+      ${buildClienteBaseSql(empresaRelationExpr)}
       SELECT COUNT(*)::int AS total
       ${buildClienteWhereClause({ searchParamRef: '$2' })}
     `;
@@ -981,8 +998,10 @@ const fidelizacionService = {
     }
 
     // Booleano estricto: "true" (string) u otros tipos se rechazan. Si se
-    // omite, el valor seguro por defecto es false (no habilitar acumulacion
-    // implicitamente al guardar otros campos de la configuracion).
+    // omite, el valor efectivo se resuelve mas abajo (tras leer la
+    // configuracion previa dentro de la transaccion): conserva el valor
+    // anterior si existe, y solo cae a false para la primera configuracion
+    // de la sucursal (ver resolveEffectiveAcumulacionHabilitada).
     if (
       req.body.acumulacion_habilitada !== undefined &&
       typeof req.body.acumulacion_habilitada !== 'boolean'
@@ -995,20 +1014,24 @@ const fidelizacionService = {
         })
       };
     }
-    const acumulacionHabilitada = req.body.acumulacion_habilitada === undefined
-      ? false
-      : req.body.acumulacion_habilitada;
+    const acumulacionHabilitadaProvided = req.body.acumulacion_habilitada !== undefined;
+    const acumulacionHabilitadaInput = acumulacionHabilitadaProvided ? req.body.acumulacion_habilitada : null;
 
-    // La tasa solo es obligatoria (>0) cuando la acumulacion esta habilitada.
-    // Con el switch apagado es valido guardar la configuracion aunque exista
-    // una tasa ya configurada (se conserva tal cual para no afectar canje).
+    // lempiras_por_punto tambien se usa para calcular canjes, asi que debe
+    // seguir siendo > 0 en TODA configuracion guardada, sin importar el
+    // switch. Si el payload trae el campo pero es invalido (0, negativo,
+    // NaN, no numerico) se rechaza siempre, aunque el switch este apagado:
+    // ya no se ignora en silencio. Si lo omite, se resuelve mas abajo
+    // (conserva la tasa anterior o exige una nueva si es la primera
+    // configuracion; ver resolveEffectiveLempirasPorPunto).
+    const lempirasPorPuntoProvided = req.body.lempiras_por_punto !== undefined;
     const lempirasPorPuntoInput = parsePositiveNumber(req.body.lempiras_por_punto);
-    if (acumulacionHabilitada && !lempirasPorPuntoInput) {
+    if (lempirasPorPuntoProvided && !lempirasPorPuntoInput) {
       return {
         status: 400,
         body: buildErrorBody({
           code: 'VALIDATION_ERROR',
-          message: 'lempiras_por_punto debe ser un numero mayor a 0 cuando la acumulacion de puntos esta habilitada.'
+          message: 'lempiras_por_punto debe ser un numero mayor a 0.'
         })
       };
     }
@@ -1140,13 +1163,32 @@ const fidelizacionService = {
       await client.query('LOCK TABLE public.fidelizacion_configuracion_sucursal IN EXCLUSIVE MODE');
 
       const previousConfig = await getActiveFidelizacionConfig(client, scope.targetSucursalId);
-      // Si el switch queda apagado y no se envio una tasa valida, se
-      // conserva la tasa anterior (no se pisa con 0): sigue siendo la que
-      // usa el canje, y evita romper esa regla de negocio por apagar
-      // acumulacion.
-      const lempirasPorPunto = lempirasPorPuntoInput
-        || Number(previousConfig?.lempiras_por_punto)
-        || 0;
+
+      // Switch: booleano explicito del payload, o se conserva el de la
+      // configuracion previa; solo cae a false si es la primera
+      // configuracion de la sucursal.
+      const acumulacionHabilitada = resolveEffectiveAcumulacionHabilitada({
+        inputProvided: acumulacionHabilitadaProvided,
+        inputValue: acumulacionHabilitadaInput,
+        previousConfig
+      });
+
+      // Tasa: numero explicito del payload, o se conserva la tasa anterior
+      // (nunca se pisa con 0). La primera configuracion de una sucursal
+      // exige una tasa > 0 sin importar el switch: tambien la usa el canje.
+      const lempirasResolution = resolveEffectiveLempirasPorPunto({
+        inputProvided: lempirasPorPuntoProvided,
+        inputValue: lempirasPorPuntoInput,
+        previousConfig
+      });
+      if (!lempirasResolution.ok) {
+        throw createFidelizacionError(
+          400,
+          'VALIDATION_ERROR',
+          'lempiras_por_punto debe ser un numero mayor a 0 para la primera configuracion de la sucursal.'
+        );
+      }
+      const lempirasPorPunto = lempirasResolution.value;
 
       await client.query(
         `
@@ -1735,5 +1777,7 @@ router.get(
   })
 );
 
-export { fidelizacionService };
+// buildClienteBaseSql se exporta solo para pruebas (verificar la SQL real
+// generada sin depender de una base de datos).
+export { fidelizacionService, buildClienteBaseSql };
 export default router;

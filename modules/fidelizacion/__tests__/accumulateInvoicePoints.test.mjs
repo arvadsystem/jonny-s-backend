@@ -394,3 +394,173 @@ describe('accumulateInvoicePoints (capa unica: gate de pago + decide + persiste)
     assert.equal(connectCalled, false);
   });
 });
+
+describe('accumulateInvoicePoints: bloqueante 3 (tabla de estado por factura, sin acumulacion retroactiva)', () => {
+  const ctx = (overrides = {}) => ({
+    id_pedido: null,
+    id_sucursal: 1,
+    id_usuario: 9,
+    id_cliente: 5,
+    monto_factura: 100,
+    fecha_referencia_config: '2026-03-01T10:00:00Z',
+    tiene_pago_control: false,
+    pago_control_monto_pendiente: null,
+    pago_control_estado_codigo: null,
+    ...overrides
+  });
+
+  it('camino LIVE (default): perfil incompleto queda SKIPPED_TERMINAL/CLIENT_PROFILE_INCOMPLETE (confiable: es tiempo de compra)', async () => {
+    const { client, state } = createFidelizacionMockClient({
+      clienteProfiles: { 5: { estado: true, nombre: '', telefono: '' } },
+      facturaContexts: { 850: ctx() }
+    });
+
+    let result;
+    await withMockedFidelizacionPoolConnect(async () => client, async () => {
+      result = await accumulateInvoicePoints({ idFactura: 850 });
+    });
+
+    assert.equal(result.created, false);
+    assert.equal(result.reason, 'CLIENT_PROFILE_INCOMPLETE');
+    assert.equal(state.estadoFacturas.get(850).estado, 'SKIPPED_TERMINAL');
+    assert.equal(state.estadoFacturas.get(850).motivo, 'CLIENT_PROFILE_INCOMPLETE');
+    assert.equal(state.movimientos.length, 0);
+  });
+
+  it('camino RECONCILE: mismo rechazo por perfil incompleto se relabela a LEGACY_ELIGIBILITY_UNVERIFIABLE', async () => {
+    const { client, state } = createFidelizacionMockClient({
+      clienteProfiles: { 5: { estado: true, nombre: '', telefono: '' } },
+      facturaContexts: { 851: ctx() }
+    });
+
+    let result;
+    await withMockedFidelizacionPoolConnect(async () => client, async () => {
+      result = await accumulateInvoicePoints({ idFactura: 851, trigger: 'RECONCILE' });
+    });
+
+    assert.equal(result.created, false);
+    assert.equal(result.reason, 'LEGACY_ELIGIBILITY_UNVERIFIABLE');
+    assert.equal(state.estadoFacturas.get(851).motivo, 'LEGACY_ELIGIBILITY_UNVERIFIABLE');
+  });
+
+  it('completar el perfil despues no reabre una factura ya terminal (el escenario exacto del bug reportado)', async () => {
+    const { client, state } = createFidelizacionMockClient({
+      clienteProfiles: { 5: { estado: true, nombre: '', telefono: '' } },
+      facturaContexts: { 852: ctx() }
+    });
+
+    await withMockedFidelizacionPoolConnect(async () => client, async () => {
+      const first = await accumulateInvoicePoints({ idFactura: 852, trigger: 'RECONCILE' });
+      assert.equal(first.created, false);
+    });
+    assert.equal(state.movimientos.length, 0);
+
+    // El cliente completa su perfil DESPUES de la primera evaluacion.
+    state.clienteProfiles[5] = { estado: true, nombre: 'Completo Ahora', telefono: '9999-9999' };
+
+    let second;
+    await withMockedFidelizacionPoolConnect(async () => client, async () => {
+      second = await accumulateInvoicePoints({ idFactura: 852, trigger: 'RECONCILE' });
+    });
+
+    assert.equal(second.created, false, 'no debe otorgar puntos retroactivos');
+    assert.equal(second.reason, 'LEGACY_ELIGIBILITY_UNVERIFIABLE', 'debe devolver el motivo terminal ya grabado, sin volver a mirar el perfil');
+    assert.equal(state.movimientos.length, 0);
+    assert.equal(state.estadoFacturas.get(852).intentos, 1, 'la segunda llamada no debe incrementar intentos: se corta antes de volver a evaluar');
+  });
+
+  it('factura ya PROCESSED (idempotencia): una segunda llamada devuelve ALREADY_REGISTERED sin volver a evaluar nada', async () => {
+    const { client, state } = createFidelizacionMockClient({
+      facturaContexts: { 853: ctx() }
+    });
+
+    await withMockedFidelizacionPoolConnect(async () => client, async () => {
+      const first = await accumulateInvoicePoints({ idFactura: 853 });
+      assert.equal(first.created, true);
+    });
+    assert.equal(state.movimientos.length, 1);
+
+    let second;
+    await withMockedFidelizacionPoolConnect(async () => client, async () => {
+      second = await accumulateInvoicePoints({ idFactura: 853 });
+    });
+
+    assert.equal(second.created, false);
+    assert.equal(second.reason, 'ALREADY_REGISTERED');
+    assert.equal(state.movimientos.length, 1, 'no debe duplicar el movimiento');
+  });
+
+  // Nota sobre "dos workers concurrentes no duplican el movimiento": en
+  // produccion esto lo garantizan dos capas independientes de esta funcion
+  // (no simulables en el mock sin locking real de Postgres): (1) el pool
+  // dedicado fidelizacionPool tiene max:1 conexion (ver fidelizacionPool.js
+  // y fidelizacionPool.test.mjs: "esta configurado con max: 1 conexion"),
+  // asi que un segundo connectClient() espera a que el primero libere la
+  // conexion; (2) pg_advisory_xact_lock(idFactura) serializa incluso entre
+  // procesos/instancias distintas. Lo que SI se prueba aqui con el mock es
+  // la idempotencia que resulta de esa serializacion: una vez que la
+  // primera llamada termina y persiste PROCESSED/SKIPPED_TERMINAL, cualquier
+  // llamada posterior para la misma factura (la "segunda" tras esperar a la
+  // primera) nunca vuelve a evaluar nada ni duplica el movimiento -ver
+  // "factura ya PROCESSED (idempotencia)" arriba-.
+
+  it('error tecnico: queda RETRYABLE_ERROR (no terminal)', async () => {
+    const failing = createFidelizacionMockClient({
+      facturaContexts: { 855: ctx() },
+      failOn: 'INSERT INTO public.fidelizacion_movimientos'
+    });
+
+    let firstResult;
+    await withMockedFidelizacionPoolConnect(async () => failing.client, async () => {
+      firstResult = await accumulateInvoicePoints({ idFactura: 855 });
+    });
+    assert.equal(firstResult.reason, 'ERROR');
+    assert.equal(failing.state.estadoFacturas.get(855).estado, 'RETRYABLE_ERROR', 'un error tecnico nunca queda como skip terminal de negocio');
+    assert.ok(failing.state.estadoFacturas.get(855).ultimo_error, 'debe guardar el ultimo error tecnico');
+  });
+
+  it('un estado RETRYABLE_ERROR persistido no bloquea el reintento (a diferencia de un estado terminal)', async () => {
+    const { client, state } = createFidelizacionMockClient({
+      facturaContexts: { 857: ctx() },
+      estadoFacturasIniciales: {
+        857: { estado: 'RETRYABLE_ERROR', motivo: null, intentos: 1, ultimo_error: 'ECONNRESET previo' }
+      }
+    });
+
+    let result;
+    await withMockedFidelizacionPoolConnect(async () => client, async () => {
+      result = await accumulateInvoicePoints({ idFactura: 857 });
+    });
+
+    assert.equal(result.created, true, 'RETRYABLE_ERROR debe volver a evaluar normalmente, no quedarse bloqueado');
+    assert.equal(state.movimientos.length, 1);
+    assert.equal(state.estadoFacturas.get(857).estado, 'PROCESSED');
+    assert.equal(state.estadoFacturas.get(857).intentos, 2, 'el reintento incrementa intentos sobre la fila existente');
+  });
+
+  it('falla especifica al guardar el estado reintentable: nunca cambia el resultado ya decidido (ERROR) ni propaga', async () => {
+    const { client } = createFidelizacionMockClient({
+      facturaContexts: { 856: ctx() },
+      failOn: 'INSERT INTO public.fidelizacion_movimientos'
+    });
+
+    const originalQuery = client.query.bind(client);
+    client.query = async (sql, params) => {
+      const text = String(sql);
+      if (text.includes('INSERT INTO public.fidelizacion_acumulacion_facturas_estado')) {
+        throw new Error('SIMULATED_STATE_TABLE_FAILURE');
+      }
+      return originalQuery(sql, params);
+    };
+
+    let result;
+    await withMockedFidelizacionPoolConnect(async () => client, async () => {
+      await assert.doesNotReject(
+        (async () => { result = await accumulateInvoicePoints({ idFactura: 856 }); })()
+      );
+    });
+
+    assert.equal(result.created, false);
+    assert.equal(result.reason, 'ERROR', 'una falla guardando el estado de fidelizacion no cambia el resultado ya decidido');
+  });
+});

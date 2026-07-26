@@ -47,6 +47,7 @@ export const createFidelizacionMockClient = ({
   clienteProfiles = {},
   defaultClienteProfile = DEFAULT_CLIENTE_PROFILE,
   missingAccumulationIds = null,
+  estadoFacturasIniciales = {},
   failOn = null,
   releaseError = null
 } = {}) => {
@@ -68,6 +69,20 @@ export const createFidelizacionMockClient = ({
     ),
     defaultClienteProfile,
     missingAccumulationIds: missingAccumulationIds ? [...missingAccumulationIds] : null,
+    // fidelizacion_acumulacion_facturas_estado: Map<id_factura, fila>. Refleja
+    // el mismo guard que el INSERT ... ON CONFLICT real: nunca degrada un
+    // estado terminal (PROCESSED/SKIPPED_TERMINAL) ya grabado.
+    estadoFacturas: new Map(
+      Object.entries(estadoFacturasIniciales).map(([id, row]) => [Number(id), {
+        id_factura: Number(id),
+        estado: 'PENDING',
+        motivo: null,
+        elegibilidad_determinada: null,
+        fecha_referencia: null,
+        intentos: 0,
+        ...row
+      }])
+    ),
     nextMovimientoId: movimientos.length + 1,
     calls: [],
     released: false,
@@ -79,26 +94,23 @@ export const createFidelizacionMockClient = ({
     return override === undefined ? state.defaultClienteProfile : override;
   };
 
-  // Mismo criterio que isClienteProfileComplete en services/fidelizacionService.js:
-  // activo + nombre no vacio + telefono con exactamente 8 digitos (normalizePhoneHN).
-  const isClienteProfileValid = (idCliente) => {
-    const profile = getClienteProfile(idCliente);
-    if (!profile) return false;
-    const nombreValido = String(profile.nombre ?? '').trim().length > 0;
-    const digits = String(profile.telefono ?? '').replace(/\D/g, '');
-    const telefonoValido = digits.length === 8;
-    return Boolean(profile.estado ?? true) && nombreValido && telefonoValido;
-  };
-
   const hasMovimiento = (idFactura) => state.movimientos.some(
     (m) => m.id_factura === Number(idFactura) && m.tipo === 'ACUMULACION' && m.origen === 'FACTURA'
   );
 
+  const isRetryableOrNoState = (idFactura) => {
+    const row = state.estadoFacturas.get(Number(idFactura));
+    return !row || row.estado === 'PENDING' || row.estado === 'RETRYABLE_ERROR';
+  };
+
   // Recalcula la lista de candidatos "pagados sin movimiento" a partir de
-  // facturaContexts, replicando los mismos filtros que la consulta real
-  // (perfil de cliente completo, switch+tasa historicos, pago completo, sin
-  // movimiento). Si el test declaro missingAccumulationIds explicitamente,
-  // se respeta tal cual (compatibilidad con pruebas mas simples).
+  // facturaContexts, replicando los mismos filtros que la consulta real:
+  // pago completo, sin movimiento, y sin fila terminal en
+  // fidelizacion_acumulacion_facturas_estado. Ya NO filtra por perfil de
+  // cliente ni por configuracion vigente (eso es exactamente lo que causaba
+  // la acumulacion retroactiva: ver fidelizacionRepository.js). Si el test
+  // declaro missingAccumulationIds explicitamente, se respeta tal cual
+  // (compatibilidad con pruebas mas simples).
   const computeMissingAccumulationCandidates = (cursor, limit) => {
     if (state.missingAccumulationIds !== null) {
       return state.missingAccumulationIds.filter((id) => id > cursor).slice(0, limit);
@@ -110,12 +122,8 @@ export const createFidelizacionMockClient = ({
         if (id <= cursor) return false;
         if (!context.id_cliente) return false;
         if (!isContextFullyPaid(context)) return false;
-        if (!isClienteProfileValid(context.id_cliente)) return false;
-        const matchedConfig = resolveConfigForDate(state.activeConfigs, context.fecha_referencia_config);
-        if (!matchedConfig) return false;
-        if (!matchedConfig.acumulacion_habilitada) return false;
-        if (!(Number(matchedConfig.lempiras_por_punto) > 0)) return false;
         if (hasMovimiento(id)) return false;
+        if (!isRetryableOrNoState(id)) return false;
         return true;
       })
       .sort((a, b) => a.id - b.id)
@@ -146,6 +154,38 @@ export const createFidelizacionMockClient = ({
       // se simula un esquema SIN esa columna (empresaRelationExpr cae a c.id_empresa).
       if (text.includes('information_schema.columns') && text.includes('clientes')) {
         return { rowCount: 0, rows: [] };
+      }
+
+      // Tabla de estado de procesamiento por factura (getAccumulationState /
+      // upsertAccumulationState / recordAccumulationRetryableError).
+      if (text.includes('INSERT INTO public.fidelizacion_acumulacion_facturas_estado')) {
+        const [facturaId, estado, motivo, elegibilidadDeterminada, fechaReferencia, ultimoError] = params;
+        const id = Number(facturaId);
+        const existing = state.estadoFacturas.get(id);
+
+        // Mismo guard que el WHERE del ON CONFLICT DO UPDATE real: nunca
+        // degrada un estado terminal ya grabado.
+        if (existing && existing.estado !== 'PENDING' && existing.estado !== 'RETRYABLE_ERROR') {
+          return { rows: [existing] };
+        }
+
+        const nextRow = {
+          id_factura: id,
+          estado,
+          motivo: motivo ?? null,
+          elegibilidad_determinada: elegibilidadDeterminada ?? null,
+          fecha_referencia: fechaReferencia ?? existing?.fecha_referencia ?? null,
+          intentos: (existing?.intentos || 0) + 1,
+          ultimo_error: ultimoError ?? null
+        };
+        state.estadoFacturas.set(id, nextRow);
+        return { rows: [nextRow] };
+      }
+
+      if (text.includes('FROM public.fidelizacion_acumulacion_facturas_estado')) {
+        const id = Number(params[0]);
+        const row = state.estadoFacturas.get(id);
+        return { rows: row ? [row] : [] };
       }
 
       if (text.includes('NOT EXISTS') && text.includes('FROM public.facturas f')) {

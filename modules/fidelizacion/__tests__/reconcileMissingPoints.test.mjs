@@ -84,13 +84,12 @@ describe('reconcileMissingPoints (worker de reconciliacion idempotente, sin inan
     assert.equal(state.movimientos.length, 1);
   });
 
-  it('filtra clientes con perfil incompleto: primer lote sin candidatos procesables, segundo lote (perfil completo) si avanza', async () => {
+  it('perfil incompleto: la factura SI se lista (ya no se filtra en silencio) pero queda SKIPPED_TERMINAL/LEGACY_ELIGIBILITY_UNVERIFIABLE, sin movimiento', async () => {
     const { client, state } = createFidelizacionMockClient({
       clienteProfiles: {
         5: { estado: true, nombre: '', telefono: '9999-9999' } // sin nombre: perfil incompleto
       },
       facturaContexts: {
-        // id_cliente 5 tiene perfil incompleto: nunca debe aparecer como candidato.
         2001: baseContext({ id_cliente: 5, monto_factura: 100 }),
         2002: baseContext({ id_cliente: 5, monto_factura: 100 }),
         2003: baseContext({ id_cliente: 6, monto_factura: 100 })
@@ -99,11 +98,50 @@ describe('reconcileMissingPoints (worker de reconciliacion idempotente, sin inan
 
     const result = await withMockedFidelizacionPoolConnect(async () => client, () => reconcileMissingPoints({ limit: 25 }));
 
-    assert.equal(result.scanned, 1, 'las facturas de cliente con perfil incompleto nunca deben listarse como candidatas');
-    assert.deepEqual(result.ids_factura, [2003]);
-    assert.equal(result.processed, 1);
+    // Bloqueante 3: ya no se filtra en la consulta de listado (eso era la
+    // causa raiz de la acumulacion retroactiva). Las 3 facturas se listan y
+    // se evaluan una sola vez; las de perfil incompleto quedan terminales.
+    assert.equal(result.scanned, 3);
+    assert.deepEqual(result.ids_factura, [2001, 2002, 2003]);
+    assert.equal(result.processed, 1, 'solo la factura con perfil completo (2003) genera puntos');
+    assert.equal(result.skipped, 2);
     assert.equal(state.movimientos.length, 1);
     assert.equal(state.movimientos[0].id_factura, 2003);
+
+    for (const id of [2001, 2002]) {
+      const row = state.estadoFacturas.get(id);
+      assert.equal(row.estado, 'SKIPPED_TERMINAL');
+      assert.equal(row.motivo, 'LEGACY_ELIGIBILITY_UNVERIFIABLE', 'reconciliacion (no la venta inmediata) determino esto: se relabela, no queda como CLIENT_PROFILE_INCOMPLETE');
+    }
+  });
+
+  it('bug reportado: completar el perfil DESPUES de que la factura quedo terminal no la reabre en un tick posterior', async () => {
+    const { client, state } = createFidelizacionMockClient({
+      clienteProfiles: {
+        5: { estado: true, nombre: '', telefono: '' } // perfil incompleto al momento de la compra
+      },
+      facturaContexts: {
+        2501: baseContext({ id_cliente: 5, monto_factura: 100 })
+      }
+    });
+
+    const firstTick = await withMockedFidelizacionPoolConnect(async () => client, () => reconcileMissingPoints({ limit: 25 }));
+    assert.deepEqual(firstTick.ids_factura, [2501]);
+    assert.equal(firstTick.processed, 0);
+    assert.equal(state.movimientos.length, 0);
+    assert.equal(state.estadoFacturas.get(2501).estado, 'SKIPPED_TERMINAL');
+
+    // El cliente completa su perfil DESPUES (nombre y telefono validos).
+    state.clienteProfiles[5] = { estado: true, nombre: 'Ahora Completo', telefono: '9999-9999' };
+
+    const secondTick = await withMockedFidelizacionPoolConnect(async () => client, () => reconcileMissingPoints({ limit: 25 }));
+
+    // La factura 2501 ya no debe ni listarse (esta terminal): no reaparece,
+    // y sobre todo nunca genera un movimiento con los datos de hoy.
+    assert.deepEqual(secondTick.ids_factura, []);
+    assert.equal(secondTick.scanned, 0);
+    assert.equal(state.movimientos.length, 0, 'completar el perfil no debe generar puntos retroactivos para la factura antigua');
+    assert.equal(state.estadoFacturas.get(2501).estado, 'SKIPPED_TERMINAL', 'el estado terminal sobrevive intacto');
   });
 
   it('cursor keyset: avanza y el siguiente lote no repite siempre las primeras facturas', async () => {
@@ -130,7 +168,7 @@ describe('reconcileMissingPoints (worker de reconciliacion idempotente, sin inan
     assert.equal(secondBatch.next_cursor, 3003);
   });
 
-  it('factura sin configuracion historica valida no bloquea a las siguientes', async () => {
+  it('factura sin configuracion historica valida: se lista, queda SKIPPED_TERMINAL/CONFIG_NOT_FOUND, y no bloquea a las siguientes', async () => {
     const { client, state } = createFidelizacionMockClient({
       activeConfigs: [
         { lempiras_por_punto: 10, vigente_desde: '2026-01-01T00:00:00Z', vigente_hasta: null }
@@ -144,12 +182,19 @@ describe('reconcileMissingPoints (worker de reconciliacion idempotente, sin inan
 
     const result = await withMockedFidelizacionPoolConnect(async () => client, () => reconcileMissingPoints({ limit: 25 }));
 
-    assert.deepEqual(result.ids_factura, [4002], 'la factura sin configuracion historica no debe listarse, pero no debe impedir listar 4002');
+    assert.deepEqual(result.ids_factura, [4001, 4002]);
     assert.equal(result.processed, 1);
+    assert.equal(result.skipped, 1);
     assert.equal(state.movimientos.length, 1);
+    assert.equal(state.estadoFacturas.get(4001).estado, 'SKIPPED_TERMINAL');
+    assert.equal(state.estadoFacturas.get(4001).motivo, 'CONFIG_NOT_FOUND');
+
+    // Un tick posterior no vuelve a listar 4001 (ya es terminal), sin importar cuanto cambie el reloj.
+    const secondTick = await withMockedFidelizacionPoolConnect(async () => client, () => reconcileMissingPoints({ limit: 25 }));
+    assert.deepEqual(secondTick.ids_factura, []);
   });
 
-  it('excluye sucursales con switch de acumulacion apagado en la fecha de referencia', async () => {
+  it('sucursal con switch de acumulacion apagado en la fecha de referencia: se lista, queda SKIPPED_TERMINAL/ACCUMULATION_DISABLED', async () => {
     const { client, state } = createFidelizacionMockClient({
       activeConfigs: [
         { lempiras_por_punto: 10, acumulacion_habilitada: false, vigente_desde: '2026-01-01T00:00:00Z', vigente_hasta: null }
@@ -162,11 +207,15 @@ describe('reconcileMissingPoints (worker de reconciliacion idempotente, sin inan
 
     const result = await withMockedFidelizacionPoolConnect(async () => client, () => reconcileMissingPoints({ limit: 25 }));
 
-    assert.equal(result.scanned, 0, 'ninguna factura con el switch apagado debe listarse como candidata');
+    assert.deepEqual(result.ids_factura, [4101, 4102]);
+    assert.equal(result.processed, 0);
+    assert.equal(result.skipped, 2);
     assert.equal(state.movimientos.length, 0);
+    assert.equal(state.estadoFacturas.get(4101).motivo, 'ACCUMULATION_DISABLED');
+    assert.equal(state.estadoFacturas.get(4102).motivo, 'ACCUMULATION_DISABLED');
   });
 
-  it('excluye configuraciones sin tasa valida (lempiras_por_punto <= 0) aunque el switch este encendido', async () => {
+  it('configuracion sin tasa valida (lempiras_por_punto <= 0): se lista, queda SKIPPED_TERMINAL/ACCUMULATION_RULE_NOT_CONFIGURED', async () => {
     const { client, state } = createFidelizacionMockClient({
       activeConfigs: [
         { lempiras_por_punto: 0, acumulacion_habilitada: true, vigente_desde: '2026-01-01T00:00:00Z', vigente_hasta: null }
@@ -178,8 +227,11 @@ describe('reconcileMissingPoints (worker de reconciliacion idempotente, sin inan
 
     const result = await withMockedFidelizacionPoolConnect(async () => client, () => reconcileMissingPoints({ limit: 25 }));
 
-    assert.equal(result.scanned, 0, 'una configuracion sin tasa valida no debe generar candidatos');
+    assert.deepEqual(result.ids_factura, [4201]);
+    assert.equal(result.processed, 0);
+    assert.equal(result.skipped, 1);
     assert.equal(state.movimientos.length, 0);
+    assert.equal(state.estadoFacturas.get(4201).motivo, 'ACCUMULATION_RULE_NOT_CONFIGURED');
   });
 
   it('un fallo individual en el lote no cancela el resto', async () => {

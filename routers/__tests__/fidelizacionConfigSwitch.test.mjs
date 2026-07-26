@@ -46,19 +46,26 @@ describe('routers/fidelizacion.js: switch administrativo acumulacion_habilitada'
     assert.match(surrounding, /status:\s*400/);
   });
 
-  it('el valor por defecto de acumulacion_habilitada cuando se omite es false', async () => {
+  it('si se omite acumulacion_habilitada, se resuelve con resolveEffectiveAcumulacionHabilitada (conserva la config previa; false solo si es la primera)', async () => {
     const source = await getRouterSource();
     const handler = getHandlerBlock(source, 'async saveConfiguracion(req)');
-    assert.match(
-      handler,
-      /req\.body\.acumulacion_habilitada === undefined\s*\n?\s*\?\s*false/
-    );
+    assert.match(handler, /resolveEffectiveAcumulacionHabilitada\(\{\s*\n\s*inputProvided:\s*acumulacionHabilitadaProvided,\s*\n\s*inputValue:\s*acumulacionHabilitadaInput,\s*\n\s*previousConfig\s*\n\s*\}\)/);
   });
 
-  it('lempiras_por_punto solo es obligatorio (>0) cuando acumulacion_habilitada es true', async () => {
+  it('lempiras_por_punto provisto pero invalido (0/negativo/NaN) se rechaza con 400 siempre, sin importar el switch', async () => {
     const source = await getRouterSource();
     const handler = getHandlerBlock(source, 'async saveConfiguracion(req)');
-    assert.match(handler, /if \(acumulacionHabilitada && !lempirasPorPuntoInput\)/);
+    assert.match(handler, /if \(lempirasPorPuntoProvided && !lempirasPorPuntoInput\)/);
+  });
+
+  it('la tasa final se resuelve con resolveEffectiveLempirasPorPunto y rechaza con 400 si no puede producir un valor > 0 (primera configuracion sin tasa)', async () => {
+    const source = await getRouterSource();
+    const handler = getHandlerBlock(source, 'async saveConfiguracion(req)');
+    assert.match(handler, /resolveEffectiveLempirasPorPunto\(\{/);
+    assert.match(handler, /if \(!lempirasResolution\.ok\)/);
+    const rejectIdx = handler.search(/if \(!lempirasResolution\.ok\)/);
+    const surrounding = handler.slice(rejectIdx, rejectIdx + 300);
+    assert.match(surrounding, /400/);
   });
 
   it('el INSERT de configuracion persiste acumulacion_habilitada', async () => {
