@@ -176,7 +176,9 @@ const serializeCatalogRow = (row) => ({
   stock_minimo: Number(row.stock_minimo ?? 0),
   estado_stock: row.estado_stock,
   unidad_base: row.unidad_base,
-  presentaciones: Array.isArray(row.presentaciones) ? row.presentaciones : []
+  presentaciones: Array.isArray(row.presentaciones) ? row.presentaciones : [],
+  solicitable: Boolean(row.solicitable),
+  motivo_no_solicitable: row.motivo_no_solicitable || null
 });
 
 const normalizeAccess = async (req, queryRunner, dependencies) => {
@@ -273,6 +275,7 @@ const buildCatalogUnion = (type) => {
            COALESCE(pa.stock_minimo, 0)::numeric AS stock_minimo,
            ${stockStatusSql('COALESCE(pa.cantidad, 0)', 'COALESCE(pa.stock_minimo, 0)')} AS estado_stock,
            'Unidad'::text AS unidad_base, '[]'::jsonb AS presentaciones,
+           true AS solicitable, NULL::text AS motivo_no_solicitable,
            ${normalizeSearchSql(productSearch)} AS search_text,
            ${compactSearchSql(productSearch)} AS search_text_compact
     FROM public.productos p
@@ -292,8 +295,17 @@ const buildCatalogUnion = (type) => {
            COALESCE(ia.cantidad, 0)::numeric AS cantidad,
            COALESCE(ia.stock_minimo, 0)::numeric AS stock_minimo,
            ${stockStatusSql('COALESCE(ia.cantidad, 0)', 'COALESCE(ia.stock_minimo, 0)')} AS estado_stock,
-           COALESCE(NULLIF(TRIM(CONCAT(ub.nombre, CASE WHEN NULLIF(TRIM(ub.simbolo), '') IS NULL THEN '' ELSE CONCAT(' (', TRIM(ub.simbolo), ')') END)), ''), 'Sin unidad') AS unidad_base,
+           CASE
+             WHEN i.id_unidad_medida > 0 AND ub.id_unidad_medida IS NOT NULL
+               THEN NULLIF(TRIM(CONCAT(ub.nombre, CASE WHEN NULLIF(TRIM(ub.simbolo), '') IS NULL THEN '' ELSE CONCAT(' (', TRIM(ub.simbolo), ')') END)), '')
+             ELSE NULL
+           END AS unidad_base,
            COALESCE(pres.presentaciones, '[]'::jsonb) AS presentaciones,
+           (i.id_unidad_medida > 0 AND ub.id_unidad_medida IS NOT NULL) AS solicitable,
+           CASE
+             WHEN i.id_unidad_medida > 0 AND ub.id_unidad_medida IS NOT NULL THEN NULL
+             ELSE 'UNIDAD_BASE_NO_CONFIGURADA'
+           END::text AS motivo_no_solicitable,
            ${normalizeSearchSql(supplySearch)} AS search_text,
            ${compactSearchSql(supplySearch)} AS search_text_compact
     FROM public.insumos i
@@ -332,6 +344,7 @@ const loadInsumoSnapshot = async (masterId, presentationId, queryRunner) => {
     const result = await queryRunner.query(
       `
         SELECT i.id_unidad_medida AS id_unidad_base,
+               um.id_unidad_medida AS id_unidad_base_valida,
                COALESCE(NULLIF(TRIM(um.nombre), ''), CONCAT('Unidad #', i.id_unidad_medida::text)) AS nombre_unidad_base
         FROM public.insumos i
         LEFT JOIN public.unidades_medida um ON um.id_unidad_medida = i.id_unidad_medida
@@ -341,8 +354,8 @@ const loadInsumoSnapshot = async (masterId, presentationId, queryRunner) => {
       [masterId]
     );
     const row = result.rows?.[0];
-    if (!parsePositiveIntStrict(row?.id_unidad_base)) {
-      fail(409, 'CONFLICT', 'El insumo no tiene una unidad base valida.');
+    if (!parsePositiveIntStrict(row?.id_unidad_base) || !parsePositiveIntStrict(row?.id_unidad_base_valida)) {
+      fail(409, 'CONFLICT', 'El insumo requiere que Inventario configure su unidad base antes de solicitarlo.');
     }
     return {
       id_presentacion_insumo: null,

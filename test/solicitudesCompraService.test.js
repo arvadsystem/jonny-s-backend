@@ -183,7 +183,8 @@ test('catalogo filtra antes de ordenar y paginar sin exponer campos auxiliares',
       if (sql.includes('FROM public.almacenes a') && !sql.includes('WITH catalogo')) return { rows: [warehouseRow()], rowCount: 1 };
       return { rows: [{ ...warehouseRow(), tipo_item: 'PRODUCTO', id_item: 1, nombre: 'Coca-Cola',
         descripcion: null, categoria: 'Bebidas', cantidad: 1, stock_minimo: 0, estado_stock: 'DISPONIBLE',
-        unidad_base: 'Unidad', presentaciones: [], search_text: 'secreto', search_text_compact: 'secreto', total_count: 1 }], rowCount: 1 };
+        unidad_base: 'Unidad', presentaciones: [], solicitable: true, motivo_no_solicitable: null,
+        search_text: 'secreto', search_text_compact: 'secreto', total_count: 1 }], rowCount: 1 };
     });
     return createSolicitudesCompraService(baseOverrides(db)).listCatalog({ query: { id_almacen: 11 } });
   })();
@@ -209,7 +210,7 @@ test('catalogo devuelve productos del almacen con stock local', async () => {
         tipo_item: 'PRODUCTO', id_item: 20, nombre: 'Agua', descripcion: 'Botella', categoria: 'Bebidas',
         id_almacen: 11, nombre_almacen: 'Bodega principal', id_sucursal: 3, nombre_sucursal: 'Sucursal 3',
         cantidad: '4.5', stock_minimo: '5', estado_stock: 'STOCK_BAJO', unidad_base: 'Unidad',
-        presentaciones: [], total_count: 1
+        presentaciones: [], solicitable: true, motivo_no_solicitable: null, total_count: 1
       }],
       rowCount: 1
     };
@@ -221,6 +222,8 @@ test('catalogo devuelve productos del almacen con stock local', async () => {
   assert.equal(result.items[0].cantidad, 4.5);
   assert.equal(result.items[0].estado_stock, 'STOCK_BAJO');
   assert.deepEqual(result.items[0].presentaciones, []);
+  assert.equal(result.items[0].solicitable, true);
+  assert.equal(result.items[0].motivo_no_solicitable, null);
 });
 
 test('catalogo devuelve insumos con presentaciones de compra', async () => {
@@ -241,7 +244,7 @@ test('catalogo devuelve insumos con presentaciones de compra', async () => {
         tipo_item: 'INSUMO', id_item: 30, nombre: 'Harina', descripcion: null, categoria: 'Secos',
         id_almacen: 11, nombre_almacen: 'Bodega principal', id_sucursal: 3, nombre_sucursal: 'Sucursal 3',
         cantidad: '0', stock_minimo: '2.5', estado_stock: 'SIN_STOCK', unidad_base: 'Kilogramo (kg)',
-        presentaciones: [presentation], total_count: 1
+        presentaciones: [presentation], solicitable: true, motivo_no_solicitable: null, total_count: 1
       }],
       rowCount: 1
     };
@@ -249,6 +252,36 @@ test('catalogo devuelve insumos con presentaciones de compra', async () => {
   const service = createSolicitudesCompraService(baseOverrides(db));
   const result = await service.listCatalog({ query: { id_almacen: 11, tipo: 'insumo' } });
   assert.deepEqual(result.items[0].presentaciones, [presentation]);
+  assert.equal(result.items[0].solicitable, true);
+  assert.equal(result.items[0].unidad_base, 'Kilogramo (kg)');
+});
+
+test('catalogo conserva insumo sin unidad valida como no solicitable y dentro de la paginacion', async () => {
+  const db = makeReadDb(async (sql, params) => {
+    if (sql.includes('FROM public.almacenes a') && !sql.includes('WITH catalogo')) return { rows: [warehouseRow()], rowCount: 1 };
+    assert.equal(params[1], 'aceite');
+    assert.match(sql, /i\.id_unidad_medida > 0 AND ub\.id_unidad_medida IS NOT NULL/);
+    assert.match(sql, /'UNIDAD_BASE_NO_CONFIGURADA'/);
+    return {
+      rows: [{
+        tipo_item: 'INSUMO', id_item: 31, nombre: 'Aceite sin unidad', descripcion: null, categoria: 'Secos',
+        id_almacen: 11, nombre_almacen: 'Bodega principal', id_sucursal: 3, nombre_sucursal: 'Sucursal 3',
+        cantidad: '1', stock_minimo: '2', estado_stock: 'STOCK_BAJO', unidad_base: null,
+        presentaciones: [], solicitable: false, motivo_no_solicitable: 'UNIDAD_BASE_NO_CONFIGURADA', total_count: 7
+      }],
+      rowCount: 1
+    };
+  });
+  const service = createSolicitudesCompraService(baseOverrides(db));
+  const result = await service.listCatalog({
+    query: { id_almacen: 11, tipo: 'insumo', buscar: 'aceite', solo_stock_bajo: 'true', page: 2, limit: 3 }
+  });
+  assert.equal(result.items.length, 1);
+  assert.equal(result.items[0].solicitable, false);
+  assert.equal(result.items[0].motivo_no_solicitable, 'UNIDAD_BASE_NO_CONFIGURADA');
+  assert.equal(result.items[0].unidad_base, null);
+  assert.equal(result.pagination.total, 7);
+  assert.equal(result.pagination.total_pages, 3);
 });
 
 test('catalogo bloquea almacen de otra sucursal para operativo', async () => {
@@ -286,7 +319,7 @@ test('crea insumo en unidad base con factor 1', async () => {
   const tx = makeTransactionDb(async (sql, params) => {
     if (sql.includes('FROM public.almacenes a')) return { rows: [warehouseRow()], rowCount: 1 };
     if (sql.includes('SELECT i.id_unidad_medida AS id_unidad_base')) {
-      return { rows: [{ id_unidad_base: 5, nombre_unidad_base: 'Gramo' }], rowCount: 1 };
+      return { rows: [{ id_unidad_base: 5, id_unidad_base_valida: 5, nombre_unidad_base: 'Gramo' }], rowCount: 1 };
     }
     if (sql.includes('INSERT INTO public.solicitudes_compra (')) {
       return { rows: [{ id_solicitud_compra: 41, estado: 'PENDIENTE', fecha_creacion: '2026-07-21T12:00:00Z' }], rowCount: 1 };
@@ -332,6 +365,41 @@ test('conversion a unidad base usa cantidad por factor de base de datos', () => 
   const requested = parseQuantity('2.5');
   assert.equal(requested.decimal, '2.5');
   assert.equal(Number(requested.decimal) * 1000, 2500);
+});
+
+test('creacion rechaza insumo sin unidad relacionada con 409 antes del encabezado y revierte', async () => {
+  for (const row of [
+    { id_unidad_base: null, id_unidad_base_valida: null, nombre_unidad_base: null },
+    { id_unidad_base: 999, id_unidad_base_valida: null, nombre_unidad_base: 'Unidad #999' }
+  ]) {
+    const tx = makeTransactionDb(async (sql) => {
+      if (sql.includes('FROM public.almacenes a')) return { rows: [warehouseRow()], rowCount: 1 };
+      if (sql.includes('SELECT i.id_unidad_medida AS id_unidad_base')) return { rows: [row], rowCount: 1 };
+      throw new Error('No debe iniciar INSERT de encabezado');
+    });
+    const service = createSolicitudesCompraService(baseOverrides(tx.db));
+    await assert.rejects(
+      service.create({ body: { id_almacen: 11, detalles: [{ tipo_item: 'insumo', id_item: 50, cantidad: 1 }] } }),
+      (error) => error.status === 409
+        && error.code === 'CONFLICT'
+        && error.message === 'El insumo requiere que Inventario configure su unidad base antes de solicitarlo.'
+    );
+    assert.equal(tx.calls.some((call) => call.sql.includes('INSERT INTO public.solicitudes_compra (')), false);
+    assert.ok(tx.calls.some((call) => call.sql === 'ROLLBACK'));
+  }
+});
+
+test('creacion no permite que solicitable enviado por frontend influya en la validacion', async () => {
+  const tx = makeTransactionDb(async (sql) => {
+    throw new Error(`No debe consultar ni insertar: ${sql}`);
+  });
+  const service = createSolicitudesCompraService(baseOverrides(tx.db));
+  await assert.rejects(
+    service.create({ body: { id_almacen: 11, detalles: [{ tipo_item: 'insumo', id_item: 50, cantidad: 1, solicitable: true }] } }),
+    (error) => error.status === 400 && error.code === 'VALIDATION_ERROR'
+  );
+  assert.equal(tx.calls.some((call) => call.sql.includes('INSERT INTO public.solicitudes_compra (')), false);
+  assert.equal(tx.calls.length, 0);
 });
 
 test('rechaza presentacion perteneciente a otro insumo', async () => {
