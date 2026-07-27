@@ -469,14 +469,26 @@ export const upsertAccumulationState = async (client, {
 // que esta es la unica oportunidad de no perderla). Si no se conoce -la
 // falla ocurrio antes de resolver el snapshot-, la fila queda sin el y la
 // regla estricta de RECONCILE aplicara despues.
+//
+// Fecha autoritativa: snapshot.fechaReferencia gana SIEMPRE que exista -es
+// la fecha historica congelada al momento del pago-; fechaReferencia (la del
+// contexto ACTUAL, que puede venir NULL o incluso distinta) es solo el
+// fallback. El orden importa: `fechaReferencia ?? snapshot?.fechaReferencia`
+// tomaria un NULL del contexto actual sobre una fecha valida del snapshot.
+// Esto es ademas del COALESCE(existente, EXCLUDED) que ya hace
+// upsertAccumulationState -que protege una fecha durable ya confirmada en la
+// fila-; aqui se decide que valor ENTRA como EXCLUDED cuando la fila es
+// nueva o su fecha todavia esta vacia.
 export const recordAccumulationRetryableError = async (client, idFactura, { fechaReferencia = null, error = null, snapshot = null } = {}) => {
+  const effectiveFechaReferencia = snapshot?.fechaReferencia ?? fechaReferencia ?? null;
+
   try {
     await upsertAccumulationState(client, {
       idFactura,
       estado: ACCUMULATION_STATE.RETRYABLE_ERROR,
       motivo: null,
       elegibilidadDeterminada: null,
-      fechaReferencia,
+      fechaReferencia: effectiveFechaReferencia,
       ultimoError: String(error?.message || error || 'FIDELIZACION_ACCUMULATE_ERROR').slice(0, 500),
       snapshot
     });
@@ -762,7 +774,15 @@ export const listPaidInvoicesMissingAccumulation = async (client, { cursor = 0, 
       LEFT JOIN public.fidelizacion_acumulacion_facturas_estado est
         ON est.id_factura = f.id_factura
       WHERE f.id_factura > $1
-        AND COALESCE(f.id_cliente, p.id_cliente) IS NOT NULL
+        -- Precedencia: la evidencia durable YA CONGELADA (est.id_cliente)
+        -- decide primero -una reserva PENDING con snapshot puede procesar
+        -- una factura aunque el cliente ACTUAL de la factura/pedido sea
+        -- NULL hoy (p.ej. si esa relacion se desvinculo despues del pago)-;
+        -- f.id_cliente/p.id_cliente solo son el fallback para candidatos sin
+        -- fila durable todavia. Sin est.id_cliente aqui, esta consulta
+        -- descartaba la factura ANTES de que accumulateInvoicePoints/
+        -- persistAccumulation llegaran a consultar el snapshot.
+        AND COALESCE(est.id_cliente, f.id_cliente, p.id_cliente) IS NOT NULL
         AND (
           upc.id_pedido_pago_control IS NULL
           OR (

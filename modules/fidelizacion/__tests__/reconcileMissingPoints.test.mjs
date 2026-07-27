@@ -682,3 +682,222 @@ describe('Elegibilidad historica en RECONCILE (snapshot durable vs evidencia vs 
     assert.equal(principal.state.estadoFacturas.get(7106).estado, 'PROCESSED');
   });
 });
+
+describe('Ronda 6, bloqueante 1: la consulta de candidatos ya no descarta clientes que solo viven en el snapshot durable', () => {
+  it('caso obligatorio: factura y pedido con id_cliente NULL, pero con reserva durable PENDING (id_cliente=5, snapshot completo) -> reconcileMissingPoints la encuentra, encola, procesa y acredita', async () => {
+    // factura.id_cliente = NULL, pedido.id_cliente = NULL: el UNICO rastro
+    // de a quien acreditar vive en la fila durable (est.id_cliente).
+    const contextoSinCliente = baseContext({ id_cliente: null, id_pedido: 800 });
+    const { client, state } = createFidelizacionMockClient({
+      facturaContexts: { 7001: contextoSinCliente },
+      pedidos: { 800: { id_cliente: null } },
+      estadoFacturasIniciales: {
+        7001: pendingConSnapshot(contextoSinCliente, {
+          id_cliente: 5,
+          id_sucursal: 1,
+          nombre_snapshot: 'Cliente Historico',
+          telefono_snapshot: '9999-0000',
+          perfil_completo_snapshot: true,
+          fecha_referencia: '2026-03-01T10:00:00Z'
+        })
+      }
+    });
+
+    const result = await withMockedFidelizacionPoolConnect(async () => client, () => reconcileMissingPoints({ limit: 25 }));
+
+    assert.deepEqual(result.ids_factura, [7001], 'la consulta de candidatos SI la encuentra via COALESCE(est.id_cliente, f.id_cliente, p.id_cliente)');
+    assert.equal(result.processed, 1);
+    assert.equal(state.movimientos.length, 1);
+    assert.ok(state.saldos.has(5), 'el saldo se acredita al cliente del snapshot durable');
+    assert.equal(state.estadoFacturas.get(7001).estado, 'PROCESSED');
+  });
+
+  it('prueba negativa: factura y pedido con id_cliente NULL, sin estado durable y sin pedidos_contacto -> no se acredita, no se inventa cliente, y no hay bucle', async () => {
+    const contextoSinCliente = baseContext({ id_cliente: null, id_pedido: null });
+    const { client, state } = createFidelizacionMockClient({
+      facturaContexts: { 7002: contextoSinCliente }
+      // Sin estadoFacturasIniciales, sin pedidos, sin pedidosContacto: no hay
+      // absolutamente ninguna evidencia -ni durable ni historica- de a quien
+      // acreditar.
+    });
+
+    const primerTick = await withMockedFidelizacionPoolConnect(async () => client, () => reconcileMissingPoints({ limit: 25 }));
+
+    assert.equal(state.movimientos.length, 0, 'nunca se acredita sin evidencia de cliente');
+    assert.equal(state.saldos.size, 0, 'no se inventa ningun cliente');
+
+    // Politica definida: o bien nunca se lista (sin cliente conocido), o se
+    // lista y termina en un motivo terminal reconocido (no un perfil actual
+    // inventado). Cualquiera de las dos es aceptable segun la forma final de
+    // la consulta; lo que NO es aceptable es un bucle permanente.
+    if (primerTick.ids_factura.includes(7002)) {
+      const row = state.estadoFacturas.get(7002);
+      assert.ok(row, 'si se lista, debe quedar una fila de estado con una decision');
+      assert.equal(row.estado, 'SKIPPED_TERMINAL', 'termina en una politica definida, no en un bucle reintentable');
+      assert.ok(
+        ['LEGACY_ELIGIBILITY_UNVERIFIABLE', 'MISSING_REQUIRED_DATA'].includes(row.motivo),
+        `motivo terminal reconocido, no perfil actual inventado (recibido: ${row.motivo})`
+      );
+    } else {
+      assert.equal(state.estadoFacturas.has(7002), false, 'si no se lista, tampoco queda ninguna fila huerfana');
+    }
+
+    // Segundo tick: nunca debe volver a acreditar ni a crecer indefinidamente.
+    const segundoTick = await withMockedFidelizacionPoolConnect(async () => client, () => reconcileMissingPoints({ limit: 25 }));
+    assert.equal(state.movimientos.length, 0);
+    assert.equal(segundoTick.ids_factura.includes(7002) && state.estadoFacturas.get(7002)?.estado !== 'SKIPPED_TERMINAL', false, 'sin bucle permanente');
+  });
+
+  it('prueba de control del mock: si el mock volviera a ignorar est.id_cliente, este caso fallaria (candidato solo visible via estado durable)', async () => {
+    // Deliberadamente NO usa pendingConSnapshot para dejar explicito que el
+    // UNICO id_cliente disponible es el de la fila durable -si
+    // computeMissingAccumulationCandidates volviera a usar solo
+    // resolveClienteEfectivo(context), este candidato jamas aparaceria.
+    const contextoSinCliente = baseContext({ id_cliente: null, id_pedido: null });
+    const { client } = createFidelizacionMockClient({
+      facturaContexts: { 7003: contextoSinCliente },
+      estadoFacturasIniciales: {
+        7003: {
+          estado: 'PENDING',
+          id_cliente: 5,
+          id_sucursal: 1,
+          nombre_snapshot: 'Solo En Snapshot',
+          telefono_snapshot: '9999-2222',
+          perfil_completo_snapshot: true,
+          fecha_referencia: '2026-03-01T10:00:00Z'
+        }
+      }
+    });
+
+    const result = await withMockedFidelizacionPoolConnect(async () => client, () => reconcileMissingPoints({ limit: 25 }));
+
+    assert.deepEqual(result.ids_factura, [7003], 'el mock debe reproducir COALESCE(est.id_cliente, f.id_cliente, p.id_cliente), no solo el contexto de factura/pedido');
+  });
+});
+
+describe('Ronda 6, bloqueante 2: RETRYABLE_ERROR conserva la fecha historica del snapshot, nunca la del contexto actual', () => {
+  it('caso 1: contexto actual sin fecha, snapshot con fecha valida, error tecnico posterior -> RETRYABLE_ERROR usa la fecha del snapshot', async () => {
+    const { client, state } = createFidelizacionMockClient({
+      facturaContexts: { 8001: baseContext({ fecha_referencia_config: null }) },
+      estadoFacturasIniciales: {
+        8001: pendingConSnapshot(baseContext(), { fecha_referencia: '2026-03-01T10:00:00Z' })
+      },
+      failOn: 'UPDATE public.fidelizacion_saldos_cliente'
+    });
+
+    await withMockedFidelizacionPoolConnect(async () => client, () => accumulateInvoicePoints({ idFactura: 8001 }));
+
+    const row = state.estadoFacturas.get(8001);
+    assert.equal(row.estado, 'RETRYABLE_ERROR');
+    assert.equal(row.fecha_referencia, '2026-03-01T10:00:00Z');
+  });
+
+  it('caso 2: fechas contradictorias (snapshot A, contexto actual B, ambas presentes) -> es un ACCUMULATION_CONTEXT_MISMATCH terminal (no un error tecnico), pero la fecha conservada sigue siendo A, jamas B', async () => {
+    // Con cliente/sucursal/pedido iguales entre snapshot y contexto actual,
+    // una fecha distinta y presente en ambos lados es una CONTRADICCION real
+    // -no un error tecnico-: resolveEffectiveAccumulationContext (rondas 4/5)
+    // ya la detecta y la vuelve terminal antes de llegar a ningun punto de
+    // fallo tecnico. Esta prueba confirma que, incluso en ese camino
+    // terminal, la fecha durable ya confirmada (A) es la que sobrevive -el
+    // COALESCE(existente, EXCLUDED) de upsertAccumulationState protege la
+    // fecha ya grabada aunque el motivo terminal reciba la fecha B como
+    // referenceDate-.
+    const { client, state } = createFidelizacionMockClient({
+      facturaContexts: { 8002: baseContext({ fecha_referencia_config: '2026-06-01T00:00:00Z' }) },
+      estadoFacturasIniciales: {
+        8002: pendingConSnapshot(baseContext(), { fecha_referencia: '2026-01-01T00:00:00Z' })
+      }
+    });
+
+    const result = await withMockedFidelizacionPoolConnect(async () => client, () => accumulateInvoicePoints({ idFactura: 8002 }));
+
+    assert.equal(result.reason, 'ACCUMULATION_CONTEXT_MISMATCH');
+    const row = state.estadoFacturas.get(8002);
+    assert.equal(row.estado, 'SKIPPED_TERMINAL');
+    assert.equal(row.fecha_referencia, '2026-01-01T00:00:00Z', 'la fecha durable original (A) se conserva; la fecha del contexto actual (B) nunca la reemplaza');
+  });
+
+  it('caso 3: contexto actual sin fecha (no contradictoria, simplemente ausente), error tecnico, y la reconciliacion posterior usa la fecha historica preservada al consultar la configuracion vigente', async () => {
+    const { client, state } = createFidelizacionMockClient({
+      activeConfigs: [
+        { lempiras_por_punto: 10, vigente_desde: '2025-01-01T00:00:00Z', vigente_hasta: '2026-02-01T00:00:00Z' },
+        { lempiras_por_punto: 999, vigente_desde: '2026-02-01T00:00:00Z', vigente_hasta: null }
+      ],
+      // Sin fecha en el contexto actual: no hay contradiccion posible con el
+      // snapshot (resolveEffectiveAccumulationContext nunca marca mismatch
+      // cuando un lado esta ausente), asi que el flujo SI llega al punto de
+      // fallo tecnico simulado mas abajo.
+      facturaContexts: { 8003: baseContext({ fecha_referencia_config: null }) },
+      estadoFacturasIniciales: {
+        8003: pendingConSnapshot(baseContext(), { fecha_referencia: '2026-01-15T00:00:00Z' })
+      }
+    });
+
+    // Falla UNA sola vez (no via `failOn`, que persistiria en el reintento):
+    // se necesita que la primera pasada falle tecnicamente y la segunda, ya
+    // limpia, procese de verdad -para inspeccionar la fecha que realmente le
+    // llega a getActiveFidelizacionConfig en ese reintento-.
+    const originalQuery = client.query.bind(client);
+    let falloUsado = false;
+    client.query = async (sql, params) => {
+      if (!falloUsado && String(sql).includes('UPDATE public.fidelizacion_saldos_cliente')) {
+        falloUsado = true;
+        throw new Error('SIMULATED_SALDO_UPDATE_FAILURE');
+      }
+      return originalQuery(sql, params);
+    };
+
+    await withMockedFidelizacionPoolConnect(async () => client, () => accumulateInvoicePoints({ idFactura: 8003 }));
+    assert.equal(state.estadoFacturas.get(8003).estado, 'RETRYABLE_ERROR');
+    assert.equal(state.estadoFacturas.get(8003).fecha_referencia, '2026-01-15T00:00:00Z');
+
+    const configCallsAntes = state.calls.filter((c) => c.sql.includes('FROM public.fidelizacion_configuracion_sucursal')).length;
+    await withMockedFidelizacionPoolConnect(async () => client, () => accumulateInvoicePoints({ idFactura: 8003, trigger: 'RECONCILE' }));
+    const configCalls = state.calls.filter((c) => c.sql.includes('FROM public.fidelizacion_configuracion_sucursal'));
+    assert.ok(configCalls.length > configCallsAntes, 'debe haber consultado la configuracion en el reintento');
+
+    const ultimaConfigCall = configCalls[configCalls.length - 1];
+    assert.equal(ultimaConfigCall.params[1], '2026-01-15T00:00:00Z', 'getActiveFidelizacionConfig recibe la fecha historica preservada del snapshot, no la (ausente) del contexto actual');
+    assert.equal(state.estadoFacturas.get(8003).estado, 'PROCESSED');
+  });
+
+  it('caso 4: snapshot sin fecha, contexto actual con fecha B -> RETRYABLE_ERROR usa la fecha B (fallback)', async () => {
+    const { client, state } = createFidelizacionMockClient({
+      facturaContexts: { 8004: baseContext({ fecha_referencia_config: '2026-04-01T00:00:00Z' }) },
+      estadoFacturasIniciales: {
+        8004: pendingConSnapshot(baseContext(), { fecha_referencia: null })
+      },
+      failOn: 'UPDATE public.fidelizacion_saldos_cliente'
+    });
+
+    await withMockedFidelizacionPoolConnect(async () => client, () => accumulateInvoicePoints({ idFactura: 8004 }));
+
+    const row = state.estadoFacturas.get(8004);
+    assert.equal(row.estado, 'RETRYABLE_ERROR');
+    assert.equal(row.fecha_referencia, '2026-04-01T00:00:00Z', 'sin fecha en el snapshot, se usa la del contexto actual');
+  });
+
+  it('caso 5: la fila ya tenia una fecha durable confirmada pero SIN snapshot -> se reconstruye un snapshot con otra fecha, y el COALESCE de upsertAccumulationState igual conserva la fecha original', async () => {
+    // Fila legada: tiene fecha_referencia durable confirmada, pero
+    // perfil_completo_snapshot es NULL (nunca llego a tener snapshot) -> a
+    // efectos de snapshotFromStateRow, esto es "sin snapshot", asi que
+    // persistAccumulation reconstruye uno fresco desde el contexto ACTUAL,
+    // que trae una fecha DISTINTA. Aun asi, el COALESCE(existente, EXCLUDED)
+    // de upsertAccumulationState debe conservar la fecha original -nunca
+    // reemplazar una fecha durable ya confirmada, ni con el contexto actual
+    // ni con un snapshot recien reconstruido-.
+    const { client, state } = createFidelizacionMockClient({
+      facturaContexts: { 8005: baseContext({ fecha_referencia_config: '2026-05-01T00:00:00Z' }) },
+      estadoFacturasIniciales: {
+        8005: { estado: 'RETRYABLE_ERROR', fecha_referencia: '2026-01-01T00:00:00Z', perfil_completo_snapshot: null }
+      },
+      failOn: 'UPDATE public.fidelizacion_saldos_cliente'
+    });
+
+    await withMockedFidelizacionPoolConnect(async () => client, () => accumulateInvoicePoints({ idFactura: 8005 }));
+
+    const row = state.estadoFacturas.get(8005);
+    assert.equal(row.estado, 'RETRYABLE_ERROR');
+    assert.equal(row.fecha_referencia, '2026-01-01T00:00:00Z', 'la fecha durable original (confirmada antes) se conserva; ni el contexto actual ni un snapshot recien reconstruido la reemplazan');
+  });
+});

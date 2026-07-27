@@ -236,7 +236,16 @@ export const createFidelizacionMockClient = ({
       .map(([idStr, context]) => ({ id: Number(idStr), context }))
       .filter(({ id, context }) => {
         if (id <= cursor) return false;
-        if (!resolveClienteEfectivo(context)) return false;
+        // COALESCE(est.id_cliente, f.id_cliente, p.id_cliente): la evidencia
+        // durable YA CONGELADA decide primero -una reserva PENDING con
+        // snapshot puede ser candidata aunque el cliente ACTUAL de la
+        // factura/pedido sea NULL hoy-; resolveClienteEfectivo (factura/
+        // pedido) es solo el fallback para candidatos sin fila durable
+        // todavia. Sin esto, el mock ocultaria el mismo bug que tenia la
+        // consulta real (descartar un candidato con snapshot valido).
+        const durableState = state.estadoFacturas.get(id);
+        const effectiveCandidateClient = parseIdLike(durableState?.id_cliente) ?? resolveClienteEfectivo(context);
+        if (!effectiveCandidateClient) return false;
         if (!isContextFullyPaid(context)) return false;
         if (hasMovimiento(id)) return false;
         if (!isRetryableOrNoState(id)) return false;
@@ -510,7 +519,12 @@ export const createFidelizacionMockClient = ({
           estado,
           motivo: motivo ?? null,
           elegibilidad_determinada: elegibilidadDeterminada ?? null,
-          fecha_referencia: fechaReferencia ?? existing?.fecha_referencia ?? null,
+          // COALESCE(existente, EXCLUDED) igual que el SQL real: una fecha
+          // durable ya confirmada NUNCA se reemplaza por la que llegue en
+          // este upsert (ronda 6: este orden estaba invertido -favorecia el
+          // valor nuevo sobre el existente-, escondiendo que una fecha ya
+          // grabada podia sobrescribirse).
+          fecha_referencia: existing?.fecha_referencia ?? fechaReferencia ?? null,
           intentos: (existing?.intentos || 0) + 1,
           ultimo_error: ultimoError ?? null
         };
