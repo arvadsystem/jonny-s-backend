@@ -16,6 +16,7 @@ COPY services ./services
 COPY print-agent/src/documentRenderer.js ./print-agent/src/documentRenderer.js
 COPY utils ./utils
 COPY jobs ./jobs
+COPY modules ./modules
 COPY scripts ./scripts
 
 RUN test -f /usr/src/app/print-agent/src/documentRenderer.js
