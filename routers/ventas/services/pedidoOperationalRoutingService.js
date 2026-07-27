@@ -1,5 +1,6 @@
 import { resolveEstadoPedidoIdByCode } from './catalogLookupService.js';
 import { resolveStandaloneExtraLine } from '../utils/parseUtils.js';
+import { PEDIDO_ORIGIN, resolvePedidoOrigin } from '../../../utils/pedidoOrigen.js';
 
 export const PEDIDO_OPERATIONAL_ACTION = Object.freeze({
   SEND_TO_KITCHEN: 'ENVIAR_COCINA',
@@ -9,11 +10,11 @@ export const PEDIDO_OPERATIONAL_ACTION = Object.freeze({
   AWAIT_VALIDATION: 'PENDIENTE_VALIDACION'
 });
 
-export const PEDIDO_ORIGIN = Object.freeze({
-  PUBLIC_MENU: 'PUBLIC_MENU',
-  INTERNAL_POS: 'INTERNAL_POS',
-  UNKNOWN: 'UNKNOWN'
-});
+// Clasificador de origen: la implementacion canonica vive en
+// utils/pedidoOrigen.js (funcion pura, compartida con fidelizacion para que
+// ambos modulos apliquen la MISMA regla). Se reexporta aqui sin cambios para
+// no romper a ningun consumidor actual de este servicio.
+export { PEDIDO_ORIGIN, resolvePedidoOrigin };
 
 const PEDIDO_INITIAL_ROUTING_CURRENT_STATE = Object.freeze({
   PENDING: 'PENDIENTE',
@@ -49,13 +50,6 @@ const normalizeCode = (value) => String(value || '')
   .trim()
   .toUpperCase()
   .replace(/[\s-]+/g, '_');
-
-export const resolvePedidoOrigin = ({ origen_pedido: persistedSource } = {}) => {
-  const normalizedSource = normalizeCode(persistedSource);
-  if (normalizedSource === 'MENU') return PEDIDO_ORIGIN.PUBLIC_MENU;
-  if (normalizedSource === 'CAJA') return PEDIDO_ORIGIN.INTERNAL_POS;
-  return PEDIDO_ORIGIN.UNKNOWN;
-};
 
 export const DELIVERY_PREFERENCE_TRUE_VALUES = Object.freeze(['true', '1', 'si']);
 export const DELIVERY_PREFERENCE_FALSE_VALUES = Object.freeze(['false', '0', 'no']);
