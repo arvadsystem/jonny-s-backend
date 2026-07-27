@@ -192,7 +192,17 @@ describe('scheduler runtime shutdown', () => {
     releaseTick();
     const [started] = await Promise.all([starting, stopping]);
 
-    assert.deepEqual(started, { started: false, reason: 'STOPPING', interval_ms: 15000 });
+    // start() ahora tambien reporta el resultado del scheduler de
+    // reconciliacion de fidelizacion (independiente del de correo, ver
+    // startFidelizacionSchedulerSafely en scheduler.js); en este entorno de
+    // prueba queda deshabilitado por configuracion, que es el resultado real
+    // y correcto -no bloquea ni afecta el resultado del scheduler de correo-.
+    assert.deepEqual(started, {
+      started: false,
+      reason: 'STOPPING',
+      interval_ms: 15000,
+      fidelizacion: { started: false, reason: 'DISABLED' }
+    });
     assert.deepEqual(events, ['first-tick-started', 'first-tick-finished', 'pool-closed', 'exit-0']);
     assert.equal(timers.intervals.length, 0);
   });

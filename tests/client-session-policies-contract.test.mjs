@@ -3,6 +3,12 @@ import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
+import {
+  configureOperationalSessionCutoffWorkerForTests,
+  getOperationalSessionCutoffWorkerState,
+  resetOperationalSessionCutoffWorkerForTests,
+  startOperationalSessionCutoffWorker
+} from '../jobs/operationalSessionCutoffWorker.js';
 
 const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const readSource = (relativePath) => readFile(path.join(repositoryRoot, relativePath), 'utf8');
@@ -89,5 +95,78 @@ test('el worker se registra una vez en arranque (en segundo plano, sin bloquear 
   const listenIndex = source.indexOf('app.listen(PORT');
   const startIndex = source.indexOf('startOperationalSessionCutoffWorker()');
   assert.ok(listenIndex >= 0 && startIndex > listenIndex);
-  assert.match(source, /stopOperationalSessionCutoffWorker\(\{ timeoutMs: 5000 \}\)/);
+
+  // "participa en shutdown" ya no se puede verificar por texto: server.js
+  // invoca el stop a traves de un parametro inyectable (stopSessionCutoffWorker,
+  // alias local dentro de createServerRuntime) cuyo valor por defecto es
+  // stopOperationalSessionCutoffWorker, asi que nunca aparece en el codigo
+  // fuente como el nombre completo de la funcion seguido de su argumento.
+  // Se verifica por comportamiento: se arranca el worker real y se confirma
+  // que el shutdown de server.js, usando ese valor por defecto sin
+  // sobreescribir, lo detiene (misma cobertura que
+  // jobs/__tests__/operationalSessionCutoffWorker.test.mjs, ejercida aqui de
+  // forma independiente porque este archivo tiene su propio contrato).
+  const timers = (() => {
+    const scheduled = [];
+    const cleared = [];
+    return {
+      scheduled,
+      cleared,
+      setTimeout(callback, delayMs) {
+        const timer = { callback, delayMs };
+        scheduled.push(timer);
+        return timer;
+      },
+      clearTimeout(timer) {
+        cleared.push(timer);
+      }
+    };
+  })();
+
+  resetOperationalSessionCutoffWorkerForTests();
+  try {
+    configureOperationalSessionCutoffWorkerForTests({
+      now: () => new Date('2026-06-29T06:10:00.000Z'),
+      setTimeout: timers.setTimeout,
+      clearTimeout: timers.clearTimeout,
+      closeSessions: async () => ({ executed: true, closedSessions: 0, reason: 'COMPLETED' }),
+      log: () => {},
+      error: () => {}
+    });
+
+    const started = await startOperationalSessionCutoffWorker();
+    assert.equal(started.started, true);
+    assert.equal(timers.scheduled.length, 1, 'el worker debe quedar con su timer activo antes del shutdown');
+
+    const previousAutostartFlag = process.env.SERVER_RUNTIME_AUTOSTART_DISABLED;
+    process.env.SERVER_RUNTIME_AUTOSTART_DISABLED = 'true';
+    let createServerRuntime;
+    try {
+      ({ createServerRuntime } = await import(`../server.js?case=${Date.now()}-client-session-contract`));
+    } finally {
+      if (previousAutostartFlag === undefined) delete process.env.SERVER_RUNTIME_AUTOSTART_DISABLED;
+      else process.env.SERVER_RUNTIME_AUTOSTART_DISABLED = previousAutostartFlag;
+    }
+
+    const runtime = createServerRuntime({
+      server: { close: (cb) => cb(null) },
+      runtimeConfig: { gracefulShutdownTimeoutMs: 5000 },
+      stopReadiness: async () => {},
+      stopCajaWorker: async () => {},
+      // stopSessionCutoffWorker NO se sobreescribe: se ejercita el valor por
+      // defecto real de produccion.
+      detachPrintAgentWs: async () => {},
+      waitForFidelizacionQueue: async () => {},
+      closeFidelizacionDatabasePool: async () => {},
+      closeDatabasePool: async () => {},
+      runtimeProcess: { exit: () => {} }
+    });
+
+    await runtime.shutdown('SIGTERM');
+
+    assert.equal(timers.cleared.length, 1, 'el shutdown debe detener el worker real de corte operativo');
+    assert.equal(getOperationalSessionCutoffWorkerState().next_cutoff_local, null, 'el worker real debe quedar detenido');
+  } finally {
+    resetOperationalSessionCutoffWorkerForTests();
+  }
 });

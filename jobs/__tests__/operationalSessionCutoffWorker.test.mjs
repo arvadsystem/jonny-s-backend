@@ -137,10 +137,62 @@ describe('arranque en server.js', () => {
       /startOperationalSessionCutoffWorker\(\)\.catch\(/,
       'un fallo al iniciar el worker de corte operativo en segundo plano debe capturarse, nunca tumbar el proceso'
     );
-    assert.match(
-      serverSource,
-      /stopOperationalSessionCutoffWorker\(\{ timeoutMs: 5000 \}\)/,
-      'el shutdown limpio debe seguir deteniendo el worker de corte operativo'
-    );
+  });
+
+  // Reemplaza una asercion de texto contra el codigo fuente (buscaba el
+  // nombre de la funcion escrito literalmente junto a su argumento) por una
+  // prueba de comportamiento real. server.js invoca este stop a traves de un
+  // parametro inyectable (`stopSessionCutoffWorker`, alias local dentro de
+  // createServerRuntime) cuyo valor por defecto es
+  // stopOperationalSessionCutoffWorker: la llamada real en tiempo de
+  // ejecucion nunca contiene el nombre completo de la funcion seguido de su
+  // argumento como texto contiguo, asi que una expresion regular contra el
+  // codigo fuente no puede validarlo. Aqui se arranca el worker real (con el
+  // mismo arnes de timers ya usado en este archivo), se construye el runtime
+  // de server.js SIN sobreescribir stopSessionCutoffWorker (para ejercer
+  // exactamente el valor por defecto de produccion) y se verifica que el
+  // shutdown detiene el timer real del worker.
+  it('el shutdown de createServerRuntime, usando su valor por defecto (sin sobreescribir), detiene el worker de corte operativo real', async () => {
+    const timers = createTimerHarness();
+    configureOperationalSessionCutoffWorkerForTests({
+      now: () => new Date('2026-06-29T06:10:00.000Z'),
+      setTimeout: timers.setTimeout,
+      clearTimeout: timers.clearTimeout,
+      closeSessions: async () => ({ executed: true, closedSessions: 0, reason: 'COMPLETED' }),
+      log: () => {},
+      error: () => {}
+    });
+
+    const started = await startOperationalSessionCutoffWorker();
+    assert.equal(started.started, true);
+    assert.equal(timers.timers.length, 1, 'el worker debe quedar con su timer activo antes del shutdown');
+
+    const previousAutostartFlag = process.env.SERVER_RUNTIME_AUTOSTART_DISABLED;
+    process.env.SERVER_RUNTIME_AUTOSTART_DISABLED = 'true';
+    let createServerRuntime;
+    try {
+      ({ createServerRuntime } = await import('../../server.js'));
+    } finally {
+      if (previousAutostartFlag === undefined) delete process.env.SERVER_RUNTIME_AUTOSTART_DISABLED;
+      else process.env.SERVER_RUNTIME_AUTOSTART_DISABLED = previousAutostartFlag;
+    }
+    const runtime = createServerRuntime({
+      server: { close: (cb) => cb(null) },
+      runtimeConfig: { gracefulShutdownTimeoutMs: 5000 },
+      stopReadiness: async () => {},
+      stopCajaWorker: async () => {},
+      // stopSessionCutoffWorker NO se sobreescribe a proposito: se ejercita
+      // el valor por defecto real de produccion.
+      detachPrintAgentWs: async () => {},
+      waitForFidelizacionQueue: async () => {},
+      closeFidelizacionDatabasePool: async () => {},
+      closeDatabasePool: async () => {},
+      runtimeProcess: { exit: () => {} }
+    });
+
+    await runtime.shutdown('SIGTERM');
+
+    assert.equal(timers.cleared.length, 1, 'el shutdown debe limpiar el timer real del worker de corte operativo');
+    assert.equal(getOperationalSessionCutoffWorkerState().next_cutoff_local, null, 'el worker real debe quedar detenido');
   });
 });

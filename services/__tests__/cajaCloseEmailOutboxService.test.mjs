@@ -20,11 +20,53 @@ import {
   calculateTotalNetSales,
   formatCajaCierreDateTime
 } from '../../utils/cajaCierreReportePdf.js';
+import {
+  configureCajaCloseEmailOutboxWorkerForTests,
+  getCajaCloseEmailOutboxWorkerState,
+  resetCajaCloseEmailOutboxWorkerForTests,
+  startCajaCloseEmailOutboxWorker
+} from '../../jobs/cajaCloseEmailOutboxWorker.js';
 
 const routerSource = readFileSync(resolve('routers/cajas.js'), 'utf8');
 const serverSource = readFileSync(resolve('server.js'), 'utf8');
 const migrationSource = readFileSync(resolve('sql/2026-06-28_caja_close_email_outbox.sql'), 'utf8');
 const emailServiceSource = readFileSync(resolve('utils/emailService.js'), 'utf8');
+
+// Mismo arnes de timers ya usado en jobs/__tests__/cajaCloseEmailOutboxWorker.test.mjs,
+// para arrancar el worker REAL sin timers reales ni una base de datos real.
+const createTimeoutHarness = () => {
+  const timers = [];
+  const cleared = [];
+  return {
+    timers,
+    cleared,
+    setTimeout(callback, delayMs) {
+      const timer = { callback, delayMs };
+      timers.push(timer);
+      return timer;
+    },
+    clearTimeout(timer) {
+      cleared.push(timer);
+    }
+  };
+};
+
+const createIntervalHarness = () => {
+  const timers = [];
+  const cleared = [];
+  return {
+    timers,
+    cleared,
+    setInterval(callback, delayMs) {
+      const timer = { callback, delayMs };
+      timers.push(timer);
+      return timer;
+    },
+    clearInterval(timer) {
+      cleared.push(timer);
+    }
+  };
+};
 
 const withCajaCloseEmailTo = async (value, fn) => {
   const previous = process.env.CAJA_CLOSE_EMAIL_TO;
@@ -219,9 +261,68 @@ describe('caja close email durable outbox', () => {
     }
   });
 
-  it('reinicio del proceso recupera notificaciones persistidas al arrancar el backend', () => {
+  it('reinicio del proceso recupera notificaciones persistidas al arrancar el backend', async () => {
     assert.match(serverSource, /startCajaCloseEmailOutboxWorker\(\)/);
-    assert.match(serverSource, /stopCajaCloseEmailOutboxWorker\(\{ timeoutMs: 5000 \}\)/);
+
+    // El arranque (arriba) se sigue verificando por texto: startCajaCloseEmailOutboxWorker()
+    // se invoca literalmente dentro del callback onReady. El STOP, en cambio,
+    // ya no aparece como texto contiguo con su argumento -server.js lo llama
+    // a traves de un parametro inyectable (stopCajaWorker, alias local
+    // dentro de createServerRuntime) cuyo valor por defecto es
+    // stopCajaCloseEmailOutboxWorker-, asi que se verifica por comportamiento:
+    // se arranca el worker REAL (con dependencias inyectadas para no tocar
+    // una base real) y se confirma que el shutdown de server.js, usando su
+    // valor por defecto SIN sobreescribir, detiene ese worker real.
+    const timeouts = createTimeoutHarness();
+    const intervals = createIntervalHarness();
+    resetCajaCloseEmailOutboxWorkerForTests();
+    configureCajaCloseEmailOutboxWorkerForTests({
+      setTimeout: timeouts.setTimeout,
+      clearTimeout: timeouts.clearTimeout,
+      setInterval: intervals.setInterval,
+      clearInterval: intervals.clearInterval,
+      processBatch: async () => ({ claimed: 0, processed: 0 }),
+      log: () => {},
+      warn: () => {},
+      error: () => {}
+    });
+
+    try {
+      const started = await startCajaCloseEmailOutboxWorker();
+      assert.equal(started.started, true);
+      assert.equal(timeouts.timers.length, 1, 'el worker debe quedar con su timer de tick activo antes del shutdown');
+
+      const previousAutostartFlag = process.env.SERVER_RUNTIME_AUTOSTART_DISABLED;
+      process.env.SERVER_RUNTIME_AUTOSTART_DISABLED = 'true';
+      let createServerRuntime;
+      try {
+        ({ createServerRuntime } = await import(`../../server.js?case=${Date.now()}-caja-outbox-shutdown`));
+      } finally {
+        if (previousAutostartFlag === undefined) delete process.env.SERVER_RUNTIME_AUTOSTART_DISABLED;
+        else process.env.SERVER_RUNTIME_AUTOSTART_DISABLED = previousAutostartFlag;
+      }
+
+      const runtime = createServerRuntime({
+        server: { close: (cb) => cb(null) },
+        runtimeConfig: { gracefulShutdownTimeoutMs: 5000 },
+        stopReadiness: async () => {},
+        // stopCajaWorker NO se sobreescribe a proposito: se ejercita el
+        // valor por defecto real de produccion (stopCajaCloseEmailOutboxWorker).
+        stopSessionCutoffWorker: async () => {},
+        detachPrintAgentWs: async () => {},
+        waitForFidelizacionQueue: async () => {},
+        closeFidelizacionDatabasePool: async () => {},
+        closeDatabasePool: async () => {},
+        runtimeProcess: { exit: () => {} }
+      });
+
+      await runtime.shutdown('SIGTERM');
+
+      assert.equal(timeouts.cleared.length, 1, 'el shutdown debe limpiar el timer real del worker de outbox de caja');
+      assert.equal(getCajaCloseEmailOutboxWorkerState().started, false, 'el worker real debe quedar detenido');
+    } finally {
+      resetCajaCloseEmailOutboxWorkerForTests();
+    }
   });
 
   it('el servidor abre el puerto antes de iniciar el worker, y un fallo al iniciarlo no lo bloquea ni lo tumba', () => {

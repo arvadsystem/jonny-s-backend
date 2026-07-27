@@ -95,19 +95,65 @@ describe('server.js: el puerto abre sin esperar a PostgreSQL', () => {
     assert.match(serverSource, /startOperationalSessionCutoffWorker\(\)\.catch\(/);
   });
 
-  it('el shutdown detiene el monitor de DB, espera el chequeo en vuelo (acotado) y solo entonces cierra HTTP/workers/pool', () => {
-    const stopDbIndex = serverSource.indexOf('stopDatabaseReadinessLoop({ timeoutMs: 5000 })');
-    const closeHttpIndex = serverSource.indexOf('closeHttpServer()');
-    assert.ok(stopDbIndex >= 0, 'debe existir una llamada a stopDatabaseReadinessLoop({ timeoutMs: 5000 })');
-    assert.ok(stopDbIndex < closeHttpIndex, 'debe detener/esperar el monitor de DB antes de cerrar el servidor HTTP');
-    assert.match(
-      serverSource,
-      /stopDatabaseReadinessLoop\(\{ timeoutMs: 5000 \}\)\s*\n\s*\.then\(\(\)\s*=>\s*closeHttpServer\(\)\)/,
-      'closeHttpServer() debe encadenarse DESPUES de que stopDatabaseReadinessLoop() resuelva (o venza su timeout), no en paralelo'
-    );
-    assert.match(serverSource, /stopCajaCloseEmailOutboxWorker\(\{ timeoutMs: 5000 \}\)/);
-    assert.match(serverSource, /stopOperationalSessionCutoffWorker\(\{ timeoutMs: 5000 \}\)/);
-    assert.match(serverSource, /closePool\(\)/);
+  // Reemplaza aserciones de texto contra el codigo fuente (buscaban los
+  // nombres de las funciones escritos literalmente junto a su argumento) por
+  // una prueba de comportamiento real. server.js invoca estos stops a traves
+  // de parametros inyectables (stopReadiness/stopCajaWorker/
+  // stopSessionCutoffWorker, alias locales dentro de createServerRuntime)
+  // cuyos valores por defecto son las funciones reales importadas: la
+  // llamada en tiempo de ejecucion nunca contiene el nombre completo de la
+  // funcion seguido de su argumento como texto contiguo. Se verifica aqui
+  // con espias inyectados que: (1) cada stop recibe { timeoutMs: 5000 }; (2)
+  // el monitor de DB se detiene ANTES de cerrar el servidor HTTP; (3) el
+  // pool principal se cierra despues de HTTP/workers.
+  it('el shutdown detiene el monitor de DB, espera el chequeo en vuelo (acotado) y solo entonces cierra HTTP/workers/pool', async () => {
+    // Restaurado en el finally: esta bandera no debe filtrarse al proceso
+    // hijo real que spawnea la siguiente describe (le haria creer que el
+    // autostart esta deshabilitado y nunca abriria el puerto).
+    const previousAutostartFlag = process.env.SERVER_RUNTIME_AUTOSTART_DISABLED;
+    process.env.SERVER_RUNTIME_AUTOSTART_DISABLED = 'true';
+    let createServerRuntime;
+    try {
+      ({ createServerRuntime } = await import(`../../server.js?case=${Date.now()}-shutdown-order`));
+    } finally {
+      if (previousAutostartFlag === undefined) delete process.env.SERVER_RUNTIME_AUTOSTART_DISABLED;
+      else process.env.SERVER_RUNTIME_AUTOSTART_DISABLED = previousAutostartFlag;
+    }
+
+    const calls = [];
+    const runtime = createServerRuntime({
+      server: {
+        close: (cb) => { calls.push('http_closed'); cb(null); }
+      },
+      runtimeConfig: { gracefulShutdownTimeoutMs: 5000 },
+      stopReadiness: async (opts) => { calls.push({ name: 'stopReadiness', opts }); },
+      stopCajaWorker: async (opts) => { calls.push({ name: 'stopCajaWorker', opts }); },
+      stopSessionCutoffWorker: async (opts) => { calls.push({ name: 'stopSessionCutoffWorker', opts }); },
+      detachPrintAgentWs: async () => { calls.push('print_agent_detached'); },
+      waitForFidelizacionQueue: async () => {},
+      closeFidelizacionDatabasePool: async () => {},
+      closeDatabasePool: async () => { calls.push('main_pool_closed'); },
+      runtimeProcess: { exit: () => {} }
+    });
+
+    await runtime.shutdown('SIGTERM');
+
+    const stopReadinessCall = calls.find((c) => c && c.name === 'stopReadiness');
+    const stopCajaCall = calls.find((c) => c && c.name === 'stopCajaWorker');
+    const stopSessionCall = calls.find((c) => c && c.name === 'stopSessionCutoffWorker');
+
+    assert.ok(stopReadinessCall, 'debe detener el monitor de DB');
+    assert.deepEqual(stopReadinessCall.opts, { timeoutMs: 5000 });
+    assert.ok(stopCajaCall, 'debe detener el worker de outbox de caja');
+    assert.deepEqual(stopCajaCall.opts, { timeoutMs: 5000 });
+    assert.ok(stopSessionCall, 'debe detener el worker de corte operativo');
+    assert.deepEqual(stopSessionCall.opts, { timeoutMs: 5000 });
+
+    const readinessIndex = calls.indexOf(stopReadinessCall);
+    const httpClosedIndex = calls.indexOf('http_closed');
+    const mainPoolIndex = calls.indexOf('main_pool_closed');
+    assert.ok(readinessIndex < httpClosedIndex, 'debe detener/esperar el monitor de DB antes de cerrar el servidor HTTP');
+    assert.ok(mainPoolIndex > httpClosedIndex, 'el pool principal se cierra despues de HTTP/workers, nunca antes');
   });
 });
 
