@@ -76,6 +76,80 @@ const buildStoredValidationFixture = ({ sourceSnapshot = snapshot, payloadRows =
 };
 
 describe('caja close computation', () => {
+  it('rechaza observacion faltante con el metodo exacto antes de persistir', () => {
+    assert.throws(
+      () => buildSegmentedArqueoComputation({
+        snapshot,
+        payloadRows: [
+          { metodo_pago_codigo: 'EFECTIVO', monto_declarado: 0 },
+          { metodo_pago_codigo: 'TARJETA', monto_declarado: 10, cantidad_referencias: 1 },
+          { metodo_pago_codigo: 'TRANSFERENCIA', monto_declarado: 5, observacion: '' }
+        ],
+        threshold: 0,
+        requireObservacionOnDifference: true
+      }),
+      (error) => {
+        assert.equal(error.httpStatus, 400);
+        assert.equal(error.code, 'VENTAS_CAJAS_ARQUEO_OBSERVACION_REQUIRED');
+        assert.equal(error.details.method, 'TRANSFERENCIA');
+        assert.equal(error.details.metodo_pago_codigo, 'TRANSFERENCIA');
+        assert.equal(error.details.field, 'observacion');
+        assert.equal(error.details.focus_target, 'arqueos.TRANSFERENCIA.observacion');
+        assert.equal(error.details.step, 'TRANSFERENCIA');
+        assert.equal(error.details.accion_requerida, 'AGREGAR_OBSERVACION');
+        assert.equal(
+          error.publicMessage,
+          'Existe diferencia en TRANSFERENCIA. Agrega una observación para continuar.'
+        );
+        return true;
+      }
+    );
+  });
+
+  it('no convierte una observacion faltante heredada en validacion STALE al cerrar', () => {
+    const payloadRows = [
+      { metodo_pago_codigo: 'EFECTIVO', monto_declarado: 0 },
+      { metodo_pago_codigo: 'TARJETA', monto_declarado: 10, cantidad_referencias: 1 },
+      { metodo_pago_codigo: 'TRANSFERENCIA', monto_declarado: 5, observacion: '' }
+    ];
+    const legacyComputation = buildSegmentedArqueoComputation({
+      snapshot,
+      payloadRows,
+      threshold: 0,
+      requireObservacionOnDifference: false
+    });
+    const fixture = {
+      validation: {
+        total_teorico: legacyComputation.monto_teorico_total,
+        total_declarado: legacyComputation.monto_declarado_total,
+        diferencia_total: legacyComputation.diferencia_total,
+        hay_diferencia: true,
+        payload_declarado_json: { arqueos: payloadRows, observacion_cierre: null },
+        resultado_json: {
+          resumen: {
+            total_teorico: legacyComputation.monto_teorico_total,
+            total_declarado: legacyComputation.monto_declarado_total,
+            diferencia_total: legacyComputation.diferencia_total,
+            hay_diferencia: true
+          },
+          metodos: legacyComputation.rows
+        }
+      },
+      validationMethods: legacyComputation.rows
+    };
+
+    assert.throws(
+      () => recomputeAndAssertCloseValidation({
+        ...fixture,
+        snapshot,
+        threshold: 0
+      }),
+      (error) => error.httpStatus === 400
+        && error.code === 'VENTAS_CAJAS_ARQUEO_OBSERVACION_REQUIRED'
+        && error.details?.method === 'TRANSFERENCIA'
+    );
+  });
+
   it('no exige observacion en preview/validacion cuando se desactiva la regla', () => {
     const result = buildSegmentedArqueoComputation({
       snapshot,
@@ -213,7 +287,9 @@ describe('caja close computation', () => {
     altered.validation.payload_declarado_json.arqueos[0].monto_declarado = 1;
     assert.throws(
       () => recomputeAndAssertCloseValidation({ ...altered, snapshot, threshold: 0 }),
-      (error) => error.code === 'VENTAS_CAJAS_CLOSE_VALIDATION_STALE'
+      (error) => error.httpStatus === 400
+        && error.code === 'VENTAS_CAJAS_ARQUEO_OBSERVACION_REQUIRED'
+        && error.details?.method === 'EFECTIVO'
     );
 
     const invalidPayloads = [

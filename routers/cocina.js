@@ -225,6 +225,16 @@ const parseTegucigalpaLocalTimestampToEpoch = (value) => {
   return resolvedEpoch + parts.milliseconds;
 };
 
+export const resolveTegucigalpaLocalWaitingMinutes = (
+  value,
+  nowMs = Date.now()
+) => {
+  const fechaRefMs = parseTegucigalpaLocalTimestampToEpoch(value);
+  return Number.isFinite(fechaRefMs)
+    ? Math.max(0, Math.floor((nowMs - fechaRefMs) / 60000))
+    : null;
+};
+
 export const resolveKdsWaitingMetrics = ({
   startedAt,
   expectedMinutes,
@@ -1490,7 +1500,11 @@ router.put('/cocina/pedidos/:id/estado', checkPermission(COCINA_VIEW_PERMISSIONS
         `
           UPDATE pedidos
           SET id_estado_pedido = $1,
-              visible_en_cocina_at = COALESCE(visible_en_cocina_at, fecha_hora_pedido, NOW())
+              visible_en_cocina_at = COALESCE(
+                visible_en_cocina_at,
+                fecha_hora_pedido,
+                NOW() AT TIME ZONE 'America/Tegucigalpa'
+              )
               ${hasEnPreparacionAt && estadoDestino === 'EN_PREPARACION'
                 ? ', en_preparacion_at = COALESCE(en_preparacion_at, NOW())'
                 : ''}
@@ -1512,10 +1526,9 @@ router.put('/cocina/pedidos/:id/estado', checkPermission(COCINA_VIEW_PERMISSIONS
 
       // ���� 10. Alerta de expiración (fire-and-forget, fuera de la tx) ��
       if (estadoDestino === 'NO_ENTREGADO' || estadoDestino === 'COMPLETADO') {
-        const fechaRef = pedido.fecha_hora_pedido;
-        const minutosEnEspera = fechaRef
-          ? Math.floor((Date.now() - new Date(fechaRef).getTime()) / 60000)
-          : null;
+        const minutosEnEspera = resolveTegucigalpaLocalWaitingMinutes(
+          pedido.fecha_hora_pedido
+        );
 
         if (minutosEnEspera !== null && minutosEnEspera >= EXPIRY_WARN_MINUTES) {
           tryEnviarAlertaExpiracion(
