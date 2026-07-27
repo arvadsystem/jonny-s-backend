@@ -1,12 +1,51 @@
 import pool from '../config/db-connection.js';
 import { getClientIp } from '../utils/security/clientInfo.js';
+import { normalizePhoneHN } from '../utils/security/personasHardening.js';
+import { computeAccumulationPoints } from '../modules/fidelizacion/domain/pointsCalculator.js';
 
-const CLIENT_ROLE_NAME = 'CLIENTE';
 const TEGUCIGALPA_TIMEZONE = 'America/Tegucigalpa';
 
 const hasBitacorasCache = {
   loaded: false,
   value: false
+};
+
+// Mismo nombre de columna que routers/clientes.js (CLIENTE_EMPRESA_RELATION_FIELD):
+// algunos entornos ya tienen clientes.id_empresa_cliente, otros todavia
+// resuelven la relacion cliente->empresa via clientes.id_empresa. Se detecta
+// una sola vez (cache de proceso) para no asumir un esquema fijo.
+const CLIENTE_EMPRESA_RELATION_FIELD = 'id_empresa_cliente';
+const clienteEmpresaRelationCache = {
+  loaded: false,
+  hasField: false
+};
+
+const loadHasClienteEmpresaRelationField = async (queryRunner = pool) => {
+  if (!clienteEmpresaRelationCache.loaded) {
+    const result = await queryRunner.query(
+      `
+        SELECT 1
+        FROM information_schema.columns
+        WHERE table_schema = 'public' AND table_name = 'clientes' AND column_name = $1
+        LIMIT 1
+      `,
+      [CLIENTE_EMPRESA_RELATION_FIELD]
+    );
+    clienteEmpresaRelationCache.loaded = true;
+    clienteEmpresaRelationCache.hasField = result.rowCount > 0;
+  }
+
+  return clienteEmpresaRelationCache.hasField;
+};
+
+// Fragmento SQL (no parametrizado: solo puede valer uno de dos literales
+// internos, nunca datos de entrada) para resolver el id_empresa real de un
+// cliente tipo empresa, igual que empresaRelationExpr en routers/clientes.js.
+export const buildClienteEmpresaRelationSql = async (client, alias = 'c') => {
+  const hasField = await loadHasClienteEmpresaRelationField(client);
+  return hasField
+    ? `COALESCE(${alias}.${CLIENTE_EMPRESA_RELATION_FIELD}, CASE WHEN ${alias}.id_persona IS NULL THEN ${alias}.id_empresa ELSE NULL END)`
+    : `${alias}.id_empresa`;
 };
 
 const normalizeText = (value) => String(value ?? '').trim();
@@ -24,6 +63,37 @@ const parseNonNegativeInt = (value) => {
 const parsePositiveNumber = (value) => {
   const parsed = Number(value);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+};
+
+// lempiras_por_punto tambien se usa para calcular canjes, asi que debe seguir
+// siendo > 0 en TODA configuracion guardada, independiente del switch de
+// acumulacion. Reglas:
+// - Si el payload trae el campo (inputProvided=true) pero no es un numero
+//   valido > 0 (0, negativo, NaN, no numerico), es invalido: nunca se cae de
+//   forma silenciosa a la tasa anterior.
+// - Si el payload omite el campo, se conserva la tasa anterior (siempre que
+//   sea > 0); si no hay configuracion previa, tambien es invalido (no hay
+//   tasa valida que conservar para la primera configuracion de la sucursal).
+const resolveEffectiveLempirasPorPunto = ({ inputProvided, inputValue, previousConfig }) => {
+  if (inputProvided) {
+    return inputValue ? { ok: true, value: inputValue } : { ok: false };
+  }
+
+  const previousValue = Number(previousConfig?.lempiras_por_punto);
+  if (Number.isFinite(previousValue) && previousValue > 0) {
+    return { ok: true, value: previousValue };
+  }
+
+  return { ok: false };
+};
+
+// Compatibilidad con payloads antiguos: si el switch se omite y ya existe
+// configuracion previa, se conserva su valor (nunca se apaga en silencio);
+// solo se usa false cuando de verdad es la primera configuracion.
+const resolveEffectiveAcumulacionHabilitada = ({ inputProvided, inputValue, previousConfig }) => {
+  if (inputProvided) return Boolean(inputValue);
+  if (previousConfig) return Boolean(previousConfig.acumulacion_habilitada);
+  return false;
 };
 
 const roundMoney = (value) => Number(Number(value || 0).toFixed(2));
@@ -150,7 +220,15 @@ const resolveFidelizacionCatalogs = async (client) => {
   };
 };
 
-export const getActiveFidelizacionConfig = async (client, idSucursal) => {
+// referenceDate es opcional.
+// - referenceDate null (canje presencial, configuracion administrativa):
+//   busca la configuracion ACTUAL, exige estado=true y vigencia HOY.
+// - referenceDate presente (acumulacion por factura pagada): busca la
+//   configuracion cuya ventana de vigencia incluia esa fecha, SIN exigir
+//   estado=true, porque una configuracion historica puede haber sido
+//   desactivada despues sin que eso deba reescribir lo que aplico en su
+//   momento a una factura ya pagada.
+export const getActiveFidelizacionConfig = async (client, idSucursal, referenceDate = null) => {
   const sucursalId = parsePositiveInt(idSucursal);
   if (!sucursalId) return null;
 
@@ -160,6 +238,7 @@ export const getActiveFidelizacionConfig = async (client, idSucursal) => {
         fcs.id_configuracion,
         fcs.id_sucursal,
         fcs.lempiras_por_punto,
+        fcs.acumulacion_habilitada,
         fcs.vigente_desde,
         fcs.vigente_hasta,
         fcs.estado,
@@ -168,13 +247,13 @@ export const getActiveFidelizacionConfig = async (client, idSucursal) => {
         fcs.fecha_actualizacion
       FROM public.fidelizacion_configuracion_sucursal fcs
       WHERE fcs.id_sucursal = $1
-        AND COALESCE(fcs.estado, true) = true
-        AND fcs.vigente_desde <= NOW()
-        AND (fcs.vigente_hasta IS NULL OR fcs.vigente_hasta > NOW())
+        AND ($2::timestamptz IS NOT NULL OR COALESCE(fcs.estado, true) = true)
+        AND fcs.vigente_desde <= COALESCE($2::timestamptz, NOW())
+        AND (fcs.vigente_hasta IS NULL OR fcs.vigente_hasta > COALESCE($2::timestamptz, NOW()))
       ORDER BY fcs.vigente_desde DESC, fcs.id_configuracion DESC
       LIMIT 1
     `,
-    [sucursalId]
+    [sucursalId, referenceDate || null]
   );
 
   return result.rows[0] || null;
@@ -240,28 +319,47 @@ const syncLegacyClientePoints = async (client, idCliente, puntosDisponibles) => 
   );
 };
 
-const isClienteUsuarioElegible = async (client, idCliente) => {
+// Elegibilidad por PERFIL del cliente (no por usuario/rol): activo, con
+// nombre valido (persona.nombre o empresa.nombre_empresa segun el tipo de
+// cliente) y con un telefono asociado mediante la relacion real del modelo
+// actual (personas/empresas -> telefonos). No exige apellido, correo, ni que
+// el cliente tenga usuario o rol CLIENTE.
+export const fetchClienteProfileForFidelizacion = async (client, idCliente) => {
+  const clienteId = parsePositiveInt(idCliente);
+  if (!clienteId) return null;
+
+  const empresaRelationExpr = await buildClienteEmpresaRelationSql(client, 'c');
+
   const result = await client.query(
     `
-      SELECT 1
-      FROM public.usuarios_clientes uc
-      INNER JOIN public.usuarios u
-        ON u.id_usuario = uc.id_usuario
-       AND u.id_cliente = uc.id_cliente
-      INNER JOIN public.roles_usuarios ru
-        ON ru.id_usuario = u.id_usuario
-      INNER JOIN public.roles r
-        ON r.id_rol = ru.id_rol
-      WHERE uc.id_cliente = $1
-        AND COALESCE(uc.estado, true) = true
-        AND COALESCE(u.estado, false) = true
-        AND UPPER(TRIM(r.nombre)) = $2
+      SELECT
+        c.id_cliente,
+        COALESCE(c.estado, true) AS estado,
+        CASE WHEN c.id_persona IS NOT NULL THEN p.nombre ELSE e.nombre_empresa END AS nombre,
+        CASE WHEN c.id_persona IS NOT NULL THEN telf_p.telefono ELSE telf_e.telefono END AS telefono
+      FROM public.clientes c
+      LEFT JOIN public.personas p ON p.id_persona = c.id_persona
+      LEFT JOIN public.telefonos telf_p ON telf_p.id_telefono = p.id_telefono
+      LEFT JOIN public.empresas e ON e.id_empresa = ${empresaRelationExpr}
+      LEFT JOIN public.telefonos telf_e ON telf_e.id_telefono = e.id_telefono
+      WHERE c.id_cliente = $1
       LIMIT 1
     `,
-    [idCliente, CLIENT_ROLE_NAME]
+    [clienteId]
   );
 
-  return result.rowCount > 0;
+  return result.rows[0] || null;
+};
+
+// normalizePhoneHN es la funcion canonica de normalizacion de telefono ya
+// existente en el proyecto (utils/security/personasHardening.js), reutilizada
+// aqui tal cual. Nombre valido = no vacio tras trim; no se exige formato de
+// nombre (eso ya lo valida el alta de personas/empresas, no fidelizacion).
+export const isClienteProfileComplete = (profile) => {
+  if (!profile) return false;
+  const nombreValido = normalizeText(profile.nombre).length > 0;
+  const telefonoValido = Boolean(normalizePhoneHN(profile.telefono));
+  return Boolean(profile.estado) && nombreValido && telefonoValido;
 };
 
 const registerFidelizacionMovement = async (client, payload) => {
@@ -400,13 +498,6 @@ const addSaldoPoints = async ({
 const buildVentaNumero = (idFactura) => `VTA-${String(idFactura).padStart(5, '0')}`;
 const buildCanjeNumero = (idCanje) => `CAN-${String(idCanje).padStart(5, '0')}`;
 
-const computeAccumulationPoints = (montoFactura, lempirasPorPunto) => {
-  const total = Number(montoFactura || 0);
-  const ratio = Number(lempirasPorPunto || 0);
-  if (!Number.isFinite(total) || !Number.isFinite(ratio) || total <= 0 || ratio <= 0) return 0;
-  return Math.floor(total / ratio);
-};
-
 const computeRedemptionPoints = (precioProducto, lempirasPorPunto) => {
   const price = Number(precioProducto || 0);
   const ratio = Number(lempirasPorPunto || 0);
@@ -414,6 +505,15 @@ const computeRedemptionPoints = (precioProducto, lempirasPorPunto) => {
   return Math.ceil(price / ratio);
 };
 
+// eligibilitySnapshot (opcional): evidencia historica capturada al momento
+// del pago (ver modules/fidelizacion/application/reservePaidInvoiceAccumulation.js).
+// Cuando viene, la elegibilidad sale de ahi y NO se consulta el perfil actual
+// del cliente -es lo que impide que completar el perfil despues otorgue
+// puntos retroactivos, y lo que permite acumular a un cliente del menu
+// publico cuyo telefono solo existe en pedidos_contacto-.
+// Cuando no viene, se conserva el comportamiento historico (consultar el
+// perfil vigente), que es el correcto para llamadas directas y para las
+// pruebas que ejercitan esta funcion de forma aislada.
 export const registerFacturaLoyaltyAccumulation = async ({
   client,
   idFactura,
@@ -421,7 +521,9 @@ export const registerFacturaLoyaltyAccumulation = async ({
   idCliente = null,
   idSucursal = null,
   idUsuarioEjecutor = null,
-  montoFactura = 0
+  montoFactura = 0,
+  referenceDate = null,
+  eligibilitySnapshot = null
 }) => {
   const facturaId = parsePositiveInt(idFactura);
   const clienteId = parsePositiveInt(idCliente);
@@ -455,14 +557,28 @@ export const registerFacturaLoyaltyAccumulation = async ({
     };
   }
 
-  const clienteElegible = await isClienteUsuarioElegible(client, clienteId);
-  if (!clienteElegible) {
-    return { created: false, reason: 'CLIENT_NOT_ELIGIBLE' };
+  // Elegibilidad: snapshot historico si lo hay, perfil vigente si no. Este
+  // camino es SOLO LECTURA -jamas escribe en telefonos/personas/empresas-.
+  // Una escritura fallida aqui (p.ej. el UNIQUE de telefonos.telefono)
+  // abortaria toda la transaccion en PostgreSQL y ningun try/catch de JS la
+  // recuperaria, dejando la acumulacion rota de forma silenciosa.
+  const perfilCompleto = eligibilitySnapshot
+    ? Boolean(eligibilitySnapshot.perfilCompletoSnapshot)
+    : isClienteProfileComplete(await fetchClienteProfileForFidelizacion(client, clienteId));
+
+  if (!perfilCompleto) {
+    return { created: false, reason: 'CLIENT_PROFILE_INCOMPLETE' };
   }
 
-  const activeConfig = await getActiveFidelizacionConfig(client, sucursalId);
+  const activeConfig = await getActiveFidelizacionConfig(client, sucursalId, referenceDate);
   if (!activeConfig) {
     return { created: false, reason: 'CONFIG_NOT_FOUND' };
+  }
+  if (!activeConfig.acumulacion_habilitada) {
+    return { created: false, reason: 'ACCUMULATION_DISABLED' };
+  }
+  if (!(Number(activeConfig.lempiras_por_punto) > 0)) {
+    return { created: false, reason: 'ACCUMULATION_RULE_NOT_CONFIGURED' };
   }
 
   const points = computeAccumulationPoints(montoFactura, activeConfig.lempiras_por_punto);
@@ -871,6 +987,8 @@ export {
   parsePositiveInt,
   parseNonNegativeInt,
   parsePositiveNumber,
+  resolveEffectiveLempirasPorPunto,
+  resolveEffectiveAcumulacionHabilitada,
   computeAccumulationPoints,
   computeRedemptionPoints
 };

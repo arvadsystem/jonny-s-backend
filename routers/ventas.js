@@ -4,7 +4,7 @@ import { createHash } from 'node:crypto';
 import pool from '../config/db-connection.js';
 import { checkPermission, requestHasAnyPermission, requestHasAnyRole } from '../middleware/checkPermission.js';
 import { resolveRequestUserSucursalScope } from '../utils/sucursalScope.js';
-import { registerFacturaLoyaltyAccumulation } from '../services/fidelizacionService.js';
+import { notifyPaidInvoice, reservePaidInvoiceAccumulation } from '../modules/fidelizacion/index.js';
 import { generarCodigoDocumento } from '../services/facturacionCorrelativoService.js';
 import {
   aplicarSnapshotEnFactura,
@@ -144,7 +144,6 @@ import {
   VENTAS_DESCUENTO_APLICAR_PERMISSION,
   VENTAS_DESCUENTOS_PERMISSIONS,
   VENTAS_DESCUENTOS_WRITE_PERMISSIONS,
-  VENTAS_FIDELIZACION_ADVISORY_LOCK_CLASS,
   VENTAS_HISTORY_ADMIN_ROLES,
   VENTAS_HISTORY_CAJERO_ROLE,
   VENTAS_LIMIT_72H_CUTOFF_SQL,
@@ -1101,84 +1100,6 @@ const buildCreateVentaDetailResponse = ({
   };
 };
 
-const logVentasFidelizacionAsyncPerf = (payload) => {
-  if (!isVentasPerfEnabled()) return;
-  console.info('[ventas:perf:fidelizacion_async]', payload);
-};
-
-const registerVentaFidelizacionAfterCommit = async ({
-  idFactura,
-  idPedido = null,
-  idCliente = null,
-  idSucursal = null,
-  idUsuarioEjecutor = null,
-  montoFactura = 0
-}) => {
-  const facturaId = parseOptionalPositiveInt(idFactura);
-  const startedAt = performance.now();
-
-  if (!facturaId || !parseOptionalPositiveInt(idCliente) || !parseOptionalPositiveInt(idSucursal)) {
-    logVentasFidelizacionAsyncPerf({
-      id_factura: facturaId || null,
-      post_rpc_fidelizacion_ms: Math.max(0, Math.round(performance.now() - startedAt)),
-      created: false,
-      reason: 'MISSING_REQUIRED_DATA'
-    });
-    return;
-  }
-
-  let client = null;
-  let transactionStarted = false;
-
-  try {
-    const poolWaitStart = ventasPerf.now();
-    client = await pool.connect();
-    ventasPerf.add('pool_wait_ms', poolWaitStart);
-    instrumentVentasSqlClient(client, ventasPerf);
-    const transactionStart = ventasPerf.now();
-    await client.query('BEGIN');
-    transactionStarted = true;
-    await client.query(
-      'SELECT pg_advisory_xact_lock($1::int, $2::int)',
-      [VENTAS_FIDELIZACION_ADVISORY_LOCK_CLASS, facturaId]
-    );
-
-    const result = await registerFacturaLoyaltyAccumulation({
-      client,
-      idFactura: facturaId,
-      idPedido,
-      idCliente,
-      idSucursal,
-      idUsuarioEjecutor,
-      montoFactura
-    });
-
-    await client.query('COMMIT');
-    transactionStarted = false;
-    ventasPerf.add('transaction_ms', transactionStart);
-
-    logVentasFidelizacionAsyncPerf({
-      id_factura: facturaId,
-      post_rpc_fidelizacion_ms: Math.max(0, Math.round(performance.now() - startedAt)),
-      created: Boolean(result?.created),
-      reason: result?.reason || null
-    });
-  } catch (err) {
-    if (transactionStarted) {
-      try {
-        await client.query('ROLLBACK');
-      } catch (_) {
-        // La venta ya fue confirmada; este rollback solo protege el trabajo diferido.
-      }
-    }
-    console.error('[ventas:fidelizacion_async] error:', {
-      id_factura: facturaId,
-      code: err?.code || err?.name || 'FIDELIZACION_ASYNC_ERROR'
-    });
-  } finally {
-    if (client) client.release();
-  }
-};
 const createVentaWithRpcTransaction = async ({ client, venta, perf, requestStartedAt = 0 }) => {
   const rpcTotalStart = perf?.now?.() || 0;
 
@@ -1278,14 +1199,7 @@ const createVentaWithRpcTransaction = async ({ client, venta, perf, requestStart
   return {
     response: responsePayload,
     afterRpcStart,
-    fidelizacionJob: {
-      idFactura,
-      idPedido: parseOptionalPositiveInt(response.id_pedido),
-      idCliente: venta.id_cliente,
-      idSucursal: venta.id_sucursal,
-      idUsuarioEjecutor: venta.id_usuario,
-      montoFactura: venta.total
-    }
+    fidelizacionJob: { idFactura }
   };
 };
 const createVentaWithRpcV2Transaction = async ({ client, venta, perf, requestStartedAt = 0 }) => {
@@ -1361,14 +1275,7 @@ const createVentaWithRpcV2Transaction = async ({ client, venta, perf, requestSta
   return {
     response: responsePayload,
     afterRpcStart,
-    fidelizacionJob: {
-      idFactura,
-      idPedido: parseOptionalPositiveInt(response.id_pedido),
-      idCliente: venta.id_cliente,
-      idSucursal: venta.id_sucursal,
-      idUsuarioEjecutor: venta.id_usuario,
-      montoFactura: venta.total
-    }
+    fidelizacionJob: { idFactura }
   };
 };
 
@@ -1415,7 +1322,7 @@ const createVentaWithRpcV3Transaction = async ({
       fidelizacion: null
     },
     afterRpcStart,
-    fidelizacionJob: buildRpcFidelizacionJob({ response, venta })
+    fidelizacionJob: buildRpcFidelizacionJob({ response })
   };
 };
 
@@ -9591,28 +9498,18 @@ router.post('/ventas/pedidos/:id/registrar-pago', checkPermission(['VENTAS_CREAR
 
     if (pedidoPagadoCompleto) {
       await updatePedidoLegacyPagoConfirmado({ client, idPedido, userId });
+      // Reserva durable de fidelizacion DENTRO de esta transaccion (aislada en
+      // su propio SAVEPOINT: nunca lanza ni aborta el pago). Solo cuando el
+      // pedido quedo completamente pagado; un pago parcial no reserva.
+      await reservePaidInvoiceAccumulation({ client, idFactura });
     }
-
-    const fidelizacionStart = ventasPerf.now();
-    const acumulacionFidelizacion = pedidoPagadoCompleto
-      ? await registerFacturaLoyaltyAccumulation({
-        client,
-        idFactura,
-        idPedido,
-        idCliente: parseOptionalPositiveInt(pedido.id_cliente),
-        idSucursal: idSucursalPedido,
-        idUsuarioEjecutor: userId,
-        montoFactura: totalPedido
-      })
-      : { created: false };
-    ventasPerf.add('fidelizacion_ms', fidelizacionStart);
 
     const commitStart = ventasPerf.now();
     await client.query('COMMIT');
     ventasPerf.add('commit_ms', commitStart);
     ventasPerf.log({ ...ventasPerfContext, status: 201 });
 
-    return res.status(201).json({
+    res.status(201).json({
       message: 'Pago registrado correctamente.',
       id_pedido: idPedido,
       id_factura: idFactura,
@@ -9625,13 +9522,13 @@ router.post('/ventas/pedidos/:id/registrar-pago', checkPermission(['VENTAS_CREAR
       cambio,
       id_sesion_caja: Number(sessionActiva.data.id_sesion_caja),
       metodo_pago: String(metodoPago.codigo || metodoPago.nombre || '').toUpperCase(),
-      fidelizacion: acumulacionFidelizacion.created
-        ? {
-            puntos_acumulados: acumulacionFidelizacion.points,
-            saldo_nuevo: acumulacionFidelizacion.saldoNuevo
-          }
-        : null
+      fidelizacion: null
     });
+
+    if (pedidoPagadoCompleto) {
+      void notifyPaidInvoice({ idFactura }).catch(() => undefined);
+    }
+    return undefined;
   } catch (err) {
     await client.query('ROLLBACK');
     const mappedErr = mapCajaFinancialLockError(err);
@@ -9941,6 +9838,12 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
         idUsuario: userId,
         idSucursal: venta.id_sucursal
       });
+      // Reserva durable de fidelizacion antes del COMMIT, con el mismo guard
+      // que la notificacion post-COMMIT (un replay idempotente no reserva).
+      // En V3 el idFactura puede venir null: la reserva lo detecta y no opera.
+      if (shouldRunRpcPostCommitSideEffects(rpcV3ResponseBody)) {
+        await reservePaidInvoiceAccumulation({ client, idFactura: rpcCreateResult.fidelizacionJob.idFactura });
+      }
       const commitStart = ventasPerf.now();
       await client.query('COMMIT');
       transactionStarted = false;
@@ -9958,7 +9861,7 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
       res.status(201).json(rpcV3ResponseBody);
 
       if (shouldRunRpcPostCommitSideEffects(rpcV3ResponseBody)) {
-        void registerVentaFidelizacionAfterCommit(rpcCreateResult.fidelizacionJob);
+        void notifyPaidInvoice({ idFactura: rpcCreateResult.fidelizacionJob.idFactura }).catch(() => undefined);
       }
       return;
     }
@@ -9985,15 +9888,12 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
         idUsuario: userId,
         perf: ventasPerf
       });
-      if (ventaHasExtras) {
-        const fidelizacionPedidoId = parseOptionalPositiveInt(rpcCreateResult.fidelizacionJob?.idPedido);
-        if (!fidelizacionPedidoId) {
-          throw {
-            httpStatus: 500,
-            code: 'VENTAS_RPC_V2_PEDIDO_INVALIDO',
-            publicMessage: 'La venta fue procesada por RPC V2, pero no devolvio pedido valido para descontar extras.'
-          };
-        }
+      if (ventaHasExtras && !idPedidoRpc) {
+        throw {
+          httpStatus: 500,
+          code: 'VENTAS_RPC_V2_PEDIDO_INVALIDO',
+          publicMessage: 'La venta fue procesada por RPC V2, pero no devolvio pedido valido para descontar extras.'
+        };
       }
 
       await applyPedidoInitialOperationalRouting({ client, idPedido: idPedidoRpc });
@@ -10012,6 +9912,10 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
         idSucursal: venta.id_sucursal
       });
 
+      // Reserva durable de fidelizacion antes del COMMIT (SAVEPOINT propio:
+      // nunca lanza ni aborta la venta).
+      await reservePaidInvoiceAccumulation({ client, idFactura: rpcCreateResult.fidelizacionJob.idFactura });
+
       const commitStart = ventasPerf.now();
       await client.query('COMMIT');
       transactionStarted = false;
@@ -10023,7 +9927,7 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
       ventasPerf.log({ ...ventasPerfContext, status: 201 });
       res.status(201).json(rpcV2ResponseBody);
 
-      void registerVentaFidelizacionAfterCommit(rpcCreateResult.fidelizacionJob);
+      void notifyPaidInvoice({ idFactura: rpcCreateResult.fidelizacionJob.idFactura }).catch(() => undefined);
       return;
     }
 
@@ -10071,6 +9975,10 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
         idSucursal: venta.id_sucursal
       });
 
+      // Reserva durable de fidelizacion antes del COMMIT (SAVEPOINT propio:
+      // nunca lanza ni aborta la venta).
+      await reservePaidInvoiceAccumulation({ client, idFactura: rpcCreateResult.fidelizacionJob.idFactura });
+
       const commitStart = ventasPerf.now();
       await client.query('COMMIT');
       transactionStarted = false;
@@ -10082,7 +9990,7 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
       ventasPerf.log({ ...ventasPerfContext, status: 201 });
       res.status(201).json(rpcV1ResponseBody);
 
-      void registerVentaFidelizacionAfterCommit(rpcCreateResult.fidelizacionJob);
+      void notifyPaidInvoice({ idFactura: rpcCreateResult.fidelizacionJob.idFactura }).catch(() => undefined);
       return;
     }
 
@@ -10575,18 +10483,6 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
       cuentaDivididaResponse = await fetchCuentaDividida(client, { idFactura, idPedido });
     }
 
-    const fidelizacionStart = ventasPerf.now();
-    const acumulacionFidelizacion = await registerFacturaLoyaltyAccumulation({
-      client,
-      idFactura,
-      idPedido,
-      idCliente: venta.id_cliente,
-      idSucursal: venta.id_sucursal,
-      idUsuarioEjecutor: venta.id_usuario,
-      montoFactura: venta.total
-    });
-    ventasPerf.add('fidelizacion_ms', fidelizacionStart);
-
     const ticketResponseStart = ventasPerf.now();
     const facturacionNormalizada = await normalizarDatosTicketDesdeSnapshot({
       client,
@@ -10618,7 +10514,7 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
         facturacion: facturacionNormalizada,
         context: createDetailContext,
         items: createDetailItems,
-        fidelizacion: acumulacionFidelizacion,
+        fidelizacion: null,
         cuentaDividida: cuentaDivididaResponse
       }), venta)
     });
@@ -10635,6 +10531,10 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
       idSucursal: venta.id_sucursal
     });
 
+    // Reserva durable de fidelizacion antes del COMMIT (SAVEPOINT propio:
+    // nunca lanza ni aborta la venta).
+    await reservePaidInvoiceAccumulation({ client, idFactura });
+
     const commitStart = ventasPerf.now();
     await client.query('COMMIT');
     transactionStarted = false;
@@ -10645,6 +10545,9 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
     ventasPerf.log(ventasPerfContext);
 
     res.status(201).json(createVentaResponse);
+
+    void notifyPaidInvoice({ idFactura }).catch(() => undefined);
+    return undefined;
   } catch (err) {
     if (transactionStarted) {
       await client.query('ROLLBACK').catch((rollbackErr) => {

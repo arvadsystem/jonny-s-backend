@@ -27,7 +27,7 @@ const routerSource = readFileSync(resolve('routers/cajas.js'), 'utf8');
 // conteos de statements deben operar sobre el codigo sin comentarios, no
 // sobre el texto crudo del archivo.
 const stripSqlComments = (source) => source
-  .split('\n')
+  .split(/\r?\n/)
   .map((line) => line.replace(/--.*$/, ''))
   .join('\n');
 

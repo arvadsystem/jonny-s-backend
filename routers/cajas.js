@@ -32,6 +32,10 @@ import {
   canBypassCajaSucursalForAuxiliary
 } from '../services/cajaAssignmentRulesService.js';
 import { validateCajaCloseEditObservation } from '../services/cajaCloseEditValidationService.js';
+import {
+  buildCloseValidationArtifacts,
+  isReusableCloseValidation
+} from '../services/cajaCloseValidationIdempotencyService.js';
 
 const router = express.Router();
 const CAJAS_SCOPE_PERMISSION = 'VENTAS_CAJAS_MULTISUCURSAL_VER';
@@ -123,12 +127,15 @@ const createArqueoObservationRequiredError = (methodCode, message = null) => {
   return createCajaError(
     400,
     'VENTAS_CAJAS_ARQUEO_OBSERVACION_REQUIRED',
-    message || `Debe indicar observación para ${normalizedMethodCode} cuando existe diferencia.`,
+    message || `Existe diferencia en ${normalizedMethodCode}. Agrega una observación para continuar.`,
     {
+      method: normalizedMethodCode,
       metodo_pago_codigo: normalizedMethodCode,
       field: 'observacion',
       focus_target: `arqueos.${normalizedMethodCode}.observacion`,
-      step: normalizedMethodCode
+      step: normalizedMethodCode,
+      motivo: 'DIFERENCIA_SIN_OBSERVACION',
+      accion_requerida: 'AGREGAR_OBSERVACION'
     }
   );
 };
@@ -726,17 +733,32 @@ const fetchSessionOperationalFingerprint = async (client, idSesionCaja, currentS
 
 const assertOperationalFingerprintMatches = ({ validation, currentFingerprint }) => {
   const stored = validation?.resultado_json?.huella_operacional;
+  const safeCurrentFingerprint = currentFingerprint && typeof currentFingerprint === 'object'
+    ? currentFingerprint
+    : {};
+  const safeFingerprintKeys = Object.keys(safeCurrentFingerprint);
+  const safeStoredFingerprint = stored && typeof stored === 'object'
+    ? Object.fromEntries(safeFingerprintKeys.map((key) => [key, stored[key] ?? null]))
+    : null;
+  const buildDetails = (motivo, changedFields) => ({
+    motivo,
+    campos: changedFields,
+    campos_cambiados: changedFields,
+    huella_validada: safeStoredFingerprint,
+    huella_actual: Object.fromEntries(safeFingerprintKeys.map((key) => [key, safeCurrentFingerprint[key] ?? null]))
+  });
   if (!stored || !currentFingerprint) {
     throw createCajaError(
       409,
       'VENTAS_CAJAS_CLOSE_VALIDATION_STALE',
-      'La sesion cambio despues de revisar las diferencias. Debe realizar una nueva revision antes de cerrar.'
+      'La revisión actual no contiene una huella operativa válida. Genera una nueva revisión antes de cerrar.',
+      buildDetails('HUELLA_OPERACIONAL_AUSENTE', safeFingerprintKeys)
     );
   }
 
   const changed = [];
-  for (const key of Object.keys(currentFingerprint)) {
-    if (!fingerprintValuesEqual(key, stored[key], currentFingerprint[key])) {
+  for (const key of safeFingerprintKeys) {
+    if (!fingerprintValuesEqual(key, stored[key], safeCurrentFingerprint[key])) {
       changed.push(key);
     }
   }
@@ -745,8 +767,8 @@ const assertOperationalFingerprintMatches = ({ validation, currentFingerprint })
     throw createCajaError(
       409,
       'VENTAS_CAJAS_CLOSE_VALIDATION_STALE',
-      'La sesion cambio despues de revisar las diferencias. Debe realizar una nueva revision antes de cerrar.',
-      { campos: changed }
+      'Hubo actividad posterior a la revisión. Revisa los cambios y genera una nueva revisión antes de cerrar.',
+      buildDetails('HUELLA_OPERACIONAL_CAMBIO', changed)
     );
   }
 };
@@ -770,6 +792,42 @@ const buildExpectedOtroValidationRow = (currentSummary) => {
   };
 };
 
+const enrichCloseValidationStaleError = ({ error, validation, currentFingerprint }) => {
+  if (
+    error?.code === 'VENTAS_CAJAS_ARQUEO_OBSERVACION_REQUIRED'
+    || error?.code !== 'VENTAS_CAJAS_CLOSE_VALIDATION_STALE'
+  ) {
+    return error;
+  }
+
+  const previousDetails = error.details && typeof error.details === 'object' ? error.details : {};
+  const changedFields = [
+    ...(Array.isArray(previousDetails.inconsistencias)
+      ? previousDetails.inconsistencias.map((item) =>
+          `${normalizeMethodCode(item?.metodo_pago_codigo) || 'TOTAL'}.${String(item?.campo || item?.motivo || 'CAMBIO')}`
+        )
+      : []),
+    ...(Array.isArray(previousDetails.diferencias)
+      ? previousDetails.diferencias.map((item) => normalizeMethodCode(item?.metodo_pago_codigo) || 'TOTAL')
+      : []),
+    ...(previousDetails.codigo ? [`CATALOGO.${normalizeMethodCode(previousDetails.codigo)}`] : [])
+  ];
+  const safeFingerprintKeys = Object.keys(currentFingerprint || {});
+  error.details = {
+    ...previousDetails,
+    motivo: previousDetails.motivo || 'VALIDACION_NO_COINCIDE',
+    campos: changedFields,
+    campos_cambiados: changedFields,
+    huella_validada: Object.fromEntries(
+      safeFingerprintKeys.map((key) => [key, validation?.resultado_json?.huella_operacional?.[key] ?? null])
+    ),
+    huella_actual: Object.fromEntries(
+      safeFingerprintKeys.map((key) => [key, currentFingerprint?.[key] ?? null])
+    )
+  };
+  return error;
+};
+
 const assertCloseValidationMatchesCurrentSummary = ({
   validation,
   validationMethods,
@@ -777,16 +835,27 @@ const assertCloseValidationMatchesCurrentSummary = ({
   currentFingerprint,
   threshold
 }) => {
-  const recomputedValidation = recomputeAndAssertCloseValidation({
-    validation,
-    validationMethods,
-    snapshot: currentSummary,
-    threshold
-  });
-  assertCoreCatalogValid(currentSummary?.catalogValidation, {
-    errorCode: 'VENTAS_CAJAS_CLOSE_VALIDATION_STALE',
-    publicMessage: 'El catalogo de metodos de pago cambio despues de validar el cierre. Debe realizar una nueva revision.'
-  });
+  assertOperationalFingerprintMatches({ validation, currentFingerprint });
+  let recomputedValidation;
+  try {
+    recomputedValidation = recomputeAndAssertCloseValidation({
+      validation,
+      validationMethods,
+      snapshot: currentSummary,
+      threshold
+    });
+  } catch (error) {
+    throw enrichCloseValidationStaleError({ error, validation, currentFingerprint });
+  }
+
+  try {
+    assertCoreCatalogValid(currentSummary?.catalogValidation, {
+      errorCode: 'VENTAS_CAJAS_CLOSE_VALIDATION_STALE',
+      publicMessage: 'El catalogo de metodos de pago cambio despues de validar el cierre. Debe realizar una nueva revision.'
+    });
+  } catch (error) {
+    throw enrichCloseValidationStaleError({ error, validation, currentFingerprint });
+  }
 
   const currentByCode = buildCurrentCloseTheoreticalByCode(currentSummary);
   const storedRows = Array.isArray(validationMethods) ? validationMethods : [];
@@ -869,15 +938,15 @@ const assertCloseValidationMatchesCurrentSummary = ({
   }
 
   if (staleDetails.length > 0) {
-    throw createCajaError(
+    const error = createCajaError(
       409,
       'VENTAS_CAJAS_CLOSE_VALIDATION_STALE',
       'La sesión cambió después de revisar las diferencias. Debe realizar una nueva revisión antes de cerrar.',
-      { diferencias: staleDetails }
+      { motivo: 'VALIDACION_NO_COINCIDE', diferencias: staleDetails }
     );
+    throw enrichCloseValidationStaleError({ error, validation, currentFingerprint });
   }
 
-  assertOperationalFingerprintMatches({ validation, currentFingerprint });
   return recomputedValidation;
 };
 
@@ -2557,28 +2626,76 @@ const persistCloseValidationAttempt = async ({
   session,
   idUsuarioValida,
   computation,
-  payloadRows,
   observacionCierre,
   origen,
   ipOrigen,
   userAgent,
   operationalFingerprint = null
 }) => {
-  const hayDiferencia = computation.rows.some((row) => roundMoney(row.diferencia) !== 0);
-  const payloadDeclarado = {
-    arqueos: Array.isArray(payloadRows) ? payloadRows : [],
-    observacion_cierre: observacionCierre || null
-  };
-  const resultado = {
-    resumen: {
-      total_teorico: computation.monto_teorico_total,
-      total_declarado: computation.monto_declarado_total,
-      diferencia_total: computation.diferencia_total,
-      hay_diferencia: hayDiferencia
-    },
-    metodos: computation.rows,
-    huella_operacional: operationalFingerprint
-  };
+  const {
+    hayDiferencia,
+    payloadDeclarado,
+    resultado,
+    persistedMethods
+  } = buildCloseValidationArtifacts({
+    computation,
+    observacionCierre,
+    operationalFingerprint
+  });
+
+  const latestValidationResult = await client.query(
+    `
+      SELECT v.id_validacion_cierre::text AS id_validacion_cierre,
+             v.id_sesion_caja::text AS id_sesion_caja,
+             v.id_usuario_valida,
+             v.id_cierre_caja,
+             v.numero_intento,
+             v.hay_diferencia,
+             v.payload_declarado_json,
+             v.resultado_json,
+             COALESCE((
+               SELECT jsonb_agg(
+                 jsonb_build_object(
+                   'id_metodo_pago', vm.id_metodo_pago,
+                   'metodo_pago_codigo', vm.metodo_pago_codigo,
+                   'monto_teorico', vm.monto_teorico,
+                   'monto_declarado', vm.monto_declarado,
+                   'diferencia', vm.diferencia,
+                   'cantidad_referencias', vm.cantidad_referencias,
+                   'resultado', vm.resultado,
+                   'requiere_revision', vm.requiere_revision,
+                   'observacion', vm.observacion
+                 )
+                 ORDER BY vm.id_validacion_metodo ASC
+               )
+               FROM public.cajas_cierres_validaciones_metodos vm
+               WHERE vm.id_validacion_cierre = v.id_validacion_cierre
+             ), '[]'::jsonb) AS metodos_persistidos_json
+      FROM public.cajas_cierres_validaciones v
+      WHERE v.id_sesion_caja = $1
+        AND v.id_cierre_caja IS NULL
+      ORDER BY v.numero_intento DESC, v.fecha_validacion DESC, v.id_validacion_cierre DESC
+      LIMIT 1
+      FOR UPDATE OF v
+    `,
+    [session.id_sesion_caja]
+  );
+  const latestValidation = latestValidationResult.rows?.[0] || null;
+  if (isReusableCloseValidation({
+    candidate: latestValidation,
+    idSesionCaja: session.id_sesion_caja,
+    idUsuarioValida,
+    payloadDeclarado,
+    resultado,
+    persistedMethods
+  })) {
+    return {
+      id_validacion_cierre: parsePositiveBigIntId(latestValidation.id_validacion_cierre),
+      numero_intento: Number(latestValidation.numero_intento || 1),
+      hay_diferencia: Boolean(latestValidation.hay_diferencia),
+      reutilizada: true
+    };
+  }
 
   let validationResult;
   try {
@@ -2660,17 +2777,7 @@ const persistCloseValidationAttempt = async ({
       observacionCierre || null,
       normalizeText(ipOrigen, 120),
       normalizeText(userAgent, 300),
-      JSON.stringify(computation.rows.map((row) => ({
-        id_metodo_pago: row.id_metodo_pago,
-        metodo_pago_codigo: row.metodo_pago_codigo,
-        monto_teorico: row.monto_teorico,
-        monto_declarado: row.monto_declarado,
-        diferencia: row.diferencia,
-        cantidad_referencias: row.cantidad_referencias,
-        resultado: row.resultado,
-        requiere_revision: row.requiere_revision,
-        observacion: row.observacion
-      })))
+      JSON.stringify(persistedMethods)
     ]
     );
   } catch (err) {
@@ -2689,15 +2796,19 @@ const persistCloseValidationAttempt = async ({
   return {
     id_validacion_cierre: idValidacionCierre,
     numero_intento: Number(validationRow.numero_intento || 1),
-    hay_diferencia: Boolean(validationRow.hay_diferencia)
+    hay_diferencia: Boolean(validationRow.hay_diferencia),
+    reutilizada: false
   };
 };
 
 const buildCloseValidationResponse = ({ validation, computation, isCashierOnly }) => {
   const base = {
-    message: 'Diferencias revisadas correctamente.',
+    message: validation.reutilizada
+      ? `Revisión actual #${validation.numero_intento} reutilizada. No se creó un recuento nuevo.`
+      : `Revisión actual #${validation.numero_intento} creada correctamente.`,
     id_validacion_cierre: validation.id_validacion_cierre,
     numero_intento: validation.numero_intento,
+    reutilizada: Boolean(validation.reutilizada),
     comparacion_visible: true,
     teorico_visible: !isCashierOnly,
     resumen: {
@@ -5319,7 +5430,7 @@ router.post('/ventas/cajas/sesiones/:id/cierre-validaciones', checkPermission(['
         snapshot,
         payloadRows,
         threshold,
-        requireObservacionOnDifference: false
+        requireObservacionOnDifference: true
       });
       const operationalFingerprint = snapshot.fingerprint;
 
@@ -5328,7 +5439,6 @@ router.post('/ventas/cajas/sesiones/:id/cierre-validaciones', checkPermission(['
         session,
         idUsuarioValida: scopeContext.idUsuario,
         computation,
-        payloadRows,
         observacionCierre,
         origen: req.body?.origen,
         ipOrigen: getClientIp(req),
