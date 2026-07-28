@@ -2,12 +2,14 @@ import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import { readFile } from 'node:fs/promises';
 import {
+  fidelizacionService,
   buildClienteBaseSql,
   buildClienteWhereClause,
   escapeLikePattern,
   buildLikeSearch,
   parsePageParam,
   parseLimitParam,
+  parseNullablePositiveInt,
   MAX_SEARCH_LENGTH,
   MAX_PAGE_SIZE,
   DEFAULT_CLIENTES_PAGE_SIZE
@@ -383,5 +385,147 @@ describe('fetchClienteDetalleRow / panel / listClientes: calculan empresaRelatio
     const whereBlock = sql.slice(whereIdx);
     assert.doesNotMatch(whereBlock, /id_usuario_cliente/);
     assert.doesNotMatch(whereBlock, /nombre_usuario/);
+  });
+});
+
+// Bloqueante 1 (auditoria independiente): parseNullablePositiveInt usaba
+// Number.parseInt sin exigir que el valor completo fuera un entero (via
+// isStrictPositiveIntegerString), asi que "1 OR 1=1" o "1;DROP TABLE
+// clientes" se interpretaban como el id 1. Se endurece el helper
+// compartido (10 usos en este router: id_sucursal en query/body,
+// id_cliente e id_estado_canje en listCanjes), todos con el mismo
+// contrato de "identificador entero opcional", asi que no se duplica un
+// parser paralelo especifico solo para id_sucursal.
+
+describe('parseNullablePositiveInt: identificador entero estricto (ejecutable, sin mockear nada)', () => {
+  it("parseNullablePositiveInt('1') devuelve 1", () => {
+    assert.equal(parseNullablePositiveInt('1'), 1);
+  });
+
+  it("parseNullablePositiveInt('001') devuelve 1 (ceros a la izquierda si siguen siendo solo digitos)", () => {
+    assert.equal(parseNullablePositiveInt('001'), 1);
+  });
+
+  it("parseNullablePositiveInt('1 OR 1=1') devuelve null (no se trunca a 1)", () => {
+    assert.equal(parseNullablePositiveInt('1 OR 1=1'), null);
+  });
+
+  it("parseNullablePositiveInt('1;DROP TABLE clientes') devuelve null (no se trunca a 1)", () => {
+    assert.equal(parseNullablePositiveInt('1;DROP TABLE clientes'), null);
+  });
+
+  it("parseNullablePositiveInt('1.5') devuelve null (no se trunca a 1)", () => {
+    assert.equal(parseNullablePositiveInt('1.5'), null);
+  });
+
+  it("parseNullablePositiveInt('-1') devuelve null", () => {
+    assert.equal(parseNullablePositiveInt('-1'), null);
+  });
+
+  it("parseNullablePositiveInt('0') devuelve null", () => {
+    assert.equal(parseNullablePositiveInt('0'), null);
+  });
+
+  it("parseNullablePositiveInt('abc') devuelve null", () => {
+    assert.equal(parseNullablePositiveInt('abc'), null);
+  });
+
+  it('un arreglo no se acepta (id_sucursal[]=1 -> Express/qs entrega [\'1\'], que String() convertiria en "1" si no se rechaza el tipo primero)', () => {
+    assert.equal(parseNullablePositiveInt(['1']), null);
+    assert.equal(parseNullablePositiveInt(['1', '2']), null);
+  });
+
+  it('un objeto no se acepta (id_sucursal[valor]=1 -> Express/qs entrega {valor: "1"})', () => {
+    assert.equal(parseNullablePositiveInt({ valor: '1' }), null);
+  });
+
+  it('valores validos adicionales: "25" -> 25, numero 7 -> 7', () => {
+    assert.equal(parseNullablePositiveInt('25'), 25);
+    assert.equal(parseNullablePositiveInt(7), 7);
+  });
+
+  it('undefined, null y cadena vacia devuelven null (nullable: sin sucursal solicitada)', () => {
+    assert.equal(parseNullablePositiveInt(undefined), null);
+    assert.equal(parseNullablePositiveInt(null), null);
+    assert.equal(parseNullablePositiveInt(''), null);
+  });
+
+  it('espacios internos no se aceptan ("1 2" no es un entero puro)', () => {
+    assert.equal(parseNullablePositiveInt('1 2'), null);
+  });
+
+  it('texto despues del numero no se acepta ("1abc")', () => {
+    assert.equal(parseNullablePositiveInt('1abc'), null);
+  });
+});
+
+describe('listClientes: id_sucursal invalido responde 400 VALIDATION_ERROR antes de tocar PostgreSQL (ejecutable)', () => {
+  // Si listClientes llegara a intentar resolveFidelizacionScope/pool.query,
+  // la promesa no resolveria en este entorno de pruebas (sin Postgres real
+  // alcanzable) dentro del timeout corto: el pool esta configurado con
+  // connectionTimeoutMillis: 15000, muy por encima de los 500ms del race.
+  // Que la promesa resuelva casi instantaneamente es evidencia ejecutable
+  // de que la validacion corto el flujo antes de tocar la base de datos.
+  const withDeadline = async (promise, ms, label) => {
+    let timer;
+    try {
+      return await Promise.race([
+        promise,
+        new Promise((_resolve, reject) => {
+          timer = setTimeout(
+            () => reject(new Error(`Timeout: "${label}" tardo mas de ${ms}ms (sugiere que intento tocar la base de datos en vez de rechazar antes)`)),
+            ms
+          );
+        })
+      ]);
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+
+  const invalidSucursalCases = [
+    ['1 OR 1=1', '1 OR 1=1'],
+    ['1;DROP TABLE clientes', '1;DROP TABLE clientes'],
+    ['1.5', '1.5'],
+    ['-1', '-1'],
+    ['0', '0'],
+    ['abc', 'abc'],
+    ['arreglo id_sucursal[]=1', ['1']],
+    ['objeto id_sucursal[valor]=1', { valor: '1' }]
+  ];
+
+  for (const [label, idSucursal] of invalidSucursalCases) {
+    it(`id_sucursal=${label} -> 400 VALIDATION_ERROR, sin acceder a PostgreSQL`, async () => {
+      const result = await withDeadline(
+        fidelizacionService.listClientes({ query: { id_sucursal: idSucursal } }),
+        500,
+        `listClientes con id_sucursal=${label}`
+      );
+      assert.equal(result.status, 400);
+      assert.equal(result.body?.code, 'VALIDATION_ERROR');
+      assert.match(result.body?.message || '', /id_sucursal debe ser un entero positivo/);
+    });
+  }
+
+  it('id_sucursal=1 (valido) NO se rechaza en esta validacion: el flujo continua hacia resolveFidelizacionScope (no se prueba aqui, requiere DB real)', () => {
+    // Cobertura complementaria estructural: confirma que la condicion de
+    // rechazo esta atada a "parseNullablePositiveInt devuelve null", no a
+    // un valor especifico como '1'.
+    assert.equal(parseNullablePositiveInt('1'), 1);
+  });
+});
+
+describe('routers/fidelizacion.js: parseNullablePositiveInt sigue siendo el unico parser de identificadores enteros opcionales', () => {
+  it('los 10 usos conocidos de parseNullablePositiveInt siguen presentes (id_sucursal en query/body, id_cliente, id_estado_canje)', async () => {
+    const source = await readFile(new URL('../fidelizacion.js', import.meta.url), 'utf8');
+    const usages = [...source.matchAll(/parseNullablePositiveInt\(/g)];
+    // La definicion es "const parseNullablePositiveInt = (value) =>" (no
+    // matchea el regex de llamada), asi que solo cuenta los 10 usos reales.
+    assert.equal(usages.length, 10, 'no debe agregarse ni quitarse ningun uso de parseNullablePositiveInt sin revisar este contrato');
+  });
+
+  it('no se creo un parser paralelo especifico solo para id_sucursal (todas las referencias son al mismo helper)', async () => {
+    const source = await readFile(new URL('../fidelizacion.js', import.meta.url), 'utf8');
+    assert.doesNotMatch(source, /parseStrictSucursalId|parseSucursalIdParam|parseIdSucursalStrict/);
   });
 });

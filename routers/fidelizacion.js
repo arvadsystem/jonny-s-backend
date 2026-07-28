@@ -42,6 +42,11 @@ const isPlainObject = (value) => value !== null && typeof value === 'object' && 
 const STRICT_POSITIVE_INTEGER_PATTERN = /^\d+$/;
 
 const isStrictPositiveIntegerString = (value) => {
+  // Un arreglo de un solo elemento (p.ej. id_sucursal[]=1, que Express/qs
+  // entrega como ['1']) o un objeto (id_sucursal[valor]=1 -> {valor:'1'})
+  // nunca son un identificador valido, pero String(['1']) === '1' pasaria
+  // el regex si no se rechazan explicitamente antes de convertir a texto.
+  if (value !== null && typeof value === 'object') return false;
   if (typeof value === 'number') return Number.isInteger(value) && value > 0;
   return STRICT_POSITIVE_INTEGER_PATTERN.test(String(value ?? '').trim());
 };
@@ -60,8 +65,16 @@ const parseLimitParam = (value, fallback = 20) => {
   return Math.min(parsed, MAX_PAGE_SIZE);
 };
 
+// Usado para todo identificador entero opcional que llega en la peticion
+// (id_sucursal, id_cliente, id_estado_canje; en query o en body): mismo
+// contrato en los 10 puntos donde se usa este helper, por eso se endurece
+// aqui en vez de duplicar un parser paralelo especifico. Number.parseInt
+// (dentro de parsePositiveInt) trunca decimales y se detiene en el primer
+// caracter no numerico ("1 OR 1=1" -> 1), asi que exige primero que el
+// valor completo sean digitos antes de parsearlo.
 const parseNullablePositiveInt = (value) => {
   if (value === undefined || value === null || value === '') return null;
+  if (!isStrictPositiveIntegerString(value)) return null;
   return parsePositiveInt(value);
 };
 
@@ -1837,6 +1850,7 @@ export {
   buildLikeSearch,
   parsePageParam,
   parseLimitParam,
+  parseNullablePositiveInt,
   MAX_SEARCH_LENGTH,
   MAX_PAGE_SIZE,
   DEFAULT_CLIENTES_PAGE_SIZE
