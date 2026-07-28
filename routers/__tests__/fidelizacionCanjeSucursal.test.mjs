@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import { readFile } from 'node:fs/promises';
+import pool from '../../config/db-connection.js';
 import { resolveFidelizacionScope, fidelizacionService } from '../fidelizacion.js';
 
 // Bloqueante confirmado: canjeablesCliente y createCanje resolvian la
@@ -220,7 +221,12 @@ describe('routers/fidelizacion.js: canjeablesCliente y createCanje exigen sucurs
     const handler = source.slice(start, end);
     assert.match(handler, /requireExplicitSucursalForSuperAdmin:\s*true/);
     assert.match(handler, /allowedFields = new Set\(\['id_cliente', 'id_sucursal', 'items', 'observacion'\]\)/);
-    assert.match(handler, /parseNullablePositiveInt\(req\.body\.id_sucursal\)/);
+    // parseStrictPositiveInt (no el parseNullablePositiveInt lenient de
+    // rondas anteriores): id_sucursal/id_cliente de createCanje ahora usan
+    // el parser estricto (bloqueante de integridad de la auditoria
+    // independiente, ver services/fidelizacionService.js).
+    assert.match(handler, /parseStrictPositiveInt\(req\.body\.id_sucursal\)/);
+    assert.match(handler, /parseStrictPositiveInt\(req\.body\.id_cliente\)/);
   });
 
   it('getConfiguracion, listClientes, panel y demas endpoints multisucursal NO pasan requireExplicitSucursalForSuperAdmin (no se les cambio el comportamiento)', async () => {
@@ -271,5 +277,160 @@ describe('routers/fidelizacion.js: canjeablesCliente y getConfiguracionProducts 
     assert.match(handler, /FIDELIZACION_PRODUCTO_SIN_ASIGNACION/);
     assert.match(handler, /FIDELIZACION_PRODUCTO_ASIGNACION_AMBIGUA/);
     assert.doesNotMatch(handler, /LEFT JOIN public\.almacenes a\s*\n\s*ON a\.id_almacen = p\.id_almacen/);
+  });
+});
+
+// Bloqueante de integridad (auditoria independiente): id_cliente,
+// id_producto y puntos_requeridos_override recibidos por el router
+// tambien deben validarse estrictamente, sin confiar solo en la
+// validacion del servicio. Estas pruebas ejecutan los handlers REALES
+// (fidelizacionService.saveConfiguracion / .createCanje) con permisos
+// concedidos via req.__accessContext (cache de request, evita tocar la DB
+// para leer roles/permisos) y demuestran -monkey-parcheando pool.connect
+// para que lance si se le llama- que un payload invalido nunca llega a
+// abrir una conexion/transaccion.
+
+const grantedReq = ({ isSuperAdmin = false, permissions = [], body = {}, params = {} } = {}) => ({
+  user: { id_usuario: 7 },
+  __isSuperAdmin: isSuperAdmin,
+  __accessContext: {
+    idUsuario: 7,
+    isSuperAdmin,
+    roles: new Set(isSuperAdmin ? ['SUPER_ADMIN'] : []),
+    permissions: new Set(permissions.map((permission) => permission.toUpperCase()))
+  },
+  body,
+  params,
+  query: {}
+});
+
+const withPoolConnectNeverCalled = async (fn) => {
+  const original = pool.connect;
+  pool.connect = async () => {
+    throw new Error('pool.connect no debia llamarse: un payload invalido debe rechazarse antes de abrir una conexion/transaccion.');
+  };
+  try {
+    return await fn();
+  } finally {
+    pool.connect = original;
+  }
+};
+
+describe('routers/fidelizacion.js: saveConfiguracion y createCanje rechazan payloads invalidos antes de tocar PostgreSQL (ejecutable, sin mockear el modulo)', () => {
+  it('saveConfiguracion: id_producto="156abc" -> 400 VALIDATION_ERROR sin abrir conexion a PostgreSQL', async () => {
+    await withPoolConnectNeverCalled(async () => {
+      const req = grantedReq({
+        permissions: ['fidelizacion_configurar_reglas', 'fidelizacion_gestionar_productos_canjeables'],
+        body: {
+          id_sucursal: 1,
+          lempiras_por_punto: 10,
+          productos_canjeables: [{ id_producto: '156abc' }]
+        }
+      });
+
+      const result = await fidelizacionService.saveConfiguracion(req);
+      assert.equal(result.status, 400);
+      assert.equal(result.body.code, 'VALIDATION_ERROR');
+    });
+  });
+
+  it('saveConfiguracion: puntos_requeridos_override="5x" -> 400 VALIDATION_ERROR sin abrir conexion a PostgreSQL', async () => {
+    await withPoolConnectNeverCalled(async () => {
+      const req = grantedReq({
+        permissions: ['fidelizacion_configurar_reglas', 'fidelizacion_gestionar_productos_canjeables'],
+        body: {
+          id_sucursal: 1,
+          lempiras_por_punto: 10,
+          productos_canjeables: [{ id_producto: 156, puntos_requeridos_override: '5x' }]
+        }
+      });
+
+      const result = await fidelizacionService.saveConfiguracion(req);
+      assert.equal(result.status, 400);
+      assert.equal(result.body.code, 'VALIDATION_ERROR');
+    });
+  });
+
+  it('createCanje: id_cliente="10x" -> 400 VALIDATION_ERROR sin abrir conexion a PostgreSQL', async () => {
+    await withPoolConnectNeverCalled(async () => {
+      const req = grantedReq({
+        body: { id_cliente: '10x', items: [{ id_producto: 156, cantidad: 1 }] }
+      });
+
+      const result = await fidelizacionService.createCanje(req);
+      assert.equal(result.status, 400);
+      assert.equal(result.body.code, 'VALIDATION_ERROR');
+    });
+  });
+
+  it('createCanje: id_sucursal="1 OR 1=1" -> 400 VALIDATION_ERROR sin abrir conexion a PostgreSQL', async () => {
+    await withPoolConnectNeverCalled(async () => {
+      const req = grantedReq({
+        body: { id_cliente: 10, id_sucursal: '1 OR 1=1', items: [{ id_producto: 156, cantidad: 1 }] }
+      });
+
+      const result = await fidelizacionService.createCanje(req);
+      assert.equal(result.status, 400);
+      assert.equal(result.body.code, 'VALIDATION_ERROR');
+    });
+  });
+});
+
+// Cobertura end-to-end del router completo (createCanje real, con
+// pool.connect() parcheado para devolver un client simulado que resuelve
+// el scope como un usuario local con sucursal operativa 3): confirma que
+// un item invalido en el body llega intacto hasta
+// createPresentialFidelizacionCanje y se rechaza ahi, sin crear el canje,
+// exactamente como en el caso de uso real via Express.
+describe('routers/fidelizacion.js: createCanje end-to-end (pool.connect simulado) rechaza items invalidos sin crear el canje', () => {
+  const normalizeSqlLocal = (sqlRaw) => String(sqlRaw).replace(/\s+/g, ' ').trim();
+
+  const buildCreateCanjeRouterClient = ({ userSucursalId = 3 } = {}) => {
+    const calls = [];
+    return {
+      calls,
+      query: async (sqlRaw, params = []) => {
+        const sql = normalizeSqlLocal(sqlRaw);
+        calls.push({ sql, params });
+        if (sql === 'BEGIN' || sql === 'COMMIT' || sql === 'ROLLBACK') return { rows: [], rowCount: 0 };
+        if (sql.includes('FROM public.usuarios u') && sql.includes('LEFT JOIN public.empleados e')) {
+          return { rows: [{ id_sucursal: userSucursalId }], rowCount: 1 };
+        }
+        if (sql.includes('FROM public.v_usuarios_sucursales_scope')) {
+          return { rows: [{ id_sucursal: userSucursalId, es_principal: true }], rowCount: 1 };
+        }
+        // Nada mas deberia ejecutarse: un item invalido debe rechazarse
+        // dentro de createPresentialFidelizacionCanje (aggregateCanjeItems)
+        // antes de fetchClienteEstado/getClienteSaldoForUpdate/etc.
+        throw new Error(`Consulta inesperada (el item invalido debia rechazarse antes de esto): ${sql}`);
+      },
+      release: () => {}
+    };
+  };
+
+  it('cantidad="2 OR 1=1" en items[] se rechaza (FIDELIZACION_CANJE_ITEM_INVALID) sin crear el canje, via el router completo', async () => {
+    const client = buildCreateCanjeRouterClient();
+    const original = pool.connect;
+    pool.connect = async () => client;
+
+    try {
+      const req = grantedReq({
+        body: { id_cliente: 10, items: [{ id_producto: 156, cantidad: '2 OR 1=1' }] }
+      });
+
+      await assert.rejects(
+        fidelizacionService.createCanje(req),
+        (error) => {
+          assert.equal(error.code, 'FIDELIZACION_CANJE_ITEM_INVALID');
+          assert.equal(error.httpStatus, 400);
+          return true;
+        }
+      );
+
+      assert.ok(!client.calls.some((call) => call.sql.startsWith('INSERT INTO public.fidelizacion_canjes (')));
+      assert.ok(client.calls.some((call) => call.sql === 'ROLLBACK'), 'el router debe hacer ROLLBACK ante el rechazo');
+    } finally {
+      pool.connect = original;
+    }
   });
 });

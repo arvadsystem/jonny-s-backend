@@ -3,7 +3,8 @@ import { describe, it } from 'node:test';
 import { readFile } from 'node:fs/promises';
 import {
   resolveFidelizacionProductAssignments,
-  createPresentialFidelizacionCanje
+  createPresentialFidelizacionCanje,
+  parseStrictPositiveInt
 } from '../fidelizacionService.js';
 
 // Defecto confirmado: Fidelizacion resolvia la sucursal de un producto
@@ -173,33 +174,54 @@ describe('resolveFidelizacionProductAssignments (helper centralizado producto ma
     assert.equal(client.calls.length, 0);
   });
 
-  it('consultas siempre parametrizadas: un id_sucursal con texto extra viaja como parametro entero, nunca concatenado en el SQL', async () => {
-    // parsePositiveInt (el mismo parser usado en todo el router) reduce
-    // "1; DROP TABLE ..." a su parte entera (1) antes de construir la
-    // consulta -- eso no es una brecha de SQL injection porque el valor
-    // JAMAS se concatena en el texto SQL, solo viaja en el arreglo de
-    // parametros ($1). Esta prueba demuestra justamente eso: el payload
-    // completo desaparece, el SQL sigue siendo el mismo texto fijo, y el
-    // parametro es el entero 1, no la cadena maliciosa.
+  it('un id_sucursal con texto extra ("1; DROP TABLE ...") se rechaza por completo: NUNCA se trunca a 1 ni ejecuta ninguna consulta', async () => {
+    // parseStrictPositiveInt (services/fidelizacionService.js) exige que
+    // TODO el valor sean digitos antes de aceptarlo. A diferencia del
+    // parser lenient anterior (que truncaba "1; DROP TABLE ..." a 1),
+    // este payload se rechaza de raiz: idSucursal queda null y la funcion
+    // retorna un Map vacio sin tocar la base de datos. Sigue sin ser una
+    // brecha de SQL injection (las consultas parametrizadas ya lo evitaban),
+    // pero ahora tampoco es una entrada invalida convertida en una
+    // operacion valida distinta.
     const maliciousSucursal = '1; DROP TABLE productos_almacenes; --';
+    const client = buildAssignmentClient([{ rows: [] }]);
+    const result = await resolveFidelizacionProductAssignments({ client, idSucursal: maliciousSucursal, productIds: [1] });
+
+    assert.equal(result.size, 0);
+    assert.equal(client.calls.length, 0, 'un id_sucursal invalido nunca debe generar una consulta, ni siquiera parametrizada');
+  });
+
+  it('un producto valido sigue viajando parametrizado (ningun payload se concatena en el texto SQL)', async () => {
     const client = buildAssignmentClient([
       { rows: [{ id_producto: 1, total_asignaciones: 1 }] },
       { rows: [{ id_producto: 1, nombre_producto: 'X', descripcion_producto: '', precio: 1, id_archivo_imagen_principal: null, id_almacen: 1, cantidad: 1, stock_minimo: 0, id_sucursal: 1, nombre_almacen: 'A' }] }
     ]);
-    await resolveFidelizacionProductAssignments({ client, idSucursal: maliciousSucursal, productIds: [1] });
+    await resolveFidelizacionProductAssignments({ client, idSucursal: 1, productIds: [1] });
 
     for (const call of client.calls) {
       assert.match(call.sql, /\$1/);
-      assert.doesNotMatch(call.sql, /DROP TABLE/);
     }
     assert.deepEqual(client.calls[0].params, [1, [1]]);
     assert.match(client.calls[0].sql, /\$2::int\[\]/);
   });
 
-  it('productIds con valores no numericos o duplicados se limpian antes de parametrizar (sin agregacion silenciosa incorrecta)', async () => {
+  it('1.5 en productIds se descarta (NUNCA se trunca a 1): probado en aislamiento, sin un "1" literal que enmascare el resultado', async () => {
+    // Bloqueante de integridad: con el parser lenient anterior, 1.5 se
+    // truncaba a 1 (Number.parseInt("1.5",10) === 1). parseStrictPositiveInt
+    // exige "^\d+$" completo, asi que 1.5 se descarta directamente. Se
+    // prueba con 1.5 como UNICO id (sin ningun "1" entero real en la
+    // lista) para que la aserción realmente dependa del rechazo estricto,
+    // no de una coincidencia con otro id valido ya presente.
+    const client = buildAssignmentClient([]);
+    const result = await resolveFidelizacionProductAssignments({ client, idSucursal: 3, productIds: [1.5] });
+    assert.equal(result.size, 0);
+    assert.equal(client.calls.length, 0, 'sin ids validos, no debe ejecutarse ninguna consulta');
+  });
+
+  it('productIds con valores no numericos, negativos, cero o duplicados se limpian antes de parametrizar (sin agregacion silenciosa incorrecta)', async () => {
     const client = buildAssignmentClient([{ rows: [{ id_producto: 1, total_asignaciones: 1 }] }]);
-    await resolveFidelizacionProductAssignments({ client, idSucursal: 3, productIds: [1, 1, 'abc', -5, 0, 1.5] });
-    assert.deepEqual(client.calls[0].params, [3, [1]]);
+    await resolveFidelizacionProductAssignments({ client, idSucursal: 3, productIds: [1, 1, 'abc', -5, 0, 1.5, '2 OR 1=1'] });
+    assert.deepEqual(client.calls[0].params, [3, [1]], 'solo el entero valido (1, deduplicado) debe llegar al arreglo de parametros');
   });
 
   it('sin idSucursal o sin productIds devuelve un Map vacio sin consultar la base de datos', async () => {
@@ -209,6 +231,106 @@ describe('resolveFidelizacionProductAssignments (helper centralizado producto ma
     assert.equal(r1.size, 0);
     assert.equal(r2.size, 0);
     assert.equal(client.calls.length, 0);
+  });
+});
+
+// Riesgo de concurrencia confirmado: entre el COUNT(*) GROUP BY (deteccion
+// de ambiguedad) y el SELECT ... FOR UPDATE OF pa (fetch con lock), otra
+// transaccion puede crear/activar una segunda asignacion. La version
+// anterior escribia cada fila del SELECT directamente en resultMap: si
+// llegaban 2 filas para el mismo producto, la ULTIMA en el bucle
+// sobrescribia a la primera y el producto terminaba como 'OK' con un
+// almacen elegido por el orden accidental de PostgreSQL. Estas pruebas
+// demuestran que la decision final se basa en las filas REALMENTE
+// bloqueadas (agrupadas por id_producto), nunca en el COUNT previo ni en
+// "la ultima fila gana".
+describe('resolveFidelizacionProductAssignments: la decision final se basa en las filas bloqueadas, no en el COUNT previo ni en el orden de llegada', () => {
+  it('COUNT=1 pero el SELECT bloqueado devuelve 2 filas para el mismo producto -> AMBIGUA (nunca "la ultima fila gana")', async () => {
+    const client = buildAssignmentClient([
+      { rows: [{ id_producto: 156, total_asignaciones: 1 }] },
+      {
+        rows: [
+          { id_producto: 156, nombre_producto: 'X', descripcion_producto: '', precio: 10, id_archivo_imagen_principal: null, id_almacen: 1, cantidad: 100, stock_minimo: 0, id_sucursal: 1, nombre_almacen: 'Almacen A' },
+          { id_producto: 156, nombre_producto: 'X', descripcion_producto: '', precio: 10, id_archivo_imagen_principal: null, id_almacen: 2, cantidad: 5, stock_minimo: 0, id_sucursal: 1, nombre_almacen: 'Almacen B' }
+        ]
+      }
+    ]);
+
+    const result = await resolveFidelizacionProductAssignments({ client, idSucursal: 1, productIds: [156], lockForUpdate: true });
+    const row = result.get(156);
+
+    assert.equal(row.status, 'AMBIGUA');
+    // Explicitamente NO debe quedar como 'OK' con los datos de la segunda
+    // fila (que es lo que pasaria si el bucle solo sobrescribiera resultMap
+    // fila por fila sin agrupar antes).
+    assert.notEqual(row.id_almacen, 2);
+    assert.equal(row.id_almacen, undefined, 'un resultado AMBIGUA no debe traer id_almacen de ninguna de las dos filas');
+  });
+
+  it('COUNT=1 pero el SELECT bloqueado devuelve 0 filas para ese producto -> SIN_ASIGNACION (la asignacion se desactivo entre las dos consultas)', async () => {
+    const client = buildAssignmentClient([
+      { rows: [{ id_producto: 156, total_asignaciones: 1 }] },
+      { rows: [] }
+    ]);
+
+    const result = await resolveFidelizacionProductAssignments({ client, idSucursal: 1, productIds: [156], lockForUpdate: true });
+    assert.deepEqual(result.get(156), { id_producto: 156, status: 'SIN_ASIGNACION' });
+  });
+
+  it('COUNT=1 y el SELECT bloqueado devuelve exactamente 1 fila -> OK con los datos de esa fila', async () => {
+    const client = buildAssignmentClient([
+      { rows: [{ id_producto: 156, total_asignaciones: 1 }] },
+      { rows: [{ id_producto: 156, nombre_producto: 'X', descripcion_producto: '', precio: 10, id_archivo_imagen_principal: null, id_almacen: 7, cantidad: 50, stock_minimo: 5, id_sucursal: 1, nombre_almacen: 'Almacen C' }] }
+    ]);
+
+    const result = await resolveFidelizacionProductAssignments({ client, idSucursal: 1, productIds: [156], lockForUpdate: true });
+    const row = result.get(156);
+    assert.equal(row.status, 'OK');
+    assert.equal(row.id_almacen, 7);
+    assert.equal(row.stock_disponible, 45);
+  });
+
+  it('con multiples productos, cada uno se agrupa y resuelve de forma independiente (uno OK, otro AMBIGUA en la misma respuesta)', async () => {
+    const client = buildAssignmentClient([
+      { rows: [{ id_producto: 1, total_asignaciones: 1 }, { id_producto: 2, total_asignaciones: 1 }] },
+      {
+        rows: [
+          { id_producto: 1, nombre_producto: 'A', descripcion_producto: '', precio: 1, id_archivo_imagen_principal: null, id_almacen: 1, cantidad: 10, stock_minimo: 0, id_sucursal: 1, nombre_almacen: 'A' },
+          { id_producto: 2, nombre_producto: 'B', descripcion_producto: '', precio: 2, id_archivo_imagen_principal: null, id_almacen: 5, cantidad: 20, stock_minimo: 0, id_sucursal: 1, nombre_almacen: 'B1' },
+          { id_producto: 2, nombre_producto: 'B', descripcion_producto: '', precio: 2, id_archivo_imagen_principal: null, id_almacen: 6, cantidad: 3, stock_minimo: 0, id_sucursal: 1, nombre_almacen: 'B2' }
+        ]
+      }
+    ]);
+
+    const result = await resolveFidelizacionProductAssignments({ client, idSucursal: 1, productIds: [1, 2], lockForUpdate: true });
+    assert.equal(result.get(1).status, 'OK');
+    assert.equal(result.get(1).id_almacen, 1);
+    assert.equal(result.get(2).status, 'AMBIGUA');
+  });
+
+  it('la consulta con lock incluye ORDER BY pa.id_producto ASC, pa.id_almacen ASC ANTES de FOR UPDATE OF pa', async () => {
+    const client = buildAssignmentClient([
+      { rows: [{ id_producto: 1, total_asignaciones: 1 }] },
+      { rows: [{ id_producto: 1, nombre_producto: 'X', descripcion_producto: '', precio: 1, id_archivo_imagen_principal: null, id_almacen: 1, cantidad: 1, stock_minimo: 0, id_sucursal: 1, nombre_almacen: 'A' }] }
+    ]);
+
+    await resolveFidelizacionProductAssignments({ client, idSucursal: 1, productIds: [1], lockForUpdate: true });
+
+    const lockSql = client.calls[1].sql;
+    assert.match(lockSql, /ORDER BY pa\.id_producto ASC, pa\.id_almacen ASC\s+FOR UPDATE OF pa/, 'el ORDER BY determinista debe preceder a FOR UPDATE OF pa (reduce el riesgo de deadlock)');
+  });
+
+  it('sin lockForUpdate (listados de solo lectura) el ORDER BY se conserva pero no se agrega FOR UPDATE', async () => {
+    const client = buildAssignmentClient([
+      { rows: [{ id_producto: 1, total_asignaciones: 1 }] },
+      { rows: [{ id_producto: 1, nombre_producto: 'X', descripcion_producto: '', precio: 1, id_archivo_imagen_principal: null, id_almacen: 1, cantidad: 1, stock_minimo: 0, id_sucursal: 1, nombre_almacen: 'A' }] }
+    ]);
+
+    await resolveFidelizacionProductAssignments({ client, idSucursal: 1, productIds: [1], lockForUpdate: false });
+
+    const dataSql = client.calls[1].sql;
+    assert.match(dataSql, /ORDER BY pa\.id_producto ASC, pa\.id_almacen ASC/);
+    assert.doesNotMatch(dataSql, /FOR UPDATE/);
   });
 });
 
@@ -648,5 +770,202 @@ describe('routers/fidelizacion.js: createCanje hace ROLLBACK ante cualquier erro
     assert.match(catchBlock, /await client\.query\('ROLLBACK'\);/);
     assert.match(catchBlock, /throw error;/);
     assert.match(handler, /client\.release\(\);/);
+  });
+});
+
+// Bloqueante de integridad confirmado por la auditoria independiente:
+// parsePositiveInt (Number.parseInt) trunca/detiene en el primer caracter
+// no numerico -- "156abc" -> 156, "1.5" -> 1, "2 OR 1=1" -> 2 -- por lo que
+// una entrada invalida se convertia en silencio en una operacion valida
+// distinta (otro id_producto, otra cantidad). No es una brecha de SQL
+// injection (las consultas ya estaban parametrizadas), pero si un problema
+// de integridad. parseStrictPositiveInt exige que TODO el valor sea un
+// entero positivo puro.
+describe('parseStrictPositiveInt: entero positivo estricto (Number.isSafeInteger, no solo Number.isInteger)', () => {
+  it('acepta enteros y cadenas puramente numericas, incluyendo ceros a la izquierda', () => {
+    assert.equal(parseStrictPositiveInt(1), 1);
+    assert.equal(parseStrictPositiveInt('1'), 1);
+    assert.equal(parseStrictPositiveInt('001'), 1);
+  });
+
+  it('rechaza cero, negativos y decimales (numero o cadena)', () => {
+    assert.equal(parseStrictPositiveInt(0), null);
+    assert.equal(parseStrictPositiveInt('0'), null);
+    assert.equal(parseStrictPositiveInt(-1), null);
+    assert.equal(parseStrictPositiveInt('-1'), null);
+    assert.equal(parseStrictPositiveInt(1.5), null);
+    assert.equal(parseStrictPositiveInt('1.5'), null);
+  });
+
+  it('rechaza texto parcialmente numerico y fragmentos tipo SQL: nunca se trunca al prefijo numerico', () => {
+    assert.equal(parseStrictPositiveInt('156abc'), null);
+    assert.equal(parseStrictPositiveInt('2 OR 1=1'), null);
+    assert.equal(parseStrictPositiveInt('2;DROP TABLE clientes'), null);
+    assert.equal(parseStrictPositiveInt('5x'), null);
+  });
+
+  it('rechaza arreglos y objetos explicitamente (String(["1"]) === "1" no debe colar)', () => {
+    assert.equal(parseStrictPositiveInt(['1']), null);
+    assert.equal(parseStrictPositiveInt({}), null);
+    assert.equal(parseStrictPositiveInt({ value: 1 }), null);
+  });
+
+  it('rechaza NaN, Infinity y null cuando el campo es obligatorio', () => {
+    assert.equal(parseStrictPositiveInt(NaN), null);
+    assert.equal(parseStrictPositiveInt(Infinity), null);
+    assert.equal(parseStrictPositiveInt(null), null);
+    assert.equal(parseStrictPositiveInt(undefined), null);
+  });
+
+  it('usa Number.isSafeInteger: un entero mas alla de 2^53-1 se rechaza aunque solo tenga digitos', () => {
+    assert.equal(parseStrictPositiveInt(Number.MAX_SAFE_INTEGER), Number.MAX_SAFE_INTEGER);
+    assert.equal(parseStrictPositiveInt(String(Number.MAX_SAFE_INTEGER)), Number.MAX_SAFE_INTEGER);
+    // MAX_SAFE_INTEGER + 2 como cadena de puros digitos: Number.isInteger()
+    // seguiria devolviendo true (float64 sin parte fraccionaria), pero
+    // Number.isSafeInteger() no. Esta es la diferencia que exige el
+    // contrato del helper (no basta con Number.isInteger).
+    assert.equal(parseStrictPositiveInt(String(Number.MAX_SAFE_INTEGER + 2)), null);
+  });
+});
+
+// 9.4: createPresentialFidelizacionCanje debe rechazar items invalidos por
+// si sola, sin pasar por el router -- defensa en profundidad real, no solo
+// aserciones sobre routers/fidelizacion.js. Un client cuyo query() lanza si
+// se le llama demuestra que la validacion ocurre ANTES de cualquier
+// consulta (aggregateCanjeItems se ejecuta antes de fetchClienteEstado, el
+// primer client.query real de la funcion).
+describe('createPresentialFidelizacionCanje: articulos invalidos se rechazan antes de cualquier consulta (defensa del servicio, sin router)', () => {
+  const clientQueNuncaDebeLlamarse = () => ({
+    query: async (sqlRaw) => {
+      throw new Error(`No debia ejecutarse ninguna consulta con items invalidos: ${normalizeSql(sqlRaw)}`);
+    }
+  });
+
+  const invalidItemCases = [
+    ['id_producto="156.9"', [{ id_producto: '156.9', cantidad: 1 }]],
+    ['cantidad="2.9"', [{ id_producto: 156, cantidad: '2.9' }]],
+    ['cantidad="2 OR 1=1"', [{ id_producto: 156, cantidad: '2 OR 1=1' }]],
+    ['cantidad=["2"]', [{ id_producto: 156, cantidad: ['2'] }]],
+    ['cantidad={}', [{ id_producto: 156, cantidad: {} }]],
+    ['cantidad=0', [{ id_producto: 156, cantidad: 0 }]],
+    ['cantidad=-1', [{ id_producto: 156, cantidad: -1 }]],
+    ['id_producto=["156"]', [{ id_producto: ['156'], cantidad: 1 }]],
+    ['id_producto={}', [{ id_producto: {}, cantidad: 1 }]]
+  ];
+
+  for (const [label, items] of invalidItemCases) {
+    it(`${label} se rechaza con FIDELIZACION_CANJE_ITEM_INVALID antes de tocar el client`, async () => {
+      await assert.rejects(
+        createPresentialFidelizacionCanje({
+          client: clientQueNuncaDebeLlamarse(),
+          req: {},
+          idCliente: 10,
+          idSucursal: 1,
+          idUsuarioEjecutor: 5,
+          items
+        }),
+        (error) => {
+          assert.equal(error.code, 'FIDELIZACION_CANJE_ITEM_INVALID');
+          assert.equal(error.httpStatus, 400);
+          return true;
+        }
+      );
+    });
+  }
+
+  it('la suma agregada de un producto duplicado que desborda Number.MAX_SAFE_INTEGER se rechaza (no continua con un total incorrecto)', async () => {
+    const unsafeChunk = Number.MAX_SAFE_INTEGER - 1;
+    await assert.rejects(
+      createPresentialFidelizacionCanje({
+        client: clientQueNuncaDebeLlamarse(),
+        req: {},
+        idCliente: 10,
+        idSucursal: 1,
+        idUsuarioEjecutor: 5,
+        items: [
+          { id_producto: 156, cantidad: unsafeChunk },
+          { id_producto: 156, cantidad: unsafeChunk }
+        ]
+      }),
+      (error) => {
+        assert.equal(error.code, 'FIDELIZACION_CANJE_ITEM_INVALID');
+        return true;
+      }
+    );
+  });
+
+  it('articulos duplicados validos si se agregan correctamente (id_producto=156 x2 -> cantidad=3)', async () => {
+    const fixture = buildCanjeFixture({
+      canjeables: new Map([[156, { puntos_requeridos_override: 1, canjeable_estado: true }]]),
+      assignments: new Map([[156, baseAssignment({ cantidad: 100, stock_minimo: 0 })]])
+    });
+
+    const result = await createPresentialFidelizacionCanje({
+      client: fixture,
+      req: {},
+      idCliente: 10,
+      idSucursal: 1,
+      idUsuarioEjecutor: 5,
+      items: [
+        { id_producto: 156, cantidad: 1 },
+        { id_producto: 156, cantidad: 2 }
+      ]
+    });
+
+    assert.equal(result.items[0].cantidad, 3);
+  });
+});
+
+// 9.6: cuando el resultado final de la resolucion es AMBIGUA o
+// SIN_ASIGNACION, no debe quedar ningun efecto parcial: ni canje, ni
+// detalle, ni descuento de puntos, ni movimiento de inventario.
+describe('createPresentialFidelizacionCanje: sin efectos parciales cuando la asignacion es ambigua o no existe', () => {
+  const assertNoEffects = (fixture) => {
+    assert.ok(!fixture.calls.some((call) => call.sql.startsWith('INSERT INTO public.fidelizacion_canjes (')), 'no debe crearse el canje');
+    assert.ok(!fixture.calls.some((call) => call.sql.startsWith('INSERT INTO public.fidelizacion_canjes_detalle')), 'no debe crearse ningun detalle');
+    assert.ok(!fixture.calls.some((call) => call.sql.startsWith('UPDATE public.fidelizacion_saldos_cliente')), 'no debe descontarse ningun punto');
+    assert.ok(!fixture.calls.some((call) => call.sql.startsWith('INSERT INTO public.movimientos_inventario')), 'no debe insertarse ningun movimiento de inventario');
+  };
+
+  it('AMBIGUA: no se crea canje, detalle, descuento de puntos ni movimiento de inventario', async () => {
+    const fixture = buildCanjeFixture({
+      canjeables: new Map([[156, { puntos_requeridos_override: 5, canjeable_estado: true }]]),
+      assignments: new Map([[156, baseAssignment({ total_asignaciones: 2 })]])
+    });
+
+    await assert.rejects(
+      createPresentialFidelizacionCanje({
+        client: fixture,
+        req: {},
+        idCliente: 10,
+        idSucursal: 1,
+        idUsuarioEjecutor: 5,
+        items: [{ id_producto: 156, cantidad: 1 }]
+      }),
+      { code: 'FIDELIZACION_PRODUCTO_ASIGNACION_AMBIGUA' }
+    );
+
+    assertNoEffects(fixture);
+  });
+
+  it('SIN_ASIGNACION: no se crea canje, detalle, descuento de puntos ni movimiento de inventario', async () => {
+    const fixture = buildCanjeFixture({
+      canjeables: new Map([[156, { puntos_requeridos_override: 5, canjeable_estado: true }]]),
+      assignments: new Map()
+    });
+
+    await assert.rejects(
+      createPresentialFidelizacionCanje({
+        client: fixture,
+        req: {},
+        idCliente: 10,
+        idSucursal: 1,
+        idUsuarioEjecutor: 5,
+        items: [{ id_producto: 156, cantidad: 1 }]
+      }),
+      { code: 'FIDELIZACION_PRODUCTO_SIN_ASIGNACION' }
+    );
+
+    assertNoEffects(fixture);
   });
 });

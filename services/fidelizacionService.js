@@ -55,6 +55,35 @@ const parsePositiveInt = (value) => {
   return Number.isInteger(parsed) && parsed > 0 ? parsed : null;
 };
 
+// parsePositiveInt (arriba) usa Number.parseInt, que trunca y se detiene en
+// el primer caracter no numerico: "156abc" -> 156, "1.5" -> 1, "2 OR 1=1" -> 2.
+// Eso no es una brecha de SQL injection (todo sigue parametrizado), pero es
+// un problema de integridad: una entrada invalida se convierte en silencio
+// en una operacion valida distinta (otro id_producto, otra cantidad). Este
+// parser estricto exige que TODO el valor sea un entero positivo puro antes
+// de aceptarlo -- usado para id_cliente, id_sucursal, id_producto, cantidad
+// y puntos_requeridos_override en el flujo de canje (bloqueante de
+// integridad de la auditoria independiente). No reemplaza parsePositiveInt
+// globalmente (evita auditar/romper sus otros usos existentes en este
+// archivo); es un helper nuevo y separado.
+const parseStrictPositiveInt = (value) => {
+  // Rechaza arreglos y objetos explicitamente: String(['1']) === '1' pasaria
+  // el regex de abajo si no se filtra el tipo primero (p.ej. id_producto[]=1).
+  if (value !== null && typeof value === 'object') return null;
+
+  if (typeof value === 'number') {
+    return Number.isInteger(value) && value > 0 ? value : null;
+  }
+
+  const normalized = String(value ?? '').trim();
+  if (!/^\d+$/.test(normalized)) return null;
+
+  const parsed = Number(normalized);
+  // Number.isSafeInteger (no solo Number.isInteger): un id fuera del rango
+  // seguro de JS (> 2^53-1) no debe aceptarse como entero valido.
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : null;
+};
+
 const parseNonNegativeInt = (value) => {
   const parsed = Number.parseInt(String(value ?? ''), 10);
   return Number.isInteger(parsed) && parsed >= 0 ? parsed : null;
@@ -655,10 +684,13 @@ export const resolveFidelizacionProductAssignments = async ({
   productIds,
   lockForUpdate = false
 }) => {
-  const sucursalId = parsePositiveInt(idSucursal);
+  // Defensa en profundidad: esta funcion se puede llamar directamente
+  // (pruebas, otros servicios) sin pasar por la validacion del router, asi
+  // que valida con el parser estricto en vez de confiar solo en el caller.
+  const sucursalId = parseStrictPositiveInt(idSucursal);
   const uniqueIds = [...new Set(
     (Array.isArray(productIds) ? productIds : [])
-      .map((id) => parsePositiveInt(id))
+      .map((id) => parseStrictPositiveInt(id))
       .filter((id) => id !== null)
   )];
 
@@ -699,6 +731,9 @@ export const resolveFidelizacionProductAssignments = async ({
   }
 
   if (lockableIds.length > 0) {
+    // ORDER BY antes de FOR UPDATE: bloqueo en un orden deterministico
+    // (id_producto, id_almacen) para reducir el riesgo de deadlock cuando
+    // dos transacciones bloquean varios productos en distinto orden.
     const dataResult = await client.query(
       `
         SELECT
@@ -722,13 +757,46 @@ export const resolveFidelizacionProductAssignments = async ({
          AND COALESCE(p.estado, true) = true
         WHERE pa.id_producto = ANY($2::int[])
           AND COALESCE(pa.estado, true) = true
+        ORDER BY pa.id_producto ASC, pa.id_almacen ASC
         ${lockForUpdate ? 'FOR UPDATE OF pa' : ''}
       `,
       [sucursalId, lockableIds]
     );
 
+    // No se escribe cada fila directamente en resultMap: entre el COUNT de
+    // arriba y este SELECT con lock, otra transaccion pudo crear/activar
+    // una segunda asignacion (COUNT=1 ya no refleja la realidad bloqueada).
+    // Se agrupan las filas REALMENTE bloqueadas por id_producto y la
+    // decision final (OK/AMBIGUA/SIN_ASIGNACION) se basa en esa
+    // agrupacion, nunca en el conteo previo ni en el orden accidental de
+    // llegada de las filas.
+    const lockedRowsByProduct = new Map();
     for (const row of dataResult.rows) {
       const idProducto = Number(row.id_producto);
+      const rows = lockedRowsByProduct.get(idProducto) || [];
+      rows.push(row);
+      lockedRowsByProduct.set(idProducto, rows);
+    }
+
+    for (const idProducto of lockableIds) {
+      const rows = lockedRowsByProduct.get(idProducto) || [];
+
+      if (rows.length === 0) {
+        // La unica asignacion detectada por el COUNT se desactivo/elimino
+        // entre las dos consultas.
+        resultMap.set(idProducto, { id_producto: idProducto, status: 'SIN_ASIGNACION' });
+        continue;
+      }
+
+      if (rows.length > 1) {
+        // Aparecio una segunda asignacion activa despues del COUNT: se
+        // rechaza como ambigua, nunca se elige una fila arbitrariamente
+        // (ni LIMIT 1, ni MIN(id_almacen), ni la ultima en llegar).
+        resultMap.set(idProducto, { id_producto: idProducto, status: 'AMBIGUA' });
+        continue;
+      }
+
+      const [row] = rows;
       const cantidad = Number(row.cantidad || 0);
       const stockMinimo = Number(row.stock_minimo || 0);
       resultMap.set(idProducto, {
@@ -754,7 +822,7 @@ export const resolveFidelizacionProductAssignments = async ({
 const fetchCanjeProductRowsForUpdate = async (client, idSucursal, productIds) => {
   const uniqueIds = [...new Set(
     (Array.isArray(productIds) ? productIds : [])
-      .map((id) => parsePositiveInt(id))
+      .map((id) => parseStrictPositiveInt(id))
       .filter((id) => id !== null)
   )];
   if (uniqueIds.length === 0) return [];
@@ -850,8 +918,11 @@ const aggregateCanjeItems = (items) => {
       );
     }
 
-    const idProducto = parsePositiveInt(item.id_producto);
-    const cantidad = parsePositiveInt(item.cantidad);
+    // Cada id_producto y cantidad individual debe superar la validacion
+    // estricta ANTES de agregarse: "156abc", "2.9", "2 OR 1=1", arreglos u
+    // objetos se rechazan aqui, nunca se truncan a un id/cantidad distinta.
+    const idProducto = parseStrictPositiveInt(item.id_producto);
+    const cantidad = parseStrictPositiveInt(item.cantidad);
 
     if (!idProducto || !cantidad) {
       throw createFidelizacionError(
@@ -862,7 +933,18 @@ const aggregateCanjeItems = (items) => {
     }
 
     const current = byProduct.get(idProducto) || { id_producto: idProducto, cantidad: 0 };
-    current.cantidad += cantidad;
+    const nextCantidad = current.cantidad + cantidad;
+    // La suma acumulada (articulos duplicados agregados) tambien debe
+    // seguir siendo un entero seguro y positivo: un overflow se rechaza en
+    // vez de continuar con un total incorrecto.
+    if (!Number.isSafeInteger(nextCantidad) || nextCantidad <= 0) {
+      throw createFidelizacionError(
+        400,
+        'FIDELIZACION_CANJE_ITEM_INVALID',
+        'La cantidad total solicitada para un producto no es valida.'
+      );
+    }
+    current.cantidad = nextCantidad;
     byProduct.set(idProducto, current);
   }
 
@@ -1131,6 +1213,7 @@ export const createPresentialFidelizacionCanje = async ({
 export {
   normalizeText,
   parsePositiveInt,
+  parseStrictPositiveInt,
   parseNonNegativeInt,
   parsePositiveNumber,
   resolveEffectiveLempirasPorPunto,

@@ -21,6 +21,7 @@ import {
   parseNonNegativeInt,
   parsePositiveInt,
   parsePositiveNumber,
+  parseStrictPositiveInt,
   resolveEffectiveAcumulacionHabilitada,
   resolveEffectiveLempirasPorPunto,
   resolveFidelizacionProductAssignments
@@ -890,7 +891,7 @@ const fidelizacionService = {
   async canjeablesCliente(req) {
     await assertAllPermissions(req, ['fidelizacion_ver_clientes', 'fidelizacion_canjear_presencial']);
 
-    const idCliente = parsePositiveInt(req.params.id_cliente);
+    const idCliente = parseStrictPositiveInt(req.params.id_cliente);
     if (!idCliente) {
       return {
         status: 400,
@@ -1179,7 +1180,7 @@ const fidelizacionService = {
       };
     }
 
-    const requestedSucursalId = parseNullablePositiveInt(req.body.id_sucursal);
+    const requestedSucursalId = parseStrictPositiveInt(req.body.id_sucursal);
     if (req.body.id_sucursal !== undefined && !requestedSucursalId) {
       return {
         status: 400,
@@ -1223,7 +1224,7 @@ const fidelizacionService = {
         };
       }
 
-      const idProducto = parsePositiveInt(item.id_producto);
+      const idProducto = parseStrictPositiveInt(item.id_producto);
       if (!idProducto) {
         return {
           status: 400,
@@ -1236,7 +1237,7 @@ const fidelizacionService = {
 
       let puntosOverride = null;
       if (item.puntos_requeridos_override !== undefined && item.puntos_requeridos_override !== null && item.puntos_requeridos_override !== '') {
-        puntosOverride = parsePositiveInt(item.puntos_requeridos_override);
+        puntosOverride = parseStrictPositiveInt(item.puntos_requeridos_override);
         if (!puntosOverride) {
           return {
             status: 400,
@@ -1522,7 +1523,7 @@ const fidelizacionService = {
       };
     }
 
-    const idCliente = parsePositiveInt(req.body.id_cliente);
+    const idCliente = parseStrictPositiveInt(req.body.id_cliente);
     if (!idCliente) {
       return {
         status: 400,
@@ -1533,7 +1534,7 @@ const fidelizacionService = {
       };
     }
 
-    const requestedSucursalId = parseNullablePositiveInt(req.body.id_sucursal);
+    const requestedSucursalId = parseStrictPositiveInt(req.body.id_sucursal);
     if (req.body.id_sucursal !== undefined && !requestedSucursalId) {
       return {
         status: 400,
