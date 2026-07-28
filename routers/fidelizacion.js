@@ -17,11 +17,13 @@ import {
   createPresentialFidelizacionCanje,
   getActiveFidelizacionConfig,
   insertFidelizacionAuditLog,
+  isExplicitRateConfirmation,
   normalizeText,
   parseNonNegativeInt,
   parsePositiveInt,
   parsePositiveNumber,
   parseStrictPositiveInt,
+  requiresRateConfirmation,
   resolveEffectiveAcumulacionHabilitada,
   resolveEffectiveLempirasPorPunto,
   resolveFidelizacionProductAssignments,
@@ -1127,6 +1129,7 @@ const fidelizacionService = {
       'id_sucursal',
       'lempiras_por_punto',
       'acumulacion_habilitada',
+      'confirmar_equivalencia',
       'productos',
       'productos_canjeables'
     ]);
@@ -1346,6 +1349,36 @@ const fidelizacionService = {
         );
       }
       const lempirasPorPunto = lempirasResolution.value;
+
+      // Confirmacion explicita de la equivalencia de la tasa.
+      //
+      // lempiras_por_punto = lempiras necesarios para ganar 1 punto
+      // (puntos = floor(total / tasa)). El campo resulto ambiguo en QA: se
+      // guardo 0.01 creyendo que era "puntos por lempira" y una compra de
+      // L 1,130.00 acumulo 113,000 puntos. La formula no cambia; lo que se
+      // agrega es una barrera consciente cuando la tasa se define por primera
+      // vez o cambia de valor.
+      //
+      // El backend NO confia en la interfaz: aunque el modal ya obliga a
+      // marcar la casilla, aqui se vuelve a exigir. Se compara la tasa
+      // EFECTIVA (la que realmente quedaria guardada) contra la vigente, de
+      // forma numerica, asi que reenviar la misma tasa escrita distinto
+      // (100 vs "100.00") o guardar solo productos/switch no vuelve a pedir
+      // confirmacion.
+      //
+      // Va DESPUES de resolver la tasa efectiva -necesita previousConfig para
+      // saber si cambio- pero ANTES de cualquier escritura: no se desactiva la
+      // configuracion anterior, no se inserta la nueva y no se tocan los
+      // productos canjeables. El throw viaja al catch de este handler, que ya
+      // hace ROLLBACK.
+      if (requiresRateConfirmation({ previousConfig, nextLempirasPorPunto: lempirasPorPunto })
+        && !isExplicitRateConfirmation(req.body.confirmar_equivalencia)) {
+        throw createFidelizacionError(
+          400,
+          'FIDELIZACION_RATE_CONFIRMATION_REQUIRED',
+          'Debe confirmar la equivalencia de puntos antes de guardar la configuracion.'
+        );
+      }
 
       await client.query(
         `

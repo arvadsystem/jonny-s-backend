@@ -118,6 +118,41 @@ const resolveEffectiveLempirasPorPunto = ({ inputProvided, inputValue, previousC
   return { ok: false };
 };
 
+// Decide si guardar una configuracion exige que el usuario confirme
+// explicitamente la equivalencia de la tasa (confirmar_equivalencia).
+//
+// Contexto del defecto: lempiras_por_punto significa "cuantos lempiras hacen
+// falta para ganar 1 punto" (puntos = floor(total / tasa)). Un usuario lo
+// interpreto al reves y guardo 0.01, con lo que una compra de L 1,130.00
+// acumulo 113,000 puntos. La formula era correcta; lo ambiguo era el campo.
+// Por eso se exige una confirmacion explicita cuando la tasa se establece por
+// primera vez o cambia de valor.
+//
+// La comparacion es NUMERICA, no textual: la columna es numeric y el driver
+// de PostgreSQL puede devolverla como string, asi que 100, "100" y "100.00"
+// son exactamente la misma tasa y NO deben volver a pedir confirmacion (un
+// guardado que solo toca productos canjeables o el switch no debe convertirse
+// en una confirmacion innecesaria). Se centraliza aqui para que exista una
+// sola definicion de "la tasa cambio".
+export const isSameLempirasPorPuntoRate = (a, b) => {
+  const left = Number(a);
+  const right = Number(b);
+  if (!Number.isFinite(left) || !Number.isFinite(right)) return false;
+  return left === right;
+};
+
+// requiresRateConfirmation: true cuando no hay configuracion previa (primera
+// tasa de la sucursal) o cuando la tasa efectiva difiere de la vigente.
+export const requiresRateConfirmation = ({ previousConfig, nextLempirasPorPunto }) => {
+  if (!previousConfig) return true;
+  return !isSameLempirasPorPuntoRate(previousConfig.lempiras_por_punto, nextLempirasPorPunto);
+};
+
+// Confirmacion estrictamente booleana: "true", 1, "1", {} y [] NO valen. Un
+// cliente que no sea la interfaz oficial no debe poder saltarse la
+// confirmacion enviando un valor "parecido a verdadero".
+export const isExplicitRateConfirmation = (value) => value === true;
+
 // Compatibilidad con payloads antiguos: si el switch se omite y ya existe
 // configuracion previa, se conserva su valor (nunca se apaga en silencio);
 // solo se usa false cuando de verdad es la primera configuracion.
