@@ -376,61 +376,101 @@ describe('routers/fidelizacion.js: saveConfiguracion y createCanje rechazan payl
   });
 });
 
-// Cobertura end-to-end del router completo (createCanje real, con
-// pool.connect() parcheado para devolver un client simulado que resuelve
-// el scope como un usuario local con sucursal operativa 3): confirma que
-// un item invalido en el body llega intacto hasta
-// createPresentialFidelizacionCanje y se rechaza ahi, sin crear el canje,
-// exactamente como en el caso de uso real via Express.
-describe('routers/fidelizacion.js: createCanje end-to-end (pool.connect simulado) rechaza items invalidos sin crear el canje', () => {
-  const normalizeSqlLocal = (sqlRaw) => String(sqlRaw).replace(/\s+/g, ' ').trim();
-
-  const buildCreateCanjeRouterClient = ({ userSucursalId = 3 } = {}) => {
-    const calls = [];
-    return {
-      calls,
-      query: async (sqlRaw, params = []) => {
-        const sql = normalizeSqlLocal(sqlRaw);
-        calls.push({ sql, params });
-        if (sql === 'BEGIN' || sql === 'COMMIT' || sql === 'ROLLBACK') return { rows: [], rowCount: 0 };
-        if (sql.includes('FROM public.usuarios u') && sql.includes('LEFT JOIN public.empleados e')) {
-          return { rows: [{ id_sucursal: userSucursalId }], rowCount: 1 };
-        }
-        if (sql.includes('FROM public.v_usuarios_sucursales_scope')) {
-          return { rows: [{ id_sucursal: userSucursalId, es_principal: true }], rowCount: 1 };
-        }
-        // Nada mas deberia ejecutarse: un item invalido debe rechazarse
-        // dentro de createPresentialFidelizacionCanje (aggregateCanjeItems)
-        // antes de fetchClienteEstado/getClienteSaldoForUpdate/etc.
-        throw new Error(`Consulta inesperada (el item invalido debia rechazarse antes de esto): ${sql}`);
-      },
-      release: () => {}
-    };
+// Ronda 5, defecto 2 (bloqueante confirmado por la auditoria independiente):
+// antes de esta correccion, un item invalido en items[] se rechazaba RECIEN
+// dentro de createPresentialFidelizacionCanje, es decir, DESPUES de
+// pool.connect() y BEGIN -- una conexion del pool y una transaccion se
+// abrian y luego se revertian (ROLLBACK) por un payload que nunca debio
+// llegar tan lejos. Ahora routers/fidelizacion.js llama
+// validateAndAggregateCanjeItems(req.body.items) ANTES de pool.connect(), asi
+// que un item invalido nunca abre conexion ni transaccion: cero llamadas a
+// pool.connect, sin BEGIN, sin ROLLBACK (nunca empezo nada que revertir).
+//
+// La prueba anterior de esta suite (que parcheaba pool.connect para
+// devolver un client y esperaba ver un ROLLBACK) quedo obsoleta por este
+// mismo cambio requerido: ya no puede haber ROLLBACK porque ya no hay
+// BEGIN. Se reemplaza por las pruebas de abajo, que cuentan explicitamente
+// las llamadas a pool.connect (no solo lanzan si se llama) para evidenciar
+// el cero exacto.
+const withPoolConnectCallCount = async (fn) => {
+  const original = pool.connect;
+  let callCount = 0;
+  pool.connect = async () => {
+    callCount += 1;
+    throw new Error('pool.connect no debia llamarse: los items invalidos deben rechazarse antes de abrir conexion/transaccion.');
   };
+  try {
+    await fn();
+  } finally {
+    pool.connect = original;
+  }
+  return callCount;
+};
 
-  it('cantidad="2 OR 1=1" en items[] se rechaza (FIDELIZACION_CANJE_ITEM_INVALID) sin crear el canje, via el router completo', async () => {
-    const client = buildCreateCanjeRouterClient();
-    const original = pool.connect;
-    pool.connect = async () => client;
+describe('routers/fidelizacion.js: createCanje valida y agrega items ANTES de pool.connect/BEGIN (0 llamadas a pool.connect en cada caso invalido)', () => {
+  const invalidItemsCases = [
+    ['items no enviado', undefined],
+    ['items=[]', []],
+    ['id_producto="156abc"', [{ id_producto: '156abc', cantidad: 1 }]],
+    ['id_producto=156.9', [{ id_producto: 156.9, cantidad: 1 }]],
+    ['id_producto=Number.MAX_SAFE_INTEGER + 1', [{ id_producto: Number.MAX_SAFE_INTEGER + 1, cantidad: 1 }]],
+    ['cantidad="2.9"', [{ id_producto: 156, cantidad: '2.9' }]],
+    ['cantidad="2 OR 1=1"', [{ id_producto: 156, cantidad: '2 OR 1=1' }]],
+    ['cantidad=Number.MAX_SAFE_INTEGER + 1', [{ id_producto: 156, cantidad: Number.MAX_SAFE_INTEGER + 1 }]],
+    ['cantidad=[]', [{ id_producto: 156, cantidad: [] }]],
+    ['cantidad={}', [{ id_producto: 156, cantidad: {} }]],
+    ['cantidad=0', [{ id_producto: 156, cantidad: 0 }]],
+    ['cantidad=-1', [{ id_producto: 156, cantidad: -1 }]]
+  ];
 
-    try {
-      const req = grantedReq({
-        body: { id_cliente: 10, items: [{ id_producto: 156, cantidad: '2 OR 1=1' }] }
+  for (const [label, items] of invalidItemsCases) {
+    it(`${label}: rechaza con 400 antes de pool.connect (0 llamadas), sin BEGIN ni ROLLBACK`, async () => {
+      const body = items === undefined ? { id_cliente: 10 } : { id_cliente: 10, items };
+      const req = grantedReq({ body });
+
+      let rejected = null;
+      const callCount = await withPoolConnectCallCount(async () => {
+        try {
+          await fidelizacionService.createCanje(req);
+        } catch (error) {
+          rejected = error;
+        }
       });
 
-      await assert.rejects(
-        fidelizacionService.createCanje(req),
-        (error) => {
-          assert.equal(error.code, 'FIDELIZACION_CANJE_ITEM_INVALID');
-          assert.equal(error.httpStatus, 400);
-          return true;
-        }
-      );
+      assert.equal(callCount, 0, 'pool.connect no debio llamarse ni una vez');
+      assert.ok(rejected, 'createCanje debia rechazar');
+      assert.equal(rejected.httpStatus, 400);
+      assert.match(rejected.code, /^FIDELIZACION_CANJE_ITEM/);
+    });
+  }
+});
 
-      assert.ok(!client.calls.some((call) => call.sql.startsWith('INSERT INTO public.fidelizacion_canjes (')));
-      assert.ok(client.calls.some((call) => call.sql === 'ROLLBACK'), 'el router debe hacer ROLLBACK ante el rechazo');
-    } finally {
-      pool.connect = original;
-    }
+// Prueba estructural complementaria: confirma que el router calcula
+// validatedItems = validateAndAggregateCanjeItems(req.body.items) ANTES de
+// pool.connect(), y que pasa exactamente ese arreglo ya agregado (no
+// req.body.items crudo) a createPresentialFidelizacionCanje. Combinada con
+// las pruebas ejecutables de validateAndAggregateCanjeItems (duplicados,
+// overflow, idempotencia) en fidelizacionService.canjeProductoMaestro.test.mjs,
+// esto prueba el contrato de agregacion de duplicados de extremo a extremo
+// sin necesitar un mock completo de PostgreSQL para todo el flujo del canje.
+describe('routers/fidelizacion.js: createCanje pasa validatedItems (ya agregado) a createPresentialFidelizacionCanje, calculado antes de pool.connect', () => {
+  it('validatedItems se calcula antes de "const client = await pool.connect()" y se pasa como items al servicio', async () => {
+    const source = await readFile(new URL('../fidelizacion.js', import.meta.url), 'utf8');
+    const start = source.indexOf('async createCanje(req)');
+    const end = source.indexOf('\n  },', start);
+    const handler = source.slice(start, end);
+
+    const validatedIdx = handler.indexOf('const validatedItems = validateAndAggregateCanjeItems(req.body.items);');
+    const connectIdx = handler.indexOf('const client = await pool.connect();');
+    assert.notEqual(validatedIdx, -1, 'debe existir la validacion previa de items');
+    assert.notEqual(connectIdx, -1, 'debe existir la apertura de conexion');
+    assert.ok(validatedIdx < connectIdx, 'validateAndAggregateCanjeItems debe ejecutarse ANTES de pool.connect()');
+
+    assert.match(handler, /items: validatedItems/);
+    assert.doesNotMatch(
+      handler.slice(connectIdx),
+      /items: req\.body\.items/,
+      'no debe pasarse req.body.items crudo (sin agregar) al servicio'
+    );
   });
 });

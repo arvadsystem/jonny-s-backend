@@ -71,16 +71,18 @@ const parseStrictPositiveInt = (value) => {
   // el regex de abajo si no se filtra el tipo primero (p.ej. id_producto[]=1).
   if (value !== null && typeof value === 'object') return null;
 
+  // Number.isSafeInteger (no solo Number.isInteger) en AMBAS ramas: un
+  // number que ya perdio precision en JS (p.ej. Number.MAX_SAFE_INTEGER + 1,
+  // que sigue siendo "entero" segun Number.isInteger pero ya no representa
+  // un valor exacto) tampoco debe aceptarse como id/cantidad valido.
   if (typeof value === 'number') {
-    return Number.isInteger(value) && value > 0 ? value : null;
+    return Number.isSafeInteger(value) && value > 0 ? value : null;
   }
 
   const normalized = String(value ?? '').trim();
   if (!/^\d+$/.test(normalized)) return null;
 
   const parsed = Number(normalized);
-  // Number.isSafeInteger (no solo Number.isInteger): un id fuera del rango
-  // seguro de JS (> 2^53-1) no debe aceptarse como entero valido.
   return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : null;
 };
 
@@ -898,7 +900,14 @@ const insertInventoryMovement = async ({
   );
 };
 
-const aggregateCanjeItems = (items) => {
+// Exportada (no interna): el router debe poder validar y agregar los
+// items ANTES de abrir conexion/transaccion (pool.connect/BEGIN), en vez de
+// solo dentro de createPresentialFidelizacionCanje. La misma funcion se usa
+// tambien dentro del servicio como defensa en profundidad (llamadas
+// directas sin pasar por el router). Es idempotente sobre un arreglo ya
+// agregado: cada id_producto aparece una sola vez en items ya agregados, asi
+// que sumarlo consigo mismo una vez produce el mismo resultado.
+export const validateAndAggregateCanjeItems = (items) => {
   if (!Array.isArray(items) || items.length === 0) {
     throw createFidelizacionError(
       400,
@@ -960,9 +969,14 @@ export const createPresentialFidelizacionCanje = async ({
   items,
   observacion = null
 }) => {
-  const clienteId = parsePositiveInt(idCliente);
-  const sucursalId = parsePositiveInt(idSucursal);
-  const actorId = parsePositiveInt(idUsuarioEjecutor);
+  // Defensa en profundidad: esta funcion se puede invocar directamente
+  // (pruebas, otros servicios) sin pasar por routers/fidelizacion.js, asi
+  // que valida con el parser estricto en vez de confiar en el caller
+  // (parsePositiveInt truncaba "10x" -> 10, "1x" -> 1, "5x" -> 5 en
+  // silencio).
+  const clienteId = parseStrictPositiveInt(idCliente);
+  const sucursalId = parseStrictPositiveInt(idSucursal);
+  const actorId = parseStrictPositiveInt(idUsuarioEjecutor);
   const safeObservation = normalizeText(observacion).slice(0, 200) || null;
 
   if (!clienteId) {
@@ -981,7 +995,7 @@ export const createPresentialFidelizacionCanje = async ({
     );
   }
 
-  const aggregatedItems = aggregateCanjeItems(items);
+  const aggregatedItems = validateAndAggregateCanjeItems(items);
   const cliente = await fetchClienteEstado(client, clienteId);
   if (!cliente || !Boolean(cliente.estado)) {
     throw createFidelizacionError(

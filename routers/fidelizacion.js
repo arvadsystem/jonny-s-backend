@@ -24,7 +24,8 @@ import {
   parseStrictPositiveInt,
   resolveEffectiveAcumulacionHabilitada,
   resolveEffectiveLempirasPorPunto,
-  resolveFidelizacionProductAssignments
+  resolveFidelizacionProductAssignments,
+  validateAndAggregateCanjeItems
 } from '../services/fidelizacionService.js';
 
 const router = express.Router();
@@ -1545,6 +1546,15 @@ const fidelizacionService = {
       };
     }
 
+    // Validar y agregar items ANTES de pool.connect/BEGIN: un payload con
+    // items invalidos (id_producto/cantidad no numericos, decimales,
+    // arreglos, overflow, etc.) no debe consumir una conexion del pool ni
+    // abrir una transaccion que termine en ROLLBACK. validateAndAggregateCanjeItems
+    // lanza un error con httpStatus/code/publicMessage (createFidelizacionError);
+    // asyncHandler ya lo convierte en la respuesta 4xx correspondiente, igual
+    // que cualquier otro error FIDELIZACION_* lanzado en este router.
+    const validatedItems = validateAndAggregateCanjeItems(req.body.items);
+
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
@@ -1567,7 +1577,7 @@ const fidelizacionService = {
         idCliente,
         idSucursal: scope.targetSucursalId,
         idUsuarioEjecutor: scope.idUsuario,
-        items: req.body.items,
+        items: validatedItems,
         observacion: req.body.observacion
       });
 

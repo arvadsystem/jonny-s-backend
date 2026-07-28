@@ -4,7 +4,8 @@ import { readFile } from 'node:fs/promises';
 import {
   resolveFidelizacionProductAssignments,
   createPresentialFidelizacionCanje,
-  parseStrictPositiveInt
+  parseStrictPositiveInt,
+  validateAndAggregateCanjeItems
 } from '../fidelizacionService.js';
 
 // Defecto confirmado: Fidelizacion resolvia la sucursal de un producto
@@ -825,6 +826,21 @@ describe('parseStrictPositiveInt: entero positivo estricto (Number.isSafeInteger
     // Number.isSafeInteger() no. Esta es la diferencia que exige el
     // contrato del helper (no basta con Number.isInteger).
     assert.equal(parseStrictPositiveInt(String(Number.MAX_SAFE_INTEGER + 2)), null);
+    assert.equal(parseStrictPositiveInt('9007199254740992'), null);
+  });
+
+  // Defecto confirmado por la auditoria independiente: la rama NUMERICA
+  // (typeof value === 'number') todavia usaba solo Number.isInteger, no
+  // Number.isSafeInteger. Number.MAX_SAFE_INTEGER + 1 como NUMBER (no como
+  // string) es un caso donde Number.isInteger(...) === true pero ya perdio
+  // precision (deja de representar un entero exacto); antes de esta
+  // correccion se aceptaba en silencio como id_producto/cantidad validos.
+  it('rama numerica: Number.MAX_SAFE_INTEGER + 1 (number, no string) se rechaza -- antes se aceptaba con Number.isInteger', () => {
+    const unsafeNumber = Number.MAX_SAFE_INTEGER + 1;
+    assert.equal(Number.isInteger(unsafeNumber), true, 'precondicion del defecto: Number.isInteger igual lo considera entero');
+    assert.equal(Number.isSafeInteger(unsafeNumber), false, 'precondicion del defecto: Number.isSafeInteger lo rechaza');
+    assert.equal(parseStrictPositiveInt(unsafeNumber), null);
+    assert.equal(parseStrictPositiveInt(9007199254740992), null);
   });
 });
 
@@ -967,5 +983,205 @@ describe('createPresentialFidelizacionCanje: sin efectos parciales cuando la asi
     );
 
     assertNoEffects(fixture);
+  });
+});
+
+// Ronda 5, defecto 2: aggregateCanjeItems se convirtio en
+// validateAndAggregateCanjeItems, EXPORTADA, para que routers/fidelizacion.js
+// pueda validar y agregar los items ANTES de pool.connect()/BEGIN (no solo
+// dentro de createPresentialFidelizacionCanje, ya iniciada la transaccion).
+// Esta suite prueba el contrato completo de la funcion compartida
+// directamente (sin PostgreSQL real), incluyendo duplicados, overflow y la
+// idempotencia sobre un arreglo ya agregado (el servicio la vuelve a llamar
+// como defensa en profundidad).
+describe('validateAndAggregateCanjeItems: contrato completo (funcion compartida por el router y por createPresentialFidelizacionCanje)', () => {
+  const assertRejectsWithCode = (items, code, label) => {
+    assert.throws(
+      () => validateAndAggregateCanjeItems(items),
+      (error) => {
+        assert.equal(error.code, code, label);
+        assert.equal(error.httpStatus, 400, label);
+        return true;
+      },
+      label
+    );
+  };
+
+  it('rechaza items que no son un arreglo, o un arreglo vacio', () => {
+    assertRejectsWithCode(undefined, 'FIDELIZACION_CANJE_ITEMS_REQUIRED', 'items undefined');
+    assertRejectsWithCode(null, 'FIDELIZACION_CANJE_ITEMS_REQUIRED', 'items null');
+    assertRejectsWithCode({}, 'FIDELIZACION_CANJE_ITEMS_REQUIRED', 'items objeto');
+    assertRejectsWithCode('x', 'FIDELIZACION_CANJE_ITEMS_REQUIRED', 'items string');
+    assertRejectsWithCode([], 'FIDELIZACION_CANJE_ITEMS_REQUIRED', 'items vacio');
+  });
+
+  it('rechaza un item que no es un objeto valido (null, arreglo o string) dentro de items', () => {
+    assertRejectsWithCode([null], 'FIDELIZACION_CANJE_ITEM_INVALID', 'item null');
+    assertRejectsWithCode([[]], 'FIDELIZACION_CANJE_ITEM_INVALID', 'item arreglo');
+    assertRejectsWithCode(['x'], 'FIDELIZACION_CANJE_ITEM_INVALID', 'item string');
+  });
+
+  it('rechaza un item sin id_producto o sin cantidad', () => {
+    assertRejectsWithCode([{ cantidad: 1 }], 'FIDELIZACION_CANJE_ITEM_INVALID', 'sin id_producto');
+    assertRejectsWithCode([{ id_producto: 156 }], 'FIDELIZACION_CANJE_ITEM_INVALID', 'sin cantidad');
+  });
+
+  it('rechaza id_producto invalido: decimal, parcialmente numerico, objeto, arreglo, entero inseguro', () => {
+    assertRejectsWithCode([{ id_producto: '156abc', cantidad: 1 }], 'FIDELIZACION_CANJE_ITEM_INVALID', 'id_producto="156abc"');
+    assertRejectsWithCode([{ id_producto: 156.9, cantidad: 1 }], 'FIDELIZACION_CANJE_ITEM_INVALID', 'id_producto=156.9');
+    assertRejectsWithCode([{ id_producto: {}, cantidad: 1 }], 'FIDELIZACION_CANJE_ITEM_INVALID', 'id_producto={}');
+    assertRejectsWithCode([{ id_producto: [156], cantidad: 1 }], 'FIDELIZACION_CANJE_ITEM_INVALID', 'id_producto=[156]');
+    assertRejectsWithCode(
+      [{ id_producto: Number.MAX_SAFE_INTEGER + 1, cantidad: 1 }],
+      'FIDELIZACION_CANJE_ITEM_INVALID',
+      'id_producto=MAX_SAFE_INTEGER + 1'
+    );
+  });
+
+  it('rechaza cantidad invalida: decimal, parcialmente numerica, objeto, arreglo, cero, negativa, entero inseguro', () => {
+    assertRejectsWithCode([{ id_producto: 156, cantidad: '2.9' }], 'FIDELIZACION_CANJE_ITEM_INVALID', 'cantidad="2.9"');
+    assertRejectsWithCode([{ id_producto: 156, cantidad: '2 OR 1=1' }], 'FIDELIZACION_CANJE_ITEM_INVALID', 'cantidad="2 OR 1=1"');
+    assertRejectsWithCode([{ id_producto: 156, cantidad: {} }], 'FIDELIZACION_CANJE_ITEM_INVALID', 'cantidad={}');
+    assertRejectsWithCode([{ id_producto: 156, cantidad: [] }], 'FIDELIZACION_CANJE_ITEM_INVALID', 'cantidad=[]');
+    assertRejectsWithCode([{ id_producto: 156, cantidad: 0 }], 'FIDELIZACION_CANJE_ITEM_INVALID', 'cantidad=0');
+    assertRejectsWithCode([{ id_producto: 156, cantidad: -1 }], 'FIDELIZACION_CANJE_ITEM_INVALID', 'cantidad=-1');
+    assertRejectsWithCode(
+      [{ id_producto: 156, cantidad: 9007199254740992 }],
+      'FIDELIZACION_CANJE_ITEM_INVALID',
+      'cantidad=Number.MAX_SAFE_INTEGER + 1 (era aceptado antes de la correccion de Number.isSafeInteger en la rama numerica)'
+    );
+  });
+
+  it('agrega productos duplicados: [156 x1, 156 x2] -> [{id_producto:156, cantidad:3}]', () => {
+    const result = validateAndAggregateCanjeItems([
+      { id_producto: 156, cantidad: 1 },
+      { id_producto: 156, cantidad: 2 }
+    ]);
+    assert.deepEqual(result, [{ id_producto: 156, cantidad: 3 }]);
+  });
+
+  it('rechaza overflow: la suma acumulada que supera Number.MAX_SAFE_INTEGER nunca produce una cantidad valida', () => {
+    assertRejectsWithCode(
+      [
+        { id_producto: 156, cantidad: Number.MAX_SAFE_INTEGER },
+        { id_producto: 156, cantidad: 1 }
+      ],
+      'FIDELIZACION_CANJE_ITEM_INVALID',
+      'overflow por suma de duplicados'
+    );
+  });
+
+  it('es idempotente sobre un arreglo ya agregado: createPresentialFidelizacionCanje puede volver a validarlo sin cambiar el resultado', () => {
+    const once = validateAndAggregateCanjeItems([
+      { id_producto: 156, cantidad: 1 },
+      { id_producto: 156, cantidad: 2 },
+      { id_producto: 200, cantidad: 5 }
+    ]);
+    const twice = validateAndAggregateCanjeItems(once);
+    assert.deepEqual(twice, once);
+  });
+});
+
+// Ronda 5, defecto 3: createPresentialFidelizacionCanje todavia usaba
+// parsePositiveInt (permisivo) para idCliente/idSucursal/idUsuarioEjecutor,
+// lo que truncaba "10x" -> 10, "1x" -> 1, "5x" -> 5 en silencio en llamadas
+// directas al servicio (sin pasar por el router). Ahora usa
+// parseStrictPositiveInt. Se usa un client que CUENTA sus llamadas (en vez
+// de solo lanzar) para evidenciar explicitamente client.query calls = 0,
+// tal como exige la ronda.
+describe('createPresentialFidelizacionCanje: idCliente/idSucursal/idUsuarioEjecutor usan parseStrictPositiveInt, sin ejecutar ninguna consulta', () => {
+  const buildCountingClient = () => {
+    const calls = [];
+    return {
+      calls,
+      query: async (sqlRaw, params = []) => {
+        calls.push({ sql: normalizeSql(sqlRaw), params });
+        return { rows: [], rowCount: 0 };
+      }
+    };
+  };
+
+  const validArgs = { idCliente: 10, idSucursal: 1, idUsuarioEjecutor: 5, items: [{ id_producto: 156, cantidad: 1 }] };
+
+  it('idCliente="10x" -> FIDELIZACION_CLIENTE_INVALIDO (400), client.query calls = 0', async () => {
+    const client = buildCountingClient();
+    await assert.rejects(
+      createPresentialFidelizacionCanje({ client, req: {}, ...validArgs, idCliente: '10x' }),
+      (error) => {
+        assert.equal(error.code, 'FIDELIZACION_CLIENTE_INVALIDO');
+        assert.equal(error.httpStatus, 400);
+        return true;
+      }
+    );
+    assert.equal(client.calls.length, 0);
+  });
+
+  it('idCliente=Number.MAX_SAFE_INTEGER + 1 -> FIDELIZACION_CLIENTE_INVALIDO, client.query calls = 0', async () => {
+    const client = buildCountingClient();
+    await assert.rejects(
+      createPresentialFidelizacionCanje({ client, req: {}, ...validArgs, idCliente: Number.MAX_SAFE_INTEGER + 1 }),
+      { code: 'FIDELIZACION_CLIENTE_INVALIDO' }
+    );
+    assert.equal(client.calls.length, 0);
+  });
+
+  it('idSucursal="1x" -> FIDELIZACION_CANJE_SCOPE_ERROR (403), client.query calls = 0', async () => {
+    const client = buildCountingClient();
+    await assert.rejects(
+      createPresentialFidelizacionCanje({ client, req: {}, ...validArgs, idSucursal: '1x' }),
+      (error) => {
+        assert.equal(error.code, 'FIDELIZACION_CANJE_SCOPE_ERROR');
+        assert.equal(error.httpStatus, 403);
+        return true;
+      }
+    );
+    assert.equal(client.calls.length, 0);
+  });
+
+  it('idSucursal=Number.MAX_SAFE_INTEGER + 1 -> FIDELIZACION_CANJE_SCOPE_ERROR, client.query calls = 0', async () => {
+    const client = buildCountingClient();
+    await assert.rejects(
+      createPresentialFidelizacionCanje({ client, req: {}, ...validArgs, idSucursal: Number.MAX_SAFE_INTEGER + 1 }),
+      { code: 'FIDELIZACION_CANJE_SCOPE_ERROR' }
+    );
+    assert.equal(client.calls.length, 0);
+  });
+
+  it('idUsuarioEjecutor="5x" -> FIDELIZACION_CANJE_SCOPE_ERROR (403), client.query calls = 0', async () => {
+    const client = buildCountingClient();
+    await assert.rejects(
+      createPresentialFidelizacionCanje({ client, req: {}, ...validArgs, idUsuarioEjecutor: '5x' }),
+      (error) => {
+        assert.equal(error.code, 'FIDELIZACION_CANJE_SCOPE_ERROR');
+        assert.equal(error.httpStatus, 403);
+        return true;
+      }
+    );
+    assert.equal(client.calls.length, 0);
+  });
+
+  it('idUsuarioEjecutor=Number.MAX_SAFE_INTEGER + 1 -> FIDELIZACION_CANJE_SCOPE_ERROR, client.query calls = 0', async () => {
+    const client = buildCountingClient();
+    await assert.rejects(
+      createPresentialFidelizacionCanje({ client, req: {}, ...validArgs, idUsuarioEjecutor: Number.MAX_SAFE_INTEGER + 1 }),
+      { code: 'FIDELIZACION_CANJE_SCOPE_ERROR' }
+    );
+    assert.equal(client.calls.length, 0);
+  });
+
+  it('IDs principales validos pero items con id_producto/cantidad invalidos: se rechaza antes de fetchClienteEstado/pg_advisory_xact_lock, client.query calls = 0', async () => {
+    const client = buildCountingClient();
+    await assert.rejects(
+      createPresentialFidelizacionCanje({
+        client,
+        req: {},
+        idCliente: 10,
+        idSucursal: 1,
+        idUsuarioEjecutor: 5,
+        items: [{ id_producto: 156, cantidad: '2x' }]
+      }),
+      { code: 'FIDELIZACION_CANJE_ITEM_INVALID' }
+    );
+    assert.equal(client.calls.length, 0, 'ni fetchClienteEstado ni pg_advisory_xact_lock ni el saldo deben consultarse');
   });
 });
