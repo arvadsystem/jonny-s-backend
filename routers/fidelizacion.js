@@ -2,6 +2,7 @@ import express from 'express';
 import pool from '../config/db-connection.js';
 import { checkPermission, requestHasAnyPermission } from '../middleware/checkPermission.js';
 import { resolveRequestUserSucursalScope } from '../utils/sucursalScope.js';
+import { attachImagenPrincipalUrls } from '../utils/uploads.js';
 import {
   buildErrorBody,
   isValidDateOnly,
@@ -21,7 +22,8 @@ import {
   parsePositiveInt,
   parsePositiveNumber,
   resolveEffectiveAcumulacionHabilitada,
-  resolveEffectiveLempirasPorPunto
+  resolveEffectiveLempirasPorPunto,
+  resolveFidelizacionProductAssignments
 } from '../services/fidelizacionService.js';
 
 const router = express.Router();
@@ -152,7 +154,8 @@ const resolveFidelizacionScope = async ({
   client,
   requestedSucursalId = null,
   allowAllBranches = false,
-  requireOperationalSucursal = false
+  requireOperationalSucursal = false,
+  requireExplicitSucursalForSuperAdmin = false
 }) => {
   const scope = await resolveRequestUserSucursalScope(req, client);
   const idUsuario = parsePositiveInt(scope?.idUsuario);
@@ -199,6 +202,15 @@ const resolveFidelizacionScope = async ({
     targetSucursalId = requestedSucursalId;
   } else if (allowAllBranches && Boolean(scope?.isSuperAdmin) && hasMultisucursalAccess && !requireOperationalSucursal) {
     targetSucursalId = null;
+  } else if (requireExplicitSucursalForSuperAdmin && Boolean(scope?.isSuperAdmin)) {
+    // El superadministrador no tiene una sucursal "propia" para el canje:
+    // debe elegirla explicitamente en cada solicitud (nunca se usa
+    // userSucursalId en silencio, aunque el usuario tenga una asignada).
+    throw createFidelizacionError(
+      400,
+      'FIDELIZACION_SUCURSAL_REQUIRED',
+      'Debe seleccionar la sucursal donde se realizara el canje.'
+    );
   } else {
     if (!userSucursalId) {
       throw createFidelizacionError(
@@ -415,10 +427,18 @@ const fetchClienteDetalleRow = async (client, idCliente, targetSucursalId = null
   return result.rows[0] || null;
 };
 
-const getConfiguracionProducts = async (client, idSucursal, lempirasPorPunto = null) => {
-  if (!parsePositiveInt(idSucursal)) return [];
+// Datos maestros (nombre/descripcion/precio/imagen) siempre vienen de
+// productos: un producto configurado como canjeable debe seguir apareciendo
+// en el listado administrativo aunque su asignacion local en esta sucursal
+// se haya vuelto invalida (para que el admin pueda verlo y corregirlo), asi
+// que el fetch de fps+productos NUNCA depende de resolveFidelizacionProductAssignments
+// para existir -- solo se usa para completar stock/almacen local cuando hay
+// una asignacion resoluble.
+const getConfiguracionProducts = async (client, req, idSucursal, lempirasPorPunto = null) => {
+  const sucursalId = parsePositiveInt(idSucursal);
+  if (!sucursalId) return [];
 
-  const result = await client.query(
+  const fpsResult = await client.query(
     `
       SELECT
         fps.id_registro,
@@ -430,34 +450,47 @@ const getConfiguracionProducts = async (client, idSucursal, lempirasPorPunto = n
         fps.fecha_creacion,
         fps.fecha_actualizacion,
         p.nombre_producto,
+        COALESCE(p.descripcion_producto, '') AS descripcion_producto,
         p.precio,
-        COALESCE(p.estado, true) AS producto_estado,
-        p.id_almacen,
-        COALESCE(p.cantidad, 0)::int AS cantidad,
-        COALESCE(p.stock_minimo, 0)::int AS stock_minimo,
-        a.id_sucursal AS id_sucursal_almacen,
-        COALESCE(a.estado, true) AS almacen_estado
+        p.id_archivo_imagen_principal,
+        COALESCE(p.estado, true) AS producto_estado
       FROM public.fidelizacion_productos_canjeables_sucursal fps
       INNER JOIN public.productos p
         ON p.id_producto = fps.id_producto
-      LEFT JOIN public.almacenes a
-        ON a.id_almacen = p.id_almacen
       WHERE fps.id_sucursal = $1
       ORDER BY COALESCE(fps.estado, true) DESC, p.nombre_producto ASC, fps.id_registro ASC
     `,
-    [idSucursal]
+    [sucursalId]
   );
 
-  return result.rows.map((row) => ({
-    ...row,
-    puntos_requeridos_efectivos:
-      parseNonNegativeInt(row.puntos_requeridos_override) ??
-      computeRedemptionPoints(row.precio, lempirasPorPunto),
-    stock_disponible: Math.max(
-      Number(row.cantidad || 0) - Number(row.stock_minimo || 0),
-      0
-    )
-  }));
+  const assignments = await resolveFidelizacionProductAssignments({
+    client,
+    idSucursal: sucursalId,
+    productIds: fpsResult.rows.map((row) => row.id_producto),
+    lockForUpdate: false
+  });
+
+  const merged = fpsResult.rows.map((row) => {
+    const assignment = assignments.get(Number(row.id_producto));
+    const resolved = assignment?.status === 'OK';
+    const cantidad = resolved ? assignment.cantidad : 0;
+    const stockMinimo = resolved ? assignment.stock_minimo : 0;
+
+    return {
+      ...row,
+      asignacion_local_estado: assignment?.status || 'SIN_ASIGNACION',
+      id_almacen: resolved ? assignment.id_almacen : null,
+      nombre_almacen: resolved ? assignment.nombre_almacen : null,
+      cantidad,
+      stock_minimo: stockMinimo,
+      stock_disponible: Math.max(cantidad - stockMinimo, 0),
+      puntos_requeridos_efectivos:
+        parseNonNegativeInt(row.puntos_requeridos_override) ??
+        computeRedemptionPoints(row.precio, lempirasPorPunto)
+    };
+  });
+
+  return attachImagenPrincipalUrls(pool, req, merged);
 };
 
 const fidelizacionService = {
@@ -868,10 +901,29 @@ const fidelizacionService = {
       };
     }
 
+    const requestedSucursalId = parseNullablePositiveInt(req.query.id_sucursal);
+    if (req.query.id_sucursal !== undefined && !requestedSucursalId) {
+      return {
+        status: 400,
+        body: buildErrorBody({
+          code: 'VALIDATION_ERROR',
+          message: 'id_sucursal debe ser un entero positivo.'
+        })
+      };
+    }
+
+    // No superadmin: siempre su sucursal operativa autenticada (nunca un
+    // id_sucursal arbitrario del navegador salvo que este dentro de su
+    // alcance multisucursal ya autorizado, ver resolveFidelizacionScope).
+    // Superadmin: debe elegir la sucursal explicitamente en cada solicitud
+    // (requireExplicitSucursalForSuperAdmin) -- responde
+    // FIDELIZACION_SUCURSAL_REQUIRED si no la envia.
     const scope = await resolveFidelizacionScope({
       req,
       client: pool,
-      requireOperationalSucursal: true
+      requestedSucursalId,
+      requireOperationalSucursal: true,
+      requireExplicitSucursalForSuperAdmin: true
     });
 
     const cliente = await fetchClienteDetalleRow(pool, idCliente, null);
@@ -908,35 +960,63 @@ const fidelizacionService = {
       };
     }
 
-    const result = await pool.query(
+    // Datos maestros (nombre/descripcion/precio/imagen) desde productos; el
+    // stock/almacen local se resuelve aparte via
+    // resolveFidelizacionProductAssignments (producto maestro + sucursal
+    // operativa -> productos_almacenes), nunca con productos.id_almacen.
+    const canjeablesResult = await pool.query(
       `
         SELECT
           fps.id_producto,
           p.nombre_producto,
-          p.descripcion_producto,
+          COALESCE(p.descripcion_producto, '') AS descripcion_producto,
           p.precio,
-          p.id_almacen,
-          COALESCE(p.cantidad, 0)::int AS cantidad,
-          COALESCE(p.stock_minimo, 0)::int AS stock_minimo,
-          fps.puntos_requeridos_override,
-          GREATEST(COALESCE(p.cantidad, 0) - COALESCE(p.stock_minimo, 0), 0)::int AS stock_disponible
+          p.id_archivo_imagen_principal,
+          fps.puntos_requeridos_override
         FROM public.fidelizacion_productos_canjeables_sucursal fps
         INNER JOIN public.productos p
           ON p.id_producto = fps.id_producto
-        INNER JOIN public.almacenes a
-          ON a.id_almacen = p.id_almacen
         WHERE fps.id_sucursal = $1
           AND COALESCE(fps.estado, true) = true
           AND COALESCE(p.estado, true) = true
-          AND COALESCE(a.estado, true) = true
-          AND a.id_sucursal = $1
-          AND GREATEST(COALESCE(p.cantidad, 0) - COALESCE(p.stock_minimo, 0), 0) > 0
         ORDER BY p.nombre_producto ASC
       `,
       [scope.targetSucursalId]
     );
 
-    const data = result.rows
+    const assignments = await resolveFidelizacionProductAssignments({
+      client: pool,
+      idSucursal: scope.targetSucursalId,
+      productIds: canjeablesResult.rows.map((row) => row.id_producto),
+      lockForUpdate: false
+    });
+
+    const merged = canjeablesResult.rows
+      .map((row) => {
+        const assignment = assignments.get(Number(row.id_producto));
+        if (assignment?.status !== 'OK') return null;
+        if (assignment.stock_disponible <= 0) return null;
+
+        return {
+          id_producto: row.id_producto,
+          nombre_producto: row.nombre_producto,
+          descripcion_producto: row.descripcion_producto,
+          id_archivo_imagen_principal: row.id_archivo_imagen_principal,
+          precio: row.precio,
+          id_sucursal: assignment.id_sucursal,
+          id_almacen: assignment.id_almacen,
+          nombre_almacen: assignment.nombre_almacen,
+          cantidad: assignment.cantidad,
+          stock_minimo: assignment.stock_minimo,
+          stock_disponible: assignment.stock_disponible,
+          puntos_requeridos_override: row.puntos_requeridos_override
+        };
+      })
+      .filter((row) => row !== null);
+
+    const withImagenes = await attachImagenPrincipalUrls(pool, req, merged);
+
+    const data = withImagenes
       .map((row) => ({
         ...row,
         puntos_requeridos:
@@ -998,6 +1078,7 @@ const fidelizacionService = {
     const config = await getActiveFidelizacionConfig(pool, scope.targetSucursalId);
     const productos = await getConfiguracionProducts(
       pool,
+      req,
       scope.targetSucursalId,
       config?.lempiras_por_punto || null
     );
@@ -1186,21 +1267,24 @@ const fidelizacionService = {
       if (productIds.length > 0) {
         const productsResult = await client.query(
           `
-            SELECT
-              p.id_producto,
-              p.nombre_producto,
-              COALESCE(p.estado, true) AS estado,
-              p.id_almacen,
-              a.id_sucursal AS id_sucursal_almacen,
-              COALESCE(a.estado, true) AS almacen_estado
+            SELECT p.id_producto, p.nombre_producto, COALESCE(p.estado, true) AS estado
             FROM public.productos p
-            LEFT JOIN public.almacenes a
-              ON a.id_almacen = p.id_almacen
             WHERE p.id_producto = ANY($1::int[])
           `,
           [productIds]
         );
         const existingMap = new Map(productsResult.rows.map((row) => [Number(row.id_producto), row]));
+
+        // Un producto maestro puede estar asignado a varias sucursales via
+        // productos_almacenes: se valida la asignacion activa en la
+        // sucursal solicitada, nunca con productos.id_almacen (legado, un
+        // solo almacen por producto).
+        const assignments = await resolveFidelizacionProductAssignments({
+          client,
+          idSucursal: scope.targetSucursalId,
+          productIds,
+          lockForUpdate: false
+        });
 
         for (const idProducto of productIds) {
           const row = existingMap.get(idProducto);
@@ -1211,11 +1295,20 @@ const fidelizacionService = {
               'Uno o mas productos seleccionados no estan disponibles.'
             );
           }
-          if (!row.id_almacen || !Boolean(row.almacen_estado) || Number(row.id_sucursal_almacen || 0) !== scope.targetSucursalId) {
+
+          const assignment = assignments.get(idProducto);
+          if (assignment?.status === 'AMBIGUA') {
             throw createFidelizacionError(
               409,
-              'FIDELIZACION_PRODUCT_SCOPE_ERROR',
-              'Uno o mas productos no pertenecen al inventario operativo de la sucursal.'
+              'FIDELIZACION_PRODUCTO_ASIGNACION_AMBIGUA',
+              `El producto ${row.nombre_producto || idProducto} tiene mas de una asignacion activa en esta sucursal.`
+            );
+          }
+          if (assignment?.status !== 'OK') {
+            throw createFidelizacionError(
+              409,
+              'FIDELIZACION_PRODUCTO_SIN_ASIGNACION',
+              `El producto ${row.nombre_producto || idProducto} no tiene una asignacion de inventario activa en esta sucursal.`
             );
           }
         }
@@ -1416,7 +1509,7 @@ const fidelizacionService = {
       };
     }
 
-    const allowedFields = new Set(['id_cliente', 'items', 'observacion']);
+    const allowedFields = new Set(['id_cliente', 'id_sucursal', 'items', 'observacion']);
     const unknownFields = unknownFieldsFromPayload(req.body, allowedFields);
     if (unknownFields.length) {
       return {
@@ -1440,15 +1533,32 @@ const fidelizacionService = {
       };
     }
 
+    const requestedSucursalId = parseNullablePositiveInt(req.body.id_sucursal);
+    if (req.body.id_sucursal !== undefined && !requestedSucursalId) {
+      return {
+        status: 400,
+        body: buildErrorBody({
+          code: 'VALIDATION_ERROR',
+          message: 'id_sucursal debe ser un entero positivo.'
+        })
+      };
+    }
+
     const client = await pool.connect();
     try {
+      await client.query('BEGIN');
+
+      // No superadmin: sucursal operativa autenticada (id_sucursal enviado
+      // solo se admite si esta dentro de su alcance ya autorizado). Superadmin:
+      // debe enviar id_sucursal explicitamente (FIDELIZACION_SUCURSAL_REQUIRED
+      // si falta) -- nunca se usa su userSucursalId en silencio.
       const scope = await resolveFidelizacionScope({
         req,
         client,
-        requireOperationalSucursal: true
+        requestedSucursalId,
+        requireOperationalSucursal: true,
+        requireExplicitSucursalForSuperAdmin: true
       });
-
-      await client.query('BEGIN');
 
       const result = await createPresentialFidelizacionCanje({
         client,
@@ -1851,6 +1961,7 @@ export {
   parsePageParam,
   parseLimitParam,
   parseNullablePositiveInt,
+  resolveFidelizacionScope,
   MAX_SEARCH_LENGTH,
   MAX_PAGE_SIZE,
   DEFAULT_CLIENTES_PAGE_SIZE

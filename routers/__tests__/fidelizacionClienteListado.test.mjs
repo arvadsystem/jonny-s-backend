@@ -516,12 +516,16 @@ describe('listClientes: id_sucursal invalido responde 400 VALIDATION_ERROR antes
 });
 
 describe('routers/fidelizacion.js: parseNullablePositiveInt sigue siendo el unico parser de identificadores enteros opcionales', () => {
-  it('los 10 usos conocidos de parseNullablePositiveInt siguen presentes (id_sucursal en query/body, id_cliente, id_estado_canje)', async () => {
+  it('los 12 usos conocidos de parseNullablePositiveInt siguen presentes (id_sucursal en query/body, id_cliente, id_estado_canje)', async () => {
     const source = await readFile(new URL('../fidelizacion.js', import.meta.url), 'utf8');
     const usages = [...source.matchAll(/parseNullablePositiveInt\(/g)];
     // La definicion es "const parseNullablePositiveInt = (value) =>" (no
-    // matchea el regex de llamada), asi que solo cuenta los 10 usos reales.
-    assert.equal(usages.length, 10, 'no debe agregarse ni quitarse ningun uso de parseNullablePositiveInt sin revisar este contrato');
+    // matchea el regex de llamada), asi que solo cuenta los usos reales.
+    // Eran 10; la correccion de canje por producto maestro agrego 2 mas:
+    // canjeablesCliente (req.query.id_sucursal) y createCanje
+    // (req.body.id_sucursal), ambos para exigir sucursal explicita al
+    // superadmin sin debilitar la validacion estricta ya existente.
+    assert.equal(usages.length, 12, 'no debe agregarse ni quitarse ningun uso de parseNullablePositiveInt sin revisar este contrato');
   });
 
   it('no se creo un parser paralelo especifico solo para id_sucursal (todas las referencias son al mismo helper)', async () => {

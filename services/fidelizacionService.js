@@ -625,37 +625,178 @@ const fetchClienteEstado = async (client, idCliente) => {
   return result.rows[0] || null;
 };
 
-const fetchCanjeProductRowsForUpdate = async (client, idSucursal, productIds) => {
-  if (!Array.isArray(productIds) || productIds.length === 0) return [];
+// Resolucion centralizada producto maestro -> asignacion local (sucursal):
+// unico punto de la app que decide, para un id_producto MAESTRO (el mismo
+// que fidelizacion_productos_canjeables_sucursal.id_producto ya almacena),
+// cual es su almacen/stock dentro de una sucursal especifica. Reemplaza el
+// join legado (productos.id_almacen / productos.cantidad / productos.stock_minimo)
+// que asumia un solo almacen por producto y por eso rechazaba productos
+// maestros validos asignados a mas de una sucursal via productos_almacenes.
+//
+// Se usa desde configuracion (GET/PUT), el catalogo de canjeables (GET) y la
+// confirmacion del canje (POST, con lockForUpdate=true) para no duplicar
+// cuatro consultas incompatibles con la misma intencion.
+//
+// Contrato de retorno: Map<id_producto, resultado>, con resultado.status en
+// { 'OK', 'SIN_ASIGNACION', 'AMBIGUA' }. 'SIN_ASIGNACION' cubre tanto la
+// ausencia de asignacion activa como producto/asignacion/almacen inactivos
+// (ninguno de esos casos es un producto local usable). 'AMBIGUA' es cuando
+// el producto maestro tiene mas de una asignacion activa dentro de la MISMA
+// sucursal (dos almacenes distintos de esa sucursal) y no hay una regla
+// canonica para elegir uno: nunca se resuelve con LIMIT 1 ni MIN(id_almacen).
+//
+// FOR UPDATE no puede combinarse con funciones de ventana en el SELECT, asi
+// que la deteccion de ambiguedad (COUNT... GROUP BY) y el fetch con lock se
+// hacen en dos consultas separadas -- mismo patron ya usado en este repo por
+// fetchProductosMaestrosByIdsForUpdate (services/inventarioStockValidator.js).
+export const resolveFidelizacionProductAssignments = async ({
+  client,
+  idSucursal,
+  productIds,
+  lockForUpdate = false
+}) => {
+  const sucursalId = parsePositiveInt(idSucursal);
+  const uniqueIds = [...new Set(
+    (Array.isArray(productIds) ? productIds : [])
+      .map((id) => parsePositiveInt(id))
+      .filter((id) => id !== null)
+  )];
 
-  const result = await client.query(
+  const resultMap = new Map();
+  if (!sucursalId || uniqueIds.length === 0) return resultMap;
+
+  const countsResult = await client.query(
     `
-      SELECT
-        fps.id_registro,
-        fps.id_producto,
-        fps.puntos_requeridos_override,
-        COALESCE(fps.estado, true) AS canjeable_estado,
-        p.nombre_producto,
-        p.precio,
-        COALESCE(p.cantidad, 0)::int AS cantidad,
-        COALESCE(p.stock_minimo, 0)::int AS stock_minimo,
-        COALESCE(p.estado, true) AS producto_estado,
-        p.id_almacen,
-        a.id_sucursal AS almacen_id_sucursal,
-        COALESCE(a.estado, true) AS almacen_estado
-      FROM public.fidelizacion_productos_canjeables_sucursal fps
-      INNER JOIN public.productos p
-        ON p.id_producto = fps.id_producto
+      SELECT pa.id_producto, COUNT(*)::int AS total_asignaciones
+      FROM public.productos_almacenes pa
       INNER JOIN public.almacenes a
-        ON a.id_almacen = p.id_almacen
-      WHERE fps.id_sucursal = $1
-        AND fps.id_producto = ANY($2::int[])
-      FOR UPDATE OF p
+        ON a.id_almacen = pa.id_almacen
+       AND a.id_sucursal = $1
+       AND COALESCE(a.estado, true) = true
+      INNER JOIN public.productos p
+        ON p.id_producto = pa.id_producto
+       AND COALESCE(p.estado, true) = true
+      WHERE pa.id_producto = ANY($2::int[])
+        AND COALESCE(pa.estado, true) = true
+      GROUP BY pa.id_producto
     `,
-    [idSucursal, productIds]
+    [sucursalId, uniqueIds]
+  );
+  const countsByProduct = new Map(
+    countsResult.rows.map((row) => [Number(row.id_producto), Number(row.total_asignaciones || 0)])
   );
 
-  return result.rows;
+  const lockableIds = [];
+  for (const idProducto of uniqueIds) {
+    const total = countsByProduct.get(idProducto) || 0;
+    if (total === 0) {
+      resultMap.set(idProducto, { id_producto: idProducto, status: 'SIN_ASIGNACION' });
+    } else if (total > 1) {
+      resultMap.set(idProducto, { id_producto: idProducto, status: 'AMBIGUA' });
+    } else {
+      lockableIds.push(idProducto);
+    }
+  }
+
+  if (lockableIds.length > 0) {
+    const dataResult = await client.query(
+      `
+        SELECT
+          p.id_producto,
+          p.nombre_producto,
+          COALESCE(p.descripcion_producto, '') AS descripcion_producto,
+          p.precio,
+          p.id_archivo_imagen_principal,
+          pa.id_almacen,
+          COALESCE(pa.cantidad, 0)::int AS cantidad,
+          COALESCE(pa.stock_minimo, 0)::int AS stock_minimo,
+          a.id_sucursal,
+          COALESCE(NULLIF(TRIM(COALESCE(a.nombre, '')), ''), CONCAT('Almacen #', a.id_almacen::text)) AS nombre_almacen
+        FROM public.productos_almacenes pa
+        INNER JOIN public.almacenes a
+          ON a.id_almacen = pa.id_almacen
+         AND a.id_sucursal = $1
+         AND COALESCE(a.estado, true) = true
+        INNER JOIN public.productos p
+          ON p.id_producto = pa.id_producto
+         AND COALESCE(p.estado, true) = true
+        WHERE pa.id_producto = ANY($2::int[])
+          AND COALESCE(pa.estado, true) = true
+        ${lockForUpdate ? 'FOR UPDATE OF pa' : ''}
+      `,
+      [sucursalId, lockableIds]
+    );
+
+    for (const row of dataResult.rows) {
+      const idProducto = Number(row.id_producto);
+      const cantidad = Number(row.cantidad || 0);
+      const stockMinimo = Number(row.stock_minimo || 0);
+      resultMap.set(idProducto, {
+        id_producto: idProducto,
+        status: 'OK',
+        nombre_producto: row.nombre_producto,
+        descripcion_producto: row.descripcion_producto,
+        precio: row.precio,
+        id_archivo_imagen_principal: row.id_archivo_imagen_principal,
+        id_sucursal: Number(row.id_sucursal),
+        id_almacen: Number(row.id_almacen),
+        nombre_almacen: row.nombre_almacen,
+        cantidad,
+        stock_minimo: stockMinimo,
+        stock_disponible: Math.max(cantidad - stockMinimo, 0)
+      });
+    }
+  }
+
+  return resultMap;
+};
+
+const fetchCanjeProductRowsForUpdate = async (client, idSucursal, productIds) => {
+  const uniqueIds = [...new Set(
+    (Array.isArray(productIds) ? productIds : [])
+      .map((id) => parsePositiveInt(id))
+      .filter((id) => id !== null)
+  )];
+  if (uniqueIds.length === 0) return [];
+
+  const [canjeablesResult, assignments] = await Promise.all([
+    client.query(
+      `
+        SELECT id_producto, puntos_requeridos_override, COALESCE(estado, true) AS canjeable_estado
+        FROM public.fidelizacion_productos_canjeables_sucursal
+        WHERE id_sucursal = $1
+          AND id_producto = ANY($2::int[])
+      `,
+      [idSucursal, uniqueIds]
+    ),
+    resolveFidelizacionProductAssignments({
+      client,
+      idSucursal,
+      productIds: uniqueIds,
+      lockForUpdate: true
+    })
+  ]);
+
+  const canjeablesByProduct = new Map(
+    canjeablesResult.rows.map((row) => [Number(row.id_producto), row])
+  );
+
+  return uniqueIds.map((idProducto) => {
+    const canjeable = canjeablesByProduct.get(idProducto) || null;
+    const assignment = assignments.get(idProducto) || { id_producto: idProducto, status: 'SIN_ASIGNACION' };
+
+    return {
+      id_producto: idProducto,
+      canjeable_estado: canjeable ? Boolean(canjeable.canjeable_estado) : false,
+      puntos_requeridos_override: canjeable ? canjeable.puntos_requeridos_override : null,
+      assignment_status: assignment.status,
+      nombre_producto: assignment.nombre_producto,
+      precio: assignment.precio,
+      cantidad: assignment.cantidad,
+      stock_minimo: assignment.stock_minimo,
+      id_almacen: assignment.id_almacen
+    };
+  });
 };
 
 const insertInventoryMovement = async ({
@@ -808,19 +949,24 @@ export const createPresentialFidelizacionCanje = async ({
       );
     }
 
-    if (!Boolean(row.producto_estado)) {
+    // assignment_status viene de resolveFidelizacionProductAssignments
+    // (producto maestro + productos_almacenes + almacenes de esta sucursal,
+    // bloqueado con FOR UPDATE OF pa). SIN_ASIGNACION cubre tanto la
+    // ausencia de asignacion activa como producto/asignacion/almacen
+    // inactivos: ninguno de esos casos deja un almacen local usable.
+    if (row.assignment_status === 'AMBIGUA') {
       throw createFidelizacionError(
         409,
-        'FIDELIZACION_PRODUCTO_INACTIVE',
-        'Uno o mas productos seleccionados estan inactivos.'
+        'FIDELIZACION_PRODUCTO_ASIGNACION_AMBIGUA',
+        `El producto ${row.nombre_producto || item.id_producto} tiene mas de una asignacion activa en esta sucursal.`
       );
     }
 
-    if (!Boolean(row.almacen_estado) || Number(row.almacen_id_sucursal || 0) !== sucursalId) {
+    if (row.assignment_status !== 'OK') {
       throw createFidelizacionError(
         409,
-        'FIDELIZACION_PRODUCTO_SCOPE_ERROR',
-        'Uno o mas productos no pertenecen al inventario operativo de la sucursal.'
+        'FIDELIZACION_PRODUCTO_SIN_ASIGNACION',
+        `El producto ${row.nombre_producto || item.id_producto} no tiene una asignacion de inventario activa en esta sucursal.`
       );
     }
 
