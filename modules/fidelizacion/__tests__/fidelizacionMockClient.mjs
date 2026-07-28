@@ -15,18 +15,107 @@ const DEFAULT_CLIENTE_PROFILE = { estado: true, nombre: 'Cliente Demo', telefono
 
 const toDateOrNull = (value) => (value ? new Date(value) : null);
 
+// ---------------------------------------------------------------------------
+// Modelo fiel de `timestamp without time zone` de PostgreSQL
+// ---------------------------------------------------------------------------
+// Varias columnas del sistema son `timestamp without time zone` (sin offset):
+// el valor guardado es un reloj de pared, y el INSTANTE que representa depende
+// de la zona con la que se interprete.
+//
+//   - facturas.fecha_hora_facturacion y pedidos_pago_control.fecha_pago_confirmado
+//     guardan hora LOCAL de Honduras.
+//   - fidelizacion_configuracion_sucursal.vigente_desde/vigente_hasta guardan UTC.
+//
+// PostgreSQL resuelve esa interpretacion asi:
+//   - `naked AT TIME ZONE 'X'`      -> se interpreta como hora local de X.
+//   - comparacion naked vs timestamptz SIN AT TIME ZONE -> se interpreta con el
+//     TimeZone de la SESION (en este backend, UTC).
+//
+// Estas dos funciones reproducen exactamente esa regla, y la zona se deduce del
+// TEXTO SQL REAL que emite el codigo de produccion. Asi la prueba no es una
+// asercion de regex sobre el SQL: es la MISMA semantica de PostgreSQL corriendo
+// sobre la consulta real. Si alguien quitara el `AT TIME ZONE 'America/Tegucigalpa'`
+// del repositorio, este mock volveria a interpretar la hora local como UTC
+// -igual que PostgreSQL- y las pruebas del defecto VTA-00004 fallarian.
+//
+// Honduras no aplica horario de verano: offset fijo UTC-6.
+const HONDURAS_UTC_OFFSET_MINUTES = -360;
+const SESSION_TIME_ZONE = 'UTC';
+
+const ZONE_OFFSET_MINUTES = {
+  UTC: 0,
+  'America/Tegucigalpa': HONDURAS_UTC_OFFSET_MINUTES
+};
+
+// Convierte un reloj de pared sin zona ('2026-07-28 12:08:57') en el instante
+// absoluto que representa cuando se interpreta en `zone`. Nunca usa
+// `new Date(stringSinOffset)` (que dependeria del TZ del proceso Node): arma el
+// instante con Date.UTC y aplica el offset de la zona de forma explicita.
+export const nakedTimestampToInstant = (naked, zone = SESSION_TIME_ZONE) => {
+  if (naked === null || naked === undefined || naked === '') return null;
+  const match = /^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})(?::(\d{2}))?/.exec(String(naked).trim());
+  if (!match) return null;
+  const [, year, month, day, hour, minute, second] = match;
+  const wallClockAsUtcMs = Date.UTC(
+    Number(year), Number(month) - 1, Number(day),
+    Number(hour), Number(minute), Number(second || 0)
+  );
+  const offsetMinutes = ZONE_OFFSET_MINUTES[zone] ?? 0;
+  return new Date(wallClockAsUtcMs - offsetMinutes * 60000);
+};
+
+// Zona con la que PostgreSQL interpretara la columna sin zona en ESTA consulta:
+// la declarada con AT TIME ZONE si el SQL real la trae, o el TimeZone de la
+// sesion (UTC) si la consulta no declara ninguna.
+export const zoneAppliedBySql = (sqlText, columnHint = null) => {
+  const source = String(sqlText || '');
+  if (columnHint) {
+    const scoped = new RegExp(`${columnHint}\\s+AT TIME ZONE '([^']+)'`).exec(source);
+    if (scoped) return scoped[1];
+  }
+  const generic = /AT TIME ZONE '([^']+)'/.exec(source);
+  return generic ? generic[1] : SESSION_TIME_ZONE;
+};
+
+// Instante de referencia de una factura tal como lo devolveria PostgreSQL.
+// Compatibilidad: si la prueba declara `fecha_referencia_config` como ISO con
+// offset (el estilo de las pruebas previas), ya es un instante y se usa tal
+// cual -no se vuelve a convertir (evita la doble conversion)-. Solo cuando la
+// prueba declara `fecha_referencia_local_naked` (lo que fisicamente hay en la
+// columna `timestamp without time zone`) se aplica la semantica de zona.
+const resolveFacturaReferenceInstant = (context, sqlText) => {
+  if (context?.fecha_referencia_local_naked) {
+    return nakedTimestampToInstant(context.fecha_referencia_local_naked, zoneAppliedBySql(sqlText));
+  }
+  return context?.fecha_referencia_config ?? null;
+};
+
+// Igual para la vigencia de configuracion: `vigente_desde_naked`/
+// `vigente_hasta_naked` representan lo guardado en columnas sin zona (UTC).
+const resolveConfigBoundary = (cfg, nakedKey, isoKey, sqlText) => {
+  if (cfg?.[nakedKey]) {
+    return nakedTimestampToInstant(cfg[nakedKey], zoneAppliedBySql(sqlText, 'fcs\\.vigente_desde'));
+  }
+  return toDateOrNull(cfg?.[isoKey]);
+};
+
 // Refleja el WHERE real de getActiveFidelizacionConfig: con referenceDate se
 // ignora "estado" (config historica), sin referenceDate se exige estado=true.
-const resolveConfigForDate = (activeConfigs, referenceParam) => {
+// vigente_desde inclusivo (<=), vigente_hasta exclusivo (>).
+const resolveConfigForDate = (activeConfigs, referenceParam, sqlText = '') => {
   const refDate = referenceParam ? new Date(referenceParam) : new Date();
   const matches = activeConfigs.filter((cfg) => {
     if (!referenceParam && cfg.estado === false) return false;
-    const desde = toDateOrNull(cfg.vigente_desde) || new Date(0);
-    const hasta = toDateOrNull(cfg.vigente_hasta);
+    const desde = resolveConfigBoundary(cfg, 'vigente_desde_naked', 'vigente_desde', sqlText) || new Date(0);
+    const hasta = resolveConfigBoundary(cfg, 'vigente_hasta_naked', 'vigente_hasta', sqlText);
     return desde <= refDate && (!hasta || hasta > refDate);
   });
   if (matches.length === 0) return null;
-  matches.sort((a, b) => new Date(b.vigente_desde || 0) - new Date(a.vigente_desde || 0));
+  matches.sort((a, b) => {
+    const aDesde = resolveConfigBoundary(a, 'vigente_desde_naked', 'vigente_desde', sqlText) || new Date(0);
+    const bDesde = resolveConfigBoundary(b, 'vigente_desde_naked', 'vigente_desde', sqlText) || new Date(0);
+    return bDesde - aDesde;
+  });
   return matches[0];
 };
 
@@ -226,7 +315,7 @@ export const createFidelizacionMockClient = ({
   // declaro missingAccumulationIds explicitamente, se respeta tal cual
   // (compatibilidad con pruebas mas simples; el periodo de gracia no aplica
   // a esa via de compatibilidad).
-  const computeMissingAccumulationCandidates = (cursor, limit, graceMs = 0) => {
+  const computeMissingAccumulationCandidates = (cursor, limit, graceMs = 0, sqlText = '') => {
     if (state.missingAccumulationIds !== null) {
       return state.missingAccumulationIds.filter((id) => id > cursor).slice(0, limit);
     }
@@ -249,7 +338,10 @@ export const createFidelizacionMockClient = ({
         if (!isContextFullyPaid(context)) return false;
         if (hasMovimiento(id)) return false;
         if (!isRetryableOrNoState(id)) return false;
-        const refMs = context.fecha_referencia_config ? new Date(context.fecha_referencia_config).getTime() : NaN;
+        // El periodo de gracia compara el MISMO instante canonico que la
+        // consulta real (con su AT TIME ZONE), no el reloj de pared crudo.
+        const refInstant = resolveFacturaReferenceInstant(context, sqlText);
+        const refMs = refInstant ? new Date(refInstant).getTime() : NaN;
         if (Number.isFinite(refMs) && refMs > graceCutoff) return false;
         return true;
       })
@@ -383,7 +475,9 @@ export const createFidelizacionMockClient = ({
             id_pedido: idPedido,
             id_cliente: idCliente,
             id_sucursal: context.id_sucursal ?? null,
-            fecha_referencia: context.fecha_referencia_config ?? null,
+            // Misma conversion de zona que aplicaria PostgreSQL sobre el SQL
+            // real de fetchAccumulationSnapshotSources.
+            fecha_referencia: resolveFacturaReferenceInstant(context, text),
             origen_pedido: pedido ? (pedido.origen_pedido ?? null) : null,
             pedido_id_cliente: pedido ? (pedido.id_cliente ?? null) : null,
             nombre_contacto: contacto ? (contacto.nombre_contacto ?? null) : null,
@@ -542,7 +636,7 @@ export const createFidelizacionMockClient = ({
         const cursor = Number(params[0]) || 0;
         const limit = Number(params[1]) || 25;
         const graceMs = Number(params[3]) || 0;
-        const ids = computeMissingAccumulationCandidates(cursor, limit, graceMs);
+        const ids = computeMissingAccumulationCandidates(cursor, limit, graceMs, text);
         return { rows: ids.map((id) => ({ id_factura: id })) };
       }
 
@@ -553,7 +647,16 @@ export const createFidelizacionMockClient = ({
         // COALESCE(f.id_cliente, p.id_cliente): id_sucursal/id_usuario del
         // context se dejan tal cual (esos usan COALESCE(pedido, factura), no
         // forman parte de este bug); solo id_cliente se resuelve aqui.
-        return { rows: [{ id_factura: facturaId, ...context, id_cliente: resolveClienteEfectivo(context) }] };
+        return {
+          rows: [{
+            id_factura: facturaId,
+            ...context,
+            id_cliente: resolveClienteEfectivo(context),
+            // Misma conversion de zona que aplicaria PostgreSQL sobre el SQL
+            // real de getFacturaAccumulationContext.
+            fecha_referencia_config: resolveFacturaReferenceInstant(context, text)
+          }]
+        };
       }
 
       // Perfil de cliente (fetchClienteProfileForFidelizacion): activo,
@@ -588,7 +691,9 @@ export const createFidelizacionMockClient = ({
       }
 
       if (text.includes('FROM public.fidelizacion_configuracion_sucursal')) {
-        const match = resolveConfigForDate(state.activeConfigs, params[1]);
+        // Se pasa el SQL real: la zona con la que se interpretan
+        // vigente_desde/vigente_hasta sale de la propia consulta.
+        const match = resolveConfigForDate(state.activeConfigs, params[1], text);
         return { rows: match ? [match] : [] };
       }
 

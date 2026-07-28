@@ -279,8 +279,24 @@ export const getActiveFidelizacionConfig = async (client, idSucursal, referenceD
       FROM public.fidelizacion_configuracion_sucursal fcs
       WHERE fcs.id_sucursal = $1
         AND ($2::timestamptz IS NOT NULL OR COALESCE(fcs.estado, true) = true)
-        AND fcs.vigente_desde <= COALESCE($2::timestamptz, NOW())
-        AND (fcs.vigente_hasta IS NULL OR fcs.vigente_hasta > COALESCE($2::timestamptz, NOW()))
+        -- vigente_desde/vigente_hasta son 'timestamp without time zone' que
+        -- guardan HORA UTC: se escriben con NOW() a secas (ver saveConfiguracion
+        -- en routers/fidelizacion.js) y PostgreSQL castea timestamptz ->
+        -- timestamp con el TimeZone de la sesion, que es UTC. Se declara esa
+        -- zona explicitamente (AT TIME ZONE 'UTC' -> timestamptz) en vez de
+        -- confiar en el cast implicito: asi la comparacion es siempre entre
+        -- instantes reales equivalentes y deja de depender del TimeZone de la
+        -- sesion/servidor. La fecha de referencia ($2) ya llega como instante
+        -- absoluto desde el punto canonico de conversion
+        -- (FACTURA_REFERENCE_INSTANT_SQL en modules/fidelizacion/infrastructure/
+        -- fidelizacionRepository.js), asi que aqui NO se vuelve a convertir.
+        -- Semantica de vigencia intacta: vigente_desde inclusivo (<=),
+        -- vigente_hasta exclusivo (>).
+        AND (fcs.vigente_desde AT TIME ZONE 'UTC') <= COALESCE($2::timestamptz, NOW())
+        AND (
+          fcs.vigente_hasta IS NULL
+          OR (fcs.vigente_hasta AT TIME ZONE 'UTC') > COALESCE($2::timestamptz, NOW())
+        )
       ORDER BY fcs.vigente_desde DESC, fcs.id_configuracion DESC
       LIMIT 1
     `,

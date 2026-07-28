@@ -20,6 +20,45 @@ export const FIDELIZACION_ACCUMULATION_ADVISORY_LOCK_CLASS = 724201;
 // Duplicado deliberadamente: Fidelizacion no debe depender de constantes internas de Ventas.
 const PAGADO_CONFIRMADO_CODIGO = 'PAGADO_CONFIRMADO';
 
+// ---------------------------------------------------------------------------
+// PUNTO CANONICO UNICO: fecha local de factura -> instante absoluto (timestamptz)
+// ---------------------------------------------------------------------------
+// Defecto confirmado (VTA-00004): tanto facturas.fecha_hora_facturacion como
+// pedidos_pago_control.fecha_pago_confirmado son `timestamp without time zone`
+// que guardan HORA LOCAL DE HONDURAS -se escriben con
+// (NOW() AT TIME ZONE 'America/Tegucigalpa'); ver
+// sql/2026-05-02_honduras_operational_timestamps.sql,
+// routers/ventas/services/ventaImmediatePaymentStateService.js y routers/ventas.js-.
+// En cambio fidelizacion_configuracion_sucursal.vigente_desde/vigente_hasta son
+// `timestamp without time zone` que guardan HORA UTC (se escriben con NOW() a
+// secas, y PostgreSQL castea timestamptz -> timestamp usando el TimeZone de la
+// sesion, que es UTC).
+//
+// Al comparar ambos sin declarar zona, PostgreSQL interpretaba la hora local de
+// la factura como si fuera UTC: una venta de las 12:08 Honduras (18:08 UTC real)
+// se comparaba como "12:08 UTC" contra una configuracion activada a las 17:43
+// UTC, concluia 12:08 < 17:43 y seleccionaba la configuracion historica anterior
+// -con acumulacion desactivada-, devolviendo ACCUMULATION_DISABLED.
+//
+// Este fragmento es el UNICO lugar donde una fecha local de factura se convierte
+// en instante absoluto. Todas las consultas de acumulacion (contexto LIVE,
+// snapshot durable y candidatos de reconciliacion) lo reutilizan, de modo que
+// LIVE, RECOVERY y RECONCILE comparten exactamente el mismo contrato temporal y
+// nunca se compara un instante ya convertido contra uno sin convertir.
+// El resultado es `timestamptz`, asi que el driver de PostgreSQL lo entrega como
+// un instante absoluto: la conversion NO depende del TZ del proceso Node, ni se
+// resta ninguna hora a mano en JavaScript.
+//
+// SQL dinamico permitido: se interpola una constante interna del modulo, jamas
+// un valor de la peticion (misma politica ya usada por TEGUCIGALPA_TIMEZONE en
+// services/fidelizacionService.js).
+//
+// Requiere que la consulta exponga los alias `upc` (pedidos_pago_control) y `f`
+// (facturas), que es como estan escritas las tres consultas de acumulacion.
+const HONDURAS_TIMEZONE = 'America/Tegucigalpa';
+export const FACTURA_REFERENCE_INSTANT_SQL =
+  `(COALESCE(upc.fecha_pago_confirmado, f.fecha_hora_facturacion) AT TIME ZONE '${HONDURAS_TIMEZONE}')`;
+
 const parsePositiveInt = (value) => {
   const parsed = Number.parseInt(String(value ?? ''), 10);
   return Number.isInteger(parsed) && parsed > 0 ? parsed : null;
@@ -96,7 +135,7 @@ export const getFacturaAccumulationContext = async (client, idFactura) => {
         COALESCE(p.id_usuario, f.id_usuario) AS id_usuario,
         COALESCE(f.id_cliente, p.id_cliente) AS id_cliente,
         COALESCE(fc.total_cobrado, 0) AS monto_factura,
-        COALESCE(upc.fecha_pago_confirmado, f.fecha_hora_facturacion) AS fecha_referencia_config,
+        ${FACTURA_REFERENCE_INSTANT_SQL} AS fecha_referencia_config,
         (upc.id_pedido_pago_control IS NOT NULL) AS tiene_pago_control,
         upc.monto_pendiente AS pago_control_monto_pendiente,
         cep.codigo AS pago_control_estado_codigo
@@ -176,7 +215,7 @@ const fetchAccumulationSnapshotSources = async (client, idFactura) => {
         f.id_pedido,
         COALESCE(f.id_cliente, p.id_cliente) AS id_cliente,
         COALESCE(p.id_sucursal, f.id_sucursal) AS id_sucursal,
-        COALESCE(upc.fecha_pago_confirmado, f.fecha_hora_facturacion) AS fecha_referencia,
+        ${FACTURA_REFERENCE_INSTANT_SQL} AS fecha_referencia,
         p.origen_pedido,
         p.id_cliente AS pedido_id_cliente,
         pc.nombre_contacto,
@@ -758,7 +797,7 @@ export const listPaidInvoicesMissingAccumulation = async (client, { cursor = 0, 
     `
       SELECT
         f.id_factura,
-        COALESCE(upc.fecha_pago_confirmado, f.fecha_hora_facturacion) AS fecha_referencia_config,
+        ${FACTURA_REFERENCE_INSTANT_SQL} AS fecha_referencia_config,
         COALESCE(p.id_sucursal, f.id_sucursal) AS id_sucursal
       FROM public.facturas f
       LEFT JOIN public.pedidos p ON p.id_pedido = f.id_pedido
@@ -797,7 +836,11 @@ export const listPaidInvoicesMissingAccumulation = async (client, { cursor = 0, 
         -- paso hace al menos $4 ms. Evita la carrera con el camino LIVE, que
         -- todavia no tuvo tiempo de crear su fila PENDING para una factura
         -- pagada hace unos instantes.
-        AND COALESCE(upc.fecha_pago_confirmado, f.fecha_hora_facturacion)
+        -- Mismo instante canonico: sin la conversion, una factura local de las
+        -- 12:08 Honduras se comparaba como 12:08 UTC (6 horas mas vieja de lo
+        -- real) contra NOW(), y el periodo de gracia se daba por cumplido antes
+        -- de tiempo, reabriendo justo la carrera con LIVE que pretende evitar.
+        AND ${FACTURA_REFERENCE_INSTANT_SQL}
           <= NOW() - make_interval(secs => $4::double precision / 1000)
         AND NOT EXISTS (
           SELECT 1
