@@ -1,7 +1,29 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
-import { buildClienteBaseSql } from '../fidelizacion.js';
+import { readFile } from 'node:fs/promises';
+import {
+  buildClienteBaseSql,
+  buildClienteWhereClause,
+  escapeLikePattern,
+  buildLikeSearch,
+  parsePageParam,
+  parseLimitParam,
+  MAX_SEARCH_LENGTH,
+  MAX_PAGE_SIZE,
+  DEFAULT_CLIENTES_PAGE_SIZE
+} from '../fidelizacion.js';
 import { isClienteProfileComplete } from '../../services/fidelizacionService.js';
+
+const getRouterSource = () => readFile(new URL('../fidelizacion.js', import.meta.url), 'utf8');
+
+const getListClientesHandler = async () => {
+  const source = await getRouterSource();
+  const start = source.indexOf('async listClientes(req)');
+  assert.notEqual(start, -1, 'No se encontro el handler listClientes');
+  const end = source.indexOf('\n  },', start);
+  assert.notEqual(end, -1, 'No se encontro el cierre de listClientes');
+  return source.slice(start, end);
+};
 
 // buildClienteBaseSql es una funcion pura (arma texto SQL, no toca la DB),
 // asi que se puede llamar directamente y verificar el SQL real que produce
@@ -95,6 +117,252 @@ describe('buildClienteWhereClause: la busqueda sigue funcionando sobre las misma
   it('la busqueda referencia nombre_principal/correo/telefono/documento/nombre_usuario/id_cliente', async () => {
     const { fidelizacionService } = await import('../fidelizacion.js');
     assert.ok(fidelizacionService.listClientes, 'listClientes debe seguir existiendo');
+  });
+});
+
+describe('buildClienteWhereClause: filtro de puntos + busqueda (contrato SQL exacto)', () => {
+  const sql = buildClienteWhereClause({ searchParamRef: '$2' });
+
+  it('el primer AND es un OR entre "existe busqueda" y los puntos (misma condicion que dataQuery y countQuery comparten)', () => {
+    assert.match(
+      sql,
+      /AND \(\s*\n\s*\$2::text IS NOT NULL\s*\n\s*OR COALESCE\(cc\.puntos_acumulados_total, 0\) > 0\s*\n\s*OR COALESCE\(cc\.puntos_disponibles, 0\) > 0\s*\n\s*\)/
+    );
+  });
+
+  it('sin busqueda ($2 IS NULL) el filtro exige acumulados>0 O disponibles>0 (nunca solo disponibles>0, que ocultaria a quien ya canjeo todo)', () => {
+    assert.match(sql, /OR COALESCE\(cc\.puntos_acumulados_total, 0\) > 0/);
+    assert.match(sql, /OR COALESCE\(cc\.puntos_disponibles, 0\) > 0/);
+  });
+
+  it('con busqueda ($2 IS NOT NULL) el filtro de puntos queda anulado: es el primer termino del OR, por eso el AND completo ya es verdadero', () => {
+    const puntosAndIdx = sql.indexOf('AND (\n      $2::text IS NOT NULL');
+    assert.notEqual(puntosAndIdx, -1);
+  });
+
+  it('el segundo AND (columnas de busqueda) es independiente del filtro de puntos', () => {
+    assert.match(sql, /AND \(\s*\n\s*\$2::text IS NULL\s*\n\s*OR cc\.nombre_principal ILIKE \$2/);
+  });
+
+  it('busca por nombre, correo, telefono, documento, nombre_usuario e id_cliente (columnas permitidas, ninguna otra)', () => {
+    assert.match(sql, /cc\.nombre_principal ILIKE \$2/);
+    assert.match(sql, /cc\.correo ILIKE \$2/);
+    assert.match(sql, /cc\.telefono ILIKE \$2/);
+    assert.match(sql, /cc\.documento ILIKE \$2/);
+    assert.match(sql, /cc\.nombre_usuario ILIKE \$2/);
+    assert.match(sql, /cc\.id_cliente::text ILIKE \$2/);
+  });
+
+  it('las 6 comparaciones ILIKE usan clausula ESCAPE valida de Postgres', () => {
+    const ilikeCount = (sql.match(/ILIKE \$2/g) || []).length;
+    const escapeCount = (sql.match(/ILIKE \$2 ESCAPE '\\'/g) || []).length;
+    assert.equal(ilikeCount, 6);
+    assert.equal(escapeCount, 6, 'las 6 columnas de busqueda deben declarar ESCAPE');
+  });
+
+  it('el placeholder es siempre el parametro recibido, nunca un valor interpolado desde req.query', () => {
+    assert.doesNotMatch(sql, /req\.query/);
+  });
+
+  it('es una funcion pura parametrizable por posicion (no hardcodea "$2"): sirve para no duplicar el filtro entre dataQuery y countQuery', () => {
+    const altSql = buildClienteWhereClause({ searchParamRef: '$5' });
+    assert.match(altSql, /\$5::text IS NOT NULL/);
+    assert.match(altSql, /cc\.nombre_principal ILIKE \$5 ESCAPE '\\'/);
+  });
+});
+
+describe('escapeLikePattern: % _ y \\ se escapan (no son comodines arbitrarios de ILIKE)', () => {
+  it('escapa % con \\%', () => {
+    assert.equal(escapeLikePattern('50%'), '50\\%');
+  });
+
+  it('escapa _ con \\_', () => {
+    assert.equal(escapeLikePattern('a_b'), 'a\\_b');
+  });
+
+  it('escapa \\ (el propio caracter de escape) con \\\\', () => {
+    assert.equal(escapeLikePattern('a\\b'), 'a\\\\b');
+  });
+
+  it('escapa combinaciones de los tres caracteres en una sola pasada', () => {
+    assert.equal(escapeLikePattern('100%_off\\now'), '100\\%\\_off\\\\now');
+  });
+
+  it('no modifica el resto del texto', () => {
+    assert.equal(escapeLikePattern('Juan Perez'), 'Juan Perez');
+  });
+});
+
+describe('buildLikeSearch: normaliza, escapa y envuelve con % (usa escapeLikePattern antes de comodinar)', () => {
+  it('un porcentaje literal en la busqueda se trata como texto, no como comodin', () => {
+    assert.equal(buildLikeSearch('50%'), '%50\\%%');
+  });
+
+  it('un guion bajo literal se trata como texto, no como comodin', () => {
+    assert.equal(buildLikeSearch('a_b'), '%a\\_b%');
+  });
+
+  it('una barra invertida literal se escapa (no rompe la clausula ESCAPE de Postgres)', () => {
+    assert.equal(buildLikeSearch('a\\b'), '%a\\\\b%');
+  });
+
+  it('texto vacio o solo espacios devuelve null (sin busqueda: aplica el filtro de puntos)', () => {
+    assert.equal(buildLikeSearch(''), null);
+    assert.equal(buildLikeSearch('   '), null);
+    assert.equal(buildLikeSearch(undefined), null);
+  });
+
+  it('recorta espacios en los extremos antes de envolver', () => {
+    assert.equal(buildLikeSearch('  Juan  '), '%Juan%');
+  });
+});
+
+describe('Seguridad: parsePageParam/parseLimitParam rechazan fragmentos SQL y valores no enteros', () => {
+  it('page=0 y page=-1 se rechazan', () => {
+    assert.equal(parsePageParam('0'), null);
+    assert.equal(parsePageParam('-1'), null);
+  });
+
+  it('page="1 OR 1=1" se rechaza (Number.parseInt lo truncaria a 1 si no se validara con regex estricto)', () => {
+    assert.equal(parsePageParam('1 OR 1=1'), null);
+  });
+
+  it('limit="9;DROP TABLE clientes" se rechaza (no se trunca a 9)', () => {
+    assert.equal(parseLimitParam('9;DROP TABLE clientes'), null);
+  });
+
+  it('limit="abc" se rechaza', () => {
+    assert.equal(parseLimitParam('abc'), null);
+  });
+
+  it('limit="9.5" se rechaza (no se trunca a 9): no se aceptan decimales', () => {
+    assert.equal(parseLimitParam('9.5'), null);
+  });
+
+  it('limit=0 se rechaza', () => {
+    assert.equal(parseLimitParam('0'), null);
+  });
+
+  it('valores validos si se aceptan: page="2" -> 2, limit="9" -> 9', () => {
+    assert.equal(parsePageParam('2'), 2);
+    assert.equal(parseLimitParam('9'), 9);
+  });
+
+  it('limit sigue acotado por el maximo de seguridad existente (MAX_PAGE_SIZE=100)', () => {
+    assert.equal(MAX_PAGE_SIZE, 100);
+    assert.equal(parseLimitParam('500'), 100);
+  });
+
+  it('sin parametro, listClientes usa 9 por defecto (DEFAULT_CLIENTES_PAGE_SIZE)', () => {
+    assert.equal(DEFAULT_CLIENTES_PAGE_SIZE, 9);
+    assert.equal(parseLimitParam(undefined, DEFAULT_CLIENTES_PAGE_SIZE), 9);
+  });
+});
+
+describe('Seguridad: payloads maliciosos en "search" nunca alteran el texto SQL, solo viajan como parametro', () => {
+  it('%\' OR 1=1 -- queda escapado y nunca aparece como fragmento SQL en el WHERE', () => {
+    const malicious = "%' OR 1=1 --";
+    const pattern = buildLikeSearch(malicious);
+    assert.equal(pattern, "%\\%' OR 1=1 --%", 'el % inicial del payload debe quedar escapado como texto literal');
+
+    const sql = buildClienteWhereClause({ searchParamRef: '$2' });
+    assert.doesNotMatch(sql, /OR 1=1/, 'el WHERE es un string constante: nunca incluye el valor de busqueda');
+  });
+
+  it("'; DROP TABLE clientes; -- solo queda en el arreglo de parametros, jamas en el texto SQL", () => {
+    const malicious = "'; DROP TABLE clientes; --";
+    const pattern = buildLikeSearch(malicious);
+    assert.equal(pattern, `%${malicious}%`, 'sin % _ o \\ que escapar, el payload solo queda envuelto en %...%');
+
+    const sql = buildClienteWhereClause({ searchParamRef: '$2' });
+    assert.doesNotMatch(sql, /DROP TABLE/);
+    assert.doesNotMatch(sql, /--/);
+  });
+});
+
+describe('listClientes: paginacion y busqueda parametrizadas (fuente real del handler)', () => {
+  it('el limit por defecto (sin query param) es 9 (DEFAULT_CLIENTES_PAGE_SIZE), no 20', async () => {
+    const handler = await getListClientesHandler();
+    assert.match(handler, /parseLimitParam\(req\.query\.limit, DEFAULT_CLIENTES_PAGE_SIZE\)/);
+  });
+
+  it('LIMIT y OFFSET usan placeholders literales ($3/$4), nunca un valor interpolado', async () => {
+    const handler = await getListClientesHandler();
+    assert.match(handler, /LIMIT \$3\s*\n\s*OFFSET \$4/);
+    assert.doesNotMatch(handler, /LIMIT \$\{/);
+    assert.doesNotMatch(handler, /OFFSET \$\{/);
+    assert.doesNotMatch(handler, /req\.query\.offset/);
+  });
+
+  it('el offset se calcula en JS como (page - 1) * limit, con page/limit ya validados', async () => {
+    const handler = await getListClientesHandler();
+    assert.match(handler, /const offset = \(page - 1\) \* limit;/);
+  });
+
+  it('el arreglo de parametros de dataQuery es [id_sucursal, search, limit, offset] en ese orden', async () => {
+    const handler = await getListClientesHandler();
+    assert.match(handler, /pool\.query\(dataQuery, \[scope\.targetSucursalId, search, limit, offset\]\)/);
+  });
+
+  it('el arreglo de parametros de countQuery es [id_sucursal, search] (misma condicion, sin limit/offset)', async () => {
+    const handler = await getListClientesHandler();
+    assert.match(handler, /pool\.query\(countQuery, \[scope\.targetSucursalId, search\]\)/);
+  });
+
+  it('dataQuery y countQuery llaman buildClienteWhereClause con el mismo placeholder: comparten exactamente la misma condicion', async () => {
+    const handler = await getListClientesHandler();
+    const calls = [...handler.matchAll(/buildClienteWhereClause\(\{ searchParamRef: '(\$\d)' \}\)/g)];
+    assert.equal(calls.length, 2, 'dataQuery y countQuery deben construir el WHERE con el mismo helper, cada una una vez');
+    assert.equal(calls[0][1], calls[1][1], 'ambas queries deben usar el mismo placeholder de busqueda');
+  });
+
+  it('el ORDER BY es fijo en el servidor (nombre_principal, id_cliente), nunca proviene de la peticion', async () => {
+    const handler = await getListClientesHandler();
+    assert.match(handler, /ORDER BY cc\.nombre_principal ASC, cc\.id_cliente ASC/);
+    assert.doesNotMatch(handler, /ORDER BY \$\{/);
+    assert.doesNotMatch(handler, /req\.query\.orderBy/);
+    assert.doesNotMatch(handler, /req\.query\.sort/);
+  });
+
+  it('search se obtiene de req.query.search con fallback a req.query.q, sin concatenarse jamas en un template SQL', async () => {
+    const handler = await getListClientesHandler();
+    assert.match(handler, /req\.query\.search !== undefined \? req\.query\.search : req\.query\.q/);
+    assert.doesNotMatch(handler, /ILIKE '%\$\{/);
+    assert.doesNotMatch(handler, /ILIKE \$\{/);
+  });
+});
+
+describe('listClientes: longitud maxima de busqueda (120 caracteres, 400 en vez de truncar en silencio)', () => {
+  it('MAX_SEARCH_LENGTH es 120', () => {
+    assert.equal(MAX_SEARCH_LENGTH, 120);
+  });
+
+  it('una busqueda que exceda MAX_SEARCH_LENGTH devuelve VALIDATION_ERROR 400 antes de tocar la base de datos', async () => {
+    const handler = await getListClientesHandler();
+    assert.match(handler, /normalizeText\(rawSearchInput\)\.length > MAX_SEARCH_LENGTH/);
+    const idx = handler.search(/normalizeText\(rawSearchInput\)\.length > MAX_SEARCH_LENGTH/);
+    const surrounding = handler.slice(idx, idx + 300);
+    assert.match(surrounding, /status:\s*400/);
+    assert.match(surrounding, /VALIDATION_ERROR/);
+    // La validacion de longitud ocurre antes de resolveFidelizacionScope (antes de tocar la DB).
+    const scopeIdx = handler.indexOf('resolveFidelizacionScope');
+    assert.ok(idx < scopeIdx, 'la validacion de longitud debe ocurrir antes de resolveFidelizacionScope');
+  });
+});
+
+describe('listClientes: id_sucursal sigue validado y jamas confiado del frontend', () => {
+  it('id_sucursal invalido (no entero positivo) devuelve 400 antes de resolver el scope', async () => {
+    const handler = await getListClientesHandler();
+    const idx = handler.indexOf("message: 'id_sucursal debe ser un entero positivo.'");
+    assert.notEqual(idx, -1);
+    const scopeIdx = handler.indexOf('resolveFidelizacionScope');
+    assert.ok(idx < scopeIdx, 'la validacion de id_sucursal debe ocurrir antes de resolveFidelizacionScope');
+  });
+
+  it('el id_sucursal efectivo siempre pasa por resolveFidelizacionScope (permisos/alcance multisucursal), nunca se usa crudo', async () => {
+    const handler = await getListClientesHandler();
+    assert.match(handler, /const scope = await resolveFidelizacionScope\(\{/);
+    assert.match(handler, /scope\.targetSucursalId/);
   });
 });
 

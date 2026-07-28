@@ -27,18 +27,34 @@ import {
 const router = express.Router();
 
 const MAX_PAGE_SIZE = 100;
+const MAX_SEARCH_LENGTH = 120;
+const DEFAULT_CLIENTES_PAGE_SIZE = 9;
 const MULTISUCURSAL_PERMISSION = 'fidelizacion_ver_multisucursal';
 const TEGUCIGALPA_TIMEZONE = 'America/Tegucigalpa';
 
 const isPlainObject = (value) => value !== null && typeof value === 'object' && !Array.isArray(value);
 
+// page/limit deben llegar como enteros positivos "puros": Number.parseInt
+// trunca decimales y se detiene en el primer caracter no numerico (p.ej.
+// "1 OR 1=1" -> 1, "9;DROP TABLE clientes" -> 9), asi que aceptaria payloads
+// maliciosos como validos. Este regex exige que TODO el valor sean digitos
+// antes de pasarlo a parsePositiveInt.
+const STRICT_POSITIVE_INTEGER_PATTERN = /^\d+$/;
+
+const isStrictPositiveIntegerString = (value) => {
+  if (typeof value === 'number') return Number.isInteger(value) && value > 0;
+  return STRICT_POSITIVE_INTEGER_PATTERN.test(String(value ?? '').trim());
+};
+
 const parsePageParam = (value, fallback = 1) => {
   if (value === undefined) return fallback;
+  if (!isStrictPositiveIntegerString(value)) return null;
   return parsePositiveInt(value);
 };
 
 const parseLimitParam = (value, fallback = 20) => {
   if (value === undefined) return fallback;
+  if (!isStrictPositiveIntegerString(value)) return null;
   const parsed = parsePositiveInt(value);
   if (!parsed) return null;
   return Math.min(parsed, MAX_PAGE_SIZE);
@@ -55,9 +71,15 @@ const parseOptionalDateOnly = (value) => {
   return isValidDateOnly(normalized) ? normalized : null;
 };
 
+// % y _ son comodines de ILIKE aunque el valor viaje parametrizado ($n): un
+// parametro evita SQL injection pero no evita que el usuario use un
+// comodin arbitrario. Se escapan junto con la propia barra invertida (que
+// es el caracter de escape) para que %, _ y \ se busquen como texto literal.
+const escapeLikePattern = (value) => String(value).replace(/[\\%_]/g, (character) => `\\${character}`);
+
 const buildLikeSearch = (value) => {
   const normalized = normalizeText(value);
-  return normalized ? `%${normalized}%` : null;
+  return normalized ? `%${escapeLikePattern(normalized)}%` : null;
 };
 
 const asyncHandler = (handler, { defaultCode, defaultMessage }) => async (req, res) => {
@@ -338,17 +360,28 @@ const buildClienteBaseSql = (empresaRelationExpr = 'c.id_empresa') => `
   )
 `;
 
+// Sin busqueda: solo clientes con participacion real (acumulados o
+// disponibles > 0), para no listar clientes en cero por defecto. Con
+// busqueda: el filtro de puntos se desactiva por completo (para poder
+// encontrar un cliente aunque tenga 0 en las tres columnas), y en su lugar
+// debe coincidir con alguna columna permitida. searchParamRef es siempre una
+// constante interna ($2), nunca un valor recibido de req.query.
 const buildClienteWhereClause = ({ searchParamRef }) => `
   FROM cliente_cards cc
   WHERE cc.visible_en_sucursal = true
     AND (
+      ${searchParamRef}::text IS NOT NULL
+      OR COALESCE(cc.puntos_acumulados_total, 0) > 0
+      OR COALESCE(cc.puntos_disponibles, 0) > 0
+    )
+    AND (
       ${searchParamRef}::text IS NULL
-      OR cc.nombre_principal ILIKE ${searchParamRef}
-      OR cc.correo ILIKE ${searchParamRef}
-      OR cc.telefono ILIKE ${searchParamRef}
-      OR cc.documento ILIKE ${searchParamRef}
-      OR cc.nombre_usuario ILIKE ${searchParamRef}
-      OR cc.id_cliente::text ILIKE ${searchParamRef}
+      OR cc.nombre_principal ILIKE ${searchParamRef} ESCAPE '\\'
+      OR cc.correo ILIKE ${searchParamRef} ESCAPE '\\'
+      OR cc.telefono ILIKE ${searchParamRef} ESCAPE '\\'
+      OR cc.documento ILIKE ${searchParamRef} ESCAPE '\\'
+      OR cc.nombre_usuario ILIKE ${searchParamRef} ESCAPE '\\'
+      OR cc.id_cliente::text ILIKE ${searchParamRef} ESCAPE '\\'
     )
 `;
 
@@ -500,7 +533,7 @@ const fidelizacionService = {
 
   async listClientes(req) {
     const page = parsePageParam(req.query.page, 1);
-    const limit = parseLimitParam(req.query.limit, 20);
+    const limit = parseLimitParam(req.query.limit, DEFAULT_CLIENTES_PAGE_SIZE);
     if (!page || !limit) {
       return {
         status: 400,
@@ -522,6 +555,17 @@ const fidelizacionService = {
       };
     }
 
+    const rawSearchInput = req.query.search !== undefined ? req.query.search : req.query.q;
+    if (rawSearchInput !== undefined && normalizeText(rawSearchInput).length > MAX_SEARCH_LENGTH) {
+      return {
+        status: 400,
+        body: buildErrorBody({
+          code: 'VALIDATION_ERROR',
+          message: `search no debe exceder ${MAX_SEARCH_LENGTH} caracteres.`
+        })
+      };
+    }
+
     const scope = await resolveFidelizacionScope({
       req,
       client: pool,
@@ -529,7 +573,7 @@ const fidelizacionService = {
       allowAllBranches: true
     });
 
-    const search = buildLikeSearch(req.query.search || req.query.q);
+    const search = buildLikeSearch(rawSearchInput);
     const offset = (page - 1) * limit;
     const empresaRelationExpr = await buildClienteEmpresaRelationSql(pool, 'c');
 
@@ -1782,7 +1826,19 @@ router.get(
   })
 );
 
-// buildClienteBaseSql se exporta solo para pruebas (verificar la SQL real
-// generada sin depender de una base de datos).
-export { fidelizacionService, buildClienteBaseSql };
+// Estos helpers puros se exportan solo para pruebas (verificar la SQL real
+// generada y la validacion/escape de listClientes sin depender de una base
+// de datos).
+export {
+  fidelizacionService,
+  buildClienteBaseSql,
+  buildClienteWhereClause,
+  escapeLikePattern,
+  buildLikeSearch,
+  parsePageParam,
+  parseLimitParam,
+  MAX_SEARCH_LENGTH,
+  MAX_PAGE_SIZE,
+  DEFAULT_CLIENTES_PAGE_SIZE
+};
 export default router;
