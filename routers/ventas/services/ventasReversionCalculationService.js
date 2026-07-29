@@ -133,14 +133,29 @@ export const resolveFacturaLinesForUpdate = async (client, idFactura) => {
   return result.rows;
 };
 
+const EMPTY_REVERSED_AMOUNTS = Object.freeze({
+  cantidad: 0,
+  subtotal: 0,
+  descuento: 0,
+  isv_15: 0,
+  isv_18: 0,
+  total: 0
+});
+
 /**
  * Bloquea (FOR UPDATE) las cabeceras de reversiones APLICADA de esta
- * factura antes de agregar sus cantidades revertidas, para que ninguna
- * transaccion concurrente pueda alterar su estado mientras se calculan los
- * saldos reversables de esta operacion. La serializacion primaria ya viene
- * del `SELECT ... FOR UPDATE` sobre la propia factura (tomado antes que
- * esto en el flujo de creacion); este lock es una capa adicional explicita
- * sobre las reversiones anteriores en si.
+ * factura antes de agregar sus cantidades/montos revertidos, para que
+ * ninguna transaccion concurrente pueda alterar su estado mientras se
+ * calculan los saldos reversables de esta operacion. La serializacion
+ * primaria ya viene del `SELECT ... FOR UPDATE` sobre la propia factura
+ * (tomado antes que esto en el flujo de creacion); este lock es una capa
+ * adicional explicita sobre las reversiones anteriores en si.
+ *
+ * Devuelve, por id_detalle_factura, tanto la cantidad ya revertida como
+ * los montos ya revertidos (subtotal/descuento/isv_15/isv_18/total) --
+ * necesarios para que la ultima reversion que completa una linea absorba
+ * exactamente el residuo restante en vez de volver a prorratear desde el
+ * valor original (ver ajusteResiduoMonetario en resolveReversionLines).
  */
 export const resolveAlreadyReversedQty = async (client, idFactura) => {
   await client.query(
@@ -157,7 +172,14 @@ export const resolveAlreadyReversedQty = async (client, idFactura) => {
 
   const result = await client.query(
     `
-      SELECT rd.id_detalle_factura, COALESCE(SUM(rd.cantidad_revertida), 0)::numeric AS cantidad_revertida
+      SELECT
+        rd.id_detalle_factura,
+        COALESCE(SUM(rd.cantidad_revertida), 0)::numeric AS cantidad_revertida,
+        COALESCE(SUM(rd.subtotal_revertido), 0)::numeric(12,2) AS subtotal_revertido,
+        COALESCE(SUM(rd.descuento_revertido), 0)::numeric(12,2) AS descuento_revertido,
+        COALESCE(SUM(rd.isv_15_revertido), 0)::numeric(12,2) AS isv_15_revertido,
+        COALESCE(SUM(rd.isv_18_revertido), 0)::numeric(12,2) AS isv_18_revertido,
+        COALESCE(SUM(rd.total_revertido), 0)::numeric(12,2) AS total_revertido
       FROM public.facturas_reversiones fr
       INNER JOIN public.facturas_reversiones_detalle rd ON rd.id_reversion = fr.id_reversion
       WHERE fr.id_factura_original = $1
@@ -169,10 +191,19 @@ export const resolveAlreadyReversedQty = async (client, idFactura) => {
 
   const map = new Map();
   for (const row of result.rows) {
-    map.set(Number(row.id_detalle_factura), Number(row.cantidad_revertida));
+    map.set(Number(row.id_detalle_factura), {
+      cantidad: Number(row.cantidad_revertida),
+      subtotal: Number(row.subtotal_revertido),
+      descuento: Number(row.descuento_revertido),
+      isv_15: Number(row.isv_15_revertido),
+      isv_18: Number(row.isv_18_revertido),
+      total: Number(row.total_revertido)
+    });
   }
   return map;
 };
+
+const getReversedAmounts = (reversedQtyMap, idDetalle) => reversedQtyMap.get(idDetalle) || EMPTY_REVERSED_AMOUNTS;
 
 const computeTotalSoldQuantity = (facturaLines) => facturaLines.reduce((sum, line) => {
   const soldQty = Number(line.cantidad_vendida || 0);
@@ -182,7 +213,7 @@ const computeTotalSoldQuantity = (facturaLines) => facturaLines.reduce((sum, lin
 const computeTotalReversedQuantity = (facturaLines, reversedQtyMap) => facturaLines.reduce((sum, line) => {
   const soldQty = Number(line.cantidad_vendida || 0);
   if (!Number.isInteger(soldQty) || soldQty <= 0) return sum;
-  return sum + Number(reversedQtyMap.get(Number(line.id_detalle_factura)) || 0);
+  return sum + getReversedAmounts(reversedQtyMap, Number(line.id_detalle_factura)).cantidad;
 }, 0);
 
 export const validatePartialReversionApplicability = ({ tipoReversion, facturaLines, reversedQtyMap }) => {
@@ -194,7 +225,7 @@ export const validatePartialReversionApplicability = ({ tipoReversion, facturaLi
       if (!Number.isInteger(soldQty) || soldQty <= 0) return null;
 
       const idDetalle = Number(line.id_detalle_factura || 0);
-      const reversedQty = Number(reversedQtyMap.get(idDetalle) || 0);
+      const reversedQty = getReversedAmounts(reversedQtyMap, idDetalle).cantidad;
       const pendingQty = soldQty - reversedQty;
       if (!Number.isInteger(pendingQty) || pendingQty <= 0) return null;
 
@@ -234,7 +265,8 @@ export const resolveReversionLines = ({ tipoReversion, requestedLines, facturaLi
       continue;
     }
 
-    const reversedQty = Number(reversedQtyMap.get(idDetalle) || 0);
+    const reversedAmounts = getReversedAmounts(reversedQtyMap, idDetalle);
+    const reversedQty = reversedAmounts.cantidad;
     const availableQty = soldQty - reversedQty;
 
     const requestedQty = tipoReversion === 'TOTAL'
@@ -257,13 +289,54 @@ export const resolveReversionLines = ({ tipoReversion, requestedLines, facturaLi
       throw createReversionError(409, 'VENTAS_REVERSION_CANTIDAD_EXCEDE_DISPONIBLE', `La línea ${idDetalle} excede la cantidad reversible.`);
     }
 
-    const ratio = requestedQty / soldQty;
-    const subtotal = roundMoney(Number(line.sub_total) * ratio);
-    const descuento = roundMoney(Number(line.descuento_linea) * ratio);
-    const total = roundMoney(Number(line.total_detalle) * ratio);
-
+    // Ajuste de residuo monetario acumulado: cada valor (subtotal,
+    // descuento, ISV 15, ISV 18, total) se calcula por separado como
+    // "valor original - ya revertido", nunca solo "original * ratio" desde
+    // cero. Si esta operacion COMPLETA la cantidad reversable de la linea
+    // (requestedQty === availableQty), se usa exactamente ese residuo en
+    // vez de un prorrateo nuevo -- esto es lo que garantiza que
+    // SUM(reversiones aplicadas de la linea) == snapshot original exacto,
+    // sin importar cuantas reversiones parciales precedieron. Si NO
+    // completa la linea, se aplica el prorrateo normal (ratio =
+    // requestedQty/soldQty) pero recortado (Math.min) para que nunca
+    // pueda exceder el residuo disponible por errores de redondeo.
     const isv15Rate = Number(line.isv_porcentaje || 0) === 15 ? 0.15 : 0;
     const isv18Rate = Number(line.isv_porcentaje || 0) === 18 ? 0.18 : 0;
+
+    const originalSubtotal = roundMoney(line.sub_total);
+    const originalDescuento = roundMoney(line.descuento_linea);
+    const originalTotal = roundMoney(line.total_detalle);
+    const originalIsv15 = roundMoney(Number(line.sub_total) * isv15Rate);
+    const originalIsv18 = roundMoney(Number(line.sub_total) * isv18Rate);
+
+    const remainingSubtotal = roundMoney(originalSubtotal - reversedAmounts.subtotal);
+    const remainingDescuento = roundMoney(originalDescuento - reversedAmounts.descuento);
+    const remainingIsv15 = roundMoney(originalIsv15 - reversedAmounts.isv_15);
+    const remainingIsv18 = roundMoney(originalIsv18 - reversedAmounts.isv_18);
+    const remainingTotal = roundMoney(originalTotal - reversedAmounts.total);
+
+    const completesLine = requestedQty === availableQty;
+
+    let subtotal;
+    let descuento;
+    let isv15;
+    let isv18;
+    let total;
+
+    if (completesLine) {
+      subtotal = remainingSubtotal;
+      descuento = remainingDescuento;
+      isv15 = remainingIsv15;
+      isv18 = remainingIsv18;
+      total = remainingTotal;
+    } else {
+      const ratio = requestedQty / soldQty;
+      subtotal = Math.min(roundMoney(originalSubtotal * ratio), remainingSubtotal);
+      descuento = Math.min(roundMoney(originalDescuento * ratio), remainingDescuento);
+      isv15 = Math.min(roundMoney(originalIsv15 * ratio), remainingIsv15);
+      isv18 = Math.min(roundMoney(originalIsv18 * ratio), remainingIsv18);
+      total = Math.min(roundMoney(originalTotal * ratio), remainingTotal);
+    }
 
     output.push({
       id_detalle_factura: idDetalle,
@@ -271,13 +344,14 @@ export const resolveReversionLines = ({ tipoReversion, requestedLines, facturaLi
       tipo_item: line.tipo_item,
       id_producto: parsePositiveInt(line.id_producto),
       id_receta: parsePositiveInt(line.id_receta),
+      id_detalle_pedido: parsePositiveInt(line.id_detalle_pedido),
       cantidad_vendida: soldQty,
       cantidad_revertida: requestedQty,
       precio_unitario_original: roundMoney(line.precio_unitario),
       subtotal_revertido: subtotal,
       descuento_revertido: descuento,
-      isv_15_revertido: roundMoney(subtotal * isv15Rate),
-      isv_18_revertido: roundMoney(subtotal * isv18Rate),
+      isv_15_revertido: isv15,
+      isv_18_revertido: isv18,
       total_revertido: total,
       devuelve_inventario: Boolean(line.devuelve_inventario)
     });
