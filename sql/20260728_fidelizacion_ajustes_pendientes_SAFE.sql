@@ -381,9 +381,11 @@ $ensure_unique_reversion$;
 DO $ensure_checks$
 DECLARE
   v_definicion text;
+  v_expresion text;
   v_normalizada text;
   v_literales text[];
   v_numeros text[];
+  v_canonica text := 'estado=''pendiente''andpuntos_recuperados=0andpuntos_pendientes=puntos_objetivoorestado=''parcialmente_recuperado''andpuntos_recuperados>0andpuntos_pendientes>0orestado=''recuperado''andpuntos_recuperados=puntos_objetivoandpuntos_pendientes=0';
 BEGIN
   -- 1) estado: conjunto exacto de literales de texto = los 3 estados.
   SELECT pg_get_constraintdef(oid, true) INTO v_definicion
@@ -465,11 +467,13 @@ BEGIN
     END IF;
   END IF;
 
-  -- 6) estado_coherente: conjunto exacto de literales de texto = los 3
-  -- estados, y conjunto exacto de literales numericos = {0} (los 0 de
-  -- puntos_recuperados=0 y puntos_pendientes=0; RECUPERADO/PENDIENTE usan
-  -- comparaciones columna=columna sin literal numerico adicional).
-  SELECT pg_get_constraintdef(oid, true) INTO v_definicion
+  -- 6) estado_coherente: ademas de los conjuntos exactos de literales,
+  -- compara la expresion logica completa. pg_get_expr evita el envoltorio
+  -- CHECK (...); la normalizacion solo elimina casts automaticos de texto,
+  -- espacios y parentesis agregados por PostgreSQL, y homogeneiza
+  -- mayusculas/minusculas. No elimina operadores, columnas ni conectores.
+  SELECT pg_get_constraintdef(oid, true), pg_get_expr(conbin, conrelid, true)
+  INTO v_definicion, v_expresion
   FROM pg_constraint WHERE conrelid = 'public.fidelizacion_ajustes_pendientes'::regclass
     AND conname = 'ck_fidelizacion_ajustes_pendientes_estado_coherente';
 
@@ -486,14 +490,24 @@ BEGIN
     INTO v_literales
     FROM regexp_matches(v_definicion, '''([^'']*)''', 'g') AS m;
 
-    SELECT array_agg(DISTINCT m[0] ORDER BY m[0])
+    SELECT array_agg(DISTINCT m[1] ORDER BY m[1])
     INTO v_numeros
-    FROM regexp_matches(v_definicion, '\y\d+\y', 'g') AS m;
+    FROM regexp_matches(v_expresion, '\y(\d+)\y', 'g') AS m;
+
+    v_normalizada := lower(v_expresion);
+    v_normalizada := regexp_replace(
+      v_normalizada,
+      '::[[:space:]]*(text|character varying)(\([0-9]+\))?',
+      '',
+      'g'
+    );
+    v_normalizada := regexp_replace(v_normalizada, '[[:space:]()]', '', 'g');
 
     IF v_literales IS DISTINCT FROM ARRAY['PARCIALMENTE_RECUPERADO', 'PENDIENTE', 'RECUPERADO']::text[]
        OR v_numeros IS DISTINCT FROM ARRAY['0']::text[]
+       OR v_normalizada IS DISTINCT FROM v_canonica
     THEN
-      RAISE EXCEPTION 'PREFLIGHT_FAILED_ESQUEMA_INCOMPATIBLE: ck_fidelizacion_ajustes_pendientes_estado_coherente existe con una definicion distinta a la esperada (literales=%, numeros=%): %', v_literales, v_numeros, v_definicion;
+      RAISE EXCEPTION 'PREFLIGHT_FAILED_ESQUEMA_INCOMPATIBLE: ck_fidelizacion_ajustes_pendientes_estado_coherente existe con una definicion distinta a la semantica canonica (literales=%, numeros=%, expresion_normalizada=%): %', v_literales, v_numeros, v_normalizada, v_definicion;
     END IF;
   END IF;
 END

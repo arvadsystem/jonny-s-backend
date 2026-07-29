@@ -57,17 +57,79 @@ WHERE con.conrelid = 'public.fidelizacion_ajustes_pendientes'::regclass
   AND con.contype = 'f'
 ORDER BY con.conname;
 
--- 6) Restriccion de coherencia estado/contadores presente y con los tres
--- estados representados en su definicion.
+-- 6) Restriccion de coherencia estado/contadores. Primero se expone la
+-- expresion real; despues un bloque de solo lectura exige exactamente una
+-- restriccion validada y compara su semantica logica completa.
 SELECT
   conname,
   pg_get_constraintdef(oid, true) AS definicion,
-  pg_get_constraintdef(oid, true) LIKE '%PENDIENTE%' AS incluye_pendiente,
-  pg_get_constraintdef(oid, true) LIKE '%PARCIALMENTE_RECUPERADO%' AS incluye_parcial,
-  pg_get_constraintdef(oid, true) LIKE '%RECUPERADO%' AS incluye_recuperado
+  pg_get_expr(conbin, conrelid, true) AS expresion,
+  convalidated
 FROM pg_constraint
 WHERE conrelid = 'public.fidelizacion_ajustes_pendientes'::regclass
   AND conname = 'ck_fidelizacion_ajustes_pendientes_estado_coherente';
+
+DO $verify_estado_coherente$
+DECLARE
+  v_conteo integer;
+  v_validada boolean;
+  v_expresion text;
+  v_normalizada text;
+  v_literales text[];
+  v_canonica text := 'estado=''pendiente''andpuntos_recuperados=0andpuntos_pendientes=puntos_objetivoorestado=''parcialmente_recuperado''andpuntos_recuperados>0andpuntos_pendientes>0orestado=''recuperado''andpuntos_recuperados=puntos_objetivoandpuntos_pendientes=0';
+BEGIN
+  SELECT COUNT(*)
+  INTO v_conteo
+  FROM pg_constraint
+  WHERE conrelid = 'public.fidelizacion_ajustes_pendientes'::regclass
+    AND conname = 'ck_fidelizacion_ajustes_pendientes_estado_coherente';
+
+  IF v_conteo IS DISTINCT FROM 1 THEN
+    RAISE EXCEPTION
+      'VERIFY_FAILED_ESTADO_COHERENTE: se esperaba exactamente una restriccion ck_fidelizacion_ajustes_pendientes_estado_coherente y se encontraron %.',
+      v_conteo;
+  END IF;
+
+  SELECT
+    convalidated,
+    pg_get_expr(conbin, conrelid, true)
+  INTO v_validada, v_expresion
+  FROM pg_constraint
+  WHERE conrelid = 'public.fidelizacion_ajustes_pendientes'::regclass
+    AND conname = 'ck_fidelizacion_ajustes_pendientes_estado_coherente';
+
+  IF v_validada IS NOT TRUE THEN
+    RAISE EXCEPTION
+      'VERIFY_FAILED_ESTADO_COHERENTE: ck_fidelizacion_ajustes_pendientes_estado_coherente existe pero convalidated no es true.';
+  END IF;
+
+  SELECT array_agg(DISTINCT m[1] ORDER BY m[1])
+  INTO v_literales
+  FROM regexp_matches(v_expresion, '''([^'']*)''', 'g') AS m;
+
+  v_normalizada := lower(v_expresion);
+  v_normalizada := regexp_replace(
+    v_normalizada,
+    '::[[:space:]]*(text|character varying)(\([0-9]+\))?',
+    '',
+    'g'
+  );
+  v_normalizada := regexp_replace(v_normalizada, '[[:space:]()]', '', 'g');
+
+  IF v_literales IS DISTINCT FROM ARRAY['PARCIALMENTE_RECUPERADO', 'PENDIENTE', 'RECUPERADO']::text[]
+     OR v_normalizada IS DISTINCT FROM v_canonica
+  THEN
+    RAISE EXCEPTION
+      'VERIFY_FAILED_ESTADO_COHERENTE: expresion distinta a la semantica canonica (literales=%, expresion_normalizada=%). Expresion real: %',
+      v_literales,
+      v_normalizada,
+      v_expresion;
+  END IF;
+
+  RAISE NOTICE
+    'VERIFY_OK: ck_fidelizacion_ajustes_pendientes_estado_coherente es unica, validada y semanticamente canonica.';
+END
+$verify_estado_coherente$;
 
 -- 7) Defaults reales por columna, via pg_get_expr(adbin, adrelid)
 -- normalizado (sin casts de tipo), igual que el criterio que usa el SAFE.

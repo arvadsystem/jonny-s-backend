@@ -274,9 +274,9 @@ BEGIN
   INTO v_literales
   FROM regexp_matches(v_definicion, '''([^'']*)''', 'g') AS m;
 
-  SELECT array_agg(DISTINCT m[0] ORDER BY m[0])
+  SELECT array_agg(DISTINCT m[1] ORDER BY m[1])
   INTO v_numeros
-  FROM regexp_matches(v_definicion, '\y\d+\y', 'g') AS m;
+  FROM regexp_matches(v_definicion, '\y(\d+)\y', 'g') AS m;
 
   -- Conjunto EXACTO: tipos {comanda, factura, reversion}; limites
   -- numericos {0 (de content_bytes>0), 262144 (comanda), 2097152
