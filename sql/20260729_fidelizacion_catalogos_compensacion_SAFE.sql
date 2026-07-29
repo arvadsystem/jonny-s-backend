@@ -11,12 +11,10 @@
 -- (no-op), 1 fila inactiva (ABORTA, no reactiva sin autorizacion) y 2+
 -- filas (ABORTA por ambiguedad).
 --
--- El codigo de aplicacion (Fase 4) SOLO crea el movimiento de compensacion
--- dedicado cuando ambos catalogos existen y estan activos (verificado en
--- runtime via getCatalogRowByCode); si no, el ajuste pendiente se sigue
--- registrando/actualizando igual en fidelizacion_ajustes_pendientes, pero
--- la compensacion queda documentada unicamente en la observacion del
--- movimiento de acumulacion (no bloquea la acumulacion).
+-- El runtime actual exige ambos catalogos cuando existe deuda compensable.
+-- Si COMPENSACION/AJUSTE_PENDIENTE no existen de forma unica y activa,
+-- services/fidelizacionService.js aborta la acumulacion con
+-- FIDELIZACION_SCHEMA_PENDIENTE antes de aplicar la compensacion FIFO.
 
 BEGIN;
 
@@ -27,8 +25,13 @@ DO $tipos_movimiento$
 DECLARE
   v_coincidencias integer;
   v_activo boolean;
+  v_codigo text;
+  v_nombre text;
+  v_descripcion text;
+  v_afecta_saldo boolean;
+  v_signo_operacion smallint;
+  v_columnas_faltantes text;
   v_columnas_desconocidas text;
-  v_tiene_estado boolean;
 BEGIN
   IF to_regclass('public.cat_fidelizacion_tipos_movimiento') IS NULL THEN
     RAISE EXCEPTION 'PREFLIGHT_FAILED: public.cat_fidelizacion_tipos_movimiento no existe';
@@ -45,23 +48,77 @@ BEGIN
   END IF;
 
   IF v_coincidencias = 1 THEN
-    SELECT COALESCE(estado, true) INTO v_activo
+    SELECT
+      codigo,
+      nombre,
+      descripcion,
+      afecta_saldo,
+      signo_operacion,
+      estado
+    INTO
+      v_codigo,
+      v_nombre,
+      v_descripcion,
+      v_afecta_saldo,
+      v_signo_operacion,
+      v_activo
     FROM public.cat_fidelizacion_tipos_movimiento
     WHERE UPPER(TRIM(codigo)) = 'COMPENSACION';
 
-    IF v_activo THEN
-      RAISE NOTICE 'cat_fidelizacion_tipos_movimiento.COMPENSACION ya existe y esta activo; no-op';
-    ELSE
+    IF v_activo IS NOT TRUE THEN
       RAISE EXCEPTION
         'PREFLIGHT_FAILED_INACTIVE: cat_fidelizacion_tipos_movimiento.COMPENSACION existe pero esta marcado inactivo (estado=false); esta migracion no reactiva filas existentes sin autorizacion explicita. Revisar manualmente.';
     END IF;
+
+    IF v_codigo IS DISTINCT FROM 'COMPENSACION'
+       OR v_nombre IS DISTINCT FROM 'Compensación'
+       OR v_descripcion IS DISTINCT FROM 'Aplicación de puntos acumulados a ajustes pendientes de reversión.'
+       OR v_afecta_saldo IS DISTINCT FROM true
+       OR v_signo_operacion IS DISTINCT FROM -1
+    THEN
+      RAISE EXCEPTION
+        'PREFLIGHT_FAILED_SEMANTICA_INCOMPATIBLE: COMPENSACION existe activa pero su semantica no coincide con codigo=COMPENSACION, nombre=Compensación, descripcion canonica, afecta_saldo=true y signo_operacion=-1.';
+    END IF;
+
+    RAISE NOTICE 'cat_fidelizacion_tipos_movimiento.COMPENSACION ya existe activa y con semantica canonica; no-op';
   ELSE
+    SELECT string_agg(requerida.column_name, ', ' ORDER BY requerida.column_name)
+    INTO v_columnas_faltantes
+    FROM (
+      VALUES
+        ('codigo'),
+        ('nombre'),
+        ('descripcion'),
+        ('afecta_saldo'),
+        ('signo_operacion'),
+        ('estado')
+    ) AS requerida(column_name)
+    LEFT JOIN information_schema.columns c
+      ON c.table_schema = 'public'
+     AND c.table_name = 'cat_fidelizacion_tipos_movimiento'
+     AND c.column_name = requerida.column_name
+    WHERE c.column_name IS NULL;
+
+    IF v_columnas_faltantes IS NOT NULL THEN
+      RAISE EXCEPTION
+        'PREFLIGHT_FAILED_ESQUEMA_INCOMPATIBLE: cat_fidelizacion_tipos_movimiento no contiene columnas obligatorias: %.',
+        v_columnas_faltantes;
+    END IF;
+
     SELECT string_agg(column_name, ', ' ORDER BY column_name)
     INTO v_columnas_desconocidas
     FROM information_schema.columns
     WHERE table_schema = 'public'
       AND table_name = 'cat_fidelizacion_tipos_movimiento'
-      AND column_name NOT IN ('id_tipo_movimiento', 'codigo', 'estado')
+      AND column_name NOT IN (
+        'id_tipo_movimiento',
+        'codigo',
+        'nombre',
+        'descripcion',
+        'afecta_saldo',
+        'signo_operacion',
+        'estado'
+      )
       AND is_nullable = 'NO'
       AND column_default IS NULL;
 
@@ -71,17 +128,22 @@ BEGIN
         v_columnas_desconocidas;
     END IF;
 
-    SELECT EXISTS (
-      SELECT 1 FROM information_schema.columns
-      WHERE table_schema = 'public' AND table_name = 'cat_fidelizacion_tipos_movimiento'
-        AND column_name = 'estado'
-    ) INTO v_tiene_estado;
-
-    IF v_tiene_estado THEN
-      INSERT INTO public.cat_fidelizacion_tipos_movimiento (codigo, estado) VALUES ('COMPENSACION', true);
-    ELSE
-      INSERT INTO public.cat_fidelizacion_tipos_movimiento (codigo) VALUES ('COMPENSACION');
-    END IF;
+    INSERT INTO public.cat_fidelizacion_tipos_movimiento (
+      codigo,
+      nombre,
+      descripcion,
+      afecta_saldo,
+      signo_operacion,
+      estado
+    )
+    VALUES (
+      'COMPENSACION',
+      'Compensación',
+      'Aplicación de puntos acumulados a ajustes pendientes de reversión.',
+      true,
+      -1,
+      true
+    );
 
     RAISE NOTICE 'cat_fidelizacion_tipos_movimiento: fila COMPENSACION insertada (entorno carecia de ella)';
   END IF;
@@ -92,8 +154,11 @@ DO $origenes_movimiento$
 DECLARE
   v_coincidencias integer;
   v_activo boolean;
+  v_codigo text;
+  v_nombre text;
+  v_descripcion text;
+  v_columnas_faltantes text;
   v_columnas_desconocidas text;
-  v_tiene_estado boolean;
 BEGIN
   IF to_regclass('public.cat_fidelizacion_origenes_movimiento') IS NULL THEN
     RAISE EXCEPTION 'PREFLIGHT_FAILED: public.cat_fidelizacion_origenes_movimiento no existe';
@@ -110,23 +175,59 @@ BEGIN
   END IF;
 
   IF v_coincidencias = 1 THEN
-    SELECT COALESCE(estado, true) INTO v_activo
+    SELECT codigo, nombre, descripcion, estado
+    INTO v_codigo, v_nombre, v_descripcion, v_activo
     FROM public.cat_fidelizacion_origenes_movimiento
     WHERE UPPER(TRIM(codigo)) = 'AJUSTE_PENDIENTE';
 
-    IF v_activo THEN
-      RAISE NOTICE 'cat_fidelizacion_origenes_movimiento.AJUSTE_PENDIENTE ya existe y esta activo; no-op';
-    ELSE
+    IF v_activo IS NOT TRUE THEN
       RAISE EXCEPTION
         'PREFLIGHT_FAILED_INACTIVE: cat_fidelizacion_origenes_movimiento.AJUSTE_PENDIENTE existe pero esta marcado inactivo (estado=false); esta migracion no reactiva filas existentes sin autorizacion explicita. Revisar manualmente.';
     END IF;
+
+    IF v_codigo IS DISTINCT FROM 'AJUSTE_PENDIENTE'
+       OR v_nombre IS DISTINCT FROM 'Ajuste pendiente'
+       OR v_descripcion IS DISTINCT FROM 'Compensación aplicada a una deuda pendiente originada por reversión.'
+    THEN
+      RAISE EXCEPTION
+        'PREFLIGHT_FAILED_SEMANTICA_INCOMPATIBLE: AJUSTE_PENDIENTE existe activo pero su semantica no coincide con codigo, nombre y descripcion canonicos.';
+    END IF;
+
+    RAISE NOTICE 'cat_fidelizacion_origenes_movimiento.AJUSTE_PENDIENTE ya existe activo y con semantica canonica; no-op';
   ELSE
+    SELECT string_agg(requerida.column_name, ', ' ORDER BY requerida.column_name)
+    INTO v_columnas_faltantes
+    FROM (
+      VALUES
+        ('codigo'),
+        ('nombre'),
+        ('descripcion'),
+        ('estado')
+    ) AS requerida(column_name)
+    LEFT JOIN information_schema.columns c
+      ON c.table_schema = 'public'
+     AND c.table_name = 'cat_fidelizacion_origenes_movimiento'
+     AND c.column_name = requerida.column_name
+    WHERE c.column_name IS NULL;
+
+    IF v_columnas_faltantes IS NOT NULL THEN
+      RAISE EXCEPTION
+        'PREFLIGHT_FAILED_ESQUEMA_INCOMPATIBLE: cat_fidelizacion_origenes_movimiento no contiene columnas obligatorias: %.',
+        v_columnas_faltantes;
+    END IF;
+
     SELECT string_agg(column_name, ', ' ORDER BY column_name)
     INTO v_columnas_desconocidas
     FROM information_schema.columns
     WHERE table_schema = 'public'
       AND table_name = 'cat_fidelizacion_origenes_movimiento'
-      AND column_name NOT IN ('id_origen_movimiento', 'codigo', 'estado')
+      AND column_name NOT IN (
+        'id_origen_movimiento',
+        'codigo',
+        'nombre',
+        'descripcion',
+        'estado'
+      )
       AND is_nullable = 'NO'
       AND column_default IS NULL;
 
@@ -136,17 +237,18 @@ BEGIN
         v_columnas_desconocidas;
     END IF;
 
-    SELECT EXISTS (
-      SELECT 1 FROM information_schema.columns
-      WHERE table_schema = 'public' AND table_name = 'cat_fidelizacion_origenes_movimiento'
-        AND column_name = 'estado'
-    ) INTO v_tiene_estado;
-
-    IF v_tiene_estado THEN
-      INSERT INTO public.cat_fidelizacion_origenes_movimiento (codigo, estado) VALUES ('AJUSTE_PENDIENTE', true);
-    ELSE
-      INSERT INTO public.cat_fidelizacion_origenes_movimiento (codigo) VALUES ('AJUSTE_PENDIENTE');
-    END IF;
+    INSERT INTO public.cat_fidelizacion_origenes_movimiento (
+      codigo,
+      nombre,
+      descripcion,
+      estado
+    )
+    VALUES (
+      'AJUSTE_PENDIENTE',
+      'Ajuste pendiente',
+      'Compensación aplicada a una deuda pendiente originada por reversión.',
+      true
+    );
 
     RAISE NOTICE 'cat_fidelizacion_origenes_movimiento: fila AJUSTE_PENDIENTE insertada (entorno carecia de ella)';
   END IF;

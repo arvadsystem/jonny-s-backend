@@ -1,83 +1,130 @@
--- Clasificacion: PRE/POST seguro. Ejecutar SIEMPRE antes del SAFE
--- companero, para confirmar el estado real del entorno (en QA se espera
--- que ambas filas ya existan activas y por lo tanto el SAFE sea no-op en
--- ambos bloques). Las consultas 1-3 asumen que
--- cat_fidelizacion_tipos_movimiento/cat_fidelizacion_origenes_movimiento
--- existen (son catalogos base que la aplicacion ya usa en produccion via
--- services/ventasReversionService.js); la consulta 5 guarda su ausencia
--- explicitamente antes de referenciarlas.
+-- Clasificacion: PRE/POST seguro. Solo lectura: SELECT y validaciones que
+-- pueden abortar con RAISE EXCEPTION; no contiene DDL ni DML.
 
--- 1) Presencia y estado de REVERSO en cat_fidelizacion_tipos_movimiento.
-SELECT id_tipo_movimiento, codigo, estado
+-- 1) REVERSO con toda su semantica y conteo normalizado.
+SELECT
+  codigo,
+  nombre,
+  descripcion,
+  signo_operacion,
+  afecta_saldo,
+  estado,
+  COUNT(*) OVER () AS cantidad_filas_normalizadas
 FROM public.cat_fidelizacion_tipos_movimiento
-WHERE UPPER(TRIM(codigo)) = 'REVERSO';
-
--- 2) Presencia y estado de REVERSO_FACTURA en
--- cat_fidelizacion_origenes_movimiento.
-SELECT id_origen_movimiento, codigo, estado
-FROM public.cat_fidelizacion_origenes_movimiento
-WHERE UPPER(TRIM(codigo)) = 'REVERSO_FACTURA';
-
--- 3) Catalogo completo de ambos, para inspeccion manual (nada mas debe
--- haberse tocado).
-SELECT id_tipo_movimiento, codigo, estado
-FROM public.cat_fidelizacion_tipos_movimiento
+WHERE UPPER(TRIM(codigo)) = 'REVERSO'
 ORDER BY id_tipo_movimiento;
 
-SELECT id_origen_movimiento, codigo, estado
+-- 2) REVERSO_FACTURA con toda su semantica y conteo normalizado.
+SELECT
+  codigo,
+  nombre,
+  descripcion,
+  estado,
+  COUNT(*) OVER () AS cantidad_filas_normalizadas
 FROM public.cat_fidelizacion_origenes_movimiento
+WHERE UPPER(TRIM(codigo)) = 'REVERSO_FACTURA'
 ORDER BY id_origen_movimiento;
 
--- 4) Resumen booleano directo para el reporte de Fase 1: TRUE en ambas
--- columnas significa "el entorno ya tenia los catalogos activos, el SAFE
--- debe ser no-op en ambos bloques". FALSE puede significar tanto
--- "ausente" como "existe pero inactivo" o "ambiguo" -- usar las consultas
--- 1/2 para distinguir cual caso es antes de correr el SAFE.
+-- 3) Resumen que sigue mostrando 0 cuando una fila falta.
 SELECT
-  EXISTS (
-    SELECT 1 FROM public.cat_fidelizacion_tipos_movimiento
-    WHERE UPPER(TRIM(codigo)) = 'REVERSO' AND COALESCE(estado, true) = true
-  ) AS reverso_activo,
-  EXISTS (
-    SELECT 1 FROM public.cat_fidelizacion_origenes_movimiento
-    WHERE UPPER(TRIM(codigo)) = 'REVERSO_FACTURA' AND COALESCE(estado, true) = true
-  ) AS reverso_factura_activo;
-
--- 5) Guardia de ambiguedad/inactividad explicita, guardada con to_regclass
--- por si alguna de las dos tablas no existiera en un entorno futuro.
-DO $diagnostico$
-DECLARE
-  v_reverso_count integer := 0;
-  v_reverso_factura_count integer := 0;
-BEGIN
-  IF to_regclass('public.cat_fidelizacion_tipos_movimiento') IS NULL THEN
-    RAISE NOTICE 'cat_fidelizacion_tipos_movimiento no existe en este entorno';
-  ELSE
-    SELECT COUNT(*) INTO v_reverso_count
+  (
+    SELECT COUNT(*)
     FROM public.cat_fidelizacion_tipos_movimiento
-    WHERE UPPER(TRIM(codigo)) = 'REVERSO';
-    IF v_reverso_count > 1 THEN
-      RAISE NOTICE 'AMBIGUEDAD: % filas REVERSO en cat_fidelizacion_tipos_movimiento; el SAFE abortara.', v_reverso_count;
-    ELSIF v_reverso_count = 1 THEN
-      RAISE NOTICE 'REVERSO: exactamente 1 fila (revisar consulta 1 para estado activo/inactivo)';
-    ELSE
-      RAISE NOTICE 'REVERSO: 0 filas; el SAFE insertara una fila activa';
-    END IF;
+    WHERE UPPER(TRIM(codigo)) = 'REVERSO'
+  ) AS reverso_filas_normalizadas,
+  (
+    SELECT COUNT(*)
+    FROM public.cat_fidelizacion_origenes_movimiento
+    WHERE UPPER(TRIM(codigo)) = 'REVERSO_FACTURA'
+  ) AS reverso_factura_filas_normalizadas;
+
+-- 4) Validacion estricta de unicidad, actividad, campos obligatorios y
+-- semantica canonica. En QA debe confirmar que el SAFE seria no-op.
+DO $verify_catalogos_reverso$
+DECLARE
+  v_count integer;
+  v_codigo text;
+  v_nombre text;
+  v_descripcion text;
+  v_signo_operacion smallint;
+  v_afecta_saldo boolean;
+  v_estado boolean;
+BEGIN
+  IF to_regclass('public.cat_fidelizacion_tipos_movimiento') IS NULL
+     OR to_regclass('public.cat_fidelizacion_origenes_movimiento') IS NULL
+  THEN
+    RAISE EXCEPTION
+      'PREFLIGHT_FAILED_ESQUEMA_INCOMPATIBLE: faltan catalogos base de fidelizacion.';
   END IF;
 
-  IF to_regclass('public.cat_fidelizacion_origenes_movimiento') IS NULL THEN
-    RAISE NOTICE 'cat_fidelizacion_origenes_movimiento no existe en este entorno';
-  ELSE
-    SELECT COUNT(*) INTO v_reverso_factura_count
-    FROM public.cat_fidelizacion_origenes_movimiento
-    WHERE UPPER(TRIM(codigo)) = 'REVERSO_FACTURA';
-    IF v_reverso_factura_count > 1 THEN
-      RAISE NOTICE 'AMBIGUEDAD: % filas REVERSO_FACTURA en cat_fidelizacion_origenes_movimiento; el SAFE abortara.', v_reverso_factura_count;
-    ELSIF v_reverso_factura_count = 1 THEN
-      RAISE NOTICE 'REVERSO_FACTURA: exactamente 1 fila (revisar consulta 2 para estado activo/inactivo)';
-    ELSE
-      RAISE NOTICE 'REVERSO_FACTURA: 0 filas; el SAFE insertara una fila activa';
-    END IF;
+  SELECT COUNT(*) INTO v_count
+  FROM public.cat_fidelizacion_tipos_movimiento
+  WHERE UPPER(TRIM(codigo)) = 'REVERSO';
+
+  IF v_count > 1 THEN
+    RAISE EXCEPTION
+      'PREFLIGHT_FAILED_AMBIGUOUS: existen % filas REVERSO.', v_count;
+  ELSIF v_count = 0 THEN
+    RAISE EXCEPTION
+      'PREFLIGHT_FAILED_SEMANTICA_INCOMPATIBLE: falta la fila REVERSO.';
   END IF;
+
+  SELECT codigo, nombre, descripcion, signo_operacion, afecta_saldo, estado
+  INTO v_codigo, v_nombre, v_descripcion, v_signo_operacion, v_afecta_saldo, v_estado
+  FROM public.cat_fidelizacion_tipos_movimiento
+  WHERE UPPER(TRIM(codigo)) = 'REVERSO';
+
+  IF v_estado IS NOT TRUE THEN
+    RAISE EXCEPTION
+      'PREFLIGHT_FAILED_INACTIVE: REVERSO existe pero esta inactivo.';
+  END IF;
+
+  IF NULLIF(TRIM(v_codigo), '') IS NULL
+     OR NULLIF(TRIM(v_nombre), '') IS NULL
+     OR NULLIF(TRIM(v_descripcion), '') IS NULL
+     OR v_codigo IS DISTINCT FROM 'REVERSO'
+     OR v_nombre IS DISTINCT FROM 'Reverso'
+     OR v_descripcion IS DISTINCT FROM 'Reversión de un movimiento previo.'
+     OR v_signo_operacion IS DISTINCT FROM 1
+     OR v_afecta_saldo IS DISTINCT FROM true
+  THEN
+    RAISE EXCEPTION
+      'PREFLIGHT_FAILED_SEMANTICA_INCOMPATIBLE: REVERSO no cumple codigo/nombre/descripcion, signo_operacion=1, afecta_saldo=true y campos obligatorios no vacios.';
+  END IF;
+
+  SELECT COUNT(*) INTO v_count
+  FROM public.cat_fidelizacion_origenes_movimiento
+  WHERE UPPER(TRIM(codigo)) = 'REVERSO_FACTURA';
+
+  IF v_count > 1 THEN
+    RAISE EXCEPTION
+      'PREFLIGHT_FAILED_AMBIGUOUS: existen % filas REVERSO_FACTURA.', v_count;
+  ELSIF v_count = 0 THEN
+    RAISE EXCEPTION
+      'PREFLIGHT_FAILED_SEMANTICA_INCOMPATIBLE: falta la fila REVERSO_FACTURA.';
+  END IF;
+
+  SELECT codigo, nombre, descripcion, estado
+  INTO v_codigo, v_nombre, v_descripcion, v_estado
+  FROM public.cat_fidelizacion_origenes_movimiento
+  WHERE UPPER(TRIM(codigo)) = 'REVERSO_FACTURA';
+
+  IF v_estado IS NOT TRUE THEN
+    RAISE EXCEPTION
+      'PREFLIGHT_FAILED_INACTIVE: REVERSO_FACTURA existe pero esta inactivo.';
+  END IF;
+
+  IF NULLIF(TRIM(v_codigo), '') IS NULL
+     OR NULLIF(TRIM(v_nombre), '') IS NULL
+     OR NULLIF(TRIM(v_descripcion), '') IS NULL
+     OR v_codigo IS DISTINCT FROM 'REVERSO_FACTURA'
+     OR v_nombre IS DISTINCT FROM 'Reverso de factura'
+     OR v_descripcion IS DISTINCT FROM 'Movimiento generado por reversión de acumulación por factura.'
+  THEN
+    RAISE EXCEPTION
+      'PREFLIGHT_FAILED_SEMANTICA_INCOMPATIBLE: REVERSO_FACTURA no cumple codigo/nombre/descripcion canonicos y campos obligatorios no vacios.';
+  END IF;
+
+  RAISE NOTICE 'VERIFY_OK: REVERSO y REVERSO_FACTURA son unicos, activos y semanticamente canonicos.';
 END
-$diagnostico$;
+$verify_catalogos_reverso$;
