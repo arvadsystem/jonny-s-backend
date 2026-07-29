@@ -18,6 +18,10 @@ import {
   listFacturaReversiones
 } from '../services/ventasReversionService.js';
 import {
+  getVentaReversionContext,
+  previewVentaReversion
+} from './ventas/services/ventasReversionReadService.js';
+import {
   lockCajaFinancialSession,
   mapCajaFinancialLockError
 } from '../services/cajaFinancialLockService.js';
@@ -366,6 +370,23 @@ const getIdempotencyKey = (req) => {
 };
 
 const REVERSION_ALLOWED_ROLES = Object.freeze(['ADMIN', 'ADMINISTRADOR', 'SUPER_ADMIN']);
+const REVERSION_IDEMPOTENCY_KEY_MAX_LENGTH = 200;
+
+// Fase 2: Idempotency-Key deja de ser opcional para POST /ventas/:id/reversiones.
+// A diferencia de getIdempotencyKey (que desenvuelve arreglos y trata la
+// ausencia como null silencioso), este validador RECHAZA explicitamente:
+// header ausente, arreglo (multiples valores), string vacio/solo espacios,
+// y longitud excesiva.
+const validateReversionIdempotencyKeyHeader = (req) => {
+  const raw = req.headers?.['idempotency-key'];
+  if (raw === undefined || raw === null) return { ok: false };
+  if (Array.isArray(raw)) return { ok: false };
+  if (typeof raw !== 'string') return { ok: false };
+  const value = raw.trim();
+  if (!value) return { ok: false };
+  if (value.length > REVERSION_IDEMPOTENCY_KEY_MAX_LENGTH) return { ok: false };
+  return { ok: true, value };
+};
 
 const stableStringify = (value) => {
   if (value === null || typeof value !== 'object') return JSON.stringify(value);
@@ -7249,15 +7270,22 @@ router.post('/ventas/:id/reversiones', checkPermission(['VENTAS_REVERSION_CREAR'
     return res.status(401).json({ error: true, message: 'No autorizado.' });
   }
 
+  const idempotencyValidation = validateReversionIdempotencyKeyHeader(req);
+  if (!idempotencyValidation.ok) {
+    return res.status(400).json({
+      error: true,
+      code: 'VENTAS_REVERSION_IDEMPOTENCY_KEY_REQUERIDA',
+      message: 'Idempotency-Key es requerido para registrar una reversión.'
+    });
+  }
+
   const rawUserAgent = String(req.headers?.['user-agent'] || '');
   const userAgent = rawUserAgent.slice(0, 500);
   const ipOrigen = String(getClientIp(req) || '-').slice(0, 80);
   const deviceInfo = parseUserAgent(rawUserAgent);
   const dispositivo = String(deviceInfo?.dispositivo || 'Desconocido').slice(0, 80);
-  const idempotencyKey = getIdempotencyKey(req);
-  const idempotencyRequestHash = idempotencyKey
-    ? buildIdempotencyRequestHash({ idFactura, body: req.body })
-    : null;
+  const idempotencyKey = idempotencyValidation.value;
+  const idempotencyRequestHash = buildIdempotencyRequestHash({ idFactura, body: req.body });
 
   try {
     const hasAllowedRole = await requestHasAnyRole(req, REVERSION_ALLOWED_ROLES);
@@ -7399,6 +7427,67 @@ router.post('/ventas/:id/reversiones', checkPermission(['VENTAS_REVERSION_CREAR'
 
     console.error('Error interno en reversión de venta:', error);
     return sendVentasInternalError(res, 'No se pudo completar la reversión de venta.');
+  }
+});
+
+router.get('/ventas/:id/reversion-context', checkPermission(['VENTAS_VER']), async (req, res) => {
+  try {
+    const idFactura = parsePositiveInt(req.params.id);
+    if (!idFactura) {
+      return res.status(400).json({ error: true, message: 'ID de venta invalido.' });
+    }
+    const idUsuario = parsePositiveInt(req.user?.id_usuario);
+    if (!idUsuario) {
+      return res.status(401).json({ error: true, message: 'No autorizado.' });
+    }
+
+    const context = await getVentaReversionContext({ idFactura, idUsuario });
+    return res.status(200).json(context);
+  } catch (error) {
+    if (Number.isInteger(error?.httpStatus) && error.httpStatus >= 400 && error.httpStatus < 500) {
+      return res.status(error.httpStatus).json({
+        error: true,
+        code: error.code || 'VENTAS_REVERSION_CONTEXT_ERROR',
+        message: error.publicMessage || 'No se pudo obtener el contexto de reversión.'
+      });
+    }
+    console.error('Error al obtener contexto de reversión:', error);
+    return sendVentasInternalError(res, 'No se pudo obtener el contexto de reversión.');
+  }
+});
+
+router.post('/ventas/:id/reversion-preview', checkPermission(['VENTAS_REVERSION_CREAR']), async (req, res) => {
+  try {
+    const idFactura = parsePositiveInt(req.params.id);
+    if (!idFactura) {
+      return res.status(400).json({ error: true, message: 'ID de venta invalido.' });
+    }
+    const idUsuario = parsePositiveInt(req.user?.id_usuario);
+    if (!idUsuario) {
+      return res.status(401).json({ error: true, message: 'No autorizado.' });
+    }
+
+    const hasAllowedRole = await requestHasAnyRole(req, REVERSION_ALLOWED_ROLES);
+    if (!hasAllowedRole) {
+      return res.status(403).json({
+        error: true,
+        code: 'VENTAS_REVERSION_ROL_NO_AUTORIZADO',
+        message: 'Solo administradores pueden registrar reversiones.'
+      });
+    }
+
+    const preview = await previewVentaReversion({ idFactura, idUsuario, body: req.body });
+    return res.status(200).json(preview);
+  } catch (error) {
+    if (Number.isInteger(error?.httpStatus) && error.httpStatus >= 400 && error.httpStatus < 500) {
+      return res.status(error.httpStatus).json({
+        error: true,
+        code: error.code || 'VENTAS_REVERSION_PREVIEW_ERROR',
+        message: error.publicMessage || 'No se pudo calcular la vista previa de reversión.'
+      });
+    }
+    console.error('Error al calcular vista previa de reversión:', error);
+    return sendVentasInternalError(res, 'No se pudo calcular la vista previa de reversión.');
   }
 });
 

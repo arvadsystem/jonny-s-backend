@@ -1,4 +1,4 @@
-﻿import pool from '../config/db-connection.js';
+import pool from '../config/db-connection.js';
 import { generarCodigoDocumento } from './facturacionCorrelativoService.js';
 import { getClientIp, parseUserAgent } from '../utils/security/clientInfo.js';
 import { restoreSalsasInventoryFromSnapshots } from '../routers/ventas/services/salsasInventoryService.js';
@@ -6,8 +6,34 @@ import {
   lockCajaFinancialSessions,
   mapCajaFinancialLockError
 } from './cajaFinancialLockService.js';
+import { parsePositiveInt } from '../routers/ventas/utils/parseUtils.js';
+import { roundMoney } from '../routers/ventas/utils/moneyUtils.js';
+import {
+  resolveOriginalSessionFromCobros,
+  lockAndValidateOriginalCajaSession
+} from '../routers/ventas/services/ventasReversionSessionService.js';
+import {
+  assertPedidoEligibleForReversion,
+  resolveCancelledEstadoPedidoIdOrThrow
+} from '../routers/ventas/services/ventasReversionEligibilityService.js';
+import {
+  buildRequestedLines,
+  resolveFacturaLinesForUpdate,
+  resolveAlreadyReversedQty,
+  resolveReversionLines,
+  computeFacturaTotal,
+  computeAccumulatedResult,
+  validatePartialReversionApplicability
+} from '../routers/ventas/services/ventasReversionCalculationService.js';
 
-const REVERSAL_WINDOW_SQL = `NOW() - INTERVAL '1 hour'`;
+// Fase 2: eliminada la ventana de 1 hora (REVERSAL_WINDOW_SQL /
+// VENTAS_REVERSION_FUERA_VENTANA) y el bloqueo por horario administrativo
+// de sucursal (assertSucursalOpenForReversion). Regla definitiva: la venta
+// puede reversarse mientras la sesion original (resuelta desde
+// facturas_cobros, no desde facturas.id_sesion_caja) permanezca abierta y
+// el pedido asociado no haya iniciado preparacion. Ver
+// ventasReversionSessionService.js y ventasReversionEligibilityService.js.
+
 const VALID_MOTIVOS = new Set([
   'PRODUCTO_EQUIVOCADO',
   'CANTIDAD_EQUIVOCADA',
@@ -16,21 +42,12 @@ const VALID_MOTIVOS = new Set([
   'METODO_PAGO_EQUIVOCADO',
   'ERROR_OPERATIVO',
   'OTRO',
-  // Compatibilidad hacia atr\u00e1s (no visibles en frontend nuevo)
+  // Compatibilidad hacia atrás (no visibles en frontend nuevo)
   'ERROR_DIGITACION',
   'PRODUCTO_NO_DISPONIBLE',
   'DEVOLUCION',
   'COBRO_INCORRECTO'
 ]);
-
-const parsePositiveInt = (value) => {
-  const parsed = Number.parseInt(String(value ?? ''), 10);
-  return Number.isInteger(parsed) && parsed > 0 ? parsed : null;
-};
-
-const isIntegerNumber = (value) => Number.isInteger(Number(value));
-
-const roundMoney = (value) => Number(Number(value || 0).toFixed(2));
 
 const normalizeText = (value, max = 200) => {
   if (value === undefined || value === null) return null;
@@ -90,77 +107,6 @@ const resolveSucursalScope = async (client, idUsuario) => {
   };
 };
 
-const assertOriginalCajaSessionOpen = async ({ client, factura }) => {
-  const idSesionCaja = parsePositiveInt(factura?.id_sesion_caja);
-  const idSucursal = parsePositiveInt(factura?.id_sucursal);
-
-  if (!idSesionCaja || !idSucursal) {
-    throw createReversionError(
-      409,
-      'VENTA_SIN_SESION_CAJA_VALIDA',
-      'La venta no tiene una sesión de caja válida para reversión.'
-    );
-  }
-
-  const result = await client.query(
-    `
-      SELECT
-        cs.id_sesion_caja,
-        cs.id_caja,
-        cs.id_sucursal,
-        cs.fecha_cierre,
-        UPPER(TRIM(cse.codigo)) AS estado_codigo,
-        COALESCE(c.estado, true) AS caja_activa
-      FROM public.cajas_sesiones cs
-      LEFT JOIN public.cat_cajas_sesiones_estados cse
-        ON cse.id_estado_sesion_caja = cs.id_estado_sesion_caja
-      LEFT JOIN public.cajas c
-        ON c.id_caja = cs.id_caja
-       AND c.id_sucursal = cs.id_sucursal
-      WHERE cs.id_sesion_caja = $1
-        AND cs.id_sucursal = $2
-      LIMIT 1
-    `,
-    [idSesionCaja, idSucursal]
-  );
-
-  if (!result.rowCount) {
-    throw createReversionError(
-      409,
-      'VENTA_SIN_SESION_CAJA_VALIDA',
-      'La venta no tiene una sesión de caja válida para reversión.'
-    );
-  }
-
-  const session = result.rows[0];
-  const facturaCajaId = parsePositiveInt(factura?.id_caja);
-  if (facturaCajaId && Number(session.id_caja) !== Number(facturaCajaId)) {
-    throw createReversionError(
-      409,
-      'VENTA_SIN_SESION_CAJA_VALIDA',
-      'La venta no tiene una sesión de caja válida para reversión.'
-    );
-  }
-
-  if (!Boolean(session.caja_activa)) {
-    throw createReversionError(
-      409,
-      'VENTA_SIN_SESION_CAJA_VALIDA',
-      'La venta no tiene una sesión de caja válida para reversión.'
-    );
-  }
-
-  if (session.estado_codigo !== 'ABIERTA' || session.fecha_cierre) {
-    throw createReversionError(
-      409,
-      'CAJA_CERRADA_REVERSA_NO_PERMITIDA',
-      'No se puede reversar porque la caja de esta venta ya fue cerrada.'
-    );
-  }
-
-  return session;
-};
-
 const assertSucursalAllowedForReversion = (scope, idSucursal, action = 'crear') => {
   const targetSucursalId = parsePositiveInt(idSucursal);
   if (!targetSucursalId) {
@@ -176,88 +122,6 @@ const assertSucursalAllowedForReversion = (scope, idSucursal, action = 'crear') 
   if (!allowed.includes(targetSucursalId)) {
     const verb = action === 'consultar' ? 'consultar reversiones de' : 'reversar';
     throw createReversionError(403, 'VENTAS_REVERSION_SCOPE_FORBIDDEN', `No puedes ${verb} una venta de otra sucursal.`);
-  }
-};
-
-const assertSucursalOpenForReversion = async ({ client, idSucursal }) => {
-  const idSucursalTarget = parsePositiveInt(idSucursal);
-  if (!idSucursalTarget) {
-    throw createReversionError(
-      409,
-      'SUCURSAL_CERRADA_REVERSA_NO_PERMITIDA',
-      'No se puede reversar porque la sucursal ya está fuera de horario operativo.'
-    );
-  }
-
-  const result = await client.query(
-    `
-      WITH clock AS (
-        SELECT
-          (NOW() AT TIME ZONE 'America/Tegucigalpa')::date AS fecha_actual,
-          (NOW() AT TIME ZONE 'America/Tegucigalpa')::time AS hora_actual,
-          EXTRACT(ISODOW FROM (NOW() AT TIME ZONE 'America/Tegucigalpa'))::int AS dia_semana
-      ),
-      branch AS (
-        SELECT id_sucursal, estado, hora_inicio, hora_final
-        FROM public.sucursales
-        WHERE id_sucursal = $1
-        LIMIT 1
-      )
-      SELECT
-        b.id_sucursal,
-        CASE
-          WHEN b.id_sucursal IS NULL THEN false
-          WHEN COALESCE(b.estado, true) = false THEN false
-          WHEN fe.id_fecha_especial IS NOT NULL THEN
-            CASE
-              WHEN COALESCE(fe.cerrado, false) = true THEN false
-              WHEN fe.hora_inicio IS NULL OR fe.hora_final IS NULL THEN false
-              WHEN fe.hora_final > fe.hora_inicio THEN clock.hora_actual >= fe.hora_inicio AND clock.hora_actual < fe.hora_final
-              ELSE clock.hora_actual >= fe.hora_inicio OR clock.hora_actual < fe.hora_final
-            END
-          WHEN sh.id_horario IS NOT NULL THEN
-            CASE
-              WHEN COALESCE(sh.cerrado, false) = true THEN false
-              WHEN sh.hora_inicio IS NULL OR sh.hora_final IS NULL THEN false
-              WHEN sh.hora_final > sh.hora_inicio THEN clock.hora_actual >= sh.hora_inicio AND clock.hora_actual < sh.hora_final
-              ELSE clock.hora_actual >= sh.hora_inicio OR clock.hora_actual < sh.hora_final
-            END
-          WHEN b.hora_inicio IS NOT NULL AND b.hora_final IS NOT NULL THEN
-            CASE
-              WHEN b.hora_final > b.hora_inicio THEN clock.hora_actual >= b.hora_inicio AND clock.hora_actual < b.hora_final
-              ELSE clock.hora_actual >= b.hora_inicio OR clock.hora_actual < b.hora_final
-            END
-          ELSE true
-        END AS abierta
-      FROM clock
-      LEFT JOIN branch b ON true
-      LEFT JOIN LATERAL (
-        SELECT id_fecha_especial, cerrado, hora_inicio, hora_final
-        FROM public.sucursales_fechas_especiales
-        WHERE id_sucursal = b.id_sucursal
-          AND fecha = clock.fecha_actual
-          AND COALESCE(estado, true) = true
-        ORDER BY id_fecha_especial DESC
-        LIMIT 1
-      ) fe ON b.id_sucursal IS NOT NULL
-      LEFT JOIN LATERAL (
-        SELECT id_horario, cerrado, hora_inicio, hora_final
-        FROM public.sucursales_horarios
-        WHERE id_sucursal = b.id_sucursal
-          AND dia_semana = clock.dia_semana
-          AND COALESCE(estado, true) = true
-        LIMIT 1
-      ) sh ON b.id_sucursal IS NOT NULL
-    `,
-    [idSucursalTarget]
-  );
-
-  if (!Boolean(result.rows?.[0]?.abierta)) {
-    throw createReversionError(
-      409,
-      'SUCURSAL_CERRADA_REVERSA_NO_PERMITIDA',
-      'No se puede reversar porque la sucursal ya está fuera de horario operativo.'
-    );
   }
 };
 
@@ -284,232 +148,11 @@ const resolveReversionCajaMovementType = async (client) => {
     throw createReversionError(
       409,
       'VENTAS_REVERSION_TIPO_MOVIMIENTO_CAJA_INVALIDO',
-      'No existe tipo de movimiento de caja REVERSION/REVERSO activo en cat\u00e1logo.'
+      'No existe tipo de movimiento de caja REVERSION/REVERSO activo en catálogo.'
     );
   }
 
   return Number(result.rows[0].id_tipo_movimiento_caja);
-};
-
-const buildRequestedLines = (lineas) => {
-  const rows = Array.isArray(lineas) ? lineas : [];
-  const byDetail = new Map();
-
-  for (const row of rows) {
-    const idDetalle = parsePositiveInt(row?.id_detalle_factura);
-    if (!idDetalle) {
-      throw createReversionError(400, 'VENTAS_REVERSION_LINEA_INVALIDA', 'Cada l\u00ednea debe incluir id_detalle_factura v\u00e1lido.');
-    }
-
-    const cantidadRaw = row?.cantidad;
-    if (!isIntegerNumber(cantidadRaw)) {
-      throw createReversionError(400, 'VENTAS_REVERSION_CANTIDAD_ENTERA_REQUERIDA', 'cantidad debe ser entera para reversi\u00f3n parcial de inventario.');
-    }
-
-    const cantidad = parsePositiveInt(cantidadRaw);
-    if (!cantidad) {
-      throw createReversionError(400, 'VENTAS_REVERSION_LINEA_INVALIDA', 'cantidad debe ser mayor a 0.');
-    }
-
-    const prev = byDetail.get(idDetalle) || 0;
-    byDetail.set(idDetalle, prev + cantidad);
-  }
-
-  return byDetail;
-};
-
-const resolveFacturaLinesForUpdate = async (client, idFactura) => {
-  const result = await client.query(
-    `
-      SELECT
-        df.id_detalle_factura,
-        COALESCE(dfo.id_producto, df.id_producto) AS id_producto,
-        COALESCE(dfo.id_receta, df.id_receta::int) AS id_receta,
-        COALESCE(dfo.id_detalle_pedido, df.id_detalle_pedido::int) AS id_detalle_pedido,
-        COALESCE(dfo.origen_snapshot, df.origen_snapshot) AS origen_snapshot,
-        COALESCE(df.cantidad, 0)::int AS cantidad_vendida,
-        COALESCE(df.precio_unitario, 0)::numeric(12,2) AS precio_unitario,
-        COALESCE(df.sub_total, 0)::numeric(12,2) AS sub_total,
-        COALESCE(df.total_detalle, 0)::numeric(12,2) AS total_detalle,
-        COALESCE((SELECT d.monto_descuento FROM public.descuentos d WHERE d.id_descuento = df.id_descuento), 0)::numeric(12,2) AS descuento_linea,
-        0::numeric(6,2) AS isv_porcentaje,
-        CASE
-          WHEN NULLIF(TRIM(dfo.tipo_item), '') IS NOT NULL THEN UPPER(TRIM(dfo.tipo_item))
-          WHEN NULLIF(TRIM(df.tipo_item), '') IS NOT NULL THEN UPPER(TRIM(df.tipo_item))
-          WHEN df.id_producto IS NOT NULL THEN 'PRODUCTO'
-          ELSE 'ITEM'
-        END AS tipo_item,
-        CASE
-          WHEN UPPER(
-            COALESCE(
-              NULLIF(TRIM(dfo.tipo_item), ''),
-              NULLIF(TRIM(df.tipo_item), ''),
-              CASE WHEN COALESCE(dfo.id_producto, df.id_producto) IS NOT NULL THEN 'PRODUCTO' ELSE 'ITEM' END
-            )
-          ) = 'PRODUCTO'
-            AND COALESCE(dfo.id_producto, df.id_producto) IS NOT NULL THEN true
-          ELSE false
-        END AS devuelve_inventario
-      FROM public.detalle_facturas df
-      LEFT JOIN public.detalle_facturas_origen dfo
-        ON dfo.id_detalle_factura = df.id_detalle_factura
-      WHERE df.id_factura = $1
-      ORDER BY df.id_detalle_factura
-      FOR UPDATE OF df`,
-    [idFactura]
-  );
-
-  if (!result.rowCount) {
-    throw createReversionError(409, 'VENTAS_REVERSION_FACTURA_SIN_DETALLE', 'La factura no tiene detalle para reversar.');
-  }
-
-  return result.rows;
-};
-
-const resolveAlreadyReversedQty = async (client, idFactura) => {
-  const result = await client.query(
-    `
-      SELECT rd.id_detalle_factura, COALESCE(SUM(rd.cantidad_revertida), 0)::numeric AS cantidad_revertida
-      FROM public.facturas_reversiones fr
-      INNER JOIN public.facturas_reversiones_detalle rd ON rd.id_reversion = fr.id_reversion
-      WHERE fr.id_factura_original = $1
-        AND UPPER(TRIM(COALESCE(fr.estado, ''))) = 'APLICADA'
-      GROUP BY rd.id_detalle_factura
-    `,
-    [idFactura]
-  );
-
-  const map = new Map();
-  for (const row of result.rows) {
-    map.set(Number(row.id_detalle_factura), Number(row.cantidad_revertida));
-  }
-  return map;
-};
-
-const resolveReversionLines = ({ tipoReversion, requestedLines, facturaLines, reversedQtyMap }) => {
-  const byId = new Map(facturaLines.map((row) => [Number(row.id_detalle_factura), row]));
-
-  if (tipoReversion === 'PARCIAL') {
-    for (const reqId of requestedLines.keys()) {
-      if (!byId.has(reqId)) {
-        throw createReversionError(409, 'VENTAS_REVERSION_LINEA_NO_PERTENECE', `La l\u00ednea ${reqId} no pertenece a la factura.`);
-      }
-    }
-  }
-
-  const output = [];
-
-  for (const line of facturaLines) {
-    const idDetalle = Number(line.id_detalle_factura);
-    const soldQty = Number(line.cantidad_vendida || 0);
-
-    if (!Number.isInteger(soldQty) || soldQty <= 0) {
-      continue;
-    }
-
-    const reversedQty = Number(reversedQtyMap.get(idDetalle) || 0);
-    const availableQty = soldQty - reversedQty;
-
-    const requestedQty = tipoReversion === 'TOTAL'
-      ? availableQty
-      : Number(requestedLines.get(idDetalle) || 0);
-
-    if (tipoReversion === 'PARCIAL' && requestedLines.has(idDetalle) && availableQty <= 0) {
-      throw createReversionError(409, 'VENTAS_REVERSION_LINEA_AGOTADA', `La l\u00ednea ${idDetalle} ya fue totalmente reversada.`);
-    }
-
-    if (requestedQty <= 0) {
-      continue;
-    }
-
-    if (!Number.isInteger(requestedQty)) {
-      throw createReversionError(400, 'VENTAS_REVERSION_CANTIDAD_ENTERA_REQUERIDA', 'cantidad debe ser entera para reversi\u00f3n parcial de inventario.');
-    }
-
-    if (requestedQty > availableQty) {
-      throw createReversionError(409, 'VENTAS_REVERSION_CANTIDAD_EXCEDE', `La l\u00ednea ${idDetalle} excede la cantidad reversible.`);
-    }
-
-    const ratio = requestedQty / soldQty;
-    const subtotal = roundMoney(Number(line.sub_total) * ratio);
-    const descuento = roundMoney(Number(line.descuento_linea) * ratio);
-    const total = roundMoney(Number(line.total_detalle) * ratio);
-
-    const isv15Rate = Number(line.isv_porcentaje || 0) === 15 ? 0.15 : 0;
-    const isv18Rate = Number(line.isv_porcentaje || 0) === 18 ? 0.18 : 0;
-
-    output.push({
-      id_detalle_factura: idDetalle,
-      origen_snapshot: line.origen_snapshot || null,
-      tipo_item: line.tipo_item,
-      id_producto: parsePositiveInt(line.id_producto),
-      id_receta: parsePositiveInt(line.id_receta),
-      cantidad_vendida: soldQty,
-      cantidad_revertida: requestedQty,
-      precio_unitario_original: roundMoney(line.precio_unitario),
-      subtotal_revertido: subtotal,
-      descuento_revertido: descuento,
-      isv_15_revertido: roundMoney(subtotal * isv15Rate),
-      isv_18_revertido: roundMoney(subtotal * isv18Rate),
-      total_revertido: total,
-      devuelve_inventario: Boolean(line.devuelve_inventario)
-    });
-  }
-
-  if (!output.length) {
-    throw createReversionError(409, 'VENTAS_REVERSION_SIN_LINEAS', 'No hay l\u00edneas reversables para procesar.');
-  }
-
-  if (tipoReversion === 'PARCIAL') {
-    const provided = [...requestedLines.keys()].sort((a, b) => a - b);
-    const applied = output.map((row) => row.id_detalle_factura).sort((a, b) => a - b);
-    if (provided.length !== applied.length || provided.some((id, idx) => id !== applied[idx])) {
-      throw createReversionError(409, 'VENTAS_REVERSION_LINEAS_INVALIDAS', 'La solicitud parcial contiene l\u00edneas inv\u00e1lidas o no reversables.');
-    }
-  }
-
-  return output;
-};
-
-const computeFacturaTotal = async (client, idFactura) => {
-  const result = await client.query(
-    `
-      SELECT COALESCE(SUM(df.total_detalle), 0)::numeric(12,2) AS total_factura
-      FROM public.detalle_facturas df
-      WHERE df.id_factura = $1
-    `,
-    [idFactura]
-  );
-  return Number(result.rows?.[0]?.total_factura || 0);
-};
-
-
-const validatePartialReversionApplicability = ({ tipoReversion, facturaLines, reversedQtyMap }) => {
-  if (tipoReversion !== 'PARCIAL') return;
-
-  const pendingQuantities = facturaLines
-    .map((line) => {
-      const soldQty = Number(line.cantidad_vendida || 0);
-      if (!Number.isInteger(soldQty) || soldQty <= 0) return null;
-
-      const idDetalle = Number(line.id_detalle_factura || 0);
-      const reversedQty = Number(reversedQtyMap.get(idDetalle) || 0);
-      const pendingQty = soldQty - reversedQty;
-      if (!Number.isInteger(pendingQty) || pendingQty <= 0) return null;
-
-      return pendingQty;
-    })
-    .filter(Boolean);
-
-  const hasMultiplePendingLines = pendingQuantities.length > 1;
-  const hasPendingQtyGreaterThanOne = pendingQuantities.some((qty) => qty > 1);
-  if (hasMultiplePendingLines || hasPendingQtyGreaterThanOne) return;
-
-  throw createReversionError(
-    409,
-    'VENTAS_REVERSION_PARCIAL_NO_APLICA',
-    'La reversi\u00f3n parcial no aplica para una venta con una sola unidad pendiente. Usa reversi\u00f3n total.'
-  );
 };
 
 const revertLoyaltyForFactura = async ({
@@ -725,7 +368,7 @@ const registerInventoryReturn = async ({ client, idReversion, codigoReversion, c
     if (!line.devuelve_inventario || !line.id_producto) continue;
 
     if (!Number.isInteger(Number(line.cantidad_revertida)) || Number(line.cantidad_revertida) <= 0) {
-      throw createReversionError(400, 'VENTAS_REVERSION_INVENTARIO_CANTIDAD_INVALIDA', 'Cantidad de devoluci\u00f3n a inventario debe ser entera positiva.');
+      throw createReversionError(400, 'VENTAS_REVERSION_INVENTARIO_CANTIDAD_INVALIDA', 'Cantidad de devolución a inventario debe ser entera positiva.');
     }
 
     const prodResult = await client.query(
@@ -760,7 +403,7 @@ const registerInventoryReturn = async ({ client, idReversion, codigoReversion, c
         product.id_almacen,
         product.id_producto,
         idReversion,
-        `Entrada por reversi\u00f3n ${codigoReversion} de venta ${codigoVenta}`
+        `Entrada por reversión ${codigoReversion} de venta ${codigoVenta}`
       ]
     );
   }
@@ -918,7 +561,7 @@ export const listFacturaReversiones = async ({ idFactura, idUsuario }) => {
   const facturaId = parsePositiveInt(idFactura);
   const userId = parsePositiveInt(idUsuario);
   if (!facturaId || !userId) {
-    throw createReversionError(400, 'VENTAS_REVERSION_PARAM_INVALIDO', 'Par\u00e1metros inv\u00e1lidos.');
+    throw createReversionError(400, 'VENTAS_REVERSION_PARAM_INVALIDO', 'Parámetros inválidos.');
   }
 
   const client = await pool.connect();
@@ -1010,7 +653,7 @@ export const createVentaReversion = async ({ idFactura, body, req, idUsuario, id
   const facturaId = parsePositiveInt(idFactura);
   const userId = parsePositiveInt(idUsuario);
   if (!facturaId || !userId) {
-    throw createReversionError(400, 'VENTAS_REVERSION_PARAM_INVALIDO', 'Solicitud inv\u00e1lida.');
+    throw createReversionError(400, 'VENTAS_REVERSION_PARAM_INVALIDO', 'Solicitud inválida.');
   }
 
   const tipoReversion = String(body?.tipo_reversion || '').trim().toUpperCase();
@@ -1020,14 +663,14 @@ export const createVentaReversion = async ({ idFactura, body, req, idUsuario, id
 
   const motivo = normalizeMotivo(body?.motivo);
   if (!VALID_MOTIVOS.has(motivo)) {
-    throw createReversionError(400, 'VENTAS_REVERSION_MOTIVO_INVALIDO', 'Motivo de reversi\u00f3n inv\u00e1lido.');
+    throw createReversionError(400, 'VENTAS_REVERSION_MOTIVO_INVALIDO', 'Motivo de reversión inválido.');
   }
 
   const observacion = normalizeText(body?.observacion, 300);
+  // buildRequestedLines valida formato/limites/duplicados con overflow
+  // seguro y lanza sus propios errores 400 (ver
+  // ventasReversionCalculationService.js).
   const requestedLines = tipoReversion === 'PARCIAL' ? buildRequestedLines(body?.lineas) : new Map();
-  if (tipoReversion === 'PARCIAL' && requestedLines.size === 0) {
-    throw createReversionError(400, 'VENTAS_REVERSION_LINEAS_REQUERIDAS', 'Debe enviar l\u00edneas para reversi\u00f3n parcial.');
-  }
 
   const ip = normalizeText(getClientIp(req), 80) || '-';
   const uaRaw = String(req?.headers?.['user-agent'] || '');
@@ -1040,6 +683,7 @@ export const createVentaReversion = async ({ idFactura, body, req, idUsuario, id
   try {
     await client.query('BEGIN');
 
+    // 1) reservar idempotencia
     if (typeof idempotency?.reserve === 'function') {
       idempotencyReservation = await idempotency.reserve(client);
       if (idempotencyReservation?.replay || idempotencyReservation?.conflict) {
@@ -1050,6 +694,7 @@ export const createVentaReversion = async ({ idFactura, body, req, idUsuario, id
 
     const scope = await resolveSucursalScope(client, userId);
 
+    // 2) bloquear factura
     const facturaResult = await client.query(
       `
         SELECT
@@ -1076,32 +721,37 @@ export const createVentaReversion = async ({ idFactura, body, req, idUsuario, id
     const idSucursal = Number(factura.id_sucursal || 0);
     assertSucursalAllowedForReversion(scope, idSucursal, 'crear');
 
-    const cajaContext = await assertOriginalCajaSessionOpen({ client, factura });
-    await lockCajaFinancialSessions(client, [
-      factura.id_sesion_caja,
-      cajaContext.id_sesion_caja
-    ]);
-    await assertOriginalCajaSessionOpen({ client, factura });
-    await assertSucursalOpenForReversion({ client, idSucursal });
-
-    const ageResult = await client.query(
-      `SELECT CASE WHEN $1::timestamp >= (${REVERSAL_WINDOW_SQL}) THEN true ELSE false END AS in_window`,
-      [factura.fecha_hora_facturacion]
-    );
-
-    if (!Boolean(ageResult.rows?.[0]?.in_window)) {
-      throw createReversionError(409, 'VENTAS_REVERSION_FUERA_VENTANA', 'La venta excede la ventana m\u00e1xima de 1 hora para reversi\u00f3n.');
-    }
-
+    // 3) bloquear detalles de factura
     const facturaLines = await resolveFacturaLinesForUpdate(client, facturaId);
-    const reversedQtyMap = await resolveAlreadyReversedQty(client, facturaId);
-    validatePartialReversionApplicability({ tipoReversion, facturaLines, reversedQtyMap });
+
+    // 4) bloquear cobros + 5) resolver sesion original (facturas_cobros, no
+    // facturas.id_sesion_caja)
+    const resolvedSession = await resolveOriginalSessionFromCobros({
+      client,
+      idFactura: facturaId,
+      facturaIdSesionCaja: factura.id_sesion_caja
+    });
+
+    // 6) bloquear sesion de caja original y validar que siga ABIERTA
+    const sessionContext = await lockAndValidateOriginalCajaSession({
+      client,
+      idSesionCaja: resolvedSession.id_sesion_caja,
+      idSucursal
+    });
+
+    // 7) bloquear pedido + validar elegibilidad de Cocina (venta directa
+    // sin pedido: no hay nada que validar, se permite)
+    await assertPedidoEligibleForReversion({ client, idPedido: factura.id_pedido });
+
+    // 8) bloquear reversiones anteriores + calcular saldos reversables
+    const reversedQtyMapBefore = await resolveAlreadyReversedQty(client, facturaId);
+    validatePartialReversionApplicability({ tipoReversion, facturaLines, reversedQtyMap: reversedQtyMapBefore });
 
     const reversionLines = resolveReversionLines({
       tipoReversion,
       requestedLines,
       facturaLines,
-      reversedQtyMap
+      reversedQtyMap: reversedQtyMapBefore
     });
 
     const idTipoMovimientoCaja = await resolveReversionCajaMovementType(client);
@@ -1114,7 +764,16 @@ export const createVentaReversion = async ({ idFactura, body, req, idUsuario, id
 
     const montoReversado = roundMoney(reversionLines.reduce((acc, line) => acc + Number(line.total_revertido || 0), 0));
     const totalFactura = await computeFacturaTotal(client, facturaId);
+    const accumulated = computeAccumulatedResult({ facturaLines, reversedQtyMapBefore, reversionLines });
 
+    // 9) insertar reversion (cabecera).
+    // id_caja_actual/id_sesion_caja_actual: el esquema de
+    // facturas_reversiones obliga a NOT NULL en estas columnas "actual".
+    // Fase 2 elimina el concepto de "caja actual distinta de la original"
+    // (ver seccion 20 del ticket): se almacena aqui EXACTAMENTE el mismo
+    // valor que id_caja_original/id_sesion_caja_original, porque la unica
+    // sesion valida para reversar es la original resuelta desde
+    // facturas_cobros -- nunca una sesion "actualmente abierta" distinta.
     const insertReversion = await client.query(
       `
         INSERT INTO public.facturas_reversiones (
@@ -1138,9 +797,9 @@ export const createVentaReversion = async ({ idFactura, body, req, idUsuario, id
           correo_notificado
         )
         VALUES (
-          $1, $2, $3, $4, $5, $6, $7,
-          $8, $9, $10, $11, 'APLICADA', $12,
-          $13::date, $14, $15, $16, false
+          $1, $2, $3, $4, $5, $4, $5,
+          $6, $7, $8, $9, 'APLICADA', $10,
+          $11::date, $12, $13, $14, false
         )
         RETURNING id_reversion
       `,
@@ -1148,10 +807,8 @@ export const createVentaReversion = async ({ idFactura, body, req, idUsuario, id
         correlativo.codigo,
         facturaId,
         idSucursal,
-        parsePositiveInt(factura.id_caja),
-        parsePositiveInt(factura.id_sesion_caja),
-        parsePositiveInt(cajaContext.id_caja),
-        parsePositiveInt(cajaContext.id_sesion_caja),
+        sessionContext.id_caja,
+        sessionContext.id_sesion_caja,
         tipoReversion,
         motivo,
         observacion,
@@ -1166,6 +823,7 @@ export const createVentaReversion = async ({ idFactura, body, req, idUsuario, id
 
     const idReversion = Number(insertReversion.rows[0].id_reversion);
 
+    // 10) insertar detalles
     for (const line of reversionLines) {
       await client.query(
         `
@@ -1184,7 +842,7 @@ export const createVentaReversion = async ({ idFactura, body, req, idUsuario, id
             total_revertido,
             devuelve_inventario
           )
-          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
         `,
         [
           idReversion,
@@ -1204,6 +862,8 @@ export const createVentaReversion = async ({ idFactura, body, req, idUsuario, id
       );
     }
 
+    // 11) registrar movimiento de caja en la sesion ORIGINAL (nunca en una
+    // sesion distinta)
     await client.query(
       `
         INSERT INTO public.cajas_movimientos (
@@ -1221,17 +881,21 @@ export const createVentaReversion = async ({ idFactura, body, req, idUsuario, id
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW())
       `,
       [
-        cajaContext.id_sesion_caja,
-        cajaContext.id_caja,
+        sessionContext.id_sesion_caja,
+        sessionContext.id_caja,
         idSucursal,
         idTipoMovimientoCaja,
         userId,
         montoReversado,
         correlativo.codigo,
-        `Reversi\u00f3n ${correlativo.codigo} de venta ${factura.codigo_venta || `VTA-${String(facturaId).padStart(5, '0')}`}`
+        `Reversión ${correlativo.codigo} de venta ${factura.codigo_venta || `VTA-${String(facturaId).padStart(5, '0')}`}`
       ]
     );
 
+    // Fidelizacion e inventario: se mantienen sin cambios de logica en
+    // Fase 2 (territorio de Fase 3/4), pero deben seguir ejecutandose
+    // dentro de la MISMA transaccion -- nunca se confirma Caja omitiendo
+    // silenciosamente estos dos efectos.
     const loyalty = await revertLoyaltyForFactura({
       client,
       idFactura: facturaId,
@@ -1274,10 +938,37 @@ export const createVentaReversion = async ({ idFactura, body, req, idUsuario, id
       });
     }
 
+    // 12) actualizar estados finales cuando corresponda. Si la factura
+    // queda totalmente reversada (segun el resultado ACUMULADO real, sin
+    // importar si esta operacion puntual fue solicitada como PARCIAL) y
+    // tiene pedido asociado, se cancela el pedido y se anula el pago. Si
+    // el catalogo CANCELADO no esta configurado en este entorno, la
+    // transaccion completa aborta (ROLLBACK) en vez de dejar el pedido en
+    // un estado incorrecto o de confirmar la reversion financiera sin la
+    // transicion de estado correspondiente.
+    let estadoFinal = null;
+    if (accumulated.factura_totalmente_reversada && factura.id_pedido) {
+      const idEstadoCancelado = await resolveCancelledEstadoPedidoIdOrThrow(client);
+      await client.query(
+        `
+          UPDATE public.pedidos
+          SET id_estado_pedido = $2,
+              estado_pago = 'PAGO_ANULADO'
+          WHERE id_pedido = $1
+        `,
+        [factura.id_pedido, idEstadoCancelado]
+      );
+      estadoFinal = { estado_pago: 'PAGO_ANULADO', estado_pedido: 'CANCELADO' };
+    }
+    // Venta directa (sin pedido) totalmente reversada: facturas no tiene
+    // columna de estado propia (confirmado en la auditoria de Fase 0); no
+    // hay nada adicional que actualizar.
+
     const result = {
       id_reversion: idReversion,
       codigo_reversion: correlativo.codigo,
       fecha_operacion: correlativo.fecha_operacion,
+      tipo_reversion_solicitado: tipoReversion,
       tipo_reversion: tipoReversion,
       motivo,
       observacion,
@@ -1286,11 +977,15 @@ export const createVentaReversion = async ({ idFactura, body, req, idUsuario, id
       codigo_venta: factura.codigo_venta || `VTA-${String(facturaId).padStart(5, '0')}`,
       id_factura_original: facturaId,
       id_sucursal: idSucursal,
-      id_caja_original: parsePositiveInt(factura.id_caja),
-      id_sesion_caja_original: parsePositiveInt(factura.id_sesion_caja),
-      id_caja_actual: parsePositiveInt(cajaContext.id_caja),
-      id_sesion_caja_actual: parsePositiveInt(cajaContext.id_sesion_caja),
+      id_caja_original: sessionContext.id_caja,
+      id_sesion_caja_original: sessionContext.id_sesion_caja,
+      id_caja_actual: sessionContext.id_caja,
+      id_sesion_caja_actual: sessionContext.id_sesion_caja,
       lineas: reversionLines,
+      resultado_acumulado: accumulated.resultado_acumulado,
+      cantidad_restante_final: accumulated.cantidad_restante_final,
+      factura_totalmente_reversada: accumulated.factura_totalmente_reversada,
+      estado_final: estadoFinal,
       fidelizacion: loyalty,
       auditoria: {
         ip_origen: ip,
@@ -1327,4 +1022,9 @@ export const createVentaReversion = async ({ idFactura, body, req, idUsuario, id
   }
 };
 
-export { VALID_MOTIVOS, createReversionError };
+export {
+  VALID_MOTIVOS,
+  createReversionError,
+  resolveSucursalScope,
+  assertSucursalAllowedForReversion
+};
