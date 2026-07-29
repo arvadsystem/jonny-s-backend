@@ -16,6 +16,7 @@ const PAYLOAD_CANONICAL_KEYS = Object.freeze([
   'documento_canonico'
 ]);
 const SOURCE_KEYS = Object.freeze(['id_factura', 'id_pedido']);
+const REVERSION_SOURCE_KEYS = Object.freeze(['id_factura', 'id_pedido', 'id_reversion']);
 const DOCUMENT_KEYS = Object.freeze(['kind', 'format', 'flavor', 'content_sha256', 'content_bytes']);
 const DATA_ITEM_KEYS = Object.freeze(['type', 'format', 'flavor', 'data', 'options']);
 
@@ -47,14 +48,21 @@ const validateCanonicalPayload = (payload) => {
     || isPositiveSafeInteger(payload.source?.id_factura);
   const pedidoSourceValid = payload.source?.id_pedido === null
     || isPositiveSafeInteger(payload.source?.id_pedido);
+  const reversionSourceValid = payload.tipo_documento !== 'reversion'
+    || isPositiveSafeInteger(payload.source?.id_reversion);
   const requiredSourcePresent = payload.tipo_documento === 'factura'
     ? isPositiveSafeInteger(payload.source?.id_factura)
     : payload.tipo_documento === 'comanda'
       && (isPositiveSafeInteger(payload.source?.id_factura) || isPositiveSafeInteger(payload.source?.id_pedido));
-  if (!hasExactKeys(payload.source, SOURCE_KEYS)
+  const sourceKeys = payload.tipo_documento === 'reversion' ? REVERSION_SOURCE_KEYS : SOURCE_KEYS;
+  const resolvedRequiredSource = payload.tipo_documento === 'reversion'
+    ? isPositiveSafeInteger(payload.source?.id_factura) && reversionSourceValid
+    : requiredSourcePresent;
+  if (!hasExactKeys(payload.source, sourceKeys)
     || !facturaSourceValid
     || !pedidoSourceValid
-    || !requiredSourcePresent) {
+    || !reversionSourceValid
+    || !resolvedRequiredSource) {
     invalidCanonicalDocument();
   }
   if (!hasExactKeys(payload.documento_canonico, DOCUMENT_KEYS)) invalidCanonicalDocument();
@@ -73,6 +81,13 @@ const validateCanonicalPayload = (payload) => {
       format: 'html',
       flavor: 'plain',
       maxBytes: HTML_MAX_BYTES
+    },
+    reversion: {
+      impresoraLogica: 'factura',
+      kind: 'venta_reversion_ticket_pdf',
+      format: 'pdf',
+      flavor: 'base64',
+      maxBytes: PDF_MAX_BYTES
     }
   };
   const contract = contracts[payload.tipo_documento];

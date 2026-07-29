@@ -81,6 +81,7 @@ const validatePrintParams = (params, job) => {
       || job.tipo_documento !== job.payload.tipo_documento
       || parsePositiveId(job.id_factura) !== payloadValidation.idFactura
       || parsePositiveId(job.id_pedido) !== payloadValidation.idPedido
+      || parsePositiveId(job.id_reversion) !== payloadValidation.idReversion
       || !validateCanonicalPrintDataItem(job.payload, item)) return null;
     return { printerName };
   }
@@ -137,7 +138,7 @@ export const authorizeAndSignAgentQzRequest = async ({
   try {
     await client.query('BEGIN');
     const jobResult = await client.query(
-      `SELECT id_trabajo,id_sucursal,id_agente_tomado,tipo_documento,estado,payload,id_factura,id_pedido,
+      `SELECT id_trabajo,id_sucursal,id_agente_tomado,tipo_documento,estado,payload,id_factura,id_pedido,id_reversion,
               (lease_expires_at IS NOT NULL AND lease_expires_at > now()) AS lease_active
        FROM public.trabajos_impresion
        WHERE id_trabajo=$1 AND id_sucursal=$2 AND id_agente_tomado=$3

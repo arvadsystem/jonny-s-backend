@@ -5,7 +5,7 @@ import {
 } from './printJobDocumentService.js';
 import { notifyPrintJobAvailable } from './printAgentWebSocketService.js';
 
-export const PRINT_DOCUMENT_TYPES = new Set(['factura', 'comanda', 'caja']);
+export const PRINT_DOCUMENT_TYPES = new Set(['factura', 'comanda', 'caja', 'reversion']);
 const MAX_PAYLOAD_BYTES = 256 * 1024;
 
 export const validatePrintPayload = (payload) => {
@@ -33,7 +33,7 @@ export const validatePrintPayload = (payload) => {
 
 export const enqueuePrintJob = async ({
   idSucursal, tipoDocumento, payload, idempotencyKey, idFactura = null,
-  idPedido = null, idUsuario = null, esReimpresion = false,
+  idPedido = null, idReversion = null, idUsuario = null, esReimpresion = false,
   canonicalDocument = null, db = pool, onInsertedTransaction = null,
   notify = notifyPrintJobAvailable
 }) => {
@@ -46,6 +46,15 @@ export const enqueuePrintJob = async ({
   const key = String(idempotencyKey || '').trim();
   if (key.length < 8 || key.length > 160) {
     throw Object.assign(new Error('Idempotency-Key es obligatorio.'), { code: 'PRINT_IDEMPOTENCY_INVALID', status: 400 });
+  }
+  const normalizedIdReversion = Number.isSafeInteger(Number(idReversion)) && Number(idReversion) > 0
+    ? Number(idReversion)
+    : null;
+  if ((normalizedType === 'reversion') !== Boolean(normalizedIdReversion)) {
+    throw Object.assign(new Error('La referencia de reversion es invalida.'), {
+      code: 'PRINT_REVERSION_INVALID',
+      status: 400
+    });
   }
   const canonicalValidation = Number(payload.schema_version) === 2
     ? validateCanonicalPrintDataItem(payload, canonicalDocument)
@@ -62,13 +71,22 @@ export const enqueuePrintJob = async ({
   try {
     await client.query('BEGIN');
     const insertResult = await client.query(
-      `INSERT INTO public.trabajos_impresion
-         (id_sucursal, tipo_documento, payload, idempotency_key, id_factura, id_pedido,
-          id_usuario_solicitante, es_reimpresion)
-       VALUES ($1,$2,$3::jsonb,$4,$5,$6,$7,$8)
-       ON CONFLICT (id_sucursal, idempotency_key, tipo_documento) DO NOTHING
-       RETURNING id_trabajo,id_sucursal,tipo_documento,estado,fecha_creacion,true AS inserted`,
-      [idSucursal, normalizedType, JSON.stringify(payload), key, idFactura, idPedido, idUsuario, esReimpresion]
+      normalizedType === 'reversion'
+        ? `INSERT INTO public.trabajos_impresion
+             (id_sucursal, tipo_documento, payload, idempotency_key, id_factura, id_pedido,
+              id_reversion, id_usuario_solicitante, es_reimpresion)
+           VALUES ($1,$2,$3::jsonb,$4,$5,$6,$7,$8,$9)
+           ON CONFLICT (id_sucursal, idempotency_key, tipo_documento) DO NOTHING
+           RETURNING id_trabajo,id_sucursal,tipo_documento,estado,fecha_creacion,true AS inserted`
+        : `INSERT INTO public.trabajos_impresion
+             (id_sucursal, tipo_documento, payload, idempotency_key, id_factura, id_pedido,
+              id_usuario_solicitante, es_reimpresion)
+           VALUES ($1,$2,$3::jsonb,$4,$5,$6,$7,$8)
+           ON CONFLICT (id_sucursal, idempotency_key, tipo_documento) DO NOTHING
+           RETURNING id_trabajo,id_sucursal,tipo_documento,estado,fecha_creacion,true AS inserted`,
+      normalizedType === 'reversion'
+        ? [idSucursal, normalizedType, JSON.stringify(payload), key, idFactura, idPedido, normalizedIdReversion, idUsuario, esReimpresion]
+        : [idSucursal, normalizedType, JSON.stringify(payload), key, idFactura, idPedido, idUsuario, esReimpresion]
     );
     let job = insertResult.rows[0];
     if (!job) {
@@ -114,9 +132,131 @@ export const enqueuePrintJob = async ({
     return publicJob;
   } catch (error) {
     try { await client.query('ROLLBACK'); } catch { /* conserva error original */ }
+    if (normalizedType === 'reversion' && ['42P01', '42703', '23514'].includes(error?.code)) {
+      throw Object.assign(new Error('El esquema de impresion de reversiones esta pendiente.'), {
+        code: 'PRINTING_REVERSION_SCHEMA_PENDIENTE',
+        status: 409,
+        httpStatus: 409,
+        publicMessage: 'El esquema de impresion de reversiones esta pendiente.',
+        cause: error
+      });
+    }
     throw error;
   } finally {
     if (shouldRelease) client.release();
+  }
+};
+
+export const enqueuePrintJobInTransaction = async ({
+  client,
+  idSucursal,
+  tipoDocumento,
+  payload,
+  idempotencyKey,
+  idFactura,
+  idReversion,
+  idUsuario = null,
+  esReimpresion = false,
+  canonicalDocument
+}) => {
+  if (!client || typeof client.query !== 'function') {
+    throw Object.assign(new Error('Cliente transaccional obligatorio.'), {
+      code: 'PRINT_TRANSACTION_CLIENT_REQUIRED',
+      status: 500
+    });
+  }
+  const normalizedType = String(tipoDocumento || '').trim().toLowerCase();
+  const validation = validatePrintPayload(payload);
+  const reversionId = Number(idReversion);
+  const key = String(idempotencyKey || '').trim();
+  if (!validation.ok
+    || normalizedType !== 'reversion'
+    || payload?.tipo_documento !== 'reversion'
+    || !Number.isSafeInteger(reversionId)
+    || reversionId <= 0
+    || key.length < 8
+    || key.length > 160) {
+    throw Object.assign(new Error(validation.message || 'Trabajo de reversion invalido.'), {
+      code: 'PRINT_REVERSION_INVALID',
+      status: 400
+    });
+  }
+  const canonicalValidation = validateCanonicalPrintDataItem(payload, canonicalDocument);
+  if (!canonicalValidation) {
+    throw Object.assign(new Error('El contenido canonico es obligatorio.'), {
+      code: 'PRINT_DOCUMENT_CONTENT_INVALID',
+      status: 400
+    });
+  }
+
+  try {
+    const inserted = await client.query(
+      `
+        INSERT INTO public.trabajos_impresion (
+          id_sucursal, tipo_documento, payload, idempotency_key,
+          id_factura, id_pedido, id_reversion, id_usuario_solicitante,
+          es_reimpresion
+        )
+        VALUES ($1, 'reversion', $2::jsonb, $3, $4, NULL, $5, $6, $7)
+        ON CONFLICT (id_sucursal, idempotency_key, tipo_documento) DO NOTHING
+        RETURNING id_trabajo, id_sucursal, tipo_documento, estado, fecha_creacion
+      `,
+      [
+        idSucursal,
+        JSON.stringify(payload),
+        key,
+        idFactura,
+        reversionId,
+        idUsuario,
+        esReimpresion
+      ]
+    );
+    let job = inserted.rows?.[0];
+    if (!job) {
+      const existing = await client.query(
+        `
+          SELECT id_trabajo, id_sucursal, tipo_documento, estado, fecha_creacion
+          FROM public.trabajos_impresion
+          WHERE id_sucursal = $1
+            AND idempotency_key = $2
+            AND tipo_documento = 'reversion'
+          LIMIT 1
+        `,
+        [idSucursal, key]
+      );
+      job = existing.rows?.[0];
+    }
+    if (!job) throw Object.assign(new Error('No se pudo crear el trabajo.'), { code: 'PRINT_ENQUEUE_FAILED' });
+    if (inserted.rows?.[0]) {
+      await client.query(
+        `
+          INSERT INTO public.trabajos_impresion_documentos (
+            id_trabajo, schema_version, tipo_documento, formato, flavor,
+            contenido, content_sha256, content_bytes
+          )
+          VALUES ($1, $2, 'reversion', 'pdf', 'base64', $3, $4, $5)
+        `,
+        [
+          job.id_trabajo,
+          payload.schema_version,
+          canonicalValidation.contentBytes,
+          payload.documento_canonico.content_sha256,
+          payload.documento_canonico.content_bytes
+        ]
+      );
+    }
+    return job;
+  } catch (error) {
+    if (['42P01', '42703', '23514'].includes(error?.code)) {
+      throw Object.assign(new Error('El esquema de impresion de reversiones esta pendiente.'), {
+        code: 'PRINTING_REVERSION_SCHEMA_PENDIENTE',
+        status: 409,
+        httpStatus: 409,
+        publicMessage: 'El esquema de impresion de reversiones esta pendiente.',
+        cause: error
+      });
+    }
+    throw error;
   }
 };
 
