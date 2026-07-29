@@ -17,10 +17,7 @@
 // no). Si no lo envia: una sola sesion abierta en la sucursal -> se
 // selecciona automaticamente; 2+ -> FIDELIZACION_CANJE_SESSION_SELECTION_REQUIRED
 // (el frontend debe pedir que elija); 0 -> FIDELIZACION_CANJE_SESSION_REQUIRED.
-const parsePositiveInt = (value) => {
-  const parsed = Number.parseInt(String(value ?? ''), 10);
-  return Number.isInteger(parsed) && parsed > 0 ? parsed : null;
-};
+import { parsePositiveInt } from '../routers/ventas/utils/parseUtils.js';
 
 const createCanjeSessionError = (status, code, message) => {
   const error = new Error(message);
@@ -123,6 +120,16 @@ export const resolveCanjeSesionCaja = async ({
 
   if (hasMultisucursalAccess) {
     const requestedId = parsePositiveInt(requestedIdSesionCaja);
+    const requestedValueProvided = requestedIdSesionCaja !== null
+      && requestedIdSesionCaja !== undefined
+      && requestedIdSesionCaja !== '';
+    if (requestedValueProvided && !requestedId) {
+      throw createCanjeSessionError(
+        400,
+        'FIDELIZACION_CANJE_SESSION_INVALID',
+        'La sesión de caja indicada debe ser un entero mayor a cero.'
+      );
+    }
     if (requestedId) {
       const session = await fetchSessionById(client, requestedId);
       const valid = Boolean(session)

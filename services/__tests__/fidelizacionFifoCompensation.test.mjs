@@ -164,6 +164,34 @@ describe('22) movimiento auditable de compensacion', () => {
     assert.equal(state.movimientos.length, 1);
   });
 
+  it('sin catalogos COMPENSACION/AJUSTE_PENDIENTE aborta antes de aplicar la deuda', async () => {
+    const { client, state } = createFidelizacionMockClient({
+      ajustesPendientesTableExists: true,
+      compensationCatalogsAvailable: false,
+      ajustesPendientes: [{ id_cliente: 5, id_factura: 900, id_reversion: 1, puntos_objetivo: 5, puntos_pendientes: 5, estado: 'PENDIENTE' }]
+    });
+    await assert.rejects(
+      registerFacturaLoyaltyAccumulation(baseAccumulationArgs(client, { idFactura: 112 })),
+      (err) => err.code === 'FIDELIZACION_SCHEMA_PENDIENTE' && err.httpStatus === 409
+    );
+    assert.equal(state.ajustesPendientes[0].puntos_pendientes, 5);
+    assert.equal(state.movimientos.length, 0);
+  });
+
+  it('la secuencia de saldos del movimiento principal y la compensacion es continua y termina en el saldo real', async () => {
+    const { client, state } = createFidelizacionMockClient({
+      ajustesPendientesTableExists: true,
+      ajustesPendientes: [{ id_cliente: 5, id_factura: 900, id_reversion: 1, puntos_objetivo: 7, puntos_pendientes: 7, estado: 'PENDIENTE' }]
+    });
+    await registerFacturaLoyaltyAccumulation(baseAccumulationArgs(client, { idFactura: 113 }));
+    const [acumulacion, compensacion] = state.movimientos;
+    assert.equal(acumulacion.saldo_anterior, 0);
+    assert.equal(acumulacion.saldo_nuevo, 25);
+    assert.equal(compensacion.saldo_anterior, acumulacion.saldo_nuevo);
+    assert.equal(compensacion.saldo_nuevo, 18);
+    assert.equal(state.saldos.get(5).puntos_disponibles, compensacion.saldo_nuevo);
+  });
+
   it('tabla fidelizacion_ajustes_pendientes ausente (esquema Fase 4 no aplicado): la acumulacion funciona exactamente igual que antes de Fase 4', async () => {
     const { client, state } = createFidelizacionMockClient({ ajustesPendientesTableExists: false });
     const result = await registerFacturaLoyaltyAccumulation(baseAccumulationArgs(client, { idFactura: 111 }));

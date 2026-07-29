@@ -176,7 +176,8 @@ export const createFidelizacionMockClient = ({
   // de compensacion la activan explicitamente con
   // ajustesPendientesTableExists: true y ajustesPendientes: [...].
   ajustesPendientesTableExists = false,
-  ajustesPendientes = []
+  ajustesPendientes = [],
+  compensationCatalogsAvailable = true
 } = {}) => {
   const rawConfigs = activeConfigs || (activeConfig ? [activeConfig] : []);
   const resolvedConfigs = rawConfigs.map((cfg) => ({
@@ -716,12 +717,14 @@ export const createFidelizacionMockClient = ({
 
       if (text.includes('cat_fidelizacion_tipos_movimiento') && text.includes('SELECT')) {
         const code = String(params[0] || '').toUpperCase();
+        if (code === 'COMPENSACION' && !compensationCatalogsAvailable) return { rows: [] };
         const id = CATALOG_IDS.tipos[code];
         return { rows: id ? [{ id_catalogo: id, codigo: code, nombre: code, estado: true }] : [] };
       }
 
       if (text.includes('cat_fidelizacion_origenes_movimiento') && text.includes('SELECT')) {
         const code = String(params[0] || '').toUpperCase();
+        if (code === 'AJUSTE_PENDIENTE' && !compensationCatalogsAvailable) return { rows: [] };
         const id = CATALOG_IDS.origenes[code];
         return { rows: id ? [{ id_catalogo: id, codigo: code, nombre: code, estado: true }] : [] };
       }
@@ -770,8 +773,11 @@ export const createFidelizacionMockClient = ({
         state.movimientos.push({
           id_movimiento: idMovimiento,
           id_factura: params[7] ? Number(params[7]) : null,
-          tipo: 'ACUMULACION',
-          origen: 'FACTURA'
+          tipo: Number(params[2]) === CATALOG_IDS.tipos.COMPENSACION ? 'COMPENSACION' : 'ACUMULACION',
+          origen: Number(params[6]) === CATALOG_IDS.origenes.AJUSTE_PENDIENTE ? 'AJUSTE_PENDIENTE' : 'FACTURA',
+          puntos_delta: Number(params[3]),
+          saldo_anterior: Number(params[4]),
+          saldo_nuevo: Number(params[5])
         });
         return { rows: [{ id_movimiento: idMovimiento }] };
       }

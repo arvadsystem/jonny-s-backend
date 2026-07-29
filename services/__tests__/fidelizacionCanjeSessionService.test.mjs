@@ -83,6 +83,19 @@ describe('24-25-26) Cajero (sin acceso multisucursal): siempre su propia sesion'
 });
 
 describe('27-28-29-30-31) Administrador/Super Admin (hasMultisucursalAccess=true)', () => {
+  it('rechaza id_sesion_caja con sufijo no numerico (10abc)', async () => {
+    const client = createSessionMockClient();
+    await assert.rejects(
+      resolveCanjeSesionCaja({
+        client,
+        idSucursal: 1,
+        idUsuario: 7,
+        hasMultisucursalAccess: true,
+        requestedIdSesionCaja: '10abc'
+      }),
+      (err) => err.code === 'FIDELIZACION_CANJE_SESSION_INVALID' && err.httpStatus === 400
+    );
+  });
   it('27) sin id_sesion_caja explicito, una sola sesion abierta en la sucursal -> se selecciona automaticamente', async () => {
     const client = createSessionMockClient({ allOpenSessions: [OPEN_SESSION_ROW({ id_sesion_caja: 55 })] });
     const result = await resolveCanjeSesionCaja({ client, idSucursal: 1, idUsuario: 1, hasMultisucursalAccess: true });

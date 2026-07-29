@@ -21,13 +21,10 @@
 //     silencio). Si esa tabla no existe (migracion 20260728 no aplicada
 //     todavia), aborta con FIDELIZACION_SCHEMA_PENDIENTE -- rollback
 //     completo de la reversion, nunca confirma un estado inconsistente.
-//  4) Trazabilidad por reversion (seccion 3.5): si
-//     fidelizacion_movimientos.id_reversion existe (migracion 20260729),
-//     crea un movimiento REVERSO INDEPENDIENTE por cada reversion en vez de
-//     actualizar un unico movimiento mutable por factura. Si la columna no
-//     existe todavia, conserva el comportamiento anterior (un unico
-//     movimiento REVERSO por factura, actualizado en cada reversion
-//     parcial subsiguiente) como respaldo seguro y equivalente.
+//  4) Trazabilidad por reversion (seccion 3.5):
+//     fidelizacion_movimientos.id_reversion es obligatoria. Cada reversion
+//     crea un movimiento REVERSO independiente; si la columna no existe se
+//     aborta la transaccion, sin degradar a un movimiento mutable por factura.
 import { parsePositiveInt } from '../utils/parseUtils.js';
 import { getClienteSaldoForUpdate } from '../../../services/fidelizacionService.js';
 
@@ -114,24 +111,45 @@ export const resolveLoyaltySourceMovement = async (client, idFactura) => {
 };
 
 const resolveReverseCatalog = async (client) => {
-  const result = await client.query(
-    `
-      SELECT
-        tm.id_tipo_movimiento AS id_tipo_movimiento_reverso,
-        om.id_origen_movimiento AS id_origen_movimiento_reverso
-      FROM public.cat_fidelizacion_tipos_movimiento tm
-      CROSS JOIN public.cat_fidelizacion_origenes_movimiento om
-      WHERE UPPER(TRIM(tm.codigo)) = 'REVERSO'
-        AND UPPER(TRIM(om.codigo)) = 'REVERSO_FACTURA'
-        AND COALESCE(tm.estado, true) = true
-        AND COALESCE(om.estado, true) = true
-      LIMIT 1
-    `
-  );
-  if (!result.rowCount) return null;
+  const [types, origins] = await Promise.all([
+    client.query(
+      `
+        SELECT id_tipo_movimiento AS id_catalogo, estado
+        FROM public.cat_fidelizacion_tipos_movimiento
+        WHERE UPPER(TRIM(codigo)) = UPPER(TRIM($1))
+        ORDER BY id_tipo_movimiento
+        FOR SHARE
+      `,
+      ['REVERSO']
+    ),
+    client.query(
+      `
+        SELECT id_origen_movimiento AS id_catalogo, estado
+        FROM public.cat_fidelizacion_origenes_movimiento
+        WHERE UPPER(TRIM(codigo)) = UPPER(TRIM($1))
+        ORDER BY id_origen_movimiento
+        FOR SHARE
+      `,
+      ['REVERSO_FACTURA']
+    )
+  ]);
+  const type = types.rows?.[0];
+  const origin = origins.rows?.[0];
+  if (
+    types.rows?.length !== 1
+    || origins.rows?.length !== 1
+    || type?.estado === false
+    || origin?.estado === false
+  ) {
+    throw createFidelizacionReversionError(
+      409,
+      'FIDELIZACION_CATALOGS_ERROR',
+      'Los catalogos de reversion de fidelizacion no estan configurados de forma unica y activa.'
+    );
+  }
   return {
-    reverseTypeId: Number(result.rows[0].id_tipo_movimiento_reverso),
-    reverseOriginId: Number(result.rows[0].id_origen_movimiento_reverso)
+    reverseTypeId: Number(type.id_catalogo),
+    reverseOriginId: Number(origin.id_catalogo)
   };
 };
 
@@ -151,10 +169,20 @@ const sumReversedAmountAcumulado = async (client, idFactura) => {
 const sumAlreadyReversedPoints = async (client, idFactura) => {
   const result = await client.query(
     `
-      SELECT COALESCE(SUM(ABS(puntos_delta)), 0)::int AS puntos_revertidos
-      FROM public.fidelizacion_movimientos
-      WHERE id_factura = $1
-        AND puntos_delta < 0
+      SELECT COALESCE(SUM(ABS(fm.puntos_delta)), 0)::int AS puntos_revertidos
+      FROM public.fidelizacion_movimientos fm
+      INNER JOIN public.cat_fidelizacion_tipos_movimiento tm
+        ON tm.id_tipo_movimiento = fm.id_tipo_movimiento
+      INNER JOIN public.cat_fidelizacion_origenes_movimiento om
+        ON om.id_origen_movimiento = fm.id_origen_movimiento
+      INNER JOIN public.facturas_reversiones fr
+        ON fr.id_reversion = fm.id_reversion
+       AND fr.id_factura_original = fm.id_factura
+       AND UPPER(TRIM(COALESCE(fr.estado, ''))) = 'APLICADA'
+      WHERE fm.id_factura = $1
+        AND UPPER(TRIM(tm.codigo)) = 'REVERSO'
+        AND UPPER(TRIM(om.codigo)) = 'REVERSO_FACTURA'
+        AND fm.puntos_delta < 0
     `,
     [idFactura]
   );
@@ -209,89 +237,37 @@ const insertLoyaltyReversalMovement = async ({
   reverseOriginId
 }) => {
   const observacion = `Reversión ${tipoReversion} de puntos por reversión de venta ${codigoReversion || ''}.`.trim();
-  const canUseIdReversion = await hasColumn(client, 'fidelizacion_movimientos', 'id_reversion');
-
-  if (canUseIdReversion) {
-    // Fase 4: un movimiento REVERSO independiente por cada id_reversion.
-    // Nunca se reutiliza/actualiza un movimiento existente de otra
-    // reversion.
-    const result = await client.query(
-      `
-        INSERT INTO public.fidelizacion_movimientos (
-          id_cliente, id_sucursal, id_tipo_movimiento, puntos_delta,
-          saldo_anterior, saldo_nuevo, id_origen_movimiento, id_factura,
-          id_reversion, observacion, id_usuario_ejecutor, fecha_creacion
-        )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW())
-        ON CONFLICT (id_reversion) DO NOTHING
-        RETURNING id_movimiento
-      `,
-      [
-        idCliente,
-        idSucursal,
-        reverseTypeId,
-        puntosAplicables * -1,
-        saldoAnterior,
-        saldoNuevo,
-        reverseOriginId,
-        idFactura,
-        idReversion,
-        observacion,
-        idUsuario
-      ]
-    );
-    return Number(result.rows?.[0]?.id_movimiento || 0);
-  }
-
-  // Respaldo (columna aun no aplicada): comportamiento equivalente al
-  // anterior a Fase 4 -- un unico movimiento REVERSO mutable por factura.
-  const existingResult = await client.query(
-    `
-      SELECT id_movimiento, puntos_delta
-      FROM public.fidelizacion_movimientos
-      WHERE id_factura = $1
-        AND id_tipo_movimiento = $2
-        AND id_origen_movimiento = $3
-      LIMIT 1
-      FOR UPDATE
-    `,
-    [idFactura, reverseTypeId, reverseOriginId]
-  );
-
-  if (existingResult.rowCount) {
-    const existing = existingResult.rows[0];
-    const nuevoDelta = Number(existing.puntos_delta || 0) - puntosAplicables;
-    await client.query(
-      `
-        UPDATE public.fidelizacion_movimientos
-        SET puntos_delta = $1, saldo_nuevo = $2, observacion = $3, id_usuario_ejecutor = $4
-        WHERE id_movimiento = $5
-      `,
-      [nuevoDelta, saldoNuevo, observacion, idUsuario, Number(existing.id_movimiento)]
-    );
-    return Number(existing.id_movimiento);
-  }
-
-  const inserted = await client.query(
+  const result = await client.query(
     `
       INSERT INTO public.fidelizacion_movimientos (
         id_cliente, id_sucursal, id_tipo_movimiento, puntos_delta,
         saldo_anterior, saldo_nuevo, id_origen_movimiento, id_factura,
-        observacion, id_usuario_ejecutor, fecha_creacion
+        id_reversion, observacion, id_usuario_ejecutor, fecha_creacion
       )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW())
       RETURNING id_movimiento
     `,
-    [idCliente, idSucursal, reverseTypeId, puntosAplicables * -1, saldoAnterior, saldoNuevo, reverseOriginId, idFactura, observacion, idUsuario]
+    [
+      idCliente,
+      idSucursal,
+      reverseTypeId,
+      puntosAplicables * -1,
+      saldoAnterior,
+      saldoNuevo,
+      reverseOriginId,
+      idFactura,
+      idReversion,
+      observacion,
+      idUsuario
+    ]
   );
-  return Number(inserted.rows?.[0]?.id_movimiento || 0);
+  return Number(result.rows?.[0]?.id_movimiento || 0);
 };
 
 /**
  * Registra (o confirma idempotentemente) la deuda de puntos que esta
- * reversion no pudo retirar de inmediato. UNIQUE(id_reversion) hace que un
- * reintento de la MISMA reversion (mismo id_reversion) sea un no-op
- * seguro via ON CONFLICT DO NOTHING.
+ * reversion no pudo retirar de inmediato. Un conflicto por id_reversion
+ * solo es replay cuando todos los campos financieros coinciden.
  */
 const upsertPendingAdjustment = async ({ client, idCliente, idFactura, idReversion, puntosObjetivo, puntosAplicables, idUsuarioEjecutor }) => {
   const puntosRecuperados = Math.max(0, Math.min(puntosAplicables, puntosObjetivo));
@@ -307,12 +283,39 @@ const upsertPendingAdjustment = async ({ client, idCliente, idFactura, idReversi
       )
       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
       ON CONFLICT (id_reversion) DO NOTHING
-      RETURNING id_ajuste
+      RETURNING id_ajuste, true AS inserted
     `,
     [idCliente, idFactura, idReversion, puntosObjetivo, puntosRecuperados, puntosPendientes, estado, idUsuarioEjecutor]
   );
 
-  return result.rows?.[0]?.id_ajuste ? Number(result.rows[0].id_ajuste) : null;
+  if (result.rows?.[0]?.id_ajuste) return Number(result.rows[0].id_ajuste);
+
+  const existingResult = await client.query(
+    `
+      SELECT
+        id_ajuste, id_cliente, id_factura, puntos_objetivo,
+        puntos_recuperados, puntos_pendientes
+      FROM public.fidelizacion_ajustes_pendientes
+      WHERE id_reversion = $1
+      FOR UPDATE
+    `,
+    [idReversion]
+  );
+  const existing = existingResult.rows?.[0];
+  const matches = Boolean(existing)
+    && Number(existing.id_cliente) === Number(idCliente)
+    && Number(existing.id_factura) === Number(idFactura)
+    && Number(existing.puntos_objetivo) === puntosObjetivo
+    && Number(existing.puntos_recuperados) === puntosRecuperados
+    && Number(existing.puntos_pendientes) === puntosPendientes;
+  if (!matches) {
+    throw createFidelizacionReversionError(
+      409,
+      'FIDELIZACION_AJUSTE_CONFLICTO',
+      'El ajuste pendiente existente no coincide con la reversion solicitada.'
+    );
+  }
+  return Number(existing.id_ajuste);
 };
 
 /**
@@ -338,8 +341,15 @@ export const applyLoyaltyReversalForFactura = async ({
   const puntosOriginales = Number(source.puntos_delta || 0);
   if (puntosOriginales <= 0) return { applied: false, reason: 'NO_GENERO_PUNTOS' };
 
+  if (!(await hasColumn(client, 'fidelizacion_movimientos', 'id_reversion'))) {
+    throw createFidelizacionReversionError(
+      409,
+      'FIDELIZACION_SCHEMA_PENDIENTE',
+      'Falta aplicar la trazabilidad por reversion de fidelizacion; no se puede completar la reversion de forma consistente.'
+    );
+  }
+
   const reverseCatalog = await resolveReverseCatalog(client);
-  if (!reverseCatalog) return { applied: false, reason: 'LOYALTY_REVERSAL_CATALOG_MISSING' };
 
   const puntosYaRevertidos = await sumAlreadyReversedPoints(client, facturaId);
   const puntosDisponiblesParaReversar = Math.max(0, puntosOriginales - puntosYaRevertidos);
@@ -377,17 +387,16 @@ export const applyLoyaltyReversalForFactura = async ({
   }
 
   const nuevoSaldo = Math.max(0, saldoAnterior - puntosAplicables);
-  const nuevoAcumulado = Math.max(0, Number(saldo.puntos_acumulados_total || 0) - puntosAplicables);
 
   let idMovimiento = null;
   if (puntosAplicables > 0) {
     await client.query(
       `
         UPDATE public.fidelizacion_saldos_cliente
-        SET puntos_disponibles = $1, puntos_acumulados_total = $2, fecha_actualizacion = NOW()
-        WHERE id_cliente = $3
+        SET puntos_disponibles = $1, fecha_actualizacion = NOW()
+        WHERE id_cliente = $2
       `,
-      [nuevoSaldo, nuevoAcumulado, source.id_cliente]
+      [nuevoSaldo, source.id_cliente]
     );
     await client.query('UPDATE public.clientes SET puntos = $1 WHERE id_cliente = $2', [nuevoSaldo, source.id_cliente]);
 

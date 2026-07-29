@@ -457,23 +457,49 @@ const hasFidelizacionAjustesPendientesTable = async (client) => {
   return ajustesPendientesTableExistsCache;
 };
 
-// Catalogos de compensacion (COMPENSACION/AJUSTE_PENDIENTE, migracion
-// 20260729_fidelizacion_catalogos_compensacion): a diferencia de
-// resolveFidelizacionCatalogs (que EXIGE existencia y lanza si falta), esta
-// resolucion es opcional -- si los catalogos no estan sembrados todavia, la
-// compensacion FIFO de deuda igual se aplica sobre fidelizacion_ajustes_pendientes,
-// solo se omite el movimiento auditable dedicado (queda documentado en la
-// observacion del movimiento principal).
+// Catalogos obligatorios de compensacion
+// (COMPENSACION/AJUSTE_PENDIENTE). Se leen sin LIMIT para detectar
+// configuraciones ambiguas por codigo normalizado.
 const resolveCompensationCatalogs = async (client) => {
-  const [tipoCompensacion, origenAjustePendiente] = await Promise.all([
-    getCatalogRowByCode(client, 'cat_fidelizacion_tipos_movimiento', 'id_tipo_movimiento', 'COMPENSACION'),
-    getCatalogRowByCode(client, 'cat_fidelizacion_origenes_movimiento', 'id_origen_movimiento', 'AJUSTE_PENDIENTE')
+  const [types, origins] = await Promise.all([
+    client.query(
+      `
+        SELECT id_tipo_movimiento AS id_catalogo, estado
+        FROM public.cat_fidelizacion_tipos_movimiento
+        WHERE UPPER(TRIM(codigo)) = UPPER(TRIM($1))
+        ORDER BY id_tipo_movimiento
+        FOR SHARE
+      `,
+      ['COMPENSACION']
+    ),
+    client.query(
+      `
+        SELECT id_origen_movimiento AS id_catalogo, estado
+        FROM public.cat_fidelizacion_origenes_movimiento
+        WHERE UPPER(TRIM(codigo)) = UPPER(TRIM($1))
+        ORDER BY id_origen_movimiento
+        FOR SHARE
+      `,
+      ['AJUSTE_PENDIENTE']
+    )
   ]);
-  if (!tipoCompensacion || tipoCompensacion.estado === false) return null;
-  if (!origenAjustePendiente || origenAjustePendiente.estado === false) return null;
+  const type = types.rows?.[0];
+  const origin = origins.rows?.[0];
+  if (
+    types.rows?.length !== 1
+    || origins.rows?.length !== 1
+    || type?.estado === false
+    || origin?.estado === false
+  ) {
+    throw createFidelizacionError(
+      409,
+      'FIDELIZACION_SCHEMA_PENDIENTE',
+      'Los catalogos de compensacion de fidelizacion no estan configurados de forma unica y activa.'
+    );
+  }
   return {
-    tipoCompensacionId: Number(tipoCompensacion.id_catalogo),
-    origenAjustePendienteId: Number(origenAjustePendiente.id_catalogo)
+    tipoCompensacionId: Number(type.id_catalogo),
+    origenAjustePendienteId: Number(origin.id_catalogo)
   };
 };
 
@@ -502,6 +528,8 @@ const applyFifoCompensation = async ({ client, idCliente, puntosDisponiblesParaC
   );
 
   const ajustesTocados = [];
+  const hasCompensableDebt = result.rows.some((row) => Number(row.puntos_pendientes || 0) > 0);
+  const catalogs = hasCompensableDebt ? await resolveCompensationCatalogs(client) : null;
   for (const ajuste of result.rows) {
     if (remaining <= 0) break;
     const pendienteActual = Number(ajuste.puntos_pendientes || 0);
@@ -528,7 +556,7 @@ const applyFifoCompensation = async ({ client, idCliente, puntosDisponiblesParaC
   }
 
   const compensado = ajustesTocados.reduce((sum, entry) => sum + entry.compensado, 0);
-  return { compensado, ajustesTocados };
+  return { compensado, ajustesTocados, catalogs };
 };
 
 const registerFidelizacionMovement = async (client, payload) => {
@@ -617,7 +645,7 @@ const addSaldoPoints = async ({
   // de una reversion anterior. Si fidelizacion_ajustes_pendientes no
   // existe todavia (migracion no aplicada), se omite por completo y el
   // comportamiento es identico al anterior a Fase 4.
-  let compensacion = { compensado: 0, ajustesTocados: [] };
+  let compensacion = { compensado: 0, ajustesTocados: [], catalogs: null };
   if (isAccumulation && (await hasFidelizacionAjustesPendientesTable(client))) {
     compensacion = await applyFifoCompensation({
       client,
@@ -690,30 +718,20 @@ const addSaldoPoints = async ({
 
   let idMovimientoCompensacion = null;
   if (compensacion.compensado > 0) {
-    // El movimiento auditable DEDICADO de compensacion solo se crea si los
-    // catalogos COMPENSACION/AJUSTE_PENDIENTE ya estan sembrados
-    // (migracion 20260729_fidelizacion_catalogos_compensacion). Si no, la
-    // compensacion sobre fidelizacion_ajustes_pendientes ya quedo aplicada
-    // arriba y documentada en la observacion del movimiento principal --
-    // nunca se bloquea la acumulacion por la ausencia de este catalogo
-    // opcional.
-    const compensationCatalogs = await resolveCompensationCatalogs(client);
-    if (compensationCatalogs) {
-      idMovimientoCompensacion = await registerFidelizacionMovement(client, {
-        id_cliente: idCliente,
-        id_sucursal: idSucursal,
-        id_tipo_movimiento: compensationCatalogs.tipoCompensacionId,
-        puntos_delta: compensacion.compensado * -1,
-        saldo_anterior: saldoIntermedio,
-        saldo_nuevo: nextSaldo,
-        id_origen_movimiento: compensationCatalogs.origenAjustePendienteId,
-        id_factura: idFactura,
-        id_pedido: idPedido,
-        id_canje: idCanje,
-        observacion: `Compensacion FIFO de ${compensacion.compensado} pts contra ajuste(s) pendiente(s) #${compensacion.ajustesTocados.map((t) => t.id_ajuste).join(', #')}.`,
-        id_usuario_ejecutor: idUsuarioEjecutor
-      });
-    }
+    idMovimientoCompensacion = await registerFidelizacionMovement(client, {
+      id_cliente: idCliente,
+      id_sucursal: idSucursal,
+      id_tipo_movimiento: compensacion.catalogs.tipoCompensacionId,
+      puntos_delta: compensacion.compensado * -1,
+      saldo_anterior: saldoIntermedio,
+      saldo_nuevo: nextSaldo,
+      id_origen_movimiento: compensacion.catalogs.origenAjustePendienteId,
+      id_factura: idFactura,
+      id_pedido: idPedido,
+      id_canje: idCanje,
+      observacion: `Compensacion FIFO de ${compensacion.compensado} pts contra ajuste(s) pendiente(s) #${compensacion.ajustesTocados.map((t) => t.id_ajuste).join(', #')}.`,
+      id_usuario_ejecutor: idUsuarioEjecutor
+    });
   }
 
   return {

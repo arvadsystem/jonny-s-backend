@@ -14,7 +14,10 @@ beforeEach(() => {
   __resetVentasReversionFidelizacionSchemaProbeCacheForTests();
 });
 
-const REVERSE_CATALOG_ROW = { id_tipo_movimiento_reverso: 3, id_origen_movimiento_reverso: 3 };
+const REVERSE_CATALOG_ROW = {
+  type: { id_catalogo: 3, estado: true },
+  origin: { id_catalogo: 3, estado: true }
+};
 
 const createLoyaltyMockClient = ({
   sourceMovements = [{ id_movimiento: 1, id_cliente: 5, puntos_delta: 100 }],
@@ -24,11 +27,14 @@ const createLoyaltyMockClient = ({
   saldo = { id_cliente: 5, puntos_disponibles: 100, puntos_acumulados_total: 100, puntos_canjeados_total: 0 },
   hasIdReversionColumn = true,
   hasAjustesPendientesTable = true,
-  existingLegacyReverseRow = null
+  existingAdjustment = null
 } = {}) => {
   const inserted = [];
   const updates = { saldo: [], clientes: [], movimientosReverso: [], ajustesPendientes: [] };
   const ajustesInsertados = [];
+  const adjustmentByReversion = new Map(
+    existingAdjustment ? [[Number(existingAdjustment.id_reversion), { ...existingAdjustment }]] : []
+  );
   let saldoState = { ...saldo };
 
   const client = {
@@ -39,15 +45,20 @@ const createLoyaltyMockClient = ({
         return { rowCount: sourceMovements.length, rows: sourceMovements };
       }
 
-      if (/cat_fidelizacion_tipos_movimiento tm[\s\S]*CROSS JOIN/.test(text)) {
-        return reverseCatalogRow ? { rowCount: 1, rows: [reverseCatalogRow] } : { rowCount: 0, rows: [] };
+      if (/FROM public\.cat_fidelizacion_tipos_movimiento/.test(text)) {
+        const rows = reverseCatalogRow?.types || (reverseCatalogRow?.type ? [reverseCatalogRow.type] : []);
+        return { rowCount: rows.length, rows };
+      }
+      if (/FROM public\.cat_fidelizacion_origenes_movimiento/.test(text)) {
+        const rows = reverseCatalogRow?.origins || (reverseCatalogRow?.origin ? [reverseCatalogRow.origin] : []);
+        return { rowCount: rows.length, rows };
       }
 
       if (/SUM\(monto_reversado\)/.test(text)) {
         return { rows: [{ monto_reversado_acumulado: montoReversadoAcumulado }] };
       }
 
-      if (/SUM\(ABS\(puntos_delta\)\)/.test(text)) {
+      if (/SUM\(ABS\(fm\.puntos_delta\)\)/.test(text)) {
         return { rows: [{ puntos_revertidos: alreadyReversedPoints }] };
       }
 
@@ -60,9 +71,9 @@ const createLoyaltyMockClient = ({
         return { rows: [{ ...saldoState }] };
       }
       if (/UPDATE public\.fidelizacion_saldos_cliente/.test(text)) {
-        const [disponibles, acumulados] = params;
-        saldoState = { ...saldoState, puntos_disponibles: Number(disponibles), puntos_acumulados_total: Number(acumulados) };
-        updates.saldo.push({ disponibles: Number(disponibles), acumulados: Number(acumulados) });
+        const [disponibles] = params;
+        saldoState = { ...saldoState, puntos_disponibles: Number(disponibles) };
+        updates.saldo.push({ disponibles: Number(disponibles), acumulados: saldoState.puntos_acumulados_total });
         return { rows: [] };
       }
       if (/UPDATE public\.clientes/.test(text)) {
@@ -101,10 +112,25 @@ const createLoyaltyMockClient = ({
       }
 
       if (/INSERT INTO public\.fidelizacion_ajustes_pendientes/.test(text)) {
+        const idReversion = Number(params[2]);
+        if (adjustmentByReversion.has(idReversion)) return { rows: [] };
         const idAjuste = ajustesInsertados.length + 1;
         ajustesInsertados.push({ params, idAjuste });
         updates.ajustesPendientes.push(params);
+        adjustmentByReversion.set(idReversion, {
+          id_ajuste: idAjuste,
+          id_cliente: Number(params[0]),
+          id_factura: Number(params[1]),
+          id_reversion: idReversion,
+          puntos_objetivo: Number(params[3]),
+          puntos_recuperados: Number(params[4]),
+          puntos_pendientes: Number(params[5])
+        });
         return { rows: [{ id_ajuste: idAjuste }] };
+      }
+      if (/FROM public\.fidelizacion_ajustes_pendientes[\s\S]*WHERE id_reversion = \$1[\s\S]*FOR UPDATE/.test(text)) {
+        const row = adjustmentByReversion.get(Number(params[0]));
+        return { rowCount: row ? 1 : 0, rows: row ? [{ ...row }] : [] };
       }
 
       throw new Error(`Consulta no simulada en mock de reversion de fidelizacion: ${text}`);
@@ -328,44 +354,49 @@ describe('applyLoyaltyReversalForFactura', () => {
     assert.equal(ajustesInsertados[0].params[2], 555);
   });
 
-  it('11) reintento no duplica ajuste: ON CONFLICT (id_reversion) DO NOTHING vuelve idempotente la segunda llamada con el mismo id_reversion', async () => {
-    const state = { ajustes: [] };
-    const client = {
-      async query(sql, params = []) {
-        const text = String(sql);
-        if (/FROM public\.fidelizacion_movimientos fm[\s\S]*puntos_delta > 0/.test(text)) {
-          return { rowCount: 1, rows: [{ id_movimiento: 1, id_cliente: 5, puntos_delta: 10 }] };
-        }
-        if (/cat_fidelizacion_tipos_movimiento tm[\s\S]*CROSS JOIN/.test(text)) return { rowCount: 1, rows: [REVERSE_CATALOG_ROW] };
-        if (/SUM\(monto_reversado\)/.test(text)) return { rows: [{ monto_reversado_acumulado: 0 }] };
-        if (/SUM\(ABS\(puntos_delta\)\)/.test(text)) return { rows: [{ puntos_revertidos: 0 }] };
-        if (/INSERT INTO public\.fidelizacion_saldos_cliente/.test(text)) return { rows: [] };
-        if (/FROM public\.fidelizacion_saldos_cliente[\s\S]*FOR UPDATE/.test(text)) {
-          return { rows: [{ id_cliente: 5, puntos_disponibles: 0, puntos_acumulados_total: 10, puntos_canjeados_total: 10 }] };
-        }
-        if (/information_schema\.columns[\s\S]*column_name = \$2/.test(text)) return { rowCount: 1, rows: [{ x: 1 }] };
-        if (/SELECT to_regclass\(\$1\)/.test(text)) return { rows: [{ reg: 'fidelizacion_ajustes_pendientes' }] };
-        if (/INSERT INTO public\.fidelizacion_ajustes_pendientes/.test(text)) {
-          const idReversion = Number(params[2]);
-          if (state.ajustes.some((a) => a.id_reversion === idReversion)) {
-            return { rows: [] }; // ON CONFLICT DO NOTHING
-          }
-          state.ajustes.push({ id_reversion: idReversion });
-          return { rows: [{ id_ajuste: state.ajustes.length }] };
-        }
-        throw new Error(`no simulado: ${text}`);
+  it('11) ajuste existente igual se bloquea, valida y trata como replay', async () => {
+    const { client, ajustesInsertados } = createLoyaltyMockClient({
+      sourceMovements: [{ id_movimiento: 1, id_cliente: 5, puntos_delta: 10 }],
+      saldo: { id_cliente: 5, puntos_disponibles: 0, puntos_acumulados_total: 10, puntos_canjeados_total: 10 },
+      existingAdjustment: {
+        id_ajuste: 77,
+        id_cliente: 5,
+        id_factura: 1,
+        id_reversion: 999,
+        puntos_objetivo: 10,
+        puntos_recuperados: 0,
+        puntos_pendientes: 10
       }
-    };
-
-    const args = {
+    });
+    const result = await applyLoyaltyReversalForFactura({
       client, idFactura: 1, idSucursal: 1, idUsuario: 7, tipoReversion: 'TOTAL',
       idReversion: 999, codigoReversion: 'REV-999', totalFactura: 100, facturaTotalmenteReversada: true
-    };
-    const r1 = await applyLoyaltyReversalForFactura(args);
-    const r2 = await applyLoyaltyReversalForFactura(args);
-    assert.equal(r1.id_ajuste_pendiente, 1);
-    assert.equal(r2.id_ajuste_pendiente, null, 'ON CONFLICT DO NOTHING no devuelve fila, no crea un segundo ajuste');
-    assert.equal(state.ajustes.length, 1);
+    });
+    assert.equal(result.id_ajuste_pendiente, 77);
+    assert.equal(ajustesInsertados.length, 0);
+  });
+
+  it('ajuste existente diferente aborta con FIDELIZACION_AJUSTE_CONFLICTO', async () => {
+    const { client } = createLoyaltyMockClient({
+      sourceMovements: [{ id_movimiento: 1, id_cliente: 5, puntos_delta: 10 }],
+      saldo: { id_cliente: 5, puntos_disponibles: 0, puntos_acumulados_total: 10, puntos_canjeados_total: 10 },
+      existingAdjustment: {
+        id_ajuste: 77,
+        id_cliente: 5,
+        id_factura: 999,
+        id_reversion: 998,
+        puntos_objetivo: 10,
+        puntos_recuperados: 0,
+        puntos_pendientes: 10
+      }
+    });
+    await assert.rejects(
+      applyLoyaltyReversalForFactura({
+        client, idFactura: 1, idSucursal: 1, idUsuario: 7, tipoReversion: 'TOTAL',
+        idReversion: 998, codigoReversion: 'REV-998', totalFactura: 100, facturaTotalmenteReversada: true
+      }),
+      (err) => err.code === 'FIDELIZACION_AJUSTE_CONFLICTO' && err.httpStatus === 409
+    );
   });
 
   it('12) dos reversiones diferentes de la misma factura generan movimientos/registros separados (trazabilidad por id_reversion)', async () => {
@@ -408,30 +439,82 @@ describe('applyLoyaltyReversalForFactura', () => {
     assert.equal(updates.movimientosReverso.length, 0);
   });
 
-  it('sin catalogo REVERSO/REVERSO_FACTURA sembrado -> no aplica (gracioso, no bloquea la reversion financiera)', async () => {
+  it('catalogo REVERSO ausente aborta con FIDELIZACION_CATALOGS_ERROR', async () => {
     const { client } = createLoyaltyMockClient({
       sourceMovements: [{ id_movimiento: 1, id_cliente: 5, puntos_delta: 10 }],
       reverseCatalogRow: null
     });
-    const result = await applyLoyaltyReversalForFactura({
-      client, idFactura: 1, idSucursal: 1, idUsuario: 7, tipoReversion: 'TOTAL',
-      idReversion: 41, codigoReversion: 'REV-41', totalFactura: 100, facturaTotalmenteReversada: true
-    });
-    assert.equal(result.applied, false);
-    assert.equal(result.reason, 'LOYALTY_REVERSAL_CATALOG_MISSING');
+    await assert.rejects(
+      applyLoyaltyReversalForFactura({
+        client, idFactura: 1, idSucursal: 1, idUsuario: 7, tipoReversion: 'TOTAL',
+        idReversion: 41, codigoReversion: 'REV-41', totalFactura: 100, facturaTotalmenteReversada: true
+      }),
+      (err) => err.code === 'FIDELIZACION_CATALOGS_ERROR' && err.httpStatus === 409
+    );
   });
 
-  it('sin columna id_reversion en fidelizacion_movimientos -> respaldo legacy (un unico movimiento mutable por factura)', async () => {
+  it('catalogo REVERSO duplicado por codigo normalizado aborta por ambiguedad', async () => {
+    const { client } = createLoyaltyMockClient({
+      reverseCatalogRow: {
+        types: [{ id_catalogo: 3, estado: true }, { id_catalogo: 4, estado: true }],
+        origins: [{ id_catalogo: 3, estado: true }]
+      }
+    });
+    await assert.rejects(
+      applyLoyaltyReversalForFactura({
+        client, idFactura: 1, idSucursal: 1, idUsuario: 7, tipoReversion: 'TOTAL',
+        idReversion: 43, codigoReversion: 'REV-43', totalFactura: 100, facturaTotalmenteReversada: true
+      }),
+      (err) => err.code === 'FIDELIZACION_CATALOGS_ERROR' && err.httpStatus === 409
+    );
+  });
+
+  it('sin columna id_reversion en fidelizacion_movimientos -> FIDELIZACION_SCHEMA_PENDIENTE', async () => {
     const { client, updates } = createLoyaltyMockClient({
       sourceMovements: [{ id_movimiento: 1, id_cliente: 5, puntos_delta: 10 }],
-      hasIdReversionColumn: false,
-      existingLegacyReverseRow: null
+      hasIdReversionColumn: false
     });
-    const result = await applyLoyaltyReversalForFactura({
-      client, idFactura: 1, idSucursal: 1, idUsuario: 7, tipoReversion: 'TOTAL',
-      idReversion: 42, codigoReversion: 'REV-42', totalFactura: 100, facturaTotalmenteReversada: true
+    await assert.rejects(
+      applyLoyaltyReversalForFactura({
+        client, idFactura: 1, idSucursal: 1, idUsuario: 7, tipoReversion: 'TOTAL',
+        idReversion: 42, codigoReversion: 'REV-42', totalFactura: 100, facturaTotalmenteReversada: true
+      }),
+      (err) => err.code === 'FIDELIZACION_SCHEMA_PENDIENTE' && err.httpStatus === 409
+    );
+    assert.equal(updates.movimientosReverso.length, 0);
+  });
+
+  it('una reversion reduce disponibles pero conserva puntos_acumulados_total y puntos_canjeados_total', async () => {
+    const mock = createLoyaltyMockClient({
+      sourceMovements: [{ id_movimiento: 1, id_cliente: 5, puntos_delta: 10 }],
+      saldo: { id_cliente: 5, puntos_disponibles: 8, puntos_acumulados_total: 123, puntos_canjeados_total: 45 }
     });
-    assert.equal(result.applied, true);
-    assert.equal(updates.movimientosReverso.length, 1);
+    await applyLoyaltyReversalForFactura({
+      client: mock.client, idFactura: 1, idSucursal: 1, idUsuario: 7, tipoReversion: 'TOTAL',
+      idReversion: 44, codigoReversion: 'REV-44', totalFactura: 100, facturaTotalmenteReversada: true
+    });
+    assert.equal(mock.saldoState.puntos_disponibles, 0);
+    assert.equal(mock.saldoState.puntos_acumulados_total, 123);
+    assert.equal(mock.saldoState.puntos_canjeados_total, 45);
+  });
+
+  it('el conteo previo filtra solo REVERSO/REVERSO_FACTURA con id_reversion APLICADA de la misma factura', async () => {
+    let sumSql = '';
+    const { client } = createLoyaltyMockClient();
+    const wrappedClient = {
+      async query(sql, params) {
+        if (/SUM\(ABS\(fm\.puntos_delta\)\)/.test(String(sql))) sumSql = String(sql);
+        return client.query(sql, params);
+      }
+    };
+    await applyLoyaltyReversalForFactura({
+      client: wrappedClient, idFactura: 1, idSucursal: 1, idUsuario: 7, tipoReversion: 'PARCIAL',
+      idReversion: 45, codigoReversion: 'REV-45', totalFactura: 1000, facturaTotalmenteReversada: false
+    });
+    assert.match(sumSql, /UPPER\(TRIM\(tm\.codigo\)\) = 'REVERSO'/);
+    assert.match(sumSql, /UPPER\(TRIM\(om\.codigo\)\) = 'REVERSO_FACTURA'/);
+    assert.match(sumSql, /fr\.id_reversion = fm\.id_reversion/);
+    assert.match(sumSql, /fr\.id_factura_original = fm\.id_factura/);
+    assert.match(sumSql, /APLICADA/);
   });
 });
