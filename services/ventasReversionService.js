@@ -25,6 +25,7 @@ import {
   computeAccumulatedResult,
   validatePartialReversionApplicability
 } from '../routers/ventas/services/ventasReversionCalculationService.js';
+import { returnInventoryForReversionLines } from '../routers/ventas/services/ventasReversionInventoryService.js';
 
 // Fase 2: eliminada la ventana de 1 hora (REVERSAL_WINDOW_SQL /
 // VENTAS_REVERSION_FUERA_VENTANA) y el bloqueo por horario administrativo
@@ -363,141 +364,16 @@ const revertLoyaltyForFactura = async ({
   };
 };
 
-const registerInventoryReturn = async ({ client, idReversion, codigoReversion, codigoVenta, lineas }) => {
-  for (const line of lineas) {
-    if (!line.devuelve_inventario || !line.id_producto) continue;
-
-    if (!Number.isInteger(Number(line.cantidad_revertida)) || Number(line.cantidad_revertida) <= 0) {
-      throw createReversionError(400, 'VENTAS_REVERSION_INVENTARIO_CANTIDAD_INVALIDA', 'Cantidad de devolución a inventario debe ser entera positiva.');
-    }
-
-    const prodResult = await client.query(
-      `
-        SELECT id_producto, id_almacen
-        FROM public.productos
-        WHERE id_producto = $1
-        LIMIT 1
-        FOR UPDATE`,
-      [line.id_producto]
-    );
-
-    if (!prodResult.rowCount) continue;
-    const product = prodResult.rows[0];
-
-    await client.query(
-      `
-        INSERT INTO public.movimientos_inventario (
-          tipo,
-          cantidad,
-          id_almacen,
-          id_producto,
-          id_insumo,
-          ref_origen,
-          id_ref,
-          descripcion
-        )
-        VALUES ('ENTRADA', $1, $2, $3, NULL, 'REVERSION_VENTA', $4, $5)
-      `,
-      [
-        Number(line.cantidad_revertida),
-        product.id_almacen,
-        product.id_producto,
-        idReversion,
-        `Entrada por reversión ${codigoReversion} de venta ${codigoVenta}`
-      ]
-    );
-  }
-};
-
-export const buildPedidoMovementReturnRows = ({ movements = [], lineas = [] } = {}) => {
-  const soldQty = (Array.isArray(lineas) ? lineas : []).reduce(
-    (sum, line) => sum + Number(line?.cantidad_vendida || line?.origen_snapshot?.cantidad || 0),
-    0
-  );
-  const reversedQty = (Array.isArray(lineas) ? lineas : []).reduce(
-    (sum, line) => sum + Number(line?.cantidad_revertida || 0),
-    0
-  );
-  const ratio = soldQty > 0 && reversedQty > 0 ? Math.min(1, reversedQty / soldQty) : 0;
-  if (ratio <= 0) return [];
-
-  return (Array.isArray(movements) ? movements : [])
-    .map((movement) => {
-      const cantidad = roundMoney(Number(movement?.cantidad || 0) * ratio);
-      if (cantidad <= 0) return null;
-      return {
-        cantidad,
-        id_almacen: parsePositiveInt(movement?.id_almacen),
-        id_producto: parsePositiveInt(movement?.id_producto),
-        id_insumo: parsePositiveInt(movement?.id_insumo),
-        ratio
-      };
-    })
-    .filter((row) => row && row.id_almacen && (row.id_producto || row.id_insumo));
-};
-
-const restorePedidoInventoryMovementsForReversion = async ({
-  client,
-  idPedido,
-  idReversion,
-  codigoReversion,
-  codigoVenta,
-  lineas
-}) => {
-  const pedidoId = parsePositiveInt(idPedido);
-  if (!pedidoId) return false;
-
-  const movementResult = await client.query(
-    `
-      SELECT
-        mi.id_movimiento,
-        mi.cantidad,
-        mi.id_almacen,
-        mi.id_producto,
-        mi.id_insumo
-      FROM public.movimientos_inventario mi
-      WHERE mi.tipo = 'SALIDA'
-        AND mi.ref_origen IN ('PEDIDO', 'FALTANTE_COCINA')
-        AND mi.id_ref = $1
-      ORDER BY mi.id_movimiento
-      FOR UPDATE
-    `,
-    [pedidoId]
-  );
-  const returnRows = buildPedidoMovementReturnRows({
-    movements: movementResult.rows,
-    lineas
-  });
-  if (!returnRows.length) return false;
-
-  for (const row of returnRows) {
-    await client.query(
-      `
-        INSERT INTO public.movimientos_inventario (
-          tipo,
-          cantidad,
-          id_almacen,
-          id_producto,
-          id_insumo,
-          ref_origen,
-          id_ref,
-          descripcion
-        )
-        VALUES ('ENTRADA', $1, $2, $3, $4, 'REVERSION_VENTA_INVENTARIO', $5, $6)
-      `,
-      [
-        row.cantidad,
-        row.id_almacen,
-        row.id_producto || null,
-        row.id_insumo || null,
-        idReversion,
-        `Entrada proporcional por reversión ${codigoReversion} de venta ${codigoVenta}`
-      ]
-    );
-  }
-
-  return true;
-};
+// Fase 3: eliminados por completo registerInventoryReturn (usaba
+// productos.id_almacen como respaldo -- prohibido), buildPedidoMovementReturnRows
+// y restorePedidoInventoryMovementsForReversion (ratio global de TODO el
+// pedido aplicado a TODOS sus movimientos, sin importar la linea
+// reversada). Reemplazados por
+// routers/ventas/services/ventasReversionInventoryService.js, que
+// devuelve inventario por id_detalle_pedido de CADA linea individual y
+// aborta con VENTAS_REVERSION_INVENTARIO_TRACE_REQUIRED si una linea que
+// exige trazabilidad (PRODUCTO/RECETA) no tiene movimiento original
+// rastreable.
 
 export const buildSalsaInventorySnapshotsForReturn = (lineas = []) => {
   const snapshots = [];
@@ -906,37 +782,44 @@ export const createVentaReversion = async ({ idFactura, body, req, idUsuario, id
       totalFactura
     });
 
+    // Devolucion de inventario POR LINEA (Fase 3): cada linea reversada se
+    // resuelve exclusivamente contra sus propios movimientos SALIDA
+    // originales (via id_detalle_pedido), nunca contra un ratio agregado
+    // de todo el pedido. Lineas PRODUCTO/RECETA sin movimiento original
+    // trazable abortan con VENTAS_REVERSION_INVENTARIO_TRACE_REQUIRED,
+    // provocando ROLLBACK completo (sin REV, sin movimiento de caja, sin
+    // puntos retirados, sin pedido cancelado, sin inventario parcial) --
+    // ver routers/ventas/services/ventasReversionInventoryService.js.
     const codigoVenta = factura.codigo_venta || `VTA-${String(facturaId).padStart(5, '0')}`;
-    const restoredFromOriginalMovements = await restorePedidoInventoryMovementsForReversion({
+    const { returnedInsumoKeys } = await returnInventoryForReversionLines({
       client,
+      reversionLines,
       idPedido: factura.id_pedido,
       idReversion,
       codigoReversion: correlativo.codigo,
       codigoVenta,
-      lineas: reversionLines
+      idUsuario: userId,
+      reversedQtyMapBefore
     });
-    if (!restoredFromOriginalMovements) {
-      await registerInventoryReturn({
-        client,
-        idReversion,
-        codigoReversion: correlativo.codigo,
-        codigoVenta,
-        lineas: reversionLines
-      });
-      const salsaSnapshots = await filterConsumedSalsaSnapshots({
-        client,
-        idPedido: factura.id_pedido,
-        idFactura: facturaId,
-        snapshots: buildSalsaInventorySnapshotsForReturn(reversionLines)
-      });
-      await restoreSalsasInventoryFromSnapshots({
-        client,
-        snapshots: salsaSnapshots,
-        idReversion,
-        codigoReversion: correlativo.codigo,
-        codigoVenta
-      });
-    }
+
+    // Salsas/complementos: solo se usa el respaldo por snapshot para
+    // insumos que NO fueron ya devueltos por movimiento original (evita
+    // devolver dos veces el mismo insumo).
+    const salsaSnapshotsCandidatas = buildSalsaInventorySnapshotsForReturn(reversionLines)
+      .filter((snapshot) => !returnedInsumoKeys.has(`${Number(snapshot?.id_insumo)}:${Number(snapshot?.id_almacen)}`));
+    const salsaSnapshots = await filterConsumedSalsaSnapshots({
+      client,
+      idPedido: factura.id_pedido,
+      idFactura: facturaId,
+      snapshots: salsaSnapshotsCandidatas
+    });
+    await restoreSalsasInventoryFromSnapshots({
+      client,
+      snapshots: salsaSnapshots,
+      idReversion,
+      codigoReversion: correlativo.codigo,
+      codigoVenta
+    });
 
     // 12) actualizar estados finales cuando corresponda. Si la factura
     // queda totalmente reversada (segun el resultado ACUMULADO real, sin

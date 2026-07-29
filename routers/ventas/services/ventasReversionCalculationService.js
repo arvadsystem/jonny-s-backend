@@ -116,7 +116,24 @@ export const resolveFacturaLinesForUpdate = async (client, idFactura) => {
           ) = 'PRODUCTO'
             AND COALESCE(dfo.id_producto, df.id_producto) IS NOT NULL THEN true
           ELSE false
-        END AS devuelve_inventario
+        END AS devuelve_inventario,
+        -- Fase 3: PRODUCTO y RECETA exigen trazabilidad de inventario por
+        -- movimiento original (id_detalle_pedido); si no se encuentra,
+        -- la reversion aborta con VENTAS_REVERSION_INVENTARIO_TRACE_REQUIRED
+        -- en vez de usar productos.id_almacen como respaldo. EXTRA/ITEM se
+        -- intentan devolver de forma oportunista (si hay movimiento
+        -- rastreable) pero no bloquean la reversion si no lo hay.
+        CASE
+          WHEN UPPER(
+            COALESCE(
+              NULLIF(TRIM(dfo.tipo_item), ''),
+              NULLIF(TRIM(df.tipo_item), ''),
+              CASE WHEN COALESCE(dfo.id_producto, df.id_producto) IS NOT NULL THEN 'PRODUCTO' ELSE 'ITEM' END
+            )
+          ) IN ('PRODUCTO', 'RECETA')
+            AND COALESCE(dfo.id_producto, df.id_producto, dfo.id_receta, df.id_receta::int) IS NOT NULL THEN true
+          ELSE false
+        END AS requiere_trazabilidad_inventario
       FROM public.detalle_facturas df
       LEFT JOIN public.detalle_facturas_origen dfo
         ON dfo.id_detalle_factura = df.id_detalle_factura
@@ -353,7 +370,8 @@ export const resolveReversionLines = ({ tipoReversion, requestedLines, facturaLi
       isv_15_revertido: isv15,
       isv_18_revertido: isv18,
       total_revertido: total,
-      devuelve_inventario: Boolean(line.devuelve_inventario)
+      devuelve_inventario: Boolean(line.devuelve_inventario),
+      requiereTrazabilidad: Boolean(line.requiere_trazabilidad_inventario)
     });
   }
 

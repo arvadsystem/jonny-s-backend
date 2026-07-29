@@ -28,11 +28,26 @@ const router = express.Router();
 // Constantes del módulo
 // �"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"��"�
 
+// Fase 3: sincronizado con routers/ventas/constants.js:ESTADO_PEDIDO_CODES
+// (antes le faltaban PENDIENTE y CANCELADO, lo cual dependia de una
+// coincidencia accidental -- ningun estado no reconocido localmente
+// resolvia a un codigo transitable -- para bloquear correctamente
+// pedidos CANCELADO en las transiciones de Cocina). Ver punto 12 del
+// ticket de Fase 3.
 const ESTADO_PEDIDO_CODES = {
+  PENDIENTE: new Set([
+    'pendiente',
+    'pendientes',
+    'por_pagar',
+    'pendiente_por_pagar',
+    'pendiente_/_por_pagar',
+    'pendientes_/_por_pagar'
+  ]),
   EN_COCINA: new Set(['en_cocina', 'en_cocina_pendiente']),
   EN_PREPARACION: new Set(['en_preparacion']),
   LISTO_PARA_ENTREGA: new Set(['listo_para_entrega']),
   NO_ENTREGADO: new Set(['no_entregado']),
+  CANCELADO: new Set(['cancelado', 'cancelada', 'anulado', 'anulada']),
   COMPLETADO: new Set([
     'completada',
     'completado',
@@ -1014,7 +1029,8 @@ router.get('/cocina/pedidos', checkPermission(COCINA_VIEW_PERMISSIONS), async (r
                  END AS configuracion_menu_json_type,`
               : "'sql_null'::text AS configuracion_menu_json_type,"}
             COALESCE(prod.nombre_producto, rec.nombre_receta, standalone_extra.nombre_extra_snapshot) AS nombre_item,
-            COALESCE(dp.total_pedido, COALESCE(dp.sub_total_pedido, 0)) AS total_linea
+            COALESCE(dp.total_pedido, COALESCE(dp.sub_total_pedido, 0)) AS total_linea,
+            COALESCE(reversion_acumulada.cantidad, 0) AS cantidad_revertida_acumulada
           FROM pedidos p
           LEFT JOIN estados_pedido ep ON ep.id_estado_pedido = p.id_estado_pedido
           LEFT JOIN sucursales s ON s.id_sucursal = p.id_sucursal
@@ -1070,6 +1086,22 @@ router.get('/cocina/pedidos', checkPermission(COCINA_VIEW_PERMISSIONS), async (r
             ORDER BY dpe.id_detalle_pedido_extra
             LIMIT 1
           ) standalone_extra ON true
+          -- Fase 3: cantidad efectiva de Cocina = cantidad original del
+          -- detalle de pedido menos la cantidad acumulada ya revertida por
+          -- reversiones de venta APLICADA vinculadas a ESA linea exacta,
+          -- resuelta via detalle_facturas_origen.id_detalle_pedido (nunca
+          -- por producto/receta/nombre/posicion). Nunca cuenta reversiones
+          -- que no esten en estado APLICADA.
+          LEFT JOIN LATERAL (
+            SELECT COALESCE(SUM(frd.cantidad_revertida), 0) AS cantidad
+            FROM public.detalle_facturas_origen dfo_kds
+            INNER JOIN public.facturas_reversiones_detalle frd
+              ON frd.id_detalle_factura = dfo_kds.id_detalle_factura
+            INNER JOIN public.facturas_reversiones fr_kds
+              ON fr_kds.id_reversion = frd.id_reversion
+            WHERE dfo_kds.id_detalle_pedido = dp.id_detalle_pedido
+              AND UPPER(TRIM(COALESCE(fr_kds.estado, ''))) = 'APLICADA'
+          ) reversion_acumulada ON dp.id_detalle_pedido IS NOT NULL
           ${whereClause}
           ORDER BY
             ${hasEnPreparacionAt
@@ -1169,6 +1201,16 @@ router.get('/cocina/pedidos', checkPermission(COCINA_VIEW_PERMISSIONS), async (r
 
         if (row.id_detalle_pedido) {
           const cantidad = Number(row.cantidad);
+          // Fase 3: cantidad efectiva = original - acumulado ya revertido
+          // (reversiones APLICADA). Si la linea quedo completamente
+          // reversada, no se muestra en Cocina en absoluto (nunca se
+          // filtra solo en frontend). No se modifica destructivamente
+          // detalle_pedido.cantidad: esto es puramente de lectura/API.
+          const cantidadRevertidaAcumulada = Number(row.cantidad_revertida_acumulada || 0);
+          const cantidadEfectiva = cantidad - cantidadRevertidaAcumulada;
+          if (cantidadEfectiva <= 0) {
+            continue;
+          }
           const hasProduct = row.id_producto !== null && row.id_producto !== undefined;
           const hasRecipe = row.id_receta !== null && row.id_receta !== undefined;
           const isStandaloneExtra = !hasProduct
@@ -1192,12 +1234,14 @@ router.get('/cocina/pedidos', checkPermission(COCINA_VIEW_PERMISSIONS), async (r
             es_linea_extra_independiente: isStandaloneExtra,
             instruccion_operativa: row.kds_instruccion_operativa,
             nombre_item: row.nombre_item,
-            cantidad,
+            cantidad: cantidadEfectiva,
+            cantidad_original: cantidad,
+            cantidad_revertida: cantidadRevertidaAcumulada,
             observacion: row.observacion || null,
             configuracion_menu: row.configuracion_menu ?? null,
             modificaciones: []
           });
-          pedido.total_items += cantidad;
+          pedido.total_items += cantidadEfectiva;
         }
       }
 
@@ -1370,6 +1414,22 @@ router.put('/cocina/pedidos/:id/estado', checkPermission(COCINA_VIEW_PERMISSIONS
       // ���� 6. Verificar estado actual y transición válida ��������������������������
       const estadoActual = estadoCodeByIdMap.get(Number(pedido.id_estado_pedido ?? 0)) || null;
 
+      // Fase 3: bloqueo EXPLICITO de pedidos CANCELADO (por ejemplo, por
+      // una reversion de venta totalmente aplicada que ya bloqueo y
+      // actualizo esta misma fila con FOR UPDATE OF p antes que esta
+      // transaccion). El SELECT ... FOR UPDATE de arriba ya lee el estado
+      // MAS RECIENTE una vez que consigue el lock (no una version
+      // obsoleta previa a esperar el lock), por lo que esta verificacion
+      // es segura incluso si la reversion de venta commiteo justo antes.
+      if (estadoActual === 'CANCELADO') {
+        await client.query('ROLLBACK');
+        return res.status(409).json({
+          error: true,
+          code: 'COCINA_PEDIDO_CANCELADO_NO_OPERABLE',
+          message: 'El pedido fue cancelado (reversion de venta) y no puede continuar en Cocina.'
+        });
+      }
+
       const routing = await readPedidoOperationalRouting({ client, idPedido });
       if (routing.requiere_revision) {
         await client.query('ROLLBACK');
@@ -1495,6 +1555,14 @@ router.put('/cocina/pedidos/:id/estado', checkPermission(COCINA_VIEW_PERMISSIONS
       }
 
       // ���� 9. Actualizar estado ������������������������������������������������������������������������������
+      // Fase 3: actualizacion condicional (compare-and-swap) contra el
+      // id_estado_pedido leido bajo FOR UPDATE OF p en el paso 4. El lock
+      // ya serializa esta transaccion frente a cualquier otra (incluida
+      // una reversion de venta) que intente tocar la misma fila, asi que
+      // en la practica esta condicion nunca deberia fallar; se agrega de
+      // todas formas como verificacion explicita en la capa SQL: una
+      // actualizacion que no afecte filas debe devolver un conflicto
+      // controlado, nunca sobreescribir en silencio un estado que cambio.
       const hasEnPreparacionAt = await hasColumn(client, 'pedidos', 'en_preparacion_at');
       const updatedPedidoResult = await client.query(
         `
@@ -1509,10 +1577,20 @@ router.put('/cocina/pedidos/:id/estado', checkPermission(COCINA_VIEW_PERMISSIONS
                 ? ', en_preparacion_at = COALESCE(en_preparacion_at, NOW())'
                 : ''}
           WHERE id_pedido = $2
+            AND id_estado_pedido = $3
           RETURNING ${hasEnPreparacionAt ? 'en_preparacion_at' : 'NULL::timestamptz AS en_preparacion_at'}
         `,
-        [idEstadoDestino, idPedido]
+        [idEstadoDestino, idPedido, Number(pedido.id_estado_pedido)]
       );
+
+      if (updatedPedidoResult.rowCount === 0) {
+        await client.query('ROLLBACK');
+        return res.status(409).json({
+          error: true,
+          code: 'COCINA_TRANSICION_CONFLICTO',
+          message: 'El pedido cambió de estado antes de completar esta operación. Actualiza y vuelve a intentar.'
+        });
+      }
 
       await client.query('COMMIT');
 
