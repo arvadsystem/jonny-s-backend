@@ -27,6 +27,16 @@ const getListClientesHandler = async () => {
   return source.slice(start, end);
 };
 
+const getFidelizacionServiceHandler = (source, handlerName) => {
+  const start = source.indexOf(`  async ${handlerName}(req)`);
+  assert.notEqual(start, -1, `No se encontro el handler ${handlerName}`);
+  const commaEnd = source.indexOf('\n  },', start);
+  const objectEnd = source.indexOf('\n};', start);
+  const end = commaEnd === -1 ? objectEnd : commaEnd;
+  assert.notEqual(end, -1, `No se encontro el cierre de ${handlerName}`);
+  return source.slice(start, end);
+};
+
 // buildClienteBaseSql es una funcion pura (arma texto SQL, no toca la DB),
 // asi que se puede llamar directamente y verificar el SQL real que produce
 // (comportamiento real, no solo regex sobre el archivo fuente). La regla de
@@ -515,22 +525,56 @@ describe('listClientes: id_sucursal invalido responde 400 VALIDATION_ERROR antes
   });
 });
 
-describe('routers/fidelizacion.js: parseNullablePositiveInt sigue siendo el unico parser de identificadores enteros opcionales', () => {
-  it('los 10 usos restantes de parseNullablePositiveInt siguen presentes (id_sucursal/id_cliente/id_estado_canje en endpoints fuera del alcance de esta correccion)', async () => {
+describe('routers/fidelizacion.js: parseNullablePositiveInt sigue protegiendo los identificadores enteros opcionales', () => {
+  it('cada handler relevante valida por estructura los campos opcionales esperados, sin depender de un conteo global', async () => {
     const source = await readFile(new URL('../fidelizacion.js', import.meta.url), 'utf8');
-    const usages = [...source.matchAll(/parseNullablePositiveInt\(/g)];
-    // La definicion es "const parseNullablePositiveInt = (value) =>" (no
-    // matchea el regex de llamada), asi que solo cuenta los usos reales.
-    // Eran 10 originalmente; la correccion de canje por producto maestro
-    // (ronda anterior) los subio a 12 (canjeablesCliente y createCanje).
-    // La correccion de validacion estricta (auditoria independiente, bloqueante
-    // de integridad) migro esos 2 -mas otros 2 que usaban el parsePositiveInt
-    // lenient (id_cliente en canjeablesCliente/createCanje)- a
-    // parseStrictPositiveInt (services/fidelizacionService.js, exige
-    // Number.isSafeInteger y rechaza texto parcialmente numerico). Los
-    // otros 10 usos de parseNullablePositiveInt (endpoints fuera del
-    // alcance de esta correccion puntual) quedan intactos.
-    assert.equal(usages.length, 10, 'no debe agregarse ni quitarse ningun uso de parseNullablePositiveInt sin revisar este contrato');
+    const expectedFieldsByHandler = new Map([
+      ['panel', ['id_sucursal']],
+      ['listClientes', ['id_sucursal']],
+      ['detalleCliente', ['id_sucursal']],
+      ['movimientosCliente', ['id_sucursal']],
+      ['canjeablesCliente', ['id_sucursal']],
+      ['getConfiguracion', ['id_sucursal']],
+      ['listCanjeSesiones', ['id_sucursal']],
+      ['listCanjes', ['id_sucursal', 'id_cliente', 'id_estado_canje']],
+      ['detalleCanje', ['id_sucursal']]
+    ]);
+
+    for (const [handlerName, fields] of expectedFieldsByHandler) {
+      const handler = getFidelizacionServiceHandler(source, handlerName);
+      for (const field of fields) {
+        assert.match(
+          handler,
+          new RegExp(`parseNullablePositiveInt\\(req\\.query\\.${field}\\)`),
+          `${handlerName} debe conservar el parser estricto para ${field}`
+        );
+      }
+    }
+  });
+
+  it('listCanjeSesiones valida id_sucursal antes de resolver el alcance y consultar sesiones', async () => {
+    const source = await readFile(new URL('../fidelizacion.js', import.meta.url), 'utf8');
+    const handler = getFidelizacionServiceHandler(source, 'listCanjeSesiones');
+    const parseIndex = handler.indexOf('parseNullablePositiveInt(req.query.id_sucursal)');
+    const scopeIndex = handler.indexOf('resolveFidelizacionScope({');
+    const listIndex = handler.indexOf('listCanjeSesionesDisponibles({');
+
+    assert.ok(parseIndex < scopeIndex, 'listCanjeSesiones debe validar id_sucursal antes del scope');
+    assert.ok(scopeIndex < listIndex, 'listCanjeSesiones debe resolver el scope antes de consultar sesiones');
+  });
+
+  it('listCanjes conserva validaciones separadas para sucursal, cliente y estado de canje', async () => {
+    const source = await readFile(new URL('../fidelizacion.js', import.meta.url), 'utf8');
+    const handler = getFidelizacionServiceHandler(source, 'listCanjes');
+
+    for (const [field, variable] of [
+      ['id_sucursal', 'requestedSucursalId'],
+      ['id_cliente', 'idCliente'],
+      ['id_estado_canje', 'idEstadoCanje']
+    ]) {
+      assert.match(handler, new RegExp(`const ${variable} = parseNullablePositiveInt\\(req\\.query\\.${field}\\)`));
+      assert.match(handler, new RegExp(`req\\.query\\.${field} !== undefined && !${variable}`));
+    }
   });
 
   it('parseStrictPositiveInt se usa exactamente donde exige esta correccion: canjeablesCliente, saveConfiguracion y createCanje', async () => {
