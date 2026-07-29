@@ -5,13 +5,23 @@
 --   trabajos_impresion_documentos -> factura, comanda, reversion (nunca
 --                                     tuvo 'caja'; no se agrega aqui)
 --
+-- Validacion ESTRUCTURAL, no por subcadena: cada CHECK que restringe
+-- tipo_documento a una lista de valores se valida extrayendo, con
+-- regexp_matches sobre pg_get_constraintdef(oid, true), el CONJUNTO EXACTO
+-- de literales de texto referenciados (sin duplicados, ordenado), y
+-- comparandolo por igualdad de array contra el conjunto esperado completo
+-- -- nunca solo "contiene factura Y contiene comanda", que aceptaria
+-- valores adicionales no autorizados. Lo mismo para formato_chk/bytes_chk:
+-- se valida el conjunto exacto de literales de texto (tipo_documento,
+-- formato, flavor) y el conjunto exacto de literales numericos (limites de
+-- tamano), en vez de solo buscar subcadenas sueltas.
+--
 -- Idempotencia real (no solo "el nombre ya existe"): cada bloque
 -- inspecciona la DEFINICION vigente de la restriccion relevante, sin
--- importar su nombre. Si la definicion ya incluye exactamente lo esperado,
--- no hace nada. Si el nombre esperado existe pero con una definicion
--- vieja/incompleta (por ejemplo, una ejecucion parcial anterior que solo
--- corrigio tipo_chk pero no formato_chk), la corrige. tipo_chk, formato_chk
--- y bytes_chk de trabajos_impresion_documentos se procesan de forma
+-- importar su nombre. Si la definicion ya es exactamente la esperada, no
+-- hace nada. Si el nombre esperado existe pero con una definicion
+-- vieja/incompleta/con valores extra, la corrige. tipo_chk, formato_chk y
+-- bytes_chk de trabajos_impresion_documentos se procesan de forma
 -- INDEPENDIENTE entre si -- nunca hay un RETURN global que salga temprano
 -- solo porque uno de los tres ya este correcto.
 --
@@ -48,7 +58,8 @@ DECLARE
   v_conteo integer;
   v_current_conname text;
   v_definicion text;
-  v_definicion_completa boolean;
+  v_literales text[];
+  v_definicion_exacta boolean;
 BEGIN
   SELECT a.attnum INTO v_tipo_attnum
   FROM pg_attribute a
@@ -81,21 +92,23 @@ BEGIN
     AND c.contype = 'c'
     AND c.conkey = ARRAY[v_tipo_attnum]::smallint[];
 
-  v_definicion_completa :=
-    v_definicion LIKE '%factura%'
-    AND v_definicion LIKE '%comanda%'
-    AND v_definicion LIKE '%caja%'
-    AND v_definicion LIKE '%reversion%';
+  SELECT array_agg(DISTINCT m[1] ORDER BY m[1])
+  INTO v_literales
+  FROM regexp_matches(v_definicion, '''([^'']*)''', 'g') AS m;
 
-  IF v_current_conname = 'ck_trabajos_impresion_tipo_documento' AND v_definicion_completa THEN
-    RAISE NOTICE 'ck_trabajos_impresion_tipo_documento ya tiene la definicion correcta (factura/comanda/caja/reversion); no-op';
+  -- Conjunto EXACTO esperado: ni de mas (p.ej. un valor colado por error)
+  -- ni de menos (p.ej. reversion faltante).
+  v_definicion_exacta := v_literales = ARRAY['caja', 'comanda', 'factura', 'reversion']::text[];
+
+  IF v_current_conname = 'ck_trabajos_impresion_tipo_documento' AND v_definicion_exacta THEN
+    RAISE NOTICE 'ck_trabajos_impresion_tipo_documento ya tiene exactamente el conjunto esperado (factura, comanda, caja, reversion); no-op';
     RETURN;
   END IF;
 
   -- El CHECK sobre tipo_documento existe pero: (a) tiene el nombre
-  -- autogenerado original, o (b) tiene nuestro nombre explicito pero una
-  -- definicion vieja/incompleta de una ejecucion parcial previa. En ambos
-  -- casos se reemplaza por la version correcta.
+  -- autogenerado original, (b) tiene nuestro nombre explicito con una
+  -- definicion vieja/incompleta, o (c) tiene valores adicionales no
+  -- autorizados. En todos los casos se reemplaza por la version exacta.
   LOCK TABLE public.trabajos_impresion IN ACCESS EXCLUSIVE MODE NOWAIT;
 
   EXECUTE format('ALTER TABLE public.trabajos_impresion DROP CONSTRAINT %I', v_current_conname);
@@ -135,11 +148,9 @@ COMMIT;
 
 -- ============== FASE 3: trabajos_impresion_documentos ==============
 -- tipo_chk, formato_chk y bytes_chk se procesan de forma INDEPENDIENTE:
--- cada uno tiene su propio bloque DO que verifica su propia definicion y
--- la corrige si hace falta, sin depender de si los otros dos ya estaban
--- correctos. Esto garantiza que una repeticion despues de un fallo parcial
--- (por ejemplo, la corrida anterior corrigio tipo_chk pero se interrumpio
--- antes de llegar a formato_chk) complete lo que falte.
+-- cada uno tiene su propio bloque DO que verifica su propio conjunto
+-- exacto de literales y lo corrige si hace falta, sin depender de si los
+-- otros dos ya estaban correctos.
 BEGIN;
 SET LOCAL lock_timeout = '5s';
 SET LOCAL statement_timeout = '30s';
@@ -147,6 +158,7 @@ SET LOCAL statement_timeout = '30s';
 DO $ensure_tipo_chk$
 DECLARE
   v_definicion text;
+  v_literales text[];
 BEGIN
   IF to_regclass('public.trabajos_impresion_documentos') IS NULL THEN
     RAISE NOTICE 'trabajos_impresion_documentos no existe; se omite tipo_chk (schema v2 opcional)';
@@ -166,8 +178,13 @@ BEGIN
   WHERE conrelid = 'public.trabajos_impresion_documentos'::regclass
     AND conname = 'trabajos_impresion_documentos_tipo_chk';
 
-  IF v_definicion LIKE '%factura%' AND v_definicion LIKE '%comanda%' AND v_definicion LIKE '%reversion%' THEN
-    RAISE NOTICE 'trabajos_impresion_documentos_tipo_chk ya tiene la definicion correcta; no-op';
+  SELECT array_agg(DISTINCT m[1] ORDER BY m[1])
+  INTO v_literales
+  FROM regexp_matches(v_definicion, '''([^'']*)''', 'g') AS m;
+
+  -- Conjunto EXACTO: factura, comanda, reversion -- nunca 'caja'.
+  IF v_literales = ARRAY['comanda', 'factura', 'reversion']::text[] THEN
+    RAISE NOTICE 'trabajos_impresion_documentos_tipo_chk ya tiene exactamente el conjunto esperado (factura, comanda, reversion); no-op';
     RETURN;
   END IF;
 
@@ -184,6 +201,7 @@ $ensure_tipo_chk$;
 DO $ensure_formato_chk$
 DECLARE
   v_definicion text;
+  v_literales text[];
 BEGIN
   IF to_regclass('public.trabajos_impresion_documentos') IS NULL THEN
     RAISE NOTICE 'trabajos_impresion_documentos no existe; se omite formato_chk (schema v2 opcional)';
@@ -203,11 +221,16 @@ BEGIN
   WHERE conrelid = 'public.trabajos_impresion_documentos'::regclass
     AND conname = 'trabajos_impresion_documentos_formato_chk';
 
-  -- El comprobante de reversion es PDF/base64, igual que factura (mismo
-  -- limite de tamano MAX_CANONICAL_PDF_BYTES=2097152 de
-  -- services/printJobDocumentService.js).
-  IF v_definicion LIKE '%reversion%' AND v_definicion LIKE '%pdf%' AND v_definicion LIKE '%base64%' THEN
-    RAISE NOTICE 'trabajos_impresion_documentos_formato_chk ya tiene la definicion correcta; no-op';
+  SELECT array_agg(DISTINCT m[1] ORDER BY m[1])
+  INTO v_literales
+  FROM regexp_matches(v_definicion, '''([^'']*)''', 'g') AS m;
+
+  -- Conjunto EXACTO de literales de texto esperado:
+  -- {factura, reversion, comanda, pdf, base64, html, plain}. El comprobante
+  -- de reversion es PDF/base64, igual que factura (mismo limite de tamano
+  -- MAX_CANONICAL_PDF_BYTES=2097152 de services/printJobDocumentService.js).
+  IF v_literales = ARRAY['base64', 'comanda', 'factura', 'html', 'pdf', 'plain', 'reversion']::text[] THEN
+    RAISE NOTICE 'trabajos_impresion_documentos_formato_chk ya tiene exactamente el conjunto esperado; no-op';
     RETURN;
   END IF;
 
@@ -226,6 +249,8 @@ $ensure_formato_chk$;
 DO $ensure_bytes_chk$
 DECLARE
   v_definicion text;
+  v_literales text[];
+  v_numeros text[];
 BEGIN
   IF to_regclass('public.trabajos_impresion_documentos') IS NULL THEN
     RAISE NOTICE 'trabajos_impresion_documentos no existe; se omite bytes_chk (schema v2 opcional)';
@@ -245,8 +270,21 @@ BEGIN
   WHERE conrelid = 'public.trabajos_impresion_documentos'::regclass
     AND conname = 'trabajos_impresion_documentos_bytes_chk';
 
-  IF v_definicion LIKE '%reversion%' AND v_definicion LIKE '%2097152%' THEN
-    RAISE NOTICE 'trabajos_impresion_documentos_bytes_chk ya tiene la definicion correcta; no-op';
+  SELECT array_agg(DISTINCT m[1] ORDER BY m[1])
+  INTO v_literales
+  FROM regexp_matches(v_definicion, '''([^'']*)''', 'g') AS m;
+
+  SELECT array_agg(DISTINCT m[0] ORDER BY m[0])
+  INTO v_numeros
+  FROM regexp_matches(v_definicion, '\y\d+\y', 'g') AS m;
+
+  -- Conjunto EXACTO: tipos {comanda, factura, reversion}; limites
+  -- numericos {0 (de content_bytes>0), 262144 (comanda), 2097152
+  -- (factura y reversion, mismo limite)}.
+  IF v_literales = ARRAY['comanda', 'factura', 'reversion']::text[]
+     AND v_numeros = ARRAY['0', '2097152', '262144']::text[]
+  THEN
+    RAISE NOTICE 'trabajos_impresion_documentos_bytes_chk ya tiene exactamente los limites esperados (factura/reversion<=2097152, comanda<=262144); no-op';
     RETURN;
   END IF;
 
