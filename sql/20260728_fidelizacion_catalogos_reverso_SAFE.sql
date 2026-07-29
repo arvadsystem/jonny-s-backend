@@ -90,7 +90,7 @@ BEGIN
 
     IF v_codigo IS DISTINCT FROM 'REVERSO'
        OR v_nombre IS DISTINCT FROM 'Reverso'
-       OR v_descripcion IS DISTINCT FROM 'Reversión de un movimiento previo.'
+       OR v_descripcion IS DISTINCT FROM U&'Reversi\00F3n de un movimiento previo.'
        OR v_afecta_saldo IS DISTINCT FROM true
        OR v_signo_operacion IS DISTINCT FROM 1
     THEN
@@ -158,7 +158,7 @@ BEGIN
     VALUES (
       'REVERSO',
       'Reverso',
-      'Reversión de un movimiento previo.',
+      U&'Reversi\00F3n de un movimiento previo.',
       true,
       1,
       true
@@ -206,7 +206,7 @@ BEGIN
 
     IF v_codigo IS DISTINCT FROM 'REVERSO_FACTURA'
        OR v_nombre IS DISTINCT FROM 'Reverso de factura'
-       OR v_descripcion IS DISTINCT FROM 'Movimiento generado por reversión de acumulación por factura.'
+       OR v_descripcion IS DISTINCT FROM U&'Movimiento generado por reversi\00F3n de acumulaci\00F3n por factura.'
     THEN
       RAISE EXCEPTION
         'PREFLIGHT_FAILED_SEMANTICA_INCOMPATIBLE: REVERSO_FACTURA existe activo pero su semantica no coincide con codigo, nombre y descripcion canonicos.';
@@ -265,7 +265,7 @@ BEGIN
     VALUES (
       'REVERSO_FACTURA',
       'Reverso de factura',
-      'Movimiento generado por reversión de acumulación por factura.',
+      U&'Movimiento generado por reversi\00F3n de acumulaci\00F3n por factura.',
       true
     );
 

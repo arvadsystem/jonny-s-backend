@@ -71,13 +71,13 @@ BEGIN
     END IF;
 
     IF v_codigo IS DISTINCT FROM 'COMPENSACION'
-       OR v_nombre IS DISTINCT FROM 'Compensación'
-       OR v_descripcion IS DISTINCT FROM 'Aplicación de puntos acumulados a ajustes pendientes de reversión.'
+       OR v_nombre IS DISTINCT FROM U&'Compensaci\00F3n'
+       OR v_descripcion IS DISTINCT FROM U&'Aplicaci\00F3n de puntos acumulados a ajustes pendientes de reversi\00F3n.'
        OR v_afecta_saldo IS DISTINCT FROM true
        OR v_signo_operacion IS DISTINCT FROM -1
     THEN
       RAISE EXCEPTION
-        'PREFLIGHT_FAILED_SEMANTICA_INCOMPATIBLE: COMPENSACION existe activa pero su semantica no coincide con codigo=COMPENSACION, nombre=Compensación, descripcion canonica, afecta_saldo=true y signo_operacion=-1.';
+        U&'PREFLIGHT_FAILED_SEMANTICA_INCOMPATIBLE: COMPENSACION existe activa pero su semantica no coincide con codigo=COMPENSACION, nombre=Compensaci\00F3n, descripcion canonica, afecta_saldo=true y signo_operacion=-1.';
     END IF;
 
     RAISE NOTICE 'cat_fidelizacion_tipos_movimiento.COMPENSACION ya existe activa y con semantica canonica; no-op';
@@ -138,8 +138,8 @@ BEGIN
     )
     VALUES (
       'COMPENSACION',
-      'Compensación',
-      'Aplicación de puntos acumulados a ajustes pendientes de reversión.',
+      U&'Compensaci\00F3n',
+      U&'Aplicaci\00F3n de puntos acumulados a ajustes pendientes de reversi\00F3n.',
       true,
       -1,
       true
@@ -187,7 +187,7 @@ BEGIN
 
     IF v_codigo IS DISTINCT FROM 'AJUSTE_PENDIENTE'
        OR v_nombre IS DISTINCT FROM 'Ajuste pendiente'
-       OR v_descripcion IS DISTINCT FROM 'Compensación aplicada a una deuda pendiente originada por reversión.'
+       OR v_descripcion IS DISTINCT FROM U&'Compensaci\00F3n aplicada a una deuda pendiente originada por reversi\00F3n.'
     THEN
       RAISE EXCEPTION
         'PREFLIGHT_FAILED_SEMANTICA_INCOMPATIBLE: AJUSTE_PENDIENTE existe activo pero su semantica no coincide con codigo, nombre y descripcion canonicos.';
@@ -246,7 +246,7 @@ BEGIN
     VALUES (
       'AJUSTE_PENDIENTE',
       'Ajuste pendiente',
-      'Compensación aplicada a una deuda pendiente originada por reversión.',
+      U&'Compensaci\00F3n aplicada a una deuda pendiente originada por reversi\00F3n.',
       true
     );
 

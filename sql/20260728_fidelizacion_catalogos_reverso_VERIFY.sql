@@ -84,7 +84,7 @@ BEGIN
      OR NULLIF(TRIM(v_descripcion), '') IS NULL
      OR v_codigo IS DISTINCT FROM 'REVERSO'
      OR v_nombre IS DISTINCT FROM 'Reverso'
-     OR v_descripcion IS DISTINCT FROM 'Reversión de un movimiento previo.'
+     OR v_descripcion IS DISTINCT FROM U&'Reversi\00F3n de un movimiento previo.'
      OR v_signo_operacion IS DISTINCT FROM 1
      OR v_afecta_saldo IS DISTINCT FROM true
   THEN
@@ -119,7 +119,7 @@ BEGIN
      OR NULLIF(TRIM(v_descripcion), '') IS NULL
      OR v_codigo IS DISTINCT FROM 'REVERSO_FACTURA'
      OR v_nombre IS DISTINCT FROM 'Reverso de factura'
-     OR v_descripcion IS DISTINCT FROM 'Movimiento generado por reversión de acumulación por factura.'
+     OR v_descripcion IS DISTINCT FROM U&'Movimiento generado por reversi\00F3n de acumulaci\00F3n por factura.'
   THEN
     RAISE EXCEPTION
       'PREFLIGHT_FAILED_SEMANTICA_INCOMPATIBLE: REVERSO_FACTURA no cumple codigo/nombre/descripcion canonicos y campos obligatorios no vacios.';

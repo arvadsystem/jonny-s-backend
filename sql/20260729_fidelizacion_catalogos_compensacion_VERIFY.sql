@@ -84,8 +84,8 @@ BEGIN
      OR NULLIF(TRIM(v_nombre), '') IS NULL
      OR NULLIF(TRIM(v_descripcion), '') IS NULL
      OR v_codigo IS DISTINCT FROM 'COMPENSACION'
-     OR v_nombre IS DISTINCT FROM 'Compensación'
-     OR v_descripcion IS DISTINCT FROM 'Aplicación de puntos acumulados a ajustes pendientes de reversión.'
+     OR v_nombre IS DISTINCT FROM U&'Compensaci\00F3n'
+     OR v_descripcion IS DISTINCT FROM U&'Aplicaci\00F3n de puntos acumulados a ajustes pendientes de reversi\00F3n.'
      OR v_signo_operacion IS DISTINCT FROM -1
      OR v_afecta_saldo IS DISTINCT FROM true
   THEN
@@ -120,7 +120,7 @@ BEGIN
      OR NULLIF(TRIM(v_descripcion), '') IS NULL
      OR v_codigo IS DISTINCT FROM 'AJUSTE_PENDIENTE'
      OR v_nombre IS DISTINCT FROM 'Ajuste pendiente'
-     OR v_descripcion IS DISTINCT FROM 'Compensación aplicada a una deuda pendiente originada por reversión.'
+     OR v_descripcion IS DISTINCT FROM U&'Compensaci\00F3n aplicada a una deuda pendiente originada por reversi\00F3n.'
   THEN
     RAISE EXCEPTION
       'PREFLIGHT_FAILED_SEMANTICA_INCOMPATIBLE: AJUSTE_PENDIENTE no cumple codigo/nombre/descripcion canonicos y campos obligatorios no vacios.';
