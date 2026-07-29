@@ -21,6 +21,36 @@ const isPlainObject = (value) =>
   value !== null && typeof value === 'object' && !Array.isArray(value);
 
 /**
+ * Fase 3 (correccion final): "evidencia de consumo de inventario" para
+ * salsas/complementos -- la misma estructura que antes consumia el
+ * respaldo ambiguo por snapshot (buildSalsaInventorySnapshotsForReturn,
+ * ahora eliminado de services/ventasReversionService.js). Si el snapshot
+ * de origen de la linea contiene selecciones de salsa/complemento con un
+ * `inventario` resuelto (cantidad_base_total > 0), eso demuestra que al
+ * momento de la venta SI se configuro consumo de inventario para ese
+ * componente -- sin importar el tipo_item de la linea contenedora (un
+ * EXTRA o un ITEM puede llevar salsas igual que un PRODUCTO). En ese caso
+ * la linea debe exigir un movimiento original exacto igual que
+ * PRODUCTO/RECETA: nunca se omite la devolucion en silencio ni se recurre
+ * a un respaldo por snapshot/insumo/almacen agregado.
+ */
+export const hasSalsaInventoryConsumptionEvidence = (origenSnapshot) => {
+  const source = origenSnapshot;
+  const selection = Array.isArray(source?.componentes?.seleccion)
+    ? source.componentes.seleccion
+    : Array.isArray(source?.complementos?.seleccion)
+      ? source.complementos.seleccion
+      : [];
+  for (const entry of selection) {
+    const snapshot = entry?.inventario;
+    if (snapshot && typeof snapshot === 'object' && Number(snapshot.cantidad_base_total || 0) > 0) {
+      return true;
+    }
+  }
+  return false;
+};
+
+/**
  * Valida y consolida el arreglo `lineas` de una reversion parcial.
  *
  * Rechaza explicitamente: no-arreglo, arreglo vacio, mas de
@@ -371,7 +401,14 @@ export const resolveReversionLines = ({ tipoReversion, requestedLines, facturaLi
       isv_18_revertido: isv18,
       total_revertido: total,
       devuelve_inventario: Boolean(line.devuelve_inventario),
+      // Fase 3 (correccion final): PRODUCTO/RECETA siempre exigen
+      // trazabilidad exacta; ademas, CUALQUIER linea (incluida EXTRA/ITEM)
+      // con evidencia de consumo de salsa/complemento en su snapshot de
+      // origen tambien la exige -- ya no existe una via "oportunista" que
+      // omita en silencio la devolucion cuando SI hubo evidencia de
+      // consumo.
       requiereTrazabilidad: Boolean(line.requiere_trazabilidad_inventario)
+        || hasSalsaInventoryConsumptionEvidence(line.origen_snapshot)
     });
   }
 

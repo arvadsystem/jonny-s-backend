@@ -1,7 +1,6 @@
 import pool from '../config/db-connection.js';
 import { generarCodigoDocumento } from './facturacionCorrelativoService.js';
 import { getClientIp, parseUserAgent } from '../utils/security/clientInfo.js';
-import { restoreSalsasInventoryFromSnapshots } from '../routers/ventas/services/salsasInventoryService.js';
 import {
   lockCajaFinancialSessions,
   mapCajaFinancialLockError
@@ -372,66 +371,22 @@ const revertLoyaltyForFactura = async ({
 // routers/ventas/services/ventasReversionInventoryService.js, que
 // devuelve inventario por id_detalle_pedido de CADA linea individual y
 // aborta con VENTAS_REVERSION_INVENTARIO_TRACE_REQUIRED si una linea que
-// exige trazabilidad (PRODUCTO/RECETA) no tiene movimiento original
-// rastreable.
-
-export const buildSalsaInventorySnapshotsForReturn = (lineas = []) => {
-  const snapshots = [];
-  for (const line of Array.isArray(lineas) ? lineas : []) {
-    const source = line?.origen_snapshot;
-    const selection = Array.isArray(source?.componentes?.seleccion)
-      ? source.componentes.seleccion
-      : Array.isArray(source?.complementos?.seleccion)
-        ? source.complementos.seleccion
-        : [];
-    const soldQty = Number(source?.cantidad || 0);
-    const reversedQty = Number(line?.cantidad_revertida || 0);
-    const ratio = soldQty > 0 && reversedQty > 0 ? Math.min(1, reversedQty / soldQty) : 1;
-    const aggregateSnapshotsSeen = new Set();
-    for (const entry of selection) {
-      const snapshot = entry?.inventario;
-      if (!snapshot || typeof snapshot !== 'object') continue;
-      const totalBase = Number(snapshot.cantidad_base_total || 0);
-      if (totalBase <= 0) continue;
-      const aggregateKey = `${Number(snapshot.id_salsa || entry?.id_salsa || 0)}:${Number(snapshot.id_insumo || 0)}:${Number(snapshot.id_almacen || 0)}`;
-      if (Number(snapshot.porciones || 0) > 1) {
-        if (aggregateSnapshotsSeen.has(aggregateKey)) continue;
-        aggregateSnapshotsSeen.add(aggregateKey);
-      }
-      snapshots.push({
-        ...snapshot,
-        cantidad_base_total: totalBase * ratio,
-        porciones: Number(snapshot.porciones || 0) * ratio
-      });
-    }
-  }
-  return snapshots;
-};
-
-const filterConsumedSalsaSnapshots = async ({ client, idPedido, idFactura, snapshots }) => {
-  const pedidoId = parsePositiveInt(idPedido);
-  const facturaId = parsePositiveInt(idFactura);
-  if (!pedidoId && !facturaId) return [];
-
-  const result = await client.query(
-    `
-      SELECT DISTINCT mi.id_insumo, mi.id_almacen
-      FROM public.movimientos_inventario mi
-      WHERE mi.tipo = 'SALIDA'
-        AND mi.id_insumo IS NOT NULL
-        AND (
-          (mi.ref_origen IN ('PEDIDO', 'FALTANTE_COCINA') AND mi.id_ref = $1)
-          OR (mi.ref_origen = 'PEDIDO_PENDIENTE_SALSA' AND mi.id_ref = $1)
-          OR (mi.ref_origen = 'VENTA_SALSA' AND mi.id_ref = $2)
-        )
-    `,
-    [pedidoId, facturaId]
-  );
-  const consumedKeys = new Set((result.rows || []).map((row) => `${Number(row.id_insumo)}:${Number(row.id_almacen)}`));
-  return (Array.isArray(snapshots) ? snapshots : []).filter((snapshot) => (
-    consumedKeys.has(`${Number(snapshot?.id_insumo)}:${Number(snapshot?.id_almacen)}`)
-  ));
-};
+// exige trazabilidad (PRODUCTO/RECETA, o cualquier linea con evidencia de
+// consumo de salsa/complemento) no tiene movimiento original rastreable.
+//
+// Fase 3 (correccion final): eliminados tambien buildSalsaInventorySnapshotsForReturn
+// y filterConsumedSalsaSnapshots -- el respaldo ambiguo que agrupaba por
+// id_insumo+id_almacen (sin id_detalle_pedido) para "adivinar" que salsas
+// devolver cuando el movimiento original por linea no se encontraba. Ese
+// respaldo podia: confundir consumo de otra linea del mismo pedido,
+// devolver de mas o de menos si dos lineas compartian el mismo insumo y
+// almacen, y no absorber el residuo acumulado de parciales. Ahora,
+// cualquier linea con evidencia de consumo de salsa/complemento
+// (hasSalsaInventoryConsumptionEvidence en ventasReversionCalculationService.js)
+// exige trazabilidad exacta igual que PRODUCTO/RECETA: sin movimiento
+// original rastreable, la transaccion aborta con
+// VENTAS_REVERSION_INVENTARIO_TRACE_REQUIRED (rollback completo) en vez de
+// usar el respaldo ambiguo.
 
 export const listFacturaReversiones = async ({ idFactura, idUsuario }) => {
   const facturaId = parsePositiveInt(idFactura);
@@ -785,13 +740,15 @@ export const createVentaReversion = async ({ idFactura, body, req, idUsuario, id
     // Devolucion de inventario POR LINEA (Fase 3): cada linea reversada se
     // resuelve exclusivamente contra sus propios movimientos SALIDA
     // originales (via id_detalle_pedido), nunca contra un ratio agregado
-    // de todo el pedido. Lineas PRODUCTO/RECETA sin movimiento original
+    // de todo el pedido ni contra un respaldo ambiguo por
+    // insumo+almacen. Lineas PRODUCTO/RECETA, y cualquier linea con
+    // evidencia de consumo de salsa/complemento, sin movimiento original
     // trazable abortan con VENTAS_REVERSION_INVENTARIO_TRACE_REQUIRED,
     // provocando ROLLBACK completo (sin REV, sin movimiento de caja, sin
     // puntos retirados, sin pedido cancelado, sin inventario parcial) --
     // ver routers/ventas/services/ventasReversionInventoryService.js.
     const codigoVenta = factura.codigo_venta || `VTA-${String(facturaId).padStart(5, '0')}`;
-    const { returnedInsumoKeys } = await returnInventoryForReversionLines({
+    await returnInventoryForReversionLines({
       client,
       reversionLines,
       idPedido: factura.id_pedido,
@@ -800,25 +757,6 @@ export const createVentaReversion = async ({ idFactura, body, req, idUsuario, id
       codigoVenta,
       idUsuario: userId,
       reversedQtyMapBefore
-    });
-
-    // Salsas/complementos: solo se usa el respaldo por snapshot para
-    // insumos que NO fueron ya devueltos por movimiento original (evita
-    // devolver dos veces el mismo insumo).
-    const salsaSnapshotsCandidatas = buildSalsaInventorySnapshotsForReturn(reversionLines)
-      .filter((snapshot) => !returnedInsumoKeys.has(`${Number(snapshot?.id_insumo)}:${Number(snapshot?.id_almacen)}`));
-    const salsaSnapshots = await filterConsumedSalsaSnapshots({
-      client,
-      idPedido: factura.id_pedido,
-      idFactura: facturaId,
-      snapshots: salsaSnapshotsCandidatas
-    });
-    await restoreSalsasInventoryFromSnapshots({
-      client,
-      snapshots: salsaSnapshots,
-      idReversion,
-      codigoReversion: correlativo.codigo,
-      codigoVenta
     });
 
     // 12) actualizar estados finales cuando corresponda. Si la factura

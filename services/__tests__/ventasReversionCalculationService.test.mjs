@@ -4,7 +4,8 @@ import {
   buildRequestedLines,
   resolveReversionLines,
   computeAccumulatedResult,
-  validatePartialReversionApplicability
+  validatePartialReversionApplicability,
+  hasSalsaInventoryConsumptionEvidence
 } from '../../routers/ventas/services/ventasReversionCalculationService.js';
 
 describe('buildRequestedLines — validacion estricta del payload (seccion 12)', () => {
@@ -395,6 +396,93 @@ describe('resolveReversionLines', () => {
     })[0];
     assert.ok(op3.total_revertido >= 0);
     assert.equal(op3.total_revertido, 3.33);
+  });
+});
+
+describe('hasSalsaInventoryConsumptionEvidence (Fase 3, correccion final)', () => {
+  it('sin origen_snapshot -> false', () => {
+    assert.equal(hasSalsaInventoryConsumptionEvidence(null), false);
+    assert.equal(hasSalsaInventoryConsumptionEvidence(undefined), false);
+  });
+
+  it('snapshot sin selecciones de componentes/complementos -> false', () => {
+    assert.equal(hasSalsaInventoryConsumptionEvidence({ cantidad: 2 }), false);
+  });
+
+  it('seleccion sin inventario resuelto (cantidad_base_total 0 o ausente) -> false', () => {
+    assert.equal(hasSalsaInventoryConsumptionEvidence({
+      componentes: { seleccion: [{ id_salsa: 5, inventario: { cantidad_base_total: 0 } }] }
+    }), false);
+    assert.equal(hasSalsaInventoryConsumptionEvidence({
+      componentes: { seleccion: [{ id_salsa: 5 }] }
+    }), false);
+  });
+
+  it('seleccion con inventario.cantidad_base_total > 0 en componentes.seleccion -> true', () => {
+    assert.equal(hasSalsaInventoryConsumptionEvidence({
+      componentes: { seleccion: [{ id_salsa: 5, inventario: { cantidad_base_total: 49.5 } }] }
+    }), true);
+  });
+
+  it('tambien detecta la variante complementos.seleccion', () => {
+    assert.equal(hasSalsaInventoryConsumptionEvidence({
+      complementos: { seleccion: [{ id_salsa: 7, inventario: { cantidad_base_total: 10 } }] }
+    }), true);
+  });
+
+  it('4-5) resolveReversionLines: linea EXTRA con evidencia de consumo de salsa exige trazabilidad igual que PRODUCTO', () => {
+    const extraLine = {
+      id_detalle_factura: 1,
+      id_producto: null,
+      id_receta: null,
+      id_detalle_pedido: null,
+      origen_snapshot: {
+        cantidad: 1,
+        componentes: { seleccion: [{ id_salsa: 5, inventario: { cantidad_base_total: 20 } }] }
+      },
+      cantidad_vendida: 1,
+      precio_unitario: 50,
+      sub_total: 50,
+      total_detalle: 50,
+      descuento_linea: 0,
+      isv_porcentaje: 0,
+      tipo_item: 'EXTRA',
+      devuelve_inventario: false,
+      requiere_trazabilidad_inventario: false
+    };
+    const lines = resolveReversionLines({
+      tipoReversion: 'TOTAL',
+      requestedLines: new Map(),
+      facturaLines: [extraLine],
+      reversedQtyMap: new Map()
+    });
+    assert.equal(lines[0].requiereTrazabilidad, true);
+  });
+
+  it('linea EXTRA sin evidencia de consumo de salsa NO exige trazabilidad (se mantiene oportunista)', () => {
+    const extraLine = {
+      id_detalle_factura: 1,
+      id_producto: null,
+      id_receta: null,
+      id_detalle_pedido: null,
+      origen_snapshot: { cantidad: 1 },
+      cantidad_vendida: 1,
+      precio_unitario: 50,
+      sub_total: 50,
+      total_detalle: 50,
+      descuento_linea: 0,
+      isv_porcentaje: 0,
+      tipo_item: 'EXTRA',
+      devuelve_inventario: false,
+      requiere_trazabilidad_inventario: false
+    };
+    const lines = resolveReversionLines({
+      tipoReversion: 'TOTAL',
+      requestedLines: new Map(),
+      facturaLines: [extraLine],
+      reversedQtyMap: new Map()
+    });
+    assert.equal(lines[0].requiereTrazabilidad, false);
   });
 });
 
