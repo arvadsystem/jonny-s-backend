@@ -1,5 +1,8 @@
--- Verificacion exclusivamente de lectura (ningun DDL/DML). Segura de
--- ejecutar en cualquier entorno, antes y despues de aplicar el SAFE.
+-- Clasificacion: PRE/POST seguro.
+-- Verificacion exclusivamente de lectura (ningun DDL/DML). estados_pedido y
+-- pedidos son tablas base preexistentes (no creadas por esta migracion),
+-- por lo que estas consultas nunca fallan por tabla/columna ausente, tanto
+-- antes como despues de aplicar el SAFE.
 
 -- 1) Fila(s) que hoy resuelven a CANCELADO por descripcion normalizada,
 -- igual que ESTADO_PEDIDO_CODES.CANCELADO en routers/ventas/constants.js.

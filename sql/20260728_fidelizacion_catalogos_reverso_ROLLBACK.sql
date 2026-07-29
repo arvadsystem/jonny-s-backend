@@ -1,3 +1,5 @@
+-- Clasificacion: PRE/POST seguro (usa to_regclass antes de referenciar las
+-- tablas; nunca ejecuta DELETE).
 -- Rollback INTENCIONALMENTE SIN BORRADO AUTOMATICO.
 --
 -- Motivo: cat_fidelizacion_tipos_movimiento y cat_fidelizacion_origenes_movimiento

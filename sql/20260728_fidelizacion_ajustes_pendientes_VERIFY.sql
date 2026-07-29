@@ -1,11 +1,19 @@
--- Verificacion exclusivamente de lectura. Segura de ejecutar en cualquier
--- entorno, antes y despues de aplicar el SAFE.
+-- Clasificacion: POST-SAFE solamente. Usa ::regclass sobre
+-- fidelizacion_ajustes_pendientes, tabla que esta migracion puede crear;
+-- ejecutar unicamente despues de correr el SAFE companero (si se ejecuta
+-- antes y la tabla no existe, las consultas 2/3/4/5/6 fallan por diseno en
+-- vez de devolver resultados enganosos).
 
--- 1) Tabla y columnas esperadas.
+-- 1) Tabla y columnas esperadas (11 columnas).
 SELECT column_name, data_type, is_nullable, column_default
 FROM information_schema.columns
 WHERE table_schema = 'public' AND table_name = 'fidelizacion_ajustes_pendientes'
 ORDER BY ordinal_position;
+
+-- 1b) Conteo exacto de columnas: debe ser 11.
+SELECT COUNT(*) AS total_columnas
+FROM information_schema.columns
+WHERE table_schema = 'public' AND table_name = 'fidelizacion_ajustes_pendientes';
 
 -- 2) Constraints (CHECK, UNIQUE, FK, PK) presentes.
 SELECT conname, contype, pg_get_constraintdef(oid, true) AS definicion
@@ -37,3 +45,15 @@ JOIN pg_attribute att2 ON att2.attrelid = con.conrelid AND att2.attnum = ANY(con
 WHERE con.conrelid = 'public.fidelizacion_ajustes_pendientes'::regclass
   AND con.contype = 'f'
 ORDER BY con.conname;
+
+-- 6) Restriccion de coherencia estado/contadores presente y con los tres
+-- estados representados en su definicion.
+SELECT
+  conname,
+  pg_get_constraintdef(oid, true) AS definicion,
+  pg_get_constraintdef(oid, true) LIKE '%PENDIENTE%' AS incluye_pendiente,
+  pg_get_constraintdef(oid, true) LIKE '%PARCIALMENTE_RECUPERADO%' AS incluye_parcial,
+  pg_get_constraintdef(oid, true) LIKE '%RECUPERADO%' AS incluye_recuperado
+FROM pg_constraint
+WHERE conrelid = 'public.fidelizacion_ajustes_pendientes'::regclass
+  AND conname = 'ck_fidelizacion_ajustes_pendientes_estado_coherente';

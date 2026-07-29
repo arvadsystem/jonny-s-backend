@@ -1,3 +1,5 @@
+-- Clasificacion: PRE/POST seguro (verifica existencia de tabla/columna
+-- antes de referenciarlas).
 -- Rollback: elimina la FK, el indice y la columna id_sesion_caja de
 -- fidelizacion_canjes. Se bloquea de forma segura si existe algun canje con
 -- id_sesion_caja ya asignado (dato real de negocio que se perderia).

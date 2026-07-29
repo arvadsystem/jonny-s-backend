@@ -1,3 +1,6 @@
+-- Clasificacion: PRE/POST seguro (guarda con to_regclass la tabla opcional
+-- trabajos_impresion_documentos; bloquea con ROLLBACK_BLOCKED_NONEMPTY en
+-- vez de perder datos 'reversion' ya persistidos).
 -- Restaura los CHECK de tipo_documento a su conjunto original
 -- (trabajos_impresion: factura/comanda/caja; trabajos_impresion_documentos:
 -- factura/comanda, formato/bytes sin reversion), pero SOLO si ningun

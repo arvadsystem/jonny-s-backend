@@ -1,3 +1,5 @@
+-- Clasificacion: PRE/POST seguro (guardado con to_regclass; no falla si la
+-- tabla nunca existio).
 -- Rollback protegido: solo elimina la tabla si existe y esta vacia.
 -- No usa CASCADE. No borra datos historicos porque, si la tabla tiene
 -- filas, significa que ya se registraron ajustes de puntos reales, y

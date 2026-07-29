@@ -1,4 +1,4 @@
--- Siembra CONDICIONAL e IDEMPOTENTE de los codigos REVERSO
+-- Siembra CONDICIONAL de los codigos REVERSO
 -- (cat_fidelizacion_tipos_movimiento) y REVERSO_FACTURA
 -- (cat_fidelizacion_origenes_movimiento), que
 -- services/ventasReversionService.js:revertLoyaltyForFactura ya consulta
@@ -6,10 +6,27 @@
 -- este repo.
 --
 -- Segun confirmacion del entorno QA, estas dos filas YA EXISTEN activas
--- ahi -> en QA este script debe ser un no-op verificable (ver el VERIFY
--- companero). Solo inserta si el entorno destino realmente carece de ellas
--- (otro QA, produccion futura, etc.). Nunca se ejecuta este archivo sin
--- antes correr el VERIFY y confirmar el estado real.
+-- ahi -> en QA este script debe reportar "exactamente una fila activa;
+-- no-op" para ambos codigos. Solo inserta si el entorno destino realmente
+-- carece de ellas.
+--
+-- Para cada codigo (REVERSO y REVERSO_FACTURA), en su tabla
+-- correspondiente, esta migracion distingue explicitamente CUATRO estados
+-- y nunca activa ni modifica silenciosamente una fila existente:
+--   0 filas con ese codigo normalizado          -> INSERT activo.
+--   exactamente 1 fila, y esta activa           -> no-op.
+--   exactamente 1 fila, pero esta INACTIVA      -> ABORTA con error
+--                                                   explicito (una fila
+--                                                   inactiva es una
+--                                                   decision de negocio
+--                                                   deliberada; activarla
+--                                                   sin autorizacion
+--                                                   humana seria
+--                                                   incorrecto).
+--   2+ filas con el mismo codigo normalizado    -> ABORTA por ambiguedad
+--                                                   (no hay forma segura
+--                                                   de saber cual es la
+--                                                   valida).
 --
 -- Igual que con estados_pedido (ver
 -- 20260728_estado_pedido_cancelado_SAFE.sql), ninguna de las dos tablas
@@ -25,7 +42,8 @@ SET LOCAL statement_timeout = '30s';
 
 DO $tipos_movimiento$
 DECLARE
-  v_ya_existe boolean;
+  v_coincidencias integer;
+  v_activo boolean;
   v_columnas_desconocidas text;
   v_tiene_estado boolean;
 BEGIN
@@ -33,15 +51,29 @@ BEGIN
     RAISE EXCEPTION 'PREFLIGHT_FAILED: public.cat_fidelizacion_tipos_movimiento no existe';
   END IF;
 
-  SELECT EXISTS (
-    SELECT 1 FROM public.cat_fidelizacion_tipos_movimiento
-    WHERE UPPER(TRIM(codigo)) = 'REVERSO'
-  )
-  INTO v_ya_existe;
+  SELECT COUNT(*) INTO v_coincidencias
+  FROM public.cat_fidelizacion_tipos_movimiento
+  WHERE UPPER(TRIM(codigo)) = 'REVERSO';
 
-  IF v_ya_existe THEN
-    RAISE NOTICE 'cat_fidelizacion_tipos_movimiento.REVERSO ya existe; no-op';
+  IF v_coincidencias > 1 THEN
+    RAISE EXCEPTION
+      'PREFLIGHT_FAILED_AMBIGUOUS: existen % filas en cat_fidelizacion_tipos_movimiento con codigo normalizado REVERSO; no se puede determinar cual es la valida sin intervencion manual.',
+      v_coincidencias;
+  END IF;
+
+  IF v_coincidencias = 1 THEN
+    SELECT COALESCE(estado, true) INTO v_activo
+    FROM public.cat_fidelizacion_tipos_movimiento
+    WHERE UPPER(TRIM(codigo)) = 'REVERSO';
+
+    IF v_activo THEN
+      RAISE NOTICE 'cat_fidelizacion_tipos_movimiento.REVERSO ya existe y esta activo; no-op';
+    ELSE
+      RAISE EXCEPTION
+        'PREFLIGHT_FAILED_INACTIVE: cat_fidelizacion_tipos_movimiento.REVERSO existe pero esta marcado inactivo (estado=false); esta migracion no reactiva filas existentes sin autorizacion explicita. Revisar manualmente.';
+    END IF;
   ELSE
+    -- v_coincidencias = 0: no existe ninguna fila -> insertar activa.
     SELECT string_agg(column_name, ', ' ORDER BY column_name)
     INTO v_columnas_desconocidas
     FROM information_schema.columns
@@ -76,7 +108,8 @@ $tipos_movimiento$;
 
 DO $origenes_movimiento$
 DECLARE
-  v_ya_existe boolean;
+  v_coincidencias integer;
+  v_activo boolean;
   v_columnas_desconocidas text;
   v_tiene_estado boolean;
 BEGIN
@@ -84,14 +117,27 @@ BEGIN
     RAISE EXCEPTION 'PREFLIGHT_FAILED: public.cat_fidelizacion_origenes_movimiento no existe';
   END IF;
 
-  SELECT EXISTS (
-    SELECT 1 FROM public.cat_fidelizacion_origenes_movimiento
-    WHERE UPPER(TRIM(codigo)) = 'REVERSO_FACTURA'
-  )
-  INTO v_ya_existe;
+  SELECT COUNT(*) INTO v_coincidencias
+  FROM public.cat_fidelizacion_origenes_movimiento
+  WHERE UPPER(TRIM(codigo)) = 'REVERSO_FACTURA';
 
-  IF v_ya_existe THEN
-    RAISE NOTICE 'cat_fidelizacion_origenes_movimiento.REVERSO_FACTURA ya existe; no-op';
+  IF v_coincidencias > 1 THEN
+    RAISE EXCEPTION
+      'PREFLIGHT_FAILED_AMBIGUOUS: existen % filas en cat_fidelizacion_origenes_movimiento con codigo normalizado REVERSO_FACTURA; no se puede determinar cual es la valida sin intervencion manual.',
+      v_coincidencias;
+  END IF;
+
+  IF v_coincidencias = 1 THEN
+    SELECT COALESCE(estado, true) INTO v_activo
+    FROM public.cat_fidelizacion_origenes_movimiento
+    WHERE UPPER(TRIM(codigo)) = 'REVERSO_FACTURA';
+
+    IF v_activo THEN
+      RAISE NOTICE 'cat_fidelizacion_origenes_movimiento.REVERSO_FACTURA ya existe y esta activo; no-op';
+    ELSE
+      RAISE EXCEPTION
+        'PREFLIGHT_FAILED_INACTIVE: cat_fidelizacion_origenes_movimiento.REVERSO_FACTURA existe pero esta marcado inactivo (estado=false); esta migracion no reactiva filas existentes sin autorizacion explicita. Revisar manualmente.';
+    END IF;
   ELSE
     SELECT string_agg(column_name, ', ' ORDER BY column_name)
     INTO v_columnas_desconocidas
