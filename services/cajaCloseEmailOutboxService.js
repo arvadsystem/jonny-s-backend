@@ -7,6 +7,7 @@ import {
   formatCajaCierreDateTime
 } from '../utils/cajaCierreReportePdf.js';
 import { resolveCajaCloseEmailRecipient } from './cajaCloseNotificationService.js';
+import { loadCajaCloseReportSections } from './cajaCloseReportSectionsService.js';
 
 export const CAJA_CLOSE_EMAIL_FALLBACK_TO = 'gersonmz@jonnyshn.com';
 export const CAJA_CLOSE_EMAIL_OUTBOX_TABLE = 'public.cajas_cierres_notificaciones_email';
@@ -286,6 +287,27 @@ export const buildCajaCloseEmailHtml = ({ payload = {}, pdfAttached = false } = 
     { label: 'Revision', render: (row) => (row.requiere_revision ? 'Si' : 'No') },
     { label: 'Observacion', render: (row) => row.observacion || 'N/A' }
   ];
+  const reversionColumns = [
+    { label: 'Hora', render: (row) => formatHtmlDateTime(row.hora) },
+    { label: 'Codigo REV', render: (row) => row.codigo_reversion },
+    { label: 'Venta original', render: (row) => row.venta_original },
+    { label: 'Tipo', render: (row) => row.tipo },
+    { label: 'Resultado', render: (row) => row.resultado_acumulado },
+    { label: 'Detalle', render: (row) => row.detalle },
+    { label: 'Motivo', render: (row) => row.motivo },
+    { label: 'Monto', align: 'right', render: (row) => money(row.monto) },
+    { label: 'Usuario', render: (row) => row.usuario },
+    { label: 'Observacion', render: (row) => row.observacion || 'N/A' }
+  ];
+  const redemptionColumns = [
+    { label: 'Hora', render: (row) => formatHtmlDateTime(row.hora) },
+    { label: 'Codigo de canje', render: (row) => row.codigo_canje },
+    { label: 'Cliente', render: (row) => row.cliente },
+    { label: 'Productos', render: (row) => row.productos },
+    { label: 'Puntos', align: 'right', render: (row) => String(row.puntos || 0) },
+    { label: 'Estado', render: (row) => row.estado },
+    { label: 'Usuario', render: (row) => row.usuario }
+  ];
   const generatedAt = payload.generatedAt || new Date();
   const resolutionLabel = payload.resolutionCode || payload.idResolucionFinal || 'No disponible';
   const payrollSync = payload.payrollSync || {};
@@ -296,6 +318,8 @@ export const buildCajaCloseEmailHtml = ({ payload = {}, pdfAttached = false } = 
     ? 'Este cierre requiere auditoria preventiva por recuento, diferencia o inconsistencia detectada durante el proceso de cierre.'
     : 'Este cierre fue registrado sin inconsistencias pendientes de auditoria.';
   const ventasTotalesNetas = calculateTotalNetSales(payload);
+  const reversionSummary = payload.reversiones?.resumen || {};
+  const redemptionSummary = payload.canjes_fidelizacion?.resumen || {};
   const moneyCellStyle = 'text-align:right;white-space:nowrap;';
   return `<!doctype html>
 <html>
@@ -307,8 +331,8 @@ export const buildCajaCloseEmailHtml = ({ payload = {}, pdfAttached = false } = 
     <tr><td><strong>Cierre</strong></td><td>${payload.idCierreCaja || 'N/A'}</td></tr>
     <tr><td><strong>ID sesion</strong></td><td>${payload.idSesionCaja || 'N/A'}</td></tr>
     <tr><td><strong>Codigo de caja</strong></td><td>${escapeHtml(session.codigo_caja || session.id_caja || 'N/A')}</td></tr>
-    <tr><td><strong>Caja</strong></td><td>${session.nombre_caja || session.codigo_caja || 'N/A'}</td></tr>
-    <tr><td><strong>Sucursal</strong></td><td>${session.nombre_sucursal || session.id_sucursal || 'N/A'}</td></tr>
+    <tr><td><strong>Caja</strong></td><td>${escapeHtml(session.nombre_caja || session.codigo_caja || 'N/A')}</td></tr>
+    <tr><td><strong>Sucursal</strong></td><td>${escapeHtml(session.nombre_sucursal || session.id_sucursal || 'N/A')}</td></tr>
     <tr><td><strong>Responsable</strong></td><td>${escapeHtml(resolveActorName({ nombre: actors.responsable_nombre, usuario: actors.responsable_usuario }))}</td></tr>
     <tr><td><strong>Usuario de cierre</strong></td><td>${escapeHtml(resolveActorName({ nombre: actors.cierre_nombre, usuario: actors.cierre_usuario }))}</td></tr>
     <tr><td><strong>Fecha/hora de cierre</strong></td><td>${escapeHtml(formatHtmlDateTime(payload.fechaCierre))}</td></tr>
@@ -346,6 +370,29 @@ export const buildCajaCloseEmailHtml = ({ payload = {}, pdfAttached = false } = 
     rows: payload.movimientosManuales?.egresos,
     emptyMessage: 'Sin egresos manuales registrados.'
   })}
+  <h3 style="margin:18px 0 8px;">Reversiones de venta</h3>
+  <p style="margin:0 0 8px;">
+    Parciales: <strong>${Number(reversionSummary.cantidad_parciales || 0)}</strong> &nbsp;|&nbsp;
+    Totales: <strong>${Number(reversionSummary.cantidad_totales || 0)}</strong> &nbsp;|&nbsp;
+    Monto total: <strong>${escapeHtml(money(reversionSummary.monto_total_reversado))}</strong>
+  </p>
+  ${buildHtmlTable({
+    title: 'Detalle de reversiones',
+    columns: reversionColumns,
+    rows: payload.reversiones?.items,
+    emptyMessage: 'Sin reversiones de venta registradas en esta sesion.'
+  })}
+  <h3 style="margin:18px 0 8px;">Canjes de Fidelizacion</h3>
+  <p style="margin:0 0 8px;">
+    Cantidad: <strong>${Number(redemptionSummary.cantidad_canjes || 0)}</strong> &nbsp;|&nbsp;
+    Puntos canjeados: <strong>${Number(redemptionSummary.total_puntos_canjeados || 0)}</strong>
+  </p>
+  ${buildHtmlTable({
+    title: 'Detalle de canjes',
+    columns: redemptionColumns,
+    rows: payload.canjes_fidelizacion?.items,
+    emptyMessage: 'Sin canjes de Fidelizacion registrados en esta sesion.'
+  })}
   <p>${pdfAttached ? 'Se adjunta el reporte PDF del cierre.' : 'No fue posible adjuntar el PDF automaticamente.'}</p>
 </body>
 </html>`;
@@ -356,26 +403,41 @@ export const resolveCajaCloseOutboxRecipient = (fallback = CAJA_CLOSE_EMAIL_FALL
 
 export const createCajaCloseEmailNotification = async (client, {
   idCierreCaja,
-  emailDestino = null
+  emailDestino = null,
+  payload = null
 } = {}) => {
   const closeId = normalizeCloseId(idCierreCaja);
   if (!closeId) return null;
   const recipient = resolveCajaCloseOutboxRecipient(emailDestino || CAJA_CLOSE_EMAIL_FALLBACK_TO);
-  const result = await client.query(
-    `
-      INSERT INTO public.cajas_cierres_notificaciones_email (
-        id_cierre_caja, estado, intentos, proximo_intento, email_destino, fecha_creacion, fecha_actualizacion
-      )
-      VALUES ($1, 'PENDIENTE', 0, NOW(), $2, NOW(), NOW())
-      ON CONFLICT (id_cierre_caja)
-      DO UPDATE SET
-        email_destino = COALESCE(public.cajas_cierres_notificaciones_email.email_destino, EXCLUDED.email_destino),
-        fecha_actualizacion = NOW()
-      RETURNING *
-    `,
-    [closeId, recipient]
-  );
-  return result.rows?.[0] || null;
+  const durablePayload = payload && typeof payload === 'object' ? payload : null;
+  try {
+    const result = await client.query(
+      `
+        INSERT INTO public.cajas_cierres_notificaciones_email (
+          id_cierre_caja, estado, intentos, proximo_intento, email_destino,
+          payload_snapshot, fecha_creacion, fecha_actualizacion
+        )
+        VALUES ($1, 'PENDIENTE', 0, NOW(), $2, $3::jsonb, NOW(), NOW())
+        ON CONFLICT (id_cierre_caja)
+        DO UPDATE SET
+          email_destino = COALESCE(public.cajas_cierres_notificaciones_email.email_destino, EXCLUDED.email_destino),
+          payload_snapshot = COALESCE(public.cajas_cierres_notificaciones_email.payload_snapshot, EXCLUDED.payload_snapshot),
+          fecha_actualizacion = NOW()
+        RETURNING *
+      `,
+      [closeId, recipient, durablePayload ? JSON.stringify(durablePayload) : null]
+    );
+    return result.rows?.[0] || null;
+  } catch (error) {
+    if (error?.code === '42703') {
+      throw Object.assign(new Error('El esquema del snapshot durable de cierre esta pendiente.'), {
+        code: 'CAJA_CLOSE_EMAIL_SNAPSHOT_SCHEMA_PENDIENTE',
+        httpStatus: 409,
+        publicMessage: 'El esquema del reporte durable de cierre esta pendiente.'
+      });
+    }
+    throw error;
+  }
 };
 
 export const fetchCajaCloseEmailNotificationByCloseId = async (queryRunner, idCierreCaja) => {
@@ -488,6 +550,10 @@ export const loadCajaCloseEmailPayload = async (queryRunner, idCierreCaja) => {
   });
   const movimientosManuales = await fetchCajaCloseManualMovements(queryRunner, row.id_sesion_caja);
   const arqueos = await fetchCajaCloseArqueos(queryRunner, row.id_cierre_caja);
+  const reportSections = await loadCajaCloseReportSections({
+    queryRunner,
+    idSesionCaja: row.id_sesion_caja
+  });
   const payrollSync = { synced: true, reason: 'NOT_REQUIRED' };
   return {
     idCierreCaja: String(row.id_cierre_caja),
@@ -519,8 +585,16 @@ export const loadCajaCloseEmailPayload = async (queryRunner, idCierreCaja) => {
     payrollSync,
     payrollSyncLabel: resolvePayrollSyncLabel(payrollSync),
     arqueos,
-    movimientosManuales
+    movimientosManuales,
+    ...reportSections
   };
+};
+
+const resolveDurableCajaClosePayload = (notification) => {
+  const snapshot = notification?.payload_snapshot;
+  if (!snapshot || typeof snapshot !== 'object' || Array.isArray(snapshot)) return null;
+  if (!snapshot.reversiones || !snapshot.canjes_fidelizacion) return null;
+  return snapshot;
 };
 
 export const sendCajaCloseEmailFromOutbox = async (notification, {
@@ -529,7 +603,8 @@ export const sendCajaCloseEmailFromOutbox = async (notification, {
   buildPdf = buildCajaCierrePdfBuffer,
   buildPdfFilename = buildCajaCierrePdfFilename
 } = {}) => {
-  const payload = await loadCajaCloseEmailPayload(queryRunner, notification.id_cierre_caja);
+  const payload = resolveDurableCajaClosePayload(notification)
+    || await loadCajaCloseEmailPayload(queryRunner, notification.id_cierre_caja);
   if (!payload) {
     const error = new Error('No se encontro el cierre asociado a la notificacion.');
     error.code = 'CAJA_CLOSE_EMAIL_PAYLOAD_NOT_FOUND';

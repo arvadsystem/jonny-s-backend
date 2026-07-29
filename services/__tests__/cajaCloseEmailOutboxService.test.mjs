@@ -368,7 +368,8 @@ describe('caja close email durable outbox', () => {
       assert.equal(row.estado, 'PENDIENTE');
     });
     assert.match(calls[0].sql, /ON CONFLICT \(id_cierre_caja\)/);
-    assert.deepEqual(calls[0].params, ['123', 'arvadsystem@gmail.com']);
+    assert.deepEqual(calls[0].params, ['123', 'arvadsystem@gmail.com', null]);
+    assert.match(calls[0].sql, /payload_snapshot/);
   });
 
   it('reclama con FOR UPDATE SKIP LOCKED y libera PROCESANDO abandonados', async () => {
