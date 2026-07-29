@@ -77,9 +77,19 @@ describe('createVentaReversion — regresion estructural Fase 2', () => {
   });
 
   it('Fidelizacion e inventario se siguen invocando dentro de la misma transaccion (no se omiten silenciosamente)', () => {
-    assert.match(source, /revertLoyaltyForFactura/);
-    assert.match(source, /restorePedidoInventoryMovementsForReversion/);
-    assert.match(source, /registerInventoryReturn/);
+    // Fase 4: revertLoyaltyForFactura fue eliminada por completo (ver
+    // applyLoyaltyReversalForFactura en
+    // routers/ventas/services/ventasReversionFidelizacionService.js);
+    // Fase 3 ya habia eliminado restorePedidoInventoryMovementsForReversion
+    // y registerInventoryReturn (ver returnInventoryForReversionLines en
+    // routers/ventas/services/ventasReversionInventoryService.js). Se
+    // verifica la INVOCACION real de los reemplazos actuales, no solo la
+    // presencia de un identificador (que podria ser un comentario
+    // explicando por que se elimino algo).
+    assert.match(source, /applyLoyaltyReversalForFactura\(/);
+    assert.match(source, /returnInventoryForReversionLines\(/);
+    assert.doesNotMatch(source, /(const|function)\s+revertLoyaltyForFactura\b/);
+    assert.doesNotMatch(source, /revertLoyaltyForFactura\(/);
   });
 });
 

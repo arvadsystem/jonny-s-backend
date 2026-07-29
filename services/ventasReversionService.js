@@ -25,6 +25,7 @@ import {
   validatePartialReversionApplicability
 } from '../routers/ventas/services/ventasReversionCalculationService.js';
 import { returnInventoryForReversionLines } from '../routers/ventas/services/ventasReversionInventoryService.js';
+import { applyLoyaltyReversalForFactura } from '../routers/ventas/services/ventasReversionFidelizacionService.js';
 
 // Fase 2: eliminada la ventana de 1 hora (REVERSAL_WINDOW_SQL /
 // VENTAS_REVERSION_FUERA_VENTANA) y el bloqueo por horario administrativo
@@ -155,213 +156,11 @@ const resolveReversionCajaMovementType = async (client) => {
   return Number(result.rows[0].id_tipo_movimiento_caja);
 };
 
-const revertLoyaltyForFactura = async ({
-  client,
-  idFactura,
-  idSucursal,
-  idUsuario,
-  tipoReversion,
-  montoReversado,
-  totalFactura
-}) => {
-  const sourceResult = await client.query(
-    `
-      SELECT
-        fm.id_movimiento,
-        fm.id_cliente,
-        fm.puntos_delta
-      FROM public.fidelizacion_movimientos fm
-      INNER JOIN public.cat_fidelizacion_tipos_movimiento tm ON tm.id_tipo_movimiento = fm.id_tipo_movimiento
-      INNER JOIN public.cat_fidelizacion_origenes_movimiento om ON om.id_origen_movimiento = fm.id_origen_movimiento
-      WHERE fm.id_factura = $1
-        AND UPPER(TRIM(tm.codigo)) = 'ACUMULACION'
-        AND UPPER(TRIM(om.codigo)) = 'FACTURA'
-        AND fm.puntos_delta > 0
-      ORDER BY fm.id_movimiento ASC
-      LIMIT 1
-      FOR UPDATE OF fm
-    `,
-    [idFactura]
-  );
-
-  if (!sourceResult.rowCount) return { applied: false, reason: 'NO_LOYALTY_MOVEMENT' };
-
-  const source = sourceResult.rows[0];
-  const puntosOriginales = Number(source.puntos_delta || 0);
-  if (puntosOriginales <= 0) return { applied: false, reason: 'INVALID_LOYALTY_DELTA' };
-
-  const reverseCatalogResult = await client.query(
-    `
-      SELECT
-        tm.id_tipo_movimiento AS id_tipo_movimiento_reverso,
-        om.id_origen_movimiento AS id_origen_movimiento_reverso
-      FROM public.cat_fidelizacion_tipos_movimiento tm
-      CROSS JOIN public.cat_fidelizacion_origenes_movimiento om
-      WHERE UPPER(TRIM(tm.codigo)) = 'REVERSO'
-        AND UPPER(TRIM(om.codigo)) = 'REVERSO_FACTURA'
-        AND COALESCE(tm.estado, true) = true
-        AND COALESCE(om.estado, true) = true
-      LIMIT 1
-    `
-  );
-  if (!reverseCatalogResult.rowCount) {
-    return { applied: false, reason: 'LOYALTY_REVERSAL_CATALOG_MISSING' };
-  }
-
-  const reverseCatalog = reverseCatalogResult.rows[0];
-  const reverseTypeId = Number(reverseCatalog.id_tipo_movimiento_reverso);
-  const reverseOriginId = Number(reverseCatalog.id_origen_movimiento_reverso);
-
-  const reversedResult = await client.query(
-    `
-      SELECT COALESCE(SUM(ABS(puntos_delta)), 0)::int AS puntos_revertidos
-      FROM public.fidelizacion_movimientos
-      WHERE id_factura = $1
-        AND puntos_delta < 0
-    `,
-    [idFactura]
-  );
-
-  const puntosYaRevertidos = Number(reversedResult.rows?.[0]?.puntos_revertidos || 0);
-  const puntosPendientes = Math.max(0, puntosOriginales - puntosYaRevertidos);
-  if (puntosPendientes <= 0) return { applied: false, reason: 'ALREADY_REVERSED' };
-
-  let puntosObjetivo = puntosPendientes;
-  if (tipoReversion === 'PARCIAL') {
-    if (totalFactura <= 0) return { applied: false, reason: 'TOTAL_FACTURA_INVALID_FOR_PARTIAL' };
-    const montoReversadoAcumuladoResult = await client.query(
-      `
-        SELECT COALESCE(SUM(fr.monto_reversado), 0)::numeric AS monto_reversado_acumulado
-        FROM public.facturas_reversiones fr
-        WHERE fr.id_factura_original = $1
-          AND UPPER(TRIM(COALESCE(fr.estado, ''))) = 'APLICADA'
-      `,
-      [idFactura]
-    );
-    const montoReversadoAcumulado = Number(montoReversadoAcumuladoResult.rows?.[0]?.monto_reversado_acumulado || 0);
-    const proporcion = Math.max(0, Math.min(1, montoReversadoAcumulado / totalFactura));
-    puntosObjetivo = Math.floor(puntosOriginales * proporcion) - puntosYaRevertidos;
-    puntosObjetivo = Math.max(0, Math.min(puntosObjetivo, puntosPendientes));
-  }
-
-  if (puntosObjetivo <= 0) return { applied: false, reason: 'PARTIAL_WITHOUT_POINTS' };
-
-  const saldoResult = await client.query(
-    `
-      SELECT id_cliente, puntos_disponibles, puntos_acumulados_total
-      FROM public.fidelizacion_saldos_cliente
-      WHERE id_cliente = $1
-      FOR UPDATE
-    `,
-    [source.id_cliente]
-  );
-  if (!saldoResult.rowCount) return { applied: false, reason: 'NO_LOYALTY_BALANCE' };
-
-  const saldo = saldoResult.rows[0];
-  const saldoAnterior = Number(saldo.puntos_disponibles || 0);
-  const puntosAplicables = Math.min(puntosObjetivo, saldoAnterior);
-  if (puntosAplicables <= 0) return { applied: false, reason: 'LOYALTY_BALANCE_ZERO' };
-
-  const nuevoSaldo = saldoAnterior - puntosAplicables;
-  const nuevoAcumulado = Math.max(0, Number(saldo.puntos_acumulados_total || 0) - puntosAplicables);
-
-  await client.query(
-    `
-      UPDATE public.fidelizacion_saldos_cliente
-      SET
-        puntos_disponibles = $1,
-        puntos_acumulados_total = $2,
-        fecha_actualizacion = NOW()
-      WHERE id_cliente = $3
-    `,
-    [nuevoSaldo, nuevoAcumulado, source.id_cliente]
-  );
-
-  await client.query(
-    `
-      UPDATE public.clientes
-      SET puntos = $1
-      WHERE id_cliente = $2
-    `,
-    [nuevoSaldo, source.id_cliente]
-  );
-
-  const existingReverseResult = await client.query(
-    `
-      SELECT id_movimiento, puntos_delta
-      FROM public.fidelizacion_movimientos
-      WHERE id_factura = $1
-        AND id_tipo_movimiento = $2
-        AND id_origen_movimiento = $3
-      LIMIT 1
-      FOR UPDATE
-    `,
-    [idFactura, reverseTypeId, reverseOriginId]
-  );
-
-  if (existingReverseResult.rowCount) {
-    const existing = existingReverseResult.rows[0];
-    const nuevoDelta = Number(existing.puntos_delta || 0) - puntosAplicables;
-
-    await client.query(
-      `
-        UPDATE public.fidelizacion_movimientos
-        SET
-          puntos_delta = $1,
-          saldo_nuevo = $2,
-          observacion = $3,
-          id_usuario_ejecutor = $4
-        WHERE id_movimiento = $5
-      `,
-      [
-        nuevoDelta,
-        nuevoSaldo,
-        `Reversión ${tipoReversion} de puntos por reversión de venta.`,
-        idUsuario,
-        Number(existing.id_movimiento)
-      ]
-    );
-  } else {
-    await client.query(
-      `
-        INSERT INTO public.fidelizacion_movimientos (
-          id_cliente,
-          id_sucursal,
-          id_tipo_movimiento,
-          puntos_delta,
-          saldo_anterior,
-          saldo_nuevo,
-          id_origen_movimiento,
-          id_factura,
-          observacion,
-          id_usuario_ejecutor,
-          fecha_creacion
-        )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())
-      `,
-      [
-        source.id_cliente,
-        idSucursal,
-        reverseTypeId,
-        puntosAplicables * -1,
-        saldoAnterior,
-        nuevoSaldo,
-        reverseOriginId,
-        idFactura,
-        `Reversión ${tipoReversion} de puntos por reversión de venta.`,
-        idUsuario
-      ]
-    );
-  }
-
-  return {
-    applied: true,
-    id_cliente: Number(source.id_cliente),
-    puntos_revertidos: puntosAplicables,
-    saldo_anterior: saldoAnterior,
-    saldo_nuevo: nuevoSaldo
-  };
-};
+// Fase 4: eliminada revertLoyaltyForFactura (reemplazada por completo por
+// routers/ventas/services/ventasReversionFidelizacionService.js:applyLoyaltyReversalForFactura,
+// que corrige la ambiguedad de fuente, el calculo del objetivo acumulado
+// real, la deuda de puntos durable (fidelizacion_ajustes_pendientes) y la
+// trazabilidad por reversion (id_reversion en fidelizacion_movimientos).
 
 // Fase 3: eliminados por completo registerInventoryReturn (usaba
 // productos.id_almacen como respaldo -- prohibido), buildPedidoMovementReturnRows
@@ -723,18 +522,25 @@ export const createVentaReversion = async ({ idFactura, body, req, idUsuario, id
       ]
     );
 
-    // Fidelizacion e inventario: se mantienen sin cambios de logica en
-    // Fase 2 (territorio de Fase 3/4), pero deben seguir ejecutandose
-    // dentro de la MISMA transaccion -- nunca se confirma Caja omitiendo
-    // silenciosamente estos dos efectos.
-    const loyalty = await revertLoyaltyForFactura({
+    // Fidelizacion (Fase 4): reversion de puntos por el resultado ACUMULADO
+    // real (accumulated.factura_totalmente_reversada), nunca por
+    // tipo_reversion solicitado. Si falta saldo disponible, el remanente
+    // se registra como deuda durable en fidelizacion_ajustes_pendientes
+    // (o aborta con FIDELIZACION_SCHEMA_PENDIENTE si esa tabla no existe
+    // todavia) -- nunca se descarta en silencio. Debe seguir ejecutandose
+    // dentro de la MISMA transaccion que Caja e inventario: cualquier
+    // error aqui hace ROLLBACK completo (sin REV, sin Caja, sin
+    // inventario devuelto).
+    const loyalty = await applyLoyaltyReversalForFactura({
       client,
       idFactura: facturaId,
       idSucursal,
       idUsuario: userId,
       tipoReversion,
-      montoReversado,
-      totalFactura
+      idReversion,
+      codigoReversion: correlativo.codigo,
+      totalFactura,
+      facturaTotalmenteReversada: accumulated.factura_totalmente_reversada
     });
 
     // Devolucion de inventario POR LINEA (Fase 3): cada linea reversada se

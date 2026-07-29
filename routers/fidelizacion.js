@@ -3,6 +3,7 @@ import pool from '../config/db-connection.js';
 import { checkPermission, requestHasAnyPermission } from '../middleware/checkPermission.js';
 import { resolveRequestUserSucursalScope } from '../utils/sucursalScope.js';
 import { attachImagenPrincipalUrls } from '../utils/uploads.js';
+import { resolveCanjeSesionCaja } from '../services/fidelizacionCanjeSessionService.js';
 import {
   buildErrorBody,
   isValidDateOnly,
@@ -1544,7 +1545,7 @@ const fidelizacionService = {
       };
     }
 
-    const allowedFields = new Set(['id_cliente', 'id_sucursal', 'items', 'observacion']);
+    const allowedFields = new Set(['id_cliente', 'id_sucursal', 'id_sesion_caja', 'items', 'observacion']);
     const unknownFields = unknownFieldsFromPayload(req.body, allowedFields);
     if (unknownFields.length) {
       return {
@@ -1579,6 +1580,22 @@ const fidelizacionService = {
       };
     }
 
+    // Fase 4 (seccion 3.8): id_sesion_caja explicito solo lo acepta
+    // Administrador/Super Admin (resolveCanjeSesionCaja lo ignora para un
+    // cajero regular, que siempre usa su propia sesion). No se valida el
+    // rol aqui: eso lo decide resolveFidelizacionScope.hasMultisucursalAccess
+    // mas abajo, ya dentro de la transaccion.
+    const requestedSesionCajaId = parseStrictPositiveInt(req.body.id_sesion_caja);
+    if (req.body.id_sesion_caja !== undefined && !requestedSesionCajaId) {
+      return {
+        status: 400,
+        body: buildErrorBody({
+          code: 'VALIDATION_ERROR',
+          message: 'id_sesion_caja debe ser un entero positivo.'
+        })
+      };
+    }
+
     // Validar y agregar items ANTES de pool.connect/BEGIN: un payload con
     // items invalidos (id_producto/cantidad no numericos, decimales,
     // arreglos, overflow, etc.) no debe consumir una conexion del pool ni
@@ -1604,12 +1621,26 @@ const fidelizacionService = {
         requireExplicitSucursalForSuperAdmin: true
       });
 
+      // Fase 4 (seccion 3.8): sesion de caja obligatoria para todo canje
+      // presencial nuevo. Cajero -> su propia sesion abierta (ambigua/ausente
+      // -> error). Administrador/Super Admin (hasMultisucursalAccess) ->
+      // puede enviar id_sesion_caja explicito (validado) o dejar que se
+      // auto-seleccione si hay exactamente una abierta en la sucursal.
+      const sessionResolution = await resolveCanjeSesionCaja({
+        client,
+        idSucursal: scope.targetSucursalId,
+        idUsuario: scope.idUsuario,
+        hasMultisucursalAccess: scope.hasMultisucursalAccess,
+        requestedIdSesionCaja: requestedSesionCajaId
+      });
+
       const result = await createPresentialFidelizacionCanje({
         client,
         req,
         idCliente,
         idSucursal: scope.targetSucursalId,
         idUsuarioEjecutor: scope.idUsuario,
+        idSesionCaja: sessionResolution.id_sesion_caja,
         items: validatedItems,
         observacion: req.body.observacion
       });
@@ -1627,6 +1658,7 @@ const fidelizacionService = {
             saldo_anterior: result.saldoAnterior,
             saldo_nuevo: result.saldoNuevo,
             id_sucursal: scope.targetSucursalId,
+            id_sesion_caja: sessionResolution.id_sesion_caja,
             items: result.items
           }
         }

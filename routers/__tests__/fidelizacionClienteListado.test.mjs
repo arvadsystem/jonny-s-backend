@@ -538,8 +538,9 @@ describe('routers/fidelizacion.js: parseNullablePositiveInt sigue siendo el unic
     const usages = [...source.matchAll(/parseStrictPositiveInt\(/g)];
     // canjeablesCliente: id_cliente (1). saveConfiguracion: id_sucursal,
     // item.id_producto, puntos_requeridos_override (3). createCanje:
-    // id_cliente, id_sucursal (2). Total: 6.
-    assert.equal(usages.length, 6, 'no debe agregarse ni quitarse ningun uso de parseStrictPositiveInt sin revisar este contrato');
+    // id_cliente, id_sucursal, id_sesion_caja (3, Fase 4 agrega
+    // id_sesion_caja -- seccion 3.8 del ticket). Total: 7.
+    assert.equal(usages.length, 7, 'no debe agregarse ni quitarse ningun uso de parseStrictPositiveInt sin revisar este contrato');
   });
 
   it('no se creo un parser paralelo especifico solo para id_sucursal (todas las referencias son al mismo helper)', async () => {

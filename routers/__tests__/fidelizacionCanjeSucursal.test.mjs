@@ -220,7 +220,8 @@ describe('routers/fidelizacion.js: canjeablesCliente y createCanje exigen sucurs
     const end = source.indexOf('\n  },', start);
     const handler = source.slice(start, end);
     assert.match(handler, /requireExplicitSucursalForSuperAdmin:\s*true/);
-    assert.match(handler, /allowedFields = new Set\(\['id_cliente', 'id_sucursal', 'items', 'observacion'\]\)/);
+    // Fase 4: id_sesion_caja se agrego como campo permitido (seccion 3.8).
+    assert.match(handler, /allowedFields = new Set\(\['id_cliente', 'id_sucursal', 'id_sesion_caja', 'items', 'observacion'\]\)/);
     // parseStrictPositiveInt (no el parseNullablePositiveInt lenient de
     // rondas anteriores): id_sucursal/id_cliente de createCanje ahora usan
     // el parser estricto (bloqueante de integridad de la auditoria

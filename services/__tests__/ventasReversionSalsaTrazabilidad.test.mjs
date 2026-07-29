@@ -248,7 +248,7 @@ describe('9) falla de inventario (salsa/extra sin trazabilidad) hace rollback co
     const beginIdx = source.indexOf(`await client.query('BEGIN')`);
     const revInsertIdx = source.indexOf('INSERT INTO public.facturas_reversiones (');
     const cajaInsertIdx = source.indexOf('INSERT INTO public.cajas_movimientos (');
-    const loyaltyCallIdx = source.indexOf('revertLoyaltyForFactura({');
+    const loyaltyCallIdx = source.indexOf('applyLoyaltyReversalForFactura({');
     const inventoryCallIdx = source.indexOf('returnInventoryForReversionLines({');
     // Hay un COMMIT anterior (linea temprana del reply idempotente, antes
     // de tocar Caja/inventario/puntos): se busca el COMMIT final de la

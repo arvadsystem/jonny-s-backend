@@ -1,12 +1,23 @@
 import assert from 'node:assert/strict';
-import { describe, it } from 'node:test';
+import { describe, it, beforeEach } from 'node:test';
 import { readFile } from 'node:fs/promises';
 import {
   resolveFidelizacionProductAssignments,
   createPresentialFidelizacionCanje,
   parseStrictPositiveInt,
-  validateAndAggregateCanjeItems
+  validateAndAggregateCanjeItems,
+  __resetFidelizacionSchemaProbeCachesForTests
 } from '../fidelizacionService.js';
+
+// Fase 4: la sonda de esquema de fidelizacion_canjes.id_sesion_caja se
+// cachea a nivel de proceso (ver __resetFidelizacionSchemaProbeCachesForTests).
+// Se reinicia antes de cada prueba de este archivo para que el resultado
+// de OTRO archivo de pruebas ejecutado antes en el mismo proceso `node
+// --test` nunca contamine estos fixtures (que esperan la columna
+// presente por defecto).
+beforeEach(() => {
+  __resetFidelizacionSchemaProbeCachesForTests();
+});
 
 // Defecto confirmado: Fidelizacion resolvia la sucursal de un producto
 // canjeable con productos.id_almacen (un solo almacen "legado" por
@@ -486,6 +497,13 @@ const buildCanjeFixture = (options = {}) => {
     if (sql.includes("to_regclass('public.bitacoras')")) return { rows: [{ reg: null }], rowCount: 1 };
     if (sql.startsWith('INSERT INTO public.bitacoras')) return { rows: [], rowCount: 1 };
 
+    // Fase 4 (seccion 3.8): sonda de columna fidelizacion_canjes.id_sesion_caja.
+    // Por defecto EXISTE en este fixture (estos tests ejercitan el flujo
+    // real de confirmacion de canje, no el camino de esquema pendiente).
+    if (sql.includes('information_schema.columns') && sql.includes("table_name = 'fidelizacion_canjes'")) {
+      return { rows: state.sesionCajaColumnExists === false ? [] : [{ '?column?': 1 }], rowCount: state.sesionCajaColumnExists === false ? 0 : 1 };
+    }
+
     throw new Error(`Consulta no reconocida por el fixture: ${sql}`);
   };
 
@@ -519,6 +537,7 @@ describe('createPresentialFidelizacionCanje: confirmacion del canje con la asign
       idCliente: 10,
       idSucursal: 1,
       idUsuarioEjecutor: 5,
+      idSesionCaja: 1,
       items: [{ id_producto: 156, cantidad: 2 }]
     });
 
@@ -538,6 +557,7 @@ describe('createPresentialFidelizacionCanje: confirmacion del canje con la asign
       idCliente: 10,
       idSucursal: 1,
       idUsuarioEjecutor: 5,
+      idSesionCaja: 1,
       items: [{ id_producto: 156, cantidad: 3 }]
     });
 
@@ -557,6 +577,7 @@ describe('createPresentialFidelizacionCanje: confirmacion del canje con la asign
         idCliente: 10,
         idSucursal: 1,
         idUsuarioEjecutor: 5,
+      idSesionCaja: 1,
         items: [{ id_producto: 156, cantidad: 1 }]
       }),
       (error) => {
@@ -580,6 +601,7 @@ describe('createPresentialFidelizacionCanje: confirmacion del canje con la asign
         idCliente: 10,
         idSucursal: 1,
         idUsuarioEjecutor: 5,
+      idSesionCaja: 1,
         items: [{ id_producto: 156, cantidad: 1 }]
       }),
       (error) => {
@@ -602,6 +624,7 @@ describe('createPresentialFidelizacionCanje: confirmacion del canje con la asign
       idCliente: 10,
       idSucursal: 1,
       idUsuarioEjecutor: 5,
+      idSesionCaja: 1,
       items: [{ id_producto: 156, cantidad: 1 }]
     });
 
@@ -622,6 +645,7 @@ describe('createPresentialFidelizacionCanje: confirmacion del canje con la asign
       idCliente: 10,
       idSucursal: 1,
       idUsuarioEjecutor: 5,
+      idSesionCaja: 1,
       items: [{ id_producto: 156, cantidad: 2 }]
     });
 
@@ -645,6 +669,7 @@ describe('createPresentialFidelizacionCanje: confirmacion del canje con la asign
       idCliente: 10,
       idSucursal: 1,
       idUsuarioEjecutor: 5,
+      idSesionCaja: 1,
       items: [{ id_producto: 156, cantidad: 2 }]
     });
 
@@ -672,6 +697,7 @@ describe('createPresentialFidelizacionCanje: confirmacion del canje con la asign
       idCliente: 10,
       idSucursal: 1,
       idUsuarioEjecutor: 5,
+      idSesionCaja: 1,
       items: [{ id_producto: 156, cantidad: 1 }]
     });
     assert.ok(resultA.idCanje);
@@ -689,6 +715,7 @@ describe('createPresentialFidelizacionCanje: confirmacion del canje con la asign
         idCliente: 11,
         idSucursal: 1,
         idUsuarioEjecutor: 5,
+      idSesionCaja: 1,
         items: [{ id_producto: 156, cantidad: 1 }]
       }),
       (error) => {
@@ -713,6 +740,7 @@ describe('createPresentialFidelizacionCanje: confirmacion del canje con la asign
         idCliente: 10,
         idSucursal: 1,
         idUsuarioEjecutor: 5,
+      idSesionCaja: 1,
         items: [{ id_producto: 156, cantidad: 1 }]
       }),
       (error) => {
@@ -745,6 +773,7 @@ describe('createPresentialFidelizacionCanje: confirmacion del canje con la asign
         idCliente: 10,
         idSucursal: 1,
         idUsuarioEjecutor: 5,
+      idSesionCaja: 1,
         items: [{ id_producto: 156, cantidad: 1 }]
       }),
       (error) => {
@@ -878,6 +907,7 @@ describe('createPresentialFidelizacionCanje: articulos invalidos se rechazan ant
           idCliente: 10,
           idSucursal: 1,
           idUsuarioEjecutor: 5,
+      idSesionCaja: 1,
           items
         }),
         (error) => {
@@ -898,6 +928,7 @@ describe('createPresentialFidelizacionCanje: articulos invalidos se rechazan ant
         idCliente: 10,
         idSucursal: 1,
         idUsuarioEjecutor: 5,
+      idSesionCaja: 1,
         items: [
           { id_producto: 156, cantidad: unsafeChunk },
           { id_producto: 156, cantidad: unsafeChunk }
@@ -922,6 +953,7 @@ describe('createPresentialFidelizacionCanje: articulos invalidos se rechazan ant
       idCliente: 10,
       idSucursal: 1,
       idUsuarioEjecutor: 5,
+      idSesionCaja: 1,
       items: [
         { id_producto: 156, cantidad: 1 },
         { id_producto: 156, cantidad: 2 }
@@ -956,6 +988,7 @@ describe('createPresentialFidelizacionCanje: sin efectos parciales cuando la asi
         idCliente: 10,
         idSucursal: 1,
         idUsuarioEjecutor: 5,
+      idSesionCaja: 1,
         items: [{ id_producto: 156, cantidad: 1 }]
       }),
       { code: 'FIDELIZACION_PRODUCTO_ASIGNACION_AMBIGUA' }
@@ -977,6 +1010,7 @@ describe('createPresentialFidelizacionCanje: sin efectos parciales cuando la asi
         idCliente: 10,
         idSucursal: 1,
         idUsuarioEjecutor: 5,
+      idSesionCaja: 1,
         items: [{ id_producto: 156, cantidad: 1 }]
       }),
       { code: 'FIDELIZACION_PRODUCTO_SIN_ASIGNACION' }
@@ -1178,6 +1212,7 @@ describe('createPresentialFidelizacionCanje: idCliente/idSucursal/idUsuarioEjecu
         idCliente: 10,
         idSucursal: 1,
         idUsuarioEjecutor: 5,
+      idSesionCaja: 1,
         items: [{ id_producto: 156, cantidad: '2x' }]
       }),
       { code: 'FIDELIZACION_CANJE_ITEM_INVALID' }

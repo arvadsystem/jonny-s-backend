@@ -444,6 +444,93 @@ export const isClienteProfileComplete = (profile) => {
   return Boolean(profile.estado) && nombreValido && telefonoValido;
 };
 
+// Fase 4 (seccion 3.6): sonda de esquema para fidelizacion_ajustes_pendientes,
+// consistente con el patron hasColumn/hasTable ya usado en Fase 3
+// (routers/cocina.js, routers/ventas/services/ventasReversionInventoryService.js).
+// Cacheada por proceso: la tabla no aparece/desaparece en caliente durante
+// la vida de un mismo proceso Node.
+let ajustesPendientesTableExistsCache = null;
+const hasFidelizacionAjustesPendientesTable = async (client) => {
+  if (ajustesPendientesTableExistsCache !== null) return ajustesPendientesTableExistsCache;
+  const result = await client.query('SELECT to_regclass($1) AS reg', ['public.fidelizacion_ajustes_pendientes']);
+  ajustesPendientesTableExistsCache = Boolean(result.rows?.[0]?.reg);
+  return ajustesPendientesTableExistsCache;
+};
+
+// Catalogos de compensacion (COMPENSACION/AJUSTE_PENDIENTE, migracion
+// 20260729_fidelizacion_catalogos_compensacion): a diferencia de
+// resolveFidelizacionCatalogs (que EXIGE existencia y lanza si falta), esta
+// resolucion es opcional -- si los catalogos no estan sembrados todavia, la
+// compensacion FIFO de deuda igual se aplica sobre fidelizacion_ajustes_pendientes,
+// solo se omite el movimiento auditable dedicado (queda documentado en la
+// observacion del movimiento principal).
+const resolveCompensationCatalogs = async (client) => {
+  const [tipoCompensacion, origenAjustePendiente] = await Promise.all([
+    getCatalogRowByCode(client, 'cat_fidelizacion_tipos_movimiento', 'id_tipo_movimiento', 'COMPENSACION'),
+    getCatalogRowByCode(client, 'cat_fidelizacion_origenes_movimiento', 'id_origen_movimiento', 'AJUSTE_PENDIENTE')
+  ]);
+  if (!tipoCompensacion || tipoCompensacion.estado === false) return null;
+  if (!origenAjustePendiente || origenAjustePendiente.estado === false) return null;
+  return {
+    tipoCompensacionId: Number(tipoCompensacion.id_catalogo),
+    origenAjustePendienteId: Number(origenAjustePendiente.id_catalogo)
+  };
+};
+
+/**
+ * Compensacion FIFO (seccion 3.6 del ticket): antes de que una acumulacion
+ * aumente puntos_disponibles, se bloquean (FOR UPDATE) los ajustes
+ * pendientes del cliente en orden fecha_creacion ASC, id_ajuste ASC, y los
+ * puntos nuevos se aplican primero a la deuda mas antigua. Solo el
+ * remanente (si sobra algo despues de saldar toda la deuda) aumenta el
+ * saldo disponible real.
+ */
+const applyFifoCompensation = async ({ client, idCliente, puntosDisponiblesParaCompensar }) => {
+  let remaining = Number(puntosDisponiblesParaCompensar || 0);
+  if (remaining <= 0) return { compensado: 0, ajustesTocados: [] };
+
+  const result = await client.query(
+    `
+      SELECT id_ajuste, puntos_recuperados, puntos_pendientes, estado
+      FROM public.fidelizacion_ajustes_pendientes
+      WHERE id_cliente = $1
+        AND estado IN ('PENDIENTE', 'PARCIALMENTE_RECUPERADO')
+      ORDER BY fecha_creacion ASC, id_ajuste ASC
+      FOR UPDATE
+    `,
+    [idCliente]
+  );
+
+  const ajustesTocados = [];
+  for (const ajuste of result.rows) {
+    if (remaining <= 0) break;
+    const pendienteActual = Number(ajuste.puntos_pendientes || 0);
+    if (pendienteActual <= 0) continue;
+
+    const compensar = Math.min(remaining, pendienteActual);
+    if (compensar <= 0) continue;
+
+    const nuevoRecuperados = Number(ajuste.puntos_recuperados || 0) + compensar;
+    const nuevoPendientes = pendienteActual - compensar;
+    const nuevoEstado = nuevoPendientes === 0 ? 'RECUPERADO' : 'PARCIALMENTE_RECUPERADO';
+
+    await client.query(
+      `
+        UPDATE public.fidelizacion_ajustes_pendientes
+        SET puntos_recuperados = $1, puntos_pendientes = $2, estado = $3, fecha_actualizacion = NOW()
+        WHERE id_ajuste = $4
+      `,
+      [nuevoRecuperados, nuevoPendientes, nuevoEstado, Number(ajuste.id_ajuste)]
+    );
+
+    remaining -= compensar;
+    ajustesTocados.push({ id_ajuste: Number(ajuste.id_ajuste), compensado: compensar });
+  }
+
+  const compensado = ajustesTocados.reduce((sum, entry) => sum + entry.compensado, 0);
+  return { compensado, ajustesTocados };
+};
+
 const registerFidelizacionMovement = async (client, payload) => {
   const result = await client.query(
     `
@@ -522,7 +609,31 @@ const addSaldoPoints = async ({
   const saldoAnterior = Number(saldo.puntos_disponibles || 0);
   const acumuladosActuales = Number(saldo.puntos_acumulados_total || 0);
   const canjeadosActuales = Number(saldo.puntos_canjeados_total || 0);
-  const nextSaldo = saldoAnterior + Number(puntosDelta || 0);
+  const isAccumulation = Number(puntosDelta || 0) > 0;
+
+  // Fase 4 (seccion 3.6): compensacion FIFO. SOLO se aplica sobre
+  // acumulaciones (puntosDelta > 0), nunca sobre canjes -- un canje ya
+  // exige saldo disponible suficiente y no debe verse afectado por deuda
+  // de una reversion anterior. Si fidelizacion_ajustes_pendientes no
+  // existe todavia (migracion no aplicada), se omite por completo y el
+  // comportamiento es identico al anterior a Fase 4.
+  let compensacion = { compensado: 0, ajustesTocados: [] };
+  if (isAccumulation && (await hasFidelizacionAjustesPendientesTable(client))) {
+    compensacion = await applyFifoCompensation({
+      client,
+      idCliente,
+      puntosDisponiblesParaCompensar: Number(puntosDelta)
+    });
+  }
+
+  // saldoIntermedio: saldo conceptual tras la acumulacion/canje ANTES de
+  // aplicar la compensacion (saldo_nuevo del movimiento principal).
+  // nextSaldo: saldo REAL final, unica escritura real a
+  // fidelizacion_saldos_cliente. Cuando compensacion.compensado===0 (todo
+  // canje, y toda acumulacion sin deuda pendiente) ambos coinciden y el
+  // comportamiento es exactamente el mismo que antes de Fase 4.
+  const saldoIntermedio = saldoAnterior + Number(puntosDelta || 0);
+  const nextSaldo = saldoIntermedio - compensacion.compensado;
 
   if (nextSaldo < 0) {
     throw createFidelizacionError(
@@ -532,8 +643,13 @@ const addSaldoPoints = async ({
     );
   }
 
-  const accumulatedDelta = puntosDelta > 0 ? Number(puntosDelta) : 0;
-  const redeemedDelta = puntosDelta < 0 ? Math.abs(Number(puntosDelta)) : 0;
+  // puntos_acumulados_total: significado HISTORICO ("total ganado alguna
+  // vez"), nunca reducido por compensar una deuda -- el cliente si gano
+  // estos puntos; la deuda es de una reversion PREVIA, ya reflejada en su
+  // propio momento (ver applyLoyaltyReversalForFactura). Por eso usa el
+  // delta COMPLETO (Number(puntosDelta)), no el remanente tras compensar.
+  const accumulatedDelta = isAccumulation ? Number(puntosDelta) : 0;
+  const redeemedDelta = !isAccumulation ? Math.abs(Number(puntosDelta)) : 0;
 
   await client.query(
     `
@@ -561,19 +677,51 @@ const addSaldoPoints = async ({
     id_tipo_movimiento: movementIds.idTipoMovimiento,
     puntos_delta: Number(puntosDelta),
     saldo_anterior: saldoAnterior,
-    saldo_nuevo: nextSaldo,
+    saldo_nuevo: saldoIntermedio,
     id_origen_movimiento: movementIds.idOrigenMovimiento,
     id_factura: idFactura,
     id_pedido: idPedido,
     id_canje: idCanje,
-    observacion,
+    observacion: compensacion.compensado > 0
+      ? `${observacion || ''} (Compensacion FIFO: ${compensacion.compensado} pts aplicados a ajuste(s) pendiente(s) #${compensacion.ajustesTocados.map((t) => t.id_ajuste).join(', #')}.)`.trim()
+      : observacion,
     id_usuario_ejecutor: idUsuarioEjecutor
   });
+
+  let idMovimientoCompensacion = null;
+  if (compensacion.compensado > 0) {
+    // El movimiento auditable DEDICADO de compensacion solo se crea si los
+    // catalogos COMPENSACION/AJUSTE_PENDIENTE ya estan sembrados
+    // (migracion 20260729_fidelizacion_catalogos_compensacion). Si no, la
+    // compensacion sobre fidelizacion_ajustes_pendientes ya quedo aplicada
+    // arriba y documentada en la observacion del movimiento principal --
+    // nunca se bloquea la acumulacion por la ausencia de este catalogo
+    // opcional.
+    const compensationCatalogs = await resolveCompensationCatalogs(client);
+    if (compensationCatalogs) {
+      idMovimientoCompensacion = await registerFidelizacionMovement(client, {
+        id_cliente: idCliente,
+        id_sucursal: idSucursal,
+        id_tipo_movimiento: compensationCatalogs.tipoCompensacionId,
+        puntos_delta: compensacion.compensado * -1,
+        saldo_anterior: saldoIntermedio,
+        saldo_nuevo: nextSaldo,
+        id_origen_movimiento: compensationCatalogs.origenAjustePendienteId,
+        id_factura: idFactura,
+        id_pedido: idPedido,
+        id_canje: idCanje,
+        observacion: `Compensacion FIFO de ${compensacion.compensado} pts contra ajuste(s) pendiente(s) #${compensacion.ajustesTocados.map((t) => t.id_ajuste).join(', #')}.`,
+        id_usuario_ejecutor: idUsuarioEjecutor
+      });
+    }
+  }
 
   return {
     idMovimiento: movementId,
     saldoAnterior,
-    saldoNuevo: nextSaldo
+    saldoNuevo: nextSaldo,
+    puntosCompensados: compensacion.compensado,
+    idMovimientoCompensacion
   };
 };
 
@@ -1011,12 +1159,31 @@ export const validateAndAggregateCanjeItems = (items) => {
   return [...byProduct.values()];
 };
 
+// Fase 4 (seccion 3.8): sonda de esquema para
+// fidelizacion_canjes.id_sesion_caja (migracion 20260728_fidelizacion_canjes_sesion_caja).
+let canjesSesionCajaColumnExistsCache = null;
+const hasFidelizacionCanjesSesionCajaColumn = async (client) => {
+  if (canjesSesionCajaColumnExistsCache !== null) return canjesSesionCajaColumnExistsCache;
+  const result = await client.query(
+    `
+      SELECT 1
+      FROM information_schema.columns
+      WHERE table_schema = 'public' AND table_name = 'fidelizacion_canjes'
+        AND column_name = 'id_sesion_caja'
+      LIMIT 1
+    `
+  );
+  canjesSesionCajaColumnExistsCache = result.rowCount > 0;
+  return canjesSesionCajaColumnExistsCache;
+};
+
 export const createPresentialFidelizacionCanje = async ({
   client,
   req,
   idCliente,
   idSucursal,
   idUsuarioEjecutor,
+  idSesionCaja,
   items,
   observacion = null
 }) => {
@@ -1028,6 +1195,7 @@ export const createPresentialFidelizacionCanje = async ({
   const clienteId = parseStrictPositiveInt(idCliente);
   const sucursalId = parseStrictPositiveInt(idSucursal);
   const actorId = parseStrictPositiveInt(idUsuarioEjecutor);
+  const sesionCajaId = parseStrictPositiveInt(idSesionCaja);
   const safeObservation = normalizeText(observacion).slice(0, 200) || null;
 
   if (!clienteId) {
@@ -1046,7 +1214,33 @@ export const createPresentialFidelizacionCanje = async ({
     );
   }
 
+  // Validar y agregar items ANTES de tocar el cliente/DB (mismo orden que
+  // ya exigia el resto de esta funcion): un payload con items invalidos no
+  // debe ejecutar ninguna consulta.
   const aggregatedItems = validateAndAggregateCanjeItems(items);
+
+  // Fase 4 (seccion 3.8): id_sesion_caja es obligatorio para TODO canje
+  // presencial nuevo. El llamador (routers/fidelizacion.js) debe resolverlo
+  // primero con resolveCanjeSesionCaja (que ya distingue cajero/administrador
+  // y produce los codigos FIDELIZACION_CANJE_SESSION_* especificos); esta
+  // funcion solo valida que efectivamente haya recibido un id positivo --
+  // nunca continua con NULL para un canje nuevo.
+  if (!sesionCajaId) {
+    throw createFidelizacionError(
+      400,
+      'FIDELIZACION_CANJE_SESSION_REQUIRED',
+      'Debe indicar la sesión de caja bajo la cual se registra el canje.'
+    );
+  }
+
+  if (!(await hasFidelizacionCanjesSesionCajaColumn(client))) {
+    throw createFidelizacionError(
+      409,
+      'FIDELIZACION_SCHEMA_PENDIENTE',
+      'Falta aplicar la migracion de sesion de caja para canjes de fidelizacion; no se puede registrar el canje de forma auditable.'
+    );
+  }
+
   const cliente = await fetchClienteEstado(client, clienteId);
   if (!cliente || !Boolean(cliente.estado)) {
     throw createFidelizacionError(
@@ -1174,11 +1368,12 @@ export const createPresentialFidelizacionCanje = async ({
         total_puntos,
         observacion,
         id_usuario_ejecutor,
+        id_sesion_caja,
         fecha_creacion,
         fecha_entrega,
         fecha_anulacion
       )
-      VALUES ($1, $2, $3, $4, $5, $6, NOW(), NULL, NULL)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), NULL, NULL)
       RETURNING id_canje
     `,
     [
@@ -1187,7 +1382,8 @@ export const createPresentialFidelizacionCanje = async ({
       catalogs.estadoRegistradoId,
       totalPuntos,
       safeObservation,
-      actorId
+      actorId,
+      sesionCajaId
     ]
   );
   const idCanje = Number(canjeResult.rows?.[0]?.id_canje || 0);
@@ -1273,6 +1469,21 @@ export const createPresentialFidelizacionCanje = async ({
     estadoCanjeId: catalogs.estadoRegistradoId,
     items: detailRows
   };
+};
+
+// Exportado UNICAMENTE para pruebas: los caches de sondas de esquema
+// (hasFidelizacionAjustesPendientesTable, hasFidelizacionCanjesSesionCajaColumn)
+// son a nivel de modulo/proceso -- necesario para no repetir la consulta a
+// information_schema en cada llamada real, pero eso significa que dentro
+// de una misma ejecucion de `node --test` (un solo proceso para muchos
+// archivos) el primer resultado observado quedaria fijo para todo el resto
+// de la suite. Esta funcion permite que un archivo de pruebas simule tanto
+// "el esquema de Fase 4 ya se aplico" como "todavia no" en la misma
+// ejecucion, sin afectar el comportamiento de produccion (nunca se llama
+// fuera de pruebas).
+export const __resetFidelizacionSchemaProbeCachesForTests = () => {
+  ajustesPendientesTableExistsCache = null;
+  canjesSesionCajaColumnExistsCache = null;
 };
 
 export {

@@ -2,8 +2,8 @@
 // registerFacturaLoyaltyAccumulation y el resto del modulo de fidelizacion,
 // para que las pruebas nunca toquen una base de datos real.
 const CATALOG_IDS = {
-  tipos: { ACUMULACION: 1, CANJE: 2 },
-  origenes: { FACTURA: 1, CANJE: 2 },
+  tipos: { ACUMULACION: 1, CANJE: 2, REVERSO: 3, COMPENSACION: 4 },
+  origenes: { FACTURA: 1, CANJE: 2, REVERSO_FACTURA: 3, AJUSTE_PENDIENTE: 4 },
   estados: { REGISTRADO: 1 }
 };
 
@@ -168,7 +168,15 @@ export const createFidelizacionMockClient = ({
   // (ver fidelizacionLockCoordinator.mjs) para que pg_advisory_xact_lock
   // bloquee de verdad entre ambos, igual que Postgres real.
   sharedState = null,
-  lockCoordinator = null
+  lockCoordinator = null,
+  // Fase 4 (compensacion FIFO en addSaldoPoints): por defecto la tabla NO
+  // existe (mismo estado que un entorno donde la migracion 20260728 aun no
+  // se aplico), para que TODAS las pruebas existentes de acumulacion sigan
+  // comportandose exactamente igual sin declarar nada nuevo. Las pruebas
+  // de compensacion la activan explicitamente con
+  // ajustesPendientesTableExists: true y ajustesPendientes: [...].
+  ajustesPendientesTableExists = false,
+  ajustesPendientes = []
 } = {}) => {
   const rawConfigs = activeConfigs || (activeConfig ? [activeConfig] : []);
   const resolvedConfigs = rawConfigs.map((cfg) => ({
@@ -203,6 +211,15 @@ export const createFidelizacionMockClient = ({
       }])
     ),
     nextMovimientoId: movimientos.length + 1,
+    ajustesPendientesTableExists,
+    ajustesPendientes: ajustesPendientes.map((row, index) => ({
+      id_ajuste: index + 1,
+      puntos_recuperados: 0,
+      estado: 'PENDIENTE',
+      fecha_creacion: index,
+      ...row
+    })),
+    nextAjusteId: ajustesPendientes.length + 1,
     calls: [],
     released: false,
     releaseCallCount: 0,
@@ -757,6 +774,59 @@ export const createFidelizacionMockClient = ({
           origen: 'FACTURA'
         });
         return { rows: [{ id_movimiento: idMovimiento }] };
+      }
+
+      // Fase 4: sonda de esquema (hasTable) para
+      // fidelizacion_ajustes_pendientes -- SELECT to_regclass($1) AS reg.
+      // Por defecto ausente (ver ajustesPendientesTableExists arriba).
+      if (text.includes('SELECT to_regclass(')) {
+        const tableParam = String(params?.[0] || '');
+        if (tableParam.includes('fidelizacion_ajustes_pendientes')) {
+          return { rows: [{ reg: state.ajustesPendientesTableExists ? 'fidelizacion_ajustes_pendientes' : null }] };
+        }
+        return { rows: [{ reg: null }] };
+      }
+
+      // Fase 4: bloqueo FIFO de ajustes pendientes de un cliente (compensacion
+      // en addSaldoPoints) -- ORDER BY fecha_creacion ASC, id_ajuste ASC.
+      if (text.includes('FROM public.fidelizacion_ajustes_pendientes') && text.includes('FOR UPDATE')) {
+        const idCliente = Number(params[0]);
+        const rows = state.ajustesPendientes
+          .filter((a) => a.id_cliente === idCliente && (a.estado === 'PENDIENTE' || a.estado === 'PARCIALMENTE_RECUPERADO'))
+          .sort((a, b) => (a.fecha_creacion - b.fecha_creacion) || (a.id_ajuste - b.id_ajuste));
+        return { rows: rows.map((row) => ({ ...row })) };
+      }
+
+      if (text.includes('UPDATE public.fidelizacion_ajustes_pendientes')) {
+        const [puntosRecuperados, puntosPendientes, estado, idAjuste] = params;
+        const row = state.ajustesPendientes.find((a) => a.id_ajuste === Number(idAjuste));
+        if (row) {
+          row.puntos_recuperados = Number(puntosRecuperados);
+          row.puntos_pendientes = Number(puntosPendientes);
+          row.estado = estado;
+        }
+        return { rows: [] };
+      }
+
+      if (text.includes('INSERT INTO public.fidelizacion_ajustes_pendientes')) {
+        const [idCliente, idFactura, idReversion, puntosObjetivo, puntosRecuperados, puntosPendientes, estado, idUsuarioEjecutor] = params;
+        if (state.ajustesPendientes.some((a) => a.id_reversion === Number(idReversion))) {
+          return { rows: [] };
+        }
+        const idAjuste = state.nextAjusteId++;
+        state.ajustesPendientes.push({
+          id_ajuste: idAjuste,
+          id_cliente: Number(idCliente),
+          id_factura: Number(idFactura),
+          id_reversion: Number(idReversion),
+          puntos_objetivo: Number(puntosObjetivo),
+          puntos_recuperados: Number(puntosRecuperados),
+          puntos_pendientes: Number(puntosPendientes),
+          estado,
+          id_usuario_ejecutor: idUsuarioEjecutor,
+          fecha_creacion: state.ajustesPendientes.length
+        });
+        return { rows: [{ id_ajuste: idAjuste }] };
       }
 
       state.aborted = true;
