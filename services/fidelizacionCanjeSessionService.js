@@ -31,7 +31,7 @@ const OPEN_SESSION_JOIN = `
   FROM public.cajas_sesiones cs
   INNER JOIN public.cat_cajas_sesiones_estados cse
     ON cse.id_estado_sesion_caja = cs.id_estado_sesion_caja
-  LEFT JOIN public.cajas c
+  INNER JOIN public.cajas c
     ON c.id_caja = cs.id_caja
    AND c.id_sucursal = cs.id_sucursal
   WHERE cs.id_sucursal = $1
@@ -71,6 +71,56 @@ const fetchAllOpenSessionsAtSucursal = async (client, idSucursal) => {
     [idSucursal]
   );
   return result.rows;
+};
+
+export const listCanjeSesionesDisponibles = async ({
+  client,
+  idSucursal,
+  idUsuario,
+  hasMultisucursalAccess
+}) => {
+  const sucursalId = parsePositiveInt(idSucursal);
+  const userId = parsePositiveInt(idUsuario);
+  if (!sucursalId || !userId) {
+    throw createCanjeSessionError(
+      400,
+      'FIDELIZACION_CANJE_SESSION_INVALID',
+      'No se pudo resolver la sucursal o el usuario para listar sesiones de caja.'
+    );
+  }
+  const userFilter = hasMultisucursalAccess
+    ? ''
+    : `
+        AND (
+          cs.id_usuario_responsable = $2
+          OR EXISTS (
+            SELECT 1
+            FROM public.cajas_sesiones_participantes csp
+            WHERE csp.id_sesion_caja = cs.id_sesion_caja
+              AND csp.id_usuario = $2
+              AND COALESCE(csp.activo, true) = true
+          )
+        )
+      `;
+  const result = await client.query(
+    `
+      SELECT
+        cs.id_sesion_caja,
+        cs.id_caja,
+        c.codigo_caja,
+        c.nombre_caja
+      ${OPEN_SESSION_JOIN}
+      ${userFilter}
+      ORDER BY c.codigo_caja ASC, cs.id_sesion_caja ASC
+    `,
+    hasMultisucursalAccess ? [sucursalId] : [sucursalId, userId]
+  );
+  return (result.rows || []).map((row) => ({
+    id_sesion_caja: Number(row.id_sesion_caja),
+    id_caja: Number(row.id_caja),
+    codigo_caja: String(row.codigo_caja || ''),
+    nombre_caja: String(row.nombre_caja || '')
+  }));
 };
 
 const fetchSessionById = async (client, idSesionCaja) => {

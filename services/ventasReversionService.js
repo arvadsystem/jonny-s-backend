@@ -26,7 +26,10 @@ import {
 } from '../routers/ventas/services/ventasReversionCalculationService.js';
 import { returnInventoryForReversionLines } from '../routers/ventas/services/ventasReversionInventoryService.js';
 import { applyLoyaltyReversalForFactura } from '../routers/ventas/services/ventasReversionFidelizacionService.js';
-import { enqueueAutomaticVentaReversionPrintJob } from './ventaReversionPrintService.js';
+import {
+  buildVentaReversionPrintStatus,
+  enqueueAutomaticVentaReversionPrintJob
+} from './ventaReversionPrintService.js';
 
 // Fase 2: eliminada la ventana de 1 hora (REVERSAL_WINDOW_SQL /
 // VENTAS_REVERSION_FUERA_VENTANA) y el bloqueo por horario administrativo
@@ -625,13 +628,14 @@ export const createVentaReversion = async ({ idFactura, body, req, idUsuario, id
     // Fase 5: el trabajo inicial y su PDF canonico quedan durables dentro de
     // la misma transaccion financiera. No se contacta al agente ni a QZ aqui;
     // una impresora apagada no puede deshacer la reversion.
-    await enqueueAutomaticVentaReversionPrintJob({
+    const printResult = await enqueueAutomaticVentaReversionPrintJob({
       client,
       idReversion,
       idFactura: facturaId,
       idSucursal,
       idUsuario: userId
     });
+    result.impresion = buildVentaReversionPrintStatus(printResult);
 
     const responseBody = {
       success: true,

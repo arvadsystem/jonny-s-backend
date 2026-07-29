@@ -3,7 +3,10 @@ import pool from '../config/db-connection.js';
 import { checkPermission, requestHasAnyPermission } from '../middleware/checkPermission.js';
 import { resolveRequestUserSucursalScope } from '../utils/sucursalScope.js';
 import { attachImagenPrincipalUrls } from '../utils/uploads.js';
-import { resolveCanjeSesionCaja } from '../services/fidelizacionCanjeSessionService.js';
+import {
+  listCanjeSesionesDisponibles,
+  resolveCanjeSesionCaja
+} from '../services/fidelizacionCanjeSessionService.js';
 import {
   buildErrorBody,
   isValidDateOnly,
@@ -1675,6 +1678,38 @@ const fidelizacionService = {
     }
   },
 
+  async listCanjeSesiones(req) {
+    const requestedSucursalId = parseNullablePositiveInt(req.query.id_sucursal);
+    if (req.query.id_sucursal !== undefined && !requestedSucursalId) {
+      return {
+        status: 400,
+        body: buildErrorBody({
+          code: 'VALIDATION_ERROR',
+          message: 'id_sucursal debe ser un entero positivo.'
+        })
+      };
+    }
+    const client = await pool.connect();
+    try {
+      const scope = await resolveFidelizacionScope({
+        req,
+        client,
+        requestedSucursalId,
+        requireOperationalSucursal: true,
+        requireExplicitSucursalForSuperAdmin: true
+      });
+      const items = await listCanjeSesionesDisponibles({
+        client,
+        idSucursal: scope.targetSucursalId,
+        idUsuario: scope.idUsuario,
+        hasMultisucursalAccess: scope.hasMultisucursalAccess
+      });
+      return { status: 200, body: { items } };
+    } finally {
+      client.release();
+    }
+  },
+
   async listCanjes(req) {
     const page = parsePageParam(req.query.page, 1);
     const limit = parseLimitParam(req.query.limit, 20);
@@ -2004,6 +2039,15 @@ router.post(
   asyncHandler(fidelizacionService.createCanje, {
     defaultCode: 'FIDELIZACION_CANJE_CREATE_ERROR',
     defaultMessage: 'No se pudo registrar el canje de fidelizacion.'
+  })
+);
+
+router.get(
+  '/fidelizacion/canje-sesiones',
+  checkPermission(['fidelizacion_canjear_presencial']),
+  asyncHandler(fidelizacionService.listCanjeSesiones, {
+    defaultCode: 'FIDELIZACION_CANJE_SESIONES_LIST_ERROR',
+    defaultMessage: 'No se pudieron obtener las sesiones de caja disponibles.'
   })
 );
 

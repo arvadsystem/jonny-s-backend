@@ -10,7 +10,10 @@ import {
   validateCanonicalPrintPayload
 } from '../printJobDocumentService.js';
 import { enqueuePrintJobInTransaction } from '../printQueueService.js';
-import { enqueueAutomaticVentaReversionPrintJob } from '../ventaReversionPrintService.js';
+import {
+  buildVentaReversionPrintStatus,
+  enqueueAutomaticVentaReversionPrintJob
+} from '../ventaReversionPrintService.js';
 import { enqueueVentaReversionPrintJob } from '../../routers/printing.js';
 import { validateCanonicalPrintJobData } from '../../print-agent/src/documentRenderer.js';
 
@@ -132,6 +135,37 @@ describe('comprobante canonico de reversion', () => {
 });
 
 describe('cola durable de reversion', () => {
+  it('expone estado estable con id real cuando la impresion automatica esta habilitada', () => {
+    assert.deepEqual(
+      buildVentaReversionPrintStatus({
+        enabled: true,
+        job: { id_trabajo: 71, estado: 'pendiente', tipo_documento: 'reversion' }
+      }),
+      {
+        automatica_habilitada: true,
+        trabajo_creado: true,
+        id_trabajo: 71,
+        estado: 'PENDIENTE',
+        tipo_documento: 'reversion',
+        impresora_logica: 'factura'
+      }
+    );
+  });
+
+  it('expone estado estable y sin trabajo cuando la impresion automatica esta deshabilitada', () => {
+    assert.deepEqual(
+      buildVentaReversionPrintStatus({ enabled: false, job: null }),
+      {
+        automatica_habilitada: false,
+        trabajo_creado: false,
+        id_trabajo: null,
+        estado: 'DESHABILITADA',
+        tipo_documento: 'reversion',
+        impresora_logica: 'factura'
+      }
+    );
+  });
+
   const createTransactionalMock = ({ schemaError = null } = {}) => {
     const state = { job: null, documents: 0, sql: [] };
     return {
@@ -243,6 +277,18 @@ describe('cola durable de reversion', () => {
     const source = readFileSync(new URL('../ventaReversionPrintService.js', import.meta.url), 'utf8');
     assert.doesNotMatch(source, /qz|websocket|printerMap|notifyPrintJobAvailable/i);
     assert.match(source, /enqueuePrintJobInTransaction/);
+  });
+
+  it('persiste el id de impresion en la respuesta idempotente antes del COMMIT', () => {
+    const source = readFileSync(new URL('../ventasReversionService.js', import.meta.url), 'utf8');
+    const statusIndex = source.indexOf('result.impresion = buildVentaReversionPrintStatus(printResult)');
+    const responseIndex = source.indexOf('const responseBody =', statusIndex);
+    const saveIndex = source.indexOf('idempotency.saveSuccess', responseIndex);
+    const commitIndex = source.indexOf("client.query('COMMIT')", saveIndex);
+    assert.ok(statusIndex > 0);
+    assert.ok(responseIndex > statusIndex);
+    assert.ok(saveIndex > responseIndex);
+    assert.ok(commitIndex > saveIndex);
   });
 });
 

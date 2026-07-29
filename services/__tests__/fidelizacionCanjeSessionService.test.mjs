@@ -4,7 +4,10 @@ import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
-import { resolveCanjeSesionCaja } from '../fidelizacionCanjeSessionService.js';
+import {
+  listCanjeSesionesDisponibles,
+  resolveCanjeSesionCaja
+} from '../fidelizacionCanjeSessionService.js';
 
 const OPEN_SESSION_ROW = (overrides = {}) => ({
   id_sesion_caja: 1,
@@ -186,5 +189,79 @@ describe('32-33-34) canje guarda id_sesion_caja, no crea efecto financiero, hist
     const migration = readFileSync(resolve('sql/20260728_fidelizacion_canjes_sesion_caja_SAFE.sql'), 'utf8');
     assert.match(migration, /ADD COLUMN IF NOT EXISTS id_sesion_caja BIGINT NULL/);
     assert.doesNotMatch(migration, /UPDATE public\.fidelizacion_canjes/, 'no debe hacer backfill inferido para canjes historicos');
+  });
+});
+
+describe('listado seguro de sesiones disponibles para canje', () => {
+  it('administrador recibe solo los campos publicos de sesiones abiertas y cajas activas de la sucursal', async () => {
+    const queries = [];
+    const client = {
+      async query(sql, params) {
+        queries.push({ sql: String(sql), params });
+        return {
+          rows: [{
+            id_sesion_caja: 31,
+            id_caja: 4,
+            codigo_caja: 'CAJA-04',
+            nombre_caja: 'Caja principal'
+          }]
+        };
+      }
+    };
+
+    const result = await listCanjeSesionesDisponibles({
+      client,
+      idSucursal: 9,
+      idUsuario: 15,
+      hasMultisucursalAccess: true
+    });
+
+    assert.deepEqual(result, [{
+      id_sesion_caja: 31,
+      id_caja: 4,
+      codigo_caja: 'CAJA-04',
+      nombre_caja: 'Caja principal'
+    }]);
+    assert.deepEqual(queries[0].params, [9]);
+    assert.match(queries[0].sql, /INNER JOIN public\.cajas c/i);
+    assert.match(queries[0].sql, /cs\.fecha_cierre IS NULL/i);
+    assert.match(queries[0].sql, /UPPER\(TRIM\(cse\.codigo\)\) = 'ABIERTA'/i);
+    assert.match(queries[0].sql, /COALESCE\(c\.estado, true\) = true/i);
+    assert.doesNotMatch(queries[0].sql, /csp\.id_usuario = \$2/i);
+  });
+
+  it('cajero queda limitado a sesiones donde es responsable o participante activo', async () => {
+    const queries = [];
+    const client = {
+      async query(sql, params) {
+        queries.push({ sql: String(sql), params });
+        return {
+          rows: [{
+            id_sesion_caja: 32,
+            id_caja: 5,
+            codigo_caja: 'CAJA-05',
+            nombre_caja: 'Caja auxiliar'
+          }]
+        };
+      }
+    };
+
+    const result = await listCanjeSesionesDisponibles({
+      client,
+      idSucursal: 9,
+      idUsuario: 15,
+      hasMultisucursalAccess: false
+    });
+
+    assert.deepEqual(Object.keys(result[0]), [
+      'id_sesion_caja',
+      'id_caja',
+      'codigo_caja',
+      'nombre_caja'
+    ]);
+    assert.deepEqual(queries[0].params, [9, 15]);
+    assert.match(queries[0].sql, /cs\.id_usuario_responsable = \$2/i);
+    assert.match(queries[0].sql, /csp\.id_usuario = \$2/i);
+    assert.match(queries[0].sql, /COALESCE\(csp\.activo, true\) = true/i);
   });
 });
