@@ -409,6 +409,12 @@ export const attachSalsaInventorySnapshotsToLines = async ({ client, lines = [],
       if (!snapshot.id_insumo || !snapshot.id_almacen || snapshot.cantidad_base_total <= 0) {
         throw createInventoryError('VENTAS_SALSA_INVENTARIO_NO_DISPONIBLE', `La salsa ${source.nombre || idSalsa} requiere revisar su configuracion de inventario.`);
       }
+      // Fase 3 (correccion final): se conserva la linea exacta que
+      // consumio esta salsa, para que un consumo posterior (si alguna vez
+      // se usa consumeSalsasInventoryFromSnapshots en vez del camino real
+      // de produccion via pedidoConsumoResolver/inventarioMovimientoService)
+      // nunca mezcle el consumo de dos lineas distintas en una sola SALIDA.
+      snapshot.id_detalle_pedido = toPositiveInventoryInt(line?.id_detalle_pedido) || null;
       const stockKey = `${snapshot.id_insumo}:${snapshot.id_almacen}`;
       const current = usageByStockKey.get(stockKey) || {
         idInsumo: snapshot.id_insumo,
@@ -513,9 +519,16 @@ export const consumeSalsasInventoryFromSnapshots = async ({
   lines = [],
   idUsuario = null,
   idReferencia = null,
+  idPedidoTrazabilidad = null,
   refOrigen = 'VENTA_SALSA',
   descripcion = 'Salida por salsa vendida'
 } = {}) => {
+  // Fase 3 (correccion final): agrupar SIEMPRE tambien por
+  // id_detalle_pedido cuando el snapshot lo trae -- nunca se mezcla el
+  // consumo de dos lineas de pedido distintas en una sola fila SALIDA,
+  // aunque compartan el mismo insumo y almacen. Si el snapshot no trae
+  // id_detalle_pedido (camino legacy sin linea resoluble), se mantiene el
+  // agrupado historico por insumo+almacen para no romper compatibilidad.
   const usage = new Map();
   for (const line of Array.isArray(lines) ? lines : []) {
     for (const entry of Array.isArray(line?.salsas_inventario_snapshot) ? line.salsas_inventario_snapshot : []) {
@@ -523,8 +536,15 @@ export const consumeSalsasInventoryFromSnapshots = async ({
       const idAlmacen = toPositiveInventoryInt(entry?.id_almacen);
       const cantidad = Number(entry?.cantidad_base_total || 0);
       if (!idInsumo || !idAlmacen || cantidad <= 0) continue;
-      const key = `${idInsumo}:${idAlmacen}`;
-      const current = usage.get(key) || { idInsumo, idAlmacen, cantidad: 0, nombres: new Set() };
+      const idDetallePedido = toPositiveInventoryInt(entry?.id_detalle_pedido) || null;
+      const key = `${idInsumo}:${idAlmacen}:${idDetallePedido || 'sin_detalle'}`;
+      const current = usage.get(key) || {
+        idInsumo,
+        idAlmacen,
+        idDetallePedido,
+        cantidad: 0,
+        nombres: new Set()
+      };
       current.cantidad += cantidad;
       if (entry.nombre) current.nombres.add(entry.nombre);
       usage.set(key, current);
@@ -555,16 +575,22 @@ export const consumeSalsasInventoryFromSnapshots = async ({
             cantidad,
             id_almacen,
             id_insumo,
+            id_detalle_pedido,
+            origen_consumo,
+            id_pedido_trazabilidad,
             ref_origen,
             id_ref,
             descripcion
           )
-          VALUES ('SALIDA', $1, $2, $3, $4, $5, $6)
+          VALUES ('SALIDA', $1, $2, $3, $4, $5, $6, $7, $8, $9)
         `,
         [
           row.cantidad,
           row.idAlmacen,
           row.idInsumo,
+          row.idDetallePedido,
+          row.idDetallePedido ? 'SALSA' : null,
+          row.idDetallePedido ? toPositiveInventoryInt(idPedidoTrazabilidad) : null,
           refOrigen,
           idReferencia,
           `${descripcion}: ${[...row.nombres].join(', ') || 'salsas'}${toPositiveInventoryInt(idUsuario) ? ` - usuario ${idUsuario}` : ''}`

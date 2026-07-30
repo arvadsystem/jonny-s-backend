@@ -10,6 +10,7 @@ import {
   loadCajaCloseEmailPayload,
   markCajaCloseEmailNotificationFailed,
   normalizeManualMovement,
+  processCajaCloseEmailOutboxBatch,
   processClaimedCajaCloseEmailNotification,
   resolveCajaCloseOutboxRecipient
 } from '../cajaCloseEmailOutboxService.js';
@@ -19,11 +20,53 @@ import {
   calculateTotalNetSales,
   formatCajaCierreDateTime
 } from '../../utils/cajaCierreReportePdf.js';
+import {
+  configureCajaCloseEmailOutboxWorkerForTests,
+  getCajaCloseEmailOutboxWorkerState,
+  resetCajaCloseEmailOutboxWorkerForTests,
+  startCajaCloseEmailOutboxWorker
+} from '../../jobs/cajaCloseEmailOutboxWorker.js';
 
 const routerSource = readFileSync(resolve('routers/cajas.js'), 'utf8');
 const serverSource = readFileSync(resolve('server.js'), 'utf8');
 const migrationSource = readFileSync(resolve('sql/2026-06-28_caja_close_email_outbox.sql'), 'utf8');
 const emailServiceSource = readFileSync(resolve('utils/emailService.js'), 'utf8');
+
+// Mismo arnes de timers ya usado en jobs/__tests__/cajaCloseEmailOutboxWorker.test.mjs,
+// para arrancar el worker REAL sin timers reales ni una base de datos real.
+const createTimeoutHarness = () => {
+  const timers = [];
+  const cleared = [];
+  return {
+    timers,
+    cleared,
+    setTimeout(callback, delayMs) {
+      const timer = { callback, delayMs };
+      timers.push(timer);
+      return timer;
+    },
+    clearTimeout(timer) {
+      cleared.push(timer);
+    }
+  };
+};
+
+const createIntervalHarness = () => {
+  const timers = [];
+  const cleared = [];
+  return {
+    timers,
+    cleared,
+    setInterval(callback, delayMs) {
+      const timer = { callback, delayMs };
+      timers.push(timer);
+      return timer;
+    },
+    clearInterval(timer) {
+      cleared.push(timer);
+    }
+  };
+};
 
 const withCajaCloseEmailTo = async (value, fn) => {
   const previous = process.env.CAJA_CLOSE_EMAIL_TO;
@@ -218,9 +261,89 @@ describe('caja close email durable outbox', () => {
     }
   });
 
-  it('reinicio del proceso recupera notificaciones persistidas al arrancar el backend', () => {
+  it('reinicio del proceso recupera notificaciones persistidas al arrancar el backend', async () => {
     assert.match(serverSource, /startCajaCloseEmailOutboxWorker\(\)/);
-    assert.match(serverSource, /stopCajaCloseEmailOutboxWorker\(\{ timeoutMs: 5000 \}\)/);
+
+    // El arranque (arriba) se sigue verificando por texto: startCajaCloseEmailOutboxWorker()
+    // se invoca literalmente dentro del callback onReady. El STOP, en cambio,
+    // ya no aparece como texto contiguo con su argumento -server.js lo llama
+    // a traves de un parametro inyectable (stopCajaWorker, alias local
+    // dentro de createServerRuntime) cuyo valor por defecto es
+    // stopCajaCloseEmailOutboxWorker-, asi que se verifica por comportamiento:
+    // se arranca el worker REAL (con dependencias inyectadas para no tocar
+    // una base real) y se confirma que el shutdown de server.js, usando su
+    // valor por defecto SIN sobreescribir, detiene ese worker real.
+    const timeouts = createTimeoutHarness();
+    const intervals = createIntervalHarness();
+    resetCajaCloseEmailOutboxWorkerForTests();
+    configureCajaCloseEmailOutboxWorkerForTests({
+      setTimeout: timeouts.setTimeout,
+      clearTimeout: timeouts.clearTimeout,
+      setInterval: intervals.setInterval,
+      clearInterval: intervals.clearInterval,
+      processBatch: async () => ({ claimed: 0, processed: 0 }),
+      log: () => {},
+      warn: () => {},
+      error: () => {}
+    });
+
+    try {
+      const started = await startCajaCloseEmailOutboxWorker();
+      assert.equal(started.started, true);
+      assert.equal(timeouts.timers.length, 1, 'el worker debe quedar con su timer de tick activo antes del shutdown');
+
+      const previousAutostartFlag = process.env.SERVER_RUNTIME_AUTOSTART_DISABLED;
+      process.env.SERVER_RUNTIME_AUTOSTART_DISABLED = 'true';
+      let createServerRuntime;
+      try {
+        ({ createServerRuntime } = await import(`../../server.js?case=${Date.now()}-caja-outbox-shutdown`));
+      } finally {
+        if (previousAutostartFlag === undefined) delete process.env.SERVER_RUNTIME_AUTOSTART_DISABLED;
+        else process.env.SERVER_RUNTIME_AUTOSTART_DISABLED = previousAutostartFlag;
+      }
+
+      const runtime = createServerRuntime({
+        server: { close: (cb) => cb(null) },
+        runtimeConfig: { gracefulShutdownTimeoutMs: 5000 },
+        stopReadiness: async () => {},
+        // stopCajaWorker NO se sobreescribe a proposito: se ejercita el
+        // valor por defecto real de produccion (stopCajaCloseEmailOutboxWorker).
+        stopSessionCutoffWorker: async () => {},
+        detachPrintAgentWs: async () => {},
+        waitForFidelizacionQueue: async () => {},
+        closeFidelizacionDatabasePool: async () => {},
+        closeDatabasePool: async () => {},
+        runtimeProcess: { exit: () => {} }
+      });
+
+      await runtime.shutdown('SIGTERM');
+
+      assert.equal(timeouts.cleared.length, 1, 'el shutdown debe limpiar el timer real del worker de outbox de caja');
+      assert.equal(getCajaCloseEmailOutboxWorkerState().started, false, 'el worker real debe quedar detenido');
+    } finally {
+      resetCajaCloseEmailOutboxWorkerForTests();
+    }
+  });
+
+  it('el servidor abre el puerto antes de iniciar el worker, y un fallo al iniciarlo no lo bloquea ni lo tumba', () => {
+    const listenIndex = serverSource.indexOf('app.listen(PORT');
+    const startIndex = serverSource.indexOf('startCajaCloseEmailOutboxWorker()');
+    assert.ok(listenIndex >= 0, 'debe existir app.listen(PORT');
+    assert.ok(startIndex >= 0, 'debe existir una llamada a startCajaCloseEmailOutboxWorker()');
+    assert.ok(
+      startIndex > listenIndex,
+      'startCajaCloseEmailOutboxWorker() debe aparecer despues de app.listen(PORT (dentro de su callback), nunca antes'
+    );
+    assert.doesNotMatch(
+      serverSource,
+      /await\s+startCajaCloseEmailOutboxWorker\(\)/,
+      'el arranque no debe esperar (await) el primer tick del worker antes de abrir el puerto'
+    );
+    assert.match(
+      serverSource,
+      /startCajaCloseEmailOutboxWorker\(\)\.catch\(/,
+      'un fallo al iniciar el worker en segundo plano debe capturarse, nunca tumbar el proceso'
+    );
   });
 
   it('resuelve destinatario QA y fallback de produccion', async () => {
@@ -245,7 +368,8 @@ describe('caja close email durable outbox', () => {
       assert.equal(row.estado, 'PENDIENTE');
     });
     assert.match(calls[0].sql, /ON CONFLICT \(id_cierre_caja\)/);
-    assert.deepEqual(calls[0].params, ['123', 'arvadsystem@gmail.com']);
+    assert.deepEqual(calls[0].params, ['123', 'arvadsystem@gmail.com', null]);
+    assert.match(calls[0].sql, /payload_snapshot/);
   });
 
   it('reclama con FOR UPDATE SKIP LOCKED y libera PROCESANDO abandonados', async () => {
@@ -716,5 +840,104 @@ describe('caja close email durable outbox', () => {
       }),
       'Cierre de caja registrado - Caja Central - Sucursal 1'
     );
+  });
+
+  describe('processCajaCloseEmailOutboxBatch: timeout de claim y coordinacion entre replicas', () => {
+    // Cliente/pool dedicados a la transaccion BEGIN/lock/claim/COMMIT que abre
+    // processCajaCloseEmailOutboxBatch. Enruta por regex sobre el texto de cada SQL, igual
+    // que los fakes de mas arriba en este archivo (sin mocking library, solo objetos planos).
+    const createFakeOutboxClient = ({ lockAcquired = true, claimRows = [], failClaimWith = null } = {}) => {
+      const calls = [];
+      const client = {
+        async query(sql, params) {
+          calls.push({ sql: String(sql), params });
+          const text = String(sql);
+          if (/^\s*BEGIN\s*$/i.test(text)) return {};
+          if (/^\s*COMMIT\s*$/i.test(text)) return {};
+          if (/^\s*ROLLBACK\s*$/i.test(text)) return {};
+          if (/SET LOCAL statement_timeout/i.test(text)) return {};
+          if (/pg_try_advisory_xact_lock/i.test(text)) return { rows: [{ locked: lockAcquired }] };
+          if (/FOR UPDATE SKIP LOCKED/i.test(text)) {
+            if (failClaimWith) throw failClaimWith;
+            return { rows: claimRows };
+          }
+          return { rows: [] };
+        },
+        release: () => {}
+      };
+      return { client, calls };
+    };
+
+    it('aplica un statement_timeout de 5000ms (default) antes de reclamar', async () => {
+      const { client, calls } = createFakeOutboxClient({ lockAcquired: true, claimRows: [] });
+      const pool = { connect: async () => client };
+
+      const result = await processCajaCloseEmailOutboxBatch({ notificationPool: pool });
+
+      assert.equal(result.claimed, 0);
+      const timeoutCall = calls.find((call) => /SET LOCAL statement_timeout/i.test(call.sql));
+      assert.ok(timeoutCall, 'debe fijar statement_timeout antes de reclamar');
+      assert.match(timeoutCall.sql, /SET LOCAL statement_timeout = 5000\b/);
+      const beginIndex = calls.findIndex((call) => /^\s*BEGIN\s*$/i.test(call.sql));
+      const timeoutIndex = calls.indexOf(timeoutCall);
+      const claimIndex = calls.findIndex((call) => /FOR UPDATE SKIP LOCKED/i.test(call.sql));
+      assert.ok(beginIndex < timeoutIndex && timeoutIndex < claimIndex, 'el timeout debe fijarse dentro de la transaccion, antes del claim');
+    });
+
+    it('respeta un claimTimeoutMs explicito, acotado entre 100 y 30000ms', async () => {
+      const { client, calls } = createFakeOutboxClient({ lockAcquired: true, claimRows: [] });
+      const pool = { connect: async () => client };
+
+      await processCajaCloseEmailOutboxBatch({ notificationPool: pool, claimTimeoutMs: 2000 });
+
+      const timeoutCall = calls.find((call) => /SET LOCAL statement_timeout/i.test(call.sql));
+      assert.match(timeoutCall.sql, /SET LOCAL statement_timeout = 2000\b/);
+    });
+
+    it('si el claim excede el timeout, el error se propaga (no se traga) tras hacer ROLLBACK', async () => {
+      const timeoutError = Object.assign(new Error('canceling statement due to statement timeout'), { code: '57014' });
+      const { client, calls } = createFakeOutboxClient({ lockAcquired: true, failClaimWith: timeoutError });
+      const pool = { connect: async () => client };
+
+      await assert.rejects(
+        processCajaCloseEmailOutboxBatch({ notificationPool: pool }),
+        (error) => error.code === '57014'
+      );
+      assert.ok(calls.some((call) => /^\s*ROLLBACK\s*$/i.test(call.sql)), 'debe hacer ROLLBACK tras el timeout de claim');
+    });
+
+    // El lock solo serializa esta transaccion de claim, no "una unica instancia activa"
+    // durante todo el procesamiento -- el envio de correos, fuera de esta transaccion,
+    // puede seguir corriendo en paralelo en varias replicas sobre sus propias filas ya
+    // reclamadas (ver el comentario junto a OUTBOX_ADVISORY_LOCK_KEY en el servicio).
+    it('el claim se serializa entre replicas: si otra ya sostiene el advisory lock, esta se retira sin reclamar filas', async () => {
+      const { client, calls } = createFakeOutboxClient({ lockAcquired: false });
+      const pool = { connect: async () => client };
+
+      const result = await processCajaCloseEmailOutboxBatch({ notificationPool: pool });
+
+      assert.deepEqual(result, { claimed: 0, processed: 0, locked: false });
+      assert.ok(
+        !calls.some((call) => /FOR UPDATE SKIP LOCKED/i.test(call.sql)),
+        'no debe intentar reclamar filas si no obtuvo el advisory lock'
+      );
+      assert.ok(calls.some((call) => /^\s*ROLLBACK\s*$/i.test(call.sql)), 'debe cerrar la transaccion (ROLLBACK) al retirarse sin el lock');
+    });
+
+    it('con el lock disponible, las filas reclamadas siguen procesandose (correos pendientes no se pierden)', async () => {
+      const claimRows = [
+        { id_notificacion: 1, id_cierre_caja: 501, email_destino: null, intentos: 0 },
+        { id_notificacion: 2, id_cierre_caja: 502, email_destino: null, intentos: 0 }
+      ];
+      const { client, calls } = createFakeOutboxClient({ lockAcquired: true, claimRows });
+      const genericQuery = async (sql, params) => { calls.push({ sql: String(sql), params }); return { rows: [] }; };
+      const pool = { connect: async () => client, query: genericQuery };
+
+      const result = await processCajaCloseEmailOutboxBatch({ notificationPool: pool });
+
+      assert.equal(result.claimed, 2);
+      assert.equal(result.processed, 2, 'ambas filas reclamadas deben pasar por el procesamiento (exito o fallo, nunca se descartan)');
+      assert.equal(result.locked, true);
+    });
   });
 });

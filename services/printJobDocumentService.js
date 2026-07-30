@@ -7,6 +7,7 @@ import {
 } from '../routers/ventas/services/kitchenPrintRoutingService.js';
 import { buildVentaTicketPdfBuffer } from '../routers/ventas/services/ventaTicketPdfService.js';
 import { buildComandaCocinaHtml } from './comandaCocinaHtmlService.js';
+import { buildVentaReversionTicketPdfBuffer } from './ventaReversionTicketPdfService.js';
 
 export const LEGACY_CANONICAL_PRINT_SCHEMA_VERSION = 2;
 export const CANONICAL_PRINT_SCHEMA_VERSION = 2;
@@ -73,6 +74,7 @@ const PAYLOAD_KEYS = Object.freeze([
   'documento_canonico'
 ]);
 const SOURCE_KEYS = Object.freeze(['id_factura', 'id_pedido']);
+const REVERSION_SOURCE_KEYS = Object.freeze(['id_factura', 'id_pedido', 'id_reversion']);
 const DOCUMENT_KEYS = Object.freeze(['kind', 'format', 'flavor', 'content_sha256', 'content_bytes']);
 const DATA_ITEM_KEYS = Object.freeze(['type', 'format', 'flavor', 'data', 'options']);
 
@@ -123,11 +125,20 @@ const getDocumentContract = (tipoDocumento) => {
       maxBytes: MAX_CANONICAL_HTML_BYTES
     };
   }
+  if (tipoDocumento === 'reversion') {
+    return {
+      logicalPrinter: 'factura',
+      kind: 'venta_reversion_ticket_pdf',
+      format: 'pdf',
+      flavor: 'base64',
+      maxBytes: MAX_CANONICAL_PDF_BYTES
+    };
+  }
   return null;
 };
 
 export const resolveCanonicalPrintWidth = ({ tipoDocumento, venta = {}, printerConfig = null }) => {
-  if (String(tipoDocumento || '').toLowerCase() === 'factura') {
+  if (['factura', 'reversion'].includes(String(tipoDocumento || '').toLowerCase())) {
     return resolveWidth(venta?.facturacion?.ticket?.ancho_ticket_mm || venta?.ancho_ticket_mm);
   }
   const cocina = (Array.isArray(printerConfig?.impresoras) ? printerConfig.impresoras : [])
@@ -144,17 +155,19 @@ export const validateCanonicalPrintPayload = (payload) => {
   const tipoDocumento = String(payload.tipo_documento || '').trim().toLowerCase();
   const contract = getDocumentContract(tipoDocumento);
   const widthMm = payload.ancho_mm;
+  const expectedSourceKeys = tipoDocumento === 'reversion' ? REVERSION_SOURCE_KEYS : SOURCE_KEYS;
   if (!contract
     || payload.tipo_documento !== tipoDocumento
     || payload.impresora_logica !== contract.logicalPrinter
     || ![58, 80].includes(widthMm)
-    || !hasExactKeys(payload.source, SOURCE_KEYS)
+    || !hasExactKeys(payload.source, expectedSourceKeys)
     || !hasExactKeys(payload.documento_canonico, DOCUMENT_KEYS)) {
     return { ok: false, message: 'Contrato canonico de impresion invalido.' };
   }
 
   const rawIdFactura = payload.source.id_factura;
   const rawIdPedido = payload.source.id_pedido;
+  const rawIdReversion = payload.source.id_reversion;
   const idFactura = Number.isSafeInteger(rawIdFactura) && rawIdFactura > 0
     ? rawIdFactura
     : null;
@@ -165,12 +178,19 @@ export const validateCanonicalPrintPayload = (payload) => {
       : null);
   const facturaFieldValid = rawIdFactura === null || idFactura !== null;
   const pedidoFieldValid = rawIdPedido === null || idPedido !== null;
+  const idReversion = rawIdReversion === undefined
+    ? null
+    : (Number.isSafeInteger(rawIdReversion) && rawIdReversion > 0 ? rawIdReversion : null);
+  const reversionFieldValid = tipoDocumento === 'reversion' ? idReversion !== null : rawIdReversion === undefined;
   const sourceValid = tipoDocumento === 'factura'
     ? idFactura !== null
-    : idFactura !== null || idPedido !== null;
+    : tipoDocumento === 'reversion'
+      ? idFactura !== null && idReversion !== null
+      : idFactura !== null || idPedido !== null;
   const document = payload.documento_canonico;
   if (!facturaFieldValid
     || !pedidoFieldValid
+    || !reversionFieldValid
     || !sourceValid
     || document.kind !== contract.kind
     || document.format !== contract.format
@@ -188,6 +208,7 @@ export const validateCanonicalPrintPayload = (payload) => {
     contract,
     idFactura,
     idPedido,
+    idReversion,
     widthMm,
     schemaVersion: payload.schema_version
   };
@@ -260,6 +281,12 @@ const renderCanonicalDocument = async ({
       throw printDocumentError('PRINT_DOCUMENT_PDF_INVALID', 'El PDF canonico no es valido.');
     }
     data = contentBytes.toString('base64');
+  } else if (tipoDocumento === 'reversion') {
+    contentBytes = await buildVentaReversionTicketPdfBuffer(renderSource);
+    if (!Buffer.isBuffer(contentBytes) || contentBytes.subarray(0, 5).toString('ascii') !== '%PDF-') {
+      throw printDocumentError('PRINT_DOCUMENT_PDF_INVALID', 'El PDF canonico de reversion no es valido.');
+    }
+    data = contentBytes.toString('base64');
   } else {
     data = buildComandaCocinaHtml(renderSource, {
       widthMm,
@@ -296,6 +323,10 @@ export const createCanonicalPrintJob = async ({ tipoDocumento, venta, widthMm })
   const normalizedWidth = resolveWidth(widthMm);
   const idFactura = parsePositiveId(venta?.id_factura);
   const idPedido = parsePositiveId(venta?.id_pedido);
+  const idReversion = parsePositiveId(venta?.id_reversion);
+  const sourceIdFactura = normalizedType === 'reversion'
+    ? parsePositiveId(venta?.id_factura_original)
+    : idFactura;
   const contract = getDocumentContract(normalizedType);
   if (!contract) {
     throw printDocumentError('PRINT_DOCUMENT_TYPE_INVALID', 'Tipo de documento canonico invalido.', 400);
@@ -305,6 +336,9 @@ export const createCanonicalPrintJob = async ({ tipoDocumento, venta, widthMm })
   }
   if (normalizedType === 'comanda' && !idFactura && !idPedido) {
     throw printDocumentError('PRINT_DOCUMENT_SOURCE_INVALID', 'El origen de la comanda es invalido.', 400);
+  }
+  if (normalizedType === 'reversion' && (!idReversion || !sourceIdFactura)) {
+    throw printDocumentError('PRINT_DOCUMENT_REVERSION_INVALID', 'La reversion del documento es invalida.', 400);
   }
 
   const rendered = await renderCanonicalDocument({
@@ -319,8 +353,9 @@ export const createCanonicalPrintJob = async ({ tipoDocumento, venta, widthMm })
     impresora_logica: contract.logicalPrinter,
     ancho_mm: normalizedWidth,
     source: {
-      id_factura: idFactura,
-      id_pedido: idPedido
+      id_factura: sourceIdFactura,
+      id_pedido: idPedido,
+      ...(normalizedType === 'reversion' ? { id_reversion: idReversion } : {})
     },
     documento_canonico: rendered.descriptor
   };
@@ -340,8 +375,13 @@ export const renderCanonicalPrintJobDocument = async ({
   if (!validation.ok) {
     throw printDocumentError('PRINT_DOCUMENT_PAYLOAD_INVALID', validation.message, 400);
   }
-  if (parsePositiveId(venta?.id_factura) !== validation.idFactura
-    || parsePositiveId(venta?.id_pedido) !== validation.idPedido) {
+  const ventaIdFactura = payload.tipo_documento === 'reversion'
+    ? parsePositiveId(venta?.id_factura_original)
+    : parsePositiveId(venta?.id_factura);
+  if (ventaIdFactura !== validation.idFactura
+    || parsePositiveId(venta?.id_pedido) !== validation.idPedido
+    || (payload.tipo_documento === 'reversion'
+      && parsePositiveId(venta?.id_reversion) !== validation.idReversion)) {
     throw printDocumentError('PRINT_DOCUMENT_SOURCE_MISMATCH', 'La fuente del documento no coincide con el trabajo.', 409);
   }
 
@@ -410,7 +450,7 @@ export const getCanonicalPrintDocumentForAgent = async ({
 }) => {
   const result = await db.query(
     `SELECT ti.id_trabajo,ti.id_sucursal,ti.id_agente_tomado,ti.tipo_documento,ti.estado,
-            ti.payload,ti.id_factura,ti.id_pedido,
+            ti.payload,ti.id_factura,ti.id_pedido,ti.id_reversion,
             (lease_expires_at IS NOT NULL AND lease_expires_at > now()) AS lease_active
             ,tid.id_documento AS persisted_document_id
             ,tid.id_trabajo AS persisted_job_id
@@ -445,12 +485,20 @@ export const getCanonicalPrintDocumentForAgent = async ({
   if (!validation.ok
     || job.tipo_documento !== job.payload?.tipo_documento
     || parsePositiveId(job.id_factura) !== validation.idFactura
-    || parsePositiveId(job.id_pedido) !== validation.idPedido) {
+    || parsePositiveId(job.id_pedido) !== validation.idPedido
+    || parsePositiveId(job.id_reversion) !== validation.idReversion) {
     throw printDocumentError('PRINT_DOCUMENT_JOB_MISMATCH', 'El documento no coincide con el trabajo reclamado.', 409);
   }
 
   const persistedDocument = buildPersistedCanonicalDataItem({ job, validation });
   if (persistedDocument) return { job, document: persistedDocument };
+  if (job.tipo_documento === 'reversion') {
+    throw printDocumentError(
+      'PRINT_DOCUMENT_STORED_REQUIRED',
+      'El comprobante canonico de reversion no esta persistido.',
+      409
+    );
+  }
 
   const sourceCache = new Map();
   const loadSource = async ({

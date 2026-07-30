@@ -9,8 +9,6 @@ import {
 import { normalizePedidoPayload } from '../../../services/pedidoPayloadValidator.js';
 import { resolvePedidoConsumo } from '../../../services/pedidoConsumoResolver.js';
 import { buildSalsaConsumptionItemsFromPedidoDetails } from '../../../services/salsasPedidoSnapshotService.js';
-import { buildSalsaInventorySnapshotsForReturn } from '../../../services/ventasReversionService.js';
-import { buildPedidoMovementReturnRows } from '../../../services/ventasReversionService.js';
 import {
   buildSalsaConsumptionSnapshot,
   restoreSalsasInventoryFromSnapshots
@@ -364,33 +362,16 @@ describe('ventas bulk recipe quantity payload', () => {
     assert.equal(result.items[0].snapshot.porciones_total, 198);
   });
 
-  it('revierte exactamente el total persistido proporcional a la cantidad revertida', () => {
-    const snapshots = buildSalsaInventorySnapshotsForReturn([
-      {
-        cantidad_revertida: 99,
-        origen_snapshot: {
-          cantidad: 99,
-          componentes: {
-            seleccion: [{
-              id_salsa: 5,
-              inventario: {
-                id_salsa: 5,
-                id_insumo: 400,
-                id_almacen: 3,
-                cantidad_base_total: 49.5,
-                porciones: 2,
-                porciones_total: 198,
-                cantidad_linea: 99
-              }
-            }]
-          }
-        }
-      }
-    ]);
-
-    assert.equal(snapshots.length, 1);
-    assert.equal(snapshots[0].cantidad_base_total, 49.5);
-  });
+  // NOTA (Fase 3, correccion final): buildSalsaInventorySnapshotsForReturn
+  // y el respaldo ambiguo por snapshot (agrupaba por id_insumo+id_almacen,
+  // sin id_detalle_pedido) fueron eliminados por completo de
+  // services/ventasReversionService.js -- ya no se usan en el flujo de
+  // reversion. Ver hasSalsaInventoryConsumptionEvidence en
+  // routers/ventas/services/ventasReversionCalculationService.js, que
+  // ahora exige movimiento original exacto para cualquier linea con
+  // evidencia de consumo de salsa/complemento (igual que PRODUCTO/RECETA),
+  // y routers/ventas/services/ventasReversionInventoryService.js, que
+  // ejecuta esa devolucion por id_detalle_pedido.
 
   it('registra entrada de reversion por la misma cantidad total del snapshot', async () => {
     const queries = [];
@@ -417,21 +398,13 @@ describe('ventas bulk recipe quantity payload', () => {
     assert.equal(insert.params[0], 198);
   });
 
-  it('construye devoluciones proporcionales desde movimientos originales del pedido', () => {
-    const rows = buildPedidoMovementReturnRows({
-      movements: [
-        { cantidad: 198, id_almacen: 1, id_producto: 10, id_insumo: null },
-        { cantidad: 49.5, id_almacen: 2, id_producto: null, id_insumo: 400 }
-      ],
-      lineas: [
-        { cantidad_vendida: 99, cantidad_revertida: 33 }
-      ]
-    });
-
-    assert.equal(rows.length, 2);
-    assert.equal(rows[0].cantidad, 66);
-    assert.equal(rows[1].cantidad, 16.5);
-  });
+  // NOTA (Fase 3): buildPedidoMovementReturnRows y el algoritmo de ratio
+  // global de pedido que probaba esta prueba fueron eliminados por
+  // completo de services/ventasReversionService.js -- ver
+  // routers/ventas/services/ventasReversionInventoryService.js, que
+  // reemplaza ese calculo por devolucion de inventario POR LINEA
+  // (id_detalle_pedido), cubierto por
+  // services/__tests__/ventasReversionInventoryService.test.mjs.
 
   it('bloquea venta transaccional por receta sin componentes sin crear registros parciales', async () => {
     const client = makeTransactionClient({ recipeComponents: [] });

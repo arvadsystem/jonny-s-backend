@@ -225,6 +225,111 @@ const buildManualMovementSection = (title, rows = []) => [
   }
 ];
 
+const buildReversionTableBody = (rows = []) => {
+  const body = [[
+    { text: 'Hora', style: 'tableHeader' },
+    { text: 'Codigo REV', style: 'tableHeader' },
+    { text: 'Venta', style: 'tableHeader' },
+    { text: 'Tipo / resultado', style: 'tableHeader' },
+    { text: 'Detalle', style: 'tableHeader' },
+    { text: 'Motivo', style: 'tableHeader' },
+    { text: 'Monto', style: 'tableHeader', alignment: 'right' },
+    { text: 'Usuario', style: 'tableHeader' }
+  ]];
+  if (!Array.isArray(rows) || rows.length === 0) {
+    body.push([
+      { text: 'Sin reversiones de venta registradas en esta sesion.', colSpan: 8, color: '#667085' },
+      {}, {}, {}, {}, {}, {}, {}
+    ]);
+    return body;
+  }
+  rows.forEach((row) => body.push([
+    formatCajaCierreDateTime(row.hora),
+    cleanText(row.codigo_reversion, 'N/A'),
+    cleanText(row.venta_original, 'N/A'),
+    `${cleanText(row.tipo, 'N/A')} / ${cleanText(row.resultado_acumulado, 'No confirmado')}`,
+    cleanText(row.detalle, 'Sin detalle'),
+    cleanText(
+      [row.motivo, row.observacion].filter(Boolean).join(' - '),
+      'N/A'
+    ),
+    { text: formatMoney(row.monto), alignment: 'right', noWrap: true },
+    cleanText(row.usuario, 'No disponible')
+  ]));
+  return body;
+};
+
+const buildRedemptionTableBody = (rows = []) => {
+  const body = [[
+    { text: 'Hora', style: 'tableHeader' },
+    { text: 'Codigo', style: 'tableHeader' },
+    { text: 'Cliente', style: 'tableHeader' },
+    { text: 'Productos', style: 'tableHeader' },
+    { text: 'Puntos', style: 'tableHeader', alignment: 'right' },
+    { text: 'Estado', style: 'tableHeader' },
+    { text: 'Usuario', style: 'tableHeader' }
+  ]];
+  if (!Array.isArray(rows) || rows.length === 0) {
+    body.push([
+      { text: 'Sin canjes de Fidelizacion registrados en esta sesion.', colSpan: 7, color: '#667085' },
+      {}, {}, {}, {}, {}, {}
+    ]);
+    return body;
+  }
+  rows.forEach((row) => body.push([
+    formatCajaCierreDateTime(row.hora),
+    cleanText(row.codigo_canje, 'N/A'),
+    cleanText(row.cliente, 'No disponible'),
+    cleanText(row.productos, 'Sin productos'),
+    { text: String(Number(row.puntos || 0)), alignment: 'right' },
+    cleanText(row.estado, 'N/A'),
+    cleanText(row.usuario, 'No disponible')
+  ]));
+  return body;
+};
+
+const buildReversionSection = (section = {}) => {
+  const summary = section.resumen || {};
+  return [
+    { text: 'Reversiones de venta', style: 'section' },
+    {
+      text: `Parciales: ${Number(summary.cantidad_parciales || 0)} | Totales: ${Number(summary.cantidad_totales || 0)} | Monto total: ${formatMoney(summary.monto_total_reversado)}`,
+      margin: [0, 0, 0, 6]
+    },
+    {
+      fontSize: 6.5,
+      table: {
+        headerRows: 1,
+        dontBreakRows: true,
+        widths: ['9%', '10%', '10%', '11%', '20%', '15%', '11%', '14%'],
+        body: buildReversionTableBody(section.items)
+      },
+      layout: 'lightHorizontalLines'
+    }
+  ];
+};
+
+const buildRedemptionSection = (section = {}) => {
+  const summary = section.resumen || {};
+  return [
+    { text: 'Canjes de Fidelizacion', style: 'section' },
+    {
+      text: `Cantidad: ${Number(summary.cantidad_canjes || 0)} | Puntos canjeados: ${Number(summary.total_puntos_canjeados || 0)}`,
+      margin: [0, 0, 0, 6]
+    },
+    {
+      fontSize: 7,
+      table: {
+        headerRows: 1,
+        dontBreakRows: true,
+        widths: ['11%', '12%', '16%', '27%', '9%', '11%', '14%'],
+        body: buildRedemptionTableBody(section.items)
+      },
+      layout: 'lightHorizontalLines'
+    }
+  ];
+};
+
 export const buildCajaCierrePdfFilename = (idCierreCaja) =>
   `cierre-caja-${cierreCode(idCierreCaja)}.pdf`;
 
@@ -337,6 +442,8 @@ export const buildCajaCierrePdfDefinition = (payload = {}) => {
       },
       ...buildManualMovementSection('Ingresos manuales', payload.movimientosManuales?.ingresos),
       ...buildManualMovementSection('Egresos manuales', payload.movimientosManuales?.egresos),
+      ...buildReversionSection(payload.reversiones),
+      ...buildRedemptionSection(payload.canjes_fidelizacion),
       {
         text: 'Este reporte forma parte del control interno de caja.',
         margin: [0, 14, 0, 0],

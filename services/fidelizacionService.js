@@ -1,7 +1,8 @@
 import pool from '../config/db-connection.js';
 import { getClientIp } from '../utils/security/clientInfo.js';
+import { normalizePhoneHN } from '../utils/security/personasHardening.js';
+import { computeAccumulationPoints } from '../modules/fidelizacion/domain/pointsCalculator.js';
 
-const CLIENT_ROLE_NAME = 'CLIENTE';
 const TEGUCIGALPA_TIMEZONE = 'America/Tegucigalpa';
 
 const hasBitacorasCache = {
@@ -9,11 +10,80 @@ const hasBitacorasCache = {
   value: false
 };
 
+// Mismo nombre de columna que routers/clientes.js (CLIENTE_EMPRESA_RELATION_FIELD):
+// algunos entornos ya tienen clientes.id_empresa_cliente, otros todavia
+// resuelven la relacion cliente->empresa via clientes.id_empresa. Se detecta
+// una sola vez (cache de proceso) para no asumir un esquema fijo.
+const CLIENTE_EMPRESA_RELATION_FIELD = 'id_empresa_cliente';
+const clienteEmpresaRelationCache = {
+  loaded: false,
+  hasField: false
+};
+
+const loadHasClienteEmpresaRelationField = async (queryRunner = pool) => {
+  if (!clienteEmpresaRelationCache.loaded) {
+    const result = await queryRunner.query(
+      `
+        SELECT 1
+        FROM information_schema.columns
+        WHERE table_schema = 'public' AND table_name = 'clientes' AND column_name = $1
+        LIMIT 1
+      `,
+      [CLIENTE_EMPRESA_RELATION_FIELD]
+    );
+    clienteEmpresaRelationCache.loaded = true;
+    clienteEmpresaRelationCache.hasField = result.rowCount > 0;
+  }
+
+  return clienteEmpresaRelationCache.hasField;
+};
+
+// Fragmento SQL (no parametrizado: solo puede valer uno de dos literales
+// internos, nunca datos de entrada) para resolver el id_empresa real de un
+// cliente tipo empresa, igual que empresaRelationExpr en routers/clientes.js.
+export const buildClienteEmpresaRelationSql = async (client, alias = 'c') => {
+  const hasField = await loadHasClienteEmpresaRelationField(client);
+  return hasField
+    ? `COALESCE(${alias}.${CLIENTE_EMPRESA_RELATION_FIELD}, CASE WHEN ${alias}.id_persona IS NULL THEN ${alias}.id_empresa ELSE NULL END)`
+    : `${alias}.id_empresa`;
+};
+
 const normalizeText = (value) => String(value ?? '').trim();
 
 const parsePositiveInt = (value) => {
   const parsed = Number.parseInt(String(value ?? ''), 10);
   return Number.isInteger(parsed) && parsed > 0 ? parsed : null;
+};
+
+// parsePositiveInt (arriba) usa Number.parseInt, que trunca y se detiene en
+// el primer caracter no numerico: "156abc" -> 156, "1.5" -> 1, "2 OR 1=1" -> 2.
+// Eso no es una brecha de SQL injection (todo sigue parametrizado), pero es
+// un problema de integridad: una entrada invalida se convierte en silencio
+// en una operacion valida distinta (otro id_producto, otra cantidad). Este
+// parser estricto exige que TODO el valor sea un entero positivo puro antes
+// de aceptarlo -- usado para id_cliente, id_sucursal, id_producto, cantidad
+// y puntos_requeridos_override en el flujo de canje (bloqueante de
+// integridad de la auditoria independiente). No reemplaza parsePositiveInt
+// globalmente (evita auditar/romper sus otros usos existentes en este
+// archivo); es un helper nuevo y separado.
+const parseStrictPositiveInt = (value) => {
+  // Rechaza arreglos y objetos explicitamente: String(['1']) === '1' pasaria
+  // el regex de abajo si no se filtra el tipo primero (p.ej. id_producto[]=1).
+  if (value !== null && typeof value === 'object') return null;
+
+  // Number.isSafeInteger (no solo Number.isInteger) en AMBAS ramas: un
+  // number que ya perdio precision en JS (p.ej. Number.MAX_SAFE_INTEGER + 1,
+  // que sigue siendo "entero" segun Number.isInteger pero ya no representa
+  // un valor exacto) tampoco debe aceptarse como id/cantidad valido.
+  if (typeof value === 'number') {
+    return Number.isSafeInteger(value) && value > 0 ? value : null;
+  }
+
+  const normalized = String(value ?? '').trim();
+  if (!/^\d+$/.test(normalized)) return null;
+
+  const parsed = Number(normalized);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : null;
 };
 
 const parseNonNegativeInt = (value) => {
@@ -24,6 +94,72 @@ const parseNonNegativeInt = (value) => {
 const parsePositiveNumber = (value) => {
   const parsed = Number(value);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+};
+
+// lempiras_por_punto tambien se usa para calcular canjes, asi que debe seguir
+// siendo > 0 en TODA configuracion guardada, independiente del switch de
+// acumulacion. Reglas:
+// - Si el payload trae el campo (inputProvided=true) pero no es un numero
+//   valido > 0 (0, negativo, NaN, no numerico), es invalido: nunca se cae de
+//   forma silenciosa a la tasa anterior.
+// - Si el payload omite el campo, se conserva la tasa anterior (siempre que
+//   sea > 0); si no hay configuracion previa, tambien es invalido (no hay
+//   tasa valida que conservar para la primera configuracion de la sucursal).
+const resolveEffectiveLempirasPorPunto = ({ inputProvided, inputValue, previousConfig }) => {
+  if (inputProvided) {
+    return inputValue ? { ok: true, value: inputValue } : { ok: false };
+  }
+
+  const previousValue = Number(previousConfig?.lempiras_por_punto);
+  if (Number.isFinite(previousValue) && previousValue > 0) {
+    return { ok: true, value: previousValue };
+  }
+
+  return { ok: false };
+};
+
+// Decide si guardar una configuracion exige que el usuario confirme
+// explicitamente la equivalencia de la tasa (confirmar_equivalencia).
+//
+// Contexto del defecto: lempiras_por_punto significa "cuantos lempiras hacen
+// falta para ganar 1 punto" (puntos = floor(total / tasa)). Un usuario lo
+// interpreto al reves y guardo 0.01, con lo que una compra de L 1,130.00
+// acumulo 113,000 puntos. La formula era correcta; lo ambiguo era el campo.
+// Por eso se exige una confirmacion explicita cuando la tasa se establece por
+// primera vez o cambia de valor.
+//
+// La comparacion es NUMERICA, no textual: la columna es numeric y el driver
+// de PostgreSQL puede devolverla como string, asi que 100, "100" y "100.00"
+// son exactamente la misma tasa y NO deben volver a pedir confirmacion (un
+// guardado que solo toca productos canjeables o el switch no debe convertirse
+// en una confirmacion innecesaria). Se centraliza aqui para que exista una
+// sola definicion de "la tasa cambio".
+export const isSameLempirasPorPuntoRate = (a, b) => {
+  const left = Number(a);
+  const right = Number(b);
+  if (!Number.isFinite(left) || !Number.isFinite(right)) return false;
+  return left === right;
+};
+
+// requiresRateConfirmation: true cuando no hay configuracion previa (primera
+// tasa de la sucursal) o cuando la tasa efectiva difiere de la vigente.
+export const requiresRateConfirmation = ({ previousConfig, nextLempirasPorPunto }) => {
+  if (!previousConfig) return true;
+  return !isSameLempirasPorPuntoRate(previousConfig.lempiras_por_punto, nextLempirasPorPunto);
+};
+
+// Confirmacion estrictamente booleana: "true", 1, "1", {} y [] NO valen. Un
+// cliente que no sea la interfaz oficial no debe poder saltarse la
+// confirmacion enviando un valor "parecido a verdadero".
+export const isExplicitRateConfirmation = (value) => value === true;
+
+// Compatibilidad con payloads antiguos: si el switch se omite y ya existe
+// configuracion previa, se conserva su valor (nunca se apaga en silencio);
+// solo se usa false cuando de verdad es la primera configuracion.
+const resolveEffectiveAcumulacionHabilitada = ({ inputProvided, inputValue, previousConfig }) => {
+  if (inputProvided) return Boolean(inputValue);
+  if (previousConfig) return Boolean(previousConfig.acumulacion_habilitada);
+  return false;
 };
 
 const roundMoney = (value) => Number(Number(value || 0).toFixed(2));
@@ -150,7 +286,15 @@ const resolveFidelizacionCatalogs = async (client) => {
   };
 };
 
-export const getActiveFidelizacionConfig = async (client, idSucursal) => {
+// referenceDate es opcional.
+// - referenceDate null (canje presencial, configuracion administrativa):
+//   busca la configuracion ACTUAL, exige estado=true y vigencia HOY.
+// - referenceDate presente (acumulacion por factura pagada): busca la
+//   configuracion cuya ventana de vigencia incluia esa fecha, SIN exigir
+//   estado=true, porque una configuracion historica puede haber sido
+//   desactivada despues sin que eso deba reescribir lo que aplico en su
+//   momento a una factura ya pagada.
+export const getActiveFidelizacionConfig = async (client, idSucursal, referenceDate = null) => {
   const sucursalId = parsePositiveInt(idSucursal);
   if (!sucursalId) return null;
 
@@ -160,6 +304,7 @@ export const getActiveFidelizacionConfig = async (client, idSucursal) => {
         fcs.id_configuracion,
         fcs.id_sucursal,
         fcs.lempiras_por_punto,
+        fcs.acumulacion_habilitada,
         fcs.vigente_desde,
         fcs.vigente_hasta,
         fcs.estado,
@@ -168,13 +313,29 @@ export const getActiveFidelizacionConfig = async (client, idSucursal) => {
         fcs.fecha_actualizacion
       FROM public.fidelizacion_configuracion_sucursal fcs
       WHERE fcs.id_sucursal = $1
-        AND COALESCE(fcs.estado, true) = true
-        AND fcs.vigente_desde <= NOW()
-        AND (fcs.vigente_hasta IS NULL OR fcs.vigente_hasta > NOW())
+        AND ($2::timestamptz IS NOT NULL OR COALESCE(fcs.estado, true) = true)
+        -- vigente_desde/vigente_hasta son 'timestamp without time zone' que
+        -- guardan HORA UTC: se escriben con NOW() a secas (ver saveConfiguracion
+        -- en routers/fidelizacion.js) y PostgreSQL castea timestamptz ->
+        -- timestamp con el TimeZone de la sesion, que es UTC. Se declara esa
+        -- zona explicitamente (AT TIME ZONE 'UTC' -> timestamptz) en vez de
+        -- confiar en el cast implicito: asi la comparacion es siempre entre
+        -- instantes reales equivalentes y deja de depender del TimeZone de la
+        -- sesion/servidor. La fecha de referencia ($2) ya llega como instante
+        -- absoluto desde el punto canonico de conversion
+        -- (FACTURA_REFERENCE_INSTANT_SQL en modules/fidelizacion/infrastructure/
+        -- fidelizacionRepository.js), asi que aqui NO se vuelve a convertir.
+        -- Semantica de vigencia intacta: vigente_desde inclusivo (<=),
+        -- vigente_hasta exclusivo (>).
+        AND (fcs.vigente_desde AT TIME ZONE 'UTC') <= COALESCE($2::timestamptz, NOW())
+        AND (
+          fcs.vigente_hasta IS NULL
+          OR (fcs.vigente_hasta AT TIME ZONE 'UTC') > COALESCE($2::timestamptz, NOW())
+        )
       ORDER BY fcs.vigente_desde DESC, fcs.id_configuracion DESC
       LIMIT 1
     `,
-    [sucursalId]
+    [sucursalId, referenceDate || null]
   );
 
   return result.rows[0] || null;
@@ -240,28 +401,162 @@ const syncLegacyClientePoints = async (client, idCliente, puntosDisponibles) => 
   );
 };
 
-const isClienteUsuarioElegible = async (client, idCliente) => {
+// Elegibilidad por PERFIL del cliente (no por usuario/rol): activo, con
+// nombre valido (persona.nombre o empresa.nombre_empresa segun el tipo de
+// cliente) y con un telefono asociado mediante la relacion real del modelo
+// actual (personas/empresas -> telefonos). No exige apellido, correo, ni que
+// el cliente tenga usuario o rol CLIENTE.
+export const fetchClienteProfileForFidelizacion = async (client, idCliente) => {
+  const clienteId = parsePositiveInt(idCliente);
+  if (!clienteId) return null;
+
+  const empresaRelationExpr = await buildClienteEmpresaRelationSql(client, 'c');
+
   const result = await client.query(
     `
-      SELECT 1
-      FROM public.usuarios_clientes uc
-      INNER JOIN public.usuarios u
-        ON u.id_usuario = uc.id_usuario
-       AND u.id_cliente = uc.id_cliente
-      INNER JOIN public.roles_usuarios ru
-        ON ru.id_usuario = u.id_usuario
-      INNER JOIN public.roles r
-        ON r.id_rol = ru.id_rol
-      WHERE uc.id_cliente = $1
-        AND COALESCE(uc.estado, true) = true
-        AND COALESCE(u.estado, false) = true
-        AND UPPER(TRIM(r.nombre)) = $2
+      SELECT
+        c.id_cliente,
+        COALESCE(c.estado, true) AS estado,
+        CASE WHEN c.id_persona IS NOT NULL THEN p.nombre ELSE e.nombre_empresa END AS nombre,
+        CASE WHEN c.id_persona IS NOT NULL THEN telf_p.telefono ELSE telf_e.telefono END AS telefono
+      FROM public.clientes c
+      LEFT JOIN public.personas p ON p.id_persona = c.id_persona
+      LEFT JOIN public.telefonos telf_p ON telf_p.id_telefono = p.id_telefono
+      LEFT JOIN public.empresas e ON e.id_empresa = ${empresaRelationExpr}
+      LEFT JOIN public.telefonos telf_e ON telf_e.id_telefono = e.id_telefono
+      WHERE c.id_cliente = $1
       LIMIT 1
     `,
-    [idCliente, CLIENT_ROLE_NAME]
+    [clienteId]
   );
 
-  return result.rowCount > 0;
+  return result.rows[0] || null;
+};
+
+// normalizePhoneHN es la funcion canonica de normalizacion de telefono ya
+// existente en el proyecto (utils/security/personasHardening.js), reutilizada
+// aqui tal cual. Nombre valido = no vacio tras trim; no se exige formato de
+// nombre (eso ya lo valida el alta de personas/empresas, no fidelizacion).
+export const isClienteProfileComplete = (profile) => {
+  if (!profile) return false;
+  const nombreValido = normalizeText(profile.nombre).length > 0;
+  const telefonoValido = Boolean(normalizePhoneHN(profile.telefono));
+  return Boolean(profile.estado) && nombreValido && telefonoValido;
+};
+
+// Fase 4 (seccion 3.6): sonda de esquema para fidelizacion_ajustes_pendientes,
+// consistente con el patron hasColumn/hasTable ya usado en Fase 3
+// (routers/cocina.js, routers/ventas/services/ventasReversionInventoryService.js).
+// Cacheada por proceso: la tabla no aparece/desaparece en caliente durante
+// la vida de un mismo proceso Node.
+let ajustesPendientesTableExistsCache = null;
+const hasFidelizacionAjustesPendientesTable = async (client) => {
+  if (ajustesPendientesTableExistsCache !== null) return ajustesPendientesTableExistsCache;
+  const result = await client.query('SELECT to_regclass($1) AS reg', ['public.fidelizacion_ajustes_pendientes']);
+  ajustesPendientesTableExistsCache = Boolean(result.rows?.[0]?.reg);
+  return ajustesPendientesTableExistsCache;
+};
+
+// Catalogos obligatorios de compensacion
+// (COMPENSACION/AJUSTE_PENDIENTE). Se leen sin LIMIT para detectar
+// configuraciones ambiguas por codigo normalizado.
+const resolveCompensationCatalogs = async (client) => {
+  const [types, origins] = await Promise.all([
+    client.query(
+      `
+        SELECT id_tipo_movimiento AS id_catalogo, estado
+        FROM public.cat_fidelizacion_tipos_movimiento
+        WHERE UPPER(TRIM(codigo)) = UPPER(TRIM($1))
+        ORDER BY id_tipo_movimiento
+        FOR SHARE
+      `,
+      ['COMPENSACION']
+    ),
+    client.query(
+      `
+        SELECT id_origen_movimiento AS id_catalogo, estado
+        FROM public.cat_fidelizacion_origenes_movimiento
+        WHERE UPPER(TRIM(codigo)) = UPPER(TRIM($1))
+        ORDER BY id_origen_movimiento
+        FOR SHARE
+      `,
+      ['AJUSTE_PENDIENTE']
+    )
+  ]);
+  const type = types.rows?.[0];
+  const origin = origins.rows?.[0];
+  if (
+    types.rows?.length !== 1
+    || origins.rows?.length !== 1
+    || type?.estado === false
+    || origin?.estado === false
+  ) {
+    throw createFidelizacionError(
+      409,
+      'FIDELIZACION_SCHEMA_PENDIENTE',
+      'Los catalogos de compensacion de fidelizacion no estan configurados de forma unica y activa.'
+    );
+  }
+  return {
+    tipoCompensacionId: Number(type.id_catalogo),
+    origenAjustePendienteId: Number(origin.id_catalogo)
+  };
+};
+
+/**
+ * Compensacion FIFO (seccion 3.6 del ticket): antes de que una acumulacion
+ * aumente puntos_disponibles, se bloquean (FOR UPDATE) los ajustes
+ * pendientes del cliente en orden fecha_creacion ASC, id_ajuste ASC, y los
+ * puntos nuevos se aplican primero a la deuda mas antigua. Solo el
+ * remanente (si sobra algo despues de saldar toda la deuda) aumenta el
+ * saldo disponible real.
+ */
+const applyFifoCompensation = async ({ client, idCliente, puntosDisponiblesParaCompensar }) => {
+  let remaining = Number(puntosDisponiblesParaCompensar || 0);
+  if (remaining <= 0) return { compensado: 0, ajustesTocados: [] };
+
+  const result = await client.query(
+    `
+      SELECT id_ajuste, puntos_recuperados, puntos_pendientes, estado
+      FROM public.fidelizacion_ajustes_pendientes
+      WHERE id_cliente = $1
+        AND estado IN ('PENDIENTE', 'PARCIALMENTE_RECUPERADO')
+      ORDER BY fecha_creacion ASC, id_ajuste ASC
+      FOR UPDATE
+    `,
+    [idCliente]
+  );
+
+  const ajustesTocados = [];
+  const hasCompensableDebt = result.rows.some((row) => Number(row.puntos_pendientes || 0) > 0);
+  const catalogs = hasCompensableDebt ? await resolveCompensationCatalogs(client) : null;
+  for (const ajuste of result.rows) {
+    if (remaining <= 0) break;
+    const pendienteActual = Number(ajuste.puntos_pendientes || 0);
+    if (pendienteActual <= 0) continue;
+
+    const compensar = Math.min(remaining, pendienteActual);
+    if (compensar <= 0) continue;
+
+    const nuevoRecuperados = Number(ajuste.puntos_recuperados || 0) + compensar;
+    const nuevoPendientes = pendienteActual - compensar;
+    const nuevoEstado = nuevoPendientes === 0 ? 'RECUPERADO' : 'PARCIALMENTE_RECUPERADO';
+
+    await client.query(
+      `
+        UPDATE public.fidelizacion_ajustes_pendientes
+        SET puntos_recuperados = $1, puntos_pendientes = $2, estado = $3, fecha_actualizacion = NOW()
+        WHERE id_ajuste = $4
+      `,
+      [nuevoRecuperados, nuevoPendientes, nuevoEstado, Number(ajuste.id_ajuste)]
+    );
+
+    remaining -= compensar;
+    ajustesTocados.push({ id_ajuste: Number(ajuste.id_ajuste), compensado: compensar });
+  }
+
+  const compensado = ajustesTocados.reduce((sum, entry) => sum + entry.compensado, 0);
+  return { compensado, ajustesTocados, catalogs };
 };
 
 const registerFidelizacionMovement = async (client, payload) => {
@@ -342,7 +637,31 @@ const addSaldoPoints = async ({
   const saldoAnterior = Number(saldo.puntos_disponibles || 0);
   const acumuladosActuales = Number(saldo.puntos_acumulados_total || 0);
   const canjeadosActuales = Number(saldo.puntos_canjeados_total || 0);
-  const nextSaldo = saldoAnterior + Number(puntosDelta || 0);
+  const isAccumulation = Number(puntosDelta || 0) > 0;
+
+  // Fase 4 (seccion 3.6): compensacion FIFO. SOLO se aplica sobre
+  // acumulaciones (puntosDelta > 0), nunca sobre canjes -- un canje ya
+  // exige saldo disponible suficiente y no debe verse afectado por deuda
+  // de una reversion anterior. Si fidelizacion_ajustes_pendientes no
+  // existe todavia (migracion no aplicada), se omite por completo y el
+  // comportamiento es identico al anterior a Fase 4.
+  let compensacion = { compensado: 0, ajustesTocados: [], catalogs: null };
+  if (isAccumulation && (await hasFidelizacionAjustesPendientesTable(client))) {
+    compensacion = await applyFifoCompensation({
+      client,
+      idCliente,
+      puntosDisponiblesParaCompensar: Number(puntosDelta)
+    });
+  }
+
+  // saldoIntermedio: saldo conceptual tras la acumulacion/canje ANTES de
+  // aplicar la compensacion (saldo_nuevo del movimiento principal).
+  // nextSaldo: saldo REAL final, unica escritura real a
+  // fidelizacion_saldos_cliente. Cuando compensacion.compensado===0 (todo
+  // canje, y toda acumulacion sin deuda pendiente) ambos coinciden y el
+  // comportamiento es exactamente el mismo que antes de Fase 4.
+  const saldoIntermedio = saldoAnterior + Number(puntosDelta || 0);
+  const nextSaldo = saldoIntermedio - compensacion.compensado;
 
   if (nextSaldo < 0) {
     throw createFidelizacionError(
@@ -352,8 +671,13 @@ const addSaldoPoints = async ({
     );
   }
 
-  const accumulatedDelta = puntosDelta > 0 ? Number(puntosDelta) : 0;
-  const redeemedDelta = puntosDelta < 0 ? Math.abs(Number(puntosDelta)) : 0;
+  // puntos_acumulados_total: significado HISTORICO ("total ganado alguna
+  // vez"), nunca reducido por compensar una deuda -- el cliente si gano
+  // estos puntos; la deuda es de una reversion PREVIA, ya reflejada en su
+  // propio momento (ver applyLoyaltyReversalForFactura). Por eso usa el
+  // delta COMPLETO (Number(puntosDelta)), no el remanente tras compensar.
+  const accumulatedDelta = isAccumulation ? Number(puntosDelta) : 0;
+  const redeemedDelta = !isAccumulation ? Math.abs(Number(puntosDelta)) : 0;
 
   await client.query(
     `
@@ -381,31 +705,46 @@ const addSaldoPoints = async ({
     id_tipo_movimiento: movementIds.idTipoMovimiento,
     puntos_delta: Number(puntosDelta),
     saldo_anterior: saldoAnterior,
-    saldo_nuevo: nextSaldo,
+    saldo_nuevo: saldoIntermedio,
     id_origen_movimiento: movementIds.idOrigenMovimiento,
     id_factura: idFactura,
     id_pedido: idPedido,
     id_canje: idCanje,
-    observacion,
+    observacion: compensacion.compensado > 0
+      ? `${observacion || ''} (Compensacion FIFO: ${compensacion.compensado} pts aplicados a ajuste(s) pendiente(s) #${compensacion.ajustesTocados.map((t) => t.id_ajuste).join(', #')}.)`.trim()
+      : observacion,
     id_usuario_ejecutor: idUsuarioEjecutor
   });
+
+  let idMovimientoCompensacion = null;
+  if (compensacion.compensado > 0) {
+    idMovimientoCompensacion = await registerFidelizacionMovement(client, {
+      id_cliente: idCliente,
+      id_sucursal: idSucursal,
+      id_tipo_movimiento: compensacion.catalogs.tipoCompensacionId,
+      puntos_delta: compensacion.compensado * -1,
+      saldo_anterior: saldoIntermedio,
+      saldo_nuevo: nextSaldo,
+      id_origen_movimiento: compensacion.catalogs.origenAjustePendienteId,
+      id_factura: idFactura,
+      id_pedido: idPedido,
+      id_canje: idCanje,
+      observacion: `Compensacion FIFO de ${compensacion.compensado} pts contra ajuste(s) pendiente(s) #${compensacion.ajustesTocados.map((t) => t.id_ajuste).join(', #')}.`,
+      id_usuario_ejecutor: idUsuarioEjecutor
+    });
+  }
 
   return {
     idMovimiento: movementId,
     saldoAnterior,
-    saldoNuevo: nextSaldo
+    saldoNuevo: nextSaldo,
+    puntosCompensados: compensacion.compensado,
+    idMovimientoCompensacion
   };
 };
 
 const buildVentaNumero = (idFactura) => `VTA-${String(idFactura).padStart(5, '0')}`;
 const buildCanjeNumero = (idCanje) => `CAN-${String(idCanje).padStart(5, '0')}`;
-
-const computeAccumulationPoints = (montoFactura, lempirasPorPunto) => {
-  const total = Number(montoFactura || 0);
-  const ratio = Number(lempirasPorPunto || 0);
-  if (!Number.isFinite(total) || !Number.isFinite(ratio) || total <= 0 || ratio <= 0) return 0;
-  return Math.floor(total / ratio);
-};
 
 const computeRedemptionPoints = (precioProducto, lempirasPorPunto) => {
   const price = Number(precioProducto || 0);
@@ -414,6 +753,15 @@ const computeRedemptionPoints = (precioProducto, lempirasPorPunto) => {
   return Math.ceil(price / ratio);
 };
 
+// eligibilitySnapshot (opcional): evidencia historica capturada al momento
+// del pago (ver modules/fidelizacion/application/reservePaidInvoiceAccumulation.js).
+// Cuando viene, la elegibilidad sale de ahi y NO se consulta el perfil actual
+// del cliente -es lo que impide que completar el perfil despues otorgue
+// puntos retroactivos, y lo que permite acumular a un cliente del menu
+// publico cuyo telefono solo existe en pedidos_contacto-.
+// Cuando no viene, se conserva el comportamiento historico (consultar el
+// perfil vigente), que es el correcto para llamadas directas y para las
+// pruebas que ejercitan esta funcion de forma aislada.
 export const registerFacturaLoyaltyAccumulation = async ({
   client,
   idFactura,
@@ -421,7 +769,9 @@ export const registerFacturaLoyaltyAccumulation = async ({
   idCliente = null,
   idSucursal = null,
   idUsuarioEjecutor = null,
-  montoFactura = 0
+  montoFactura = 0,
+  referenceDate = null,
+  eligibilitySnapshot = null
 }) => {
   const facturaId = parsePositiveInt(idFactura);
   const clienteId = parsePositiveInt(idCliente);
@@ -455,14 +805,28 @@ export const registerFacturaLoyaltyAccumulation = async ({
     };
   }
 
-  const clienteElegible = await isClienteUsuarioElegible(client, clienteId);
-  if (!clienteElegible) {
-    return { created: false, reason: 'CLIENT_NOT_ELIGIBLE' };
+  // Elegibilidad: snapshot historico si lo hay, perfil vigente si no. Este
+  // camino es SOLO LECTURA -jamas escribe en telefonos/personas/empresas-.
+  // Una escritura fallida aqui (p.ej. el UNIQUE de telefonos.telefono)
+  // abortaria toda la transaccion en PostgreSQL y ningun try/catch de JS la
+  // recuperaria, dejando la acumulacion rota de forma silenciosa.
+  const perfilCompleto = eligibilitySnapshot
+    ? Boolean(eligibilitySnapshot.perfilCompletoSnapshot)
+    : isClienteProfileComplete(await fetchClienteProfileForFidelizacion(client, clienteId));
+
+  if (!perfilCompleto) {
+    return { created: false, reason: 'CLIENT_PROFILE_INCOMPLETE' };
   }
 
-  const activeConfig = await getActiveFidelizacionConfig(client, sucursalId);
+  const activeConfig = await getActiveFidelizacionConfig(client, sucursalId, referenceDate);
   if (!activeConfig) {
     return { created: false, reason: 'CONFIG_NOT_FOUND' };
+  }
+  if (!activeConfig.acumulacion_habilitada) {
+    return { created: false, reason: 'ACCUMULATION_DISABLED' };
+  }
+  if (!(Number(activeConfig.lempiras_por_punto) > 0)) {
+    return { created: false, reason: 'ACCUMULATION_RULE_NOT_CONFIGURED' };
   }
 
   const points = computeAccumulationPoints(montoFactura, activeConfig.lempiras_por_punto);
@@ -509,37 +873,217 @@ const fetchClienteEstado = async (client, idCliente) => {
   return result.rows[0] || null;
 };
 
-const fetchCanjeProductRowsForUpdate = async (client, idSucursal, productIds) => {
-  if (!Array.isArray(productIds) || productIds.length === 0) return [];
+// Resolucion centralizada producto maestro -> asignacion local (sucursal):
+// unico punto de la app que decide, para un id_producto MAESTRO (el mismo
+// que fidelizacion_productos_canjeables_sucursal.id_producto ya almacena),
+// cual es su almacen/stock dentro de una sucursal especifica. Reemplaza el
+// join legado (productos.id_almacen / productos.cantidad / productos.stock_minimo)
+// que asumia un solo almacen por producto y por eso rechazaba productos
+// maestros validos asignados a mas de una sucursal via productos_almacenes.
+//
+// Se usa desde configuracion (GET/PUT), el catalogo de canjeables (GET) y la
+// confirmacion del canje (POST, con lockForUpdate=true) para no duplicar
+// cuatro consultas incompatibles con la misma intencion.
+//
+// Contrato de retorno: Map<id_producto, resultado>, con resultado.status en
+// { 'OK', 'SIN_ASIGNACION', 'AMBIGUA' }. 'SIN_ASIGNACION' cubre tanto la
+// ausencia de asignacion activa como producto/asignacion/almacen inactivos
+// (ninguno de esos casos es un producto local usable). 'AMBIGUA' es cuando
+// el producto maestro tiene mas de una asignacion activa dentro de la MISMA
+// sucursal (dos almacenes distintos de esa sucursal) y no hay una regla
+// canonica para elegir uno: nunca se resuelve con LIMIT 1 ni MIN(id_almacen).
+//
+// FOR UPDATE no puede combinarse con funciones de ventana en el SELECT, asi
+// que la deteccion de ambiguedad (COUNT... GROUP BY) y el fetch con lock se
+// hacen en dos consultas separadas -- mismo patron ya usado en este repo por
+// fetchProductosMaestrosByIdsForUpdate (services/inventarioStockValidator.js).
+export const resolveFidelizacionProductAssignments = async ({
+  client,
+  idSucursal,
+  productIds,
+  lockForUpdate = false
+}) => {
+  // Defensa en profundidad: esta funcion se puede llamar directamente
+  // (pruebas, otros servicios) sin pasar por la validacion del router, asi
+  // que valida con el parser estricto en vez de confiar solo en el caller.
+  const sucursalId = parseStrictPositiveInt(idSucursal);
+  const uniqueIds = [...new Set(
+    (Array.isArray(productIds) ? productIds : [])
+      .map((id) => parseStrictPositiveInt(id))
+      .filter((id) => id !== null)
+  )];
 
-  const result = await client.query(
+  const resultMap = new Map();
+  if (!sucursalId || uniqueIds.length === 0) return resultMap;
+
+  const countsResult = await client.query(
     `
-      SELECT
-        fps.id_registro,
-        fps.id_producto,
-        fps.puntos_requeridos_override,
-        COALESCE(fps.estado, true) AS canjeable_estado,
-        p.nombre_producto,
-        p.precio,
-        COALESCE(p.cantidad, 0)::int AS cantidad,
-        COALESCE(p.stock_minimo, 0)::int AS stock_minimo,
-        COALESCE(p.estado, true) AS producto_estado,
-        p.id_almacen,
-        a.id_sucursal AS almacen_id_sucursal,
-        COALESCE(a.estado, true) AS almacen_estado
-      FROM public.fidelizacion_productos_canjeables_sucursal fps
-      INNER JOIN public.productos p
-        ON p.id_producto = fps.id_producto
+      SELECT pa.id_producto, COUNT(*)::int AS total_asignaciones
+      FROM public.productos_almacenes pa
       INNER JOIN public.almacenes a
-        ON a.id_almacen = p.id_almacen
-      WHERE fps.id_sucursal = $1
-        AND fps.id_producto = ANY($2::int[])
-      FOR UPDATE OF p
+        ON a.id_almacen = pa.id_almacen
+       AND a.id_sucursal = $1
+       AND COALESCE(a.estado, true) = true
+      INNER JOIN public.productos p
+        ON p.id_producto = pa.id_producto
+       AND COALESCE(p.estado, true) = true
+      WHERE pa.id_producto = ANY($2::int[])
+        AND COALESCE(pa.estado, true) = true
+      GROUP BY pa.id_producto
     `,
-    [idSucursal, productIds]
+    [sucursalId, uniqueIds]
+  );
+  const countsByProduct = new Map(
+    countsResult.rows.map((row) => [Number(row.id_producto), Number(row.total_asignaciones || 0)])
   );
 
-  return result.rows;
+  const lockableIds = [];
+  for (const idProducto of uniqueIds) {
+    const total = countsByProduct.get(idProducto) || 0;
+    if (total === 0) {
+      resultMap.set(idProducto, { id_producto: idProducto, status: 'SIN_ASIGNACION' });
+    } else if (total > 1) {
+      resultMap.set(idProducto, { id_producto: idProducto, status: 'AMBIGUA' });
+    } else {
+      lockableIds.push(idProducto);
+    }
+  }
+
+  if (lockableIds.length > 0) {
+    // ORDER BY antes de FOR UPDATE: bloqueo en un orden deterministico
+    // (id_producto, id_almacen) para reducir el riesgo de deadlock cuando
+    // dos transacciones bloquean varios productos en distinto orden.
+    const dataResult = await client.query(
+      `
+        SELECT
+          p.id_producto,
+          p.nombre_producto,
+          COALESCE(p.descripcion_producto, '') AS descripcion_producto,
+          p.precio,
+          p.id_archivo_imagen_principal,
+          pa.id_almacen,
+          COALESCE(pa.cantidad, 0)::int AS cantidad,
+          COALESCE(pa.stock_minimo, 0)::int AS stock_minimo,
+          a.id_sucursal,
+          COALESCE(NULLIF(TRIM(COALESCE(a.nombre, '')), ''), CONCAT('Almacen #', a.id_almacen::text)) AS nombre_almacen
+        FROM public.productos_almacenes pa
+        INNER JOIN public.almacenes a
+          ON a.id_almacen = pa.id_almacen
+         AND a.id_sucursal = $1
+         AND COALESCE(a.estado, true) = true
+        INNER JOIN public.productos p
+          ON p.id_producto = pa.id_producto
+         AND COALESCE(p.estado, true) = true
+        WHERE pa.id_producto = ANY($2::int[])
+          AND COALESCE(pa.estado, true) = true
+        ORDER BY pa.id_producto ASC, pa.id_almacen ASC
+        ${lockForUpdate ? 'FOR UPDATE OF pa' : ''}
+      `,
+      [sucursalId, lockableIds]
+    );
+
+    // No se escribe cada fila directamente en resultMap: entre el COUNT de
+    // arriba y este SELECT con lock, otra transaccion pudo crear/activar
+    // una segunda asignacion (COUNT=1 ya no refleja la realidad bloqueada).
+    // Se agrupan las filas REALMENTE bloqueadas por id_producto y la
+    // decision final (OK/AMBIGUA/SIN_ASIGNACION) se basa en esa
+    // agrupacion, nunca en el conteo previo ni en el orden accidental de
+    // llegada de las filas.
+    const lockedRowsByProduct = new Map();
+    for (const row of dataResult.rows) {
+      const idProducto = Number(row.id_producto);
+      const rows = lockedRowsByProduct.get(idProducto) || [];
+      rows.push(row);
+      lockedRowsByProduct.set(idProducto, rows);
+    }
+
+    for (const idProducto of lockableIds) {
+      const rows = lockedRowsByProduct.get(idProducto) || [];
+
+      if (rows.length === 0) {
+        // La unica asignacion detectada por el COUNT se desactivo/elimino
+        // entre las dos consultas.
+        resultMap.set(idProducto, { id_producto: idProducto, status: 'SIN_ASIGNACION' });
+        continue;
+      }
+
+      if (rows.length > 1) {
+        // Aparecio una segunda asignacion activa despues del COUNT: se
+        // rechaza como ambigua, nunca se elige una fila arbitrariamente
+        // (ni LIMIT 1, ni MIN(id_almacen), ni la ultima en llegar).
+        resultMap.set(idProducto, { id_producto: idProducto, status: 'AMBIGUA' });
+        continue;
+      }
+
+      const [row] = rows;
+      const cantidad = Number(row.cantidad || 0);
+      const stockMinimo = Number(row.stock_minimo || 0);
+      resultMap.set(idProducto, {
+        id_producto: idProducto,
+        status: 'OK',
+        nombre_producto: row.nombre_producto,
+        descripcion_producto: row.descripcion_producto,
+        precio: row.precio,
+        id_archivo_imagen_principal: row.id_archivo_imagen_principal,
+        id_sucursal: Number(row.id_sucursal),
+        id_almacen: Number(row.id_almacen),
+        nombre_almacen: row.nombre_almacen,
+        cantidad,
+        stock_minimo: stockMinimo,
+        stock_disponible: Math.max(cantidad - stockMinimo, 0)
+      });
+    }
+  }
+
+  return resultMap;
+};
+
+const fetchCanjeProductRowsForUpdate = async (client, idSucursal, productIds) => {
+  const uniqueIds = [...new Set(
+    (Array.isArray(productIds) ? productIds : [])
+      .map((id) => parseStrictPositiveInt(id))
+      .filter((id) => id !== null)
+  )];
+  if (uniqueIds.length === 0) return [];
+
+  const [canjeablesResult, assignments] = await Promise.all([
+    client.query(
+      `
+        SELECT id_producto, puntos_requeridos_override, COALESCE(estado, true) AS canjeable_estado
+        FROM public.fidelizacion_productos_canjeables_sucursal
+        WHERE id_sucursal = $1
+          AND id_producto = ANY($2::int[])
+      `,
+      [idSucursal, uniqueIds]
+    ),
+    resolveFidelizacionProductAssignments({
+      client,
+      idSucursal,
+      productIds: uniqueIds,
+      lockForUpdate: true
+    })
+  ]);
+
+  const canjeablesByProduct = new Map(
+    canjeablesResult.rows.map((row) => [Number(row.id_producto), row])
+  );
+
+  return uniqueIds.map((idProducto) => {
+    const canjeable = canjeablesByProduct.get(idProducto) || null;
+    const assignment = assignments.get(idProducto) || { id_producto: idProducto, status: 'SIN_ASIGNACION' };
+
+    return {
+      id_producto: idProducto,
+      canjeable_estado: canjeable ? Boolean(canjeable.canjeable_estado) : false,
+      puntos_requeridos_override: canjeable ? canjeable.puntos_requeridos_override : null,
+      assignment_status: assignment.status,
+      nombre_producto: assignment.nombre_producto,
+      precio: assignment.precio,
+      cantidad: assignment.cantidad,
+      stock_minimo: assignment.stock_minimo,
+      id_almacen: assignment.id_almacen
+    };
+  });
 };
 
 const insertInventoryMovement = async ({
@@ -573,7 +1117,14 @@ const insertInventoryMovement = async ({
   );
 };
 
-const aggregateCanjeItems = (items) => {
+// Exportada (no interna): el router debe poder validar y agregar los
+// items ANTES de abrir conexion/transaccion (pool.connect/BEGIN), en vez de
+// solo dentro de createPresentialFidelizacionCanje. La misma funcion se usa
+// tambien dentro del servicio como defensa en profundidad (llamadas
+// directas sin pasar por el router). Es idempotente sobre un arreglo ya
+// agregado: cada id_producto aparece una sola vez en items ya agregados, asi
+// que sumarlo consigo mismo una vez produce el mismo resultado.
+export const validateAndAggregateCanjeItems = (items) => {
   if (!Array.isArray(items) || items.length === 0) {
     throw createFidelizacionError(
       400,
@@ -593,8 +1144,11 @@ const aggregateCanjeItems = (items) => {
       );
     }
 
-    const idProducto = parsePositiveInt(item.id_producto);
-    const cantidad = parsePositiveInt(item.cantidad);
+    // Cada id_producto y cantidad individual debe superar la validacion
+    // estricta ANTES de agregarse: "156abc", "2.9", "2 OR 1=1", arreglos u
+    // objetos se rechazan aqui, nunca se truncan a un id/cantidad distinta.
+    const idProducto = parseStrictPositiveInt(item.id_producto);
+    const cantidad = parseStrictPositiveInt(item.cantidad);
 
     if (!idProducto || !cantidad) {
       throw createFidelizacionError(
@@ -605,11 +1159,40 @@ const aggregateCanjeItems = (items) => {
     }
 
     const current = byProduct.get(idProducto) || { id_producto: idProducto, cantidad: 0 };
-    current.cantidad += cantidad;
+    const nextCantidad = current.cantidad + cantidad;
+    // La suma acumulada (articulos duplicados agregados) tambien debe
+    // seguir siendo un entero seguro y positivo: un overflow se rechaza en
+    // vez de continuar con un total incorrecto.
+    if (!Number.isSafeInteger(nextCantidad) || nextCantidad <= 0) {
+      throw createFidelizacionError(
+        400,
+        'FIDELIZACION_CANJE_ITEM_INVALID',
+        'La cantidad total solicitada para un producto no es valida.'
+      );
+    }
+    current.cantidad = nextCantidad;
     byProduct.set(idProducto, current);
   }
 
   return [...byProduct.values()];
+};
+
+// Fase 4 (seccion 3.8): sonda de esquema para
+// fidelizacion_canjes.id_sesion_caja (migracion 20260728_fidelizacion_canjes_sesion_caja).
+let canjesSesionCajaColumnExistsCache = null;
+const hasFidelizacionCanjesSesionCajaColumn = async (client) => {
+  if (canjesSesionCajaColumnExistsCache !== null) return canjesSesionCajaColumnExistsCache;
+  const result = await client.query(
+    `
+      SELECT 1
+      FROM information_schema.columns
+      WHERE table_schema = 'public' AND table_name = 'fidelizacion_canjes'
+        AND column_name = 'id_sesion_caja'
+      LIMIT 1
+    `
+  );
+  canjesSesionCajaColumnExistsCache = result.rowCount > 0;
+  return canjesSesionCajaColumnExistsCache;
 };
 
 export const createPresentialFidelizacionCanje = async ({
@@ -618,12 +1201,19 @@ export const createPresentialFidelizacionCanje = async ({
   idCliente,
   idSucursal,
   idUsuarioEjecutor,
+  idSesionCaja,
   items,
   observacion = null
 }) => {
-  const clienteId = parsePositiveInt(idCliente);
-  const sucursalId = parsePositiveInt(idSucursal);
-  const actorId = parsePositiveInt(idUsuarioEjecutor);
+  // Defensa en profundidad: esta funcion se puede invocar directamente
+  // (pruebas, otros servicios) sin pasar por routers/fidelizacion.js, asi
+  // que valida con el parser estricto en vez de confiar en el caller
+  // (parsePositiveInt truncaba "10x" -> 10, "1x" -> 1, "5x" -> 5 en
+  // silencio).
+  const clienteId = parseStrictPositiveInt(idCliente);
+  const sucursalId = parseStrictPositiveInt(idSucursal);
+  const actorId = parseStrictPositiveInt(idUsuarioEjecutor);
+  const sesionCajaId = parseStrictPositiveInt(idSesionCaja);
   const safeObservation = normalizeText(observacion).slice(0, 200) || null;
 
   if (!clienteId) {
@@ -642,7 +1232,33 @@ export const createPresentialFidelizacionCanje = async ({
     );
   }
 
-  const aggregatedItems = aggregateCanjeItems(items);
+  // Validar y agregar items ANTES de tocar el cliente/DB (mismo orden que
+  // ya exigia el resto de esta funcion): un payload con items invalidos no
+  // debe ejecutar ninguna consulta.
+  const aggregatedItems = validateAndAggregateCanjeItems(items);
+
+  // Fase 4 (seccion 3.8): id_sesion_caja es obligatorio para TODO canje
+  // presencial nuevo. El llamador (routers/fidelizacion.js) debe resolverlo
+  // primero con resolveCanjeSesionCaja (que ya distingue cajero/administrador
+  // y produce los codigos FIDELIZACION_CANJE_SESSION_* especificos); esta
+  // funcion solo valida que efectivamente haya recibido un id positivo --
+  // nunca continua con NULL para un canje nuevo.
+  if (!sesionCajaId) {
+    throw createFidelizacionError(
+      400,
+      'FIDELIZACION_CANJE_SESSION_REQUIRED',
+      'Debe indicar la sesión de caja bajo la cual se registra el canje.'
+    );
+  }
+
+  if (!(await hasFidelizacionCanjesSesionCajaColumn(client))) {
+    throw createFidelizacionError(
+      409,
+      'FIDELIZACION_SCHEMA_PENDIENTE',
+      'Falta aplicar la migracion de sesion de caja para canjes de fidelizacion; no se puede registrar el canje de forma auditable.'
+    );
+  }
+
   const cliente = await fetchClienteEstado(client, clienteId);
   if (!cliente || !Boolean(cliente.estado)) {
     throw createFidelizacionError(
@@ -692,19 +1308,24 @@ export const createPresentialFidelizacionCanje = async ({
       );
     }
 
-    if (!Boolean(row.producto_estado)) {
+    // assignment_status viene de resolveFidelizacionProductAssignments
+    // (producto maestro + productos_almacenes + almacenes de esta sucursal,
+    // bloqueado con FOR UPDATE OF pa). SIN_ASIGNACION cubre tanto la
+    // ausencia de asignacion activa como producto/asignacion/almacen
+    // inactivos: ninguno de esos casos deja un almacen local usable.
+    if (row.assignment_status === 'AMBIGUA') {
       throw createFidelizacionError(
         409,
-        'FIDELIZACION_PRODUCTO_INACTIVE',
-        'Uno o mas productos seleccionados estan inactivos.'
+        'FIDELIZACION_PRODUCTO_ASIGNACION_AMBIGUA',
+        `El producto ${row.nombre_producto || item.id_producto} tiene mas de una asignacion activa en esta sucursal.`
       );
     }
 
-    if (!Boolean(row.almacen_estado) || Number(row.almacen_id_sucursal || 0) !== sucursalId) {
+    if (row.assignment_status !== 'OK') {
       throw createFidelizacionError(
         409,
-        'FIDELIZACION_PRODUCTO_SCOPE_ERROR',
-        'Uno o mas productos no pertenecen al inventario operativo de la sucursal.'
+        'FIDELIZACION_PRODUCTO_SIN_ASIGNACION',
+        `El producto ${row.nombre_producto || item.id_producto} no tiene una asignacion de inventario activa en esta sucursal.`
       );
     }
 
@@ -765,11 +1386,12 @@ export const createPresentialFidelizacionCanje = async ({
         total_puntos,
         observacion,
         id_usuario_ejecutor,
+        id_sesion_caja,
         fecha_creacion,
         fecha_entrega,
         fecha_anulacion
       )
-      VALUES ($1, $2, $3, $4, $5, $6, NOW(), NULL, NULL)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), NULL, NULL)
       RETURNING id_canje
     `,
     [
@@ -778,7 +1400,8 @@ export const createPresentialFidelizacionCanje = async ({
       catalogs.estadoRegistradoId,
       totalPuntos,
       safeObservation,
-      actorId
+      actorId,
+      sesionCajaId
     ]
   );
   const idCanje = Number(canjeResult.rows?.[0]?.id_canje || 0);
@@ -866,11 +1489,29 @@ export const createPresentialFidelizacionCanje = async ({
   };
 };
 
+// Exportado UNICAMENTE para pruebas: los caches de sondas de esquema
+// (hasFidelizacionAjustesPendientesTable, hasFidelizacionCanjesSesionCajaColumn)
+// son a nivel de modulo/proceso -- necesario para no repetir la consulta a
+// information_schema en cada llamada real, pero eso significa que dentro
+// de una misma ejecucion de `node --test` (un solo proceso para muchos
+// archivos) el primer resultado observado quedaria fijo para todo el resto
+// de la suite. Esta funcion permite que un archivo de pruebas simule tanto
+// "el esquema de Fase 4 ya se aplico" como "todavia no" en la misma
+// ejecucion, sin afectar el comportamiento de produccion (nunca se llama
+// fuera de pruebas).
+export const __resetFidelizacionSchemaProbeCachesForTests = () => {
+  ajustesPendientesTableExistsCache = null;
+  canjesSesionCajaColumnExistsCache = null;
+};
+
 export {
   normalizeText,
   parsePositiveInt,
+  parseStrictPositiveInt,
   parseNonNegativeInt,
   parsePositiveNumber,
+  resolveEffectiveLempirasPorPunto,
+  resolveEffectiveAcumulacionHabilitada,
   computeAccumulationPoints,
   computeRedemptionPoints
 };

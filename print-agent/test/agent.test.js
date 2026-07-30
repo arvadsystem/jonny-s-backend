@@ -118,6 +118,41 @@ test('dispatch_started queda en cuarentena sin bloquear el siguiente trabajo', a
   }
 });
 
+test('un resultado ambiguo de qz.print (rechazo) nunca dispara un reintento automatico de dispatch', async () => {
+  const fixture = await createStoreFixture('jonnys-no-retry-after-print-');
+  try {
+    const target = job(50);
+    let dispatchCalls = 0;
+    const runner = createRunner({
+      config,
+      stateStore: fixture.store,
+      api: {
+        status: async () => ({ job: { estado: 'imprimiendo', assigned_to_agent: true, lease_active: true } }),
+        claim: async () => ({ jobs: dispatchCalls === 0 ? [target] : [] }),
+        printing: async () => {}, renew: async () => {}, confirmationPending: async () => {}, complete: async () => {}, fail: async () => {}
+      },
+      qz: {
+        prepare: async (value) => ({ job: value }),
+        // Resultado fisico ambiguo (qz.print rechazado): runner.js nunca debe reintentar
+        // dispatch automaticamente despues de esto, solo dejar el trabajo en cuarentena.
+        dispatch: async () => { dispatchCalls += 1; throw new Error('QZ_PRINT_AMBIGUOUS'); }
+      }
+    });
+
+    await runner.pollOnce();
+    assert.equal(dispatchCalls, 1, 'qz.dispatch (qz.print) se llama exactamente una vez tras el rechazo, sin reintento inmediato');
+    assert.equal(fixture.store.list()[0]?.status, 'dispatch_started', 'el trabajo queda en cuarentena, nunca se vuelve a despachar automaticamente');
+
+    // Nuevas vueltas de polling, con el mismo estado remoto ambiguo ("imprimiendo" con lease
+    // activo), tampoco deben volver a llamar qz.dispatch para este mismo trabajo.
+    await runner.pollOnce();
+    await runner.pollOnce();
+    assert.equal(dispatchCalls, 1, 'ninguna vuelta de polling posterior reintenta el dispatch automaticamente');
+  } finally {
+    await fs.rm(fixture.tempDir, { recursive: true, force: true });
+  }
+});
+
 test('respuesta QZ exitosa y fallo de complete persisten printed_unconfirmed; reinicio solo confirma', async () => {
   const fixture = await createStoreFixture('jonnys-printed-');
   try {
@@ -312,6 +347,21 @@ test('configuracion QZ rechaza IP literales, hostnames invalidos y host personal
   );
 });
 
+test('QZ_PRECONNECT_ENABLED es false por defecto y el polling sigue en 3000ms por defecto', () => {
+  const defaults = loadConfig({
+    API_BASE_URL: 'https://qa.example.com', PRINT_AGENT_ID: 'agent-id', PRINT_AGENT_TOKEN: 'x'.repeat(48),
+    BRANCH_ID: '2', PRINTER_MAP_JSON: '{"factura":"QA Printer"}'
+  });
+  assert.equal(defaults.qzPreconnectEnabled, false);
+  assert.equal(defaults.pollIntervalMs, 3000);
+
+  const enabled = loadConfig({
+    API_BASE_URL: 'https://qa.example.com', PRINT_AGENT_ID: 'agent-id', PRINT_AGENT_TOKEN: 'x'.repeat(48),
+    BRANCH_ID: '2', PRINTER_MAP_JSON: '{"factura":"QA Printer"}', QZ_PRECONNECT_ENABLED: 'true'
+  });
+  assert.equal(enabled.qzPreconnectEnabled, true);
+});
+
 test('certificado QZ rechaza claves privadas', () => {
   class LocalhostCertificate {
     checkHost(host) { return host === 'localhost' ? host : undefined; }
@@ -420,7 +470,10 @@ test('cliente QZ usa documentos canonicos v2 y conserva discovery, WSS, SHA512 y
     const client = createQzClient({
       config: {
         qzHost: 'qz-elcarmen.jonnyshn.com', qzSecurePort: 8181, qzCaCertPath: caPath,
-        printerMap: { factura: 'ZKP8008', cocina: 'Kitchen Printer' }
+        printerMap: { factura: 'ZKP8008', cocina: 'Kitchen Printer' },
+        // TTL 0: esta prueba verifica discovery/firma/documento por cada prepare(); la
+        // cache de impresoras (Fase 4) se cubre por separado en qzClientPreconnectAndCache.test.js.
+        printerCacheTtlMs: 0
       },
       api,
       qz,
@@ -588,7 +641,11 @@ test('cliente QZ usa documentos canonicos v2 y conserva discovery, WSS, SHA512 y
       crypto.createHash('sha256').update(preparedPendingComanda.data[0].data, 'utf8').digest('hex'),
       pendingComandaJob.payload.documento_canonico.content_sha256
     );
-    assert.equal(findCalls.length, 4);
+    // La impresora configurada no aparece en la lista mutada (availablePrinters =
+    // ['Otra impresora']): antes de declarar IMPRESORA_NO_ENCONTRADA, la Fase 4 invalida
+    // la cache y reintenta una sola vez, por eso el trabajo 73 genera dos find en vez de
+    // uno (cinco find en total en vez de cuatro).
+    assert.equal(findCalls.length, 5);
     assert.equal(findCalls[0][0], undefined);
     assert.equal(findCalls[0][1], undefined);
     assert.equal(findCalls[0][2], signCalls[0].request.timestamp);
@@ -601,10 +658,14 @@ test('cliente QZ usa documentos canonicos v2 y conserva discovery, WSS, SHA512 y
     assert.equal(findCalls[3][0], undefined);
     assert.equal(findCalls[3][1], undefined);
     assert.equal(findCalls[3][2], signCalls[6].request.timestamp);
+    assert.equal(findCalls[4][0], undefined);
+    assert.equal(findCalls[4][1], undefined);
+    assert.equal(findCalls[4][2], signCalls[7].request.timestamp);
     assert.deepEqual(signCalls[0].request.params, {});
     assert.deepEqual(signCalls[2].request.params, {});
     assert.deepEqual(signCalls[4].request.params, {});
     assert.deepEqual(signCalls[6].request.params, {});
+    assert.deepEqual(signCalls[7].request.params, {});
     assert.deepEqual(signCalls.map(({ jobId, request, digest }) => ({ jobId, call: request.call, digest })), [
       { jobId: 71, call: 'printers.find', digest: 'find-digest' },
       { jobId: 71, call: 'print', digest: 'print-digest' },
@@ -612,6 +673,7 @@ test('cliente QZ usa documentos canonicos v2 y conserva discovery, WSS, SHA512 y
       { jobId: 72, call: 'print', digest: 'print-digest' },
       { jobId: 74, call: 'printers.find', digest: 'find-digest' },
       { jobId: 74, call: 'print', digest: 'print-digest' },
+      { jobId: 73, call: 'printers.find', digest: 'find-digest' },
       { jobId: 73, call: 'printers.find', digest: 'find-digest' }
     ]);
     assert.equal(printCalls.length, 3);

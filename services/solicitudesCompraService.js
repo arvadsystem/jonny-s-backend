@@ -10,7 +10,9 @@ const DEFAULT_LIMIT = 20;
 const MAX_LIMIT = 100;
 const MAX_LINES = 100;
 const MAX_OBSERVATION_LENGTH = 1000;
-const MAX_QUANTITY_SCALED = 9_999_999_999_999n;
+const MAX_SEARCH_LENGTH = 120;
+const QUANTITY_SCALE = 1_000_000n;
+const MAX_QUANTITY_SCALED = 999_999_999_999_900n;
 const VALID_STATES = new Set(['PENDIENTE', 'APROBADA', 'RECHAZADA', 'RECIBIDA', 'CANCELADA']);
 const ADMIN_ROLES = new Set(['SUPER_ADMIN', 'ADMIN', 'ADMINISTRADOR']);
 const OPERATIVE_ROLES = new Set(['CAJERO', 'COCINA', 'COCINERO', 'COCINERA', 'JEFA_COCINA', 'JEFE_COCINA']);
@@ -58,19 +60,19 @@ const parseDate = (value) => {
 };
 
 const scaledToDecimal = (scaled) => {
-  const integer = scaled / 10_000n;
-  const fraction = String(scaled % 10_000n).padStart(4, '0').replace(/0+$/, '');
+  const integer = scaled / QUANTITY_SCALE;
+  const fraction = String(scaled % QUANTITY_SCALE).padStart(6, '0').replace(/0+$/, '');
   return fraction ? `${integer}.${fraction}` : String(integer);
 };
 
 export const parseQuantity = (value, { integerOnly = false } = {}) => {
   const text = String(value ?? '').trim();
-  const pattern = integerOnly ? /^[1-9]\d*$/ : /^(?:0|[1-9]\d*)(?:\.\d{1,4})?$/;
+  const pattern = integerOnly ? /^[1-9]\d*$/ : /^(?:0|[1-9]\d*)(?:\.\d{1,6})?$/;
   if (!pattern.test(text)) return null;
   const [whole, fraction = ''] = text.split('.');
-  const scaled = BigInt(whole) * 10_000n + BigInt(fraction.padEnd(4, '0') || '0');
+  const scaled = BigInt(whole) * QUANTITY_SCALE + BigInt(fraction.padEnd(6, '0') || '0');
   if (scaled <= 0n || scaled > MAX_QUANTITY_SCALED) return null;
-  if (integerOnly && scaled % 10_000n !== 0n) return null;
+  if (integerOnly && scaled % QUANTITY_SCALE !== 0n) return null;
   return { scaled, decimal: scaledToDecimal(scaled) };
 };
 
@@ -101,6 +103,35 @@ const normalizeObservation = (value) => {
   return normalized || null;
 };
 
+export const normalizeSolicitudSearch = (value) => {
+  if (!hasValue(value)) return null;
+  const normalized = String(value).replace(/\s+/g, ' ').trim();
+  if (normalized.length > MAX_SEARCH_LENGTH) {
+    fail(400, 'VALIDATION_ERROR', `buscar no puede exceder ${MAX_SEARCH_LENGTH} caracteres.`);
+  }
+  return normalized || null;
+};
+
+export const normalizeCatalogSearch = (value) => {
+  const normalized = normalizeSolicitudSearch(value);
+  if (!normalized) return null;
+  const text = normalized.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase()
+    .replace(/[^a-z0-9]+/g, ' ').trim().replace(/\s+/g, ' ');
+  return { text, compact: text.replace(/[^a-z0-9]+/g, '') };
+};
+
+export const resolveOperativeWarehouseId = async (queryRunner, userSucursalId) => {
+  const result = await queryRunner.query(
+    `SELECT a.id_almacen FROM public.almacenes a
+     WHERE a.id_sucursal = $1 AND COALESCE(a.estado, true) = true
+     ORDER BY a.id_almacen LIMIT 2`,
+    [userSucursalId]
+  );
+  if (result.rowCount === 0) fail(403, 'FORBIDDEN', 'La sucursal no tiene un almacén operativo disponible.');
+  if (result.rowCount > 1) fail(409, 'SCOPE_AMBIGUOUS', 'La sucursal requiere una asignación explícita de almacén.');
+  return Number(result.rows[0].id_almacen);
+};
+
 const validateRequestShape = (body) => {
   if (!Array.isArray(body.detalles) || body.detalles.length === 0) {
     fail(400, 'VALIDATION_ERROR', 'Debe incluir al menos una linea.');
@@ -122,6 +153,16 @@ const stockStatusSql = (quantitySql, minimumSql) => `
   END
 `;
 
+const normalizeSearchSql = (expression) => `
+  TRANSLATE(LOWER(COALESCE(${expression}, '')),
+    'áàäâãåéèëêíìïîóòöôõúùüûñç',
+    'aaaaaaeeeeiiiiooooouuuunc')
+`;
+
+const compactSearchSql = (expression) => `
+  REGEXP_REPLACE(${normalizeSearchSql(expression)}, '[^a-z0-9]+', '', 'g')
+`;
+
 const serializeCatalogRow = (row) => ({
   tipo_item: String(row.tipo_item).toLowerCase(),
   id_item: Number(row.id_item),
@@ -136,7 +177,9 @@ const serializeCatalogRow = (row) => ({
   stock_minimo: Number(row.stock_minimo ?? 0),
   estado_stock: row.estado_stock,
   unidad_base: row.unidad_base,
-  presentaciones: Array.isArray(row.presentaciones) ? row.presentaciones : []
+  presentaciones: Array.isArray(row.presentaciones) ? row.presentaciones : [],
+  solicitable: Boolean(row.solicitable),
+  motivo_no_solicitable: row.motivo_no_solicitable || null
 });
 
 const normalizeAccess = async (req, queryRunner, dependencies) => {
@@ -149,12 +192,14 @@ const normalizeAccess = async (req, queryRunner, dependencies) => {
   if (!access.idUsuario) fail(401, 'UNAUTHORIZED', 'No autorizado.');
   if (!isAdmin && !isOperative) fail(403, 'FORBIDDEN', 'El rol del usuario no puede operar solicitudes de compra.');
   if (isOperative && !scope.userSucursalId) fail(403, 'FORBIDDEN', 'El usuario no tiene una sucursal operativa asignada.');
+  const operativeWarehouseId = isOperative ? await dependencies.resolveOperativeWarehouse(queryRunner, scope.userSucursalId) : null;
 
   return {
     idUsuario: access.idUsuario,
     isAdmin,
     isOperative,
     userSucursalId: scope.userSucursalId || null,
+    operativeWarehouseId,
     allowedSucursalIds: isOperative ? [scope.userSucursalId] : null
   };
 };
@@ -174,7 +219,7 @@ const getWarehouse = async (warehouseId, access, queryRunner) => {
   const warehouse = result.rows?.[0];
   if (!warehouse) fail(404, 'NOT_FOUND', 'Almacen no encontrado.');
   if (!warehouse.estado) fail(409, 'CONFLICT', 'El almacen esta inactivo.');
-  if (access.isOperative && Number(warehouse.id_sucursal) !== access.userSucursalId) {
+  if (access.isOperative && (Number(warehouse.id_sucursal) !== access.userSucursalId || Number(warehouse.id_almacen) !== access.operativeWarehouseId)) {
     fail(403, 'FORBIDDEN', 'No tiene acceso al almacen solicitado.');
   }
   return {
@@ -193,8 +238,8 @@ const resolveCatalogWarehouse = async (rawWarehouseId, access, queryRunner) => {
   const params = [];
   let scopeSql = '';
   if (access.isOperative) {
-    params.push(access.userSucursalId);
-    scopeSql = ` AND a.id_sucursal = $${params.length}`;
+    params.push(access.operativeWarehouseId);
+    scopeSql = ` AND a.id_almacen = $${params.length}`;
   }
   const result = await queryRunner.query(
     `
@@ -220,6 +265,8 @@ const resolveCatalogWarehouse = async (rawWarehouseId, access, queryRunner) => {
 };
 
 const buildCatalogUnion = (type) => {
+  const productSearch = `CONCAT_WS(' ', p.id_producto::text, p.nombre_producto, p.descripcion_producto,
+    cp.nombre_categoria, 'Producto', 'Unidad')`;
   const productSql = `
     SELECT 'PRODUCTO'::text AS tipo_item, p.id_producto AS id_item,
            p.nombre_producto AS nombre, p.descripcion_producto AS descripcion,
@@ -228,7 +275,10 @@ const buildCatalogUnion = (type) => {
            COALESCE(pa.cantidad, 0)::numeric AS cantidad,
            COALESCE(pa.stock_minimo, 0)::numeric AS stock_minimo,
            ${stockStatusSql('COALESCE(pa.cantidad, 0)', 'COALESCE(pa.stock_minimo, 0)')} AS estado_stock,
-           'Unidad'::text AS unidad_base, '[]'::jsonb AS presentaciones
+           'Unidad'::text AS unidad_base, '[]'::jsonb AS presentaciones,
+           true AS solicitable, NULL::text AS motivo_no_solicitable,
+           ${normalizeSearchSql(productSearch)} AS search_text,
+           ${compactSearchSql(productSearch)} AS search_text_compact
     FROM public.productos p
     INNER JOIN public.productos_almacenes pa ON pa.id_producto = p.id_producto
     INNER JOIN public.almacenes a ON a.id_almacen = pa.id_almacen
@@ -236,6 +286,8 @@ const buildCatalogUnion = (type) => {
     LEFT JOIN public.categorias_productos cp ON cp.id_categoria_producto = p.id_categoria_producto
     WHERE pa.id_almacen = $1 AND p.estado = true AND pa.estado = true AND a.estado = true
   `;
+  const supplySearch = `CONCAT_WS(' ', i.id_insumo::text, i.nombre_insumo, i.descripcion,
+    ci.nombre_categoria, 'Insumo', ub.nombre, ub.simbolo, pres.search_text)`;
   const supplySql = `
     SELECT 'INSUMO'::text AS tipo_item, i.id_insumo AS id_item,
            i.nombre_insumo AS nombre, i.descripcion AS descripcion,
@@ -244,8 +296,19 @@ const buildCatalogUnion = (type) => {
            COALESCE(ia.cantidad, 0)::numeric AS cantidad,
            COALESCE(ia.stock_minimo, 0)::numeric AS stock_minimo,
            ${stockStatusSql('COALESCE(ia.cantidad, 0)', 'COALESCE(ia.stock_minimo, 0)')} AS estado_stock,
-           COALESCE(NULLIF(TRIM(CONCAT(ub.nombre, CASE WHEN NULLIF(TRIM(ub.simbolo), '') IS NULL THEN '' ELSE CONCAT(' (', TRIM(ub.simbolo), ')') END)), ''), 'Sin unidad') AS unidad_base,
-           COALESCE(pres.presentaciones, '[]'::jsonb) AS presentaciones
+           CASE
+             WHEN i.id_unidad_medida > 0 AND ub.id_unidad_medida IS NOT NULL
+               THEN NULLIF(TRIM(CONCAT(ub.nombre, CASE WHEN NULLIF(TRIM(ub.simbolo), '') IS NULL THEN '' ELSE CONCAT(' (', TRIM(ub.simbolo), ')') END)), '')
+             ELSE NULL
+           END AS unidad_base,
+           COALESCE(pres.presentaciones, '[]'::jsonb) AS presentaciones,
+           (i.id_unidad_medida > 0 AND ub.id_unidad_medida IS NOT NULL) AS solicitable,
+           CASE
+             WHEN i.id_unidad_medida > 0 AND ub.id_unidad_medida IS NOT NULL THEN NULL
+             ELSE 'UNIDAD_BASE_NO_CONFIGURADA'
+           END::text AS motivo_no_solicitable,
+           ${normalizeSearchSql(supplySearch)} AS search_text,
+           ${compactSearchSql(supplySearch)} AS search_text_compact
     FROM public.insumos i
     INNER JOIN public.insumos_almacenes ia ON ia.id_insumo = i.id_insumo
     INNER JOIN public.almacenes a ON a.id_almacen = ia.id_almacen
@@ -262,7 +325,8 @@ const buildCatalogUnion = (type) => {
         'unidad_base', ubp.nombre,
         'factor_conversion', ip.cantidad_base / NULLIF(ip.cantidad_presentacion, 0),
         'es_predeterminada_compra', ip.es_predeterminada_compra
-      ) ORDER BY ip.es_predeterminada_compra DESC, ip.id_presentacion) AS presentaciones
+      ) ORDER BY ip.es_predeterminada_compra DESC, ip.id_presentacion) AS presentaciones,
+      STRING_AGG(CONCAT_WS(' ', ip.nombre_presentacion, up.nombre, up.simbolo, ubp.nombre, ubp.simbolo), ' ') AS search_text
       FROM public.insumo_presentaciones ip
       INNER JOIN public.unidades_medida up ON up.id_unidad_medida = ip.id_unidad_presentacion
       INNER JOIN public.unidades_medida ubp ON ubp.id_unidad_medida = ip.id_unidad_base
@@ -281,6 +345,7 @@ const loadInsumoSnapshot = async (masterId, presentationId, queryRunner) => {
     const result = await queryRunner.query(
       `
         SELECT i.id_unidad_medida AS id_unidad_base,
+               um.id_unidad_medida AS id_unidad_base_valida,
                COALESCE(NULLIF(TRIM(um.nombre), ''), CONCAT('Unidad #', i.id_unidad_medida::text)) AS nombre_unidad_base
         FROM public.insumos i
         LEFT JOIN public.unidades_medida um ON um.id_unidad_medida = i.id_unidad_medida
@@ -290,8 +355,8 @@ const loadInsumoSnapshot = async (masterId, presentationId, queryRunner) => {
       [masterId]
     );
     const row = result.rows?.[0];
-    if (!parsePositiveIntStrict(row?.id_unidad_base)) {
-      fail(409, 'CONFLICT', 'El insumo no tiene una unidad base valida.');
+    if (!parsePositiveIntStrict(row?.id_unidad_base) || !parsePositiveIntStrict(row?.id_unidad_base_valida)) {
+      fail(409, 'CONFLICT', 'El insumo requiere que Inventario configure su unidad base antes de solicitarlo.');
     }
     return {
       id_presentacion_insumo: null,
@@ -355,7 +420,7 @@ const normalizeRequestLines = async (rawLines, warehouse, queryRunner, dependenc
     if (!quantity) {
       fail(400, 'VALIDATION_ERROR', type === 'producto'
         ? 'La cantidad de producto debe ser un entero positivo.'
-        : 'La cantidad de insumo debe ser positiva y tener hasta 4 decimales.');
+        : 'La cantidad de insumo debe ser positiva y tener hasta 6 decimales.');
     }
 
     const resolved = await dependencies.resolveMaster(type, rawItemId, queryRunner);
@@ -412,7 +477,8 @@ export const createSolicitudesCompraService = (overrides = {}) => {
     readAccess: overrides.readAccess || readRequestAccess,
     resolveScope: overrides.resolveScope || resolveRequestUserSucursalScope,
     resolveMaster: overrides.resolveMaster || resolveCatalogoMaestroEntity,
-    getAssignment: overrides.getAssignment || getWarehouseAssignmentDetails
+    getAssignment: overrides.getAssignment || getWarehouseAssignmentDetails,
+    resolveOperativeWarehouse: overrides.resolveOperativeWarehouse || resolveOperativeWarehouseId
   };
 
   const listCatalog = async (req) => {
@@ -422,15 +488,15 @@ export const createSolicitudesCompraService = (overrides = {}) => {
     if (type && !['producto', 'insumo'].includes(type)) fail(400, 'VALIDATION_ERROR', 'tipo debe ser producto o insumo.');
     const lowStock = parseBoolean(req.query?.solo_stock_bajo);
     if (lowStock === null) fail(400, 'VALIDATION_ERROR', 'solo_stock_bajo debe ser booleano.');
-    const search = hasValue(req.query?.buscar) ? String(req.query.buscar).trim().slice(0, 120) : null;
+    const search = normalizeCatalogSearch(req.query?.buscar);
     const pagination = parsePagination(req.query);
     const result = await dependencies.db.query(
       `
         WITH catalogo AS (${buildCatalogUnion(type)})
         SELECT catalogo.*, COUNT(*) OVER()::integer AS total_count
         FROM catalogo
-        WHERE ($2::text IS NULL OR catalogo.nombre ILIKE '%' || $2 || '%' OR COALESCE(catalogo.descripcion, '') ILIKE '%' || $2 || '%')
-          AND ($3::boolean = false OR catalogo.estado_stock IN ('SIN_STOCK', 'STOCK_BAJO'))
+        WHERE ($2::text IS NULL OR catalogo.search_text LIKE '%' || $2 || '%' OR catalogo.search_text_compact LIKE '%' || $3 || '%')
+          AND ($4::boolean = false OR catalogo.estado_stock IN ('SIN_STOCK', 'STOCK_BAJO'))
         ORDER BY
           CASE catalogo.estado_stock
             WHEN 'SIN_STOCK' THEN 0
@@ -441,9 +507,9 @@ export const createSolicitudesCompraService = (overrides = {}) => {
           LOWER(catalogo.nombre),
           catalogo.tipo_item,
           catalogo.id_item
-        LIMIT $4 OFFSET $5
+        LIMIT $5 OFFSET $6
       `,
-      [warehouse.id_almacen, search, lowStock, pagination.limit, pagination.offset]
+      [warehouse.id_almacen, search?.text ?? null, search?.compact ?? null, lowStock, pagination.limit, pagination.offset]
     );
     const total = Number(result.rows?.[0]?.total_count ?? 0);
     return {
@@ -487,7 +553,7 @@ export const createSolicitudesCompraService = (overrides = {}) => {
               id_solicitud_compra, tipo_item, id_producto, id_insumo,
               id_presentacion_insumo, id_unidad_base, nombre_presentacion_snapshot,
               factor_conversion_snapshot, cantidad_solicitada, cantidad_base_solicitada
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8::numeric, $9::numeric, $9::numeric * $8::numeric)
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8::numeric, $9::numeric, ROUND($9::numeric * $8::numeric, 6))
           `,
           [
             header.id_solicitud_compra,
@@ -537,16 +603,47 @@ export const createSolicitudesCompraService = (overrides = {}) => {
     if (hasValue(req.query?.fecha_desde) && !from) fail(400, 'VALIDATION_ERROR', 'fecha_desde debe usar formato YYYY-MM-DD.');
     if (hasValue(req.query?.fecha_hasta) && !to) fail(400, 'VALIDATION_ERROR', 'fecha_hasta debe usar formato YYYY-MM-DD.');
     if (from && to && from > to) fail(400, 'VALIDATION_ERROR', 'fecha_desde no puede ser posterior a fecha_hasta.');
+    const search = normalizeSolicitudSearch(req.query?.buscar);
 
     const params = [];
     const where = [];
     const add = (clause, value) => { params.push(value); where.push(clause.replace('?', `$${params.length}`)); };
-    if (access.isOperative) add('sc.id_sucursal = ?', access.userSucursalId);
+    if (access.isOperative) {
+      add('sc.id_sucursal = ?', access.userSucursalId);
+      add('sc.id_almacen = ?', access.operativeWarehouseId);
+    }
     else if (branchId) add('sc.id_sucursal = ?', branchId);
     if (state) add('sc.estado = ?', state);
     if (warehouseId) add('sc.id_almacen = ?', warehouseId);
     if (from) add('sc.fecha_creacion >= ?::date', from);
     if (to) add("sc.fecha_creacion < (?::date + INTERVAL '1 day')", to);
+    if (search) {
+      if (/^\d+$/.test(search)) {
+        add('sc.id_solicitud_compra::text = ?', search);
+      } else {
+        params.push(search);
+        const ref = `$${params.length}`;
+        where.push(`(
+          COALESCE(NULLIF(TRIM(CONCAT_WS(' ', p.nombre, p.apellido)), ''), '') ILIKE '%' || ${ref} || '%'
+          OR u.nombre_usuario ILIKE '%' || ${ref} || '%'
+          OR s.nombre_sucursal ILIKE '%' || ${ref} || '%'
+          OR a.nombre ILIKE '%' || ${ref} || '%'
+          OR sc.estado ILIKE '%' || ${ref} || '%'
+          OR COALESCE(sc.observacion_solicitud, '') ILIKE '%' || ${ref} || '%'
+          OR COALESCE(sc.comentario_revision, '') ILIKE '%' || ${ref} || '%'
+          OR COALESCE(sc.observacion_recepcion, '') ILIKE '%' || ${ref} || '%'
+          OR EXISTS (
+            SELECT 1 FROM public.solicitudes_compra_detalle sd
+            LEFT JOIN public.productos sp ON sp.id_producto = sd.id_producto
+            LEFT JOIN public.insumos si ON si.id_insumo = sd.id_insumo
+            WHERE sd.id_solicitud_compra = sc.id_solicitud_compra
+              AND (COALESCE(sp.nombre_producto, '') ILIKE '%' || ${ref} || '%'
+                OR COALESCE(si.nombre_insumo, '') ILIKE '%' || ${ref} || '%'
+                OR COALESCE(sd.nombre_presentacion_snapshot, '') ILIKE '%' || ${ref} || '%')
+          )
+        )`);
+      }
+    }
     params.push(pagination.limit, pagination.offset);
     const limitRef = `$${params.length - 1}`;
     const offsetRef = `$${params.length}`;
@@ -630,7 +727,7 @@ export const createSolicitudesCompraService = (overrides = {}) => {
     );
     const header = headerResult.rows?.[0];
     if (!header) fail(404, 'NOT_FOUND', 'Solicitud de compra no encontrada.');
-    if (access.isOperative && Number(header.id_sucursal) !== access.userSucursalId) {
+    if (access.isOperative && (Number(header.id_sucursal) !== access.userSucursalId || Number(header.id_almacen) !== access.operativeWarehouseId)) {
       fail(403, 'FORBIDDEN', 'No tiene acceso a esta solicitud de compra.');
     }
     const detailsResult = await dependencies.db.query(
@@ -640,6 +737,7 @@ export const createSolicitudesCompraService = (overrides = {}) => {
                CASE WHEN d.tipo_item = 'PRODUCTO' THEN p.nombre_producto ELSE i.nombre_insumo END AS nombre,
                CASE WHEN d.tipo_item = 'PRODUCTO' THEN cp.nombre_categoria ELSE ci.nombre_categoria END AS categoria,
                d.cantidad_solicitada, d.nombre_presentacion_snapshot AS presentacion_snapshot,
+               d.factor_conversion_snapshot::text AS factor_conversion_snapshot,
                d.cantidad_base_solicitada, ub.nombre AS unidad_base,
                d.cantidad_aprobada, d.cantidad_base_aprobada,
                CASE WHEN prov.id_proveedor IS NULL THEN NULL ELSE JSON_BUILD_OBJECT(
@@ -689,12 +787,12 @@ export const createSolicitudesCompraService = (overrides = {}) => {
         ...row,
         id_solicitud_detalle: Number(row.id_solicitud_detalle),
         id_item: Number(row.id_item),
-        cantidad_solicitada: Number(row.cantidad_solicitada),
-        cantidad_base_solicitada: Number(row.cantidad_base_solicitada),
-        cantidad_aprobada: row.cantidad_aprobada === null ? null : Number(row.cantidad_aprobada),
-        cantidad_base_aprobada: row.cantidad_base_aprobada === null ? null : Number(row.cantidad_base_aprobada),
-        cantidad_recibida: row.cantidad_recibida === null ? null : Number(row.cantidad_recibida),
-        cantidad_base_recibida: row.cantidad_base_recibida === null ? null : Number(row.cantidad_base_recibida),
+        cantidad_solicitada: String(row.cantidad_solicitada),
+        cantidad_base_solicitada: String(row.cantidad_base_solicitada),
+        cantidad_aprobada: row.cantidad_aprobada === null ? null : String(row.cantidad_aprobada),
+        cantidad_base_aprobada: row.cantidad_base_aprobada === null ? null : String(row.cantidad_base_aprobada),
+        cantidad_recibida: row.cantidad_recibida === null ? null : String(row.cantidad_recibida),
+        cantidad_base_recibida: row.cantidad_base_recibida === null ? null : String(row.cantidad_base_recibida),
         stock_actual: Number(row.stock_actual ?? 0),
         stock_minimo: Number(row.stock_minimo ?? 0)
       }))

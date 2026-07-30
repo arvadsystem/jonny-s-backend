@@ -82,6 +82,7 @@ const fixture = (options = {}) => {
     resolveScope: async () => ({ userSucursalId: options.userSucursalId ?? 3, allowedSucursalIds: options.allowedSucursalIds ?? [options.userSucursalId ?? 3] }),
     resolveMaster: async (type, id) => options.masterInvalid ? ({ ok: false }) : ({ ok: true, masterId: id, master: { estado_global: true, tipo: type } }),
     getAssignment: async () => ({ activo: !options.assignmentInactive }),
+    resolveOperativeWarehouse: async () => Number(options.operativeWarehouseId ?? 4),
     now: () => 1721563200000,
     uuid: () => '123e4567-e89b-12d3-a456-426614174000'
   });
@@ -110,9 +111,9 @@ test('rol no permitido responde 403', async () => {
   assert.equal((await codeOf(fixture({ role: 'MESERO' }).service.receive(req()))).status, 403);
 });
 
-test('administrador queda limitado a su alcance administrativo actual', async () => {
+test('administrador conserva alcance global aunque su resolver reporte otra sucursal', async () => {
   const f = fixture({ role: 'ADMIN', userSucursalId: 2, allowedSucursalIds: [2] });
-  assert.equal((await codeOf(f.service.receive(req()))).status, 403);
+  assert.equal((await f.service.receive(req())).ok, true);
 });
 
 test('solicitud inexistente responde 404', async () => {
@@ -209,15 +210,15 @@ test('producto exige entero positivo', async () => {
   assert.equal((await codeOf(fixture().service.receive(req(body({ detalles }))))).status, 400);
 });
 
-test('insumo acepta cuatro decimales y calcula base con snapshot', async () => {
-  const f = fixture({ details: [product(), supply({ cantidad_aprobada: '1.2345', cantidad_base_aprobada: '1234.5' })] });
-  const detalles = [body().detalles[0], { id_solicitud_detalle: 11, cantidad_recibida: '1.2345' }];
+test('insumo acepta seis decimales y calcula base con snapshot', async () => {
+  const f = fixture({ details: [product(), supply({ cantidad_aprobada: '1.123456', cantidad_base_aprobada: '1123.456' })] });
+  const detalles = [body().detalles[0], { id_solicitud_detalle: 11, cantidad_recibida: '1.123456' }];
   await f.service.receive(req(body({ detalles })));
   const update = f.calls.filter((call) => call.sql.startsWith('UPDATE public.solicitudes_compra_detalle'))[1];
-  assert.deepEqual(update.params.slice(2), ['1.2345', '1234.5']);
+  assert.deepEqual(update.params.slice(2), ['1.123456', '1123.456']);
 });
 
-for (const invalid of [0, -1, null, '1.00001']) {
+for (const invalid of [0, -1, null, '1.1234567']) {
   test(`cantidad de insumo invalida ${String(invalid)} es rechazada`, async () => {
     const detalles = [body().detalles[0], { id_solicitud_detalle: 11, cantidad_recibida: invalid }];
     assert.equal((await codeOf(fixture().service.receive(req(body({ detalles }))))).status, 400);
@@ -239,8 +240,8 @@ test('diferencia menor o mayor es aceptada con observacion', async () => {
   }
 });
 
-test('igualdad numerica 2, 2.0 y 2.0000 no exige observacion', async () => {
-  for (const amount of [2, '2.0', '2.0000']) {
+test('producto entero equivalente 2, 2.0 y 2.000000 no exige observacion', async () => {
+  for (const amount of [2, '2.0', '2.000000']) {
     const detalles = [{ id_solicitud_detalle: 10, cantidad_recibida: amount }, body().detalles[1]];
     assert.equal((await fixture().service.receive(req(body({ detalles })))).ok, true);
   }

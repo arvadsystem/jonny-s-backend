@@ -2,6 +2,11 @@ import express from 'express';
 import pool from '../config/db-connection.js';
 import { checkPermission, requestHasAnyPermission } from '../middleware/checkPermission.js';
 import { resolveRequestUserSucursalScope } from '../utils/sucursalScope.js';
+import { attachImagenPrincipalUrls } from '../utils/uploads.js';
+import {
+  listCanjeSesionesDisponibles,
+  resolveCanjeSesionCaja
+} from '../services/fidelizacionCanjeSessionService.js';
 import {
   buildErrorBody,
   isValidDateOnly,
@@ -10,40 +15,76 @@ import {
   unknownFieldsFromPayload
 } from '../utils/security/personasHardening.js';
 import {
+  buildClienteEmpresaRelationSql,
   computeRedemptionPoints,
   createFidelizacionError,
   createPresentialFidelizacionCanje,
   getActiveFidelizacionConfig,
   insertFidelizacionAuditLog,
+  isExplicitRateConfirmation,
   normalizeText,
   parseNonNegativeInt,
   parsePositiveInt,
-  parsePositiveNumber
+  parsePositiveNumber,
+  parseStrictPositiveInt,
+  requiresRateConfirmation,
+  resolveEffectiveAcumulacionHabilitada,
+  resolveEffectiveLempirasPorPunto,
+  resolveFidelizacionProductAssignments,
+  validateAndAggregateCanjeItems
 } from '../services/fidelizacionService.js';
 
 const router = express.Router();
 
 const MAX_PAGE_SIZE = 100;
+const MAX_SEARCH_LENGTH = 120;
+const DEFAULT_CLIENTES_PAGE_SIZE = 9;
 const MULTISUCURSAL_PERMISSION = 'fidelizacion_ver_multisucursal';
-const CLIENT_ROLE_NAME = 'CLIENTE';
 const TEGUCIGALPA_TIMEZONE = 'America/Tegucigalpa';
 
 const isPlainObject = (value) => value !== null && typeof value === 'object' && !Array.isArray(value);
 
+// page/limit deben llegar como enteros positivos "puros": Number.parseInt
+// trunca decimales y se detiene en el primer caracter no numerico (p.ej.
+// "1 OR 1=1" -> 1, "9;DROP TABLE clientes" -> 9), asi que aceptaria payloads
+// maliciosos como validos. Este regex exige que TODO el valor sean digitos
+// antes de pasarlo a parsePositiveInt.
+const STRICT_POSITIVE_INTEGER_PATTERN = /^\d+$/;
+
+const isStrictPositiveIntegerString = (value) => {
+  // Un arreglo de un solo elemento (p.ej. id_sucursal[]=1, que Express/qs
+  // entrega como ['1']) o un objeto (id_sucursal[valor]=1 -> {valor:'1'})
+  // nunca son un identificador valido, pero String(['1']) === '1' pasaria
+  // el regex si no se rechazan explicitamente antes de convertir a texto.
+  if (value !== null && typeof value === 'object') return false;
+  if (typeof value === 'number') return Number.isInteger(value) && value > 0;
+  return STRICT_POSITIVE_INTEGER_PATTERN.test(String(value ?? '').trim());
+};
+
 const parsePageParam = (value, fallback = 1) => {
   if (value === undefined) return fallback;
+  if (!isStrictPositiveIntegerString(value)) return null;
   return parsePositiveInt(value);
 };
 
 const parseLimitParam = (value, fallback = 20) => {
   if (value === undefined) return fallback;
+  if (!isStrictPositiveIntegerString(value)) return null;
   const parsed = parsePositiveInt(value);
   if (!parsed) return null;
   return Math.min(parsed, MAX_PAGE_SIZE);
 };
 
+// Usado para todo identificador entero opcional que llega en la peticion
+// (id_sucursal, id_cliente, id_estado_canje; en query o en body): mismo
+// contrato en los 10 puntos donde se usa este helper, por eso se endurece
+// aqui en vez de duplicar un parser paralelo especifico. Number.parseInt
+// (dentro de parsePositiveInt) trunca decimales y se detiene en el primer
+// caracter no numerico ("1 OR 1=1" -> 1), asi que exige primero que el
+// valor completo sean digitos antes de parsearlo.
 const parseNullablePositiveInt = (value) => {
   if (value === undefined || value === null || value === '') return null;
+  if (!isStrictPositiveIntegerString(value)) return null;
   return parsePositiveInt(value);
 };
 
@@ -53,9 +94,15 @@ const parseOptionalDateOnly = (value) => {
   return isValidDateOnly(normalized) ? normalized : null;
 };
 
+// % y _ son comodines de ILIKE aunque el valor viaje parametrizado ($n): un
+// parametro evita SQL injection pero no evita que el usuario use un
+// comodin arbitrario. Se escapan junto con la propia barra invertida (que
+// es el caracter de escape) para que %, _ y \ se busquen como texto literal.
+const escapeLikePattern = (value) => String(value).replace(/[\\%_]/g, (character) => `\\${character}`);
+
 const buildLikeSearch = (value) => {
   const normalized = normalizeText(value);
-  return normalized ? `%${normalized}%` : null;
+  return normalized ? `%${escapeLikePattern(normalized)}%` : null;
 };
 
 const asyncHandler = (handler, { defaultCode, defaultMessage }) => async (req, res) => {
@@ -115,7 +162,8 @@ const resolveFidelizacionScope = async ({
   client,
   requestedSucursalId = null,
   allowAllBranches = false,
-  requireOperationalSucursal = false
+  requireOperationalSucursal = false,
+  requireExplicitSucursalForSuperAdmin = false
 }) => {
   const scope = await resolveRequestUserSucursalScope(req, client);
   const idUsuario = parsePositiveInt(scope?.idUsuario);
@@ -162,6 +210,15 @@ const resolveFidelizacionScope = async ({
     targetSucursalId = requestedSucursalId;
   } else if (allowAllBranches && Boolean(scope?.isSuperAdmin) && hasMultisucursalAccess && !requireOperationalSucursal) {
     targetSucursalId = null;
+  } else if (requireExplicitSucursalForSuperAdmin && Boolean(scope?.isSuperAdmin)) {
+    // El superadministrador no tiene una sucursal "propia" para el canje:
+    // debe elegirla explicitamente en cada solicitud (nunca se usa
+    // userSucursalId en silencio, aunque el usuario tenga una asignada).
+    throw createFidelizacionError(
+      400,
+      'FIDELIZACION_SUCURSAL_REQUIRED',
+      'Debe seleccionar la sucursal donde se realizara el canje.'
+    );
   } else {
     if (!userSucursalId) {
       throw createFidelizacionError(
@@ -195,32 +252,17 @@ const assertAllPermissions = async (req, permissions) => {
   }
 };
 
-const buildClienteBaseSql = () => `
-  WITH eligible_clients AS (
-    SELECT DISTINCT
-      c.id_cliente,
-      u.id_usuario AS id_usuario_cliente,
-      u.nombre_usuario
-    FROM public.clientes c
-    INNER JOIN public.usuarios_clientes uc
-      ON uc.id_cliente = c.id_cliente
-     AND COALESCE(uc.estado, true) = true
-    INNER JOIN public.usuarios u
-      ON u.id_usuario = uc.id_usuario
-     AND u.id_cliente = uc.id_cliente
-     AND COALESCE(u.estado, false) = true
-    INNER JOIN public.roles_usuarios ru
-      ON ru.id_usuario = u.id_usuario
-    INNER JOIN public.roles r
-      ON r.id_rol = ru.id_rol
-    WHERE COALESCE(c.estado, true) = true
-      AND UPPER(TRIM(r.nombre)) = '${CLIENT_ROLE_NAME}'
-  ),
-  cliente_cards AS (
+// empresaRelationExpr: fragmento SQL resuelto por buildClienteEmpresaRelationSql
+// (services/fidelizacionService.js) -- misma deteccion dinamica de
+// clientes.id_empresa_cliente vs clientes.id_empresa que ya usa
+// fetchClienteProfileForFidelizacion y listPaidInvoicesMissingAccumulation.
+// No se duplica una tercera implementacion incompatible de esa relacion.
+const buildClienteBaseSql = (empresaRelationExpr = 'c.id_empresa') => `
+  WITH cliente_cards AS (
     SELECT
       c.id_cliente,
-      ec.id_usuario_cliente,
-      ec.nombre_usuario,
+      u.id_usuario AS id_usuario_cliente,
+      u.nombre_usuario,
       COALESCE(
         NULLIF(TRIM(CONCAT(COALESCE(p.nombre, ''), ' ', COALESCE(p.apellido, ''))), ''),
         NULLIF(TRIM(e.nombre_empresa), ''),
@@ -242,12 +284,10 @@ const buildClienteBaseSql = () => `
         ELSE false
       END AS visible_en_sucursal
     FROM public.clientes c
-    INNER JOIN eligible_clients ec
-      ON ec.id_cliente = c.id_cliente
     LEFT JOIN public.personas p
       ON p.id_persona = c.id_persona
     LEFT JOIN public.empresas e
-      ON e.id_empresa = c.id_empresa
+      ON e.id_empresa = ${empresaRelationExpr}
     LEFT JOIN public.telefonos tel_p
       ON tel_p.id_telefono = p.id_telefono
     LEFT JOIN public.telefonos tel_e
@@ -256,6 +296,16 @@ const buildClienteBaseSql = () => `
       ON cor_p.id_correo = p.id_correo
     LEFT JOIN public.correos cor_e
       ON cor_e.id_correo = e.id_correo
+    -- Datos de usuario opcionales (LEFT JOIN): un cliente puede acumular y
+    -- aparecer en el panel sin tener cuenta de usuario ni rol CLIENTE
+    -- (misma regla de perfil que la acumulacion, ver mas abajo).
+    LEFT JOIN public.usuarios_clientes uc
+      ON uc.id_cliente = c.id_cliente
+     AND COALESCE(uc.estado, true) = true
+    LEFT JOIN public.usuarios u
+      ON u.id_usuario = uc.id_usuario
+     AND u.id_cliente = uc.id_cliente
+     AND COALESCE(u.estado, false) = true
     LEFT JOIN public.fidelizacion_saldos_cliente fs
       ON fs.id_cliente = c.id_cliente
     LEFT JOIN LATERAL (
@@ -317,27 +367,62 @@ const buildClienteBaseSql = () => `
       ) x
       LIMIT 1
     ) activity_scope ON true
+    -- Misma regla de elegibilidad por perfil que usa la acumulacion
+    -- (isClienteProfileComplete / fetchClienteProfileForFidelizacion en
+    -- services/fidelizacionService.js): activo, con nombre (persona o
+    -- empresa) y telefono con exactamente 8 digitos (criterio canonico de
+    -- normalizePhoneHN). No se exige usuario, rol CLIENTE, correo, apellido
+    -- ni credenciales de acceso.
+    WHERE COALESCE(c.estado, true) = true
+      -- Mismo criterio EXACTO que isClienteProfileComplete/fetchClienteProfileForFidelizacion
+      -- (services/fidelizacionService.js): solo p.nombre, nunca CONCAT con
+      -- apellido. Una persona sin nombre pero con apellido no debe pasar
+      -- este filtro (el apellido si se sigue mostrando en nombre_principal,
+      -- eso es solo visual).
+      AND TRIM(COALESCE(
+        CASE WHEN c.id_persona IS NOT NULL THEN p.nombre ELSE e.nombre_empresa END,
+        ''
+      )) <> ''
+      AND length(regexp_replace(
+        COALESCE(
+          CASE WHEN c.id_persona IS NOT NULL THEN tel_p.telefono ELSE tel_e.telefono END,
+          ''
+        ),
+        '\\D', '', 'g'
+      )) = 8
   )
 `;
 
+// Sin busqueda: solo clientes con participacion real (acumulados o
+// disponibles > 0), para no listar clientes en cero por defecto. Con
+// busqueda: el filtro de puntos se desactiva por completo (para poder
+// encontrar un cliente aunque tenga 0 en las tres columnas), y en su lugar
+// debe coincidir con alguna columna permitida. searchParamRef es siempre una
+// constante interna ($2), nunca un valor recibido de req.query.
 const buildClienteWhereClause = ({ searchParamRef }) => `
   FROM cliente_cards cc
   WHERE cc.visible_en_sucursal = true
     AND (
+      ${searchParamRef}::text IS NOT NULL
+      OR COALESCE(cc.puntos_acumulados_total, 0) > 0
+      OR COALESCE(cc.puntos_disponibles, 0) > 0
+    )
+    AND (
       ${searchParamRef}::text IS NULL
-      OR cc.nombre_principal ILIKE ${searchParamRef}
-      OR cc.correo ILIKE ${searchParamRef}
-      OR cc.telefono ILIKE ${searchParamRef}
-      OR cc.documento ILIKE ${searchParamRef}
-      OR cc.nombre_usuario ILIKE ${searchParamRef}
-      OR cc.id_cliente::text ILIKE ${searchParamRef}
+      OR cc.nombre_principal ILIKE ${searchParamRef} ESCAPE '\\'
+      OR cc.correo ILIKE ${searchParamRef} ESCAPE '\\'
+      OR cc.telefono ILIKE ${searchParamRef} ESCAPE '\\'
+      OR cc.documento ILIKE ${searchParamRef} ESCAPE '\\'
+      OR cc.nombre_usuario ILIKE ${searchParamRef} ESCAPE '\\'
+      OR cc.id_cliente::text ILIKE ${searchParamRef} ESCAPE '\\'
     )
 `;
 
 const fetchClienteDetalleRow = async (client, idCliente, targetSucursalId = null) => {
+  const empresaRelationExpr = await buildClienteEmpresaRelationSql(client, 'c');
   const result = await client.query(
     `
-      ${buildClienteBaseSql()}
+      ${buildClienteBaseSql(empresaRelationExpr)}
       SELECT *
       FROM cliente_cards
       WHERE id_cliente = $2
@@ -350,10 +435,18 @@ const fetchClienteDetalleRow = async (client, idCliente, targetSucursalId = null
   return result.rows[0] || null;
 };
 
-const getConfiguracionProducts = async (client, idSucursal, lempirasPorPunto = null) => {
-  if (!parsePositiveInt(idSucursal)) return [];
+// Datos maestros (nombre/descripcion/precio/imagen) siempre vienen de
+// productos: un producto configurado como canjeable debe seguir apareciendo
+// en el listado administrativo aunque su asignacion local en esta sucursal
+// se haya vuelto invalida (para que el admin pueda verlo y corregirlo), asi
+// que el fetch de fps+productos NUNCA depende de resolveFidelizacionProductAssignments
+// para existir -- solo se usa para completar stock/almacen local cuando hay
+// una asignacion resoluble.
+const getConfiguracionProducts = async (client, req, idSucursal, lempirasPorPunto = null) => {
+  const sucursalId = parsePositiveInt(idSucursal);
+  if (!sucursalId) return [];
 
-  const result = await client.query(
+  const fpsResult = await client.query(
     `
       SELECT
         fps.id_registro,
@@ -365,34 +458,47 @@ const getConfiguracionProducts = async (client, idSucursal, lempirasPorPunto = n
         fps.fecha_creacion,
         fps.fecha_actualizacion,
         p.nombre_producto,
+        COALESCE(p.descripcion_producto, '') AS descripcion_producto,
         p.precio,
-        COALESCE(p.estado, true) AS producto_estado,
-        p.id_almacen,
-        COALESCE(p.cantidad, 0)::int AS cantidad,
-        COALESCE(p.stock_minimo, 0)::int AS stock_minimo,
-        a.id_sucursal AS id_sucursal_almacen,
-        COALESCE(a.estado, true) AS almacen_estado
+        p.id_archivo_imagen_principal,
+        COALESCE(p.estado, true) AS producto_estado
       FROM public.fidelizacion_productos_canjeables_sucursal fps
       INNER JOIN public.productos p
         ON p.id_producto = fps.id_producto
-      LEFT JOIN public.almacenes a
-        ON a.id_almacen = p.id_almacen
       WHERE fps.id_sucursal = $1
       ORDER BY COALESCE(fps.estado, true) DESC, p.nombre_producto ASC, fps.id_registro ASC
     `,
-    [idSucursal]
+    [sucursalId]
   );
 
-  return result.rows.map((row) => ({
-    ...row,
-    puntos_requeridos_efectivos:
-      parseNonNegativeInt(row.puntos_requeridos_override) ??
-      computeRedemptionPoints(row.precio, lempirasPorPunto),
-    stock_disponible: Math.max(
-      Number(row.cantidad || 0) - Number(row.stock_minimo || 0),
-      0
-    )
-  }));
+  const assignments = await resolveFidelizacionProductAssignments({
+    client,
+    idSucursal: sucursalId,
+    productIds: fpsResult.rows.map((row) => row.id_producto),
+    lockForUpdate: false
+  });
+
+  const merged = fpsResult.rows.map((row) => {
+    const assignment = assignments.get(Number(row.id_producto));
+    const resolved = assignment?.status === 'OK';
+    const cantidad = resolved ? assignment.cantidad : 0;
+    const stockMinimo = resolved ? assignment.stock_minimo : 0;
+
+    return {
+      ...row,
+      asignacion_local_estado: assignment?.status || 'SIN_ASIGNACION',
+      id_almacen: resolved ? assignment.id_almacen : null,
+      nombre_almacen: resolved ? assignment.nombre_almacen : null,
+      cantidad,
+      stock_minimo: stockMinimo,
+      stock_disponible: Math.max(cantidad - stockMinimo, 0),
+      puntos_requeridos_efectivos:
+        parseNonNegativeInt(row.puntos_requeridos_override) ??
+        computeRedemptionPoints(row.precio, lempirasPorPunto)
+    };
+  });
+
+  return attachImagenPrincipalUrls(pool, req, merged);
 };
 
 const fidelizacionService = {
@@ -415,11 +521,13 @@ const fidelizacionService = {
       allowAllBranches: true
     });
 
+    const empresaRelationExpr = await buildClienteEmpresaRelationSql(pool, 'c');
+
     const [config, aggregateResult, canjesHoyResult, canjesMesResult] = await Promise.all([
       scope.targetSucursalId ? getActiveFidelizacionConfig(pool, scope.targetSucursalId) : null,
       pool.query(
         `
-          ${buildClienteBaseSql()}
+          ${buildClienteBaseSql(empresaRelationExpr)}
           SELECT
             COUNT(*) FILTER (WHERE COALESCE(puntos_disponibles, 0) > 0)::int AS clientes_con_puntos,
             COALESCE(SUM(COALESCE(puntos_disponibles, 0)), 0)::int AS puntos_disponibles_totales
@@ -479,7 +587,7 @@ const fidelizacionService = {
 
   async listClientes(req) {
     const page = parsePageParam(req.query.page, 1);
-    const limit = parseLimitParam(req.query.limit, 20);
+    const limit = parseLimitParam(req.query.limit, DEFAULT_CLIENTES_PAGE_SIZE);
     if (!page || !limit) {
       return {
         status: 400,
@@ -501,6 +609,17 @@ const fidelizacionService = {
       };
     }
 
+    const rawSearchInput = req.query.search !== undefined ? req.query.search : req.query.q;
+    if (rawSearchInput !== undefined && normalizeText(rawSearchInput).length > MAX_SEARCH_LENGTH) {
+      return {
+        status: 400,
+        body: buildErrorBody({
+          code: 'VALIDATION_ERROR',
+          message: `search no debe exceder ${MAX_SEARCH_LENGTH} caracteres.`
+        })
+      };
+    }
+
     const scope = await resolveFidelizacionScope({
       req,
       client: pool,
@@ -508,11 +627,12 @@ const fidelizacionService = {
       allowAllBranches: true
     });
 
-    const search = buildLikeSearch(req.query.search || req.query.q);
+    const search = buildLikeSearch(rawSearchInput);
     const offset = (page - 1) * limit;
+    const empresaRelationExpr = await buildClienteEmpresaRelationSql(pool, 'c');
 
     const dataQuery = `
-      ${buildClienteBaseSql()}
+      ${buildClienteBaseSql(empresaRelationExpr)}
       SELECT
         cc.id_cliente,
         cc.id_usuario_cliente,
@@ -534,7 +654,7 @@ const fidelizacionService = {
     `;
 
     const countQuery = `
-      ${buildClienteBaseSql()}
+      ${buildClienteBaseSql(empresaRelationExpr)}
       SELECT COUNT(*)::int AS total
       ${buildClienteWhereClause({ searchParamRef: '$2' })}
     `;
@@ -778,7 +898,7 @@ const fidelizacionService = {
   async canjeablesCliente(req) {
     await assertAllPermissions(req, ['fidelizacion_ver_clientes', 'fidelizacion_canjear_presencial']);
 
-    const idCliente = parsePositiveInt(req.params.id_cliente);
+    const idCliente = parseStrictPositiveInt(req.params.id_cliente);
     if (!idCliente) {
       return {
         status: 400,
@@ -789,10 +909,29 @@ const fidelizacionService = {
       };
     }
 
+    const requestedSucursalId = parseNullablePositiveInt(req.query.id_sucursal);
+    if (req.query.id_sucursal !== undefined && !requestedSucursalId) {
+      return {
+        status: 400,
+        body: buildErrorBody({
+          code: 'VALIDATION_ERROR',
+          message: 'id_sucursal debe ser un entero positivo.'
+        })
+      };
+    }
+
+    // No superadmin: siempre su sucursal operativa autenticada (nunca un
+    // id_sucursal arbitrario del navegador salvo que este dentro de su
+    // alcance multisucursal ya autorizado, ver resolveFidelizacionScope).
+    // Superadmin: debe elegir la sucursal explicitamente en cada solicitud
+    // (requireExplicitSucursalForSuperAdmin) -- responde
+    // FIDELIZACION_SUCURSAL_REQUIRED si no la envia.
     const scope = await resolveFidelizacionScope({
       req,
       client: pool,
-      requireOperationalSucursal: true
+      requestedSucursalId,
+      requireOperationalSucursal: true,
+      requireExplicitSucursalForSuperAdmin: true
     });
 
     const cliente = await fetchClienteDetalleRow(pool, idCliente, null);
@@ -829,35 +968,63 @@ const fidelizacionService = {
       };
     }
 
-    const result = await pool.query(
+    // Datos maestros (nombre/descripcion/precio/imagen) desde productos; el
+    // stock/almacen local se resuelve aparte via
+    // resolveFidelizacionProductAssignments (producto maestro + sucursal
+    // operativa -> productos_almacenes), nunca con productos.id_almacen.
+    const canjeablesResult = await pool.query(
       `
         SELECT
           fps.id_producto,
           p.nombre_producto,
-          p.descripcion_producto,
+          COALESCE(p.descripcion_producto, '') AS descripcion_producto,
           p.precio,
-          p.id_almacen,
-          COALESCE(p.cantidad, 0)::int AS cantidad,
-          COALESCE(p.stock_minimo, 0)::int AS stock_minimo,
-          fps.puntos_requeridos_override,
-          GREATEST(COALESCE(p.cantidad, 0) - COALESCE(p.stock_minimo, 0), 0)::int AS stock_disponible
+          p.id_archivo_imagen_principal,
+          fps.puntos_requeridos_override
         FROM public.fidelizacion_productos_canjeables_sucursal fps
         INNER JOIN public.productos p
           ON p.id_producto = fps.id_producto
-        INNER JOIN public.almacenes a
-          ON a.id_almacen = p.id_almacen
         WHERE fps.id_sucursal = $1
           AND COALESCE(fps.estado, true) = true
           AND COALESCE(p.estado, true) = true
-          AND COALESCE(a.estado, true) = true
-          AND a.id_sucursal = $1
-          AND GREATEST(COALESCE(p.cantidad, 0) - COALESCE(p.stock_minimo, 0), 0) > 0
         ORDER BY p.nombre_producto ASC
       `,
       [scope.targetSucursalId]
     );
 
-    const data = result.rows
+    const assignments = await resolveFidelizacionProductAssignments({
+      client: pool,
+      idSucursal: scope.targetSucursalId,
+      productIds: canjeablesResult.rows.map((row) => row.id_producto),
+      lockForUpdate: false
+    });
+
+    const merged = canjeablesResult.rows
+      .map((row) => {
+        const assignment = assignments.get(Number(row.id_producto));
+        if (assignment?.status !== 'OK') return null;
+        if (assignment.stock_disponible <= 0) return null;
+
+        return {
+          id_producto: row.id_producto,
+          nombre_producto: row.nombre_producto,
+          descripcion_producto: row.descripcion_producto,
+          id_archivo_imagen_principal: row.id_archivo_imagen_principal,
+          precio: row.precio,
+          id_sucursal: assignment.id_sucursal,
+          id_almacen: assignment.id_almacen,
+          nombre_almacen: assignment.nombre_almacen,
+          cantidad: assignment.cantidad,
+          stock_minimo: assignment.stock_minimo,
+          stock_disponible: assignment.stock_disponible,
+          puntos_requeridos_override: row.puntos_requeridos_override
+        };
+      })
+      .filter((row) => row !== null);
+
+    const withImagenes = await attachImagenPrincipalUrls(pool, req, merged);
+
+    const data = withImagenes
       .map((row) => ({
         ...row,
         puntos_requeridos:
@@ -919,6 +1086,7 @@ const fidelizacionService = {
     const config = await getActiveFidelizacionConfig(pool, scope.targetSucursalId);
     const productos = await getConfiguracionProducts(
       pool,
+      req,
       scope.targetSucursalId,
       config?.lempiras_por_punto || null
     );
@@ -933,6 +1101,7 @@ const fidelizacionService = {
             ? {
                 id_configuracion: Number(config.id_configuracion),
                 lempiras_por_punto: Number(config.lempiras_por_punto),
+                acumulacion_habilitada: Boolean(config.acumulacion_habilitada),
                 vigente_desde: config.vigente_desde,
                 vigente_hasta: config.vigente_hasta,
                 id_usuario_creador: Number(config.id_usuario_creador)
@@ -963,6 +1132,8 @@ const fidelizacionService = {
     const allowedFields = new Set([
       'id_sucursal',
       'lempiras_por_punto',
+      'acumulacion_habilitada',
+      'confirmar_equivalencia',
       'productos',
       'productos_canjeables'
     ]);
@@ -978,8 +1149,36 @@ const fidelizacionService = {
       };
     }
 
-    const lempirasPorPunto = parsePositiveNumber(req.body.lempiras_por_punto);
-    if (!lempirasPorPunto) {
+    // Booleano estricto: "true" (string) u otros tipos se rechazan. Si se
+    // omite, el valor efectivo se resuelve mas abajo (tras leer la
+    // configuracion previa dentro de la transaccion): conserva el valor
+    // anterior si existe, y solo cae a false para la primera configuracion
+    // de la sucursal (ver resolveEffectiveAcumulacionHabilitada).
+    if (
+      req.body.acumulacion_habilitada !== undefined &&
+      typeof req.body.acumulacion_habilitada !== 'boolean'
+    ) {
+      return {
+        status: 400,
+        body: buildErrorBody({
+          code: 'VALIDATION_ERROR',
+          message: 'acumulacion_habilitada debe ser un booleano.'
+        })
+      };
+    }
+    const acumulacionHabilitadaProvided = req.body.acumulacion_habilitada !== undefined;
+    const acumulacionHabilitadaInput = acumulacionHabilitadaProvided ? req.body.acumulacion_habilitada : null;
+
+    // lempiras_por_punto tambien se usa para calcular canjes, asi que debe
+    // seguir siendo > 0 en TODA configuracion guardada, sin importar el
+    // switch. Si el payload trae el campo pero es invalido (0, negativo,
+    // NaN, no numerico) se rechaza siempre, aunque el switch este apagado:
+    // ya no se ignora en silencio. Si lo omite, se resuelve mas abajo
+    // (conserva la tasa anterior o exige una nueva si es la primera
+    // configuracion; ver resolveEffectiveLempirasPorPunto).
+    const lempirasPorPuntoProvided = req.body.lempiras_por_punto !== undefined;
+    const lempirasPorPuntoInput = parsePositiveNumber(req.body.lempiras_por_punto);
+    if (lempirasPorPuntoProvided && !lempirasPorPuntoInput) {
       return {
         status: 400,
         body: buildErrorBody({
@@ -989,7 +1188,7 @@ const fidelizacionService = {
       };
     }
 
-    const requestedSucursalId = parseNullablePositiveInt(req.body.id_sucursal);
+    const requestedSucursalId = parseStrictPositiveInt(req.body.id_sucursal);
     if (req.body.id_sucursal !== undefined && !requestedSucursalId) {
       return {
         status: 400,
@@ -1033,7 +1232,7 @@ const fidelizacionService = {
         };
       }
 
-      const idProducto = parsePositiveInt(item.id_producto);
+      const idProducto = parseStrictPositiveInt(item.id_producto);
       if (!idProducto) {
         return {
           status: 400,
@@ -1046,7 +1245,7 @@ const fidelizacionService = {
 
       let puntosOverride = null;
       if (item.puntos_requeridos_override !== undefined && item.puntos_requeridos_override !== null && item.puntos_requeridos_override !== '') {
-        puntosOverride = parsePositiveInt(item.puntos_requeridos_override);
+        puntosOverride = parseStrictPositiveInt(item.puntos_requeridos_override);
         if (!puntosOverride) {
           return {
             status: 400,
@@ -1077,21 +1276,24 @@ const fidelizacionService = {
       if (productIds.length > 0) {
         const productsResult = await client.query(
           `
-            SELECT
-              p.id_producto,
-              p.nombre_producto,
-              COALESCE(p.estado, true) AS estado,
-              p.id_almacen,
-              a.id_sucursal AS id_sucursal_almacen,
-              COALESCE(a.estado, true) AS almacen_estado
+            SELECT p.id_producto, p.nombre_producto, COALESCE(p.estado, true) AS estado
             FROM public.productos p
-            LEFT JOIN public.almacenes a
-              ON a.id_almacen = p.id_almacen
             WHERE p.id_producto = ANY($1::int[])
           `,
           [productIds]
         );
         const existingMap = new Map(productsResult.rows.map((row) => [Number(row.id_producto), row]));
+
+        // Un producto maestro puede estar asignado a varias sucursales via
+        // productos_almacenes: se valida la asignacion activa en la
+        // sucursal solicitada, nunca con productos.id_almacen (legado, un
+        // solo almacen por producto).
+        const assignments = await resolveFidelizacionProductAssignments({
+          client,
+          idSucursal: scope.targetSucursalId,
+          productIds,
+          lockForUpdate: false
+        });
 
         for (const idProducto of productIds) {
           const row = existingMap.get(idProducto);
@@ -1102,11 +1304,20 @@ const fidelizacionService = {
               'Uno o mas productos seleccionados no estan disponibles.'
             );
           }
-          if (!row.id_almacen || !Boolean(row.almacen_estado) || Number(row.id_sucursal_almacen || 0) !== scope.targetSucursalId) {
+
+          const assignment = assignments.get(idProducto);
+          if (assignment?.status === 'AMBIGUA') {
             throw createFidelizacionError(
               409,
-              'FIDELIZACION_PRODUCT_SCOPE_ERROR',
-              'Uno o mas productos no pertenecen al inventario operativo de la sucursal.'
+              'FIDELIZACION_PRODUCTO_ASIGNACION_AMBIGUA',
+              `El producto ${row.nombre_producto || idProducto} tiene mas de una asignacion activa en esta sucursal.`
+            );
+          }
+          if (assignment?.status !== 'OK') {
+            throw createFidelizacionError(
+              409,
+              'FIDELIZACION_PRODUCTO_SIN_ASIGNACION',
+              `El producto ${row.nombre_producto || idProducto} no tiene una asignacion de inventario activa en esta sucursal.`
             );
           }
         }
@@ -1116,6 +1327,63 @@ const fidelizacionService = {
       await client.query('LOCK TABLE public.fidelizacion_configuracion_sucursal IN EXCLUSIVE MODE');
 
       const previousConfig = await getActiveFidelizacionConfig(client, scope.targetSucursalId);
+
+      // Switch: booleano explicito del payload, o se conserva el de la
+      // configuracion previa; solo cae a false si es la primera
+      // configuracion de la sucursal.
+      const acumulacionHabilitada = resolveEffectiveAcumulacionHabilitada({
+        inputProvided: acumulacionHabilitadaProvided,
+        inputValue: acumulacionHabilitadaInput,
+        previousConfig
+      });
+
+      // Tasa: numero explicito del payload, o se conserva la tasa anterior
+      // (nunca se pisa con 0). La primera configuracion de una sucursal
+      // exige una tasa > 0 sin importar el switch: tambien la usa el canje.
+      const lempirasResolution = resolveEffectiveLempirasPorPunto({
+        inputProvided: lempirasPorPuntoProvided,
+        inputValue: lempirasPorPuntoInput,
+        previousConfig
+      });
+      if (!lempirasResolution.ok) {
+        throw createFidelizacionError(
+          400,
+          'VALIDATION_ERROR',
+          'lempiras_por_punto debe ser un numero mayor a 0 para la primera configuracion de la sucursal.'
+        );
+      }
+      const lempirasPorPunto = lempirasResolution.value;
+
+      // Confirmacion explicita de la equivalencia de la tasa.
+      //
+      // lempiras_por_punto = lempiras necesarios para ganar 1 punto
+      // (puntos = floor(total / tasa)). El campo resulto ambiguo en QA: se
+      // guardo 0.01 creyendo que era "puntos por lempira" y una compra de
+      // L 1,130.00 acumulo 113,000 puntos. La formula no cambia; lo que se
+      // agrega es una barrera consciente cuando la tasa se define por primera
+      // vez o cambia de valor.
+      //
+      // El backend NO confia en la interfaz: aunque el modal ya obliga a
+      // marcar la casilla, aqui se vuelve a exigir. Se compara la tasa
+      // EFECTIVA (la que realmente quedaria guardada) contra la vigente, de
+      // forma numerica, asi que reenviar la misma tasa escrita distinto
+      // (100 vs "100.00") o guardar solo productos/switch no vuelve a pedir
+      // confirmacion.
+      //
+      // Va DESPUES de resolver la tasa efectiva -necesita previousConfig para
+      // saber si cambio- pero ANTES de cualquier escritura: no se desactiva la
+      // configuracion anterior, no se inserta la nueva y no se tocan los
+      // productos canjeables. El throw viaja al catch de este handler, que ya
+      // hace ROLLBACK.
+      if (requiresRateConfirmation({ previousConfig, nextLempirasPorPunto: lempirasPorPunto })
+        && !isExplicitRateConfirmation(req.body.confirmar_equivalencia)) {
+        throw createFidelizacionError(
+          400,
+          'FIDELIZACION_RATE_CONFIRMATION_REQUIRED',
+          'Debe confirmar la equivalencia de puntos antes de guardar la configuracion.'
+        );
+      }
+
       await client.query(
         `
           UPDATE public.fidelizacion_configuracion_sucursal
@@ -1135,6 +1403,7 @@ const fidelizacionService = {
           INSERT INTO public.fidelizacion_configuracion_sucursal (
             id_sucursal,
             lempiras_por_punto,
+            acumulacion_habilitada,
             vigente_desde,
             vigente_hasta,
             estado,
@@ -1142,10 +1411,10 @@ const fidelizacionService = {
             fecha_creacion,
             fecha_actualizacion
           )
-          VALUES ($1, $2, NOW(), NULL, true, $3, NOW(), NOW())
+          VALUES ($1, $2, $3, NOW(), NULL, true, $4, NOW(), NOW())
           RETURNING id_configuracion
         `,
-        [scope.targetSucursalId, lempirasPorPunto, scope.idUsuario]
+        [scope.targetSucursalId, lempirasPorPunto, acumulacionHabilitada, scope.idUsuario]
       );
       const idConfiguracion = Number(configInsertResult.rows?.[0]?.id_configuracion || 0);
 
@@ -1229,12 +1498,14 @@ const fidelizacionService = {
         datosAntes: previousConfig
           ? {
               id_configuracion: Number(previousConfig.id_configuracion),
-              lempiras_por_punto: Number(previousConfig.lempiras_por_punto)
+              lempiras_por_punto: Number(previousConfig.lempiras_por_punto),
+              acumulacion_habilitada: Boolean(previousConfig.acumulacion_habilitada)
             }
           : null,
         datosDespues: {
           id_sucursal: scope.targetSucursalId,
           lempiras_por_punto: lempirasPorPunto,
+          acumulacion_habilitada: acumulacionHabilitada,
           productos_canjeables: [...productsMap.values()]
         }
       });
@@ -1249,6 +1520,7 @@ const fidelizacionService = {
           data: {
             id_sucursal: scope.targetSucursalId,
             lempiras_por_punto: lempirasPorPunto,
+            acumulacion_habilitada: acumulacionHabilitada,
             total_productos_canjeables: productsMap.size
           }
         }
@@ -1276,7 +1548,7 @@ const fidelizacionService = {
       };
     }
 
-    const allowedFields = new Set(['id_cliente', 'items', 'observacion']);
+    const allowedFields = new Set(['id_cliente', 'id_sucursal', 'id_sesion_caja', 'items', 'observacion']);
     const unknownFields = unknownFieldsFromPayload(req.body, allowedFields);
     if (unknownFields.length) {
       return {
@@ -1289,7 +1561,7 @@ const fidelizacionService = {
       };
     }
 
-    const idCliente = parsePositiveInt(req.body.id_cliente);
+    const idCliente = parseStrictPositiveInt(req.body.id_cliente);
     if (!idCliente) {
       return {
         status: 400,
@@ -1300,15 +1572,70 @@ const fidelizacionService = {
       };
     }
 
+    const requestedSucursalId = parseStrictPositiveInt(req.body.id_sucursal);
+    if (req.body.id_sucursal !== undefined && !requestedSucursalId) {
+      return {
+        status: 400,
+        body: buildErrorBody({
+          code: 'VALIDATION_ERROR',
+          message: 'id_sucursal debe ser un entero positivo.'
+        })
+      };
+    }
+
+    // Fase 4 (seccion 3.8): id_sesion_caja explicito solo lo acepta
+    // Administrador/Super Admin (resolveCanjeSesionCaja lo ignora para un
+    // cajero regular, que siempre usa su propia sesion). No se valida el
+    // rol aqui: eso lo decide resolveFidelizacionScope.hasMultisucursalAccess
+    // mas abajo, ya dentro de la transaccion.
+    const requestedSesionCajaId = parseStrictPositiveInt(req.body.id_sesion_caja);
+    if (req.body.id_sesion_caja !== undefined && !requestedSesionCajaId) {
+      return {
+        status: 400,
+        body: buildErrorBody({
+          code: 'VALIDATION_ERROR',
+          message: 'id_sesion_caja debe ser un entero positivo.'
+        })
+      };
+    }
+
+    // Validar y agregar items ANTES de pool.connect/BEGIN: un payload con
+    // items invalidos (id_producto/cantidad no numericos, decimales,
+    // arreglos, overflow, etc.) no debe consumir una conexion del pool ni
+    // abrir una transaccion que termine en ROLLBACK. validateAndAggregateCanjeItems
+    // lanza un error con httpStatus/code/publicMessage (createFidelizacionError);
+    // asyncHandler ya lo convierte en la respuesta 4xx correspondiente, igual
+    // que cualquier otro error FIDELIZACION_* lanzado en este router.
+    const validatedItems = validateAndAggregateCanjeItems(req.body.items);
+
     const client = await pool.connect();
     try {
+      await client.query('BEGIN');
+
+      // No superadmin: sucursal operativa autenticada (id_sucursal enviado
+      // solo se admite si esta dentro de su alcance ya autorizado). Superadmin:
+      // debe enviar id_sucursal explicitamente (FIDELIZACION_SUCURSAL_REQUIRED
+      // si falta) -- nunca se usa su userSucursalId en silencio.
       const scope = await resolveFidelizacionScope({
         req,
         client,
-        requireOperationalSucursal: true
+        requestedSucursalId,
+        requireOperationalSucursal: true,
+        requireExplicitSucursalForSuperAdmin: true
       });
 
-      await client.query('BEGIN');
+      // Fase 4 (seccion 3.8): sesion de caja obligatoria para todo canje
+      // presencial nuevo. Cajero -> su propia sesion abierta (ambigua/ausente
+      // -> error). Administrador/Super Admin (hasMultisucursalAccess) ->
+      // puede enviar id_sesion_caja explicito (validado) o dejar que se
+      // auto-seleccione si hay exactamente una abierta en la sucursal.
+      const sessionResolution = await resolveCanjeSesionCaja({
+        client,
+        idSucursal: scope.targetSucursalId,
+        idUsuario: scope.idUsuario,
+        hasMultisucursalAccess: scope.hasMultisucursalAccess,
+        requestedIdSesionCaja: requestedSesionCajaId
+      });
 
       const result = await createPresentialFidelizacionCanje({
         client,
@@ -1316,7 +1643,8 @@ const fidelizacionService = {
         idCliente,
         idSucursal: scope.targetSucursalId,
         idUsuarioEjecutor: scope.idUsuario,
-        items: req.body.items,
+        idSesionCaja: sessionResolution.id_sesion_caja,
+        items: validatedItems,
         observacion: req.body.observacion
       });
 
@@ -1333,6 +1661,7 @@ const fidelizacionService = {
             saldo_anterior: result.saldoAnterior,
             saldo_nuevo: result.saldoNuevo,
             id_sucursal: scope.targetSucursalId,
+            id_sesion_caja: sessionResolution.id_sesion_caja,
             items: result.items
           }
         }
@@ -1344,6 +1673,38 @@ const fidelizacionService = {
         // no-op
       }
       throw error;
+    } finally {
+      client.release();
+    }
+  },
+
+  async listCanjeSesiones(req) {
+    const requestedSucursalId = parseNullablePositiveInt(req.query.id_sucursal);
+    if (req.query.id_sucursal !== undefined && !requestedSucursalId) {
+      return {
+        status: 400,
+        body: buildErrorBody({
+          code: 'VALIDATION_ERROR',
+          message: 'id_sucursal debe ser un entero positivo.'
+        })
+      };
+    }
+    const client = await pool.connect();
+    try {
+      const scope = await resolveFidelizacionScope({
+        req,
+        client,
+        requestedSucursalId,
+        requireOperationalSucursal: true,
+        requireExplicitSucursalForSuperAdmin: true
+      });
+      const items = await listCanjeSesionesDisponibles({
+        client,
+        idSucursal: scope.targetSucursalId,
+        idUsuario: scope.idUsuario,
+        hasMultisucursalAccess: scope.hasMultisucursalAccess
+      });
+      return { status: 200, body: { items } };
     } finally {
       client.release();
     }
@@ -1682,6 +2043,15 @@ router.post(
 );
 
 router.get(
+  '/fidelizacion/canje-sesiones',
+  checkPermission(['fidelizacion_canjear_presencial']),
+  asyncHandler(fidelizacionService.listCanjeSesiones, {
+    defaultCode: 'FIDELIZACION_CANJE_SESIONES_LIST_ERROR',
+    defaultMessage: 'No se pudieron obtener las sesiones de caja disponibles.'
+  })
+);
+
+router.get(
   '/fidelizacion/canjes',
   checkPermission(['fidelizacion_ver_canjes']),
   asyncHandler(fidelizacionService.listCanjes, {
@@ -1699,4 +2069,21 @@ router.get(
   })
 );
 
+// Estos helpers puros se exportan solo para pruebas (verificar la SQL real
+// generada y la validacion/escape de listClientes sin depender de una base
+// de datos).
+export {
+  fidelizacionService,
+  buildClienteBaseSql,
+  buildClienteWhereClause,
+  escapeLikePattern,
+  buildLikeSearch,
+  parsePageParam,
+  parseLimitParam,
+  parseNullablePositiveInt,
+  resolveFidelizacionScope,
+  MAX_SEARCH_LENGTH,
+  MAX_PAGE_SIZE,
+  DEFAULT_CLIENTES_PAGE_SIZE
+};
 export default router;

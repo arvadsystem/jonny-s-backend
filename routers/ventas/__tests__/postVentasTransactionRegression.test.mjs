@@ -20,8 +20,12 @@ const getPostVentasHandlerSource = async () => {
   return source.slice(start, end);
 };
 
-const simulatePostVentasTransaction = async ({ failBeforeCommit = false } = {}) => {
+const simulatePostVentasTransaction = async ({
+  failBeforeCommit = false,
+  failCommit = false
+} = {}) => {
   const calls = [];
+  const responses = [];
   const client = {
     async query(sql) {
       const command = String(sql).trim();
@@ -29,6 +33,9 @@ const simulatePostVentasTransaction = async ({ failBeforeCommit = false } = {}) 
       await new Promise((resolve) => setTimeout(resolve, 1));
       if (failBeforeCommit && command === 'SAVE_SUCCESS') {
         throw new Error('idempotency success failed');
+      }
+      if (failCommit && command === 'COMMIT') {
+        throw new Error('commit failed');
       }
       return { rows: [] };
     }
@@ -49,6 +56,7 @@ const simulatePostVentasTransaction = async ({ failBeforeCommit = false } = {}) 
     transactionStarted = false;
     transactionCommitted = true;
     perf.add('transaction_ms', transactionStart);
+    responses.push('HTTP_SUCCESS');
   } catch (error) {
     if (transactionStarted) {
       await client.query('ROLLBACK');
@@ -59,7 +67,26 @@ const simulatePostVentasTransaction = async ({ failBeforeCommit = false } = {}) 
     }
   }
 
-  return { calls, summary: perf.summary() };
+  return { calls, responses, summary: perf.summary() };
+};
+
+const assertAtomicSuccessOrder = (block, label, responseBodyName) => {
+  const saveIndex = block.indexOf('await saveVentasIdempotencySuccess({');
+  const reserveIndex = block.indexOf('await reservePaidInvoiceAccumulation({');
+  const commitIndex = block.indexOf("await client.query('COMMIT');");
+  const responseIndex = block.indexOf(`res.status(201).json(${responseBodyName});`);
+  const notifyIndex = block.indexOf('void notifyPaidInvoice({');
+
+  assert.notEqual(saveIndex, -1, `${label}: falta guardar idempotencia SUCCESS`);
+  assert.match(
+    block.slice(saveIndex, reserveIndex),
+    /await saveVentasIdempotencySuccess\(\{\s*client,/,
+    `${label}: SUCCESS debe usar el mismo client transaccional`
+  );
+  assert.ok(saveIndex < reserveIndex, `${label}: SUCCESS debe preceder la reserva de fidelizacion`);
+  assert.ok(reserveIndex < commitIndex, `${label}: la reserva debe preceder el COMMIT`);
+  assert.ok(commitIndex < responseIndex, `${label}: no debe responder exito antes del COMMIT`);
+  assert.ok(responseIndex < notifyIndex, `${label}: notifyPaidInvoice debe ser post-COMMIT y posterior a la respuesta`);
 };
 
 describe('POST /ventas transaction regression guard', () => {
@@ -81,19 +108,27 @@ describe('POST /ventas transaction regression guard', () => {
     );
   });
 
-  it('guarda SUCCESS idempotente antes de cada COMMIT exitoso legacy/V1/V2 de POST /ventas', async () => {
+  it('V3/V2/V1/legacy mantienen venta, idempotencia SUCCESS y fidelizacion en la misma frontera atomica', async () => {
     const handler = await getPostVentasHandlerSource();
-    const commitMatches = [...handler.matchAll(/await client\.query\('COMMIT'\);/g)];
-    assert.equal(commitMatches.length, 4);
-    for (const match of commitMatches.slice(1)) {
-      const beforeCommit = handler.slice(Math.max(0, match.index - 900), match.index);
-      const afterCommit = handler.slice(match.index, match.index + 450);
-      assert.match(beforeCommit, /await saveVentasIdempotencySuccess\(/);
-      assert.doesNotMatch(afterCommit, /await saveVentasIdempotencySuccess\(/);
-    }
+    const v3Start = handler.indexOf('if (ventasRpcV3Enabled) {');
+    const v2Start = handler.indexOf('if (ventasRpcV2Enabled && !ventaHasSalsasInventario)', v3Start);
+    const v1Start = handler.indexOf('if (ventasRpcV1Enabled && !ventaHasExtras && !ventaHasSalsasInventario)', v2Start);
+    const legacyStart = handler.indexOf('const correlativoStart = ventasPerf.now();', v1Start);
+    const catchStart = handler.lastIndexOf('  } catch (err) {');
+
+    assert.notEqual(v3Start, -1, 'No se encontro el bloque V3');
+    assert.notEqual(v2Start, -1, 'No se encontro el bloque V2');
+    assert.notEqual(v1Start, -1, 'No se encontro el bloque V1');
+    assert.notEqual(legacyStart, -1, 'No se encontro el bloque legacy');
+    assert.notEqual(catchStart, -1, 'No se encontro el catch de POST /ventas');
+
+    assertAtomicSuccessOrder(handler.slice(v3Start, v2Start), 'V3', 'rpcV3ResponseBody');
+    assertAtomicSuccessOrder(handler.slice(v2Start, v1Start), 'V2', 'rpcV2ResponseBody');
+    assertAtomicSuccessOrder(handler.slice(v1Start, legacyStart), 'V1', 'rpcV1ResponseBody');
+    assertAtomicSuccessOrder(handler.slice(legacyStart, catchStart), 'legacy', 'createVentaResponse');
   });
 
-  it('POST /ventas V3 persiste snapshots antes del COMMIT sin idempotencia externa ni inventario Node', async () => {
+  it('POST /ventas V3 persiste snapshots e idempotencia antes del COMMIT sin inventario Node', async () => {
     const handler = await getPostVentasHandlerSource();
     const v3Start = handler.indexOf('if (ventasRpcV3Enabled) {');
     assert.notEqual(v3Start, -1, 'No se encontro el bloque V3.');
@@ -109,8 +144,28 @@ describe('POST /ventas transaction regression guard', () => {
       v3Block.indexOf('await persistVentaPedidoSnapshots(') < v3Block.indexOf("await client.query('COMMIT');"),
       'Los snapshots V3 deben guardarse antes del COMMIT.'
     );
-    assert.doesNotMatch(v3Block, /saveVentasIdempotencySuccess/);
+    assert.ok(
+      v3Block.indexOf('await persistVentaPedidoSnapshots(') < v3Block.indexOf('await saveVentasIdempotencySuccess({'),
+      'Los snapshots V3 deben existir antes de guardar la respuesta idempotente reconciliada.'
+    );
+    assert.ok(
+      v3Block.indexOf('await saveVentasIdempotencySuccess({') < v3Block.indexOf("await client.query('COMMIT');"),
+      'La idempotencia V3 debe quedar confirmada atomicamente con la venta.'
+    );
     assert.doesNotMatch(v3Block, /validarYDescontarInventarioCajaPedido/);
+  });
+
+  it('saveVentasIdempotencySuccess ejecuta el UPDATE mediante el client recibido', async () => {
+    const source = await readFile(new URL('../../ventas.js', import.meta.url), 'utf8');
+    const start = source.indexOf('const saveVentasIdempotencySuccess = async ({');
+    const end = source.indexOf('\n};', start);
+    assert.notEqual(start, -1);
+    assert.notEqual(end, -1);
+    const helper = source.slice(start, end);
+
+    assert.match(helper, /client = pool/);
+    assert.match(helper, /await client\.query\(/);
+    assert.doesNotMatch(helper, /await pool\.query\(/);
   });
 
   it('persistencia de snapshots evita duplicados por replay para el mismo pedido', async () => {
@@ -200,6 +255,14 @@ describe('POST /ventas transaction regression guard', () => {
     assert.equal(calls.filter((call) => call === 'COMMIT').length, 0);
     assert.equal(calls.filter((call) => call === 'ROLLBACK').length, 1);
     assert.equal(summary.sql_query_count, calls.length);
+    assert.ok(summary.sql_total_ms > 0);
+  });
+
+  it('un error de COMMIT revierte, marca FAILED y nunca permite responder exito', async () => {
+    const { calls, responses, summary } = await simulatePostVentasTransaction({ failCommit: true });
+    assert.deepEqual(calls, ['BEGIN', 'INSERT_SALE', 'SAVE_SUCCESS', 'COMMIT', 'ROLLBACK', 'SAVE_FAILURE']);
+    assert.deepEqual(responses, []);
+    assert.equal(calls.filter((call) => call === 'ROLLBACK').length, 1);
     assert.ok(summary.sql_total_ms > 0);
   });
 });

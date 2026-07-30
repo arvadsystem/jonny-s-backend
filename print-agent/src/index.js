@@ -7,6 +7,7 @@ import { createQzClient } from './qzClient.js';
 import { createRunner } from './runner.js';
 import { createPrintStateStore } from './stateStore.js';
 import { acquireProcessLock } from './processLock.js';
+import { createPrintAgentWebSocketClient } from './wsClient.js';
 
 const config = loadConfig();
 const agentDirectory = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -19,6 +20,7 @@ const processLock = acquireProcessLock({
 
 let qz;
 let runner;
+let wsClient;
 let shutdownPromise;
 let exitRequested = false;
 const shutdown = async (signal) => {
@@ -26,6 +28,7 @@ const shutdown = async (signal) => {
 
   shutdownPromise = (async () => {
     log('info', 'shutdown', { signal });
+    wsClient?.stop();
     runner?.stop();
     await qz?.disconnect().catch(() => undefined);
     processLock.release();
@@ -48,10 +51,30 @@ process.once('SIGTERM', () => exitAfterShutdown('SIGTERM'));
 
 try {
   const api = createApiClient({ config });
-  qz = createQzClient({ config, api });
+  qz = createQzClient({ config, api, log });
   const stateStore = createPrintStateStore({ filePath: config.stateFile });
   await stateStore.init();
   runner = createRunner({ config, api, qz, stateStore, log });
+  if (config.websocketEnabled) {
+    wsClient = createPrintAgentWebSocketClient({
+      config,
+      log,
+      onSignal: (trigger) => runner.claimAndProcess(trigger)
+    });
+    wsClient.start();
+    log('info', 'ws_client_enabled', {});
+  }
+  // Preconexion best-effort, deshabilitada por defecto (QZ_PRECONNECT_ENABLED): antes de
+  // reclamar un trabajo no existe signingContext, y QZ Tray exige firma ligada a un trabajo
+  // real -- intentar preconectar sin eso deja la sesion como "anonymous" (QZ_GENERIC_
+  // SIGNING_DISABLED, job_id 0). El primer trabajo real conecta igual dentro de
+  // qz.prepare(), con su firma valida. Si se habilita, qzClient.js igual omite la conexion
+  // mientras no exista un mecanismo de firma seguro para ella (ver qzClient.js/preconnect).
+  if (config.qzPreconnectEnabled) {
+    await qz.preconnect();
+  } else {
+    log('info', 'qz_preconnect_disabled', {});
+  }
   log('info', 'agent_started', { agent_id: config.agentId, branch_id: config.branchId });
   await runner.run();
 } finally {

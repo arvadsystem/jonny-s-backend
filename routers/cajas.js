@@ -19,6 +19,7 @@ import {
   CAJA_CLOSE_EMAIL_FALLBACK_TO,
   createCajaCloseEmailNotification,
   fetchCajaCloseEmailNotificationByCloseId,
+  loadCajaCloseEmailPayload,
   reactivateFailedCajaCloseEmailNotification
 } from '../services/cajaCloseEmailOutboxService.js';
 import {
@@ -5195,10 +5196,6 @@ const closeSessionHandler = async (req, res) => {
       ]
     );
     const idCierreCaja = parsePositiveBigIntId(closeResult.rows?.[0]?.id_cierre_caja);
-    const closeEmailNotification = await createCajaCloseEmailNotification(client, {
-      idCierreCaja,
-      emailDestino: CAJA_CLOSE_EMAIL_FALLBACK_TO
-    });
 
     if (idCierreCaja && idValidacionCierre) {
       await client.query(
@@ -5307,6 +5304,12 @@ const closeSessionHandler = async (req, res) => {
         Math.abs(roundMoney(diferencia)) > 0 ||
         resolutionCode === 'PENDIENTE_REVISION' ||
         hasArqueoInconsistency;
+      const closeEmailPayload = await loadCajaCloseEmailPayload(client, idCierreCaja);
+      const closeEmailNotification = await createCajaCloseEmailNotification(client, {
+        idCierreCaja,
+        emailDestino: CAJA_CLOSE_EMAIL_FALLBACK_TO,
+        payload: closeEmailPayload
+      });
       const isCashierOnly = await isCashierOnlyRequest(req, client);
       return {
         idCierreCaja,
@@ -5378,9 +5381,11 @@ router.post('/ventas/cajas/cierres/:id/reintentar-correo', checkPermission(['VEN
 
       const currentNotification = await fetchCajaCloseEmailNotificationByCloseId(client, idCierreCaja);
       if (!currentNotification) {
+        const payload = await loadCajaCloseEmailPayload(client, idCierreCaja);
         return createCajaCloseEmailNotification(client, {
           idCierreCaja,
-          emailDestino: CAJA_CLOSE_EMAIL_FALLBACK_TO
+          emailDestino: CAJA_CLOSE_EMAIL_FALLBACK_TO,
+          payload
         });
       }
       if (currentNotification.estado !== 'FALLIDO') {

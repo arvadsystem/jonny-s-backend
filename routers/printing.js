@@ -1,4 +1,5 @@
 import express from 'express';
+import { randomUUID } from 'node:crypto';
 import pool from '../config/db-connection.js';
 import { checkPermission, requestHasAnyRole } from '../middleware/checkPermission.js';
 import { resolveRequestUserSucursalScope } from '../utils/sucursalScope.js';
@@ -16,6 +17,7 @@ import {
   listAmbiguousPrintJobs,
   resolvePrintJobAdministratively
 } from '../services/printQueueAdminService.js';
+import { loadVentaReversionTicketData } from '../services/ventaReversionTicketPdfService.js';
 
 const router = express.Router();
 const ADMIN_ROLE_CODES = Object.freeze(['ADMIN', 'ADMINISTRADOR', 'SUPER_ADMIN']);
@@ -169,6 +171,64 @@ export const enqueueVentaCanonicalPrintJob = async ({
   return { job, createdDocument };
 };
 
+export const enqueueVentaReversionPrintJob = async ({
+  req,
+  idReversion,
+  queryRunner = pool,
+  loadReversion = loadVentaReversionTicketData,
+  resolveScope = resolveRequestUserSucursalScope,
+  createPayload = createCanonicalPrintJob,
+  enqueue = enqueuePrintJob,
+  createUuid = randomUUID
+}) => {
+  const normalizedIdReversion = parseStrictPositiveId(idReversion);
+  if (!normalizedIdReversion) {
+    throw createPrintRequestError('ID de reversion invalido.', {
+      code: 'PRINT_REVERSION_INVALID'
+    });
+  }
+  const reversion = await loadReversion({
+    db: queryRunner,
+    idReversion: normalizedIdReversion
+  });
+  if (!reversion) {
+    throw createPrintRequestError('Reversion no encontrada.', {
+      status: 404,
+      code: 'PRINT_REVERSION_NOT_FOUND'
+    });
+  }
+  if (String(reversion.estado || '').trim().toUpperCase() !== 'APLICADA') {
+    throw createPrintRequestError('Solo se puede reimprimir una reversion aplicada.', {
+      status: 409,
+      code: 'PRINT_REVERSION_NOT_APPLIED'
+    });
+  }
+  const idSucursal = await resolveAllowedSucursal(
+    req,
+    reversion.id_sucursal,
+    queryRunner,
+    resolveScope
+  );
+  const createdDocument = await createPayload({
+    tipoDocumento: 'reversion',
+    venta: reversion,
+    widthMm: reversion.ancho_ticket_mm
+  });
+  const job = await enqueue({
+    idSucursal,
+    tipoDocumento: 'reversion',
+    payload: createdDocument.payload,
+    canonicalDocument: createdDocument.document,
+    idempotencyKey: `reversion:${normalizedIdReversion}:reprint:${createUuid()}`,
+    idFactura: Number(reversion.id_factura_original),
+    idPedido: null,
+    idReversion: normalizedIdReversion,
+    idUsuario: Number(req?.user?.id_usuario || 0) || null,
+    esReimpresion: true
+  });
+  return { job, createdDocument };
+};
+
 const requireAdministrativePrintRole = async (req) => {
   if (!(await requestHasAnyRole(req, ADMIN_ROLE_CODES))) {
     throw Object.assign(new Error('Resolucion exclusiva para administradores.'), { status: 403, code: 'PRINT_ADMIN_ROLE_REQUIRED' });
@@ -245,6 +305,27 @@ router.post('/ventas/:id/print-jobs', checkPermission(['VENTAS_IMPRIMIR', 'VENTA
   } catch (error) {
     console.error('[printing.enqueue] fallo', { code: error?.code || null });
     return res.status(error?.status || 500).json({ ok: false, code: error?.code || 'PRINT_ENQUEUE_FAILED', message: error?.status ? error.message : 'No se pudo enviar el trabajo de impresion.' });
+  }
+});
+
+router.post('/ventas/reversiones/:idReversion/print-jobs', checkPermission(['VENTAS_IMPRIMIR']), async (req, res) => {
+  try {
+    const { job } = await enqueueVentaReversionPrintJob({
+      req,
+      idReversion: req.params.idReversion
+    });
+    return res.status(202).json({
+      ok: true,
+      message: 'Reimpresion de reversion enviada a la cola.',
+      job
+    });
+  } catch (error) {
+    console.error('[printing.enqueue-reversion] fallo', { code: error?.code || null });
+    return res.status(error?.status || 500).json({
+      ok: false,
+      code: error?.code || 'PRINT_ENQUEUE_FAILED',
+      message: error?.status ? error.message : 'No se pudo enviar la reimpresion.'
+    });
   }
 });
 

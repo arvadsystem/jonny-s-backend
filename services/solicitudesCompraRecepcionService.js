@@ -9,7 +9,8 @@ import {
 import {
   SolicitudesCompraError,
   parsePositiveIntStrict,
-  parseQuantity
+  parseQuantity,
+  resolveOperativeWarehouseId
 } from './solicitudesCompraService.js';
 import { multiplyApprovedQuantityToBase } from './solicitudesCompraRevisionService.js';
 import { SUPABASE_ADMIN_BUCKET, detectFileMimeTypeFromBuffer } from '../utils/uploads.js';
@@ -120,17 +121,15 @@ const assertAccess = async (req, queryRunner, dependencies) => {
   if (!isAdmin && !isOperative) fail(403, 'FORBIDDEN', 'El rol del usuario no puede recibir solicitudes de compra.');
   const userSucursalId = Number(scope?.userSucursalId || 0) || null;
   if (isOperative && !userSucursalId) fail(403, 'FORBIDDEN', 'El usuario no tiene una sucursal operativa asignada.');
+  const operativeWarehouseId = isOperative ? await dependencies.resolveOperativeWarehouse(queryRunner, userSucursalId) : null;
   const allowedSucursalIds = new Set((scope?.allowedSucursalIds || []).map(Number).filter((id) => Number.isInteger(id) && id > 0));
   if (userSucursalId) allowedSucursalIds.add(userSucursalId);
-  return { idUsuario: Number(rawAccess.idUsuario), isAdmin, isSuperAdmin, isOperative, userSucursalId, allowedSucursalIds };
+  return { idUsuario: Number(rawAccess.idUsuario), isAdmin, isSuperAdmin, isOperative, userSucursalId, operativeWarehouseId, allowedSucursalIds };
 };
 
 const assertBranchAccess = (header, access) => {
   if (!header) fail(404, 'NOT_FOUND', 'Solicitud de compra no encontrada.');
-  if (access.isOperative && Number(header.id_sucursal) !== access.userSucursalId) {
-    fail(403, 'FORBIDDEN', 'No tiene acceso a esta solicitud de compra.');
-  }
-  if (access.isAdmin && !access.isSuperAdmin && !access.allowedSucursalIds.has(Number(header.id_sucursal))) {
+  if (access.isOperative && (Number(header.id_sucursal) !== access.userSucursalId || Number(header.id_almacen) !== access.operativeWarehouseId)) {
     fail(403, 'FORBIDDEN', 'No tiene acceso a esta solicitud de compra.');
   }
 };
@@ -150,7 +149,7 @@ const parseStoredPositive = (value) => parseQuantity(String(value ?? ''), { inte
 const parseReceivedQuantity = (value, type) => {
   if (type !== 'PRODUCTO') return parseQuantity(value);
   const text = String(value ?? '').trim();
-  const integerEquivalent = /^(?:[1-9]\d*)(?:\.0{1,4})?$/.exec(text);
+  const integerEquivalent = /^(?:[1-9]\d*)(?:\.0{1,6})?$/.exec(text);
   return integerEquivalent ? parseQuantity(text.split('.')[0], { integerOnly: true }) : null;
 };
 
@@ -174,7 +173,7 @@ const normalizeDetails = (submitted, stored) => {
     const received = parseReceivedQuantity(line.rawQuantity, type);
     if (!received) fail(400, 'VALIDATION_ERROR', type === 'PRODUCTO'
       ? 'La cantidad recibida de un producto debe ser un entero positivo.'
-      : 'La cantidad recibida de un insumo debe ser positiva y tener hasta 4 decimales.');
+      : 'La cantidad recibida de un insumo debe ser positiva y tener hasta 6 decimales.');
     if (received.scaled !== approved.scaled) hasDifference = true;
     const factor = type === 'PRODUCTO' ? '1' : String(row.factor_conversion_snapshot ?? '').trim();
     return {
@@ -252,7 +251,8 @@ export const createSolicitudesCompraRecepcionService = (overrides = {}) => {
     getAssignment: overrides.getAssignment || getWarehouseAssignmentDetails,
     storage: overrides.storage || storageAdapter,
     now: overrides.now || (() => Date.now()),
-    uuid: overrides.uuid || (() => crypto.randomUUID())
+    uuid: overrides.uuid || (() => crypto.randomUUID()),
+    resolveOperativeWarehouse: overrides.resolveOperativeWarehouse || resolveOperativeWarehouseId
   };
 
   const receive = async (req) => {
