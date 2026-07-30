@@ -1,4 +1,5 @@
 import { parsePositiveInt } from '../utils/parseUtils.js';
+import { hasSalsaInventoryConsumptionEvidence } from './ventasReversionCalculationService.js';
 
 const PREPARATION_STARTED_STATES = new Set([
   'EN_PREPARACION',
@@ -18,6 +19,57 @@ const createPolicyError = (code, message) => {
 };
 
 const normalizeType = (value) => String(value || '').trim().toUpperCase();
+const isObject = (value) => value !== null && typeof value === 'object' && !Array.isArray(value);
+
+const hasConfiguredProduct = (value) => Boolean(
+  parsePositiveInt(value?.id_producto)
+  || parsePositiveInt(value?.inventario?.id_producto)
+);
+
+const hasConfiguredConsumable = (value) => Boolean(
+  parsePositiveInt(value?.id_insumo)
+  || parsePositiveInt(value?.id_insumo_configurado)
+  || parsePositiveInt(value?.id_insumo_maestro)
+  || parsePositiveInt(value?.id_insumo_legacy)
+  || parsePositiveInt(value?.inventario?.id_insumo)
+  || parsePositiveInt(value?.inventario?.id_insumo_configurado)
+  || parsePositiveInt(value?.inventario?.id_insumo_maestro)
+  || parsePositiveInt(value?.inventario?.id_insumo_legacy)
+  || value?.inventario_configurado === true
+  || value?.inventario?.inventario_configurado === true
+  || Number(value?.cantidad_insumo || value?.cant || value?.cantidad_base_total || 0) > 0
+  || Number(value?.inventario?.cantidad_insumo
+    || value?.inventario?.cant
+    || value?.inventario?.cantidad_base_total
+    || 0) > 0
+);
+
+const resolveSnapshotInventoryEvidence = (line) => {
+  const snapshot = isObject(line?.origen_snapshot) ? line.origen_snapshot : {};
+  const extras = [
+    ...(Array.isArray(snapshot.extras) ? snapshot.extras : []),
+    ...(Array.isArray(snapshot.extras_snapshot) ? snapshot.extras_snapshot : [])
+  ];
+  const standaloneExtra = Boolean(
+    line?.es_linea_extra_independiente
+    || snapshot.es_linea_extra_independiente
+    || parsePositiveInt(snapshot.id_extra)
+  );
+  const product = hasConfiguredProduct(snapshot)
+    || extras.some((extra) => hasConfiguredProduct(extra));
+  const consumable = Boolean(
+    parsePositiveInt(snapshot.id_receta)
+    || hasSalsaInventoryConsumptionEvidence(snapshot)
+    || extras.some((extra) => hasConfiguredConsumable(extra))
+    || (standaloneExtra && hasConfiguredConsumable(snapshot))
+  );
+
+  return {
+    product,
+    consumable,
+    configured: product || consumable
+  };
+};
 
 export const hasPedidoPreparationStarted = (pedidoContext) => Boolean(
   pedidoContext?.preparacion_iniciada
@@ -64,8 +116,16 @@ const loadExactOriginalMovements = async ({ client, line, forUpdate }) => {
 const classifyLinePolicy = ({ line, movements, pedidoContext }) => {
   const originalType = normalizeType(line?.tipo_item) || 'ITEM';
   const preparacionIniciada = hasPedidoPreparationStarted(pedidoContext);
-  const declaresProduct = Boolean(parsePositiveInt(line?.id_producto));
+  const snapshotEvidence = resolveSnapshotInventoryEvidence(line);
+  const declaresProduct = Boolean(parsePositiveInt(line?.id_producto))
+    || originalType === 'PRODUCTO'
+    || snapshotEvidence.product;
   const declaresRecipe = Boolean(parsePositiveInt(line?.id_receta)) || originalType === 'RECETA';
+  const consumableEvidence = declaresRecipe || snapshotEvidence.consumable;
+  const requiresTraceEvidence = Boolean(line?.requiereTrazabilidad)
+    || declaresProduct
+    || consumableEvidence
+    || snapshotEvidence.configured;
   const hasProductMovement = movements.some((movement) => parsePositiveInt(movement.id_producto));
   const hasConsumableMovement = movements.some((movement) => parsePositiveInt(movement.id_insumo));
   const hasUnknownMovement = movements.some(
@@ -73,7 +133,7 @@ const classifyLinePolicy = ({ line, movements, pedidoContext }) => {
   );
 
   if (!movements.length) {
-    if (declaresRecipe && preparacionIniciada) {
+    if (preparacionIniciada && !declaresProduct && consumableEvidence) {
       return {
         tipo_politica_inventario: 'CONSUMIBLE_PREPARABLE',
         preparacion_iniciada: true,
@@ -83,7 +143,7 @@ const classifyLinePolicy = ({ line, movements, pedidoContext }) => {
         movimientos_a_restituir: []
       };
     }
-    if (declaresProduct || declaresRecipe || originalType === 'PRODUCTO') {
+    if (requiresTraceEvidence) {
       throw createPolicyError(
         'VENTAS_REVERSION_INVENTARIO_TRACE_REQUIRED',
         'No existe trazabilidad suficiente para devolver el inventario de esta venta.'
@@ -138,15 +198,18 @@ export const resolveReversionInventoryPolicies = async ({
   for (const line of Array.isArray(lines) ? lines : []) {
     const movements = await loadExactOriginalMovements({ client, line, forUpdate });
     const policy = classifyLinePolicy({ line, movements, pedidoContext });
+    const requiereTrazabilidadFinal = Boolean(line.requiereTrazabilidad)
+      || policy.exige_trazabilidad;
     const enrichedLine = {
       ...line,
       tipo_politica_inventario: policy.tipo_politica_inventario,
       preparacion_iniciada: policy.preparacion_iniciada,
       devuelve_inventario: policy.devuelve_inventario,
       motivo_no_devolucion: policy.motivo_no_devolucion,
-      requiereTrazabilidad: policy.exige_trazabilidad,
+      requiereTrazabilidad: requiereTrazabilidadFinal,
       politica_inventario: {
         ...policy,
+        exige_trazabilidad: requiereTrazabilidadFinal,
         movimientos_a_restituir: policy.movimientos_a_restituir.map(
           (movement) => Number(movement.id_movimiento)
         )
