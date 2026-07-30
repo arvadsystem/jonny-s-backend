@@ -12,7 +12,7 @@ import {
   lockAndValidateOriginalCajaSession
 } from '../routers/ventas/services/ventasReversionSessionService.js';
 import {
-  assertPedidoEligibleForReversion,
+  resolvePedidoReversionContext,
   resolveCancelledEstadoPedidoIdOrThrow
 } from '../routers/ventas/services/ventasReversionEligibilityService.js';
 import {
@@ -25,6 +25,7 @@ import {
   validatePartialReversionApplicability
 } from '../routers/ventas/services/ventasReversionCalculationService.js';
 import { returnInventoryForReversionLines } from '../routers/ventas/services/ventasReversionInventoryService.js';
+import { applyReversionInventoryPolicy } from '../routers/ventas/services/ventasReversionInventoryPolicyService.js';
 import { applyLoyaltyReversalForFactura } from '../routers/ventas/services/ventasReversionFidelizacionService.js';
 import {
   buildVentaReversionPrintStatus,
@@ -68,6 +69,42 @@ const createReversionError = (status, code, message) => {
   error.code = code;
   error.publicMessage = message;
   return error;
+};
+
+const INVENTORY_REVERSION_ERROR_MAP = [
+  {
+    trace: 'REVERSION_TRACE_INVALID',
+    code: 'VENTAS_REVERSION_INVENTARIO_TRACE_REQUIRED',
+    message: 'No existe trazabilidad suficiente para devolver el inventario de esta venta.'
+  },
+  {
+    trace: 'REVERSION_OVER_RETURN',
+    code: 'VENTAS_REVERSION_INVENTARIO_EXCEDE_ORIGINAL',
+    message: 'La devolución de inventario excede el movimiento original.'
+  },
+  {
+    trace: 'REVERSION_ALREADY_FULLY_RETURNED',
+    code: 'VENTAS_REVERSION_INVENTARIO_YA_DEVUELTO',
+    message: 'El inventario de esta línea ya fue devuelto completamente.'
+  },
+  {
+    trace: 'LEGACY_PARTIAL_BLOCKED',
+    code: 'VENTAS_REVERSION_INVENTARIO_LEGACY_NO_COMPATIBLE',
+    message: 'La trazabilidad histórica de esta venta no permite una devolución parcial segura.'
+  }
+];
+
+const mapInventoryReversionDatabaseError = (error) => {
+  const technicalText = [
+    error?.message,
+    error?.detail,
+    error?.hint,
+    error?.where
+  ].filter(Boolean).join(' ');
+  const match = INVENTORY_REVERSION_ERROR_MAP.find(({ trace }) => technicalText.includes(trace));
+  return match
+    ? createReversionError(409, match.code, match.message)
+    : error;
 };
 
 const resolveSucursalScope = async (client, idUsuario) => {
@@ -375,17 +412,23 @@ export const createVentaReversion = async ({ idFactura, body, req, idUsuario, id
 
     // 7) bloquear pedido + validar elegibilidad de Cocina (venta directa
     // sin pedido: no hay nada que validar, se permite)
-    await assertPedidoEligibleForReversion({ client, idPedido: factura.id_pedido });
+    const pedidoContext = await resolvePedidoReversionContext({
+      client,
+      idPedido: factura.id_pedido
+    });
 
     // 8) bloquear reversiones anteriores + calcular saldos reversables
     const reversedQtyMapBefore = await resolveAlreadyReversedQty(client, facturaId);
     validatePartialReversionApplicability({ tipoReversion, facturaLines, reversedQtyMap: reversedQtyMapBefore });
 
-    const reversionLines = resolveReversionLines({
-      tipoReversion,
-      requestedLines,
-      facturaLines,
-      reversedQtyMap: reversedQtyMapBefore
+    const reversionLines = applyReversionInventoryPolicy({
+      pedidoContext,
+      lines: resolveReversionLines({
+        tipoReversion,
+        requestedLines,
+        facturaLines,
+        reversedQtyMap: reversedQtyMapBefore
+      })
     });
 
     const idTipoMovimientoCaja = await resolveReversionCajaMovementType(client);
@@ -652,7 +695,7 @@ export const createVentaReversion = async ({ idFactura, body, req, idUsuario, id
     return { result, responseBody };
   } catch (error) {
     try { await client.query('ROLLBACK'); } catch {}
-    const mappedError = mapCajaFinancialLockError(error);
+    const mappedError = mapCajaFinancialLockError(mapInventoryReversionDatabaseError(error));
     if (error?.code === '23514' && error?.constraint === 'ck_facturas_reversiones_motivo') {
       throw createReversionError(
         409,

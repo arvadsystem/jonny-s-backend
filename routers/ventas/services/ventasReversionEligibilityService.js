@@ -1,7 +1,3 @@
-// Elegibilidad minima de Cocina/Pedido para reversion de venta (Fase 2).
-// Solo valida si el pedido PUEDE reversarse (bloqueo binario). El calculo
-// de cantidad EFECTIVA visible en el tablero de Cocina (original - ya
-// reversado) es responsabilidad de la Fase 3 y no se toca aqui.
 import { ESTADO_PEDIDO_CODES } from '../constants.js';
 import { normalizeTextKey } from '../utils/parseUtils.js';
 import { resolveEstadoPedidoIdByCode } from './catalogLookupService.js';
@@ -14,8 +10,6 @@ const createReversionEligibilityError = (httpStatus, code, message) => {
   return error;
 };
 
-const ALLOWED_PEDIDO_STATE_CODES = new Set(['PENDIENTE', 'EN_COCINA']);
-
 const resolvePedidoStateCode = (descripcion) => {
   const normalized = normalizeTextKey(descripcion);
   for (const [code, aliases] of Object.entries(ESTADO_PEDIDO_CODES)) {
@@ -25,17 +19,14 @@ const resolvePedidoStateCode = (descripcion) => {
 };
 
 /**
- * Bloquea (FOR UPDATE) y valida el pedido asociado a la factura, si existe.
- * Permite unicamente PENDIENTE/EN_COCINA con en_preparacion_at IS NULL.
- * Bloquea EN_PREPARACION, LISTO_PARA_ENTREGA, COMPLETADO, NO_ENTREGADO,
- * CANCELADO, cualquier estado no reconocido, y cualquier pedido con
- * en_preparacion_at NOT NULL incluso si el texto del estado dice EN_COCINA.
- *
- * Venta directa (factura sin id_pedido): no hay Cocina que validar: se
- * permite sin inventar un estado. Retorna null en ese caso.
+ * Bloquea y carga el contexto operativo del pedido asociado. El avance de
+ * Cocina no impide la reversion financiera: este contexto alimenta la
+ * politica unica de inventario por linea.
  */
-export const assertPedidoEligibleForReversion = async ({ client, idPedido }) => {
-  const pedidoId = Number.isSafeInteger(Number(idPedido)) && Number(idPedido) > 0 ? Number(idPedido) : null;
+export const resolvePedidoReversionContext = async ({ client, idPedido, forUpdate = true }) => {
+  const pedidoId = Number.isSafeInteger(Number(idPedido)) && Number(idPedido) > 0
+    ? Number(idPedido)
+    : null;
   if (!pedidoId) return null;
 
   const result = await client.query(
@@ -47,7 +38,7 @@ export const assertPedidoEligibleForReversion = async ({ client, idPedido }) => 
       FROM public.pedidos p
       LEFT JOIN public.estados_pedido ep ON ep.id_estado_pedido = p.id_estado_pedido
       WHERE p.id_pedido = $1
-      FOR UPDATE OF p
+      ${forUpdate ? 'FOR UPDATE OF p' : ''}
     `,
     [pedidoId]
   );
@@ -56,31 +47,23 @@ export const assertPedidoEligibleForReversion = async ({ client, idPedido }) => 
 
   const pedido = result.rows[0];
   const stateCode = resolvePedidoStateCode(pedido.estado_descripcion);
-  const preparacionIniciada = pedido.en_preparacion_at !== null && pedido.en_preparacion_at !== undefined;
-  const isAllowedState = ALLOWED_PEDIDO_STATE_CODES.has(stateCode);
-
-  if (!isAllowedState || preparacionIniciada) {
-    throw createReversionEligibilityError(
-      409,
-      'VENTAS_REVERSION_PREPARACION_INICIADA',
-      'La venta ya inició preparación y no puede reversarse.'
-    );
-  }
+  const preparacionIniciada = Boolean(
+    pedido.en_preparacion_at
+    || ['EN_PREPARACION', 'LISTO_PARA_ENTREGA', 'COMPLETADO'].includes(stateCode)
+  );
 
   return {
     id_pedido: pedidoId,
-    estado: stateCode,
-    en_preparacion_at: pedido.en_preparacion_at
+    estado: stateCode || 'DESCONOCIDO',
+    en_preparacion_at: pedido.en_preparacion_at,
+    preparacion_iniciada: preparacionIniciada
   };
 };
 
-/**
- * Resuelve el id_estado_pedido de CANCELADO por CODIGO (nunca hardcodeado).
- * Si el catalogo aun no tiene la fila (migracion de Fase 1 no aplicada
- * todavia en este entorno), NO cae de vuelta a PENDIENTE: aborta con un
- * codigo de configuracion explicito para que el pedido nunca quede en un
- * estado incorrecto.
- */
+// Alias conservado para no romper importadores existentes. Ya no rechaza por
+// estado de Cocina; devuelve el contexto bloqueado del pedido.
+export const assertPedidoEligibleForReversion = resolvePedidoReversionContext;
+
 export const resolveCancelledEstadoPedidoIdOrThrow = async (client) => {
   const idEstadoCancelado = await resolveEstadoPedidoIdByCode(client, 'CANCELADO');
   if (!idEstadoCancelado) {

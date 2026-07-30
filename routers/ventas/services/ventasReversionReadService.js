@@ -3,8 +3,7 @@
 // El frontend NUNCA debe calcular elegibilidad ni montos criticos: ambos
 // endpoints recalculan siempre desde la base de datos.
 import pool from '../../../config/db-connection.js';
-import { parsePositiveInt, normalizeTextKey } from '../utils/parseUtils.js';
-import { ESTADO_PEDIDO_CODES } from '../constants.js';
+import { parsePositiveInt } from '../utils/parseUtils.js';
 import {
   resolveSucursalScope,
   assertSucursalAllowedForReversion,
@@ -18,18 +17,10 @@ import {
   computeFacturaTotal,
   computeAccumulatedResult
 } from './ventasReversionCalculationService.js';
+import { resolvePedidoReversionContext } from './ventasReversionEligibilityService.js';
+import { applyReversionInventoryPolicy } from './ventasReversionInventoryPolicyService.js';
 
 const roundToTwo = (value) => Number(Number(value || 0).toFixed(2));
-
-const ALLOWED_PEDIDO_STATE_CODES = new Set(['PENDIENTE', 'EN_COCINA']);
-
-const resolvePedidoStateCode = (descripcion) => {
-  const normalized = normalizeTextKey(descripcion);
-  for (const [code, aliases] of Object.entries(ESTADO_PEDIDO_CODES)) {
-    if (aliases.has(normalized)) return code;
-  }
-  return null;
-};
 
 const loadFacturaForRead = async (client, facturaId) => {
   const result = await client.query(
@@ -119,34 +110,15 @@ const resolveSesionOriginalInfo = async (client, { idFactura, idSucursal }) => {
 };
 
 const resolvePedidoInfo = async (client, idPedido) => {
-  if (!idPedido) return { reversible: true, code: null, motivo_bloqueo: null, pedido: null };
-
-  const result = await client.query(
-    `
-      SELECT p.id_pedido, p.en_preparacion_at, ep.descripcion AS estado_descripcion
-      FROM public.pedidos p
-      LEFT JOIN public.estados_pedido ep ON ep.id_estado_pedido = p.id_estado_pedido
-      WHERE p.id_pedido = $1
-      LIMIT 1
-    `,
-    [idPedido]
-  );
-  const pedido = result.rows?.[0];
-  if (!pedido) return { reversible: true, code: null, motivo_bloqueo: null, pedido: null };
-
-  const stateCode = resolvePedidoStateCode(pedido.estado_descripcion);
-  const preparacionIniciada = pedido.en_preparacion_at !== null && pedido.en_preparacion_at !== undefined;
-  const allowed = ALLOWED_PEDIDO_STATE_CODES.has(stateCode) && !preparacionIniciada;
-
   return {
-    reversible: allowed,
-    code: allowed ? null : 'VENTAS_REVERSION_PREPARACION_INICIADA',
-    motivo_bloqueo: allowed ? null : 'La venta ya inició preparación y no puede reversarse.',
-    pedido: {
-      id_pedido: Number(pedido.id_pedido),
-      estado: stateCode || 'DESCONOCIDO',
-      preparacion_iniciada: preparacionIniciada
-    }
+    reversible: true,
+    code: null,
+    motivo_bloqueo: null,
+    pedido: await resolvePedidoReversionContext({
+      client,
+      idPedido,
+      forUpdate: false
+    })
   };
 };
 
@@ -285,11 +257,15 @@ export const previewVentaReversion = async ({ idFactura, idUsuario, body }) => {
 
       const facturaLines = await resolveFacturaLinesForUpdate(client, facturaId);
       const reversedQtyMapBefore = await resolveAlreadyReversedQty(client, facturaId);
-      const reversionLines = resolveReversionLines({
-        tipoReversion,
-        requestedLines,
-        facturaLines,
-        reversedQtyMap: reversedQtyMapBefore
+      const pedidoInfo = await resolvePedidoInfo(client, parsePositiveInt(factura.id_pedido));
+      const reversionLines = applyReversionInventoryPolicy({
+        pedidoContext: pedidoInfo.pedido,
+        lines: resolveReversionLines({
+          tipoReversion,
+          requestedLines,
+          facturaLines,
+          reversedQtyMap: reversedQtyMapBefore
+        })
       });
       const totalFactura = await computeFacturaTotal(client, facturaId);
       const accumulated = computeAccumulatedResult({ facturaLines, reversedQtyMapBefore, reversionLines });
@@ -313,12 +289,18 @@ export const previewVentaReversion = async ({ idFactura, idUsuario, body }) => {
         factura_totalmente_reversada: accumulated.factura_totalmente_reversada,
         lineas: reversionLines.map((line) => ({
           id_detalle_factura: line.id_detalle_factura,
+          tipo_item: line.tipo_item,
+          cantidad: line.cantidad_revertida,
+          monto: line.total_revertido,
           cantidad_revertida: line.cantidad_revertida,
           subtotal_revertido: line.subtotal_revertido,
           descuento_revertido: line.descuento_revertido,
           isv_15_revertido: line.isv_15_revertido,
           isv_18_revertido: line.isv_18_revertido,
-          total_revertido: line.total_revertido
+          total_revertido: line.total_revertido,
+          devuelve_inventario: line.devuelve_inventario,
+          motivo_no_devolucion: line.motivo_no_devolucion,
+          preparacion_iniciada: line.preparacion_iniciada
         })),
         // Inventario, puntos pendientes e impresion se calculan en fases
         // posteriores (3/4/5); no se inventan aqui.

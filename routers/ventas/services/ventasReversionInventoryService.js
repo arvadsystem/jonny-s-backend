@@ -18,6 +18,7 @@
 // VENTAS_REVERSION_INVENTARIO_TRACE_REQUIRED (rollback completo, sin REV,
 // sin movimiento de caja, sin puntos, sin pedido cancelado).
 import { parsePositiveInt } from '../utils/parseUtils.js';
+import { filterMovementsForReversionPolicy } from './ventasReversionInventoryPolicyService.js';
 
 const createReversionError = (status, code, message) => {
   const error = new Error(message);
@@ -88,22 +89,18 @@ const resolveOriginalMovementsForDetallePedido = async (client, idDetallePedido)
  * agregar, para que dos reversiones que tocaran el mismo movimiento nunca
  * puedan calcular su residuo con datos obsoletos.
  */
-const resolveAlreadyReturnedForMovement = async (client, { idDetallePedido, idAlmacen, idProducto, idInsumo, origenConsumo }) => {
+const resolveAlreadyReturnedForMovement = async (client, idMovimientoOrigen) => {
   await client.query(
     `
       SELECT id_movimiento
       FROM public.movimientos_inventario
       WHERE tipo = 'ENTRADA'
         AND ref_origen = $1
-        AND id_detalle_pedido = $2
-        AND id_almacen = $3
-        AND COALESCE(id_producto, 0) = COALESCE($4, 0)
-        AND COALESCE(id_insumo, 0) = COALESCE($5, 0)
-        AND origen_consumo IS NOT DISTINCT FROM $6
+        AND id_movimiento_origen = $2
       ORDER BY id_movimiento
       FOR UPDATE
     `,
-    [RETURN_REF_ORIGEN, idDetallePedido, idAlmacen, idProducto, idInsumo, origenConsumo]
+    [RETURN_REF_ORIGEN, idMovimientoOrigen]
   );
 
   const sumResult = await client.query(
@@ -112,13 +109,9 @@ const resolveAlreadyReturnedForMovement = async (client, { idDetallePedido, idAl
       FROM public.movimientos_inventario
       WHERE tipo = 'ENTRADA'
         AND ref_origen = $1
-        AND id_detalle_pedido = $2
-        AND id_almacen = $3
-        AND COALESCE(id_producto, 0) = COALESCE($4, 0)
-        AND COALESCE(id_insumo, 0) = COALESCE($5, 0)
-        AND origen_consumo IS NOT DISTINCT FROM $6
+        AND id_movimiento_origen = $2
     `,
-    [RETURN_REF_ORIGEN, idDetallePedido, idAlmacen, idProducto, idInsumo, origenConsumo]
+    [RETURN_REF_ORIGEN, idMovimientoOrigen]
   );
   return Number(sumResult.rows?.[0]?.total || 0);
 };
@@ -160,7 +153,14 @@ export const returnInventoryForReversionLine = async ({
     return { returned: false, reason: 'SIN_DETALLE_PEDIDO' };
   }
 
-  const originals = await resolveOriginalMovementsForDetallePedido(client, idDetallePedido);
+  const originalCandidates = await resolveOriginalMovementsForDetallePedido(client, idDetallePedido);
+  const originals = filterMovementsForReversionPolicy({
+    policy: line.politica_inventario,
+    movements: originalCandidates
+  });
+  if (!line.devuelve_inventario) {
+    return { returned: false, reason: line.motivo_no_devolucion || 'POLITICA_NO_DEVUELVE' };
+  }
   if (!originals.length) {
     if (line.requiereTrazabilidad) {
       throw createReversionError(
@@ -206,7 +206,8 @@ export const returnInventoryForReversionLine = async ({
       );
     }
 
-    const yaDevuelto = await resolveAlreadyReturnedForMovement(client, context);
+    const idMovimientoOrigen = Number(original.id_movimiento);
+    const yaDevuelto = await resolveAlreadyReturnedForMovement(client, idMovimientoOrigen);
 
     // Objetivo acumulado de devolucion para este movimiento original:
     // proporcional a la cantidad acumulada reversada de la linea, salvo
@@ -244,10 +245,11 @@ export const returnInventoryForReversionLine = async ({
           origen_consumo,
           ref_origen,
           id_ref,
+          id_movimiento_origen,
           id_pedido_trazabilidad,
           descripcion
         )
-        VALUES ('ENTRADA', $1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+        VALUES ('ENTRADA', $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
       `,
       [
         entradaActual,
@@ -258,13 +260,14 @@ export const returnInventoryForReversionLine = async ({
         context.origenConsumo,
         RETURN_REF_ORIGEN,
         idReversion,
+        idMovimientoOrigen,
         parsePositiveInt(original.id_pedido_trazabilidad),
         `Entrada por reversión ${codigoReversion} de venta ${codigoVenta} (movimiento original #${original.id_movimiento}, usuario ${idUsuario || 'N/D'})`
       ]
     );
 
     inserted.push({
-      id_movimiento_origen: Number(original.id_movimiento),
+      id_movimiento_origen: idMovimientoOrigen,
       cantidad: entradaActual,
       id_insumo: context.idInsumo || null,
       id_almacen: context.idAlmacen || null
