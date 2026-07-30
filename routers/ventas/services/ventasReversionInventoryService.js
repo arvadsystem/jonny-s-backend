@@ -18,7 +18,6 @@
 // VENTAS_REVERSION_INVENTARIO_TRACE_REQUIRED (rollback completo, sin REV,
 // sin movimiento de caja, sin puntos, sin pedido cancelado).
 import { parsePositiveInt } from '../utils/parseUtils.js';
-import { filterMovementsForReversionPolicy } from './ventasReversionInventoryPolicyService.js';
 
 const createReversionError = (status, code, message) => {
   const error = new Error(message);
@@ -33,58 +32,13 @@ const createReversionError = (status, code, message) => {
 // 2, para no perder precision en insumos fraccionarios (ej. gramos/onzas).
 const roundQty = (value) => Number((Number(value) || 0).toFixed(4));
 
-// Tipos de referencia que representan una SALIDA original de inventario
-// atribuible a una linea de pedido especifica (producto, receta/insumos,
-// extras, y las dos variantes de consumo de salsa que si dejan un
-// movimiento real). No incluye 'REVERSION_VENTA*' (esas son las entradas
-// que este mismo modulo genera) ni ningun otro ref_origen no relacionado
-// con el consumo de un pedido.
-const ORIGINAL_MOVEMENT_REF_ORIGENS = [
-  'PEDIDO',
-  'FALTANTE_COCINA',
-  'PEDIDO_PENDIENTE_SALSA',
-  'VENTA_SALSA'
-];
-
+// Las SALIDAS originales ya llegan validadas por la politica central:
+// solo PEDIDO y FALTANTE_COCINA son referencias compatibles.
 const RETURN_REF_ORIGEN = 'REVERSION_VENTA_INVENTARIO';
 
 /**
- * Localiza y bloquea (FOR UPDATE) los movimientos SALIDA originales
- * ligados EXACTAMENTE a esta linea de pedido (id_detalle_pedido), nunca al
- * pedido completo.
- */
-const resolveOriginalMovementsForDetallePedido = async (client, idDetallePedido) => {
-  const result = await client.query(
-    `
-      SELECT
-        id_movimiento,
-        cantidad,
-        id_almacen,
-        id_producto,
-        id_insumo,
-        origen_consumo,
-        id_pedido_trazabilidad
-      FROM public.movimientos_inventario
-      WHERE tipo = 'SALIDA'
-        AND id_detalle_pedido = $1
-        AND ref_origen = ANY($2::text[])
-      ORDER BY id_movimiento
-      FOR UPDATE
-    `,
-    [idDetallePedido, ORIGINAL_MOVEMENT_REF_ORIGENS]
-  );
-  return result.rows;
-};
-
-/**
  * Suma cuanto ya se devolvio (ENTRADA de reversion) para ESTE movimiento
- * original especifico, identificado por la misma tupla compuesta con la
- * que se inserto originalmente la SALIDA (id_detalle_pedido + id_almacen +
- * id_producto/id_insumo + origen_consumo). Esta tupla es una identidad
- * segura porque el insert original (services/inventarioMovimientoService.js
- * addMergedMovementRow) fusiona en una unica fila de SALIDA por pedido +
- * almacen + producto/insumo + origen_consumo -- nunca hay dos SALIDA
- * originales distintas con la misma tupla para el mismo detalle de pedido.
+ * original especifico, identificado por id_movimiento_origen.
  * Bloquea primero las filas ENTRADA candidatas (FOR UPDATE) antes de
  * agregar, para que dos reversiones que tocaran el mismo movimiento nunca
  * puedan calcular su residuo con datos obsoletos.
@@ -153,11 +107,9 @@ export const returnInventoryForReversionLine = async ({
     return { returned: false, reason: 'SIN_DETALLE_PEDIDO' };
   }
 
-  const originalCandidates = await resolveOriginalMovementsForDetallePedido(client, idDetallePedido);
-  const originals = filterMovementsForReversionPolicy({
-    policy: line.politica_inventario,
-    movements: originalCandidates
-  });
+  const originals = Array.isArray(line.movimientosOriginales)
+    ? line.movimientosOriginales
+    : [];
   if (!line.devuelve_inventario) {
     return { returned: false, reason: line.motivo_no_devolucion || 'POLITICA_NO_DEVUELVE' };
   }
@@ -328,4 +280,4 @@ export const returnInventoryForReversionLines = async ({
   return { results, returnedInsumoKeys };
 };
 
-export { ORIGINAL_MOVEMENT_REF_ORIGENS, RETURN_REF_ORIGEN };
+export { RETURN_REF_ORIGEN };

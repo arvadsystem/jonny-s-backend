@@ -25,7 +25,7 @@ import {
   validatePartialReversionApplicability
 } from '../routers/ventas/services/ventasReversionCalculationService.js';
 import { returnInventoryForReversionLines } from '../routers/ventas/services/ventasReversionInventoryService.js';
-import { applyReversionInventoryPolicy } from '../routers/ventas/services/ventasReversionInventoryPolicyService.js';
+import { resolveReversionInventoryPolicies } from '../routers/ventas/services/ventasReversionInventoryPolicyService.js';
 import { applyLoyaltyReversalForFactura } from '../routers/ventas/services/ventasReversionFidelizacionService.js';
 import {
   buildVentaReversionPrintStatus,
@@ -293,7 +293,10 @@ export const listFacturaReversiones = async ({ idFactura, idUsuario }) => {
               'isv_15_revertido', rd.isv_15_revertido,
               'isv_18_revertido', rd.isv_18_revertido,
               'total_revertido', rd.total_revertido,
-              'devuelve_inventario', rd.devuelve_inventario
+              'devuelve_inventario', rd.devuelve_inventario,
+              'motivo_no_devolucion', rd.motivo_no_devolucion,
+              'preparacion_iniciada', rd.preparacion_iniciada,
+              'tipo_politica_inventario', rd.tipo_politica_inventario
             )
             ORDER BY rd.id_reversion_detalle
           ) AS lineas
@@ -421,14 +424,16 @@ export const createVentaReversion = async ({ idFactura, body, req, idUsuario, id
     const reversedQtyMapBefore = await resolveAlreadyReversedQty(client, facturaId);
     validatePartialReversionApplicability({ tipoReversion, facturaLines, reversedQtyMap: reversedQtyMapBefore });
 
-    const reversionLines = applyReversionInventoryPolicy({
+    const reversionLines = await resolveReversionInventoryPolicies({
+      client,
       pedidoContext,
       lines: resolveReversionLines({
         tipoReversion,
         requestedLines,
         facturaLines,
         reversedQtyMap: reversedQtyMapBefore
-      })
+      }),
+      forUpdate: true
     });
 
     const idTipoMovimientoCaja = await resolveReversionCajaMovementType(client);
@@ -517,9 +522,12 @@ export const createVentaReversion = async ({ idFactura, body, req, idUsuario, id
             isv_15_revertido,
             isv_18_revertido,
             total_revertido,
-            devuelve_inventario
+            devuelve_inventario,
+            motivo_no_devolucion,
+            preparacion_iniciada,
+            tipo_politica_inventario
           )
-          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
         `,
         [
           idReversion,
@@ -534,7 +542,10 @@ export const createVentaReversion = async ({ idFactura, body, req, idUsuario, id
           line.isv_15_revertido,
           line.isv_18_revertido,
           line.total_revertido,
-          line.devuelve_inventario
+          line.devuelve_inventario,
+          line.motivo_no_devolucion,
+          line.preparacion_iniciada,
+          line.tipo_politica_inventario
         ]
       );
     }

@@ -111,6 +111,13 @@ export const resolveFacturaLinesForUpdate = async (client, idFactura) => {
         COALESCE(dfo.id_receta, df.id_receta::int) AS id_receta,
         COALESCE(dfo.id_detalle_pedido, df.id_detalle_pedido::int) AS id_detalle_pedido,
         COALESCE(dfo.origen_snapshot, df.origen_snapshot) AS origen_snapshot,
+        COALESCE(
+          dfo.origen_snapshot->>'nombre_item',
+          df.origen_snapshot->>'nombre_item',
+          prod.nombre_producto,
+          rec.nombre_receta,
+          'Item'
+        ) AS nombre_item,
         COALESCE(df.cantidad, 0)::int AS cantidad_vendida,
         COALESCE(df.precio_unitario, 0)::numeric(12,2) AS precio_unitario,
         COALESCE(df.sub_total, 0)::numeric(12,2) AS sub_total,
@@ -167,6 +174,10 @@ export const resolveFacturaLinesForUpdate = async (client, idFactura) => {
       FROM public.detalle_facturas df
       LEFT JOIN public.detalle_facturas_origen dfo
         ON dfo.id_detalle_factura = df.id_detalle_factura
+      LEFT JOIN public.productos prod
+        ON prod.id_producto = COALESCE(dfo.id_producto, df.id_producto)
+      LEFT JOIN public.recetas rec
+        ON rec.id_receta = COALESCE(dfo.id_receta, df.id_receta::int)
       WHERE df.id_factura = $1
       ORDER BY df.id_detalle_factura
       FOR UPDATE OF df`,
@@ -387,6 +398,7 @@ export const resolveReversionLines = ({ tipoReversion, requestedLines, facturaLi
 
     output.push({
       id_detalle_factura: idDetalle,
+      nombre: line.nombre_item || 'Item',
       origen_snapshot: line.origen_snapshot || null,
       tipo_item: line.tipo_item,
       id_producto: parsePositiveInt(line.id_producto),

@@ -18,7 +18,7 @@ import {
   computeAccumulatedResult
 } from './ventasReversionCalculationService.js';
 import { resolvePedidoReversionContext } from './ventasReversionEligibilityService.js';
-import { applyReversionInventoryPolicy } from './ventasReversionInventoryPolicyService.js';
+import { resolveReversionInventoryPolicies } from './ventasReversionInventoryPolicyService.js';
 
 const roundToTwo = (value) => Number(Number(value || 0).toFixed(2));
 
@@ -258,14 +258,16 @@ export const previewVentaReversion = async ({ idFactura, idUsuario, body }) => {
       const facturaLines = await resolveFacturaLinesForUpdate(client, facturaId);
       const reversedQtyMapBefore = await resolveAlreadyReversedQty(client, facturaId);
       const pedidoInfo = await resolvePedidoInfo(client, parsePositiveInt(factura.id_pedido));
-      const reversionLines = applyReversionInventoryPolicy({
+      const reversionLines = await resolveReversionInventoryPolicies({
+        client,
         pedidoContext: pedidoInfo.pedido,
         lines: resolveReversionLines({
           tipoReversion,
           requestedLines,
           facturaLines,
           reversedQtyMap: reversedQtyMapBefore
-        })
+        }),
+        forUpdate: false
       });
       const totalFactura = await computeFacturaTotal(client, facturaId);
       const accumulated = computeAccumulatedResult({ facturaLines, reversedQtyMapBefore, reversionLines });
@@ -289,7 +291,9 @@ export const previewVentaReversion = async ({ idFactura, idUsuario, body }) => {
         factura_totalmente_reversada: accumulated.factura_totalmente_reversada,
         lineas: reversionLines.map((line) => ({
           id_detalle_factura: line.id_detalle_factura,
+          nombre: line.nombre,
           tipo_item: line.tipo_item,
+          tipo_politica_inventario: line.tipo_politica_inventario,
           cantidad: line.cantidad_revertida,
           monto: line.total_revertido,
           cantidad_revertida: line.cantidad_revertida,

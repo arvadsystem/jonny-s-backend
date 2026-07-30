@@ -76,7 +76,11 @@ export const loadVentaReversionTicketData = async ({ db, idReversion }) => {
           ) AS nombre_item,
           rd.cantidad_revertida,
           rd.precio_unitario_original,
-          rd.total_revertido
+          rd.total_revertido,
+          rd.devuelve_inventario,
+          rd.motivo_no_devolucion,
+          rd.preparacion_iniciada,
+          rd.tipo_politica_inventario
         FROM public.facturas_reversiones_detalle rd
         LEFT JOIN public.detalle_facturas df
           ON df.id_detalle_factura = rd.id_detalle_factura
@@ -160,7 +164,10 @@ export const buildVentaReversionTicketModel = (data) => {
           name: line.nombre_item || 'Item',
           quantity: quantity(line.cantidad_revertida),
           unitPrice: money(line.precio_unitario_original),
-          total: money(line.total_revertido)
+          total: money(line.total_revertido),
+          inventoryPolicy: line.tipo_politica_inventario || null,
+          inventoryReason: line.motivo_no_devolucion || null,
+          preparationStarted: line.preparacion_iniciada === true
         }))
       : [],
     showDetail: data?.mostrar_detalle_reversion === true,
@@ -200,6 +207,9 @@ export const buildVentaReversionTicketPdfBuffer = async (data) => {
       doc.font('Helvetica-Bold').fontSize(8).text(line.name);
       doc.font('Helvetica').text(`${line.quantity} x ${line.unitPrice}`, { continued: true });
       doc.text(line.total, { align: 'right' });
+      if (line.inventoryReason === 'PREPARACION_INICIADA') {
+        doc.font('Helvetica').fontSize(7).text('Inventario: no devuelto; preparación iniciada.');
+      }
     }
   }
   if (model.total) {

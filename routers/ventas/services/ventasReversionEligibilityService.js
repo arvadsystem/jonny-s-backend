@@ -49,7 +49,7 @@ export const resolvePedidoReversionContext = async ({ client, idPedido, forUpdat
   const stateCode = resolvePedidoStateCode(pedido.estado_descripcion);
   const preparacionIniciada = Boolean(
     pedido.en_preparacion_at
-    || ['EN_PREPARACION', 'LISTO_PARA_ENTREGA', 'COMPLETADO'].includes(stateCode)
+    || ['EN_PREPARACION', 'LISTO_PARA_ENTREGA', 'COMPLETADO', 'NO_ENTREGADO'].includes(stateCode)
   );
 
   return {
