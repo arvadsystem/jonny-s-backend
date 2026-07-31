@@ -1,5 +1,6 @@
 import PDFDocument from 'pdfkit';
 import { formatHondurasDate, formatHondurasTime } from '../utils/hondurasDateTime.js';
+import { normalizarDatosTicketDesdeSnapshot } from './facturacionSnapshotService.js';
 
 const MM_TO_PT = 72 / 25.4;
 const toWidth = (value) => Number(value) === 58 ? 58 : 80;
@@ -10,6 +11,16 @@ const money = (value) => `L ${Number(value || 0).toFixed(2)}`;
 const quantity = (value) => {
   const parsed = Number(value || 0);
   return Number.isInteger(parsed) ? String(parsed) : parsed.toFixed(4).replace(/0+$/, '').replace(/\.$/, '');
+};
+
+const decodePdfLogo = (value) => {
+  const match = String(value || '').match(/^data:image\/(png|jpe?g);base64,([A-Za-z0-9+/=]+)$/i);
+  if (!match) return null;
+  try {
+    return Buffer.from(match[2], 'base64');
+  } catch {
+    return null;
+  }
 };
 
 export const loadVentaReversionTicketData = async ({ db, idReversion }) => {
@@ -31,6 +42,7 @@ export const loadVentaReversionTicketData = async ({ db, idReversion }) => {
         fr.creada_por,
         f.codigo_venta,
         f.fecha_hora_facturacion,
+        f.facturacion_snapshot,
         s.nombre_sucursal,
         c.codigo_caja,
         c.nombre_caja,
@@ -115,8 +127,18 @@ export const loadVentaReversionTicketData = async ({ db, idReversion }) => {
     )
   ]);
 
+  const facturacion = await normalizarDatosTicketDesdeSnapshot({
+    client: db,
+    factura: {
+      id_sucursal: header.id_sucursal,
+      facturacion_snapshot: header.facturacion_snapshot
+    },
+    includePrintAssets: true
+  });
+
   return {
     ...header,
+    facturacion,
     ancho_ticket_mm: toWidth(header.ancho_ticket_mm),
     imprimir_comprobante_reversion: toBoolean(header.imprimir_comprobante_reversion),
     mostrar_venta_original_reversion: toBoolean(header.mostrar_venta_original_reversion),
@@ -152,9 +174,21 @@ export const buildVentaReversionTicketModel = (data) => {
   if (data?.mostrar_motivo_reversion) fields.push({ label: 'Motivo', value: data?.motivo || '-' });
   fields.push({ label: 'Tipo solicitado', value: data?.tipo_reversion || '-' });
   fields.push({ label: 'Resultado acumulado', value: data?.resultado_acumulado || 'PARCIAL' });
+  const facturacion = data?.facturacion && typeof data.facturacion === 'object' ? data.facturacion : {};
+  const emisor = facturacion.emisor && typeof facturacion.emisor === 'object' ? facturacion.emisor : {};
+  const ticket = facturacion.ticket && typeof facturacion.ticket === 'object' ? facturacion.ticket : {};
 
   return {
     widthMm: toWidth(data?.ancho_ticket_mm),
+    branding: {
+      logo: ticket.mostrar_logo_ticket === true ? decodePdfLogo(emisor.logo_data_url) : null,
+      nombre: emisor.nombre_emisor || "JONNY'S",
+      textoEncabezado: ticket.texto_encabezado_ticket || null,
+      rtn: ticket.mostrar_rtn !== false ? emisor.rtn_emisor || null : null,
+      direccion: ticket.mostrar_direccion !== false ? emisor.direccion_emisor || null : null,
+      telefono: ticket.mostrar_telefono !== false ? emisor.telefono_emisor || null : null,
+      correo: ticket.mostrar_correo === true ? emisor.correo_emisor || null : null
+    },
     title: 'COMPROBANTE DE REVERSIÓN',
     disclaimer: 'NO ES FACTURA',
     fields,
@@ -178,7 +212,18 @@ export const buildVentaReversionTicketModel = (data) => {
 export const buildVentaReversionTicketPdfBuffer = async (data) => {
   const model = buildVentaReversionTicketModel(data);
   const widthPt = model.widthMm * MM_TO_PT;
-  const estimatedHeight = Math.max(360, 235 + model.fields.length * 18 + model.lines.length * 34);
+  const brandingLines = [
+    model.branding.nombre,
+    model.branding.textoEncabezado,
+    model.branding.rtn,
+    model.branding.direccion,
+    model.branding.telefono,
+    model.branding.correo
+  ].filter(Boolean).length;
+  const estimatedHeight = Math.max(
+    420,
+    270 + brandingLines * 14 + (model.branding.logo ? 72 : 0) + model.fields.length * 18 + model.lines.length * 34
+  );
   const doc = new PDFDocument({
     size: [widthPt, estimatedHeight],
     margins: { top: 12, right: 12, bottom: 12, left: 12 },
@@ -192,7 +237,21 @@ export const buildVentaReversionTicketPdfBuffer = async (data) => {
     doc.on('error', reject);
   });
 
-  doc.font('Helvetica-Bold').fontSize(model.widthMm === 58 ? 11 : 13).text(model.title, { align: 'center' });
+  if (model.branding.logo) {
+    doc.image(model.branding.logo, {
+      fit: [widthPt - 24, model.widthMm === 58 ? 54 : 72],
+      align: 'center'
+    });
+    doc.moveDown(0.3);
+  }
+  doc.font('Helvetica-Bold').fontSize(model.widthMm === 58 ? 9 : 10).text(model.branding.nombre, { align: 'center' });
+  if (model.branding.textoEncabezado) doc.font('Helvetica').fontSize(8).text(model.branding.textoEncabezado, { align: 'center' });
+  if (model.branding.rtn) doc.font('Helvetica').fontSize(8).text(`RTN: ${model.branding.rtn}`, { align: 'center' });
+  if (model.branding.direccion) doc.font('Helvetica').fontSize(8).text(model.branding.direccion, { align: 'center' });
+  if (model.branding.telefono) doc.font('Helvetica').fontSize(8).text(`Tel: ${model.branding.telefono}`, { align: 'center' });
+  if (model.branding.correo) doc.font('Helvetica').fontSize(8).text(model.branding.correo, { align: 'center' });
+  doc.moveDown(0.35).dash(2, { space: 2 }).moveTo(12, doc.y).lineTo(widthPt - 12, doc.y).stroke().undash();
+  doc.moveDown(0.4).font('Helvetica-Bold').fontSize(model.widthMm === 58 ? 11 : 13).text(model.title, { align: 'center' });
   doc.fontSize(10).text(model.disclaimer, { align: 'center' });
   doc.moveDown(0.5).dash(2, { space: 2 }).moveTo(12, doc.y).lineTo(widthPt - 12, doc.y).stroke().undash();
   doc.moveDown(0.4);

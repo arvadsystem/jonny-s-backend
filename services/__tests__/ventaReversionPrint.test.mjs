@@ -47,6 +47,24 @@ const baseData = (overrides = {}) => ({
   mostrar_detalle_reversion: true,
   mostrar_total_reversion: true,
   resultado_acumulado: 'PARCIAL',
+  facturacion: {
+    emisor: {
+      nombre_emisor: "JONNY'S EL CARMEN",
+      rtn_emisor: '08011999123456',
+      direccion_emisor: 'El Carmen, San Pedro Sula',
+      telefono_emisor: '2500-0000',
+      correo_emisor: 'facturacion@example.com',
+      logo_data_url: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII='
+    },
+    ticket: {
+      mostrar_logo_ticket: true,
+      mostrar_rtn: true,
+      mostrar_direccion: true,
+      mostrar_telefono: true,
+      mostrar_correo: true,
+      texto_encabezado_ticket: 'Gracias por su compra'
+    }
+  },
   lineas: [
     {
       id_reversion_detalle: 1,
@@ -61,6 +79,37 @@ const baseData = (overrides = {}) => ({
 });
 
 describe('comprobante canonico de reversion', () => {
+  it('reutiliza logo, restaurante y campos del encabezado de la factura', () => {
+    const model = buildVentaReversionTicketModel(baseData());
+    assert.equal(model.branding.nombre, "JONNY'S EL CARMEN");
+    assert.equal(model.branding.rtn, '08011999123456');
+    assert.equal(model.branding.direccion, 'El Carmen, San Pedro Sula');
+    assert.equal(model.branding.telefono, '2500-0000');
+    assert.equal(model.branding.correo, 'facturacion@example.com');
+    assert.equal(model.branding.textoEncabezado, 'Gracias por su compra');
+    assert.ok(Buffer.isBuffer(model.branding.logo));
+  });
+
+  it('respeta las banderas visuales del encabezado de facturacion', () => {
+    const model = buildVentaReversionTicketModel(baseData({
+      facturacion: {
+        emisor: baseData().facturacion.emisor,
+        ticket: {
+          mostrar_logo_ticket: false,
+          mostrar_rtn: false,
+          mostrar_direccion: false,
+          mostrar_telefono: false,
+          mostrar_correo: false
+        }
+      }
+    }));
+    assert.equal(model.branding.logo, null);
+    assert.equal(model.branding.rtn, null);
+    assert.equal(model.branding.direccion, null);
+    assert.equal(model.branding.telefono, null);
+    assert.equal(model.branding.correo, null);
+  });
+
   it('una parcial contiene solo las lineas de esa operacion', () => {
     const model = buildVentaReversionTicketModel(baseData());
     assert.equal(model.lines.length, 1);
