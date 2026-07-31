@@ -41,6 +41,17 @@ export const isDivisionEstadoAnulada = (division) => normalizeEstadoDivision(div
 
 export const isDivisionEstadoActiva = (division) => !isDivisionEstadoAnulada(division);
 
+export const summarizeActiveDivisions = (divisions = []) => {
+  const activeDivisions = (Array.isArray(divisions) ? divisions : [])
+    .filter(isDivisionEstadoActiva);
+  return {
+    total_dividido: roundMoney(activeDivisions.reduce((sum, division) => sum + Number(division?.total || 0), 0)),
+    monto_pagado: roundMoney(activeDivisions.reduce((sum, division) => sum + Number(division?.monto_pagado || 0), 0)),
+    monto_pendiente: roundMoney(activeDivisions.reduce((sum, division) => sum + Number(division?.monto_pendiente || 0), 0)),
+    pendientes: activeDivisions.filter((division) => normalizeEstadoDivision(division) === 'PENDIENTE').length
+  };
+};
+
 // Una division es "respaldo automatico redistribuible" solo si CUMPLE
 // TODAS estas condiciones financieras -- nunca solo por su etiqueta:
 //   - PENDIENTE (nunca PAGADA, ANULADA no aplica aqui igual)
@@ -135,26 +146,78 @@ export const selectNewDivisionToCharge = ({ persistedDivisions = [], position } 
   return persistedDivisions[index] || null;
 };
 
-// Divisiones de respaldo EXISTENTES cuyas lineas quedaron TODAS cubiertas
-// por el nuevo plan (newlyAssignedDetalleIds): estas quedan superadas y
-// deben anularse (estado='ANULADA') para que sus lineas no queden
-// representadas dos veces (una vez en el respaldo viejo, otra en la
-// division nueva). Solo aplica a divisiones redistribuibles -- nunca a una
-// division pagada, facturada o con lineas todavia sin cubrir.
-export const resolveSupersededBackupDivisionIds = ({ existingDivisions = [], newlyAssignedDetalleIds } = {}) => {
+// Calcula el ajuste de cada respaldo existente alcanzado por el plan nuevo.
+// Quita solo las lineas reasignadas, recalcula los importes desde los items
+// restantes y lo marca ANULADA cuando queda vacio. Nunca toca una division
+// pagada, facturada o con pago parcial.
+export const resolveBackupDivisionAdjustments = ({ existingDivisions = [], newlyAssignedDetalleIds } = {}) => {
   const assignedIds = newlyAssignedDetalleIds instanceof Set
     ? newlyAssignedDetalleIds
     : new Set(newlyAssignedDetalleIds || []);
-  const superseded = [];
+  const adjustments = [];
   for (const division of Array.isArray(existingDivisions) ? existingDivisions : []) {
     if (!isRedistributableBackupDivision(division)) continue;
     const items = Array.isArray(division?.items) ? division.items : [];
     if (!items.length) continue;
-    const allCovered = items.every((item) => assignedIds.has(Number(item?.id_detalle_pedido)));
-    if (allCovered) {
-      const id = Number(division?.id_cuenta_division);
-      if (Number.isInteger(id) && id > 0) superseded.push(id);
+    const coveredItems = items.filter((item) => assignedIds.has(Number(item?.id_detalle_pedido)));
+    if (!coveredItems.length) continue;
+    const id = Number(division?.id_cuenta_division);
+    if (!Number.isInteger(id) || id <= 0) continue;
+    const remainingItems = items.filter((item) => !assignedIds.has(Number(item?.id_detalle_pedido)));
+    adjustments.push({
+      id_cuenta_division: id,
+      coveredItemIds: coveredItems
+        .map((item) => Number(item?.id_cuenta_division_item))
+        .filter((itemId) => Number.isInteger(itemId) && itemId > 0),
+      coveredDetalleIds: coveredItems
+        .map((item) => Number(item?.id_detalle_pedido))
+        .filter((detalleId) => Number.isInteger(detalleId) && detalleId > 0),
+      remainingItems,
+      estado: remainingItems.length ? 'PENDIENTE' : 'ANULADA',
+      subtotal_base: roundMoney(remainingItems.reduce((sum, item) => sum + Number(item?.subtotal_base || 0), 0)),
+      subtotal_extras: roundMoney(remainingItems.reduce((sum, item) => sum + Number(item?.subtotal_extras || 0), 0)),
+      descuento_total: roundMoney(remainingItems.reduce((sum, item) => sum + Number(item?.descuento_total || 0), 0)),
+      isv_total: roundMoney(remainingItems.reduce((sum, item) => sum + Number(item?.isv_total || 0), 0)),
+      total: roundMoney(remainingItems.reduce((sum, item) => sum + Number(item?.total_linea || 0), 0))
+    });
+  }
+  return adjustments;
+};
+
+export const resolveUnrepresentedLeftoverItems = ({
+  leftoverItems = [],
+  existingDivisions = [],
+  newlyAssignedDetalleIds
+} = {}) => {
+  const assignedIds = newlyAssignedDetalleIds instanceof Set
+    ? newlyAssignedDetalleIds
+    : new Set(newlyAssignedDetalleIds || []);
+  const representedByExistingBackup = new Set();
+  for (const division of Array.isArray(existingDivisions) ? existingDivisions : []) {
+    if (!isRedistributableBackupDivision(division)) continue;
+    for (const item of Array.isArray(division?.items) ? division.items : []) {
+      const detalleId = Number(item?.id_detalle_pedido);
+      if (Number.isInteger(detalleId) && detalleId > 0 && !assignedIds.has(detalleId)) {
+        representedByExistingBackup.add(detalleId);
+      }
     }
   }
-  return superseded;
+  return (Array.isArray(leftoverItems) ? leftoverItems : []).filter((item) => (
+    !representedByExistingBackup.has(Number(item?.line?.id_detalle_pedido))
+  ));
+};
+
+export const resolveDuplicateActiveDetalleIds = (divisions = []) => {
+  const seen = new Set();
+  const duplicated = new Set();
+  for (const division of Array.isArray(divisions) ? divisions : []) {
+    if (!isDivisionEstadoActiva(division)) continue;
+    for (const item of Array.isArray(division?.items) ? division.items : []) {
+      const detalleId = Number(item?.id_detalle_pedido);
+      if (!Number.isInteger(detalleId) || detalleId <= 0) continue;
+      if (seen.has(detalleId)) duplicated.add(detalleId);
+      seen.add(detalleId);
+    }
+  }
+  return [...duplicated].sort((left, right) => left - right);
 };

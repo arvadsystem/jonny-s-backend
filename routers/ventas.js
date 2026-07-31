@@ -160,7 +160,10 @@ import {
   resolveNextOrdenSequence,
   buildBackupDivisionsPlan,
   selectNewDivisionToCharge,
-  resolveSupersededBackupDivisionIds
+  resolveBackupDivisionAdjustments,
+  resolveUnrepresentedLeftoverItems,
+  resolveDuplicateActiveDetalleIds,
+  summarizeActiveDivisions
 } from './ventas/services/cuentaDivididaSplitService.js';
 import { validarYDescontarPedido } from '../services/inventarioPedidoService.js';
 import { buildPedidoConsumoPayload } from './cocina.js';
@@ -9182,10 +9185,20 @@ router.post('/ventas/pedidos/:id/registrar-pago', checkPermission(['VENTAS_CREAR
       const existingDivisionItemsResult = existingDivisionIdsForItems.length
         ? await client.query(
           `
-            SELECT id_cuenta_division, id_detalle_pedido
+            SELECT
+              id_cuenta_division_item,
+              id_cuenta_division,
+              id_detalle_pedido,
+              subtotal_base,
+              subtotal_extras,
+              descuento_total,
+              isv_total,
+              total_linea
             FROM public.ventas_cuenta_division_items
             WHERE id_cuenta_division = ANY($1::bigint[])
               AND id_detalle_pedido IS NOT NULL
+            ORDER BY id_cuenta_division, id_cuenta_division_item
+            FOR UPDATE
           `,
           [existingDivisionIdsForItems]
         )
@@ -9194,7 +9207,11 @@ router.post('/ventas/pedidos/:id/registrar-pago', checkPermission(['VENTAS_CREAR
       for (const row of existingDivisionItemsResult.rows) {
         const divId = Number(row.id_cuenta_division);
         if (!existingItemsByDivisionId.has(divId)) existingItemsByDivisionId.set(divId, []);
-        existingItemsByDivisionId.get(divId).push({ id_detalle_pedido: Number(row.id_detalle_pedido) });
+        existingItemsByDivisionId.get(divId).push({
+          ...row,
+          id_cuenta_division_item: Number(row.id_cuenta_division_item),
+          id_detalle_pedido: Number(row.id_detalle_pedido)
+        });
       }
       const divisionesExistentesConItems = divisionesExistentesResult.rows.map((row) => ({
         ...row,
@@ -9282,29 +9299,52 @@ router.post('/ventas/pedidos/:id/registrar-pago', checkPermission(['VENTAS_CREAR
           estadoInicial: 'PENDIENTE'
         });
 
-        // HOTFIX (ronda 2, correccion #5): las lineas recien asignadas en
-        // ESTE envio pueden superar por completo a una division de
-        // respaldo automatico PENDIENTE previamente creada (sin factura,
-        // sin pago) -- esa division vieja queda anulada para que sus
-        // lineas no aparezcan representadas dos veces (una en el respaldo
-        // viejo, otra en la division nueva/Persona real).
+        // Las lineas recien asignadas se retiran de cualquier respaldo
+        // automatico redistribuible. Si el respaldo conserva lineas, sus
+        // importes se recalculan; si queda vacio, se marca ANULADA.
         const newlyAssignedDetalleIds = new Set(
           cuentaDivisionPlan.divisions.flatMap((division) => (
             division.items.map((item) => Number(item.line?.id_detalle_pedido)).filter(Boolean)
           ))
         );
-        const supersededBackupDivisionIds = resolveSupersededBackupDivisionIds({
+        const backupAdjustments = resolveBackupDivisionAdjustments({
           existingDivisions: divisionesExistentesConItems,
           newlyAssignedDetalleIds
         });
-        if (supersededBackupDivisionIds.length) {
+        for (const adjustment of backupAdjustments) {
+          if (adjustment.coveredItemIds.length) {
+            await client.query(
+              `
+                DELETE FROM public.ventas_cuenta_division_items
+                WHERE id_cuenta_division = $1
+                  AND id_cuenta_division_item = ANY($2::bigint[])
+              `,
+              [adjustment.id_cuenta_division, adjustment.coveredItemIds]
+            );
+          }
           await client.query(
             `
               UPDATE public.ventas_cuenta_divisiones
-              SET estado = 'ANULADA', fecha_actualizacion = (NOW() AT TIME ZONE 'America/Tegucigalpa')
-              WHERE id_cuenta_division = ANY($1::bigint[])
+              SET subtotal_base = $2,
+                  subtotal_extras = $3,
+                  descuento_total = $4,
+                  isv_total = $5,
+                  total = $6,
+                  monto_pagado = 0,
+                  monto_pendiente = $6,
+                  estado = $7,
+                  fecha_actualizacion = (NOW() AT TIME ZONE 'America/Tegucigalpa')
+              WHERE id_cuenta_division = $1
             `,
-            [supersededBackupDivisionIds]
+            [
+              adjustment.id_cuenta_division,
+              adjustment.subtotal_base,
+              adjustment.subtotal_extras,
+              adjustment.descuento_total,
+              adjustment.isv_total,
+              adjustment.total,
+              adjustment.estado
+            ]
           );
         }
 
@@ -9321,9 +9361,13 @@ router.post('/ventas/pedidos/:id/registrar-pago', checkPermission(['VENTAS_CREAR
         const assignedLineIndexes = new Set(
           cuentaDivisionPlan.divisions.flatMap((division) => division.items.map((item) => item.line_index))
         );
-        const leftoverItems = divisionLines
+        const leftoverItems = resolveUnrepresentedLeftoverItems({
+          leftoverItems: divisionLines
           .map((line, lineIndex) => ({ line_index: lineIndex, cart_key: normalizeCartKey(line?.cart_key), line }))
-          .filter((entry) => !assignedLineIndexes.has(entry.line_index));
+          .filter((entry) => !assignedLineIndexes.has(entry.line_index)),
+          existingDivisions: divisionesExistentesConItems,
+          newlyAssignedDetalleIds
+        });
         if (leftoverItems.length > 0) {
           const backupOrdenes = resolveNextOrdenSequence({
             existingDivisions: [...divisionesExistentesConItems, ...persistedDivisions],
@@ -9359,6 +9403,45 @@ router.post('/ventas/pedidos/:id/registrar-pago', checkPermission(['VENTAS_CREAR
             message: 'La subcuenta seleccionada para cobrar no existe en cuenta_dividida.'
           });
         }
+      }
+    }
+    if (cuentaDivisionPago) {
+      const activeDivisionItemsResult = await client.query(
+        `
+          SELECT
+            vcd.id_cuenta_division,
+            vcd.estado,
+            vdi.id_cuenta_division_item,
+            vdi.id_detalle_pedido
+          FROM public.ventas_cuenta_divisiones vcd
+          INNER JOIN public.ventas_cuenta_division_items vdi
+            ON vdi.id_cuenta_division = vcd.id_cuenta_division
+          WHERE vcd.id_pedido = $1
+            AND UPPER(TRIM(COALESCE(vcd.estado, ''))) <> 'ANULADA'
+            AND vdi.id_detalle_pedido IS NOT NULL
+          ORDER BY vcd.id_cuenta_division, vdi.id_cuenta_division_item
+          FOR UPDATE OF vcd, vdi
+        `,
+        [idPedido]
+      );
+      const activeDivisionsById = new Map();
+      for (const row of activeDivisionItemsResult.rows) {
+        const divisionId = Number(row.id_cuenta_division);
+        if (!activeDivisionsById.has(divisionId)) {
+          activeDivisionsById.set(divisionId, { ...row, items: [] });
+        }
+        activeDivisionsById.get(divisionId).items.push({
+          id_detalle_pedido: Number(row.id_detalle_pedido)
+        });
+      }
+      const duplicateActiveDetalleIds = resolveDuplicateActiveDetalleIds([...activeDivisionsById.values()]);
+      if (duplicateActiveDetalleIds.length) {
+        await client.query('ROLLBACK');
+        return res.status(409).json({
+          error: true,
+          code: 'CUENTA_DIVIDIDA_LINEA_ACTIVA_DUPLICADA',
+          message: 'Una linea del pedido no puede pertenecer a mas de una subcuenta activa.'
+        });
       }
     }
     ventasPerf.add('registrar_pago_cuenta_dividida_ms', cuentaDivididaStart);
@@ -9656,17 +9739,16 @@ router.post('/ventas/pedidos/:id/registrar-pago', checkPermission(['VENTAS_CREAR
       );
       const divisionSummary = await client.query(
         `
-          SELECT
-            COALESCE(SUM(total), 0)::numeric(14,2) AS total_dividido,
-            COALESCE(SUM(monto_pagado), 0)::numeric(14,2) AS monto_pagado,
-            COALESCE(SUM(monto_pendiente), 0)::numeric(14,2) AS monto_pendiente,
-            COUNT(*) FILTER (WHERE UPPER(TRIM(estado)) = 'PENDIENTE')::int AS pendientes
+          SELECT id_cuenta_division, total, monto_pagado, monto_pendiente, estado
           FROM public.ventas_cuenta_divisiones
           WHERE id_pedido = $1
+            AND UPPER(TRIM(COALESCE(estado, ''))) <> 'ANULADA'
+          ORDER BY id_cuenta_division
+          FOR UPDATE
         `,
         [idPedido]
       );
-      const summary = divisionSummary.rows?.[0] || {};
+      const summary = summarizeActiveDivisions(divisionSummary.rows);
       const totalDividido = roundMoney(summary.total_dividido);
       const montoPendienteSinAsignar = Math.max(roundMoney(totalPedido - totalDividido), 0);
       montoPagadoRespuesta = roundMoney(summary.monto_pagado);

@@ -76,9 +76,11 @@ describe('POST /ventas/pedidos/:id/registrar-pago — Escenario A/F: division de
   it('tras persistir las divisiones solicitadas, calcula las lineas sobrantes (no cubiertas por cuentaDivisionPlan) y crea UNA division PENDIENTE de respaldo POR LINEA via buildBackupDivisionsPlan (alternativa recomendada, ronda 2)', () => {
     const anchor = source.indexOf('const persistedDivisions = await persistCuentaDividida({');
     assert.ok(anchor > -1);
-    const block = source.slice(anchor, anchor + 3200);
+    const end = source.indexOf('cuentaDivisionPago = selectNewDivisionToCharge({', anchor);
+    assert.ok(end > anchor);
+    const block = source.slice(anchor, end);
     assert.match(block, /const assignedLineIndexes = new Set\(/);
-    assert.match(block, /const leftoverItems = divisionLines/);
+    assert.match(block, /const leftoverItems = resolveUnrepresentedLeftoverItems\(\{/);
     assert.match(block, /if \(leftoverItems\.length > 0\) \{/);
     assert.match(block, /const backupDivisions = buildBackupDivisionsPlan\(\{/);
     assert.match(block, /estadoInicial: 'PENDIENTE'/);
@@ -110,8 +112,26 @@ describe('POST /ventas/pedidos/:id/registrar-pago — Escenario A/F: division de
   });
 
   it('correccion #5: una division de respaldo automatica ya superada por el nuevo plan se anula (nunca queda representando lineas duplicadas)', () => {
-    assert.match(source, /const supersededBackupDivisionIds = resolveSupersededBackupDivisionIds\(\{/);
-    assert.match(source, /SET estado = 'ANULADA'/);
+    assert.match(source, /const backupAdjustments = resolveBackupDivisionAdjustments\(\{/);
+    assert.match(source, /DELETE FROM public\.ventas_cuenta_division_items/);
+    assert.match(source, /estado = \$7/);
+  });
+
+  it('el resumen financiero excluye ANULADA con la condicion SQL requerida', () => {
+    assert.match(source, /AND UPPER\(TRIM\(COALESCE\(estado, ''\)\)\) <> 'ANULADA'/);
+    assert.match(source, /const summary = summarizeActiveDivisions\(divisionSummary\.rows\);/);
+  });
+
+  it('bloquea divisiones e items en orden determinista y valida la unicidad activa antes de facturar', () => {
+    const registrarPagoStart = source.indexOf("router.post('/ventas/pedidos/:id/registrar-pago'");
+    const facturaStart = source.indexOf('const scopeSessionStart', registrarPagoStart);
+    const block = source.slice(registrarPagoStart, facturaStart);
+    assert.match(block, /ORDER BY orden, id_cuenta_division\s+FOR UPDATE/);
+    assert.match(block, /ORDER BY id_cuenta_division, id_cuenta_division_item\s+FOR UPDATE/);
+    assert.match(block, /FOR UPDATE OF vcd, vdi/);
+    assert.match(block, /resolveDuplicateActiveDetalleIds/);
+    assert.match(block, /code: 'CUENTA_DIVIDIDA_LINEA_ACTIVA_DUPLICADA'/);
+    assert.match(block, /await client\.query\('ROLLBACK'\)/);
   });
 
   it('Escenario F (duplicados): buildCuentaDivisionPlan sigue lanzando CUENTA_DIVIDIDA_ITEM_DUPLICADO cuando una linea se asigna dos veces', () => {
@@ -149,7 +169,8 @@ describe('POST /ventas/pedidos/:id/registrar-pago — Escenario A/F: division de
   it('transaccion unica con BEGIN/COMMIT/ROLLBACK envolviendo todo el registro de pago', () => {
     const fnStart = source.indexOf("router.post('/ventas/pedidos/:id/registrar-pago'");
     assert.ok(fnStart > -1);
-    const fnBody = source.slice(fnStart, fnStart + 40000);
+    const nextRoute = source.indexOf('\nrouter.', fnStart + 10);
+    const fnBody = source.slice(fnStart, nextRoute > fnStart ? nextRoute : source.length);
     assert.match(fnBody, /await client\.query\('COMMIT'\)/);
     assert.match(fnBody, /await client\.query\('ROLLBACK'\)/);
   });

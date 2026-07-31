@@ -16,7 +16,10 @@ import {
   resolveNextOrdenSequence,
   buildBackupDivisionsPlan,
   selectNewDivisionToCharge,
-  resolveSupersededBackupDivisionIds
+  resolveBackupDivisionAdjustments,
+  resolveUnrepresentedLeftoverItems,
+  resolveDuplicateActiveDetalleIds,
+  summarizeActiveDivisions
 } from '../services/cuentaDivididaSplitService.js';
 
 const persona1Pagada = {
@@ -200,44 +203,111 @@ describe('12) NO_ENTREGADO: no debe excluir un pedido con deuda vigente del list
   });
 });
 
-describe('resolveSupersededBackupDivisionIds — evita lineas duplicadas entre un respaldo viejo y una division nueva', () => {
-  it('un respaldo redistribuible cuyas lineas quedan TODAS cubiertas por el plan nuevo se marca superado (a anular)', () => {
-    const backup = {
-      id_cuenta_division: 701,
-      estado: 'PENDIENTE',
-      etiqueta: `${AUTO_BACKUP_DIVISION_LABEL_PREFIX} 1`,
-      id_factura: null,
-      monto_pagado: 0,
-      items: [{ id_detalle_pedido: 3834 }]
-    };
-    const superseded = resolveSupersededBackupDivisionIds({
-      existingDivisions: [backup],
-      newlyAssignedDetalleIds: new Set([3834])
-    });
-    assert.deepEqual(superseded, [701]);
+const backupItem = (itemId, detalleId, total) => ({
+  id_cuenta_division_item: itemId,
+  id_detalle_pedido: detalleId,
+  subtotal_base: total,
+  subtotal_extras: 0,
+  descuento_total: 0,
+  isv_total: 0,
+  total_linea: total
+});
+
+const backupFactory = (items) => ({
+  id_cuenta_division: 701,
+  estado: 'PENDIENTE',
+  etiqueta: `${AUTO_BACKUP_DIVISION_LABEL_PREFIX} historico`,
+  id_factura: null,
+  monto_pagado: 0,
+  items
+});
+
+describe('Hotfix de saldo y representacion activa', () => {
+  it('1-2) el resumen financiero excluye ANULADA y conserva exactamente el saldo activo', () => {
+    const summary = summarizeActiveDivisions([
+      { estado: 'PAGADA', total: 170, monto_pagado: 170, monto_pendiente: 0 },
+      { estado: 'PAGADA', total: 170, monto_pagado: 170, monto_pendiente: 0 },
+      { estado: 'PENDIENTE', total: 170, monto_pagado: 0, monto_pendiente: 170 },
+      { estado: 'ANULADA', total: 170, monto_pagado: 0, monto_pendiente: 170 }
+    ]);
+    assert.deepEqual(summary, { total_dividido: 510, monto_pagado: 340, monto_pendiente: 170, pendientes: 1 });
   });
 
-  it('un respaldo cubierto solo PARCIALMENTE no se anula (todavia representa saldo real)', () => {
-    const backup = {
-      id_cuenta_division: 701,
-      estado: 'PENDIENTE',
-      etiqueta: `${AUTO_BACKUP_DIVISION_LABEL_PREFIX} 1`,
-      id_factura: null,
-      monto_pagado: 0,
-      items: [{ id_detalle_pedido: 3834 }, { id_detalle_pedido: 3835 }]
-    };
-    const superseded = resolveSupersededBackupDivisionIds({
-      existingDivisions: [backup],
-      newlyAssignedDetalleIds: new Set([3834])
-    });
-    assert.deepEqual(superseded, []);
+  it('3) detecta una linea representada en dos divisiones activas, pero ignora copias ANULADAS', () => {
+    assert.deepEqual(resolveDuplicateActiveDetalleIds([
+      { estado: 'PAGADA', items: [{ id_detalle_pedido: 3833 }] },
+      { estado: 'PENDIENTE', items: [{ id_detalle_pedido: 3833 }, { id_detalle_pedido: 3834 }] },
+      { estado: 'ANULADA', items: [{ id_detalle_pedido: 3834 }] }
+    ]), [3833]);
   });
 
-  it('una division PAGADA nunca se anula por esta funcion, aunque coincida la linea', () => {
-    const superseded = resolveSupersededBackupDivisionIds({
+  it('5) redistribucion parcial quita solo la linea cubierta y recalcula el respaldo historico', () => {
+    const [adjustment] = resolveBackupDivisionAdjustments({
+      existingDivisions: [backupFactory([backupItem(1, 3834, 170), backupItem(2, 3835, 90)])],
+      newlyAssignedDetalleIds: new Set([3834])
+    });
+    assert.deepEqual(adjustment.coveredItemIds, [1]);
+    assert.deepEqual(adjustment.remainingItems.map((item) => item.id_detalle_pedido), [3835]);
+    assert.equal(adjustment.estado, 'PENDIENTE');
+    assert.equal(adjustment.total, 90);
+  });
+
+  it('6) absorcion total deja el respaldo sin lineas y lo marca ANULADA con saldo cero', () => {
+    const [adjustment] = resolveBackupDivisionAdjustments({
+      existingDivisions: [backupFactory([backupItem(1, 3834, 170)])],
+      newlyAssignedDetalleIds: new Set([3834])
+    });
+    assert.equal(adjustment.estado, 'ANULADA');
+    assert.deepEqual(adjustment.remainingItems, []);
+    assert.equal(adjustment.total, 0);
+  });
+
+  it('7) una linea que permanece en un respaldo existente no genera un segundo respaldo', () => {
+    const unresolved = resolveUnrepresentedLeftoverItems({
+      leftoverItems: [
+        { line_index: 1, line: lineaFactory(3835, 90) }
+      ],
+      existingDivisions: [backupFactory([backupItem(1, 3834, 170), backupItem(2, 3835, 90)])],
+      newlyAssignedDetalleIds: new Set([3834])
+    });
+    assert.deepEqual(unresolved, []);
+  });
+
+  it('8) una division PAGADA o facturada nunca se ajusta como respaldo', () => {
+    assert.deepEqual(resolveBackupDivisionAdjustments({
       existingDivisions: [persona1Pagada],
       newlyAssignedDetalleIds: new Set([3833])
-    });
-    assert.deepEqual(superseded, []);
+    }), []);
+  });
+
+  it('8) un respaldo parcialmente pagado no se ajusta y mantiene sus lineas reservadas', () => {
+    const partial = {
+      ...backupFactory([backupItem(1, 3834, 170)]),
+      monto_pagado: 50
+    };
+    assert.deepEqual(resolveBackupDivisionAdjustments({
+      existingDivisions: [partial],
+      newlyAssignedDetalleIds: new Set([3834])
+    }), []);
+    assert.ok(resolveAssignedDetalleIds([partial]).has(3834));
+  });
+
+  it('7) un pedido con todas las divisiones activas PAGADA queda sin saldo ni pendientes', () => {
+    const summary = summarizeActiveDivisions([
+      { estado: 'PAGADA', total: 170, monto_pagado: 170, monto_pendiente: 0 },
+      { estado: 'PAGADA', total: 170, monto_pagado: 170, monto_pendiente: 0 },
+      { estado: 'PAGADA', total: 170, monto_pagado: 170, monto_pendiente: 0 },
+      { estado: 'ANULADA', total: 170, monto_pagado: 0, monto_pendiente: 170 }
+    ]);
+    assert.equal(summary.monto_pendiente, 0);
+    assert.equal(summary.pendientes, 0);
+    assert.equal(summary.total_dividido, 510);
+  });
+
+  it('9) dos intentos sobre la misma linea producen una duplicidad detectable', () => {
+    assert.deepEqual(resolveDuplicateActiveDetalleIds([
+      { estado: 'PENDIENTE', items: [{ id_detalle_pedido: 3834 }] },
+      { estado: 'PENDIENTE', items: [{ id_detalle_pedido: 3834 }] }
+    ]), [3834]);
   });
 });
