@@ -16,7 +16,6 @@ const MAX_LIMIT = 100;
 const DEFAULT_LIMIT = 10;
 
 const PLANILLA_FUNCTION_NAMES = Object.freeze([
-  'fn_generar_planilla_mensual_por_sucursal',
   'fn_recalcular_detalle_planilla',
   'fn_recalcular_planilla_por_sucursal',
   'fn_listar_planillas_por_sucursal',
@@ -60,7 +59,6 @@ const PLANILLAS_SUMMARY_COSTS_PERMISSIONS = ['PLANILLAS_RESUMEN_VER_COSTOS'];
 
 const PLANILLA_ENDPOINT_CONTRACT = Object.freeze({
   list: 'fn_listar_planillas_por_sucursal',
-  generar: 'fn_generar_planilla_mensual_por_sucursal',
   recalcularPlanilla: 'fn_recalcular_planilla_por_sucursal',
   detalle: 'fn_listar_detalle_planilla',
   resumen: 'fn_listar_resumen_planilla_por_sucursal',
