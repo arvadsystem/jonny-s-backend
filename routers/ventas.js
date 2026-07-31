@@ -7928,6 +7928,7 @@ async function listarPedidosPendientesPago(req, res) {
             'id_cuenta_division', vcd.id_cuenta_division,
             'etiqueta', vcd.etiqueta,
             'orden', vcd.orden,
+            'id_factura', vcd.id_factura,
             'total', vcd.total,
             'monto_pagado', vcd.monto_pagado,
             'monto_pendiente', vcd.monto_pendiente,

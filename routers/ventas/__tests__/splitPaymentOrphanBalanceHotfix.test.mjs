@@ -55,6 +55,12 @@ describe('GET /ventas/pedidos-pendientes — Escenario A/C/D: el saldo financier
     assert.match(fnBody, /items_asignados/);
     assert.match(fnBody, /items_sin_asignar: Math\.max\(Number\(row\.items_total \|\| 0\) - Number\(row\.items_asignados \|\| 0\), 0\)/);
   });
+
+  it('cada division incluye id_factura para mostrar el historial pagado sin otra consulta', () => {
+    const fnStart = source.indexOf('async function listarPedidosPendientesPago');
+    const fnBody = source.slice(fnStart, fnStart + 20000);
+    assert.match(fnBody, /'id_factura', vcd\.id_factura,/);
+  });
 });
 
 describe('GET /ventas/:id — puede_cobrar (detalle) usa la misma regla simplificada', () => {
