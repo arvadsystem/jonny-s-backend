@@ -487,7 +487,7 @@ const normalizeEstadoAlias = (value) => {
   const aliases = {
     ABIERTA: 'BORRADOR',
     BORRADOR: 'BORRADOR',
-    CERRADA: 'CALCULADA',
+    CERRADA: 'CERRADA',
     CALCULADA: 'CALCULADA',
     PAGADA: 'PAGADA',
     ANULADA: 'ANULADA'
