@@ -141,6 +141,9 @@ describe('comprobante canonico de reversion', () => {
       assert.equal(pdf.subarray(0, 5).toString('ascii'), '%PDF-');
       assert.ok(pdf.length > 500);
       assert.equal(buildVentaReversionTicketModel(baseData({ ancho_ticket_mm: width })).widthMm, width);
+      const mediaBox = pdf.toString('latin1').match(/\/MediaBox\s*\[\s*0\s+0\s+([\d.]+)\s+([\d.]+)\s*\]/);
+      assert.ok(mediaBox, `PDF ${width} mm debe declarar MediaBox`);
+      assert.ok(Math.abs(Number(mediaBox[1]) - ((width * 72) / 25.4)) < 0.01);
     }
   });
 
@@ -175,6 +178,11 @@ describe('comprobante canonico de reversion', () => {
     assert.equal(canonical.payload.impresora_logica, 'factura');
     assert.equal(canonical.payload.documento_canonico.kind, 'venta_reversion_ticket_pdf');
     assert.equal(canonical.payload.source.id_reversion, 41);
+    assert.deepEqual(canonical.document.options, {
+      pageWidth: 80,
+      altFontRendering: true,
+      ignoreTransparency: true
+    });
     assert.equal(validateCanonicalPrintPayload(canonical.payload).ok, true);
     assert.deepEqual(
       validateCanonicalPrintJobData(canonical.payload, canonical.document),

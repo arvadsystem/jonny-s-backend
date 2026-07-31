@@ -28,7 +28,11 @@ const hasExactKeys = (value, expectedKeys) => (
 );
 const buildCanonicalDataOptions = ({ contract, widthMm }) => (
   contract.format === 'pdf'
-    ? { altFontRendering: true, ignoreTransparency: true }
+    ? {
+        ...(contract.kind === 'venta_reversion_ticket_pdf' ? { pageWidth: widthMm } : {}),
+        altFontRendering: true,
+        ignoreTransparency: true
+      }
     : { pageWidth: widthMm }
 );
 const hasExactOptionValues = (options, expected) => (
