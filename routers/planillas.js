@@ -1429,6 +1429,93 @@ const resolveMovimientoScope = async (idMovimiento) => {
   };
 };
 
+const getMovimientoAnulacionState = async (db, idMovimiento) => {
+  const result = await db.query(
+    `
+      SELECT
+        mp.id_movimiento_planilla,
+        mp.id_detalle_planilla,
+        COALESCE(mp.estado, TRUE) AS estado,
+        dp.total_bonos,
+        dp.total_deducciones,
+        dp.neto_pagar
+      FROM public.movimiento_planilla mp
+      INNER JOIN public.detalle_planilla dp
+        ON dp.id_detalle_planilla = mp.id_detalle_planilla
+      WHERE mp.id_movimiento_planilla = $1
+      LIMIT 1
+    `,
+    [idMovimiento]
+  );
+
+  return result.rows?.[0] || null;
+};
+
+const ensureMovimientoAnuladoState = async ({ idMovimiento, idDetalle }) => {
+  const currentState = await getMovimientoAnulacionState(pool, idMovimiento);
+  if (!currentState) {
+    throw createRequestError('El movimiento indicado no existe.', 404, 'NOT_FOUND');
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    if (currentState.estado !== false) {
+      const updateResult = await client.query(
+        `
+          UPDATE public.movimiento_planilla
+          SET estado = FALSE
+          WHERE id_movimiento_planilla = $1
+            AND id_detalle_planilla = $2
+            AND COALESCE(estado, TRUE) = TRUE
+          RETURNING id_movimiento_planilla
+        `,
+        [idMovimiento, idDetalle]
+      );
+
+      if (!updateResult.rowCount) {
+        const verifiedState = await getMovimientoAnulacionState(client, idMovimiento);
+        if (verifiedState?.estado !== false) {
+          throw createRequestError(
+            'No se pudo confirmar la anulacion del movimiento.',
+            409,
+            'MOVIMIENTO_ANULACION_NO_CONFIRMADA'
+          );
+        }
+      }
+    } else {
+      const verifiedState = await getMovimientoAnulacionState(client, idMovimiento);
+      if (verifiedState?.estado !== false) {
+        throw createRequestError(
+          'No se pudo confirmar la anulacion del movimiento.',
+          409,
+          'MOVIMIENTO_ANULACION_NO_CONFIRMADA'
+        );
+      }
+    }
+
+    await client.query('SELECT public.fn_recalcular_detalle_planilla($1)', [idDetalle]);
+    const refreshedState = await getMovimientoAnulacionState(client, idMovimiento);
+
+    if (refreshedState?.estado !== false) {
+      throw createRequestError(
+        'No se pudo confirmar la anulacion del movimiento.',
+        409,
+        'MOVIMIENTO_ANULACION_NO_CONFIRMADA'
+      );
+    }
+
+    await client.query('COMMIT');
+    return refreshedState;
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw error;
+  } finally {
+    client.release();
+  }
+};
+
 const listPlanillaEligibleEmployeesBySucursal = async ({ db = pool, idSucursal }) => {
   const safeSucursalId = parsePositiveInt(idSucursal);
   if (!safeSucursalId) return { validRows: [], invalidRows: [] };
@@ -2324,6 +2411,11 @@ const buildMovimientosDataset = async ({
         mp.monto,
         mp.observacion,
         COALESCE(mp.estado, TRUE) AS estado,
+        NOT COALESCE(mp.estado, TRUE) AS anulado,
+        CASE
+          WHEN COALESCE(mp.estado, TRUE) = TRUE THEN 'VIGENTE'
+          ELSE 'ANULADO'
+        END AS estado_movimiento,
         ${movimientoTipoPeriodoExpr} AS tipo_periodo,
         ${movimientoQuincenaExpr} AS quincena,
         ${movimientoFechaExpr} AS fecha,
@@ -2340,21 +2432,27 @@ const buildMovimientosDataset = async ({
     [idPlanilla, detailIds]
   );
 
-  const movimientosRows = (movimientosResult.rows || []).map((row) => ({
-    ...row,
-    id_planilla: idPlanilla,
-    periodo_movimiento: planillaPeriodoKey || null,
-    fecha_periodo: planillaPeriodoInicio,
-    tipo: row.tipo || row.tipo_movimiento,
-    fecha: row.fecha || row.fecha_registro,
-    es_monetario: true,
-    anulable: parsePositiveInt(row.id_movimiento_planilla) !== null,
-    origen_movimiento: 'MOVIMIENTO',
-    quincena_resuelta: resolveQuincenaFromRowContext({
+  const movimientosRows = (movimientosResult.rows || []).map((row) => {
+    const isAnulado = row.estado === false || row.anulado === true;
+    return {
       ...row,
-      fecha: row.fecha || row.fecha_registro
-    })
-  }));
+      id_planilla: idPlanilla,
+      periodo_movimiento: planillaPeriodoKey || null,
+      fecha_periodo: planillaPeriodoInicio,
+      tipo: row.tipo || row.tipo_movimiento,
+      fecha: row.fecha || row.fecha_registro,
+      es_monetario: true,
+      anulado: isAnulado,
+      es_anulado: isAnulado,
+      estado_movimiento: isAnulado ? 'ANULADO' : 'VIGENTE',
+      anulable: !isAnulado && parsePositiveInt(row.id_movimiento_planilla) !== null,
+      origen_movimiento: 'MOVIMIENTO',
+      quincena_resuelta: resolveQuincenaFromRowContext({
+        ...row,
+        fecha: row.fecha || row.fecha_registro
+      })
+    };
+  });
 
   const employeeIds = [...new Set(detalleScope.map((row) => parsePositiveInt(row.id_empleado)).filter(Boolean))];
   if (!employeeIds.length) {
@@ -6180,31 +6278,24 @@ const planillaService = {
 
     const rows = await queryFunctionRows(PLANILLA_ENDPOINT_CONTRACT.anularMovimiento, [idMovimiento]);
     const rpcData = rows[0] || {};
-    const detalleActualizado = await pool.query(
-      `
-        SELECT
-          dp.id_detalle_planilla,
-          dp.total_bonos,
-          dp.total_deducciones,
-          dp.neto_pagar
-        FROM public.detalle_planilla dp
-        WHERE dp.id_detalle_planilla = $1
-        LIMIT 1
-      `,
-      [movimientoScope.id_detalle_planilla]
-    );
-    const detalleRow = detalleActualizado.rows?.[0] || {};
+    const detalleRow = await ensureMovimientoAnuladoState({
+      idMovimiento,
+      idDetalle: movimientoScope.id_detalle_planilla
+    });
     const responseData = {
       ...rpcData,
       id_movimiento_planilla: parsePositiveInt(rpcData.id_movimiento_planilla) || idMovimiento,
       id_detalle_planilla:
         parsePositiveInt(rpcData.id_detalle_planilla) || movimientoScope.id_detalle_planilla,
+      anulado: true,
+      es_anulado: true,
+      estado_movimiento: 'ANULADO',
       neto_actualizado:
-        rpcData.neto_actualizado ?? detalleRow.neto_pagar ?? null,
+        detalleRow.neto_pagar ?? rpcData.neto_actualizado ?? null,
       total_bonos:
-        rpcData.total_bonos ?? detalleRow.total_bonos ?? null,
+        detalleRow.total_bonos ?? rpcData.total_bonos ?? null,
       total_deducciones:
-        rpcData.total_deducciones ?? detalleRow.total_deducciones ?? null
+        detalleRow.total_deducciones ?? rpcData.total_deducciones ?? null
     };
 
     return {

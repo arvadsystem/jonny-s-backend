@@ -39,11 +39,41 @@ test('respuesta de anulacion expone totales actualizados', async () => {
   const source = await readFile(routerPath, 'utf8');
   const actionBlock = source.slice(source.indexOf('async anularMovimiento(req)'));
 
+  assert.match(actionBlock, /ensureMovimientoAnuladoState/);
   assert.match(actionBlock, /id_movimiento_planilla:/);
   assert.match(actionBlock, /id_detalle_planilla:/);
+  assert.match(actionBlock, /anulado:\s*true/);
+  assert.match(actionBlock, /es_anulado:\s*true/);
+  assert.match(actionBlock, /estado_movimiento:\s*'ANULADO'/);
   assert.match(actionBlock, /neto_actualizado:/);
   assert.match(actionBlock, /total_bonos:/);
   assert.match(actionBlock, /total_deducciones:/);
+});
+
+test('dataset de movimientos marca anulados y evita nueva anulacion', async () => {
+  const source = await readFile(routerPath, 'utf8');
+  const datasetBlock = source.slice(
+    source.indexOf('const buildMovimientosDataset'),
+    source.indexOf('const resolvePlanillaMeta')
+  );
+
+  assert.match(datasetBlock, /AS anulado/);
+  assert.match(datasetBlock, /AS estado_movimiento/);
+  assert.match(datasetBlock, /const isAnulado = row\.estado === false \|\| row\.anulado === true/);
+  assert.match(datasetBlock, /es_anulado:\s*isAnulado/);
+  assert.match(datasetBlock, /anulable:\s*!isAnulado/);
+});
+
+test('anulacion verifica estado persistido y recalcula detalle', async () => {
+  const source = await readFile(routerPath, 'utf8');
+  const helperBlock = source.slice(
+    source.indexOf('const ensureMovimientoAnuladoState'),
+    source.indexOf('const listPlanillaEligibleEmployeesBySucursal')
+  );
+
+  assert.match(helperBlock, /SET estado = FALSE/);
+  assert.match(helperBlock, /fn_recalcular_detalle_planilla/);
+  assert.match(helperBlock, /MOVIMIENTO_ANULACION_NO_CONFIRMADA/);
 });
 
 test('router de planillas no contiene mojibake', async () => {
