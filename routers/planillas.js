@@ -6181,13 +6181,40 @@ const planillaService = {
     }
 
     const rows = await queryFunctionRows(PLANILLA_ENDPOINT_CONTRACT.anularMovimiento, [idMovimiento]);
+    const rpcData = rows[0] || {};
+    const detalleActualizado = await pool.query(
+      `
+        SELECT
+          dp.id_detalle_planilla,
+          dp.total_bonos,
+          dp.total_deducciones,
+          dp.neto_pagar
+        FROM public.detalle_planilla dp
+        WHERE dp.id_detalle_planilla = $1
+        LIMIT 1
+      `,
+      [movimientoScope.id_detalle_planilla]
+    );
+    const detalleRow = detalleActualizado.rows?.[0] || {};
+    const responseData = {
+      ...rpcData,
+      id_movimiento_planilla: parsePositiveInt(rpcData.id_movimiento_planilla) || idMovimiento,
+      id_detalle_planilla:
+        parsePositiveInt(rpcData.id_detalle_planilla) || movimientoScope.id_detalle_planilla,
+      neto_actualizado:
+        rpcData.neto_actualizado ?? detalleRow.neto_pagar ?? null,
+      total_bonos:
+        rpcData.total_bonos ?? detalleRow.total_bonos ?? null,
+      total_deducciones:
+        rpcData.total_deducciones ?? detalleRow.total_deducciones ?? null
+    };
 
     return {
       status: 200,
       body: {
         error: false,
         message: 'Movimiento anulado correctamente',
-        data: rows[0] || null
+        data: responseData
       }
     };
   },
@@ -6198,7 +6225,7 @@ const planillaService = {
 
     const idPlanilla = parsePositiveInt(req.params.id_planilla);
     if (!idPlanilla) {
-      return { status: 400, body: { error: true, message: 'id_planilla invalido' } };
+      return { status: 400, body: { error: true, message: 'id_planilla inválido' } };
     }
 
     const scopeValidation = await validatePlanillaSucursalScope(idPlanilla, req.query?.id_sucursal);
