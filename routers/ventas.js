@@ -6643,13 +6643,14 @@ router.get('/ventas/pedidos-menu', checkPermission(['VENTAS_VER']), async (req, 
           COALESCE(ppc.monto_total, p.total, 0)::numeric(14,2) AS monto_total,
           COALESCE(ppc.monto_pagado, 0)::numeric(14,2) AS monto_pagado,
           COALESCE(ppc.monto_pendiente, 0)::numeric(14,2) AS monto_pendiente,
+          -- HOTFIX (saldo dividido oculto): igual que en
+          -- GET /ventas/pedidos-pendientes, puede_cobrar depende
+          -- unicamente del saldo real (estado_pago + monto_pendiente),
+          -- nunca de si ya existe id_factura ni de si ya existe una
+          -- division PENDIENTE persistida.
           (
             UPPER(TRIM(COALESCE(ppc.estado_pago_codigo, ''))) = '${PEDIDO_PENDIENTE_ESTADO_PAGO}'
             AND COALESCE(ppc.monto_pendiente, 0) > 0
-            AND (
-              f.id_factura IS NULL
-              OR COALESCE(vcd_info.divisiones_pendientes_count, 0) > 0
-            )
           ) AS puede_cobrar,
           ${validacionSelect},
           ${pagoConfirmadoAtSelect},
@@ -7758,24 +7759,32 @@ async function listarPedidosPendientesPago(req, res) {
     const userSucursalId = parseOptionalPositiveInt(scope?.userSucursalId);
     const effectiveAllowedSucursalIds = allowedSucursalIds.length > 0 ? allowedSucursalIds : userSucursalId ? [userSucursalId] : [];
 
-    const hasPendingSplitDivisionSql = `EXISTS (
-        SELECT 1
-        FROM public.ventas_cuenta_divisiones vcd_pending
-        WHERE vcd_pending.id_pedido = p.id_pedido
-          AND UPPER(TRIM(vcd_pending.estado)) = 'PENDIENTE'
-      )`;
-    const cobrableFacturaScopeSql = `(f.id_factura IS NULL OR ${hasPendingSplitDivisionSql})`;
+    // HOTFIX (saldo dividido oculto): la regla financiera es unica y no
+    // depende de si ya existe una factura parcial ni de si ya existe una
+    // division PENDIENTE persistida -- ambas condiciones podian ser falsas
+    // legitimamente (factura parcial ya creada, lineas restantes sin
+    // division todavia) mientras el pedido seguia debiendo dinero real.
+    // Unica fuente de verdad: pedidos_pago_control.estado_pago_codigo +
+    // monto_pendiente (ya calculados correctamente por
+    // POST /ventas/pedidos/:id/registrar-pago, incluyendo el saldo de
+    // lineas sin asignar via montoPendienteSinAsignar). NUNCA se debe
+    // volver a bloquear el cobro solo porque exista id_factura o porque no
+    // exista todavia una fila en ventas_cuenta_divisiones.
     const filters = [
       'UPPER(TRIM(ppc.estado_pago_codigo)) = $1',
-      'COALESCE(ppc.monto_pendiente, 0) > 0',
-      cobrableFacturaScopeSql
+      'COALESCE(ppc.monto_pendiente, 0) > 0'
     ];
     const params = [PEDIDO_PENDIENTE_ESTADO_PAGO];
+    // HOTFIX: COMPLETADO es un estado OPERATIVO (cocina/entrega), no
+    // financiero. Este endpoint es de pendientes de COBRO: un pedido
+    // COMPLETADO con saldo pendiente debe seguir apareciendo aqui hasta que
+    // el saldo llegue a cero. Los demas estados excluidos son terminales
+    // (venta anulada/cancelada) donde ya no existe una deuda legitima que
+    // cobrar.
     const excludedPedidoEstados = [
       'CANCELADO',
       'ANULADO',
       'NO_ENTREGADO',
-      'COMPLETADO',
       'CANCELADO_POR_NO_PAGO',
       'CANCELADO_TIMEOUT',
       'PAGO_ANULADO'
@@ -7881,6 +7890,22 @@ async function listarPedidosPendientesPago(req, res) {
         ORDER BY f_inner.fecha_hora_facturacion DESC NULLS LAST, f_inner.id_factura DESC
         LIMIT 1
       ) f ON true
+      -- HOTFIX: cuenta lineas activas del pedido vs lineas ya asignadas a
+      -- ALGUNA division (pagada o pendiente), para exponer
+      -- items/items_asignados/items_sin_asignar sin depender de que exista
+      -- una division PENDIENTE persistida.
+      LEFT JOIN LATERAL (
+        SELECT
+          COUNT(DISTINCT dp_items.id_detalle_pedido)::int AS items_total,
+          COUNT(DISTINCT dp_items.id_detalle_pedido) FILTER (
+            WHERE vdi_items.id_cuenta_division_item IS NOT NULL
+          )::int AS items_asignados
+        FROM public.detalle_pedido dp_items
+        LEFT JOIN public.ventas_cuenta_division_items vdi_items
+          ON vdi_items.id_detalle_pedido = dp_items.id_detalle_pedido
+        WHERE dp_items.id_pedido = p.id_pedido
+          AND COALESCE(dp_items.estado, true) = true
+      ) items_info ON true
       LEFT JOIN LATERAL (
         SELECT jsonb_agg(
           jsonb_build_object(
@@ -7959,10 +7984,12 @@ async function listarPedidosPendientesPago(req, res) {
           COALESCE(ppc.monto_total, p.total, 0)::numeric(14,2) AS monto_total,
           COALESCE(ppc.monto_pagado, 0)::numeric(14,2) AS monto_pagado,
           COALESCE(ppc.monto_pendiente, 0)::numeric(14,2) AS monto_pendiente,
+          -- HOTFIX: puede_cobrar depende UNICAMENTE del saldo financiero
+          -- real (misma regla que el WHERE de este endpoint), nunca de la
+          -- existencia de id_factura ni de una division PENDIENTE.
           (
             UPPER(TRIM(ppc.estado_pago_codigo)) = $1
             AND COALESCE(ppc.monto_pendiente, 0) > 0
-            AND ${cobrableFacturaScopeSql}
           ) AS puede_cobrar,
           pd.id_pedido_delivery IS NOT NULL AS es_delivery,
           CASE
@@ -7975,7 +8002,9 @@ async function listarPedidosPendientesPago(req, res) {
           pd.direccion_entrega,
           pd.referencia_entrega,
           pd.observacion_delivery,
-          COALESCE(vcd_info.divisiones, '[]'::jsonb) AS cuenta_dividida
+          COALESCE(vcd_info.divisiones, '[]'::jsonb) AS cuenta_dividida,
+          COALESCE(items_info.items_total, 0)::int AS items_total,
+          COALESCE(items_info.items_asignados, 0)::int AS items_asignados
         ${fromClause}
         ${whereClause}
         ORDER BY p.fecha_hora_pedido DESC, p.id_pedido DESC
@@ -8011,6 +8040,9 @@ async function listarPedidosPendientesPago(req, res) {
       cuenta_dividida: {
         divisiones: Array.isArray(row.cuenta_dividida) ? row.cuenta_dividida : []
       },
+      items: Number(row.items_total || 0),
+      items_asignados: Number(row.items_asignados || 0),
+      items_sin_asignar: Math.max(Number(row.items_total || 0) - Number(row.items_asignados || 0), 0),
       es_delivery: Boolean(row.es_delivery),
       costo_envio: row.costo_envio === null || row.costo_envio === undefined ? null : roundMoney(row.costo_envio),
       estado_delivery: row.estado_delivery,
@@ -9206,6 +9238,53 @@ router.post('/ventas/pedidos/:id/registrar-pago', checkPermission(['VENTAS_CREAR
           lineRefs: divisionLines.map((line) => ({ id_detalle_pedido: line.id_detalle_pedido })),
           estadoInicial: 'PENDIENTE'
         });
+
+        // HOTFIX (saldo dividido oculto): si el payload de cuenta_dividida
+        // cubrio SOLO ALGUNAS de las lineas todavia disponibles
+        // (divisionLines), las lineas restantes quedaban sin NINGUNA fila
+        // en ventas_cuenta_divisiones -- el saldo seguia siendo correcto en
+        // pedidos_pago_control, pero no habia ninguna division PENDIENTE
+        // que las representara. El backend nunca debe depender de que el
+        // frontend envie el 100% de las lineas: aqui se crea
+        // automaticamente una division PENDIENTE de respaldo ("Saldo
+        // pendiente de asignar") que cubre exactamente esas lineas
+        // sobrantes, calculada 100% en backend a partir de los montos
+        // reales de detalle_pedido (nunca de un total enviado por el
+        // frontend).
+        const assignedLineIndexes = new Set(
+          cuentaDivisionPlan.divisions.flatMap((division) => division.items.map((item) => item.line_index))
+        );
+        const leftoverItems = divisionLines
+          .map((line, lineIndex) => ({ line_index: lineIndex, cart_key: normalizeCartKey(line?.cart_key), line }))
+          .filter((entry) => !assignedLineIndexes.has(entry.line_index));
+        if (leftoverItems.length > 0) {
+          const maxOrdenExistente = Math.max(
+            0,
+            ...divisionesExistentesResult.rows.map((row) => Number(row.orden) || 0),
+            ...persistedDivisions.map((division) => Number(division.orden) || 0)
+          );
+          const leftoverDivisionPlan = {
+            total: roundMoney(leftoverItems.reduce((sum, item) => sum + Number(item.line?.total_linea || 0), 0)),
+            divisions: [{
+              etiqueta: 'Saldo pendiente de asignar',
+              orden: maxOrdenExistente + 1,
+              subtotal_base: roundMoney(leftoverItems.reduce((sum, item) => sum + Number(item.line?.base_sub_total ?? item.line?.sub_total ?? 0), 0)),
+              subtotal_extras: roundMoney(leftoverItems.reduce((sum, item) => sum + Number(item.line?.subtotal_extras || 0), 0)),
+              descuento_total: roundMoney(leftoverItems.reduce((sum, item) => sum + Number(item.line?.descuento || 0), 0)),
+              isv_total: 0,
+              total: roundMoney(leftoverItems.reduce((sum, item) => sum + Number(item.line?.total_linea || 0), 0)),
+              items: leftoverItems
+            }]
+          };
+          await persistCuentaDividida({
+            client,
+            plan: leftoverDivisionPlan,
+            idPedido,
+            lineRefs: divisionLines.map((line) => ({ id_detalle_pedido: line.id_detalle_pedido })),
+            estadoInicial: 'PENDIENTE'
+          });
+        }
+
         cuentaDivisionPago = persistedDivisions.find((division) => Number(division.orden) === Number(cobrarDivisionOrdenRequested)) || null;
         if (!cuentaDivisionPago) {
           await client.query('ROLLBACK');
