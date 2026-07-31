@@ -13,6 +13,7 @@ import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
+import { EXCLUDED_PEDIDOS_PENDIENTES_ESTADOS } from '../services/cuentaDivididaSplitService.js';
 
 const source = readFileSync(resolve('routers/ventas.js'), 'utf8');
 
@@ -25,16 +26,19 @@ describe('GET /ventas/pedidos-pendientes — Escenario A/C/D: el saldo financier
     assert.match(fnBody, /const filters = \[\s*'UPPER\(TRIM\(ppc\.estado_pago_codigo\)\) = \$1',\s*'COALESCE\(ppc\.monto_pendiente, 0\) > 0'\s*\];/);
   });
 
-  it('Escenario C: COMPLETADO ya NO esta en excludedPedidoEstados (estado operativo no debe bloquear el endpoint financiero)', () => {
+  it('el listado usa el arreglo compartido EXCLUDED_PEDIDOS_PENDIENTES_ESTADOS (nunca uno literal duplicado)', () => {
     const fnStart = source.indexOf('async function listarPedidosPendientesPago');
     const fnBody = source.slice(fnStart, fnStart + 6000);
-    const block = fnBody.match(/const excludedPedidoEstados = \[[\s\S]*?\];/)?.[0] || '';
-    assert.ok(block, 'no se encontro el arreglo excludedPedidoEstados');
-    assert.doesNotMatch(block, /'COMPLETADO'/);
+    assert.match(fnBody, /const excludedPedidoEstados = \[\.\.\.EXCLUDED_PEDIDOS_PENDIENTES_ESTADOS\];/);
+  });
+
+  it('Escenario C / #7 NO_ENTREGADO: ni COMPLETADO ni NO_ENTREGADO estan en la lista de exclusion real (prueba ejecutable, no regex)', () => {
+    assert.ok(!EXCLUDED_PEDIDOS_PENDIENTES_ESTADOS.includes('COMPLETADO'));
+    assert.ok(!EXCLUDED_PEDIDOS_PENDIENTES_ESTADOS.includes('NO_ENTREGADO'));
     // Los estados verdaderamente terminales (venta anulada/cancelada) siguen excluidos.
-    assert.match(block, /'CANCELADO'/);
-    assert.match(block, /'ANULADO'/);
-    assert.match(block, /'PAGO_ANULADO'/);
+    assert.ok(EXCLUDED_PEDIDOS_PENDIENTES_ESTADOS.includes('CANCELADO'));
+    assert.ok(EXCLUDED_PEDIDOS_PENDIENTES_ESTADOS.includes('ANULADO'));
+    assert.ok(EXCLUDED_PEDIDOS_PENDIENTES_ESTADOS.includes('PAGO_ANULADO'));
   });
 
   it('Escenario D: puede_cobrar (listado) depende unicamente de estado_pago + monto_pendiente, nunca de id_factura', () => {
@@ -63,23 +67,45 @@ describe('GET /ventas/:id — puede_cobrar (detalle) usa la misma regla simplifi
 });
 
 describe('POST /ventas/pedidos/:id/registrar-pago — Escenario A/F: division de respaldo para lineas sin asignar', () => {
-  it('tras persistir las divisiones solicitadas, calcula las lineas sobrantes (no cubiertas por cuentaDivisionPlan) y crea una division PENDIENTE de respaldo', () => {
+  it('tras persistir las divisiones solicitadas, calcula las lineas sobrantes (no cubiertas por cuentaDivisionPlan) y crea UNA division PENDIENTE de respaldo POR LINEA via buildBackupDivisionsPlan (alternativa recomendada, ronda 2)', () => {
     const anchor = source.indexOf('const persistedDivisions = await persistCuentaDividida({');
     assert.ok(anchor > -1);
-    const block = source.slice(anchor, anchor + 3000);
+    const block = source.slice(anchor, anchor + 3200);
     assert.match(block, /const assignedLineIndexes = new Set\(/);
     assert.match(block, /const leftoverItems = divisionLines/);
     assert.match(block, /if \(leftoverItems\.length > 0\) \{/);
-    assert.match(block, /etiqueta: 'Saldo pendiente de asignar'/);
+    assert.match(block, /const backupDivisions = buildBackupDivisionsPlan\(\{/);
     assert.match(block, /estadoInicial: 'PENDIENTE'/);
+    // Nunca debe volver a existir una sola division agregada "de asignar"
+    // que despues impida separar las lineas en personas distintas.
+    assert.doesNotMatch(block, /etiqueta: 'Saldo pendiente de asignar'/);
   });
 
-  it('el total de la division de respaldo se calcula 100% desde detalle_pedido (total_linea de cada linea sobrante), nunca desde un total enviado por el frontend', () => {
-    const anchor = source.indexOf('const leftoverDivisionPlan = {');
-    assert.ok(anchor > -1);
-    const block = source.slice(anchor, anchor + 900);
-    assert.match(block, /total: roundMoney\(leftoverItems\.reduce\(\(sum, item\) => sum \+ Number\(item\.line\?\.total_linea \|\| 0\), 0\)\)/);
-    assert.doesNotMatch(block, /req\.body/);
+  it('el total de cada division de respaldo se calcula 100% desde detalle_pedido (buildBackupDivisionsPlan usa item.line.total_linea), nunca desde un total enviado por el frontend', () => {
+    const serviceSource = readFileSync(resolve('routers/ventas/services/cuentaDivididaSplitService.js'), 'utf8');
+    const fnBlock = serviceSource.match(/export const buildBackupDivisionsPlan = \([\s\S]{0,900}/)?.[0] || '';
+    assert.match(fnBlock, /total: roundMoney\(item\?\.line\?\.total_linea \|\| 0\)/);
+    assert.doesNotMatch(fnBlock, /req\.body/);
+  });
+
+  it('correccion #1: el orden de las divisiones nuevas se recalcula con resolveNextOrdenSequence (nunca se confia en division.orden enviado por el frontend)', () => {
+    const registrarPagoStart = source.indexOf("router.post('/ventas/pedidos/:id/registrar-pago'");
+    assert.ok(registrarPagoStart > -1);
+    const anchor = source.indexOf('const cuentaDivisionPlan = buildCuentaDivisionPlan({', registrarPagoStart);
+    assert.ok(anchor > -1, 'no se encontro la construccion del plan dentro de registrar-pago');
+    const block = source.slice(anchor, anchor + 1200);
+    assert.match(block, /const nuevosOrdenes = resolveNextOrdenSequence\(\{/);
+    assert.match(block, /division\.orden = nuevosOrdenes\[index\];/);
+  });
+
+  it('correccion #1: la division a cobrar se selecciona por POSICION (selectNewDivisionToCharge), nunca comparando contra el valor de orden persistido', () => {
+    assert.match(source, /cuentaDivisionPago = selectNewDivisionToCharge\(\{/);
+    assert.doesNotMatch(source, /persistedDivisions\.find\(\(division\) => Number\(division\.orden\) === Number\(cobrarDivisionOrdenRequested\)\)/);
+  });
+
+  it('correccion #5: una division de respaldo automatica ya superada por el nuevo plan se anula (nunca queda representando lineas duplicadas)', () => {
+    assert.match(source, /const supersededBackupDivisionIds = resolveSupersededBackupDivisionIds\(\{/);
+    assert.match(source, /SET estado = 'ANULADA'/);
   });
 
   it('Escenario F (duplicados): buildCuentaDivisionPlan sigue lanzando CUENTA_DIVIDIDA_ITEM_DUPLICADO cuando una linea se asigna dos veces', () => {
@@ -88,11 +114,12 @@ describe('POST /ventas/pedidos/:id/registrar-pago — Escenario A/F: division de
     assert.match(fnBlock, /if \(assigned\.has\(lineIndex\)\) \{/);
   });
 
-  it('Escenario F: una linea ya facturada (asignada a otra division) no puede volver a facturarse -- detallePedidoRowsDisponibles excluye lineas ya asignadas antes de construir el plan', () => {
-    const anchor = source.indexOf('let detallePedidoRowsDisponibles = detallePedidoResult.rows;');
+  it('Escenario F: una linea ya facturada (asignada a otra division) no puede volver a facturarse -- detallePedidoRowsDisponibles usa filterAvailableLines (ANULADA/redistribuible-aware) antes de construir el plan', () => {
+    const anchor = source.indexOf('const detallePedidoRowsDisponibles = filterAvailableLines({');
     assert.ok(anchor > -1);
-    const block = source.slice(anchor, anchor + 1200);
-    assert.match(block, /assignedDetalleIds\.has\(Number\(row\.id_detalle_pedido\)\)/);
+    const block = source.slice(anchor, anchor + 300);
+    assert.match(block, /allLines: detallePedidoResult\.rows,/);
+    assert.match(block, /divisions: divisionesExistentesConItems/);
   });
 
   it('una division pagada no puede cobrarse otra vez (CUENTA_DIVISION_YA_FACTURADA)', () => {

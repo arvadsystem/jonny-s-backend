@@ -154,6 +154,14 @@ import {
   VENTAS_MAX_PAGE_SIZE
 } from './ventas/constants.js';
 import { roundMoney } from './ventas/utils/moneyUtils.js';
+import {
+  EXCLUDED_PEDIDOS_PENDIENTES_ESTADOS,
+  filterAvailableLines,
+  resolveNextOrdenSequence,
+  buildBackupDivisionsPlan,
+  selectNewDivisionToCharge,
+  resolveSupersededBackupDivisionIds
+} from './ventas/services/cuentaDivididaSplitService.js';
 import { validarYDescontarPedido } from '../services/inventarioPedidoService.js';
 import { buildPedidoConsumoPayload } from './cocina.js';
 import {
@@ -7775,20 +7783,22 @@ async function listarPedidosPendientesPago(req, res) {
       'COALESCE(ppc.monto_pendiente, 0) > 0'
     ];
     const params = [PEDIDO_PENDIENTE_ESTADO_PAGO];
-    // HOTFIX: COMPLETADO es un estado OPERATIVO (cocina/entrega), no
-    // financiero. Este endpoint es de pendientes de COBRO: un pedido
-    // COMPLETADO con saldo pendiente debe seguir apareciendo aqui hasta que
-    // el saldo llegue a cero. Los demas estados excluidos son terminales
-    // (venta anulada/cancelada) donde ya no existe una deuda legitima que
-    // cobrar.
-    const excludedPedidoEstados = [
-      'CANCELADO',
-      'ANULADO',
-      'NO_ENTREGADO',
-      'CANCELADO_POR_NO_PAGO',
-      'CANCELADO_TIMEOUT',
-      'PAGO_ANULADO'
-    ];
+    // HOTFIX (ronda 2, correccion #7): COMPLETADO y NO_ENTREGADO son
+    // estados OPERATIVOS (cocina/entrega), no financieros. Auditoria de
+    // codigo confirmada: ningun flujo que transiciona un pedido a
+    // NO_ENTREGADO (routers/cocina.js PUT /cocina/pedidos/:id/estado,
+    // routers/ventas.js PUT /ventas/pedidos-menu/:id/estado) toca
+    // pedidos_pago_control ni anula el pago -- la deuda sigue vigente
+    // exactamente igual que con COMPLETADO. Los unicos codigos que SI
+    // representan una cancelacion financiera real y confirmada en codigo
+    // son CANCELADO/ANULADO (reversion de venta,
+    // services/ventasReversionService.js) y
+    // CANCELADO_POR_NO_PAGO/CANCELADO_TIMEOUT/PAGO_ANULADO (expiracion de
+    // pago pendiente, routers/ventas.js:expirePendingPublicOrders). La
+    // lista completa vive en cuentaDivididaSplitService.js
+    // (EXCLUDED_PEDIDOS_PENDIENTES_ESTADOS) para poder probarla de forma
+    // ejecutable sin duplicar el arreglo.
+    const excludedPedidoEstados = [...EXCLUDED_PEDIDOS_PENDIENTES_ESTADOS];
     params.push(excludedPedidoEstados);
     filters.push("REPLACE(REPLACE(UPPER(TRIM(COALESCE(ep.descripcion, ''))), ' ', '_'), '-', '_') <> ALL($" + params.length + '::text[])');
 
@@ -7891,18 +7901,24 @@ async function listarPedidosPendientesPago(req, res) {
         LIMIT 1
       ) f ON true
       -- HOTFIX: cuenta lineas activas del pedido vs lineas ya asignadas a
-      -- ALGUNA division (pagada o pendiente), para exponer
+      -- ALGUNA division ACTIVA (pagada o pendiente), para exponer
       -- items/items_asignados/items_sin_asignar sin depender de que exista
-      -- una division PENDIENTE persistida.
+      -- una division PENDIENTE persistida. HOTFIX (ronda 2, correccion
+      -- #6): una division ANULADA nunca reserva sus lineas -- el JOIN
+      -- hacia ventas_cuenta_divisiones descarta explicitamente estado
+      -- ANULADA antes de contar como "asignada".
       LEFT JOIN LATERAL (
         SELECT
           COUNT(DISTINCT dp_items.id_detalle_pedido)::int AS items_total,
           COUNT(DISTINCT dp_items.id_detalle_pedido) FILTER (
-            WHERE vdi_items.id_cuenta_division_item IS NOT NULL
+            WHERE vcd_items.id_cuenta_division IS NOT NULL
           )::int AS items_asignados
         FROM public.detalle_pedido dp_items
         LEFT JOIN public.ventas_cuenta_division_items vdi_items
           ON vdi_items.id_detalle_pedido = dp_items.id_detalle_pedido
+        LEFT JOIN public.ventas_cuenta_divisiones vcd_items
+          ON vcd_items.id_cuenta_division = vdi_items.id_cuenta_division
+         AND UPPER(TRIM(COALESCE(vcd_items.estado, ''))) <> 'ANULADA'
         WHERE dp_items.id_pedido = p.id_pedido
           AND COALESCE(dp_items.estado, true) = true
       ) items_info ON true
@@ -9152,36 +9168,46 @@ router.post('/ventas/pedidos/:id/registrar-pago', checkPermission(['VENTAS_CREAR
           message: 'Este pedido tiene cuenta dividida. Debes enviar id_cuenta_division para cobrar una subcuenta.'
         });
       }
+      // HOTFIX (ronda 2): se cargan los items de cada division existente
+      // (antes solo se hacia un SELECT DISTINCT ad-hoc que no distinguia
+      // estado ni tipo de division). resolveAssignedDetalleIds/filterAvailableLines
+      // (routers/ventas/services/cuentaDivididaSplitService.js) usan esta
+      // forma enriquecida para: (a) nunca reservar lineas de una division
+      // ANULADA, y (b) permitir reabsorber lineas de un respaldo
+      // automatico PENDIENTE sin factura ni pago (isRedistributableBackupDivision).
+      const existingDivisionIdsForItems = divisionesExistentesResult.rows
+        .map((row) => parseOptionalPositiveInt(row.id_cuenta_division))
+        .filter(Boolean);
+      const existingDivisionItemsResult = existingDivisionIdsForItems.length
+        ? await client.query(
+          `
+            SELECT id_cuenta_division, id_detalle_pedido
+            FROM public.ventas_cuenta_division_items
+            WHERE id_cuenta_division = ANY($1::bigint[])
+              AND id_detalle_pedido IS NOT NULL
+          `,
+          [existingDivisionIdsForItems]
+        )
+        : { rows: [] };
+      const existingItemsByDivisionId = new Map();
+      for (const row of existingDivisionItemsResult.rows) {
+        const divId = Number(row.id_cuenta_division);
+        if (!existingItemsByDivisionId.has(divId)) existingItemsByDivisionId.set(divId, []);
+        existingItemsByDivisionId.get(divId).push({ id_detalle_pedido: Number(row.id_detalle_pedido) });
+      }
+      const divisionesExistentesConItems = divisionesExistentesResult.rows.map((row) => ({
+        ...row,
+        items: existingItemsByDivisionId.get(Number(row.id_cuenta_division)) || []
+      }));
       if (cuentaDivididaSolicitada) {
         detallePedidoExtrasByIdCache = await fetchDetallePedidoExtras(
           client,
           detallePedidoResult.rows.map((row) => row.id_detalle_pedido)
         );
-        let detallePedidoRowsDisponibles = detallePedidoResult.rows;
-        if (divisionesExistentesResult.rowCount > 0) {
-          const existingDivisionIds = divisionesExistentesResult.rows
-            .map((row) => parseOptionalPositiveInt(row.id_cuenta_division))
-            .filter(Boolean);
-          const assignedItemsResult = existingDivisionIds.length
-            ? await client.query(
-              `
-                SELECT DISTINCT id_detalle_pedido
-                FROM public.ventas_cuenta_division_items
-                WHERE id_cuenta_division = ANY($1::bigint[])
-                  AND id_detalle_pedido IS NOT NULL
-              `,
-              [existingDivisionIds]
-            )
-            : { rows: [] };
-          const assignedDetalleIds = new Set(
-            assignedItemsResult.rows
-              .map((row) => parseOptionalPositiveInt(row.id_detalle_pedido))
-              .filter(Boolean)
-          );
-          detallePedidoRowsDisponibles = detallePedidoResult.rows.filter((row) => (
-            !assignedDetalleIds.has(Number(row.id_detalle_pedido))
-          ));
-        }
+        const detallePedidoRowsDisponibles = filterAvailableLines({
+          allLines: detallePedidoResult.rows,
+          divisions: divisionesExistentesConItems
+        });
         if (!detallePedidoRowsDisponibles.length) {
           await client.query('ROLLBACK');
           return res.status(409).json({
@@ -9231,6 +9257,22 @@ router.post('/ventas/pedidos/:id/registrar-pago', checkPermission(['VENTAS_CREAR
           expectedTotal: roundMoney(pedido.total || pagoControl.monto_pendiente),
           allowPartial: true
         });
+
+        // HOTFIX (ronda 2, correccion #1): el "orden" de cada division
+        // NUEVA lo asigna EXCLUSIVAMENTE el backend, a partir del maximo
+        // orden ya existente -- nunca se confia en division.orden enviado
+        // por el frontend (que podia repetir orden=1 con la Persona 1 ya
+        // existente). resolveNextOrdenSequence esta en
+        // cuentaDividaSplitService.js y es la misma funcion probada por
+        // pruebas unitarias.
+        const nuevosOrdenes = resolveNextOrdenSequence({
+          existingDivisions: divisionesExistentesConItems,
+          count: cuentaDivisionPlan.divisions.length
+        });
+        cuentaDivisionPlan.divisions.forEach((division, index) => {
+          division.orden = nuevosOrdenes[index];
+        });
+
         const persistedDivisions = await persistCuentaDividida({
           client,
           plan: cuentaDivisionPlan,
@@ -9239,18 +9281,42 @@ router.post('/ventas/pedidos/:id/registrar-pago', checkPermission(['VENTAS_CREAR
           estadoInicial: 'PENDIENTE'
         });
 
-        // HOTFIX (saldo dividido oculto): si el payload de cuenta_dividida
-        // cubrio SOLO ALGUNAS de las lineas todavia disponibles
-        // (divisionLines), las lineas restantes quedaban sin NINGUNA fila
-        // en ventas_cuenta_divisiones -- el saldo seguia siendo correcto en
-        // pedidos_pago_control, pero no habia ninguna division PENDIENTE
-        // que las representara. El backend nunca debe depender de que el
-        // frontend envie el 100% de las lineas: aqui se crea
-        // automaticamente una division PENDIENTE de respaldo ("Saldo
-        // pendiente de asignar") que cubre exactamente esas lineas
-        // sobrantes, calculada 100% en backend a partir de los montos
-        // reales de detalle_pedido (nunca de un total enviado por el
-        // frontend).
+        // HOTFIX (ronda 2, correccion #5): las lineas recien asignadas en
+        // ESTE envio pueden superar por completo a una division de
+        // respaldo automatico PENDIENTE previamente creada (sin factura,
+        // sin pago) -- esa division vieja queda anulada para que sus
+        // lineas no aparezcan representadas dos veces (una en el respaldo
+        // viejo, otra en la division nueva/Persona real).
+        const newlyAssignedDetalleIds = new Set(
+          cuentaDivisionPlan.divisions.flatMap((division) => (
+            division.items.map((item) => Number(item.line?.id_detalle_pedido)).filter(Boolean)
+          ))
+        );
+        const supersededBackupDivisionIds = resolveSupersededBackupDivisionIds({
+          existingDivisions: divisionesExistentesConItems,
+          newlyAssignedDetalleIds
+        });
+        if (supersededBackupDivisionIds.length) {
+          await client.query(
+            `
+              UPDATE public.ventas_cuenta_divisiones
+              SET estado = 'ANULADA', fecha_actualizacion = (NOW() AT TIME ZONE 'America/Tegucigalpa')
+              WHERE id_cuenta_division = ANY($1::bigint[])
+            `,
+            [supersededBackupDivisionIds]
+          );
+        }
+
+        // HOTFIX (saldo dividido oculto, correccion #5): si el payload de
+        // cuenta_dividida cubrio SOLO ALGUNAS de las lineas todavia
+        // disponibles (divisionLines), las lineas restantes quedaban sin
+        // NINGUNA fila en ventas_cuenta_divisiones. El backend nunca debe
+        // depender de que el frontend envie el 100% de las lineas: aqui se
+        // crea automaticamente UNA division PENDIENTE de respaldo POR CADA
+        // linea sobrante (alternativa recomendada del ticket -- nunca una
+        // sola division agregada que despues impida separarlas en
+        // personas distintas), calculada 100% en backend a partir de los
+        // montos reales de detalle_pedido.
         const assignedLineIndexes = new Set(
           cuentaDivisionPlan.divisions.flatMap((division) => division.items.map((item) => item.line_index))
         );
@@ -9258,34 +9324,32 @@ router.post('/ventas/pedidos/:id/registrar-pago', checkPermission(['VENTAS_CREAR
           .map((line, lineIndex) => ({ line_index: lineIndex, cart_key: normalizeCartKey(line?.cart_key), line }))
           .filter((entry) => !assignedLineIndexes.has(entry.line_index));
         if (leftoverItems.length > 0) {
-          const maxOrdenExistente = Math.max(
-            0,
-            ...divisionesExistentesResult.rows.map((row) => Number(row.orden) || 0),
-            ...persistedDivisions.map((division) => Number(division.orden) || 0)
-          );
-          const leftoverDivisionPlan = {
-            total: roundMoney(leftoverItems.reduce((sum, item) => sum + Number(item.line?.total_linea || 0), 0)),
-            divisions: [{
-              etiqueta: 'Saldo pendiente de asignar',
-              orden: maxOrdenExistente + 1,
-              subtotal_base: roundMoney(leftoverItems.reduce((sum, item) => sum + Number(item.line?.base_sub_total ?? item.line?.sub_total ?? 0), 0)),
-              subtotal_extras: roundMoney(leftoverItems.reduce((sum, item) => sum + Number(item.line?.subtotal_extras || 0), 0)),
-              descuento_total: roundMoney(leftoverItems.reduce((sum, item) => sum + Number(item.line?.descuento || 0), 0)),
-              isv_total: 0,
-              total: roundMoney(leftoverItems.reduce((sum, item) => sum + Number(item.line?.total_linea || 0), 0)),
-              items: leftoverItems
-            }]
-          };
+          const backupOrdenes = resolveNextOrdenSequence({
+            existingDivisions: [...divisionesExistentesConItems, ...persistedDivisions],
+            count: leftoverItems.length
+          });
+          const backupDivisions = buildBackupDivisionsPlan({
+            leftoverItems,
+            startingOrden: backupOrdenes[0]
+          });
           await persistCuentaDividida({
             client,
-            plan: leftoverDivisionPlan,
+            plan: { divisions: backupDivisions, total: roundMoney(backupDivisions.reduce((sum, division) => sum + Number(division.total || 0), 0)) },
             idPedido,
             lineRefs: divisionLines.map((line) => ({ id_detalle_pedido: line.id_detalle_pedido })),
             estadoInicial: 'PENDIENTE'
           });
         }
 
-        cuentaDivisionPago = persistedDivisions.find((division) => Number(division.orden) === Number(cobrarDivisionOrdenRequested)) || null;
+        // HOTFIX (ronda 2, correccion #1): la division a cobrar se resuelve
+        // por POSICION dentro del plan recien enviado (1-based,
+        // cobrar_division_orden), nunca comparando contra el valor de
+        // "orden" persistido -- que ahora lo controla el backend y puede no
+        // coincidir con lo que el frontend calculo al armar el payload.
+        cuentaDivisionPago = selectNewDivisionToCharge({
+          persistedDivisions,
+          position: cobrarDivisionOrdenRequested
+        });
         if (!cuentaDivisionPago) {
           await client.query('ROLLBACK');
           return res.status(400).json({
