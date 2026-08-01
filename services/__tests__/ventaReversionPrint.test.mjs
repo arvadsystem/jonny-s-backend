@@ -1,10 +1,17 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { describe, it } from 'node:test';
+import PDFDocument from 'pdfkit';
+import sharp from 'sharp';
 import {
   buildVentaReversionTicketModel,
-  buildVentaReversionTicketPdfBuffer
+  buildVentaReversionTicketPdfBuffer,
+  resolveVentaReversionLogoLayout
 } from '../ventaReversionTicketPdfService.js';
+import {
+  mmToPixels203Dpi,
+  optimizePrintLogoDataUrl
+} from '../printLogoOptimizationService.js';
 import {
   createCanonicalPrintJob,
   validateCanonicalPrintPayload
@@ -78,6 +85,100 @@ const baseData = (overrides = {}) => ({
   ...overrides
 });
 
+const asDataUrl = (buffer, mime = 'png') => `data:image/${mime};base64,${buffer.toString('base64')}`;
+
+const createPng = async ({ width, height, background }) => sharp({
+  create: { width, height, channels: 4, background }
+}).png().toBuffer();
+
+const createNoisyPng = async (width, height) => {
+  const pixels = Buffer.alloc(width * height * 3);
+  let state = 0x9e3779b9;
+  for (let index = 0; index < pixels.length; index += 1) {
+    state ^= state << 13;
+    state ^= state >>> 17;
+    state ^= state << 5;
+    pixels[index] = state & 0xff;
+  }
+  return sharp(pixels, { raw: { width, height, channels: 3 } }).png().toBuffer();
+};
+
+const buildUnoptimizedLogoPdf = async (logoBuffer, widthPt, heightPt) => {
+  const doc = new PDFDocument({ size: [226.771654, 420], margins: 0, compress: false });
+  const chunks = [];
+  doc.on('data', (chunk) => chunks.push(chunk));
+  const complete = new Promise((resolve, reject) => {
+    doc.on('end', () => resolve(Buffer.concat(chunks)));
+    doc.on('error', reject);
+  });
+  doc.image(logoBuffer, 19.84252, 12, { width: widthPt, height: heightPt });
+  doc.fontSize(10).text("JONNY'S EL CARMEN", 19.84252, 100, { width: 174.330708, align: 'center' });
+  doc.end();
+  return complete;
+};
+
+describe('optimizacion del logo de impresion', () => {
+  it('conserva proporcion y limites en logos horizontales y verticales', async () => {
+    const horizontal = await optimizePrintLogoDataUrl(asDataUrl(await createPng({
+      width: 1600,
+      height: 400,
+      background: '#cc3300'
+    })), {
+      targetWidthPx: mmToPixels203Dpi(47.5),
+      targetHeightPx: mmToPixels203Dpi(19)
+    });
+    const vertical = await optimizePrintLogoDataUrl(asDataUrl(await createPng({
+      width: 400,
+      height: 1600,
+      background: '#3366cc'
+    })), {
+      targetWidthPx: mmToPixels203Dpi(61.5),
+      targetHeightPx: mmToPixels203Dpi(25)
+    });
+
+    assert.equal(horizontal.ok, true);
+    assert.equal(horizontal.outputWidthPx <= mmToPixels203Dpi(47.5), true);
+    assert.equal(horizontal.outputHeightPx <= mmToPixels203Dpi(19), true);
+    assert.ok(Math.abs((horizontal.outputWidthPx / horizontal.outputHeightPx) - 4) < 0.02);
+    assert.equal(vertical.ok, true);
+    assert.equal(vertical.outputWidthPx <= mmToPixels203Dpi(61.5), true);
+    assert.equal(vertical.outputHeightPx <= mmToPixels203Dpi(25), true);
+    assert.ok(Math.abs((vertical.outputWidthPx / vertical.outputHeightPx) - 0.25) < 0.02);
+  });
+
+  it('no amplia logos pequenos y aplana transparencia sobre blanco', async () => {
+    const small = await optimizePrintLogoDataUrl(asDataUrl(await createPng({
+      width: 40,
+      height: 20,
+      background: '#112233'
+    })), { targetWidthPx: 380, targetHeightPx: 152 });
+    const transparent = await optimizePrintLogoDataUrl(asDataUrl(await createPng({
+      width: 20,
+      height: 20,
+      background: { r: 0, g: 0, b: 0, alpha: 0 }
+    })), { targetWidthPx: 380, targetHeightPx: 152 });
+
+    assert.equal(small.ok, true);
+    assert.deepEqual([small.outputWidthPx, small.outputHeightPx], [40, 20]);
+    assert.equal(transparent.ok, true);
+    const pixel = await sharp(transparent.buffer).removeAlpha().raw().toBuffer();
+    assert.deepEqual([...pixel.subarray(0, 3)], [255, 255, 255]);
+  });
+
+  it('rechaza data URLs e imagenes invalidas sin exponer contenido', async () => {
+    const unsupported = await optimizePrintLogoDataUrl('data:image/svg+xml;base64,PHN2Zz48L3N2Zz4=', {
+      targetWidthPx: 380,
+      targetHeightPx: 152
+    });
+    const corrupt = await optimizePrintLogoDataUrl('data:image/png;base64,bm8gZXMgdW5hIGltYWdlbg==', {
+      targetWidthPx: 380,
+      targetHeightPx: 152
+    });
+    assert.deepEqual(unsupported, { ok: false, reason: 'UNSUPPORTED_DATA_URL' });
+    assert.deepEqual(corrupt, { ok: false, reason: 'IMAGE_PROCESSING_FAILED' });
+  });
+});
+
 describe('comprobante canonico de reversion', () => {
   it('reutiliza logo, restaurante y campos del encabezado de la factura', () => {
     const model = buildVentaReversionTicketModel(baseData());
@@ -87,7 +188,7 @@ describe('comprobante canonico de reversion', () => {
     assert.equal(model.branding.telefono, '2500-0000');
     assert.equal(model.branding.correo, 'facturacion@example.com');
     assert.equal(model.branding.textoEncabezado, 'Gracias por su compra');
-    assert.ok(Buffer.isBuffer(model.branding.logo));
+    assert.match(model.branding.logoDataUrl, /^data:image\/png;base64,/);
   });
 
   it('respeta las banderas visuales del encabezado de facturacion', () => {
@@ -103,7 +204,7 @@ describe('comprobante canonico de reversion', () => {
         }
       }
     }));
-    assert.equal(model.branding.logo, null);
+    assert.equal(model.branding.logoDataUrl, null);
     assert.equal(model.branding.rtn, null);
     assert.equal(model.branding.direccion, null);
     assert.equal(model.branding.telefono, null);
@@ -158,6 +259,64 @@ describe('comprobante canonico de reversion', () => {
       const physicalRightMarginMm = width - expectedMetrics[width].leftMm - expectedMetrics[width].usableWidthMm;
       assert.equal(physicalRightMarginMm, expectedMetrics[width].rightMm + 1.5);
     }
+  });
+
+  it('centra el logo y reserva 2.5 mm antes del primer texto en ambos anchos', async () => {
+    const logo = await createPng({ width: 1600, height: 400, background: '#cc3300' });
+    for (const width of [58, 80]) {
+      const usableWidthMm = width === 58 ? 47.5 : 61.5;
+      const contentLeftMm = width === 58 ? 4 : 7;
+      const maxHeightMm = width === 58 ? 19 : 25;
+      const layout = resolveVentaReversionLogoLayout({
+        contentLeftPt: (contentLeftMm * 72) / 25.4,
+        usableWidthPt: (usableWidthMm * 72) / 25.4,
+        imageWidthPx: mmToPixels203Dpi(usableWidthMm),
+        imageHeightPx: mmToPixels203Dpi(maxHeightMm),
+        maxHeightPt: (maxHeightMm * 72) / 25.4
+      });
+      const centerPt = ((contentLeftMm + (usableWidthMm / 2)) * 72) / 25.4;
+      assert.ok(Math.abs((layout.x + (layout.renderedWidthPt / 2)) - centerPt) < 0.01);
+      assert.ok(layout.renderedWidthPt <= (usableWidthMm * 72) / 25.4);
+      assert.ok(layout.renderedHeightPt <= (maxHeightMm * 72) / 25.4);
+      assert.ok(Math.abs(layout.gapPt - ((2.5 * 72) / 25.4)) < 0.001);
+
+      const data = baseData({ ancho_ticket_mm: width });
+      data.facturacion.emisor.logo_data_url = asDataUrl(logo);
+      const pdfText = (await buildVentaReversionTicketPdfBuffer(data)).toString('latin1');
+      const pageHeightPt = Number(pdfText.match(/\/MediaBox\s*\[\s*0\s+0\s+[\d.]+\s+([\d.]+)\s*\]/)?.[1]);
+      const imageTransforms = [...pdfText.matchAll(/([\d.]+)\s+0\s+0\s+-([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+cm/g)]
+        .map((match) => match.slice(1).map(Number));
+      const imageTransform = imageTransforms.find(([renderedWidth, renderedHeight]) => (
+        renderedWidth > 10 && renderedHeight > 10
+      ));
+      const firstTextMatrix = pdfText.match(/1\s+0\s+0\s+1\s+[\d.]+\s+([\d.]+)\s+Tm/);
+      assert.ok(imageTransform, `PDF ${width} mm debe contener el logo optimizado`);
+      assert.ok(firstTextMatrix, `PDF ${width} mm debe contener texto posterior al logo`);
+      const [renderedWidthPt, renderedHeightPt, logoXPt, logoBottomPt] = imageTransform;
+      const firstTextBaselineFromTopPt = pageHeightPt - Number(firstTextMatrix[1]);
+      assert.ok(Math.abs((logoXPt + (renderedWidthPt / 2)) - centerPt) < 0.01);
+      assert.ok(renderedWidthPt <= (usableWidthMm * 72) / 25.4 + 0.01);
+      assert.ok(renderedHeightPt <= (maxHeightMm * 72) / 25.4 + 0.01);
+      assert.ok(firstTextBaselineFromTopPt >= logoBottomPt + layout.gapPt);
+    }
+  });
+
+  it('continua generando el PDF cuando el logo es invalido', async () => {
+    const data = baseData();
+    data.facturacion.emisor.logo_data_url = 'data:image/png;base64,bm8gZXMgdW5hIGltYWdlbg==';
+    const pdf = await buildVentaReversionTicketPdfBuffer(data);
+    assert.equal(pdf.subarray(0, 5).toString('ascii'), '%PDF-');
+    assert.match(pdf.toString('latin1'), /4a4f4e4e59275320454c204341524d454e/i);
+  });
+
+  it('reduce el PDF frente al mismo fixture con el logo grande sin optimizar', async () => {
+    const originalLogo = await createNoisyPng(1600, 600);
+    const data = baseData();
+    data.facturacion.emisor.logo_data_url = asDataUrl(originalLogo);
+    const optimizedPdf = await buildVentaReversionTicketPdfBuffer(data);
+    const unoptimizedPdf = await buildUnoptimizedLogoPdf(originalLogo, 174.330708, 65.373);
+    assert.equal(optimizedPdf.subarray(0, 5).toString('ascii'), '%PDF-');
+    assert.ok(optimizedPdf.length < unoptimizedPdf.length, `${optimizedPdf.length} debe ser menor que ${unoptimizedPdf.length}`);
   });
 
   it('rechaza anchos distintos de 58 mm y 80 mm', () => {

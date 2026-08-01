@@ -1,8 +1,14 @@
 import PDFDocument from 'pdfkit';
 import { formatHondurasDate, formatHondurasTime } from '../utils/hondurasDateTime.js';
 import { normalizarDatosTicketDesdeSnapshot } from './facturacionSnapshotService.js';
+import {
+  mmToPixels203Dpi,
+  optimizePrintLogoDataUrl
+} from './printLogoOptimizationService.js';
 
 const MM_TO_PT = 72 / 25.4;
+const POINTS_PER_203_DPI_PIXEL = 72 / 203;
+const LOGO_GAP_PT = 2.5 * MM_TO_PT;
 const toWidth = (value) => {
   const widthMm = value === null || value === undefined || value === '' ? 80 : Number(value);
   if (![58, 80].includes(widthMm)) {
@@ -41,16 +47,6 @@ const money = (value) => `L ${Number(value || 0).toFixed(2)}`;
 const quantity = (value) => {
   const parsed = Number(value || 0);
   return Number.isInteger(parsed) ? String(parsed) : parsed.toFixed(4).replace(/0+$/, '').replace(/\.$/, '');
-};
-
-const decodePdfLogo = (value) => {
-  const match = String(value || '').match(/^data:image\/(png|jpe?g);base64,([A-Za-z0-9+/=]+)$/i);
-  if (!match) return null;
-  try {
-    return Buffer.from(match[2], 'base64');
-  } catch {
-    return null;
-  }
 };
 
 export const loadVentaReversionTicketData = async ({ db, idReversion }) => {
@@ -211,7 +207,7 @@ export const buildVentaReversionTicketModel = (data) => {
   return {
     widthMm: toWidth(data?.ancho_ticket_mm),
     branding: {
-      logo: ticket.mostrar_logo_ticket === true ? decodePdfLogo(emisor.logo_data_url) : null,
+      logoDataUrl: ticket.mostrar_logo_ticket === true ? emisor.logo_data_url || null : null,
       nombre: emisor.nombre_emisor || "JONNY'S",
       textoEncabezado: ticket.texto_encabezado_ticket || null,
       rtn: ticket.mostrar_rtn !== false ? emisor.rtn_emisor || null : null,
@@ -239,11 +235,55 @@ export const buildVentaReversionTicketModel = (data) => {
   };
 };
 
+export const resolveVentaReversionLogoLayout = ({
+  contentLeftPt,
+  usableWidthPt,
+  imageWidthPx,
+  imageHeightPx,
+  maxHeightPt
+}) => {
+  if (![contentLeftPt, usableWidthPt, imageWidthPx, imageHeightPx, maxHeightPt].every(Number.isFinite)) {
+    return null;
+  }
+  if (usableWidthPt <= 0 || imageWidthPx <= 0 || imageHeightPx <= 0 || maxHeightPt <= 0) return null;
+
+  const scale = Math.min(
+    POINTS_PER_203_DPI_PIXEL,
+    usableWidthPt / imageWidthPx,
+    maxHeightPt / imageHeightPx
+  );
+  const renderedWidthPt = imageWidthPx * scale;
+  const renderedHeightPt = imageHeightPx * scale;
+
+  return {
+    x: contentLeftPt + ((usableWidthPt - renderedWidthPt) / 2),
+    renderedWidthPt,
+    renderedHeightPt,
+    gapPt: LOGO_GAP_PT
+  };
+};
+
 export const buildVentaReversionTicketPdfBuffer = async (data) => {
   const model = buildVentaReversionTicketModel(data);
   const metrics = resolveFacturaLikeMetrics(model.widthMm);
   const contentLeftPt = metrics.marginsPt.left;
   const contentRightPt = contentLeftPt + metrics.usableWidthPt;
+  const maxLogoHeightMm = model.widthMm === 58 ? 19 : 25;
+  const optimizedLogo = model.branding.logoDataUrl
+    ? await optimizePrintLogoDataUrl(model.branding.logoDataUrl, {
+        targetWidthPx: mmToPixels203Dpi(metrics.usableWidthMm),
+        targetHeightPx: mmToPixels203Dpi(maxLogoHeightMm)
+      })
+    : { ok: false, reason: 'LOGO_NOT_CONFIGURED' };
+  const logoLayout = optimizedLogo.ok
+    ? resolveVentaReversionLogoLayout({
+        contentLeftPt,
+        usableWidthPt: metrics.usableWidthPt,
+        imageWidthPx: optimizedLogo.outputWidthPx,
+        imageHeightPx: optimizedLogo.outputHeightPx,
+        maxHeightPt: maxLogoHeightMm * MM_TO_PT
+      })
+    : null;
   const brandingLines = [
     model.branding.nombre,
     model.branding.textoEncabezado,
@@ -254,7 +294,11 @@ export const buildVentaReversionTicketPdfBuffer = async (data) => {
   ].filter(Boolean).length;
   const estimatedHeight = Math.max(
     420,
-    270 + brandingLines * 14 + (model.branding.logo ? 72 : 0) + model.fields.length * 18 + model.lines.length * 34
+    270
+      + brandingLines * 14
+      + (logoLayout ? logoLayout.renderedHeightPt + logoLayout.gapPt : 0)
+      + model.fields.length * 18
+      + model.lines.length * 34
   );
   const doc = new PDFDocument({
     size: [metrics.widthPt, estimatedHeight],
@@ -281,12 +325,14 @@ export const buildVentaReversionTicketPdfBuffer = async (data) => {
     .stroke()
     .undash();
 
-  if (model.branding.logo) {
-    doc.image(model.branding.logo, contentLeftPt, doc.y, {
-      fit: [metrics.usableWidthPt, model.widthMm === 58 ? 54 : 72],
-      align: 'center'
+  if (optimizedLogo.ok && logoLayout) {
+    const logoY = doc.y;
+    doc.image(optimizedLogo.buffer, logoLayout.x, logoY, {
+      width: logoLayout.renderedWidthPt,
+      height: logoLayout.renderedHeightPt
     });
-    doc.moveDown(0.3);
+    doc.y = logoY + logoLayout.renderedHeightPt + logoLayout.gapPt;
+    doc.x = contentLeftPt;
   }
   doc.font('Helvetica-Bold').fontSize(model.widthMm === 58 ? 9 : 10);
   writeContentText(model.branding.nombre, { align: 'center' });
