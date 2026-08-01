@@ -3,7 +3,37 @@ import { formatHondurasDate, formatHondurasTime } from '../utils/hondurasDateTim
 import { normalizarDatosTicketDesdeSnapshot } from './facturacionSnapshotService.js';
 
 const MM_TO_PT = 72 / 25.4;
-const toWidth = (value) => Number(value) === 58 ? 58 : 80;
+const toWidth = (value) => {
+  const widthMm = value === null || value === undefined || value === '' ? 80 : Number(value);
+  if (![58, 80].includes(widthMm)) {
+    throw Object.assign(new RangeError('El ancho del comprobante de reversion debe ser 58 mm u 80 mm.'), {
+      code: 'VENTA_REVERSION_TICKET_WIDTH_INVALID'
+    });
+  }
+  return widthMm;
+};
+const resolveFacturaLikeMetrics = (value) => {
+  const widthMm = toWidth(value);
+  const marginsMm = widthMm === 58
+    ? { top: 4, right: 5, bottom: 4, left: 4 }
+    : { top: 4, right: 10, bottom: 4, left: 7 };
+  const usableWidthMm = widthMm === 58 ? 47.5 : 61.5;
+  const toPt = (millimeters) => millimeters * MM_TO_PT;
+
+  return {
+    widthMm,
+    widthPt: toPt(widthMm),
+    marginsMm,
+    marginsPt: {
+      top: toPt(marginsMm.top),
+      right: toPt(marginsMm.right),
+      bottom: toPt(marginsMm.bottom),
+      left: toPt(marginsMm.left)
+    },
+    usableWidthMm,
+    usableWidthPt: toPt(usableWidthMm)
+  };
+};
 const toBoolean = (value, fallback = true) => value === null || value === undefined
   ? fallback
   : value === true;
@@ -211,7 +241,9 @@ export const buildVentaReversionTicketModel = (data) => {
 
 export const buildVentaReversionTicketPdfBuffer = async (data) => {
   const model = buildVentaReversionTicketModel(data);
-  const widthPt = model.widthMm * MM_TO_PT;
+  const metrics = resolveFacturaLikeMetrics(model.widthMm);
+  const contentLeftPt = metrics.marginsPt.left;
+  const contentRightPt = contentLeftPt + metrics.usableWidthPt;
   const brandingLines = [
     model.branding.nombre,
     model.branding.textoEncabezado,
@@ -225,8 +257,8 @@ export const buildVentaReversionTicketPdfBuffer = async (data) => {
     270 + brandingLines * 14 + (model.branding.logo ? 72 : 0) + model.fields.length * 18 + model.lines.length * 34
   );
   const doc = new PDFDocument({
-    size: [widthPt, estimatedHeight],
-    margins: { top: 12, right: 12, bottom: 12, left: 12 },
+    size: [metrics.widthPt, estimatedHeight],
+    margins: metrics.marginsPt,
     compress: false,
     info: { Title: model.title, Subject: model.disclaimer }
   });
@@ -236,44 +268,94 @@ export const buildVentaReversionTicketPdfBuffer = async (data) => {
     doc.on('end', () => resolve(Buffer.concat(chunks)));
     doc.on('error', reject);
   });
+  const writeContentText = (value, options = {}) => doc.text(
+    value,
+    contentLeftPt,
+    doc.y,
+    { width: metrics.usableWidthPt, ...options }
+  );
+  const drawDivider = () => doc
+    .dash(2, { space: 2 })
+    .moveTo(contentLeftPt, doc.y)
+    .lineTo(contentRightPt, doc.y)
+    .stroke()
+    .undash();
 
   if (model.branding.logo) {
-    doc.image(model.branding.logo, {
-      fit: [widthPt - 24, model.widthMm === 58 ? 54 : 72],
+    doc.image(model.branding.logo, contentLeftPt, doc.y, {
+      fit: [metrics.usableWidthPt, model.widthMm === 58 ? 54 : 72],
       align: 'center'
     });
     doc.moveDown(0.3);
   }
-  doc.font('Helvetica-Bold').fontSize(model.widthMm === 58 ? 9 : 10).text(model.branding.nombre, { align: 'center' });
-  if (model.branding.textoEncabezado) doc.font('Helvetica').fontSize(8).text(model.branding.textoEncabezado, { align: 'center' });
-  if (model.branding.rtn) doc.font('Helvetica').fontSize(8).text(`RTN: ${model.branding.rtn}`, { align: 'center' });
-  if (model.branding.direccion) doc.font('Helvetica').fontSize(8).text(model.branding.direccion, { align: 'center' });
-  if (model.branding.telefono) doc.font('Helvetica').fontSize(8).text(`Tel: ${model.branding.telefono}`, { align: 'center' });
-  if (model.branding.correo) doc.font('Helvetica').fontSize(8).text(model.branding.correo, { align: 'center' });
-  doc.moveDown(0.35).dash(2, { space: 2 }).moveTo(12, doc.y).lineTo(widthPt - 12, doc.y).stroke().undash();
-  doc.moveDown(0.4).font('Helvetica-Bold').fontSize(model.widthMm === 58 ? 11 : 13).text(model.title, { align: 'center' });
-  doc.fontSize(10).text(model.disclaimer, { align: 'center' });
-  doc.moveDown(0.5).dash(2, { space: 2 }).moveTo(12, doc.y).lineTo(widthPt - 12, doc.y).stroke().undash();
+  doc.font('Helvetica-Bold').fontSize(model.widthMm === 58 ? 9 : 10);
+  writeContentText(model.branding.nombre, { align: 'center' });
+  if (model.branding.textoEncabezado) {
+    doc.font('Helvetica').fontSize(8);
+    writeContentText(model.branding.textoEncabezado, { align: 'center' });
+  }
+  if (model.branding.rtn) {
+    doc.font('Helvetica').fontSize(8);
+    writeContentText(`RTN: ${model.branding.rtn}`, { align: 'center' });
+  }
+  if (model.branding.direccion) {
+    doc.font('Helvetica').fontSize(8);
+    writeContentText(model.branding.direccion, { align: 'center' });
+  }
+  if (model.branding.telefono) {
+    doc.font('Helvetica').fontSize(8);
+    writeContentText(`Tel: ${model.branding.telefono}`, { align: 'center' });
+  }
+  if (model.branding.correo) {
+    doc.font('Helvetica').fontSize(8);
+    writeContentText(model.branding.correo, { align: 'center' });
+  }
+  doc.moveDown(0.35);
+  drawDivider();
+  doc.moveDown(0.4).font('Helvetica-Bold').fontSize(model.widthMm === 58 ? 11 : 13);
+  writeContentText(model.title, { align: 'center' });
+  doc.fontSize(10);
+  writeContentText(model.disclaimer, { align: 'center' });
+  doc.moveDown(0.5);
+  drawDivider();
   doc.moveDown(0.4);
   for (const field of model.fields) {
-    doc.font('Helvetica-Bold').fontSize(8).text(`${field.label}: `, { continued: true });
+    doc.font('Helvetica-Bold').fontSize(8).text(
+      `${field.label}: `,
+      contentLeftPt,
+      doc.y,
+      { continued: true, width: metrics.usableWidthPt }
+    );
     doc.font('Helvetica').text(String(field.value || '-'));
   }
-  if (model.observation) doc.font('Helvetica').fontSize(8).text(`Observacion: ${model.observation}`);
+  if (model.observation) {
+    doc.font('Helvetica').fontSize(8);
+    writeContentText(`Observacion: ${model.observation}`);
+  }
   if (model.showDetail) {
-    doc.moveDown(0.4).font('Helvetica-Bold').fontSize(9).text('Detalle de esta reversion');
+    doc.moveDown(0.4).font('Helvetica-Bold').fontSize(9);
+    writeContentText('Detalle de esta reversion');
     for (const line of model.lines) {
-      doc.font('Helvetica-Bold').fontSize(8).text(line.name);
-      doc.font('Helvetica').text(`${line.quantity} x ${line.unitPrice}`, { continued: true });
+      doc.font('Helvetica-Bold').fontSize(8);
+      writeContentText(line.name);
+      doc.font('Helvetica').text(
+        `${line.quantity} x ${line.unitPrice}`,
+        contentLeftPt,
+        doc.y,
+        { continued: true, width: metrics.usableWidthPt }
+      );
       doc.text(line.total, { align: 'right' });
       if (line.inventoryReason === 'PREPARACION_INICIADA') {
-        doc.font('Helvetica').fontSize(7).text('Inventario: no devuelto; preparación iniciada.');
+        doc.font('Helvetica').fontSize(7);
+        writeContentText('Inventario: no devuelto; preparación iniciada.');
       }
     }
   }
   if (model.total) {
-    doc.moveDown(0.4).dash(2, { space: 2 }).moveTo(12, doc.y).lineTo(widthPt - 12, doc.y).stroke().undash();
-    doc.moveDown(0.3).font('Helvetica-Bold').fontSize(10).text(`TOTAL REVERSADO: ${model.total}`, { align: 'right' });
+    doc.moveDown(0.4);
+    drawDivider();
+    doc.moveDown(0.3).font('Helvetica-Bold').fontSize(10);
+    writeContentText(`TOTAL REVERSADO: ${model.total}`, { align: 'right' });
   }
   doc.end();
   return complete;

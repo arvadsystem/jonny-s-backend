@@ -23,7 +23,7 @@ const qzConfigEnv = (host) => ({
   QZ_CA_CERT_PATH: 'C:/ProgramData/qz/ssl/root-ca.crt'
 });
 
-test('reversion PDF fuerza el ancho fisico declarado en milimetros', () => {
+test('reversion PDF usa exactamente el mismo contrato QZ que factura PDF', () => {
   const pdf = Buffer.from('%PDF-1.4\nreversion 80mm\n%%EOF\n', 'utf8');
   const payload = {
     schema_version: 2,
@@ -44,14 +44,16 @@ test('reversion PDF fuerza el ancho fisico declarado en milimetros', () => {
     format: 'pdf',
     flavor: 'base64',
     data: pdf.toString('base64'),
-    options: { pageWidth: 80, altFontRendering: true, ignoreTransparency: true }
+    options: { altFontRendering: true, ignoreTransparency: true }
   };
 
   assert.deepEqual(validateCanonicalPrintJobData(payload, item), item);
   for (const options of [
-    { altFontRendering: true, ignoreTransparency: true },
+    { pageWidth: 80, altFontRendering: true, ignoreTransparency: true },
     { pageWidth: 58, altFontRendering: true, ignoreTransparency: true },
-    { pageWidth: '80', altFontRendering: true, ignoreTransparency: true }
+    { pageWidth: '80', altFontRendering: true, ignoreTransparency: true },
+    { altFontRendering: true },
+    { ignoreTransparency: true }
   ]) {
     assert.throws(
       () => validateCanonicalPrintJobData(payload, { ...item, options }),

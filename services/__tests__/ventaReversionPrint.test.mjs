@@ -136,15 +136,35 @@ describe('comprobante canonico de reversion', () => {
   });
 
   it('genera PDF valido en 58 mm y 80 mm', async () => {
+    const expectedMetrics = {
+      58: { leftMm: 4, rightMm: 5, usableWidthMm: 47.5 },
+      80: { leftMm: 7, rightMm: 10, usableWidthMm: 61.5 }
+    };
     for (const width of [58, 80]) {
       const pdf = await buildVentaReversionTicketPdfBuffer(baseData({ ancho_ticket_mm: width }));
       assert.equal(pdf.subarray(0, 5).toString('ascii'), '%PDF-');
       assert.ok(pdf.length > 500);
       assert.equal(buildVentaReversionTicketModel(baseData({ ancho_ticket_mm: width })).widthMm, width);
-      const mediaBox = pdf.toString('latin1').match(/\/MediaBox\s*\[\s*0\s+0\s+([\d.]+)\s+([\d.]+)\s*\]/);
+      const pdfText = pdf.toString('latin1');
+      const mediaBox = pdfText.match(/\/MediaBox\s*\[\s*0\s+0\s+([\d.]+)\s+([\d.]+)\s*\]/);
       assert.ok(mediaBox, `PDF ${width} mm debe declarar MediaBox`);
       assert.ok(Math.abs(Number(mediaBox[1]) - ((width * 72) / 25.4)) < 0.01);
+      const divider = pdfText.match(/([\d.]+)\s+[\d.]+\s+m\s+([\d.]+)\s+[\d.]+\s+l/);
+      assert.ok(divider, `PDF ${width} mm debe declarar separadores dentro del ancho util`);
+      const leftPt = (expectedMetrics[width].leftMm * 72) / 25.4;
+      const usableWidthPt = (expectedMetrics[width].usableWidthMm * 72) / 25.4;
+      assert.ok(Math.abs(Number(divider[1]) - leftPt) < 0.01);
+      assert.ok(Math.abs((Number(divider[2]) - Number(divider[1])) - usableWidthPt) < 0.01);
+      const physicalRightMarginMm = width - expectedMetrics[width].leftMm - expectedMetrics[width].usableWidthMm;
+      assert.equal(physicalRightMarginMm, expectedMetrics[width].rightMm + 1.5);
     }
+  });
+
+  it('rechaza anchos distintos de 58 mm y 80 mm', () => {
+    assert.throws(
+      () => buildVentaReversionTicketModel(baseData({ ancho_ticket_mm: 59 })),
+      (error) => error.code === 'VENTA_REVERSION_TICKET_WIDTH_INVALID'
+    );
   });
 
   it('respeta todos los campos ocultos por configuracion', () => {
@@ -179,10 +199,10 @@ describe('comprobante canonico de reversion', () => {
     assert.equal(canonical.payload.documento_canonico.kind, 'venta_reversion_ticket_pdf');
     assert.equal(canonical.payload.source.id_reversion, 41);
     assert.deepEqual(canonical.document.options, {
-      pageWidth: 80,
       altFontRendering: true,
       ignoreTransparency: true
     });
+    assert.equal(Object.hasOwn(canonical.document.options, 'pageWidth'), false);
     assert.equal(validateCanonicalPrintPayload(canonical.payload).ok, true);
     assert.deepEqual(
       validateCanonicalPrintJobData(canonical.payload, canonical.document),
