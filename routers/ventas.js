@@ -423,7 +423,8 @@ const reserveVentasIdempotencyKey = async ({
   idUsuario = null,
   idSucursal = null,
   idSesionCaja = null,
-  idPedido = null
+  idPedido = null,
+  idFactura = null
 }) => {
   if (!idempotencyKey) return { enabled: false };
 
@@ -438,9 +439,10 @@ const reserveVentasIdempotencyKey = async ({
           id_sucursal,
           id_sesion_caja,
           id_pedido,
+          id_factura,
           status
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, 'IN_PROGRESS')
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'IN_PROGRESS')
         ON CONFLICT (idempotency_key) DO NOTHING
         RETURNING idempotency_key
       `,
@@ -451,7 +453,8 @@ const reserveVentasIdempotencyKey = async ({
         parseOptionalPositiveInt(idUsuario) || null,
         parseOptionalPositiveInt(idSucursal) || null,
         parseOptionalPositiveInt(idSesionCaja) || null,
-        parseOptionalPositiveInt(idPedido) || null
+        parseOptionalPositiveInt(idPedido) || null,
+        parseOptionalPositiveInt(idFactura) || null
       ]
     );
 
@@ -470,7 +473,8 @@ const reserveVentasIdempotencyKey = async ({
           response_body,
           id_usuario,
           id_sucursal,
-          id_sesion_caja
+          id_sesion_caja,
+          id_factura
         FROM public.ventas_idempotency_keys
         WHERE idempotency_key = $1
         LIMIT 1
@@ -486,8 +490,8 @@ const reserveVentasIdempotencyKey = async ({
     if (existing.operation !== operation || existing.request_hash !== requestHash) {
       return { enabled: true, conflict: true, code: 'IDEMPOTENCY_KEY_REUSED' };
     }
-    const expectedScope = [idUsuario, idSucursal, idSesionCaja].map((value) => parseOptionalPositiveInt(value) || null);
-    const storedScope = [existing.id_usuario, existing.id_sucursal, existing.id_sesion_caja].map((value) => parseOptionalPositiveInt(value) || null);
+    const expectedScope = [idUsuario, idSucursal, idSesionCaja, idFactura].map((value) => parseOptionalPositiveInt(value) || null);
+    const storedScope = [existing.id_usuario, existing.id_sucursal, existing.id_sesion_caja, existing.id_factura].map((value) => parseOptionalPositiveInt(value) || null);
     if (expectedScope.some((value, index) => value !== null && value !== storedScope[index])) {
       return { enabled: true, conflict: true, code: 'IDEMPOTENCY_SCOPE_MISMATCH' };
     }
@@ -511,6 +515,7 @@ const reserveVentasIdempotencyKey = async ({
           id_usuario = COALESCE($3, id_usuario),
           id_sucursal = COALESCE($4, id_sucursal),
           id_sesion_caja = COALESCE($5, id_sesion_caja),
+          id_factura = COALESCE($7, id_factura),
           status = 'IN_PROGRESS',
           http_status = NULL,
           response_body = NULL,
@@ -525,7 +530,8 @@ const reserveVentasIdempotencyKey = async ({
         parseOptionalPositiveInt(idUsuario) || null,
         parseOptionalPositiveInt(idSucursal) || null,
         parseOptionalPositiveInt(idSesionCaja) || null,
-        parseOptionalPositiveInt(idPedido) || null
+        parseOptionalPositiveInt(idPedido) || null,
+        parseOptionalPositiveInt(idFactura) || null
       ]
     );
     return { enabled: true, reserved: true, idempotencyKey, requestHash };
@@ -7337,12 +7343,15 @@ router.post('/ventas/:id/reversiones', checkPermission(['VENTAS_REVERSION_CREAR'
       req,
       idUsuario,
       idempotency: {
-        reserve: (client) => reserveVentasIdempotencyKey({
+        reserve: (client, scope) => reserveVentasIdempotencyKey({
           client,
           idempotencyKey,
           operation: 'VENTAS_REVERSION_CREAR',
           requestHash: idempotencyRequestHash,
-          idUsuario
+          idUsuario,
+          idSucursal: scope?.idSucursal,
+          idSesionCaja: scope?.idSesionCaja,
+          idFactura: scope?.idFactura
         }),
         saveSuccess: (client, reservation, responseBody, result) => saveVentasIdempotencySuccess({
           client,
@@ -7351,7 +7360,8 @@ router.post('/ventas/:id/reversiones', checkPermission(['VENTAS_REVERSION_CREAR'
           responseBody,
           idFactura,
           idUsuario,
-          idSucursal: result?.id_sucursal
+          idSucursal: result?.id_sucursal,
+          idSesionCaja: result?.id_sesion_caja_original
         })
       }
     });

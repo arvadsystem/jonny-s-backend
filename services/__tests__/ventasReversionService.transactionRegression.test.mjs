@@ -48,17 +48,17 @@ describe('createVentaReversion — regresion estructural Fase 2', () => {
   });
 
   it('valida elegibilidad de pedido/Cocina y resuelve CANCELADO por codigo', () => {
-    assert.match(source, /assertPedidoEligibleForReversion/);
+    assert.match(source, /resolvePedidoReversionContext/);
     assert.match(source, /resolveCancelledEstadoPedidoIdOrThrow/);
   });
 
-  it('REGRESION: el INSERT de facturas_reversiones_detalle tiene exactamente 13 placeholders para 13 columnas (bug preexistente corregido en Fase 2: el baseline tenia 14 placeholders para 13 columnas)', () => {
+  it('REGRESION: el INSERT de facturas_reversiones_detalle conserva 16 placeholders para 16 columnas', () => {
     const match = source.match(/INSERT INTO public\.facturas_reversiones_detalle \(([\s\S]*?)\)\s*VALUES \(([\s\S]*?)\)/);
     assert.ok(match, 'no se encontro el INSERT de facturas_reversiones_detalle');
     const columnCount = match[1].split(',').filter((s) => s.trim()).length;
     const placeholderCount = (match[2].match(/\$\d+/g) || []).length;
-    assert.equal(columnCount, 13);
-    assert.equal(placeholderCount, 13, `se esperaban 13 placeholders, se encontraron ${placeholderCount}`);
+    assert.equal(columnCount, 16);
+    assert.equal(placeholderCount, 16, `se esperaban 16 placeholders, se encontraron ${placeholderCount}`);
   });
 
   it('id_caja_actual/id_sesion_caja_actual se persisten con el MISMO valor que original ($4/$5), documentando que Fase 2 elimina el concepto de sesion "actual" distinta', () => {
@@ -69,6 +69,34 @@ describe('createVentaReversion — regresion estructural Fase 2', () => {
     const movimientoBlock = source.match(/INSERT INTO public\.cajas_movimientos[\s\S]{0,900}/)?.[0] || '';
     assert.match(movimientoBlock, /sessionContext\.id_sesion_caja/);
     assert.match(movimientoBlock, /sessionContext\.id_caja/);
+  });
+
+  it('Caja solo registra la porcion efectiva y omite el INSERT para tarjeta/transferencia', () => {
+    assert.match(source, /if \(paymentAllocation\.monto_efectivo_reversado > 0\)/);
+    assert.match(source, /paymentAllocation\.monto_efectivo_reversado/);
+    assert.doesNotMatch(source, /idTipoMovimientoCaja,[\s\S]{0,80}\buserId,[\s\S]{0,80}\bmontoReversado,/);
+  });
+
+  it('reserva idempotencia despues de resolver la sesion original y antes de cualquier INSERT', () => {
+    const sessionIndex = source.indexOf('lockAndValidateOriginalCajaSession({', source.indexOf('export const createVentaReversion'));
+    const reserveIndex = source.indexOf('idempotency.reserve(client, {', sessionIndex);
+    const headerIndex = source.indexOf('INSERT INTO public.facturas_reversiones (', reserveIndex);
+    assert.ok(sessionIndex >= 0 && sessionIndex < reserveIndex && reserveIndex < headerIndex);
+    assert.match(source.slice(reserveIndex, headerIndex), /idFactura: facturaId[\s\S]*idSucursal[\s\S]*idSesionCaja/);
+  });
+
+  it('replay retorna antes de cabecera, movimiento, inventario e impresion', () => {
+    const replayIndex = source.indexOf('idempotencyReservation?.replay');
+    assert.ok(replayIndex < source.indexOf('INSERT INTO public.facturas_reversiones ('));
+    assert.ok(replayIndex < source.indexOf('enqueueAutomaticVentaReversionPrintJob({'));
+  });
+
+  it('un fallo intermedio conserva ROLLBACK y el exito idempotente ocurre antes de COMMIT', () => {
+    const rollbackIndex = source.indexOf("client.query('ROLLBACK')");
+    const saveIndex = source.indexOf('idempotency.saveSuccess');
+    const commitIndex = source.indexOf("client.query('COMMIT')", saveIndex);
+    assert.ok(rollbackIndex >= 0);
+    assert.ok(saveIndex >= 0 && saveIndex < commitIndex);
   });
 
   it('22) resuelve CANCELADO y PAGO_ANULADO solo cuando la factura queda totalmente reversada, y solo si tiene pedido', () => {
@@ -111,5 +139,12 @@ describe('routers/ventas.js — endpoints de reversion Fase 2', () => {
 
   it('24) expone POST /ventas/:id/reversion-preview', () => {
     assert.match(routerSource, /router\.post\('\/ventas\/:id\/reversion-preview'/);
+  });
+
+  it('la reserva y el SUCCESS vinculan usuario, sucursal, sesion original y factura', () => {
+    const routeStart = routerSource.indexOf('const creation = await createVentaReversion({');
+    const route = routerSource.slice(routeStart, routeStart + 2400);
+    assert.match(route, /idUsuario,[\s\S]*idSucursal: scope\?\.idSucursal,[\s\S]*idSesionCaja: scope\?\.idSesionCaja,[\s\S]*idFactura: scope\?\.idFactura/);
+    assert.match(route, /idFactura,[\s\S]*idUsuario,[\s\S]*idSucursal: result\?\.id_sucursal,[\s\S]*idSesionCaja: result\?\.id_sesion_caja_original/);
   });
 });

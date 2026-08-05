@@ -32,11 +32,22 @@ export const resolveOriginalSessionFromCobros = async ({ client, idFactura, fact
 
   const cobrosResult = await client.query(
     `
-      SELECT id_factura_cobro, id_sesion_caja
-      FROM public.facturas_cobros
-      WHERE id_factura = $1
-      ORDER BY id_factura_cobro
-      FOR UPDATE
+      SELECT
+        fc.id_factura_cobro,
+        fc.id_sesion_caja,
+        fc.id_metodo_pago,
+        fc.monto,
+        mp.codigo AS metodo_pago_codigo,
+        mp.nombre AS metodo_pago_nombre,
+        (mp.id_metodo_pago IS NOT NULL) AS metodo_pago_encontrado,
+        (mp.id_metodo_pago IS NOT NULL AND COALESCE(mp.estado, true)) AS metodo_pago_activo,
+        COALESCE(mp.afecta_efectivo, false) AS afecta_efectivo
+      FROM public.facturas_cobros fc
+      LEFT JOIN public.cat_metodos_pago mp
+        ON mp.id_metodo_pago = fc.id_metodo_pago
+      WHERE fc.id_factura = $1
+      ORDER BY fc.id_factura_cobro
+      FOR UPDATE OF fc
     `,
     [facturaId]
   );
@@ -82,7 +93,7 @@ export const resolveOriginalSessionFromCobros = async ({ client, idFactura, fact
     );
   }
 
-  return { id_sesion_caja: idSesionCajaOriginal };
+  return { id_sesion_caja: idSesionCajaOriginal, cobros: cobrosResult.rows };
 };
 
 /**

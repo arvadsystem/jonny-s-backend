@@ -12,6 +12,10 @@ import {
   lockAndValidateOriginalCajaSession
 } from '../routers/ventas/services/ventasReversionSessionService.js';
 import {
+  buildReversionPaymentAllocation,
+  resolvePreviouslyReversedAmountForUpdate
+} from '../routers/ventas/services/ventasReversionPaymentAllocationService.js';
+import {
   resolvePedidoReversionContext,
   resolveCancelledEstadoPedidoIdOrThrow
 } from '../routers/ventas/services/ventasReversionEligibilityService.js';
@@ -357,15 +361,6 @@ export const createVentaReversion = async ({ idFactura, body, req, idUsuario, id
   try {
     await client.query('BEGIN');
 
-    // 1) reservar idempotencia
-    if (typeof idempotency?.reserve === 'function') {
-      idempotencyReservation = await idempotency.reserve(client);
-      if (idempotencyReservation?.replay || idempotencyReservation?.conflict) {
-        await client.query('COMMIT');
-        return { idempotency: idempotencyReservation };
-      }
-    }
-
     const scope = await resolveSucursalScope(client, userId);
 
     // 2) bloquear factura
@@ -413,6 +408,19 @@ export const createVentaReversion = async ({ idFactura, body, req, idUsuario, id
       idSucursal
     });
 
+    // Se reserva con el alcance financiero resuelto por backend.
+    if (typeof idempotency?.reserve === 'function') {
+      idempotencyReservation = await idempotency.reserve(client, {
+        idFactura: facturaId,
+        idSucursal,
+        idSesionCaja: sessionContext.id_sesion_caja
+      });
+      if (idempotencyReservation?.replay || idempotencyReservation?.conflict) {
+        await client.query('COMMIT');
+        return { idempotency: idempotencyReservation };
+      }
+    }
+
     // 7) bloquear pedido + validar elegibilidad de Cocina (venta directa
     // sin pedido: no hay nada que validar, se permite)
     const pedidoContext = await resolvePedidoReversionContext({
@@ -436,17 +444,22 @@ export const createVentaReversion = async ({ idFactura, body, req, idUsuario, id
       forUpdate: true
     });
 
-    const idTipoMovimientoCaja = await resolveReversionCajaMovementType(client);
+    const montoReversado = roundMoney(reversionLines.reduce((acc, line) => acc + Number(line.total_revertido || 0), 0));
+    const totalFactura = await computeFacturaTotal(client, facturaId);
+    const previouslyReversed = await resolvePreviouslyReversedAmountForUpdate({ client, idFactura: facturaId });
+    const paymentAllocation = buildReversionPaymentAllocation({
+      paymentRows: resolvedSession.cobros,
+      facturaTotal: totalFactura,
+      previouslyReversed,
+      currentReversal: montoReversado
+    });
+    const accumulated = computeAccumulatedResult({ facturaLines, reversedQtyMapBefore, reversionLines });
 
     const correlativo = await generarCodigoDocumento({
       client,
       idSucursal,
       tipoDocumento: 'REVERSION'
     });
-
-    const montoReversado = roundMoney(reversionLines.reduce((acc, line) => acc + Number(line.total_revertido || 0), 0));
-    const totalFactura = await computeFacturaTotal(client, facturaId);
-    const accumulated = computeAccumulatedResult({ facturaLines, reversedQtyMapBefore, reversionLines });
 
     // 9) insertar reversion (cabecera).
     // id_caja_actual/id_sesion_caja_actual: el esquema de
@@ -552,7 +565,9 @@ export const createVentaReversion = async ({ idFactura, body, req, idUsuario, id
 
     // 11) registrar movimiento de caja en la sesion ORIGINAL (nunca en una
     // sesion distinta)
-    await client.query(
+    if (paymentAllocation.monto_efectivo_reversado > 0) {
+      const idTipoMovimientoCaja = await resolveReversionCajaMovementType(client);
+      await client.query(
       `
         INSERT INTO public.cajas_movimientos (
           id_sesion_caja,
@@ -574,11 +589,12 @@ export const createVentaReversion = async ({ idFactura, body, req, idUsuario, id
         idSucursal,
         idTipoMovimientoCaja,
         userId,
-        montoReversado,
+        paymentAllocation.monto_efectivo_reversado,
         correlativo.codigo,
         `Reversión ${correlativo.codigo} de venta ${factura.codigo_venta || `VTA-${String(facturaId).padStart(5, '0')}`}`
       ]
-    );
+      );
+    }
 
     // Fidelizacion (Fase 4): reversion de puntos por el resultado ACUMULADO
     // real (accumulated.factura_totalmente_reversada), nunca por
@@ -671,6 +687,8 @@ export const createVentaReversion = async ({ idFactura, body, req, idUsuario, id
       cantidad_restante_final: accumulated.cantidad_restante_final,
       factura_totalmente_reversada: accumulated.factura_totalmente_reversada,
       estado_final: estadoFinal,
+      distribucion_metodos_pago: paymentAllocation.asignaciones,
+      monto_efectivo_reversado: paymentAllocation.monto_efectivo_reversado,
       fidelizacion: loyalty,
       auditoria: {
         ip_origen: ip,

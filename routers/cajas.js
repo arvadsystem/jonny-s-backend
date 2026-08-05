@@ -377,6 +377,7 @@ const fetchSessionMethodFinancialSummary = async (client, idSesionCaja) => {
     `
       SELECT
         fr.id_reversion,
+        fr.id_factura_original,
         COALESCE(fr.monto_reversado, 0)::numeric(12,2) AS monto_reversado,
         fc.id_factura_cobro,
         COALESCE(fc.monto, 0)::numeric(12,2) AS monto_cobro,
@@ -396,29 +397,6 @@ const fetchSessionMethodFinancialSummary = async (client, idSesionCaja) => {
     [idSesionCaja]
   );
 
-  const reversionTotalsResult = await client.query(
-    `
-      SELECT
-        fr.id_reversion,
-        COALESCE(SUM(fc.monto), 0)::numeric(12,2) AS total_cobrado
-      FROM public.facturas_reversiones fr
-      INNER JOIN public.facturas_cobros fc
-        ON fc.id_factura = fr.id_factura_original
-      WHERE (
-          fr.id_sesion_caja_original = $1
-          OR (fr.id_sesion_caja_original IS NULL AND fc.id_sesion_caja = $1)
-        )
-        AND UPPER(TRIM(COALESCE(fr.estado, ''))) = 'APLICADA'
-      GROUP BY fr.id_reversion
-    `,
-    [idSesionCaja]
-  );
-
-  const reversionTotalsById = new Map();
-  for (const row of reversionTotalsResult.rows || []) {
-    reversionTotalsById.set(String(row.id_reversion || ''), roundMoney(row.total_cobrado));
-  }
-
   const reversionRowsById = new Map();
   for (const row of reversionsResult.rows || []) {
     const idReversion = parsePositiveBigIntId(row.id_reversion);
@@ -429,22 +407,27 @@ const fetchSessionMethodFinancialSummary = async (client, idSesionCaja) => {
   }
 
   const allocatedReversionsByCode = new Map();
-  for (const [idReversion, rows] of reversionRowsById.entries()) {
-    const totalCobrado = Number(reversionTotalsById.get(idReversion) || 0);
+  const reversedBeforeByFactura = new Map();
+  for (const rows of reversionRowsById.values()) {
     const montoReversado = roundMoney(rows[0]?.monto_reversado || 0);
-    if (montoReversado <= 0 || totalCobrado <= 0) continue;
+    const idFactura = String(rows[0]?.id_factura_original || '');
+    const reversedBefore = roundMoney(reversedBeforeByFactura.get(idFactura) || 0);
+    if (montoReversado <= 0) continue;
 
-    let allocated = 0;
-    rows.forEach((row, index) => {
+    let paymentBefore = 0;
+    rows.forEach((row) => {
       const code = normalizeMethodCode(row.metodo_pago_codigo);
-      if (!code) return;
-      const isLast = index === rows.length - 1;
-      const monto = isLast
-        ? roundMoney(montoReversado - allocated)
-        : roundMoney((Number(row.monto_cobro || 0) / totalCobrado) * montoReversado);
-      allocated = roundMoney(allocated + monto);
+      const paymentAmount = roundMoney(row.monto_cobro || 0);
+      const monto = roundMoney(Math.max(
+        0,
+        Math.min(reversedBefore + montoReversado, paymentBefore + paymentAmount)
+          - Math.max(reversedBefore, paymentBefore)
+      ));
+      paymentBefore = roundMoney(paymentBefore + paymentAmount);
+      if (!code || monto <= 0) return;
       allocatedReversionsByCode.set(code, roundMoney(Number(allocatedReversionsByCode.get(code) || 0) + monto));
     });
+    reversedBeforeByFactura.set(idFactura, roundMoney(reversedBefore + montoReversado));
   }
 
   const movementsResult = await client.query(
