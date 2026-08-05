@@ -16,7 +16,6 @@ const MAX_LIMIT = 100;
 const DEFAULT_LIMIT = 10;
 
 const PLANILLA_FUNCTION_NAMES = Object.freeze([
-  'fn_generar_planilla_mensual_por_sucursal',
   'fn_recalcular_detalle_planilla',
   'fn_recalcular_planilla_por_sucursal',
   'fn_listar_planillas_por_sucursal',
@@ -60,7 +59,6 @@ const PLANILLAS_SUMMARY_COSTS_PERMISSIONS = ['PLANILLAS_RESUMEN_VER_COSTOS'];
 
 const PLANILLA_ENDPOINT_CONTRACT = Object.freeze({
   list: 'fn_listar_planillas_por_sucursal',
-  generar: 'fn_generar_planilla_mensual_por_sucursal',
   recalcularPlanilla: 'fn_recalcular_planilla_por_sucursal',
   detalle: 'fn_listar_detalle_planilla',
   resumen: 'fn_listar_resumen_planilla_por_sucursal',
@@ -487,7 +485,7 @@ const normalizeEstadoAlias = (value) => {
   const aliases = {
     ABIERTA: 'BORRADOR',
     BORRADOR: 'BORRADOR',
-    CERRADA: 'CALCULADA',
+    CERRADA: 'CERRADA',
     CALCULADA: 'CALCULADA',
     PAGADA: 'PAGADA',
     ANULADA: 'ANULADA'
@@ -620,7 +618,7 @@ const resolvePeriodoContextInput = ({
     ? normalizeTipoPeriodoStrict(rawTipoPeriodo)
     : defaultTipoPeriodo;
   if (hasTipoPeriodo && !tipoPeriodo) {
-    return { error: 'tipo_periodo invalido. Use mensual o quincenal.' };
+    return { error: 'tipo_periodo inválido. Use mensual o quincenal.' };
   }
 
   const hasQuincena =
@@ -1059,7 +1057,7 @@ const mapDbError = (err) => {
     return {
       status: 501,
       code: 'DB_FUNCTION_ERROR',
-      message: 'La funcion SQL requerida no esta disponible en esta base de datos.'
+      message: 'La función SQL requerida no está disponible en esta base de datos.'
     };
   }
 
@@ -1067,7 +1065,7 @@ const mapDbError = (err) => {
     return {
       status: 500,
       code: 'DB_FUNCTION_ERROR',
-      message: 'La funcion SQL de planillas no esta alineada. Revisa el script de actualizacion del modulo.'
+      message: 'La función SQL de planillas no está alineada. Revisa el script de actualización del módulo.'
     };
   }
 
@@ -1104,12 +1102,12 @@ const getPlanillaFunctionCatalog = async () => {
 
 const ensureFunctionInstalled = async (fnName) => {
   if (!isFunctionAllowed(fnName)) {
-    throw new Error(`FunciÃƒÆ’Ã‚Â³n SQL no permitida: ${fnName}`);
+    throw new Error(`Función SQL no permitida: ${fnName}`);
   }
 
   const catalog = await getPlanillaFunctionCatalog();
   if (!catalog.has(fnName)) {
-    const error = new Error(`La funciÃƒÆ’Ã‚Â³n ${fnName} no estÃƒÆ’Ã‚Â¡ instalada en la base de datos actual.`);
+    const error = new Error(`La función ${fnName} no está instalada en la base de datos actual.`);
     error.code = 'PLANILLA_FN_MISSING';
     throw error;
   }
@@ -1431,6 +1429,93 @@ const resolveMovimientoScope = async (idMovimiento) => {
   };
 };
 
+const getMovimientoAnulacionState = async (db, idMovimiento) => {
+  const result = await db.query(
+    `
+      SELECT
+        mp.id_movimiento_planilla,
+        mp.id_detalle_planilla,
+        COALESCE(mp.estado, TRUE) AS estado,
+        dp.total_bonos,
+        dp.total_deducciones,
+        dp.neto_pagar
+      FROM public.movimiento_planilla mp
+      INNER JOIN public.detalle_planilla dp
+        ON dp.id_detalle_planilla = mp.id_detalle_planilla
+      WHERE mp.id_movimiento_planilla = $1
+      LIMIT 1
+    `,
+    [idMovimiento]
+  );
+
+  return result.rows?.[0] || null;
+};
+
+const ensureMovimientoAnuladoState = async ({ idMovimiento, idDetalle }) => {
+  const currentState = await getMovimientoAnulacionState(pool, idMovimiento);
+  if (!currentState) {
+    throw createRequestError('El movimiento indicado no existe.', 404, 'NOT_FOUND');
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    if (currentState.estado !== false) {
+      const updateResult = await client.query(
+        `
+          UPDATE public.movimiento_planilla
+          SET estado = FALSE
+          WHERE id_movimiento_planilla = $1
+            AND id_detalle_planilla = $2
+            AND COALESCE(estado, TRUE) = TRUE
+          RETURNING id_movimiento_planilla
+        `,
+        [idMovimiento, idDetalle]
+      );
+
+      if (!updateResult.rowCount) {
+        const verifiedState = await getMovimientoAnulacionState(client, idMovimiento);
+        if (verifiedState?.estado !== false) {
+          throw createRequestError(
+            'No se pudo confirmar la anulacion del movimiento.',
+            409,
+            'MOVIMIENTO_ANULACION_NO_CONFIRMADA'
+          );
+        }
+      }
+    } else {
+      const verifiedState = await getMovimientoAnulacionState(client, idMovimiento);
+      if (verifiedState?.estado !== false) {
+        throw createRequestError(
+          'No se pudo confirmar la anulacion del movimiento.',
+          409,
+          'MOVIMIENTO_ANULACION_NO_CONFIRMADA'
+        );
+      }
+    }
+
+    await client.query('SELECT public.fn_recalcular_detalle_planilla($1)', [idDetalle]);
+    const refreshedState = await getMovimientoAnulacionState(client, idMovimiento);
+
+    if (refreshedState?.estado !== false) {
+      throw createRequestError(
+        'No se pudo confirmar la anulacion del movimiento.',
+        409,
+        'MOVIMIENTO_ANULACION_NO_CONFIRMADA'
+      );
+    }
+
+    await client.query('COMMIT');
+    return refreshedState;
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw error;
+  } finally {
+    client.release();
+  }
+};
+
 const listPlanillaEligibleEmployeesBySucursal = async ({ db = pool, idSucursal }) => {
   const safeSucursalId = parsePositiveInt(idSucursal);
   if (!safeSucursalId) return { validRows: [], invalidRows: [] };
@@ -1695,7 +1780,7 @@ const validatePlanillaSucursalScope = async (idPlanilla, rawIdSucursal, options 
     return {
       ok: false,
       status: 400,
-      body: buildErrorBody({ code: 'VALIDATION_ERROR', message: 'id_sucursal invalido.' })
+      body: buildErrorBody({ code: 'VALIDATION_ERROR', message: 'id_sucursal inválido.' })
     };
   }
 
@@ -2326,6 +2411,11 @@ const buildMovimientosDataset = async ({
         mp.monto,
         mp.observacion,
         COALESCE(mp.estado, TRUE) AS estado,
+        NOT COALESCE(mp.estado, TRUE) AS anulado,
+        CASE
+          WHEN COALESCE(mp.estado, TRUE) = TRUE THEN 'VIGENTE'
+          ELSE 'ANULADO'
+        END AS estado_movimiento,
         ${movimientoTipoPeriodoExpr} AS tipo_periodo,
         ${movimientoQuincenaExpr} AS quincena,
         ${movimientoFechaExpr} AS fecha,
@@ -2342,21 +2432,27 @@ const buildMovimientosDataset = async ({
     [idPlanilla, detailIds]
   );
 
-  const movimientosRows = (movimientosResult.rows || []).map((row) => ({
-    ...row,
-    id_planilla: idPlanilla,
-    periodo_movimiento: planillaPeriodoKey || null,
-    fecha_periodo: planillaPeriodoInicio,
-    tipo: row.tipo || row.tipo_movimiento,
-    fecha: row.fecha || row.fecha_registro,
-    es_monetario: true,
-    anulable: parsePositiveInt(row.id_movimiento_planilla) !== null,
-    origen_movimiento: 'MOVIMIENTO',
-    quincena_resuelta: resolveQuincenaFromRowContext({
+  const movimientosRows = (movimientosResult.rows || []).map((row) => {
+    const isAnulado = row.estado === false || row.anulado === true;
+    return {
       ...row,
-      fecha: row.fecha || row.fecha_registro
-    })
-  }));
+      id_planilla: idPlanilla,
+      periodo_movimiento: planillaPeriodoKey || null,
+      fecha_periodo: planillaPeriodoInicio,
+      tipo: row.tipo || row.tipo_movimiento,
+      fecha: row.fecha || row.fecha_registro,
+      es_monetario: true,
+      anulado: isAnulado,
+      es_anulado: isAnulado,
+      estado_movimiento: isAnulado ? 'ANULADO' : 'VIGENTE',
+      anulable: !isAnulado && parsePositiveInt(row.id_movimiento_planilla) !== null,
+      origen_movimiento: 'MOVIMIENTO',
+      quincena_resuelta: resolveQuincenaFromRowContext({
+        ...row,
+        fecha: row.fecha || row.fecha_registro
+      })
+    };
+  });
 
   const employeeIds = [...new Set(detalleScope.map((row) => parsePositiveInt(row.id_empleado)).filter(Boolean))];
   if (!employeeIds.length) {
@@ -3496,12 +3592,12 @@ const planillaService = {
 
     const idSucursal = req.query.id_sucursal === undefined ? null : parsePositiveInt(req.query.id_sucursal);
     if (req.query.id_sucursal !== undefined && !idSucursal) {
-      return { status: 400, body: { error: true, message: 'id_sucursal invÃƒÆ’Ã‚Â¡lido' } };
+      return { status: 400, body: { error: true, message: 'id_sucursal inválido' } };
     }
 
     const periodo = req.query.periodo === undefined ? null : normalizePeriodo(req.query.periodo);
     if (req.query.periodo !== undefined && !periodo) {
-      return { status: 400, body: { error: true, message: 'periodo invÃƒÆ’Ã‚Â¡lido. Use YYYY-MM o YYYY-MM-DD' } };
+      return { status: 400, body: { error: true, message: 'período inválido. Use YYYY-MM o YYYY-MM-DD' } };
     }
 
     const search = sanitizeText(req.query.search ?? req.query.q, 120);
@@ -3514,7 +3610,7 @@ const planillaService = {
       String(req.query.tipo_periodo).trim() !== '';
     const tipoPeriodo = normalizeTipoPeriodo(req.query.tipo_periodo);
     if (req.query.tipo_periodo !== undefined && !tipoPeriodo) {
-      return { status: 400, body: { error: true, message: 'tipo_periodo invalido. Use mensual o quincenal.' } };
+      return { status: 400, body: { error: true, message: 'tipo_periodo inválido. Use mensual o quincenal.' } };
     }
     const quincena = normalizeQuincena(req.query.quincena);
     if (req.query.quincena !== undefined && quincena === null) {
@@ -3525,7 +3621,7 @@ const planillaService = {
     }
 
     if (req.query.estado !== undefined && !estado) {
-      return { status: 400, body: { error: true, message: 'estado invalido' } };
+      return { status: 400, body: { error: true, message: 'estado inválido' } };
     }
 
     const periodoKey = periodo ? toMonthKey(periodo) : null;
@@ -3677,7 +3773,7 @@ const planillaService = {
         status: 400,
         body: buildErrorBody({
           code: 'VALIDATION_ERROR',
-          message: 'tipo_periodo invalido. Use mensual o quincenal.'
+          message: 'tipo_periodo inválido. Use mensual o quincenal.'
         })
       };
     }
@@ -3708,7 +3804,7 @@ const planillaService = {
         status: 400,
         body: buildErrorBody({
           code: 'VALIDATION_ERROR',
-          message: 'No hay estados de planilla configurados en el catalogo.'
+          message: 'No hay estados de planilla configurados en el catálogo.'
         })
       };
     }
@@ -3748,7 +3844,7 @@ const planillaService = {
         status: 200,
         body: {
           error: false,
-          message: 'La planilla ya existia para ese periodo y sucursal.',
+          message: 'La planilla ya existía para ese período y sucursal.',
           data: { id_planilla: existingId, existente: true, ...periodoMeta, periodo: toMonthKey(fechaPlanilla) }
         }
       };
@@ -3762,7 +3858,7 @@ const planillaService = {
         status: 409,
         body: buildErrorBody({
           code: 'NO_VALID_EMPLOYEES',
-          message: 'No hay empleados activos validos para generar la planilla en esta sucursal.',
+          message: 'No hay empleados activos válidos para generar la planilla en esta sucursal.',
           details: {
             invalid_employees: invalidRows.slice(0, 25)
           }
@@ -3840,7 +3936,7 @@ const planillaService = {
 
     const idPlanilla = parsePositiveInt(req.params.id_planilla);
     if (!idPlanilla) {
-      return { status: 400, body: { error: true, message: 'id_planilla invÃƒÆ’Ã‚Â¡lido' } };
+      return { status: 400, body: { error: true, message: 'id_planilla inválido' } };
     }
 
     const scopeValidation = await validatePlanillaSucursalScope(idPlanilla, req.body?.id_sucursal);
@@ -3897,7 +3993,7 @@ const planillaService = {
 
     const idPlanilla = parsePositiveInt(req.params.id_planilla);
     if (!idPlanilla) {
-      return { status: 400, body: { error: true, message: 'id_planilla invÃƒÆ’Ã‚Â¡lido' } };
+      return { status: 400, body: { error: true, message: 'id_planilla inválido' } };
     }
 
     const scopeValidation = await validatePlanillaSucursalScope(idPlanilla, req.query?.id_sucursal);
@@ -3935,10 +4031,10 @@ const planillaService = {
         ? null
         : Number(req.query.salario_max);
     if (salarioMin !== null && (!Number.isFinite(salarioMin) || salarioMin < 0)) {
-      return { status: 400, body: { error: true, message: 'salario_min invalido.' } };
+      return { status: 400, body: { error: true, message: 'salario_min inválido.' } };
     }
     if (salarioMax !== null && (!Number.isFinite(salarioMax) || salarioMax < 0)) {
-      return { status: 400, body: { error: true, message: 'salario_max invalido.' } };
+      return { status: 400, body: { error: true, message: 'salario_max inválido.' } };
     }
 
     const filtered = await buildDetallePlanillaDataset({
@@ -3968,7 +4064,7 @@ const planillaService = {
 
     const idPlanilla = parsePositiveInt(req.params.id_planilla);
     if (!idPlanilla) {
-      return { status: 400, body: { error: true, message: 'id_planilla invÃƒÆ’Ã‚Â¡lido' } };
+      return { status: 400, body: { error: true, message: 'id_planilla inválido' } };
     }
 
     const scopeValidation = await validatePlanillaSucursalScope(idPlanilla, req.query?.id_sucursal);
@@ -4081,7 +4177,7 @@ const planillaService = {
 
     const idPlanilla = parsePositiveInt(req.params.id_planilla);
     if (!idPlanilla) {
-      return { status: 400, body: { error: true, message: 'id_planilla invÃƒÆ’Ã‚Â¡lido' } };
+      return { status: 400, body: { error: true, message: 'id_planilla inválido' } };
     }
 
     const scopeValidation = await validatePlanillaSucursalScope(idPlanilla, req.query?.id_sucursal);
@@ -4131,7 +4227,7 @@ const planillaService = {
 
     const idPlanilla = parsePositiveInt(req.params.id_planilla);
     if (!idPlanilla) {
-      return res.status(400).json(buildErrorBody({ code: 'VALIDATION_ERROR', message: 'id_planilla invalido.' }));
+      return res.status(400).json(buildErrorBody({ code: 'VALIDATION_ERROR', message: 'id_planilla inválido.' }));
     }
 
     const scopeValidation = await validatePlanillaSucursalScope(idPlanilla, req.query?.id_sucursal);
@@ -4166,10 +4262,10 @@ const planillaService = {
         : Number(req.query.salario_max);
 
     if (salarioMin !== null && (!Number.isFinite(salarioMin) || salarioMin < 0)) {
-      return res.status(400).json(buildErrorBody({ code: 'VALIDATION_ERROR', message: 'salario_min invalido.' }));
+      return res.status(400).json(buildErrorBody({ code: 'VALIDATION_ERROR', message: 'salario_min inválido.' }));
     }
     if (salarioMax !== null && (!Number.isFinite(salarioMax) || salarioMax < 0)) {
-      return res.status(400).json(buildErrorBody({ code: 'VALIDATION_ERROR', message: 'salario_max invalido.' }));
+      return res.status(400).json(buildErrorBody({ code: 'VALIDATION_ERROR', message: 'salario_max inválido.' }));
     }
 
     const includeDetalle = parseBooleanQueryParam(req.query.includeDetalle, true);
@@ -4252,7 +4348,7 @@ const planillaService = {
     if (!idPlanilla) {
       return {
         status: 400,
-        body: buildErrorBody({ code: 'VALIDATION_ERROR', message: 'id_planilla invalido.' })
+        body: buildErrorBody({ code: 'VALIDATION_ERROR', message: 'id_planilla inválido.' })
       };
     }
 
@@ -4268,7 +4364,7 @@ const planillaService = {
     if (req.query.id_empleado !== undefined && !idEmpleado) {
       return {
         status: 400,
-        body: buildErrorBody({ code: 'VALIDATION_ERROR', message: 'id_empleado invalido.' })
+        body: buildErrorBody({ code: 'VALIDATION_ERROR', message: 'id_empleado inválido.' })
       };
     }
 
@@ -4276,7 +4372,7 @@ const planillaService = {
     if (estado && !['PENDIENTE', 'COMPENSADA', 'TODAS'].includes(estado)) {
       return {
         status: 400,
-        body: buildErrorBody({ code: 'VALIDATION_ERROR', message: 'estado invalido. Use PENDIENTE o COMPENSADA.' })
+        body: buildErrorBody({ code: 'VALIDATION_ERROR', message: 'estado inválido. Use PENDIENTE o COMPENSADA.' })
       };
     }
     const periodoContext = resolvePeriodoContextInput({
@@ -4466,7 +4562,7 @@ const planillaService = {
         status: 400,
         body: buildErrorBody({
           code: 'VALIDATION_ERROR',
-          message: 'id_tipo_hora invalido.'
+          message: 'id_tipo_hora inválido.'
         })
       };
     }
@@ -4476,7 +4572,7 @@ const planillaService = {
         status: 400,
         body: buildErrorBody({
           code: 'VALIDATION_ERROR',
-          message: 'id_factor_horas_extras invalido.'
+          message: 'id_factor_horas_extras inválido.'
         })
       };
     }
@@ -4744,7 +4840,7 @@ const planillaService = {
         status: 400,
         body: buildErrorBody({
           code: 'VALIDATION_ERROR',
-          message: 'id_empleado invalido.'
+          message: 'id_empleado inválido.'
         })
       };
     }
@@ -4774,7 +4870,7 @@ const planillaService = {
         status: 400,
         body: buildErrorBody({
           code: 'VALIDATION_ERROR',
-          message: 'horas invalido.'
+          message: 'horas inválido.'
         })
       };
     }
@@ -4934,7 +5030,7 @@ const planillaService = {
     if (!idPlanilla) {
       return {
         status: 400,
-        body: buildErrorBody({ code: 'VALIDATION_ERROR', message: 'id_planilla invalido.' })
+        body: buildErrorBody({ code: 'VALIDATION_ERROR', message: 'id_planilla inválido.' })
       };
     }
 
@@ -4950,7 +5046,7 @@ const planillaService = {
         status: 400,
         body: buildErrorBody({
           code: 'VALIDATION_ERROR',
-          message: 'tipo_periodo invalido. Use mensual o quincenal.'
+          message: 'tipo_periodo inválido. Use mensual o quincenal.'
         })
       };
     }
@@ -4984,7 +5080,7 @@ const planillaService = {
     if (!estadoInfo) {
       return {
         status: 400,
-        body: { error: true, message: 'id_estado_planilla/estado invÃƒÆ’Ã‚Â¡lido o no existe en catÃƒÆ’Ã‚Â¡logo' }
+        body: { error: true, message: 'id_estado_planilla/estado inválido o no existe en catálogo' }
       };
     }
 
@@ -5085,7 +5181,7 @@ const planillaService = {
     if (!idPlanilla) {
       return {
         status: 400,
-        body: buildErrorBody({ code: 'VALIDATION_ERROR', message: 'id_planilla invalido.' })
+        body: buildErrorBody({ code: 'VALIDATION_ERROR', message: 'id_planilla inválido.' })
       };
     }
 
@@ -5109,7 +5205,7 @@ const planillaService = {
 
     const idSucursal = parsePositiveInt(req.params.id_sucursal);
     if (!idSucursal) {
-      return { status: 400, body: { error: true, message: 'id_sucursal invÃƒÆ’Ã‚Â¡lido' } };
+      return { status: 400, body: { error: true, message: 'id_sucursal inválido' } };
     }
 
     const pagination = parsePagination(req.query || {});
@@ -5140,7 +5236,7 @@ const planillaService = {
 
     const idSucursal = parsePositiveInt(req.params.id_sucursal);
     if (!idSucursal) {
-      return { status: 400, body: { error: true, message: 'id_sucursal invÃƒÆ’Ã‚Â¡lido' } };
+      return { status: 400, body: { error: true, message: 'id_sucursal inválido' } };
     }
 
     const pagination = parsePagination(req.query || {});
@@ -5156,7 +5252,7 @@ const planillaService = {
     }
     const periodo = req.query.periodo ? normalizePeriodo(req.query.periodo) : null;
     if (req.query.periodo && !periodo) {
-      return { status: 400, body: { error: true, message: 'periodo invÃƒÆ’Ã‚Â¡lido. Use YYYY-MM o YYYY-MM-DD' } };
+      return { status: 400, body: { error: true, message: 'período inválido. Use YYYY-MM o YYYY-MM-DD' } };
     }
 
     const periodoKey = periodo ? toMonthKey(periodo) : null;
@@ -5183,7 +5279,7 @@ const planillaService = {
 
     const idPlanilla = parsePositiveInt(req.params.id_planilla);
     if (!idPlanilla) {
-      return { status: 400, body: { error: true, message: 'id_planilla invÃƒÆ’Ã‚Â¡lido' } };
+      return { status: 400, body: { error: true, message: 'id_planilla inválido' } };
     }
 
     const scopeValidation = await validatePlanillaSucursalScope(idPlanilla, req.query?.id_sucursal);
@@ -5200,7 +5296,7 @@ const planillaService = {
 
     const idDetalle = req.query.id_detalle === undefined ? null : parsePositiveInt(req.query.id_detalle);
     if (req.query.id_detalle !== undefined && !idDetalle) {
-      return { status: 400, body: { error: true, message: 'id_detalle invÃƒÆ’Ã‚Â¡lido' } };
+      return { status: 400, body: { error: true, message: 'id_detalle inválido' } };
     }
 
     if (idDetalle) {
@@ -5305,7 +5401,7 @@ const planillaService = {
         status: 409,
         body: buildErrorBody({
           code: 'ADELANTO_INACTIVO',
-          message: 'El adelanto esta inactivo o ya fue liquidado.'
+          message: 'El adelanto está inactivo o ya fue liquidado.'
         })
       };
     }
@@ -5399,7 +5495,7 @@ const planillaService = {
         requestedQuincena: periodoContext.quincena
       });
 
-      // AM: usamos la ruta de compatibilidad como flujo principal para evitar fallas de la funcion SQL legacy.
+      // AM: usamos la ruta de compatibilidad como flujo principal para evitar fallas de la función SQL legacy.
       const data = await applyAdelantoFallback({
         idAdelanto,
         idPlanilla,
@@ -6027,7 +6123,7 @@ const planillaService = {
 
     const idPlanilla = parsePositiveInt(req.params.id_planilla);
     if (!idPlanilla) {
-      return { status: 400, body: { error: true, message: 'id_planilla invalido' } };
+      return { status: 400, body: { error: true, message: 'id_planilla inválido' } };
     }
 
     const scopeValidation = await validatePlanillaSucursalScope(idPlanilla, req.query?.id_sucursal);
@@ -6055,7 +6151,7 @@ const planillaService = {
 
     const idDetalle = req.query.id_detalle === undefined ? null : parsePositiveInt(req.query.id_detalle);
     if (req.query.id_detalle !== undefined && !idDetalle) {
-      return { status: 400, body: { error: true, message: 'id_detalle invalido' } };
+      return { status: 400, body: { error: true, message: 'id_detalle inválido' } };
     }
 
     const rows = await buildMovimientosDataset({
@@ -6181,13 +6277,33 @@ const planillaService = {
     }
 
     const rows = await queryFunctionRows(PLANILLA_ENDPOINT_CONTRACT.anularMovimiento, [idMovimiento]);
+    const rpcData = rows[0] || {};
+    const detalleRow = await ensureMovimientoAnuladoState({
+      idMovimiento,
+      idDetalle: movimientoScope.id_detalle_planilla
+    });
+    const responseData = {
+      ...rpcData,
+      id_movimiento_planilla: parsePositiveInt(rpcData.id_movimiento_planilla) || idMovimiento,
+      id_detalle_planilla:
+        parsePositiveInt(rpcData.id_detalle_planilla) || movimientoScope.id_detalle_planilla,
+      anulado: true,
+      es_anulado: true,
+      estado_movimiento: 'ANULADO',
+      neto_actualizado:
+        detalleRow.neto_pagar ?? rpcData.neto_actualizado ?? null,
+      total_bonos:
+        detalleRow.total_bonos ?? rpcData.total_bonos ?? null,
+      total_deducciones:
+        detalleRow.total_deducciones ?? rpcData.total_deducciones ?? null
+    };
 
     return {
       status: 200,
       body: {
         error: false,
         message: 'Movimiento anulado correctamente',
-        data: rows[0] || null
+        data: responseData
       }
     };
   },
@@ -6198,7 +6314,7 @@ const planillaService = {
 
     const idPlanilla = parsePositiveInt(req.params.id_planilla);
     if (!idPlanilla) {
-      return { status: 400, body: { error: true, message: 'id_planilla invalido' } };
+      return { status: 400, body: { error: true, message: 'id_planilla inválido' } };
     }
 
     const scopeValidation = await validatePlanillaSucursalScope(idPlanilla, req.query?.id_sucursal);

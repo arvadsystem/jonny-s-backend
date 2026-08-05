@@ -18,6 +18,7 @@ import {
   resolvePrintJobAdministratively
 } from '../services/printQueueAdminService.js';
 import { loadVentaReversionTicketData } from '../services/ventaReversionTicketPdfService.js';
+import { classifyPrintJobState, PRINT_AGENT_EXPECTED_CLAIM_SECONDS } from '../services/printJobStateService.js';
 
 const router = express.Router();
 const ADMIN_ROLE_CODES = Object.freeze(['ADMIN', 'ADMINISTRADOR', 'SUPER_ADMIN']);
@@ -345,12 +346,22 @@ router.get('/ventas/print-jobs/:id', checkPermission(['VENTAS_IMPRIMIR', 'VENTAS
   if (!Number.isInteger(idTrabajo) || idTrabajo <= 0) return res.status(400).json({ ok: false, message: 'ID invalido.' });
   const scope = await resolveRequestUserSucursalScope(req, pool);
   const result = await pool.query(
-    `SELECT id_trabajo,id_sucursal,tipo_documento,estado,intentos,fecha_creacion,finalizado_at,error_sanitizado
-     FROM public.trabajos_impresion WHERE id_trabajo=$1`, [idTrabajo]
+    `SELECT t.id_trabajo,t.id_sucursal,t.tipo_documento,t.estado,t.intentos,t.max_intentos,
+            t.disponible_at,t.lease_expires_at,t.fecha_creacion,t.finalizado_at,t.error_sanitizado,
+            EXTRACT(EPOCH FROM (now() - t.fecha_creacion))::integer AS waiting_seconds,
+            EXISTS (
+              SELECT 1
+              FROM public.agentes_impresion a
+              WHERE a.id_sucursal=t.id_sucursal
+                AND a.estado='activo'
+                AND a.ultimo_heartbeat_at >= now() - make_interval(secs => $2)
+            ) AS agent_online
+     FROM public.trabajos_impresion t WHERE t.id_trabajo=$1`,
+    [idTrabajo, PRINT_AGENT_EXPECTED_CLAIM_SECONDS]
   );
   const job = result.rows[0];
   if (!job || (!scope.isSuperAdmin && !scope.allowedSucursalIds.includes(Number(job.id_sucursal)))) return res.status(404).json({ ok: false, message: 'Trabajo no encontrado.' });
-  return res.json({ ok: true, job });
+  return res.json({ ok: true, job: { ...job, ...classifyPrintJobState(job) } });
 });
 
 router.get('/ventas/print-jobs/:id/events', checkPermission(['VENTAS_IMPRIMIR']), async (req, res) => {

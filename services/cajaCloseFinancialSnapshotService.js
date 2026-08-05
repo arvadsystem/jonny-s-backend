@@ -429,7 +429,15 @@ export const loadCajaCloseFinancialSnapshot = async ({ queryRunner, idSesionCaja
           arps.id_reversion,
           arps.id_factura_original,
           arps.monto_reversado,
-          arps.id_sesion_caja_atribuida
+          arps.id_sesion_caja_atribuida,
+          COALESCE(
+            SUM(arps.monto_reversado) OVER (
+              PARTITION BY arps.id_factura_original
+              ORDER BY arps.id_reversion
+              ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+            ),
+            0
+          )::numeric(14,2) AS monto_reversado_anterior
         FROM attributed_reversion_payment_state arps
         WHERE arps.id_sesion_caja_atribuida = $1::bigint
       ),
@@ -437,12 +445,18 @@ export const loadCajaCloseFinancialSnapshot = async ({ queryRunner, idSesionCaja
         SELECT
           rs.id_reversion,
           rs.monto_reversado,
+          rs.monto_reversado_anterior,
           fc.id_factura_cobro,
           fc.id_metodo_pago,
           COALESCE(fc.monto, 0)::numeric(14,2) AS monto_cobro,
-          SUM(COALESCE(fc.monto, 0)) OVER (PARTITION BY rs.id_reversion)::numeric(14,2) AS total_cobrado,
-          ROW_NUMBER() OVER (PARTITION BY rs.id_reversion ORDER BY fc.id_factura_cobro ASC) AS rn,
-          COUNT(*) OVER (PARTITION BY rs.id_reversion) AS line_count
+          COALESCE(
+            SUM(COALESCE(fc.monto, 0)) OVER (
+              PARTITION BY rs.id_reversion
+              ORDER BY fc.id_factura_cobro
+              ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+            ),
+            0
+          )::numeric(14,2) AS monto_cobro_anterior
         FROM reversion_source rs
         INNER JOIN public.facturas_cobros fc
           ON fc.id_factura = rs.id_factura_original
@@ -453,23 +467,13 @@ export const loadCajaCloseFinancialSnapshot = async ({ queryRunner, idSesionCaja
           rl.id_reversion,
           rl.id_factura_cobro,
           rl.id_metodo_pago,
-          CASE
-            WHEN rl.total_cobrado <= 0 THEN 0::numeric(14,2)
-            WHEN rl.rn = rl.line_count THEN
-              (
-                rl.monto_reversado
-                - COALESCE(
-                    SUM(ROUND((rl.monto_cobro / NULLIF(rl.total_cobrado, 0)) * rl.monto_reversado, 2))
-                      OVER (
-                        PARTITION BY rl.id_reversion
-                        ORDER BY rl.id_factura_cobro ASC
-                        ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
-                      ),
-                    0
-                  )
-              )::numeric(14,2)
-            ELSE ROUND((rl.monto_cobro / NULLIF(rl.total_cobrado, 0)) * rl.monto_reversado, 2)::numeric(14,2)
-          END AS monto_asignado
+          GREATEST(
+            0,
+            LEAST(
+              rl.monto_reversado_anterior + rl.monto_reversado,
+              rl.monto_cobro_anterior + rl.monto_cobro
+            ) - GREATEST(rl.monto_reversado_anterior, rl.monto_cobro_anterior)
+          )::numeric(14,2) AS monto_asignado
         FROM reversion_lines rl
       ),
       reversions_by_method AS (

@@ -1,8 +1,45 @@
 import PDFDocument from 'pdfkit';
 import { formatHondurasDate, formatHondurasTime } from '../utils/hondurasDateTime.js';
+import { normalizarDatosTicketDesdeSnapshot } from './facturacionSnapshotService.js';
+import {
+  mmToPixels203Dpi,
+  optimizePrintLogoDataUrl
+} from './printLogoOptimizationService.js';
 
 const MM_TO_PT = 72 / 25.4;
-const toWidth = (value) => Number(value) === 58 ? 58 : 80;
+const POINTS_PER_203_DPI_PIXEL = 72 / 203;
+const LOGO_GAP_PT = 2.5 * MM_TO_PT;
+const toWidth = (value) => {
+  const widthMm = value === null || value === undefined || value === '' ? 80 : Number(value);
+  if (![58, 80].includes(widthMm)) {
+    throw Object.assign(new RangeError('El ancho del comprobante de reversion debe ser 58 mm u 80 mm.'), {
+      code: 'VENTA_REVERSION_TICKET_WIDTH_INVALID'
+    });
+  }
+  return widthMm;
+};
+const resolveFacturaLikeMetrics = (value) => {
+  const widthMm = toWidth(value);
+  const marginsMm = widthMm === 58
+    ? { top: 4, right: 5, bottom: 4, left: 4 }
+    : { top: 4, right: 10, bottom: 4, left: 7 };
+  const usableWidthMm = widthMm === 58 ? 47.5 : 61.5;
+  const toPt = (millimeters) => millimeters * MM_TO_PT;
+
+  return {
+    widthMm,
+    widthPt: toPt(widthMm),
+    marginsMm,
+    marginsPt: {
+      top: toPt(marginsMm.top),
+      right: toPt(marginsMm.right),
+      bottom: toPt(marginsMm.bottom),
+      left: toPt(marginsMm.left)
+    },
+    usableWidthMm,
+    usableWidthPt: toPt(usableWidthMm)
+  };
+};
 const toBoolean = (value, fallback = true) => value === null || value === undefined
   ? fallback
   : value === true;
@@ -31,6 +68,7 @@ export const loadVentaReversionTicketData = async ({ db, idReversion }) => {
         fr.creada_por,
         f.codigo_venta,
         f.fecha_hora_facturacion,
+        f.facturacion_snapshot,
         s.nombre_sucursal,
         c.codigo_caja,
         c.nombre_caja,
@@ -115,8 +153,18 @@ export const loadVentaReversionTicketData = async ({ db, idReversion }) => {
     )
   ]);
 
+  const facturacion = await normalizarDatosTicketDesdeSnapshot({
+    client: db,
+    factura: {
+      id_sucursal: header.id_sucursal,
+      facturacion_snapshot: header.facturacion_snapshot
+    },
+    includePrintAssets: true
+  });
+
   return {
     ...header,
+    facturacion,
     ancho_ticket_mm: toWidth(header.ancho_ticket_mm),
     imprimir_comprobante_reversion: toBoolean(header.imprimir_comprobante_reversion),
     mostrar_venta_original_reversion: toBoolean(header.mostrar_venta_original_reversion),
@@ -152,9 +200,21 @@ export const buildVentaReversionTicketModel = (data) => {
   if (data?.mostrar_motivo_reversion) fields.push({ label: 'Motivo', value: data?.motivo || '-' });
   fields.push({ label: 'Tipo solicitado', value: data?.tipo_reversion || '-' });
   fields.push({ label: 'Resultado acumulado', value: data?.resultado_acumulado || 'PARCIAL' });
+  const facturacion = data?.facturacion && typeof data.facturacion === 'object' ? data.facturacion : {};
+  const emisor = facturacion.emisor && typeof facturacion.emisor === 'object' ? facturacion.emisor : {};
+  const ticket = facturacion.ticket && typeof facturacion.ticket === 'object' ? facturacion.ticket : {};
 
   return {
     widthMm: toWidth(data?.ancho_ticket_mm),
+    branding: {
+      logoDataUrl: ticket.mostrar_logo_ticket === true ? emisor.logo_data_url || null : null,
+      nombre: emisor.nombre_emisor || "JONNY'S",
+      textoEncabezado: ticket.texto_encabezado_ticket || null,
+      rtn: ticket.mostrar_rtn !== false ? emisor.rtn_emisor || null : null,
+      direccion: ticket.mostrar_direccion !== false ? emisor.direccion_emisor || null : null,
+      telefono: ticket.mostrar_telefono !== false ? emisor.telefono_emisor || null : null,
+      correo: ticket.mostrar_correo === true ? emisor.correo_emisor || null : null
+    },
     title: 'COMPROBANTE DE REVERSIÓN',
     disclaimer: 'NO ES FACTURA',
     fields,
@@ -175,13 +235,74 @@ export const buildVentaReversionTicketModel = (data) => {
   };
 };
 
+export const resolveVentaReversionLogoLayout = ({
+  contentLeftPt,
+  usableWidthPt,
+  imageWidthPx,
+  imageHeightPx,
+  maxHeightPt
+}) => {
+  if (![contentLeftPt, usableWidthPt, imageWidthPx, imageHeightPx, maxHeightPt].every(Number.isFinite)) {
+    return null;
+  }
+  if (usableWidthPt <= 0 || imageWidthPx <= 0 || imageHeightPx <= 0 || maxHeightPt <= 0) return null;
+
+  const scale = Math.min(
+    POINTS_PER_203_DPI_PIXEL,
+    usableWidthPt / imageWidthPx,
+    maxHeightPt / imageHeightPx
+  );
+  const renderedWidthPt = imageWidthPx * scale;
+  const renderedHeightPt = imageHeightPx * scale;
+
+  return {
+    x: contentLeftPt + ((usableWidthPt - renderedWidthPt) / 2),
+    renderedWidthPt,
+    renderedHeightPt,
+    gapPt: LOGO_GAP_PT
+  };
+};
+
 export const buildVentaReversionTicketPdfBuffer = async (data) => {
   const model = buildVentaReversionTicketModel(data);
-  const widthPt = model.widthMm * MM_TO_PT;
-  const estimatedHeight = Math.max(360, 235 + model.fields.length * 18 + model.lines.length * 34);
+  const metrics = resolveFacturaLikeMetrics(model.widthMm);
+  const contentLeftPt = metrics.marginsPt.left;
+  const contentRightPt = contentLeftPt + metrics.usableWidthPt;
+  const maxLogoHeightMm = model.widthMm === 58 ? 19 : 25;
+  const optimizedLogo = model.branding.logoDataUrl
+    ? await optimizePrintLogoDataUrl(model.branding.logoDataUrl, {
+        targetWidthPx: mmToPixels203Dpi(metrics.usableWidthMm),
+        targetHeightPx: mmToPixels203Dpi(maxLogoHeightMm)
+      })
+    : { ok: false, reason: 'LOGO_NOT_CONFIGURED' };
+  const logoLayout = optimizedLogo.ok
+    ? resolveVentaReversionLogoLayout({
+        contentLeftPt,
+        usableWidthPt: metrics.usableWidthPt,
+        imageWidthPx: optimizedLogo.outputWidthPx,
+        imageHeightPx: optimizedLogo.outputHeightPx,
+        maxHeightPt: maxLogoHeightMm * MM_TO_PT
+      })
+    : null;
+  const brandingLines = [
+    model.branding.nombre,
+    model.branding.textoEncabezado,
+    model.branding.rtn,
+    model.branding.direccion,
+    model.branding.telefono,
+    model.branding.correo
+  ].filter(Boolean).length;
+  const estimatedHeight = Math.max(
+    420,
+    270
+      + brandingLines * 14
+      + (logoLayout ? logoLayout.renderedHeightPt + logoLayout.gapPt : 0)
+      + model.fields.length * 18
+      + model.lines.length * 34
+  );
   const doc = new PDFDocument({
-    size: [widthPt, estimatedHeight],
-    margins: { top: 12, right: 12, bottom: 12, left: 12 },
+    size: [metrics.widthPt, estimatedHeight],
+    margins: metrics.marginsPt,
     compress: false,
     info: { Title: model.title, Subject: model.disclaimer }
   });
@@ -191,30 +312,96 @@ export const buildVentaReversionTicketPdfBuffer = async (data) => {
     doc.on('end', () => resolve(Buffer.concat(chunks)));
     doc.on('error', reject);
   });
+  const writeContentText = (value, options = {}) => doc.text(
+    value,
+    contentLeftPt,
+    doc.y,
+    { width: metrics.usableWidthPt, ...options }
+  );
+  const drawDivider = () => doc
+    .dash(2, { space: 2 })
+    .moveTo(contentLeftPt, doc.y)
+    .lineTo(contentRightPt, doc.y)
+    .stroke()
+    .undash();
 
-  doc.font('Helvetica-Bold').fontSize(model.widthMm === 58 ? 11 : 13).text(model.title, { align: 'center' });
-  doc.fontSize(10).text(model.disclaimer, { align: 'center' });
-  doc.moveDown(0.5).dash(2, { space: 2 }).moveTo(12, doc.y).lineTo(widthPt - 12, doc.y).stroke().undash();
+  if (optimizedLogo.ok && logoLayout) {
+    const logoY = doc.y;
+    doc.image(optimizedLogo.buffer, logoLayout.x, logoY, {
+      width: logoLayout.renderedWidthPt,
+      height: logoLayout.renderedHeightPt
+    });
+    doc.y = logoY + logoLayout.renderedHeightPt + logoLayout.gapPt;
+    doc.x = contentLeftPt;
+  }
+  doc.font('Helvetica-Bold').fontSize(model.widthMm === 58 ? 9 : 10);
+  writeContentText(model.branding.nombre, { align: 'center' });
+  if (model.branding.textoEncabezado) {
+    doc.font('Helvetica').fontSize(8);
+    writeContentText(model.branding.textoEncabezado, { align: 'center' });
+  }
+  if (model.branding.rtn) {
+    doc.font('Helvetica').fontSize(8);
+    writeContentText(`RTN: ${model.branding.rtn}`, { align: 'center' });
+  }
+  if (model.branding.direccion) {
+    doc.font('Helvetica').fontSize(8);
+    writeContentText(model.branding.direccion, { align: 'center' });
+  }
+  if (model.branding.telefono) {
+    doc.font('Helvetica').fontSize(8);
+    writeContentText(`Tel: ${model.branding.telefono}`, { align: 'center' });
+  }
+  if (model.branding.correo) {
+    doc.font('Helvetica').fontSize(8);
+    writeContentText(model.branding.correo, { align: 'center' });
+  }
+  doc.moveDown(0.35);
+  drawDivider();
+  doc.moveDown(0.4).font('Helvetica-Bold').fontSize(model.widthMm === 58 ? 11 : 13);
+  writeContentText(model.title, { align: 'center' });
+  doc.fontSize(10);
+  writeContentText(model.disclaimer, { align: 'center' });
+  doc.moveDown(0.5);
+  drawDivider();
   doc.moveDown(0.4);
   for (const field of model.fields) {
-    doc.font('Helvetica-Bold').fontSize(8).text(`${field.label}: `, { continued: true });
+    doc.font('Helvetica-Bold').fontSize(8).text(
+      `${field.label}: `,
+      contentLeftPt,
+      doc.y,
+      { continued: true, width: metrics.usableWidthPt }
+    );
     doc.font('Helvetica').text(String(field.value || '-'));
   }
-  if (model.observation) doc.font('Helvetica').fontSize(8).text(`Observacion: ${model.observation}`);
+  if (model.observation) {
+    doc.font('Helvetica').fontSize(8);
+    writeContentText(`Observacion: ${model.observation}`);
+  }
   if (model.showDetail) {
-    doc.moveDown(0.4).font('Helvetica-Bold').fontSize(9).text('Detalle de esta reversion');
+    doc.moveDown(0.4).font('Helvetica-Bold').fontSize(9);
+    writeContentText('Detalle de esta reversion');
     for (const line of model.lines) {
-      doc.font('Helvetica-Bold').fontSize(8).text(line.name);
-      doc.font('Helvetica').text(`${line.quantity} x ${line.unitPrice}`, { continued: true });
+      doc.font('Helvetica-Bold').fontSize(8);
+      writeContentText(line.name);
+      doc.font('Helvetica').text(
+        `${line.quantity} x ${line.unitPrice}`,
+        contentLeftPt,
+        doc.y,
+        { continued: true, width: metrics.usableWidthPt }
+      );
       doc.text(line.total, { align: 'right' });
       if (line.inventoryReason === 'PREPARACION_INICIADA') {
-        doc.font('Helvetica').fontSize(7).text('Inventario: no devuelto; preparación iniciada.');
+        doc.font('Helvetica').fontSize(7);
+        writeContentText('Inventario: no devuelto; preparación iniciada.');
       }
     }
   }
   if (model.total) {
-    doc.moveDown(0.4).dash(2, { space: 2 }).moveTo(12, doc.y).lineTo(widthPt - 12, doc.y).stroke().undash();
-    doc.moveDown(0.3).font('Helvetica-Bold').fontSize(10).text(`TOTAL REVERSADO: ${model.total}`, { align: 'right' });
+    doc.moveDown(0.4);
+    drawDivider();
+    doc.moveDown(0.3).font('Helvetica-Bold').fontSize(10);
+    writeContentText(`TOTAL REVERSADO: ${model.total}`, { align: 'right' });
   }
   doc.end();
   return complete;

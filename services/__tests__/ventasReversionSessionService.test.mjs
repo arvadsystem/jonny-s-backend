@@ -23,7 +23,8 @@ describe('resolveOriginalSessionFromCobros', () => {
       })]
     ]);
     const result = await resolveOriginalSessionFromCobros({ client, idFactura: 232, facturaIdSesionCaja: 19 });
-    assert.deepEqual(result, { id_sesion_caja: 19 });
+    assert.equal(result.id_sesion_caja, 19);
+    assert.equal(result.cobros.length, 2);
   });
 
   it('8) cero sesiones (sin cobros) -> VENTAS_REVERSION_SESSION_MISSING', async () => {

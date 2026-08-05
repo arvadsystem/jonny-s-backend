@@ -4,25 +4,60 @@ export const IDEMPOTENCY_MODE = Object.freeze({
   DISABLED: 'disabled'
 });
 
-export const hasCuentaDivididaPayload = (body) => Array.isArray(body?.cuenta_dividida);
+export const PEDIDO_PENDIENTE_IDEMPOTENCY_KEY_MAX_LENGTH = 200;
 
-export const resolvePedidoPendienteIdempotencyMode = ({
-  pedidoPendienteRpcV2Enabled = false,
-  cuentaDivididaSolicitada = false,
-  idempotencyKey = null
-} = {}) => {
-  if (!idempotencyKey) return IDEMPOTENCY_MODE.DISABLED;
-  return pedidoPendienteRpcV2Enabled && !cuentaDivididaSolicitada
-    ? IDEMPOTENCY_MODE.RPC
-    : IDEMPOTENCY_MODE.EXTERNAL;
+export const validatePedidoPendienteIdempotencyKeyHeader = (rawValue) => {
+  if (rawValue === undefined || rawValue === null) {
+    return {
+      ok: false,
+      status: 400,
+      code: 'VENTAS_PEDIDO_IDEMPOTENCY_KEY_REQUERIDA',
+      message: 'Idempotency-Key es requerido para crear el pedido.'
+    };
+  }
+  if (Array.isArray(rawValue) || typeof rawValue !== 'string') {
+    return {
+      ok: false,
+      status: 400,
+      code: 'VENTAS_PEDIDO_IDEMPOTENCY_KEY_INVALIDA',
+      message: 'Idempotency-Key debe ser una cadena unica de hasta 200 caracteres.'
+    };
+  }
+  const value = rawValue.trim();
+  if (!value) {
+    return {
+      ok: false,
+      status: 400,
+      code: 'VENTAS_PEDIDO_IDEMPOTENCY_KEY_REQUERIDA',
+      message: 'Idempotency-Key es requerido para crear el pedido.'
+    };
+  }
+  if (value.includes(',') || value.length > PEDIDO_PENDIENTE_IDEMPOTENCY_KEY_MAX_LENGTH) {
+    return {
+      ok: false,
+      status: 400,
+      code: 'VENTAS_PEDIDO_IDEMPOTENCY_KEY_INVALIDA',
+      message: 'Idempotency-Key debe ser una cadena unica de hasta 200 caracteres.'
+    };
+  }
+  return { ok: true, value };
 };
 
-export const resolveVentaIdempotencyMode = ({
-  ventasRpcV3Enabled = false,
-  idempotencyKey = null
-} = {}) => {
+export const hasCuentaDivididaPayload = (body) => Array.isArray(body?.cuenta_dividida);
+
+export const resolvePedidoPendienteIdempotencyMode = ({ idempotencyKey = null } = {}) => {
   if (!idempotencyKey) return IDEMPOTENCY_MODE.DISABLED;
-  return ventasRpcV3Enabled ? IDEMPOTENCY_MODE.RPC : IDEMPOTENCY_MODE.EXTERNAL;
+  // La RPC v2 desplegada aun no recibe id_sesion_caja en sus helpers de
+  // reserva/finalizacion. Hasta que exista ese contrato SQL, Node conserva la
+  // reserva y su scope; la persistencia puede seguir usando la RPC v1.
+  return IDEMPOTENCY_MODE.EXTERNAL;
+};
+
+export const resolveVentaIdempotencyMode = ({ idempotencyKey = null } = {}) => {
+  if (!idempotencyKey) return IDEMPOTENCY_MODE.DISABLED;
+  // La RPC v3 desplegada reserva antes de validar la sesion y omite
+  // id_sesion_caja. Mantener el scope en Node evita reservas financieras NULL.
+  return IDEMPOTENCY_MODE.EXTERNAL;
 };
 
 export const buildRpcManagedIdempotencyReservation = (idempotencyKey = null) => ({

@@ -57,4 +57,16 @@ describe('ventas RPC route selection', () => {
       pedidoLines: [{ item_index: 0 }]
     }), false);
   });
+
+  it('flags V3/V2 encendidas no delegan idempotencia hasta que la RPC reciba id_sesion_caja', () => {
+    assert.equal(resolveVentaIdempotencyMode({
+      ventasRpcV3Enabled: true,
+      idempotencyKey: 'idem-session-scoped'
+    }), IDEMPOTENCY_MODE.EXTERNAL);
+    assert.equal(resolvePedidoPendienteIdempotencyMode({
+      pedidoPendienteRpcV2Enabled: true,
+      cuentaDivididaSolicitada: false,
+      idempotencyKey: 'idem-session-scoped'
+    }), IDEMPOTENCY_MODE.EXTERNAL);
+  });
 });

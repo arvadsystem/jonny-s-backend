@@ -86,7 +86,10 @@ const hasExactKeys = (value, expectedKeys) => (
 );
 const buildCanonicalDataOptions = ({ contract, widthMm }) => (
   contract.format === 'pdf'
-    ? { altFontRendering: true, ignoreTransparency: true }
+    ? {
+        altFontRendering: true,
+        ignoreTransparency: true
+      }
     : { pageWidth: widthMm }
 );
 const hasExactOptionValues = (options, expected) => (
