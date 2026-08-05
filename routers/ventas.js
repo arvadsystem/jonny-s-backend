@@ -167,6 +167,7 @@ import {
   summarizeActiveDivisions
 } from './ventas/services/cuentaDivididaSplitService.js';
 import { validarYDescontarPedido } from '../services/inventarioPedidoService.js';
+import { SHORTAGE_MOVEMENT_REF } from '../services/inventarioMovimientoService.js';
 import { buildPedidoConsumoPayload } from './cocina.js';
 import {
   coercePositiveIntArray,
@@ -2127,7 +2128,10 @@ const validarYDescontarInventarioCajaPedido = async ({
     const inventoryResult = await validarYDescontarPedido(consumoPayloadResult.payload, {
       id_usuario: idUsuario,
       dbClient: client,
-      perf
+      perf,
+      allowNegativeStock: true,
+      allowIncompleteConfiguration: false,
+      shortageMode: SHORTAGE_MOVEMENT_REF
     });
     if (!inventoryResult?.ok) {
       throw {
@@ -8491,7 +8495,7 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
           [rpcResponseBody.id_pedido]
         );
       }
-      await validarYDescontarInventarioCajaPedido({
+      const inventoryOutcome = await validarYDescontarInventarioCajaPedido({
         client,
         idPedido: rpcResponseBody.id_pedido,
         idSucursal: pedidoPendiente.id_sucursal,
@@ -8502,10 +8506,13 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
         client,
         idPedido: rpcResponseBody.id_pedido
       });
-      const reconciledRpcResponseBody = await reconcileVentaResponseWithPersistedPedidoState({
-        client,
-        response: rpcResponseBody
-      });
+      const reconciledRpcResponseBody = {
+        ...(await reconcileVentaResponseWithPersistedPedidoState({
+          client,
+          response: rpcResponseBody
+        })),
+        ...(inventoryOutcome?.warning ? { warning: inventoryOutcome.warning } : {})
+      };
       const idempotencySuccessStart = ventasPerf.now();
       await saveExternalIdempotencySuccessIfNeeded({
         reservation: idempotencyReservation,
@@ -8830,7 +8837,7 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
       );
     }
 
-    await validarYDescontarInventarioCajaPedido({
+    const inventoryOutcome = await validarYDescontarInventarioCajaPedido({
       client,
       idPedido,
       idSucursal: pedidoPendiente.id_sucursal,
@@ -8851,10 +8858,13 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
       cuenta_dividida: cuentaDivididaResponse
     };
     await applyPedidoInitialOperationalRouting({ client, idPedido });
-    const responseBody = await reconcileVentaResponseWithPersistedPedidoState({
-      client,
-      response: baseResponseBody
-    });
+    const responseBody = {
+      ...(await reconcileVentaResponseWithPersistedPedidoState({
+        client,
+        response: baseResponseBody
+      })),
+      ...(inventoryOutcome?.warning ? { warning: inventoryOutcome.warning } : {})
+    };
     const idempotencySuccessStart = ventasPerf.now();
     await saveExternalIdempotencySuccessIfNeeded({
       reservation: idempotencyReservation,
@@ -10413,7 +10423,7 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
         venta
       });
       await persistVentaPedidoSnapshots({ client, idPedido: idPedidoRpc, venta });
-      await validarYDescontarInventarioCajaPedido({
+      const inventoryOutcome = await validarYDescontarInventarioCajaPedido({
         client,
         idPedido: idPedidoRpc,
         idSucursal: venta.id_sucursal,
@@ -10429,10 +10439,13 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
       }
 
       await applyPedidoInitialOperationalRouting({ client, idPedido: idPedidoRpc });
-      const rpcV2ResponseBody = await reconcileVentaResponseWithPersistedPedidoState({
-        client,
-        response: attachVentaSnapshotsToResponse(rpcCreateResult.response, venta)
-      });
+      const rpcV2ResponseBody = {
+        ...(await reconcileVentaResponseWithPersistedPedidoState({
+          client,
+          response: attachVentaSnapshotsToResponse(rpcCreateResult.response, venta)
+        })),
+        ...(inventoryOutcome?.warning ? { warning: inventoryOutcome.warning } : {})
+      };
       await saveVentasIdempotencySuccess({
         client,
         reservation: idempotencyReservation,
@@ -10482,7 +10495,7 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
         idPedido: rpcCreateResult.response?.id_pedido,
         venta
       });
-      await validarYDescontarInventarioCajaPedido({
+      const inventoryOutcome = await validarYDescontarInventarioCajaPedido({
         client,
         idPedido: rpcCreateResult.response?.id_pedido,
         idSucursal: venta.id_sucursal,
@@ -10493,10 +10506,13 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
         client,
         idPedido: rpcCreateResult.response?.id_pedido
       });
-      const rpcV1ResponseBody = await reconcileVentaResponseWithPersistedPedidoState({
-        client,
-        response: attachVentaSnapshotsToResponse(rpcCreateResult.response, venta)
-      });
+      const rpcV1ResponseBody = {
+        ...(await reconcileVentaResponseWithPersistedPedidoState({
+          client,
+          response: attachVentaSnapshotsToResponse(rpcCreateResult.response, venta)
+        })),
+        ...(inventoryOutcome?.warning ? { warning: inventoryOutcome.warning } : {})
+      };
       await saveVentasIdempotencySuccess({
         client,
         reservation: idempotencyReservation,
@@ -10741,7 +10757,7 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
     }
     ventasPerf.add('detalle_pedido_insert_ms', detallePedidoInsertStart);
     ventasPerf.add('detalle_pedido_ms', detallePedidoStart);
-    await validarYDescontarInventarioCajaPedido({
+    const inventoryOutcome = await validarYDescontarInventarioCajaPedido({
       client,
       idPedido,
       idSucursal: venta.id_sucursal,
@@ -11036,22 +11052,25 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
       detalleFacturaRowsInserted: detalleFacturaResult.rows
     });
     await applyPedidoInitialOperationalRouting({ client, idPedido });
-    const createVentaResponse = await reconcileVentaResponseWithPersistedPedidoState({
-      client,
-      response: attachVentaSnapshotsToResponse(buildCreateVentaDetailResponse({
-        idFactura,
-        idPedido,
-        venta,
-        correlativoVenta,
-        fechaHoraPedido,
-        fechaHoraFacturacion,
-        facturacion: facturacionNormalizada,
-        context: createDetailContext,
-        items: createDetailItems,
-        fidelizacion: null,
-        cuentaDividida: cuentaDivididaResponse
-      }), venta)
-    });
+    const createVentaResponse = {
+      ...(await reconcileVentaResponseWithPersistedPedidoState({
+        client,
+        response: attachVentaSnapshotsToResponse(buildCreateVentaDetailResponse({
+          idFactura,
+          idPedido,
+          venta,
+          correlativoVenta,
+          fechaHoraPedido,
+          fechaHoraFacturacion,
+          facturacion: facturacionNormalizada,
+          context: createDetailContext,
+          items: createDetailItems,
+          fidelizacion: null,
+          cuentaDividida: cuentaDivididaResponse
+        }), venta)
+      })),
+      ...(inventoryOutcome?.warning ? { warning: inventoryOutcome.warning } : {})
+    };
     ventasPerf.add('ticket_response_build_ms', ticketResponseStart);
 
     await saveVentasIdempotencySuccess({
