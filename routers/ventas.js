@@ -125,7 +125,8 @@ import {
   saveExternalIdempotencyFailureIfNeeded,
   saveExternalIdempotencySuccessIfNeeded,
   shouldRunRpcPostCommitSideEffects,
-  shouldUsePedidoPendienteRpcV2
+  shouldUsePedidoPendienteRpcV2,
+  validatePedidoPendienteIdempotencyKeyHeader
 } from './ventas/services/ventasRpcRoutingService.js';
 import {
   DESCUENTO_ALCANCE_KEYS,
@@ -420,7 +421,9 @@ const reserveVentasIdempotencyKey = async ({
   operation,
   requestHash,
   idUsuario = null,
-  idSucursal = null
+  idSucursal = null,
+  idSesionCaja = null,
+  idPedido = null
 }) => {
   if (!idempotencyKey) return { enabled: false };
 
@@ -433,9 +436,11 @@ const reserveVentasIdempotencyKey = async ({
           request_hash,
           id_usuario,
           id_sucursal,
+          id_sesion_caja,
+          id_pedido,
           status
         )
-        VALUES ($1, $2, $3, $4, $5, 'IN_PROGRESS')
+        VALUES ($1, $2, $3, $4, $5, $6, $7, 'IN_PROGRESS')
         ON CONFLICT (idempotency_key) DO NOTHING
         RETURNING idempotency_key
       `,
@@ -444,7 +449,9 @@ const reserveVentasIdempotencyKey = async ({
         operation,
         requestHash,
         parseOptionalPositiveInt(idUsuario) || null,
-        parseOptionalPositiveInt(idSucursal) || null
+        parseOptionalPositiveInt(idSucursal) || null,
+        parseOptionalPositiveInt(idSesionCaja) || null,
+        parseOptionalPositiveInt(idPedido) || null
       ]
     );
 
@@ -460,7 +467,10 @@ const reserveVentasIdempotencyKey = async ({
           request_hash,
           status,
           http_status,
-          response_body
+          response_body,
+          id_usuario,
+          id_sucursal,
+          id_sesion_caja
         FROM public.ventas_idempotency_keys
         WHERE idempotency_key = $1
         LIMIT 1
@@ -475,6 +485,11 @@ const reserveVentasIdempotencyKey = async ({
 
     if (existing.operation !== operation || existing.request_hash !== requestHash) {
       return { enabled: true, conflict: true, code: 'IDEMPOTENCY_KEY_REUSED' };
+    }
+    const expectedScope = [idUsuario, idSucursal, idSesionCaja].map((value) => parseOptionalPositiveInt(value) || null);
+    const storedScope = [existing.id_usuario, existing.id_sucursal, existing.id_sesion_caja].map((value) => parseOptionalPositiveInt(value) || null);
+    if (expectedScope.some((value, index) => value !== null && value !== storedScope[index])) {
+      return { enabled: true, conflict: true, code: 'IDEMPOTENCY_SCOPE_MISMATCH' };
     }
     if (String(existing.status || '').trim().toUpperCase() === 'SUCCESS') {
       return {
@@ -495,18 +510,22 @@ const reserveVentasIdempotencyKey = async ({
           operation = $2,
           id_usuario = COALESCE($3, id_usuario),
           id_sucursal = COALESCE($4, id_sucursal),
+          id_sesion_caja = COALESCE($5, id_sesion_caja),
           status = 'IN_PROGRESS',
           http_status = NULL,
           response_body = NULL,
           error_code = NULL,
-          updated_at = now()
+          updated_at = now(),
+          id_pedido = COALESCE($6, id_pedido)
         WHERE idempotency_key = $1
       `,
       [
         idempotencyKey,
         operation,
         parseOptionalPositiveInt(idUsuario) || null,
-        parseOptionalPositiveInt(idSucursal) || null
+        parseOptionalPositiveInt(idSucursal) || null,
+        parseOptionalPositiveInt(idSesionCaja) || null,
+        parseOptionalPositiveInt(idPedido) || null
       ]
     );
     return { enabled: true, reserved: true, idempotencyKey, requestHash };
@@ -527,7 +546,8 @@ const saveVentasIdempotencySuccess = async ({
   idPedido = null,
   idFactura = null,
   idUsuario = null,
-  idSucursal = null
+  idSucursal = null,
+  idSesionCaja = null
 }) => {
   if ((!reservation?.reserved && !reservation?.rpcManaged) || !reservation?.idempotencyKey) return;
   await client.query(
@@ -541,6 +561,7 @@ const saveVentasIdempotencySuccess = async ({
         id_factura = COALESCE($5, id_factura),
         id_usuario = COALESCE($6, id_usuario),
         id_sucursal = COALESCE($7, id_sucursal),
+        id_sesion_caja = COALESCE($8, id_sesion_caja),
         error_code = NULL,
         updated_at = now()
       WHERE idempotency_key = $1
@@ -552,7 +573,8 @@ const saveVentasIdempotencySuccess = async ({
       parseOptionalPositiveInt(idPedido) || null,
       parseOptionalPositiveInt(idFactura) || null,
       parseOptionalPositiveInt(idUsuario) || null,
-      parseOptionalPositiveInt(idSucursal) || null
+      parseOptionalPositiveInt(idSucursal) || null,
+      parseOptionalPositiveInt(idSesionCaja) || null
     ]
   );
 };
@@ -8191,7 +8213,11 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
   const ventasPerf = createVentasPerfTracker();
   const pedidoPendienteRouteStart = ventasPerf.now();
   const pedidoPendienteRoute = 'POST /ventas/pedidos-pendientes';
-  const pedidoPendienteRpcV2Enabled = isPedidoPendienteRpcV2Enabled();
+  const pedidoPendienteRpcV2Configured = isPedidoPendienteRpcV2Enabled();
+  // La RPC v2 desplegada no tiene id_sesion_caja en la reserva idempotente.
+  // Se conserva el flag para observabilidad, pero se usa v1/legacy hasta que
+  // el contrato SQL sea session-aware mediante una fase de migracion separada.
+  const pedidoPendienteRpcV2Enabled = false;
   const pedidoPendienteRpcV1Enabled = isPedidoPendienteRpcV1Enabled();
   const pedidoPendienteRpcEnabled = pedidoPendienteRpcV2Enabled || pedidoPendienteRpcV1Enabled;
   const cuentaDivididaSolicitada = hasCuentaDivididaPayload(req.body);
@@ -8216,6 +8242,7 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
     id_sesion_caja: parseOptionalPositiveInt(req.body?.id_sesion_caja) || null,
     items_count: Array.isArray(req.body?.items) ? req.body.items.length : 0,
     rpc_enabled: pedidoPendienteRpcEnabled,
+    rpc_v2_configured: pedidoPendienteRpcV2Configured,
     rpc_version: pedidoPendienteRpcV2Enabled ? 'v2' : pedidoPendienteRpcV1Enabled ? 'v1' : 'legacy',
     cuenta_dividida: cuentaDivididaSolicitada
   };
@@ -8231,10 +8258,21 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
       ...extra
     };
   };
-  const idempotencyKey = getIdempotencyKey(req);
-  const idempotencyRequestHash = idempotencyKey
-    ? buildIdempotencyRequestHash(req.body)
-    : null;
+  const idempotencyValidation = validatePedidoPendienteIdempotencyKeyHeader(req.headers?.['idempotency-key']);
+  if (!idempotencyValidation.ok) {
+    addPedidoPendienteTotalRoute();
+    ventasPerf.log(buildPedidoPendientePerfLogContext({
+      status: 400,
+      error_code: idempotencyValidation.code
+    }));
+    return res.status(idempotencyValidation.status).json({
+      error: true,
+      code: idempotencyValidation.code,
+      message: idempotencyValidation.message
+    });
+  }
+  const idempotencyKey = idempotencyValidation.value;
+  const idempotencyRequestHash = buildIdempotencyRequestHash(req.body);
   const idempotencyMode = resolvePedidoPendienteIdempotencyMode({
     pedidoPendienteRpcV2Enabled,
     cuentaDivididaSolicitada,
@@ -8277,6 +8315,30 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
     ventasPerf.add('auth_scope_ms', contextoStart);
     ventasPerf.add('pedido_pendiente_scope_ms', contextoStart);
 
+    const buildStart = ventasPerf.now();
+    const prepared = await buildPedidoPendientePayload({
+      client,
+      body: req.body,
+      userId,
+      sucursalScope: scope,
+      canApplyDiscount,
+      canAuthorizeIncompleteComplementos,
+      perf: ventasPerf
+    });
+    ventasPerf.add('pedido_pendiente_build_ms', buildStart);
+
+    if (!prepared.ok) {
+      await client.query('ROLLBACK');
+      transactionStarted = false;
+      addPedidoPendienteTotalRoute();
+      ventasPerf.log(buildPedidoPendientePerfLogContext({
+        status: prepared.status,
+        error_code: prepared.body?.code || null
+      }));
+      return res.status(prepared.status).json(prepared.body);
+    }
+
+    const pedidoPendiente = prepared.data;
     const idempotencyStart = ventasPerf.now();
     try {
       idempotencyReservation = await reserveIdempotencyForMode({
@@ -8288,7 +8350,8 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
           operation: 'POST /ventas/pedidos-pendientes',
           requestHash: idempotencyRequestHash,
           idUsuario: userId,
-          idSucursal: req.body?.id_sucursal
+          idSucursal: pedidoPendiente.id_sucursal,
+          idSesionCaja: pedidoPendiente.id_sesion_caja
         }
       });
     } finally {
@@ -8329,40 +8392,7 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
       });
     }
 
-    const buildStart = ventasPerf.now();
-    const prepared = await buildPedidoPendientePayload({
-      client,
-      body: req.body,
-      userId,
-      sucursalScope: scope,
-      canApplyDiscount,
-      canAuthorizeIncompleteComplementos,
-      perf: ventasPerf
-    });
-    ventasPerf.add('pedido_pendiente_build_ms', buildStart);
-
-    if (!prepared.ok) {
-      await client.query('ROLLBACK');
-      transactionStarted = false;
-      await saveExternalIdempotencyFailureIfNeeded({
-        reservation: idempotencyReservation,
-        saveFailure: saveVentasIdempotencyFailure,
-        args: {
-          reservation: idempotencyReservation,
-          httpStatus: prepared.status,
-          errorCode: prepared.body?.code || null
-        }
-      });
-      addPedidoPendienteTotalRoute();
-      ventasPerf.log(buildPedidoPendientePerfLogContext({
-        status: prepared.status,
-        error_code: prepared.body?.code || null
-      }));
-      return res.status(prepared.status).json(prepared.body);
-    }
-
     const cuentaDivididaPlanStart = ventasPerf.now();
-    const pedidoPendiente = prepared.data;
     await attachSalsaInventorySnapshotsToLines({
       client,
       lines: pedidoPendiente.pedido_lines,
@@ -8421,7 +8451,8 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
         responseBody: reconciledRpcResponseBody,
         idPedido: reconciledRpcResponseBody.id_pedido,
         idUsuario: userId,
-        idSucursal: pedidoPendiente.id_sucursal
+        idSucursal: pedidoPendiente.id_sucursal,
+        idSesionCaja: pedidoPendiente.id_sesion_caja
       });
       const commitStart = ventasPerf.now();
       await client.query('COMMIT');
@@ -8476,7 +8507,8 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
           responseBody: reconciledRpcResponseBody,
           idPedido: reconciledRpcResponseBody.id_pedido,
           idUsuario: userId,
-          idSucursal: pedidoPendiente.id_sucursal
+          idSucursal: pedidoPendiente.id_sucursal,
+          idSesionCaja: pedidoPendiente.id_sesion_caja
         }
       });
       ventasPerf.add('pedido_pendiente_idempotency_success_ms', idempotencySuccessStart);
@@ -8824,7 +8856,8 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
         responseBody,
         idPedido,
         idUsuario: userId,
-        idSucursal: pedidoPendiente.id_sucursal
+        idSucursal: pedidoPendiente.id_sucursal,
+        idSesionCaja: pedidoPendiente.id_sesion_caja
       }
     });
     ventasPerf.add('pedido_pendiente_idempotency_success_ms', idempotencySuccessStart);
@@ -8878,9 +8911,96 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
     if (client) client.release();
   }
 });
+router.get('/ventas/idempotency-result', checkPermission(['VENTAS_CREAR']), async (req, res) => {
+  res.set('Cache-Control', 'private, no-store');
+  const validation = validatePedidoPendienteIdempotencyKeyHeader(req.headers?.['idempotency-key']);
+  if (!validation.ok) {
+    return res.status(400).json({ error: true, code: 'VENTAS_IDEMPOTENCY_KEY_INVALIDA', message: 'Idempotency-Key invalida.' });
+  }
+  const operation = String(req.query?.operation || '').trim();
+  const idSucursal = parseOptionalPositiveInt(req.query?.id_sucursal);
+  const idSesionCaja = parseOptionalPositiveInt(req.query?.id_sesion_caja);
+  const allowedOperations = new Set([
+    'POST /ventas',
+    'POST /ventas/pedidos-pendientes',
+    'POST /ventas/pedidos/:id/registrar-pago'
+  ]);
+  if (!allowedOperations.has(operation) || !idSucursal || !idSesionCaja) {
+    return res.status(400).json({ error: true, code: 'VENTAS_IDEMPOTENCY_SCOPE_INVALIDO', message: 'El scope de recuperacion es invalido.' });
+  }
+
+  const client = await pool.connect();
+  try {
+    const scope = await resolveRequestUserSucursalScope(req, client);
+    const idUsuario = parseOptionalPositiveInt(scope.idUsuario);
+    const session = await resolveCajaSession({
+      client,
+      idSucursal,
+      idUsuario,
+      idSesionCaja,
+      isSuperAdmin: Boolean(scope?.isSuperAdmin)
+    });
+    if (!idUsuario || !session.ok) return res.status(404).json({ status: 'NOT_FOUND' });
+
+    const result = await client.query(
+      `
+        SELECT vik.operation, vik.status, vik.http_status, vik.id_pedido, vik.id_factura,
+               vik.response_body
+        FROM public.ventas_idempotency_keys vik
+        LEFT JOIN public.facturas f ON f.id_factura = vik.id_factura
+        WHERE vik.idempotency_key = $1
+          AND vik.id_usuario = $2
+          AND vik.id_sucursal = $3
+          AND COALESCE(vik.id_sesion_caja, f.id_sesion_caja) = $4
+        LIMIT 1
+      `,
+      [validation.value, idUsuario, idSucursal, idSesionCaja]
+    );
+    const row = result.rows?.[0];
+    if (!row) return res.status(404).json({ status: 'NOT_FOUND' });
+    if (row.operation !== operation) return res.status(409).json({ status: 'CONFLICT' });
+    const storedStatus = String(row.status || '').trim().toUpperCase();
+    if (storedStatus === 'IN_PROGRESS') return res.json({ status: 'PROCESSING' });
+    if (storedStatus === 'FAILED') return res.json({ status: 'FAILED', http_status: row.http_status || null });
+    const body = isPlainObject(row.response_body) ? row.response_body : {};
+    return res.json({
+      status: 'SUCCESS',
+      id_pedido: parseOptionalPositiveInt(row.id_pedido ?? body.id_pedido) || null,
+      id_factura: parseOptionalPositiveInt(row.id_factura ?? body.id_factura) || null,
+      codigo_venta: normalizePedidoText(body.codigo_venta ?? body.numero_venta, 80),
+      http_status: Number(row.http_status || 200),
+      response_body: {
+        id_pedido: parseOptionalPositiveInt(body.id_pedido) || null,
+        id_factura: parseOptionalPositiveInt(body.id_factura) || null,
+        codigo_venta: normalizePedidoText(body.codigo_venta ?? body.numero_venta, 80),
+        estado_pago: normalizePedidoText(body.estado_pago, 40),
+        id_cuenta_division: parseOptionalPositiveInt(body.id_cuenta_division) || null,
+        monto_pagado: Number.isFinite(Number(body.monto_pagado)) ? Number(body.monto_pagado) : null,
+        monto_pendiente: Number.isFinite(Number(body.monto_pendiente)) ? Number(body.monto_pendiente) : null,
+        id_sesion_caja: parseOptionalPositiveInt(body.id_sesion_caja) || idSesionCaja
+      }
+    });
+  } catch (err) {
+    console.error('Error consultando resultado idempotente financiero:', { code: err?.code || null });
+    return res.status(500).json({ error: true, message: 'No se pudo consultar el resultado de la operacion.' });
+  } finally {
+    client.release();
+  }
+});
+
 router.post('/ventas/pedidos/:id/registrar-pago', checkPermission(['VENTAS_CREAR']), async (req, res) => {
   const ventasPerf = createVentasPerfTracker();
+  const idempotencyValidation = validatePedidoPendienteIdempotencyKeyHeader(req.headers?.['idempotency-key']);
+  if (!idempotencyValidation.ok) {
+    return res.status(400).json({
+      error: true,
+      code: 'VENTAS_PAGO_IDEMPOTENCY_KEY_INVALIDA',
+      message: 'Idempotency-Key es requerido y debe ser una cadena unica de hasta 200 caracteres.'
+    });
+  }
   const idPedido = parseOptionalPositiveInt(req.params.id);
+  const idempotencyKey = idempotencyValidation.value;
+  const idempotencyRequestHash = buildIdempotencyRequestHash({ id_pedido: idPedido, body: req.body });
   const idCuentaDivisionRequested = parseOptionalPositiveInt(req.body?.id_cuenta_division);
   const cuentaDivididaSolicitada = hasCuentaDivididaPayload(req.body);
   const cobrarDivisionOrdenRequested = parsePositiveInt(req.body?.cobrar_division_orden);
@@ -8924,10 +9044,72 @@ router.post('/ventas/pedidos/:id/registrar-pago', checkPermission(['VENTAS_CREAR
   const client = await pool.connect();
   ventasPerf.add('pool_wait_ms', poolWaitStart);
   instrumentVentasSqlClient(client, ventasPerf);
+  let idempotencyReservation = null;
 
   try {
+    const requestedSessionId = parseOptionalPositiveInt(req.body?.id_sesion_caja);
+    if (!requestedSessionId) {
+      return res.status(400).json({
+        error: true,
+        code: 'VENTAS_PAGO_SESION_CAJA_REQUERIDA',
+        message: 'id_sesion_caja es requerido para registrar el pago.'
+      });
+    }
+    const preScope = await resolveRequestUserSucursalScope(req, client);
+    const preUserId = parseOptionalPositiveInt(preScope.idUsuario);
+    const sessionBranchResult = await client.query(
+      `SELECT c.id_sucursal
+       FROM public.cajas_sesiones cs
+       INNER JOIN public.cajas c ON c.id_caja = cs.id_caja
+       WHERE cs.id_sesion_caja = $1
+       LIMIT 1`,
+      [requestedSessionId]
+    );
+    const preSucursalId = parseOptionalPositiveInt(sessionBranchResult.rows?.[0]?.id_sucursal);
+    const preSession = await resolveCajaSession({
+      client,
+      idSucursal: preSucursalId,
+      idUsuario: preUserId,
+      idSesionCaja: requestedSessionId,
+      isSuperAdmin: Boolean(preScope?.isSuperAdmin)
+    });
+    if (!preUserId || !preSucursalId || !preSession.ok) {
+      return res.status(409).json({
+        error: true,
+        code: preSession.reason || 'NO_ACTIVE_SESSION',
+        message: 'La sesion de caja no es valida para registrar este pago.'
+      });
+    }
     const transactionStart = ventasPerf.now();
     await client.query('BEGIN');
+
+    idempotencyReservation = await reserveVentasIdempotencyKey({
+      client,
+      idempotencyKey,
+      operation: 'POST /ventas/pedidos/:id/registrar-pago',
+      requestHash: idempotencyRequestHash,
+      idUsuario: preUserId,
+      idSucursal: preSucursalId,
+      idSesionCaja: requestedSessionId,
+      idPedido
+    });
+    if (idempotencyReservation.replay) {
+      await client.query('ROLLBACK');
+      return res.status(idempotencyReservation.httpStatus || 200).json({
+        ...idempotencyReservation.responseBody,
+        idempotent_replay: true
+      });
+    }
+    if (idempotencyReservation.conflict) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({
+        error: true,
+        code: idempotencyReservation.code,
+        message: idempotencyReservation.code === 'REQUEST_ALREADY_IN_PROGRESS'
+          ? 'El pago con esta clave sigue en proceso.'
+          : 'Idempotency-Key ya fue usado con otro pago o scope.'
+      });
+    }
 
     const contextoStart = ventasPerf.now();
     const contextoBaseResult = await client.query(
@@ -9480,7 +9662,7 @@ router.post('/ventas/pedidos/:id/registrar-pago', checkPermission(['VENTAS_CREAR
     ventasPerfContext.items_count = detallePedidoRowsFacturar.length;
 
     const scopeSessionStart = ventasPerf.now();
-    const scope = await resolveRequestUserSucursalScope(req, client);
+    const scope = preScope;
     const userId = parseOptionalPositiveInt(scope.idUsuario);
     ventasPerfContext.id_usuario = userId || null;
     if (!userId) {
@@ -9820,11 +10002,7 @@ router.post('/ventas/pedidos/:id/registrar-pago', checkPermission(['VENTAS_CREAR
     }
 
     const commitStart = ventasPerf.now();
-    await client.query('COMMIT');
-    ventasPerf.add('commit_ms', commitStart);
-    ventasPerf.log({ ...ventasPerfContext, status: 201 });
-
-    res.status(201).json({
+    const paymentResponseBody = {
       message: 'Pago registrado correctamente.',
       id_pedido: idPedido,
       id_factura: idFactura,
@@ -9838,7 +10016,24 @@ router.post('/ventas/pedidos/:id/registrar-pago', checkPermission(['VENTAS_CREAR
       id_sesion_caja: Number(sessionActiva.data.id_sesion_caja),
       metodo_pago: String(metodoPago.codigo || metodoPago.nombre || '').toUpperCase(),
       fidelizacion: null
+    };
+    await saveVentasIdempotencySuccess({
+      client,
+      reservation: idempotencyReservation,
+      httpStatus: 201,
+      responseBody: paymentResponseBody,
+      idPedido,
+      idFactura,
+      idUsuario: userId,
+      idSucursal: idSucursalPedido,
+      idSesionCaja: sessionActiva.data.id_sesion_caja
     });
+
+    await client.query('COMMIT');
+    ventasPerf.add('commit_ms', commitStart);
+    ventasPerf.log({ ...ventasPerfContext, status: 201 });
+
+    res.status(201).json(paymentResponseBody);
 
     if (pedidoPagadoCompleto) {
       void notifyPaidInvoice({ idFactura }).catch(() => undefined);
@@ -9872,13 +10067,25 @@ router.post('/ventas/pedidos/:id/registrar-pago', checkPermission(['VENTAS_CREAR
 });
 
 router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
+  const ventaIdempotencyValidation = validatePedidoPendienteIdempotencyKeyHeader(req.headers?.['idempotency-key']);
+  if (!ventaIdempotencyValidation.ok) {
+    return res.status(400).json({
+      error: true,
+      code: 'VENTAS_IDEMPOTENCY_KEY_INVALIDA',
+      message: 'Idempotency-Key es requerido y debe ser una cadena unica de hasta 200 caracteres.'
+    });
+  }
   const ventasPerf = createVentasPerfTracker();
   logVentasPerfRoute('POST /ventas', {
     items_count: Array.isArray(req.body?.items) ? req.body.items.length : 0,
     has_pedido_pendiente: false
   });
   const cuentaDivididaSolicitada = hasCuentaDivididaPayload(req.body);
-  const ventasRpcV3Enabled = !cuentaDivididaSolicitada && isVentasRpcV3Enabled();
+  const ventasRpcV3Configured = !cuentaDivididaSolicitada && isVentasRpcV3Enabled();
+  // La RPC v3 desplegada no propaga id_sesion_caja a idempotencia. Se usa el
+  // camino v2/v1 con reserva externa hasta una migracion SQL expresamente
+  // autorizada en otra fase.
+  const ventasRpcV3Enabled = false;
   const ventasRpcV2Enabled = !cuentaDivididaSolicitada && isVentasRpcV2Enabled();
   const ventasRpcV1Enabled = !cuentaDivididaSolicitada && isVentasRpcTransactionEnabled();
   const ventasPerfContext = {
@@ -9889,13 +10096,12 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
     items_count: Array.isArray(req.body?.items) ? req.body.items.length : 0,
     rpc_enabled: ventasRpcV3Enabled || ventasRpcV2Enabled || ventasRpcV1Enabled,
     rpc_v3_enabled: ventasRpcV3Enabled,
+    rpc_v3_configured: ventasRpcV3Configured,
     rpc_v2_enabled: ventasRpcV2Enabled,
     rpc_version: ventasRpcV3Enabled ? 'v3' : ventasRpcV2Enabled ? 'v2' : ventasRpcV1Enabled ? 'v1' : 'legacy'
   };
-  const idempotencyKey = getIdempotencyKey(req);
-  const idempotencyRequestHash = idempotencyKey
-    ? buildIdempotencyRequestHash(req.body)
-    : null;
+  const idempotencyKey = ventaIdempotencyValidation.value;
+  const idempotencyRequestHash = buildIdempotencyRequestHash(req.body);
   const idempotencyMode = resolveVentaIdempotencyMode({
     ventasRpcV3Enabled,
     idempotencyKey
@@ -9943,56 +10149,6 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
     const userId = parseOptionalPositiveInt(scope.idUsuario);
     ventasPerfContext.id_usuario = userId || null;
     ventasPerf.add('auth_context_ms', authContextStart);
-
-    idempotencyReservation = await reserveIdempotencyForMode({
-      mode: idempotencyMode,
-      idempotencyKey,
-      reserveExternal: reserveVentasIdempotencyKey,
-      reserveArgs: {
-        client,
-        idempotencyKey,
-        operation: 'POST /ventas',
-        requestHash: idempotencyRequestHash,
-        idUsuario: userId,
-        idSucursal: req.body?.id_sucursal
-      }
-    });
-    if (idempotencyReservation.replay) {
-      await client.query('ROLLBACK');
-      transactionStarted = false;
-      await applyPedidoReplayOperationalRouting({
-        client,
-        idPedido: idempotencyReservation.responseBody?.id_pedido
-      });
-      const replayResponse = await reconcileVentaResponseWithPersistedPedidoState({
-        client,
-        response: idempotencyReservation.responseBody
-      });
-      ventasPerf.log({
-        ...ventasPerfContext,
-        status: idempotencyReservation.httpStatus || 200
-      });
-      return res.status(idempotencyReservation.httpStatus || 200).json({
-        ...replayResponse,
-        idempotent_replay: true
-      });
-    }
-    if (idempotencyReservation.conflict) {
-      await client.query('ROLLBACK');
-      transactionStarted = false;
-      ventasPerf.log({
-        ...ventasPerfContext,
-        status: 409,
-        error_code: idempotencyReservation.code
-      });
-      return res.status(409).json({
-        error: true,
-        code: idempotencyReservation.code,
-        message: idempotencyReservation.code === 'IDEMPOTENCY_KEY_REUSED'
-          ? 'Idempotency-Key ya fue usado con otro payload.'
-          : 'La solicitud ya esta en proceso.'
-      });
-    }
 
     const prepared = await buildVentaPayload({
       client,
@@ -10084,6 +10240,56 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
     venta.id_caja = Number(validatedCajaSession.id_caja);
     venta.id_sesion_caja = Number(validatedCajaSession.id_sesion_caja);
     venta.id_sucursal = Number(validatedCajaSession.id_sucursal);
+    idempotencyReservation = await reserveIdempotencyForMode({
+      mode: idempotencyMode,
+      idempotencyKey,
+      reserveExternal: reserveVentasIdempotencyKey,
+      reserveArgs: {
+        client,
+        idempotencyKey,
+        operation: 'POST /ventas',
+        requestHash: idempotencyRequestHash,
+        idUsuario: parseOptionalPositiveInt(venta.id_usuario) || userId,
+        idSucursal: venta.id_sucursal,
+        idSesionCaja: venta.id_sesion_caja
+      }
+    });
+    if (idempotencyReservation.replay) {
+      await client.query('ROLLBACK');
+      transactionStarted = false;
+      await applyPedidoReplayOperationalRouting({
+        client,
+        idPedido: idempotencyReservation.responseBody?.id_pedido
+      });
+      const replayResponse = await reconcileVentaResponseWithPersistedPedidoState({
+        client,
+        response: idempotencyReservation.responseBody
+      });
+      ventasPerf.log({
+        ...ventasPerfContext,
+        status: idempotencyReservation.httpStatus || 200
+      });
+      return res.status(idempotencyReservation.httpStatus || 200).json({
+        ...replayResponse,
+        idempotent_replay: true
+      });
+    }
+    if (idempotencyReservation.conflict) {
+      await client.query('ROLLBACK');
+      transactionStarted = false;
+      ventasPerf.log({
+        ...ventasPerfContext,
+        status: 409,
+        error_code: idempotencyReservation.code
+      });
+      return res.status(409).json({
+        error: true,
+        code: idempotencyReservation.code,
+        message: idempotencyReservation.code === 'IDEMPOTENCY_KEY_REUSED'
+          ? 'Idempotency-Key ya fue usado con otro payload.'
+          : 'La solicitud ya esta en proceso.'
+      });
+    }
     const ventaHasExtras = hasVentaExtras(venta);
     const ventaHasSalsasInventario = getSelectedSalsaIdsFromLines(venta.all_lines).length > 0;
     if (ventasRpcV3Enabled) {
@@ -10151,7 +10357,8 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
         idPedido: idPedidoRpc,
         idFactura: rpcCreateResult.response?.id_factura,
         idUsuario: userId,
-        idSucursal: venta.id_sucursal
+        idSucursal: venta.id_sucursal,
+        idSesionCaja: venta.id_sesion_caja
       });
       // Reserva durable de fidelizacion antes del COMMIT, con el mismo guard
       // que la notificacion post-COMMIT (un replay idempotente no reserva).
@@ -10224,7 +10431,8 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
         idPedido: idPedidoRpc,
         idFactura: rpcCreateResult.response?.id_factura,
         idUsuario: userId,
-        idSucursal: venta.id_sucursal
+        idSucursal: venta.id_sucursal,
+        idSesionCaja: venta.id_sesion_caja
       });
 
       // Reserva durable de fidelizacion antes del COMMIT (SAVEPOINT propio:
@@ -10287,7 +10495,8 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
         idPedido: rpcCreateResult.response?.id_pedido,
         idFactura: rpcCreateResult.response?.id_factura,
         idUsuario: userId,
-        idSucursal: venta.id_sucursal
+        idSucursal: venta.id_sucursal,
+        idSesionCaja: venta.id_sesion_caja
       });
 
       // Reserva durable de fidelizacion antes del COMMIT (SAVEPOINT propio:
@@ -10843,7 +11052,8 @@ router.post('/ventas', checkPermission(['VENTAS_CREAR']), async (req, res) => {
       idPedido,
       idFactura,
       idUsuario: venta.id_usuario || userId,
-      idSucursal: venta.id_sucursal
+      idSucursal: venta.id_sucursal,
+      idSesionCaja: venta.id_sesion_caja
     });
 
     // Reserva durable de fidelizacion antes del COMMIT (SAVEPOINT propio:

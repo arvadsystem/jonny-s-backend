@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
+import fs from 'node:fs';
 import {
   IDEMPOTENCY_MODE,
   hasCuentaDivididaPayload,
@@ -8,7 +9,8 @@ import {
   saveExternalIdempotencyFailureIfNeeded,
   saveExternalIdempotencySuccessIfNeeded,
   shouldRunRpcPostCommitSideEffects,
-  shouldUsePedidoPendienteRpcV2
+  shouldUsePedidoPendienteRpcV2,
+  validatePedidoPendienteIdempotencyKeyHeader
 } from '../services/ventasRpcRoutingService.js';
 
 const createCalls = () => ({
@@ -23,12 +25,66 @@ const createCalls = () => ({
 });
 
 describe('pedido pendiente RPC idempotency selection', () => {
-  it('selecciona rpc-managed solo para V2 sin cuenta dividida', () => {
+  it('exige una Idempotency-Key escalar, no vacia y acotada', () => {
+    for (const missing of [undefined, null, '', '   ']) {
+      assert.deepEqual(validatePedidoPendienteIdempotencyKeyHeader(missing), {
+        ok: false,
+        status: 400,
+        code: 'VENTAS_PEDIDO_IDEMPOTENCY_KEY_REQUERIDA',
+        message: 'Idempotency-Key es requerido para crear el pedido.'
+      });
+    }
+    for (const invalid of [['duplicada'], 'idem-a, idem-b', 'x'.repeat(201)]) {
+      const validation = validatePedidoPendienteIdempotencyKeyHeader(invalid);
+      assert.equal(validation.status, 400);
+      assert.equal(validation.code, 'VENTAS_PEDIDO_IDEMPOTENCY_KEY_INVALIDA');
+    }
+    assert.deepEqual(validatePedidoPendienteIdempotencyKeyHeader(' idem-1 '), {
+      ok: true,
+      value: 'idem-1'
+    });
+  });
+
+  it('la ruta exige la clave y conserva reserva atomica, replay y conflicto por hash', () => {
+    const source = fs.readFileSync(new URL('../../ventas.js', import.meta.url), 'utf8');
+    const routeStart = source.indexOf("router.post('/ventas/pedidos-pendientes'");
+    const routeEnd = source.indexOf("router.post('/ventas/pedidos/:id/registrar-pago'", routeStart);
+    const route = source.slice(routeStart, routeEnd);
+    assert.match(route, /validatePedidoPendienteIdempotencyKeyHeader/);
+    assert.match(route, /idempotencyValidation\.code/);
+    assert.match(route, /res\.status\(idempotencyValidation\.status\)/);
+    assert.match(route, /buildIdempotencyRequestHash\(req\.body\)/);
+    assert.match(route, /idempotencyReservation\.replay/);
+    assert.match(route, /idempotencyReservation\.conflict/);
+    assert.match(source, /INSERT INTO public\.ventas_idempotency_keys[\s\S]*?ON CONFLICT \(idempotency_key\) DO NOTHING/);
+    assert.match(source, /WHERE idempotency_key = \$1[\s\S]*?FOR UPDATE/);
+    assert.match(source, /existing\.request_hash !== requestHash/);
+    assert.ok(route.indexOf('validatePedidoPendienteIdempotencyKeyHeader') < route.indexOf('pool.connect()'));
+    assert.ok(route.indexOf('validatePedidoPendienteIdempotencyKeyHeader') < route.indexOf("client.query('BEGIN')"));
+    assert.ok(route.indexOf('validatePedidoPendienteIdempotencyKeyHeader') < route.indexOf('resolvePedidoPendienteIdempotencyMode'));
+  });
+
+  it('dos reservas concurrentes simuladas con la misma clave dejan un solo ganador', async () => {
+    let reserved = false;
+    const reserveExternal = async () => {
+      if (reserved) return { conflict: true, code: 'REQUEST_ALREADY_IN_PROGRESS' };
+      reserved = true;
+      return { reserved: true, idempotencyKey: 'idem-concurrente' };
+    };
+    const [first, second] = await Promise.all([
+      reserveIdempotencyForMode({ mode: IDEMPOTENCY_MODE.EXTERNAL, reserveExternal }),
+      reserveIdempotencyForMode({ mode: IDEMPOTENCY_MODE.EXTERNAL, reserveExternal })
+    ]);
+    assert.equal([first, second].filter((result) => result.reserved).length, 1);
+    assert.equal([first, second].filter((result) => result.conflict).length, 1);
+  });
+
+  it('mantiene reserva externa mientras V2 no propague la sesion de caja', () => {
     assert.equal(resolvePedidoPendienteIdempotencyMode({
       pedidoPendienteRpcV2Enabled: true,
       cuentaDivididaSolicitada: false,
       idempotencyKey: 'idem-1'
-    }), IDEMPOTENCY_MODE.RPC);
+    }), IDEMPOTENCY_MODE.EXTERNAL);
   });
 
   it('selecciona externa para V2 con cuenta dividida', () => {
