@@ -11,6 +11,7 @@ import {
   resolveOriginalSessionFromCobros,
   lockAndValidateOriginalCajaSession
 } from '../routers/ventas/services/ventasReversionSessionService.js';
+import { resolveReversionIdempotencyGate } from '../routers/ventas/services/ventasReversionIdempotencyGateService.js';
 import {
   buildReversionPaymentAllocation,
   resolvePreviouslyReversedAmountForUpdate
@@ -390,10 +391,7 @@ export const createVentaReversion = async ({ idFactura, body, req, idUsuario, id
     const idSucursal = Number(factura.id_sucursal || 0);
     assertSucursalAllowedForReversion(scope, idSucursal, 'crear');
 
-    // 3) bloquear detalles de factura
-    const facturaLines = await resolveFacturaLinesForUpdate(client, facturaId);
-
-    // 4) bloquear cobros + 5) resolver sesion original (facturas_cobros, no
+    // 3) bloquear cobros + resolver sesion original (facturas_cobros, no
     // facturas.id_sesion_caja)
     const resolvedSession = await resolveOriginalSessionFromCobros({
       client,
@@ -401,25 +399,26 @@ export const createVentaReversion = async ({ idFactura, body, req, idUsuario, id
       facturaIdSesionCaja: factura.id_sesion_caja
     });
 
-    // 6) bloquear sesion de caja original y validar que siga ABIERTA
-    const sessionContext = await lockAndValidateOriginalCajaSession({
+    // El replay SUCCESS se resuelve antes de validar el estado ACTUAL de la
+    // sesion. Para una key nueva, la reserva y la validacion permanecen en la
+    // misma transaccion: una sesion cerrada provoca ROLLBACK de la reserva.
+    const idempotencyGate = await resolveReversionIdempotencyGate({
       client,
+      idempotency,
+      idFactura: facturaId,
+      idSucursal,
       idSesionCaja: resolvedSession.id_sesion_caja,
-      idSucursal
+      validateSession: lockAndValidateOriginalCajaSession
     });
-
-    // Se reserva con el alcance financiero resuelto por backend.
-    if (typeof idempotency?.reserve === 'function') {
-      idempotencyReservation = await idempotency.reserve(client, {
-        idFactura: facturaId,
-        idSucursal,
-        idSesionCaja: sessionContext.id_sesion_caja
-      });
-      if (idempotencyReservation?.replay || idempotencyReservation?.conflict) {
-        await client.query('COMMIT');
-        return { idempotency: idempotencyReservation };
-      }
+    idempotencyReservation = idempotencyGate.reservation;
+    if (idempotencyGate.terminal) {
+      await client.query('COMMIT');
+      return { idempotency: idempotencyReservation };
     }
+    const sessionContext = idempotencyGate.sessionContext;
+
+    // 4) Solo una operacion nueva bloquea detalles y continua con efectos.
+    const facturaLines = await resolveFacturaLinesForUpdate(client, facturaId);
 
     // 7) bloquear pedido + validar elegibilidad de Cocina (venta directa
     // sin pedido: no hay nada que validar, se permite)

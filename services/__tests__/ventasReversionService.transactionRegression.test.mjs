@@ -12,6 +12,7 @@ import { resolve } from 'node:path';
 
 const source = readFileSync(resolve('services/ventasReversionService.js'), 'utf8');
 const routerSource = readFileSync(resolve('routers/ventas.js'), 'utf8');
+const gateSource = readFileSync(resolve('routers/ventas/services/ventasReversionIdempotencyGateService.js'), 'utf8');
 
 describe('createVentaReversion — regresion estructural Fase 2', () => {
   it('6) elimina por completo la ventana de 1 hora (declaracion, uso ejecutable y codigo de error)', () => {
@@ -77,18 +78,32 @@ describe('createVentaReversion — regresion estructural Fase 2', () => {
     assert.doesNotMatch(source, /idTipoMovimientoCaja,[\s\S]{0,80}\buserId,[\s\S]{0,80}\bmontoReversado,/);
   });
 
-  it('reserva idempotencia despues de resolver la sesion original y antes de cualquier INSERT', () => {
-    const sessionIndex = source.indexOf('lockAndValidateOriginalCajaSession({', source.indexOf('export const createVentaReversion'));
-    const reserveIndex = source.indexOf('idempotency.reserve(client, {', sessionIndex);
-    const headerIndex = source.indexOf('INSERT INTO public.facturas_reversiones (', reserveIndex);
-    assert.ok(sessionIndex >= 0 && sessionIndex < reserveIndex && reserveIndex < headerIndex);
-    assert.match(source.slice(reserveIndex, headerIndex), /idFactura: facturaId[\s\S]*idSucursal[\s\S]*idSesionCaja/);
+  it('resuelve factura/cobros/scope antes de idempotencia y valida sesion solo despues de descartar replay/conflicto', () => {
+    const createStart = source.indexOf('export const createVentaReversion');
+    const cobrosIndex = source.indexOf('resolveOriginalSessionFromCobros({', createStart);
+    const gateIndex = source.indexOf('resolveReversionIdempotencyGate({', cobrosIndex);
+    const detailsIndex = source.indexOf('resolveFacturaLinesForUpdate(client, facturaId)', gateIndex);
+    assert.ok(cobrosIndex >= 0 && cobrosIndex < gateIndex && gateIndex < detailsIndex);
+    assert.match(source.slice(gateIndex, detailsIndex), /idFactura: facturaId[\s\S]*idSucursal[\s\S]*idSesionCaja: resolvedSession\.id_sesion_caja/);
+
+    const reserveIndex = gateSource.indexOf('idempotency.reserve(client, {');
+    const terminalIndex = gateSource.indexOf('reservation?.replay || reservation?.conflict', reserveIndex);
+    const validateIndex = gateSource.indexOf('validateSession({', terminalIndex);
+    assert.ok(reserveIndex >= 0 && reserveIndex < terminalIndex && terminalIndex < validateIndex);
   });
 
-  it('replay retorna antes de cabecera, movimiento, inventario e impresion', () => {
-    const replayIndex = source.indexOf('idempotencyReservation?.replay');
-    assert.ok(replayIndex < source.indexOf('INSERT INTO public.facturas_reversiones ('));
-    assert.ok(replayIndex < source.indexOf('enqueueAutomaticVentaReversionPrintJob({'));
+  it('replay retorna antes de detalles, cabecera, Caja, inventario, fidelizacion e impresion', () => {
+    const replayIndex = source.indexOf('if (idempotencyGate.terminal)');
+    for (const marker of [
+      'resolveFacturaLinesForUpdate(client, facturaId)',
+      'INSERT INTO public.facturas_reversiones (',
+      'INSERT INTO public.cajas_movimientos (',
+      'returnInventoryForReversionLines({',
+      'applyLoyaltyReversalForFactura({',
+      'enqueueAutomaticVentaReversionPrintJob({'
+    ]) {
+      assert.ok(replayIndex >= 0 && replayIndex < source.indexOf(marker), `replay debe anteceder ${marker}`);
+    }
   });
 
   it('un fallo intermedio conserva ROLLBACK y el exito idempotente ocurre antes de COMMIT', () => {
@@ -97,6 +112,14 @@ describe('createVentaReversion — regresion estructural Fase 2', () => {
     const commitIndex = source.indexOf("client.query('COMMIT')", saveIndex);
     assert.ok(rollbackIndex >= 0);
     assert.ok(saveIndex >= 0 && saveIndex < commitIndex);
+  });
+
+  it('una reserva nueva y la validacion de sesion comparten la transaccion; sesion cerrada cae al ROLLBACK', () => {
+    const beginIndex = source.indexOf("client.query('BEGIN')");
+    const gateIndex = source.indexOf('resolveReversionIdempotencyGate({', beginIndex);
+    const rollbackIndex = source.indexOf("client.query('ROLLBACK')", gateIndex);
+    assert.ok(beginIndex >= 0 && beginIndex < gateIndex && gateIndex < rollbackIndex);
+    assert.match(source.slice(gateIndex, gateIndex + 500), /validateSession: lockAndValidateOriginalCajaSession/);
   });
 
   it('22) resuelve CANCELADO y PAGO_ANULADO solo cuando la factura queda totalmente reversada, y solo si tiene pedido', () => {
