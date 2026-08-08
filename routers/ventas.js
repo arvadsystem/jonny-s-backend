@@ -3859,9 +3859,9 @@ const normalizePedidoText = (value, maxLength = 200) => {
   return normalized ? normalized.slice(0, maxLength) : null;
 };
 
-const normalizeTelefonoDigits = (value) => {
+const normalizeTelefonoDigits = (value, maxLength = 30) => {
   const digits = String(value ?? '').replace(/\D/g, '');
-  return digits || null;
+  return digits ? digits.slice(0, maxLength) : null;
 };
 
 const buildPedidoPendienteItemsBody = (body) => {
@@ -3951,7 +3951,7 @@ const buildPedidoPendientePayload = async ({ client, body, userId, sucursalScope
 
   const nombreContacto = normalizePedidoText(contacto.nombre_contacto, 120);
   const telefonoContacto = normalizePedidoText(contacto.telefono_contacto, 40);
-  const telefonoNormalizado = normalizeTelefonoDigits(contacto.telefono_contacto);
+  const telefonoNormalizado = normalizeTelefonoDigits(telefonoContacto, 30);
 
   const pagoPendiente = isPlainObject(body.pago_pendiente) ? body.pago_pendiente : {};
   const motivoPagoPendiente = normalizePedidoCatalogCode(pagoPendiente.motivo);
@@ -4149,9 +4149,12 @@ const buildPedidoPendientePayload = async ({ client, body, userId, sucursalScope
       delivery,
       descripcion_pedido: buildKitchenDescriptionSummary(finalizedLines, contexto.observacion_contexto),
       descripcion_envio: modalidad === 'DELIVERY'
-        ? [delivery.direccion_entrega, delivery.referencia_entrega ? `Ref: ${delivery.referencia_entrega}` : null]
-          .filter(Boolean)
-          .join(' | ') || null
+        ? normalizePedidoText(
+            [delivery.direccion_entrega, delivery.referencia_entrega ? `Ref: ${delivery.referencia_entrega}` : null]
+              .filter(Boolean)
+              .join(' | '),
+            250
+          )
         : modalidad,
       pedido_lines: finalizedLines,
       subtotal_bruto: subtotalBruto,
@@ -8897,13 +8900,21 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
       });
       transactionStarted = false;
     }
+    const originalPgErrorCode = err?.code || null;
+    if (originalPgErrorCode === '22001' && !Number.isInteger(err.httpStatus)) {
+      // Postgres 22001 = valor excede el limite de la columna. El INSERT no persistio nada
+      // (rollback ya ejecutado arriba), asi que es un rechazo definitivo, no un resultado ambiguo.
+      err.httpStatus = 422;
+      err.code = 'PEDIDO_PENDIENTE_CAMPO_EXCEDE_LONGITUD';
+      err.publicMessage = 'Uno de los campos del pedido excede la longitud permitida. Revisa los datos de contacto, entrega u observaciones.';
+    }
     await saveExternalIdempotencyFailureIfNeeded({
       reservation: idempotencyReservation,
       saveFailure: saveVentasIdempotencyFailure,
       args: {
         reservation: idempotencyReservation,
         httpStatus: Number.isInteger(err?.httpStatus) ? err.httpStatus : 500,
-        errorCode: err?.code || null
+        errorCode: originalPgErrorCode
       }
     }).catch((idempotencyErr) => {
       console.error('No se pudo marcar fallo idempotente de pedido pendiente:', idempotencyErr);
