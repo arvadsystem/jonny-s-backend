@@ -14,12 +14,36 @@ export const SHORTAGE_MOVEMENT_REF = 'FALTANTE_COCINA';
 const VALID_CONSUMPTION_ORIGINS = new Set(['PRODUCTO', 'RECETA', 'EXTRA', 'SALSA']);
 const VALID_INSUMO_CONSUMPTION_ORIGINS = new Set(['RECETA', 'EXTRA', 'SALSA']);
 
+// public.movimientos_inventario.descripcion es varchar(150). Es un resumen de
+// auditoria derivado -- la trazabilidad estructurada real vive en columnas propias
+// (id_producto/id_insumo/id_detalle_pedido/origen_consumo/ref_origen/id_ref/
+// id_pedido_trazabilidad/cantidad). Este limite NUNCA debe romper una venta.
+const MOVEMENT_DESCRIPTION_MAX_LENGTH = 150;
+// Referencia de precision: el esquema ya trabaja con numeric(18,6) para cantidades.
+const AUDIT_NUMBER_DECIMALS = 6;
+
 const createInventoryTraceError = (code, message, details = null) => {
   const error = new Error(message);
   error.httpStatus = 409;
   error.code = code;
   if (details) error.details = details;
   return error;
+};
+
+// Normaliza UNICAMENTE la representacion textual de un numero de auditoria (shortage
+// requerido/disponible/faltante). Nunca se usa para el valor real que descuenta
+// inventario (`movement.cantidad`), que sigue viniendo de normalizeTraceQuantity/la
+// logica de consumo existente sin pasar por aqui.
+//
+// Redondea a 6 decimales (numeric(18,6) es la referencia del esquema) para eliminar
+// ruido de punto flotante (0.30000000000000004 -> 0.300000) y despues usa la
+// conversion numero->string de JS, que ya elimina ceros finales innecesarios
+// (0.300000 -> 0.3) sin notacion cientifica en el rango de valores de inventario.
+export const formatAuditQty = (value) => {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return '0';
+  const fixed = Number(numeric.toFixed(AUDIT_NUMBER_DECIMALS));
+  return String(fixed);
 };
 
 export const normalizeOrigenConsumo = (value) => {
@@ -73,6 +97,19 @@ export const fetchExistingPedidoMovement = async (client, idPedido) => {
   return rs.rows[0]?.id_movimiento ? Number(rs.rows[0].id_movimiento) : null;
 };
 
+// Defensa en profundidad en el limite del INSERT: buildInventoryMovementDescription
+// ya garantiza <=150 por construccion (ver arriba), asi que esto nunca deberia
+// activarse. Se conserva como red de seguridad final (no como mecanismo principal)
+// por si algun futuro caller de insertMovimientosBatch construye `descripcion` sin
+// pasar por ese helper.
+const clampMovementDescriptionForInsert = (rawDescripcion) => {
+  const trimmed = String(rawDescripcion || '').trim();
+  if (!trimmed) return null;
+  return trimmed.length > MOVEMENT_DESCRIPTION_MAX_LENGTH
+    ? trimmed.slice(0, MOVEMENT_DESCRIPTION_MAX_LENGTH)
+    : trimmed;
+};
+
 const insertMovimientosBatch = async (client, movements) => {
   const rows = Array.isArray(movements) ? movements : [];
   if (!rows.length) return 0;
@@ -89,7 +126,7 @@ const insertMovimientosBatch = async (client, movements) => {
       movement.ref_origen || MOVEMENT_REF,
       Number(movement.id_ref),
       Number(movement.id_pedido_trazabilidad),
-      String(movement.descripcion || '').trim() || null
+      clampMovementDescriptionForInsert(movement.descripcion)
     );
     return `('SALIDA', $${offset + 1}, $${offset + 2}, $${offset + 3}, $${offset + 4}, $${offset + 5}, $${offset + 6}, $${offset + 7}, $${offset + 8}, $${offset + 9}, $${offset + 10})`;
   }).join(', ');
@@ -141,6 +178,64 @@ const addMergedMovementRow = (target, movement) => {
     return;
   }
   existing.cantidad = Number(existing.cantidad || 0) + Number(movement.cantidad || 0);
+};
+
+const buildShortageAuditSegment = (shortage) => (
+  shortage
+    ? `req:${formatAuditQty(shortage.requerido)} disp:${formatAuditQty(shortage.disponible)} def:${formatAuditQty(shortage.faltante)}`
+    : ''
+);
+
+const joinDescriptionSegments = (segments, separator) => segments.filter(Boolean).join(separator);
+
+// Construye la descripcion de auditoria de un movimiento de inventario, garantizando
+// por construccion que nunca exceda MOVEMENT_DESCRIPTION_MAX_LENGTH (150, el limite
+// real de la columna). El formato compacto por defecto ya conserva id_pedido,
+// id_detalle_pedido, tipo de recurso + su id, origen_consumo (para insumo), usuario y
+// el shortage completo (requerido/disponible/faltante) cuando existe. Si ese formato
+// completo excediera el limite (numeros/IDs extremos), se reduce de forma semantica y
+// deterministica -- separadores mas densos, luego se omite lo mas decorativo primero
+// (origen_consumo, despues usuario) -- nunca recortando IDs ni valores esenciales a la
+// mitad. La red de seguridad final (recorte) es defensiva y, dado el presupuesto de
+// caracteres de estos campos, no deberia alcanzarse nunca en la practica.
+export const buildInventoryMovementDescription = ({
+  pedidoId,
+  tipoRecurso,
+  resourceId,
+  detalleId,
+  origenConsumo,
+  actorUserId,
+  shortage = null
+}) => {
+  const resourceLabel = tipoRecurso === 'producto' ? 'prod' : 'ins';
+  const shortageSegment = buildShortageAuditSegment(shortage);
+  const origenSegment = tipoRecurso === 'insumo' ? String(origenConsumo || '') : '';
+  const userSegment = toPositiveInt(actorUserId) ? `usr:${actorUserId}` : '';
+
+  const build = (separator, { includeOrigen = true, includeUser = true } = {}) => joinDescriptionSegments([
+    `Pedido #${pedidoId}`,
+    `${resourceLabel}:${resourceId}`,
+    `det:${detalleId}`,
+    includeOrigen ? origenSegment : '',
+    shortageSegment,
+    includeUser ? userSegment : ''
+  ], separator);
+
+  const candidates = [
+    () => build(' | '),
+    () => build('|'),
+    () => build('|', { includeOrigen: false }),
+    () => build('|', { includeOrigen: false, includeUser: false })
+  ];
+
+  for (const candidate of candidates) {
+    const description = candidate();
+    if (description.length <= MOVEMENT_DESCRIPTION_MAX_LENGTH) return description;
+  }
+
+  // Defensa final: en teoria inalcanzable (la ultima variante solo contiene 3 IDs y
+  // etiquetas cortas), pero se conserva por seguridad en vez de asumirlo.
+  return build('|', { includeOrigen: false, includeUser: false }).slice(0, MOVEMENT_DESCRIPTION_MAX_LENGTH);
 };
 
 export const buildLineMovementRows = ({
@@ -207,7 +302,15 @@ export const buildLineMovementRows = ({
         id_ref: pedidoId,
         id_pedido_trazabilidad: pedidoId,
         ref_origen: refOrigen,
-        descripcion: `Descuento por pedido #${pedidoId} (producto ${inputProductId}, detalle ${idDetallePedido})${shortage ? ` - faltante auditado req:${shortage.requerido} disp:${shortage.disponible} deficit:${shortage.faltante}` : ''}${toPositiveInt(actorUserId) ? ` - usuario ${actorUserId}` : ''}`
+        descripcion: buildInventoryMovementDescription({
+          pedidoId,
+          tipoRecurso: 'producto',
+          resourceId: inputProductId,
+          detalleId: idDetallePedido,
+          origenConsumo,
+          actorUserId,
+          shortage
+        })
       });
       continue;
     }
@@ -234,7 +337,15 @@ export const buildLineMovementRows = ({
       id_ref: pedidoId,
       id_pedido_trazabilidad: pedidoId,
       ref_origen: refOrigen,
-      descripcion: `Descuento por pedido #${pedidoId} (insumo ${inputInsumoId}, detalle ${idDetallePedido}, origen ${origenConsumo})${shortage ? ` - faltante auditado req:${shortage.requerido} disp:${shortage.disponible} deficit:${shortage.faltante}` : ''}${toPositiveInt(actorUserId) ? ` - usuario ${actorUserId}` : ''}`
+      descripcion: buildInventoryMovementDescription({
+        pedidoId,
+        tipoRecurso: 'insumo',
+        resourceId: inputInsumoId,
+        detalleId: idDetallePedido,
+        origenConsumo,
+        actorUserId,
+        shortage
+      })
     });
   }
 
