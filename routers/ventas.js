@@ -3859,9 +3859,62 @@ const normalizePedidoText = (value, maxLength = 200) => {
   return normalized ? normalized.slice(0, maxLength) : null;
 };
 
-const normalizeTelefonoDigits = (value) => {
+const normalizeTelefonoDigits = (value, maxLength = 30) => {
   const digits = String(value ?? '').replace(/\D/g, '');
-  return digits || null;
+  return digits ? digits.slice(0, maxLength) : null;
+};
+
+// Igual que normalizePedidoText (trim + colapsar espacios) pero SIN slice: para datos
+// canonicos donde recortar en silencio equivaldria a perder parte del valor real que
+// el usuario escribio. La longitud se valida explicitamente despues, por separado.
+const normalizePedidoTextNoSlice = (value) => {
+  if (value === undefined || value === null) return null;
+  const normalized = String(value).replace(/\s+/g, ' ').trim();
+  return normalized || null;
+};
+
+// pedidos_contacto.telefono_contacto es varchar(40) y es un dato CANONICO (lo que el
+// usuario escribio), a diferencia de telefono_normalizado (derivado). Antes se
+// normalizaba con normalizePedidoText(..., 40), que recorta en silencio ANTES de
+// cualquier validacion -- si el cajero escribia 41+ caracteres, el excedente se
+// perdia sin aviso y ese valor incompleto era el que terminaba guardado. Ahora se
+// obtiene el texto sin slice y se rechaza explicitamente si excede la columna.
+const PEDIDO_PENDIENTE_TELEFONO_CONTACTO_MAX_LENGTH = 40;
+const validatePedidoPendienteTelefonoContacto = (rawTelefonoContacto) => {
+  const normalized = normalizePedidoTextNoSlice(rawTelefonoContacto);
+  if (normalized && normalized.length > PEDIDO_PENDIENTE_TELEFONO_CONTACTO_MAX_LENGTH) {
+    return {
+      ok: false,
+      status: 422,
+      body: {
+        error: true,
+        code: 'PEDIDO_PENDIENTE_TELEFONO_INVALIDO',
+        message: 'contacto.telefono_contacto excede la longitud permitida (maximo 40 caracteres).'
+      }
+    };
+  }
+  return { ok: true, value: normalized };
+};
+
+// pedidos_contacto.telefono_normalizado es varchar(30). telefono_contacto es un dato
+// canonico ingresado por el usuario: si sus digitos exceden la columna no debe
+// truncarse en silencio (perderiamos parte del numero real del cliente); se rechaza
+// explicitamente para que el cajero corrija el dato.
+const PEDIDO_PENDIENTE_TELEFONO_NORMALIZADO_MAX_LENGTH = 30;
+const validatePedidoPendienteTelefonoNormalizado = (telefonoContacto) => {
+  const digits = String(telefonoContacto ?? '').replace(/\D/g, '');
+  if (digits.length > PEDIDO_PENDIENTE_TELEFONO_NORMALIZADO_MAX_LENGTH) {
+    return {
+      ok: false,
+      status: 422,
+      body: {
+        error: true,
+        code: 'PEDIDO_PENDIENTE_TELEFONO_INVALIDO',
+        message: 'contacto.telefono_contacto contiene demasiados digitos validos.'
+      }
+    };
+  }
+  return { ok: true, digits: digits || null };
 };
 
 const buildPedidoPendienteItemsBody = (body) => {
@@ -3950,8 +4003,12 @@ const buildPedidoPendientePayload = async ({ client, body, userId, sucursalScope
   }
 
   const nombreContacto = normalizePedidoText(contacto.nombre_contacto, 120);
-  const telefonoContacto = normalizePedidoText(contacto.telefono_contacto, 40);
-  const telefonoNormalizado = normalizeTelefonoDigits(contacto.telefono_contacto);
+  const telefonoContactoValidation = validatePedidoPendienteTelefonoContacto(contacto.telefono_contacto);
+  if (!telefonoContactoValidation.ok) return telefonoContactoValidation;
+  const telefonoContacto = telefonoContactoValidation.value;
+  const telefonoNormalizadoValidation = validatePedidoPendienteTelefonoNormalizado(telefonoContacto);
+  if (!telefonoNormalizadoValidation.ok) return telefonoNormalizadoValidation;
+  const telefonoNormalizado = telefonoNormalizadoValidation.digits;
 
   const pagoPendiente = isPlainObject(body.pago_pendiente) ? body.pago_pendiente : {};
   const motivoPagoPendiente = normalizePedidoCatalogCode(pagoPendiente.motivo);
@@ -4146,12 +4203,24 @@ const buildPedidoPendientePayload = async ({ client, body, userId, sucursalScope
       },
       observacion_contexto: normalizePedidoText(contexto.observacion_contexto, 250),
       observacion_pago: normalizePedidoText(pagoPendiente.observacion_pago, 250),
+      // `delivery` (arriba) es la fuente canonica: direccion_entrega/referencia_entrega
+      // completas (cada una ya validada contra su propio limite) se insertan integras en
+      // pedidos_delivery, sin pasar por el recorte de abajo.
       delivery,
       descripcion_pedido: buildKitchenDescriptionSummary(finalizedLines, contexto.observacion_contexto),
+      // pedidos.descripcion_envio es un RESUMEN derivado para cocina/etiquetas (igual
+      // que descripcion_pedido), no el dato canonico de entrega -- ese vive completo en
+      // pedidos_delivery via el objeto `delivery` de arriba. Recortar este resumen a la
+      // longitud de columna es seguro porque no reemplaza ni modifica direccion_entrega
+      // ni referencia_entrega, que siguen disponibles completas para consultas/impresion
+      // desde pedidos_delivery.
       descripcion_envio: modalidad === 'DELIVERY'
-        ? [delivery.direccion_entrega, delivery.referencia_entrega ? `Ref: ${delivery.referencia_entrega}` : null]
-          .filter(Boolean)
-          .join(' | ') || null
+        ? normalizePedidoText(
+            [delivery.direccion_entrega, delivery.referencia_entrega ? `Ref: ${delivery.referencia_entrega}` : null]
+              .filter(Boolean)
+              .join(' | '),
+            250
+          )
         : modalidad,
       pedido_lines: finalizedLines,
       subtotal_bruto: subtotalBruto,
@@ -8897,13 +8966,21 @@ router.post('/ventas/pedidos-pendientes', checkPermission(['VENTAS_CREAR']), asy
       });
       transactionStarted = false;
     }
+    const originalPgErrorCode = err?.code || null;
+    if (originalPgErrorCode === '22001' && !Number.isInteger(err.httpStatus)) {
+      // Postgres 22001 = valor excede el limite de la columna. El INSERT no persistio nada
+      // (rollback ya ejecutado arriba), asi que es un rechazo definitivo, no un resultado ambiguo.
+      err.httpStatus = 422;
+      err.code = 'PEDIDO_PENDIENTE_CAMPO_EXCEDE_LONGITUD';
+      err.publicMessage = 'Uno de los campos del pedido excede la longitud permitida. Revisa los datos de contacto, entrega u observaciones.';
+    }
     await saveExternalIdempotencyFailureIfNeeded({
       reservation: idempotencyReservation,
       saveFailure: saveVentasIdempotencyFailure,
       args: {
         reservation: idempotencyReservation,
         httpStatus: Number.isInteger(err?.httpStatus) ? err.httpStatus : 500,
-        errorCode: err?.code || null
+        errorCode: originalPgErrorCode
       }
     }).catch((idempotencyErr) => {
       console.error('No se pudo marcar fallo idempotente de pedido pendiente:', idempotencyErr);
