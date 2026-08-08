@@ -3864,6 +3864,27 @@ const normalizeTelefonoDigits = (value, maxLength = 30) => {
   return digits ? digits.slice(0, maxLength) : null;
 };
 
+// pedidos_contacto.telefono_normalizado es varchar(30). telefono_contacto es un dato
+// canonico ingresado por el usuario: si sus digitos exceden la columna no debe
+// truncarse en silencio (perderiamos parte del numero real del cliente); se rechaza
+// explicitamente para que el cajero corrija el dato.
+const PEDIDO_PENDIENTE_TELEFONO_NORMALIZADO_MAX_LENGTH = 30;
+const validatePedidoPendienteTelefonoNormalizado = (telefonoContacto) => {
+  const digits = String(telefonoContacto ?? '').replace(/\D/g, '');
+  if (digits.length > PEDIDO_PENDIENTE_TELEFONO_NORMALIZADO_MAX_LENGTH) {
+    return {
+      ok: false,
+      status: 422,
+      body: {
+        error: true,
+        code: 'PEDIDO_PENDIENTE_TELEFONO_INVALIDO',
+        message: 'contacto.telefono_contacto contiene demasiados digitos validos.'
+      }
+    };
+  }
+  return { ok: true, digits: digits || null };
+};
+
 const buildPedidoPendienteItemsBody = (body) => {
   const items = Array.isArray(body?.items) ? body.items : [];
   const descuentosLinea = Array.isArray(body?.descuentos_linea) ? body.descuentos_linea : [];
@@ -3951,7 +3972,9 @@ const buildPedidoPendientePayload = async ({ client, body, userId, sucursalScope
 
   const nombreContacto = normalizePedidoText(contacto.nombre_contacto, 120);
   const telefonoContacto = normalizePedidoText(contacto.telefono_contacto, 40);
-  const telefonoNormalizado = normalizeTelefonoDigits(telefonoContacto, 30);
+  const telefonoNormalizadoValidation = validatePedidoPendienteTelefonoNormalizado(telefonoContacto);
+  if (!telefonoNormalizadoValidation.ok) return telefonoNormalizadoValidation;
+  const telefonoNormalizado = telefonoNormalizadoValidation.digits;
 
   const pagoPendiente = isPlainObject(body.pago_pendiente) ? body.pago_pendiente : {};
   const motivoPagoPendiente = normalizePedidoCatalogCode(pagoPendiente.motivo);
@@ -4146,8 +4169,17 @@ const buildPedidoPendientePayload = async ({ client, body, userId, sucursalScope
       },
       observacion_contexto: normalizePedidoText(contexto.observacion_contexto, 250),
       observacion_pago: normalizePedidoText(pagoPendiente.observacion_pago, 250),
+      // `delivery` (arriba) es la fuente canonica: direccion_entrega/referencia_entrega
+      // completas (cada una ya validada contra su propio limite) se insertan integras en
+      // pedidos_delivery, sin pasar por el recorte de abajo.
       delivery,
       descripcion_pedido: buildKitchenDescriptionSummary(finalizedLines, contexto.observacion_contexto),
+      // pedidos.descripcion_envio es un RESUMEN derivado para cocina/etiquetas (igual
+      // que descripcion_pedido), no el dato canonico de entrega -- ese vive completo en
+      // pedidos_delivery via el objeto `delivery` de arriba. Recortar este resumen a la
+      // longitud de columna es seguro porque no reemplaza ni modifica direccion_entrega
+      // ni referencia_entrega, que siguen disponibles completas para consultas/impresion
+      // desde pedidos_delivery.
       descripcion_envio: modalidad === 'DELIVERY'
         ? normalizePedidoText(
             [delivery.direccion_entrega, delivery.referencia_entrega ? `Ref: ${delivery.referencia_entrega}` : null]

@@ -10,27 +10,73 @@ import { describe, it } from 'node:test';
 //   - descripcion_envio se armaba concatenando direccion_entrega + referencia_entrega
 //     (cada uno ya acotado a <=250/300) sin recortar el resultado final (columna
 //     pedidos.descripcion_envio es varchar(250)).
-// Este archivo verifica, sobre el codigo fuente real, que ambos quedaron acotados
-// y que el catch de la ruta distingue el rechazo definitivo (22001) de un 500 ambiguo.
+// Este archivo verifica, sobre el codigo fuente real, que:
+//   1. descripcion_envio (resumen derivado, no canonico) queda acotado sin tocar los
+//      campos canonicos direccion_entrega/referencia_entrega que van integros a
+//      pedidos_delivery.
+//   2. telefono_normalizado (RONDA 2) ya NO se trunca en silencio: si excede el limite
+//      de la columna se rechaza explicitamente con 422, preservando el dato canonico
+//      telefono_contacto tal como lo escribio el usuario.
+//   3. el catch de la ruta distingue el rechazo definitivo (22001) de un 500 ambiguo.
 
 const getVentasSource = async () => readFile(new URL('../../ventas.js', import.meta.url), 'utf8');
 
 describe('Fix: overflow 22001 en POST /ventas/pedidos-pendientes', () => {
-  it('normalizeTelefonoDigits acota el resultado a un maxLength (default 30)', async () => {
+  it('RONDA 2: telefono_normalizado ya no trunca en silencio -- se valida explicitamente contra el limite de columna (422)', async () => {
     const source = await getVentasSource();
     assert.match(
       source,
-      /const normalizeTelefonoDigits = \(value, maxLength = 30\) => \{\s*const digits = String\(value \?\? ''\)\.replace\(\/\\D\/g, ''\);\s*return digits \? digits\.slice\(0, maxLength\) : null;/,
-      'normalizeTelefonoDigits debe recortar los digitos a maxLength en vez de devolverlos sin limite.'
+      /const PEDIDO_PENDIENTE_TELEFONO_NORMALIZADO_MAX_LENGTH = 30;/,
+      'Debe existir una constante explicita para el limite de columna de telefono_normalizado.'
+    );
+    assert.match(
+      source,
+      /const validatePedidoPendienteTelefonoNormalizado = \(telefonoContacto\) => \{/,
+      'Debe existir un validador dedicado (no un slice silencioso) para telefono_normalizado.'
+    );
+    assert.doesNotMatch(
+      source,
+      /telefonoNormalizadoValidation[\s\S]{0,5}=[\s\S]{0,5}normalizeTelefonoDigits/,
+      'telefono_normalizado no debe seguir calculandose via normalizeTelefonoDigits (que trunca en silencio) dentro de buildPedidoPendientePayload.'
     );
   });
 
-  it('telefono_normalizado se calcula desde el telefono ya acotado y con cap explicito de 30', async () => {
+  it('validatePedidoPendienteTelefonoNormalizado rechaza (422, codigo estable) en vez de truncar cuando excede 30 digitos', async () => {
+    const source = await getVentasSource();
+    const idx = source.indexOf('const validatePedidoPendienteTelefonoNormalizado = (telefonoContacto) => {');
+    assert.notEqual(idx, -1);
+    const snippet = source.slice(idx, idx + 700);
+    assert.match(snippet, /digits\.length > PEDIDO_PENDIENTE_TELEFONO_NORMALIZADO_MAX_LENGTH/);
+    assert.match(snippet, /status: 422/);
+    assert.match(snippet, /code: 'PEDIDO_PENDIENTE_TELEFONO_INVALIDO'/);
+  });
+
+  it('buildPedidoPendientePayload propaga el rechazo de telefono_normalizado antes de construir el resto del payload', async () => {
     const source = await getVentasSource();
     assert.match(
       source,
-      /const telefonoNormalizado = normalizeTelefonoDigits\(telefonoContacto, 30\);/,
-      'telefono_normalizado debe pasar por normalizeTelefonoDigits con maxLength=30 (columna pedidos_contacto.telefono_normalizado es varchar(30)).'
+      /const telefonoNormalizadoValidation = validatePedidoPendienteTelefonoNormalizado\(telefonoContacto\);\s*\n\s*if \(!telefonoNormalizadoValidation\.ok\) return telefonoNormalizadoValidation;\s*\n\s*const telefonoNormalizado = telefonoNormalizadoValidation\.digits;/,
+      'buildPedidoPendientePayload debe retornar el error de validacion de inmediato (ok:false) en lugar de continuar con un valor truncado.'
+    );
+  });
+
+  it('el objeto `delivery` (canonico, va integro a pedidos_delivery) se pasa intacto y no se deriva de una version recortada', async () => {
+    const source = await getVentasSource();
+    // El resumen descripcion_envio lee delivery.direccion_entrega/referencia_entrega
+    // pero el objeto `delivery` en si -- el que se inserta en pedidos_delivery -- se
+    // incluye en el payload de salida sin pasar por normalizePedidoText de nuevo.
+    const idx = source.indexOf('descripcion_envio: modalidad === ');
+    assert.notEqual(idx, -1);
+    const before = source.slice(Math.max(0, idx - 900), idx);
+    assert.match(
+      before,
+      /\r?\n\s*delivery,\r?\n/,
+      'El campo `delivery` canonico debe pasarse tal cual (sin recorte adicional) justo antes del resumen descripcion_envio.'
+    );
+    assert.doesNotMatch(
+      before,
+      /delivery:\s*\{/,
+      'delivery no debe reconstruirse/recortarse aqui -- debe ser el mismo objeto ya validado mas arriba.'
     );
   });
 
