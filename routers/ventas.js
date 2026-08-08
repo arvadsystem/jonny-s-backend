@@ -3864,6 +3864,38 @@ const normalizeTelefonoDigits = (value, maxLength = 30) => {
   return digits ? digits.slice(0, maxLength) : null;
 };
 
+// Igual que normalizePedidoText (trim + colapsar espacios) pero SIN slice: para datos
+// canonicos donde recortar en silencio equivaldria a perder parte del valor real que
+// el usuario escribio. La longitud se valida explicitamente despues, por separado.
+const normalizePedidoTextNoSlice = (value) => {
+  if (value === undefined || value === null) return null;
+  const normalized = String(value).replace(/\s+/g, ' ').trim();
+  return normalized || null;
+};
+
+// pedidos_contacto.telefono_contacto es varchar(40) y es un dato CANONICO (lo que el
+// usuario escribio), a diferencia de telefono_normalizado (derivado). Antes se
+// normalizaba con normalizePedidoText(..., 40), que recorta en silencio ANTES de
+// cualquier validacion -- si el cajero escribia 41+ caracteres, el excedente se
+// perdia sin aviso y ese valor incompleto era el que terminaba guardado. Ahora se
+// obtiene el texto sin slice y se rechaza explicitamente si excede la columna.
+const PEDIDO_PENDIENTE_TELEFONO_CONTACTO_MAX_LENGTH = 40;
+const validatePedidoPendienteTelefonoContacto = (rawTelefonoContacto) => {
+  const normalized = normalizePedidoTextNoSlice(rawTelefonoContacto);
+  if (normalized && normalized.length > PEDIDO_PENDIENTE_TELEFONO_CONTACTO_MAX_LENGTH) {
+    return {
+      ok: false,
+      status: 422,
+      body: {
+        error: true,
+        code: 'PEDIDO_PENDIENTE_TELEFONO_INVALIDO',
+        message: 'contacto.telefono_contacto excede la longitud permitida (maximo 40 caracteres).'
+      }
+    };
+  }
+  return { ok: true, value: normalized };
+};
+
 // pedidos_contacto.telefono_normalizado es varchar(30). telefono_contacto es un dato
 // canonico ingresado por el usuario: si sus digitos exceden la columna no debe
 // truncarse en silencio (perderiamos parte del numero real del cliente); se rechaza
@@ -3971,7 +4003,9 @@ const buildPedidoPendientePayload = async ({ client, body, userId, sucursalScope
   }
 
   const nombreContacto = normalizePedidoText(contacto.nombre_contacto, 120);
-  const telefonoContacto = normalizePedidoText(contacto.telefono_contacto, 40);
+  const telefonoContactoValidation = validatePedidoPendienteTelefonoContacto(contacto.telefono_contacto);
+  if (!telefonoContactoValidation.ok) return telefonoContactoValidation;
+  const telefonoContacto = telefonoContactoValidation.value;
   const telefonoNormalizadoValidation = validatePedidoPendienteTelefonoNormalizado(telefonoContacto);
   if (!telefonoNormalizadoValidation.ok) return telefonoNormalizadoValidation;
   const telefonoNormalizado = telefonoNormalizadoValidation.digits;
