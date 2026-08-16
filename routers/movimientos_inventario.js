@@ -916,8 +916,14 @@ router.get('/kardex', checkPermission(MOVIMIENTOS_VIEW_PERMISSIONS), async (req,
         AND ($3::text IS NULL OR tipo = $3)
         AND ($4::text IS NULL OR item_tipo = $4)
         AND ($5::int IS NULL OR item_id = $5)
-        AND ($6::date IS NULL OR fecha_mov::date >= $6)
-        AND ($7::date IS NULL OR fecha_mov::date <= $7)
+        AND (
+          $6::date IS NULL
+          OR ((fecha_mov AT TIME ZONE 'UTC') AT TIME ZONE 'America/Tegucigalpa')::date >= $6
+        )
+        AND (
+          $7::date IS NULL
+          OR ((fecha_mov AT TIME ZONE 'UTC') AT TIME ZONE 'America/Tegucigalpa')::date <= $7
+        )
         AND (
           $8::text IS NULL OR (
             COALESCE(item_nombre, '') ILIKE '%' || $8 || '%'

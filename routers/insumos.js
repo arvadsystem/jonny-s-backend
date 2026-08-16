@@ -33,6 +33,7 @@ import {
   findCatalogoMaestroByNormalizedName,
   resolveCatalogoMaestroMutationTarget
 } from '../services/catalogoMaestroMutationGuardService.js';
+import { validateInsumoUnidadBaseChange } from '../services/insumoUnidadBaseGuardService.js';
 
 const router = express.Router();
 const INSUMOS_LIST_PERMISSIONS = ['INVENTARIO_INSUMOS_VER', 'INVENTARIO_INSUMOS_DETALLE_VER'];
@@ -2286,6 +2287,20 @@ router.put('/insumos/edicion', checkPermission(INSUMOS_EDIT_PERMISSIONS), async 
       id_archivo_imagen_principal: archivoValidation.id
     };
 
+    const unitChangeValidation = await validateInsumoUnidadBaseChange({
+      idInsumo: mutationTarget.masterId,
+      nombreInsumo: actual.nombre_insumo,
+      currentUnitId: actual.id_unidad_medida,
+      nextUnitId: normalized.id_unidad_medida
+    }, client);
+    if (!unitChangeValidation.ok) {
+      return res.status(unitChangeValidation.status).json({
+        error: true,
+        code: unitChangeValidation.code,
+        message: unitChangeValidation.message
+      });
+    }
+
     await client.query('BEGIN');
 
     const duplicateGeneral = await findInsumoByUniqueKey(
@@ -2462,6 +2477,24 @@ router.put('/insumos', checkPermission(INSUMOS_EDIT_PERMISSIONS), async (req, re
         });
       }
       valorNormalizado = unidadValidation.id;
+
+      const actual = await getInsumoById(mutationTarget.masterId, pool);
+      if (!actual) {
+        return res.status(404).json({ error: true, message: 'Insumo no encontrado.' });
+      }
+      const unitChangeValidation = await validateInsumoUnidadBaseChange({
+        idInsumo: mutationTarget.masterId,
+        nombreInsumo: actual.nombre_insumo,
+        currentUnitId: actual.id_unidad_medida,
+        nextUnitId: valorNormalizado
+      }, pool);
+      if (!unitChangeValidation.ok) {
+        return res.status(unitChangeValidation.status).json({
+          error: true,
+          code: unitChangeValidation.code,
+          message: unitChangeValidation.message
+        });
+      }
     }
 
     if (campo === 'id_archivo_imagen_principal') {
