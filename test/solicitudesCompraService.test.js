@@ -167,6 +167,7 @@ test('catalogo indexa campos de producto insumo unidades y presentaciones valida
   ]) assert.match(sql, new RegExp(field.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
   assert.match(sql, /STRING_AGG\(/);
   assert.match(sql, /ip\.estado = true AND ip\.uso_compra = true/);
+  assert.match(sql, /ip\.id_unidad_base = i\.id_unidad_medida/);
   assert.match(sql, /ip\.cantidad_presentacion > 0 AND ip\.cantidad_base > 0/);
   assert.equal((sql.match(/LEFT JOIN LATERAL/g) || []).length, 1);
   assert.deepEqual(captured.params.slice(1, 3), ['7x7', '7x7']);
@@ -392,7 +393,7 @@ test('creacion rechaza insumo sin unidad relacionada con 409 antes del encabezad
     await assert.rejects(
       service.create({ body: { id_almacen: 11, detalles: [{ tipo_item: 'insumo', id_item: 50, cantidad: 1 }] } }),
       (error) => error.status === 409
-        && error.code === 'CONFLICT'
+        && error.code === 'INSUMO_SIN_UNIDAD_BASE'
         && error.message === 'El insumo requiere que Inventario configure su unidad base antes de solicitarlo.'
     );
     assert.equal(tx.calls.some((call) => call.sql.includes('INSERT INTO public.solicitudes_compra (')), false);
@@ -427,6 +428,54 @@ test('rechaza presentacion perteneciente a otro insumo', async () => {
     (error) => error.status === 400 && /no pertenece/.test(error.message)
   );
   assert.ok(tx.calls.some((call) => call.sql === 'ROLLBACK'));
+});
+
+test('presentacion incompatible devuelve 409 semantico y mensaje accionable sin crear solicitud', async () => {
+  const tx = makeTransactionDb(async (sql) => {
+    if (sql.includes('FROM public.almacenes a')) return { rows: [warehouseRow()], rowCount: 1 };
+    if (sql.includes('FROM public.insumo_presentaciones ip')) {
+      return {
+        rows: [{
+          id_presentacion: 15,
+          id_insumo: 230,
+          id_unidad_base: 8,
+          id_unidad_base_insumo: 5,
+          nombre_insumo: 'CONCENTRADO PINA',
+          nombre_presentacion: 'Bote 33.814 oz',
+          factor_conversion: '1000'
+        }],
+        rowCount: 1
+      };
+    }
+    throw new Error('No debe crear el encabezado');
+  });
+  const service = createSolicitudesCompraService(baseOverrides(tx.db));
+  await assert.rejects(
+    service.create({ body: { id_almacen: 11, detalles: [{ tipo_item: 'insumo', id_item: 230, id_presentacion_insumo: 15, cantidad: 1 }] } }),
+    (error) => error.status === 409
+      && error.code === 'PRESENTACION_UNIDAD_BASE_INCOMPATIBLE'
+      && /CONCENTRADO PINA/.test(error.message)
+      && /Revisa la unidad base y la presentacion de compra/.test(error.message)
+  );
+  assert.equal(tx.calls.some((call) => call.sql.includes('INSERT INTO public.solicitudes_compra (')), false);
+  assert.ok(tx.calls.some((call) => call.sql === 'ROLLBACK'));
+});
+
+test('error interno de base de datos nunca expone SQL al contrato de solicitudes', async () => {
+  const tx = makeTransactionDb(async (sql) => {
+    if (sql.includes('FROM public.almacenes a')) return { rows: [warehouseRow()], rowCount: 1 };
+    if (sql.includes('INSERT INTO public.solicitudes_compra (')) {
+      throw new Error('relation public.foo does not exist while SELECT * FROM secretos');
+    }
+    throw new Error('Consulta inesperada');
+  });
+  const service = createSolicitudesCompraService(baseOverrides(tx.db));
+  await assert.rejects(
+    service.create({ body: { id_almacen: 11, detalles: [{ tipo_item: 'producto', id_item: 10, cantidad: 1 }] } }),
+    (error) => error.status === 500
+      && error.code === 'INTERNAL_ERROR'
+      && error.message === 'No se pudo completar la operacion solicitada.'
+  );
 });
 
 test('rechaza item sin asignacion activa al almacen', async () => {

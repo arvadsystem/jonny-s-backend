@@ -331,6 +331,7 @@ const buildCatalogUnion = (type) => {
       INNER JOIN public.unidades_medida up ON up.id_unidad_medida = ip.id_unidad_presentacion
       INNER JOIN public.unidades_medida ubp ON ubp.id_unidad_medida = ip.id_unidad_base
       WHERE ip.id_insumo = i.id_insumo AND ip.estado = true AND ip.uso_compra = true
+        AND ip.id_unidad_base = i.id_unidad_medida
         AND ip.cantidad_presentacion > 0 AND ip.cantidad_base > 0
     ) pres ON true
     WHERE ia.id_almacen = $1 AND i.estado = true AND ia.estado = true AND a.estado = true
@@ -356,7 +357,7 @@ const loadInsumoSnapshot = async (masterId, presentationId, queryRunner) => {
     );
     const row = result.rows?.[0];
     if (!parsePositiveIntStrict(row?.id_unidad_base) || !parsePositiveIntStrict(row?.id_unidad_base_valida)) {
-      fail(409, 'CONFLICT', 'El insumo requiere que Inventario configure su unidad base antes de solicitarlo.');
+      fail(409, 'INSUMO_SIN_UNIDAD_BASE', 'El insumo requiere que Inventario configure su unidad base antes de solicitarlo.');
     }
     return {
       id_presentacion_insumo: null,
@@ -372,7 +373,8 @@ const loadInsumoSnapshot = async (masterId, presentationId, queryRunner) => {
              ip.nombre_presentacion, ip.cantidad_presentacion::text,
              ip.cantidad_base::text,
              (ip.cantidad_base / NULLIF(ip.cantidad_presentacion, 0))::text AS factor_conversion,
-             i.id_unidad_medida AS id_unidad_base_insumo
+             i.id_unidad_medida AS id_unidad_base_insumo,
+             i.nombre_insumo
       FROM public.insumo_presentaciones ip
       INNER JOIN public.insumos i ON i.id_insumo = ip.id_insumo
       WHERE ip.id_presentacion = $1 AND ip.estado = true AND ip.uso_compra = true
@@ -385,7 +387,13 @@ const loadInsumoSnapshot = async (masterId, presentationId, queryRunner) => {
   if (!row) fail(400, 'VALIDATION_ERROR', 'La presentacion de insumo no existe o no esta disponible para compra.');
   if (Number(row.id_insumo) !== masterId) fail(400, 'VALIDATION_ERROR', 'La presentacion no pertenece al insumo indicado.');
   if (Number(row.id_unidad_base) !== Number(row.id_unidad_base_insumo)) {
-    fail(409, 'CONFLICT', 'La unidad base de la presentacion no coincide con la unidad base del insumo.');
+    const insumo = String(row.nombre_insumo ?? 'El insumo').replace(/\s+/g, ' ').trim() || 'El insumo';
+    const presentacion = String(row.nombre_presentacion ?? 'seleccionada').replace(/\s+/g, ' ').trim() || 'seleccionada';
+    fail(
+      409,
+      'PRESENTACION_UNIDAD_BASE_INCOMPATIBLE',
+      `${insumo}: la presentacion '${presentacion}' utiliza una unidad base diferente a la configurada en el insumo. Revisa la unidad base y la presentacion de compra desde Inventario y vuelve a intentar.`
+    );
   }
   return {
     id_presentacion_insumo: Number(row.id_presentacion),
