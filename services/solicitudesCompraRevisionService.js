@@ -67,6 +67,15 @@ const assertAdministrativeAccess = async (req, queryRunner, readAccess) => {
   return { idUsuario: Number(access.idUsuario), isSuperAdmin: Boolean(access.isSuperAdmin), roles };
 };
 
+const assertRejectAccess = async (req, queryRunner, readAccess) => {
+  const access = await readAccess(req, queryRunner);
+  if (!access?.idUsuario) fail(401, 'UNAUTHORIZED', 'No autorizado.');
+  const roles = new Set(Array.from(access.roles || []).map(normalizeRole));
+  const canReject = Boolean(access.isSuperAdmin) || roles.has('ADMINISTRADOR');
+  if (!canReject) fail(403, 'FORBIDDEN', 'No tienes permiso para rechazar esta solicitud.');
+  return { idUsuario: Number(access.idUsuario), isSuperAdmin: Boolean(access.isSuperAdmin), roles };
+};
+
 const validateApprovalPayload = (body) => {
   ensurePlainObject(body, 'El payload debe ser un objeto.');
   rejectUnexpectedFields(body, APPROVAL_FIELDS, 'El payload');
@@ -149,6 +158,13 @@ const assertPendingHeader = (header) => {
   }
   if (header.inventario_aplicado === true) {
     fail(409, 'CONFLICT', 'La solicitud ya tiene inventario aplicado.');
+  }
+};
+
+const assertRejectableHeader = (header) => {
+  if (!header) fail(404, 'NOT_FOUND', 'Solicitud de compra no encontrada.');
+  if (String(header.estado || '').trim().toUpperCase() !== 'PENDIENTE' || header.inventario_aplicado === true) {
+    fail(409, 'INVALID_STATE', 'La solicitud cambió y ya no puede rechazarse.');
   }
 };
 
@@ -352,7 +368,7 @@ export const createSolicitudesCompraRevisionService = (overrides = {}) => {
     try {
       await client.query('BEGIN');
       transactionStarted = true;
-      const access = await assertAdministrativeAccess(req, client, dependencies.readAccess);
+      const access = await assertRejectAccess(req, client, dependencies.readAccess);
       const headerResult = await client.query(
         `
           SELECT id_solicitud_compra, estado, inventario_aplicado
@@ -362,7 +378,7 @@ export const createSolicitudesCompraRevisionService = (overrides = {}) => {
         `,
         [requestId]
       );
-      assertPendingHeader(headerResult.rows?.[0]);
+      assertRejectableHeader(headerResult.rows?.[0]);
       const rejectionResult = await client.query(
         `
           UPDATE public.solicitudes_compra

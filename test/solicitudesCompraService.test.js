@@ -641,7 +641,7 @@ test('detalle expone IDs reales distintos y conserva encabezado, proveedor y can
     estado: 'APROBADA', observacion_solicitud: 'Reposicion', comentario_revision: 'Aprobada',
     observacion_recepcion: null, fecha_creacion: '2026-07-21T12:00:00Z',
     fecha_revision: '2026-07-21T13:00:00Z', fecha_recepcion: null,
-    inventario_aplicado: false, fecha_inventario_aplicado: null, tiene_evidencia: false,
+    inventario_aplicado: false, acciones: { puede_rechazar: false }, fecha_inventario_aplicado: null, tiene_evidencia: false,
     receptor: null, revisor: { id_usuario: 1, nombre: 'Administrador' }
   });
   assert.deepEqual(result.detalles.map((line) => line.id_solicitud_detalle), [15, 16]);
@@ -719,6 +719,32 @@ test('ADMINISTRADOR combinado con CAJERO conserva proveedor visible', async () =
   const result = await fixture.service.getById({ params: { id_solicitud_compra: 44 } });
   assert.equal(Object.hasOwn(result.detalles[0], 'proveedor'), true);
 });
+
+for (const scenario of [
+  { name: 'ADMINISTRADOR PENDIENTE', roles: ['ADMINISTRADOR'], state: 'PENDIENTE', expected: true },
+  { name: 'SUPER_ADMIN PENDIENTE', roles: [], superAdmin: true, state: 'PENDIENTE', expected: true },
+  { name: 'CAJERO PENDIENTE', roles: ['CAJERO'], state: 'PENDIENTE', expected: false },
+  { name: 'COCINA PENDIENTE', roles: ['COCINA'], state: 'PENDIENTE', expected: false },
+  { name: 'ADMIN PENDIENTE', roles: ['ADMIN'], state: 'PENDIENTE', expected: false },
+  { name: 'ADMINISTRADOR APROBADA', roles: ['ADMINISTRADOR'], state: 'APROBADA', expected: false },
+  { name: 'ADMINISTRADOR RECIBIDA', roles: ['ADMINISTRADOR'], state: 'RECIBIDA', expected: false }
+]) {
+  test(`capacidad de listado ${scenario.name}: ${scenario.expected}`, async () => {
+    const db = makeReadDb(async () => ({
+      rows: [{
+        id_solicitud_compra: 9, estado: scenario.state, inventario_aplicado: scenario.state === 'RECIBIDA',
+        total_count: 1, total_lineas: 1, total_productos: 1, total_insumos: 0
+      }],
+      rowCount: 1
+    }));
+    const service = createSolicitudesCompraService(baseOverrides(db, {
+      readAccess: async () => ({ idUsuario: 2, isSuperAdmin: scenario.superAdmin, roles: new Set(scenario.roles), permissions: new Set() })
+    }));
+    const result = await service.list({ query: {} });
+    assert.equal(result.solicitudes[0].acciones.puede_rechazar, scenario.expected);
+    assert.equal(Object.hasOwn(result.solicitudes[0], 'inventario_aplicado'), false);
+  });
+}
 
 test('servicio no crea movimientos de inventario', async () => {
   const source = await readFile(new URL('../services/solicitudesCompraService.js', import.meta.url), 'utf8');

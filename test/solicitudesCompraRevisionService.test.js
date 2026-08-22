@@ -35,6 +35,29 @@ const cookAccess = async () => ({
   permissions: new Set(['INVENTARIO_OC_RECHAZAR'])
 });
 
+const accessForRole = (role, { superAdmin = false } = {}) => async () => ({
+  idUsuario: 9,
+  isSuperAdmin: superAdmin,
+  roles: new Set(role ? [role] : []),
+  permissions: new Set(['INVENTARIO_OC_RECHAZAR', 'INVENTARIO_ORDENES_COMPRA_GESTIONAR'])
+});
+
+const makeRejectionFixture = ({ access = adminAccess, state = 'PENDIENTE', inventoryApplied = false, updateRows = 1 } = {}) => {
+  const tx = makeTransactionDb(async (sql, params) => {
+    if (sql.includes('FROM public.solicitudes_compra') && sql.includes('FOR UPDATE')) {
+      return { rows: [{ id_solicitud_compra: 8, estado: state, inventario_aplicado: inventoryApplied }], rowCount: 1 };
+    }
+    if (sql.startsWith('UPDATE public.solicitudes_compra')) {
+      return {
+        rows: updateRows ? [{ id_solicitud_compra: 8, estado: 'RECHAZADA', comentario_revision: params[1], id_usuario_revisor: 9, fecha_revision: '2026-08-22T12:00:00Z' }] : [],
+        rowCount: updateRows
+      };
+    }
+    throw new Error(`Consulta inesperada: ${sql.slice(0, 80)}`);
+  });
+  return { service: createSolicitudesCompraRevisionService({ db: tx.db, readAccess: access }), calls: tx.calls };
+};
+
 const productStored = (id = 10) => ({
   id_solicitud_detalle: id,
   tipo_item: 'PRODUCTO',
@@ -192,6 +215,70 @@ test('cocinera no puede rechazar aunque tenga permiso', async () => {
   assert.ok(tx.calls.some((call) => call.sql === 'ROLLBACK'));
 });
 
+for (const role of ['CAJERO', 'COCINA', 'COCINERO', 'COCINERA', 'ADMIN', 'ROOT']) {
+  test(`${role} no puede rechazar aunque tenga permiso legacy`, async () => {
+    const fixture = makeRejectionFixture({ access: accessForRole(role) });
+    await assert.rejects(
+      fixture.service.reject({ params: { id_solicitud_compra: 8 }, body: { comentario_revision: 'Duplicada' } }),
+      (error) => error.status === 403 && error.code === 'FORBIDDEN'
+    );
+    assert.ok(!fixture.calls.some((call) => call.sql.includes('FOR UPDATE')));
+  });
+}
+
+for (const scenario of [
+  { name: 'ADMINISTRADOR', access: adminAccess },
+  { name: 'SUPER_ADMIN', access: superAdminAccess },
+  { name: 'ADMINISTRADOR y CAJERO', access: async () => ({ idUsuario: 9, isSuperAdmin: false, roles: new Set(['ADMINISTRADOR', 'CAJERO']), permissions: new Set() }) }
+]) {
+  test(`${scenario.name} rechaza PENDIENTE`, async () => {
+    const fixture = makeRejectionFixture({ access: scenario.access });
+    const result = await fixture.service.reject({ params: { id_solicitud_compra: 8 }, body: { comentario_revision: 'Duplicada' } });
+    assert.equal(result.solicitud.estado, 'RECHAZADA');
+    assert.ok(fixture.calls.some((call) => call.sql.includes('FOR UPDATE')));
+    const update = fixture.calls.find((call) => call.sql.startsWith('UPDATE public.solicitudes_compra'));
+    assert.match(update.sql, /estado = 'PENDIENTE'/);
+    assert.match(update.sql, /inventario_aplicado = false/);
+    assert.match(update.sql, /comentario_revision = \$2/);
+    assert.match(update.sql, /id_usuario_revisor = \$3/);
+    assert.match(update.sql, /fecha_revision = NOW\(\)/);
+  });
+}
+
+for (const state of ['APROBADA', 'RECIBIDA', 'RECHAZADA', 'CANCELADA']) {
+  test(`rechazo bloquea estado ${state}`, async () => {
+    const fixture = makeRejectionFixture({ state });
+    await assert.rejects(
+      fixture.service.reject({ params: { id_solicitud_compra: 8 }, body: { comentario_revision: 'Duplicada' } }),
+      (error) => error.status === 409 && error.code === 'INVALID_STATE'
+    );
+  });
+}
+
+test('rechazo bloquea inventario aplicado con INVALID_STATE', async () => {
+  const fixture = makeRejectionFixture({ inventoryApplied: true });
+  await assert.rejects(
+    fixture.service.reject({ params: { id_solicitud_compra: 8 }, body: { comentario_revision: 'Duplicada' } }),
+    (error) => error.status === 409 && error.code === 'INVALID_STATE'
+  );
+});
+
+test('rechazo concurrente pierde con INVALID_STATE cuando UPDATE ya no encuentra PENDIENTE', async () => {
+  const fixture = makeRejectionFixture({ updateRows: 0 });
+  await assert.rejects(
+    fixture.service.reject({ params: { id_solicitud_compra: 8 }, body: { comentario_revision: 'Duplicada' } }),
+    (error) => error.status === 409 && error.code === 'INVALID_STATE'
+  );
+  assert.ok(fixture.calls.some((call) => call.sql === 'ROLLBACK'));
+});
+
+test('rechazo no modifica detalle ni inventario', async () => {
+  const source = await readFile(new URL('../services/solicitudesCompraRevisionService.js', import.meta.url), 'utf8');
+  const rejectionSource = source.slice(source.indexOf('const reject = async'), source.indexOf('return { listProviders'));
+  assert.doesNotMatch(rejectionSource, /UPDATE\s+public\.solicitudes_compra_detalle/i);
+  assert.doesNotMatch(rejectionSource, /movimientos_inventario|DELETE\s+FROM/i);
+});
+
 test('administrador aprueba solicitud PENDIENTE', async () => {
   const fixture = makeApprovalFixture();
   const result = await fixture.service.approve(approveRequest());
@@ -330,6 +417,23 @@ test('rechazo exige comentario no vacio', async () => {
     (error) => error.status === 400 && /obligatorio/.test(error.message)
   );
   assert.equal(connected, false);
+});
+
+test('rechazo limita comentario a mil caracteres', async () => {
+  const fixture = makeRejectionFixture();
+  await assert.rejects(
+    fixture.service.reject({ params: { id_solicitud_compra: 8 }, body: { comentario_revision: 'x'.repeat(1001) } }),
+    (error) => error.status === 400 && error.code === 'VALIDATION_ERROR'
+  );
+  assert.equal(fixture.calls.length, 0);
+});
+
+test('aprobacion y rechazo serializan la cabecera con FOR UPDATE', async () => {
+  const source = await readFile(new URL('../services/solicitudesCompraRevisionService.js', import.meta.url), 'utf8');
+  const approvalSource = source.slice(source.indexOf('const approve = async'), source.indexOf('const reject = async'));
+  const rejectionSource = source.slice(source.indexOf('const reject = async'), source.indexOf('return { listProviders'));
+  assert.match(approvalSource, /FROM public\.solicitudes_compra[\s\S]*FOR UPDATE/);
+  assert.match(rejectionSource, /FROM public\.solicitudes_compra[\s\S]*FOR UPDATE/);
 });
 
 test('rechazo guarda comentario normalizado, revisor y fecha', async () => {

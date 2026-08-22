@@ -190,6 +190,7 @@ const normalizeAccess = async (req, queryRunner, dependencies) => {
   const isAdmin = Boolean(access.isSuperAdmin) || Array.from(roles).some((role) => ADMIN_ROLES.has(role));
   const isOperative = !isAdmin && Array.from(roles).some((role) => OPERATIVE_ROLES.has(role));
   const canViewProviders = Boolean(access.isSuperAdmin) || roles.has('ADMINISTRADOR');
+  const canReject = Boolean(access.isSuperAdmin) || roles.has('ADMINISTRADOR');
 
   if (!access.idUsuario) fail(401, 'UNAUTHORIZED', 'No autorizado.');
   if (!isAdmin && !isOperative) fail(403, 'FORBIDDEN', 'El rol del usuario no puede operar solicitudes de compra.');
@@ -201,6 +202,7 @@ const normalizeAccess = async (req, queryRunner, dependencies) => {
     isAdmin,
     isOperative,
     canViewProviders,
+    canReject,
     userSucursalId: scope.userSucursalId || null,
     operativeWarehouseId,
     allowedSucursalIds: isOperative ? [scope.userSucursalId] : null
@@ -674,7 +676,7 @@ export const createSolicitudesCompraService = (overrides = {}) => {
           FROM public.solicitudes_compra_detalle d
           GROUP BY d.id_solicitud_compra
         )
-        SELECT sc.id_solicitud_compra, sc.estado,
+        SELECT sc.id_solicitud_compra, sc.estado, sc.inventario_aplicado,
                JSON_BUILD_OBJECT('id_sucursal', s.id_sucursal, 'nombre', s.nombre_sucursal) AS sucursal,
                JSON_BUILD_OBJECT('id_almacen', a.id_almacen, 'nombre', a.nombre) AS almacen,
                JSON_BUILD_OBJECT('id_usuario', u.id_usuario, 'nombre', COALESCE(NULLIF(TRIM(CONCAT_WS(' ', p.nombre, p.apellido)), ''), u.nombre_usuario)) AS solicitante,
@@ -704,7 +706,14 @@ export const createSolicitudesCompraService = (overrides = {}) => {
     const total = Number(result.rows?.[0]?.total_count ?? 0);
     return {
       ok: true,
-      solicitudes: (result.rows || []).map(({ total_count, ...row }) => row),
+      solicitudes: (result.rows || []).map(({ total_count, inventario_aplicado, ...row }) => ({
+        ...row,
+        acciones: {
+          puede_rechazar: access.canReject
+            && String(row.estado || '').trim().toUpperCase() === 'PENDIENTE'
+            && inventario_aplicado !== true
+        }
+      })),
       pagination: { page: pagination.page, limit: pagination.limit, total, total_pages: Math.ceil(total / pagination.limit) }
     };
   };
@@ -801,6 +810,11 @@ export const createSolicitudesCompraService = (overrides = {}) => {
         fecha_revision: header.fecha_revision,
         fecha_recepcion: header.fecha_recepcion,
         inventario_aplicado: Boolean(header.inventario_aplicado),
+        acciones: {
+          puede_rechazar: access.canReject
+            && String(header.estado || '').trim().toUpperCase() === 'PENDIENTE'
+            && header.inventario_aplicado !== true
+        },
         fecha_inventario_aplicado: header.fecha_inventario_aplicado,
         tiene_evidencia: Boolean(header.tiene_evidencia),
         receptor: header.id_usuario_recepcion ? { id_usuario: Number(header.id_usuario_recepcion), nombre: header.receptor_nombre } : null,
