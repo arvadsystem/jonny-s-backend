@@ -189,6 +189,7 @@ const normalizeAccess = async (req, queryRunner, dependencies) => {
   const roles = new Set(Array.from(access.roles || []).map(normalizeRole));
   const isAdmin = Boolean(access.isSuperAdmin) || Array.from(roles).some((role) => ADMIN_ROLES.has(role));
   const isOperative = !isAdmin && Array.from(roles).some((role) => OPERATIVE_ROLES.has(role));
+  const canViewProviders = Boolean(access.isSuperAdmin) || roles.has('ADMINISTRADOR');
 
   if (!access.idUsuario) fail(401, 'UNAUTHORIZED', 'No autorizado.');
   if (!isAdmin && !isOperative) fail(403, 'FORBIDDEN', 'El rol del usuario no puede operar solicitudes de compra.');
@@ -199,6 +200,7 @@ const normalizeAccess = async (req, queryRunner, dependencies) => {
     idUsuario: access.idUsuario,
     isAdmin,
     isOperative,
+    canViewProviders,
     userSucursalId: scope.userSucursalId || null,
     operativeWarehouseId,
     allowedSucursalIds: isOperative ? [scope.userSucursalId] : null
@@ -746,6 +748,15 @@ export const createSolicitudesCompraService = (overrides = {}) => {
     if (access.isOperative && (Number(header.id_sucursal) !== access.userSucursalId || Number(header.id_almacen) !== access.operativeWarehouseId)) {
       fail(403, 'FORBIDDEN', 'No tiene acceso a esta solicitud de compra.');
     }
+    const providerSelect = access.canViewProviders
+      ? `, CASE WHEN prov.id_proveedor IS NULL THEN NULL ELSE JSON_BUILD_OBJECT(
+           'id_proveedor', prov.id_proveedor,
+           'nombre_proveedor', prov.nombre_proveedor
+         ) END AS proveedor`
+      : '';
+    const providerJoin = access.canViewProviders
+      ? 'LEFT JOIN public.proveedores prov ON prov.id_proveedor = d.id_proveedor'
+      : '';
     const detailsResult = await dependencies.db.query(
       `
         SELECT d.id_solicitud_detalle, d.tipo_item,
@@ -755,11 +766,7 @@ export const createSolicitudesCompraService = (overrides = {}) => {
                d.cantidad_solicitada, d.nombre_presentacion_snapshot AS presentacion_snapshot,
                d.factor_conversion_snapshot::text AS factor_conversion_snapshot,
                d.cantidad_base_solicitada, ub.nombre AS unidad_base,
-               d.cantidad_aprobada, d.cantidad_base_aprobada,
-               CASE WHEN prov.id_proveedor IS NULL THEN NULL ELSE JSON_BUILD_OBJECT(
-                 'id_proveedor', prov.id_proveedor,
-                 'nombre_proveedor', prov.nombre_proveedor
-               ) END AS proveedor,
+               d.cantidad_aprobada, d.cantidad_base_aprobada${providerSelect},
                d.cantidad_recibida, d.cantidad_base_recibida,
                COALESCE(pa.cantidad, ia.cantidad, 0)::numeric AS stock_actual,
                COALESCE(pa.stock_minimo, ia.stock_minimo, 0)::numeric AS stock_minimo,
@@ -773,7 +780,7 @@ export const createSolicitudesCompraService = (overrides = {}) => {
         LEFT JOIN public.categorias_insumos ci ON ci.id_categoria_insumo = i.id_categoria_insumo
         LEFT JOIN public.insumos_almacenes ia ON ia.id_insumo = d.id_insumo AND ia.id_almacen = sc.id_almacen
         LEFT JOIN public.unidades_medida ub ON ub.id_unidad_medida = d.id_unidad_base
-        LEFT JOIN public.proveedores prov ON prov.id_proveedor = d.id_proveedor
+        ${providerJoin}
         WHERE d.id_solicitud_compra = $1
         ORDER BY d.id_solicitud_detalle
       `,
@@ -799,8 +806,11 @@ export const createSolicitudesCompraService = (overrides = {}) => {
         receptor: header.id_usuario_recepcion ? { id_usuario: Number(header.id_usuario_recepcion), nombre: header.receptor_nombre } : null,
         revisor: header.id_usuario_revisor ? { id_usuario: Number(header.id_usuario_revisor), nombre: header.revisor_nombre } : null
       },
-      detalles: (detailsResult.rows || []).map((row) => ({
-        ...row,
+      detalles: (detailsResult.rows || []).map((row) => {
+        const { proveedor, ...safeRow } = row;
+        return {
+        ...safeRow,
+        ...(access.canViewProviders ? { proveedor: proveedor ?? null } : {}),
         id_solicitud_detalle: Number(row.id_solicitud_detalle),
         id_item: Number(row.id_item),
         cantidad_solicitada: String(row.cantidad_solicitada),
@@ -811,7 +821,8 @@ export const createSolicitudesCompraService = (overrides = {}) => {
         cantidad_base_recibida: row.cantidad_base_recibida === null ? null : String(row.cantidad_base_recibida),
         stock_actual: Number(row.stock_actual ?? 0),
         stock_minimo: Number(row.stock_minimo ?? 0)
-      }))
+      };
+      })
     };
   };
 

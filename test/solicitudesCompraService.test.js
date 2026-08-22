@@ -651,6 +651,9 @@ test('detalle expone IDs reales distintos y conserva encabezado, proveedor y can
   assert.notEqual(result.detalles[0].presentacion_snapshot, result.detalles[1].presentacion_snapshot);
   assert.deepEqual(result.detalles.map((line) => line.factor_conversion_snapshot), ['25', '1']);
   assert.deepEqual(result.detalles[0].proveedor, provider);
+  assert.equal(Object.hasOwn(result.detalles[1], 'proveedor'), true);
+  assert.equal(result.detalles[1].proveedor, null);
+  assert.match(detailSql, /LEFT JOIN public\.proveedores/);
   assert.deepEqual(
     result.detalles.map(({ cantidad_solicitada, cantidad_aprobada, cantidad_recibida }) => ({ cantidad_solicitada, cantidad_aprobada, cantidad_recibida })),
     [
@@ -658,6 +661,63 @@ test('detalle expone IDs reales distintos y conserva encabezado, proveedor y can
       { cantidad_solicitada: '3', cantidad_aprobada: '2.5', cantidad_recibida: '2' }
     ]
   );
+});
+
+const providerVisibilityFixture = ({ role, roles = [role], isSuperAdmin = false, state = 'APROBADA', provider = { id_proveedor: 5, nombre_proveedor: 'Proveedor Central' } }) => {
+  let detailSql = '';
+  const header = {
+    id_solicitud_compra: 44, id_sucursal: 3, nombre_sucursal: 'Sucursal 3', id_almacen: 11,
+    nombre_almacen: 'Bodega', id_usuario_solicitante: 7, solicitante_nombre: 'Operador', estado: state,
+    inventario_aplicado: state === 'RECIBIDA', tiene_evidencia: false
+  };
+  const detail = {
+    id_solicitud_detalle: 15, tipo_item: 'PRODUCTO', id_item: 20, nombre: 'Producto', categoria: 'General',
+    cantidad_solicitada: '2', presentacion_snapshot: 'Unidad', factor_conversion_snapshot: '1',
+    cantidad_base_solicitada: '2', unidad_base: 'Unidad', cantidad_aprobada: '2', cantidad_base_aprobada: '2',
+    proveedor: provider, cantidad_recibida: state === 'RECIBIDA' ? '2' : null,
+    cantidad_base_recibida: state === 'RECIBIDA' ? '2' : null, stock_actual: '5', stock_minimo: '1', estado_stock: 'DISPONIBLE'
+  };
+  const db = makeReadDb(async (sql) => {
+    if (sql.includes('FROM public.solicitudes_compra sc')) return { rows: [header], rowCount: 1 };
+    detailSql = sql;
+    return { rows: [detail], rowCount: 1 };
+  });
+  const service = createSolicitudesCompraService(baseOverrides(db, {
+    readAccess: async () => ({ idUsuario: 7, isSuperAdmin, roles: new Set(roles), permissions: new Set() })
+  }));
+  return { service, getDetailSql: () => detailSql };
+};
+
+test('SUPER_ADMIN recibe proveedor y consulta administrativa incluye JOIN', async () => {
+  const fixture = providerVisibilityFixture({ role: 'SUPER_ADMIN', isSuperAdmin: true });
+  const result = await fixture.service.getById({ params: { id_solicitud_compra: 44 } });
+  assert.equal(result.detalles[0].proveedor.nombre_proveedor, 'Proveedor Central');
+  assert.match(fixture.getDetailSql(), /LEFT JOIN public\.proveedores/);
+});
+
+for (const role of ['ADMIN', 'CAJERO', 'COCINA', 'COCINERO', 'COCINERA', 'JEFA_COCINA', 'JEFE_COCINA']) {
+  test(`${role} consulta APROBADA sin propiedad proveedor ni JOIN`, async () => {
+    const fixture = providerVisibilityFixture({ role });
+    const result = await fixture.service.getById({ params: { id_solicitud_compra: 44 } });
+    assert.equal(Object.hasOwn(result.detalles[0], 'proveedor'), false);
+    assert.equal(result.detalles[0].nombre, 'Producto');
+    assert.equal(result.detalles[0].cantidad_aprobada, '2');
+    assert.doesNotMatch(fixture.getDetailSql(), /JOIN public\.proveedores/);
+  });
+}
+
+test('operativo consulta RECIBIDA sin propiedad proveedor', async () => {
+  const fixture = providerVisibilityFixture({ role: 'CAJERO', state: 'RECIBIDA' });
+  const result = await fixture.service.getById({ params: { id_solicitud_compra: 44 } });
+  assert.equal(result.solicitud.estado, 'RECIBIDA');
+  assert.equal(result.detalles[0].cantidad_recibida, '2');
+  assert.equal(Object.hasOwn(result.detalles[0], 'proveedor'), false);
+});
+
+test('ADMINISTRADOR combinado con CAJERO conserva proveedor visible', async () => {
+  const fixture = providerVisibilityFixture({ role: 'ADMINISTRADOR', roles: ['ADMINISTRADOR', 'CAJERO'] });
+  const result = await fixture.service.getById({ params: { id_solicitud_compra: 44 } });
+  assert.equal(Object.hasOwn(result.detalles[0], 'proveedor'), true);
 });
 
 test('servicio no crea movimientos de inventario', async () => {
