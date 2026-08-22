@@ -38,6 +38,7 @@ const fixture = (options = {}) => {
   const calls = [];
   let headerReads = 0;
   let evidenceReads = 0;
+  let evidenceCount = options.existingEvidenceCount ?? (options.existingEvidence ? 1 : 0);
   const header = { id_solicitud_compra: 7, id_sucursal: 3, id_almacen: 4, estado: 'APROBADA', inventario_aplicado: false, fecha_inventario_aplicado: null, ...options.header };
   const details = options.details || [product(), supply()];
   const query = async (sqlRaw, params = []) => {
@@ -51,19 +52,38 @@ const fixture = (options = {}) => {
       return { rows: value ? [value] : [], rowCount: value ? 1 : 0 };
     }
     if (sql.includes('FROM public.solicitudes_compra_detalle')) return { rows: details, rowCount: details.length };
-    if (sql.includes('FROM public.solicitudes_compra_evidencias') && !sql.includes('INNER JOIN')) {
+    if (sql.includes('COUNT(*)::int AS total') && sql.includes('FROM public.solicitudes_compra_evidencias')) {
       evidenceReads += 1;
-      const exists = options.existingEvidence || (options.txExistingEvidence && evidenceReads > 1);
-      return { rows: exists ? [{ id_evidencia: 8 }] : [], rowCount: exists ? 1 : 0 };
+      const total = Array.isArray(options.evidenceCountSequence)
+        ? options.evidenceCountSequence[Math.min(evidenceReads - 1, options.evidenceCountSequence.length - 1)]
+        : evidenceCount;
+      return { rows: [{ total }], rowCount: 1 };
     }
     if (sql.startsWith('INSERT INTO public.archivos')) return { rows: [{ id_archivo: 358 }], rowCount: 1 };
-    if (sql.startsWith('INSERT INTO public.solicitudes_compra_evidencias')) return { rows: [{ id_evidencia: 9 }], rowCount: 1 };
+    if (sql.startsWith('INSERT INTO public.solicitudes_compra_evidencias')) {
+      evidenceCount += 1;
+      return { rows: [{ id_evidencia: 9 }], rowCount: 1 };
+    }
+    if (sql.startsWith('DELETE FROM public.solicitudes_compra_evidencias')) {
+      evidenceCount = Math.max(0, evidenceCount - 1);
+      return { rows: [], rowCount: options.deleteRowCount ?? 1 };
+    }
+    if (sql.startsWith('UPDATE public.archivos SET estado = false')) return { rows: [], rowCount: 1 };
     if (sql.startsWith('UPDATE public.solicitudes_compra_detalle')) return { rows: [], rowCount: options.detailUpdateRowCount ?? 1 };
     if (sql.startsWith('INSERT INTO public.movimientos_inventario')) return { rows: [], rowCount: 1 };
     if (sql.startsWith('UPDATE public.solicitudes_compra')) return {
       rows: [{ id_solicitud_compra: 7, estado: 'RECIBIDA', id_usuario_recepcion: options.userId || 9, fecha_recepcion: '2026-07-21T12:00:00Z', inventario_aplicado: true }],
       rowCount: options.headerUpdateRowCount ?? 1
     };
+    if (sql.includes('INNER JOIN public.archivos') && sql.includes('FOR UPDATE')) {
+      const row = options.deleteEvidenceRow === null ? null : (options.deleteEvidenceRow || {
+        id_evidencia: 9,
+        id_archivo: 358,
+        tipo_evidencia: 'FACTURA',
+        url_publica: 'admin-docs/solicitudes-compra/7/x.jpg'
+      });
+      return { rows: row ? [row] : [], rowCount: row ? 1 : 0 };
+    }
     if (sql.includes('INNER JOIN public.archivos')) return { rows: options.evidenceRows || [], rowCount: (options.evidenceRows || []).length };
     throw new Error(`Unexpected query: ${sql}`);
   };
@@ -90,6 +110,8 @@ const fixture = (options = {}) => {
 };
 
 const req = (payload = body()) => ({ params: { id_solicitud_compra: '7' }, body: payload, query: {}, user: { id_usuario: 9 } });
+const uploadReq = (invoice = body().factura) => req({ factura: invoice });
+const deleteReq = (idEvidence = '9') => ({ ...req({}), params: { id_solicitud_compra: '7', id_evidencia: idEvidence } });
 const codeOf = async (promise) => { try { await promise; return null; } catch (error) { return { status: error.status, code: error.code, message: error.message }; } };
 
 for (const role of ['CAJERO', 'COCINA', 'COCINERA', 'ADMIN', 'SUPER_ADMIN']) {
@@ -142,51 +164,87 @@ test('fecha de inventario aplicada bloquea recepcion', async () => {
   assert.equal((await codeOf(fixture({ header: { fecha_inventario_aplicado: '2026-01-01' } }).service.receive(req()))).status, 409);
 });
 
-test('factura es obligatoria', async () => {
-  assert.equal((await codeOf(fixture().service.receive(req(body({ factura: undefined }))))).status, 400);
+test('receive sin evidencia persistida exige factura', async () => {
+  const error = await codeOf(fixture().service.receive(req(body({ factura: undefined }))));
+  assert.deepEqual([error.status, error.code], [409, 'FACTURA_REQUIRED']);
 });
 
 for (const [mime, extension] of [['image/jpeg', 'jpg'], ['image/png', 'png'], ['image/webp', 'webp']]) {
   test(`${mime} valido se sube con extension ${extension}`, async () => {
     const f = fixture();
-    await f.service.receive(req(body({ factura: { nombre_original: 'foto.bad', mime_type: mime, data_url: imageData(mime) } })));
+    await f.service.uploadInvoiceEvidence(uploadReq({ nombre_original: 'foto.bad', mime_type: mime, data_url: imageData(mime) }));
     assert.match(f.storageCalls[0][1], new RegExp(`\\.${extension}$`));
   });
 }
 
 test('PDF es rechazado', async () => {
   const invoice = { nombre_original: 'x.pdf', mime_type: 'application/pdf', data_url: imageData('application/pdf') };
-  assert.deepEqual((await codeOf(fixture().service.receive(req(body({ factura: invoice }))))).code, 'UNSUPPORTED_MEDIA_TYPE');
+  assert.deepEqual((await codeOf(fixture().service.uploadInvoiceEvidence(uploadReq(invoice)))).code, 'UNSUPPORTED_MEDIA_TYPE');
 });
 
 test('MIME falso es rechazado', async () => {
   const invoice = { nombre_original: 'x.jpg', mime_type: 'image/jpeg', data_url: imageData('image/png').replace('image/png', 'image/jpeg') };
-  assert.equal((await codeOf(fixture().service.receive(req(body({ factura: invoice }))))).status, 415);
+  assert.equal((await codeOf(fixture().service.uploadInvoiceEvidence(uploadReq(invoice)))).status, 415);
 });
 
 test('firma binaria invalida es rechazada', async () => {
   const invoice = { nombre_original: 'x.jpg', mime_type: 'image/jpeg', data_url: `data:image/jpeg;base64,${Buffer.from('hello').toString('base64')}` };
-  assert.equal((await codeOf(fixture().service.receive(req(body({ factura: invoice }))))).status, 415);
+  assert.equal((await codeOf(fixture().service.uploadInvoiceEvidence(uploadReq(invoice)))).status, 415);
 });
 
 test('base64 invalido es rechazado', async () => {
   const invoice = { nombre_original: 'x.jpg', mime_type: 'image/jpeg', data_url: 'data:image/jpeg;base64,@@@' };
-  assert.equal((await codeOf(fixture().service.receive(req(body({ factura: invoice }))))).status, 400);
+  assert.equal((await codeOf(fixture().service.uploadInvoiceEvidence(uploadReq(invoice)))).status, 400);
 });
 
 test('archivo mayor de 6 MB responde 413', async () => {
   const invoice = { nombre_original: 'x.jpg', mime_type: 'image/jpeg', data_url: imageData('image/jpeg', 6 * 1024 * 1024) };
-  assert.deepEqual((await codeOf(fixture().service.receive(req(body({ factura: invoice }))))).code, 'FILE_TOO_LARGE');
+  assert.deepEqual((await codeOf(fixture().service.uploadInvoiceEvidence(uploadReq(invoice)))).code, 'FILE_TOO_LARGE');
 });
 
 test('nombre original se normaliza y ruta privada es determinista', async () => {
   const f = fixture();
-  await f.service.receive(req(body({ factura: { nombre_original: '../../fáctúra<script>.jpg', mime_type: 'image/jpeg', data_url: imageData() } })));
+  await f.service.uploadInvoiceEvidence(uploadReq({ nombre_original: '../../fáctúra<script>.jpg', mime_type: 'image/jpeg', data_url: imageData() }));
   const fileInsert = f.calls.find((call) => call.sql.startsWith('INSERT INTO public.archivos'));
   assert.equal(fileInsert.params[0], 'facturascript.jpg');
   assert.equal(fileInsert.params[1], 'admin-docs/solicitudes-compra/7/factura-1721563200000-123e4567-e89b-12d3-a456-426614174000.jpg');
   assert.doesNotMatch(fileInsert.params[1], /jonnys-assets/);
 });
+
+test('dos uploads para la misma solicitud quedan permitidos', async () => {
+  const f = fixture();
+  await f.service.uploadInvoiceEvidence(uploadReq());
+  await f.service.uploadInvoiceEvidence(uploadReq({ nombre_original: 'segunda.png', mime_type: 'image/png', data_url: imageData('image/png') }));
+  assert.equal(f.storageCalls.filter((call) => call[0] === 'upload').length, 2);
+  assert.equal(f.calls.filter((call) => call.sql.startsWith('INSERT INTO public.solicitudes_compra_evidencias')).length, 2);
+});
+
+test('upload numero diez queda permitido y el once devuelve limite semantico', async () => {
+  const allowed = fixture({ existingEvidenceCount: 9 });
+  assert.equal((await allowed.service.uploadInvoiceEvidence(uploadReq())).ok, true);
+  const blocked = fixture({ existingEvidenceCount: 10 });
+  const error = await codeOf(blocked.service.uploadInvoiceEvidence(uploadReq()));
+  assert.deepEqual([error.status, error.code], [409, 'FACTURA_EVIDENCE_LIMIT']);
+  assert.equal(blocked.storageCalls.length, 0);
+});
+
+for (const role of ['ADMIN', 'CAJERO', 'COCINA']) {
+  test(`upload de factura permite rol ${role} dentro de alcance`, async () => {
+    assert.equal((await fixture({ role }).service.uploadInvoiceEvidence(uploadReq())).ok, true);
+  });
+}
+
+test('upload operativo fuera de sucursal responde 403', async () => {
+  const error = await codeOf(fixture({ role: 'CAJERO', userSucursalId: 99 }).service.uploadInvoiceEvidence(uploadReq()));
+  assert.deepEqual([error.status, error.code], [403, 'FORBIDDEN']);
+});
+
+for (const state of ['PENDIENTE', 'RECIBIDA']) {
+  test(`upload queda bloqueado cuando solicitud esta ${state}`, async () => {
+    const error = await codeOf(fixture({ header: { estado: state } }).service.uploadInvoiceEvidence(uploadReq()));
+    assert.deepEqual([error.status, error.code], [409, 'INVALID_STATE']);
+  });
+}
 
 test('lineas faltantes son rechazadas antes del upload', async () => {
   const f = fixture();
@@ -262,7 +320,7 @@ test('maestro invalido y asignacion inactiva bloquean dentro de transaccion', as
     const f = fixture(options);
     assert.equal((await codeOf(f.service.receive(req()))).status, 409);
     assert.ok(f.calls.some((call) => call.sql === 'ROLLBACK'));
-    assert.equal(f.storageCalls.at(-1)[0], 'remove');
+    assert.equal(f.storageCalls.length, 0);
   }
 });
 
@@ -285,32 +343,42 @@ test('encabezado queda RECIBIDA con usuario, fecha e inventario aplicado', async
   assert.match(update.sql, /estado = 'APROBADA' AND inventario_aplicado = false/);
 });
 
-test('registra archivo privado y una evidencia FACTURA', async () => {
+test('contrato legacy registra archivo privado y una evidencia FACTURA', async () => {
   const f = fixture();
   const result = await f.service.receive(req());
-  assert.deepEqual(result.evidencia, { id_evidencia: 9, id_archivo: 358, nombre_original: 'factura.jpg', tipo_archivo: 'image/jpeg' });
+  assert.deepEqual(result.evidencia, { id_evidencia: 9, id_archivo: 358, nombre_original: 'factura.jpg', tipo_archivo: 'image/jpeg', tamano_bytes: 4 });
   assert.equal(f.calls.filter((call) => call.sql.startsWith('INSERT INTO public.archivos')).length, 1);
   assert.match(f.calls.find((call) => call.sql.startsWith('INSERT INTO public.solicitudes_compra_evidencias')).sql, /'FACTURA'/);
 });
 
-test('evidencia previa bloquea sin upload', async () => {
+test('contrato legacy permite agregar una factura cuando ya existe otra y respeta modelo 1 a N', async () => {
   const f = fixture({ existingEvidence: true });
-  assert.equal((await codeOf(f.service.receive(req()))).status, 409);
+  assert.equal((await f.service.receive(req())).ok, true);
+  assert.equal(f.storageCalls.filter((call) => call[0] === 'upload').length, 1);
+});
+
+test('contrato legacy respeta limite de diez y no sube la imagen once', async () => {
+  const f = fixture({ existingEvidenceCount: 10 });
+  const error = await codeOf(f.service.receive(req()));
+  assert.deepEqual([error.status, error.code], [409, 'FACTURA_EVIDENCE_LIMIT']);
+  assert.ok(f.calls.some((call) => call.sql === 'ROLLBACK'));
   assert.equal(f.storageCalls.length, 0);
 });
 
-test('evidencia concurrente bloquea, revierte y compensa', async () => {
-  const f = fixture({ txExistingEvidence: true });
-  assert.equal((await codeOf(f.service.receive(req()))).status, 409);
+test('falla de upload responde STORAGE_ERROR y revierte transaccion protegida', async () => {
+  const f = fixture({ uploadError: true });
+  const error = await codeOf(f.service.uploadInvoiceEvidence(uploadReq()));
+  assert.deepEqual([error.status, error.code], [502, 'STORAGE_ERROR']);
+  assert.ok(f.calls.some((call) => call.sql === 'BEGIN'));
   assert.ok(f.calls.some((call) => call.sql === 'ROLLBACK'));
-  assert.equal(f.storageCalls.at(-1)[0], 'remove');
 });
 
-test('falla de upload responde STORAGE_ERROR sin abrir transaccion', async () => {
-  const f = fixture({ uploadError: true });
-  const error = await codeOf(f.service.receive(req()));
-  assert.deepEqual([error.status, error.code], [502, 'STORAGE_ERROR']);
-  assert.equal(f.calls.some((call) => call.sql === 'BEGIN'), false);
+test('fallo DB posterior al upload compensa el objeto de Storage', async () => {
+  const f = fixture({ failOn: 'INSERT INTO public.archivos' });
+  const error = await codeOf(f.service.uploadInvoiceEvidence(uploadReq()));
+  assert.equal(error.status, 500);
+  assert.ok(f.calls.some((call) => call.sql === 'ROLLBACK'));
+  assert.equal(f.storageCalls.at(-1)[0], 'remove');
 });
 
 test('falla de movimiento ejecuta ROLLBACK sin COMMIT y compensa', async () => {
@@ -324,7 +392,7 @@ test('falla de movimiento ejecuta ROLLBACK sin COMMIT y compensa', async () => {
 test('falla al adquirir conexion despues de upload tambien compensa', async () => {
   const f = fixture({ connectError: true });
   assert.equal((await codeOf(f.service.receive(req()))).status, 500);
-  assert.equal(f.storageCalls.at(-1)[0], 'remove');
+  assert.equal(f.storageCalls.length, 0);
 });
 
 test('falla de compensacion conserva error principal sin ruta ni secreto', async () => {
@@ -338,11 +406,80 @@ test('falla de compensacion conserva error principal sin ruta ni secreto', async
   } finally { console.warn = originalWarn; }
 });
 
-test('FOR UPDATE protege encabezado, detalles y evidencia', async () => {
+test('FOR UPDATE protege encabezado y detalles; el encabezado serializa evidencias', async () => {
   const f = fixture();
   await f.service.receive(req());
   const locked = f.calls.filter((call) => /FOR UPDATE/.test(call.sql));
-  assert.equal(locked.length, 3);
+  assert.equal(locked.length, 2);
+});
+
+test('limite se comprueba dentro de transaccion despues de bloquear solicitud', async () => {
+  const f = fixture({ existingEvidenceCount: 10 });
+  await codeOf(f.service.uploadInvoiceEvidence(uploadReq()));
+  const beginIndex = f.calls.findIndex((call) => call.sql === 'BEGIN');
+  const lockIndex = f.calls.findIndex((call) => /FROM public\.solicitudes_compra WHERE.*FOR UPDATE/.test(call.sql));
+  const countIndex = f.calls.findIndex((call) => /COUNT\(\*\)::int AS total/.test(call.sql));
+  assert.ok(beginIndex >= 0 && beginIndex < lockIndex && lockIndex < countIndex);
+  assert.equal(f.storageCalls.length, 0);
+});
+
+test('receive sin factura en body funciona con evidencia persistida', async () => {
+  const f = fixture({ existingEvidenceCount: 1 });
+  const result = await f.service.receive(req(body({ factura: undefined })));
+  assert.equal(result.ok, true);
+  assert.equal(Object.hasOwn(result, 'evidencia'), false);
+  assert.equal(f.storageCalls.length, 0);
+});
+
+test('doble receive conserva bloqueo por update condicional y rollback', async () => {
+  const f = fixture({ existingEvidenceCount: 1, headerUpdateRowCount: 0 });
+  const error = await codeOf(f.service.receive(req(body({ factura: undefined }))));
+  assert.deepEqual([error.status, error.code], [409, 'INVALID_STATE']);
+  assert.ok(f.calls.some((call) => call.sql === 'ROLLBACK'));
+  assert.equal(f.calls.some((call) => call.sql === 'COMMIT'), false);
+});
+
+test('delete de factura APROBADA desvincula DB antes de limpiar Storage', async () => {
+  const f = fixture({ existingEvidenceCount: 1 });
+  const result = await f.service.deleteInvoiceEvidence(deleteReq());
+  assert.equal(result.ok, true);
+  const deleteIndex = f.calls.findIndex((call) => call.sql.startsWith('DELETE FROM public.solicitudes_compra_evidencias'));
+  const softDeleteIndex = f.calls.findIndex((call) => call.sql.startsWith('UPDATE public.archivos SET estado = false'));
+  const commitIndex = f.calls.findIndex((call) => call.sql === 'COMMIT');
+  assert.ok(deleteIndex >= 0 && deleteIndex < softDeleteIndex && softDeleteIndex < commitIndex);
+  assert.deepEqual(f.storageCalls.at(-1), ['remove', 'solicitudes-compra/7/x.jpg']);
+});
+
+test('despues de borrar todas las facturas receive sin factura responde FACTURA_REQUIRED', async () => {
+  const f = fixture({ existingEvidenceCount: 1 });
+  await f.service.deleteInvoiceEvidence(deleteReq());
+  const error = await codeOf(f.service.receive(req(body({ factura: undefined }))));
+  assert.deepEqual([error.status, error.code], [409, 'FACTURA_REQUIRED']);
+  assert.equal(f.calls.some((call) => call.sql.startsWith('INSERT INTO public.movimientos_inventario')), false);
+});
+
+test('delete de evidencia ajena o inexistente queda bloqueado', async () => {
+  const error = await codeOf(fixture({ deleteEvidenceRow: null }).service.deleteInvoiceEvidence(deleteReq('77')));
+  assert.deepEqual([error.status, error.code], [404, 'NOT_FOUND']);
+});
+
+test('delete queda bloqueado despues de RECIBIDA o inventario aplicado', async () => {
+  const received = await codeOf(fixture({ header: { estado: 'RECIBIDA' } }).service.deleteInvoiceEvidence(deleteReq()));
+  const applied = await codeOf(fixture({ header: { inventario_aplicado: true } }).service.deleteInvoiceEvidence(deleteReq()));
+  assert.deepEqual([received.status, received.code], [409, 'INVALID_STATE']);
+  assert.equal(applied.status, 409);
+});
+
+test('fallo de limpieza Storage tras delete no deja evidencia activa', async () => {
+  const f = fixture({ removeError: true });
+  const originalWarn = console.warn;
+  console.warn = () => {};
+  try {
+    const result = await f.service.deleteInvoiceEvidence(deleteReq());
+    assert.equal(result.storage_cleanup_pending, true);
+    assert.ok(f.calls.some((call) => call.sql.startsWith('DELETE FROM public.solicitudes_compra_evidencias')));
+    assert.ok(f.calls.some((call) => call.sql === 'COMMIT'));
+  } finally { console.warn = originalWarn; }
 });
 
 test('endpoint de evidencias respeta sucursal', async () => {
@@ -358,6 +495,16 @@ test('endpoint genera URL firmada de 300 segundos mediante mock', async () => {
   assert.equal(result.evidencias[0].expira_en_segundos, 300);
   assert.equal(result.evidencias[0].url_firmada, 'https://signed.invalid/temporary');
   assert.deepEqual(f.storageCalls[0], ['signed', 'solicitudes-compra/7/x.jpg', 300]);
+});
+
+test('listEvidence devuelve varias facturas y genera una URL firmada por cada una', async () => {
+  const evidenceRows = [1, 2].map((id) => ({ id_evidencia: id, tipo_evidencia: 'FACTURA', fecha_registro: `2026-01-0${id}`,
+    id_usuario_registro: 9, nombre_original: `factura-${id}.jpg`, url_publica: `admin-docs/solicitudes-compra/7/${id}.jpg`,
+    tipo_archivo: 'image/jpeg', tamano_bytes: 44, usuario_nombre: 'Ana' }));
+  const f = fixture({ evidenceRows });
+  const result = await f.service.listEvidence(req());
+  assert.equal(result.evidencias.length, 2);
+  assert.equal(f.storageCalls.filter((call) => call[0] === 'signed').length, 2);
 });
 
 test('URL firmada no se persiste en DB ni se expone la ruta privada', async () => {
@@ -387,6 +534,8 @@ test('rutas recibir y evidencias se declaran antes del GET dinamico', async () =
   const source = await readFile(new URL('../routers/solicitudes_compra.js', import.meta.url), 'utf8');
   assert.ok(source.indexOf("router.post('/:id_solicitud_compra/recibir'") < source.indexOf("router.get('/:id_solicitud_compra'"));
   assert.ok(source.indexOf("router.get('/:id_solicitud_compra/evidencias'") < source.indexOf("router.get('/:id_solicitud_compra'"));
+  assert.ok(source.indexOf("router.post('/:id_solicitud_compra/evidencias/factura'") < source.indexOf("router.get('/:id_solicitud_compra'"));
+  assert.ok(source.indexOf("router.delete('/:id_solicitud_compra/evidencias/:id_evidencia'") < source.indexOf("router.get('/:id_solicitud_compra'"));
   assert.match(source, /INVENTARIO_OC_RECEPCIONAR/);
   assert.match(source, /INVENTARIO_ORDENES_COMPRA_RECEPCIONAR/);
 });

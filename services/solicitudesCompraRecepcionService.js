@@ -17,6 +17,7 @@ import { SUPABASE_ADMIN_BUCKET, detectFileMimeTypeFromBuffer } from '../utils/up
 import { resolveRequestUserSucursalScope } from '../utils/sucursalScope.js';
 
 const MAX_FILE_BYTES = 6 * 1024 * 1024;
+const MAX_FACTURA_EVIDENCES = 10;
 const MAX_LINES = 100;
 const MAX_OBSERVATION_LENGTH = 1000;
 const SIGNED_URL_SECONDS = 300;
@@ -28,6 +29,7 @@ const ALLOWED_MIMES = Object.freeze({
 const ADMIN_ROLES = new Set(['SUPER_ADMIN', 'ADMIN', 'ADMINISTRADOR']);
 const OPERATIVE_ROLES = new Set(['CAJERO', 'COCINA', 'COCINERO', 'COCINERA', 'JEFA_COCINA', 'JEFE_COCINA']);
 const RECEIPT_FIELDS = new Set(['observacion_recepcion', 'factura', 'detalles']);
+const UPLOAD_FIELDS = new Set(['factura']);
 const INVOICE_FIELDS = new Set(['nombre_original', 'mime_type', 'data_url']);
 const DETAIL_FIELDS = new Set(['id_solicitud_detalle', 'cantidad_recibida']);
 const BASE64_REGEX = /^[A-Za-z0-9+/]+={0,2}$/;
@@ -91,7 +93,7 @@ const decodeInvoice = (invoice) => {
 const validatePayload = (body) => {
   ensurePlainObject(body, 'El payload debe ser un objeto.');
   rejectUnexpectedFields(body, RECEIPT_FIELDS, 'El payload');
-  const invoice = decodeInvoice(body.factura);
+  const invoice = body.factura === undefined || body.factura === null ? null : decodeInvoice(body.factura);
   if (!Array.isArray(body.detalles) || !body.detalles.length) {
     fail(400, 'VALIDATION_ERROR', 'detalles debe contener todas las lineas aprobadas.');
   }
@@ -108,6 +110,12 @@ const validatePayload = (body) => {
     return { id_solicitud_detalle: id, rawQuantity: detail.cantidad_recibida };
   });
   return { invoice, details, observation: normalizeObservation(body.observacion_recepcion) };
+};
+
+const validateUploadPayload = (body) => {
+  ensurePlainObject(body, 'El payload debe ser un objeto.');
+  rejectUnexpectedFields(body, UPLOAD_FIELDS, 'El payload');
+  return decodeInvoice(body.factura);
 };
 
 const assertAccess = async (req, queryRunner, dependencies) => {
@@ -230,14 +238,14 @@ const loadDetails = async (runner, requestId, { lock = false } = {}) => (await r
   [requestId]
 )).rows || [];
 
-const assertNoInvoice = async (runner, requestId, { lock = false } = {}) => {
+const countInvoiceEvidence = async (runner, requestId) => {
   const result = await runner.query(
-    `SELECT id_evidencia FROM public.solicitudes_compra_evidencias
-     WHERE id_solicitud_compra = $1 AND tipo_evidencia = 'FACTURA'
-     LIMIT 1${lock ? ' FOR UPDATE' : ''}`,
+    `SELECT COUNT(*)::int AS total
+     FROM public.solicitudes_compra_evidencias
+     WHERE id_solicitud_compra = $1 AND tipo_evidencia = 'FACTURA'`,
     [requestId]
   );
-  if (result.rowCount) fail(409, 'CONFLICT', 'La solicitud ya tiene una factura registrada.');
+  return Number(result.rows?.[0]?.total || 0);
 };
 
 const safeRollback = async (client) => { try { await client.query('ROLLBACK'); } catch { /* AM: conserva error principal. */ } };
@@ -255,6 +263,55 @@ export const createSolicitudesCompraRecepcionService = (overrides = {}) => {
     resolveOperativeWarehouse: overrides.resolveOperativeWarehouse || resolveOperativeWarehouseId
   };
 
+  const cleanupUploadedPaths = async (paths) => {
+    for (const path of paths) {
+      try { await dependencies.storage.remove(path); } catch (cleanupError) {
+        console.warn('[solicitudes_compra] compensacion de factura pendiente', { code: cleanupError?.code || null });
+      }
+    }
+  };
+
+  const persistInvoiceEvidence = async ({ client, requestId, access, invoice, uploadedPaths }) => {
+    const currentCount = await countInvoiceEvidence(client, requestId);
+    if (currentCount >= MAX_FACTURA_EVIDENCES) {
+      fail(409, 'FACTURA_EVIDENCE_LIMIT', 'La solicitud admite un maximo de 10 imagenes de factura.');
+    }
+
+    const objectPath = `solicitudes-compra/${requestId}/factura-${dependencies.now()}-${dependencies.uuid()}.${invoice.extension}`;
+    try {
+      await dependencies.storage.upload(objectPath, invoice.buffer, invoice.mimeType);
+      uploadedPaths.push(objectPath);
+    } catch {
+      fail(502, 'STORAGE_ERROR', 'No se pudo guardar la factura privada.');
+    }
+
+    const storedPath = `${SUPABASE_ADMIN_BUCKET}/${objectPath}`;
+    const fileResult = await client.query(
+      `INSERT INTO public.archivos (nombre_original, url_publica, tipo_archivo, tamano_bytes, id_usuario, estado)
+       VALUES ($1, $2, $3, $4, $5, true)
+       RETURNING id_archivo`,
+      [invoice.originalName, storedPath, invoice.mimeType, invoice.buffer.length, access.idUsuario]
+    );
+    const fileId = Number(fileResult.rows?.[0]?.id_archivo);
+    if (!fileId) fail(500, 'INTERNAL_ERROR', 'No se pudo registrar la factura.');
+    const evidenceResult = await client.query(
+      `INSERT INTO public.solicitudes_compra_evidencias
+        (id_solicitud_compra, id_archivo, tipo_evidencia, id_usuario_registro)
+       VALUES ($1, $2, 'FACTURA', $3)
+       RETURNING id_evidencia`,
+      [requestId, fileId, access.idUsuario]
+    );
+    const evidenceId = Number(evidenceResult.rows?.[0]?.id_evidencia);
+    if (!evidenceId) fail(500, 'INTERNAL_ERROR', 'No se pudo vincular la factura a la solicitud.');
+    return {
+      id_evidencia: evidenceId,
+      id_archivo: fileId,
+      nombre_original: invoice.originalName,
+      tipo_archivo: invoice.mimeType,
+      tamano_bytes: invoice.buffer.length
+    };
+  };
+
   const receive = async (req) => {
     const requestId = parsePositiveIntStrict(req.params?.id_solicitud_compra);
     if (!requestId) fail(400, 'VALIDATION_ERROR', 'id_solicitud_compra debe ser un entero positivo.');
@@ -263,21 +320,14 @@ export const createSolicitudesCompraRecepcionService = (overrides = {}) => {
     const access = await assertAccess(req, dependencies.db, dependencies);
     const preHeader = await loadHeader(dependencies.db, requestId);
     assertHeader(preHeader, access);
-    await assertNoInvoice(dependencies.db, requestId);
     const preDetails = normalizeDetails(payload.details, await loadDetails(dependencies.db, requestId));
     if (preDetails.hasDifference && !payload.observation) {
       fail(400, 'VALIDATION_ERROR', 'observacion_recepcion es obligatoria cuando existen diferencias.');
     }
 
-    const objectPath = `solicitudes-compra/${requestId}/factura-${dependencies.now()}-${dependencies.uuid()}.${payload.invoice.extension}`;
-    try {
-      await dependencies.storage.upload(objectPath, payload.invoice.buffer, payload.invoice.mimeType);
-    } catch {
-      fail(502, 'STORAGE_ERROR', 'No se pudo guardar la factura privada.');
-    }
-
     let client;
     let transactionStarted = false;
+    const uploadedPaths = [];
     try {
       client = await dependencies.db.connect();
       await client.query('BEGIN');
@@ -289,7 +339,6 @@ export const createSolicitudesCompraRecepcionService = (overrides = {}) => {
       if (details.hasDifference && !payload.observation) {
         fail(400, 'VALIDATION_ERROR', 'observacion_recepcion es obligatoria cuando existen diferencias.');
       }
-      await assertNoInvoice(client, requestId, { lock: true });
 
       for (const detail of details.normalized) {
         if (!detail.masterId) fail(409, 'CONFLICT', 'La linea no conserva un item maestro valido.');
@@ -300,23 +349,13 @@ export const createSolicitudesCompraRecepcionService = (overrides = {}) => {
         if (!assignment?.activo) fail(409, 'CONFLICT', `El ${entityType} no tiene asignacion activa en el almacen.`);
       }
 
-      const storedPath = `${SUPABASE_ADMIN_BUCKET}/${objectPath}`;
-      const fileResult = await client.query(
-        `INSERT INTO public.archivos (nombre_original, url_publica, tipo_archivo, tamano_bytes, id_usuario, estado)
-         VALUES ($1, $2, $3, $4, $5, true)
-         RETURNING id_archivo`,
-        [payload.invoice.originalName, storedPath, payload.invoice.mimeType, payload.invoice.buffer.length, txAccess.idUsuario]
-      );
-      const fileId = Number(fileResult.rows?.[0]?.id_archivo);
-      if (!fileId) fail(500, 'INTERNAL_ERROR', 'No se pudo registrar la factura.');
-      const evidenceResult = await client.query(
-        `INSERT INTO public.solicitudes_compra_evidencias
-          (id_solicitud_compra, id_archivo, tipo_evidencia, id_usuario_registro)
-         VALUES ($1, $2, 'FACTURA', $3)
-         RETURNING id_evidencia`,
-        [requestId, fileId, txAccess.idUsuario]
-      );
-      const evidenceId = Number(evidenceResult.rows?.[0]?.id_evidencia);
+      const legacyEvidence = payload.invoice
+        ? await persistInvoiceEvidence({ client, requestId, access: txAccess, invoice: payload.invoice, uploadedPaths })
+        : null;
+      const evidenceCount = await countInvoiceEvidence(client, requestId);
+      if (evidenceCount < 1) {
+        fail(409, 'FACTURA_REQUIRED', 'Debes cargar al menos una imagen de factura antes de confirmar la recepcion.');
+      }
 
       for (const detail of details.normalized) {
         const update = await client.query(
@@ -356,17 +395,98 @@ export const createSolicitudesCompraRecepcionService = (overrides = {}) => {
           inventario_aplicado: received.inventario_aplicado, total_lineas: details.normalized.length,
           total_movimientos: details.normalized.length
         },
-        evidencia: { id_evidencia: evidenceId, id_archivo: fileId, nombre_original: payload.invoice.originalName, tipo_archivo: payload.invoice.mimeType }
+        ...(legacyEvidence ? { evidencia: legacyEvidence } : {})
       };
     } catch (error) {
       if (transactionStarted && client) await safeRollback(client);
-      try { await dependencies.storage.remove(objectPath); } catch (cleanupError) {
-        console.warn('[solicitudes_compra] compensacion de factura pendiente', { code: cleanupError?.code || null });
-      }
+      await cleanupUploadedPaths(uploadedPaths);
       throw mapError(error);
     } finally {
       client?.release();
     }
+  };
+
+  const uploadInvoiceEvidence = async (req) => {
+    const requestId = parsePositiveIntStrict(req.params?.id_solicitud_compra);
+    if (!requestId) fail(400, 'VALIDATION_ERROR', 'id_solicitud_compra debe ser un entero positivo.');
+    const invoice = validateUploadPayload(req.body);
+    let client;
+    let transactionStarted = false;
+    const uploadedPaths = [];
+    try {
+      client = await dependencies.db.connect();
+      await client.query('BEGIN');
+      transactionStarted = true;
+      const access = await assertAccess(req, client, dependencies);
+      const header = await loadHeader(client, requestId, { lock: true });
+      assertHeader(header, access);
+      const evidence = await persistInvoiceEvidence({ client, requestId, access, invoice, uploadedPaths });
+      await client.query('COMMIT');
+      transactionStarted = false;
+      return { ok: true, evidencia: evidence };
+    } catch (error) {
+      if (transactionStarted && client) await safeRollback(client);
+      await cleanupUploadedPaths(uploadedPaths);
+      throw mapError(error);
+    } finally {
+      client?.release();
+    }
+  };
+
+  const deleteInvoiceEvidence = async (req) => {
+    const requestId = parsePositiveIntStrict(req.params?.id_solicitud_compra);
+    const evidenceId = parsePositiveIntStrict(req.params?.id_evidencia);
+    if (!requestId || !evidenceId) fail(400, 'VALIDATION_ERROR', 'Los identificadores de solicitud y evidencia deben ser enteros positivos.');
+    let client;
+    let transactionStarted = false;
+    let objectPath = null;
+    try {
+      client = await dependencies.db.connect();
+      await client.query('BEGIN');
+      transactionStarted = true;
+      const access = await assertAccess(req, client, dependencies);
+      const header = await loadHeader(client, requestId, { lock: true });
+      assertHeader(header, access);
+      const evidenceResult = await client.query(
+        `SELECT e.id_evidencia, e.id_archivo, e.tipo_evidencia, a.url_publica
+         FROM public.solicitudes_compra_evidencias e
+         INNER JOIN public.archivos a ON a.id_archivo = e.id_archivo
+         WHERE e.id_solicitud_compra = $1 AND e.id_evidencia = $2
+         FOR UPDATE`,
+        [requestId, evidenceId]
+      );
+      const evidence = evidenceResult.rows?.[0];
+      if (!evidence) fail(404, 'NOT_FOUND', 'La evidencia no pertenece a esta solicitud o ya no existe.');
+      if (String(evidence.tipo_evidencia || '').toUpperCase() !== 'FACTURA') {
+        fail(409, 'INVALID_EVIDENCE_TYPE', 'Solo se pueden quitar evidencias de factura desde este flujo.');
+      }
+      const prefix = `${SUPABASE_ADMIN_BUCKET}/`;
+      if (!String(evidence.url_publica || '').startsWith(prefix)) {
+        fail(409, 'INVALID_EVIDENCE_PATH', 'La evidencia no conserva una ruta privada valida.');
+      }
+      objectPath = String(evidence.url_publica).slice(prefix.length);
+      const unlink = await client.query(
+        `DELETE FROM public.solicitudes_compra_evidencias
+         WHERE id_solicitud_compra = $1 AND id_evidencia = $2 AND tipo_evidencia = 'FACTURA'`,
+        [requestId, evidenceId]
+      );
+      if (unlink.rowCount !== 1) fail(409, 'CONFLICT', 'La evidencia cambio durante la eliminacion.');
+      await client.query('UPDATE public.archivos SET estado = false WHERE id_archivo = $1', [Number(evidence.id_archivo)]);
+      await client.query('COMMIT');
+      transactionStarted = false;
+    } catch (error) {
+      if (transactionStarted && client) await safeRollback(client);
+      throw mapError(error);
+    } finally {
+      client?.release();
+    }
+
+    let storageCleanupPending = false;
+    try { await dependencies.storage.remove(objectPath); } catch (cleanupError) {
+      storageCleanupPending = true;
+      console.warn('[solicitudes_compra] limpieza fisica de evidencia pendiente', { code: cleanupError?.code || null });
+    }
+    return { ok: true, id_evidencia: evidenceId, storage_cleanup_pending: storageCleanupPending };
   };
 
   const listEvidence = async (req) => {
@@ -403,7 +523,7 @@ export const createSolicitudesCompraRecepcionService = (overrides = {}) => {
     return { ok: true, evidencias: evidences };
   };
 
-  return { receive, listEvidence };
+  return { receive, uploadInvoiceEvidence, deleteInvoiceEvidence, listEvidence };
 };
 
 export const solicitudesCompraRecepcionService = createSolicitudesCompraRecepcionService();
