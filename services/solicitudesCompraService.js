@@ -346,7 +346,7 @@ const buildCatalogUnion = (type) => {
   return `${productSql} UNION ALL ${supplySql}`;
 };
 
-const loadInsumoSnapshot = async (masterId, presentationId, queryRunner) => {
+export const loadInsumoSnapshot = async (masterId, presentationId, queryRunner) => {
   if (!presentationId) {
     const result = await queryRunner.query(
       `
@@ -734,7 +734,13 @@ export const createSolicitudesCompraService = (overrides = {}) => {
                EXISTS (
                  SELECT 1 FROM public.solicitudes_compra_evidencias sce
                  WHERE sce.id_solicitud_compra = sc.id_solicitud_compra
-               ) AS tiene_evidencia
+               ) AS tiene_evidencia,
+               (
+                 SELECT c.id_captura_compra_rapida
+                 FROM public.capturas_compra_rapida c
+                 WHERE c.id_solicitud_compra = sc.id_solicitud_compra
+                 LIMIT 1
+               ) AS id_captura_origen
         FROM public.solicitudes_compra sc
         INNER JOIN public.sucursales s ON s.id_sucursal = sc.id_sucursal
         INNER JOIN public.almacenes a ON a.id_almacen = sc.id_almacen
@@ -817,6 +823,9 @@ export const createSolicitudesCompraService = (overrides = {}) => {
         },
         fecha_inventario_aplicado: header.fecha_inventario_aplicado,
         tiene_evidencia: Boolean(header.tiene_evidencia),
+        origen_captura_rapida: header.id_captura_origen
+          ? { id_captura_compra_rapida: Number(header.id_captura_origen) }
+          : null,
         receptor: header.id_usuario_recepcion ? { id_usuario: Number(header.id_usuario_recepcion), nombre: header.receptor_nombre } : null,
         revisor: header.id_usuario_revisor ? { id_usuario: Number(header.id_usuario_revisor), nombre: header.revisor_nombre } : null
       },

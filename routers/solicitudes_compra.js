@@ -7,6 +7,7 @@ import {
 import { solicitudesCompraRevisionService } from '../services/solicitudesCompraRevisionService.js';
 import { solicitudesCompraRecepcionService } from '../services/solicitudesCompraRecepcionService.js';
 import { capturasCompraRapidaService } from '../services/capturasCompraRapidaService.js';
+import { capturasCompraRapidaFormalizacionService } from '../services/capturasCompraRapidaFormalizacionService.js';
 
 const router = express.Router();
 
@@ -16,7 +17,7 @@ const VIEW_PERMISSIONS = [
   'INVENTARIO_ORDENES_COMPRA_VER',
   'INVENTARIO_ORDENES_COMPRA_VER_TODAS'
 ];
-const CATALOG_PERMISSIONS = Array.from(new Set([...CREATE_PERMISSIONS, ...VIEW_PERMISSIONS]));
+const CATALOG_PERMISSIONS = Array.from(new Set([...CREATE_PERMISSIONS, ...VIEW_PERMISSIONS, 'INVENTARIO_OC_CAPTURA_RAPIDA_GESTIONAR']));
 const APPROVE_PERMISSIONS = ['INVENTARIO_OC_APROBAR', 'INVENTARIO_ORDENES_COMPRA_GESTIONAR'];
 const REJECT_PERMISSIONS = ['INVENTARIO_OC_RECHAZAR', 'INVENTARIO_ORDENES_COMPRA_GESTIONAR'];
 const REVIEW_PERMISSIONS = Array.from(new Set([...APPROVE_PERMISSIONS, ...REJECT_PERMISSIONS]));
@@ -76,12 +77,14 @@ const handler = (operation, successStatus = null) => async (req, res) => {
 
 router.get('/catalogo', requirePermissions(CATALOG_PERMISSIONS), handler(solicitudesCompraService.listCatalog));
 router.get('/proveedores', requirePermissions(REVIEW_PERMISSIONS), handler(solicitudesCompraRevisionService.listProviders));
+router.get('/capturas-rapidas/proveedores', requirePermissions(QUICK_CAPTURE_MANAGE), handler(capturasCompraRapidaFormalizacionService.listProviders));
 router.post('/capturas-rapidas', requirePermissions(QUICK_CAPTURE_CREATE), handler(capturasCompraRapidaService.create, 201));
 router.post('/capturas-rapidas/:id_captura/evidencias/factura', requirePermissions(QUICK_CAPTURE_CREATE), handler(capturasCompraRapidaService.uploadInvoice));
 router.delete('/capturas-rapidas/:id_captura/evidencias/:id_evidencia', requirePermissions(QUICK_CAPTURE_CREATE), handler(capturasCompraRapidaService.deleteEvidence));
 router.delete('/capturas-rapidas/:id_captura', requirePermissions(QUICK_CAPTURE_CREATE), handler(capturasCompraRapidaService.discard));
 router.put('/capturas-rapidas/:id_captura/enviar', requirePermissions(QUICK_CAPTURE_CREATE), handler(capturasCompraRapidaService.send));
 router.put('/capturas-rapidas/:id_captura/rechazar', requirePermissions(QUICK_CAPTURE_MANAGE), handler(capturasCompraRapidaService.reject));
+router.post('/capturas-rapidas/:id_captura/formalizar', requirePermissions(QUICK_CAPTURE_MANAGE), handler(capturasCompraRapidaFormalizacionService.formalize));
 router.get('/capturas-rapidas', requirePermissions(QUICK_CAPTURE_VIEW), handler(capturasCompraRapidaService.list));
 router.get('/capturas-rapidas/:id_captura/evidencias', requirePermissions(QUICK_CAPTURE_VIEW), handler(capturasCompraRapidaService.listEvidence));
 router.get('/capturas-rapidas/:id_captura', requirePermissions(QUICK_CAPTURE_VIEW), handler(capturasCompraRapidaService.detail));

@@ -642,6 +642,7 @@ test('detalle expone IDs reales distintos y conserva encabezado, proveedor y can
     observacion_recepcion: null, fecha_creacion: '2026-07-21T12:00:00Z',
     fecha_revision: '2026-07-21T13:00:00Z', fecha_recepcion: null,
     inventario_aplicado: false, acciones: { puede_rechazar: false }, fecha_inventario_aplicado: null, tiene_evidencia: false,
+    origen_captura_rapida: null,
     receptor: null, revisor: { id_usuario: 1, nombre: 'Administrador' }
   });
   assert.deepEqual(result.detalles.map((line) => line.id_solicitud_detalle), [15, 16]);

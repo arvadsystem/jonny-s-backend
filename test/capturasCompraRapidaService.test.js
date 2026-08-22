@@ -138,7 +138,9 @@ test('rechazo valida motivo y estados inmutables', async () => {
 
 test('detalle expone acciones canonicas y rechazo no toca evidencias storage inventario ni OC', async () => {
   const source = await readFile(new URL('../services/capturasCompraRapidaService.js', import.meta.url), 'utf8');
-  assert.match(source, /puede_rechazar: access\.isAdministrative && capture\.estado === 'PENDIENTE' && capture\.id_solicitud_compra === null/);
+  assert.match(source, /const canManage = access\.isAdministrative && capture\.estado === 'PENDIENTE' && capture\.id_solicitud_compra === null/);
+  assert.match(source, /puede_rechazar: canManage/);
+  assert.match(source, /puede_formalizar: canManage && Number\(capture\.cantidad_evidencias \|\| 0\) >= 1/);
   const rejectSource = source.slice(source.indexOf('const reject ='), source.indexOf('const listEvidence'));
   assert.match(rejectSource, /loadLocked\(client, id\)/);
   assert.match(source, /const loadLocked[\s\S]*FOR UPDATE/);
@@ -177,12 +179,12 @@ test('fuente mantiene locks limites estados compensacion y ausencia de efectos O
   assert.doesNotMatch(source, /solicitudes_compra_detalle|movimientos_inventario|UPDATE public\.(?:productos|insumos)/);
 });
 
-test('router monta nueve endpoints antes de la ruta dinamica y omite formalizar', async () => {
+test('router monta endpoints QR2 QR3 QR4 antes de la ruta dinamica', async () => {
   const source = await readFile(new URL('../routers/solicitudes_compra.js', import.meta.url), 'utf8');
   const quick = source.indexOf("router.post('/capturas-rapidas'");
   const dynamic = source.indexOf("router.get('/:id_solicitud_compra'");
   assert.ok(quick >= 0 && quick < dynamic);
-  assert.equal((source.match(/router\.(?:get|post|put|delete)\('\/capturas-rapidas/g) || []).length, 9);
+  assert.equal((source.match(/router\.(?:get|post|put|delete)\('\/capturas-rapidas/g) || []).length, 11);
   assert.match(source, /capturas-rapidas\/:id_captura\/rechazar/);
-  assert.doesNotMatch(source, /capturas-rapidas[^'\n]*\/formalizar/);
+  assert.match(source, /capturas-rapidas\/:id_captura\/formalizar/);
 });

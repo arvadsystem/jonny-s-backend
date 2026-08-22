@@ -333,7 +333,11 @@ export const createCapturasCompraRapidaService = (overrides = {}) => {
     );
     if (!result.rows?.[0]) fail(404, 'NOT_FOUND', 'Captura rapida no encontrada.');
     const capture = result.rows[0];
-    capture.acciones = { puede_rechazar: access.isAdministrative && capture.estado === 'PENDIENTE' && capture.id_solicitud_compra === null };
+    const canManage = access.isAdministrative && capture.estado === 'PENDIENTE' && capture.id_solicitud_compra === null;
+    capture.acciones = {
+      puede_rechazar: canManage,
+      puede_formalizar: canManage && Number(capture.cantidad_evidencias || 0) >= 1
+    };
     return { ok: true, captura: capture };
   };
 
