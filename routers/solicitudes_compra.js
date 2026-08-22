@@ -29,6 +29,7 @@ const EVIDENCE_PERMISSIONS = Array.from(new Set([
 ]));
 const QUICK_CAPTURE_CREATE = ['INVENTARIO_OC_CAPTURA_RAPIDA_CREAR'];
 const QUICK_CAPTURE_VIEW = ['INVENTARIO_OC_CAPTURA_RAPIDA_VER'];
+const QUICK_CAPTURE_MANAGE = ['INVENTARIO_OC_CAPTURA_RAPIDA_GESTIONAR'];
 
 const requirePermissions = (permissions) => async (req, res, next) => {
   const idUsuario = Number.parseInt(String(req?.user?.id_usuario ?? ''), 10);
@@ -80,6 +81,7 @@ router.post('/capturas-rapidas/:id_captura/evidencias/factura', requirePermissio
 router.delete('/capturas-rapidas/:id_captura/evidencias/:id_evidencia', requirePermissions(QUICK_CAPTURE_CREATE), handler(capturasCompraRapidaService.deleteEvidence));
 router.delete('/capturas-rapidas/:id_captura', requirePermissions(QUICK_CAPTURE_CREATE), handler(capturasCompraRapidaService.discard));
 router.put('/capturas-rapidas/:id_captura/enviar', requirePermissions(QUICK_CAPTURE_CREATE), handler(capturasCompraRapidaService.send));
+router.put('/capturas-rapidas/:id_captura/rechazar', requirePermissions(QUICK_CAPTURE_MANAGE), handler(capturasCompraRapidaService.reject));
 router.get('/capturas-rapidas', requirePermissions(QUICK_CAPTURE_VIEW), handler(capturasCompraRapidaService.list));
 router.get('/capturas-rapidas/:id_captura/evidencias', requirePermissions(QUICK_CAPTURE_VIEW), handler(capturasCompraRapidaService.listEvidence));
 router.get('/capturas-rapidas/:id_captura', requirePermissions(QUICK_CAPTURE_VIEW), handler(capturasCompraRapidaService.detail));

@@ -15,6 +15,7 @@ const FORBIDDEN_CREATE_ROLES = new Set(['ADMIN', 'ROOT', 'ADMINISTRADOR', 'SUPER
 const ALLOWED_MIMES = Object.freeze({ 'image/jpeg': 'jpg', 'image/png': 'png', 'image/webp': 'webp' });
 const INVOICE_FIELDS = new Set(['nombre_original', 'mime_type', 'data_url']);
 const BASE64_REGEX = /^[A-Za-z0-9+/]+={0,2}$/;
+const CAPTURE_STATES = new Set(['BORRADOR', 'PENDIENTE', 'FORMALIZADA', 'RECHAZADA']);
 
 const fail = (status, code, message) => { throw new SolicitudesCompraError(status, code, message); };
 const normalizeRole = (value) => String(value ?? '').trim().replace(/[\s-]+/g, '_').toUpperCase();
@@ -24,6 +25,16 @@ const ensurePlainObject = (value, message) => {
 const rejectUnexpectedFields = (value, allowed, context) => {
   const unexpected = Object.keys(value).filter((key) => !allowed.has(key));
   if (unexpected.length) fail(400, 'VALIDATION_ERROR', `${context} contiene campos no permitidos: ${unexpected.join(', ')}.`);
+};
+const normalizeSearch = (value) => {
+  const search = String(value ?? '').trim().replace(/\s+/g, ' ');
+  if (search.length > 120) fail(400, 'VALIDATION_ERROR', 'La busqueda no puede exceder 120 caracteres.');
+  return search;
+};
+const normalizeRejectReason = (value) => {
+  const reason = String(value ?? '').trim().replace(/\s+/g, ' ');
+  if (!reason || reason.length > 1000) fail(400, 'VALIDATION_ERROR', 'El motivo del rechazo es obligatorio y no puede exceder 1000 caracteres.');
+  return reason;
 };
 
 export const decodeQuickCaptureInvoice = (invoice) => {
@@ -84,7 +95,7 @@ const readAccess = async (req, runner, dependencies, { mutation = false } = {}) 
 
 const loadLocked = async (client, id) => (await client.query(
   `SELECT id_captura_compra_rapida, id_sucursal, id_almacen, id_usuario_registro, estado,
-          fecha_creacion, fecha_envio
+          fecha_creacion, fecha_envio, id_solicitud_compra
    FROM public.capturas_compra_rapida
    WHERE id_captura_compra_rapida = $1
    FOR UPDATE`, [id]
@@ -244,22 +255,52 @@ export const createCapturasCompraRapidaService = (overrides = {}) => {
     const access = await readAccess(req, dependencies.db, dependencies);
     const page = parsePositiveIntStrict(req.query?.page) || 1;
     const limit = Math.min(parsePositiveIntStrict(req.query?.limit) || 10, 100);
+    const state = String(req.query?.estado ?? '').trim().toUpperCase();
+    if (state && !CAPTURE_STATES.has(state)) fail(400, 'VALIDATION_ERROR', 'estado no es valido.');
+    const search = normalizeSearch(req.query?.buscar);
     const params = [];
-    const ownerWhere = access.isOperative ? `WHERE c.id_usuario_registro = $${params.push(access.idUsuario)}` : '';
+    const conditions = [];
+    if (access.isOperative) conditions.push(`c.id_usuario_registro = $${params.push(access.idUsuario)}`);
+    if (state) conditions.push(`c.estado = $${params.push(state)}`);
+    if (search) {
+      const ref = `$${params.push(search)}`;
+      const numeric = /^\d+$/.test(search) ? Number(search) : null;
+      conditions.push(`(
+        ${numeric ? `c.id_captura_compra_rapida = $${params.push(numeric)} OR` : ''}
+        u.nombre_usuario ILIKE '%' || ${ref} || '%'
+        OR COALESCE(p.nombre, '') ILIKE '%' || ${ref} || '%'
+        OR COALESCE(p.apellido, '') ILIKE '%' || ${ref} || '%'
+        OR s.nombre_sucursal ILIKE '%' || ${ref} || '%'
+        OR a.nombre ILIKE '%' || ${ref} || '%'
+      )`);
+    }
+    const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
     params.push(limit, (page - 1) * limit);
     const result = await dependencies.db.query(
       `SELECT c.id_captura_compra_rapida, c.estado, c.id_sucursal, c.id_almacen, c.fecha_creacion, c.fecha_envio,
+              c.fecha_gestion, c.id_solicitud_compra, c.motivo_rechazo,
               JSON_BUILD_OBJECT('id', s.id_sucursal, 'nombre', s.nombre_sucursal) AS sucursal,
               JSON_BUILD_OBJECT('id', a.id_almacen, 'nombre', a.nombre) AS almacen,
+              JSON_BUILD_OBJECT('id_usuario', u.id_usuario, 'nombre', COALESCE(NULLIF(TRIM(CONCAT_WS(' ', p.nombre, p.apellido)), ''), u.nombre_usuario), 'nombre_usuario', u.nombre_usuario) AS registrador,
+              CASE WHEN ug.id_usuario IS NULL THEN NULL ELSE JSON_BUILD_OBJECT('id_usuario', ug.id_usuario, 'nombre', COALESCE(NULLIF(TRIM(CONCAT_WS(' ', pg.nombre, pg.apellido)), ''), ug.nombre_usuario), 'nombre_usuario', ug.nombre_usuario) END AS gestor,
               COUNT(e.id_captura_evidencia)::int AS cantidad_evidencias,
               COUNT(*) OVER()::int AS total_count
        FROM public.capturas_compra_rapida c
        INNER JOIN public.sucursales s ON s.id_sucursal = c.id_sucursal
        INNER JOIN public.almacenes a ON a.id_almacen = c.id_almacen
+       INNER JOIN public.usuarios u ON u.id_usuario = c.id_usuario_registro
+       LEFT JOIN public.empleados er ON er.id_empleado = u.id_empleado
+       LEFT JOIN public.personas p ON p.id_persona = er.id_persona
+       LEFT JOIN public.usuarios ug ON ug.id_usuario = c.id_usuario_gestion
+       LEFT JOIN public.empleados eg ON eg.id_empleado = ug.id_empleado
+       LEFT JOIN public.personas pg ON pg.id_persona = eg.id_persona
        LEFT JOIN public.capturas_compra_rapida_evidencias e ON e.id_captura_compra_rapida = c.id_captura_compra_rapida
-       ${ownerWhere}
-       GROUP BY c.id_captura_compra_rapida, s.id_sucursal, s.nombre_sucursal, a.id_almacen, a.nombre
-       ORDER BY c.fecha_creacion DESC LIMIT $${params.length - 1} OFFSET $${params.length}`, params
+       ${where}
+       GROUP BY c.id_captura_compra_rapida, s.id_sucursal, s.nombre_sucursal, a.id_almacen, a.nombre,
+                u.id_usuario, p.nombre, p.apellido, ug.id_usuario, pg.nombre, pg.apellido
+       ORDER BY CASE c.estado WHEN 'PENDIENTE' THEN 1 WHEN 'BORRADOR' THEN 2 WHEN 'RECHAZADA' THEN 3 ELSE 4 END,
+                COALESCE(c.fecha_envio, c.fecha_creacion) DESC
+       LIMIT $${params.length - 1} OFFSET $${params.length}`, params
     );
     const total = Number(result.rows?.[0]?.total_count || 0);
     return { ok: true, capturas: (result.rows || []).map(({ total_count, ...row }) => row), pagination: { page, limit, total, total_pages: Math.ceil(total / limit) } };
@@ -273,16 +314,54 @@ export const createCapturasCompraRapidaService = (overrides = {}) => {
     const ownerWhere = access.isOperative ? ` AND c.id_usuario_registro = $${params.push(access.idUsuario)}` : '';
     const result = await dependencies.db.query(
       `SELECT c.id_captura_compra_rapida, c.estado, c.id_sucursal, c.id_almacen, c.fecha_creacion, c.fecha_envio,
+              c.fecha_gestion, c.id_solicitud_compra, c.observacion, c.motivo_rechazo,
               JSON_BUILD_OBJECT('id', s.id_sucursal, 'nombre', s.nombre_sucursal) AS sucursal,
               JSON_BUILD_OBJECT('id', a.id_almacen, 'nombre', a.nombre) AS almacen,
+              JSON_BUILD_OBJECT('id_usuario', u.id_usuario, 'nombre', COALESCE(NULLIF(TRIM(CONCAT_WS(' ', p.nombre, p.apellido)), ''), u.nombre_usuario), 'nombre_usuario', u.nombre_usuario) AS registrador,
+              CASE WHEN ug.id_usuario IS NULL THEN NULL ELSE JSON_BUILD_OBJECT('id_usuario', ug.id_usuario, 'nombre', COALESCE(NULLIF(TRIM(CONCAT_WS(' ', pg.nombre, pg.apellido)), ''), ug.nombre_usuario), 'nombre_usuario', ug.nombre_usuario) END AS gestor,
               (SELECT COUNT(*)::int FROM public.capturas_compra_rapida_evidencias e WHERE e.id_captura_compra_rapida = c.id_captura_compra_rapida) AS cantidad_evidencias
        FROM public.capturas_compra_rapida c
        INNER JOIN public.sucursales s ON s.id_sucursal = c.id_sucursal
        INNER JOIN public.almacenes a ON a.id_almacen = c.id_almacen
+       INNER JOIN public.usuarios u ON u.id_usuario = c.id_usuario_registro
+       LEFT JOIN public.empleados er ON er.id_empleado = u.id_empleado
+       LEFT JOIN public.personas p ON p.id_persona = er.id_persona
+       LEFT JOIN public.usuarios ug ON ug.id_usuario = c.id_usuario_gestion
+       LEFT JOIN public.empleados eg ON eg.id_empleado = ug.id_empleado
+       LEFT JOIN public.personas pg ON pg.id_persona = eg.id_persona
        WHERE c.id_captura_compra_rapida = $1${ownerWhere}`, params
     );
     if (!result.rows?.[0]) fail(404, 'NOT_FOUND', 'Captura rapida no encontrada.');
-    return { ok: true, captura: result.rows[0] };
+    const capture = result.rows[0];
+    capture.acciones = { puede_rechazar: access.isAdministrative && capture.estado === 'PENDIENTE' && capture.id_solicitud_compra === null };
+    return { ok: true, captura: capture };
+  };
+
+  const reject = async (req) => {
+    const id = parsePositiveIntStrict(req.params?.id_captura);
+    if (!id) fail(400, 'VALIDATION_ERROR', 'id_captura debe ser un entero positivo.');
+    ensurePlainObject(req.body, 'El payload debe ser un objeto.');
+    rejectUnexpectedFields(req.body, new Set(['motivo_rechazo']), 'El payload');
+    const reason = normalizeRejectReason(req.body.motivo_rechazo);
+    const client = await dependencies.db.connect(); let started = false;
+    try {
+      await client.query('BEGIN'); started = true;
+      const access = await readAccess(req, client, dependencies);
+      if (!access.isAdministrative) fail(403, 'FORBIDDEN', 'El rol del usuario no puede gestionar capturas rapidas.');
+      const capture = await loadLocked(client, id);
+      if (!capture) fail(404, 'NOT_FOUND', 'Captura rapida no encontrada.');
+      if (capture.estado !== 'PENDIENTE' || capture.id_solicitud_compra !== null) fail(409, 'INVALID_STATE', 'La captura cambio y ya no puede rechazarse.');
+      const result = await client.query(
+        `UPDATE public.capturas_compra_rapida
+         SET estado = 'RECHAZADA', id_usuario_gestion = $2, fecha_gestion = NOW(), motivo_rechazo = $3
+         WHERE id_captura_compra_rapida = $1 AND estado = 'PENDIENTE' AND id_solicitud_compra IS NULL
+         RETURNING id_captura_compra_rapida, estado, fecha_envio, fecha_gestion, motivo_rechazo, id_usuario_gestion`,
+        [id, access.idUsuario, reason]
+      );
+      if (result.rowCount !== 1) fail(409, 'INVALID_STATE', 'La captura cambio y ya no puede rechazarse.');
+      await client.query('COMMIT'); started = false;
+      return { ok: true, captura: result.rows[0] };
+    } catch (error) { if (started) await rollback(client); throw mapError(error); } finally { client.release(); }
   };
 
   const listEvidence = async (req) => {
@@ -304,7 +383,7 @@ export const createCapturasCompraRapidaService = (overrides = {}) => {
     return { ok: true, evidencias };
   };
 
-  return { create, uploadInvoice, deleteEvidence, discard, send, list, detail, listEvidence };
+  return { create, uploadInvoice, deleteEvidence, discard, send, list, detail, listEvidence, reject };
 };
 
 export const capturasCompraRapidaService = createCapturasCompraRapidaService();
