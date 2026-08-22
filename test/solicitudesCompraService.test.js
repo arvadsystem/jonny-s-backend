@@ -140,6 +140,7 @@ test('catalogo completo no excluye disponibles cuando solo_stock_bajo es false o
 });
 
 test('catalogo normaliza tildes separadores espacios y variante compacta', () => {
+  assert.deepEqual(normalizeCatalogSearch('PIÑA'), { text: 'pina', compact: 'pina' });
   assert.deepEqual(normalizeCatalogSearch('  LIMÓN   isotónico  '), {
     text: 'limon isotonico',
     compact: 'limonisotonico'
@@ -153,6 +154,7 @@ test('catalogo normaliza tildes separadores espacios y variante compacta', () =>
     compact: 'cocacola5x11'
   });
   assert.equal(normalizeCatalogSearch('   '), null);
+  assert.equal(normalizeCatalogSearch(' -- !!! '), null);
   assert.throws(() => normalizeCatalogSearch('x'.repeat(121)), (error) => error.status === 400);
 });
 
@@ -428,6 +430,25 @@ test('rechaza presentacion perteneciente a otro insumo', async () => {
     (error) => error.status === 400 && /no pertenece/.test(error.message)
   );
   assert.ok(tx.calls.some((call) => call.sql === 'ROLLBACK'));
+});
+
+test('catalogo usa tokens AND parametrizados para frases en cualquier orden', async () => {
+  for (const buscar of ['concentrado pina', 'pina concentrado']) {
+    const { captured } = await captureCatalogQuery({ buscar });
+    const sql = captured.sql.replace(/\s+/g, ' ');
+    assert.match(sql, /NOT EXISTS \( SELECT 1 FROM unnest\(string_to_array\(\$2, ' '\)\) AS search_token\(value\)/);
+    assert.match(sql, /WHERE catalogo\.search_text NOT LIKE '%' \|\| search_token\.value \|\| '%'/);
+    assert.equal(captured.params[1], buscar);
+    assert.equal(captured.params[2], buscar.replace(/ /g, ''));
+  }
+});
+
+test('tokens compuestos son obligatorios y no una coincidencia OR libre', async () => {
+  const { captured } = await captureCatalogQuery({ buscar: 'pina mostaza' });
+  const sql = captured.sql.replace(/\s+/g, ' ');
+  assert.match(sql, /NOT EXISTS[\s\S]*WHERE catalogo\.search_text NOT LIKE/);
+  assert.doesNotMatch(sql, /search_token\.value[^)]* OR /);
+  assert.deepEqual(captured.params.slice(1, 3), ['pina mostaza', 'pinamostaza']);
 });
 
 test('presentacion incompatible devuelve 409 semantico y mensaje accionable sin crear solicitud', async () => {

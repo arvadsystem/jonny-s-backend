@@ -117,6 +117,7 @@ export const normalizeCatalogSearch = (value) => {
   if (!normalized) return null;
   const text = normalized.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase()
     .replace(/[^a-z0-9]+/g, ' ').trim().replace(/\s+/g, ' ');
+  if (!text) return null;
   return { text, compact: text.replace(/[^a-z0-9]+/g, '') };
 };
 
@@ -503,7 +504,14 @@ export const createSolicitudesCompraService = (overrides = {}) => {
         WITH catalogo AS (${buildCatalogUnion(type)})
         SELECT catalogo.*, COUNT(*) OVER()::integer AS total_count
         FROM catalogo
-        WHERE ($2::text IS NULL OR catalogo.search_text LIKE '%' || $2 || '%' OR catalogo.search_text_compact LIKE '%' || $3 || '%')
+        WHERE ($2::text IS NULL
+          OR catalogo.search_text LIKE '%' || $2 || '%'
+          OR catalogo.search_text_compact LIKE '%' || $3 || '%'
+          OR NOT EXISTS (
+            SELECT 1
+            FROM unnest(string_to_array($2, ' ')) AS search_token(value)
+            WHERE catalogo.search_text NOT LIKE '%' || search_token.value || '%'
+          ))
           AND ($4::boolean = false OR catalogo.estado_stock IN ('SIN_STOCK', 'STOCK_BAJO'))
         ORDER BY
           CASE catalogo.estado_stock
