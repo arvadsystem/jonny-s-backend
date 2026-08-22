@@ -105,31 +105,20 @@ CREATE INDEX IF NOT EXISTS idx_capturas_compra_rapida_evidencias_captura_fecha
   ON public.capturas_compra_rapida_evidencias
   (id_captura_compra_rapida, fecha_registro DESC);
 
-WITH requested_perms(nombre_permiso) AS (
+WITH requested_perms(nombre_permiso, descripcion) AS (
   VALUES
-    ('INVENTARIO_OC_CAPTURA_RAPIDA_CREAR'),
-    ('INVENTARIO_OC_CAPTURA_RAPIDA_VER'),
-    ('INVENTARIO_OC_CAPTURA_RAPIDA_GESTIONAR')
-), missing_perms AS (
-  SELECT rp.nombre_permiso
-  FROM requested_perms rp
-  WHERE NOT EXISTS (
-    SELECT 1
-    FROM public.permisos p
-    WHERE p.nombre_permiso = rp.nombre_permiso
-  )
-), base AS (
-  SELECT COALESCE(MAX(id_permiso), 0) AS max_id
-  FROM public.permisos
-), numbered_perms AS (
-  SELECT base.max_id + ROW_NUMBER() OVER (ORDER BY mp.nombre_permiso) AS id_permiso,
-         mp.nombre_permiso
-  FROM missing_perms mp
-  CROSS JOIN base
+    ('INVENTARIO_OC_CAPTURA_RAPIDA_CREAR', 'Permite crear y enviar capturas rápidas de compras con factura.'),
+    ('INVENTARIO_OC_CAPTURA_RAPIDA_VER', 'Permite consultar capturas rápidas de compras y sus evidencias.'),
+    ('INVENTARIO_OC_CAPTURA_RAPIDA_GESTIONAR', 'Permite gestionar, rechazar y formalizar capturas rápidas de compras.')
 )
-INSERT INTO public.permisos (id_permiso, nombre_permiso)
-SELECT id_permiso, nombre_permiso
-FROM numbered_perms;
+INSERT INTO public.permisos (nombre_permiso, descripcion)
+SELECT rp.nombre_permiso, rp.descripcion
+FROM requested_perms rp
+WHERE NOT EXISTS (
+  SELECT 1
+  FROM public.permisos p
+  WHERE p.nombre_permiso = rp.nombre_permiso
+);
 
 WITH role_permissions(nombre_rol, nombre_permiso) AS (
   VALUES

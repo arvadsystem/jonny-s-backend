@@ -66,17 +66,26 @@ test('script crea exclusivamente los indices requeridos', async () => {
   ]) assert.match(sql, new RegExp(`CREATE INDEX IF NOT EXISTS ${index}`));
 });
 
-test('permisos usan missing_perms MAX y ROW_NUMBER sin IDs hardcodeados', async () => {
+test('permisos respetan identity e incluyen metadata administrativa', async () => {
   const [sql] = await readArtifacts();
-  for (const permission of [
-    'INVENTARIO_OC_CAPTURA_RAPIDA_CREAR',
-    'INVENTARIO_OC_CAPTURA_RAPIDA_VER',
-    'INVENTARIO_OC_CAPTURA_RAPIDA_GESTIONAR'
-  ]) assert.match(sql, new RegExp(permission));
-  assert.match(sql, /missing_perms/);
-  assert.match(sql, /MAX\(id_permiso\)/);
-  assert.match(sql, /ROW_NUMBER\(\) OVER/);
-  assert.doesNotMatch(sql, /INSERT INTO public\.permisos[\s\S]*VALUES\s*\(\s*\d+/);
+  const permissionBlock = sql.slice(sql.indexOf('WITH requested_perms'), sql.indexOf('WITH role_permissions'));
+  const expected = [
+    ['INVENTARIO_OC_CAPTURA_RAPIDA_CREAR', 'Permite crear y enviar capturas rápidas de compras con factura.'],
+    ['INVENTARIO_OC_CAPTURA_RAPIDA_VER', 'Permite consultar capturas rápidas de compras y sus evidencias.'],
+    ['INVENTARIO_OC_CAPTURA_RAPIDA_GESTIONAR', 'Permite gestionar, rechazar y formalizar capturas rápidas de compras.']
+  ];
+  for (const [permission, description] of expected) {
+    assert.match(permissionBlock, new RegExp(permission));
+    assert.ok(permissionBlock.includes(description));
+  }
+  assert.match(permissionBlock, /requested_perms\(nombre_permiso, descripcion\)/);
+  assert.match(permissionBlock, /INSERT INTO public\.permisos \(nombre_permiso, descripcion\)/);
+  assert.match(permissionBlock, /WHERE NOT EXISTS/);
+  assert.doesNotMatch(permissionBlock, /INSERT INTO public\.permisos\s*\([^)]*id_permiso/i);
+  assert.doesNotMatch(sql, /MAX\s*\(\s*id_permiso\s*\)/i);
+  assert.doesNotMatch(sql, /ROW_NUMBER\s*\(/i);
+  assert.doesNotMatch(sql, /OVERRIDING\s+SYSTEM\s+VALUE/i);
+  assert.doesNotMatch(sql, /setval\s*\(/i);
 });
 
 test('asignacion usa roles normalizados y matriz exacta sin root ni admin generico', async () => {

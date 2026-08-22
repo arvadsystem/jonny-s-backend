@@ -32,6 +32,8 @@ Permisos definidos:
 - `INVENTARIO_OC_CAPTURA_RAPIDA_VER`: permite consultar capturas rápidas y sus evidencias.
 - `INVENTARIO_OC_CAPTURA_RAPIDA_GESTIONAR`: permite gestionar, rechazar y formalizar capturas rápidas.
 
+Nota técnica: `public.permisos.id_permiso` es una identity `GENERATED ALWAYS`. Las migraciones de este flujo deben permitir que PostgreSQL genere ese ID y nunca insertar IDs manuales, usar `OVERRIDING SYSTEM VALUE` ni manipular su secuencia.
+
 Asignación inicial por nombre normalizado:
 
 - CAJERO y COCINA: CREAR y VER.
