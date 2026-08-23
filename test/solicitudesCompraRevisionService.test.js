@@ -104,13 +104,15 @@ const makeApprovalFixture = ({
   masterActive = true,
   assignmentActive = true,
   onResolveMaster = null,
-  onGetAssignment = null
+  onGetAssignment = null,
+  loadSnapshot = null,
+  failHeaderUpdate = false
 } = {}) => {
   let detailUpdates = 0;
   const tx = makeTransactionDb(async (sql, params) => {
     if (sql.includes('FROM public.solicitudes_compra') && sql.includes('id_almacen') && sql.includes('FOR UPDATE')) {
       return {
-        rows: [{ id_solicitud_compra: 8, id_almacen: 12, estado: state, inventario_aplicado: inventoryApplied }],
+        rows: [{ id_solicitud_compra: 8, id_sucursal: 3, id_almacen: 12, estado: state, inventario_aplicado: inventoryApplied }],
         rowCount: 1
       };
     }
@@ -125,7 +127,9 @@ const makeApprovalFixture = ({
       if (failDetailUpdateAt === detailUpdates) throw Object.assign(new Error('update failed'), { code: '23503' });
       return { rows: [], rowCount: 1 };
     }
+    if (sql.startsWith('INSERT INTO public.solicitudes_compra_detalle')) return { rows: [], rowCount: 1 };
     if (sql.startsWith('UPDATE public.solicitudes_compra')) {
+      if (failHeaderUpdate) throw Object.assign(new Error('header failed'), { code: '23503' });
       return {
         rows: [{
           id_solicitud_compra: 8,
@@ -151,8 +155,9 @@ const makeApprovalFixture = ({
     },
     getAssignment: async (type, id) => {
       if (onGetAssignment) onGetAssignment(type, id);
-      return { id_almacen: 12, activo: assignmentActive };
-    }
+      return { id_almacen: 12, id_sucursal: 3, activo: assignmentActive };
+    },
+    loadSnapshot: loadSnapshot || (async (id, presentationId) => ({ id_presentacion_insumo: presentationId || null, id_unidad_base: 4, nombre_presentacion_snapshot: presentationId ? 'Caja' : 'Unidad base', factor_conversion_snapshot: presentationId ? '12' : '1' }))
   });
   return { service, calls: tx.calls };
 };
@@ -419,6 +424,74 @@ test('rechazo exige comentario no vacio', async () => {
   assert.equal(connected, false);
 });
 
+test('aprobacion mixta inserta producto administrativo dentro de la misma transaccion', async () => {
+  const fixture = makeApprovalFixture({ activeProviderIds: [5, 7] });
+  const result = await fixture.service.approve(approveRequest(approvalBody([
+    { id_solicitud_detalle: 10, cantidad_aprobada: '3', id_proveedor: 5 },
+    { tipo_item: 'producto', id_item: 44, cantidad_aprobada: '2', id_proveedor: 7 }
+  ])));
+  const insert = fixture.calls.find((call) => call.sql.startsWith('INSERT INTO public.solicitudes_compra_detalle'));
+  assert.ok(insert);
+  assert.match(insert.sql, /'ADMINISTRACION'/);
+  assert.deepEqual(insert.params.slice(0, 4), [8, 'PRODUCTO', 44, null]);
+  assert.equal(result.solicitud.total_lineas, 2);
+  assert.ok(fixture.calls.findIndex((call) => call.sql === 'BEGIN') < fixture.calls.indexOf(insert));
+  assert.ok(fixture.calls.indexOf(insert) < fixture.calls.findIndex((call) => call.sql === 'COMMIT'));
+});
+
+test('aprobacion mixta inserta insumo base y presentacion con snapshots server-side', async () => {
+  const fixture = makeApprovalFixture({ activeProviderIds: [5, 8] });
+  await fixture.service.approve(approveRequest(approvalBody([
+    { id_solicitud_detalle: 10, cantidad_aprobada: '3', id_proveedor: 5 },
+    { tipo_item: 'insumo', id_item: 51, cantidad_aprobada: '1.5', id_proveedor: 8 },
+    { tipo_item: 'insumo', id_item: 52, id_presentacion_insumo: 90, cantidad_aprobada: '2', id_proveedor: 8 }
+  ])));
+  const inserts = fixture.calls.filter((call) => call.sql.startsWith('INSERT INTO public.solicitudes_compra_detalle'));
+  assert.equal(inserts.length, 2);
+  assert.equal(inserts[0].params[4], null);
+  assert.equal(inserts[0].params[9], '1.5');
+  assert.equal(inserts[1].params[4], 90);
+  assert.equal(inserts[1].params[9], '24');
+});
+
+test('lineas nuevas bloquean duplicado original duplicado nuevo y producto decimal', async () => {
+  await assert.rejects(makeApprovalFixture().service.approve(approveRequest(approvalBody([
+    { id_solicitud_detalle: 10, cantidad_aprobada: '3', id_proveedor: 5 },
+    { tipo_item: 'producto', id_item: 110, cantidad_aprobada: '2', id_proveedor: 5 }
+  ]))), (error) => error.status === 400 && /ya forma parte/.test(error.message));
+  await assert.rejects(makeApprovalFixture().service.approve(approveRequest(approvalBody([
+    { id_solicitud_detalle: 10, cantidad_aprobada: '3', id_proveedor: 5 },
+    { tipo_item: 'producto', id_item: 44, cantidad_aprobada: '2', id_proveedor: 5 },
+    { tipo_item: 'producto', id_item: 44, cantidad_aprobada: '4', id_proveedor: 5 }
+  ]))), (error) => error.status === 400);
+  await assert.rejects(makeApprovalFixture().service.approve(approveRequest(approvalBody([
+    { id_solicitud_detalle: 10, cantidad_aprobada: '3', id_proveedor: 5 },
+    { tipo_item: 'producto', id_item: 44, cantidad_aprobada: '1.5', id_proveedor: 5 }
+  ]))), (error) => error.status === 400 && /entero positivo/.test(error.message));
+});
+
+test('payload mixto no permite omitir originales ni falsificar union de campos', async () => {
+  const fixture = makeApprovalFixture({ stored: [productStored(10), productStored(12)] });
+  await assert.rejects(fixture.service.approve(approveRequest(approvalBody([
+    { id_solicitud_detalle: 10, cantidad_aprobada: '3', id_proveedor: 5 },
+    { tipo_item: 'producto', id_item: 44, cantidad_aprobada: '2', id_proveedor: 5 }
+  ]))), (error) => error.status === 400 && /exactamente/.test(error.message));
+  await assert.rejects(makeApprovalFixture().service.approve(approveRequest(approvalBody([
+    { id_solicitud_detalle: 10, tipo_item: 'producto', cantidad_aprobada: '3', id_proveedor: 5 }
+  ]))), (error) => error.status === 400 && /campos no permitidos/.test(error.message));
+});
+
+test('fallo posterior a insert administrativo revierte sin commit', async () => {
+  const fixture = makeApprovalFixture({ failHeaderUpdate: true });
+  await assert.rejects(fixture.service.approve(approveRequest(approvalBody([
+    { id_solicitud_detalle: 10, cantidad_aprobada: '3', id_proveedor: 5 },
+    { tipo_item: 'producto', id_item: 44, cantidad_aprobada: '2', id_proveedor: 5 }
+  ]))));
+  assert.ok(fixture.calls.some((call) => call.sql.startsWith('INSERT INTO public.solicitudes_compra_detalle')));
+  assert.ok(fixture.calls.some((call) => call.sql === 'ROLLBACK'));
+  assert.equal(fixture.calls.some((call) => call.sql === 'COMMIT'), false);
+});
+
 test('rechazo limita comentario a mil caracteres', async () => {
   const fixture = makeRejectionFixture();
   await assert.rejects(
@@ -544,6 +617,22 @@ test('codigo nuevo no contiene acceso Supabase, CLI, credenciales ni clientes ad
   ]);
   const combined = sources.join('\n');
   assert.doesNotMatch(combined, /supabase|service_role|execute_sql|apply_migration|project[_-]?id|cluideiojeikzcmmizhe/i);
+});
+
+test('trazabilidad versionada distingue creacion normal captura y administracion sin ejecutar SQL', async () => {
+  const [normal, quick, revision, migration] = await Promise.all([
+    readFile(new URL('../services/solicitudesCompraService.js', import.meta.url), 'utf8'),
+    readFile(new URL('../services/capturasCompraRapidaFormalizacionService.js', import.meta.url), 'utf8'),
+    readFile(new URL('../services/solicitudesCompraRevisionService.js', import.meta.url), 'utf8'),
+    readFile(new URL('../docs/sql/2026-08-22-oc-origen-linea-administracion.sql', import.meta.url), 'utf8')
+  ]);
+  assert.match(normal, /origen_linea[\s\S]{0,180}'SUCURSAL'/);
+  assert.match(normal, /COALESCE\(d\.origen_linea, 'SUCURSAL'\) AS origen_linea/);
+  assert.match(quick, /origen_linea[\s\S]{0,180}'CAPTURA_RAPIDA'/);
+  assert.match(revision, /origen_linea[\s\S]{0,300}'ADMINISTRACION'/);
+  assert.match(migration, /CHECK \(origen_linea IN \('SUCURSAL', 'ADMINISTRACION', 'CAPTURA_RAPIDA'\)\)/);
+  assert.match(migration, /capturas_compra_rapida[\s\S]*id_solicitud_compra/);
+  assert.doesNotMatch(migration, /CREATE\s+INDEX/i);
 });
 
 test('aprobacion revalida maestro y asignacion local sin modificar stock', async () => {

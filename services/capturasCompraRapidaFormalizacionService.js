@@ -127,8 +127,8 @@ export const createCapturasCompraRapidaFormalizacionService = (overrides = {}) =
             (id_solicitud_compra, tipo_item, id_producto, id_insumo, id_presentacion_insumo, id_unidad_base,
              nombre_presentacion_snapshot, factor_conversion_snapshot, id_proveedor,
              cantidad_solicitada, cantidad_base_solicitada, cantidad_aprobada, cantidad_base_aprobada,
-             cantidad_recibida, cantidad_base_recibida)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8::numeric, $9, $10::numeric, $11::numeric, $10::numeric, $11::numeric, $10::numeric, $11::numeric)`,
+             cantidad_recibida, cantidad_base_recibida, origen_linea)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8::numeric, $9, $10::numeric, $11::numeric, $10::numeric, $11::numeric, $10::numeric, $11::numeric, 'CAPTURA_RAPIDA')`,
           [requestId, line.type.toUpperCase(), line.type === 'producto' ? line.masterId : null, line.type === 'insumo' ? line.masterId : null,
             line.id_presentacion_insumo, line.id_unidad_base, line.nombre_presentacion_snapshot, line.factor_conversion_snapshot,
             line.providerId, line.quantity, line.baseQuantity]

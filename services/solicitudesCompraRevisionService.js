@@ -5,6 +5,7 @@ import {
   resolveCatalogoMaestroEntity
 } from './catalogoMaestroAsignacionesService.js';
 import {
+  loadInsumoSnapshot,
   SolicitudesCompraError,
   parsePositiveIntStrict,
   parseQuantity
@@ -16,7 +17,8 @@ const MAX_LINES = 100;
 const MAX_COMMENT_LENGTH = 1000;
 const ADMIN_ROLES = new Set(['SUPER_ADMIN', 'ADMIN', 'ADMINISTRADOR']);
 const APPROVAL_FIELDS = new Set(['comentario_revision', 'detalles']);
-const APPROVAL_DETAIL_FIELDS = new Set(['id_solicitud_detalle', 'cantidad_aprobada', 'id_proveedor']);
+const EXISTING_APPROVAL_DETAIL_FIELDS = new Set(['id_solicitud_detalle', 'cantidad_aprobada', 'id_proveedor']);
+const NEW_APPROVAL_DETAIL_FIELDS = new Set(['tipo_item', 'id_item', 'id_presentacion_insumo', 'cantidad_aprobada', 'id_proveedor']);
 const REJECTION_FIELDS = new Set(['comentario_revision']);
 
 const fail = (status, code, message) => {
@@ -86,15 +88,26 @@ const validateApprovalPayload = (body) => {
   const seenIds = new Set();
   const parsedDetails = body.detalles.map((detail) => {
     ensurePlainObject(detail, 'Cada detalle debe ser un objeto.');
-    rejectUnexpectedFields(detail, APPROVAL_DETAIL_FIELDS, 'El detalle');
-    const id = parsePositiveIntStrict(detail.id_solicitud_detalle);
+    const existing = Object.hasOwn(detail, 'id_solicitud_detalle');
+    rejectUnexpectedFields(detail, existing ? EXISTING_APPROVAL_DETAIL_FIELDS : NEW_APPROVAL_DETAIL_FIELDS, 'El detalle');
     const providerId = parsePositiveIntStrict(detail.id_proveedor);
-    if (!id) fail(400, 'VALIDATION_ERROR', 'id_solicitud_detalle debe ser un entero positivo.');
-    if (seenIds.has(id)) fail(400, 'VALIDATION_ERROR', 'No se permiten IDs de detalle duplicados.');
     if (!providerId) fail(400, 'VALIDATION_ERROR', 'id_proveedor es obligatorio y debe ser un entero positivo.');
     if (!hasValue(detail.cantidad_aprobada)) fail(400, 'VALIDATION_ERROR', 'cantidad_aprobada es obligatoria.');
-    seenIds.add(id);
-    return { id_solicitud_detalle: id, id_proveedor: providerId, rawQuantity: detail.cantidad_aprobada };
+    if (existing) {
+      const id = parsePositiveIntStrict(detail.id_solicitud_detalle);
+      if (!id) fail(400, 'VALIDATION_ERROR', 'id_solicitud_detalle debe ser un entero positivo.');
+      if (seenIds.has(id)) fail(400, 'VALIDATION_ERROR', 'No se permiten IDs de detalle duplicados.');
+      seenIds.add(id);
+      return { kind: 'existing', id_solicitud_detalle: id, id_proveedor: providerId, rawQuantity: detail.cantidad_aprobada };
+    }
+    const type = String(detail.tipo_item ?? '').trim().toLowerCase();
+    const itemId = parsePositiveIntStrict(detail.id_item);
+    const presentationId = hasValue(detail.id_presentacion_insumo) ? parsePositiveIntStrict(detail.id_presentacion_insumo) : null;
+    if (!['producto', 'insumo'].includes(type)) fail(400, 'VALIDATION_ERROR', 'tipo_item debe ser producto o insumo.');
+    if (!itemId) fail(400, 'VALIDATION_ERROR', 'id_item debe ser un entero positivo.');
+    if (hasValue(detail.id_presentacion_insumo) && !presentationId) fail(400, 'VALIDATION_ERROR', 'id_presentacion_insumo debe ser un entero positivo.');
+    if (type === 'producto' && presentationId) fail(400, 'VALIDATION_ERROR', 'Los productos no aceptan presentacion de insumo.');
+    return { kind: 'new', type, itemId, presentationId, id_proveedor: providerId, rawQuantity: detail.cantidad_aprobada };
   });
   return { comment: normalizeComment(body.comentario_revision), details: parsedDetails };
 };
@@ -173,7 +186,8 @@ export const createSolicitudesCompraRevisionService = (overrides = {}) => {
     db: overrides.db || pool,
     readAccess: overrides.readAccess || readRequestAccess,
     resolveMaster: overrides.resolveMaster || resolveCatalogoMaestroEntity,
-    getAssignment: overrides.getAssignment || getWarehouseAssignmentDetails
+    getAssignment: overrides.getAssignment || getWarehouseAssignmentDetails,
+    loadSnapshot: overrides.loadSnapshot || loadInsumoSnapshot
   };
 
   const listProviders = async (req) => {
@@ -220,7 +234,7 @@ export const createSolicitudesCompraRevisionService = (overrides = {}) => {
       const access = await assertAdministrativeAccess(req, client, dependencies.readAccess);
       const headerResult = await client.query(
         `
-          SELECT id_solicitud_compra, id_almacen, estado, inventario_aplicado
+          SELECT id_solicitud_compra, id_sucursal, id_almacen, estado, inventario_aplicado
           FROM public.solicitudes_compra
           WHERE id_solicitud_compra = $1
           FOR UPDATE
@@ -232,7 +246,7 @@ export const createSolicitudesCompraRevisionService = (overrides = {}) => {
       const storedResult = await client.query(
         `
           SELECT id_solicitud_detalle, tipo_item, id_producto, id_insumo,
-                 factor_conversion_snapshot
+                 id_presentacion_insumo, factor_conversion_snapshot
           FROM public.solicitudes_compra_detalle
           WHERE id_solicitud_compra = $1
           ORDER BY id_solicitud_detalle
@@ -241,15 +255,18 @@ export const createSolicitudesCompraRevisionService = (overrides = {}) => {
         [requestId]
       );
       const storedDetails = storedResult.rows || [];
-      if (storedDetails.length !== payload.details.length) {
+      const submittedExisting = payload.details.filter((detail) => detail.kind === 'existing');
+      const submittedNew = payload.details.filter((detail) => detail.kind === 'new');
+      if (storedDetails.length + submittedNew.length > MAX_LINES) fail(400, 'VALIDATION_ERROR', `No se permiten mas de ${MAX_LINES} lineas.`);
+      if (storedDetails.length !== submittedExisting.length) {
         fail(400, 'VALIDATION_ERROR', 'El payload debe contener exactamente todas las lineas actuales de la solicitud.');
       }
       const storedById = new Map(storedDetails.map((detail) => [Number(detail.id_solicitud_detalle), detail]));
-      if (payload.details.some((detail) => !storedById.has(detail.id_solicitud_detalle))) {
+      if (submittedExisting.some((detail) => !storedById.has(detail.id_solicitud_detalle))) {
         fail(400, 'VALIDATION_ERROR', 'El payload contiene una linea que no pertenece a la solicitud.');
       }
 
-      const normalizedDetails = payload.details.map((submitted) => {
+      const normalizedExisting = submittedExisting.map((submitted) => {
         const stored = storedById.get(submitted.id_solicitud_detalle);
         const type = String(stored.tipo_item || '').trim().toUpperCase();
         if (!['PRODUCTO', 'INSUMO'].includes(type)) fail(409, 'CONFLICT', 'La solicitud contiene un tipo de item no valido.');
@@ -271,6 +288,37 @@ export const createSolicitudesCompraRevisionService = (overrides = {}) => {
         };
       });
 
+      const existingKeys = new Set(normalizedExisting.map((detail) => `${detail.type.toLowerCase()}:${detail.masterId}:${storedById.get(detail.id_solicitud_detalle)?.id_presentacion_insumo ?? 'base'}`));
+      const normalizedNew = [];
+      for (const submitted of submittedNew) {
+        const quantity = parseQuantity(submitted.rawQuantity, { integerOnly: submitted.type === 'producto' });
+        if (!quantity) fail(400, 'VALIDATION_ERROR', submitted.type === 'producto'
+          ? 'La cantidad aprobada de un producto debe ser un entero positivo.'
+          : 'La cantidad aprobada de un insumo debe ser positiva y tener hasta 6 decimales.');
+        const resolved = await dependencies.resolveMaster(submitted.type, submitted.itemId, client);
+        if (!resolved.ok || !resolved.master?.estado_global) fail(409, 'CONFLICT', `El ${submitted.type} maestro ya no esta activo o disponible.`);
+        const masterId = Number(resolved.masterId);
+        const assignment = await dependencies.getAssignment(submitted.type, masterId, Number(header.id_almacen), client);
+        if (!assignment?.activo || Number(assignment.id_sucursal) !== Number(header.id_sucursal)) {
+          fail(409, 'CONFLICT', `El ${submitted.type} no tiene una asignacion activa en el almacen de la solicitud.`);
+        }
+        const snapshot = submitted.type === 'producto'
+          ? { id_presentacion_insumo: null, id_unidad_base: null, nombre_presentacion_snapshot: 'Unidad', factor_conversion_snapshot: '1' }
+          : await dependencies.loadSnapshot(masterId, submitted.presentationId, client);
+        const key = `${submitted.type}:${masterId}:${snapshot.id_presentacion_insumo ?? 'base'}`;
+        if (existingKeys.has(key)) fail(400, 'VALIDATION_ERROR', 'El artículo ya forma parte de la solicitud. Ajusta la cantidad aprobada de la línea existente.');
+        existingKeys.add(key);
+        normalizedNew.push({
+          ...submitted,
+          type: submitted.type.toUpperCase(),
+          masterId,
+          ...snapshot,
+          approvedQuantity: quantity.decimal,
+          approvedBaseQuantity: multiplyApprovedQuantityToBase(quantity.decimal, snapshot.factor_conversion_snapshot)
+        });
+      }
+      const normalizedDetails = [...normalizedExisting, ...normalizedNew];
+
       const providerIds = Array.from(new Set(normalizedDetails.map((detail) => detail.id_proveedor)));
       const providersResult = await client.query(
         `
@@ -286,7 +334,7 @@ export const createSolicitudesCompraRevisionService = (overrides = {}) => {
         fail(400, 'VALIDATION_ERROR', 'Uno o mas proveedores no existen o estan inactivos.');
       }
 
-      for (const detail of normalizedDetails) {
+      for (const detail of normalizedExisting) {
         if (!detail.masterId) fail(409, 'CONFLICT', 'La linea no conserva un item maestro valido.');
         const entityType = detail.type.toLowerCase();
         const resolved = await dependencies.resolveMaster(entityType, detail.masterId, client);
@@ -297,6 +345,23 @@ export const createSolicitudesCompraRevisionService = (overrides = {}) => {
         if (!assignment || !assignment.activo) {
           fail(409, 'CONFLICT', `El ${entityType} ya no tiene una asignacion activa en el almacen de la solicitud.`);
         }
+      }
+
+      for (const detail of normalizedNew) {
+        await client.query(
+          `
+            INSERT INTO public.solicitudes_compra_detalle (
+              id_solicitud_compra, tipo_item, id_producto, id_insumo,
+              id_presentacion_insumo, id_unidad_base, nombre_presentacion_snapshot,
+              factor_conversion_snapshot, cantidad_solicitada, cantidad_base_solicitada,
+              cantidad_aprobada, cantidad_base_aprobada, id_proveedor, origen_linea,
+              cantidad_recibida, cantidad_base_recibida
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8::numeric, $9::numeric, $10::numeric, $9::numeric, $10::numeric, $11, 'ADMINISTRACION', NULL, NULL)
+          `,
+          [requestId, detail.type, detail.type === 'PRODUCTO' ? detail.masterId : null, detail.type === 'INSUMO' ? detail.masterId : null,
+            detail.id_presentacion_insumo, detail.id_unidad_base, detail.nombre_presentacion_snapshot,
+            detail.factor_conversion_snapshot, detail.approvedQuantity, detail.approvedBaseQuantity, detail.id_proveedor]
+        );
       }
 
       for (const detail of normalizedDetails) {

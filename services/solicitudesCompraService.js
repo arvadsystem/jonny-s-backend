@@ -572,8 +572,8 @@ export const createSolicitudesCompraService = (overrides = {}) => {
             INSERT INTO public.solicitudes_compra_detalle (
               id_solicitud_compra, tipo_item, id_producto, id_insumo,
               id_presentacion_insumo, id_unidad_base, nombre_presentacion_snapshot,
-              factor_conversion_snapshot, cantidad_solicitada, cantidad_base_solicitada
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8::numeric, $9::numeric, ROUND($9::numeric * $8::numeric, 6))
+              factor_conversion_snapshot, cantidad_solicitada, cantidad_base_solicitada, origen_linea
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8::numeric, $9::numeric, ROUND($9::numeric * $8::numeric, 6), 'SUCURSAL')
           `,
           [
             header.id_solicitud_compra,
@@ -774,7 +774,8 @@ export const createSolicitudesCompraService = (overrides = {}) => {
       : '';
     const detailsResult = await dependencies.db.query(
       `
-        SELECT d.id_solicitud_detalle, d.tipo_item,
+        SELECT d.id_solicitud_detalle, d.tipo_item, COALESCE(d.origen_linea, 'SUCURSAL') AS origen_linea,
+               d.id_presentacion_insumo,
                COALESCE(d.id_producto, d.id_insumo) AS id_item,
                CASE WHEN d.tipo_item = 'PRODUCTO' THEN p.nombre_producto ELSE i.nombre_insumo END AS nombre,
                CASE WHEN d.tipo_item = 'PRODUCTO' THEN cp.nombre_categoria ELSE ci.nombre_categoria END AS categoria,
@@ -834,8 +835,10 @@ export const createSolicitudesCompraService = (overrides = {}) => {
         return {
         ...safeRow,
         ...(access.canViewProviders ? { proveedor: proveedor ?? null } : {}),
+        origen_linea: row.origen_linea || 'SUCURSAL',
         id_solicitud_detalle: Number(row.id_solicitud_detalle),
         id_item: Number(row.id_item),
+        id_presentacion_insumo: row.id_presentacion_insumo === null ? null : Number(row.id_presentacion_insumo),
         cantidad_solicitada: String(row.cantidad_solicitada),
         cantidad_base_solicitada: String(row.cantidad_base_solicitada),
         cantidad_aprobada: row.cantidad_aprobada === null ? null : String(row.cantidad_aprobada),
