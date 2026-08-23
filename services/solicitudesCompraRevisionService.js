@@ -364,7 +364,7 @@ export const createSolicitudesCompraRevisionService = (overrides = {}) => {
         );
       }
 
-      for (const detail of normalizedDetails) {
+      for (const detail of normalizedExisting) {
         const updateResult = await client.query(
           `
             UPDATE public.solicitudes_compra_detalle

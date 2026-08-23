@@ -106,7 +106,8 @@ const makeApprovalFixture = ({
   onResolveMaster = null,
   onGetAssignment = null,
   loadSnapshot = null,
-  failHeaderUpdate = false
+  failHeaderUpdate = false,
+  detailUpdateRowCounts = null
 } = {}) => {
   let detailUpdates = 0;
   const tx = makeTransactionDb(async (sql, params) => {
@@ -125,7 +126,7 @@ const makeApprovalFixture = ({
     if (sql.startsWith('UPDATE public.solicitudes_compra_detalle')) {
       detailUpdates += 1;
       if (failDetailUpdateAt === detailUpdates) throw Object.assign(new Error('update failed'), { code: '23503' });
-      return { rows: [], rowCount: 1 };
+      return { rows: [], rowCount: detailUpdateRowCounts?.[detailUpdates - 1] ?? 1 };
     }
     if (sql.startsWith('INSERT INTO public.solicitudes_compra_detalle')) return { rows: [], rowCount: 1 };
     if (sql.startsWith('UPDATE public.solicitudes_compra')) {
@@ -437,6 +438,57 @@ test('aprobacion mixta inserta producto administrativo dentro de la misma transa
   assert.equal(result.solicitud.total_lineas, 2);
   assert.ok(fixture.calls.findIndex((call) => call.sql === 'BEGIN') < fixture.calls.indexOf(insert));
   assert.ok(fixture.calls.indexOf(insert) < fixture.calls.findIndex((call) => call.sql === 'COMMIT'));
+});
+
+test('regresion: una existente y una nueva actualiza solo id persistido y confirma APROBADA', async () => {
+  const fixture = makeApprovalFixture({ stored: [productStored(101)] });
+  const result = await fixture.service.approve(approveRequest(approvalBody([
+    { id_solicitud_detalle: 101, cantidad_aprobada: '3', id_proveedor: 5 },
+    { tipo_item: 'producto', id_item: 44, cantidad_aprobada: '2', id_proveedor: 5 }
+  ])));
+  const inserts = fixture.calls.filter((call) => call.sql.startsWith('INSERT INTO public.solicitudes_compra_detalle'));
+  const detailUpdates = fixture.calls.filter((call) => call.sql.startsWith('UPDATE public.solicitudes_compra_detalle'));
+  const headerUpdates = fixture.calls.filter((call) => call.sql.startsWith('UPDATE public.solicitudes_compra\n'));
+  assert.equal(inserts.length, 1);
+  assert.equal(detailUpdates.length, 1);
+  assert.equal(detailUpdates[0].params[0], 101);
+  assert.ok(detailUpdates.every((call) => call.params[0] !== null && call.params[0] !== undefined));
+  assert.equal(headerUpdates.length, 1);
+  assert.equal(fixture.calls.filter((call) => call.sql === 'COMMIT').length, 1);
+  assert.equal(fixture.calls.filter((call) => call.sql === 'ROLLBACK').length, 0);
+  assert.equal(result.solicitud.estado, 'APROBADA');
+});
+
+test('regresion: dos existentes y tres nuevas producen dos UPDATE y tres INSERT', async () => {
+  const fixture = makeApprovalFixture({ stored: [productStored(101), productStored(102)] });
+  const result = await fixture.service.approve(approveRequest(approvalBody([
+    { id_solicitud_detalle: 101, cantidad_aprobada: '3', id_proveedor: 5 },
+    { id_solicitud_detalle: 102, cantidad_aprobada: '4', id_proveedor: 5 },
+    { tipo_item: 'producto', id_item: 44, cantidad_aprobada: '1', id_proveedor: 5 },
+    { tipo_item: 'producto', id_item: 45, cantidad_aprobada: '2', id_proveedor: 5 },
+    { tipo_item: 'producto', id_item: 46, cantidad_aprobada: '3', id_proveedor: 5 }
+  ])));
+  const inserts = fixture.calls.filter((call) => call.sql.startsWith('INSERT INTO public.solicitudes_compra_detalle'));
+  const updates = fixture.calls.filter((call) => call.sql.startsWith('UPDATE public.solicitudes_compra_detalle'));
+  assert.equal(inserts.length, 3);
+  assert.equal(updates.length, 2);
+  assert.deepEqual(updates.map((call) => call.params[0]), [101, 102]);
+  assert.equal(fixture.calls.filter((call) => call.sql === 'COMMIT').length, 1);
+  assert.equal(result.solicitud.estado, 'APROBADA');
+  assert.equal(result.solicitud.total_lineas, 5);
+});
+
+test('regresion: UPDATE existente con rowCount cero revierte INSERT administrativo', async () => {
+  const fixture = makeApprovalFixture({ stored: [productStored(101)], detailUpdateRowCounts: [0] });
+  await assert.rejects(fixture.service.approve(approveRequest(approvalBody([
+    { id_solicitud_detalle: 101, cantidad_aprobada: '3', id_proveedor: 5 },
+    { tipo_item: 'producto', id_item: 44, cantidad_aprobada: '2', id_proveedor: 5 }
+  ]))), (error) => error.status === 409 && error.code === 'CONFLICT');
+  assert.equal(fixture.calls.filter((call) => call.sql.startsWith('INSERT INTO public.solicitudes_compra_detalle')).length, 1);
+  assert.equal(fixture.calls.filter((call) => call.sql.startsWith('UPDATE public.solicitudes_compra_detalle')).length, 1);
+  assert.equal(fixture.calls.filter((call) => call.sql === 'ROLLBACK').length, 1);
+  assert.equal(fixture.calls.filter((call) => call.sql === 'COMMIT').length, 0);
+  assert.equal(fixture.calls.filter((call) => call.sql.startsWith('UPDATE public.solicitudes_compra\n')).length, 0);
 });
 
 test('aprobacion mixta inserta insumo base y presentacion con snapshots server-side', async () => {
