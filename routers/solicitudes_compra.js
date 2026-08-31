@@ -90,6 +90,7 @@ router.get('/capturas-rapidas/:id_captura/evidencias', requirePermissions(QUICK_
 router.get('/capturas-rapidas/:id_captura', requirePermissions(QUICK_CAPTURE_VIEW), handler(capturasCompraRapidaService.detail));
 router.post('/', requirePermissions(CREATE_PERMISSIONS), handler(solicitudesCompraService.create));
 router.get('/', requirePermissions(VIEW_PERMISSIONS), handler(solicitudesCompraService.list));
+router.get('/envios/:client_request_id', requirePermissions(CREATE_PERMISSIONS), handler(solicitudesCompraService.getByClientRequestId));
 router.put('/:id_solicitud_compra/aprobar', requirePermissions(APPROVE_PERMISSIONS), handler(solicitudesCompraRevisionService.approve));
 router.put('/:id_solicitud_compra/rechazar', requirePermissions(REJECT_PERMISSIONS), handler(solicitudesCompraRevisionService.reject));
 router.post('/:id_solicitud_compra/evidencias/factura', requirePermissions(RECEIVE_PERMISSIONS), handler(solicitudesCompraRecepcionService.uploadInvoiceEvidence));
