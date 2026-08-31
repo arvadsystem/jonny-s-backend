@@ -7,7 +7,7 @@ const UUID = '123e4567-e89b-42d3-a456-426614174000';
 const access = async () => ({ idUsuario: 7, isSuperAdmin: false, roles: new Set(['CAJERO']) });
 const scope = async () => ({ userSucursalId: 3 });
 
-const makeRuntime = ({ replay = false, reused = false, legacyExisting = false, failDetail = false } = {}) => {
+const makeRuntime = ({ replay = false, reused = false, legacyWindow = 'none', failDetail = false } = {}) => {
   const calls = [];
   let releases = 0;
   let reservedFingerprint = null;
@@ -25,7 +25,7 @@ const makeRuntime = ({ replay = false, reused = false, legacyExisting = false, f
       request_fingerprint: reused ? '0'.repeat(64) : reservedFingerprint,
       estado: 'APROBADA', fecha_creacion: '2026-08-30T12:00:00Z', total_lineas: 55 }], rowCount: 1 };
     if (text.includes('pg_advisory_xact_lock')) return { rows: [{}], rowCount: 1 };
-    if (text.includes("INTERVAL '5 minutes'")) return legacyExisting
+    if (text.includes("INTERVAL '5 minutes'")) return legacyWindow === 'within'
       ? { rows: [{ id_solicitud_compra: 499, estado: 'PENDIENTE', fecha_creacion: '2026-08-30T11:59:50Z', total_lineas: 55 }], rowCount: 1 }
       : { rows: [], rowCount: 0 };
     if (text.startsWith('WITH inputs')) return { rows: params[0].map((id) => ({ input_id: id, master_ids: [], master_id: id,
@@ -53,6 +53,73 @@ const makeRuntime = ({ replay = false, reused = false, legacyExisting = false, f
   const service = createSolicitudesCompraService({ db, readAccess: access, resolveScope: scope,
     resolveOperativeWarehouse: async () => 11, getPoolState: () => ({ totalCount: 1, idleCount: 0, waitingCount: 0 }) });
   return { service, calls, get releases() { return releases; } };
+};
+
+const makeConcurrentRuntime = ({ failFirstDetail = false } = {}) => {
+  const calls = [];
+  const releases = new Map();
+  let nextClientId = 0;
+  let headerCount = 0;
+  let detailInsertCount = 0;
+  let committed = null;
+  let reservation = null;
+  let firstDetailFailed = false;
+  let settleReservation;
+  let reservationSettled = new Promise((resolve) => { settleReservation = resolve; });
+  const makeClient = () => {
+    const clientId = ++nextClientId;
+    let ownsReservation = false;
+    const query = async (sql, params = []) => {
+      const text = String(sql).trim(); calls.push({ clientId, text, params });
+      if (text === 'BEGIN') return { rows: [], rowCount: 0 };
+      if (text === 'COMMIT') {
+        if (ownsReservation) { committed = reservation; reservation = null; ownsReservation = false; settleReservation('committed'); }
+        return { rows: [], rowCount: 0 };
+      }
+      if (text === 'ROLLBACK') {
+        if (ownsReservation) { reservation = null; ownsReservation = false; settleReservation('rolled_back'); }
+        return { rows: [], rowCount: 0 };
+      }
+      if (text.includes('FROM public.almacenes a')) return { rows: [{ id_almacen: 11, id_sucursal: 3, nombre_almacen: 'Bodega', nombre_sucursal: 'Centro', estado: true }], rowCount: 1 };
+      if (text.includes('ON CONFLICT (client_request_id)')) {
+        if (committed) return { rows: [], rowCount: 0 };
+        if (reservation) {
+          const outcome = await reservationSettled;
+          if (outcome === 'rolled_back') return query(sql, params);
+          return { rows: [], rowCount: 0 };
+        }
+        headerCount += 1;
+        reservation = { id_solicitud_compra: 500, id_usuario_solicitante: 7, id_almacen: 11,
+          request_fingerprint: params[5], estado: 'PENDIENTE', fecha_creacion: '2026-08-30T12:00:00Z', total_lineas: 55 };
+        ownsReservation = true;
+        reservationSettled = new Promise((resolve) => { settleReservation = resolve; });
+        return { rows: [reservation], rowCount: 1 };
+      }
+      if (text.includes('WHERE sc.client_request_id')) return { rows: committed ? [{ ...committed }] : [], rowCount: committed ? 1 : 0 };
+      if (text.startsWith('WITH inputs')) return { rows: params[0].map((id) => ({ input_id: id, master_ids: [], master_id: id,
+        found_id: id, nombre: `Item ${id}`, estado_global: true })), rowCount: params[0].length };
+      if (text.includes("SELECT 'producto'::text AS tipo")) return { rows: [
+        ...params[1].map((id) => ({ tipo: 'producto', master_id: id, id_almacen: 11, activo: true, id_sucursal: 3 })),
+        ...params[2].map((id) => ({ tipo: 'insumo', master_id: id, id_almacen: 11, activo: true, id_sucursal: 3 }))
+      ], rowCount: params[1].length + params[2].length };
+      if (text.startsWith('WITH requested')) {
+        const requested = JSON.parse(params[0]);
+        return { rows: requested.map(({ master_id, presentation_id }) => ({ master_id, presentation_id,
+          id_unidad_base_insumo: 5, id_unidad_base_valida: 5, nombre_unidad_base: 'Gramo' })), rowCount: requested.length };
+      }
+      if (text.includes('INSERT INTO public.solicitudes_compra_detalle')) {
+        if (failFirstDetail && !firstDetailFailed) { firstDetailFailed = true; throw Object.assign(new Error('fk'), { code: '23503' }); }
+        detailInsertCount += 1; return { rows: [], rowCount: 1 };
+      }
+      throw new Error(`Consulta inesperada concurrente: ${text.slice(0, 80)}`);
+    };
+    return { query, release: () => releases.set(clientId, (releases.get(clientId) || 0) + 1) };
+  };
+  const service = createSolicitudesCompraService({ db: { connect: async () => makeClient() }, readAccess: access,
+    resolveScope: scope, resolveOperativeWarehouse: async () => 11,
+    getPoolState: () => ({ totalCount: nextClientId, idleCount: 0, waitingCount: 0 }) });
+  return { service, calls, releases, get headerCount() { return headerCount; },
+    get detailInsertCount() { return detailInsertCount; }, get committed() { return committed; } };
 };
 
 const payload = (count = 1, withUuid = true) => ({ id_almacen: 11, ...(withUuid ? { client_request_id: UUID } : {}),
@@ -95,12 +162,54 @@ test('key reutilizada por otro usuario responde 409 sin filtrar datos y release 
   assert.equal(runtime.releases, 1);
 });
 
-test('legacy dedupe bajo advisory lock retorna existente sin nuevo header', async () => {
-  const runtime = makeRuntime({ legacyExisting: true });
+test('legacy dedupe bajo advisory lock retorna existente dentro de 5 minutos', async () => {
+  const runtime = makeRuntime({ legacyWindow: 'within' });
   const result = await runtime.service.create({ body: payload(55, false) });
   assert.equal(result.legacy_deduplicated, true);
   assert.equal(runtime.calls.filter((call) => call.text.includes('INSERT INTO public.solicitudes_compra (')).length, 0);
   assert.equal(runtime.releases, 1);
+});
+
+test('legacy permite nueva OC fuera de ventana de 5 minutos', async () => {
+  const runtime = makeRuntime({ legacyWindow: 'outside' });
+  const result = await runtime.service.create({ body: payload(1, false) });
+  assert.equal(result.legacy_deduplicated, false);
+  assert.equal(runtime.calls.filter((call) => call.text.includes('INSERT INTO public.solicitudes_compra (')).length, 1);
+});
+
+test('legacy permite nueva OC con fingerprint diferente dentro de la ventana', async () => {
+  const runtime = makeRuntime({ legacyWindow: 'different' });
+  const result = await runtime.service.create({ body: { ...payload(1, false), observacion: 'Otra solicitud' } });
+  assert.equal(result.legacy_deduplicated, false);
+  assert.equal(runtime.calls.filter((call) => call.text.includes('INSERT INTO public.solicitudes_compra (')).length, 1);
+  assert.match(runtime.calls.find((call) => call.text.includes('pg_advisory_xact_lock')).params[0], /^[0-9]+:[0-9]+:[0-9a-f]{64}$/);
+});
+
+test('dos create concurrentes con la misma UUID producen una creacion y un replay', async () => {
+  const runtime = makeConcurrentRuntime();
+  const [first, second] = await Promise.all([
+    runtime.service.create({ body: payload(55) }),
+    runtime.service.create({ body: payload(55) })
+  ]);
+  assert.equal(runtime.headerCount, 1);
+  assert.equal(runtime.detailInsertCount, 1);
+  assert.equal(first.id_solicitud_compra, second.id_solicitud_compra);
+  assert.deepEqual([first.idempotent_replay, second.idempotent_replay].sort(), [false, true]);
+  assert.equal(runtime.releases.size, 2);
+  assert.deepEqual([...runtime.releases.values()], [1, 1]);
+});
+
+test('rollback libera reserva y retry con la misma UUID puede crear', async () => {
+  const runtime = makeConcurrentRuntime({ failFirstDetail: true });
+  await assert.rejects(runtime.service.create({ body: payload(1) }), (error) => error.status === 400);
+  const result = await runtime.service.create({ body: payload(1) });
+  assert.equal(result.id_solicitud_compra, 500);
+  assert.equal(result.idempotent_replay, false);
+  assert.equal(runtime.headerCount, 2, 'dos reservas transaccionales, pero solo la segunda queda confirmada');
+  assert.equal(runtime.detailInsertCount, 1);
+  assert.equal(runtime.committed.id_solicitud_compra, 500);
+  assert.equal(runtime.releases.size, 2);
+  assert.deepEqual([...runtime.releases.values()], [1, 1]);
 });
 
 test('rollback de detalle libera cliente una vez y no hace commit', async () => {
