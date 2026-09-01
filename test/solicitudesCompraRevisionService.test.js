@@ -338,6 +338,16 @@ test('cantidad_base_aprobada usa factor_conversion_snapshot con redondeo a seis 
   assert.equal(update.params[3], '3.08625');
 });
 
+test('aprobacion conserva cantidad decimal y factor snapshot de 18 decimales', async () => {
+  assert.equal(multiplyApprovedQuantityToBase('2.5', '12.000000000000000000'), '30');
+  const fixture = makeApprovalFixture({ stored: [supplyStored(11, '12.000000000000000000')] });
+  await fixture.service.approve(approveRequest(approvalBody([
+    { id_solicitud_detalle: 11, cantidad_aprobada: '2.5', id_proveedor: 5 }
+  ])));
+  const update = fixture.calls.find((call) => call.sql.startsWith('UPDATE public.solicitudes_compra_detalle'));
+  assert.deepEqual(update.params.slice(2, 4), ['2.5', '30']);
+});
+
 test('proveedor inexistente es rechazado', async () => {
   const fixture = makeApprovalFixture({ activeProviderIds: [] });
   await assert.rejects(fixture.service.approve(approveRequest()), (error) => error.status === 400 && /proveedores/.test(error.message));
@@ -504,6 +514,20 @@ test('aprobacion mixta inserta insumo base y presentacion con snapshots server-s
   assert.equal(inserts[0].params[9], '1.5');
   assert.equal(inserts[1].params[4], 90);
   assert.equal(inserts[1].params[9], '24');
+});
+
+test('administracion agrega insumo con presentacion y factor de 18 decimales', async () => {
+  const fixture = makeApprovalFixture({
+    activeProviderIds: [5, 8],
+    loadSnapshot: async () => ({ id_presentacion_insumo: 90, id_unidad_base: 4, nombre_presentacion_snapshot: 'Caja', factor_conversion_snapshot: '0.041666666666666667' })
+  });
+  await fixture.service.approve(approveRequest(approvalBody([
+    { id_solicitud_detalle: 10, cantidad_aprobada: '3', id_proveedor: 5 },
+    { tipo_item: 'insumo', id_item: 52, id_presentacion_insumo: 90, cantidad_aprobada: '24', id_proveedor: 8 }
+  ])));
+  const insert = fixture.calls.find((call) => call.sql.startsWith('INSERT INTO public.solicitudes_compra_detalle'));
+  assert.equal(insert.params[7], '0.041666666666666667');
+  assert.equal(insert.params[9], '1');
 });
 
 test('lineas nuevas bloquean duplicado original duplicado nuevo y producto decimal', async () => {

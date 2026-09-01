@@ -370,7 +370,7 @@ const buildCatalogUnion = (type) => {
         'unidad_presentacion', up.nombre,
         'cantidad_base', ip.cantidad_base,
         'unidad_base', ubp.nombre,
-        'factor_conversion', ip.cantidad_base / NULLIF(ip.cantidad_presentacion, 0),
+        'factor_conversion', CAST(ip.cantidad_base / NULLIF(ip.cantidad_presentacion, 0) AS numeric(30,18)),
         'es_predeterminada_compra', ip.es_predeterminada_compra
       ) ORDER BY ip.es_predeterminada_compra DESC, ip.id_presentacion) AS presentaciones,
       STRING_AGG(CONCAT_WS(' ', ip.nombre_presentacion, up.nombre, up.simbolo, ubp.nombre, ubp.simbolo), ' ') AS search_text
@@ -419,7 +419,7 @@ export const loadInsumoSnapshot = async (masterId, presentationId, queryRunner) 
       SELECT ip.id_presentacion, ip.id_insumo, ip.id_unidad_base,
              ip.nombre_presentacion, ip.cantidad_presentacion::text,
              ip.cantidad_base::text,
-             (ip.cantidad_base / NULLIF(ip.cantidad_presentacion, 0))::text AS factor_conversion,
+             CAST(ip.cantidad_base / NULLIF(ip.cantidad_presentacion, 0) AS numeric(30,18))::text AS factor_conversion,
              i.id_unidad_medida AS id_unidad_base_insumo,
              i.nombre_insumo
       FROM public.insumo_presentaciones ip
@@ -524,7 +524,7 @@ const normalizeRequestLinesBatch = async (inputLines, warehouse, queryRunner) =>
             COALESCE(NULLIF(TRIM(um.nombre), ''), CONCAT('Unidad #', i.id_unidad_medida::text)) AS nombre_unidad_base,
             ip.id_presentacion, ip.id_insumo AS presentation_insumo_id, ip.id_unidad_base,
             ip.nombre_presentacion, ip.cantidad_presentacion::text, ip.cantidad_base::text,
-            (ip.cantidad_base / NULLIF(ip.cantidad_presentacion, 0))::text AS factor_conversion,
+            CAST(ip.cantidad_base / NULLIF(ip.cantidad_presentacion, 0) AS numeric(30,18))::text AS factor_conversion,
             COALESCE(ip.estado, false) AS presentation_active, COALESCE(ip.uso_compra, false) AS uso_compra
        FROM requested r JOIN public.insumos i ON i.id_insumo = r.master_id
        LEFT JOIN public.unidades_medida um ON um.id_unidad_medida = i.id_unidad_medida

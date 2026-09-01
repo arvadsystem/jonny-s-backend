@@ -76,6 +76,26 @@ test('crea OC RECIBIDA, detalles coherentes, reutiliza evidencias y crea un movi
   assert.equal(state.calls.at(-2).text, 'COMMIT');
 });
 
+test('formaliza captura con factor raw de 18 decimales sin perder cantidad base', async () => {
+  const state = fixture();
+  const service = createCapturasCompraRapidaFormalizacionService({
+    db: state.db,
+    readAccess: access,
+    resolveMaster: async (type, id) => ({ ok: true, masterId: id, master: { estado_global: true } }),
+    getAssignment: async () => ({ activo: true, id_sucursal: 2 }),
+    loadSnapshot: async () => ({ id_presentacion_insumo: 99, id_unidad_base: 4, nombre_presentacion_snapshot: 'Caja', factor_conversion_snapshot: '12.0000000000000000' })
+  });
+  const result = await service.formalize(request('ADMINISTRADOR', {
+    detalles: [{ tipo_item: 'insumo', id_item: 9, id_presentacion_insumo: 99, cantidad: '2.5', id_proveedor: 5 }]
+  }));
+  assert.equal(result.solicitud.estado, 'RECIBIDA');
+  const detail = state.calls.find((call) => call.text.startsWith('INSERT INTO public.solicitudes_compra_detalle'));
+  const movement = state.calls.find((call) => call.text.startsWith('INSERT INTO public.movimientos_inventario'));
+  assert.equal(detail.params[7], '12.0000000000000000');
+  assert.equal(detail.params[10], '30');
+  assert.equal(movement.params[0], '30');
+});
+
 test('fallo de movimiento revierte toda la operacion y nunca confirma captura', async () => {
   const state = fixture({ failMovement: true });
   await assert.rejects(serviceFor(state).formalize(request()), (error) => error.status === 500);

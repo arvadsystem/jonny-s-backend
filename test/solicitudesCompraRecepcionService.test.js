@@ -276,6 +276,28 @@ test('insumo acepta seis decimales y calcula base con snapshot', async () => {
   assert.deepEqual(update.params.slice(2), ['1.123456', '1123.456']);
 });
 
+test('recepcion conserva decimal recibido y factor snapshot de 18 decimales', async () => {
+  const f = fixture({ details: [
+    product(),
+    supply({ factor_conversion_snapshot: '12.000000000000000000', cantidad_aprobada: '2.5', cantidad_base_aprobada: '30' })
+  ] });
+  const detalles = [body().detalles[0], { id_solicitud_detalle: 11, cantidad_recibida: '2.25' }];
+  await f.service.receive(req(body({ detalles, observacion_recepcion: 'Recepcion parcial' })));
+  const update = f.calls.filter((call) => call.sql.startsWith('UPDATE public.solicitudes_compra_detalle'))[1];
+  assert.deepEqual(update.params.slice(2), ['2.25', '27']);
+});
+
+test('recepcion redondea factor periodico al contrato final de seis decimales', async () => {
+  const f = fixture({ details: [
+    product(),
+    supply({ factor_conversion_snapshot: '0.041666666666666667', cantidad_aprobada: '24', cantidad_base_aprobada: '1' })
+  ] });
+  const detalles = [body().detalles[0], { id_solicitud_detalle: 11, cantidad_recibida: '24' }];
+  await f.service.receive(req(body({ detalles })));
+  const update = f.calls.filter((call) => call.sql.startsWith('UPDATE public.solicitudes_compra_detalle'))[1];
+  assert.deepEqual(update.params.slice(2), ['24', '1']);
+});
+
 for (const invalid of [0, -1, null, '1.1234567']) {
   test(`cantidad de insumo invalida ${String(invalid)} es rechazada`, async () => {
     const detalles = [body().detalles[0], { id_solicitud_detalle: 11, cantidad_recibida: invalid }];
