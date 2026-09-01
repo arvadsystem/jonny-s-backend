@@ -1,6 +1,10 @@
 import crypto from 'node:crypto';
+import dotenv from 'dotenv';
 
-const PREFIX = 'QA_F4_VENTAS_COCINA';
+dotenv.config();
+
+// Mantiene todos los nombres de fixture por debajo del limite varchar(50).
+const PREFIX = 'QA_F4_VCI';
 const text = (value) => String(value ?? '').trim();
 const lower = (value) => text(value).toLowerCase();
 const number = (value) => Number(value);
@@ -26,30 +30,63 @@ const preflight = () => {
   }
   ensure(process.argv.includes('--rollback-only'), 'QA_ROLLBACK_ONLY_REQUIRED', 'Debe ejecutar este harness con --rollback-only.');
 
-  const expected = {
-    host: lower(process.env.QA_EXPECTED_DB_HOST),
-    database: lower(process.env.QA_EXPECTED_DB_NAME),
-    user: lower(process.env.QA_EXPECTED_DB_USER)
-  };
-  const missing = Object.entries(expected).filter(([, value]) => !value).map(([key]) => key);
+  const projectRef = lower(process.env.QA_EXPECTED_PROJECT_REF);
   ensure(
-    missing.length === 0,
+    /^[a-z0-9]{20}$/.test(projectRef),
     'QA_DB_IDENTITY_REQUIRED',
-    'Defina QA_EXPECTED_DB_HOST, QA_EXPECTED_DB_NAME y QA_EXPECTED_DB_USER con la identidad QA verificada.',
-    { missing }
+    'Defina QA_EXPECTED_PROJECT_REF con el project ref QA verificado.'
   );
 
   const configured = {
     host: lower(process.env.DB_HOST),
     database: lower(process.env.DB_NAME || 'postgres'),
-    user: lower(process.env.DB_USER)
+    user: lower(process.env.DB_USER),
+    supabaseUrl: text(process.env.SUPABASE_URL)
+  };
+  ensure(configured.database === 'postgres', 'QA_DB_NAME_MISMATCH', 'DB_NAME debe ser postgres para este harness QA.');
+
+  const directHost = `db.${projectRef}.supabase.co`;
+  const poolerHostPattern = /^[a-z0-9-]+\.pooler\.supabase\.com$/;
+  let connectionMode;
+  if (configured.host === directHost) {
+    connectionMode = 'direct';
+    ensure(configured.user === 'postgres', 'QA_DB_USER_PROJECT_MISMATCH', 'DB_USER no corresponde a la conexion directa del proyecto QA esperado.');
+  } else if (poolerHostPattern.test(configured.host)) {
+    connectionMode = 'pooler';
+    ensure(
+      configured.user === `postgres.${projectRef}`,
+      'QA_DB_USER_PROJECT_MISMATCH',
+      'DB_USER del Pooler no contiene exactamente el project ref QA esperado.'
+    );
+  } else {
+    fail('QA_DB_HOST_NOT_ALLOWED', 'DB_HOST no es el host directo esperado ni un host Pooler valido de Supabase.');
+  }
+
+  if (configured.supabaseUrl) {
+    let supabaseUrl;
+    try {
+      supabaseUrl = new URL(configured.supabaseUrl);
+    } catch {
+      fail('QA_SUPABASE_URL_INVALID', 'SUPABASE_URL no es una URL valida.');
+    }
+    ensure(
+      supabaseUrl.protocol === 'https:' && lower(supabaseUrl.hostname) === `${projectRef}.supabase.co`,
+      'QA_SUPABASE_URL_PROJECT_MISMATCH',
+      'SUPABASE_URL no corresponde exactamente al project ref QA esperado.'
+    );
+  }
+
+  const expected = {
+    projectRef,
+    connectionMode,
+    configuredHost: configured.host,
+    database: 'postgres',
+    runtimeUser: 'postgres'
   };
   ensure(
-    configured.host === expected.host
-      && configured.database === expected.database
-      && configured.user === expected.user,
-    'QA_DB_CONFIG_IDENTITY_MISMATCH',
-    'La conexion configurada no coincide exactamente con la identidad QA esperada.'
+    configured.host && configured.user,
+    'QA_DB_CONFIG_IDENTITY_MISSING',
+    'DB_HOST y DB_USER son obligatorios para validar la identidad QA.'
   );
   return expected;
 };
@@ -63,13 +100,15 @@ const verifyRuntimeIdentity = async (client, expected) => {
   `);
   const runtime = rows[0] || {};
   ensure(
-    lower(runtime.database) === expected.database && lower(runtime.user) === expected.user,
+    lower(runtime.database) === expected.database && lower(runtime.user) === expected.runtimeUser,
     'QA_DB_RUNTIME_IDENTITY_MISMATCH',
     'PostgreSQL no reporto la identidad QA esperada.'
   );
   return {
     verified: true,
-    fingerprint: hash(`${expected.host}|${runtime.database}|${runtime.user}`),
+    project_ref: expected.projectRef,
+    connection_mode: expected.connectionMode,
+    fingerprint: hash(`${expected.projectRef}|${expected.connectionMode}|${expected.configuredHost}|${runtime.database}|${runtime.user}`),
     server_address_present: Boolean(runtime.server_address),
     is_replica: Boolean(runtime.is_replica)
   };
@@ -88,19 +127,34 @@ const getKitchenState = async (client) => {
 
 const pickContext = async (client) => {
   const { rows } = await client.query(`
-    SELECT f.id_sucursal, f.id_usuario, f.id_cliente, f.id_caja, f.id_sesion_caja,
-           COALESCE(fc.id_metodo_pago, 1) AS id_metodo_pago
-    FROM facturas f
-    LEFT JOIN facturas_cobros fc ON fc.id_factura=f.id_factura
-    WHERE f.id_pedido IS NOT NULL
-      AND f.id_sucursal IS NOT NULL
-      AND f.id_usuario IS NOT NULL
-      AND f.id_caja IS NOT NULL
-      AND f.id_sesion_caja IS NOT NULL
-    ORDER BY f.id_factura DESC
+    WITH metodo_pago AS (
+      SELECT id_metodo_pago
+      FROM public.cat_metodos_pago
+      WHERE COALESCE(estado,true)=true
+      ORDER BY id_metodo_pago
+      LIMIT 1
+    )
+    SELECT cs.id_sucursal,
+           cs.id_usuario_responsable AS id_usuario,
+           NULL::integer AS id_cliente,
+           cs.id_caja,
+           cs.id_sesion_caja,
+           metodo_pago.id_metodo_pago
+    FROM public.cajas_sesiones cs
+    INNER JOIN public.cat_cajas_sesiones_estados estado
+      ON estado.id_estado_sesion_caja=cs.id_estado_sesion_caja
+     AND UPPER(TRIM(estado.codigo))='ABIERTA'
+    INNER JOIN public.cajas caja
+      ON caja.id_caja=cs.id_caja
+     AND caja.id_sucursal=cs.id_sucursal
+     AND COALESCE(caja.estado,true)=true
+    CROSS JOIN metodo_pago
+    WHERE cs.fecha_cierre IS NULL
+      AND cs.id_usuario_responsable IS NOT NULL
+    ORDER BY cs.fecha_apertura DESC, cs.id_sesion_caja DESC
     LIMIT 1
   `);
-  ensure(rows.length === 1, 'QA_BASE_CONTEXT_MISSING', 'No hay contexto base de factura con pedido para QA.');
+  ensure(rows.length === 1, 'QA_OPEN_CASH_SESSION_MISSING', 'No hay una sesion de caja QA abierta con responsable y metodo de pago activo.');
   return rows[0];
 };
 
@@ -148,7 +202,20 @@ const createFixtures = async (client, ctx, tag) => {
        RETURNING id_producto`,
       [`${PREFIX}_${tag}_${suffix}`, stock, template.idAlmacen]
     );
-    return number(rows[0].id_producto);
+    const idProducto = number(rows[0].id_producto);
+    await client.query(
+      `INSERT INTO public.productos_almacenes (
+         id_producto,id_almacen,cantidad,stock_minimo,estado
+       ) VALUES ($1,$2,$3,0,true)`,
+      [idProducto, template.idAlmacen, stock]
+    );
+    await client.query(
+      `INSERT INTO public.productos_mapeo_maestro (
+         id_producto_legacy,id_producto_maestro,id_almacen_origen,estado_migracion,observacion
+       ) VALUES ($1,$1,$2,'VALIDADO',$3)`,
+      [idProducto, template.idAlmacen, `${PREFIX} rollback-only`]
+    );
+    return idProducto;
   };
   const products = {
     stock48: await insertProduct('PRODUCTO_48', 48),
@@ -164,6 +231,18 @@ const createFixtures = async (client, ctx, tag) => {
     [`${PREFIX}_${tag}_INSUMO_0`, template.idAlmacen, template.supply.id_categoria_insumo, template.supply.id_unidad_medida]
   );
   const idInsumo = number(supplyResult.rows[0].id_insumo);
+  await client.query(
+    `INSERT INTO public.insumos_almacenes (
+       id_insumo,id_almacen,cantidad,stock_minimo,precio_compra,estado
+     ) VALUES ($1,$2,0,0,3.25,true)`,
+    [idInsumo, template.idAlmacen]
+  );
+  await client.query(
+    `INSERT INTO public.insumos_mapeo_maestro (
+       id_insumo_legacy,id_insumo_maestro,id_almacen_origen,estado_migracion,observacion
+     ) VALUES ($1,$1,$2,'VALIDADO',$3)`,
+    [idInsumo, template.idAlmacen, `${PREFIX} rollback-only`]
+  );
 
   const insertRecipe = async (suffix, description) => {
     const { rows } = await client.query(
@@ -191,6 +270,7 @@ const createFixtures = async (client, ctx, tag) => {
   const idRecetaRota = await insertRecipe('RECETA_INVALIDA', 'QA receta sin componentes');
   return {
     tag,
+    idAlmacen: template.idAlmacen,
     products,
     idInsumo,
     idReceta,
@@ -215,14 +295,15 @@ const createSaleArtifacts = async (client, ctx, kitchenState, tag, code, lines) 
     [description, subtotal, tax, total, kitchenState, ctx.id_sucursal, ctx.id_cliente || null, ctx.id_usuario]
   );
   const idPedido = number(order.rows[0].id_pedido);
+  const invoiceCode = `QAF4-${tag.slice(-8)}-${code[0]}-${idPedido}`;
   const detailIds = [];
   for (const line of lines) {
     const lineTotal = money(number(line.precio) * number(line.cantidad));
     const detail = await client.query(
       `INSERT INTO detalle_pedido (
          sub_total_pedido,total_pedido,id_producto,id_pedido,id_descuento,
-         estado,id_combo,id_receta,observacion
-       ) VALUES ($1,$2,$3,$4,NULL,true,NULL,$5,$6) RETURNING id_detalle_pedido`,
+         estado,id_receta,observacion
+       ) VALUES ($1,$2,$3,$4,NULL,true,$5,$6) RETURNING id_detalle_pedido`,
       [lineTotal, lineTotal, line.id_producto || null, idPedido, line.id_receta || null, `${PREFIX}_${code}`]
     );
     detailIds.push(number(detail.rows[0].id_detalle_pedido));
@@ -232,7 +313,7 @@ const createSaleArtifacts = async (client, ctx, kitchenState, tag, code, lines) 
        id_caja,id_pedido,id_sucursal,id_usuario,id_cliente,codigo_venta,fecha_operacion,
        efectivo_entregado,cambio,fecha_hora_facturacion,isv_15,isv_18,id_sesion_caja
      ) VALUES ($1,$2,$3,$4,$5,$6,CURRENT_DATE,$7,0,CURRENT_TIMESTAMP,$8,0,$9) RETURNING id_factura`,
-    [ctx.id_caja, idPedido, ctx.id_sucursal, ctx.id_usuario, ctx.id_cliente || null, `${PREFIX}-${tag}-${code}`, total, tax, ctx.id_sesion_caja]
+    [ctx.id_caja, idPedido, ctx.id_sucursal, ctx.id_usuario, ctx.id_cliente || null, invoiceCode, total, tax, ctx.id_sesion_caja]
   );
   const idFactura = number(invoice.rows[0].id_factura);
   await client.query(
@@ -251,16 +332,17 @@ const createSaleArtifacts = async (client, ctx, kitchenState, tag, code, lines) 
       [idFactura, line.id_producto || null, line.cantidad, line.precio, lineTotal, lineTotal, idPedido]
     );
   }
-  return { idPedido, idFactura, detailIds };
+  return { idPedido, idFactura, detailIds, invoiceCode };
 };
 
 const payloadFor = (ctx, created, lines) => ({
   id_pedido: created.idPedido,
   id_sucursal: number(ctx.id_sucursal),
-  items: lines.map((line) => ({
+  items: lines.map((line, index) => ({
     tipo_item: line.id_receta ? 'RECETA' : 'PRODUCTO',
     id_item: number(line.id_receta || line.id_producto),
-    cantidad: number(line.cantidad)
+    cantidad: number(line.cantidad),
+    id_detalle_pedido: created.detailIds[index]
   }))
 });
 
@@ -278,9 +360,12 @@ const movementRows = async (client, idPedido) => {
 };
 
 const resourceStock = async (client, resource) => {
-  const table = resource.type === 'producto' ? 'productos' : 'insumos';
+  const table = resource.type === 'producto' ? 'productos_almacenes' : 'insumos_almacenes';
   const column = resource.type === 'producto' ? 'id_producto' : 'id_insumo';
-  const { rows } = await client.query(`SELECT cantidad FROM ${table} WHERE ${column}=$1`, [resource.id]);
+  const { rows } = await client.query(
+    `SELECT cantidad FROM ${table} WHERE ${column}=$1 AND id_almacen=$2`,
+    [resource.id, resource.idAlmacen]
+  );
   ensure(rows.length === 1, 'QA_RESOURCE_MISSING', `No existe el recurso QA ${resource.type}.`);
   return number(rows[0].cantidad);
 };
@@ -380,19 +465,24 @@ const transactionChecks = async (client, cases) => {
 const verifyRollback = async (client, fixture, cases, tag) => {
   const orderIds = Object.values(cases).map((item) => item?.created?.idPedido).filter(Number.isInteger);
   const invoiceIds = Object.values(cases).map((item) => item?.created?.idFactura).filter(Number.isInteger);
+  const invoiceCodes = Object.values(cases).map((item) => item?.created?.invoiceCode).filter(Boolean);
   const productIds = Object.values(fixture.products);
   const { rows } = await client.query(
     `SELECT
-       (SELECT COUNT(*) FROM productos WHERE id_producto=ANY($1::int[]) OR nombre_producto LIKE $5) AS products,
-       (SELECT COUNT(*) FROM insumos WHERE id_insumo=$2 OR nombre_insumo LIKE $5) AS supplies,
+       ((SELECT COUNT(*) FROM productos WHERE id_producto=ANY($1::int[]) OR nombre_producto LIKE $5)
+        + (SELECT COUNT(*) FROM productos_almacenes WHERE id_producto=ANY($1::int[]))
+        + (SELECT COUNT(*) FROM productos_mapeo_maestro WHERE id_producto_maestro=ANY($1::int[]) OR id_producto_legacy=ANY($1::int[]))) AS products,
+       ((SELECT COUNT(*) FROM insumos WHERE id_insumo=$2 OR nombre_insumo LIKE $5)
+        + (SELECT COUNT(*) FROM insumos_almacenes WHERE id_insumo=$2)
+        + (SELECT COUNT(*) FROM insumos_mapeo_maestro WHERE id_insumo_maestro=$2 OR id_insumo_legacy=$2)) AS supplies,
        (SELECT COUNT(*) FROM recetas WHERE id_receta=ANY($3::int[]) OR nombre_receta LIKE $5) AS recipes,
        (SELECT COUNT(*) FROM pedidos WHERE id_pedido=ANY($4::int[]) OR descripcion_pedido LIKE $5) AS orders,
-       (SELECT COUNT(*) FROM facturas WHERE id_factura=ANY($6::int[]) OR codigo_venta LIKE $7) AS invoices,
+       (SELECT COUNT(*) FROM facturas WHERE id_factura=ANY($6::int[]) OR codigo_venta=ANY($7::text[])) AS invoices,
        (SELECT COUNT(*) FROM facturas_cobros WHERE id_factura=ANY($6::int[])) AS payments,
        (SELECT COUNT(*) FROM movimientos_inventario WHERE id_ref=ANY($4::int[])) AS movements,
        (SELECT cantidad FROM productos WHERE id_producto=$8) AS original_product_stock,
        (SELECT cantidad FROM insumos WHERE id_insumo=$9) AS original_supply_stock`,
-    [productIds, fixture.idInsumo, [fixture.idReceta, fixture.idRecetaRota], orderIds, `${PREFIX}_${tag}%`, invoiceIds, `${PREFIX}-${tag}%`, fixture.originals.product.id, fixture.originals.supply.id]
+    [productIds, fixture.idInsumo, [fixture.idReceta, fixture.idRecetaRota], orderIds, `${PREFIX}_${tag}%`, invoiceIds, invoiceCodes, fixture.originals.product.id, fixture.originals.supply.id]
   );
   const row = rows[0];
   const persisted = Object.fromEntries(['products', 'supplies', 'recipes', 'orders', 'invoices', 'payments', 'movements'].map((key) => [key, number(row[key])]));
@@ -419,6 +509,18 @@ const main = async () => {
   let transactionStarted = false;
   try {
     const expected = preflight();
+    if (process.argv.includes('--preflight-only')) {
+      console.log(JSON.stringify({
+        ok: true,
+        mode: 'PREFLIGHT_ONLY',
+        identity: {
+          project_ref: expected.projectRef,
+          connection_mode: expected.connectionMode,
+          fingerprint: hash(`${expected.projectRef}|${expected.connectionMode}|${expected.configuredHost}`)
+        }
+      }, null, 2));
+      return;
+    }
     const [{ default: importedPool }, { validarYDescontarPedido }] = await Promise.all([
       import('../config/db-connection.js'),
       import('../services/inventarioPedidoService.js')
@@ -437,10 +539,10 @@ const main = async () => {
     const common = { client, service: validarYDescontarPedido, ctx, kitchenState, tag };
     const linesA = [{ id_producto: fixture.products.stock48, cantidad: 49, precio: 12.5 }];
     const cases = {};
-    cases.A_producto_stock_48 = await runDeficit({ ...common, code: 'A_PRODUCTO_48_A_49', lines: linesA, resource: { type: 'producto', id: fixture.products.stock48 }, before: 48, consumed: 49, after: -1 });
-    cases.B_producto_stock_0 = await runDeficit({ ...common, code: 'B_PRODUCTO_0', lines: [{ id_producto: fixture.products.stock0, cantidad: 1, precio: 12.5 }], resource: { type: 'producto', id: fixture.products.stock0 }, before: 0, consumed: 1, after: -1 });
-    cases.C_producto_stock_negativo = await runDeficit({ ...common, code: 'C_PRODUCTO_NEG5', lines: [{ id_producto: fixture.products.stockNegative, cantidad: 2, precio: 12.5 }], resource: { type: 'producto', id: fixture.products.stockNegative }, before: -5, consumed: 2, after: -7 });
-    cases.D_receta_insumo_stock_0 = await runDeficit({ ...common, code: 'D_RECETA_INSUMO_0', lines: [{ id_receta: fixture.idReceta, cantidad: 1, precio: 25 }], resource: { type: 'insumo', id: fixture.idInsumo }, before: 0, consumed: 2, after: -2 });
+    cases.A_producto_stock_48 = await runDeficit({ ...common, code: 'A_PRODUCTO_48_A_49', lines: linesA, resource: { type: 'producto', id: fixture.products.stock48, idAlmacen: fixture.idAlmacen }, before: 48, consumed: 49, after: -1 });
+    cases.B_producto_stock_0 = await runDeficit({ ...common, code: 'B_PRODUCTO_0', lines: [{ id_producto: fixture.products.stock0, cantidad: 1, precio: 12.5 }], resource: { type: 'producto', id: fixture.products.stock0, idAlmacen: fixture.idAlmacen }, before: 0, consumed: 1, after: -1 });
+    cases.C_producto_stock_negativo = await runDeficit({ ...common, code: 'C_PRODUCTO_NEG5', lines: [{ id_producto: fixture.products.stockNegative, cantidad: 2, precio: 12.5 }], resource: { type: 'producto', id: fixture.products.stockNegative, idAlmacen: fixture.idAlmacen }, before: -5, consumed: 2, after: -7 });
+    cases.D_receta_insumo_stock_0 = await runDeficit({ ...common, code: 'D_RECETA_INSUMO_0', lines: [{ id_receta: fixture.idReceta, cantidad: 1, precio: 25 }], resource: { type: 'insumo', id: fixture.idInsumo, idAlmacen: fixture.idAlmacen }, before: 0, consumed: 2, after: -2 });
     cases.E_configuracion_invalida = await runInvalidConfig({ ...common, fixture });
     cases.F_idempotencia = await runIdempotency({ client, service: validarYDescontarPedido, ctx, source: cases.A_producto_stock_48, lines: linesA });
     const sqlChecks = await transactionChecks(client, cases);
