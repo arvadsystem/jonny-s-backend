@@ -1589,17 +1589,10 @@ router.put('/cocina/pedidos/:id/estado', checkPermission(COCINA_VIEW_PERMISSIONS
         }
 
         try {
-          const strictSalsaInsumoIds = new Set(
-            consumoPayloadResult.payload.items
-              .filter((item) => item.tipo_item === 'SALSA')
-              .map((item) => parsePositiveInt(item.id_insumo))
-              .filter(Boolean)
-          );
           inventoryResult = await validarYDescontarPedido(consumoPayloadResult.payload, {
             id_usuario: req?.user?.id_usuario,
             allowNegativeStock: true,
-            allowIncompleteConfiguration: true,
-            strictInsumoIds: strictSalsaInsumoIds,
+            allowIncompleteConfiguration: false,
             dbClient: client
           });
         } catch (inventoryError) {
