@@ -953,6 +953,8 @@ router.get('/cocina/pedidos', checkPermission(COCINA_VIEW_PERMISSIONS), async (r
       if (q) {
         const qLike = `%${q}%`;
         const qParam = pushParam(qLike);
+        const qNormalizedLike = `%${q.normalize('NFD').replace(/[\u0300-\u036f]/g, '')}%`;
+        const qNormalizedParam = pushParam(qNormalizedLike);
         filters.push(`
           (
             p.id_pedido::text ILIKE ${qParam}
@@ -966,19 +968,41 @@ router.get('/cocina/pedidos', checkPermission(COCINA_VIEW_PERMISSIONS), async (r
             OR COALESCE(pedido_contexto.canal_codigo, '') ILIKE ${qParam}
             OR COALESCE(pedido_contexto.modalidad_codigo, '') ILIKE ${qParam}
             OR CASE
-                 WHEN UPPER(COALESCE(pedido_contexto.canal_codigo, p.canal, '')) = 'MENU_PUBLICO'
-                   OR UPPER(COALESCE(p.origen_pedido, '')) IN ('MENU', 'WEB', 'MENU_PUBLICO', 'PUBLIC_MENU') THEN 'web'
-                 WHEN UPPER(COALESCE(pedido_contexto.modalidad_codigo, p.tipo_entrega, '')) = 'DELIVERY' THEN 'delivery'
-                 ELSE 'local'
-               END ILIKE ${qParam}
-            OR CASE UPPER(COALESCE(pedido_contexto.modalidad_codigo, p.tipo_entrega, ''))
-                 WHEN 'CONSUMO_LOCAL' THEN 'comer aqui'
-                 WHEN 'LOCAL' THEN 'comer aqui'
-                 WHEN 'RECOGER' THEN 'para llevar'
-                 WHEN 'PARA_LLEVAR' THEN 'para llevar'
-                 WHEN 'DELIVERY' THEN 'delivery'
-                 ELSE ''
-               END ILIKE ${qParam}
+                 WHEN (
+                   UPPER(COALESCE(pedido_contexto.canal_codigo, p.canal, '')) = 'MENU_PUBLICO'
+                   OR UPPER(COALESCE(p.origen_pedido, '')) IN ('MENU', 'WEB', 'MENU_PUBLICO', 'PUBLIC_MENU')
+                   OR LOWER(COALESCE(p.descripcion_pedido, '')) LIKE '%[public-menu]%'
+                   OR LOWER(COALESCE(p.descripcion_pedido, '')) LIKE '%[menu-publico]%'
+                 ) THEN 'web'
+                 WHEN (
+                   UPPER(COALESCE(pedido_contexto.modalidad_codigo, p.tipo_entrega, '')) = 'DELIVERY'
+                   OR EXISTS (
+                     SELECT 1 FROM public.pedidos_delivery pd_search_origin
+                     WHERE pd_search_origin.id_pedido = p.id_pedido
+                   )
+                 ) THEN 'delivery'
+                 WHEN (
+                   UPPER(COALESCE(pedido_contexto.canal_codigo, p.canal, '')) IN ('LOCAL', 'TELEFONO', 'WHATSAPP')
+                   OR UPPER(COALESCE(pedido_contexto.modalidad_codigo, p.tipo_entrega, '')) IN ('CONSUMO_LOCAL', 'LOCAL', 'RECOGER', 'PARA_LLEVAR')
+                   OR UPPER(COALESCE(p.origen_pedido, '')) = 'CAJA'
+                 ) THEN 'local'
+                 ELSE 'no definido'
+               END ILIKE ${qNormalizedParam}
+            OR CASE
+                 WHEN (
+                   UPPER(COALESCE(pedido_contexto.modalidad_codigo, p.tipo_entrega, '')) = 'DELIVERY'
+                   OR EXISTS (
+                     SELECT 1 FROM public.pedidos_delivery pd_search_mode
+                     WHERE pd_search_mode.id_pedido = p.id_pedido
+                   )
+                 ) THEN 'delivery'
+                 WHEN UPPER(COALESCE(pedido_contexto.modalidad_codigo, p.tipo_entrega, '')) IN ('CONSUMO_LOCAL', 'LOCAL') THEN 'comer aqui'
+                 WHEN UPPER(COALESCE(pedido_contexto.modalidad_codigo, p.tipo_entrega, '')) IN ('RECOGER', 'PARA_LLEVAR') THEN 'para llevar'
+                 WHEN LOWER(COALESCE(p.descripcion_envio, '')) LIKE ANY(ARRAY['%delivery%', '%domicilio%']) THEN 'delivery'
+                 WHEN LOWER(COALESCE(p.descripcion_envio, '')) LIKE ANY(ARRAY['%recoger%', '%para llevar%', '%llevar%']) THEN 'para llevar'
+                 WHEN LOWER(COALESCE(p.descripcion_envio, '')) LIKE ANY(ARRAY['%consumo_local%', '%comer aqui%', '%comer aquí%']) THEN 'comer aqui'
+                 ELSE 'modalidad no definida'
+               END ILIKE ${qNormalizedParam}
           )
         `);
       }

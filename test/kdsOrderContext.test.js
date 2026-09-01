@@ -51,6 +51,45 @@ test('GET cocina incorpora contexto canónico y expone contrato KDS sin inferenc
   assert.doesNotMatch(source, /inferTipoServicio/);
 });
 
+test('busqueda SQL replica precedencia WEB delivery local y no inventa local', async () => {
+  const source = await readFile(new URL('../routers/cocina.js', import.meta.url), 'utf8');
+  const searchStart = source.indexOf("OR CASE\n                 WHEN (");
+  const searchEnd = source.indexOf('END ILIKE ${qNormalizedParam}', searchStart);
+  const originCase = source.slice(searchStart, searchEnd);
+  assert.ok(searchStart > 0 && searchEnd > searchStart);
+
+  const webIndex = originCase.indexOf("THEN 'web'");
+  const deliveryIndex = originCase.indexOf("THEN 'delivery'");
+  const localIndex = originCase.indexOf("THEN 'local'");
+  assert.ok(webIndex >= 0 && webIndex < deliveryIndex && deliveryIndex < localIndex);
+  assert.match(originCase, /MENU_PUBLICO/); // WEB por canal/contexto.
+  assert.match(originCase, /origen_pedido[\s\S]*'MENU', 'WEB', 'MENU_PUBLICO', 'PUBLIC_MENU'/); // WEB por origen.
+  assert.match(originCase, /%\[public-menu\]%/); // WEB legacy.
+  assert.match(originCase, /%\[menu-publico\]%/);
+  assert.match(originCase, /pedidos_delivery pd_search_origin/); // DELIVERY por existencia.
+  assert.match(originCase, /modalidad_codigo[\s\S]*= 'DELIVERY'/); // DELIVERY por modalidad.
+  assert.match(originCase, /'LOCAL', 'TELEFONO', 'WHATSAPP'/); // LOCAL reconocido.
+  assert.match(originCase, /'CONSUMO_LOCAL', 'LOCAL', 'RECOGER', 'PARA_LLEVAR'/);
+  assert.match(originCase, /origen_pedido[\s\S]*= 'CAJA'/);
+  assert.match(originCase, /ELSE 'no definido'/);
+  assert.doesNotMatch(originCase, /ELSE 'local'/);
+});
+
+test('busqueda de modalidad usa estructura delivery y fallback legacy sin default local', async () => {
+  const source = await readFile(new URL('../routers/cocina.js', import.meta.url), 'utf8');
+  const modeStart = source.indexOf('pedidos_delivery pd_search_mode');
+  const modeCaseStart = source.lastIndexOf('OR CASE', modeStart);
+  const modeEnd = source.indexOf('END ILIKE ${qNormalizedParam}', modeStart);
+  const modeCase = source.slice(modeCaseStart, modeEnd);
+  assert.match(modeCase, /pedidos_delivery pd_search_mode/);
+  assert.match(modeCase, /'CONSUMO_LOCAL', 'LOCAL'[\s\S]*THEN 'comer aqui'/);
+  assert.match(modeCase, /'RECOGER', 'PARA_LLEVAR'[\s\S]*THEN 'para llevar'/);
+  assert.match(modeCase, /descripcion_envio[\s\S]*%delivery%/);
+  assert.match(modeCase, /descripcion_envio[\s\S]*%para llevar%/);
+  assert.match(modeCase, /ELSE 'modalidad no definida'/);
+  assert.match(source, /q\.normalize\('NFD'\)/);
+});
+
 test('public menu resuelve canal MENU_PUBLICO y modalidad según tipo', async () => {
   for (const [tipoPedido, expectedMode] of [['dine-in', 'CONSUMO_LOCAL'], ['pickup', 'RECOGER'], ['delivery', 'DELIVERY']]) {
     const calls = [];
