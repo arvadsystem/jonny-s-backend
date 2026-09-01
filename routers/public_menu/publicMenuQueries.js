@@ -793,17 +793,19 @@ export const fetchPedidoByIdempotencyKeyQuery = async (
 };
 
 // Inserta cabecera de pedido publico y devuelve ID generado.
-export const insertPublicPedidoQuery = async (client, payload) => {
+export const insertPublicPedidoQuery = async (client, payload, { hasColumnFn = hasColumn } = {}) => {
   const [
     hasEstadoPagoColumn,
     hasTipoEntregaColumn,
     hasValidacionPagoVenceAtColumn,
-    hasVisibleEnCocinaAtColumn
+    hasVisibleEnCocinaAtColumn,
+    hasCanalColumn
   ] = await Promise.all([
-    hasColumn('pedidos', 'estado_pago'),
-    hasColumn('pedidos', 'tipo_entrega'),
-    hasColumn('pedidos', 'validacion_pago_vence_at'),
-    hasColumn('pedidos', 'visible_en_cocina_at')
+    hasColumnFn('pedidos', 'estado_pago'),
+    hasColumnFn('pedidos', 'tipo_entrega'),
+    hasColumnFn('pedidos', 'validacion_pago_vence_at'),
+    hasColumnFn('pedidos', 'visible_en_cocina_at'),
+    hasColumnFn('pedidos', 'canal')
   ]);
 
   const columns = ['fecha_hora_pedido'];
@@ -830,6 +832,7 @@ export const insertPublicPedidoQuery = async (client, payload) => {
   pushValue('id_cliente', payload.id_cliente);
   pushValue('id_usuario', payload.id_usuario);
   pushValue('origen_pedido', payload.origen_pedido || 'MENU');
+  if (hasCanalColumn) pushValue('canal', 'MENU_PUBLICO');
 
   // Refuerzo item 9: forzamos estado de pago/tipo de entrega si el esquema los soporta.
   if (hasEstadoPagoColumn) {
@@ -873,7 +876,7 @@ export const insertPublicPedidoQuery = async (client, payload) => {
   return result.rows[0] || null;
 };
 
-export const resolvePublicOrderCatalogContextQuery = async (client, { tipoPedido }) => {
+export const resolvePublicOrderCatalogContextQuery = async (client, { tipoPedido }, { hasTableFn = hasTable } = {}) => {
   const [
     hasCanales,
     hasModalidades,
@@ -881,14 +884,14 @@ export const resolvePublicOrderCatalogContextQuery = async (client, { tipoPedido
     hasMotivosPagoPendiente,
     hasDeliveryEstados
   ] = await Promise.all([
-    hasTable('cat_pedidos_canales'),
-    hasTable('cat_pedidos_modalidades_entrega'),
-    hasTable('cat_pedidos_estados_pago'),
-    hasTable('cat_pedidos_motivos_pago_pendiente'),
-    hasTable('cat_delivery_estados')
+    hasTableFn('cat_pedidos_canales'),
+    hasTableFn('cat_pedidos_modalidades_entrega'),
+    hasTableFn('cat_pedidos_estados_pago'),
+    hasTableFn('cat_pedidos_motivos_pago_pendiente'),
+    hasTableFn('cat_delivery_estados')
   ]);
   const normalizedTipoPedido = String(tipoPedido || '').trim().toLowerCase();
-  const canalCode = 'LOCAL';
+  const canalCode = 'MENU_PUBLICO';
   const estadoPagoPendienteCandidates = [
     'PENDIENTE_VALIDACION',
     'PENDIENTE_PAGO',

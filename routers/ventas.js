@@ -3234,7 +3234,7 @@ const insertCuentaDivisionCobros = async ({
 };
 
 const hydrateVentaLines = async (client, normalizedItems, perf = null, options = {}) => {
-  const validateProductStock = options?.validateProductStock !== false;
+  const validateProductStock = options?.validateProductStock === true;
   const productoIds = [
     ...new Set(
       normalizedItems
@@ -4771,6 +4771,7 @@ const buildVentaPayload = async ({ client, body, userId, sucursalScope, canApply
 
   const hydratedResult = await hydrateVentaLines(client, normalizedItemsResult.data, perf, {
     idSucursal,
+    validateProductStock: false,
     complementosIncompleteAuthorization: {
       serverAuthorized: canAuthorizeIncompleteComplementos === true,
       authorizedByUserId: userId

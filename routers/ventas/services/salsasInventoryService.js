@@ -311,9 +311,6 @@ export const resolveSalsasInventory = async ({
       inventario_configurado: true,
       disponible: result.estado !== false
     };
-    if (result.stock_disponible < result.cantidad_consumo_base) {
-      return markUnavailable(result, 'SALSA_STOCK_INSUFICIENTE', { preserveInventoryConfiguration: true });
-    }
     return result;
   });
 };
@@ -353,6 +350,8 @@ export const buildSalsaConsumptionSnapshot = (resolved, count, lineQuantity = 1)
     id_insumo_legacy: resolved.id_insumo_legacy,
     cantidad_porcion: Number(resolved.cantidad_consumo_configurada || 0),
     id_unidad_consumo: resolved.id_unidad_consumo,
+    stock_disponible: Number(resolved.stock_disponible ?? 0),
+    cantidad_consumo_base: Number(resolved.cantidad_consumo_base || 0),
     cantidad_base_por_porcion: Number(resolved.cantidad_consumo_base || 0),
     cantidad_base_total: Number(resolved.cantidad_consumo_base || 0) * porcionesPorOrden * cantidadLinea,
     id_unidad_base: resolved.id_unidad_base,
@@ -442,12 +441,6 @@ export const attachSalsaInventorySnapshotsToLines = async ({ client, lines = [],
     });
   }
 
-  for (const usage of usageByStockKey.values()) {
-    if (usage.stockDisponible < usage.requerido) {
-      throw createInventoryError('VENTAS_SALSA_STOCK_INSUFICIENTE', `No hay existencias suficientes para la salsa ${usage.nombre}.`);
-    }
-  }
-
   return [...usageByStockKey.values()];
 };
 
@@ -505,11 +498,6 @@ export const attachSalsaInventorySnapshotsToPublicLines = async ({ client, lines
         inventario: snapshot
       };
     });
-  }
-  for (const usage of usageByStockKey.values()) {
-    if (usage.stockDisponible < usage.requerido) {
-      throw createInventoryError('VENTAS_SALSA_STOCK_INSUFICIENTE', `No hay existencias suficientes para la salsa ${usage.nombre}.`);
-    }
   }
   return lines;
 };

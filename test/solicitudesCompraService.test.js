@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import {
   createSolicitudesCompraService,
+  loadInsumoSnapshot,
   normalizeCatalogSearch,
   normalizeSolicitudSearch,
   parseQuantity,
@@ -371,6 +372,9 @@ test('conversion a unidad base usa cantidad por factor de base de datos', () => 
 });
 
 test('parseQuantity acepta seis decimales exactos y conserva el maximo operativo previo', () => {
+  for (const value of ['0.5', '1.25', '2.875', '3.125', '10.333333']) {
+    assert.equal(parseQuantity(value).decimal, value);
+  }
   assert.equal(parseQuantity('0.000001').decimal, '0.000001');
   assert.equal(parseQuantity('1.123456').decimal, '1.123456');
   assert.equal(parseQuantity('999999999.9999').decimal, '999999999.9999');
@@ -379,6 +383,19 @@ test('parseQuantity acepta seis decimales exactos y conserva el maximo operativo
   }
   assert.equal(parseQuantity('2', { integerOnly: true }).decimal, '2');
   assert.equal(parseQuantity('2.000001', { integerOnly: true }), null);
+});
+
+test('catalogo y snapshots canonizan factor de conversion a numeric(30,18)', async () => {
+  let snapshotSql = '';
+  await loadInsumoSnapshot(230, 15, {
+    async query(sql) {
+      snapshotSql = sql;
+      return { rows: [{ id_presentacion: 15, id_insumo: 230, id_unidad_base: 5, id_unidad_base_insumo: 5, nombre_presentacion: 'Caja', factor_conversion: '0.041666666666666667' }] };
+    }
+  });
+  assert.match(snapshotSql, /CAST\(ip\.cantidad_base \/ NULLIF\(ip\.cantidad_presentacion, 0\) AS numeric\(30,18\)\)::text/);
+  const source = await readFile(new URL('../services/solicitudesCompraService.js', import.meta.url), 'utf8');
+  assert.equal((source.match(/AS numeric\(30,18\)/g) || []).length, 3);
 });
 
 test('creacion rechaza insumo sin unidad relacionada con 409 antes del encabezado y revierte', async () => {

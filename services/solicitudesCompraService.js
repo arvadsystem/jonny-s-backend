@@ -1,4 +1,5 @@
-import pool from '../config/db-connection.js';
+import { createHash } from 'node:crypto';
+import pool, { getPoolState, logPoolWaitIfAny } from '../config/db-connection.js';
 import { readRequestAccess } from '../middleware/checkPermission.js';
 import {
   getWarehouseAssignmentDetails,
@@ -16,8 +17,9 @@ const MAX_QUANTITY_SCALED = 999_999_999_999_900n;
 const VALID_STATES = new Set(['PENDIENTE', 'APROBADA', 'RECHAZADA', 'RECIBIDA', 'CANCELADA']);
 const ADMIN_ROLES = new Set(['SUPER_ADMIN', 'ADMIN', 'ADMINISTRADOR']);
 const OPERATIVE_ROLES = new Set(['CAJERO', 'COCINA', 'COCINERO', 'COCINERA', 'JEFA_COCINA', 'JEFE_COCINA']);
-const TOP_LEVEL_FIELDS = new Set(['id_almacen', 'observacion', 'detalles']);
+const TOP_LEVEL_FIELDS = new Set(['id_almacen', 'observacion', 'detalles', 'client_request_id']);
 const DETAIL_FIELDS = new Set(['tipo_item', 'id_item', 'id_presentacion_insumo', 'cantidad']);
+const UUID_V4_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 export class SolicitudesCompraError extends Error {
   constructor(status, code, message) {
@@ -101,6 +103,46 @@ const normalizeObservation = (value) => {
     fail(400, 'VALIDATION_ERROR', `observacion no puede exceder ${MAX_OBSERVATION_LENGTH} caracteres.`);
   }
   return normalized || null;
+};
+
+export const normalizeClientRequestId = (value) => {
+  if (value === undefined || value === null) return null;
+  if (typeof value !== 'string' || !UUID_V4_PATTERN.test(value.trim())) {
+    fail(400, 'VALIDATION_ERROR', 'client_request_id debe ser un UUID v4 valido.');
+  }
+  return value.trim().toLowerCase();
+};
+
+const validateAndNormalizeInputLines = (rawLines) => {
+  if (!Array.isArray(rawLines) || rawLines.length === 0) fail(400, 'VALIDATION_ERROR', 'Debe incluir al menos una linea.');
+  if (rawLines.length > MAX_LINES) fail(400, 'VALIDATION_ERROR', `No se permiten mas de ${MAX_LINES} lineas.`);
+  return rawLines.map((rawLine) => {
+    ensurePlainObject(rawLine, 'Cada detalle debe ser un objeto.');
+    rejectUnexpectedFields(rawLine, DETAIL_FIELDS, 'El detalle');
+    const type = String(rawLine.tipo_item ?? '').trim().toLowerCase();
+    if (!['producto', 'insumo'].includes(type)) fail(400, 'VALIDATION_ERROR', 'tipo_item debe ser producto o insumo.');
+    const rawItemId = parsePositiveIntStrict(rawLine.id_item);
+    if (!rawItemId) fail(400, 'VALIDATION_ERROR', 'id_item debe ser un entero positivo.');
+    const presentationId = hasValue(rawLine.id_presentacion_insumo) ? parsePositiveIntStrict(rawLine.id_presentacion_insumo) : null;
+    if (hasValue(rawLine.id_presentacion_insumo) && !presentationId) fail(400, 'VALIDATION_ERROR', 'id_presentacion_insumo debe ser un entero positivo.');
+    if (type === 'producto' && presentationId) fail(400, 'VALIDATION_ERROR', 'Los productos no aceptan presentacion de insumo.');
+    const quantity = parseQuantity(rawLine.cantidad, { integerOnly: type === 'producto' });
+    if (!quantity) fail(400, 'VALIDATION_ERROR', type === 'producto'
+      ? 'La cantidad de producto debe ser un entero positivo.'
+      : 'La cantidad de insumo debe ser positiva y tener hasta 6 decimales.');
+    return { type, rawItemId, presentationId, quantity };
+  });
+};
+
+export const buildRequestFingerprint = ({ warehouseId, observation, lines }) => {
+  const canonicalLines = lines.map((line) => [
+    line.type.toUpperCase(), line.rawItemId, line.presentationId ?? null, line.quantity.decimal
+  ]).sort((left, right) => JSON.stringify(left).localeCompare(JSON.stringify(right)));
+  return createHash('sha256').update(JSON.stringify({
+    id_almacen: warehouseId,
+    observacion: observation,
+    detalles: canonicalLines
+  })).digest('hex');
 };
 
 export const normalizeSolicitudSearch = (value) => {
@@ -328,7 +370,7 @@ const buildCatalogUnion = (type) => {
         'unidad_presentacion', up.nombre,
         'cantidad_base', ip.cantidad_base,
         'unidad_base', ubp.nombre,
-        'factor_conversion', ip.cantidad_base / NULLIF(ip.cantidad_presentacion, 0),
+        'factor_conversion', CAST(ip.cantidad_base / NULLIF(ip.cantidad_presentacion, 0) AS numeric(30,18)),
         'es_predeterminada_compra', ip.es_predeterminada_compra
       ) ORDER BY ip.es_predeterminada_compra DESC, ip.id_presentacion) AS presentaciones,
       STRING_AGG(CONCAT_WS(' ', ip.nombre_presentacion, up.nombre, up.simbolo, ubp.nombre, ubp.simbolo), ' ') AS search_text
@@ -377,7 +419,7 @@ export const loadInsumoSnapshot = async (masterId, presentationId, queryRunner) 
       SELECT ip.id_presentacion, ip.id_insumo, ip.id_unidad_base,
              ip.nombre_presentacion, ip.cantidad_presentacion::text,
              ip.cantidad_base::text,
-             (ip.cantidad_base / NULLIF(ip.cantidad_presentacion, 0))::text AS factor_conversion,
+             CAST(ip.cantidad_base / NULLIF(ip.cantidad_presentacion, 0) AS numeric(30,18))::text AS factor_conversion,
              i.id_unidad_medida AS id_unidad_base_insumo,
              i.nombre_insumo
       FROM public.insumo_presentaciones ip
@@ -408,71 +450,146 @@ export const loadInsumoSnapshot = async (masterId, presentationId, queryRunner) 
   };
 };
 
-const normalizeRequestLines = async (rawLines, warehouse, queryRunner, dependencies) => {
-  if (!Array.isArray(rawLines) || rawLines.length === 0) fail(400, 'VALIDATION_ERROR', 'Debe incluir al menos una linea.');
-  if (rawLines.length > MAX_LINES) fail(400, 'VALIDATION_ERROR', `No se permiten mas de ${MAX_LINES} lineas.`);
-  const grouped = new Map();
+const loadMasterBatch = async (type, inputIds, queryRunner) => {
+  if (inputIds.length === 0) return new Map();
+  const isProduct = type === 'producto';
+  const mappingTable = isProduct ? 'productos_mapeo_maestro' : 'insumos_mapeo_maestro';
+  const legacyColumn = isProduct ? 'id_producto_legacy' : 'id_insumo_legacy';
+  const masterColumn = isProduct ? 'id_producto_maestro' : 'id_insumo_maestro';
+  const masterTable = isProduct ? 'productos' : 'insumos';
+  const idColumn = isProduct ? 'id_producto' : 'id_insumo';
+  const nameColumn = isProduct ? 'nombre_producto' : 'nombre_insumo';
+  const result = await queryRunner.query(
+    `WITH inputs AS (SELECT DISTINCT UNNEST($1::int[]) AS input_id),
+       mapped AS (
+         SELECT i.input_id, ARRAY_REMOVE(ARRAY_AGG(DISTINCT candidates.master_id), NULL) AS master_ids
+         FROM inputs i LEFT JOIN LATERAL (
+           SELECT m.${masterColumn} AS master_id FROM public.${mappingTable} m WHERE m.${legacyColumn} = i.input_id
+           UNION SELECT m.${masterColumn} FROM public.${mappingTable} m WHERE m.${masterColumn} = i.input_id
+         ) candidates ON true GROUP BY i.input_id
+       ), resolved AS (
+         SELECT input_id, master_ids,
+           CASE WHEN CARDINALITY(master_ids) = 0 THEN input_id ELSE master_ids[1] END AS master_id
+         FROM mapped
+       )
+     SELECT r.input_id, r.master_ids, r.master_id, m.${idColumn} AS found_id,
+            m.${nameColumn} AS nombre, COALESCE(m.estado, true) AS estado_global
+     FROM resolved r LEFT JOIN public.${masterTable} m ON m.${idColumn} = r.master_id`,
+    [inputIds]
+  );
+  return new Map((result.rows || []).map((row) => [Number(row.input_id), row]));
+};
 
-  for (const rawLine of rawLines) {
-    ensurePlainObject(rawLine, 'Cada detalle debe ser un objeto.');
-    rejectUnexpectedFields(rawLine, DETAIL_FIELDS, 'El detalle');
-    const type = String(rawLine.tipo_item ?? '').trim().toLowerCase();
-    if (!['producto', 'insumo'].includes(type)) fail(400, 'VALIDATION_ERROR', 'tipo_item debe ser producto o insumo.');
-    const rawItemId = parsePositiveIntStrict(rawLine.id_item);
-    if (!rawItemId) fail(400, 'VALIDATION_ERROR', 'id_item debe ser un entero positivo.');
-    const presentationId = hasValue(rawLine.id_presentacion_insumo)
-      ? parsePositiveIntStrict(rawLine.id_presentacion_insumo)
-      : null;
-    if (hasValue(rawLine.id_presentacion_insumo) && !presentationId) {
-      fail(400, 'VALIDATION_ERROR', 'id_presentacion_insumo debe ser un entero positivo.');
+const normalizeRequestLinesBatch = async (inputLines, warehouse, queryRunner) => {
+  const productIds = [...new Set(inputLines.filter((line) => line.type === 'producto').map((line) => line.rawItemId))];
+  const supplyIds = [...new Set(inputLines.filter((line) => line.type === 'insumo').map((line) => line.rawItemId))];
+  const productMasters = await loadMasterBatch('producto', productIds, queryRunner);
+  const supplyMasters = await loadMasterBatch('insumo', supplyIds, queryRunner);
+  const resolvedLines = inputLines.map((line) => {
+    const row = (line.type === 'producto' ? productMasters : supplyMasters).get(line.rawItemId);
+    const mappedIds = Array.isArray(row?.master_ids) ? row.master_ids : [];
+    if (mappedIds.length > 1) fail(409, 'CONFLICT', `El ${line.type} indicado tiene mapeos maestros inconsistentes.`);
+    if (!row?.found_id) fail(404, 'NOT_FOUND', `${line.type === 'producto' ? 'Producto' : 'Insumo'} maestro no encontrado.`);
+    if (!(row.estado_global === true || row.estado_global === 1 || String(row.estado_global).toLowerCase() === 'true')) {
+      fail(409, 'CONFLICT', `El ${line.type} maestro esta inactivo.`);
     }
-    if (type === 'producto' && presentationId) {
-      fail(400, 'VALIDATION_ERROR', 'Los productos no aceptan presentacion de insumo.');
-    }
-    const quantity = parseQuantity(rawLine.cantidad, { integerOnly: type === 'producto' });
-    if (!quantity) {
-      fail(400, 'VALIDATION_ERROR', type === 'producto'
-        ? 'La cantidad de producto debe ser un entero positivo.'
-        : 'La cantidad de insumo debe ser positiva y tener hasta 6 decimales.');
-    }
+    return { ...line, masterId: Number(row.master_id), masterName: String(row.nombre ?? '') };
+  });
 
-    const resolved = await dependencies.resolveMaster(type, rawItemId, queryRunner);
-    if (!resolved.ok) fail(resolved.status || 400, resolved.status === 404 ? 'NOT_FOUND' : 'CONFLICT', resolved.message);
-    if (!resolved.master.estado_global) fail(409, 'CONFLICT', `El ${type} maestro esta inactivo.`);
-    const masterId = Number(resolved.masterId);
-    const assignment = await dependencies.getAssignment(type, masterId, warehouse.id_almacen, queryRunner);
-    if (!assignment || !assignment.activo) {
-      fail(409, 'CONFLICT', `El ${type} no tiene una asignacion activa en el almacen solicitado.`);
-    }
-    if (Number(assignment.id_sucursal) !== warehouse.id_sucursal) {
-      fail(409, 'CONFLICT', `La asignacion del ${type} no coincide con la sucursal del almacen.`);
-    }
+  const resolvedProductIds = [...new Set(resolvedLines.filter((line) => line.type === 'producto').map((line) => line.masterId))];
+  const resolvedSupplyIds = [...new Set(resolvedLines.filter((line) => line.type === 'insumo').map((line) => line.masterId))];
+  const assignments = await queryRunner.query(
+    `SELECT 'producto'::text AS tipo, pa.id_producto AS master_id, pa.id_almacen,
+            COALESCE(pa.estado, true) AS activo, a.id_sucursal
+       FROM public.productos_almacenes pa JOIN public.almacenes a ON a.id_almacen = pa.id_almacen
+      WHERE pa.id_almacen = $1 AND pa.id_producto = ANY($2::int[])
+     UNION ALL
+     SELECT 'insumo', ia.id_insumo, ia.id_almacen, COALESCE(ia.estado, true), a.id_sucursal
+       FROM public.insumos_almacenes ia JOIN public.almacenes a ON a.id_almacen = ia.id_almacen
+      WHERE ia.id_almacen = $1 AND ia.id_insumo = ANY($3::int[])`,
+    [warehouse.id_almacen, resolvedProductIds, resolvedSupplyIds]
+  );
+  const assignmentMap = new Map((assignments.rows || []).map((row) => [`${row.tipo}:${Number(row.master_id)}`, row]));
 
-    const snapshot = type === 'producto'
-      ? {
-          id_presentacion_insumo: null,
-          id_unidad_base: null,
-          nombre_presentacion_snapshot: 'Unidad',
-          factor_conversion_snapshot: '1'
-        }
-      : await loadInsumoSnapshot(masterId, presentationId, queryRunner);
-    const key = `${type}:${masterId}:${snapshot.id_presentacion_insumo ?? 'base'}`;
-    const existing = grouped.get(key);
-    const nextScaled = (existing?.quantityScaled || 0n) + quantity.scaled;
-    if (nextScaled > MAX_QUANTITY_SCALED) fail(400, 'VALIDATION_ERROR', 'La cantidad agrupada excede el maximo permitido.');
-    grouped.set(key, {
-      tipo_item: type.toUpperCase(),
-      id_producto: type === 'producto' ? masterId : null,
-      id_insumo: type === 'insumo' ? masterId : null,
-      ...snapshot,
-      quantityScaled: nextScaled
-    });
-  }
-
-  return Array.from(grouped.values()).map(({ quantityScaled, ...line }) => ({
-    ...line,
-    cantidad_solicitada: scaledToDecimal(quantityScaled)
+  const supplyPairs = resolvedLines.filter((line) => line.type === 'insumo').map((line) => ({
+    master_id: line.masterId, presentation_id: line.presentationId
   }));
+  const snapshots = supplyPairs.length === 0 ? { rows: [] } : await queryRunner.query(
+    `WITH requested AS (
+       SELECT DISTINCT master_id, presentation_id
+       FROM jsonb_to_recordset($1::jsonb) AS x(master_id int, presentation_id int)
+     )
+     SELECT r.master_id, r.presentation_id, i.id_unidad_medida AS id_unidad_base_insumo,
+            i.nombre_insumo, um.id_unidad_medida AS id_unidad_base_valida,
+            COALESCE(NULLIF(TRIM(um.nombre), ''), CONCAT('Unidad #', i.id_unidad_medida::text)) AS nombre_unidad_base,
+            ip.id_presentacion, ip.id_insumo AS presentation_insumo_id, ip.id_unidad_base,
+            ip.nombre_presentacion, ip.cantidad_presentacion::text, ip.cantidad_base::text,
+            CAST(ip.cantidad_base / NULLIF(ip.cantidad_presentacion, 0) AS numeric(30,18))::text AS factor_conversion,
+            COALESCE(ip.estado, false) AS presentation_active, COALESCE(ip.uso_compra, false) AS uso_compra
+       FROM requested r JOIN public.insumos i ON i.id_insumo = r.master_id
+       LEFT JOIN public.unidades_medida um ON um.id_unidad_medida = i.id_unidad_medida
+       LEFT JOIN public.insumo_presentaciones ip ON ip.id_presentacion = r.presentation_id`,
+    [JSON.stringify(supplyPairs)]
+  );
+  const snapshotMap = new Map((snapshots.rows || []).map((row) => [`${Number(row.master_id)}:${row.presentation_id ?? 'base'}`, row]));
+  const grouped = new Map();
+  for (const line of resolvedLines) {
+    const assignment = assignmentMap.get(`${line.type}:${line.masterId}`);
+    if (!assignment || !(assignment.activo === true || assignment.activo === 1 || String(assignment.activo).toLowerCase() === 'true')) {
+      fail(409, 'CONFLICT', `El ${line.type} no tiene una asignacion activa en el almacen solicitado.`);
+    }
+    if (Number(assignment.id_sucursal) !== warehouse.id_sucursal) fail(409, 'CONFLICT', `La asignacion del ${line.type} no coincide con la sucursal del almacen.`);
+    let snapshot = { id_presentacion_insumo: null, id_unidad_base: null, nombre_presentacion_snapshot: 'Unidad', factor_conversion_snapshot: '1' };
+    if (line.type === 'insumo') {
+      const row = snapshotMap.get(`${line.masterId}:${line.presentationId ?? 'base'}`);
+      if (!parsePositiveIntStrict(row?.id_unidad_base_insumo) || !parsePositiveIntStrict(row?.id_unidad_base_valida)) {
+        fail(409, 'INSUMO_SIN_UNIDAD_BASE', 'El insumo requiere que Inventario configure su unidad base antes de solicitarlo.');
+      }
+      if (line.presentationId) {
+        const validPresentation = row?.id_presentacion && row.presentation_active && row.uso_compra
+          && Number(row.cantidad_presentacion) > 0 && Number(row.cantidad_base) > 0;
+        if (!validPresentation) fail(400, 'VALIDATION_ERROR', 'La presentacion de insumo no existe o no esta disponible para compra.');
+        if (Number(row.presentation_insumo_id) !== line.masterId) fail(400, 'VALIDATION_ERROR', 'La presentacion no pertenece al insumo indicado.');
+        if (Number(row.id_unidad_base) !== Number(row.id_unidad_base_insumo)) {
+          fail(409, 'PRESENTACION_UNIDAD_BASE_INCOMPATIBLE', `${line.masterName || 'El insumo'}: la presentacion '${String(row.nombre_presentacion || 'seleccionada')}' utiliza una unidad base diferente a la configurada en el insumo. Revisa la unidad base y la presentacion de compra desde Inventario y vuelve a intentar.`);
+        }
+        snapshot = { id_presentacion_insumo: Number(row.id_presentacion), id_unidad_base: Number(row.id_unidad_base), nombre_presentacion_snapshot: row.nombre_presentacion, factor_conversion_snapshot: row.factor_conversion };
+      } else {
+        snapshot = { id_presentacion_insumo: null, id_unidad_base: Number(row.id_unidad_base_insumo), nombre_presentacion_snapshot: row.nombre_unidad_base, factor_conversion_snapshot: '1' };
+      }
+    }
+    const key = `${line.type}:${line.masterId}:${snapshot.id_presentacion_insumo ?? 'base'}`;
+    const existing = grouped.get(key);
+    const nextScaled = (existing?.quantityScaled || 0n) + line.quantity.scaled;
+    if (nextScaled > MAX_QUANTITY_SCALED) fail(400, 'VALIDATION_ERROR', 'La cantidad agrupada excede el maximo permitido.');
+    grouped.set(key, { tipo_item: line.type.toUpperCase(), id_producto: line.type === 'producto' ? line.masterId : null,
+      id_insumo: line.type === 'insumo' ? line.masterId : null, ...snapshot, quantityScaled: nextScaled });
+  }
+  return [...grouped.values()].map(({ quantityScaled, ...line }) => ({ ...line, cantidad_solicitada: scaledToDecimal(quantityScaled) }));
+};
+
+// Compatibilidad exclusiva para los fakes escalares históricos; el runtime real siempre usa el camino batch.
+const normalizeRequestLinesScalarCompatibility = async (inputLines, warehouse, queryRunner, dependencies) => {
+  const grouped = new Map();
+  for (const line of inputLines) {
+    const resolved = await dependencies.resolveMaster(line.type, line.rawItemId, queryRunner);
+    if (!resolved.ok) fail(resolved.status || 400, resolved.status === 404 ? 'NOT_FOUND' : 'CONFLICT', resolved.message);
+    if (!resolved.master.estado_global) fail(409, 'CONFLICT', `El ${line.type} maestro esta inactivo.`);
+    const masterId = Number(resolved.masterId);
+    const assignment = await dependencies.getAssignment(line.type, masterId, warehouse.id_almacen, queryRunner);
+    if (!assignment || !assignment.activo) fail(409, 'CONFLICT', `El ${line.type} no tiene una asignacion activa en el almacen solicitado.`);
+    if (Number(assignment.id_sucursal) !== warehouse.id_sucursal) fail(409, 'CONFLICT', `La asignacion del ${line.type} no coincide con la sucursal del almacen.`);
+    const snapshot = line.type === 'producto'
+      ? { id_presentacion_insumo: null, id_unidad_base: null, nombre_presentacion_snapshot: 'Unidad', factor_conversion_snapshot: '1' }
+      : await loadInsumoSnapshot(masterId, line.presentationId, queryRunner);
+    const key = `${line.type}:${masterId}:${snapshot.id_presentacion_insumo ?? 'base'}`;
+    const existing = grouped.get(key);
+    const nextScaled = (existing?.quantityScaled || 0n) + line.quantity.scaled;
+    if (nextScaled > MAX_QUANTITY_SCALED) fail(400, 'VALIDATION_ERROR', 'La cantidad agrupada excede el maximo permitido.');
+    grouped.set(key, { tipo_item: line.type.toUpperCase(), id_producto: line.type === 'producto' ? masterId : null,
+      id_insumo: line.type === 'insumo' ? masterId : null, ...snapshot, quantityScaled: nextScaled });
+  }
+  return [...grouped.values()].map(({ quantityScaled, ...line }) => ({ ...line, cantidad_solicitada: scaledToDecimal(quantityScaled) }));
 };
 
 const mapDatabaseError = (error) => {
@@ -491,8 +608,12 @@ export const createSolicitudesCompraService = (overrides = {}) => {
     resolveScope: overrides.resolveScope || resolveRequestUserSucursalScope,
     resolveMaster: overrides.resolveMaster || resolveCatalogoMaestroEntity,
     getAssignment: overrides.getAssignment || getWarehouseAssignmentDetails,
-    resolveOperativeWarehouse: overrides.resolveOperativeWarehouse || resolveOperativeWarehouseId
+    resolveOperativeWarehouse: overrides.resolveOperativeWarehouse || resolveOperativeWarehouseId,
+    getPoolState: overrides.getPoolState || getPoolState,
+    logPoolWaitIfAny: overrides.logPoolWaitIfAny || logPoolWaitIfAny,
+    now: overrides.now || (() => Date.now())
   };
+  dependencies.useScalarCompatibility = Boolean(overrides.resolveMaster || overrides.getAssignment);
 
   const listCatalog = async (req) => {
     const access = await normalizeAccess(req, dependencies.db, dependencies);
@@ -541,54 +662,146 @@ export const createSolicitudesCompraService = (overrides = {}) => {
   };
 
   const create = async (req) => {
+    const startedAt = dependencies.now();
     ensurePlainObject(req.body, 'El payload debe ser un objeto.');
     rejectUnexpectedFields(req.body, TOP_LEVEL_FIELDS, 'El payload');
     validateRequestShape(req.body);
     const warehouseId = parsePositiveIntStrict(req.body.id_almacen);
     if (!warehouseId) fail(400, 'VALIDATION_ERROR', 'id_almacen es obligatorio y debe ser un entero positivo.');
     const observation = normalizeObservation(req.body.observacion);
-    const client = await dependencies.db.connect();
-    let transactionStarted = false;
+    const clientRequestId = normalizeClientRequestId(req.body.client_request_id);
+    const inputLines = validateAndNormalizeInputLines(req.body.detalles);
+    const fingerprint = buildRequestFingerprint({ warehouseId, observation, lines: inputLines });
+    const poolBefore = dependencies.getPoolState();
+    if (poolBefore.waitingCount > 0) dependencies.logPoolWaitIfAny('solicitudes_compra.create');
+    let client;
     try {
-      await client.query('BEGIN');
+      client = await dependencies.db.connect();
+    } catch {
+      throw new SolicitudesCompraError(503, 'DATABASE_BUSY', 'El servicio está procesando otras operaciones. Intenta nuevamente en unos segundos.');
+    }
+    let transactionStarted = false;
+    let queryCount = 0;
+    let idempotentReplay = false;
+    let legacyDeduplicated = false;
+    let totalLines = inputLines.length;
+    let poolAfter = poolBefore;
+    const query = async (sql, params) => {
+      queryCount += 1;
+      return client.query(sql, params);
+    };
+    try {
+      await query('BEGIN');
       transactionStarted = true;
-      const access = await normalizeAccess(req, client, dependencies);
-      const warehouse = await getWarehouse(warehouseId, access, client);
-      const lines = await normalizeRequestLines(req.body.detalles, warehouse, client, dependencies);
-      const headerResult = await client.query(
+      const queryRunner = { query };
+      const access = await normalizeAccess(req, queryRunner, dependencies);
+      const warehouse = await getWarehouse(warehouseId, access, queryRunner);
+      let header;
+      if (clientRequestId) {
+        const reservation = await query(
+          `INSERT INTO public.solicitudes_compra (
+             id_sucursal, id_almacen, id_usuario_solicitante, estado,
+             observacion_solicitud, inventario_aplicado, client_request_id, request_fingerprint
+           ) VALUES ($1, $2, $3, 'PENDIENTE', $4, false, $5::uuid, $6)
+           ON CONFLICT (client_request_id) WHERE client_request_id IS NOT NULL DO NOTHING
+           RETURNING id_solicitud_compra, estado, fecha_creacion`,
+          [warehouse.id_sucursal, warehouse.id_almacen, access.idUsuario, observation, clientRequestId, fingerprint]
+        );
+        header = reservation.rows?.[0];
+        if (!header) {
+          const existing = await query(
+            `SELECT sc.id_solicitud_compra, sc.id_usuario_solicitante, sc.id_almacen,
+                    sc.request_fingerprint, sc.estado, sc.fecha_creacion,
+                    COUNT(d.id_solicitud_detalle)::integer AS total_lineas
+             FROM public.solicitudes_compra sc
+             LEFT JOIN public.solicitudes_compra_detalle d ON d.id_solicitud_compra = sc.id_solicitud_compra
+             WHERE sc.client_request_id = $1::uuid
+             GROUP BY sc.id_solicitud_compra`,
+            [clientRequestId]
+          );
+          const row = existing.rows?.[0];
+          const matches = row && Number(row.id_usuario_solicitante) === Number(access.idUsuario)
+            && Number(row.id_almacen) === warehouse.id_almacen && row.request_fingerprint === fingerprint;
+          if (!matches) fail(409, 'IDEMPOTENCY_KEY_REUSED', 'El identificador de envío ya fue utilizado para otra solicitud.');
+          header = row;
+          totalLines = Number(row.total_lineas ?? 0);
+          idempotentReplay = true;
+        }
+      } else if (!dependencies.useScalarCompatibility) {
+        const lockKey = `${access.idUsuario}:${warehouse.id_almacen}:${fingerprint}`;
+        await query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [lockKey]);
+        const existing = await query(
+          `SELECT sc.id_solicitud_compra, sc.estado, sc.fecha_creacion,
+                  COUNT(d.id_solicitud_detalle)::integer AS total_lineas
+           FROM public.solicitudes_compra sc
+           LEFT JOIN public.solicitudes_compra_detalle d ON d.id_solicitud_compra = sc.id_solicitud_compra
+           WHERE sc.id_usuario_solicitante = $1 AND sc.id_almacen = $2
+             AND sc.request_fingerprint = $3
+             AND sc.fecha_creacion >= CURRENT_TIMESTAMP - INTERVAL '5 minutes'
+           GROUP BY sc.id_solicitud_compra ORDER BY sc.fecha_creacion DESC LIMIT 1`,
+          [access.idUsuario, warehouse.id_almacen, fingerprint]
+        );
+        header = existing.rows?.[0];
+        if (header) {
+          totalLines = Number(header.total_lineas ?? 0);
+          legacyDeduplicated = true;
+        }
+      }
+      if (idempotentReplay || legacyDeduplicated) {
+        await query('COMMIT');
+        transactionStarted = false;
+        return { ok: true, mensaje: 'Solicitud de compra creada correctamente.',
+          id_solicitud_compra: Number(header.id_solicitud_compra), estado: header.estado,
+          fecha_creacion: header.fecha_creacion, total_lineas: totalLines,
+          idempotent_replay: idempotentReplay, legacy_deduplicated: legacyDeduplicated, query_count: queryCount };
+      }
+      const lines = dependencies.useScalarCompatibility
+        ? await normalizeRequestLinesScalarCompatibility(inputLines, warehouse, queryRunner, dependencies)
+        : await normalizeRequestLinesBatch(inputLines, warehouse, queryRunner);
+      if (!header) {
+        const headerResult = await query(
         `
           INSERT INTO public.solicitudes_compra (
             id_sucursal, id_almacen, id_usuario_solicitante, estado,
-            observacion_solicitud, inventario_aplicado
-          ) VALUES ($1, $2, $3, 'PENDIENTE', $4, false)
+            observacion_solicitud, inventario_aplicado, request_fingerprint
+          ) VALUES ($1, $2, $3, 'PENDIENTE', $4, false, $5)
           RETURNING id_solicitud_compra, estado, fecha_creacion
         `,
-        [warehouse.id_sucursal, warehouse.id_almacen, access.idUsuario, observation]
-      );
-      const header = headerResult.rows[0];
-      for (const line of lines) {
-        await client.query(
-          `
-            INSERT INTO public.solicitudes_compra_detalle (
-              id_solicitud_compra, tipo_item, id_producto, id_insumo,
-              id_presentacion_insumo, id_unidad_base, nombre_presentacion_snapshot,
-              factor_conversion_snapshot, cantidad_solicitada, cantidad_base_solicitada, origen_linea
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8::numeric, $9::numeric, ROUND($9::numeric * $8::numeric, 6), 'SUCURSAL')
-          `,
-          [
-            header.id_solicitud_compra,
-            line.tipo_item,
-            line.id_producto,
-            line.id_insumo,
-            line.id_presentacion_insumo,
-            line.id_unidad_base,
-            line.nombre_presentacion_snapshot,
-            line.factor_conversion_snapshot,
-            line.cantidad_solicitada
-          ]
+          [warehouse.id_sucursal, warehouse.id_almacen, access.idUsuario, observation, fingerprint]
         );
+        header = headerResult.rows[0];
       }
-      await client.query('COMMIT');
+      if (dependencies.useScalarCompatibility) {
+        for (const line of lines) {
+          await query(
+            `INSERT INTO public.solicitudes_compra_detalle (
+               id_solicitud_compra, tipo_item, id_producto, id_insumo,
+               id_presentacion_insumo, id_unidad_base, nombre_presentacion_snapshot,
+               factor_conversion_snapshot, cantidad_solicitada, cantidad_base_solicitada, origen_linea
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8::numeric, $9::numeric,
+               ROUND($9::numeric * $8::numeric, 6), 'SUCURSAL')`,
+            [header.id_solicitud_compra, line.tipo_item, line.id_producto, line.id_insumo,
+              line.id_presentacion_insumo, line.id_unidad_base, line.nombre_presentacion_snapshot,
+              line.factor_conversion_snapshot, line.cantidad_solicitada]
+          );
+        }
+      } else await query(
+        `INSERT INTO public.solicitudes_compra_detalle (
+           id_solicitud_compra, tipo_item, id_producto, id_insumo,
+           id_presentacion_insumo, id_unidad_base, nombre_presentacion_snapshot,
+           factor_conversion_snapshot, cantidad_solicitada, cantidad_base_solicitada, origen_linea
+         )
+         SELECT $1, x.tipo_item, x.id_producto, x.id_insumo, x.id_presentacion_insumo,
+                x.id_unidad_base, x.nombre_presentacion_snapshot, x.factor_conversion_snapshot,
+                x.cantidad_solicitada, ROUND(x.cantidad_solicitada * x.factor_conversion_snapshot, 6), 'SUCURSAL'
+         FROM jsonb_to_recordset($2::jsonb) AS x(
+           tipo_item text, id_producto int, id_insumo int, id_presentacion_insumo int,
+           id_unidad_base int, nombre_presentacion_snapshot text,
+           factor_conversion_snapshot numeric, cantidad_solicitada numeric
+         )`,
+        [header.id_solicitud_compra, JSON.stringify(lines)]
+      );
+      await query('COMMIT');
       transactionStarted = false;
       return {
         ok: true,
@@ -596,16 +809,44 @@ export const createSolicitudesCompraService = (overrides = {}) => {
         id_solicitud_compra: Number(header.id_solicitud_compra),
         estado: header.estado,
         fecha_creacion: header.fecha_creacion,
-        total_lineas: lines.length
+        total_lineas: lines.length,
+        idempotent_replay: false,
+        legacy_deduplicated: false,
+        query_count: queryCount
       };
     } catch (error) {
       if (transactionStarted) {
-        try { await client.query('ROLLBACK'); } catch { /* AM: conserva el error original. */ }
+        try { await query('ROLLBACK'); } catch { /* AM: conserva el error original. */ }
       }
       throw mapDatabaseError(error);
     } finally {
       client.release();
+      poolAfter = dependencies.getPoolState();
+      const durationMs = dependencies.now() - startedAt;
+      if (durationMs > 5000) console.warn('[solicitudes_compra] create_slow', {
+        duration_ms: durationMs, total_lineas: inputLines.length, query_count: queryCount,
+        has_client_request_id: Boolean(clientRequestId), idempotent_replay: idempotentReplay,
+        legacy_deduplicated: legacyDeduplicated,
+        pool_before: poolBefore, pool_after: poolAfter
+      });
     }
+  };
+
+  const getByClientRequestId = async (req) => {
+    const clientRequestId = normalizeClientRequestId(req.params?.client_request_id);
+    const access = await normalizeAccess(req, dependencies.db, dependencies);
+    const result = await dependencies.db.query(
+      `SELECT sc.id_solicitud_compra, sc.id_usuario_solicitante, sc.estado, sc.fecha_creacion,
+              COUNT(d.id_solicitud_detalle)::integer AS total_lineas
+       FROM public.solicitudes_compra sc
+       LEFT JOIN public.solicitudes_compra_detalle d ON d.id_solicitud_compra = sc.id_solicitud_compra
+       WHERE sc.client_request_id = $1::uuid
+       GROUP BY sc.id_solicitud_compra`, [clientRequestId]
+    );
+    const row = result.rows?.[0];
+    if (!row || Number(row.id_usuario_solicitante) !== Number(access.idUsuario)) return { ok: true, found: false };
+    return { ok: true, found: true, solicitud: { id_solicitud_compra: Number(row.id_solicitud_compra),
+      estado: row.estado, fecha_creacion: row.fecha_creacion, total_lineas: Number(row.total_lineas ?? 0) } };
   };
 
   const list = async (req) => {
@@ -852,7 +1093,7 @@ export const createSolicitudesCompraService = (overrides = {}) => {
     };
   };
 
-  return { listCatalog, create, list, getById };
+  return { listCatalog, create, getByClientRequestId, list, getById };
 };
 
 export const solicitudesCompraService = createSolicitudesCompraService();
