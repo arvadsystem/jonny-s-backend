@@ -6,6 +6,11 @@ import {
   requestHasAnyPermission
 } from '../middleware/checkPermission.js';
 import { resolveRequestUserSucursalScope } from '../utils/sucursalScope.js';
+import {
+  resolveKdsDeliveryMode,
+  resolveKdsOrderOrigin,
+  resolveLegacyKdsServiceType
+} from '../utils/kdsOrderContext.js';
 import { enviarCorreo } from '../utils/emailService.js';
 import { validarYDescontarPedido } from '../services/inventarioPedidoService.js';
 import { registrarAlertasInventarioPedido } from '../services/inventarioAlertasService.js';
@@ -618,14 +623,6 @@ export const buildPedidoConsumoPayload = async (client, idPedido, idSucursal) =>
   };
 };
 
-const inferTipoServicio = (descripcionEnvio) => {
-  const text = String(descripcionEnvio || '').trim().toLowerCase();
-  if (!text) return 'LOCAL';
-  if (text.includes('delivery')) return 'DELIVERY';
-  if (text.includes('llevar')) return 'PARA_LLEVAR';
-  return 'LOCAL';
-};
-
 const extractPedidoNotes = (descripcionPedido) =>
   String(descripcionPedido || '')
     .split('|')
@@ -963,6 +960,25 @@ router.get('/cocina/pedidos', checkPermission(COCINA_VIEW_PERMISSIONS), async (r
             OR COALESCE(NULLIF(trim(concat_ws(' ', per.nombre, per.apellido)), ''), emp.nombre_empresa, 'Consumidor final') ILIKE ${qParam}
             OR COALESCE(prod.nombre_producto, rec.nombre_receta, standalone_extra.nombre_extra_snapshot, '') ILIKE ${qParam}
             OR COALESCE(dp.observacion, p.descripcion_pedido, '') ILIKE ${qParam}
+            OR COALESCE(p.origen_pedido, '') ILIKE ${qParam}
+            OR COALESCE(p.canal, '') ILIKE ${qParam}
+            OR COALESCE(p.tipo_entrega, '') ILIKE ${qParam}
+            OR COALESCE(pedido_contexto.canal_codigo, '') ILIKE ${qParam}
+            OR COALESCE(pedido_contexto.modalidad_codigo, '') ILIKE ${qParam}
+            OR CASE
+                 WHEN UPPER(COALESCE(pedido_contexto.canal_codigo, p.canal, '')) = 'MENU_PUBLICO'
+                   OR UPPER(COALESCE(p.origen_pedido, '')) IN ('MENU', 'WEB', 'MENU_PUBLICO', 'PUBLIC_MENU') THEN 'web'
+                 WHEN UPPER(COALESCE(pedido_contexto.modalidad_codigo, p.tipo_entrega, '')) = 'DELIVERY' THEN 'delivery'
+                 ELSE 'local'
+               END ILIKE ${qParam}
+            OR CASE UPPER(COALESCE(pedido_contexto.modalidad_codigo, p.tipo_entrega, ''))
+                 WHEN 'CONSUMO_LOCAL' THEN 'comer aqui'
+                 WHEN 'LOCAL' THEN 'comer aqui'
+                 WHEN 'RECOGER' THEN 'para llevar'
+                 WHEN 'PARA_LLEVAR' THEN 'para llevar'
+                 WHEN 'DELIVERY' THEN 'delivery'
+                 ELSE ''
+               END ILIKE ${qParam}
           )
         `);
       }
@@ -986,6 +1002,15 @@ router.get('/cocina/pedidos', checkPermission(COCINA_VIEW_PERMISSIONS), async (r
             ep.descripcion AS estado_descripcion,
             p.descripcion_pedido,
             p.descripcion_envio,
+            p.origen_pedido,
+            p.canal,
+            p.tipo_entrega,
+            pedido_contexto.canal_codigo,
+            pedido_contexto.modalidad_codigo,
+            EXISTS (
+              SELECT 1 FROM public.pedidos_delivery pd_kds
+              WHERE pd_kds.id_pedido = p.id_pedido
+            ) AS has_delivery,
             p.fecha_hora_pedido,
             p.visible_en_cocina_at,
             ${hasEnPreparacionAt ? 'p.en_preparacion_at,' : 'NULL::timestamptz AS en_preparacion_at,'}
@@ -1037,6 +1062,16 @@ router.get('/cocina/pedidos', checkPermission(COCINA_VIEW_PERMISSIONS), async (r
           LEFT JOIN clientes c ON c.id_cliente = p.id_cliente
           LEFT JOIN personas per ON per.id_persona = c.id_persona
           LEFT JOIN empresas emp ON emp.id_empresa = c.id_empresa
+          LEFT JOIN LATERAL (
+            SELECT canal.codigo AS canal_codigo, modalidad.codigo AS modalidad_codigo
+            FROM public.pedidos_contexto pc
+            LEFT JOIN public.cat_pedidos_canales canal ON canal.id_canal_pedido = pc.id_canal_pedido
+            LEFT JOIN public.cat_pedidos_modalidades_entrega modalidad
+              ON modalidad.id_modalidad_entrega = pc.id_modalidad_entrega
+            WHERE pc.id_pedido = p.id_pedido
+            ORDER BY pc.id_pedido
+            LIMIT 1
+          ) pedido_contexto ON TRUE
           -- AM: Usa LEFT JOIN LATERAL para tomar una sola factura por pedido y evitar duplicados por multiples facturas.
           LEFT JOIN LATERAL (
             SELECT f.*
@@ -1165,6 +1200,16 @@ router.get('/cocina/pedidos', checkPermission(COCINA_VIEW_PERMISSIONS), async (r
       for (const row of operationalRows) {
         if (!grouped.has(row.id_pedido)) {
           const estadoCode = resolveEstadoCode(row.estado_descripcion);
+          const kdsContext = {
+            canalCodigo: row.canal_codigo || row.canal,
+            modalidadCodigo: row.modalidad_codigo || row.tipo_entrega,
+            origenPedido: row.origen_pedido,
+            descripcionPedido: row.descripcion_pedido,
+            descripcionEnvio: row.descripcion_envio,
+            hasDelivery: row.has_delivery === true || row.has_delivery === 1 || String(row.has_delivery).toLowerCase() === 'true'
+          };
+          const origenPedidoKds = resolveKdsOrderOrigin(kdsContext);
+          const modalidadEntregaKds = resolveKdsDeliveryMode(kdsContext);
 
           grouped.set(row.id_pedido, {
             id_pedido: Number(row.id_pedido),
@@ -1176,7 +1221,11 @@ router.get('/cocina/pedidos', checkPermission(COCINA_VIEW_PERMISSIONS), async (r
             estado_codigo: estadoCode,
             columna_kds: COLUMN_BY_CODE[estadoCode] || 'PENDIENTES',
             cliente_nombre: row.cliente_nombre || 'Consumidor final',
-            tipo_servicio: inferTipoServicio(row.descripcion_envio),
+            origen_pedido_kds: origenPedidoKds,
+            modalidad_entrega_kds: modalidadEntregaKds,
+            canal_codigo: row.canal_codigo || row.canal || null,
+            modalidad_codigo: row.modalidad_codigo || row.tipo_entrega || null,
+            tipo_servicio: resolveLegacyKdsServiceType(modalidadEntregaKds),
             descripcion_pedido: row.descripcion_pedido || null,
             descripcion_envio: row.descripcion_envio || null,
             fecha_operacion: row.fecha_operacion || null,
