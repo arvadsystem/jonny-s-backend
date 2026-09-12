@@ -257,6 +257,27 @@ export const getWarehouseAssignmentDetails = async (entityType, masterId, wareho
   };
 };
 
+export const validateWarehouseAssignmentsBatch = async (lines, warehouseId, db = pool) => {
+  const productIds = lines.filter((line) => line.type === 'PRODUCTO').map((line) => line.masterId);
+  const supplyIds = lines.filter((line) => line.type === 'INSUMO').map((line) => line.masterId);
+  const result = await db.query(
+    `SELECT input.tipo, input.id_maestro,
+            CASE WHEN input.tipo = 'PRODUCTO' THEN p.id_producto IS NOT NULL ELSE i.id_insumo IS NOT NULL END AS existe,
+            CASE WHEN input.tipo = 'PRODUCTO' THEN COALESCE(p.estado, true) ELSE COALESCE(i.estado, true) END AS activo,
+            CASE WHEN input.tipo = 'PRODUCTO' THEN COALESCE(pa.estado, false) ELSE COALESCE(ia.estado, false) END AS asignado
+     FROM (
+       SELECT 'PRODUCTO'::text AS tipo, UNNEST($1::int[]) AS id_maestro
+       UNION ALL SELECT 'INSUMO'::text, UNNEST($2::int[])
+     ) input
+     LEFT JOIN public.productos p ON input.tipo = 'PRODUCTO' AND p.id_producto = input.id_maestro
+     LEFT JOIN public.productos_almacenes pa ON input.tipo = 'PRODUCTO' AND pa.id_producto = input.id_maestro AND pa.id_almacen = $3
+     LEFT JOIN public.insumos i ON input.tipo = 'INSUMO' AND i.id_insumo = input.id_maestro
+     LEFT JOIN public.insumos_almacenes ia ON input.tipo = 'INSUMO' AND ia.id_insumo = input.id_maestro AND ia.id_almacen = $3
+     ORDER BY input.tipo, input.id_maestro`, [productIds, supplyIds, warehouseId]
+  );
+  return result.rows || [];
+};
+
 export const findActiveSucursalAssignmentConflict = async (entityType, masterId, warehouseId, db = pool) => {
   const config = getEntityConfig(entityType);
   const result = await db.query(

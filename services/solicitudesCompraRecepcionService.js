@@ -4,7 +4,8 @@ import { readRequestAccess } from '../middleware/checkPermission.js';
 import { supabase } from './supabaseClient.js';
 import {
   getWarehouseAssignmentDetails,
-  resolveCatalogoMaestroEntity
+  resolveCatalogoMaestroEntity,
+  validateWarehouseAssignmentsBatch
 } from './catalogoMaestroAsignacionesService.js';
 import {
   SolicitudesCompraError,
@@ -28,11 +29,12 @@ const ALLOWED_MIMES = Object.freeze({
 });
 const ADMIN_ROLES = new Set(['SUPER_ADMIN', 'ADMIN', 'ADMINISTRADOR']);
 const OPERATIVE_ROLES = new Set(['CAJERO', 'COCINA', 'COCINERO', 'COCINERA', 'JEFA_COCINA', 'JEFE_COCINA']);
-const RECEIPT_FIELDS = new Set(['observacion_recepcion', 'factura', 'detalles']);
-const UPLOAD_FIELDS = new Set(['factura']);
+const RECEIPT_FIELDS = new Set(['observacion_recepcion', 'factura', 'detalles', 'reception_request_id']);
+const UPLOAD_FIELDS = new Set(['factura', 'upload_request_id']);
 const INVOICE_FIELDS = new Set(['nombre_original', 'mime_type', 'data_url']);
 const DETAIL_FIELDS = new Set(['id_solicitud_detalle', 'cantidad_recibida']);
 const BASE64_REGEX = /^[A-Za-z0-9+/]+={0,2}$/;
+const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 const fail = (status, code, message) => { throw new SolicitudesCompraError(status, code, message); };
 const normalizeRole = (value) => String(value ?? '').trim().replace(/[\s-]+/g, '_').toUpperCase();
@@ -55,6 +57,36 @@ const normalizeObservation = (value) => {
   }
   return normalized || null;
 };
+
+const normalizeUuid = (value, field) => {
+  const normalized = String(value ?? '').trim().toLowerCase();
+  if (!UUID_REGEX.test(normalized)) fail(400, 'VALIDATION_ERROR', `${field} debe ser un UUID valido.`);
+  return normalized;
+};
+
+const sha256 = (value) => crypto.createHash('sha256').update(value).digest('hex');
+const canonicalQuantity = (value) => {
+  const text = String(value ?? '').trim();
+  const [whole, fraction = ''] = text.split('.');
+  const normalizedFraction = fraction.replace(/0+$/, '');
+  return normalizedFraction ? `${whole}.${normalizedFraction}` : whole;
+};
+
+export const buildReceptionFingerprint = ({ requestId, observation, details }) => sha256(JSON.stringify({
+  id_solicitud_compra: Number(requestId),
+  observacion_recepcion: observation,
+  detalles: details.map((detail) => ({
+    id_solicitud_detalle: Number(detail.id_solicitud_detalle),
+    cantidad_recibida: canonicalQuantity(detail.rawQuantity)
+  })).sort((left, right) => left.id_solicitud_detalle - right.id_solicitud_detalle)
+}));
+
+export const buildUploadFingerprint = ({ requestId, invoice }) => sha256(JSON.stringify({
+  id_solicitud_compra: Number(requestId),
+  nombre: invoice.originalName.toLowerCase(),
+  mime: invoice.mimeType,
+  contenido_sha256: sha256(invoice.buffer)
+}));
 
 export const normalizeInvoiceName = (value) => {
   const raw = String(value ?? '').trim().split(/[\\/]/).pop() || 'factura';
@@ -109,13 +141,19 @@ const validatePayload = (body) => {
     seen.add(id);
     return { id_solicitud_detalle: id, rawQuantity: detail.cantidad_recibida };
   });
-  return { invoice, details, observation: normalizeObservation(body.observacion_recepcion) };
+  return {
+    invoice,
+    details,
+    observation: normalizeObservation(body.observacion_recepcion),
+    receptionRequestId: normalizeUuid(body.reception_request_id, 'reception_request_id')
+  };
 };
 
 const validateUploadPayload = (body) => {
   ensurePlainObject(body, 'El payload debe ser un objeto.');
   rejectUnexpectedFields(body, UPLOAD_FIELDS, 'El payload');
-  return decodeInvoice(body.factura);
+  const invoice = decodeInvoice(body.factura);
+  return { invoice, uploadRequestId: normalizeUuid(body.upload_request_id, 'upload_request_id') };
 };
 
 const assertAccess = async (req, queryRunner, dependencies) => {
@@ -154,11 +192,17 @@ const assertHeader = (header, access) => {
 
 const parseStoredPositive = (value) => parseQuantity(String(value ?? ''), { integerOnly: false });
 
-const parseReceivedQuantity = (value, type) => {
-  if (type !== 'PRODUCTO') return parseQuantity(value);
+export const parseReceivedQuantity = (value, type) => {
   const text = String(value ?? '').trim();
-  const integerEquivalent = /^(?:[1-9]\d*)(?:\.0{1,6})?$/.exec(text);
-  return integerEquivalent ? parseQuantity(text.split('.')[0], { integerOnly: true }) : null;
+  if (!text) return null;
+  if (type !== 'PRODUCTO') {
+    if (!/^(?:0|[1-9]\d*)(?:\.\d{1,6})?$/.test(text)) return null;
+    return parseQuantity(text) || (canonicalQuantity(text) === '0' ? { decimal: '0', scaled: 0n } : null);
+  }
+  const integerEquivalent = /^(?:0|[1-9]\d*)(?:\.0{1,6})?$/.exec(text);
+  if (!integerEquivalent) return null;
+  const integer = text.split('.')[0];
+  return parseQuantity(integer, { integerOnly: true }) || (integer === '0' ? { decimal: '0', scaled: 0n } : null);
 };
 
 const normalizeDetails = (submitted, stored) => {
@@ -180,8 +224,8 @@ const normalizeDetails = (submitted, stored) => {
     }
     const received = parseReceivedQuantity(line.rawQuantity, type);
     if (!received) fail(400, 'VALIDATION_ERROR', type === 'PRODUCTO'
-      ? 'La cantidad recibida de un producto debe ser un entero positivo.'
-      : 'La cantidad recibida de un insumo debe ser positiva y tener hasta 6 decimales.');
+      ? 'La cantidad recibida de un producto debe ser cero o un entero positivo.'
+      : 'La cantidad recibida de un insumo debe ser no negativa y tener hasta 6 decimales.');
     if (received.scaled !== approved.scaled) hasDifference = true;
     const factor = type === 'PRODUCTO' ? '1' : String(row.factor_conversion_snapshot ?? '').trim();
     return {
@@ -189,7 +233,7 @@ const normalizeDetails = (submitted, stored) => {
       type,
       masterId: parsePositiveIntStrict(type === 'PRODUCTO' ? row.id_producto : row.id_insumo),
       received: received.decimal,
-      receivedBase: type === 'PRODUCTO' ? received.decimal : multiplyApprovedQuantityToBase(received.decimal, factor),
+      receivedBase: received.scaled === 0n ? '0' : (type === 'PRODUCTO' ? received.decimal : multiplyApprovedQuantityToBase(received.decimal, factor)),
       idProducto: type === 'PRODUCTO' ? Number(row.id_producto) : null,
       idInsumo: type === 'INSUMO' ? Number(row.id_insumo) : null
     };
@@ -225,7 +269,8 @@ const mapError = (error) => {
 };
 
 const loadHeader = async (runner, requestId, { lock = false } = {}) => (await runner.query(
-  `SELECT id_solicitud_compra, id_sucursal, id_almacen, estado, inventario_aplicado, fecha_inventario_aplicado
+  `SELECT id_solicitud_compra, id_sucursal, id_almacen, estado, inventario_aplicado, fecha_inventario_aplicado,
+          id_usuario_recepcion, fecha_recepcion, reception_request_id, reception_request_fingerprint
    FROM public.solicitudes_compra WHERE id_solicitud_compra = $1${lock ? ' FOR UPDATE' : ''}`,
   [requestId]
 )).rows?.[0];
@@ -250,6 +295,32 @@ const countInvoiceEvidence = async (runner, requestId) => {
 
 const safeRollback = async (client) => { try { await client.query('ROLLBACK'); } catch { /* AM: conserva error principal. */ } };
 
+const loadReceptionResult = async (runner, requestId) => {
+  const result = await runner.query(
+    `SELECT sc.id_solicitud_compra, sc.estado, sc.id_usuario_recepcion, sc.fecha_recepcion, sc.inventario_aplicado,
+            COUNT(DISTINCT d.id_solicitud_detalle)::int AS total_lineas,
+            COUNT(DISTINCT mi.id_movimiento)::int AS total_movimientos
+     FROM public.solicitudes_compra sc
+     LEFT JOIN public.solicitudes_compra_detalle d ON d.id_solicitud_compra = sc.id_solicitud_compra
+     LEFT JOIN public.movimientos_inventario mi ON mi.ref_origen = 'SOLICITUD_COMPRA' AND mi.id_ref = sc.id_solicitud_compra
+     WHERE sc.id_solicitud_compra = $1
+     GROUP BY sc.id_solicitud_compra`, [requestId]
+  );
+  return result.rows?.[0] || null;
+};
+
+const formatReceptionResult = (row, replay = false) => ({
+  ok: true,
+  mensaje: 'Solicitud recibida e inventario actualizado correctamente.',
+  replay,
+  solicitud: {
+    id_solicitud_compra: Number(row.id_solicitud_compra), estado: row.estado,
+    id_usuario_recepcion: Number(row.id_usuario_recepcion), fecha_recepcion: row.fecha_recepcion,
+    inventario_aplicado: row.inventario_aplicado,
+    total_lineas: Number(row.total_lineas), total_movimientos: Number(row.total_movimientos)
+  }
+});
+
 export const createSolicitudesCompraRecepcionService = (overrides = {}) => {
   const dependencies = {
     db: overrides.db || pool,
@@ -257,6 +328,7 @@ export const createSolicitudesCompraRecepcionService = (overrides = {}) => {
     resolveScope: overrides.resolveScope || resolveRequestUserSucursalScope,
     resolveMaster: overrides.resolveMaster || resolveCatalogoMaestroEntity,
     getAssignment: overrides.getAssignment || getWarehouseAssignmentDetails,
+    validateAssignmentsBatch: overrides.validateAssignmentsBatch || validateWarehouseAssignmentsBatch,
     storage: overrides.storage || storageAdapter,
     now: overrides.now || (() => Date.now()),
     uuid: overrides.uuid || (() => crypto.randomUUID()),
@@ -271,7 +343,31 @@ export const createSolicitudesCompraRecepcionService = (overrides = {}) => {
     }
   };
 
-  const persistInvoiceEvidence = async ({ client, requestId, access, invoice, uploadedPaths }) => {
+  const findUpload = async (runner, uploadRequestId) => (await runner.query(
+    `SELECT e.id_evidencia, e.id_archivo, e.upload_request_fingerprint,
+            a.nombre_original, a.tipo_archivo, a.tamano_bytes, a.url_publica
+     FROM public.solicitudes_compra_evidencias e
+     INNER JOIN public.archivos a ON a.id_archivo = e.id_archivo
+     WHERE e.upload_request_id = $1::uuid`, [uploadRequestId]
+  )).rows?.[0] || null;
+
+  const formatEvidence = (row) => ({
+    id_evidencia: Number(row.id_evidencia), id_archivo: Number(row.id_archivo),
+    nombre_original: row.nombre_original, tipo_archivo: row.tipo_archivo,
+    tamano_bytes: Number(row.tamano_bytes)
+  });
+
+  const persistInvoiceEvidence = async ({ client, requestId, access, invoice, uploadedPaths, uploadRequestId = null }) => {
+    const fingerprint = uploadRequestId ? buildUploadFingerprint({ requestId, invoice }) : null;
+    if (uploadRequestId) {
+      const existing = await findUpload(client, uploadRequestId);
+      if (existing) {
+        if (existing.upload_request_fingerprint !== fingerprint) {
+          fail(409, 'IDEMPOTENCY_CONFLICT', 'upload_request_id ya fue utilizado con otro archivo.');
+        }
+        return { evidence: formatEvidence(existing), replay: true };
+      }
+    }
     const currentCount = await countInvoiceEvidence(client, requestId);
     if (currentCount >= MAX_FACTURA_EVIDENCES) {
       fail(409, 'FACTURA_EVIDENCE_LIMIT', 'La solicitud admite un maximo de 10 imagenes de factura.');
@@ -296,34 +392,50 @@ export const createSolicitudesCompraRecepcionService = (overrides = {}) => {
     if (!fileId) fail(500, 'INTERNAL_ERROR', 'No se pudo registrar la factura.');
     const evidenceResult = await client.query(
       `INSERT INTO public.solicitudes_compra_evidencias
-        (id_solicitud_compra, id_archivo, tipo_evidencia, id_usuario_registro)
-       VALUES ($1, $2, 'FACTURA', $3)
+        (id_solicitud_compra, id_archivo, tipo_evidencia, id_usuario_registro, upload_request_id, upload_request_fingerprint)
+       VALUES ($1, $2, 'FACTURA', $3, $4::uuid, $5)
        RETURNING id_evidencia`,
-      [requestId, fileId, access.idUsuario]
+      [requestId, fileId, access.idUsuario, uploadRequestId, fingerprint]
     );
     const evidenceId = Number(evidenceResult.rows?.[0]?.id_evidencia);
     if (!evidenceId) fail(500, 'INTERNAL_ERROR', 'No se pudo vincular la factura a la solicitud.');
-    return {
+    return { evidence: {
       id_evidencia: evidenceId,
       id_archivo: fileId,
       nombre_original: invoice.originalName,
       tipo_archivo: invoice.mimeType,
       tamano_bytes: invoice.buffer.length
-    };
+    }, replay: false };
   };
 
   const receive = async (req) => {
     const requestId = parsePositiveIntStrict(req.params?.id_solicitud_compra);
     if (!requestId) fail(400, 'VALIDATION_ERROR', 'id_solicitud_compra debe ser un entero positivo.');
     const payload = validatePayload(req.body);
+    const fingerprint = buildReceptionFingerprint({ requestId, observation: payload.observation, details: payload.details });
+    const startedAt = dependencies.now();
+    const metrics = { request_id: payload.receptionRequestId, id_solicitud_compra: requestId };
 
+    const accessStarted = dependencies.now();
     const access = await assertAccess(req, dependencies.db, dependencies);
+    metrics.access_ms = dependencies.now() - accessStarted;
+    const prevalidationStarted = dependencies.now();
     const preHeader = await loadHeader(dependencies.db, requestId);
+    assertBranchAccess(preHeader, access);
+    if (String(preHeader.reception_request_id || '').toLowerCase() === payload.receptionRequestId) {
+      if (preHeader.reception_request_fingerprint !== fingerprint) fail(409, 'IDEMPOTENCY_CONFLICT', 'reception_request_id ya fue utilizado con otro payload.');
+      if (String(preHeader.estado).toUpperCase() === 'RECIBIDA' && preHeader.inventario_aplicado === true) {
+        const replay = formatReceptionResult(await loadReceptionResult(dependencies.db, requestId), true);
+        console.info('[solicitudes_compra.recepcion]', { ...metrics, total_ms: dependencies.now() - startedAt, replay: true });
+        return replay;
+      }
+    }
     assertHeader(preHeader, access);
     const preDetails = normalizeDetails(payload.details, await loadDetails(dependencies.db, requestId));
     if (preDetails.hasDifference && !payload.observation) {
       fail(400, 'VALIDATION_ERROR', 'observacion_recepcion es obligatoria cuando existen diferencias.');
     }
+    metrics.prevalidation_ms = dependencies.now() - prevalidationStarted;
 
     let client;
     let transactionStarted = false;
@@ -333,70 +445,100 @@ export const createSolicitudesCompraRecepcionService = (overrides = {}) => {
       await client.query('BEGIN');
       transactionStarted = true;
       const txAccess = await assertAccess(req, client, dependencies);
+      const lockStarted = dependencies.now();
       const header = await loadHeader(client, requestId, { lock: true });
+      metrics.lock_wait_ms = dependencies.now() - lockStarted;
+      assertBranchAccess(header, txAccess);
+      if (String(header.reception_request_id || '').toLowerCase() === payload.receptionRequestId) {
+        if (header.reception_request_fingerprint !== fingerprint) fail(409, 'IDEMPOTENCY_CONFLICT', 'reception_request_id ya fue utilizado con otro payload.');
+        if (String(header.estado).toUpperCase() === 'RECIBIDA' && header.inventario_aplicado === true) {
+          const replayRow = await loadReceptionResult(client, requestId);
+          await client.query('COMMIT'); transactionStarted = false;
+          console.info('[solicitudes_compra.recepcion]', { ...metrics, total_ms: dependencies.now() - startedAt, replay: true });
+          return formatReceptionResult(replayRow, true);
+        }
+      }
       assertHeader(header, txAccess);
+      const validationStarted = dependencies.now();
       const details = normalizeDetails(payload.details, await loadDetails(client, requestId, { lock: true }));
       if (details.hasDifference && !payload.observation) {
         fail(400, 'VALIDATION_ERROR', 'observacion_recepcion es obligatoria cuando existen diferencias.');
       }
+      metrics.validation_ms = dependencies.now() - validationStarted;
+      metrics.total_lines = details.normalized.length;
+      metrics.positive_lines = details.normalized.filter((detail) => detail.receivedBase !== '0').length;
+      metrics.zero_lines = details.normalized.length - metrics.positive_lines;
 
-      for (const detail of details.normalized) {
-        if (!detail.masterId) fail(409, 'CONFLICT', 'La linea no conserva un item maestro valido.');
-        const entityType = detail.type.toLowerCase();
-        const resolved = await dependencies.resolveMaster(entityType, detail.masterId, client);
-        if (!resolved.ok || !resolved.master?.estado_global) fail(409, 'CONFLICT', `El ${entityType} maestro ya no esta activo.`);
-        const assignment = await dependencies.getAssignment(entityType, Number(resolved.masterId), Number(header.id_almacen), client);
-        if (!assignment?.activo) fail(409, 'CONFLICT', `El ${entityType} no tiene asignacion activa en el almacen.`);
+      const inventoryValidationStarted = dependencies.now();
+      if (details.normalized.some((detail) => !detail.masterId)) fail(409, 'CONFLICT', 'La linea no conserva un item maestro valido.');
+      const validations = await dependencies.validateAssignmentsBatch(details.normalized, Number(header.id_almacen), client);
+      if (validations.length !== details.normalized.length || validations.some((row) => !row.existe || !row.activo || !row.asignado)) {
+        fail(409, 'CONFLICT', 'Uno o mas items ya no estan activos o no tienen asignacion activa en el almacen.');
       }
+      metrics.inventory_validation_ms = dependencies.now() - inventoryValidationStarted;
 
       const legacyEvidence = payload.invoice
-        ? await persistInvoiceEvidence({ client, requestId, access: txAccess, invoice: payload.invoice, uploadedPaths })
+        ? (await persistInvoiceEvidence({ client, requestId, access: txAccess, invoice: payload.invoice, uploadedPaths })).evidence
         : null;
       const evidenceCount = await countInvoiceEvidence(client, requestId);
       if (evidenceCount < 1) {
         fail(409, 'FACTURA_REQUIRED', 'Debes cargar al menos una imagen de factura antes de confirmar la recepcion.');
       }
 
-      for (const detail of details.normalized) {
-        const update = await client.query(
-          `UPDATE public.solicitudes_compra_detalle
-           SET cantidad_recibida = $3::numeric, cantidad_base_recibida = $4::numeric, fecha_actualizacion = NOW()
-           WHERE id_solicitud_detalle = $1 AND id_solicitud_compra = $2`,
-          [detail.id, requestId, detail.received, detail.receivedBase]
-        );
-        if (update.rowCount !== 1) fail(409, 'CONFLICT', 'Una linea cambio durante la recepcion.');
+      const ids = details.normalized.map((detail) => detail.id);
+      const receivedQuantities = details.normalized.map((detail) => detail.received);
+      const receivedBase = details.normalized.map((detail) => detail.receivedBase);
+      const detailsUpdateStarted = dependencies.now();
+      const update = await client.query(
+        `UPDATE public.solicitudes_compra_detalle d
+         SET cantidad_recibida = v.cantidad_recibida, cantidad_base_recibida = v.cantidad_base_recibida,
+             fecha_actualizacion = NOW()
+         FROM UNNEST($1::int[], $2::numeric[], $3::numeric[]) AS v(id, cantidad_recibida, cantidad_base_recibida)
+         WHERE d.id_solicitud_detalle = v.id AND d.id_solicitud_compra = $4`, [ids, receivedQuantities, receivedBase, requestId]
+      );
+      if (update.rowCount !== details.normalized.length) fail(409, 'CONFLICT', 'Una linea cambio durante la recepcion.');
+      metrics.details_update_ms = dependencies.now() - detailsUpdateStarted;
+
+      const positive = details.normalized.filter((detail) => detail.receivedBase !== '0');
+      const movementsStarted = dependencies.now();
+      if (positive.length) {
         await client.query(
           `INSERT INTO public.movimientos_inventario
             (tipo, cantidad, id_almacen, id_producto, id_insumo, ref_origen, id_ref, descripcion)
-           VALUES ('ENTRADA', $1::numeric, $2, $3, $4, 'SOLICITUD_COMPRA', $5, $6)`,
-          [detail.receivedBase, Number(header.id_almacen), detail.idProducto, detail.idInsumo, requestId,
-            `Recepcion de solicitud de compra #${requestId}`]
+           SELECT 'ENTRADA', v.cantidad, $1, v.id_producto, v.id_insumo, 'SOLICITUD_COMPRA', $2, $3
+           FROM UNNEST($4::numeric[], $5::int[], $6::int[]) AS v(cantidad, id_producto, id_insumo)`,
+          [Number(header.id_almacen), requestId, `Recepcion de solicitud de compra #${requestId}`,
+            positive.map((detail) => detail.receivedBase), positive.map((detail) => detail.idProducto), positive.map((detail) => detail.idInsumo)]
         );
       }
+      metrics.movements_ms = dependencies.now() - movementsStarted;
 
       const headerResult = await client.query(
         `UPDATE public.solicitudes_compra
          SET estado = 'RECIBIDA', id_usuario_recepcion = $2, fecha_recepcion = NOW(),
-             observacion_recepcion = $3, inventario_aplicado = true, fecha_inventario_aplicado = NOW()
+             observacion_recepcion = $3, inventario_aplicado = true, fecha_inventario_aplicado = NOW(),
+             reception_request_id = $4::uuid, reception_request_fingerprint = $5
          WHERE id_solicitud_compra = $1 AND estado = 'APROBADA' AND inventario_aplicado = false
          RETURNING id_solicitud_compra, estado, id_usuario_recepcion, fecha_recepcion, inventario_aplicado`,
-        [requestId, txAccess.idUsuario, payload.observation]
+        [requestId, txAccess.idUsuario, payload.observation, payload.receptionRequestId, fingerprint]
       );
       if (headerResult.rowCount !== 1) fail(409, 'INVALID_STATE', 'La solicitud cambio durante la recepcion.');
+      const commitStarted = dependencies.now();
       await client.query('COMMIT');
+      metrics.commit_ms = dependencies.now() - commitStarted;
       transactionStarted = false;
       const received = headerResult.rows[0];
-      return {
-        ok: true,
-        mensaje: 'Solicitud recibida e inventario actualizado correctamente.',
-        solicitud: {
+      const response = {
+        ...formatReceptionResult({
           id_solicitud_compra: Number(received.id_solicitud_compra), estado: received.estado,
           id_usuario_recepcion: Number(received.id_usuario_recepcion), fecha_recepcion: received.fecha_recepcion,
           inventario_aplicado: received.inventario_aplicado, total_lineas: details.normalized.length,
-          total_movimientos: details.normalized.length
-        },
+          total_movimientos: positive.length
+        }),
         ...(legacyEvidence ? { evidencia: legacyEvidence } : {})
       };
+      console.info('[solicitudes_compra.recepcion]', { ...metrics, total_ms: dependencies.now() - startedAt, replay: false });
+      return response;
     } catch (error) {
       if (transactionStarted && client) await safeRollback(client);
       await cleanupUploadedPaths(uploadedPaths);
@@ -409,7 +551,7 @@ export const createSolicitudesCompraRecepcionService = (overrides = {}) => {
   const uploadInvoiceEvidence = async (req) => {
     const requestId = parsePositiveIntStrict(req.params?.id_solicitud_compra);
     if (!requestId) fail(400, 'VALIDATION_ERROR', 'id_solicitud_compra debe ser un entero positivo.');
-    const invoice = validateUploadPayload(req.body);
+    const { invoice, uploadRequestId } = validateUploadPayload(req.body);
     let client;
     let transactionStarted = false;
     const uploadedPaths = [];
@@ -419,11 +561,19 @@ export const createSolicitudesCompraRecepcionService = (overrides = {}) => {
       transactionStarted = true;
       const access = await assertAccess(req, client, dependencies);
       const header = await loadHeader(client, requestId, { lock: true });
+      assertBranchAccess(header, access);
+      const fingerprint = buildUploadFingerprint({ requestId, invoice });
+      const existing = await findUpload(client, uploadRequestId);
+      if (existing) {
+        if (existing.upload_request_fingerprint !== fingerprint) fail(409, 'IDEMPOTENCY_CONFLICT', 'upload_request_id ya fue utilizado con otro archivo.');
+        await client.query('COMMIT'); transactionStarted = false;
+        return { ok: true, replay: true, evidencia: formatEvidence(existing) };
+      }
       assertHeader(header, access);
-      const evidence = await persistInvoiceEvidence({ client, requestId, access, invoice, uploadedPaths });
+      const persisted = await persistInvoiceEvidence({ client, requestId, access, invoice, uploadedPaths, uploadRequestId });
       await client.query('COMMIT');
       transactionStarted = false;
-      return { ok: true, evidencia: evidence };
+      return { ok: true, replay: persisted.replay, evidencia: persisted.evidence };
     } catch (error) {
       if (transactionStarted && client) await safeRollback(client);
       await cleanupUploadedPaths(uploadedPaths);
@@ -431,6 +581,39 @@ export const createSolicitudesCompraRecepcionService = (overrides = {}) => {
     } finally {
       client?.release();
     }
+  };
+
+  const reconcileReception = async (req) => {
+    const receptionRequestId = normalizeUuid(req.params?.reception_request_id, 'reception_request_id');
+    const access = await assertAccess(req, dependencies.db, dependencies);
+    const header = (await dependencies.db.query(
+      `SELECT id_solicitud_compra, id_sucursal, id_almacen, estado, inventario_aplicado, fecha_recepcion
+       FROM public.solicitudes_compra WHERE reception_request_id = $1::uuid`, [receptionRequestId]
+    )).rows?.[0];
+    if (!header) fail(404, 'NOT_CONFIRMED', 'La recepcion todavia no ha sido confirmada.');
+    assertBranchAccess(header, access);
+    if (String(header.estado).toUpperCase() !== 'RECIBIDA' || header.inventario_aplicado !== true) {
+      fail(404, 'NOT_CONFIRMED', 'La recepcion todavia no ha sido confirmada.');
+    }
+    const result = await loadReceptionResult(dependencies.db, Number(header.id_solicitud_compra));
+    return { ok: true, confirmed: true, solicitud: formatReceptionResult(result, true).solicitud };
+  };
+
+  const reconcileInvoiceUpload = async (req) => {
+    const requestId = parsePositiveIntStrict(req.params?.id_solicitud_compra);
+    const uploadRequestId = normalizeUuid(req.params?.upload_request_id, 'upload_request_id');
+    if (!requestId) fail(400, 'VALIDATION_ERROR', 'id_solicitud_compra debe ser un entero positivo.');
+    const access = await assertAccess(req, dependencies.db, dependencies);
+    const header = await loadHeader(dependencies.db, requestId);
+    assertBranchAccess(header, access);
+    const existing = await findUpload(dependencies.db, uploadRequestId);
+    if (!existing || Number((await dependencies.db.query(
+      'SELECT id_solicitud_compra FROM public.solicitudes_compra_evidencias WHERE id_evidencia = $1',
+      [Number(existing.id_evidencia)]
+    )).rows?.[0]?.id_solicitud_compra) !== requestId) {
+      fail(404, 'NOT_CONFIRMED', 'La evidencia todavia no ha sido confirmada.');
+    }
+    return { ok: true, confirmed: true, evidencia: formatEvidence(existing) };
   };
 
   const deleteInvoiceEvidence = async (req) => {
@@ -523,7 +706,7 @@ export const createSolicitudesCompraRecepcionService = (overrides = {}) => {
     return { ok: true, evidencias: evidences };
   };
 
-  return { receive, uploadInvoiceEvidence, deleteInvoiceEvidence, listEvidence };
+  return { receive, reconcileReception, uploadInvoiceEvidence, reconcileInvoiceUpload, deleteInvoiceEvidence, listEvidence };
 };
 
 export const solicitudesCompraRecepcionService = createSolicitudesCompraRecepcionService();
