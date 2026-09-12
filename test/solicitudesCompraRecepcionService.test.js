@@ -25,6 +25,7 @@ const supply = (overrides = {}) => ({
 });
 
 const body = (overrides = {}) => ({
+  reception_request_id: '11111111-1111-4111-8111-111111111111',
   observacion_recepcion: null,
   factura: { nombre_original: 'factura.jpg', mime_type: 'image/jpeg', data_url: imageData() },
   detalles: [
@@ -39,7 +40,7 @@ const fixture = (options = {}) => {
   let headerReads = 0;
   let evidenceReads = 0;
   let evidenceCount = options.existingEvidenceCount ?? (options.existingEvidence ? 1 : 0);
-  const header = { id_solicitud_compra: 7, id_sucursal: 3, id_almacen: 4, estado: 'APROBADA', inventario_aplicado: false, fecha_inventario_aplicado: null, ...options.header };
+  const header = { id_solicitud_compra: 7, id_sucursal: 3, id_almacen: 4, estado: 'APROBADA', inventario_aplicado: false, fecha_inventario_aplicado: null, reception_request_id: null, reception_request_fingerprint: null, ...options.header };
   const details = options.details || [product(), supply()];
   const query = async (sqlRaw, params = []) => {
     const sql = String(sqlRaw).replace(/\s+/g, ' ').trim();
@@ -69,7 +70,7 @@ const fixture = (options = {}) => {
       return { rows: [], rowCount: options.deleteRowCount ?? 1 };
     }
     if (sql.startsWith('UPDATE public.archivos SET estado = false')) return { rows: [], rowCount: 1 };
-    if (sql.startsWith('UPDATE public.solicitudes_compra_detalle')) return { rows: [], rowCount: options.detailUpdateRowCount ?? 1 };
+    if (sql.startsWith('UPDATE public.solicitudes_compra_detalle')) return { rows: [], rowCount: options.detailUpdateRowCount ?? details.length };
     if (sql.startsWith('INSERT INTO public.movimientos_inventario')) return { rows: [], rowCount: 1 };
     if (sql.startsWith('UPDATE public.solicitudes_compra')) return {
       rows: [{ id_solicitud_compra: 7, estado: 'RECIBIDA', id_usuario_recepcion: options.userId || 9, fecha_recepcion: '2026-07-21T12:00:00Z', inventario_aplicado: true }],
@@ -102,6 +103,7 @@ const fixture = (options = {}) => {
     resolveScope: async () => ({ userSucursalId: options.userSucursalId ?? 3, allowedSucursalIds: options.allowedSucursalIds ?? [options.userSucursalId ?? 3] }),
     resolveMaster: async (type, id) => options.masterInvalid ? ({ ok: false }) : ({ ok: true, masterId: id, master: { estado_global: true, tipo: type } }),
     getAssignment: async () => ({ activo: !options.assignmentInactive }),
+    validateAssignmentsBatch: async (lines) => lines.map((line) => ({ existe: !options.masterInvalid, activo: !options.masterInvalid, asignado: !options.assignmentInactive })),
     resolveOperativeWarehouse: async () => Number(options.operativeWarehouseId ?? 4),
     now: () => 1721563200000,
     uuid: () => '123e4567-e89b-12d3-a456-426614174000'
@@ -110,7 +112,7 @@ const fixture = (options = {}) => {
 };
 
 const req = (payload = body()) => ({ params: { id_solicitud_compra: '7' }, body: payload, query: {}, user: { id_usuario: 9 } });
-const uploadReq = (invoice = body().factura) => req({ factura: invoice });
+const uploadReq = (invoice = body().factura) => req({ factura: invoice, upload_request_id: '22222222-2222-4222-8222-222222222222' });
 const deleteReq = (idEvidence = '9') => ({ ...req({}), params: { id_solicitud_compra: '7', id_evidencia: idEvidence } });
 const codeOf = async (promise) => { try { await promise; return null; } catch (error) { return { status: error.status, code: error.code, message: error.message }; } };
 
@@ -263,7 +265,7 @@ test('IDs duplicados son rechazados', async () => {
   assert.equal((await codeOf(fixture().service.receive(req(body({ detalles }))))).status, 400);
 });
 
-test('producto exige entero positivo', async () => {
+test('producto rechaza decimal real', async () => {
   const detalles = [{ id_solicitud_detalle: 10, cantidad_recibida: 2.5 }, body().detalles[1]];
   assert.equal((await codeOf(fixture().service.receive(req(body({ detalles }))))).status, 400);
 });
@@ -272,8 +274,8 @@ test('insumo acepta seis decimales y calcula base con snapshot', async () => {
   const f = fixture({ details: [product(), supply({ cantidad_aprobada: '1.123456', cantidad_base_aprobada: '1123.456' })] });
   const detalles = [body().detalles[0], { id_solicitud_detalle: 11, cantidad_recibida: '1.123456' }];
   await f.service.receive(req(body({ detalles })));
-  const update = f.calls.filter((call) => call.sql.startsWith('UPDATE public.solicitudes_compra_detalle'))[1];
-  assert.deepEqual(update.params.slice(2), ['1.123456', '1123.456']);
+  const update = f.calls.find((call) => call.sql.startsWith('UPDATE public.solicitudes_compra_detalle'));
+  assert.deepEqual([update.params[1][1], update.params[2][1]], ['1.123456', '1123.456']);
 });
 
 test('recepcion conserva decimal recibido y factor snapshot de 18 decimales', async () => {
@@ -283,8 +285,8 @@ test('recepcion conserva decimal recibido y factor snapshot de 18 decimales', as
   ] });
   const detalles = [body().detalles[0], { id_solicitud_detalle: 11, cantidad_recibida: '2.25' }];
   await f.service.receive(req(body({ detalles, observacion_recepcion: 'Recepcion parcial' })));
-  const update = f.calls.filter((call) => call.sql.startsWith('UPDATE public.solicitudes_compra_detalle'))[1];
-  assert.deepEqual(update.params.slice(2), ['2.25', '27']);
+  const update = f.calls.find((call) => call.sql.startsWith('UPDATE public.solicitudes_compra_detalle'));
+  assert.deepEqual([update.params[1][1], update.params[2][1]], ['2.25', '27']);
 });
 
 test('recepcion redondea factor periodico al contrato final de seis decimales', async () => {
@@ -294,11 +296,20 @@ test('recepcion redondea factor periodico al contrato final de seis decimales', 
   ] });
   const detalles = [body().detalles[0], { id_solicitud_detalle: 11, cantidad_recibida: '24' }];
   await f.service.receive(req(body({ detalles })));
-  const update = f.calls.filter((call) => call.sql.startsWith('UPDATE public.solicitudes_compra_detalle'))[1];
-  assert.deepEqual(update.params.slice(2), ['24', '1']);
+  const update = f.calls.find((call) => call.sql.startsWith('UPDATE public.solicitudes_compra_detalle'));
+  assert.deepEqual([update.params[1][1], update.params[2][1]], ['24', '1']);
 });
 
-for (const invalid of [0, -1, null, '1.1234567']) {
+test('cantidad de insumo cero es recibida sin movimiento para esa linea', async () => {
+  const detalles = [body().detalles[0], { id_solicitud_detalle: 11, cantidad_recibida: 0 }];
+  const f = fixture();
+  const result = await f.service.receive(req(body({ detalles, observacion_recepcion: 'No se recibio insumo' })));
+  assert.equal(result.solicitud.total_movimientos, 1);
+  const update = f.calls.find((call) => call.sql.startsWith('UPDATE public.solicitudes_compra_detalle'));
+  assert.deepEqual([update.params[1][1], update.params[2][1]], ['0', '0']);
+});
+
+for (const invalid of [-1, null, '1.1234567']) {
   test(`cantidad de insumo invalida ${String(invalid)} es rechazada`, async () => {
     const detalles = [body().detalles[0], { id_solicitud_detalle: 11, cantidad_recibida: invalid }];
     assert.equal((await codeOf(fixture().service.receive(req(body({ detalles }))))).status, 400);
@@ -346,13 +357,13 @@ test('maestro invalido y asignacion inactiva bloquean dentro de transaccion', as
   }
 });
 
-test('crea exactamente un movimiento por detalle con cantidad base y referencias', async () => {
+test('crea un insert batch con exactamente una fila por detalle positivo', async () => {
   const f = fixture();
   await f.service.receive(req());
   const moves = f.calls.filter((call) => call.sql.startsWith('INSERT INTO public.movimientos_inventario'));
-  assert.equal(moves.length, 2);
-  assert.deepEqual(moves[0].params.slice(0, 5), ['2', 4, 101, null, 7]);
-  assert.deepEqual(moves[1].params.slice(0, 5), ['1500', 4, null, 201, 7]);
+  assert.equal(moves.length, 1);
+  assert.deepEqual(moves[0].params.slice(0, 3), [4, 7, 'Recepcion de solicitud de compra #7']);
+  assert.deepEqual(moves[0].params.slice(3), [['2', '1500'], [101, null], [null, 201]]);
   assert.match(moves[0].sql, /'ENTRADA'.*'SOLICITUD_COMPRA'/);
 });
 
