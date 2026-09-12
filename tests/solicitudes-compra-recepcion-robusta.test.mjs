@@ -12,6 +12,8 @@ const {
 
 const source = fs.readFileSync(new URL('../services/solicitudesCompraRecepcionService.js', import.meta.url), 'utf8');
 const router = fs.readFileSync(new URL('../routers/solicitudes_compra.js', import.meta.url), 'utf8');
+const zeroMigration = fs.readFileSync(new URL('../sql/20260912012510_oc_recepcion_allow_zero.sql', import.meta.url), 'utf8');
+const idempotencyMigration = fs.readFileSync(new URL('../sql/20260912012521_oc_recepcion_idempotency_contract.sql', import.meta.url), 'utf8');
 
 test('producto 0 es valido', () => assert.equal(parseReceivedQuantity('0', 'PRODUCTO')?.decimal, '0'));
 test('producto entero positivo es valido', () => assert.equal(parseReceivedQuantity('2', 'PRODUCTO')?.decimal, '2'));
@@ -49,4 +51,22 @@ test('fingerprint de upload incluye bytes', () => {
 test('rutas de reconciliacion estan protegidas por permisos de recepcion', () => {
   assert.match(router, /\/recepciones\/:reception_request_id'[\s\S]*requirePermissions\(RECEIVE_PERMISSIONS\)/);
   assert.match(router, /evidencias\/envios\/:upload_request_id'[\s\S]*requirePermissions\(RECEIVE_PERMISSIONS\)/);
+});
+
+test('migracion zero reemplaza el constraint compuesto sin crear constraints individuales', () => {
+  assert.match(zeroMigration, /DROP CONSTRAINT IF EXISTS chk_solicitudes_compra_detalle_cantidades/);
+  assert.match(zeroMigration, /ADD CONSTRAINT chk_solicitudes_compra_detalle_cantidades/);
+  assert.match(zeroMigration, /cantidad_recibida IS NULL OR cantidad_recibida >= 0::numeric/);
+  assert.match(zeroMigration, /cantidad_base_recibida IS NULL OR cantidad_base_recibida >= 0::numeric/);
+  assert.match(zeroMigration, /cantidad_aprobada IS NULL OR cantidad_aprobada > 0::numeric/);
+  assert.match(zeroMigration, /cantidad_base_aprobada IS NULL OR cantidad_base_aprobada > 0::numeric/);
+  assert.doesNotMatch(zeroMigration, /solicitudes_compra_detalle_cantidad_(?:base_)?recibida_check/);
+});
+
+test('migracion de idempotencia coincide con nombres y NOT VALID del contrato QA', () => {
+  assert.match(idempotencyMigration, /solicitudes_compra_reception_request_fingerprint_format_chk/);
+  assert.match(idempotencyMigration, /solicitudes_compra_evidencias_upload_request_fingerprint_format_chk/);
+  assert.match(idempotencyMigration, /solicitudes_compra_reception_request_id_uidx/);
+  assert.match(idempotencyMigration, /solicitudes_compra_evidencias_upload_request_id_uidx/);
+  assert.equal((idempotencyMigration.match(/\) NOT VALID;/g) || []).length, 2);
 });
