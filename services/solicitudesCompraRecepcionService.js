@@ -499,7 +499,13 @@ export const createSolicitudesCompraRecepcionService = (overrides = {}) => {
       if (update.rowCount !== details.normalized.length) fail(409, 'CONFLICT', 'Una linea cambio durante la recepcion.');
       metrics.details_update_ms = dependencies.now() - detailsUpdateStarted;
 
-      const positive = details.normalized.filter((detail) => detail.receivedBase !== '0');
+      const positive = details.normalized
+        .filter((detail) => detail.receivedBase !== '0')
+        .sort((left, right) => {
+          const leftType = left.type === 'PRODUCTO' ? 0 : 1;
+          const rightType = right.type === 'PRODUCTO' ? 0 : 1;
+          return leftType - rightType || left.masterId - right.masterId || left.id - right.id;
+        });
       const movementsStarted = dependencies.now();
       if (positive.length) {
         await client.query(
