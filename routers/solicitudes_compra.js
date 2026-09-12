@@ -91,9 +91,11 @@ router.get('/capturas-rapidas/:id_captura', requirePermissions(QUICK_CAPTURE_VIE
 router.post('/', requirePermissions(CREATE_PERMISSIONS), handler(solicitudesCompraService.create));
 router.get('/', requirePermissions(VIEW_PERMISSIONS), handler(solicitudesCompraService.list));
 router.get('/envios/:client_request_id', requirePermissions(CREATE_PERMISSIONS), handler(solicitudesCompraService.getByClientRequestId));
+router.get('/recepciones/:reception_request_id', requirePermissions(RECEIVE_PERMISSIONS), handler(solicitudesCompraRecepcionService.reconcileReception));
 router.put('/:id_solicitud_compra/aprobar', requirePermissions(APPROVE_PERMISSIONS), handler(solicitudesCompraRevisionService.approve));
 router.put('/:id_solicitud_compra/rechazar', requirePermissions(REJECT_PERMISSIONS), handler(solicitudesCompraRevisionService.reject));
 router.post('/:id_solicitud_compra/evidencias/factura', requirePermissions(RECEIVE_PERMISSIONS), handler(solicitudesCompraRecepcionService.uploadInvoiceEvidence));
+router.get('/:id_solicitud_compra/evidencias/envios/:upload_request_id', requirePermissions(RECEIVE_PERMISSIONS), handler(solicitudesCompraRecepcionService.reconcileInvoiceUpload));
 router.delete('/:id_solicitud_compra/evidencias/:id_evidencia', requirePermissions(RECEIVE_PERMISSIONS), handler(solicitudesCompraRecepcionService.deleteInvoiceEvidence));
 router.post('/:id_solicitud_compra/recibir', requirePermissions(RECEIVE_PERMISSIONS), handler(solicitudesCompraRecepcionService.receive));
 router.get('/:id_solicitud_compra/evidencias', requirePermissions(EVIDENCE_PERMISSIONS), handler(solicitudesCompraRecepcionService.listEvidence));
