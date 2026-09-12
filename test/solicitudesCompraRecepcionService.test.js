@@ -25,6 +25,7 @@ const supply = (overrides = {}) => ({
 });
 
 const body = (overrides = {}) => ({
+  reception_request_id: '11111111-1111-4111-8111-111111111111',
   observacion_recepcion: null,
   factura: { nombre_original: 'factura.jpg', mime_type: 'image/jpeg', data_url: imageData() },
   detalles: [
@@ -39,7 +40,7 @@ const fixture = (options = {}) => {
   let headerReads = 0;
   let evidenceReads = 0;
   let evidenceCount = options.existingEvidenceCount ?? (options.existingEvidence ? 1 : 0);
-  const header = { id_solicitud_compra: 7, id_sucursal: 3, id_almacen: 4, estado: 'APROBADA', inventario_aplicado: false, fecha_inventario_aplicado: null, ...options.header };
+  const header = { id_solicitud_compra: 7, id_sucursal: 3, id_almacen: 4, estado: 'APROBADA', inventario_aplicado: false, fecha_inventario_aplicado: null, reception_request_id: null, reception_request_fingerprint: null, ...options.header };
   const details = options.details || [product(), supply()];
   const query = async (sqlRaw, params = []) => {
     const sql = String(sqlRaw).replace(/\s+/g, ' ').trim();
@@ -69,7 +70,7 @@ const fixture = (options = {}) => {
       return { rows: [], rowCount: options.deleteRowCount ?? 1 };
     }
     if (sql.startsWith('UPDATE public.archivos SET estado = false')) return { rows: [], rowCount: 1 };
-    if (sql.startsWith('UPDATE public.solicitudes_compra_detalle')) return { rows: [], rowCount: options.detailUpdateRowCount ?? 1 };
+    if (sql.startsWith('UPDATE public.solicitudes_compra_detalle')) return { rows: [], rowCount: options.detailUpdateRowCount ?? details.length };
     if (sql.startsWith('INSERT INTO public.movimientos_inventario')) return { rows: [], rowCount: 1 };
     if (sql.startsWith('UPDATE public.solicitudes_compra')) return {
       rows: [{ id_solicitud_compra: 7, estado: 'RECIBIDA', id_usuario_recepcion: options.userId || 9, fecha_recepcion: '2026-07-21T12:00:00Z', inventario_aplicado: true }],
@@ -102,6 +103,11 @@ const fixture = (options = {}) => {
     resolveScope: async () => ({ userSucursalId: options.userSucursalId ?? 3, allowedSucursalIds: options.allowedSucursalIds ?? [options.userSucursalId ?? 3] }),
     resolveMaster: async (type, id) => options.masterInvalid ? ({ ok: false }) : ({ ok: true, masterId: id, master: { estado_global: true, tipo: type } }),
     getAssignment: async () => ({ activo: !options.assignmentInactive }),
+    validateAssignmentsBatch: async (lines) => lines.map((line) => ({
+      existe: !options.masterInvalid,
+      activo: !options.masterInvalid,
+      asignado: !options.assignmentInactive && !options.assignmentMissing
+    })),
     resolveOperativeWarehouse: async () => Number(options.operativeWarehouseId ?? 4),
     now: () => 1721563200000,
     uuid: () => '123e4567-e89b-12d3-a456-426614174000'
@@ -110,9 +116,97 @@ const fixture = (options = {}) => {
 };
 
 const req = (payload = body()) => ({ params: { id_solicitud_compra: '7' }, body: payload, query: {}, user: { id_usuario: 9 } });
-const uploadReq = (invoice = body().factura) => req({ factura: invoice });
+const uploadReq = (invoice = body().factura, uploadRequestId = '22222222-2222-4222-8222-222222222222') => (
+  req({ factura: invoice, upload_request_id: uploadRequestId })
+);
 const deleteReq = (idEvidence = '9') => ({ ...req({}), params: { id_solicitud_compra: '7', id_evidencia: idEvidence } });
 const codeOf = async (promise) => { try { await promise; return null; } catch (error) { return { status: error.status, code: error.code, message: error.message }; } };
+
+const statefulFixture = ({ withEvidence = false } = {}) => {
+  const calls = [];
+  const storageCalls = [];
+  const state = {
+    header: {
+      id_solicitud_compra: 7, id_sucursal: 3, id_almacen: 4, estado: 'APROBADA', inventario_aplicado: false,
+      fecha_inventario_aplicado: null, id_usuario_recepcion: null, fecha_recepcion: null,
+      reception_request_id: null, reception_request_fingerprint: null
+    },
+    details: [product(), supply()],
+    evidences: withEvidence ? [{ id_evidencia: 1, id_archivo: 1, tipo_evidencia: 'FACTURA' }] : [],
+    files: new Map(),
+    movements: 0,
+    detailUpdates: 0
+  };
+  let nextFileId = 10;
+  let nextEvidenceId = 20;
+  const query = async (sqlRaw, params = []) => {
+    const sql = String(sqlRaw).replace(/\s+/g, ' ').trim();
+    calls.push({ sql, params });
+    if (['BEGIN', 'COMMIT', 'ROLLBACK'].includes(sql)) return { rows: [], rowCount: 0 };
+    if (sql.includes('FROM public.solicitudes_compra sc') && sql.includes('COUNT(DISTINCT')) {
+      return { rows: [{ ...state.header, total_lineas: state.details.length, total_movimientos: state.movements }], rowCount: 1 };
+    }
+    if (sql.includes('FROM public.solicitudes_compra WHERE') && !sql.includes('_detalle')) {
+      return { rows: [{ ...state.header }], rowCount: 1 };
+    }
+    if (sql.includes('FROM public.solicitudes_compra_detalle')) return { rows: state.details.map((row) => ({ ...row })), rowCount: state.details.length };
+    if (sql.includes('COUNT(*)::int AS total') && sql.includes('solicitudes_compra_evidencias')) {
+      return { rows: [{ total: state.evidences.length }], rowCount: 1 };
+    }
+    if (sql.includes('WHERE e.upload_request_id = $1::uuid')) {
+      const evidence = state.evidences.find((row) => row.upload_request_id === params[0]);
+      if (!evidence) return { rows: [], rowCount: 0 };
+      return { rows: [{ ...evidence, ...state.files.get(evidence.id_archivo) }], rowCount: 1 };
+    }
+    if (sql.startsWith('INSERT INTO public.archivos')) {
+      const id_archivo = nextFileId++;
+      state.files.set(id_archivo, { nombre_original: params[0], url_publica: params[1], tipo_archivo: params[2], tamano_bytes: params[3] });
+      return { rows: [{ id_archivo }], rowCount: 1 };
+    }
+    if (sql.startsWith('INSERT INTO public.solicitudes_compra_evidencias')) {
+      const row = {
+        id_evidencia: nextEvidenceId++, id_archivo: params[1], tipo_evidencia: 'FACTURA',
+        upload_request_id: params[3], upload_request_fingerprint: params[4]
+      };
+      state.evidences.push(row);
+      return { rows: [{ id_evidencia: row.id_evidencia }], rowCount: 1 };
+    }
+    if (sql.startsWith('UPDATE public.solicitudes_compra_detalle')) {
+      state.detailUpdates += 1;
+      return { rows: [], rowCount: state.details.length };
+    }
+    if (sql.startsWith('INSERT INTO public.movimientos_inventario')) {
+      state.movements += params[3].length;
+      return { rows: [], rowCount: params[3].length };
+    }
+    if (sql.startsWith('UPDATE public.solicitudes_compra SET')) {
+      Object.assign(state.header, {
+        estado: 'RECIBIDA', id_usuario_recepcion: params[1], fecha_recepcion: '2026-07-21T12:00:00Z',
+        inventario_aplicado: true, fecha_inventario_aplicado: '2026-07-21T12:00:00Z',
+        reception_request_id: params[3], reception_request_fingerprint: params[4]
+      });
+      return { rows: [{ ...state.header }], rowCount: 1 };
+    }
+    throw new Error(`Unexpected stateful query: ${sql}`);
+  };
+  const client = { query, release() {} };
+  const db = { query, connect: async () => client };
+  const storage = {
+    upload: async (...args) => storageCalls.push(['upload', ...args]),
+    remove: async (...args) => storageCalls.push(['remove', ...args]),
+    createSignedUrl: async () => 'https://signed.invalid/temporary'
+  };
+  const service = createSolicitudesCompraRecepcionService({
+    db, storage,
+    readAccess: async () => ({ idUsuario: 9, roles: new Set(['ADMIN']), isSuperAdmin: false }),
+    resolveScope: async () => ({ userSucursalId: 3, allowedSucursalIds: [3] }),
+    validateAssignmentsBatch: async (lines) => lines.map(() => ({ existe: true, activo: true, asignado: true })),
+    resolveOperativeWarehouse: async () => 4,
+    now: () => 1721563200000,
+    uuid: () => '123e4567-e89b-12d3-a456-426614174000'
+  });
+  return { service, state, calls, storageCalls };
+};
 
 for (const role of ['CAJERO', 'COCINA', 'COCINERA', 'ADMIN', 'SUPER_ADMIN']) {
   test(`${role} recibe una solicitud permitida de su alcance`, async () => {
@@ -214,7 +308,10 @@ test('nombre original se normaliza y ruta privada es determinista', async () => 
 test('dos uploads para la misma solicitud quedan permitidos', async () => {
   const f = fixture();
   await f.service.uploadInvoiceEvidence(uploadReq());
-  await f.service.uploadInvoiceEvidence(uploadReq({ nombre_original: 'segunda.png', mime_type: 'image/png', data_url: imageData('image/png') }));
+  await f.service.uploadInvoiceEvidence(uploadReq(
+    { nombre_original: 'segunda.png', mime_type: 'image/png', data_url: imageData('image/png') },
+    '33333333-3333-4333-8333-333333333333'
+  ));
   assert.equal(f.storageCalls.filter((call) => call[0] === 'upload').length, 2);
   assert.equal(f.calls.filter((call) => call.sql.startsWith('INSERT INTO public.solicitudes_compra_evidencias')).length, 2);
 });
@@ -263,7 +360,7 @@ test('IDs duplicados son rechazados', async () => {
   assert.equal((await codeOf(fixture().service.receive(req(body({ detalles }))))).status, 400);
 });
 
-test('producto exige entero positivo', async () => {
+test('producto rechaza decimal real', async () => {
   const detalles = [{ id_solicitud_detalle: 10, cantidad_recibida: 2.5 }, body().detalles[1]];
   assert.equal((await codeOf(fixture().service.receive(req(body({ detalles }))))).status, 400);
 });
@@ -272,8 +369,8 @@ test('insumo acepta seis decimales y calcula base con snapshot', async () => {
   const f = fixture({ details: [product(), supply({ cantidad_aprobada: '1.123456', cantidad_base_aprobada: '1123.456' })] });
   const detalles = [body().detalles[0], { id_solicitud_detalle: 11, cantidad_recibida: '1.123456' }];
   await f.service.receive(req(body({ detalles })));
-  const update = f.calls.filter((call) => call.sql.startsWith('UPDATE public.solicitudes_compra_detalle'))[1];
-  assert.deepEqual(update.params.slice(2), ['1.123456', '1123.456']);
+  const update = f.calls.find((call) => call.sql.startsWith('UPDATE public.solicitudes_compra_detalle'));
+  assert.deepEqual([update.params[1][1], update.params[2][1]], ['1.123456', '1123.456']);
 });
 
 test('recepcion conserva decimal recibido y factor snapshot de 18 decimales', async () => {
@@ -283,8 +380,8 @@ test('recepcion conserva decimal recibido y factor snapshot de 18 decimales', as
   ] });
   const detalles = [body().detalles[0], { id_solicitud_detalle: 11, cantidad_recibida: '2.25' }];
   await f.service.receive(req(body({ detalles, observacion_recepcion: 'Recepcion parcial' })));
-  const update = f.calls.filter((call) => call.sql.startsWith('UPDATE public.solicitudes_compra_detalle'))[1];
-  assert.deepEqual(update.params.slice(2), ['2.25', '27']);
+  const update = f.calls.find((call) => call.sql.startsWith('UPDATE public.solicitudes_compra_detalle'));
+  assert.deepEqual([update.params[1][1], update.params[2][1]], ['2.25', '27']);
 });
 
 test('recepcion redondea factor periodico al contrato final de seis decimales', async () => {
@@ -294,11 +391,20 @@ test('recepcion redondea factor periodico al contrato final de seis decimales', 
   ] });
   const detalles = [body().detalles[0], { id_solicitud_detalle: 11, cantidad_recibida: '24' }];
   await f.service.receive(req(body({ detalles })));
-  const update = f.calls.filter((call) => call.sql.startsWith('UPDATE public.solicitudes_compra_detalle'))[1];
-  assert.deepEqual(update.params.slice(2), ['24', '1']);
+  const update = f.calls.find((call) => call.sql.startsWith('UPDATE public.solicitudes_compra_detalle'));
+  assert.deepEqual([update.params[1][1], update.params[2][1]], ['24', '1']);
 });
 
-for (const invalid of [0, -1, null, '1.1234567']) {
+test('cantidad de insumo cero es recibida sin movimiento para esa linea', async () => {
+  const detalles = [body().detalles[0], { id_solicitud_detalle: 11, cantidad_recibida: 0 }];
+  const f = fixture();
+  const result = await f.service.receive(req(body({ detalles, observacion_recepcion: 'No se recibio insumo' })));
+  assert.equal(result.solicitud.total_movimientos, 1);
+  const update = f.calls.find((call) => call.sql.startsWith('UPDATE public.solicitudes_compra_detalle'));
+  assert.deepEqual([update.params[1][1], update.params[2][1]], ['0', '0']);
+});
+
+for (const invalid of [-1, null, '1.1234567']) {
   test(`cantidad de insumo invalida ${String(invalid)} es rechazada`, async () => {
     const detalles = [body().detalles[0], { id_solicitud_detalle: 11, cantidad_recibida: invalid }];
     assert.equal((await codeOf(fixture().service.receive(req(body({ detalles }))))).status, 400);
@@ -346,14 +452,111 @@ test('maestro invalido y asignacion inactiva bloquean dentro de transaccion', as
   }
 });
 
-test('crea exactamente un movimiento por detalle con cantidad base y referencias', async () => {
+test('crea un insert batch con exactamente una fila por detalle positivo', async () => {
   const f = fixture();
   await f.service.receive(req());
   const moves = f.calls.filter((call) => call.sql.startsWith('INSERT INTO public.movimientos_inventario'));
-  assert.equal(moves.length, 2);
-  assert.deepEqual(moves[0].params.slice(0, 5), ['2', 4, 101, null, 7]);
-  assert.deepEqual(moves[1].params.slice(0, 5), ['1500', 4, null, 201, 7]);
+  assert.equal(moves.length, 1);
+  assert.deepEqual(moves[0].params.slice(0, 3), [4, 7, 'Recepcion de solicitud de compra #7']);
+  assert.deepEqual(moves[0].params.slice(3), [['2', '1500'], [101, null], [null, 201]]);
   assert.match(moves[0].sql, /'ENTRADA'.*'SOLICITUD_COMPRA'/);
+});
+
+test('maestro activo sin asignacion real responde CONFLICT sin efectos de recepcion', async () => {
+  const f = fixture({ assignmentMissing: true });
+  const error = await codeOf(f.service.receive(req()));
+  assert.deepEqual([error.status, error.code], [409, 'CONFLICT']);
+  assert.equal(f.calls.some((call) => call.sql.startsWith('UPDATE public.solicitudes_compra_detalle')), false);
+  assert.equal(f.calls.some((call) => call.sql.startsWith('INSERT INTO public.movimientos_inventario')), false);
+  assert.equal(f.calls.some((call) => call.sql.startsWith('UPDATE public.solicitudes_compra SET')), false);
+});
+
+test('ordena movimientos por tipo, masterId e id aunque los detalles lleguen invertidos', async () => {
+  const details = [
+    supply({ id_solicitud_detalle: 14, id_insumo: 202 }),
+    product({ id_solicitud_detalle: 13, id_producto: 102 }),
+    supply({ id_solicitud_detalle: 12, id_insumo: 201 }),
+    product({ id_solicitud_detalle: 11, id_producto: 101 })
+  ];
+  const detalles = details.map((line) => ({ id_solicitud_detalle: line.id_solicitud_detalle, cantidad_recibida: 1 }));
+  const f = fixture({ details });
+  await f.service.receive(req(body({ detalles, observacion_recepcion: 'Orden de prueba.' })));
+  const movement = f.calls.find((call) => call.sql.startsWith('INSERT INTO public.movimientos_inventario'));
+  assert.deepEqual(movement.params.slice(3), [
+    ['1', '1', '1000', '1000'],
+    [101, 102, null, null],
+    [null, null, 201, 202]
+  ]);
+});
+
+test('todas las lineas cero actualizan detalles y finalizan sin movimientos', async () => {
+  const f = statefulFixture({ withEvidence: true });
+  const result = await f.service.receive(req(body({
+    factura: undefined,
+    observacion_recepcion: 'No se recibio mercaderia.',
+    detalles: [
+      { id_solicitud_detalle: 10, cantidad_recibida: 0 },
+      { id_solicitud_detalle: 11, cantidad_recibida: 0 }
+    ]
+  })));
+  assert.deepEqual([result.solicitud.estado, result.solicitud.total_movimientos], ['RECIBIDA', 0]);
+  assert.equal(f.state.detailUpdates, 1);
+  assert.equal(f.state.movements, 0);
+  assert.equal(f.calls.some((call) => call.sql.startsWith('INSERT INTO public.movimientos_inventario')), false);
+});
+
+test('reception_request_id persiste y la segunda llamada real hace replay sin efectos', async () => {
+  const f = statefulFixture({ withEvidence: true });
+  const payload = body({ factura: undefined });
+  const first = await f.service.receive(req(payload));
+  const second = await f.service.receive(req(payload));
+  assert.equal(first.replay, false);
+  assert.equal(second.replay, true);
+  assert.equal(f.state.header.reception_request_id, payload.reception_request_id);
+  assert.equal(f.state.detailUpdates, 1);
+  assert.equal(f.state.movements, 2);
+  assert.equal(f.storageCalls.filter((call) => call[0] === 'upload').length, 0);
+});
+
+test('reception_request_id persistido rechaza payload diferente', async () => {
+  const f = statefulFixture({ withEvidence: true });
+  const payload = body({ factura: undefined });
+  await f.service.receive(req(payload));
+  const error = await codeOf(f.service.receive(req({ ...payload, observacion_recepcion: 'Cantidad corregida.' })));
+  assert.deepEqual([error.status, error.code], [409, 'IDEMPOTENCY_CONFLICT']);
+  assert.equal(f.state.detailUpdates, 1);
+  assert.equal(f.state.movements, 2);
+});
+
+test('upload_request_id persistido reproduce la misma factura sin segundo upload', async () => {
+  const f = statefulFixture();
+  const first = await f.service.uploadInvoiceEvidence(uploadReq());
+  const second = await f.service.uploadInvoiceEvidence(uploadReq());
+  assert.equal(first.replay, false);
+  assert.equal(second.replay, true);
+  assert.equal(f.state.evidences.length, 1);
+  assert.equal(f.storageCalls.filter((call) => call[0] === 'upload').length, 1);
+});
+
+test('upload_request_id persistido rechaza otro archivo sin segundo upload', async () => {
+  const f = statefulFixture();
+  await f.service.uploadInvoiceEvidence(uploadReq());
+  const other = { nombre_original: 'otra.png', mime_type: 'image/png', data_url: imageData('image/png') };
+  const error = await codeOf(f.service.uploadInvoiceEvidence(uploadReq(other)));
+  assert.deepEqual([error.status, error.code], [409, 'IDEMPOTENCY_CONFLICT']);
+  assert.equal(f.state.evidences.length, 1);
+  assert.equal(f.storageCalls.filter((call) => call[0] === 'upload').length, 1);
+});
+
+test('dos upload_request_id distintos permiten dos facturas para la misma solicitud', async () => {
+  const f = statefulFixture();
+  const firstId = '22222222-2222-4222-8222-222222222222';
+  const secondId = '33333333-3333-4333-8333-333333333333';
+  await f.service.uploadInvoiceEvidence(uploadReq(body().factura, firstId));
+  await f.service.uploadInvoiceEvidence(uploadReq({ nombre_original: 'segunda.png', mime_type: 'image/png', data_url: imageData('image/png') }, secondId));
+  assert.equal(f.state.evidences.length, 2);
+  assert.deepEqual(f.state.evidences.map((row) => row.upload_request_id), [firstId, secondId]);
+  assert.equal(f.storageCalls.filter((call) => call[0] === 'upload').length, 2);
 });
 
 test('encabezado queda RECIBIDA con usuario, fecha e inventario aplicado', async () => {
