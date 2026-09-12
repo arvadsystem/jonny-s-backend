@@ -103,7 +103,11 @@ const fixture = (options = {}) => {
     resolveScope: async () => ({ userSucursalId: options.userSucursalId ?? 3, allowedSucursalIds: options.allowedSucursalIds ?? [options.userSucursalId ?? 3] }),
     resolveMaster: async (type, id) => options.masterInvalid ? ({ ok: false }) : ({ ok: true, masterId: id, master: { estado_global: true, tipo: type } }),
     getAssignment: async () => ({ activo: !options.assignmentInactive }),
-    validateAssignmentsBatch: async (lines) => lines.map((line) => ({ existe: !options.masterInvalid, activo: !options.masterInvalid, asignado: !options.assignmentInactive })),
+    validateAssignmentsBatch: async (lines) => lines.map((line) => ({
+      existe: !options.masterInvalid,
+      activo: !options.masterInvalid,
+      asignado: !options.assignmentInactive && !options.assignmentMissing
+    })),
     resolveOperativeWarehouse: async () => Number(options.operativeWarehouseId ?? 4),
     now: () => 1721563200000,
     uuid: () => '123e4567-e89b-12d3-a456-426614174000'
@@ -456,6 +460,15 @@ test('crea un insert batch con exactamente una fila por detalle positivo', async
   assert.deepEqual(moves[0].params.slice(0, 3), [4, 7, 'Recepcion de solicitud de compra #7']);
   assert.deepEqual(moves[0].params.slice(3), [['2', '1500'], [101, null], [null, 201]]);
   assert.match(moves[0].sql, /'ENTRADA'.*'SOLICITUD_COMPRA'/);
+});
+
+test('maestro activo sin asignacion real responde CONFLICT sin efectos de recepcion', async () => {
+  const f = fixture({ assignmentMissing: true });
+  const error = await codeOf(f.service.receive(req()));
+  assert.deepEqual([error.status, error.code], [409, 'CONFLICT']);
+  assert.equal(f.calls.some((call) => call.sql.startsWith('UPDATE public.solicitudes_compra_detalle')), false);
+  assert.equal(f.calls.some((call) => call.sql.startsWith('INSERT INTO public.movimientos_inventario')), false);
+  assert.equal(f.calls.some((call) => call.sql.startsWith('UPDATE public.solicitudes_compra SET')), false);
 });
 
 test('ordena movimientos por tipo, masterId e id aunque los detalles lleguen invertidos', async () => {

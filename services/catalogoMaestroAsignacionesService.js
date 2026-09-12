@@ -264,7 +264,10 @@ export const validateWarehouseAssignmentsBatch = async (lines, warehouseId, db =
     `SELECT input.tipo, input.id_maestro,
             CASE WHEN input.tipo = 'PRODUCTO' THEN p.id_producto IS NOT NULL ELSE i.id_insumo IS NOT NULL END AS existe,
             CASE WHEN input.tipo = 'PRODUCTO' THEN COALESCE(p.estado, true) ELSE COALESCE(i.estado, true) END AS activo,
-            CASE WHEN input.tipo = 'PRODUCTO' THEN COALESCE(pa.estado, true) ELSE COALESCE(ia.estado, true) END AS asignado
+            CASE
+              WHEN input.tipo = 'PRODUCTO' THEN pa.id_producto IS NOT NULL AND COALESCE(pa.estado, true)
+              ELSE ia.id_insumo IS NOT NULL AND COALESCE(ia.estado, true)
+            END AS asignado
      FROM (
        SELECT 'PRODUCTO'::text AS tipo, UNNEST($1::int[]) AS id_maestro
        UNION ALL SELECT 'INSUMO'::text, UNNEST($2::int[])
