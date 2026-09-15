@@ -58,7 +58,7 @@ export const evaluatePasswordExpiration = ({
 
   const manualMustChange = Boolean(mustChangePassword);
   const expiredByAge = !excludedByClienteRole && ageDays !== null && ageDays >= maxAgeDays;
-  const mustChange = !excludedByClienteRole && (manualMustChange || expiredByAge);
+  const mustChange = !excludedByClienteRole && manualMustChange;
 
   return {
     excludedByClienteRole,
