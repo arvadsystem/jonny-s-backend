@@ -24,6 +24,7 @@ import {
 import { getClientIp, parseUserAgent } from '../utils/security/clientInfo.js';
 import { insertLoginLog } from '../utils/security/loginLogger.js';
 import { createExclusiveClientSession, closeAllUserSessions } from '../utils/security/sessionService.js';
+import { runInternalPasswordRecoveryTransaction } from '../utils/security/passwordRecoveryFlow.js';
 import { enviarCorreo, enviarVerificacion, enviarRecuperacion } from '../utils/emailService.js';
 
 const router = express.Router();
@@ -1217,29 +1218,26 @@ const resetInternalUserPasswordFromPublicForgot = async (user) => {
   const client = await pool.connect();
 
   try {
-    await client.query('BEGIN');
-    const updateResult = await client.query(
-      `
-        UPDATE usuarios
-        SET
-          clave = crypt($1::text, gen_salt('bf', 12)),
-          must_change_password = true,
-          fecha_cambio_clave = NULL
-        WHERE id_usuario = $2
-        RETURNING id_usuario, nombre_usuario, must_change_password
-      `,
-      [temporaryPassword, idUsuario]
-    );
-
-    if (updateResult.rows.length === 0) {
-      await client.query('ROLLBACK');
-      return;
-    }
-
-    await closeAllUserSessions(idUsuario, 'password_reset', client);
-
-    try {
-      await enviarCorreo(
+    await runInternalPasswordRecoveryTransaction({
+      client,
+      updatePassword: async (queryRunner) => {
+        const updateResult = await queryRunner.query(
+          `
+            UPDATE usuarios
+            SET
+              clave = crypt($1::text, gen_salt('bf', 12)),
+              must_change_password = true,
+              fecha_cambio_clave = NULL
+            WHERE id_usuario = $2
+            RETURNING id_usuario, nombre_usuario, must_change_password
+          `,
+          [temporaryPassword, idUsuario]
+        );
+        return updateResult.rows.length > 0;
+      },
+      closeSessions: (queryRunner) =>
+        closeAllUserSessions(idUsuario, 'password_reset', queryRunner),
+      sendNotification: (queryRunner) => enviarCorreo(
         user.correo,
         'Nueva contrasena temporal - Jonnys SmartOrder',
         buildInternalTemporaryPasswordEmailHtml({
@@ -1250,18 +1248,12 @@ const resetInternalUserPasswordFromPublicForgot = async (user) => {
         {
           id_usuario: idUsuario,
           tipo_correo: 'credenciales_temporales_reset',
-          fromKey: 'ACCESO'
+          fromKey: 'ACCESO',
+          queryRunner,
         }
-      );
-    } catch (emailError) {
-      const recoveryError = new Error('INTERNAL_PASSWORD_RECOVERY_EMAIL_FAILED');
-      recoveryError.cause = emailError;
-      throw recoveryError;
-    }
-
-    await client.query('COMMIT');
+      ),
+    });
   } catch (error) {
-    await client.query('ROLLBACK').catch(() => {});
     console.error('[public/forgot-password] Recuperacion interna revertida:', error?.message || error);
     return;
   } finally {

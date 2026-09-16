@@ -18,6 +18,7 @@ import { ensurePasswordChangedAtColumn } from '../utils/security/passwordExpirat
 import { enviarCorreo } from '../utils/emailService.js';
 import { buildAuthTokenPayload, getUserAuthzSnapshot } from '../utils/security/authTokenPayload.js';
 import { closeAllUserSessions } from '../utils/security/sessionService.js';
+import { sendPasswordEmailBestEffort } from '../utils/security/passwordRecoveryFlow.js';
 
 const router = express.Router();
 const USUARIOS_LIST_PERMISSIONS = ['USUARIOS_LISTADO_VER'];
@@ -909,32 +910,35 @@ const v2SendTemporaryPasswordEmail = async ({
     return { sent: false, skipped: true, reason: 'INVALID_USER_ID', to: null };
   }
 
-  const targetEmail = await v2ResolveUsuarioEmail(id, queryRunner);
-  if (!v2IsSafeEmail(targetEmail)) {
-    return { sent: false, skipped: true, reason: 'EMAIL_NOT_AVAILABLE', to: null };
-  }
-
   const subject = mode === 'reset'
     ? 'Nueva contrasena temporal - Jonnys SmartOrder'
     : 'Credenciales temporales - Jonnys SmartOrder';
-  const html = v2BuildTemporaryPasswordEmailHtml({
-    displayName,
-    username,
-    temporaryPassword,
-    mode,
-  });
 
-  try {
-    await enviarCorreo(targetEmail, subject, html, {
-      id_usuario: id,
-      tipo_correo: mode === 'reset' ? 'credenciales_temporales_reset' : 'credenciales_temporales_creacion',
-      fromKey: 'ACCESO',
-    });
-    return { sent: true, skipped: false, to: targetEmail };
-  } catch (error) {
-    console.error('[usuarios/v2] Error enviando contrasena temporal por correo:', error?.message || error);
-    return { sent: false, skipped: false, reason: 'SMTP_SEND_FAILED', to: targetEmail };
-  }
+  return sendPasswordEmailBestEffort({
+    resolveEmail: () => v2ResolveUsuarioEmail(id, queryRunner),
+    isEmailValid: v2IsSafeEmail,
+    sendEmail: (targetEmail) => enviarCorreo(
+      targetEmail,
+      subject,
+      v2BuildTemporaryPasswordEmailHtml({
+        displayName,
+        username,
+        temporaryPassword,
+        mode,
+      }),
+      {
+        id_usuario: id,
+        tipo_correo: mode === 'reset' ? 'credenciales_temporales_reset' : 'credenciales_temporales_creacion',
+        fromKey: 'ACCESO',
+      }
+    ),
+    onError: (stage, error) => {
+      console.error(
+        `[usuarios/v2] Error de ${stage === 'resolve' ? 'resolucion de correo' : 'envio de contrasena temporal'}:`,
+        error?.message || error
+      );
+    },
+  });
 };
 
 const v2UsernameExists = async (nombreUsuario, { excludeId = null, queryRunner = pool } = {}) => {

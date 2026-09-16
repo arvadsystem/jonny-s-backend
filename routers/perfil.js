@@ -16,6 +16,7 @@ import { supabase } from '../services/supabaseClient.js';
 import { passwordChangeLimiter } from '../middleware/rateLimiter.js';
 import { enviarCorreo } from '../utils/emailService.js';
 import { closeOtherUserSessions } from '../utils/security/sessionService.js';
+import { sendPasswordEmailBestEffort } from '../utils/security/passwordRecoveryFlow.js';
 import {
   ALLOWED_IMAGE_MIME_TYPES,
   SUPABASE_ASSETS_BUCKET,
@@ -342,13 +343,9 @@ const buildPasswordChangedSecurityEmailHtml = () => {
 };
 
 const sendPasswordChangedSecurityEmail = async (idUsuario) => {
-  const email = await resolveProfileSecurityEmail(idUsuario);
-  if (!email) {
-    return { sent: false, skipped: true, reason: 'EMAIL_NOT_AVAILABLE' };
-  }
-
-  try {
-    await enviarCorreo(
+  return sendPasswordEmailBestEffort({
+    resolveEmail: () => resolveProfileSecurityEmail(idUsuario),
+    sendEmail: (email) => enviarCorreo(
       email,
       'Su contrasena fue modificada - Jonnys SmartOrder',
       buildPasswordChangedSecurityEmailHtml(),
@@ -357,12 +354,14 @@ const sendPasswordChangedSecurityEmail = async (idUsuario) => {
         tipo_correo: 'seguridad_cambio_contrasena',
         fromKey: 'ACCESO',
       }
-    );
-    return { sent: true, skipped: false };
-  } catch (error) {
-    console.error('PUT /perfil/password security email error:', error?.message || error);
-    return { sent: false, skipped: false, reason: 'SMTP_SEND_FAILED' };
-  }
+    ),
+    onError: (stage, error) => {
+      console.error(
+        `PUT /perfil/password security email ${stage === 'resolve' ? 'resolution' : 'send'} error:`,
+        error?.message || error
+      );
+    },
+  });
 };
 
 const issueUpdatedAccessToken = async (req, res) => {

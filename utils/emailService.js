@@ -143,51 +143,44 @@ const templateRecuperacion = (linkRecuperacion) => `
  * @param {string} html - Cuerpo HTML
  * @param {object} [meta] - Metadata para log ({id_usuario, tipo_correo})
  */
-const enviarCorreo = async (to, subject, html, meta = {}) => {
-  const {
-    id_usuario = null,
-    tipo_correo = 'general',
-    fromKey = null,
-    attachments = []
-  } = meta;
-
-  // Registrar intento en log
+export const sendEmailWithLogging = async ({
+  to,
+  subject,
+  html,
+  id_usuario = null,
+  tipo_correo = 'general',
+  attachments = [],
+  fromAddress,
+  queryRunner,
+  strictLogWrites = false,
+  mailTransport,
+  logger = console,
+}) => {
   let logId = null;
   try {
-    const logRes = await pool.query(
+    const logRes = await queryRunner.query(
       `INSERT INTO log_correos_enviados (id_usuario, tipo_correo, email_destino, asunto, estado_envio, intentos)
        VALUES ($1, $2, $3, $4, 'enviando', 1) RETURNING id_log`,
       [id_usuario, tipo_correo, to, subject]
     );
     logId = logRes.rows[0]?.id_log;
   } catch (logErr) {
-    console.warn('[emailService] No se pudo registrar log de correo:', logErr.message);
+    logger.warn('[emailService] No se pudo registrar log de correo:', logErr.message);
+    if (strictLogWrites) throw logErr;
   }
 
+  let info;
   try {
-    const fromAddress = getFromAddress(fromKey);
     const mailOptions = { from: fromAddress, to, subject, html };
     if (Array.isArray(attachments) && attachments.length > 0) {
       mailOptions.attachments = attachments;
     }
-    const info = await transporter.sendMail(mailOptions);
-    console.log(`📧 [emailService] Correo enviado a ${to} (desde ${fromAddress}) — MessageId: ${info.messageId}`);
-
-    // Actualizar log como exitoso
-    if (logId) {
-      await pool.query(
-        `UPDATE log_correos_enviados SET estado_envio = 'enviado', enviado_en = NOW() WHERE id_log = $1`,
-        [logId]
-      ).catch(() => {});
-    }
-
-    return { success: true, messageId: info.messageId };
+    info = await mailTransport.sendMail(mailOptions);
   } catch (err) {
-    console.error(`❌ [emailService] Error enviando correo a ${to}:`, err.message);
+    logger.error(`❌ [emailService] Error enviando correo a ${to}:`, err.message);
 
-    // Actualizar log como fallido
     if (logId) {
-      await pool.query(
+      await queryRunner.query(
         `UPDATE log_correos_enviados SET estado_envio = 'fallido', error_detalle = $1 WHERE id_log = $2`,
         [err.message, logId]
       ).catch(() => {});
@@ -195,6 +188,45 @@ const enviarCorreo = async (to, subject, html, meta = {}) => {
 
     throw err;
   }
+
+  logger.log(`📧 [emailService] Correo enviado a ${to} (desde ${fromAddress}) — MessageId: ${info.messageId}`);
+
+  if (logId) {
+    try {
+      await queryRunner.query(
+        `UPDATE log_correos_enviados SET estado_envio = 'enviado', enviado_en = NOW() WHERE id_log = $1`,
+        [logId]
+      );
+    } catch (logErr) {
+      logger.warn('[emailService] No se pudo confirmar log de correo:', logErr.message);
+      if (strictLogWrites) throw logErr;
+    }
+  }
+
+  return { success: true, messageId: info.messageId };
+};
+
+const enviarCorreo = async (to, subject, html, meta = {}) => {
+  const {
+    id_usuario = null,
+    tipo_correo = 'general',
+    fromKey = null,
+    attachments = [],
+    queryRunner = null,
+  } = meta;
+
+  return sendEmailWithLogging({
+    to,
+    subject,
+    html,
+    id_usuario,
+    tipo_correo,
+    attachments,
+    fromAddress: getFromAddress(fromKey),
+    queryRunner: queryRunner || pool,
+    strictLogWrites: Boolean(queryRunner),
+    mailTransport: transporter,
+  });
 };
 
 /**
