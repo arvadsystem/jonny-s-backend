@@ -199,7 +199,11 @@ export async function closeSession(id_sesion, motivo_cierre = 'logout') {
  * Cierra todas las sesiones activas de un usuario.
  * Util para hardening despues de reset/cambio de contrasena.
  */
-export async function closeAllUserSessions(id_usuario, motivo_cierre = 'password_reset') {
+export async function closeAllUserSessions(
+  id_usuario,
+  motivo_cierre = 'password_reset',
+  queryRunner = pool
+) {
   const sql = `
     UPDATE sesiones_activas
     SET activa = FALSE,
@@ -208,7 +212,36 @@ export async function closeAllUserSessions(id_usuario, motivo_cierre = 'password
     WHERE id_usuario = $1
       AND activa = TRUE
   `;
-  const result = await pool.query(sql, [id_usuario, motivo_cierre]);
+  const result = await queryRunner.query(sql, [id_usuario, motivo_cierre]);
+  return result.rowCount || 0;
+}
+
+/**
+ * Cierra las demas sesiones activas de un usuario y conserva la sesion actual.
+ */
+export async function closeOtherUserSessions(
+  id_usuario,
+  currentSessionId,
+  motivo_cierre = 'password_change',
+  queryRunner = pool
+) {
+  const safeCurrentSessionId = String(currentSessionId ?? '').trim();
+  if (!safeCurrentSessionId) {
+    const error = new Error('CURRENT_SESSION_ID_REQUIRED');
+    error.code = 'CURRENT_SESSION_ID_REQUIRED';
+    throw error;
+  }
+
+  const sql = `
+    UPDATE sesiones_activas
+    SET activa = FALSE,
+        fecha_cierre = ${HN_NOW_SQL},
+        motivo_cierre = $3
+    WHERE id_usuario = $1
+      AND id_sesion <> $2
+      AND activa = TRUE
+  `;
+  const result = await queryRunner.query(sql, [id_usuario, safeCurrentSessionId, motivo_cierre]);
   return result.rowCount || 0;
 }
 

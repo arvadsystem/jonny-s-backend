@@ -14,6 +14,8 @@ import { ensurePasswordChangedAtColumn } from '../utils/security/passwordExpirat
 import { buildAuthTokenPayload, getUserAuthzSnapshot } from '../utils/security/authTokenPayload.js';
 import { supabase } from '../services/supabaseClient.js';
 import { passwordChangeLimiter } from '../middleware/rateLimiter.js';
+import { enviarCorreo } from '../utils/emailService.js';
+import { closeOtherUserSessions } from '../utils/security/sessionService.js';
 import {
   ALLOWED_IMAGE_MIME_TYPES,
   SUPABASE_ASSETS_BUCKET,
@@ -267,7 +269,7 @@ const cookieConfig = () => {
   };
 };
 
-const verifyStoredPassword = async (plainPassword, storedPassword) => {
+const verifyStoredPassword = async (plainPassword, storedPassword, queryRunner = pool) => {
   const plain = String(plainPassword ?? '');
   const stored = String(storedPassword ?? '');
   if (!plain || !stored) return false;
@@ -275,11 +277,92 @@ const verifyStoredPassword = async (plainPassword, storedPassword) => {
   if (plain === stored) return true;
   if (!LEGACY_BCRYPT_PREFIX_RE.test(stored)) return false;
 
-  const result = await pool.query(
+  const result = await queryRunner.query(
     'SELECT crypt($1::text, $2::text) = $2::text AS ok',
     [plain, stored]
   );
   return Boolean(result.rows?.[0]?.ok);
+};
+
+const resolveProfileSecurityEmail = async (idUsuario) => {
+  const result = await pool.query(
+    `
+      SELECT COALESCE(
+        NULLIF(TRIM(ce_link.direccion_correo), ''),
+        NULLIF(TRIM(ce_persona.direccion_correo), ''),
+        NULLIF(TRIM(cc_link.direccion_correo), ''),
+        NULLIF(TRIM(cc_persona.direccion_correo), '')
+      ) AS correo
+      FROM usuarios u
+      LEFT JOIN empleados e ON e.id_empleado = u.id_empleado
+      LEFT JOIN personas pe ON pe.id_persona = e.id_persona
+      LEFT JOIN correos ce_link ON ce_link.id_correo = pe.id_correo
+      LEFT JOIN correos ce_persona ON (pe.id_correo IS NULL AND ce_persona.id_persona = pe.id_persona)
+      LEFT JOIN clientes cl ON cl.id_cliente = u.id_cliente
+      LEFT JOIN personas pc ON pc.id_persona = cl.id_persona
+      LEFT JOIN correos cc_link ON cc_link.id_correo = pc.id_correo
+      LEFT JOIN correos cc_persona ON (pc.id_correo IS NULL AND cc_persona.id_persona = pc.id_persona)
+      WHERE u.id_usuario = $1
+      LIMIT 1
+    `,
+    [idUsuario]
+  );
+
+  const email = String(result.rows?.[0]?.correo ?? '').trim().toLowerCase();
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) ? email : null;
+};
+
+const buildPasswordChangedSecurityEmailHtml = () => {
+  const changedAt = new Intl.DateTimeFormat('es-HN', {
+    timeZone: 'America/Tegucigalpa',
+    dateStyle: 'long',
+    timeStyle: 'short',
+  }).format(new Date());
+
+  return `
+<!DOCTYPE html>
+<html lang="es">
+<head><meta charset="UTF-8"></head>
+<body style="margin:0; padding:0; background:#0e0704; font-family:Arial,sans-serif;">
+  <table width="100%" cellpadding="0" cellspacing="0" style="max-width:620px; margin:28px auto; background:#1a1108; border:1px solid rgba(212,165,116,0.25); border-radius:14px;">
+    <tr>
+      <td style="padding:28px 32px; color:#fdfaf5;">
+        <h2 style="margin:0 0 10px; color:#d4a574;">Cambio de contrasena</h2>
+        <p style="margin:0 0 12px; color:rgba(255,255,255,0.82); line-height:1.5;">
+          Su contrasena fue modificada correctamente.
+        </p>
+        <p style="margin:0; color:rgba(255,255,255,0.62); line-height:1.5;">
+          Fecha y hora: ${changedAt}
+        </p>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>`;
+};
+
+const sendPasswordChangedSecurityEmail = async (idUsuario) => {
+  const email = await resolveProfileSecurityEmail(idUsuario);
+  if (!email) {
+    return { sent: false, skipped: true, reason: 'EMAIL_NOT_AVAILABLE' };
+  }
+
+  try {
+    await enviarCorreo(
+      email,
+      'Su contrasena fue modificada - Jonnys SmartOrder',
+      buildPasswordChangedSecurityEmailHtml(),
+      {
+        id_usuario: idUsuario,
+        tipo_correo: 'seguridad_cambio_contrasena',
+        fromKey: 'ACCESO',
+      }
+    );
+    return { sent: true, skipped: false };
+  } catch (error) {
+    console.error('PUT /perfil/password security email error:', error?.message || error);
+    return { sent: false, skipped: false, reason: 'SMTP_SEND_FAILED' };
+  }
 };
 
 const issueUpdatedAccessToken = async (req, res) => {
@@ -639,6 +722,10 @@ router.put('/perfil/password', passwordChangeLimiter, async (req, res) => {
     if (!Number.isInteger(idUsuario) || idUsuario <= 0) {
       return res.status(401).json({ error: true, message: 'No autorizado' });
     }
+    const currentSessionId = String(req.user?.sid ?? '').trim();
+    if (!currentSessionId) {
+      return res.status(401).json({ error: true, message: 'Sesion actual no identificada' });
+    }
 
     const claveActual = String(
       req.body?.clave_actual
@@ -659,6 +746,7 @@ router.put('/perfil/password', passwordChangeLimiter, async (req, res) => {
 
     const client = await pool.connect();
     let fechaCambioClave = null;
+    let closedOtherSessions = 0;
     try {
       await client.query('BEGIN');
 
@@ -671,13 +759,13 @@ router.put('/perfil/password', passwordChangeLimiter, async (req, res) => {
       }
 
       const claveBD = String(rUser.rows[0]?.clave ?? '');
-      const passwordOk = await verifyStoredPassword(claveActual, claveBD);
+      const passwordOk = await verifyStoredPassword(claveActual, claveBD, client);
       if (!passwordOk) {
         await client.query('ROLLBACK');
         return res.status(400).json({ error: true, message: 'La contrasena actual no es correcta' });
       }
 
-      const samePassword = await verifyStoredPassword(claveNueva, claveBD);
+      const samePassword = await verifyStoredPassword(claveNueva, claveBD, client);
       if (samePassword) {
         await client.query('ROLLBACK');
         return res.status(400).json({ error: true, message: 'La nueva contrasena no puede ser igual a la actual' });
@@ -758,6 +846,13 @@ router.put('/perfil/password', passwordChangeLimiter, async (req, res) => {
         [idUsuario, PASSWORD_HISTORY_KEEP]
       );
 
+      closedOtherSessions = await closeOtherUserSessions(
+        idUsuario,
+        currentSessionId,
+        'password_change',
+        client
+      );
+
       await client.query('COMMIT');
     } catch (txError) {
       try { await client.query('ROLLBACK'); } catch {}
@@ -767,14 +862,15 @@ router.put('/perfil/password', passwordChangeLimiter, async (req, res) => {
     }
 
     await issueUpdatedAccessToken(req, res);
+    const securityEmailNotification = await sendPasswordChangedSecurityEmail(idUsuario);
     return res.json({
       error: false,
       message: 'Contrasena actualizada correctamente',
       fecha_cambio_clave: fechaCambioClave,
       must_change_password: false,
-      password_expired: false,
-      password_expired_by_age: false,
-      password_change_required: false
+      password_change_required: false,
+      otras_sesiones_cerradas: closedOtherSessions,
+      security_email_notification: securityEmailNotification
     });
   } catch (err) {
     console.error('PUT /perfil/password error:', err?.message || err);

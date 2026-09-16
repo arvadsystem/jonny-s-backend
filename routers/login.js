@@ -110,18 +110,9 @@ const buildPasswordPolicyFlags = (passwordExpiration) => {
 
   const recommendation30d =
     !excludedByClienteRole && ageDays !== null && ageDays >= 30;
-  const warning58d =
-    !excludedByClienteRole && ageDays !== null && ageDays >= 58 && ageDays < 60;
-  const daysToExpire =
-    !excludedByClienteRole && ageDays !== null
-      ? Math.max(0, 60 - ageDays)
-      : null;
-
   return {
     password_age_days: ageDays,
     password_recommend_change: recommendation30d,
-    password_warning_58d: warning58d,
-    password_days_to_expire: daysToExpire,
     password_policy_excluded: excludedByClienteRole,
   };
 };
@@ -529,8 +520,6 @@ router.get('/me', authRequired, requireActiveSession, refreshKitchenDisplaySessi
   if (!Object.prototype.hasOwnProperty.call(usuario, 'password_age_days')) {
     usuario.password_age_days = null;
     usuario.password_recommend_change = false;
-    usuario.password_warning_58d = false;
-    usuario.password_days_to_expire = null;
     usuario.password_policy_excluded = false;
   }
 

@@ -17,6 +17,7 @@ import {
 import { ensurePasswordChangedAtColumn } from '../utils/security/passwordExpiration.js';
 import { enviarCorreo } from '../utils/emailService.js';
 import { buildAuthTokenPayload, getUserAuthzSnapshot } from '../utils/security/authTokenPayload.js';
+import { closeAllUserSessions } from '../utils/security/sessionService.js';
 
 const router = express.Router();
 const USUARIOS_LIST_PERMISSIONS = ['USUARIOS_LISTADO_VER'];
@@ -2362,19 +2363,42 @@ router.post('/usuarios/v2/generate', checkPermission(USUARIOS_CREATE_PERMISSIONS
 });
 
 router.post('/usuarios/v2/reset-password/:id_usuario', checkPermission(USUARIOS_RESET_PASSWORD_PERMISSIONS), async (req, res) => {
+  let client = null;
   try {
     const idUsuario = v2ParsePositiveInt(req.params.id_usuario);
     if (!idUsuario) {
       return res.status(400).json({ error: true, message: 'id_usuario invalido' });
     }
 
-    const currentUser = await v2FetchUsuarioById(idUsuario);
+    const actorId = v2ParsePositiveInt(req.user?.id_usuario);
+    if (actorId === idUsuario) {
+      return res.status(400).json({
+        error: true,
+        code: 'SELF_PASSWORD_RESET_NOT_ALLOWED',
+        message: 'Use la opcion Cambiar contrasena para actualizar su propia cuenta',
+      });
+    }
+
+    client = await pool.connect();
+    await client.query('BEGIN');
+
+    const lockResult = await client.query(
+      'SELECT id_usuario FROM usuarios WHERE id_usuario = $1 LIMIT 1 FOR UPDATE',
+      [idUsuario]
+    );
+    if (lockResult.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: true, message: 'Usuario no encontrado' });
+    }
+
+    const currentUser = await v2FetchUsuarioById(idUsuario, client);
     if (!currentUser) {
+      await client.query('ROLLBACK');
       return res.status(404).json({ error: true, message: 'Usuario no encontrado' });
     }
 
     const temporaryPassword = await v2GenerateTemporaryPassword();
-    const passwordForStorage = await v2BuildPasswordForStorage(temporaryPassword);
+    const passwordForStorage = await v2BuildPasswordForStorage(temporaryPassword, client);
     const capabilities = await v2GetCapabilities();
 
     const setParts = ['clave = $1'];
@@ -2386,10 +2410,16 @@ router.post('/usuarios/v2/reset-password/:id_usuario', checkPermission(USUARIOS_
 
     values.push(idUsuario);
 
-    await pool.query(
+    const updateResult = await client.query(
       `UPDATE usuarios SET ${setParts.join(', ')} WHERE id_usuario = $${values.length}`,
       values
     );
+    if (updateResult.rowCount !== 1) {
+      throw new Error('No se pudo actualizar la contrasena temporal');
+    }
+
+    const closedSessions = await closeAllUserSessions(idUsuario, 'password_reset', client);
+    await client.query('COMMIT');
 
     const emailNotification = await v2SendTemporaryPasswordEmail({
       idUsuario: currentUser?.id_usuario,
@@ -2399,14 +2429,26 @@ router.post('/usuarios/v2/reset-password/:id_usuario', checkPermission(USUARIOS_
       mode: 'reset',
     });
 
-    return res.status(200).json({
+    const responsePayload = {
       ok: true,
+      message: 'Contrasena temporal regenerada correctamente',
       nombre_usuario: currentUser?.nombre_usuario || null,
-      temp_password: temporaryPassword,
+      sesiones_cerradas: closedSessions,
       email_notification: emailNotification,
-    });
+    };
+    if (!emailNotification?.sent) {
+      responsePayload.temp_password = temporaryPassword;
+    }
+
+    res.set('Cache-Control', 'no-store');
+    return res.status(200).json(responsePayload);
   } catch (err) {
+    if (client) {
+      try { await client.query('ROLLBACK'); } catch {}
+    }
     console.error('Error en /usuarios/v2/reset-password/:id_usuario:', err.message);
     return res.status(500).json({ error: true, message: 'Error interno del servidor' });
+  } finally {
+    if (client) client.release();
   }
 });

@@ -1236,34 +1236,36 @@ const resetInternalUserPasswordFromPublicForgot = async (user) => {
       return;
     }
 
+    await closeAllUserSessions(idUsuario, 'password_reset', client);
+
+    try {
+      await enviarCorreo(
+        user.correo,
+        'Nueva contrasena temporal - Jonnys SmartOrder',
+        buildInternalTemporaryPasswordEmailHtml({
+          displayName: user.nombre_visible,
+          username: user.nombre_usuario,
+          temporaryPassword
+        }),
+        {
+          id_usuario: idUsuario,
+          tipo_correo: 'credenciales_temporales_reset',
+          fromKey: 'ACCESO'
+        }
+      );
+    } catch (emailError) {
+      const recoveryError = new Error('INTERNAL_PASSWORD_RECOVERY_EMAIL_FAILED');
+      recoveryError.cause = emailError;
+      throw recoveryError;
+    }
+
     await client.query('COMMIT');
   } catch (error) {
     await client.query('ROLLBACK').catch(() => {});
-    console.error('[public/forgot-password] Error regenerando contrasena temporal interna:', error?.message || error);
+    console.error('[public/forgot-password] Recuperacion interna revertida:', error?.message || error);
     return;
   } finally {
     client.release();
-  }
-
-  await closeAllUserSessions(idUsuario, 'password_reset').catch(() => {});
-
-  try {
-    await enviarCorreo(
-      user.correo,
-      'Nueva contrasena temporal - Jonnys SmartOrder',
-      buildInternalTemporaryPasswordEmailHtml({
-        displayName: user.nombre_visible,
-        username: user.nombre_usuario,
-        temporaryPassword
-      }),
-      {
-        id_usuario: idUsuario,
-        tipo_correo: 'credenciales_temporales_reset',
-        fromKey: 'ACCESO'
-      }
-    );
-  } catch (error) {
-    console.error('[public/forgot-password] Error enviando credenciales temporales internas:', error?.message || error);
   }
 };
 

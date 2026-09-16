@@ -1,6 +1,5 @@
 import pool from '../../config/db-connection.js';
 
-export const PASSWORD_EXPIRATION_DAYS = 60;
 export const PASSWORD_CHANGED_AT_COLUMN = 'fecha_cambio_clave';
 
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -44,7 +43,6 @@ export const evaluatePasswordExpiration = ({
   passwordChangedAt = null,
   createdAt = null,
   now = new Date(),
-  maxAgeDays = PASSWORD_EXPIRATION_DAYS,
 } = {}) => {
   const excludedByClienteRole = isClienteUser({ roles, tipoUsuario });
   const referenceDate = parseDate(passwordChangedAt) || parseDate(createdAt);
@@ -57,13 +55,11 @@ export const evaluatePasswordExpiration = ({
   }
 
   const manualMustChange = Boolean(mustChangePassword);
-  const expiredByAge = !excludedByClienteRole && ageDays !== null && ageDays >= maxAgeDays;
   const mustChange = !excludedByClienteRole && manualMustChange;
 
   return {
     excludedByClienteRole,
     manualMustChange,
-    expiredByAge,
     mustChangePassword: mustChange,
     ageDays,
     referenceDate,
